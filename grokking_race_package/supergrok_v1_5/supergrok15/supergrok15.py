@@ -248,13 +248,20 @@ class SuperGrok15(Optimizer):
         else:
             self.meta_net = meta_net
 
+        # Auto-move meta-net to same device as parameters
+        try:
+            first_param = next(iter(self.param_groups[0]["params"]))
+            self.meta_net = self.meta_net.to(first_param.device)
+        except (StopIteration, IndexError):
+            pass  # no params yet, will be moved manually
+
         # ── Internal state ────────────────────────────────────────────
         self._global_step = 0
         self._cached_alpha = alpha_init
         self._cached_train_acc = 0.0
         self._layer_beta1_cache: Dict[torch.nn.Parameter, float] = {}
         self._layer_alpha_cache: Dict[torch.nn.Parameter, float] = {}
-        # Cached sharpness directions from LookSAM (per parameter id)
+        # Cached sharpness directions from LookSAM (keyed by param index)
         self._sharpness_cache: Dict[int, torch.Tensor] = {}
 
         # Build parameter index
@@ -345,9 +352,9 @@ class SuperGrok15(Optimizer):
 
     def _get_sharpness(self, p: torch.nn.Parameter) -> torch.Tensor:
         """Return cached sharpness signal for parameter, or zeros."""
-        pid = id(p)
-        if pid in self._sharpness_cache:
-            return self._sharpness_cache[pid]
+        pidx = self._param_index.get(p, -1)
+        if pidx in self._sharpness_cache:
+            return self._sharpness_cache[pidx]
         return torch.zeros_like(p.data)
 
     # ══════════════════════════════════════════════════════════════════
@@ -442,9 +449,7 @@ class SuperGrok15(Optimizer):
                         smart_grad.flatten().unsqueeze(0),
                         mu.flatten().unsqueeze(0),
                     ).item()
-                    gate = torch.sigmoid(
-                        torch.tensor(self.gate_temperature * cos_sim)
-                    ).item()
+                    gate = 1.0 / (1.0 + math.exp(-self.gate_temperature * cos_sim))
                     lamb_eff = ramp * gate * self.lamb
                     final_grad = smart_grad + lamb_eff * mu
                 else:
@@ -553,7 +558,9 @@ class SuperGrok15(Optimizer):
         for name, p in model.named_parameters():
             if p.grad is not None and name in train_grads:
                 d = p.grad.detach() - train_grads[name]
-                self._sharpness_cache[id(p)] = d.abs()
+                pidx = self._param_index.get(p, -1)
+                if pidx >= 0:
+                    self._sharpness_cache[pidx] = d.abs()
 
         sam_loss_val = sam_loss.item()
 
@@ -568,7 +575,8 @@ class SuperGrok15(Optimizer):
         smart_grads: Dict[str, torch.Tensor] = {}
         for name, p in model.named_parameters():
             if name in train_grads:
-                sharpness = self._sharpness_cache.get(id(p), torch.zeros_like(p.data))
+                pidx = self._param_index.get(p, -1)
+                sharpness = self._sharpness_cache.get(pidx, torch.zeros_like(p.data))
                 smart_grads[name] = self.meta_net(train_grads[name], sharpness)
 
         # Compute validation gradients
@@ -631,9 +639,9 @@ class SuperGrok15(Optimizer):
                         mu_norms.append(s["mu"].norm().item())
                     if "exp_avg" in s:
                         ea_norms.append(s["exp_avg"].norm().item())
-                pid = id(p)
-                if pid in self._sharpness_cache:
-                    sharp_norms.append(self._sharpness_cache[pid].norm().item())
+                pidx = self._param_index.get(p, -1)
+                if pidx in self._sharpness_cache:
+                    sharp_norms.append(self._sharpness_cache[pidx].norm().item())
         return {
             "global_step": self._global_step,
             "cached_alpha": self._cached_alpha,

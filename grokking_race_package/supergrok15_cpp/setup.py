@@ -31,7 +31,13 @@ if USE_CUDA:
         name="supergrok15_cpp._ops",
         sources=[
             "csrc/ops.cpp",
+            "csrc/graph_compiler.cpp",
+            "csrc/stream_scheduler.cpp",
             "csrc/kernels.cu",
+            "csrc/grokfast_kernels.cu",
+            "csrc/lion_kernels.cu",
+            "csrc/looksam_kernels.cu",
+            "csrc/muon_kernels.cu",
         ],
         define_macros=[("WITH_CUDA", None)],
         extra_compile_args={
@@ -62,7 +68,11 @@ if USE_CUDA:
 else:
     ext = CppExtension(
         name="supergrok15_cpp._ops",
-        sources=["csrc/ops.cpp"],
+        sources=[
+            "csrc/ops.cpp",
+            "csrc/graph_compiler.cpp",
+            "csrc/stream_scheduler.cpp",
+        ],
         extra_compile_args={
             "cxx": [
                 "-O3",
@@ -79,8 +89,8 @@ setup(
     name="supergrok15_cpp",
     version="1.5.0",
     description=(
-        "SuperGrok v1.5 C++/CUDA — Sharpness-aware grokking optimizer "
-        "with fused CUDA kernels for meta-net inference and Adam updates"
+        "Grokking Race C++/CUDA — Fused optimizer kernels for SuperGrok v1.5, "
+        "Grokfast, Lion, LookSAM, Muon + graph compiler + stream scheduler"
     ),
     author="Peter C.",
     packages=find_packages(),

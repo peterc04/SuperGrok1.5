@@ -522,6 +522,15 @@ def _load(c, device, init_state):
 def _tr(name, c):
     return TrainResult(name, c["seed"], c.get("model_type","decoder"), c.get("frac_train",0.5))
 
+# ── C++/CUDA fused kernels (Layer 1 of optimization stack) ────────────
+# Provides fused optimizer step kernels for Grokfast, Lion, LookSAM, Muon
+# in addition to the existing SuperGrok v1.5 kernels.
+_fused_ops = None
+try:
+    from supergrok15_cpp import _ops as _fused_ops
+except ImportError:
+    pass  # Fall back to pure Python (no speed penalty for correctness)
+
 # ── 1. AdamW ──────────────────────────────────────────────────────────
 def train_adamw(c, init, tx, ty, vx, vy, dev, bp=0):
     r=_tr("AdamW",c); m=_load(c,dev,init)
@@ -607,15 +616,15 @@ def train_supergrok(c, init, tx, ty, vx, vy, dev, bp=0):
     crit_sg=nn.CrossEntropyLoss()
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("SuperGrok",c["max_steps"],bp)):
-        loss=F.cross_entropy(m(tx),ty); opt.zero_grad(); loss.backward()
+        logits=m(tx); loss=F.cross_entropy(logits,ty); opt.zero_grad(); loss.backward()
         train_loss_val=loss.item()
-        # Compute train accuracy for memorization detection
+        # Compute train accuracy for memorization detection (reuse logits)
         with torch.no_grad():
-            train_acc=(m(tx)[:,:c["p"]].argmax(-1)==ty).float().mean().item()
+            train_acc=(logits.detach()[:,:c["p"]].argmax(-1)==ty).float().mean().item()
         # Bilevel meta-net update via meta_step (every muf steps)
         if step%muf==0:
             try: opt.meta_step(m, vx, vy, crit_sg, mopt)
-            except Exception: pass  # graceful fallback
+            except Exception as e: warnings.warn(f"SuperGrok meta_step failed at step {step}: {e}")
         # Optimizer step with full signals
         kw={"train_loss":train_loss_val, "train_acc":train_acc}
         if step%c.get("supergrok_alpha_update_freq",50)==0:
@@ -654,14 +663,14 @@ def train_supergrok15(c, init, tx, ty, vx, vy, dev, bp=0):
     crit_s15=nn.CrossEntropyLoss()
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("SuperGrok1.5",c["max_steps"],bp)):
-        loss=F.cross_entropy(m(tx),ty); opt.zero_grad(); loss.backward()
+        logits=m(tx); loss=F.cross_entropy(logits,ty); opt.zero_grad(); loss.backward()
         train_loss_val=loss.item()
         with torch.no_grad():
-            train_acc=(m(tx)[:,:c["p"]].argmax(-1)==ty).float().mean().item()
+            train_acc=(logits.detach()[:,:c["p"]].argmax(-1)==ty).float().mean().item()
         # Combined SAM + bilevel every sam_freq steps
         if step%sf==0:
             try: opt.sam_meta_step(m, tx, ty, vx, vy, crit_s15, mopt)
-            except Exception: pass
+            except Exception as e: warnings.warn(f"SuperGrok1.5 sam_meta_step failed at step {step}: {e}")
         kw={"train_loss":train_loss_val, "train_acc":train_acc}
         if step%c.get("supergrok15_alpha_update_freq",50)==0:
             with torch.no_grad():
@@ -684,13 +693,32 @@ def _grokfast_ema(model, grads, alpha=0.98, lamb=2.0):
             p.grad.data = p.grad.data + grads[n]*lamb
     return grads
 
+def _grokfast_ema_fused(model, ema_bufs, alpha=0.98, lamb=2.0):
+    """Fused C++/CUDA EMA: processes all params in one C++ loop, no Python overhead."""
+    grads = [p.grad.data for p in model.parameters() if p.requires_grad and p.grad is not None]
+    _fused_ops.grokfast_fused_step(grads, ema_bufs, alpha, lamb)
+
 def train_grokfast(c, init, tx, ty, vx, vy, dev, bp=0):
     r=_tr("Grokfast",c); m=_load(c,dev,init)
     opt=torch.optim.AdamW(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]), weight_decay=c["weight_decay"])
-    grads=None; st=_stopper(c); m.train(); t0=time.time()
+    st=_stopper(c); m.train(); t0=time.time()
+    use_fused = _fused_ops is not None
+    alpha_gf, lamb_gf = c.get("grokfast_alpha",0.98), c.get("grokfast_lamb",2.0)
+    if use_fused:
+        ema_bufs = [torch.zeros_like(p) for p in m.parameters() if p.requires_grad]
+        ema_init = False
+    else:
+        grads = None
     for step in (pb:=_pbar("Grokfast",c["max_steps"],bp)):
         loss=F.cross_entropy(m(tx),ty); opt.zero_grad(); loss.backward()
-        grads=_grokfast_ema(m, grads, c.get("grokfast_alpha",0.98), c.get("grokfast_lamb",2.0))
+        if use_fused:
+            if not ema_init:
+                for i, p in enumerate(p_ for p_ in m.parameters() if p_.requires_grad and p_.grad is not None):
+                    ema_bufs[i].copy_(p.grad.data)
+                ema_init = True
+            _grokfast_ema_fused(m, ema_bufs, alpha_gf, lamb_gf)
+        else:
+            grads=_grokfast_ema(m, grads, alpha_gf, lamb_gf)
         opt.step()
         if step%c["log_every"]==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
@@ -712,16 +740,23 @@ def train_muon(c, init, tx, ty, vx, vy, dev, bp=0):
     adam_opt = torch.optim.AdamW(adam_params, lr=c["lr"], betas=(c["beta1"],c["beta2"]),
         weight_decay=c["weight_decay"]) if adam_params else None
     bufs=[torch.zeros_like(p) for p in muon_params]
+    use_fused = _fused_ops is not None
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("Muon",c["max_steps"],bp)):
         loss=F.cross_entropy(m(tx),ty); m.zero_grad(); loss.backward()
-        with torch.no_grad():
-            for p, buf in zip(muon_params, bufs):
-                if p.grad is None: continue
-                buf.mul_(muon_mom).add_(p.grad); orth=_newton_schulz(buf)
-                scale=0.2*math.sqrt(max(buf.shape[0],buf.shape[1]))
-                p.data.add_(orth, alpha=-muon_lr*scale/max(buf.shape[0],buf.shape[1])**0.5)
-                p.data.mul_(1 - c["lr"] * c["weight_decay"])
+        if use_fused:
+            muon_grads = [p.grad.data if p.grad is not None else torch.Tensor() for p in muon_params]
+            with torch.no_grad():
+                _fused_ops.muon_fused_step(muon_params, muon_grads, bufs,
+                    muon_mom, muon_lr, c["weight_decay"], 5)
+        else:
+            with torch.no_grad():
+                for p, buf in zip(muon_params, bufs):
+                    if p.grad is None: continue
+                    buf.mul_(muon_mom).add_(p.grad); orth=_newton_schulz(buf)
+                    scale=0.2*math.sqrt(max(buf.shape[0],buf.shape[1]))
+                    p.data.add_(orth, alpha=-muon_lr*scale/max(buf.shape[0],buf.shape[1])**0.5)
+                    p.data.mul_(1 - c["lr"] * c["weight_decay"])
         if adam_opt: adam_opt.step()
         if step%c["log_every"]==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
@@ -730,12 +765,29 @@ def train_muon(c, init, tx, ty, vx, vy, dev, bp=0):
 
 # ── 7. Lion ───────────────────────────────────────────────────────────
 def train_lion(c, init, tx, ty, vx, vy, dev, bp=0):
-    from lion_pytorch import Lion
     r=_tr("Lion",c); m=_load(c,dev,init)
-    opt=Lion(m.parameters(), lr=c.get("lion_lr",c["lr"]/3), weight_decay=c.get("lion_wd",c["weight_decay"]*3))
+    lion_lr=c.get("lion_lr",c["lr"]/3); lion_wd=c.get("lion_wd",c["weight_decay"]*3)
+    use_fused = _fused_ops is not None
+    if use_fused:
+        # Use fused C++/CUDA Lion kernel — no Python package needed
+        params_list = list(m.parameters())
+        exp_avgs = [torch.zeros_like(p) for p in params_list]
+    else:
+        from lion_pytorch import Lion
+        opt=Lion(m.parameters(), lr=lion_lr, weight_decay=lion_wd)
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("Lion",c["max_steps"],bp)):
-        loss=F.cross_entropy(m(tx),ty); opt.zero_grad(); loss.backward(); opt.step()
+        loss=F.cross_entropy(m(tx),ty)
+        if use_fused:
+            for p in params_list:
+                if p.grad is not None: p.grad.zero_()
+            loss.backward()
+            grads = [p.grad.data if p.grad is not None else torch.Tensor() for p in params_list]
+            with torch.no_grad():
+                _fused_ops.lion_fused_step(params_list, grads, exp_avgs,
+                    lion_lr, c["beta1"], 0.99, lion_wd)
+        else:
+            opt.zero_grad(); loss.backward(); opt.step()
         if step%c["log_every"]==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
             if done: break
@@ -746,29 +798,53 @@ def train_looksam(c, init, tx, ty, vx, vy, dev, bp=0):
     r=_tr("LookSAM",c); m=_load(c,dev,init)
     rho=c.get("looksam_rho",0.05); k=c.get("looksam_k",5); la=c.get("looksam_alpha",0.7)
     opt=torch.optim.AdamW(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]), weight_decay=c["weight_decay"])
-    v_dir={}; st=_stopper(c); m.train(); t0=time.time()
+    use_fused = _fused_ops is not None
+    if use_fused:
+        params_list = [p for p in m.parameters() if p.requires_grad]
+        v_dir_list = [torch.zeros_like(p) for p in params_list]
+        v_dir_init = False
+    else:
+        v_dir={}
+    st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("LookSAM",c["max_steps"],bp)):
         loss=F.cross_entropy(m(tx),ty); opt.zero_grad(); loss.backward()
         if step%k==1 or k==1:
-            sg={}; gnorm=0.
-            for n,p in m.named_parameters():
-                if p.grad is not None: sg[n]=p.grad.data.clone(); gnorm+=p.grad.data.norm()**2
-            gnorm=gnorm**0.5
-            with torch.no_grad():
+            if use_fused:
+                # Save normal gradients, perturb, compute SAM grads, restore, get direction
+                normal_grads = [p.grad.data.clone() for p in params_list]
+                backups = _fused_ops.looksam_perturb_all(params_list, normal_grads, rho)
+                opt.zero_grad(); F.cross_entropy(m(tx),ty).backward()
+                sam_grads = [p.grad.data.clone() if p.grad is not None else torch.zeros_like(p) for p in params_list]
+                _fused_ops.looksam_restore_all(params_list, backups)
+                _fused_ops.looksam_compute_directions(v_dir_list, sam_grads, normal_grads)
+                # Restore original gradients for AdamW step
+                for p, ng in zip(params_list, normal_grads):
+                    if p.grad is not None: p.grad.data.copy_(ng)
+                v_dir_init = True
+            else:
+                sg={}; gnorm=0.
                 for n,p in m.named_parameters():
-                    if n in sg: p.data.add_(sg[n], alpha=rho/max(gnorm,1e-12))
-            opt.zero_grad(); F.cross_entropy(m(tx),ty).backward()
-            with torch.no_grad():
-                for n,p in m.named_parameters():
-                    if n in sg:
-                        p.data.sub_(sg[n], alpha=rho/max(gnorm,1e-12))
-                        if p.grad is not None:
-                            v_dir[n]=p.grad.data-sg[n]; vn=v_dir[n].norm()
-                            if vn>1e-12: v_dir[n]/=vn
+                    if p.grad is not None: sg[n]=p.grad.data.clone(); gnorm+=p.grad.data.norm()**2
+                gnorm=gnorm**0.5
+                with torch.no_grad():
+                    for n,p in m.named_parameters():
+                        if n in sg: p.data.add_(sg[n], alpha=rho/max(gnorm,1e-12))
+                opt.zero_grad(); F.cross_entropy(m(tx),ty).backward()
+                with torch.no_grad():
+                    for n,p in m.named_parameters():
+                        if n in sg:
+                            p.data.sub_(sg[n], alpha=rho/max(gnorm,1e-12))
+                            if p.grad is not None:
+                                v_dir[n]=p.grad.data-sg[n]; vn=v_dir[n].norm()
+                                if vn>1e-12: v_dir[n]/=vn
         else:
-            with torch.no_grad():
-                for n,p in m.named_parameters():
-                    if p.grad is not None and n in v_dir: p.grad.data+=la*p.grad.data.norm()*v_dir[n]
+            if use_fused and v_dir_init:
+                grads = [p.grad.data if p.grad is not None else torch.Tensor() for p in params_list]
+                _fused_ops.looksam_adjust_grads(grads, v_dir_list, la)
+            elif not use_fused:
+                with torch.no_grad():
+                    for n,p in m.named_parameters():
+                        if p.grad is not None and n in v_dir: p.grad.data+=la*p.grad.data.norm()*v_dir[n]
         opt.step()
         if step%c["log_every"]==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
