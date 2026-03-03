@@ -607,15 +607,15 @@ def train_supergrok(c, init, tx, ty, vx, vy, dev, bp=0):
     crit_sg=nn.CrossEntropyLoss()
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("SuperGrok",c["max_steps"],bp)):
-        loss=F.cross_entropy(m(tx),ty); opt.zero_grad(); loss.backward()
+        logits=m(tx); loss=F.cross_entropy(logits,ty); opt.zero_grad(); loss.backward()
         train_loss_val=loss.item()
-        # Compute train accuracy for memorization detection
+        # Compute train accuracy for memorization detection (reuse logits)
         with torch.no_grad():
-            train_acc=(m(tx)[:,:c["p"]].argmax(-1)==ty).float().mean().item()
+            train_acc=(logits.detach()[:,:c["p"]].argmax(-1)==ty).float().mean().item()
         # Bilevel meta-net update via meta_step (every muf steps)
         if step%muf==0:
             try: opt.meta_step(m, vx, vy, crit_sg, mopt)
-            except Exception: pass  # graceful fallback
+            except Exception as e: warnings.warn(f"SuperGrok meta_step failed at step {step}: {e}")
         # Optimizer step with full signals
         kw={"train_loss":train_loss_val, "train_acc":train_acc}
         if step%c.get("supergrok_alpha_update_freq",50)==0:
@@ -654,14 +654,14 @@ def train_supergrok15(c, init, tx, ty, vx, vy, dev, bp=0):
     crit_s15=nn.CrossEntropyLoss()
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("SuperGrok1.5",c["max_steps"],bp)):
-        loss=F.cross_entropy(m(tx),ty); opt.zero_grad(); loss.backward()
+        logits=m(tx); loss=F.cross_entropy(logits,ty); opt.zero_grad(); loss.backward()
         train_loss_val=loss.item()
         with torch.no_grad():
-            train_acc=(m(tx)[:,:c["p"]].argmax(-1)==ty).float().mean().item()
+            train_acc=(logits.detach()[:,:c["p"]].argmax(-1)==ty).float().mean().item()
         # Combined SAM + bilevel every sam_freq steps
         if step%sf==0:
             try: opt.sam_meta_step(m, tx, ty, vx, vy, crit_s15, mopt)
-            except Exception: pass
+            except Exception as e: warnings.warn(f"SuperGrok1.5 sam_meta_step failed at step {step}: {e}")
         kw={"train_loss":train_loss_val, "train_acc":train_acc}
         if step%c.get("supergrok15_alpha_update_freq",50)==0:
             with torch.no_grad():
