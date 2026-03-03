@@ -173,6 +173,13 @@ class SuperGrok15(Optimizer):
         else:
             self.meta_net = meta_net
 
+        # Auto-move meta-net to same device as parameters
+        try:
+            first_param = next(iter(self.param_groups[0]["params"]))
+            self.meta_net = self.meta_net.to(first_param.device)
+        except (StopIteration, IndexError):
+            pass  # no params yet, will be moved manually
+
         # Internal state
         self._global_step = 0
         self._cached_alpha = alpha_init
@@ -298,7 +305,12 @@ class SuperGrok15(Optimizer):
             for f in self._flat_layer_alphas
         ]
 
-        # Get hyperparams from first group
+        # Get hyperparams from first group (C++ path only supports single group)
+        if len(self.param_groups) > 1:
+            import warnings
+            warnings.warn("SuperGrok15 C++ path uses only the first param group's "
+                          "hyperparameters. Multiple param groups will be ignored.",
+                          RuntimeWarning, stacklevel=2)
         group = self.param_groups[0]
         lr = group["lr"]
         beta2 = group["betas"][1]
@@ -344,11 +356,15 @@ class SuperGrok15(Optimizer):
     def _python_step(self, grads, layer_alphas, lr, beta2, eps,
                      wd_eff, ramp, W1, b1, W2, b2, rescale):
         """Pure Python fallback when C++ extension is not available."""
-        # Gradient clipping
+        # Gradient clipping (manual norm computation on raw tensors)
         if self.gradient_clipping > 0:
             valid = [g for g in grads if g.numel() > 0]
             if valid:
-                torch.nn.utils.clip_grad_norm_(valid, self.gradient_clipping)
+                total_norm = torch.sqrt(sum(g.norm() ** 2 for g in valid))
+                clip_coef = self.gradient_clipping / (total_norm + 1e-6)
+                if clip_coef < 1.0:
+                    for g in valid:
+                        g.mul_(clip_coef)
 
         for i in range(self._num_params):
             g = grads[i]
