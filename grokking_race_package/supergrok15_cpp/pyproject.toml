@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "torch>=1.13.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "supergrok15_cpp"
+version = "1.5.0"
+description = "SuperGrok v1.5 C++/CUDA — fused kernels for sharpness-aware grokking"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.8"
+authors = [{name = "Peter C."}]
+dependencies = ["torch>=1.13.0"]
+
+[project.urls]
+Homepage = "https://github.com/peterc04/SuperGrok"
