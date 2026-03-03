@@ -583,3 +583,79 @@ class SuperGrok15(Optimizer):
                      f"wd_thresh={self.wd_thresh}")
         lines.append(")")
         return "\n".join(lines)
+
+    # ══════════════════════════════════════════════════════════════════
+    #  Drop-in API: step_full() — complete pipeline in one call
+    # ══════════════════════════════════════════════════════════════════
+
+    def step_full(
+        self,
+        model: nn.Module,
+        train_x: torch.Tensor,
+        train_y: torch.Tensor,
+        val_x: torch.Tensor,
+        val_y: torch.Tensor,
+        criterion: Optional[Callable] = None,
+    ) -> Dict[str, float]:
+        """Complete training step: forward + backward + SAM + meta-learning + optimizer.
+
+        This is the fully self-contained API. Call this instead of manually
+        orchestrating loss.backward(), sam_meta_step(), and step().
+
+        Usage:
+            opt = SuperGrok15(model.parameters(), lr=1e-3)
+            for batch_x, batch_y in dataloader:
+                metrics = opt.step_full(model, batch_x, batch_y, val_x, val_y)
+                print(f"loss={metrics['train_loss']:.4f}")
+
+        Returns a dict with: train_loss, train_acc, val_loss (when computed),
+        sam_loss (when SAM step runs).
+        """
+        if criterion is None:
+            criterion = nn.CrossEntropyLoss()
+
+        # Auto-create meta optimizer on first call
+        if not hasattr(self, '_auto_meta_opt'):
+            self._auto_meta_opt = torch.optim.Adam(
+                self.meta_net.parameters(), lr=1e-4)
+
+        # ── Forward + backward ────────────────────────────────────────
+        model.zero_grad()
+        logits = model(train_x)
+        loss = criterion(logits, train_y)
+        loss.backward()
+
+        train_loss_val = loss.item()
+        with torch.no_grad():
+            num_classes = logits.size(-1)
+            train_acc = (logits.detach().argmax(-1) == train_y).float().mean().item()
+
+        metrics = {"train_loss": train_loss_val, "train_acc": train_acc}
+
+        # ── SAM + bilevel (automatic scheduling) ──────────────────────
+        step_num = self._global_step + 1  # Will be incremented in step()
+        if step_num % self.sam_freq == 0:
+            try:
+                sam_loss, val_loss = self.sam_meta_step(
+                    model, train_x, train_y, val_x, val_y,
+                    criterion, self._auto_meta_opt)
+                metrics["sam_loss"] = sam_loss
+            except Exception:
+                pass  # SAM failure is non-fatal
+
+        # ── Optimizer step with signals ───────────────────────────────
+        kw: Dict[str, float] = {
+            "train_loss": train_loss_val,
+            "train_acc": train_acc,
+        }
+        alpha_freq = self.alpha_update_freq
+        if step_num % alpha_freq == 0:
+            with torch.no_grad():
+                val_logits = model(val_x)
+                val_loss_val = criterion(val_logits, val_y).item()
+            kw["val_loss"] = val_loss_val
+            metrics["val_loss"] = val_loss_val
+
+        self.step(**kw)
+
+        return metrics
