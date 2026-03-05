@@ -9,6 +9,13 @@ The meta-net lives in Python (as an nn.Module) for bilevel backward
 compatibility.  During step(), its weights are extracted as flat tensors
 and passed to the fused CUDA kernel which evaluates the 2→H→1 MLP
 per-element in parallel without reshape/matmul overhead.
+
+Key v1.5 optimizations:
+  - Sigmoid gating (metric-driven, replaces cosine similarity gating)
+  - Adaptive SAM frequency (sigmoid-driven, based on training accuracy)
+  - Decoupled SAM and bilevel optimization (independent schedules)
+  - Progressive weight decay (sigmoid-driven)
+  - All dynamics are fully configurable via sigmoid parameters
 """
 
 import math
@@ -85,11 +92,15 @@ class SharpnessMetaNet(nn.Module):
 class SuperGrok15(Optimizer):
     r"""SuperGrok v1.5 — C++/CUDA Accelerated Grokking Optimizer.
 
-    Identical semantics to the pure-Python version but with:
+    Features:
       - Fused CUDA kernel for meta-net inference (per-element MLP)
       - Fused CUDA kernel for Adam + progressive weight decay
       - C++ parameter loop (no Python for-loop overhead)
       - C++ SAM perturbation + sharpness computation
+      - Sigmoid gating (metric-driven, based on training accuracy)
+      - Adaptive SAM frequency (sigmoid-driven schedule)
+      - Decoupled SAM and bilevel optimization (independent schedules)
+      - Progressive weight decay (sigmoid-driven)
 
     Falls back to pure Python if C++ extension is not built.
     """
@@ -112,11 +123,23 @@ class SuperGrok15(Optimizer):
         meta_net: Optional[nn.Module] = None,
         meta_hidden_dim: int = 32,
         alpha_update_freq: int = 100,
-        gate_temperature: float = 5.0,
         zero_loss_threshold: float = 1e-4,
         zero_acc_threshold: float = 0.995,
         sam_rho: float = 0.05,
-        sam_freq: int = 5,
+        # ── Sigmoid gating (replaces cosine gating) ──────────────────
+        gate_scale: float = 20.0,
+        gate_thresh: float = 0.8,
+        # ── Adaptive SAM frequency (sigmoid-driven) ──────────────────
+        sam_freq_min: int = 3,
+        sam_freq_max: int = 20,
+        sam_scale: float = 20.0,
+        sam_thresh: float = 0.85,
+        # ── Decoupled bilevel optimization ────────────────────────────
+        bilevel_freq_min: int = 5,
+        bilevel_freq_max: int = 30,
+        bilevel_scale: float = 20.0,
+        bilevel_thresh: float = 0.9,
+        # ── Progressive weight decay ─────────────────────────────────
         wd_ramp: float = 4.0,
         wd_scale: float = 20.0,
         wd_thresh: float = 0.9,
@@ -135,12 +158,16 @@ class SuperGrok15(Optimizer):
             raise ValueError(f"Invalid weight_decay: {weight_decay}")
         if lamb < 0.0:
             raise ValueError(f"Invalid lamb: {lamb}")
-        if gate_temperature <= 0.0:
-            raise ValueError(f"Invalid gate_temperature: {gate_temperature}")
         if sam_rho < 0.0:
             raise ValueError(f"Invalid sam_rho: {sam_rho}")
-        if sam_freq < 1:
-            raise ValueError(f"Invalid sam_freq: {sam_freq}")
+        if sam_freq_min < 1:
+            raise ValueError(f"Invalid sam_freq_min: {sam_freq_min}")
+        if sam_freq_max < sam_freq_min:
+            raise ValueError(f"sam_freq_max ({sam_freq_max}) must be >= sam_freq_min ({sam_freq_min})")
+        if bilevel_freq_min < 1:
+            raise ValueError(f"Invalid bilevel_freq_min: {bilevel_freq_min}")
+        if bilevel_freq_max < bilevel_freq_min:
+            raise ValueError(f"bilevel_freq_max ({bilevel_freq_max}) must be >= bilevel_freq_min ({bilevel_freq_min})")
         if wd_ramp < 0.0:
             raise ValueError(f"Invalid wd_ramp: {wd_ramp}")
 
@@ -157,15 +184,31 @@ class SuperGrok15(Optimizer):
         self.warmup_ramp = max(1, warmup_ramp)
         self.gradient_clipping = gradient_clipping
         self.alpha_update_freq = alpha_update_freq
-        self.gate_temperature = gate_temperature
         self.zero_loss_threshold = zero_loss_threshold
         self.zero_acc_threshold = zero_acc_threshold
         self.sam_rho = sam_rho
-        self.sam_freq = sam_freq
+        self.meta_hidden_dim = meta_hidden_dim
+
+        # Sigmoid gating
+        self.gate_scale = gate_scale
+        self.gate_thresh = gate_thresh
+
+        # Adaptive SAM frequency
+        self.sam_freq_min = sam_freq_min
+        self.sam_freq_max = sam_freq_max
+        self.sam_scale = sam_scale
+        self.sam_thresh = sam_thresh
+
+        # Decoupled bilevel
+        self.bilevel_freq_min = bilevel_freq_min
+        self.bilevel_freq_max = bilevel_freq_max
+        self.bilevel_scale = bilevel_scale
+        self.bilevel_thresh = bilevel_thresh
+
+        # Progressive weight decay
         self.wd_ramp = wd_ramp
         self.wd_scale = wd_scale
         self.wd_thresh = wd_thresh
-        self.meta_hidden_dim = meta_hidden_dim
 
         # Meta-net (Python module for bilevel backward)
         if meta_net is None:
@@ -184,6 +227,7 @@ class SuperGrok15(Optimizer):
         self._global_step = 0
         self._cached_alpha = alpha_init
         self._cached_train_acc = 0.0
+        self._sam_call_count = 0
 
         # Build flat parameter lists for C++ (avoids dict lookups per step)
         self._flat_params = []
@@ -206,10 +250,10 @@ class SuperGrok15(Optimizer):
             for p in group["params"]:
                 self._flat_params.append(p)
                 self._flat_steps.append(0)
-                # Layer-wise β₁
+                # Layer-wise beta1
                 lb1 = beta1 * ((1.0 - gamma) ** idx)
                 self._flat_layer_beta1s.append(lb1)
-                # Layer-wise α (computed at step time, placeholder)
+                # Layer-wise alpha (computed at step time, placeholder)
                 if gamma_alpha == 0.0:
                     la_factor = 1.0
                 else:
@@ -235,8 +279,12 @@ class SuperGrok15(Optimizer):
         self._state_initialized = True
 
     # ══════════════════════════════════════════════════════════════════
-    #  Alpha / ramp / progressive wd computation
+    #  Sigmoid-driven dynamics (all use the same pattern as weight decay)
     # ══════════════════════════════════════════════════════════════════
+
+    def _sigmoid(self, scale, value, thresh):
+        """Compute sigmoid: 1 / (1 + exp(-scale * (value - thresh)))"""
+        return 1.0 / (1.0 + math.exp(-scale * (value - thresh)))
 
     def _update_alpha(self, train_loss, val_loss, train_acc):
         if train_loss is None and train_acc is None:
@@ -262,8 +310,27 @@ class SuperGrok15(Optimizer):
 
     def _get_effective_wd(self, base_wd):
         acc = self._cached_train_acc
-        sigmoid_val = 1.0 / (1.0 + math.exp(-self.wd_scale * (acc - self.wd_thresh)))
+        sigmoid_val = self._sigmoid(self.wd_scale, acc, self.wd_thresh)
         return base_wd * (1.0 + self.wd_ramp * sigmoid_val)
+
+    def _get_gate_signal(self):
+        """Sigmoid gating based on training accuracy (replaces cosine similarity gating)."""
+        acc = self._cached_train_acc
+        return self._sigmoid(self.gate_scale, acc, self.gate_thresh)
+
+    def _get_effective_sam_freq(self):
+        """Sigmoid-driven SAM frequency. More SAM during transition, less early/late."""
+        acc = self._cached_train_acc
+        sam_heat = self._sigmoid(self.sam_scale, acc, self.sam_thresh)
+        freq = self.sam_freq_max - (self.sam_freq_max - self.sam_freq_min) * sam_heat
+        return max(1, round(freq))
+
+    def _get_effective_bilevel_freq(self):
+        """Sigmoid-driven bilevel frequency. Independent of SAM schedule."""
+        acc = self._cached_train_acc
+        bilevel_heat = self._sigmoid(self.bilevel_scale, acc, self.bilevel_thresh)
+        freq = self.bilevel_freq_max - (self.bilevel_freq_max - self.bilevel_freq_min) * bilevel_heat
+        return max(1, round(freq))
 
     # ══════════════════════════════════════════════════════════════════
     #  Main optimizer step
@@ -318,6 +385,9 @@ class SuperGrok15(Optimizer):
         base_wd = group["weight_decay"]
         wd_eff = self._get_effective_wd(base_wd)
 
+        # Sigmoid gate signal (computed once, not per-parameter)
+        gate_signal = self._get_gate_signal()
+
         # Collect gradients (handle missing)
         grads = []
         for p in self._flat_params:
@@ -343,18 +413,20 @@ class SuperGrok15(Optimizer):
                 self._flat_layer_beta1s,
                 W1, b1, W2, b2, rescale, self.meta_hidden_dim,
                 beta2, lr, wd_eff, eps,
-                self.lamb, ramp, self.gate_temperature,
+                self.lamb, ramp, gate_signal,
                 self.gradient_clipping,
             )
         else:
             # ── Pure Python fallback ──────────────────────────────────
             self._python_step(grads, layer_alphas, lr, beta2, eps,
-                              wd_eff, ramp, W1, b1, W2, b2, rescale)
+                              wd_eff, ramp, gate_signal,
+                              W1, b1, W2, b2, rescale)
 
         return loss
 
     def _python_step(self, grads, layer_alphas, lr, beta2, eps,
-                     wd_eff, ramp, W1, b1, W2, b2, rescale):
+                     wd_eff, ramp, gate_signal,
+                     W1, b1, W2, b2, rescale):
         """Pure Python fallback when C++ extension is not available."""
         # Gradient clipping (manual norm computation on raw tensors)
         if self.gradient_clipping > 0:
@@ -365,6 +437,9 @@ class SuperGrok15(Optimizer):
                 if clip_coef < 1.0:
                     for g in valid:
                         g.mul_(clip_coef)
+
+        # Compute lamb_eff once (sigmoid gating — no per-param computation)
+        lamb_eff = ramp * gate_signal * self.lamb if ramp > 0 else 0.0
 
         for i in range(self._num_params):
             g = grads[i]
@@ -387,16 +462,7 @@ class SuperGrok15(Optimizer):
             # Meta-net
             smart_grad = self.meta_net(g, sharp)
 
-            # Gating
-            lamb_eff = 0.0
-            if ramp > 0 and mu.norm() > 1e-12 and smart_grad.norm() > 1e-12:
-                cos_sim = F.cosine_similarity(
-                    smart_grad.flatten().unsqueeze(0),
-                    mu.flatten().unsqueeze(0),
-                ).item()
-                gate = 1.0 / (1.0 + math.exp(-self.gate_temperature * cos_sim))
-                lamb_eff = ramp * gate * self.lamb
-
+            # Final gradient = smart_grad + lambda * mu
             fg = smart_grad + lamb_eff * mu
             ea.mul_(beta1).add_(fg, alpha=1.0 - beta1)
             easq.mul_(beta2).addcmul_(fg, fg, value=1.0 - beta2)
@@ -410,23 +476,23 @@ class SuperGrok15(Optimizer):
             p.data.addcdiv_(ea, denom, value=-step_size)
 
     # ══════════════════════════════════════════════════════════════════
-    #  LookSAM + Bilevel Meta-Step
+    #  Decoupled SAM + Bilevel
     # ══════════════════════════════════════════════════════════════════
 
-    def sam_meta_step(
+    def sam_step(
         self,
         model: nn.Module,
         train_x: torch.Tensor,
         train_y: torch.Tensor,
-        val_x: torch.Tensor,
-        val_y: torch.Tensor,
         criterion: Callable,
-        meta_optimizer: Optimizer,
-    ) -> Tuple[float, float]:
-        """Combined LookSAM perturbation + bilevel meta-net update.
+    ) -> float:
+        """SAM perturbation + sharpness computation ONLY. No bilevel.
 
-        SAM perturbation and sharpness computation use C++/CUDA.
-        Bilevel backward uses Python autograd (required for meta-net training).
+        Perturbs parameters in the sharpness-ascent direction, computes
+        sharpness signal |sam_grad - normal_grad|, then restores parameters.
+        The cached sharpness is used by the meta-net during step().
+
+        Returns sam_loss value.
         """
         self._ensure_state()
 
@@ -437,7 +503,7 @@ class SuperGrok15(Optimizer):
                 train_grads[name] = p.grad.detach().clone()
 
         if not train_grads:
-            return 0.0, 0.0
+            return 0.0
 
         # Build flat grad list for C++ SAM
         flat_grads_for_sam = []
@@ -483,13 +549,11 @@ class SuperGrok15(Optimizer):
 
         # ── Step 3: Compute sharpness + restore (C++ or Python) ───────
         if _HAS_CPP:
-            # Build sharpness tensors for params we track
             sharpness_out = [torch.zeros_like(p.data) for _, p in named_params]
             _ops.sharpness_restore_all(
                 flat_params_for_sam, sharpness_out, backups,
                 sam_grads, flat_grads_for_sam
             )
-            # Map sharpness to optimizer's cache by param id
             for i, (name, p) in enumerate(named_params):
                 pidx = self._param_to_idx.get(id(p))
                 if pidx is not None and sharpness_out[i].numel() > 0:
@@ -503,13 +567,48 @@ class SuperGrok15(Optimizer):
                     if pidx is not None:
                         self._flat_sharpness[pidx] = d
 
-        # ── Step 4: Bilevel — train meta-net (Python autograd) ────────
-        smart_grads = {}
+        # Restore training gradients
         for name, p in named_params:
             if name in train_grads:
+                p.grad = train_grads[name]
+            else:
+                p.grad = None
+
+        return sam_loss_val
+
+    def bilevel_step(
+        self,
+        model: nn.Module,
+        train_x: torch.Tensor,
+        train_y: torch.Tensor,
+        val_x: torch.Tensor,
+        val_y: torch.Tensor,
+        criterion: Callable,
+        meta_optimizer: Optimizer,
+    ) -> float:
+        """Bilevel meta-net training ONLY. Uses cached sharpness.
+
+        Computes smart gradients via meta-net, then aligns them with
+        validation gradient direction to train the meta-net.
+
+        Returns val_loss value.
+        """
+        self._ensure_state()
+        named_params = list(model.named_parameters())
+
+        # Save current gradients
+        saved_grads = {}
+        for name, p in named_params:
+            if p.grad is not None:
+                saved_grads[name] = p.grad.detach().clone()
+
+        # Compute smart gradients using cached sharpness
+        smart_grads = {}
+        for name, p in named_params:
+            if name in saved_grads:
                 pidx = self._param_to_idx.get(id(p))
                 sharp = self._flat_sharpness[pidx] if pidx is not None else torch.zeros_like(p.data)
-                smart_grads[name] = self.meta_net(train_grads[name], sharp)
+                smart_grads[name] = self.meta_net(saved_grads[name], sharp)
 
         # Validation gradients
         model.zero_grad()
@@ -517,7 +616,7 @@ class SuperGrok15(Optimizer):
             val_loss = criterion(model(val_x), val_y)
             val_loss.backward()
 
-        # Meta-loss = −⟨smart_grad, val_grad_unit⟩
+        # Meta-loss = -<smart_grad, val_grad_unit>
         meta_optimizer.zero_grad()
         device = val_x.device
         meta_loss = torch.tensor(0.0, device=device)
@@ -531,14 +630,33 @@ class SuperGrok15(Optimizer):
         meta_loss.backward()
         meta_optimizer.step()
 
-        # ── Step 5: Restore training gradients ────────────────────────
+        # Restore saved gradients
         for name, p in named_params:
-            if name in train_grads:
-                p.grad = train_grads[name]
+            if name in saved_grads:
+                p.grad = saved_grads[name]
             else:
                 p.grad = None
 
-        return sam_loss_val, val_loss.item()
+        return val_loss.item()
+
+    def sam_meta_step(
+        self,
+        model: nn.Module,
+        train_x: torch.Tensor,
+        train_y: torch.Tensor,
+        val_x: torch.Tensor,
+        val_y: torch.Tensor,
+        criterion: Callable,
+        meta_optimizer: Optimizer,
+    ) -> Tuple[float, float]:
+        """Combined SAM + bilevel (backward-compatible API).
+
+        Calls sam_step() then bilevel_step() sequentially.
+        """
+        sam_loss_val = self.sam_step(model, train_x, train_y, criterion)
+        val_loss_val = self.bilevel_step(
+            model, train_x, train_y, val_x, val_y, criterion, meta_optimizer)
+        return sam_loss_val, val_loss_val
 
     # ══════════════════════════════════════════════════════════════════
     #  Inspection helpers
@@ -564,6 +682,9 @@ class SuperGrok15(Optimizer):
             "cached_train_acc": self._cached_train_acc,
             "ramp_factor": self._get_ramp_factor(),
             "effective_wd": self.get_effective_wd(),
+            "gate_signal": self._get_gate_signal(),
+            "effective_sam_freq": self._get_effective_sam_freq(),
+            "effective_bilevel_freq": self._get_effective_bilevel_freq(),
             "avg_mu_norm": sum(mu_norms) / max(len(mu_norms), 1),
             "avg_sharpness_norm": sum(sharp_norms) / max(len(sharp_norms), 1),
             "sharpness_cached": any(s.norm().item() > 0 for s in self._flat_sharpness) if self._state_initialized else False,
@@ -578,9 +699,13 @@ class SuperGrok15(Optimizer):
                          f"eps={group['eps']}, wd={group['weight_decay']}")
         lines.append(f"  alpha_init={self.alpha_init}, lamb={self.lamb}, "
                      f"gamma={self.gamma}")
-        lines.append(f"  sam_rho={self.sam_rho}, sam_freq={self.sam_freq}")
-        lines.append(f"  wd_ramp={self.wd_ramp}, wd_scale={self.wd_scale}, "
-                     f"wd_thresh={self.wd_thresh}")
+        lines.append(f"  gate: scale={self.gate_scale}, thresh={self.gate_thresh}")
+        lines.append(f"  sam: rho={self.sam_rho}, freq=[{self.sam_freq_min},{self.sam_freq_max}], "
+                     f"scale={self.sam_scale}, thresh={self.sam_thresh}")
+        lines.append(f"  bilevel: freq=[{self.bilevel_freq_min},{self.bilevel_freq_max}], "
+                     f"scale={self.bilevel_scale}, thresh={self.bilevel_thresh}")
+        lines.append(f"  wd: ramp={self.wd_ramp}, scale={self.wd_scale}, "
+                     f"thresh={self.wd_thresh}")
         lines.append(")")
         return "\n".join(lines)
 
@@ -600,7 +725,10 @@ class SuperGrok15(Optimizer):
         """Complete training step: forward + backward + SAM + meta-learning + optimizer.
 
         This is the fully self-contained API. Call this instead of manually
-        orchestrating loss.backward(), sam_meta_step(), and step().
+        orchestrating loss.backward(), sam_step(), bilevel_step(), and step().
+
+        SAM and bilevel frequencies are automatically managed via sigmoid schedules.
+        Metrics are only computed when needed (deferred .item() calls).
 
         Usage:
             opt = SuperGrok15(model.parameters(), lr=1e-3)
@@ -608,8 +736,8 @@ class SuperGrok15(Optimizer):
                 metrics = opt.step_full(model, batch_x, batch_y, val_x, val_y)
                 print(f"loss={metrics['train_loss']:.4f}")
 
-        Returns a dict with: train_loss, train_acc, val_loss (when computed),
-        sam_loss (when SAM step runs).
+        Returns a dict with: train_loss, train_acc (when computed),
+        val_loss (when computed), sam_loss (when SAM step runs).
         """
         if criterion is None:
             criterion = nn.CrossEntropyLoss()
@@ -625,36 +753,49 @@ class SuperGrok15(Optimizer):
         loss = criterion(logits, train_y)
         loss.backward()
 
-        train_loss_val = loss.item()
-        with torch.no_grad():
-            num_classes = logits.size(-1)
-            train_acc = (logits.detach().argmax(-1) == train_y).float().mean().item()
-
-        metrics = {"train_loss": train_loss_val, "train_acc": train_acc}
-
-        # ── SAM + bilevel (automatic scheduling) ──────────────────────
+        metrics: Dict[str, float] = {}
         step_num = self._global_step + 1  # Will be incremented in step()
-        if step_num % self.sam_freq == 0:
+
+        # ── Adaptive SAM (sigmoid-driven frequency) ───────────────────
+        sam_freq_eff = self._get_effective_sam_freq()
+        if step_num % sam_freq_eff == 0:
             try:
-                sam_loss, val_loss = self.sam_meta_step(
-                    model, train_x, train_y, val_x, val_y,
-                    criterion, self._auto_meta_opt)
+                sam_loss = self.sam_step(model, train_x, train_y, criterion)
                 metrics["sam_loss"] = sam_loss
             except Exception:
-                pass  # SAM failure is non-fatal
+                pass
 
-        # ── Optimizer step with signals ───────────────────────────────
-        kw: Dict[str, float] = {
-            "train_loss": train_loss_val,
-            "train_acc": train_acc,
-        }
+        # ── Adaptive bilevel (independent sigmoid-driven frequency) ───
+        bilevel_freq_eff = self._get_effective_bilevel_freq()
+        if step_num % bilevel_freq_eff == 0:
+            try:
+                val_loss = self.bilevel_step(
+                    model, train_x, train_y, val_x, val_y,
+                    criterion, self._auto_meta_opt)
+                metrics["val_loss"] = val_loss
+            except Exception:
+                pass
+
+        # ── Deferred metrics (only compute .item() when needed) ───────
+        kw: Dict[str, float] = {}
         alpha_freq = self.alpha_update_freq
-        if step_num % alpha_freq == 0:
+        needs_metrics = (step_num % alpha_freq == 0) or step_num == 1
+        if needs_metrics:
             with torch.no_grad():
-                val_logits = model(val_x)
-                val_loss_val = criterion(val_logits, val_y).item()
-            kw["val_loss"] = val_loss_val
-            metrics["val_loss"] = val_loss_val
+                train_loss_val = loss.item()
+                train_acc = (logits.detach().argmax(-1) == train_y).float().mean().item()
+            kw["train_loss"] = train_loss_val
+            kw["train_acc"] = train_acc
+            metrics["train_loss"] = train_loss_val
+            metrics["train_acc"] = train_acc
+
+            if step_num % alpha_freq == 0:
+                with torch.no_grad():
+                    val_logits = model(val_x)
+                    val_loss_val = criterion(val_logits, val_y).item()
+                kw["val_loss"] = val_loss_val
+                if "val_loss" not in metrics:
+                    metrics["val_loss"] = val_loss_val
 
         self.step(**kw)
 

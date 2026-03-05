@@ -1,29 +1,29 @@
 """
-SuperGrok v1.5 — Low-Data Grokking Optimizer
+SuperGrok v1.5 — Low-Data Grokking Optimizer (Pure Python)
 
-Builds on v1.1 with three modifications targeting the low-data regime
-(ft10/ft25) where grokking fails because the memorization→generalization
+Builds on v1.1 with optimizations targeting the low-data regime
+(ft10/ft25) where grokking fails because the memorization->generalization
 signal is too weak for temporal filtering alone.
 
-Changes from v1.1:
+Key features:
   1. 2D SharpnessMetaNet: input is (gradient, sharpness_signal) per element.
      The sharpness signal tells the meta-net which gradient components sit
-     in sharp basins (memorization) vs flat basins (generalization), giving
-     it a direct structural signal instead of relying on temporal patterns.
+     in sharp basins (memorization) vs flat basins (generalization).
 
-  2. LookSAM integration: every k steps, compute SAM perturbation to get
-     the sharpness direction, cache it for the k−1 intermediate steps.
-     Synced with meta_step cadence to amortize overhead.
+  2. LookSAM integration: adaptive SAM frequency (sigmoid-driven) to
+     compute sharpness directions when they matter most.
 
-  3. Progressive weight decay: gentle during feature learning, aggressive
-     after memorization.  wd_eff = wd · (1 + wd_ramp · σ(s · (acc − θ))).
+  3. Decoupled SAM and bilevel optimization: independent sigmoid-driven
+     schedules for SAM perturbation and meta-net training.
 
-Inherits from v1.1:
-  - Decoupled Memory (Rule 1): mu tracks raw gradients only
-  - Soft Sigmoid Gating (Rule 2): smooth amplification control
-  - Memorization Fix (Rule 3): adaptive alpha via train_acc / train_loss
-  - Layer-wise β₁ and α decay
-  - Smooth warmup ramp
+  4. Sigmoid gating: metric-driven gate (based on training accuracy)
+     replaces cosine similarity gating for faster computation.
+
+  5. Progressive weight decay: gentle during feature learning, aggressive
+     after memorization. wd_eff = wd * (1 + wd_ramp * sigmoid(s * (acc - th))).
+
+All dynamic schedules use the same sigmoid pattern, making them
+fully configurable via (scale, threshold, min, max) parameters.
 """
 
 import math
@@ -35,29 +35,19 @@ from typing import Optional, Callable, Dict, Any, Tuple
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  2D Sharpness-Aware Meta-Net  (v1.5 NEW)
+#  2D Sharpness-Aware Meta-Net
 # ═══════════════════════════════════════════════════════════════════════
 
 class SharpnessMetaNet(nn.Module):
     """Element-wise gradient transformation conditioned on sharpness.
 
-    Takes two signals per element:
-      - ``grad``:  the raw gradient value
-      - ``sharp``: the sharpness signal (magnitude of gradient change
-        under SAM perturbation)
-
     Architecture::
 
-        correction = rescale · MLP([grad, sharp])
+        correction = rescale * MLP([grad, sharp])
         output     = grad + correction
 
-    The skip connection over the raw gradient means the network starts
-    as identity (``rescale`` initialised to 0) and learns a *correction*
-    informed by landscape geometry.
-
-    The 2D input space has clean geometry:
-      - High sharpness + large grad → memorization → suppress
-      - Low sharpness  + large grad → generalization → amplify
+    The skip connection means the network starts as identity (rescale=0)
+    and learns a correction informed by landscape geometry.
     """
 
     def __init__(self, hidden_dim: int = 32):
@@ -67,10 +57,7 @@ class SharpnessMetaNet(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
-        # Start at 0 so skip connection dominates → near-identity
         self.rescale = nn.Parameter(torch.zeros(1))
-
-        # Small random init
         with torch.no_grad():
             self.net[0].weight.normal_(0, 0.01)
             self.net[0].bias.zero_()
@@ -78,92 +65,68 @@ class SharpnessMetaNet(nn.Module):
             self.net[2].bias.zero_()
 
     def forward(self, grad: torch.Tensor, sharpness: torch.Tensor) -> torch.Tensor:
-        """Transform gradient using sharpness context.
-
-        Args:
-            grad: Raw gradient tensor of any shape.
-            sharpness: Sharpness signal, same shape as grad.
-                Typically ``|sam_grad − normal_grad|`` per element.
-
-        Returns:
-            Transformed gradient, same shape as input.
-        """
         if grad.numel() == 0:
             return grad
         shape = grad.shape
-        # Stack into (N, 2) input
         flat_g = grad.reshape(-1, 1)
         flat_s = sharpness.reshape(-1, 1)
-        inp = torch.cat([flat_g, flat_s], dim=1)  # (N, 2)
-        correction = self.rescale * self.net(inp)   # (N, 1)
+        inp = torch.cat([flat_g, flat_s], dim=1)
+        correction = self.rescale * self.net(inp)
         out = flat_g + correction
         return out.reshape(shape)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  SuperGrok v1.5 Optimizer
+#  SuperGrok v1.5 Optimizer (Pure Python)
 # ═══════════════════════════════════════════════════════════════════════
 
 class SuperGrok15(Optimizer):
     r"""SuperGrok v1.5 — Sharpness-Aware Grokking Optimizer.
 
-    Extends v1.1 with LookSAM-based sharpness signals, a 2D meta-net,
-    and progressive weight decay for improved low-data grokking.
+    Features:
+      - Sigmoid gating (metric-driven, based on training accuracy)
+      - Adaptive SAM frequency (sigmoid-driven schedule)
+      - Decoupled SAM and bilevel optimization (independent schedules)
+      - 2D meta-net with sharpness signal
+      - Progressive weight decay (sigmoid-driven)
+      - Layer-wise beta1 and alpha decay
 
-    **New in v1.5:**
-
-    **LookSAM Integration**
-        Every ``sam_freq`` steps, compute the SAM perturbation to find
-        the worst-case gradient direction.  Cache the *sharpness direction*
-        ``d = sam_grad − normal_grad`` for use in intermediate steps.
-        On intermediate steps, the cached ``d`` provides the sharpness
-        signal to the meta-net at negligible cost.
-
-    **2D Meta-Net**
-        The meta-net receives ``(gradient, |cached_d|)`` per element.
-        The sharpness channel gives it a direct structural signal about
-        whether each gradient component sits in a sharp basin
-        (memorization) or flat basin (generalization).
-
-    **Progressive Weight Decay**
-        Weight decay ramps up after memorization is detected:
-
-            wd_eff = wd · (1 + wd_ramp · sigmoid(wd_scale · (acc − wd_thresh)))
-
-        Below the accuracy threshold, decay stays near ``wd``.
-        Above it, decay ramps up to ``wd · (1 + wd_ramp)``.
+    All sigmoid-driven dynamics use the pattern:
+        heat = sigmoid(scale * (metric - threshold))
+        effective_value = max_val - (max_val - min_val) * heat
 
     Args:
         params: Model parameters.
-        lr (float): Learning rate.  Default: ``1e-3``.
-        betas (tuple): Adam momentum coefficients.  Default: ``(0.9, 0.999)``.
-        eps (float): Numerical stability.  Default: ``1e-8``.
-        weight_decay (float): Base weight decay.  Default: ``1.0``.
-        alpha_init (float): EMA momentum for Grokfast buffer.
-            Default: ``0.98``.
-        lamb (float): Peak amplification factor.  Default: ``2.0``.
-        gamma (float): Layer-wise β₁ decay.  Default: ``0.1``.
-        gamma_alpha (float): Layer-wise α decay.  Default: ``0.0``.
-        kappa (float): Grokking signal decay rate.  Default: ``0.1``.
-        warmup_steps (int): Steps before amplification.  Default: ``100``.
-        warmup_ramp (int): Ramp length after warmup.  Default: ``100``.
-        gradient_clipping (float): Max gradient norm.  Default: ``1.0``.
-        meta_net (nn.Module | None): Custom meta-net.  Default: auto-created.
-        meta_hidden_dim (int): Hidden dim for auto meta-net.  Default: ``32``.
-        alpha_update_freq (int): Steps between alpha updates.  Default: ``100``.
-        gate_temperature (float): Sigmoid gate temperature.  Default: ``5.0``.
-        zero_loss_threshold (float): Memorization loss threshold.
-            Default: ``1e-4``.
-        zero_acc_threshold (float): Memorization accuracy threshold.
-            Default: ``0.995``.
-        sam_rho (float): SAM perturbation radius.  Default: ``0.05``.
-        sam_freq (int): Steps between SAM computations.  Default: ``5``.
-        wd_ramp (float): Max weight decay multiplier above base.
-            wd_eff ranges from wd to wd·(1+wd_ramp).  Default: ``4.0``.
-        wd_scale (float): Sigmoid steepness for progressive wd.
-            Default: ``20.0``.
-        wd_thresh (float): Accuracy threshold for wd ramp onset.
-            Default: ``0.9``.
+        lr: Learning rate. Default: 1e-3.
+        betas: Adam momentum coefficients. Default: (0.9, 0.999).
+        eps: Numerical stability. Default: 1e-8.
+        weight_decay: Base weight decay. Default: 1.0.
+        alpha_init: EMA momentum for memory buffer. Default: 0.98.
+        lamb: Peak amplification factor. Default: 2.0.
+        gamma: Layer-wise beta1 decay. Default: 0.1.
+        gamma_alpha: Layer-wise alpha decay. Default: 0.0.
+        kappa: Grokking signal decay rate. Default: 0.1.
+        warmup_steps: Steps before amplification. Default: 100.
+        warmup_ramp: Ramp length after warmup. Default: 100.
+        gradient_clipping: Max gradient norm. Default: 1.0.
+        meta_hidden_dim: Hidden dim for meta-net. Default: 32.
+        alpha_update_freq: Steps between alpha updates. Default: 100.
+        zero_loss_threshold: Memorization loss threshold. Default: 1e-4.
+        zero_acc_threshold: Memorization accuracy threshold. Default: 0.995.
+        sam_rho: SAM perturbation radius. Default: 0.05.
+        gate_scale: Sigmoid steepness for gating. Default: 20.0.
+        gate_thresh: Accuracy threshold for gate activation. Default: 0.8.
+        sam_freq_min: Most aggressive SAM frequency. Default: 3.
+        sam_freq_max: Laziest SAM frequency. Default: 20.
+        sam_scale: Sigmoid steepness for SAM schedule. Default: 20.0.
+        sam_thresh: Accuracy threshold for SAM activation. Default: 0.85.
+        bilevel_freq_min: Most aggressive bilevel frequency. Default: 5.
+        bilevel_freq_max: Laziest bilevel frequency. Default: 30.
+        bilevel_scale: Sigmoid steepness for bilevel schedule. Default: 20.0.
+        bilevel_thresh: Accuracy threshold for bilevel activation. Default: 0.9.
+        wd_ramp: Max weight decay multiplier above base. Default: 4.0.
+        wd_scale: Sigmoid steepness for progressive wd. Default: 20.0.
+        wd_thresh: Accuracy threshold for wd ramp onset. Default: 0.9.
     """
 
     def __init__(
@@ -184,17 +147,27 @@ class SuperGrok15(Optimizer):
         meta_net: Optional[nn.Module] = None,
         meta_hidden_dim: int = 32,
         alpha_update_freq: int = 100,
-        gate_temperature: float = 5.0,
         zero_loss_threshold: float = 1e-4,
         zero_acc_threshold: float = 0.995,
-        # v1.5 new params
         sam_rho: float = 0.05,
-        sam_freq: int = 5,
+        # ── Sigmoid gating (replaces cosine gating) ──────────────────
+        gate_scale: float = 20.0,
+        gate_thresh: float = 0.8,
+        # ── Adaptive SAM frequency (sigmoid-driven) ──────────────────
+        sam_freq_min: int = 3,
+        sam_freq_max: int = 20,
+        sam_scale: float = 20.0,
+        sam_thresh: float = 0.85,
+        # ── Decoupled bilevel optimization ────────────────────────────
+        bilevel_freq_min: int = 5,
+        bilevel_freq_max: int = 30,
+        bilevel_scale: float = 20.0,
+        bilevel_thresh: float = 0.9,
+        # ── Progressive weight decay ─────────────────────────────────
         wd_ramp: float = 4.0,
         wd_scale: float = 20.0,
         wd_thresh: float = 0.9,
     ):
-        # ── Validation ────────────────────────────────────────────────
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not (0.0 <= alpha_init <= 1.0):
@@ -209,19 +182,23 @@ class SuperGrok15(Optimizer):
             raise ValueError(f"Invalid weight_decay: {weight_decay}")
         if lamb < 0.0:
             raise ValueError(f"Invalid lamb: {lamb}")
-        if gate_temperature <= 0.0:
-            raise ValueError(f"Invalid gate_temperature: {gate_temperature}")
         if sam_rho < 0.0:
             raise ValueError(f"Invalid sam_rho: {sam_rho}")
-        if sam_freq < 1:
-            raise ValueError(f"Invalid sam_freq: {sam_freq}")
+        if sam_freq_min < 1:
+            raise ValueError(f"Invalid sam_freq_min: {sam_freq_min}")
+        if sam_freq_max < sam_freq_min:
+            raise ValueError(f"sam_freq_max ({sam_freq_max}) must be >= sam_freq_min ({sam_freq_min})")
+        if bilevel_freq_min < 1:
+            raise ValueError(f"Invalid bilevel_freq_min: {bilevel_freq_min}")
+        if bilevel_freq_max < bilevel_freq_min:
+            raise ValueError(f"bilevel_freq_max ({bilevel_freq_max}) must be >= bilevel_freq_min ({bilevel_freq_min})")
         if wd_ramp < 0.0:
             raise ValueError(f"Invalid wd_ramp: {wd_ramp}")
 
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
-        # ── v1.1 hyperparameters ──────────────────────────────────────
+        # Core hyperparameters
         self.alpha_init = alpha_init
         self.lamb = lamb
         self.gamma = gamma
@@ -231,18 +208,32 @@ class SuperGrok15(Optimizer):
         self.warmup_ramp = max(1, warmup_ramp)
         self.gradient_clipping = gradient_clipping
         self.alpha_update_freq = alpha_update_freq
-        self.gate_temperature = gate_temperature
         self.zero_loss_threshold = zero_loss_threshold
         self.zero_acc_threshold = zero_acc_threshold
-
-        # ── v1.5 hyperparameters ──────────────────────────────────────
         self.sam_rho = sam_rho
-        self.sam_freq = sam_freq
+
+        # Sigmoid gating
+        self.gate_scale = gate_scale
+        self.gate_thresh = gate_thresh
+
+        # Adaptive SAM frequency
+        self.sam_freq_min = sam_freq_min
+        self.sam_freq_max = sam_freq_max
+        self.sam_scale = sam_scale
+        self.sam_thresh = sam_thresh
+
+        # Decoupled bilevel
+        self.bilevel_freq_min = bilevel_freq_min
+        self.bilevel_freq_max = bilevel_freq_max
+        self.bilevel_scale = bilevel_scale
+        self.bilevel_thresh = bilevel_thresh
+
+        # Progressive weight decay
         self.wd_ramp = wd_ramp
         self.wd_scale = wd_scale
         self.wd_thresh = wd_thresh
 
-        # ── Meta-net (2D sharpness-aware) ─────────────────────────────
+        # Meta-net
         if meta_net is None:
             self.meta_net = SharpnessMetaNet(meta_hidden_dim)
         else:
@@ -253,15 +244,14 @@ class SuperGrok15(Optimizer):
             first_param = next(iter(self.param_groups[0]["params"]))
             self.meta_net = self.meta_net.to(first_param.device)
         except (StopIteration, IndexError):
-            pass  # no params yet, will be moved manually
+            pass
 
-        # ── Internal state ────────────────────────────────────────────
+        # Internal state
         self._global_step = 0
         self._cached_alpha = alpha_init
         self._cached_train_acc = 0.0
         self._layer_beta1_cache: Dict[torch.nn.Parameter, float] = {}
         self._layer_alpha_cache: Dict[torch.nn.Parameter, float] = {}
-        # Cached sharpness directions from LookSAM (keyed by param index)
         self._sharpness_cache: Dict[int, torch.Tensor] = {}
 
         # Build parameter index
@@ -273,8 +263,12 @@ class SuperGrok15(Optimizer):
                 self._num_params += 1
 
     # ══════════════════════════════════════════════════════════════════
-    #  Layer-wise helpers (same as v1.1)
+    #  Sigmoid-driven dynamics
     # ══════════════════════════════════════════════════════════════════
+
+    def _sigmoid(self, scale, value, thresh):
+        """Compute sigmoid: 1 / (1 + exp(-scale * (value - thresh)))"""
+        return 1.0 / (1.0 + math.exp(-scale * (value - thresh)))
 
     def _get_layer_beta1(self, p: torch.nn.Parameter, beta1: float, gamma: float) -> float:
         if p in self._layer_beta1_cache:
@@ -301,16 +295,7 @@ class SuperGrok15(Optimizer):
         elapsed = step - self.warmup_steps
         return min(1.0, elapsed / self.warmup_ramp)
 
-    # ══════════════════════════════════════════════════════════════════
-    #  Alpha update (grokking signal) — same as v1.1
-    # ══════════════════════════════════════════════════════════════════
-
-    def _update_alpha(
-        self,
-        train_loss: Optional[float],
-        val_loss: Optional[float],
-        train_acc: Optional[float],
-    ) -> None:
+    def _update_alpha(self, train_loss, val_loss, train_acc):
         if train_loss is None and train_acc is None:
             return
         signal = 0.0
@@ -325,40 +310,38 @@ class SuperGrok15(Optimizer):
             signal = max(0.0, (val_loss - train_loss) / train_loss)
         self._cached_alpha = self.alpha_init * math.exp(-self.kappa * signal)
 
-    # ══════════════════════════════════════════════════════════════════
-    #  Progressive Weight Decay  (v1.5 NEW)
-    # ══════════════════════════════════════════════════════════════════
-
     def _get_effective_wd(self, base_wd: float) -> float:
-        """Compute progressive weight decay based on train accuracy.
-
-        Below ``wd_thresh``, decay ≈ base_wd.
-        Above ``wd_thresh``, decay ramps toward base_wd · (1 + wd_ramp).
-
-        With defaults (wd=1.0, wd_ramp=4.0, wd_thresh=0.9, wd_scale=20):
-          - acc=0.5:  wd_eff ≈ 1.00  (barely above base)
-          - acc=0.85: wd_eff ≈ 1.54
-          - acc=0.90: wd_eff ≈ 3.00  (midpoint of ramp)
-          - acc=0.95: wd_eff ≈ 4.46
-          - acc=1.00: wd_eff ≈ 4.97  (near max of 5.0)
-        """
         acc = self._cached_train_acc
-        sigmoid_val = 1.0 / (1.0 + math.exp(-self.wd_scale * (acc - self.wd_thresh)))
+        sigmoid_val = self._sigmoid(self.wd_scale, acc, self.wd_thresh)
         return base_wd * (1.0 + self.wd_ramp * sigmoid_val)
 
-    # ══════════════════════════════════════════════════════════════════
-    #  Sharpness helper
-    # ══════════════════════════════════════════════════════════════════
+    def _get_gate_signal(self) -> float:
+        """Sigmoid gating based on training accuracy."""
+        acc = self._cached_train_acc
+        return self._sigmoid(self.gate_scale, acc, self.gate_thresh)
+
+    def _get_effective_sam_freq(self) -> int:
+        """Sigmoid-driven SAM frequency."""
+        acc = self._cached_train_acc
+        sam_heat = self._sigmoid(self.sam_scale, acc, self.sam_thresh)
+        freq = self.sam_freq_max - (self.sam_freq_max - self.sam_freq_min) * sam_heat
+        return max(1, round(freq))
+
+    def _get_effective_bilevel_freq(self) -> int:
+        """Sigmoid-driven bilevel frequency."""
+        acc = self._cached_train_acc
+        bilevel_heat = self._sigmoid(self.bilevel_scale, acc, self.bilevel_thresh)
+        freq = self.bilevel_freq_max - (self.bilevel_freq_max - self.bilevel_freq_min) * bilevel_heat
+        return max(1, round(freq))
 
     def _get_sharpness(self, p: torch.nn.Parameter) -> torch.Tensor:
-        """Return cached sharpness signal for parameter, or zeros."""
         pidx = self._param_index.get(p, -1)
         if pidx in self._sharpness_cache:
             return self._sharpness_cache[pidx]
         return torch.zeros_like(p.data)
 
     # ══════════════════════════════════════════════════════════════════
-    #  Main optimiser step
+    #  Main optimizer step
     # ══════════════════════════════════════════════════════════════════
 
     @torch.no_grad()
@@ -369,14 +352,6 @@ class SuperGrok15(Optimizer):
         val_loss: Optional[float] = None,
         train_acc: Optional[float] = None,
     ):
-        """Perform a single optimization step.
-
-        Args:
-            closure: Re-evaluates loss (standard PyTorch).
-            train_loss: Current training loss.
-            val_loss: Current validation loss.
-            train_acc: Current training accuracy in [0, 1].
-        """
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -384,11 +359,10 @@ class SuperGrok15(Optimizer):
 
         self._global_step += 1
 
-        # Cache train_acc for progressive weight decay
         if train_acc is not None:
             self._cached_train_acc = train_acc
 
-        # ── Update alpha ──────────────────────────────────────────────
+        # Alpha update
         if self._global_step % self.alpha_update_freq == 0 or self._global_step == 1:
             self._update_alpha(train_loss, val_loss, train_acc)
         elif train_acc is not None and train_acc >= self.zero_acc_threshold:
@@ -399,13 +373,17 @@ class SuperGrok15(Optimizer):
         base_alpha = self._cached_alpha
         ramp = self._get_ramp_factor()
 
-        # ── Gradient clipping ─────────────────────────────────────────
+        # Sigmoid gate signal (computed once, not per-parameter)
+        gate_signal = self._get_gate_signal()
+        lamb_eff = ramp * gate_signal * self.lamb if ramp > 0 else 0.0
+
+        # Gradient clipping
         if self.gradient_clipping > 0:
             all_params = [p for g in self.param_groups for p in g["params"] if p.grad is not None]
             if all_params:
                 torch.nn.utils.clip_grad_norm_(all_params, self.gradient_clipping)
 
-        # ── Per-parameter update ──────────────────────────────────────
+        # Per-parameter update
         for group in self.param_groups:
             lr = group["lr"]
             beta1, beta2 = group["betas"]
@@ -436,26 +414,17 @@ class SuperGrok15(Optimizer):
                 layer_beta1 = self._get_layer_beta1(p, beta1, self.gamma)
                 layer_alpha = self._get_layer_alpha(p, base_alpha)
 
-                # ── Rule 1: Decoupled Memory ──────────────────────────
+                # Decoupled Memory: mu tracks raw gradients only
                 mu.mul_(layer_alpha).add_(grad, alpha=1.0 - layer_alpha)
 
-                # ── 2D Meta-net transformation (v1.5) ─────────────────
+                # 2D Meta-net transformation
                 sharpness = self._get_sharpness(p)
                 smart_grad = self.meta_net(grad, sharpness)
 
-                # ── Rule 2: Soft Sigmoid Gating ───────────────────────
-                if ramp > 0 and mu.norm() > 1e-12 and smart_grad.norm() > 1e-12:
-                    cos_sim = F.cosine_similarity(
-                        smart_grad.flatten().unsqueeze(0),
-                        mu.flatten().unsqueeze(0),
-                    ).item()
-                    gate = 1.0 / (1.0 + math.exp(-self.gate_temperature * cos_sim))
-                    lamb_eff = ramp * gate * self.lamb
-                    final_grad = smart_grad + lamb_eff * mu
-                else:
-                    final_grad = smart_grad
+                # Sigmoid gating: final_grad = smart_grad + lamb_eff * mu
+                final_grad = smart_grad + lamb_eff * mu
 
-                # ── AdamW update ──────────────────────────────────────
+                # AdamW update
                 exp_avg.mul_(layer_beta1).add_(final_grad, alpha=1.0 - layer_beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(final_grad, final_grad, value=1.0 - beta2)
 
@@ -465,16 +434,134 @@ class SuperGrok15(Optimizer):
                 step_size = lr / bc1
                 denom = (exp_avg_sq.sqrt() / math.sqrt(bc2)).add_(eps)
 
-                # Progressive weight decay (v1.5)
                 p.data.mul_(1.0 - lr * wd_eff)
-                # Adam step
                 p.data.addcdiv_(exp_avg, denom, value=-step_size)
 
         return loss
 
     # ══════════════════════════════════════════════════════════════════
-    #  LookSAM + Bilevel Meta-Step  (v1.5 NEW)
+    #  Decoupled SAM + Bilevel
     # ══════════════════════════════════════════════════════════════════
+
+    def sam_step(
+        self,
+        model: nn.Module,
+        train_x: torch.Tensor,
+        train_y: torch.Tensor,
+        criterion: Callable,
+    ) -> float:
+        """SAM perturbation + sharpness computation ONLY. No bilevel.
+
+        Returns sam_loss value.
+        """
+        # Save current training gradients
+        train_grads: Dict[str, torch.Tensor] = {}
+        for name, p in model.named_parameters():
+            if p.grad is not None:
+                train_grads[name] = p.grad.detach().clone()
+
+        if not train_grads:
+            return 0.0
+
+        # Compute grad norm for SAM perturbation
+        grad_norm = 0.0
+        for tg in train_grads.values():
+            grad_norm += tg.norm().item() ** 2
+        grad_norm = math.sqrt(grad_norm) + 1e-12
+
+        # Perturb parameters
+        param_backups: Dict[str, torch.Tensor] = {}
+        for name, p in model.named_parameters():
+            param_backups[name] = p.data.clone()
+            if name in train_grads:
+                p.data.add_(train_grads[name], alpha=self.sam_rho / grad_norm)
+
+        # Forward + backward at perturbed point
+        model.zero_grad()
+        with torch.enable_grad():
+            sam_loss = criterion(model(train_x), train_y)
+            sam_loss.backward()
+
+        # Cache sharpness direction: d = |sam_grad - normal_grad|
+        for name, p in model.named_parameters():
+            if p.grad is not None and name in train_grads:
+                d = (p.grad.detach() - train_grads[name]).abs()
+                pidx = self._param_index.get(p, -1)
+                if pidx >= 0:
+                    self._sharpness_cache[pidx] = d
+
+        sam_loss_val = sam_loss.item()
+
+        # Restore parameters
+        for name, p in model.named_parameters():
+            if name in param_backups:
+                p.data.copy_(param_backups[name])
+
+        # Restore training gradients
+        for name, p in model.named_parameters():
+            if name in train_grads:
+                p.grad = train_grads[name]
+            else:
+                p.grad = None
+
+        return sam_loss_val
+
+    def bilevel_step(
+        self,
+        model: nn.Module,
+        train_x: torch.Tensor,
+        train_y: torch.Tensor,
+        val_x: torch.Tensor,
+        val_y: torch.Tensor,
+        criterion: Callable,
+        meta_optimizer: Optimizer,
+    ) -> float:
+        """Bilevel meta-net training ONLY. Uses cached sharpness.
+
+        Returns val_loss value.
+        """
+        # Save current gradients
+        saved_grads: Dict[str, torch.Tensor] = {}
+        for name, p in model.named_parameters():
+            if p.grad is not None:
+                saved_grads[name] = p.grad.detach().clone()
+
+        # Compute smart gradients using cached sharpness
+        smart_grads: Dict[str, torch.Tensor] = {}
+        for name, p in model.named_parameters():
+            if name in saved_grads:
+                pidx = self._param_index.get(p, -1)
+                sharpness = self._sharpness_cache.get(pidx, torch.zeros_like(p.data))
+                smart_grads[name] = self.meta_net(saved_grads[name], sharpness)
+
+        # Validation gradients
+        model.zero_grad()
+        with torch.enable_grad():
+            val_loss = criterion(model(val_x), val_y)
+            val_loss.backward()
+
+        # Meta-loss = -<smart_grad, val_grad_unit>
+        meta_optimizer.zero_grad()
+        device = val_x.device
+        meta_loss = torch.tensor(0.0, device=device)
+        for name, p in model.named_parameters():
+            if name in smart_grads and p.grad is not None:
+                vg = p.grad.detach()
+                vg_norm = vg.norm()
+                vg_unit = vg / vg_norm if vg_norm > 1e-12 else vg
+                meta_loss = meta_loss - (smart_grads[name] * vg_unit).sum()
+
+        meta_loss.backward()
+        meta_optimizer.step()
+
+        # Restore saved gradients
+        for name, p in model.named_parameters():
+            if name in saved_grads:
+                p.grad = saved_grads[name]
+            else:
+                p.grad = None
+
+        return val_loss.item()
 
     def sam_meta_step(
         self,
@@ -486,132 +573,11 @@ class SuperGrok15(Optimizer):
         criterion: Callable,
         meta_optimizer: Optimizer,
     ) -> Tuple[float, float]:
-        """Combined LookSAM perturbation + bilevel meta-net update.
-
-        Performs three operations in sequence:
-          1. **LookSAM**: Perturb parameters in the worst-case direction,
-             compute gradients at the perturbed point, cache the sharpness
-             direction ``d = sam_grad − normal_grad`` for intermediate steps.
-          2. **Bilevel**: Train the 2D meta-net to align its transformed
-             gradients (conditioned on sharpness) with validation gradient.
-          3. **Restore**: Put original parameters and training gradients back.
-
-        **Call sequence** (in training loop)::
-
-            # 1. Forward + backward on training data
-            loss = criterion(model(train_x), train_y)
-            optimizer.zero_grad()
-            loss.backward()
-
-            # 2. Combined SAM + bilevel (every sam_freq steps)
-            if step % optimizer.sam_freq == 0:
-                optimizer.sam_meta_step(model, train_x, train_y,
-                                        val_x, val_y, criterion, meta_opt)
-
-            # 3. Optimizer step
-            optimizer.step(train_loss=loss.item(), train_acc=acc)
-
-        Args:
-            model: The model being trained.
-            train_x: Training inputs (for SAM perturbation).
-            train_y: Training targets.
-            val_x: Validation inputs (for bilevel).
-            val_y: Validation targets.
-            criterion: Loss function.
-            meta_optimizer: Optimizer for meta-net parameters.
-
-        Returns:
-            Tuple of (sam_loss, val_loss) for logging.
-        """
-        # ── Step 1: Save current training gradients ───────────────────
-        train_grads: Dict[str, torch.Tensor] = {}
-        for name, p in model.named_parameters():
-            if p.grad is not None:
-                train_grads[name] = p.grad.detach().clone()
-
-        if not train_grads:
-            return 0.0, 0.0
-
-        # ── Step 2: LookSAM — compute sharpness directions ───────────
-        # Compute per-parameter ascent direction: ε_p = ρ · g_p / ‖g‖
-        grad_norm = 0.0
-        for tg in train_grads.values():
-            grad_norm += tg.norm().item() ** 2
-        grad_norm = math.sqrt(grad_norm) + 1e-12
-
-        # Perturb parameters: θ → θ + ε
-        param_backups: Dict[str, torch.Tensor] = {}
-        for name, p in model.named_parameters():
-            param_backups[name] = p.data.clone()
-            if name in train_grads:
-                eps_p = self.sam_rho * train_grads[name] / grad_norm
-                p.data.add_(eps_p)
-
-        # Forward + backward at perturbed point
-        model.zero_grad()
-        with torch.enable_grad():
-            sam_logits = model(train_x)
-            sam_loss = criterion(sam_logits, train_y)
-            sam_loss.backward()
-
-        # Cache sharpness direction: d[p] = sam_grad[p] − normal_grad[p]
-        for name, p in model.named_parameters():
-            if p.grad is not None and name in train_grads:
-                d = p.grad.detach() - train_grads[name]
-                pidx = self._param_index.get(p, -1)
-                if pidx >= 0:
-                    self._sharpness_cache[pidx] = d.abs()
-
-        sam_loss_val = sam_loss.item()
-
-        # Restore parameters: θ → θ − ε (back to original)
-        for name, p in model.named_parameters():
-            if name in param_backups:
-                p.data.copy_(param_backups[name])
-
-        # ── Step 3: Bilevel — train 2D meta-net ──────────────────────
-        # Transform training grads through meta-net WITH sharpness
-        # (with gradient tracking for backprop through meta-net)
-        smart_grads: Dict[str, torch.Tensor] = {}
-        for name, p in model.named_parameters():
-            if name in train_grads:
-                pidx = self._param_index.get(p, -1)
-                sharpness = self._sharpness_cache.get(pidx, torch.zeros_like(p.data))
-                smart_grads[name] = self.meta_net(train_grads[name], sharpness)
-
-        # Compute validation gradients
-        model.zero_grad()
-        with torch.enable_grad():
-            val_logits = model(val_x)
-            val_loss = criterion(val_logits, val_y)
-            val_loss.backward()
-
-        # Meta-loss = −⟨smart_grad, val_grad_unit⟩
-        meta_optimizer.zero_grad()
-
-        device = val_x.device
-        meta_loss = torch.tensor(0.0, device=device)
-        for name, p in model.named_parameters():
-            if name in smart_grads and p.grad is not None:
-                vg = p.grad.detach()
-                vg_norm = vg.norm()
-                if vg_norm > 1e-12:
-                    vg_unit = vg / vg_norm
-                else:
-                    vg_unit = vg
-                meta_loss = meta_loss - (smart_grads[name] * vg_unit).sum()
-
-        meta_loss.backward()
-        meta_optimizer.step()
-
-        # ── Step 4: Restore training gradients ────────────────────────
-        for name, p in model.named_parameters():
-            if name in train_grads:
-                p.grad = train_grads[name]
-            else:
-                p.grad = None
-
-        return sam_loss_val, val_loss.item()
+        """Combined SAM + bilevel (backward-compatible API)."""
+        sam_loss_val = self.sam_step(model, train_x, train_y, criterion)
+        val_loss_val = self.bilevel_step(
+            model, train_x, train_y, val_x, val_y, criterion, meta_optimizer)
+        return sam_loss_val, val_loss_val
 
     # ══════════════════════════════════════════════════════════════════
     #  Inspection helpers
@@ -624,7 +590,6 @@ class SuperGrok15(Optimizer):
         return self._cached_alpha
 
     def get_effective_wd(self) -> float:
-        """Current effective weight decay (for logging)."""
         if self.param_groups:
             return self._get_effective_wd(self.param_groups[0]["weight_decay"])
         return 0.0
@@ -648,6 +613,9 @@ class SuperGrok15(Optimizer):
             "cached_train_acc": self._cached_train_acc,
             "ramp_factor": self._get_ramp_factor(),
             "effective_wd": self.get_effective_wd(),
+            "gate_signal": self._get_gate_signal(),
+            "effective_sam_freq": self._get_effective_sam_freq(),
+            "effective_bilevel_freq": self._get_effective_bilevel_freq(),
             "avg_mu_norm": sum(mu_norms) / max(len(mu_norms), 1),
             "avg_exp_avg_norm": sum(ea_norms) / max(len(ea_norms), 1),
             "avg_sharpness_norm": sum(sharp_norms) / max(len(sharp_norms), 1),
@@ -655,23 +623,24 @@ class SuperGrok15(Optimizer):
         }
 
     def __repr__(self) -> str:
-        lines = [f"SuperGrok v1.5 ("]
+        lines = ["SuperGrok v1.5 ("]
         for group in self.param_groups:
             lines.append(f"  lr={group['lr']}, betas={group['betas']}, "
                          f"eps={group['eps']}, wd={group['weight_decay']}")
         lines.append(f"  alpha_init={self.alpha_init}, lamb={self.lamb}, "
-                     f"gamma={self.gamma}, gamma_alpha={self.gamma_alpha}")
-        lines.append(f"  kappa={self.kappa}, warmup={self.warmup_steps}+{self.warmup_ramp}, "
-                     f"gate_temp={self.gate_temperature}")
-        lines.append(f"  sam_rho={self.sam_rho}, sam_freq={self.sam_freq}")
-        lines.append(f"  wd_ramp={self.wd_ramp}, wd_scale={self.wd_scale}, "
-                     f"wd_thresh={self.wd_thresh}")
-        lines.append(f"  meta_net={self.meta_net.__class__.__name__}")
+                     f"gamma={self.gamma}")
+        lines.append(f"  gate: scale={self.gate_scale}, thresh={self.gate_thresh}")
+        lines.append(f"  sam: rho={self.sam_rho}, freq=[{self.sam_freq_min},{self.sam_freq_max}], "
+                     f"scale={self.sam_scale}, thresh={self.sam_thresh}")
+        lines.append(f"  bilevel: freq=[{self.bilevel_freq_min},{self.bilevel_freq_max}], "
+                     f"scale={self.bilevel_scale}, thresh={self.bilevel_thresh}")
+        lines.append(f"  wd: ramp={self.wd_ramp}, scale={self.wd_scale}, "
+                     f"thresh={self.wd_thresh}")
         lines.append(")")
         return "\n".join(lines)
 
     # ══════════════════════════════════════════════════════════════════
-    #  Drop-in API: step_full() — complete pipeline in one call
+    #  Drop-in API: step_full()
     # ══════════════════════════════════════════════════════════════════
 
     def step_full(
@@ -683,63 +652,69 @@ class SuperGrok15(Optimizer):
         val_y: torch.Tensor,
         criterion: Optional[Callable] = None,
     ) -> Dict[str, float]:
-        """Complete training step: forward + backward + SAM + meta-learning + optimizer.
-
-        This is the fully self-contained API. Call this instead of manually
-        orchestrating loss.backward(), sam_meta_step(), and step().
+        """Complete training step with automatic SAM/bilevel scheduling.
 
         Usage:
             opt = SuperGrok15(model.parameters(), lr=1e-3)
             for batch_x, batch_y in dataloader:
                 metrics = opt.step_full(model, batch_x, batch_y, val_x, val_y)
-                print(f"loss={metrics['train_loss']:.4f}")
-
-        Returns a dict with: train_loss, train_acc, val_loss (when computed),
-        sam_loss (when SAM step runs).
         """
         if criterion is None:
             criterion = nn.CrossEntropyLoss()
 
-        # Auto-create meta optimizer on first call
         if not hasattr(self, '_auto_meta_opt'):
             self._auto_meta_opt = torch.optim.Adam(
                 self.meta_net.parameters(), lr=1e-4)
 
-        # ── Forward + backward ────────────────────────────────────────
+        # Forward + backward
         model.zero_grad()
         logits = model(train_x)
         loss = criterion(logits, train_y)
         loss.backward()
 
-        train_loss_val = loss.item()
-        with torch.no_grad():
-            train_acc = (logits.detach().argmax(-1) == train_y).float().mean().item()
+        metrics: Dict[str, float] = {}
+        step_num = self._global_step + 1
 
-        metrics = {"train_loss": train_loss_val, "train_acc": train_acc}
-
-        # ── SAM + bilevel (automatic scheduling) ──────────────────────
-        step_num = self._global_step + 1  # Will be incremented in step()
-        if step_num % self.sam_freq == 0:
+        # Adaptive SAM (sigmoid-driven frequency)
+        sam_freq_eff = self._get_effective_sam_freq()
+        if step_num % sam_freq_eff == 0:
             try:
-                sam_loss, val_loss = self.sam_meta_step(
-                    model, train_x, train_y, val_x, val_y,
-                    criterion, self._auto_meta_opt)
+                sam_loss = self.sam_step(model, train_x, train_y, criterion)
                 metrics["sam_loss"] = sam_loss
             except Exception:
-                pass  # SAM failure is non-fatal
+                pass
 
-        # ── Optimizer step with signals ───────────────────────────────
-        kw: Dict[str, float] = {
-            "train_loss": train_loss_val,
-            "train_acc": train_acc,
-        }
+        # Adaptive bilevel (independent sigmoid-driven frequency)
+        bilevel_freq_eff = self._get_effective_bilevel_freq()
+        if step_num % bilevel_freq_eff == 0:
+            try:
+                val_loss = self.bilevel_step(
+                    model, train_x, train_y, val_x, val_y,
+                    criterion, self._auto_meta_opt)
+                metrics["val_loss"] = val_loss
+            except Exception:
+                pass
+
+        # Deferred metrics (only compute .item() when needed)
+        kw: Dict[str, float] = {}
         alpha_freq = self.alpha_update_freq
-        if step_num % alpha_freq == 0:
+        needs_metrics = (step_num % alpha_freq == 0) or step_num == 1
+        if needs_metrics:
             with torch.no_grad():
-                val_logits = model(val_x)
-                val_loss_val = criterion(val_logits, val_y).item()
-            kw["val_loss"] = val_loss_val
-            metrics["val_loss"] = val_loss_val
+                train_loss_val = loss.item()
+                train_acc = (logits.detach().argmax(-1) == train_y).float().mean().item()
+            kw["train_loss"] = train_loss_val
+            kw["train_acc"] = train_acc
+            metrics["train_loss"] = train_loss_val
+            metrics["train_acc"] = train_acc
+
+            if step_num % alpha_freq == 0:
+                with torch.no_grad():
+                    val_logits = model(val_x)
+                    val_loss_val = criterion(val_logits, val_y).item()
+                kw["val_loss"] = val_loss_val
+                if "val_loss" not in metrics:
+                    metrics["val_loss"] = val_loss_val
 
         self.step(**kw)
 
