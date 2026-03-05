@@ -500,6 +500,11 @@ def _stopper(c):
 def _pbar(name, mx, pos):
     return tqdm(range(1, mx+1), desc=f"{name:<14s}", position=pos, leave=True, ncols=120,
                 bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {postfix}]")
+def _progressive_eval_freq(step, base_freq=10, max_freq=50, scale=0.01, thresh=500):
+    """Sigmoid-driven eval frequency: eval less often early, more often later."""
+    heat = 1.0 / (1.0 + math.exp(-scale * (step - thresh)))
+    freq = max_freq - (max_freq - base_freq) * heat
+    return max(base_freq, round(freq))
 def _eval_log(r, step, m, tx, ty, vx, vy, c, st, pb):
     tl, ta = evaluate(m, tx, ty, c["p"]); vl, va = evaluate(m, vx, vy, c["p"])
     r.steps.append(step); r.train_losses.append(tl); r.train_accs.append(ta)
@@ -641,7 +646,6 @@ def train_supergrok(c, init, tx, ty, vx, vy, dev, bp=0):
 # ── 4b. SuperGrok v1.5 ────────────────────────────────────────────────
 def train_supergrok15(c, init, tx, ty, vx, vy, dev, bp=0):
     from supergrok15_cpp import SuperGrok15
-    sf=c.get("supergrok15_sam_freq",5)
     r=_tr("SuperGrok1.5",c); m=_load(c,dev,init)
     opt=SuperGrok15(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
         weight_decay=c["weight_decay"], alpha_init=c.get("supergrok15_alpha",0.98),
@@ -650,35 +654,56 @@ def train_supergrok15(c, init, tx, ty, vx, vy, dev, bp=0):
         warmup_ramp=c.get("supergrok15_warmup_ramp",100),
         gradient_clipping=c.get("supergrok15_grad_clip",1.0),
         alpha_update_freq=c.get("supergrok15_alpha_update_freq",50),
-        gate_temperature=c.get("supergrok15_gate_temp",5.0),
         zero_loss_threshold=c.get("supergrok15_zero_loss_thresh",1e-4),
         zero_acc_threshold=c.get("supergrok15_zero_acc_thresh",0.995),
         meta_hidden_dim=c.get("supergrok15_meta_dim",32),
-        sam_rho=c.get("supergrok15_sam_rho",0.05), sam_freq=sf,
+        sam_rho=c.get("supergrok15_sam_rho",0.05),
+        gate_scale=c.get("supergrok15_gate_scale",20.0),
+        gate_thresh=c.get("supergrok15_gate_thresh",0.8),
+        sam_freq_min=c.get("supergrok15_sam_freq_min",3),
+        sam_freq_max=c.get("supergrok15_sam_freq_max",20),
+        sam_scale=c.get("supergrok15_sam_scale",20.0),
+        sam_thresh=c.get("supergrok15_sam_thresh",0.85),
+        bilevel_freq_min=c.get("supergrok15_bilevel_freq_min",5),
+        bilevel_freq_max=c.get("supergrok15_bilevel_freq_max",30),
+        bilevel_scale=c.get("supergrok15_bilevel_scale",20.0),
+        bilevel_thresh=c.get("supergrok15_bilevel_thresh",0.9),
         wd_ramp=c.get("supergrok15_wd_ramp",4.0),
         wd_scale=c.get("supergrok15_wd_scale",20.0),
         wd_thresh=c.get("supergrok15_wd_thresh",0.9))
     opt.meta_net=opt.meta_net.to(dev)
     mopt=torch.optim.Adam(opt.meta_net.parameters(), lr=1e-4)
     crit_s15=nn.CrossEntropyLoss()
+    alpha_freq=c.get("supergrok15_alpha_update_freq",50)
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("SuperGrok1.5",c["max_steps"],bp)):
         logits=m(tx); loss=F.cross_entropy(logits,ty); opt.zero_grad(); loss.backward()
-        train_loss_val=loss.item()
-        with torch.no_grad():
-            train_acc=(logits.detach()[:,:c["p"]].argmax(-1)==ty).float().mean().item()
-        # Combined SAM + bilevel every sam_freq steps
-        if step%sf==0:
-            try: opt.sam_meta_step(m, tx, ty, vx, vy, crit_s15, mopt)
-            except Exception as e: warnings.warn(f"SuperGrok1.5 sam_meta_step failed at step {step}: {e}")
-        kw={"train_loss":train_loss_val, "train_acc":train_acc}
-        if step%c.get("supergrok15_alpha_update_freq",50)==0:
+        # Adaptive SAM (sigmoid-driven frequency)
+        sam_freq_eff=opt._get_effective_sam_freq()
+        if step%sam_freq_eff==0:
+            try: opt.sam_step(m, tx, ty, crit_s15)
+            except Exception as e: warnings.warn(f"SuperGrok1.5 sam_step failed at step {step}: {e}")
+        # Adaptive bilevel (independent sigmoid-driven frequency)
+        bilevel_freq_eff=opt._get_effective_bilevel_freq()
+        if step%bilevel_freq_eff==0:
+            try: opt.bilevel_step(m, tx, ty, vx, vy, crit_s15, mopt)
+            except Exception as e: warnings.warn(f"SuperGrok1.5 bilevel_step failed at step {step}: {e}")
+        # Deferred metrics — only compute .item() when needed
+        eval_freq=_progressive_eval_freq(step, base_freq=c["log_every"])
+        kw={}
+        needs_metrics=(step%alpha_freq==0) or (step%eval_freq==0) or step==1
+        if needs_metrics:
             with torch.no_grad():
-                vl_s15=F.cross_entropy(m(vx),vy).item()
-            kw["val_loss"]=vl_s15
+                train_loss_val=loss.item()
+                train_acc=(logits.detach()[:,:c["p"]].argmax(-1)==ty).float().mean().item()
+            kw["train_loss"]=train_loss_val; kw["train_acc"]=train_acc
+            if step%alpha_freq==0:
+                with torch.no_grad():
+                    vl_s15=F.cross_entropy(m(vx),vy).item()
+                kw["val_loss"]=vl_s15
         try: opt.step(**kw)
         except TypeError: opt.step()
-        if step%c["log_every"]==0 or step==1:
+        if step%eval_freq==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
             if done: break
     pb.close(); return _fin(r,st,step,t0)
@@ -1483,10 +1508,14 @@ if __name__ == "__main__":
         "supergrok15":{"weight_decay": 1.0, "supergrok15_alpha": 0.98, "supergrok15_lamb": 2.0,
                        "supergrok15_gamma": 0.1, "supergrok15_kappa": 0.1, "supergrok15_warmup": 100,
                        "supergrok15_warmup_ramp": 100, "supergrok15_grad_clip": 1.0,
-                       "supergrok15_meta_dim": 32, "supergrok15_gate_temp": 5.0,
-                       "supergrok15_alpha_update_freq": 50,
+                       "supergrok15_meta_dim": 32, "supergrok15_alpha_update_freq": 50,
                        "supergrok15_zero_loss_thresh": 1e-4, "supergrok15_zero_acc_thresh": 0.995,
-                       "supergrok15_sam_rho": 0.05, "supergrok15_sam_freq": 5,
+                       "supergrok15_sam_rho": 0.05,
+                       "supergrok15_gate_scale": 20.0, "supergrok15_gate_thresh": 0.8,
+                       "supergrok15_sam_freq_min": 3, "supergrok15_sam_freq_max": 20,
+                       "supergrok15_sam_scale": 20.0, "supergrok15_sam_thresh": 0.85,
+                       "supergrok15_bilevel_freq_min": 5, "supergrok15_bilevel_freq_max": 30,
+                       "supergrok15_bilevel_scale": 20.0, "supergrok15_bilevel_thresh": 0.9,
                        "supergrok15_wd_ramp": 4.0, "supergrok15_wd_scale": 20.0,
                        "supergrok15_wd_thresh": 0.9},
         "grokfast":   {"weight_decay": 1.0, "grokfast_alpha": 0.98, "grokfast_lamb": 2.0},

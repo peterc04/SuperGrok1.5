@@ -69,7 +69,7 @@ void supergrok15_fused_step(
     torch::Tensor W2, torch::Tensor b2,
     float rescale, int hidden_dim,
     float beta2, float lr, float wd_eff, float eps,
-    float lamb, float ramp, float gate_temperature,
+    float lamb, float ramp, float gate_signal,
     float grad_clip_norm
 ) {
     const size_t n_params = params.size();
@@ -129,19 +129,10 @@ void supergrok15_fused_step(
                            W1, b1, W2, b2, rescale, hidden_dim);
         }
 
-        // Soft sigmoid gating
+        // Sigmoid gating (pre-computed from training accuracy in Python)
         float lamb_eff = 0.0f;
         if (ramp > 0.0f) {
-            float mu_norm = mu.norm().item<float>();
-            float sg_norm = smart_grad.norm().item<float>();
-            if (mu_norm > 1e-12f && sg_norm > 1e-12f) {
-                float cos_sim = torch::cosine_similarity(
-                    smart_grad.flatten().unsqueeze(0),
-                    mu.flatten().unsqueeze(0)
-                ).item<float>();
-                float gate = 1.0f / (1.0f + std::exp(-gate_temperature * cos_sim));
-                lamb_eff = ramp * gate * lamb;
-            }
+            lamb_eff = ramp * gate_signal * lamb;
         }
 
         if (use_cuda) {
@@ -507,7 +498,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("W1"), py::arg("b1"), py::arg("W2"), py::arg("b2"),
           py::arg("rescale"), py::arg("hidden_dim"),
           py::arg("beta2"), py::arg("lr"), py::arg("wd_eff"), py::arg("eps"),
-          py::arg("lamb"), py::arg("ramp"), py::arg("gate_temperature"),
+          py::arg("lamb"), py::arg("ramp"), py::arg("gate_signal"),
           py::arg("grad_clip_norm"));
 
     m.def("sam_perturb_all", &supergrok15_sam_perturb_all,
