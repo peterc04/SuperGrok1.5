@@ -97,7 +97,7 @@ void supergrok15_fused_step(
     torch::Tensor W2, torch::Tensor b2,
     float rescale, int hidden_dim,
     float beta2, float lr, float wd_eff, float eps,
-    float lamb, float ramp, float gate_temperature,
+    float lamb, float ramp, float gate_signal,
     float grad_clip_norm);
 
 std::vector<torch::Tensor> supergrok15_sam_perturb_all(
