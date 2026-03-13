@@ -41,9 +41,9 @@ constexpr int GROKADAMW_BLOCK_SIZE = 256;
 template <typename scalar_t>
 __global__ void fused_grokadamw_step_kernel(
     scalar_t* __restrict__ param,          // [N] -- updated in-place
-    scalar_t* __restrict__ exp_avg,        // [N] -- first moment, updated
-    scalar_t* __restrict__ exp_avg_sq,     // [N] -- second moment, updated
-    scalar_t* __restrict__ ema,            // [N] -- EMA gradient filter, updated
+    float* __restrict__ exp_avg,           // [N] -- first moment, updated
+    float* __restrict__ exp_avg_sq,        // [N] -- second moment, updated
+    float* __restrict__ ema,               // [N] -- EMA gradient filter, updated
     const scalar_t* __restrict__ grad,     // [N] -- pre-clipped gradient
     const float alpha,                     // EMA decay for gradient filter
     const float lamb,                      // Amplification factor
@@ -61,24 +61,24 @@ __global__ void fused_grokadamw_step_kernel(
 
     // Read inputs -- cast to float for accumulation precision
     const float g = static_cast<float>(grad[idx]);
-    const float e = static_cast<float>(ema[idx]);
+    const float e = ema[idx];
 
     // -- 1. EMA gradient filter -----------------------------------------
     const float filtered = alpha * e + (1.0f - alpha) * g;
-    ema[idx] = static_cast<scalar_t>(filtered);
+    ema[idx] = filtered;
 
     // -- 2. Gradient amplification --------------------------------------
     const float amplified = g + lamb * filtered;
 
     // -- 3. Adam moment updates -----------------------------------------
-    const float ea_old = static_cast<float>(exp_avg[idx]);
-    const float easq_old = static_cast<float>(exp_avg_sq[idx]);
+    const float ea_old = exp_avg[idx];
+    const float easq_old = exp_avg_sq[idx];
 
     const float ea = beta1 * ea_old + (1.0f - beta1) * amplified;
     const float easq = beta2 * easq_old + (1.0f - beta2) * amplified * amplified;
 
-    exp_avg[idx] = static_cast<scalar_t>(ea);
-    exp_avg_sq[idx] = static_cast<scalar_t>(easq);
+    exp_avg[idx] = ea;
+    exp_avg_sq[idx] = easq;
 
     // -- 4. Bias-corrected Adam step with decoupled weight decay --------
     const float step_size = lr / bc1;
@@ -120,9 +120,9 @@ void launch_fused_grokadamw_step(
         param.scalar_type(), "fused_grokadamw_step", ([&] {
             fused_grokadamw_step_kernel<scalar_t><<<grid, GROKADAMW_BLOCK_SIZE>>>(
                 param.data_ptr<scalar_t>(),
-                exp_avg.data_ptr<scalar_t>(),
-                exp_avg_sq.data_ptr<scalar_t>(),
-                ema.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(),
+                exp_avg_sq.data_ptr<float>(),
+                ema.data_ptr<float>(),
                 grad.data_ptr<scalar_t>(),
                 alpha,
                 lamb,

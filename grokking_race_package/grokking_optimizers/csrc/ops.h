@@ -276,7 +276,7 @@ void neuralgrok_fused_step(
     float eps, float grad_clip_norm);
 
 // ── Prodigy ─────────────────────────────────────────────────────────
-void prodigy_fused_step(
+float prodigy_fused_step(
     std::vector<torch::Tensor>& params,
     std::vector<torch::Tensor>& grads,
     std::vector<torch::Tensor>& exp_avgs,
@@ -284,7 +284,7 @@ void prodigy_fused_step(
     std::vector<torch::Tensor>& s_bufs,
     std::vector<torch::Tensor>& param_inits,
     std::vector<int64_t>& steps,
-    float& d_lr,
+    float d_lr,
     float beta1, float beta2, float lr, float wd,
     float eps);
 
