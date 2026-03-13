@@ -17,6 +17,7 @@ from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
 from grokking_optimizers import _ops
+from grokking_optimizers._adamw_helper import adamw_step
 
 
 class Muon(Optimizer):
@@ -156,8 +157,8 @@ class Muon(Optimizer):
             params_list,
             grads_list,
             momentum_buf_list,
-            group["lr"],
             group["momentum"],
+            group["lr"],
             group["weight_decay"],
             group["ns_steps"],
         )
@@ -195,7 +196,7 @@ class Muon(Optimizer):
         betas = group.get("betas", (0.9, 0.98))
         eps = group.get("eps", 1e-8)
 
-        _ops.adamw_fused_step(
+        adamw_step(
             params_list,
             grads_list,
             exp_avg_list,

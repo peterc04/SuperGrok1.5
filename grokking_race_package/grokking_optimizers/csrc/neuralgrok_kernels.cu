@@ -44,10 +44,10 @@ template <typename scalar_t>
 __global__ void fused_neuralgrok_amplifier_kernel(
     const scalar_t* __restrict__ grad,           // [N]
     scalar_t* __restrict__ amplified_grad,       // [N] -- output
-    const scalar_t* __restrict__ W1,             // [H, 1] -- row-major
-    const scalar_t* __restrict__ b1,             // [H]
-    const scalar_t* __restrict__ W2,             // [1, H] -- row-major
-    const scalar_t* __restrict__ b2,             // [1]
+    const float* __restrict__ W1,                // [H, 1] -- row-major
+    const float* __restrict__ b1,                // [H]
+    const float* __restrict__ W2,                // [1, H] -- row-major
+    const float* __restrict__ b2,                // [1]
     const float alpha,                           // Scale factor for MLP output
     const float beta,                            // Bias term (skip connection strength)
     const int N,
@@ -55,11 +55,11 @@ __global__ void fused_neuralgrok_amplifier_kernel(
 ) {
     // Load MLP weights into shared memory
     extern __shared__ char smem_raw[];
-    scalar_t* smem = reinterpret_cast<scalar_t*>(smem_raw);
-    scalar_t* sW1 = smem;              // H elements
-    scalar_t* sb1 = sW1 + H;          // H elements
-    scalar_t* sW2 = sb1 + H;          // H elements
-    scalar_t* sb2 = sW2 + H;          // 1 element
+    float* smem = reinterpret_cast<float*>(smem_raw);
+    float* sW1 = smem;              // H elements
+    float* sb1 = sW1 + H;          // H elements
+    float* sW2 = sb1 + H;          // H elements
+    float* sb2 = sW2 + H;          // 1 element
 
     const int tid = threadIdx.x;
 
@@ -85,15 +85,15 @@ __global__ void fused_neuralgrok_amplifier_kernel(
 
     for (int h = 0; h < H; h++) {
         // Linear(1, H): z = W1[h] * g + b1[h]
-        float z = static_cast<float>(sW1[h]) * g + static_cast<float>(sb1[h]);
+        float z = sW1[h] * g + sb1[h];
 
         // ReLU activation
         z = (z > 0.0f) ? z : 0.0f;
 
         // Linear(H, 1): accumulate W2[h] * relu_out
-        mlp_out += static_cast<float>(sW2[h]) * z;
+        mlp_out += sW2[h] * z;
     }
-    mlp_out += static_cast<float>(sb2[0]);
+    mlp_out += sb2[0];
 
     // -- Amplification: grad * (alpha * mlp_out + beta) -----------------
     const float amp = g * (alpha * mlp_out + beta);
@@ -109,8 +109,8 @@ __global__ void fused_neuralgrok_amplifier_kernel(
 template <typename scalar_t>
 __global__ void fused_neuralgrok_adam_kernel(
     scalar_t* __restrict__ param,             // [N] -- updated
-    scalar_t* __restrict__ exp_avg,           // [N] -- updated
-    scalar_t* __restrict__ exp_avg_sq,        // [N] -- updated
+    float* __restrict__ exp_avg,              // [N] -- updated
+    float* __restrict__ exp_avg_sq,           // [N] -- updated
     const scalar_t* __restrict__ amplified_grad,  // [N]
     const float beta1,
     const float beta2,
@@ -126,15 +126,15 @@ __global__ void fused_neuralgrok_adam_kernel(
 
     // Cast to float for accumulation precision
     const float ag = static_cast<float>(amplified_grad[idx]);
-    const float ea_old = static_cast<float>(exp_avg[idx]);
-    const float easq_old = static_cast<float>(exp_avg_sq[idx]);
+    const float ea_old = exp_avg[idx];
+    const float easq_old = exp_avg_sq[idx];
 
     // -- Adam moment updates --------------------------------------------
     const float ea = beta1 * ea_old + (1.0f - beta1) * ag;
     const float easq = beta2 * easq_old + (1.0f - beta2) * ag * ag;
 
-    exp_avg[idx] = static_cast<scalar_t>(ea);
-    exp_avg_sq[idx] = static_cast<scalar_t>(easq);
+    exp_avg[idx] = ea;
+    exp_avg_sq[idx] = easq;
 
     // -- Bias-corrected step with decoupled weight decay ----------------
     const float step_size = lr / bc1;
@@ -167,18 +167,24 @@ void launch_fused_neuralgrok_amplifier(
     const int grid = (N + NEURALGROK_BLOCK_SIZE - 1) / NEURALGROK_BLOCK_SIZE;
     // Shared memory: (H + H + H + 1) elements
     const int smem_elems = hidden_dim * 3 + 1;
+    const int smem_bytes = smem_elems * sizeof(float);
+
+    // Convert weights to FP32 (Python provides FP32 weights, dispatch is on grad dtype)
+    auto W1_f = W1.to(torch::kFloat32).contiguous();
+    auto b1_f = b1.to(torch::kFloat32).contiguous();
+    auto W2_f = W2.to(torch::kFloat32).contiguous();
+    auto b2_f = b2.to(torch::kFloat32).contiguous();
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         grad.scalar_type(), "fused_neuralgrok_amplifier", ([&] {
-            const int smem_bytes = smem_elems * sizeof(scalar_t);
             fused_neuralgrok_amplifier_kernel<scalar_t><<<grid, NEURALGROK_BLOCK_SIZE, smem_bytes>>>(
                 grad.data_ptr<scalar_t>(),
                 amplified_grad.data_ptr<scalar_t>(),
-                W1.data_ptr<scalar_t>(),
-                b1.data_ptr<scalar_t>(),
-                W2.data_ptr<scalar_t>(),
-                b2.data_ptr<scalar_t>(),
+                W1_f.data_ptr<float>(),
+                b1_f.data_ptr<float>(),
+                W2_f.data_ptr<float>(),
+                b2_f.data_ptr<float>(),
                 alpha,
                 beta,
                 N,
@@ -210,8 +216,8 @@ void launch_fused_neuralgrok_adam(
         param.scalar_type(), "fused_neuralgrok_adam", ([&] {
             fused_neuralgrok_adam_kernel<scalar_t><<<grid, NEURALGROK_BLOCK_SIZE>>>(
                 param.data_ptr<scalar_t>(),
-                exp_avg.data_ptr<scalar_t>(),
-                exp_avg_sq.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(),
+                exp_avg_sq.data_ptr<float>(),
                 amplified_grad.data_ptr<scalar_t>(),
                 beta1,
                 beta2,

@@ -111,7 +111,7 @@ class Prodigy(Optimizer):
             if len(params_list) == 0:
                 continue
 
-            # The kernel updates d_lr in-place via the returned value.
+            # The kernel returns the updated d_lr value.
             self._d_lr = _ops.prodigy_fused_step(
                 params_list,
                 grads_list,
@@ -120,12 +120,12 @@ class Prodigy(Optimizer):
                 s_list,
                 param_init_list,
                 step_list,
-                group["lr"],
+                self._d_lr,
                 group["betas"][0],
                 group["betas"][1],
-                group["eps"],
+                group["lr"],
                 group["weight_decay"],
-                self._d_lr,
+                group["eps"],
             )
 
         return loss

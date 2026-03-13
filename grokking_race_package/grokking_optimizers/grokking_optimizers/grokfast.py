@@ -16,6 +16,7 @@ from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
 from grokking_optimizers import _ops
+from grokking_optimizers._adamw_helper import adamw_step
 
 
 class Grokfast(Optimizer):
@@ -128,7 +129,7 @@ class Grokfast(Optimizer):
             )
 
             # Phase 2: AdamW update with the amplified gradients
-            _ops.adamw_fused_step(
+            adamw_step(
                 params_list,
                 grads_list,
                 exp_avg_list,
