@@ -59,7 +59,7 @@ void launch_dsa_project(
 void launch_dsa_indexer_topk(
     torch::Tensor idx_q, torch::Tensor idx_k,
     torch::Tensor w_idx, torch::Tensor selected_indices,
-    int N, int n_idx_heads, int top_k);
+    int n_idx_heads, int top_k);
 
 void launch_dsa_sparse_attention(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,

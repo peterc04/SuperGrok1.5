@@ -5,13 +5,10 @@
  * Attention (DSA).  The meta-net processes (grad, sharpness) pairs through
  * cross-element sparse attention to produce a correction signal.
  *
- * Six kernels:
+ * Three kernels:
  *   1. dsa_project         — project each element to Q/K/V + indexer keys
  *   2. dsa_indexer_topk    — lightning indexer scores + top-k selection
  *   3. dsa_sparse_attention — sparse attention + output projection + skip
- *   4. fused_adam_decay     — gating blend + Adam moments + progressive wd
- *   5. sam_perturb          — worst-case parameter perturbation
- *   6. sharpness_restore    — |sam_grad - grad| + param restore
  */
 
 #include <torch/extension.h>
@@ -34,7 +31,7 @@ constexpr int TILE_K     = 256;
 // is allocated dynamically so these are only used for sanity checks.
 constexpr int MAX_D_HEAD     = 128;
 constexpr int MAX_IDX_HEADS  = 32;
-constexpr int MAX_TOP_K      = 512;
+constexpr int MAX_TOP_K      = 128;
 
 
 // ═══════════════════════════════════════════════════════════════════════════

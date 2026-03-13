@@ -183,6 +183,9 @@ class SuperGrok15(Optimizer):
 
         self._num_params = num_params
         self._state_initialized = False
+        self._flat_param_data = [p.data for p in self._flat_params]
+        self._weights_dirty = True
+        self._cached_weights = None
 
     def _ensure_state(self):
         if self._state_initialized:
@@ -274,10 +277,13 @@ class SuperGrok15(Optimizer):
         for p in self._flat_params:
             grads.append(p.grad.data if p.grad is not None else torch.Tensor())
 
-        W1, b1, W2, b2, rescale = self.meta_net.get_weights()
+        if self._weights_dirty:
+            self._cached_weights = self.meta_net.get_weights()
+            self._weights_dirty = False
+        W1, b1, W2, b2, rescale = self._cached_weights
 
         _ops.supergrok15_fused_step(
-            [p.data for p in self._flat_params],
+            self._flat_param_data,
             grads,
             self._flat_exp_avgs,
             self._flat_exp_avg_sqs,
@@ -367,6 +373,7 @@ class SuperGrok15(Optimizer):
 
         meta_loss.backward()
         meta_optimizer.step()
+        self._weights_dirty = True
 
         for name, p in named_params:
             p.grad = saved_grads.get(name)
