@@ -573,7 +573,7 @@ void neuralgrok_fused_step(
 //  Prodigy — Distance-Aware Self-Tuning Adam
 // ═══════════════════════════════════════════════════════════════════════
 
-void prodigy_fused_step(
+float prodigy_fused_step(
     std::vector<torch::Tensor>& params,
     std::vector<torch::Tensor>& grads,
     std::vector<torch::Tensor>& exp_avgs,
@@ -581,7 +581,7 @@ void prodigy_fused_step(
     std::vector<torch::Tensor>& s_bufs,
     std::vector<torch::Tensor>& param_inits,
     std::vector<int64_t>& steps,
-    float& d_lr,
+    float d_lr,
     float beta1, float beta2, float lr, float wd,
     float eps
 ) {
@@ -643,6 +643,8 @@ void prodigy_fused_step(
         params[i].mul_(1.0f - lr * d_lr * wd);
         params[i].addcdiv_(exp_avgs[i], denom_t, -step_size);
     }
+
+    return d_lr;
 }
 
 

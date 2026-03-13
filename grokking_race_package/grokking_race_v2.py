@@ -933,40 +933,45 @@ def save_json(rbo, save_dir="results", total_wall=None, model_type="decoder", fr
         json.dump(d,f,indent=2)
 
 # ── Multi-GPU worker ──────────────────────────────────────────────────
-def _gpu_worker(gpu_id, tasks, base, merged, seeds, result_queue, worker_id):
-    """Run a batch of (optimizer, seed) tasks on a specific GPU.
+def _gpu_worker(gpu_id, task_queue, base, merged, result_queue, worker_id):
+    """Pull tasks from a shared queue and run them on a specific GPU.
 
     Each worker is an independent process with exclusive GPU access.
-    Data and init states are recreated on the assigned GPU to avoid
+    Data and init states are lazily created on the assigned GPU to avoid
     cross-device tensor issues.
 
     Args:
         gpu_id: CUDA device index (e.g. 0, 1, 2, 3)
-        tasks: list of (optimizer_name, seed) tuples
+        task_queue: mp.Queue of (optimizer_name, seed) tuples; None = stop
         base: base config dict
         merged: dict of {optimizer_name: merged_config}
-        seeds: list of all seeds
-        result_queue: mp.Queue for returning (name, TrainResult or None) pairs
+        result_queue: mp.Queue for returning (name, seed, TrainResult or None)
         worker_id: integer ID for logging
     """
     try:
         device = torch.device(f"cuda:{gpu_id}")
         torch.cuda.set_device(gpu_id)
-        mt = base.get("model_type", "decoder")
-        print(f"  [GPU {gpu_id}] Worker {worker_id}: {len(tasks)} tasks on {device}")
+        print(f"  [GPU {gpu_id}] Worker {worker_id} started on {device}")
 
-        # Recreate data + init states on this GPU
+        # Lazily populated cache of seed data on this GPU
         seed_data = {}
-        for s in seeds:
-            torch.manual_seed(s); np.random.seed(s)
-            tx, ty, vx, vy = make_data_for_task(base, s)
-            tx, ty = tx.to(device), ty.to(device)
-            vx, vy = vx.to(device), vy.to(device)
-            ctmp = dict(base); ctmp["seed"] = s
-            ist = get_init_state(ctmp, device)
-            seed_data[s] = (tx, ty, vx, vy, ist)
 
-        for name, s in tasks:
+        while True:
+            task = task_queue.get()
+            if task is None:  # poison pill
+                break
+            name, s = task
+
+            # Lazily create data for this seed on this GPU
+            if s not in seed_data:
+                torch.manual_seed(s); np.random.seed(s)
+                tx, ty, vx, vy = make_data_for_task(base, s)
+                tx, ty = tx.to(device), ty.to(device)
+                vx, vy = vx.to(device), vy.to(device)
+                ctmp = dict(base); ctmp["seed"] = s
+                ist = get_init_state(ctmp, device)
+                seed_data[s] = (tx, ty, vx, vy, ist)
+
             cfg = dict(merged[name]); cfg["seed"] = s
             tx, ty, vx, vy, ist = seed_data[s]
             try:
@@ -983,9 +988,6 @@ def _gpu_worker(gpu_id, tasks, base, merged, seeds, result_queue, worker_id):
     except Exception as e:
         import traceback; traceback.print_exc()
         print(f"  [GPU {gpu_id}] Worker {worker_id} crashed: {e}")
-        # Signal that all tasks for this worker failed
-        for name, s in tasks:
-            result_queue.put((name, s, None))
 
 
 # ── run_pipeline ──────────────────────────────────────────────────────
@@ -1059,28 +1061,24 @@ def run_pipeline(optimizers=None, optimizer_configs=None, seeds=None,
         n_workers = len(gpu_ids)
         print(f"\n  ▸ Multi-GPU mode: distributing {total_tasks} tasks across {n_workers} GPUs")
 
-        # Distribute tasks round-robin across GPUs for load balancing.
-        # Each optimizer goes to a different GPU so wall-clock measurements
-        # are isolated — no two tasks share a GPU simultaneously.
-        worker_tasks = [[] for _ in range(n_workers)]
-        for i, task in enumerate(tasks):
-            worker_tasks[i % n_workers].append(task)
+        # Shared work queue: all tasks go into one queue, workers pull dynamically.
+        # This ensures maximum GPU utilization — fast GPUs pick up more tasks.
+        task_queue = MPQueue()
+        for task in tasks:
+            task_queue.put(task)
+        # Poison pills — one per worker so each knows when to stop
+        for _ in range(n_workers):
+            task_queue.put(None)
 
-        for i, wt in enumerate(worker_tasks):
-            names = set(n for n, _ in wt)
-            print(f"    GPU {gpu_ids[i]}: {len(wt)} tasks ({', '.join(DISPLAY_NAMES.get(n,n) for n in sorted(names))})")
+        print(f"    {total_tasks} tasks in shared queue across {n_workers} GPUs: {gpu_ids}")
 
         # Spawn workers
         result_queue = MPQueue()
         workers = []
-        for i, wt in enumerate(worker_tasks):
-            if not wt:
-                continue
-            # Each worker needs the subset of seeds it will use
-            worker_seeds = list(set(s for _, s in wt))
+        for i in range(n_workers):
             p = mp.Process(
                 target=_gpu_worker,
-                args=(gpu_ids[i], wt, base, merged, worker_seeds, result_queue, i),
+                args=(gpu_ids[i], task_queue, base, merged, result_queue, i),
                 daemon=False,
             )
             workers.append(p)

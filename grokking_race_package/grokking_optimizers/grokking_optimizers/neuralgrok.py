@@ -35,6 +35,7 @@ class _Amplifier(nn.Module):
         if num_layers < 2:
             raise ValueError("num_layers must be >= 2 (input + output layer)")
 
+        self.hidden_dim = hidden_dim
         layers: List[nn.Module] = []
         layers.append(nn.Linear(1, hidden_dim))
         layers.append(nn.ReLU())
@@ -190,17 +191,18 @@ class NeuralGrok(Optimizer):
                 exp_avg_list,
                 exp_avg_sq_list,
                 step_list,
-                group["lr"],
-                group["betas"][0],
-                group["betas"][1],
-                group["eps"],
-                group["weight_decay"],
-                group["alpha"],
-                group["beta"],
                 W1_d,
                 b1_d,
                 W_last_d,
                 b_last_d,
+                group["alpha"],
+                group["beta"],
+                self.amplifier.hidden_dim,
+                group["betas"][0],
+                group["betas"][1],
+                group["lr"],
+                group["weight_decay"],
+                group["eps"],
                 group["grad_clip"],
             )
 

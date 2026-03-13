@@ -49,9 +49,9 @@ constexpr int PRODIGY_WARP_SIZE = 32;
 template <typename scalar_t>
 __global__ void fused_prodigy_step_kernel(
     scalar_t* __restrict__ param,          // [N] -- updated in-place
-    scalar_t* __restrict__ exp_avg,        // [N] -- first moment, updated
-    scalar_t* __restrict__ exp_avg_sq,     // [N] -- second moment, updated
-    scalar_t* __restrict__ s,              // [N] -- EMA of d_lr-scaled sq grads, updated
+    float* __restrict__ exp_avg,           // [N] -- first moment, updated
+    float* __restrict__ exp_avg_sq,        // [N] -- second moment, updated
+    float* __restrict__ s,                 // [N] -- EMA of d_lr-scaled sq grads, updated
     const scalar_t* __restrict__ grad,     // [N]
     const float d_lr,                      // Adaptive learning rate (precomputed in C++)
     const float beta1,
@@ -72,19 +72,19 @@ __global__ void fused_prodigy_step_kernel(
     const float d_lr_g_sq = d_lr * d_lr * g * g;
 
     // -- 1. Update s (EMA of d_lr-scaled squared gradients) -------------
-    const float s_old = static_cast<float>(s[idx]);
+    const float s_old = s[idx];
     const float s_new = beta2 * s_old + (1.0f - beta2) * d_lr_g_sq;
-    s[idx] = static_cast<scalar_t>(s_new);
+    s[idx] = s_new;
 
     // -- 2. Adam moment updates -----------------------------------------
-    const float ea_old = static_cast<float>(exp_avg[idx]);
-    const float easq_old = static_cast<float>(exp_avg_sq[idx]);
+    const float ea_old = exp_avg[idx];
+    const float easq_old = exp_avg_sq[idx];
 
     const float ea = beta1 * ea_old + (1.0f - beta1) * d_lr_g;
     const float easq = beta2 * easq_old + (1.0f - beta2) * d_lr_g_sq;
 
-    exp_avg[idx] = static_cast<scalar_t>(ea);
-    exp_avg_sq[idx] = static_cast<scalar_t>(easq);
+    exp_avg[idx] = ea;
+    exp_avg_sq[idx] = easq;
 
     // -- 3. Bias-corrected step with weight decay -----------------------
     const float denom = sqrtf(easq / bc2) + d_lr * eps;
@@ -203,9 +203,9 @@ void launch_fused_prodigy_step(
         param.scalar_type(), "fused_prodigy_step", ([&] {
             fused_prodigy_step_kernel<scalar_t><<<grid, PRODIGY_BLOCK_SIZE>>>(
                 param.data_ptr<scalar_t>(),
-                exp_avg.data_ptr<scalar_t>(),
-                exp_avg_sq.data_ptr<scalar_t>(),
-                s.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(),
+                exp_avg_sq.data_ptr<float>(),
+                s.data_ptr<float>(),
                 grad.data_ptr<scalar_t>(),
                 d_lr,
                 beta1,

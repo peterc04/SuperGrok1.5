@@ -386,43 +386,45 @@ __global__ void dsa_sparse_attention_kernel(
 template <typename scalar_t>
 __global__ void fused_adam_decay_kernel(
     scalar_t* __restrict__ param,
-    scalar_t* __restrict__ exp_avg,
-    scalar_t* __restrict__ exp_avg_sq,
+    float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq,
     const scalar_t* __restrict__ smart_grad,
     const scalar_t* __restrict__ mu,
-    const scalar_t lamb_eff,
-    const scalar_t beta1,
-    const scalar_t beta2,
-    const scalar_t lr,
-    const scalar_t wd_eff,
-    const scalar_t eps,
-    const scalar_t bc1,
-    const scalar_t bc2,
+    const float lamb_eff,
+    const float beta1,
+    const float beta2,
+    const float lr,
+    const float wd_eff,
+    const float eps,
+    const float bc1,
+    const float bc2,
     const int N
 ) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
 
-    // Final gradient = smart_grad + lambda * mu
-    const scalar_t fg = smart_grad[idx] + lamb_eff * mu[idx];
+    // Read in native precision, compute in FP32
+    const float sg = static_cast<float>(smart_grad[idx]);
+    const float m = static_cast<float>(mu[idx]);
 
-    // Adam moment updates
-    const scalar_t ea = beta1 * exp_avg[idx]
-                      + (static_cast<scalar_t>(1) - beta1) * fg;
-    const scalar_t easq = beta2 * exp_avg_sq[idx]
-                        + (static_cast<scalar_t>(1) - beta2) * fg * fg;
-    exp_avg[idx]    = ea;
+    // Final gradient = smart_grad + lambda * mu
+    const float fg = sg + lamb_eff * m;
+
+    // Adam moment updates (FP32 state)
+    const float ea = beta1 * exp_avg[idx] + (1.0f - beta1) * fg;
+    const float easq = beta2 * exp_avg_sq[idx] + (1.0f - beta2) * fg * fg;
+    exp_avg[idx] = ea;
     exp_avg_sq[idx] = easq;
 
     // Bias-corrected step
-    const scalar_t step_size = lr / bc1;
-    const scalar_t denom = sqrtf(static_cast<float>(easq / bc2)) + eps;
+    const float step_size = lr / bc1;
+    const float denom = sqrtf(easq / bc2) + eps;
 
     // Progressive weight decay + Adam step (fused)
-    scalar_t p = param[idx];
-    p *= (static_cast<scalar_t>(1) - lr * wd_eff);
+    float p = static_cast<float>(param[idx]);
+    p *= (1.0f - lr * wd_eff);
     p -= step_size * ea / denom;
-    param[idx] = p;
+    param[idx] = static_cast<scalar_t>(p);
 }
 
 
@@ -621,18 +623,18 @@ void launch_fused_adam_decay(
         param.scalar_type(), "fused_adam_decay", ([&] {
             fused_adam_decay_kernel<scalar_t><<<grid, BLOCK_SIZE>>>(
                 param.data_ptr<scalar_t>(),
-                exp_avg.data_ptr<scalar_t>(),
-                exp_avg_sq.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(),
+                exp_avg_sq.data_ptr<float>(),
                 smart_grad.data_ptr<scalar_t>(),
                 mu.data_ptr<scalar_t>(),
-                static_cast<scalar_t>(lamb_eff),
-                static_cast<scalar_t>(beta1),
-                static_cast<scalar_t>(beta2),
-                static_cast<scalar_t>(lr),
-                static_cast<scalar_t>(wd_eff),
-                static_cast<scalar_t>(eps),
-                static_cast<scalar_t>(bc1),
-                static_cast<scalar_t>(bc2),
+                lamb_eff,
+                beta1,
+                beta2,
+                lr,
+                wd_eff,
+                eps,
+                bc1,
+                bc2,
                 N
             );
         })

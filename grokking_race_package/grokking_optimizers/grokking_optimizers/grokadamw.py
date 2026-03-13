@@ -131,13 +131,13 @@ class GrokAdamW(Optimizer):
                 exp_avg_sq_list,
                 ema_list,
                 step_list,
-                group["lr"],
-                group["betas"][0],
-                group["betas"][1],
-                group["eps"],
-                group["weight_decay"],
                 group["alpha"],
                 group["lamb"],
+                group["betas"][0],
+                group["betas"][1],
+                group["lr"],
+                group["weight_decay"],
+                group["eps"],
                 group["grad_clip"],
             )
 
