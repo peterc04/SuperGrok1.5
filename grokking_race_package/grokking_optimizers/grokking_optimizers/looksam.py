@@ -16,6 +16,7 @@ from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
 from grokking_optimizers import _ops
+from grokking_optimizers._adamw_helper import adamw_step
 
 
 class LookSAM(Optimizer):
@@ -126,7 +127,7 @@ class LookSAM(Optimizer):
             if len(params_list) == 0:
                 continue
 
-            _ops.adamw_fused_step(
+            adamw_step(
                 params_list,
                 grads_list,
                 exp_avg_list,
