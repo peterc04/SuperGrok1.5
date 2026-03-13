@@ -9,9 +9,9 @@
   Vision Transformer   →  MNIST (a + b) mod 97         [16 patches + CLS]
   Mamba SSM            →  (a÷b₁÷b₂÷b₃) mod 97        [8-token chain]
 
-11 optimizers:
-  AdamW, NeuralGrok, GrokAdamW, SuperGrok (v1.1), SuperGrok1.5 (C++/CUDA),
-  Grokfast, Muon, Lion, LookSAM, Prodigy
+11 optimizers (all C++/CUDA accelerated via grokking_optimizers package):
+  AdamW, NeuralGrok, GrokAdamW, SuperGrok (v1.1), SuperGrok1.5,
+  SuperGrok2 (Sparse Attention), Grokfast, Muon, Lion, LookSAM, Prodigy
 
 USAGE:
   # First time — install everything:
@@ -51,36 +51,17 @@ def run_setup():
     print("  INSTALLING DEPENDENCIES")
     print("=" * 55)
 
-    _sh("pip install -q torch torchvision matplotlib numpy tqdm "
-        "grokadamw lion-pytorch pytorch-optimizer prodigyopt requests")
+    _sh("pip install -q torch torchvision matplotlib numpy tqdm requests")
 
-    os.makedirs("repos", exist_ok=True)
-    for url, dst, branch in [
-        ("https://github.com/ironjr/grokfast.git",         "repos/grokfast",      None),
-        ("https://github.com/Blackzxy/NeuralOptGrok.git",  "repos/NeuralOptGrok", "neuralgrad"),
-        ("https://github.com/peterc04/SuperGrok.git",      "repos/SuperGrok",     None),
-    ]:
-        if not os.path.exists(dst):
-            try:
-                b = f" -b {branch}" if branch else ""
-                _sh(f"git clone -q{b} {url} {dst}")
-            except Exception:
-                _sh(f"git clone -q {url} {dst}")
-        else:
-            print(f"  ✓ {dst} already exists")
-
-    if os.path.exists("repos/SuperGrok/supergrok_package"):
-        _sh("pip install -q -e repos/SuperGrok/supergrok_package/")
-
-    # Build SuperGrok v1.5 C++/CUDA extension
-    if os.path.exists("supergrok15_cpp"):
-        print("Building SuperGrok v1.5 C++ extension …")
-        _sh("pip install -q -e supergrok15_cpp/")
-    elif os.path.exists("repos/SuperGrok/supergrok15_cpp"):
-        print("Building SuperGrok v1.5 C++ extension …")
-        _sh("pip install -q -e repos/SuperGrok/supergrok15_cpp/")
+    # Build grokking_optimizers C++/CUDA extension (all optimizers)
+    opt_pkg = os.path.join(os.path.dirname(__file__), "grokking_optimizers")
+    if not os.path.exists(opt_pkg):
+        opt_pkg = "grokking_optimizers"
+    if os.path.exists(opt_pkg):
+        print("Building grokking_optimizers C++/CUDA extension …")
+        _sh(f"pip install -q -e {opt_pkg}/")
     else:
-        print("  ⚠ supergrok15_cpp/ not found — SuperGrok 1.5 will use Python fallback")
+        print("  ⚠ grokking_optimizers/ not found — install with: pip install -e grokking_optimizers/")
 
     # Pre-download MNIST
     print("Downloading MNIST …")
@@ -475,9 +456,6 @@ import numpy as np, warnings
 from tqdm.auto import tqdm
 
 REPO = Path(".") / "repos"
-for _p in [REPO/"NeuralOptGrok"/"src", REPO/"NeuralOptGrok",
-           REPO/"SuperGrok"/"supergrok_package"]:
-    if _p.exists(): sys.path.insert(0, str(_p))
 
 class TrainResult:
     __slots__ = ("name","seed","steps","train_losses","train_accs",
@@ -527,14 +505,11 @@ def _load(c, device, init_state):
 def _tr(name, c):
     return TrainResult(name, c["seed"], c.get("model_type","decoder"), c.get("frac_train",0.5))
 
-# ── C++/CUDA fused kernels (Layer 1 of optimization stack) ────────────
-# Provides fused optimizer step kernels for Grokfast, Lion, LookSAM, Muon
-# in addition to the existing SuperGrok v1.5 kernels.
-_fused_ops = None
-try:
-    from supergrok15_cpp import _ops as _fused_ops
-except ImportError:
-    pass  # Fall back to pure Python (no speed penalty for correctness)
+# ── C++/CUDA fused optimizers (grokking_optimizers package) ────────────
+from grokking_optimizers import (
+    SuperGrok15, SuperGrok2, SuperGrok11, SparseAttentionMetaNet,
+    GrokAdamW, NeuralGrok, Prodigy, Grokfast, Lion, LookSAM, Muon,
+)
 
 # ── 1. AdamW ──────────────────────────────────────────────────────────
 def train_adamw(c, init, tx, ty, vx, vy, dev, bp=0):
@@ -549,32 +524,20 @@ def train_adamw(c, init, tx, ty, vx, vy, dev, bp=0):
     pb.close(); return _fin(r,st,step,t0)
 
 # ── 2. NeuralGrok ─────────────────────────────────────────────────────
-class _Amplifier(nn.Module):
-    def __init__(self, nl=3, hd=128):
-        super().__init__(); layers=[]
-        for i in range(nl):
-            if i==0: layers+=[nn.Linear(1,hd),nn.ReLU()]
-            elif i==nl-1: layers+=[nn.Linear(hd,1)]
-            else: layers+=[nn.Linear(hd,hd),nn.ReLU()]
-        self.net=nn.Sequential(*layers)
-    def forward(self,g): s=g.shape; return self.net(g.reshape(-1,1)).reshape(s)
-
 def train_neuralgrok(c, init, tx, ty, vx, vy, dev, bp=0):
-    nl=c.get("neural_layers",3); hd=c.get("neural_hidden",128)
-    alpha=c.get("neural_alpha",10.); beta=c.get("neural_beta",4.); ist=c.get("inner_steps",1)
-    r=_tr("NeuralGrok",c); m=_load(c,dev,init); amp=_Amplifier(nl,hd).to(dev)
-    mopt=torch.optim.AdamW(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]), weight_decay=c["weight_decay"])
-    aopt=torch.optim.Adam(amp.parameters(), lr=1e-3)
+    r=_tr("NeuralGrok",c); m=_load(c,dev,init)
+    opt=NeuralGrok(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
+        weight_decay=c["weight_decay"], alpha=c.get("neural_alpha",10.0),
+        beta=c.get("neural_beta",4.0), num_layers=c.get("neural_layers",3),
+        hidden_dim=c.get("neural_hidden",128), inner_steps=c.get("inner_steps",1),
+        grad_clip=c.get("neural_grad_clip",1.0))
+    opt.amplifier=opt.amplifier.to(dev)
+    aopt=opt.get_amplifier_optimizer(lr=1e-3)
     ni=int(tx.size(0)*0.9); ix,ox,iy,oy = tx[:ni],tx[ni:],ty[:ni],ty[ni:]
-    st=_stopper(c); m.train(); amp.train(); t0=time.time()
+    st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("NeuralGrok",c["max_steps"],bp)):
-        for _ in range(ist):
-            loss=F.cross_entropy(m(ix),iy); mopt.zero_grad(); loss.backward()
-            with torch.no_grad():
-                for p in m.parameters():
-                    if p.grad is not None: p.grad.data = p.grad.data + alpha*amp(p.grad.data)
-            mopt.step()
-        aopt.zero_grad(); (beta*F.cross_entropy(m(ox),oy)).backward(); aopt.step()
+        loss=F.cross_entropy(m(ix),iy); opt.zero_grad(); loss.backward(); opt.step()
+        aopt.zero_grad(); (c.get("neural_beta",4.0)*F.cross_entropy(m(ox),oy)).backward(); aopt.step()
         if step%c["log_every"]==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
             if done: break
@@ -582,31 +545,26 @@ def train_neuralgrok(c, init, tx, ty, vx, vy, dev, bp=0):
 
 # ── 3. GrokAdamW ──────────────────────────────────────────────────────
 def train_grokadamw(c, init, tx, ty, vx, vy, dev, bp=0):
-    from grokadamw import GrokAdamW
     r=_tr("GrokAdamW",c); m=_load(c,dev,init)
-    _L={"t":0.,"v":0.}
-    def gsf(): return (_L["v"]-_L["t"])/_L["t"] if _L["t"]!=0 else 0.
     opt=GrokAdamW(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
-        weight_decay=c["weight_decay"], alpha_init=c.get("grokadamw_alpha",0.98),
-        lamb=c.get("grokadamw_lamb",2.0), gamma=c.get("grokadamw_gamma",0.1),
-        grokking_signal_fns=[gsf], grokking_signal_decay_rate=c.get("grokadamw_decay",0.1),
-        gradient_clipping=c.get("grokadamw_grad_clip",1.0))
+        weight_decay=c["weight_decay"], alpha=c.get("grokadamw_alpha",0.98),
+        lamb=c.get("grokadamw_lamb",5.0), gamma=c.get("grokadamw_gamma",0.1),
+        decay=c.get("grokadamw_decay",0.1), grad_clip=c.get("grokadamw_grad_clip",1.0))
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("GrokAdamW",c["max_steps"],bp)):
         loss=F.cross_entropy(m(tx),ty); opt.zero_grad(); loss.backward(); opt.step()
         if step%c["log_every"]==0 or step==1:
-            done,tl,vl=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb); _L["t"]=tl; _L["v"]=vl
+            done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
             if done: break
     pb.close(); return _fin(r,st,step,t0)
 
 # ── 4. SuperGrok v1.1 ─────────────────────────────────────────────────
 def train_supergrok(c, init, tx, ty, vx, vy, dev, bp=0):
-    from supergrok import SuperGrok
     muf=c.get("supergrok_meta_update_freq",5)
     r=_tr("SuperGrok",c); m=_load(c,dev,init)
-    opt=SuperGrok(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
+    opt=SuperGrok11(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
         weight_decay=c["weight_decay"], alpha_init=c.get("supergrok_alpha",0.98),
-        lamb=c.get("supergrok_lamb",2.0), gamma=c.get("supergrok_gamma",0.1),
+        lamb=c.get("supergrok_lamb",5.0), gamma=c.get("supergrok_gamma",0.1),
         kappa=c.get("supergrok_kappa",0.1), warmup_steps=c.get("supergrok_warmup",100),
         warmup_ramp=c.get("supergrok_warmup_ramp",100),
         gradient_clipping=c.get("supergrok_grad_clip",1.0),
@@ -615,7 +573,6 @@ def train_supergrok(c, init, tx, ty, vx, vy, dev, bp=0):
         zero_loss_threshold=c.get("supergrok_zero_loss_thresh",1e-4),
         zero_acc_threshold=c.get("supergrok_zero_acc_thresh",0.995),
         meta_hidden_dim=c.get("supergrok_meta_dim",32))
-    # Move meta-net to device and create its optimizer
     opt.meta_net=opt.meta_net.to(dev)
     mopt=torch.optim.Adam(opt.meta_net.parameters(), lr=1e-4)
     crit_sg=nn.CrossEntropyLoss()
@@ -623,14 +580,11 @@ def train_supergrok(c, init, tx, ty, vx, vy, dev, bp=0):
     for step in (pb:=_pbar("SuperGrok",c["max_steps"],bp)):
         logits=m(tx); loss=F.cross_entropy(logits,ty); opt.zero_grad(); loss.backward()
         train_loss_val=loss.item()
-        # Compute train accuracy for memorization detection (reuse logits)
         with torch.no_grad():
             train_acc=(logits.detach()[:,:c["p"]].argmax(-1)==ty).float().mean().item()
-        # Bilevel meta-net update via meta_step (every muf steps)
         if step%muf==0:
             try: opt.meta_step(m, vx, vy, crit_sg, mopt)
             except Exception as e: warnings.warn(f"SuperGrok meta_step failed at step {step}: {e}")
-        # Optimizer step with full signals
         kw={"train_loss":train_loss_val, "train_acc":train_acc}
         if step%c.get("supergrok_alpha_update_freq",50)==0:
             with torch.no_grad():
@@ -645,7 +599,6 @@ def train_supergrok(c, init, tx, ty, vx, vy, dev, bp=0):
 
 # ── 4b. SuperGrok v1.5 ────────────────────────────────────────────────
 def train_supergrok15(c, init, tx, ty, vx, vy, dev, bp=0):
-    from supergrok15_cpp import SuperGrok15
     r=_tr("SuperGrok1.5",c); m=_load(c,dev,init)
     opt=SuperGrok15(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
         weight_decay=c["weight_decay"], alpha_init=c.get("supergrok15_alpha",0.98),
@@ -708,81 +661,92 @@ def train_supergrok15(c, init, tx, ty, vx, vy, dev, bp=0):
             if done: break
     pb.close(); return _fin(r,st,step,t0)
 
+# ── 4c. SuperGrok v2 (Sparse Attention) ──────────────────────────────
+def train_supergrok2(c, init, tx, ty, vx, vy, dev, bp=0):
+    r=_tr("SuperGrok2",c); m=_load(c,dev,init)
+    opt=SuperGrok2(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
+        weight_decay=c["weight_decay"], alpha_init=c.get("sg2_alpha",0.98),
+        lamb=c.get("sg2_lamb",2.0), gamma=c.get("sg2_gamma",0.1),
+        kappa=c.get("sg2_kappa",0.1), warmup_steps=c.get("sg2_warmup",100),
+        warmup_ramp=c.get("sg2_warmup_ramp",100),
+        gradient_clipping=c.get("sg2_grad_clip",1.0),
+        d_head=c.get("sg2_d_head",16), n_idx_heads=c.get("sg2_n_idx_heads",4),
+        top_k=c.get("sg2_top_k",64),
+        alpha_update_freq=c.get("sg2_alpha_update_freq",50),
+        zero_loss_threshold=c.get("sg2_zero_loss_thresh",1e-4),
+        zero_acc_threshold=c.get("sg2_zero_acc_thresh",0.995),
+        sam_rho=c.get("sg2_sam_rho",0.05),
+        gate_scale=c.get("sg2_gate_scale",20.0), gate_thresh=c.get("sg2_gate_thresh",0.8),
+        sam_freq_min=c.get("sg2_sam_freq_min",3), sam_freq_max=c.get("sg2_sam_freq_max",20),
+        sam_scale=c.get("sg2_sam_scale",20.0), sam_thresh=c.get("sg2_sam_thresh",0.85),
+        bilevel_freq_min=c.get("sg2_bilevel_freq_min",5), bilevel_freq_max=c.get("sg2_bilevel_freq_max",30),
+        bilevel_scale=c.get("sg2_bilevel_scale",20.0), bilevel_thresh=c.get("sg2_bilevel_thresh",0.9),
+        wd_ramp=c.get("sg2_wd_ramp",4.0), wd_scale=c.get("sg2_wd_scale",20.0),
+        wd_thresh=c.get("sg2_wd_thresh",0.9))
+    opt.meta_net=opt.meta_net.to(dev)
+    mopt=torch.optim.Adam(opt.meta_net.parameters(), lr=1e-4)
+    crit_s2=nn.CrossEntropyLoss()
+    alpha_freq=c.get("sg2_alpha_update_freq",50)
+    st=_stopper(c); m.train(); t0=time.time()
+    for step in (pb:=_pbar("SuperGrok2",c["max_steps"],bp)):
+        logits=m(tx); loss=F.cross_entropy(logits,ty); opt.zero_grad(); loss.backward()
+        # Adaptive SAM (sigmoid-driven frequency)
+        sam_freq_eff=opt._get_effective_sam_freq()
+        if step%sam_freq_eff==0:
+            try: opt.sam_step(m, tx, ty, crit_s2)
+            except Exception as e: warnings.warn(f"SuperGrok2 sam_step failed at step {step}: {e}")
+        # Adaptive bilevel (independent sigmoid-driven frequency)
+        bilevel_freq_eff=opt._get_effective_bilevel_freq()
+        if step%bilevel_freq_eff==0:
+            try: opt.bilevel_step(m, tx, ty, vx, vy, crit_s2, mopt)
+            except Exception as e: warnings.warn(f"SuperGrok2 bilevel_step failed at step {step}: {e}")
+        # Deferred metrics
+        eval_freq=_progressive_eval_freq(step, base_freq=c["log_every"])
+        kw={}
+        needs_metrics=(step%alpha_freq==0) or (step%eval_freq==0) or step==1
+        if needs_metrics:
+            with torch.no_grad():
+                train_loss_val=loss.item()
+                train_acc=(logits.detach()[:,:c["p"]].argmax(-1)==ty).float().mean().item()
+            kw["train_loss"]=train_loss_val; kw["train_acc"]=train_acc
+            if step%alpha_freq==0:
+                with torch.no_grad():
+                    vl_s2=F.cross_entropy(m(vx),vy).item()
+                kw["val_loss"]=vl_s2
+        try: opt.step(**kw)
+        except TypeError: opt.step()
+        if step%eval_freq==0 or step==1:
+            done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
+            if done: break
+    pb.close(); return _fin(r,st,step,t0)
+
 # ── 5. Grokfast ───────────────────────────────────────────────────────
-def _grokfast_ema(model, grads, alpha=0.98, lamb=2.0):
-    if grads is None:
-        return {n: p.grad.data.detach().clone() for n,p in model.named_parameters() if p.requires_grad and p.grad is not None}
-    for n,p in model.named_parameters():
-        if p.requires_grad and p.grad is not None:
-            grads[n] = grads[n]*alpha + p.grad.data.detach()*(1-alpha)
-            p.grad.data = p.grad.data + grads[n]*lamb
-    return grads
-
-def _grokfast_ema_fused(model, ema_bufs, alpha=0.98, lamb=2.0):
-    """Fused C++/CUDA EMA: processes all params in one C++ loop, no Python overhead."""
-    grads = [p.grad.data for p in model.parameters() if p.requires_grad and p.grad is not None]
-    _fused_ops.grokfast_fused_step(grads, ema_bufs, alpha, lamb)
-
 def train_grokfast(c, init, tx, ty, vx, vy, dev, bp=0):
     r=_tr("Grokfast",c); m=_load(c,dev,init)
-    opt=torch.optim.AdamW(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]), weight_decay=c["weight_decay"])
+    opt=Grokfast(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
+        weight_decay=c["weight_decay"], grokfast_alpha=c.get("grokfast_alpha",0.98),
+        grokfast_lamb=c.get("grokfast_lamb",2.0))
     st=_stopper(c); m.train(); t0=time.time()
-    use_fused = _fused_ops is not None
-    alpha_gf, lamb_gf = c.get("grokfast_alpha",0.98), c.get("grokfast_lamb",2.0)
-    if use_fused:
-        ema_bufs = [torch.zeros_like(p) for p in m.parameters() if p.requires_grad]
-        ema_init = False
-    else:
-        grads = None
     for step in (pb:=_pbar("Grokfast",c["max_steps"],bp)):
-        loss=F.cross_entropy(m(tx),ty); opt.zero_grad(); loss.backward()
-        if use_fused:
-            if not ema_init:
-                for i, p in enumerate(p_ for p_ in m.parameters() if p_.requires_grad and p_.grad is not None):
-                    ema_bufs[i].copy_(p.grad.data)
-                ema_init = True
-            _grokfast_ema_fused(m, ema_bufs, alpha_gf, lamb_gf)
-        else:
-            grads=_grokfast_ema(m, grads, alpha_gf, lamb_gf)
-        opt.step()
+        loss=F.cross_entropy(m(tx),ty); opt.zero_grad(); loss.backward(); opt.step()
         if step%c["log_every"]==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
             if done: break
     pb.close(); return _fin(r,st,step,t0)
 
 # ── 6. Muon ───────────────────────────────────────────────────────────
-def _newton_schulz(M, steps=5):
-    a,b,c_ = 3.4445,-4.7750,2.0315; X = M/(M.norm()+1e-7)
-    for _ in range(steps): A=X@X.T; X=a*X+b*(A@X)+c_*(A@(A@X))
-    return X
-
 def train_muon(c, init, tx, ty, vx, vy, dev, bp=0):
     r=_tr("Muon",c); m=_load(c,dev,init)
-    muon_lr=c.get("muon_lr",c["lr"]*20); muon_mom=c.get("muon_momentum",0.95)
     muon_params, adam_params = [], []
     for n,p in m.named_parameters():
         if p.requires_grad: (muon_params if p.ndim==2 else adam_params).append(p)
-    adam_opt = torch.optim.AdamW(adam_params, lr=c["lr"], betas=(c["beta1"],c["beta2"]),
-        weight_decay=c["weight_decay"]) if adam_params else None
-    bufs=[torch.zeros_like(p) for p in muon_params]
-    use_fused = _fused_ops is not None
+    opt=Muon(muon_params, params_1d=adam_params if adam_params else None,
+        lr=c.get("muon_lr",0.02), momentum=c.get("muon_momentum",0.95),
+        weight_decay=c["weight_decay"], adamw_lr=c["lr"],
+        adamw_betas=(c["beta1"],c["beta2"]))
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("Muon",c["max_steps"],bp)):
-        loss=F.cross_entropy(m(tx),ty); m.zero_grad(); loss.backward()
-        if use_fused:
-            muon_grads = [p.grad.data if p.grad is not None else torch.Tensor() for p in muon_params]
-            with torch.no_grad():
-                _fused_ops.muon_fused_step(muon_params, muon_grads, bufs,
-                    muon_mom, muon_lr, c["weight_decay"], 5)
-        else:
-            with torch.no_grad():
-                for p, buf in zip(muon_params, bufs):
-                    if p.grad is None: continue
-                    buf.mul_(muon_mom).add_(p.grad); orth=_newton_schulz(buf)
-                    scale=0.2*math.sqrt(max(buf.shape[0],buf.shape[1]))
-                    p.data.add_(orth, alpha=-muon_lr*scale/max(buf.shape[0],buf.shape[1])**0.5)
-                    p.data.mul_(1 - c["lr"] * c["weight_decay"])
-        if adam_opt: adam_opt.step()
+        loss=F.cross_entropy(m(tx),ty); opt.zero_grad(); loss.backward(); opt.step()
         if step%c["log_every"]==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
             if done: break
@@ -791,28 +755,11 @@ def train_muon(c, init, tx, ty, vx, vy, dev, bp=0):
 # ── 7. Lion ───────────────────────────────────────────────────────────
 def train_lion(c, init, tx, ty, vx, vy, dev, bp=0):
     r=_tr("Lion",c); m=_load(c,dev,init)
-    lion_lr=c.get("lion_lr",c["lr"]/3); lion_wd=c.get("lion_wd",c["weight_decay"]*3)
-    use_fused = _fused_ops is not None
-    if use_fused:
-        # Use fused C++/CUDA Lion kernel — no Python package needed
-        params_list = list(m.parameters())
-        exp_avgs = [torch.zeros_like(p) for p in params_list]
-    else:
-        from lion_pytorch import Lion
-        opt=Lion(m.parameters(), lr=lion_lr, weight_decay=lion_wd)
+    opt=Lion(m.parameters(), lr=c.get("lion_lr",3e-4),
+        betas=(c["beta1"],0.99), weight_decay=c.get("lion_wd",3.0))
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("Lion",c["max_steps"],bp)):
-        loss=F.cross_entropy(m(tx),ty)
-        if use_fused:
-            for p in params_list:
-                if p.grad is not None: p.grad.zero_()
-            loss.backward()
-            grads = [p.grad.data if p.grad is not None else torch.Tensor() for p in params_list]
-            with torch.no_grad():
-                _fused_ops.lion_fused_step(params_list, grads, exp_avgs,
-                    lion_lr, c["beta1"], 0.99, lion_wd)
-        else:
-            opt.zero_grad(); loss.backward(); opt.step()
+        loss=F.cross_entropy(m(tx),ty); opt.zero_grad(); loss.backward(); opt.step()
         if step%c["log_every"]==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
             if done: break
@@ -821,55 +768,16 @@ def train_lion(c, init, tx, ty, vx, vy, dev, bp=0):
 # ── 9. LookSAM ───────────────────────────────────────────────────────
 def train_looksam(c, init, tx, ty, vx, vy, dev, bp=0):
     r=_tr("LookSAM",c); m=_load(c,dev,init)
-    rho=c.get("looksam_rho",0.05); k=c.get("looksam_k",5); la=c.get("looksam_alpha",0.7)
-    opt=torch.optim.AdamW(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]), weight_decay=c["weight_decay"])
-    use_fused = _fused_ops is not None
-    if use_fused:
-        params_list = [p for p in m.parameters() if p.requires_grad]
-        v_dir_list = [torch.zeros_like(p) for p in params_list]
-        v_dir_init = False
-    else:
-        v_dir={}
+    k=c.get("looksam_k",5)
+    opt=LookSAM(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
+        weight_decay=c["weight_decay"], rho=c.get("looksam_rho",0.05),
+        k=k, alpha=c.get("looksam_alpha",0.7))
+    crit_ls=nn.CrossEntropyLoss()
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("LookSAM",c["max_steps"],bp)):
         loss=F.cross_entropy(m(tx),ty); opt.zero_grad(); loss.backward()
-        if step%k==1 or k==1:
-            if use_fused:
-                # Save normal gradients, perturb, compute SAM grads, restore, get direction
-                normal_grads = [p.grad.data.clone() for p in params_list]
-                backups = _fused_ops.looksam_perturb_all(params_list, normal_grads, rho)
-                opt.zero_grad(); F.cross_entropy(m(tx),ty).backward()
-                sam_grads = [p.grad.data.clone() if p.grad is not None else torch.zeros_like(p) for p in params_list]
-                _fused_ops.looksam_restore_all(params_list, backups)
-                _fused_ops.looksam_compute_directions(v_dir_list, sam_grads, normal_grads)
-                # Restore original gradients for AdamW step
-                for p, ng in zip(params_list, normal_grads):
-                    if p.grad is not None: p.grad.data.copy_(ng)
-                v_dir_init = True
-            else:
-                sg={}; gnorm=0.
-                for n,p in m.named_parameters():
-                    if p.grad is not None: sg[n]=p.grad.data.clone(); gnorm+=p.grad.data.norm()**2
-                gnorm=gnorm**0.5
-                with torch.no_grad():
-                    for n,p in m.named_parameters():
-                        if n in sg: p.data.add_(sg[n], alpha=rho/max(gnorm,1e-12))
-                opt.zero_grad(); F.cross_entropy(m(tx),ty).backward()
-                with torch.no_grad():
-                    for n,p in m.named_parameters():
-                        if n in sg:
-                            p.data.sub_(sg[n], alpha=rho/max(gnorm,1e-12))
-                            if p.grad is not None:
-                                v_dir[n]=p.grad.data-sg[n]; vn=v_dir[n].norm()
-                                if vn>1e-12: v_dir[n]/=vn
-        else:
-            if use_fused and v_dir_init:
-                grads = [p.grad.data if p.grad is not None else torch.Tensor() for p in params_list]
-                _fused_ops.looksam_adjust_grads(grads, v_dir_list, la)
-            elif not use_fused:
-                with torch.no_grad():
-                    for n,p in m.named_parameters():
-                        if p.grad is not None and n in v_dir: p.grad.data+=la*p.grad.data.norm()*v_dir[n]
+        if opt.should_sam_step():
+            opt.sam_step(m, tx, ty, crit_ls)
         opt.step()
         if step%c["log_every"]==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
@@ -878,7 +786,6 @@ def train_looksam(c, init, tx, ty, vx, vy, dev, bp=0):
 
 # ── 10. Prodigy ───────────────────────────────────────────────────────
 def train_prodigy(c, init, tx, ty, vx, vy, dev, bp=0):
-    from prodigyopt import Prodigy
     r=_tr("Prodigy",c); m=_load(c,dev,init)
     opt=Prodigy(m.parameters(), lr=c.get("prodigy_lr",1.0), weight_decay=c["weight_decay"])
     st=_stopper(c); m.train(); t0=time.time()
@@ -893,20 +800,20 @@ def train_prodigy(c, init, tx, ty, vx, vy, dev, bp=0):
 OPTIMIZER_REGISTRY = {
     "adamw":train_adamw, "neuralgrok":train_neuralgrok,
     "grokadamw":train_grokadamw, "supergrok":train_supergrok,
-    "supergrok15":train_supergrok15,
+    "supergrok15":train_supergrok15, "supergrok2":train_supergrok2,
     "grokfast":train_grokfast, "muon":train_muon,
     "lion":train_lion,
     "looksam":train_looksam, "prodigy":train_prodigy,
 }
 COLORS = {
     "adamw":"#1f77b4","neuralgrok":"#ff7f0e","grokadamw":"#2ca02c",
-    "supergrok":"#d62728","supergrok15":"#ff4444",
+    "supergrok":"#d62728","supergrok15":"#ff4444","supergrok2":"#ff8800",
     "grokfast":"#9467bd","muon":"#8c564b",
     "lion":"#e377c2","looksam":"#bcbd22","prodigy":"#17becf",
 }
 DISPLAY_NAMES = {
     "adamw":"AdamW","neuralgrok":"NeuralGrok","grokadamw":"GrokAdamW",
-    "supergrok":"SuperGrok","supergrok15":"SuperGrok1.5",
+    "supergrok":"SuperGrok","supergrok15":"SuperGrok1.5","supergrok2":"SuperGrok2",
     "grokfast":"Grokfast","muon":"Muon",
     "lion":"Lion","looksam":"LookSAM","prodigy":"Prodigy",
 }
@@ -1518,6 +1425,20 @@ if __name__ == "__main__":
                        "supergrok15_bilevel_scale": 20.0, "supergrok15_bilevel_thresh": 0.9,
                        "supergrok15_wd_ramp": 4.0, "supergrok15_wd_scale": 20.0,
                        "supergrok15_wd_thresh": 0.9},
+        "supergrok2": {"weight_decay": 1.0, "sg2_alpha": 0.98, "sg2_lamb": 2.0,
+                       "sg2_gamma": 0.1, "sg2_kappa": 0.1, "sg2_warmup": 100,
+                       "sg2_warmup_ramp": 100, "sg2_grad_clip": 1.0,
+                       "sg2_d_head": 16, "sg2_n_idx_heads": 4, "sg2_top_k": 64,
+                       "sg2_alpha_update_freq": 50,
+                       "sg2_zero_loss_thresh": 1e-4, "sg2_zero_acc_thresh": 0.995,
+                       "sg2_sam_rho": 0.05,
+                       "sg2_gate_scale": 20.0, "sg2_gate_thresh": 0.8,
+                       "sg2_sam_freq_min": 3, "sg2_sam_freq_max": 20,
+                       "sg2_sam_scale": 20.0, "sg2_sam_thresh": 0.85,
+                       "sg2_bilevel_freq_min": 5, "sg2_bilevel_freq_max": 30,
+                       "sg2_bilevel_scale": 20.0, "sg2_bilevel_thresh": 0.9,
+                       "sg2_wd_ramp": 4.0, "sg2_wd_scale": 20.0,
+                       "sg2_wd_thresh": 0.9},
         "grokfast":   {"weight_decay": 1.0, "grokfast_alpha": 0.98, "grokfast_lamb": 2.0},
         "muon":       {"weight_decay": 1.0, "muon_lr": 0.02, "muon_momentum": 0.95},
         "lion":       {"lion_lr": 3e-4, "lion_wd": 3.0},
@@ -1527,7 +1448,7 @@ if __name__ == "__main__":
     }
 
     ALL_OPTIMIZERS = ["adamw","neuralgrok","grokadamw","supergrok","supergrok15",
-                      "grokfast","muon","lion","looksam","prodigy"]
+                      "supergrok2","grokfast","muon","lion","looksam","prodigy"]
 
     _common = dict(
         optimizer_configs=optimizer_configs,
