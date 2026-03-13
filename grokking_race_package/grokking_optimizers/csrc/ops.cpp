@@ -75,19 +75,18 @@ void supergrok15_fused_step(
         float bc1 = 1.0f - std::pow(beta1, static_cast<float>(step));
         float bc2 = 1.0f - std::pow(beta2, static_cast<float>(step));
 
-        auto smart_grad = torch::empty_like(params[i]);
-
 #ifdef WITH_CUDA
         if (params[i].is_cuda()) {
-            launch_fused_mu_metanet(
-                mus[i], grads[i], sharpness_cache[i], smart_grad, alpha,
-                W1, b1, W2, b2, rescale, hidden_dim);
-            launch_fused_adam_decay(
-                params[i], exp_avgs[i], exp_avg_sqs[i], smart_grad, mus[i],
-                lamb_eff, beta1, beta2, lr, wd_eff, eps, bc1, bc2);
+            launch_fused_supergrok15_full_step(
+                params[i], exp_avgs[i], exp_avg_sqs[i], mus[i],
+                grads[i], sharpness_cache[i], alpha,
+                W1, b1, W2, b2, rescale,
+                lamb_eff, beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+                hidden_dim);
             continue;
         }
 #endif
+        auto smart_grad = torch::empty_like(params[i]);
         // CPU fallback using ATen
         mus[i].mul_(alpha).add_(grads[i], 1.0f - alpha);
         auto shape = grads[i].sizes().vec();
@@ -230,12 +229,21 @@ void supergrok2_fused_step(
 #ifdef WITH_CUDA
     if (max_N > 0 && n_params > 0 && params[0].is_cuda()) {
         auto dev = params[0].device();
-        auto opts_f = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
-        Q_buf = torch::empty({max_N, d_head}, opts_f);
-        K_buf = torch::empty({max_N, d_head}, opts_f);
-        V_buf = torch::empty({max_N, d_head}, opts_f);
-        idx_q_buf = torch::empty({max_N, n_idx_heads}, opts_f);
-        idx_k_buf = torch::empty({max_N, n_idx_heads}, opts_f);
+        // Find first defined grad to determine dtype (must match grad.scalar_type()
+        // since dsa_project and dsa_sparse_attention dispatch on grad dtype)
+        auto grad_dtype = torch::kFloat32;
+        for (size_t i = 0; i < n_params; i++) {
+            if (grads[i].defined() && grads[i].numel() > 0) {
+                grad_dtype = grads[i].scalar_type();
+                break;
+            }
+        }
+        auto opts_proj = torch::TensorOptions().device(dev).dtype(grad_dtype);
+        Q_buf = torch::empty({max_N, d_head}, opts_proj);
+        K_buf = torch::empty({max_N, d_head}, opts_proj);
+        V_buf = torch::empty({max_N, d_head}, opts_proj);
+        idx_q_buf = torch::empty({max_N, n_idx_heads}, opts_proj);
+        idx_k_buf = torch::empty({max_N, n_idx_heads}, opts_proj);
         int eff_top_k_max = std::min(top_k, max_N);
         selected_buf = torch::empty({max_N, eff_top_k_max}, torch::TensorOptions().device(dev).dtype(torch::kInt32));
     }
@@ -283,8 +291,8 @@ void supergrok2_fused_step(
 
             // Step 3: Sparse attention + skip connection → smart_grad
             launch_dsa_sparse_attention(
-                Q, K, V, selected,
-                grads[i], smart_grad,
+                grads[i], Q, K, V, selected,
+                smart_grad,
                 W_out, b_out,
                 rescale, d_head, eff_top_k);
 
@@ -495,7 +503,7 @@ void grokadamw_fused_step(
 #ifdef WITH_CUDA
         if (params[i].is_cuda()) {
             launch_fused_grokadamw_step(
-                params[i], grads[i], exp_avgs[i], exp_avg_sqs[i], emas[i],
+                params[i], exp_avgs[i], exp_avg_sqs[i], emas[i], grads[i],
                 alpha, lamb_grok, beta1, beta2, lr, wd, eps, bc1, bc2);
             continue;
         }
@@ -649,7 +657,7 @@ float prodigy_fused_step(
 #ifdef WITH_CUDA
         if (params[i].is_cuda()) {
             launch_fused_prodigy_step(
-                params[i], grads[i], exp_avgs[i], exp_avg_sqs[i], s_bufs[i],
+                params[i], exp_avgs[i], exp_avg_sqs[i], s_bufs[i], grads[i],
                 d_lr, beta1, beta2, lr, wd, eps, bc1, bc2);
             continue;
         }

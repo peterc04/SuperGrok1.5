@@ -369,6 +369,14 @@ class SelectiveSSMLayer(nn.Module):
         self.norm = nn.LayerNorm(d)
     def _selective_scan(self, x, dt, B, C):
         batch, L, _ = x.shape; A = -torch.exp(self.A_log); dt = F.softplus(dt)
+        # Try CUDA kernel
+        if x.is_cuda:
+            try:
+                from mamba_scan_ext import selective_scan_cuda
+                return selective_scan_cuda(x, dt, B, C, A)
+            except ImportError:
+                pass
+        # Python fallback
         h = torch.zeros(batch, self.d_inner, self.state_dim, device=x.device, dtype=x.dtype)
         ys = []
         for t in range(L):
@@ -461,6 +469,24 @@ import numpy as np, warnings
 from tqdm.auto import tqdm
 
 REPO = Path(".") / "repos"
+
+# ── JIT-compile Mamba CUDA scan kernel (if available) ──────────────────
+try:
+    from torch.utils.cpp_extension import load as _load_ext
+    _mamba_scan_src = os.path.join(os.path.dirname(__file__), "mamba_scan_kernel.cu")
+    if os.path.exists(_mamba_scan_src) and torch.cuda.is_available():
+        import mamba_scan_ext  # noqa: F401 — already built
+except ImportError:
+    try:
+        mamba_scan_ext = _load_ext(
+            name="mamba_scan_ext",
+            sources=[_mamba_scan_src],
+            verbose=False,
+        )
+    except Exception:
+        pass  # Fall back to Python scan
+except Exception:
+    pass
 
 class TrainResult:
     __slots__ = ("name","seed","steps","train_losses","train_accs",
