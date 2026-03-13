@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "torch>=2.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grokking-optimizers"
+version = "2.0.0"
+description = "C++/CUDA fused optimizer kernels for grokking experiments"
+requires-python = ">=3.8"
+dependencies = ["torch>=2.0.0"]
