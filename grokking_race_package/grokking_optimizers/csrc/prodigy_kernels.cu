@@ -112,7 +112,7 @@ __global__ void prodigy_dlr_reduce_kernel(
     const scalar_t* __restrict__ grad,         // [N]
     const scalar_t* __restrict__ param,        // [N]
     const scalar_t* __restrict__ param_init,   // [N]
-    const scalar_t* __restrict__ s,            // [N]
+    const float* __restrict__ s,               // [N] — always FP32
     float* __restrict__ out_num,               // [1] -- global numerator accumulator
     float* __restrict__ out_den,               // [1] -- global denominator accumulator
     const int N
@@ -244,7 +244,7 @@ void launch_prodigy_dlr_reduce(
                 grad.data_ptr<scalar_t>(),
                 param.data_ptr<scalar_t>(),
                 param_init.data_ptr<scalar_t>(),
-                s.data_ptr<scalar_t>(),
+                s.data_ptr<float>(),
                 out_num.data_ptr<float>(),
                 out_den.data_ptr<float>(),
                 N
