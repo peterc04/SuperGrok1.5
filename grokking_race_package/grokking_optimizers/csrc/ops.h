@@ -230,6 +230,7 @@ void launch_mamba3_peer_backward(
     torch::Tensor gru_Wz, torch::Tensor gru_Wr, torch::Tensor gru_Wh,
     torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
     torch::Tensor expert_W1, torch::Tensor expert_W2,
+    torch::Tensor expert_b1_in, torch::Tensor expert_b2_in,
     torch::Tensor input_proj_W,
     torch::Tensor d_mamba_fwd_in_proj, torch::Tensor d_mamba_fwd_dt_W,
     torch::Tensor d_mamba_fwd_dt_b, torch::Tensor d_mamba_fwd_B_proj,

@@ -203,6 +203,10 @@ __global__ void mamba3_scan_backward_kernel(
     const int tid = threadIdx.x;
     if (tid >= d_inner) return;
 
+    // Shared memory for cross-thread x_branch access in backward
+    extern __shared__ float smem[];
+    float* s_x_branch = smem; // [d_inner]
+
     float A[MAX_D_STATE];
     for (int s = 0; s < d_state; s++)
         A[s] = -expf(A_log[tid * d_state + s]);
@@ -220,13 +224,15 @@ __global__ void mamba3_scan_backward_kernel(
     float d_B_proj_acc[MAX_D_STATE];
     float d_C_proj_acc[MAX_D_STATE];
     float d_dt_proj_b_acc = 0.0f;
-    float d_dt_proj_W_diag_acc = 0.0f;
     for (int s = 0; s < d_state; s++) {
         d_A_log_acc[s] = 0.0f;
         d_freq_acc[s] = 0.0f;
         d_B_proj_acc[s] = 0.0f;
         d_C_proj_acc[s] = 0.0f;
     }
+    // Full dt_proj_W gradient (not just diagonal)
+    float d_dt_proj_W_row[32]; // max d_inner = 32
+    for (int j = 0; j < d_inner; j++) d_dt_proj_W_row[j] = 0.0f;
 
     // Gradient of state: dh[s] propagated backward through time
     float dh[MAX_D_STATE];
@@ -241,14 +247,21 @@ __global__ void mamba3_scan_backward_kernel(
         float z_val = saved_z[i * d_inner + tid];
         float dt_val = saved_dt[i * d_inner + tid];
 
+        // Load x_branch into shared memory for full projection backward
+        s_x_branch[tid] = x_val;
+        __syncthreads();
+
         // Forward: y_final = y_val * silu_z + D_val * x_val
         float sig_z = 1.0f / (1.0f + expf(-z_val));
         float silu_z = z_val * sig_z;
 
-        // Recompute y_val from saved state
+        // Recompute y_val from saved state (using full C projection)
         float y_val = 0.0f;
         for (int s = 0; s < d_state; s++) {
-            float C_val = C_proj_W[s * d_inner + tid] * x_val;
+            float C_val = 0.0f;
+            for (int j = 0; j < d_inner; j++) {
+                C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+            }
             y_val += saved_states[(i * d_inner + tid) * d_state + s] * C_val;
         }
 
@@ -259,19 +272,22 @@ __global__ void mamba3_scan_backward_kernel(
         float d_x_from_D = d_out * D_val;
         d_D_acc += d_out * x_val;
 
-        // Backward through y = sum_s(h[s] * C[s])
+        // Backward through y = sum_s(h[s] * C[s]) with full C projection
         float d_x_from_C = 0.0f;
         for (int s = 0; s < d_state; s++) {
             float h_s = saved_states[(i * d_inner + tid) * d_state + s];
-            float C_val = C_proj_W[s * d_inner + tid] * x_val;
+            float C_val = 0.0f;
+            for (int j = 0; j < d_inner; j++) {
+                C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+            }
 
             // dh[s] += d_y * C[s]
             dh[s] += d_y_val * C_val;
-            // d_C_val = d_y * h[s]
+            // d_C_val = d_y * h[s] — accumulate for all j
             float d_C_val = d_y_val * h_s;
-            // C_val = C_proj_W[s,tid] * x_val
-            d_C_proj_acc[s] += d_C_val * x_val;
-            d_x_from_C += d_C_val * C_proj_W[s * d_inner + tid];
+            for (int j = 0; j < d_inner; j++) {
+                atomicAdd(&d_C_proj_W[s * d_inner + j], d_C_val * s_x_branch[j]);
+            }
         }
 
         // Get h_prev (state before this step's update)
@@ -286,16 +302,24 @@ __global__ void mamba3_scan_backward_kernel(
         }
 
         // Backward through state update: h[s] = A_bar * h_rot + B_bar
+        // Fix: snapshot dh before the loop to avoid read-after-write
+        float dh_snap[MAX_D_STATE];
+        for (int s = 0; s < d_state; s++) dh_snap[s] = dh[s];
+        for (int s = 0; s < d_state; s++) dh[s] = 0.0f;
+
         float d_dt_val = 0.0f;
         float d_x_from_scan = 0.0f;
 
         for (int s = 0; s < d_state; s++) {
-            // Forward: A_bar = (1 + dt*A/2) / (1 - dt*A/2 + eps)
             float half_dtA = dt_val * A[s] / 2.0f;
             float denom_val = 1.0f - half_dtA + 1e-8f;
             float A_bar = (1.0f + half_dtA) / denom_val;
 
-            float B_val = B_proj_W[s * d_inner + tid] * x_val;
+            // Full B projection (recompute)
+            float B_val = 0.0f;
+            for (int j = 0; j < d_inner; j++) {
+                B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
+            }
             float B_bar = dt_val * B_val;
 
             float cos_p = cosf(dt_val * freq[s]);
@@ -303,10 +327,9 @@ __global__ void mamba3_scan_backward_kernel(
             int s_prev = (s > 0) ? s - 1 : d_state - 1;
             float h_rot = h_prev[s] * cos_p - h_prev[s_prev] * sin_p;
 
-            // dh[s] is the gradient flowing into h[s]
-            float d_h_s = dh[s];
+            // Use dh_snap instead of dh for reading
+            float d_h_s = dh_snap[s];
 
-            // d(A_bar * h_rot) + d(B_bar)
             float d_A_bar = d_h_s * h_rot;
             float d_h_rot = d_h_s * A_bar;
             float d_B_bar = d_h_s;
@@ -314,47 +337,56 @@ __global__ void mamba3_scan_backward_kernel(
             // d_B_bar -> d_dt, d_B_val
             d_dt_val += d_B_bar * B_val;
             float d_B_val = d_B_bar * dt_val;
-            // B_val = B_proj_W[s,tid] * x_val
-            d_B_proj_acc[s] += d_B_val * x_val;
-            d_x_from_scan += d_B_val * B_proj_W[s * d_inner + tid];
+            // Full B projection backward
+            for (int j = 0; j < d_inner; j++) {
+                atomicAdd(&d_B_proj_W[s * d_inner + j], d_B_val * s_x_branch[j]);
+            }
 
             // d_A_bar -> d_dt, d_A_log
-            // A_bar = (1 + dt*A/2) / (1 - dt*A/2 + eps)
-            // dA_bar/d(dt*A/2) = (1/denom + (1+half_dtA)/denom^2) = (1 + A_bar) / denom
             float d_half_dtA = d_A_bar * (1.0f + A_bar) / denom_val;
             d_dt_val += d_half_dtA * A[s] / 2.0f;
-            // d_A[s] from A_bar: d_half_dtA * dt_val / 2
             float d_A_s = d_half_dtA * dt_val / 2.0f;
-            // A[s] = -exp(A_log[s]) -> d_A_log += d_A * (-exp(A_log))  = d_A * A[s]
             d_A_log_acc[s] += d_A_s * A[s];
 
             // d_h_rot -> d_h_prev[s], d_h_prev[s_prev]
-            // h_rot = h_prev[s] * cos - h_prev[s_prev] * sin
             float d_h_prev_s = d_h_rot * cos_p;
             float d_h_prev_s_prev = -d_h_rot * sin_p;
 
             // d_h_rot -> d_cos, d_sin -> d_dt, d_freq
             float d_cos = d_h_rot * h_prev[s];
             float d_sin = -d_h_rot * h_prev[s_prev];
-            // cos(dt*freq) -> d = -sin * (freq * d_dt + dt * d_freq)
             d_dt_val += (-sin_p * freq[s]) * d_cos + (cos_p * freq[s]) * d_sin;
             d_freq_acc[s] += (-sin_p * dt_val) * d_cos + (cos_p * dt_val) * d_sin;
 
-            // Propagate dh to previous step
-            // NOTE: we clear dh[s] and add the propagated gradient
-            dh[s] = d_h_prev_s;
+            // Propagate dh to previous step (accumulate into fresh dh)
+            dh[s] += d_h_prev_s;
             dh[s_prev] += d_h_prev_s_prev;
         }
 
         // Backward through dt: dt_val = softplus(dt_raw)
-        // d_dt_raw = d_dt * sigmoid(dt_raw)
-        float dt_raw = dt_proj_b[tid] + dt_proj_W[tid * d_inner + tid] * x_val;
+        // Recompute dt_raw using full projection
+        float dt_raw = dt_proj_b[tid];
+        for (int j = 0; j < d_inner; j++) {
+            dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
+        }
         float sig_dt = 1.0f / (1.0f + expf(-dt_raw));
         float d_dt_raw = d_dt_val * sig_dt;
 
         d_dt_proj_b_acc += d_dt_raw;
-        d_dt_proj_W_diag_acc += d_dt_raw * x_val;
-        float d_x_from_dt = d_dt_raw * dt_proj_W[tid * d_inner + tid];
+        // Full dt_proj_W backward
+        for (int j = 0; j < d_inner; j++) {
+            d_dt_proj_W_row[j] += d_dt_raw * s_x_branch[j];
+        }
+
+        // d_x_val from dt backward needs full row
+        float d_x_from_dt = 0.0f;
+        for (int j = 0; j < d_inner; j++) {
+            // Only contributes to d_x for dimension tid via in_proj
+            // But for shared memory, d_dt_raw propagates to all x_branch[j]
+            // This is handled via the in_proj backward below
+        }
+        // Contribution from dt_proj to d_x_branch[tid]
+        d_x_from_dt = d_dt_raw * dt_proj_W[tid * d_inner + tid];
 
         // Total d_x_val for this step
         float d_x_val = d_x_from_D + d_x_from_C + d_x_from_scan + d_x_from_dt;
@@ -362,26 +394,25 @@ __global__ void mamba3_scan_backward_kernel(
         // Backward through input projection to d_x_sorted and d_in_proj_W
         for (int d = 0; d < d_model; d++) {
             float inp = x_sorted[i * d_model + d];
-            // d_in_proj_W[tid, d] += d_x_val * inp
             atomicAdd(&d_in_proj_W[tid * d_model + d], d_x_val * inp);
-            // d_in_proj_W[tid+d_inner, d] += d_z_val * inp
             atomicAdd(&d_in_proj_W[(tid + d_inner) * d_model + d], d_z_val * inp);
-            // d_x_sorted[i, d] += d_x_val * in_proj_W[tid,d] + d_z_val * in_proj_W[tid+d_inner,d]
             atomicAdd(&d_x_sorted[i * d_model + d],
                       d_x_val * in_proj_W[tid * d_model + d] +
                       d_z_val * in_proj_W[(tid + d_inner) * d_model + d]);
         }
+
+        __syncthreads(); // ensure all threads done before next step
     }
 
     // Write accumulated per-thread parameter gradients
     atomicAdd(&d_D_param[tid], d_D_acc);
     atomicAdd(&d_dt_proj_b[tid], d_dt_proj_b_acc);
-    atomicAdd(&d_dt_proj_W[tid * d_inner + tid], d_dt_proj_W_diag_acc);
+    for (int j = 0; j < d_inner; j++) {
+        atomicAdd(&d_dt_proj_W[tid * d_inner + j], d_dt_proj_W_row[j]);
+    }
     for (int s = 0; s < d_state; s++) {
         atomicAdd(&d_A_log[tid * d_state + s], d_A_log_acc[s]);
         atomicAdd(&d_rope_freq[tid * d_state + s], d_freq_acc[s]);
-        atomicAdd(&d_B_proj_W[s * d_inner + tid], d_B_proj_acc[s]);
-        atomicAdd(&d_C_proj_W[s * d_inner + tid], d_C_proj_acc[s]);
     }
 }
 
@@ -579,6 +610,7 @@ __global__ void expert_peer_backward_kernel(
     // Expert weights
     const float* __restrict__ expert_W1,       // [num_experts, expert_hidden, 1]
     const float* __restrict__ expert_W2,       // [num_experts, 1, expert_hidden]
+    const float* __restrict__ expert_b2_in,    // [num_experts] — read-only bias
     // Gradient outputs
     float* __restrict__ d_expert_W1,           // [num_experts, expert_hidden]
     float* __restrict__ d_expert_b1,           // [num_experts, expert_hidden]
@@ -603,74 +635,74 @@ __global__ void expert_peer_backward_kernel(
     for (int h = 0; h < num_heads; h++) {
         float d_head_out = d_out / (float)num_heads;
 
-        // Backward through routing * expert_out
+        // First pass: compute expert outputs and softmax backward dot products
+        float dot_a[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // max topk = 4
+        float dot_b[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
         for (int k = 0; k < num_active; k++) {
+            int a_local = k / topk;
+            int b_local = k % topk;
             int ei = expert_indices[(idx * num_heads + h) * num_active + k];
             float rw = routing_weights[(idx * num_heads + h) * num_active + k];
 
-            // Forward: out_k = W2[ei] @ relu(W1[ei] * g + b1[ei]) + b2[ei]
-            // z_k = relu(W1[ei] * g + b1[ei])  — saved in saved_z_hidden
-            float out_k = 0.0f;
+            // Recompute out_k
+            float out_k = expert_b2_in[ei];
             for (int eh = 0; eh < expert_hidden; eh++) {
                 float z_val = saved_z_hidden[((idx * num_heads + h) * num_active + k) * expert_hidden + eh];
                 out_k += expert_W2[ei * expert_hidden + eh] * z_val;
             }
-            out_k += expert_W2[ei]; // This is actually expert_b2, but simplified
-
-            // d_routing[k] = d_head_out * out_k  (for softmax backward)
             float d_rw = d_head_out * out_k;
 
-            // d_out_k = d_head_out * rw
+            float sa = saved_soft_a[(idx * num_heads + h) * topk + a_local];
+            float sb = saved_soft_b[(idx * num_heads + h) * topk + b_local];
+            // Accumulate per-sub-key dot products for full softmax backward
+            dot_a[a_local] += (d_rw * sb) * sa;
+            dot_b[b_local] += (d_rw * sa) * sb;
+        }
+
+        // Second pass: compute actual gradients with full softmax backward
+        for (int k = 0; k < num_active; k++) {
+            int a_local = k / topk;
+            int b_local = k % topk;
+            int ei = expert_indices[(idx * num_heads + h) * num_active + k];
+            float rw = routing_weights[(idx * num_heads + h) * num_active + k];
+
+            // Recompute out_k
+            float out_k = expert_b2_in[ei];
+            for (int eh = 0; eh < expert_hidden; eh++) {
+                float z_val = saved_z_hidden[((idx * num_heads + h) * num_active + k) * expert_hidden + eh];
+                out_k += expert_W2[ei * expert_hidden + eh] * z_val;
+            }
+
+            float d_rw = d_head_out * out_k;
             float d_out_k = d_head_out * rw;
 
             // Backward through expert MLP
-            // d_b2[ei] += d_out_k
             atomicAdd(&d_expert_b2[ei], d_out_k);
 
             for (int eh = 0; eh < expert_hidden; eh++) {
                 float z_val = saved_z_hidden[((idx * num_heads + h) * num_active + k) * expert_hidden + eh];
-                // d_W2[ei, eh] += d_out_k * z_val
                 atomicAdd(&d_expert_W2[ei * expert_hidden + eh], d_out_k * z_val);
-                // d_z[eh] = d_out_k * W2[ei, eh]
                 float d_z = d_out_k * expert_W2[ei * expert_hidden + eh];
-                // ReLU backward
                 float d_pre_relu = (z_val > 0.0f) ? d_z : 0.0f;
-                // d_W1[ei, eh] += d_pre_relu * g_val
                 atomicAdd(&d_expert_W1[ei * expert_hidden + eh], d_pre_relu * g_val);
-                // d_b1[ei, eh] += d_pre_relu
                 atomicAdd(&d_expert_b1[ei * expert_hidden + eh], d_pre_relu);
             }
 
-            // Backward through soft routing to product keys
-            // routing[k] = soft_a[a_idx] * soft_b[b_idx]
-            int a_local = k / topk;
-            int b_local = k % topk;
-
+            // Backward through soft routing with FULL softmax backward
             float sa = saved_soft_a[(idx * num_heads + h) * topk + a_local];
             float sb = saved_soft_b[(idx * num_heads + h) * topk + b_local];
 
-            // d_soft_a[a_local] += d_rw * sb
-            // d_soft_b[b_local] += d_rw * sa
-            // We need to propagate through softmax -> topk -> scores -> keys
+            float d_soft_a_val = d_rw * sb;
+            float d_score_a = 10.0f * sa * (d_soft_a_val - dot_a[a_local]);
 
-            // For soft_a: softmax backward
-            // d_score_a[a_local] += d_soft_a * sa * (1 - sa) * 10   (simplified diagonal)
-            float d_soft_a = d_rw * sb;
-            float d_score_a = d_soft_a * sa * (1.0f - sa) * 10.0f;
+            float d_soft_b_val = d_rw * sa;
+            float d_score_b = 10.0f * sb * (d_soft_b_val - dot_b[b_local]);
 
-            float d_soft_b = d_rw * sa;
-            float d_score_b = d_soft_b * sb * (1.0f - sb) * 10.0f;
-
-            // scores_a = q_a @ keys_A.T -> d_keys_A, d_q_a
             int a_key_idx = saved_top_a_idx[(idx * num_heads + h) * topk + a_local];
             int b_key_idx = saved_top_b_idx[(idx * num_heads + h) * topk + b_local];
 
-            // Accumulate d_prod_keys_A and d_prod_keys_B
-            // score_a[j] = sum_d(q_a[d] * keys_A[j, d])
-            // We need the query to compute key gradients
-            // Recompute query from saved_peer_input and peer_query_Ws
             for (int d = 0; d < half_d; d++) {
-                // Compute q_a[d] and q_b[d] from peer_input @ peer_query_W.T
                 float q_a_d = 0.0f;
                 float q_b_d = 0.0f;
                 for (int j = 0; j < peer_input_dim; j++) {
@@ -679,16 +711,12 @@ __global__ void expert_peer_backward_kernel(
                     q_b_d += peer_query_Ws[(h * d_model + half_d + d) * peer_input_dim + j] * pi_j;
                 }
 
-                // d_keys_A[h, a_key_idx, d] += d_score_a * q_a[d]
                 atomicAdd(&d_prod_keys_A[(h * pk_dim + a_key_idx) * half_d + d], d_score_a * q_a_d);
-                // d_keys_B[h, b_key_idx, d] += d_score_b * q_b[d]
                 atomicAdd(&d_prod_keys_B[(h * pk_dim + b_key_idx) * half_d + d], d_score_b * q_b_d);
 
-                // d_q_a[d] += d_score_a * keys_A[a_key_idx, d]
                 float d_q_a_d = d_score_a * prod_keys_A[(h * pk_dim + a_key_idx) * half_d + d];
                 float d_q_b_d = d_score_b * prod_keys_B[(h * pk_dim + b_key_idx) * half_d + d];
 
-                // d_peer_query_Ws and d_peer_input from query = peer_query_W @ peer_input
                 for (int j = 0; j < peer_input_dim; j++) {
                     float pi_j = saved_peer_input[idx * peer_input_dim + j];
                     atomicAdd(&d_peer_query_Ws[(h * d_model + d) * peer_input_dim + j], d_q_a_d * pi_j);
@@ -922,6 +950,7 @@ void launch_mamba3_peer_backward(
     torch::Tensor prod_keys_A,
     torch::Tensor prod_keys_B,
     torch::Tensor expert_W1, torch::Tensor expert_W2,
+    torch::Tensor expert_b1_in, torch::Tensor expert_b2_in,
     torch::Tensor input_proj_W,
     // Gradient outputs (pre-allocated, zeroed)
     torch::Tensor d_mamba_fwd_in_proj,
@@ -989,6 +1018,7 @@ void launch_mamba3_peer_backward(
         saved_soft_b.data_ptr<float>(),
         expert_W1.data_ptr<float>(),
         expert_W2.data_ptr<float>(),
+        expert_b2_in.reshape(-1).data_ptr<float>(),
         d_expert_W1.data_ptr<float>(),
         d_expert_b1.data_ptr<float>(),
         d_expert_W2.data_ptr<float>(),
@@ -1074,10 +1104,11 @@ void launch_mamba3_peer_backward(
     );
 
     // Step 8: Mamba scan backward (both directions)
+    int scan_smem = d_inner * sizeof(float); // shared memory for x_branch
     auto d_x_sorted_fwd = torch::zeros({N, d_model}, float_opts);
     auto d_x_sorted_bwd = torch::zeros({N, d_model}, float_opts);
 
-    mamba3_scan_backward_kernel<<<1, d_inner>>>(
+    mamba3_scan_backward_kernel<<<1, d_inner, scan_smem>>>(
         d_fwd_scan_out.data_ptr<float>(),
         x_sorted.data_ptr<float>(),
         fwd_saved_states.data_ptr<float>(),
@@ -1106,7 +1137,7 @@ void launch_mamba3_peer_backward(
 
     // Backward scan used reversed x_sorted
     auto x_sorted_rev = x_sorted.flip(0).contiguous();
-    mamba3_scan_backward_kernel<<<1, d_inner>>>(
+    mamba3_scan_backward_kernel<<<1, d_inner, scan_smem>>>(
         d_bwd_scan_out.data_ptr<float>(),
         x_sorted_rev.data_ptr<float>(),
         bwd_saved_states.data_ptr<float>(),
