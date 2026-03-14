@@ -241,6 +241,8 @@ __global__ void fused_elem_step_kernel(
     const float eps,
     const float bc1,
     const float bc2,
+    // Expert activation counter (nullable)
+    int* __restrict__ expert_counts,      // [num_experts] or nullptr
     // Dims
     const int N,
     const int d_model,
@@ -428,6 +430,8 @@ __global__ void fused_elem_step_kernel(
         }
 
         int expert_idx = best_a * pk_dim + best_b;
+        if (expert_counts != nullptr)
+            atomicAdd(&expert_counts[expert_idx], 1);
 
         // Expert MLP: z = relu(W1 * g + b1), out = W2 @ z + b2
         float head_out = expert_b2[expert_idx];
@@ -781,6 +785,7 @@ void launch_mamba3_peer_step(
                 expert_b2.data_ptr<float>(),
                 rescale, alpha_mu, lamb_eff,
                 beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+                nullptr,  // expert_counts — not tracked in single-param launcher
                 N, d_model, d_inner, gru_hidden,
                 num_heads, pk_dim, expert_hidden, num_experts
             );
@@ -1015,6 +1020,7 @@ void launch_mamba3_peer_batched_step(
                 expert_b2.data_ptr<float>(),
                 rescale, alpha_mus[p], lamb_effs[p],
                 beta1s[p], beta2, lr, wd_eff, eps, bc1s[p], bc2s[p],
+                nullptr,  // expert_counts — not tracked in batched launcher
                 N, d_model, d_inner, gru_hidden,
                 num_heads, pk_dim, expert_hidden, num_experts
             );
