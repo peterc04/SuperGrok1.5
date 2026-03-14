@@ -345,7 +345,7 @@ class Mamba3PEERMetaNet(nn.Module):
                 with torch.no_grad():
                     self.expert_counts.scatter_add_(
                         0, expert_idx,
-                        torch.ones_like(expert_idx, dtype=torch.long))
+                        torch.ones_like(expert_idx, dtype=torch.int32))
 
             # Expert evaluation
             W1 = self.expert_W1[expert_idx]  # [N, expert_hidden, 1]
@@ -360,11 +360,8 @@ class Mamba3PEERMetaNet(nn.Module):
         # Average over heads
         total_expert_out = total_expert_out / self.num_peer_heads
 
-        # 7. Dynamic expert recycling
-        if self.training:
-            self.step_counter += 1
-            if self.step_counter.item() % self.recycle_interval == 0:
-                self._recycle_dead_experts()
+        # 7. Dynamic expert recycling is handled by the optimizer (supergrok2.py)
+        #    to avoid per-parameter increment in the Python fallback path.
 
         # 8. Skip connection
         smart_grad = (g.unsqueeze(-1) + self.rescale * total_expert_out).squeeze(-1)

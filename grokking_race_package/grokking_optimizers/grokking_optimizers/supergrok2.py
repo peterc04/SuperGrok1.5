@@ -198,7 +198,8 @@ class SuperGrok2(Optimizer):
                 torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
             self._flat_mus.append(
                 torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
-            self._flat_sharpness.append(torch.zeros_like(p.data))
+            self._flat_sharpness.append(
+                torch.zeros(p.data.shape, dtype=torch.float32, device=p.device))
             # Per-parameter GRU state
             self._flat_gru_states.append(
                 torch.zeros(p.data.numel(), self.gru_hidden,
@@ -444,6 +445,12 @@ class SuperGrok2(Optimizer):
                 denom = (easq / bc2).sqrt().add_(eps)
                 p.data.mul_(1 - lr * wd_eff)
                 p.data.addcdiv_(ea.reshape(p.data.shape), denom.reshape(p.data.shape), value=-step_size)
+
+            # Expert recycling for Python fallback (once per step, not per param)
+            self.meta_net.step_counter += 1
+            if (self.meta_net.recycle_interval > 0 and
+                    self.meta_net.step_counter % self.meta_net.recycle_interval == 0):
+                self.meta_net._recycle_dead_experts()
 
         return loss
 
