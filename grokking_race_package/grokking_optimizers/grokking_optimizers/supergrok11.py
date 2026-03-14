@@ -190,7 +190,7 @@ class SuperGrok11(Optimizer):
         return loss
 
     def meta_step(self, model, val_x, val_y, criterion, meta_optimizer):
-        """Bilevel meta-net training."""
+        """Bilevel meta-net training. Batched meta-net forward."""
         self._ensure_state()
         named_params = list(model.named_parameters())
 
@@ -199,12 +199,30 @@ class SuperGrok11(Optimizer):
             if p.grad is not None:
                 saved_grads[name] = p.grad.detach().clone()
 
-        smart_grads = {}
+        # Batched meta-net forward — one call instead of per-parameter
+        all_grads = []
+        all_sharps = []
+        all_names = []
+        all_sizes = []
         for name, p in named_params:
             if name in saved_grads:
                 pidx = self._param_to_idx.get(id(p))
-                sharp = self._flat_sharpness[pidx] if pidx is not None else torch.zeros_like(p.data)
-                smart_grads[name] = self.meta_net(saved_grads[name], sharp)
+                all_grads.append(saved_grads[name].reshape(-1))
+                all_sharps.append(
+                    self._flat_sharpness[pidx].reshape(-1) if pidx is not None
+                    else torch.zeros(p.data.numel(), device=p.device))
+                all_names.append(name)
+                all_sizes.append(saved_grads[name].numel())
+
+        smart_grads = {}
+        if all_grads:
+            cat_grads = torch.cat(all_grads)
+            cat_sharps = torch.cat(all_sharps)
+            cat_smart = self.meta_net(cat_grads, cat_sharps)
+            offset = 0
+            for name, size in zip(all_names, all_sizes):
+                smart_grads[name] = cat_smart[offset:offset+size].reshape(saved_grads[name].shape)
+                offset += size
 
         model.zero_grad()
         with torch.enable_grad():
