@@ -160,12 +160,14 @@ template <typename scalar_t>
 __global__ void sg11_sam_perturb_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
-    const scalar_t rho_over_norm,   // rho / (global_grad_norm + eps)
+    const float rho_over_norm,   // rho / (global_grad_norm + eps)
     const int N
 ) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
-    param[idx] += rho_over_norm * grad[idx];
+    float p = static_cast<float>(param[idx]);
+    float g = static_cast<float>(grad[idx]);
+    param[idx] = static_cast<scalar_t>(p + rho_over_norm * g);
 }
 
 
@@ -184,7 +186,9 @@ __global__ void sg11_sharpness_restore_kernel(
 ) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
-    sharpness[idx] = fabsf(sam_grad[idx] - normal_grad[idx]);
+    float sg = static_cast<float>(sam_grad[idx]);
+    float ng = static_cast<float>(normal_grad[idx]);
+    sharpness[idx] = static_cast<scalar_t>(fabsf(sg - ng));
     param[idx] = backup[idx];
 }
 
@@ -313,7 +317,7 @@ void launch_sg11_sam_perturb(
         sg11_sam_perturb_kernel<scalar_t><<<grid, BLOCK_SIZE>>>(
             param.data_ptr<scalar_t>(),
             grad.data_ptr<scalar_t>(),
-            static_cast<scalar_t>(rho_over_norm),
+            rho_over_norm,
             N
         );
     }));

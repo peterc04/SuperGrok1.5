@@ -269,6 +269,8 @@ void launch_mamba3_peer_backward(
     torch::Tensor expert_W1, torch::Tensor expert_W2,
     torch::Tensor expert_b1_in, torch::Tensor expert_b2_in,
     torch::Tensor input_proj_W,
+    torch::Tensor mamba_fwd_init_state,  // [d_inner, d_state] or empty
+    torch::Tensor mamba_bwd_init_state,  // [d_inner, d_state] or empty
     torch::Tensor d_mamba_fwd_in_proj, torch::Tensor d_mamba_fwd_dt_W,
     torch::Tensor d_mamba_fwd_dt_b, torch::Tensor d_mamba_fwd_B_proj,
     torch::Tensor d_mamba_fwd_C_proj, torch::Tensor d_mamba_fwd_A_log,

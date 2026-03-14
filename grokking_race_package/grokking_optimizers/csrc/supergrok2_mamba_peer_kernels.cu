@@ -26,6 +26,8 @@
 
 constexpr int SG2M_BLOCK = 256;
 constexpr int MAX_D_STATE = 32;
+constexpr int MAX_D_MODEL = 16;
+constexpr int MAX_GRU_HIDDEN = 8;
 
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -322,7 +324,7 @@ __global__ void fused_elem_step_kernel(
     const int peer_input_dim = gru_hidden + 2 * d_model + 2;
 
     // 1. Apply Mamba out_proj to get fwd_ctx and bwd_ctx (using shared memory)
-    float fwd_ctx[16], bwd_ctx[16];  // max d_model = 16
+    float fwd_ctx[MAX_D_MODEL], bwd_ctx[MAX_D_MODEL];
     for (int d = 0; d < d_model; d++) {
         float fwd_val = 0.0f, bwd_val = 0.0f;
         for (int j = 0; j < d_inner; j++) {
@@ -334,13 +336,13 @@ __global__ void fused_elem_step_kernel(
     }
 
     // 2. GRU update (using shared memory weights)
-    float h_old[8];  // max gru_hidden = 8
+    float h_old[MAX_GRU_HIDDEN];
     for (int j = 0; j < gru_hidden; j++) {
         h_old[j] = gru_state[idx * gru_hidden + j];
     }
 
-    float h_new[8];
-    float z_gate[8], r_gate[8];
+    float h_new[MAX_GRU_HIDDEN];
+    float z_gate[MAX_GRU_HIDDEN], r_gate[MAX_GRU_HIDDEN];
     for (int j = 0; j < gru_hidden; j++) {
         float val_z = s_gru_bz[j];
         float val_r = s_gru_br[j];
@@ -398,7 +400,7 @@ __global__ void fused_elem_step_kernel(
     for (int head = 0; head < num_heads; head++) {
         // Compute query for this head
         const float* pq_W = peer_query_Ws + head * d_model * peer_input_dim;
-        float query[16];  // max d_model = 16
+        float query[MAX_D_MODEL];
         for (int d = 0; d < d_model; d++) {
             float val = 0.0f;
             int off = 0;

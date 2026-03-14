@@ -346,6 +346,7 @@ __global__ void mamba3_scan_backward_kernel(
     float* __restrict__ d_D_param,            // [d_inner]
     float* __restrict__ d_rope_freq,          // [d_inner, d_state/2]
     float* __restrict__ d_x_sorted,           // [N, d_model]
+    const float* __restrict__ initial_state,  // [d_inner, d_state] or nullptr
     // Dims
     const int N, const int d_model, const int d_inner, const int d_state,
     const int reverse
@@ -453,8 +454,10 @@ __global__ void mamba3_scan_backward_kernel(
             for (int s = 0; s < d_state; s++)
                 h_prev[s] = saved_states[(i_prev * d_inner + tid) * d_state + s];
         } else {
+            // Use initial_state if provided, else zero
             for (int s = 0; s < d_state; s++)
-                h_prev[s] = 0.0f;
+                h_prev[s] = (initial_state != nullptr)
+                    ? initial_state[tid * d_state + s] : 0.0f;
         }
 
         // Backward through state update: h[s] = A_bar * h_rot + B_bar * x_val
@@ -1381,6 +1384,9 @@ void launch_mamba3_peer_backward(
     torch::Tensor expert_W1, torch::Tensor expert_W2,
     torch::Tensor expert_b1_in, torch::Tensor expert_b2_in,
     torch::Tensor input_proj_W,
+    // Mamba initial states (for correct h_prev at step 0)
+    torch::Tensor mamba_fwd_init_state,  // [d_inner, d_state] or empty
+    torch::Tensor mamba_bwd_init_state,  // [d_inner, d_state] or empty
     // Gradient outputs (pre-allocated, zeroed)
     torch::Tensor d_mamba_fwd_in_proj,
     torch::Tensor d_mamba_fwd_dt_W,
@@ -1561,6 +1567,8 @@ void launch_mamba3_peer_backward(
         d_mamba_fwd_D.data_ptr<float>(),
         d_mamba_fwd_rope.data_ptr<float>(),
         d_x_sorted_fwd.data_ptr<float>(),
+        mamba_fwd_init_state.numel() > 0
+            ? mamba_fwd_init_state.data_ptr<float>() : nullptr,
         N, d_model, d_inner, d_state, 0
     );
 
@@ -1590,6 +1598,8 @@ void launch_mamba3_peer_backward(
         d_mamba_bwd_D.data_ptr<float>(),
         d_mamba_bwd_rope.data_ptr<float>(),
         d_x_sorted_bwd.data_ptr<float>(),
+        mamba_bwd_init_state.numel() > 0
+            ? mamba_bwd_init_state.data_ptr<float>() : nullptr,
         N, d_model, d_inner, d_state, 0
     );
 
