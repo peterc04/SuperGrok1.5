@@ -24,6 +24,8 @@
 
 constexpr int SG2B_BLOCK = 256;
 constexpr int MAX_D_STATE = 32;
+constexpr int MAX_D_INNER = 32;
+constexpr int MAX_TOPK = 4;
 
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -386,7 +388,7 @@ __global__ void mamba3_scan_backward_kernel(
         d_freq_acc[p] = 0.0f;
     }
     // Full dt_proj_W gradient (not just diagonal)
-    float d_dt_proj_W_row[32]; // max d_inner = 32
+    float d_dt_proj_W_row[MAX_D_INNER];
     for (int j = 0; j < d_inner; j++) d_dt_proj_W_row[j] = 0.0f;
 
     // Gradient of state: dh[s] propagated backward through time
@@ -675,7 +677,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
     float d_dt_proj_b_acc = 0.0f;
     for (int s = 0; s < d_state; s++) d_A_log_acc[s] = 0.0f;
     for (int p = 0; p < half_d_state; p++) d_freq_acc[p] = 0.0f;
-    float d_dt_proj_W_row[32];
+    float d_dt_proj_W_row[MAX_D_INNER];
     for (int j = 0; j < d_inner; j++) d_dt_proj_W_row[j] = 0.0f;
 
     float dh[MAX_D_STATE];
@@ -1066,8 +1068,8 @@ __global__ void expert_peer_backward_kernel(
         float d_head_out = d_out / (float)num_heads;
 
         // First pass: compute expert outputs and softmax backward dot products
-        float dot_a[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // max topk = 4
-        float dot_b[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float dot_a[MAX_TOPK] = {};
+        float dot_b[MAX_TOPK] = {};
 
         for (int k = 0; k < num_active; k++) {
             int a_local = k / topk;
