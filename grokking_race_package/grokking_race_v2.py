@@ -153,8 +153,10 @@ def _ntfy(message, title=None, priority="default", tags=None):
         if tags: headers["Tags"] = tags
         requests.post(f"https://ntfy.sh/{_NTFY_TOPIC}",
                       data=message.encode(), headers=headers, timeout=5)
-    except Exception:
-        pass  # notifications are best-effort
+    except ImportError:
+        print("  ⚠ ntfy: 'requests' library not installed — run: pip install requests")
+    except Exception as e:
+        print(f"  ⚠ ntfy failed: {e}")
 
 def _start_ntfy_listener():
     """Listen for incoming messages on the ntfy topic and reply with status."""
@@ -300,24 +302,25 @@ def make_data_for_task(c, seed):
 
 # ── Model 1: Decoder Transformer ─────────────────────────────────────
 class DecoderBlock(nn.Module):
-    def __init__(self, d, h):
+    def __init__(self, d, h, seq_len=4):
         super().__init__()
         self.attn = nn.MultiheadAttention(d, h, dropout=0., batch_first=True)
         self.n1 = nn.LayerNorm(d); self.n2 = nn.LayerNorm(d)
         self.ff = nn.Sequential(nn.Linear(d, 4*d), nn.GELU(), nn.Linear(4*d, d))
+        self.register_buffer('causal_mask', torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool), 1))
     def forward(self, x):
-        mask = torch.triu(torch.ones(x.size(1), x.size(1), device=x.device, dtype=torch.bool), 1)
-        a, _ = self.attn(x, x, x, attn_mask=mask)
+        a, _ = self.attn(x, x, x, attn_mask=self.causal_mask)
         x = self.n1(x + a); return self.n2(x + self.ff(x))
 
 class Transformer(nn.Module):
     def __init__(self, nl=2, d=128, h=4, ntok=99, seq=4):
         super().__init__()
         self.tok = nn.Embedding(ntok, d); self.pos = nn.Embedding(seq, d)
-        self.layers = nn.ModuleList([DecoderBlock(d, h) for _ in range(nl)])
+        self.layers = nn.ModuleList([DecoderBlock(d, h, seq_len=seq) for _ in range(nl)])
         self.norm = nn.LayerNorm(d); self.out = nn.Linear(d, ntok)
+        self.register_buffer('pos_ids', torch.arange(seq).unsqueeze(0))
     def forward(self, x):
-        h = self.tok(x) + self.pos(torch.arange(x.size(1), device=x.device).unsqueeze(0))
+        h = self.tok(x) + self.pos(self.pos_ids)
         for l in self.layers: h = l(h)
         return self.out(self.norm(h)[:, -1, :])
 
@@ -340,10 +343,11 @@ class ViT(nn.Module):
         self.pos = nn.Embedding(num_patches + 1, d)
         self.layers = nn.ModuleList([EncoderBlock(d, h) for _ in range(nl)])
         self.norm = nn.LayerNorm(d); self.out = nn.Linear(d, p)
+        self.register_buffer('pos_ids', torch.arange(num_patches + 1).unsqueeze(0))
     def forward(self, x):
         B = x.size(0); h = self.patch_proj(x)
         h = torch.cat([self.cls_token.expand(B, -1, -1), h], dim=1)
-        h = h + self.pos(torch.arange(h.size(1), device=x.device).unsqueeze(0))
+        h = h + self.pos(self.pos_ids)
         for l in self.layers: h = l(h)
         return self.out(self.norm(h[:, 0, :]))
 
@@ -365,6 +369,14 @@ class SelectiveSSMLayer(nn.Module):
         self.norm = nn.LayerNorm(d)
     def _selective_scan(self, x, dt, B, C):
         batch, L, _ = x.shape; A = -torch.exp(self.A_log); dt = F.softplus(dt)
+        # Try CUDA kernel
+        if x.is_cuda:
+            try:
+                from mamba_scan_ext import selective_scan_cuda
+                return selective_scan_cuda(x, dt, B, C, A)
+            except ImportError:
+                pass
+        # Python fallback
         h = torch.zeros(batch, self.d_inner, self.state_dim, device=x.device, dtype=x.dtype)
         ys = []
         for t in range(L):
@@ -387,8 +399,9 @@ class MambaModel(nn.Module):
         self.tok = nn.Embedding(ntok, d); self.pos = nn.Embedding(seq_len, d)
         self.layers = nn.ModuleList([SelectiveSSMLayer(d) for _ in range(nl)])
         self.norm = nn.LayerNorm(d); self.out = nn.Linear(d, p)
+        self.register_buffer('pos_ids', torch.arange(seq_len).unsqueeze(0))
     def forward(self, x):
-        h = self.tok(x) + self.pos(torch.arange(x.size(1), device=x.device).unsqueeze(0))
+        h = self.tok(x) + self.pos(self.pos_ids)
         for l in self.layers: h = l(h)
         return self.out(self.norm(h[:, -1, :]))
 
@@ -426,10 +439,10 @@ def get_init_state(c, device):
 
 @torch.no_grad()
 def evaluate(model, x, y, p=97):
-    model.eval(); logits = model(x)
+    logits = model(x)
     loss = F.cross_entropy(logits, y).item()
     acc = (logits[:, :p].argmax(-1) == y).float().mean().item()
-    model.train(); return loss, acc
+    return loss, acc
 
 class EarlyStopper:
     def __init__(self, threshold=0.95, patience=500, max_steps=100_000):
@@ -456,6 +469,24 @@ import numpy as np, warnings
 from tqdm.auto import tqdm
 
 REPO = Path(".") / "repos"
+
+# ── JIT-compile Mamba CUDA scan kernel (if available) ──────────────────
+try:
+    from torch.utils.cpp_extension import load as _load_ext
+    _mamba_scan_src = os.path.join(os.path.dirname(__file__), "mamba_scan_kernel.cu")
+    if os.path.exists(_mamba_scan_src) and torch.cuda.is_available():
+        import mamba_scan_ext  # noqa: F401 — already built
+except ImportError:
+    try:
+        mamba_scan_ext = _load_ext(
+            name="mamba_scan_ext",
+            sources=[_mamba_scan_src],
+            verbose=False,
+        )
+    except Exception:
+        pass  # Fall back to Python scan
+except Exception:
+    pass
 
 class TrainResult:
     __slots__ = ("name","seed","steps","train_losses","train_accs",
