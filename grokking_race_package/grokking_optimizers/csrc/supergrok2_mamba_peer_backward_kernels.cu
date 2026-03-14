@@ -1246,7 +1246,10 @@ void launch_mamba3_peer_bilevel_fwd_save(
     torch::Tensor bwd_saved_dt,
     // Sort-related
     torch::Tensor x_sorted,          // [N, d_model] — sorted input (computed here)
-    torch::Tensor sort_indices        // [N] — sort indices (computed here)
+    torch::Tensor sort_indices,       // [N] — sort indices (computed here)
+    // Mamba initial states (for exact match with forward_for_bilevel)
+    torch::Tensor fwd_initial_state,  // [d_inner, d_state] or empty
+    torch::Tensor bwd_initial_state   // [d_inner, d_state] or empty
 ) {
     const int N = grad.numel();
     if (N == 0) return;
@@ -1298,7 +1301,8 @@ void launch_mamba3_peer_bilevel_fwd_save(
         fwd_saved_x_branch.data_ptr<float>(),
         fwd_saved_z.data_ptr<float>(),
         fwd_saved_dt.data_ptr<float>(),
-        nullptr,  // no initial_state for bilevel
+        fwd_initial_state.numel() > 0
+            ? fwd_initial_state.data_ptr<float>() : nullptr,
         N, d_model, d_inner, d_state, 0
     );
 
@@ -1321,7 +1325,8 @@ void launch_mamba3_peer_bilevel_fwd_save(
         bwd_saved_x_branch.data_ptr<float>(),
         bwd_saved_z.data_ptr<float>(),
         bwd_saved_dt.data_ptr<float>(),
-        nullptr,  // no initial_state for bilevel
+        bwd_initial_state.numel() > 0
+            ? bwd_initial_state.data_ptr<float>() : nullptr,
         N, d_model, d_inner, d_state, 0
     );
 }
@@ -1685,7 +1690,10 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
     torch::Tensor bwd_saved_dt_packed,
     torch::Tensor x_sorted_packed,           // [total_N, d_model]
     torch::Tensor offsets_t,                 // [num_params + 1]
-    torch::Tensor sort_indices_packed        // [total_N] int
+    torch::Tensor sort_indices_packed,       // [total_N] int
+    // Mamba initial states (persistent, not zeros)
+    torch::Tensor fwd_initial_states,        // [num_params, d_inner, d_state]
+    torch::Tensor bwd_initial_states         // [num_params, d_inner, d_state]
 ) {
     const int num_params = grads.size();
     if (num_params == 0) return;
@@ -1726,8 +1734,6 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
     offsets_t.copy_(torch::from_blob(offsets_cpu.data(), {num_params + 1},
         torch::kInt32).to(dev));
 
-    // Zero initial states for bilevel
-    auto initial_states = torch::zeros({num_params, d_inner, d_state}, float_opts);
     auto final_fwd = torch::empty({num_params, d_inner, d_state}, float_opts);
     auto final_bwd = torch::empty({num_params, d_inner, d_state}, float_opts);
 
@@ -1736,11 +1742,11 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
 
     int scan_smem = d_inner * sizeof(float);
 
-    // Step 2: Forward scan with saving
+    // Step 2: Forward scan with saving (uses persistent initial states)
     mamba3_scan_fwd_save_batched_kernel<<<num_params, d_inner, scan_smem>>>(
         x_sorted_packed.data_ptr<float>(),
         fwd_scan_out_packed.data_ptr<float>(),
-        initial_states.data_ptr<float>(),
+        fwd_initial_states.data_ptr<float>(),
         final_fwd.data_ptr<float>(),
         offsets_t.data_ptr<int>(),
         rev_fwd.data_ptr<int>(),
@@ -1769,11 +1775,11 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
         x_sorted_rev_packed.narrow(0, offsets_cpu[p], N).copy_(slice.flip(0));
     }
 
-    // Step 4: Backward scan with saving
+    // Step 4: Backward scan with saving (uses persistent initial states)
     mamba3_scan_fwd_save_batched_kernel<<<num_params, d_inner, scan_smem>>>(
         x_sorted_rev_packed.data_ptr<float>(),
         bwd_scan_out_packed.data_ptr<float>(),
-        initial_states.data_ptr<float>(),
+        bwd_initial_states.data_ptr<float>(),
         final_bwd.data_ptr<float>(),
         offsets_t.data_ptr<int>(),
         rev_fwd.data_ptr<int>(),  // not reversed — the data is already flipped
@@ -1851,6 +1857,9 @@ void launch_mamba3_peer_backward_batched(
     torch::Tensor d_mamba_bwd_D,
     torch::Tensor d_mamba_bwd_rope,
     torch::Tensor d_x_sorted_packed,         // [total_N, d_model] output
+    // Mamba initial states (persistent, for correct h_prev at step 0)
+    torch::Tensor fwd_initial_states,        // [num_params, d_inner, d_state]
+    torch::Tensor bwd_initial_states,        // [num_params, d_inner, d_state]
     // Dims
     int d_model, int d_state, int d_inner, int num_params
 ) {
@@ -1862,9 +1871,6 @@ void launch_mamba3_peer_backward_batched(
     auto dev = d_fwd_scan_out_packed.device();
     auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
     auto int_opts = torch::TensorOptions().device(dev).dtype(torch::kInt32);
-
-    // Zero initial states for bilevel backward h_prev at step 0
-    auto initial_states = torch::zeros({num_params, d_inner, d_state}, float_opts);
 
     auto rev_fwd = torch::zeros({num_params}, int_opts);
     auto rev_bwd = torch::zeros({num_params}, int_opts);  // data was pre-reversed
@@ -1882,7 +1888,7 @@ void launch_mamba3_peer_backward_batched(
         fwd_saved_dt_packed.data_ptr<float>(),
         offsets_t.data_ptr<int>(),
         rev_fwd.data_ptr<int>(),
-        initial_states.data_ptr<float>(),
+        fwd_initial_states.data_ptr<float>(),
         mamba_fwd_in_proj.data_ptr<float>(),
         mamba_fwd_dt_W.data_ptr<float>(),
         mamba_fwd_dt_b.data_ptr<float>(),
@@ -1929,7 +1935,7 @@ void launch_mamba3_peer_backward_batched(
         bwd_saved_dt_packed.data_ptr<float>(),
         offsets_t.data_ptr<int>(),
         rev_bwd.data_ptr<int>(),
-        initial_states.data_ptr<float>(),
+        bwd_initial_states.data_ptr<float>(),
         mamba_bwd_in_proj.data_ptr<float>(),
         mamba_bwd_dt_W.data_ptr<float>(),
         mamba_bwd_dt_b.data_ptr<float>(),
