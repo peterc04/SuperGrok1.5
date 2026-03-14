@@ -179,6 +179,11 @@ class LookSAM(Optimizer):
                 if p.grad is None:
                     continue
                 state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+                    state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+                    state["sam_direction"] = torch.zeros_like(p, dtype=torch.float32)
                 params_list.append(p)
                 orig_grads_list.append(p.grad.clone())
                 direction_list.append(state["sam_direction"])

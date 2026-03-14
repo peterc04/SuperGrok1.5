@@ -17,6 +17,65 @@
 #include <stdexcept>
 
 
+// ───────────────────────────────────────────────────────────────────────
+//  Helper: device-side gradient clipping (single CPU sync instead of N)
+// ───────────────────────────────────────────────────────────────────────
+static void clip_grad_norms_device_side(
+    std::vector<torch::Tensor>& grads,
+    size_t n_params,
+    float grad_clip_norm
+) {
+    if (grad_clip_norm <= 0.0f) return;
+
+    // Find device from first valid grad
+    torch::Device dev(torch::kCPU);
+    for (size_t i = 0; i < n_params; i++) {
+        if (grads[i].defined() && grads[i].numel() > 0) {
+            dev = grads[i].device();
+            break;
+        }
+    }
+
+    // Accumulate norm^2 on device — all .norm() calls are async kernel launches
+    auto norm_sq = torch::zeros({1}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
+    for (size_t i = 0; i < n_params; i++) {
+        if (grads[i].defined() && grads[i].numel() > 0) {
+            norm_sq.add_(grads[i].to(torch::kFloat32).norm().pow(2));
+        }
+    }
+    // Single CPU sync
+    float total_norm = std::sqrt(norm_sq.item<float>());
+    if (total_norm > grad_clip_norm) {
+        float clip_coef = grad_clip_norm / (total_norm + 1e-6f);
+        for (size_t i = 0; i < n_params; i++) {
+            if (grads[i].defined() && grads[i].numel() > 0)
+                grads[i].mul_(clip_coef);
+        }
+    }
+}
+
+// Helper: device-side SAM grad norm (single CPU sync instead of N)
+static float compute_sam_grad_norm_device_side(
+    std::vector<torch::Tensor>& grads,
+    size_t n_grads
+) {
+    torch::Device dev(torch::kCPU);
+    for (size_t i = 0; i < n_grads; i++) {
+        if (grads[i].defined() && grads[i].numel() > 0) {
+            dev = grads[i].device();
+            break;
+        }
+    }
+    auto norm_sq = torch::zeros({1}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
+    for (size_t i = 0; i < n_grads; i++) {
+        if (grads[i].defined() && grads[i].numel() > 0) {
+            norm_sq.add_(grads[i].to(torch::kFloat32).norm().pow(2));
+        }
+    }
+    return std::sqrt(norm_sq.item<float>()) + 1e-12f;
+}
+
+
 // ═══════════════════════════════════════════════════════════════════════
 //  SuperGrok v1.5 — Main Step
 // ═══════════════════════════════════════════════════════════════════════
@@ -40,24 +99,8 @@ void supergrok15_fused_step(
 ) {
     const size_t n_params = params.size();
 
-    // Gradient clipping (global norm)
-    if (grad_clip_norm > 0.0f) {
-        float total_norm_sq = 0.0f;
-        for (size_t i = 0; i < n_params; i++) {
-            if (grads[i].defined() && grads[i].numel() > 0) {
-                float norm = grads[i].norm().item<float>();
-                total_norm_sq += norm * norm;
-            }
-        }
-        float total_norm = std::sqrt(total_norm_sq);
-        if (total_norm > grad_clip_norm) {
-            float clip_coef = grad_clip_norm / (total_norm + 1e-6f);
-            for (size_t i = 0; i < n_params; i++) {
-                if (grads[i].defined() && grads[i].numel() > 0)
-                    grads[i].mul_(clip_coef);
-            }
-        }
-    }
+    // Gradient clipping (device-side — single CPU sync)
+    clip_grad_norms_device_side(grads, n_params, grad_clip_norm);
 
     float lamb_eff = 0.0f;
     if (ramp > 0.0f) {
@@ -113,14 +156,8 @@ std::vector<torch::Tensor> supergrok15_sam_perturb_all(
     std::vector<torch::Tensor>& grads,
     float rho
 ) {
-    float total_norm_sq = 0.0f;
-    for (size_t i = 0; i < grads.size(); i++) {
-        if (grads[i].defined() && grads[i].numel() > 0) {
-            float n = grads[i].norm().item<float>();
-            total_norm_sq += n * n;
-        }
-    }
-    float grad_norm = std::sqrt(total_norm_sq) + 1e-12f;
+    // Device-side grad norm (single CPU sync)
+    float grad_norm = compute_sam_grad_norm_device_side(grads, grads.size());
     float rho_over_norm = rho / grad_norm;
 
     std::vector<torch::Tensor> backups;
@@ -194,24 +231,8 @@ void supergrok2_fused_step(
 ) {
     const size_t n_params = params.size();
 
-    // Gradient clipping
-    if (grad_clip_norm > 0.0f) {
-        float total_norm_sq = 0.0f;
-        for (size_t i = 0; i < n_params; i++) {
-            if (grads[i].defined() && grads[i].numel() > 0) {
-                float norm = grads[i].norm().item<float>();
-                total_norm_sq += norm * norm;
-            }
-        }
-        float total_norm = std::sqrt(total_norm_sq);
-        if (total_norm > grad_clip_norm) {
-            float clip_coef = grad_clip_norm / (total_norm + 1e-6f);
-            for (size_t i = 0; i < n_params; i++) {
-                if (grads[i].defined() && grads[i].numel() > 0)
-                    grads[i].mul_(clip_coef);
-            }
-        }
-    }
+    // Gradient clipping (device-side — single CPU sync)
+    clip_grad_norms_device_side(grads, n_params, grad_clip_norm);
 
     float lamb_eff = 0.0f;
     if (ramp > 0.0f) {
@@ -358,24 +379,8 @@ void supergrok11_fused_step(
 ) {
     const size_t n_params = params.size();
 
-    // Gradient clipping
-    if (grad_clip_norm > 0.0f) {
-        float total_norm_sq = 0.0f;
-        for (size_t i = 0; i < n_params; i++) {
-            if (grads[i].defined() && grads[i].numel() > 0) {
-                float norm = grads[i].norm().item<float>();
-                total_norm_sq += norm * norm;
-            }
-        }
-        float total_norm = std::sqrt(total_norm_sq);
-        if (total_norm > grad_clip_norm) {
-            float clip_coef = grad_clip_norm / (total_norm + 1e-6f);
-            for (size_t i = 0; i < n_params; i++) {
-                if (grads[i].defined() && grads[i].numel() > 0)
-                    grads[i].mul_(clip_coef);
-            }
-        }
-    }
+    // Gradient clipping (device-side — single CPU sync)
+    clip_grad_norms_device_side(grads, n_params, grad_clip_norm);
 
     for (size_t i = 0; i < n_params; i++) {
         if (!grads[i].defined() || grads[i].numel() == 0)
@@ -396,8 +401,14 @@ void supergrok11_fused_step(
                 mus[i], grads[i], sharpness_cache[i], smart_grad, alpha,
                 W1, b1, W2, b2, rescale, hidden_dim);
 
-            // Per-parameter cosine gating
-            float gate = compute_cosine_gate(smart_grad, mus[i], gate_temperature);
+            // Per-parameter cosine gating (device-side reduction, single sync)
+            auto sg_f = smart_grad.to(torch::kFloat32).reshape(-1);
+            auto mu_f = mus[i].to(torch::kFloat32).reshape(-1);
+            auto vals = torch::stack({(sg_f * mu_f).sum(), sg_f.norm(), mu_f.norm()});
+            auto cpu_vals = vals.cpu();
+            float cos_sim = cpu_vals[0].item<float>() /
+                (cpu_vals[1].item<float>() * cpu_vals[2].item<float>() + 1e-8f);
+            float gate = 1.0f / (1.0f + std::exp(-gate_temperature * cos_sim));
             float lamb_eff = ramp > 0.0f ? ramp * gate * lamb : 0.0f;
 
             launch_sg11_adam_decay(
@@ -417,13 +428,12 @@ void supergrok11_fused_step(
         auto out = torch::addmm(b2.to(torch::kFloat32), act, W2.to(torch::kFloat32).t());
         smart_grad.copy_((flat_g + rescale * out).reshape(shape));
 
-        // Cosine gating
+        // Cosine gating (batched reduction — single sync)
         auto sg_flat = smart_grad.reshape(-1).to(torch::kFloat32);
         auto mu_flat = mus[i].reshape(-1).to(torch::kFloat32);
-        float dot_val = (sg_flat * mu_flat).sum().item<float>();
-        float sg_norm = sg_flat.norm().item<float>();
-        float mu_norm = mu_flat.norm().item<float>();
-        float cos_sim = dot_val / (sg_norm * mu_norm + 1e-8f);
+        auto vals = torch::stack({(sg_flat * mu_flat).sum(), sg_flat.norm(), mu_flat.norm()});
+        float cos_sim = vals[0].item<float>() /
+            (vals[1].item<float>() * vals[2].item<float>() + 1e-8f);
         float gate = 1.0f / (1.0f + std::exp(-gate_temperature * cos_sim));
         float lamb_eff = ramp > 0.0f ? ramp * gate * lamb : 0.0f;
 
@@ -474,24 +484,8 @@ void grokadamw_fused_step(
 ) {
     const size_t n_params = params.size();
 
-    // Gradient clipping
-    if (grad_clip_norm > 0.0f) {
-        float total_norm_sq = 0.0f;
-        for (size_t i = 0; i < n_params; i++) {
-            if (grads[i].defined() && grads[i].numel() > 0) {
-                float norm = grads[i].norm().item<float>();
-                total_norm_sq += norm * norm;
-            }
-        }
-        float total_norm = std::sqrt(total_norm_sq);
-        if (total_norm > grad_clip_norm) {
-            float clip_coef = grad_clip_norm / (total_norm + 1e-6f);
-            for (size_t i = 0; i < n_params; i++) {
-                if (grads[i].defined() && grads[i].numel() > 0)
-                    grads[i].mul_(clip_coef);
-            }
-        }
-    }
+    // Gradient clipping (device-side — single CPU sync)
+    clip_grad_norms_device_side(grads, n_params, grad_clip_norm);
 
     for (size_t i = 0; i < n_params; i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
@@ -540,24 +534,8 @@ void neuralgrok_fused_step(
 ) {
     const size_t n_params = params.size();
 
-    // Gradient clipping
-    if (grad_clip_norm > 0.0f) {
-        float total_norm_sq = 0.0f;
-        for (size_t i = 0; i < n_params; i++) {
-            if (grads[i].defined() && grads[i].numel() > 0) {
-                float norm = grads[i].norm().item<float>();
-                total_norm_sq += norm * norm;
-            }
-        }
-        float total_norm = std::sqrt(total_norm_sq);
-        if (total_norm > grad_clip_norm) {
-            float clip_coef = grad_clip_norm / (total_norm + 1e-6f);
-            for (size_t i = 0; i < n_params; i++) {
-                if (grads[i].defined() && grads[i].numel() > 0)
-                    grads[i].mul_(clip_coef);
-            }
-        }
-    }
+    // Gradient clipping (device-side — single CPU sync)
+    clip_grad_norms_device_side(grads, n_params, grad_clip_norm);
 
     for (size_t i = 0; i < n_params; i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
@@ -616,30 +594,40 @@ float prodigy_fused_step(
 ) {
     const size_t n_params = params.size();
 
-    // Step 1: Compute d_lr update (reduction across all params)
-    float numerator = 0.0f;
-    float denominator = 0.0f;
+    // Step 1: Compute d_lr update (device-side accumulation — single CPU sync)
+    // Find device
+    torch::Device dev(torch::kCPU);
+    for (size_t i = 0; i < n_params; i++) {
+        if (grads[i].defined() && grads[i].numel() > 0) {
+            dev = grads[i].device();
+            break;
+        }
+    }
+
+    auto num_acc = torch::zeros({1}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
+    auto den_acc = torch::zeros({1}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
 
     for (size_t i = 0; i < n_params; i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
 
 #ifdef WITH_CUDA
         if (params[i].is_cuda()) {
-            auto num_out = torch::zeros({1}, torch::TensorOptions().device(params[i].device()).dtype(torch::kFloat32));
-            auto den_out = torch::zeros({1}, torch::TensorOptions().device(params[i].device()).dtype(torch::kFloat32));
             launch_prodigy_dlr_reduce(
                 grads[i], params[i], param_inits[i], s_bufs[i],
-                num_out, den_out);
-            numerator += num_out.item<float>();
-            denominator += den_out.item<float>();
+                num_acc, den_acc);
             continue;
         }
 #endif
         auto g_f = grads[i].to(torch::kFloat32);
         auto diff = (params[i] - param_inits[i]).to(torch::kFloat32);
-        numerator += (g_f.flatten() * diff.flatten()).sum().item<float>();
-        denominator += s_bufs[i].to(torch::kFloat32).sum().item<float>();
+        num_acc.add_((g_f.flatten() * diff.flatten()).sum());
+        den_acc.add_(s_bufs[i].to(torch::kFloat32).sum());
     }
+
+    // Single CPU sync for both values
+    auto results = torch::cat({num_acc, den_acc}).cpu();
+    float numerator = results[0].item<float>();
+    float denominator = results[1].item<float>();
 
     // Update d_lr
     if (denominator > 1e-30f) {
@@ -741,14 +729,8 @@ std::vector<torch::Tensor> looksam_perturb_all(
     std::vector<torch::Tensor>& grads,
     float rho
 ) {
-    float total_norm_sq = 0.0f;
-    for (size_t i = 0; i < grads.size(); i++) {
-        if (grads[i].defined() && grads[i].numel() > 0) {
-            float n = grads[i].norm().item<float>();
-            total_norm_sq += n * n;
-        }
-    }
-    float grad_norm = std::sqrt(total_norm_sq) + 1e-12f;
+    // Device-side grad norm (single CPU sync)
+    float grad_norm = compute_sam_grad_norm_device_side(grads, grads.size());
     float rho_over_norm = rho / grad_norm;
 
     std::vector<torch::Tensor> backups;
