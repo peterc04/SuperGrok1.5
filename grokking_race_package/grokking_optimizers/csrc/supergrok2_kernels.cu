@@ -5,13 +5,10 @@
  * Attention (DSA).  The meta-net processes (grad, sharpness) pairs through
  * cross-element sparse attention to produce a correction signal.
  *
- * Six kernels:
+ * Three kernels:
  *   1. dsa_project         — project each element to Q/K/V + indexer keys
  *   2. dsa_indexer_topk    — lightning indexer scores + top-k selection
  *   3. dsa_sparse_attention — sparse attention + output projection + skip
- *   4. fused_adam_decay     — gating blend + Adam moments + progressive wd
- *   5. sam_perturb          — worst-case parameter perturbation
- *   6. sharpness_restore    — |sam_grad - grad| + param restore
  */
 
 #include <torch/extension.h>
@@ -34,7 +31,7 @@ constexpr int TILE_K     = 256;
 // is allocated dynamically so these are only used for sanity checks.
 constexpr int MAX_D_HEAD     = 128;
 constexpr int MAX_IDX_HEADS  = 32;
-constexpr int MAX_TOP_K      = 512;
+constexpr int MAX_TOP_K      = 128;
 
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -379,96 +376,11 @@ __global__ void dsa_sparse_attention_kernel(
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Kernel 4: Fused gating blend + Adam moments + progressive wd + step
-//            (reused from SuperGrok v1.5)
-// ═══════════════════════════════════════════════════════════════════════════
-
-template <typename scalar_t>
-__global__ void fused_adam_decay_kernel(
-    scalar_t* __restrict__ param,
-    float* __restrict__ exp_avg,
-    float* __restrict__ exp_avg_sq,
-    const scalar_t* __restrict__ smart_grad,
-    const scalar_t* __restrict__ mu,
-    const float lamb_eff,
-    const float beta1,
-    const float beta2,
-    const float lr,
-    const float wd_eff,
-    const float eps,
-    const float bc1,
-    const float bc2,
-    const int N
-) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N) return;
-
-    // Read in native precision, compute in FP32
-    const float sg = static_cast<float>(smart_grad[idx]);
-    const float m = static_cast<float>(mu[idx]);
-
-    // Final gradient = smart_grad + lambda * mu
-    const float fg = sg + lamb_eff * m;
-
-    // Adam moment updates (FP32 state)
-    const float ea = beta1 * exp_avg[idx] + (1.0f - beta1) * fg;
-    const float easq = beta2 * exp_avg_sq[idx] + (1.0f - beta2) * fg * fg;
-    exp_avg[idx] = ea;
-    exp_avg_sq[idx] = easq;
-
-    // Bias-corrected step
-    const float step_size = lr / bc1;
-    const float denom = sqrtf(easq / bc2) + eps;
-
-    // Progressive weight decay + Adam step (fused)
-    float p = static_cast<float>(param[idx]);
-    p *= (1.0f - lr * wd_eff);
-    p -= step_size * ea / denom;
-    param[idx] = static_cast<scalar_t>(p);
-}
-
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Kernel 5: SAM parameter perturbation (reused from SuperGrok v1.5)
-// ═══════════════════════════════════════════════════════════════════════════
-
-template <typename scalar_t>
-__global__ void sam_perturb_kernel(
-    scalar_t* __restrict__ param,
-    const scalar_t* __restrict__ grad,
-    const scalar_t rho_over_norm,
-    const int N
-) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N) return;
-    param[idx] += rho_over_norm * grad[idx];
-}
-
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Kernel 6: Compute sharpness + restore parameters (reused from v1.5)
-// ═══════════════════════════════════════════════════════════════════════════
-
-template <typename scalar_t>
-__global__ void sharpness_restore_kernel(
-    scalar_t* __restrict__ param,
-    scalar_t* __restrict__ sharpness,
-    const scalar_t* __restrict__ backup,
-    const scalar_t* __restrict__ sam_grad,
-    const scalar_t* __restrict__ normal_grad,
-    const int N
-) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N) return;
-    sharpness[idx] = static_cast<scalar_t>(
-        fabsf(static_cast<float>(sam_grad[idx]) - static_cast<float>(normal_grad[idx]))
-    );
-    param[idx] = backup[idx];
-}
-
-
-// ═══════════════════════════════════════════════════════════════════════════
 //  C++ Dispatch Functions
+//
+//  Kernels 4-6 (fused_adam_decay, sam_perturb, sharpness_restore) are
+//  defined in supergrok15_kernels.cu and reused by v2 via the shared
+//  launcher declarations in ops.h.
 // ═══════════════════════════════════════════════════════════════════════════
 
 void launch_dsa_project(
@@ -599,94 +511,5 @@ void launch_dsa_sparse_attention(
 }
 
 
-void launch_fused_adam_decay(
-    torch::Tensor param,
-    torch::Tensor exp_avg,
-    torch::Tensor exp_avg_sq,
-    torch::Tensor smart_grad,
-    torch::Tensor mu,
-    float lamb_eff,
-    float beta1,
-    float beta2,
-    float lr,
-    float wd_eff,
-    float eps,
-    float bc1,
-    float bc2
-) {
-    const int N = param.numel();
-    if (N == 0) return;
-    const int grid = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
-        param.scalar_type(), "fused_adam_decay", ([&] {
-            fused_adam_decay_kernel<scalar_t><<<grid, BLOCK_SIZE>>>(
-                param.data_ptr<scalar_t>(),
-                exp_avg.data_ptr<float>(),
-                exp_avg_sq.data_ptr<float>(),
-                smart_grad.data_ptr<scalar_t>(),
-                mu.data_ptr<scalar_t>(),
-                lamb_eff,
-                beta1,
-                beta2,
-                lr,
-                wd_eff,
-                eps,
-                bc1,
-                bc2,
-                N
-            );
-        })
-    );
-}
-
-
-void launch_sam_perturb(
-    torch::Tensor param,
-    torch::Tensor grad,
-    float rho_over_norm
-) {
-    const int N = param.numel();
-    if (N == 0) return;
-    const int grid = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
-        param.scalar_type(), "sam_perturb", ([&] {
-            sam_perturb_kernel<scalar_t><<<grid, BLOCK_SIZE>>>(
-                param.data_ptr<scalar_t>(),
-                grad.data_ptr<scalar_t>(),
-                static_cast<scalar_t>(rho_over_norm),
-                N
-            );
-        })
-    );
-}
-
-
-void launch_sharpness_restore(
-    torch::Tensor param,
-    torch::Tensor sharpness,
-    torch::Tensor backup,
-    torch::Tensor sam_grad,
-    torch::Tensor normal_grad
-) {
-    const int N = param.numel();
-    if (N == 0) return;
-    const int grid = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
-        param.scalar_type(), "sharpness_restore", ([&] {
-            sharpness_restore_kernel<scalar_t><<<grid, BLOCK_SIZE>>>(
-                param.data_ptr<scalar_t>(),
-                sharpness.data_ptr<scalar_t>(),
-                backup.data_ptr<scalar_t>(),
-                sam_grad.data_ptr<scalar_t>(),
-                normal_grad.data_ptr<scalar_t>(),
-                N
-            );
-        })
-    );
-}
+// launch_fused_adam_decay, launch_sam_perturb, launch_sharpness_restore
+// are provided by supergrok15_kernels.cu — no duplicate definitions here.

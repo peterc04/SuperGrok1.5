@@ -45,7 +45,7 @@ void supergrok15_fused_step(
         float total_norm_sq = 0.0f;
         for (size_t i = 0; i < n_params; i++) {
             if (grads[i].defined() && grads[i].numel() > 0) {
-                float norm = grads[i].to(torch::kFloat32).norm().item<float>();
+                float norm = grads[i].norm().item<float>();
                 total_norm_sq += norm * norm;
             }
         }
@@ -75,19 +75,18 @@ void supergrok15_fused_step(
         float bc1 = 1.0f - std::pow(beta1, static_cast<float>(step));
         float bc2 = 1.0f - std::pow(beta2, static_cast<float>(step));
 
-        auto smart_grad = torch::empty_like(params[i]);
-
 #ifdef WITH_CUDA
         if (params[i].is_cuda()) {
-            launch_fused_mu_metanet(
-                mus[i], grads[i], sharpness_cache[i], smart_grad, alpha,
-                W1, b1, W2, b2, rescale, hidden_dim);
-            launch_fused_adam_decay(
-                params[i], exp_avgs[i], exp_avg_sqs[i], smart_grad, mus[i],
-                lamb_eff, beta1, beta2, lr, wd_eff, eps, bc1, bc2);
+            launch_fused_supergrok15_full_step(
+                params[i], exp_avgs[i], exp_avg_sqs[i], mus[i],
+                grads[i], sharpness_cache[i], alpha,
+                W1, b1, W2, b2, rescale,
+                lamb_eff, beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+                hidden_dim);
             continue;
         }
 #endif
+        auto smart_grad = torch::empty_like(params[i]);
         // CPU fallback using ATen
         mus[i].mul_(alpha).add_(grads[i], 1.0f - alpha);
         auto shape = grads[i].sizes().vec();
@@ -117,7 +116,7 @@ std::vector<torch::Tensor> supergrok15_sam_perturb_all(
     float total_norm_sq = 0.0f;
     for (size_t i = 0; i < grads.size(); i++) {
         if (grads[i].defined() && grads[i].numel() > 0) {
-            float n = grads[i].to(torch::kFloat32).norm().item<float>();
+            float n = grads[i].norm().item<float>();
             total_norm_sq += n * n;
         }
     }
@@ -200,7 +199,7 @@ void supergrok2_fused_step(
         float total_norm_sq = 0.0f;
         for (size_t i = 0; i < n_params; i++) {
             if (grads[i].defined() && grads[i].numel() > 0) {
-                float norm = grads[i].to(torch::kFloat32).norm().item<float>();
+                float norm = grads[i].norm().item<float>();
                 total_norm_sq += norm * norm;
             }
         }
@@ -218,6 +217,37 @@ void supergrok2_fused_step(
     if (ramp > 0.0f) {
         lamb_eff = ramp * gate_signal * lamb;
     }
+
+    // Pre-allocate DSA buffers outside the per-parameter loop
+    int max_N = 0;
+    for (size_t i = 0; i < n_params; i++) {
+        if (grads[i].defined() && grads[i].numel() > 0)
+            max_N = std::max(max_N, (int)grads[i].numel());
+    }
+
+    torch::Tensor Q_buf, K_buf, V_buf, idx_q_buf, idx_k_buf, selected_buf;
+#ifdef WITH_CUDA
+    if (max_N > 0 && n_params > 0 && params[0].is_cuda()) {
+        auto dev = params[0].device();
+        // Find first defined grad to determine dtype (must match grad.scalar_type()
+        // since dsa_project and dsa_sparse_attention dispatch on grad dtype)
+        auto grad_dtype = torch::kFloat32;
+        for (size_t i = 0; i < n_params; i++) {
+            if (grads[i].defined() && grads[i].numel() > 0) {
+                grad_dtype = grads[i].scalar_type();
+                break;
+            }
+        }
+        auto opts_proj = torch::TensorOptions().device(dev).dtype(grad_dtype);
+        Q_buf = torch::empty({max_N, d_head}, opts_proj);
+        K_buf = torch::empty({max_N, d_head}, opts_proj);
+        V_buf = torch::empty({max_N, d_head}, opts_proj);
+        idx_q_buf = torch::empty({max_N, n_idx_heads}, opts_proj);
+        idx_k_buf = torch::empty({max_N, n_idx_heads}, opts_proj);
+        int eff_top_k_max = std::min(top_k, max_N);
+        selected_buf = torch::empty({max_N, eff_top_k_max}, torch::TensorOptions().device(dev).dtype(torch::kInt32));
+    }
+#endif
 
     for (size_t i = 0; i < n_params; i++) {
         if (!grads[i].defined() || grads[i].numel() == 0)
@@ -239,31 +269,30 @@ void supergrok2_fused_step(
 
 #ifdef WITH_CUDA
         if (params[i].is_cuda()) {
-            // Allocate intermediate buffers
-            auto options_f = torch::TensorOptions().device(params[i].device()).dtype(torch::kFloat32);
-            auto Q = torch::empty({N, d_head}, options_f);
-            auto K = torch::empty({N, d_head}, options_f);
-            auto V = torch::empty({N, d_head}, options_f);
-            auto idx_q_buf = torch::empty({N, n_idx_heads}, options_f);
-            auto idx_k_buf = torch::empty({N, n_idx_heads}, options_f);
-            auto selected = torch::empty({N, eff_top_k}, torch::TensorOptions().device(params[i].device()).dtype(torch::kInt32));
+            // Use pre-allocated buffers with narrow views
+            auto Q = Q_buf.narrow(0, 0, N);
+            auto K = K_buf.narrow(0, 0, N);
+            auto V = V_buf.narrow(0, 0, N);
+            auto idx_q = idx_q_buf.narrow(0, 0, N);
+            auto idx_k = idx_k_buf.narrow(0, 0, N);
+            auto selected = selected_buf.narrow(0, 0, N).narrow(1, 0, eff_top_k);
 
             // Step 1: Project to Q, K, V, idx_q, idx_k
             launch_dsa_project(
                 grads[i], sharpness_cache[i],
-                Q, K, V, idx_q_buf, idx_k_buf,
+                Q, K, V, idx_q, idx_k,
                 W_q, b_q, W_k, b_k, W_v, b_v,
                 W_iq, W_ik, d_head, n_idx_heads);
 
             // Step 2: Lightning indexer + top-k selection
             launch_dsa_indexer_topk(
-                idx_q_buf, idx_k_buf, w_idx, selected,
-                N, n_idx_heads, eff_top_k);
+                idx_q, idx_k, w_idx, selected,
+                n_idx_heads, eff_top_k);
 
             // Step 3: Sparse attention + skip connection → smart_grad
             launch_dsa_sparse_attention(
-                Q, K, V, selected,
-                grads[i], smart_grad,
+                grads[i], Q, K, V, selected,
+                smart_grad,
                 W_out, b_out,
                 rescale, d_head, eff_top_k);
 
@@ -334,7 +363,7 @@ void supergrok11_fused_step(
         float total_norm_sq = 0.0f;
         for (size_t i = 0; i < n_params; i++) {
             if (grads[i].defined() && grads[i].numel() > 0) {
-                float norm = grads[i].to(torch::kFloat32).norm().item<float>();
+                float norm = grads[i].norm().item<float>();
                 total_norm_sq += norm * norm;
             }
         }
@@ -450,7 +479,7 @@ void grokadamw_fused_step(
         float total_norm_sq = 0.0f;
         for (size_t i = 0; i < n_params; i++) {
             if (grads[i].defined() && grads[i].numel() > 0) {
-                float norm = grads[i].to(torch::kFloat32).norm().item<float>();
+                float norm = grads[i].norm().item<float>();
                 total_norm_sq += norm * norm;
             }
         }
@@ -474,7 +503,7 @@ void grokadamw_fused_step(
 #ifdef WITH_CUDA
         if (params[i].is_cuda()) {
             launch_fused_grokadamw_step(
-                params[i], grads[i], exp_avgs[i], exp_avg_sqs[i], emas[i],
+                params[i], exp_avgs[i], exp_avg_sqs[i], emas[i], grads[i],
                 alpha, lamb_grok, beta1, beta2, lr, wd, eps, bc1, bc2);
             continue;
         }
@@ -516,7 +545,7 @@ void neuralgrok_fused_step(
         float total_norm_sq = 0.0f;
         for (size_t i = 0; i < n_params; i++) {
             if (grads[i].defined() && grads[i].numel() > 0) {
-                float norm = grads[i].to(torch::kFloat32).norm().item<float>();
+                float norm = grads[i].norm().item<float>();
                 total_norm_sq += norm * norm;
             }
         }
@@ -628,7 +657,7 @@ float prodigy_fused_step(
 #ifdef WITH_CUDA
         if (params[i].is_cuda()) {
             launch_fused_prodigy_step(
-                params[i], grads[i], exp_avgs[i], exp_avg_sqs[i], s_bufs[i],
+                params[i], exp_avgs[i], exp_avg_sqs[i], s_bufs[i], grads[i],
                 d_lr, beta1, beta2, lr, wd, eps, bc1, bc2);
             continue;
         }
@@ -715,7 +744,7 @@ std::vector<torch::Tensor> looksam_perturb_all(
     float total_norm_sq = 0.0f;
     for (size_t i = 0; i < grads.size(); i++) {
         if (grads[i].defined() && grads[i].numel() > 0) {
-            float n = grads[i].to(torch::kFloat32).norm().item<float>();
+            float n = grads[i].norm().item<float>();
             total_norm_sq += n * n;
         }
     }
@@ -769,7 +798,9 @@ void looksam_compute_directions(
 
 #ifdef WITH_CUDA
         if (v_dirs[i].is_cuda()) {
-            launch_looksam_direction(v_dirs[i], sam_grads[i], normal_grads[i], inv_norm);
+            auto sg_f = sam_grads[i].to(v_dirs[i].dtype());
+            auto ng_f = normal_grads[i].to(v_dirs[i].dtype());
+            launch_looksam_direction(v_dirs[i], sg_f, ng_f, inv_norm);
             continue;
         }
 #endif
@@ -786,12 +817,13 @@ void looksam_adjust_grads(
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
         if (!v_dirs[i].defined() || v_dirs[i].numel() == 0) continue;
 
-        float grad_norm = grads[i].to(torch::kFloat32).norm().item<float>();
+        float grad_norm = grads[i].norm().item<float>();
         float la_times_gnorm = la * grad_norm;
 
 #ifdef WITH_CUDA
         if (grads[i].is_cuda()) {
-            launch_looksam_adjust(grads[i], v_dirs[i], la_times_gnorm);
+            auto vd_typed = v_dirs[i].to(grads[i].dtype());
+            launch_looksam_adjust(grads[i], vd_typed, la_times_gnorm);
             continue;
         }
 #endif
@@ -826,7 +858,7 @@ void muon_fused_step(
 
         buf.mul_(momentum).add_(g);
 
-        float buf_norm = buf.to(torch::kFloat32).norm().item<float>() + 1e-7f;
+        float buf_norm = buf.norm().item<float>() + 1e-7f;
         float inv_norm = 1.0f / buf_norm;
 
         auto X = buf * inv_norm;
@@ -862,7 +894,8 @@ void muon_fused_step(
 
         if (use_cuda) {
 #ifdef WITH_CUDA
-            launch_muon_update(p, X, neg_lr_scale, decay_factor);
+            auto X_typed = X.to(p.dtype());
+            launch_muon_update(p, X_typed, neg_lr_scale, decay_factor);
 #endif
         } else {
             p.add_(X, neg_lr_scale);

@@ -53,6 +53,10 @@ class _Amplifier(nn.Module):
     def get_weights(self) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """Return first- and last-layer weights for the C++ kernel.
 
+        NOTE: The C++ kernel only evaluates a 2-layer MLP (first + last layer).
+        If num_layers > 2, intermediate layers are skipped in the CUDA path.
+        Set num_layers=2 for exact CUDA/Python parity.
+
         Returns:
             (W1, b1, W_last, b_last) — all as contiguous FP32 tensors.
         """

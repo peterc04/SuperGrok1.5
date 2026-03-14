@@ -19,7 +19,7 @@ constexpr int GF_BLOCK_SIZE = 256;
 template <typename scalar_t>
 __global__ void fused_grokfast_ema_kernel(
     scalar_t* __restrict__ grad,
-    scalar_t* __restrict__ ema,
+    float* __restrict__ ema,
     const float alpha,
     const float lamb,
     const int N
@@ -28,11 +28,11 @@ __global__ void fused_grokfast_ema_kernel(
     if (idx >= N) return;
 
     const float g = static_cast<float>(grad[idx]);
-    const float e_old = static_cast<float>(ema[idx]);
+    const float e_old = ema[idx];
 
     // EMA update
     const float e = alpha * e_old + (1.0f - alpha) * g;
-    ema[idx] = static_cast<scalar_t>(e);
+    ema[idx] = e;
 
     // Gradient amplification
     grad[idx] = static_cast<scalar_t>(g + lamb * e);
@@ -53,7 +53,7 @@ void launch_fused_grokfast_ema(
         grad.scalar_type(), "fused_grokfast_ema", ([&] {
         fused_grokfast_ema_kernel<scalar_t><<<grid, GF_BLOCK_SIZE>>>(
             grad.data_ptr<scalar_t>(),
-            ema.data_ptr<scalar_t>(),
+            ema.data_ptr<float>(),
             alpha, lamb, N
         );
     }));
