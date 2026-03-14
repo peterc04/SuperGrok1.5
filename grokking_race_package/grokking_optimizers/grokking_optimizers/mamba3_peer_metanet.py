@@ -17,7 +17,7 @@ Architecture per optimizer step, per parameter:
      - 4 experts activated per element, outputs summed
   5. EXPERT MLP:
      - Selected expert transforms gradient: 1 -> hidden -> 1
-     - 128 experts default, hidden=16 default
+     - 144 experts default, hidden=16 default
   6. DYNAMIC EXPERT RECYCLING (every recycle_interval steps):
      - Count activations per expert
      - Dead experts (< threshold activations): clone top expert + noise
@@ -194,7 +194,7 @@ class Mamba3PEERMetaNet(nn.Module):
         d_state: Mamba state dimension (default: 16)
         mamba_expand: Mamba expansion factor (default: 2)
         num_peer_heads: Number of PEER routing heads (default: 4)
-        num_experts: Total experts in pool (default: 128, must be perfect square)
+        num_experts: Total experts in pool (default: 144, must be perfect square)
         expert_hidden: Hidden dim per expert MLP (default: 16)
         gru_hidden: Per-element GRU hidden dim (default: 4)
         rescale: Skip connection scale (default: 0.1)
@@ -208,7 +208,7 @@ class Mamba3PEERMetaNet(nn.Module):
         d_state: int = 16,
         mamba_expand: int = 2,
         num_peer_heads: int = 4,
-        num_experts: int = 128,
+        num_experts: int = 144,
         expert_hidden: int = 16,
         gru_hidden: int = 4,
         rescale: float = 0.1,

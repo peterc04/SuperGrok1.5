@@ -98,87 +98,92 @@ __global__ void mamba3_scan_kernel(
     const int d_state,
     const int reverse               // 0 = forward, 1 = reverse
 ) {
-    const int tid = threadIdx.x;  // thread index = d_inner dimension
+    const int tid = threadIdx.x;
     if (tid >= d_inner) return;
 
-    // State in registers (d_state values per thread)
-    // Using fixed max d_state of 32
+    // Shared memory for cross-thread communication
+    extern __shared__ float smem[];
+    float* s_x_branch = smem;           // [d_inner]
+    float* s_z_branch = smem + d_inner; // [d_inner]
+
+    // State in registers
     float h[32];
+    float h_snap[32]; // snapshot for RoPE (fixes read-after-write)
     for (int s = 0; s < d_state; s++) h[s] = 0.0f;
 
-    // A values for this d_inner dim
-    float A[32];
+    float A[32], freq[32];
     for (int s = 0; s < d_state; s++) {
         A[s] = -expf(A_log[tid * d_state + s]);
-    }
-
-    // RoPE frequencies for this d_inner dim
-    float freq[32];
-    for (int s = 0; s < d_state; s++) {
         freq[s] = rope_freq[tid * d_state + s];
     }
-
     float D_val = D_param[tid];
 
     for (int step = 0; step < N; step++) {
         int i = reverse ? (N - 1 - step) : step;
 
-        // Input projection: compute x_branch[tid] and z[tid]
-        // in_proj_W is [2*d_inner, d_model], row tid = x_branch, row tid+d_inner = z
-        float x_val = 0.0f;
-        float z_val = 0.0f;
+        // Input projection: each thread computes its own x and z
+        float x_val = 0.0f, z_val = 0.0f;
         for (int d = 0; d < d_model; d++) {
             float inp = x_sorted[i * d_model + d];
             x_val += in_proj_W[tid * d_model + d] * inp;
             z_val += in_proj_W[(tid + d_inner) * d_model + d] * inp;
         }
 
-        // dt projection: dt[tid] = softplus(dt_proj_W[tid,:] @ x_branch + dt_proj_b[tid])
-        // x_branch is distributed across threads — need cross-thread communication
-        // For simplicity in this kernel, dt uses only the local x_val (single-dim approx)
-        // This matches the Python reference when d_inner is small
+        // Write x_branch to shared memory for cross-thread access
+        s_x_branch[tid] = x_val;
+        __syncthreads();
+
+        // FULL dt projection: dt[tid] = sum_j(dt_proj_W[tid, j] * x_branch[j]) + dt_proj_b[tid]
         float dt_raw = dt_proj_b[tid];
-        // Since each thread only has its own x_val, use diagonal approximation
-        dt_raw += dt_proj_W[tid * d_inner + tid] * x_val;
-        float dt_val = logf(1.0f + expf(dt_raw));  // softplus
+        for (int j = 0; j < d_inner; j++) {
+            dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
+        }
+        float dt_val = logf(1.0f + expf(dt_raw)); // softplus
 
-        // B projection: B[s] = B_proj_W[s, tid] * x_val (diagonal approx)
-        // C projection: C[s] = C_proj_W[s, tid] * x_val (diagonal approx)
-        // For full accuracy these need cross-thread reduction
+        // Snapshot h for RoPE (fixes read-after-write)
+        for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
 
-        // Trapezoidal discretization + RoPE + state update
+        // State update with trapezoidal + RoPE
         for (int s = 0; s < d_state; s++) {
             float A_bar = (1.0f + dt_val * A[s] / 2.0f) / (1.0f - dt_val * A[s] / 2.0f + 1e-8f);
-            float B_val = B_proj_W[s * d_inner + tid] * x_val;
+
+            // FULL B projection: B[s] = sum_j(B_proj_W[s, j] * x_branch[j])
+            float B_val = 0.0f;
+            for (int j = 0; j < d_inner; j++) {
+                B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
+            }
             float B_bar = dt_val * B_val;
 
-            // RoPE rotation
+            // RoPE using SNAPSHOT (not in-place updated h)
             float cos_p = cosf(dt_val * freq[s]);
             float sin_p = sinf(dt_val * freq[s]);
             int s_prev = (s > 0) ? s - 1 : d_state - 1;
-            float h_rot = h[s] * cos_p - h[s_prev] * sin_p;
+            float h_rot = h_snap[s] * cos_p - h_snap[s_prev] * sin_p;
 
             h[s] = A_bar * h_rot + B_bar;
         }
 
-        // Output: y[tid] = sum_s(h[s] * C[s])
+        // FULL C projection for output: y = sum_s(h[s] * C[s])
+        // C[s] = sum_j(C_proj_W[s, j] * x_branch[j])
         float y_val = 0.0f;
         for (int s = 0; s < d_state; s++) {
-            float C_val = C_proj_W[s * d_inner + tid] * x_val;
+            float C_val = 0.0f;
+            for (int j = 0; j < d_inner; j++) {
+                C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+            }
             y_val += h[s] * C_val;
         }
 
-        // Gated output: y = y * silu(z) + D * x
+        // Gated output
         float silu_z = z_val / (1.0f + expf(-z_val));
         y_val = y_val * silu_z + D_val * x_val;
 
         scan_output[i * d_inner + tid] = y_val;
+        __syncthreads(); // ensure all threads done before next step
     }
 
-    // Write final state
-    for (int s = 0; s < d_state; s++) {
+    for (int s = 0; s < d_state; s++)
         final_state[tid * d_state + s] = h[s];
-    }
 }
 
 
@@ -566,8 +571,11 @@ void launch_mamba3_peer_step(
     auto bwd_scan_out = torch::empty({N, d_inner}, float_opts);
     auto new_bwd_state = torch::empty({d_inner, d_state}, float_opts);
 
+    // Shared memory for scan: x_branch + z_branch
+    int scan_smem = 2 * d_inner * sizeof(float);
+
     // Forward scan
-    mamba3_scan_kernel<<<1, d_inner>>>(
+    mamba3_scan_kernel<<<1, d_inner, scan_smem>>>(
         x_sorted.data_ptr<float>(),
         mamba_fwd_in_proj.data_ptr<float>(),
         mamba_fwd_dt_W.data_ptr<float>(),
@@ -583,7 +591,7 @@ void launch_mamba3_peer_step(
     );
 
     // Backward scan (reverse direction)
-    mamba3_scan_kernel<<<1, d_inner>>>(
+    mamba3_scan_kernel<<<1, d_inner, scan_smem>>>(
         x_sorted.data_ptr<float>(),
         mamba_bwd_in_proj.data_ptr<float>(),
         mamba_bwd_dt_W.data_ptr<float>(),

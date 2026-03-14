@@ -64,7 +64,12 @@ __global__ void mamba3_scan_fwd_save_kernel(
     const int tid = threadIdx.x;
     if (tid >= d_inner) return;
 
+    // Shared memory for cross-thread communication
+    extern __shared__ float smem[];
+    float* s_x_branch = smem;           // [d_inner]
+
     float h[MAX_D_STATE];
+    float h_snap[MAX_D_STATE]; // snapshot for RoPE
     for (int s = 0; s < d_state; s++) h[s] = 0.0f;
 
     float A[MAX_D_STATE];
@@ -93,21 +98,37 @@ __global__ void mamba3_scan_fwd_save_kernel(
         saved_x_branch[i * d_inner + tid] = x_val;
         saved_z[i * d_inner + tid] = z_val;
 
-        // dt projection (diagonal approximation)
-        float dt_raw = dt_proj_b[tid] + dt_proj_W[tid * d_inner + tid] * x_val;
+        // Write x_branch to shared memory for cross-thread access
+        s_x_branch[tid] = x_val;
+        __syncthreads();
+
+        // FULL dt projection
+        float dt_raw = dt_proj_b[tid];
+        for (int j = 0; j < d_inner; j++) {
+            dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
+        }
         float dt_val = logf(1.0f + expf(dt_raw));
         saved_dt[i * d_inner + tid] = dt_val;
+
+        // Snapshot h for RoPE (fixes read-after-write)
+        for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
 
         // State update with trapezoidal + RoPE
         for (int s = 0; s < d_state; s++) {
             float A_bar = (1.0f + dt_val * A[s] / 2.0f) / (1.0f - dt_val * A[s] / 2.0f + 1e-8f);
-            float B_val = B_proj_W[s * d_inner + tid] * x_val;
+
+            // FULL B projection
+            float B_val = 0.0f;
+            for (int j = 0; j < d_inner; j++) {
+                B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
+            }
             float B_bar = dt_val * B_val;
 
+            // RoPE using SNAPSHOT
             float cos_p = cosf(dt_val * freq[s]);
             float sin_p = sinf(dt_val * freq[s]);
             int s_prev = (s > 0) ? s - 1 : d_state - 1;
-            float h_rot = h[s] * cos_p - h[s_prev] * sin_p;
+            float h_rot = h_snap[s] * cos_p - h_snap[s_prev] * sin_p;
 
             h[s] = A_bar * h_rot + B_bar;
         }
@@ -116,10 +137,13 @@ __global__ void mamba3_scan_fwd_save_kernel(
         for (int s = 0; s < d_state; s++)
             saved_states[(i * d_inner + tid) * d_state + s] = h[s];
 
-        // Output
+        // FULL C projection for output
         float y_val = 0.0f;
         for (int s = 0; s < d_state; s++) {
-            float C_val = C_proj_W[s * d_inner + tid] * x_val;
+            float C_val = 0.0f;
+            for (int j = 0; j < d_inner; j++) {
+                C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+            }
             y_val += h[s] * C_val;
         }
 
@@ -127,6 +151,7 @@ __global__ void mamba3_scan_fwd_save_kernel(
         y_val = y_val * silu_z + D_val * x_val;
 
         scan_output[i * d_inner + tid] = y_val;
+        __syncthreads(); // ensure all threads done before next step
     }
 
     for (int s = 0; s < d_state; s++)
@@ -790,8 +815,11 @@ void launch_mamba3_peer_bilevel_fwd_save(
         x_sorted.copy_(x_proj.index_select(0, sorted));
     }
 
+    // Shared memory for scan: x_branch
+    int scan_smem = d_inner * sizeof(float);
+
     // Step 2: Forward scan with state saving
-    mamba3_scan_fwd_save_kernel<<<1, d_inner>>>(
+    mamba3_scan_fwd_save_kernel<<<1, d_inner, scan_smem>>>(
         x_sorted.data_ptr<float>(),
         mamba_fwd_in_proj.data_ptr<float>(),
         mamba_fwd_dt_W.data_ptr<float>(),
@@ -813,7 +841,7 @@ void launch_mamba3_peer_bilevel_fwd_save(
     // Step 3: Backward scan with state saving (reversed input)
     // Need reversed x_sorted
     auto x_sorted_rev = x_sorted.flip(0).contiguous();
-    mamba3_scan_fwd_save_kernel<<<1, d_inner>>>(
+    mamba3_scan_fwd_save_kernel<<<1, d_inner, scan_smem>>>(
         x_sorted_rev.data_ptr<float>(),
         mamba_bwd_in_proj.data_ptr<float>(),
         mamba_bwd_dt_W.data_ptr<float>(),
