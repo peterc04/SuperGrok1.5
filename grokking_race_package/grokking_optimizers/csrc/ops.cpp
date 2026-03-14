@@ -420,7 +420,7 @@ void supergrok11_fused_step(
         // Cosine gating
         auto sg_flat = smart_grad.reshape(-1).to(torch::kFloat32);
         auto mu_flat = mus[i].reshape(-1).to(torch::kFloat32);
-        float dot_val = torch::dot(sg_flat, mu_flat).item<float>();
+        float dot_val = (sg_flat * mu_flat).sum().item<float>();
         float sg_norm = sg_flat.norm().item<float>();
         float mu_norm = mu_flat.norm().item<float>();
         float cos_sim = dot_val / (sg_norm * mu_norm + 1e-8f);
@@ -637,7 +637,7 @@ float prodigy_fused_step(
 #endif
         auto g_f = grads[i].to(torch::kFloat32);
         auto diff = (params[i] - param_inits[i]).to(torch::kFloat32);
-        numerator += torch::dot(g_f.flatten(), diff.flatten()).item<float>();
+        numerator += (g_f.flatten() * diff.flatten()).sum().item<float>();
         denominator += s_bufs[i].to(torch::kFloat32).sum().item<float>();
     }
 
