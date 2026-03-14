@@ -21,6 +21,7 @@ except ImportError as e:
 
 from .supergrok15 import SuperGrok15, SharpnessMetaNet
 from .supergrok2 import SuperGrok2
+from .mamba3_peer_metanet import Mamba3PEERMetaNet, Mamba3ScanBlock, MiniGRU
 from .isab_peer_metanet import ISABPEERMetaNet
 from .supergrok11 import SuperGrok11
 from .grokadamw import GrokAdamW
@@ -34,7 +35,8 @@ from .cuda_graph_optimizer import CUDAGraphOptimizer
 
 __all__ = [
     "SuperGrok15", "SharpnessMetaNet",
-    "SuperGrok2", "ISABPEERMetaNet",
+    "SuperGrok2", "Mamba3PEERMetaNet", "Mamba3ScanBlock", "MiniGRU",
+    "ISABPEERMetaNet",
     "SuperGrok11",
     "GrokAdamW",
     "NeuralGrok",

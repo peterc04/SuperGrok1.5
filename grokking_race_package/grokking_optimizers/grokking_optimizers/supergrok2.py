@@ -1,17 +1,18 @@
 """
-SuperGrok v2 — ISAB + PEER + Recurrent Meta-Net Grokking Optimizer
+SuperGrok v2 — Mamba-3 + 4-Head PEER + GRU Meta-Net Grokking Optimizer
 
-Replaces the old DSA-based meta-net with an ISAB+PEER+Recurrent architecture
-that captures cross-element gradient correlations in O(N×M) instead of O(N²).
+Replaces the old ISAB+PEER+Recurrent architecture with Mamba-3 based meta-net
+that captures cross-element gradient correlations via bidirectional selective
+state space scans.
 
 Key features:
-  - ISAB (Induced Set Attention Block) for global context via inducing points
-  - PEER (Product-key Expert Routing) for sparse expert selection
-  - Recurrent per-element hidden state for temporal gradient patterns
-  - Soft routing (softmax) in bilevel for gradient flow, hard (argmax) in inference
+  - Mamba-3 bidirectional scan (sorted by |gradient| magnitude)
+  - 4-Head PEER product-key expert routing (128 experts, 4 active per element)
+  - Per-element GRU for temporal gradient memory
+  - Dynamic expert recycling (dead experts cloned from top performer)
   - All adaptive scheduling from v1.5 (sigmoid SAM/bilevel/WD, alpha updates)
   - functional_call SAM (no parameter modification)
-  - Python fallback path (CUDA kernels in Phase 4)
+  - Python fallback path (CUDA kernels in Phase C)
 """
 
 import math
@@ -20,18 +21,15 @@ import torch.nn as nn
 from torch.optim import Optimizer
 from typing import Optional, Dict
 
-from grokking_optimizers.isab_peer_metanet import ISABPEERMetaNet
-from grokking_optimizers._adamw_helper import adamw_step
+from grokking_optimizers.mamba3_peer_metanet import Mamba3PEERMetaNet
 
 
 class SuperGrok2(Optimizer):
-    r"""SuperGrok v2 — ISAB+PEER+Recurrent Grokking Optimizer.
+    r"""SuperGrok v2 — Mamba-3+PEER Grokking Optimizer.
 
     Same dynamics as SuperGrok v1.5 (sigmoid gating, adaptive SAM/bilevel,
-    progressive WD) but with an ISAB+PEER+Recurrent meta-net that captures
-    cross-element gradient correlations in O(N×M) time.
-
-    Uses Python fallback path for meta-net inference. CUDA kernels TBD (Phase 4).
+    progressive WD) but with a Mamba-3+PEER meta-net that captures
+    cross-element gradient correlations via bidirectional selective scans.
     """
 
     def __init__(
@@ -50,12 +48,16 @@ class SuperGrok2(Optimizer):
         warmup_ramp: int = 100,
         gradient_clipping: float = 1.0,
         meta_net: Optional[nn.Module] = None,
-        num_inducing: int = 16,
-        meta_d_model: int = 8,
-        num_peer_experts: int = 1024,
-        expert_hidden: int = 4,
-        recurrent_dim: int = 8,
+        d_model: int = 8,
+        d_state: int = 16,
+        mamba_expand: int = 2,
+        num_peer_heads: int = 4,
+        num_experts: int = 128,
+        expert_hidden: int = 16,
+        gru_hidden: int = 4,
         meta_rescale: float = 0.1,
+        recycle_interval: int = 100,
+        recycle_threshold: float = 0.001,
         alpha_update_freq: int = 100,
         zero_loss_threshold: float = 1e-4,
         zero_acc_threshold: float = 0.995,
@@ -92,12 +94,12 @@ class SuperGrok2(Optimizer):
         self.zero_acc_threshold = zero_acc_threshold
         self.sam_rho = sam_rho
 
-        # Meta-net hyperparams (stored for reference)
-        self.num_inducing = num_inducing
-        self.meta_d_model = meta_d_model
-        self.num_peer_experts = num_peer_experts
+        # Meta-net hyperparams
+        self.d_model = d_model
+        self.d_state = d_state
+        self.num_experts = num_experts
         self.expert_hidden = expert_hidden
-        self.recurrent_dim = recurrent_dim
+        self.gru_hidden = gru_hidden
         self.meta_rescale = meta_rescale
 
         # Adaptive scheduling params
@@ -115,15 +117,19 @@ class SuperGrok2(Optimizer):
         self.wd_scale = wd_scale
         self.wd_thresh = wd_thresh
 
-        # Meta-net: ISAB + PEER + Recurrent
+        # Meta-net: Mamba-3 + 4-Head PEER + GRU
         if meta_net is None:
-            self.meta_net = ISABPEERMetaNet(
-                num_inducing=num_inducing,
-                d_model=meta_d_model,
-                num_peer_experts=num_peer_experts,
+            self.meta_net = Mamba3PEERMetaNet(
+                d_model=d_model,
+                d_state=d_state,
+                mamba_expand=mamba_expand,
+                num_peer_heads=num_peer_heads,
+                num_experts=num_experts,
                 expert_hidden=expert_hidden,
-                recurrent_dim=recurrent_dim,
+                gru_hidden=gru_hidden,
                 rescale=meta_rescale,
+                recycle_interval=recycle_interval,
+                recycle_threshold=recycle_threshold,
             )
         else:
             self.meta_net = meta_net
@@ -147,7 +153,9 @@ class SuperGrok2(Optimizer):
         self._flat_exp_avg_sqs = []
         self._flat_mus = []
         self._flat_sharpness = []
-        self._flat_recurrent_states = []
+        self._flat_gru_states = []
+        self._flat_mamba_fwd_states = []
+        self._flat_mamba_bwd_states = []
         self._param_to_idx = {}
 
         idx = 0
@@ -184,10 +192,13 @@ class SuperGrok2(Optimizer):
                 torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
             self._flat_mus.append(torch.zeros_like(p.data))
             self._flat_sharpness.append(torch.zeros_like(p.data))
-            # Per-parameter recurrent state for ISAB+PEER meta-net
-            self._flat_recurrent_states.append(
-                torch.zeros(p.data.numel(), self.recurrent_dim,
+            # Per-parameter GRU state
+            self._flat_gru_states.append(
+                torch.zeros(p.data.numel(), self.gru_hidden,
                             dtype=torch.float32, device=p.device))
+            # Per-parameter Mamba states (initialized on first use)
+            self._flat_mamba_fwd_states.append(None)
+            self._flat_mamba_bwd_states.append(None)
         self._state_initialized = True
 
     def _sigmoid(self, scale, value, thresh):
@@ -263,65 +274,63 @@ class SuperGrok2(Optimizer):
 
         group = self.param_groups[0]
         lr = group["lr"]
-        beta1_base = group["betas"][0]
         beta2 = group["betas"][1]
         eps = group["eps"]
         wd_eff = self._get_effective_wd(group["weight_decay"])
 
-        # Python fallback: per-parameter meta-net forward + Adam
-        params_for_adam = []
-        grads_for_adam = []
-        exp_avgs_for_adam = []
-        exp_avg_sqs_for_adam = []
-        steps_for_adam = []
-
+        # Per-parameter meta-net forward + Adam
         for i, p in enumerate(self._flat_params):
             if p.grad is None:
                 continue
 
             self._flat_steps[i] += 1
             grad = p.grad.data
-            N = grad.numel()
 
             # Gradient clipping (per-parameter)
             grad_norm = grad.norm()
             if grad_norm > self.gradient_clipping:
                 grad = grad * (self.gradient_clipping / (grad_norm + 1e-12))
 
-            # Meta-net forward with recurrent state
+            # Meta-net forward with GRU + Mamba states
             flat_grad = grad.reshape(-1)
             flat_sharp = self._flat_sharpness[i].reshape(-1)
-            recurrent_h = self._flat_recurrent_states[i]
 
-            smart_grad, new_h = self.meta_net(flat_grad, flat_sharp, recurrent_h)
-            self._flat_recurrent_states[i] = new_h.detach()
+            smart_grad, new_gru, new_fwd, new_bwd = self.meta_net(
+                flat_grad, flat_sharp,
+                self._flat_gru_states[i],
+                self._flat_mamba_fwd_states[i],
+                self._flat_mamba_bwd_states[i])
+            self._flat_gru_states[i] = new_gru.detach()
+            self._flat_mamba_fwd_states[i] = new_fwd.detach()
+            self._flat_mamba_bwd_states[i] = new_bwd.detach()
 
-            # Gating: interpolate between raw grad and smart grad
+            # Gating
             alpha_i = max(0.0, min(1.0, base_alpha * self._flat_layer_alphas[i]))
             lamb_eff = self.lamb * ramp * gate_signal
 
-            # mu update: mu = alpha * mu + (1 - alpha) * smart_grad
+            # mu update: EMA of raw gradient
             mu = self._flat_mus[i]
-            mu.mul_(alpha_i).add_(smart_grad.reshape(grad.shape), alpha=1.0 - alpha_i)
+            mu.mul_(alpha_i).add_(grad, alpha=1.0 - alpha_i)
 
-            # Effective gradient: grad + lamb * mu
-            effective_grad = grad + lamb_eff * mu
+            # Effective gradient: smart_grad is PRIMARY + lamb * mu
+            effective_grad = smart_grad.reshape(grad.shape) + lamb_eff * mu
             self._flat_mus[i] = mu
 
-            # Collect for batched Adam step
-            params_for_adam.append(p.data)
-            grads_for_adam.append(effective_grad)
-            exp_avgs_for_adam.append(self._flat_exp_avgs[i])
-            exp_avg_sqs_for_adam.append(self._flat_exp_avg_sqs[i])
-            steps_for_adam.append(self._flat_steps[i])
+            # Per-parameter Adam with per-layer beta1
+            beta1_i = self._flat_layer_beta1s[i]
+            step_i = self._flat_steps[i]
+            bc1 = 1.0 - beta1_i ** step_i
+            bc2 = 1.0 - beta2 ** step_i
 
-        if params_for_adam:
-            adamw_step(
-                params_for_adam, grads_for_adam,
-                exp_avgs_for_adam, exp_avg_sqs_for_adam,
-                steps_for_adam,
-                lr, beta1_base, beta2, eps, wd_eff,
-            )
+            ea = self._flat_exp_avgs[i]
+            easq = self._flat_exp_avg_sqs[i]
+            fg = effective_grad.reshape(-1).float()
+            ea.mul_(beta1_i).add_(fg, alpha=1 - beta1_i)
+            easq.mul_(beta2).addcmul_(fg, fg, value=1 - beta2)
+            step_size = lr / bc1
+            denom = (easq / bc2).sqrt().add_(eps)
+            p.data.mul_(1 - lr * wd_eff)
+            p.data.addcdiv_(ea.reshape(p.data.shape), denom.reshape(p.data.shape), value=-step_size)
 
         return loss
 
@@ -335,13 +344,11 @@ class SuperGrok2(Optimizer):
         if not train_grads:
             return 0.0
 
-        # Compute perturbation direction without modifying actual params
         flat_grads = [train_grads[n] for n, _ in model.named_parameters() if n in train_grads]
         total_norm_sq = sum(g.norm().pow(2) for g in flat_grads if g.numel() > 0)
         grad_norm = total_norm_sq.sqrt() + 1e-12
         rho_over_norm = self.sam_rho / grad_norm
 
-        # Build perturbed parameter dict WITHOUT modifying actual params
         named_params = dict(model.named_parameters())
         perturbed_params = {}
         for name, p in named_params.items():
@@ -350,7 +357,6 @@ class SuperGrok2(Optimizer):
             else:
                 perturbed_params[name] = p.detach()
 
-        # Forward at perturbed point — actual params untouched
         model.zero_grad()
         with torch.enable_grad():
             sam_logits = torch.func.functional_call(model, perturbed_params, (train_x,))
@@ -358,7 +364,6 @@ class SuperGrok2(Optimizer):
             sam_loss.backward()
         sam_loss_val = sam_loss.item()
 
-        # Compute sharpness = |sam_grad - normal_grad|
         for name, p in model.named_parameters():
             pidx = self._param_to_idx.get(id(p))
             if pidx is not None and p.grad is not None and name in train_grads:
@@ -366,7 +371,6 @@ class SuperGrok2(Optimizer):
                 normal_grad = train_grads[name]
                 self._flat_sharpness[pidx] = (sam_grad - normal_grad).abs()
 
-        # Restore original grads
         for name, p in model.named_parameters():
             p.grad = train_grads.get(name)
 
@@ -382,39 +386,20 @@ class SuperGrok2(Optimizer):
             if p.grad is not None:
                 saved_grads[name] = p.grad.detach().clone()
 
-        # Batched meta-net forward with soft routing for gradient flow
-        all_grads = []
-        all_sharps = []
-        all_recurrent = []
-        all_names = []
-        all_sizes = []
+        # Per-parameter meta-net forward with soft routing for gradient flow
+        smart_grads = {}
         for name, p in named_params:
             if name in saved_grads:
                 pidx = self._param_to_idx.get(id(p))
-                all_grads.append(saved_grads[name].reshape(-1))
-                all_sharps.append(
-                    self._flat_sharpness[pidx].reshape(-1) if pidx is not None
-                    else torch.zeros(p.data.numel(), device=p.device))
-                all_recurrent.append(
-                    self._flat_recurrent_states[pidx] if pidx is not None
-                    else torch.zeros(p.data.numel(), self.recurrent_dim,
-                                     dtype=torch.float32, device=p.device))
-                all_names.append(name)
-                all_sizes.append(saved_grads[name].numel())
-
-        smart_grads = {}
-        if all_grads:
-            cat_grads = torch.cat(all_grads)
-            cat_sharps = torch.cat(all_sharps)
-            cat_recurrent = torch.cat(all_recurrent, dim=0)
-            # Use forward_for_bilevel for differentiable soft routing
-            cat_smart, _ = self.meta_net.forward_for_bilevel(
-                cat_grads, cat_sharps, cat_recurrent)
-            offset = 0
-            for name, size in zip(all_names, all_sizes):
-                smart_grads[name] = cat_smart[offset:offset+size].reshape(
-                    saved_grads[name].shape)
-                offset += size
+                if pidx is None:
+                    continue
+                sg, _, _, _ = self.meta_net.forward_for_bilevel_cuda(
+                    saved_grads[name].reshape(-1),
+                    self._flat_sharpness[pidx].reshape(-1),
+                    self._flat_gru_states[pidx],
+                    self._flat_mamba_fwd_states[pidx],
+                    self._flat_mamba_bwd_states[pidx])
+                smart_grads[name] = sg.reshape(saved_grads[name].shape)
 
         model.zero_grad()
         with torch.enable_grad():

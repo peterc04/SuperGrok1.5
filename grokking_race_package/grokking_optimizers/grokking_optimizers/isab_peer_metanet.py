@@ -142,20 +142,38 @@ class ISABPEERMetaNet(nn.Module):
         read_attn = torch.softmax(torch.bmm(rq, I_up.transpose(1, 2)) * scale, dim=-1)
         context = torch.bmm(read_attn, I_up).squeeze(0)
 
-        # PEER with soft routing (differentiable)
+        # PEER with top-k sparse soft routing (differentiable, memory-efficient)
         peer_input = torch.cat([h_new, context, inp], dim=1)
         query = self.peer_query(peer_input)
         q_a, q_b = query[:, :self.d_model // 2], query[:, self.d_model // 2:]
-        scores_a = torch.softmax(q_a @ self.product_keys_A.T * 10.0, dim=-1)  # temperature=0.1
-        scores_b = torch.softmax(q_b @ self.product_keys_B.T * 10.0, dim=-1)
+        logits_a = q_a @ self.product_keys_A.T * 10.0  # [N, pk_dim]
+        logits_b = q_b @ self.product_keys_B.T * 10.0  # [N, pk_dim]
 
-        # Full routing weights: outer product -> [N, num_experts]
-        routing = (scores_a.unsqueeze(2) * scores_b.unsqueeze(1)).reshape(N, -1)
+        # Top-4 per sub-key → 16 active experts per element (instead of pk_dim^2)
+        top_k = min(4, self.pk_dim)
+        topk_a_vals, topk_a_idx = logits_a.topk(top_k, dim=-1)  # [N, top_k]
+        topk_b_vals, topk_b_idx = logits_b.topk(top_k, dim=-1)  # [N, top_k]
+        scores_a = torch.softmax(topk_a_vals, dim=-1)  # [N, top_k]
+        scores_b = torch.softmax(topk_b_vals, dim=-1)  # [N, top_k]
 
-        # Soft expert eval: weighted sum of all expert outputs
-        all_z = torch.relu(torch.einsum('ehi,ni->neh', self.expert_W1, g) + self.expert_b1.unsqueeze(0))
-        all_out = torch.einsum('eoh,neh->neo', self.expert_W2, all_z) + self.expert_b2.unsqueeze(0)
-        out = (routing.unsqueeze(-1) * all_out).sum(dim=1)
+        # Sparse outer product: [N, top_k * top_k] active experts
+        # Compute expert indices from product of top-k sub-keys
+        idx_a_exp = topk_a_idx.unsqueeze(2).expand(-1, -1, top_k)  # [N, top_k, top_k]
+        idx_b_exp = topk_b_idx.unsqueeze(1).expand(-1, top_k, -1)  # [N, top_k, top_k]
+        expert_indices = (idx_a_exp * self.pk_dim + idx_b_exp).reshape(N, -1)  # [N, top_k^2]
+        routing_weights = (scores_a.unsqueeze(2) * scores_b.unsqueeze(1)).reshape(N, -1)  # [N, top_k^2]
+
+        # Evaluate only active experts
+        flat_idx = expert_indices.reshape(-1)  # [N * top_k^2]
+        W1_sel = self.expert_W1[flat_idx]  # [N*top_k^2, expert_hidden, 1]
+        b1_sel = self.expert_b1[flat_idx]  # [N*top_k^2, expert_hidden]
+        W2_sel = self.expert_W2[flat_idx]  # [N*top_k^2, 1, expert_hidden]
+        b2_sel = self.expert_b2[flat_idx]  # [N*top_k^2, 1]
+        g_rep = g.repeat_interleave(top_k * top_k, dim=0)  # [N*top_k^2, 1]
+        z = torch.relu(torch.bmm(W1_sel, g_rep.unsqueeze(-1)).squeeze(-1) + b1_sel)
+        expert_out = torch.bmm(W2_sel, z.unsqueeze(-1)).squeeze(-1) + b2_sel  # [N*top_k^2, 1]
+        expert_out = expert_out.reshape(N, top_k * top_k)  # [N, top_k^2]
+        out = (routing_weights * expert_out).sum(dim=-1, keepdim=True)  # [N, 1]
 
         smart_grad = (g + self.rescale * out).reshape(grad.shape)
         return smart_grad.to(grad.dtype), h_new
