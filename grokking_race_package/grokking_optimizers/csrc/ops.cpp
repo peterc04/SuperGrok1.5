@@ -1036,5 +1036,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // ── SuperGrok v2 Bilevel Backward ────────────────────────────────
     m.def("supergrok2_bilevel_backward", &launch_mamba3_peer_backward,
           "SuperGrok2 bilevel: full backward through meta-net");
+
+    // ── SuperGrok v2 Batched Bilevel Forward-Save ─────────────────────
+    m.def("supergrok2_bilevel_fwd_save_batched", &launch_mamba3_peer_bilevel_fwd_save_batched,
+          "SuperGrok2 bilevel: batched forward scan with state saving");
+
+    // ── SuperGrok v2 Batched Bilevel Backward ─────────────────────────
+    m.def("supergrok2_bilevel_backward_batched", &launch_mamba3_peer_backward_batched,
+          "SuperGrok2 bilevel: batched backward through scan");
 #endif
 }

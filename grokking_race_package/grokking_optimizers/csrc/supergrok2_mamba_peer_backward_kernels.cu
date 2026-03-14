@@ -171,6 +171,145 @@ __global__ void mamba3_scan_fwd_save_kernel(
 
 
 // ═══════════════════════════════════════════════════════════════════════
+//  Kernel 1b: Batched Mamba-3 Scan Forward with State Saving
+//
+//  One block per parameter. Same logic as fwd_save but with packed data
+//  and offset table. Saves states, x_branch, z, dt for backward.
+//
+//  Grid: num_params (one block per parameter)
+//  Threads: d_inner per block
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void mamba3_scan_fwd_save_batched_kernel(
+    const float* __restrict__ x_sorted_packed,    // [total_N, d_model]
+    float* __restrict__ scan_output_packed,        // [total_N, d_inner]
+    const float* __restrict__ initial_states,      // [num_params, d_inner, d_state]
+    float* __restrict__ final_states,              // [num_params, d_inner, d_state]
+    const int* __restrict__ offsets,               // [num_params + 1]
+    const int* __restrict__ reverse_flags,         // [num_params]
+    // Saved intermediates (packed)
+    float* __restrict__ saved_states_packed,       // [total_N, d_inner, d_state]
+    float* __restrict__ saved_x_branch_packed,     // [total_N, d_inner]
+    float* __restrict__ saved_z_packed,            // [total_N, d_inner]
+    float* __restrict__ saved_dt_packed,           // [total_N, d_inner]
+    // Shared Mamba weights
+    const float* __restrict__ in_proj_W,           // [2*d_inner, d_model]
+    const float* __restrict__ dt_proj_W,           // [d_inner, d_inner]
+    const float* __restrict__ dt_proj_b,           // [d_inner]
+    const float* __restrict__ B_proj_W,            // [d_state, d_inner]
+    const float* __restrict__ C_proj_W,            // [d_state, d_inner]
+    const float* __restrict__ A_log,               // [d_inner, d_state]
+    const float* __restrict__ D_param,             // [d_inner]
+    const float* __restrict__ rope_freq,           // [d_inner, d_state/2]
+    const int d_model,
+    const int d_inner,
+    const int d_state
+) {
+    const int param_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (tid >= d_inner) return;
+
+    const int start = offsets[param_idx];
+    const int end = offsets[param_idx + 1];
+    const int N = end - start;
+    const int reverse = reverse_flags[param_idx];
+
+    extern __shared__ float smem[];
+    float* s_x_branch = smem;
+
+    // State in registers — load from initial_state
+    float h[MAX_D_STATE], h_snap[MAX_D_STATE];
+    const float* my_init = initial_states + param_idx * d_inner * d_state;
+    for (int s = 0; s < d_state; s++) h[s] = my_init[tid * d_state + s];
+
+    float A[MAX_D_STATE];
+    for (int s = 0; s < d_state; s++)
+        A[s] = -expf(A_log[tid * d_state + s]);
+
+    const int half_d_state = d_state / 2;
+    float freq[MAX_D_STATE / 2];
+    for (int p = 0; p < half_d_state; p++)
+        freq[p] = rope_freq[tid * half_d_state + p];
+
+    float D_val = D_param[tid];
+
+    const float* my_x = x_sorted_packed + start * d_model;
+    float* my_out = scan_output_packed + start * d_inner;
+    float* my_saved_states = saved_states_packed + start * d_inner * d_state;
+    float* my_saved_xb = saved_x_branch_packed + start * d_inner;
+    float* my_saved_z = saved_z_packed + start * d_inner;
+    float* my_saved_dt = saved_dt_packed + start * d_inner;
+
+    for (int step = 0; step < N; step++) {
+        int i = reverse ? (N - 1 - step) : step;
+
+        float x_val = 0.0f, z_val = 0.0f;
+        for (int d = 0; d < d_model; d++) {
+            float inp = my_x[i * d_model + d];
+            x_val += in_proj_W[tid * d_model + d] * inp;
+            z_val += in_proj_W[(tid + d_inner) * d_model + d] * inp;
+        }
+
+        // Save x_branch and z
+        my_saved_xb[i * d_inner + tid] = x_val;
+        my_saved_z[i * d_inner + tid] = z_val;
+
+        s_x_branch[tid] = x_val;
+        __syncthreads();
+
+        float dt_raw = dt_proj_b[tid];
+        for (int j = 0; j < d_inner; j++)
+            dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
+        float dt_val = logf(1.0f + expf(dt_raw));
+        my_saved_dt[i * d_inner + tid] = dt_val;
+
+        for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
+
+        for (int s = 0; s < d_state; s++) {
+            float A_bar = (1.0f + dt_val * A[s] / 2.0f) / (1.0f - dt_val * A[s] / 2.0f + 1e-8f);
+            float B_val = 0.0f;
+            for (int j = 0; j < d_inner; j++)
+                B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
+            float B_bar = dt_val * B_val;
+            // Paired RoPE
+            int pair_idx = s / 2;
+            float cos_p, sin_p;
+            __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+            float h_rot;
+            if (s % 2 == 0) {
+                h_rot = h_snap[s] * cos_p - h_snap[s + 1] * sin_p;
+            } else {
+                h_rot = h_snap[s] * cos_p + h_snap[s - 1] * sin_p;
+            }
+            h[s] = A_bar * h_rot + B_bar * x_val;
+        }
+
+        // Save state after update
+        for (int s = 0; s < d_state; s++)
+            my_saved_states[(i * d_inner + tid) * d_state + s] = h[s];
+
+        // Output with C projection
+        float y_val = 0.0f;
+        for (int s = 0; s < d_state; s++) {
+            float C_val = 0.0f;
+            for (int j = 0; j < d_inner; j++)
+                C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+            y_val += h[s] * C_val;
+        }
+        float silu_z = z_val / (1.0f + expf(-z_val));
+        y_val = y_val * silu_z + D_val * x_val;
+
+        my_out[i * d_inner + tid] = y_val;
+        __syncthreads();
+    }
+
+    float* my_final = final_states + param_idx * d_inner * d_state;
+    for (int s = 0; s < d_state; s++)
+        my_final[tid * d_state + s] = h[s];
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
 //  Kernel 2: Mamba-3 Scan Backward
 //
 //  Computes gradients through the selective scan using saved states.
@@ -447,6 +586,254 @@ __global__ void mamba3_scan_backward_kernel(
     for (int p = 0; p < half_d_state; p++) {
         atomicAdd(&d_rope_freq[tid * half_d_state + p], d_freq_acc[p]);
     }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Kernel 2b: Batched Mamba-3 Scan Backward
+//
+//  One block per parameter. Same logic as backward kernel but with
+//  packed data and offset table. Weight gradients accumulated via
+//  atomicAdd (shared across all params).
+//
+//  Grid: num_params (one block per parameter)
+//  Threads: d_inner per block
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void mamba3_scan_backward_batched_kernel(
+    const float* __restrict__ d_scan_output_packed,  // [total_N, d_inner]
+    const float* __restrict__ x_sorted_packed,       // [total_N, d_model]
+    const float* __restrict__ saved_states_packed,   // [total_N, d_inner, d_state]
+    const float* __restrict__ saved_x_branch_packed, // [total_N, d_inner]
+    const float* __restrict__ saved_z_packed,        // [total_N, d_inner]
+    const float* __restrict__ saved_dt_packed,       // [total_N, d_inner]
+    const int* __restrict__ offsets,                 // [num_params + 1]
+    const int* __restrict__ reverse_flags,           // [num_params]
+    // Initial states (for h_prev at step 0)
+    const float* __restrict__ initial_states,        // [num_params, d_inner, d_state]
+    // Weights (read-only)
+    const float* __restrict__ in_proj_W,
+    const float* __restrict__ dt_proj_W,
+    const float* __restrict__ dt_proj_b,
+    const float* __restrict__ B_proj_W,
+    const float* __restrict__ C_proj_W,
+    const float* __restrict__ A_log,
+    const float* __restrict__ D_param,
+    const float* __restrict__ rope_freq,
+    // Gradient outputs (accumulated via atomicAdd)
+    float* __restrict__ d_in_proj_W,
+    float* __restrict__ d_dt_proj_W,
+    float* __restrict__ d_dt_proj_b,
+    float* __restrict__ d_B_proj_W,
+    float* __restrict__ d_C_proj_W,
+    float* __restrict__ d_A_log,
+    float* __restrict__ d_D_param,
+    float* __restrict__ d_rope_freq,
+    float* __restrict__ d_x_sorted_packed,           // [total_N, d_model]
+    // Dims
+    const int d_model, const int d_inner, const int d_state
+) {
+    const int param_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (tid >= d_inner) return;
+
+    const int start = offsets[param_idx];
+    const int end = offsets[param_idx + 1];
+    const int N = end - start;
+    const int reverse = reverse_flags[param_idx];
+
+    extern __shared__ float smem[];
+    float* s_x_branch = smem;
+    float* s_d_dt_raw = smem + d_inner;
+
+    // Point to this param's packed data
+    const float* my_d_scan = d_scan_output_packed + start * d_inner;
+    const float* my_x_sorted = x_sorted_packed + start * d_model;
+    const float* my_saved_states = saved_states_packed + start * d_inner * d_state;
+    const float* my_saved_xb = saved_x_branch_packed + start * d_inner;
+    const float* my_saved_z = saved_z_packed + start * d_inner;
+    const float* my_saved_dt = saved_dt_packed + start * d_inner;
+    float* my_d_x_sorted = d_x_sorted_packed + start * d_model;
+
+    float A[MAX_D_STATE];
+    for (int s = 0; s < d_state; s++)
+        A[s] = -expf(A_log[tid * d_state + s]);
+
+    const int half_d_state = d_state / 2;
+    float freq[MAX_D_STATE / 2];
+    for (int p = 0; p < half_d_state; p++)
+        freq[p] = rope_freq[tid * half_d_state + p];
+
+    float D_val = D_param[tid];
+
+    float d_D_acc = 0.0f;
+    float d_A_log_acc[MAX_D_STATE];
+    float d_freq_acc[MAX_D_STATE / 2];
+    float d_dt_proj_b_acc = 0.0f;
+    for (int s = 0; s < d_state; s++) d_A_log_acc[s] = 0.0f;
+    for (int p = 0; p < half_d_state; p++) d_freq_acc[p] = 0.0f;
+    float d_dt_proj_W_row[32];
+    for (int j = 0; j < d_inner; j++) d_dt_proj_W_row[j] = 0.0f;
+
+    float dh[MAX_D_STATE];
+    for (int s = 0; s < d_state; s++) dh[s] = 0.0f;
+
+    // Initial state for h_prev at step 0
+    const float* my_init = initial_states + param_idx * d_inner * d_state;
+
+    for (int step = N - 1; step >= 0; step--) {
+        int i = reverse ? (N - 1 - step) : step;
+
+        float d_out = my_d_scan[i * d_inner + tid];
+        float x_val = my_saved_xb[i * d_inner + tid];
+        float z_val = my_saved_z[i * d_inner + tid];
+        float dt_val = my_saved_dt[i * d_inner + tid];
+
+        s_x_branch[tid] = x_val;
+        __syncthreads();
+
+        float sig_z = 1.0f / (1.0f + expf(-z_val));
+        float silu_z = z_val * sig_z;
+
+        float y_val = 0.0f;
+        for (int s = 0; s < d_state; s++) {
+            float C_val = 0.0f;
+            for (int j = 0; j < d_inner; j++)
+                C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+            y_val += my_saved_states[(i * d_inner + tid) * d_state + s] * C_val;
+        }
+
+        float d_y_val = d_out * silu_z;
+        float d_silu_z = d_out * y_val;
+        float d_z_val = d_silu_z * (sig_z + z_val * sig_z * (1.0f - sig_z));
+        float d_x_from_D = d_out * D_val;
+        d_D_acc += d_out * x_val;
+
+        float d_x_from_C = 0.0f;
+        for (int s = 0; s < d_state; s++) {
+            float h_s = my_saved_states[(i * d_inner + tid) * d_state + s];
+            float C_val = 0.0f;
+            for (int j = 0; j < d_inner; j++)
+                C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+            dh[s] += d_y_val * C_val;
+            float d_C_val = d_y_val * h_s;
+            for (int j = 0; j < d_inner; j++)
+                atomicAdd(&d_C_proj_W[s * d_inner + j], d_C_val * s_x_branch[j]);
+            d_x_from_C += d_y_val * h_s * C_proj_W[s * d_inner + tid];
+        }
+
+        // Get h_prev
+        float h_prev[MAX_D_STATE];
+        if (step > 0) {
+            int i_prev = reverse ? (N - step) : (step - 1);
+            for (int s = 0; s < d_state; s++)
+                h_prev[s] = my_saved_states[(i_prev * d_inner + tid) * d_state + s];
+        } else {
+            // Use initial state for this param
+            for (int s = 0; s < d_state; s++)
+                h_prev[s] = my_init[tid * d_state + s];
+        }
+
+        float dh_snap[MAX_D_STATE];
+        for (int s = 0; s < d_state; s++) dh_snap[s] = dh[s];
+        for (int s = 0; s < d_state; s++) dh[s] = 0.0f;
+
+        float d_dt_val = 0.0f;
+        float d_x_from_scan = 0.0f;
+
+        for (int s = 0; s < d_state; s++) {
+            float half_dtA = dt_val * A[s] / 2.0f;
+            float denom_val = 1.0f - half_dtA + 1e-8f;
+            float A_bar = (1.0f + half_dtA) / denom_val;
+
+            float B_val = 0.0f;
+            for (int j = 0; j < d_inner; j++)
+                B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
+            float B_bar = dt_val * B_val;
+
+            int pair_idx = s / 2;
+            float cos_p, sin_p;
+            __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+            float h_rot;
+            int partner;
+            float sign;
+            if (s % 2 == 0) {
+                partner = s + 1;
+                sign = -1.0f;
+                h_rot = h_prev[s] * cos_p - h_prev[partner] * sin_p;
+            } else {
+                partner = s - 1;
+                sign = 1.0f;
+                h_rot = h_prev[s] * cos_p + h_prev[partner] * sin_p;
+            }
+
+            float d_h_s = dh_snap[s];
+            float d_A_bar = d_h_s * h_rot;
+            float d_h_rot = d_h_s * A_bar;
+            float d_B_bar = d_h_s * x_val;
+            d_x_from_scan += d_h_s * B_bar;
+
+            d_dt_val += d_B_bar * B_val;
+            float d_B_val = d_B_bar * dt_val;
+            for (int j = 0; j < d_inner; j++)
+                atomicAdd(&d_B_proj_W[s * d_inner + j], d_B_val * s_x_branch[j]);
+            d_x_from_scan += d_B_val * B_proj_W[s * d_inner + tid];
+
+            float d_half_dtA = d_A_bar * (1.0f + A_bar) / denom_val;
+            d_dt_val += d_half_dtA * A[s] / 2.0f;
+            float d_A_s = d_half_dtA * dt_val / 2.0f;
+            d_A_log_acc[s] += d_A_s * A[s];
+
+            float d_h_prev_s = d_h_rot * cos_p;
+            float d_h_prev_partner = d_h_rot * sign * sin_p;
+
+            float d_cos = d_h_rot * h_prev[s];
+            float d_sin = d_h_rot * sign * h_prev[partner];
+            d_dt_val += (-sin_p * freq[pair_idx]) * d_cos + (cos_p * freq[pair_idx]) * d_sin;
+            d_freq_acc[pair_idx] += (-sin_p * dt_val) * d_cos + (cos_p * dt_val) * d_sin;
+
+            dh[s] += d_h_prev_s;
+            dh[partner] += d_h_prev_partner;
+        }
+
+        float dt_raw = dt_proj_b[tid];
+        for (int j = 0; j < d_inner; j++)
+            dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
+        float sig_dt = 1.0f / (1.0f + expf(-dt_raw));
+        float d_dt_raw = d_dt_val * sig_dt;
+
+        d_dt_proj_b_acc += d_dt_raw;
+        for (int j = 0; j < d_inner; j++)
+            d_dt_proj_W_row[j] += d_dt_raw * s_x_branch[j];
+
+        s_d_dt_raw[tid] = d_dt_raw;
+        __syncthreads();
+        float d_x_from_dt = 0.0f;
+        for (int t = 0; t < d_inner; t++)
+            d_x_from_dt += s_d_dt_raw[t] * dt_proj_W[t * d_inner + tid];
+
+        float d_x_val = d_x_from_D + d_x_from_C + d_x_from_scan + d_x_from_dt;
+
+        for (int d = 0; d < d_model; d++) {
+            float inp = my_x_sorted[i * d_model + d];
+            atomicAdd(&d_in_proj_W[tid * d_model + d], d_x_val * inp);
+            atomicAdd(&d_in_proj_W[(tid + d_inner) * d_model + d], d_z_val * inp);
+            atomicAdd(&my_d_x_sorted[i * d_model + d],
+                      d_x_val * in_proj_W[tid * d_model + d] +
+                      d_z_val * in_proj_W[(tid + d_inner) * d_model + d]);
+        }
+
+        __syncthreads();
+    }
+
+    atomicAdd(&d_D_param[tid], d_D_acc);
+    atomicAdd(&d_dt_proj_b[tid], d_dt_proj_b_acc);
+    for (int j = 0; j < d_inner; j++)
+        atomicAdd(&d_dt_proj_W[tid * d_inner + j], d_dt_proj_W_row[j]);
+    for (int s = 0; s < d_state; s++)
+        atomicAdd(&d_A_log[tid * d_state + s], d_A_log_acc[s]);
+    for (int p = 0; p < half_d_state; p++)
+        atomicAdd(&d_rope_freq[tid * half_d_state + p], d_freq_acc[p]);
 }
 
 
@@ -1229,4 +1616,324 @@ void launch_mamba3_peer_backward(
             N, d_model
         );
     }));
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Batched Bilevel Forward-Save Launcher
+//
+//  Packs multiple parameters' data and launches batched fwd_save kernel
+//  for both scan directions. Returns packed saved intermediates.
+// ═══════════════════════════════════════════════════════════════════════
+
+void launch_mamba3_peer_bilevel_fwd_save_batched(
+    std::vector<torch::Tensor> grads,             // [num_params] each [N_i]
+    std::vector<torch::Tensor> sharpness_list,    // [num_params] each [N_i]
+    // Input proj weights
+    torch::Tensor input_proj_W,
+    torch::Tensor input_proj_b,
+    // Mamba forward weights
+    torch::Tensor mamba_fwd_in_proj,
+    torch::Tensor mamba_fwd_dt_W,
+    torch::Tensor mamba_fwd_dt_b,
+    torch::Tensor mamba_fwd_B_proj,
+    torch::Tensor mamba_fwd_C_proj,
+    torch::Tensor mamba_fwd_A_log,
+    torch::Tensor mamba_fwd_D,
+    torch::Tensor mamba_fwd_rope,
+    torch::Tensor mamba_fwd_out_proj,
+    // Mamba backward weights
+    torch::Tensor mamba_bwd_in_proj,
+    torch::Tensor mamba_bwd_dt_W,
+    torch::Tensor mamba_bwd_dt_b,
+    torch::Tensor mamba_bwd_B_proj,
+    torch::Tensor mamba_bwd_C_proj,
+    torch::Tensor mamba_bwd_A_log,
+    torch::Tensor mamba_bwd_D,
+    torch::Tensor mamba_bwd_rope,
+    torch::Tensor mamba_bwd_out_proj,
+    // Dims
+    int d_model, int d_state, int d_inner,
+    // Outputs (pre-allocated by caller)
+    torch::Tensor fwd_scan_out_packed,       // [total_N, d_inner]
+    torch::Tensor bwd_scan_out_packed,       // [total_N, d_inner]
+    torch::Tensor fwd_saved_states_packed,   // [total_N, d_inner, d_state]
+    torch::Tensor fwd_saved_xb_packed,       // [total_N, d_inner]
+    torch::Tensor fwd_saved_z_packed,        // [total_N, d_inner]
+    torch::Tensor fwd_saved_dt_packed,       // [total_N, d_inner]
+    torch::Tensor bwd_saved_states_packed,
+    torch::Tensor bwd_saved_xb_packed,
+    torch::Tensor bwd_saved_z_packed,
+    torch::Tensor bwd_saved_dt_packed,
+    torch::Tensor x_sorted_packed,           // [total_N, d_model]
+    torch::Tensor offsets_t,                 // [num_params + 1]
+    torch::Tensor sort_indices_packed        // [total_N] int
+) {
+    const int num_params = grads.size();
+    if (num_params == 0) return;
+
+    auto dev = grads[0].device();
+    auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
+    auto int_opts = torch::TensorOptions().device(dev).dtype(torch::kInt32);
+
+    // Step 1: Input projection + sort per param, pack into x_sorted_packed
+    std::vector<int> offsets_cpu(num_params + 1);
+    offsets_cpu[0] = 0;
+    for (int p = 0; p < num_params; p++) {
+        int N = grads[p].numel();
+        offsets_cpu[p + 1] = offsets_cpu[p] + N;
+
+        if (N == 0) continue;
+
+        auto g_f = grads[p].to(torch::kFloat32).reshape(-1);
+        auto s_f = sharpness_list[p].to(torch::kFloat32).reshape(-1);
+        auto inp = torch::stack({g_f, s_f}, 1);
+        auto x_proj = torch::addmm(input_proj_b, inp, input_proj_W.t());
+
+        auto sort_keys = g_f.abs();
+        auto sorted_idx = sort_keys.argsort();
+        auto sorted_idx_int = sorted_idx.to(torch::kInt32);
+
+        // Copy sort indices
+        sort_indices_packed.narrow(0, offsets_cpu[p], N).copy_(sorted_idx_int);
+
+        // Sort and copy x_sorted
+        auto x_sorted_p = x_proj.index_select(0, sorted_idx);
+        x_sorted_packed.narrow(0, offsets_cpu[p], N).copy_(x_sorted_p);
+    }
+
+    offsets_t.copy_(torch::from_blob(offsets_cpu.data(), {num_params + 1},
+        torch::kInt32).to(dev));
+
+    // Zero initial states for bilevel
+    auto initial_states = torch::zeros({num_params, d_inner, d_state}, float_opts);
+    auto final_fwd = torch::empty({num_params, d_inner, d_state}, float_opts);
+    auto final_bwd = torch::empty({num_params, d_inner, d_state}, float_opts);
+
+    auto rev_fwd = torch::zeros({num_params}, int_opts);
+    auto rev_bwd = torch::ones({num_params}, int_opts);
+
+    int scan_smem = d_inner * sizeof(float);
+
+    // Step 2: Forward scan with saving
+    mamba3_scan_fwd_save_batched_kernel<<<num_params, d_inner, scan_smem>>>(
+        x_sorted_packed.data_ptr<float>(),
+        fwd_scan_out_packed.data_ptr<float>(),
+        initial_states.data_ptr<float>(),
+        final_fwd.data_ptr<float>(),
+        offsets_t.data_ptr<int>(),
+        rev_fwd.data_ptr<int>(),
+        fwd_saved_states_packed.data_ptr<float>(),
+        fwd_saved_xb_packed.data_ptr<float>(),
+        fwd_saved_z_packed.data_ptr<float>(),
+        fwd_saved_dt_packed.data_ptr<float>(),
+        mamba_fwd_in_proj.data_ptr<float>(),
+        mamba_fwd_dt_W.data_ptr<float>(),
+        mamba_fwd_dt_b.data_ptr<float>(),
+        mamba_fwd_B_proj.data_ptr<float>(),
+        mamba_fwd_C_proj.data_ptr<float>(),
+        mamba_fwd_A_log.data_ptr<float>(),
+        mamba_fwd_D.data_ptr<float>(),
+        mamba_fwd_rope.data_ptr<float>(),
+        d_model, d_inner, d_state
+    );
+
+    // Step 3: Build reversed x_sorted for backward scan direction
+    // Each param's portion of x_sorted_packed needs to be reversed independently
+    auto x_sorted_rev_packed = torch::empty_like(x_sorted_packed);
+    for (int p = 0; p < num_params; p++) {
+        int N = offsets_cpu[p + 1] - offsets_cpu[p];
+        if (N == 0) continue;
+        auto slice = x_sorted_packed.narrow(0, offsets_cpu[p], N);
+        x_sorted_rev_packed.narrow(0, offsets_cpu[p], N).copy_(slice.flip(0));
+    }
+
+    // Step 4: Backward scan with saving
+    mamba3_scan_fwd_save_batched_kernel<<<num_params, d_inner, scan_smem>>>(
+        x_sorted_rev_packed.data_ptr<float>(),
+        bwd_scan_out_packed.data_ptr<float>(),
+        initial_states.data_ptr<float>(),
+        final_bwd.data_ptr<float>(),
+        offsets_t.data_ptr<int>(),
+        rev_fwd.data_ptr<int>(),  // not reversed — the data is already flipped
+        bwd_saved_states_packed.data_ptr<float>(),
+        bwd_saved_xb_packed.data_ptr<float>(),
+        bwd_saved_z_packed.data_ptr<float>(),
+        bwd_saved_dt_packed.data_ptr<float>(),
+        mamba_bwd_in_proj.data_ptr<float>(),
+        mamba_bwd_dt_W.data_ptr<float>(),
+        mamba_bwd_dt_b.data_ptr<float>(),
+        mamba_bwd_B_proj.data_ptr<float>(),
+        mamba_bwd_C_proj.data_ptr<float>(),
+        mamba_bwd_A_log.data_ptr<float>(),
+        mamba_bwd_D.data_ptr<float>(),
+        mamba_bwd_rope.data_ptr<float>(),
+        d_model, d_inner, d_state
+    );
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Batched Bilevel Backward Launcher
+//
+//  Takes packed saved intermediates and gradient signals, launches
+//  batched backward scan kernels for both directions.
+// ═══════════════════════════════════════════════════════════════════════
+
+void launch_mamba3_peer_backward_batched(
+    // Packed gradient signals (from out_proj backward)
+    torch::Tensor d_fwd_scan_out_packed,     // [total_N, d_inner]
+    torch::Tensor d_bwd_scan_out_packed,     // [total_N, d_inner]
+    // Packed saved intermediates
+    torch::Tensor x_sorted_packed,           // [total_N, d_model]
+    torch::Tensor fwd_saved_states_packed,   // [total_N, d_inner, d_state]
+    torch::Tensor fwd_saved_xb_packed,       // [total_N, d_inner]
+    torch::Tensor fwd_saved_z_packed,        // [total_N, d_inner]
+    torch::Tensor fwd_saved_dt_packed,       // [total_N, d_inner]
+    torch::Tensor bwd_saved_states_packed,
+    torch::Tensor bwd_saved_xb_packed,
+    torch::Tensor bwd_saved_z_packed,
+    torch::Tensor bwd_saved_dt_packed,
+    torch::Tensor offsets_t,                 // [num_params + 1]
+    // Weights
+    torch::Tensor mamba_fwd_in_proj,
+    torch::Tensor mamba_fwd_dt_W,
+    torch::Tensor mamba_fwd_dt_b,
+    torch::Tensor mamba_fwd_B_proj,
+    torch::Tensor mamba_fwd_C_proj,
+    torch::Tensor mamba_fwd_A_log,
+    torch::Tensor mamba_fwd_D,
+    torch::Tensor mamba_fwd_rope,
+    torch::Tensor mamba_bwd_in_proj,
+    torch::Tensor mamba_bwd_dt_W,
+    torch::Tensor mamba_bwd_dt_b,
+    torch::Tensor mamba_bwd_B_proj,
+    torch::Tensor mamba_bwd_C_proj,
+    torch::Tensor mamba_bwd_A_log,
+    torch::Tensor mamba_bwd_D,
+    torch::Tensor mamba_bwd_rope,
+    // Gradient outputs (pre-zeroed by caller)
+    torch::Tensor d_mamba_fwd_in_proj,
+    torch::Tensor d_mamba_fwd_dt_W,
+    torch::Tensor d_mamba_fwd_dt_b,
+    torch::Tensor d_mamba_fwd_B_proj,
+    torch::Tensor d_mamba_fwd_C_proj,
+    torch::Tensor d_mamba_fwd_A_log,
+    torch::Tensor d_mamba_fwd_D,
+    torch::Tensor d_mamba_fwd_rope,
+    torch::Tensor d_mamba_bwd_in_proj,
+    torch::Tensor d_mamba_bwd_dt_W,
+    torch::Tensor d_mamba_bwd_dt_b,
+    torch::Tensor d_mamba_bwd_B_proj,
+    torch::Tensor d_mamba_bwd_C_proj,
+    torch::Tensor d_mamba_bwd_A_log,
+    torch::Tensor d_mamba_bwd_D,
+    torch::Tensor d_mamba_bwd_rope,
+    torch::Tensor d_x_sorted_packed,         // [total_N, d_model] output
+    // Dims
+    int d_model, int d_state, int d_inner, int num_params
+) {
+    if (num_params == 0) return;
+
+    auto dev = d_fwd_scan_out_packed.device();
+    auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
+    auto int_opts = torch::TensorOptions().device(dev).dtype(torch::kInt32);
+
+    // Zero initial states for bilevel backward h_prev at step 0
+    auto initial_states = torch::zeros({num_params, d_inner, d_state}, float_opts);
+
+    auto rev_fwd = torch::zeros({num_params}, int_opts);
+    auto rev_bwd = torch::zeros({num_params}, int_opts);  // data was pre-reversed
+
+    int scan_smem = 2 * d_inner * sizeof(float);  // s_x_branch + s_d_dt_raw
+
+    // Forward direction backward scan
+    auto d_x_sorted_fwd = torch::zeros_like(d_x_sorted_packed);
+    mamba3_scan_backward_batched_kernel<<<num_params, d_inner, scan_smem>>>(
+        d_fwd_scan_out_packed.data_ptr<float>(),
+        x_sorted_packed.data_ptr<float>(),
+        fwd_saved_states_packed.data_ptr<float>(),
+        fwd_saved_xb_packed.data_ptr<float>(),
+        fwd_saved_z_packed.data_ptr<float>(),
+        fwd_saved_dt_packed.data_ptr<float>(),
+        offsets_t.data_ptr<int>(),
+        rev_fwd.data_ptr<int>(),
+        initial_states.data_ptr<float>(),
+        mamba_fwd_in_proj.data_ptr<float>(),
+        mamba_fwd_dt_W.data_ptr<float>(),
+        mamba_fwd_dt_b.data_ptr<float>(),
+        mamba_fwd_B_proj.data_ptr<float>(),
+        mamba_fwd_C_proj.data_ptr<float>(),
+        mamba_fwd_A_log.data_ptr<float>(),
+        mamba_fwd_D.data_ptr<float>(),
+        mamba_fwd_rope.data_ptr<float>(),
+        d_mamba_fwd_in_proj.data_ptr<float>(),
+        d_mamba_fwd_dt_W.data_ptr<float>(),
+        d_mamba_fwd_dt_b.data_ptr<float>(),
+        d_mamba_fwd_B_proj.data_ptr<float>(),
+        d_mamba_fwd_C_proj.data_ptr<float>(),
+        d_mamba_fwd_A_log.data_ptr<float>(),
+        d_mamba_fwd_D.data_ptr<float>(),
+        d_mamba_fwd_rope.data_ptr<float>(),
+        d_x_sorted_fwd.data_ptr<float>(),
+        d_model, d_inner, d_state
+    );
+
+    // Build reversed x_sorted for bwd direction backward
+    // The bwd scan used reversed x_sorted in forward, so we need that here too
+    auto total_N = x_sorted_packed.size(0);
+    auto x_sorted_rev_packed = torch::empty_like(x_sorted_packed);
+    // Read offsets from GPU
+    auto offsets_cpu = offsets_t.to(torch::kCPU);
+    auto offsets_ptr = offsets_cpu.data_ptr<int>();
+    for (int p = 0; p < num_params; p++) {
+        int start = offsets_ptr[p];
+        int N = offsets_ptr[p + 1] - start;
+        if (N == 0) continue;
+        x_sorted_rev_packed.narrow(0, start, N).copy_(
+            x_sorted_packed.narrow(0, start, N).flip(0));
+    }
+
+    // Backward direction backward scan
+    auto d_x_sorted_bwd = torch::zeros({total_N, d_model}, float_opts);
+    mamba3_scan_backward_batched_kernel<<<num_params, d_inner, scan_smem>>>(
+        d_bwd_scan_out_packed.data_ptr<float>(),
+        x_sorted_rev_packed.data_ptr<float>(),
+        bwd_saved_states_packed.data_ptr<float>(),
+        bwd_saved_xb_packed.data_ptr<float>(),
+        bwd_saved_z_packed.data_ptr<float>(),
+        bwd_saved_dt_packed.data_ptr<float>(),
+        offsets_t.data_ptr<int>(),
+        rev_bwd.data_ptr<int>(),
+        initial_states.data_ptr<float>(),
+        mamba_bwd_in_proj.data_ptr<float>(),
+        mamba_bwd_dt_W.data_ptr<float>(),
+        mamba_bwd_dt_b.data_ptr<float>(),
+        mamba_bwd_B_proj.data_ptr<float>(),
+        mamba_bwd_C_proj.data_ptr<float>(),
+        mamba_bwd_A_log.data_ptr<float>(),
+        mamba_bwd_D.data_ptr<float>(),
+        mamba_bwd_rope.data_ptr<float>(),
+        d_mamba_bwd_in_proj.data_ptr<float>(),
+        d_mamba_bwd_dt_W.data_ptr<float>(),
+        d_mamba_bwd_dt_b.data_ptr<float>(),
+        d_mamba_bwd_B_proj.data_ptr<float>(),
+        d_mamba_bwd_C_proj.data_ptr<float>(),
+        d_mamba_bwd_A_log.data_ptr<float>(),
+        d_mamba_bwd_D.data_ptr<float>(),
+        d_mamba_bwd_rope.data_ptr<float>(),
+        d_x_sorted_bwd.data_ptr<float>(),
+        d_model, d_inner, d_state
+    );
+
+    // Combine: flip bwd back and add
+    // Each param's bwd portion needs to be flipped
+    for (int p = 0; p < num_params; p++) {
+        int start = offsets_ptr[p];
+        int N = offsets_ptr[p + 1] - start;
+        if (N == 0) continue;
+        auto bwd_slice = d_x_sorted_bwd.narrow(0, start, N);
+        d_x_sorted_packed.narrow(0, start, N).copy_(
+            d_x_sorted_fwd.narrow(0, start, N) + bwd_slice.flip(0));
+    }
 }
