@@ -32,7 +32,6 @@ ext = CUDAExtension(
         "csrc/ops.cpp",
         # SuperGrok family
         "csrc/supergrok15_kernels.cu",
-        "csrc/supergrok2_kernels.cu",
         "csrc/supergrok2_isab_peer_kernels.cu",
         "csrc/supergrok11_kernels.cu",
         # Other optimizers

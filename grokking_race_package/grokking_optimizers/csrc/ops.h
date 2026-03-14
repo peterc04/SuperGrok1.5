@@ -54,29 +54,6 @@ void launch_fused_supergrok15_full_step(
     float beta1, float beta2, float lr, float wd_eff, float eps,
     float bc1, float bc2, int hidden_dim);
 
-// ── SuperGrok v2 (supergrok2_kernels.cu) ────────────────────────────
-void launch_dsa_project(
-    torch::Tensor grad, torch::Tensor sharpness,
-    torch::Tensor Q, torch::Tensor K, torch::Tensor V,
-    torch::Tensor idx_q, torch::Tensor idx_k,
-    torch::Tensor W_q, torch::Tensor b_q,
-    torch::Tensor W_k, torch::Tensor b_k,
-    torch::Tensor W_v, torch::Tensor b_v,
-    torch::Tensor W_iq, torch::Tensor W_ik,
-    int d_head, int n_idx_heads);
-
-void launch_dsa_indexer_topk(
-    torch::Tensor idx_q, torch::Tensor idx_k,
-    torch::Tensor w_idx, torch::Tensor selected_indices,
-    int n_idx_heads, int top_k);
-
-void launch_dsa_sparse_attention(
-    torch::Tensor Q, torch::Tensor K, torch::Tensor V,
-    torch::Tensor selected_indices,
-    torch::Tensor grad, torch::Tensor smart_grad,
-    torch::Tensor W_out, torch::Tensor b_out,
-    float rescale, int d_head, int top_k);
-
 // ── SuperGrok v2 ISAB+PEER (supergrok2_isab_peer_kernels.cu) ────────
 void launch_isab_peer_metanet(
     torch::Tensor grad, torch::Tensor sharpness,
@@ -222,29 +199,6 @@ void supergrok15_sharpness_restore_all(
     std::vector<torch::Tensor>& backups,
     std::vector<torch::Tensor>& sam_grads,
     std::vector<torch::Tensor>& normal_grads);
-
-// ── SuperGrok v2 ────────────────────────────────────────────────────
-void supergrok2_fused_step(
-    std::vector<torch::Tensor>& params,
-    std::vector<torch::Tensor>& grads,
-    std::vector<torch::Tensor>& exp_avgs,
-    std::vector<torch::Tensor>& exp_avg_sqs,
-    std::vector<torch::Tensor>& mus,
-    std::vector<torch::Tensor>& sharpness_cache,
-    std::vector<int64_t>& steps,
-    std::vector<float>& layer_alphas,
-    std::vector<float>& layer_beta1s,
-    // DSA weights
-    torch::Tensor W_q, torch::Tensor b_q,
-    torch::Tensor W_k, torch::Tensor b_k,
-    torch::Tensor W_v, torch::Tensor b_v,
-    torch::Tensor W_iq, torch::Tensor W_ik,
-    torch::Tensor w_idx,
-    torch::Tensor W_out, torch::Tensor b_out,
-    float rescale, int d_head, int n_idx_heads, int top_k,
-    float beta2, float lr, float wd_eff, float eps,
-    float lamb, float ramp, float gate_signal,
-    float grad_clip_norm);
 
 // ── SuperGrok v1.1 ──────────────────────────────────────────────────
 void supergrok11_fused_step(
