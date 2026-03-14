@@ -1,5 +1,9 @@
 # SuperGrok 1.5 — Comprehensive Analysis
 
+> **Status (2025):** All bugs identified in Sections 1.1–1.8 below have been fixed in subsequent commits. The codebase has since evolved significantly — SuperGrok v2 (Mamba-3 + 4-Head PEER + GRU) has been added with custom CUDA kernels, and the optimizer suite now includes 11 optimizers with 12 CUDA kernel files. This document is retained for historical reference. See README.md for the current architecture.
+
+---
+
 ## Executive Summary
 
 SuperGrok 1.5 is an ambitious custom optimizer targeting **grokking acceleration** in low-data regimes. It combines five interacting mechanisms: AdamW base updates, EMA gradient memory (mu), a 2D sharpness-aware meta-net, LookSAM integration, and progressive weight decay. The benchmark harness is well-engineered with multi-GPU support, status monitoring, and comprehensive visualization.
