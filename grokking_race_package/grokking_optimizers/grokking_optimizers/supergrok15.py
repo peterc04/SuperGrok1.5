@@ -105,11 +105,13 @@ class SuperGrok15(Optimizer):
         wd_ramp: float = 4.0,
         wd_scale: float = 20.0,
         wd_thresh: float = 0.9,
+        sam_enable_threshold: float = 0.0,
     ):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
         self.alpha_init = alpha_init
+        self.sam_enable_threshold = sam_enable_threshold
         self.lamb = lamb
         self.gamma = gamma
         self.gamma_alpha = gamma_alpha
@@ -231,6 +233,8 @@ class SuperGrok15(Optimizer):
         return self._sigmoid(self.gate_scale, self._cached_train_acc, self.gate_thresh)
 
     def _get_effective_sam_freq(self):
+        if self._cached_train_acc < self.sam_enable_threshold:
+            return 999999  # effectively disabled
         acc = self._cached_train_acc
         sam_heat = self._sigmoid(self.sam_scale, acc, self.sam_thresh)
         freq = self.sam_freq_max - (self.sam_freq_max - self.sam_freq_min) * sam_heat
@@ -301,7 +305,7 @@ class SuperGrok15(Optimizer):
         return loss
 
     def sam_step(self, model, train_x, train_y, criterion):
-        """SAM perturbation + sharpness computation. No bilevel."""
+        """SAM perturbation + sharpness computation via functional_call (no param modification)."""
         self._ensure_state()
         train_grads = {}
         for name, p in model.named_parameters():
@@ -310,37 +314,45 @@ class SuperGrok15(Optimizer):
         if not train_grads:
             return 0.0
 
-        named_params = list(model.named_parameters())
-        flat_grads = [train_grads.get(n, torch.Tensor()) for n, _ in named_params]
-        flat_params = [p.data for _, p in named_params]
+        # Compute perturbation direction without modifying actual params
+        flat_grads = [train_grads[n] for n, _ in model.named_parameters() if n in train_grads]
+        total_norm_sq = sum(g.norm().pow(2) for g in flat_grads if g.numel() > 0)
+        grad_norm = total_norm_sq.sqrt() + 1e-12
+        rho_over_norm = self.sam_rho / grad_norm
 
-        backups = _ops.supergrok15_sam_perturb_all(flat_params, flat_grads, self.sam_rho)
+        # Build perturbed parameter dict WITHOUT modifying actual params
+        named_params = dict(model.named_parameters())
+        perturbed_params = {}
+        for name, p in named_params.items():
+            if name in train_grads:
+                perturbed_params[name] = p.detach() + rho_over_norm * train_grads[name]
+            else:
+                perturbed_params[name] = p.detach()
 
+        # Forward at perturbed point — actual params untouched
         model.zero_grad()
         with torch.enable_grad():
-            sam_loss = criterion(model(train_x), train_y)
+            sam_logits = torch.func.functional_call(model, perturbed_params, (train_x,))
+            sam_loss = criterion(sam_logits, train_y)
             sam_loss.backward()
         sam_loss_val = sam_loss.item()
 
-        sam_grads = []
-        for _, p in named_params:
-            sam_grads.append(p.grad.detach().clone() if p.grad is not None else torch.Tensor())
-
-        sharpness_out = [torch.zeros_like(p.data) for _, p in named_params]
-        _ops.supergrok15_sharpness_restore_all(flat_params, sharpness_out, backups, sam_grads, flat_grads)
-
-        for i, (name, p) in enumerate(named_params):
+        # Compute sharpness = |sam_grad - normal_grad|
+        for name, p in model.named_parameters():
             pidx = self._param_to_idx.get(id(p))
-            if pidx is not None and sharpness_out[i].numel() > 0:
-                self._flat_sharpness[pidx] = sharpness_out[i]
+            if pidx is not None and p.grad is not None and name in train_grads:
+                sam_grad = p.grad.detach()
+                normal_grad = train_grads[name]
+                self._flat_sharpness[pidx] = (sam_grad - normal_grad).abs()
 
-        for name, p in named_params:
+        # Restore original grads
+        for name, p in model.named_parameters():
             p.grad = train_grads.get(name)
 
         return sam_loss_val
 
     def bilevel_step(self, model, train_x, train_y, val_x, val_y, criterion, meta_optimizer):
-        """Bilevel meta-net training. Uses cached sharpness."""
+        """Bilevel meta-net training. Uses cached sharpness. Batched meta-net forward."""
         self._ensure_state()
         named_params = list(model.named_parameters())
 
@@ -349,12 +361,30 @@ class SuperGrok15(Optimizer):
             if p.grad is not None:
                 saved_grads[name] = p.grad.detach().clone()
 
-        smart_grads = {}
+        # Batched meta-net forward — one call instead of per-parameter
+        all_grads = []
+        all_sharps = []
+        all_names = []
+        all_sizes = []
         for name, p in named_params:
             if name in saved_grads:
                 pidx = self._param_to_idx.get(id(p))
-                sharp = self._flat_sharpness[pidx] if pidx is not None else torch.zeros_like(p.data)
-                smart_grads[name] = self.meta_net(saved_grads[name], sharp)
+                all_grads.append(saved_grads[name].reshape(-1))
+                all_sharps.append(
+                    self._flat_sharpness[pidx].reshape(-1) if pidx is not None
+                    else torch.zeros(p.data.numel(), device=p.device))
+                all_names.append(name)
+                all_sizes.append(saved_grads[name].numel())
+
+        smart_grads = {}
+        if all_grads:
+            cat_grads = torch.cat(all_grads)
+            cat_sharps = torch.cat(all_sharps)
+            cat_smart = self.meta_net(cat_grads, cat_sharps)
+            offset = 0
+            for name, size in zip(all_names, all_sizes):
+                smart_grads[name] = cat_smart[offset:offset+size].reshape(saved_grads[name].shape)
+                offset += size
 
         model.zero_grad()
         with torch.enable_grad():
