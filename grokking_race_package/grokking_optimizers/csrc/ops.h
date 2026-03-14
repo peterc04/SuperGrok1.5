@@ -54,23 +54,6 @@ void launch_fused_supergrok15_full_step(
     float beta1, float beta2, float lr, float wd_eff, float eps,
     float bc1, float bc2, int hidden_dim);
 
-// ── SuperGrok v2 ISAB+PEER (supergrok2_isab_peer_kernels.cu) ────────
-void launch_isab_peer_metanet(
-    torch::Tensor grad, torch::Tensor sharpness,
-    torch::Tensor recurrent_h, torch::Tensor smart_grad,
-    torch::Tensor inducing_points,
-    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
-    torch::Tensor induce_q_W, torch::Tensor induce_k_W, torch::Tensor induce_v_W,
-    torch::Tensor read_q_W,
-    torch::Tensor W_h, torch::Tensor W_x_W, torch::Tensor W_x_b,
-    torch::Tensor peer_query_W,
-    torch::Tensor product_keys_A, torch::Tensor product_keys_B,
-    torch::Tensor expert_W1, torch::Tensor expert_b1,
-    torch::Tensor expert_W2, torch::Tensor expert_b2,
-    float rescale,
-    int num_inducing, int d_model, int pk_dim,
-    int expert_hidden, int recurrent_dim, int num_experts);
-
 // ── SuperGrok v1.1 (supergrok11_kernels.cu) ─────────────────────────
 void launch_sg11_mu_metanet(
     torch::Tensor mu, torch::Tensor grad, torch::Tensor sharpness,

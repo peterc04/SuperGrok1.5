@@ -738,7 +738,7 @@ def train_supergrok15(c, init, tx, ty, vx, vy, dev, bp=0):
             if done: break
     pb.close(); return _fin(r,st,step,t0)
 
-# ── 4c. SuperGrok v2 (Sparse Attention) ──────────────────────────────
+# ── 4c. SuperGrok v2 (Mamba-3 + PEER) ────────────────────────────────
 def train_supergrok2(c, init, tx, ty, vx, vy, dev, bp=0):
     r=_tr("SuperGrok2",c); m=_load(c,dev,init)
     opt=SuperGrok2(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
@@ -747,12 +747,16 @@ def train_supergrok2(c, init, tx, ty, vx, vy, dev, bp=0):
         kappa=c.get("sg2_kappa",0.1), warmup_steps=c.get("sg2_warmup",100),
         warmup_ramp=c.get("sg2_warmup_ramp",100),
         gradient_clipping=c.get("sg2_grad_clip",1.0),
-        num_inducing=c.get("sg2_num_inducing",16),
-        meta_d_model=c.get("sg2_meta_d_model",8),
-        num_peer_experts=c.get("sg2_num_peer_experts",1024),
-        expert_hidden=c.get("sg2_expert_hidden",4),
-        recurrent_dim=c.get("sg2_recurrent_dim",8),
+        d_model=c.get("sg2_d_model",8),
+        d_state=c.get("sg2_d_state",16),
+        mamba_expand=c.get("sg2_mamba_expand",2),
+        num_peer_heads=c.get("sg2_num_peer_heads",4),
+        num_experts=c.get("sg2_num_experts",128),
+        expert_hidden=c.get("sg2_expert_hidden",16),
+        gru_hidden=c.get("sg2_gru_hidden",4),
         meta_rescale=c.get("sg2_meta_rescale",0.1),
+        recycle_interval=c.get("sg2_recycle_interval",100),
+        recycle_threshold=c.get("sg2_recycle_threshold",0.001),
         alpha_update_freq=c.get("sg2_alpha_update_freq",50),
         zero_loss_threshold=c.get("sg2_zero_loss_thresh",1e-4),
         zero_acc_threshold=c.get("sg2_zero_acc_thresh",0.995),
