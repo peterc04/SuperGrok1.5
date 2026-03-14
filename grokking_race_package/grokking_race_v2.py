@@ -551,12 +551,24 @@ def _tr(name, c):
 from grokking_optimizers import (
     SuperGrok15, SuperGrok2, SuperGrok11, ISABPEERMetaNet,
     GrokAdamW, NeuralGrok, Prodigy, Grokfast, Lion, LookSAM, Muon,
+    CUDAGraphOptimizer,
 )
+
+def _maybe_wrap_cuda_graph(opt, c):
+    """Wrap optimizer in CUDAGraphOptimizer if enabled in config."""
+    if c.get("use_cuda_graph", False):
+        return CUDAGraphOptimizer(
+            opt,
+            warmup_steps=c.get("cuda_graph_warmup", 3),
+            max_graph_age=c.get("cuda_graph_max_age", 0),
+        )
+    return opt
 
 # ── 1. AdamW ──────────────────────────────────────────────────────────
 def train_adamw(c, init, tx, ty, vx, vy, dev, bp=0):
     r=_tr("AdamW",c); m=_load(c,dev,init)
     opt=torch.optim.AdamW(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]), weight_decay=c["weight_decay"])
+    opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("AdamW",c["max_steps"],bp)):
@@ -608,6 +620,7 @@ def train_grokadamw(c, init, tx, ty, vx, vy, dev, bp=0):
         weight_decay=c["weight_decay"], alpha=c.get("grokadamw_alpha",0.98),
         lamb=c.get("grokadamw_lamb",5.0), gamma=c.get("grokadamw_gamma",0.1),
         decay=c.get("grokadamw_decay",0.1), grad_clip=c.get("grokadamw_grad_clip",1.0))
+    opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("GrokAdamW",c["max_steps"],bp)):
@@ -643,6 +656,10 @@ def train_supergrok(c, init, tx, ty, vx, vy, dev, bp=0):
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             logits=m(tx); loss=F.cross_entropy(logits,ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
+        # Check for inf/nan gradients from AMP unscaling
+        _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
+        if _has_inf:
+            scaler.update(); continue
         train_loss_val=loss.item()
         with torch.no_grad():
             train_acc=(logits.detach()[:,:c["p"]].argmax(-1)==ty).float().mean().item()
@@ -699,6 +716,10 @@ def train_supergrok15(c, init, tx, ty, vx, vy, dev, bp=0):
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             logits=m(tx); loss=F.cross_entropy(logits,ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
+        # Check for inf/nan gradients from AMP unscaling
+        _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
+        if _has_inf:
+            scaler.update(); continue
         # Adaptive SAM (sigmoid-driven frequency)
         sam_freq_eff=opt._get_effective_sam_freq()
         if step%sam_freq_eff==0:
@@ -730,7 +751,7 @@ def train_supergrok15(c, init, tx, ty, vx, vy, dev, bp=0):
             if done: break
     pb.close(); return _fin(r,st,step,t0)
 
-# ── 4c. SuperGrok v2 (Sparse Attention) ──────────────────────────────
+# ── 4c. SuperGrok v2 (Mamba-3 + PEER) ────────────────────────────────
 def train_supergrok2(c, init, tx, ty, vx, vy, dev, bp=0):
     r=_tr("SuperGrok2",c); m=_load(c,dev,init)
     opt=SuperGrok2(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
@@ -739,12 +760,16 @@ def train_supergrok2(c, init, tx, ty, vx, vy, dev, bp=0):
         kappa=c.get("sg2_kappa",0.1), warmup_steps=c.get("sg2_warmup",100),
         warmup_ramp=c.get("sg2_warmup_ramp",100),
         gradient_clipping=c.get("sg2_grad_clip",1.0),
-        num_inducing=c.get("sg2_num_inducing",16),
-        meta_d_model=c.get("sg2_meta_d_model",8),
-        num_peer_experts=c.get("sg2_num_peer_experts",1024),
-        expert_hidden=c.get("sg2_expert_hidden",4),
-        recurrent_dim=c.get("sg2_recurrent_dim",8),
+        d_model=c.get("sg2_d_model",8),
+        d_state=c.get("sg2_d_state",16),
+        mamba_expand=c.get("sg2_mamba_expand",2),
+        num_peer_heads=c.get("sg2_num_peer_heads",4),
+        num_experts=c.get("sg2_num_experts",128),
+        expert_hidden=c.get("sg2_expert_hidden",16),
+        gru_hidden=c.get("sg2_gru_hidden",4),
         meta_rescale=c.get("sg2_meta_rescale",0.1),
+        recycle_interval=c.get("sg2_recycle_interval",100),
+        recycle_threshold=c.get("sg2_recycle_threshold",0.001),
         alpha_update_freq=c.get("sg2_alpha_update_freq",50),
         zero_loss_threshold=c.get("sg2_zero_loss_thresh",1e-4),
         zero_acc_threshold=c.get("sg2_zero_acc_thresh",0.995),
@@ -767,6 +792,10 @@ def train_supergrok2(c, init, tx, ty, vx, vy, dev, bp=0):
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             logits=m(tx); loss=F.cross_entropy(logits,ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
+        # Check for inf/nan gradients from AMP unscaling
+        _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
+        if _has_inf:
+            scaler.update(); continue
         # Adaptive SAM (sigmoid-driven frequency)
         sam_freq_eff=opt._get_effective_sam_freq()
         if step%sam_freq_eff==0:
@@ -804,6 +833,7 @@ def train_grokfast(c, init, tx, ty, vx, vy, dev, bp=0):
     opt=Grokfast(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
         weight_decay=c["weight_decay"], grokfast_alpha=c.get("grokfast_alpha",0.98),
         grokfast_lamb=c.get("grokfast_lamb",2.0))
+    opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("Grokfast",c["max_steps"],bp)):
@@ -825,6 +855,7 @@ def train_muon(c, init, tx, ty, vx, vy, dev, bp=0):
         lr=c.get("muon_lr",0.02), momentum=c.get("muon_momentum",0.95),
         weight_decay=c["weight_decay"], adamw_lr=c["lr"],
         adamw_betas=(c["beta1"],c["beta2"]))
+    opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("Muon",c["max_steps"],bp)):
@@ -841,6 +872,7 @@ def train_lion(c, init, tx, ty, vx, vy, dev, bp=0):
     r=_tr("Lion",c); m=_load(c,dev,init)
     opt=Lion(m.parameters(), lr=c.get("lion_lr",3e-4),
         betas=(c["beta1"],0.99), weight_decay=c.get("lion_wd",3.0))
+    opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("Lion",c["max_steps"],bp)):
@@ -866,6 +898,10 @@ def train_looksam(c, init, tx, ty, vx, vy, dev, bp=0):
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
+        # Check for inf/nan gradients from AMP unscaling
+        _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
+        if _has_inf:
+            scaler.update(); continue
         if opt.should_sam_step():
             opt.sam_step(m, tx, ty, crit_ls)
         opt.step()
@@ -879,6 +915,7 @@ def train_looksam(c, init, tx, ty, vx, vy, dev, bp=0):
 def train_prodigy(c, init, tx, ty, vx, vy, dev, bp=0):
     r=_tr("Prodigy",c); m=_load(c,dev,init)
     opt=Prodigy(m.parameters(), lr=c.get("prodigy_lr",1.0), weight_decay=c["weight_decay"])
+    opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("Prodigy",c["max_steps"],bp)):

@@ -54,46 +54,6 @@ void launch_fused_supergrok15_full_step(
     float beta1, float beta2, float lr, float wd_eff, float eps,
     float bc1, float bc2, int hidden_dim);
 
-// ── SuperGrok v2 (supergrok2_kernels.cu) ────────────────────────────
-void launch_dsa_project(
-    torch::Tensor grad, torch::Tensor sharpness,
-    torch::Tensor Q, torch::Tensor K, torch::Tensor V,
-    torch::Tensor idx_q, torch::Tensor idx_k,
-    torch::Tensor W_q, torch::Tensor b_q,
-    torch::Tensor W_k, torch::Tensor b_k,
-    torch::Tensor W_v, torch::Tensor b_v,
-    torch::Tensor W_iq, torch::Tensor W_ik,
-    int d_head, int n_idx_heads);
-
-void launch_dsa_indexer_topk(
-    torch::Tensor idx_q, torch::Tensor idx_k,
-    torch::Tensor w_idx, torch::Tensor selected_indices,
-    int n_idx_heads, int top_k);
-
-void launch_dsa_sparse_attention(
-    torch::Tensor Q, torch::Tensor K, torch::Tensor V,
-    torch::Tensor selected_indices,
-    torch::Tensor grad, torch::Tensor smart_grad,
-    torch::Tensor W_out, torch::Tensor b_out,
-    float rescale, int d_head, int top_k);
-
-// ── SuperGrok v2 ISAB+PEER (supergrok2_isab_peer_kernels.cu) ────────
-void launch_isab_peer_metanet(
-    torch::Tensor grad, torch::Tensor sharpness,
-    torch::Tensor recurrent_h, torch::Tensor smart_grad,
-    torch::Tensor inducing_points,
-    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
-    torch::Tensor induce_q_W, torch::Tensor induce_k_W, torch::Tensor induce_v_W,
-    torch::Tensor read_q_W,
-    torch::Tensor W_h, torch::Tensor W_x_W, torch::Tensor W_x_b,
-    torch::Tensor peer_query_W,
-    torch::Tensor product_keys_A, torch::Tensor product_keys_B,
-    torch::Tensor expert_W1, torch::Tensor expert_b1,
-    torch::Tensor expert_W2, torch::Tensor expert_b2,
-    float rescale,
-    int num_inducing, int d_model, int pk_dim,
-    int expert_hidden, int recurrent_dim, int num_experts);
-
 // ── SuperGrok v1.1 (supergrok11_kernels.cu) ─────────────────────────
 void launch_sg11_mu_metanet(
     torch::Tensor mu, torch::Tensor grad, torch::Tensor sharpness,
@@ -186,6 +146,114 @@ void launch_muon_update(
     torch::Tensor param, torch::Tensor orth,
     float neg_lr_scale, float decay_factor);
 
+// ── SuperGrok v2 Mamba-3+PEER (supergrok2_mamba_peer_kernels.cu) ──
+void launch_mamba3_peer_step(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness,
+    torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor mu,
+    torch::Tensor gru_state,
+    torch::Tensor mamba_fwd_state, torch::Tensor mamba_bwd_state,
+    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
+    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
+    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
+    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
+    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
+    torch::Tensor mamba_fwd_out_proj,
+    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
+    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
+    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
+    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
+    torch::Tensor mamba_bwd_out_proj,
+    torch::Tensor gru_Wz, torch::Tensor gru_bz,
+    torch::Tensor gru_Wr, torch::Tensor gru_br,
+    torch::Tensor gru_Wh, torch::Tensor gru_bh,
+    torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+    torch::Tensor expert_W1, torch::Tensor expert_b1,
+    torch::Tensor expert_W2, torch::Tensor expert_b2,
+    float rescale, float alpha_mu, float lamb_eff,
+    float beta1, float beta2, float lr, float wd_eff, float eps,
+    float bc1, float bc2,
+    int d_model, int d_state, int d_inner,
+    int gru_hidden, int num_heads, int pk_dim,
+    int expert_hidden, int num_experts);
+
+// ── SuperGrok v2 Bilevel Backward (supergrok2_mamba_peer_backward_kernels.cu)
+void launch_mamba3_peer_bilevel_fwd_save(
+    torch::Tensor grad, torch::Tensor sharpness,
+    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
+    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
+    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
+    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
+    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
+    torch::Tensor mamba_fwd_out_proj,
+    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
+    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
+    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
+    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
+    torch::Tensor mamba_bwd_out_proj,
+    int d_model, int d_state, int d_inner,
+    torch::Tensor fwd_scan_out, torch::Tensor bwd_scan_out,
+    torch::Tensor fwd_final_state, torch::Tensor bwd_final_state,
+    torch::Tensor fwd_saved_states, torch::Tensor fwd_saved_x_branch,
+    torch::Tensor fwd_saved_z, torch::Tensor fwd_saved_dt,
+    torch::Tensor bwd_saved_states, torch::Tensor bwd_saved_x_branch,
+    torch::Tensor bwd_saved_z, torch::Tensor bwd_saved_dt,
+    torch::Tensor x_sorted, torch::Tensor sort_indices);
+
+void launch_mamba3_peer_backward(
+    torch::Tensor d_smart_grad, torch::Tensor grad, torch::Tensor sharpness,
+    float rescale,
+    torch::Tensor sort_indices, torch::Tensor x_sorted,
+    torch::Tensor fwd_scan_out, torch::Tensor bwd_scan_out,
+    torch::Tensor fwd_saved_states, torch::Tensor fwd_saved_x_branch,
+    torch::Tensor fwd_saved_z, torch::Tensor fwd_saved_dt,
+    torch::Tensor bwd_saved_states, torch::Tensor bwd_saved_x_branch,
+    torch::Tensor bwd_saved_z, torch::Tensor bwd_saved_dt,
+    torch::Tensor gru_input, torch::Tensor gru_h_old,
+    torch::Tensor gru_z_gate, torch::Tensor gru_r_gate,
+    torch::Tensor gru_h_tilde,
+    torch::Tensor peer_input,
+    torch::Tensor expert_indices, torch::Tensor routing_weights,
+    torch::Tensor saved_z_hidden,
+    torch::Tensor saved_scores_a, torch::Tensor saved_scores_b,
+    torch::Tensor saved_top_a_idx, torch::Tensor saved_top_b_idx,
+    torch::Tensor saved_soft_a, torch::Tensor saved_soft_b,
+    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
+    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
+    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
+    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
+    torch::Tensor mamba_fwd_out_proj,
+    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
+    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
+    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
+    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
+    torch::Tensor mamba_bwd_out_proj,
+    torch::Tensor gru_Wz, torch::Tensor gru_Wr, torch::Tensor gru_Wh,
+    torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+    torch::Tensor expert_W1, torch::Tensor expert_W2,
+    torch::Tensor input_proj_W,
+    torch::Tensor d_mamba_fwd_in_proj, torch::Tensor d_mamba_fwd_dt_W,
+    torch::Tensor d_mamba_fwd_dt_b, torch::Tensor d_mamba_fwd_B_proj,
+    torch::Tensor d_mamba_fwd_C_proj, torch::Tensor d_mamba_fwd_A_log,
+    torch::Tensor d_mamba_fwd_D, torch::Tensor d_mamba_fwd_rope,
+    torch::Tensor d_mamba_fwd_out_proj,
+    torch::Tensor d_mamba_bwd_in_proj, torch::Tensor d_mamba_bwd_dt_W,
+    torch::Tensor d_mamba_bwd_dt_b, torch::Tensor d_mamba_bwd_B_proj,
+    torch::Tensor d_mamba_bwd_C_proj, torch::Tensor d_mamba_bwd_A_log,
+    torch::Tensor d_mamba_bwd_D, torch::Tensor d_mamba_bwd_rope,
+    torch::Tensor d_mamba_bwd_out_proj,
+    torch::Tensor d_gru_Wz, torch::Tensor d_gru_bz,
+    torch::Tensor d_gru_Wr, torch::Tensor d_gru_br,
+    torch::Tensor d_gru_Wh, torch::Tensor d_gru_bh,
+    torch::Tensor d_peer_query_Ws,
+    torch::Tensor d_prod_keys_A, torch::Tensor d_prod_keys_B,
+    torch::Tensor d_expert_W1, torch::Tensor d_expert_b1,
+    torch::Tensor d_expert_W2, torch::Tensor d_expert_b2,
+    torch::Tensor d_input_proj_W, torch::Tensor d_input_proj_b,
+    int d_model, int d_state, int d_inner,
+    int gru_hidden, int gru_input_dim,
+    int num_heads, int topk, int pk_dim,
+    int expert_hidden, int peer_input_dim, int num_experts);
+
 #endif  // WITH_CUDA
 
 
@@ -222,29 +290,6 @@ void supergrok15_sharpness_restore_all(
     std::vector<torch::Tensor>& backups,
     std::vector<torch::Tensor>& sam_grads,
     std::vector<torch::Tensor>& normal_grads);
-
-// ── SuperGrok v2 ────────────────────────────────────────────────────
-void supergrok2_fused_step(
-    std::vector<torch::Tensor>& params,
-    std::vector<torch::Tensor>& grads,
-    std::vector<torch::Tensor>& exp_avgs,
-    std::vector<torch::Tensor>& exp_avg_sqs,
-    std::vector<torch::Tensor>& mus,
-    std::vector<torch::Tensor>& sharpness_cache,
-    std::vector<int64_t>& steps,
-    std::vector<float>& layer_alphas,
-    std::vector<float>& layer_beta1s,
-    // DSA weights
-    torch::Tensor W_q, torch::Tensor b_q,
-    torch::Tensor W_k, torch::Tensor b_k,
-    torch::Tensor W_v, torch::Tensor b_v,
-    torch::Tensor W_iq, torch::Tensor W_ik,
-    torch::Tensor w_idx,
-    torch::Tensor W_out, torch::Tensor b_out,
-    float rescale, int d_head, int n_idx_heads, int top_k,
-    float beta2, float lr, float wd_eff, float eps,
-    float lamb, float ramp, float gate_signal,
-    float grad_clip_norm);
 
 // ── SuperGrok v1.1 ──────────────────────────────────────────────────
 void supergrok11_fused_step(
@@ -353,3 +398,33 @@ void muon_fused_step(
     std::vector<torch::Tensor>& grads,
     std::vector<torch::Tensor>& bufs,
     float momentum, float lr, float wd, int ns_steps);
+
+// ── SuperGrok v2 Mamba-3+PEER ────────────────────────────────────
+void supergrok2_mamba_peer_step(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness,
+    torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor mu,
+    torch::Tensor gru_state,
+    torch::Tensor mamba_fwd_state, torch::Tensor mamba_bwd_state,
+    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
+    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
+    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
+    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
+    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
+    torch::Tensor mamba_fwd_out_proj,
+    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
+    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
+    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
+    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
+    torch::Tensor mamba_bwd_out_proj,
+    torch::Tensor gru_Wz, torch::Tensor gru_bz,
+    torch::Tensor gru_Wr, torch::Tensor gru_br,
+    torch::Tensor gru_Wh, torch::Tensor gru_bh,
+    torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+    torch::Tensor expert_W1, torch::Tensor expert_b1,
+    torch::Tensor expert_W2, torch::Tensor expert_b2,
+    float rescale, float alpha_mu, float lamb_eff,
+    float beta1, float beta2, float lr_val, float wd_eff, float eps,
+    float bc1, float bc2,
+    int d_model, int d_state, int d_inner,
+    int gru_hidden, int num_heads, int pk_dim,
+    int expert_hidden, int num_experts);
