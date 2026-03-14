@@ -208,7 +208,7 @@ void launch_fused_mu_metanet(
     if (N == 0) return;
     const int grid = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
     // Shared memory: (H*2 + H + H + 1) floats — always FP32
-    const int smem_bytes = (hidden_dim * 3 + 1) * sizeof(float);
+    const int smem_bytes = (hidden_dim * 4 + 1) * sizeof(float);
 
     // Meta-net weights are always FP32
     auto W1_f = W1.to(torch::kFloat32).contiguous();
@@ -434,7 +434,7 @@ void launch_fused_supergrok15_full_step(
     const int N = grad.numel();
     if (N == 0) return;
     const int grid = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    const int smem_bytes = (hidden_dim * 3 + 1) * sizeof(float);
+    const int smem_bytes = (hidden_dim * 4 + 1) * sizeof(float);
 
     auto W1_f = W1.to(torch::kFloat32).contiguous();
     auto b1_f = b1.to(torch::kFloat32).contiguous();

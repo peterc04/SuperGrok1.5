@@ -229,7 +229,7 @@ void launch_sg11_mu_metanet(
     if (N == 0) return;
     const int grid = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
     // Shared memory: (H*2 + H + H + 1) elements
-    const int smem_elems = hidden_dim * 3 + 1;
+    const int smem_elems = hidden_dim * 4 + 1;
     const int smem_bytes = smem_elems * sizeof(float);
 
     auto W1_f = W1.to(torch::kFloat32).contiguous();
