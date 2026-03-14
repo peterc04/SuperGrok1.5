@@ -138,6 +138,12 @@ class SuperGrok11(Optimizer):
             return 0.0
         return min(1.0, (self._global_step - self.warmup_steps) / self.warmup_ramp)
 
+    def _get_effective_sam_freq(self):
+        """Check sam_enable_threshold before allowing SAM steps."""
+        if self._cached_train_acc < self.sam_enable_threshold:
+            return 999999  # effectively disabled
+        return 1  # caller controls actual frequency
+
     @torch.no_grad()
     def step(self, closure=None, train_loss=None, val_loss=None, train_acc=None):
         loss = None
