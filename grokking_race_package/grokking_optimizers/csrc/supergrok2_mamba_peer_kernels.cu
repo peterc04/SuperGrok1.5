@@ -241,64 +241,103 @@ __global__ void fused_elem_step_kernel(
     const int expert_hidden,
     const int num_experts
 ) {
+    // Shared memory layout for weight caching:
+    //   [0 .. d_model*d_inner-1]: out_proj_fwd_W
+    //   [d_model*d_inner .. 2*d_model*d_inner-1]: out_proj_bwd_W
+    //   Then GRU weights: 3 matrices (Wz, Wr, Wh) + 3 biases (bz, br, bh)
+    extern __shared__ float smem[];
+
+    const int gru_input_dim = 2 + 2 * d_model;
+    const int gru_row_len = gru_input_dim + gru_hidden;
+    const int op_size = d_model * d_inner;
+    const int gru_mat_size = gru_hidden * gru_row_len;
+
+    // Pointers into shared memory
+    float* s_out_fwd = smem;
+    float* s_out_bwd = smem + op_size;
+    float* s_gru_Wz = s_out_bwd + op_size;
+    float* s_gru_Wr = s_gru_Wz + gru_mat_size;
+    float* s_gru_Wh = s_gru_Wr + gru_mat_size;
+    float* s_gru_bz = s_gru_Wh + gru_mat_size;
+    float* s_gru_br = s_gru_bz + gru_hidden;
+    float* s_gru_bh = s_gru_br + gru_hidden;
+    // Total smem: 2*op_size + 3*gru_mat_size + 3*gru_hidden floats
+
+    // Cooperative loading: each thread loads some elements
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+
+    // Load out_proj weights
+    for (int i = tid; i < 2 * op_size; i += block_size) {
+        if (i < op_size)
+            smem[i] = out_proj_fwd_W[i];
+        else
+            smem[i] = out_proj_bwd_W[i - op_size];
+    }
+    // Load GRU weights
+    int gru_total = 3 * gru_mat_size + 3 * gru_hidden;
+    float* gru_smem_start = s_gru_Wz;
+    const float* gru_gmem[] = {gru_Wz, gru_Wr, gru_Wh, gru_bz, gru_br, gru_bh};
+    int gru_sizes[] = {gru_mat_size, gru_mat_size, gru_mat_size, gru_hidden, gru_hidden, gru_hidden};
+    int gru_offset = 0;
+    for (int seg = 0; seg < 6; seg++) {
+        for (int i = tid; i < gru_sizes[seg]; i += block_size)
+            gru_smem_start[gru_offset + i] = gru_gmem[seg][i];
+        gru_offset += gru_sizes[seg];
+    }
+
+    __syncthreads();
+
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
 
     const float g = static_cast<float>(grad[idx]);
     const float s = static_cast<float>(sharpness[idx]);
     const int half_d = d_model / 2;
-    const int gru_input_dim = 2 + 2 * d_model;
     const int peer_input_dim = gru_hidden + 2 * d_model + 2;
 
-    // 1. Apply Mamba out_proj to get fwd_ctx and bwd_ctx
+    // 1. Apply Mamba out_proj to get fwd_ctx and bwd_ctx (using shared memory)
     float fwd_ctx[16], bwd_ctx[16];  // max d_model = 16
     for (int d = 0; d < d_model; d++) {
         float fwd_val = 0.0f, bwd_val = 0.0f;
         for (int j = 0; j < d_inner; j++) {
-            fwd_val += out_proj_fwd_W[d * d_inner + j] * fwd_scan_out[idx * d_inner + j];
-            bwd_val += out_proj_bwd_W[d * d_inner + j] * bwd_scan_out[idx * d_inner + j];
+            fwd_val += s_out_fwd[d * d_inner + j] * fwd_scan_out[idx * d_inner + j];
+            bwd_val += s_out_bwd[d * d_inner + j] * bwd_scan_out[idx * d_inner + j];
         }
         fwd_ctx[d] = fwd_val;
         bwd_ctx[d] = bwd_val;
     }
 
-    // 2. GRU update
-    // gru_input = [g, s, fwd_ctx[d_model], bwd_ctx[d_model]]
-    // Compute z, r gates and candidate
+    // 2. GRU update (using shared memory weights)
     float h_old[8];  // max gru_hidden = 8
     for (int j = 0; j < gru_hidden; j++) {
         h_old[j] = gru_state[idx * gru_hidden + j];
     }
 
     float h_new[8];
-    // Update gate z = sigmoid(Wz @ [x, h] + bz)
     float z_gate[8], r_gate[8];
     for (int j = 0; j < gru_hidden; j++) {
-        float val_z = gru_bz[j];
-        float val_r = gru_br[j];
+        float val_z = s_gru_bz[j];
+        float val_r = s_gru_br[j];
         int offset = 0;
-        // x part: [g, s]
-        val_z += gru_Wz[j * (gru_input_dim + gru_hidden) + 0] * g;
-        val_z += gru_Wz[j * (gru_input_dim + gru_hidden) + 1] * s;
-        val_r += gru_Wr[j * (gru_input_dim + gru_hidden) + 0] * g;
-        val_r += gru_Wr[j * (gru_input_dim + gru_hidden) + 1] * s;
+        val_z += s_gru_Wz[j * gru_row_len + 0] * g;
+        val_z += s_gru_Wz[j * gru_row_len + 1] * s;
+        val_r += s_gru_Wr[j * gru_row_len + 0] * g;
+        val_r += s_gru_Wr[j * gru_row_len + 1] * s;
         offset = 2;
-        // fwd_ctx part
         for (int d = 0; d < d_model; d++) {
-            val_z += gru_Wz[j * (gru_input_dim + gru_hidden) + offset + d] * fwd_ctx[d];
-            val_r += gru_Wr[j * (gru_input_dim + gru_hidden) + offset + d] * fwd_ctx[d];
+            val_z += s_gru_Wz[j * gru_row_len + offset + d] * fwd_ctx[d];
+            val_r += s_gru_Wr[j * gru_row_len + offset + d] * fwd_ctx[d];
         }
         offset += d_model;
-        // bwd_ctx part
         for (int d = 0; d < d_model; d++) {
-            val_z += gru_Wz[j * (gru_input_dim + gru_hidden) + offset + d] * bwd_ctx[d];
-            val_r += gru_Wr[j * (gru_input_dim + gru_hidden) + offset + d] * bwd_ctx[d];
+            val_z += s_gru_Wz[j * gru_row_len + offset + d] * bwd_ctx[d];
+            val_r += s_gru_Wr[j * gru_row_len + offset + d] * bwd_ctx[d];
         }
         offset += d_model;
-        // h part
         for (int k = 0; k < gru_hidden; k++) {
-            val_z += gru_Wz[j * (gru_input_dim + gru_hidden) + offset + k] * h_old[k];
-            val_r += gru_Wr[j * (gru_input_dim + gru_hidden) + offset + k] * h_old[k];
+            val_z += s_gru_Wz[j * gru_row_len + offset + k] * h_old[k];
+            val_r += s_gru_Wr[j * gru_row_len + offset + k] * h_old[k];
         }
         z_gate[j] = 1.0f / (1.0f + expf(-val_z));
         r_gate[j] = 1.0f / (1.0f + expf(-val_r));
@@ -306,19 +345,19 @@ __global__ void fused_elem_step_kernel(
 
     // Candidate: h_tilde = tanh(Wh @ [x, r*h] + bh)
     for (int j = 0; j < gru_hidden; j++) {
-        float val = gru_bh[j];
+        float val = s_gru_bh[j];
         int offset = 0;
-        val += gru_Wh[j * (gru_input_dim + gru_hidden) + 0] * g;
-        val += gru_Wh[j * (gru_input_dim + gru_hidden) + 1] * s;
+        val += s_gru_Wh[j * gru_row_len + 0] * g;
+        val += s_gru_Wh[j * gru_row_len + 1] * s;
         offset = 2;
         for (int d = 0; d < d_model; d++)
-            val += gru_Wh[j * (gru_input_dim + gru_hidden) + offset + d] * fwd_ctx[d];
+            val += s_gru_Wh[j * gru_row_len + offset + d] * fwd_ctx[d];
         offset += d_model;
         for (int d = 0; d < d_model; d++)
-            val += gru_Wh[j * (gru_input_dim + gru_hidden) + offset + d] * bwd_ctx[d];
+            val += s_gru_Wh[j * gru_row_len + offset + d] * bwd_ctx[d];
         offset += d_model;
         for (int k = 0; k < gru_hidden; k++)
-            val += gru_Wh[j * (gru_input_dim + gru_hidden) + offset + k] * (r_gate[k] * h_old[k]);
+            val += s_gru_Wh[j * gru_row_len + offset + k] * (r_gate[k] * h_old[k]);
         float h_tilde = tanhf(val);
         h_new[j] = (1.0f - z_gate[j]) * h_old[j] + z_gate[j] * h_tilde;
     }
@@ -580,10 +619,16 @@ void launch_mamba3_peer_step(
     // Step 3: Fused per-element step (GRU + PEER + Expert + Adam)
     {
         const int grid = (N + SG2M_BLOCK - 1) / SG2M_BLOCK;
+        // Shared memory: out_proj (2 * d_model * d_inner) + GRU (3 matrices + 3 biases)
+        int gru_input_dim_val = 2 + 2 * d_model;
+        int gru_row_len = gru_input_dim_val + gru_hidden;
+        int smem_bytes = (2 * d_model * d_inner
+                        + 3 * gru_hidden * gru_row_len
+                        + 3 * gru_hidden) * sizeof(float);
         AT_DISPATCH_FLOATING_TYPES_AND2(
             at::ScalarType::Half, at::ScalarType::BFloat16,
             param.scalar_type(), "fused_elem_step", ([&] {
-            fused_elem_step_kernel<scalar_t><<<grid, SG2M_BLOCK>>>(
+            fused_elem_step_kernel<scalar_t><<<grid, SG2M_BLOCK, smem_bytes>>>(
                 param.data_ptr<scalar_t>(),
                 grad.data_ptr<scalar_t>(),
                 sharpness.data_ptr<scalar_t>(),

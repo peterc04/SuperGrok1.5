@@ -551,12 +551,24 @@ def _tr(name, c):
 from grokking_optimizers import (
     SuperGrok15, SuperGrok2, SuperGrok11, ISABPEERMetaNet,
     GrokAdamW, NeuralGrok, Prodigy, Grokfast, Lion, LookSAM, Muon,
+    CUDAGraphOptimizer,
 )
+
+def _maybe_wrap_cuda_graph(opt, c):
+    """Wrap optimizer in CUDAGraphOptimizer if enabled in config."""
+    if c.get("use_cuda_graph", False):
+        return CUDAGraphOptimizer(
+            opt,
+            warmup_steps=c.get("cuda_graph_warmup", 3),
+            max_graph_age=c.get("cuda_graph_max_age", 0),
+        )
+    return opt
 
 # ── 1. AdamW ──────────────────────────────────────────────────────────
 def train_adamw(c, init, tx, ty, vx, vy, dev, bp=0):
     r=_tr("AdamW",c); m=_load(c,dev,init)
     opt=torch.optim.AdamW(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]), weight_decay=c["weight_decay"])
+    opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("AdamW",c["max_steps"],bp)):
@@ -608,6 +620,7 @@ def train_grokadamw(c, init, tx, ty, vx, vy, dev, bp=0):
         weight_decay=c["weight_decay"], alpha=c.get("grokadamw_alpha",0.98),
         lamb=c.get("grokadamw_lamb",5.0), gamma=c.get("grokadamw_gamma",0.1),
         decay=c.get("grokadamw_decay",0.1), grad_clip=c.get("grokadamw_grad_clip",1.0))
+    opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("GrokAdamW",c["max_steps"],bp)):
@@ -820,6 +833,7 @@ def train_grokfast(c, init, tx, ty, vx, vy, dev, bp=0):
     opt=Grokfast(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
         weight_decay=c["weight_decay"], grokfast_alpha=c.get("grokfast_alpha",0.98),
         grokfast_lamb=c.get("grokfast_lamb",2.0))
+    opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("Grokfast",c["max_steps"],bp)):
@@ -841,6 +855,7 @@ def train_muon(c, init, tx, ty, vx, vy, dev, bp=0):
         lr=c.get("muon_lr",0.02), momentum=c.get("muon_momentum",0.95),
         weight_decay=c["weight_decay"], adamw_lr=c["lr"],
         adamw_betas=(c["beta1"],c["beta2"]))
+    opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("Muon",c["max_steps"],bp)):
@@ -857,6 +872,7 @@ def train_lion(c, init, tx, ty, vx, vy, dev, bp=0):
     r=_tr("Lion",c); m=_load(c,dev,init)
     opt=Lion(m.parameters(), lr=c.get("lion_lr",3e-4),
         betas=(c["beta1"],0.99), weight_decay=c.get("lion_wd",3.0))
+    opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("Lion",c["max_steps"],bp)):
@@ -899,6 +915,7 @@ def train_looksam(c, init, tx, ty, vx, vy, dev, bp=0):
 def train_prodigy(c, init, tx, ty, vx, vy, dev, bp=0):
     r=_tr("Prodigy",c); m=_load(c,dev,init)
     opt=Prodigy(m.parameters(), lr=c.get("prodigy_lr",1.0), weight_decay=c["weight_decay"])
+    opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time()
     for step in (pb:=_pbar("Prodigy",c["max_steps"],bp)):
