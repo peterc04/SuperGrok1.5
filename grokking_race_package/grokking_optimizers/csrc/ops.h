@@ -292,6 +292,58 @@ void launch_mamba3_peer_backward(
     int num_heads, int topk, int pk_dim,
     int expert_hidden, int peer_input_dim, int num_experts);
 
+// Batched bilevel forward-save
+void launch_mamba3_peer_bilevel_fwd_save_batched(
+    std::vector<torch::Tensor> grads,
+    std::vector<torch::Tensor> sharpness_list,
+    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
+    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
+    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
+    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
+    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
+    torch::Tensor mamba_fwd_out_proj,
+    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
+    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
+    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
+    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
+    torch::Tensor mamba_bwd_out_proj,
+    int d_model, int d_state, int d_inner,
+    torch::Tensor fwd_scan_out_packed, torch::Tensor bwd_scan_out_packed,
+    torch::Tensor fwd_saved_states_packed, torch::Tensor fwd_saved_xb_packed,
+    torch::Tensor fwd_saved_z_packed, torch::Tensor fwd_saved_dt_packed,
+    torch::Tensor bwd_saved_states_packed, torch::Tensor bwd_saved_xb_packed,
+    torch::Tensor bwd_saved_z_packed, torch::Tensor bwd_saved_dt_packed,
+    torch::Tensor x_sorted_packed, torch::Tensor offsets_t,
+    torch::Tensor sort_indices_packed);
+
+// Batched bilevel backward scan
+void launch_mamba3_peer_backward_batched(
+    torch::Tensor d_fwd_scan_out_packed, torch::Tensor d_bwd_scan_out_packed,
+    torch::Tensor x_sorted_packed,
+    torch::Tensor fwd_saved_states_packed, torch::Tensor fwd_saved_xb_packed,
+    torch::Tensor fwd_saved_z_packed, torch::Tensor fwd_saved_dt_packed,
+    torch::Tensor bwd_saved_states_packed, torch::Tensor bwd_saved_xb_packed,
+    torch::Tensor bwd_saved_z_packed, torch::Tensor bwd_saved_dt_packed,
+    torch::Tensor offsets_t,
+    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
+    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
+    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
+    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
+    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
+    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
+    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
+    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
+    torch::Tensor d_mamba_fwd_in_proj, torch::Tensor d_mamba_fwd_dt_W,
+    torch::Tensor d_mamba_fwd_dt_b, torch::Tensor d_mamba_fwd_B_proj,
+    torch::Tensor d_mamba_fwd_C_proj, torch::Tensor d_mamba_fwd_A_log,
+    torch::Tensor d_mamba_fwd_D, torch::Tensor d_mamba_fwd_rope,
+    torch::Tensor d_mamba_bwd_in_proj, torch::Tensor d_mamba_bwd_dt_W,
+    torch::Tensor d_mamba_bwd_dt_b, torch::Tensor d_mamba_bwd_B_proj,
+    torch::Tensor d_mamba_bwd_C_proj, torch::Tensor d_mamba_bwd_A_log,
+    torch::Tensor d_mamba_bwd_D, torch::Tensor d_mamba_bwd_rope,
+    torch::Tensor d_x_sorted_packed,
+    int d_model, int d_state, int d_inner, int num_params);
+
 #endif  // WITH_CUDA
 
 
