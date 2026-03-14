@@ -736,6 +736,70 @@ void muon_fused_step(
 
 
 // ═══════════════════════════════════════════════════════════════════════
+//  SuperGrok v2 — Mamba-3+PEER Per-Parameter Step (dispatch to CUDA)
+// ═══════════════════════════════════════════════════════════════════════
+
+void supergrok2_mamba_peer_step(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness,
+    torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor mu,
+    torch::Tensor gru_state,
+    torch::Tensor mamba_fwd_state, torch::Tensor mamba_bwd_state,
+    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
+    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
+    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
+    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
+    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
+    torch::Tensor mamba_fwd_out_proj,
+    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
+    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
+    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
+    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
+    torch::Tensor mamba_bwd_out_proj,
+    torch::Tensor gru_Wz, torch::Tensor gru_bz,
+    torch::Tensor gru_Wr, torch::Tensor gru_br,
+    torch::Tensor gru_Wh, torch::Tensor gru_bh,
+    torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+    torch::Tensor expert_W1, torch::Tensor expert_b1,
+    torch::Tensor expert_W2, torch::Tensor expert_b2,
+    float rescale, float alpha_mu, float lamb_eff,
+    float beta1, float beta2, float lr_val, float wd_eff, float eps,
+    float bc1, float bc2,
+    int d_model, int d_state, int d_inner,
+    int gru_hidden, int num_heads, int pk_dim,
+    int expert_hidden, int num_experts
+) {
+    if (grad.numel() == 0) return;
+
+#ifdef WITH_CUDA
+    if (param.is_cuda()) {
+        launch_mamba3_peer_step(
+            param, grad, sharpness, exp_avg, exp_avg_sq, mu,
+            gru_state, mamba_fwd_state, mamba_bwd_state,
+            input_proj_W, input_proj_b,
+            mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
+            mamba_fwd_B_proj, mamba_fwd_C_proj, mamba_fwd_A_log,
+            mamba_fwd_D, mamba_fwd_rope, mamba_fwd_out_proj,
+            mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
+            mamba_bwd_B_proj, mamba_bwd_C_proj, mamba_bwd_A_log,
+            mamba_bwd_D, mamba_bwd_rope, mamba_bwd_out_proj,
+            gru_Wz, gru_bz, gru_Wr, gru_br, gru_Wh, gru_bh,
+            peer_query_Ws, prod_keys_A, prod_keys_B,
+            expert_W1, expert_b1, expert_W2, expert_b2,
+            rescale, alpha_mu, lamb_eff,
+            beta1, beta2, lr_val, wd_eff, eps, bc1, bc2,
+            d_model, d_state, d_inner,
+            gru_hidden, num_heads, pk_dim,
+            expert_hidden, num_experts);
+        return;
+    }
+#endif
+    throw std::runtime_error(
+        "supergrok2_mamba_peer_step requires CUDA tensors. "
+        "Use the Python meta-net fallback for CPU.");
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
 //  pybind11 Bindings
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -846,4 +910,36 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("params"), py::arg("grads"), py::arg("bufs"),
           py::arg("momentum"), py::arg("lr"), py::arg("wd"),
           py::arg("ns_steps"));
+
+    // ── SuperGrok v2 Mamba-3+PEER ────────────────────────────────────
+    m.def("supergrok2_mamba_peer_step", &supergrok2_mamba_peer_step,
+          "SuperGrok2: per-param Mamba-3+PEER meta-net + mu + Adam + WD",
+          py::arg("param"), py::arg("grad"), py::arg("sharpness"),
+          py::arg("exp_avg"), py::arg("exp_avg_sq"), py::arg("mu"),
+          py::arg("gru_state"),
+          py::arg("mamba_fwd_state"), py::arg("mamba_bwd_state"),
+          py::arg("input_proj_W"), py::arg("input_proj_b"),
+          py::arg("mamba_fwd_in_proj"), py::arg("mamba_fwd_dt_W"),
+          py::arg("mamba_fwd_dt_b"), py::arg("mamba_fwd_B_proj"),
+          py::arg("mamba_fwd_C_proj"), py::arg("mamba_fwd_A_log"),
+          py::arg("mamba_fwd_D"), py::arg("mamba_fwd_rope"),
+          py::arg("mamba_fwd_out_proj"),
+          py::arg("mamba_bwd_in_proj"), py::arg("mamba_bwd_dt_W"),
+          py::arg("mamba_bwd_dt_b"), py::arg("mamba_bwd_B_proj"),
+          py::arg("mamba_bwd_C_proj"), py::arg("mamba_bwd_A_log"),
+          py::arg("mamba_bwd_D"), py::arg("mamba_bwd_rope"),
+          py::arg("mamba_bwd_out_proj"),
+          py::arg("gru_Wz"), py::arg("gru_bz"),
+          py::arg("gru_Wr"), py::arg("gru_br"),
+          py::arg("gru_Wh"), py::arg("gru_bh"),
+          py::arg("peer_query_Ws"), py::arg("prod_keys_A"), py::arg("prod_keys_B"),
+          py::arg("expert_W1"), py::arg("expert_b1"),
+          py::arg("expert_W2"), py::arg("expert_b2"),
+          py::arg("rescale"), py::arg("alpha_mu"), py::arg("lamb_eff"),
+          py::arg("beta1"), py::arg("beta2"), py::arg("lr_val"),
+          py::arg("wd_eff"), py::arg("eps"),
+          py::arg("bc1"), py::arg("bc2"),
+          py::arg("d_model"), py::arg("d_state"), py::arg("d_inner"),
+          py::arg("gru_hidden"), py::arg("num_heads"), py::arg("pk_dim"),
+          py::arg("expert_hidden"), py::arg("num_experts"));
 }
