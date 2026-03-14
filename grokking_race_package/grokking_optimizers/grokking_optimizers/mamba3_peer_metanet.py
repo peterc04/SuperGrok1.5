@@ -74,7 +74,7 @@ class Mamba3ScanBlock(nn.Module):
         # A: diagonal state transition (log-space for stability)
         # Initialize as negative real values (decaying dynamics)
         self.A_log = nn.Parameter(
-            torch.log(torch.linspace(1, d_state, d_state)).unsqueeze(0).expand(self.d_inner, -1))
+            torch.log(torch.linspace(1, d_state, d_state)).unsqueeze(0).repeat(self.d_inner, 1))
 
         # D: skip connection within SSM
         self.D = nn.Parameter(torch.ones(self.d_inner))

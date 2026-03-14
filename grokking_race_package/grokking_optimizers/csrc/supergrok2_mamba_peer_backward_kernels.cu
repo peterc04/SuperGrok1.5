@@ -55,6 +55,7 @@ __global__ void mamba3_scan_fwd_save_kernel(
     float* __restrict__ saved_x_branch,     // [N, d_inner]
     float* __restrict__ saved_z,            // [N, d_inner]
     float* __restrict__ saved_dt,           // [N, d_inner]
+    const float* __restrict__ initial_state, // [d_inner, d_state] or nullptr
     const int N,
     const int d_model,
     const int d_inner,
@@ -70,7 +71,11 @@ __global__ void mamba3_scan_fwd_save_kernel(
 
     float h[MAX_D_STATE];
     float h_snap[MAX_D_STATE]; // snapshot for RoPE
-    for (int s = 0; s < d_state; s++) h[s] = 0.0f;
+    if (initial_state != nullptr) {
+        for (int s = 0; s < d_state; s++) h[s] = initial_state[tid * d_state + s];
+    } else {
+        for (int s = 0; s < d_state; s++) h[s] = 0.0f;
+    }
 
     float A[MAX_D_STATE];
     for (int s = 0; s < d_state; s++)
@@ -130,7 +135,7 @@ __global__ void mamba3_scan_fwd_save_kernel(
             int s_prev = (s > 0) ? s - 1 : d_state - 1;
             float h_rot = h_snap[s] * cos_p - h_snap[s_prev] * sin_p;
 
-            h[s] = A_bar * h_rot + B_bar;
+            h[s] = A_bar * h_rot + B_bar * x_val;
         }
 
         // Save state after update
@@ -863,6 +868,7 @@ void launch_mamba3_peer_bilevel_fwd_save(
         fwd_saved_x_branch.data_ptr<float>(),
         fwd_saved_z.data_ptr<float>(),
         fwd_saved_dt.data_ptr<float>(),
+        nullptr,  // no initial_state for bilevel
         N, d_model, d_inner, d_state, 0
     );
 
@@ -885,6 +891,7 @@ void launch_mamba3_peer_bilevel_fwd_save(
         bwd_saved_x_branch.data_ptr<float>(),
         bwd_saved_z.data_ptr<float>(),
         bwd_saved_dt.data_ptr<float>(),
+        nullptr,  // no initial_state for bilevel
         N, d_model, d_inner, d_state, 0
     );
 }

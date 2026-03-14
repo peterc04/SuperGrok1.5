@@ -727,7 +727,7 @@ def train_supergrok15(c, init, tx, ty, vx, vy, dev, bp=0):
             scaler.update(); continue
         # Adaptive SAM (sigmoid-driven frequency)
         sam_freq_eff=opt._get_effective_sam_freq()
-        if step%sam_freq_eff==0:
+        if sam_freq_eff < 999999 and step%sam_freq_eff==0:
             try: opt.sam_step(m, tx, ty, crit_s15)
             except Exception as e: warnings.warn(f"SuperGrok1.5 sam_step failed at step {step}: {e}")
         # Adaptive bilevel (independent sigmoid-driven frequency)
@@ -803,7 +803,7 @@ def train_supergrok2(c, init, tx, ty, vx, vy, dev, bp=0):
             scaler.update(); continue
         # Adaptive SAM (sigmoid-driven frequency)
         sam_freq_eff=opt._get_effective_sam_freq()
-        if step%sam_freq_eff==0:
+        if sam_freq_eff < 999999 and step%sam_freq_eff==0:
             try: opt.sam_step(m, tx, ty, crit_s2)
             except Exception as e: warnings.warn(f"SuperGrok2 sam_step failed at step {step}: {e}")
         # Adaptive bilevel (independent sigmoid-driven frequency)

@@ -92,6 +92,7 @@ __global__ void mamba3_scan_kernel(
     const float* __restrict__ rope_freq,  // [d_inner, d_state]
     float* __restrict__ scan_output,      // [N, d_inner]
     float* __restrict__ final_state,      // [d_inner, d_state]
+    const float* __restrict__ initial_state, // [d_inner, d_state] or nullptr
     const int N,
     const int d_model,
     const int d_inner,
@@ -106,10 +107,14 @@ __global__ void mamba3_scan_kernel(
     float* s_x_branch = smem;           // [d_inner]
     float* s_z_branch = smem + d_inner; // [d_inner]
 
-    // State in registers
+    // State in registers — load from initial_state if provided
     float h[32];
     float h_snap[32]; // snapshot for RoPE (fixes read-after-write)
-    for (int s = 0; s < d_state; s++) h[s] = 0.0f;
+    if (initial_state != nullptr) {
+        for (int s = 0; s < d_state; s++) h[s] = initial_state[tid * d_state + s];
+    } else {
+        for (int s = 0; s < d_state; s++) h[s] = 0.0f;
+    }
 
     float A[32], freq[32];
     for (int s = 0; s < d_state; s++) {
@@ -160,7 +165,7 @@ __global__ void mamba3_scan_kernel(
             int s_prev = (s > 0) ? s - 1 : d_state - 1;
             float h_rot = h_snap[s] * cos_p - h_snap[s_prev] * sin_p;
 
-            h[s] = A_bar * h_rot + B_bar;
+            h[s] = A_bar * h_rot + B_bar * x_val;
         }
 
         // FULL C projection for output: y = sum_s(h[s] * C[s])
@@ -574,7 +579,9 @@ void launch_mamba3_peer_step(
     // Shared memory for scan: x_branch + z_branch
     int scan_smem = 2 * d_inner * sizeof(float);
 
-    // Forward scan
+    // Forward scan — pass initial_state if available
+    const float* fwd_init_ptr = (mamba_fwd_state.numel() > 0) ?
+        mamba_fwd_state.data_ptr<float>() : nullptr;
     mamba3_scan_kernel<<<1, d_inner, scan_smem>>>(
         x_sorted.data_ptr<float>(),
         mamba_fwd_in_proj.data_ptr<float>(),
@@ -587,10 +594,13 @@ void launch_mamba3_peer_step(
         mamba_fwd_rope.data_ptr<float>(),
         fwd_scan_out.data_ptr<float>(),
         new_fwd_state.data_ptr<float>(),
+        fwd_init_ptr,
         N, d_model, d_inner, d_state, 0  // forward
     );
 
     // Backward scan (reverse direction)
+    const float* bwd_init_ptr = (mamba_bwd_state.numel() > 0) ?
+        mamba_bwd_state.data_ptr<float>() : nullptr;
     mamba3_scan_kernel<<<1, d_inner, scan_smem>>>(
         x_sorted.data_ptr<float>(),
         mamba_bwd_in_proj.data_ptr<float>(),
@@ -603,6 +613,7 @@ void launch_mamba3_peer_step(
         mamba_bwd_rope.data_ptr<float>(),
         bwd_scan_out.data_ptr<float>(),
         new_bwd_state.data_ptr<float>(),
+        bwd_init_ptr,
         N, d_model, d_inner, d_state, 1  // reverse
     );
 

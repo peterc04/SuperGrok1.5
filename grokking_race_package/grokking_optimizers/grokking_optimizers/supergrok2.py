@@ -196,7 +196,8 @@ class SuperGrok2(Optimizer):
                 torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
             self._flat_exp_avg_sqs.append(
                 torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
-            self._flat_mus.append(torch.zeros_like(p.data))
+            self._flat_mus.append(
+                torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
             self._flat_sharpness.append(torch.zeros_like(p.data))
             # Per-parameter GRU state
             self._flat_gru_states.append(
@@ -332,7 +333,7 @@ class SuperGrok2(Optimizer):
                 _ops.supergrok2_mamba_peer_step(
                     p.data, grad, self._flat_sharpness[i],
                     self._flat_exp_avgs[i], self._flat_exp_avg_sqs[i],
-                    self._flat_mus[i].float().reshape(-1),
+                    self._flat_mus[i],
                     self._flat_gru_states[i],
                     self._flat_mamba_fwd_states[i],
                     self._flat_mamba_bwd_states[i],
