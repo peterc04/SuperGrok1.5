@@ -67,13 +67,9 @@ void launch_sg11_adam_decay(
     float lamb_eff, float beta1, float beta2, float lr, float wd_eff,
     float eps, float bc1, float bc2);
 
-void launch_sg11_sam_perturb(torch::Tensor param, torch::Tensor grad, float rho_over_norm);
-
-void launch_sg11_sharpness_restore(
-    torch::Tensor param, torch::Tensor sharpness, torch::Tensor backup,
-    torch::Tensor sam_grad, torch::Tensor normal_grad);
-
-float compute_cosine_gate(torch::Tensor smart_grad, torch::Tensor mu, float gate_temp);
+// NOTE: launch_sg11_sam_perturb and launch_sg11_sharpness_restore are defined
+// in supergrok11_kernels.cu but not called from ops.cpp (v1.1 delegates to v1.5
+// implementations). compute_cosine_gate is also unused (ops.cpp uses ATen inline).
 
 // ── GrokAdamW (grokadamw_kernels.cu) ────────────────────────────────
 void launch_fused_grokadamw_step(
@@ -99,9 +95,9 @@ void launch_fused_neuralgrok_adam(
 
 // ── Prodigy (prodigy_kernels.cu) ────────────────────────────────────
 void launch_fused_prodigy_step(
-    torch::Tensor param, torch::Tensor grad,
+    torch::Tensor param,
     torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
-    torch::Tensor s,
+    torch::Tensor s, torch::Tensor grad,
     float d_lr, float beta1, float beta2, float lr, float wd,
     float eps, float bc1, float bc2);
 
@@ -134,9 +130,8 @@ void launch_looksam_restore(
     torch::Tensor param, torch::Tensor backup);
 
 // ── Muon (muon_kernels.cu) ─────────────────────────────────────────
-void launch_muon_momentum_normalize(
-    torch::Tensor buf, torch::Tensor X, torch::Tensor grad,
-    float momentum, float inv_norm);
+// NOTE: launch_muon_momentum_normalize is defined in muon_kernels.cu but not
+// called from ops.cpp (momentum + normalize done via ATen ops inline).
 
 void launch_muon_ns_combine(
     torch::Tensor X_out, torch::Tensor X, torch::Tensor AX, torch::Tensor AAX,
