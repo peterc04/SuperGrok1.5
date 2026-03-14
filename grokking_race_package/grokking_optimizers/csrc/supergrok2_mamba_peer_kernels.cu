@@ -605,6 +605,150 @@ __global__ void mamba3_scan_batched_kernel(
 
 
 // ═══════════════════════════════════════════════════════════════════════
+//  Kernel 5: Combined Forward + Backward Batched Scan
+//
+//  Grid = 2 * num_params: first num_params blocks do forward scan,
+//  second num_params blocks do backward scan (reversed input).
+//  This avoids two kernel launches and exploits GPU parallelism.
+//
+//  block_idx < num_params: forward, uses fwd weights
+//  block_idx >= num_params: backward (reverse), uses bwd weights
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void mamba3_scan_combined_kernel(
+    const float* __restrict__ x_sorted_packed,    // [total_N, d_model]
+    float* __restrict__ fwd_scan_output,          // [total_N, d_inner]
+    float* __restrict__ bwd_scan_output,          // [total_N, d_inner]
+    const float* __restrict__ fwd_initial_states, // [num_params, d_inner, d_state]
+    const float* __restrict__ bwd_initial_states, // [num_params, d_inner, d_state]
+    float* __restrict__ fwd_final_states,         // [num_params, d_inner, d_state]
+    float* __restrict__ bwd_final_states,         // [num_params, d_inner, d_state]
+    const int* __restrict__ offsets,              // [num_params + 1]
+    // Forward weights
+    const float* __restrict__ fwd_in_proj_W,
+    const float* __restrict__ fwd_dt_proj_W,
+    const float* __restrict__ fwd_dt_proj_b,
+    const float* __restrict__ fwd_B_proj_W,
+    const float* __restrict__ fwd_C_proj_W,
+    const float* __restrict__ fwd_A_log,
+    const float* __restrict__ fwd_D_param,
+    const float* __restrict__ fwd_rope_freq,
+    // Backward weights
+    const float* __restrict__ bwd_in_proj_W,
+    const float* __restrict__ bwd_dt_proj_W,
+    const float* __restrict__ bwd_dt_proj_b,
+    const float* __restrict__ bwd_B_proj_W,
+    const float* __restrict__ bwd_C_proj_W,
+    const float* __restrict__ bwd_A_log,
+    const float* __restrict__ bwd_D_param,
+    const float* __restrict__ bwd_rope_freq,
+    const int d_model,
+    const int d_inner,
+    const int d_state,
+    const int num_params
+) {
+    const int block_id = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (tid >= d_inner) return;
+
+    const bool is_bwd = (block_id >= num_params);
+    const int param_idx = is_bwd ? (block_id - num_params) : block_id;
+    const int reverse = is_bwd ? 1 : 0;
+
+    // Select weight set
+    const float* in_proj_W   = is_bwd ? bwd_in_proj_W   : fwd_in_proj_W;
+    const float* dt_proj_W   = is_bwd ? bwd_dt_proj_W   : fwd_dt_proj_W;
+    const float* dt_proj_b   = is_bwd ? bwd_dt_proj_b   : fwd_dt_proj_b;
+    const float* B_proj_W    = is_bwd ? bwd_B_proj_W    : fwd_B_proj_W;
+    const float* C_proj_W    = is_bwd ? bwd_C_proj_W    : fwd_C_proj_W;
+    const float* A_log_ptr   = is_bwd ? bwd_A_log       : fwd_A_log;
+    const float* D_param_ptr = is_bwd ? bwd_D_param     : fwd_D_param;
+    const float* rope_ptr    = is_bwd ? bwd_rope_freq   : fwd_rope_freq;
+    float* scan_output       = is_bwd ? bwd_scan_output : fwd_scan_output;
+    const float* init_states = is_bwd ? bwd_initial_states : fwd_initial_states;
+    float* fin_states        = is_bwd ? bwd_final_states   : fwd_final_states;
+
+    const int start = offsets[param_idx];
+    const int end = offsets[param_idx + 1];
+    const int N = end - start;
+
+    extern __shared__ float smem[];
+    float* s_x_branch = smem;
+
+    float h[32], h_snap[32];
+    const float* my_init = init_states + param_idx * d_inner * d_state;
+    for (int s = 0; s < d_state; s++) h[s] = my_init[tid * d_state + s];
+
+    const int half_d_state = d_state / 2;
+    float A[32], freq[16];
+    for (int s = 0; s < d_state; s++)
+        A[s] = -expf(A_log_ptr[tid * d_state + s]);
+    for (int p = 0; p < half_d_state; p++)
+        freq[p] = rope_ptr[tid * half_d_state + p];
+    float D_val = D_param_ptr[tid];
+
+    const float* my_x = x_sorted_packed + start * d_model;
+    float* my_out = scan_output + start * d_inner;
+
+    for (int step = 0; step < N; step++) {
+        int i = reverse ? (N - 1 - step) : step;
+
+        float x_val = 0.0f, z_val = 0.0f;
+        for (int d = 0; d < d_model; d++) {
+            float inp = my_x[i * d_model + d];
+            x_val += in_proj_W[tid * d_model + d] * inp;
+            z_val += in_proj_W[(tid + d_inner) * d_model + d] * inp;
+        }
+
+        s_x_branch[tid] = x_val;
+        __syncthreads();
+
+        float dt_raw = dt_proj_b[tid];
+        for (int j = 0; j < d_inner; j++)
+            dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
+        float dt_val = logf(1.0f + expf(dt_raw));
+
+        for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
+
+        for (int s = 0; s < d_state; s++) {
+            float A_bar = (1.0f + dt_val * A[s] / 2.0f) / (1.0f - dt_val * A[s] / 2.0f + 1e-8f);
+            float B_val = 0.0f;
+            for (int j = 0; j < d_inner; j++)
+                B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
+            float B_bar = dt_val * B_val;
+            int pair_idx = s / 2;
+            float cos_p, sin_p;
+            __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+            float h_rot;
+            if (s % 2 == 0) {
+                h_rot = h_snap[s] * cos_p - h_snap[s + 1] * sin_p;
+            } else {
+                h_rot = h_snap[s] * cos_p + h_snap[s - 1] * sin_p;
+            }
+            h[s] = A_bar * h_rot + B_bar * x_val;
+        }
+
+        float y_val = 0.0f;
+        for (int s = 0; s < d_state; s++) {
+            float C_val = 0.0f;
+            for (int j = 0; j < d_inner; j++)
+                C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+            y_val += h[s] * C_val;
+        }
+        float silu_z = z_val / (1.0f + expf(-z_val));
+        y_val = y_val * silu_z + D_val * x_val;
+
+        my_out[i * d_inner + tid] = y_val;
+        __syncthreads();
+    }
+
+    float* my_final = fin_states + param_idx * d_inner * d_state;
+    for (int s = 0; s < d_state; s++)
+        my_final[tid * d_state + s] = h[s];
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
 //  Launcher: Full Mamba-3 + PEER step (single parameter)
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -950,20 +1094,19 @@ void launch_mamba3_peer_batched_step(
     auto fwd_scan_packed = torch::empty({total_N, d_inner}, float_opts);
     auto bwd_scan_packed = torch::empty({total_N, d_inner}, float_opts);
 
-    // Reverse flags: fwd = all 0, bwd = all 1
-    auto rev_fwd = torch::zeros({num_params}, int_opts);
-    auto rev_bwd = torch::ones({num_params}, int_opts);
-
     int scan_smem = d_inner * sizeof(float);
 
-    // Step 3: Launch batched forward scan
-    mamba3_scan_batched_kernel<<<num_params, d_inner, scan_smem>>>(
+    // Step 3+4: Combined forward + backward scan in single launch
+    // Grid = 2*num_params: first half fwd, second half bwd (reversed)
+    mamba3_scan_combined_kernel<<<2 * num_params, d_inner, scan_smem>>>(
         x_sorted_packed.data_ptr<float>(),
         fwd_scan_packed.data_ptr<float>(),
+        bwd_scan_packed.data_ptr<float>(),
         initial_fwd.data_ptr<float>(),
+        initial_bwd.data_ptr<float>(),
         final_fwd.data_ptr<float>(),
+        final_bwd.data_ptr<float>(),
         offsets_t.data_ptr<int>(),
-        rev_fwd.data_ptr<int>(),
         mamba_fwd_in_proj.data_ptr<float>(),
         mamba_fwd_dt_W.data_ptr<float>(),
         mamba_fwd_dt_b.data_ptr<float>(),
@@ -972,17 +1115,6 @@ void launch_mamba3_peer_batched_step(
         mamba_fwd_A_log.data_ptr<float>(),
         mamba_fwd_D.data_ptr<float>(),
         mamba_fwd_rope.data_ptr<float>(),
-        d_model, d_inner, d_state
-    );
-
-    // Step 4: Launch batched backward scan
-    mamba3_scan_batched_kernel<<<num_params, d_inner, scan_smem>>>(
-        x_sorted_packed.data_ptr<float>(),
-        bwd_scan_packed.data_ptr<float>(),
-        initial_bwd.data_ptr<float>(),
-        final_bwd.data_ptr<float>(),
-        offsets_t.data_ptr<int>(),
-        rev_bwd.data_ptr<int>(),
         mamba_bwd_in_proj.data_ptr<float>(),
         mamba_bwd_dt_W.data_ptr<float>(),
         mamba_bwd_dt_b.data_ptr<float>(),
@@ -991,7 +1123,7 @@ void launch_mamba3_peer_batched_step(
         mamba_bwd_A_log.data_ptr<float>(),
         mamba_bwd_D.data_ptr<float>(),
         mamba_bwd_rope.data_ptr<float>(),
-        d_model, d_inner, d_state
+        d_model, d_inner, d_state, num_params
     );
 
     // Step 5: Copy final states back + unsort + fused_elem_step per param
