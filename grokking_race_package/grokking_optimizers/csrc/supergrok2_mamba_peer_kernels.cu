@@ -162,8 +162,8 @@ __global__ void mamba3_scan_kernel(
             float B_bar = dt_val * B_val;
 
             // RoPE using SNAPSHOT (not in-place updated h)
-            float cos_p = cosf(dt_val * freq[s]);
-            float sin_p = sinf(dt_val * freq[s]);
+            float cos_p, sin_p;
+            __sincosf(dt_val * freq[s], &sin_p, &cos_p);
             int s_prev = (s > 0) ? s - 1 : d_state - 1;
             float h_rot = h_snap[s] * cos_p - h_snap[s_prev] * sin_p;
 
@@ -421,7 +421,7 @@ __global__ void fused_elem_step_kernel(
         for (int k = 0; k < pk_dim; k++) {
             float dot = 0.0f;
             for (int d = 0; d < half_d; d++)
-                dot += query[d] * keys_A[k * half_d + d];
+                dot += query[d] * __ldg(&keys_A[k * half_d + d]);
             if (dot > best_score_a) { best_score_a = dot; best_a = k; }
         }
 
@@ -430,7 +430,7 @@ __global__ void fused_elem_step_kernel(
         for (int k = 0; k < pk_dim; k++) {
             float dot = 0.0f;
             for (int d = 0; d < half_d; d++)
-                dot += query[half_d + d] * keys_B[k * half_d + d];
+                dot += query[half_d + d] * __ldg(&keys_B[k * half_d + d]);
             if (dot > best_score_b) { best_score_b = dot; best_b = k; }
         }
 
@@ -439,12 +439,13 @@ __global__ void fused_elem_step_kernel(
             atomicAdd(&expert_counts[expert_idx], 1);
 
         // Expert MLP: z = relu(W1 * g + b1), out = W2 @ z + b2
-        float head_out = expert_b2[expert_idx];
+        // Use __ldg for read-only expert weight loads (L1 cache hint)
+        float head_out = __ldg(&expert_b2[expert_idx]);
         for (int h = 0; h < expert_hidden; h++) {
-            float z_val = expert_W1[expert_idx * expert_hidden + h] * g
-                        + expert_b1[expert_idx * expert_hidden + h];
+            float z_val = __ldg(&expert_W1[expert_idx * expert_hidden + h]) * g
+                        + __ldg(&expert_b1[expert_idx * expert_hidden + h]);
             z_val = fmaxf(z_val, 0.0f);  // ReLU
-            head_out += expert_W2[expert_idx * expert_hidden + h] * z_val;
+            head_out += __ldg(&expert_W2[expert_idx * expert_hidden + h]) * z_val;
         }
         total_out += head_out;
     }
@@ -559,8 +560,8 @@ __global__ void mamba3_scan_batched_kernel(
             for (int j = 0; j < d_inner; j++)
                 B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
             float B_bar = dt_val * B_val;
-            float cos_p = cosf(dt_val * freq[s]);
-            float sin_p = sinf(dt_val * freq[s]);
+            float cos_p, sin_p;
+            __sincosf(dt_val * freq[s], &sin_p, &cos_p);
             int s_prev = (s > 0) ? s - 1 : d_state - 1;
             float h_rot = h_snap[s] * cos_p - h_snap[s_prev] * sin_p;
             h[s] = A_bar * h_rot + B_bar * x_val;

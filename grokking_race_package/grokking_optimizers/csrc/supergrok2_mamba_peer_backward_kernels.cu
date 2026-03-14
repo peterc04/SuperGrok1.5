@@ -130,8 +130,8 @@ __global__ void mamba3_scan_fwd_save_kernel(
             float B_bar = dt_val * B_val;
 
             // RoPE using SNAPSHOT
-            float cos_p = cosf(dt_val * freq[s]);
-            float sin_p = sinf(dt_val * freq[s]);
+            float cos_p, sin_p;
+            __sincosf(dt_val * freq[s], &sin_p, &cos_p);
             int s_prev = (s > 0) ? s - 1 : d_state - 1;
             float h_rot = h_snap[s] * cos_p - h_snap[s_prev] * sin_p;
 
@@ -330,8 +330,8 @@ __global__ void mamba3_scan_backward_kernel(
             }
             float B_bar = dt_val * B_val;
 
-            float cos_p = cosf(dt_val * freq[s]);
-            float sin_p = sinf(dt_val * freq[s]);
+            float cos_p, sin_p;
+            __sincosf(dt_val * freq[s], &sin_p, &cos_p);
             int s_prev = (s > 0) ? s - 1 : d_state - 1;
             float h_rot = h_prev[s] * cos_p - h_prev[s_prev] * sin_p;
 
