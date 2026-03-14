@@ -285,14 +285,22 @@ class SuperGrok2(Optimizer):
         eps = group["eps"]
         wd_eff = self._get_effective_wd(group["weight_decay"])
 
-        # Per-parameter meta-net forward + Adam
+        # Per-parameter pre-processing: clip grads, compute per-param scalars, init states
+        lamb_eff = self.lamb * ramp * gate_signal
+        active_indices = []
+        clipped_grads = []
+        alpha_mus_list = []
+        lamb_effs_list = []
+        beta1s_list = []
+        bc1s_list = []
+        bc2s_list = []
+
         for i, p in enumerate(self._flat_params):
             if p.grad is None:
                 continue
 
             self._flat_steps[i] += 1
             grad = p.grad.data
-            N = grad.numel()
 
             # Gradient clipping (per-parameter)
             grad_norm = grad.norm()
@@ -300,7 +308,6 @@ class SuperGrok2(Optimizer):
                 grad = grad * (self.gradient_clipping / (grad_norm + 1e-12))
 
             alpha_i = max(0.0, min(1.0, base_alpha * self._flat_layer_alphas[i]))
-            lamb_eff = self.lamb * ramp * gate_signal
             beta1_i = self._flat_layer_beta1s[i]
             step_i = self._flat_steps[i]
             bc1 = 1.0 - beta1_i ** step_i
@@ -315,69 +322,94 @@ class SuperGrok2(Optimizer):
                 self._flat_mamba_bwd_states[i] = torch.zeros(
                     d_inner, d_state, dtype=torch.float32, device=p.device)
 
-            if _HAS_CUDA and p.is_cuda:
-                # Ensure weights are extracted and cached
-                if self._weights_dirty:
-                    w = self.meta_net.get_weights()
-                    # Stack per-head weights into contiguous tensors
-                    self._cached_peer_query_Ws = torch.stack(
-                        [q.weight.data.float().contiguous() for q in self.meta_net.peer_queries])
-                    self._cached_prod_keys_A = torch.stack(
-                        [k.data.float().contiguous() for k in self.meta_net.product_keys_A])
-                    self._cached_prod_keys_B = torch.stack(
-                        [k.data.float().contiguous() for k in self.meta_net.product_keys_B])
-                    self._cached_weights = w
-                    self._weights_dirty = False
-                w = self._cached_weights
+            active_indices.append(i)
+            clipped_grads.append(grad)
+            alpha_mus_list.append(float(alpha_i))
+            lamb_effs_list.append(float(lamb_eff))
+            beta1s_list.append(float(beta1_i))
+            bc1s_list.append(float(bc1))
+            bc2s_list.append(float(bc2))
 
-                _ops.supergrok2_mamba_peer_step(
-                    p.data, grad, self._flat_sharpness[i],
-                    self._flat_exp_avgs[i], self._flat_exp_avg_sqs[i],
-                    self._flat_mus[i],
-                    self._flat_gru_states[i],
-                    self._flat_mamba_fwd_states[i],
-                    self._flat_mamba_bwd_states[i],
-                    # Input proj
-                    w['input_proj_W'], w['input_proj_b'],
-                    # Mamba forward
-                    w['mamba_fwd_in_proj'], w['mamba_fwd_dt_proj_W'],
-                    w['mamba_fwd_dt_proj_b'], w['mamba_fwd_B_proj'],
-                    w['mamba_fwd_C_proj'], w['mamba_fwd_A_log'],
-                    w['mamba_fwd_D'], w['mamba_fwd_rope_freq'],
-                    w['mamba_fwd_out_proj'],
-                    # Mamba backward
-                    w['mamba_bwd_in_proj'], w['mamba_bwd_dt_proj_W'],
-                    w['mamba_bwd_dt_proj_b'], w['mamba_bwd_B_proj'],
-                    w['mamba_bwd_C_proj'], w['mamba_bwd_A_log'],
-                    w['mamba_bwd_D'], w['mamba_bwd_rope_freq'],
-                    w['mamba_bwd_out_proj'],
-                    # GRU
-                    w['gru_W_z'], w['gru_b_z'],
-                    w['gru_W_r'], w['gru_b_r'],
-                    w['gru_W_h'], w['gru_b_h'],
-                    # PEER (stacked)
-                    self._cached_peer_query_Ws,
-                    self._cached_prod_keys_A,
-                    self._cached_prod_keys_B,
-                    # Experts (reshape for CUDA: [E, eh, 1] -> [E, eh])
-                    w['expert_W1'].reshape(self.num_experts, -1),
-                    w['expert_b1'],
-                    w['expert_W2'].reshape(self.num_experts, -1),
-                    w['expert_b2'].reshape(-1),
-                    # Scalars
-                    float(self.meta_net.rescale),
-                    float(alpha_i), float(lamb_eff),
-                    float(beta1_i), float(beta2), float(lr), float(wd_eff), float(eps),
-                    float(bc1), float(bc2),
-                    # Dims
-                    self.meta_net.d_model, self.meta_net.d_state,
-                    self.meta_net.mamba_fwd.d_inner,
-                    self.meta_net.gru_hidden, self.meta_net.num_peer_heads,
-                    self.meta_net.pk_dim, self.meta_net.expert_hidden,
-                    self.meta_net.num_experts,
-                )
-            else:
-                # Python fallback
+        if not active_indices:
+            return loss
+
+        # Check if we can use CUDA batched path
+        use_cuda = _HAS_CUDA and self._flat_params[active_indices[0]].is_cuda
+
+        if use_cuda:
+            # Ensure weights are extracted and cached
+            if self._weights_dirty:
+                w = self.meta_net.get_weights()
+                self._cached_peer_query_Ws = torch.stack(
+                    [q.weight.data.float().contiguous() for q in self.meta_net.peer_queries])
+                self._cached_prod_keys_A = torch.stack(
+                    [k.data.float().contiguous() for k in self.meta_net.product_keys_A])
+                self._cached_prod_keys_B = torch.stack(
+                    [k.data.float().contiguous() for k in self.meta_net.product_keys_B])
+                self._cached_weights = w
+                self._weights_dirty = False
+            w = self._cached_weights
+
+            _ops.supergrok2_mamba_peer_batched_step(
+                [self._flat_params[i].data for i in active_indices],
+                clipped_grads,
+                [self._flat_sharpness[i] for i in active_indices],
+                [self._flat_exp_avgs[i] for i in active_indices],
+                [self._flat_exp_avg_sqs[i] for i in active_indices],
+                [self._flat_mus[i] for i in active_indices],
+                [self._flat_gru_states[i] for i in active_indices],
+                [self._flat_mamba_fwd_states[i] for i in active_indices],
+                [self._flat_mamba_bwd_states[i] for i in active_indices],
+                # Input proj
+                w['input_proj_W'], w['input_proj_b'],
+                # Mamba forward
+                w['mamba_fwd_in_proj'], w['mamba_fwd_dt_proj_W'],
+                w['mamba_fwd_dt_proj_b'], w['mamba_fwd_B_proj'],
+                w['mamba_fwd_C_proj'], w['mamba_fwd_A_log'],
+                w['mamba_fwd_D'], w['mamba_fwd_rope_freq'],
+                w['mamba_fwd_out_proj'],
+                # Mamba backward
+                w['mamba_bwd_in_proj'], w['mamba_bwd_dt_proj_W'],
+                w['mamba_bwd_dt_proj_b'], w['mamba_bwd_B_proj'],
+                w['mamba_bwd_C_proj'], w['mamba_bwd_A_log'],
+                w['mamba_bwd_D'], w['mamba_bwd_rope_freq'],
+                w['mamba_bwd_out_proj'],
+                # GRU
+                w['gru_W_z'], w['gru_b_z'],
+                w['gru_W_r'], w['gru_b_r'],
+                w['gru_W_h'], w['gru_b_h'],
+                # PEER (stacked)
+                self._cached_peer_query_Ws,
+                self._cached_prod_keys_A,
+                self._cached_prod_keys_B,
+                # Experts
+                w['expert_W1'].reshape(self.num_experts, -1),
+                w['expert_b1'],
+                w['expert_W2'].reshape(self.num_experts, -1),
+                w['expert_b2'].reshape(-1),
+                # Per-param scalars
+                alpha_mus_list, lamb_effs_list,
+                beta1s_list, bc1s_list, bc2s_list,
+                # Shared scalars
+                float(self.meta_net.rescale),
+                float(beta2), float(lr), float(wd_eff), float(eps),
+                # Dims
+                self.meta_net.d_model, self.meta_net.d_state,
+                self.meta_net.mamba_fwd.d_inner,
+                self.meta_net.gru_hidden, self.meta_net.num_peer_heads,
+                self.meta_net.pk_dim, self.meta_net.expert_hidden,
+                self.meta_net.num_experts,
+            )
+        else:
+            # Python fallback — per-parameter
+            for idx, i in enumerate(active_indices):
+                p = self._flat_params[i]
+                grad = clipped_grads[idx]
+                alpha_i = alpha_mus_list[idx]
+                beta1_i = beta1s_list[idx]
+                bc1 = bc1s_list[idx]
+                bc2 = bc2s_list[idx]
+
                 flat_grad = grad.reshape(-1)
                 flat_sharp = self._flat_sharpness[i].reshape(-1)
 
@@ -392,7 +424,7 @@ class SuperGrok2(Optimizer):
 
                 mu = self._flat_mus[i]
                 mu.mul_(alpha_i).add_(grad, alpha=1.0 - alpha_i)
-                effective_grad = smart_grad.reshape(grad.shape) + lamb_eff * mu
+                effective_grad = smart_grad.reshape(grad.shape) + lamb_effs_list[idx] * mu
                 self._flat_mus[i] = mu
 
                 fg = effective_grad.reshape(-1).float()

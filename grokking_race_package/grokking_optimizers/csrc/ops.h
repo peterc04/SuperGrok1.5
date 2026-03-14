@@ -176,6 +176,41 @@ void launch_mamba3_peer_step(
     int gru_hidden, int num_heads, int pk_dim,
     int expert_hidden, int num_experts);
 
+// Batched version: all parameters at once
+void launch_mamba3_peer_batched_step(
+    std::vector<torch::Tensor> params,
+    std::vector<torch::Tensor> grads,
+    std::vector<torch::Tensor> sharpness_list,
+    std::vector<torch::Tensor> exp_avgs,
+    std::vector<torch::Tensor> exp_avg_sqs,
+    std::vector<torch::Tensor> mus,
+    std::vector<torch::Tensor> gru_states,
+    std::vector<torch::Tensor> mamba_fwd_states,
+    std::vector<torch::Tensor> mamba_bwd_states,
+    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
+    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
+    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
+    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
+    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
+    torch::Tensor mamba_fwd_out_proj,
+    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
+    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
+    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
+    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
+    torch::Tensor mamba_bwd_out_proj,
+    torch::Tensor gru_Wz, torch::Tensor gru_bz,
+    torch::Tensor gru_Wr, torch::Tensor gru_br,
+    torch::Tensor gru_Wh, torch::Tensor gru_bh,
+    torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+    torch::Tensor expert_W1, torch::Tensor expert_b1,
+    torch::Tensor expert_W2, torch::Tensor expert_b2,
+    std::vector<float> alpha_mus, std::vector<float> lamb_effs,
+    std::vector<float> beta1s, std::vector<float> bc1s, std::vector<float> bc2s,
+    float rescale, float beta2, float lr, float wd_eff, float eps,
+    int d_model, int d_state, int d_inner,
+    int gru_hidden, int num_heads, int pk_dim,
+    int expert_hidden, int num_experts);
+
 // ── SuperGrok v2 Bilevel Backward (supergrok2_mamba_peer_backward_kernels.cu)
 void launch_mamba3_peer_bilevel_fwd_save(
     torch::Tensor grad, torch::Tensor sharpness,
