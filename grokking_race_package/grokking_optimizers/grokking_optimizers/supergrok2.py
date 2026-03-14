@@ -399,7 +399,13 @@ class SuperGrok2(Optimizer):
                 self.meta_net.gru_hidden, self.meta_net.num_peer_heads,
                 self.meta_net.pk_dim, self.meta_net.expert_hidden,
                 self.meta_net.num_experts,
+                self.meta_net.expert_counts,
             )
+            # Expert recycling: increment step counter and periodically recycle
+            self.meta_net.step_counter += 1
+            if (self.meta_net.recycle_interval > 0 and
+                    self.meta_net.step_counter % self.meta_net.recycle_interval == 0):
+                self.meta_net._recycle_dead_experts()
         else:
             # Python fallback — per-parameter
             for idx, i in enumerate(active_indices):
