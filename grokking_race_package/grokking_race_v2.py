@@ -667,9 +667,9 @@ def train_supergrok(c, init, tx, ty, vx, vy, dev, bp=0):
         if step%muf==0:
             try: opt.meta_step(m, vx, vy, crit_sg, mopt)
             except Exception as e: warnings.warn(f"SuperGrok meta_step failed at step {step}: {e}")
-        # SAM step (v1.1 sharpness-aware minimization)
+        # SAM step (v1.1 sharpness-aware minimization, respects sam_enable_threshold)
         sam_freq = max(1, muf * 2)
-        if hasattr(opt, 'sam_step') and step % sam_freq == 0:
+        if hasattr(opt, 'sam_step') and step % sam_freq == 0 and opt._get_effective_sam_freq() < 999999:
             try: opt.sam_step(m, tx, ty, crit_sg)
             except Exception as e: warnings.warn(f"SuperGrok sam_step failed at step {step}: {e}")
         kw={"train_loss":train_loss_val, "train_acc":train_acc}
