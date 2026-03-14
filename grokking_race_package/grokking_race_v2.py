@@ -373,7 +373,10 @@ class SelectiveSSMLayer(nn.Module):
         if x.is_cuda:
             try:
                 from mamba_scan_ext import selective_scan_cuda
-                return selective_scan_cuda(x, dt, B, C, A)
+                return selective_scan_cuda(
+                    x.contiguous(), dt.contiguous(),
+                    B.contiguous(), C.contiguous(), A.contiguous()
+                )
             except ImportError:
                 pass
         # Python fallback
@@ -454,6 +457,7 @@ class EarlyStopper:
         self.best_val_acc = max(self.best_val_acc, val_acc)
         if val_acc >= self.threshold:
             if not self._triggered:
+                if torch.cuda.is_available(): torch.cuda.synchronize()
                 self._triggered=True; self.grokking_step=current_step
                 self.grokking_wall = time.time()-self._t0
             self._counter += 1; return self._counter >= self.patience
@@ -521,6 +525,7 @@ def _eval_log(r, step, m, tx, ty, vx, vy, c, st, pb):
     pb.set_postfix({"trn":f"{ta:.3f}","val":f"{va:.3f}","tl":f"{tl:.3f}","vl":f"{vl:.3f}"}, refresh=False)
     return st.step(va, step), tl, vl
 def _fin(r, st, step, t0):
+    if torch.cuda.is_available(): torch.cuda.synchronize()
     r.wall_time=time.time()-t0; r.total_steps=step
     r.grokking_step=st.grokking_step; r.grokking_wall=st.grokking_wall
     r.final_train_acc = r.train_accs[-1] if r.train_accs else 0.
@@ -555,6 +560,13 @@ def train_adamw(c, init, tx, ty, vx, vy, dev, bp=0):
     pb.close(); return _fin(r,st,step,t0)
 
 # ── 2. NeuralGrok ─────────────────────────────────────────────────────
+# NOTE: The NeuralGrok amplifier MLP is trained here via aopt on the outer
+# split, but opt.step() calls the fused C++ kernel which uses a *snapshot*
+# of the amplifier weights (cached at build time).  The amplifier's
+# learned weights therefore lag behind by one step.  This is intentional:
+# the C++ kernel cannot call back into Python autograd, so the amplifier
+# must be trained separately and its updated weights are picked up on the
+# next opt.step() call when the cache is refreshed.
 def train_neuralgrok(c, init, tx, ty, vx, vy, dev, bp=0):
     r=_tr("NeuralGrok",c); m=_load(c,dev,init)
     opt=NeuralGrok(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),

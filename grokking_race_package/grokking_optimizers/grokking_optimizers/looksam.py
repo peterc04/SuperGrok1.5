@@ -153,7 +153,7 @@ class LookSAM(Optimizer):
         """Perform a LookSAM sharpness-aware gradient direction adjustment.
 
         This method:
-          1. Saves current gradients.
+          1. Saves current gradients and backs up parameters.
           2. Perturbs parameters in the sharpness direction.
           3. Computes gradients at the perturbed point.
           4. Restores original parameters.
@@ -168,30 +168,32 @@ class LookSAM(Optimizer):
             train_y: Target batch.
             criterion: Loss function ``criterion(model(train_x), train_y)``.
         """
+        # Collect per-group data in a single pass so it survives across phases
+        group_data = []
         for group in self.param_groups:
             params_list = []
-            grads_list = []
+            orig_grads_list = []
             direction_list = []
-            param_backup_list = []
 
             for p in group["params"]:
                 if p.grad is None:
                     continue
                 state = self.state[p]
                 params_list.append(p)
-                grads_list.append(p.grad.clone())
+                orig_grads_list.append(p.grad.clone())
                 direction_list.append(state["sam_direction"])
-                param_backup_list.append(p.data.clone())
 
             if len(params_list) == 0:
+                group_data.append(None)
                 continue
 
-            # Step 1: Perturb parameters toward sharpness direction
-            _ops.looksam_perturb_all(
+            # Step 1: Perturb parameters — returns backups
+            backups = _ops.looksam_perturb_all(
                 params_list,
-                grads_list,
+                orig_grads_list,
                 group["rho"],
             )
+            group_data.append((params_list, orig_grads_list, direction_list, backups, group))
 
         # Step 2: Forward pass at the perturbed point
         model.zero_grad()
@@ -200,54 +202,34 @@ class LookSAM(Optimizer):
             perturbed_loss.backward()
 
         # Step 3 & 4: Restore parameters and compute/adjust directions
-        for group in self.param_groups:
-            params_list = []
-            orig_grads_list = []
-            perturbed_grads_list = []
-            direction_list = []
-            param_backup_list = []
-
-            idx = 0
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-
-                state = self.state[p]
-                params_list.append(p)
-                perturbed_grads_list.append(p.grad.clone())
-                direction_list.append(state["sam_direction"])
-                idx += 1
-
-            if len(params_list) == 0:
+        for gd in group_data:
+            if gd is None:
                 continue
+            params_list, orig_grads_list, direction_list, backups, group = gd
+
+            # Collect perturbed gradients
+            perturbed_grads_list = [p.grad.clone() for p in params_list]
 
             # Restore original parameters
-            _ops.looksam_restore_all(
-                params_list,
-                param_backup_list,
-            )
+            _ops.looksam_restore_all(params_list, backups)
 
-            # Compute sharpness-aware directions from original and perturbed grads
+            # Compute sharpness-aware directions: (v_dirs, sam_grads, normal_grads)
             _ops.looksam_compute_directions(
-                grads_list,
-                perturbed_grads_list,
                 direction_list,
+                perturbed_grads_list,
+                orig_grads_list,
             )
 
             # Adjust current gradients using the sharpness-aware directions
             _ops.looksam_adjust_grads(
-                grads_list,
+                orig_grads_list,
                 direction_list,
                 group["alpha"],
             )
 
             # Write adjusted gradients back to parameters
-            grad_idx = 0
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                p.grad.copy_(grads_list[grad_idx])
-                grad_idx += 1
+            for p, g in zip(params_list, orig_grads_list):
+                p.grad.copy_(g)
 
     @property
     def global_step(self) -> int:
