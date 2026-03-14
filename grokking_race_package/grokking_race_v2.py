@@ -549,7 +549,7 @@ def _tr(name, c):
 
 # ── C++/CUDA fused optimizers (grokking_optimizers package) ────────────
 from grokking_optimizers import (
-    SuperGrok15, SuperGrok2, SuperGrok11, ISABPEERMetaNet,
+    SuperGrok15, SuperGrok2, SuperGrok11,
     GrokAdamW, NeuralGrok, Prodigy, Grokfast, Lion, LookSAM, Muon,
     CUDAGraphOptimizer,
 )
