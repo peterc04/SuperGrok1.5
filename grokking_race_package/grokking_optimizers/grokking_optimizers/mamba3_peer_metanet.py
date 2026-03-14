@@ -462,15 +462,26 @@ class Mamba3PEERMetaNet(nn.Module):
             self.expert_b2.data[i] = self.expert_b2.data[top_expert] + \
                 noise_scale * torch.randn_like(self.expert_b2.data[i])
 
-            # Randomize product keys pointing to this expert
-            # The expert at index i corresponds to sub-key pair (i // pk_dim, i % pk_dim)
+            # Only randomize a product key if ALL experts sharing it are dead
             a_idx = i // self.pk_dim
             b_idx = i % self.pk_dim
-            for h in range(self.num_peer_heads):
-                self.product_keys_A[h].data[a_idx] = torch.randn_like(
-                    self.product_keys_A[h].data[a_idx]) * 0.02
-                self.product_keys_B[h].data[b_idx] = torch.randn_like(
-                    self.product_keys_B[h].data[b_idx]) * 0.02
+
+            # Check if all experts in row a_idx are dead
+            row_start = a_idx * self.pk_dim
+            row_end = row_start + self.pk_dim
+            if dead_mask[row_start:row_end].all():
+                for h in range(self.num_peer_heads):
+                    self.product_keys_A[h].data[a_idx] = torch.randn_like(
+                        self.product_keys_A[h].data[a_idx]) * 0.02
+
+            # Check if all experts in column b_idx are dead
+            col_indices = torch.arange(0, self.num_experts, self.pk_dim,
+                                       device=dead_mask.device) + b_idx
+            col_indices = col_indices[col_indices < self.num_experts]
+            if dead_mask[col_indices].all():
+                for h in range(self.num_peer_heads):
+                    self.product_keys_B[h].data[b_idx] = torch.randn_like(
+                        self.product_keys_B[h].data[b_idx]) * 0.02
 
         # Reset counters
         self.expert_counts.zero_()
