@@ -448,8 +448,9 @@ class Mamba3PEERMetaNet(nn.Module):
             self.expert_counts.zero_()
             return
 
-        # Find top-performing expert (most activations = most trusted by router)
-        top_expert = self.expert_counts.argmax().item()
+        # Find top-performing expert (weighted sample from top experts for diversity)
+        counts_f = self.expert_counts.float()
+        top_expert = torch.multinomial(counts_f, 1).item()
         dead_indices = dead_mask.nonzero(as_tuple=True)[0]
 
         for idx in dead_indices:

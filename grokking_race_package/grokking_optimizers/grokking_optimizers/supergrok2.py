@@ -199,7 +199,7 @@ class SuperGrok2(Optimizer):
             self._flat_mus.append(
                 torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
             self._flat_sharpness.append(
-                torch.zeros(p.data.shape, dtype=torch.float32, device=p.device))
+                torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
             # Per-parameter GRU state
             self._flat_gru_states.append(
                 torch.zeros(p.data.numel(), self.gru_hidden,
