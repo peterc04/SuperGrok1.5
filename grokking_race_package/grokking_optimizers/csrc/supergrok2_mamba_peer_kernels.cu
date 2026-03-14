@@ -644,7 +644,8 @@ void launch_mamba3_peer_step(
     // Dims
     int d_model, int d_state, int d_inner,
     int gru_hidden, int num_heads, int pk_dim,
-    int expert_hidden, int num_experts
+    int expert_hidden, int num_experts,
+    torch::Tensor expert_counts
 ) {
     const int N = grad.numel();
     if (N == 0) return;
@@ -791,7 +792,7 @@ void launch_mamba3_peer_step(
                 expert_b2.data_ptr<float>(),
                 rescale, alpha_mu, lamb_eff,
                 beta1, beta2, lr, wd_eff, eps, bc1, bc2,
-                nullptr,  // expert_counts — not tracked in single-param launcher
+                expert_counts.data_ptr<int>(),
                 N, d_model, d_inner, gru_hidden,
                 num_heads, pk_dim, expert_hidden, num_experts
             );
@@ -843,7 +844,8 @@ void launch_mamba3_peer_batched_step(
     // Dims
     int d_model, int d_state, int d_inner,
     int gru_hidden, int num_heads, int pk_dim,
-    int expert_hidden, int num_experts
+    int expert_hidden, int num_experts,
+    torch::Tensor expert_counts
 ) {
     const int num_params = params.size();
     if (num_params == 0) return;
@@ -1026,7 +1028,7 @@ void launch_mamba3_peer_batched_step(
                 expert_b2.data_ptr<float>(),
                 rescale, alpha_mus[p], lamb_effs[p],
                 beta1s[p], beta2, lr, wd_eff, eps, bc1s[p], bc2s[p],
-                nullptr,  // expert_counts — not tracked in batched launcher
+                expert_counts.data_ptr<int>(),
                 N, d_model, d_inner, gru_hidden,
                 num_heads, pk_dim, expert_hidden, num_experts
             );

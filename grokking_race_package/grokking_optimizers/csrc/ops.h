@@ -174,7 +174,8 @@ void launch_mamba3_peer_step(
     float bc1, float bc2,
     int d_model, int d_state, int d_inner,
     int gru_hidden, int num_heads, int pk_dim,
-    int expert_hidden, int num_experts);
+    int expert_hidden, int num_experts,
+    torch::Tensor expert_counts);
 
 // Batched version: all parameters at once
 void launch_mamba3_peer_batched_step(
@@ -209,7 +210,8 @@ void launch_mamba3_peer_batched_step(
     float rescale, float beta2, float lr, float wd_eff, float eps,
     int d_model, int d_state, int d_inner,
     int gru_hidden, int num_heads, int pk_dim,
-    int expert_hidden, int num_experts);
+    int expert_hidden, int num_experts,
+    torch::Tensor expert_counts);
 
 // ── SuperGrok v2 Bilevel Backward (supergrok2_mamba_peer_backward_kernels.cu)
 void launch_mamba3_peer_bilevel_fwd_save(

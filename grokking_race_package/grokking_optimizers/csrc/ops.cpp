@@ -766,7 +766,8 @@ void supergrok2_mamba_peer_step(
     float bc1, float bc2,
     int d_model, int d_state, int d_inner,
     int gru_hidden, int num_heads, int pk_dim,
-    int expert_hidden, int num_experts
+    int expert_hidden, int num_experts,
+    torch::Tensor expert_counts
 ) {
     if (grad.numel() == 0) return;
 
@@ -789,7 +790,8 @@ void supergrok2_mamba_peer_step(
             beta1, beta2, lr_val, wd_eff, eps, bc1, bc2,
             d_model, d_state, d_inner,
             gru_hidden, num_heads, pk_dim,
-            expert_hidden, num_experts);
+            expert_hidden, num_experts,
+            expert_counts);
         return;
     }
 #endif
@@ -831,7 +833,8 @@ void supergrok2_mamba_peer_batched_step(
     float rescale, float beta2, float lr_val, float wd_eff, float eps,
     int d_model, int d_state, int d_inner,
     int gru_hidden, int num_heads, int pk_dim,
-    int expert_hidden, int num_experts
+    int expert_hidden, int num_experts,
+    torch::Tensor expert_counts
 ) {
     if (params.empty()) return;
 #ifdef WITH_CUDA
@@ -853,7 +856,8 @@ void supergrok2_mamba_peer_batched_step(
             rescale, beta2, lr_val, wd_eff, eps,
             d_model, d_state, d_inner,
             gru_hidden, num_heads, pk_dim,
-            expert_hidden, num_experts);
+            expert_hidden, num_experts,
+            expert_counts);
         return;
     }
 #endif
@@ -1017,7 +1021,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("bc1"), py::arg("bc2"),
           py::arg("d_model"), py::arg("d_state"), py::arg("d_inner"),
           py::arg("gru_hidden"), py::arg("num_heads"), py::arg("pk_dim"),
-          py::arg("expert_hidden"), py::arg("num_experts"));
+          py::arg("expert_hidden"), py::arg("num_experts"),
+          py::arg("expert_counts"));
 
     // ── SuperGrok v2 Batched Step ──────────────────────────────────────
     m.def("supergrok2_mamba_peer_batched_step", &supergrok2_mamba_peer_batched_step,

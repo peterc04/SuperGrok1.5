@@ -263,7 +263,7 @@ class Mamba3PEERMetaNet(nn.Module):
         self.expert_b2 = nn.Parameter(torch.zeros(num_experts, 1))
 
         # -- Expert activation tracking (not a parameter)
-        self.register_buffer('expert_counts', torch.zeros(num_experts, dtype=torch.long))
+        self.register_buffer('expert_counts', torch.zeros(num_experts, dtype=torch.int32))
         self.register_buffer('step_counter', torch.tensor(0, dtype=torch.long))
 
     def forward(
