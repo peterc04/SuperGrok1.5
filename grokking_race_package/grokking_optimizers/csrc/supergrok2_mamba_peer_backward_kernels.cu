@@ -208,9 +208,10 @@ __global__ void mamba3_scan_backward_kernel(
     const int tid = threadIdx.x;
     if (tid >= d_inner) return;
 
-    // Shared memory for cross-thread x_branch access in backward
+    // Shared memory for cross-thread access in backward
     extern __shared__ float smem[];
-    float* s_x_branch = smem; // [d_inner]
+    float* s_x_branch = smem;              // [d_inner]
+    float* s_d_dt_raw = smem + d_inner;    // [d_inner] — for full dt backward
 
     float A[MAX_D_STATE];
     for (int s = 0; s < d_state; s++)
@@ -293,6 +294,8 @@ __global__ void mamba3_scan_backward_kernel(
             for (int j = 0; j < d_inner; j++) {
                 atomicAdd(&d_C_proj_W[s * d_inner + j], d_C_val * s_x_branch[j]);
             }
+            // Accumulate d_x_from_C: gradient of y w.r.t. x_branch[tid] via C projection
+            d_x_from_C += d_y_val * h_s * C_proj_W[s * d_inner + tid];
         }
 
         // Get h_prev (state before this step's update)
@@ -306,7 +309,7 @@ __global__ void mamba3_scan_backward_kernel(
                 h_prev[s] = 0.0f;
         }
 
-        // Backward through state update: h[s] = A_bar * h_rot + B_bar
+        // Backward through state update: h[s] = A_bar * h_rot + B_bar * x_val
         // Fix: snapshot dh before the loop to avoid read-after-write
         float dh_snap[MAX_D_STATE];
         for (int s = 0; s < d_state; s++) dh_snap[s] = dh[s];
@@ -337,7 +340,9 @@ __global__ void mamba3_scan_backward_kernel(
 
             float d_A_bar = d_h_s * h_rot;
             float d_h_rot = d_h_s * A_bar;
-            float d_B_bar = d_h_s;
+            // Forward: h[s] = A_bar * h_rot + B_bar * x_val
+            float d_B_bar = d_h_s * x_val;
+            d_x_from_scan += d_h_s * B_bar;  // gradient through x_val
 
             // d_B_bar -> d_dt, d_B_val
             d_dt_val += d_B_bar * B_val;
@@ -383,15 +388,13 @@ __global__ void mamba3_scan_backward_kernel(
             d_dt_proj_W_row[j] += d_dt_raw * s_x_branch[j];
         }
 
-        // d_x_val from dt backward needs full row
+        // Full dt backward using shared memory for cross-thread d_dt_raw
+        s_d_dt_raw[tid] = d_dt_raw;
+        __syncthreads();
         float d_x_from_dt = 0.0f;
-        for (int j = 0; j < d_inner; j++) {
-            // Only contributes to d_x for dimension tid via in_proj
-            // But for shared memory, d_dt_raw propagates to all x_branch[j]
-            // This is handled via the in_proj backward below
+        for (int t = 0; t < d_inner; t++) {
+            d_x_from_dt += s_d_dt_raw[t] * dt_proj_W[t * d_inner + tid];
         }
-        // Contribution from dt_proj to d_x_branch[tid]
-        d_x_from_dt = d_dt_raw * dt_proj_W[tid * d_inner + tid];
 
         // Total d_x_val for this step
         float d_x_val = d_x_from_D + d_x_from_C + d_x_from_scan + d_x_from_dt;
@@ -534,14 +537,6 @@ __global__ void gru_backward_kernel(
             atomicAdd(&d_Wh[gh * total_dim + input_dim + j], d_tanh_input * rh);
         }
 
-        // d_r from Wh backward: d_tanh_input * Wh[gh, input_dim + j] * h_old[j]
-        float d_r = 0.0f;
-        for (int j = 0; j < gru_hidden; j++) {
-            d_r += d_tanh_input * Wh[gh * total_dim + input_dim + j] * h_old[idx * gru_hidden + j];
-        }
-        // Only accumulate for matching dimension
-        float d_r_input = d_r * r_val * (1.0f - r_val);
-
         // Accumulate d_Wz, d_bz from d_z_input
         atomicAdd(&d_bz[gh], d_z_input);
         for (int j = 0; j < total_dim; j++) {
@@ -553,21 +548,36 @@ __global__ void gru_backward_kernel(
             atomicAdd(&d_Wz[gh * total_dim + j], d_z_input * xh_j);
         }
 
-        // Accumulate d_Wr, d_br from d_r_input
-        atomicAdd(&d_br[gh], d_r_input);
-        for (int j = 0; j < total_dim; j++) {
-            float xh_j;
-            if (j < input_dim)
-                xh_j = gru_input[idx * input_dim + j];
-            else
-                xh_j = h_old[idx * gru_hidden + (j - input_dim)];
-            atomicAdd(&d_Wr[gh * total_dim + j], d_r_input * xh_j);
+        // d_r from Wh backward: per-dimension d_r[j] (not mixed)
+        // Forward: xrh[input_dim+j] = r[j] * h_old[j]
+        // d_xrh[input_dim+j] from this gh = d_tanh_input * Wh[gh, input_dim+j]
+        // d_r[j] from this gh = d_tanh_input * Wh[gh, input_dim+j] * h_old[j]
+        for (int j = 0; j < gru_hidden; j++) {
+            float d_r_j = d_tanh_input * Wh[gh * total_dim + input_dim + j]
+                        * h_old[idx * gru_hidden + j];
+            float r_j = r_gate[idx * gru_hidden + j];
+            float d_r_j_input = d_r_j * r_j * (1.0f - r_j);
+
+            // Accumulate d_Wr[j, :] and d_br[j] from this gh's contribution
+            atomicAdd(&d_br[j], d_r_j_input);
+            for (int k = 0; k < total_dim; k++) {
+                float xh_k;
+                if (k < input_dim)
+                    xh_k = gru_input[idx * input_dim + k];
+                else
+                    xh_k = h_old[idx * gru_hidden + (k - input_dim)];
+                atomicAdd(&d_Wr[j * total_dim + k], d_r_j_input * xh_k);
+            }
+            // d_gru_input from Wr backward
+            for (int k = 0; k < input_dim; k++) {
+                atomicAdd(&d_gru_input[idx * input_dim + k],
+                          d_r_j_input * Wr[j * total_dim + k]);
+            }
         }
 
-        // d_gru_input from Wz and Wr and Wh backward
+        // d_gru_input from Wz and Wh backward (Wr handled above per-dimension)
         for (int j = 0; j < input_dim; j++) {
             float d_input_j = d_z_input * Wz[gh * total_dim + j]
-                            + d_r_input * Wr[gh * total_dim + j]
                             + d_tanh_input * Wh[gh * total_dim + j];
             atomicAdd(&d_gru_input[idx * input_dim + j], d_input_j);
         }
@@ -1111,7 +1121,7 @@ void launch_mamba3_peer_backward(
     );
 
     // Step 8: Mamba scan backward (both directions)
-    int scan_smem = d_inner * sizeof(float); // shared memory for x_branch
+    int scan_smem = 2 * d_inner * sizeof(float); // s_x_branch + s_d_dt_raw
     auto d_x_sorted_fwd = torch::zeros({N, d_model}, float_opts);
     auto d_x_sorted_bwd = torch::zeros({N, d_model}, float_opts);
 
