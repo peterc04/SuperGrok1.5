@@ -107,7 +107,6 @@ __global__ void mamba3_scan_kernel(
     // Shared memory for cross-thread communication
     extern __shared__ float smem[];
     float* s_x_branch = smem;           // [d_inner]
-    float* s_z_branch = smem + d_inner; // [d_inner]
 
     // State in registers — load from initial_state if provided
     float h[32];
@@ -858,8 +857,8 @@ void launch_mamba3_peer_step(
     auto bwd_scan_out = torch::empty({N, d_inner}, float_opts);
     auto new_bwd_state = torch::empty({d_inner, d_state}, float_opts);
 
-    // Shared memory for scan: x_branch + z_branch
-    int scan_smem = 2 * d_inner * sizeof(float);
+    // Shared memory for scan: x_branch only (z computed per-thread)
+    int scan_smem = d_inner * sizeof(float);
 
     // Forward scan — pass initial_state if available
     const float* fwd_init_ptr = (mamba_fwd_state.numel() > 0) ?

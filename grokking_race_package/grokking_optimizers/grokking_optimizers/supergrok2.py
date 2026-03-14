@@ -302,10 +302,12 @@ class SuperGrok2(Optimizer):
             self._flat_steps[i] += 1
             grad = p.grad.data
 
-            # Gradient clipping (per-parameter)
+            # Gradient clipping (per-parameter) + NaN guard
             grad_norm = grad.norm()
             if grad_norm > self.gradient_clipping:
                 grad = grad * (self.gradient_clipping / (grad_norm + 1e-12))
+            if not torch.isfinite(grad).all():
+                grad = torch.where(torch.isfinite(grad), grad, torch.zeros_like(grad))
 
             alpha_i = max(0.0, min(1.0, base_alpha * self._flat_layer_alphas[i]))
             beta1_i = self._flat_layer_beta1s[i]
