@@ -21,7 +21,6 @@ from torch.optim import Optimizer
 from typing import Optional, Dict
 
 from grokking_optimizers.isab_peer_metanet import ISABPEERMetaNet
-from grokking_optimizers._adamw_helper import adamw_step
 
 
 class SuperGrok2(Optimizer):
@@ -268,13 +267,7 @@ class SuperGrok2(Optimizer):
         eps = group["eps"]
         wd_eff = self._get_effective_wd(group["weight_decay"])
 
-        # Python fallback: per-parameter meta-net forward + Adam
-        params_for_adam = []
-        grads_for_adam = []
-        exp_avgs_for_adam = []
-        exp_avg_sqs_for_adam = []
-        steps_for_adam = []
-
+        # Per-parameter meta-net forward + Adam
         for i, p in enumerate(self._flat_params):
             if p.grad is None:
                 continue
@@ -300,28 +293,29 @@ class SuperGrok2(Optimizer):
             alpha_i = max(0.0, min(1.0, base_alpha * self._flat_layer_alphas[i]))
             lamb_eff = self.lamb * ramp * gate_signal
 
-            # mu update: mu = alpha * mu + (1 - alpha) * smart_grad
+            # mu update: EMA of raw gradient (not smart_grad)
             mu = self._flat_mus[i]
-            mu.mul_(alpha_i).add_(smart_grad.reshape(grad.shape), alpha=1.0 - alpha_i)
+            mu.mul_(alpha_i).add_(grad, alpha=1.0 - alpha_i)
 
-            # Effective gradient: grad + lamb * mu
-            effective_grad = grad + lamb_eff * mu
+            # Effective gradient: smart_grad is PRIMARY + lamb * mu
+            effective_grad = smart_grad.reshape(grad.shape) + lamb_eff * mu
             self._flat_mus[i] = mu
 
-            # Collect for batched Adam step
-            params_for_adam.append(p.data)
-            grads_for_adam.append(effective_grad)
-            exp_avgs_for_adam.append(self._flat_exp_avgs[i])
-            exp_avg_sqs_for_adam.append(self._flat_exp_avg_sqs[i])
-            steps_for_adam.append(self._flat_steps[i])
+            # Per-parameter Adam with per-layer beta1
+            beta1_i = self._flat_layer_beta1s[i]
+            step_i = self._flat_steps[i]
+            bc1 = 1.0 - beta1_i ** step_i
+            bc2 = 1.0 - beta2 ** step_i
 
-        if params_for_adam:
-            adamw_step(
-                params_for_adam, grads_for_adam,
-                exp_avgs_for_adam, exp_avg_sqs_for_adam,
-                steps_for_adam,
-                lr, beta1_base, beta2, eps, wd_eff,
-            )
+            ea = self._flat_exp_avgs[i]
+            easq = self._flat_exp_avg_sqs[i]
+            fg = effective_grad.reshape(-1).float()
+            ea.mul_(beta1_i).add_(fg, alpha=1 - beta1_i)
+            easq.mul_(beta2).addcmul_(fg, fg, value=1 - beta2)
+            step_size = lr / bc1
+            denom = (easq / bc2).sqrt().add_(eps)
+            p.data.mul_(1 - lr * wd_eff)
+            p.data.addcdiv_(ea.reshape(p.data.shape), denom.reshape(p.data.shape), value=-step_size)
 
         return loss
 
@@ -404,17 +398,11 @@ class SuperGrok2(Optimizer):
 
         smart_grads = {}
         if all_grads:
-            cat_grads = torch.cat(all_grads)
-            cat_sharps = torch.cat(all_sharps)
-            cat_recurrent = torch.cat(all_recurrent, dim=0)
-            # Use forward_for_bilevel for differentiable soft routing
-            cat_smart, _ = self.meta_net.forward_for_bilevel(
-                cat_grads, cat_sharps, cat_recurrent)
-            offset = 0
-            for name, size in zip(all_names, all_sizes):
-                smart_grads[name] = cat_smart[offset:offset+size].reshape(
-                    saved_grads[name].shape)
-                offset += size
+            # Process per-parameter to avoid OOM from batching all params
+            for j, (name, size) in enumerate(zip(all_names, all_sizes)):
+                sg, _ = self.meta_net.forward_for_bilevel(
+                    all_grads[j], all_sharps[j], all_recurrent[j])
+                smart_grads[name] = sg.reshape(saved_grads[name].shape)
 
         model.zero_grad()
         with torch.enable_grad():

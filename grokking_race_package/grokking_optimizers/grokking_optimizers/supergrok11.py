@@ -41,11 +41,13 @@ class SuperGrok11(Optimizer):
         zero_loss_threshold: float = 1e-4,
         zero_acc_threshold: float = 0.995,
         sam_rho: float = 0.05,
+        sam_enable_threshold: float = 0.0,
     ):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
         self.alpha_init = alpha_init
+        self.sam_enable_threshold = sam_enable_threshold
         self.lamb = lamb
         self.gamma = gamma
         self.gamma_alpha = gamma_alpha
@@ -188,6 +190,48 @@ class SuperGrok11(Optimizer):
         )
 
         return loss
+
+    def sam_step(self, model, train_x, train_y, criterion):
+        """SAM perturbation + sharpness computation via functional_call (no param modification)."""
+        self._ensure_state()
+        train_grads = {}
+        for name, p in model.named_parameters():
+            if p.grad is not None:
+                train_grads[name] = p.grad.detach().clone()
+        if not train_grads:
+            return 0.0
+
+        flat_grads = [train_grads[n] for n, _ in model.named_parameters() if n in train_grads]
+        total_norm_sq = sum(g.norm().pow(2) for g in flat_grads if g.numel() > 0)
+        grad_norm = total_norm_sq.sqrt() + 1e-12
+        rho_over_norm = self.sam_rho / grad_norm
+
+        named_params = dict(model.named_parameters())
+        perturbed_params = {}
+        for name, p in named_params.items():
+            if name in train_grads:
+                perturbed_params[name] = p.detach() + rho_over_norm * train_grads[name]
+            else:
+                perturbed_params[name] = p.detach()
+
+        model.zero_grad()
+        with torch.enable_grad():
+            sam_logits = torch.func.functional_call(model, perturbed_params, (train_x,))
+            sam_loss = criterion(sam_logits, train_y)
+            sam_loss.backward()
+        sam_loss_val = sam_loss.item()
+
+        for name, p in model.named_parameters():
+            pidx = self._param_to_idx.get(id(p))
+            if pidx is not None and p.grad is not None and name in train_grads:
+                sam_grad = p.grad.detach()
+                normal_grad = train_grads[name]
+                self._flat_sharpness[pidx] = (sam_grad - normal_grad).abs()
+
+        for name, p in model.named_parameters():
+            p.grad = train_grads.get(name)
+
+        return sam_loss_val
 
     def meta_step(self, model, val_x, val_y, criterion, meta_optimizer):
         """Bilevel meta-net training. Batched meta-net forward."""

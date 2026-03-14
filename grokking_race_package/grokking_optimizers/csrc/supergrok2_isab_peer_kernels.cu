@@ -42,6 +42,7 @@ __global__ void isab_reduce_kernel(
     const float* __restrict__ induce_k_W,     // [d_model, d_model]
     const float* __restrict__ induce_v_W,     // [d_model, d_model]
     float* __restrict__ I_up,                 // [M, d_model] — output
+    float* __restrict__ attn_buf,             // [M, N] — global memory for attention scores
     const int N,
     const int M,
     const int d_model
@@ -51,9 +52,9 @@ __global__ void isab_reduce_kernel(
 
     const int tid = threadIdx.x;
     extern __shared__ float smem[];
-    // Layout: q_m[d_model], attn_scores[N_padded], attn_sum[1]
+    // Layout: q_m[d_model] only — attn_raw moved to global memory
     float* q_m = smem;
-    float* attn_raw = q_m + d_model;
+    float* attn_raw = attn_buf + m * N;
 
     // Step 1: Compute q for this inducing point: q_m = induce_q_W @ inducing_pts[m]
     if (tid < d_model) {
@@ -410,10 +411,11 @@ void launch_isab_peer_metanet(
 
     // Step 2: ISAB reduction — inducing points attend to elements
     auto I_up = torch::empty({num_inducing, d_model}, float_opts);
+    // Attention scores in global memory (avoids shared memory overflow for large N)
+    auto attn_buf = torch::empty({num_inducing, N}, float_opts);
     {
-        // Shared memory: q_m[d_model] + attn_raw[N] + reduce_buf[SG2_BLOCK]
-        int smem_bytes = (d_model + N) * sizeof(float);
-        // Clamp blocks to SG2_BLOCK threads
+        // Shared memory: q_m[d_model] only
+        int smem_bytes = d_model * sizeof(float);
         isab_reduce_kernel<<<num_inducing, SG2_BLOCK, smem_bytes>>>(
             x_proj.data_ptr<float>(),
             inducing_points.data_ptr<float>(),
@@ -421,6 +423,7 @@ void launch_isab_peer_metanet(
             induce_k_W.data_ptr<float>(),
             induce_v_W.data_ptr<float>(),
             I_up.data_ptr<float>(),
+            attn_buf.data_ptr<float>(),
             N, num_inducing, d_model
         );
     }
