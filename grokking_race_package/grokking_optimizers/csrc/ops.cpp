@@ -275,7 +275,7 @@ void supergrok2_fused_step(
             auto V = V_buf.narrow(0, 0, N);
             auto idx_q = idx_q_buf.narrow(0, 0, N);
             auto idx_k = idx_k_buf.narrow(0, 0, N);
-            auto selected = selected_buf.narrow(0, 0, N).narrow(1, 0, eff_top_k);
+            auto selected = selected_buf.narrow(0, 0, N).narrow(1, 0, eff_top_k).contiguous();
 
             // Step 1: Project to Q, K, V, idx_q, idx_k
             launch_dsa_project(
