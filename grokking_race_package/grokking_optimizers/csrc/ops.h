@@ -77,9 +77,9 @@ float compute_cosine_gate(torch::Tensor smart_grad, torch::Tensor mu, float gate
 
 // ── GrokAdamW (grokadamw_kernels.cu) ────────────────────────────────
 void launch_fused_grokadamw_step(
-    torch::Tensor param, torch::Tensor grad,
+    torch::Tensor param,
     torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
-    torch::Tensor ema,
+    torch::Tensor ema, torch::Tensor grad,
     float alpha, float lamb,
     float beta1, float beta2, float lr, float wd,
     float eps, float bc1, float bc2);
@@ -513,7 +513,7 @@ void supergrok2_mamba_peer_step(
     torch::Tensor expert_W1, torch::Tensor expert_b1,
     torch::Tensor expert_W2, torch::Tensor expert_b2,
     float rescale, float alpha_mu, float lamb_eff,
-    float beta1, float beta2, float lr_val, float wd_eff, float eps,
+    float beta1, float beta2, float lr, float wd_eff, float eps,
     float bc1, float bc2,
     int d_model, int d_state, int d_inner,
     int gru_hidden, int num_heads, int pk_dim,
