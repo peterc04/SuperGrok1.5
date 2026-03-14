@@ -1,87 +1,122 @@
-# Grokking Race v2 — 11-Optimizer Multi-GPU Benchmark
+# Grokking Race v2 — 11-Optimizer Benchmark with Custom C++/CUDA Kernels
+
+A comprehensive benchmark suite for studying **grokking** (delayed generalization after memorization) across 11 optimizers, 3 model architectures, and multiple data splits. Includes **SuperGrok v2**, a novel optimizer with a Mamba-3 + PEER + GRU meta-network implemented in custom CUDA kernels.
 
 ## Quick Start
 
 ```bash
-# 1. Upload this entire directory to your GCP VM
+# 1. Build the C++/CUDA optimizer extension
+cd grokking_race_package/grokking_optimizers
+pip install -e .
 
-# 2. Install dependencies + build C++ extension
-python grokking_race_v2.py --setup
-
-# 3. Run (single GPU, sequential — fair benchmark)
+# 2. Run the benchmark (single GPU)
+cd ..
 python grokking_race_v2.py
 
-# 4. Run (multi-GPU — fast, still fair)
+# 3. Run (multi-GPU — fast, still fair)
 python grokking_race_v2.py --gpus 0,1,2,3
-
-# 5. With phone notifications
-python grokking_race_v2.py --gpus auto --ntfy peter-grok-2025
 ```
 
-## Files
+## Optimizers (11)
+
+| Optimizer | Description |
+|-----------|-------------|
+| **SuperGrok v2** | Mamba-3 bidirectional scan + 4-head PEER routing + GRU + 144 experts (custom CUDA) |
+| **SuperGrok v1.5** | 2D sharpness meta-net + SAM + progressive WD (custom CUDA) |
+| **SuperGrok v1.1** | Meta-net with cosine similarity gating (custom CUDA) |
+| **GrokAdamW** | EMA gradient filter + amplification + AdamW (custom CUDA) |
+| **NeuralGrok** | MLP gradient amplifier + AdamW (custom CUDA) |
+| **Prodigy** | Distance-aware self-tuning AdamW (custom CUDA) |
+| **Grokfast** | EMA + gradient amplification (custom CUDA) |
+| **Lion** | Sign-based momentum optimizer (custom CUDA) |
+| **LookSAM** | Sharpness-Aware Minimization with direction caching (custom CUDA) |
+| **Muon** | Momentum + Newton-Schulz orthogonalization (custom CUDA) |
+| **AdamW** | Standard PyTorch AdamW (baseline) |
+
+## SuperGrok v2 Architecture
+
+The meta-network processes per-parameter gradient vectors through:
+
+1. **Sort** by gradient magnitude → creates meaningful sequence for scan
+2. **Bidirectional Mamba-3 Scan** (forward + backward) — trapezoidal discretization, paired RoPE, selective B/C/dt gating — captures cross-element gradient correlations
+3. **Per-element GRU** (4-dim hidden) — temporal memory across optimizer steps
+4. **4-Head PEER Routing** — product-key expert selection (top-4 per sub-key per head, 144 total experts)
+5. **Expert MLP** — per-expert gradient transformation (1 → 16 → 1)
+6. **Skip connection** — `smart_grad = grad + 0.1 * expert_output`
+7. **Adaptive Adam** — bias-corrected first/second moments + weight decay
+
+Additional features: dynamic expert recycling, sigmoid-driven SAM/bilevel/WD scheduling, functional_call SAM (no parameter modification), CUDA batched scan, AMP support.
+
+## Model Architectures
+
+- **Decoder Transformer** — causal attention, standard for modular arithmetic grokking
+- **Vision Transformer (ViT)** — patch embeddings for image classification
+- **Mamba SSM** — selective state space model (linear-time sequence processing)
+
+## File Structure
 
 ```
-grokking_race_v2.py              # Main benchmark (1,497 lines)
-supergrok15_cpp/                 # C++/CUDA optimizer (build with pip install -e .)
-  csrc/kernels.cu                #   4 fused CUDA kernels
-  csrc/ops.cpp                   #   C++ dispatch + CPU fallback + pybind11
-  csrc/ops.h                     #   Declarations
-  supergrok15_cpp/optim.py       #   Python wrapper
-  supergrok15_cpp/__init__.py
-  setup.py                       #   Build script (auto-detects CUDA)
-  tests.py                       #   Test suite
-  pyproject.toml
-supergrok_v1_5/                  # Pure Python fallback (no build needed)
-  supergrok15/supergrok15.py
-  supergrok15/__init__.py
-  tests.py
-  pyproject.toml
+grokking_race_package/
+├── grokking_race_v2.py                         # Benchmark harness (1,687 lines)
+├── README.md
+├── ANALYSIS.md
+├── grokking_optimizers/                        # C++/CUDA optimizer package
+│   ├── setup.py                                # Build script (sm_70–sm_90)
+│   └── grokking_optimizers/
+│       ├── __init__.py                         # Package exports
+│       ├── supergrok2.py                       # SuperGrok v2 optimizer (1,049 lines)
+│       ├── mamba3_peer_metanet.py              # Mamba-3+PEER+GRU meta-net (574 lines)
+│       ├── supergrok15.py                      # SuperGrok v1.5 optimizer (478 lines)
+│       ├── supergrok11.py                      # SuperGrok v1.1 optimizer (296 lines)
+│       ├── grokadamw.py                        # GrokAdamW (144 lines)
+│       ├── neuralgrok.py                       # NeuralGrok (228 lines)
+│       ├── prodigy.py                          # Prodigy (136 lines)
+│       ├── grokfast.py                         # Grokfast (145 lines)
+│       ├── lion.py                             # Lion (101 lines)
+│       ├── looksam.py                          # LookSAM (247 lines)
+│       ├── muon.py                             # Muon (210 lines)
+│       └── cuda_graph_optimizer.py             # CUDA graph wrapper (168 lines)
+│   └── csrc/
+│       ├── ops.h                               # C++ declarations (554 lines)
+│       ├── ops.cpp                             # Pybind11 dispatch (1,076 lines)
+│       ├── supergrok2_mamba_peer_kernels.cu    # v2 forward kernels (1,218 lines)
+│       ├── supergrok2_mamba_peer_backward_kernels.cu  # v2 backward kernels (1,963 lines)
+│       ├── supergrok15_kernels.cu              # v1.5 kernels (464 lines)
+│       ├── supergrok11_kernels.cu              # v1.1 kernels (349 lines)
+│       ├── grokadamw_kernels.cu                # GrokAdamW kernels (140 lines)
+│       ├── neuralgrok_kernels.cu               # NeuralGrok kernels (233 lines)
+│       ├── prodigy_kernels.cu                  # Prodigy kernels (254 lines)
+│       ├── grokfast_kernels.cu                 # Grokfast kernels (60 lines)
+│       ├── lion_kernels.cu                     # Lion kernels (79 lines)
+│       ├── looksam_kernels.cu                  # LookSAM kernels (155 lines)
+│       └── muon_kernels.cu                     # Muon kernels (146 lines)
 ```
 
-## Modes
+Total: ~12,400 lines (5,500 Python, 4,500 CUDA, 1,600 C++)
 
-Change `MODE` at bottom of `grokking_race_v2.py`:
+## Configuration
 
-- **A** — Single run (1 model, 1 split, 6 seeds)
-- **B** — Multi-split (1 model, 4 splits × 5 seeds)
-- **C** — Architecture comparison (3 models × 5 seeds)
-- **D** — Full sweep (3 models × 4 splits × 5 seeds = 660 runs)
+Key SuperGrok v2 hyperparameters (defaults):
 
-## Optimizers
-
-AdamW, NeuralGrok, GrokAdamW, SuperGrok (v1.1), **SuperGrok 1.5 (C++/CUDA)**,
-Grokfast, Muon, Lion, LookSAM, Prodigy
-
-## SuperGrok 1.5 — What's New
-
-Three modifications targeting low-data grokking (ft10/ft25):
-
-1. **2D SharpnessMetaNet**: Meta-net sees `(gradient, sharpness)` per element.
-   Sharpness = `|SAM_grad − normal_grad|` — direct signal for memorization
-   (sharp basin) vs generalization (flat basin).
-
-2. **LookSAM integration**: Every 5 steps, compute SAM perturbation to get
-   sharpness direction, cache for intermediate steps. Synced with bilevel.
-
-3. **Progressive weight decay**: `wd_eff = wd × (1 + 4 × σ(20 × (acc − 0.9)))`.
-   Gentle during feature learning, 5× base after full memorization.
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `d_model` | 8 | Meta-net internal dimension |
+| `d_state` | 16 | Mamba state dimension (paired RoPE) |
+| `mamba_expand` | 2 | Expansion factor (d_inner = d_model × expand) |
+| `num_experts` | 144 | Total experts in PEER pool |
+| `expert_hidden` | 16 | Expert MLP hidden dimension |
+| `gru_hidden` | 4 | GRU temporal memory dimension |
+| `num_peer_heads` | 4 | PEER routing heads |
+| `meta_rescale` | 0.1 | Skip connection scale factor |
+| `sam_rho` | 0.05 | SAM perturbation radius |
+| `recycle_interval` | 100 | Steps between dead expert recycling |
 
 ## Multi-GPU
 
-`--gpus 0,1,2,3` spawns one process per GPU. Tasks distributed round-robin.
-Each GPU runs its tasks sequentially with exclusive access — wall-clock
-measurements are uncontested and fair. Without `--gpus`, runs sequentially
-on default device (also fair, just slower).
+`--gpus 0,1,2,3` spawns one process per GPU. Tasks are distributed round-robin with exclusive GPU access for fair wall-clock measurements.
 
-## Building the C++ Extension
+## Requirements
 
-```bash
-cd supergrok15_cpp
-pip install -e .
-python tests.py
-```
-
-Requires PyTorch with CUDA. Falls back to CPU-only ATen ops if CUDA
-unavailable. Falls back to pure Python if extension fails to build entirely.
-
-Set `SUPERGROK_NO_CUDA=1` to force CPU-only build.
+- PyTorch 2.0+ with CUDA support
+- CUDA 11.8 or 12.x
+- GPU architectures: V100 (sm_70), T4 (sm_75), A100 (sm_80), RTX 3090 (sm_86), RTX 4090 (sm_89), H100 (sm_90)
