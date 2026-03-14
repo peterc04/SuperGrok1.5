@@ -25,6 +25,7 @@
 #include <thrust/sequence.h>
 
 constexpr int SG2M_BLOCK = 256;
+constexpr int MAX_D_STATE = 32;
 
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -109,8 +110,8 @@ __global__ void mamba3_scan_kernel(
     float* s_x_branch = smem;           // [d_inner]
 
     // State in registers — load from initial_state if provided
-    float h[32];
-    float h_snap[32]; // snapshot for RoPE (fixes read-after-write)
+    float h[MAX_D_STATE];
+    float h_snap[MAX_D_STATE]; // snapshot for RoPE (fixes read-after-write)
     if (initial_state != nullptr) {
         for (int s = 0; s < d_state; s++) h[s] = initial_state[tid * d_state + s];
     } else {
@@ -118,7 +119,7 @@ __global__ void mamba3_scan_kernel(
     }
 
     const int half_d_state = d_state / 2;
-    float A[32], freq[16];  // freq is d_state/2
+    float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
     for (int s = 0; s < d_state; s++) {
         A[s] = -expf(A_log[tid * d_state + s]);
     }
@@ -147,7 +148,7 @@ __global__ void mamba3_scan_kernel(
         for (int j = 0; j < d_inner; j++) {
             dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
         }
-        float dt_val = logf(1.0f + expf(dt_raw)); // softplus
+        float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw)); // stable softplus
 
         // Snapshot h for RoPE (fixes read-after-write)
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
@@ -442,6 +443,7 @@ __global__ void fused_elem_step_kernel(
         }
 
         int expert_idx = best_a * pk_dim + best_b;
+        if (expert_idx >= num_experts) expert_idx = num_experts - 1;
         if (expert_counts != nullptr)
             atomicAdd(&expert_counts[expert_idx], 1);
 
@@ -527,12 +529,12 @@ __global__ void mamba3_scan_batched_kernel(
     float* s_x_branch = smem;
 
     // State in registers — load from initial_state
-    float h[32], h_snap[32];
+    float h[MAX_D_STATE], h_snap[MAX_D_STATE];
     const float* my_init = initial_states + param_idx * d_inner * d_state;
     for (int s = 0; s < d_state; s++) h[s] = my_init[tid * d_state + s];
 
     const int half_d_state = d_state / 2;
-    float A[32], freq[16];  // freq is d_state/2
+    float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
     for (int s = 0; s < d_state; s++) {
         A[s] = -expf(A_log[tid * d_state + s]);
     }
@@ -560,7 +562,7 @@ __global__ void mamba3_scan_batched_kernel(
         float dt_raw = dt_proj_b[tid];
         for (int j = 0; j < d_inner; j++)
             dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
-        float dt_val = logf(1.0f + expf(dt_raw));
+        float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw)); // stable softplus
 
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
 
@@ -674,12 +676,12 @@ __global__ void mamba3_scan_combined_kernel(
     extern __shared__ float smem[];
     float* s_x_branch = smem;
 
-    float h[32], h_snap[32];
+    float h[MAX_D_STATE], h_snap[MAX_D_STATE];
     const float* my_init = init_states + param_idx * d_inner * d_state;
     for (int s = 0; s < d_state; s++) h[s] = my_init[tid * d_state + s];
 
     const int half_d_state = d_state / 2;
-    float A[32], freq[16];
+    float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
     for (int s = 0; s < d_state; s++)
         A[s] = -expf(A_log_ptr[tid * d_state + s]);
     for (int p = 0; p < half_d_state; p++)
@@ -705,7 +707,7 @@ __global__ void mamba3_scan_combined_kernel(
         float dt_raw = dt_proj_b[tid];
         for (int j = 0; j < d_inner; j++)
             dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
-        float dt_val = logf(1.0f + expf(dt_raw));
+        float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw)); // stable softplus
 
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
 

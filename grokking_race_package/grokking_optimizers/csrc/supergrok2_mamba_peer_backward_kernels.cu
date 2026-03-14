@@ -113,7 +113,7 @@ __global__ void mamba3_scan_fwd_save_kernel(
         for (int j = 0; j < d_inner; j++) {
             dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
         }
-        float dt_val = logf(1.0f + expf(dt_raw));
+        float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw));
         saved_dt[i * d_inner + tid] = dt_val;
 
         // Snapshot h for RoPE (fixes read-after-write)
@@ -260,7 +260,7 @@ __global__ void mamba3_scan_fwd_save_batched_kernel(
         float dt_raw = dt_proj_b[tid];
         for (int j = 0; j < d_inner; j++)
             dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
-        float dt_val = logf(1.0f + expf(dt_raw));
+        float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw));
         my_saved_dt[i * d_inner + tid] = dt_val;
 
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
