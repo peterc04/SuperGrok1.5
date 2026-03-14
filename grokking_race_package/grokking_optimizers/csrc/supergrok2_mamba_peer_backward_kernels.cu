@@ -1249,6 +1249,9 @@ void launch_mamba3_peer_bilevel_fwd_save(
     const int N = grad.numel();
     if (N == 0) return;
 
+    TORCH_CHECK(d_state % 2 == 0, "d_state must be even for paired RoPE (got ", d_state, ")");
+    TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
+
     auto dev = grad.device();
     auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
     auto int_opts = torch::TensorOptions().device(dev).dtype(torch::kInt32);
@@ -1424,6 +1427,9 @@ void launch_mamba3_peer_backward(
 ) {
     const int N = d_smart_grad.numel();
     if (N == 0) return;
+
+    TORCH_CHECK(d_state % 2 == 0, "d_state must be even for paired RoPE (got ", d_state, ")");
+    TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
 
     auto dev = d_smart_grad.device();
     auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
@@ -1682,6 +1688,9 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
     const int num_params = grads.size();
     if (num_params == 0) return;
 
+    TORCH_CHECK(d_state % 2 == 0, "d_state must be even for paired RoPE (got ", d_state, ")");
+    TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
+
     auto dev = grads[0].device();
     auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
     auto int_opts = torch::TensorOptions().device(dev).dtype(torch::kInt32);
@@ -1844,6 +1853,9 @@ void launch_mamba3_peer_backward_batched(
     int d_model, int d_state, int d_inner, int num_params
 ) {
     if (num_params == 0) return;
+
+    TORCH_CHECK(d_state % 2 == 0, "d_state must be even for paired RoPE (got ", d_state, ")");
+    TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
 
     auto dev = d_fwd_scan_out_packed.device();
     auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
