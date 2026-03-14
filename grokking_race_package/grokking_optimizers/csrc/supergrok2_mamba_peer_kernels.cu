@@ -50,8 +50,10 @@ __global__ void input_proj_sort_kernel(
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
 
-    const float g = static_cast<float>(grad[idx]);
-    const float s = static_cast<float>(sharpness[idx]);
+    float g = static_cast<float>(grad[idx]);
+    float s = static_cast<float>(sharpness[idx]);
+    if (!isfinite(g)) g = 0.0f;
+    if (!isfinite(s)) s = 0.0f;
 
     for (int d = 0; d < d_model; d++) {
         x_out[idx * d_model + d] = proj_W[d * 2] * g + proj_W[d * 2 + 1] * s + proj_b[d];
@@ -303,8 +305,11 @@ __global__ void fused_elem_step_kernel(
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
 
-    const float g = static_cast<float>(grad[idx]);
-    const float s = static_cast<float>(sharpness[idx]);
+    float g = static_cast<float>(grad[idx]);
+    float s = static_cast<float>(sharpness[idx]);
+    // Clamp NaN/Inf gradients to zero for robustness
+    if (!isfinite(g)) g = 0.0f;
+    if (!isfinite(s)) s = 0.0f;
     const int half_d = d_model / 2;
     const int peer_input_dim = gru_hidden + 2 * d_model + 2;
 
