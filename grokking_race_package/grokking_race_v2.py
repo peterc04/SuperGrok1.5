@@ -603,7 +603,7 @@ def train_neuralgrok(c, init, tx, ty, vx, vy, dev, bp=0):
     for step in (pb:=_pbar("NeuralGrok",c["max_steps"],bp)):
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             loss=F.cross_entropy(m(ix),iy)
-        opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+        opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt)
         aopt.zero_grad()
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             aloss=c.get("neural_beta",4.0)*F.cross_entropy(m(ox),oy)
@@ -656,10 +656,11 @@ def train_supergrok(c, init, tx, ty, vx, vy, dev, bp=0):
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             logits=m(tx); loss=F.cross_entropy(logits,ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
-        # Check for inf/nan gradients from AMP unscaling
-        _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
-        if _has_inf:
-            scaler.update(); continue
+        # Check for inf/nan gradients from AMP unscaling (skip when AMP disabled)
+        if c.get("use_amp", False):
+            _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
+            if _has_inf:
+                scaler.update(); continue
         train_loss_val=loss.item()
         with torch.no_grad():
             train_acc=(logits.detach()[:,:c["p"]].argmax(-1)==ty).float().mean().item()
@@ -721,10 +722,11 @@ def train_supergrok15(c, init, tx, ty, vx, vy, dev, bp=0):
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             logits=m(tx); loss=F.cross_entropy(logits,ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
-        # Check for inf/nan gradients from AMP unscaling
-        _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
-        if _has_inf:
-            scaler.update(); continue
+        # Check for inf/nan gradients from AMP unscaling (skip when AMP disabled)
+        if c.get("use_amp", False):
+            _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
+            if _has_inf:
+                scaler.update(); continue
         # Adaptive SAM (sigmoid-driven frequency)
         sam_freq_eff=opt._get_effective_sam_freq()
         if sam_freq_eff < 999999 and step%sam_freq_eff==0:
@@ -797,10 +799,11 @@ def train_supergrok2(c, init, tx, ty, vx, vy, dev, bp=0):
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             logits=m(tx); loss=F.cross_entropy(logits,ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
-        # Check for inf/nan gradients from AMP unscaling
-        _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
-        if _has_inf:
-            scaler.update(); continue
+        # Check for inf/nan gradients from AMP unscaling (skip when AMP disabled)
+        if c.get("use_amp", False):
+            _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
+            if _has_inf:
+                scaler.update(); continue
         # Adaptive SAM (sigmoid-driven frequency)
         sam_freq_eff=opt._get_effective_sam_freq()
         if sam_freq_eff < 999999 and step%sam_freq_eff==0:
@@ -903,10 +906,11 @@ def train_looksam(c, init, tx, ty, vx, vy, dev, bp=0):
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
-        # Check for inf/nan gradients from AMP unscaling
-        _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
-        if _has_inf:
-            scaler.update(); continue
+        # Check for inf/nan gradients from AMP unscaling (skip when AMP disabled)
+        if c.get("use_amp", False):
+            _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
+            if _has_inf:
+                scaler.update(); continue
         if opt.should_sam_step():
             opt.sam_step(m, tx, ty, crit_ls)
         opt.step()
