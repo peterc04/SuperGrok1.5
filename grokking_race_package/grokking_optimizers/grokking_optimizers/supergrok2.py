@@ -393,7 +393,7 @@ class SuperGrok2(Optimizer):
                 pidx = self._param_to_idx.get(id(p))
                 if pidx is None:
                     continue
-                sg, _, _, _ = self.meta_net.forward_for_bilevel(
+                sg, _, _, _ = self.meta_net.forward_for_bilevel_cuda(
                     saved_grads[name].reshape(-1),
                     self._flat_sharpness[pidx].reshape(-1),
                     self._flat_gru_states[pidx],

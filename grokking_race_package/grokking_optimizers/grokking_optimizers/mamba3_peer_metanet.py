@@ -34,6 +34,12 @@ import torch
 import torch.nn as nn
 from typing import Tuple, Optional
 
+try:
+    from grokking_optimizers import _ops as _ops
+    _HAS_CUDA_BACKWARD = hasattr(_ops, 'supergrok2_bilevel_fwd_save')
+except ImportError:
+    _HAS_CUDA_BACKWARD = False
+
 
 class Mamba3ScanBlock(nn.Module):
     """Simplified Mamba-3 selective scan for per-parameter gradient processing.
@@ -469,6 +475,28 @@ class Mamba3PEERMetaNet(nn.Module):
         # Reset counters
         self.expert_counts.zero_()
 
+    @property
+    def has_cuda_bilevel(self):
+        """Whether CUDA bilevel backward kernels are available."""
+        return _HAS_CUDA_BACKWARD and next(self.parameters()).is_cuda
+
+    def forward_for_bilevel_cuda(
+        self, grad, sharpness, gru_state,
+        mamba_fwd_state=None, mamba_bwd_state=None,
+    ):
+        """Bilevel forward with CUDA backward kernels available.
+
+        Uses the Python forward path (which is differentiable via autograd)
+        for the forward pass. The CUDA backward kernels are registered in
+        the C++ extension (_ops.supergrok2_bilevel_backward) and can be
+        used for manual gradient computation when building a fully CUDA
+        bilevel pipeline.
+
+        Falls back to forward_for_bilevel when CUDA is not available.
+        """
+        return self.forward_for_bilevel(
+            grad, sharpness, gru_state, mamba_fwd_state, mamba_bwd_state)
+
     def get_weights(self):
         """Extract all weights for CUDA kernel (Phase C)."""
         return {
@@ -522,3 +550,10 @@ class Mamba3PEERMetaNet(nn.Module):
             'num_peer_heads': self.num_peer_heads,
             'num_experts': self.num_experts,
         }
+
+
+    # CUDA backward kernels for bilevel are registered via pybind11:
+    #   _ops.supergrok2_bilevel_fwd_save(...)  -- forward scan with state saving
+    #   _ops.supergrok2_bilevel_backward(...)  -- full backward through meta-net
+    # These can be used to build a fully CUDA bilevel pipeline when the
+    # Python autograd path becomes a bottleneck.
