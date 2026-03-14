@@ -607,45 +607,64 @@ class SuperGrok2(Optimizer):
         d_input_proj_W = torch.zeros_like(w['input_proj_W'])
         d_input_proj_b = torch.zeros_like(w['input_proj_b'])
 
-        # ── Per-parameter CUDA forward-save + Python GRU/PEER ──
-        smart_grads = {}
-        per_param_saved = {}
-
+        # ── Collect active parameters for bilevel ──
+        param_info = []  # (name, p, pidx, grad_flat, sharp_flat, N)
         for name, p in named_params:
             if name not in saved_grads:
                 continue
             pidx = self._param_to_idx.get(id(p))
             if pidx is None:
                 continue
-
             grad_flat = saved_grads[name].reshape(-1).float().contiguous()
             sharp_flat = self._flat_sharpness[pidx].reshape(-1).float().contiguous()
             N = grad_flat.numel()
             if N == 0:
                 continue
+            param_info.append((name, p, pidx, grad_flat, sharp_flat, N))
 
-            # Allocate scan output + saved buffers
-            fwd_scan_out = torch.zeros(N, d_inner, device=device)
-            bwd_scan_out = torch.zeros(N, d_inner, device=device)
-            fwd_final = torch.zeros(d_inner, d_state, device=device)
-            bwd_final = torch.zeros(d_inner, d_state, device=device)
-            fwd_saved_states = torch.zeros(N, d_inner, d_state, device=device)
-            fwd_saved_xb = torch.zeros(N, d_inner, device=device)
-            fwd_saved_z = torch.zeros(N, d_inner, device=device)
-            fwd_saved_dt = torch.zeros(N, d_inner, device=device)
-            bwd_saved_states = torch.zeros(N, d_inner, d_state, device=device)
-            bwd_saved_xb = torch.zeros(N, d_inner, device=device)
-            bwd_saved_z = torch.zeros(N, d_inner, device=device)
-            bwd_saved_dt = torch.zeros(N, d_inner, device=device)
-            x_sorted = torch.zeros(N, d_model, device=device)
-            sort_indices = torch.zeros(N, dtype=torch.int32, device=device)
+        num_bilevel_params = len(param_info)
+        if num_bilevel_params == 0:
+            return 0.0
 
-            # CUDA forward-save: input_proj + sort + bidirectional scan
-            # NOTE: current C++ launcher uses zero initial_state for bilevel scans.
-            # TODO(perf): modify launcher to accept persistent mamba states for
-            # exact match with Python forward_for_bilevel behavior.
-            _ops.supergrok2_bilevel_fwd_save(
-                grad_flat, sharp_flat,
+        use_batched = hasattr(_ops, 'supergrok2_bilevel_fwd_save_batched')
+
+        if use_batched:
+            # ═════════════════════════════════════════════════════════
+            #  BATCHED BILEVEL PATH — single kernel launch per phase
+            # ═════════════════════════════════════════════════════════
+            Ns = [info[5] for info in param_info]
+            total_N = sum(Ns)
+            offsets_list = [0]
+            for n in Ns:
+                offsets_list.append(offsets_list[-1] + n)
+
+            # Stack persistent Mamba states [num_params, d_inner, d_state]
+            fwd_init_states = torch.stack(
+                [self._flat_mamba_fwd_states[info[2]].float().contiguous()
+                 for info in param_info])
+            bwd_init_states = torch.stack(
+                [self._flat_mamba_bwd_states[info[2]].float().contiguous()
+                 for info in param_info])
+
+            # Pre-allocate packed output tensors
+            fwd_scan_out_packed = torch.zeros(total_N, d_inner, device=device)
+            bwd_scan_out_packed = torch.zeros(total_N, d_inner, device=device)
+            fwd_saved_states_p = torch.zeros(total_N, d_inner, d_state, device=device)
+            fwd_saved_xb_p = torch.zeros(total_N, d_inner, device=device)
+            fwd_saved_z_p = torch.zeros(total_N, d_inner, device=device)
+            fwd_saved_dt_p = torch.zeros(total_N, d_inner, device=device)
+            bwd_saved_states_p = torch.zeros(total_N, d_inner, d_state, device=device)
+            bwd_saved_xb_p = torch.zeros(total_N, d_inner, device=device)
+            bwd_saved_z_p = torch.zeros(total_N, d_inner, device=device)
+            bwd_saved_dt_p = torch.zeros(total_N, d_inner, device=device)
+            x_sorted_packed = torch.zeros(total_N, d_model, device=device)
+            offsets_t = torch.zeros(num_bilevel_params + 1, dtype=torch.int32, device=device)
+            sort_indices_packed = torch.zeros(total_N, dtype=torch.int32, device=device)
+
+            # 1a. Single batched forward-save call
+            _ops.supergrok2_bilevel_fwd_save_batched(
+                [info[3] for info in param_info],
+                [info[4] for info in param_info],
                 w['input_proj_W'], w['input_proj_b'],
                 w['mamba_fwd_in_proj'], w['mamba_fwd_dt_proj_W'],
                 w['mamba_fwd_dt_proj_b'], w['mamba_fwd_B_proj'],
@@ -658,214 +677,552 @@ class SuperGrok2(Optimizer):
                 w['mamba_bwd_D'], w['mamba_bwd_rope_freq'],
                 w['mamba_bwd_out_proj'],
                 d_model, d_state, d_inner,
-                fwd_scan_out, bwd_scan_out,
-                fwd_final, bwd_final,
-                fwd_saved_states, fwd_saved_xb, fwd_saved_z, fwd_saved_dt,
-                bwd_saved_states, bwd_saved_xb, bwd_saved_z, bwd_saved_dt,
-                x_sorted, sort_indices,
+                fwd_scan_out_packed, bwd_scan_out_packed,
+                fwd_saved_states_p, fwd_saved_xb_p,
+                fwd_saved_z_p, fwd_saved_dt_p,
+                bwd_saved_states_p, bwd_saved_xb_p,
+                bwd_saved_z_p, bwd_saved_dt_p,
+                x_sorted_packed, offsets_t,
+                sort_indices_packed,
+                fwd_init_states, bwd_init_states,
             )
 
-            # Apply out_proj: scan_out [N, d_inner] → context [N, d_model]
-            fwd_ctx_sorted = fwd_scan_out @ w['mamba_fwd_out_proj'].T
-            # bwd scan output is in reversed-sorted order; apply out_proj then flip
-            bwd_ctx_reversed = bwd_scan_out @ w['mamba_bwd_out_proj'].T
-            bwd_ctx_sorted = bwd_ctx_reversed.flip(0)
+            # 1b. Per-parameter GRU + PEER forward (using packed scan outputs)
+            smart_grads = {}
+            per_param_fwd = {}
 
-            # Unsort to original element order
-            sort_idx_long = sort_indices.long()
-            unsort_idx = sort_idx_long.argsort()
-            fwd_ctx = fwd_ctx_sorted[unsort_idx]
-            bwd_ctx = bwd_ctx_sorted[unsort_idx]
+            for idx, (name, p, pidx, grad_flat, sharp_flat, N) in enumerate(param_info):
+                start = offsets_list[idx]
 
-            g = grad_flat
-            s = sharp_flat
+                fwd_scan_out = fwd_scan_out_packed[start:start+N]
+                bwd_scan_out = bwd_scan_out_packed[start:start+N]
+                sort_indices = sort_indices_packed[start:start+N]
 
-            # ── GRU forward (manual, saving intermediates) ──
-            gru_inp = torch.cat([
-                g.unsqueeze(-1), s.unsqueeze(-1), fwd_ctx, bwd_ctx
-            ], dim=-1)  # [N, gru_input_dim]
-            h_old = self._flat_gru_states[pidx].float()  # [N, gru_hidden]
-            xh = torch.cat([gru_inp, h_old], dim=-1)  # [N, gru_input_dim + gru_hidden]
-            z_gate = torch.sigmoid(xh @ gru_Wz.T + gru_bz)
-            r_gate = torch.sigmoid(xh @ gru_Wr.T + gru_br)
-            xrh = torch.cat([gru_inp, r_gate * h_old], dim=-1)
-            h_tilde = torch.tanh(xrh @ gru_Wh.T + gru_bh)
-            h_new = (1 - z_gate) * h_old + z_gate * h_tilde
+                fwd_ctx_sorted = fwd_scan_out @ w['mamba_fwd_out_proj'].T
+                bwd_ctx_reversed = bwd_scan_out @ w['mamba_bwd_out_proj'].T
+                bwd_ctx_sorted = bwd_ctx_reversed.flip(0)
 
-            # ── PEER routing + expert MLP forward (saving intermediates) ──
-            peer_inp = torch.cat([
-                h_new, fwd_ctx, bwd_ctx, g.unsqueeze(-1), s.unsqueeze(-1)
-            ], dim=-1)  # [N, peer_input_dim]
+                sort_idx_long = sort_indices.long()
+                unsort_idx = sort_idx_long.argsort()
+                fwd_ctx = fwd_ctx_sorted[unsort_idx]
+                bwd_ctx = bwd_ctx_sorted[unsort_idx]
 
-            all_expert_indices = torch.zeros(
-                N, num_heads, num_active, dtype=torch.int32, device=device)
-            all_routing_weights = torch.zeros(
-                N, num_heads, num_active, device=device)
-            all_z_hidden = torch.zeros(
-                N, num_heads, num_active, expert_hidden, device=device)
-            all_scores_a = torch.zeros(N, num_heads, pk_dim, device=device)
-            all_scores_b = torch.zeros(N, num_heads, pk_dim, device=device)
-            all_top_a_idx = torch.zeros(
-                N, num_heads, topk, dtype=torch.int32, device=device)
-            all_top_b_idx = torch.zeros(
-                N, num_heads, topk, dtype=torch.int32, device=device)
-            all_soft_a = torch.zeros(N, num_heads, topk, device=device)
-            all_soft_b = torch.zeros(N, num_heads, topk, device=device)
+                g = grad_flat
+                s = sharp_flat
 
-            total_expert_out = torch.zeros(N, device=device)
+                # GRU forward
+                gru_inp = torch.cat([
+                    g.unsqueeze(-1), s.unsqueeze(-1), fwd_ctx, bwd_ctx
+                ], dim=-1)
+                h_old = self._flat_gru_states[pidx].float()
+                xh = torch.cat([gru_inp, h_old], dim=-1)
+                z_gate = torch.sigmoid(xh @ gru_Wz.T + gru_bz)
+                r_gate = torch.sigmoid(xh @ gru_Wr.T + gru_br)
+                xrh = torch.cat([gru_inp, r_gate * h_old], dim=-1)
+                h_tilde = torch.tanh(xrh @ gru_Wh.T + gru_bh)
+                h_new = (1 - z_gate) * h_old + z_gate * h_tilde
 
-            for h in range(num_heads):
-                query = peer_inp @ peer_query_Ws[h].T  # [N, d_model]
-                q_a = query[:, :half_d]
-                q_b = query[:, half_d:]
+                # PEER routing + expert MLP forward
+                peer_inp = torch.cat([
+                    h_new, fwd_ctx, bwd_ctx, g.unsqueeze(-1), s.unsqueeze(-1)
+                ], dim=-1)
 
-                scores_a = q_a @ prod_keys_A[h].T  # [N, pk_dim]
-                scores_b = q_b @ prod_keys_B[h].T
-                all_scores_a[:, h] = scores_a
-                all_scores_b[:, h] = scores_b
+                all_expert_indices = torch.zeros(
+                    N, num_heads, num_active, dtype=torch.int32, device=device)
+                all_routing_weights = torch.zeros(
+                    N, num_heads, num_active, device=device)
+                all_z_hidden = torch.zeros(
+                    N, num_heads, num_active, expert_hidden, device=device)
+                total_expert_out = torch.zeros(N, device=device)
 
-                top_a_vals, top_a_idx = scores_a.topk(topk, dim=-1)
-                top_b_vals, top_b_idx = scores_b.topk(topk, dim=-1)
-                all_top_a_idx[:, h] = top_a_idx.int()
-                all_top_b_idx[:, h] = top_b_idx.int()
+                for h in range(num_heads):
+                    query = peer_inp @ peer_query_Ws[h].T
+                    q_a = query[:, :half_d]
+                    q_b = query[:, half_d:]
+                    scores_a = q_a @ prod_keys_A[h].T
+                    scores_b = q_b @ prod_keys_B[h].T
+                    top_a_vals, top_a_idx = scores_a.topk(topk, dim=-1)
+                    top_b_vals, top_b_idx = scores_b.topk(topk, dim=-1)
+                    soft_a = torch.softmax(top_a_vals * 10.0, dim=-1)
+                    soft_b = torch.softmax(top_b_vals * 10.0, dim=-1)
+                    expert_idx = (
+                        top_a_idx.unsqueeze(2) * pk_dim + top_b_idx.unsqueeze(1)
+                    ).reshape(N, num_active)
+                    routing_w = (
+                        soft_a.unsqueeze(2) * soft_b.unsqueeze(1)
+                    ).reshape(N, num_active)
+                    all_expert_indices[:, h] = expert_idx.int()
+                    all_routing_weights[:, h] = routing_w
 
-                soft_a = torch.softmax(top_a_vals * 10.0, dim=-1)
-                soft_b = torch.softmax(top_b_vals * 10.0, dim=-1)
-                all_soft_a[:, h] = soft_a
-                all_soft_b[:, h] = soft_b
+                    ew1 = expert_W1_flat[expert_idx.long()]
+                    eb1_sel = expert_b1[expert_idx.long()]
+                    ew2 = expert_W2_flat[expert_idx.long()]
+                    eb2_sel = expert_b2_flat[expert_idx.long()]
+                    g_exp = g.unsqueeze(-1).unsqueeze(1).expand(-1, num_active, -1)
+                    z_hidden = torch.relu(ew1 * g_exp + eb1_sel)
+                    all_z_hidden[:, h] = z_hidden
+                    out_k = (ew2 * z_hidden).sum(-1) + eb2_sel
+                    head_out = (routing_w * out_k).sum(-1)
+                    total_expert_out = total_expert_out + head_out / num_heads
 
-                expert_idx = (
-                    top_a_idx.unsqueeze(2) * pk_dim + top_b_idx.unsqueeze(1)
-                ).reshape(N, num_active)
-                routing_w = (
-                    soft_a.unsqueeze(2) * soft_b.unsqueeze(1)
-                ).reshape(N, num_active)
-                all_expert_indices[:, h] = expert_idx.int()
-                all_routing_weights[:, h] = routing_w
+                smart_grad = g + rescale * total_expert_out
+                smart_grads[name] = smart_grad.reshape(saved_grads[name].shape)
 
-                # Vectorized expert MLP
-                ew1 = expert_W1_flat[expert_idx.long()]  # [N, num_active, H]
-                eb1_sel = expert_b1[expert_idx.long()]
-                ew2 = expert_W2_flat[expert_idx.long()]
-                eb2_sel = expert_b2_flat[expert_idx.long()]  # [N, num_active]
+                per_param_fwd[name] = {
+                    'sort_indices': sort_indices, 'unsort_idx': unsort_idx,
+                    'fwd_scan_out': fwd_scan_out, 'bwd_scan_out': bwd_scan_out,
+                    'gru_input': gru_inp.contiguous(),
+                    'gru_h_old': h_old.contiguous(),
+                    'gru_z_gate': z_gate.contiguous(),
+                    'gru_r_gate': r_gate.contiguous(),
+                    'gru_h_tilde': h_tilde.contiguous(),
+                    'peer_input': peer_inp.contiguous(),
+                    'expert_indices': all_expert_indices.contiguous(),
+                    'routing_weights': all_routing_weights.contiguous(),
+                    'saved_z_hidden': all_z_hidden.contiguous(),
+                    'grad_flat': grad_flat, 'sharp_flat': sharp_flat,
+                }
 
-                g_exp = g.unsqueeze(-1).unsqueeze(1).expand(-1, num_active, -1)
-                z_hidden = torch.relu(ew1 * g_exp + eb1_sel)  # [N, active, H]
-                all_z_hidden[:, h] = z_hidden
-                out_k = (ew2 * z_hidden).sum(-1) + eb2_sel  # [N, active]
-                head_out = (routing_w * out_k).sum(-1)  # [N]
-                total_expert_out = total_expert_out + head_out / num_heads
+            # 2. Compute validation gradients
+            model.zero_grad()
+            with torch.enable_grad():
+                val_loss = criterion(model(val_x), val_y)
+                val_loss.backward()
 
-            smart_grad = g + rescale * total_expert_out
-            smart_grads[name] = smart_grad.reshape(saved_grads[name].shape)
+            # 3. Per-parameter backward through expert/PEER/GRU/out_proj
+            #    → pack d_fwd/bwd_scan_out for batched scan backward
+            d_fwd_scan_packed = torch.zeros(total_N, d_inner, device=device)
+            d_bwd_scan_packed = torch.zeros(total_N, d_inner, device=device)
 
-            per_param_saved[name] = {
-                'sort_indices': sort_indices, 'x_sorted': x_sorted,
-                'fwd_scan_out': fwd_scan_out, 'bwd_scan_out': bwd_scan_out,
-                'fwd_saved_states': fwd_saved_states,
-                'fwd_saved_xb': fwd_saved_xb,
-                'fwd_saved_z': fwd_saved_z,
-                'fwd_saved_dt': fwd_saved_dt,
-                'bwd_saved_states': bwd_saved_states,
-                'bwd_saved_xb': bwd_saved_xb,
-                'bwd_saved_z': bwd_saved_z,
-                'bwd_saved_dt': bwd_saved_dt,
-                'gru_input': gru_inp.contiguous(),
-                'gru_h_old': h_old.contiguous(),
-                'gru_z_gate': z_gate.contiguous(),
-                'gru_r_gate': r_gate.contiguous(),
-                'gru_h_tilde': h_tilde.contiguous(),
-                'peer_input': peer_inp.contiguous(),
-                'expert_indices': all_expert_indices.contiguous(),
-                'routing_weights': all_routing_weights.contiguous(),
-                'saved_z_hidden': all_z_hidden.contiguous(),
-                'saved_scores_a': all_scores_a.contiguous(),
-                'saved_scores_b': all_scores_b.contiguous(),
-                'saved_top_a_idx': all_top_a_idx.contiguous(),
-                'saved_top_b_idx': all_top_b_idx.contiguous(),
-                'saved_soft_a': all_soft_a.contiguous(),
-                'saved_soft_b': all_soft_b.contiguous(),
-                'grad_flat': grad_flat, 'sharp_flat': sharp_flat,
-            }
+            for idx, (name, p, pidx, grad_flat, sharp_flat, N) in enumerate(param_info):
+                if p.grad is None:
+                    continue
+                start = offsets_list[idx]
+                sv = per_param_fwd[name]
 
-        # 2. Compute validation gradients
-        model.zero_grad()
-        with torch.enable_grad():
-            val_loss = criterion(model(val_x), val_y)
-            val_loss.backward()
+                vg = p.grad.detach().reshape(-1).float()
+                vg_norm = vg.norm()
+                vg_unit = vg / vg_norm if vg_norm > 1e-12 else vg
+                d_smart = -vg_unit
 
-        # 3-4. Per-parameter: d_smart_grad → CUDA backward → accumulate grads
-        for name, p in named_params:
-            if name not in per_param_saved or p.grad is None:
-                continue
+                # Expert/PEER backward
+                d_expert_out = d_smart * rescale  # [N]
+                d_peer_input = torch.zeros(N, peer_input_dim, device=device)
 
-            vg = p.grad.detach().reshape(-1).float()
-            vg_norm = vg.norm()
-            vg_unit = vg / vg_norm if vg_norm > 1e-12 else vg
-            d_smart_grad = -vg_unit
-            sv = per_param_saved[name]
+                for h in range(num_heads):
+                    eidx = sv['expert_indices'][:, h].long()  # [N, K²]
+                    rw = sv['routing_weights'][:, h]           # [N, K²]
+                    zh = sv['saved_z_hidden'][:, h]            # [N, K², H]
+                    ew2 = expert_W2_flat[eidx]                 # [N, K², H]
+                    eb2_sel = expert_b2_flat[eidx]             # [N, K²]
+                    ew1 = expert_W1_flat[eidx]                 # [N, K², H]
 
-            # Empty init states — matches zero init used in fwd_save
-            empty_state = torch.empty(0, device=device, dtype=torch.float32)
+                    # Recompute out_k for routing gradient
+                    out_k = (ew2 * zh).sum(-1) + eb2_sel       # [N, K²]
 
-            _ops.supergrok2_bilevel_backward(
-                # Upstream gradient + original inputs
-                d_smart_grad, sv['grad_flat'], sv['sharp_flat'], rescale,
-                # Saved from forward: sort + scan
-                sv['sort_indices'], sv['x_sorted'],
-                sv['fwd_scan_out'], sv['bwd_scan_out'],
-                sv['fwd_saved_states'], sv['fwd_saved_xb'],
-                sv['fwd_saved_z'], sv['fwd_saved_dt'],
-                sv['bwd_saved_states'], sv['bwd_saved_xb'],
-                sv['bwd_saved_z'], sv['bwd_saved_dt'],
-                # GRU intermediates
-                sv['gru_input'], sv['gru_h_old'],
-                sv['gru_z_gate'], sv['gru_r_gate'], sv['gru_h_tilde'],
-                # PEER intermediates
-                sv['peer_input'],
-                sv['expert_indices'], sv['routing_weights'],
-                sv['saved_z_hidden'],
-                sv['saved_scores_a'], sv['saved_scores_b'],
-                sv['saved_top_a_idx'], sv['saved_top_b_idx'],
-                sv['saved_soft_a'], sv['saved_soft_b'],
-                # Weights (read-only)
+                    d_head = d_expert_out / num_heads          # [N]
+                    d_out_k = d_head.unsqueeze(-1) * rw        # [N, K²]
+                    d_rw = d_head.unsqueeze(-1) * out_k        # [N, K²]
+
+                    # Expert MLP backward
+                    d_eb2 = d_out_k
+                    d_ew2_zh = d_out_k.unsqueeze(-1).expand_as(zh)
+                    d_ew2 = d_ew2_zh * zh
+                    d_zh = d_ew2_zh * ew2
+                    relu_mask = (zh > 0).float()
+                    d_pre_relu = d_zh * relu_mask
+                    d_ew1 = d_pre_relu * grad_flat.unsqueeze(-1).unsqueeze(1).expand_as(d_pre_relu)
+                    d_eb1 = d_pre_relu
+
+                    # Accumulate expert weight gradients
+                    eidx_flat = eidx.reshape(-1)
+                    d_expert_W1.index_add_(0, eidx_flat, d_ew1.reshape(-1, expert_hidden))
+                    d_expert_b1.index_add_(0, eidx_flat, d_eb1.reshape(-1, expert_hidden))
+                    d_expert_W2.index_add_(0, eidx_flat, d_ew2.reshape(-1, expert_hidden))
+                    d_expert_b2.index_add_(0, eidx_flat, d_eb2.reshape(-1))
+
+                    # Routing backward → product-key softmax → query → peer_input
+                    # Recompute soft_a, soft_b from scores
+                    query = sv['peer_input'] @ peer_query_Ws[h].T
+                    q_a = query[:, :half_d]
+                    q_b = query[:, half_d:]
+                    scores_a = q_a @ prod_keys_A[h].T
+                    scores_b = q_b @ prod_keys_B[h].T
+                    top_a_vals, top_a_idx = scores_a.topk(topk, dim=-1)
+                    top_b_vals, top_b_idx = scores_b.topk(topk, dim=-1)
+                    soft_a = torch.softmax(top_a_vals * 10.0, dim=-1)
+                    soft_b = torch.softmax(top_b_vals * 10.0, dim=-1)
+
+                    # routing_w = soft_a[:, :, None] * soft_b[:, None, :]
+                    # d_soft_a = sum_j(d_rw[i,j] * soft_b[j])
+                    # d_soft_b = sum_i(d_rw[i,j] * soft_a[i])
+                    d_rw_reshaped = d_rw.reshape(N, topk, topk)
+                    d_soft_a = (d_rw_reshaped * soft_b.unsqueeze(1)).sum(-1)
+                    d_soft_b = (d_rw_reshaped * soft_a.unsqueeze(2)).sum(-2)
+
+                    # softmax backward: d_pre = soft * (d - sum(soft*d))
+                    sa_dot = (soft_a * d_soft_a).sum(-1, keepdim=True)
+                    d_top_a = soft_a * (d_soft_a - sa_dot) * 10.0
+                    sb_dot = (soft_b * d_soft_b).sum(-1, keepdim=True)
+                    d_top_b = soft_b * (d_soft_b - sb_dot) * 10.0
+
+                    # topk backward: scatter into full score gradients
+                    d_scores_a = torch.zeros(N, pk_dim, device=device)
+                    d_scores_b = torch.zeros(N, pk_dim, device=device)
+                    d_scores_a.scatter_add_(1, top_a_idx, d_top_a)
+                    d_scores_b.scatter_add_(1, top_b_idx, d_top_b)
+
+                    # scores = q @ keys.T → d_q, d_keys
+                    d_q_a = d_scores_a @ prod_keys_A[h]
+                    d_q_b = d_scores_b @ prod_keys_B[h]
+                    d_prod_keys_A[h].addmm_(d_scores_a.T, q_a)
+                    d_prod_keys_B[h].addmm_(d_scores_b.T, q_b)
+
+                    d_query = torch.cat([d_q_a, d_q_b], dim=-1)
+                    d_peer_query_Ws[h].addmm_(d_query.T, sv['peer_input'])
+                    d_peer_input.addmm_(d_query, peer_query_Ws[h])
+
+                # GRU backward
+                d_gru_out = d_peer_input[:, :gru_hidden]
+                d_h_new = d_gru_out
+
+                z_g = sv['gru_z_gate']
+                r_g = sv['gru_r_gate']
+                h_til = sv['gru_h_tilde']
+                h_o = sv['gru_h_old']
+                gru_in = sv['gru_input']
+                xh = torch.cat([gru_in, h_o], dim=-1)
+
+                d_z = d_h_new * (h_til - h_o)
+                d_h_tilde = d_h_new * z_g
+                d_h_old = d_h_new * (1 - z_g)
+
+                d_pre_tanh = d_h_tilde * (1 - h_til ** 2)
+                xrh = torch.cat([gru_in, r_g * h_o], dim=-1)
+                d_Wh_contrib = d_pre_tanh.T @ xrh
+                d_gru_Wh.add_(d_Wh_contrib)
+                d_gru_bh.add_(d_pre_tanh.sum(0))
+                d_xrh = d_pre_tanh @ gru_Wh
+                d_gru_inp_1 = d_xrh[:, :gru_input_dim]
+                d_r_h_old = d_xrh[:, gru_input_dim:]
+                d_r = d_r_h_old * h_o
+                d_h_old = d_h_old + d_r_h_old * r_g
+
+                d_pre_r = d_r * r_g * (1 - r_g)
+                d_gru_Wr.add_(d_pre_r.T @ xh)
+                d_gru_br.add_(d_pre_r.sum(0))
+                d_xh_r = d_pre_r @ gru_Wr
+
+                d_pre_z = d_z * z_g * (1 - z_g)
+                d_gru_Wz.add_(d_pre_z.T @ xh)
+                d_gru_bz.add_(d_pre_z.sum(0))
+                d_xh_z = d_pre_z @ gru_Wz
+
+                d_xh_total = d_xh_r + d_xh_z
+                d_gru_inp_2 = d_xh_total[:, :gru_input_dim]
+
+                d_gru_input = d_gru_inp_1 + d_gru_inp_2
+
+                # Combine d_fwd_ctx, d_bwd_ctx from GRU + PEER inputs
+                d_fwd_ctx = (d_gru_input[:, 2:2+d_model]
+                             + d_peer_input[:, gru_hidden:gru_hidden+d_model])
+                d_bwd_ctx = (d_gru_input[:, 2+d_model:2+2*d_model]
+                             + d_peer_input[:, gru_hidden+d_model:gru_hidden+2*d_model])
+
+                # Re-sort for out_proj backward
+                sort_idx_long = sv['sort_indices'].long()
+                d_fwd_sorted = d_fwd_ctx.index_select(0, sort_idx_long)
+                d_bwd_sorted = d_bwd_ctx.index_select(0, sort_idx_long).flip(0)
+
+                # Out-proj backward: ctx = scan_out @ out_proj.T
+                # d_scan_out = d_ctx @ out_proj; d_out_proj += scan_out.T @ d_ctx
+                d_fwd_scan = d_fwd_sorted @ w['mamba_fwd_out_proj']
+                d_mamba_fwd_out_proj.addmm_(sv['fwd_scan_out'].T, d_fwd_sorted)
+                d_bwd_scan = d_bwd_sorted @ w['mamba_bwd_out_proj']
+                d_mamba_bwd_out_proj.addmm_(sv['bwd_scan_out'].T, d_bwd_sorted)
+
+                # Pack into batched tensors
+                d_fwd_scan_packed[start:start+N] = d_fwd_scan
+                d_bwd_scan_packed[start:start+N] = d_bwd_scan
+
+            # 4. Single batched backward scan call
+            d_x_sorted_packed = torch.zeros(total_N, d_model, device=device)
+            _ops.supergrok2_bilevel_backward_batched(
+                d_fwd_scan_packed, d_bwd_scan_packed,
+                x_sorted_packed,
+                fwd_saved_states_p, fwd_saved_xb_p,
+                fwd_saved_z_p, fwd_saved_dt_p,
+                bwd_saved_states_p, bwd_saved_xb_p,
+                bwd_saved_z_p, bwd_saved_dt_p,
+                offsets_t,
                 w['mamba_fwd_in_proj'], w['mamba_fwd_dt_proj_W'],
                 w['mamba_fwd_dt_proj_b'], w['mamba_fwd_B_proj'],
                 w['mamba_fwd_C_proj'], w['mamba_fwd_A_log'],
                 w['mamba_fwd_D'], w['mamba_fwd_rope_freq'],
-                w['mamba_fwd_out_proj'],
                 w['mamba_bwd_in_proj'], w['mamba_bwd_dt_proj_W'],
                 w['mamba_bwd_dt_proj_b'], w['mamba_bwd_B_proj'],
                 w['mamba_bwd_C_proj'], w['mamba_bwd_A_log'],
                 w['mamba_bwd_D'], w['mamba_bwd_rope_freq'],
-                w['mamba_bwd_out_proj'],
-                gru_Wz, gru_Wr, gru_Wh,
-                peer_query_Ws, prod_keys_A, prod_keys_B,
-                expert_W1_flat, expert_W2_flat,
-                w['expert_b1'], expert_b2_flat,
-                w['input_proj_W'],
-                # Mamba initial states (empty = zero, matching fwd_save)
-                empty_state, empty_state,
-                # Gradient accumulators (accumulated via atomicAdd in CUDA)
                 d_mamba_fwd_in_proj, d_mamba_fwd_dt_W,
                 d_mamba_fwd_dt_b, d_mamba_fwd_B_proj,
                 d_mamba_fwd_C_proj, d_mamba_fwd_A_log,
-                d_mamba_fwd_D, d_mamba_fwd_rope, d_mamba_fwd_out_proj,
+                d_mamba_fwd_D, d_mamba_fwd_rope,
                 d_mamba_bwd_in_proj, d_mamba_bwd_dt_W,
                 d_mamba_bwd_dt_b, d_mamba_bwd_B_proj,
                 d_mamba_bwd_C_proj, d_mamba_bwd_A_log,
-                d_mamba_bwd_D, d_mamba_bwd_rope, d_mamba_bwd_out_proj,
-                d_gru_Wz, d_gru_bz, d_gru_Wr, d_gru_br,
-                d_gru_Wh, d_gru_bh,
-                d_peer_query_Ws, d_prod_keys_A, d_prod_keys_B,
-                d_expert_W1, d_expert_b1, d_expert_W2, d_expert_b2,
-                d_input_proj_W, d_input_proj_b,
-                # Dimensions
-                d_model, d_state, d_inner,
-                gru_hidden, gru_input_dim,
-                num_heads, topk, pk_dim,
-                expert_hidden, peer_input_dim, num_experts,
+                d_mamba_bwd_D, d_mamba_bwd_rope,
+                d_x_sorted_packed,
+                fwd_init_states, bwd_init_states,
+                d_model, d_state, d_inner, num_bilevel_params,
             )
+
+            # 5. Per-parameter input_proj backward from d_x_sorted
+            for idx, (name, p, pidx, grad_flat, sharp_flat, N) in enumerate(param_info):
+                start = offsets_list[idx]
+                sv = per_param_fwd.get(name)
+                if sv is None:
+                    continue
+
+                d_x_sorted = d_x_sorted_packed[start:start+N]
+                unsort_idx = sv['unsort_idx']
+                d_x_unsorted = d_x_sorted.index_select(0, unsort_idx)
+
+                # input_proj: x = [g, s] @ W.T + b → d_W += d_x.T @ [g, s], d_b += d_x.sum(0)
+                gs = torch.stack([grad_flat, sharp_flat], dim=-1)  # [N, 2]
+                d_input_proj_W.addmm_(d_x_unsorted.T, gs)
+                d_input_proj_b.add_(d_x_unsorted.sum(0))
+
+        else:
+            # ═════════════════════════════════════════════════════════
+            #  SERIAL BILEVEL FALLBACK — per-parameter kernel launches
+            # ═════════════════════════════════════════════════════════
+            smart_grads = {}
+            per_param_saved = {}
+
+            for idx, (name, p, pidx, grad_flat, sharp_flat, N) in enumerate(param_info):
+                # Allocate scan output + saved buffers
+                fwd_scan_out = torch.zeros(N, d_inner, device=device)
+                bwd_scan_out = torch.zeros(N, d_inner, device=device)
+                fwd_final = torch.zeros(d_inner, d_state, device=device)
+                bwd_final = torch.zeros(d_inner, d_state, device=device)
+                fwd_saved_states = torch.zeros(N, d_inner, d_state, device=device)
+                fwd_saved_xb = torch.zeros(N, d_inner, device=device)
+                fwd_saved_z = torch.zeros(N, d_inner, device=device)
+                fwd_saved_dt = torch.zeros(N, d_inner, device=device)
+                bwd_saved_states = torch.zeros(N, d_inner, d_state, device=device)
+                bwd_saved_xb = torch.zeros(N, d_inner, device=device)
+                bwd_saved_z = torch.zeros(N, d_inner, device=device)
+                bwd_saved_dt = torch.zeros(N, d_inner, device=device)
+                x_sorted = torch.zeros(N, d_model, device=device)
+                sort_indices = torch.zeros(N, dtype=torch.int32, device=device)
+
+                # Pass persistent Mamba states (not zeros)
+                fwd_init = self._flat_mamba_fwd_states[pidx].float().contiguous()
+                bwd_init = self._flat_mamba_bwd_states[pidx].float().contiguous()
+
+                _ops.supergrok2_bilevel_fwd_save(
+                    grad_flat, sharp_flat,
+                    w['input_proj_W'], w['input_proj_b'],
+                    w['mamba_fwd_in_proj'], w['mamba_fwd_dt_proj_W'],
+                    w['mamba_fwd_dt_proj_b'], w['mamba_fwd_B_proj'],
+                    w['mamba_fwd_C_proj'], w['mamba_fwd_A_log'],
+                    w['mamba_fwd_D'], w['mamba_fwd_rope_freq'],
+                    w['mamba_fwd_out_proj'],
+                    w['mamba_bwd_in_proj'], w['mamba_bwd_dt_proj_W'],
+                    w['mamba_bwd_dt_proj_b'], w['mamba_bwd_B_proj'],
+                    w['mamba_bwd_C_proj'], w['mamba_bwd_A_log'],
+                    w['mamba_bwd_D'], w['mamba_bwd_rope_freq'],
+                    w['mamba_bwd_out_proj'],
+                    d_model, d_state, d_inner,
+                    fwd_scan_out, bwd_scan_out,
+                    fwd_final, bwd_final,
+                    fwd_saved_states, fwd_saved_xb, fwd_saved_z, fwd_saved_dt,
+                    bwd_saved_states, bwd_saved_xb, bwd_saved_z, bwd_saved_dt,
+                    x_sorted, sort_indices,
+                    fwd_init, bwd_init,
+                )
+
+                fwd_ctx_sorted = fwd_scan_out @ w['mamba_fwd_out_proj'].T
+                bwd_ctx_reversed = bwd_scan_out @ w['mamba_bwd_out_proj'].T
+                bwd_ctx_sorted = bwd_ctx_reversed.flip(0)
+
+                sort_idx_long = sort_indices.long()
+                unsort_idx = sort_idx_long.argsort()
+                fwd_ctx = fwd_ctx_sorted[unsort_idx]
+                bwd_ctx = bwd_ctx_sorted[unsort_idx]
+
+                g = grad_flat
+                s = sharp_flat
+
+                # GRU forward
+                gru_inp = torch.cat([
+                    g.unsqueeze(-1), s.unsqueeze(-1), fwd_ctx, bwd_ctx
+                ], dim=-1)
+                h_old = self._flat_gru_states[pidx].float()
+                xh = torch.cat([gru_inp, h_old], dim=-1)
+                z_gate = torch.sigmoid(xh @ gru_Wz.T + gru_bz)
+                r_gate = torch.sigmoid(xh @ gru_Wr.T + gru_br)
+                xrh = torch.cat([gru_inp, r_gate * h_old], dim=-1)
+                h_tilde = torch.tanh(xrh @ gru_Wh.T + gru_bh)
+                h_new = (1 - z_gate) * h_old + z_gate * h_tilde
+
+                # PEER routing + expert MLP forward
+                peer_inp = torch.cat([
+                    h_new, fwd_ctx, bwd_ctx, g.unsqueeze(-1), s.unsqueeze(-1)
+                ], dim=-1)
+
+                all_expert_indices = torch.zeros(
+                    N, num_heads, num_active, dtype=torch.int32, device=device)
+                all_routing_weights = torch.zeros(
+                    N, num_heads, num_active, device=device)
+                all_z_hidden = torch.zeros(
+                    N, num_heads, num_active, expert_hidden, device=device)
+                all_scores_a = torch.zeros(N, num_heads, pk_dim, device=device)
+                all_scores_b = torch.zeros(N, num_heads, pk_dim, device=device)
+                all_top_a_idx = torch.zeros(
+                    N, num_heads, topk, dtype=torch.int32, device=device)
+                all_top_b_idx = torch.zeros(
+                    N, num_heads, topk, dtype=torch.int32, device=device)
+                all_soft_a = torch.zeros(N, num_heads, topk, device=device)
+                all_soft_b = torch.zeros(N, num_heads, topk, device=device)
+                total_expert_out = torch.zeros(N, device=device)
+
+                for h in range(num_heads):
+                    query = peer_inp @ peer_query_Ws[h].T
+                    q_a = query[:, :half_d]
+                    q_b = query[:, half_d:]
+                    scores_a = q_a @ prod_keys_A[h].T
+                    scores_b = q_b @ prod_keys_B[h].T
+                    all_scores_a[:, h] = scores_a
+                    all_scores_b[:, h] = scores_b
+                    top_a_vals, top_a_idx = scores_a.topk(topk, dim=-1)
+                    top_b_vals, top_b_idx = scores_b.topk(topk, dim=-1)
+                    all_top_a_idx[:, h] = top_a_idx.int()
+                    all_top_b_idx[:, h] = top_b_idx.int()
+                    soft_a = torch.softmax(top_a_vals * 10.0, dim=-1)
+                    soft_b = torch.softmax(top_b_vals * 10.0, dim=-1)
+                    all_soft_a[:, h] = soft_a
+                    all_soft_b[:, h] = soft_b
+                    expert_idx = (
+                        top_a_idx.unsqueeze(2) * pk_dim + top_b_idx.unsqueeze(1)
+                    ).reshape(N, num_active)
+                    routing_w = (
+                        soft_a.unsqueeze(2) * soft_b.unsqueeze(1)
+                    ).reshape(N, num_active)
+                    all_expert_indices[:, h] = expert_idx.int()
+                    all_routing_weights[:, h] = routing_w
+
+                    ew1 = expert_W1_flat[expert_idx.long()]
+                    eb1_sel = expert_b1[expert_idx.long()]
+                    ew2 = expert_W2_flat[expert_idx.long()]
+                    eb2_sel = expert_b2_flat[expert_idx.long()]
+                    g_exp = g.unsqueeze(-1).unsqueeze(1).expand(-1, num_active, -1)
+                    z_hidden = torch.relu(ew1 * g_exp + eb1_sel)
+                    all_z_hidden[:, h] = z_hidden
+                    out_k = (ew2 * z_hidden).sum(-1) + eb2_sel
+                    head_out = (routing_w * out_k).sum(-1)
+                    total_expert_out = total_expert_out + head_out / num_heads
+
+                smart_grad = g + rescale * total_expert_out
+                smart_grads[name] = smart_grad.reshape(saved_grads[name].shape)
+
+                per_param_saved[name] = {
+                    'sort_indices': sort_indices, 'x_sorted': x_sorted,
+                    'fwd_scan_out': fwd_scan_out, 'bwd_scan_out': bwd_scan_out,
+                    'fwd_saved_states': fwd_saved_states,
+                    'fwd_saved_xb': fwd_saved_xb,
+                    'fwd_saved_z': fwd_saved_z,
+                    'fwd_saved_dt': fwd_saved_dt,
+                    'bwd_saved_states': bwd_saved_states,
+                    'bwd_saved_xb': bwd_saved_xb,
+                    'bwd_saved_z': bwd_saved_z,
+                    'bwd_saved_dt': bwd_saved_dt,
+                    'gru_input': gru_inp.contiguous(),
+                    'gru_h_old': h_old.contiguous(),
+                    'gru_z_gate': z_gate.contiguous(),
+                    'gru_r_gate': r_gate.contiguous(),
+                    'gru_h_tilde': h_tilde.contiguous(),
+                    'peer_input': peer_inp.contiguous(),
+                    'expert_indices': all_expert_indices.contiguous(),
+                    'routing_weights': all_routing_weights.contiguous(),
+                    'saved_z_hidden': all_z_hidden.contiguous(),
+                    'saved_scores_a': all_scores_a.contiguous(),
+                    'saved_scores_b': all_scores_b.contiguous(),
+                    'saved_top_a_idx': all_top_a_idx.contiguous(),
+                    'saved_top_b_idx': all_top_b_idx.contiguous(),
+                    'saved_soft_a': all_soft_a.contiguous(),
+                    'saved_soft_b': all_soft_b.contiguous(),
+                    'grad_flat': grad_flat, 'sharp_flat': sharp_flat,
+                    'fwd_init': fwd_init, 'bwd_init': bwd_init,
+                }
+
+            # 2. Compute validation gradients
+            model.zero_grad()
+            with torch.enable_grad():
+                val_loss = criterion(model(val_x), val_y)
+                val_loss.backward()
+
+            # 3-4. Per-parameter: d_smart_grad → CUDA backward → accumulate
+            for name, p in named_params:
+                if name not in per_param_saved or p.grad is None:
+                    continue
+
+                vg = p.grad.detach().reshape(-1).float()
+                vg_norm = vg.norm()
+                vg_unit = vg / vg_norm if vg_norm > 1e-12 else vg
+                d_smart_grad = -vg_unit
+                sv = per_param_saved[name]
+
+                _ops.supergrok2_bilevel_backward(
+                    d_smart_grad, sv['grad_flat'], sv['sharp_flat'], rescale,
+                    sv['sort_indices'], sv['x_sorted'],
+                    sv['fwd_scan_out'], sv['bwd_scan_out'],
+                    sv['fwd_saved_states'], sv['fwd_saved_xb'],
+                    sv['fwd_saved_z'], sv['fwd_saved_dt'],
+                    sv['bwd_saved_states'], sv['bwd_saved_xb'],
+                    sv['bwd_saved_z'], sv['bwd_saved_dt'],
+                    sv['gru_input'], sv['gru_h_old'],
+                    sv['gru_z_gate'], sv['gru_r_gate'], sv['gru_h_tilde'],
+                    sv['peer_input'],
+                    sv['expert_indices'], sv['routing_weights'],
+                    sv['saved_z_hidden'],
+                    sv['saved_scores_a'], sv['saved_scores_b'],
+                    sv['saved_top_a_idx'], sv['saved_top_b_idx'],
+                    sv['saved_soft_a'], sv['saved_soft_b'],
+                    w['mamba_fwd_in_proj'], w['mamba_fwd_dt_proj_W'],
+                    w['mamba_fwd_dt_proj_b'], w['mamba_fwd_B_proj'],
+                    w['mamba_fwd_C_proj'], w['mamba_fwd_A_log'],
+                    w['mamba_fwd_D'], w['mamba_fwd_rope_freq'],
+                    w['mamba_fwd_out_proj'],
+                    w['mamba_bwd_in_proj'], w['mamba_bwd_dt_proj_W'],
+                    w['mamba_bwd_dt_proj_b'], w['mamba_bwd_B_proj'],
+                    w['mamba_bwd_C_proj'], w['mamba_bwd_A_log'],
+                    w['mamba_bwd_D'], w['mamba_bwd_rope_freq'],
+                    w['mamba_bwd_out_proj'],
+                    gru_Wz, gru_Wr, gru_Wh,
+                    peer_query_Ws, prod_keys_A, prod_keys_B,
+                    expert_W1_flat, expert_W2_flat,
+                    w['expert_b1'], expert_b2_flat,
+                    w['input_proj_W'],
+                    sv['fwd_init'], sv['bwd_init'],
+                    d_mamba_fwd_in_proj, d_mamba_fwd_dt_W,
+                    d_mamba_fwd_dt_b, d_mamba_fwd_B_proj,
+                    d_mamba_fwd_C_proj, d_mamba_fwd_A_log,
+                    d_mamba_fwd_D, d_mamba_fwd_rope, d_mamba_fwd_out_proj,
+                    d_mamba_bwd_in_proj, d_mamba_bwd_dt_W,
+                    d_mamba_bwd_dt_b, d_mamba_bwd_B_proj,
+                    d_mamba_bwd_C_proj, d_mamba_bwd_A_log,
+                    d_mamba_bwd_D, d_mamba_bwd_rope, d_mamba_bwd_out_proj,
+                    d_gru_Wz, d_gru_bz, d_gru_Wr, d_gru_br,
+                    d_gru_Wh, d_gru_bh,
+                    d_peer_query_Ws, d_prod_keys_A, d_prod_keys_B,
+                    d_expert_W1, d_expert_b1, d_expert_W2, d_expert_b2,
+                    d_input_proj_W, d_input_proj_b,
+                    d_model, d_state, d_inner,
+                    gru_hidden, gru_input_dim,
+                    num_heads, topk, pk_dim,
+                    expert_hidden, peer_input_dim, num_experts,
+                )
 
         # 5. Map accumulated gradients to meta-net parameters and step
         meta_optimizer.zero_grad()
