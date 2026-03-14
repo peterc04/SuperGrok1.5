@@ -338,7 +338,7 @@ void grokadamw_fused_step(
     for (size_t i = 0; i < n_params; i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
 
-        steps[i] += 1;
+        // step already incremented by Python caller
         float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
         float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
 
@@ -388,7 +388,7 @@ void neuralgrok_fused_step(
     for (size_t i = 0; i < n_params; i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
 
-        steps[i] += 1;
+        // step already incremented by Python caller
         float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
         float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
 
@@ -486,7 +486,7 @@ float prodigy_fused_step(
     for (size_t i = 0; i < n_params; i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
 
-        steps[i] += 1;
+        // step already incremented by Python caller
         float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
         float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
 
