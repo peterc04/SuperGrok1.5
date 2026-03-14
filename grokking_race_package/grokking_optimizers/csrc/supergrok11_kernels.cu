@@ -199,7 +199,7 @@ float compute_cosine_gate(
     float gate_temp
 ) {
     // Use ATen ops for the global reduction (cuBLAS under the hood)
-    auto dot = torch::dot(smart_grad.flatten(), mu.flatten()).item<float>();
+    auto dot = (smart_grad.flatten() * mu.flatten()).sum().item<float>();
     auto sg_norm = smart_grad.norm().item<float>();
     auto mu_norm = mu.norm().item<float>();
     float cos_sim = dot / (sg_norm * mu_norm + 1e-8f);
