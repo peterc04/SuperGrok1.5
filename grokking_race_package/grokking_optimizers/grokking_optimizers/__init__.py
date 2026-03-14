@@ -20,7 +20,8 @@ except ImportError as e:
     ) from e
 
 from .supergrok15 import SuperGrok15, SharpnessMetaNet
-from .supergrok2 import SuperGrok2, SparseAttentionMetaNet
+from .supergrok2 import SuperGrok2
+from .isab_peer_metanet import ISABPEERMetaNet
 from .supergrok11 import SuperGrok11
 from .grokadamw import GrokAdamW
 from .neuralgrok import NeuralGrok
@@ -29,10 +30,11 @@ from .grokfast import Grokfast
 from .lion import Lion
 from .looksam import LookSAM
 from .muon import Muon
+from .cuda_graph_optimizer import CUDAGraphOptimizer
 
 __all__ = [
     "SuperGrok15", "SharpnessMetaNet",
-    "SuperGrok2", "SparseAttentionMetaNet",
+    "SuperGrok2", "ISABPEERMetaNet",
     "SuperGrok11",
     "GrokAdamW",
     "NeuralGrok",
@@ -41,4 +43,5 @@ __all__ = [
     "Lion",
     "LookSAM",
     "Muon",
+    "CUDAGraphOptimizer",
 ]

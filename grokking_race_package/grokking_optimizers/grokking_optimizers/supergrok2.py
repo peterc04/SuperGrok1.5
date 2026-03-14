@@ -1,138 +1,37 @@
 """
-SuperGrok v2 — C++/CUDA Accelerated Grokking Optimizer with DeepSeek Sparse Attention
+SuperGrok v2 — ISAB + PEER + Recurrent Meta-Net Grokking Optimizer
 
-Same as SuperGrok v1.5 but replaces the MLP meta-net with a
-DeepSeek-style Sparse Attention meta-net that captures cross-element
-gradient correlations.
+Replaces the old DSA-based meta-net with an ISAB+PEER+Recurrent architecture
+that captures cross-element gradient correlations in O(N×M) instead of O(N²).
 
-The lightning indexer selects top-k most relevant gradient elements
-per query, enabling O(N*k) attention instead of O(N^2).
+Key features:
+  - ISAB (Induced Set Attention Block) for global context via inducing points
+  - PEER (Product-key Expert Routing) for sparse expert selection
+  - Recurrent per-element hidden state for temporal gradient patterns
+  - Soft routing (softmax) in bilevel for gradient flow, hard (argmax) in inference
+  - All adaptive scheduling from v1.5 (sigmoid SAM/bilevel/WD, alpha updates)
+  - functional_call SAM (no parameter modification)
+  - Python fallback path (CUDA kernels in Phase 4)
 """
 
 import math
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
-from typing import Optional, Callable, Dict, Tuple
+from typing import Optional, Dict
 
-from grokking_optimizers import _ops
-
-
-class SparseAttentionMetaNet(nn.Module):
-    """DeepSeek Sparse Attention meta-net for gradient correction.
-
-    Architecture:
-        1. Project each (grad, sharpness) pair to Q, K, V
-        2. Lightning indexer scores element pairs
-        3. Top-k selection per query element
-        4. Sparse attention computes cross-element correction
-        5. Skip connection: smart_grad = grad + rescale * correction
-    """
-
-    def __init__(self, d_head: int = 16, n_idx_heads: int = 4,
-                 top_k: int = 64, rescale_init: float = 0.0):
-        super().__init__()
-        self.d_head = d_head
-        self.n_idx_heads = n_idx_heads
-        self.top_k = top_k
-
-        # Projection matrices: (grad, sharpness) -> Q, K, V
-        self.W_q = nn.Linear(2, d_head, bias=True)
-        self.W_k = nn.Linear(2, d_head, bias=True)
-        self.W_v = nn.Linear(2, d_head, bias=True)
-
-        # Lightning indexer projections
-        self.W_iq = nn.Linear(2, n_idx_heads, bias=False)
-        self.W_ik = nn.Linear(2, n_idx_heads, bias=False)
-        self.w_idx = nn.Parameter(torch.ones(n_idx_heads) / n_idx_heads)
-
-        # Output projection: d_head -> 1 (scalar correction)
-        self.W_out = nn.Linear(d_head, 1, bias=True)
-
-        # Skip connection scale
-        self.rescale = nn.Parameter(torch.tensor(rescale_init))
-
-        # Initialize small
-        for m in [self.W_q, self.W_k, self.W_v, self.W_iq, self.W_ik, self.W_out]:
-            if hasattr(m, 'weight'):
-                nn.init.normal_(m.weight, 0, 0.01)
-            if hasattr(m, 'bias') and m.bias is not None:
-                nn.init.zeros_(m.bias)
-
-    def forward(self, grad: torch.Tensor, sharpness: torch.Tensor) -> torch.Tensor:
-        """Forward pass (Python path for bilevel backward)."""
-        if grad.numel() == 0:
-            return grad
-        shape = grad.shape
-        N = grad.numel()
-        eff_k = min(self.top_k, N)
-
-        flat_g = grad.reshape(-1, 1)
-        flat_s = sharpness.reshape(-1, 1)
-        inp = torch.cat([flat_g, flat_s], dim=1)  # [N, 2]
-
-        # Project to Q, K, V
-        q = self.W_q(inp)   # [N, d_head]
-        k = self.W_k(inp)   # [N, d_head]
-        v = self.W_v(inp)   # [N, d_head]
-
-        # Lightning indexer
-        idx_q = self.W_iq(inp)  # [N, n_idx_heads]
-        idx_k = self.W_ik(inp)  # [N, n_idx_heads]
-
-        # Index scores: I[i,j] = sum_h(w_h * ReLU(idx_q[i,h] * idx_k[j,h]))
-        # For each query, compute scores against all keys
-        # scores[i, j] = sum_h w_h * relu(idx_q[i,h] * idx_k[j,h])
-        scores = torch.zeros(N, N, device=grad.device)
-        for h in range(self.n_idx_heads):
-            outer = idx_q[:, h:h+1] * idx_k[:, h:h+1].t()  # [N, N]
-            scores += self.w_idx[h] * torch.relu(outer)
-
-        # Top-k selection
-        _, topk_indices = scores.topk(eff_k, dim=-1)  # [N, k]
-
-        # Sparse attention
-        scale = 1.0 / math.sqrt(self.d_head)
-        # Gather selected keys and values
-        k_selected = k[topk_indices]  # [N, k, d_head]
-        v_selected = v[topk_indices]  # [N, k, d_head]
-
-        # Attention weights
-        attn_scores = torch.bmm(q.unsqueeze(1), k_selected.transpose(1, 2)).squeeze(1) * scale  # [N, k]
-        attn_weights = torch.softmax(attn_scores, dim=-1)  # [N, k]
-
-        # Weighted sum
-        context = torch.bmm(attn_weights.unsqueeze(1), v_selected).squeeze(1)  # [N, d_head]
-
-        # Project to scalar correction
-        correction = self.W_out(context)  # [N, 1]
-
-        return (flat_g + self.rescale * correction).reshape(shape)
-
-    def get_weights(self):
-        """Extract weight tensors for C++ CUDA kernels."""
-        return (
-            self.W_q.weight.data.contiguous(),
-            self.W_q.bias.data.contiguous(),
-            self.W_k.weight.data.contiguous(),
-            self.W_k.bias.data.contiguous(),
-            self.W_v.weight.data.contiguous(),
-            self.W_v.bias.data.contiguous(),
-            self.W_iq.weight.data.contiguous(),
-            self.W_ik.weight.data.contiguous(),
-            self.w_idx.data.contiguous(),
-            self.W_out.weight.data.contiguous(),
-            self.W_out.bias.data.contiguous(),
-            self.rescale.data.item(),
-        )
+from grokking_optimizers.isab_peer_metanet import ISABPEERMetaNet
+from grokking_optimizers._adamw_helper import adamw_step
 
 
 class SuperGrok2(Optimizer):
-    r"""SuperGrok v2 — C++/CUDA Grokking Optimizer with Sparse Attention.
+    r"""SuperGrok v2 — ISAB+PEER+Recurrent Grokking Optimizer.
 
     Same dynamics as SuperGrok v1.5 (sigmoid gating, adaptive SAM/bilevel,
-    progressive WD) but with a DeepSeek Sparse Attention meta-net that
-    captures cross-element gradient correlations.
+    progressive WD) but with an ISAB+PEER+Recurrent meta-net that captures
+    cross-element gradient correlations in O(N×M) time.
+
+    Uses Python fallback path for meta-net inference. CUDA kernels TBD (Phase 4).
     """
 
     def __init__(
@@ -151,9 +50,12 @@ class SuperGrok2(Optimizer):
         warmup_ramp: int = 100,
         gradient_clipping: float = 1.0,
         meta_net: Optional[nn.Module] = None,
-        d_head: int = 16,
-        n_idx_heads: int = 4,
-        top_k: int = 64,
+        num_inducing: int = 16,
+        meta_d_model: int = 8,
+        num_peer_experts: int = 1024,
+        expert_hidden: int = 4,
+        recurrent_dim: int = 8,
+        meta_rescale: float = 0.1,
         alpha_update_freq: int = 100,
         zero_loss_threshold: float = 1e-4,
         zero_acc_threshold: float = 0.995,
@@ -171,11 +73,13 @@ class SuperGrok2(Optimizer):
         wd_ramp: float = 4.0,
         wd_scale: float = 20.0,
         wd_thresh: float = 0.9,
+        sam_enable_threshold: float = 0.0,
     ):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
         self.alpha_init = alpha_init
+        self.sam_enable_threshold = sam_enable_threshold
         self.lamb = lamb
         self.gamma = gamma
         self.gamma_alpha = gamma_alpha
@@ -187,10 +91,16 @@ class SuperGrok2(Optimizer):
         self.zero_loss_threshold = zero_loss_threshold
         self.zero_acc_threshold = zero_acc_threshold
         self.sam_rho = sam_rho
-        self.d_head = d_head
-        self.n_idx_heads = n_idx_heads
-        self.top_k = top_k
 
+        # Meta-net hyperparams (stored for reference)
+        self.num_inducing = num_inducing
+        self.meta_d_model = meta_d_model
+        self.num_peer_experts = num_peer_experts
+        self.expert_hidden = expert_hidden
+        self.recurrent_dim = recurrent_dim
+        self.meta_rescale = meta_rescale
+
+        # Adaptive scheduling params
         self.gate_scale = gate_scale
         self.gate_thresh = gate_thresh
         self.sam_freq_min = sam_freq_min
@@ -205,8 +115,16 @@ class SuperGrok2(Optimizer):
         self.wd_scale = wd_scale
         self.wd_thresh = wd_thresh
 
+        # Meta-net: ISAB + PEER + Recurrent
         if meta_net is None:
-            self.meta_net = SparseAttentionMetaNet(d_head, n_idx_heads, top_k)
+            self.meta_net = ISABPEERMetaNet(
+                num_inducing=num_inducing,
+                d_model=meta_d_model,
+                num_peer_experts=num_peer_experts,
+                expert_hidden=expert_hidden,
+                recurrent_dim=recurrent_dim,
+                rescale=meta_rescale,
+            )
         else:
             self.meta_net = meta_net
 
@@ -229,6 +147,7 @@ class SuperGrok2(Optimizer):
         self._flat_exp_avg_sqs = []
         self._flat_mus = []
         self._flat_sharpness = []
+        self._flat_recurrent_states = []
         self._param_to_idx = {}
 
         idx = 0
@@ -259,10 +178,16 @@ class SuperGrok2(Optimizer):
         if self._state_initialized:
             return
         for p in self._flat_params:
-            self._flat_exp_avgs.append(torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
-            self._flat_exp_avg_sqs.append(torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
+            self._flat_exp_avgs.append(
+                torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
+            self._flat_exp_avg_sqs.append(
+                torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
             self._flat_mus.append(torch.zeros_like(p.data))
             self._flat_sharpness.append(torch.zeros_like(p.data))
+            # Per-parameter recurrent state for ISAB+PEER meta-net
+            self._flat_recurrent_states.append(
+                torch.zeros(p.data.numel(), self.recurrent_dim,
+                            dtype=torch.float32, device=p.device))
         self._state_initialized = True
 
     def _sigmoid(self, scale, value, thresh):
@@ -272,31 +197,45 @@ class SuperGrok2(Optimizer):
         if train_loss is None and train_acc is None:
             return
         signal = 0.0
-        if (train_acc is not None and train_acc >= self.zero_acc_threshold) or \
-           (train_loss is not None and train_loss < self.zero_loss_threshold):
+        memorized = False
+        if train_acc is not None and train_acc >= self.zero_acc_threshold:
+            memorized = True
+        elif train_loss is not None and train_loss < self.zero_loss_threshold:
+            memorized = True
+        if memorized:
             signal = 10.0
         elif val_loss is not None and train_loss is not None and train_loss > 1e-12:
             signal = max(0.0, (val_loss - train_loss) / train_loss)
         self._cached_alpha = self.alpha_init * math.exp(-self.kappa * signal)
 
     def _get_ramp_factor(self):
-        if self._global_step <= self.warmup_steps:
+        step = self._global_step
+        if step <= self.warmup_steps:
             return 0.0
-        return min(1.0, (self._global_step - self.warmup_steps) / self.warmup_ramp)
+        elapsed = step - self.warmup_steps
+        return min(1.0, elapsed / self.warmup_ramp)
 
     def _get_effective_wd(self, base_wd):
-        return base_wd * (1.0 + self.wd_ramp * self._sigmoid(self.wd_scale, self._cached_train_acc, self.wd_thresh))
+        acc = self._cached_train_acc
+        sigmoid_val = self._sigmoid(self.wd_scale, acc, self.wd_thresh)
+        return base_wd * (1.0 + self.wd_ramp * sigmoid_val)
 
     def _get_gate_signal(self):
         return self._sigmoid(self.gate_scale, self._cached_train_acc, self.gate_thresh)
 
     def _get_effective_sam_freq(self):
-        sam_heat = self._sigmoid(self.sam_scale, self._cached_train_acc, self.sam_thresh)
-        return max(1, round(self.sam_freq_max - (self.sam_freq_max - self.sam_freq_min) * sam_heat))
+        if self._cached_train_acc < self.sam_enable_threshold:
+            return 999999  # effectively disabled
+        acc = self._cached_train_acc
+        sam_heat = self._sigmoid(self.sam_scale, acc, self.sam_thresh)
+        freq = self.sam_freq_max - (self.sam_freq_max - self.sam_freq_min) * sam_heat
+        return max(1, round(freq))
 
     def _get_effective_bilevel_freq(self):
-        bilevel_heat = self._sigmoid(self.bilevel_scale, self._cached_train_acc, self.bilevel_thresh)
-        return max(1, round(self.bilevel_freq_max - (self.bilevel_freq_max - self.bilevel_freq_min) * bilevel_heat))
+        acc = self._cached_train_acc
+        bilevel_heat = self._sigmoid(self.bilevel_scale, acc, self.bilevel_thresh)
+        freq = self.bilevel_freq_max - (self.bilevel_freq_max - self.bilevel_freq_min) * bilevel_heat
+        return max(1, round(freq))
 
     @torch.no_grad()
     def step(self, closure=None, train_loss=None, val_loss=None, train_acc=None):
@@ -313,49 +252,81 @@ class SuperGrok2(Optimizer):
 
         if self._global_step % self.alpha_update_freq == 0 or self._global_step == 1:
             self._update_alpha(train_loss, val_loss, train_acc)
+        elif train_acc is not None and train_acc >= self.zero_acc_threshold:
+            self._update_alpha(train_loss, val_loss, train_acc)
+        elif train_loss is not None and train_loss < self.zero_loss_threshold:
+            self._update_alpha(train_loss, val_loss, train_acc)
 
         base_alpha = self._cached_alpha
         ramp = self._get_ramp_factor()
-        layer_alphas = [max(0.0, min(1.0, base_alpha * f)) for f in self._flat_layer_alphas]
+        gate_signal = self._get_gate_signal()
 
         group = self.param_groups[0]
         lr = group["lr"]
+        beta1_base = group["betas"][0]
         beta2 = group["betas"][1]
         eps = group["eps"]
         wd_eff = self._get_effective_wd(group["weight_decay"])
-        gate_signal = self._get_gate_signal()
 
-        grads = []
-        for p in self._flat_params:
-            grads.append(p.grad.data if p.grad is not None else torch.Tensor())
+        # Python fallback: per-parameter meta-net forward + Adam
+        params_for_adam = []
+        grads_for_adam = []
+        exp_avgs_for_adam = []
+        exp_avg_sqs_for_adam = []
+        steps_for_adam = []
 
-        if self._weights_dirty:
-            self._cached_weights = self.meta_net.get_weights()
-            self._weights_dirty = False
-        W_q, b_q, W_k, b_k, W_v, b_v, W_iq, W_ik, w_idx, W_out, b_out, rescale = self._cached_weights
+        for i, p in enumerate(self._flat_params):
+            if p.grad is None:
+                continue
 
-        _ops.supergrok2_fused_step(
-            self._flat_param_data,
-            grads,
-            self._flat_exp_avgs,
-            self._flat_exp_avg_sqs,
-            self._flat_mus,
-            self._flat_sharpness,
-            self._flat_steps,
-            layer_alphas,
-            self._flat_layer_beta1s,
-            W_q, b_q, W_k, b_k, W_v, b_v,
-            W_iq, W_ik, w_idx, W_out, b_out,
-            rescale, self.d_head, self.n_idx_heads, self.top_k,
-            beta2, lr, wd_eff, eps,
-            self.lamb, ramp, gate_signal,
-            self.gradient_clipping,
-        )
+            self._flat_steps[i] += 1
+            grad = p.grad.data
+            N = grad.numel()
+
+            # Gradient clipping (per-parameter)
+            grad_norm = grad.norm()
+            if grad_norm > self.gradient_clipping:
+                grad = grad * (self.gradient_clipping / (grad_norm + 1e-12))
+
+            # Meta-net forward with recurrent state
+            flat_grad = grad.reshape(-1)
+            flat_sharp = self._flat_sharpness[i].reshape(-1)
+            recurrent_h = self._flat_recurrent_states[i]
+
+            smart_grad, new_h = self.meta_net(flat_grad, flat_sharp, recurrent_h)
+            self._flat_recurrent_states[i] = new_h.detach()
+
+            # Gating: interpolate between raw grad and smart grad
+            alpha_i = max(0.0, min(1.0, base_alpha * self._flat_layer_alphas[i]))
+            lamb_eff = self.lamb * ramp * gate_signal
+
+            # mu update: mu = alpha * mu + (1 - alpha) * smart_grad
+            mu = self._flat_mus[i]
+            mu.mul_(alpha_i).add_(smart_grad.reshape(grad.shape), alpha=1.0 - alpha_i)
+
+            # Effective gradient: grad + lamb * mu
+            effective_grad = grad + lamb_eff * mu
+            self._flat_mus[i] = mu
+
+            # Collect for batched Adam step
+            params_for_adam.append(p.data)
+            grads_for_adam.append(effective_grad)
+            exp_avgs_for_adam.append(self._flat_exp_avgs[i])
+            exp_avg_sqs_for_adam.append(self._flat_exp_avg_sqs[i])
+            steps_for_adam.append(self._flat_steps[i])
+
+        if params_for_adam:
+            adamw_step(
+                params_for_adam, grads_for_adam,
+                exp_avgs_for_adam, exp_avg_sqs_for_adam,
+                steps_for_adam,
+                lr, beta1_base, beta2, eps, wd_eff,
+            )
 
         return loss
 
     def sam_step(self, model, train_x, train_y, criterion):
-        """SAM perturbation + sharpness computation."""
+        """SAM perturbation + sharpness computation via functional_call (no param modification)."""
         self._ensure_state()
         train_grads = {}
         for name, p in model.named_parameters():
@@ -364,38 +335,45 @@ class SuperGrok2(Optimizer):
         if not train_grads:
             return 0.0
 
-        named_params = list(model.named_parameters())
-        flat_grads = [train_grads.get(n, torch.Tensor()) for n, _ in named_params]
-        flat_params = [p.data for _, p in named_params]
+        # Compute perturbation direction without modifying actual params
+        flat_grads = [train_grads[n] for n, _ in model.named_parameters() if n in train_grads]
+        total_norm_sq = sum(g.norm().pow(2) for g in flat_grads if g.numel() > 0)
+        grad_norm = total_norm_sq.sqrt() + 1e-12
+        rho_over_norm = self.sam_rho / grad_norm
 
-        # Reuse v1.5 SAM kernels
-        backups = _ops.supergrok15_sam_perturb_all(flat_params, flat_grads, self.sam_rho)
+        # Build perturbed parameter dict WITHOUT modifying actual params
+        named_params = dict(model.named_parameters())
+        perturbed_params = {}
+        for name, p in named_params.items():
+            if name in train_grads:
+                perturbed_params[name] = p.detach() + rho_over_norm * train_grads[name]
+            else:
+                perturbed_params[name] = p.detach()
 
+        # Forward at perturbed point — actual params untouched
         model.zero_grad()
         with torch.enable_grad():
-            sam_loss = criterion(model(train_x), train_y)
+            sam_logits = torch.func.functional_call(model, perturbed_params, (train_x,))
+            sam_loss = criterion(sam_logits, train_y)
             sam_loss.backward()
         sam_loss_val = sam_loss.item()
 
-        sam_grads = []
-        for _, p in named_params:
-            sam_grads.append(p.grad.detach().clone() if p.grad is not None else torch.Tensor())
-
-        sharpness_out = [torch.zeros_like(p.data) for _, p in named_params]
-        _ops.supergrok15_sharpness_restore_all(flat_params, sharpness_out, backups, sam_grads, flat_grads)
-
-        for i, (name, p) in enumerate(named_params):
+        # Compute sharpness = |sam_grad - normal_grad|
+        for name, p in model.named_parameters():
             pidx = self._param_to_idx.get(id(p))
-            if pidx is not None and sharpness_out[i].numel() > 0:
-                self._flat_sharpness[pidx] = sharpness_out[i]
+            if pidx is not None and p.grad is not None and name in train_grads:
+                sam_grad = p.grad.detach()
+                normal_grad = train_grads[name]
+                self._flat_sharpness[pidx] = (sam_grad - normal_grad).abs()
 
-        for name, p in named_params:
+        # Restore original grads
+        for name, p in model.named_parameters():
             p.grad = train_grads.get(name)
 
         return sam_loss_val
 
     def bilevel_step(self, model, train_x, train_y, val_x, val_y, criterion, meta_optimizer):
-        """Bilevel meta-net training using cached sharpness."""
+        """Bilevel meta-net training. Uses forward_for_bilevel (soft routing) for gradient flow."""
         self._ensure_state()
         named_params = list(model.named_parameters())
 
@@ -404,12 +382,39 @@ class SuperGrok2(Optimizer):
             if p.grad is not None:
                 saved_grads[name] = p.grad.detach().clone()
 
-        smart_grads = {}
+        # Batched meta-net forward with soft routing for gradient flow
+        all_grads = []
+        all_sharps = []
+        all_recurrent = []
+        all_names = []
+        all_sizes = []
         for name, p in named_params:
             if name in saved_grads:
                 pidx = self._param_to_idx.get(id(p))
-                sharp = self._flat_sharpness[pidx] if pidx is not None else torch.zeros_like(p.data)
-                smart_grads[name] = self.meta_net(saved_grads[name], sharp)
+                all_grads.append(saved_grads[name].reshape(-1))
+                all_sharps.append(
+                    self._flat_sharpness[pidx].reshape(-1) if pidx is not None
+                    else torch.zeros(p.data.numel(), device=p.device))
+                all_recurrent.append(
+                    self._flat_recurrent_states[pidx] if pidx is not None
+                    else torch.zeros(p.data.numel(), self.recurrent_dim,
+                                     dtype=torch.float32, device=p.device))
+                all_names.append(name)
+                all_sizes.append(saved_grads[name].numel())
+
+        smart_grads = {}
+        if all_grads:
+            cat_grads = torch.cat(all_grads)
+            cat_sharps = torch.cat(all_sharps)
+            cat_recurrent = torch.cat(all_recurrent, dim=0)
+            # Use forward_for_bilevel for differentiable soft routing
+            cat_smart, _ = self.meta_net.forward_for_bilevel(
+                cat_grads, cat_sharps, cat_recurrent)
+            offset = 0
+            for name, size in zip(all_names, all_sizes):
+                smart_grads[name] = cat_smart[offset:offset+size].reshape(
+                    saved_grads[name].shape)
+                offset += size
 
         model.zero_grad()
         with torch.enable_grad():
@@ -436,7 +441,7 @@ class SuperGrok2(Optimizer):
         return val_loss.item()
 
     def sam_meta_step(self, model, train_x, train_y, val_x, val_y, criterion, meta_optimizer):
-        """Combined SAM + bilevel."""
+        """Combined SAM + bilevel (backward-compatible)."""
         sam_loss = self.sam_step(model, train_x, train_y, criterion)
         val_loss = self.bilevel_step(model, train_x, train_y, val_x, val_y, criterion, meta_optimizer)
         return sam_loss, val_loss
@@ -444,8 +449,16 @@ class SuperGrok2(Optimizer):
     def get_global_step(self):
         return self._global_step
 
+    def get_cached_alpha(self):
+        return self._cached_alpha
+
+    def get_effective_wd(self):
+        if self.param_groups:
+            return self._get_effective_wd(self.param_groups[0]["weight_decay"])
+        return 0.0
+
     def step_full(self, model, train_x, train_y, val_x, val_y, criterion=None):
-        """Complete training step with adaptive SAM/bilevel scheduling."""
+        """Complete training step: forward + backward + SAM + meta-learning + optimizer."""
         if criterion is None:
             criterion = nn.CrossEntropyLoss()
         if not hasattr(self, '_auto_meta_opt'):
@@ -456,28 +469,40 @@ class SuperGrok2(Optimizer):
         loss = criterion(logits, train_y)
         loss.backward()
 
-        metrics = {}
+        metrics: Dict[str, float] = {}
         step_num = self._global_step + 1
 
-        if step_num % self._get_effective_sam_freq() == 0:
+        sam_freq_eff = self._get_effective_sam_freq()
+        if step_num % sam_freq_eff == 0:
             try:
                 metrics["sam_loss"] = self.sam_step(model, train_x, train_y, criterion)
             except Exception:
                 pass
 
-        if step_num % self._get_effective_bilevel_freq() == 0:
+        bilevel_freq_eff = self._get_effective_bilevel_freq()
+        if step_num % bilevel_freq_eff == 0:
             try:
                 metrics["val_loss"] = self.bilevel_step(
                     model, train_x, train_y, val_x, val_y, criterion, self._auto_meta_opt)
             except Exception:
                 pass
 
-        kw = {}
-        if (step_num % self.alpha_update_freq == 0) or step_num == 1:
+        kw: Dict[str, float] = {}
+        alpha_freq = self.alpha_update_freq
+        if (step_num % alpha_freq == 0) or step_num == 1:
             with torch.no_grad():
-                kw["train_loss"] = loss.item()
-                kw["train_acc"] = (logits.detach().argmax(-1) == train_y).float().mean().item()
-            metrics.update(kw)
+                train_loss_val = loss.item()
+                train_acc = (logits.detach().argmax(-1) == train_y).float().mean().item()
+            kw["train_loss"] = train_loss_val
+            kw["train_acc"] = train_acc
+            metrics["train_loss"] = train_loss_val
+            metrics["train_acc"] = train_acc
+            if step_num % alpha_freq == 0:
+                with torch.no_grad():
+                    val_loss_val = criterion(model(val_x), val_y).item()
+                kw["val_loss"] = val_loss_val
+                if "val_loss" not in metrics:
+                    metrics["val_loss"] = val_loss_val
 
         self.step(**kw)
         return metrics
