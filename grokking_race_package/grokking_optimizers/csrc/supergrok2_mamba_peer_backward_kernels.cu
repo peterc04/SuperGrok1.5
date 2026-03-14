@@ -351,6 +351,8 @@ __global__ void mamba3_scan_backward_kernel(
             for (int j = 0; j < d_inner; j++) {
                 atomicAdd(&d_B_proj_W[s * d_inner + j], d_B_val * s_x_branch[j]);
             }
+            // Gradient of B_val w.r.t. x_branch[tid]: B_proj_W[s, tid]
+            d_x_from_scan += d_B_val * B_proj_W[s * d_inner + tid];
 
             // d_A_bar -> d_dt, d_A_log
             float d_half_dtA = d_A_bar * (1.0f + A_bar) / denom_val;
