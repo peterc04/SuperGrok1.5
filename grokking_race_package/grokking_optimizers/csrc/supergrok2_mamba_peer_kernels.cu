@@ -1126,33 +1126,46 @@ void launch_mamba3_peer_batched_step(
     );
 
     // Step 5: Copy final states back + unsort + fused_elem_step per param
+    // Pre-compute all unsorted scan outputs, then launch kernels on streams
     int gru_input_dim_val = 2 + 2 * d_model;
     int gru_row_len = gru_input_dim_val + gru_hidden;
     int smem_bytes = (2 * d_model * d_inner
                     + 3 * gru_hidden * gru_row_len
                     + 3 * gru_hidden) * sizeof(float);
 
+    // Pre-compute unsorted scan outputs and copy final states
+    std::vector<torch::Tensor> fwd_unsorted_list(num_params);
+    std::vector<torch::Tensor> bwd_unsorted_list(num_params);
     for (int p = 0; p < num_params; p++) {
         int N = N_vec[p];
         if (N == 0) continue;
         int off = offsets_cpu[p];
 
-        // Copy final states
         mamba_fwd_states[p].copy_(final_fwd[p]);
         mamba_bwd_states[p].copy_(final_bwd[p]);
 
-        // Unsort scan outputs
         auto fwd_slice = fwd_scan_packed.narrow(0, off, N);
         auto bwd_slice = bwd_scan_packed.narrow(0, off, N);
-        auto fwd_unsorted = fwd_slice.index_select(0, unsort_idx_list[p]);
-        auto bwd_unsorted = bwd_slice.index_select(0, unsort_idx_list[p]);
+        fwd_unsorted_list[p] = fwd_slice.index_select(0, unsort_idx_list[p]);
+        bwd_unsorted_list[p] = bwd_slice.index_select(0, unsort_idx_list[p]);
+    }
 
-        // Launch fused_elem_step
+    // Launch fused_elem_step kernels on a pool of streams for concurrency
+    constexpr int NUM_STREAMS = 4;
+    cudaStream_t streams[NUM_STREAMS];
+    for (int s = 0; s < NUM_STREAMS; s++)
+        cudaStreamCreate(&streams[s]);
+
+    for (int p = 0; p < num_params; p++) {
+        int N = N_vec[p];
+        if (N == 0) continue;
+
+        cudaStream_t stream = streams[p % NUM_STREAMS];
         const int grid = (N + SG2M_BLOCK - 1) / SG2M_BLOCK;
         AT_DISPATCH_FLOATING_TYPES_AND2(
             at::ScalarType::Half, at::ScalarType::BFloat16,
             params[p].scalar_type(), "fused_elem_step_batch", ([&] {
-            fused_elem_step_kernel<scalar_t><<<grid, SG2M_BLOCK, smem_bytes>>>(
+            fused_elem_step_kernel<scalar_t><<<grid, SG2M_BLOCK, smem_bytes, stream>>>(
                 params[p].data_ptr<scalar_t>(),
                 grads[p].data_ptr<scalar_t>(),
                 sharpness_list[p].data_ptr<scalar_t>(),
@@ -1160,8 +1173,8 @@ void launch_mamba3_peer_batched_step(
                 exp_avg_sqs[p].data_ptr<float>(),
                 mus[p].data_ptr<float>(),
                 gru_states[p].data_ptr<float>(),
-                fwd_unsorted.data_ptr<float>(),
-                bwd_unsorted.data_ptr<float>(),
+                fwd_unsorted_list[p].data_ptr<float>(),
+                bwd_unsorted_list[p].data_ptr<float>(),
                 mamba_fwd_out_proj.data_ptr<float>(),
                 mamba_bwd_out_proj.data_ptr<float>(),
                 gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
@@ -1181,5 +1194,11 @@ void launch_mamba3_peer_batched_step(
                 num_heads, pk_dim, expert_hidden, num_experts
             );
         }));
+    }
+
+    // Sync all streams and clean up
+    for (int s = 0; s < NUM_STREAMS; s++) {
+        cudaStreamSynchronize(streams[s]);
+        cudaStreamDestroy(streams[s]);
     }
 }
