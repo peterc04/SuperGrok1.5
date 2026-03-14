@@ -80,8 +80,9 @@ class Mamba3ScanBlock(nn.Module):
         self.D = nn.Parameter(torch.ones(self.d_inner))
 
         # RoPE-equivalent phase for complex dynamics (Mamba-3)
-        # Learnable per-state frequencies
-        self.rope_freq = nn.Parameter(torch.randn(self.d_inner, d_state) * 0.01)
+        # Paired RoPE: each pair (2i, 2i+1) shares one frequency
+        assert d_state % 2 == 0, "d_state must be even for paired RoPE"
+        self.rope_freq = nn.Parameter(torch.randn(self.d_inner, d_state // 2) * 0.01)
 
         # Output projection: d_inner -> d_model
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
@@ -110,7 +111,7 @@ class Mamba3ScanBlock(nn.Module):
         A = -torch.exp(self.A_log)  # [d_inner, d_state]
 
         # RoPE phase rotation for complex dynamics
-        phase = self.rope_freq  # [d_inner, d_state]
+        phase = self.rope_freq  # [d_inner, d_state//2]
 
         # Selective scan (sequential -- Python reference, CUDA kernel in Phase C)
         if initial_state is not None:
@@ -127,11 +128,16 @@ class Mamba3ScanBlock(nn.Module):
             A_bar = (1.0 + dt_i * A / 2.0) / (1.0 - dt_i * A / 2.0 + 1e-8)
             B_bar = dt_i * B[i].unsqueeze(0)  # [d_inner, d_state]
 
-            # Complex rotation via RoPE-equivalent
-            cos_phase = torch.cos(dt_i * phase)
-            sin_phase = torch.sin(dt_i * phase)
-            # Apply rotation to state (pairs of dimensions act as real/imag)
-            h_rot = h * cos_phase - torch.roll(h, 1, dims=-1) * sin_phase
+            # Paired RoPE: (2i, 2i+1) form complex pairs
+            # phase is [d_inner, d_state//2], broadcast dt_i to match
+            angle = dt_i * phase  # [d_inner, d_state//2]
+            cos_a = torch.cos(angle)
+            sin_a = torch.sin(angle)
+            h_even = h[:, 0::2]   # [d_inner, d_state//2]
+            h_odd  = h[:, 1::2]   # [d_inner, d_state//2]
+            h_rot = torch.zeros_like(h)
+            h_rot[:, 0::2] = h_even * cos_a - h_odd * sin_a
+            h_rot[:, 1::2] = h_odd * cos_a + h_even * sin_a
 
             # State update
             h = A_bar * h_rot + B_bar * x_branch[i].unsqueeze(-1)
