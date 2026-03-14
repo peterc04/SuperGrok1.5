@@ -800,6 +800,19 @@ void supergrok2_mamba_peer_step(
 
 
 // ═══════════════════════════════════════════════════════════════════════
+//  SuperGrok v2 — Bilevel Forward (with state saving) + Backward
+// ═══════════════════════════════════════════════════════════════════════
+
+// These are thin wrappers that dispatch to the CUDA launchers.
+// The actual heavy lifting is in supergrok2_mamba_peer_backward_kernels.cu.
+// No CPU fallback — bilevel always runs on CUDA.
+
+// (The launch_mamba3_peer_bilevel_fwd_save and launch_mamba3_peer_backward
+//  functions are called directly via pybind11 — no extra wrapper needed
+//  since they already have the right signatures.)
+
+
+// ═══════════════════════════════════════════════════════════════════════
 //  pybind11 Bindings
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -942,4 +955,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("d_model"), py::arg("d_state"), py::arg("d_inner"),
           py::arg("gru_hidden"), py::arg("num_heads"), py::arg("pk_dim"),
           py::arg("expert_hidden"), py::arg("num_experts"));
+
+#ifdef WITH_CUDA
+    // ── SuperGrok v2 Bilevel Forward (state-saving) ──────────────────
+    m.def("supergrok2_bilevel_fwd_save", &launch_mamba3_peer_bilevel_fwd_save,
+          "SuperGrok2 bilevel: forward scan with state saving for backward");
+
+    // ── SuperGrok v2 Bilevel Backward ────────────────────────────────
+    m.def("supergrok2_bilevel_backward", &launch_mamba3_peer_backward,
+          "SuperGrok2 bilevel: full backward through meta-net");
+#endif
 }
