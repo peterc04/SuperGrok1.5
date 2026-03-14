@@ -814,6 +814,11 @@ void launch_mamba3_peer_step(
     const int N = grad.numel();
     if (N == 0) return;
 
+    TORCH_CHECK(d_state % 2 == 0, "d_state must be even for paired RoPE (got ", d_state, ")");
+    TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
+    TORCH_CHECK(d_model <= MAX_D_MODEL, "d_model exceeds MAX_D_MODEL (", d_model, " > ", MAX_D_MODEL, ")");
+    TORCH_CHECK(gru_hidden <= MAX_GRU_HIDDEN, "gru_hidden exceeds MAX_GRU_HIDDEN (", gru_hidden, " > ", MAX_GRU_HIDDEN, ")");
+
     auto dev = grad.device();
     auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
     auto int_opts = torch::TensorOptions().device(dev).dtype(torch::kInt32);
@@ -1013,6 +1018,11 @@ void launch_mamba3_peer_batched_step(
 ) {
     const int num_params = params.size();
     if (num_params == 0) return;
+
+    TORCH_CHECK(d_state % 2 == 0, "d_state must be even for paired RoPE (got ", d_state, ")");
+    TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
+    TORCH_CHECK(d_model <= MAX_D_MODEL, "d_model exceeds MAX_D_MODEL (", d_model, " > ", MAX_D_MODEL, ")");
+    TORCH_CHECK(gru_hidden <= MAX_GRU_HIDDEN, "gru_hidden exceeds MAX_GRU_HIDDEN (", gru_hidden, " > ", MAX_GRU_HIDDEN, ")");
 
     auto dev = grads[0].device();
     auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
