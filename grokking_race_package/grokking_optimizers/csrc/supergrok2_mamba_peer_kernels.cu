@@ -118,10 +118,13 @@ __global__ void mamba3_scan_kernel(
         for (int s = 0; s < d_state; s++) h[s] = 0.0f;
     }
 
-    float A[32], freq[32];
+    const int half_d_state = d_state / 2;
+    float A[32], freq[16];  // freq is d_state/2
     for (int s = 0; s < d_state; s++) {
         A[s] = -expf(A_log[tid * d_state + s]);
-        freq[s] = rope_freq[tid * d_state + s];
+    }
+    for (int p = 0; p < half_d_state; p++) {
+        freq[p] = rope_freq[tid * half_d_state + p];
     }
     float D_val = D_param[tid];
 
@@ -150,7 +153,7 @@ __global__ void mamba3_scan_kernel(
         // Snapshot h for RoPE (fixes read-after-write)
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
 
-        // State update with trapezoidal + RoPE
+        // State update with trapezoidal + paired RoPE
         for (int s = 0; s < d_state; s++) {
             float A_bar = (1.0f + dt_val * A[s] / 2.0f) / (1.0f - dt_val * A[s] / 2.0f + 1e-8f);
 
@@ -161,11 +164,16 @@ __global__ void mamba3_scan_kernel(
             }
             float B_bar = dt_val * B_val;
 
-            // RoPE using SNAPSHOT (not in-place updated h)
+            // Paired RoPE: (2i, 2i+1) form complex pairs
+            int pair_idx = s / 2;
             float cos_p, sin_p;
-            __sincosf(dt_val * freq[s], &sin_p, &cos_p);
-            int s_prev = (s > 0) ? s - 1 : d_state - 1;
-            float h_rot = h_snap[s] * cos_p - h_snap[s_prev] * sin_p;
+            __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+            float h_rot;
+            if (s % 2 == 0) {
+                h_rot = h_snap[s] * cos_p - h_snap[s + 1] * sin_p;
+            } else {
+                h_rot = h_snap[s] * cos_p + h_snap[s - 1] * sin_p;
+            }
 
             h[s] = A_bar * h_rot + B_bar * x_val;
         }
@@ -524,10 +532,13 @@ __global__ void mamba3_scan_batched_kernel(
     const float* my_init = initial_states + param_idx * d_inner * d_state;
     for (int s = 0; s < d_state; s++) h[s] = my_init[tid * d_state + s];
 
-    float A[32], freq[32];
+    const int half_d_state = d_state / 2;
+    float A[32], freq[16];  // freq is d_state/2
     for (int s = 0; s < d_state; s++) {
         A[s] = -expf(A_log[tid * d_state + s]);
-        freq[s] = rope_freq[tid * d_state + s];
+    }
+    for (int p = 0; p < half_d_state; p++) {
+        freq[p] = rope_freq[tid * half_d_state + p];
     }
     float D_val = D_param[tid];
 
@@ -560,10 +571,16 @@ __global__ void mamba3_scan_batched_kernel(
             for (int j = 0; j < d_inner; j++)
                 B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
             float B_bar = dt_val * B_val;
+            // Paired RoPE: (2i, 2i+1) form complex pairs
+            int pair_idx = s / 2;
             float cos_p, sin_p;
-            __sincosf(dt_val * freq[s], &sin_p, &cos_p);
-            int s_prev = (s > 0) ? s - 1 : d_state - 1;
-            float h_rot = h_snap[s] * cos_p - h_snap[s_prev] * sin_p;
+            __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+            float h_rot;
+            if (s % 2 == 0) {
+                h_rot = h_snap[s] * cos_p - h_snap[s + 1] * sin_p;
+            } else {
+                h_rot = h_snap[s] * cos_p + h_snap[s - 1] * sin_p;
+            }
             h[s] = A_bar * h_rot + B_bar * x_val;
         }
 

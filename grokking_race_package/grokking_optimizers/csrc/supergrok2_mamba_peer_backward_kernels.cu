@@ -81,9 +81,10 @@ __global__ void mamba3_scan_fwd_save_kernel(
     for (int s = 0; s < d_state; s++)
         A[s] = -expf(A_log[tid * d_state + s]);
 
-    float freq[MAX_D_STATE];
-    for (int s = 0; s < d_state; s++)
-        freq[s] = rope_freq[tid * d_state + s];
+    const int half_d_state = d_state / 2;
+    float freq[MAX_D_STATE / 2];  // paired RoPE: d_state/2 frequencies
+    for (int p = 0; p < half_d_state; p++)
+        freq[p] = rope_freq[tid * half_d_state + p];
 
     float D_val = D_param[tid];
 
@@ -129,11 +130,16 @@ __global__ void mamba3_scan_fwd_save_kernel(
             }
             float B_bar = dt_val * B_val;
 
-            // RoPE using SNAPSHOT
+            // Paired RoPE using SNAPSHOT
+            int pair_idx = s / 2;
             float cos_p, sin_p;
-            __sincosf(dt_val * freq[s], &sin_p, &cos_p);
-            int s_prev = (s > 0) ? s - 1 : d_state - 1;
-            float h_rot = h_snap[s] * cos_p - h_snap[s_prev] * sin_p;
+            __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+            float h_rot;
+            if (s % 2 == 0) {
+                h_rot = h_snap[s] * cos_p - h_snap[s + 1] * sin_p;
+            } else {
+                h_rot = h_snap[s] * cos_p + h_snap[s - 1] * sin_p;
+            }
 
             h[s] = A_bar * h_rot + B_bar * x_val;
         }
@@ -199,7 +205,7 @@ __global__ void mamba3_scan_backward_kernel(
     float* __restrict__ d_C_proj_W,           // [d_state, d_inner]
     float* __restrict__ d_A_log,              // [d_inner, d_state]
     float* __restrict__ d_D_param,            // [d_inner]
-    float* __restrict__ d_rope_freq,          // [d_inner, d_state]
+    float* __restrict__ d_rope_freq,          // [d_inner, d_state/2]
     float* __restrict__ d_x_sorted,           // [N, d_model]
     // Dims
     const int N, const int d_model, const int d_inner, const int d_state,
@@ -217,24 +223,27 @@ __global__ void mamba3_scan_backward_kernel(
     for (int s = 0; s < d_state; s++)
         A[s] = -expf(A_log[tid * d_state + s]);
 
-    float freq[MAX_D_STATE];
-    for (int s = 0; s < d_state; s++)
-        freq[s] = rope_freq[tid * d_state + s];
+    const int half_d_state = d_state / 2;
+    float freq[MAX_D_STATE / 2];  // paired RoPE: d_state/2 frequencies
+    for (int p = 0; p < half_d_state; p++)
+        freq[p] = rope_freq[tid * half_d_state + p];
 
     float D_val = D_param[tid];
 
     // Accumulated gradients for this thread's parameters
     float d_D_acc = 0.0f;
     float d_A_log_acc[MAX_D_STATE];
-    float d_freq_acc[MAX_D_STATE];
+    float d_freq_acc[MAX_D_STATE / 2];  // paired: d_state/2 frequencies
     float d_B_proj_acc[MAX_D_STATE];
     float d_C_proj_acc[MAX_D_STATE];
     float d_dt_proj_b_acc = 0.0f;
     for (int s = 0; s < d_state; s++) {
         d_A_log_acc[s] = 0.0f;
-        d_freq_acc[s] = 0.0f;
         d_B_proj_acc[s] = 0.0f;
         d_C_proj_acc[s] = 0.0f;
+    }
+    for (int p = 0; p < half_d_state; p++) {
+        d_freq_acc[p] = 0.0f;
     }
     // Full dt_proj_W gradient (not just diagonal)
     float d_dt_proj_W_row[32]; // max d_inner = 32
@@ -330,10 +339,22 @@ __global__ void mamba3_scan_backward_kernel(
             }
             float B_bar = dt_val * B_val;
 
+            // Paired RoPE
+            int pair_idx = s / 2;
             float cos_p, sin_p;
-            __sincosf(dt_val * freq[s], &sin_p, &cos_p);
-            int s_prev = (s > 0) ? s - 1 : d_state - 1;
-            float h_rot = h_prev[s] * cos_p - h_prev[s_prev] * sin_p;
+            __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+            float h_rot;
+            int partner;
+            float sign;  // sign of sin term in h_rot formula
+            if (s % 2 == 0) {
+                partner = s + 1;
+                sign = -1.0f;  // h_rot = h[s]*cos - h[s+1]*sin
+                h_rot = h_prev[s] * cos_p - h_prev[partner] * sin_p;
+            } else {
+                partner = s - 1;
+                sign = 1.0f;   // h_rot = h[s]*cos + h[s-1]*sin
+                h_rot = h_prev[s] * cos_p + h_prev[partner] * sin_p;
+            }
 
             // Use dh_snap instead of dh for reading
             float d_h_s = dh_snap[s];
@@ -360,19 +381,19 @@ __global__ void mamba3_scan_backward_kernel(
             float d_A_s = d_half_dtA * dt_val / 2.0f;
             d_A_log_acc[s] += d_A_s * A[s];
 
-            // d_h_rot -> d_h_prev[s], d_h_prev[s_prev]
+            // d_h_rot -> d_h_prev[s], d_h_prev[partner] (paired RoPE)
             float d_h_prev_s = d_h_rot * cos_p;
-            float d_h_prev_s_prev = -d_h_rot * sin_p;
+            float d_h_prev_partner = d_h_rot * sign * sin_p;
 
             // d_h_rot -> d_cos, d_sin -> d_dt, d_freq
             float d_cos = d_h_rot * h_prev[s];
-            float d_sin = -d_h_rot * h_prev[s_prev];
-            d_dt_val += (-sin_p * freq[s]) * d_cos + (cos_p * freq[s]) * d_sin;
-            d_freq_acc[s] += (-sin_p * dt_val) * d_cos + (cos_p * dt_val) * d_sin;
+            float d_sin = d_h_rot * sign * h_prev[partner];
+            d_dt_val += (-sin_p * freq[pair_idx]) * d_cos + (cos_p * freq[pair_idx]) * d_sin;
+            d_freq_acc[pair_idx] += (-sin_p * dt_val) * d_cos + (cos_p * dt_val) * d_sin;
 
             // Propagate dh to previous step (accumulate into fresh dh)
             dh[s] += d_h_prev_s;
-            dh[s_prev] += d_h_prev_s_prev;
+            dh[partner] += d_h_prev_partner;
         }
 
         // Backward through dt: dt_val = softplus(dt_raw)
@@ -422,7 +443,9 @@ __global__ void mamba3_scan_backward_kernel(
     }
     for (int s = 0; s < d_state; s++) {
         atomicAdd(&d_A_log[tid * d_state + s], d_A_log_acc[s]);
-        atomicAdd(&d_rope_freq[tid * d_state + s], d_freq_acc[s]);
+    }
+    for (int p = 0; p < half_d_state; p++) {
+        atomicAdd(&d_rope_freq[tid * half_d_state + p], d_freq_acc[p]);
     }
 }
 
