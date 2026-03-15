@@ -149,6 +149,7 @@ class SuperGrok2(Optimizer):
             pass
 
         self._global_step = 0
+        self._step_counter = 0  # Python int for expert recycling (avoids GPU sync)
         self._cached_alpha = alpha_init
         self._cached_train_acc = 0.0
 
@@ -413,9 +414,9 @@ class SuperGrok2(Optimizer):
                 self.meta_net.expert_counts,
             )
             # Expert recycling: increment step counter and periodically recycle
-            self.meta_net.step_counter += 1
+            self._step_counter += 1
             if (self.meta_net.recycle_interval > 0 and
-                    self.meta_net.step_counter % self.meta_net.recycle_interval == 0):
+                    self._step_counter % self.meta_net.recycle_interval == 0):
                 self.meta_net._recycle_dead_experts()
         else:
             # Python fallback — per-parameter
@@ -455,9 +456,9 @@ class SuperGrok2(Optimizer):
                 p.data.addcdiv_(ea.reshape(p.data.shape), denom.reshape(p.data.shape), value=-step_size)
 
             # Expert recycling for Python fallback (once per step, not per param)
-            self.meta_net.step_counter += 1
+            self._step_counter += 1
             if (self.meta_net.recycle_interval > 0 and
-                    self.meta_net.step_counter % self.meta_net.recycle_interval == 0):
+                    self._step_counter % self.meta_net.recycle_interval == 0):
                 self.meta_net._recycle_dead_experts()
 
         return loss
