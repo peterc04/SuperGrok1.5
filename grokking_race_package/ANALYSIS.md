@@ -360,7 +360,30 @@ The bilevel forward-save path stores scan states at every timestep for backward 
 | GRU + PEER (elem_step) | O(N × (gru_ops + peer_ops)) | N > 10K |
 | Adam update | O(N) | Never dominant |
 
-### 8.3 Cross-Optimizer Kernel Fusion Comparison
+### 8.3 Optimization Implementation History
+
+| Commit | Section | Change | Impact |
+|--------|---------|--------|--------|
+| `e2c52ee` | S1 | Replace GPU step_counter with Python int | Eliminate CUDA sync per step |
+| `6bb7726` | S1 | Replace CPU flip loops with CUDA kernels | Eliminate CPU-GPU syncs |
+| `2a299fb` | S6 | Shared memory reduction for routing gradients | 256x fewer atomicAdds |
+| `19ca4bd` | S3 | Parallel scan for bilevel forward-save | O(N) → O(N/P + log N) scan |
+| `7645b1b` | S4 | Batched parallel scan single-launch | Multi-param parallel scan |
+| `8ef722f` | S2 | Fix register spill in backward scan | Reduce register pressure |
+| `2a15228` | S8 | Pre-allocate bilevel workspace buffers | Eliminate ~100 MB per-step allocs |
+| `41c3e3b` | S9 | cuBLAS GEMM for precompute projections | Leverage Tensor Cores for N≥1024 |
+| `41e730b` | S12 | Add comprehensive test suite | 10 test categories |
+| `07c8204` | S11 | Fix workspace buffer overflow + dim guards | Correctness fix + safety |
+
+### 8.4 Convergence Loop Summary (Section 11)
+
+An iterative full-codebase audit was performed to find remaining bugs and optimizations:
+
+- **Pass 1**: 5 parallel subagent audits covering all forward kernels, backward kernels, Python files, remaining kernel files, and build system. Found 1 real bug (BilevelWorkspace buffer overflow where `ensure_fwd_save` and `ensure_batched` shared `pre_B`/`pre_C` buffers but tracked sizes independently) and added defensive dimension guards. Several false positives were identified and rejected (RoPE bounds, final_state race condition, expert_idx overflow, Adam bc1/bc2 division by zero).
+
+- **Pass 2**: Same 5-area audit found zero real issues. **Convergence achieved.**
+
+### 8.5 Cross-Optimizer Kernel Fusion Comparison
 
 | Optimizer | # Kernel Launches/Step | Fusion Level |
 |-----------|----------------------|-------------|

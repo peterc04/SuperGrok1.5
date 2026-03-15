@@ -53,6 +53,33 @@ Additional features: dynamic expert recycling, sigmoid-driven SAM/bilevel/WD sch
 - **Expert Weights in Shared Memory**: All 144 expert MLP weights (W1, b1, W2, b2) are loaded into CUDA shared memory at block start, eliminating repeated global memory reads during per-element PEER evaluation.
 - **Expert Backward Shared-Memory Reduction**: Per-block accumulators in shared memory for expert weight gradients, with a single block-level `atomicAdd` at the end — reduces atomic contention by 256x.
 - **Gradient Checkpointing for Bilevel**: Optional `bilevel_checkpoint_interval` parameter saves Mamba scan states every C steps instead of every step during bilevel forward-save. During backward, intermediate states are recomputed from the nearest checkpoint. With C=32, reduces bilevel saved-state memory by ~82% (1.2 GB → 224 MB for 50 parameters).
+- **Pre-Allocated Bilevel Workspace**: A `thread_local` `BilevelWorkspace` struct reuses temporary buffers (precompute outputs, reversed sort arrays, gradient accumulators) across optimizer steps, eliminating ~100 MB of per-step `torch::empty` allocations for 50 parameters.
+- **ATen GEMM for Projection Precompute**: For parameters with N >= 1024 elements, bilevel precompute projections (input, dt, B, C) use cuBLAS via `torch::mm_out` instead of a custom CUDA kernel. Automatically falls back to the custom kernel for small N where cuBLAS launch overhead dominates.
+- **Dimension Safety Guards**: Runtime `TORCH_CHECK` assertions validate that d_model, d_inner, and d_state do not exceed compile-time maximums (MAX_D_MODEL=16, MAX_D_INNER=32, MAX_D_STATE=32) in all forward and backward launchers.
+
+## Testing
+
+```bash
+cd grokking_race_package
+python test_supergrok2.py
+```
+
+The test suite (`test_supergrok2.py`) covers 10 areas:
+
+| Test | Description |
+|------|-------------|
+| 12A | Import and build verification |
+| 12B | Sequential vs parallel scan numerical equivalence |
+| 12C | Forward step correctness (params changed, no NaN, state populated) |
+| 12D | Bilevel meta-learning correctness |
+| 12E | Two-pass backward equivalence |
+| 12F | Expert recycling stability (50 steps without crash) |
+| 12G | Gradient checkpointing equivalence (checkpoint_interval=1 vs 8) |
+| 12H | Edge cases (N=0, N=1, zero grads, large grads, FP16 params) |
+| 12I | All 11 optimizers construct + step |
+| 12J | Memory leak check (200 steps, <10% growth) |
+
+Each test reports PASS/FAIL. Exit code 0 = all pass, 1 = any failure.
 
 ## Model Architectures
 

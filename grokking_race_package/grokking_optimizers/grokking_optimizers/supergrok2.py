@@ -13,6 +13,14 @@ Key features:
   - All adaptive scheduling from v1.5 (sigmoid SAM/bilevel/WD, alpha updates)
   - functional_call SAM (no parameter modification)
   - Python fallback path (CUDA kernels in Phase C)
+
+Performance:
+  - Blelloch parallel prefix scan for N >= 256 (O(N/P + log N) vs O(N))
+  - Expert weights in shared memory (eliminates global reads during PEER eval)
+  - Pre-allocated BilevelWorkspace (eliminates per-step temporary allocations)
+  - ATen GEMM for bilevel precompute projections (N >= 1024)
+  - Gradient checkpointing for bilevel (bilevel_checkpoint_interval parameter)
+  - Shared-memory reduction for backward expert gradients (256x fewer atomics)
 """
 
 import math
