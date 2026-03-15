@@ -44,6 +44,24 @@ constexpr int PSCAN_THRESHOLD = 256;   // fall back to sequential if N < this
 
 
 // ═══════════════════════════════════════════════════════════════════════
+//  Warp-level reduction helper for two-pass backward
+//
+//  Sum a float across d_inner threads (all in one warp, d_inner ≤ 32).
+//  Uses __shfl_down_sync; works for any d_inner ≤ 32 (including non-power-of-2).
+// ═══════════════════════════════════════════════════════════════════════
+
+__device__ __forceinline__ float warp_reduce_sum(float val, int d_inner, int tid) {
+    unsigned mask = (d_inner < 32) ? ((1u << d_inner) - 1) : 0xFFFFFFFF;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other = __shfl_down_sync(mask, val, offset);
+        if (tid + offset < d_inner)
+            val += other;
+    }
+    return val;  // only lane 0 has the correct sum
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
 //  Parallel Prefix Scan Infrastructure (mirrors forward file)
 //
 //  Affine recurrence: h[t] = M[t] * h[t-1] + b[t]
@@ -1042,13 +1060,14 @@ __global__ void mamba3_scan_backward_kernel(
     float* __restrict__ d_in_proj_W,          // [2*d_inner, d_model]
     float* __restrict__ d_dt_proj_W,          // [d_inner, d_inner]
     float* __restrict__ d_dt_proj_b,          // [d_inner]
-    float* __restrict__ d_B_proj_W,           // [d_state, d_inner]
-    float* __restrict__ d_C_proj_W,           // [d_state, d_inner]
     float* __restrict__ d_A_log,              // [d_inner, d_state]
     float* __restrict__ d_D_param,            // [d_inner]
     float* __restrict__ d_rope_freq,          // [d_inner, d_state/2]
     float* __restrict__ d_x_sorted,           // [N, d_model]
     const float* __restrict__ initial_state,  // [d_inner, d_state] or nullptr
+    // Two-pass outputs: per-timestep warp-reduced derivatives for GEMM
+    float* __restrict__ d_C_vals_buf,         // [N, d_state] — reduced across d_inner threads
+    float* __restrict__ d_B_vals_buf,         // [N, d_state] — reduced across d_inner threads
     // Dims
     const int N, const int d_model, const int d_inner, const int d_state,
     const int reverse,
@@ -1057,22 +1076,12 @@ __global__ void mamba3_scan_backward_kernel(
     const int tid = threadIdx.x;
     if (tid >= d_inner) return;
 
-    // Shared memory layout:
+    // Shared memory layout (two-pass: no s_d_C_proj_W / s_d_B_proj_W):
     //   s_x_branch:    [d_inner]
     //   s_d_dt_raw:    [d_inner]
-    //   s_d_C_proj_W:  [d_state * d_inner]  — replaces per-thread local array
-    //   s_d_B_proj_W:  [d_state * d_inner]  — replaces per-thread local array
     extern __shared__ float smem[];
     float* s_x_branch = smem;                                 // [d_inner]
     float* s_d_dt_raw = smem + d_inner;                       // [d_inner]
-    float* s_d_C_proj_W = smem + 2 * d_inner;                // [d_state * d_inner]
-    float* s_d_B_proj_W = s_d_C_proj_W + d_state * d_inner;  // [d_state * d_inner]
-    const int wgrad_smem_size = 2 * d_state * d_inner;
-
-    // Zero shared weight gradient accumulators cooperatively
-    for (int i = tid; i < wgrad_smem_size; i += d_inner)
-        s_d_C_proj_W[i] = 0.0f;  // covers both C and B arrays (contiguous)
-    __syncthreads();
 
     float A[MAX_D_STATE];
     for (int s = 0; s < d_state; s++)
@@ -1157,8 +1166,10 @@ __global__ void mamba3_scan_backward_kernel(
                     C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
                 dh[s] += d_y_val * C_val;
                 float d_C_val = d_y_val * h_s;
-                for (int j = 0; j < d_inner; j++)
-                    atomicAdd(&s_d_C_proj_W[s * d_inner + j], d_C_val * s_x_branch[j]);
+                // Two-pass: warp reduce d_C_val across d_inner threads, write to buffer
+                float d_C_reduced = warp_reduce_sum(d_C_val, d_inner, tid);
+                if (tid == 0)
+                    d_C_vals_buf[i * d_state + s] = d_C_reduced;
                 d_x_from_C += d_y_val * h_s * C_proj_W[s * d_inner + tid];
             }
 
@@ -1208,8 +1219,10 @@ __global__ void mamba3_scan_backward_kernel(
                 d_x_from_scan += d_h_s * B_bar;
                 d_dt_val += d_B_bar * B_val;
                 float d_B_val = d_B_bar * dt_val;
-                for (int j = 0; j < d_inner; j++)
-                    atomicAdd(&s_d_B_proj_W[s * d_inner + j], d_B_val * s_x_branch[j]);
+                // Two-pass: warp reduce d_B_val across d_inner threads, write to buffer
+                float d_B_reduced = warp_reduce_sum(d_B_val, d_inner, tid);
+                if (tid == 0)
+                    d_B_vals_buf[i * d_state + s] = d_B_reduced;
                 d_x_from_scan += d_B_val * B_proj_W[s * d_inner + tid];
                 float d_half_dtA = d_A_bar * (1.0f + A_bar) / denom_val;
                 d_dt_val += d_half_dtA * A[s] / 2.0f;
@@ -1360,8 +1373,10 @@ __global__ void mamba3_scan_backward_kernel(
                         C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
                     dh[s] += d_y_val * C_val;
                     float d_C_val = d_y_val * h_s;
-                    for (int j = 0; j < d_inner; j++)
-                        atomicAdd(&s_d_C_proj_W[s * d_inner + j], d_C_val * s_x_branch[j]);
+                    // Two-pass: warp reduce d_C_val across d_inner threads, write to buffer
+                    float d_C_reduced = warp_reduce_sum(d_C_val, d_inner, tid);
+                    if (tid == 0)
+                        d_C_vals_buf[i * d_state + s] = d_C_reduced;
                     d_x_from_C += d_y_val * h_s * C_proj_W[s * d_inner + tid];
                 }
 
@@ -1405,8 +1420,10 @@ __global__ void mamba3_scan_backward_kernel(
                     d_x_from_scan += d_h_s * B_bar;
                     d_dt_val += d_B_bar * B_val;
                     float d_B_val = d_B_bar * dt_val;
-                    for (int j = 0; j < d_inner; j++)
-                        atomicAdd(&s_d_B_proj_W[s * d_inner + j], d_B_val * s_x_branch[j]);
+                    // Two-pass: warp reduce d_B_val across d_inner threads, write to buffer
+                    float d_B_reduced = warp_reduce_sum(d_B_val, d_inner, tid);
+                    if (tid == 0)
+                        d_B_vals_buf[i * d_state + s] = d_B_reduced;
                     d_x_from_scan += d_B_val * B_proj_W[s * d_inner + tid];
                     float d_half_dtA = d_A_bar * (1.0f + A_bar) / denom_val;
                     d_dt_val += d_half_dtA * A[s] / 2.0f;
@@ -1465,14 +1482,8 @@ __global__ void mamba3_scan_backward_kernel(
     for (int p = 0; p < half_d_state; p++) {
         atomicAdd(&d_rope_freq[tid * half_d_state + p], d_freq_acc[p]);
     }
-    // Flush shared memory weight gradient accumulators to global
-    __syncthreads();
-    for (int k = tid; k < d_state * d_inner; k += d_inner) {
-        if (s_d_C_proj_W[k] != 0.0f)
-            atomicAdd(&d_C_proj_W[k], s_d_C_proj_W[k]);
-        if (s_d_B_proj_W[k] != 0.0f)
-            atomicAdd(&d_B_proj_W[k], s_d_B_proj_W[k]);
-    }
+    // Two-pass: C_proj_W and B_proj_W gradients are computed via GEMM in the launcher
+    // (d_C_vals_buf and d_B_vals_buf were filled per-timestep above)
     // Write per-thread in_proj_W gradients
     for (int d = 0; d < d_model; d++) {
         atomicAdd(&d_in_proj_W[tid * d_model + d], d_in_proj_W_x_local[d]);
@@ -1516,13 +1527,14 @@ __global__ void mamba3_scan_backward_batched_kernel(
     float* __restrict__ d_in_proj_W,
     float* __restrict__ d_dt_proj_W,
     float* __restrict__ d_dt_proj_b,
-    float* __restrict__ d_B_proj_W,
-    float* __restrict__ d_C_proj_W,
     float* __restrict__ d_A_log,
     float* __restrict__ d_D_param,
     float* __restrict__ d_rope_freq,
     float* __restrict__ d_x_sorted_packed,           // [total_N, d_model]
     const int* __restrict__ ckpt_offsets,            // [num_params + 1] or nullptr
+    // Two-pass outputs: per-timestep warp-reduced derivatives for GEMM
+    float* __restrict__ d_C_vals_buf,                // [total_N, d_state]
+    float* __restrict__ d_B_vals_buf,                // [total_N, d_state]
     // Dims
     const int d_model, const int d_inner, const int d_state,
     const int checkpoint_interval  // 0 or 1 = no checkpointing
@@ -1536,22 +1548,12 @@ __global__ void mamba3_scan_backward_batched_kernel(
     const int N = end - start;
     const int reverse = reverse_flags[param_idx];
 
-    // Shared memory layout (same as non-batched kernel):
+    // Shared memory layout (two-pass: no s_d_C_proj_W / s_d_B_proj_W):
     //   s_x_branch:    [d_inner]
     //   s_d_dt_raw:    [d_inner]
-    //   s_d_C_proj_W:  [d_state * d_inner]
-    //   s_d_B_proj_W:  [d_state * d_inner]
     extern __shared__ float smem[];
     float* s_x_branch = smem;
     float* s_d_dt_raw = smem + d_inner;
-    float* s_d_C_proj_W = smem + 2 * d_inner;
-    float* s_d_B_proj_W = s_d_C_proj_W + d_state * d_inner;
-    const int wgrad_smem_size = 2 * d_state * d_inner;
-
-    // Zero shared weight gradient accumulators cooperatively
-    for (int i = tid; i < wgrad_smem_size; i += d_inner)
-        s_d_C_proj_W[i] = 0.0f;  // covers both C and B (contiguous)
-    __syncthreads();
 
     // Point to this param's packed data
     const float* my_d_scan = d_scan_output_packed + start * d_inner;
@@ -1564,6 +1566,9 @@ __global__ void mamba3_scan_backward_batched_kernel(
     const float* my_saved_z = saved_z_packed + start * d_inner;
     const float* my_saved_dt = saved_dt_packed + start * d_inner;
     float* my_d_x_sorted = d_x_sorted_packed + start * d_model;
+    // Two-pass buffers for this param
+    float* my_d_C_vals = d_C_vals_buf + start * d_state;
+    float* my_d_B_vals = d_B_vals_buf + start * d_state;
 
     float A[MAX_D_STATE];
     for (int s = 0; s < d_state; s++)
@@ -1638,8 +1643,10 @@ __global__ void mamba3_scan_backward_batched_kernel(
                     C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
                 dh[s] += d_y_val * C_val;
                 float d_C_val = d_y_val * h_s;
-                for (int j = 0; j < d_inner; j++)
-                    atomicAdd(&s_d_C_proj_W[s * d_inner + j], d_C_val * s_x_branch[j]);
+                // Two-pass: warp reduce d_C_val across d_inner threads, write to buffer
+                float d_C_reduced = warp_reduce_sum(d_C_val, d_inner, tid);
+                if (tid == 0)
+                    my_d_C_vals[i * d_state + s] = d_C_reduced;
                 d_x_from_C += d_y_val * h_s * C_proj_W[s * d_inner + tid];
             }
 
@@ -1688,8 +1695,10 @@ __global__ void mamba3_scan_backward_batched_kernel(
                 d_x_from_scan += d_h_s * B_bar;
                 d_dt_val += d_B_bar * B_val;
                 float d_B_val = d_B_bar * dt_val;
-                for (int j = 0; j < d_inner; j++)
-                    atomicAdd(&s_d_B_proj_W[s * d_inner + j], d_B_val * s_x_branch[j]);
+                // Two-pass: warp reduce d_B_val across d_inner threads, write to buffer
+                float d_B_reduced = warp_reduce_sum(d_B_val, d_inner, tid);
+                if (tid == 0)
+                    my_d_B_vals[i * d_state + s] = d_B_reduced;
                 d_x_from_scan += d_B_val * B_proj_W[s * d_inner + tid];
                 float d_half_dtA = d_A_bar * (1.0f + A_bar) / denom_val;
                 d_dt_val += d_half_dtA * A[s] / 2.0f;
@@ -1819,8 +1828,10 @@ __global__ void mamba3_scan_backward_batched_kernel(
                         C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
                     dh[s] += d_y_val * C_val;
                     float d_C_val = d_y_val * h_s;
-                    for (int j = 0; j < d_inner; j++)
-                        atomicAdd(&s_d_C_proj_W[s * d_inner + j], d_C_val * s_x_branch[j]);
+                    // Two-pass: warp reduce d_C_val across d_inner threads, write to buffer
+                    float d_C_reduced = warp_reduce_sum(d_C_val, d_inner, tid);
+                    if (tid == 0)
+                        my_d_C_vals[i * d_state + s] = d_C_reduced;
                     d_x_from_C += d_y_val * h_s * C_proj_W[s * d_inner + tid];
                 }
                 float h_prev[MAX_D_STATE];
@@ -1859,8 +1870,10 @@ __global__ void mamba3_scan_backward_batched_kernel(
                     d_x_from_scan += d_h_s * B_bar;
                     d_dt_val += d_B_bar * B_val;
                     float d_B_val = d_B_bar * dt_val;
-                    for (int j = 0; j < d_inner; j++)
-                        atomicAdd(&s_d_B_proj_W[s * d_inner + j], d_B_val * s_x_branch[j]);
+                    // Two-pass: warp reduce d_B_val across d_inner threads, write to buffer
+                    float d_B_reduced = warp_reduce_sum(d_B_val, d_inner, tid);
+                    if (tid == 0)
+                        my_d_B_vals[i * d_state + s] = d_B_reduced;
                     d_x_from_scan += d_B_val * B_proj_W[s * d_inner + tid];
                     float d_half_dtA = d_A_bar * (1.0f + A_bar) / denom_val;
                     d_dt_val += d_half_dtA * A[s] / 2.0f;
@@ -1910,14 +1923,8 @@ __global__ void mamba3_scan_backward_batched_kernel(
         atomicAdd(&d_A_log[tid * d_state + s], d_A_log_acc[s]);
     for (int p = 0; p < half_d_state; p++)
         atomicAdd(&d_rope_freq[tid * half_d_state + p], d_freq_acc[p]);
-    // Flush shared memory weight gradient accumulators to global
-    __syncthreads();
-    for (int k = tid; k < d_state * d_inner; k += d_inner) {
-        if (s_d_C_proj_W[k] != 0.0f)
-            atomicAdd(&d_C_proj_W[k], s_d_C_proj_W[k]);
-        if (s_d_B_proj_W[k] != 0.0f)
-            atomicAdd(&d_B_proj_W[k], s_d_B_proj_W[k]);
-    }
+    // Two-pass: C_proj_W and B_proj_W gradients are computed via GEMM in the launcher
+    // (d_C_vals_buf and d_B_vals_buf were filled per-timestep above)
     // Write per-thread in_proj_W gradients
     for (int d = 0; d < d_model; d++) {
         atomicAdd(&d_in_proj_W[tid * d_model + d], d_in_proj_W_x_local[d]);
@@ -2977,12 +2984,17 @@ void launch_mamba3_peer_backward(
     );
 
     // Step 8: Mamba scan backward (both directions)
-    // s_x_branch[d_inner] + s_d_dt_raw[d_inner] + s_d_C_proj_W[d_state*d_inner] + s_d_B_proj_W[d_state*d_inner]
-    int scan_smem = (2 * d_inner + 2 * d_state * d_inner) * sizeof(float);
+    // Two-pass: s_x_branch[d_inner] + s_d_dt_raw[d_inner] (no s_d_C/B_proj_W)
+    int scan_smem = 2 * d_inner * sizeof(float);
     auto d_x_sorted_fwd = g_bilevel_ws.d_x_sorted_fwd.narrow(0, 0, N);
     auto d_x_sorted_bwd = g_bilevel_ws.d_x_sorted_bwd.narrow(0, 0, N);
     d_x_sorted_fwd.zero_();
     d_x_sorted_bwd.zero_();
+
+    // Two-pass buffers for warp-reduced per-timestep derivatives
+    auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
+    auto d_C_vals_fwd = torch::empty({N, d_state}, float_opts);
+    auto d_B_vals_fwd = torch::empty({N, d_state}, float_opts);
 
     mamba3_scan_backward_kernel<<<1, d_inner, scan_smem>>>(
         d_fwd_scan_out.data_ptr<float>(),
@@ -3002,20 +3014,29 @@ void launch_mamba3_peer_backward(
         d_mamba_fwd_in_proj.data_ptr<float>(),
         d_mamba_fwd_dt_W.data_ptr<float>(),
         d_mamba_fwd_dt_b.data_ptr<float>(),
-        d_mamba_fwd_B_proj.data_ptr<float>(),
-        d_mamba_fwd_C_proj.data_ptr<float>(),
         d_mamba_fwd_A_log.data_ptr<float>(),
         d_mamba_fwd_D.data_ptr<float>(),
         d_mamba_fwd_rope.data_ptr<float>(),
         d_x_sorted_fwd.data_ptr<float>(),
         mamba_fwd_init_state.numel() > 0
             ? mamba_fwd_init_state.data_ptr<float>() : nullptr,
+        d_C_vals_fwd.data_ptr<float>(),
+        d_B_vals_fwd.data_ptr<float>(),
         N, d_model, d_inner, d_state, 0,
         (checkpoint_interval > 1) ? checkpoint_interval : 0
     );
 
+    // Two-pass GEMM: d_C_proj_W += d_C_vals.T @ saved_x_branch
+    // d_C_vals_fwd: [N, d_state], fwd_saved_x_branch: [N, d_inner]
+    // d_C_proj_W: [d_state, d_inner] += [d_state, N] @ [N, d_inner]
+    torch::mm_out(d_mamba_fwd_C_proj, d_C_vals_fwd.t(), fwd_saved_x_branch);
+    torch::mm_out(d_mamba_fwd_B_proj, d_B_vals_fwd.t(), fwd_saved_x_branch);
+
     // Backward scan used reversed x_sorted
     auto x_sorted_rev = x_sorted.flip(0).contiguous();
+    auto d_C_vals_bwd = torch::empty({N, d_state}, float_opts);
+    auto d_B_vals_bwd = torch::empty({N, d_state}, float_opts);
+
     mamba3_scan_backward_kernel<<<1, d_inner, scan_smem>>>(
         d_bwd_scan_out.data_ptr<float>(),
         x_sorted_rev.data_ptr<float>(),
@@ -3034,17 +3055,21 @@ void launch_mamba3_peer_backward(
         d_mamba_bwd_in_proj.data_ptr<float>(),
         d_mamba_bwd_dt_W.data_ptr<float>(),
         d_mamba_bwd_dt_b.data_ptr<float>(),
-        d_mamba_bwd_B_proj.data_ptr<float>(),
-        d_mamba_bwd_C_proj.data_ptr<float>(),
         d_mamba_bwd_A_log.data_ptr<float>(),
         d_mamba_bwd_D.data_ptr<float>(),
         d_mamba_bwd_rope.data_ptr<float>(),
         d_x_sorted_bwd.data_ptr<float>(),
         mamba_bwd_init_state.numel() > 0
             ? mamba_bwd_init_state.data_ptr<float>() : nullptr,
+        d_C_vals_bwd.data_ptr<float>(),
+        d_B_vals_bwd.data_ptr<float>(),
         N, d_model, d_inner, d_state, 0,
         (checkpoint_interval > 1) ? checkpoint_interval : 0
     );
+
+    // Two-pass GEMM: d_C_proj_W += d_C_vals.T @ saved_x_branch (bwd direction)
+    torch::mm_out(d_mamba_bwd_C_proj, d_C_vals_bwd.t(), bwd_saved_x_branch);
+    torch::mm_out(d_mamba_bwd_B_proj, d_B_vals_bwd.t(), bwd_saved_x_branch);
 
     // Combine d_x_sorted from both directions
     // bwd scan backward produces d for reversed input, flip back
@@ -3468,8 +3493,8 @@ void launch_mamba3_peer_backward_batched(
     auto total_N = x_sorted_packed.size(0);
     g_bilevel_ws.ensure_batched(total_N, d_model, d_inner, d_state, dev);
 
-    // s_x_branch[d_inner] + s_d_dt_raw[d_inner] + s_d_C_proj_W[d_state*d_inner] + s_d_B_proj_W[d_state*d_inner]
-    int scan_smem = (2 * d_inner + 2 * d_state * d_inner) * sizeof(float);
+    // Two-pass: s_x_branch[d_inner] + s_d_dt_raw[d_inner] (no s_d_C/B_proj_W)
+    int scan_smem = 2 * d_inner * sizeof(float);
     int ckpt_int = (checkpoint_interval > 1) ? checkpoint_interval : 0;
 
     // Compute checkpoint offsets if needed (using offsets already on GPU)
@@ -3488,6 +3513,11 @@ void launch_mamba3_peer_backward_batched(
         ckpt_offsets_t = torch::from_blob(ckpt_offsets_cpu.data(), {num_params + 1},
             torch::kInt32).to(dev).clone();
     }
+
+    // Two-pass buffers for warp-reduced per-timestep derivatives
+    auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
+    auto d_C_vals_packed = torch::empty({total_N, d_state}, float_opts);
+    auto d_B_vals_packed = torch::empty({total_N, d_state}, float_opts);
 
     // Forward direction backward scan
     auto d_x_sorted_fwd = g_bilevel_ws.d_x_sorted_fwd_bat.narrow(0, 0, total_N);
@@ -3513,15 +3543,20 @@ void launch_mamba3_peer_backward_batched(
         d_mamba_fwd_in_proj.data_ptr<float>(),
         d_mamba_fwd_dt_W.data_ptr<float>(),
         d_mamba_fwd_dt_b.data_ptr<float>(),
-        d_mamba_fwd_B_proj.data_ptr<float>(),
-        d_mamba_fwd_C_proj.data_ptr<float>(),
         d_mamba_fwd_A_log.data_ptr<float>(),
         d_mamba_fwd_D.data_ptr<float>(),
         d_mamba_fwd_rope.data_ptr<float>(),
         d_x_sorted_fwd.data_ptr<float>(),
         ckpt_int > 1 ? ckpt_offsets_t.data_ptr<int>() : nullptr,
+        d_C_vals_packed.data_ptr<float>(),
+        d_B_vals_packed.data_ptr<float>(),
         d_model, d_inner, d_state, ckpt_int
     );
+
+    // Two-pass GEMM: d_C_proj_W = d_C_vals_packed.T @ fwd_saved_xb_packed
+    // [d_state, total_N] @ [total_N, d_inner] → [d_state, d_inner]
+    torch::mm_out(d_mamba_fwd_C_proj, d_C_vals_packed.t(), fwd_saved_xb_packed);
+    torch::mm_out(d_mamba_fwd_B_proj, d_B_vals_packed.t(), fwd_saved_xb_packed);
 
     // Build reversed x_sorted via CUDA kernel (no CPU-GPU sync)
     auto x_sorted_rev_packed = g_bilevel_ws.x_sorted_rev.narrow(0, 0, total_N);
@@ -3536,7 +3571,7 @@ void launch_mamba3_peer_backward_batched(
         );
     }
 
-    // Backward direction backward scan
+    // Backward direction backward scan (reuse d_C/B_vals_packed buffers)
     auto d_x_sorted_bwd = g_bilevel_ws.d_x_sorted_bwd_bat.narrow(0, 0, total_N);
     d_x_sorted_bwd.zero_();
     mamba3_scan_backward_batched_kernel<<<num_params, d_inner, scan_smem>>>(
@@ -3560,15 +3595,19 @@ void launch_mamba3_peer_backward_batched(
         d_mamba_bwd_in_proj.data_ptr<float>(),
         d_mamba_bwd_dt_W.data_ptr<float>(),
         d_mamba_bwd_dt_b.data_ptr<float>(),
-        d_mamba_bwd_B_proj.data_ptr<float>(),
-        d_mamba_bwd_C_proj.data_ptr<float>(),
         d_mamba_bwd_A_log.data_ptr<float>(),
         d_mamba_bwd_D.data_ptr<float>(),
         d_mamba_bwd_rope.data_ptr<float>(),
         d_x_sorted_bwd.data_ptr<float>(),
         ckpt_int > 1 ? ckpt_offsets_t.data_ptr<int>() : nullptr,
+        d_C_vals_packed.data_ptr<float>(),
+        d_B_vals_packed.data_ptr<float>(),
         d_model, d_inner, d_state, ckpt_int
     );
+
+    // Two-pass GEMM: d_C_proj_W = d_C_vals_packed.T @ bwd_saved_xb_packed
+    torch::mm_out(d_mamba_bwd_C_proj, d_C_vals_packed.t(), bwd_saved_xb_packed);
+    torch::mm_out(d_mamba_bwd_B_proj, d_B_vals_packed.t(), bwd_saved_xb_packed);
 
     // Combine: out = fwd + reverse_segments(bwd) via single CUDA kernel
     {

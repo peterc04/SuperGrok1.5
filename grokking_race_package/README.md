@@ -52,6 +52,8 @@ Additional features: dynamic expert recycling, sigmoid-driven SAM/bilevel/WD sch
 - **Blelloch Parallel Prefix Scan**: For parameters with N >= 256 elements, the sequential O(N) scan is replaced with a work-efficient parallel scan achieving O(N/P + log N) time. Uses affine transform composition over paired RoPE state dimensions. Automatically falls back to sequential scan for small parameters.
 - **Expert Weights in Shared Memory**: All 144 expert MLP weights (W1, b1, W2, b2) are loaded into CUDA shared memory at block start, eliminating repeated global memory reads during per-element PEER evaluation.
 - **Expert Backward Shared-Memory Reduction**: Per-block accumulators in shared memory for expert weight gradients, with a single block-level `atomicAdd` at the end — reduces atomic contention by 256x.
+- **Two-Pass GEMM Backward for Projection Weights**: Backward scan weight gradients (d_C_proj_W, d_B_proj_W) use a two-pass approach: Pass 1 writes per-timestep warp-reduced derivative scalars to a global buffer via `__shfl_down_sync`; Pass 2 accumulates via cuBLAS GEMM (`torch::mm_out`). Eliminates N×d_state×d_inner shared-memory atomicAdds per scan direction, replacing them with a single matrix multiply.
+- **Batched Parallel Scan Single-Launch**: For parameters with N >= 256 elements, the per-parameter for-loop of parallel scan kernel launches is replaced with a single `mamba3_parallel_scan_batched_kernel` using a 2D grid `dim3(d_inner, num_params)`. Eliminates num_params kernel launch overhead and enables cross-parameter SM scheduling.
 - **Gradient Checkpointing for Bilevel**: Optional `bilevel_checkpoint_interval` parameter saves Mamba scan states every C steps instead of every step during bilevel forward-save. During backward, intermediate states are recomputed from the nearest checkpoint. With C=32, reduces bilevel saved-state memory by ~82% (1.2 GB → 224 MB for 50 parameters).
 - **Pre-Allocated Bilevel Workspace**: A `thread_local` `BilevelWorkspace` struct reuses temporary buffers (precompute outputs, reversed sort arrays, gradient accumulators) across optimizer steps, eliminating ~100 MB of per-step `torch::empty` allocations for 50 parameters.
 - **ATen GEMM for Projection Precompute**: For parameters with N >= 1024 elements, bilevel precompute projections (input, dt, B, C) use cuBLAS via `torch::mm_out` instead of a custom CUDA kernel. Automatically falls back to the custom kernel for small N where cuBLAS launch overhead dominates.
@@ -64,7 +66,7 @@ cd grokking_race_package
 python test_supergrok2.py
 ```
 
-The test suite (`test_supergrok2.py`) covers 10 areas:
+The test suite (`test_supergrok2.py`) covers 12 areas:
 
 | Test | Description |
 |------|-------------|
@@ -78,6 +80,8 @@ The test suite (`test_supergrok2.py`) covers 10 areas:
 | 12H | Edge cases (N=0, N=1, zero grads, large grads, FP16 params) |
 | 12I | All 11 optimizers construct + step |
 | 12J | Memory leak check (200 steps, <10% growth) |
+| 12K | Two-pass GEMM backward reproducibility (max diff < 1e-4 across seeded runs) |
+| 12L | Batched parallel scan single-launch (finite params, bitwise reproducibility) |
 
 Each test reports PASS/FAIL. Exit code 0 = all pass, 1 = any failure.
 

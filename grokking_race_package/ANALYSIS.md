@@ -318,6 +318,24 @@ In the backward pass, all N elements accumulate expert weight gradients via `ato
 
 **Benefit**: Reduces atomic contention by block_size (256x). Total atomicAdds reduced from N × 4_heads × K² per expert to (N/256) × 4_heads × K².
 
+### 7.5 Two-Pass GEMM Backward for Projection Weights
+
+The backward scan kernel accumulated d_C_proj_W and d_B_proj_W via per-timestep shared-memory atomicAdds: each of d_inner threads wrote d_state values per timestep, totaling N × d_inner × d_state atomicAdds per direction per projection weight matrix.
+
+**Implementation**: Two-pass approach:
+1. **Pass 1 (in-kernel)**: At each timestep, the d_C_val and d_B_val scalars are warp-reduced across d_inner threads using `__shfl_down_sync`. Lane 0 writes the reduced scalar to a global buffer `d_C_vals_buf[t, s]` (shape [N, d_state]).
+2. **Pass 2 (launcher)**: A single cuBLAS GEMM via `torch::mm_out` computes `d_C_proj_W = d_C_vals_buf.T @ saved_x_branch` — a [d_state, N] × [N, d_inner] → [d_state, d_inner] matrix multiply.
+
+**Benefit**: Eliminates N × d_state × d_inner shared-memory atomicAdds per direction, replacing them with N × d_state warp reductions (free within a warp) plus a single GEMM. Also removes 2 × d_state × d_inner floats from shared memory, reducing shared memory from `2*d_inner + 2*d_state*d_inner` to `2*d_inner` floats.
+
+### 7.6 Batched Parallel Scan Single-Launch
+
+For parameters with N >= 256, the parallel scan was launched via a per-parameter Python/C++ for-loop, issuing num_params separate kernel launches. Each launch incurs ~5-10μs overhead, and serialized launches prevent cross-parameter SM scheduling.
+
+**Implementation**: New `mamba3_parallel_scan_batched_kernel` uses a 2D grid `dim3(d_inner, num_params)` where `blockIdx.x` selects the d_inner column and `blockIdx.y` selects the parameter. Each block reads its parameter's element count from an offsets array and a per-parameter reverse flag to handle forward vs backward scan direction.
+
+**Benefit**: Eliminates 2 × num_params kernel launches (forward + backward) per optimizer step, replacing them with 2 single launches. For 50 parameters, saves ~500-1000μs of launch overhead and enables the GPU scheduler to overlap blocks from different parameters across SMs.
+
 ### 7.4 Gradient Checkpointing for Bilevel
 
 The bilevel forward-save path stores scan states at every timestep for backward recomputation. For 50 parameters × 2 directions × avg N=10K, this requires ~1.22 GB of saved states.
@@ -374,6 +392,8 @@ The bilevel forward-save path stores scan states at every timestep for backward 
 | `41c3e3b` | S9 | cuBLAS GEMM for precompute projections | Leverage Tensor Cores for N≥1024 |
 | `41e730b` | S12 | Add comprehensive test suite | 10 test categories |
 | `07c8204` | S11 | Fix workspace buffer overflow + dim guards | Correctness fix + safety |
+| — | S7.5 | Two-pass GEMM backward for d_C/d_B_proj_W | Eliminate N×d_state×d_inner atomicAdds |
+| — | S7.6 | Batched parallel scan single-launch | Eliminate 2×num_params kernel launches |
 
 ### 8.4 Convergence Loop Summary (Section 11)
 
