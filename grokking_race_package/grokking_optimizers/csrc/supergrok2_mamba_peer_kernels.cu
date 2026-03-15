@@ -137,7 +137,7 @@ __global__ void mamba3_scan_kernel(
     const float* __restrict__ C_proj_W,   // [d_state, d_inner]
     const float* __restrict__ A_log,      // [d_inner, d_state]
     const float* __restrict__ D_param,    // [d_inner]
-    const float* __restrict__ rope_freq,  // [d_inner, d_state]
+    const float* __restrict__ rope_freq,  // [d_inner, d_state/2]
     float* __restrict__ scan_output,      // [N, d_inner]
     float* __restrict__ final_state,      // [d_inner, d_state]
     const float* __restrict__ initial_state, // [d_inner, d_state] or nullptr
@@ -889,7 +889,7 @@ __global__ void mamba3_scan_batched_kernel(
     const float* __restrict__ C_proj_W,            // [d_state, d_inner]
     const float* __restrict__ A_log,               // [d_inner, d_state]
     const float* __restrict__ D_param,             // [d_inner]
-    const float* __restrict__ rope_freq,           // [d_inner, d_state]
+    const float* __restrict__ rope_freq,           // [d_inner, d_state/2]
     const int d_model,
     const int d_inner,
     const int d_state
@@ -1207,7 +1207,7 @@ struct ScanWorkspace {
         d_state = ds;
     }
 };
-static ScanWorkspace g_workspace;
+static thread_local ScanWorkspace g_workspace;
 } // namespace
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1235,7 +1235,7 @@ void launch_mamba3_peer_step(
     torch::Tensor mamba_fwd_C_proj,   // [d_state, d_inner]
     torch::Tensor mamba_fwd_A_log,    // [d_inner, d_state]
     torch::Tensor mamba_fwd_D,        // [d_inner]
-    torch::Tensor mamba_fwd_rope,     // [d_inner, d_state]
+    torch::Tensor mamba_fwd_rope,     // [d_inner, d_state/2]
     torch::Tensor mamba_fwd_out_proj, // [d_model, d_inner]
     // Mamba backward weights
     torch::Tensor mamba_bwd_in_proj,
@@ -1277,6 +1277,7 @@ void launch_mamba3_peer_step(
     TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
     TORCH_CHECK(d_model <= MAX_D_MODEL, "d_model exceeds MAX_D_MODEL (", d_model, " > ", MAX_D_MODEL, ")");
     TORCH_CHECK(gru_hidden <= MAX_GRU_HIDDEN, "gru_hidden exceeds MAX_GRU_HIDDEN (", gru_hidden, " > ", MAX_GRU_HIDDEN, ")");
+    TORCH_CHECK(d_inner % 4 == 0, "d_inner must be a multiple of 4 for vectorized loads (got ", d_inner, ")");
 
     auto dev = grad.device();
     auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
@@ -1570,6 +1571,7 @@ void launch_mamba3_peer_batched_step(
     TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
     TORCH_CHECK(d_model <= MAX_D_MODEL, "d_model exceeds MAX_D_MODEL (", d_model, " > ", MAX_D_MODEL, ")");
     TORCH_CHECK(gru_hidden <= MAX_GRU_HIDDEN, "gru_hidden exceeds MAX_GRU_HIDDEN (", gru_hidden, " > ", MAX_GRU_HIDDEN, ")");
+    TORCH_CHECK(d_inner % 4 == 0, "d_inner must be a multiple of 4 for vectorized loads (got ", d_inner, ")");
 
     auto dev = grads[0].device();
     auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);

@@ -51,7 +51,7 @@ __global__ void mamba3_scan_fwd_save_kernel(
     const float* __restrict__ C_proj_W,     // [d_state, d_inner]
     const float* __restrict__ A_log,        // [d_inner, d_state]
     const float* __restrict__ D_param,      // [d_inner]
-    const float* __restrict__ rope_freq,    // [d_inner, d_state]
+    const float* __restrict__ rope_freq,    // [d_inner, d_state/2]
     float* __restrict__ scan_output,        // [N, d_inner]
     float* __restrict__ final_state,        // [d_inner, d_state]
     // Saved intermediates for backward
