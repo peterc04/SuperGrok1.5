@@ -97,6 +97,32 @@ The PyTorch test suite (`test_supergrok2.py`) covers 27 areas (plus 12 JAX tests
 
 Each test reports PASS/FAIL. Exit code 0 = all pass, 1 = any failure.
 
+### Cross-Platform Test Matrix
+
+```bash
+# Test all optimizers on current GPU
+python tests/test_matrix.py
+
+# Test all NVIDIA architecture tiers via FORCE_ARCH
+python tests/test_all_tiers.py
+
+# Test all JAX optimizers
+python tests/test_jax_matrix.py
+```
+
+### Benchmarks
+
+```bash
+# Benchmark all optimizers (step time, memory, throughput)
+python benchmarks/benchmark_supergrok2.py
+
+# Benchmark a single optimizer with larger model
+python benchmarks/benchmark_supergrok2.py --optimizer SuperGrok2 --model-size 512
+
+# Auto-tune kernel configs for current GPU
+python benchmarks/autotune.py
+```
+
 ## Model Architectures
 
 - **Decoder Transformer** — causal attention, standard for modular arithmetic grokking
@@ -149,9 +175,12 @@ Each test reports PASS/FAIL. Exit code 0 = all pass, 1 = any failure.
 │   ├── sharding.py                              # TPU mesh + data-parallel sharding
 │   ├── quantization_jax.py                      # INT8 quantization utilities
 │   ├── bridge.py                                # PyTorch <-> JAX weight conversion
-│   ├── pallas_kernels.py                        # Pallas custom kernels (placeholder)
+│   ├── simple_optimizers_jax.py                  # JAX: GrokAdamW, Lion, Grokfast, Prodigy, Muon, LookSAM
+│   ├── metanet_optimizers_jax.py                 # JAX: SuperGrok v1.5, v1.1, NeuralGrok
+│   ├── pallas_kernels.py                         # Pallas custom kernels (with fallback stub)
+│   ├── distributed_example.py                    # Multi-TPU pod training example
 │   └── tests/
-│       └── test_supergrok2_jax.py               # 12-test JAX test suite
+│       └── test_supergrok2_jax.py                # 17-test JAX test suite
 │
 ├── grokking_optimizers/                        # Python package
 │   ├── __init__.py                             # Package exports
@@ -172,7 +201,16 @@ Each test reports PASS/FAIL. Exit code 0 = all pass, 1 = any failure.
 │   └── distributed.py                          # DDP/FSDP training utilities
 │
 ├── tests/                                      # Test suite
-│   └── test_supergrok2.py
+│   ├── test_supergrok2.py                      # 27-area PyTorch test suite
+│   ├── test_matrix.py                          # Cross-platform optimizer matrix
+│   ├── test_all_tiers.py                       # Multi-tier FORCE_ARCH validation
+│   ├── test_jax_matrix.py                      # JAX optimizer test matrix (10 tests)
+│   ├── test_amd_hip.py                         # AMD ROCm/HIP-specific tests
+│   └── test_cpu_fallback.py                    # CPU fallback path tests
+│
+├── benchmarks/                                 # Performance benchmarks
+│   ├── benchmark_supergrok2.py                 # Step time, memory, throughput
+│   └── autotune.py                             # Per-GPU kernel auto-tuning
 │
 ├── setup.py                                    # Build script (CUDA sm_70–sm_90 + ROCm)
 ├── pyproject.toml
@@ -379,7 +417,7 @@ jax_weights_to_pytorch(jax_weights, pytorch_meta_net)
 python supergrok2_jax_tpu/tests/test_supergrok2_jax.py
 ```
 
-12 tests covering: imports, associative scan operator, Mamba scan, GRU cell, PEER routing, full forward, optimizer step, bilevel gradients, JIT compilation, INT8 quantization, sharding, and pytree compatibility.
+17 tests covering: imports, associative scan operator, Mamba scan, GRU cell, PEER routing, full forward, optimizer step, bilevel gradients, JIT compilation, INT8 quantization, sharding, pytree compatibility, cross-framework test vectors, all simple optimizers, meta-net optimizers, sharding utilities, and JIT no-retrace verification.
 
 ### Requirements (JAX)
 

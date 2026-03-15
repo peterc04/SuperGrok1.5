@@ -105,7 +105,7 @@ class Mamba3ScanBlock(nn.Module):
         x_branch, z = xz.chunk(2, dim=-1)  # each [N, d_inner]
 
         # Selective parameters (input-dependent)
-        dt = torch.softplus(self.dt_proj(x_branch))  # [N, d_inner] -- positive
+        dt = torch.nn.functional.softplus(self.dt_proj(x_branch))  # [N, d_inner] -- positive
         B = self.B_proj(x_branch)                       # [N, d_state]
         C = self.C_proj(x_branch)                       # [N, d_state]
 
@@ -151,7 +151,7 @@ class Mamba3ScanBlock(nn.Module):
         y = torch.stack(outputs, dim=0)  # [N, d_inner]
 
         # Gated output
-        y = y * torch.silu(z)  # [N, d_inner]
+        y = y * torch.nn.functional.silu(z)  # [N, d_inner]
 
         # Skip connection within SSM
         y = y + self.D.unsqueeze(0) * x_branch

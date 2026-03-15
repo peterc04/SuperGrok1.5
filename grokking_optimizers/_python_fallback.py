@@ -57,10 +57,13 @@ def supergrok15_fused_step(
         g = g.reshape(-1).float()
         g = _clip_grad(g, grad_clip_norm)
 
-        # Meta-net: simple MLP
-        scaled = g * rescale_val
-        hidden = torch.relu(torch.addmv(b1_f, W1_f, scaled))
-        smart_g = g + rescale_val * torch.mv(W2_f.t(), hidden)
+        # Meta-net: per-element MLP (vectorized)
+        # Input: [N, 2] where features are (grad, mu) per element
+        mu_flat = mus[i].reshape(-1).float()
+        inp = torch.stack([g * rescale_val, mu_flat * rescale_val], dim=-1)  # [N, 2]
+        hidden = torch.relu(inp @ W1_f.t() + b1_f.unsqueeze(0))  # [N, H]
+        meta_out = (hidden @ W2_f.t() + b2_f.unsqueeze(0)).squeeze(-1)  # [N]
+        smart_g = g + rescale_val * meta_out
 
         # Mu EMA
         alpha = layer_alphas[i]

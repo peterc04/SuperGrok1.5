@@ -416,3 +416,40 @@ An iterative full-codebase audit was performed to find remaining bugs and optimi
 | Muon | 1 + 3×ns_steps (matmul) | Unfused matmuls |
 | LookSAM | 4 + AdamW | Many launches |
 | SuperGrok v1.1 | 2 (metanet + adam) + gate | Could fuse like v1.5 |
+
+---
+
+## 9. Production Engineering Summary (v2.1.0)
+
+### 9.1 Platform Coverage
+
+| Platform | Backend | Optimizers | Tests |
+|----------|---------|-----------|-------|
+| NVIDIA GPU (sm_70–sm_100) | C++/CUDA | All 11 | test_supergrok2.py (27), test_matrix.py (10), test_all_tiers.py (3 tiers) |
+| AMD GPU (MI100–MI300X) | C++/HIP | All 11 | test_amd_hip.py |
+| CPU (x86/ARM) | C++/OpenMP | All 11 | test_cpu_fallback.py |
+| TPU (v4/v5) / JAX-on-GPU | JAX | All 11 | test_supergrok2_jax.py (17), test_jax_matrix.py (10) |
+
+### 9.2 Test Matrix
+
+Total test coverage: **67 test points** across 6 test files:
+- `tests/test_supergrok2.py`: 27 areas (12A–12AA) — core functionality, edge cases, memory, quantization, distributed, compile
+- `tests/test_matrix.py`: 10 optimizers × current device — cross-platform correctness
+- `tests/test_all_tiers.py`: 10 optimizers × 3 NVIDIA tiers (sm_75, sm_80, sm_90) — tier validation
+- `tests/test_jax_matrix.py`: 10 JAX optimizers — functional correctness
+- `supergrok2_jax_tpu/tests/test_supergrok2_jax.py`: 17 tests (J1–J17) — JAX implementation
+- `tests/test_amd_hip.py` + `tests/test_cpu_fallback.py`: Platform-specific paths
+
+### 9.3 Benchmark Suite
+
+- `benchmarks/benchmark_supergrok2.py`: Step time (ms), throughput (params/sec), peak memory (MB) for all 11 optimizers. Uses CUDA events for accurate GPU timing.
+- `benchmarks/autotune.py`: Per-GPU kernel profiling with result caching in `~/.cache/supergrok/`. Profiles scan and elem_step kernels at multiple problem sizes.
+
+### 9.4 JAX Optimizer Parity
+
+All 11 optimizers now have pure JAX implementations:
+- **Simple optimizers** (`simple_optimizers_jax.py`): GrokAdamW, Lion, Grokfast, Prodigy, Muon, LookSAM
+- **Meta-net optimizers** (`metanet_optimizers_jax.py`): SuperGrok v1.5, v1.1, NeuralGrok
+- **SuperGrok v2** (`supergrok2_jax.py` + `mamba3_peer_metanet_jax.py`): Full meta-net with `lax.associative_scan`
+
+All use functional NamedTuple state, no mutation, and are JIT-compatible.

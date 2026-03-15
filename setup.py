@@ -188,7 +188,10 @@ setup(
         "AMD (MI250/MI300X), TPU (v4/v5), and CPU. "
         "Multi-precision: FP32/TF32/BF16/FP8/INT8/INT4/MXFP4/NVFP4."
     ),
+    long_description=open("README.md").read(),
+    long_description_content_type="text/markdown",
     author="Peter C.",
+    url="https://github.com/peterc04/SuperGrok1.5",
     license="MIT",
     classifiers=[
         "Development Status :: 4 - Beta",

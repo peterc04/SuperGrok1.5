@@ -11,11 +11,13 @@ import torch.nn as nn
 from torch.optim import Optimizer
 from typing import Optional, Callable, Dict, Tuple
 
-from grokking_optimizers import _HAS_OPS
-if _HAS_OPS:
+from grokking_optimizers import _HAS_OPS, _HAS_CUDA
+if _HAS_OPS and _HAS_CUDA:
     from grokking_optimizers import _ops
+    from grokking_optimizers import _python_fallback as _ops_cpu
 else:
     from grokking_optimizers import _python_fallback as _ops
+    _ops_cpu = _ops
 from .supergrok15 import SharpnessMetaNet
 
 
@@ -183,7 +185,8 @@ class SuperGrok11(Optimizer):
             self._weights_dirty = False
         W1, b1, W2, b2, rescale = self._cached_weights
 
-        _ops.supergrok11_fused_step(
+        ops_impl = _ops if self._flat_params[0].is_cuda else _ops_cpu
+        ops_impl.supergrok11_fused_step(
             self._flat_param_data,
             grads,
             self._flat_exp_avgs,
