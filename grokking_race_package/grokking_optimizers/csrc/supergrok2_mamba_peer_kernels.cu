@@ -691,8 +691,8 @@ __global__ void fused_elem_step_kernel(
 
     // 1. Apply Mamba out_proj to get fwd_ctx and bwd_ctx (using shared memory)
     // Preload scan outputs with float4 vectorized loads
-    float fwd_scan[MAX_D_MODEL]; // reuse MAX_D_MODEL=16 for d_inner
-    float bwd_scan[MAX_D_MODEL];
+    float fwd_scan[MAX_D_INNER];
+    float bwd_scan[MAX_D_INNER];
     for (int j = 0; j < d_inner; j += 4) {
         float4 fwd4 = *reinterpret_cast<const float4*>(&fwd_scan_out[idx * d_inner + j]);
         float4 bwd4 = *reinterpret_cast<const float4*>(&bwd_scan_out[idx * d_inner + j]);
