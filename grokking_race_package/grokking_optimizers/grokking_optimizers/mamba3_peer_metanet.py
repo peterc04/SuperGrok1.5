@@ -17,7 +17,7 @@ Architecture per optimizer step, per parameter:
      - 4 experts activated per element, outputs summed
   5. EXPERT MLP:
      - Selected expert transforms gradient: 1 -> hidden -> 1
-     - 128 experts default, hidden=16 default
+     - 144 experts default, hidden=16 default
   6. DYNAMIC EXPERT RECYCLING (every recycle_interval steps):
      - Count activations per expert
      - Dead experts (< threshold activations): clone top expert + noise
@@ -74,14 +74,15 @@ class Mamba3ScanBlock(nn.Module):
         # A: diagonal state transition (log-space for stability)
         # Initialize as negative real values (decaying dynamics)
         self.A_log = nn.Parameter(
-            torch.log(torch.linspace(1, d_state, d_state)).unsqueeze(0).expand(self.d_inner, -1))
+            torch.log(torch.linspace(1, d_state, d_state)).unsqueeze(0).repeat(self.d_inner, 1))
 
         # D: skip connection within SSM
         self.D = nn.Parameter(torch.ones(self.d_inner))
 
         # RoPE-equivalent phase for complex dynamics (Mamba-3)
-        # Learnable per-state frequencies
-        self.rope_freq = nn.Parameter(torch.randn(self.d_inner, d_state) * 0.01)
+        # Paired RoPE: each pair (2i, 2i+1) shares one frequency
+        assert d_state % 2 == 0, "d_state must be even for paired RoPE"
+        self.rope_freq = nn.Parameter(torch.randn(self.d_inner, d_state // 2) * 0.01)
 
         # Output projection: d_inner -> d_model
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
@@ -110,7 +111,7 @@ class Mamba3ScanBlock(nn.Module):
         A = -torch.exp(self.A_log)  # [d_inner, d_state]
 
         # RoPE phase rotation for complex dynamics
-        phase = self.rope_freq  # [d_inner, d_state]
+        phase = self.rope_freq  # [d_inner, d_state//2]
 
         # Selective scan (sequential -- Python reference, CUDA kernel in Phase C)
         if initial_state is not None:
@@ -127,11 +128,16 @@ class Mamba3ScanBlock(nn.Module):
             A_bar = (1.0 + dt_i * A / 2.0) / (1.0 - dt_i * A / 2.0 + 1e-8)
             B_bar = dt_i * B[i].unsqueeze(0)  # [d_inner, d_state]
 
-            # Complex rotation via RoPE-equivalent
-            cos_phase = torch.cos(dt_i * phase)
-            sin_phase = torch.sin(dt_i * phase)
-            # Apply rotation to state (pairs of dimensions act as real/imag)
-            h_rot = h * cos_phase - torch.roll(h, 1, dims=-1) * sin_phase
+            # Paired RoPE: (2i, 2i+1) form complex pairs
+            # phase is [d_inner, d_state//2], broadcast dt_i to match
+            angle = dt_i * phase  # [d_inner, d_state//2]
+            cos_a = torch.cos(angle)
+            sin_a = torch.sin(angle)
+            h_even = h[:, 0::2]   # [d_inner, d_state//2]
+            h_odd  = h[:, 1::2]   # [d_inner, d_state//2]
+            h_rot = torch.zeros_like(h)
+            h_rot[:, 0::2] = h_even * cos_a - h_odd * sin_a
+            h_rot[:, 1::2] = h_odd * cos_a + h_even * sin_a
 
             # State update
             h = A_bar * h_rot + B_bar * x_branch[i].unsqueeze(-1)
@@ -194,7 +200,7 @@ class Mamba3PEERMetaNet(nn.Module):
         d_state: Mamba state dimension (default: 16)
         mamba_expand: Mamba expansion factor (default: 2)
         num_peer_heads: Number of PEER routing heads (default: 4)
-        num_experts: Total experts in pool (default: 128, must be perfect square)
+        num_experts: Total experts in pool (default: 144, must be perfect square)
         expert_hidden: Hidden dim per expert MLP (default: 16)
         gru_hidden: Per-element GRU hidden dim (default: 4)
         rescale: Skip connection scale (default: 0.1)
@@ -208,7 +214,7 @@ class Mamba3PEERMetaNet(nn.Module):
         d_state: int = 16,
         mamba_expand: int = 2,
         num_peer_heads: int = 4,
-        num_experts: int = 128,
+        num_experts: int = 144,
         expert_hidden: int = 16,
         gru_hidden: int = 4,
         rescale: float = 0.1,
@@ -263,7 +269,7 @@ class Mamba3PEERMetaNet(nn.Module):
         self.expert_b2 = nn.Parameter(torch.zeros(num_experts, 1))
 
         # -- Expert activation tracking (not a parameter)
-        self.register_buffer('expert_counts', torch.zeros(num_experts, dtype=torch.long))
+        self.register_buffer('expert_counts', torch.zeros(num_experts, dtype=torch.int32))
         self.register_buffer('step_counter', torch.tensor(0, dtype=torch.long))
 
     def forward(
@@ -339,7 +345,7 @@ class Mamba3PEERMetaNet(nn.Module):
                 with torch.no_grad():
                     self.expert_counts.scatter_add_(
                         0, expert_idx,
-                        torch.ones_like(expert_idx, dtype=torch.long))
+                        torch.ones_like(expert_idx, dtype=torch.int32))
 
             # Expert evaluation
             W1 = self.expert_W1[expert_idx]  # [N, expert_hidden, 1]
@@ -354,11 +360,8 @@ class Mamba3PEERMetaNet(nn.Module):
         # Average over heads
         total_expert_out = total_expert_out / self.num_peer_heads
 
-        # 7. Dynamic expert recycling
-        if self.training:
-            self.step_counter += 1
-            if self.step_counter.item() % self.recycle_interval == 0:
-                self._recycle_dead_experts()
+        # 7. Dynamic expert recycling is handled by the optimizer (supergrok2.py)
+        #    to avoid per-parameter increment in the Python fallback path.
 
         # 8. Skip connection
         smart_grad = (g.unsqueeze(-1) + self.rescale * total_expert_out).squeeze(-1)
@@ -445,8 +448,9 @@ class Mamba3PEERMetaNet(nn.Module):
             self.expert_counts.zero_()
             return
 
-        # Find top-performing expert (most activations = most trusted by router)
-        top_expert = self.expert_counts.argmax().item()
+        # Find top-performing expert (weighted sample from top experts for diversity)
+        counts_f = self.expert_counts.float()
+        top_expert = torch.multinomial(counts_f, 1).item()
         dead_indices = dead_mask.nonzero(as_tuple=True)[0]
 
         for idx in dead_indices:
@@ -462,15 +466,26 @@ class Mamba3PEERMetaNet(nn.Module):
             self.expert_b2.data[i] = self.expert_b2.data[top_expert] + \
                 noise_scale * torch.randn_like(self.expert_b2.data[i])
 
-            # Randomize product keys pointing to this expert
-            # The expert at index i corresponds to sub-key pair (i // pk_dim, i % pk_dim)
+            # Only randomize a product key if ALL experts sharing it are dead
             a_idx = i // self.pk_dim
             b_idx = i % self.pk_dim
-            for h in range(self.num_peer_heads):
-                self.product_keys_A[h].data[a_idx] = torch.randn_like(
-                    self.product_keys_A[h].data[a_idx]) * 0.02
-                self.product_keys_B[h].data[b_idx] = torch.randn_like(
-                    self.product_keys_B[h].data[b_idx]) * 0.02
+
+            # Check if all experts in row a_idx are dead
+            row_start = a_idx * self.pk_dim
+            row_end = row_start + self.pk_dim
+            if dead_mask[row_start:row_end].all():
+                for h in range(self.num_peer_heads):
+                    self.product_keys_A[h].data[a_idx] = torch.randn_like(
+                        self.product_keys_A[h].data[a_idx]) * 0.02
+
+            # Check if all experts in column b_idx are dead
+            col_indices = torch.arange(0, self.num_experts, self.pk_dim,
+                                       device=dead_mask.device) + b_idx
+            col_indices = col_indices[col_indices < self.num_experts]
+            if dead_mask[col_indices].all():
+                for h in range(self.num_peer_heads):
+                    self.product_keys_B[h].data[b_idx] = torch.randn_like(
+                        self.product_keys_B[h].data[b_idx]) * 0.02
 
         # Reset counters
         self.expert_counts.zero_()

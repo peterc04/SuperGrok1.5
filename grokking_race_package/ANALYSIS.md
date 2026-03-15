@@ -1,5 +1,9 @@
 # SuperGrok 1.5 — Comprehensive Analysis
 
+> **Status (2025):** All bugs identified in Sections 1.1–1.8 below have been fixed in subsequent commits. The codebase has since evolved significantly — SuperGrok v2 (Mamba-3 + 4-Head PEER + GRU) has been added with custom CUDA kernels, and the optimizer suite now includes 11 optimizers with 12 CUDA kernel files. This document is retained for historical reference. See README.md for the current architecture.
+
+---
+
 ## Executive Summary
 
 SuperGrok 1.5 is an ambitious custom optimizer targeting **grokking acceleration** in low-data regimes. It combines five interacting mechanisms: AdamW base updates, EMA gradient memory (mu), a 2D sharpness-aware meta-net, LookSAM integration, and progressive weight decay. The benchmark harness is well-engineered with multi-GPU support, status monitoring, and comprehensive visualization.
@@ -283,3 +287,132 @@ A standalone **SAM** or **GSAM** optimizer would help isolate the contribution o
 | Fairness | Validation data leakage | Info | Documented |
 | Fairness | Computational cost inequality | Info | Documented |
 | Fairness | Missing SAM baseline | Low | Suggested |
+
+---
+
+## 7. SuperGrok v2 — Performance Optimizations (Implemented)
+
+### 7.1 Blelloch Parallel Prefix Scan
+
+The sequential Mamba-3 scan was the single largest bottleneck: O(N) serial steps with <1% GPU occupancy (16 threads on an SM supporting 2048). The linear recurrence `h[t] = A_bar * rot(h[t-1]) + B_bar * x[t]` is reformulated as a parallel prefix scan over affine transforms.
+
+**Implementation**: Two-phase approach:
+1. **Precompute kernel** (1 thread/timestep): Computes x_val, z_val, dt_val, B_val, C_val for all timesteps in parallel, resolving cross-thread dependencies (dt_proj, B_proj require all d_inner threads' x_branch values).
+2. **Parallel scan kernel** (PSCAN_BLOCK=512 threads/block): Processes d_state/2 paired dimensions sequentially. Each pair uses Blelloch exclusive prefix scan with `Affine2x2` composition. Accumulates scan output via global memory (no contention — each [t,j] written by exactly one thread).
+
+**Speedup**: For N=65536 with 512 threads: ~128 + 10 = 138 parallel steps vs 65536 sequential steps — **~475x speedup** for the scan portion. Threshold-gated: only activates for N >= 256.
+
+### 7.2 Expert Weights in Shared Memory
+
+The `fused_elem_step_kernel` evaluates 4 PEER heads × K² experts per element. Expert weights (W1, b1, W2, b2) were loaded from global memory via `__ldg` on every access. With 144 experts × expert_hidden=16: W1 is 144×16 = 2304 floats (9.2 KB), total ~7.5 KB for all weight tensors.
+
+**Implementation**: Cooperative loading at block start — threads collectively load all expert weights into shared memory arrays (s_expert_W1, s_expert_b1, s_expert_W2, s_expert_b2). Subsequent per-element expert evaluation reads from shared memory instead of global.
+
+**Benefit**: Eliminates repeated L1/L2 cache pressure. Shared memory latency is ~5 cycles vs ~100+ cycles for cached global loads.
+
+### 7.3 Expert Backward Shared-Memory Reduction
+
+In the backward pass, all N elements accumulate expert weight gradients via `atomicAdd` to 144 × expert_hidden global memory locations. With N=10K and block_size=256, this creates massive contention.
+
+**Implementation**: Per-block shared memory accumulators for d_expert_W1, d_expert_b1, d_expert_W2, d_expert_b2. Each thread accumulates into block-local shared memory. After all elements in the block are processed, a single cooperative `atomicAdd` flushes to global memory.
+
+**Benefit**: Reduces atomic contention by block_size (256x). Total atomicAdds reduced from N × 4_heads × K² per expert to (N/256) × 4_heads × K².
+
+### 7.5 Two-Pass GEMM Backward for Projection Weights
+
+The backward scan kernel accumulated d_C_proj_W and d_B_proj_W via per-timestep shared-memory atomicAdds: each of d_inner threads wrote d_state values per timestep, totaling N × d_inner × d_state atomicAdds per direction per projection weight matrix.
+
+**Implementation**: Two-pass approach:
+1. **Pass 1 (in-kernel)**: At each timestep, the d_C_val and d_B_val scalars are warp-reduced across d_inner threads using `__shfl_down_sync`. Lane 0 writes the reduced scalar to a global buffer `d_C_vals_buf[t, s]` (shape [N, d_state]).
+2. **Pass 2 (launcher)**: A single cuBLAS GEMM via `torch::mm_out` computes `d_C_proj_W = d_C_vals_buf.T @ saved_x_branch` — a [d_state, N] × [N, d_inner] → [d_state, d_inner] matrix multiply.
+
+**Benefit**: Eliminates N × d_state × d_inner shared-memory atomicAdds per direction, replacing them with N × d_state warp reductions (free within a warp) plus a single GEMM. Also removes 2 × d_state × d_inner floats from shared memory, reducing shared memory from `2*d_inner + 2*d_state*d_inner` to `2*d_inner` floats.
+
+### 7.6 Batched Parallel Scan Single-Launch
+
+For parameters with N >= 256, the parallel scan was launched via a per-parameter Python/C++ for-loop, issuing num_params separate kernel launches. Each launch incurs ~5-10μs overhead, and serialized launches prevent cross-parameter SM scheduling.
+
+**Implementation**: New `mamba3_parallel_scan_batched_kernel` uses a 2D grid `dim3(d_inner, num_params)` where `blockIdx.x` selects the d_inner column and `blockIdx.y` selects the parameter. Each block reads its parameter's element count from an offsets array and a per-parameter reverse flag to handle forward vs backward scan direction.
+
+**Benefit**: Eliminates 2 × num_params kernel launches (forward + backward) per optimizer step, replacing them with 2 single launches. For 50 parameters, saves ~500-1000μs of launch overhead and enables the GPU scheduler to overlap blocks from different parameters across SMs.
+
+### 7.4 Gradient Checkpointing for Bilevel
+
+The bilevel forward-save path stores scan states at every timestep for backward recomputation. For 50 parameters × 2 directions × avg N=10K, this requires ~1.22 GB of saved states.
+
+**Implementation**: New `bilevel_checkpoint_interval` parameter (default 1 = no checkpointing). When C > 1:
+- **Forward-save**: Only writes scan states every C steps (plus the final step).
+- **Backward**: Processes segments in reverse order. For each segment, loads the checkpoint input state, forward-recomputes all intermediate states into a register array, then runs backward through the segment using recomputed states.
+
+**Memory savings**: With C=32, saved_states reduces from N × d_inner × d_state to ceil(N/32) × d_inner × d_state — **~97% reduction** in saved state memory. Total bilevel memory: 1.22 GB → ~224 MB.
+
+**Tradeoff**: 2x compute for the scan portion during backward (one forward recomputation + one backward pass per segment). The scan is typically <10% of total bilevel time, so the net compute overhead is small.
+
+---
+
+## 8. Further Optimization Opportunities (Not Yet Implemented)
+
+### 8.1 Prioritized Optimization Table
+
+| # | Optimization | Impact | Difficulty | Files |
+|---|-------------|--------|------------|-------|
+| 1 | Fuse v1.1 into full_step kernel (like v1.5) | MEDIUM | Easy | supergrok11_kernels.cu |
+| 2 | Fuse NeuralGrok amplifier+adam into single kernel | LOW | Easy | neuralgrok_kernels.cu |
+| 3 | Cache meta-net weights (avoid per-step .float().contiguous()) | LOW-MEDIUM | Easy | supergrok2.py, supergrok15.py |
+| 4 | Pre-allocate scan workspace buffers | LOW-MEDIUM | Easy | supergrok2_mamba_peer_kernels.cu |
+| 5 | Persistent CUDA streams (don't create/destroy per step) | VERY LOW | Easy | supergrok2_mamba_peer_kernels.cu |
+| 6 | Skip .to(kFloat32) when already FP32 | VERY LOW | Easy | All launcher functions |
+| 7 | Fast GELU (sigmoid approx instead of tanh) | LOW | Easy | supergrok15_kernels.cu |
+| 8 | Custom cosine-gate reduction kernel for v1.1 | LOW | Medium | supergrok11_kernels.cu, ops.cpp |
+| 9 | Batch Muon Newton-Schulz across parameters | LOW | Medium | ops.cpp, muon_kernels.cu |
+| 10 | CUB segmented sort for batched params | LOW | Medium | supergrok2_mamba_peer_kernels.cu |
+
+### 8.2 Scaling Analysis
+
+| Component | Complexity | Dominant for |
+|-----------|-----------|-------------|
+| Input projection | O(N × d_model) | N > 100K |
+| Sort (thrust) | O(N × log N) | N > 10K |
+| Mamba scan (parallel) | O(N/P + log N) × d_state | N > 256 |
+| Mamba scan (sequential) | O(N × d_inner × d_state) | N < 256 |
+| GRU + PEER (elem_step) | O(N × (gru_ops + peer_ops)) | N > 10K |
+| Adam update | O(N) | Never dominant |
+
+### 8.3 Optimization Implementation History
+
+| Commit | Section | Change | Impact |
+|--------|---------|--------|--------|
+| `e2c52ee` | S1 | Replace GPU step_counter with Python int | Eliminate CUDA sync per step |
+| `6bb7726` | S1 | Replace CPU flip loops with CUDA kernels | Eliminate CPU-GPU syncs |
+| `2a299fb` | S6 | Shared memory reduction for routing gradients | 256x fewer atomicAdds |
+| `19ca4bd` | S3 | Parallel scan for bilevel forward-save | O(N) → O(N/P + log N) scan |
+| `7645b1b` | S4 | Batched parallel scan single-launch | Multi-param parallel scan |
+| `8ef722f` | S2 | Fix register spill in backward scan | Reduce register pressure |
+| `2a15228` | S8 | Pre-allocate bilevel workspace buffers | Eliminate ~100 MB per-step allocs |
+| `41c3e3b` | S9 | cuBLAS GEMM for precompute projections | Leverage Tensor Cores for N≥1024 |
+| `41e730b` | S12 | Add comprehensive test suite | 10 test categories |
+| `07c8204` | S11 | Fix workspace buffer overflow + dim guards | Correctness fix + safety |
+| — | S7.5 | Two-pass GEMM backward for d_C/d_B_proj_W | Eliminate N×d_state×d_inner atomicAdds |
+| — | S7.6 | Batched parallel scan single-launch | Eliminate 2×num_params kernel launches |
+
+### 8.4 Convergence Loop Summary (Section 11)
+
+An iterative full-codebase audit was performed to find remaining bugs and optimizations:
+
+- **Pass 1**: 5 parallel subagent audits covering all forward kernels, backward kernels, Python files, remaining kernel files, and build system. Found 1 real bug (BilevelWorkspace buffer overflow where `ensure_fwd_save` and `ensure_batched` shared `pre_B`/`pre_C` buffers but tracked sizes independently) and added defensive dimension guards. Several false positives were identified and rejected (RoPE bounds, final_state race condition, expert_idx overflow, Adam bc1/bc2 division by zero).
+
+- **Pass 2**: Same 5-area audit found zero real issues. **Convergence achieved.**
+
+### 8.5 Cross-Optimizer Kernel Fusion Comparison
+
+| Optimizer | # Kernel Launches/Step | Fusion Level |
+|-----------|----------------------|-------------|
+| SuperGrok v1.5 | 1 (full_step) | Best |
+| Lion | 1 | Fully fused |
+| GrokAdamW | 1 | Fully fused |
+| NeuralGrok | 2 (amplifier + adam) | Could fuse |
+| Prodigy | 2 (dlr_reduce + adam) | Reasonable |
+| SuperGrok v2 | 3 (input_proj + scan + elem_step) + sort | Complex pipeline |
+| Muon | 1 + 3×ns_steps (matmul) | Unfused matmuls |
+| LookSAM | 4 + AdamW | Many launches |
+| SuperGrok v1.1 | 2 (metanet + adam) + gate | Could fuse like v1.5 |

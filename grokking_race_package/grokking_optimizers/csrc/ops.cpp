@@ -40,7 +40,7 @@ static void clip_grad_norms_device_side(
     auto norm_sq = torch::zeros({1}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
     for (size_t i = 0; i < n_params; i++) {
         if (grads[i].defined() && grads[i].numel() > 0) {
-            norm_sq.add_(grads[i].to(torch::kFloat32).norm().pow(2));
+            norm_sq.add_(grads[i].norm().to(torch::kFloat32).pow(2));
         }
     }
     // Single CPU sync
@@ -69,7 +69,7 @@ static float compute_sam_grad_norm_device_side(
     auto norm_sq = torch::zeros({1}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
     for (size_t i = 0; i < n_grads; i++) {
         if (grads[i].defined() && grads[i].numel() > 0) {
-            norm_sq.add_(grads[i].to(torch::kFloat32).norm().pow(2));
+            norm_sq.add_(grads[i].norm().to(torch::kFloat32).pow(2));
         }
     }
     return std::sqrt(norm_sq.item<float>()) + 1e-12f;
@@ -245,18 +245,13 @@ void supergrok11_fused_step(
 
 #ifdef WITH_CUDA
         if (params[i].is_cuda()) {
+            // Step 1: Fused mu EMA + meta-net to get smart_grad (used for cosine gate)
             launch_sg11_mu_metanet(
                 mus[i], grads[i], sharpness_cache[i], smart_grad, alpha,
                 W1, b1, W2, b2, rescale, hidden_dim);
 
-            // Per-parameter cosine gating (device-side reduction, single sync)
-            auto sg_f = smart_grad.to(torch::kFloat32).reshape(-1);
-            auto mu_f = mus[i].to(torch::kFloat32).reshape(-1);
-            auto vals = torch::stack({(sg_f * mu_f).sum(), sg_f.norm(), mu_f.norm()});
-            auto cpu_vals = vals.cpu();
-            float cos_sim = cpu_vals[0].item<float>() /
-                (cpu_vals[1].item<float>() * cpu_vals[2].item<float>() + 1e-8f);
-            float gate = 1.0f / (1.0f + std::exp(-gate_temperature * cos_sim));
+            // Step 2: Fused cosine gate reduction (single kernel, single CPU sync)
+            float gate = compute_cosine_gate_fused(smart_grad, mus[i], gate_temperature);
             float lamb_eff = ramp > 0.0f ? ramp * gate * lamb : 0.0f;
 
             launch_sg11_adam_decay(
@@ -338,7 +333,7 @@ void grokadamw_fused_step(
     for (size_t i = 0; i < n_params; i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
 
-        steps[i] += 1;
+        // step already incremented by Python caller
         float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
         float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
 
@@ -388,24 +383,23 @@ void neuralgrok_fused_step(
     for (size_t i = 0; i < n_params; i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
 
-        steps[i] += 1;
+        // step already incremented by Python caller
         float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
         float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
 
-        auto amplified_grad = torch::empty_like(params[i]);
-
 #ifdef WITH_CUDA
         if (params[i].is_cuda()) {
-            launch_fused_neuralgrok_amplifier(
-                grads[i], amplified_grad,
-                W1, b1, W2, b2, alpha_amp, beta_amp, hidden_dim);
-            launch_fused_neuralgrok_adam(
-                params[i], exp_avgs[i], exp_avg_sqs[i], amplified_grad,
+            // Single fused kernel: amplifier + adam in one pass
+            // (amplified_grad stays in registers, never hits GMEM)
+            launch_fused_neuralgrok_full_step(
+                params[i], exp_avgs[i], exp_avg_sqs[i], grads[i],
+                W1, b1, W2, b2, alpha_amp, beta_amp, hidden_dim,
                 beta1, beta2, lr, wd, eps, bc1, bc2);
             continue;
         }
 #endif
         // CPU fallback
+        auto amplified_grad = torch::empty_like(params[i]);
         auto g_f = grads[i].reshape({-1, 1}).to(torch::kFloat32);
         auto z = torch::addmm(b1.to(torch::kFloat32), g_f, W1.to(torch::kFloat32).t());
         auto act = torch::relu(z);
@@ -486,7 +480,7 @@ float prodigy_fused_step(
     for (size_t i = 0; i < n_params; i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
 
-        steps[i] += 1;
+        // step already incremented by Python caller
         float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
         float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
 
@@ -679,16 +673,33 @@ void muon_fused_step(
     constexpr float NS_B = -4.7750f;
     constexpr float NS_C = 2.0315f;
 
+    // Phase 1: Update all momentum buffers and compute norms asynchronously
+    std::vector<torch::Tensor> norm_tensors;
+    std::vector<size_t> valid_indices;
+    norm_tensors.reserve(params.size());
+    valid_indices.reserve(params.size());
     for (size_t i = 0; i < params.size(); i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
+        bufs[i].mul_(momentum).add_(grads[i]);
+        norm_tensors.push_back(bufs[i].norm());  // async kernel launch
+        valid_indices.push_back(i);
+    }
 
+    // Single CPU sync: stack all norms and transfer to CPU
+    std::vector<float> norms_cpu;
+    if (!norm_tensors.empty()) {
+        auto norms_stacked = torch::stack(norm_tensors).cpu();
+        auto norms_ptr = norms_stacked.data_ptr<float>();
+        norms_cpu.assign(norms_ptr, norms_ptr + norm_tensors.size());
+    }
+
+    // Phase 2: Newton-Schulz iterations using pre-computed norms
+    for (size_t vi = 0; vi < valid_indices.size(); vi++) {
+        size_t i = valid_indices[vi];
         auto& p = params[i];
-        auto& g = grads[i];
         auto& buf = bufs[i];
 
-        buf.mul_(momentum).add_(g);
-
-        float buf_norm = buf.norm().item<float>() + 1e-7f;
+        float buf_norm = norms_cpu[vi] + 1e-7f;
         float inv_norm = 1.0f / buf_norm;
 
         auto X = buf * inv_norm;
@@ -762,11 +773,12 @@ void supergrok2_mamba_peer_step(
     torch::Tensor expert_W1, torch::Tensor expert_b1,
     torch::Tensor expert_W2, torch::Tensor expert_b2,
     float rescale, float alpha_mu, float lamb_eff,
-    float beta1, float beta2, float lr_val, float wd_eff, float eps,
+    float beta1, float beta2, float lr, float wd_eff, float eps,
     float bc1, float bc2,
     int d_model, int d_state, int d_inner,
     int gru_hidden, int num_heads, int pk_dim,
-    int expert_hidden, int num_experts
+    int expert_hidden, int num_experts,
+    torch::Tensor expert_counts
 ) {
     if (grad.numel() == 0) return;
 
@@ -786,16 +798,82 @@ void supergrok2_mamba_peer_step(
             peer_query_Ws, prod_keys_A, prod_keys_B,
             expert_W1, expert_b1, expert_W2, expert_b2,
             rescale, alpha_mu, lamb_eff,
-            beta1, beta2, lr_val, wd_eff, eps, bc1, bc2,
+            beta1, beta2, lr, wd_eff, eps, bc1, bc2,
             d_model, d_state, d_inner,
             gru_hidden, num_heads, pk_dim,
-            expert_hidden, num_experts);
+            expert_hidden, num_experts,
+            expert_counts);
         return;
     }
 #endif
     throw std::runtime_error(
         "supergrok2_mamba_peer_step requires CUDA tensors. "
         "Use the Python meta-net fallback for CPU.");
+}
+
+
+void supergrok2_mamba_peer_batched_step(
+    std::vector<torch::Tensor> params,
+    std::vector<torch::Tensor> grads,
+    std::vector<torch::Tensor> sharpness_list,
+    std::vector<torch::Tensor> exp_avgs,
+    std::vector<torch::Tensor> exp_avg_sqs,
+    std::vector<torch::Tensor> mus,
+    std::vector<torch::Tensor> gru_states,
+    std::vector<torch::Tensor> mamba_fwd_states,
+    std::vector<torch::Tensor> mamba_bwd_states,
+    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
+    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
+    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
+    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
+    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
+    torch::Tensor mamba_fwd_out_proj,
+    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
+    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
+    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
+    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
+    torch::Tensor mamba_bwd_out_proj,
+    torch::Tensor gru_Wz, torch::Tensor gru_bz,
+    torch::Tensor gru_Wr, torch::Tensor gru_br,
+    torch::Tensor gru_Wh, torch::Tensor gru_bh,
+    torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+    torch::Tensor expert_W1, torch::Tensor expert_b1,
+    torch::Tensor expert_W2, torch::Tensor expert_b2,
+    std::vector<float> alpha_mus, std::vector<float> lamb_effs,
+    std::vector<float> beta1s, std::vector<float> bc1s, std::vector<float> bc2s,
+    float rescale, float beta2, float lr, float wd_eff, float eps,
+    int d_model, int d_state, int d_inner,
+    int gru_hidden, int num_heads, int pk_dim,
+    int expert_hidden, int num_experts,
+    torch::Tensor expert_counts
+) {
+    if (params.empty()) return;
+#ifdef WITH_CUDA
+    if (params[0].is_cuda()) {
+        launch_mamba3_peer_batched_step(
+            params, grads, sharpness_list, exp_avgs, exp_avg_sqs, mus,
+            gru_states, mamba_fwd_states, mamba_bwd_states,
+            input_proj_W, input_proj_b,
+            mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
+            mamba_fwd_B_proj, mamba_fwd_C_proj, mamba_fwd_A_log,
+            mamba_fwd_D, mamba_fwd_rope, mamba_fwd_out_proj,
+            mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
+            mamba_bwd_B_proj, mamba_bwd_C_proj, mamba_bwd_A_log,
+            mamba_bwd_D, mamba_bwd_rope, mamba_bwd_out_proj,
+            gru_Wz, gru_bz, gru_Wr, gru_br, gru_Wh, gru_bh,
+            peer_query_Ws, prod_keys_A, prod_keys_B,
+            expert_W1, expert_b1, expert_W2, expert_b2,
+            alpha_mus, lamb_effs, beta1s, bc1s, bc2s,
+            rescale, beta2, lr, wd_eff, eps,
+            d_model, d_state, d_inner,
+            gru_hidden, num_heads, pk_dim,
+            expert_hidden, num_experts,
+            expert_counts);
+        return;
+    }
+#endif
+    throw std::runtime_error(
+        "supergrok2_mamba_peer_batched_step requires CUDA tensors.");
 }
 
 
@@ -949,12 +1027,45 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("expert_W1"), py::arg("expert_b1"),
           py::arg("expert_W2"), py::arg("expert_b2"),
           py::arg("rescale"), py::arg("alpha_mu"), py::arg("lamb_eff"),
-          py::arg("beta1"), py::arg("beta2"), py::arg("lr_val"),
+          py::arg("beta1"), py::arg("beta2"), py::arg("lr"),
           py::arg("wd_eff"), py::arg("eps"),
           py::arg("bc1"), py::arg("bc2"),
           py::arg("d_model"), py::arg("d_state"), py::arg("d_inner"),
           py::arg("gru_hidden"), py::arg("num_heads"), py::arg("pk_dim"),
-          py::arg("expert_hidden"), py::arg("num_experts"));
+          py::arg("expert_hidden"), py::arg("num_experts"),
+          py::arg("expert_counts"));
+
+    // ── SuperGrok v2 Batched Step ──────────────────────────────────────
+    m.def("supergrok2_mamba_peer_batched_step", &supergrok2_mamba_peer_batched_step,
+          "SuperGrok2: batched Mamba-3+PEER step for all params at once",
+          py::arg("params"), py::arg("grads"), py::arg("sharpness_list"),
+          py::arg("exp_avgs"), py::arg("exp_avg_sqs"), py::arg("mus"),
+          py::arg("gru_states"), py::arg("mamba_fwd_states"), py::arg("mamba_bwd_states"),
+          py::arg("input_proj_W"), py::arg("input_proj_b"),
+          py::arg("mamba_fwd_in_proj"), py::arg("mamba_fwd_dt_W"),
+          py::arg("mamba_fwd_dt_b"), py::arg("mamba_fwd_B_proj"),
+          py::arg("mamba_fwd_C_proj"), py::arg("mamba_fwd_A_log"),
+          py::arg("mamba_fwd_D"), py::arg("mamba_fwd_rope"),
+          py::arg("mamba_fwd_out_proj"),
+          py::arg("mamba_bwd_in_proj"), py::arg("mamba_bwd_dt_W"),
+          py::arg("mamba_bwd_dt_b"), py::arg("mamba_bwd_B_proj"),
+          py::arg("mamba_bwd_C_proj"), py::arg("mamba_bwd_A_log"),
+          py::arg("mamba_bwd_D"), py::arg("mamba_bwd_rope"),
+          py::arg("mamba_bwd_out_proj"),
+          py::arg("gru_Wz"), py::arg("gru_bz"),
+          py::arg("gru_Wr"), py::arg("gru_br"),
+          py::arg("gru_Wh"), py::arg("gru_bh"),
+          py::arg("peer_query_Ws"), py::arg("prod_keys_A"), py::arg("prod_keys_B"),
+          py::arg("expert_W1"), py::arg("expert_b1"),
+          py::arg("expert_W2"), py::arg("expert_b2"),
+          py::arg("alpha_mus"), py::arg("lamb_effs"),
+          py::arg("beta1s"), py::arg("bc1s"), py::arg("bc2s"),
+          py::arg("rescale"), py::arg("beta2"), py::arg("lr"),
+          py::arg("wd_eff"), py::arg("eps"),
+          py::arg("d_model"), py::arg("d_state"), py::arg("d_inner"),
+          py::arg("gru_hidden"), py::arg("num_heads"), py::arg("pk_dim"),
+          py::arg("expert_hidden"), py::arg("num_experts"),
+          py::arg("expert_counts"));
 
 #ifdef WITH_CUDA
     // ── SuperGrok v2 Bilevel Forward (state-saving) ──────────────────
@@ -964,5 +1075,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // ── SuperGrok v2 Bilevel Backward ────────────────────────────────
     m.def("supergrok2_bilevel_backward", &launch_mamba3_peer_backward,
           "SuperGrok2 bilevel: full backward through meta-net");
+
+    // ── SuperGrok v2 Batched Bilevel Forward-Save ─────────────────────
+    m.def("supergrok2_bilevel_fwd_save_batched", &launch_mamba3_peer_bilevel_fwd_save_batched,
+          "SuperGrok2 bilevel: batched forward scan with state saving");
+
+    // ── SuperGrok v2 Batched Bilevel Backward ─────────────────────────
+    m.def("supergrok2_bilevel_backward_batched", &launch_mamba3_peer_backward_batched,
+          "SuperGrok2 bilevel: batched backward through scan");
 #endif
 }

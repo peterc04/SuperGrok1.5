@@ -195,8 +195,8 @@ class SuperGrok15(Optimizer):
         for p in self._flat_params:
             self._flat_exp_avgs.append(torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
             self._flat_exp_avg_sqs.append(torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
-            self._flat_mus.append(torch.zeros_like(p.data))
-            self._flat_sharpness.append(torch.zeros_like(p.data))
+            self._flat_mus.append(torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
+            self._flat_sharpness.append(torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
         self._state_initialized = True
 
     def _sigmoid(self, scale, value, thresh):
