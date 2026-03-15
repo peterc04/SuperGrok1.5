@@ -355,10 +355,16 @@ class SuperGrok2(Optimizer):
                 self._weights_dirty = False
             w = self._cached_weights
 
+            # Cast sharpness to match grad dtype (FP32 sharpness + FP16 grad would
+            # cause the CUDA kernel to reinterpret FP32 bits as FP16)
+            sharpness_list = [
+                self._flat_sharpness[i].to(clipped_grads[k].dtype)
+                for k, i in enumerate(active_indices)
+            ]
             _ops.supergrok2_mamba_peer_batched_step(
                 [self._flat_params[i].data for i in active_indices],
                 clipped_grads,
-                [self._flat_sharpness[i] for i in active_indices],
+                sharpness_list,
                 [self._flat_exp_avgs[i] for i in active_indices],
                 [self._flat_exp_avg_sqs[i] for i in active_indices],
                 [self._flat_mus[i] for i in active_indices],
@@ -434,8 +440,8 @@ class SuperGrok2(Optimizer):
                 self._flat_mamba_bwd_states[i] = new_bwd.detach()
 
                 mu = self._flat_mus[i]
-                mu.mul_(alpha_i).add_(grad, alpha=1.0 - alpha_i)
-                effective_grad = smart_grad.reshape(grad.shape) + lamb_effs_list[idx] * mu
+                mu.mul_(alpha_i).add_(grad.reshape(-1), alpha=1.0 - alpha_i)
+                effective_grad = smart_grad.reshape(-1) + lamb_effs_list[idx] * mu
                 self._flat_mus[i] = mu
 
                 fg = effective_grad.reshape(-1).float()
@@ -809,6 +815,8 @@ class SuperGrok2(Optimizer):
                 sv = per_param_fwd[name]
 
                 vg = p.grad.detach().reshape(-1).float()
+                if not torch.isfinite(vg).all():
+                    continue
                 vg_norm = vg.norm()
                 vg_unit = vg / vg_norm if vg_norm > 1e-12 else vg
                 d_smart = -vg_unit
@@ -1180,6 +1188,8 @@ class SuperGrok2(Optimizer):
                     continue
 
                 vg = p.grad.detach().reshape(-1).float()
+                if not torch.isfinite(vg).all():
+                    continue
                 vg_norm = vg.norm()
                 vg_unit = vg / vg_norm if vg_norm > 1e-12 else vg
                 d_smart_grad = -vg_unit
