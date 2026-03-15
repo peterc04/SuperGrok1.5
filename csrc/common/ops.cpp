@@ -119,7 +119,7 @@ void supergrok15_fused_step(
         float bc1 = 1.0f - std::pow(beta1, static_cast<float>(step));
         float bc2 = 1.0f - std::pow(beta2, static_cast<float>(step));
 
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
         if (params[i].is_cuda()) {
             launch_fused_supergrok15_full_step(
                 params[i], exp_avgs[i], exp_avg_sqs[i], mus[i],
@@ -166,7 +166,7 @@ std::vector<torch::Tensor> supergrok15_sam_perturb_all(
     for (size_t i = 0; i < params.size(); i++) {
         backups.push_back(params[i].clone());
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
         if (params[i].is_cuda()) {
             launch_sam_perturb(params[i], grads[i], rho_over_norm);
             continue;
@@ -191,7 +191,7 @@ void supergrok15_sharpness_restore_all(
             params[i].copy_(backups[i]);
             continue;
         }
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
         if (params[i].is_cuda()) {
             launch_sharpness_restore(
                 params[i], sharpness_cache[i], backups[i],
@@ -244,7 +244,7 @@ void supergrok11_fused_step(
 
         auto smart_grad = torch::empty_like(params[i]);
 
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
         if (params[i].is_cuda()) {
             // Step 1: Fused mu EMA + meta-net to get smart_grad (used for cosine gate)
             launch_sg11_mu_metanet(
@@ -338,7 +338,7 @@ void grokadamw_fused_step(
         float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
         float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
 
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
         if (params[i].is_cuda()) {
             launch_fused_grokadamw_step(
                 params[i], exp_avgs[i], exp_avg_sqs[i], emas[i], grads[i],
@@ -388,7 +388,7 @@ void neuralgrok_fused_step(
         float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
         float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
 
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
         if (params[i].is_cuda()) {
             // Single fused kernel: amplifier + adam in one pass
             // (amplified_grad stays in registers, never hits GMEM)
@@ -453,7 +453,7 @@ float prodigy_fused_step(
     for (size_t i = 0; i < n_params; i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
 
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
         if (params[i].is_cuda()) {
             launch_prodigy_dlr_reduce(
                 grads[i], params[i], param_inits[i], s_bufs[i],
@@ -485,7 +485,7 @@ float prodigy_fused_step(
         float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
         float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
 
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
         if (params[i].is_cuda()) {
             launch_fused_prodigy_step(
                 params[i], exp_avgs[i], exp_avg_sqs[i], s_bufs[i], grads[i],
@@ -520,7 +520,7 @@ void grokfast_fused_step(
 ) {
     for (size_t i = 0; i < grads.size(); i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
         if (grads[i].is_cuda()) {
             launch_fused_grokfast_ema(grads[i], ema_bufs[i], alpha, lamb);
             continue;
@@ -548,7 +548,7 @@ void lion_fused_step(
 ) {
     for (size_t i = 0; i < params.size(); i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
         if (params[i].is_cuda()) {
             launch_fused_lion_step(params[i], exp_avgs[i], grads[i],
                                    lr, beta1, beta2, wd);
@@ -581,7 +581,7 @@ std::vector<torch::Tensor> looksam_perturb_all(
     for (size_t i = 0; i < params.size(); i++) {
         backups.push_back(params[i].clone());
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
         if (params[i].is_cuda()) {
             launch_looksam_perturb(params[i], grads[i], rho_over_norm);
             continue;
@@ -597,7 +597,7 @@ void looksam_restore_all(
     std::vector<torch::Tensor>& backups
 ) {
     for (size_t i = 0; i < params.size(); i++) {
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
         if (params[i].is_cuda()) {
             launch_looksam_restore(params[i], backups[i]);
             continue;
@@ -621,7 +621,7 @@ void looksam_compute_directions(
         if (norm < 1e-12f) continue;
         float inv_norm = 1.0f / norm;
 
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
         if (v_dirs[i].is_cuda()) {
             auto sg_f = sam_grads[i].to(v_dirs[i].dtype());
             auto ng_f = normal_grads[i].to(v_dirs[i].dtype());
@@ -645,7 +645,7 @@ void looksam_adjust_grads(
         float grad_norm = grads[i].norm().item<float>();
         float la_times_gnorm = la * grad_norm;
 
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
         if (grads[i].is_cuda()) {
             auto vd_typed = v_dirs[i].to(grads[i].dtype());
             launch_looksam_adjust(grads[i], vd_typed, la_times_gnorm);
@@ -705,7 +705,7 @@ void muon_fused_step(
 
         auto X = buf * inv_norm;
 
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
         bool use_cuda = p.is_cuda();
 #else
         bool use_cuda = false;
@@ -717,7 +717,7 @@ void muon_fused_step(
             auto AAX = torch::mm(A, AX);
 
             if (use_cuda) {
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
                 auto X_new = torch::empty_like(X);
                 launch_muon_ns_combine(X_new, X, AX, AAX, NS_A, NS_B, NS_C);
                 X = X_new;
@@ -735,7 +735,7 @@ void muon_fused_step(
         float decay_factor = 1.0f - lr * wd;
 
         if (use_cuda) {
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
             auto X_typed = X.to(p.dtype());
             launch_muon_update(p, X_typed, neg_lr_scale, decay_factor);
 #endif
@@ -783,13 +783,20 @@ void supergrok2_mamba_peer_step(
 ) {
     if (grad.numel() == 0) return;
 
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
     if (param.is_cuda()) {
+#ifdef WITH_HIP
+        auto amd_tier = get_amd_tier();
+        auto dispatch_fn = (amd_tier == AmdTier::CDNA3) ? launch_mamba3_peer_step_cdna3 :
+                           (amd_tier == AmdTier::CDNA2) ? launch_mamba3_peer_step_cdna2 :
+                                                           launch_mamba3_peer_step;
+#else
         auto tier = get_arch_tier();
         auto dispatch_fn = (tier == ArchTier::BLACKWELL) ? launch_mamba3_peer_step_blackwell :
                            (tier == ArchTier::HOPPER)    ? launch_mamba3_peer_step_hopper :
                            (tier == ArchTier::AMPERE)    ? launch_mamba3_peer_step_ampere :
                                                            launch_mamba3_peer_step;
+#endif
         dispatch_fn(
             param, grad, sharpness, exp_avg, exp_avg_sq, mu,
             gru_state, mamba_fwd_state, mamba_bwd_state,
@@ -813,7 +820,7 @@ void supergrok2_mamba_peer_step(
     }
 #endif
     throw std::runtime_error(
-        "supergrok2_mamba_peer_step requires CUDA tensors. "
+        "supergrok2_mamba_peer_step requires CUDA/HIP tensors. "
         "Use the Python meta-net fallback for CPU.");
 }
 
@@ -854,13 +861,20 @@ void supergrok2_mamba_peer_batched_step(
     torch::Tensor expert_counts
 ) {
     if (params.empty()) return;
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
     if (params[0].is_cuda()) {
+#ifdef WITH_HIP
+        auto amd_tier = get_amd_tier();
+        auto dispatch_fn = (amd_tier == AmdTier::CDNA3) ? launch_mamba3_peer_batched_step_cdna3 :
+                           (amd_tier == AmdTier::CDNA2) ? launch_mamba3_peer_batched_step_cdna2 :
+                                                           launch_mamba3_peer_batched_step;
+#else
         auto tier = get_arch_tier();
         auto dispatch_fn = (tier == ArchTier::BLACKWELL) ? launch_mamba3_peer_batched_step_blackwell :
                            (tier == ArchTier::HOPPER)    ? launch_mamba3_peer_batched_step_hopper :
                            (tier == ArchTier::AMPERE)    ? launch_mamba3_peer_batched_step_ampere :
                                                            launch_mamba3_peer_batched_step;
+#endif
         dispatch_fn(
             params, grads, sharpness_list, exp_avgs, exp_avg_sqs, mus,
             gru_states, mamba_fwd_states, mamba_bwd_states,
@@ -884,7 +898,7 @@ void supergrok2_mamba_peer_batched_step(
     }
 #endif
     throw std::runtime_error(
-        "supergrok2_mamba_peer_batched_step requires CUDA tensors.");
+        "supergrok2_mamba_peer_batched_step requires CUDA/HIP tensors.");
 }
 
 
@@ -899,7 +913,7 @@ void supergrok2_mamba_peer_batched_step(
 // Dispatch wrappers for bilevel batched operations.
 // These select the correct tier launcher based on GPU architecture.
 
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
 static void dispatch_bilevel_fwd_save_batched(
     std::vector<torch::Tensor> grads,
     std::vector<torch::Tensor> sharpness_list,
@@ -925,11 +939,18 @@ static void dispatch_bilevel_fwd_save_batched(
     torch::Tensor fwd_initial_states, torch::Tensor bwd_initial_states,
     int checkpoint_interval
 ) {
+#ifdef WITH_HIP
+    auto amd_tier = get_amd_tier();
+    auto fn = (amd_tier == AmdTier::CDNA3) ? launch_mamba3_peer_bilevel_fwd_save_batched_cdna3 :
+              (amd_tier == AmdTier::CDNA2) ? launch_mamba3_peer_bilevel_fwd_save_batched_cdna2 :
+                                              launch_mamba3_peer_bilevel_fwd_save_batched;
+#else
     auto tier = get_arch_tier();
     auto fn = (tier == ArchTier::BLACKWELL) ? launch_mamba3_peer_bilevel_fwd_save_batched_blackwell :
               (tier == ArchTier::HOPPER)    ? launch_mamba3_peer_bilevel_fwd_save_batched_hopper :
               (tier == ArchTier::AMPERE)    ? launch_mamba3_peer_bilevel_fwd_save_batched_ampere :
                                               launch_mamba3_peer_bilevel_fwd_save_batched;
+#endif
     fn(grads, sharpness_list,
        input_proj_W, input_proj_b,
        mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
@@ -978,11 +999,18 @@ static void dispatch_bilevel_backward_batched(
     int d_model, int d_state, int d_inner, int num_params,
     int checkpoint_interval
 ) {
+#ifdef WITH_HIP
+    auto amd_tier = get_amd_tier();
+    auto fn = (amd_tier == AmdTier::CDNA3) ? launch_mamba3_peer_backward_batched_cdna3 :
+              (amd_tier == AmdTier::CDNA2) ? launch_mamba3_peer_backward_batched_cdna2 :
+                                              launch_mamba3_peer_backward_batched;
+#else
     auto tier = get_arch_tier();
     auto fn = (tier == ArchTier::BLACKWELL) ? launch_mamba3_peer_backward_batched_blackwell :
               (tier == ArchTier::HOPPER)    ? launch_mamba3_peer_backward_batched_hopper :
               (tier == ArchTier::AMPERE)    ? launch_mamba3_peer_backward_batched_ampere :
                                               launch_mamba3_peer_backward_batched;
+#endif
     fn(d_fwd_scan_out_packed, d_bwd_scan_out_packed,
        x_sorted_packed,
        fwd_saved_states_packed, fwd_saved_xb_packed,
@@ -1007,7 +1035,7 @@ static void dispatch_bilevel_backward_batched(
        d_model, d_state, d_inner, num_params,
        checkpoint_interval);
 }
-#endif  // WITH_CUDA
+#endif  // WITH_CUDA || WITH_HIP
 
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1042,6 +1070,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_warp_size", []() -> int {
         return WARP_SIZE;
     }, "Get warp/wavefront size (32 for NVIDIA, 64 for AMD CDNA)");
+
+    m.def("get_amd_tier_name", []() -> std::string {
+        return std::string(get_amd_tier_name());
+    }, "Get AMD architecture tier: 'generic', 'cdna2', or 'cdna3'");
 
     // ── SuperGrok v1.5 ───────────────────────────────────────────────
     m.def("supergrok15_fused_step", &supergrok15_fused_step,
@@ -1213,7 +1245,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("expert_hidden"), py::arg("num_experts"),
           py::arg("expert_counts"));
 
-#ifdef WITH_CUDA
+#if defined(WITH_CUDA) || defined(WITH_HIP)
     // ── SuperGrok v2 Bilevel Forward (state-saving) ──────────────────
     m.def("supergrok2_bilevel_fwd_save", &launch_mamba3_peer_bilevel_fwd_save,
           "SuperGrok2 bilevel: forward scan with state saving for backward");

@@ -17,7 +17,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Callable, Dict
 from .dispatch import (
-    get_gpu_arch, get_gpu_vendor,
+    get_gpu_arch, get_gpu_vendor, get_amd_tier,
     supports_bf16, supports_fp8, supports_tf32, supports_nvfp4,
 )
 
@@ -55,7 +55,14 @@ class PrecisionConfig:
             arch = get_gpu_arch()
             vendor = get_gpu_vendor()
             if vendor == 'amd':
-                self.projection_precision = 'bf16' if supports_bf16() else 'fp32'
+                # CDNA3 (MI300X): BF16 MFMA available, prefer BF16
+                # CDNA2 (MI250): BF16 MFMA available, prefer BF16
+                # Generic (MI100): FP32 only
+                amd_t = get_amd_tier()
+                if amd_t in ('cdna3', 'cdna2') and supports_bf16():
+                    self.projection_precision = 'bf16'
+                else:
+                    self.projection_precision = 'fp32'
             elif arch >= 90:
                 self.projection_precision = 'fp8'
             elif arch >= 80:

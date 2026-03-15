@@ -63,7 +63,7 @@ def get_warp_size() -> int:
 
 
 def get_arch_tier() -> str:
-    """Architecture tier: 'blackwell', 'hopper', 'ampere', or 'generic'."""
+    """NVIDIA architecture tier: 'blackwell', 'hopper', 'ampere', or 'generic'."""
     if get_gpu_vendor() == 'amd':
         return 'generic'
     arch = get_gpu_arch()
@@ -74,6 +74,49 @@ def get_arch_tier() -> str:
     if arch >= 80:
         return 'ampere'
     return 'generic'
+
+
+@functools.lru_cache(maxsize=1)
+def get_amd_tier() -> str:
+    """AMD architecture tier: 'cdna3', 'cdna2', or 'generic'.
+
+    FORCE_ARCH convention (matches C++ get_amd_tier):
+      942  → cdna3 (full GCN arch number)
+      94   → cdna3 (from get_device_capability major*10+minor)
+      90   → cdna2 (gfx90a)
+      908  → generic (MI100, full GCN arch)
+      else → generic
+    """
+    if get_gpu_vendor() != 'amd':
+        return 'generic'
+
+    # Handle FORCE_ARCH directly to match C++ convention
+    force = os.environ.get('FORCE_ARCH')
+    if force:
+        arch = int(force)
+        if arch >= 942:  return 'cdna3'   # gfx942 (full arch number)
+        if arch == 94:   return 'cdna3'   # capability format (9, 4)
+        if arch == 90:   return 'cdna2'   # gfx90a
+        return 'generic'                   # gfx908, etc.
+
+    # Real hardware: get_gpu_arch returns major*10+minor
+    arch = get_gpu_arch()
+    if arch >= 94:   # gfx942 → (9, 4) → 94
+        return 'cdna3'
+    if arch >= 90:   # gfx90a → (9, 0) → 90
+        return 'cdna2'
+    return 'generic'
+
+
+def get_amd_label() -> str:
+    """Human-readable label for AMD GPU tier."""
+    tier = get_amd_tier()
+    labels = {
+        'cdna3': 'MI300X (gfx942, CDNA3)',
+        'cdna2': 'MI250 (gfx90a, CDNA2)',
+        'generic': 'AMD GPU (generic CDNA)',
+    }
+    return labels.get(tier, 'AMD GPU')
 
 
 def supports_fp8() -> bool:

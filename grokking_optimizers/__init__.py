@@ -43,6 +43,7 @@ from .dispatch import (
     get_gpu_arch, get_gpu_vendor, get_backend, get_arch_label,
     get_warp_size, supports_bf16, supports_fp8, supports_tf32,
     supports_matrix_cores, supports_nvfp4,
+    get_amd_tier, get_amd_label,
 )
 from .quantization import PrecisionConfig
 from .distributed import (
@@ -67,6 +68,7 @@ __all__ = [
     "get_gpu_arch", "get_gpu_vendor", "get_backend", "get_arch_label",
     "get_warp_size", "supports_bf16", "supports_fp8", "supports_tf32",
     "supports_matrix_cores", "supports_nvfp4",
+    "get_amd_tier", "get_amd_label",
     "PrecisionConfig",
     "CompiledSuperGrok2",
     "setup_distributed", "cleanup_distributed",

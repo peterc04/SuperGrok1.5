@@ -162,3 +162,41 @@ using GpuStream_t = cudaStream_t;
 #else
   #define FULL_WARP_MASK 0xFFFFFFFF
 #endif
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Async memset
+// ═══════════════════════════════════════════════════════════════════════
+
+#if GROK_HIP
+  #define gpuMemsetAsync hipMemsetAsync
+#else
+  #define gpuMemsetAsync cudaMemsetAsync
+#endif
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Stream management
+// ═══════════════════════════════════════════════════════════════════════
+
+#if GROK_HIP
+  #define gpuStreamCreate hipStreamCreate
+  #define gpuStreamSynchronize hipStreamSynchronize
+  #define gpuStreamDestroy hipStreamDestroy
+#else
+  #define gpuStreamCreate cudaStreamCreate
+  #define gpuStreamSynchronize cudaStreamSynchronize
+  #define gpuStreamDestroy cudaStreamDestroy
+#endif
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Kernel launch attribute (for configuring smem size)
+// ═══════════════════════════════════════════════════════════════════════
+
+#if GROK_HIP
+  #define gpuFuncSetAttribute hipFuncSetAttribute
+  #define gpuFuncAttributeMaxDynamicSharedMemorySize \
+          hipFuncAttributeMaxDynamicSharedMemorySize
+#else
+  #define gpuFuncSetAttribute cudaFuncSetAttribute
+  #define gpuFuncAttributeMaxDynamicSharedMemorySize \
+          cudaFuncAttributeMaxDynamicSharedMemorySize
+#endif

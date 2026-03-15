@@ -102,3 +102,53 @@ inline ArchTier get_arch_tier() {
     if (arch >= 80) return ArchTier::AMPERE;
     return ArchTier::GENERIC;
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+//  AMD architecture tier
+//
+//  GENERIC — gfx908 (MI100): basic CDNA, wavefront-64
+//  CDNA2   — gfx90a (MI250): MFMA_F32_16x16x4, 8MB L2
+//  CDNA3   — gfx942 (MI300X): MFMA_F32_32x32x8_BF16, 256MB L2
+// ═══════════════════════════════════════════════════════════════════════
+
+enum class AmdTier {
+    GENERIC,    // gfx908 (MI100)
+    CDNA2,      // gfx90a (MI250)
+    CDNA3,      // gfx942 (MI300X)
+};
+
+inline AmdTier get_amd_tier() {
+#if GROK_HIP
+    // FORCE_ARCH env var: 942 → CDNA3, 90 → CDNA2, anything else → GENERIC
+    const char* force = std::getenv("FORCE_ARCH");
+    if (force != nullptr && force[0] != '\0') {
+        int arch = std::atoi(force);
+        if (arch >= 942) return AmdTier::CDNA3;
+        if (arch == 90)  return AmdTier::CDNA2;
+        return AmdTier::GENERIC;
+    }
+
+    gpuDeviceProp_t prop;
+    if (gpuGetDeviceProperties(&prop, 0) == GPU_SUCCESS) {
+        const char* name = prop.gcnArchName;
+        // gcnArchName format: "gfx942:sramecc+:xnack-" (may have suffixes)
+        if (name[0] == 'g' && name[1] == 'f' && name[2] == 'x') {
+            // Check for known CDNA arch names (strncmp ignores suffixes)
+            if (name[3] == '9' && name[4] == '4' && name[5] == '2')
+                return AmdTier::CDNA3;   // MI300X
+            if (name[3] == '9' && name[4] == '0' && name[5] == 'a')
+                return AmdTier::CDNA2;   // MI250
+        }
+    }
+#endif
+    return AmdTier::GENERIC;
+}
+
+inline const char* get_amd_tier_name() {
+    AmdTier tier = get_amd_tier();
+    switch (tier) {
+        case AmdTier::CDNA3:   return "cdna3";
+        case AmdTier::CDNA2:   return "cdna2";
+        default:               return "generic";
+    }
+}

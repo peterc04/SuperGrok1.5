@@ -24,12 +24,18 @@ constexpr int QUANT_BLOCK = 256;
 
 
 // ═══════════════════════════════════════════════════════════════════════
-//  FP8 E4M3 Quantize / Dequantize
+//  FP8 E4M3 Quantize / Dequantize — NVIDIA only
+//
+//  FP8 hardware types are NVIDIA-specific (sm_89+). The software
+//  emulation below uses standard FP32 bit manipulation, but FP8 is
+//  only useful on NVIDIA GPUs. AMD GPUs should use BF16 or INT8.
 //
 //  E4M3: 4-bit exponent, 3-bit mantissa, 1 sign bit
 //  Range: [-448, 448], min subnormal ~2^-9
 //  Per-tensor scaling: scale = max(|x|) / 448
 // ═══════════════════════════════════════════════════════════════════════
+
+#if GROK_CUDA  // FP8 is NVIDIA-only
 
 // FP8 E4M3 codebook constants
 constexpr float FP8_E4M3_MAX = 448.0f;
@@ -129,6 +135,8 @@ __global__ void dequantize_fp8_e4m3_kernel(
     if (gid >= N) return;
     output[gid] = fp8_e4m3_to_float(input[gid]) * (*scale);
 }
+
+#endif  // GROK_CUDA (FP8 kernels)
 
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -367,13 +375,15 @@ __global__ void dequantize_mxfp4_kernel(
 
 
 // ═══════════════════════════════════════════════════════════════════════
-//  NVFP4 (Blackwell FP4 E2M1 with per-16-element blocks)
+//  NVFP4 (Blackwell FP4 E2M1 with per-16-element blocks) — NVIDIA only
 //
 //  Same E2M1 codebook as MXFP4 but uses 16-element blocks (Blackwell
 //  hardware native block size). Provides finer granularity scaling.
 //  On non-Blackwell hardware, functionally identical to MXFP4 with
 //  smaller block size.
 // ═══════════════════════════════════════════════════════════════════════
+
+#if GROK_CUDA  // NVFP4 is NVIDIA Blackwell-specific
 
 constexpr int NVFP4_BLOCK_SIZE = 16;
 
@@ -438,12 +448,15 @@ __global__ void dequantize_nvfp4_kernel(
         output[elem_idx + 1] = mxfp4_to_float((packed >> 4) & 0x0F, bs);
 }
 
+#endif  // GROK_CUDA (NVFP4 kernels)
+
 
 // ═══════════════════════════════════════════════════════════════════════
 //  Host launcher functions (called from ops.cpp)
 // ═══════════════════════════════════════════════════════════════════════
 
-// FP8 E4M3
+// FP8 E4M3 — NVIDIA only
+#if GROK_CUDA
 std::vector<torch::Tensor> quantize_fp8_e4m3(torch::Tensor input) {
     TORCH_CHECK(input.is_cuda(), "Input must be CUDA tensor");
     auto input_f = input.to(torch::kFloat32).contiguous().reshape(-1);
@@ -469,6 +482,16 @@ torch::Tensor dequantize_fp8_e4m3(torch::Tensor input, torch::Tensor scale, int6
         scale.data_ptr<float>(), numel);
     return output;
 }
+#else
+std::vector<torch::Tensor> quantize_fp8_e4m3(torch::Tensor input) {
+    TORCH_CHECK(false, "FP8 E4M3 quantization requires NVIDIA GPU (sm_89+)");
+    return {};
+}
+torch::Tensor dequantize_fp8_e4m3(torch::Tensor input, torch::Tensor scale, int64_t numel) {
+    TORCH_CHECK(false, "FP8 E4M3 dequantization requires NVIDIA GPU (sm_89+)");
+    return torch::Tensor();
+}
+#endif  // GROK_CUDA (FP8 launchers)
 
 // INT8
 std::vector<torch::Tensor> quantize_int8(torch::Tensor input) {
@@ -555,7 +578,8 @@ torch::Tensor dequantize_mxfp4(torch::Tensor input, torch::Tensor block_scales, 
     return output;
 }
 
-// NVFP4
+// NVFP4 — NVIDIA Blackwell only
+#if GROK_CUDA
 std::vector<torch::Tensor> quantize_nvfp4(torch::Tensor input) {
     TORCH_CHECK(input.is_cuda(), "Input must be CUDA tensor");
     auto input_f = input.to(torch::kFloat32).contiguous().reshape(-1);
@@ -583,3 +607,13 @@ torch::Tensor dequantize_nvfp4(torch::Tensor input, torch::Tensor block_scales, 
         block_scales.data_ptr<float>(), numel);
     return output;
 }
+#else
+std::vector<torch::Tensor> quantize_nvfp4(torch::Tensor input) {
+    TORCH_CHECK(false, "NVFP4 quantization requires NVIDIA Blackwell GPU (sm_100+)");
+    return {};
+}
+torch::Tensor dequantize_nvfp4(torch::Tensor input, torch::Tensor block_scales, int64_t numel) {
+    TORCH_CHECK(false, "NVFP4 dequantization requires NVIDIA Blackwell GPU (sm_100+)");
+    return torch::Tensor();
+}
+#endif  // GROK_CUDA (NVFP4 launchers)

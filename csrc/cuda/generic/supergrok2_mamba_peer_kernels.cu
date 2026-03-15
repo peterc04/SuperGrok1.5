@@ -1542,7 +1542,7 @@ void launch_mamba3_peer_step(
             );
 
             // Zero scan output before parallel scan accumulates into it
-            cudaMemsetAsync(scan_out, 0, N * d_inner * sizeof(float));
+            gpuMemsetAsync(scan_out, 0, N * d_inner * sizeof(float));
 
             // Phase B+C: Parallel prefix scan + output
             int pscan_smem = 6 * PSCAN_BLOCK * sizeof(float);
@@ -1915,7 +1915,7 @@ void launch_mamba3_peer_batched_step(
             );
 
             // Zero scan output
-            cudaMemsetAsync(scan_packed.data_ptr<float>(), 0,
+            gpuMemsetAsync(scan_packed.data_ptr<float>(), 0,
                 total_N * d_inner * sizeof(float));
 
             // Phase B+C: single-launch batched parallel scan (all params at once)
@@ -2013,11 +2013,11 @@ void launch_mamba3_peer_batched_step(
 
     // Launch fused_elem_step kernels on a persistent pool of streams
     constexpr int NUM_STREAMS = 4;
-    static cudaStream_t streams[NUM_STREAMS] = {};
+    static GpuStream_t streams[NUM_STREAMS] = {};
     static bool streams_initialized = false;
     if (!streams_initialized) {
         for (int s = 0; s < NUM_STREAMS; s++)
-            cudaStreamCreate(&streams[s]);
+            gpuStreamCreate(&streams[s]);
         streams_initialized = true;
     }
 
@@ -2025,7 +2025,7 @@ void launch_mamba3_peer_batched_step(
         int N = N_vec[p];
         if (N == 0) continue;
 
-        cudaStream_t stream = streams[p % NUM_STREAMS];
+        GpuStream_t stream = streams[p % NUM_STREAMS];
         const int grid = (N + SG2M_BLOCK - 1) / SG2M_BLOCK;
         AT_DISPATCH_FLOATING_TYPES_AND2(
             at::ScalarType::Half, at::ScalarType::BFloat16,
@@ -2063,6 +2063,6 @@ void launch_mamba3_peer_batched_step(
 
     // Sync all streams (persistent — no destroy)
     for (int s = 0; s < NUM_STREAMS; s++) {
-        cudaStreamSynchronize(streams[s]);
+        gpuStreamSynchronize(streams[s]);
     }
 }

@@ -26,6 +26,7 @@ _has_gpu = torch.cuda.is_available() or (_force_cuda and torch.version.cuda is n
 
 if _has_gpu and _is_hip:
     from torch.utils.cpp_extension import CUDAExtension
+    import glob as _glob
     print(f"Building Grokking Optimizers C++/HIP extension")
     print(f"  ROCm version: {torch.version.hip}")
 
@@ -42,10 +43,36 @@ if _has_gpu and _is_hip:
         "csrc/cuda/generic/lion_kernels.cu",
         "csrc/cuda/generic/looksam_kernels.cu",
         "csrc/cuda/generic/muon_kernels.cu",
+        "csrc/quantization/quantization_kernels.cu",
     ]
+
+    # Auto-detect CDNA specialization sources
+    cdna_sources = sorted(
+        _glob.glob("csrc/hip/cdna2/*.hip.cpp") +
+        _glob.glob("csrc/hip/cdna3/*.hip.cpp")
+    )
+    if cdna_sources:
+        print(f"  CDNA sources: {', '.join(os.path.basename(s) for s in cdna_sources)}")
+
+    # ROCm arch flags from TORCH_CUDA_ARCH_LIST or defaults
+    rocm_archs = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()
+    if rocm_archs:
+        hipcc_arch_flags = []
+        for arch in rocm_archs.replace(",", ";").split(";"):
+            arch = arch.strip()
+            if arch:
+                hipcc_arch_flags.append(f"--offload-arch={arch}")
+        print(f"  ROCm archs (from TORCH_CUDA_ARCH_LIST): {rocm_archs}")
+    else:
+        hipcc_arch_flags = [
+            "--offload-arch=gfx908",    # MI100
+            "--offload-arch=gfx90a",    # MI250
+            "--offload-arch=gfx942",    # MI300X
+        ]
+
     ext = CUDAExtension(
         name="grokking_optimizers._ops",
-        sources=generic_sources,
+        sources=generic_sources + cdna_sources,
         include_dirs=["csrc/common", "csrc"],
         define_macros=[("WITH_HIP", None)],
         extra_compile_args={
@@ -55,10 +82,7 @@ if _has_gpu and _is_hip:
             ],
             "nvcc": [
                 "-O3", "-std=c++17", "-DWITH_HIP",
-                "--offload-arch=gfx908",    # MI100
-                "--offload-arch=gfx90a",    # MI200
-                "--offload-arch=gfx942",    # MI300X
-            ],
+            ] + hipcc_arch_flags,
         },
     )
 
