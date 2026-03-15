@@ -25,6 +25,7 @@
 constexpr int SG2B_BLOCK = 256;
 constexpr int MAX_D_STATE = 32;
 constexpr int MAX_D_INNER = 32;
+constexpr int MAX_D_MODEL = 16;
 constexpr int MAX_TOPK = 4;
 
 
@@ -391,6 +392,20 @@ __global__ void mamba3_scan_backward_kernel(
     float d_dt_proj_W_row[MAX_D_INNER];
     for (int j = 0; j < d_inner; j++) d_dt_proj_W_row[j] = 0.0f;
 
+    // Thread-local accumulators for weight gradients (avoid per-step atomicAdds)
+    float d_C_proj_W_local[MAX_D_STATE * MAX_D_INNER];
+    float d_B_proj_W_local[MAX_D_STATE * MAX_D_INNER];
+    float d_in_proj_W_x_local[MAX_D_MODEL];  // row tid of d_in_proj_W
+    float d_in_proj_W_z_local[MAX_D_MODEL];  // row (tid+d_inner) of d_in_proj_W
+    for (int k = 0; k < d_state * d_inner; k++) {
+        d_C_proj_W_local[k] = 0.0f;
+        d_B_proj_W_local[k] = 0.0f;
+    }
+    for (int d = 0; d < d_model; d++) {
+        d_in_proj_W_x_local[d] = 0.0f;
+        d_in_proj_W_z_local[d] = 0.0f;
+    }
+
     // Gradient of state: dh[s] propagated backward through time
     float dh[MAX_D_STATE];
     for (int s = 0; s < d_state; s++) dh[s] = 0.0f;
@@ -443,7 +458,7 @@ __global__ void mamba3_scan_backward_kernel(
             // d_C_val = d_y * h[s] — accumulate for all j
             float d_C_val = d_y_val * h_s;
             for (int j = 0; j < d_inner; j++) {
-                atomicAdd(&d_C_proj_W[s * d_inner + j], d_C_val * s_x_branch[j]);
+                d_C_proj_W_local[s * d_inner + j] += d_C_val * s_x_branch[j];
             }
             // Accumulate d_x_from_C: gradient of y w.r.t. x_branch[tid] via C projection
             d_x_from_C += d_y_val * h_s * C_proj_W[s * d_inner + tid];
@@ -514,7 +529,7 @@ __global__ void mamba3_scan_backward_kernel(
             float d_B_val = d_B_bar * dt_val;
             // Full B projection backward
             for (int j = 0; j < d_inner; j++) {
-                atomicAdd(&d_B_proj_W[s * d_inner + j], d_B_val * s_x_branch[j]);
+                d_B_proj_W_local[s * d_inner + j] += d_B_val * s_x_branch[j];
             }
             // Gradient of B_val w.r.t. x_branch[tid]: B_proj_W[s, tid]
             d_x_from_scan += d_B_val * B_proj_W[s * d_inner + tid];
@@ -569,8 +584,8 @@ __global__ void mamba3_scan_backward_kernel(
         // Backward through input projection to d_x_sorted and d_in_proj_W
         for (int d = 0; d < d_model; d++) {
             float inp = x_sorted[i * d_model + d];
-            atomicAdd(&d_in_proj_W[tid * d_model + d], d_x_val * inp);
-            atomicAdd(&d_in_proj_W[(tid + d_inner) * d_model + d], d_z_val * inp);
+            d_in_proj_W_x_local[d] += d_x_val * inp;
+            d_in_proj_W_z_local[d] += d_z_val * inp;
             atomicAdd(&d_x_sorted[i * d_model + d],
                       d_x_val * in_proj_W[tid * d_model + d] +
                       d_z_val * in_proj_W[(tid + d_inner) * d_model + d]);
@@ -590,6 +605,17 @@ __global__ void mamba3_scan_backward_kernel(
     }
     for (int p = 0; p < half_d_state; p++) {
         atomicAdd(&d_rope_freq[tid * half_d_state + p], d_freq_acc[p]);
+    }
+    // Write locally accumulated weight gradients
+    for (int k = 0; k < d_state * d_inner; k++) {
+        atomicAdd(&d_C_proj_W[k], d_C_proj_W_local[k]);
+    }
+    for (int k = 0; k < d_state * d_inner; k++) {
+        atomicAdd(&d_B_proj_W[k], d_B_proj_W_local[k]);
+    }
+    for (int d = 0; d < d_model; d++) {
+        atomicAdd(&d_in_proj_W[tid * d_model + d], d_in_proj_W_x_local[d]);
+        atomicAdd(&d_in_proj_W[(tid + d_inner) * d_model + d], d_in_proj_W_z_local[d]);
     }
 }
 
@@ -680,6 +706,20 @@ __global__ void mamba3_scan_backward_batched_kernel(
     float d_dt_proj_W_row[MAX_D_INNER];
     for (int j = 0; j < d_inner; j++) d_dt_proj_W_row[j] = 0.0f;
 
+    // Thread-local accumulators for weight gradients (avoid per-step atomicAdds)
+    float d_C_proj_W_local[MAX_D_STATE * MAX_D_INNER];
+    float d_B_proj_W_local[MAX_D_STATE * MAX_D_INNER];
+    float d_in_proj_W_x_local[MAX_D_MODEL];  // row tid of d_in_proj_W
+    float d_in_proj_W_z_local[MAX_D_MODEL];  // row (tid+d_inner) of d_in_proj_W
+    for (int k = 0; k < d_state * d_inner; k++) {
+        d_C_proj_W_local[k] = 0.0f;
+        d_B_proj_W_local[k] = 0.0f;
+    }
+    for (int d = 0; d < d_model; d++) {
+        d_in_proj_W_x_local[d] = 0.0f;
+        d_in_proj_W_z_local[d] = 0.0f;
+    }
+
     float dh[MAX_D_STATE];
     for (int s = 0; s < d_state; s++) dh[s] = 0.0f;
 
@@ -723,7 +763,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
             dh[s] += d_y_val * C_val;
             float d_C_val = d_y_val * h_s;
             for (int j = 0; j < d_inner; j++)
-                atomicAdd(&d_C_proj_W[s * d_inner + j], d_C_val * s_x_branch[j]);
+                d_C_proj_W_local[s * d_inner + j] += d_C_val * s_x_branch[j];
             d_x_from_C += d_y_val * h_s * C_proj_W[s * d_inner + tid];
         }
 
@@ -781,7 +821,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
             d_dt_val += d_B_bar * B_val;
             float d_B_val = d_B_bar * dt_val;
             for (int j = 0; j < d_inner; j++)
-                atomicAdd(&d_B_proj_W[s * d_inner + j], d_B_val * s_x_branch[j]);
+                d_B_proj_W_local[s * d_inner + j] += d_B_val * s_x_branch[j];
             d_x_from_scan += d_B_val * B_proj_W[s * d_inner + tid];
 
             float d_half_dtA = d_A_bar * (1.0f + A_bar) / denom_val;
@@ -821,8 +861,8 @@ __global__ void mamba3_scan_backward_batched_kernel(
 
         for (int d = 0; d < d_model; d++) {
             float inp = my_x_sorted[i * d_model + d];
-            atomicAdd(&d_in_proj_W[tid * d_model + d], d_x_val * inp);
-            atomicAdd(&d_in_proj_W[(tid + d_inner) * d_model + d], d_z_val * inp);
+            d_in_proj_W_x_local[d] += d_x_val * inp;
+            d_in_proj_W_z_local[d] += d_z_val * inp;
             atomicAdd(&my_d_x_sorted[i * d_model + d],
                       d_x_val * in_proj_W[tid * d_model + d] +
                       d_z_val * in_proj_W[(tid + d_inner) * d_model + d]);
@@ -839,6 +879,17 @@ __global__ void mamba3_scan_backward_batched_kernel(
         atomicAdd(&d_A_log[tid * d_state + s], d_A_log_acc[s]);
     for (int p = 0; p < half_d_state; p++)
         atomicAdd(&d_rope_freq[tid * half_d_state + p], d_freq_acc[p]);
+    // Write locally accumulated weight gradients
+    for (int k = 0; k < d_state * d_inner; k++) {
+        atomicAdd(&d_C_proj_W[k], d_C_proj_W_local[k]);
+    }
+    for (int k = 0; k < d_state * d_inner; k++) {
+        atomicAdd(&d_B_proj_W[k], d_B_proj_W_local[k]);
+    }
+    for (int d = 0; d < d_model; d++) {
+        atomicAdd(&d_in_proj_W[tid * d_model + d], d_in_proj_W_x_local[d]);
+        atomicAdd(&d_in_proj_W[(tid + d_inner) * d_model + d], d_in_proj_W_z_local[d]);
+    }
 }
 
 
@@ -861,17 +912,41 @@ __global__ void input_proj_backward_kernel(
     const int N,
     const int d_model
 ) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N) return;
+    // Shared memory for per-block reduction: d_model*2 for d_proj_W + d_model for d_proj_b
+    extern __shared__ float smem[];
+    float* s_d_proj_W = smem;           // [d_model * 2]
+    float* s_d_proj_b = smem + d_model * 2;  // [d_model]
 
-    float g = static_cast<float>(grad[idx]);
-    float s = static_cast<float>(sharpness[idx]);
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
 
-    for (int d = 0; d < d_model; d++) {
-        float d_xd = d_x[idx * d_model + d];
-        atomicAdd(&d_proj_W[d * 2 + 0], d_xd * g);
-        atomicAdd(&d_proj_W[d * 2 + 1], d_xd * s);
-        atomicAdd(&d_proj_b[d], d_xd);
+    // Initialize shared memory accumulators
+    for (int i = tid; i < d_model * 2; i += block_size) s_d_proj_W[i] = 0.0f;
+    for (int i = tid; i < d_model; i += block_size) s_d_proj_b[i] = 0.0f;
+    __syncthreads();
+
+    const int idx = blockIdx.x * blockDim.x + tid;
+    if (idx < N) {
+        float g = static_cast<float>(grad[idx]);
+        float s = static_cast<float>(sharpness[idx]);
+
+        for (int d = 0; d < d_model; d++) {
+            float d_xd = d_x[idx * d_model + d];
+            atomicAdd(&s_d_proj_W[d * 2 + 0], d_xd * g);
+            atomicAdd(&s_d_proj_W[d * 2 + 1], d_xd * s);
+            atomicAdd(&s_d_proj_b[d], d_xd);
+        }
+    }
+    __syncthreads();
+
+    // Block-level reduction: one thread per shared memory element writes to global
+    for (int i = tid; i < d_model * 2; i += block_size) {
+        if (s_d_proj_W[i] != 0.0f)
+            atomicAdd(&d_proj_W[i], s_d_proj_W[i]);
+    }
+    for (int i = tid; i < d_model; i += block_size) {
+        if (s_d_proj_b[i] != 0.0f)
+            atomicAdd(&d_proj_b[i], s_d_proj_b[i]);
     }
 }
 
@@ -913,91 +988,105 @@ __global__ void gru_backward_kernel(
     // Dims
     const int N, const int input_dim, const int gru_hidden
 ) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N) return;
-
+    extern __shared__ float smem[];
+    // Layout: s_d_Wz[gru_hidden*total_dim] + s_d_Wr[same] + s_d_Wh[same]
+    //       + s_d_bz[gru_hidden] + s_d_br[gru_hidden] + s_d_bh[gru_hidden]
     const int total_dim = input_dim + gru_hidden;
+    const int w_size = gru_hidden * total_dim;
+    float* s_d_Wz = smem;
+    float* s_d_Wr = s_d_Wz + w_size;
+    float* s_d_Wh = s_d_Wr + w_size;
+    float* s_d_bz = s_d_Wh + w_size;
+    float* s_d_br = s_d_bz + gru_hidden;
+    float* s_d_bh = s_d_br + gru_hidden;
+    const int smem_total = 3 * w_size + 3 * gru_hidden;
 
-    for (int gh = 0; gh < gru_hidden; gh++) {
-        float d_h = d_h_new[idx * gru_hidden + gh];
-        float z_val = z_gate[idx * gru_hidden + gh];
-        float r_val = r_gate[idx * gru_hidden + gh];
-        float ht_val = h_tilde[idx * gru_hidden + gh];
-        float h_old_val = h_old[idx * gru_hidden + gh];
+    const int tid = threadIdx.x;
 
-        // h_new = (1-z) * h_old + z * h_tilde
-        float d_z = d_h * (ht_val - h_old_val);
-        float d_h_tilde_val = d_h * z_val;
-        // d_h_old from this gate: d_h * (1 - z)  [not needed if we don't backprop further into h_old]
+    // Zero shared accumulators
+    for (int i = tid; i < smem_total; i += blockDim.x) smem[i] = 0.0f;
+    __syncthreads();
 
-        // d_h_tilde: tanh backward
-        float d_tanh_input = d_h_tilde_val * (1.0f - ht_val * ht_val);
+    const int idx = blockIdx.x * blockDim.x + tid;
+    if (idx < N) {
+        for (int gh = 0; gh < gru_hidden; gh++) {
+            float d_h = d_h_new[idx * gru_hidden + gh];
+            float z_val = z_gate[idx * gru_hidden + gh];
+            float r_val = r_gate[idx * gru_hidden + gh];
+            float ht_val = h_tilde[idx * gru_hidden + gh];
+            float h_old_val = h_old[idx * gru_hidden + gh];
 
-        // d_z: sigmoid backward
-        float d_z_input = d_z * z_val * (1.0f - z_val);
+            float d_z = d_h * (ht_val - h_old_val);
+            float d_h_tilde_val = d_h * z_val;
 
-        // Accumulate d_Wh, d_bh from d_tanh_input
-        // Wh @ xrh + bh -> tanh -> h_tilde
-        // xrh = cat(x, r * h_old)
-        atomicAdd(&d_bh[gh], d_tanh_input);
-        for (int j = 0; j < input_dim; j++) {
-            float xj = gru_input[idx * input_dim + j];
-            atomicAdd(&d_Wh[gh * total_dim + j], d_tanh_input * xj);
-        }
-        for (int j = 0; j < gru_hidden; j++) {
-            float rh = r_val * h_old[idx * gru_hidden + j];
-            // Only use r_val for the current gh dimension's r
-            if (j == gh)
-                rh = r_val * h_old_val;
-            else
-                rh = r_gate[idx * gru_hidden + j] * h_old[idx * gru_hidden + j];
-            atomicAdd(&d_Wh[gh * total_dim + input_dim + j], d_tanh_input * rh);
-        }
+            float d_tanh_input = d_h_tilde_val * (1.0f - ht_val * ht_val);
+            float d_z_input = d_z * z_val * (1.0f - z_val);
 
-        // Accumulate d_Wz, d_bz from d_z_input
-        atomicAdd(&d_bz[gh], d_z_input);
-        for (int j = 0; j < total_dim; j++) {
-            float xh_j;
-            if (j < input_dim)
-                xh_j = gru_input[idx * input_dim + j];
-            else
-                xh_j = h_old[idx * gru_hidden + (j - input_dim)];
-            atomicAdd(&d_Wz[gh * total_dim + j], d_z_input * xh_j);
-        }
-
-        // d_r from Wh backward: per-dimension d_r[j] (not mixed)
-        // Forward: xrh[input_dim+j] = r[j] * h_old[j]
-        // d_xrh[input_dim+j] from this gh = d_tanh_input * Wh[gh, input_dim+j]
-        // d_r[j] from this gh = d_tanh_input * Wh[gh, input_dim+j] * h_old[j]
-        for (int j = 0; j < gru_hidden; j++) {
-            float d_r_j = d_tanh_input * Wh[gh * total_dim + input_dim + j]
-                        * h_old[idx * gru_hidden + j];
-            float r_j = r_gate[idx * gru_hidden + j];
-            float d_r_j_input = d_r_j * r_j * (1.0f - r_j);
-
-            // Accumulate d_Wr[j, :] and d_br[j] from this gh's contribution
-            atomicAdd(&d_br[j], d_r_j_input);
-            for (int k = 0; k < total_dim; k++) {
-                float xh_k;
-                if (k < input_dim)
-                    xh_k = gru_input[idx * input_dim + k];
+            // Accumulate to shared memory instead of global
+            atomicAdd(&s_d_bh[gh], d_tanh_input);
+            for (int j = 0; j < input_dim; j++) {
+                float xj = gru_input[idx * input_dim + j];
+                atomicAdd(&s_d_Wh[gh * total_dim + j], d_tanh_input * xj);
+            }
+            for (int j = 0; j < gru_hidden; j++) {
+                float rh;
+                if (j == gh)
+                    rh = r_val * h_old_val;
                 else
-                    xh_k = h_old[idx * gru_hidden + (k - input_dim)];
-                atomicAdd(&d_Wr[j * total_dim + k], d_r_j_input * xh_k);
+                    rh = r_gate[idx * gru_hidden + j] * h_old[idx * gru_hidden + j];
+                atomicAdd(&s_d_Wh[gh * total_dim + input_dim + j], d_tanh_input * rh);
             }
-            // d_gru_input from Wr backward
-            for (int k = 0; k < input_dim; k++) {
-                atomicAdd(&d_gru_input[idx * input_dim + k],
-                          d_r_j_input * Wr[j * total_dim + k]);
-            }
-        }
 
-        // d_gru_input from Wz and Wh backward (Wr handled above per-dimension)
-        for (int j = 0; j < input_dim; j++) {
-            float d_input_j = d_z_input * Wz[gh * total_dim + j]
-                            + d_tanh_input * Wh[gh * total_dim + j];
-            atomicAdd(&d_gru_input[idx * input_dim + j], d_input_j);
+            atomicAdd(&s_d_bz[gh], d_z_input);
+            for (int j = 0; j < total_dim; j++) {
+                float xh_j;
+                if (j < input_dim)
+                    xh_j = gru_input[idx * input_dim + j];
+                else
+                    xh_j = h_old[idx * gru_hidden + (j - input_dim)];
+                atomicAdd(&s_d_Wz[gh * total_dim + j], d_z_input * xh_j);
+            }
+
+            for (int j = 0; j < gru_hidden; j++) {
+                float d_r_j = d_tanh_input * Wh[gh * total_dim + input_dim + j]
+                            * h_old[idx * gru_hidden + j];
+                float r_j = r_gate[idx * gru_hidden + j];
+                float d_r_j_input = d_r_j * r_j * (1.0f - r_j);
+
+                atomicAdd(&s_d_br[j], d_r_j_input);
+                for (int k = 0; k < total_dim; k++) {
+                    float xh_k;
+                    if (k < input_dim)
+                        xh_k = gru_input[idx * input_dim + k];
+                    else
+                        xh_k = h_old[idx * gru_hidden + (k - input_dim)];
+                    atomicAdd(&s_d_Wr[j * total_dim + k], d_r_j_input * xh_k);
+                }
+                for (int k = 0; k < input_dim; k++) {
+                    atomicAdd(&d_gru_input[idx * input_dim + k],
+                              d_r_j_input * Wr[j * total_dim + k]);
+                }
+            }
+
+            for (int j = 0; j < input_dim; j++) {
+                float d_input_j = d_z_input * Wz[gh * total_dim + j]
+                                + d_tanh_input * Wh[gh * total_dim + j];
+                atomicAdd(&d_gru_input[idx * input_dim + j], d_input_j);
+            }
         }
+    }
+    __syncthreads();
+
+    // Write block sums to global
+    for (int i = tid; i < w_size; i += blockDim.x) {
+        if (s_d_Wz[i] != 0.0f) atomicAdd(&d_Wz[i], s_d_Wz[i]);
+        if (s_d_Wr[i] != 0.0f) atomicAdd(&d_Wr[i], s_d_Wr[i]);
+        if (s_d_Wh[i] != 0.0f) atomicAdd(&d_Wh[i], s_d_Wh[i]);
+    }
+    for (int i = tid; i < gru_hidden; i += blockDim.x) {
+        if (s_d_bz[i] != 0.0f) atomicAdd(&d_bz[i], s_d_bz[i]);
+        if (s_d_br[i] != 0.0f) atomicAdd(&d_br[i], s_d_br[i]);
+        if (s_d_bh[i] != 0.0f) atomicAdd(&d_bh[i], s_d_bh[i]);
     }
 }
 
@@ -1180,18 +1269,35 @@ __global__ void out_proj_backward_kernel(
     float* __restrict__ d_scan_out,            // [N, d_inner]
     const int N, const int d_model, const int d_inner
 ) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N) return;
+    extern __shared__ float smem[];
+    float* s_d_out_proj_W = smem;  // [d_model * d_inner]
 
-    for (int j = 0; j < d_inner; j++) {
-        float d_scan_j = 0.0f;
-        float so_j = scan_out[idx * d_inner + j];
-        for (int d = 0; d < d_model; d++) {
-            float d_ctx = d_context[idx * d_model + d];
-            d_scan_j += d_ctx * out_proj_W[d * d_inner + j];
-            atomicAdd(&d_out_proj_W[d * d_inner + j], d_ctx * so_j);
+    const int tid = threadIdx.x;
+    const int op_size = d_model * d_inner;
+
+    // Zero shared accumulators
+    for (int i = tid; i < op_size; i += blockDim.x) s_d_out_proj_W[i] = 0.0f;
+    __syncthreads();
+
+    const int idx = blockIdx.x * blockDim.x + tid;
+    if (idx < N) {
+        for (int j = 0; j < d_inner; j++) {
+            float d_scan_j = 0.0f;
+            float so_j = scan_out[idx * d_inner + j];
+            for (int d = 0; d < d_model; d++) {
+                float d_ctx = d_context[idx * d_model + d];
+                d_scan_j += d_ctx * out_proj_W[d * d_inner + j];
+                atomicAdd(&s_d_out_proj_W[d * d_inner + j], d_ctx * so_j);
+            }
+            d_scan_out[idx * d_inner + j] = d_scan_j;
         }
-        d_scan_out[idx * d_inner + j] = d_scan_j;
+    }
+    __syncthreads();
+
+    // Write block sums to global
+    for (int i = tid; i < op_size; i += blockDim.x) {
+        if (s_d_out_proj_W[i] != 0.0f)
+            atomicAdd(&d_out_proj_W[i], s_d_out_proj_W[i]);
     }
 }
 
@@ -1487,7 +1593,9 @@ void launch_mamba3_peer_backward(
 
     // Step 4: GRU backward
     auto d_gru_input = torch::zeros({N, gru_input_dim}, float_opts);
-    gru_backward_kernel<<<grid, SG2B_BLOCK>>>(
+    const int gru_total_dim = gru_input_dim + gru_hidden;
+    const int gru_smem = (3 * gru_hidden * gru_total_dim + 3 * gru_hidden) * sizeof(float);
+    gru_backward_kernel<<<grid, SG2B_BLOCK, gru_smem>>>(
         d_gru_out.data_ptr<float>(),
         gru_input.data_ptr<float>(),
         gru_h_old.data_ptr<float>(),
@@ -1533,7 +1641,8 @@ void launch_mamba3_peer_backward(
     auto d_fwd_scan_out = torch::zeros({N, d_inner}, float_opts);
     auto d_bwd_scan_out = torch::zeros({N, d_inner}, float_opts);
 
-    out_proj_backward_kernel<<<grid, SG2B_BLOCK>>>(
+    int out_proj_bwd_smem = d_model * d_inner * sizeof(float);
+    out_proj_backward_kernel<<<grid, SG2B_BLOCK, out_proj_bwd_smem>>>(
         d_fwd_sorted.data_ptr<float>(),
         fwd_scan_out.data_ptr<float>(),
         mamba_fwd_out_proj.data_ptr<float>(),
@@ -1542,7 +1651,7 @@ void launch_mamba3_peer_backward(
         N, d_model, d_inner
     );
 
-    out_proj_backward_kernel<<<grid, SG2B_BLOCK>>>(
+    out_proj_backward_kernel<<<grid, SG2B_BLOCK, out_proj_bwd_smem>>>(
         d_bwd_sorted.data_ptr<float>(),
         bwd_scan_out.data_ptr<float>(),
         mamba_bwd_out_proj.data_ptr<float>(),
@@ -1630,7 +1739,8 @@ void launch_mamba3_peer_backward(
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         grad.scalar_type(), "input_proj_backward", ([&] {
-        input_proj_backward_kernel<scalar_t><<<grid, SG2B_BLOCK>>>(
+        int input_proj_bwd_smem = (d_model * 3) * sizeof(float);
+        input_proj_backward_kernel<scalar_t><<<grid, SG2B_BLOCK, input_proj_bwd_smem>>>(
             d_x_unsorted.data_ptr<float>(),
             grad.data_ptr<scalar_t>(),
             sharpness.data_ptr<scalar_t>(),

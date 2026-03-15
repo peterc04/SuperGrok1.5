@@ -40,7 +40,7 @@ static void clip_grad_norms_device_side(
     auto norm_sq = torch::zeros({1}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
     for (size_t i = 0; i < n_params; i++) {
         if (grads[i].defined() && grads[i].numel() > 0) {
-            norm_sq.add_(grads[i].to(torch::kFloat32).norm().pow(2));
+            norm_sq.add_(grads[i].norm().to(torch::kFloat32).pow(2));
         }
     }
     // Single CPU sync
@@ -69,7 +69,7 @@ static float compute_sam_grad_norm_device_side(
     auto norm_sq = torch::zeros({1}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
     for (size_t i = 0; i < n_grads; i++) {
         if (grads[i].defined() && grads[i].numel() > 0) {
-            norm_sq.add_(grads[i].to(torch::kFloat32).norm().pow(2));
+            norm_sq.add_(grads[i].norm().to(torch::kFloat32).pow(2));
         }
     }
     return std::sqrt(norm_sq.item<float>()) + 1e-12f;
@@ -245,18 +245,13 @@ void supergrok11_fused_step(
 
 #ifdef WITH_CUDA
         if (params[i].is_cuda()) {
+            // Step 1: Fused mu EMA + meta-net to get smart_grad (used for cosine gate)
             launch_sg11_mu_metanet(
                 mus[i], grads[i], sharpness_cache[i], smart_grad, alpha,
                 W1, b1, W2, b2, rescale, hidden_dim);
 
-            // Per-parameter cosine gating (device-side reduction, single sync)
-            auto sg_f = smart_grad.to(torch::kFloat32).reshape(-1);
-            auto mu_f = mus[i].to(torch::kFloat32).reshape(-1);
-            auto vals = torch::stack({(sg_f * mu_f).sum(), sg_f.norm(), mu_f.norm()});
-            auto cpu_vals = vals.cpu();
-            float cos_sim = cpu_vals[0].item<float>() /
-                (cpu_vals[1].item<float>() * cpu_vals[2].item<float>() + 1e-8f);
-            float gate = 1.0f / (1.0f + std::exp(-gate_temperature * cos_sim));
+            // Step 2: Fused cosine gate reduction (single kernel, single CPU sync)
+            float gate = compute_cosine_gate_fused(smart_grad, mus[i], gate_temperature);
             float lamb_eff = ramp > 0.0f ? ramp * gate * lamb : 0.0f;
 
             launch_sg11_adam_decay(
@@ -392,20 +387,19 @@ void neuralgrok_fused_step(
         float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
         float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
 
-        auto amplified_grad = torch::empty_like(params[i]);
-
 #ifdef WITH_CUDA
         if (params[i].is_cuda()) {
-            launch_fused_neuralgrok_amplifier(
-                grads[i], amplified_grad,
-                W1, b1, W2, b2, alpha_amp, beta_amp, hidden_dim);
-            launch_fused_neuralgrok_adam(
-                params[i], exp_avgs[i], exp_avg_sqs[i], amplified_grad,
+            // Single fused kernel: amplifier + adam in one pass
+            // (amplified_grad stays in registers, never hits GMEM)
+            launch_fused_neuralgrok_full_step(
+                params[i], exp_avgs[i], exp_avg_sqs[i], grads[i],
+                W1, b1, W2, b2, alpha_amp, beta_amp, hidden_dim,
                 beta1, beta2, lr, wd, eps, bc1, bc2);
             continue;
         }
 #endif
         // CPU fallback
+        auto amplified_grad = torch::empty_like(params[i]);
         auto g_f = grads[i].reshape({-1, 1}).to(torch::kFloat32);
         auto z = torch::addmm(b1.to(torch::kFloat32), g_f, W1.to(torch::kFloat32).t());
         auto act = torch::relu(z);
@@ -679,16 +673,33 @@ void muon_fused_step(
     constexpr float NS_B = -4.7750f;
     constexpr float NS_C = 2.0315f;
 
+    // Phase 1: Update all momentum buffers and compute norms asynchronously
+    std::vector<torch::Tensor> norm_tensors;
+    std::vector<size_t> valid_indices;
+    norm_tensors.reserve(params.size());
+    valid_indices.reserve(params.size());
     for (size_t i = 0; i < params.size(); i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
+        bufs[i].mul_(momentum).add_(grads[i]);
+        norm_tensors.push_back(bufs[i].norm());  // async kernel launch
+        valid_indices.push_back(i);
+    }
 
+    // Single CPU sync: stack all norms and transfer to CPU
+    std::vector<float> norms_cpu;
+    if (!norm_tensors.empty()) {
+        auto norms_stacked = torch::stack(norm_tensors).cpu();
+        auto norms_ptr = norms_stacked.data_ptr<float>();
+        norms_cpu.assign(norms_ptr, norms_ptr + norm_tensors.size());
+    }
+
+    // Phase 2: Newton-Schulz iterations using pre-computed norms
+    for (size_t vi = 0; vi < valid_indices.size(); vi++) {
+        size_t i = valid_indices[vi];
         auto& p = params[i];
-        auto& g = grads[i];
         auto& buf = bufs[i];
 
-        buf.mul_(momentum).add_(g);
-
-        float buf_norm = buf.norm().item<float>() + 1e-7f;
+        float buf_norm = norms_cpu[vi] + 1e-7f;
         float inv_norm = 1.0f / buf_norm;
 
         auto X = buf * inv_norm;

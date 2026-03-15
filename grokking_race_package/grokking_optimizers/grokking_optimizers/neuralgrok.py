@@ -134,6 +134,9 @@ class NeuralGrok(Optimizer):
 
         super().__init__(params, defaults)
 
+        self._meta_weights_dirty = True
+        self._cached_meta_weights = None
+
     @torch.no_grad()
     def step(self, closure=None) -> Optional[float]:
         """Perform a single optimisation step.
@@ -150,8 +153,11 @@ class NeuralGrok(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        # Extract amplifier weights for the fused kernel
-        W1, b1, W_last, b_last = self.amplifier.get_weights()
+        # Extract amplifier weights for the fused kernel (cached)
+        if self._meta_weights_dirty or self._cached_meta_weights is None:
+            self._cached_meta_weights = self.amplifier.get_weights()
+            self._meta_weights_dirty = False
+        W1, b1, W_last, b_last = self._cached_meta_weights
 
         for group in self.param_groups:
             params_list = []
@@ -211,6 +217,15 @@ class NeuralGrok(Optimizer):
             )
 
         return loss
+
+    def mark_amplifier_dirty(self) -> None:
+        """Mark the cached amplifier weights as stale.
+
+        Call this after updating the amplifier weights (e.g. after
+        ``amplifier_optimizer.step()``) so that the next optimizer step
+        re-extracts FP32 contiguous copies.
+        """
+        self._meta_weights_dirty = True
 
     def get_amplifier(self) -> _Amplifier:
         """Return the gradient amplifier module."""

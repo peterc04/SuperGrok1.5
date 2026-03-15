@@ -23,6 +23,7 @@
 #include <thrust/sort.h>
 #include <thrust/device_ptr.h>
 #include <thrust/sequence.h>
+#include <cub/device/device_segmented_radix_sort.cuh>
 
 constexpr int SG2M_BLOCK = 256;
 constexpr int MAX_D_STATE = 32;
@@ -107,9 +108,27 @@ __global__ void mamba3_scan_kernel(
     const int tid = threadIdx.x;
     if (tid >= d_inner) return;
 
-    // Shared memory for cross-thread communication
+    // Shared memory layout: x_branch + cached projection weights
     extern __shared__ float smem[];
-    float* s_x_branch = smem;           // [d_inner]
+    float* s_x_branch = smem;                              // d_inner
+    float* s_in_proj_W = s_x_branch + d_inner;             // 2 * d_inner * d_model
+    float* s_dt_proj_W = s_in_proj_W + 2*d_inner*d_model;  // d_inner * d_inner
+    float* s_dt_proj_b = s_dt_proj_W + d_inner*d_inner;    // d_inner
+    float* s_B_proj_W = s_dt_proj_b + d_inner;             // d_state * d_inner
+    float* s_C_proj_W = s_B_proj_W + d_state*d_inner;      // d_state * d_inner
+
+    // Cooperatively load all projection weights into shared memory
+    for (int i = tid; i < 2*d_inner*d_model; i += d_inner)
+        s_in_proj_W[i] = in_proj_W[i];
+    for (int i = tid; i < d_inner*d_inner; i += d_inner)
+        s_dt_proj_W[i] = dt_proj_W[i];
+    for (int i = tid; i < d_inner; i += d_inner)
+        s_dt_proj_b[i] = dt_proj_b[i];
+    for (int i = tid; i < d_state*d_inner; i += d_inner)
+        s_B_proj_W[i] = B_proj_W[i];
+    for (int i = tid; i < d_state*d_inner; i += d_inner)
+        s_C_proj_W[i] = C_proj_W[i];
+    __syncthreads();
 
     // State in registers — load from initial_state if provided
     float h[MAX_D_STATE];
@@ -133,12 +152,12 @@ __global__ void mamba3_scan_kernel(
     for (int step = 0; step < N; step++) {
         int i = reverse ? (N - 1 - step) : step;
 
-        // Input projection: each thread computes its own x and z
+        // Input projection: each thread computes its own x and z (shared memory weights)
         float x_val = 0.0f, z_val = 0.0f;
         for (int d = 0; d < d_model; d++) {
             float inp = x_sorted[i * d_model + d];
-            x_val += in_proj_W[tid * d_model + d] * inp;
-            z_val += in_proj_W[(tid + d_inner) * d_model + d] * inp;
+            x_val += s_in_proj_W[tid * d_model + d] * inp;
+            z_val += s_in_proj_W[(tid + d_inner) * d_model + d] * inp;
         }
 
         // Write x_branch to shared memory for cross-thread access
@@ -146,9 +165,9 @@ __global__ void mamba3_scan_kernel(
         __syncthreads();
 
         // FULL dt projection: dt[tid] = sum_j(dt_proj_W[tid, j] * x_branch[j]) + dt_proj_b[tid]
-        float dt_raw = dt_proj_b[tid];
+        float dt_raw = s_dt_proj_b[tid];
         for (int j = 0; j < d_inner; j++) {
-            dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
+            dt_raw += s_dt_proj_W[tid * d_inner + j] * s_x_branch[j];
         }
         float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw)); // stable softplus
 
@@ -162,7 +181,7 @@ __global__ void mamba3_scan_kernel(
             // FULL B projection: B[s] = sum_j(B_proj_W[s, j] * x_branch[j])
             float B_val = 0.0f;
             for (int j = 0; j < d_inner; j++) {
-                B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
+                B_val += s_B_proj_W[s * d_inner + j] * s_x_branch[j];
             }
             float B_bar = dt_val * B_val;
 
@@ -186,7 +205,7 @@ __global__ void mamba3_scan_kernel(
         for (int s = 0; s < d_state; s++) {
             float C_val = 0.0f;
             for (int j = 0; j < d_inner; j++) {
-                C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+                C_val += s_C_proj_W[s * d_inner + j] * s_x_branch[j];
             }
             y_val += h[s] * C_val;
         }
@@ -324,12 +343,22 @@ __global__ void fused_elem_step_kernel(
     const int peer_input_dim = gru_hidden + 2 * d_model + 2;
 
     // 1. Apply Mamba out_proj to get fwd_ctx and bwd_ctx (using shared memory)
+    // Preload scan outputs with float4 vectorized loads
+    float fwd_scan[MAX_D_MODEL]; // reuse MAX_D_MODEL=16 for d_inner
+    float bwd_scan[MAX_D_MODEL];
+    for (int j = 0; j < d_inner; j += 4) {
+        float4 fwd4 = *reinterpret_cast<const float4*>(&fwd_scan_out[idx * d_inner + j]);
+        float4 bwd4 = *reinterpret_cast<const float4*>(&bwd_scan_out[idx * d_inner + j]);
+        fwd_scan[j] = fwd4.x; fwd_scan[j+1] = fwd4.y; fwd_scan[j+2] = fwd4.z; fwd_scan[j+3] = fwd4.w;
+        bwd_scan[j] = bwd4.x; bwd_scan[j+1] = bwd4.y; bwd_scan[j+2] = bwd4.z; bwd_scan[j+3] = bwd4.w;
+    }
+
     float fwd_ctx[MAX_D_MODEL], bwd_ctx[MAX_D_MODEL];
     for (int d = 0; d < d_model; d++) {
         float fwd_val = 0.0f, bwd_val = 0.0f;
         for (int j = 0; j < d_inner; j++) {
-            fwd_val += s_out_fwd[d * d_inner + j] * fwd_scan_out[idx * d_inner + j];
-            bwd_val += s_out_bwd[d * d_inner + j] * bwd_scan_out[idx * d_inner + j];
+            fwd_val += s_out_fwd[d * d_inner + j] * fwd_scan[j];
+            bwd_val += s_out_bwd[d * d_inner + j] * bwd_scan[j];
         }
         fwd_ctx[d] = fwd_val;
         bwd_ctx[d] = bwd_val;
@@ -527,8 +556,27 @@ __global__ void mamba3_scan_batched_kernel(
     const int N = end - start;
     const int reverse = reverse_flags[param_idx];
 
+    // Shared memory layout: x_branch + cached projection weights
     extern __shared__ float smem[];
-    float* s_x_branch = smem;
+    float* s_x_branch = smem;                              // d_inner
+    float* s_in_proj_W = s_x_branch + d_inner;             // 2 * d_inner * d_model
+    float* s_dt_proj_W = s_in_proj_W + 2*d_inner*d_model;  // d_inner * d_inner
+    float* s_dt_proj_b = s_dt_proj_W + d_inner*d_inner;    // d_inner
+    float* s_B_proj_W = s_dt_proj_b + d_inner;             // d_state * d_inner
+    float* s_C_proj_W = s_B_proj_W + d_state*d_inner;      // d_state * d_inner
+
+    // Cooperatively load all projection weights into shared memory
+    for (int i = tid; i < 2*d_inner*d_model; i += d_inner)
+        s_in_proj_W[i] = in_proj_W[i];
+    for (int i = tid; i < d_inner*d_inner; i += d_inner)
+        s_dt_proj_W[i] = dt_proj_W[i];
+    for (int i = tid; i < d_inner; i += d_inner)
+        s_dt_proj_b[i] = dt_proj_b[i];
+    for (int i = tid; i < d_state*d_inner; i += d_inner)
+        s_B_proj_W[i] = B_proj_W[i];
+    for (int i = tid; i < d_state*d_inner; i += d_inner)
+        s_C_proj_W[i] = C_proj_W[i];
+    __syncthreads();
 
     // State in registers — load from initial_state
     float h[MAX_D_STATE], h_snap[MAX_D_STATE];
@@ -554,16 +602,16 @@ __global__ void mamba3_scan_batched_kernel(
         float x_val = 0.0f, z_val = 0.0f;
         for (int d = 0; d < d_model; d++) {
             float inp = my_x[i * d_model + d];
-            x_val += in_proj_W[tid * d_model + d] * inp;
-            z_val += in_proj_W[(tid + d_inner) * d_model + d] * inp;
+            x_val += s_in_proj_W[tid * d_model + d] * inp;
+            z_val += s_in_proj_W[(tid + d_inner) * d_model + d] * inp;
         }
 
         s_x_branch[tid] = x_val;
         __syncthreads();
 
-        float dt_raw = dt_proj_b[tid];
+        float dt_raw = s_dt_proj_b[tid];
         for (int j = 0; j < d_inner; j++)
-            dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
+            dt_raw += s_dt_proj_W[tid * d_inner + j] * s_x_branch[j];
         float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw)); // stable softplus
 
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
@@ -572,7 +620,7 @@ __global__ void mamba3_scan_batched_kernel(
             float A_bar = (1.0f + dt_val * A[s] / 2.0f) / (1.0f - dt_val * A[s] / 2.0f + 1e-8f);
             float B_val = 0.0f;
             for (int j = 0; j < d_inner; j++)
-                B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
+                B_val += s_B_proj_W[s * d_inner + j] * s_x_branch[j];
             float B_bar = dt_val * B_val;
             // Paired RoPE: (2i, 2i+1) form complex pairs
             int pair_idx = s / 2;
@@ -591,7 +639,7 @@ __global__ void mamba3_scan_batched_kernel(
         for (int s = 0; s < d_state; s++) {
             float C_val = 0.0f;
             for (int j = 0; j < d_inner; j++)
-                C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+                C_val += s_C_proj_W[s * d_inner + j] * s_x_branch[j];
             y_val += h[s] * C_val;
         }
         float silu_z = z_val / (1.0f + expf(-z_val));
@@ -675,8 +723,27 @@ __global__ void mamba3_scan_combined_kernel(
     const int end = offsets[param_idx + 1];
     const int N = end - start;
 
+    // Shared memory layout: x_branch + cached projection weights
     extern __shared__ float smem[];
-    float* s_x_branch = smem;
+    float* s_x_branch = smem;                              // d_inner
+    float* s_in_proj_W = s_x_branch + d_inner;             // 2 * d_inner * d_model
+    float* s_dt_proj_W = s_in_proj_W + 2*d_inner*d_model;  // d_inner * d_inner
+    float* s_dt_proj_b = s_dt_proj_W + d_inner*d_inner;    // d_inner
+    float* s_B_proj_W = s_dt_proj_b + d_inner;             // d_state * d_inner
+    float* s_C_proj_W = s_B_proj_W + d_state*d_inner;      // d_state * d_inner
+
+    // Cooperatively load all projection weights into shared memory
+    for (int i = tid; i < 2*d_inner*d_model; i += d_inner)
+        s_in_proj_W[i] = in_proj_W[i];
+    for (int i = tid; i < d_inner*d_inner; i += d_inner)
+        s_dt_proj_W[i] = dt_proj_W[i];
+    for (int i = tid; i < d_inner; i += d_inner)
+        s_dt_proj_b[i] = dt_proj_b[i];
+    for (int i = tid; i < d_state*d_inner; i += d_inner)
+        s_B_proj_W[i] = B_proj_W[i];
+    for (int i = tid; i < d_state*d_inner; i += d_inner)
+        s_C_proj_W[i] = C_proj_W[i];
+    __syncthreads();
 
     float h[MAX_D_STATE], h_snap[MAX_D_STATE];
     const float* my_init = init_states + param_idx * d_inner * d_state;
@@ -699,16 +766,16 @@ __global__ void mamba3_scan_combined_kernel(
         float x_val = 0.0f, z_val = 0.0f;
         for (int d = 0; d < d_model; d++) {
             float inp = my_x[i * d_model + d];
-            x_val += in_proj_W[tid * d_model + d] * inp;
-            z_val += in_proj_W[(tid + d_inner) * d_model + d] * inp;
+            x_val += s_in_proj_W[tid * d_model + d] * inp;
+            z_val += s_in_proj_W[(tid + d_inner) * d_model + d] * inp;
         }
 
         s_x_branch[tid] = x_val;
         __syncthreads();
 
-        float dt_raw = dt_proj_b[tid];
+        float dt_raw = s_dt_proj_b[tid];
         for (int j = 0; j < d_inner; j++)
-            dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
+            dt_raw += s_dt_proj_W[tid * d_inner + j] * s_x_branch[j];
         float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw)); // stable softplus
 
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
@@ -717,7 +784,7 @@ __global__ void mamba3_scan_combined_kernel(
             float A_bar = (1.0f + dt_val * A[s] / 2.0f) / (1.0f - dt_val * A[s] / 2.0f + 1e-8f);
             float B_val = 0.0f;
             for (int j = 0; j < d_inner; j++)
-                B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
+                B_val += s_B_proj_W[s * d_inner + j] * s_x_branch[j];
             float B_bar = dt_val * B_val;
             int pair_idx = s / 2;
             float cos_p, sin_p;
@@ -735,7 +802,7 @@ __global__ void mamba3_scan_combined_kernel(
         for (int s = 0; s < d_state; s++) {
             float C_val = 0.0f;
             for (int j = 0; j < d_inner; j++)
-                C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+                C_val += s_C_proj_W[s * d_inner + j] * s_x_branch[j];
             y_val += h[s] * C_val;
         }
         float silu_z = z_val / (1.0f + expf(-z_val));
@@ -750,6 +817,38 @@ __global__ void mamba3_scan_combined_kernel(
         my_final[tid * d_state + s] = h[s];
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Workspace cache: pre-allocated buffers that grow as needed
+// ═══════════════════════════════════════════════════════════════════════
+namespace {
+struct ScanWorkspace {
+    torch::Tensor x_proj;       // [max_N, d_model]
+    torch::Tensor sort_keys;    // [max_N]
+    torch::Tensor sort_indices; // [max_N]
+    torch::Tensor fwd_scan;     // [max_N, d_inner]
+    torch::Tensor bwd_scan;     // [max_N, d_inner]
+    int max_N = 0;
+    int d_model = 0;
+    int d_inner = 0;
+
+    void ensure(int N, int dm, int di, torch::Device dev) {
+        if (N <= max_N && dm == d_model && di == d_inner) return;
+        int alloc_N = std::max(N, max_N);
+        auto fo = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
+        auto io = torch::TensorOptions().device(dev).dtype(torch::kInt32);
+        x_proj = torch::empty({alloc_N, dm}, fo);
+        sort_keys = torch::empty({alloc_N}, fo);
+        sort_indices = torch::empty({alloc_N}, io);
+        fwd_scan = torch::empty({alloc_N, di}, fo);
+        bwd_scan = torch::empty({alloc_N, di}, fo);
+        max_N = alloc_N;
+        d_model = dm;
+        d_inner = di;
+    }
+};
+static ScanWorkspace g_workspace;
+} // namespace
 
 // ═══════════════════════════════════════════════════════════════════════
 //  Launcher: Full Mamba-3 + PEER step (single parameter)
@@ -823,10 +922,13 @@ void launch_mamba3_peer_step(
     auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
     auto int_opts = torch::TensorOptions().device(dev).dtype(torch::kInt32);
 
+    // Pre-allocated workspace (grows as needed, reused across calls)
+    g_workspace.ensure(N, d_model, d_inner, dev);
+
     // Step 1: Input projection + sort key computation
-    auto x_proj = torch::empty({N, d_model}, float_opts);
-    auto sort_keys = torch::empty({N}, float_opts);
-    auto sort_indices = torch::empty({N}, int_opts);
+    auto x_proj = g_workspace.x_proj.narrow(0, 0, N);
+    auto sort_keys = g_workspace.sort_keys.narrow(0, 0, N);
+    auto sort_indices = g_workspace.sort_indices.narrow(0, 0, N);
 
     {
         const int grid = (N + SG2M_BLOCK - 1) / SG2M_BLOCK;
@@ -860,14 +962,14 @@ void launch_mamba3_peer_step(
         x_sorted = x_proj.index_select(0, idx_tensor);
     }
 
-    // Step 2: Bidirectional Mamba-3 scan
-    auto fwd_scan_out = torch::empty({N, d_inner}, float_opts);
+    // Step 2: Bidirectional Mamba-3 scan (reuse workspace for scan outputs)
+    auto fwd_scan_out = g_workspace.fwd_scan.narrow(0, 0, N);
     auto new_fwd_state = torch::empty({d_inner, d_state}, float_opts);
-    auto bwd_scan_out = torch::empty({N, d_inner}, float_opts);
+    auto bwd_scan_out = g_workspace.bwd_scan.narrow(0, 0, N);
     auto new_bwd_state = torch::empty({d_inner, d_state}, float_opts);
 
-    // Shared memory for scan: x_branch only (z computed per-thread)
-    int scan_smem = d_inner * sizeof(float);
+    // Shared memory for scan: x_branch + cached projection weights
+    int scan_smem = (d_inner + 2*d_inner*d_model + d_inner*d_inner + d_inner + 2*d_state*d_inner) * sizeof(float);
 
     // Forward scan — pass initial_state if available
     const float* fwd_init_ptr = (mamba_fwd_state.numel() > 0) ?
@@ -1028,21 +1130,41 @@ void launch_mamba3_peer_batched_step(
     auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
     auto int_opts = torch::TensorOptions().device(dev).dtype(torch::kInt32);
 
-    // Step 1: Input projection + sort for all params, pack sorted data
+    // Step 1: Input projection + CUB segmented sort for all params
     std::vector<int> N_vec(num_params);
+    std::vector<torch::Tensor> x_proj_list(num_params);
     std::vector<torch::Tensor> x_sorted_list(num_params);
     std::vector<torch::Tensor> sort_idx_list(num_params);
     std::vector<torch::Tensor> unsort_idx_list(num_params);
     int total_N = 0;
 
+    // First pass: compute total_N and per-param sizes
     for (int p = 0; p < num_params; p++) {
-        int N = grads[p].numel();
-        N_vec[p] = N;
+        N_vec[p] = grads[p].numel();
+        total_N += N_vec[p];
+    }
+    if (total_N == 0) return;
+
+    // Build segment offsets for CUB segmented sort
+    std::vector<int> seg_offsets_cpu(num_params + 1);
+    seg_offsets_cpu[0] = 0;
+    for (int p = 0; p < num_params; p++)
+        seg_offsets_cpu[p + 1] = seg_offsets_cpu[p] + N_vec[p];
+
+    // Allocate packed keys/indices for all params
+    auto all_keys = torch::empty({total_N}, float_opts);
+    auto all_indices = torch::empty({total_N}, int_opts);
+    auto all_keys_out = torch::empty({total_N}, float_opts);
+    auto all_indices_out = torch::empty({total_N}, int_opts);
+
+    // Run input_proj_sort for all params, writing into packed arrays
+    for (int p = 0; p < num_params; p++) {
+        int N = N_vec[p];
         if (N == 0) continue;
+        int off = seg_offsets_cpu[p];
 
         auto x_proj = torch::empty({N, d_model}, float_opts);
-        auto sort_keys = torch::empty({N}, float_opts);
-        auto sort_indices = torch::empty({N}, int_opts);
+        x_proj_list[p] = x_proj;
 
         const int grid = (N + SG2M_BLOCK - 1) / SG2M_BLOCK;
         AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -1052,43 +1174,55 @@ void launch_mamba3_peer_batched_step(
                 grads[p].data_ptr<scalar_t>(),
                 sharpness_list[p].data_ptr<scalar_t>(),
                 x_proj.data_ptr<float>(),
-                sort_keys.data_ptr<float>(),
-                sort_indices.data_ptr<int>(),
+                all_keys.data_ptr<float>() + off,
+                all_indices.data_ptr<int>() + off,
                 input_proj_W.data_ptr<float>(),
                 input_proj_b.data_ptr<float>(),
                 N, d_model
             );
         }));
+    }
 
-        {
-            thrust::device_ptr<float> keys_ptr(sort_keys.data_ptr<float>());
-            thrust::device_ptr<int> idx_ptr(sort_indices.data_ptr<int>());
-            thrust::sort_by_key(keys_ptr, keys_ptr + N, idx_ptr);
-        }
+    // CUB segmented sort: sort all params' keys+indices in a single call
+    auto seg_offsets_t = torch::from_blob(seg_offsets_cpu.data(), {num_params + 1},
+        torch::kInt32).to(dev).contiguous();
 
-        auto idx_long = sort_indices.to(torch::kLong);
-        x_sorted_list[p] = x_proj.index_select(0, idx_long);
-        sort_idx_list[p] = sort_indices;
+    size_t cub_temp_bytes = 0;
+    cub::DeviceSegmentedRadixSort::SortPairs(
+        nullptr, cub_temp_bytes,
+        all_keys.data_ptr<float>(), all_keys_out.data_ptr<float>(),
+        all_indices.data_ptr<int>(), all_indices_out.data_ptr<int>(),
+        total_N, num_params,
+        seg_offsets_t.data_ptr<int>(), seg_offsets_t.data_ptr<int>() + 1);
+
+    auto cub_temp = torch::empty({(int64_t)cub_temp_bytes},
+        torch::TensorOptions().device(dev).dtype(torch::kUInt8));
+    cub::DeviceSegmentedRadixSort::SortPairs(
+        cub_temp.data_ptr<void>(), cub_temp_bytes,
+        all_keys.data_ptr<float>(), all_keys_out.data_ptr<float>(),
+        all_indices.data_ptr<int>(), all_indices_out.data_ptr<int>(),
+        total_N, num_params,
+        seg_offsets_t.data_ptr<int>(), seg_offsets_t.data_ptr<int>() + 1);
+
+    // Extract per-param sorted data
+    for (int p = 0; p < num_params; p++) {
+        int N = N_vec[p];
+        if (N == 0) continue;
+        int off = seg_offsets_cpu[p];
+
+        sort_idx_list[p] = all_indices_out.narrow(0, off, N);
+        auto idx_long = sort_idx_list[p].to(torch::kLong);
+        x_sorted_list[p] = x_proj_list[p].index_select(0, idx_long);
 
         auto unsort = torch::empty({N}, torch::TensorOptions().device(dev).dtype(torch::kLong));
         unsort.scatter_(0, idx_long,
             torch::arange(N, torch::TensorOptions().device(dev).dtype(torch::kLong)));
         unsort_idx_list[p] = unsort;
-
-        total_N += N;
     }
 
-    if (total_N == 0) return;
-
-    // Step 2: Pack sorted data and build offset table
-    // Build offset table
-    std::vector<int> offsets_cpu(num_params + 1);
-    offsets_cpu[0] = 0;
-    for (int p = 0; p < num_params; p++)
-        offsets_cpu[p + 1] = offsets_cpu[p] + N_vec[p];
-
-    auto offsets_t = torch::from_blob(offsets_cpu.data(), {num_params + 1},
-        torch::kInt32).to(dev);
+    // Step 2: Pack sorted data (reuse seg_offsets from step 1)
+    auto& offsets_cpu = seg_offsets_cpu;
+    auto offsets_t = seg_offsets_t;
 
     // Concatenate sorted data
     std::vector<torch::Tensor> valid_sorted;
@@ -1107,7 +1241,7 @@ void launch_mamba3_peer_batched_step(
     auto fwd_scan_packed = torch::empty({total_N, d_inner}, float_opts);
     auto bwd_scan_packed = torch::empty({total_N, d_inner}, float_opts);
 
-    int scan_smem = d_inner * sizeof(float);
+    int scan_smem = (d_inner + 2*d_inner*d_model + d_inner*d_inner + d_inner + 2*d_state*d_inner) * sizeof(float);
 
     // Step 3+4: Combined forward + backward scan in single launch
     // Grid = 2*num_params: first half fwd, second half bwd (reversed)
@@ -1164,11 +1298,15 @@ void launch_mamba3_peer_batched_step(
         bwd_unsorted_list[p] = bwd_slice.index_select(0, unsort_idx_list[p]);
     }
 
-    // Launch fused_elem_step kernels on a pool of streams for concurrency
+    // Launch fused_elem_step kernels on a persistent pool of streams
     constexpr int NUM_STREAMS = 4;
-    cudaStream_t streams[NUM_STREAMS];
-    for (int s = 0; s < NUM_STREAMS; s++)
-        cudaStreamCreate(&streams[s]);
+    static cudaStream_t streams[NUM_STREAMS] = {};
+    static bool streams_initialized = false;
+    if (!streams_initialized) {
+        for (int s = 0; s < NUM_STREAMS; s++)
+            cudaStreamCreate(&streams[s]);
+        streams_initialized = true;
+    }
 
     for (int p = 0; p < num_params; p++) {
         int N = N_vec[p];
@@ -1210,9 +1348,8 @@ void launch_mamba3_peer_batched_step(
         }));
     }
 
-    // Sync all streams and clean up
+    // Sync all streams (persistent — no destroy)
     for (int s = 0; s < NUM_STREAMS; s++) {
         cudaStreamSynchronize(streams[s]);
-        cudaStreamDestroy(streams[s]);
     }
 }
