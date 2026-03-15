@@ -19,7 +19,11 @@ import torch.nn as nn
 from torch.optim import Optimizer
 from typing import Optional, Callable, Dict, Any, Tuple
 
-from grokking_optimizers import _ops
+from grokking_optimizers import _HAS_OPS
+if _HAS_OPS:
+    from grokking_optimizers import _ops
+else:
+    from grokking_optimizers import _python_fallback as _ops
 
 
 class SharpnessMetaNet(nn.Module):

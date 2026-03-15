@@ -32,10 +32,12 @@ from typing import Optional, Dict, List
 
 from grokking_optimizers.mamba3_peer_metanet import Mamba3PEERMetaNet
 
-try:
+from grokking_optimizers import _HAS_OPS
+if _HAS_OPS:
     from grokking_optimizers import _ops
     _HAS_CUDA = True
-except ImportError:
+else:
+    from grokking_optimizers import _python_fallback as _ops
     _HAS_CUDA = False
 
 

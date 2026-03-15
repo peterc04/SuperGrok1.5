@@ -140,25 +140,41 @@ elif _has_gpu:
 
 else:
     from torch.utils.cpp_extension import CppExtension
+    import platform as _platform
     print("Building Grokking Optimizers C++ CPU-only extension")
-    print("  No GPU detected — building reference CPU kernels.")
-    print("  CPU mode is for debugging and testing; not optimized for training.")
+    print("  No GPU detected — building reference CPU kernels with OpenMP + SIMD.")
+
+    _cpu_sources = [
+        "csrc/cpu/cpu_ops.cpp",
+        "csrc/cpu/cpu_kernels.cpp",
+        "csrc/cpu/generic/all_optimizers_cpu.cpp",
+        "csrc/cpu/generic/supergrok2_scan_cpu.cpp",
+    ]
+
+    _cpu_cxx_flags = [
+        "-O3", "-std=c++17", "-DWITH_CPU",
+        "-ffast-math", "-funroll-loops",
+        "-fopenmp",
+    ]
+
+    _cpu_arch = _platform.machine().lower()
+    if _cpu_arch in ("x86_64", "amd64"):
+        _cpu_sources.append("csrc/cpu/avx512/simd_kernels.cpp")
+        _cpu_cxx_flags.append("-march=native")
+        print("  SIMD: x86_64 detected, AVX-512 auto-detected via -march=native")
+    elif _cpu_arch in ("aarch64", "arm64"):
+        _cpu_sources.append("csrc/cpu/neon/simd_kernels.cpp")
+        print("  SIMD: ARM detected, NEON intrinsics enabled")
+    else:
+        print(f"  SIMD: unknown arch '{_cpu_arch}', scalar fallback only")
 
     ext = CppExtension(
         name="grokking_optimizers._ops",
-        sources=[
-            "csrc/cpu/cpu_ops.cpp",
-            "csrc/cpu/cpu_kernels.cpp",
-        ],
-        include_dirs=["csrc/common", "csrc"],
+        sources=_cpu_sources,
+        include_dirs=["csrc/common", "csrc", "csrc/cpu"],
         define_macros=[("WITH_CPU", None)],
         extra_compile_args={
-            "cxx": [
-                "-O3", "-std=c++17", "-DWITH_CPU",
-                "-ffast-math", "-funroll-loops",
-                "-fopenmp",
-                "-march=native",
-            ],
+            "cxx": _cpu_cxx_flags,
         },
         extra_link_args=["-fopenmp"],
     )

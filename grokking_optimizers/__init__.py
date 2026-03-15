@@ -12,20 +12,24 @@ Usage:
 __version__ = "2.1.0"
 
 # ── Backend capability flags ─────────────────────────────────────────
+# Three-tier detection:
+#   _HAS_OPS  = True  → C++ extension loaded (GPU or CPU build)
+#   _HAS_CUDA = True  → GPU kernels available (CUDA or HIP build)
+#   _HAS_CPU_OPS = True → CPU C++ kernels available (CPU build)
+# If _HAS_OPS is False, the pure-Python fallback in _python_fallback.py
+# is used automatically by every optimizer.
+_HAS_OPS = False
 _HAS_CUDA = False
-_HAS_CPU = False
+_HAS_CPU_OPS = False
 
 try:
-    from grokking_optimizers import _ops  # noqa: F401
+    import torch  # noqa: F401 — must import torch first to load libc10.so
+    from . import _ops  # noqa: F401
+    _HAS_OPS = True
     _HAS_CUDA = hasattr(_ops, 'supergrok2_mamba_peer_batched_step')
-    _HAS_CPU = hasattr(_ops, 'supergrok2_cpu_step')
-except ImportError as e:
-    import warnings
-    warnings.warn(
-        f"grokking_optimizers C++ extension not found. "
-        f"Build with: pip install -e . (from the repo root). "
-        f"Pure Python fallback only. Original error: {e}"
-    )
+    _HAS_CPU_OPS = hasattr(_ops, 'supergrok2_cpu_step')
+except Exception:
+    _ops = None
 
 from .supergrok15 import SuperGrok15, SharpnessMetaNet
 from .supergrok2 import SuperGrok2, CompiledSuperGrok2
@@ -74,5 +78,5 @@ __all__ = [
     "setup_distributed", "cleanup_distributed",
     "get_rank", "get_world_size", "is_main_process",
     "broadcast_optimizer_state", "wrap_model_ddp",
-    "_HAS_CUDA", "_HAS_CPU",
+    "_HAS_OPS", "_HAS_CUDA", "_HAS_CPU_OPS",
 ]

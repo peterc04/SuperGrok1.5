@@ -15,7 +15,11 @@ import torch
 from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
-from grokking_optimizers import _ops
+from grokking_optimizers import _HAS_OPS
+if _HAS_OPS:
+    from grokking_optimizers import _ops
+else:
+    from grokking_optimizers import _python_fallback as _ops
 from grokking_optimizers._adamw_helper import adamw_step
 
 

@@ -16,7 +16,11 @@ import torch.nn as nn
 from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
-from grokking_optimizers import _ops
+from grokking_optimizers import _HAS_OPS
+if _HAS_OPS:
+    from grokking_optimizers import _ops
+else:
+    from grokking_optimizers import _python_fallback as _ops
 
 
 class _Amplifier(nn.Module):
