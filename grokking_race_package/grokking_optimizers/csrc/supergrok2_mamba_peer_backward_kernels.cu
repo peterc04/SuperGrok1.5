@@ -325,6 +325,223 @@ __global__ void mamba3_parallel_scan_fwd_save_kernel(
 
 
 // ═══════════════════════════════════════════════════════════════════════
+//  Batched Parallel Scan with State Saving
+//
+//  Single-launch kernel for all parameters. 2D grid:
+//    blockIdx.x = d_inner dimension (j)
+//    blockIdx.y = parameter index
+//  Eliminates per-parameter kernel launch loop.
+//
+//  Grid:  (d_inner, num_params)
+//  Block: PSCAN_BLOCK threads (power of 2)
+//  Shared: 6 * block_size floats
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void mamba3_batched_parallel_scan_fwd_save_kernel(
+    const float* __restrict__ pre_x_val,     // [total_N, d_inner]
+    const float* __restrict__ pre_z_val,     // [total_N, d_inner]
+    const float* __restrict__ pre_dt_val,    // [total_N, d_inner]
+    const float* __restrict__ pre_B_val,     // [total_N, d_state]
+    const float* __restrict__ pre_C_val,     // [total_N, d_state]
+    const float* __restrict__ A_log,         // [d_inner, d_state]
+    const float* __restrict__ D_param,       // [d_inner]
+    const float* __restrict__ rope_freq,     // [d_inner, d_state/2]
+    float* __restrict__ scan_output,         // [total_N, d_inner] — pre-zeroed
+    const float* __restrict__ initial_states, // [num_params, d_inner, d_state]
+    float* __restrict__ final_states,        // [num_params, d_inner, d_state]
+    float* __restrict__ saved_states,        // [total_ckpts or total_N, d_inner, d_state]
+    const int* __restrict__ offsets,          // [num_params + 1]
+    const int* __restrict__ reverse_flags,   // [num_params]
+    const int* __restrict__ ckpt_offsets,     // [num_params + 1] or nullptr
+    const int d_inner, const int d_state,
+    const int checkpoint_interval
+) {
+    const int j = blockIdx.x;          // d_inner index
+    const int param_idx = blockIdx.y;  // parameter index
+    if (j >= d_inner) return;
+
+    const int ltid = threadIdx.x;
+    const int num_threads = blockDim.x;
+    extern __shared__ float smem[];
+
+    const int start = offsets[param_idx];
+    const int end = offsets[param_idx + 1];
+    const int N = end - start;
+    if (N == 0) return;
+    const int reverse = reverse_flags[param_idx];
+
+    // Offset pointers to this parameter's packed data
+    const float* my_pre_x = pre_x_val + start * d_inner;
+    const float* my_pre_z = pre_z_val + start * d_inner;
+    const float* my_pre_dt = pre_dt_val + start * d_inner;
+    const float* my_pre_B = pre_B_val + start * d_state;
+    const float* my_pre_C = pre_C_val + start * d_state;
+    float* my_scan_out = scan_output + start * d_inner;
+
+    const int ckpt_start = (checkpoint_interval > 1 && ckpt_offsets != nullptr)
+                           ? ckpt_offsets[param_idx] : start;
+    float* my_saved = saved_states + ckpt_start * d_inner * d_state;
+
+    const int chunk_size = (N + num_threads - 1) / num_threads;
+    const int my_start = ltid * chunk_size;
+    const int my_end = min(my_start + chunk_size, N);
+    const int my_count = max(my_end - my_start, 0);
+    const int half_d_state = d_state / 2;
+
+    float A[MAX_D_STATE], freq_arr[MAX_D_STATE / 2];
+    for (int s = 0; s < d_state; s++)
+        A[s] = -expf(A_log[j * d_state + s]);
+    for (int p = 0; p < half_d_state; p++)
+        freq_arr[p] = rope_freq[j * half_d_state + p];
+    float D_val = D_param[j];
+
+    float h_init_all[MAX_D_STATE];
+    const float* init_ptr = initial_states + param_idx * d_inner * d_state;
+    for (int s = 0; s < d_state; s++)
+        h_init_all[s] = init_ptr[j * d_state + s];
+
+    #define BUILD_AFFINE_BATCH(t_idx, A_e, A_o, f_val, s_e, s_o, elem_out) do { \
+        float dt = my_pre_dt[(t_idx) * d_inner + j]; \
+        float x_val = my_pre_x[(t_idx) * d_inner + j]; \
+        float B_e = my_pre_B[(t_idx) * d_state + (s_e)]; \
+        float B_o = my_pre_B[(t_idx) * d_state + (s_o)]; \
+        float A_bar_e = (1.0f + dt * (A_e) / 2.0f) / (1.0f - dt * (A_e) / 2.0f + 1e-8f); \
+        float A_bar_o = (1.0f + dt * (A_o) / 2.0f) / (1.0f - dt * (A_o) / 2.0f + 1e-8f); \
+        float cos_v, sin_v; \
+        __sincosf(dt * (f_val), &sin_v, &cos_v); \
+        (elem_out).m00 = A_bar_e * cos_v; \
+        (elem_out).m01 = -A_bar_e * sin_v; \
+        (elem_out).m10 = A_bar_o * sin_v; \
+        (elem_out).m11 = A_bar_o * cos_v; \
+        (elem_out).b0 = dt * B_e * x_val; \
+        (elem_out).b1 = dt * B_o * x_val; \
+    } while(0)
+
+    for (int p = 0; p < half_d_state; p++) {
+        const int s_e = 2 * p, s_o = 2 * p + 1;
+        const float A_e = A[s_e], A_o = A[s_o];
+        const float f_val = freq_arr[p];
+        const float h_init_e = h_init_all[s_e], h_init_o = h_init_all[s_o];
+
+        // Step 1: Sequential scan within chunk
+        Affine2x2 summary = affine_identity();
+        for (int step = 0; step < my_count; step++) {
+            int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
+            Affine2x2 elem;
+            BUILD_AFFINE_BATCH(t, A_e, A_o, f_val, s_e, s_o, elem);
+            summary = affine_combine(summary, elem);
+        }
+
+        int base = ltid * 6;
+        smem[base] = summary.m00; smem[base+1] = summary.m01;
+        smem[base+2] = summary.m10; smem[base+3] = summary.m11;
+        smem[base+4] = summary.b0;  smem[base+5] = summary.b1;
+        __syncthreads();
+
+        // Step 2: Blelloch exclusive prefix scan
+        for (int stride = 1; stride < num_threads; stride *= 2) {
+            int idx = (ltid + 1) * stride * 2 - 1;
+            if (idx < num_threads) {
+                Affine2x2 left  = {smem[(idx-stride)*6], smem[(idx-stride)*6+1],
+                                   smem[(idx-stride)*6+2], smem[(idx-stride)*6+3],
+                                   smem[(idx-stride)*6+4], smem[(idx-stride)*6+5]};
+                Affine2x2 right = {smem[idx*6], smem[idx*6+1],
+                                   smem[idx*6+2], smem[idx*6+3],
+                                   smem[idx*6+4], smem[idx*6+5]};
+                Affine2x2 combined = affine_combine(left, right);
+                smem[idx*6]   = combined.m00; smem[idx*6+1] = combined.m01;
+                smem[idx*6+2] = combined.m10; smem[idx*6+3] = combined.m11;
+                smem[idx*6+4] = combined.b0;  smem[idx*6+5] = combined.b1;
+            }
+            __syncthreads();
+        }
+        if (ltid == 0) {
+            int last = (num_threads - 1) * 6;
+            smem[last] = 1.0f; smem[last+1] = 0.0f;
+            smem[last+2] = 0.0f; smem[last+3] = 1.0f;
+            smem[last+4] = 0.0f; smem[last+5] = 0.0f;
+        }
+        __syncthreads();
+        for (int stride = num_threads / 2; stride >= 1; stride /= 2) {
+            int idx = (ltid + 1) * stride * 2 - 1;
+            if (idx < num_threads) {
+                Affine2x2 left  = {smem[(idx-stride)*6], smem[(idx-stride)*6+1],
+                                   smem[(idx-stride)*6+2], smem[(idx-stride)*6+3],
+                                   smem[(idx-stride)*6+4], smem[(idx-stride)*6+5]};
+                Affine2x2 right = {smem[idx*6], smem[idx*6+1],
+                                   smem[idx*6+2], smem[idx*6+3],
+                                   smem[idx*6+4], smem[idx*6+5]};
+                smem[(idx-stride)*6]   = right.m00; smem[(idx-stride)*6+1] = right.m01;
+                smem[(idx-stride)*6+2] = right.m10; smem[(idx-stride)*6+3] = right.m11;
+                smem[(idx-stride)*6+4] = right.b0;  smem[(idx-stride)*6+5] = right.b1;
+                Affine2x2 combined = affine_combine(right, left);
+                smem[idx*6]   = combined.m00; smem[idx*6+1] = combined.m01;
+                smem[idx*6+2] = combined.m10; smem[idx*6+3] = combined.m11;
+                smem[idx*6+4] = combined.b0;  smem[idx*6+5] = combined.b1;
+            }
+            __syncthreads();
+        }
+
+        Affine2x2 prefix = {smem[ltid*6], smem[ltid*6+1],
+                            smem[ltid*6+2], smem[ltid*6+3],
+                            smem[ltid*6+4], smem[ltid*6+5]};
+
+        // Step 3: Re-scan with prefix, save states
+        Affine2x2 running = prefix;
+        for (int step = 0; step < my_count; step++) {
+            int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
+            int seq_step = my_start + step;
+
+            Affine2x2 elem;
+            BUILD_AFFINE_BATCH(t, A_e, A_o, f_val, s_e, s_o, elem);
+            running = affine_combine(running, elem);
+
+            float h_e = running.m00 * h_init_e + running.m01 * h_init_o + running.b0;
+            float h_o = running.m10 * h_init_e + running.m11 * h_init_o + running.b1;
+
+            if (checkpoint_interval <= 1) {
+                my_saved[(t * d_inner + j) * d_state + s_e] = h_e;
+                my_saved[(t * d_inner + j) * d_state + s_o] = h_o;
+            } else {
+                bool at_seg_end = ((seq_step + 1) % checkpoint_interval == 0)
+                                  || (seq_step == N - 1);
+                if (at_seg_end) {
+                    int ckpt_idx = seq_step / checkpoint_interval;
+                    my_saved[(ckpt_idx * d_inner + j) * d_state + s_e] = h_e;
+                    my_saved[(ckpt_idx * d_inner + j) * d_state + s_o] = h_o;
+                }
+            }
+
+            float C_e = my_pre_C[t * d_state + s_e];
+            float C_o = my_pre_C[t * d_state + s_o];
+            my_scan_out[t * d_inner + j] += h_e * C_e + h_o * C_o;
+        }
+
+        // Last thread writes final state
+        if (my_end == N && my_count > 0) {
+            float* my_final = final_states + param_idx * d_inner * d_state;
+            float h_e_f = running.m00 * h_init_e + running.m01 * h_init_o + running.b0;
+            float h_o_f = running.m10 * h_init_e + running.m11 * h_init_o + running.b1;
+            my_final[j * d_state + s_e] = h_e_f;
+            my_final[j * d_state + s_o] = h_o_f;
+        }
+        __syncthreads();
+    }
+
+    #undef BUILD_AFFINE_BATCH
+
+    // SiLU gating + D skip connection
+    for (int step = 0; step < my_count; step++) {
+        int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
+        float z = my_pre_z[t * d_inner + j];
+        float silu_z = z / (1.0f + expf(-z));
+        float x_val = my_pre_x[t * d_inner + j];
+        my_scan_out[t * d_inner + j] = my_scan_out[t * d_inner + j] * silu_z + D_val * x_val;
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
 //  Utility Kernels: Segmented Reverse and Combine+Flip
 //
 //  Replace per-param C++ loops calling .flip().copy_() with single
@@ -2728,8 +2945,8 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
     auto rev_fwd = torch::zeros({num_params}, int_opts);
     auto rev_bwd = torch::ones({num_params}, int_opts);
 
-    int scan_smem = d_inner * sizeof(float);
     int ckpt_int = (checkpoint_interval > 1) ? checkpoint_interval : 0;
+    int total_N = offsets_cpu[num_params];
 
     // Compute checkpoint offsets if checkpointing is enabled
     torch::Tensor ckpt_offsets_t;
@@ -2745,67 +2962,178 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
             torch::kInt32).to(dev).clone();
     }
 
-    // Step 2: Forward scan with saving (uses persistent initial states)
-    mamba3_scan_fwd_save_batched_kernel<<<num_params, d_inner, scan_smem>>>(
-        x_sorted_packed.data_ptr<float>(),
-        fwd_scan_out_packed.data_ptr<float>(),
-        fwd_initial_states.data_ptr<float>(),
-        final_fwd.data_ptr<float>(),
-        offsets_t.data_ptr<int>(),
-        rev_fwd.data_ptr<int>(),
-        fwd_saved_states_packed.data_ptr<float>(),
-        fwd_saved_xb_packed.data_ptr<float>(),
-        fwd_saved_z_packed.data_ptr<float>(),
-        fwd_saved_dt_packed.data_ptr<float>(),
-        mamba_fwd_in_proj.data_ptr<float>(),
-        mamba_fwd_dt_W.data_ptr<float>(),
-        mamba_fwd_dt_b.data_ptr<float>(),
-        mamba_fwd_B_proj.data_ptr<float>(),
-        mamba_fwd_C_proj.data_ptr<float>(),
-        mamba_fwd_A_log.data_ptr<float>(),
-        mamba_fwd_D.data_ptr<float>(),
-        mamba_fwd_rope.data_ptr<float>(),
-        ckpt_int > 1 ? ckpt_offsets_t.data_ptr<int>() : nullptr,
-        d_model, d_inner, d_state, ckpt_int
-    );
-
-    // Step 3: Build reversed x_sorted for backward scan direction via CUDA kernel
-    int total_N = offsets_cpu[num_params];
-    auto x_sorted_rev_packed = torch::empty_like(x_sorted_packed);
-    {
-        int total_elems = total_N * d_model;
-        int rev_grid = (total_elems + SG2B_BLOCK - 1) / SG2B_BLOCK;
-        reverse_segments_kernel<<<rev_grid, SG2B_BLOCK>>>(
-            x_sorted_packed.data_ptr<float>(),
-            x_sorted_rev_packed.data_ptr<float>(),
-            offsets_t.data_ptr<int>(),
-            d_model, num_params
-        );
+    // Determine max N across params for parallel scan threshold
+    int max_N = 0;
+    for (int p = 0; p < num_params; p++) {
+        int N = offsets_cpu[p + 1] - offsets_cpu[p];
+        if (N > max_N) max_N = N;
     }
 
-    // Step 4: Backward scan with saving (uses persistent initial states)
-    mamba3_scan_fwd_save_batched_kernel<<<num_params, d_inner, scan_smem>>>(
-        x_sorted_rev_packed.data_ptr<float>(),
-        bwd_scan_out_packed.data_ptr<float>(),
-        bwd_initial_states.data_ptr<float>(),
-        final_bwd.data_ptr<float>(),
-        offsets_t.data_ptr<int>(),
-        rev_fwd.data_ptr<int>(),  // not reversed — the data is already flipped
-        bwd_saved_states_packed.data_ptr<float>(),
-        bwd_saved_xb_packed.data_ptr<float>(),
-        bwd_saved_z_packed.data_ptr<float>(),
-        bwd_saved_dt_packed.data_ptr<float>(),
-        mamba_bwd_in_proj.data_ptr<float>(),
-        mamba_bwd_dt_W.data_ptr<float>(),
-        mamba_bwd_dt_b.data_ptr<float>(),
-        mamba_bwd_B_proj.data_ptr<float>(),
-        mamba_bwd_C_proj.data_ptr<float>(),
-        mamba_bwd_A_log.data_ptr<float>(),
-        mamba_bwd_D.data_ptr<float>(),
-        mamba_bwd_rope.data_ptr<float>(),
-        ckpt_int > 1 ? ckpt_offsets_t.data_ptr<int>() : nullptr,
-        d_model, d_inner, d_state, ckpt_int
-    );
+    if (max_N >= PSCAN_THRESHOLD) {
+        // ═══ Parallel scan path: precompute + batched parallel prefix scan ═══
+        // Precompute for all packed data (weights shared across params)
+        auto pre_B = torch::empty({total_N, d_state}, float_opts);
+        auto pre_C = torch::empty({total_N, d_state}, float_opts);
+        const int pre_grid = (total_N + SG2B_BLOCK - 1) / SG2B_BLOCK;
+
+        // Forward precompute — outputs to saved_xb/z/dt directly
+        bilevel_precompute_kernel<<<pre_grid, SG2B_BLOCK>>>(
+            x_sorted_packed.data_ptr<float>(),
+            mamba_fwd_in_proj.data_ptr<float>(),
+            mamba_fwd_dt_W.data_ptr<float>(),
+            mamba_fwd_dt_b.data_ptr<float>(),
+            mamba_fwd_B_proj.data_ptr<float>(),
+            mamba_fwd_C_proj.data_ptr<float>(),
+            fwd_saved_xb_packed.data_ptr<float>(),
+            fwd_saved_z_packed.data_ptr<float>(),
+            fwd_saved_dt_packed.data_ptr<float>(),
+            pre_B.data_ptr<float>(),
+            pre_C.data_ptr<float>(),
+            total_N, d_model, d_inner, d_state
+        );
+
+        // Forward parallel scan — single launch for all params
+        fwd_scan_out_packed.zero_();
+        int block_po2 = 1;
+        int actual_block = std::min(PSCAN_BLOCK, max_N);
+        while (block_po2 < actual_block) block_po2 *= 2;
+        block_po2 = std::min(block_po2, PSCAN_BLOCK);
+        int pscan_smem = 6 * block_po2 * sizeof(float);
+        dim3 grid2d(d_inner, num_params);
+
+        mamba3_batched_parallel_scan_fwd_save_kernel<<<grid2d, block_po2, pscan_smem>>>(
+            fwd_saved_xb_packed.data_ptr<float>(),
+            fwd_saved_z_packed.data_ptr<float>(),
+            fwd_saved_dt_packed.data_ptr<float>(),
+            pre_B.data_ptr<float>(),
+            pre_C.data_ptr<float>(),
+            mamba_fwd_A_log.data_ptr<float>(),
+            mamba_fwd_D.data_ptr<float>(),
+            mamba_fwd_rope.data_ptr<float>(),
+            fwd_scan_out_packed.data_ptr<float>(),
+            fwd_initial_states.data_ptr<float>(),
+            final_fwd.data_ptr<float>(),
+            fwd_saved_states_packed.data_ptr<float>(),
+            offsets_t.data_ptr<int>(),
+            rev_fwd.data_ptr<int>(),
+            ckpt_int > 1 ? ckpt_offsets_t.data_ptr<int>() : nullptr,
+            d_inner, d_state, ckpt_int
+        );
+
+        // Build reversed x_sorted for backward
+        auto x_sorted_rev_packed = torch::empty_like(x_sorted_packed);
+        {
+            int total_elems = total_N * d_model;
+            int rev_grid = (total_elems + SG2B_BLOCK - 1) / SG2B_BLOCK;
+            reverse_segments_kernel<<<rev_grid, SG2B_BLOCK>>>(
+                x_sorted_packed.data_ptr<float>(),
+                x_sorted_rev_packed.data_ptr<float>(),
+                offsets_t.data_ptr<int>(),
+                d_model, num_params
+            );
+        }
+
+        // Backward precompute
+        auto pre_B_bwd = torch::empty({total_N, d_state}, float_opts);
+        auto pre_C_bwd = torch::empty({total_N, d_state}, float_opts);
+
+        bilevel_precompute_kernel<<<pre_grid, SG2B_BLOCK>>>(
+            x_sorted_rev_packed.data_ptr<float>(),
+            mamba_bwd_in_proj.data_ptr<float>(),
+            mamba_bwd_dt_W.data_ptr<float>(),
+            mamba_bwd_dt_b.data_ptr<float>(),
+            mamba_bwd_B_proj.data_ptr<float>(),
+            mamba_bwd_C_proj.data_ptr<float>(),
+            bwd_saved_xb_packed.data_ptr<float>(),
+            bwd_saved_z_packed.data_ptr<float>(),
+            bwd_saved_dt_packed.data_ptr<float>(),
+            pre_B_bwd.data_ptr<float>(),
+            pre_C_bwd.data_ptr<float>(),
+            total_N, d_model, d_inner, d_state
+        );
+
+        // Backward parallel scan — single launch
+        bwd_scan_out_packed.zero_();
+        mamba3_batched_parallel_scan_fwd_save_kernel<<<grid2d, block_po2, pscan_smem>>>(
+            bwd_saved_xb_packed.data_ptr<float>(),
+            bwd_saved_z_packed.data_ptr<float>(),
+            bwd_saved_dt_packed.data_ptr<float>(),
+            pre_B_bwd.data_ptr<float>(),
+            pre_C_bwd.data_ptr<float>(),
+            mamba_bwd_A_log.data_ptr<float>(),
+            mamba_bwd_D.data_ptr<float>(),
+            mamba_bwd_rope.data_ptr<float>(),
+            bwd_scan_out_packed.data_ptr<float>(),
+            bwd_initial_states.data_ptr<float>(),
+            final_bwd.data_ptr<float>(),
+            bwd_saved_states_packed.data_ptr<float>(),
+            offsets_t.data_ptr<int>(),
+            rev_fwd.data_ptr<int>(),
+            ckpt_int > 1 ? ckpt_offsets_t.data_ptr<int>() : nullptr,
+            d_inner, d_state, ckpt_int
+        );
+    } else {
+        // ═══ Sequential fallback for small N ═══
+        int scan_smem = d_inner * sizeof(float);
+
+        mamba3_scan_fwd_save_batched_kernel<<<num_params, d_inner, scan_smem>>>(
+            x_sorted_packed.data_ptr<float>(),
+            fwd_scan_out_packed.data_ptr<float>(),
+            fwd_initial_states.data_ptr<float>(),
+            final_fwd.data_ptr<float>(),
+            offsets_t.data_ptr<int>(),
+            rev_fwd.data_ptr<int>(),
+            fwd_saved_states_packed.data_ptr<float>(),
+            fwd_saved_xb_packed.data_ptr<float>(),
+            fwd_saved_z_packed.data_ptr<float>(),
+            fwd_saved_dt_packed.data_ptr<float>(),
+            mamba_fwd_in_proj.data_ptr<float>(),
+            mamba_fwd_dt_W.data_ptr<float>(),
+            mamba_fwd_dt_b.data_ptr<float>(),
+            mamba_fwd_B_proj.data_ptr<float>(),
+            mamba_fwd_C_proj.data_ptr<float>(),
+            mamba_fwd_A_log.data_ptr<float>(),
+            mamba_fwd_D.data_ptr<float>(),
+            mamba_fwd_rope.data_ptr<float>(),
+            ckpt_int > 1 ? ckpt_offsets_t.data_ptr<int>() : nullptr,
+            d_model, d_inner, d_state, ckpt_int
+        );
+
+        auto x_sorted_rev_packed = torch::empty_like(x_sorted_packed);
+        {
+            int total_elems = total_N * d_model;
+            int rev_grid = (total_elems + SG2B_BLOCK - 1) / SG2B_BLOCK;
+            reverse_segments_kernel<<<rev_grid, SG2B_BLOCK>>>(
+                x_sorted_packed.data_ptr<float>(),
+                x_sorted_rev_packed.data_ptr<float>(),
+                offsets_t.data_ptr<int>(),
+                d_model, num_params
+            );
+        }
+
+        mamba3_scan_fwd_save_batched_kernel<<<num_params, d_inner, scan_smem>>>(
+            x_sorted_rev_packed.data_ptr<float>(),
+            bwd_scan_out_packed.data_ptr<float>(),
+            bwd_initial_states.data_ptr<float>(),
+            final_bwd.data_ptr<float>(),
+            offsets_t.data_ptr<int>(),
+            rev_fwd.data_ptr<int>(),
+            bwd_saved_states_packed.data_ptr<float>(),
+            bwd_saved_xb_packed.data_ptr<float>(),
+            bwd_saved_z_packed.data_ptr<float>(),
+            bwd_saved_dt_packed.data_ptr<float>(),
+            mamba_bwd_in_proj.data_ptr<float>(),
+            mamba_bwd_dt_W.data_ptr<float>(),
+            mamba_bwd_dt_b.data_ptr<float>(),
+            mamba_bwd_B_proj.data_ptr<float>(),
+            mamba_bwd_C_proj.data_ptr<float>(),
+            mamba_bwd_A_log.data_ptr<float>(),
+            mamba_bwd_D.data_ptr<float>(),
+            mamba_bwd_rope.data_ptr<float>(),
+            ckpt_int > 1 ? ckpt_offsets_t.data_ptr<int>() : nullptr,
+            d_model, d_inner, d_state, ckpt_int
+        );
+    }
 }
 
 
