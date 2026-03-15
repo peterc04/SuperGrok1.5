@@ -250,7 +250,8 @@ void launch_mamba3_peer_bilevel_fwd_save(
     torch::Tensor bwd_saved_states, torch::Tensor bwd_saved_x_branch,
     torch::Tensor bwd_saved_z, torch::Tensor bwd_saved_dt,
     torch::Tensor x_sorted, torch::Tensor sort_indices,
-    torch::Tensor fwd_initial_state, torch::Tensor bwd_initial_state);
+    torch::Tensor fwd_initial_state, torch::Tensor bwd_initial_state,
+    int checkpoint_interval);
 
 void launch_mamba3_peer_backward(
     torch::Tensor d_smart_grad, torch::Tensor grad, torch::Tensor sharpness,
@@ -308,7 +309,8 @@ void launch_mamba3_peer_backward(
     int d_model, int d_state, int d_inner,
     int gru_hidden, int gru_input_dim,
     int num_heads, int topk, int pk_dim,
-    int expert_hidden, int peer_input_dim, int num_experts);
+    int expert_hidden, int peer_input_dim, int num_experts,
+    int checkpoint_interval);
 
 // Batched bilevel forward-save
 void launch_mamba3_peer_bilevel_fwd_save_batched(
@@ -333,7 +335,8 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
     torch::Tensor bwd_saved_z_packed, torch::Tensor bwd_saved_dt_packed,
     torch::Tensor x_sorted_packed, torch::Tensor offsets_t,
     torch::Tensor sort_indices_packed,
-    torch::Tensor fwd_initial_states, torch::Tensor bwd_initial_states);
+    torch::Tensor fwd_initial_states, torch::Tensor bwd_initial_states,
+    int checkpoint_interval);
 
 // Batched bilevel backward scan
 void launch_mamba3_peer_backward_batched(
@@ -362,7 +365,8 @@ void launch_mamba3_peer_backward_batched(
     torch::Tensor d_mamba_bwd_D, torch::Tensor d_mamba_bwd_rope,
     torch::Tensor d_x_sorted_packed,
     torch::Tensor fwd_initial_states, torch::Tensor bwd_initial_states,
-    int d_model, int d_state, int d_inner, int num_params);
+    int d_model, int d_state, int d_inner, int num_params,
+    int checkpoint_interval);
 
 #endif  // WITH_CUDA
 

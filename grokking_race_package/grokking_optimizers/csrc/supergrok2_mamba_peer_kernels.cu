@@ -24,11 +24,53 @@
 #include <thrust/device_ptr.h>
 #include <thrust/sequence.h>
 #include <cub/device/device_segmented_radix_sort.cuh>
+#include <algorithm>
 
 constexpr int SG2M_BLOCK = 256;
 constexpr int MAX_D_STATE = 32;
 constexpr int MAX_D_MODEL = 16;
 constexpr int MAX_GRU_HIDDEN = 8;
+constexpr int MAX_D_INNER = 32;
+constexpr int PSCAN_BLOCK = 512;    // threads per parallel scan block (must be power of 2)
+constexpr int PSCAN_THRESHOLD = 256; // fall back to sequential scan if N < this
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Parallel Prefix Scan Infrastructure
+//
+//  The selective scan h[t] = M[t] * h[t-1] + b[t] is an affine recurrence.
+//  Affine transforms compose associatively:
+//    (M2, b2) ∘ (M1, b1) = (M2 * M1, M2 * b1 + b2)
+//
+//  This enables Blelloch parallel prefix scan over affine transforms.
+//  For paired RoPE, each pair (s_even, s_odd) uses a 2×2 matrix + 2-vector.
+//
+//  Identity: M = I_2, b = 0
+//  Combine:  (M_out, b_out) = (M_right * M_left, M_right * b_left + b_right)
+// ═══════════════════════════════════════════════════════════════════════
+
+struct Affine2x2 {
+    float m00, m01, m10, m11;  // 2×2 matrix
+    float b0, b1;               // 2-vector bias
+};
+
+__device__ __forceinline__ Affine2x2 affine_identity() {
+    return {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+}
+
+__device__ __forceinline__ Affine2x2 affine_combine(Affine2x2 left, Affine2x2 right) {
+    // Computes right ∘ left: apply left first, then right
+    // M_out = M_right * M_left
+    // b_out = M_right * b_left + b_right
+    Affine2x2 out;
+    out.m00 = right.m00 * left.m00 + right.m01 * left.m10;
+    out.m01 = right.m00 * left.m01 + right.m01 * left.m11;
+    out.m10 = right.m10 * left.m00 + right.m11 * left.m10;
+    out.m11 = right.m10 * left.m01 + right.m11 * left.m11;
+    out.b0  = right.m00 * left.b0  + right.m01 * left.b1 + right.b0;
+    out.b1  = right.m10 * left.b0  + right.m11 * left.b1 + right.b1;
+    return out;
+}
 
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -224,6 +266,297 @@ __global__ void mamba3_scan_kernel(
 
 
 // ═══════════════════════════════════════════════════════════════════════
+//  Phase A: Parallel Scan Pre-computation
+//
+//  Pre-computes ALL cross-thread-dependent quantities for all N timesteps.
+//  Each thread handles one timestep, computing:
+//    - x_val[j] and z_val[j] for all d_inner j (input projection)
+//    - dt_val[j] for all d_inner j (full dt projection, requires x_branch)
+//    - B_val[s] for all d_state s (full B projection, requires x_branch)
+//    - C_val[s] for all d_state s (full C projection, requires x_branch)
+//
+//  Grid:  ((N + 255) / 256, 1, 1)
+//  Block: (256, 1, 1)
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void mamba3_parallel_precompute_kernel(
+    const float* __restrict__ x_sorted,     // [N, d_model]
+    const float* __restrict__ in_proj_W,    // [2*d_inner, d_model]
+    const float* __restrict__ dt_proj_W,    // [d_inner, d_inner]
+    const float* __restrict__ dt_proj_b,    // [d_inner]
+    const float* __restrict__ B_proj_W,     // [d_state, d_inner]
+    const float* __restrict__ C_proj_W,     // [d_state, d_inner]
+    float* __restrict__ pre_x_val,          // [N, d_inner] output
+    float* __restrict__ pre_z_val,          // [N, d_inner] output
+    float* __restrict__ pre_dt_val,         // [N, d_inner] output
+    float* __restrict__ pre_B_val,          // [N, d_state] output
+    float* __restrict__ pre_C_val,          // [N, d_state] output
+    const int N,
+    const int d_model,
+    const int d_inner,
+    const int d_state
+) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= N) return;
+
+    // Load input for this timestep
+    float inp[MAX_D_MODEL];
+    for (int d = 0; d < d_model; d++)
+        inp[d] = x_sorted[t * d_model + d];
+
+    // Compute x_val[j] and z_val[j] for all d_inner
+    float x_branch[MAX_D_INNER];
+    for (int j = 0; j < d_inner; j++) {
+        float x_val = 0.0f, z_val = 0.0f;
+        for (int d = 0; d < d_model; d++) {
+            x_val += in_proj_W[j * d_model + d] * inp[d];
+            z_val += in_proj_W[(j + d_inner) * d_model + d] * inp[d];
+        }
+        x_branch[j] = x_val;
+        pre_x_val[t * d_inner + j] = x_val;
+        pre_z_val[t * d_inner + j] = z_val;
+    }
+
+    // Compute dt_val[j] for all d_inner (full projection: dt = softplus(W @ x + b))
+    for (int j = 0; j < d_inner; j++) {
+        float dt_raw = dt_proj_b[j];
+        for (int k = 0; k < d_inner; k++)
+            dt_raw += dt_proj_W[j * d_inner + k] * x_branch[k];
+        float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw));
+        pre_dt_val[t * d_inner + j] = dt_val;
+    }
+
+    // Compute B_val[s] and C_val[s] for all d_state
+    for (int s = 0; s < d_state; s++) {
+        float B_val = 0.0f, C_val = 0.0f;
+        for (int j = 0; j < d_inner; j++) {
+            B_val += B_proj_W[s * d_inner + j] * x_branch[j];
+            C_val += C_proj_W[s * d_inner + j] * x_branch[j];
+        }
+        pre_B_val[t * d_state + s] = B_val;
+        pre_C_val[t * d_state + s] = C_val;
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Phase B+C: Parallel Prefix Scan with Blelloch Algorithm
+//
+//  Each block handles all N timesteps for one d_inner dimension (one j).
+//  Pairs are processed sequentially within the block; within each pair,
+//  the N timesteps are divided into chunks, scanned in parallel via
+//  the Blelloch exclusive prefix scan, then the prefix is propagated.
+//
+//  Output y_val contributions are accumulated in scan_output via global
+//  memory RMW (no contention: each [t, j] is written by exactly one thread).
+//  After all pairs, gating (SiLU) and skip connection are applied.
+//
+//  Grid:  (d_inner, 1, 1) for single param
+//  Block: (PSCAN_BLOCK, 1, 1)
+//  Shared memory: 6 * PSCAN_BLOCK * sizeof(float) for Blelloch scan
+//
+//  Mathematical proof of correctness:
+//    Sequential: h[t] = M[t] * h[t-1] + b[t]
+//    Parallel:   h[t] = (M[t] ∘ M[t-1] ∘ ... ∘ M[0]) * h[-1] + b_cumulative[t]
+//    where ∘ is affine_combine, which is associative.
+//    The Blelloch scan computes all prefix compositions in O(N) work and O(log N) depth.
+//    The chunk-based approach uses O(N/P) sequential work + O(log P) parallel depth.
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void mamba3_parallel_scan_kernel(
+    const float* __restrict__ pre_x_val,    // [N, d_inner]
+    const float* __restrict__ pre_z_val,    // [N, d_inner]
+    const float* __restrict__ pre_dt_val,   // [N, d_inner]
+    const float* __restrict__ pre_B_val,    // [N, d_state]
+    const float* __restrict__ pre_C_val,    // [N, d_state]
+    const float* __restrict__ A_log,        // [d_inner, d_state]
+    const float* __restrict__ D_param,      // [d_inner]
+    const float* __restrict__ rope_freq,    // [d_inner, d_state/2]
+    float* __restrict__ scan_output,        // [N, d_inner] — must be pre-zeroed
+    float* __restrict__ final_state,        // [d_inner, d_state]
+    const float* __restrict__ initial_state, // [d_inner, d_state] or nullptr
+    const int N,
+    const int d_inner,
+    const int d_state,
+    const int reverse
+) {
+    const int j = blockIdx.x;  // d_inner index for this block
+    if (j >= d_inner) return;
+    const int ltid = threadIdx.x;
+    const int num_threads = blockDim.x;
+
+    // Shared memory: Affine2x2 array for Blelloch scan [num_threads × 6 floats]
+    extern __shared__ float smem[];
+
+    // Each thread handles a contiguous chunk of timesteps
+    const int chunk_size = (N + num_threads - 1) / num_threads;
+    const int my_start = ltid * chunk_size;
+    const int my_end = min(my_start + chunk_size, N);
+    const int my_count = max(my_end - my_start, 0);
+
+    const int half_d_state = d_state / 2;
+
+    // Load per-d_inner constants
+    float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
+    for (int s = 0; s < d_state; s++)
+        A[s] = -expf(A_log[j * d_state + s]);
+    for (int p = 0; p < half_d_state; p++)
+        freq[p] = rope_freq[j * half_d_state + p];
+    float D_val = D_param[j];
+
+    // Load initial state (read-only throughout)
+    float h_init_all[MAX_D_STATE];
+    if (initial_state != nullptr) {
+        for (int s = 0; s < d_state; s++)
+            h_init_all[s] = initial_state[j * d_state + s];
+    } else {
+        for (int s = 0; s < d_state; s++)
+            h_init_all[s] = 0.0f;
+    }
+
+    // Helper: build affine transform for timestep t, pair p
+    // (inline lambda-like macro to avoid function call overhead)
+    #define BUILD_AFFINE(t_idx, A_e, A_o, f_val, s_e, s_o, elem_out) do { \
+        float dt = pre_dt_val[(t_idx) * d_inner + j]; \
+        float x_val = pre_x_val[(t_idx) * d_inner + j]; \
+        float B_e = pre_B_val[(t_idx) * d_state + (s_e)]; \
+        float B_o = pre_B_val[(t_idx) * d_state + (s_o)]; \
+        float A_bar_e = (1.0f + dt * (A_e) / 2.0f) / (1.0f - dt * (A_e) / 2.0f + 1e-8f); \
+        float A_bar_o = (1.0f + dt * (A_o) / 2.0f) / (1.0f - dt * (A_o) / 2.0f + 1e-8f); \
+        float cos_v, sin_v; \
+        __sincosf(dt * (f_val), &sin_v, &cos_v); \
+        (elem_out).m00 = A_bar_e * cos_v; \
+        (elem_out).m01 = -A_bar_e * sin_v; \
+        (elem_out).m10 = A_bar_o * sin_v; \
+        (elem_out).m11 = A_bar_o * cos_v; \
+        (elem_out).b0 = dt * B_e * x_val; \
+        (elem_out).b1 = dt * B_o * x_val; \
+    } while(0)
+
+    // Process each pair sequentially
+    for (int p = 0; p < half_d_state; p++) {
+        const int s_e = 2 * p;
+        const int s_o = 2 * p + 1;
+        const float A_e = A[s_e], A_o = A[s_o];
+        const float f_val = freq[p];
+        const float h_init_e = h_init_all[s_e];
+        const float h_init_o = h_init_all[s_o];
+
+        // === Step 1: Sequential scan within chunk → get chunk summary ===
+        Affine2x2 summary = affine_identity();
+        for (int step = 0; step < my_count; step++) {
+            int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
+            Affine2x2 elem;
+            BUILD_AFFINE(t, A_e, A_o, f_val, s_e, s_o, elem);
+            summary = affine_combine(summary, elem);
+        }
+
+        // Store summary in shared memory
+        int base = ltid * 6;
+        smem[base + 0] = summary.m00; smem[base + 1] = summary.m01;
+        smem[base + 2] = summary.m10; smem[base + 3] = summary.m11;
+        smem[base + 4] = summary.b0;  smem[base + 5] = summary.b1;
+        __syncthreads();
+
+        // === Step 2: Blelloch exclusive prefix scan on chunk summaries ===
+        // Up-sweep (reduction phase)
+        for (int stride = 1; stride < num_threads; stride *= 2) {
+            int idx = (ltid + 1) * stride * 2 - 1;
+            if (idx < num_threads) {
+                Affine2x2 left  = {smem[(idx-stride)*6], smem[(idx-stride)*6+1],
+                                   smem[(idx-stride)*6+2], smem[(idx-stride)*6+3],
+                                   smem[(idx-stride)*6+4], smem[(idx-stride)*6+5]};
+                Affine2x2 right = {smem[idx*6], smem[idx*6+1],
+                                   smem[idx*6+2], smem[idx*6+3],
+                                   smem[idx*6+4], smem[idx*6+5]};
+                Affine2x2 combined = affine_combine(left, right);
+                smem[idx*6]   = combined.m00; smem[idx*6+1] = combined.m01;
+                smem[idx*6+2] = combined.m10; smem[idx*6+3] = combined.m11;
+                smem[idx*6+4] = combined.b0;  smem[idx*6+5] = combined.b1;
+            }
+            __syncthreads();
+        }
+
+        // Set last element to identity (for exclusive scan)
+        if (ltid == 0) {
+            int last = (num_threads - 1) * 6;
+            smem[last]   = 1.0f; smem[last+1] = 0.0f;
+            smem[last+2] = 0.0f; smem[last+3] = 1.0f;
+            smem[last+4] = 0.0f; smem[last+5] = 0.0f;
+        }
+        __syncthreads();
+
+        // Down-sweep
+        for (int stride = num_threads / 2; stride >= 1; stride /= 2) {
+            int idx = (ltid + 1) * stride * 2 - 1;
+            if (idx < num_threads) {
+                Affine2x2 left  = {smem[(idx-stride)*6], smem[(idx-stride)*6+1],
+                                   smem[(idx-stride)*6+2], smem[(idx-stride)*6+3],
+                                   smem[(idx-stride)*6+4], smem[(idx-stride)*6+5]};
+                Affine2x2 right = {smem[idx*6], smem[idx*6+1],
+                                   smem[idx*6+2], smem[idx*6+3],
+                                   smem[idx*6+4], smem[idx*6+5]};
+                // Swap and combine
+                smem[(idx-stride)*6]   = right.m00; smem[(idx-stride)*6+1] = right.m01;
+                smem[(idx-stride)*6+2] = right.m10; smem[(idx-stride)*6+3] = right.m11;
+                smem[(idx-stride)*6+4] = right.b0;  smem[(idx-stride)*6+5] = right.b1;
+                Affine2x2 combined = affine_combine(left, right);
+                smem[idx*6]   = combined.m00; smem[idx*6+1] = combined.m01;
+                smem[idx*6+2] = combined.m10; smem[idx*6+3] = combined.m11;
+                smem[idx*6+4] = combined.b0;  smem[idx*6+5] = combined.b1;
+            }
+            __syncthreads();
+        }
+
+        // Read exclusive prefix for this thread
+        Affine2x2 prefix = {smem[ltid*6], smem[ltid*6+1],
+                            smem[ltid*6+2], smem[ltid*6+3],
+                            smem[ltid*6+4], smem[ltid*6+5]};
+
+        // === Step 3: Re-scan chunk with prefix, compute output ===
+        Affine2x2 running = prefix;
+        for (int step = 0; step < my_count; step++) {
+            int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
+
+            Affine2x2 elem;
+            BUILD_AFFINE(t, A_e, A_o, f_val, s_e, s_o, elem);
+            running = affine_combine(running, elem);
+
+            // Compute h[t] from cumulative transform + initial state
+            float h_e = running.m00 * h_init_e + running.m01 * h_init_o + running.b0;
+            float h_o = running.m10 * h_init_e + running.m11 * h_init_o + running.b1;
+
+            // Accumulate y_val contribution from this pair
+            float C_e = pre_C_val[t * d_state + s_e];
+            float C_o = pre_C_val[t * d_state + s_o];
+            scan_output[t * d_inner + j] += h_e * C_e + h_o * C_o;
+        }
+
+        // Last thread writes final state for this pair
+        if (my_end == N && my_count > 0) {
+            float h_e_final = running.m00 * h_init_e + running.m01 * h_init_o + running.b0;
+            float h_o_final = running.m10 * h_init_e + running.m11 * h_init_o + running.b1;
+            final_state[j * d_state + s_e] = h_e_final;
+            final_state[j * d_state + s_o] = h_o_final;
+        }
+
+        __syncthreads(); // ensure all threads done before next pair
+    }
+
+    #undef BUILD_AFFINE
+
+    // === Phase C: Apply SiLU gating and D skip connection ===
+    for (int step = 0; step < my_count; step++) {
+        int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
+        float z = pre_z_val[t * d_inner + j];
+        float silu_z = z / (1.0f + expf(-z));
+        float x_val = pre_x_val[t * d_inner + j];
+        scan_output[t * d_inner + j] = scan_output[t * d_inner + j] * silu_z + D_val * x_val;
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
 //  Kernel 3: Fused Per-Element Step
 //
 //  GRU + multi-head PEER routing + expert MLP + mu update + Adam
@@ -304,7 +637,12 @@ __global__ void fused_elem_step_kernel(
     float* s_gru_bz = s_gru_Wh + gru_mat_size;
     float* s_gru_br = s_gru_bz + gru_hidden;
     float* s_gru_bh = s_gru_br + gru_hidden;
-    // Total smem: 2*op_size + 3*gru_mat_size + 3*gru_hidden floats
+    // Expert weights in shared memory
+    float* s_expert_W1 = s_gru_bh + gru_hidden;          // [num_experts * expert_hidden]
+    float* s_expert_b1 = s_expert_W1 + num_experts * expert_hidden;
+    float* s_expert_W2 = s_expert_b1 + num_experts * expert_hidden;
+    float* s_expert_b2 = s_expert_W2 + num_experts * expert_hidden;
+    // Total smem: 2*op_size + 3*gru_mat_size + 3*gru_hidden + 3*num_experts*expert_hidden + num_experts floats
 
     // Cooperative loading: each thread loads some elements
     const int tid = threadIdx.x;
@@ -327,6 +665,15 @@ __global__ void fused_elem_step_kernel(
         for (int i = tid; i < gru_sizes[seg]; i += block_size)
             gru_smem_start[gru_offset + i] = gru_gmem[seg][i];
         gru_offset += gru_sizes[seg];
+    }
+    // Load expert weights
+    for (int i = tid; i < num_experts * expert_hidden; i += block_size) {
+        s_expert_W1[i] = expert_W1[i];
+        s_expert_b1[i] = expert_b1[i];
+        s_expert_W2[i] = expert_W2[i];
+    }
+    for (int i = tid; i < num_experts; i += block_size) {
+        s_expert_b2[i] = expert_b2[i];
     }
 
     __syncthreads();
@@ -479,13 +826,13 @@ __global__ void fused_elem_step_kernel(
             atomicAdd(&expert_counts[expert_idx], 1);
 
         // Expert MLP: z = relu(W1 * g + b1), out = W2 @ z + b2
-        // Use __ldg for read-only expert weight loads (L1 cache hint)
-        float head_out = __ldg(&expert_b2[expert_idx]);
+        // Use shared memory for expert weight reads
+        float head_out = s_expert_b2[expert_idx];
         for (int h = 0; h < expert_hidden; h++) {
-            float z_val = __ldg(&expert_W1[expert_idx * expert_hidden + h]) * g
-                        + __ldg(&expert_b1[expert_idx * expert_hidden + h]);
+            float z_val = s_expert_W1[expert_idx * expert_hidden + h] * g
+                        + s_expert_b1[expert_idx * expert_hidden + h];
             z_val = fmaxf(z_val, 0.0f);  // ReLU
-            head_out += __ldg(&expert_W2[expert_idx * expert_hidden + h]) * z_val;
+            head_out += s_expert_W2[expert_idx * expert_hidden + h] * z_val;
         }
         total_out += head_out;
     }
@@ -828,12 +1175,19 @@ struct ScanWorkspace {
     torch::Tensor sort_indices; // [max_N]
     torch::Tensor fwd_scan;     // [max_N, d_inner]
     torch::Tensor bwd_scan;     // [max_N, d_inner]
+    // Parallel scan precompute buffers
+    torch::Tensor pre_x_val;    // [max_N, d_inner]
+    torch::Tensor pre_z_val;    // [max_N, d_inner]
+    torch::Tensor pre_dt_val;   // [max_N, d_inner]
+    torch::Tensor pre_B_val;    // [max_N, d_state]
+    torch::Tensor pre_C_val;    // [max_N, d_state]
     int max_N = 0;
     int d_model = 0;
     int d_inner = 0;
+    int d_state = 0;
 
-    void ensure(int N, int dm, int di, torch::Device dev) {
-        if (N <= max_N && dm == d_model && di == d_inner) return;
+    void ensure(int N, int dm, int di, int ds, torch::Device dev) {
+        if (N <= max_N && dm == d_model && di == d_inner && ds == d_state) return;
         int alloc_N = std::max(N, max_N);
         auto fo = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
         auto io = torch::TensorOptions().device(dev).dtype(torch::kInt32);
@@ -842,9 +1196,15 @@ struct ScanWorkspace {
         sort_indices = torch::empty({alloc_N}, io);
         fwd_scan = torch::empty({alloc_N, di}, fo);
         bwd_scan = torch::empty({alloc_N, di}, fo);
+        pre_x_val = torch::empty({alloc_N, di}, fo);
+        pre_z_val = torch::empty({alloc_N, di}, fo);
+        pre_dt_val = torch::empty({alloc_N, di}, fo);
+        pre_B_val = torch::empty({alloc_N, ds}, fo);
+        pre_C_val = torch::empty({alloc_N, ds}, fo);
         max_N = alloc_N;
         d_model = dm;
         d_inner = di;
+        d_state = ds;
     }
 };
 static ScanWorkspace g_workspace;
@@ -923,7 +1283,7 @@ void launch_mamba3_peer_step(
     auto int_opts = torch::TensorOptions().device(dev).dtype(torch::kInt32);
 
     // Pre-allocated workspace (grows as needed, reused across calls)
-    g_workspace.ensure(N, d_model, d_inner, dev);
+    g_workspace.ensure(N, d_model, d_inner, d_state, dev);
 
     // Step 1: Input projection + sort key computation
     auto x_proj = g_workspace.x_proj.narrow(0, 0, N);
@@ -968,46 +1328,130 @@ void launch_mamba3_peer_step(
     auto bwd_scan_out = g_workspace.bwd_scan.narrow(0, 0, N);
     auto new_bwd_state = torch::empty({d_inner, d_state}, float_opts);
 
-    // Shared memory for scan: x_branch + cached projection weights
-    int scan_smem = (d_inner + 2*d_inner*d_model + d_inner*d_inner + d_inner + 2*d_state*d_inner) * sizeof(float);
-
-    // Forward scan — pass initial_state if available
     const float* fwd_init_ptr = (mamba_fwd_state.numel() > 0) ?
         mamba_fwd_state.data_ptr<float>() : nullptr;
-    mamba3_scan_kernel<<<1, d_inner, scan_smem>>>(
-        x_sorted.data_ptr<float>(),
-        mamba_fwd_in_proj.data_ptr<float>(),
-        mamba_fwd_dt_W.data_ptr<float>(),
-        mamba_fwd_dt_b.data_ptr<float>(),
-        mamba_fwd_B_proj.data_ptr<float>(),
-        mamba_fwd_C_proj.data_ptr<float>(),
-        mamba_fwd_A_log.data_ptr<float>(),
-        mamba_fwd_D.data_ptr<float>(),
-        mamba_fwd_rope.data_ptr<float>(),
-        fwd_scan_out.data_ptr<float>(),
-        new_fwd_state.data_ptr<float>(),
-        fwd_init_ptr,
-        N, d_model, d_inner, d_state, 0  // forward
-    );
-
-    // Backward scan (reverse direction)
     const float* bwd_init_ptr = (mamba_bwd_state.numel() > 0) ?
         mamba_bwd_state.data_ptr<float>() : nullptr;
-    mamba3_scan_kernel<<<1, d_inner, scan_smem>>>(
-        x_sorted.data_ptr<float>(),
-        mamba_bwd_in_proj.data_ptr<float>(),
-        mamba_bwd_dt_W.data_ptr<float>(),
-        mamba_bwd_dt_b.data_ptr<float>(),
-        mamba_bwd_B_proj.data_ptr<float>(),
-        mamba_bwd_C_proj.data_ptr<float>(),
-        mamba_bwd_A_log.data_ptr<float>(),
-        mamba_bwd_D.data_ptr<float>(),
-        mamba_bwd_rope.data_ptr<float>(),
-        bwd_scan_out.data_ptr<float>(),
-        new_bwd_state.data_ptr<float>(),
-        bwd_init_ptr,
-        N, d_model, d_inner, d_state, 1  // reverse
-    );
+
+    if (N >= PSCAN_THRESHOLD) {
+        // ===== PARALLEL PREFIX SCAN (Blelloch) for large N =====
+        // Phase A: Precompute all cross-thread-dependent values
+
+        // Helper lambda to run parallel scan for one direction
+        auto run_parallel_scan = [&](
+            const float* in_proj_W, const float* dt_proj_W, const float* dt_proj_b,
+            const float* B_proj_W, const float* C_proj_W,
+            const float* A_log_ptr, const float* D_param_ptr, const float* rope_ptr,
+            float* scan_out, float* new_state, const float* init_ptr, int rev
+        ) {
+            auto pre_x = g_workspace.pre_x_val.narrow(0, 0, N);
+            auto pre_z = g_workspace.pre_z_val.narrow(0, 0, N);
+            auto pre_dt = g_workspace.pre_dt_val.narrow(0, 0, N);
+            auto pre_B = g_workspace.pre_B_val.narrow(0, 0, N);
+            auto pre_C = g_workspace.pre_C_val.narrow(0, 0, N);
+
+            // Phase A: Precompute
+            const int pre_grid = (N + SG2M_BLOCK - 1) / SG2M_BLOCK;
+            mamba3_parallel_precompute_kernel<<<pre_grid, SG2M_BLOCK>>>(
+                x_sorted.data_ptr<float>(),
+                in_proj_W, dt_proj_W, dt_proj_b, B_proj_W, C_proj_W,
+                pre_x.data_ptr<float>(),
+                pre_z.data_ptr<float>(),
+                pre_dt.data_ptr<float>(),
+                pre_B.data_ptr<float>(),
+                pre_C.data_ptr<float>(),
+                N, d_model, d_inner, d_state
+            );
+
+            // Zero scan output before parallel scan accumulates into it
+            cudaMemsetAsync(scan_out, 0, N * d_inner * sizeof(float));
+
+            // Phase B+C: Parallel prefix scan + output
+            int pscan_smem = 6 * PSCAN_BLOCK * sizeof(float);
+            int actual_block = std::min(PSCAN_BLOCK, N);
+            // Round up to next power of 2 for Blelloch
+            int block_po2 = 1;
+            while (block_po2 < actual_block) block_po2 *= 2;
+            block_po2 = std::min(block_po2, PSCAN_BLOCK);
+            pscan_smem = 6 * block_po2 * sizeof(float);
+
+            mamba3_parallel_scan_kernel<<<d_inner, block_po2, pscan_smem>>>(
+                pre_x.data_ptr<float>(),
+                pre_z.data_ptr<float>(),
+                pre_dt.data_ptr<float>(),
+                pre_B.data_ptr<float>(),
+                pre_C.data_ptr<float>(),
+                A_log_ptr, D_param_ptr, rope_ptr,
+                scan_out, new_state, init_ptr,
+                N, d_inner, d_state, rev
+            );
+        };
+
+        // Forward scan
+        run_parallel_scan(
+            mamba_fwd_in_proj.data_ptr<float>(),
+            mamba_fwd_dt_W.data_ptr<float>(),
+            mamba_fwd_dt_b.data_ptr<float>(),
+            mamba_fwd_B_proj.data_ptr<float>(),
+            mamba_fwd_C_proj.data_ptr<float>(),
+            mamba_fwd_A_log.data_ptr<float>(),
+            mamba_fwd_D.data_ptr<float>(),
+            mamba_fwd_rope.data_ptr<float>(),
+            fwd_scan_out.data_ptr<float>(),
+            new_fwd_state.data_ptr<float>(),
+            fwd_init_ptr, 0
+        );
+
+        // Backward scan (reverse direction)
+        run_parallel_scan(
+            mamba_bwd_in_proj.data_ptr<float>(),
+            mamba_bwd_dt_W.data_ptr<float>(),
+            mamba_bwd_dt_b.data_ptr<float>(),
+            mamba_bwd_B_proj.data_ptr<float>(),
+            mamba_bwd_C_proj.data_ptr<float>(),
+            mamba_bwd_A_log.data_ptr<float>(),
+            mamba_bwd_D.data_ptr<float>(),
+            mamba_bwd_rope.data_ptr<float>(),
+            bwd_scan_out.data_ptr<float>(),
+            new_bwd_state.data_ptr<float>(),
+            bwd_init_ptr, 1
+        );
+    } else {
+        // ===== SEQUENTIAL SCAN for small N (N < PSCAN_THRESHOLD) =====
+        int scan_smem = (d_inner + 2*d_inner*d_model + d_inner*d_inner + d_inner + 2*d_state*d_inner) * sizeof(float);
+
+        mamba3_scan_kernel<<<1, d_inner, scan_smem>>>(
+            x_sorted.data_ptr<float>(),
+            mamba_fwd_in_proj.data_ptr<float>(),
+            mamba_fwd_dt_W.data_ptr<float>(),
+            mamba_fwd_dt_b.data_ptr<float>(),
+            mamba_fwd_B_proj.data_ptr<float>(),
+            mamba_fwd_C_proj.data_ptr<float>(),
+            mamba_fwd_A_log.data_ptr<float>(),
+            mamba_fwd_D.data_ptr<float>(),
+            mamba_fwd_rope.data_ptr<float>(),
+            fwd_scan_out.data_ptr<float>(),
+            new_fwd_state.data_ptr<float>(),
+            fwd_init_ptr,
+            N, d_model, d_inner, d_state, 0
+        );
+
+        mamba3_scan_kernel<<<1, d_inner, scan_smem>>>(
+            x_sorted.data_ptr<float>(),
+            mamba_bwd_in_proj.data_ptr<float>(),
+            mamba_bwd_dt_W.data_ptr<float>(),
+            mamba_bwd_dt_b.data_ptr<float>(),
+            mamba_bwd_B_proj.data_ptr<float>(),
+            mamba_bwd_C_proj.data_ptr<float>(),
+            mamba_bwd_A_log.data_ptr<float>(),
+            mamba_bwd_D.data_ptr<float>(),
+            mamba_bwd_rope.data_ptr<float>(),
+            bwd_scan_out.data_ptr<float>(),
+            new_bwd_state.data_ptr<float>(),
+            bwd_init_ptr,
+            N, d_model, d_inner, d_state, 1
+        );
+    }
 
     // Copy final states back
     if (mamba_fwd_state.numel() > 0) {
@@ -1030,12 +1474,13 @@ void launch_mamba3_peer_step(
     // Step 3: Fused per-element step (GRU + PEER + Expert + Adam)
     {
         const int grid = (N + SG2M_BLOCK - 1) / SG2M_BLOCK;
-        // Shared memory: out_proj (2 * d_model * d_inner) + GRU (3 matrices + 3 biases)
+        // Shared memory: out_proj (2 * d_model * d_inner) + GRU (3 matrices + 3 biases) + expert weights
         int gru_input_dim_val = 2 + 2 * d_model;
         int gru_row_len = gru_input_dim_val + gru_hidden;
         int smem_bytes = (2 * d_model * d_inner
                         + 3 * gru_hidden * gru_row_len
-                        + 3 * gru_hidden) * sizeof(float);
+                        + 3 * gru_hidden
+                        + 3 * num_experts * expert_hidden + num_experts) * sizeof(float);
         AT_DISPATCH_FLOATING_TYPES_AND2(
             at::ScalarType::Half, at::ScalarType::BFloat16,
             param.scalar_type(), "fused_elem_step", ([&] {
@@ -1241,37 +1686,126 @@ void launch_mamba3_peer_batched_step(
     auto fwd_scan_packed = torch::empty({total_N, d_inner}, float_opts);
     auto bwd_scan_packed = torch::empty({total_N, d_inner}, float_opts);
 
-    int scan_smem = (d_inner + 2*d_inner*d_model + d_inner*d_inner + d_inner + 2*d_state*d_inner) * sizeof(float);
+    int max_N = *std::max_element(N_vec.begin(), N_vec.end());
 
-    // Step 3+4: Combined forward + backward scan in single launch
-    // Grid = 2*num_params: first half fwd, second half bwd (reversed)
-    mamba3_scan_combined_kernel<<<2 * num_params, d_inner, scan_smem>>>(
-        x_sorted_packed.data_ptr<float>(),
-        fwd_scan_packed.data_ptr<float>(),
-        bwd_scan_packed.data_ptr<float>(),
-        initial_fwd.data_ptr<float>(),
-        initial_bwd.data_ptr<float>(),
-        final_fwd.data_ptr<float>(),
-        final_bwd.data_ptr<float>(),
-        offsets_t.data_ptr<int>(),
-        mamba_fwd_in_proj.data_ptr<float>(),
-        mamba_fwd_dt_W.data_ptr<float>(),
-        mamba_fwd_dt_b.data_ptr<float>(),
-        mamba_fwd_B_proj.data_ptr<float>(),
-        mamba_fwd_C_proj.data_ptr<float>(),
-        mamba_fwd_A_log.data_ptr<float>(),
-        mamba_fwd_D.data_ptr<float>(),
-        mamba_fwd_rope.data_ptr<float>(),
-        mamba_bwd_in_proj.data_ptr<float>(),
-        mamba_bwd_dt_W.data_ptr<float>(),
-        mamba_bwd_dt_b.data_ptr<float>(),
-        mamba_bwd_B_proj.data_ptr<float>(),
-        mamba_bwd_C_proj.data_ptr<float>(),
-        mamba_bwd_A_log.data_ptr<float>(),
-        mamba_bwd_D.data_ptr<float>(),
-        mamba_bwd_rope.data_ptr<float>(),
-        d_model, d_inner, d_state, num_params
-    );
+    if (max_N >= PSCAN_THRESHOLD) {
+        // ===== PARALLEL PREFIX SCAN for large N =====
+        // Phase A: Precompute all timestep quantities (shared weights, all params at once)
+        auto pre_x = torch::empty({total_N, d_inner}, float_opts);
+        auto pre_z = torch::empty({total_N, d_inner}, float_opts);
+        auto pre_dt = torch::empty({total_N, d_inner}, float_opts);
+        auto pre_B = torch::empty({total_N, d_state}, float_opts);
+        auto pre_C = torch::empty({total_N, d_state}, float_opts);
+
+        // Process each direction (fwd/bwd share same input data but different weights)
+        auto run_batched_parallel_scan = [&](
+            torch::Tensor in_proj_W, torch::Tensor dt_proj_W, torch::Tensor dt_proj_b,
+            torch::Tensor B_proj_W, torch::Tensor C_proj_W,
+            torch::Tensor A_log_t, torch::Tensor D_param_t, torch::Tensor rope_t,
+            torch::Tensor initial_states_t, torch::Tensor final_states_t,
+            torch::Tensor scan_packed, int rev
+        ) {
+            // Phase A: precompute for all packed timesteps (all params share weights)
+            const int pre_grid = (total_N + SG2M_BLOCK - 1) / SG2M_BLOCK;
+            mamba3_parallel_precompute_kernel<<<pre_grid, SG2M_BLOCK>>>(
+                x_sorted_packed.data_ptr<float>(),
+                in_proj_W.data_ptr<float>(),
+                dt_proj_W.data_ptr<float>(),
+                dt_proj_b.data_ptr<float>(),
+                B_proj_W.data_ptr<float>(),
+                C_proj_W.data_ptr<float>(),
+                pre_x.data_ptr<float>(),
+                pre_z.data_ptr<float>(),
+                pre_dt.data_ptr<float>(),
+                pre_B.data_ptr<float>(),
+                pre_C.data_ptr<float>(),
+                total_N, d_model, d_inner, d_state
+            );
+
+            // Zero scan output
+            cudaMemsetAsync(scan_packed.data_ptr<float>(), 0,
+                total_N * d_inner * sizeof(float));
+
+            // Phase B+C: per-param parallel scans
+            for (int p = 0; p < num_params; p++) {
+                int N_p = N_vec[p];
+                if (N_p == 0) continue;
+                int off = offsets_cpu[p];
+
+                int block = std::min(PSCAN_BLOCK, N_p);
+                int block_po2 = 1;
+                while (block_po2 < block) block_po2 *= 2;
+                block_po2 = std::min(block_po2, PSCAN_BLOCK);
+                int pscan_smem = 6 * block_po2 * (int)sizeof(float);
+
+                const float* init_ptr = initial_states_t.data_ptr<float>()
+                    + p * d_inner * d_state;
+                float* fin_ptr = final_states_t.data_ptr<float>()
+                    + p * d_inner * d_state;
+
+                mamba3_parallel_scan_kernel<<<d_inner, block_po2, pscan_smem>>>(
+                    pre_x.data_ptr<float>() + off * d_inner,
+                    pre_z.data_ptr<float>() + off * d_inner,
+                    pre_dt.data_ptr<float>() + off * d_inner,
+                    pre_B.data_ptr<float>() + off * d_state,
+                    pre_C.data_ptr<float>() + off * d_state,
+                    A_log_t.data_ptr<float>(),
+                    D_param_t.data_ptr<float>(),
+                    rope_t.data_ptr<float>(),
+                    scan_packed.data_ptr<float>() + off * d_inner,
+                    fin_ptr, init_ptr,
+                    N_p, d_inner, d_state, rev
+                );
+            }
+        };
+
+        // Forward scan
+        run_batched_parallel_scan(
+            mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
+            mamba_fwd_B_proj, mamba_fwd_C_proj,
+            mamba_fwd_A_log, mamba_fwd_D, mamba_fwd_rope,
+            initial_fwd, final_fwd, fwd_scan_packed, 0
+        );
+
+        // Backward scan (reverse)
+        run_batched_parallel_scan(
+            mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
+            mamba_bwd_B_proj, mamba_bwd_C_proj,
+            mamba_bwd_A_log, mamba_bwd_D, mamba_bwd_rope,
+            initial_bwd, final_bwd, bwd_scan_packed, 1
+        );
+    } else {
+        // ===== SEQUENTIAL COMBINED SCAN for small N =====
+        int scan_smem = (d_inner + 2*d_inner*d_model + d_inner*d_inner + d_inner + 2*d_state*d_inner) * sizeof(float);
+
+        mamba3_scan_combined_kernel<<<2 * num_params, d_inner, scan_smem>>>(
+            x_sorted_packed.data_ptr<float>(),
+            fwd_scan_packed.data_ptr<float>(),
+            bwd_scan_packed.data_ptr<float>(),
+            initial_fwd.data_ptr<float>(),
+            initial_bwd.data_ptr<float>(),
+            final_fwd.data_ptr<float>(),
+            final_bwd.data_ptr<float>(),
+            offsets_t.data_ptr<int>(),
+            mamba_fwd_in_proj.data_ptr<float>(),
+            mamba_fwd_dt_W.data_ptr<float>(),
+            mamba_fwd_dt_b.data_ptr<float>(),
+            mamba_fwd_B_proj.data_ptr<float>(),
+            mamba_fwd_C_proj.data_ptr<float>(),
+            mamba_fwd_A_log.data_ptr<float>(),
+            mamba_fwd_D.data_ptr<float>(),
+            mamba_fwd_rope.data_ptr<float>(),
+            mamba_bwd_in_proj.data_ptr<float>(),
+            mamba_bwd_dt_W.data_ptr<float>(),
+            mamba_bwd_dt_b.data_ptr<float>(),
+            mamba_bwd_B_proj.data_ptr<float>(),
+            mamba_bwd_C_proj.data_ptr<float>(),
+            mamba_bwd_A_log.data_ptr<float>(),
+            mamba_bwd_D.data_ptr<float>(),
+            mamba_bwd_rope.data_ptr<float>(),
+            d_model, d_inner, d_state, num_params
+        );
+    }
 
     // Step 5: Copy final states back + unsort + fused_elem_step per param
     // Pre-compute all unsorted scan outputs, then launch kernels on streams
@@ -1279,7 +1813,8 @@ void launch_mamba3_peer_batched_step(
     int gru_row_len = gru_input_dim_val + gru_hidden;
     int smem_bytes = (2 * d_model * d_inner
                     + 3 * gru_hidden * gru_row_len
-                    + 3 * gru_hidden) * sizeof(float);
+                    + 3 * gru_hidden
+                    + 3 * num_experts * expert_hidden + num_experts) * sizeof(float);
 
     // Pre-compute unsorted scan outputs and copy final states
     std::vector<torch::Tensor> fwd_unsorted_list(num_params);

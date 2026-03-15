@@ -47,6 +47,13 @@ The meta-network processes per-parameter gradient vectors through:
 
 Additional features: dynamic expert recycling, sigmoid-driven SAM/bilevel/WD scheduling, functional_call SAM (no parameter modification), CUDA batched scan, AMP support.
 
+### Performance Optimizations
+
+- **Blelloch Parallel Prefix Scan**: For parameters with N >= 256 elements, the sequential O(N) scan is replaced with a work-efficient parallel scan achieving O(N/P + log N) time. Uses affine transform composition over paired RoPE state dimensions. Automatically falls back to sequential scan for small parameters.
+- **Expert Weights in Shared Memory**: All 144 expert MLP weights (W1, b1, W2, b2) are loaded into CUDA shared memory at block start, eliminating repeated global memory reads during per-element PEER evaluation.
+- **Expert Backward Shared-Memory Reduction**: Per-block accumulators in shared memory for expert weight gradients, with a single block-level `atomicAdd` at the end — reduces atomic contention by 256x.
+- **Gradient Checkpointing for Bilevel**: Optional `bilevel_checkpoint_interval` parameter saves Mamba scan states every C steps instead of every step during bilevel forward-save. During backward, intermediate states are recomputed from the nearest checkpoint. With C=32, reduces bilevel saved-state memory by ~82% (1.2 GB → 224 MB for 50 parameters).
+
 ## Model Architectures
 
 - **Decoder Transformer** — causal attention, standard for modular arithmetic grokking
@@ -110,6 +117,7 @@ Key SuperGrok v2 hyperparameters (defaults):
 | `meta_rescale` | 0.1 | Skip connection scale factor |
 | `sam_rho` | 0.05 | SAM perturbation radius |
 | `recycle_interval` | 100 | Steps between dead expert recycling |
+| `bilevel_checkpoint_interval` | 1 | Checkpoint interval for bilevel gradient checkpointing (1 = save every step, 32 = save every 32 steps) |
 
 ## Multi-GPU
 

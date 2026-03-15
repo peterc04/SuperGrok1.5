@@ -82,6 +82,7 @@ class SuperGrok2(Optimizer):
         wd_scale: float = 20.0,
         wd_thresh: float = 0.9,
         sam_enable_threshold: float = 0.0,
+        bilevel_checkpoint_interval: int = 1,
     ):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
@@ -122,6 +123,7 @@ class SuperGrok2(Optimizer):
         self.wd_ramp = wd_ramp
         self.wd_scale = wd_scale
         self.wd_thresh = wd_thresh
+        self.bilevel_checkpoint_interval = max(1, bilevel_checkpoint_interval)
 
         # Meta-net: Mamba-3 + 4-Head PEER + GRU
         if meta_net is None:
@@ -647,13 +649,18 @@ class SuperGrok2(Optimizer):
                  for info in param_info])
 
             # Pre-allocate packed output tensors
+            ckpt_int = self.bilevel_checkpoint_interval
             fwd_scan_out_packed = torch.zeros(total_N, d_inner, device=device)
             bwd_scan_out_packed = torch.zeros(total_N, d_inner, device=device)
-            fwd_saved_states_p = torch.zeros(total_N, d_inner, d_state, device=device)
+            if ckpt_int <= 1:
+                ckpt_total_N = total_N
+            else:
+                ckpt_total_N = sum((n + ckpt_int - 1) // ckpt_int for n in Ns)
+            fwd_saved_states_p = torch.zeros(ckpt_total_N, d_inner, d_state, device=device)
             fwd_saved_xb_p = torch.zeros(total_N, d_inner, device=device)
             fwd_saved_z_p = torch.zeros(total_N, d_inner, device=device)
             fwd_saved_dt_p = torch.zeros(total_N, d_inner, device=device)
-            bwd_saved_states_p = torch.zeros(total_N, d_inner, d_state, device=device)
+            bwd_saved_states_p = torch.zeros(ckpt_total_N, d_inner, d_state, device=device)
             bwd_saved_xb_p = torch.zeros(total_N, d_inner, device=device)
             bwd_saved_z_p = torch.zeros(total_N, d_inner, device=device)
             bwd_saved_dt_p = torch.zeros(total_N, d_inner, device=device)
@@ -685,6 +692,7 @@ class SuperGrok2(Optimizer):
                 x_sorted_packed, offsets_t,
                 sort_indices_packed,
                 fwd_init_states, bwd_init_states,
+                ckpt_int,
             )
 
             # 1b. Per-parameter GRU + PEER forward (using packed scan outputs)
@@ -974,6 +982,7 @@ class SuperGrok2(Optimizer):
                 d_x_sorted_packed,
                 fwd_init_states, bwd_init_states,
                 d_model, d_state, d_inner, num_bilevel_params,
+                ckpt_int,
             )
 
             # 5. Per-parameter input_proj backward from d_x_sorted
@@ -998,6 +1007,7 @@ class SuperGrok2(Optimizer):
             # ═════════════════════════════════════════════════════════
             smart_grads = {}
             per_param_saved = {}
+            ckpt_int = self.bilevel_checkpoint_interval
 
             for idx, (name, p, pidx, grad_flat, sharp_flat, N) in enumerate(param_info):
                 # Allocate scan output + saved buffers
@@ -1005,11 +1015,12 @@ class SuperGrok2(Optimizer):
                 bwd_scan_out = torch.zeros(N, d_inner, device=device)
                 fwd_final = torch.zeros(d_inner, d_state, device=device)
                 bwd_final = torch.zeros(d_inner, d_state, device=device)
-                fwd_saved_states = torch.zeros(N, d_inner, d_state, device=device)
+                num_ckpts = (N + ckpt_int - 1) // ckpt_int if ckpt_int > 1 else N
+                fwd_saved_states = torch.zeros(num_ckpts, d_inner, d_state, device=device)
                 fwd_saved_xb = torch.zeros(N, d_inner, device=device)
                 fwd_saved_z = torch.zeros(N, d_inner, device=device)
                 fwd_saved_dt = torch.zeros(N, d_inner, device=device)
-                bwd_saved_states = torch.zeros(N, d_inner, d_state, device=device)
+                bwd_saved_states = torch.zeros(num_ckpts, d_inner, d_state, device=device)
                 bwd_saved_xb = torch.zeros(N, d_inner, device=device)
                 bwd_saved_z = torch.zeros(N, d_inner, device=device)
                 bwd_saved_dt = torch.zeros(N, d_inner, device=device)
@@ -1040,6 +1051,7 @@ class SuperGrok2(Optimizer):
                     bwd_saved_states, bwd_saved_xb, bwd_saved_z, bwd_saved_dt,
                     x_sorted, sort_indices,
                     fwd_init, bwd_init,
+                    ckpt_int,
                 )
 
                 fwd_ctx_sorted = fwd_scan_out @ w['mamba_fwd_out_proj'].T
@@ -1222,6 +1234,7 @@ class SuperGrok2(Optimizer):
                     gru_hidden, gru_input_dim,
                     num_heads, topk, pk_dim,
                     expert_hidden, peer_input_dim, num_experts,
+                    ckpt_int,
                 )
 
         # 5. Map accumulated gradients to meta-net parameters and step
