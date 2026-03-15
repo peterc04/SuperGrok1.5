@@ -21,7 +21,7 @@ except ImportError as e:
     ) from e
 
 from .supergrok15 import SuperGrok15, SharpnessMetaNet
-from .supergrok2 import SuperGrok2
+from .supergrok2 import SuperGrok2, CompiledSuperGrok2
 from .mamba3_peer_metanet import Mamba3PEERMetaNet, Mamba3ScanBlock, MiniGRU
 from .supergrok11 import SuperGrok11
 from .grokadamw import GrokAdamW
@@ -38,10 +38,16 @@ from .dispatch import (
     supports_matrix_cores,
 )
 from .quantization import PrecisionConfig
+from .distributed import (
+    setup_distributed, cleanup_distributed,
+    get_rank, get_world_size, is_main_process,
+    broadcast_optimizer_state, wrap_model_ddp,
+)
 
 __all__ = [
     "SuperGrok15", "SharpnessMetaNet",
-    "SuperGrok2", "Mamba3PEERMetaNet", "Mamba3ScanBlock", "MiniGRU",
+    "SuperGrok2", "CompiledSuperGrok2",
+    "Mamba3PEERMetaNet", "Mamba3ScanBlock", "MiniGRU",
     "SuperGrok11",
     "GrokAdamW",
     "NeuralGrok",
@@ -55,4 +61,8 @@ __all__ = [
     "get_warp_size", "supports_bf16", "supports_fp8", "supports_tf32",
     "supports_matrix_cores",
     "PrecisionConfig",
+    "CompiledSuperGrok2",
+    "setup_distributed", "cleanup_distributed",
+    "get_rank", "get_world_size", "is_main_process",
+    "broadcast_optimizer_state", "wrap_model_ddp",
 ]

@@ -857,6 +857,126 @@ def test_12v_expert_fp32():
     assert torch.allclose(result['w1'], w1.float())
 
 
+def test_12w_distributed_helpers():
+    """Test distributed helper methods on SuperGrok2 (non-distributed mode)."""
+    from grokking_optimizers import SuperGrok2
+
+    model = make_small_model()
+    opt = SuperGrok2(model.parameters(), lr=1e-3)
+
+    # _is_distributed should return False when dist not initialized
+    assert not opt._is_distributed(), "Should not be distributed"
+
+    # These should be no-ops (not raise) when not distributed
+    opt._allreduce_meta_grads()
+    opt._allreduce_expert_counts()
+    opt._sync_mamba_states()
+
+    # Run a step to init states
+    fake_step(model)
+    opt.step()
+
+    # After step, sync should still be no-op
+    opt._sync_mamba_states()
+
+    # Verify distributed params exist
+    assert opt.bilevel_allreduce_meta_grads is True
+    assert opt.expert_allreduce_before_recycle is True
+    assert opt.mamba_state_sync_interval == 1000
+
+
+def test_12x_compiled_wrapper():
+    """Test CompiledSuperGrok2 wrapper (eager fallback mode)."""
+    from grokking_optimizers import SuperGrok2, CompiledSuperGrok2
+
+    model = make_small_model()
+    opt = SuperGrok2(model.parameters(), lr=1e-3)
+    compiled = CompiledSuperGrok2(opt, warmup_steps=2)
+
+    # Properties
+    assert compiled.param_groups is opt.param_groups
+    assert compiled.meta_net is opt.meta_net
+
+    # Warmup steps (eager mode)
+    for i in range(3):
+        model.zero_grad()
+        fake_step(model)
+        compiled.step()
+
+    # Verify step count incremented
+    assert compiled._step_count == 3
+    assert opt._global_step == 3
+
+    # Invalidate should not crash
+    compiled.invalidate()
+
+    # state_dict round-trip
+    sd = compiled.state_dict()
+    assert sd is not None
+
+
+def test_12y_step_compiled():
+    """Test _prepare_for_compile and step_compiled methods."""
+    from grokking_optimizers import SuperGrok2
+
+    model = make_small_model()
+    opt = SuperGrok2(model.parameters(), lr=1e-3)
+
+    # First do an eager step to initialize states
+    model.zero_grad()
+    fake_step(model)
+    opt.step()
+
+    # Prepare for compile
+    opt._prepare_for_compile()
+    assert opt._compile_prepared is True
+    assert opt._cached_weights is not None
+    assert len(opt._static_grads) == opt._num_params
+
+    # Run step_compiled
+    model.zero_grad()
+    fake_step(model)
+    old_step = opt._global_step
+    opt.step_compiled()
+    assert opt._global_step == old_step + 1
+
+    # Check params were updated (at least one should change)
+    # The step_compiled uses the CUDA batched path if available
+
+
+def test_12z_fsdp_exclusion():
+    """Test FSDP exclusion helper marks meta-net modules."""
+    from grokking_optimizers import SuperGrok2
+
+    model = make_small_model()
+    opt = SuperGrok2(model.parameters(), lr=1e-3)
+
+    # Mark meta-net for FSDP exclusion
+    SuperGrok2.exclude_meta_net_from_fsdp(opt.meta_net)
+
+    # All modules should have _fsdp_wrap = False
+    assert opt.meta_net._fsdp_wrap is False
+    for module in opt.meta_net.modules():
+        assert hasattr(module, '_fsdp_wrap')
+        assert module._fsdp_wrap is False
+
+
+def test_12aa_distributed_module():
+    """Test distributed module imports and utility functions."""
+    from grokking_optimizers.distributed import (
+        get_rank, get_world_size, is_main_process,
+    )
+
+    # Without dist init, should return defaults
+    rank = get_rank()
+    world = get_world_size()
+    is_main = is_main_process()
+
+    assert rank == 0
+    assert world == 1
+    assert is_main is True
+
+
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("SKIP: No CUDA device available")
@@ -938,6 +1058,21 @@ if __name__ == "__main__":
 
     print("\n--- 12V: Expert FP32 Passthrough ---")
     run_test("12V: Expert FP32 passthrough", test_12v_expert_fp32)
+
+    print("\n--- 12W: Distributed Helpers ---")
+    run_test("12W: Distributed helper methods", test_12w_distributed_helpers)
+
+    print("\n--- 12X: CompiledSuperGrok2 Wrapper ---")
+    run_test("12X: CompiledSuperGrok2 wrapper", test_12x_compiled_wrapper)
+
+    print("\n--- 12Y: step_compiled Method ---")
+    run_test("12Y: step_compiled method", test_12y_step_compiled)
+
+    print("\n--- 12Z: FSDP Exclusion Helper ---")
+    run_test("12Z: FSDP exclusion helper", test_12z_fsdp_exclusion)
+
+    print("\n--- 12AA: Distributed Module Import ---")
+    run_test("12AA: Distributed module import", test_12aa_distributed_module)
 
     # Summary
     print("\n" + "=" * 60)

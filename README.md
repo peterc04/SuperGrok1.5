@@ -63,7 +63,7 @@ Additional features: dynamic expert recycling, sigmoid-driven SAM/bilevel/WD sch
 python tests/test_supergrok2.py
 ```
 
-The test suite (`test_supergrok2.py`) covers 22 areas:
+The test suite (`test_supergrok2.py`) covers 27 areas:
 
 | Test | Description |
 |------|-------------|
@@ -89,6 +89,11 @@ The test suite (`test_supergrok2.py`) covers 22 areas:
 | 12T | MXFP4 microscaling FP4 quantization |
 | 12U | Dynamic precision selection (stability-aware) |
 | 12V | Expert FP32 passthrough |
+| 12W | Distributed helper methods (DDP hooks, no-op without dist) |
+| 12X | CompiledSuperGrok2 wrapper (warmup/capture/replay) |
+| 12Y | step_compiled method (_prepare_for_compile + step) |
+| 12Z | FSDP exclusion helper (meta-net module marking) |
+| 12AA | Distributed module import and utilities |
 
 Each test reports PASS/FAIL. Exit code 0 = all pass, 1 = any failure.
 
@@ -150,7 +155,8 @@ Each test reports PASS/FAIL. Exit code 0 = all pass, 1 = any failure.
 │   ├── lion.py                                 # Lion
 │   ├── looksam.py                              # LookSAM
 │   ├── muon.py                                 # Muon
-│   └── cuda_graph_optimizer.py                 # CUDA graph wrapper
+│   ├── cuda_graph_optimizer.py                 # CUDA graph wrapper
+│   └── distributed.py                          # DDP/FSDP training utilities
 │
 ├── tests/                                      # Test suite
 │   └── test_supergrok2.py
@@ -182,6 +188,9 @@ Key SuperGrok v2 hyperparameters (defaults):
 | `projection_precision` | `'auto'` | Precision for projection GEMMs: `'fp32'`, `'tf32'`, `'bf16'`, `'fp8'`, `'mxfp4'`, or `'auto'` |
 | `expert_precision` | `'fp32'` | Expert weight quantization: `'fp32'`, `'int8'`, `'int4'`, or `'auto'` |
 | `dynamic` | `False` | Enable dynamic precision selection (progressively lowers precision as training stabilizes) |
+| `bilevel_allreduce_meta_grads` | `True` | All-reduce meta-net gradients across ranks in distributed training |
+| `expert_allreduce_before_recycle` | `True` | All-reduce expert counts before recycling in distributed training |
+| `mamba_state_sync_interval` | 1000 | Steps between mamba state broadcasts (0 = disable) |
 
 ## Hardware Support
 
@@ -239,6 +248,66 @@ Scan state accumulation always stays FP32 (numerical necessity for long recurren
 ## Multi-GPU
 
 `--gpus 0,1,2,3` spawns one process per GPU. Tasks are distributed round-robin with exclusive GPU access for fair wall-clock measurements.
+
+## Distributed Training (DDP / FSDP)
+
+SuperGrok v2 supports PyTorch DDP and FSDP for multi-node training.
+
+### DDP
+
+```python
+from grokking_optimizers import SuperGrok2, setup_distributed, wrap_model_ddp
+
+setup_distributed()
+model = wrap_model_ddp(model.cuda())
+opt = SuperGrok2(model.parameters(), lr=1e-3)
+# Training loop works as normal — meta-grad all-reduce is automatic
+```
+
+Key features:
+- **Meta-gradient all-reduce**: Bilevel meta-net gradients are averaged across ranks before stepping (controlled by `bilevel_allreduce_meta_grads=True`).
+- **Expert count sync**: Expert activation counts are all-reduced across ranks before recycling dead experts (`expert_allreduce_before_recycle=True`).
+- **Mamba state broadcast**: Periodic broadcast of Mamba scan states from rank 0 to prevent drift (`mamba_state_sync_interval=1000`).
+
+### FSDP
+
+```python
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+opt = SuperGrok2(model.parameters(), lr=1e-3)
+SuperGrok2.exclude_meta_net_from_fsdp(opt.meta_net)  # Keep meta-net replicated
+model = FSDP(model, auto_wrap_policy=...)
+```
+
+Launch with `torchrun`:
+```bash
+torchrun --nproc_per_node=4 train.py
+```
+
+## torch.compile / CUDA Graph Support
+
+SuperGrok v2 provides a graph-capturable optimizer step via `CompiledSuperGrok2`:
+
+```python
+from grokking_optimizers import SuperGrok2, CompiledSuperGrok2
+
+opt = SuperGrok2(model.parameters(), lr=1e-3)
+compiled_opt = CompiledSuperGrok2(opt, warmup_steps=3)
+
+for step in range(n_steps):
+    loss.backward()
+    compiled_opt.step()  # Warmup → capture → replay automatically
+```
+
+Features:
+- **Warmup phase**: First N steps run in eager mode to initialize optimizer state.
+- **CUDA graph capture**: After warmup, the step is captured as a CUDA graph.
+- **Automatic replay**: Subsequent steps replay the graph with zero CPU overhead.
+- **Expert recycling**: Periodically drops to eager mode for dead expert recycling.
+- **Graceful fallback**: Falls back to eager mode if graph capture fails.
+- **torch.compile support**: Optional `enable_compile=True` for `torch.compile` integration.
+
+The low-level `step_compiled()` method on `SuperGrok2` is also available for custom graph capture pipelines.
 
 ## Requirements
 
