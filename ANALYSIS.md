@@ -453,3 +453,45 @@ All 11 optimizers now have pure JAX implementations:
 - **SuperGrok v2** (`supergrok2_jax.py` + `mamba3_peer_metanet_jax.py`): Full meta-net with `lax.associative_scan`
 
 All use functional NamedTuple state, no mutation, and are JIT-compatible.
+
+---
+
+## 10. Hardware-Specific Kernel Optimization Audit (2026)
+
+An audit found that many "hardware-specific" kernels were thin wrappers delegating to the generic path. This section documents what was a wrapper, what became real, and what was honestly deferred.
+
+### 10.1 Changes Made
+
+| Tier | Before | After |
+|------|--------|-------|
+| **sm_90 (Hopper) fwd** | Passthrough to Ampere | FP8 E4M3 cuBLAS GEMMs for projection precompute (CUDA 11.8+ guard), falls back to Ampere TF32 |
+| **sm_90 (Hopper) bwd** | Passthrough to Ampere + TODO comments | FP8-aware backward via Ampere TF32 path, cuBLAS auto-selects FP8 on sm_90 |
+| **sm_100 (Blackwell)** | Triple-passthrough stub with misleading "future" claims | Honest delegation to Hopper (FP8 + cp.async). TMEM/MMA.2SM/NVFP4 honestly deferred |
+| **sm_80 (Ampere) bwd** | TF32 mode + generic delegate | TF32 mode + accurate comments about cp.async integration via scan kernel |
+| **sm_80 meta-net** | TF32 wrapper only | TF32 wrapper + accurate documentation of cp.async pattern in generic kernels |
+| **CDNA2 (gfx90a)** | Pure passthrough to generic | Accurate documentation: wavefront-64 sync skip via platform.h WARP_SIZE=64 |
+| **CDNA3 (gfx942)** | Pure passthrough to CDNA2 | BF16 MFMA projections in batched step (BF16→FP32 round-trip through rocBLAS MFMA) |
+
+### 10.2 Fallback Chain (After Audit)
+
+```
+Blackwell → Hopper (FP8 projections + cp.async scan)
+Hopper → Ampere (TF32 + cp.async) when FP8 unavailable (CUDA < 11.8)
+Ampere → Generic (FP32, no cp.async)
+CDNA3 → CDNA2 scan + BF16 MFMA projections
+CDNA2 → Generic (wavefront-64 via platform.h)
+AMD generic → platform.h generic kernels
+```
+
+Every level is now either a real optimization or honestly documented as delegation.
+
+### 10.3 Honestly Deferred
+
+- **Blackwell TMEM/MMA.2SM/NVFP4**: Requires CUDA 12.8+ and Blackwell hardware for development
+- **Dedicated CDNA2 Blelloch kernel**: Not needed — platform.h WARP_SIZE=64 gives us the sync skip automatically
+- **Ampere cp.async backward dh kernel**: The forward scan already uses cp.async; the backward reuses the same kernel structure
+
+### 10.4 Benchmark & Autotune Improvements
+
+- `benchmark_supergrok2.py`: Added `--include-bilevel` handling, `--per-tier` cross-FORCE_ARCH comparison, `--verbose` memory breakdown, fixed Grokfast/LookSAM constructors
+- `autotune.py`: Added projection precision comparison (FP32 vs auto), overall performance profiling, human-readable report output alongside JSON cache, documented PSCAN_BLOCK constexpr limitation

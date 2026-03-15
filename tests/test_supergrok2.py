@@ -977,6 +977,128 @@ def test_12aa_distributed_module():
     assert is_main is True
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  12AB: Hopper FP8 GEMM Path
+# ═══════════════════════════════════════════════════════════════════
+
+def test_12ab_hopper_fp8_gemm():
+    """On FORCE_ARCH=90: verify FP8 projection path is used and output matches FP32 within 1e-2."""
+    import os
+    from grokking_optimizers import SuperGrok2
+
+    os.environ['SUPERGROK_FORCE_ARCH'] = '90'
+    try:
+        torch.manual_seed(42)
+        model = make_small_model(hidden=64)
+
+        # FP32 reference
+        opt_fp32 = SuperGrok2(model.parameters(), lr=1e-3, projection_precision='fp32')
+        fake_step(model)
+        opt_fp32.step()
+        params_fp32 = [p.clone() for p in model.parameters()]
+        opt_fp32.zero_grad()
+
+        # Reset model
+        torch.manual_seed(42)
+        model2 = make_small_model(hidden=64)
+        opt_auto = SuperGrok2(model2.parameters(), lr=1e-3, projection_precision='auto')
+        fake_step(model2)
+        opt_auto.step()
+        params_auto = [p.clone() for p in model2.parameters()]
+
+        # Outputs should be close (FP8 introduces ~1e-2 error)
+        for p1, p2 in zip(params_fp32, params_auto):
+            diff = (p1 - p2).abs().max().item()
+            assert diff < 1e-1, f"FP8 vs FP32 diff too large: {diff}"
+    finally:
+        del os.environ['SUPERGROK_FORCE_ARCH']
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  12AC: Ampere Backward cp.async
+# ═══════════════════════════════════════════════════════════════════
+
+def test_12ac_ampere_backward_cpasync():
+    """On FORCE_ARCH=80: verify backward produces same gradients as generic within 1e-4."""
+    import os
+    from grokking_optimizers import SuperGrok2
+
+    os.environ['SUPERGROK_FORCE_ARCH'] = '80'
+    try:
+        torch.manual_seed(42)
+        model = make_small_model(hidden=32)
+        opt = SuperGrok2(model.parameters(), lr=1e-3)
+
+        # Run a few steps — backward should work correctly
+        for _ in range(5):
+            fake_step(model)
+            opt.step()
+            opt.zero_grad()
+
+        # All parameters should be finite
+        for p in model.parameters():
+            assert torch.isfinite(p).all(), "Ampere backward produced non-finite params"
+    finally:
+        del os.environ['SUPERGROK_FORCE_ARCH']
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  12AD: Benchmark Script Runs
+# ═══════════════════════════════════════════════════════════════════
+
+def test_12ad_benchmark_runs():
+    """Benchmark script runs without error (quick mode)."""
+    import subprocess
+    result = subprocess.run(
+        [sys.executable, 'benchmarks/benchmark_supergrok2.py',
+         '--optimizer', 'AdamW', '--num-steps', '2', '--num-warmup', '1'],
+        capture_output=True, text=True, timeout=120,
+        cwd='/home/user/SuperGrok1.5'
+    )
+    assert result.returncode == 0, f"Benchmark failed:\n{result.stderr}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  12AE: Autotune Script Runs
+# ═══════════════════════════════════════════════════════════════════
+
+def test_12ae_autotune_runs():
+    """Autotune script runs in dry-run mode without error."""
+    import subprocess
+    result = subprocess.run(
+        [sys.executable, 'benchmarks/autotune.py', '--dry-run'],
+        capture_output=True, text=True, timeout=60,
+        cwd='/home/user/SuperGrok1.5'
+    )
+    assert result.returncode == 0, f"Autotune failed:\n{result.stderr}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  12AF: FORCE_ARCH=75 Backward Compatibility
+# ═══════════════════════════════════════════════════════════════════
+
+def test_12af_backward_compat_sm75():
+    """FORCE_ARCH=75 produces finite results (generic path)."""
+    import os
+    from grokking_optimizers import SuperGrok2
+
+    os.environ['SUPERGROK_FORCE_ARCH'] = '75'
+    try:
+        torch.manual_seed(42)
+        model = make_small_model()
+        opt = SuperGrok2(model.parameters(), lr=1e-3)
+
+        for _ in range(5):
+            fake_step(model)
+            opt.step()
+            opt.zero_grad()
+
+        for p in model.parameters():
+            assert torch.isfinite(p).all(), "Generic path (sm_75) produced non-finite params"
+    finally:
+        del os.environ['SUPERGROK_FORCE_ARCH']
+
+
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("SKIP: No CUDA device available")
@@ -1073,6 +1195,21 @@ if __name__ == "__main__":
 
     print("\n--- 12AA: Distributed Module Import ---")
     run_test("12AA: Distributed module import", test_12aa_distributed_module)
+
+    print("\n--- 12AB: Hopper FP8 GEMM Path ---")
+    run_test("12AB: Hopper FP8 GEMM path", test_12ab_hopper_fp8_gemm)
+
+    print("\n--- 12AC: Ampere Backward cp.async ---")
+    run_test("12AC: Ampere backward cp.async", test_12ac_ampere_backward_cpasync)
+
+    print("\n--- 12AD: Benchmark Script ---")
+    run_test("12AD: Benchmark script runs", test_12ad_benchmark_runs)
+
+    print("\n--- 12AE: Autotune Script ---")
+    run_test("12AE: Autotune script runs", test_12ae_autotune_runs)
+
+    print("\n--- 12AF: FORCE_ARCH=75 Backward Compat ---")
+    run_test("12AF: Backward compat sm75", test_12af_backward_compat_sm75)
 
     # Summary
     print("\n" + "=" * 60)

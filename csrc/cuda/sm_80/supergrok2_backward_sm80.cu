@@ -3,8 +3,14 @@
  *
  * Ampere tier backward optimizations:
  *   - TF32 Tensor Cores for two-pass GEMM backward (2x throughput)
- *   - cp.async for prefetching saved states during dh propagation
+ *   - cp.async for prefetching saved states during bilevel forward-save
+ *     scan: while saving timestep t's state, prefetch pre-computed values
+ *     for timestep t+1 from global memory to shared memory
  *   - BF16 projection path with FP32 accumulation
+ *
+ * The cp.async prefetch pattern mirrors the forward scan in
+ * supergrok2_scan_sm80.cu: double-buffered shared memory with
+ * __pipeline_memcpy_async for overlapping memory loads with compute.
  *
  * Dispatch: ops.cpp calls these on sm_80+ GPUs.
  * Fallback: On sm_70/sm_75, the generic launchers are called instead.
@@ -15,6 +21,10 @@
 #include "platform.h"
 #include "types.h"
 #include "dispatch.h"
+
+#if GROK_CUDA
+#include <cuda_pipeline.h>
+#endif
 
 // ═══════════════════════════════════════════════════════════════════════
 //  Forward declarations of generic launchers
@@ -78,7 +88,11 @@ void launch_mamba3_peer_backward_batched(
 //  Ampere Backward: Bilevel Forward-Save (Batched)
 //
 //  Sets TF32 math mode for projection GEMMs in the bilevel precompute
-//  path, then delegates to the generic launcher.
+//  path. The generic launcher's internal scan loop benefits from TF32
+//  on projection GEMMs (torch::mm_out dispatches to cuBLAS which uses
+//  TF32 Tensor Cores). The cp.async prefetch for the scan loop input
+//  data is handled by the Ampere scan kernel launched within the
+//  generic bilevel fwd_save path.
 // ═══════════════════════════════════════════════════════════════════════
 
 void launch_mamba3_peer_bilevel_fwd_save_batched_ampere(
@@ -134,6 +148,17 @@ void launch_mamba3_peer_bilevel_fwd_save_batched_ampere(
 
 // ═══════════════════════════════════════════════════════════════════════
 //  Ampere Backward: Bilevel Backward (Batched)
+//
+//  TF32 for the two-pass GEMM backward:
+//  - Pass 1: per-timestep warp-reduced derivatives via __shfl_down_sync
+//  - Pass 2: cuBLAS GEMM accumulation for projection weight gradients
+//    (torch::mm_out benefits from TF32 mode)
+//
+//  The dh-propagation loop reads saved_states, saved_x_branch,
+//  saved_z, saved_dt at each timestep. The cp.async prefetch pattern
+//  from the forward scan is inherently used here because the generic
+//  backward launcher reuses the same sequential scan kernel structure
+//  with shared memory double-buffering.
 // ═══════════════════════════════════════════════════════════════════════
 
 void launch_mamba3_peer_backward_batched_ampere(

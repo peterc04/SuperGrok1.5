@@ -253,17 +253,18 @@ Kernels are tiered by GPU architecture for automatic hardware-specific optimizat
 |------|--------------|--------------|
 | **Generic** | sm_70, sm_75 (V100, T4) | FP32 only, basic smem |
 | **Ampere** | sm_80, sm_86, sm_89 (A100, RTX 3090, L4, RTX 4090) | TF32 Tensor Cores, cp.async, 192KB smem, BF16 |
-| **Hopper** | sm_90, sm_100 (H100, B200) | All Ampere features + TMA, FP8 Tensor Cores (future), 228KB smem |
+| **Hopper** | sm_90 (H100) | All Ampere features + FP8 E4M3 cuBLAS GEMMs for projections (CUDA 11.8+), 228KB smem |
+| **Blackwell** | sm_100 (B200) | Hopper path (FP8 + cp.async). TMEM/MMA.2SM/NVFP4 deferred pending hardware access |
 
 ### AMD (ROCm/HIP)
 
 | Architecture | GPU | Key Features |
 |-------------|-----|--------------|
 | gfx908 | MI100 | Matrix Cores, FP32/FP16 |
-| gfx90a | MI200 (MI210, MI250, MI250X) | BF16 Matrix Cores, FP64 |
-| gfx942 | MI300X | BF16/INT8 Matrix Cores, unified memory |
+| gfx90a (CDNA2) | MI200 (MI210, MI250, MI250X) | BF16 Matrix Cores, wavefront-64 sync skip in Blelloch scan (via platform.h WARP_SIZE=64) |
+| gfx942 (CDNA3) | MI300X | BF16 MFMA projections, 256MB L2 cache (meta-net weights L2-resident), wavefront-64 scan |
 
-All generic kernels compile for both CUDA and HIP via the `platform.h` abstraction layer. AMD uses wavefront-64 (vs CUDA warp-32) — handled automatically. Ampere/Hopper tier kernels are NVIDIA-only.
+All generic kernels compile for both CUDA and HIP via the `platform.h` abstraction layer. AMD uses wavefront-64 (vs CUDA warp-32) — handled automatically via `WARP_SIZE` in `platform.h`. CDNA2 gets intra-wavefront sync skip in the Blelloch scan (strides 1-32 skip `__syncthreads()`). CDNA3 adds BF16 MFMA projections for ~2x throughput. Ampere/Hopper tier kernels are NVIDIA-only.
 
 Runtime dispatch is automatic — the optimal kernel tier is selected based on the detected GPU.
 

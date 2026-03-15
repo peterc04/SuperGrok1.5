@@ -7,7 +7,8 @@ name = "grokking-optimizers"
 version = "2.1.0"
 description = "C++/CUDA/HIP/JAX optimizer suite with SuperGrok v2 (Mamba-3 + PEER + GRU meta-net)"
 requires-python = ">=3.8"
-license = "MIT"
+license = {text = "MIT"}
+readme = "README.md"
 dependencies = ["torch>=2.0.0"]
 
 [project.optional-dependencies]

@@ -1,13 +1,21 @@
 /*
- * SuperGrok v2 — Blackwell Stub (sm_100+)
+ * SuperGrok v2 — Blackwell (sm_100+) — Delegates to Hopper tier.
  *
- * Blackwell (B200) tier stub. Currently delegates to Hopper launchers.
+ * Current: FP8 projections + cp.async scan (via Hopper path).
+ * The Hopper tier provides FP8 E4M3 cuBLAS GEMMs for projection
+ * precompute and cp.async double-buffered scan, which is already
+ * a substantial optimization over generic FP32.
  *
- * Future Blackwell-specific optimizations:
- *   - NVFP4 native Tensor Core operations for quantized projections
+ * Deferred optimizations requiring Blackwell hardware access:
+ *   - TMEM (Tensor Memory): hardware-managed shared memory staging
+ *   - MMA.2SM: cross-SM cooperative matrix multiply
+ *   - NVFP4 native Tensor Core support (vs software dequant)
  *   - Fifth-generation Tensor Cores with 2x FP8 throughput
  *   - Enhanced TMA with multicast support
- *   - Confidential computing extensions
+ *   - Requires CUDA 12.8+
+ *
+ * These are deferred until Blackwell hardware is available for
+ * development and profiling. The Hopper path is correct and fast.
  *
  * The Blackwell tier is detected when sm_arch >= 100. FORCE_ARCH=100
  * can be used to test this dispatch path on older hardware.

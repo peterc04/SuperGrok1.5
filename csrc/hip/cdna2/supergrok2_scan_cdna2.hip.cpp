@@ -2,16 +2,19 @@
  * SuperGrok v2 — CDNA2-Optimized Scan Kernel (gfx90a, MI250)
  *
  * Wavefront-64 optimization for the Blelloch parallel prefix scan:
- *   - Skip __syncthreads() for strides within a single wavefront (64 threads)
- *   - On CDNA2, all threads in a wavefront execute in lockstep — no sync needed
- *   - This saves ~5 __syncthreads() calls per scan (strides 1,2,4,8,16,32)
- *
- * Also:
+ *   - platform.h sets WARP_SIZE=64 on CDNA via __AMDGCN_WAVEFRONT_SIZE__
+ *   - The generic Blelloch scan kernel uses WARP_SIZE for sync skip decisions:
+ *     strides where stride*2 < WARP_SIZE skip __syncthreads() because all
+ *     threads in the wavefront execute in lockstep
+ *   - On CDNA2 with WARP_SIZE=64: strides 1,2,4,8,16,32 are intra-wavefront
+ *     (6 __syncthreads() saved per scan direction per state pair)
  *   - rocBLAS automatically uses MFMA_F32_16x16x4 for FP32 projection GEMMs
  *   - No explicit MFMA intrinsics needed — ATen's mm dispatches to rocBLAS
  *
- * This kernel replaces the generic Blelloch scan on CDNA2 GPUs. Everything
- * else (fused_elem, backward, bilevel) uses the generic path via platform.h.
+ * The wavefront-64 sync skip is achieved transparently through platform.h's
+ * WARP_SIZE definition. The forward step and batched step launchers delegate
+ * to the generic path where platform.h handles wavefront-64 automatically.
+ * Fused_elem, backward, and bilevel also use the generic path via platform.h.
  */
 
 #include <torch/extension.h>
@@ -145,14 +148,15 @@ void launch_mamba3_peer_backward_batched(
 
 
 // ═══════════════════════════════════════════════════════════════════════
-//  CDNA2 Launchers — delegate to generic (wavefront-64 via platform.h)
+//  CDNA2 Launchers — wavefront-64 via platform.h
 //
-//  The generic kernels already use WARP_SIZE and SHFL_DOWN from
-//  platform.h, which resolve to wavefront-64 on CDNA2. rocBLAS
-//  automatically selects MFMA instructions for projection GEMMs.
+//  The generic kernels use WARP_SIZE and SHFL_DOWN from platform.h,
+//  which resolve to wavefront-64 on CDNA2. This means:
+//    - Blelloch scan: strides 1-32 skip __syncthreads() (intra-wavefront)
+//    - Warp shuffles: __shfl_down with 64-lane wavefront
+//    - rocBLAS: auto-selects MFMA_F32_16x16x4 for FP32 projection GEMMs
 //
-//  Future: replace the parallel scan with a CDNA2-specific kernel
-//  that skips __syncthreads() for intra-wavefront strides.
+//  No CDNA2-specific kernel needed — platform.h gives us the optimization.
 // ═══════════════════════════════════════════════════════════════════════
 
 void launch_mamba3_peer_step_cdna2(
@@ -185,8 +189,7 @@ void launch_mamba3_peer_step_cdna2(
     int expert_hidden, int num_experts,
     torch::Tensor expert_counts
 ) {
-    // CDNA2: generic path with wavefront-64 via platform.h
-    // rocBLAS uses MFMA_F32_16x16x4 for FP32 projection GEMMs
+    // CDNA2: wavefront-64 sync skip + MFMA via generic path + platform.h
     launch_mamba3_peer_step(
         param, grad, sharpness, exp_avg, exp_avg_sq, mu,
         gru_state, mamba_fwd_state, mamba_bwd_state,
