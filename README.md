@@ -63,7 +63,7 @@ Additional features: dynamic expert recycling, sigmoid-driven SAM/bilevel/WD sch
 python tests/test_supergrok2.py
 ```
 
-The test suite (`test_supergrok2.py`) covers 12 areas:
+The test suite (`test_supergrok2.py`) covers 22 areas:
 
 | Test | Description |
 |------|-------------|
@@ -79,6 +79,16 @@ The test suite (`test_supergrok2.py`) covers 12 areas:
 | 12J | Memory leak check (200 steps, <10% growth) |
 | 12K | Two-pass GEMM backward reproducibility (max diff < 1e-4 across seeded runs) |
 | 12L | Batched parallel scan single-launch (finite params, bitwise reproducibility) |
+| 12M | Dispatch detection (Python/C++ GPU architecture agreement) |
+| 12N | Precision config auto-selection |
+| 12O | Projection precision equivalence (FP32 vs auto) |
+| 12P | Dispatch convergence (10 steps) |
+| 12Q | Platform/vendor detection (Python/C++ agreement) |
+| 12R | INT8 symmetric quantization round-trip |
+| 12S | INT4 GPTQ-style packing correctness |
+| 12T | MXFP4 microscaling FP4 quantization |
+| 12U | Dynamic precision selection (stability-aware) |
+| 12V | Expert FP32 passthrough |
 
 Each test reports PASS/FAIL. Exit code 0 = all pass, 1 = any failure.
 
@@ -94,27 +104,32 @@ Each test reports PASS/FAIL. Exit code 0 = all pass, 1 = any failure.
 ./
 ├── csrc/
 │   ├── common/                                 # Shared headers and pybind dispatch
+│   │   ├── platform.h                          # CUDA/HIP abstraction layer
 │   │   ├── types.h                             # Affine2x2, constants, common structs
 │   │   ├── utils.cuh                           # warp_reduce_sum, device helpers
+│   │   ├── dispatch.h                          # Runtime GPU arch detection (C++)
+│   │   ├── quantization.h                      # Quantization structs and device helpers
 │   │   ├── ops.h                               # Master C++ declarations
 │   │   └── ops.cpp                             # Pybind11 dispatch
 │   │
 │   ├── cuda/
-│   │   └── generic/                            # Architecture-independent CUDA kernels
-│   │       ├── supergrok2_mamba_peer_kernels.cu
-│   │       ├── supergrok2_mamba_peer_backward_kernels.cu
-│   │       ├── supergrok15_kernels.cu
-│   │       ├── supergrok11_kernels.cu
-│   │       ├── grokadamw_kernels.cu
-│   │       ├── neuralgrok_kernels.cu
-│   │       ├── prodigy_kernels.cu
-│   │       ├── grokfast_kernels.cu
-│   │       ├── lion_kernels.cu
-│   │       ├── looksam_kernels.cu
-│   │       └── muon_kernels.cu
-│   │   ├── sm_75/ .. sm_100/                   # Per-architecture specialized kernels (future)
+│   │   ├── generic/                            # Architecture-independent GPU kernels
+│   │   │   ├── supergrok2_mamba_peer_kernels.cu
+│   │   │   ├── supergrok2_mamba_peer_backward_kernels.cu
+│   │   │   ├── supergrok15_kernels.cu
+│   │   │   ├── supergrok11_kernels.cu
+│   │   │   ├── grokadamw_kernels.cu
+│   │   │   ├── neuralgrok_kernels.cu
+│   │   │   ├── prodigy_kernels.cu
+│   │   │   ├── grokfast_kernels.cu
+│   │   │   ├── lion_kernels.cu
+│   │   │   ├── looksam_kernels.cu
+│   │   │   └── muon_kernels.cu
+│   │   ├── sm_80/                              # Ampere-optimized kernels (TF32)
+│   │   └── sm_90/                              # Hopper-optimized kernels
 │   │
-│   ├── hip/                                    # AMD ROCm/HIP kernels (future)
+│   ├── hip/                                    # AMD ROCm/HIP notes and optimizations
+│   │   └── README_HIP.md                       # Wavefront-64 architecture notes
 │   ├── cpu/                                    # CPU fallback kernels (future)
 │   └── quantization/                           # Quantization kernels (future)
 │
@@ -122,7 +137,8 @@ Each test reports PASS/FAIL. Exit code 0 = all pass, 1 = any failure.
 │
 ├── grokking_optimizers/                        # Python package
 │   ├── __init__.py                             # Package exports
-│   ├── dispatch.py                             # Runtime hardware detection
+│   ├── dispatch.py                             # Runtime hardware + vendor detection
+│   ├── quantization.py                         # PrecisionConfig, INT8/INT4/MXFP4
 │   ├── supergrok2.py                           # SuperGrok v2 optimizer
 │   ├── mamba3_peer_metanet.py                  # Mamba-3+PEER+GRU meta-net
 │   ├── supergrok15.py                          # SuperGrok v1.5 optimizer
@@ -139,7 +155,7 @@ Each test reports PASS/FAIL. Exit code 0 = all pass, 1 = any failure.
 ├── tests/                                      # Test suite
 │   └── test_supergrok2.py
 │
-├── setup.py                                    # Build script (sm_70–sm_90)
+├── setup.py                                    # Build script (CUDA sm_70–sm_90 + ROCm)
 ├── pyproject.toml
 ├── grokking_race_v2.py                         # Benchmark harness
 ├── README.md
@@ -163,11 +179,15 @@ Key SuperGrok v2 hyperparameters (defaults):
 | `sam_rho` | 0.05 | SAM perturbation radius |
 | `recycle_interval` | 100 | Steps between dead expert recycling |
 | `bilevel_checkpoint_interval` | 1 | Checkpoint interval for bilevel gradient checkpointing (1 = save every step, 32 = save every 32 steps) |
-| `projection_precision` | `'auto'` | Precision for projection GEMMs: `'fp32'`, `'tf32'`, `'bf16'`, `'fp8'`, or `'auto'` |
+| `projection_precision` | `'auto'` | Precision for projection GEMMs: `'fp32'`, `'tf32'`, `'bf16'`, `'fp8'`, `'mxfp4'`, or `'auto'` |
+| `expert_precision` | `'fp32'` | Expert weight quantization: `'fp32'`, `'int8'`, `'int4'`, or `'auto'` |
+| `dynamic` | `False` | Enable dynamic precision selection (progressively lowers precision as training stabilizes) |
 
 ## Hardware Support
 
 Kernels are tiered by GPU architecture for automatic hardware-specific optimization:
+
+### NVIDIA (CUDA)
 
 | Tier | Architectures | Key Features |
 |------|--------------|--------------|
@@ -175,19 +195,46 @@ Kernels are tiered by GPU architecture for automatic hardware-specific optimizat
 | **Ampere** | sm_80, sm_86, sm_89 (A100, RTX 3090, L4, RTX 4090) | TF32 Tensor Cores, cp.async, 192KB smem, BF16 |
 | **Hopper** | sm_90, sm_100 (H100, B200) | All Ampere features + TMA, FP8 Tensor Cores (future), 228KB smem |
 
+### AMD (ROCm/HIP)
+
+| Architecture | GPU | Key Features |
+|-------------|-----|--------------|
+| gfx908 | MI100 | Matrix Cores, FP32/FP16 |
+| gfx90a | MI200 (MI210, MI250, MI250X) | BF16 Matrix Cores, FP64 |
+| gfx942 | MI300X | BF16/INT8 Matrix Cores, unified memory |
+
+All generic kernels compile for both CUDA and HIP via the `platform.h` abstraction layer. AMD uses wavefront-64 (vs CUDA warp-32) — handled automatically. Ampere/Hopper tier kernels are NVIDIA-only.
+
 Runtime dispatch is automatic — the optimal kernel tier is selected based on the detected GPU.
 
 ## Quantization
+
+### Projection Precision
 
 Projection GEMMs support multi-precision via `projection_precision`:
 
 | Format | Where | Benefit |
 |--------|-------|---------|
 | TF32 | Projections on sm_80+ | 2x FP32 throughput, transparent via cuBLAS |
-| BF16 | Projections on sm_80+ | Same range as FP32, 2x bandwidth |
+| BF16 | Projections on sm_80+ / gfx90a+ | Same range as FP32, 2x bandwidth |
 | FP8 (E4M3) | Projections on sm_89+/sm_90+ | 4x throughput vs FP32 on Tensor Cores |
+| MXFP4 | Projection weights (all GPUs) | 8x compression, Microscaling FP4 with shared exponents |
 
-Scan state accumulation always stays FP32 (numerical necessity for long recurrences). Expert weights stay FP32 (already in shared memory).
+### Expert Weight Quantization
+
+Expert MLP weights support weight-only quantization via `expert_precision`:
+
+| Format | Compression | Description |
+|--------|------------|-------------|
+| FP32 | 1x | Default, full precision |
+| INT8 | 4x | Symmetric per-tensor quantization (scale = max(\|w\|)/127) |
+| INT4 | 8x | GPTQ-style packing with group scales and zero-points |
+
+### Dynamic Precision Selection
+
+When `dynamic=True`, the optimizer monitors gradient norm stability (coefficient of variation) and progressively lowers precision as training stabilizes. If training becomes unstable, precision is raised back. This is inspired by Unsloth's progressive precision approach.
+
+Scan state accumulation always stays FP32 (numerical necessity for long recurrences).
 
 ## Multi-GPU
 
@@ -195,6 +242,6 @@ Scan state accumulation always stays FP32 (numerical necessity for long recurren
 
 ## Requirements
 
-- PyTorch 2.0+ with CUDA support
-- CUDA 11.8 or 12.x
-- GPU architectures: V100 (sm_70), T4 (sm_75), A100 (sm_80), RTX 3090 (sm_86), RTX 4090 (sm_89), H100 (sm_90)
+- PyTorch 2.0+ with CUDA or ROCm support
+- **NVIDIA**: CUDA 11.8 or 12.x — GPU architectures: V100 (sm_70), T4 (sm_75), A100 (sm_80), RTX 3090 (sm_86), RTX 4090 (sm_89), H100 (sm_90)
+- **AMD**: ROCm 5.4+ (recommended 6.0+) — GPU architectures: MI100 (gfx908), MI200 (gfx90a), MI300X (gfx942)

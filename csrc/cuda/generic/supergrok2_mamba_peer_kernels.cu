@@ -24,15 +24,10 @@
  */
 
 #include <torch/extension.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <thrust/sort.h>
-#include <thrust/device_ptr.h>
-#include <thrust/sequence.h>
-#include <cub/device/device_segmented_radix_sort.cuh>
 #include <algorithm>
 
+#include "platform.h"
 #include "types.h"
 
 
@@ -193,7 +188,7 @@ __global__ void mamba3_scan_kernel(
             // Paired RoPE: (2i, 2i+1) form complex pairs
             int pair_idx = s / 2;
             float cos_p, sin_p;
-            __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+            FAST_SINCOSF(dt_val * freq[pair_idx], &sin_p, &cos_p);
             float h_rot;
             if (s % 2 == 0) {
                 h_rot = h_snap[s] * cos_p - h_snap[s + 1] * sin_p;
@@ -387,7 +382,7 @@ __global__ void mamba3_parallel_scan_kernel(
         float A_bar_e = (1.0f + dt * (A_e) / 2.0f) / (1.0f - dt * (A_e) / 2.0f + 1e-8f); \
         float A_bar_o = (1.0f + dt * (A_o) / 2.0f) / (1.0f - dt * (A_o) / 2.0f + 1e-8f); \
         float cos_v, sin_v; \
-        __sincosf(dt * (f_val), &sin_v, &cos_v); \
+        FAST_SINCOSF(dt * (f_val), &sin_v, &cos_v); \
         (elem_out).m00 = A_bar_e * cos_v; \
         (elem_out).m01 = -A_bar_e * sin_v; \
         (elem_out).m10 = A_bar_o * sin_v; \
@@ -605,7 +600,7 @@ __global__ void mamba3_parallel_scan_batched_kernel(
         float A_bar_e = (1.0f + dt * (A_e) / 2.0f) / (1.0f - dt * (A_e) / 2.0f + 1e-8f); \
         float A_bar_o = (1.0f + dt * (A_o) / 2.0f) / (1.0f - dt * (A_o) / 2.0f + 1e-8f); \
         float cos_v, sin_v; \
-        __sincosf(dt * (f_val), &sin_v, &cos_v); \
+        FAST_SINCOSF(dt * (f_val), &sin_v, &cos_v); \
         (elem_out).m00 = A_bar_e * cos_v; \
         (elem_out).m01 = -A_bar_e * sin_v; \
         (elem_out).m10 = A_bar_o * sin_v; \
@@ -988,7 +983,7 @@ __global__ void fused_elem_step_kernel(
         for (int k = 0; k < pk_dim; k++) {
             float dot = 0.0f;
             for (int d = 0; d < half_d; d++)
-                dot += query[d] * __ldg(&keys_A[k * half_d + d]);
+                dot += query[d] * LDG(&keys_A[k * half_d + d]);
             if (dot > best_score_a) { best_score_a = dot; best_a = k; }
         }
 
@@ -997,7 +992,7 @@ __global__ void fused_elem_step_kernel(
         for (int k = 0; k < pk_dim; k++) {
             float dot = 0.0f;
             for (int d = 0; d < half_d; d++)
-                dot += query[half_d + d] * __ldg(&keys_B[k * half_d + d]);
+                dot += query[half_d + d] * LDG(&keys_B[k * half_d + d]);
             if (dot > best_score_b) { best_score_b = dot; best_b = k; }
         }
 
@@ -1153,7 +1148,7 @@ __global__ void mamba3_scan_batched_kernel(
             // Paired RoPE: (2i, 2i+1) form complex pairs
             int pair_idx = s / 2;
             float cos_p, sin_p;
-            __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+            FAST_SINCOSF(dt_val * freq[pair_idx], &sin_p, &cos_p);
             float h_rot;
             if (s % 2 == 0) {
                 h_rot = h_snap[s] * cos_p - h_snap[s + 1] * sin_p;
@@ -1316,7 +1311,7 @@ __global__ void mamba3_scan_combined_kernel(
             float B_bar = dt_val * B_val;
             int pair_idx = s / 2;
             float cos_p, sin_p;
-            __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+            FAST_SINCOSF(dt_val * freq[pair_idx], &sin_p, &cos_p);
             float h_rot;
             if (s % 2 == 0) {
                 h_rot = h_snap[s] * cos_p - h_snap[s + 1] * sin_p;

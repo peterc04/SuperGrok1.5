@@ -1025,6 +1025,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         }
     }, "Get architecture tier name: 'generic', 'ampere', or 'hopper'");
 
+    m.def("get_gpu_vendor_name", []() -> std::string {
+        auto vendor = get_gpu_vendor();
+        switch (vendor) {
+            case GpuVendor::NVIDIA: return "nvidia";
+            case GpuVendor::AMD:    return "amd";
+            default:                return "none";
+        }
+    }, "Get GPU vendor: 'nvidia', 'amd', or 'none'");
+
+    m.def("get_warp_size", []() -> int {
+        return WARP_SIZE;
+    }, "Get warp/wavefront size (32 for NVIDIA, 64 for AMD CDNA)");
+
     // ── SuperGrok v1.5 ───────────────────────────────────────────────
     m.def("supergrok15_fused_step", &supergrok15_fused_step,
           "SuperGrok1.5: fused mu + meta-net + gating + adam + progressive wd",

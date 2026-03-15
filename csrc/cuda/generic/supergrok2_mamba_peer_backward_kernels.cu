@@ -27,12 +27,9 @@
  */
 
 #include <torch/extension.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <thrust/sort.h>
-#include <thrust/device_ptr.h>
 
+#include "platform.h"
 #include "types.h"
 #include "utils.cuh"
 
@@ -241,7 +238,7 @@ __global__ void mamba3_parallel_scan_fwd_save_kernel(
         float A_bar_e = (1.0f + dt * (A_e) / 2.0f) / (1.0f - dt * (A_e) / 2.0f + 1e-8f); \
         float A_bar_o = (1.0f + dt * (A_o) / 2.0f) / (1.0f - dt * (A_o) / 2.0f + 1e-8f); \
         float cos_v, sin_v; \
-        __sincosf(dt * (f_val), &sin_v, &cos_v); \
+        FAST_SINCOSF(dt * (f_val), &sin_v, &cos_v); \
         (elem_out).m00 = A_bar_e * cos_v; \
         (elem_out).m01 = -A_bar_e * sin_v; \
         (elem_out).m10 = A_bar_o * sin_v; \
@@ -463,7 +460,7 @@ __global__ void mamba3_batched_parallel_scan_fwd_save_kernel(
         float A_bar_e = (1.0f + dt * (A_e) / 2.0f) / (1.0f - dt * (A_e) / 2.0f + 1e-8f); \
         float A_bar_o = (1.0f + dt * (A_o) / 2.0f) / (1.0f - dt * (A_o) / 2.0f + 1e-8f); \
         float cos_v, sin_v; \
-        __sincosf(dt * (f_val), &sin_v, &cos_v); \
+        FAST_SINCOSF(dt * (f_val), &sin_v, &cos_v); \
         (elem_out).m00 = A_bar_e * cos_v; \
         (elem_out).m01 = -A_bar_e * sin_v; \
         (elem_out).m10 = A_bar_o * sin_v; \
@@ -776,7 +773,7 @@ __global__ void mamba3_scan_fwd_save_kernel(
             // Paired RoPE using SNAPSHOT
             int pair_idx = s / 2;
             float cos_p, sin_p;
-            __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+            FAST_SINCOSF(dt_val * freq[pair_idx], &sin_p, &cos_p);
             float h_rot;
             if (s % 2 == 0) {
                 h_rot = h_snap[s] * cos_p - h_snap[s + 1] * sin_p;
@@ -931,7 +928,7 @@ __global__ void mamba3_scan_fwd_save_batched_kernel(
             // Paired RoPE
             int pair_idx = s / 2;
             float cos_p, sin_p;
-            __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+            FAST_SINCOSF(dt_val * freq[pair_idx], &sin_p, &cos_p);
             float h_rot;
             if (s % 2 == 0) {
                 h_rot = h_snap[s] * cos_p - h_snap[s + 1] * sin_p;
@@ -1147,7 +1144,7 @@ __global__ void mamba3_scan_backward_kernel(
                 float B_bar = dt_val * B_val;
                 int pair_idx = s / 2;
                 float cos_p, sin_p;
-                __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+                FAST_SINCOSF(dt_val * freq[pair_idx], &sin_p, &cos_p);
                 float h_rot;
                 int partner;
                 float sign;
@@ -1268,7 +1265,7 @@ __global__ void mamba3_scan_backward_kernel(
 
                     int pair_idx = s / 2;
                     float cos_p, sin_p;
-                    __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+                    FAST_SINCOSF(dt_val * freq[pair_idx], &sin_p, &cos_p);
                     float h_rot;
                     if (s % 2 == 0)
                         h_rot = h_snap_r[s] * cos_p - h_snap_r[s + 1] * sin_p;
@@ -1348,7 +1345,7 @@ __global__ void mamba3_scan_backward_kernel(
                     float B_bar = dt_val * B_val;
                     int pair_idx = s / 2;
                     float cos_p, sin_p;
-                    __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+                    FAST_SINCOSF(dt_val * freq[pair_idx], &sin_p, &cos_p);
                     float h_rot;
                     int partner;
                     float sign;
@@ -1623,7 +1620,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
                 float B_bar = dt_val * B_val;
                 int pair_idx = s / 2;
                 float cos_p, sin_p;
-                __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+                FAST_SINCOSF(dt_val * freq[pair_idx], &sin_p, &cos_p);
                 float h_rot;
                 int partner;
                 float sign;
@@ -1731,7 +1728,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
                     float B_bar = dt_val * B_val;
                     int pair_idx = s / 2;
                     float cos_p, sin_p;
-                    __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+                    FAST_SINCOSF(dt_val * freq[pair_idx], &sin_p, &cos_p);
                     float h_rot;
                     if (s % 2 == 0)
                         h_rot = h_snap_r[s] * cos_p - h_snap_r[s + 1] * sin_p;
@@ -1798,7 +1795,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
                     float B_bar = dt_val * B_val;
                     int pair_idx = s / 2;
                     float cos_p, sin_p;
-                    __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+                    FAST_SINCOSF(dt_val * freq[pair_idx], &sin_p, &cos_p);
                     float h_rot;
                     int partner;
                     float sign;

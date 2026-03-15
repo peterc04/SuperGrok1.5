@@ -17,9 +17,9 @@
  */
 
 #include <torch/extension.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
 #include <ATen/cuda/CUDAContext.h>
+
+#include "platform.h"
 
 constexpr int BLOCK_SIZE = 256;
 

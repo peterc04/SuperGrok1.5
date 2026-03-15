@@ -677,6 +677,186 @@ def test_12p_dispatch_convergence():
 #  Main
 # ═══════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════
+#  12Q: Platform / Vendor Detection
+# ═══════════════════════════════════════════════════════════════════
+
+def test_12q_vendor_detection():
+    """Verify GPU vendor detection consistency across Python and C++."""
+    from grokking_optimizers.dispatch import get_gpu_vendor, get_backend, get_warp_size
+    from grokking_optimizers import _ops
+
+    vendor = get_gpu_vendor()
+    cpp_vendor = _ops.get_gpu_vendor_name()
+    backend = get_backend()
+
+    assert vendor == cpp_vendor, \
+        f"Python ({vendor}) and C++ ({cpp_vendor}) disagree on GPU vendor"
+    assert vendor in ('nvidia', 'amd', 'none'), \
+        f"Unexpected vendor: {vendor}"
+
+    # Backend and vendor must be consistent
+    if vendor == 'nvidia':
+        assert backend == 'cuda', f"NVIDIA vendor but backend={backend}"
+    elif vendor == 'amd':
+        assert backend == 'hip', f"AMD vendor but backend={backend}"
+
+    # Warp size
+    ws = get_warp_size()
+    cpp_ws = _ops.get_warp_size()
+    assert ws == cpp_ws, \
+        f"Python warp_size ({ws}) != C++ warp_size ({cpp_ws})"
+    assert ws in (32, 64), f"Unexpected warp size: {ws}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  12R: Extended Quantization — INT8 Symmetric
+# ═══════════════════════════════════════════════════════════════════
+
+def test_12r_int8_quantization():
+    """Verify INT8 symmetric quantization round-trip for expert weights."""
+    from grokking_optimizers.quantization import PrecisionConfig
+
+    pc = PrecisionConfig(expert_precision='int8')
+    assert pc.expert_precision == 'int8'
+
+    # Create fake expert weights
+    num_experts, hidden = 144, 16
+    w1 = torch.randn(num_experts, hidden, device='cuda')
+    b1 = torch.randn(num_experts, hidden, device='cuda')
+    w2 = torch.randn(num_experts, hidden, device='cuda')
+    b2 = torch.randn(num_experts, device='cuda')
+
+    result = pc.convert_expert_weights(w1, b1, w2, b2)
+    assert result['mode'] == 'int8'
+    assert result['w1_q'].dtype == torch.int8
+    assert result['w2_q'].dtype == torch.int8
+    assert result['b1'].dtype == torch.float32  # biases stay FP32
+    assert result['b2'].dtype == torch.float32
+
+    # Check round-trip error: dequantized should be close to original
+    w1_deq = result['w1_q'].float() * result['w1_s']
+    max_err = (w1 - w1_deq).abs().max().item()
+    w1_range = w1.abs().max().item()
+    # INT8 symmetric error should be < 1/127 of the range
+    assert max_err < w1_range / 100, \
+        f"INT8 round-trip error too large: {max_err:.6f} (range={w1_range:.6f})"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  12S: Extended Quantization — INT4 GPTQ-Style
+# ═══════════════════════════════════════════════════════════════════
+
+def test_12s_int4_quantization():
+    """Verify INT4 GPTQ-style packing and unpacking."""
+    from grokking_optimizers.quantization import PrecisionConfig
+
+    pc = PrecisionConfig(expert_precision='int4')
+    assert pc.expert_precision == 'int4'
+
+    num_experts, hidden = 144, 16
+    w1 = torch.randn(num_experts, hidden, device='cuda') * 0.5
+    b1 = torch.randn(num_experts, hidden, device='cuda')
+    w2 = torch.randn(num_experts, hidden, device='cuda') * 0.5
+    b2 = torch.randn(num_experts, device='cuda')
+
+    result = pc.convert_expert_weights(w1, b1, w2, b2)
+    assert result['mode'] == 'int4'
+    assert result['w1_packed'].dtype == torch.uint8
+    assert result['w2_packed'].dtype == torch.uint8
+
+    # Packed tensor should be half the element count (pairs packed)
+    total_w1 = w1.numel()
+    packed_w1 = result['w1_packed'].numel()
+    assert packed_w1 == (total_w1 + 1) // 2, \
+        f"INT4 packed size mismatch: {packed_w1} vs expected {(total_w1 + 1) // 2}"
+
+    # Scales should be positive
+    assert (result['w1_scales'] > 0).all(), "INT4 scales should be positive"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  12T: Extended Quantization — MXFP4
+# ═══════════════════════════════════════════════════════════════════
+
+def test_12t_mxfp4_quantization():
+    """Verify MXFP4 (Microscaling FP4) quantization for projections."""
+    from grokking_optimizers.quantization import PrecisionConfig
+
+    pc = PrecisionConfig(projection_precision='mxfp4')
+    assert pc.projection_precision == 'mxfp4'
+
+    # Create a small projection weight matrix
+    w = torch.randn(16, 8, device='cuda')
+    packed, shared_exp = pc.convert_projection_weights(w)
+
+    assert packed.dtype == torch.uint8
+    assert shared_exp.dtype == torch.uint8
+
+    # Packed should be half the padded element count
+    N = w.numel()
+    block_size = 32
+    N_padded = ((N + block_size - 1) // block_size) * block_size
+    assert packed.numel() == N_padded // 2, \
+        f"MXFP4 packed size: {packed.numel()} vs expected {N_padded // 2}"
+
+    # Number of shared exponents = number of blocks
+    num_blocks = N_padded // block_size
+    assert shared_exp.numel() == num_blocks, \
+        f"MXFP4 shared_exp count: {shared_exp.numel()} vs expected {num_blocks}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  12U: Dynamic Precision Selection
+# ═══════════════════════════════════════════════════════════════════
+
+def test_12u_dynamic_precision():
+    """Verify dynamic precision selection responds to gradient stability."""
+    from grokking_optimizers.quantization import PrecisionConfig
+
+    pc = PrecisionConfig(projection_precision='fp32', dynamic=True)
+    assert pc.dynamic is True
+    assert pc._precision_tier == 0
+
+    # Simulate 500 warmup steps with stable gradients
+    for i in range(501):
+        pc.update_dynamic(1.0 + 0.001 * (i % 2))  # very stable
+
+    # After warmup with stable grads, should have lowered precision
+    assert pc._precision_tier > 0, \
+        f"Dynamic precision should have lowered tier after stable warmup, got {pc._precision_tier}"
+
+    # Reset and test unstable gradients
+    pc2 = PrecisionConfig(projection_precision='fp32', dynamic=True)
+    for i in range(600):
+        # Wildly varying gradient norms
+        pc2.update_dynamic(1.0 if i % 2 == 0 else 100.0)
+
+    # With unstable grads, should stay at tier 0
+    assert pc2._precision_tier == 0, \
+        f"Dynamic precision should stay at tier 0 with unstable grads, got {pc2._precision_tier}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  12V: Expert Precision FP32 Passthrough
+# ═══════════════════════════════════════════════════════════════════
+
+def test_12v_expert_fp32():
+    """Verify FP32 expert weight passthrough."""
+    from grokking_optimizers.quantization import PrecisionConfig
+
+    pc = PrecisionConfig(expert_precision='fp32')
+    w1 = torch.randn(10, 4, device='cuda')
+    b1 = torch.randn(10, 4, device='cuda')
+    w2 = torch.randn(10, 4, device='cuda')
+    b2 = torch.randn(10, device='cuda')
+
+    result = pc.convert_expert_weights(w1, b1, w2, b2)
+    assert result['mode'] == 'fp32'
+    assert result['w1'].dtype == torch.float32
+    assert torch.allclose(result['w1'], w1.float())
+
+
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("SKIP: No CUDA device available")
@@ -740,6 +920,24 @@ if __name__ == "__main__":
 
     print("\n--- 12P: Dispatch Convergence ---")
     run_test("12P: Dispatch convergence (10 steps)", test_12p_dispatch_convergence)
+
+    print("\n--- 12Q: Platform / Vendor Detection ---")
+    run_test("12Q: Vendor detection (Python/C++ agreement)", test_12q_vendor_detection)
+
+    print("\n--- 12R: INT8 Quantization ---")
+    run_test("12R: INT8 symmetric quantization", test_12r_int8_quantization)
+
+    print("\n--- 12S: INT4 Quantization ---")
+    run_test("12S: INT4 GPTQ-style packing", test_12s_int4_quantization)
+
+    print("\n--- 12T: MXFP4 Quantization ---")
+    run_test("12T: MXFP4 microscaling FP4", test_12t_mxfp4_quantization)
+
+    print("\n--- 12U: Dynamic Precision ---")
+    run_test("12U: Dynamic precision selection", test_12u_dynamic_precision)
+
+    print("\n--- 12V: Expert FP32 Passthrough ---")
+    run_test("12V: Expert FP32 passthrough", test_12v_expert_fp32)
 
     # Summary
     print("\n" + "=" * 60)

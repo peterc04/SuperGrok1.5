@@ -35,11 +35,11 @@
  */
 
 #include <torch/extension.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
+
+#include "platform.h"
 
 constexpr int PRODIGY_BLOCK_SIZE = 256;
-constexpr int PRODIGY_WARP_SIZE = 32;
+constexpr int PRODIGY_WARP_SIZE = WARP_SIZE;
 
 // ===================================================================
 //  Kernel 1: Fused Prodigy per-element step
@@ -145,8 +145,8 @@ __global__ void prodigy_dlr_reduce_kernel(
 
     // -- Warp-level reduction via shuffle --------------------------------
     for (int offset = PRODIGY_WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        local_num += __shfl_down_sync(0xffffffff, local_num, offset);
-        local_den += __shfl_down_sync(0xffffffff, local_den, offset);
+        local_num += SHFL_DOWN(local_num, offset);
+        local_den += SHFL_DOWN(local_den, offset);
     }
 
     // Lane 0 of each warp writes to shared memory
@@ -162,8 +162,8 @@ __global__ void prodigy_dlr_reduce_kernel(
         float warp_den = (lane_id < NUM_WARPS) ? shared_den[lane_id] : 0.0f;
 
         for (int offset = NUM_WARPS / 2; offset > 0; offset >>= 1) {
-            warp_num += __shfl_down_sync(0xffffffff, warp_num, offset);
-            warp_den += __shfl_down_sync(0xffffffff, warp_den, offset);
+            warp_num += SHFL_DOWN(warp_num, offset);
+            warp_den += SHFL_DOWN(warp_den, offset);
         }
 
         // Lane 0 of warp 0 does atomic add to global accumulators

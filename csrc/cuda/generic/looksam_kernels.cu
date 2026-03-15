@@ -10,8 +10,8 @@
  */
 
 #include <torch/extension.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
+
+#include "platform.h"
 
 constexpr int LOOKSAM_BLOCK_SIZE = 256;
 

@@ -23,9 +23,9 @@
  */
 
 #include <torch/extension.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
 #include <cmath>
+
+#include "platform.h"
 
 constexpr int BLOCK_SIZE = 256;
 
@@ -233,14 +233,14 @@ __global__ void cosine_gate_reduce_kernel(
     }
 
     // Warp shuffle reduction
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        dot_acc += __shfl_down_sync(0xffffffff, dot_acc, offset);
-        sg_sq_acc += __shfl_down_sync(0xffffffff, sg_sq_acc, offset);
-        mu_sq_acc += __shfl_down_sync(0xffffffff, mu_sq_acc, offset);
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        dot_acc += SHFL_DOWN(dot_acc, offset);
+        sg_sq_acc += SHFL_DOWN(sg_sq_acc, offset);
+        mu_sq_acc += SHFL_DOWN(mu_sq_acc, offset);
     }
 
     // Lane 0 of each warp atomicAdds to global
-    if ((threadIdx.x & 31) == 0) {
+    if ((threadIdx.x & (WARP_SIZE - 1)) == 0) {
         atomicAdd(&results[0], dot_acc);
         atomicAdd(&results[1], sg_sq_acc);
         atomicAdd(&results[2], mu_sq_acc);
