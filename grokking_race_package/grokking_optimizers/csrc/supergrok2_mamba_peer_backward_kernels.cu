@@ -123,6 +123,87 @@ __global__ void bilevel_precompute_kernel(
 
 
 // ═══════════════════════════════════════════════════════════════════════
+//  Softplus + Bias Kernel (used after cuBLAS GEMM for dt projection)
+//
+//  Applies dt_val = softplus(dt_raw + bias[j]) for each element.
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void softplus_bias_kernel(
+    float* __restrict__ dt_out,       // [N, d_inner] — in-place
+    const float* __restrict__ bias,   // [d_inner]
+    const int N, const int d_inner
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * d_inner) return;
+    const int j = idx % d_inner;
+    float dt_raw = dt_out[idx] + bias[j];
+    dt_out[idx] = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw));
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  cuBLAS GEMM Precompute (ATen wrappers)
+//
+//  Replaces bilevel_precompute_kernel with batched GEMM calls for large N.
+//  Uses ATen's torch::mm (cuBLAS under the hood) for better throughput
+//  on large parameter tensors.
+//
+//  Projections:
+//    x_branch [N,d_inner] = x_sorted [N,d_model] × in_proj_W[0:d_inner,:].T
+//    z        [N,d_inner] = x_sorted [N,d_model] × in_proj_W[d_inner:,:].T
+//    dt       [N,d_inner] = softplus(x_branch [N,d_inner] × dt_proj_W.T + bias)
+//    B        [N,d_state] = x_branch [N,d_inner] × B_proj_W.T
+//    C        [N,d_state] = x_branch [N,d_inner] × C_proj_W.T
+// ═══════════════════════════════════════════════════════════════════════
+
+constexpr int GEMM_PRECOMPUTE_THRESHOLD = 1024;  // use GEMM when N >= this
+
+static void bilevel_precompute_gemm(
+    torch::Tensor x_sorted,       // [N, d_model]
+    torch::Tensor in_proj_W,      // [2*d_inner, d_model]
+    torch::Tensor dt_proj_W,      // [d_inner, d_inner]
+    torch::Tensor dt_proj_b,      // [d_inner]
+    torch::Tensor B_proj_W,       // [d_state, d_inner]
+    torch::Tensor C_proj_W,       // [d_state, d_inner]
+    torch::Tensor pre_x_val,      // [N, d_inner] output
+    torch::Tensor pre_z_val,      // [N, d_inner] output
+    torch::Tensor pre_dt_val,     // [N, d_inner] output
+    torch::Tensor pre_B_val,      // [N, d_state] output
+    torch::Tensor pre_C_val,      // [N, d_state] output
+    int d_model, int d_inner, int d_state
+) {
+    const int N = x_sorted.size(0);
+
+    // Split in_proj into x and z halves: [d_inner, d_model] each
+    auto in_proj_x = in_proj_W.narrow(0, 0, d_inner);        // [d_inner, d_model]
+    auto in_proj_z = in_proj_W.narrow(0, d_inner, d_inner);   // [d_inner, d_model]
+
+    // x_branch = x_sorted @ in_proj_x.T → [N, d_inner]
+    auto x_branch = torch::mm(x_sorted, in_proj_x.t());
+    pre_x_val.copy_(x_branch);
+
+    // z = x_sorted @ in_proj_z.T → [N, d_inner]
+    torch::mm_out(pre_z_val, x_sorted, in_proj_z.t());
+
+    // dt_raw = x_branch @ dt_proj_W.T → [N, d_inner], then add bias + softplus
+    torch::mm_out(pre_dt_val, x_branch, dt_proj_W.t());
+    int total_dt = N * d_inner;
+    int dt_grid = (total_dt + SG2B_BLOCK - 1) / SG2B_BLOCK;
+    softplus_bias_kernel<<<dt_grid, SG2B_BLOCK>>>(
+        pre_dt_val.data_ptr<float>(),
+        dt_proj_b.data_ptr<float>(),
+        N, d_inner
+    );
+
+    // B = x_branch @ B_proj_W.T → [N, d_state]
+    torch::mm_out(pre_B_val, x_branch, B_proj_W.t());
+
+    // C = x_branch @ C_proj_W.T → [N, d_state]
+    torch::mm_out(pre_C_val, x_branch, C_proj_W.t());
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
 //  Parallel Scan with State Saving for Bilevel Forward
 //
 //  Blelloch parallel prefix scan (same as forward scan kernel) plus
@@ -2487,23 +2568,31 @@ void launch_mamba3_peer_bilevel_fwd_save(
         // ═══ Parallel scan path: precompute + Blelloch parallel prefix scan ═══
         auto pre_B_fwd = g_bilevel_ws.pre_B.narrow(0, 0, N);
         auto pre_C_fwd = g_bilevel_ws.pre_C.narrow(0, 0, N);
-        const int pre_grid = (N + SG2B_BLOCK - 1) / SG2B_BLOCK;
 
         // Forward direction: precompute
-        bilevel_precompute_kernel<<<pre_grid, SG2B_BLOCK>>>(
-            x_sorted.data_ptr<float>(),
-            mamba_fwd_in_proj.data_ptr<float>(),
-            mamba_fwd_dt_W.data_ptr<float>(),
-            mamba_fwd_dt_b.data_ptr<float>(),
-            mamba_fwd_B_proj.data_ptr<float>(),
-            mamba_fwd_C_proj.data_ptr<float>(),
-            fwd_saved_x_branch.data_ptr<float>(),  // pre_x_val = saved_x_branch
-            fwd_saved_z.data_ptr<float>(),          // pre_z_val = saved_z
-            fwd_saved_dt.data_ptr<float>(),         // pre_dt_val = saved_dt
-            pre_B_fwd.data_ptr<float>(),
-            pre_C_fwd.data_ptr<float>(),
-            N, d_model, d_inner, d_state
-        );
+        if (N >= GEMM_PRECOMPUTE_THRESHOLD) {
+            bilevel_precompute_gemm(
+                x_sorted, mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
+                mamba_fwd_B_proj, mamba_fwd_C_proj,
+                fwd_saved_x_branch, fwd_saved_z, fwd_saved_dt,
+                pre_B_fwd, pre_C_fwd,
+                d_model, d_inner, d_state);
+        } else {
+            const int pre_grid = (N + SG2B_BLOCK - 1) / SG2B_BLOCK;
+            bilevel_precompute_kernel<<<pre_grid, SG2B_BLOCK>>>(
+                x_sorted.data_ptr<float>(),
+                mamba_fwd_in_proj.data_ptr<float>(),
+                mamba_fwd_dt_W.data_ptr<float>(),
+                mamba_fwd_dt_b.data_ptr<float>(),
+                mamba_fwd_B_proj.data_ptr<float>(),
+                mamba_fwd_C_proj.data_ptr<float>(),
+                fwd_saved_x_branch.data_ptr<float>(),
+                fwd_saved_z.data_ptr<float>(),
+                fwd_saved_dt.data_ptr<float>(),
+                pre_B_fwd.data_ptr<float>(),
+                pre_C_fwd.data_ptr<float>(),
+                N, d_model, d_inner, d_state);
+        }
 
         // Forward direction: parallel scan with state saving
         fwd_scan_out.zero_();
@@ -2536,20 +2625,29 @@ void launch_mamba3_peer_bilevel_fwd_save(
         auto pre_B_bwd = g_bilevel_ws.pre_B.narrow(0, 0, N);
         auto pre_C_bwd = g_bilevel_ws.pre_C.narrow(0, 0, N);
 
-        bilevel_precompute_kernel<<<pre_grid, SG2B_BLOCK>>>(
-            x_sorted_rev.data_ptr<float>(),
-            mamba_bwd_in_proj.data_ptr<float>(),
-            mamba_bwd_dt_W.data_ptr<float>(),
-            mamba_bwd_dt_b.data_ptr<float>(),
-            mamba_bwd_B_proj.data_ptr<float>(),
-            mamba_bwd_C_proj.data_ptr<float>(),
-            bwd_saved_x_branch.data_ptr<float>(),
-            bwd_saved_z.data_ptr<float>(),
-            bwd_saved_dt.data_ptr<float>(),
-            pre_B_bwd.data_ptr<float>(),
-            pre_C_bwd.data_ptr<float>(),
-            N, d_model, d_inner, d_state
-        );
+        if (N >= GEMM_PRECOMPUTE_THRESHOLD) {
+            bilevel_precompute_gemm(
+                x_sorted_rev, mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
+                mamba_bwd_B_proj, mamba_bwd_C_proj,
+                bwd_saved_x_branch, bwd_saved_z, bwd_saved_dt,
+                pre_B_bwd, pre_C_bwd,
+                d_model, d_inner, d_state);
+        } else {
+            const int pre_grid = (N + SG2B_BLOCK - 1) / SG2B_BLOCK;
+            bilevel_precompute_kernel<<<pre_grid, SG2B_BLOCK>>>(
+                x_sorted_rev.data_ptr<float>(),
+                mamba_bwd_in_proj.data_ptr<float>(),
+                mamba_bwd_dt_W.data_ptr<float>(),
+                mamba_bwd_dt_b.data_ptr<float>(),
+                mamba_bwd_B_proj.data_ptr<float>(),
+                mamba_bwd_C_proj.data_ptr<float>(),
+                bwd_saved_x_branch.data_ptr<float>(),
+                bwd_saved_z.data_ptr<float>(),
+                bwd_saved_dt.data_ptr<float>(),
+                pre_B_bwd.data_ptr<float>(),
+                pre_C_bwd.data_ptr<float>(),
+                N, d_model, d_inner, d_state);
+        }
 
         // Backward direction: parallel scan with state saving
         bwd_scan_out.zero_();
@@ -3086,23 +3184,31 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
         // Precompute for all packed data (weights shared across params)
         auto pre_B = g_bilevel_ws.pre_B.narrow(0, 0, total_N);
         auto pre_C = g_bilevel_ws.pre_C.narrow(0, 0, total_N);
-        const int pre_grid = (total_N + SG2B_BLOCK - 1) / SG2B_BLOCK;
 
         // Forward precompute — outputs to saved_xb/z/dt directly
-        bilevel_precompute_kernel<<<pre_grid, SG2B_BLOCK>>>(
-            x_sorted_packed.data_ptr<float>(),
-            mamba_fwd_in_proj.data_ptr<float>(),
-            mamba_fwd_dt_W.data_ptr<float>(),
-            mamba_fwd_dt_b.data_ptr<float>(),
-            mamba_fwd_B_proj.data_ptr<float>(),
-            mamba_fwd_C_proj.data_ptr<float>(),
-            fwd_saved_xb_packed.data_ptr<float>(),
-            fwd_saved_z_packed.data_ptr<float>(),
-            fwd_saved_dt_packed.data_ptr<float>(),
-            pre_B.data_ptr<float>(),
-            pre_C.data_ptr<float>(),
-            total_N, d_model, d_inner, d_state
-        );
+        if (total_N >= GEMM_PRECOMPUTE_THRESHOLD) {
+            bilevel_precompute_gemm(
+                x_sorted_packed, mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
+                mamba_fwd_B_proj, mamba_fwd_C_proj,
+                fwd_saved_xb_packed, fwd_saved_z_packed, fwd_saved_dt_packed,
+                pre_B, pre_C,
+                d_model, d_inner, d_state);
+        } else {
+            const int pre_grid = (total_N + SG2B_BLOCK - 1) / SG2B_BLOCK;
+            bilevel_precompute_kernel<<<pre_grid, SG2B_BLOCK>>>(
+                x_sorted_packed.data_ptr<float>(),
+                mamba_fwd_in_proj.data_ptr<float>(),
+                mamba_fwd_dt_W.data_ptr<float>(),
+                mamba_fwd_dt_b.data_ptr<float>(),
+                mamba_fwd_B_proj.data_ptr<float>(),
+                mamba_fwd_C_proj.data_ptr<float>(),
+                fwd_saved_xb_packed.data_ptr<float>(),
+                fwd_saved_z_packed.data_ptr<float>(),
+                fwd_saved_dt_packed.data_ptr<float>(),
+                pre_B.data_ptr<float>(),
+                pre_C.data_ptr<float>(),
+                total_N, d_model, d_inner, d_state);
+        }
 
         // Forward parallel scan — single launch for all params
         fwd_scan_out_packed.zero_();
@@ -3149,20 +3255,29 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
         auto pre_B_bwd = g_bilevel_ws.pre_B.narrow(0, 0, total_N);
         auto pre_C_bwd = g_bilevel_ws.pre_C.narrow(0, 0, total_N);
 
-        bilevel_precompute_kernel<<<pre_grid, SG2B_BLOCK>>>(
-            x_sorted_rev_packed.data_ptr<float>(),
-            mamba_bwd_in_proj.data_ptr<float>(),
-            mamba_bwd_dt_W.data_ptr<float>(),
-            mamba_bwd_dt_b.data_ptr<float>(),
-            mamba_bwd_B_proj.data_ptr<float>(),
-            mamba_bwd_C_proj.data_ptr<float>(),
-            bwd_saved_xb_packed.data_ptr<float>(),
-            bwd_saved_z_packed.data_ptr<float>(),
-            bwd_saved_dt_packed.data_ptr<float>(),
-            pre_B_bwd.data_ptr<float>(),
-            pre_C_bwd.data_ptr<float>(),
-            total_N, d_model, d_inner, d_state
-        );
+        if (total_N >= GEMM_PRECOMPUTE_THRESHOLD) {
+            bilevel_precompute_gemm(
+                x_sorted_rev_packed, mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
+                mamba_bwd_B_proj, mamba_bwd_C_proj,
+                bwd_saved_xb_packed, bwd_saved_z_packed, bwd_saved_dt_packed,
+                pre_B_bwd, pre_C_bwd,
+                d_model, d_inner, d_state);
+        } else {
+            const int pre_grid = (total_N + SG2B_BLOCK - 1) / SG2B_BLOCK;
+            bilevel_precompute_kernel<<<pre_grid, SG2B_BLOCK>>>(
+                x_sorted_rev_packed.data_ptr<float>(),
+                mamba_bwd_in_proj.data_ptr<float>(),
+                mamba_bwd_dt_W.data_ptr<float>(),
+                mamba_bwd_dt_b.data_ptr<float>(),
+                mamba_bwd_B_proj.data_ptr<float>(),
+                mamba_bwd_C_proj.data_ptr<float>(),
+                bwd_saved_xb_packed.data_ptr<float>(),
+                bwd_saved_z_packed.data_ptr<float>(),
+                bwd_saved_dt_packed.data_ptr<float>(),
+                pre_B_bwd.data_ptr<float>(),
+                pre_C_bwd.data_ptr<float>(),
+                total_N, d_model, d_inner, d_state);
+        }
 
         // Backward parallel scan — single launch
         bwd_scan_out_packed.zero_();
