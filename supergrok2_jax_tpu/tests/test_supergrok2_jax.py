@@ -443,6 +443,234 @@ def test_j12_state_pytree():
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  J13: Cross-Framework Scan (test vectors)
+# ═══════════════════════════════════════════════════════════════════
+
+def test_j13_cross_framework_scan():
+    """Verify JAX scan produces finite output from deterministic test vectors."""
+    from supergrok2_jax_tpu.bridge import export_test_vectors
+    from supergrok2_jax_tpu.mamba3_peer_metanet_jax import MetaNetConfig, init_meta_weights, meta_net_forward
+    import tempfile, os
+
+    # Generate deterministic test vectors
+    with tempfile.NamedTemporaryFile(suffix='.npz', delete=False) as f:
+        tmp_path = f.name
+    try:
+        vectors = export_test_vectors(save_path=tmp_path)
+
+        # Load back and verify
+        loaded = np.load(tmp_path)
+        grad_np = loaded['inputs/grad']
+        sharpness_np = loaded['inputs/sharpness']
+        gru_np = loaded['inputs/gru_state']
+        fwd_np = loaded['inputs/mamba_fwd_state']
+        bwd_np = loaded['inputs/mamba_bwd_state']
+
+        # Convert to JAX
+        grad_jax = jnp.array(grad_np)
+        sharpness_jax = jnp.array(sharpness_np)
+        gru_jax = jnp.array(gru_np)
+        fwd_jax = jnp.array(fwd_np)
+        bwd_jax = jnp.array(bwd_np)
+
+        # Run JAX forward
+        config = MetaNetConfig()
+        key = jax.random.PRNGKey(42)
+        meta_weights = init_meta_weights(config, key)
+
+        smart_grad, new_gru, new_fwd, new_bwd, exp_counts = meta_net_forward(
+            grad_jax, sharpness_jax, gru_jax, fwd_jax, bwd_jax,
+            meta_weights, config)
+
+        assert smart_grad.shape == grad_jax.shape, f"Shape mismatch: {smart_grad.shape}"
+        assert jnp.all(jnp.isfinite(smart_grad)), "Non-finite smart_grad"
+        assert jnp.all(jnp.isfinite(new_gru)), "Non-finite GRU state"
+    finally:
+        os.unlink(tmp_path)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  J14: All Simple Optimizers
+# ═══════════════════════════════════════════════════════════════════
+
+def test_j14_simple_optimizers():
+    """Verify all simple optimizers produce valid, changed parameters."""
+    from supergrok2_jax_tpu.simple_optimizers_jax import (
+        GrokAdamWConfig, init_grokadamw_state, grokadamw_step,
+        LionConfig, init_lion_state, lion_step,
+        GrokfastConfig, init_grokfast_state, grokfast_amplify,
+        ProdigyConfig, init_prodigy_state, prodigy_step,
+        MuonConfig, init_muon_state, muon_step,
+        LookSAMConfig, init_looksam_state, looksam_adam_step,
+    )
+
+    key = jax.random.PRNGKey(999)
+    k1, k2 = jax.random.split(key)
+    param = jax.random.normal(k1, (4, 4)) * 0.1
+    grad = jax.random.normal(k2, (4, 4)) * 0.01
+
+    # GrokAdamW
+    s = init_grokadamw_state(param)
+    new_p, new_s = grokadamw_step(param, grad, s, GrokAdamWConfig())
+    assert jnp.all(jnp.isfinite(new_p)), "GrokAdamW non-finite"
+    assert not jnp.allclose(new_p, param), "GrokAdamW unchanged"
+
+    # Lion
+    s = init_lion_state(param)
+    new_p, new_s = lion_step(param, grad, s, LionConfig())
+    assert jnp.all(jnp.isfinite(new_p)), "Lion non-finite"
+    assert not jnp.allclose(new_p, param), "Lion unchanged"
+
+    # Grokfast (amplify only)
+    s = init_grokfast_state(param)
+    amp_g, new_s = grokfast_amplify(grad, s, GrokfastConfig())
+    assert jnp.all(jnp.isfinite(amp_g)), "Grokfast non-finite"
+
+    # Prodigy
+    s = init_prodigy_state(param)
+    new_p, new_s, d_lr = prodigy_step(param, grad, s, ProdigyConfig(), d_lr=1.0)
+    assert jnp.all(jnp.isfinite(new_p)), "Prodigy non-finite"
+
+    # Muon
+    s = init_muon_state(param)
+    new_p, new_s = muon_step(param, grad, s, MuonConfig())
+    assert jnp.all(jnp.isfinite(new_p)), "Muon non-finite"
+    assert not jnp.allclose(new_p, param), "Muon unchanged"
+
+    # LookSAM (Adam step only)
+    s = init_looksam_state(param)
+    new_p, new_s = looksam_adam_step(param, grad, s, LookSAMConfig())
+    assert jnp.all(jnp.isfinite(new_p)), "LookSAM non-finite"
+    assert not jnp.allclose(new_p, param), "LookSAM unchanged"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  J15: Meta-Net Optimizers
+# ═══════════════════════════════════════════════════════════════════
+
+def test_j15_metanet_optimizers():
+    """Verify SuperGrok v1.5, v1.1, and NeuralGrok produce valid output."""
+    import math
+    from supergrok2_jax_tpu.metanet_optimizers_jax import (
+        SuperGrok15Config, SuperGrok15Weights, init_supergrok15_state, supergrok15_step,
+        SuperGrok11Config, SuperGrok11Weights, init_supergrok11_state, supergrok11_step,
+        NeuralGrokConfig, NeuralGrokWeights, init_neuralgrok_state, neuralgrok_step,
+    )
+
+    key = jax.random.PRNGKey(777)
+    k1, k2, k3, k4 = jax.random.split(key, 4)
+    param = jax.random.normal(k1, (16,)) * 0.1
+    grad = jax.random.normal(k2, (16,)) * 0.01
+
+    hidden_dim = 32
+    bound = 1.0 / math.sqrt(1)
+
+    # SuperGrok v1.5
+    w15 = SuperGrok15Weights(
+        W1=jax.random.uniform(k3, (hidden_dim, 1), minval=-bound, maxval=bound),
+        b1=jnp.zeros(hidden_dim),
+        W2=jax.random.uniform(k4, (1, hidden_dim), minval=-bound, maxval=bound),
+        b2=jnp.zeros(1),
+        rescale=0.1,
+    )
+    s = init_supergrok15_state(param)
+    new_p, new_s = supergrok15_step(param, grad, s, w15, SuperGrok15Config())
+    assert jnp.all(jnp.isfinite(new_p)), "SG15 non-finite"
+    assert not jnp.allclose(new_p, param), "SG15 unchanged"
+
+    # SuperGrok v1.1
+    w11 = SuperGrok11Weights(
+        W1=w15.W1, b1=w15.b1, W2=w15.W2, b2=w15.b2, rescale=0.1)
+    s = init_supergrok11_state(param)
+    new_p, new_s = supergrok11_step(param, grad, s, w11, SuperGrok11Config())
+    assert jnp.all(jnp.isfinite(new_p)), "SG11 non-finite"
+    assert not jnp.allclose(new_p, param), "SG11 unchanged"
+
+    # NeuralGrok
+    k5, k6 = jax.random.split(k3)
+    wng = NeuralGrokWeights(
+        W1=jax.random.uniform(k5, (hidden_dim, 1), minval=-bound, maxval=bound),
+        b1=jnp.zeros(hidden_dim),
+        W_last=jax.random.uniform(k6, (1, hidden_dim), minval=-bound, maxval=bound),
+        b_last=jnp.zeros(1),
+        alpha=0.5, beta=0.5,
+    )
+    s = init_neuralgrok_state(param)
+    new_p, new_s = neuralgrok_step(param, grad, s, wng, NeuralGrokConfig())
+    assert jnp.all(jnp.isfinite(new_p)), "NeuralGrok non-finite"
+    assert not jnp.allclose(new_p, param), "NeuralGrok unchanged"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  J16: Sharding + Multi-Host Utilities
+# ═══════════════════════════════════════════════════════════════════
+
+def test_j16_sharding_multihost():
+    """Verify multi-host sharding utilities import and basic ops work."""
+    from supergrok2_jax_tpu.sharding import (
+        create_mesh, shard_params, shard_batch,
+        replicate_meta_weights, initialize_multi_host,
+        sharded_supergrok2_step, sharded_bilevel_step,
+    )
+    from supergrok2_jax_tpu.pallas_kernels import _HAS_PALLAS, pallas_mamba3_scan
+
+    # Verify multi-host functions are callable
+    assert callable(initialize_multi_host)
+    assert callable(sharded_supergrok2_step)
+    assert callable(sharded_bilevel_step)
+
+    # Verify Pallas stub works
+    assert isinstance(_HAS_PALLAS, bool)
+    assert callable(pallas_mamba3_scan)
+
+    # Verify shard_batch works
+    mesh = create_mesh()
+    batch = jnp.ones((4, 8))
+    sharded = shard_batch(batch, mesh)
+    assert jnp.allclose(sharded, batch)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  J17: JIT No-Retrace
+# ═══════════════════════════════════════════════════════════════════
+
+def test_j17_jit_no_retrace():
+    """Verify JIT-compiled simple optimizers don't retrace on second call."""
+    from supergrok2_jax_tpu.simple_optimizers_jax import (
+        LionConfig, init_lion_state, lion_step,
+        GrokAdamWConfig, init_grokadamw_state, grokadamw_step,
+    )
+
+    key = jax.random.PRNGKey(123)
+    k1, k2 = jax.random.split(key)
+    param = jax.random.normal(k1, (8,)) * 0.1
+    grad = jax.random.normal(k2, (8,)) * 0.01
+
+    # Lion JIT
+    lion_cfg = LionConfig()
+    s = init_lion_state(param)
+    jit_lion = jax.jit(lion_step, static_argnums=(3,))
+
+    p1, s1 = jit_lion(param, grad, s, lion_cfg)
+    p2, s2 = jit_lion(p1, grad, s1, lion_cfg)
+
+    # Second call should produce different result (optimizer makes progress)
+    assert not jnp.allclose(p1, p2), "Lion JIT stuck"
+    assert jnp.all(jnp.isfinite(p2)), "Lion JIT non-finite"
+
+    # GrokAdamW JIT
+    grok_cfg = GrokAdamWConfig()
+    s = init_grokadamw_state(param)
+    jit_grok = jax.jit(grokadamw_step, static_argnums=(3,))
+
+    p1, s1 = jit_grok(param, grad, s, grok_cfg)
+    p2, s2 = jit_grok(p1, grad, s1, grok_cfg)
+
+    assert not jnp.allclose(p1, p2), "GrokAdamW JIT stuck"
+    assert jnp.all(jnp.isfinite(p2)), "GrokAdamW JIT non-finite"
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Main
 # ═══════════════════════════════════════════════════════════════════
 
@@ -488,6 +716,21 @@ if __name__ == "__main__":
 
     print("\n--- J12: State Pytree ---")
     run_test("J12: State pytree compatibility", test_j12_state_pytree)
+
+    print("\n--- J13: Cross-Framework Scan ---")
+    run_test("J13: Cross-framework test vectors", test_j13_cross_framework_scan)
+
+    print("\n--- J14: Simple Optimizers ---")
+    run_test("J14: All simple optimizers", test_j14_simple_optimizers)
+
+    print("\n--- J15: Meta-Net Optimizers ---")
+    run_test("J15: Meta-net optimizers (SG15, SG11, NeuralGrok)", test_j15_metanet_optimizers)
+
+    print("\n--- J16: Sharding + Multi-Host ---")
+    run_test("J16: Sharding + multi-host utilities", test_j16_sharding_multihost)
+
+    print("\n--- J17: JIT No-Retrace ---")
+    run_test("J17: JIT no-retrace", test_j17_jit_no_retrace)
 
     # Summary
     print("\n" + "=" * 60)

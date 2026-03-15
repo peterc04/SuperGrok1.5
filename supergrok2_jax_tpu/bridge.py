@@ -171,37 +171,74 @@ def jax_weights_to_pytorch(
 
 
 def export_test_vectors(
-    meta_net_pytorch,
-    grad,
-    sharpness,
-    gru_state,
-    mamba_fwd_state,
-    mamba_bwd_state,
+    meta_net_pytorch=None,
+    grad=None,
+    sharpness=None,
+    gru_state=None,
+    mamba_fwd_state=None,
+    mamba_bwd_state=None,
+    save_path=None,
 ) -> Dict:
     """Export input/output pairs for cross-framework testing.
 
-    Runs the PyTorch forward pass and captures all inputs and outputs
-    as numpy arrays for comparison with the JAX implementation.
+    Two modes:
+      1. With meta_net_pytorch + tensors: runs PyTorch forward and captures I/O
+      2. With save_path only: generates deterministic test vectors and saves to .npz
 
     Args:
-        meta_net_pytorch: PyTorch Mamba3PEERMetaNet
-        grad: [N] tensor
-        sharpness: [N] tensor
-        gru_state: [N, gru_hidden] tensor
-        mamba_fwd_state: [d_inner, d_state] tensor
-        mamba_bwd_state: [d_inner, d_state] tensor
+        meta_net_pytorch: PyTorch Mamba3PEERMetaNet (mode 1)
+        grad: [N] tensor (mode 1)
+        sharpness: [N] tensor (mode 1)
+        gru_state: [N, gru_hidden] tensor (mode 1)
+        mamba_fwd_state: [d_inner, d_state] tensor (mode 1)
+        mamba_bwd_state: [d_inner, d_state] tensor (mode 1)
+        save_path: if provided, save vectors to this .npz path (mode 2)
 
     Returns:
         dict with 'inputs' and 'outputs' sub-dicts of numpy arrays
     """
-    import torch
     import numpy as np
+
+    # Mode 2: standalone test vector generation (no PyTorch needed)
+    if meta_net_pytorch is None and save_path is not None:
+        rng = np.random.RandomState(42)
+        N = 64
+        d_model, d_state, d_inner, gru_hidden = 8, 16, 16, 4
+
+        vectors = {
+            'inputs': {
+                'grad': rng.randn(N).astype(np.float32) * 0.1,
+                'sharpness': np.abs(rng.randn(N).astype(np.float32)) * 0.01,
+                'gru_state': np.zeros((N, gru_hidden), dtype=np.float32),
+                'mamba_fwd_state': np.zeros((d_inner, d_state), dtype=np.float32),
+                'mamba_bwd_state': np.zeros((d_inner, d_state), dtype=np.float32),
+            },
+            'config': {
+                'N': N,
+                'd_model': d_model,
+                'd_state': d_state,
+                'd_inner': d_inner,
+                'gru_hidden': gru_hidden,
+            },
+        }
+
+        # Flatten for npz save
+        flat = {}
+        for section in vectors:
+            for key, val in vectors[section].items():
+                flat[f"{section}/{key}"] = np.array(val) if not isinstance(val, np.ndarray) else val
+
+        np.savez(save_path, **flat)
+        return vectors
+
+    # Mode 1: PyTorch forward pass capture
+    import torch
 
     with torch.no_grad():
         smart_grad, new_gru, new_fwd, new_bwd = meta_net_pytorch.forward_for_bilevel(
             grad, sharpness, gru_state, mamba_fwd_state, mamba_bwd_state)
 
-    return {
+    result = {
         'inputs': {
             'grad': grad.cpu().numpy(),
             'sharpness': sharpness.cpu().numpy(),
@@ -216,3 +253,13 @@ def export_test_vectors(
             'new_mamba_bwd_state': new_bwd.detach().cpu().numpy(),
         },
     }
+
+    if save_path is not None:
+        import numpy as np
+        flat = {}
+        for section in result:
+            for key, val in result[section].items():
+                flat[f"{section}/{key}"] = val
+        np.savez(save_path, **flat)
+
+    return result
