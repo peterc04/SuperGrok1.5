@@ -63,7 +63,7 @@ Additional features: dynamic expert recycling, sigmoid-driven SAM/bilevel/WD sch
 python tests/test_supergrok2.py
 ```
 
-The test suite (`test_supergrok2.py`) covers 27 areas:
+The PyTorch test suite (`test_supergrok2.py`) covers 27 areas (plus 12 JAX tests in `supergrok2_jax_tpu/tests/`):
 
 | Test | Description |
 |------|-------------|
@@ -138,7 +138,20 @@ Each test reports PASS/FAIL. Exit code 0 = all pass, 1 = any failure.
 │   ├── cpu/                                    # CPU fallback kernels (future)
 │   └── quantization/                           # Quantization kernels (future)
 │
-├── jax/                                        # TPU/JAX implementation (future)
+├── supergrok2_jax_tpu/                          # TPU/JAX implementation
+│   ├── __init__.py                              # Package exports
+│   ├── scan.py                                  # Mamba-3 scan via lax.associative_scan
+│   ├── gru.py                                   # Per-element GRU cell
+│   ├── peer.py                                  # Multi-head PEER routing (soft + hard)
+│   ├── mamba3_peer_metanet_jax.py               # Full meta-net forward pass
+│   ├── supergrok2_jax.py                        # Optimizer step (functional)
+│   ├── bilevel.py                               # Bilevel optimization via jax.grad
+│   ├── sharding.py                              # TPU mesh + data-parallel sharding
+│   ├── quantization_jax.py                      # INT8 quantization utilities
+│   ├── bridge.py                                # PyTorch <-> JAX weight conversion
+│   ├── pallas_kernels.py                        # Pallas custom kernels (placeholder)
+│   └── tests/
+│       └── test_supergrok2_jax.py               # 12-test JAX test suite
 │
 ├── grokking_optimizers/                        # Python package
 │   ├── __init__.py                             # Package exports
@@ -308,6 +321,70 @@ Features:
 - **torch.compile support**: Optional `enable_compile=True` for `torch.compile` integration.
 
 The low-level `step_compiled()` method on `SuperGrok2` is also available for custom graph capture pipelines.
+
+## JAX / TPU Support
+
+A complete JAX rewrite of SuperGrok v2 for TPU (and JAX-on-GPU). Uses JAX native primitives instead of CUDA kernels.
+
+### Key Differences from PyTorch/CUDA
+
+| Feature | PyTorch/CUDA | JAX/TPU |
+|---------|-------------|---------|
+| Mamba scan | Sequential CUDA kernel (Blelloch parallel for N>=256) | `lax.associative_scan` (O(log N) depth) |
+| Bilevel backward | 1000+ lines of custom backward CUDA kernels | `jax.grad` (automatic differentiation) |
+| State management | In-place mutation (`tensor.mul_()`) | Functional (explicit state in, state out) |
+| Compilation | `torch.compile` / CUDA graphs | `jax.jit` (XLA compilation) |
+| Multi-device | DDP/FSDP | `jax.sharding.Mesh` with data-parallel axis |
+
+### Usage
+
+```python
+import jax
+import jax.numpy as jnp
+from supergrok2_jax_tpu import (
+    OptimizerConfig, MetaNetConfig,
+    init_state, init_meta_weights, supergrok2_step,
+)
+
+# Initialize
+config = OptimizerConfig(lr=1e-3)
+meta_config = MetaNetConfig()
+key = jax.random.PRNGKey(0)
+meta_weights = init_meta_weights(meta_config, key)
+opt_state = init_state(params, config, meta_config)
+
+# Training step (JIT-compatible)
+@jax.jit
+def train_step(params, grads, opt_state, meta_weights):
+    return supergrok2_step(params, grads, opt_state, meta_weights, config, meta_config)
+
+new_params, new_opt_state = train_step(params, grads, opt_state, meta_weights)
+```
+
+### PyTorch <-> JAX Bridge
+
+```python
+from supergrok2_jax_tpu import pytorch_weights_to_jax, jax_weights_to_pytorch
+
+# Convert trained PyTorch meta-net to JAX
+jax_weights = pytorch_weights_to_jax(pytorch_meta_net)
+
+# Convert back
+jax_weights_to_pytorch(jax_weights, pytorch_meta_net)
+```
+
+### JAX Tests
+
+```bash
+python supergrok2_jax_tpu/tests/test_supergrok2_jax.py
+```
+
+12 tests covering: imports, associative scan operator, Mamba scan, GRU cell, PEER routing, full forward, optimizer step, bilevel gradients, JIT compilation, INT8 quantization, sharding, and pytree compatibility.
+
+### Requirements (JAX)
+
+- JAX 0.4+ (`pip install jax[tpu]` for TPU, `pip install jax[cuda12]` for GPU)
+- NumPy
 
 ## Requirements
 
