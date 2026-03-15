@@ -163,6 +163,31 @@ Key SuperGrok v2 hyperparameters (defaults):
 | `sam_rho` | 0.05 | SAM perturbation radius |
 | `recycle_interval` | 100 | Steps between dead expert recycling |
 | `bilevel_checkpoint_interval` | 1 | Checkpoint interval for bilevel gradient checkpointing (1 = save every step, 32 = save every 32 steps) |
+| `projection_precision` | `'auto'` | Precision for projection GEMMs: `'fp32'`, `'tf32'`, `'bf16'`, `'fp8'`, or `'auto'` |
+
+## Hardware Support
+
+Kernels are tiered by GPU architecture for automatic hardware-specific optimization:
+
+| Tier | Architectures | Key Features |
+|------|--------------|--------------|
+| **Generic** | sm_70, sm_75 (V100, T4) | FP32 only, basic smem |
+| **Ampere** | sm_80, sm_86, sm_89 (A100, RTX 3090, L4, RTX 4090) | TF32 Tensor Cores, cp.async, 192KB smem, BF16 |
+| **Hopper** | sm_90, sm_100 (H100, B200) | All Ampere features + TMA, FP8 Tensor Cores (future), 228KB smem |
+
+Runtime dispatch is automatic — the optimal kernel tier is selected based on the detected GPU.
+
+## Quantization
+
+Projection GEMMs support multi-precision via `projection_precision`:
+
+| Format | Where | Benefit |
+|--------|-------|---------|
+| TF32 | Projections on sm_80+ | 2x FP32 throughput, transparent via cuBLAS |
+| BF16 | Projections on sm_80+ | Same range as FP32, 2x bandwidth |
+| FP8 (E4M3) | Projections on sm_89+/sm_90+ | 4x throughput vs FP32 on Tensor Cores |
+
+Scan state accumulation always stays FP32 (numerical necessity for long recurrences). Expert weights stay FP32 (already in shared memory).
 
 ## Multi-GPU
 

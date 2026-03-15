@@ -30,12 +30,11 @@ ext = CUDAExtension(
     name="grokking_optimizers._ops",
     sources=[
         "csrc/common/ops.cpp",
-        # SuperGrok family
+        # Generic CUDA kernels (architecture-independent)
         "csrc/cuda/generic/supergrok15_kernels.cu",
         "csrc/cuda/generic/supergrok11_kernels.cu",
         "csrc/cuda/generic/supergrok2_mamba_peer_kernels.cu",
         "csrc/cuda/generic/supergrok2_mamba_peer_backward_kernels.cu",
-        # Other optimizers
         "csrc/cuda/generic/grokadamw_kernels.cu",
         "csrc/cuda/generic/neuralgrok_kernels.cu",
         "csrc/cuda/generic/prodigy_kernels.cu",
@@ -43,6 +42,12 @@ ext = CUDAExtension(
         "csrc/cuda/generic/lion_kernels.cu",
         "csrc/cuda/generic/looksam_kernels.cu",
         "csrc/cuda/generic/muon_kernels.cu",
+        # Ampere-optimized kernels (sm_80+: TF32, cp.async)
+        "csrc/cuda/sm_80/supergrok2_scan_sm80.cu",
+        "csrc/cuda/sm_80/supergrok2_backward_sm80.cu",
+        # Hopper-optimized kernels (sm_90+: delegates to Ampere for now)
+        "csrc/cuda/sm_90/supergrok2_scan_sm90.cu",
+        "csrc/cuda/sm_90/supergrok2_backward_sm90.cu",
     ],
     include_dirs=["csrc/common", "csrc"],
     define_macros=[("WITH_CUDA", None)],

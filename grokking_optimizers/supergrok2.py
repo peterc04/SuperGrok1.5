@@ -91,6 +91,7 @@ class SuperGrok2(Optimizer):
         wd_thresh: float = 0.9,
         sam_enable_threshold: float = 0.0,
         bilevel_checkpoint_interval: int = 1,
+        projection_precision: str = 'auto',
     ):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
@@ -108,6 +109,11 @@ class SuperGrok2(Optimizer):
         self.zero_loss_threshold = zero_loss_threshold
         self.zero_acc_threshold = zero_acc_threshold
         self.sam_rho = sam_rho
+
+        # Precision configuration for projection GEMMs
+        from .quantization import PrecisionConfig
+        self.precision_config = PrecisionConfig(
+            projection_precision=projection_precision)
 
         # Meta-net hyperparams
         self.d_model = d_model

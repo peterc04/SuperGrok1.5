@@ -12,6 +12,7 @@
  */
 
 #include "ops.h"
+#include "dispatch.h"
 #include <cmath>
 #include <algorithm>
 #include <stdexcept>
@@ -784,7 +785,11 @@ void supergrok2_mamba_peer_step(
 
 #ifdef WITH_CUDA
     if (param.is_cuda()) {
-        launch_mamba3_peer_step(
+        auto tier = get_arch_tier();
+        auto dispatch_fn = (tier == ArchTier::HOPPER)  ? launch_mamba3_peer_step_hopper :
+                           (tier == ArchTier::AMPERE)   ? launch_mamba3_peer_step_ampere :
+                                                          launch_mamba3_peer_step;
+        dispatch_fn(
             param, grad, sharpness, exp_avg, exp_avg_sq, mu,
             gru_state, mamba_fwd_state, mamba_bwd_state,
             input_proj_W, input_proj_b,
@@ -850,7 +855,11 @@ void supergrok2_mamba_peer_batched_step(
     if (params.empty()) return;
 #ifdef WITH_CUDA
     if (params[0].is_cuda()) {
-        launch_mamba3_peer_batched_step(
+        auto tier = get_arch_tier();
+        auto dispatch_fn = (tier == ArchTier::HOPPER)  ? launch_mamba3_peer_batched_step_hopper :
+                           (tier == ArchTier::AMPERE)   ? launch_mamba3_peer_batched_step_ampere :
+                                                          launch_mamba3_peer_batched_step;
+        dispatch_fn(
             params, grads, sharpness_list, exp_avgs, exp_avg_sqs, mus,
             gru_states, mamba_fwd_states, mamba_bwd_states,
             input_proj_W, input_proj_b,
@@ -885,9 +894,116 @@ void supergrok2_mamba_peer_batched_step(
 // The actual heavy lifting is in supergrok2_mamba_peer_backward_kernels.cu.
 // No CPU fallback — bilevel always runs on CUDA.
 
-// (The launch_mamba3_peer_bilevel_fwd_save and launch_mamba3_peer_backward
-//  functions are called directly via pybind11 — no extra wrapper needed
-//  since they already have the right signatures.)
+// Dispatch wrappers for bilevel batched operations.
+// These select the correct tier launcher based on GPU architecture.
+
+#ifdef WITH_CUDA
+static void dispatch_bilevel_fwd_save_batched(
+    std::vector<torch::Tensor> grads,
+    std::vector<torch::Tensor> sharpness_list,
+    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
+    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
+    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
+    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
+    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
+    torch::Tensor mamba_fwd_out_proj,
+    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
+    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
+    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
+    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
+    torch::Tensor mamba_bwd_out_proj,
+    int d_model, int d_state, int d_inner,
+    torch::Tensor fwd_scan_out_packed, torch::Tensor bwd_scan_out_packed,
+    torch::Tensor fwd_saved_states_packed, torch::Tensor fwd_saved_xb_packed,
+    torch::Tensor fwd_saved_z_packed, torch::Tensor fwd_saved_dt_packed,
+    torch::Tensor bwd_saved_states_packed, torch::Tensor bwd_saved_xb_packed,
+    torch::Tensor bwd_saved_z_packed, torch::Tensor bwd_saved_dt_packed,
+    torch::Tensor x_sorted_packed, torch::Tensor offsets_t,
+    torch::Tensor sort_indices_packed,
+    torch::Tensor fwd_initial_states, torch::Tensor bwd_initial_states,
+    int checkpoint_interval
+) {
+    auto tier = get_arch_tier();
+    auto fn = (tier == ArchTier::HOPPER)  ? launch_mamba3_peer_bilevel_fwd_save_batched_hopper :
+              (tier == ArchTier::AMPERE)   ? launch_mamba3_peer_bilevel_fwd_save_batched_ampere :
+                                             launch_mamba3_peer_bilevel_fwd_save_batched;
+    fn(grads, sharpness_list,
+       input_proj_W, input_proj_b,
+       mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
+       mamba_fwd_B_proj, mamba_fwd_C_proj, mamba_fwd_A_log,
+       mamba_fwd_D, mamba_fwd_rope, mamba_fwd_out_proj,
+       mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
+       mamba_bwd_B_proj, mamba_bwd_C_proj, mamba_bwd_A_log,
+       mamba_bwd_D, mamba_bwd_rope, mamba_bwd_out_proj,
+       d_model, d_state, d_inner,
+       fwd_scan_out_packed, bwd_scan_out_packed,
+       fwd_saved_states_packed, fwd_saved_xb_packed,
+       fwd_saved_z_packed, fwd_saved_dt_packed,
+       bwd_saved_states_packed, bwd_saved_xb_packed,
+       bwd_saved_z_packed, bwd_saved_dt_packed,
+       x_sorted_packed, offsets_t, sort_indices_packed,
+       fwd_initial_states, bwd_initial_states,
+       checkpoint_interval);
+}
+
+static void dispatch_bilevel_backward_batched(
+    torch::Tensor d_fwd_scan_out_packed, torch::Tensor d_bwd_scan_out_packed,
+    torch::Tensor x_sorted_packed,
+    torch::Tensor fwd_saved_states_packed, torch::Tensor fwd_saved_xb_packed,
+    torch::Tensor fwd_saved_z_packed, torch::Tensor fwd_saved_dt_packed,
+    torch::Tensor bwd_saved_states_packed, torch::Tensor bwd_saved_xb_packed,
+    torch::Tensor bwd_saved_z_packed, torch::Tensor bwd_saved_dt_packed,
+    torch::Tensor offsets_t,
+    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
+    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
+    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
+    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
+    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
+    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
+    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
+    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
+    torch::Tensor d_mamba_fwd_in_proj, torch::Tensor d_mamba_fwd_dt_W,
+    torch::Tensor d_mamba_fwd_dt_b, torch::Tensor d_mamba_fwd_B_proj,
+    torch::Tensor d_mamba_fwd_C_proj, torch::Tensor d_mamba_fwd_A_log,
+    torch::Tensor d_mamba_fwd_D, torch::Tensor d_mamba_fwd_rope,
+    torch::Tensor d_mamba_bwd_in_proj, torch::Tensor d_mamba_bwd_dt_W,
+    torch::Tensor d_mamba_bwd_dt_b, torch::Tensor d_mamba_bwd_B_proj,
+    torch::Tensor d_mamba_bwd_C_proj, torch::Tensor d_mamba_bwd_A_log,
+    torch::Tensor d_mamba_bwd_D, torch::Tensor d_mamba_bwd_rope,
+    torch::Tensor d_x_sorted_packed,
+    torch::Tensor fwd_initial_states, torch::Tensor bwd_initial_states,
+    int d_model, int d_state, int d_inner, int num_params,
+    int checkpoint_interval
+) {
+    auto tier = get_arch_tier();
+    auto fn = (tier == ArchTier::HOPPER)  ? launch_mamba3_peer_backward_batched_hopper :
+              (tier == ArchTier::AMPERE)   ? launch_mamba3_peer_backward_batched_ampere :
+                                             launch_mamba3_peer_backward_batched;
+    fn(d_fwd_scan_out_packed, d_bwd_scan_out_packed,
+       x_sorted_packed,
+       fwd_saved_states_packed, fwd_saved_xb_packed,
+       fwd_saved_z_packed, fwd_saved_dt_packed,
+       bwd_saved_states_packed, bwd_saved_xb_packed,
+       bwd_saved_z_packed, bwd_saved_dt_packed,
+       offsets_t,
+       mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
+       mamba_fwd_B_proj, mamba_fwd_C_proj, mamba_fwd_A_log,
+       mamba_fwd_D, mamba_fwd_rope,
+       mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
+       mamba_bwd_B_proj, mamba_bwd_C_proj, mamba_bwd_A_log,
+       mamba_bwd_D, mamba_bwd_rope,
+       d_mamba_fwd_in_proj, d_mamba_fwd_dt_W, d_mamba_fwd_dt_b,
+       d_mamba_fwd_B_proj, d_mamba_fwd_C_proj, d_mamba_fwd_A_log,
+       d_mamba_fwd_D, d_mamba_fwd_rope,
+       d_mamba_bwd_in_proj, d_mamba_bwd_dt_W, d_mamba_bwd_dt_b,
+       d_mamba_bwd_B_proj, d_mamba_bwd_C_proj, d_mamba_bwd_A_log,
+       d_mamba_bwd_D, d_mamba_bwd_rope,
+       d_x_sorted_packed,
+       fwd_initial_states, bwd_initial_states,
+       d_model, d_state, d_inner, num_params,
+       checkpoint_interval);
+}
+#endif  // WITH_CUDA
 
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -896,6 +1012,18 @@ void supergrok2_mamba_peer_batched_step(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "Grokking Optimizers — C++/CUDA fused operations for all optimizers";
+
+    // ── Runtime dispatch info ────────────────────────────────────────
+    m.def("get_sm_arch", &get_sm_arch,
+          "Get GPU SM architecture as integer (e.g. 80 for A100)");
+    m.def("get_arch_tier_name", []() -> std::string {
+        auto tier = get_arch_tier();
+        switch (tier) {
+            case ArchTier::HOPPER:  return "hopper";
+            case ArchTier::AMPERE:  return "ampere";
+            default:                return "generic";
+        }
+    }, "Get architecture tier name: 'generic', 'ampere', or 'hopper'");
 
     // ── SuperGrok v1.5 ───────────────────────────────────────────────
     m.def("supergrok15_fused_step", &supergrok15_fused_step,
@@ -1076,12 +1204,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("supergrok2_bilevel_backward", &launch_mamba3_peer_backward,
           "SuperGrok2 bilevel: full backward through meta-net");
 
-    // ── SuperGrok v2 Batched Bilevel Forward-Save ─────────────────────
-    m.def("supergrok2_bilevel_fwd_save_batched", &launch_mamba3_peer_bilevel_fwd_save_batched,
+    // ── SuperGrok v2 Batched Bilevel Forward-Save (with dispatch) ──────
+    m.def("supergrok2_bilevel_fwd_save_batched", &dispatch_bilevel_fwd_save_batched,
           "SuperGrok2 bilevel: batched forward scan with state saving");
 
-    // ── SuperGrok v2 Batched Bilevel Backward ─────────────────────────
-    m.def("supergrok2_bilevel_backward_batched", &launch_mamba3_peer_backward_batched,
+    // ── SuperGrok v2 Batched Bilevel Backward (with dispatch) ─────────
+    m.def("supergrok2_bilevel_backward_batched", &dispatch_bilevel_backward_batched,
           "SuperGrok2 bilevel: batched backward through scan");
 #endif
 }

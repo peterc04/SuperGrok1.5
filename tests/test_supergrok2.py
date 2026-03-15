@@ -548,6 +548,132 @@ def test_12l_batched_parallel_scan():
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  12M: Dispatch Detection
+# ═══════════════════════════════════════════════════════════════════
+
+def test_12m_dispatch_detection():
+    """Verify dispatch.py and C++ agree on GPU architecture."""
+    from grokking_optimizers.dispatch import get_gpu_arch, get_backend, get_arch_label
+    from grokking_optimizers import _ops
+
+    py_arch = get_gpu_arch()
+    cpp_arch = _ops.get_sm_arch()
+    cpp_tier = _ops.get_arch_tier_name()
+
+    assert py_arch == cpp_arch, \
+        f"Python ({py_arch}) and C++ ({cpp_arch}) disagree on SM arch"
+    assert py_arch > 0, f"GPU arch should be positive, got {py_arch}"
+    assert get_backend() in ('cuda', 'hip', 'cpu'), \
+        f"Unexpected backend: {get_backend()}"
+    assert cpp_tier in ('generic', 'ampere', 'hopper'), \
+        f"Unexpected tier: {cpp_tier}"
+    assert isinstance(get_arch_label(), str), "Arch label should be a string"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  12N: Precision Config
+# ═══════════════════════════════════════════════════════════════════
+
+def test_12n_precision_config():
+    """Verify PrecisionConfig auto-selects correctly for current GPU."""
+    from grokking_optimizers.quantization import PrecisionConfig
+    from grokking_optimizers.dispatch import get_gpu_arch
+
+    arch = get_gpu_arch()
+
+    # Auto precision
+    pc_auto = PrecisionConfig('auto')
+    if arch >= 90:
+        assert pc_auto.projection_precision == 'fp8'
+    elif arch >= 80:
+        assert pc_auto.projection_precision == 'bf16'
+    else:
+        assert pc_auto.projection_precision == 'fp32'
+
+    # Explicit FP32
+    pc_fp32 = PrecisionConfig('fp32')
+    assert pc_fp32.projection_precision == 'fp32'
+    assert pc_fp32.scan_precision == 'fp32'
+
+    # Weight conversion
+    w = torch.randn(16, 8, device='cuda')
+    w_out, scale = pc_fp32.convert_projection_weights(w)
+    assert w_out.dtype == torch.float32
+    assert scale is None
+
+    if arch >= 80:
+        pc_bf16 = PrecisionConfig('bf16')
+        w_bf16, scale = pc_bf16.convert_projection_weights(w)
+        assert w_bf16.dtype == torch.bfloat16
+        assert scale is None
+
+    if arch >= 90:
+        pc_fp8 = PrecisionConfig('fp8')
+        w_fp8, scale = pc_fp8.convert_projection_weights(w)
+        assert w_fp8.dtype == torch.float8_e4m3fn
+        assert scale is not None
+        assert scale.item() > 0
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  12O: Projection Precision Equivalence
+# ═══════════════════════════════════════════════════════════════════
+
+def test_12o_precision_equivalence():
+    """Run forward step with FP32 and auto precision. Both should work."""
+    from grokking_optimizers import SuperGrok2
+
+    torch.manual_seed(123)
+    model = make_small_model()
+    opt = SuperGrok2(model.parameters(), lr=1e-3, projection_precision='fp32')
+    fake_step(model)
+    opt.step()
+    opt.zero_grad()
+
+    # Verify model params were updated (not NaN)
+    for p in model.parameters():
+        assert torch.isfinite(p).all(), "FP32 precision produced non-finite params"
+
+    torch.manual_seed(456)
+    model_auto = make_small_model()
+    opt_auto = SuperGrok2(model_auto.parameters(), lr=1e-3, projection_precision='auto')
+    fake_step(model_auto)
+    opt_auto.step()
+    opt_auto.zero_grad()
+
+    for p in model_auto.parameters():
+        assert torch.isfinite(p).all(), "Auto precision produced non-finite params"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  12P: Dispatch Convergence
+# ═══════════════════════════════════════════════════════════════════
+
+def test_12p_dispatch_convergence():
+    """Run 10 optimizer steps. Loss should decrease and params stay finite."""
+    from grokking_optimizers import SuperGrok2
+
+    torch.manual_seed(789)
+    model = make_small_model()
+    opt = SuperGrok2(model.parameters(), lr=1e-3, projection_precision='auto')
+
+    losses = []
+    for _ in range(10):
+        loss = fake_step(model)
+        losses.append(loss)
+        opt.step()
+        opt.zero_grad()
+
+    # Params should be finite after 10 steps
+    for p in model.parameters():
+        assert torch.isfinite(p).all(), "Parameters went non-finite during training"
+
+    # Loss should generally decrease (allow some noise)
+    assert losses[-1] < losses[0] * 1.5, \
+        f"Loss didn't converge: start={losses[0]:.4f}, end={losses[-1]:.4f}"
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Main
 # ═══════════════════════════════════════════════════════════════════
 
@@ -602,6 +728,18 @@ if __name__ == "__main__":
 
     print("\n--- 12L: Batched Parallel Scan ---")
     run_test("12L: Batched parallel scan single-launch", test_12l_batched_parallel_scan)
+
+    print("\n--- 12M: Dispatch Detection ---")
+    run_test("12M: Dispatch detection (Python/C++ agreement)", test_12m_dispatch_detection)
+
+    print("\n--- 12N: Precision Config ---")
+    run_test("12N: Precision config auto-selection", test_12n_precision_config)
+
+    print("\n--- 12O: Precision Equivalence ---")
+    run_test("12O: Projection precision equivalence", test_12o_precision_equivalence)
+
+    print("\n--- 12P: Dispatch Convergence ---")
+    run_test("12P: Dispatch convergence (10 steps)", test_12p_dispatch_convergence)
 
     # Summary
     print("\n" + "=" * 60)

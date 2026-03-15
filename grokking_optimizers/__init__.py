@@ -31,6 +31,8 @@ from .lion import Lion
 from .looksam import LookSAM
 from .muon import Muon
 from .cuda_graph_optimizer import CUDAGraphOptimizer
+from .dispatch import get_gpu_arch, get_backend, get_arch_label
+from .quantization import PrecisionConfig
 
 __all__ = [
     "SuperGrok15", "SharpnessMetaNet",
@@ -44,4 +46,6 @@ __all__ = [
     "LookSAM",
     "Muon",
     "CUDAGraphOptimizer",
+    "get_gpu_arch", "get_backend", "get_arch_label",
+    "PrecisionConfig",
 ]
