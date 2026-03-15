@@ -118,8 +118,8 @@ class SuperGrok11(Optimizer):
         for p in self._flat_params:
             self._flat_exp_avgs.append(torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
             self._flat_exp_avg_sqs.append(torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
-            self._flat_mus.append(torch.zeros_like(p.data))
-            self._flat_sharpness.append(torch.zeros_like(p.data))
+            self._flat_mus.append(torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
+            self._flat_sharpness.append(torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
         self._state_initialized = True
 
     def _update_alpha(self, train_loss, val_loss, train_acc):
@@ -137,6 +137,12 @@ class SuperGrok11(Optimizer):
         if self._global_step <= self.warmup_steps:
             return 0.0
         return min(1.0, (self._global_step - self.warmup_steps) / self.warmup_ramp)
+
+    def _get_effective_sam_freq(self):
+        """Check sam_enable_threshold before allowing SAM steps."""
+        if self._cached_train_acc < self.sam_enable_threshold:
+            return 999999  # effectively disabled
+        return 1  # caller controls actual frequency
 
     @torch.no_grad()
     def step(self, closure=None, train_loss=None, val_loss=None, train_acc=None):
