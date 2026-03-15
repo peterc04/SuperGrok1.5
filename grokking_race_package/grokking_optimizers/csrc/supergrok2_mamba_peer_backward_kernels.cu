@@ -455,10 +455,22 @@ __global__ void mamba3_scan_backward_kernel(
     const int tid = threadIdx.x;
     if (tid >= d_inner) return;
 
-    // Shared memory for cross-thread access in backward
+    // Shared memory layout:
+    //   s_x_branch:    [d_inner]
+    //   s_d_dt_raw:    [d_inner]
+    //   s_d_C_proj_W:  [d_state * d_inner]  — replaces per-thread local array
+    //   s_d_B_proj_W:  [d_state * d_inner]  — replaces per-thread local array
     extern __shared__ float smem[];
-    float* s_x_branch = smem;              // [d_inner]
-    float* s_d_dt_raw = smem + d_inner;    // [d_inner] — for full dt backward
+    float* s_x_branch = smem;                                 // [d_inner]
+    float* s_d_dt_raw = smem + d_inner;                       // [d_inner]
+    float* s_d_C_proj_W = smem + 2 * d_inner;                // [d_state * d_inner]
+    float* s_d_B_proj_W = s_d_C_proj_W + d_state * d_inner;  // [d_state * d_inner]
+    const int wgrad_smem_size = 2 * d_state * d_inner;
+
+    // Zero shared weight gradient accumulators cooperatively
+    for (int i = tid; i < wgrad_smem_size; i += d_inner)
+        s_d_C_proj_W[i] = 0.0f;  // covers both C and B arrays (contiguous)
+    __syncthreads();
 
     float A[MAX_D_STATE];
     for (int s = 0; s < d_state; s++)
@@ -475,13 +487,9 @@ __global__ void mamba3_scan_backward_kernel(
     float d_D_acc = 0.0f;
     float d_A_log_acc[MAX_D_STATE];
     float d_freq_acc[MAX_D_STATE / 2];  // paired: d_state/2 frequencies
-    float d_B_proj_acc[MAX_D_STATE];
-    float d_C_proj_acc[MAX_D_STATE];
     float d_dt_proj_b_acc = 0.0f;
     for (int s = 0; s < d_state; s++) {
         d_A_log_acc[s] = 0.0f;
-        d_B_proj_acc[s] = 0.0f;
-        d_C_proj_acc[s] = 0.0f;
     }
     for (int p = 0; p < half_d_state; p++) {
         d_freq_acc[p] = 0.0f;
@@ -490,15 +498,9 @@ __global__ void mamba3_scan_backward_kernel(
     float d_dt_proj_W_row[MAX_D_INNER];
     for (int j = 0; j < d_inner; j++) d_dt_proj_W_row[j] = 0.0f;
 
-    // Thread-local accumulators for weight gradients (avoid per-step atomicAdds)
-    float d_C_proj_W_local[MAX_D_STATE * MAX_D_INNER];
-    float d_B_proj_W_local[MAX_D_STATE * MAX_D_INNER];
+    // Small per-thread accumulators (16 floats each — fit in registers)
     float d_in_proj_W_x_local[MAX_D_MODEL];  // row tid of d_in_proj_W
     float d_in_proj_W_z_local[MAX_D_MODEL];  // row (tid+d_inner) of d_in_proj_W
-    for (int k = 0; k < d_state * d_inner; k++) {
-        d_C_proj_W_local[k] = 0.0f;
-        d_B_proj_W_local[k] = 0.0f;
-    }
     for (int d = 0; d < d_model; d++) {
         d_in_proj_W_x_local[d] = 0.0f;
         d_in_proj_W_z_local[d] = 0.0f;
@@ -554,7 +556,7 @@ __global__ void mamba3_scan_backward_kernel(
                 dh[s] += d_y_val * C_val;
                 float d_C_val = d_y_val * h_s;
                 for (int j = 0; j < d_inner; j++)
-                    d_C_proj_W_local[s * d_inner + j] += d_C_val * s_x_branch[j];
+                    atomicAdd(&s_d_C_proj_W[s * d_inner + j], d_C_val * s_x_branch[j]);
                 d_x_from_C += d_y_val * h_s * C_proj_W[s * d_inner + tid];
             }
 
@@ -605,7 +607,7 @@ __global__ void mamba3_scan_backward_kernel(
                 d_dt_val += d_B_bar * B_val;
                 float d_B_val = d_B_bar * dt_val;
                 for (int j = 0; j < d_inner; j++)
-                    d_B_proj_W_local[s * d_inner + j] += d_B_val * s_x_branch[j];
+                    atomicAdd(&s_d_B_proj_W[s * d_inner + j], d_B_val * s_x_branch[j]);
                 d_x_from_scan += d_B_val * B_proj_W[s * d_inner + tid];
                 float d_half_dtA = d_A_bar * (1.0f + A_bar) / denom_val;
                 d_dt_val += d_half_dtA * A[s] / 2.0f;
@@ -757,7 +759,7 @@ __global__ void mamba3_scan_backward_kernel(
                     dh[s] += d_y_val * C_val;
                     float d_C_val = d_y_val * h_s;
                     for (int j = 0; j < d_inner; j++)
-                        d_C_proj_W_local[s * d_inner + j] += d_C_val * s_x_branch[j];
+                        atomicAdd(&s_d_C_proj_W[s * d_inner + j], d_C_val * s_x_branch[j]);
                     d_x_from_C += d_y_val * h_s * C_proj_W[s * d_inner + tid];
                 }
 
@@ -802,7 +804,7 @@ __global__ void mamba3_scan_backward_kernel(
                     d_dt_val += d_B_bar * B_val;
                     float d_B_val = d_B_bar * dt_val;
                     for (int j = 0; j < d_inner; j++)
-                        d_B_proj_W_local[s * d_inner + j] += d_B_val * s_x_branch[j];
+                        atomicAdd(&s_d_B_proj_W[s * d_inner + j], d_B_val * s_x_branch[j]);
                     d_x_from_scan += d_B_val * B_proj_W[s * d_inner + tid];
                     float d_half_dtA = d_A_bar * (1.0f + A_bar) / denom_val;
                     d_dt_val += d_half_dtA * A[s] / 2.0f;
@@ -861,13 +863,15 @@ __global__ void mamba3_scan_backward_kernel(
     for (int p = 0; p < half_d_state; p++) {
         atomicAdd(&d_rope_freq[tid * half_d_state + p], d_freq_acc[p]);
     }
-    // Write locally accumulated weight gradients
-    for (int k = 0; k < d_state * d_inner; k++) {
-        atomicAdd(&d_C_proj_W[k], d_C_proj_W_local[k]);
+    // Flush shared memory weight gradient accumulators to global
+    __syncthreads();
+    for (int k = tid; k < d_state * d_inner; k += d_inner) {
+        if (s_d_C_proj_W[k] != 0.0f)
+            atomicAdd(&d_C_proj_W[k], s_d_C_proj_W[k]);
+        if (s_d_B_proj_W[k] != 0.0f)
+            atomicAdd(&d_B_proj_W[k], s_d_B_proj_W[k]);
     }
-    for (int k = 0; k < d_state * d_inner; k++) {
-        atomicAdd(&d_B_proj_W[k], d_B_proj_W_local[k]);
-    }
+    // Write per-thread in_proj_W gradients
     for (int d = 0; d < d_model; d++) {
         atomicAdd(&d_in_proj_W[tid * d_model + d], d_in_proj_W_x_local[d]);
         atomicAdd(&d_in_proj_W[(tid + d_inner) * d_model + d], d_in_proj_W_z_local[d]);
@@ -930,9 +934,22 @@ __global__ void mamba3_scan_backward_batched_kernel(
     const int N = end - start;
     const int reverse = reverse_flags[param_idx];
 
+    // Shared memory layout (same as non-batched kernel):
+    //   s_x_branch:    [d_inner]
+    //   s_d_dt_raw:    [d_inner]
+    //   s_d_C_proj_W:  [d_state * d_inner]
+    //   s_d_B_proj_W:  [d_state * d_inner]
     extern __shared__ float smem[];
     float* s_x_branch = smem;
     float* s_d_dt_raw = smem + d_inner;
+    float* s_d_C_proj_W = smem + 2 * d_inner;
+    float* s_d_B_proj_W = s_d_C_proj_W + d_state * d_inner;
+    const int wgrad_smem_size = 2 * d_state * d_inner;
+
+    // Zero shared weight gradient accumulators cooperatively
+    for (int i = tid; i < wgrad_smem_size; i += d_inner)
+        s_d_C_proj_W[i] = 0.0f;  // covers both C and B (contiguous)
+    __syncthreads();
 
     // Point to this param's packed data
     const float* my_d_scan = d_scan_output_packed + start * d_inner;
@@ -966,14 +983,9 @@ __global__ void mamba3_scan_backward_batched_kernel(
     float d_dt_proj_W_row[MAX_D_INNER];
     for (int j = 0; j < d_inner; j++) d_dt_proj_W_row[j] = 0.0f;
 
-    float d_C_proj_W_local[MAX_D_STATE * MAX_D_INNER];
-    float d_B_proj_W_local[MAX_D_STATE * MAX_D_INNER];
+    // Small per-thread accumulators (fit in registers)
     float d_in_proj_W_x_local[MAX_D_MODEL];
     float d_in_proj_W_z_local[MAX_D_MODEL];
-    for (int k = 0; k < d_state * d_inner; k++) {
-        d_C_proj_W_local[k] = 0.0f;
-        d_B_proj_W_local[k] = 0.0f;
-    }
     for (int d = 0; d < d_model; d++) {
         d_in_proj_W_x_local[d] = 0.0f;
         d_in_proj_W_z_local[d] = 0.0f;
@@ -1025,7 +1037,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
                 dh[s] += d_y_val * C_val;
                 float d_C_val = d_y_val * h_s;
                 for (int j = 0; j < d_inner; j++)
-                    d_C_proj_W_local[s * d_inner + j] += d_C_val * s_x_branch[j];
+                    atomicAdd(&s_d_C_proj_W[s * d_inner + j], d_C_val * s_x_branch[j]);
                 d_x_from_C += d_y_val * h_s * C_proj_W[s * d_inner + tid];
             }
 
@@ -1075,7 +1087,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
                 d_dt_val += d_B_bar * B_val;
                 float d_B_val = d_B_bar * dt_val;
                 for (int j = 0; j < d_inner; j++)
-                    d_B_proj_W_local[s * d_inner + j] += d_B_val * s_x_branch[j];
+                    atomicAdd(&s_d_B_proj_W[s * d_inner + j], d_B_val * s_x_branch[j]);
                 d_x_from_scan += d_B_val * B_proj_W[s * d_inner + tid];
                 float d_half_dtA = d_A_bar * (1.0f + A_bar) / denom_val;
                 d_dt_val += d_half_dtA * A[s] / 2.0f;
@@ -1206,7 +1218,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
                     dh[s] += d_y_val * C_val;
                     float d_C_val = d_y_val * h_s;
                     for (int j = 0; j < d_inner; j++)
-                        d_C_proj_W_local[s * d_inner + j] += d_C_val * s_x_branch[j];
+                        atomicAdd(&s_d_C_proj_W[s * d_inner + j], d_C_val * s_x_branch[j]);
                     d_x_from_C += d_y_val * h_s * C_proj_W[s * d_inner + tid];
                 }
                 float h_prev[MAX_D_STATE];
@@ -1246,7 +1258,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
                     d_dt_val += d_B_bar * B_val;
                     float d_B_val = d_B_bar * dt_val;
                     for (int j = 0; j < d_inner; j++)
-                        d_B_proj_W_local[s * d_inner + j] += d_B_val * s_x_branch[j];
+                        atomicAdd(&s_d_B_proj_W[s * d_inner + j], d_B_val * s_x_branch[j]);
                     d_x_from_scan += d_B_val * B_proj_W[s * d_inner + tid];
                     float d_half_dtA = d_A_bar * (1.0f + A_bar) / denom_val;
                     d_dt_val += d_half_dtA * A[s] / 2.0f;
@@ -1296,13 +1308,15 @@ __global__ void mamba3_scan_backward_batched_kernel(
         atomicAdd(&d_A_log[tid * d_state + s], d_A_log_acc[s]);
     for (int p = 0; p < half_d_state; p++)
         atomicAdd(&d_rope_freq[tid * half_d_state + p], d_freq_acc[p]);
-    // Write locally accumulated weight gradients
-    for (int k = 0; k < d_state * d_inner; k++) {
-        atomicAdd(&d_C_proj_W[k], d_C_proj_W_local[k]);
+    // Flush shared memory weight gradient accumulators to global
+    __syncthreads();
+    for (int k = tid; k < d_state * d_inner; k += d_inner) {
+        if (s_d_C_proj_W[k] != 0.0f)
+            atomicAdd(&d_C_proj_W[k], s_d_C_proj_W[k]);
+        if (s_d_B_proj_W[k] != 0.0f)
+            atomicAdd(&d_B_proj_W[k], s_d_B_proj_W[k]);
     }
-    for (int k = 0; k < d_state * d_inner; k++) {
-        atomicAdd(&d_B_proj_W[k], d_B_proj_W_local[k]);
-    }
+    // Write per-thread in_proj_W gradients
     for (int d = 0; d < d_model; d++) {
         atomicAdd(&d_in_proj_W[tid * d_model + d], d_in_proj_W_x_local[d]);
         atomicAdd(&d_in_proj_W[(tid + d_inner) * d_model + d], d_in_proj_W_z_local[d]);
@@ -2140,7 +2154,8 @@ void launch_mamba3_peer_backward(
     );
 
     // Step 8: Mamba scan backward (both directions)
-    int scan_smem = 2 * d_inner * sizeof(float); // s_x_branch + s_d_dt_raw
+    // s_x_branch[d_inner] + s_d_dt_raw[d_inner] + s_d_C_proj_W[d_state*d_inner] + s_d_B_proj_W[d_state*d_inner]
+    int scan_smem = (2 * d_inner + 2 * d_state * d_inner) * sizeof(float);
     auto d_x_sorted_fwd = torch::zeros({N, d_model}, float_opts);
     auto d_x_sorted_bwd = torch::zeros({N, d_model}, float_opts);
 
@@ -2489,7 +2504,8 @@ void launch_mamba3_peer_backward_batched(
     auto rev_fwd = torch::zeros({num_params}, int_opts);
     auto rev_bwd = torch::zeros({num_params}, int_opts);  // data was pre-reversed
 
-    int scan_smem = 2 * d_inner * sizeof(float);  // s_x_branch + s_d_dt_raw
+    // s_x_branch[d_inner] + s_d_dt_raw[d_inner] + s_d_C_proj_W[d_state*d_inner] + s_d_B_proj_W[d_state*d_inner]
+    int scan_smem = (2 * d_inner + 2 * d_state * d_inner) * sizeof(float);
     int ckpt_int = (checkpoint_interval > 1) ? checkpoint_interval : 0;
 
     // Compute checkpoint offsets if needed (using offsets already on GPU)
