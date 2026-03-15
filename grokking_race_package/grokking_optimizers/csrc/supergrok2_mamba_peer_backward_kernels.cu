@@ -1563,16 +1563,25 @@ __global__ void expert_peer_backward_kernel(
     const int d_model, const int pk_dim, const int expert_hidden,
     const int peer_input_dim, const int num_experts
 ) {
-    // Shared memory accumulators for expert weight gradients
+    // Shared memory accumulators for expert + routing weight gradients
     extern __shared__ float smem[];
     float* s_d_expert_W1 = smem;
     float* s_d_expert_b1 = s_d_expert_W1 + num_experts * expert_hidden;
     float* s_d_expert_W2 = s_d_expert_b1 + num_experts * expert_hidden;
     float* s_d_expert_b2 = s_d_expert_W2 + num_experts * expert_hidden;
     int total_expert_smem = 3 * num_experts * expert_hidden + num_experts;
+    // Routing weight gradients in smem
+    int half_d_smem = d_model / 2;
+    int pqw_size = num_heads * d_model * peer_input_dim;
+    int pka_size = num_heads * pk_dim * half_d_smem;
+    int pkb_size = pka_size;
+    float* s_d_peer_query_Ws = smem + total_expert_smem;
+    float* s_d_prod_keys_A = s_d_peer_query_Ws + pqw_size;
+    float* s_d_prod_keys_B = s_d_prod_keys_A + pka_size;
+    int total_smem = total_expert_smem + pqw_size + pka_size + pkb_size;
 
     // Zero shared accumulators cooperatively
-    for (int i = threadIdx.x; i < total_expert_smem; i += blockDim.x)
+    for (int i = threadIdx.x; i < total_smem; i += blockDim.x)
         smem[i] = 0.0f;
     __syncthreads();
 
@@ -1662,16 +1671,16 @@ __global__ void expert_peer_backward_kernel(
                     q_b_d += peer_query_Ws[(h * d_model + half_d + d) * peer_input_dim + j] * pi_j;
                 }
 
-                atomicAdd(&d_prod_keys_A[(h * pk_dim + a_key_idx) * half_d + d], d_score_a * q_a_d);
-                atomicAdd(&d_prod_keys_B[(h * pk_dim + b_key_idx) * half_d + d], d_score_b * q_b_d);
+                atomicAdd(&s_d_prod_keys_A[(h * pk_dim + a_key_idx) * half_d + d], d_score_a * q_a_d);
+                atomicAdd(&s_d_prod_keys_B[(h * pk_dim + b_key_idx) * half_d + d], d_score_b * q_b_d);
 
                 float d_q_a_d = d_score_a * prod_keys_A[(h * pk_dim + a_key_idx) * half_d + d];
                 float d_q_b_d = d_score_b * prod_keys_B[(h * pk_dim + b_key_idx) * half_d + d];
 
                 for (int j = 0; j < peer_input_dim; j++) {
                     float pi_j = saved_peer_input[idx * peer_input_dim + j];
-                    atomicAdd(&d_peer_query_Ws[(h * d_model + d) * peer_input_dim + j], d_q_a_d * pi_j);
-                    atomicAdd(&d_peer_query_Ws[(h * d_model + half_d + d) * peer_input_dim + j], d_q_b_d * pi_j);
+                    atomicAdd(&s_d_peer_query_Ws[(h * d_model + d) * peer_input_dim + j], d_q_a_d * pi_j);
+                    atomicAdd(&s_d_peer_query_Ws[(h * d_model + half_d + d) * peer_input_dim + j], d_q_b_d * pi_j);
                     atomicAdd(&d_peer_input[idx * peer_input_dim + j],
                               d_q_a_d * peer_query_Ws[(h * d_model + d) * peer_input_dim + j] +
                               d_q_b_d * peer_query_Ws[(h * d_model + half_d + d) * peer_input_dim + j]);
@@ -1681,8 +1690,10 @@ __global__ void expert_peer_backward_kernel(
     }
     } // end if (idx < N)
 
-    // Flush shared memory expert gradient accumulators to global memory
+    // Flush shared memory gradient accumulators to global memory
     __syncthreads();
+
+    // Flush expert weight gradients
     for (int i = threadIdx.x; i < total_expert_smem; i += blockDim.x) {
         if (smem[i] != 0.0f) {
             if (i < num_experts * expert_hidden)
@@ -1694,6 +1705,20 @@ __global__ void expert_peer_backward_kernel(
             else
                 atomicAdd(&d_expert_b2[i - 3 * num_experts * expert_hidden], smem[i]);
         }
+    }
+
+    // Flush routing weight gradients (peer_query_Ws, prod_keys_A, prod_keys_B)
+    for (int i = threadIdx.x; i < pqw_size; i += blockDim.x) {
+        if (s_d_peer_query_Ws[i] != 0.0f)
+            atomicAdd(&d_peer_query_Ws[i], s_d_peer_query_Ws[i]);
+    }
+    for (int i = threadIdx.x; i < pka_size; i += blockDim.x) {
+        if (s_d_prod_keys_A[i] != 0.0f)
+            atomicAdd(&d_prod_keys_A[i], s_d_prod_keys_A[i]);
+    }
+    for (int i = threadIdx.x; i < pkb_size; i += blockDim.x) {
+        if (s_d_prod_keys_B[i] != 0.0f)
+            atomicAdd(&d_prod_keys_B[i], s_d_prod_keys_B[i]);
     }
 }
 
@@ -2002,8 +2027,13 @@ void launch_mamba3_peer_backward(
 
     // Step 2: Expert + PEER backward
     auto d_peer_input = torch::zeros({N, peer_input_dim}, float_opts);
-    int expert_smem_bytes = (3 * num_experts * expert_hidden + num_experts) * sizeof(float);
-    expert_peer_backward_kernel<<<grid, SG2B_BLOCK, expert_smem_bytes>>>(
+    int half_d = d_model / 2;
+    int expert_smem_elems = 3 * num_experts * expert_hidden + num_experts;
+    int routing_smem_elems = num_heads * d_model * peer_input_dim  // peer_query_Ws
+                           + num_heads * pk_dim * half_d            // prod_keys_A
+                           + num_heads * pk_dim * half_d;           // prod_keys_B
+    int total_smem_bytes = (expert_smem_elems + routing_smem_elems) * sizeof(float);
+    expert_peer_backward_kernel<<<grid, SG2B_BLOCK, total_smem_bytes>>>(
         d_expert_out.data_ptr<float>(),
         grad.to(torch::kFloat32).reshape(-1).data_ptr<float>(),
         expert_indices.data_ptr<int>(),
