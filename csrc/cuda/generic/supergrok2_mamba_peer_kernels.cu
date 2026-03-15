@@ -29,6 +29,7 @@
 
 #include "platform.h"
 #include "types.h"
+#include "ops.h"
 
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -418,6 +419,10 @@ __global__ void mamba3_parallel_scan_kernel(
 
         // === Step 2: Blelloch exclusive prefix scan on chunk summaries ===
         // Up-sweep (reduction phase)
+        // WARP_SIZE-aware sync skip: threads within a warp/wavefront execute
+        // in lockstep, so __syncthreads() is only needed when stride*2 crosses
+        // the warp/wavefront boundary. On NVIDIA (WARP_SIZE=32) this skips
+        // strides 1-16; on AMD CDNA (WARP_SIZE=64) this skips strides 1-32.
         for (int stride = 1; stride < num_threads; stride *= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -432,7 +437,9 @@ __global__ void mamba3_parallel_scan_kernel(
                 smem[idx*6+2] = combined.m10; smem[idx*6+3] = combined.m11;
                 smem[idx*6+4] = combined.b0;  smem[idx*6+5] = combined.b1;
             }
-            __syncthreads();
+            if (stride * 2 >= WARP_SIZE) {
+                __syncthreads();
+            }
         }
 
         // Set last element to identity (for exclusive scan)
@@ -445,6 +452,7 @@ __global__ void mamba3_parallel_scan_kernel(
         __syncthreads();
 
         // Down-sweep
+        // Same WARP_SIZE-aware sync skip as up-sweep.
         for (int stride = num_threads / 2; stride >= 1; stride /= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -463,7 +471,9 @@ __global__ void mamba3_parallel_scan_kernel(
                 smem[idx*6+2] = combined.m10; smem[idx*6+3] = combined.m11;
                 smem[idx*6+4] = combined.b0;  smem[idx*6+5] = combined.b1;
             }
-            __syncthreads();
+            if (stride * 2 >= WARP_SIZE) {
+                __syncthreads();
+            }
         }
 
         // Read exclusive prefix for this thread
@@ -636,6 +646,10 @@ __global__ void mamba3_parallel_scan_batched_kernel(
 
         // === Step 2: Blelloch exclusive prefix scan on chunk summaries ===
         // Up-sweep (reduction phase)
+        // WARP_SIZE-aware sync skip: threads within a warp/wavefront execute
+        // in lockstep, so __syncthreads() is only needed when stride*2 crosses
+        // the warp/wavefront boundary. On NVIDIA (WARP_SIZE=32) this skips
+        // strides 1-16; on AMD CDNA (WARP_SIZE=64) this skips strides 1-32.
         for (int stride = 1; stride < num_threads; stride *= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -650,7 +664,9 @@ __global__ void mamba3_parallel_scan_batched_kernel(
                 smem[idx*6+2] = combined.m10; smem[idx*6+3] = combined.m11;
                 smem[idx*6+4] = combined.b0;  smem[idx*6+5] = combined.b1;
             }
-            __syncthreads();
+            if (stride * 2 >= WARP_SIZE) {
+                __syncthreads();
+            }
         }
 
         // Set last element to identity (for exclusive scan)
@@ -663,6 +679,7 @@ __global__ void mamba3_parallel_scan_batched_kernel(
         __syncthreads();
 
         // Down-sweep
+        // Same WARP_SIZE-aware sync skip as up-sweep.
         for (int stride = num_threads / 2; stride >= 1; stride /= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -681,7 +698,9 @@ __global__ void mamba3_parallel_scan_batched_kernel(
                 smem[idx*6+2] = combined.m10; smem[idx*6+3] = combined.m11;
                 smem[idx*6+4] = combined.b0;  smem[idx*6+5] = combined.b1;
             }
-            __syncthreads();
+            if (stride * 2 >= WARP_SIZE) {
+                __syncthreads();
+            }
         }
 
         // Read exclusive prefix for this thread
@@ -2062,6 +2081,402 @@ void launch_mamba3_peer_batched_step(
     }
 
     // Sync all streams (persistent — no destroy)
+    for (int s = 0; s < NUM_STREAMS; s++) {
+        gpuStreamSynchronize(streams[s]);
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Refactored Batched Step Pipeline: Separable Phases
+//
+//  Allows tier-specific precompute (FP8 on Hopper, BF16 on CDNA3) to
+//  inject custom projection GEMM implementations while sharing the
+//  sort/pack setup and scan+fused_elem finalization.
+//
+//  Phase 1: batched_step_setup_and_sort — input projection, CUB sort, packing
+//  Phase 2: generic_batched_precompute — FP32 precompute kernel (or tier override)
+//  Phase 3: batched_step_scan_and_fused_elem — scan + unsort + fused_elem_step
+// ═══════════════════════════════════════════════════════════════════════
+
+BatchedScanCtx batched_step_setup_and_sort(
+    std::vector<torch::Tensor> grads,
+    std::vector<torch::Tensor> sharpness_list,
+    std::vector<torch::Tensor> mamba_fwd_states,
+    std::vector<torch::Tensor> mamba_bwd_states,
+    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
+    int d_model, int d_state, int d_inner
+) {
+    BatchedScanCtx ctx;
+    ctx.num_params = grads.size();
+    if (ctx.num_params == 0) {
+        ctx.total_N = 0;
+        ctx.max_N = 0;
+        return ctx;
+    }
+
+    TORCH_CHECK(d_state % 2 == 0, "d_state must be even for paired RoPE (got ", d_state, ")");
+    TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE");
+    TORCH_CHECK(d_model <= MAX_D_MODEL, "d_model exceeds MAX_D_MODEL");
+    TORCH_CHECK(d_inner <= MAX_D_INNER, "d_inner exceeds MAX_D_INNER");
+    TORCH_CHECK(d_inner % 4 == 0, "d_inner must be a multiple of 4 for vectorized loads");
+
+    auto dev = grads[0].device();
+    auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
+    auto int_opts = torch::TensorOptions().device(dev).dtype(torch::kInt32);
+
+    // Compute total_N and per-param sizes
+    ctx.N_vec.resize(ctx.num_params);
+    ctx.total_N = 0;
+    for (int p = 0; p < ctx.num_params; p++) {
+        ctx.N_vec[p] = grads[p].numel();
+        ctx.total_N += ctx.N_vec[p];
+    }
+    if (ctx.total_N == 0) {
+        ctx.max_N = 0;
+        return ctx;
+    }
+
+    // Segment offsets
+    ctx.seg_offsets_cpu.resize(ctx.num_params + 1);
+    ctx.seg_offsets_cpu[0] = 0;
+    for (int p = 0; p < ctx.num_params; p++)
+        ctx.seg_offsets_cpu[p + 1] = ctx.seg_offsets_cpu[p] + ctx.N_vec[p];
+
+    // Input projection + sort
+    auto all_keys = torch::empty({ctx.total_N}, float_opts);
+    auto all_indices = torch::empty({ctx.total_N}, int_opts);
+    auto all_keys_out = torch::empty({ctx.total_N}, float_opts);
+    auto all_indices_out = torch::empty({ctx.total_N}, int_opts);
+
+    std::vector<torch::Tensor> x_proj_list(ctx.num_params);
+    std::vector<torch::Tensor> sort_idx_list(ctx.num_params);
+    std::vector<torch::Tensor> x_sorted_list(ctx.num_params);
+    ctx.unsort_idx_list.resize(ctx.num_params);
+
+    for (int p = 0; p < ctx.num_params; p++) {
+        int N = ctx.N_vec[p];
+        if (N == 0) continue;
+        int off = ctx.seg_offsets_cpu[p];
+
+        auto x_proj = torch::empty({N, d_model}, float_opts);
+        x_proj_list[p] = x_proj;
+
+        const int grid = (N + SG2M_BLOCK - 1) / SG2M_BLOCK;
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::ScalarType::Half, at::ScalarType::BFloat16,
+            grads[p].scalar_type(), "input_proj_sort_setup", ([&] {
+            input_proj_sort_kernel<scalar_t><<<grid, SG2M_BLOCK>>>(
+                grads[p].data_ptr<scalar_t>(),
+                sharpness_list[p].data_ptr<scalar_t>(),
+                x_proj.data_ptr<float>(),
+                all_keys.data_ptr<float>() + off,
+                all_indices.data_ptr<int>() + off,
+                input_proj_W.data_ptr<float>(),
+                input_proj_b.data_ptr<float>(),
+                N, d_model
+            );
+        }));
+    }
+
+    // CUB segmented sort
+    ctx.offsets_t = torch::from_blob(ctx.seg_offsets_cpu.data(), {ctx.num_params + 1},
+        torch::kInt32).to(dev).contiguous();
+
+    size_t cub_temp_bytes = 0;
+    cub::DeviceSegmentedRadixSort::SortPairs(
+        nullptr, cub_temp_bytes,
+        all_keys.data_ptr<float>(), all_keys_out.data_ptr<float>(),
+        all_indices.data_ptr<int>(), all_indices_out.data_ptr<int>(),
+        ctx.total_N, ctx.num_params,
+        ctx.offsets_t.data_ptr<int>(), ctx.offsets_t.data_ptr<int>() + 1);
+
+    auto cub_temp = torch::empty({(int64_t)cub_temp_bytes},
+        torch::TensorOptions().device(dev).dtype(torch::kUInt8));
+    cub::DeviceSegmentedRadixSort::SortPairs(
+        cub_temp.data_ptr<void>(), cub_temp_bytes,
+        all_keys.data_ptr<float>(), all_keys_out.data_ptr<float>(),
+        all_indices.data_ptr<int>(), all_indices_out.data_ptr<int>(),
+        ctx.total_N, ctx.num_params,
+        ctx.offsets_t.data_ptr<int>(), ctx.offsets_t.data_ptr<int>() + 1);
+
+    // Extract sorted data and build unsort indices
+    for (int p = 0; p < ctx.num_params; p++) {
+        int N = ctx.N_vec[p];
+        if (N == 0) continue;
+        int off = ctx.seg_offsets_cpu[p];
+
+        sort_idx_list[p] = all_indices_out.narrow(0, off, N);
+        auto idx_long = sort_idx_list[p].to(torch::kLong);
+        x_sorted_list[p] = x_proj_list[p].index_select(0, idx_long);
+
+        auto unsort = torch::empty({N}, torch::TensorOptions().device(dev).dtype(torch::kLong));
+        unsort.scatter_(0, idx_long,
+            torch::arange(N, torch::TensorOptions().device(dev).dtype(torch::kLong)));
+        ctx.unsort_idx_list[p] = unsort;
+    }
+
+    // Pack sorted data
+    std::vector<torch::Tensor> valid_sorted;
+    for (int p = 0; p < ctx.num_params; p++) {
+        if (ctx.N_vec[p] > 0) valid_sorted.push_back(x_sorted_list[p]);
+    }
+    ctx.x_sorted_packed = torch::cat(valid_sorted, 0);
+
+    // Pack initial states
+    ctx.initial_fwd = torch::stack(mamba_fwd_states, 0);
+    ctx.initial_bwd = torch::stack(mamba_bwd_states, 0);
+    ctx.final_fwd = torch::empty_like(ctx.initial_fwd);
+    ctx.final_bwd = torch::empty_like(ctx.initial_bwd);
+
+    // Allocate scan outputs
+    ctx.fwd_scan_packed = torch::empty({ctx.total_N, d_inner}, float_opts);
+    ctx.bwd_scan_packed = torch::empty({ctx.total_N, d_inner}, float_opts);
+
+    ctx.max_N = *std::max_element(ctx.N_vec.begin(), ctx.N_vec.end());
+
+    return ctx;
+}
+
+
+void generic_batched_precompute(
+    const BatchedScanCtx& ctx,
+    torch::Tensor in_proj_W, torch::Tensor dt_proj_W, torch::Tensor dt_proj_b,
+    torch::Tensor B_proj_W, torch::Tensor C_proj_W,
+    torch::Tensor& pre_x, torch::Tensor& pre_z, torch::Tensor& pre_dt,
+    torch::Tensor& pre_B, torch::Tensor& pre_C,
+    int d_model, int d_inner, int d_state
+) {
+    if (ctx.total_N == 0) return;
+
+    auto dev = ctx.x_sorted_packed.device();
+    auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
+
+    pre_x = torch::empty({ctx.total_N, d_inner}, float_opts);
+    pre_z = torch::empty({ctx.total_N, d_inner}, float_opts);
+    pre_dt = torch::empty({ctx.total_N, d_inner}, float_opts);
+    pre_B = torch::empty({ctx.total_N, d_state}, float_opts);
+    pre_C = torch::empty({ctx.total_N, d_state}, float_opts);
+
+    const int pre_grid = (ctx.total_N + SG2M_BLOCK - 1) / SG2M_BLOCK;
+    mamba3_parallel_precompute_kernel<<<pre_grid, SG2M_BLOCK>>>(
+        ctx.x_sorted_packed.data_ptr<float>(),
+        in_proj_W.data_ptr<float>(),
+        dt_proj_W.data_ptr<float>(),
+        dt_proj_b.data_ptr<float>(),
+        B_proj_W.data_ptr<float>(),
+        C_proj_W.data_ptr<float>(),
+        pre_x.data_ptr<float>(),
+        pre_z.data_ptr<float>(),
+        pre_dt.data_ptr<float>(),
+        pre_B.data_ptr<float>(),
+        pre_C.data_ptr<float>(),
+        ctx.total_N, d_model, d_inner, d_state
+    );
+}
+
+
+void batched_step_scan_and_fused_elem(
+    BatchedScanCtx& ctx,
+    torch::Tensor fwd_pre_x, torch::Tensor fwd_pre_z, torch::Tensor fwd_pre_dt,
+    torch::Tensor fwd_pre_B, torch::Tensor fwd_pre_C,
+    torch::Tensor bwd_pre_x, torch::Tensor bwd_pre_z, torch::Tensor bwd_pre_dt,
+    torch::Tensor bwd_pre_B, torch::Tensor bwd_pre_C,
+    std::vector<torch::Tensor> params,
+    std::vector<torch::Tensor> grads,
+    std::vector<torch::Tensor> sharpness_list,
+    std::vector<torch::Tensor> exp_avgs,
+    std::vector<torch::Tensor> exp_avg_sqs,
+    std::vector<torch::Tensor> mus,
+    std::vector<torch::Tensor> gru_states,
+    std::vector<torch::Tensor> mamba_fwd_states,
+    std::vector<torch::Tensor> mamba_bwd_states,
+    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
+    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
+    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
+    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
+    torch::Tensor mamba_fwd_out_proj,
+    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
+    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
+    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
+    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
+    torch::Tensor mamba_bwd_out_proj,
+    torch::Tensor gru_Wz, torch::Tensor gru_bz,
+    torch::Tensor gru_Wr, torch::Tensor gru_br,
+    torch::Tensor gru_Wh, torch::Tensor gru_bh,
+    torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+    torch::Tensor expert_W1, torch::Tensor expert_b1,
+    torch::Tensor expert_W2, torch::Tensor expert_b2,
+    std::vector<float> alpha_mus, std::vector<float> lamb_effs,
+    std::vector<float> beta1s, std::vector<float> bc1s, std::vector<float> bc2s,
+    float rescale, float beta2, float lr, float wd_eff, float eps,
+    int d_model, int d_state, int d_inner,
+    int gru_hidden, int num_heads, int pk_dim,
+    int expert_hidden, int num_experts,
+    torch::Tensor expert_counts
+) {
+    if (ctx.total_N == 0) return;
+
+    auto dev = ctx.x_sorted_packed.device();
+    auto int_opts = torch::TensorOptions().device(dev).dtype(torch::kInt32);
+
+    if (ctx.max_N >= PSCAN_THRESHOLD) {
+        // ===== PARALLEL PREFIX SCAN for large N =====
+        int block_po2 = 1;
+        int actual_block = std::min(PSCAN_BLOCK, ctx.max_N);
+        while (block_po2 < actual_block) block_po2 *= 2;
+        block_po2 = std::min(block_po2, PSCAN_BLOCK);
+        int pscan_smem = 6 * block_po2 * (int)sizeof(float);
+        dim3 pscan_grid(d_inner, ctx.num_params);
+
+        auto rev_fwd = torch::zeros({ctx.num_params}, int_opts);
+        auto rev_bwd = torch::ones({ctx.num_params}, int_opts);
+
+        auto run_scan = [&](
+            torch::Tensor pre_x_t, torch::Tensor pre_z_t, torch::Tensor pre_dt_t,
+            torch::Tensor pre_B_t, torch::Tensor pre_C_t,
+            torch::Tensor A_log_t, torch::Tensor D_param_t, torch::Tensor rope_t,
+            torch::Tensor initial_states_t, torch::Tensor final_states_t,
+            torch::Tensor scan_packed, torch::Tensor rev_flags
+        ) {
+            gpuMemsetAsync(scan_packed.data_ptr<float>(), 0,
+                ctx.total_N * d_inner * sizeof(float));
+
+            mamba3_parallel_scan_batched_kernel<<<pscan_grid, block_po2, pscan_smem>>>(
+                pre_x_t.data_ptr<float>(),
+                pre_z_t.data_ptr<float>(),
+                pre_dt_t.data_ptr<float>(),
+                pre_B_t.data_ptr<float>(),
+                pre_C_t.data_ptr<float>(),
+                A_log_t.data_ptr<float>(),
+                D_param_t.data_ptr<float>(),
+                rope_t.data_ptr<float>(),
+                scan_packed.data_ptr<float>(),
+                final_states_t.data_ptr<float>(),
+                initial_states_t.data_ptr<float>(),
+                ctx.offsets_t.data_ptr<int>(),
+                rev_flags.data_ptr<int>(),
+                d_inner, d_state, ctx.num_params
+            );
+        };
+
+        // Forward scan
+        run_scan(fwd_pre_x, fwd_pre_z, fwd_pre_dt, fwd_pre_B, fwd_pre_C,
+                 mamba_fwd_A_log, mamba_fwd_D, mamba_fwd_rope,
+                 ctx.initial_fwd, ctx.final_fwd, ctx.fwd_scan_packed, rev_fwd);
+
+        // Backward scan (reverse)
+        run_scan(bwd_pre_x, bwd_pre_z, bwd_pre_dt, bwd_pre_B, bwd_pre_C,
+                 mamba_bwd_A_log, mamba_bwd_D, mamba_bwd_rope,
+                 ctx.initial_bwd, ctx.final_bwd, ctx.bwd_scan_packed, rev_bwd);
+    } else {
+        // ===== SEQUENTIAL COMBINED SCAN for small N =====
+        int scan_smem = (d_inner + 2*d_inner*d_model + d_inner*d_inner + d_inner + 2*d_state*d_inner) * sizeof(float);
+
+        mamba3_scan_combined_kernel<<<2 * ctx.num_params, d_inner, scan_smem>>>(
+            ctx.x_sorted_packed.data_ptr<float>(),
+            ctx.fwd_scan_packed.data_ptr<float>(),
+            ctx.bwd_scan_packed.data_ptr<float>(),
+            ctx.initial_fwd.data_ptr<float>(),
+            ctx.initial_bwd.data_ptr<float>(),
+            ctx.final_fwd.data_ptr<float>(),
+            ctx.final_bwd.data_ptr<float>(),
+            ctx.offsets_t.data_ptr<int>(),
+            mamba_fwd_in_proj.data_ptr<float>(),
+            mamba_fwd_dt_W.data_ptr<float>(),
+            mamba_fwd_dt_b.data_ptr<float>(),
+            mamba_fwd_B_proj.data_ptr<float>(),
+            mamba_fwd_C_proj.data_ptr<float>(),
+            mamba_fwd_A_log.data_ptr<float>(),
+            mamba_fwd_D.data_ptr<float>(),
+            mamba_fwd_rope.data_ptr<float>(),
+            mamba_bwd_in_proj.data_ptr<float>(),
+            mamba_bwd_dt_W.data_ptr<float>(),
+            mamba_bwd_dt_b.data_ptr<float>(),
+            mamba_bwd_B_proj.data_ptr<float>(),
+            mamba_bwd_C_proj.data_ptr<float>(),
+            mamba_bwd_A_log.data_ptr<float>(),
+            mamba_bwd_D.data_ptr<float>(),
+            mamba_bwd_rope.data_ptr<float>(),
+            d_model, d_inner, d_state, ctx.num_params
+        );
+    }
+
+    // Unsort + fused_elem_step per param
+    int gru_input_dim_val = 2 + 2 * d_model;
+    int gru_row_len = gru_input_dim_val + gru_hidden;
+    int smem_bytes = (2 * d_model * d_inner
+                    + 3 * gru_hidden * gru_row_len
+                    + 3 * gru_hidden
+                    + 3 * num_experts * expert_hidden + num_experts) * sizeof(float);
+
+    // Pre-compute unsorted scan outputs and copy final states
+    std::vector<torch::Tensor> fwd_unsorted_list(ctx.num_params);
+    std::vector<torch::Tensor> bwd_unsorted_list(ctx.num_params);
+    for (int p = 0; p < ctx.num_params; p++) {
+        int N = ctx.N_vec[p];
+        if (N == 0) continue;
+        int off = ctx.seg_offsets_cpu[p];
+
+        mamba_fwd_states[p].copy_(ctx.final_fwd[p]);
+        mamba_bwd_states[p].copy_(ctx.final_bwd[p]);
+
+        auto fwd_slice = ctx.fwd_scan_packed.narrow(0, off, N);
+        auto bwd_slice = ctx.bwd_scan_packed.narrow(0, off, N);
+        fwd_unsorted_list[p] = fwd_slice.index_select(0, ctx.unsort_idx_list[p]);
+        bwd_unsorted_list[p] = bwd_slice.index_select(0, ctx.unsort_idx_list[p]);
+    }
+
+    // Launch fused_elem_step kernels on persistent stream pool
+    constexpr int NUM_STREAMS = 4;
+    static GpuStream_t streams[NUM_STREAMS] = {};
+    static bool streams_initialized = false;
+    if (!streams_initialized) {
+        for (int s = 0; s < NUM_STREAMS; s++)
+            gpuStreamCreate(&streams[s]);
+        streams_initialized = true;
+    }
+
+    for (int p = 0; p < ctx.num_params; p++) {
+        int N = ctx.N_vec[p];
+        if (N == 0) continue;
+
+        GpuStream_t stream = streams[p % NUM_STREAMS];
+        const int grid = (N + SG2M_BLOCK - 1) / SG2M_BLOCK;
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::ScalarType::Half, at::ScalarType::BFloat16,
+            params[p].scalar_type(), "fused_elem_step_refactored", ([&] {
+            fused_elem_step_kernel<scalar_t><<<grid, SG2M_BLOCK, smem_bytes, stream>>>(
+                params[p].data_ptr<scalar_t>(),
+                grads[p].data_ptr<scalar_t>(),
+                sharpness_list[p].data_ptr<scalar_t>(),
+                exp_avgs[p].data_ptr<float>(),
+                exp_avg_sqs[p].data_ptr<float>(),
+                mus[p].data_ptr<float>(),
+                gru_states[p].data_ptr<float>(),
+                fwd_unsorted_list[p].data_ptr<float>(),
+                bwd_unsorted_list[p].data_ptr<float>(),
+                mamba_fwd_out_proj.data_ptr<float>(),
+                mamba_bwd_out_proj.data_ptr<float>(),
+                gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+                gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+                gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+                peer_query_Ws.data_ptr<float>(),
+                prod_keys_A.data_ptr<float>(),
+                prod_keys_B.data_ptr<float>(),
+                expert_W1.data_ptr<float>(),
+                expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(),
+                expert_b2.data_ptr<float>(),
+                rescale, alpha_mus[p], lamb_effs[p],
+                beta1s[p], beta2, lr, wd_eff, eps, bc1s[p], bc2s[p],
+                expert_counts.data_ptr<int>(),
+                N, d_model, d_inner, gru_hidden,
+                num_heads, pk_dim, expert_hidden, num_experts
+            );
+        }));
+    }
+
     for (int s = 0; s < NUM_STREAMS; s++) {
         gpuStreamSynchronize(streams[s]);
     }

@@ -2,25 +2,28 @@
  * SuperGrok v2 — CDNA3-Optimized Launchers (gfx942, MI300X)
  *
  * MI300X-specific optimizations beyond CDNA2:
- *   - 256MB L2 cache: meta-net weights (~50KB) fit entirely in L2,
- *     eliminating global memory latency after first access
- *   - BF16 MFMA projections: input/dt/B/C projections convert to BF16
- *     before torch::mm, leveraging MFMA_F32_32x32x8_BF16 instructions
- *     for ~2x throughput over FP32 MFMA with FP32 accumulation
- *   - Wavefront-64 scan: inherited from CDNA2 via platform.h
+ *   - BF16 MFMA projection precompute: cdna3_precompute_bf16() casts
+ *     inputs and weights to BF16 at the torch::mm boundary, causing
+ *     rocBLAS to dispatch to MFMA_F32_32x32x8_BF16 instructions for
+ *     ~2x projection throughput. GEMM accumulation is FP32. Output
+ *     tensors are FP32 for scan numerical stability.
+ *   - Refactored batched step pipeline: setup_and_sort → BF16 precompute
+ *     → shared scan+fused_elem. This correctly applies BF16 at the GEMM
+ *     boundary rather than round-tripping weights through BF16→FP32.
+ *   - 256MB L2 cache: meta-net weights (~50KB) always L2-resident
  *   - 304 CUs (vs 220 MI250): more concurrent scan blocks
  *
- * The BF16 projection path converts inputs to BF16 before the GEMM.
- * rocBLAS automatically dispatches BF16 inputs to MFMA_F32_32x32x8_BF16
- * instructions. The output is accumulated in FP32 and copied back.
+ * Single-param step: delegates to CDNA2 (BF16 overhead exceeds MFMA
+ * benefit for small single-param GEMMs).
  *
- * Scan and fused_elem use the CDNA2 path (wavefront-64 via platform.h).
- * Backward and bilevel also use CDNA2 path.
+ * Bilevel fwd_save and backward: delegate to CDNA2 (wavefront-64
+ * scan via platform.h WARP_SIZE=64).
  */
 
 #include <torch/extension.h>
 #include "platform.h"
 #include "types.h"
+#include "ops.h"
 
 // ═══════════════════════════════════════════════════════════════════════
 //  Forward declarations of CDNA2 launchers
@@ -146,18 +149,78 @@ void launch_mamba3_peer_backward_batched_cdna2(
 
 
 // ═══════════════════════════════════════════════════════════════════════
-//  CDNA3 Launchers — CDNA2 wavefront-64 scan + BF16 MFMA projections
+//  BF16 MFMA Precompute
 //
-//  The batched step launcher converts projection weights to BF16 before
-//  the scan's internal GEMM precompute. rocBLAS dispatches BF16 inputs
-//  to MFMA_F32_32x32x8_BF16 for ~2x projection throughput.
+//  Runs projection GEMMs with BF16 inputs via torch::mm, which on
+//  MI300X dispatches to rocBLAS MFMA_F32_32x32x8_BF16 for ~2x
+//  throughput over FP32 MFMA. Outputs are FP32 for scan stability.
 //
-//  Single-param step: BF16 conversion overhead exceeds MFMA benefit
-//  for small GEMMs, so we use FP32 MFMA via the CDNA2 path.
+//  The BF16 conversion happens at the GEMM boundary: inputs and weights
+//  are cast to BF16, the GEMM accumulates in FP32, and outputs remain
+//  FP32. This avoids the old BF16→FP32 round-trip bug where weights
+//  were converted to BF16 then back to FP32 before the GEMM.
+// ═══════════════════════════════════════════════════════════════════════
+
+static void cdna3_precompute_bf16(
+    torch::Tensor x_sorted,          // [N, d_model] FP32
+    torch::Tensor in_proj_W,         // [2*d_inner, d_model] FP32
+    torch::Tensor dt_proj_W,         // [d_inner, d_inner]
+    torch::Tensor dt_proj_b,         // [d_inner]
+    torch::Tensor B_proj_W,          // [d_state, d_inner]
+    torch::Tensor C_proj_W,          // [d_state, d_inner]
+    torch::Tensor& pre_x,            // [N, d_inner] output FP32
+    torch::Tensor& pre_z,            // [N, d_inner] output FP32
+    torch::Tensor& pre_dt,           // [N, d_inner] output FP32
+    torch::Tensor& pre_B,            // [N, d_state] output FP32
+    torch::Tensor& pre_C,            // [N, d_state] output FP32
+    int N, int d_model, int d_inner, int d_state
+) {
+    // Convert inputs to BF16 at the GEMM boundary
+    // rocBLAS sees BF16 inputs → dispatches to MFMA_F32_32x32x8_BF16
+    // torch::mm with BF16 inputs accumulates in FP32 on CDNA3
+    auto x_bf16 = x_sorted.to(torch::kBFloat16);
+    auto in_proj_x_bf16 = in_proj_W.narrow(0, 0, d_inner).to(torch::kBFloat16);
+    auto in_proj_z_bf16 = in_proj_W.narrow(0, d_inner, d_inner).to(torch::kBFloat16);
+
+    // x_branch = x_sorted @ in_proj_x.T → [N, d_inner]
+    // BF16 GEMM → FP32 output via torch::mm accumulation
+    pre_x = torch::mm(x_bf16, in_proj_x_bf16.t()).to(torch::kFloat32);
+
+    // z_branch = x_sorted @ in_proj_z.T → [N, d_inner]
+    pre_z = torch::mm(x_bf16, in_proj_z_bf16.t()).to(torch::kFloat32);
+
+    // dt_proj: x_branch @ dt_proj_W.T + bias → softplus
+    auto pre_x_bf16 = pre_x.to(torch::kBFloat16);
+    auto dt_proj_W_bf16 = dt_proj_W.to(torch::kBFloat16);
+    pre_dt = torch::mm(pre_x_bf16, dt_proj_W_bf16.t()).to(torch::kFloat32);
+    pre_dt.add_(dt_proj_b.unsqueeze(0));
+    pre_dt = torch::where(pre_dt > 20.0f, pre_dt, torch::log1p(torch::exp(pre_dt)));
+
+    // B_proj: x_branch @ B_proj_W.T → [N, d_state]
+    auto B_proj_W_bf16 = B_proj_W.to(torch::kBFloat16);
+    pre_B = torch::mm(pre_x_bf16, B_proj_W_bf16.t()).to(torch::kFloat32);
+
+    // C_proj: x_branch @ C_proj_W.T → [N, d_state]
+    auto C_proj_W_bf16 = C_proj_W.to(torch::kBFloat16);
+    pre_C = torch::mm(pre_x_bf16, C_proj_W_bf16.t()).to(torch::kFloat32);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  CDNA3 Launchers
+//
+//  Single-param step: delegates to CDNA2 (BF16 conversion overhead
+//  exceeds MFMA benefit for small single-param GEMMs).
+//
+//  Batched step: uses refactored pipeline with BF16 MFMA precompute:
+//    1. batched_step_setup_and_sort() — shared setup
+//    2. cdna3_precompute_bf16() — BF16 projection GEMMs via MFMA
+//    3. batched_step_scan_and_fused_elem() — shared scan + fused_elem
+//
+//  Bilevel/backward: delegate to CDNA2 (wavefront-64 via platform.h).
 //
 //  MI300X L2 (256MB): meta-net weights (~50KB) are always L2-resident
-//  after first access. No explicit L2 management needed — hardware
-//  LRU cache policy handles it automatically.
+//  after first access. No explicit L2 management needed.
 // ═══════════════════════════════════════════════════════════════════════
 
 void launch_mamba3_peer_step_cdna3(
@@ -248,37 +311,45 @@ void launch_mamba3_peer_batched_step_cdna3(
     int expert_hidden, int num_experts,
     torch::Tensor expert_counts
 ) {
-    // CDNA3 batched step: convert projection weights to BF16 for MFMA
-    // rocBLAS dispatches BF16 inputs to MFMA_F32_32x32x8_BF16
-    auto mamba_fwd_in_proj_bf16 = mamba_fwd_in_proj.to(torch::kBFloat16);
-    auto mamba_bwd_in_proj_bf16 = mamba_bwd_in_proj.to(torch::kBFloat16);
-    auto mamba_fwd_dt_W_bf16 = mamba_fwd_dt_W.to(torch::kBFloat16);
-    auto mamba_bwd_dt_W_bf16 = mamba_bwd_dt_W.to(torch::kBFloat16);
-    auto mamba_fwd_B_proj_bf16 = mamba_fwd_B_proj.to(torch::kBFloat16);
-    auto mamba_bwd_B_proj_bf16 = mamba_bwd_B_proj.to(torch::kBFloat16);
-    auto mamba_fwd_C_proj_bf16 = mamba_fwd_C_proj.to(torch::kBFloat16);
-    auto mamba_bwd_C_proj_bf16 = mamba_bwd_C_proj.to(torch::kBFloat16);
+    // Phase 1: Shared setup — input projection, CUB sort, packing
+    auto ctx = batched_step_setup_and_sort(
+        grads, sharpness_list, mamba_fwd_states, mamba_bwd_states,
+        input_proj_W, input_proj_b, d_model, d_state, d_inner);
 
-    // Convert back to FP32 for the scan kernel (which expects FP32)
-    // The BF16 round-trip through rocBLAS MFMA provides ~2x projection throughput
-    // while scan accumulation stays FP32 for numerical stability
-    launch_mamba3_peer_batched_step_cdna2(
+    if (ctx.total_N == 0) return;
+
+    // Phase 2: BF16 MFMA precompute — real BF16 GEMMs via rocBLAS
+    // Inputs cast to BF16 at the GEMM boundary → MFMA_F32_32x32x8_BF16
+    // Output is FP32 for scan numerical stability
+    torch::Tensor fwd_pre_x, fwd_pre_z, fwd_pre_dt, fwd_pre_B, fwd_pre_C;
+    torch::Tensor bwd_pre_x, bwd_pre_z, bwd_pre_dt, bwd_pre_B, bwd_pre_C;
+
+    cdna3_precompute_bf16(
+        ctx.x_sorted_packed,
+        mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
+        mamba_fwd_B_proj, mamba_fwd_C_proj,
+        fwd_pre_x, fwd_pre_z, fwd_pre_dt, fwd_pre_B, fwd_pre_C,
+        ctx.total_N, d_model, d_inner, d_state);
+
+    cdna3_precompute_bf16(
+        ctx.x_sorted_packed,
+        mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
+        mamba_bwd_B_proj, mamba_bwd_C_proj,
+        bwd_pre_x, bwd_pre_z, bwd_pre_dt, bwd_pre_B, bwd_pre_C,
+        ctx.total_N, d_model, d_inner, d_state);
+
+    // Phase 3: Shared scan + fused_elem (CDNA2 wavefront-64 scan)
+    batched_step_scan_and_fused_elem(
+        ctx,
+        fwd_pre_x, fwd_pre_z, fwd_pre_dt, fwd_pre_B, fwd_pre_C,
+        bwd_pre_x, bwd_pre_z, bwd_pre_dt, bwd_pre_B, bwd_pre_C,
         params, grads, sharpness_list, exp_avgs, exp_avg_sqs, mus,
         gru_states, mamba_fwd_states, mamba_bwd_states,
-        input_proj_W, input_proj_b,
-        mamba_fwd_in_proj_bf16.to(torch::kFloat32),
-        mamba_fwd_dt_W_bf16.to(torch::kFloat32),
-        mamba_fwd_dt_b,
-        mamba_fwd_B_proj_bf16.to(torch::kFloat32),
-        mamba_fwd_C_proj_bf16.to(torch::kFloat32),
-        mamba_fwd_A_log,
+        mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
+        mamba_fwd_B_proj, mamba_fwd_C_proj, mamba_fwd_A_log,
         mamba_fwd_D, mamba_fwd_rope, mamba_fwd_out_proj,
-        mamba_bwd_in_proj_bf16.to(torch::kFloat32),
-        mamba_bwd_dt_W_bf16.to(torch::kFloat32),
-        mamba_bwd_dt_b,
-        mamba_bwd_B_proj_bf16.to(torch::kFloat32),
-        mamba_bwd_C_proj_bf16.to(torch::kFloat32),
-        mamba_bwd_A_log,
+        mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
+        mamba_bwd_B_proj, mamba_bwd_C_proj, mamba_bwd_A_log,
         mamba_bwd_D, mamba_bwd_rope, mamba_bwd_out_proj,
         gru_Wz, gru_bz, gru_Wr, gru_br, gru_Wh, gru_bh,
         peer_query_Ws, prod_keys_A, prod_keys_B,

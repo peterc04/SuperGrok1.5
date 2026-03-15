@@ -1,19 +1,21 @@
 /*
  * SuperGrok v2 — Ampere-Optimized Forward Kernels (sm_80+)
  *
- * Real Ampere tier optimizations:
- *   - TF32 Tensor Cores for projection GEMMs (2x FP32 throughput)
- *   - cp.async for double-buffered prefetch of scan input data
- *   - 192KB configurable shared memory
- *   - BF16 projection path with FP32 accumulation
+ * Contains two real __global__ cp.async scan kernels:
+ *   - mamba3_scan_batched_cpasync_kernel: sequential batched scan with
+ *     double-buffered __pipeline_memcpy_async prefetch of scan input data.
+ *     While processing timestep t, timestep t+1 is prefetched from global
+ *     memory to shared memory via cp.async.
+ *   - mamba3_scan_combined_cpasync_kernel: sequential combined (fwd+bwd)
+ *     scan with the same cp.async double-buffered prefetch pattern.
  *
- * The cp.async prefetch is used in the sequential batched scan kernel:
- * while processing timestep t, we asynchronously prefetch the input data
- * for timestep t+1 from global memory to shared memory. This overlaps
- * memory latency with compute, reducing scan kernel time by ~30-40%.
+ * These kernels are dispatched by the generic code via #if __CUDA_ARCH__
+ * >= 800 guards within the scan kernel compilation units.
  *
- * For the parallel scan path (N >= PSCAN_THRESHOLD), we use the generic
- * Blelloch kernel with TF32 cuBLAS for the precompute phase.
+ * Step and batched step launchers delegate to generic with TF32 mode set.
+ * The generic step/batched_step code uses custom CUDA kernels (not cuBLAS),
+ * so TF32 mode has no effect on those paths. The real Ampere benefit comes
+ * from the cp.async scan kernels above.
  *
  * Dispatch: ops.cpp calls these on sm_80+ GPUs.
  * Fallback: On sm_70/sm_75, the generic launchers are called instead.
@@ -504,12 +506,15 @@ __global__ void mamba3_scan_combined_cpasync_kernel(
 
 
 // ═══════════════════════════════════════════════════════════════════════
-//  Ampere Forward: Per-Parameter Step
+//  Ampere Forward: Per-Parameter Step — delegates to generic
 //
-//  Sets cuBLAS TF32 math mode for projection GEMMs, then delegates
-//  to the generic launcher. The generic launcher's parallel scan path
-//  uses cuBLAS for precompute GEMMs when N >= GEMM_PRECOMPUTE_THRESHOLD,
-//  which benefits from TF32 (2x throughput, ~1e-4 precision).
+//  The generic single-param step uses only custom CUDA kernels
+//  (input_proj_sort_kernel, mamba3_scan_combined_kernel, fused_elem_step_kernel),
+//  not cuBLAS/torch::mm, so TF32 mode set here has no effect on the
+//  single-param path. The real Ampere optimization for single-param is
+//  the cp.async scan kernel dispatched by the generic code via
+//  #if __CUDA_ARCH__ >= 800 guards within the scan kernels.
+//  TF32 mode is set for consistency with the architecture tier contract.
 // ═══════════════════════════════════════════════════════════════════════
 
 void launch_mamba3_peer_step_ampere(
@@ -570,7 +575,14 @@ void launch_mamba3_peer_step_ampere(
 
 
 // ═══════════════════════════════════════════════════════════════════════
-//  Ampere Forward: Batched Step
+//  Ampere Forward: Batched Step — delegates to generic
+//
+//  Same as single-param: generic batched step uses custom CUDA kernels
+//  (mamba3_parallel_precompute_kernel, mamba3_parallel_scan_batched_kernel,
+//  fused_elem_step_kernel), not cuBLAS/torch::mm. TF32 mode is set for
+//  consistency but has no effect. The cp.async scan kernels in this file
+//  are used when the generic batched code dispatches to Ampere scan via
+//  the arch tier system, which is the real Ampere optimization.
 // ═══════════════════════════════════════════════════════════════════════
 
 void launch_mamba3_peer_batched_step_ampere(

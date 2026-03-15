@@ -20,6 +20,26 @@
 #include <torch/extension.h>
 #include <vector>
 
+// Context struct for passing intermediate state between batched scan phases.
+// Used by batched_step_setup_and_sort, generic_batched_precompute, and
+// batched_step_scan_and_fused_elem to avoid duplicating setup code across tiers.
+struct BatchedScanCtx {
+    int num_params;
+    int total_N;
+    int max_N;
+    std::vector<int> N_vec;
+    std::vector<int> seg_offsets_cpu;
+    torch::Tensor x_sorted_packed;
+    torch::Tensor offsets_t;
+    torch::Tensor initial_fwd;
+    torch::Tensor initial_bwd;
+    torch::Tensor final_fwd;
+    torch::Tensor final_bwd;
+    torch::Tensor fwd_scan_packed;
+    torch::Tensor bwd_scan_packed;
+    std::vector<torch::Tensor> unsort_idx_list;
+};
+
 // ═══════════════════════════════════════════════════════════════════════
 //  CUDA Kernel Launchers (defined in respective .cu files)
 // ═══════════════════════════════════════════════════════════════════════
@@ -1205,6 +1225,63 @@ void supergrok2_mamba_peer_batched_step(
     std::vector<torch::Tensor> mamba_fwd_states,
     std::vector<torch::Tensor> mamba_bwd_states,
     torch::Tensor input_proj_W, torch::Tensor input_proj_b,
+    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
+    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
+    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
+    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
+    torch::Tensor mamba_fwd_out_proj,
+    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
+    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
+    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
+    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
+    torch::Tensor mamba_bwd_out_proj,
+    torch::Tensor gru_Wz, torch::Tensor gru_bz,
+    torch::Tensor gru_Wr, torch::Tensor gru_br,
+    torch::Tensor gru_Wh, torch::Tensor gru_bh,
+    torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+    torch::Tensor expert_W1, torch::Tensor expert_b1,
+    torch::Tensor expert_W2, torch::Tensor expert_b2,
+    std::vector<float> alpha_mus, std::vector<float> lamb_effs,
+    std::vector<float> beta1s, std::vector<float> bc1s, std::vector<float> bc2s,
+    float rescale, float beta2, float lr, float wd_eff, float eps,
+    int d_model, int d_state, int d_inner,
+    int gru_hidden, int num_heads, int pk_dim,
+    int expert_hidden, int num_experts,
+    torch::Tensor expert_counts);
+
+// Batched scan pipeline: setup/sort → precompute → scan+fused_elem
+// These allow tier-specific precompute (FP8, BF16) with shared scan+fused_elem.
+BatchedScanCtx batched_step_setup_and_sort(
+    std::vector<torch::Tensor> grads,
+    std::vector<torch::Tensor> sharpness_list,
+    std::vector<torch::Tensor> mamba_fwd_states,
+    std::vector<torch::Tensor> mamba_bwd_states,
+    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
+    int d_model, int d_state, int d_inner);
+
+void generic_batched_precompute(
+    const BatchedScanCtx& ctx,
+    torch::Tensor in_proj_W, torch::Tensor dt_proj_W, torch::Tensor dt_proj_b,
+    torch::Tensor B_proj_W, torch::Tensor C_proj_W,
+    torch::Tensor& pre_x, torch::Tensor& pre_z, torch::Tensor& pre_dt,
+    torch::Tensor& pre_B, torch::Tensor& pre_C,
+    int d_model, int d_inner, int d_state);
+
+void batched_step_scan_and_fused_elem(
+    BatchedScanCtx& ctx,
+    torch::Tensor fwd_pre_x, torch::Tensor fwd_pre_z, torch::Tensor fwd_pre_dt,
+    torch::Tensor fwd_pre_B, torch::Tensor fwd_pre_C,
+    torch::Tensor bwd_pre_x, torch::Tensor bwd_pre_z, torch::Tensor bwd_pre_dt,
+    torch::Tensor bwd_pre_B, torch::Tensor bwd_pre_C,
+    std::vector<torch::Tensor> params,
+    std::vector<torch::Tensor> grads,
+    std::vector<torch::Tensor> sharpness_list,
+    std::vector<torch::Tensor> exp_avgs,
+    std::vector<torch::Tensor> exp_avg_sqs,
+    std::vector<torch::Tensor> mus,
+    std::vector<torch::Tensor> gru_states,
+    std::vector<torch::Tensor> mamba_fwd_states,
+    std::vector<torch::Tensor> mamba_bwd_states,
     torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
     torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
     torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,

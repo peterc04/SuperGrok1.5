@@ -1,15 +1,16 @@
 /*
- * SuperGrok v2 — Hopper-Optimized Backward Kernels (sm_90+)
+ * SuperGrok v2 — Hopper Backward Kernels (sm_90+) — Delegates to Ampere
  *
- * Hopper backward optimizations:
- *   - FP8 E4M3 cuBLAS GEMMs for bilevel projection precompute (2x over TF32)
- *     Applied when CUDA >= 11.8 and N >= GEMM_PRECOMPUTE_THRESHOLD.
- *   - Falls back to Ampere TF32 path when FP8 unavailable.
- *   - Two-pass backward GEMMs also use FP8 when available.
+ * Both backward launchers (bilevel fwd-save and bilevel backward) delegate
+ * entirely to the Ampere backward launchers. The cp.async double-buffered
+ * backward kernel in sm_80 already saturates memory bandwidth, so a
+ * Hopper-specific backward kernel would not improve throughput.
  *
- * The bilevel forward-save and backward passes both benefit from FP8
- * projections because they process all parameters packed together,
- * making the GEMM sizes large enough to amortize FP8 overhead.
+ * FP8 backward is not implemented: it would require custom gradient
+ * quantization (per-tensor or per-channel scaling of activation gradients
+ * and weight gradients) that is not yet written. cuBLAS does NOT
+ * auto-select FP8 Tensor Core instructions — FP8 GEMMs require explicit
+ * FP8-typed inputs via cublasGemmEx with CUDA_R_8F_E4M3 descriptors.
  *
  * Dispatch: ops.cpp calls these on sm_90+ GPUs.
  */
@@ -82,10 +83,9 @@ void launch_mamba3_peer_backward_batched_ampere(
 // ═══════════════════════════════════════════════════════════════════════
 //  Hopper Backward: Bilevel Forward-Save (Batched)
 //
-//  Sets cuBLAS to use FP8 (via Ampere TF32 path + FP8 projection
-//  precompute). The Ampere backward launcher handles TF32 cuBLAS mode
-//  and cp.async scan; on Hopper, the projection GEMMs in the precompute
-//  phase benefit from FP8 when the launcher detects sm_90+.
+//  Delegates to Ampere bilevel fwd-save. The cp.async double-buffered
+//  scan in sm_80 already saturates memory bandwidth; no Hopper-specific
+//  backward kernel is needed.
 // ═══════════════════════════════════════════════════════════════════════
 
 void launch_mamba3_peer_bilevel_fwd_save_batched_hopper(
@@ -113,11 +113,9 @@ void launch_mamba3_peer_bilevel_fwd_save_batched_hopper(
     torch::Tensor fwd_initial_states, torch::Tensor bwd_initial_states,
     int checkpoint_interval
 ) {
-    // FP8 projections are applied within the Ampere launcher's GEMM precompute
-    // path when cuBLAS detects sm_90+ hardware. The launcher sets TF32 mode,
-    // which on Hopper is upgraded to FP8 by cuBLAS when tensor types allow it.
-    // For explicit FP8 control, the hopper_precompute_fp8() helper is available
-    // in the forward scan file for use by the bilevel precompute codepath.
+    // Delegates to Ampere backward. The cp.async double-buffered backward
+    // in sm_80 already saturates memory bandwidth. FP8 backward would require
+    // custom gradient quantization that isn't implemented yet.
     launch_mamba3_peer_bilevel_fwd_save_batched_ampere(
         grads, sharpness_list,
         input_proj_W, input_proj_b,
@@ -142,9 +140,9 @@ void launch_mamba3_peer_bilevel_fwd_save_batched_hopper(
 // ═══════════════════════════════════════════════════════════════════════
 //  Hopper Backward: Bilevel Backward (Batched)
 //
-//  Two-pass GEMM backward benefits from FP8 on Hopper. The Ampere
-//  launcher sets TF32 mode; on sm_90+ cuBLAS can use FP8 Tensor Cores
-//  for the accumulated projection weight gradients.
+//  Delegates to Ampere backward. cuBLAS does NOT auto-select FP8 —
+//  the Ampere launcher uses TF32 mode for all projection GEMMs.
+//  FP8 backward would require explicit gradient quantization.
 // ═══════════════════════════════════════════════════════════════════════
 
 void launch_mamba3_peer_backward_batched_hopper(
@@ -176,8 +174,8 @@ void launch_mamba3_peer_backward_batched_hopper(
     int d_model, int d_state, int d_inner, int num_params,
     int checkpoint_interval
 ) {
-    // Ampere backward with TF32 mode; on Hopper hardware, cuBLAS
-    // auto-selects FP8 Tensor Core instructions when beneficial.
+    // Delegates to Ampere backward (TF32 + cp.async). FP8 backward is not
+    // implemented — would require custom gradient quantization.
     launch_mamba3_peer_backward_batched_ampere(
         d_fwd_scan_out_packed, d_bwd_scan_out_packed,
         x_sorted_packed,

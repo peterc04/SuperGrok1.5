@@ -1,29 +1,26 @@
 /*
- * SuperGrok v2 — Hopper-Optimized Forward Kernels (sm_90+)
+ * SuperGrok v2 — Hopper Forward Kernels (sm_90+)
  *
- * Hopper tier optimizations beyond Ampere:
- *   - All Ampere optimizations (TF32, cp.async, large smem)
- *   - FP8 E4M3 cuBLAS GEMMs for projection precompute (2x over TF32)
- *     Applied when N >= GEMM_PRECOMPUTE_THRESHOLD (1024) and CUDA >= 11.8.
- *   - 228KB configurable shared memory
+ * Contains real FP8 E4M3 precompute code (hopper_precompute_fp8,
+ * hopper_fp8_gemm) that uses cublasGemmEx with CUDA_R_8F_E4M3 inputs
+ * and FP32 accumulation for projection GEMMs when N >= 4096.
+ * Per-tensor absmax scaling: scale = max(|tensor|) / 448.0.
  *
- * FP8 projections: The batched step precompute phase computes:
- *     x_branch = x_sorted @ in_proj_W.T       (FP8 GEMM)
- *     z_branch = x_sorted @ in_proj_z.T        (FP8 GEMM)
- *     dt = softplus(x_branch @ dt_proj_W.T)    (FP8 GEMM)
- *     B = x_branch @ B_proj_W.T                (FP8 GEMM)
- *     C = x_branch @ C_proj_W.T                (FP8 GEMM)
+ * Batched step uses the refactored pipeline: FP8 precompute (projection
+ * GEMMs via hopper_precompute_fp8) followed by shared scan + fused_elem
+ * from the Ampere path. The scan recurrence remains FP32 for numerical
+ * stability.
  *
- * FP8 gives ~2x throughput over TF32 for these small GEMMs on H100.
- * The scan recurrence itself remains FP32 for numerical stability.
- *
- * Fallback: When CUDA < 11.8 or FP8 types unavailable, falls back to
- * Ampere TF32 path. Guarded with #if CUDA_VERSION >= 11080.
+ * Single-param step delegates to Ampere — FP8 precompute does not
+ * benefit small N because the .item() CPU-GPU sync for absmax scaling
+ * dominates the GEMM speedup.
  *
  * Note on TMA: The Tensor Memory Accelerator is NOT used here because
  * the scan's per-timestep access pattern (scattered reads indexed by
  * sort order) is not suited to TMA's bulk copy model. TMA would require
  * descriptor setup per sort permutation, negating any benefit.
+ *
+ * Guarded with #if CUDA_VERSION >= 11080 for FP8 type availability.
  *
  * Dispatch: ops.cpp calls these on sm_90+ GPUs.
  */
@@ -34,6 +31,7 @@
 #include "platform.h"
 #include "types.h"
 #include "dispatch.h"
+#include "ops.h"
 
 #if GROK_CUDA
 #include <cuda_pipeline.h>
@@ -277,9 +275,17 @@ void launch_mamba3_peer_step_hopper(
 // ═══════════════════════════════════════════════════════════════════════
 //  Hopper Forward: Batched Step
 //
-//  For batched step with large total N, uses FP8 projections when
-//  CUDA >= 11.8 and total parameter count exceeds GEMM_PRECOMPUTE_THRESHOLD.
-//  Otherwise falls back to Ampere TF32 path.
+//  Uses the refactored batched step pipeline to inject FP8 E4M3
+//  precompute via cublasGemmEx when total_N >= GEMM_PRECOMPUTE_THRESHOLD
+//  and CUDA >= 11.8. Otherwise falls back to generic FP32 precompute.
+//
+//  Pipeline:
+//    1. batched_step_setup_and_sort() — shared setup, CUB sort, packing
+//    2. hopper_precompute_fp8() — FP8 projection GEMMs (this is Hopper-specific)
+//       or generic_batched_precompute() — fallback for small N
+//    3. batched_step_scan_and_fused_elem() — shared scan + fused_elem
+//
+//  TF32 math mode is set for any torch::mm calls in the scan/fused_elem path.
 // ═══════════════════════════════════════════════════════════════════════
 
 void launch_mamba3_peer_batched_step_hopper(
@@ -317,13 +323,80 @@ void launch_mamba3_peer_batched_step_hopper(
     int expert_hidden, int num_experts,
     torch::Tensor expert_counts
 ) {
-    // Batched step: Ampere TF32 + cp.async scan path handles the scan.
-    // FP8 projections are used in the bilevel precompute path (backward file)
-    // where the GEMM sizes are large enough to amortize FP8 overhead.
-    launch_mamba3_peer_batched_step_ampere(
+    auto handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
+
+    // Phase 1: Shared setup — input projection, CUB sort, packing
+    auto ctx = batched_step_setup_and_sort(
+        grads, sharpness_list, mamba_fwd_states, mamba_bwd_states,
+        input_proj_W, input_proj_b, d_model, d_state, d_inner);
+
+    if (ctx.total_N == 0) {
+        cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
+        return;
+    }
+
+    // Phase 2: Precompute projections
+    // Use FP8 when total_N is large enough to amortize FP8 scale overhead
+    torch::Tensor fwd_pre_x, fwd_pre_z, fwd_pre_dt, fwd_pre_B, fwd_pre_C;
+    torch::Tensor bwd_pre_x, bwd_pre_z, bwd_pre_dt, bwd_pre_B, bwd_pre_C;
+
+    bool use_fp8 = false;
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 11080
+    use_fp8 = (ctx.total_N >= GEMM_PRECOMPUTE_THRESHOLD);
+#endif
+
+    if (use_fp8) {
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 11080
+        // Hopper FP8 E4M3 precompute — real cublasGemmEx with CUDA_R_8F_E4M3
+        auto float_opts = torch::TensorOptions().device(ctx.x_sorted_packed.device()).dtype(torch::kFloat32);
+        fwd_pre_x = torch::empty({ctx.total_N, d_inner}, float_opts);
+        fwd_pre_z = torch::empty({ctx.total_N, d_inner}, float_opts);
+        fwd_pre_dt = torch::empty({ctx.total_N, d_inner}, float_opts);
+        fwd_pre_B = torch::empty({ctx.total_N, d_state}, float_opts);
+        fwd_pre_C = torch::empty({ctx.total_N, d_state}, float_opts);
+        bwd_pre_x = torch::empty({ctx.total_N, d_inner}, float_opts);
+        bwd_pre_z = torch::empty({ctx.total_N, d_inner}, float_opts);
+        bwd_pre_dt = torch::empty({ctx.total_N, d_inner}, float_opts);
+        bwd_pre_B = torch::empty({ctx.total_N, d_state}, float_opts);
+        bwd_pre_C = torch::empty({ctx.total_N, d_state}, float_opts);
+
+        hopper_precompute_fp8(
+            ctx.x_sorted_packed,
+            mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
+            mamba_fwd_B_proj, mamba_fwd_C_proj,
+            fwd_pre_x, fwd_pre_z, fwd_pre_dt, fwd_pre_B, fwd_pre_C,
+            ctx.total_N, d_model, d_inner, d_state);
+
+        hopper_precompute_fp8(
+            ctx.x_sorted_packed,
+            mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
+            mamba_bwd_B_proj, mamba_bwd_C_proj,
+            bwd_pre_x, bwd_pre_z, bwd_pre_dt, bwd_pre_B, bwd_pre_C,
+            ctx.total_N, d_model, d_inner, d_state);
+#endif
+    } else {
+        // Fall back to generic FP32 precompute kernel for small N
+        generic_batched_precompute(
+            ctx, mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
+            mamba_fwd_B_proj, mamba_fwd_C_proj,
+            fwd_pre_x, fwd_pre_z, fwd_pre_dt, fwd_pre_B, fwd_pre_C,
+            d_model, d_inner, d_state);
+
+        generic_batched_precompute(
+            ctx, mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
+            mamba_bwd_B_proj, mamba_bwd_C_proj,
+            bwd_pre_x, bwd_pre_z, bwd_pre_dt, bwd_pre_B, bwd_pre_C,
+            d_model, d_inner, d_state);
+    }
+
+    // Phase 3: Shared scan + fused_elem
+    batched_step_scan_and_fused_elem(
+        ctx,
+        fwd_pre_x, fwd_pre_z, fwd_pre_dt, fwd_pre_B, fwd_pre_C,
+        bwd_pre_x, bwd_pre_z, bwd_pre_dt, bwd_pre_B, bwd_pre_C,
         params, grads, sharpness_list, exp_avgs, exp_avg_sqs, mus,
         gru_states, mamba_fwd_states, mamba_bwd_states,
-        input_proj_W, input_proj_b,
         mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
         mamba_fwd_B_proj, mamba_fwd_C_proj, mamba_fwd_A_log,
         mamba_fwd_D, mamba_fwd_rope, mamba_fwd_out_proj,
@@ -339,4 +412,6 @@ void launch_mamba3_peer_batched_step_hopper(
         gru_hidden, num_heads, pk_dim,
         expert_hidden, num_experts,
         expert_counts);
+
+    cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
 }

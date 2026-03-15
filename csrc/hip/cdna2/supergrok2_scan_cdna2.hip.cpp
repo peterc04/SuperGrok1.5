@@ -1,20 +1,17 @@
 /*
- * SuperGrok v2 — CDNA2-Optimized Scan Kernel (gfx90a, MI250)
+ * SuperGrok v2 — CDNA2 Scan Launchers (gfx90a, MI250) — Delegates to Generic
  *
- * Wavefront-64 optimization for the Blelloch parallel prefix scan:
- *   - platform.h sets WARP_SIZE=64 on CDNA via __AMDGCN_WAVEFRONT_SIZE__
- *   - The generic Blelloch scan kernel uses WARP_SIZE for sync skip decisions:
- *     strides where stride*2 < WARP_SIZE skip __syncthreads() because all
- *     threads in the wavefront execute in lockstep
- *   - On CDNA2 with WARP_SIZE=64: strides 1,2,4,8,16,32 are intra-wavefront
- *     (6 __syncthreads() saved per scan direction per state pair)
- *   - rocBLAS automatically uses MFMA_F32_16x16x4 for FP32 projection GEMMs
- *   - No explicit MFMA intrinsics needed — ATen's mm dispatches to rocBLAS
+ * CDNA2 delegates to generic kernels which are now WARP_SIZE-aware. The
+ * generic Blelloch scan uses `if (stride * 2 >= WARP_SIZE) __syncthreads()`
+ * which correctly skips barriers for intra-wavefront strides on CDNA2
+ * (WARP_SIZE=64, skips strides 1-32). No CDNA2-specific kernel is needed
+ * because the platform.h abstraction handles the wavefront size difference.
  *
- * The wavefront-64 sync skip is achieved transparently through platform.h's
- * WARP_SIZE definition. The forward step and batched step launchers delegate
- * to the generic path where platform.h handles wavefront-64 automatically.
- * Fused_elem, backward, and bilevel also use the generic path via platform.h.
+ * platform.h sets WARP_SIZE=64 on CDNA via __AMDGCN_WAVEFRONT_SIZE__ and
+ * maps SHFL_DOWN to the appropriate AMD intrinsic. All launchers (step,
+ * batched step, bilevel fwd-save, backward) forward directly to the
+ * generic path. rocBLAS handles FP32 projection GEMMs via ATen's mm
+ * dispatch — no explicit MFMA intrinsics needed.
  */
 
 #include <torch/extension.h>
