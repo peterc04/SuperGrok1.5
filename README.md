@@ -6,11 +6,9 @@ A comprehensive benchmark suite for studying **grokking** (delayed generalizatio
 
 ```bash
 # 1. Build the C++/CUDA optimizer extension
-cd grokking_race_package/grokking_optimizers
 pip install -e .
 
 # 2. Run the benchmark (single GPU)
-cd ..
 python grokking_race_v2.py
 
 # 3. Run (multi-GPU — fast, still fair)
@@ -62,8 +60,7 @@ Additional features: dynamic expert recycling, sigmoid-driven SAM/bilevel/WD sch
 ## Testing
 
 ```bash
-cd grokking_race_package
-python test_supergrok2.py
+python tests/test_supergrok2.py
 ```
 
 The test suite (`test_supergrok2.py`) covers 12 areas:
@@ -91,46 +88,63 @@ Each test reports PASS/FAIL. Exit code 0 = all pass, 1 = any failure.
 - **Vision Transformer (ViT)** — patch embeddings for image classification
 - **Mamba SSM** — selective state space model (linear-time sequence processing)
 
-## File Structure
+## Directory Structure
 
 ```
-grokking_race_package/
-├── grokking_race_v2.py                         # Benchmark harness (1,687 lines)
+./
+├── csrc/
+│   ├── common/                                 # Shared headers and pybind dispatch
+│   │   ├── types.h                             # Affine2x2, constants, common structs
+│   │   ├── utils.cuh                           # warp_reduce_sum, device helpers
+│   │   ├── ops.h                               # Master C++ declarations
+│   │   └── ops.cpp                             # Pybind11 dispatch
+│   │
+│   ├── cuda/
+│   │   └── generic/                            # Architecture-independent CUDA kernels
+│   │       ├── supergrok2_mamba_peer_kernels.cu
+│   │       ├── supergrok2_mamba_peer_backward_kernels.cu
+│   │       ├── supergrok15_kernels.cu
+│   │       ├── supergrok11_kernels.cu
+│   │       ├── grokadamw_kernels.cu
+│   │       ├── neuralgrok_kernels.cu
+│   │       ├── prodigy_kernels.cu
+│   │       ├── grokfast_kernels.cu
+│   │       ├── lion_kernels.cu
+│   │       ├── looksam_kernels.cu
+│   │       └── muon_kernels.cu
+│   │   ├── sm_75/ .. sm_100/                   # Per-architecture specialized kernels (future)
+│   │
+│   ├── hip/                                    # AMD ROCm/HIP kernels (future)
+│   ├── cpu/                                    # CPU fallback kernels (future)
+│   └── quantization/                           # Quantization kernels (future)
+│
+├── jax/                                        # TPU/JAX implementation (future)
+│
+├── grokking_optimizers/                        # Python package
+│   ├── __init__.py                             # Package exports
+│   ├── dispatch.py                             # Runtime hardware detection
+│   ├── supergrok2.py                           # SuperGrok v2 optimizer
+│   ├── mamba3_peer_metanet.py                  # Mamba-3+PEER+GRU meta-net
+│   ├── supergrok15.py                          # SuperGrok v1.5 optimizer
+│   ├── supergrok11.py                          # SuperGrok v1.1 optimizer
+│   ├── grokadamw.py                            # GrokAdamW
+│   ├── neuralgrok.py                           # NeuralGrok
+│   ├── prodigy.py                              # Prodigy
+│   ├── grokfast.py                             # Grokfast
+│   ├── lion.py                                 # Lion
+│   ├── looksam.py                              # LookSAM
+│   ├── muon.py                                 # Muon
+│   └── cuda_graph_optimizer.py                 # CUDA graph wrapper
+│
+├── tests/                                      # Test suite
+│   └── test_supergrok2.py
+│
+├── setup.py                                    # Build script (sm_70–sm_90)
+├── pyproject.toml
+├── grokking_race_v2.py                         # Benchmark harness
 ├── README.md
-├── ANALYSIS.md
-├── grokking_optimizers/                        # C++/CUDA optimizer package
-│   ├── setup.py                                # Build script (sm_70–sm_90)
-│   └── grokking_optimizers/
-│       ├── __init__.py                         # Package exports
-│       ├── supergrok2.py                       # SuperGrok v2 optimizer (1,049 lines)
-│       ├── mamba3_peer_metanet.py              # Mamba-3+PEER+GRU meta-net (574 lines)
-│       ├── supergrok15.py                      # SuperGrok v1.5 optimizer (478 lines)
-│       ├── supergrok11.py                      # SuperGrok v1.1 optimizer (296 lines)
-│       ├── grokadamw.py                        # GrokAdamW (144 lines)
-│       ├── neuralgrok.py                       # NeuralGrok (228 lines)
-│       ├── prodigy.py                          # Prodigy (136 lines)
-│       ├── grokfast.py                         # Grokfast (145 lines)
-│       ├── lion.py                             # Lion (101 lines)
-│       ├── looksam.py                          # LookSAM (247 lines)
-│       ├── muon.py                             # Muon (210 lines)
-│       └── cuda_graph_optimizer.py             # CUDA graph wrapper (168 lines)
-│   └── csrc/
-│       ├── ops.h                               # C++ declarations (554 lines)
-│       ├── ops.cpp                             # Pybind11 dispatch (1,076 lines)
-│       ├── supergrok2_mamba_peer_kernels.cu    # v2 forward kernels (1,218 lines)
-│       ├── supergrok2_mamba_peer_backward_kernels.cu  # v2 backward kernels (1,963 lines)
-│       ├── supergrok15_kernels.cu              # v1.5 kernels (464 lines)
-│       ├── supergrok11_kernels.cu              # v1.1 kernels (349 lines)
-│       ├── grokadamw_kernels.cu                # GrokAdamW kernels (140 lines)
-│       ├── neuralgrok_kernels.cu               # NeuralGrok kernels (233 lines)
-│       ├── prodigy_kernels.cu                  # Prodigy kernels (254 lines)
-│       ├── grokfast_kernels.cu                 # Grokfast kernels (60 lines)
-│       ├── lion_kernels.cu                     # Lion kernels (79 lines)
-│       ├── looksam_kernels.cu                  # LookSAM kernels (155 lines)
-│       └── muon_kernels.cu                     # Muon kernels (146 lines)
+└── ANALYSIS.md
 ```
-
-Total: ~12,400 lines (5,500 Python, 4,500 CUDA, 1,600 C++)
 
 ## Configuration
 

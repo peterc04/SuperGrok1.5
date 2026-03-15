@@ -29,21 +29,22 @@ print(f"  CUDA version: {torch.version.cuda}")
 ext = CUDAExtension(
     name="grokking_optimizers._ops",
     sources=[
-        "csrc/ops.cpp",
+        "csrc/common/ops.cpp",
         # SuperGrok family
-        "csrc/supergrok15_kernels.cu",
-        "csrc/supergrok11_kernels.cu",
-        "csrc/supergrok2_mamba_peer_kernels.cu",
-        "csrc/supergrok2_mamba_peer_backward_kernels.cu",
+        "csrc/cuda/generic/supergrok15_kernels.cu",
+        "csrc/cuda/generic/supergrok11_kernels.cu",
+        "csrc/cuda/generic/supergrok2_mamba_peer_kernels.cu",
+        "csrc/cuda/generic/supergrok2_mamba_peer_backward_kernels.cu",
         # Other optimizers
-        "csrc/grokadamw_kernels.cu",
-        "csrc/neuralgrok_kernels.cu",
-        "csrc/prodigy_kernels.cu",
-        "csrc/grokfast_kernels.cu",
-        "csrc/lion_kernels.cu",
-        "csrc/looksam_kernels.cu",
-        "csrc/muon_kernels.cu",
+        "csrc/cuda/generic/grokadamw_kernels.cu",
+        "csrc/cuda/generic/neuralgrok_kernels.cu",
+        "csrc/cuda/generic/prodigy_kernels.cu",
+        "csrc/cuda/generic/grokfast_kernels.cu",
+        "csrc/cuda/generic/lion_kernels.cu",
+        "csrc/cuda/generic/looksam_kernels.cu",
+        "csrc/cuda/generic/muon_kernels.cu",
     ],
+    include_dirs=["csrc/common", "csrc"],
     define_macros=[("WITH_CUDA", None)],
     extra_compile_args={
         "cxx": [

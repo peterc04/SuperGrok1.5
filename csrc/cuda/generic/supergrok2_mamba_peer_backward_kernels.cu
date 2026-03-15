@@ -33,60 +33,8 @@
 #include <thrust/sort.h>
 #include <thrust/device_ptr.h>
 
-constexpr int SG2B_BLOCK = 256;
-constexpr int MAX_D_STATE = 32;
-constexpr int MAX_D_INNER = 32;
-constexpr int MAX_D_MODEL = 16;
-constexpr int MAX_TOPK = 4;
-constexpr int MAX_CKPT_INTERVAL = 32;  // max checkpoint interval for bilevel gradient checkpointing
-constexpr int PSCAN_BLOCK = 512;       // threads per parallel scan block (power of 2)
-constexpr int PSCAN_THRESHOLD = 256;   // fall back to sequential if N < this
-
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Warp-level reduction helper for two-pass backward
-//
-//  Sum a float across d_inner threads (all in one warp, d_inner ≤ 32).
-//  Uses __shfl_down_sync; works for any d_inner ≤ 32 (including non-power-of-2).
-// ═══════════════════════════════════════════════════════════════════════
-
-__device__ __forceinline__ float warp_reduce_sum(float val, int d_inner, int tid) {
-    unsigned mask = (d_inner < 32) ? ((1u << d_inner) - 1) : 0xFFFFFFFF;
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        float other = __shfl_down_sync(mask, val, offset);
-        if (tid + offset < d_inner)
-            val += other;
-    }
-    return val;  // only lane 0 has the correct sum
-}
-
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Parallel Prefix Scan Infrastructure (mirrors forward file)
-//
-//  Affine recurrence: h[t] = M[t] * h[t-1] + b[t]
-//  2×2 affine transforms for paired RoPE state dimensions.
-// ═══════════════════════════════════════════════════════════════════════
-
-struct Affine2x2 {
-    float m00, m01, m10, m11;
-    float b0, b1;
-};
-
-__device__ __forceinline__ Affine2x2 affine_identity() {
-    return {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
-}
-
-__device__ __forceinline__ Affine2x2 affine_combine(Affine2x2 left, Affine2x2 right) {
-    Affine2x2 out;
-    out.m00 = right.m00 * left.m00 + right.m01 * left.m10;
-    out.m01 = right.m00 * left.m01 + right.m01 * left.m11;
-    out.m10 = right.m10 * left.m00 + right.m11 * left.m10;
-    out.m11 = right.m10 * left.m01 + right.m11 * left.m11;
-    out.b0  = right.m00 * left.b0  + right.m01 * left.b1 + right.b0;
-    out.b1  = right.m10 * left.b0  + right.m11 * left.b1 + right.b1;
-    return out;
-}
+#include "types.h"
+#include "utils.cuh"
 
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -184,8 +132,6 @@ __global__ void softplus_bias_kernel(
 //    B        [N,d_state] = x_branch [N,d_inner] × B_proj_W.T
 //    C        [N,d_state] = x_branch [N,d_inner] × C_proj_W.T
 // ═══════════════════════════════════════════════════════════════════════
-
-constexpr int GEMM_PRECOMPUTE_THRESHOLD = 1024;  // use GEMM when N >= this
 
 static void bilevel_precompute_gemm(
     torch::Tensor x_sorted,       // [N, d_model]
