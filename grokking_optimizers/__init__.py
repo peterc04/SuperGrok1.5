@@ -15,7 +15,7 @@ try:
 except ImportError as e:
     raise ImportError(
         "grokking_optimizers C++/CUDA extension not found. "
-        "Build with: pip install -e . (from the grokking_optimizers directory). "
+        "Build with: pip install -e . (from the repo root). "
         f"Original error: {e}"
     ) from e
 
