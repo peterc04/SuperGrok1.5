@@ -31,6 +31,78 @@ constexpr int MAX_CKPT_INTERVAL = 32;  // max checkpoint interval for bilevel gr
 
 
 // ═══════════════════════════════════════════════════════════════════════
+//  Utility Kernels: Segmented Reverse and Combine+Flip
+//
+//  Replace per-param C++ loops calling .flip().copy_() with single
+//  CUDA kernel launches for all segments.
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void reverse_segments_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    const int* __restrict__ offsets,
+    const int d,           // stride (e.g., d_model)
+    const int num_params
+) {
+    // Grid: total_elements = total_N * d
+    // Each thread reverses one (row, col) element within its segment
+    const int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_N = offsets[num_params];
+    if (global_idx >= total_N * d) return;
+
+    const int row = global_idx / d;
+    const int col = global_idx % d;
+
+    // Binary search for segment
+    int lo = 0, hi = num_params;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (offsets[mid + 1] <= row) lo = mid + 1;
+        else hi = mid;
+    }
+    const int seg_start = offsets[lo];
+    const int seg_end = offsets[lo + 1];
+    const int local_row = row - seg_start;
+    const int N = seg_end - seg_start;
+    const int reversed_row = seg_start + (N - 1 - local_row);
+
+    dst[reversed_row * d + col] = src[row * d + col];
+}
+
+__global__ void combine_fwd_bwd_kernel(
+    const float* __restrict__ fwd,
+    const float* __restrict__ bwd,
+    float* __restrict__ out,
+    const int* __restrict__ offsets,
+    const int d,           // d_model
+    const int num_params
+) {
+    // out = fwd + reverse_segments(bwd)
+    const int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_N = offsets[num_params];
+    if (global_idx >= total_N * d) return;
+
+    const int row = global_idx / d;
+    const int col = global_idx % d;
+
+    // Binary search for segment
+    int lo = 0, hi = num_params;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (offsets[mid + 1] <= row) lo = mid + 1;
+        else hi = mid;
+    }
+    const int seg_start = offsets[lo];
+    const int seg_end = offsets[lo + 1];
+    const int local_row = row - seg_start;
+    const int N = seg_end - seg_start;
+    const int reversed_row = seg_start + (N - 1 - local_row);
+
+    out[row * d + col] = fwd[row * d + col] + bwd[reversed_row * d + col];
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
 //  Kernel 1: Mamba-3 Scan Forward with State Saving
 //
 //  Same as mamba3_scan_kernel but writes h[step] to saved_states buffer
@@ -2271,14 +2343,18 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
         d_model, d_inner, d_state, ckpt_int
     );
 
-    // Step 3: Build reversed x_sorted for backward scan direction
-    // Each param's portion of x_sorted_packed needs to be reversed independently
+    // Step 3: Build reversed x_sorted for backward scan direction via CUDA kernel
+    int total_N = offsets_cpu[num_params];
     auto x_sorted_rev_packed = torch::empty_like(x_sorted_packed);
-    for (int p = 0; p < num_params; p++) {
-        int N = offsets_cpu[p + 1] - offsets_cpu[p];
-        if (N == 0) continue;
-        auto slice = x_sorted_packed.narrow(0, offsets_cpu[p], N);
-        x_sorted_rev_packed.narrow(0, offsets_cpu[p], N).copy_(slice.flip(0));
+    {
+        int total_elems = total_N * d_model;
+        int rev_grid = (total_elems + SG2B_BLOCK - 1) / SG2B_BLOCK;
+        reverse_segments_kernel<<<rev_grid, SG2B_BLOCK>>>(
+            x_sorted_packed.data_ptr<float>(),
+            x_sorted_rev_packed.data_ptr<float>(),
+            offsets_t.data_ptr<int>(),
+            d_model, num_params
+        );
     }
 
     // Step 4: Backward scan with saving (uses persistent initial states)
@@ -2386,15 +2462,16 @@ void launch_mamba3_peer_backward_batched(
     int scan_smem = 2 * d_inner * sizeof(float);  // s_x_branch + s_d_dt_raw
     int ckpt_int = (checkpoint_interval > 1) ? checkpoint_interval : 0;
 
-    // Compute checkpoint offsets if needed
+    // Compute checkpoint offsets if needed (using offsets already on GPU)
     torch::Tensor ckpt_offsets_t;
     if (ckpt_int > 1) {
-        auto offsets_cpu = offsets_t.to(torch::kCPU);
-        auto offsets_ptr = offsets_cpu.data_ptr<int>();
+        // Read offsets from GPU to CPU for checkpoint computation
+        auto offsets_cpu_tmp = offsets_t.to(torch::kCPU);
+        auto offsets_ptr_tmp = offsets_cpu_tmp.data_ptr<int>();
         std::vector<int> ckpt_offsets_cpu(num_params + 1);
         ckpt_offsets_cpu[0] = 0;
         for (int p = 0; p < num_params; p++) {
-            int N = offsets_ptr[p + 1] - offsets_ptr[p];
+            int N = offsets_ptr_tmp[p + 1] - offsets_ptr_tmp[p];
             int num_ckpts = (N + ckpt_int - 1) / ckpt_int;
             ckpt_offsets_cpu[p + 1] = ckpt_offsets_cpu[p] + num_ckpts;
         }
@@ -2435,19 +2512,18 @@ void launch_mamba3_peer_backward_batched(
         d_model, d_inner, d_state, ckpt_int
     );
 
-    // Build reversed x_sorted for bwd direction backward
-    // The bwd scan used reversed x_sorted in forward, so we need that here too
+    // Build reversed x_sorted via CUDA kernel (no CPU-GPU sync)
     auto total_N = x_sorted_packed.size(0);
     auto x_sorted_rev_packed = torch::empty_like(x_sorted_packed);
-    // Read offsets from GPU
-    auto offsets_cpu = offsets_t.to(torch::kCPU);
-    auto offsets_ptr = offsets_cpu.data_ptr<int>();
-    for (int p = 0; p < num_params; p++) {
-        int start = offsets_ptr[p];
-        int N = offsets_ptr[p + 1] - start;
-        if (N == 0) continue;
-        x_sorted_rev_packed.narrow(0, start, N).copy_(
-            x_sorted_packed.narrow(0, start, N).flip(0));
+    {
+        int total_elems = total_N * d_model;
+        int rev_grid = (total_elems + SG2B_BLOCK - 1) / SG2B_BLOCK;
+        reverse_segments_kernel<<<rev_grid, SG2B_BLOCK>>>(
+            x_sorted_packed.data_ptr<float>(),
+            x_sorted_rev_packed.data_ptr<float>(),
+            offsets_t.data_ptr<int>(),
+            d_model, num_params
+        );
     }
 
     // Backward direction backward scan
@@ -2483,14 +2559,16 @@ void launch_mamba3_peer_backward_batched(
         d_model, d_inner, d_state, ckpt_int
     );
 
-    // Combine: flip bwd back and add
-    // Each param's bwd portion needs to be flipped
-    for (int p = 0; p < num_params; p++) {
-        int start = offsets_ptr[p];
-        int N = offsets_ptr[p + 1] - start;
-        if (N == 0) continue;
-        auto bwd_slice = d_x_sorted_bwd.narrow(0, start, N);
-        d_x_sorted_packed.narrow(0, start, N).copy_(
-            d_x_sorted_fwd.narrow(0, start, N) + bwd_slice.flip(0));
+    // Combine: out = fwd + reverse_segments(bwd) via single CUDA kernel
+    {
+        int total_elems = total_N * d_model;
+        int comb_grid = (total_elems + SG2B_BLOCK - 1) / SG2B_BLOCK;
+        combine_fwd_bwd_kernel<<<comb_grid, SG2B_BLOCK>>>(
+            d_x_sorted_fwd.data_ptr<float>(),
+            d_x_sorted_bwd.data_ptr<float>(),
+            d_x_sorted_packed.data_ptr<float>(),
+            offsets_t.data_ptr<int>(),
+            d_model, num_params
+        );
     }
 }
