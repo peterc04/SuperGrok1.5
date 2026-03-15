@@ -1,19 +1,26 @@
 /*
  * SuperGrok v2 — Mamba-3 + 4-Head PEER + GRU CUDA Kernels (Forward)
  *
- * Three fused kernels for the Mamba-3 + PEER meta-net architecture:
+ * Kernels for the Mamba-3 + PEER meta-net architecture:
  *
- *   1. input_proj_sort     — Project [grad, sharpness] -> [N, d_model],
- *                            compute sort keys = |grad|
- *   2. mamba3_scan          — Selective scan with trapezoidal discretization
- *                            + RoPE rotation (one direction per call)
- *   3. fused_elem_step      — GRU + multi-head PEER routing + expert MLP
- *                            + mu update + Adam + weight decay
+ *   1. input_proj_sort       — Project [grad, sharpness] -> [N, d_model],
+ *                              compute sort keys = |grad|
+ *   2. mamba3_scan (serial)  — Sequential selective scan with trapezoidal
+ *                              discretization + RoPE (one direction per call)
+ *   3. precompute_kernel     — Parallel precompute of projections (dt, B, C)
+ *   4. parallel_scan_kernel  — Blelloch parallel prefix scan with Affine2x2
+ *                              transform composition over paired RoPE dims.
+ *                              Activates for N >= PSCAN_THRESHOLD (256).
+ *   5. fused_elem_step       — GRU + multi-head PEER routing + expert MLP
+ *                              + mu update + Adam + weight decay.
+ *                              Expert weights loaded into shared memory.
  *
- * Plus sort via thrust::sort_by_key.
+ * Plus sort via thrust::sort_by_key (serial) or cub::DeviceSegmentedRadixSort
+ * (batched).
  *
  * Supports FP32, FP16, and BF16 parameter tensors.
  * All meta-net state (GRU, Mamba, weights) is always FP32.
+ * Dimension guards: TORCH_CHECK for d_model/d_inner vs compile-time maximums.
  */
 
 #include <torch/extension.h>

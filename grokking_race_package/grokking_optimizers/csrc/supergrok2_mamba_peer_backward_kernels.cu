@@ -10,7 +10,18 @@
  *   3. gru_backward            — d_gru_weights from d_gru_out
  *   4. expert_peer_backward    — d_expert_weights, d_peer_weights from d_expert_out
  *
- * Plus a forward-save scan kernel that stores intermediate states.
+ * Plus a forward-save scan kernel that stores intermediate states,
+ * with optional gradient checkpointing (bilevel_checkpoint_interval).
+ *
+ * Performance features:
+ *   - BilevelWorkspace: thread_local pre-allocated buffers for precompute
+ *     outputs, reversed sort arrays, and gradient accumulators. Eliminates
+ *     per-step torch::empty allocations.
+ *   - ATen GEMM dispatch: For N >= GEMM_PRECOMPUTE_THRESHOLD (1024),
+ *     projection precompute uses torch::mm_out (cuBLAS) instead of custom
+ *     CUDA kernels for better Tensor Core utilization.
+ *   - Shared-memory reduction for expert weight gradients (256x fewer atomics).
+ *   - Dimension guards: TORCH_CHECK for d_model/d_inner/d_state vs maximums.
  *
  * All meta-net weights and gradients are FP32.
  */
