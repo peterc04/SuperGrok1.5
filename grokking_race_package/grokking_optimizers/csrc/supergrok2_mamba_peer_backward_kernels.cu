@@ -178,15 +178,14 @@ static void bilevel_precompute_gemm(
     auto in_proj_x = in_proj_W.narrow(0, 0, d_inner);        // [d_inner, d_model]
     auto in_proj_z = in_proj_W.narrow(0, d_inner, d_inner);   // [d_inner, d_model]
 
-    // x_branch = x_sorted @ in_proj_x.T → [N, d_inner]
-    auto x_branch = torch::mm(x_sorted, in_proj_x.t());
-    pre_x_val.copy_(x_branch);
+    // x_branch = x_sorted @ in_proj_x.T → [N, d_inner] (written directly to pre_x_val)
+    torch::mm_out(pre_x_val, x_sorted, in_proj_x.t());
 
     // z = x_sorted @ in_proj_z.T → [N, d_inner]
     torch::mm_out(pre_z_val, x_sorted, in_proj_z.t());
 
     // dt_raw = x_branch @ dt_proj_W.T → [N, d_inner], then add bias + softplus
-    torch::mm_out(pre_dt_val, x_branch, dt_proj_W.t());
+    torch::mm_out(pre_dt_val, pre_x_val, dt_proj_W.t());
     int total_dt = N * d_inner;
     int dt_grid = (total_dt + SG2B_BLOCK - 1) / SG2B_BLOCK;
     softplus_bias_kernel<<<dt_grid, SG2B_BLOCK>>>(
@@ -196,10 +195,10 @@ static void bilevel_precompute_gemm(
     );
 
     // B = x_branch @ B_proj_W.T → [N, d_state]
-    torch::mm_out(pre_B_val, x_branch, B_proj_W.t());
+    torch::mm_out(pre_B_val, pre_x_val, B_proj_W.t());
 
     // C = x_branch @ C_proj_W.T → [N, d_state]
-    torch::mm_out(pre_C_val, x_branch, C_proj_W.t());
+    torch::mm_out(pre_C_val, pre_x_val, C_proj_W.t());
 }
 
 
@@ -2417,12 +2416,16 @@ struct BilevelWorkspace {
     int gru_input_dim = 0;
 
     void ensure_fwd_save(int N, int dm, int di, int ds, torch::Device dev) {
-        if (N <= max_N && dm == d_model && di == d_inner && ds == d_state) return;
+        bool preBC_ok = pre_B.defined() && pre_B.size(0) >= N;
+        if (N <= max_N && dm == d_model && di == d_inner && ds == d_state
+            && preBC_ok) return;
         int alloc_N = std::max(N, max_N);
+        // pre_B/pre_C are shared with ensure_batched — size to max of both
+        int alloc_preBC = std::max(alloc_N, max_total_N);
         auto fo = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
         auto io = torch::TensorOptions().device(dev).dtype(torch::kInt32);
-        pre_B = torch::empty({alloc_N, ds}, fo);
-        pre_C = torch::empty({alloc_N, ds}, fo);
+        pre_B = torch::empty({alloc_preBC, ds}, fo);
+        pre_C = torch::empty({alloc_preBC, ds}, fo);
         x_proj = torch::empty({alloc_N, dm}, fo);
         sort_keys = torch::empty({alloc_N}, fo);
         sort_idx = torch::empty({alloc_N}, io);
@@ -2459,12 +2462,15 @@ struct BilevelWorkspace {
     }
 
     void ensure_batched(int total_N, int dm, int di, int ds, torch::Device dev) {
+        bool preBC_ok = pre_B.defined() && pre_B.size(0) >= total_N;
         if (total_N <= max_total_N && dm == d_model && di == d_inner
-            && ds == d_state) return;
+            && ds == d_state && preBC_ok) return;
         int alloc_N = std::max(total_N, max_total_N);
+        // pre_B/pre_C are shared with ensure_fwd_save — size to max of both
+        int alloc_preBC = std::max(alloc_N, max_N);
         auto fo = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
-        pre_B = torch::empty({alloc_N, ds}, fo);
-        pre_C = torch::empty({alloc_N, ds}, fo);
+        pre_B = torch::empty({alloc_preBC, ds}, fo);
+        pre_C = torch::empty({alloc_preBC, ds}, fo);
         x_sorted_rev = torch::empty({alloc_N, dm}, fo);
         d_x_sorted_fwd_bat = torch::empty({alloc_N, dm}, fo);
         d_x_sorted_bwd_bat = torch::empty({alloc_N, dm}, fo);
@@ -2539,6 +2545,8 @@ void launch_mamba3_peer_bilevel_fwd_save(
 
     TORCH_CHECK(d_state % 2 == 0, "d_state must be even for paired RoPE (got ", d_state, ")");
     TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
+    TORCH_CHECK(d_model <= MAX_D_MODEL, "d_model exceeds MAX_D_MODEL (", d_model, " > ", MAX_D_MODEL, ")");
+    TORCH_CHECK(d_inner <= MAX_D_INNER, "d_inner exceeds MAX_D_INNER (", d_inner, " > ", MAX_D_INNER, ")");
     if (checkpoint_interval > 1) {
         TORCH_CHECK(checkpoint_interval <= MAX_CKPT_INTERVAL,
             "checkpoint_interval (", checkpoint_interval, ") exceeds MAX_CKPT_INTERVAL (", MAX_CKPT_INTERVAL, ")");
@@ -2822,6 +2830,8 @@ void launch_mamba3_peer_backward(
 
     TORCH_CHECK(d_state % 2 == 0, "d_state must be even for paired RoPE (got ", d_state, ")");
     TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
+    TORCH_CHECK(d_model <= MAX_D_MODEL, "d_model exceeds MAX_D_MODEL (", d_model, " > ", MAX_D_MODEL, ")");
+    TORCH_CHECK(d_inner <= MAX_D_INNER, "d_inner exceeds MAX_D_INNER (", d_inner, " > ", MAX_D_INNER, ")");
 
     auto dev = d_smart_grad.device();
 
@@ -3111,6 +3121,8 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
 
     TORCH_CHECK(d_state % 2 == 0, "d_state must be even for paired RoPE (got ", d_state, ")");
     TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
+    TORCH_CHECK(d_model <= MAX_D_MODEL, "d_model exceeds MAX_D_MODEL (", d_model, " > ", MAX_D_MODEL, ")");
+    TORCH_CHECK(d_inner <= MAX_D_INNER, "d_inner exceeds MAX_D_INNER (", d_inner, " > ", MAX_D_INNER, ")");
 
     auto dev = grads[0].device();
     auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
@@ -3432,6 +3444,8 @@ void launch_mamba3_peer_backward_batched(
 
     TORCH_CHECK(d_state % 2 == 0, "d_state must be even for paired RoPE (got ", d_state, ")");
     TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
+    TORCH_CHECK(d_model <= MAX_D_MODEL, "d_model exceeds MAX_D_MODEL (", d_model, " > ", MAX_D_MODEL, ")");
+    TORCH_CHECK(d_inner <= MAX_D_INNER, "d_inner exceeds MAX_D_INNER (", d_inner, " > ", MAX_D_INNER, ")");
 
     auto dev = d_fwd_scan_out_packed.device();
     auto int_opts = torch::TensorOptions().device(dev).dtype(torch::kInt32);
