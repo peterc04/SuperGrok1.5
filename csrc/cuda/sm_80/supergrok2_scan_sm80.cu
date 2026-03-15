@@ -9,13 +9,17 @@
  *   - mamba3_scan_combined_cpasync_kernel: sequential combined (fwd+bwd)
  *     scan with the same cp.async double-buffered prefetch pattern.
  *
- * These kernels are dispatched by the generic code via #if __CUDA_ARCH__
- * >= 800 guards within the scan kernel compilation units.
+ * These kernels are launched by ampere_batched_scan_and_fused_elem() in
+ * this file, which is called from the Ampere batched step launcher.
  *
- * Step and batched step launchers delegate to generic with TF32 mode set.
- * The generic step/batched_step code uses custom CUDA kernels (not cuBLAS),
- * so TF32 mode has no effect on those paths. The real Ampere benefit comes
- * from the cp.async scan kernels above.
+ * Batched step uses the refactored 3-phase pipeline:
+ *   1. batched_step_setup_and_sort() — shared setup
+ *   2. generic_batched_precompute() — FP32 precompute (TF32 math mode)
+ *   3. ampere_batched_scan_and_fused_elem() — cp.async scan + cp.async
+ *      fused_elem (uses fused_elem_step_cpasync_kernel from
+ *      supergrok2_fused_elem_sm80.cu)
+ *
+ * Single-param step delegates to generic with TF32 mode set.
  *
  * Dispatch: ops.cpp calls these on sm_80+ GPUs.
  * Fallback: On sm_70/sm_75, the generic launchers are called instead.
@@ -26,6 +30,7 @@
 #include "platform.h"
 #include "types.h"
 #include "dispatch.h"
+#include "ops.h"
 
 // cp.async intrinsics (sm_80+): asynchronous global→shared memory copy
 // These are compiled conditionally and only used on Ampere+
@@ -506,14 +511,264 @@ __global__ void mamba3_scan_combined_cpasync_kernel(
 
 
 // ═══════════════════════════════════════════════════════════════════════
+//  Forward declaration: cp.async fused_elem kernel (defined in
+//  supergrok2_fused_elem_sm80.cu)
+// ═══════════════════════════════════════════════════════════════════════
+
+template <typename scalar_t>
+__global__ void fused_elem_step_cpasync_kernel(
+    scalar_t* __restrict__ param,
+    const scalar_t* __restrict__ grad,
+    const scalar_t* __restrict__ sharpness,
+    float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq,
+    float* __restrict__ mu,
+    float* __restrict__ gru_state,
+    const float* __restrict__ fwd_scan_out,
+    const float* __restrict__ bwd_scan_out,
+    const float* __restrict__ out_proj_fwd_W,
+    const float* __restrict__ out_proj_bwd_W,
+    const float* __restrict__ gru_Wz, const float* __restrict__ gru_bz,
+    const float* __restrict__ gru_Wr, const float* __restrict__ gru_br,
+    const float* __restrict__ gru_Wh, const float* __restrict__ gru_bh,
+    const float* __restrict__ peer_query_Ws,
+    const float* __restrict__ prod_keys_A,
+    const float* __restrict__ prod_keys_B,
+    const float* __restrict__ expert_W1, const float* __restrict__ expert_b1,
+    const float* __restrict__ expert_W2, const float* __restrict__ expert_b2,
+    const float rescale, const float alpha, const float lamb_eff,
+    const float beta1, const float beta2,
+    const float lr, const float wd_eff, const float eps,
+    const float bc1, const float bc2,
+    int* __restrict__ expert_counts,
+    const int N, const int d_model, const int d_inner,
+    const int gru_hidden, const int num_heads, const int pk_dim,
+    const int expert_hidden, const int num_experts);
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Ampere Batched Scan + Fused Elem (cp.async variants)
+//
+//  Same structure as batched_step_scan_and_fused_elem, but:
+//    - Scan: launches cp.async scan kernels instead of generic ones
+//    - Fused elem: launches fused_elem_step_cpasync_kernel
+//
+//  For large N (>= PSCAN_THRESHOLD): uses mamba3_scan_batched_cpasync_kernel
+//    (separate fwd/bwd launches, sequential per-param with cp.async prefetch)
+//  For small N (< PSCAN_THRESHOLD): uses mamba3_scan_combined_cpasync_kernel
+//    (combined fwd+bwd launch, sequential with cp.async prefetch)
+// ═══════════════════════════════════════════════════════════════════════
+
+void ampere_batched_scan_and_fused_elem(
+    BatchedScanCtx& ctx,
+    torch::Tensor fwd_pre_x, torch::Tensor fwd_pre_z, torch::Tensor fwd_pre_dt,
+    torch::Tensor fwd_pre_B, torch::Tensor fwd_pre_C,
+    torch::Tensor bwd_pre_x, torch::Tensor bwd_pre_z, torch::Tensor bwd_pre_dt,
+    torch::Tensor bwd_pre_B, torch::Tensor bwd_pre_C,
+    std::vector<torch::Tensor> params,
+    std::vector<torch::Tensor> grads,
+    std::vector<torch::Tensor> sharpness_list,
+    std::vector<torch::Tensor> exp_avgs,
+    std::vector<torch::Tensor> exp_avg_sqs,
+    std::vector<torch::Tensor> mus,
+    std::vector<torch::Tensor> gru_states,
+    std::vector<torch::Tensor> mamba_fwd_states,
+    std::vector<torch::Tensor> mamba_bwd_states,
+    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
+    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
+    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
+    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
+    torch::Tensor mamba_fwd_out_proj,
+    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
+    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
+    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
+    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
+    torch::Tensor mamba_bwd_out_proj,
+    torch::Tensor gru_Wz, torch::Tensor gru_bz,
+    torch::Tensor gru_Wr, torch::Tensor gru_br,
+    torch::Tensor gru_Wh, torch::Tensor gru_bh,
+    torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+    torch::Tensor expert_W1, torch::Tensor expert_b1,
+    torch::Tensor expert_W2, torch::Tensor expert_b2,
+    std::vector<float> alpha_mus, std::vector<float> lamb_effs,
+    std::vector<float> beta1s, std::vector<float> bc1s, std::vector<float> bc2s,
+    float rescale, float beta2, float lr, float wd_eff, float eps,
+    int d_model, int d_state, int d_inner,
+    int gru_hidden, int num_heads, int pk_dim,
+    int expert_hidden, int num_experts,
+    torch::Tensor expert_counts
+) {
+    if (ctx.total_N == 0) return;
+
+    auto dev = ctx.x_sorted_packed.device();
+    auto int_opts = torch::TensorOptions().device(dev).dtype(torch::kInt32);
+
+    // cp.async scan shared memory: double-buffer + x_branch + cached projection weights
+    int scan_smem = (2*d_model + d_inner + 2*d_inner*d_model + d_inner*d_inner
+                     + d_inner + 2*d_state*d_inner) * (int)sizeof(float);
+
+    if (ctx.max_N >= PSCAN_THRESHOLD) {
+        // ===== cp.async BATCHED SCAN for large N =====
+        // Two separate launches (fwd, bwd) using mamba3_scan_batched_cpasync_kernel
+        auto rev_fwd = torch::zeros({ctx.num_params}, int_opts);
+        auto rev_bwd = torch::ones({ctx.num_params}, int_opts);
+
+        // Forward scan with cp.async prefetch
+        mamba3_scan_batched_cpasync_kernel<<<ctx.num_params, d_inner, scan_smem>>>(
+            ctx.x_sorted_packed.data_ptr<float>(),
+            ctx.fwd_scan_packed.data_ptr<float>(),
+            ctx.initial_fwd.data_ptr<float>(),
+            ctx.final_fwd.data_ptr<float>(),
+            ctx.offsets_t.data_ptr<int>(),
+            rev_fwd.data_ptr<int>(),
+            mamba_fwd_in_proj.data_ptr<float>(),
+            mamba_fwd_dt_W.data_ptr<float>(),
+            mamba_fwd_dt_b.data_ptr<float>(),
+            mamba_fwd_B_proj.data_ptr<float>(),
+            mamba_fwd_C_proj.data_ptr<float>(),
+            mamba_fwd_A_log.data_ptr<float>(),
+            mamba_fwd_D.data_ptr<float>(),
+            mamba_fwd_rope.data_ptr<float>(),
+            d_model, d_inner, d_state
+        );
+
+        // Backward scan (reversed) with cp.async prefetch
+        mamba3_scan_batched_cpasync_kernel<<<ctx.num_params, d_inner, scan_smem>>>(
+            ctx.x_sorted_packed.data_ptr<float>(),
+            ctx.bwd_scan_packed.data_ptr<float>(),
+            ctx.initial_bwd.data_ptr<float>(),
+            ctx.final_bwd.data_ptr<float>(),
+            ctx.offsets_t.data_ptr<int>(),
+            rev_bwd.data_ptr<int>(),
+            mamba_bwd_in_proj.data_ptr<float>(),
+            mamba_bwd_dt_W.data_ptr<float>(),
+            mamba_bwd_dt_b.data_ptr<float>(),
+            mamba_bwd_B_proj.data_ptr<float>(),
+            mamba_bwd_C_proj.data_ptr<float>(),
+            mamba_bwd_A_log.data_ptr<float>(),
+            mamba_bwd_D.data_ptr<float>(),
+            mamba_bwd_rope.data_ptr<float>(),
+            d_model, d_inner, d_state
+        );
+    } else {
+        // ===== cp.async COMBINED SCAN for small N =====
+        mamba3_scan_combined_cpasync_kernel<<<2 * ctx.num_params, d_inner, scan_smem>>>(
+            ctx.x_sorted_packed.data_ptr<float>(),
+            ctx.fwd_scan_packed.data_ptr<float>(),
+            ctx.bwd_scan_packed.data_ptr<float>(),
+            ctx.initial_fwd.data_ptr<float>(),
+            ctx.initial_bwd.data_ptr<float>(),
+            ctx.final_fwd.data_ptr<float>(),
+            ctx.final_bwd.data_ptr<float>(),
+            ctx.offsets_t.data_ptr<int>(),
+            mamba_fwd_in_proj.data_ptr<float>(),
+            mamba_fwd_dt_W.data_ptr<float>(),
+            mamba_fwd_dt_b.data_ptr<float>(),
+            mamba_fwd_B_proj.data_ptr<float>(),
+            mamba_fwd_C_proj.data_ptr<float>(),
+            mamba_fwd_A_log.data_ptr<float>(),
+            mamba_fwd_D.data_ptr<float>(),
+            mamba_fwd_rope.data_ptr<float>(),
+            mamba_bwd_in_proj.data_ptr<float>(),
+            mamba_bwd_dt_W.data_ptr<float>(),
+            mamba_bwd_dt_b.data_ptr<float>(),
+            mamba_bwd_B_proj.data_ptr<float>(),
+            mamba_bwd_C_proj.data_ptr<float>(),
+            mamba_bwd_A_log.data_ptr<float>(),
+            mamba_bwd_D.data_ptr<float>(),
+            mamba_bwd_rope.data_ptr<float>(),
+            ctx.num_params, d_model, d_inner, d_state
+        );
+    }
+
+    // Unsort scan outputs + copy final states
+    int gru_input_dim_val = 2 + 2 * d_model;
+    int gru_row_len = gru_input_dim_val + gru_hidden;
+    int smem_bytes = (2 * d_model * d_inner
+                    + 3 * gru_hidden * gru_row_len
+                    + 3 * gru_hidden
+                    + 3 * num_experts * expert_hidden + num_experts) * sizeof(float);
+
+    std::vector<torch::Tensor> fwd_unsorted_list(ctx.num_params);
+    std::vector<torch::Tensor> bwd_unsorted_list(ctx.num_params);
+    for (int p = 0; p < ctx.num_params; p++) {
+        int N = ctx.N_vec[p];
+        if (N == 0) continue;
+        int off = ctx.seg_offsets_cpu[p];
+
+        mamba_fwd_states[p].copy_(ctx.final_fwd[p]);
+        mamba_bwd_states[p].copy_(ctx.final_bwd[p]);
+
+        auto fwd_slice = ctx.fwd_scan_packed.narrow(0, off, N);
+        auto bwd_slice = ctx.bwd_scan_packed.narrow(0, off, N);
+        fwd_unsorted_list[p] = fwd_slice.index_select(0, ctx.unsort_idx_list[p]);
+        bwd_unsorted_list[p] = bwd_slice.index_select(0, ctx.unsort_idx_list[p]);
+    }
+
+    // Launch cp.async fused_elem_step kernels on persistent stream pool
+    constexpr int NUM_STREAMS = 4;
+    static GpuStream_t streams[NUM_STREAMS] = {};
+    static bool streams_initialized = false;
+    if (!streams_initialized) {
+        for (int s = 0; s < NUM_STREAMS; s++)
+            gpuStreamCreate(&streams[s]);
+        streams_initialized = true;
+    }
+
+    for (int p = 0; p < ctx.num_params; p++) {
+        int N = ctx.N_vec[p];
+        if (N == 0) continue;
+
+        GpuStream_t stream = streams[p % NUM_STREAMS];
+        const int grid = (N + SG2M_BLOCK - 1) / SG2M_BLOCK;
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::ScalarType::Half, at::ScalarType::BFloat16,
+            params[p].scalar_type(), "fused_elem_step_cpasync", ([&] {
+            fused_elem_step_cpasync_kernel<scalar_t><<<grid, SG2M_BLOCK, smem_bytes, stream>>>(
+                params[p].data_ptr<scalar_t>(),
+                grads[p].data_ptr<scalar_t>(),
+                sharpness_list[p].data_ptr<scalar_t>(),
+                exp_avgs[p].data_ptr<float>(),
+                exp_avg_sqs[p].data_ptr<float>(),
+                mus[p].data_ptr<float>(),
+                gru_states[p].data_ptr<float>(),
+                fwd_unsorted_list[p].data_ptr<float>(),
+                bwd_unsorted_list[p].data_ptr<float>(),
+                mamba_fwd_out_proj.data_ptr<float>(),
+                mamba_bwd_out_proj.data_ptr<float>(),
+                gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+                gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+                gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+                peer_query_Ws.data_ptr<float>(),
+                prod_keys_A.data_ptr<float>(),
+                prod_keys_B.data_ptr<float>(),
+                expert_W1.data_ptr<float>(),
+                expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(),
+                expert_b2.data_ptr<float>(),
+                rescale, alpha_mus[p], lamb_effs[p],
+                beta1s[p], beta2, lr, wd_eff, eps, bc1s[p], bc2s[p],
+                expert_counts.data_ptr<int>(),
+                N, d_model, d_inner, gru_hidden,
+                num_heads, pk_dim, expert_hidden, num_experts
+            );
+        }));
+    }
+
+    for (int s = 0; s < NUM_STREAMS; s++) {
+        gpuStreamSynchronize(streams[s]);
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
 //  Ampere Forward: Per-Parameter Step — delegates to generic
 //
 //  The generic single-param step uses only custom CUDA kernels
 //  (input_proj_sort_kernel, mamba3_scan_combined_kernel, fused_elem_step_kernel),
 //  not cuBLAS/torch::mm, so TF32 mode set here has no effect on the
-//  single-param path. The real Ampere optimization for single-param is
-//  the cp.async scan kernel dispatched by the generic code via
-//  #if __CUDA_ARCH__ >= 800 guards within the scan kernels.
+//  single-param path. The single-param path does not have a refactored
+//  pipeline split, so delegation to generic is the correct approach.
 //  TF32 mode is set for consistency with the architecture tier contract.
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -575,14 +830,18 @@ void launch_mamba3_peer_step_ampere(
 
 
 // ═══════════════════════════════════════════════════════════════════════
-//  Ampere Forward: Batched Step — delegates to generic
+//  Ampere Forward: Batched Step — refactored pipeline with cp.async
 //
-//  Same as single-param: generic batched step uses custom CUDA kernels
-//  (mamba3_parallel_precompute_kernel, mamba3_parallel_scan_batched_kernel,
-//  fused_elem_step_kernel), not cuBLAS/torch::mm. TF32 mode is set for
-//  consistency but has no effect. The cp.async scan kernels in this file
-//  are used when the generic batched code dispatches to Ampere scan via
-//  the arch tier system, which is the real Ampere optimization.
+//  Uses the refactored 3-phase pipeline:
+//    1. batched_step_setup_and_sort — input projection, CUB sort, packing
+//    2. generic_batched_precompute — FP32 precompute (TF32 math mode)
+//    3. ampere_batched_scan_and_fused_elem — cp.async scan + cp.async fused_elem
+//
+//  The cp.async scan kernels (mamba3_scan_batched_cpasync_kernel,
+//  mamba3_scan_combined_cpasync_kernel) use double-buffered
+//  __pipeline_memcpy_async to overlap global memory loads with scan compute.
+//  The fused_elem_step_cpasync_kernel uses cp.async for weight prefetch.
+//  TF32 mode is set for cuBLAS math operations in the precompute phase.
 // ═══════════════════════════════════════════════════════════════════════
 
 void launch_mamba3_peer_batched_step_ampere(
@@ -623,10 +882,39 @@ void launch_mamba3_peer_batched_step_ampere(
     auto handle = at::cuda::getCurrentCUDABlasHandle();
     cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
 
-    launch_mamba3_peer_batched_step(
+    // Phase 1: Setup + sort (shared with all tiers)
+    auto ctx = batched_step_setup_and_sort(
+        grads, sharpness_list, mamba_fwd_states, mamba_bwd_states,
+        input_proj_W, input_proj_b, d_model, d_state, d_inner);
+
+    if (ctx.total_N == 0) {
+        cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
+        return;
+    }
+
+    // Phase 2: Precompute projections (TF32 via cuBLAS math mode)
+    torch::Tensor fwd_pre_x, fwd_pre_z, fwd_pre_dt, fwd_pre_B, fwd_pre_C;
+    torch::Tensor bwd_pre_x, bwd_pre_z, bwd_pre_dt, bwd_pre_B, bwd_pre_C;
+
+    generic_batched_precompute(
+        ctx, mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
+        mamba_fwd_B_proj, mamba_fwd_C_proj,
+        fwd_pre_x, fwd_pre_z, fwd_pre_dt, fwd_pre_B, fwd_pre_C,
+        d_model, d_inner, d_state);
+
+    generic_batched_precompute(
+        ctx, mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
+        mamba_bwd_B_proj, mamba_bwd_C_proj,
+        bwd_pre_x, bwd_pre_z, bwd_pre_dt, bwd_pre_B, bwd_pre_C,
+        d_model, d_inner, d_state);
+
+    // Phase 3: cp.async scan + cp.async fused_elem (Ampere-specific)
+    ampere_batched_scan_and_fused_elem(
+        ctx,
+        fwd_pre_x, fwd_pre_z, fwd_pre_dt, fwd_pre_B, fwd_pre_C,
+        bwd_pre_x, bwd_pre_z, bwd_pre_dt, bwd_pre_B, bwd_pre_C,
         params, grads, sharpness_list, exp_avgs, exp_avg_sqs, mus,
         gru_states, mamba_fwd_states, mamba_bwd_states,
-        input_proj_W, input_proj_b,
         mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
         mamba_fwd_B_proj, mamba_fwd_C_proj, mamba_fwd_A_log,
         mamba_fwd_D, mamba_fwd_rope, mamba_fwd_out_proj,
