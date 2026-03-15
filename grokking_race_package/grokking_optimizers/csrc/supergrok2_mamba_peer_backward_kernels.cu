@@ -27,6 +27,7 @@ constexpr int MAX_D_STATE = 32;
 constexpr int MAX_D_INNER = 32;
 constexpr int MAX_D_MODEL = 16;
 constexpr int MAX_TOPK = 4;
+constexpr int MAX_CKPT_INTERVAL = 32;  // max checkpoint interval for bilevel gradient checkpointing
 
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -63,7 +64,8 @@ __global__ void mamba3_scan_fwd_save_kernel(
     const int d_model,
     const int d_inner,
     const int d_state,
-    const int reverse
+    const int reverse,
+    const int checkpoint_interval  // 0 or 1 = save every step; >1 = checkpoint every C steps
 ) {
     const int tid = threadIdx.x;
     if (tid >= d_inner) return;
@@ -147,9 +149,18 @@ __global__ void mamba3_scan_fwd_save_kernel(
             h[s] = A_bar * h_rot + B_bar * x_val;
         }
 
-        // Save state after update
-        for (int s = 0; s < d_state; s++)
-            saved_states[(i * d_inner + tid) * d_state + s] = h[s];
+        // Save state after update (checkpointed or every step)
+        if (checkpoint_interval <= 1) {
+            for (int s = 0; s < d_state; s++)
+                saved_states[(i * d_inner + tid) * d_state + s] = h[s];
+        } else {
+            bool at_seg_end = ((step + 1) % checkpoint_interval == 0) || (step == N - 1);
+            if (at_seg_end) {
+                int ckpt_idx = step / checkpoint_interval;
+                for (int s = 0; s < d_state; s++)
+                    saved_states[(ckpt_idx * d_inner + tid) * d_state + s] = h[s];
+            }
+        }
 
         // FULL C projection for output
         float y_val = 0.0f;
@@ -204,9 +215,11 @@ __global__ void mamba3_scan_fwd_save_batched_kernel(
     const float* __restrict__ A_log,               // [d_inner, d_state]
     const float* __restrict__ D_param,             // [d_inner]
     const float* __restrict__ rope_freq,           // [d_inner, d_state/2]
+    const int* __restrict__ ckpt_offsets,          // [num_params + 1] or nullptr (for checkpointing)
     const int d_model,
     const int d_inner,
-    const int d_state
+    const int d_state,
+    const int checkpoint_interval  // 0 or 1 = save every step
 ) {
     const int param_idx = blockIdx.x;
     const int tid = threadIdx.x;
@@ -238,7 +251,10 @@ __global__ void mamba3_scan_fwd_save_batched_kernel(
 
     const float* my_x = x_sorted_packed + start * d_model;
     float* my_out = scan_output_packed + start * d_inner;
-    float* my_saved_states = saved_states_packed + start * d_inner * d_state;
+    // For checkpointing: saved_states uses ckpt_offsets instead of element offsets
+    const int ckpt_start = (checkpoint_interval > 1 && ckpt_offsets != nullptr)
+                           ? ckpt_offsets[param_idx] : start;
+    float* my_saved_states = saved_states_packed + ckpt_start * d_inner * d_state;
     float* my_saved_xb = saved_x_branch_packed + start * d_inner;
     float* my_saved_z = saved_z_packed + start * d_inner;
     float* my_saved_dt = saved_dt_packed + start * d_inner;
@@ -287,9 +303,18 @@ __global__ void mamba3_scan_fwd_save_batched_kernel(
             h[s] = A_bar * h_rot + B_bar * x_val;
         }
 
-        // Save state after update
-        for (int s = 0; s < d_state; s++)
-            my_saved_states[(i * d_inner + tid) * d_state + s] = h[s];
+        // Save state after update (checkpointed or every step)
+        if (checkpoint_interval <= 1) {
+            for (int s = 0; s < d_state; s++)
+                my_saved_states[(i * d_inner + tid) * d_state + s] = h[s];
+        } else {
+            bool at_seg_end = ((step + 1) % checkpoint_interval == 0) || (step == N - 1);
+            if (at_seg_end) {
+                int ckpt_idx = step / checkpoint_interval;
+                for (int s = 0; s < d_state; s++)
+                    my_saved_states[(ckpt_idx * d_inner + tid) * d_state + s] = h[s];
+            }
+        }
 
         // Output with C projection
         float y_val = 0.0f;
@@ -352,7 +377,8 @@ __global__ void mamba3_scan_backward_kernel(
     const float* __restrict__ initial_state,  // [d_inner, d_state] or nullptr
     // Dims
     const int N, const int d_model, const int d_inner, const int d_state,
-    const int reverse
+    const int reverse,
+    const int checkpoint_interval  // 0 or 1 = no checkpointing; >1 = recompute from checkpoints
 ) {
     const int tid = threadIdx.x;
     if (tid >= d_inner) return;
@@ -410,188 +436,345 @@ __global__ void mamba3_scan_backward_kernel(
     float dh[MAX_D_STATE];
     for (int s = 0; s < d_state; s++) dh[s] = 0.0f;
 
-    // Iterate in reverse order of forward computation
-    for (int step = N - 1; step >= 0; step--) {
-        int i = reverse ? (N - 1 - step) : step;
+    // ---- Macro-like per-step backward block (used in both paths) ----
+    // We define a lambda-style approach using goto-free inline code.
+    // Both checkpointed and non-checkpointed paths call the same backward
+    // logic per step. The only difference is how h_curr and h_prev are obtained.
 
-        float d_out = d_scan_output[i * d_inner + tid];
-        float x_val = saved_x_branch[i * d_inner + tid];
-        float z_val = saved_z[i * d_inner + tid];
-        float dt_val = saved_dt[i * d_inner + tid];
+    if (checkpoint_interval <= 1) {
+        // ════════════════════════════════════════════════════════════
+        //  ORIGINAL PATH: saved_states has all N states
+        // ════════════════════════════════════════════════════════════
+        for (int step = N - 1; step >= 0; step--) {
+            int i = reverse ? (N - 1 - step) : step;
 
-        // Load x_branch into shared memory for full projection backward
-        s_x_branch[tid] = x_val;
-        __syncthreads();
+            float d_out = d_scan_output[i * d_inner + tid];
+            float x_val = saved_x_branch[i * d_inner + tid];
+            float z_val = saved_z[i * d_inner + tid];
+            float dt_val = saved_dt[i * d_inner + tid];
 
-        // Forward: y_final = y_val * silu_z + D_val * x_val
-        float sig_z = 1.0f / (1.0f + expf(-z_val));
-        float silu_z = z_val * sig_z;
+            s_x_branch[tid] = x_val;
+            __syncthreads();
 
-        // Recompute y_val from saved state (using full C projection)
-        float y_val = 0.0f;
-        for (int s = 0; s < d_state; s++) {
-            float C_val = 0.0f;
-            for (int j = 0; j < d_inner; j++) {
-                C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
-            }
-            y_val += saved_states[(i * d_inner + tid) * d_state + s] * C_val;
-        }
+            float sig_z = 1.0f / (1.0f + expf(-z_val));
+            float silu_z = z_val * sig_z;
 
-        // Backward through gated output
-        float d_y_val = d_out * silu_z;
-        float d_silu_z = d_out * y_val;
-        float d_z_val = d_silu_z * (sig_z + z_val * sig_z * (1.0f - sig_z));
-        float d_x_from_D = d_out * D_val;
-        d_D_acc += d_out * x_val;
-
-        // Backward through y = sum_s(h[s] * C[s]) with full C projection
-        float d_x_from_C = 0.0f;
-        for (int s = 0; s < d_state; s++) {
-            float h_s = saved_states[(i * d_inner + tid) * d_state + s];
-            float C_val = 0.0f;
-            for (int j = 0; j < d_inner; j++) {
-                C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+            float y_val = 0.0f;
+            for (int s = 0; s < d_state; s++) {
+                float C_val = 0.0f;
+                for (int j = 0; j < d_inner; j++)
+                    C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+                y_val += saved_states[(i * d_inner + tid) * d_state + s] * C_val;
             }
 
-            // dh[s] += d_y * C[s]
-            dh[s] += d_y_val * C_val;
-            // d_C_val = d_y * h[s] — accumulate for all j
-            float d_C_val = d_y_val * h_s;
-            for (int j = 0; j < d_inner; j++) {
-                d_C_proj_W_local[s * d_inner + j] += d_C_val * s_x_branch[j];
+            float d_y_val = d_out * silu_z;
+            float d_silu_z = d_out * y_val;
+            float d_z_val = d_silu_z * (sig_z + z_val * sig_z * (1.0f - sig_z));
+            float d_x_from_D = d_out * D_val;
+            d_D_acc += d_out * x_val;
+
+            float d_x_from_C = 0.0f;
+            for (int s = 0; s < d_state; s++) {
+                float h_s = saved_states[(i * d_inner + tid) * d_state + s];
+                float C_val = 0.0f;
+                for (int j = 0; j < d_inner; j++)
+                    C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+                dh[s] += d_y_val * C_val;
+                float d_C_val = d_y_val * h_s;
+                for (int j = 0; j < d_inner; j++)
+                    d_C_proj_W_local[s * d_inner + j] += d_C_val * s_x_branch[j];
+                d_x_from_C += d_y_val * h_s * C_proj_W[s * d_inner + tid];
             }
-            // Accumulate d_x_from_C: gradient of y w.r.t. x_branch[tid] via C projection
-            d_x_from_C += d_y_val * h_s * C_proj_W[s * d_inner + tid];
-        }
 
-        // Get h_prev (state before this step's update)
-        float h_prev[MAX_D_STATE];
-        if (step > 0) {
-            int i_prev = reverse ? (N - step) : (step - 1);
-            for (int s = 0; s < d_state; s++)
-                h_prev[s] = saved_states[(i_prev * d_inner + tid) * d_state + s];
-        } else {
-            // Use initial_state if provided, else zero
-            for (int s = 0; s < d_state; s++)
-                h_prev[s] = (initial_state != nullptr)
-                    ? initial_state[tid * d_state + s] : 0.0f;
-        }
-
-        // Backward through state update: h[s] = A_bar * h_rot + B_bar * x_val
-        // Fix: snapshot dh before the loop to avoid read-after-write
-        float dh_snap[MAX_D_STATE];
-        for (int s = 0; s < d_state; s++) dh_snap[s] = dh[s];
-        for (int s = 0; s < d_state; s++) dh[s] = 0.0f;
-
-        float d_dt_val = 0.0f;
-        float d_x_from_scan = 0.0f;
-
-        for (int s = 0; s < d_state; s++) {
-            float half_dtA = dt_val * A[s] / 2.0f;
-            float denom_val = 1.0f - half_dtA + 1e-8f;
-            float A_bar = (1.0f + half_dtA) / denom_val;
-
-            // Full B projection (recompute)
-            float B_val = 0.0f;
-            for (int j = 0; j < d_inner; j++) {
-                B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
-            }
-            float B_bar = dt_val * B_val;
-
-            // Paired RoPE
-            int pair_idx = s / 2;
-            float cos_p, sin_p;
-            __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
-            float h_rot;
-            int partner;
-            float sign;  // sign of sin term in h_rot formula
-            if (s % 2 == 0) {
-                partner = s + 1;
-                sign = -1.0f;  // h_rot = h[s]*cos - h[s+1]*sin
-                h_rot = h_prev[s] * cos_p - h_prev[partner] * sin_p;
+            float h_prev[MAX_D_STATE];
+            if (step > 0) {
+                int i_prev = reverse ? (N - step) : (step - 1);
+                for (int s = 0; s < d_state; s++)
+                    h_prev[s] = saved_states[(i_prev * d_inner + tid) * d_state + s];
             } else {
-                partner = s - 1;
-                sign = 1.0f;   // h_rot = h[s]*cos + h[s-1]*sin
-                h_rot = h_prev[s] * cos_p + h_prev[partner] * sin_p;
+                for (int s = 0; s < d_state; s++)
+                    h_prev[s] = (initial_state != nullptr)
+                        ? initial_state[tid * d_state + s] : 0.0f;
             }
 
-            // Use dh_snap instead of dh for reading
-            float d_h_s = dh_snap[s];
+            float dh_snap[MAX_D_STATE];
+            for (int s = 0; s < d_state; s++) dh_snap[s] = dh[s];
+            for (int s = 0; s < d_state; s++) dh[s] = 0.0f;
 
-            float d_A_bar = d_h_s * h_rot;
-            float d_h_rot = d_h_s * A_bar;
-            // Forward: h[s] = A_bar * h_rot + B_bar * x_val
-            float d_B_bar = d_h_s * x_val;
-            d_x_from_scan += d_h_s * B_bar;  // gradient through x_val
+            float d_dt_val = 0.0f;
+            float d_x_from_scan = 0.0f;
 
-            // d_B_bar -> d_dt, d_B_val
-            d_dt_val += d_B_bar * B_val;
-            float d_B_val = d_B_bar * dt_val;
-            // Full B projection backward
-            for (int j = 0; j < d_inner; j++) {
-                d_B_proj_W_local[s * d_inner + j] += d_B_val * s_x_branch[j];
+            for (int s = 0; s < d_state; s++) {
+                float half_dtA = dt_val * A[s] / 2.0f;
+                float denom_val = 1.0f - half_dtA + 1e-8f;
+                float A_bar = (1.0f + half_dtA) / denom_val;
+                float B_val = 0.0f;
+                for (int j = 0; j < d_inner; j++)
+                    B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
+                float B_bar = dt_val * B_val;
+                int pair_idx = s / 2;
+                float cos_p, sin_p;
+                __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+                float h_rot;
+                int partner;
+                float sign;
+                if (s % 2 == 0) {
+                    partner = s + 1; sign = -1.0f;
+                    h_rot = h_prev[s] * cos_p - h_prev[partner] * sin_p;
+                } else {
+                    partner = s - 1; sign = 1.0f;
+                    h_rot = h_prev[s] * cos_p + h_prev[partner] * sin_p;
+                }
+                float d_h_s = dh_snap[s];
+                float d_A_bar = d_h_s * h_rot;
+                float d_h_rot = d_h_s * A_bar;
+                float d_B_bar = d_h_s * x_val;
+                d_x_from_scan += d_h_s * B_bar;
+                d_dt_val += d_B_bar * B_val;
+                float d_B_val = d_B_bar * dt_val;
+                for (int j = 0; j < d_inner; j++)
+                    d_B_proj_W_local[s * d_inner + j] += d_B_val * s_x_branch[j];
+                d_x_from_scan += d_B_val * B_proj_W[s * d_inner + tid];
+                float d_half_dtA = d_A_bar * (1.0f + A_bar) / denom_val;
+                d_dt_val += d_half_dtA * A[s] / 2.0f;
+                float d_A_s = d_half_dtA * dt_val / 2.0f;
+                d_A_log_acc[s] += d_A_s * A[s];
+                float d_h_prev_s = d_h_rot * cos_p;
+                float d_h_prev_partner = d_h_rot * sign * sin_p;
+                float d_cos = d_h_rot * h_prev[s];
+                float d_sin = d_h_rot * sign * h_prev[partner];
+                d_dt_val += (-sin_p * freq[pair_idx]) * d_cos + (cos_p * freq[pair_idx]) * d_sin;
+                d_freq_acc[pair_idx] += (-sin_p * dt_val) * d_cos + (cos_p * dt_val) * d_sin;
+                dh[s] += d_h_prev_s;
+                dh[partner] += d_h_prev_partner;
             }
-            // Gradient of B_val w.r.t. x_branch[tid]: B_proj_W[s, tid]
-            d_x_from_scan += d_B_val * B_proj_W[s * d_inner + tid];
 
-            // d_A_bar -> d_dt, d_A_log
-            float d_half_dtA = d_A_bar * (1.0f + A_bar) / denom_val;
-            d_dt_val += d_half_dtA * A[s] / 2.0f;
-            float d_A_s = d_half_dtA * dt_val / 2.0f;
-            d_A_log_acc[s] += d_A_s * A[s];
+            float dt_raw = dt_proj_b[tid];
+            for (int j = 0; j < d_inner; j++)
+                dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
+            float sig_dt = 1.0f / (1.0f + expf(-dt_raw));
+            float d_dt_raw = d_dt_val * sig_dt;
 
-            // d_h_rot -> d_h_prev[s], d_h_prev[partner] (paired RoPE)
-            float d_h_prev_s = d_h_rot * cos_p;
-            float d_h_prev_partner = d_h_rot * sign * sin_p;
+            d_dt_proj_b_acc += d_dt_raw;
+            for (int j = 0; j < d_inner; j++)
+                d_dt_proj_W_row[j] += d_dt_raw * s_x_branch[j];
 
-            // d_h_rot -> d_cos, d_sin -> d_dt, d_freq
-            float d_cos = d_h_rot * h_prev[s];
-            float d_sin = d_h_rot * sign * h_prev[partner];
-            d_dt_val += (-sin_p * freq[pair_idx]) * d_cos + (cos_p * freq[pair_idx]) * d_sin;
-            d_freq_acc[pair_idx] += (-sin_p * dt_val) * d_cos + (cos_p * dt_val) * d_sin;
+            s_d_dt_raw[tid] = d_dt_raw;
+            __syncthreads();
+            float d_x_from_dt = 0.0f;
+            for (int t = 0; t < d_inner; t++)
+                d_x_from_dt += s_d_dt_raw[t] * dt_proj_W[t * d_inner + tid];
 
-            // Propagate dh to previous step (accumulate into fresh dh)
-            dh[s] += d_h_prev_s;
-            dh[partner] += d_h_prev_partner;
+            float d_x_val = d_x_from_D + d_x_from_C + d_x_from_scan + d_x_from_dt;
+
+            for (int d = 0; d < d_model; d++) {
+                float inp = x_sorted[i * d_model + d];
+                d_in_proj_W_x_local[d] += d_x_val * inp;
+                d_in_proj_W_z_local[d] += d_z_val * inp;
+                atomicAdd(&d_x_sorted[i * d_model + d],
+                          d_x_val * in_proj_W[tid * d_model + d] +
+                          d_z_val * in_proj_W[(tid + d_inner) * d_model + d]);
+            }
+            __syncthreads();
         }
+    } else {
+        // ════════════════════════════════════════════════════════════
+        //  CHECKPOINTED PATH: saved_states has only checkpoint states
+        //  Recompute intermediate states per segment during backward.
+        // ════════════════════════════════════════════════════════════
+        int num_segments = (N + checkpoint_interval - 1) / checkpoint_interval;
 
-        // Backward through dt: dt_val = softplus(dt_raw)
-        // Recompute dt_raw using full projection
-        float dt_raw = dt_proj_b[tid];
-        for (int j = 0; j < d_inner; j++) {
-            dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
+        // Buffer for recomputed segment states: seg_h[local][s]
+        // seg_h[0] = state before first step of segment (input state)
+        // seg_h[k] = state after local step k-1 (for k >= 1)
+        float seg_h[(MAX_CKPT_INTERVAL + 1) * MAX_D_STATE];
+
+        for (int seg = num_segments - 1; seg >= 0; seg--) {
+            int seg_start = seg * checkpoint_interval;
+            int seg_end = (seg_start + checkpoint_interval < N)
+                          ? seg_start + checkpoint_interval : N;
+            int seg_len = seg_end - seg_start;
+
+            // === Phase 1: Load checkpoint input state ===
+            if (seg == 0) {
+                for (int s = 0; s < d_state; s++)
+                    seg_h[s] = (initial_state != nullptr)
+                               ? initial_state[tid * d_state + s] : 0.0f;
+            } else {
+                // Checkpoint[seg-1] stores state at end of previous segment
+                int ckpt_idx = seg - 1;
+                for (int s = 0; s < d_state; s++)
+                    seg_h[s] = saved_states[(ckpt_idx * d_inner + tid) * d_state + s];
+            }
+
+            // === Phase 2: Forward-recompute all states in this segment ===
+            for (int local = 0; local < seg_len; local++) {
+                int step = seg_start + local;
+                int i = reverse ? (N - 1 - step) : step;
+
+                float x_val = saved_x_branch[i * d_inner + tid];
+                float dt_val = saved_dt[i * d_inner + tid];
+
+                s_x_branch[tid] = x_val;
+                __syncthreads();
+
+                // Snapshot for RoPE
+                float h_snap_r[MAX_D_STATE];
+                for (int s = 0; s < d_state; s++)
+                    h_snap_r[s] = seg_h[local * MAX_D_STATE + s];
+
+                for (int s = 0; s < d_state; s++) {
+                    float A_bar = (1.0f + dt_val * A[s] / 2.0f)
+                                  / (1.0f - dt_val * A[s] / 2.0f + 1e-8f);
+                    float B_val = 0.0f;
+                    for (int j = 0; j < d_inner; j++)
+                        B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
+                    float B_bar = dt_val * B_val;
+
+                    int pair_idx = s / 2;
+                    float cos_p, sin_p;
+                    __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+                    float h_rot;
+                    if (s % 2 == 0)
+                        h_rot = h_snap_r[s] * cos_p - h_snap_r[s + 1] * sin_p;
+                    else
+                        h_rot = h_snap_r[s] * cos_p + h_snap_r[s - 1] * sin_p;
+
+                    seg_h[(local + 1) * MAX_D_STATE + s] = A_bar * h_rot + B_bar * x_val;
+                }
+                __syncthreads();
+            }
+
+            // === Phase 3: Backward through this segment (reverse order) ===
+            for (int local = seg_len - 1; local >= 0; local--) {
+                int step = seg_start + local;
+                int i = reverse ? (N - 1 - step) : step;
+
+                float d_out = d_scan_output[i * d_inner + tid];
+                float x_val = saved_x_branch[i * d_inner + tid];
+                float z_val = saved_z[i * d_inner + tid];
+                float dt_val = saved_dt[i * d_inner + tid];
+
+                s_x_branch[tid] = x_val;
+                __syncthreads();
+
+                float sig_z = 1.0f / (1.0f + expf(-z_val));
+                float silu_z = z_val * sig_z;
+
+                // Use recomputed state: seg_h[(local+1)*MAX_D_STATE + s]
+                float y_val = 0.0f;
+                for (int s = 0; s < d_state; s++) {
+                    float C_val = 0.0f;
+                    for (int j = 0; j < d_inner; j++)
+                        C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+                    y_val += seg_h[(local + 1) * MAX_D_STATE + s] * C_val;
+                }
+
+                float d_y_val = d_out * silu_z;
+                float d_silu_z = d_out * y_val;
+                float d_z_val = d_silu_z * (sig_z + z_val * sig_z * (1.0f - sig_z));
+                float d_x_from_D = d_out * D_val;
+                d_D_acc += d_out * x_val;
+
+                float d_x_from_C = 0.0f;
+                for (int s = 0; s < d_state; s++) {
+                    float h_s = seg_h[(local + 1) * MAX_D_STATE + s];
+                    float C_val = 0.0f;
+                    for (int j = 0; j < d_inner; j++)
+                        C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+                    dh[s] += d_y_val * C_val;
+                    float d_C_val = d_y_val * h_s;
+                    for (int j = 0; j < d_inner; j++)
+                        d_C_proj_W_local[s * d_inner + j] += d_C_val * s_x_branch[j];
+                    d_x_from_C += d_y_val * h_s * C_proj_W[s * d_inner + tid];
+                }
+
+                // h_prev from recomputed segment states
+                float h_prev[MAX_D_STATE];
+                for (int s = 0; s < d_state; s++)
+                    h_prev[s] = seg_h[local * MAX_D_STATE + s];
+
+                float dh_snap[MAX_D_STATE];
+                for (int s = 0; s < d_state; s++) dh_snap[s] = dh[s];
+                for (int s = 0; s < d_state; s++) dh[s] = 0.0f;
+
+                float d_dt_val = 0.0f;
+                float d_x_from_scan = 0.0f;
+
+                for (int s = 0; s < d_state; s++) {
+                    float half_dtA = dt_val * A[s] / 2.0f;
+                    float denom_val = 1.0f - half_dtA + 1e-8f;
+                    float A_bar = (1.0f + half_dtA) / denom_val;
+                    float B_val = 0.0f;
+                    for (int j = 0; j < d_inner; j++)
+                        B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
+                    float B_bar = dt_val * B_val;
+                    int pair_idx = s / 2;
+                    float cos_p, sin_p;
+                    __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+                    float h_rot;
+                    int partner;
+                    float sign;
+                    if (s % 2 == 0) {
+                        partner = s + 1; sign = -1.0f;
+                        h_rot = h_prev[s] * cos_p - h_prev[partner] * sin_p;
+                    } else {
+                        partner = s - 1; sign = 1.0f;
+                        h_rot = h_prev[s] * cos_p + h_prev[partner] * sin_p;
+                    }
+                    float d_h_s = dh_snap[s];
+                    float d_A_bar = d_h_s * h_rot;
+                    float d_h_rot = d_h_s * A_bar;
+                    float d_B_bar = d_h_s * x_val;
+                    d_x_from_scan += d_h_s * B_bar;
+                    d_dt_val += d_B_bar * B_val;
+                    float d_B_val = d_B_bar * dt_val;
+                    for (int j = 0; j < d_inner; j++)
+                        d_B_proj_W_local[s * d_inner + j] += d_B_val * s_x_branch[j];
+                    d_x_from_scan += d_B_val * B_proj_W[s * d_inner + tid];
+                    float d_half_dtA = d_A_bar * (1.0f + A_bar) / denom_val;
+                    d_dt_val += d_half_dtA * A[s] / 2.0f;
+                    float d_A_s = d_half_dtA * dt_val / 2.0f;
+                    d_A_log_acc[s] += d_A_s * A[s];
+                    float d_h_prev_s = d_h_rot * cos_p;
+                    float d_h_prev_partner = d_h_rot * sign * sin_p;
+                    float d_cos = d_h_rot * h_prev[s];
+                    float d_sin = d_h_rot * sign * h_prev[partner];
+                    d_dt_val += (-sin_p * freq[pair_idx]) * d_cos + (cos_p * freq[pair_idx]) * d_sin;
+                    d_freq_acc[pair_idx] += (-sin_p * dt_val) * d_cos + (cos_p * dt_val) * d_sin;
+                    dh[s] += d_h_prev_s;
+                    dh[partner] += d_h_prev_partner;
+                }
+
+                float dt_raw = dt_proj_b[tid];
+                for (int j = 0; j < d_inner; j++)
+                    dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
+                float sig_dt = 1.0f / (1.0f + expf(-dt_raw));
+                float d_dt_raw = d_dt_val * sig_dt;
+
+                d_dt_proj_b_acc += d_dt_raw;
+                for (int j = 0; j < d_inner; j++)
+                    d_dt_proj_W_row[j] += d_dt_raw * s_x_branch[j];
+
+                s_d_dt_raw[tid] = d_dt_raw;
+                __syncthreads();
+                float d_x_from_dt = 0.0f;
+                for (int t = 0; t < d_inner; t++)
+                    d_x_from_dt += s_d_dt_raw[t] * dt_proj_W[t * d_inner + tid];
+
+                float d_x_val = d_x_from_D + d_x_from_C + d_x_from_scan + d_x_from_dt;
+
+                for (int d = 0; d < d_model; d++) {
+                    float inp = x_sorted[i * d_model + d];
+                    d_in_proj_W_x_local[d] += d_x_val * inp;
+                    d_in_proj_W_z_local[d] += d_z_val * inp;
+                    atomicAdd(&d_x_sorted[i * d_model + d],
+                              d_x_val * in_proj_W[tid * d_model + d] +
+                              d_z_val * in_proj_W[(tid + d_inner) * d_model + d]);
+                }
+                __syncthreads();
+            }
         }
-        float sig_dt = 1.0f / (1.0f + expf(-dt_raw));
-        float d_dt_raw = d_dt_val * sig_dt;
-
-        d_dt_proj_b_acc += d_dt_raw;
-        // Full dt_proj_W backward
-        for (int j = 0; j < d_inner; j++) {
-            d_dt_proj_W_row[j] += d_dt_raw * s_x_branch[j];
-        }
-
-        // Full dt backward using shared memory for cross-thread d_dt_raw
-        s_d_dt_raw[tid] = d_dt_raw;
-        __syncthreads();
-        float d_x_from_dt = 0.0f;
-        for (int t = 0; t < d_inner; t++) {
-            d_x_from_dt += s_d_dt_raw[t] * dt_proj_W[t * d_inner + tid];
-        }
-
-        // Total d_x_val for this step
-        float d_x_val = d_x_from_D + d_x_from_C + d_x_from_scan + d_x_from_dt;
-
-        // Backward through input projection to d_x_sorted and d_in_proj_W
-        for (int d = 0; d < d_model; d++) {
-            float inp = x_sorted[i * d_model + d];
-            d_in_proj_W_x_local[d] += d_x_val * inp;
-            d_in_proj_W_z_local[d] += d_z_val * inp;
-            atomicAdd(&d_x_sorted[i * d_model + d],
-                      d_x_val * in_proj_W[tid * d_model + d] +
-                      d_z_val * in_proj_W[(tid + d_inner) * d_model + d]);
-        }
-
-        __syncthreads(); // ensure all threads done before next step
     }
 
     // Write accumulated per-thread parameter gradients
@@ -661,8 +844,10 @@ __global__ void mamba3_scan_backward_batched_kernel(
     float* __restrict__ d_D_param,
     float* __restrict__ d_rope_freq,
     float* __restrict__ d_x_sorted_packed,           // [total_N, d_model]
+    const int* __restrict__ ckpt_offsets,            // [num_params + 1] or nullptr
     // Dims
-    const int d_model, const int d_inner, const int d_state
+    const int d_model, const int d_inner, const int d_state,
+    const int checkpoint_interval  // 0 or 1 = no checkpointing
 ) {
     const int param_idx = blockIdx.x;
     const int tid = threadIdx.x;
@@ -680,7 +865,10 @@ __global__ void mamba3_scan_backward_batched_kernel(
     // Point to this param's packed data
     const float* my_d_scan = d_scan_output_packed + start * d_inner;
     const float* my_x_sorted = x_sorted_packed + start * d_model;
-    const float* my_saved_states = saved_states_packed + start * d_inner * d_state;
+    // For checkpointing: saved_states uses ckpt_offsets
+    const int ckpt_start = (checkpoint_interval > 1 && ckpt_offsets != nullptr)
+                           ? ckpt_offsets[param_idx] : start;
+    const float* my_saved_states = saved_states_packed + ckpt_start * d_inner * d_state;
     const float* my_saved_xb = saved_x_branch_packed + start * d_inner;
     const float* my_saved_z = saved_z_packed + start * d_inner;
     const float* my_saved_dt = saved_dt_packed + start * d_inner;
@@ -706,11 +894,10 @@ __global__ void mamba3_scan_backward_batched_kernel(
     float d_dt_proj_W_row[MAX_D_INNER];
     for (int j = 0; j < d_inner; j++) d_dt_proj_W_row[j] = 0.0f;
 
-    // Thread-local accumulators for weight gradients (avoid per-step atomicAdds)
     float d_C_proj_W_local[MAX_D_STATE * MAX_D_INNER];
     float d_B_proj_W_local[MAX_D_STATE * MAX_D_INNER];
-    float d_in_proj_W_x_local[MAX_D_MODEL];  // row tid of d_in_proj_W
-    float d_in_proj_W_z_local[MAX_D_MODEL];  // row (tid+d_inner) of d_in_proj_W
+    float d_in_proj_W_x_local[MAX_D_MODEL];
+    float d_in_proj_W_z_local[MAX_D_MODEL];
     for (int k = 0; k < d_state * d_inner; k++) {
         d_C_proj_W_local[k] = 0.0f;
         d_B_proj_W_local[k] = 0.0f;
@@ -723,152 +910,310 @@ __global__ void mamba3_scan_backward_batched_kernel(
     float dh[MAX_D_STATE];
     for (int s = 0; s < d_state; s++) dh[s] = 0.0f;
 
-    // Initial state for h_prev at step 0
     const float* my_init = initial_states + param_idx * d_inner * d_state;
 
-    for (int step = N - 1; step >= 0; step--) {
-        int i = reverse ? (N - 1 - step) : step;
+    if (checkpoint_interval <= 1) {
+        // ════════════════════════════════════════════════════════
+        //  ORIGINAL PATH: saved_states has all N states
+        // ════════════════════════════════════════════════════════
+        for (int step = N - 1; step >= 0; step--) {
+            int i = reverse ? (N - 1 - step) : step;
 
-        float d_out = my_d_scan[i * d_inner + tid];
-        float x_val = my_saved_xb[i * d_inner + tid];
-        float z_val = my_saved_z[i * d_inner + tid];
-        float dt_val = my_saved_dt[i * d_inner + tid];
+            float d_out = my_d_scan[i * d_inner + tid];
+            float x_val = my_saved_xb[i * d_inner + tid];
+            float z_val = my_saved_z[i * d_inner + tid];
+            float dt_val = my_saved_dt[i * d_inner + tid];
 
-        s_x_branch[tid] = x_val;
-        __syncthreads();
+            s_x_branch[tid] = x_val;
+            __syncthreads();
 
-        float sig_z = 1.0f / (1.0f + expf(-z_val));
-        float silu_z = z_val * sig_z;
+            float sig_z = 1.0f / (1.0f + expf(-z_val));
+            float silu_z = z_val * sig_z;
 
-        float y_val = 0.0f;
-        for (int s = 0; s < d_state; s++) {
-            float C_val = 0.0f;
-            for (int j = 0; j < d_inner; j++)
-                C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
-            y_val += my_saved_states[(i * d_inner + tid) * d_state + s] * C_val;
-        }
-
-        float d_y_val = d_out * silu_z;
-        float d_silu_z = d_out * y_val;
-        float d_z_val = d_silu_z * (sig_z + z_val * sig_z * (1.0f - sig_z));
-        float d_x_from_D = d_out * D_val;
-        d_D_acc += d_out * x_val;
-
-        float d_x_from_C = 0.0f;
-        for (int s = 0; s < d_state; s++) {
-            float h_s = my_saved_states[(i * d_inner + tid) * d_state + s];
-            float C_val = 0.0f;
-            for (int j = 0; j < d_inner; j++)
-                C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
-            dh[s] += d_y_val * C_val;
-            float d_C_val = d_y_val * h_s;
-            for (int j = 0; j < d_inner; j++)
-                d_C_proj_W_local[s * d_inner + j] += d_C_val * s_x_branch[j];
-            d_x_from_C += d_y_val * h_s * C_proj_W[s * d_inner + tid];
-        }
-
-        // Get h_prev
-        float h_prev[MAX_D_STATE];
-        if (step > 0) {
-            int i_prev = reverse ? (N - step) : (step - 1);
-            for (int s = 0; s < d_state; s++)
-                h_prev[s] = my_saved_states[(i_prev * d_inner + tid) * d_state + s];
-        } else {
-            // Use initial state for this param
-            for (int s = 0; s < d_state; s++)
-                h_prev[s] = my_init[tid * d_state + s];
-        }
-
-        float dh_snap[MAX_D_STATE];
-        for (int s = 0; s < d_state; s++) dh_snap[s] = dh[s];
-        for (int s = 0; s < d_state; s++) dh[s] = 0.0f;
-
-        float d_dt_val = 0.0f;
-        float d_x_from_scan = 0.0f;
-
-        for (int s = 0; s < d_state; s++) {
-            float half_dtA = dt_val * A[s] / 2.0f;
-            float denom_val = 1.0f - half_dtA + 1e-8f;
-            float A_bar = (1.0f + half_dtA) / denom_val;
-
-            float B_val = 0.0f;
-            for (int j = 0; j < d_inner; j++)
-                B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
-            float B_bar = dt_val * B_val;
-
-            int pair_idx = s / 2;
-            float cos_p, sin_p;
-            __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
-            float h_rot;
-            int partner;
-            float sign;
-            if (s % 2 == 0) {
-                partner = s + 1;
-                sign = -1.0f;
-                h_rot = h_prev[s] * cos_p - h_prev[partner] * sin_p;
-            } else {
-                partner = s - 1;
-                sign = 1.0f;
-                h_rot = h_prev[s] * cos_p + h_prev[partner] * sin_p;
+            float y_val = 0.0f;
+            for (int s = 0; s < d_state; s++) {
+                float C_val = 0.0f;
+                for (int j = 0; j < d_inner; j++)
+                    C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+                y_val += my_saved_states[(i * d_inner + tid) * d_state + s] * C_val;
             }
 
-            float d_h_s = dh_snap[s];
-            float d_A_bar = d_h_s * h_rot;
-            float d_h_rot = d_h_s * A_bar;
-            float d_B_bar = d_h_s * x_val;
-            d_x_from_scan += d_h_s * B_bar;
+            float d_y_val = d_out * silu_z;
+            float d_silu_z = d_out * y_val;
+            float d_z_val = d_silu_z * (sig_z + z_val * sig_z * (1.0f - sig_z));
+            float d_x_from_D = d_out * D_val;
+            d_D_acc += d_out * x_val;
 
-            d_dt_val += d_B_bar * B_val;
-            float d_B_val = d_B_bar * dt_val;
+            float d_x_from_C = 0.0f;
+            for (int s = 0; s < d_state; s++) {
+                float h_s = my_saved_states[(i * d_inner + tid) * d_state + s];
+                float C_val = 0.0f;
+                for (int j = 0; j < d_inner; j++)
+                    C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+                dh[s] += d_y_val * C_val;
+                float d_C_val = d_y_val * h_s;
+                for (int j = 0; j < d_inner; j++)
+                    d_C_proj_W_local[s * d_inner + j] += d_C_val * s_x_branch[j];
+                d_x_from_C += d_y_val * h_s * C_proj_W[s * d_inner + tid];
+            }
+
+            float h_prev[MAX_D_STATE];
+            if (step > 0) {
+                int i_prev = reverse ? (N - step) : (step - 1);
+                for (int s = 0; s < d_state; s++)
+                    h_prev[s] = my_saved_states[(i_prev * d_inner + tid) * d_state + s];
+            } else {
+                for (int s = 0; s < d_state; s++)
+                    h_prev[s] = my_init[tid * d_state + s];
+            }
+
+            float dh_snap[MAX_D_STATE];
+            for (int s = 0; s < d_state; s++) dh_snap[s] = dh[s];
+            for (int s = 0; s < d_state; s++) dh[s] = 0.0f;
+
+            float d_dt_val = 0.0f;
+            float d_x_from_scan = 0.0f;
+
+            for (int s = 0; s < d_state; s++) {
+                float half_dtA = dt_val * A[s] / 2.0f;
+                float denom_val = 1.0f - half_dtA + 1e-8f;
+                float A_bar = (1.0f + half_dtA) / denom_val;
+                float B_val = 0.0f;
+                for (int j = 0; j < d_inner; j++)
+                    B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
+                float B_bar = dt_val * B_val;
+                int pair_idx = s / 2;
+                float cos_p, sin_p;
+                __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+                float h_rot;
+                int partner;
+                float sign;
+                if (s % 2 == 0) {
+                    partner = s + 1; sign = -1.0f;
+                    h_rot = h_prev[s] * cos_p - h_prev[partner] * sin_p;
+                } else {
+                    partner = s - 1; sign = 1.0f;
+                    h_rot = h_prev[s] * cos_p + h_prev[partner] * sin_p;
+                }
+                float d_h_s = dh_snap[s];
+                float d_A_bar = d_h_s * h_rot;
+                float d_h_rot = d_h_s * A_bar;
+                float d_B_bar = d_h_s * x_val;
+                d_x_from_scan += d_h_s * B_bar;
+                d_dt_val += d_B_bar * B_val;
+                float d_B_val = d_B_bar * dt_val;
+                for (int j = 0; j < d_inner; j++)
+                    d_B_proj_W_local[s * d_inner + j] += d_B_val * s_x_branch[j];
+                d_x_from_scan += d_B_val * B_proj_W[s * d_inner + tid];
+                float d_half_dtA = d_A_bar * (1.0f + A_bar) / denom_val;
+                d_dt_val += d_half_dtA * A[s] / 2.0f;
+                float d_A_s = d_half_dtA * dt_val / 2.0f;
+                d_A_log_acc[s] += d_A_s * A[s];
+                float d_h_prev_s = d_h_rot * cos_p;
+                float d_h_prev_partner = d_h_rot * sign * sin_p;
+                float d_cos = d_h_rot * h_prev[s];
+                float d_sin = d_h_rot * sign * h_prev[partner];
+                d_dt_val += (-sin_p * freq[pair_idx]) * d_cos + (cos_p * freq[pair_idx]) * d_sin;
+                d_freq_acc[pair_idx] += (-sin_p * dt_val) * d_cos + (cos_p * dt_val) * d_sin;
+                dh[s] += d_h_prev_s;
+                dh[partner] += d_h_prev_partner;
+            }
+
+            float dt_raw = dt_proj_b[tid];
             for (int j = 0; j < d_inner; j++)
-                d_B_proj_W_local[s * d_inner + j] += d_B_val * s_x_branch[j];
-            d_x_from_scan += d_B_val * B_proj_W[s * d_inner + tid];
+                dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
+            float sig_dt = 1.0f / (1.0f + expf(-dt_raw));
+            float d_dt_raw = d_dt_val * sig_dt;
 
-            float d_half_dtA = d_A_bar * (1.0f + A_bar) / denom_val;
-            d_dt_val += d_half_dtA * A[s] / 2.0f;
-            float d_A_s = d_half_dtA * dt_val / 2.0f;
-            d_A_log_acc[s] += d_A_s * A[s];
+            d_dt_proj_b_acc += d_dt_raw;
+            for (int j = 0; j < d_inner; j++)
+                d_dt_proj_W_row[j] += d_dt_raw * s_x_branch[j];
 
-            float d_h_prev_s = d_h_rot * cos_p;
-            float d_h_prev_partner = d_h_rot * sign * sin_p;
+            s_d_dt_raw[tid] = d_dt_raw;
+            __syncthreads();
+            float d_x_from_dt = 0.0f;
+            for (int t = 0; t < d_inner; t++)
+                d_x_from_dt += s_d_dt_raw[t] * dt_proj_W[t * d_inner + tid];
 
-            float d_cos = d_h_rot * h_prev[s];
-            float d_sin = d_h_rot * sign * h_prev[partner];
-            d_dt_val += (-sin_p * freq[pair_idx]) * d_cos + (cos_p * freq[pair_idx]) * d_sin;
-            d_freq_acc[pair_idx] += (-sin_p * dt_val) * d_cos + (cos_p * dt_val) * d_sin;
+            float d_x_val = d_x_from_D + d_x_from_C + d_x_from_scan + d_x_from_dt;
 
-            dh[s] += d_h_prev_s;
-            dh[partner] += d_h_prev_partner;
+            for (int d = 0; d < d_model; d++) {
+                float inp = my_x_sorted[i * d_model + d];
+                d_in_proj_W_x_local[d] += d_x_val * inp;
+                d_in_proj_W_z_local[d] += d_z_val * inp;
+                atomicAdd(&my_d_x_sorted[i * d_model + d],
+                          d_x_val * in_proj_W[tid * d_model + d] +
+                          d_z_val * in_proj_W[(tid + d_inner) * d_model + d]);
+            }
+            __syncthreads();
         }
+    } else {
+        // ════════════════════════════════════════════════════════
+        //  CHECKPOINTED PATH: recompute states from checkpoints
+        // ════════════════════════════════════════════════════════
+        int num_segments = (N + checkpoint_interval - 1) / checkpoint_interval;
+        float seg_h[(MAX_CKPT_INTERVAL + 1) * MAX_D_STATE];
 
-        float dt_raw = dt_proj_b[tid];
-        for (int j = 0; j < d_inner; j++)
-            dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
-        float sig_dt = 1.0f / (1.0f + expf(-dt_raw));
-        float d_dt_raw = d_dt_val * sig_dt;
+        for (int seg = num_segments - 1; seg >= 0; seg--) {
+            int seg_start = seg * checkpoint_interval;
+            int seg_end = (seg_start + checkpoint_interval < N)
+                          ? seg_start + checkpoint_interval : N;
+            int seg_len = seg_end - seg_start;
 
-        d_dt_proj_b_acc += d_dt_raw;
-        for (int j = 0; j < d_inner; j++)
-            d_dt_proj_W_row[j] += d_dt_raw * s_x_branch[j];
+            // Load checkpoint input state
+            if (seg == 0) {
+                for (int s = 0; s < d_state; s++)
+                    seg_h[s] = my_init[tid * d_state + s];
+            } else {
+                int ckpt_idx = seg - 1;
+                for (int s = 0; s < d_state; s++)
+                    seg_h[s] = my_saved_states[(ckpt_idx * d_inner + tid) * d_state + s];
+            }
 
-        s_d_dt_raw[tid] = d_dt_raw;
-        __syncthreads();
-        float d_x_from_dt = 0.0f;
-        for (int t = 0; t < d_inner; t++)
-            d_x_from_dt += s_d_dt_raw[t] * dt_proj_W[t * d_inner + tid];
+            // Forward-recompute segment states
+            for (int local = 0; local < seg_len; local++) {
+                int step = seg_start + local;
+                int i = reverse ? (N - 1 - step) : step;
+                float x_val = my_saved_xb[i * d_inner + tid];
+                float dt_val = my_saved_dt[i * d_inner + tid];
+                s_x_branch[tid] = x_val;
+                __syncthreads();
+                float h_snap_r[MAX_D_STATE];
+                for (int s = 0; s < d_state; s++)
+                    h_snap_r[s] = seg_h[local * MAX_D_STATE + s];
+                for (int s = 0; s < d_state; s++) {
+                    float A_bar = (1.0f + dt_val * A[s] / 2.0f)
+                                  / (1.0f - dt_val * A[s] / 2.0f + 1e-8f);
+                    float B_val = 0.0f;
+                    for (int j = 0; j < d_inner; j++)
+                        B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
+                    float B_bar = dt_val * B_val;
+                    int pair_idx = s / 2;
+                    float cos_p, sin_p;
+                    __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+                    float h_rot;
+                    if (s % 2 == 0)
+                        h_rot = h_snap_r[s] * cos_p - h_snap_r[s + 1] * sin_p;
+                    else
+                        h_rot = h_snap_r[s] * cos_p + h_snap_r[s - 1] * sin_p;
+                    seg_h[(local + 1) * MAX_D_STATE + s] = A_bar * h_rot + B_bar * x_val;
+                }
+                __syncthreads();
+            }
 
-        float d_x_val = d_x_from_D + d_x_from_C + d_x_from_scan + d_x_from_dt;
-
-        for (int d = 0; d < d_model; d++) {
-            float inp = my_x_sorted[i * d_model + d];
-            d_in_proj_W_x_local[d] += d_x_val * inp;
-            d_in_proj_W_z_local[d] += d_z_val * inp;
-            atomicAdd(&my_d_x_sorted[i * d_model + d],
-                      d_x_val * in_proj_W[tid * d_model + d] +
-                      d_z_val * in_proj_W[(tid + d_inner) * d_model + d]);
+            // Backward through segment
+            for (int local = seg_len - 1; local >= 0; local--) {
+                int step = seg_start + local;
+                int i = reverse ? (N - 1 - step) : step;
+                float d_out = my_d_scan[i * d_inner + tid];
+                float x_val = my_saved_xb[i * d_inner + tid];
+                float z_val = my_saved_z[i * d_inner + tid];
+                float dt_val = my_saved_dt[i * d_inner + tid];
+                s_x_branch[tid] = x_val;
+                __syncthreads();
+                float sig_z = 1.0f / (1.0f + expf(-z_val));
+                float silu_z = z_val * sig_z;
+                float y_val = 0.0f;
+                for (int s = 0; s < d_state; s++) {
+                    float C_val = 0.0f;
+                    for (int j = 0; j < d_inner; j++)
+                        C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+                    y_val += seg_h[(local + 1) * MAX_D_STATE + s] * C_val;
+                }
+                float d_y_val = d_out * silu_z;
+                float d_silu_z = d_out * y_val;
+                float d_z_val = d_silu_z * (sig_z + z_val * sig_z * (1.0f - sig_z));
+                float d_x_from_D = d_out * D_val;
+                d_D_acc += d_out * x_val;
+                float d_x_from_C = 0.0f;
+                for (int s = 0; s < d_state; s++) {
+                    float h_s = seg_h[(local + 1) * MAX_D_STATE + s];
+                    float C_val = 0.0f;
+                    for (int j = 0; j < d_inner; j++)
+                        C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
+                    dh[s] += d_y_val * C_val;
+                    float d_C_val = d_y_val * h_s;
+                    for (int j = 0; j < d_inner; j++)
+                        d_C_proj_W_local[s * d_inner + j] += d_C_val * s_x_branch[j];
+                    d_x_from_C += d_y_val * h_s * C_proj_W[s * d_inner + tid];
+                }
+                float h_prev[MAX_D_STATE];
+                for (int s = 0; s < d_state; s++)
+                    h_prev[s] = seg_h[local * MAX_D_STATE + s];
+                float dh_snap[MAX_D_STATE];
+                for (int s = 0; s < d_state; s++) dh_snap[s] = dh[s];
+                for (int s = 0; s < d_state; s++) dh[s] = 0.0f;
+                float d_dt_val = 0.0f;
+                float d_x_from_scan = 0.0f;
+                for (int s = 0; s < d_state; s++) {
+                    float half_dtA = dt_val * A[s] / 2.0f;
+                    float denom_val = 1.0f - half_dtA + 1e-8f;
+                    float A_bar = (1.0f + half_dtA) / denom_val;
+                    float B_val = 0.0f;
+                    for (int j = 0; j < d_inner; j++)
+                        B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
+                    float B_bar = dt_val * B_val;
+                    int pair_idx = s / 2;
+                    float cos_p, sin_p;
+                    __sincosf(dt_val * freq[pair_idx], &sin_p, &cos_p);
+                    float h_rot;
+                    int partner;
+                    float sign;
+                    if (s % 2 == 0) {
+                        partner = s + 1; sign = -1.0f;
+                        h_rot = h_prev[s] * cos_p - h_prev[partner] * sin_p;
+                    } else {
+                        partner = s - 1; sign = 1.0f;
+                        h_rot = h_prev[s] * cos_p + h_prev[partner] * sin_p;
+                    }
+                    float d_h_s = dh_snap[s];
+                    float d_A_bar = d_h_s * h_rot;
+                    float d_h_rot = d_h_s * A_bar;
+                    float d_B_bar = d_h_s * x_val;
+                    d_x_from_scan += d_h_s * B_bar;
+                    d_dt_val += d_B_bar * B_val;
+                    float d_B_val = d_B_bar * dt_val;
+                    for (int j = 0; j < d_inner; j++)
+                        d_B_proj_W_local[s * d_inner + j] += d_B_val * s_x_branch[j];
+                    d_x_from_scan += d_B_val * B_proj_W[s * d_inner + tid];
+                    float d_half_dtA = d_A_bar * (1.0f + A_bar) / denom_val;
+                    d_dt_val += d_half_dtA * A[s] / 2.0f;
+                    float d_A_s = d_half_dtA * dt_val / 2.0f;
+                    d_A_log_acc[s] += d_A_s * A[s];
+                    float d_h_prev_s = d_h_rot * cos_p;
+                    float d_h_prev_partner = d_h_rot * sign * sin_p;
+                    float d_cos = d_h_rot * h_prev[s];
+                    float d_sin = d_h_rot * sign * h_prev[partner];
+                    d_dt_val += (-sin_p * freq[pair_idx]) * d_cos + (cos_p * freq[pair_idx]) * d_sin;
+                    d_freq_acc[pair_idx] += (-sin_p * dt_val) * d_cos + (cos_p * dt_val) * d_sin;
+                    dh[s] += d_h_prev_s;
+                    dh[partner] += d_h_prev_partner;
+                }
+                float dt_raw = dt_proj_b[tid];
+                for (int j = 0; j < d_inner; j++)
+                    dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
+                float sig_dt = 1.0f / (1.0f + expf(-dt_raw));
+                float d_dt_raw = d_dt_val * sig_dt;
+                d_dt_proj_b_acc += d_dt_raw;
+                for (int j = 0; j < d_inner; j++)
+                    d_dt_proj_W_row[j] += d_dt_raw * s_x_branch[j];
+                s_d_dt_raw[tid] = d_dt_raw;
+                __syncthreads();
+                float d_x_from_dt = 0.0f;
+                for (int t = 0; t < d_inner; t++)
+                    d_x_from_dt += s_d_dt_raw[t] * dt_proj_W[t * d_inner + tid];
+                float d_x_val = d_x_from_D + d_x_from_C + d_x_from_scan + d_x_from_dt;
+                for (int d = 0; d < d_model; d++) {
+                    float inp = my_x_sorted[i * d_model + d];
+                    d_in_proj_W_x_local[d] += d_x_val * inp;
+                    d_in_proj_W_z_local[d] += d_z_val * inp;
+                    atomicAdd(&my_d_x_sorted[i * d_model + d],
+                              d_x_val * in_proj_W[tid * d_model + d] +
+                              d_z_val * in_proj_W[(tid + d_inner) * d_model + d]);
+                }
+                __syncthreads();
+            }
         }
-
-        __syncthreads();
     }
 
     atomicAdd(&d_D_param[tid], d_D_acc);
@@ -1146,9 +1491,22 @@ __global__ void expert_peer_backward_kernel(
     const int d_model, const int pk_dim, const int expert_hidden,
     const int peer_input_dim, const int num_experts
 ) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N) return;
+    // Shared memory accumulators for expert weight gradients
+    extern __shared__ float smem[];
+    float* s_d_expert_W1 = smem;
+    float* s_d_expert_b1 = s_d_expert_W1 + num_experts * expert_hidden;
+    float* s_d_expert_W2 = s_d_expert_b1 + num_experts * expert_hidden;
+    float* s_d_expert_b2 = s_d_expert_W2 + num_experts * expert_hidden;
+    int total_expert_smem = 3 * num_experts * expert_hidden + num_experts;
 
+    // Zero shared accumulators cooperatively
+    for (int i = threadIdx.x; i < total_expert_smem; i += blockDim.x)
+        smem[i] = 0.0f;
+    __syncthreads();
+
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < N) {
     float d_out = d_expert_out[idx];
     float g_val = grad_vals[idx];
     int half_d = d_model / 2;
@@ -1198,16 +1556,16 @@ __global__ void expert_peer_backward_kernel(
             float d_rw = d_head_out * out_k;
             float d_out_k = d_head_out * rw;
 
-            // Backward through expert MLP
-            atomicAdd(&d_expert_b2[ei], d_out_k);
+            // Backward through expert MLP (accumulate in shared memory)
+            atomicAdd(&s_d_expert_b2[ei], d_out_k);
 
             for (int eh = 0; eh < expert_hidden; eh++) {
                 float z_val = saved_z_hidden[((idx * num_heads + h) * num_active + k) * expert_hidden + eh];
-                atomicAdd(&d_expert_W2[ei * expert_hidden + eh], d_out_k * z_val);
+                atomicAdd(&s_d_expert_W2[ei * expert_hidden + eh], d_out_k * z_val);
                 float d_z = d_out_k * expert_W2[ei * expert_hidden + eh];
                 float d_pre_relu = (z_val > 0.0f) ? d_z : 0.0f;
-                atomicAdd(&d_expert_W1[ei * expert_hidden + eh], d_pre_relu * g_val);
-                atomicAdd(&d_expert_b1[ei * expert_hidden + eh], d_pre_relu);
+                atomicAdd(&s_d_expert_W1[ei * expert_hidden + eh], d_pre_relu * g_val);
+                atomicAdd(&s_d_expert_b1[ei * expert_hidden + eh], d_pre_relu);
             }
 
             // Backward through soft routing with FULL softmax backward
@@ -1247,6 +1605,22 @@ __global__ void expert_peer_backward_kernel(
                               d_q_b_d * peer_query_Ws[(h * d_model + half_d + d) * peer_input_dim + j]);
                 }
             }
+        }
+    }
+    } // end if (idx < N)
+
+    // Flush shared memory expert gradient accumulators to global memory
+    __syncthreads();
+    for (int i = threadIdx.x; i < total_expert_smem; i += blockDim.x) {
+        if (smem[i] != 0.0f) {
+            if (i < num_experts * expert_hidden)
+                atomicAdd(&d_expert_W1[i], smem[i]);
+            else if (i < 2 * num_experts * expert_hidden)
+                atomicAdd(&d_expert_b1[i - num_experts * expert_hidden], smem[i]);
+            else if (i < 3 * num_experts * expert_hidden)
+                atomicAdd(&d_expert_W2[i - 2 * num_experts * expert_hidden], smem[i]);
+            else
+                atomicAdd(&d_expert_b2[i - 3 * num_experts * expert_hidden], smem[i]);
         }
     }
 }
@@ -1355,13 +1729,18 @@ void launch_mamba3_peer_bilevel_fwd_save(
     torch::Tensor sort_indices,       // [N] — sort indices (computed here)
     // Mamba initial states (for exact match with forward_for_bilevel)
     torch::Tensor fwd_initial_state,  // [d_inner, d_state] or empty
-    torch::Tensor bwd_initial_state   // [d_inner, d_state] or empty
+    torch::Tensor bwd_initial_state,  // [d_inner, d_state] or empty
+    int checkpoint_interval            // 0 = save every step
 ) {
     const int N = grad.numel();
     if (N == 0) return;
 
     TORCH_CHECK(d_state % 2 == 0, "d_state must be even for paired RoPE (got ", d_state, ")");
     TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
+    if (checkpoint_interval > 1) {
+        TORCH_CHECK(checkpoint_interval <= MAX_CKPT_INTERVAL,
+            "checkpoint_interval (", checkpoint_interval, ") exceeds MAX_CKPT_INTERVAL (", MAX_CKPT_INTERVAL, ")");
+    }
 
     auto dev = grad.device();
     auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
@@ -1373,9 +1752,6 @@ void launch_mamba3_peer_bilevel_fwd_save(
     auto sort_idx = torch::empty({N}, int_opts);
 
     {
-        // Reuse the input_proj_sort_kernel from forward file
-        // (it's defined in supergrok2_mamba_peer_kernels.cu)
-        // For now, compute in PyTorch-compatible way
         auto g_f = grad.to(torch::kFloat32).reshape(-1);
         auto s_f = sharpness.to(torch::kFloat32).reshape(-1);
         auto inp = torch::stack({g_f, s_f}, 1);  // [N, 2]
@@ -1387,8 +1763,8 @@ void launch_mamba3_peer_bilevel_fwd_save(
         x_sorted.copy_(x_proj.index_select(0, sorted));
     }
 
-    // Shared memory for scan: x_branch
     int scan_smem = d_inner * sizeof(float);
+    int ckpt_int = (checkpoint_interval > 1) ? checkpoint_interval : 0;
 
     // Step 2: Forward scan with state saving
     mamba3_scan_fwd_save_kernel<<<1, d_inner, scan_smem>>>(
@@ -1409,11 +1785,10 @@ void launch_mamba3_peer_bilevel_fwd_save(
         fwd_saved_dt.data_ptr<float>(),
         fwd_initial_state.numel() > 0
             ? fwd_initial_state.data_ptr<float>() : nullptr,
-        N, d_model, d_inner, d_state, 0
+        N, d_model, d_inner, d_state, 0, ckpt_int
     );
 
     // Step 3: Backward scan with state saving (reversed input)
-    // Need reversed x_sorted
     auto x_sorted_rev = x_sorted.flip(0).contiguous();
     mamba3_scan_fwd_save_kernel<<<1, d_inner, scan_smem>>>(
         x_sorted_rev.data_ptr<float>(),
@@ -1433,7 +1808,7 @@ void launch_mamba3_peer_bilevel_fwd_save(
         bwd_saved_dt.data_ptr<float>(),
         bwd_initial_state.numel() > 0
             ? bwd_initial_state.data_ptr<float>() : nullptr,
-        N, d_model, d_inner, d_state, 0
+        N, d_model, d_inner, d_state, 0, ckpt_int
     );
 }
 
@@ -1536,7 +1911,8 @@ void launch_mamba3_peer_backward(
     int d_model, int d_state, int d_inner,
     int gru_hidden, int gru_input_dim,
     int num_heads, int topk, int pk_dim,
-    int expert_hidden, int peer_input_dim, int num_experts
+    int expert_hidden, int peer_input_dim, int num_experts,
+    int checkpoint_interval  // 0 = no checkpointing
 ) {
     const int N = d_smart_grad.numel();
     if (N == 0) return;
@@ -1554,7 +1930,8 @@ void launch_mamba3_peer_backward(
 
     // Step 2: Expert + PEER backward
     auto d_peer_input = torch::zeros({N, peer_input_dim}, float_opts);
-    expert_peer_backward_kernel<<<grid, SG2B_BLOCK>>>(
+    int expert_smem_bytes = (3 * num_experts * expert_hidden + num_experts) * sizeof(float);
+    expert_peer_backward_kernel<<<grid, SG2B_BLOCK, expert_smem_bytes>>>(
         d_expert_out.data_ptr<float>(),
         grad.to(torch::kFloat32).reshape(-1).data_ptr<float>(),
         expert_indices.data_ptr<int>(),
@@ -1691,7 +2068,8 @@ void launch_mamba3_peer_backward(
         d_x_sorted_fwd.data_ptr<float>(),
         mamba_fwd_init_state.numel() > 0
             ? mamba_fwd_init_state.data_ptr<float>() : nullptr,
-        N, d_model, d_inner, d_state, 0
+        N, d_model, d_inner, d_state, 0,
+        (checkpoint_interval > 1) ? checkpoint_interval : 0
     );
 
     // Backward scan used reversed x_sorted
@@ -1722,7 +2100,8 @@ void launch_mamba3_peer_backward(
         d_x_sorted_bwd.data_ptr<float>(),
         mamba_bwd_init_state.numel() > 0
             ? mamba_bwd_init_state.data_ptr<float>() : nullptr,
-        N, d_model, d_inner, d_state, 0
+        N, d_model, d_inner, d_state, 0,
+        (checkpoint_interval > 1) ? checkpoint_interval : 0
     );
 
     // Combine d_x_sorted from both directions
@@ -1803,7 +2182,8 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
     torch::Tensor sort_indices_packed,       // [total_N] int
     // Mamba initial states (persistent, not zeros)
     torch::Tensor fwd_initial_states,        // [num_params, d_inner, d_state]
-    torch::Tensor bwd_initial_states         // [num_params, d_inner, d_state]
+    torch::Tensor bwd_initial_states,        // [num_params, d_inner, d_state]
+    int checkpoint_interval                   // 0 = save every step
 ) {
     const int num_params = grads.size();
     if (num_params == 0) return;
@@ -1851,6 +2231,21 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
     auto rev_bwd = torch::ones({num_params}, int_opts);
 
     int scan_smem = d_inner * sizeof(float);
+    int ckpt_int = (checkpoint_interval > 1) ? checkpoint_interval : 0;
+
+    // Compute checkpoint offsets if checkpointing is enabled
+    torch::Tensor ckpt_offsets_t;
+    if (ckpt_int > 1) {
+        std::vector<int> ckpt_offsets_cpu(num_params + 1);
+        ckpt_offsets_cpu[0] = 0;
+        for (int p = 0; p < num_params; p++) {
+            int N = offsets_cpu[p + 1] - offsets_cpu[p];
+            int num_ckpts = (N + ckpt_int - 1) / ckpt_int;
+            ckpt_offsets_cpu[p + 1] = ckpt_offsets_cpu[p] + num_ckpts;
+        }
+        ckpt_offsets_t = torch::from_blob(ckpt_offsets_cpu.data(), {num_params + 1},
+            torch::kInt32).to(dev).clone();
+    }
 
     // Step 2: Forward scan with saving (uses persistent initial states)
     mamba3_scan_fwd_save_batched_kernel<<<num_params, d_inner, scan_smem>>>(
@@ -1872,7 +2267,8 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
         mamba_fwd_A_log.data_ptr<float>(),
         mamba_fwd_D.data_ptr<float>(),
         mamba_fwd_rope.data_ptr<float>(),
-        d_model, d_inner, d_state
+        ckpt_int > 1 ? ckpt_offsets_t.data_ptr<int>() : nullptr,
+        d_model, d_inner, d_state, ckpt_int
     );
 
     // Step 3: Build reversed x_sorted for backward scan direction
@@ -1905,7 +2301,8 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
         mamba_bwd_A_log.data_ptr<float>(),
         mamba_bwd_D.data_ptr<float>(),
         mamba_bwd_rope.data_ptr<float>(),
-        d_model, d_inner, d_state
+        ckpt_int > 1 ? ckpt_offsets_t.data_ptr<int>() : nullptr,
+        d_model, d_inner, d_state, ckpt_int
     );
 }
 
@@ -1971,7 +2368,8 @@ void launch_mamba3_peer_backward_batched(
     torch::Tensor fwd_initial_states,        // [num_params, d_inner, d_state]
     torch::Tensor bwd_initial_states,        // [num_params, d_inner, d_state]
     // Dims
-    int d_model, int d_state, int d_inner, int num_params
+    int d_model, int d_state, int d_inner, int num_params,
+    int checkpoint_interval  // 0 = no checkpointing
 ) {
     if (num_params == 0) return;
 
@@ -1986,6 +2384,23 @@ void launch_mamba3_peer_backward_batched(
     auto rev_bwd = torch::zeros({num_params}, int_opts);  // data was pre-reversed
 
     int scan_smem = 2 * d_inner * sizeof(float);  // s_x_branch + s_d_dt_raw
+    int ckpt_int = (checkpoint_interval > 1) ? checkpoint_interval : 0;
+
+    // Compute checkpoint offsets if needed
+    torch::Tensor ckpt_offsets_t;
+    if (ckpt_int > 1) {
+        auto offsets_cpu = offsets_t.to(torch::kCPU);
+        auto offsets_ptr = offsets_cpu.data_ptr<int>();
+        std::vector<int> ckpt_offsets_cpu(num_params + 1);
+        ckpt_offsets_cpu[0] = 0;
+        for (int p = 0; p < num_params; p++) {
+            int N = offsets_ptr[p + 1] - offsets_ptr[p];
+            int num_ckpts = (N + ckpt_int - 1) / ckpt_int;
+            ckpt_offsets_cpu[p + 1] = ckpt_offsets_cpu[p] + num_ckpts;
+        }
+        ckpt_offsets_t = torch::from_blob(ckpt_offsets_cpu.data(), {num_params + 1},
+            torch::kInt32).to(dev).clone();
+    }
 
     // Forward direction backward scan
     auto d_x_sorted_fwd = torch::zeros_like(d_x_sorted_packed);
@@ -2016,7 +2431,8 @@ void launch_mamba3_peer_backward_batched(
         d_mamba_fwd_D.data_ptr<float>(),
         d_mamba_fwd_rope.data_ptr<float>(),
         d_x_sorted_fwd.data_ptr<float>(),
-        d_model, d_inner, d_state
+        ckpt_int > 1 ? ckpt_offsets_t.data_ptr<int>() : nullptr,
+        d_model, d_inner, d_state, ckpt_int
     );
 
     // Build reversed x_sorted for bwd direction backward
@@ -2063,7 +2479,8 @@ void launch_mamba3_peer_backward_batched(
         d_mamba_bwd_D.data_ptr<float>(),
         d_mamba_bwd_rope.data_ptr<float>(),
         d_x_sorted_bwd.data_ptr<float>(),
-        d_model, d_inner, d_state
+        ckpt_int > 1 ? ckpt_offsets_t.data_ptr<int>() : nullptr,
+        d_model, d_inner, d_state, ckpt_int
     );
 
     // Combine: flip bwd back and add

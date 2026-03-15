@@ -287,3 +287,89 @@ A standalone **SAM** or **GSAM** optimizer would help isolate the contribution o
 | Fairness | Validation data leakage | Info | Documented |
 | Fairness | Computational cost inequality | Info | Documented |
 | Fairness | Missing SAM baseline | Low | Suggested |
+
+---
+
+## 7. SuperGrok v2 — Performance Optimizations (Implemented)
+
+### 7.1 Blelloch Parallel Prefix Scan
+
+The sequential Mamba-3 scan was the single largest bottleneck: O(N) serial steps with <1% GPU occupancy (16 threads on an SM supporting 2048). The linear recurrence `h[t] = A_bar * rot(h[t-1]) + B_bar * x[t]` is reformulated as a parallel prefix scan over affine transforms.
+
+**Implementation**: Two-phase approach:
+1. **Precompute kernel** (1 thread/timestep): Computes x_val, z_val, dt_val, B_val, C_val for all timesteps in parallel, resolving cross-thread dependencies (dt_proj, B_proj require all d_inner threads' x_branch values).
+2. **Parallel scan kernel** (PSCAN_BLOCK=512 threads/block): Processes d_state/2 paired dimensions sequentially. Each pair uses Blelloch exclusive prefix scan with `Affine2x2` composition. Accumulates scan output via global memory (no contention — each [t,j] written by exactly one thread).
+
+**Speedup**: For N=65536 with 512 threads: ~128 + 10 = 138 parallel steps vs 65536 sequential steps — **~475x speedup** for the scan portion. Threshold-gated: only activates for N >= 256.
+
+### 7.2 Expert Weights in Shared Memory
+
+The `fused_elem_step_kernel` evaluates 4 PEER heads × K² experts per element. Expert weights (W1, b1, W2, b2) were loaded from global memory via `__ldg` on every access. With 144 experts × expert_hidden=16: W1 is 144×16 = 2304 floats (9.2 KB), total ~7.5 KB for all weight tensors.
+
+**Implementation**: Cooperative loading at block start — threads collectively load all expert weights into shared memory arrays (s_expert_W1, s_expert_b1, s_expert_W2, s_expert_b2). Subsequent per-element expert evaluation reads from shared memory instead of global.
+
+**Benefit**: Eliminates repeated L1/L2 cache pressure. Shared memory latency is ~5 cycles vs ~100+ cycles for cached global loads.
+
+### 7.3 Expert Backward Shared-Memory Reduction
+
+In the backward pass, all N elements accumulate expert weight gradients via `atomicAdd` to 144 × expert_hidden global memory locations. With N=10K and block_size=256, this creates massive contention.
+
+**Implementation**: Per-block shared memory accumulators for d_expert_W1, d_expert_b1, d_expert_W2, d_expert_b2. Each thread accumulates into block-local shared memory. After all elements in the block are processed, a single cooperative `atomicAdd` flushes to global memory.
+
+**Benefit**: Reduces atomic contention by block_size (256x). Total atomicAdds reduced from N × 4_heads × K² per expert to (N/256) × 4_heads × K².
+
+### 7.4 Gradient Checkpointing for Bilevel
+
+The bilevel forward-save path stores scan states at every timestep for backward recomputation. For 50 parameters × 2 directions × avg N=10K, this requires ~1.22 GB of saved states.
+
+**Implementation**: New `bilevel_checkpoint_interval` parameter (default 1 = no checkpointing). When C > 1:
+- **Forward-save**: Only writes scan states every C steps (plus the final step).
+- **Backward**: Processes segments in reverse order. For each segment, loads the checkpoint input state, forward-recomputes all intermediate states into a register array, then runs backward through the segment using recomputed states.
+
+**Memory savings**: With C=32, saved_states reduces from N × d_inner × d_state to ceil(N/32) × d_inner × d_state — **~97% reduction** in saved state memory. Total bilevel memory: 1.22 GB → ~224 MB.
+
+**Tradeoff**: 2x compute for the scan portion during backward (one forward recomputation + one backward pass per segment). The scan is typically <10% of total bilevel time, so the net compute overhead is small.
+
+---
+
+## 8. Further Optimization Opportunities (Not Yet Implemented)
+
+### 8.1 Prioritized Optimization Table
+
+| # | Optimization | Impact | Difficulty | Files |
+|---|-------------|--------|------------|-------|
+| 1 | Fuse v1.1 into full_step kernel (like v1.5) | MEDIUM | Easy | supergrok11_kernels.cu |
+| 2 | Fuse NeuralGrok amplifier+adam into single kernel | LOW | Easy | neuralgrok_kernels.cu |
+| 3 | Cache meta-net weights (avoid per-step .float().contiguous()) | LOW-MEDIUM | Easy | supergrok2.py, supergrok15.py |
+| 4 | Pre-allocate scan workspace buffers | LOW-MEDIUM | Easy | supergrok2_mamba_peer_kernels.cu |
+| 5 | Persistent CUDA streams (don't create/destroy per step) | VERY LOW | Easy | supergrok2_mamba_peer_kernels.cu |
+| 6 | Skip .to(kFloat32) when already FP32 | VERY LOW | Easy | All launcher functions |
+| 7 | Fast GELU (sigmoid approx instead of tanh) | LOW | Easy | supergrok15_kernels.cu |
+| 8 | Custom cosine-gate reduction kernel for v1.1 | LOW | Medium | supergrok11_kernels.cu, ops.cpp |
+| 9 | Batch Muon Newton-Schulz across parameters | LOW | Medium | ops.cpp, muon_kernels.cu |
+| 10 | CUB segmented sort for batched params | LOW | Medium | supergrok2_mamba_peer_kernels.cu |
+
+### 8.2 Scaling Analysis
+
+| Component | Complexity | Dominant for |
+|-----------|-----------|-------------|
+| Input projection | O(N × d_model) | N > 100K |
+| Sort (thrust) | O(N × log N) | N > 10K |
+| Mamba scan (parallel) | O(N/P + log N) × d_state | N > 256 |
+| Mamba scan (sequential) | O(N × d_inner × d_state) | N < 256 |
+| GRU + PEER (elem_step) | O(N × (gru_ops + peer_ops)) | N > 10K |
+| Adam update | O(N) | Never dominant |
+
+### 8.3 Cross-Optimizer Kernel Fusion Comparison
+
+| Optimizer | # Kernel Launches/Step | Fusion Level |
+|-----------|----------------------|-------------|
+| SuperGrok v1.5 | 1 (full_step) | Best |
+| Lion | 1 | Fully fused |
+| GrokAdamW | 1 | Fully fused |
+| NeuralGrok | 2 (amplifier + adam) | Could fuse |
+| Prodigy | 2 (dlr_reduce + adam) | Reasonable |
+| SuperGrok v2 | 3 (input_proj + scan + elem_step) + sort | Complex pipeline |
+| Muon | 1 + 3×ns_steps (matmul) | Unfused matmuls |
+| LookSAM | 4 + AdamW | Many launches |
+| SuperGrok v1.1 | 2 (metanet + adam) + gate | Could fuse like v1.5 |
