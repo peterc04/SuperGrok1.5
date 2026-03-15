@@ -1277,6 +1277,7 @@ void launch_mamba3_peer_step(
     TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
     TORCH_CHECK(d_model <= MAX_D_MODEL, "d_model exceeds MAX_D_MODEL (", d_model, " > ", MAX_D_MODEL, ")");
     TORCH_CHECK(gru_hidden <= MAX_GRU_HIDDEN, "gru_hidden exceeds MAX_GRU_HIDDEN (", gru_hidden, " > ", MAX_GRU_HIDDEN, ")");
+    TORCH_CHECK(d_inner <= MAX_D_INNER, "d_inner exceeds MAX_D_INNER (", d_inner, " > ", MAX_D_INNER, ")");
     TORCH_CHECK(d_inner % 4 == 0, "d_inner must be a multiple of 4 for vectorized loads (got ", d_inner, ")");
 
     auto dev = grad.device();
@@ -1571,6 +1572,7 @@ void launch_mamba3_peer_batched_step(
     TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
     TORCH_CHECK(d_model <= MAX_D_MODEL, "d_model exceeds MAX_D_MODEL (", d_model, " > ", MAX_D_MODEL, ")");
     TORCH_CHECK(gru_hidden <= MAX_GRU_HIDDEN, "gru_hidden exceeds MAX_GRU_HIDDEN (", gru_hidden, " > ", MAX_GRU_HIDDEN, ")");
+    TORCH_CHECK(d_inner <= MAX_D_INNER, "d_inner exceeds MAX_D_INNER (", d_inner, " > ", MAX_D_INNER, ")");
     TORCH_CHECK(d_inner % 4 == 0, "d_inner must be a multiple of 4 for vectorized loads (got ", d_inner, ")");
 
     auto dev = grads[0].device();
