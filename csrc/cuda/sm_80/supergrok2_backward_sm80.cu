@@ -12,6 +12,7 @@
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include "platform.h"
 #include "types.h"
 #include "dispatch.h"
 

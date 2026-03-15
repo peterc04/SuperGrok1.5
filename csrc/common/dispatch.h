@@ -19,6 +19,7 @@
 #pragma once
 
 #include "platform.h"
+#include <cstdlib>
 
 // ═══════════════════════════════════════════════════════════════════════
 //  GPU Vendor
@@ -45,14 +46,25 @@ inline GpuVendor get_gpu_vendor() {
 // ═══════════════════════════════════════════════════════════════════════
 
 enum class ArchTier {
-    GENERIC,  // sm_70, sm_75 (NVIDIA) or gfx908/gfx90a/gfx942 (AMD)
-    AMPERE,   // sm_80, sm_86, sm_89
-    HOPPER,   // sm_90, sm_100
+    GENERIC,    // sm_70, sm_75 (NVIDIA) or gfx908/gfx90a/gfx942 (AMD)
+    AMPERE,     // sm_80, sm_86, sm_89
+    HOPPER,     // sm_90, sm_100
+    BLACKWELL,  // sm_100+
 };
 
 inline int get_sm_arch() {
     static int cached = -1;
     if (cached >= 0) return cached;
+
+    // FORCE_ARCH env var overrides hardware detection for testing.
+    // Set FORCE_ARCH=75 to test generic tier, =80 for Ampere, =90 for Hopper,
+    // =100 for Blackwell — regardless of actual GPU.
+    const char* force = std::getenv("FORCE_ARCH");
+    if (force != nullptr && force[0] != '\0') {
+        cached = std::atoi(force);
+        return cached;
+    }
+
 #if GROK_CUDA
     gpuDeviceProp_t prop;
     if (gpuGetDeviceProperties(&prop, 0) == GPU_SUCCESS) {
@@ -63,14 +75,11 @@ inline int get_sm_arch() {
 #elif GROK_HIP
     gpuDeviceProp_t prop;
     if (gpuGetDeviceProperties(&prop, 0) == GPU_SUCCESS) {
-        // HIP gcnArchName: e.g., "gfx90a" → 90, "gfx942" → 94
-        // Map to a tier rather than a direct SM number
         const char* name = prop.gcnArchName;
         if (name[0] == 'g' && name[1] == 'f' && name[2] == 'x') {
-            // Parse first two digits after "gfx"
             int d1 = name[3] - '0';
             int d2 = name[4] - '0';
-            cached = d1 * 10 + d2;  // e.g., gfx90a → 90, gfx94x → 94
+            cached = d1 * 10 + d2;
         } else {
             cached = 0;
         }
@@ -85,10 +94,10 @@ inline int get_sm_arch() {
 
 inline ArchTier get_arch_tier() {
     if (get_gpu_vendor() == GpuVendor::AMD) {
-        // AMD uses GENERIC tier — no Ampere/Hopper-specific kernels
         return ArchTier::GENERIC;
     }
     int arch = get_sm_arch();
+    if (arch >= 100) return ArchTier::BLACKWELL;
     if (arch >= 90) return ArchTier::HOPPER;
     if (arch >= 80) return ArchTier::AMPERE;
     return ArchTier::GENERIC;

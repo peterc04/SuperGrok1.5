@@ -786,9 +786,10 @@ void supergrok2_mamba_peer_step(
 #ifdef WITH_CUDA
     if (param.is_cuda()) {
         auto tier = get_arch_tier();
-        auto dispatch_fn = (tier == ArchTier::HOPPER)  ? launch_mamba3_peer_step_hopper :
-                           (tier == ArchTier::AMPERE)   ? launch_mamba3_peer_step_ampere :
-                                                          launch_mamba3_peer_step;
+        auto dispatch_fn = (tier == ArchTier::BLACKWELL) ? launch_mamba3_peer_step_blackwell :
+                           (tier == ArchTier::HOPPER)    ? launch_mamba3_peer_step_hopper :
+                           (tier == ArchTier::AMPERE)    ? launch_mamba3_peer_step_ampere :
+                                                           launch_mamba3_peer_step;
         dispatch_fn(
             param, grad, sharpness, exp_avg, exp_avg_sq, mu,
             gru_state, mamba_fwd_state, mamba_bwd_state,
@@ -856,9 +857,10 @@ void supergrok2_mamba_peer_batched_step(
 #ifdef WITH_CUDA
     if (params[0].is_cuda()) {
         auto tier = get_arch_tier();
-        auto dispatch_fn = (tier == ArchTier::HOPPER)  ? launch_mamba3_peer_batched_step_hopper :
-                           (tier == ArchTier::AMPERE)   ? launch_mamba3_peer_batched_step_ampere :
-                                                          launch_mamba3_peer_batched_step;
+        auto dispatch_fn = (tier == ArchTier::BLACKWELL) ? launch_mamba3_peer_batched_step_blackwell :
+                           (tier == ArchTier::HOPPER)    ? launch_mamba3_peer_batched_step_hopper :
+                           (tier == ArchTier::AMPERE)    ? launch_mamba3_peer_batched_step_ampere :
+                                                           launch_mamba3_peer_batched_step;
         dispatch_fn(
             params, grads, sharpness_list, exp_avgs, exp_avg_sqs, mus,
             gru_states, mamba_fwd_states, mamba_bwd_states,
@@ -924,9 +926,10 @@ static void dispatch_bilevel_fwd_save_batched(
     int checkpoint_interval
 ) {
     auto tier = get_arch_tier();
-    auto fn = (tier == ArchTier::HOPPER)  ? launch_mamba3_peer_bilevel_fwd_save_batched_hopper :
-              (tier == ArchTier::AMPERE)   ? launch_mamba3_peer_bilevel_fwd_save_batched_ampere :
-                                             launch_mamba3_peer_bilevel_fwd_save_batched;
+    auto fn = (tier == ArchTier::BLACKWELL) ? launch_mamba3_peer_bilevel_fwd_save_batched_blackwell :
+              (tier == ArchTier::HOPPER)    ? launch_mamba3_peer_bilevel_fwd_save_batched_hopper :
+              (tier == ArchTier::AMPERE)    ? launch_mamba3_peer_bilevel_fwd_save_batched_ampere :
+                                              launch_mamba3_peer_bilevel_fwd_save_batched;
     fn(grads, sharpness_list,
        input_proj_W, input_proj_b,
        mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
@@ -976,9 +979,10 @@ static void dispatch_bilevel_backward_batched(
     int checkpoint_interval
 ) {
     auto tier = get_arch_tier();
-    auto fn = (tier == ArchTier::HOPPER)  ? launch_mamba3_peer_backward_batched_hopper :
-              (tier == ArchTier::AMPERE)   ? launch_mamba3_peer_backward_batched_ampere :
-                                             launch_mamba3_peer_backward_batched;
+    auto fn = (tier == ArchTier::BLACKWELL) ? launch_mamba3_peer_backward_batched_blackwell :
+              (tier == ArchTier::HOPPER)    ? launch_mamba3_peer_backward_batched_hopper :
+              (tier == ArchTier::AMPERE)    ? launch_mamba3_peer_backward_batched_ampere :
+                                              launch_mamba3_peer_backward_batched;
     fn(d_fwd_scan_out_packed, d_bwd_scan_out_packed,
        x_sorted_packed,
        fwd_saved_states_packed, fwd_saved_xb_packed,
@@ -1019,11 +1023,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_arch_tier_name", []() -> std::string {
         auto tier = get_arch_tier();
         switch (tier) {
-            case ArchTier::HOPPER:  return "hopper";
-            case ArchTier::AMPERE:  return "ampere";
-            default:                return "generic";
+            case ArchTier::BLACKWELL: return "blackwell";
+            case ArchTier::HOPPER:    return "hopper";
+            case ArchTier::AMPERE:    return "ampere";
+            default:                  return "generic";
         }
-    }, "Get architecture tier name: 'generic', 'ampere', or 'hopper'");
+    }, "Get architecture tier name: 'generic', 'ampere', 'hopper', or 'blackwell'");
 
     m.def("get_gpu_vendor_name", []() -> std::string {
         auto vendor = get_gpu_vendor();
@@ -1224,5 +1229,41 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // ── SuperGrok v2 Batched Bilevel Backward (with dispatch) ─────────
     m.def("supergrok2_bilevel_backward_batched", &dispatch_bilevel_backward_batched,
           "SuperGrok2 bilevel: batched backward through scan");
+
+    // ── Quantization ──────────────────────────────────────────────────
+    m.def("quantize_fp8_e4m3", &quantize_fp8_e4m3,
+          "Quantize FP32 tensor to FP8 E4M3 format",
+          py::arg("input"));
+    m.def("dequantize_fp8_e4m3", &dequantize_fp8_e4m3,
+          "Dequantize FP8 E4M3 back to FP32",
+          py::arg("input"), py::arg("scale"), py::arg("numel"));
+
+    m.def("quantize_int8", &quantize_int8,
+          "Quantize FP32 tensor to INT8 symmetric format",
+          py::arg("input"));
+    m.def("dequantize_int8", &dequantize_int8,
+          "Dequantize INT8 back to FP32",
+          py::arg("input"), py::arg("scale"), py::arg("numel"));
+
+    m.def("quantize_int4", &quantize_int4,
+          "Quantize FP32 tensor to INT4 per-group format",
+          py::arg("input"));
+    m.def("dequantize_int4", &dequantize_int4,
+          "Dequantize INT4 back to FP32",
+          py::arg("input"), py::arg("scales"), py::arg("numel"));
+
+    m.def("quantize_mxfp4", &quantize_mxfp4,
+          "Quantize FP32 tensor to MXFP4 (E2M1) format",
+          py::arg("input"));
+    m.def("dequantize_mxfp4", &dequantize_mxfp4,
+          "Dequantize MXFP4 back to FP32",
+          py::arg("input"), py::arg("block_scales"), py::arg("numel"));
+
+    m.def("quantize_nvfp4", &quantize_nvfp4,
+          "Quantize FP32 tensor to NVFP4 (Blackwell native) format",
+          py::arg("input"));
+    m.def("dequantize_nvfp4", &dequantize_nvfp4,
+          "Dequantize NVFP4 back to FP32",
+          py::arg("input"), py::arg("block_scales"), py::arg("numel"));
 #endif
 }

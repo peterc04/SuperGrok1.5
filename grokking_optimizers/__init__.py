@@ -1,24 +1,31 @@
 """
-Grokking Optimizers — C++/CUDA/HIP Accelerated Optimizer Suite
+Grokking Optimizers — C++/CUDA/HIP/CPU Accelerated Optimizer Suite
 
 All optimizers use custom GPU kernels for maximum performance.
-Supports NVIDIA CUDA and AMD ROCm/HIP backends.
+Supports NVIDIA CUDA, AMD ROCm/HIP, and CPU-only (for debugging/testing).
 Supports FP32, FP16, and BF16 parameter tensors.
 
 Usage:
     from grokking_optimizers import SuperGrok15, SuperGrok2, GrokAdamW, ...
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
+
+# ── Backend capability flags ─────────────────────────────────────────
+_HAS_CUDA = False
+_HAS_CPU = False
 
 try:
     from grokking_optimizers import _ops  # noqa: F401
+    _HAS_CUDA = hasattr(_ops, 'supergrok2_mamba_peer_batched_step')
+    _HAS_CPU = hasattr(_ops, 'supergrok2_cpu_step')
 except ImportError as e:
-    raise ImportError(
-        "grokking_optimizers C++/CUDA/HIP extension not found. "
-        "Build with: pip install -e . (from the repo root). "
-        f"Original error: {e}"
-    ) from e
+    import warnings
+    warnings.warn(
+        f"grokking_optimizers C++ extension not found. "
+        f"Build with: pip install -e . (from the repo root). "
+        f"Pure Python fallback only. Original error: {e}"
+    )
 
 from .supergrok15 import SuperGrok15, SharpnessMetaNet
 from .supergrok2 import SuperGrok2, CompiledSuperGrok2
@@ -35,7 +42,7 @@ from .cuda_graph_optimizer import CUDAGraphOptimizer
 from .dispatch import (
     get_gpu_arch, get_gpu_vendor, get_backend, get_arch_label,
     get_warp_size, supports_bf16, supports_fp8, supports_tf32,
-    supports_matrix_cores,
+    supports_matrix_cores, supports_nvfp4,
 )
 from .quantization import PrecisionConfig
 from .distributed import (
@@ -59,10 +66,11 @@ __all__ = [
     "CUDAGraphOptimizer",
     "get_gpu_arch", "get_gpu_vendor", "get_backend", "get_arch_label",
     "get_warp_size", "supports_bf16", "supports_fp8", "supports_tf32",
-    "supports_matrix_cores",
+    "supports_matrix_cores", "supports_nvfp4",
     "PrecisionConfig",
     "CompiledSuperGrok2",
     "setup_distributed", "cleanup_distributed",
     "get_rank", "get_world_size", "is_main_process",
     "broadcast_optimizer_state", "wrap_model_ddp",
+    "_HAS_CUDA", "_HAS_CPU",
 ]

@@ -2,9 +2,13 @@
 
 Detects GPU vendor (NVIDIA/AMD) and architecture at import time.
 Provides dispatch helpers for selecting the optimal kernel variant per hardware.
+
+Set FORCE_ARCH=<sm_number> to override detected architecture for testing.
+E.g., FORCE_ARCH=80 forces Ampere tier on any GPU.
 """
 
 import functools
+import os
 import torch
 
 
@@ -22,7 +26,11 @@ def get_gpu_vendor() -> str:
 def get_gpu_arch() -> int:
     """SM compute capability as integer (e.g., 75 for T4, 80 for A100).
     For AMD, returns the GCN arch number (e.g., 90 for gfx90a, 94 for gfx942).
-    Returns 0 if no GPU available."""
+    Returns 0 if no GPU available.
+    Honors FORCE_ARCH env var for testing."""
+    force = os.environ.get('FORCE_ARCH')
+    if force:
+        return int(force)
     if not torch.cuda.is_available():
         return 0
     major, minor = torch.cuda.get_device_capability()
@@ -52,6 +60,20 @@ def get_warp_size() -> int:
             return 32
         return 64  # CDNA default
     return 32  # NVIDIA
+
+
+def get_arch_tier() -> str:
+    """Architecture tier: 'blackwell', 'hopper', 'ampere', or 'generic'."""
+    if get_gpu_vendor() == 'amd':
+        return 'generic'
+    arch = get_gpu_arch()
+    if arch >= 100:
+        return 'blackwell'
+    if arch >= 90:
+        return 'hopper'
+    if arch >= 80:
+        return 'ampere'
+    return 'generic'
 
 
 def supports_fp8() -> bool:
