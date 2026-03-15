@@ -500,7 +500,7 @@ __global__ void mamba3_parallel_scan_kernel(
                 smem[(idx-stride)*6]   = right.m00; smem[(idx-stride)*6+1] = right.m01;
                 smem[(idx-stride)*6+2] = right.m10; smem[(idx-stride)*6+3] = right.m11;
                 smem[(idx-stride)*6+4] = right.b0;  smem[(idx-stride)*6+5] = right.b1;
-                Affine2x2 combined = affine_combine(left, right);
+                Affine2x2 combined = affine_combine(right, left);
                 smem[idx*6]   = combined.m00; smem[idx*6+1] = combined.m01;
                 smem[idx*6+2] = combined.m10; smem[idx*6+3] = combined.m11;
                 smem[idx*6+4] = combined.b0;  smem[idx*6+5] = combined.b1;
