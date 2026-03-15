@@ -67,9 +67,21 @@ void launch_sg11_adam_decay(
     float lamb_eff, float beta1, float beta2, float lr, float wd_eff,
     float eps, float bc1, float bc2);
 
+void launch_fused_sg11_full_step(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor mu, torch::Tensor grad, torch::Tensor sharpness,
+    float alpha,
+    torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2,
+    float rescale, float lamb_eff,
+    float beta1, float beta2, float lr, float wd_eff, float eps,
+    float bc1, float bc2, int hidden_dim);
+
+float compute_cosine_gate_fused(
+    torch::Tensor smart_grad, torch::Tensor mu, float gate_temp);
+
 // NOTE: launch_sg11_sam_perturb and launch_sg11_sharpness_restore are defined
 // in supergrok11_kernels.cu but not called from ops.cpp (v1.1 delegates to v1.5
-// implementations). compute_cosine_gate is also unused (ops.cpp uses ATen inline).
+// implementations).
 
 // ── GrokAdamW (grokadamw_kernels.cu) ────────────────────────────────
 void launch_fused_grokadamw_step(
@@ -91,6 +103,14 @@ void launch_fused_neuralgrok_adam(
     torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
     torch::Tensor amplified_grad,
     float beta1, float beta2, float lr, float wd,
+    float eps, float bc1, float bc2);
+
+void launch_fused_neuralgrok_full_step(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor grad,
+    torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2,
+    float alpha_amp, float beta_amp, int hidden_dim,
+    float beta1, float beta2, float lr, float weight_decay,
     float eps, float bc1, float bc2);
 
 // ── Prodigy (prodigy_kernels.cu) ────────────────────────────────────
