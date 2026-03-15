@@ -2299,6 +2299,105 @@ __global__ void out_proj_backward_kernel(
 
 
 // ═══════════════════════════════════════════════════════════════════════
+//  Pre-allocated Workspace for Bilevel Operations
+//
+//  Avoids per-step tensor allocations for temporary buffers.
+//  Sizes grow to accommodate the largest N seen; never shrink.
+// ═══════════════════════════════════════════════════════════════════════
+
+namespace {
+struct BilevelWorkspace {
+    // Forward-save precompute buffers
+    torch::Tensor pre_B;             // [max_N, d_state]
+    torch::Tensor pre_C;             // [max_N, d_state]
+    torch::Tensor x_proj;            // [max_N, d_model]
+    torch::Tensor sort_keys;         // [max_N]
+    torch::Tensor sort_idx;          // [max_N] (int32)
+    // Backward intermediates
+    torch::Tensor d_peer_input;      // [max_N, max_peer_input_dim]
+    torch::Tensor d_gru_input;       // [max_N, max_gru_input_dim]
+    torch::Tensor d_fwd_ctx;         // [max_N, d_model]
+    torch::Tensor d_bwd_ctx;         // [max_N, d_model]
+    torch::Tensor d_fwd_scan_out;    // [max_N, d_inner]
+    torch::Tensor d_bwd_scan_out;    // [max_N, d_inner]
+    torch::Tensor d_x_sorted_fwd;    // [max_N, d_model]
+    torch::Tensor d_x_sorted_bwd;    // [max_N, d_model]
+    torch::Tensor unsort_idx;        // [max_N] (int64)
+    // Batched-specific
+    torch::Tensor x_sorted_rev;      // [max_total_N, d_model]
+    torch::Tensor d_x_sorted_fwd_bat;// [max_total_N, d_model]
+    torch::Tensor d_x_sorted_bwd_bat;// [max_total_N, d_model]
+    int max_N = 0;
+    int max_total_N = 0;
+    int d_model = 0;
+    int d_inner = 0;
+    int d_state = 0;
+    int peer_input_dim = 0;
+    int gru_input_dim = 0;
+
+    void ensure_fwd_save(int N, int dm, int di, int ds, torch::Device dev) {
+        if (N <= max_N && dm == d_model && di == d_inner && ds == d_state) return;
+        int alloc_N = std::max(N, max_N);
+        auto fo = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
+        auto io = torch::TensorOptions().device(dev).dtype(torch::kInt32);
+        pre_B = torch::empty({alloc_N, ds}, fo);
+        pre_C = torch::empty({alloc_N, ds}, fo);
+        x_proj = torch::empty({alloc_N, dm}, fo);
+        sort_keys = torch::empty({alloc_N}, fo);
+        sort_idx = torch::empty({alloc_N}, io);
+        max_N = alloc_N;
+        d_model = dm;
+        d_inner = di;
+        d_state = ds;
+    }
+
+    void ensure_backward(int N, int dm, int di, int ds, int pid, int gid,
+                         torch::Device dev) {
+        auto fo = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
+        auto lo = torch::TensorOptions().device(dev).dtype(torch::kLong);
+        bool need_realloc = (N > max_N || dm != d_model || di != d_inner
+                             || ds != d_state || pid != peer_input_dim
+                             || gid != gru_input_dim);
+        if (!need_realloc) return;
+        int alloc_N = std::max(N, max_N);
+        d_peer_input = torch::empty({alloc_N, pid}, fo);
+        d_gru_input = torch::empty({alloc_N, gid}, fo);
+        d_fwd_ctx = torch::empty({alloc_N, dm}, fo);
+        d_bwd_ctx = torch::empty({alloc_N, dm}, fo);
+        d_fwd_scan_out = torch::empty({alloc_N, di}, fo);
+        d_bwd_scan_out = torch::empty({alloc_N, di}, fo);
+        d_x_sorted_fwd = torch::empty({alloc_N, dm}, fo);
+        d_x_sorted_bwd = torch::empty({alloc_N, dm}, fo);
+        unsort_idx = torch::empty({alloc_N}, lo);
+        max_N = alloc_N;
+        d_model = dm;
+        d_inner = di;
+        d_state = ds;
+        peer_input_dim = pid;
+        gru_input_dim = gid;
+    }
+
+    void ensure_batched(int total_N, int dm, int di, int ds, torch::Device dev) {
+        if (total_N <= max_total_N && dm == d_model && di == d_inner
+            && ds == d_state) return;
+        int alloc_N = std::max(total_N, max_total_N);
+        auto fo = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
+        pre_B = torch::empty({alloc_N, ds}, fo);
+        pre_C = torch::empty({alloc_N, ds}, fo);
+        x_sorted_rev = torch::empty({alloc_N, dm}, fo);
+        d_x_sorted_fwd_bat = torch::empty({alloc_N, dm}, fo);
+        d_x_sorted_bwd_bat = torch::empty({alloc_N, dm}, fo);
+        max_total_N = alloc_N;
+        d_model = dm;
+        d_inner = di;
+        d_state = ds;
+    }
+};
+static thread_local BilevelWorkspace g_bilevel_ws;
+} // namespace
+
+
+// ═══════════════════════════════════════════════════════════════════════
 //  Launcher: Full Bilevel Backward Pass
 //
 //  Given d_smart_grad, computes gradients w.r.t. all meta-net parameters.
@@ -2365,21 +2464,18 @@ void launch_mamba3_peer_bilevel_fwd_save(
     }
 
     auto dev = grad.device();
-    auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
-    auto int_opts = torch::TensorOptions().device(dev).dtype(torch::kInt32);
+
+    // Pre-allocate workspace (reused across steps)
+    g_bilevel_ws.ensure_fwd_save(N, d_model, d_inner, d_state, dev);
 
     // Step 1: Input projection + sort
-    auto x_proj = torch::empty({N, d_model}, float_opts);
-    auto sort_keys = torch::empty({N}, float_opts);
-    auto sort_idx = torch::empty({N}, int_opts);
-
     {
         auto g_f = grad.to(torch::kFloat32).reshape(-1);
         auto s_f = sharpness.to(torch::kFloat32).reshape(-1);
         auto inp = torch::stack({g_f, s_f}, 1);  // [N, 2]
-        x_proj = torch::addmm(input_proj_b, inp, input_proj_W.t());  // [N, d_model]
+        auto x_proj = torch::addmm(input_proj_b, inp, input_proj_W.t());
 
-        sort_keys = g_f.abs();
+        auto sort_keys = g_f.abs();
         auto sorted = sort_keys.argsort();
         sort_indices.copy_(sorted.to(torch::kInt32));
         x_sorted.copy_(x_proj.index_select(0, sorted));
@@ -2389,9 +2485,8 @@ void launch_mamba3_peer_bilevel_fwd_save(
 
     if (N >= PSCAN_THRESHOLD) {
         // ═══ Parallel scan path: precompute + Blelloch parallel prefix scan ═══
-        // Precompute outputs serve as both scan inputs AND saved intermediates
-        auto pre_B_fwd = torch::empty({N, d_state}, float_opts);
-        auto pre_C_fwd = torch::empty({N, d_state}, float_opts);
+        auto pre_B_fwd = g_bilevel_ws.pre_B.narrow(0, 0, N);
+        auto pre_C_fwd = g_bilevel_ws.pre_C.narrow(0, 0, N);
         const int pre_grid = (N + SG2B_BLOCK - 1) / SG2B_BLOCK;
 
         // Forward direction: precompute
@@ -2436,9 +2531,10 @@ void launch_mamba3_peer_bilevel_fwd_save(
         );
 
         // Backward direction: precompute (uses reversed input)
+        // Reuse pre_B/C since forward scan is done with them
         auto x_sorted_rev = x_sorted.flip(0).contiguous();
-        auto pre_B_bwd = torch::empty({N, d_state}, float_opts);
-        auto pre_C_bwd = torch::empty({N, d_state}, float_opts);
+        auto pre_B_bwd = g_bilevel_ws.pre_B.narrow(0, 0, N);
+        auto pre_C_bwd = g_bilevel_ws.pre_C.narrow(0, 0, N);
 
         bilevel_precompute_kernel<<<pre_grid, SG2B_BLOCK>>>(
             x_sorted_rev.data_ptr<float>(),
@@ -2630,15 +2726,20 @@ void launch_mamba3_peer_backward(
     TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
 
     auto dev = d_smart_grad.device();
-    auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
+
+    // Pre-allocate workspace (reused across steps)
+    g_bilevel_ws.ensure_backward(N, d_model, d_inner, d_state,
+                                  peer_input_dim, gru_input_dim, dev);
+
     const int grid = (N + SG2B_BLOCK - 1) / SG2B_BLOCK;
     int num_active = topk * topk;
 
     // Step 1: d_expert_out = rescale * d_smart_grad
     auto d_expert_out = (d_smart_grad.reshape(-1) * rescale).contiguous();
 
-    // Step 2: Expert + PEER backward
-    auto d_peer_input = torch::zeros({N, peer_input_dim}, float_opts);
+    // Step 2: Expert + PEER backward (use workspace, zero the N-region)
+    auto d_peer_input = g_bilevel_ws.d_peer_input.narrow(0, 0, N);
+    d_peer_input.zero_();
     int half_d = d_model / 2;
     int expert_smem_elems = 3 * num_experts * expert_hidden + num_experts;
     int routing_smem_elems = num_heads * d_model * peer_input_dim  // peer_query_Ws
@@ -2683,7 +2784,8 @@ void launch_mamba3_peer_backward(
     auto d_gru_out = d_peer_input.narrow(1, 0, gru_hidden).contiguous();
 
     // Step 4: GRU backward
-    auto d_gru_input = torch::zeros({N, gru_input_dim}, float_opts);
+    auto d_gru_input = g_bilevel_ws.d_gru_input.narrow(0, 0, N);
+    d_gru_input.zero_();
     const int gru_total_dim = gru_input_dim + gru_hidden;
     const int gru_smem = (3 * gru_hidden * gru_total_dim + 3 * gru_hidden) * sizeof(float);
     gru_backward_kernel<<<grid, SG2B_BLOCK, gru_smem>>>(
@@ -2709,8 +2811,10 @@ void launch_mamba3_peer_backward(
     // Step 5: Extract d_fwd_ctx and d_bwd_ctx from d_gru_input + d_peer_input
     // gru_input = [g, s, fwd_ctx, bwd_ctx]
     // peer_input = [gru_state, fwd_ctx, bwd_ctx, g, s]
-    auto d_fwd_ctx = torch::zeros({N, d_model}, float_opts);
-    auto d_bwd_ctx = torch::zeros({N, d_model}, float_opts);
+    auto d_fwd_ctx = g_bilevel_ws.d_fwd_ctx.narrow(0, 0, N);
+    auto d_bwd_ctx = g_bilevel_ws.d_bwd_ctx.narrow(0, 0, N);
+    d_fwd_ctx.zero_();
+    d_bwd_ctx.zero_();
 
     // From gru_input: fwd_ctx at offset 2, bwd_ctx at offset 2+d_model
     d_fwd_ctx.add_(d_gru_input.narrow(1, 2, d_model));
@@ -2729,8 +2833,10 @@ void launch_mamba3_peer_backward(
     d_bwd_sorted = d_bwd_sorted.flip(0).contiguous();
 
     // Step 7: Out-projection backward for both directions
-    auto d_fwd_scan_out = torch::zeros({N, d_inner}, float_opts);
-    auto d_bwd_scan_out = torch::zeros({N, d_inner}, float_opts);
+    auto d_fwd_scan_out = g_bilevel_ws.d_fwd_scan_out.narrow(0, 0, N);
+    auto d_bwd_scan_out = g_bilevel_ws.d_bwd_scan_out.narrow(0, 0, N);
+    d_fwd_scan_out.zero_();
+    d_bwd_scan_out.zero_();
 
     int out_proj_bwd_smem = d_model * d_inner * sizeof(float);
     out_proj_backward_kernel<<<grid, SG2B_BLOCK, out_proj_bwd_smem>>>(
@@ -2754,8 +2860,10 @@ void launch_mamba3_peer_backward(
     // Step 8: Mamba scan backward (both directions)
     // s_x_branch[d_inner] + s_d_dt_raw[d_inner] + s_d_C_proj_W[d_state*d_inner] + s_d_B_proj_W[d_state*d_inner]
     int scan_smem = (2 * d_inner + 2 * d_state * d_inner) * sizeof(float);
-    auto d_x_sorted_fwd = torch::zeros({N, d_model}, float_opts);
-    auto d_x_sorted_bwd = torch::zeros({N, d_model}, float_opts);
+    auto d_x_sorted_fwd = g_bilevel_ws.d_x_sorted_fwd.narrow(0, 0, N);
+    auto d_x_sorted_bwd = g_bilevel_ws.d_x_sorted_bwd.narrow(0, 0, N);
+    d_x_sorted_fwd.zero_();
+    d_x_sorted_bwd.zero_();
 
     mamba3_scan_backward_kernel<<<1, d_inner, scan_smem>>>(
         d_fwd_scan_out.data_ptr<float>(),
@@ -2824,7 +2932,7 @@ void launch_mamba3_peer_backward(
     auto d_x_sorted = d_x_sorted_fwd + d_x_sorted_bwd.flip(0);
 
     // Unsort d_x_sorted back to original order for input_proj backward
-    auto unsort_idx = torch::empty({N}, torch::TensorOptions().device(dev).dtype(torch::kLong));
+    auto unsort_idx = g_bilevel_ws.unsort_idx.narrow(0, 0, N);
     unsort_idx.scatter_(0, sort_idx_long,
         torch::arange(N, torch::TensorOptions().device(dev).dtype(torch::kLong)));
     auto d_x_unsorted = d_x_sorted.index_select(0, unsort_idx);
@@ -2939,6 +3047,11 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
     offsets_t.copy_(torch::from_blob(offsets_cpu.data(), {num_params + 1},
         torch::kInt32).to(dev));
 
+    int total_N = offsets_cpu[num_params];
+
+    // Pre-allocate workspace for batched buffers
+    g_bilevel_ws.ensure_batched(total_N, d_model, d_inner, d_state, dev);
+
     auto final_fwd = torch::empty({num_params, d_inner, d_state}, float_opts);
     auto final_bwd = torch::empty({num_params, d_inner, d_state}, float_opts);
 
@@ -2946,7 +3059,6 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
     auto rev_bwd = torch::ones({num_params}, int_opts);
 
     int ckpt_int = (checkpoint_interval > 1) ? checkpoint_interval : 0;
-    int total_N = offsets_cpu[num_params];
 
     // Compute checkpoint offsets if checkpointing is enabled
     torch::Tensor ckpt_offsets_t;
@@ -2972,8 +3084,8 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
     if (max_N >= PSCAN_THRESHOLD) {
         // ═══ Parallel scan path: precompute + batched parallel prefix scan ═══
         // Precompute for all packed data (weights shared across params)
-        auto pre_B = torch::empty({total_N, d_state}, float_opts);
-        auto pre_C = torch::empty({total_N, d_state}, float_opts);
+        auto pre_B = g_bilevel_ws.pre_B.narrow(0, 0, total_N);
+        auto pre_C = g_bilevel_ws.pre_C.narrow(0, 0, total_N);
         const int pre_grid = (total_N + SG2B_BLOCK - 1) / SG2B_BLOCK;
 
         // Forward precompute — outputs to saved_xb/z/dt directly
@@ -3021,7 +3133,7 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
         );
 
         // Build reversed x_sorted for backward
-        auto x_sorted_rev_packed = torch::empty_like(x_sorted_packed);
+        auto x_sorted_rev_packed = g_bilevel_ws.x_sorted_rev.narrow(0, 0, total_N);
         {
             int total_elems = total_N * d_model;
             int rev_grid = (total_elems + SG2B_BLOCK - 1) / SG2B_BLOCK;
@@ -3033,9 +3145,9 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
             );
         }
 
-        // Backward precompute
-        auto pre_B_bwd = torch::empty({total_N, d_state}, float_opts);
-        auto pre_C_bwd = torch::empty({total_N, d_state}, float_opts);
+        // Backward precompute — reuse pre_B/C since forward scan is done with them
+        auto pre_B_bwd = g_bilevel_ws.pre_B.narrow(0, 0, total_N);
+        auto pre_C_bwd = g_bilevel_ws.pre_C.narrow(0, 0, total_N);
 
         bilevel_precompute_kernel<<<pre_grid, SG2B_BLOCK>>>(
             x_sorted_rev_packed.data_ptr<float>(),
@@ -3099,7 +3211,7 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
             d_model, d_inner, d_state, ckpt_int
         );
 
-        auto x_sorted_rev_packed = torch::empty_like(x_sorted_packed);
+        auto x_sorted_rev_packed = g_bilevel_ws.x_sorted_rev.narrow(0, 0, total_N);
         {
             int total_elems = total_N * d_model;
             int rev_grid = (total_elems + SG2B_BLOCK - 1) / SG2B_BLOCK;
@@ -3207,11 +3319,14 @@ void launch_mamba3_peer_backward_batched(
     TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
 
     auto dev = d_fwd_scan_out_packed.device();
-    auto float_opts = torch::TensorOptions().device(dev).dtype(torch::kFloat32);
     auto int_opts = torch::TensorOptions().device(dev).dtype(torch::kInt32);
 
     auto rev_fwd = torch::zeros({num_params}, int_opts);
     auto rev_bwd = torch::zeros({num_params}, int_opts);  // data was pre-reversed
+
+    // Pre-allocate workspace (reused across steps)
+    auto total_N = x_sorted_packed.size(0);
+    g_bilevel_ws.ensure_batched(total_N, d_model, d_inner, d_state, dev);
 
     // s_x_branch[d_inner] + s_d_dt_raw[d_inner] + s_d_C_proj_W[d_state*d_inner] + s_d_B_proj_W[d_state*d_inner]
     int scan_smem = (2 * d_inner + 2 * d_state * d_inner) * sizeof(float);
@@ -3235,7 +3350,8 @@ void launch_mamba3_peer_backward_batched(
     }
 
     // Forward direction backward scan
-    auto d_x_sorted_fwd = torch::zeros_like(d_x_sorted_packed);
+    auto d_x_sorted_fwd = g_bilevel_ws.d_x_sorted_fwd_bat.narrow(0, 0, total_N);
+    d_x_sorted_fwd.zero_();
     mamba3_scan_backward_batched_kernel<<<num_params, d_inner, scan_smem>>>(
         d_fwd_scan_out_packed.data_ptr<float>(),
         x_sorted_packed.data_ptr<float>(),
@@ -3268,8 +3384,7 @@ void launch_mamba3_peer_backward_batched(
     );
 
     // Build reversed x_sorted via CUDA kernel (no CPU-GPU sync)
-    auto total_N = x_sorted_packed.size(0);
-    auto x_sorted_rev_packed = torch::empty_like(x_sorted_packed);
+    auto x_sorted_rev_packed = g_bilevel_ws.x_sorted_rev.narrow(0, 0, total_N);
     {
         int total_elems = total_N * d_model;
         int rev_grid = (total_elems + SG2B_BLOCK - 1) / SG2B_BLOCK;
@@ -3282,7 +3397,8 @@ void launch_mamba3_peer_backward_batched(
     }
 
     // Backward direction backward scan
-    auto d_x_sorted_bwd = torch::zeros({total_N, d_model}, float_opts);
+    auto d_x_sorted_bwd = g_bilevel_ws.d_x_sorted_bwd_bat.narrow(0, 0, total_N);
+    d_x_sorted_bwd.zero_();
     mamba3_scan_backward_batched_kernel<<<num_params, d_inner, scan_smem>>>(
         d_bwd_scan_out_packed.data_ptr<float>(),
         x_sorted_rev_packed.data_ptr<float>(),
