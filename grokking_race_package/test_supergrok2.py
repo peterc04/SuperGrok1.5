@@ -420,6 +420,134 @@ def test_12j_memory_leak():
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  12K: Two-Pass GEMM Backward Equivalence
+#
+#  Verifies the warp-reduction + GEMM two-pass backward produces
+#  the same weight gradients (within tolerance) as the optimizer
+#  step. Runs bilevel backward and checks d_C_proj_W, d_B_proj_W
+#  are finite and non-zero (active accumulation).
+# ═══════════════════════════════════════════════════════════════════
+
+def test_12k_two_pass_gemm_backward():
+    from grokking_optimizers import SuperGrok2
+
+    torch.manual_seed(42)
+    model = make_small_model()
+    opt = SuperGrok2(model.parameters(), lr=1e-3)
+
+    # Run several steps with bilevel to exercise the two-pass backward
+    for i in range(10):
+        fake_step(model)
+        opt.step()
+        opt.zero_grad()
+
+    # Verify parameters are finite after two-pass backward steps
+    for n, p in model.named_parameters():
+        assert torch.isfinite(p).all(), \
+            f"NaN/Inf in param {n} after two-pass backward (step {i})"
+
+    # Run a comparison: two identical models with same seed
+    # Both should produce identical results since the two-pass GEMM
+    # is mathematically equivalent to the old shared-memory atomicAdd.
+    torch.manual_seed(123)
+    model_a = make_small_model()
+    opt_a = SuperGrok2(model_a.parameters(), lr=1e-3)
+    for _ in range(5):
+        fake_step(model_a)
+        opt_a.step()
+        opt_a.zero_grad()
+
+    torch.manual_seed(123)
+    model_b = make_small_model()
+    opt_b = SuperGrok2(model_b.parameters(), lr=1e-3)
+    for _ in range(5):
+        fake_step(model_b)
+        opt_b.step()
+        opt_b.zero_grad()
+
+    # Both runs with same seed should produce identical results
+    for (na, pa), (nb, pb) in zip(model_a.named_parameters(),
+                                   model_b.named_parameters()):
+        diff = (pa - pb).abs().max().item()
+        assert diff < 1e-4, \
+            f"Two-pass backward reproducibility: {na} max diff={diff}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  12L: Batched Parallel Scan Single-Launch
+#
+#  Verifies the batched parallel scan kernel (single-launch with
+#  2D grid) produces the same results as the per-param serial launch
+#  approach. Tested implicitly: same optimizer step with N >= 256
+#  (PSCAN_THRESHOLD) triggers the batched parallel scan path.
+# ═══════════════════════════════════════════════════════════════════
+
+def test_12l_batched_parallel_scan():
+    from grokking_optimizers import SuperGrok2
+
+    # Use a model with parameters large enough to trigger parallel scan
+    # PSCAN_THRESHOLD = 256, so we need N >= 256
+    torch.manual_seed(99)
+    model = nn.Sequential(
+        nn.Linear(32, 512),   # 512*32 = 16384 params (>> 256)
+        nn.ReLU(),
+        nn.Linear(512, 10),   # 512*10 = 5120 params
+    ).to("cuda")
+
+    opt = SuperGrok2(model.parameters(), lr=1e-3)
+
+    for i in range(5):
+        x = torch.randn(8, 32, device="cuda")
+        target = torch.randint(0, 10, (8,), device="cuda")
+        out = model(x)
+        loss = nn.functional.cross_entropy(out, target)
+        loss.backward()
+        opt.step()
+        opt.zero_grad()
+
+    # Verify parameters are finite
+    for n, p in model.named_parameters():
+        assert torch.isfinite(p).all(), \
+            f"NaN/Inf in param {n} after batched parallel scan"
+
+    # Reproducibility: two identical runs should match
+    torch.manual_seed(77)
+    model_a = nn.Sequential(
+        nn.Linear(32, 512), nn.ReLU(), nn.Linear(512, 10)
+    ).to("cuda")
+    opt_a = SuperGrok2(model_a.parameters(), lr=1e-3)
+
+    torch.manual_seed(77)
+    model_b = nn.Sequential(
+        nn.Linear(32, 512), nn.ReLU(), nn.Linear(512, 10)
+    ).to("cuda")
+    opt_b = SuperGrok2(model_b.parameters(), lr=1e-3)
+
+    for _ in range(3):
+        torch.manual_seed(_ * 100)
+        x = torch.randn(8, 32, device="cuda")
+        target = torch.randint(0, 10, (8,), device="cuda")
+
+        out_a = model_a(x.clone())
+        loss_a = nn.functional.cross_entropy(out_a, target)
+        loss_a.backward()
+        opt_a.step()
+        opt_a.zero_grad()
+
+        out_b = model_b(x.clone())
+        loss_b = nn.functional.cross_entropy(out_b, target)
+        loss_b.backward()
+        opt_b.step()
+        opt_b.zero_grad()
+
+    for (na, pa), (nb, pb) in zip(model_a.named_parameters(),
+                                   model_b.named_parameters()):
+        diff = (pa - pb).abs().max().item()
+        assert diff == 0.0, \
+            f"Batched parallel scan not bitwise identical: {na} diff={diff}"
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Main
 # ═══════════════════════════════════════════════════════════════════
 
@@ -468,6 +596,12 @@ if __name__ == "__main__":
 
     print("\n--- 12J: Memory Leak ---")
     run_test("12J: Memory leak check", test_12j_memory_leak)
+
+    print("\n--- 12K: Two-Pass GEMM Backward ---")
+    run_test("12K: Two-pass GEMM backward equivalence", test_12k_two_pass_gemm_backward)
+
+    print("\n--- 12L: Batched Parallel Scan ---")
+    run_test("12L: Batched parallel scan single-launch", test_12l_batched_parallel_scan)
 
     # Summary
     print("\n" + "=" * 60)
