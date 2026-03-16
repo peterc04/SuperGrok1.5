@@ -78,9 +78,11 @@ def get_arch_tier() -> str:
 
 @functools.lru_cache(maxsize=1)
 def get_amd_tier() -> str:
-    """AMD architecture tier: 'cdna3', 'cdna2', or 'generic'.
+    """AMD architecture tier: 'cdna4', 'cdna3', 'cdna2', or 'generic'.
 
     FORCE_ARCH convention (matches C++ get_amd_tier):
+      1200 → cdna4 (gfx1200, full GCN arch number)
+      120  → cdna4 (from get_device_capability major*10+minor)
       942  → cdna3 (full GCN arch number)
       94   → cdna3 (from get_device_capability major*10+minor)
       90   → cdna2 (gfx90a)
@@ -94,13 +96,17 @@ def get_amd_tier() -> str:
     force = os.environ.get('FORCE_ARCH')
     if force:
         arch = int(force)
+        if arch >= 1200: return 'cdna4'   # gfx1200/gfx1201 (full arch number)
         if arch >= 942:  return 'cdna3'   # gfx942 (full arch number)
+        if arch == 120:  return 'cdna4'   # capability format (12, 0)
         if arch == 94:   return 'cdna3'   # capability format (9, 4)
         if arch == 90:   return 'cdna2'   # gfx90a
         return 'generic'                   # gfx908, etc.
 
     # Real hardware: get_gpu_arch returns major*10+minor
     arch = get_gpu_arch()
+    if arch >= 120:  # gfx1200 → (12, 0) → 120
+        return 'cdna4'
     if arch >= 94:   # gfx942 → (9, 4) → 94
         return 'cdna3'
     if arch >= 90:   # gfx90a → (9, 0) → 90
@@ -112,6 +118,7 @@ def get_amd_label() -> str:
     """Human-readable label for AMD GPU tier."""
     tier = get_amd_tier()
     labels = {
+        'cdna4': 'MI400 (gfx1200, CDNA4)',
         'cdna3': 'MI300X (gfx942, CDNA3)',
         'cdna2': 'MI250 (gfx90a, CDNA2)',
         'generic': 'AMD GPU (generic CDNA)',
@@ -156,6 +163,16 @@ def supports_nvfp4() -> bool:
     return get_gpu_vendor() == 'nvidia' and get_gpu_arch() >= 100
 
 
+def supports_fp4_mfma() -> bool:
+    """Native FP4 MFMA instructions (AMD CDNA4 gfx1200+)."""
+    return get_amd_tier() == 'cdna4'
+
+
+def supports_fp6() -> bool:
+    """Enhanced FP6 support (AMD CDNA3+: gfx940/gfx941/gfx942 and gfx1200+)."""
+    return get_amd_tier() in ('cdna3', 'cdna4')
+
+
 def supports_matrix_cores() -> bool:
     """AMD Matrix Cores (CDNA gfx908+)."""
     return get_gpu_vendor() == 'amd' and get_gpu_arch() >= 90
@@ -168,6 +185,7 @@ def get_arch_label() -> str:
 
     if vendor == 'amd':
         labels = {
+            120: "MI400 (gfx1200)",
             90: "MI200 (gfx90a)",
             94: "MI300X (gfx942)",
         }
