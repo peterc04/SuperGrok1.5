@@ -59,6 +59,7 @@ from .overlap_distributed import OverlappedOptimizer, OverlappedSuperGrok2
 from .gradient_compression import INT8GradientCompressor, PowerSGDCompressor
 from .partial_graph import PartialGraphOptimizer
 from .sparse_gradients import SparseGradientHandler
+from .pipelined_optimizer import PipelinedOptimizer
 
 __all__ = [
     "SuperGrok15", "SharpnessMetaNet",
@@ -85,4 +86,5 @@ __all__ = [
     "_HAS_OPS", "_HAS_CUDA", "_HAS_CPU_OPS",
     "PartialGraphOptimizer",
     "SparseGradientHandler",
+    "PipelinedOptimizer",
 ]

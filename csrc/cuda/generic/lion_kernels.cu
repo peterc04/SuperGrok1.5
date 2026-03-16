@@ -13,6 +13,7 @@
 #include <torch/extension.h>
 
 #include "platform.h"
+#include "utils.cuh"
 
 constexpr int LION_BLOCK_SIZE = 256;
 
@@ -31,7 +32,7 @@ __global__ void fused_lion_step_kernel(
     if (idx >= N) return;
 
     const float g = static_cast<float>(grad[idx]);
-    const float ea = exp_avg[idx];
+    const float ea = stream_load(&exp_avg[idx]);
     const float p = static_cast<float>(param[idx]);
 
     // Interpolated direction for update
@@ -50,7 +51,7 @@ __global__ void fused_lion_step_kernel(
     param[idx] = static_cast<scalar_t>(p - lr * (s + wd * p));
 
     // Momentum update (FP32 state)
-    exp_avg[idx] = beta2 * ea + (1.0f - beta2) * g;
+    stream_store(&exp_avg[idx], beta2 * ea + (1.0f - beta2) * g);
 }
 
 // ===================================================================
@@ -67,7 +68,7 @@ __global__ void fused_lion_step_vec4_kernel(
     if (i >= N4) return;
 
     float4 p = param4[i];
-    float4 ea = exp_avg4[i];
+    float4 ea = stream_load4(&exp_avg4[i]);
     float4 g = grad4[i];
 
     // Interpolated direction for update
@@ -95,7 +96,7 @@ __global__ void fused_lion_step_vec4_kernel(
     ea.y = beta2 * ea.y + (1.0f - beta2) * g.y;
     ea.z = beta2 * ea.z + (1.0f - beta2) * g.z;
     ea.w = beta2 * ea.w + (1.0f - beta2) * g.w;
-    exp_avg4[i] = ea;
+    stream_store4(&exp_avg4[i], ea);
 }
 
 void launch_fused_lion_step(

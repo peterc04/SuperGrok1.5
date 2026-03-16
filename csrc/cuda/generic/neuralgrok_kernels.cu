@@ -30,6 +30,7 @@
 #include <torch/extension.h>
 
 #include "platform.h"
+#include "utils.cuh"
 
 constexpr int NEURALGROK_BLOCK_SIZE = 256;
 
@@ -126,15 +127,15 @@ __global__ void fused_neuralgrok_adam_kernel(
 
     // Cast to float for accumulation precision
     const float ag = static_cast<float>(amplified_grad[idx]);
-    const float ea_old = exp_avg[idx];
-    const float easq_old = exp_avg_sq[idx];
+    const float ea_old = stream_load(&exp_avg[idx]);
+    const float easq_old = stream_load(&exp_avg_sq[idx]);
 
-    // -- Adam moment updates --------------------------------------------
+    // -- Adam moment updates (non-temporal to preserve L2) ----------------
     const float ea = beta1 * ea_old + (1.0f - beta1) * ag;
     const float easq = beta2 * easq_old + (1.0f - beta2) * ag * ag;
 
-    exp_avg[idx] = ea;
-    exp_avg_sq[idx] = easq;
+    stream_store(&exp_avg[idx], ea);
+    stream_store(&exp_avg_sq[idx], easq);
 
     // -- Bias-corrected step with decoupled weight decay ----------------
     const float step_size = lr / bc1;
@@ -163,8 +164,8 @@ __global__ void fused_neuralgrok_adam_vec4_kernel(
     if (i >= N4) return;
 
     float4 ag = amplified_grad4[i];
-    float4 ea = exp_avg4[i];
-    float4 eas = exp_avg_sq4[i];
+    float4 ea = stream_load4(&exp_avg4[i]);
+    float4 eas = stream_load4(&exp_avg_sq4[i]);
 
     ea.x = beta1 * ea.x + (1.0f - beta1) * ag.x;
     ea.y = beta1 * ea.y + (1.0f - beta1) * ag.y;
@@ -176,8 +177,8 @@ __global__ void fused_neuralgrok_adam_vec4_kernel(
     eas.z = beta2 * eas.z + (1.0f - beta2) * ag.z * ag.z;
     eas.w = beta2 * eas.w + (1.0f - beta2) * ag.w * ag.w;
 
-    exp_avg4[i] = ea;
-    exp_avg_sq4[i] = eas;
+    stream_store4(&exp_avg4[i], ea);
+    stream_store4(&exp_avg_sq4[i], eas);
 
     float step_size = lr / bc1;
     float decay = 1.0f - lr * weight_decay;
@@ -364,14 +365,14 @@ __global__ void fused_neuralgrok_full_step_kernel(
     const float ag = g * (alpha * mlp_out + beta);
 
     // ---- Phase 2: Adam update with register-held amplified_grad ---------
-    const float ea_old = exp_avg[idx];
-    const float easq_old = exp_avg_sq[idx];
+    const float ea_old = stream_load(&exp_avg[idx]);
+    const float easq_old = stream_load(&exp_avg_sq[idx]);
 
     const float ea = beta1 * ea_old + (1.0f - beta1) * ag;
     const float easq = beta2 * easq_old + (1.0f - beta2) * ag * ag;
 
-    exp_avg[idx] = ea;
-    exp_avg_sq[idx] = easq;
+    stream_store(&exp_avg[idx], ea);
+    stream_store(&exp_avg_sq[idx], easq);
 
     const float step_size = lr / bc1;
     const float denom = sqrtf(easq / bc2) + eps;

@@ -13,6 +13,7 @@
 #include <torch/extension.h>
 
 #include "platform.h"
+#include "utils.cuh"
 
 constexpr int MUON_BLOCK_SIZE = 256;
 
@@ -29,7 +30,7 @@ __global__ void muon_momentum_normalize_kernel(
     if (idx >= numel) return;
 
     float b = momentum * static_cast<float>(buf[idx]) + static_cast<float>(grad[idx]);
-    buf[idx] = static_cast<scalar_t>(b);
+    buf[idx] = static_cast<scalar_t>(b);  // buf is reused for NS; keep in L2
     X[idx] = static_cast<scalar_t>(b * inv_norm);
 }
 
@@ -84,14 +85,14 @@ __global__ void muon_momentum_normalize_vec4_kernel(
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N4) return;
 
-    float4 b = buf4[i];
+    float4 b = stream_load4(&buf4[i]);
     float4 g = grad4[i];
 
     b.x = momentum * b.x + g.x;
     b.y = momentum * b.y + g.y;
     b.z = momentum * b.z + g.z;
     b.w = momentum * b.w + g.w;
-    buf4[i] = b;
+    stream_store4(&buf4[i], b);
 
     float4 x;
     x.x = b.x * inv_norm;

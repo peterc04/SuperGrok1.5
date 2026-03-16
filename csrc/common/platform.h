@@ -200,3 +200,78 @@ using GpuStream_t = cudaStream_t;
   #define gpuFuncAttributeMaxDynamicSharedMemorySize \
           cudaFuncAttributeMaxDynamicSharedMemorySize
 #endif
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Non-temporal (streaming) memory access
+//
+//  Used for optimizer state access to avoid L2 cache pollution.
+//  Model weights stay warm in L2 for the next forward pass.
+// ═══════════════════════════════════════════════════════════════════════
+
+#if GROK_CUDA
+  // Streaming load: reads bypass L2 (or use L2 read-only path)
+  __device__ __forceinline__ float stream_load(const float* ptr) {
+      float val;
+      asm volatile("ld.global.nc.f32 %0, [%1];" : "=f"(val) : "l"(ptr));
+      return val;
+  }
+
+  // Streaming store: writes bypass L2 allocation
+  // Available on sm_80+ (Ampere). On older, falls back to normal store.
+  __device__ __forceinline__ void stream_store(float* ptr, float val) {
+  #if __CUDA_ARCH__ >= 800
+      asm volatile("st.global.wt.f32 [%0], %1;" :: "l"(ptr), "f"(val));
+  #else
+      *ptr = val;
+  #endif
+  }
+
+  // float4 streaming variants
+  __device__ __forceinline__ float4 stream_load4(const float4* ptr) {
+      float4 val;
+      asm volatile(
+          "ld.global.nc.v4.f32 {%0,%1,%2,%3}, [%4];"
+          : "=f"(val.x), "=f"(val.y), "=f"(val.z), "=f"(val.w)
+          : "l"(ptr));
+      return val;
+  }
+
+  __device__ __forceinline__ void stream_store4(float4* ptr, float4 val) {
+  #if __CUDA_ARCH__ >= 800
+      asm volatile(
+          "st.global.wt.v4.f32 [%0], {%1,%2,%3,%4};"
+          :: "l"(ptr), "f"(val.x), "f"(val.y), "f"(val.z), "f"(val.w));
+  #else
+      *ptr = val;
+  #endif
+  }
+
+#elif GROK_HIP
+  // HIP: use __builtin_nontemporal_load/store
+  __device__ __forceinline__ float stream_load(const float* ptr) {
+      return __builtin_nontemporal_load(ptr);
+  }
+  __device__ __forceinline__ void stream_store(float* ptr, float val) {
+      __builtin_nontemporal_store(val, ptr);
+  }
+  // float4 variants: decompose into 4 scalar non-temporal ops
+  __device__ __forceinline__ float4 stream_load4(const float4* ptr) {
+      const float* fp = reinterpret_cast<const float*>(ptr);
+      return make_float4(
+          __builtin_nontemporal_load(fp),
+          __builtin_nontemporal_load(fp+1),
+          __builtin_nontemporal_load(fp+2),
+          __builtin_nontemporal_load(fp+3));
+  }
+  __device__ __forceinline__ void stream_store4(float4* ptr, float4 val) {
+      float* fp = reinterpret_cast<float*>(ptr);
+      __builtin_nontemporal_store(val.x, fp);
+      __builtin_nontemporal_store(val.y, fp+1);
+      __builtin_nontemporal_store(val.z, fp+2);
+      __builtin_nontemporal_store(val.w, fp+3);
+  }
+#else
+  // CPU: no non-temporal hint needed (OS manages caching)
+  static inline float stream_load(const float* ptr) { return *ptr; }
+  static inline void stream_store(float* ptr, float val) { *ptr = val; }
+#endif

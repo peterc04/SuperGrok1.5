@@ -99,9 +99,11 @@ class SuperGrok2(Optimizer):
         bilevel_allreduce_meta_grads: bool = True,
         expert_allreduce_before_recycle: bool = True,
         mamba_state_sync_interval: int = 1000,
+        state_precision: str = 'fp32',
     ):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
+        self.state_precision = state_precision
 
         self.alpha_init = alpha_init
         self.sam_enable_threshold = sam_enable_threshold
@@ -186,6 +188,7 @@ class SuperGrok2(Optimizer):
         self._flat_layer_beta1s = []
         self._flat_exp_avgs = []
         self._flat_exp_avg_sqs = []
+        self._flat_exp_avg_scales = []  # Config 3: INT8 per-block scales
         self._flat_mus = []
         self._flat_sharpness = []
         self._flat_gru_states = []
@@ -221,18 +224,37 @@ class SuperGrok2(Optimizer):
         if self._state_initialized:
             return
         for p in self._flat_params:
-            self._flat_exp_avgs.append(
-                torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
-            self._flat_exp_avg_sqs.append(
-                torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
-            self._flat_mus.append(
-                torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
-            self._flat_sharpness.append(
-                torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
-            # Per-parameter GRU state
-            self._flat_gru_states.append(
-                torch.zeros(p.data.numel(), self.gru_hidden,
-                            dtype=torch.float32, device=p.device))
+            N = p.data.numel()
+            if self.state_precision == 'config3':
+                # Config 3: INT8 per-block for exp_avg, BF16 for others
+                block_size = 32
+                num_blocks = (N + block_size - 1) // block_size
+                self._flat_exp_avgs.append(
+                    torch.zeros(N, dtype=torch.int8, device=p.device))
+                self._flat_exp_avg_scales.append(
+                    torch.zeros(num_blocks, dtype=torch.float32, device=p.device))
+                self._flat_exp_avg_sqs.append(
+                    torch.zeros(N, dtype=torch.bfloat16, device=p.device))
+                self._flat_mus.append(
+                    torch.zeros(N, dtype=torch.bfloat16, device=p.device))
+                self._flat_sharpness.append(
+                    torch.zeros(N, dtype=torch.bfloat16, device=p.device))
+                self._flat_gru_states.append(
+                    torch.zeros(N, self.gru_hidden,
+                                dtype=torch.bfloat16, device=p.device))
+            else:
+                # FP32 (default)
+                self._flat_exp_avgs.append(
+                    torch.zeros(N, dtype=torch.float32, device=p.device))
+                self._flat_exp_avg_sqs.append(
+                    torch.zeros(N, dtype=torch.float32, device=p.device))
+                self._flat_mus.append(
+                    torch.zeros(N, dtype=torch.float32, device=p.device))
+                self._flat_sharpness.append(
+                    torch.zeros(N, dtype=torch.float32, device=p.device))
+                self._flat_gru_states.append(
+                    torch.zeros(N, self.gru_hidden,
+                                dtype=torch.float32, device=p.device))
             # Per-parameter Mamba states (initialized on first use)
             self._flat_mamba_fwd_states.append(None)
             self._flat_mamba_bwd_states.append(None)
@@ -556,19 +578,50 @@ class SuperGrok2(Optimizer):
                 self._flat_mamba_bwd_states[i] = new_bwd.detach()
 
                 mu = self._flat_mus[i]
-                mu.mul_(alpha_i).add_(grad.reshape(-1), alpha=1.0 - alpha_i)
+                if mu.dtype != torch.float32:
+                    mu_fp32 = mu.float()
+                    mu_fp32.mul_(alpha_i).add_(grad.reshape(-1), alpha=1.0 - alpha_i)
+                    self._flat_mus[i] = mu_fp32.to(mu.dtype)
+                    mu = mu_fp32
+                else:
+                    mu.mul_(alpha_i).add_(grad.reshape(-1), alpha=1.0 - alpha_i)
                 effective_grad = smart_grad.reshape(-1) + lamb_effs_list[idx] * mu
-                self._flat_mus[i] = mu
+                self._flat_mus[i] = self._flat_mus[i]  # already stored above
 
                 fg = effective_grad.reshape(-1).float()
                 ea = self._flat_exp_avgs[i]
                 easq = self._flat_exp_avg_sqs[i]
-                ea.mul_(beta1_i).add_(fg, alpha=1 - beta1_i)
-                easq.mul_(beta2).addcmul_(fg, fg, value=1 - beta2)
-                step_size = lr / bc1
-                denom = (easq / bc2).sqrt().add_(eps)
-                p.data.mul_(1 - lr * wd_eff)
-                p.data.addcdiv_(ea.reshape(p.data.shape), denom.reshape(p.data.shape), value=-step_size)
+                if ea.dtype == torch.int8:
+                    # Config 3: dequantize INT8 → FP32, compute, requantize
+                    scale_idx = i
+                    ea_scale = self._flat_exp_avg_scales[scale_idx]
+                    ea_fp32 = ea.float() * ea_scale.repeat_interleave(32)[:ea.numel()]
+                    ea_fp32.mul_(beta1_i).add_(fg, alpha=1 - beta1_i)
+                    # Requantize: per-block max scale
+                    block_size = 32
+                    N = ea_fp32.numel()
+                    num_blocks = (N + block_size - 1) // block_size
+                    for b in range(num_blocks):
+                        start = b * block_size
+                        end = min(start + block_size, N)
+                        block_max = ea_fp32[start:end].abs().max().item()
+                        new_scale = max(block_max / 127.0, 1e-12)
+                        ea_scale[b] = new_scale
+                        ea[start:end] = (ea_fp32[start:end] / new_scale).round().clamp(-127, 127).to(torch.int8)
+                    easq_fp32 = easq.float()
+                    easq_fp32.mul_(beta2).addcmul_(fg, fg, value=1 - beta2)
+                    self._flat_exp_avg_sqs[i] = easq_fp32.to(torch.bfloat16)
+                    step_size = lr / bc1
+                    denom = (easq_fp32 / bc2).sqrt().add_(eps)
+                    p.data.mul_(1 - lr * wd_eff)
+                    p.data.addcdiv_(ea_fp32.reshape(p.data.shape), denom.reshape(p.data.shape), value=-step_size)
+                else:
+                    ea.mul_(beta1_i).add_(fg, alpha=1 - beta1_i)
+                    easq.mul_(beta2).addcmul_(fg, fg, value=1 - beta2)
+                    step_size = lr / bc1
+                    denom = (easq / bc2).sqrt().add_(eps)
+                    p.data.mul_(1 - lr * wd_eff)
+                    p.data.addcdiv_(ea.reshape(p.data.shape), denom.reshape(p.data.shape), value=-step_size)
 
             # Expert recycling for Python fallback (once per step, not per param)
             self._step_counter += 1

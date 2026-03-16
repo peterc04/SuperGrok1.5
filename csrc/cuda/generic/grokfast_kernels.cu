@@ -13,6 +13,7 @@
 #include <torch/extension.h>
 
 #include "platform.h"
+#include "utils.cuh"
 
 constexpr int GF_BLOCK_SIZE = 256;
 
@@ -28,11 +29,11 @@ __global__ void fused_grokfast_ema_kernel(
     if (idx >= N) return;
 
     const float g = static_cast<float>(grad[idx]);
-    const float e_old = ema[idx];
+    const float e_old = stream_load(&ema[idx]);
 
     // EMA update
     const float e = alpha * e_old + (1.0f - alpha) * g;
-    ema[idx] = e;
+    stream_store(&ema[idx], e);
 
     // Gradient amplification
     grad[idx] = static_cast<scalar_t>(g + lamb * e);
@@ -51,14 +52,14 @@ __global__ void fused_grokfast_ema_vec4_kernel(
     if (i >= N4) return;
 
     float4 g = grad4[i];
-    float4 e = ema4[i];
+    float4 e = stream_load4(&ema4[i]);
 
     // EMA update
     e.x = alpha * e.x + (1.0f - alpha) * g.x;
     e.y = alpha * e.y + (1.0f - alpha) * g.y;
     e.z = alpha * e.z + (1.0f - alpha) * g.z;
     e.w = alpha * e.w + (1.0f - alpha) * g.w;
-    ema4[i] = e;
+    stream_store4(&ema4[i], e);
 
     // Gradient amplification
     g.x = g.x + lamb * e.x;

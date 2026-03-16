@@ -20,6 +20,7 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include "platform.h"
+#include "utils.cuh"
 
 constexpr int BLOCK_SIZE = 256;
 
@@ -125,11 +126,11 @@ __global__ void fused_adam_decay_kernel(
     // ── Final gradient = smart_grad + lambda * mu ────────────────────
     const float fg = sg + lamb_eff * m;
 
-    // ── Adam moment updates (FP32 state) ─────────────────────────────
-    const float ea = beta1 * exp_avg[idx] + (1.0f - beta1) * fg;
-    const float easq = beta2 * exp_avg_sq[idx] + (1.0f - beta2) * fg * fg;
-    exp_avg[idx] = ea;
-    exp_avg_sq[idx] = easq;
+    // ── Adam moment updates (FP32 state, non-temporal to preserve L2) ─
+    const float ea = beta1 * stream_load(&exp_avg[idx]) + (1.0f - beta1) * fg;
+    const float easq = beta2 * stream_load(&exp_avg_sq[idx]) + (1.0f - beta2) * fg * fg;
+    stream_store(&exp_avg[idx], ea);
+    stream_store(&exp_avg_sq[idx], easq);
 
     // ── Bias-corrected step ──────────────────────────────────────────
     const float step_size = lr / bc1;
@@ -210,9 +211,9 @@ __global__ void fused_adam_decay_vec4_kernel(
     fg.z = sg.z + lamb_eff * m.z;
     fg.w = sg.w + lamb_eff * m.w;
 
-    // Adam moment updates
-    float4 ea = exp_avg4[i];
-    float4 eas = exp_avg_sq4[i];
+    // Adam moment updates (non-temporal to preserve L2 for model weights)
+    float4 ea = stream_load4(&exp_avg4[i]);
+    float4 eas = stream_load4(&exp_avg_sq4[i]);
 
     ea.x = beta1 * ea.x + (1.0f - beta1) * fg.x;
     ea.y = beta1 * ea.y + (1.0f - beta1) * fg.y;
@@ -224,8 +225,8 @@ __global__ void fused_adam_decay_vec4_kernel(
     eas.z = beta2 * eas.z + (1.0f - beta2) * fg.z * fg.z;
     eas.w = beta2 * eas.w + (1.0f - beta2) * fg.w * fg.w;
 
-    exp_avg4[i] = ea;
-    exp_avg_sq4[i] = eas;
+    stream_store4(&exp_avg4[i], ea);
+    stream_store4(&exp_avg_sq4[i], eas);
 
     // Bias-corrected step + progressive weight decay
     float step_size = lr / bc1;
@@ -557,10 +558,10 @@ __global__ void fused_supergrok15_full_step_kernel(
     const float fg = smart_grad + lamb_eff * mu_new;
 
     // ── 6. Adam moments ─────────────────────────────────────────
-    const float ea = beta1 * exp_avg[idx] + (1.0f - beta1) * fg;
-    const float easq = beta2 * exp_avg_sq[idx] + (1.0f - beta2) * fg * fg;
-    exp_avg[idx] = ea;
-    exp_avg_sq[idx] = easq;
+    const float ea = beta1 * stream_load(&exp_avg[idx]) + (1.0f - beta1) * fg;
+    const float easq = beta2 * stream_load(&exp_avg_sq[idx]) + (1.0f - beta2) * fg * fg;
+    stream_store(&exp_avg[idx], ea);
+    stream_store(&exp_avg_sq[idx], easq);
 
     // ── 7. Bias-corrected step + progressive WD ─────────────────
     const float step_size = lr / bc1;

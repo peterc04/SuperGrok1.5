@@ -37,6 +37,7 @@
 #include <torch/extension.h>
 
 #include "platform.h"
+#include "utils.cuh"
 
 constexpr int PRODIGY_BLOCK_SIZE = 256;
 constexpr int PRODIGY_WARP_SIZE = WARP_SIZE;
@@ -72,19 +73,19 @@ __global__ void fused_prodigy_step_kernel(
     const float d_lr_g_sq = d_lr * d_lr * g * g;
 
     // -- 1. Update s (EMA of d_lr-scaled squared gradients) -------------
-    const float s_old = s[idx];
+    const float s_old = stream_load(&s[idx]);
     const float s_new = beta2 * s_old + (1.0f - beta2) * d_lr_g_sq;
-    s[idx] = s_new;
+    stream_store(&s[idx], s_new);
 
     // -- 2. Adam moment updates -----------------------------------------
-    const float ea_old = exp_avg[idx];
-    const float easq_old = exp_avg_sq[idx];
+    const float ea_old = stream_load(&exp_avg[idx]);
+    const float easq_old = stream_load(&exp_avg_sq[idx]);
 
     const float ea = beta1 * ea_old + (1.0f - beta1) * d_lr_g;
     const float easq = beta2 * easq_old + (1.0f - beta2) * d_lr_g_sq;
 
-    exp_avg[idx] = ea;
-    exp_avg_sq[idx] = easq;
+    stream_store(&exp_avg[idx], ea);
+    stream_store(&exp_avg_sq[idx], easq);
 
     // -- 3. Bias-corrected step with weight decay -----------------------
     const float denom = sqrtf(easq / bc2) + d_lr * eps;
@@ -114,9 +115,9 @@ __global__ void fused_prodigy_step_vec4_kernel(
 
     float4 g = grad4[i];
     float4 p = param4[i];
-    float4 ea = exp_avg4[i];
-    float4 eas = exp_avg_sq4[i];
-    float4 sv = s4[i];
+    float4 ea = stream_load4(&exp_avg4[i]);
+    float4 eas = stream_load4(&exp_avg_sq4[i]);
+    float4 sv = stream_load4(&s4[i]);
 
     // Precompute scaled gradient components
     float4 d_lr_g, d_lr_g_sq;
@@ -130,7 +131,7 @@ __global__ void fused_prodigy_step_vec4_kernel(
     sv.y = beta2 * sv.y + (1.0f - beta2) * d_lr_g_sq.y;
     sv.z = beta2 * sv.z + (1.0f - beta2) * d_lr_g_sq.z;
     sv.w = beta2 * sv.w + (1.0f - beta2) * d_lr_g_sq.w;
-    s4[i] = sv;
+    stream_store4(&s4[i], sv);
 
     // Adam moment updates
     ea.x = beta1 * ea.x + (1.0f - beta1) * d_lr_g.x;
@@ -143,8 +144,8 @@ __global__ void fused_prodigy_step_vec4_kernel(
     eas.z = beta2 * eas.z + (1.0f - beta2) * d_lr_g_sq.z;
     eas.w = beta2 * eas.w + (1.0f - beta2) * d_lr_g_sq.w;
 
-    exp_avg4[i] = ea;
-    exp_avg_sq4[i] = eas;
+    stream_store4(&exp_avg4[i], ea);
+    stream_store4(&exp_avg_sq4[i], eas);
 
     // Bias-corrected step with weight decay
     float d_lr_eps = d_lr * eps;
