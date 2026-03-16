@@ -19,13 +19,10 @@ import torch.nn as nn
 from torch.optim import Optimizer
 from typing import Optional, Callable, Dict, Any, Tuple
 
-from grokking_optimizers import _HAS_OPS, _HAS_CUDA
-if _HAS_OPS and _HAS_CUDA:
-    from grokking_optimizers import _ops
-    from grokking_optimizers import _python_fallback as _ops_cpu
-else:
-    from grokking_optimizers import _python_fallback as _ops
-    _ops_cpu = _ops
+from grokking_optimizers._ops_loader import get_ops
+
+_ops = get_ops()  # Fails loudly if C++ extension not built
+_ops_cpu = _ops  # CPU ops are part of the same extension
 
 
 class SharpnessMetaNet(nn.Module):

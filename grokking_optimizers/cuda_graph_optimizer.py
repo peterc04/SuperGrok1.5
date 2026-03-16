@@ -92,30 +92,25 @@ class CUDAGraphOptimizer:
         self._valid = False
 
     def _record_graph(self):
-        """Record the optimizer step as a CUDA graph."""
-        try:
-            # Allocate static gradient buffers
-            self._allocate_static_grads()
-            self._copy_grads_to_static()
+        """Record the optimizer step as a CUDA graph.
 
-            # Temporarily swap grads to static buffers
-            orig_grads = self._swap_grads(self._static_grads)
+        No fallback — if graph capture fails, the error is raised.
+        """
+        # Allocate static gradient buffers
+        self._allocate_static_grads()
+        self._copy_grads_to_static()
 
-            # Record
-            self._graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self._graph):
-                self.optimizer.step()
+        # Temporarily swap grads to static buffers
+        orig_grads = self._swap_grads(self._static_grads)
 
-            # Restore original grads
-            self._swap_grads(orig_grads)
-            self._valid = True
-
-        except Exception:
-            # Graph capture failed (e.g., unsupported ops)
-            self._graph = None
-            self._valid = False
-            # Fall back to eager
+        # Record
+        self._graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._graph):
             self.optimizer.step()
+
+        # Restore original grads
+        self._swap_grads(orig_grads)
+        self._valid = True
 
     def _allocate_static_grads(self):
         """Allocate static buffers that mirror the gradient tensors."""
