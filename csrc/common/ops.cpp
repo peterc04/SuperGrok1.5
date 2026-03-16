@@ -1331,6 +1331,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dequantize_nvfp4", &dequantize_nvfp4,
           "Dequantize NVFP4 back to FP32",
           py::arg("input"), py::arg("block_scales"), py::arg("numel"));
+
+#if GROK_HIP
+    // ── CDNA4 Kernels (gfx950 / MI350X) ─────────────────────────────
+    m.def("cdna4_scan_local_with_summary", &cdna4_scan_local_with_summary,
+          "CDNA4: local scan with FP6 state and summary output");
+    m.def("cdna4_backward_fp6", &cdna4_backward_fp6,
+          "CDNA4: backward with FP6 saved states");
+    m.def("cdna4_dynamic_expert_fp4", &cdna4_dynamic_expert_fp4,
+          "CDNA4: dynamic expert forward with FP4 MFMA weights");
+    m.def("cdna4_persistent_scan_fused_elem", &cdna4_persistent_scan_fused_elem,
+          "CDNA4: persistent scan + fused elem with FP4+FP6");
+#endif
 #endif
 
     // ── CPU Fused Scan+Elem (always available) ──────────────────────

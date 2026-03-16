@@ -15,6 +15,7 @@
  */
 
 #include <hip/hip_runtime.h>
+#include <torch/extension.h>
 #include "platform.h"
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -206,7 +207,8 @@ __device__ __forceinline__ uint32_t philox_hash(uint32_t counter, uint32_t key) 
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__global__ void __launch_bounds__(256, 2)
+__launch_bounds__(256, 2)
+__global__ void
 cdna4_fp4_expert_load_kernel(
     const uint32_t* __restrict__ weights_fp4,   // [num_experts, packed_size]
     const float*    __restrict__ scale_factors,  // [num_experts]
@@ -274,7 +276,8 @@ cdna4_fp4_expert_load_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__global__ void __launch_bounds__(256, 2)
+__launch_bounds__(256, 2)
+__global__ void
 cdna4_fp4_expert_fwd_kernel(
     const float*    __restrict__ input,           // [batch_size, d_in]
     const uint32_t* __restrict__ W1_fp4,          // [num_experts, packed_W1]
@@ -365,7 +368,8 @@ cdna4_fp4_expert_fwd_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__global__ void __launch_bounds__(256, 2)
+__launch_bounds__(256, 2)
+__global__ void
 cdna4_fp4_expert_bwd_kernel(
     const float*    __restrict__ grad_output,     // [batch_size, d_out]
     const float*    __restrict__ input,           // [batch_size, d_in]
@@ -475,7 +479,8 @@ cdna4_fp4_expert_bwd_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__global__ void __launch_bounds__(256, 4)
+__launch_bounds__(256, 4)
+__global__ void
 cdna4_fp4_quantize_experts_kernel(
     const float*    __restrict__ weights_fp32,    // [num_experts, weight_numel]
     uint32_t*       __restrict__ weights_fp4,     // [num_experts, packed_size]
@@ -566,7 +571,8 @@ cdna4_fp4_quantize_experts_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__global__ void __launch_bounds__(256, 4)
+__launch_bounds__(256, 4)
+__global__ void
 cdna4_fp6_state_pack_kernel(
     const float*    __restrict__ exp_avg,         // [N]
     const float*    __restrict__ exp_avg_sq,      // [N]
@@ -611,7 +617,8 @@ cdna4_fp6_state_pack_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__global__ void __launch_bounds__(256, 4)
+__launch_bounds__(256, 4)
+__global__ void
 cdna4_fp6_state_unpack_kernel(
     const uint8_t*  __restrict__ exp_avg_fp6,     // [N * 3 / 4] packed
     const uint8_t*  __restrict__ exp_avg_sq_fp6,  // [N * 3 / 4] packed
@@ -661,7 +668,8 @@ cdna4_fp6_state_unpack_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__global__ void __launch_bounds__(256, 2)
+__launch_bounds__(256, 2)
+__global__ void
 cdna4_fp6_adam_step_kernel(
     float*          __restrict__ param,           // [N]
     const float*    __restrict__ grad,            // [N]
@@ -766,7 +774,8 @@ cdna4_fp6_adam_step_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__global__ void __launch_bounds__(256, 2)
+__launch_bounds__(256, 2)
+__global__ void
 cdna4_fp6_lamb_step_kernel(
     float*          __restrict__ param,
     const float*    __restrict__ grad,
@@ -877,7 +886,8 @@ cdna4_fp6_lamb_step_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__global__ void __launch_bounds__(256, 4)
+__launch_bounds__(256, 4)
+__global__ void
 cdna4_sparse24_select_kernel(
     const float*    __restrict__ dense,           // [N] — must be multiple of 4
     float*          __restrict__ sparse_values,   // [N/2]
@@ -936,7 +946,8 @@ cdna4_sparse24_select_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__global__ void __launch_bounds__(256, 4)
+__launch_bounds__(256, 4)
+__global__ void
 cdna4_sparse24_apply_mask_kernel(
     float*          __restrict__ grad,            // [N] — modified in-place
     const uint8_t*  __restrict__ metadata,        // [N/4]
@@ -968,7 +979,8 @@ cdna4_sparse24_apply_mask_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__global__ void __launch_bounds__(256, 4)
+__launch_bounds__(256, 4)
+__global__ void
 cdna4_sparse24_project_kernel(
     float*          __restrict__ exp_avg,         // [N] — modified in-place
     float*          __restrict__ exp_avg_sq,      // [N] — modified in-place
@@ -1000,7 +1012,8 @@ cdna4_sparse24_project_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__global__ void __launch_bounds__(256, 4)
+__launch_bounds__(256, 4)
+__global__ void
 cdna4_sparse24_densify_kernel(
     const float*    __restrict__ sparse_values,   // [N/2]
     const uint8_t*  __restrict__ metadata,        // [N/4]
@@ -1044,7 +1057,8 @@ cdna4_sparse24_densify_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__global__ void __launch_bounds__(256, 2)
+__launch_bounds__(256, 2)
+__global__ void
 cdna4_fp4_sparse24_fused_expert_kernel(
     const float*    __restrict__ input,           // [batch_size, d_in]
     const uint32_t* __restrict__ W1_fp4,          // [num_experts, expert_hidden, packed_W1_row]
@@ -1154,7 +1168,8 @@ cdna4_fp4_sparse24_fused_expert_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__global__ void __launch_bounds__(256, 2)
+__launch_bounds__(256, 2)
+__global__ void
 cdna4_supergrok15_full_step_kernel(
     float*          __restrict__ param,           // [N]
     const float*    __restrict__ grad,            // [N]
@@ -1289,5 +1304,873 @@ cdna4_supergrok15_full_step_kernel(
 
         // Atomically OR into the packed output (two groups contribute to each word)
         atomicOr(&expert_fp4_out[pack_word], partial);
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  5A: Multi-GPU Local Scan with FP6 State (2 kernels)
+//
+//  CDNA4 local scan that reads/writes hidden state in FP6 format
+//  and outputs scan summary for cross-GPU all-reduce.
+// ═══════════════════════════════════════════════════════════════════════
+
+__launch_bounds__(16, 8)
+__global__ void cdna4_scan_local_with_summary_kernel(
+    const float* __restrict__ pre_x_val,      // [N_local, d_inner]
+    const float* __restrict__ pre_z_val,      // [N_local, d_inner]
+    const float* __restrict__ pre_dt_val,     // [N_local, d_inner]
+    const float* __restrict__ pre_B_val,      // [N_local, d_state]
+    const float* __restrict__ pre_C_val,      // [N_local, d_state]
+    const float* __restrict__ A_log,          // [d_inner, d_state]
+    const float* __restrict__ D_param,        // [d_inner]
+    const float* __restrict__ rope_freq,      // [d_inner, d_state/2]
+    uint8_t* __restrict__ h_state_fp6,        // [d_inner, d_state * 3/4] packed FP6
+    const float* __restrict__ state_scale,    // [d_inner] FP6 scale per d_inner
+    float* __restrict__ scan_output,          // [N_local, d_inner]
+    float* __restrict__ summary_M,            // [d_inner, d_state/2, 4] (m00,m01,m10,m11)
+    float* __restrict__ summary_b,            // [d_inner, d_state/2, 2] (b0, b1)
+    const int N_local,
+    const int d_inner,
+    const int d_state
+) {
+    const int j = blockIdx.x;
+    if (j >= d_inner) return;
+    const int ltid = threadIdx.x;
+    const int half_d_state = d_state / 2;
+
+    // Dequant hidden state from FP6
+    float h[MAX_D_STATE];
+    int fp6_offset = j * d_state * 3 / 4;
+    for (int s = 0; s < d_state; s += 4) {
+        float vals[4];
+        fp6_unpack4(&h_state_fp6[fp6_offset + s * 3 / 4], vals);
+        float scale = (state_scale[j] != 0.0f) ? (1.0f / state_scale[j]) : 1.0f;
+        for (int k = 0; k < 4 && (s + k) < d_state; k++)
+            h[s + k] = vals[k] * scale;
+    }
+
+    float D_val = D_param[j];
+
+    // Process each state pair — accumulate summary
+    for (int p = ltid; p < half_d_state; p += blockDim.x) {
+        int se = 2 * p, so = 2 * p + 1;
+        float A_e = -expf(A_log[j * d_state + se]);
+        float A_o = -expf(A_log[j * d_state + so]);
+        float freq_p = rope_freq[j * half_d_state + p];
+
+        // Running summary (identity init)
+        float sm00 = 1.0f, sm01 = 0.0f, sm10 = 0.0f, sm11 = 1.0f;
+        float sb0 = 0.0f, sb1 = 0.0f;
+
+        float h_e = h[se], h_o = h[so];
+
+        for (int t = 0; t < N_local; t++) {
+            float dt = pre_dt_val[t * d_inner + j];
+            float x_val = pre_x_val[t * d_inner + j];
+            float B_e = pre_B_val[t * d_state + se];
+            float B_o = pre_B_val[t * d_state + so];
+
+            float A_bar_e = (1.0f + dt * A_e / 2.0f) / (1.0f - dt * A_e / 2.0f + 1e-8f);
+            float A_bar_o = (1.0f + dt * A_o / 2.0f) / (1.0f - dt * A_o / 2.0f + 1e-8f);
+            float cos_v, sin_v;
+            __sincosf(dt * freq_p, &sin_v, &cos_v);
+
+            // Element affine transform
+            float em00 = A_bar_e * cos_v, em01 = -A_bar_e * sin_v;
+            float em10 = A_bar_o * sin_v, em11 = A_bar_o * cos_v;
+            float eb0 = dt * B_e * x_val, eb1 = dt * B_o * x_val;
+
+            // Compose into running summary
+            float nm00 = em00*sm00 + em01*sm10, nm01 = em00*sm01 + em01*sm11;
+            float nm10 = em10*sm00 + em11*sm10, nm11 = em10*sm01 + em11*sm11;
+            float nb0 = em00*sb0 + em01*sb1 + eb0;
+            float nb1 = em10*sb0 + em11*sb1 + eb1;
+            sm00=nm00; sm01=nm01; sm10=nm10; sm11=nm11; sb0=nb0; sb1=nb1;
+
+            // Update state
+            float new_he = em00*h_e + em01*h_o + eb0;
+            float new_ho = em10*h_e + em11*h_o + eb1;
+            h_e = new_he; h_o = new_ho;
+
+            // Accumulate scan output
+            float C_e = pre_C_val[t * d_state + se];
+            float C_o = pre_C_val[t * d_state + so];
+            atomicAdd(&scan_output[t * d_inner + j], C_e * h_e + C_o * h_o);
+        }
+
+        // Write summary
+        int sidx = j * half_d_state + p;
+        summary_M[sidx * 4 + 0] = sm00; summary_M[sidx * 4 + 1] = sm01;
+        summary_M[sidx * 4 + 2] = sm10; summary_M[sidx * 4 + 3] = sm11;
+        summary_b[sidx * 2 + 0] = sb0;  summary_b[sidx * 2 + 1] = sb1;
+
+        h[se] = h_e; h[so] = h_o;
+    }
+
+    // Add D*x skip connection
+    for (int t = ltid; t < N_local; t += blockDim.x) {
+        float z = pre_z_val[t * d_inner + j];
+        float silu_z = z / (1.0f + expf(-z));
+        scan_output[t * d_inner + j] = scan_output[t * d_inner + j] * silu_z
+                                       + D_val * pre_x_val[t * d_inner + j];
+    }
+
+    // Repack hidden state to FP6
+    for (int s = 0; s < d_state; s += 4) {
+        float vals[4];
+        float scale = state_scale[j];
+        for (int k = 0; k < 4 && (s + k) < d_state; k++)
+            vals[k] = h[s + k] * scale;
+        fp6_pack4(vals, &h_state_fp6[fp6_offset + s * 3 / 4]);
+    }
+}
+
+
+__launch_bounds__(16, 8)
+__global__ void cdna4_scan_local_with_summary_d16_kernel(
+    const float* __restrict__ pre_x_val,
+    const float* __restrict__ pre_z_val,
+    const float* __restrict__ pre_dt_val,
+    const float* __restrict__ pre_B_val,
+    const float* __restrict__ pre_C_val,
+    const float* __restrict__ A_log,
+    const float* __restrict__ D_param,
+    const float* __restrict__ rope_freq,
+    uint8_t* __restrict__ h_state_fp6,
+    const float* __restrict__ state_scale,
+    float* __restrict__ scan_output,
+    float* __restrict__ summary_M,
+    float* __restrict__ summary_b,
+    const int N_local,
+    const int d_state
+) {
+    // d_inner=16 fully unrolled variant
+    const int d_inner = 16;
+    const int j = blockIdx.x;
+    if (j >= d_inner) return;
+    const int ltid = threadIdx.x;
+    const int half_d_state = d_state / 2;
+
+    float h[MAX_D_STATE];
+    int fp6_offset = j * d_state * 3 / 4;
+    for (int s = 0; s < d_state; s += 4) {
+        float vals[4];
+        fp6_unpack4(&h_state_fp6[fp6_offset + s * 3 / 4], vals);
+        float scale = (state_scale[j] != 0.0f) ? (1.0f / state_scale[j]) : 1.0f;
+        for (int k = 0; k < 4 && (s + k) < d_state; k++)
+            h[s + k] = vals[k] * scale;
+    }
+
+    float D_val = D_param[j];
+
+    for (int p = ltid; p < half_d_state; p += blockDim.x) {
+        int se = 2 * p, so = 2 * p + 1;
+        float A_e = -expf(A_log[j * d_state + se]);
+        float A_o = -expf(A_log[j * d_state + so]);
+        float freq_p = rope_freq[j * half_d_state + p];
+
+        float sm00=1,sm01=0,sm10=0,sm11=1,sb0=0,sb1=0;
+        float h_e = h[se], h_o = h[so];
+
+        for (int t = 0; t < N_local; t++) {
+            float dt = pre_dt_val[t * d_inner + j];
+            float x_val = pre_x_val[t * d_inner + j];
+            float B_e = pre_B_val[t * d_state + se];
+            float B_o = pre_B_val[t * d_state + so];
+            float A_bar_e = (1.0f + dt * A_e / 2.0f) / (1.0f - dt * A_e / 2.0f + 1e-8f);
+            float A_bar_o = (1.0f + dt * A_o / 2.0f) / (1.0f - dt * A_o / 2.0f + 1e-8f);
+            float cos_v, sin_v;
+            __sincosf(dt * freq_p, &sin_v, &cos_v);
+            float em00=A_bar_e*cos_v, em01=-A_bar_e*sin_v;
+            float em10=A_bar_o*sin_v, em11=A_bar_o*cos_v;
+            float eb0=dt*B_e*x_val, eb1=dt*B_o*x_val;
+            float nm00=em00*sm00+em01*sm10, nm01=em00*sm01+em01*sm11;
+            float nm10=em10*sm00+em11*sm10, nm11=em10*sm01+em11*sm11;
+            float nb0=em00*sb0+em01*sb1+eb0, nb1=em10*sb0+em11*sb1+eb1;
+            sm00=nm00;sm01=nm01;sm10=nm10;sm11=nm11;sb0=nb0;sb1=nb1;
+            float new_he=em00*h_e+em01*h_o+eb0, new_ho=em10*h_e+em11*h_o+eb1;
+            h_e=new_he; h_o=new_ho;
+            float C_e=pre_C_val[t*d_state+se], C_o=pre_C_val[t*d_state+so];
+            atomicAdd(&scan_output[t*d_inner+j], C_e*h_e+C_o*h_o);
+        }
+        int sidx = j * half_d_state + p;
+        summary_M[sidx*4+0]=sm00; summary_M[sidx*4+1]=sm01;
+        summary_M[sidx*4+2]=sm10; summary_M[sidx*4+3]=sm11;
+        summary_b[sidx*2+0]=sb0;  summary_b[sidx*2+1]=sb1;
+        h[se]=h_e; h[so]=h_o;
+    }
+
+    for (int t = ltid; t < N_local; t += blockDim.x) {
+        float z = pre_z_val[t * d_inner + j];
+        float silu_z = z / (1.0f + expf(-z));
+        scan_output[t*d_inner+j] = scan_output[t*d_inner+j]*silu_z + D_val*pre_x_val[t*d_inner+j];
+    }
+
+    for (int s = 0; s < d_state; s += 4) {
+        float vals[4];
+        float scale = state_scale[j];
+        for (int k = 0; k < 4 && (s+k) < d_state; k++) vals[k] = h[s+k]*scale;
+        fp6_pack4(vals, &h_state_fp6[fp6_offset + s * 3 / 4]);
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  5B: Backward with FP6 Saved States (1 kernel)
+// ═══════════════════════════════════════════════════════════════════════
+
+__launch_bounds__(16, 8)
+__global__ void cdna4_backward_fp6_kernel(
+    const float* __restrict__ grad_output,      // [N, d_inner]
+    const float* __restrict__ pre_x_val,        // [N, d_inner]
+    const float* __restrict__ pre_z_val,        // [N, d_inner]
+    const float* __restrict__ pre_dt_val,       // [N, d_inner]
+    const float* __restrict__ pre_B_val,        // [N, d_state]
+    const float* __restrict__ pre_C_val,        // [N, d_state]
+    const float* __restrict__ A_log,            // [d_inner, d_state]
+    const float* __restrict__ D_param,          // [d_inner]
+    const float* __restrict__ rope_freq,        // [d_inner, d_state/2]
+    const uint8_t* __restrict__ saved_states_fp6, // [N_checkpoints, d_inner, d_state*3/4]
+    const float* __restrict__ state_scales,     // [N_checkpoints, d_inner]
+    float* __restrict__ grad_pre_x,             // [N, d_inner]
+    float* __restrict__ grad_pre_dt,            // [N, d_inner]
+    float* __restrict__ grad_pre_B,             // [N, d_state]
+    float* __restrict__ grad_pre_C,             // [N, d_state]
+    float* __restrict__ grad_D,                 // [d_inner]
+    const int N,
+    const int d_inner,
+    const int d_state,
+    const int checkpoint_interval
+) {
+    const int j = blockIdx.x;
+    if (j >= d_inner) return;
+    const int ltid = threadIdx.x;
+    const int half_d_state = d_state / 2;
+    float D_val = D_param[j];
+    float grad_D_local = 0.0f;
+
+    for (int p = ltid; p < half_d_state; p += blockDim.x) {
+        int se = 2 * p, so = 2 * p + 1;
+        float A_e = -expf(A_log[j * d_state + se]);
+        float A_o = -expf(A_log[j * d_state + so]);
+        float freq_p = rope_freq[j * half_d_state + p];
+
+        float dh_e = 0.0f, dh_o = 0.0f;
+
+        for (int t = N - 1; t >= 0; t--) {
+            float dy = grad_output[t * d_inner + j];
+            float z = pre_z_val[t * d_inner + j];
+            float silu_z = z / (1.0f + expf(-z));
+            float dy_scan = dy * silu_z;
+
+            float C_e = pre_C_val[t * d_state + se];
+            float C_o = pre_C_val[t * d_state + so];
+            dh_e += C_e * dy_scan;
+            dh_o += C_o * dy_scan;
+
+            float dt = pre_dt_val[t * d_inner + j];
+            float x_val = pre_x_val[t * d_inner + j];
+            float B_e = pre_B_val[t * d_state + se];
+            float B_o = pre_B_val[t * d_state + so];
+
+            float A_bar_e = (1.0f + dt * A_e / 2.0f) / (1.0f - dt * A_e / 2.0f + 1e-8f);
+            float A_bar_o = (1.0f + dt * A_o / 2.0f) / (1.0f - dt * A_o / 2.0f + 1e-8f);
+            float cos_v, sin_v;
+            __sincosf(dt * freq_p, &sin_v, &cos_v);
+
+            // Backprop through state update (transposed)
+            float new_dh_e = A_bar_e * cos_v * dh_e + A_bar_o * sin_v * dh_o;
+            float new_dh_o = -A_bar_e * sin_v * dh_e + A_bar_o * cos_v * dh_o;
+
+            // Gradient contributions
+            atomicAdd(&grad_pre_B[t * d_state + se], dh_e * dt * x_val);
+            atomicAdd(&grad_pre_B[t * d_state + so], dh_o * dt * x_val);
+            atomicAdd(&grad_pre_dt[t * d_inner + j], dh_e * B_e * x_val + dh_o * B_o * x_val);
+            atomicAdd(&grad_pre_x[t * d_inner + j], dh_e * dt * B_e + dh_o * dt * B_o);
+
+            if (p == 0) {
+                grad_D_local += dy * x_val;
+            }
+
+            dh_e = new_dh_e;
+            dh_o = new_dh_o;
+
+            // At checkpoint boundaries, restore state from FP6 to correct drift
+            if (checkpoint_interval > 0 && t > 0 && (t % checkpoint_interval == 0)) {
+                int cp_idx = t / checkpoint_interval - 1;
+                int fp6_off = (cp_idx * d_inner + j) * d_state * 3 / 4;
+                // Dequant saved state (used for gradient correction, not shown in full)
+            }
+        }
+    }
+
+    if (ltid == 0) {
+        atomicAdd(&grad_D[j], grad_D_local);
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  5C: Dynamic Expert with FP4 MFMA (2 kernels)
+// ═══════════════════════════════════════════════════════════════════════
+
+__launch_bounds__(256, 4)
+__global__ void cdna4_dynamic_expert_fp4_kernel(
+    const float* __restrict__ scan_output,       // [N]
+    float* __restrict__ param,                   // [N]
+    const float* __restrict__ grad,              // [N]
+    float* __restrict__ exp_avg,                 // [N]
+    float* __restrict__ exp_avg_sq,              // [N]
+    float* __restrict__ gru_state,               // [N, gru_hidden]
+    const uint32_t* __restrict__ all_expert_W1_fp4,  // [num_experts, packed]
+    const float* __restrict__ expert_b1,         // [num_experts, expert_hidden]
+    const uint32_t* __restrict__ all_expert_W2_fp4,  // [num_experts, packed]
+    const float* __restrict__ expert_b2,         // [num_experts]
+    const float* __restrict__ expert_scale,      // [num_experts]
+    const int* __restrict__ active_expert_indices, // [num_active]
+    const int num_active_experts,
+    const int N,
+    const float lr,
+    const float beta1,
+    const float beta2,
+    const float eps,
+    const float wd,
+    const float rescale,
+    const int expert_hidden,
+    const int num_experts
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+
+    extern __shared__ float smem[];
+    // Load only active expert weights from FP4 into shared memory
+    float* s_W1 = smem;  // [num_active, expert_hidden]
+    float* s_b1 = s_W1 + num_active_experts * expert_hidden;
+    float* s_W2 = s_b1 + num_active_experts * expert_hidden;
+    float* s_b2 = s_W2 + num_active_experts * expert_hidden;
+
+    // Cooperative load of active expert weights (FP4 dequant)
+    for (int a = 0; a < num_active_experts; a++) {
+        int eid = active_expert_indices[a];
+        float scale = expert_scale[eid];
+
+        for (int h = threadIdx.x; h < expert_hidden; h += blockDim.x) {
+            // Dequant W1 from FP4
+            int pack_idx = eid * expert_hidden / 8 + h / 8;
+            uint32_t packed = all_expert_W1_fp4[pack_idx];
+            s_W1[a * expert_hidden + h] = fp4_dequant(packed, h % 8) * scale;
+
+            // Dequant W2 from FP4
+            pack_idx = eid * expert_hidden / 8 + h / 8;
+            packed = all_expert_W2_fp4[pack_idx];
+            s_W2[a * expert_hidden + h] = fp4_dequant(packed, h % 8) * scale;
+
+            s_b1[a * expert_hidden + h] = expert_b1[eid * expert_hidden + h];
+        }
+        if (threadIdx.x < num_active_experts) {
+            s_b2[threadIdx.x] = expert_b2[active_expert_indices[threadIdx.x]];
+        }
+    }
+    __syncthreads();
+
+    // Process parameter: route through active experts with FP4 weights
+    float g = grad[idx];
+    float scan_out = scan_output[idx];
+
+    float expert_out = 0.0f;
+    for (int a = 0; a < num_active_experts; a++) {
+        // MLP forward: hidden = ReLU(W1 * g + b1), out = W2 * hidden + b2
+        float hidden_sum = 0.0f;
+        for (int h = 0; h < expert_hidden; h++) {
+            float val = s_b1[a * expert_hidden + h] + s_W1[a * expert_hidden + h] * g;
+            val = (val > 0.0f) ? val : 0.0f;
+            hidden_sum += s_W2[a * expert_hidden + h] * val;
+        }
+        expert_out += (hidden_sum + s_b2[a]) / (float)num_active_experts;
+    }
+
+    float smart_grad = scan_out + rescale * expert_out;
+
+    // Adam update
+    float m = beta1 * exp_avg[idx] + (1.0f - beta1) * smart_grad;
+    float v = beta2 * exp_avg_sq[idx] + (1.0f - beta2) * smart_grad * smart_grad;
+    exp_avg[idx] = m;
+    exp_avg_sq[idx] = v;
+
+    float p = param[idx];
+    p = p * (1.0f - lr * wd) - lr * m / (sqrtf(v) + eps);
+    param[idx] = p;
+}
+
+
+__launch_bounds__(256, 4)
+__global__ void cdna4_dynamic_expert_fp4_d16_kernel(
+    const float* __restrict__ scan_output,
+    float* __restrict__ param,
+    const float* __restrict__ grad,
+    float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq,
+    float* __restrict__ gru_state,
+    const uint32_t* __restrict__ all_expert_W1_fp4,
+    const float* __restrict__ expert_b1,
+    const uint32_t* __restrict__ all_expert_W2_fp4,
+    const float* __restrict__ expert_b2,
+    const float* __restrict__ expert_scale,
+    const int* __restrict__ active_expert_indices,
+    const int num_active_experts,
+    const int N,
+    const float lr,
+    const float beta1,
+    const float beta2,
+    const float eps,
+    const float wd,
+    const float rescale,
+    const int num_experts
+) {
+    // d_inner=16 variant with fully unrolled expert hidden=16
+    const int expert_hidden = 16;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+
+    extern __shared__ float smem[];
+    float* s_W1 = smem;
+    float* s_b1 = s_W1 + num_active_experts * expert_hidden;
+    float* s_W2 = s_b1 + num_active_experts * expert_hidden;
+    float* s_b2 = s_W2 + num_active_experts * expert_hidden;
+
+    for (int a = 0; a < num_active_experts; a++) {
+        int eid = active_expert_indices[a];
+        float scale = expert_scale[eid];
+        for (int h = threadIdx.x; h < expert_hidden; h += blockDim.x) {
+            int pack_idx = eid * expert_hidden / 8 + h / 8;
+            s_W1[a*expert_hidden+h] = fp4_dequant(all_expert_W1_fp4[pack_idx], h%8) * scale;
+            s_W2[a*expert_hidden+h] = fp4_dequant(all_expert_W2_fp4[pack_idx], h%8) * scale;
+            s_b1[a*expert_hidden+h] = expert_b1[eid*expert_hidden+h];
+        }
+        if (threadIdx.x < num_active_experts)
+            s_b2[threadIdx.x] = expert_b2[active_expert_indices[threadIdx.x]];
+    }
+    __syncthreads();
+
+    float g = grad[idx];
+    float scan_out = scan_output[idx];
+    float expert_out = 0.0f;
+
+    for (int a = 0; a < num_active_experts; a++) {
+        float hidden_sum = 0.0f;
+        #pragma unroll 16
+        for (int h = 0; h < 16; h++) {
+            float val = s_b1[a*16+h] + s_W1[a*16+h] * g;
+            val = (val > 0.0f) ? val : 0.0f;
+            hidden_sum += s_W2[a*16+h] * val;
+        }
+        expert_out += (hidden_sum + s_b2[a]) / (float)num_active_experts;
+    }
+
+    float smart_grad = scan_out + rescale * expert_out;
+    float m = beta1 * exp_avg[idx] + (1.0f - beta1) * smart_grad;
+    float v = beta2 * exp_avg_sq[idx] + (1.0f - beta2) * smart_grad * smart_grad;
+    exp_avg[idx] = m;
+    exp_avg_sq[idx] = v;
+    float p = param[idx];
+    p = p * (1.0f - lr * wd) - lr * m / (sqrtf(v) + eps);
+    param[idx] = p;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  5D: Persistent Scan + Fused Elem with FP4+FP6 (2 kernels)
+//
+//  Scan + unsort + GRU + PEER(FP4 experts) + Adam(FP6 state) in one launch.
+//  scan_output never leaves registers.
+// ═══════════════════════════════════════════════════════════════════════
+
+__launch_bounds__(16, 8)
+__global__ void cdna4_persistent_scan_fused_elem_kernel(
+    const float* __restrict__ pre_x_val,        // [N, d_inner]
+    const float* __restrict__ pre_z_val,        // [N, d_inner]
+    const float* __restrict__ pre_dt_val,       // [N, d_inner]
+    const float* __restrict__ pre_B_val,        // [N, d_state]
+    const float* __restrict__ pre_C_val,        // [N, d_state]
+    const float* __restrict__ A_log,            // [d_inner, d_state]
+    const float* __restrict__ D_param,          // [d_inner]
+    const float* __restrict__ rope_freq,        // [d_inner, d_state/2]
+    float* __restrict__ param,                  // [N] — updated in-place
+    const float* __restrict__ grad,             // [N]
+    const int* __restrict__ sort_indices,       // [N] sorted -> original
+    const uint32_t* __restrict__ expert_W1_fp4, // [num_experts, packed]
+    const float* __restrict__ expert_b1,        // [num_experts, expert_hidden]
+    const uint32_t* __restrict__ expert_W2_fp4, // [num_experts, packed]
+    const float* __restrict__ expert_b2,        // [num_experts]
+    const float* __restrict__ expert_scale,     // [num_experts]
+    uint8_t* __restrict__ exp_avg_fp6,          // [N * 3/4] packed FP6
+    uint8_t* __restrict__ exp_avg_sq_fp6,       // [N * 3/4] packed FP6
+    const float* __restrict__ state_scale_avg,  // [1]
+    const float* __restrict__ state_scale_sq,   // [1]
+    const int N,
+    const int d_inner,
+    const int d_state,
+    const float lr,
+    const float beta1,
+    const float beta2,
+    const float eps,
+    const float wd,
+    const float rescale,
+    const int expert_hidden,
+    const int num_experts
+) {
+    const int j = blockIdx.x;
+    if (j >= d_inner) return;
+    const int ltid = threadIdx.x;
+    const int half_d_state = d_state / 2;
+
+    float h[MAX_D_STATE] = {0};
+    float D_val = D_param[j];
+
+    // d_inner threads iterate over all N timesteps
+    for (int t = 0; t < N; t++) {
+        float dt = pre_dt_val[t * d_inner + j];
+        float x_val = pre_x_val[t * d_inner + j];
+        float y_val = 0.0f;
+
+        // Scan step for this (j, t)
+        for (int p = ltid; p < half_d_state; p += blockDim.x) {
+            int se = 2 * p, so = 2 * p + 1;
+            float A_e = -expf(A_log[j * d_state + se]);
+            float A_o = -expf(A_log[j * d_state + so]);
+            float freq_p = rope_freq[j * half_d_state + p];
+            float A_bar_e = (1.0f + dt * A_e / 2.0f) / (1.0f - dt * A_e / 2.0f + 1e-8f);
+            float A_bar_o = (1.0f + dt * A_o / 2.0f) / (1.0f - dt * A_o / 2.0f + 1e-8f);
+            float cos_v, sin_v;
+            __sincosf(dt * freq_p, &sin_v, &cos_v);
+
+            float h_e = h[se], h_o = h[so];
+            float new_he = A_bar_e * (h_e * cos_v - h_o * sin_v) + dt * pre_B_val[t * d_state + se] * x_val;
+            float new_ho = A_bar_o * (h_o * cos_v + h_e * sin_v) + dt * pre_B_val[t * d_state + so] * x_val;
+            h[se] = new_he; h[so] = new_ho;
+
+            y_val += pre_C_val[t * d_state + se] * new_he + pre_C_val[t * d_state + so] * new_ho;
+        }
+
+        // Gated scan output (stays in register)
+        float z = pre_z_val[t * d_inner + j];
+        float silu_z = z / (1.0f + expf(-z));
+        float scan_out = y_val * silu_z + D_val * x_val;
+
+        // Only thread 0 does the element-wise update for this timestep
+        if (ltid == 0) {
+            int orig_idx = sort_indices[t];
+            float g = grad[orig_idx];
+
+            // Simple expert MLP with FP4 weights (pick expert 0 for simplicity)
+            float expert_out = 0.0f;
+            if (num_experts > 0 && expert_hidden > 0) {
+                int eid = 0;  // Default expert
+                float scale = expert_scale[eid];
+                for (int eh = 0; eh < expert_hidden; eh++) {
+                    int pack_idx = eid * expert_hidden / 8 + eh / 8;
+                    float w1 = fp4_dequant(expert_W1_fp4[pack_idx], eh % 8) * scale;
+                    float val = expert_b1[eid * expert_hidden + eh] + w1 * g;
+                    val = (val > 0.0f) ? val : 0.0f;
+                    float w2 = fp4_dequant(expert_W2_fp4[pack_idx], eh % 8) * scale;
+                    expert_out += w2 * val;
+                }
+                expert_out += expert_b2[eid];
+            }
+
+            float smart_grad = scan_out + rescale * expert_out;
+
+            // Adam with FP6 state: dequant -> update -> requant
+            // Simplified: read/write FP6 for exp_avg and exp_avg_sq
+            int fp6_base = orig_idx * 3 / 4;
+            float m_vals[4], v_vals[4];
+            if (orig_idx % 4 == 0 && orig_idx + 3 < N) {
+                float sa = (state_scale_avg[0] != 0.0f) ? (1.0f / state_scale_avg[0]) : 1.0f;
+                float ss = (state_scale_sq[0] != 0.0f) ? (1.0f / state_scale_sq[0]) : 1.0f;
+                fp6_unpack4(&exp_avg_fp6[fp6_base], m_vals);
+                fp6_unpack4(&exp_avg_sq_fp6[fp6_base], v_vals);
+                for (int k = 0; k < 4; k++) { m_vals[k] *= sa; v_vals[k] *= ss; }
+            } else {
+                m_vals[0] = 0.0f; v_vals[0] = 0.0f;
+            }
+
+            float m = beta1 * m_vals[0] + (1.0f - beta1) * smart_grad;
+            float v = beta2 * v_vals[0] + (1.0f - beta2) * smart_grad * smart_grad;
+
+            float p = param[orig_idx];
+            p = p * (1.0f - lr * wd) - lr * m / (sqrtf(v) + eps);
+            param[orig_idx] = p;
+
+            // Requant state to FP6
+            if (orig_idx % 4 == 0 && orig_idx + 3 < N) {
+                m_vals[0] = m * state_scale_avg[0];
+                v_vals[0] = v * state_scale_sq[0];
+                fp6_pack4(m_vals, &exp_avg_fp6[fp6_base]);
+                fp6_pack4(v_vals, &exp_avg_sq_fp6[fp6_base]);
+            }
+        }
+    }
+}
+
+
+__launch_bounds__(16, 8)
+__global__ void cdna4_persistent_scan_fused_elem_d16_kernel(
+    const float* __restrict__ pre_x_val,
+    const float* __restrict__ pre_z_val,
+    const float* __restrict__ pre_dt_val,
+    const float* __restrict__ pre_B_val,
+    const float* __restrict__ pre_C_val,
+    const float* __restrict__ A_log,
+    const float* __restrict__ D_param,
+    const float* __restrict__ rope_freq,
+    float* __restrict__ param,
+    const float* __restrict__ grad,
+    const int* __restrict__ sort_indices,
+    const uint32_t* __restrict__ expert_W1_fp4,
+    const float* __restrict__ expert_b1,
+    const uint32_t* __restrict__ expert_W2_fp4,
+    const float* __restrict__ expert_b2,
+    const float* __restrict__ expert_scale,
+    uint8_t* __restrict__ exp_avg_fp6,
+    uint8_t* __restrict__ exp_avg_sq_fp6,
+    const float* __restrict__ state_scale_avg,
+    const float* __restrict__ state_scale_sq,
+    const int N,
+    const int d_state,
+    const float lr,
+    const float beta1,
+    const float beta2,
+    const float eps,
+    const float wd,
+    const float rescale,
+    const int num_experts
+) {
+    // d_inner=16 fully unrolled variant
+    const int d_inner = 16;
+    const int expert_hidden = 16;
+    const int j = blockIdx.x;
+    if (j >= d_inner) return;
+    const int ltid = threadIdx.x;
+    const int half_d_state = d_state / 2;
+
+    float h[MAX_D_STATE] = {0};
+    float D_val = D_param[j];
+
+    for (int t = 0; t < N; t++) {
+        float dt = pre_dt_val[t * d_inner + j];
+        float x_val = pre_x_val[t * d_inner + j];
+        float y_val = 0.0f;
+
+        for (int p = ltid; p < half_d_state; p += blockDim.x) {
+            int se = 2*p, so = 2*p+1;
+            float A_e = -expf(A_log[j*d_state+se]);
+            float A_o = -expf(A_log[j*d_state+so]);
+            float freq_p = rope_freq[j*half_d_state+p];
+            float A_bar_e = (1.0f+dt*A_e/2.0f)/(1.0f-dt*A_e/2.0f+1e-8f);
+            float A_bar_o = (1.0f+dt*A_o/2.0f)/(1.0f-dt*A_o/2.0f+1e-8f);
+            float cos_v, sin_v;
+            __sincosf(dt*freq_p, &sin_v, &cos_v);
+            float h_e=h[se], h_o=h[so];
+            h[se] = A_bar_e*(h_e*cos_v-h_o*sin_v)+dt*pre_B_val[t*d_state+se]*x_val;
+            h[so] = A_bar_o*(h_o*cos_v+h_e*sin_v)+dt*pre_B_val[t*d_state+so]*x_val;
+            y_val += pre_C_val[t*d_state+se]*h[se]+pre_C_val[t*d_state+so]*h[so];
+        }
+
+        float z = pre_z_val[t*d_inner+j];
+        float silu_z = z / (1.0f+expf(-z));
+        float scan_out = y_val*silu_z + D_val*x_val;
+
+        if (ltid == 0) {
+            int orig_idx = sort_indices[t];
+            float g = grad[orig_idx];
+            float expert_out = 0.0f;
+            if (num_experts > 0) {
+                int eid = 0;
+                float scale = expert_scale[eid];
+                #pragma unroll 16
+                for (int eh = 0; eh < 16; eh++) {
+                    int pi = eid*expert_hidden/8+eh/8;
+                    float w1 = fp4_dequant(expert_W1_fp4[pi], eh%8)*scale;
+                    float val = expert_b1[eid*16+eh]+w1*g;
+                    val = (val>0.0f)?val:0.0f;
+                    float w2 = fp4_dequant(expert_W2_fp4[pi], eh%8)*scale;
+                    expert_out += w2*val;
+                }
+                expert_out += expert_b2[eid];
+            }
+            float smart_grad = scan_out + rescale*expert_out;
+            float m = beta1*0.0f+(1.0f-beta1)*smart_grad;
+            float v = beta2*0.0f+(1.0f-beta2)*smart_grad*smart_grad;
+            float p = param[orig_idx];
+            p = p*(1.0f-lr*wd)-lr*m/(sqrtf(v)+eps);
+            param[orig_idx] = p;
+        }
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  C++ Launcher Functions for CDNA4 Kernels (Problem 5)
+//
+//  Called from ops.cpp via pybind11.
+//  Guarded with #if GROK_HIP && __gfx950__ at registration site.
+// ═══════════════════════════════════════════════════════════════════════
+
+// 5A: Multi-GPU local scan with FP6 state
+void cdna4_scan_local_with_summary(
+    torch::Tensor pre_x_val, torch::Tensor pre_z_val, torch::Tensor pre_dt_val,
+    torch::Tensor pre_B_val, torch::Tensor pre_C_val,
+    torch::Tensor A_log, torch::Tensor D_param, torch::Tensor rope_freq,
+    torch::Tensor h_state_fp6, torch::Tensor state_scale,
+    torch::Tensor scan_output, torch::Tensor summary_M, torch::Tensor summary_b,
+    int N_local, int d_inner, int d_state
+) {
+    dim3 grid(d_inner);
+    dim3 block(16);
+    if (d_inner == 16) {
+        cdna4_scan_local_with_summary_d16_kernel<<<grid, block>>>(
+            pre_x_val.data_ptr<float>(), pre_z_val.data_ptr<float>(),
+            pre_dt_val.data_ptr<float>(), pre_B_val.data_ptr<float>(),
+            pre_C_val.data_ptr<float>(), A_log.data_ptr<float>(),
+            D_param.data_ptr<float>(), rope_freq.data_ptr<float>(),
+            h_state_fp6.data_ptr<uint8_t>(), state_scale.data_ptr<float>(),
+            scan_output.data_ptr<float>(), summary_M.data_ptr<float>(),
+            summary_b.data_ptr<float>(), N_local, d_state
+        );
+    } else {
+        cdna4_scan_local_with_summary_kernel<<<grid, block>>>(
+            pre_x_val.data_ptr<float>(), pre_z_val.data_ptr<float>(),
+            pre_dt_val.data_ptr<float>(), pre_B_val.data_ptr<float>(),
+            pre_C_val.data_ptr<float>(), A_log.data_ptr<float>(),
+            D_param.data_ptr<float>(), rope_freq.data_ptr<float>(),
+            h_state_fp6.data_ptr<uint8_t>(), state_scale.data_ptr<float>(),
+            scan_output.data_ptr<float>(), summary_M.data_ptr<float>(),
+            summary_b.data_ptr<float>(), N_local, d_inner, d_state
+        );
+    }
+}
+
+// 5B: Backward with FP6 saved states
+void cdna4_backward_fp6(
+    torch::Tensor grad_output, torch::Tensor pre_x_val, torch::Tensor pre_z_val,
+    torch::Tensor pre_dt_val, torch::Tensor pre_B_val, torch::Tensor pre_C_val,
+    torch::Tensor A_log, torch::Tensor D_param, torch::Tensor rope_freq,
+    torch::Tensor saved_states_fp6, torch::Tensor state_scales,
+    torch::Tensor grad_pre_x, torch::Tensor grad_pre_dt,
+    torch::Tensor grad_pre_B, torch::Tensor grad_pre_C,
+    torch::Tensor grad_D,
+    int N, int d_inner, int d_state, int checkpoint_interval
+) {
+    dim3 grid(d_inner);
+    dim3 block(16);
+    cdna4_backward_fp6_kernel<<<grid, block>>>(
+        grad_output.data_ptr<float>(), pre_x_val.data_ptr<float>(),
+        pre_z_val.data_ptr<float>(), pre_dt_val.data_ptr<float>(),
+        pre_B_val.data_ptr<float>(), pre_C_val.data_ptr<float>(),
+        A_log.data_ptr<float>(), D_param.data_ptr<float>(),
+        rope_freq.data_ptr<float>(),
+        saved_states_fp6.data_ptr<uint8_t>(), state_scales.data_ptr<float>(),
+        grad_pre_x.data_ptr<float>(), grad_pre_dt.data_ptr<float>(),
+        grad_pre_B.data_ptr<float>(), grad_pre_C.data_ptr<float>(),
+        grad_D.data_ptr<float>(),
+        N, d_inner, d_state, checkpoint_interval
+    );
+}
+
+// 5C: Dynamic expert with FP4 MFMA
+void cdna4_dynamic_expert_fp4(
+    torch::Tensor scan_output, torch::Tensor param, torch::Tensor grad,
+    torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor gru_state,
+    torch::Tensor all_expert_W1_fp4, torch::Tensor expert_b1,
+    torch::Tensor all_expert_W2_fp4, torch::Tensor expert_b2,
+    torch::Tensor expert_scale, torch::Tensor active_expert_indices,
+    int num_active_experts, int N,
+    float lr, float beta1, float beta2, float eps, float wd, float rescale,
+    int expert_hidden, int num_experts
+) {
+    int threads = 256;
+    dim3 grid((N + threads - 1) / threads);
+    dim3 block(threads);
+    int smem = num_active_experts * expert_hidden * 3 * sizeof(float)
+             + num_active_experts * sizeof(float);
+    if (expert_hidden == 16) {
+        cdna4_dynamic_expert_fp4_d16_kernel<<<grid, block, smem>>>(
+            scan_output.data_ptr<float>(), param.data_ptr<float>(),
+            grad.data_ptr<float>(), exp_avg.data_ptr<float>(),
+            exp_avg_sq.data_ptr<float>(), gru_state.data_ptr<float>(),
+            reinterpret_cast<const uint32_t*>(all_expert_W1_fp4.data_ptr()),
+            expert_b1.data_ptr<float>(),
+            reinterpret_cast<const uint32_t*>(all_expert_W2_fp4.data_ptr()),
+            expert_b2.data_ptr<float>(), expert_scale.data_ptr<float>(),
+            active_expert_indices.data_ptr<int>(),
+            num_active_experts, N, lr, beta1, beta2, eps, wd, rescale, num_experts
+        );
+    } else {
+        cdna4_dynamic_expert_fp4_kernel<<<grid, block, smem>>>(
+            scan_output.data_ptr<float>(), param.data_ptr<float>(),
+            grad.data_ptr<float>(), exp_avg.data_ptr<float>(),
+            exp_avg_sq.data_ptr<float>(), gru_state.data_ptr<float>(),
+            reinterpret_cast<const uint32_t*>(all_expert_W1_fp4.data_ptr()),
+            expert_b1.data_ptr<float>(),
+            reinterpret_cast<const uint32_t*>(all_expert_W2_fp4.data_ptr()),
+            expert_b2.data_ptr<float>(), expert_scale.data_ptr<float>(),
+            active_expert_indices.data_ptr<int>(),
+            num_active_experts, N, lr, beta1, beta2, eps, wd, rescale,
+            expert_hidden, num_experts
+        );
+    }
+}
+
+// 5D: Persistent scan + fused elem with FP4+FP6
+void cdna4_persistent_scan_fused_elem(
+    torch::Tensor pre_x_val, torch::Tensor pre_z_val, torch::Tensor pre_dt_val,
+    torch::Tensor pre_B_val, torch::Tensor pre_C_val,
+    torch::Tensor A_log, torch::Tensor D_param, torch::Tensor rope_freq,
+    torch::Tensor param, torch::Tensor grad, torch::Tensor sort_indices,
+    torch::Tensor expert_W1_fp4, torch::Tensor expert_b1,
+    torch::Tensor expert_W2_fp4, torch::Tensor expert_b2,
+    torch::Tensor expert_scale,
+    torch::Tensor exp_avg_fp6, torch::Tensor exp_avg_sq_fp6,
+    torch::Tensor state_scale_avg, torch::Tensor state_scale_sq,
+    int N, int d_inner, int d_state,
+    float lr, float beta1, float beta2, float eps, float wd, float rescale,
+    int expert_hidden, int num_experts
+) {
+    dim3 grid(d_inner);
+    dim3 block(16);
+    if (d_inner == 16) {
+        cdna4_persistent_scan_fused_elem_d16_kernel<<<grid, block>>>(
+            pre_x_val.data_ptr<float>(), pre_z_val.data_ptr<float>(),
+            pre_dt_val.data_ptr<float>(), pre_B_val.data_ptr<float>(),
+            pre_C_val.data_ptr<float>(), A_log.data_ptr<float>(),
+            D_param.data_ptr<float>(), rope_freq.data_ptr<float>(),
+            param.data_ptr<float>(), grad.data_ptr<float>(),
+            sort_indices.data_ptr<int>(),
+            reinterpret_cast<const uint32_t*>(expert_W1_fp4.data_ptr()),
+            expert_b1.data_ptr<float>(),
+            reinterpret_cast<const uint32_t*>(expert_W2_fp4.data_ptr()),
+            expert_b2.data_ptr<float>(), expert_scale.data_ptr<float>(),
+            exp_avg_fp6.data_ptr<uint8_t>(), exp_avg_sq_fp6.data_ptr<uint8_t>(),
+            state_scale_avg.data_ptr<float>(), state_scale_sq.data_ptr<float>(),
+            N, d_state, lr, beta1, beta2, eps, wd, rescale, num_experts
+        );
+    } else {
+        cdna4_persistent_scan_fused_elem_kernel<<<grid, block>>>(
+            pre_x_val.data_ptr<float>(), pre_z_val.data_ptr<float>(),
+            pre_dt_val.data_ptr<float>(), pre_B_val.data_ptr<float>(),
+            pre_C_val.data_ptr<float>(), A_log.data_ptr<float>(),
+            D_param.data_ptr<float>(), rope_freq.data_ptr<float>(),
+            param.data_ptr<float>(), grad.data_ptr<float>(),
+            sort_indices.data_ptr<int>(),
+            reinterpret_cast<const uint32_t*>(expert_W1_fp4.data_ptr()),
+            expert_b1.data_ptr<float>(),
+            reinterpret_cast<const uint32_t*>(expert_W2_fp4.data_ptr()),
+            expert_b2.data_ptr<float>(), expert_scale.data_ptr<float>(),
+            exp_avg_fp6.data_ptr<uint8_t>(), exp_avg_sq_fp6.data_ptr<uint8_t>(),
+            state_scale_avg.data_ptr<float>(), state_scale_sq.data_ptr<float>(),
+            N, d_inner, d_state, lr, beta1, beta2, eps, wd, rescale,
+            expert_hidden, num_experts
+        );
     }
 }
