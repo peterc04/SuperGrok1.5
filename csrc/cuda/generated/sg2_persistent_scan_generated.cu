@@ -12,6 +12,7 @@
 
 // ── sg2_persistent_scan_F_generic_kernel ──
 // State: FP32, HW: GENERIC, d16: False
+__launch_bounds__(16, 8)
 __global__ void sg2_persistent_scan_F_generic_kernel(
     const float* __restrict__ x_sorted,
     const float* __restrict__ in_proj_W,
@@ -118,6 +119,7 @@ __global__ void sg2_persistent_scan_F_generic_kernel(
 
 // ── sg2_persistent_scan_F_generic_d16_kernel ──
 // State: FP32, HW: GENERIC, d16: True
+__launch_bounds__(16, 8)
 __global__ void sg2_persistent_scan_F_generic_d16_kernel(
     const float* __restrict__ x_sorted,
     const float* __restrict__ in_proj_W,
@@ -225,6 +227,7 @@ __global__ void sg2_persistent_scan_F_generic_d16_kernel(
 
 // ── sg2_persistent_scan_F_sm80_kernel ──
 // State: FP32, HW: AMPERE, d16: False
+__launch_bounds__(16, 8)
 __global__ void sg2_persistent_scan_F_sm80_kernel(
     const float* __restrict__ x_sorted,
     const float* __restrict__ in_proj_W,
@@ -331,6 +334,7 @@ __global__ void sg2_persistent_scan_F_sm80_kernel(
 
 // ── sg2_persistent_scan_F_sm80_d16_kernel ──
 // State: FP32, HW: AMPERE, d16: True
+__launch_bounds__(16, 8)
 __global__ void sg2_persistent_scan_F_sm80_d16_kernel(
     const float* __restrict__ x_sorted,
     const float* __restrict__ in_proj_W,
@@ -438,6 +442,7 @@ __global__ void sg2_persistent_scan_F_sm80_d16_kernel(
 
 // ── sg2_persistent_scan_Q_generic_kernel ──
 // State: CONFIG4, HW: GENERIC, d16: False
+__launch_bounds__(16, 8)
 __global__ void sg2_persistent_scan_Q_generic_kernel(
     const float* __restrict__ x_sorted,
     const float* __restrict__ in_proj_W,
@@ -544,6 +549,7 @@ __global__ void sg2_persistent_scan_Q_generic_kernel(
 
 // ── sg2_persistent_scan_Q_generic_d16_kernel ──
 // State: CONFIG4, HW: GENERIC, d16: True
+__launch_bounds__(16, 8)
 __global__ void sg2_persistent_scan_Q_generic_d16_kernel(
     const float* __restrict__ x_sorted,
     const float* __restrict__ in_proj_W,
@@ -651,6 +657,7 @@ __global__ void sg2_persistent_scan_Q_generic_d16_kernel(
 
 // ── sg2_persistent_scan_Q_sm80_kernel ──
 // State: CONFIG4, HW: AMPERE, d16: False
+__launch_bounds__(16, 8)
 __global__ void sg2_persistent_scan_Q_sm80_kernel(
     const float* __restrict__ x_sorted,
     const float* __restrict__ in_proj_W,
@@ -757,6 +764,7 @@ __global__ void sg2_persistent_scan_Q_sm80_kernel(
 
 // ── sg2_persistent_scan_Q_sm80_d16_kernel ──
 // State: CONFIG4, HW: AMPERE, d16: True
+__launch_bounds__(16, 8)
 __global__ void sg2_persistent_scan_Q_sm80_d16_kernel(
     const float* __restrict__ x_sorted,
     const float* __restrict__ in_proj_W,

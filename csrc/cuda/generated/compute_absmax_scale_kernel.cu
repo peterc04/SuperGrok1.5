@@ -38,6 +38,7 @@ __device__ __forceinline__ void atomicMaxFloat(float* addr, float value) {
 //  reduction across warps, then atomicMax across blocks.
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void compute_absmax_kernel(
     const float* __restrict__ input,
     float* __restrict__ scale_out,

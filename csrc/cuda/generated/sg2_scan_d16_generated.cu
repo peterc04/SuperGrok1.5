@@ -19,6 +19,7 @@ constexpr int D16_D_INNER = 16;
 //  allocation optimization.
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(16, 8)
 __global__ void mamba3_parallel_scan_d16_kernel(
     const float* __restrict__ x_sorted,
     const float* __restrict__ in_proj_W,

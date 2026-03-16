@@ -299,6 +299,7 @@ def gen_fused_elem_kernel(v: dict) -> str:
 // ── {v['name']} ──
 // State: {v['state_enum']}, Expert: {v['expert_enum']}, HW: {v['hw_enum']}, MoE: {v['moe_enum']}, d16: {v['d16']}
 template <typename scalar_t>
+__launch_bounds__(256, 2)
 __global__ void {v['name']}(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
@@ -431,6 +432,7 @@ def gen_metanet_kernel(v: dict) -> str:
 // ── {v['name']} ──
 // Expert: {v['expert_enum']}, HW: {v['hw_enum']}, d16: {v['d16']}
 template <typename scalar_t>
+__launch_bounds__(256, 2)
 __global__ void {v['name']}(
     const scalar_t* __restrict__ grad,
     const float* __restrict__ fwd_scan_out,
@@ -531,6 +533,7 @@ def gen_persistent_scan_kernel(v: dict) -> str:
     kernel = f"""\
 // ── {v['name']} ──
 // State: {v['state_enum']}, HW: {v['hw_enum']}, d16: {v['d16']}
+__launch_bounds__(16, 8)
 __global__ void {v['name']}(
     const float* __restrict__ x_sorted,
     const float* __restrict__ in_proj_W,
@@ -675,6 +678,7 @@ constexpr int D16_D_INNER = 16;
 //  allocation optimization.
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(16, 8)
 __global__ void mamba3_parallel_scan_d16_kernel(
     const float* __restrict__ x_sorted,
     const float* __restrict__ in_proj_W,
@@ -895,23 +899,23 @@ constexpr int SG2_DISPATCH_BLOCK = 256;
         seen = set()
         for v in fused_variants:
             if v["name"] not in seen:
-                f.write(f"template <typename scalar_t>\n__global__ void {v['name']}(/* see sg2_fused_elem_generated.cu */);\n\n")
+                f.write(f"template <typename scalar_t>\n__launch_bounds__(256, 2)\n__global__ void {v['name']}(/* see sg2_fused_elem_generated.cu */);\n\n")
                 seen.add(v["name"])
 
         # Forward declarations for metanet
         for v in metanet_variants:
             if v["name"] not in seen:
-                f.write(f"template <typename scalar_t>\n__global__ void {v['name']}(/* see sg2_metanet_only_generated.cu */);\n\n")
+                f.write(f"template <typename scalar_t>\n__launch_bounds__(256, 2)\n__global__ void {v['name']}(/* see sg2_metanet_only_generated.cu */);\n\n")
                 seen.add(v["name"])
 
         # Forward declarations for pscan (non-template)
         for v in pscan_variants:
             if v["name"] not in seen:
-                f.write(f"__global__ void {v['name']}(/* see sg2_persistent_scan_generated.cu */);\n\n")
+                f.write(f"__launch_bounds__(16, 8)\n__global__ void {v['name']}(/* see sg2_persistent_scan_generated.cu */);\n\n")
                 seen.add(v["name"])
 
         # d16 scan
-        f.write("__global__ void mamba3_parallel_scan_d16_kernel(/* see sg2_scan_d16_generated.cu */);\n\n")
+        f.write("__launch_bounds__(16, 8)\n__global__ void mamba3_parallel_scan_d16_kernel(/* see sg2_scan_d16_generated.cu */);\n\n")
 
         # ── Fused elem dispatch ──
         f.write("""\
