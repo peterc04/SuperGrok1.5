@@ -34,13 +34,9 @@ import torch
 import torch.nn as nn
 from typing import Tuple, Optional
 
-from grokking_optimizers import _HAS_OPS
-if _HAS_OPS:
-    from grokking_optimizers import _ops
-    _HAS_CUDA_BACKWARD = hasattr(_ops, 'supergrok2_bilevel_fwd_save')
-else:
-    from grokking_optimizers import _python_fallback as _ops
-    _HAS_CUDA_BACKWARD = False
+from grokking_optimizers._ops_loader import get_ops
+_ops = get_ops()
+_HAS_CUDA_BACKWARD = hasattr(_ops, 'supergrok2_bilevel_fwd_save')
 
 
 class Mamba3ScanBlock(nn.Module):
