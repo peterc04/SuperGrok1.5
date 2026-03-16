@@ -897,3 +897,186 @@ __global__ void moe_apply_frequency_scaling_kernel(
         lr_scale[e] = new_scale;
     }
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  C++ Launcher Functions for MoE Deep Kernels
+// ═══════════════════════════════════════════════════════════════════════
+
+void moe_dynamic_expert_load(
+    torch::Tensor gate_logits, torch::Tensor W1, torch::Tensor b1,
+    torch::Tensor W2, torch::Tensor b2,
+    torch::Tensor loaded_W1, torch::Tensor loaded_b1,
+    torch::Tensor loaded_W2, torch::Tensor loaded_b2,
+    torch::Tensor active_expert_ids, torch::Tensor num_active_per_sample,
+    float threshold, int N, int num_experts, int input_dim, int expert_dim
+) {
+    dim3 grid(N);
+    dim3 block(256);
+    int smem = (num_experts + MAX_TOPK + 1) * sizeof(int);
+
+    moe_dynamic_expert_load_kernel<<<grid, block, smem>>>(
+        gate_logits.data_ptr<float>(), W1.data_ptr<float>(), b1.data_ptr<float>(),
+        W2.data_ptr<float>(), b2.data_ptr<float>(),
+        loaded_W1.data_ptr<float>(), loaded_b1.data_ptr<float>(),
+        loaded_W2.data_ptr<float>(), loaded_b2.data_ptr<float>(),
+        active_expert_ids.data_ptr<int>(), num_active_per_sample.data_ptr<int>(),
+        threshold, N, num_experts, input_dim, expert_dim
+    );
+}
+
+torch::Tensor moe_dynamic_expert_fwd(
+    torch::Tensor input, torch::Tensor gate_logits,
+    torch::Tensor loaded_W1, torch::Tensor loaded_b1,
+    torch::Tensor loaded_W2, torch::Tensor loaded_b2,
+    torch::Tensor active_expert_ids, torch::Tensor num_active_per_sample,
+    int N, int num_experts, int input_dim, int expert_dim
+) {
+    auto output = torch::zeros({N, input_dim}, input.options());
+    dim3 grid(N);
+    dim3 block(256);
+    int smem = (input_dim + expert_dim + MAX_TOPK + input_dim) * sizeof(float);
+
+    moe_dynamic_expert_fwd_kernel<<<grid, block, smem>>>(
+        input.data_ptr<float>(), gate_logits.data_ptr<float>(),
+        loaded_W1.data_ptr<float>(), loaded_b1.data_ptr<float>(),
+        loaded_W2.data_ptr<float>(), loaded_b2.data_ptr<float>(),
+        active_expert_ids.data_ptr<int>(), num_active_per_sample.data_ptr<int>(),
+        output.data_ptr<float>(), N, num_experts, input_dim, expert_dim
+    );
+    return output;
+}
+
+void moe_dynamic_expert_bwd(
+    torch::Tensor grad_output, torch::Tensor input, torch::Tensor gate_logits,
+    torch::Tensor loaded_W1, torch::Tensor loaded_b1,
+    torch::Tensor loaded_W2, torch::Tensor loaded_b2,
+    torch::Tensor active_expert_ids, torch::Tensor num_active_per_sample,
+    torch::Tensor grad_gate_logits, torch::Tensor grad_W1, torch::Tensor grad_b1,
+    torch::Tensor grad_W2, torch::Tensor grad_b2,
+    int N, int num_experts, int input_dim, int expert_dim
+) {
+    dim3 grid(N);
+    dim3 block(256);
+    int smem = (input_dim + input_dim + expert_dim + MAX_TOPK +
+                MAX_TOPK * input_dim + expert_dim * input_dim) * sizeof(float);
+
+    moe_dynamic_expert_bwd_kernel<<<grid, block, smem>>>(
+        grad_output.data_ptr<float>(), input.data_ptr<float>(),
+        gate_logits.data_ptr<float>(),
+        loaded_W1.data_ptr<float>(), loaded_b1.data_ptr<float>(),
+        loaded_W2.data_ptr<float>(), loaded_b2.data_ptr<float>(),
+        active_expert_ids.data_ptr<int>(), num_active_per_sample.data_ptr<int>(),
+        grad_gate_logits.data_ptr<float>(),
+        grad_W1.data_ptr<float>(), grad_b1.data_ptr<float>(),
+        grad_W2.data_ptr<float>(), grad_b2.data_ptr<float>(),
+        N, num_experts, input_dim, expert_dim
+    );
+}
+
+void moe_filter_active_params(
+    torch::Tensor params, torch::Tensor grads,
+    torch::Tensor state_m, torch::Tensor state_v,
+    torch::Tensor param_to_expert, torch::Tensor expert_active,
+    torch::Tensor compact_params, torch::Tensor compact_grads,
+    torch::Tensor compact_state_m, torch::Tensor compact_state_v,
+    torch::Tensor scatter_indices, torch::Tensor compact_count,
+    int total_params
+) {
+    int block = 256;
+    int grid = (total_params + block - 1) / block;
+
+    moe_filter_active_params_kernel<<<grid, block>>>(
+        params.data_ptr<float>(), grads.data_ptr<float>(),
+        state_m.data_ptr<float>(), state_v.data_ptr<float>(),
+        param_to_expert.data_ptr<int>(), expert_active.data_ptr<int>(),
+        compact_params.data_ptr<float>(), compact_grads.data_ptr<float>(),
+        compact_state_m.data_ptr<float>(), compact_state_v.data_ptr<float>(),
+        scatter_indices.data_ptr<int>(), compact_count.data_ptr<int>(),
+        total_params
+    );
+}
+
+void moe_scan_compacted(
+    torch::Tensor compact_x, torch::Tensor compact_dt,
+    torch::Tensor compact_B, torch::Tensor compact_C,
+    torch::Tensor A_log, torch::Tensor D_param, torch::Tensor rope_freq,
+    torch::Tensor scan_output, torch::Tensor final_state,
+    torch::Tensor initial_state,
+    int compact_N, int d_inner, int d_state
+) {
+    dim3 grid(d_inner);
+    dim3 block(16);
+    int smem = 16 * 6 * sizeof(float);
+    const float* init_ptr = (initial_state.numel() > 0) ? initial_state.data_ptr<float>() : nullptr;
+
+    moe_scan_compacted_kernel<<<grid, block, smem>>>(
+        compact_x.data_ptr<float>(), compact_dt.data_ptr<float>(),
+        compact_B.data_ptr<float>(), compact_C.data_ptr<float>(),
+        A_log.data_ptr<float>(), D_param.data_ptr<float>(),
+        rope_freq.data_ptr<float>(),
+        scan_output.data_ptr<float>(), final_state.data_ptr<float>(),
+        init_ptr, compact_N, d_inner, d_state
+    );
+}
+
+void moe_scatter_results(
+    torch::Tensor compact_params, torch::Tensor compact_state_m,
+    torch::Tensor compact_state_v, torch::Tensor scatter_indices,
+    torch::Tensor params, torch::Tensor state_m, torch::Tensor state_v,
+    int compact_N
+) {
+    int block = 256;
+    int grid = (compact_N + block - 1) / block;
+
+    moe_scatter_results_kernel<<<grid, block>>>(
+        compact_params.data_ptr<float>(), compact_state_m.data_ptr<float>(),
+        compact_state_v.data_ptr<float>(), scatter_indices.data_ptr<int>(),
+        params.data_ptr<float>(), state_m.data_ptr<float>(),
+        state_v.data_ptr<float>(), compact_N
+    );
+}
+
+void moe_count_expert_activations(
+    torch::Tensor gate_logits, torch::Tensor expert_counts,
+    float threshold, int N, int num_experts
+) {
+    int block = 256;
+    int grid = (N + block - 1) / block;
+    int smem = num_experts * sizeof(int);
+
+    moe_count_expert_activations_kernel<<<grid, block, smem>>>(
+        gate_logits.data_ptr<float>(), expert_counts.data_ptr<int>(),
+        threshold, N, num_experts
+    );
+}
+
+torch::Tensor moe_compute_load_balance_loss(
+    torch::Tensor expert_counts, torch::Tensor gate_logits,
+    int N, int num_experts
+) {
+    auto loss_out = torch::zeros({1}, gate_logits.options());
+    dim3 grid(1);
+    dim3 block(256);
+    int smem = (num_experts + 256) * sizeof(float);
+
+    moe_compute_load_balance_loss_kernel<<<grid, block, smem>>>(
+        expert_counts.data_ptr<int>(), gate_logits.data_ptr<float>(),
+        loss_out.data_ptr<float>(), N, num_experts
+    );
+    return loss_out;
+}
+
+void moe_apply_frequency_scaling(
+    torch::Tensor expert_counts, torch::Tensor lr_scale,
+    int num_experts, int total_activations,
+    float min_scale, float max_scale, float smoothing
+) {
+    int block = 256;
+    int grid = (num_experts + block - 1) / block;
+
+    moe_apply_frequency_scaling_kernel<<<grid, block>>>(
+        expert_counts.data_ptr<int>(), lr_scale.data_ptr<float>(),
+        num_experts, total_activations, min_scale, max_scale, smoothing
+    );
+}

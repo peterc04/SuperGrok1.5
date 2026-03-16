@@ -187,6 +187,112 @@ void launch_muon_update(
     torch::Tensor param, torch::Tensor orth,
     float neg_lr_scale, float decay_factor);
 
+// ── Distributed Scan (distributed_scan_kernels.cu) ──────────────────
+void distributed_scan_local_with_summary(
+    torch::Tensor pre_x_val, torch::Tensor pre_z_val, torch::Tensor pre_dt_val,
+    torch::Tensor pre_B_val, torch::Tensor pre_C_val,
+    torch::Tensor A_log, torch::Tensor D_param, torch::Tensor rope_freq,
+    torch::Tensor scan_output, torch::Tensor summaries,
+    torch::Tensor initial_state,
+    int N_local, int d_inner, int d_state, int reverse);
+
+void distributed_scan_apply_prefix(
+    torch::Tensor pre_x_val, torch::Tensor pre_z_val, torch::Tensor pre_dt_val,
+    torch::Tensor pre_B_val, torch::Tensor pre_C_val,
+    torch::Tensor A_log, torch::Tensor rope_freq,
+    torch::Tensor prefix_transforms, torch::Tensor scan_output,
+    torch::Tensor initial_state,
+    int N_local, int d_inner, int d_state, int reverse);
+
+void distributed_scan_summary_prefix(
+    torch::Tensor all_summaries, torch::Tensor prefix_out,
+    int K, int d_inner, int half_d_state);
+
+void distributed_scan_local_with_summary_bwd(
+    torch::Tensor pre_x_val, torch::Tensor pre_z_val, torch::Tensor pre_dt_val,
+    torch::Tensor pre_B_val, torch::Tensor pre_C_val,
+    torch::Tensor A_log, torch::Tensor D_param, torch::Tensor rope_freq,
+    torch::Tensor grad_output, torch::Tensor fwd_scan_output,
+    torch::Tensor grad_pre_x, torch::Tensor grad_pre_dt,
+    torch::Tensor grad_pre_B, torch::Tensor grad_pre_C,
+    torch::Tensor grad_D, torch::Tensor bwd_summaries,
+    torch::Tensor initial_state,
+    int N_local, int d_inner, int d_state, int reverse);
+
+void distributed_scan_apply_prefix_bwd(
+    torch::Tensor pre_x_val, torch::Tensor pre_z_val, torch::Tensor pre_dt_val,
+    torch::Tensor pre_B_val, torch::Tensor pre_C_val,
+    torch::Tensor A_log, torch::Tensor rope_freq,
+    torch::Tensor grad_output, torch::Tensor bwd_prefix_transforms,
+    torch::Tensor grad_pre_x, torch::Tensor grad_pre_dt,
+    torch::Tensor grad_pre_B, torch::Tensor grad_pre_C,
+    int N_local, int d_inner, int d_state, int reverse);
+
+void distributed_scan_summary_prefix_bwd(
+    torch::Tensor all_bwd_summaries, torch::Tensor bwd_prefix_out,
+    int K, int d_inner, int half_d_state);
+
+// ── MoE Deep (moe_deep_kernels.cu) ─────────────────────────────────
+void moe_dynamic_expert_load(
+    torch::Tensor gate_logits, torch::Tensor W1, torch::Tensor b1,
+    torch::Tensor W2, torch::Tensor b2,
+    torch::Tensor loaded_W1, torch::Tensor loaded_b1,
+    torch::Tensor loaded_W2, torch::Tensor loaded_b2,
+    torch::Tensor active_expert_ids, torch::Tensor num_active_per_sample,
+    float threshold, int N, int num_experts, int input_dim, int expert_dim);
+
+torch::Tensor moe_dynamic_expert_fwd(
+    torch::Tensor input, torch::Tensor gate_logits,
+    torch::Tensor loaded_W1, torch::Tensor loaded_b1,
+    torch::Tensor loaded_W2, torch::Tensor loaded_b2,
+    torch::Tensor active_expert_ids, torch::Tensor num_active_per_sample,
+    int N, int num_experts, int input_dim, int expert_dim);
+
+void moe_dynamic_expert_bwd(
+    torch::Tensor grad_output, torch::Tensor input, torch::Tensor gate_logits,
+    torch::Tensor loaded_W1, torch::Tensor loaded_b1,
+    torch::Tensor loaded_W2, torch::Tensor loaded_b2,
+    torch::Tensor active_expert_ids, torch::Tensor num_active_per_sample,
+    torch::Tensor grad_gate_logits, torch::Tensor grad_W1, torch::Tensor grad_b1,
+    torch::Tensor grad_W2, torch::Tensor grad_b2,
+    int N, int num_experts, int input_dim, int expert_dim);
+
+void moe_filter_active_params(
+    torch::Tensor params, torch::Tensor grads,
+    torch::Tensor state_m, torch::Tensor state_v,
+    torch::Tensor param_to_expert, torch::Tensor expert_active,
+    torch::Tensor compact_params, torch::Tensor compact_grads,
+    torch::Tensor compact_state_m, torch::Tensor compact_state_v,
+    torch::Tensor scatter_indices, torch::Tensor compact_count,
+    int total_params);
+
+void moe_scan_compacted(
+    torch::Tensor compact_x, torch::Tensor compact_dt,
+    torch::Tensor compact_B, torch::Tensor compact_C,
+    torch::Tensor A_log, torch::Tensor D_param, torch::Tensor rope_freq,
+    torch::Tensor scan_output, torch::Tensor final_state,
+    torch::Tensor initial_state,
+    int compact_N, int d_inner, int d_state);
+
+void moe_scatter_results(
+    torch::Tensor compact_params, torch::Tensor compact_state_m,
+    torch::Tensor compact_state_v, torch::Tensor scatter_indices,
+    torch::Tensor params, torch::Tensor state_m, torch::Tensor state_v,
+    int compact_N);
+
+void moe_count_expert_activations(
+    torch::Tensor gate_logits, torch::Tensor expert_counts,
+    float threshold, int N, int num_experts);
+
+torch::Tensor moe_compute_load_balance_loss(
+    torch::Tensor expert_counts, torch::Tensor gate_logits,
+    int N, int num_experts);
+
+void moe_apply_frequency_scaling(
+    torch::Tensor expert_counts, torch::Tensor lr_scale,
+    int num_experts, int total_activations,
+    float min_scale, float max_scale, float smoothing);
+
 // ── SuperGrok v2 Mamba-3+PEER (supergrok2_mamba_peer_kernels.cu) ──
 void launch_mamba3_peer_step(
     torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness,

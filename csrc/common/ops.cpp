@@ -1246,6 +1246,40 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("expert_counts"));
 
 #if defined(WITH_CUDA) || defined(WITH_HIP)
+    // ── Distributed Scan (multi-GPU) ────────────────────────────────
+    m.def("distributed_scan_local_with_summary", &distributed_scan_local_with_summary,
+          "Local scan with summary output for multi-GPU");
+    m.def("distributed_scan_apply_prefix", &distributed_scan_apply_prefix,
+          "Apply cross-GPU prefix to local scan output");
+    m.def("distributed_scan_summary_prefix", &distributed_scan_summary_prefix,
+          "Prefix scan over GPU summary states");
+    m.def("distributed_scan_local_with_summary_bwd", &distributed_scan_local_with_summary_bwd,
+          "Backward: local scan with summary");
+    m.def("distributed_scan_apply_prefix_bwd", &distributed_scan_apply_prefix_bwd,
+          "Backward: apply cross-GPU prefix");
+    m.def("distributed_scan_summary_prefix_bwd", &distributed_scan_summary_prefix_bwd,
+          "Backward: prefix scan over summaries");
+
+    // ── MoE Deep Kernels ────────────────────────────────────────────
+    m.def("moe_dynamic_expert_load", &moe_dynamic_expert_load,
+          "Load active experts into buffer");
+    m.def("moe_dynamic_expert_fwd", &moe_dynamic_expert_fwd,
+          "MoE dynamic expert forward");
+    m.def("moe_dynamic_expert_bwd", &moe_dynamic_expert_bwd,
+          "MoE dynamic expert backward");
+    m.def("moe_filter_active_params", &moe_filter_active_params,
+          "Filter active-gradient params");
+    m.def("moe_scan_compacted", &moe_scan_compacted,
+          "Scan over compacted param buffer");
+    m.def("moe_scatter_results", &moe_scatter_results,
+          "Scatter compact results back");
+    m.def("moe_count_expert_activations", &moe_count_expert_activations,
+          "Count expert activations");
+    m.def("moe_compute_load_balance_loss", &moe_compute_load_balance_loss,
+          "Load balance loss");
+    m.def("moe_apply_frequency_scaling", &moe_apply_frequency_scaling,
+          "Frequency-based LR scaling");
+
     // ── SuperGrok v2 Bilevel Forward (state-saving) ──────────────────
     m.def("supergrok2_bilevel_fwd_save", &launch_mamba3_peer_bilevel_fwd_save,
           "SuperGrok2 bilevel: forward scan with state saving for backward");
