@@ -293,6 +293,49 @@ void moe_apply_frequency_scaling(
     int num_experts, int total_activations,
     float min_scale, float max_scale, float smoothing);
 
+// ── CDNA4 Kernels (cdna4_kernels.hip.cpp) ───────────────────────────
+void cdna4_scan_local_with_summary(
+    torch::Tensor pre_x_val, torch::Tensor pre_z_val, torch::Tensor pre_dt_val,
+    torch::Tensor pre_B_val, torch::Tensor pre_C_val,
+    torch::Tensor A_log, torch::Tensor D_param, torch::Tensor rope_freq,
+    torch::Tensor h_state_fp6, torch::Tensor state_scale,
+    torch::Tensor scan_output, torch::Tensor summary_M, torch::Tensor summary_b,
+    int N_local, int d_inner, int d_state);
+
+void cdna4_backward_fp6(
+    torch::Tensor grad_output, torch::Tensor pre_x_val, torch::Tensor pre_z_val,
+    torch::Tensor pre_dt_val, torch::Tensor pre_B_val, torch::Tensor pre_C_val,
+    torch::Tensor A_log, torch::Tensor D_param, torch::Tensor rope_freq,
+    torch::Tensor saved_states_fp6, torch::Tensor state_scales,
+    torch::Tensor grad_pre_x, torch::Tensor grad_pre_dt,
+    torch::Tensor grad_pre_B, torch::Tensor grad_pre_C,
+    torch::Tensor grad_D,
+    int N, int d_inner, int d_state, int checkpoint_interval);
+
+void cdna4_dynamic_expert_fp4(
+    torch::Tensor scan_output, torch::Tensor param, torch::Tensor grad,
+    torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor gru_state,
+    torch::Tensor all_expert_W1_fp4, torch::Tensor expert_b1,
+    torch::Tensor all_expert_W2_fp4, torch::Tensor expert_b2,
+    torch::Tensor expert_scale, torch::Tensor active_expert_indices,
+    int num_active_experts, int N,
+    float lr, float beta1, float beta2, float eps, float wd, float rescale,
+    int expert_hidden, int num_experts);
+
+void cdna4_persistent_scan_fused_elem(
+    torch::Tensor pre_x_val, torch::Tensor pre_z_val, torch::Tensor pre_dt_val,
+    torch::Tensor pre_B_val, torch::Tensor pre_C_val,
+    torch::Tensor A_log, torch::Tensor D_param, torch::Tensor rope_freq,
+    torch::Tensor param, torch::Tensor grad, torch::Tensor sort_indices,
+    torch::Tensor expert_W1_fp4, torch::Tensor expert_b1,
+    torch::Tensor expert_W2_fp4, torch::Tensor expert_b2,
+    torch::Tensor expert_scale,
+    torch::Tensor exp_avg_fp6, torch::Tensor exp_avg_sq_fp6,
+    torch::Tensor state_scale_avg, torch::Tensor state_scale_sq,
+    int N, int d_inner, int d_state,
+    float lr, float beta1, float beta2, float eps, float wd, float rescale,
+    int expert_hidden, int num_experts);
+
 // ── SuperGrok v2 Mamba-3+PEER (supergrok2_mamba_peer_kernels.cu) ──
 void launch_mamba3_peer_step(
     torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness,
