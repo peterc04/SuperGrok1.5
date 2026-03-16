@@ -3977,3 +3977,162 @@ void launch_fused_elem_step_int4(
             expert_hidden, num_experts);
     }));
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+//  MXFP4 Launcher — follows exact INT8/INT4 pattern
+// ═══════════════════════════════════════════════════════════════════════
+
+void launch_fused_elem_step_mxfp4(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness,
+    torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor mu,
+    torch::Tensor gru_state,
+    torch::Tensor fwd_scan_out, torch::Tensor bwd_scan_out,
+    torch::Tensor out_proj_fwd_W, torch::Tensor out_proj_bwd_W,
+    torch::Tensor gru_Wz, torch::Tensor gru_bz,
+    torch::Tensor gru_Wr, torch::Tensor gru_br,
+    torch::Tensor gru_Wh, torch::Tensor gru_bh,
+    torch::Tensor peer_query_Ws,
+    torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+    torch::Tensor expert_W1_q, torch::Tensor expert_W1_exp,
+    torch::Tensor expert_W2_q, torch::Tensor expert_W2_exp,
+    torch::Tensor expert_b1_q, torch::Tensor expert_b1_exp,
+    torch::Tensor expert_b2_q, torch::Tensor expert_b2_exp,
+    float mxfp4_scale,
+    float rescale, float alpha, float lamb_eff,
+    float beta1, float beta2, float lr, float wd_eff, float eps,
+    float bc1, float bc2,
+    torch::Tensor expert_counts,
+    int N, int d_model, int d_inner,
+    int gru_hidden, int num_heads, int pk_dim,
+    int expert_hidden, int num_experts
+) {
+    const int block = SG2M_BLOCK;
+    const int grid = (N + block - 1) / block;
+    const int gru_input_dim = 2 + 2 * d_model;
+    const int gru_row_len = gru_input_dim + gru_hidden;
+    size_t smem = (2 * d_model * d_inner + 3 * gru_hidden * gru_row_len
+                   + 3 * gru_hidden + 4 * num_experts * expert_hidden) * sizeof(float);
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        param.scalar_type(), "fused_elem_mxfp4", ([&] {
+        fused_elem_step_mxfp4_kernel<scalar_t><<<grid, block, smem>>>(
+            param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+            sharpness.data_ptr<scalar_t>(),
+            exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+            mu.data_ptr<float>(), gru_state.data_ptr<float>(),
+            fwd_scan_out.data_ptr<float>(), bwd_scan_out.data_ptr<float>(),
+            out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+            gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+            gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+            gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+            peer_query_Ws.data_ptr<float>(),
+            prod_keys_A.data_ptr<float>(), prod_keys_B.data_ptr<float>(),
+            reinterpret_cast<const uint8_t*>(expert_W1_q.data_ptr()),
+            reinterpret_cast<const uint8_t*>(expert_W1_exp.data_ptr()),
+            reinterpret_cast<const uint8_t*>(expert_W2_q.data_ptr()),
+            reinterpret_cast<const uint8_t*>(expert_W2_exp.data_ptr()),
+            reinterpret_cast<const uint8_t*>(expert_b1_q.data_ptr()),
+            reinterpret_cast<const uint8_t*>(expert_b1_exp.data_ptr()),
+            reinterpret_cast<const uint8_t*>(expert_b2_q.data_ptr()),
+            reinterpret_cast<const uint8_t*>(expert_b2_exp.data_ptr()),
+            mxfp4_scale,
+            rescale, alpha, lamb_eff,
+            beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+            expert_counts.defined() ? expert_counts.data_ptr<int>() : nullptr,
+            N, d_model, d_inner, gru_hidden, num_heads, pk_dim,
+            expert_hidden, num_experts);
+    }));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Persistent Scan + Fused Elem Launcher
+//
+//  Wires persistent_scan_fused_elem_kernel into the sequential scan path.
+//  Guards: N <= PSCAN_THRESHOLD, shared memory fits device capacity.
+//  Falls back (returns false) if either condition fails.
+// ═══════════════════════════════════════════════════════════════════════
+
+bool launch_persistent_scan_fused_elem(
+    torch::Tensor x_sorted,
+    torch::Tensor in_proj_W, torch::Tensor dt_proj_W,
+    torch::Tensor dt_proj_b, torch::Tensor B_proj_W,
+    torch::Tensor C_proj_W, torch::Tensor A_log,
+    torch::Tensor D_param, torch::Tensor rope_freq,
+    torch::Tensor final_state, torch::Tensor initial_state,
+    torch::Tensor sort_indices,
+    torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness,
+    torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor mu_buf, torch::Tensor gru_state,
+    torch::Tensor out_proj_fwd_W, torch::Tensor out_proj_bwd_W,
+    torch::Tensor gru_Wz, torch::Tensor gru_bz,
+    torch::Tensor gru_Wr, torch::Tensor gru_br,
+    torch::Tensor gru_Wh, torch::Tensor gru_bh,
+    torch::Tensor expert_W1, torch::Tensor expert_b1,
+    torch::Tensor expert_W2, torch::Tensor expert_b2,
+    float rescale, float alpha, float lamb_eff,
+    float beta1, float beta2, float lr, float wd_eff, float eps,
+    float bc1, float bc2,
+    int N, int d_model, int d_inner, int d_state,
+    int gru_hidden, int expert_hidden, int num_experts,
+    int reverse
+) {
+    // Guard: only for sequential scan path (small N)
+    if (N > PSCAN_THRESHOLD) return false;
+
+    const int gru_input_dim = 2 + 2 * d_model;
+    const int gru_row_len = gru_input_dim + gru_hidden;
+    // Scan weights + fused_elem weights
+    size_t smem = (d_inner                               // s_x_branch
+                   + d_inner * d_model                   // in_proj_W section
+                   + d_inner                             // dt_proj
+                   + d_inner * d_state                   // B_proj
+                   + d_state * d_inner                   // C_proj
+                   + 2 * d_model * d_inner               // out_proj fwd+bwd
+                   + 3 * gru_hidden * gru_row_len        // GRU W matrices
+                   + 3 * gru_hidden                      // GRU biases
+                   + 2 * num_experts * expert_hidden      // expert W1, W2
+                   + 2 * num_experts * expert_hidden      // expert b1, b2
+                   ) * sizeof(float);
+
+    // Check device shared memory capacity
+    int dev;
+    cudaGetDevice(&dev);
+    int max_smem;
+    cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlock, dev);
+    if (static_cast<int>(smem) > max_smem) return false;
+
+    // Single block, d_inner threads
+    dim3 grid_dim(1, 1, 1);
+    dim3 block_dim(d_inner, 1, 1);
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        param.scalar_type(), "persistent_scan_fused_elem", ([&] {
+        persistent_scan_fused_elem_kernel<scalar_t><<<grid_dim, block_dim, smem>>>(
+            x_sorted.data_ptr<float>(),
+            in_proj_W.data_ptr<float>(), dt_proj_W.data_ptr<float>(),
+            dt_proj_b.data_ptr<float>(), B_proj_W.data_ptr<float>(),
+            C_proj_W.data_ptr<float>(), A_log.data_ptr<float>(),
+            D_param.data_ptr<float>(), rope_freq.data_ptr<float>(),
+            final_state.data_ptr<float>(),
+            initial_state.defined() ? initial_state.data_ptr<float>() : nullptr,
+            sort_indices.data_ptr<int>(),
+            param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+            sharpness.data_ptr<scalar_t>(),
+            exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+            mu_buf.data_ptr<float>(), gru_state.data_ptr<float>(),
+            out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+            gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+            gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+            gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+            expert_W1.data_ptr<float>(), expert_b1.data_ptr<float>(),
+            expert_W2.data_ptr<float>(), expert_b2.data_ptr<float>(),
+            rescale, alpha, lamb_eff,
+            beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+            N, d_model, d_inner, d_state,
+            gru_hidden, expert_hidden, num_experts,
+            reverse);
+    }));
+    return true;
+}
