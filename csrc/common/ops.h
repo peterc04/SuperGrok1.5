@@ -336,6 +336,97 @@ void cdna4_persistent_scan_fused_elem(
     float lr, float beta1, float beta2, float eps, float wd, float rescale,
     int expert_hidden, int num_experts);
 
+// ── CDNA4 FP4 Expert Kernels ─────────────────────────────────────────
+void cdna4_fp4_expert_load(
+    torch::Tensor weights_fp4, torch::Tensor scale_factors,
+    torch::Tensor weights_fp32,
+    int num_experts, int weight_numel, int packed_size);
+
+void cdna4_fp4_expert_fwd(
+    torch::Tensor input, torch::Tensor W1_fp4, torch::Tensor b1,
+    torch::Tensor W2_fp4, torch::Tensor b2,
+    torch::Tensor scale_W1, torch::Tensor scale_W2,
+    torch::Tensor expert_assign, torch::Tensor output,
+    int batch_size, int d_in, int expert_hidden, int d_out,
+    int packed_W1_row, int packed_W2_row);
+
+void cdna4_fp4_expert_bwd(
+    torch::Tensor grad_output, torch::Tensor input, torch::Tensor hidden_acts,
+    torch::Tensor W1_fp4, torch::Tensor W2_fp4,
+    torch::Tensor scale_W1, torch::Tensor scale_W2,
+    torch::Tensor expert_assign,
+    torch::Tensor grad_input, torch::Tensor grad_W1_accum, torch::Tensor grad_W2_accum,
+    torch::Tensor grad_b1, torch::Tensor grad_b2,
+    uint32_t rng_seed,
+    int batch_size, int d_in, int expert_hidden, int d_out,
+    int packed_W1_row, int packed_W2_row);
+
+void cdna4_fp4_quantize_experts(
+    torch::Tensor weights_fp32, torch::Tensor weights_fp4,
+    torch::Tensor scale_factors, uint32_t rng_seed,
+    int num_experts, int weight_numel, int packed_size);
+
+// ── CDNA4 FP6 State Kernels ─────────────────────────────────────────
+void cdna4_fp6_state_pack(
+    torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor exp_avg_fp6, torch::Tensor exp_avg_sq_fp6,
+    torch::Tensor state_scale_avg, torch::Tensor state_scale_sq,
+    int N);
+
+void cdna4_fp6_state_unpack(
+    torch::Tensor exp_avg_fp6, torch::Tensor exp_avg_sq_fp6,
+    torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor state_scale_avg, torch::Tensor state_scale_sq,
+    int N);
+
+void cdna4_fp6_adam_step(
+    torch::Tensor param, torch::Tensor grad,
+    torch::Tensor exp_avg_fp6, torch::Tensor exp_avg_sq_fp6,
+    torch::Tensor state_scale_avg, torch::Tensor state_scale_sq,
+    float beta1, float beta2, float lr, float eps,
+    float weight_decay, float bc1, float bc2, int N);
+
+void cdna4_fp6_lamb_step(
+    torch::Tensor param, torch::Tensor grad,
+    torch::Tensor exp_avg_fp6, torch::Tensor exp_avg_sq_fp6,
+    torch::Tensor state_scale_avg, torch::Tensor state_scale_sq,
+    torch::Tensor param_norm_out, torch::Tensor update_norm_out,
+    float beta1, float beta2, float lr, float eps,
+    float weight_decay, float bc1, float bc2, float trust_ratio, int N);
+
+// ── CDNA4 2:4 Sparsity Kernels ──────────────────────────────────────
+void cdna4_sparse24_select(
+    torch::Tensor dense, torch::Tensor sparse_values, torch::Tensor metadata, int N);
+
+void cdna4_sparse24_apply_mask(
+    torch::Tensor grad, torch::Tensor metadata, int N);
+
+void cdna4_sparse24_project(
+    torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor metadata, int N);
+
+void cdna4_sparse24_densify(
+    torch::Tensor sparse_values, torch::Tensor metadata, torch::Tensor dense, int N);
+
+// ── CDNA4 Fused Kernels ─────────────────────────────────────────────
+void cdna4_fp4_sparse24_fused_expert(
+    torch::Tensor input, torch::Tensor W1_fp4, torch::Tensor b1,
+    torch::Tensor W2_fp4, torch::Tensor b2,
+    torch::Tensor scale_W1, torch::Tensor scale_W2,
+    torch::Tensor W1_sparse_meta, torch::Tensor W2_sparse_meta,
+    torch::Tensor expert_assign, torch::Tensor output,
+    int batch_size, int d_in, int expert_hidden, int d_out,
+    int packed_W1_row, int packed_W2_row);
+
+void cdna4_supergrok15_full_step(
+    torch::Tensor param, torch::Tensor grad,
+    torch::Tensor exp_avg_fp6, torch::Tensor exp_avg_sq_fp6,
+    torch::Tensor state_scale_avg, torch::Tensor state_scale_sq,
+    torch::Tensor sparse_metadata, torch::Tensor expert_fp4_out,
+    torch::Tensor expert_scale,
+    float beta1, float beta2, float lr, float eps,
+    float weight_decay, float bc1, float bc2,
+    int N, int is_sparse, int is_expert);
+
 // ── SuperGrok v2 Mamba-3+PEER (supergrok2_mamba_peer_kernels.cu) ──
 void launch_mamba3_peer_step(
     torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness,
