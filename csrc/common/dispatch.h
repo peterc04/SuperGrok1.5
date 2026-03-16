@@ -13,6 +13,7 @@
  *
  * AMD (ROCm/HIP):
  *   GENERIC tier — gfx908 (MI100), gfx90a (MI200), gfx942 (MI300X)
+ *   CDNA4  tier — gfx950 (MI350X): FP4/FP6 native, 2:4 sparsity
  *   CDNA wavefront-64 with matrix cores
  */
 
@@ -109,20 +110,24 @@ inline ArchTier get_arch_tier() {
 //  GENERIC — gfx908 (MI100): basic CDNA, wavefront-64
 //  CDNA2   — gfx90a (MI250): MFMA_F32_16x16x4, 8MB L2
 //  CDNA3   — gfx942 (MI300X): MFMA_F32_32x32x8_BF16, 256MB L2
+//  CDNA4   — gfx950 (MI350X): native FP4 MMA, FP6 state, 2:4 sparsity,
+//            512 CUs, 288MB L2
 // ═══════════════════════════════════════════════════════════════════════
 
 enum class AmdTier {
     GENERIC,    // gfx908 (MI100)
     CDNA2,      // gfx90a (MI250)
     CDNA3,      // gfx942 (MI300X)
+    CDNA4,      // gfx950 (MI350X)
 };
 
 inline AmdTier get_amd_tier() {
 #if GROK_HIP
-    // FORCE_ARCH env var: 942 → CDNA3, 90 → CDNA2, anything else → GENERIC
+    // FORCE_ARCH env var: 950 → CDNA4, 942 → CDNA3, 90 → CDNA2, else → GENERIC
     const char* force = std::getenv("FORCE_ARCH");
     if (force != nullptr && force[0] != '\0') {
         int arch = std::atoi(force);
+        if (arch >= 950) return AmdTier::CDNA4;
         if (arch >= 942) return AmdTier::CDNA3;
         if (arch == 90)  return AmdTier::CDNA2;
         return AmdTier::GENERIC;
@@ -134,6 +139,8 @@ inline AmdTier get_amd_tier() {
         // gcnArchName format: "gfx942:sramecc+:xnack-" (may have suffixes)
         if (name[0] == 'g' && name[1] == 'f' && name[2] == 'x') {
             // Check for known CDNA arch names (strncmp ignores suffixes)
+            if (name[3] == '9' && name[4] == '5' && name[5] == '0')
+                return AmdTier::CDNA4;   // MI350X
             if (name[3] == '9' && name[4] == '4' && name[5] == '2')
                 return AmdTier::CDNA3;   // MI300X
             if (name[3] == '9' && name[4] == '0' && name[5] == 'a')
@@ -147,6 +154,7 @@ inline AmdTier get_amd_tier() {
 inline const char* get_amd_tier_name() {
     AmdTier tier = get_amd_tier();
     switch (tier) {
+        case AmdTier::CDNA4:   return "cdna4";
         case AmdTier::CDNA3:   return "cdna3";
         case AmdTier::CDNA2:   return "cdna2";
         default:               return "generic";
@@ -160,6 +168,7 @@ inline const char* get_amd_tier_name() {
 enum class StatePrecision {
     FP32 = 0,
     CONFIG4 = 1,
+    FP6 = 2,        // E3M2, CDNA4 (MI350X)
 };
 
 enum class ExpertPrecision {
@@ -167,5 +176,6 @@ enum class ExpertPrecision {
     INT8 = 1,
     INT4 = 2,
     MXFP4 = 3,
+    FP4 = 4,        // E2M1, CDNA4 native (MI350X)
 };
 

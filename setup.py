@@ -3,7 +3,7 @@ Grokking Optimizers — C++/CUDA/HIP/CPU Extension Build Script
 
 Builds custom optimizer kernels. Supports:
   - NVIDIA CUDA (sm_70-sm_90)
-  - AMD ROCm/HIP (gfx908, gfx90a, gfx942)
+  - AMD ROCm/HIP (gfx908, gfx90a, gfx942, gfx950)
   - CPU-only (OpenMP, reference implementation for debugging/testing)
 
 Build:
@@ -44,12 +44,15 @@ if _has_gpu and _is_hip:
         "csrc/cuda/generic/looksam_kernels.cu",
         "csrc/cuda/generic/muon_kernels.cu",
         "csrc/quantization/quantization_kernels.cu",
+        "csrc/cuda/generic/moe_deep_kernels.cu",
+        "csrc/cuda/generic/distributed_scan_kernels.cu",
     ]
 
     # Auto-detect CDNA specialization sources
     cdna_sources = sorted(
         _glob.glob("csrc/hip/cdna2/*.hip.cpp") +
-        _glob.glob("csrc/hip/cdna3/*.hip.cpp")
+        _glob.glob("csrc/hip/cdna3/*.hip.cpp") +
+        _glob.glob("csrc/hip/cdna4/*.hip.cpp")
     )
     if cdna_sources:
         print(f"  CDNA sources: {', '.join(os.path.basename(s) for s in cdna_sources)}")
@@ -68,6 +71,7 @@ if _has_gpu and _is_hip:
             "--offload-arch=gfx908",    # MI100
             "--offload-arch=gfx90a",    # MI250
             "--offload-arch=gfx942",    # MI300X
+            "--offload-arch=gfx950",    # MI350X
         ]
 
     ext = CUDAExtension(
@@ -104,6 +108,8 @@ elif _has_gpu:
         "csrc/cuda/generic/lion_kernels.cu",
         "csrc/cuda/generic/looksam_kernels.cu",
         "csrc/cuda/generic/muon_kernels.cu",
+        "csrc/cuda/generic/moe_deep_kernels.cu",
+        "csrc/cuda/generic/distributed_scan_kernels.cu",
     ]
     nvidia_sources = [
         "csrc/cuda/sm_80/supergrok2_scan_sm80.cu",
@@ -195,7 +201,7 @@ setup(
     description=(
         "C++/CUDA/HIP/JAX optimizer suite with SuperGrok v2 "
         "(Mamba-3 + PEER + GRU meta-net). Supports NVIDIA (sm_70-100), "
-        "AMD (MI250/MI300X), TPU (v4/v5), and CPU. "
+        "AMD (MI250/MI300X/MI350X), TPU (v4/v5), and CPU. "
         "Multi-precision: FP32/TF32/BF16/FP8/INT8/INT4/MXFP4/NVFP4."
     ),
     long_description=open("README.md").read(),
