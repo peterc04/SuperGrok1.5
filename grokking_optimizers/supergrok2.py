@@ -171,7 +171,33 @@ class SuperGrok2(Optimizer):
             first_param = next(iter(self.param_groups[0]["params"]))
             self.meta_net = self.meta_net.to(first_param.device)
         except (StopIteration, IndexError):
-            pass
+            first_param = None
+
+        # JIT Specialization: detect hardware and compile optimized kernels
+        self._jit = None
+        self._jit_kernels = None
+        if first_param is not None:
+            try:
+                from grokking_optimizers.jit import create_specializer
+                from grokking_optimizers.jit.specializer import ModelConfig as JITModelConfig
+                d_inner = d_model * mamba_expand
+                jit_config = JITModelConfig(
+                    d_inner=d_inner,
+                    d_state=d_state,
+                    num_experts=num_experts,
+                    expert_hidden=expert_hidden,
+                    gru_hidden=gru_hidden,
+                    num_heads=num_peer_heads,
+                    pk_dim=8,
+                    param_sizes=[p.numel() for g in self.param_groups for p in g["params"]],
+                    total_params=sum(p.numel() for g in self.param_groups for p in g["params"]),
+                )
+                self._jit = create_specializer(first_param.device, jit_config)
+                self._jit_kernels = self._jit.compile()
+            except Exception:
+                # JIT compilation is optional enhancement — pre-compiled kernels in _ops
+                # are always available. JIT adds hardware-specific optimizations on top.
+                pass
 
         self._global_step = 0
         self._step_counter = 0  # Python int for expert recycling (avoids GPU sync)
