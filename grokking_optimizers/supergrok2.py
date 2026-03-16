@@ -369,11 +369,8 @@ class SuperGrok2(Optimizer):
     @staticmethod
     def _is_fsdp_wrapped(model) -> bool:
         """Check if a model is wrapped with FSDP."""
-        try:
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            return isinstance(model, FSDP)
-        except ImportError:
-            return False
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        return isinstance(model, FSDP)
 
     @staticmethod
     def exclude_meta_net_from_fsdp(meta_net: nn.Module):
@@ -400,10 +397,7 @@ class SuperGrok2(Optimizer):
         parameters. The full gradients are temporary tensors that will
         be used for the meta-net scan and then discarded.
         """
-        try:
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        except ImportError:
-            return None
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
         gathered = []
         with FSDP.summon_full_params(model, writeback=False):
