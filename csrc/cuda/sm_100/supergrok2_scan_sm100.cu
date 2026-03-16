@@ -37,7 +37,7 @@
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
 
 __launch_bounds__(256, 2)
-__global__ void fused_elem_step_tma_kernel(
+__global__ __launch_bounds__(256, 2) void fused_elem_step_tma_kernel(
     float* __restrict__ param,
     const float* __restrict__ grad,
     const float* __restrict__ scan_output,
@@ -104,7 +104,7 @@ __global__ void fused_elem_step_tma_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 2)
-__global__ void fused_elem_step_tma_q4_kernel(
+__global__ __launch_bounds__(256, 2) void fused_elem_step_tma_q4_kernel(
     float* __restrict__ param,
     const float* __restrict__ grad,
     const float* __restrict__ scan_output,
@@ -157,7 +157,7 @@ __global__ void fused_elem_step_tma_q4_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 2)
-__global__ void fused_elem_step_tma_moe_kernel(
+__global__ __launch_bounds__(256, 2) void fused_elem_step_tma_moe_kernel(
     float* __restrict__ param,
     const float* __restrict__ grad,
     const float* __restrict__ scan_output,
@@ -217,7 +217,7 @@ __global__ void fused_elem_step_tma_moe_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 2)
-__global__ void fused_elem_step_tma_d16_kernel(
+__global__ __launch_bounds__(256, 2) void fused_elem_step_tma_d16_kernel(
     float* __restrict__ param,
     const float* __restrict__ grad,
     const float* __restrict__ scan_output,
@@ -262,7 +262,7 @@ __global__ void fused_elem_step_tma_d16_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 2)
-__global__ void fused_elem_step_tma_q4_moe_kernel(
+__global__ __launch_bounds__(256, 2) void fused_elem_step_tma_q4_moe_kernel(
     float* __restrict__ param,
     const float* __restrict__ grad,
     const float* __restrict__ scan_output,
@@ -312,7 +312,7 @@ __global__ void fused_elem_step_tma_q4_moe_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 2)
-__global__ void fused_elem_step_tma_q4_d16_kernel(
+__global__ __launch_bounds__(256, 2) void fused_elem_step_tma_q4_d16_kernel(
     float* __restrict__ param,
     const float* __restrict__ grad,
     const float* __restrict__ scan_output,
@@ -360,7 +360,7 @@ __global__ void fused_elem_step_tma_q4_d16_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 2)
-__global__ void fused_elem_step_fp4_kernel(
+__global__ __launch_bounds__(256, 2) void fused_elem_step_fp4_kernel(
     float* __restrict__ param,
     const float* __restrict__ grad,
     const float* __restrict__ scan_output,
@@ -409,7 +409,7 @@ __global__ void fused_elem_step_fp4_kernel(
 }
 
 __launch_bounds__(256, 2)
-__global__ void fused_elem_step_fp4_d16_kernel(
+__global__ __launch_bounds__(256, 2) void fused_elem_step_fp4_d16_kernel(
     float* __restrict__ param,
     const float* __restrict__ grad,
     const float* __restrict__ scan_output,
@@ -454,7 +454,7 @@ __global__ void fused_elem_step_fp4_d16_kernel(
 }
 
 __launch_bounds__(256, 2)
-__global__ void fused_elem_step_fp4_moe_kernel(
+__global__ __launch_bounds__(256, 2) void fused_elem_step_fp4_moe_kernel(
     float* __restrict__ param,
     const float* __restrict__ grad,
     const float* __restrict__ scan_output,
@@ -500,7 +500,7 @@ __global__ void fused_elem_step_fp4_moe_kernel(
 }
 
 __launch_bounds__(256, 2)
-__global__ void fused_elem_step_fp4_q4_kernel(
+__global__ __launch_bounds__(256, 2) void fused_elem_step_fp4_q4_kernel(
     float* __restrict__ param,
     const float* __restrict__ grad,
     const float* __restrict__ scan_output,
@@ -554,7 +554,7 @@ __global__ void fused_elem_step_fp4_q4_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(16, 8)
-__global__ void scan_tma_kernel(
+__global__ __launch_bounds__(256, 2) void scan_tma_kernel(
     const float* __restrict__ pre_x,
     const float* __restrict__ pre_z,
     const float* __restrict__ pre_dt,
@@ -598,7 +598,7 @@ __global__ void scan_tma_kernel(
 }
 
 __launch_bounds__(16, 8)
-__global__ void scan_tma_d16_kernel(
+__global__ __launch_bounds__(256, 2) void scan_tma_d16_kernel(
     const float* __restrict__ pre_x,
     const float* __restrict__ pre_z,
     const float* __restrict__ pre_dt,

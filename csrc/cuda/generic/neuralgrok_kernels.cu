@@ -43,7 +43,7 @@ constexpr int NEURALGROK_BLOCK_SIZE = 256;
 
 template <typename scalar_t>
 __launch_bounds__(256, 4)
-__global__ void fused_neuralgrok_amplifier_kernel(
+__global__ __launch_bounds__(256, 2) void fused_neuralgrok_amplifier_kernel(
     const scalar_t* __restrict__ grad,           // [N]
     scalar_t* __restrict__ amplified_grad,       // [N] -- output
     const float* __restrict__ W1,                // [H, 1] -- row-major
@@ -110,7 +110,7 @@ __global__ void fused_neuralgrok_amplifier_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ void fused_neuralgrok_adam_kernel(
+__global__ __launch_bounds__(256, 2) void fused_neuralgrok_adam_kernel(
     scalar_t* __restrict__ param,             // [N] -- updated
     float* __restrict__ exp_avg,              // [N] -- updated
     float* __restrict__ exp_avg_sq,           // [N] -- updated
@@ -155,7 +155,7 @@ __global__ void fused_neuralgrok_adam_kernel(
 // ===================================================================
 
 __launch_bounds__(256, 8)
-__global__ void fused_neuralgrok_adam_vec4_kernel(
+__global__ __launch_bounds__(256, 2) void fused_neuralgrok_adam_vec4_kernel(
     float4* __restrict__ param4,
     float4* __restrict__ exp_avg4,
     float4* __restrict__ exp_avg_sq4,
@@ -310,7 +310,7 @@ void launch_fused_neuralgrok_adam(
 
 template <typename scalar_t>
 __launch_bounds__(256, 4)
-__global__ void fused_neuralgrok_full_step_kernel(
+__global__ __launch_bounds__(256, 2) void fused_neuralgrok_full_step_kernel(
     scalar_t* __restrict__ param,             // [N] -- updated in-place
     float* __restrict__ exp_avg,              // [N] -- updated in-place
     float* __restrict__ exp_avg_sq,           // [N] -- updated in-place

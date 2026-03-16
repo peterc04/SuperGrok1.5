@@ -40,7 +40,7 @@
 
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ void fused_elem_step_cpasync_kernel(
+__global__ __launch_bounds__(256, 2) void fused_elem_step_cpasync_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     const scalar_t* __restrict__ sharpness,

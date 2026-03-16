@@ -82,7 +82,7 @@ void launch_fused_neuralgrok_full_step(
 
 template <typename scalar_t>
 __launch_bounds__(256, 4)
-__global__ void fused_supergrok15_full_step_cpasync_kernel(
+__global__ __launch_bounds__(256, 2) void fused_supergrok15_full_step_cpasync_kernel(
     scalar_t* __restrict__ param,         // [N] — updated
     float* __restrict__ exp_avg,          // [N] — FP32 state
     float* __restrict__ exp_avg_sq,       // [N] — FP32 state
@@ -212,7 +212,7 @@ __global__ void fused_supergrok15_full_step_cpasync_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 4)
-__global__ void fused_sg11_full_step_cpasync_kernel(
+__global__ __launch_bounds__(256, 2) void fused_sg11_full_step_cpasync_kernel(
     scalar_t* __restrict__ param,         // [N] — updated
     float* __restrict__ exp_avg,          // [N] — FP32 state
     float* __restrict__ exp_avg_sq,       // [N] — FP32 state
@@ -341,7 +341,7 @@ __global__ void fused_sg11_full_step_cpasync_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 4)
-__global__ void fused_neuralgrok_full_step_cpasync_kernel(
+__global__ __launch_bounds__(256, 2) void fused_neuralgrok_full_step_cpasync_kernel(
     scalar_t* __restrict__ param,             // [N] -- updated in-place
     float* __restrict__ exp_avg,              // [N] -- updated in-place
     float* __restrict__ exp_avg_sq,           // [N] -- updated in-place

@@ -1354,4 +1354,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // ── CPU MoE Filter ──────────────────────────────────────────────
     m.def("cpu_moe_filter_active_params", &cpu_moe_filter_active_params,
           "CPU: filter active-gradient params for MoE");
+
+    // ── Problem 2: Distributed Multi-GPU Pipeline ───────────────────
+    m.def("distributed_mamba3_scan_pipeline", &distributed_mamba3_scan_pipeline,
+          "Multi-GPU: Kernel A -> NCCL All-Gather -> Kernel B pipeline");
+
+    // ── Problem 3: CPU Distributed Scan Pipeline ────────────────────
+    m.def("cpu_local_scan_with_summary", &cpu_local_scan_with_summary,
+          "CPU: local scan with affine summary output");
+    m.def("cpu_summary_prefix_scan", &cpu_summary_prefix_scan,
+          "CPU: sequential prefix scan over gathered summaries");
+    m.def("cpu_apply_prefix", &cpu_apply_prefix,
+          "CPU: apply prefix transform to local scan output");
+    m.def("cpu_fused_adam_gru_step", &cpu_fused_adam_gru_step,
+          "CPU: fused Adam + GRU update step");
+
+    // ── Problem 4: Blackwell sm_100 Kernels ─────────────────────────
+    m.def("blackwell_precompute_fp4", &blackwell_precompute_fp4,
+          "Blackwell: FP4 cuBLAS projection GEMMs");
+
+    // ── Problem 5: Hopper Warp-Specialized Scan ─────────────────────
+    m.def("launch_scan_warp_specialized", &launch_scan_warp_specialized,
+          "Hopper: warp-specialized scan (generic d_state)");
+    m.def("launch_scan_warp_specialized_d16", &launch_scan_warp_specialized_d16,
+          "Hopper: warp-specialized scan (d_state=16, unrolled)");
 }

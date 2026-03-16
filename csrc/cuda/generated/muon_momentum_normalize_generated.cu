@@ -27,7 +27,7 @@ __device__ __forceinline__ int8_t float_to_int4_stochastic_gen(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ void muon_momentum_normalize_step_kernel(
+__global__ __launch_bounds__(256, 2) void muon_momentum_normalize_step_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ buf,
@@ -75,7 +75,7 @@ void launch_muon_momentum_normalize_step(
 
 
 __launch_bounds__(256, 8)
-__global__ void muon_momentum_normalize_step_vec4_kernel(
+__global__ __launch_bounds__(256, 2) void muon_momentum_normalize_step_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ grad4,
     float4* __restrict__ buf4,
@@ -151,7 +151,7 @@ void launch_muon_momentum_normalize_step_vec4(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ void muon_momentum_normalize_step_q4_kernel(
+__global__ __launch_bounds__(256, 2) void muon_momentum_normalize_step_q4_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     int8_t* __restrict__ buf_q,
@@ -209,7 +209,7 @@ void launch_muon_momentum_normalize_step_q4(
 // INT4 stochastic rounding
 
 __launch_bounds__(256, 8)
-__global__ void muon_momentum_normalize_step_q4_vec4_kernel(
+__global__ __launch_bounds__(256, 2) void muon_momentum_normalize_step_q4_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ grad4,
     int8_t* __restrict__ buf_q,
@@ -306,7 +306,7 @@ void launch_muon_momentum_normalize_step_q4_vec4(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ void muon_momentum_normalize_step_moe_kernel(
+__global__ __launch_bounds__(256, 2) void muon_momentum_normalize_step_moe_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ buf,
@@ -360,7 +360,7 @@ void launch_muon_momentum_normalize_step_moe(
 
 
 __launch_bounds__(256, 8)
-__global__ void muon_momentum_normalize_step_moe_vec4_kernel(
+__global__ __launch_bounds__(256, 2) void muon_momentum_normalize_step_moe_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ grad4,
     float4* __restrict__ buf4,
@@ -443,7 +443,7 @@ void launch_muon_momentum_normalize_step_moe_vec4(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ void muon_momentum_normalize_step_moe_q4_kernel(
+__global__ __launch_bounds__(256, 2) void muon_momentum_normalize_step_moe_q4_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     int8_t* __restrict__ buf_q,
@@ -507,7 +507,7 @@ void launch_muon_momentum_normalize_step_moe_q4(
 // INT4 stochastic rounding
 
 __launch_bounds__(256, 8)
-__global__ void muon_momentum_normalize_step_moe_q4_vec4_kernel(
+__global__ __launch_bounds__(256, 2) void muon_momentum_normalize_step_moe_q4_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ grad4,
     int8_t* __restrict__ buf_q,

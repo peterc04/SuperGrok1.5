@@ -27,7 +27,7 @@ __device__ __forceinline__ int8_t float_to_int4_stochastic_gen(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ void looksam_direction_step_kernel(
+__global__ __launch_bounds__(256, 2) void looksam_direction_step_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ v_dir_ema,
@@ -84,7 +84,7 @@ void launch_looksam_direction_step(
 
 
 __launch_bounds__(256, 8)
-__global__ void looksam_direction_step_vec4_kernel(
+__global__ __launch_bounds__(256, 2) void looksam_direction_step_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ grad4,
     float4* __restrict__ v_dir_ema4,
@@ -180,7 +180,7 @@ void launch_looksam_direction_step_vec4(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ void looksam_direction_step_q4_kernel(
+__global__ __launch_bounds__(256, 2) void looksam_direction_step_q4_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     __nv_bfloat16* __restrict__ v_dir_ema_bf16,
@@ -246,7 +246,7 @@ void launch_looksam_direction_step_q4(
 // INT4 stochastic rounding
 
 __launch_bounds__(256, 8)
-__global__ void looksam_direction_step_q4_vec4_kernel(
+__global__ __launch_bounds__(256, 2) void looksam_direction_step_q4_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ grad4,
     __nv_bfloat16* __restrict__ v_dir_ema_bf16,
@@ -344,7 +344,7 @@ void launch_looksam_direction_step_q4_vec4(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ void looksam_direction_step_moe_kernel(
+__global__ __launch_bounds__(256, 2) void looksam_direction_step_moe_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ v_dir_ema,
@@ -407,7 +407,7 @@ void launch_looksam_direction_step_moe(
 
 
 __launch_bounds__(256, 8)
-__global__ void looksam_direction_step_moe_vec4_kernel(
+__global__ __launch_bounds__(256, 2) void looksam_direction_step_moe_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ grad4,
     float4* __restrict__ v_dir_ema4,
@@ -510,7 +510,7 @@ void launch_looksam_direction_step_moe_vec4(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ void looksam_direction_step_moe_q4_kernel(
+__global__ __launch_bounds__(256, 2) void looksam_direction_step_moe_q4_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     __nv_bfloat16* __restrict__ v_dir_ema_bf16,
@@ -582,7 +582,7 @@ void launch_looksam_direction_step_moe_q4(
 // INT4 stochastic rounding
 
 __launch_bounds__(256, 8)
-__global__ void looksam_direction_step_moe_q4_vec4_kernel(
+__global__ __launch_bounds__(256, 2) void looksam_direction_step_moe_q4_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ grad4,
     __nv_bfloat16* __restrict__ v_dir_ema_bf16,

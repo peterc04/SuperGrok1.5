@@ -21,7 +21,7 @@ constexpr int D16_D_INNER = 16;
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(16, 8)
-__global__ void mamba3_parallel_scan_d16_kernel(
+__global__ __launch_bounds__(256, 2) void mamba3_parallel_scan_d16_kernel(
     const float* __restrict__ x_sorted,
     const float* __restrict__ in_proj_W,
     const float* __restrict__ dt_proj_W,
