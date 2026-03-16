@@ -173,6 +173,11 @@ void launch_looksam_restore(
 // NOTE: launch_muon_momentum_normalize is defined in muon_kernels.cu but not
 // called from ops.cpp (momentum + normalize done via ATen ops inline).
 
+void launch_muon_fused_step(
+    torch::Tensor param, torch::Tensor momentum_buffer, torch::Tensor grad,
+    float lr, float momentum, float weight_decay, int ns_steps,
+    float a, float b, float c);
+
 void launch_muon_ns_combine(
     torch::Tensor X_out, torch::Tensor X, torch::Tensor AX, torch::Tensor AAX,
     float a, float b, float c);
@@ -793,6 +798,47 @@ void launch_fused_neuralgrok_full_step_ampere(
     float beta1, float beta2, float lr, float wd_eff, float eps,
     float bc1, float bc2);
 
+// ── Muon Ampere (csrc/cuda/sm_80/muon_sm80.cu) — TF32 cuBLAS math mode ──
+void launch_muon_fused_step_ampere(
+    torch::Tensor param, torch::Tensor momentum_buffer, torch::Tensor grad,
+    float lr, float momentum, float weight_decay, int ns_steps,
+    float a, float b, float c);
+
+// ── Muon Hopper (csrc/cuda/sm_90/muon_sm90.cu) — FP8 E4M3 Newton-Schulz GEMMs ──
+void launch_muon_fused_step_hopper(
+    torch::Tensor param, torch::Tensor momentum_buffer, torch::Tensor grad,
+    float lr, float momentum, float weight_decay, int ns_steps,
+    float a, float b, float c);
+
+// ── Hopper Tier Metanet (csrc/cuda/sm_90/metanet_optimizers_sm90.cu) ──
+// Delegates to Ampere cp.async kernels — meta-net MLPs (hidden_dim=32)
+// are too small to benefit from FP8.
+void launch_fused_supergrok15_full_step_hopper(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor mu, torch::Tensor grad, torch::Tensor sharpness,
+    float alpha,
+    torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2,
+    float rescale, float lamb_eff,
+    float beta1, float beta2, float lr, float wd_eff, float eps,
+    float bc1, float bc2, int hidden_dim);
+
+void launch_fused_sg11_full_step_hopper(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor mu, torch::Tensor grad, torch::Tensor sharpness,
+    float alpha,
+    torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2,
+    float rescale, float lamb_eff,
+    float beta1, float beta2, float lr, float wd_eff, float eps,
+    float bc1, float bc2, int hidden_dim);
+
+void launch_fused_neuralgrok_full_step_hopper(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor grad,
+    torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2,
+    float alpha_amp, float beta_amp, int hidden_dim,
+    float beta1, float beta2, float lr, float weight_decay,
+    float eps, float bc1, float bc2);
+
 #endif  // WITH_CUDA (NVIDIA-specific tiers)
 
 #ifdef WITH_HIP  // AMD-specific tier declarations
@@ -1034,6 +1080,41 @@ void launch_mamba3_peer_backward_batched_cdna3(
     torch::Tensor fwd_initial_states, torch::Tensor bwd_initial_states,
     int d_model, int d_state, int d_inner, int num_params,
     int checkpoint_interval);
+
+// ── Muon CDNA3 (csrc/hip/cdna3/muon_cdna3.hip.cpp) — delegates to generic ──
+// CDNA3 BF16 MFMA marginal for Newton-Schulz on typical param matrices.
+void launch_muon_fused_step_cdna3(
+    torch::Tensor param, torch::Tensor momentum_buffer, torch::Tensor grad,
+    float lr, float momentum, float weight_decay, int ns_steps,
+    float a, float b, float c);
+
+// ── CDNA3 Tier Metanet (csrc/hip/cdna3/metanet_optimizers_cdna3.hip.cpp) ──
+// Delegates to generic — meta-net MLPs too small for MFMA benefit.
+void launch_fused_supergrok15_full_step_cdna3(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor mu, torch::Tensor grad, torch::Tensor sharpness,
+    float alpha,
+    torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2,
+    float rescale, float lamb_eff,
+    float beta1, float beta2, float lr, float wd_eff, float eps,
+    float bc1, float bc2, int hidden_dim);
+
+void launch_fused_sg11_full_step_cdna3(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor mu, torch::Tensor grad, torch::Tensor sharpness,
+    float alpha,
+    torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2,
+    float rescale, float lamb_eff,
+    float beta1, float beta2, float lr, float wd_eff, float eps,
+    float bc1, float bc2, int hidden_dim);
+
+void launch_fused_neuralgrok_full_step_cdna3(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor grad,
+    torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2,
+    float alpha_amp, float beta_amp, int hidden_dim,
+    float beta1, float beta2, float lr, float weight_decay,
+    float eps, float bc1, float bc2);
 
 #endif  // WITH_HIP (AMD-specific tiers)
 

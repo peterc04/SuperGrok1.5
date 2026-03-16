@@ -38,6 +38,36 @@ __global__ void fused_grokfast_ema_kernel(
     grad[idx] = static_cast<scalar_t>(g + lamb * e);
 }
 
+// ===================================================================
+//  Kernel: Fused Grokfast EMA — float4 vectorized (FP32 only)
+// ===================================================================
+
+__global__ void fused_grokfast_ema_vec4_kernel(
+    float4* __restrict__ grad4,
+    float4* __restrict__ ema4,
+    float alpha, float lamb, int N4
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N4) return;
+
+    float4 g = grad4[i];
+    float4 e = ema4[i];
+
+    // EMA update
+    e.x = alpha * e.x + (1.0f - alpha) * g.x;
+    e.y = alpha * e.y + (1.0f - alpha) * g.y;
+    e.z = alpha * e.z + (1.0f - alpha) * g.z;
+    e.w = alpha * e.w + (1.0f - alpha) * g.w;
+    ema4[i] = e;
+
+    // Gradient amplification
+    g.x = g.x + lamb * e.x;
+    g.y = g.y + lamb * e.y;
+    g.z = g.z + lamb * e.z;
+    g.w = g.w + lamb * e.w;
+    grad4[i] = g;
+}
+
 void launch_fused_grokfast_ema(
     torch::Tensor grad,
     torch::Tensor ema,
@@ -46,6 +76,21 @@ void launch_fused_grokfast_ema(
 ) {
     const int N = grad.numel();
     if (N == 0) return;
+
+    // float4 fast path: FP32 grads, N divisible by 4, 16-byte aligned
+    if (grad.scalar_type() == at::ScalarType::Float &&
+        N % 4 == 0 &&
+        reinterpret_cast<uintptr_t>(grad.data_ptr()) % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(ema.data_ptr()) % 16 == 0) {
+        const int N4 = N / 4;
+        const int grid4 = (N4 + GF_BLOCK_SIZE - 1) / GF_BLOCK_SIZE;
+        fused_grokfast_ema_vec4_kernel<<<grid4, GF_BLOCK_SIZE>>>(
+            reinterpret_cast<float4*>(grad.data_ptr<float>()),
+            reinterpret_cast<float4*>(ema.data_ptr<float>()),
+            alpha, lamb, N4);
+        return;
+    }
+
     const int grid = (N + GF_BLOCK_SIZE - 1) / GF_BLOCK_SIZE;
 
     AT_DISPATCH_FLOATING_TYPES_AND2(

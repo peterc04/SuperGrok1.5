@@ -110,8 +110,11 @@ elif _has_gpu:
         "csrc/cuda/sm_80/supergrok2_backward_sm80.cu",
         "csrc/cuda/sm_80/supergrok2_fused_elem_sm80.cu",
         "csrc/cuda/sm_80/metanet_optimizers_sm80.cu",
+        "csrc/cuda/sm_80/muon_sm80.cu",
         "csrc/cuda/sm_90/supergrok2_scan_sm90.cu",
         "csrc/cuda/sm_90/supergrok2_backward_sm90.cu",
+        "csrc/cuda/sm_90/muon_sm90.cu",
+        "csrc/cuda/sm_90/metanet_optimizers_sm90.cu",
         "csrc/cuda/sm_100/supergrok2_sm100.cu",
         "csrc/quantization/quantization_kernels.cu",
     ]

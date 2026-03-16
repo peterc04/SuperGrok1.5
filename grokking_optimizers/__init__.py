@@ -55,6 +55,10 @@ from .distributed import (
     get_rank, get_world_size, is_main_process,
     broadcast_optimizer_state, wrap_model_ddp,
 )
+from .overlap_distributed import OverlappedOptimizer, OverlappedSuperGrok2
+from .gradient_compression import INT8GradientCompressor, PowerSGDCompressor
+from .partial_graph import PartialGraphOptimizer
+from .sparse_gradients import SparseGradientHandler
 
 __all__ = [
     "SuperGrok15", "SharpnessMetaNet",
@@ -79,4 +83,6 @@ __all__ = [
     "get_rank", "get_world_size", "is_main_process",
     "broadcast_optimizer_state", "wrap_model_ddp",
     "_HAS_OPS", "_HAS_CUDA", "_HAS_CPU_OPS",
+    "PartialGraphOptimizer",
+    "SparseGradientHandler",
 ]

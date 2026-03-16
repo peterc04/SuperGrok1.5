@@ -185,6 +185,111 @@ __global__ void sharpness_restore_kernel(
 
 
 // ═══════════════════════════════════════════════════════════════════════
+//  Vec4 Kernel 2b: Fused Adam decay (float4 vectorized, FP32-only)
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void fused_adam_decay_vec4_kernel(
+    float4* __restrict__ param4,
+    float4* __restrict__ exp_avg4,
+    float4* __restrict__ exp_avg_sq4,
+    const float4* __restrict__ smart_grad4,
+    const float4* __restrict__ mu4,
+    float lamb_eff, float beta1, float beta2, float lr,
+    float wd_eff, float eps, float bc1, float bc2, int N4
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N4) return;
+
+    float4 sg = smart_grad4[i];
+    float4 m = mu4[i];
+
+    // Final gradient = smart_grad + lambda * mu
+    float4 fg;
+    fg.x = sg.x + lamb_eff * m.x;
+    fg.y = sg.y + lamb_eff * m.y;
+    fg.z = sg.z + lamb_eff * m.z;
+    fg.w = sg.w + lamb_eff * m.w;
+
+    // Adam moment updates
+    float4 ea = exp_avg4[i];
+    float4 eas = exp_avg_sq4[i];
+
+    ea.x = beta1 * ea.x + (1.0f - beta1) * fg.x;
+    ea.y = beta1 * ea.y + (1.0f - beta1) * fg.y;
+    ea.z = beta1 * ea.z + (1.0f - beta1) * fg.z;
+    ea.w = beta1 * ea.w + (1.0f - beta1) * fg.w;
+
+    eas.x = beta2 * eas.x + (1.0f - beta2) * fg.x * fg.x;
+    eas.y = beta2 * eas.y + (1.0f - beta2) * fg.y * fg.y;
+    eas.z = beta2 * eas.z + (1.0f - beta2) * fg.z * fg.z;
+    eas.w = beta2 * eas.w + (1.0f - beta2) * fg.w * fg.w;
+
+    exp_avg4[i] = ea;
+    exp_avg_sq4[i] = eas;
+
+    // Bias-corrected step + progressive weight decay
+    float step_size = lr / bc1;
+    float decay = 1.0f - lr * wd_eff;
+    float4 p = param4[i];
+    p.x = decay * p.x - step_size * ea.x / (sqrtf(eas.x / bc2) + eps);
+    p.y = decay * p.y - step_size * ea.y / (sqrtf(eas.y / bc2) + eps);
+    p.z = decay * p.z - step_size * ea.z / (sqrtf(eas.z / bc2) + eps);
+    p.w = decay * p.w - step_size * ea.w / (sqrtf(eas.w / bc2) + eps);
+    param4[i] = p;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Vec4 Kernel 3b: SAM perturbation (float4 vectorized, FP32-only)
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void sam_perturb_vec4_kernel(
+    float4* __restrict__ param4,
+    const float4* __restrict__ grad4,
+    float rho_over_norm,
+    int N4
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N4) return;
+
+    float4 p = param4[i];
+    float4 g = grad4[i];
+    p.x += rho_over_norm * g.x;
+    p.y += rho_over_norm * g.y;
+    p.z += rho_over_norm * g.z;
+    p.w += rho_over_norm * g.w;
+    param4[i] = p;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Vec4 Kernel 4b: Sharpness restore (float4 vectorized, FP32-only)
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void sharpness_restore_vec4_kernel(
+    float4* __restrict__ param4,
+    float4* __restrict__ sharpness4,
+    const float4* __restrict__ backup4,
+    const float4* __restrict__ sam_grad4,
+    const float4* __restrict__ normal_grad4,
+    int N4
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N4) return;
+
+    float4 sg = sam_grad4[i];
+    float4 ng = normal_grad4[i];
+    float4 s;
+    s.x = fabsf(sg.x - ng.x);
+    s.y = fabsf(sg.y - ng.y);
+    s.z = fabsf(sg.z - ng.z);
+    s.w = fabsf(sg.w - ng.w);
+    sharpness4[i] = s;
+    param4[i] = backup4[i];
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
 //  C++ Dispatch Functions (called from ops.cpp)
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -250,6 +355,29 @@ void launch_fused_adam_decay(
 ) {
     const int N = param.numel();
     if (N == 0) return;
+
+    // Float4 fast path: FP32, N divisible by 4, 16-byte aligned
+    if (param.scalar_type() == at::ScalarType::Float &&
+        (N % 4 == 0) &&
+        (reinterpret_cast<uintptr_t>(param.data_ptr<float>()) % 16 == 0) &&
+        (reinterpret_cast<uintptr_t>(exp_avg.data_ptr<float>()) % 16 == 0) &&
+        (reinterpret_cast<uintptr_t>(exp_avg_sq.data_ptr<float>()) % 16 == 0) &&
+        (reinterpret_cast<uintptr_t>(smart_grad.data_ptr<float>()) % 16 == 0) &&
+        (reinterpret_cast<uintptr_t>(mu.data_ptr<float>()) % 16 == 0))
+    {
+        const int N4 = N / 4;
+        const int grid = (N4 + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        fused_adam_decay_vec4_kernel<<<grid, BLOCK_SIZE>>>(
+            reinterpret_cast<float4*>(param.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg_sq.data_ptr<float>()),
+            reinterpret_cast<const float4*>(smart_grad.data_ptr<float>()),
+            reinterpret_cast<const float4*>(mu.data_ptr<float>()),
+            lamb_eff, beta1, beta2, lr, wd_eff, eps, bc1, bc2, N4
+        );
+        return;
+    }
+
     const int grid = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -273,6 +401,23 @@ void launch_sam_perturb(
 ) {
     const int N = param.numel();
     if (N == 0) return;
+
+    // Float4 fast path: FP32, N divisible by 4, 16-byte aligned
+    if (param.scalar_type() == at::ScalarType::Float &&
+        (N % 4 == 0) &&
+        (reinterpret_cast<uintptr_t>(param.data_ptr<float>()) % 16 == 0) &&
+        (reinterpret_cast<uintptr_t>(grad.data_ptr<float>()) % 16 == 0))
+    {
+        const int N4 = N / 4;
+        const int grid = (N4 + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        sam_perturb_vec4_kernel<<<grid, BLOCK_SIZE>>>(
+            reinterpret_cast<float4*>(param.data_ptr<float>()),
+            reinterpret_cast<const float4*>(grad.data_ptr<float>()),
+            rho_over_norm, N4
+        );
+        return;
+    }
+
     const int grid = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -295,6 +440,29 @@ void launch_sharpness_restore(
 ) {
     const int N = param.numel();
     if (N == 0) return;
+
+    // Float4 fast path: FP32, N divisible by 4, 16-byte aligned
+    if (param.scalar_type() == at::ScalarType::Float &&
+        (N % 4 == 0) &&
+        (reinterpret_cast<uintptr_t>(param.data_ptr<float>()) % 16 == 0) &&
+        (reinterpret_cast<uintptr_t>(sharpness.data_ptr<float>()) % 16 == 0) &&
+        (reinterpret_cast<uintptr_t>(backup.data_ptr<float>()) % 16 == 0) &&
+        (reinterpret_cast<uintptr_t>(sam_grad.data_ptr<float>()) % 16 == 0) &&
+        (reinterpret_cast<uintptr_t>(normal_grad.data_ptr<float>()) % 16 == 0))
+    {
+        const int N4 = N / 4;
+        const int grid = (N4 + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        sharpness_restore_vec4_kernel<<<grid, BLOCK_SIZE>>>(
+            reinterpret_cast<float4*>(param.data_ptr<float>()),
+            reinterpret_cast<float4*>(sharpness.data_ptr<float>()),
+            reinterpret_cast<const float4*>(backup.data_ptr<float>()),
+            reinterpret_cast<const float4*>(sam_grad.data_ptr<float>()),
+            reinterpret_cast<const float4*>(normal_grad.data_ptr<float>()),
+            N4
+        );
+        return;
+    }
+
     const int grid = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     AT_DISPATCH_FLOATING_TYPES_AND2(

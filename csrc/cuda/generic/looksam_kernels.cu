@@ -70,6 +70,77 @@ __global__ void looksam_restore_kernel(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+//  float4 vectorized kernels (FP32 only)
+// ═══════════════════════════════════════════════════════════════════════
+
+__global__ void looksam_direction_vec4_kernel(
+    float4* __restrict__ v_dir4,
+    const float4* __restrict__ sam_grad4,
+    const float4* __restrict__ normal_grad4,
+    float inv_norm, int N4
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N4) return;
+
+    float4 sg = sam_grad4[i];
+    float4 ng = normal_grad4[i];
+
+    float4 out;
+    out.x = (sg.x - ng.x) * inv_norm;
+    out.y = (sg.y - ng.y) * inv_norm;
+    out.z = (sg.z - ng.z) * inv_norm;
+    out.w = (sg.w - ng.w) * inv_norm;
+    v_dir4[i] = out;
+}
+
+__global__ void looksam_adjust_vec4_kernel(
+    float4* __restrict__ grad4,
+    const float4* __restrict__ v_dir4,
+    float la_times_gnorm, int N4
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N4) return;
+
+    float4 g = grad4[i];
+    float4 v = v_dir4[i];
+
+    g.x = g.x + la_times_gnorm * v.x;
+    g.y = g.y + la_times_gnorm * v.y;
+    g.z = g.z + la_times_gnorm * v.z;
+    g.w = g.w + la_times_gnorm * v.w;
+    grad4[i] = g;
+}
+
+__global__ void looksam_perturb_vec4_kernel(
+    float4* __restrict__ param4,
+    const float4* __restrict__ grad4,
+    float rho_over_norm, int N4
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N4) return;
+
+    float4 p = param4[i];
+    float4 g = grad4[i];
+
+    p.x = p.x + rho_over_norm * g.x;
+    p.y = p.y + rho_over_norm * g.y;
+    p.z = p.z + rho_over_norm * g.z;
+    p.w = p.w + rho_over_norm * g.w;
+    param4[i] = p;
+}
+
+__global__ void looksam_restore_vec4_kernel(
+    float4* __restrict__ param4,
+    const float4* __restrict__ backup4,
+    int N4
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N4) return;
+
+    param4[i] = backup4[i];
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 //  C++ Dispatch Functions
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -81,6 +152,23 @@ void launch_looksam_direction(
 ) {
     const int N = v_dir.numel();
     if (N == 0) return;
+
+    // float4 fast path: FP32 params, N divisible by 4, 16-byte aligned
+    if (v_dir.scalar_type() == at::ScalarType::Float &&
+        N % 4 == 0 &&
+        reinterpret_cast<uintptr_t>(v_dir.data_ptr()) % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(sam_grad.data_ptr()) % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(normal_grad.data_ptr()) % 16 == 0) {
+        const int N4 = N / 4;
+        const int grid4 = (N4 + LOOKSAM_BLOCK_SIZE - 1) / LOOKSAM_BLOCK_SIZE;
+        looksam_direction_vec4_kernel<<<grid4, LOOKSAM_BLOCK_SIZE>>>(
+            reinterpret_cast<float4*>(v_dir.data_ptr<float>()),
+            reinterpret_cast<const float4*>(sam_grad.data_ptr<float>()),
+            reinterpret_cast<const float4*>(normal_grad.data_ptr<float>()),
+            inv_norm, N4);
+        return;
+    }
+
     const int grid = (N + LOOKSAM_BLOCK_SIZE - 1) / LOOKSAM_BLOCK_SIZE;
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -102,6 +190,21 @@ void launch_looksam_adjust(
 ) {
     const int N = grad.numel();
     if (N == 0) return;
+
+    // float4 fast path: FP32 params, N divisible by 4, 16-byte aligned
+    if (grad.scalar_type() == at::ScalarType::Float &&
+        N % 4 == 0 &&
+        reinterpret_cast<uintptr_t>(grad.data_ptr()) % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(v_dir.data_ptr()) % 16 == 0) {
+        const int N4 = N / 4;
+        const int grid4 = (N4 + LOOKSAM_BLOCK_SIZE - 1) / LOOKSAM_BLOCK_SIZE;
+        looksam_adjust_vec4_kernel<<<grid4, LOOKSAM_BLOCK_SIZE>>>(
+            reinterpret_cast<float4*>(grad.data_ptr<float>()),
+            reinterpret_cast<const float4*>(v_dir.data_ptr<float>()),
+            la_times_gnorm, N4);
+        return;
+    }
+
     const int grid = (N + LOOKSAM_BLOCK_SIZE - 1) / LOOKSAM_BLOCK_SIZE;
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -122,6 +225,21 @@ void launch_looksam_perturb(
 ) {
     const int N = param.numel();
     if (N == 0) return;
+
+    // float4 fast path: FP32 params, N divisible by 4, 16-byte aligned
+    if (param.scalar_type() == at::ScalarType::Float &&
+        N % 4 == 0 &&
+        reinterpret_cast<uintptr_t>(param.data_ptr()) % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(grad.data_ptr()) % 16 == 0) {
+        const int N4 = N / 4;
+        const int grid4 = (N4 + LOOKSAM_BLOCK_SIZE - 1) / LOOKSAM_BLOCK_SIZE;
+        looksam_perturb_vec4_kernel<<<grid4, LOOKSAM_BLOCK_SIZE>>>(
+            reinterpret_cast<float4*>(param.data_ptr<float>()),
+            reinterpret_cast<const float4*>(grad.data_ptr<float>()),
+            rho_over_norm, N4);
+        return;
+    }
+
     const int grid = (N + LOOKSAM_BLOCK_SIZE - 1) / LOOKSAM_BLOCK_SIZE;
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -141,6 +259,21 @@ void launch_looksam_restore(
 ) {
     const int N = param.numel();
     if (N == 0) return;
+
+    // float4 fast path: FP32 params, N divisible by 4, 16-byte aligned
+    if (param.scalar_type() == at::ScalarType::Float &&
+        N % 4 == 0 &&
+        reinterpret_cast<uintptr_t>(param.data_ptr()) % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(backup.data_ptr()) % 16 == 0) {
+        const int N4 = N / 4;
+        const int grid4 = (N4 + LOOKSAM_BLOCK_SIZE - 1) / LOOKSAM_BLOCK_SIZE;
+        looksam_restore_vec4_kernel<<<grid4, LOOKSAM_BLOCK_SIZE>>>(
+            reinterpret_cast<float4*>(param.data_ptr<float>()),
+            reinterpret_cast<const float4*>(backup.data_ptr<float>()),
+            N4);
+        return;
+    }
+
     const int grid = (N + LOOKSAM_BLOCK_SIZE - 1) / LOOKSAM_BLOCK_SIZE;
 
     AT_DISPATCH_FLOATING_TYPES_AND2(

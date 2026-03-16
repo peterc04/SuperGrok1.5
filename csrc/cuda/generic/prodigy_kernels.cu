@@ -97,6 +97,68 @@ __global__ void fused_prodigy_step_kernel(
 
 
 // ===================================================================
+//  Kernel 1b: Fused Prodigy per-element step — float4 vectorized (FP32 only)
+// ===================================================================
+
+__global__ void fused_prodigy_step_vec4_kernel(
+    float4* __restrict__ param4,
+    float4* __restrict__ exp_avg4,
+    float4* __restrict__ exp_avg_sq4,
+    float4* __restrict__ s4,
+    const float4* __restrict__ grad4,
+    float d_lr, float beta1, float beta2, float lr, float weight_decay,
+    float eps, float bc1, float bc2, int N4
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N4) return;
+
+    float4 g = grad4[i];
+    float4 p = param4[i];
+    float4 ea = exp_avg4[i];
+    float4 eas = exp_avg_sq4[i];
+    float4 sv = s4[i];
+
+    // Precompute scaled gradient components
+    float4 d_lr_g, d_lr_g_sq;
+    d_lr_g.x = d_lr * g.x;  d_lr_g_sq.x = d_lr * d_lr * g.x * g.x;
+    d_lr_g.y = d_lr * g.y;  d_lr_g_sq.y = d_lr * d_lr * g.y * g.y;
+    d_lr_g.z = d_lr * g.z;  d_lr_g_sq.z = d_lr * d_lr * g.z * g.z;
+    d_lr_g.w = d_lr * g.w;  d_lr_g_sq.w = d_lr * d_lr * g.w * g.w;
+
+    // Update s
+    sv.x = beta2 * sv.x + (1.0f - beta2) * d_lr_g_sq.x;
+    sv.y = beta2 * sv.y + (1.0f - beta2) * d_lr_g_sq.y;
+    sv.z = beta2 * sv.z + (1.0f - beta2) * d_lr_g_sq.z;
+    sv.w = beta2 * sv.w + (1.0f - beta2) * d_lr_g_sq.w;
+    s4[i] = sv;
+
+    // Adam moment updates
+    ea.x = beta1 * ea.x + (1.0f - beta1) * d_lr_g.x;
+    ea.y = beta1 * ea.y + (1.0f - beta1) * d_lr_g.y;
+    ea.z = beta1 * ea.z + (1.0f - beta1) * d_lr_g.z;
+    ea.w = beta1 * ea.w + (1.0f - beta1) * d_lr_g.w;
+
+    eas.x = beta2 * eas.x + (1.0f - beta2) * d_lr_g_sq.x;
+    eas.y = beta2 * eas.y + (1.0f - beta2) * d_lr_g_sq.y;
+    eas.z = beta2 * eas.z + (1.0f - beta2) * d_lr_g_sq.z;
+    eas.w = beta2 * eas.w + (1.0f - beta2) * d_lr_g_sq.w;
+
+    exp_avg4[i] = ea;
+    exp_avg_sq4[i] = eas;
+
+    // Bias-corrected step with weight decay
+    float d_lr_eps = d_lr * eps;
+    float decay = 1.0f - lr * d_lr * weight_decay;
+
+    p.x = decay * p.x - lr * ea.x / (bc1 * (sqrtf(eas.x / bc2) + d_lr_eps));
+    p.y = decay * p.y - lr * ea.y / (bc1 * (sqrtf(eas.y / bc2) + d_lr_eps));
+    p.z = decay * p.z - lr * ea.z / (bc1 * (sqrtf(eas.z / bc2) + d_lr_eps));
+    p.w = decay * p.w - lr * ea.w / (bc1 * (sqrtf(eas.w / bc2) + d_lr_eps));
+    param4[i] = p;
+}
+
+
+// ===================================================================
 //  Kernel 2: Block reduction for computing adaptive learning rate d
 //
 //  Accumulates two global sums:
@@ -196,6 +258,24 @@ void launch_fused_prodigy_step(
 ) {
     const int N = param.numel();
     if (N == 0) return;
+
+    // float4 fast path: FP32 params, N divisible by 4, 16-byte aligned
+    if (param.scalar_type() == at::ScalarType::Float &&
+        N % 4 == 0 &&
+        reinterpret_cast<uintptr_t>(param.data_ptr()) % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(grad.data_ptr()) % 16 == 0) {
+        const int N4 = N / 4;
+        const int grid4 = (N4 + PRODIGY_BLOCK_SIZE - 1) / PRODIGY_BLOCK_SIZE;
+        fused_prodigy_step_vec4_kernel<<<grid4, PRODIGY_BLOCK_SIZE>>>(
+            reinterpret_cast<float4*>(param.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg_sq.data_ptr<float>()),
+            reinterpret_cast<float4*>(s.data_ptr<float>()),
+            reinterpret_cast<const float4*>(grad.data_ptr<float>()),
+            d_lr, beta1, beta2, lr, weight_decay, eps, bc1, bc2, N4);
+        return;
+    }
+
     const int grid = (N + PRODIGY_BLOCK_SIZE - 1) / PRODIGY_BLOCK_SIZE;
 
     AT_DISPATCH_FLOATING_TYPES_AND2(

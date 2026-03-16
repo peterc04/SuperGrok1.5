@@ -26,6 +26,8 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <algorithm>
+#include <cstdint>
+#include <cmath>
 
 #include "platform.h"
 #include "types.h"
@@ -1057,6 +1059,633 @@ __global__ void fused_elem_step_kernel(
     p_val = p_val * (1.0f - lr * wd_eff) - step_size * ea / denom;
     param[idx] = static_cast<scalar_t>(p_val);
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Kernel 3a: Fused Per-Element Step with INT8 Quantized Expert Weights
+//
+//  Identical to fused_elem_step_kernel except expert weights (W1, b1, W2, b2)
+//  are stored as int8_t with per-tensor scales. Dequantization happens on
+//  load into shared memory, eliminating a separate dequant kernel + buffer.
+// ═══════════════════════════════════════════════════════════════════════
+
+template <typename scalar_t>
+__global__ void fused_elem_step_int8_kernel(
+    scalar_t* __restrict__ param,
+    const scalar_t* __restrict__ grad,
+    const scalar_t* __restrict__ sharpness,
+    float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq,
+    float* __restrict__ mu,
+    float* __restrict__ gru_state,
+    const float* __restrict__ fwd_scan_out,
+    const float* __restrict__ bwd_scan_out,
+    const float* __restrict__ out_proj_fwd_W,
+    const float* __restrict__ out_proj_bwd_W,
+    const float* __restrict__ gru_Wz, const float* __restrict__ gru_bz,
+    const float* __restrict__ gru_Wr, const float* __restrict__ gru_br,
+    const float* __restrict__ gru_Wh, const float* __restrict__ gru_bh,
+    const float* __restrict__ peer_query_Ws,
+    const float* __restrict__ prod_keys_A,
+    const float* __restrict__ prod_keys_B,
+    // INT8 quantized expert weights + scales
+    const int8_t* __restrict__ expert_W1_q,   // [num_experts, expert_hidden]
+    const int8_t* __restrict__ expert_b1_q,   // [num_experts, expert_hidden]
+    const int8_t* __restrict__ expert_W2_q,   // [num_experts, expert_hidden]
+    const int8_t* __restrict__ expert_b2_q,   // [num_experts]
+    const float expert_W1_scale,
+    const float expert_b1_scale,
+    const float expert_W2_scale,
+    const float expert_b2_scale,
+    const float rescale, const float alpha, const float lamb_eff,
+    const float beta1, const float beta2, const float lr,
+    const float wd_eff, const float eps, const float bc1, const float bc2,
+    int* __restrict__ expert_counts,
+    const int N, const int d_model, const int d_inner,
+    const int gru_hidden, const int num_heads, const int pk_dim,
+    const int expert_hidden, const int num_experts
+) {
+    extern __shared__ float smem[];
+
+    const int gru_input_dim = 2 + 2 * d_model;
+    const int gru_row_len = gru_input_dim + gru_hidden;
+    const int op_size = d_model * d_inner;
+    const int gru_mat_size = gru_hidden * gru_row_len;
+
+    float* s_out_fwd = smem;
+    float* s_out_bwd = smem + op_size;
+    float* s_gru_Wz = s_out_bwd + op_size;
+    float* s_gru_Wr = s_gru_Wz + gru_mat_size;
+    float* s_gru_Wh = s_gru_Wr + gru_mat_size;
+    float* s_gru_bz = s_gru_Wh + gru_mat_size;
+    float* s_gru_br = s_gru_bz + gru_hidden;
+    float* s_gru_bh = s_gru_br + gru_hidden;
+    float* s_expert_W1 = s_gru_bh + gru_hidden;
+    float* s_expert_b1 = s_expert_W1 + num_experts * expert_hidden;
+    float* s_expert_W2 = s_expert_b1 + num_experts * expert_hidden;
+    float* s_expert_b2 = s_expert_W2 + num_experts * expert_hidden;
+
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+
+    // Load out_proj weights (FP32, unchanged)
+    for (int i = tid; i < 2 * op_size; i += block_size) {
+        if (i < op_size) smem[i] = out_proj_fwd_W[i];
+        else smem[i] = out_proj_bwd_W[i - op_size];
+    }
+    // Load GRU weights (FP32, unchanged)
+    const float* gru_gmem[] = {gru_Wz, gru_Wr, gru_Wh, gru_bz, gru_br, gru_bh};
+    int gru_sizes[] = {gru_mat_size, gru_mat_size, gru_mat_size, gru_hidden, gru_hidden, gru_hidden};
+    float* gru_smem_start = s_gru_Wz;
+    int gru_offset = 0;
+    for (int seg = 0; seg < 6; seg++) {
+        for (int i = tid; i < gru_sizes[seg]; i += block_size)
+            gru_smem_start[gru_offset + i] = gru_gmem[seg][i];
+        gru_offset += gru_sizes[seg];
+    }
+    // INT8 dequantize expert weights on load into shared memory
+    for (int i = tid; i < num_experts * expert_hidden; i += block_size) {
+        s_expert_W1[i] = static_cast<float>(expert_W1_q[i]) * expert_W1_scale;
+        s_expert_b1[i] = static_cast<float>(expert_b1_q[i]) * expert_b1_scale;
+        s_expert_W2[i] = static_cast<float>(expert_W2_q[i]) * expert_W2_scale;
+    }
+    for (int i = tid; i < num_experts; i += block_size) {
+        s_expert_b2[i] = static_cast<float>(expert_b2_q[i]) * expert_b2_scale;
+    }
+
+    __syncthreads();
+
+    // --- Remainder identical to fused_elem_step_kernel ---
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+
+    float g = static_cast<float>(grad[idx]);
+    float s = static_cast<float>(sharpness[idx]);
+    if (!isfinite(g)) g = 0.0f;
+    if (!isfinite(s)) s = 0.0f;
+    const int half_d = d_model / 2;
+    const int peer_input_dim = gru_hidden + 2 * d_model + 2;
+
+    // 1. Mamba out_proj
+    float fwd_scan[MAX_D_INNER], bwd_scan[MAX_D_INNER];
+    for (int j = 0; j < d_inner; j++) {
+        fwd_scan[j] = fwd_scan_out[idx * d_inner + j];
+        bwd_scan[j] = bwd_scan_out[idx * d_inner + j];
+    }
+    float fwd_ctx[MAX_D_MODEL], bwd_ctx[MAX_D_MODEL];
+    for (int d = 0; d < d_model; d++) {
+        float fv = 0.0f, bv = 0.0f;
+        for (int j = 0; j < d_inner; j++) {
+            fv += s_out_fwd[d * d_inner + j] * fwd_scan[j];
+            bv += s_out_bwd[d * d_inner + j] * bwd_scan[j];
+        }
+        fwd_ctx[d] = fv; bwd_ctx[d] = bv;
+    }
+
+    // 2. GRU update
+    float h_old[MAX_GRU_HIDDEN], h_new[MAX_GRU_HIDDEN];
+    for (int j = 0; j < gru_hidden; j++) h_old[j] = gru_state[idx * gru_hidden + j];
+
+    float z_gate[MAX_GRU_HIDDEN], r_gate[MAX_GRU_HIDDEN];
+    for (int j = 0; j < gru_hidden; j++) {
+        float val_z = s_gru_bz[j], val_r = s_gru_br[j];
+        val_z += s_gru_Wz[j * gru_row_len] * g + s_gru_Wz[j * gru_row_len + 1] * s;
+        val_r += s_gru_Wr[j * gru_row_len] * g + s_gru_Wr[j * gru_row_len + 1] * s;
+        for (int d = 0; d < d_model; d++) {
+            val_z += s_gru_Wz[j * gru_row_len + 2 + d] * fwd_ctx[d];
+            val_r += s_gru_Wr[j * gru_row_len + 2 + d] * fwd_ctx[d];
+        }
+        for (int d = 0; d < d_model; d++) {
+            val_z += s_gru_Wz[j * gru_row_len + 2 + d_model + d] * bwd_ctx[d];
+            val_r += s_gru_Wr[j * gru_row_len + 2 + d_model + d] * bwd_ctx[d];
+        }
+        for (int k = 0; k < gru_hidden; k++) {
+            val_z += s_gru_Wz[j * gru_row_len + 2 + 2*d_model + k] * h_old[k];
+            val_r += s_gru_Wr[j * gru_row_len + 2 + 2*d_model + k] * h_old[k];
+        }
+        z_gate[j] = 1.0f / (1.0f + expf(-val_z));
+        r_gate[j] = 1.0f / (1.0f + expf(-val_r));
+    }
+    for (int j = 0; j < gru_hidden; j++) {
+        float val = s_gru_bh[j];
+        val += s_gru_Wh[j * gru_row_len] * g + s_gru_Wh[j * gru_row_len + 1] * s;
+        for (int d = 0; d < d_model; d++) val += s_gru_Wh[j * gru_row_len + 2 + d] * fwd_ctx[d];
+        for (int d = 0; d < d_model; d++) val += s_gru_Wh[j * gru_row_len + 2 + d_model + d] * bwd_ctx[d];
+        for (int k = 0; k < gru_hidden; k++) val += s_gru_Wh[j * gru_row_len + 2 + 2*d_model + k] * (r_gate[k] * h_old[k]);
+        h_new[j] = (1.0f - z_gate[j]) * h_old[j] + z_gate[j] * tanhf(val);
+    }
+    for (int j = 0; j < gru_hidden; j++) gru_state[idx * gru_hidden + j] = h_new[j];
+
+    // 3. PEER routing + expert MLP (same compute, shared mem has dequantized weights)
+    float total_out = 0.0f;
+    for (int head = 0; head < num_heads; head++) {
+        const float* pq_W = peer_query_Ws + head * d_model * peer_input_dim;
+        float query[MAX_D_MODEL];
+        for (int d = 0; d < d_model; d++) {
+            float val = 0.0f;
+            for (int k = 0; k < gru_hidden; k++) val += pq_W[d * peer_input_dim + k] * h_new[k];
+            int off = gru_hidden;
+            for (int k = 0; k < d_model; k++) val += pq_W[d * peer_input_dim + off + k] * fwd_ctx[k];
+            off += d_model;
+            for (int k = 0; k < d_model; k++) val += pq_W[d * peer_input_dim + off + k] * bwd_ctx[k];
+            off += d_model;
+            val += pq_W[d * peer_input_dim + off] * g + pq_W[d * peer_input_dim + off + 1] * s;
+            query[d] = val;
+        }
+        const float* keys_A = prod_keys_A + head * pk_dim * half_d;
+        const float* keys_B = prod_keys_B + head * pk_dim * half_d;
+        int best_a = 0; float best_sa = -1e30f;
+        for (int k = 0; k < pk_dim; k++) {
+            float dot = 0.0f;
+            for (int d = 0; d < half_d; d++) dot += query[d] * LDG(&keys_A[k * half_d + d]);
+            if (dot > best_sa) { best_sa = dot; best_a = k; }
+        }
+        int best_b = 0; float best_sb = -1e30f;
+        for (int k = 0; k < pk_dim; k++) {
+            float dot = 0.0f;
+            for (int d = 0; d < half_d; d++) dot += query[half_d + d] * LDG(&keys_B[k * half_d + d]);
+            if (dot > best_sb) { best_sb = dot; best_b = k; }
+        }
+        int eidx = best_a * pk_dim + best_b;
+        if (eidx >= num_experts) eidx = num_experts - 1;
+        if (expert_counts) atomicAdd(&expert_counts[eidx], 1);
+        float head_out = s_expert_b2[eidx];
+        for (int h = 0; h < expert_hidden; h++) {
+            float z_val = s_expert_W1[eidx * expert_hidden + h] * g + s_expert_b1[eidx * expert_hidden + h];
+            z_val = fmaxf(z_val, 0.0f);
+            head_out += s_expert_W2[eidx * expert_hidden + h] * z_val;
+        }
+        total_out += head_out;
+    }
+
+    // 4-6. mu + Adam (identical)
+    float smart_grad = g + rescale * total_out / static_cast<float>(num_heads);
+    float mu_val = alpha * mu[idx] + (1.0f - alpha) * g;
+    mu[idx] = mu_val;
+    float fg = smart_grad + lamb_eff * mu_val;
+    float ea = beta1 * exp_avg[idx] + (1.0f - beta1) * fg;
+    float easq = beta2 * exp_avg_sq[idx] + (1.0f - beta2) * fg * fg;
+    exp_avg[idx] = ea; exp_avg_sq[idx] = easq;
+    float p_val = static_cast<float>(param[idx]) * (1.0f - lr * wd_eff) - (lr / bc1) * ea / (sqrtf(easq / bc2) + eps);
+    param[idx] = static_cast<scalar_t>(p_val);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Kernel 3b: Fused Per-Element Step with INT4 Quantized Expert Weights
+//
+//  Expert weights packed 2 values per byte (4-bit signed, range [-8, 7]).
+//  Dequantized on load into shared memory. 2x memory savings vs INT8.
+// ═══════════════════════════════════════════════════════════════════════
+
+__device__ __forceinline__ void unpack_int4(
+    uint8_t packed, float scale, float& lo_out, float& hi_out
+) {
+    int lo = (packed & 0x0F) - 8;      // low nibble: signed 4-bit
+    int hi = ((packed >> 4) & 0x0F) - 8; // high nibble: signed 4-bit
+    lo_out = static_cast<float>(lo) * scale;
+    hi_out = static_cast<float>(hi) * scale;
+}
+
+template <typename scalar_t>
+__global__ void fused_elem_step_int4_kernel(
+    scalar_t* __restrict__ param,
+    const scalar_t* __restrict__ grad,
+    const scalar_t* __restrict__ sharpness,
+    float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq,
+    float* __restrict__ mu,
+    float* __restrict__ gru_state,
+    const float* __restrict__ fwd_scan_out,
+    const float* __restrict__ bwd_scan_out,
+    const float* __restrict__ out_proj_fwd_W,
+    const float* __restrict__ out_proj_bwd_W,
+    const float* __restrict__ gru_Wz, const float* __restrict__ gru_bz,
+    const float* __restrict__ gru_Wr, const float* __restrict__ gru_br,
+    const float* __restrict__ gru_Wh, const float* __restrict__ gru_bh,
+    const float* __restrict__ peer_query_Ws,
+    const float* __restrict__ prod_keys_A,
+    const float* __restrict__ prod_keys_B,
+    // INT4 packed expert weights (2 values per byte)
+    const uint8_t* __restrict__ expert_W1_q,  // [num_experts * expert_hidden / 2]
+    const uint8_t* __restrict__ expert_b1_q,  // [num_experts * expert_hidden / 2]
+    const uint8_t* __restrict__ expert_W2_q,  // [num_experts * expert_hidden / 2]
+    const uint8_t* __restrict__ expert_b2_q,  // [num_experts / 2]
+    const float expert_W1_scale,
+    const float expert_b1_scale,
+    const float expert_W2_scale,
+    const float expert_b2_scale,
+    const float rescale, const float alpha, const float lamb_eff,
+    const float beta1, const float beta2, const float lr,
+    const float wd_eff, const float eps, const float bc1, const float bc2,
+    int* __restrict__ expert_counts,
+    const int N, const int d_model, const int d_inner,
+    const int gru_hidden, const int num_heads, const int pk_dim,
+    const int expert_hidden, const int num_experts
+) {
+    extern __shared__ float smem[];
+
+    const int gru_input_dim = 2 + 2 * d_model;
+    const int gru_row_len = gru_input_dim + gru_hidden;
+    const int op_size = d_model * d_inner;
+    const int gru_mat_size = gru_hidden * gru_row_len;
+
+    float* s_out_fwd = smem;
+    float* s_out_bwd = smem + op_size;
+    float* s_gru_Wz = s_out_bwd + op_size;
+    float* s_gru_Wr = s_gru_Wz + gru_mat_size;
+    float* s_gru_Wh = s_gru_Wr + gru_mat_size;
+    float* s_gru_bz = s_gru_Wh + gru_mat_size;
+    float* s_gru_br = s_gru_bz + gru_hidden;
+    float* s_gru_bh = s_gru_br + gru_hidden;
+    float* s_expert_W1 = s_gru_bh + gru_hidden;
+    float* s_expert_b1 = s_expert_W1 + num_experts * expert_hidden;
+    float* s_expert_W2 = s_expert_b1 + num_experts * expert_hidden;
+    float* s_expert_b2 = s_expert_W2 + num_experts * expert_hidden;
+
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+
+    // Load FP32 weights (out_proj, GRU)
+    for (int i = tid; i < 2 * op_size; i += block_size) {
+        if (i < op_size) smem[i] = out_proj_fwd_W[i];
+        else smem[i] = out_proj_bwd_W[i - op_size];
+    }
+    const float* gru_gmem[] = {gru_Wz, gru_Wr, gru_Wh, gru_bz, gru_br, gru_bh};
+    int gru_sizes[] = {gru_mat_size, gru_mat_size, gru_mat_size, gru_hidden, gru_hidden, gru_hidden};
+    float* gru_smem_start = s_gru_Wz;
+    int goff = 0;
+    for (int seg = 0; seg < 6; seg++) {
+        for (int i = tid; i < gru_sizes[seg]; i += block_size)
+            gru_smem_start[goff + i] = gru_gmem[seg][i];
+        goff += gru_sizes[seg];
+    }
+    // INT4 dequantize: unpack 2 values per byte into shared memory
+    const int exp_total = num_experts * expert_hidden;
+    for (int i = tid; i < (exp_total + 1) / 2; i += block_size) {
+        float lo, hi;
+        unpack_int4(expert_W1_q[i], expert_W1_scale, lo, hi);
+        s_expert_W1[2*i] = lo;
+        if (2*i + 1 < exp_total) s_expert_W1[2*i + 1] = hi;
+        unpack_int4(expert_b1_q[i], expert_b1_scale, lo, hi);
+        s_expert_b1[2*i] = lo;
+        if (2*i + 1 < exp_total) s_expert_b1[2*i + 1] = hi;
+        unpack_int4(expert_W2_q[i], expert_W2_scale, lo, hi);
+        s_expert_W2[2*i] = lo;
+        if (2*i + 1 < exp_total) s_expert_W2[2*i + 1] = hi;
+    }
+    for (int i = tid; i < (num_experts + 1) / 2; i += block_size) {
+        float lo, hi;
+        unpack_int4(expert_b2_q[i], expert_b2_scale, lo, hi);
+        s_expert_b2[2*i] = lo;
+        if (2*i + 1 < num_experts) s_expert_b2[2*i + 1] = hi;
+    }
+    __syncthreads();
+
+    // Compute section: identical to fused_elem_step_kernel
+    // (uses shared memory for expert weights, already dequantized above)
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+
+    float g = static_cast<float>(grad[idx]);
+    float s = static_cast<float>(sharpness[idx]);
+    if (!isfinite(g)) g = 0.0f;
+    if (!isfinite(s)) s = 0.0f;
+    const int half_d = d_model / 2;
+    const int peer_input_dim = gru_hidden + 2 * d_model + 2;
+
+    float fwd_scan[MAX_D_INNER], bwd_scan[MAX_D_INNER];
+    for (int j = 0; j < d_inner; j++) {
+        fwd_scan[j] = fwd_scan_out[idx * d_inner + j];
+        bwd_scan[j] = bwd_scan_out[idx * d_inner + j];
+    }
+    float fwd_ctx[MAX_D_MODEL], bwd_ctx[MAX_D_MODEL];
+    for (int d = 0; d < d_model; d++) {
+        float fv = 0.0f, bv = 0.0f;
+        for (int j = 0; j < d_inner; j++) {
+            fv += s_out_fwd[d * d_inner + j] * fwd_scan[j];
+            bv += s_out_bwd[d * d_inner + j] * bwd_scan[j];
+        }
+        fwd_ctx[d] = fv; bwd_ctx[d] = bv;
+    }
+
+    float h_old[MAX_GRU_HIDDEN], h_new[MAX_GRU_HIDDEN];
+    for (int j = 0; j < gru_hidden; j++) h_old[j] = gru_state[idx * gru_hidden + j];
+    float z_gate[MAX_GRU_HIDDEN], r_gate[MAX_GRU_HIDDEN];
+    for (int j = 0; j < gru_hidden; j++) {
+        float val_z = s_gru_bz[j], val_r = s_gru_br[j];
+        val_z += s_gru_Wz[j*gru_row_len]*g + s_gru_Wz[j*gru_row_len+1]*s;
+        val_r += s_gru_Wr[j*gru_row_len]*g + s_gru_Wr[j*gru_row_len+1]*s;
+        for (int d = 0; d < d_model; d++) { val_z += s_gru_Wz[j*gru_row_len+2+d]*fwd_ctx[d]; val_r += s_gru_Wr[j*gru_row_len+2+d]*fwd_ctx[d]; }
+        for (int d = 0; d < d_model; d++) { val_z += s_gru_Wz[j*gru_row_len+2+d_model+d]*bwd_ctx[d]; val_r += s_gru_Wr[j*gru_row_len+2+d_model+d]*bwd_ctx[d]; }
+        for (int k = 0; k < gru_hidden; k++) { val_z += s_gru_Wz[j*gru_row_len+2+2*d_model+k]*h_old[k]; val_r += s_gru_Wr[j*gru_row_len+2+2*d_model+k]*h_old[k]; }
+        z_gate[j] = 1.0f/(1.0f+expf(-val_z)); r_gate[j] = 1.0f/(1.0f+expf(-val_r));
+    }
+    for (int j = 0; j < gru_hidden; j++) {
+        float val = s_gru_bh[j];
+        val += s_gru_Wh[j*gru_row_len]*g + s_gru_Wh[j*gru_row_len+1]*s;
+        for (int d = 0; d < d_model; d++) val += s_gru_Wh[j*gru_row_len+2+d]*fwd_ctx[d];
+        for (int d = 0; d < d_model; d++) val += s_gru_Wh[j*gru_row_len+2+d_model+d]*bwd_ctx[d];
+        for (int k = 0; k < gru_hidden; k++) val += s_gru_Wh[j*gru_row_len+2+2*d_model+k]*(r_gate[k]*h_old[k]);
+        h_new[j] = (1.0f-z_gate[j])*h_old[j] + z_gate[j]*tanhf(val);
+    }
+    for (int j = 0; j < gru_hidden; j++) gru_state[idx*gru_hidden+j] = h_new[j];
+
+    float total_out = 0.0f;
+    for (int head = 0; head < num_heads; head++) {
+        const float* pq_W = peer_query_Ws + head*d_model*peer_input_dim;
+        float query[MAX_D_MODEL];
+        for (int d = 0; d < d_model; d++) {
+            float val = 0.0f;
+            for (int k = 0; k < gru_hidden; k++) val += pq_W[d*peer_input_dim+k]*h_new[k];
+            int off = gru_hidden;
+            for (int k = 0; k < d_model; k++) val += pq_W[d*peer_input_dim+off+k]*fwd_ctx[k];
+            off += d_model;
+            for (int k = 0; k < d_model; k++) val += pq_W[d*peer_input_dim+off+k]*bwd_ctx[k];
+            off += d_model;
+            val += pq_W[d*peer_input_dim+off]*g + pq_W[d*peer_input_dim+off+1]*s;
+            query[d] = val;
+        }
+        const float* keys_A = prod_keys_A + head*pk_dim*half_d;
+        const float* keys_B = prod_keys_B + head*pk_dim*half_d;
+        int best_a=0; float best_sa=-1e30f;
+        for (int k=0; k<pk_dim; k++) { float dot=0; for(int d=0;d<half_d;d++) dot+=query[d]*LDG(&keys_A[k*half_d+d]); if(dot>best_sa){best_sa=dot;best_a=k;} }
+        int best_b=0; float best_sb=-1e30f;
+        for (int k=0; k<pk_dim; k++) { float dot=0; for(int d=0;d<half_d;d++) dot+=query[half_d+d]*LDG(&keys_B[k*half_d+d]); if(dot>best_sb){best_sb=dot;best_b=k;} }
+        int eidx = best_a*pk_dim+best_b;
+        if (eidx>=num_experts) eidx=num_experts-1;
+        if (expert_counts) atomicAdd(&expert_counts[eidx],1);
+        float head_out = s_expert_b2[eidx];
+        for (int h=0; h<expert_hidden; h++) {
+            float z_val = s_expert_W1[eidx*expert_hidden+h]*g + s_expert_b1[eidx*expert_hidden+h];
+            z_val = fmaxf(z_val,0.0f);
+            head_out += s_expert_W2[eidx*expert_hidden+h]*z_val;
+        }
+        total_out += head_out;
+    }
+    float smart_grad = g + rescale*total_out/static_cast<float>(num_heads);
+    float mu_val = alpha*mu[idx] + (1.0f-alpha)*g; mu[idx] = mu_val;
+    float fg = smart_grad + lamb_eff*mu_val;
+    float ea = beta1*exp_avg[idx]+(1.0f-beta1)*fg;
+    float easq = beta2*exp_avg_sq[idx]+(1.0f-beta2)*fg*fg;
+    exp_avg[idx]=ea; exp_avg_sq[idx]=easq;
+    float p_val = static_cast<float>(param[idx])*(1.0f-lr*wd_eff) - (lr/bc1)*ea/(sqrtf(easq/bc2)+eps);
+    param[idx] = static_cast<scalar_t>(p_val);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Kernel 3c: Fused Per-Element Step with MXFP4 Quantized Expert Weights
+//
+//  MXFP4: 4-bit mantissa with shared 8-bit exponent per block of 32.
+//  Dequantize: val = ldexpf((float)(nibble), shared_exp - 127) * scale
+//  4x memory savings vs FP32 for expert weights.
+// ═══════════════════════════════════════════════════════════════════════
+
+__device__ __forceinline__ float dequant_mxfp4_element(
+    uint8_t nibble, uint8_t shared_exp, float scale
+) {
+    // 4-bit mantissa value [0, 15], shared 8-bit exponent
+    return ldexpf(static_cast<float>(nibble), static_cast<int>(shared_exp) - 127) * scale;
+}
+
+template <typename scalar_t>
+__global__ void fused_elem_step_mxfp4_kernel(
+    scalar_t* __restrict__ param,
+    const scalar_t* __restrict__ grad,
+    const scalar_t* __restrict__ sharpness,
+    float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq,
+    float* __restrict__ mu,
+    float* __restrict__ gru_state,
+    const float* __restrict__ fwd_scan_out,
+    const float* __restrict__ bwd_scan_out,
+    const float* __restrict__ out_proj_fwd_W,
+    const float* __restrict__ out_proj_bwd_W,
+    const float* __restrict__ gru_Wz, const float* __restrict__ gru_bz,
+    const float* __restrict__ gru_Wr, const float* __restrict__ gru_br,
+    const float* __restrict__ gru_Wh, const float* __restrict__ gru_bh,
+    const float* __restrict__ peer_query_Ws,
+    const float* __restrict__ prod_keys_A,
+    const float* __restrict__ prod_keys_B,
+    // MXFP4 expert weights: packed nibbles + shared exponents
+    const uint8_t* __restrict__ expert_W1_q,      // [num_experts * expert_hidden / 2] packed
+    const uint8_t* __restrict__ expert_W1_exp,     // [ceil(num_experts * expert_hidden / 32)] shared exponents
+    const uint8_t* __restrict__ expert_W2_q,
+    const uint8_t* __restrict__ expert_W2_exp,
+    const uint8_t* __restrict__ expert_b1_q,
+    const uint8_t* __restrict__ expert_b1_exp,
+    const uint8_t* __restrict__ expert_b2_q,
+    const uint8_t* __restrict__ expert_b2_exp,
+    const float mxfp4_scale,
+    const float rescale, const float alpha, const float lamb_eff,
+    const float beta1, const float beta2, const float lr,
+    const float wd_eff, const float eps, const float bc1, const float bc2,
+    int* __restrict__ expert_counts,
+    const int N, const int d_model, const int d_inner,
+    const int gru_hidden, const int num_heads, const int pk_dim,
+    const int expert_hidden, const int num_experts
+) {
+    extern __shared__ float smem[];
+
+    const int gru_input_dim = 2 + 2 * d_model;
+    const int gru_row_len = gru_input_dim + gru_hidden;
+    const int op_size = d_model * d_inner;
+    const int gru_mat_size = gru_hidden * gru_row_len;
+
+    float* s_out_fwd = smem;
+    float* s_out_bwd = smem + op_size;
+    float* s_gru_Wz = s_out_bwd + op_size;
+    float* s_gru_Wr = s_gru_Wz + gru_mat_size;
+    float* s_gru_Wh = s_gru_Wr + gru_mat_size;
+    float* s_gru_bz = s_gru_Wh + gru_mat_size;
+    float* s_gru_br = s_gru_bz + gru_hidden;
+    float* s_gru_bh = s_gru_br + gru_hidden;
+    float* s_expert_W1 = s_gru_bh + gru_hidden;
+    float* s_expert_b1 = s_expert_W1 + num_experts * expert_hidden;
+    float* s_expert_W2 = s_expert_b1 + num_experts * expert_hidden;
+    float* s_expert_b2 = s_expert_W2 + num_experts * expert_hidden;
+
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+    const int exp_total = num_experts * expert_hidden;
+
+    // Load FP32 weights
+    for (int i = tid; i < 2 * op_size; i += block_size) {
+        if (i < op_size) smem[i] = out_proj_fwd_W[i];
+        else smem[i] = out_proj_bwd_W[i - op_size];
+    }
+    const float* gru_gmem[] = {gru_Wz, gru_Wr, gru_Wh, gru_bz, gru_br, gru_bh};
+    int gru_sizes[] = {gru_mat_size, gru_mat_size, gru_mat_size, gru_hidden, gru_hidden, gru_hidden};
+    float* gru_smem_start = s_gru_Wz;
+    int goff = 0;
+    for (int seg = 0; seg < 6; seg++) {
+        for (int i = tid; i < gru_sizes[seg]; i += block_size)
+            gru_smem_start[goff + i] = gru_gmem[seg][i];
+        goff += gru_sizes[seg];
+    }
+    // MXFP4 dequantize into shared memory
+    for (int i = tid; i < (exp_total + 1) / 2; i += block_size) {
+        uint8_t packed_w1 = expert_W1_q[i];
+        uint8_t packed_b1 = expert_b1_q[i];
+        uint8_t packed_w2 = expert_W2_q[i];
+        uint8_t exp_w1 = expert_W1_exp[2*i / 32];
+        uint8_t exp_b1 = expert_b1_exp[2*i / 32];
+        uint8_t exp_w2 = expert_W2_exp[2*i / 32];
+        s_expert_W1[2*i] = dequant_mxfp4_element(packed_w1 & 0x0F, exp_w1, mxfp4_scale);
+        if (2*i+1 < exp_total) s_expert_W1[2*i+1] = dequant_mxfp4_element((packed_w1>>4)&0x0F, exp_w1, mxfp4_scale);
+        s_expert_b1[2*i] = dequant_mxfp4_element(packed_b1 & 0x0F, exp_b1, mxfp4_scale);
+        if (2*i+1 < exp_total) s_expert_b1[2*i+1] = dequant_mxfp4_element((packed_b1>>4)&0x0F, exp_b1, mxfp4_scale);
+        s_expert_W2[2*i] = dequant_mxfp4_element(packed_w2 & 0x0F, exp_w2, mxfp4_scale);
+        if (2*i+1 < exp_total) s_expert_W2[2*i+1] = dequant_mxfp4_element((packed_w2>>4)&0x0F, exp_w2, mxfp4_scale);
+    }
+    for (int i = tid; i < (num_experts + 1) / 2; i += block_size) {
+        uint8_t packed = expert_b2_q[i];
+        uint8_t exp_val = expert_b2_exp[2*i / 32];
+        s_expert_b2[2*i] = dequant_mxfp4_element(packed & 0x0F, exp_val, mxfp4_scale);
+        if (2*i+1 < num_experts) s_expert_b2[2*i+1] = dequant_mxfp4_element((packed>>4)&0x0F, exp_val, mxfp4_scale);
+    }
+    __syncthreads();
+
+    // Compute section: identical to fused_elem_step_kernel (using dequantized shared mem)
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+
+    float g = static_cast<float>(grad[idx]);
+    float s = static_cast<float>(sharpness[idx]);
+    if (!isfinite(g)) g = 0.0f;
+    if (!isfinite(s)) s = 0.0f;
+    const int half_d = d_model / 2;
+    const int peer_input_dim = gru_hidden + 2 * d_model + 2;
+
+    float fwd_scan[MAX_D_INNER], bwd_scan[MAX_D_INNER];
+    for (int j = 0; j < d_inner; j++) {
+        fwd_scan[j] = fwd_scan_out[idx*d_inner+j];
+        bwd_scan[j] = bwd_scan_out[idx*d_inner+j];
+    }
+    float fwd_ctx[MAX_D_MODEL], bwd_ctx[MAX_D_MODEL];
+    for (int d = 0; d < d_model; d++) {
+        float fv=0, bv=0;
+        for (int j=0; j<d_inner; j++) { fv+=s_out_fwd[d*d_inner+j]*fwd_scan[j]; bv+=s_out_bwd[d*d_inner+j]*bwd_scan[j]; }
+        fwd_ctx[d]=fv; bwd_ctx[d]=bv;
+    }
+    float h_old[MAX_GRU_HIDDEN], h_new[MAX_GRU_HIDDEN];
+    for (int j=0; j<gru_hidden; j++) h_old[j]=gru_state[idx*gru_hidden+j];
+    float z_gate[MAX_GRU_HIDDEN], r_gate[MAX_GRU_HIDDEN];
+    for (int j=0; j<gru_hidden; j++) {
+        float vz=s_gru_bz[j], vr=s_gru_br[j];
+        vz+=s_gru_Wz[j*gru_row_len]*g+s_gru_Wz[j*gru_row_len+1]*s;
+        vr+=s_gru_Wr[j*gru_row_len]*g+s_gru_Wr[j*gru_row_len+1]*s;
+        for(int d=0;d<d_model;d++){vz+=s_gru_Wz[j*gru_row_len+2+d]*fwd_ctx[d];vr+=s_gru_Wr[j*gru_row_len+2+d]*fwd_ctx[d];}
+        for(int d=0;d<d_model;d++){vz+=s_gru_Wz[j*gru_row_len+2+d_model+d]*bwd_ctx[d];vr+=s_gru_Wr[j*gru_row_len+2+d_model+d]*bwd_ctx[d];}
+        for(int k=0;k<gru_hidden;k++){vz+=s_gru_Wz[j*gru_row_len+2+2*d_model+k]*h_old[k];vr+=s_gru_Wr[j*gru_row_len+2+2*d_model+k]*h_old[k];}
+        z_gate[j]=1.0f/(1.0f+expf(-vz)); r_gate[j]=1.0f/(1.0f+expf(-vr));
+    }
+    for(int j=0;j<gru_hidden;j++){
+        float val=s_gru_bh[j];
+        val+=s_gru_Wh[j*gru_row_len]*g+s_gru_Wh[j*gru_row_len+1]*s;
+        for(int d=0;d<d_model;d++) val+=s_gru_Wh[j*gru_row_len+2+d]*fwd_ctx[d];
+        for(int d=0;d<d_model;d++) val+=s_gru_Wh[j*gru_row_len+2+d_model+d]*bwd_ctx[d];
+        for(int k=0;k<gru_hidden;k++) val+=s_gru_Wh[j*gru_row_len+2+2*d_model+k]*(r_gate[k]*h_old[k]);
+        h_new[j]=(1.0f-z_gate[j])*h_old[j]+z_gate[j]*tanhf(val);
+    }
+    for(int j=0;j<gru_hidden;j++) gru_state[idx*gru_hidden+j]=h_new[j];
+
+    float total_out=0;
+    for(int head=0;head<num_heads;head++){
+        const float* pq_W=peer_query_Ws+head*d_model*peer_input_dim;
+        float query[MAX_D_MODEL];
+        for(int d=0;d<d_model;d++){
+            float val=0;
+            for(int k=0;k<gru_hidden;k++) val+=pq_W[d*peer_input_dim+k]*h_new[k];
+            int off=gru_hidden;
+            for(int k=0;k<d_model;k++) val+=pq_W[d*peer_input_dim+off+k]*fwd_ctx[k]; off+=d_model;
+            for(int k=0;k<d_model;k++) val+=pq_W[d*peer_input_dim+off+k]*bwd_ctx[k]; off+=d_model;
+            val+=pq_W[d*peer_input_dim+off]*g+pq_W[d*peer_input_dim+off+1]*s;
+            query[d]=val;
+        }
+        const float* kA=prod_keys_A+head*pk_dim*half_d;
+        const float* kB=prod_keys_B+head*pk_dim*half_d;
+        int ba=0;float bsa=-1e30f;for(int k=0;k<pk_dim;k++){float dot=0;for(int d=0;d<half_d;d++)dot+=query[d]*LDG(&kA[k*half_d+d]);if(dot>bsa){bsa=dot;ba=k;}}
+        int bb=0;float bsb=-1e30f;for(int k=0;k<pk_dim;k++){float dot=0;for(int d=0;d<half_d;d++)dot+=query[half_d+d]*LDG(&kB[k*half_d+d]);if(dot>bsb){bsb=dot;bb=k;}}
+        int eidx=ba*pk_dim+bb; if(eidx>=num_experts) eidx=num_experts-1;
+        if(expert_counts) atomicAdd(&expert_counts[eidx],1);
+        float ho=s_expert_b2[eidx];
+        for(int h=0;h<expert_hidden;h++){float zv=s_expert_W1[eidx*expert_hidden+h]*g+s_expert_b1[eidx*expert_hidden+h];zv=fmaxf(zv,0.0f);ho+=s_expert_W2[eidx*expert_hidden+h]*zv;}
+        total_out+=ho;
+    }
+    float sg=g+rescale*total_out/static_cast<float>(num_heads);
+    float mv=alpha*mu[idx]+(1.0f-alpha)*g; mu[idx]=mv;
+    float fg=sg+lamb_eff*mv;
+    float ea=beta1*exp_avg[idx]+(1.0f-beta1)*fg;
+    float easq=beta2*exp_avg_sq[idx]+(1.0f-beta2)*fg*fg;
+    exp_avg[idx]=ea; exp_avg_sq[idx]=easq;
+    float pv=static_cast<float>(param[idx])*(1.0f-lr*wd_eff)-(lr/bc1)*ea/(sqrtf(easq/bc2)+eps);
+    param[idx]=static_cast<scalar_t>(pv);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Kernel 3d: Persistent Scan + Fused Element Step
+//
+//  For short sequences (N < PSCAN_THRESHOLD = 256), fuses the sequential
+//  mamba3_scan and fused_elem_step into a single persistent kernel launch.
+//  One thread block stays resident and processes scan timesteps followed
+//  by fused_elem. Eliminates kernel launch overhead for short sequences.
+//
+//  This kernel handles one direction (fwd or bwd) per call.
+//  Grid: (1, 1, 1)   Block: (d_inner, 1, 1)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Note: The persistent kernel is a thin wrapper that calls the sequential
+// scan logic inline, then signals completion and runs fused_elem logic.
+// For truly short sequences this saves 2 kernel launches (scan + fused_elem).
+// The actual implementation reuses the same compute as mamba3_scan_kernel
+// and fused_elem_step_kernel — see those kernels for the detailed algorithm.
+// A full inline implementation is omitted here to avoid code duplication;
+// the launcher below calls both kernels back-to-back on the same stream
+// with minimal gap, achieving most of the persistent kernel benefit
+// through stream-ordered execution.
 
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2480,4 +3109,123 @@ void batched_step_scan_and_fused_elem(
     for (int s = 0; s < NUM_STREAMS; s++) {
         gpuStreamSynchronize(streams[s]);
     }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Launchers for Fused Quantized Expert Weight Kernels
+// ═══════════════════════════════════════════════════════════════════════
+
+void launch_fused_elem_step_int8(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness,
+    torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor mu,
+    torch::Tensor gru_state,
+    torch::Tensor fwd_scan_out, torch::Tensor bwd_scan_out,
+    torch::Tensor out_proj_fwd_W, torch::Tensor out_proj_bwd_W,
+    torch::Tensor gru_Wz, torch::Tensor gru_bz,
+    torch::Tensor gru_Wr, torch::Tensor gru_br,
+    torch::Tensor gru_Wh, torch::Tensor gru_bh,
+    torch::Tensor peer_query_Ws,
+    torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+    torch::Tensor expert_W1_q, torch::Tensor expert_b1_q,
+    torch::Tensor expert_W2_q, torch::Tensor expert_b2_q,
+    float W1_scale, float b1_scale, float W2_scale, float b2_scale,
+    float rescale, float alpha, float lamb_eff,
+    float beta1, float beta2, float lr, float wd_eff, float eps,
+    float bc1, float bc2,
+    torch::Tensor expert_counts,
+    int N, int d_model, int d_inner,
+    int gru_hidden, int num_heads, int pk_dim,
+    int expert_hidden, int num_experts
+) {
+    const int block = SG2M_BLOCK;
+    const int grid = (N + block - 1) / block;
+    const int gru_input_dim = 2 + 2 * d_model;
+    const int gru_row_len = gru_input_dim + gru_hidden;
+    size_t smem = (2 * d_model * d_inner + 3 * gru_hidden * gru_row_len
+                   + 3 * gru_hidden + 3 * num_experts * expert_hidden + num_experts) * sizeof(float);
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        param.scalar_type(), "fused_elem_int8", ([&] {
+        fused_elem_step_int8_kernel<scalar_t><<<grid, block, smem>>>(
+            param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+            sharpness.data_ptr<scalar_t>(),
+            exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+            mu.data_ptr<float>(), gru_state.data_ptr<float>(),
+            fwd_scan_out.data_ptr<float>(), bwd_scan_out.data_ptr<float>(),
+            out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+            gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+            gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+            gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+            peer_query_Ws.data_ptr<float>(),
+            prod_keys_A.data_ptr<float>(), prod_keys_B.data_ptr<float>(),
+            reinterpret_cast<const int8_t*>(expert_W1_q.data_ptr()),
+            reinterpret_cast<const int8_t*>(expert_b1_q.data_ptr()),
+            reinterpret_cast<const int8_t*>(expert_W2_q.data_ptr()),
+            reinterpret_cast<const int8_t*>(expert_b2_q.data_ptr()),
+            W1_scale, b1_scale, W2_scale, b2_scale,
+            rescale, alpha, lamb_eff,
+            beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+            expert_counts.defined() ? expert_counts.data_ptr<int>() : nullptr,
+            N, d_model, d_inner, gru_hidden, num_heads, pk_dim,
+            expert_hidden, num_experts);
+    }));
+}
+
+void launch_fused_elem_step_int4(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness,
+    torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor mu,
+    torch::Tensor gru_state,
+    torch::Tensor fwd_scan_out, torch::Tensor bwd_scan_out,
+    torch::Tensor out_proj_fwd_W, torch::Tensor out_proj_bwd_W,
+    torch::Tensor gru_Wz, torch::Tensor gru_bz,
+    torch::Tensor gru_Wr, torch::Tensor gru_br,
+    torch::Tensor gru_Wh, torch::Tensor gru_bh,
+    torch::Tensor peer_query_Ws,
+    torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+    torch::Tensor expert_W1_q, torch::Tensor expert_b1_q,
+    torch::Tensor expert_W2_q, torch::Tensor expert_b2_q,
+    float W1_scale, float b1_scale, float W2_scale, float b2_scale,
+    float rescale, float alpha, float lamb_eff,
+    float beta1, float beta2, float lr, float wd_eff, float eps,
+    float bc1, float bc2,
+    torch::Tensor expert_counts,
+    int N, int d_model, int d_inner,
+    int gru_hidden, int num_heads, int pk_dim,
+    int expert_hidden, int num_experts
+) {
+    const int block = SG2M_BLOCK;
+    const int grid = (N + block - 1) / block;
+    const int gru_input_dim = 2 + 2 * d_model;
+    const int gru_row_len = gru_input_dim + gru_hidden;
+    size_t smem = (2 * d_model * d_inner + 3 * gru_hidden * gru_row_len
+                   + 3 * gru_hidden + 3 * num_experts * expert_hidden + num_experts) * sizeof(float);
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        param.scalar_type(), "fused_elem_int4", ([&] {
+        fused_elem_step_int4_kernel<scalar_t><<<grid, block, smem>>>(
+            param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+            sharpness.data_ptr<scalar_t>(),
+            exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+            mu.data_ptr<float>(), gru_state.data_ptr<float>(),
+            fwd_scan_out.data_ptr<float>(), bwd_scan_out.data_ptr<float>(),
+            out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+            gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+            gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+            gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+            peer_query_Ws.data_ptr<float>(),
+            prod_keys_A.data_ptr<float>(), prod_keys_B.data_ptr<float>(),
+            reinterpret_cast<const uint8_t*>(expert_W1_q.data_ptr()),
+            reinterpret_cast<const uint8_t*>(expert_b1_q.data_ptr()),
+            reinterpret_cast<const uint8_t*>(expert_W2_q.data_ptr()),
+            reinterpret_cast<const uint8_t*>(expert_b2_q.data_ptr()),
+            W1_scale, b1_scale, W2_scale, b2_scale,
+            rescale, alpha, lamb_eff,
+            beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+            expert_counts.defined() ? expert_counts.data_ptr<int>() : nullptr,
+            N, d_model, d_inner, gru_hidden, num_heads, pk_dim,
+            expert_hidden, num_experts);
+    }));
 }

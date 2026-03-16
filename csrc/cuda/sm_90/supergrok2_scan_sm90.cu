@@ -390,8 +390,11 @@ void launch_mamba3_peer_batched_step_hopper(
             d_model, d_inner, d_state);
     }
 
-    // Phase 3: Shared scan + fused_elem
-    batched_step_scan_and_fused_elem(
+    // Phase 3: cp.async scan + cp.async fused_elem (via Ampere path)
+    // Hopper uses Ampere's cp.async scan kernels which provide double-buffered
+    // prefetch. Combined with FP8 precompute above, this gives Hopper:
+    // FP8 precompute + cp.async scan + cp.async fused_elem.
+    ampere_batched_scan_and_fused_elem(
         ctx,
         fwd_pre_x, fwd_pre_z, fwd_pre_dt, fwd_pre_B, fwd_pre_C,
         bwd_pre_x, bwd_pre_z, bwd_pre_dt, bwd_pre_B, bwd_pre_C,

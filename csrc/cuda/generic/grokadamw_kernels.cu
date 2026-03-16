@@ -92,6 +92,68 @@ __global__ void fused_grokadamw_step_kernel(
 
 
 // ===================================================================
+//  Kernel: Fused GrokAdamW step — float4 vectorized (FP32 only)
+// ===================================================================
+
+__global__ void fused_grokadamw_step_vec4_kernel(
+    float4* __restrict__ param4,
+    float4* __restrict__ exp_avg4,
+    float4* __restrict__ exp_avg_sq4,
+    float4* __restrict__ ema4,
+    const float4* __restrict__ grad4,
+    float alpha, float lamb, float beta1, float beta2,
+    float lr, float weight_decay, float eps, float bc1, float bc2,
+    int N4
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N4) return;
+
+    float4 p = param4[i];
+    float4 g = grad4[i];
+    float4 e = ema4[i];
+    float4 ea = exp_avg4[i];
+    float4 eas = exp_avg_sq4[i];
+
+    // EMA filter
+    e.x = alpha * e.x + (1.0f - alpha) * g.x;
+    e.y = alpha * e.y + (1.0f - alpha) * g.y;
+    e.z = alpha * e.z + (1.0f - alpha) * g.z;
+    e.w = alpha * e.w + (1.0f - alpha) * g.w;
+    ema4[i] = e;
+
+    // Amplification
+    float4 amp;
+    amp.x = g.x + lamb * e.x;
+    amp.y = g.y + lamb * e.y;
+    amp.z = g.z + lamb * e.z;
+    amp.w = g.w + lamb * e.w;
+
+    // Adam moments
+    ea.x = beta1 * ea.x + (1.0f - beta1) * amp.x;
+    ea.y = beta1 * ea.y + (1.0f - beta1) * amp.y;
+    ea.z = beta1 * ea.z + (1.0f - beta1) * amp.z;
+    ea.w = beta1 * ea.w + (1.0f - beta1) * amp.w;
+
+    eas.x = beta2 * eas.x + (1.0f - beta2) * amp.x * amp.x;
+    eas.y = beta2 * eas.y + (1.0f - beta2) * amp.y * amp.y;
+    eas.z = beta2 * eas.z + (1.0f - beta2) * amp.z * amp.z;
+    eas.w = beta2 * eas.w + (1.0f - beta2) * amp.w * amp.w;
+
+    exp_avg4[i] = ea;
+    exp_avg_sq4[i] = eas;
+
+    // Step
+    float step_size = lr / bc1;
+    float decay = 1.0f - lr * weight_decay;
+    p.x = decay * p.x - step_size * ea.x / (sqrtf(eas.x / bc2) + eps);
+    p.y = decay * p.y - step_size * ea.y / (sqrtf(eas.y / bc2) + eps);
+    p.z = decay * p.z - step_size * ea.z / (sqrtf(eas.z / bc2) + eps);
+    p.w = decay * p.w - step_size * ea.w / (sqrtf(eas.w / bc2) + eps);
+    param4[i] = p;
+}
+
+
+// ===================================================================
 //  C++ Dispatch Function (called from ops.cpp / pybind)
 // ===================================================================
 
@@ -113,6 +175,24 @@ void launch_fused_grokadamw_step(
 ) {
     const int N = param.numel();
     if (N == 0) return;
+
+    // float4 fast path: FP32 params, N divisible by 4, 16-byte aligned
+    if (param.scalar_type() == at::ScalarType::Float &&
+        N % 4 == 0 &&
+        reinterpret_cast<uintptr_t>(param.data_ptr()) % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(grad.data_ptr()) % 16 == 0) {
+        const int N4 = N / 4;
+        const int grid4 = (N4 + GROKADAMW_BLOCK_SIZE - 1) / GROKADAMW_BLOCK_SIZE;
+        fused_grokadamw_step_vec4_kernel<<<grid4, GROKADAMW_BLOCK_SIZE>>>(
+            reinterpret_cast<float4*>(param.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg_sq.data_ptr<float>()),
+            reinterpret_cast<float4*>(ema.data_ptr<float>()),
+            reinterpret_cast<const float4*>(grad.data_ptr<float>()),
+            alpha, lamb, beta1, beta2, lr, weight_decay, eps, bc1, bc2, N4);
+        return;
+    }
+
     const int grid = (N + GROKADAMW_BLOCK_SIZE - 1) / GROKADAMW_BLOCK_SIZE;
 
     AT_DISPATCH_FLOATING_TYPES_AND2(

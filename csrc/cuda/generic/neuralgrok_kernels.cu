@@ -148,6 +148,49 @@ __global__ void fused_neuralgrok_adam_kernel(
 
 
 // ===================================================================
+//  Kernel 2b: Vec4 Adam update (float4 vectorized, FP32-only fast path)
+// ===================================================================
+
+__global__ void fused_neuralgrok_adam_vec4_kernel(
+    float4* __restrict__ param4,
+    float4* __restrict__ exp_avg4,
+    float4* __restrict__ exp_avg_sq4,
+    const float4* __restrict__ amplified_grad4,
+    float beta1, float beta2, float lr, float weight_decay,
+    float eps, float bc1, float bc2, int N4
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N4) return;
+
+    float4 ag = amplified_grad4[i];
+    float4 ea = exp_avg4[i];
+    float4 eas = exp_avg_sq4[i];
+
+    ea.x = beta1 * ea.x + (1.0f - beta1) * ag.x;
+    ea.y = beta1 * ea.y + (1.0f - beta1) * ag.y;
+    ea.z = beta1 * ea.z + (1.0f - beta1) * ag.z;
+    ea.w = beta1 * ea.w + (1.0f - beta1) * ag.w;
+
+    eas.x = beta2 * eas.x + (1.0f - beta2) * ag.x * ag.x;
+    eas.y = beta2 * eas.y + (1.0f - beta2) * ag.y * ag.y;
+    eas.z = beta2 * eas.z + (1.0f - beta2) * ag.z * ag.z;
+    eas.w = beta2 * eas.w + (1.0f - beta2) * ag.w * ag.w;
+
+    exp_avg4[i] = ea;
+    exp_avg_sq4[i] = eas;
+
+    float step_size = lr / bc1;
+    float decay = 1.0f - lr * weight_decay;
+    float4 p = param4[i];
+    p.x = decay * p.x - step_size * ea.x / (sqrtf(eas.x / bc2) + eps);
+    p.y = decay * p.y - step_size * ea.y / (sqrtf(eas.y / bc2) + eps);
+    p.z = decay * p.z - step_size * ea.z / (sqrtf(eas.z / bc2) + eps);
+    p.w = decay * p.w - step_size * ea.w / (sqrtf(eas.w / bc2) + eps);
+    param4[i] = p;
+}
+
+
+// ===================================================================
 //  C++ Dispatch Functions
 // ===================================================================
 
@@ -209,6 +252,27 @@ void launch_fused_neuralgrok_adam(
 ) {
     const int N = param.numel();
     if (N == 0) return;
+
+    // Float4 fast path: FP32, N divisible by 4, 16-byte aligned
+    if (param.scalar_type() == at::ScalarType::Float &&
+        (N % 4 == 0) &&
+        (reinterpret_cast<uintptr_t>(param.data_ptr<float>()) % 16 == 0) &&
+        (reinterpret_cast<uintptr_t>(exp_avg.data_ptr<float>()) % 16 == 0) &&
+        (reinterpret_cast<uintptr_t>(exp_avg_sq.data_ptr<float>()) % 16 == 0) &&
+        (reinterpret_cast<uintptr_t>(amplified_grad.data_ptr<float>()) % 16 == 0))
+    {
+        const int N4 = N / 4;
+        const int grid = (N4 + NEURALGROK_BLOCK_SIZE - 1) / NEURALGROK_BLOCK_SIZE;
+        fused_neuralgrok_adam_vec4_kernel<<<grid, NEURALGROK_BLOCK_SIZE>>>(
+            reinterpret_cast<float4*>(param.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg_sq.data_ptr<float>()),
+            reinterpret_cast<const float4*>(amplified_grad.data_ptr<float>()),
+            beta1, beta2, lr, weight_decay, eps, bc1, bc2, N4
+        );
+        return;
+    }
+
     const int grid = (N + NEURALGROK_BLOCK_SIZE - 1) / NEURALGROK_BLOCK_SIZE;
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
