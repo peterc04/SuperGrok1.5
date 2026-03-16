@@ -1169,3 +1169,139 @@ __global__ void scan_summary_prefix_bwd_kernel(
         }
     }
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  C++ Launcher Functions
+//
+//  Calculate grid/block/smem and launch each kernel via <<<>>>.
+//  These are called from ops.cpp via pybind11.
+// ═══════════════════════════════════════════════════════════════════════
+
+void distributed_scan_local_with_summary(
+    torch::Tensor pre_x_val, torch::Tensor pre_z_val, torch::Tensor pre_dt_val,
+    torch::Tensor pre_B_val, torch::Tensor pre_C_val,
+    torch::Tensor A_log, torch::Tensor D_param, torch::Tensor rope_freq,
+    torch::Tensor scan_output, torch::Tensor summaries,
+    torch::Tensor initial_state,
+    int N_local, int d_inner, int d_state, int reverse
+) {
+    dim3 grid(d_inner);
+    dim3 block(DSCAN_BLOCK);
+    int smem = DSCAN_BLOCK * 6 * sizeof(float);
+    const float* init_ptr = (initial_state.numel() > 0) ? initial_state.data_ptr<float>() : nullptr;
+
+    mamba3_scan_local_with_summary_kernel<<<grid, block, smem>>>(
+        pre_x_val.data_ptr<float>(), pre_z_val.data_ptr<float>(),
+        pre_dt_val.data_ptr<float>(), pre_B_val.data_ptr<float>(),
+        pre_C_val.data_ptr<float>(), A_log.data_ptr<float>(),
+        D_param.data_ptr<float>(), rope_freq.data_ptr<float>(),
+        scan_output.data_ptr<float>(), summaries.data_ptr<float>(),
+        init_ptr, N_local, d_inner, d_state, reverse
+    );
+}
+
+void distributed_scan_apply_prefix(
+    torch::Tensor pre_x_val, torch::Tensor pre_z_val, torch::Tensor pre_dt_val,
+    torch::Tensor pre_B_val, torch::Tensor pre_C_val,
+    torch::Tensor A_log, torch::Tensor rope_freq,
+    torch::Tensor prefix_transforms, torch::Tensor scan_output,
+    torch::Tensor initial_state,
+    int N_local, int d_inner, int d_state, int reverse
+) {
+    dim3 grid(d_inner);
+    dim3 block(DSCAN_BLOCK);
+    int smem = DSCAN_BLOCK * 6 * sizeof(float);
+    const float* init_ptr = (initial_state.numel() > 0) ? initial_state.data_ptr<float>() : nullptr;
+
+    mamba3_apply_scan_prefix_kernel<<<grid, block, smem>>>(
+        pre_x_val.data_ptr<float>(), pre_z_val.data_ptr<float>(),
+        pre_dt_val.data_ptr<float>(), pre_B_val.data_ptr<float>(),
+        pre_C_val.data_ptr<float>(), A_log.data_ptr<float>(),
+        rope_freq.data_ptr<float>(), prefix_transforms.data_ptr<float>(),
+        scan_output.data_ptr<float>(), init_ptr,
+        N_local, d_inner, d_state, reverse
+    );
+}
+
+void distributed_scan_summary_prefix(
+    torch::Tensor all_summaries, torch::Tensor prefix_out,
+    int K, int d_inner, int half_d_state
+) {
+    int num_pairs = d_inner * half_d_state;
+    dim3 grid(num_pairs);
+    dim3 block(K);
+
+    scan_summary_prefix_kernel<<<grid, block>>>(
+        all_summaries.data_ptr<float>(), prefix_out.data_ptr<float>(),
+        K, d_inner, half_d_state
+    );
+}
+
+void distributed_scan_local_with_summary_bwd(
+    torch::Tensor pre_x_val, torch::Tensor pre_z_val, torch::Tensor pre_dt_val,
+    torch::Tensor pre_B_val, torch::Tensor pre_C_val,
+    torch::Tensor A_log, torch::Tensor D_param, torch::Tensor rope_freq,
+    torch::Tensor grad_output, torch::Tensor fwd_scan_output,
+    torch::Tensor grad_pre_x, torch::Tensor grad_pre_dt,
+    torch::Tensor grad_pre_B, torch::Tensor grad_pre_C,
+    torch::Tensor grad_D, torch::Tensor bwd_summaries,
+    torch::Tensor initial_state,
+    int N_local, int d_inner, int d_state, int reverse
+) {
+    dim3 grid(d_inner);
+    dim3 block(DSCAN_BLOCK);
+    int smem = DSCAN_BLOCK * 6 * sizeof(float);
+    const float* init_ptr = (initial_state.numel() > 0) ? initial_state.data_ptr<float>() : nullptr;
+
+    mamba3_scan_local_with_summary_bwd_kernel<<<grid, block, smem>>>(
+        pre_x_val.data_ptr<float>(), pre_z_val.data_ptr<float>(),
+        pre_dt_val.data_ptr<float>(), pre_B_val.data_ptr<float>(),
+        pre_C_val.data_ptr<float>(), A_log.data_ptr<float>(),
+        D_param.data_ptr<float>(), rope_freq.data_ptr<float>(),
+        grad_output.data_ptr<float>(), fwd_scan_output.data_ptr<float>(),
+        grad_pre_x.data_ptr<float>(), grad_pre_dt.data_ptr<float>(),
+        grad_pre_B.data_ptr<float>(), grad_pre_C.data_ptr<float>(),
+        grad_D.data_ptr<float>(), bwd_summaries.data_ptr<float>(),
+        init_ptr, N_local, d_inner, d_state, reverse
+    );
+}
+
+void distributed_scan_apply_prefix_bwd(
+    torch::Tensor pre_x_val, torch::Tensor pre_z_val, torch::Tensor pre_dt_val,
+    torch::Tensor pre_B_val, torch::Tensor pre_C_val,
+    torch::Tensor A_log, torch::Tensor rope_freq,
+    torch::Tensor grad_output, torch::Tensor bwd_prefix_transforms,
+    torch::Tensor grad_pre_x, torch::Tensor grad_pre_dt,
+    torch::Tensor grad_pre_B, torch::Tensor grad_pre_C,
+    int N_local, int d_inner, int d_state, int reverse
+) {
+    dim3 grid(d_inner);
+    dim3 block(DSCAN_BLOCK);
+    int smem = DSCAN_BLOCK * 6 * sizeof(float);
+
+    mamba3_apply_scan_prefix_bwd_kernel<<<grid, block, smem>>>(
+        pre_x_val.data_ptr<float>(), pre_z_val.data_ptr<float>(),
+        pre_dt_val.data_ptr<float>(), pre_B_val.data_ptr<float>(),
+        pre_C_val.data_ptr<float>(), A_log.data_ptr<float>(),
+        rope_freq.data_ptr<float>(), grad_output.data_ptr<float>(),
+        bwd_prefix_transforms.data_ptr<float>(),
+        grad_pre_x.data_ptr<float>(), grad_pre_dt.data_ptr<float>(),
+        grad_pre_B.data_ptr<float>(), grad_pre_C.data_ptr<float>(),
+        N_local, d_inner, d_state, reverse
+    );
+}
+
+void distributed_scan_summary_prefix_bwd(
+    torch::Tensor all_bwd_summaries, torch::Tensor bwd_prefix_out,
+    int K, int d_inner, int half_d_state
+) {
+    int num_pairs = d_inner * half_d_state;
+    dim3 grid(num_pairs);
+    dim3 block(K);
+
+    scan_summary_prefix_bwd_kernel<<<grid, block>>>(
+        all_bwd_summaries.data_ptr<float>(), bwd_prefix_out.data_ptr<float>(),
+        K, d_inner, half_d_state
+    );
+}
