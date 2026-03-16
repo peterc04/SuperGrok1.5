@@ -1332,4 +1332,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Dequantize NVFP4 back to FP32",
           py::arg("input"), py::arg("block_scales"), py::arg("numel"));
 #endif
+
+    // ── CPU Fused Scan+Elem (always available) ──────────────────────
+    m.def("cpu_sg2_fused_scan_elem", &cpu_sg2_fused_scan_elem,
+          "CPU: fused single-pass scan + GRU + PEER + Expert + Adam");
+    m.def("cpu_sg2_fused_scan_elem_q4", &cpu_sg2_fused_scan_elem_q4,
+          "CPU: fused single-pass scan + elem with quantized state");
+
+    // ── CPU MoE Filter ──────────────────────────────────────────────
+    m.def("cpu_moe_filter_active_params", &cpu_moe_filter_active_params,
+          "CPU: filter active-gradient params for MoE");
 }
