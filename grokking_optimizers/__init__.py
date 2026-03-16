@@ -12,24 +12,26 @@ Usage:
 __version__ = "2.1.0"
 
 # ── Backend capability flags ─────────────────────────────────────────
-# Three-tier detection:
-#   _HAS_OPS  = True  → C++ extension loaded (GPU or CPU build)
-#   _HAS_CUDA = True  → GPU kernels available (CUDA or HIP build)
-#   _HAS_CPU_OPS = True → CPU C++ kernels available (CPU build)
-# If _HAS_OPS is False, the pure-Python fallback in _python_fallback.py
-# is used automatically by every optimizer.
-_HAS_OPS = False
-_HAS_CUDA = False
-_HAS_CPU_OPS = False
+# No fallbacks. If the C++ extension is not built, get_ops() fails loudly.
+# _HAS_OPS is always True in production. Tests mock this.
+from grokking_optimizers._ops_loader import get_ops
+
+import torch  # noqa: F401 — must import torch first to load libc10.so
+
+_HAS_OPS = True  # Always True in production. Tests mock this.
+
+def _get_ops():
+    return get_ops()
 
 try:
-    import torch  # noqa: F401 — must import torch first to load libc10.so
-    from . import _ops  # noqa: F401
-    _HAS_OPS = True
+    _ops = get_ops()
     _HAS_CUDA = hasattr(_ops, 'supergrok2_mamba_peer_batched_step')
     _HAS_CPU_OPS = hasattr(_ops, 'supergrok2_cpu_step')
-except Exception:
-    _ops = None
+except RuntimeError:
+    # Extension not built — flags remain for import-time checks,
+    # but any actual use of _ops will fail loudly via get_ops()
+    _HAS_CUDA = False
+    _HAS_CPU_OPS = False
 
 from .supergrok15 import SuperGrok15, SharpnessMetaNet
 from .supergrok2 import SuperGrok2, CompiledSuperGrok2

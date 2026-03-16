@@ -57,19 +57,12 @@ def _get_rank() -> int:
 
 
 def _load_distributed_scan_kernels():
-    """Lazily load the distributed scan CUDA kernels.
+    """Load the distributed scan C++ kernels.
 
-    Returns the kernel module, or None if CUDA kernels are not available.
-    Uses the same loading mechanism as the rest of the codebase.
+    Fails loudly if the C++ extension is not built. No fallback.
     """
-    try:
-        from grokking_optimizers import _HAS_OPS
-        if _HAS_OPS:
-            from grokking_optimizers import _ops
-            return _ops
-    except ImportError:
-        pass
-    return None
+    from grokking_optimizers._ops_loader import get_ops
+    return get_ops()
 
 
 def _compute_shared_mem_size(num_threads: int) -> int:
@@ -541,21 +534,14 @@ def _launch_local_scan_with_summary(
     Shared memory: DSCAN_BLOCK * 6 * sizeof(float).
     """
     ops = _load_distributed_scan_kernels()
-    if ops is not None and hasattr(ops, 'distributed_scan_local_with_summary'):
-        ops.distributed_scan_local_with_summary(
-            chunk['pre_x_val'], chunk['pre_z_val'], chunk['pre_dt_val'],
-            chunk['pre_B_val'], chunk['pre_C_val'],
-            A_log, D_param, rope_freq,
-            scan_output, summaries,
-            initial_state if initial_state is not None else torch.empty(0),
-            N_local, d_inner, d_state, reverse,
-        )
-    else:
-        _python_local_scan_with_summary(
-            chunk, A_log, D_param, rope_freq,
-            scan_output, summaries, initial_state,
-            N_local, d_inner, d_state, reverse,
-        )
+    ops.distributed_scan_local_with_summary(
+        chunk['pre_x_val'], chunk['pre_z_val'], chunk['pre_dt_val'],
+        chunk['pre_B_val'], chunk['pre_C_val'],
+        A_log, D_param, rope_freq,
+        scan_output, summaries,
+        initial_state if initial_state is not None else torch.empty(0),
+        N_local, d_inner, d_state, reverse,
+    )
 
 
 def _launch_summary_prefix_scan(
@@ -570,14 +556,9 @@ def _launch_summary_prefix_scan(
     Grid: (d_inner * half_d_state,) blocks of K threads.
     """
     ops = _load_distributed_scan_kernels()
-    if ops is not None and hasattr(ops, 'distributed_scan_summary_prefix'):
-        ops.distributed_scan_summary_prefix(
-            all_summaries, prefix_out, K, d_inner, half_d_state,
-        )
-    else:
-        _python_summary_prefix_scan(
-            all_summaries, prefix_out, K, d_inner, half_d_state,
-        )
+    ops.distributed_scan_summary_prefix(
+        all_summaries, prefix_out, K, d_inner, half_d_state,
+    )
 
 
 def _launch_apply_prefix(
@@ -597,21 +578,14 @@ def _launch_apply_prefix(
     Grid: (d_inner,) blocks of DSCAN_BLOCK threads.
     """
     ops = _load_distributed_scan_kernels()
-    if ops is not None and hasattr(ops, 'distributed_scan_apply_prefix'):
-        ops.distributed_scan_apply_prefix(
-            chunk['pre_x_val'], chunk['pre_z_val'], chunk['pre_dt_val'],
-            chunk['pre_B_val'], chunk['pre_C_val'],
-            A_log, rope_freq, prefix_transforms,
-            scan_output,
-            initial_state if initial_state is not None else torch.empty(0),
-            N_local, d_inner, d_state, reverse,
-        )
-    else:
-        _python_apply_prefix(
-            chunk, A_log, rope_freq, prefix_transforms,
-            scan_output, initial_state,
-            N_local, d_inner, d_state, reverse,
-        )
+    ops.distributed_scan_apply_prefix(
+        chunk['pre_x_val'], chunk['pre_z_val'], chunk['pre_dt_val'],
+        chunk['pre_B_val'], chunk['pre_C_val'],
+        A_log, rope_freq, prefix_transforms,
+        scan_output,
+        initial_state if initial_state is not None else torch.empty(0),
+        N_local, d_inner, d_state, reverse,
+    )
 
 
 def _launch_local_scan_backward_with_summary(
@@ -635,25 +609,16 @@ def _launch_local_scan_backward_with_summary(
 ) -> None:
     """Launch mamba3_scan_local_with_summary_bwd_kernel."""
     ops = _load_distributed_scan_kernels()
-    if ops is not None and hasattr(ops, 'distributed_scan_local_with_summary_bwd'):
-        ops.distributed_scan_local_with_summary_bwd(
-            chunk['pre_x_val'], chunk['pre_z_val'], chunk['pre_dt_val'],
-            chunk['pre_B_val'], chunk['pre_C_val'],
-            A_log, D_param, rope_freq,
-            grad_output, fwd_scan_output,
-            grad_pre_x, grad_pre_dt, grad_pre_B, grad_pre_C, grad_D,
-            bwd_summaries,
-            initial_state if initial_state is not None else torch.empty(0),
-            N_local, d_inner, d_state, reverse,
-        )
-    else:
-        _python_local_scan_backward_with_summary(
-            chunk, grad_output, fwd_scan_output,
-            A_log, D_param, rope_freq,
-            grad_pre_x, grad_pre_dt, grad_pre_B, grad_pre_C, grad_D,
-            bwd_summaries, initial_state,
-            N_local, d_inner, d_state, reverse,
-        )
+    ops.distributed_scan_local_with_summary_bwd(
+        chunk['pre_x_val'], chunk['pre_z_val'], chunk['pre_dt_val'],
+        chunk['pre_B_val'], chunk['pre_C_val'],
+        A_log, D_param, rope_freq,
+        grad_output, fwd_scan_output,
+        grad_pre_x, grad_pre_dt, grad_pre_B, grad_pre_C, grad_D,
+        bwd_summaries,
+        initial_state if initial_state is not None else torch.empty(0),
+        N_local, d_inner, d_state, reverse,
+    )
 
 
 def _launch_summary_prefix_scan_backward(
@@ -665,14 +630,9 @@ def _launch_summary_prefix_scan_backward(
 ) -> None:
     """Launch scan_summary_prefix_bwd_kernel on GPU 0."""
     ops = _load_distributed_scan_kernels()
-    if ops is not None and hasattr(ops, 'distributed_scan_summary_prefix_bwd'):
-        ops.distributed_scan_summary_prefix_bwd(
-            all_bwd_summaries, bwd_prefix_out, K, d_inner, half_d_state,
-        )
-    else:
-        _python_summary_prefix_scan_backward(
-            all_bwd_summaries, bwd_prefix_out, K, d_inner, half_d_state,
-        )
+    ops.distributed_scan_summary_prefix_bwd(
+        all_bwd_summaries, bwd_prefix_out, K, d_inner, half_d_state,
+    )
 
 
 def _launch_apply_prefix_backward(
@@ -692,436 +652,20 @@ def _launch_apply_prefix_backward(
 ) -> None:
     """Launch mamba3_apply_scan_prefix_bwd_kernel."""
     ops = _load_distributed_scan_kernels()
-    if ops is not None and hasattr(ops, 'distributed_scan_apply_prefix_bwd'):
-        ops.distributed_scan_apply_prefix_bwd(
-            chunk['pre_x_val'], chunk['pre_z_val'], chunk['pre_dt_val'],
-            chunk['pre_B_val'], chunk['pre_C_val'],
-            A_log, rope_freq, grad_output,
-            bwd_prefix_transforms,
-            grad_pre_x, grad_pre_dt, grad_pre_B, grad_pre_C,
-            N_local, d_inner, d_state, reverse,
-        )
-    else:
-        _python_apply_prefix_backward(
-            chunk, A_log, rope_freq, grad_output,
-            bwd_prefix_transforms,
-            grad_pre_x, grad_pre_dt, grad_pre_B, grad_pre_C,
-            N_local, d_inner, d_state, reverse,
-        )
+    ops.distributed_scan_apply_prefix_bwd(
+        chunk['pre_x_val'], chunk['pre_z_val'], chunk['pre_dt_val'],
+        chunk['pre_B_val'], chunk['pre_C_val'],
+        A_log, rope_freq, grad_output,
+        bwd_prefix_transforms,
+        grad_pre_x, grad_pre_dt, grad_pre_B, grad_pre_C,
+        N_local, d_inner, d_state, reverse,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Python fallback implementations
-#
-#  These mirror the CUDA kernel logic for correctness testing and
-#  CPU-only environments. They are significantly slower than the
-#  CUDA kernels but produce identical results.
+#  Python fallback functions REMOVED — Problem 1 (No Fallbacks).
+#  The C++ pipeline (distributed_scan_local_with_summary, etc.) is used.
+#  Python fallback implementations live in _python_fallback.py for tests only.
 # ═══════════════════════════════════════════════════════════════════════
 
-def _affine_identity() -> torch.Tensor:
-    """Return identity Affine2x2 as a 6-element tensor."""
-    return torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], dtype=torch.float32)
 
-
-def _affine_combine(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
-    """Compose two Affine2x2 transforms (right after left).
-
-    left, right: 6-element tensors [m00, m01, m10, m11, b0, b1].
-    Returns: composed 6-element tensor.
-    """
-    lm00, lm01, lm10, lm11, lb0, lb1 = left[0], left[1], left[2], left[3], left[4], left[5]
-    rm00, rm01, rm10, rm11, rb0, rb1 = right[0], right[1], right[2], right[3], right[4], right[5]
-
-    out = torch.empty(6, dtype=torch.float32, device=left.device)
-    out[0] = rm00 * lm00 + rm01 * lm10
-    out[1] = rm00 * lm01 + rm01 * lm11
-    out[2] = rm10 * lm00 + rm11 * lm10
-    out[3] = rm10 * lm01 + rm11 * lm11
-    out[4] = rm00 * lb0 + rm01 * lb1 + rb0
-    out[5] = rm10 * lb0 + rm11 * lb1 + rb1
-    return out
-
-
-def _build_element_py(
-    dt: float, x_val: float,
-    B_e: float, B_o: float,
-    A_e: float, A_o: float,
-    freq_val: float,
-    device: torch.device,
-) -> torch.Tensor:
-    """Python version of build_scan_element."""
-    import math
-    A_bar_e = (1.0 + dt * A_e / 2.0) / (1.0 - dt * A_e / 2.0 + 1e-8)
-    A_bar_o = (1.0 + dt * A_o / 2.0) / (1.0 - dt * A_o / 2.0 + 1e-8)
-    sin_v = math.sin(dt * freq_val)
-    cos_v = math.cos(dt * freq_val)
-
-    elem = torch.tensor([
-        A_bar_e * cos_v,    # m00
-        -A_bar_e * sin_v,   # m01
-        A_bar_o * sin_v,    # m10
-        A_bar_o * cos_v,    # m11
-        dt * B_e * x_val,   # b0
-        dt * B_o * x_val,   # b1
-    ], dtype=torch.float32, device=device)
-    return elem
-
-
-def _python_local_scan_with_summary(
-    chunk: Dict[str, torch.Tensor],
-    A_log: torch.Tensor,
-    D_param: torch.Tensor,
-    rope_freq: torch.Tensor,
-    scan_output: torch.Tensor,
-    summaries: torch.Tensor,
-    initial_state: Optional[torch.Tensor],
-    N_local: int,
-    d_inner: int,
-    d_state: int,
-    reverse: int,
-) -> None:
-    """Python fallback for local scan with summary extraction."""
-    import math
-    device = chunk['pre_x_val'].device
-    half_d_state = d_state // 2
-
-    A = torch.zeros(d_inner, d_state, device=device)
-    for j in range(d_inner):
-        for s in range(d_state):
-            A[j, s] = -math.exp(A_log[j, s].item())
-
-    for j in range(d_inner):
-        D_val = D_param[j].item()
-
-        for p in range(half_d_state):
-            s_e = 2 * p
-            s_o = 2 * p + 1
-            A_e = A[j, s_e].item()
-            A_o = A[j, s_o].item()
-            f_val = rope_freq[j, p].item()
-
-            h_init_e = initial_state[j, s_e].item() if initial_state is not None else 0.0
-            h_init_o = initial_state[j, s_o].item() if initial_state is not None else 0.0
-
-            # Sequential scan to compute output and summary
-            running = _affine_identity().to(device)
-
-            for step in range(N_local):
-                t = (N_local - 1 - step) if reverse else step
-                dt_v = chunk['pre_dt_val'][t, j].item()
-                x_v = chunk['pre_x_val'][t, j].item()
-                B_e_v = chunk['pre_B_val'][t, s_e].item()
-                B_o_v = chunk['pre_B_val'][t, s_o].item()
-
-                elem = _build_element_py(dt_v, x_v, B_e_v, B_o_v, A_e, A_o, f_val, device)
-                running = _affine_combine(running, elem)
-
-                # Compute h and accumulate output
-                h_e = running[0].item() * h_init_e + running[1].item() * h_init_o + running[4].item()
-                h_o = running[2].item() * h_init_e + running[3].item() * h_init_o + running[5].item()
-
-                C_e_v = chunk['pre_C_val'][t, s_e].item()
-                C_o_v = chunk['pre_C_val'][t, s_o].item()
-                scan_output[t, j] += h_e * C_e_v + h_o * C_o_v
-
-            # Store summary
-            sum_idx = (j * half_d_state + p) * 6
-            summaries[sum_idx:sum_idx + 6] = running
-
-        # Apply SiLU gating and D skip
-        for t in range(N_local):
-            z = chunk['pre_z_val'][t, j].item()
-            silu_z = z / (1.0 + math.exp(-z))
-            x_val = chunk['pre_x_val'][t, j].item()
-            scan_output[t, j] = scan_output[t, j].item() * silu_z + D_val * x_val
-
-
-def _python_summary_prefix_scan(
-    all_summaries: torch.Tensor,
-    prefix_out: torch.Tensor,
-    K: int,
-    d_inner: int,
-    half_d_state: int,
-) -> None:
-    """Python fallback for summary prefix scan."""
-    device = all_summaries.device
-    summary_size = d_inner * half_d_state * _AFFINE2X2_SIZE
-
-    for j in range(d_inner):
-        for p in range(half_d_state):
-            running = _affine_identity().to(device)
-
-            for k in range(K):
-                # Write exclusive prefix
-                dst_idx = (k * d_inner * half_d_state + j * half_d_state + p) * 6
-                prefix_out[dst_idx:dst_idx + 6] = running
-
-                # Incorporate summary[k]
-                src_idx = (k * d_inner * half_d_state + j * half_d_state + p) * 6
-                sk = all_summaries[src_idx:src_idx + 6]
-                running = _affine_combine(running, sk)
-
-
-def _python_apply_prefix(
-    chunk: Dict[str, torch.Tensor],
-    A_log: torch.Tensor,
-    rope_freq: torch.Tensor,
-    prefix_transforms: torch.Tensor,
-    scan_output: torch.Tensor,
-    initial_state: Optional[torch.Tensor],
-    N_local: int,
-    d_inner: int,
-    d_state: int,
-    reverse: int,
-) -> None:
-    """Python fallback for applying prefix corrections."""
-    import math
-    device = chunk['pre_x_val'].device
-    half_d_state = d_state // 2
-
-    A = torch.zeros(d_inner, d_state, device=device)
-    for j in range(d_inner):
-        for s in range(d_state):
-            A[j, s] = -math.exp(A_log[j, s].item())
-
-    for j in range(d_inner):
-        for p in range(half_d_state):
-            s_e = 2 * p
-            s_o = 2 * p + 1
-            A_e = A[j, s_e].item()
-            A_o = A[j, s_o].item()
-            f_val = rope_freq[j, p].item()
-
-            pf_idx = (j * half_d_state + p) * 6
-            pf = prefix_transforms[pf_idx:pf_idx + 6]
-
-            h_init_e = initial_state[j, s_e].item() if initial_state is not None else 0.0
-            h_init_o = initial_state[j, s_o].item() if initial_state is not None else 0.0
-
-            # Corrected initial state
-            h_corr_e = pf[0].item() * h_init_e + pf[1].item() * h_init_o + pf[4].item()
-            h_corr_o = pf[2].item() * h_init_e + pf[3].item() * h_init_o + pf[5].item()
-
-            delta_e = h_corr_e - h_init_e
-            delta_o = h_corr_o - h_init_o
-
-            if abs(delta_e) < 1e-12 and abs(delta_o) < 1e-12:
-                continue
-
-            # Propagate delta through scan
-            cur_de = delta_e
-            cur_do = delta_o
-            for step in range(N_local):
-                t = (N_local - 1 - step) if reverse else step
-                dt_v = chunk['pre_dt_val'][t, j].item()
-                x_v = chunk['pre_x_val'][t, j].item()
-                B_e_v = chunk['pre_B_val'][t, s_e].item()
-                B_o_v = chunk['pre_B_val'][t, s_o].item()
-
-                elem = _build_element_py(dt_v, x_v, B_e_v, B_o_v, A_e, A_o, f_val, device)
-                new_de = elem[0].item() * cur_de + elem[1].item() * cur_do
-                new_do = elem[2].item() * cur_de + elem[3].item() * cur_do
-                cur_de = new_de
-                cur_do = new_do
-
-                C_e_v = chunk['pre_C_val'][t, s_e].item()
-                C_o_v = chunk['pre_C_val'][t, s_o].item()
-                delta_y = cur_de * C_e_v + cur_do * C_o_v
-
-                z = chunk['pre_z_val'][t, j].item()
-                silu_z = z / (1.0 + math.exp(-z))
-                scan_output[t, j] += delta_y * silu_z
-
-
-def _python_local_scan_backward_with_summary(
-    chunk: Dict[str, torch.Tensor],
-    grad_output: torch.Tensor,
-    fwd_scan_output: torch.Tensor,
-    A_log: torch.Tensor,
-    D_param: torch.Tensor,
-    rope_freq: torch.Tensor,
-    grad_pre_x: torch.Tensor,
-    grad_pre_dt: torch.Tensor,
-    grad_pre_B: torch.Tensor,
-    grad_pre_C: torch.Tensor,
-    grad_D: torch.Tensor,
-    bwd_summaries: torch.Tensor,
-    initial_state: Optional[torch.Tensor],
-    N_local: int,
-    d_inner: int,
-    d_state: int,
-    reverse: int,
-) -> None:
-    """Python fallback for backward local scan with summary.
-
-    Simplified backward: computes gradients via reverse-mode autodiff
-    of the sequential scan. This is correct but O(N*d_state) per d_inner.
-    """
-    import math
-    device = chunk['pre_x_val'].device
-    half_d_state = d_state // 2
-
-    A = torch.zeros(d_inner, d_state, device=device)
-    for j in range(d_inner):
-        for s in range(d_state):
-            A[j, s] = -math.exp(A_log[j, s].item())
-
-    for j in range(d_inner):
-        D_val = D_param[j].item()
-
-        for p in range(half_d_state):
-            s_e = 2 * p
-            s_o = 2 * p + 1
-            A_e = A[j, s_e].item()
-            A_o = A[j, s_o].item()
-            f_val = rope_freq[j, p].item()
-
-            # Backward scan: accumulate dh in reverse
-            bwd_running = _affine_identity().to(device)
-            dh_e = 0.0
-            dh_o = 0.0
-
-            for step in range(N_local - 1, -1, -1):
-                t = (N_local - 1 - step) if reverse else step
-                dt_v = chunk['pre_dt_val'][t, j].item()
-                x_v = chunk['pre_x_val'][t, j].item()
-                B_e_v = chunk['pre_B_val'][t, s_e].item()
-                B_o_v = chunk['pre_B_val'][t, s_o].item()
-
-                fwd_elem = _build_element_py(dt_v, x_v, B_e_v, B_o_v, A_e, A_o, f_val, device)
-
-                dy_raw = grad_output[t, j].item()
-                z = chunk['pre_z_val'][t, j].item()
-                silu_z = z / (1.0 + math.exp(-z))
-                dy_scan = dy_raw * silu_z
-
-                C_e_v = chunk['pre_C_val'][t, s_e].item()
-                C_o_v = chunk['pre_C_val'][t, s_o].item()
-
-                # Backward element (transposed matrix + gradient source bias)
-                bwd_elem = torch.tensor([
-                    fwd_elem[0].item(), fwd_elem[2].item(),
-                    fwd_elem[1].item(), fwd_elem[3].item(),
-                    C_e_v * dy_scan, C_o_v * dy_scan,
-                ], dtype=torch.float32, device=device)
-
-                bwd_running = _affine_combine(bwd_running, bwd_elem)
-
-                dh_e = bwd_running[4].item()
-                dh_o = bwd_running[5].item()
-
-                # Accumulate parameter gradients
-                grad_pre_B[t, s_e] += dh_e * dt_v * x_v
-                grad_pre_B[t, s_o] += dh_o * dt_v * x_v
-                grad_pre_C[t, s_e] += dh_e * dt_v * x_v
-                grad_pre_C[t, s_o] += dh_o * dt_v * x_v
-
-                ddt = dh_e * B_e_v * x_v + dh_o * B_o_v * x_v
-                denom_e = (1.0 - dt_v * A_e / 2.0 + 1e-8)
-                denom_o = (1.0 - dt_v * A_o / 2.0 + 1e-8)
-                ddt += dh_e * A_e / (denom_e * denom_e)
-                ddt += dh_o * A_o / (denom_o * denom_o)
-                grad_pre_dt[t, j] += ddt
-
-                dx = dh_e * dt_v * B_e_v + dh_o * dt_v * B_o_v
-                grad_pre_x[t, j] += dx
-
-                if p == 0:
-                    grad_D[j] += dy_raw * x_v
-
-            # Store backward summary
-            sum_idx = (j * half_d_state + p) * 6
-            bwd_summaries[sum_idx:sum_idx + 6] = bwd_running
-
-
-def _python_summary_prefix_scan_backward(
-    all_bwd_summaries: torch.Tensor,
-    bwd_prefix_out: torch.Tensor,
-    K: int,
-    d_inner: int,
-    half_d_state: int,
-) -> None:
-    """Python fallback for backward summary prefix scan (reverse order)."""
-    device = all_bwd_summaries.device
-
-    for j in range(d_inner):
-        for p in range(half_d_state):
-            running = _affine_identity().to(device)
-
-            for k in range(K - 1, -1, -1):
-                dst_idx = (k * d_inner * half_d_state + j * half_d_state + p) * 6
-                bwd_prefix_out[dst_idx:dst_idx + 6] = running
-
-                src_idx = (k * d_inner * half_d_state + j * half_d_state + p) * 6
-                sk = all_bwd_summaries[src_idx:src_idx + 6]
-                running = _affine_combine(running, sk)
-
-
-def _python_apply_prefix_backward(
-    chunk: Dict[str, torch.Tensor],
-    A_log: torch.Tensor,
-    rope_freq: torch.Tensor,
-    grad_output: torch.Tensor,
-    bwd_prefix_transforms: torch.Tensor,
-    grad_pre_x: torch.Tensor,
-    grad_pre_dt: torch.Tensor,
-    grad_pre_B: torch.Tensor,
-    grad_pre_C: torch.Tensor,
-    N_local: int,
-    d_inner: int,
-    d_state: int,
-    reverse: int,
-) -> None:
-    """Python fallback for applying backward prefix corrections."""
-    import math
-    device = chunk['pre_x_val'].device
-    half_d_state = d_state // 2
-
-    A = torch.zeros(d_inner, d_state, device=device)
-    for j in range(d_inner):
-        for s in range(d_state):
-            A[j, s] = -math.exp(A_log[j, s].item())
-
-    for j in range(d_inner):
-        for p in range(half_d_state):
-            s_e = 2 * p
-            s_o = 2 * p + 1
-            A_e = A[j, s_e].item()
-            A_o = A[j, s_o].item()
-            f_val = rope_freq[j, p].item()
-
-            pf_idx = (j * half_d_state + p) * 6
-            bpf = bwd_prefix_transforms[pf_idx:pf_idx + 6]
-
-            delta_dh_e = bpf[4].item()
-            delta_dh_o = bpf[5].item()
-
-            if (abs(delta_dh_e) < 1e-12 and abs(delta_dh_o) < 1e-12 and
-                    abs(bpf[0].item() - 1.0) < 1e-12 and abs(bpf[3].item() - 1.0) < 1e-12):
-                continue
-
-            cur_dh_e = delta_dh_e
-            cur_dh_o = delta_dh_o
-
-            for step in range(N_local - 1, -1, -1):
-                t = (N_local - 1 - step) if reverse else step
-                dt_v = chunk['pre_dt_val'][t, j].item()
-                x_v = chunk['pre_x_val'][t, j].item()
-                B_e_v = chunk['pre_B_val'][t, s_e].item()
-                B_o_v = chunk['pre_B_val'][t, s_o].item()
-
-                fwd_elem = _build_element_py(dt_v, x_v, B_e_v, B_o_v, A_e, A_o, f_val, device)
-
-                # Propagate through transposed matrix
-                new_dh_e = fwd_elem[0].item() * cur_dh_e + fwd_elem[2].item() * cur_dh_o
-                new_dh_o = fwd_elem[1].item() * cur_dh_e + fwd_elem[3].item() * cur_dh_o
-                cur_dh_e = new_dh_e
-                cur_dh_o = new_dh_o
-
-                # Add gradient corrections
-                grad_pre_dt[t, j] += cur_dh_e * B_e_v * x_v + cur_dh_o * B_o_v * x_v
-                grad_pre_x[t, j] += cur_dh_e * dt_v * B_e_v + cur_dh_o * dt_v * B_o_v
-                grad_pre_B[t, s_e] += cur_dh_e * dt_v * x_v
-                grad_pre_B[t, s_o] += cur_dh_o * dt_v * x_v
-                grad_pre_C[t, s_e] += cur_dh_e * dt_v * x_v
-                grad_pre_C[t, s_o] += cur_dh_o * dt_v * x_v

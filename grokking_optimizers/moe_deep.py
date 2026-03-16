@@ -13,12 +13,10 @@ from typing import Optional, Dict, Any
 
 from grokking_optimizers.supergrok2 import SuperGrok2
 
-from grokking_optimizers import _HAS_OPS
-if _HAS_OPS:
-    from grokking_optimizers import _ops
-    _HAS_CUDA = True
-else:
-    _HAS_CUDA = False
+from grokking_optimizers._ops_loader import get_ops
+
+_ops = get_ops()  # Fails loudly if C++ extension not built
+_HAS_CUDA = hasattr(_ops, 'supergrok2_mamba_peer_batched_step')
 
 
 class MoEAwareSuperGrok2(SuperGrok2):
