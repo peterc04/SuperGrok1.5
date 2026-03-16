@@ -92,6 +92,7 @@ GROKADAMW_Q4_SCALAR = r"""
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void grokadamw_q4_scalar_kernel(
     scalar_t* __restrict__ param,
     int8_t* __restrict__ exp_avg_q,
@@ -179,6 +180,7 @@ GROKADAMW_Q4_VEC4 = r"""
 //  avoid redeclaration bugs. Per-block INT8 for exp_avg (block-size 8).
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void grokadamw_q4_vec4_kernel(
     float4* __restrict__ param4,
     int8_t* __restrict__ exp_avg_q,
@@ -426,6 +428,7 @@ __device__ __forceinline__ void atomicMaxFloat(float* addr, float value) {
 //  reduction across warps, then atomicMax across blocks.
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void compute_absmax_kernel(
     const float* __restrict__ input,
     float* __restrict__ scale_out,
@@ -529,6 +532,7 @@ constexpr int MUON_STREAM_BLOCK = 256;
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void muon_update_stream_kernel(
     scalar_t* __restrict__ param,
     float* __restrict__ momentum_buffer,
@@ -566,6 +570,7 @@ __global__ void muon_update_stream_kernel(
 //  float4-vectorized with stream_load4/stream_store4 for momentum.
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void muon_update_stream_vec4_kernel(
     float4* __restrict__ param4,
     float4* __restrict__ momentum_buffer4,

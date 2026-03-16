@@ -199,9 +199,11 @@ __global__ void looksam_direction_step_q4_kernel(
     const float sg_val = static_cast<float>(sam_grad[idx]);
     const float ng_val = static_cast<float>(normal_grad[idx]);
     const float raw_dir = (sg_val - ng_val) * inv_norm;
-    const float old_ema_dir = v_dir_ema_val;
+    const float old_ema_dir = __bfloat162float(v_dir_ema_bf16[idx]);
     const float new_ema_dir = ema_decay * old_ema_dir + (1.0f - ema_decay) * raw_dir;
-    /* q4 store v_dir_ema */ v_dir_ema_val = new_ema_dir; /* stored below */;
+    unsigned rng = philox_hash_gen(global_step, (unsigned)idx);
+    float rounded = new_ema_dir + ((float)(rng & 0xFFFF) / 65536.0f - 0.5f) * 0.00390625f;
+    v_dir_ema_bf16[idx] = __float2bfloat16(rounded);
     param[idx] = static_cast<scalar_t>(new_ema_dir);
 }
 
@@ -531,9 +533,11 @@ __global__ void looksam_direction_step_moe_q4_kernel(
     const float sg_val = static_cast<float>(sam_grad[idx]);
     const float ng_val = static_cast<float>(normal_grad[idx]);
     const float raw_dir = (sg_val - ng_val) * inv_norm;
-    const float old_ema_dir = v_dir_ema_val;
+    const float old_ema_dir = __bfloat162float(v_dir_ema_bf16[idx]);
     const float new_ema_dir = ema_decay * old_ema_dir + (1.0f - ema_decay) * raw_dir;
-    /* q4 store v_dir_ema */ v_dir_ema_val = new_ema_dir; /* stored below */;
+    unsigned rng = philox_hash_gen(global_step, (unsigned)idx);
+    float rounded = new_ema_dir + ((float)(rng & 0xFFFF) / 65536.0f - 0.5f) * 0.00390625f;
+    v_dir_ema_bf16[idx] = __float2bfloat16(rounded);
     param[idx] = static_cast<scalar_t>(new_ema_dir);
 }
 

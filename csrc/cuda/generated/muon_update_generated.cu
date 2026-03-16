@@ -21,6 +21,7 @@ constexpr int MUON_STREAM_BLOCK = 256;
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void muon_update_stream_kernel(
     scalar_t* __restrict__ param,
     float* __restrict__ momentum_buffer,
@@ -58,6 +59,7 @@ __global__ void muon_update_stream_kernel(
 //  float4-vectorized with stream_load4/stream_store4 for momentum.
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void muon_update_stream_vec4_kernel(
     float4* __restrict__ param4,
     float4* __restrict__ momentum_buffer4,
