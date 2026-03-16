@@ -31,6 +31,7 @@
 
 #include "platform.h"
 #include "types.h"
+#include "ptx_intrinsics.cuh"
 #include "ops.h"
 
 
@@ -413,7 +414,7 @@ __global__ void mamba3_parallel_scan_kernel(
             int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
             Affine2x2 elem;
             BUILD_AFFINE(t, A_e, A_o, f_val, s_e, s_o, elem);
-            summary = affine_combine(summary, elem);
+            summary = affine_combine_ptx(summary, elem);
         }
 
         // Store summary in shared memory
@@ -438,7 +439,7 @@ __global__ void mamba3_parallel_scan_kernel(
                 Affine2x2 right = {smem[idx*6], smem[idx*6+1],
                                    smem[idx*6+2], smem[idx*6+3],
                                    smem[idx*6+4], smem[idx*6+5]};
-                Affine2x2 combined = affine_combine(left, right);
+                Affine2x2 combined = affine_combine_ptx(left, right);
                 smem[idx*6]   = combined.m00; smem[idx*6+1] = combined.m01;
                 smem[idx*6+2] = combined.m10; smem[idx*6+3] = combined.m11;
                 smem[idx*6+4] = combined.b0;  smem[idx*6+5] = combined.b1;
@@ -472,7 +473,7 @@ __global__ void mamba3_parallel_scan_kernel(
                 smem[(idx-stride)*6]   = right.m00; smem[(idx-stride)*6+1] = right.m01;
                 smem[(idx-stride)*6+2] = right.m10; smem[(idx-stride)*6+3] = right.m11;
                 smem[(idx-stride)*6+4] = right.b0;  smem[(idx-stride)*6+5] = right.b1;
-                Affine2x2 combined = affine_combine(right, left);
+                Affine2x2 combined = affine_combine_ptx(right, left);
                 smem[idx*6]   = combined.m00; smem[idx*6+1] = combined.m01;
                 smem[idx*6+2] = combined.m10; smem[idx*6+3] = combined.m11;
                 smem[idx*6+4] = combined.b0;  smem[idx*6+5] = combined.b1;
@@ -494,7 +495,7 @@ __global__ void mamba3_parallel_scan_kernel(
 
             Affine2x2 elem;
             BUILD_AFFINE(t, A_e, A_o, f_val, s_e, s_o, elem);
-            running = affine_combine(running, elem);
+            running = affine_combine_ptx(running, elem);
 
             // Compute h[t] from cumulative transform + initial state
             float h_e = running.m00 * h_init_e + running.m01 * h_init_o + running.b0;
@@ -641,7 +642,7 @@ __global__ void mamba3_parallel_scan_batched_kernel(
             int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
             Affine2x2 elem;
             BUILD_AFFINE_BAT(t, A_e, A_o, f_val, s_e, s_o, elem);
-            summary = affine_combine(summary, elem);
+            summary = affine_combine_ptx(summary, elem);
         }
 
         // Store summary in shared memory
@@ -666,7 +667,7 @@ __global__ void mamba3_parallel_scan_batched_kernel(
                 Affine2x2 right = {smem[idx*6], smem[idx*6+1],
                                    smem[idx*6+2], smem[idx*6+3],
                                    smem[idx*6+4], smem[idx*6+5]};
-                Affine2x2 combined = affine_combine(left, right);
+                Affine2x2 combined = affine_combine_ptx(left, right);
                 smem[idx*6]   = combined.m00; smem[idx*6+1] = combined.m01;
                 smem[idx*6+2] = combined.m10; smem[idx*6+3] = combined.m11;
                 smem[idx*6+4] = combined.b0;  smem[idx*6+5] = combined.b1;
@@ -700,7 +701,7 @@ __global__ void mamba3_parallel_scan_batched_kernel(
                 smem[(idx-stride)*6]   = right.m00; smem[(idx-stride)*6+1] = right.m01;
                 smem[(idx-stride)*6+2] = right.m10; smem[(idx-stride)*6+3] = right.m11;
                 smem[(idx-stride)*6+4] = right.b0;  smem[(idx-stride)*6+5] = right.b1;
-                Affine2x2 combined = affine_combine(right, left);
+                Affine2x2 combined = affine_combine_ptx(right, left);
                 smem[idx*6]   = combined.m00; smem[idx*6+1] = combined.m01;
                 smem[idx*6+2] = combined.m10; smem[idx*6+3] = combined.m11;
                 smem[idx*6+4] = combined.b0;  smem[idx*6+5] = combined.b1;
@@ -722,7 +723,7 @@ __global__ void mamba3_parallel_scan_batched_kernel(
 
             Affine2x2 elem;
             BUILD_AFFINE_BAT(t, A_e, A_o, f_val, s_e, s_o, elem);
-            running = affine_combine(running, elem);
+            running = affine_combine_ptx(running, elem);
 
             // Compute h[t] from cumulative transform + initial state
             float h_e = running.m00 * h_init_e + running.m01 * h_init_o + running.b0;
