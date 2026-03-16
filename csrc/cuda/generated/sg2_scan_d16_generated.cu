@@ -7,6 +7,7 @@
 #include <torch/extension.h>
 #include "platform.h"
 #include "types.h"
+#include "ptx_intrinsics.cuh"
 
 // d_inner=16 compile-time constant for aggressive loop unrolling
 constexpr int D16_D_INNER = 16;
@@ -117,7 +118,7 @@ __global__ void mamba3_parallel_scan_d16_kernel(
                 int partner = tid - stride;
                 Affine2x2 combined;
                 if (partner >= 0) {
-                    combined = affine_combine(s_transforms[partner], s_transforms[tid]);
+                    combined = affine_combine_ptx(s_transforms[partner], s_transforms[tid]);
                 } else {
                     combined = s_transforms[tid];
                 }

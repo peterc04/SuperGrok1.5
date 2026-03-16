@@ -368,7 +368,7 @@ __global__ void mamba3_parallel_scan_d16_kernel(/* see sg2_scan_d16_generated.cu
 // ═══════════════════════════════════════════════════════════════════════
 //  launch_sg2_fused_elem_generated
 //
-//  Dispatches to one of the 48 generated fused_elem kernel variants
+//  Dispatches to one of the 64 generated fused_elem kernel variants
 //  based on runtime configuration.
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1613,6 +1613,407 @@ void launch_sg2_fused_elem_generated(
                 gru_hidden, num_heads, pk_dim,
                 expert_hidden, num_experts);
         }));
+    } else if (state_prec == StatePrecision::CONFIG4 && expert_prec == ExpertPrecision::FP32 && hw_tier == ArchTier::GENERIC && moe_sparse == false && d_inner_val == 16) {
+        // Selected kernel: sg2_fused_elem_Q_fp32_generic_D_d16_kernel
+        AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, param.scalar_type(), "sg2_fused_elem", ([&] {
+            sg2_fused_elem_Q_fp32_generic_D_d16_kernel<scalar_t><<<grid, block>>>(
+                param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                mu.data_ptr<float>(), gru_state.data_ptr<float>(),
+                fwd_scan_out.data_ptr<float>(), bwd_scan_out.data_ptr<float>(),
+                out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+                gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+                gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+                gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+                peer_query_Ws.data_ptr<float>(),
+                prod_keys_A.data_ptr<float>(), prod_keys_B.data_ptr<float>(),
+                expert_W1.data_ptr<float>(), expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(), expert_b2.data_ptr<float>(),
+                gate_logits.data_ptr<float>(),
+                rescale, alpha, lamb_eff,
+                beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+                gate_threshold, gate_scale,
+                expert_counts.defined() ? expert_counts.data_ptr<int>() : nullptr,
+                N, d_model, d_inner_val,
+                gru_hidden, num_heads, pk_dim,
+                expert_hidden, num_experts);
+        }));
+    } else if (state_prec == StatePrecision::CONFIG4 && expert_prec == ExpertPrecision::FP32 && hw_tier == ArchTier::GENERIC && moe_sparse == true && d_inner_val == 16) {
+        // Selected kernel: sg2_fused_elem_Q_fp32_generic_M_d16_kernel
+        AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, param.scalar_type(), "sg2_fused_elem", ([&] {
+            sg2_fused_elem_Q_fp32_generic_M_d16_kernel<scalar_t><<<grid, block>>>(
+                param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                mu.data_ptr<float>(), gru_state.data_ptr<float>(),
+                fwd_scan_out.data_ptr<float>(), bwd_scan_out.data_ptr<float>(),
+                out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+                gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+                gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+                gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+                peer_query_Ws.data_ptr<float>(),
+                prod_keys_A.data_ptr<float>(), prod_keys_B.data_ptr<float>(),
+                expert_W1.data_ptr<float>(), expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(), expert_b2.data_ptr<float>(),
+                gate_logits.data_ptr<float>(),
+                rescale, alpha, lamb_eff,
+                beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+                gate_threshold, gate_scale,
+                expert_counts.defined() ? expert_counts.data_ptr<int>() : nullptr,
+                N, d_model, d_inner_val,
+                gru_hidden, num_heads, pk_dim,
+                expert_hidden, num_experts);
+        }));
+    } else if (state_prec == StatePrecision::CONFIG4 && expert_prec == ExpertPrecision::FP32 && hw_tier == ArchTier::AMPERE && moe_sparse == false && d_inner_val == 16) {
+        // Selected kernel: sg2_fused_elem_Q_fp32_sm80_D_d16_kernel
+        AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, param.scalar_type(), "sg2_fused_elem", ([&] {
+            sg2_fused_elem_Q_fp32_sm80_D_d16_kernel<scalar_t><<<grid, block>>>(
+                param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                mu.data_ptr<float>(), gru_state.data_ptr<float>(),
+                fwd_scan_out.data_ptr<float>(), bwd_scan_out.data_ptr<float>(),
+                out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+                gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+                gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+                gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+                peer_query_Ws.data_ptr<float>(),
+                prod_keys_A.data_ptr<float>(), prod_keys_B.data_ptr<float>(),
+                expert_W1.data_ptr<float>(), expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(), expert_b2.data_ptr<float>(),
+                gate_logits.data_ptr<float>(),
+                rescale, alpha, lamb_eff,
+                beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+                gate_threshold, gate_scale,
+                expert_counts.defined() ? expert_counts.data_ptr<int>() : nullptr,
+                N, d_model, d_inner_val,
+                gru_hidden, num_heads, pk_dim,
+                expert_hidden, num_experts);
+        }));
+    } else if (state_prec == StatePrecision::CONFIG4 && expert_prec == ExpertPrecision::FP32 && hw_tier == ArchTier::AMPERE && moe_sparse == true && d_inner_val == 16) {
+        // Selected kernel: sg2_fused_elem_Q_fp32_sm80_M_d16_kernel
+        AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, param.scalar_type(), "sg2_fused_elem", ([&] {
+            sg2_fused_elem_Q_fp32_sm80_M_d16_kernel<scalar_t><<<grid, block>>>(
+                param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                mu.data_ptr<float>(), gru_state.data_ptr<float>(),
+                fwd_scan_out.data_ptr<float>(), bwd_scan_out.data_ptr<float>(),
+                out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+                gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+                gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+                gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+                peer_query_Ws.data_ptr<float>(),
+                prod_keys_A.data_ptr<float>(), prod_keys_B.data_ptr<float>(),
+                expert_W1.data_ptr<float>(), expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(), expert_b2.data_ptr<float>(),
+                gate_logits.data_ptr<float>(),
+                rescale, alpha, lamb_eff,
+                beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+                gate_threshold, gate_scale,
+                expert_counts.defined() ? expert_counts.data_ptr<int>() : nullptr,
+                N, d_model, d_inner_val,
+                gru_hidden, num_heads, pk_dim,
+                expert_hidden, num_experts);
+        }));
+    } else if (state_prec == StatePrecision::CONFIG4 && expert_prec == ExpertPrecision::INT8 && hw_tier == ArchTier::GENERIC && moe_sparse == false && d_inner_val == 16) {
+        // Selected kernel: sg2_fused_elem_Q_int8_generic_D_d16_kernel
+        AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, param.scalar_type(), "sg2_fused_elem", ([&] {
+            sg2_fused_elem_Q_int8_generic_D_d16_kernel<scalar_t><<<grid, block>>>(
+                param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                mu.data_ptr<float>(), gru_state.data_ptr<float>(),
+                fwd_scan_out.data_ptr<float>(), bwd_scan_out.data_ptr<float>(),
+                out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+                gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+                gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+                gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+                peer_query_Ws.data_ptr<float>(),
+                prod_keys_A.data_ptr<float>(), prod_keys_B.data_ptr<float>(),
+                expert_W1.data_ptr<float>(), expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(), expert_b2.data_ptr<float>(),
+                gate_logits.data_ptr<float>(),
+                rescale, alpha, lamb_eff,
+                beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+                gate_threshold, gate_scale,
+                expert_counts.defined() ? expert_counts.data_ptr<int>() : nullptr,
+                N, d_model, d_inner_val,
+                gru_hidden, num_heads, pk_dim,
+                expert_hidden, num_experts);
+        }));
+    } else if (state_prec == StatePrecision::CONFIG4 && expert_prec == ExpertPrecision::INT8 && hw_tier == ArchTier::GENERIC && moe_sparse == true && d_inner_val == 16) {
+        // Selected kernel: sg2_fused_elem_Q_int8_generic_M_d16_kernel
+        AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, param.scalar_type(), "sg2_fused_elem", ([&] {
+            sg2_fused_elem_Q_int8_generic_M_d16_kernel<scalar_t><<<grid, block>>>(
+                param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                mu.data_ptr<float>(), gru_state.data_ptr<float>(),
+                fwd_scan_out.data_ptr<float>(), bwd_scan_out.data_ptr<float>(),
+                out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+                gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+                gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+                gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+                peer_query_Ws.data_ptr<float>(),
+                prod_keys_A.data_ptr<float>(), prod_keys_B.data_ptr<float>(),
+                expert_W1.data_ptr<float>(), expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(), expert_b2.data_ptr<float>(),
+                gate_logits.data_ptr<float>(),
+                rescale, alpha, lamb_eff,
+                beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+                gate_threshold, gate_scale,
+                expert_counts.defined() ? expert_counts.data_ptr<int>() : nullptr,
+                N, d_model, d_inner_val,
+                gru_hidden, num_heads, pk_dim,
+                expert_hidden, num_experts);
+        }));
+    } else if (state_prec == StatePrecision::CONFIG4 && expert_prec == ExpertPrecision::INT8 && hw_tier == ArchTier::AMPERE && moe_sparse == false && d_inner_val == 16) {
+        // Selected kernel: sg2_fused_elem_Q_int8_sm80_D_d16_kernel
+        AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, param.scalar_type(), "sg2_fused_elem", ([&] {
+            sg2_fused_elem_Q_int8_sm80_D_d16_kernel<scalar_t><<<grid, block>>>(
+                param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                mu.data_ptr<float>(), gru_state.data_ptr<float>(),
+                fwd_scan_out.data_ptr<float>(), bwd_scan_out.data_ptr<float>(),
+                out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+                gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+                gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+                gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+                peer_query_Ws.data_ptr<float>(),
+                prod_keys_A.data_ptr<float>(), prod_keys_B.data_ptr<float>(),
+                expert_W1.data_ptr<float>(), expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(), expert_b2.data_ptr<float>(),
+                gate_logits.data_ptr<float>(),
+                rescale, alpha, lamb_eff,
+                beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+                gate_threshold, gate_scale,
+                expert_counts.defined() ? expert_counts.data_ptr<int>() : nullptr,
+                N, d_model, d_inner_val,
+                gru_hidden, num_heads, pk_dim,
+                expert_hidden, num_experts);
+        }));
+    } else if (state_prec == StatePrecision::CONFIG4 && expert_prec == ExpertPrecision::INT8 && hw_tier == ArchTier::AMPERE && moe_sparse == true && d_inner_val == 16) {
+        // Selected kernel: sg2_fused_elem_Q_int8_sm80_M_d16_kernel
+        AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, param.scalar_type(), "sg2_fused_elem", ([&] {
+            sg2_fused_elem_Q_int8_sm80_M_d16_kernel<scalar_t><<<grid, block>>>(
+                param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                mu.data_ptr<float>(), gru_state.data_ptr<float>(),
+                fwd_scan_out.data_ptr<float>(), bwd_scan_out.data_ptr<float>(),
+                out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+                gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+                gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+                gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+                peer_query_Ws.data_ptr<float>(),
+                prod_keys_A.data_ptr<float>(), prod_keys_B.data_ptr<float>(),
+                expert_W1.data_ptr<float>(), expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(), expert_b2.data_ptr<float>(),
+                gate_logits.data_ptr<float>(),
+                rescale, alpha, lamb_eff,
+                beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+                gate_threshold, gate_scale,
+                expert_counts.defined() ? expert_counts.data_ptr<int>() : nullptr,
+                N, d_model, d_inner_val,
+                gru_hidden, num_heads, pk_dim,
+                expert_hidden, num_experts);
+        }));
+    } else if (state_prec == StatePrecision::CONFIG4 && expert_prec == ExpertPrecision::INT4 && hw_tier == ArchTier::GENERIC && moe_sparse == false && d_inner_val == 16) {
+        // Selected kernel: sg2_fused_elem_Q_int4_generic_D_d16_kernel
+        AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, param.scalar_type(), "sg2_fused_elem", ([&] {
+            sg2_fused_elem_Q_int4_generic_D_d16_kernel<scalar_t><<<grid, block>>>(
+                param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                mu.data_ptr<float>(), gru_state.data_ptr<float>(),
+                fwd_scan_out.data_ptr<float>(), bwd_scan_out.data_ptr<float>(),
+                out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+                gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+                gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+                gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+                peer_query_Ws.data_ptr<float>(),
+                prod_keys_A.data_ptr<float>(), prod_keys_B.data_ptr<float>(),
+                expert_W1.data_ptr<float>(), expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(), expert_b2.data_ptr<float>(),
+                gate_logits.data_ptr<float>(),
+                rescale, alpha, lamb_eff,
+                beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+                gate_threshold, gate_scale,
+                expert_counts.defined() ? expert_counts.data_ptr<int>() : nullptr,
+                N, d_model, d_inner_val,
+                gru_hidden, num_heads, pk_dim,
+                expert_hidden, num_experts);
+        }));
+    } else if (state_prec == StatePrecision::CONFIG4 && expert_prec == ExpertPrecision::INT4 && hw_tier == ArchTier::GENERIC && moe_sparse == true && d_inner_val == 16) {
+        // Selected kernel: sg2_fused_elem_Q_int4_generic_M_d16_kernel
+        AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, param.scalar_type(), "sg2_fused_elem", ([&] {
+            sg2_fused_elem_Q_int4_generic_M_d16_kernel<scalar_t><<<grid, block>>>(
+                param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                mu.data_ptr<float>(), gru_state.data_ptr<float>(),
+                fwd_scan_out.data_ptr<float>(), bwd_scan_out.data_ptr<float>(),
+                out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+                gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+                gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+                gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+                peer_query_Ws.data_ptr<float>(),
+                prod_keys_A.data_ptr<float>(), prod_keys_B.data_ptr<float>(),
+                expert_W1.data_ptr<float>(), expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(), expert_b2.data_ptr<float>(),
+                gate_logits.data_ptr<float>(),
+                rescale, alpha, lamb_eff,
+                beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+                gate_threshold, gate_scale,
+                expert_counts.defined() ? expert_counts.data_ptr<int>() : nullptr,
+                N, d_model, d_inner_val,
+                gru_hidden, num_heads, pk_dim,
+                expert_hidden, num_experts);
+        }));
+    } else if (state_prec == StatePrecision::CONFIG4 && expert_prec == ExpertPrecision::INT4 && hw_tier == ArchTier::AMPERE && moe_sparse == false && d_inner_val == 16) {
+        // Selected kernel: sg2_fused_elem_Q_int4_sm80_D_d16_kernel
+        AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, param.scalar_type(), "sg2_fused_elem", ([&] {
+            sg2_fused_elem_Q_int4_sm80_D_d16_kernel<scalar_t><<<grid, block>>>(
+                param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                mu.data_ptr<float>(), gru_state.data_ptr<float>(),
+                fwd_scan_out.data_ptr<float>(), bwd_scan_out.data_ptr<float>(),
+                out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+                gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+                gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+                gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+                peer_query_Ws.data_ptr<float>(),
+                prod_keys_A.data_ptr<float>(), prod_keys_B.data_ptr<float>(),
+                expert_W1.data_ptr<float>(), expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(), expert_b2.data_ptr<float>(),
+                gate_logits.data_ptr<float>(),
+                rescale, alpha, lamb_eff,
+                beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+                gate_threshold, gate_scale,
+                expert_counts.defined() ? expert_counts.data_ptr<int>() : nullptr,
+                N, d_model, d_inner_val,
+                gru_hidden, num_heads, pk_dim,
+                expert_hidden, num_experts);
+        }));
+    } else if (state_prec == StatePrecision::CONFIG4 && expert_prec == ExpertPrecision::INT4 && hw_tier == ArchTier::AMPERE && moe_sparse == true && d_inner_val == 16) {
+        // Selected kernel: sg2_fused_elem_Q_int4_sm80_M_d16_kernel
+        AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, param.scalar_type(), "sg2_fused_elem", ([&] {
+            sg2_fused_elem_Q_int4_sm80_M_d16_kernel<scalar_t><<<grid, block>>>(
+                param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                mu.data_ptr<float>(), gru_state.data_ptr<float>(),
+                fwd_scan_out.data_ptr<float>(), bwd_scan_out.data_ptr<float>(),
+                out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+                gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+                gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+                gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+                peer_query_Ws.data_ptr<float>(),
+                prod_keys_A.data_ptr<float>(), prod_keys_B.data_ptr<float>(),
+                expert_W1.data_ptr<float>(), expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(), expert_b2.data_ptr<float>(),
+                gate_logits.data_ptr<float>(),
+                rescale, alpha, lamb_eff,
+                beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+                gate_threshold, gate_scale,
+                expert_counts.defined() ? expert_counts.data_ptr<int>() : nullptr,
+                N, d_model, d_inner_val,
+                gru_hidden, num_heads, pk_dim,
+                expert_hidden, num_experts);
+        }));
+    } else if (state_prec == StatePrecision::CONFIG4 && expert_prec == ExpertPrecision::MXFP4 && hw_tier == ArchTier::GENERIC && moe_sparse == false && d_inner_val == 16) {
+        // Selected kernel: sg2_fused_elem_Q_mxfp4_generic_D_d16_kernel
+        AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, param.scalar_type(), "sg2_fused_elem", ([&] {
+            sg2_fused_elem_Q_mxfp4_generic_D_d16_kernel<scalar_t><<<grid, block>>>(
+                param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                mu.data_ptr<float>(), gru_state.data_ptr<float>(),
+                fwd_scan_out.data_ptr<float>(), bwd_scan_out.data_ptr<float>(),
+                out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+                gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+                gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+                gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+                peer_query_Ws.data_ptr<float>(),
+                prod_keys_A.data_ptr<float>(), prod_keys_B.data_ptr<float>(),
+                expert_W1.data_ptr<float>(), expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(), expert_b2.data_ptr<float>(),
+                gate_logits.data_ptr<float>(),
+                rescale, alpha, lamb_eff,
+                beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+                gate_threshold, gate_scale,
+                expert_counts.defined() ? expert_counts.data_ptr<int>() : nullptr,
+                N, d_model, d_inner_val,
+                gru_hidden, num_heads, pk_dim,
+                expert_hidden, num_experts);
+        }));
+    } else if (state_prec == StatePrecision::CONFIG4 && expert_prec == ExpertPrecision::MXFP4 && hw_tier == ArchTier::GENERIC && moe_sparse == true && d_inner_val == 16) {
+        // Selected kernel: sg2_fused_elem_Q_mxfp4_generic_M_d16_kernel
+        AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, param.scalar_type(), "sg2_fused_elem", ([&] {
+            sg2_fused_elem_Q_mxfp4_generic_M_d16_kernel<scalar_t><<<grid, block>>>(
+                param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                mu.data_ptr<float>(), gru_state.data_ptr<float>(),
+                fwd_scan_out.data_ptr<float>(), bwd_scan_out.data_ptr<float>(),
+                out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+                gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+                gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+                gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+                peer_query_Ws.data_ptr<float>(),
+                prod_keys_A.data_ptr<float>(), prod_keys_B.data_ptr<float>(),
+                expert_W1.data_ptr<float>(), expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(), expert_b2.data_ptr<float>(),
+                gate_logits.data_ptr<float>(),
+                rescale, alpha, lamb_eff,
+                beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+                gate_threshold, gate_scale,
+                expert_counts.defined() ? expert_counts.data_ptr<int>() : nullptr,
+                N, d_model, d_inner_val,
+                gru_hidden, num_heads, pk_dim,
+                expert_hidden, num_experts);
+        }));
+    } else if (state_prec == StatePrecision::CONFIG4 && expert_prec == ExpertPrecision::MXFP4 && hw_tier == ArchTier::AMPERE && moe_sparse == false && d_inner_val == 16) {
+        // Selected kernel: sg2_fused_elem_Q_mxfp4_sm80_D_d16_kernel
+        AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, param.scalar_type(), "sg2_fused_elem", ([&] {
+            sg2_fused_elem_Q_mxfp4_sm80_D_d16_kernel<scalar_t><<<grid, block>>>(
+                param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                mu.data_ptr<float>(), gru_state.data_ptr<float>(),
+                fwd_scan_out.data_ptr<float>(), bwd_scan_out.data_ptr<float>(),
+                out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+                gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+                gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+                gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+                peer_query_Ws.data_ptr<float>(),
+                prod_keys_A.data_ptr<float>(), prod_keys_B.data_ptr<float>(),
+                expert_W1.data_ptr<float>(), expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(), expert_b2.data_ptr<float>(),
+                gate_logits.data_ptr<float>(),
+                rescale, alpha, lamb_eff,
+                beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+                gate_threshold, gate_scale,
+                expert_counts.defined() ? expert_counts.data_ptr<int>() : nullptr,
+                N, d_model, d_inner_val,
+                gru_hidden, num_heads, pk_dim,
+                expert_hidden, num_experts);
+        }));
+    } else if (state_prec == StatePrecision::CONFIG4 && expert_prec == ExpertPrecision::MXFP4 && hw_tier == ArchTier::AMPERE && moe_sparse == true && d_inner_val == 16) {
+        // Selected kernel: sg2_fused_elem_Q_mxfp4_sm80_M_d16_kernel
+        AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, param.scalar_type(), "sg2_fused_elem", ([&] {
+            sg2_fused_elem_Q_mxfp4_sm80_M_d16_kernel<scalar_t><<<grid, block>>>(
+                param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                mu.data_ptr<float>(), gru_state.data_ptr<float>(),
+                fwd_scan_out.data_ptr<float>(), bwd_scan_out.data_ptr<float>(),
+                out_proj_fwd_W.data_ptr<float>(), out_proj_bwd_W.data_ptr<float>(),
+                gru_Wz.data_ptr<float>(), gru_bz.data_ptr<float>(),
+                gru_Wr.data_ptr<float>(), gru_br.data_ptr<float>(),
+                gru_Wh.data_ptr<float>(), gru_bh.data_ptr<float>(),
+                peer_query_Ws.data_ptr<float>(),
+                prod_keys_A.data_ptr<float>(), prod_keys_B.data_ptr<float>(),
+                expert_W1.data_ptr<float>(), expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(), expert_b2.data_ptr<float>(),
+                gate_logits.data_ptr<float>(),
+                rescale, alpha, lamb_eff,
+                beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+                gate_threshold, gate_scale,
+                expert_counts.defined() ? expert_counts.data_ptr<int>() : nullptr,
+                N, d_model, d_inner_val,
+                gru_hidden, num_heads, pk_dim,
+                expert_hidden, num_experts);
+        }));
+
     } else {
         // Fallback: use the first generic FP32 dense kernel
         AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, param.scalar_type(), "sg2_fused_elem", ([&] {
