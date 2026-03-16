@@ -19,6 +19,7 @@
 #pragma once
 #include <torch/extension.h>
 #include <vector>
+#include "dispatch.h"
 
 // Context struct for passing intermediate state between batched scan phases.
 // Used by batched_step_setup_and_sort, generic_batched_precompute, and
@@ -838,6 +839,96 @@ void launch_fused_neuralgrok_full_step_hopper(
     float alpha_amp, float beta_amp, int hidden_dim,
     float beta1, float beta2, float lr, float weight_decay,
     float eps, float bc1, float bc2);
+
+// ── Generated SG2 Kernel Dispatchers (csrc/cuda/generated/sg2_dispatch.cu) ──
+
+
+void launch_sg2_fused_elem_generated(
+    torch::Tensor param, torch::Tensor grad,
+    torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor mu, torch::Tensor gru_state,
+    torch::Tensor fwd_scan_out, torch::Tensor bwd_scan_out,
+    torch::Tensor out_proj_fwd_W, torch::Tensor out_proj_bwd_W,
+    torch::Tensor gru_Wz, torch::Tensor gru_bz,
+    torch::Tensor gru_Wr, torch::Tensor gru_br,
+    torch::Tensor gru_Wh, torch::Tensor gru_bh,
+    torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+    torch::Tensor expert_W1, torch::Tensor expert_b1,
+    torch::Tensor expert_W2, torch::Tensor expert_b2,
+    torch::Tensor gate_logits,
+    float rescale, float alpha, float lamb_eff,
+    float beta1, float beta2, float lr, float wd_eff, float eps,
+    float bc1, float bc2, float gate_threshold, float gate_scale,
+    torch::Tensor expert_counts,
+    int d_model, int d_inner_val,
+    int gru_hidden, int num_heads, int pk_dim,
+    int expert_hidden, int num_experts,
+    int state_prec_int, int expert_prec_int,
+    bool moe_sparse);
+
+void launch_sg2_metanet_only_generated(
+    torch::Tensor grad,
+    torch::Tensor fwd_scan_out, torch::Tensor bwd_scan_out,
+    torch::Tensor out_proj_fwd_W, torch::Tensor out_proj_bwd_W,
+    torch::Tensor gru_Wz, torch::Tensor gru_bz,
+    torch::Tensor gru_Wr, torch::Tensor gru_br,
+    torch::Tensor gru_Wh, torch::Tensor gru_bh,
+    torch::Tensor gru_state,
+    torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+    torch::Tensor expert_W1, torch::Tensor expert_b1,
+    torch::Tensor expert_W2, torch::Tensor expert_b2,
+    torch::Tensor meta_output,
+    float rescale,
+    torch::Tensor expert_counts,
+    int d_model, int d_inner_val,
+    int gru_hidden, int num_heads, int pk_dim,
+    int expert_hidden, int num_experts,
+    int expert_prec_int);
+
+void launch_sg2_adam_only_generated(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor smart_grad, torch::Tensor mu,
+    float lamb_eff, float beta1, float beta2, float lr, float wd_eff,
+    float eps, float bc1, float bc2,
+    int N, StatePrecision state_prec);
+
+void launch_sg2_persistent_scan_generated(
+    torch::Tensor x_sorted,
+    torch::Tensor in_proj_W, torch::Tensor dt_proj_W, torch::Tensor dt_proj_b,
+    torch::Tensor B_proj_W, torch::Tensor C_proj_W,
+    torch::Tensor A_log, torch::Tensor D_param, torch::Tensor rope_freq,
+    torch::Tensor scan_output, torch::Tensor scan_state,
+    torch::Tensor initial_state,
+    int N, int d_model, int d_inner_val, int d_state, int reverse,
+    int state_prec_int);
+
+void launch_sg2_scan_d16(
+    torch::Tensor pre_x_val, torch::Tensor pre_z_val,
+    torch::Tensor pre_dt_val, torch::Tensor pre_B_val, torch::Tensor pre_C_val,
+    torch::Tensor A_log, torch::Tensor D_param, torch::Tensor rope_freq,
+    torch::Tensor scan_output, torch::Tensor final_state,
+    torch::Tensor initial_state,
+    int N, int d_state, int reverse);
+
+// ── Generated GrokAdamW Q4 Dispatcher (csrc/cuda/generated/grokadamw_generated.cu) ──
+void launch_grokadamw_q4_step(
+    torch::Tensor param,
+    torch::Tensor exp_avg_q, torch::Tensor exp_avg_sq_bf16,
+    torch::Tensor ema_bf16, torch::Tensor exp_avg_scales,
+    torch::Tensor grad,
+    float alpha, float lamb,
+    float beta1, float beta2, float lr, float wd,
+    float eps, float bc1, float bc2);
+
+// ── Generated Compute Absmax Scale (csrc/cuda/generated/compute_absmax_scale_kernel.cu) ──
+void launch_compute_absmax_scale(
+    torch::Tensor input, torch::Tensor scale_out,
+    float max_representable);
+
+// ── Generated Muon Update with Streaming (csrc/cuda/generated/muon_update_generated.cu) ──
+void launch_muon_update_stream(
+    torch::Tensor param, torch::Tensor orth,
+    float neg_lr_scale, float decay_factor);
 
 #endif  // WITH_CUDA (NVIDIA-specific tiers)
 

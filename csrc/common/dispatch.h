@@ -152,3 +152,20 @@ inline const char* get_amd_tier_name() {
         default:               return "generic";
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Optimizer precision enums (used by generated kernel dispatch)
+// ═══════════════════════════════════════════════════════════════════════
+
+enum class StatePrecision {
+    FP32 = 0,
+    CONFIG4 = 1,
+};
+
+enum class ExpertPrecision {
+    FP32 = 0,
+    INT8 = 1,
+    INT4 = 2,
+    MXFP4 = 3,
+};
+

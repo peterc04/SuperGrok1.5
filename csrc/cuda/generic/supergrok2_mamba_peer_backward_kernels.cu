@@ -337,15 +337,15 @@ __global__ void mamba3_parallel_scan_fwd_save_kernel(
 
             // Save state
             if (checkpoint_interval <= 1) {
-                saved_states[(t * d_inner + j) * d_state + s_e] = h_e;
-                saved_states[(t * d_inner + j) * d_state + s_o] = h_o;
+                stream_store(&saved_states[(t * d_inner + j) * d_state + s_e], h_e);
+                stream_store(&saved_states[(t * d_inner + j) * d_state + s_o], h_o);
             } else {
                 bool at_seg_end = ((seq_step + 1) % checkpoint_interval == 0)
                                   || (seq_step == N - 1);
                 if (at_seg_end) {
                     int ckpt_idx = seq_step / checkpoint_interval;
-                    saved_states[(ckpt_idx * d_inner + j) * d_state + s_e] = h_e;
-                    saved_states[(ckpt_idx * d_inner + j) * d_state + s_o] = h_o;
+                    stream_store(&saved_states[(ckpt_idx * d_inner + j) * d_state + s_e], h_e);
+                    stream_store(&saved_states[(ckpt_idx * d_inner + j) * d_state + s_o], h_o);
                 }
             }
 
@@ -748,8 +748,8 @@ __global__ void mamba3_scan_fwd_save_kernel(
         }
 
         // Save x_branch and z
-        saved_x_branch[i * d_inner + tid] = x_val;
-        saved_z[i * d_inner + tid] = z_val;
+        stream_store(&saved_x_branch[i * d_inner + tid], x_val);
+        stream_store(&saved_z[i * d_inner + tid], z_val);
 
         // Write x_branch to shared memory for cross-thread access
         s_x_branch[tid] = x_val;
@@ -761,7 +761,7 @@ __global__ void mamba3_scan_fwd_save_kernel(
             dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
         }
         float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw));
-        saved_dt[i * d_inner + tid] = dt_val;
+        stream_store(&saved_dt[i * d_inner + tid], dt_val);
 
         // Snapshot h for RoPE (fixes read-after-write)
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
@@ -794,13 +794,13 @@ __global__ void mamba3_scan_fwd_save_kernel(
         // Save state after update (checkpointed or every step)
         if (checkpoint_interval <= 1) {
             for (int s = 0; s < d_state; s++)
-                saved_states[(i * d_inner + tid) * d_state + s] = h[s];
+                stream_store(&saved_states[(i * d_inner + tid) * d_state + s], h[s]);
         } else {
             bool at_seg_end = ((step + 1) % checkpoint_interval == 0) || (step == N - 1);
             if (at_seg_end) {
                 int ckpt_idx = step / checkpoint_interval;
                 for (int s = 0; s < d_state; s++)
-                    saved_states[(ckpt_idx * d_inner + tid) * d_state + s] = h[s];
+                    stream_store(&saved_states[(ckpt_idx * d_inner + tid) * d_state + s], h[s]);
             }
         }
 
@@ -914,7 +914,7 @@ __global__ void mamba3_scan_fwd_save_batched_kernel(
 
         // Save x_branch and z
         my_saved_xb[i * d_inner + tid] = x_val;
-        my_saved_z[i * d_inner + tid] = z_val;
+        my_stream_store(&saved_z[i * d_inner + tid], z_val);
 
         s_x_branch[tid] = x_val;
         __syncthreads();
@@ -923,7 +923,7 @@ __global__ void mamba3_scan_fwd_save_batched_kernel(
         for (int j = 0; j < d_inner; j++)
             dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
         float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw));
-        my_saved_dt[i * d_inner + tid] = dt_val;
+        my_stream_store(&saved_dt[i * d_inner + tid], dt_val);
 
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
 
@@ -949,13 +949,13 @@ __global__ void mamba3_scan_fwd_save_batched_kernel(
         // Save state after update (checkpointed or every step)
         if (checkpoint_interval <= 1) {
             for (int s = 0; s < d_state; s++)
-                my_saved_states[(i * d_inner + tid) * d_state + s] = h[s];
+                my_stream_store(&saved_states[(i * d_inner + tid) * d_state + s], h[s]);
         } else {
             bool at_seg_end = ((step + 1) % checkpoint_interval == 0) || (step == N - 1);
             if (at_seg_end) {
                 int ckpt_idx = step / checkpoint_interval;
                 for (int s = 0; s < d_state; s++)
-                    my_saved_states[(ckpt_idx * d_inner + tid) * d_state + s] = h[s];
+                    my_stream_store(&saved_states[(ckpt_idx * d_inner + tid) * d_state + s], h[s]);
             }
         }
 
@@ -1565,8 +1565,8 @@ __global__ void mamba3_scan_backward_batched_kernel(
 
             float d_out = my_d_scan[i * d_inner + tid];
             float x_val = my_saved_xb[i * d_inner + tid];
-            float z_val = my_saved_z[i * d_inner + tid];
-            float dt_val = my_saved_dt[i * d_inner + tid];
+            float z_val = my_stream_load(&saved_z[i * d_inner + tid]);
+            float dt_val = my_stream_load(&saved_dt[i * d_inner + tid]);
 
             s_x_branch[tid] = x_val;
             __syncthreads();
@@ -1579,7 +1579,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
                 float C_val = 0.0f;
                 for (int j = 0; j < d_inner; j++)
                     C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
-                y_val += my_saved_states[(i * d_inner + tid) * d_state + s] * C_val;
+                y_val += my_stream_load(&saved_states[(i * d_inner + tid) * d_state + s]) * C_val;
             }
 
             float d_y_val = d_out * silu_z;
@@ -1590,7 +1590,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
 
             float d_x_from_C = 0.0f;
             for (int s = 0; s < d_state; s++) {
-                float h_s = my_saved_states[(i * d_inner + tid) * d_state + s];
+                float h_s = my_stream_load(&saved_states[(i * d_inner + tid) * d_state + s]);
                 float C_val = 0.0f;
                 for (int j = 0; j < d_inner; j++)
                     C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
@@ -1607,7 +1607,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
             if (step > 0) {
                 int i_prev = reverse ? (N - step) : (step - 1);
                 for (int s = 0; s < d_state; s++)
-                    h_prev[s] = my_saved_states[(i_prev * d_inner + tid) * d_state + s];
+                    h_prev[s] = my_stream_load(&saved_states[(i_prev * d_inner + tid) * d_state + s]);
             } else {
                 for (int s = 0; s < d_state; s++)
                     h_prev[s] = my_init[tid * d_state + s];
@@ -1715,7 +1715,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
             } else {
                 int ckpt_idx = seg - 1;
                 for (int s = 0; s < d_state; s++)
-                    seg_h[s] = my_saved_states[(ckpt_idx * d_inner + tid) * d_state + s];
+                    seg_h[s] = my_stream_load(&saved_states[(ckpt_idx * d_inner + tid) * d_state + s]);
             }
 
             // Forward-recompute segment states
@@ -1723,7 +1723,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
                 int step = seg_start + local;
                 int i = reverse ? (N - 1 - step) : step;
                 float x_val = my_saved_xb[i * d_inner + tid];
-                float dt_val = my_saved_dt[i * d_inner + tid];
+                float dt_val = my_stream_load(&saved_dt[i * d_inner + tid]);
                 s_x_branch[tid] = x_val;
                 __syncthreads();
                 float h_snap_r[MAX_D_STATE];
@@ -1755,8 +1755,8 @@ __global__ void mamba3_scan_backward_batched_kernel(
                 int i = reverse ? (N - 1 - step) : step;
                 float d_out = my_d_scan[i * d_inner + tid];
                 float x_val = my_saved_xb[i * d_inner + tid];
-                float z_val = my_saved_z[i * d_inner + tid];
-                float dt_val = my_saved_dt[i * d_inner + tid];
+                float z_val = my_stream_load(&saved_z[i * d_inner + tid]);
+                float dt_val = my_stream_load(&saved_dt[i * d_inner + tid]);
                 s_x_branch[tid] = x_val;
                 __syncthreads();
                 float sig_z = 1.0f / (1.0f + expf(-z_val));

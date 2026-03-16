@@ -14,7 +14,6 @@ Or for development:
 """
 
 import os
-import glob as _glob_mod
 import torch
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import BuildExtension
@@ -71,13 +70,9 @@ if _has_gpu and _is_hip:
             "--offload-arch=gfx942",    # MI300X
         ]
 
-    # Auto-discover generated kernel sources (from codegen/generate_kernels.py)
-    generated_sources = sorted(_glob_mod.glob("csrc/cuda/generated/*.cu"))
-    if generated_sources:
-        print(f"  Generated sources: {len(generated_sources)} files")
     ext = CUDAExtension(
         name="grokking_optimizers._ops",
-        sources=generic_sources + cdna_sources + generated_sources,
+        sources=generic_sources + cdna_sources,
         include_dirs=["csrc/common", "csrc"],
         define_macros=[("WITH_HIP", None)],
         extra_compile_args={
@@ -123,13 +118,15 @@ elif _has_gpu:
         "csrc/cuda/sm_100/supergrok2_sm100.cu",
         "csrc/quantization/quantization_kernels.cu",
     ]
-    # Auto-discover generated kernel sources (from codegen/generate_kernels.py)
-    generated_sources = sorted(_glob_mod.glob("csrc/cuda/generated/*.cu"))
+    # Auto-detect generated kernel sources
+    import glob as _glob_nv
+    generated_sources = sorted(_glob_nv.glob("csrc/cuda/generated/*.cu"))
     if generated_sources:
-        print(f"  Generated sources: {len(generated_sources)} files")
+        print(f"  Generated sources: {', '.join(os.path.basename(s) for s in generated_sources)}")
+        nvidia_sources += generated_sources
     ext = CUDAExtension(
         name="grokking_optimizers._ops",
-        sources=generic_sources + nvidia_sources + generated_sources,
+        sources=generic_sources + nvidia_sources,
         include_dirs=["csrc/common", "csrc"],
         define_macros=[("WITH_CUDA", None)],
         extra_compile_args={
