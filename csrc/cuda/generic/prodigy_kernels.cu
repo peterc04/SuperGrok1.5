@@ -48,6 +48,7 @@ constexpr int PRODIGY_WARP_SIZE = WARP_SIZE;
 // ===================================================================
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void fused_prodigy_step_kernel(
     scalar_t* __restrict__ param,          // [N] -- updated in-place
     float* __restrict__ exp_avg,           // [N] -- first moment, updated
@@ -101,6 +102,7 @@ __global__ void fused_prodigy_step_kernel(
 //  Kernel 1b: Fused Prodigy per-element step — float4 vectorized (FP32 only)
 // ===================================================================
 
+__launch_bounds__(256, 8)
 __global__ void fused_prodigy_step_vec4_kernel(
     float4* __restrict__ param4,
     float4* __restrict__ exp_avg4,
@@ -171,6 +173,7 @@ __global__ void fused_prodigy_step_vec4_kernel(
 // ===================================================================
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void prodigy_dlr_reduce_kernel(
     const scalar_t* __restrict__ grad,         // [N]
     const scalar_t* __restrict__ param,        // [N]

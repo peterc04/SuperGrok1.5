@@ -43,6 +43,7 @@
 //  saved intermediates for backward (saved_x_branch, saved_z, saved_dt).
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void bilevel_precompute_kernel(
     const float* __restrict__ x_sorted,
     const float* __restrict__ in_proj_W,    // [2*d_inner, d_model]
@@ -102,6 +103,7 @@ __global__ void bilevel_precompute_kernel(
 //  Applies dt_val = softplus(dt_raw + bias[j]) for each element.
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void softplus_bias_kernel(
     float* __restrict__ dt_out,       // [N, d_inner] — in-place
     const float* __restrict__ bias,   // [d_inner]
@@ -185,6 +187,7 @@ static void bilevel_precompute_gemm(
 //  Shared: 6 * block_size floats for Blelloch scan
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(16, 8)
 __global__ void mamba3_parallel_scan_fwd_save_kernel(
     const float* __restrict__ pre_x_val,
     const float* __restrict__ pre_z_val,
@@ -389,6 +392,7 @@ __global__ void mamba3_parallel_scan_fwd_save_kernel(
 //  Shared: 6 * block_size floats
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(16, 8)
 __global__ void mamba3_batched_parallel_scan_fwd_save_kernel(
     const float* __restrict__ pre_x_val,     // [total_N, d_inner]
     const float* __restrict__ pre_z_val,     // [total_N, d_inner]
@@ -600,6 +604,7 @@ __global__ void mamba3_batched_parallel_scan_fwd_save_kernel(
 //  CUDA kernel launches for all segments.
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void reverse_segments_kernel(
     const float* __restrict__ src,
     float* __restrict__ dst,
@@ -632,6 +637,7 @@ __global__ void reverse_segments_kernel(
     dst[reversed_row * d + col] = src[row * d + col];
 }
 
+__launch_bounds__(256, 8)
 __global__ void combine_fwd_bwd_kernel(
     const float* __restrict__ fwd,
     const float* __restrict__ bwd,
@@ -677,6 +683,7 @@ __global__ void combine_fwd_bwd_kernel(
 //  saved_dt: [N, d_inner]
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(16, 8)
 __global__ void mamba3_scan_fwd_save_kernel(
     const float* __restrict__ x_sorted,
     const float* __restrict__ in_proj_W,    // [2*d_inner, d_model]
@@ -829,6 +836,7 @@ __global__ void mamba3_scan_fwd_save_kernel(
 //  Threads: d_inner per block
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(16, 8)
 __global__ void mamba3_scan_fwd_save_batched_kernel(
     const float* __restrict__ x_sorted_packed,    // [total_N, d_model]
     float* __restrict__ scan_output_packed,        // [total_N, d_inner]
@@ -983,6 +991,7 @@ __global__ void mamba3_scan_fwd_save_batched_kernel(
 //  Also produces d_x_sorted for upstream backward.
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(16, 8)
 __global__ void mamba3_scan_backward_kernel(
     const float* __restrict__ d_scan_output,  // [N, d_inner] gradient from downstream
     const float* __restrict__ x_sorted,       // [N, d_model]
@@ -1446,6 +1455,7 @@ __global__ void mamba3_scan_backward_kernel(
 //  Threads: d_inner per block
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(16, 8)
 __global__ void mamba3_scan_backward_batched_kernel(
     const float* __restrict__ d_scan_output_packed,  // [total_N, d_inner]
     const float* __restrict__ x_sorted_packed,       // [total_N, d_model]
@@ -1886,6 +1896,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void input_proj_backward_kernel(
     const float* __restrict__ d_x,           // [N, d_model]
     const scalar_t* __restrict__ grad,       // [N]
@@ -1948,6 +1959,7 @@ __global__ void input_proj_backward_kernel(
 //  Each thread handles one element. Accumulates gradients via atomicAdd.
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void gru_backward_kernel(
     const float* __restrict__ d_h_new,       // [N, gru_hidden]
     const float* __restrict__ gru_input,     // [N, input_dim] (saved from forward)
@@ -2093,6 +2105,7 @@ __global__ void gru_backward_kernel(
 //  One thread per element.
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void expert_peer_backward_kernel(
     const float* __restrict__ d_expert_out,    // [N, 1] (rescale * d_smart_grad)
     const float* __restrict__ grad_vals,       // [N] gradient values
@@ -2298,6 +2311,7 @@ __global__ void expert_peer_backward_kernel(
 //  One thread per element.
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void out_proj_backward_kernel(
     const float* __restrict__ d_context,       // [N, d_model]
     const float* __restrict__ scan_out,        // [N, d_inner]

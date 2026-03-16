@@ -35,6 +35,7 @@ constexpr int BLOCK_SIZE = 256;
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 4)
 __global__ void fused_sg11_mu_metanet_kernel(
     scalar_t* __restrict__ mu,           // [N] — updated in-place
     const scalar_t* __restrict__ grad,   // [N]
@@ -107,6 +108,7 @@ __global__ void fused_sg11_mu_metanet_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void fused_sg11_adam_cosine_gate_kernel(
     scalar_t* __restrict__ param,             // [N] — updated
     float* __restrict__ exp_avg,           // [N] — updated
@@ -155,6 +157,7 @@ __global__ void fused_sg11_adam_cosine_gate_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void sg11_sam_perturb_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
@@ -174,6 +177,7 @@ __global__ void sg11_sam_perturb_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void sg11_sharpness_restore_kernel(
     scalar_t* __restrict__ param,         // [N] — restored to backup
     scalar_t* __restrict__ sharpness,     // [N] — output
@@ -195,6 +199,7 @@ __global__ void sg11_sharpness_restore_kernel(
 //  Vec4 Kernel 2b: Fused Adam cosine gate (float4 vectorized, FP32-only)
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void fused_sg11_adam_cosine_gate_vec4_kernel(
     float4* __restrict__ param4,
     float4* __restrict__ exp_avg4,
@@ -250,6 +255,7 @@ __global__ void fused_sg11_adam_cosine_gate_vec4_kernel(
 //  Vec4 Kernel 3b: SAM perturbation (float4 vectorized, FP32-only)
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void sg11_sam_perturb_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ grad4,
@@ -273,6 +279,7 @@ __global__ void sg11_sam_perturb_vec4_kernel(
 //  Vec4 Kernel 4b: Sharpness restore (float4 vectorized, FP32-only)
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void sg11_sharpness_restore_vec4_kernel(
     float4* __restrict__ param4,
     float4* __restrict__ sharpness4,
@@ -321,6 +328,7 @@ float compute_cosine_gate(
 //  with warp shuffle reduction — only ONE CPU sync needed.
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void cosine_gate_reduce_kernel(
     const float* __restrict__ smart_grad,  // [N]
     const float* __restrict__ mu,          // [N]
@@ -587,6 +595,7 @@ void launch_sg11_sharpness_restore(
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 4)
 __global__ void fused_sg11_full_step_kernel(
     scalar_t* __restrict__ param,         // [N] — updated
     float* __restrict__ exp_avg,          // [N] — FP32 state

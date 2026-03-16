@@ -185,6 +185,131 @@ static void ema_amplify_scalar(float* grad, float* ema, float alpha, float lamb,
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+//  BF16 / INT8 stochastic rounding (NEON + scalar)
+//
+//  Unbiased quantization for Config 4 CPU optimizer state compression.
+// ═══════════════════════════════════════════════════════════════════
+
+static unsigned _sr_philox(unsigned key, unsigned salt) {
+    unsigned v = key * 2654435761u + salt * 2246822519u;
+    v ^= v >> 16; v *= 0x45d9f3bu; v ^= v >> 16;
+    return v;
+}
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+
+static void stochastic_round_bf16_neon(
+    const float* input, uint16_t* output, int N, unsigned step
+) {
+    int i = 0;
+    for (; i + 4 <= N; i += 4) {
+        // Load 4 floats, reinterpret as uint32
+        uint32x4_t bits = vreinterpretq_u32_f32(vld1q_f32(input + i));
+
+        // Extract low 16 bits (truncated portion)
+        uint32x4_t truncated = vandq_u32(bits, vdupq_n_u32(0xFFFF));
+
+        // Generate random thresholds
+        uint32_t rng_vals[4];
+        for (int j = 0; j < 4; j++)
+            rng_vals[j] = _sr_philox(step, (unsigned)(i + j)) & 0xFFFF;
+        uint32x4_t rng = vld1q_u32(rng_vals);
+
+        // Compare: truncated > threshold → round up
+        uint32x4_t round_up = vcgtq_u32(truncated, rng);
+
+        // Add 0x10000 where rounding up
+        uint32x4_t adj = vandq_u32(round_up, vdupq_n_u32(0x10000));
+        bits = vaddq_u32(bits, adj);
+
+        // Shift right 16 to get BF16 bits
+        uint16x4_t bf16_bits = vmovn_u32(vshrq_n_u32(bits, 16));
+        vst1_u16(output + i, bf16_bits);
+    }
+    // Scalar tail
+    for (; i < N; i++) {
+        unsigned bits;
+        memcpy(&bits, &input[i], sizeof(float));
+        unsigned trunc = bits & 0xFFFF;
+        unsigned rng = _sr_philox(step, (unsigned)i) & 0xFFFF;
+        if (trunc > rng) bits += 0x10000;
+        output[i] = (uint16_t)(bits >> 16);
+    }
+}
+
+static void stochastic_round_int8_neon(
+    const float* input, int8_t* output, const float* scales,
+    int N, int block_size, unsigned step
+) {
+    int i = 0;
+    for (; i + 4 <= N; i += 4) {
+        float32x4_t vals = vld1q_f32(input + i);
+
+        // Load scales
+        float scale_arr[4];
+        for (int j = 0; j < 4; j++)
+            scale_arr[j] = scales[(i + j) / block_size];
+        float32x4_t sc = vld1q_f32(scale_arr);
+        sc = vmaxq_f32(sc, vdupq_n_f32(1e-12f));
+
+        // scaled = val / scale
+        float32x4_t scaled = vdivq_f32(vals, sc);
+
+        // Process scalar (NEON lacks efficient trunc+stochastic round)
+        float s_arr[4];
+        vst1q_f32(s_arr, scaled);
+        for (int j = 0; j < 4; j++) {
+            float sv = s_arr[j];
+            float tr = truncf(sv);
+            float frac = fabsf(sv - tr);
+            float rng = (float)(_sr_philox(step, (unsigned)(i + j)) & 0xFFFF) / 65536.0f;
+            if (frac > rng) tr += (sv > 0) ? 1.0f : -1.0f;
+            output[i + j] = (int8_t)fmaxf(-127.0f, fminf(127.0f, tr));
+        }
+    }
+    for (; i < N; i++) {
+        float scale = scales[i / block_size];
+        float scaled = input[i] / fmaxf(scale, 1e-12f);
+        float tr = truncf(scaled);
+        float frac = fabsf(scaled - tr);
+        float rng = (float)(_sr_philox(step, (unsigned)i) & 0xFFFF) / 65536.0f;
+        if (frac > rng) tr += (scaled > 0) ? 1.0f : -1.0f;
+        output[i] = (int8_t)fmaxf(-127.0f, fminf(127.0f, tr));
+    }
+}
+
+#endif  // __aarch64__
+
+// Scalar fallback for stochastic rounding
+static void stochastic_round_bf16_scalar(
+    const float* input, uint16_t* output, int N, unsigned step
+) {
+    for (int i = 0; i < N; i++) {
+        unsigned bits;
+        memcpy(&bits, &input[i], sizeof(float));
+        unsigned trunc = bits & 0xFFFF;
+        unsigned rng = _sr_philox(step, (unsigned)i) & 0xFFFF;
+        if (trunc > rng) bits += 0x10000;
+        output[i] = (uint16_t)(bits >> 16);
+    }
+}
+
+static void stochastic_round_int8_scalar(
+    const float* input, int8_t* output, const float* scales,
+    int N, int block_size, unsigned step
+) {
+    for (int i = 0; i < N; i++) {
+        float scale = scales[i / block_size];
+        float scaled = input[i] / fmaxf(scale, 1e-12f);
+        float tr = truncf(scaled);
+        float frac = fabsf(scaled - tr);
+        float rng = (float)(_sr_philox(step, (unsigned)i) & 0xFFFF) / 65536.0f;
+        if (frac > rng) tr += (scaled > 0) ? 1.0f : -1.0f;
+        output[i] = (int8_t)fmaxf(-127.0f, fminf(127.0f, tr));
+    }
+}
+
 static void matvec_scalar(const float* W, const float* x, float* out,
                           int rows, int cols) {
     for (int r = 0; r < rows; r++) {
@@ -233,5 +358,26 @@ void simd_matvec(const float* W, const float* x, float* out,
     matvec_neon(W, x, out, rows, cols);
 #else
     matvec_scalar(W, x, out, rows, cols);
+#endif
+}
+
+void simd_stochastic_round_bf16(
+    const float* input, uint16_t* output, int N, unsigned step
+) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    stochastic_round_bf16_neon(input, output, N, step);
+#else
+    stochastic_round_bf16_scalar(input, output, N, step);
+#endif
+}
+
+void simd_stochastic_round_int8(
+    const float* input, int8_t* output, const float* scales,
+    int N, int block_size, unsigned step
+) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    stochastic_round_int8_neon(input, output, scales, N, block_size, step);
+#else
+    stochastic_round_int8_scalar(input, output, scales, N, block_size, step);
 #endif
 }

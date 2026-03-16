@@ -43,6 +43,7 @@
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void input_proj_sort_kernel(
     const scalar_t* __restrict__ grad,        // [N]
     const scalar_t* __restrict__ sharpness,   // [N]
@@ -89,6 +90,7 @@ __global__ void input_proj_sort_kernel(
 //  Grid: 1 block
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(16, 8)
 __global__ void mamba3_scan_kernel(
     const float* __restrict__ x_sorted,   // [N, d_model] — sorted input
     const float* __restrict__ in_proj_W,  // [2*d_inner, d_model]
@@ -240,6 +242,7 @@ __global__ void mamba3_scan_kernel(
 //  Block: (256, 1, 1)
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void mamba3_parallel_precompute_kernel(
     const float* __restrict__ x_sorted,     // [N, d_model]
     const float* __restrict__ in_proj_W,    // [2*d_inner, d_model]
@@ -324,6 +327,7 @@ __global__ void mamba3_parallel_precompute_kernel(
 //    The chunk-based approach uses O(N/P) sequential work + O(log P) parallel depth.
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void mamba3_parallel_scan_kernel(
     const float* __restrict__ pre_x_val,    // [N, d_inner]
     const float* __restrict__ pre_z_val,    // [N, d_inner]
@@ -537,6 +541,7 @@ __global__ void mamba3_parallel_scan_kernel(
 //  params' scans to execute concurrently across SMs.
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void mamba3_parallel_scan_batched_kernel(
     const float* __restrict__ pre_x_val,    // [total_N, d_inner]
     const float* __restrict__ pre_z_val,    // [total_N, d_inner]
@@ -762,6 +767,7 @@ __global__ void mamba3_parallel_scan_batched_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 2)
 __global__ void fused_elem_step_kernel(
     scalar_t* __restrict__ param,             // [N] — updated in-place
     const scalar_t* __restrict__ grad,        // [N] — raw gradient
@@ -1070,6 +1076,7 @@ __global__ void fused_elem_step_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 2)
 __global__ void fused_elem_step_int8_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
@@ -1288,6 +1295,7 @@ __device__ __forceinline__ void unpack_int4(
 }
 
 template <typename scalar_t>
+__launch_bounds__(256, 2)
 __global__ void fused_elem_step_int4_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
@@ -1490,6 +1498,7 @@ __device__ __forceinline__ float dequant_mxfp4_element(
 }
 
 template <typename scalar_t>
+__launch_bounds__(256, 2)
 __global__ void fused_elem_step_mxfp4_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
@@ -1698,6 +1707,7 @@ __global__ void fused_elem_step_mxfp4_kernel(
 //  Block: (d_inner, 1, 1)
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(16, 8)
 __global__ void mamba3_scan_batched_kernel(
     const float* __restrict__ x_sorted_packed,    // [total_N, d_model]
     float* __restrict__ scan_output_packed,        // [total_N, d_inner]
@@ -1837,6 +1847,7 @@ __global__ void mamba3_scan_batched_kernel(
 //  block_idx >= num_params: backward (reverse), uses bwd weights
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(16, 8)
 __global__ void mamba3_scan_combined_kernel(
     const float* __restrict__ x_sorted_packed,    // [total_N, d_model]
     float* __restrict__ fwd_scan_output,          // [total_N, d_inner]
@@ -3125,6 +3136,7 @@ void batched_step_scan_and_fused_elem(
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 2)
 __global__ void fused_elem_step_int8_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
@@ -3392,6 +3404,7 @@ __global__ void fused_elem_step_int8_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 2)
 __global__ void fused_elem_step_int4_kernel(
     /* same params as fused_elem_step_kernel except expert weights are uint8_t* packed */
     scalar_t* __restrict__ param,
@@ -3697,6 +3710,7 @@ __global__ void fused_elem_step_int4_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 2)
 __global__ void fused_elem_step_mxfp4_kernel(
     // Same signature as INT4 kernel but with MXFP4 packed data
     scalar_t* __restrict__ param,
@@ -3769,6 +3783,7 @@ __global__ void fused_elem_step_mxfp4_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 2)
 __global__ void persistent_scan_fused_elem_kernel(
     // Scan inputs
     const float* __restrict__ x_sorted,

@@ -39,6 +39,7 @@
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 2)
 __global__ void fused_elem_step_cpasync_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
@@ -302,6 +303,7 @@ __global__ void fused_elem_step_cpasync_kernel(
 }
 
 // Explicit instantiations
+__launch_bounds__(256, 2)
 template __global__ void fused_elem_step_cpasync_kernel<float>(
     float*, const float*, const float*, float*, float*, float*, float*,
     const float*, const float*, const float*, const float*,
@@ -311,6 +313,7 @@ template __global__ void fused_elem_step_cpasync_kernel<float>(
     float, float, float, float, float, float, float, float, float, float,
     int*, int, int, int, int, int, int, int, int);
 
+__launch_bounds__(256, 2)
 template __global__ void fused_elem_step_cpasync_kernel<at::Half>(
     at::Half*, const at::Half*, const at::Half*, float*, float*, float*, float*,
     const float*, const float*, const float*, const float*,
@@ -320,6 +323,7 @@ template __global__ void fused_elem_step_cpasync_kernel<at::Half>(
     float, float, float, float, float, float, float, float, float, float,
     int*, int, int, int, int, int, int, int, int);
 
+__launch_bounds__(256, 2)
 template __global__ void fused_elem_step_cpasync_kernel<at::BFloat16>(
     at::BFloat16*, const at::BFloat16*, const at::BFloat16*, float*, float*, float*, float*,
     const float*, const float*, const float*, const float*,

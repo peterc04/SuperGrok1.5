@@ -18,6 +18,7 @@
 constexpr int GF_BLOCK_SIZE = 256;
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void fused_grokfast_ema_kernel(
     scalar_t* __restrict__ grad,
     float* __restrict__ ema,
@@ -43,6 +44,7 @@ __global__ void fused_grokfast_ema_kernel(
 //  Kernel: Fused Grokfast EMA — float4 vectorized (FP32 only)
 // ===================================================================
 
+__launch_bounds__(256, 8)
 __global__ void fused_grokfast_ema_vec4_kernel(
     float4* __restrict__ grad4,
     float4* __restrict__ ema4,

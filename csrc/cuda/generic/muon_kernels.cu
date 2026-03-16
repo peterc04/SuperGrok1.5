@@ -18,6 +18,7 @@
 constexpr int MUON_BLOCK_SIZE = 256;
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void muon_momentum_normalize_kernel(
     scalar_t* __restrict__ buf,
     scalar_t* __restrict__ X,
@@ -35,6 +36,7 @@ __global__ void muon_momentum_normalize_kernel(
 }
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void muon_ns_combine_kernel(
     scalar_t* __restrict__ X_out,
     const scalar_t* __restrict__ X,
@@ -55,6 +57,7 @@ __global__ void muon_ns_combine_kernel(
 }
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void muon_update_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ orth,
@@ -76,6 +79,7 @@ __global__ void muon_update_kernel(
 //  float4 vectorized kernels (FP32 only)
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void muon_momentum_normalize_vec4_kernel(
     float4* __restrict__ buf4,
     float4* __restrict__ X4,
@@ -102,6 +106,7 @@ __global__ void muon_momentum_normalize_vec4_kernel(
     X4[i] = x;
 }
 
+__launch_bounds__(256, 8)
 __global__ void muon_ns_combine_vec4_kernel(
     float4* __restrict__ X_out4,
     const float4* __restrict__ X4,
@@ -124,6 +129,7 @@ __global__ void muon_ns_combine_vec4_kernel(
     X_out4[i] = out;
 }
 
+__launch_bounds__(256, 8)
 __global__ void muon_update_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ orth4,

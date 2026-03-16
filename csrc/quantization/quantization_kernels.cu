@@ -84,6 +84,7 @@ __device__ __forceinline__ float fp8_e4m3_to_float(uint8_t val) {
     return (sign ? -result : result);
 }
 
+__launch_bounds__(256, 8)
 __global__ void quantize_fp8_e4m3_kernel(
     const float* __restrict__ input,
     uint8_t* __restrict__ output,
@@ -125,6 +126,7 @@ __global__ void quantize_fp8_e4m3_kernel(
     }
 }
 
+__launch_bounds__(256, 8)
 __global__ void dequantize_fp8_e4m3_kernel(
     const uint8_t* __restrict__ input,
     float* __restrict__ output,
@@ -146,6 +148,7 @@ __global__ void dequantize_fp8_e4m3_kernel(
 //  Quantized value = clamp(round(x / scale), -127, 127)
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void quantize_int8_kernel(
     const float* __restrict__ input,
     int8_t* __restrict__ output,
@@ -184,6 +187,7 @@ __global__ void quantize_int8_kernel(
     }
 }
 
+__launch_bounds__(256, 8)
 __global__ void dequantize_int8_kernel(
     const int8_t* __restrict__ input,
     float* __restrict__ output,
@@ -206,6 +210,7 @@ __global__ void dequantize_int8_kernel(
 
 constexpr int INT4_GROUP_SIZE = 32;
 
+__launch_bounds__(256, 8)
 __global__ void quantize_int4_kernel(
     const float* __restrict__ input,
     uint8_t* __restrict__ output,      // [N/2] packed
@@ -253,6 +258,7 @@ __global__ void quantize_int4_kernel(
     }
 }
 
+__launch_bounds__(256, 8)
 __global__ void dequantize_int4_kernel(
     const uint8_t* __restrict__ input,
     float* __restrict__ output,
@@ -309,6 +315,7 @@ __device__ __forceinline__ float mxfp4_to_float(uint8_t code, float block_scale)
     return (code & 0x08) ? -val * block_scale : val * block_scale;
 }
 
+__launch_bounds__(256, 8)
 __global__ void quantize_mxfp4_kernel(
     const float* __restrict__ input,
     uint8_t* __restrict__ output,         // [N/2] packed
@@ -353,6 +360,7 @@ __global__ void quantize_mxfp4_kernel(
     }
 }
 
+__launch_bounds__(256, 8)
 __global__ void dequantize_mxfp4_kernel(
     const uint8_t* __restrict__ input,
     float* __restrict__ output,
@@ -387,6 +395,7 @@ __global__ void dequantize_mxfp4_kernel(
 
 constexpr int NVFP4_BLOCK_SIZE = 16;
 
+__launch_bounds__(256, 8)
 __global__ void quantize_nvfp4_kernel(
     const float* __restrict__ input,
     uint8_t* __restrict__ output,
@@ -428,6 +437,7 @@ __global__ void quantize_nvfp4_kernel(
     }
 }
 
+__launch_bounds__(256, 8)
 __global__ void dequantize_nvfp4_kernel(
     const uint8_t* __restrict__ input,
     float* __restrict__ output,

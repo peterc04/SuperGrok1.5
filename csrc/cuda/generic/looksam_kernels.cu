@@ -16,6 +16,7 @@
 constexpr int LOOKSAM_BLOCK_SIZE = 256;
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void looksam_direction_kernel(
     scalar_t* __restrict__ v_dir,
     const scalar_t* __restrict__ sam_grad,
@@ -31,6 +32,7 @@ __global__ void looksam_direction_kernel(
 }
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void looksam_adjust_kernel(
     scalar_t* __restrict__ grad,
     const scalar_t* __restrict__ v_dir,
@@ -45,6 +47,7 @@ __global__ void looksam_adjust_kernel(
 }
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void looksam_perturb_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
@@ -59,6 +62,7 @@ __global__ void looksam_perturb_kernel(
 }
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void looksam_restore_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ backup,
@@ -73,6 +77,7 @@ __global__ void looksam_restore_kernel(
 //  float4 vectorized kernels (FP32 only)
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void looksam_direction_vec4_kernel(
     float4* __restrict__ v_dir4,
     const float4* __restrict__ sam_grad4,
@@ -93,6 +98,7 @@ __global__ void looksam_direction_vec4_kernel(
     v_dir4[i] = out;
 }
 
+__launch_bounds__(256, 8)
 __global__ void looksam_adjust_vec4_kernel(
     float4* __restrict__ grad4,
     const float4* __restrict__ v_dir4,
@@ -111,6 +117,7 @@ __global__ void looksam_adjust_vec4_kernel(
     grad4[i] = g;
 }
 
+__launch_bounds__(256, 8)
 __global__ void looksam_perturb_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ grad4,
@@ -129,6 +136,7 @@ __global__ void looksam_perturb_vec4_kernel(
     param4[i] = p;
 }
 
+__launch_bounds__(256, 8)
 __global__ void looksam_restore_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ backup4,

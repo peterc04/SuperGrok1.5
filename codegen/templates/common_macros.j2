@@ -1,0 +1,109 @@
+{# ═══════════════════════════════════════════════════════════════════════
+    SuperGrok v2 — Common Template Macros
+
+    Shared by all generated kernel templates.
+    Provides: Config 4 state read/write, MoE check, Philox RNG,
+    non-temporal access, float4 vectorized accessors.
+═══════════════════════════════════════════════════════════════════════ #}
+
+{# ─── Philox RNG (stateless, deterministic per step+element) ────── #}
+{% macro philox_rng() %}
+__device__ __forceinline__ unsigned philox_hash(unsigned key, unsigned salt) {
+    unsigned v = key * 2654435761u + salt * 2246822519u;
+    v ^= v >> 16; v *= 0x45d9f3bu; v ^= v >> 16;
+    return v;
+}
+{% endmacro %}
+
+{# ─── Stochastic rounding: float → INT4 ─────────────────────────── #}
+{% macro sr_int4_func() %}
+__device__ __forceinline__ int8_t float_to_int4_stochastic(
+    float val, float scale, unsigned rand_bits
+) {
+    float scaled = val / fmaxf(scale, 1e-12f);
+    float truncated = truncf(scaled);
+    float frac = fabsf(scaled - truncated);
+    float threshold = (float)(rand_bits & 0xFFFF) / 65536.0f;
+    if (frac > threshold)
+        truncated += (scaled > 0) ? 1.0f : -1.0f;
+    return (int8_t)fmaxf(-7.0f, fminf(7.0f, truncated));
+}
+{% endmacro %}
+
+{# ─── Config 4 state load macro (INT8-block8, INT4-block32, BF16) ── #}
+{% macro config4_load(state_name, q4_format, idx_var) %}
+{% if q4_format == 'int8_block8' %}
+    {
+        const int _blk_idx_{{ state_name }} = {{ idx_var }} / 8;
+        const float _scale_{{ state_name }} = {{ state_name }}_scales[_blk_idx_{{ state_name }}];
+        {{ state_name }}_val = (float){{ state_name }}_q[{{ idx_var }}] * _scale_{{ state_name }};
+    }
+{% elif q4_format == 'int4_block32' %}
+    {
+        const int _blk_idx_{{ state_name }} = {{ idx_var }} / 32;
+        const float _scale_{{ state_name }} = {{ state_name }}_scales[_blk_idx_{{ state_name }}];
+        const int _byte_idx = {{ idx_var }} / 2;
+        const int _nibble = {{ idx_var }} % 2;
+        int8_t _packed = {{ state_name }}_q[_byte_idx];
+        int8_t _raw = _nibble ? ((_packed >> 4) & 0x0F) : (_packed & 0x0F);
+        if (_raw & 0x08) _raw |= 0xF0;  // sign extend
+        {{ state_name }}_val = (float)_raw * _scale_{{ state_name }};
+    }
+{% elif q4_format == 'bf16_sr' %}
+    {{ state_name }}_val = __bfloat162float({{ state_name }}_bf16[{{ idx_var }}]);
+{% endif %}
+{% endmacro %}
+
+{# ─── Config 4 state store macro ─────────────────────────────────── #}
+{% macro config4_store(state_name, q4_format, idx_var, val_var, rng_var, step_var) %}
+{% if q4_format == 'int8_block8' %}
+    {
+        const int _blk_idx_{{ state_name }} = {{ idx_var }} / 8;
+        float _new_scale = fmaxf(fabsf({{ val_var }}), 1e-12f) / 127.0f;
+        {{ state_name }}_q[{{ idx_var }}] = float_to_int8_stochastic(
+            {{ val_var }}, _new_scale, {{ rng_var }});
+        if ({{ idx_var }} % 8 == 0)
+            {{ state_name }}_scales[_blk_idx_{{ state_name }}] = _new_scale;
+    }
+{% elif q4_format == 'int4_block32' %}
+    {
+        const int _blk_idx_{{ state_name }} = {{ idx_var }} / 32;
+        float _new_scale = fmaxf(fabsf({{ val_var }}), 1e-12f) / 7.0f;
+        int8_t _nibble = float_to_int4_stochastic(
+            {{ val_var }}, _new_scale, {{ rng_var }});
+        const int _byte_idx = {{ idx_var }} / 2;
+        const int _which = {{ idx_var }} % 2;
+        int8_t _old = {{ state_name }}_q[_byte_idx];
+        {{ state_name }}_q[_byte_idx] = _which ?
+            ((_old & 0x0F) | ((_nibble & 0x0F) << 4)) :
+            ((_old & 0xF0) | (_nibble & 0x0F));
+        if ({{ idx_var }} % 32 == 0)
+            {{ state_name }}_scales[_blk_idx_{{ state_name }}] = _new_scale;
+    }
+{% elif q4_format == 'bf16_sr' %}
+    {
+        unsigned _rng_bf16 = philox_hash({{ step_var }} * 3u + 1u, (unsigned){{ idx_var }});
+        {{ state_name }}_bf16[{{ idx_var }}] = float_to_bf16_stochastic(
+            {{ val_var }}, _rng_bf16);
+    }
+{% endif %}
+{% endmacro %}
+
+{# ─── MoE early exit (scalar) ────────────────────────────────────── #}
+{% macro moe_check_scalar(idx_var) %}
+    if (!active_mask[{{ idx_var }}]) return;
+{% endmacro %}
+
+{# ─── MoE early exit (vec4) ──────────────────────────────────────── #}
+{% macro moe_check_vec4(idx_var) %}
+    if (!active_mask[{{ idx_var }}*4] && !active_mask[{{ idx_var }}*4+1] &&
+        !active_mask[{{ idx_var }}*4+2] && !active_mask[{{ idx_var }}*4+3]) return;
+{% endmacro %}
+
+{# ─── float4 component accessor macros ───────────────────────────── #}
+{% macro vec4_component_loop(varname, operation) %}
+    {{ operation | replace("_C_", varname ~ ".x") }}
+    {{ operation | replace("_C_", varname ~ ".y") }}
+    {{ operation | replace("_C_", varname ~ ".z") }}
+    {{ operation | replace("_C_", varname ~ ".w") }}
+{% endmacro %}

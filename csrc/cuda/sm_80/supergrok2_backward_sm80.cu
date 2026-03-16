@@ -197,6 +197,7 @@ void launch_mamba3_peer_bilevel_fwd_save_batched_ampere(
 #ifdef __CUDACC__
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void mamba3_backward_dh_cpasync_kernel(
     const scalar_t* __restrict__ saved_states,   // [N, d_inner, d_state]
     const scalar_t* __restrict__ saved_x_branch, // [N, d_inner]
@@ -384,18 +385,21 @@ __global__ void mamba3_backward_dh_cpasync_kernel(
 }
 
 // Explicit instantiations
+__launch_bounds__(256, 8)
 template __global__ void mamba3_backward_dh_cpasync_kernel<float>(
     const float*, const float*, const float*, const float*,
     const float*, const float*, const float*, const float*,
     float*, float*, float*, float*,
     int, int, int);
 
+__launch_bounds__(256, 8)
 template __global__ void mamba3_backward_dh_cpasync_kernel<at::Half>(
     const at::Half*, const at::Half*, const at::Half*, const at::Half*,
     const at::Half*, const float*, const float*, const float*,
     at::Half*, at::Half*, float*, float*,
     int, int, int);
 
+__launch_bounds__(256, 8)
 template __global__ void mamba3_backward_dh_cpasync_kernel<at::BFloat16>(
     const at::BFloat16*, const at::BFloat16*, const at::BFloat16*, const at::BFloat16*,
     const at::BFloat16*, const float*, const float*, const float*,

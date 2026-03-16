@@ -208,6 +208,160 @@ static void ema_amplify_scalar(float* grad, float* ema, float alpha, float lamb,
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+//  BF16 stochastic rounding (AVX-512)
+//
+//  Unbiased quantization: add random fraction of ULP before truncation.
+//  Used by Config 4 CPU kernels for optimizer state compression.
+// ═══════════════════════════════════════════════════════════════════
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+
+static unsigned _sr_philox(unsigned key, unsigned salt) {
+    unsigned v = key * 2654435761u + salt * 2246822519u;
+    v ^= v >> 16; v *= 0x45d9f3bu; v ^= v >> 16;
+    return v;
+}
+
+static void stochastic_round_bf16_avx512(
+    const float* input, uint16_t* output, int N, unsigned step
+) {
+    // Process 16 floats at a time
+    int i = 0;
+    for (; i + 16 <= N; i += 16) {
+        __m512 vals = _mm512_loadu_ps(input + i);
+        __m512i bits = _mm512_castps_si512(vals);
+
+        // Extract truncated (lower 16) bits: these are what BF16 drops
+        __m512i truncated = _mm512_and_si512(bits, _mm512_set1_epi32(0xFFFF));
+
+        // Generate 16 random thresholds using Philox
+        __m512i rng;
+        {
+            unsigned rng_vals[16];
+            for (int j = 0; j < 16; j++)
+                rng_vals[j] = _sr_philox(step, (unsigned)(i + j)) & 0xFFFF;
+            rng = _mm512_loadu_si512(rng_vals);
+        }
+
+        // Compare: if truncated > threshold, round up
+        __mmask16 round_up = _mm512_cmpgt_epu32_mask(truncated, rng);
+
+        // Add 0x10000 to round up, then shift right 16 to get BF16
+        __m512i rounded = _mm512_mask_add_epi32(bits, round_up, bits,
+                                                 _mm512_set1_epi32(0x10000));
+        __m512i bf16_bits = _mm512_srli_epi32(rounded, 16);
+
+        // Pack 16 x 32-bit → 16 x 16-bit
+        // Extract low 16 bits of each 32-bit element
+        uint32_t tmp[16];
+        _mm512_storeu_si512(tmp, bf16_bits);
+        for (int j = 0; j < 16; j++)
+            output[i + j] = (uint16_t)tmp[j];
+    }
+    // Scalar tail
+    for (; i < N; i++) {
+        unsigned bits;
+        memcpy(&bits, &input[i], sizeof(float));
+        unsigned trunc = bits & 0xFFFF;
+        unsigned rng = _sr_philox(step, (unsigned)i) & 0xFFFF;
+        if (trunc > rng)
+            bits += 0x10000;
+        output[i] = (uint16_t)(bits >> 16);
+    }
+}
+
+static void stochastic_round_int8_avx512(
+    const float* input, int8_t* output, const float* scales,
+    int N, int block_size, unsigned step
+) {
+    int i = 0;
+    for (; i + 16 <= N; i += 16) {
+        __m512 vals = _mm512_loadu_ps(input + i);
+
+        // Load per-element block scales
+        float scale_arr[16];
+        for (int j = 0; j < 16; j++)
+            scale_arr[j] = scales[(i + j) / block_size];
+        __m512 sc = _mm512_loadu_ps(scale_arr);
+
+        // scaled = val / scale
+        __m512 scaled = _mm512_div_ps(vals, _mm512_max_ps(sc,
+                                       _mm512_set1_ps(1e-12f)));
+        __m512 trunc_val = _mm512_roundscale_ps(scaled,
+                           _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+        __m512 frac = _mm512_abs_ps(_mm512_sub_ps(scaled, trunc_val));
+
+        // Generate random thresholds
+        float rng_vals[16];
+        for (int j = 0; j < 16; j++)
+            rng_vals[j] = (float)(_sr_philox(step, (unsigned)(i + j)) & 0xFFFF) / 65536.0f;
+        __m512 threshold = _mm512_loadu_ps(rng_vals);
+
+        // Stochastic round: if frac > threshold, round away from zero
+        __mmask16 round_up = _mm512_cmp_ps_mask(frac, threshold, _CMP_GT_OQ);
+        __m512 sign = _mm512_and_ps(scaled, _mm512_set1_ps(-0.0f));
+        __m512 adj = _mm512_mask_blend_ps(round_up,
+                                           _mm512_setzero_ps(),
+                                           _mm512_or_ps(_mm512_set1_ps(1.0f), sign));
+        __m512 result = _mm512_add_ps(trunc_val, adj);
+
+        // Clamp to [-127, 127]
+        result = _mm512_max_ps(result, _mm512_set1_ps(-127.0f));
+        result = _mm512_min_ps(result, _mm512_set1_ps(127.0f));
+
+        // Convert to int8
+        __m512i ints = _mm512_cvtps_epi32(result);
+        // Pack 32-bit → 8-bit
+        int32_t tmp[16];
+        _mm512_storeu_si512(tmp, ints);
+        for (int j = 0; j < 16; j++)
+            output[i + j] = (int8_t)tmp[j];
+    }
+    // Scalar tail
+    for (; i < N; i++) {
+        float scale = scales[i / block_size];
+        float scaled = input[i] / fmaxf(scale, 1e-12f);
+        float tr = truncf(scaled);
+        float frac = fabsf(scaled - tr);
+        float rng = (float)(_sr_philox(step, (unsigned)i) & 0xFFFF) / 65536.0f;
+        if (frac > rng) tr += (scaled > 0) ? 1.0f : -1.0f;
+        output[i] = (int8_t)fmaxf(-127.0f, fminf(127.0f, tr));
+    }
+}
+
+#endif  // __AVX512F__ && __AVX512BW__
+
+// Scalar fallback implementations for stochastic rounding
+static void stochastic_round_bf16_scalar(
+    const float* input, uint16_t* output, int N, unsigned step
+) {
+    for (int i = 0; i < N; i++) {
+        unsigned bits;
+        memcpy(&bits, &input[i], sizeof(float));
+        unsigned trunc = bits & 0xFFFF;
+        unsigned rng = _sr_philox(step, (unsigned)i) & 0xFFFF;
+        if (trunc > rng)
+            bits += 0x10000;
+        output[i] = (uint16_t)(bits >> 16);
+    }
+}
+
+static void stochastic_round_int8_scalar(
+    const float* input, int8_t* output, const float* scales,
+    int N, int block_size, unsigned step
+) {
+    for (int i = 0; i < N; i++) {
+        float scale = scales[i / block_size];
+        float scaled = input[i] / fmaxf(scale, 1e-12f);
+        float tr = truncf(scaled);
+        float frac = fabsf(scaled - tr);
+        float rng = (float)(_sr_philox(step, (unsigned)i) & 0xFFFF) / 65536.0f;
+        if (frac > rng) tr += (scaled > 0) ? 1.0f : -1.0f;
+        output[i] = (int8_t)fmaxf(-127.0f, fminf(127.0f, tr));
+    }
+}
+
 static void matvec_scalar(const float* W, const float* x, float* out,
                           int rows, int cols) {
     for (int r = 0; r < rows; r++) {
@@ -265,4 +419,29 @@ void simd_matvec(const float* W, const float* x, float* out,
     }
 #endif
     matvec_scalar(W, x, out, rows, cols);
+}
+
+void simd_stochastic_round_bf16(
+    const float* input, uint16_t* output, int N, unsigned step
+) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if (_avx512_ok) {
+        stochastic_round_bf16_avx512(input, output, N, step);
+        return;
+    }
+#endif
+    stochastic_round_bf16_scalar(input, output, N, step);
+}
+
+void simd_stochastic_round_int8(
+    const float* input, int8_t* output, const float* scales,
+    int N, int block_size, unsigned step
+) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if (_avx512_ok) {
+        stochastic_round_int8_avx512(input, output, scales, N, block_size, step);
+        return;
+    }
+#endif
+    stochastic_round_int8_scalar(input, output, scales, N, block_size, step);
 }

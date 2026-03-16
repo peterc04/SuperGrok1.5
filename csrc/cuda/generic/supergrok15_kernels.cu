@@ -29,6 +29,7 @@ constexpr int BLOCK_SIZE = 256;
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 4)
 __global__ void fused_mu_metanet_kernel(
     scalar_t* __restrict__ mu,           // [N] — updated in-place
     const scalar_t* __restrict__ grad,   // [N]
@@ -100,6 +101,7 @@ __global__ void fused_mu_metanet_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void fused_adam_decay_kernel(
     scalar_t* __restrict__ param,             // [N] — updated
     float* __restrict__ exp_avg,              // [N] — FP32 state
@@ -149,6 +151,7 @@ __global__ void fused_adam_decay_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void sam_perturb_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
@@ -168,6 +171,7 @@ __global__ void sam_perturb_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 8)
 __global__ void sharpness_restore_kernel(
     scalar_t* __restrict__ param,         // [N] — restored to backup
     scalar_t* __restrict__ sharpness,     // [N] — output
@@ -189,6 +193,7 @@ __global__ void sharpness_restore_kernel(
 //  Vec4 Kernel 2b: Fused Adam decay (float4 vectorized, FP32-only)
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void fused_adam_decay_vec4_kernel(
     float4* __restrict__ param4,
     float4* __restrict__ exp_avg4,
@@ -244,6 +249,7 @@ __global__ void fused_adam_decay_vec4_kernel(
 //  Vec4 Kernel 3b: SAM perturbation (float4 vectorized, FP32-only)
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void sam_perturb_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ grad4,
@@ -267,6 +273,7 @@ __global__ void sam_perturb_vec4_kernel(
 //  Vec4 Kernel 4b: Sharpness restore (float4 vectorized, FP32-only)
 // ═══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(256, 8)
 __global__ void sharpness_restore_vec4_kernel(
     float4* __restrict__ param4,
     float4* __restrict__ sharpness4,
@@ -489,6 +496,7 @@ void launch_sharpness_restore(
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
+__launch_bounds__(256, 4)
 __global__ void fused_supergrok15_full_step_kernel(
     scalar_t* __restrict__ param,         // [N] — updated
     float* __restrict__ exp_avg,          // [N] — FP32 state
