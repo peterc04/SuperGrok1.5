@@ -28,6 +28,7 @@
 
 #include "platform.h"
 #include "types.h"
+#include "dispatch.h"
 #include "ptx_intrinsics.cuh"
 
 
@@ -510,7 +511,9 @@ void launch_distributed_prefix_apply_fused_elem(
     int N_local, int world_size, int rank,
     int d_inner, int expert_hidden, int num_experts,
     float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, float rescale
+    float bc1, float bc2, float rescale,
+    StatePrecision state_prec, ArchTier arch_tier,
+    bool is_backward
 ) {
     int weight_size = expert_W1.numel();
     int block = 256;
@@ -519,29 +522,199 @@ void launch_distributed_prefix_apply_fused_elem(
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    distributed_prefix_apply_fused_elem_kernel<<<grid, block, smem_size, stream>>>(
-        all_summaries_M.data_ptr<float>(),
-        all_summaries_b.data_ptr<float>(),
-        scan_output.data_ptr<float>(),
-        sort_indices.data_ptr<int>(),
-        param.data_ptr<float>(),
-        exp_avg.data_ptr<float>(),
-        exp_avg_sq.data_ptr<float>(),
-        gru_state.data_ptr<float>(),
-        expert_W1.data_ptr<float>(),
-        expert_b1.data_ptr<float>(),
-        expert_W2.data_ptr<float>(),
-        expert_b2.data_ptr<float>(),
-        gru_Wz.data_ptr<float>(),
-        gru_bz.data_ptr<float>(),
-        gru_Wr.data_ptr<float>(),
-        gru_br.data_ptr<float>(),
-        gru_Wh.data_ptr<float>(),
-        gru_bh.data_ptr<float>(),
-        N_local, world_size, rank,
-        d_inner, expert_hidden, num_experts,
-        lr, beta1, beta2, eps, wd,
-        bc1, bc2, rescale,
-        weight_size
-    );
+    if (is_backward) {
+        // Backward Kernel B variants
+        if (d_inner == 16) {
+            distributed_prefix_apply_fused_elem_bwd_d16_kernel<<<grid, block, smem_size, stream>>>(
+                all_summaries_M.data_ptr<float>(),
+                all_summaries_b.data_ptr<float>(),
+                scan_output.data_ptr<float>(),
+                sort_indices.data_ptr<int>(),
+                param.data_ptr<float>(),        // grad_param
+                exp_avg.data_ptr<float>(),       // grad_exp_avg
+                expert_W1.data_ptr<float>(),     // grad_expert_W1
+                expert_b1.data_ptr<float>(),     // grad_expert_b1
+                expert_W2.data_ptr<float>(),     // grad_expert_W2
+                expert_b2.data_ptr<float>(),     // grad_expert_b2
+                gru_Wz.data_ptr<float>(),        // grad_gru_weights
+                gru_bz.data_ptr<float>(),        // expert_weights (forward)
+                N_local, world_size, rank,
+                expert_hidden, num_experts,
+                rescale, weight_size
+            );
+        } else {
+            distributed_prefix_apply_fused_elem_bwd_kernel<<<grid, block, smem_size, stream>>>(
+                all_summaries_M.data_ptr<float>(),
+                all_summaries_b.data_ptr<float>(),
+                scan_output.data_ptr<float>(),
+                sort_indices.data_ptr<int>(),
+                param.data_ptr<float>(),        // grad_param
+                exp_avg.data_ptr<float>(),       // grad_exp_avg
+                expert_W1.data_ptr<float>(),     // grad_expert_W1
+                expert_b1.data_ptr<float>(),     // grad_expert_b1
+                expert_W2.data_ptr<float>(),     // grad_expert_W2
+                expert_b2.data_ptr<float>(),     // grad_expert_b2
+                gru_Wz.data_ptr<float>(),        // grad_gru_weights
+                gru_bz.data_ptr<float>(),        // expert_weights (forward)
+                N_local, world_size, rank,
+                d_inner, expert_hidden, num_experts,
+                rescale, weight_size
+            );
+        }
+    } else if (state_prec == StatePrecision::CONFIG4) {
+        // Config4 quantized state variant
+        distributed_prefix_apply_fused_elem_q4_kernel<<<grid, block, smem_size, stream>>>(
+            all_summaries_M.data_ptr<float>(),
+            all_summaries_b.data_ptr<float>(),
+            scan_output.data_ptr<float>(),
+            sort_indices.data_ptr<int>(),
+            param.data_ptr<float>(),
+            exp_avg.data_ptr<int8_t>(),      // quantized exp_avg
+            exp_avg_sq.data_ptr<float>(),    // exp_avg_scale (repurposed)
+            gru_state.data_ptr<float>(),     // exp_avg_sq (repurposed)
+            expert_W1.data_ptr<float>(),     // gru_state (repurposed)
+            expert_b1.data_ptr<float>(),     // expert_weights
+            N_local, world_size, rank,
+            d_inner, expert_hidden, num_experts,
+            lr, beta1, beta2, eps, wd,
+            bc1, bc2, rescale, weight_size
+        );
+    } else if (d_inner == 16) {
+        // d_inner=16 specialized variant
+        distributed_prefix_apply_fused_elem_d16_kernel<<<grid, block, smem_size, stream>>>(
+            all_summaries_M.data_ptr<float>(),
+            all_summaries_b.data_ptr<float>(),
+            scan_output.data_ptr<float>(),
+            sort_indices.data_ptr<int>(),
+            param.data_ptr<float>(),
+            exp_avg.data_ptr<float>(),
+            exp_avg_sq.data_ptr<float>(),
+            gru_state.data_ptr<float>(),
+            expert_W1.data_ptr<float>(),
+            N_local, world_size, rank,
+            expert_hidden, num_experts,
+            lr, beta1, beta2, eps, wd,
+            bc1, bc2, rescale, weight_size
+        );
+    } else if (arch_tier == ArchTier::AMPERE || arch_tier == ArchTier::HOPPER ||
+               arch_tier == ArchTier::BLACKWELL) {
+        // Ampere+ cp.async smem load variant
+        distributed_prefix_apply_fused_elem_cpasync_kernel<<<grid, block, smem_size, stream>>>(
+            all_summaries_M.data_ptr<float>(),
+            all_summaries_b.data_ptr<float>(),
+            scan_output.data_ptr<float>(),
+            sort_indices.data_ptr<int>(),
+            param.data_ptr<float>(),
+            exp_avg.data_ptr<float>(),
+            exp_avg_sq.data_ptr<float>(),
+            gru_state.data_ptr<float>(),
+            expert_W1.data_ptr<float>(),
+            expert_b1.data_ptr<float>(),
+            expert_W2.data_ptr<float>(),
+            expert_b2.data_ptr<float>(),
+            gru_Wz.data_ptr<float>(),
+            gru_bz.data_ptr<float>(),
+            gru_Wr.data_ptr<float>(),
+            gru_br.data_ptr<float>(),
+            gru_Wh.data_ptr<float>(),
+            gru_bh.data_ptr<float>(),
+            N_local, world_size, rank,
+            d_inner, expert_hidden, num_experts,
+            lr, beta1, beta2, eps, wd,
+            bc1, bc2, rescale, weight_size
+        );
+    } else {
+        // Generic FP32 fallback
+        distributed_prefix_apply_fused_elem_kernel<<<grid, block, smem_size, stream>>>(
+            all_summaries_M.data_ptr<float>(),
+            all_summaries_b.data_ptr<float>(),
+            scan_output.data_ptr<float>(),
+            sort_indices.data_ptr<int>(),
+            param.data_ptr<float>(),
+            exp_avg.data_ptr<float>(),
+            exp_avg_sq.data_ptr<float>(),
+            gru_state.data_ptr<float>(),
+            expert_W1.data_ptr<float>(),
+            expert_b1.data_ptr<float>(),
+            expert_W2.data_ptr<float>(),
+            expert_b2.data_ptr<float>(),
+            gru_Wz.data_ptr<float>(),
+            gru_bz.data_ptr<float>(),
+            gru_Wr.data_ptr<float>(),
+            gru_br.data_ptr<float>(),
+            gru_Wh.data_ptr<float>(),
+            gru_bh.data_ptr<float>(),
+            N_local, world_size, rank,
+            d_inner, expert_hidden, num_experts,
+            lr, beta1, beta2, eps, wd,
+            bc1, bc2, rescale, weight_size
+        );
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Backward distributed pipeline
+// ═══════════════════════════════════════════════════════════════════════
+
+void launch_distributed_prefix_apply_fused_elem_backward(
+    torch::Tensor all_bwd_summaries_M,
+    torch::Tensor all_bwd_summaries_b,
+    torch::Tensor grad_scan_output,
+    torch::Tensor sort_indices,
+    torch::Tensor grad_param,
+    torch::Tensor grad_exp_avg,
+    torch::Tensor grad_expert_W1,
+    torch::Tensor grad_expert_b1,
+    torch::Tensor grad_expert_W2,
+    torch::Tensor grad_expert_b2,
+    torch::Tensor grad_gru_weights,
+    torch::Tensor expert_weights,
+    int N_local, int world_size, int rank,
+    int d_inner, int expert_hidden, int num_experts,
+    float rescale
+) {
+    int weight_size = expert_weights.numel();
+    int block = 256;
+    int grid = (N_local + block - 1) / block;
+    int smem_size = weight_size * sizeof(float);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    if (d_inner == 16) {
+        distributed_prefix_apply_fused_elem_bwd_d16_kernel<<<grid, block, smem_size, stream>>>(
+            all_bwd_summaries_M.data_ptr<float>(),
+            all_bwd_summaries_b.data_ptr<float>(),
+            grad_scan_output.data_ptr<float>(),
+            sort_indices.data_ptr<int>(),
+            grad_param.data_ptr<float>(),
+            grad_exp_avg.data_ptr<float>(),
+            grad_expert_W1.data_ptr<float>(),
+            grad_expert_b1.data_ptr<float>(),
+            grad_expert_W2.data_ptr<float>(),
+            grad_expert_b2.data_ptr<float>(),
+            grad_gru_weights.data_ptr<float>(),
+            expert_weights.data_ptr<float>(),
+            N_local, world_size, rank,
+            expert_hidden, num_experts,
+            rescale, weight_size
+        );
+    } else {
+        distributed_prefix_apply_fused_elem_bwd_kernel<<<grid, block, smem_size, stream>>>(
+            all_bwd_summaries_M.data_ptr<float>(),
+            all_bwd_summaries_b.data_ptr<float>(),
+            grad_scan_output.data_ptr<float>(),
+            sort_indices.data_ptr<int>(),
+            grad_param.data_ptr<float>(),
+            grad_exp_avg.data_ptr<float>(),
+            grad_expert_W1.data_ptr<float>(),
+            grad_expert_b1.data_ptr<float>(),
+            grad_expert_W2.data_ptr<float>(),
+            grad_expert_b2.data_ptr<float>(),
+            grad_gru_weights.data_ptr<float>(),
+            expert_weights.data_ptr<float>(),
+            N_local, world_size, rank,
+            d_inner, expert_hidden, num_experts,
+            rescale, weight_size
+        );
+    }
 }

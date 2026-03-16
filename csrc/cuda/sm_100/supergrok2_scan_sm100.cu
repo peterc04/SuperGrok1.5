@@ -644,3 +644,203 @@ __global__ __launch_bounds__(256, 2) void scan_tma_d16_kernel(
 }
 
 #endif  // __CUDA_ARCH__ >= 1000
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Host launcher: Blackwell TMA/FP4 fused_elem + scan dispatch
+//
+//  Selects the correct kernel variant based on:
+//    - ExpertPrecision: TMA (FP32 experts) vs FP4 (NVFP4 experts)
+//    - StatePrecision:  FP32 vs CONFIG4 (quantized exp_avg)
+//    - active_mask:     dense vs MoE routing
+//    - d_inner:         generic vs d_inner=16 specialized
+// ═══════════════════════════════════════════════════════════════════════
+
+#include "dispatch.h"
+
+void launch_blackwell_scan_tma(
+    torch::Tensor pre_x, torch::Tensor pre_z, torch::Tensor pre_dt,
+    torch::Tensor pre_B, torch::Tensor pre_C,
+    torch::Tensor A_log, torch::Tensor D_param,
+    torch::Tensor scan_output,
+    torch::Tensor initial_state,
+    int N, int d_inner, int d_state
+) {
+    auto stream = at::cuda::getCurrentCUDAStream();
+    int smem = 0;
+
+    if (d_inner == 16) {
+        scan_tma_d16_kernel<<<1, 16, smem, stream>>>(
+            pre_x.data_ptr<float>(), pre_z.data_ptr<float>(),
+            pre_dt.data_ptr<float>(), pre_B.data_ptr<float>(),
+            pre_C.data_ptr<float>(), A_log.data_ptr<float>(),
+            D_param.data_ptr<float>(), scan_output.data_ptr<float>(),
+            initial_state.defined() ? initial_state.data_ptr<float>() : nullptr,
+            N, d_state
+        );
+    } else {
+        scan_tma_kernel<<<1, d_inner, smem, stream>>>(
+            pre_x.data_ptr<float>(), pre_z.data_ptr<float>(),
+            pre_dt.data_ptr<float>(), pre_B.data_ptr<float>(),
+            pre_C.data_ptr<float>(), A_log.data_ptr<float>(),
+            D_param.data_ptr<float>(), scan_output.data_ptr<float>(),
+            initial_state.defined() ? initial_state.data_ptr<float>() : nullptr,
+            N, d_inner, d_state
+        );
+    }
+}
+
+void launch_blackwell_fused_elem_tma_fp4(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor scan_output,
+    torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor exp_avg_q, torch::Tensor exp_avg_scale,
+    torch::Tensor gru_state,
+    torch::Tensor expert_W1, torch::Tensor expert_b1,
+    torch::Tensor expert_W2, torch::Tensor expert_b2,
+    torch::Tensor expert_W1_fp4, torch::Tensor expert_W1_scale,
+    torch::Tensor expert_indices, torch::Tensor expert_gates,
+    torch::Tensor gru_weights,
+    int N, int d_inner, int expert_hidden, int num_experts, int top_k,
+    float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2, float rescale,
+    int weight_size,
+    ExpertPrecision expert_prec, StatePrecision state_prec,
+    bool is_moe
+) {
+    auto stream = at::cuda::getCurrentCUDAStream();
+    int block = 256;
+    int grid = (N + block - 1) / block;
+    int smem = weight_size * sizeof(float);
+    bool is_d16 = (d_inner == 16);
+    bool use_fp4 = (expert_prec == ExpertPrecision::FP4);
+    bool use_q4 = (state_prec == StatePrecision::CONFIG4);
+
+    if (use_fp4) {
+        // FP4 expert weight variants
+        if (is_d16) {
+            fused_elem_step_fp4_d16_kernel<<<grid, block, smem, stream>>>(
+                param.data_ptr<float>(), grad.data_ptr<float>(),
+                scan_output.data_ptr<float>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                expert_W1_fp4.data_ptr<uint8_t>(),
+                expert_W1_scale.data_ptr<float>(),
+                N, expert_hidden, num_experts,
+                lr, beta1, beta2, eps, wd, bc1, bc2, rescale
+            );
+        } else if (is_moe) {
+            fused_elem_step_fp4_moe_kernel<<<grid, block, smem, stream>>>(
+                param.data_ptr<float>(), grad.data_ptr<float>(),
+                scan_output.data_ptr<float>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                expert_W1_fp4.data_ptr<uint8_t>(),
+                expert_W1_scale.data_ptr<float>(),
+                expert_indices.data_ptr<int>(),
+                expert_gates.data_ptr<float>(),
+                N, expert_hidden, num_experts, top_k,
+                lr, beta1, beta2, eps, wd, bc1, bc2, rescale
+            );
+        } else if (use_q4) {
+            fused_elem_step_fp4_q4_kernel<<<grid, block, smem, stream>>>(
+                param.data_ptr<float>(), grad.data_ptr<float>(),
+                scan_output.data_ptr<float>(),
+                exp_avg_q.data_ptr<int8_t>(),
+                exp_avg_scale.data_ptr<float>(),
+                exp_avg_sq.data_ptr<float>(),
+                expert_W1_fp4.data_ptr<uint8_t>(),
+                expert_W1_scale.data_ptr<float>(),
+                N, expert_hidden, num_experts,
+                lr, beta1, beta2, eps, wd, bc1, bc2, rescale
+            );
+        } else {
+            fused_elem_step_fp4_kernel<<<grid, block, smem, stream>>>(
+                param.data_ptr<float>(), grad.data_ptr<float>(),
+                scan_output.data_ptr<float>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                expert_W1_fp4.data_ptr<uint8_t>(),
+                expert_W1_scale.data_ptr<float>(),
+                N, expert_hidden, num_experts,
+                lr, beta1, beta2, eps, wd, bc1, bc2, rescale
+            );
+        }
+    } else {
+        // TMA expert weight variants (FP32 experts with hardware smem loading)
+        if (use_q4 && is_d16) {
+            fused_elem_step_tma_q4_d16_kernel<<<grid, block, smem, stream>>>(
+                param.data_ptr<float>(), grad.data_ptr<float>(),
+                scan_output.data_ptr<float>(),
+                exp_avg_q.data_ptr<int8_t>(),
+                exp_avg_scale.data_ptr<float>(),
+                exp_avg_sq.data_ptr<float>(),
+                expert_W1.data_ptr<float>(),
+                N,
+                lr, beta1, beta2, eps, wd, bc1, bc2, rescale,
+                weight_size
+            );
+        } else if (use_q4 && is_moe) {
+            fused_elem_step_tma_q4_moe_kernel<<<grid, block, smem, stream>>>(
+                param.data_ptr<float>(), grad.data_ptr<float>(),
+                scan_output.data_ptr<float>(),
+                exp_avg_q.data_ptr<int8_t>(),
+                exp_avg_scale.data_ptr<float>(),
+                exp_avg_sq.data_ptr<float>(),
+                expert_W1.data_ptr<float>(),
+                expert_indices.data_ptr<int>(),
+                expert_gates.data_ptr<float>(),
+                N, expert_hidden, num_experts, top_k,
+                lr, beta1, beta2, eps, wd, bc1, bc2, rescale,
+                weight_size
+            );
+        } else if (use_q4) {
+            fused_elem_step_tma_q4_kernel<<<grid, block, smem, stream>>>(
+                param.data_ptr<float>(), grad.data_ptr<float>(),
+                scan_output.data_ptr<float>(),
+                exp_avg_q.data_ptr<int8_t>(),
+                exp_avg_scale.data_ptr<float>(),
+                exp_avg_sq.data_ptr<float>(),
+                gru_state.data_ptr<float>(),
+                expert_W1.data_ptr<float>(),
+                N, expert_hidden, num_experts,
+                lr, beta1, beta2, eps, wd, bc1, bc2, rescale,
+                weight_size
+            );
+        } else if (is_moe) {
+            fused_elem_step_tma_moe_kernel<<<grid, block, smem, stream>>>(
+                param.data_ptr<float>(), grad.data_ptr<float>(),
+                scan_output.data_ptr<float>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                gru_state.data_ptr<float>(),
+                expert_W1.data_ptr<float>(), expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(), expert_b2.data_ptr<float>(),
+                expert_indices.data_ptr<int>(),
+                expert_gates.data_ptr<float>(),
+                N, expert_hidden, num_experts, top_k,
+                lr, beta1, beta2, eps, wd, bc1, bc2, rescale,
+                weight_size
+            );
+        } else if (is_d16) {
+            fused_elem_step_tma_d16_kernel<<<grid, block, smem, stream>>>(
+                param.data_ptr<float>(), grad.data_ptr<float>(),
+                scan_output.data_ptr<float>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                gru_state.data_ptr<float>(),
+                expert_W1.data_ptr<float>(),
+                N,
+                lr, beta1, beta2, eps, wd, bc1, bc2, rescale,
+                weight_size
+            );
+        } else {
+            fused_elem_step_tma_kernel<<<grid, block, smem, stream>>>(
+                param.data_ptr<float>(), grad.data_ptr<float>(),
+                scan_output.data_ptr<float>(),
+                exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+                gru_state.data_ptr<float>(),
+                expert_W1.data_ptr<float>(), expert_b1.data_ptr<float>(),
+                expert_W2.data_ptr<float>(), expert_b2.data_ptr<float>(),
+                gru_weights.data_ptr<float>(),
+                N, expert_hidden, num_experts,
+                lr, beta1, beta2, eps, wd, bc1, bc2, rescale,
+                weight_size
+            );
+        }
+    }
+}

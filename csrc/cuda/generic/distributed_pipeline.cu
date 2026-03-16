@@ -20,6 +20,7 @@
 
 #include "platform.h"
 #include "types.h"
+#include "dispatch.h"
 
 #ifdef GROK_USE_NCCL
 #include <nccl.h>
@@ -50,7 +51,9 @@ extern void launch_distributed_prefix_apply_fused_elem(
     int N_local, int world_size, int rank,
     int d_inner, int expert_hidden, int num_experts,
     float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, float rescale
+    float bc1, float bc2, float rescale,
+    StatePrecision state_prec, ArchTier arch_tier,
+    bool is_backward
 );
 
 
@@ -130,6 +133,7 @@ void distributed_mamba3_scan_pipeline(
 #endif
 
     // ── Step 3: Fused prefix + apply + elem (Kernel B) ──────────────
+    auto arch_tier = get_arch_tier();
     launch_distributed_prefix_apply_fused_elem(
         all_summaries_M.reshape({world_size, 4}),
         all_summaries_b,
@@ -140,7 +144,9 @@ void distributed_mamba3_scan_pipeline(
         N_local, world_size, rank,
         d_inner, expert_hidden, num_experts,
         lr, beta1, beta2, eps, wd,
-        bc1, bc2, rescale
+        bc1, bc2, rescale,
+        StatePrecision::FP32, arch_tier,
+        false  // not backward
     );
 
     // Everything enqueued. GPU executes Kernel A -> NCCL -> Kernel B back-to-back.
