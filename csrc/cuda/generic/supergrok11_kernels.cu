@@ -36,7 +36,7 @@ constexpr int BLOCK_SIZE = 256;
 
 template <typename scalar_t>
 __launch_bounds__(256, 4)
-__global__ void fused_sg11_mu_metanet_kernel(
+__global__ __launch_bounds__(256, 2) void fused_sg11_mu_metanet_kernel(
     scalar_t* __restrict__ mu,           // [N] — updated in-place
     const scalar_t* __restrict__ grad,   // [N]
     const scalar_t* __restrict__ sharp,  // [N]
@@ -109,7 +109,7 @@ __global__ void fused_sg11_mu_metanet_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ void fused_sg11_adam_cosine_gate_kernel(
+__global__ __launch_bounds__(256, 2) void fused_sg11_adam_cosine_gate_kernel(
     scalar_t* __restrict__ param,             // [N] — updated
     float* __restrict__ exp_avg,           // [N] — updated
     float* __restrict__ exp_avg_sq,        // [N] — updated
@@ -158,7 +158,7 @@ __global__ void fused_sg11_adam_cosine_gate_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ void sg11_sam_perturb_kernel(
+__global__ __launch_bounds__(256, 2) void sg11_sam_perturb_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     const float rho_over_norm,   // rho / (global_grad_norm + eps)
@@ -178,7 +178,7 @@ __global__ void sg11_sam_perturb_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ void sg11_sharpness_restore_kernel(
+__global__ __launch_bounds__(256, 2) void sg11_sharpness_restore_kernel(
     scalar_t* __restrict__ param,         // [N] — restored to backup
     scalar_t* __restrict__ sharpness,     // [N] — output
     const scalar_t* __restrict__ backup,  // [N]
@@ -200,7 +200,7 @@ __global__ void sg11_sharpness_restore_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ void fused_sg11_adam_cosine_gate_vec4_kernel(
+__global__ __launch_bounds__(256, 2) void fused_sg11_adam_cosine_gate_vec4_kernel(
     float4* __restrict__ param4,
     float4* __restrict__ exp_avg4,
     float4* __restrict__ exp_avg_sq4,
@@ -256,7 +256,7 @@ __global__ void fused_sg11_adam_cosine_gate_vec4_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ void sg11_sam_perturb_vec4_kernel(
+__global__ __launch_bounds__(256, 2) void sg11_sam_perturb_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ grad4,
     float rho_over_norm,
@@ -280,7 +280,7 @@ __global__ void sg11_sam_perturb_vec4_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ void sg11_sharpness_restore_vec4_kernel(
+__global__ __launch_bounds__(256, 2) void sg11_sharpness_restore_vec4_kernel(
     float4* __restrict__ param4,
     float4* __restrict__ sharpness4,
     const float4* __restrict__ backup4,
@@ -329,7 +329,7 @@ float compute_cosine_gate(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ void cosine_gate_reduce_kernel(
+__global__ __launch_bounds__(256, 2) void cosine_gate_reduce_kernel(
     const float* __restrict__ smart_grad,  // [N]
     const float* __restrict__ mu,          // [N]
     float* __restrict__ results,           // [3] output: {dot, sg_norm_sq, mu_norm_sq}
@@ -596,7 +596,7 @@ void launch_sg11_sharpness_restore(
 
 template <typename scalar_t>
 __launch_bounds__(256, 4)
-__global__ void fused_sg11_full_step_kernel(
+__global__ __launch_bounds__(256, 2) void fused_sg11_full_step_kernel(
     scalar_t* __restrict__ param,         // [N] — updated
     float* __restrict__ exp_avg,          // [N] — FP32 state
     float* __restrict__ exp_avg_sq,       // [N] — FP32 state

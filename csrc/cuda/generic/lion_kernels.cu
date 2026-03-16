@@ -19,7 +19,7 @@ constexpr int LION_BLOCK_SIZE = 256;
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ void fused_lion_step_kernel(
+__global__ __launch_bounds__(256, 2) void fused_lion_step_kernel(
     scalar_t* __restrict__ param,
     float* __restrict__ exp_avg,       // FP32 state
     const scalar_t* __restrict__ grad,
@@ -60,7 +60,7 @@ __global__ void fused_lion_step_kernel(
 // ===================================================================
 
 __launch_bounds__(256, 8)
-__global__ void fused_lion_step_vec4_kernel(
+__global__ __launch_bounds__(256, 2) void fused_lion_step_vec4_kernel(
     float4* __restrict__ param4,
     float4* __restrict__ exp_avg4,
     const float4* __restrict__ grad4,

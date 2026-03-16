@@ -39,7 +39,7 @@ __device__ __forceinline__ void atomicMaxFloat(float* addr, float value) {
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ void compute_absmax_kernel(
+__global__ __launch_bounds__(256, 2) void compute_absmax_kernel(
     const float* __restrict__ input,
     float* __restrict__ scale_out,
     const int N,

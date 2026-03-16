@@ -31,7 +31,7 @@ __device__ __forceinline__ int8_t cpasync_int8_stochastic(
 
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ void fused_supergrok15_full_step_cpasync_q4_kernel(
+__global__ __launch_bounds__(256, 2) void fused_supergrok15_full_step_cpasync_q4_kernel(
     scalar_t* __restrict__ param,
     int8_t* __restrict__ exp_avg_q,
     float* __restrict__ exp_avg_scales,
@@ -138,7 +138,7 @@ __global__ void fused_supergrok15_full_step_cpasync_q4_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ void fused_supergrok15_full_step_cpasync_moe_kernel(
+__global__ __launch_bounds__(256, 2) void fused_supergrok15_full_step_cpasync_moe_kernel(
     scalar_t* __restrict__ param,
     float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq,
@@ -230,7 +230,7 @@ __global__ void fused_supergrok15_full_step_cpasync_moe_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ void fused_supergrok15_full_step_cpasync_moe_q4_kernel(
+__global__ __launch_bounds__(256, 2) void fused_supergrok15_full_step_cpasync_moe_q4_kernel(
     scalar_t* __restrict__ param,
     int8_t* __restrict__ exp_avg_q,
     float* __restrict__ exp_avg_scales,
@@ -339,7 +339,7 @@ __global__ void fused_supergrok15_full_step_cpasync_moe_q4_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ void fused_sg11_full_step_cpasync_q4_kernel(
+__global__ __launch_bounds__(256, 2) void fused_sg11_full_step_cpasync_q4_kernel(
     scalar_t* __restrict__ param,
     int8_t* __restrict__ exp_avg_q,
     float* __restrict__ exp_avg_scales,
@@ -446,7 +446,7 @@ __global__ void fused_sg11_full_step_cpasync_q4_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ void fused_sg11_full_step_cpasync_moe_kernel(
+__global__ __launch_bounds__(256, 2) void fused_sg11_full_step_cpasync_moe_kernel(
     scalar_t* __restrict__ param,
     float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq,
@@ -538,7 +538,7 @@ __global__ void fused_sg11_full_step_cpasync_moe_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ void fused_sg11_full_step_cpasync_moe_q4_kernel(
+__global__ __launch_bounds__(256, 2) void fused_sg11_full_step_cpasync_moe_q4_kernel(
     scalar_t* __restrict__ param,
     int8_t* __restrict__ exp_avg_q,
     float* __restrict__ exp_avg_scales,
@@ -647,7 +647,7 @@ __global__ void fused_sg11_full_step_cpasync_moe_q4_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ void fused_neuralgrok_full_step_cpasync_q4_kernel(
+__global__ __launch_bounds__(256, 2) void fused_neuralgrok_full_step_cpasync_q4_kernel(
     scalar_t* __restrict__ param,
     int8_t* __restrict__ exp_avg_q,
     float* __restrict__ exp_avg_scales,
@@ -746,7 +746,7 @@ __global__ void fused_neuralgrok_full_step_cpasync_q4_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ void fused_neuralgrok_full_step_cpasync_moe_kernel(
+__global__ __launch_bounds__(256, 2) void fused_neuralgrok_full_step_cpasync_moe_kernel(
     scalar_t* __restrict__ param,
     float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq,
@@ -834,7 +834,7 @@ __global__ void fused_neuralgrok_full_step_cpasync_moe_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ void fused_neuralgrok_full_step_cpasync_moe_q4_kernel(
+__global__ __launch_bounds__(256, 2) void fused_neuralgrok_full_step_cpasync_moe_q4_kernel(
     scalar_t* __restrict__ param,
     int8_t* __restrict__ exp_avg_q,
     float* __restrict__ exp_avg_scales,

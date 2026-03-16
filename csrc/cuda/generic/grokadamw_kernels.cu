@@ -41,7 +41,7 @@ constexpr int GROKADAMW_BLOCK_SIZE = 256;
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ void fused_grokadamw_step_kernel(
+__global__ __launch_bounds__(256, 2) void fused_grokadamw_step_kernel(
     scalar_t* __restrict__ param,          // [N] -- updated in-place
     float* __restrict__ exp_avg,           // [N] -- first moment, updated
     float* __restrict__ exp_avg_sq,        // [N] -- second moment, updated
@@ -98,7 +98,7 @@ __global__ void fused_grokadamw_step_kernel(
 // ===================================================================
 
 __launch_bounds__(256, 8)
-__global__ void fused_grokadamw_step_vec4_kernel(
+__global__ __launch_bounds__(256, 2) void fused_grokadamw_step_vec4_kernel(
     float4* __restrict__ param4,
     float4* __restrict__ exp_avg4,
     float4* __restrict__ exp_avg_sq4,
@@ -168,7 +168,7 @@ constexpr int QUANT_BLOCK_SIZE = 32;
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ void fused_grokadamw_step_q3_kernel(
+__global__ __launch_bounds__(256, 2) void fused_grokadamw_step_q3_kernel(
     scalar_t* __restrict__ param,
     int8_t* __restrict__ exp_avg_int8,    // [N] INT8 quantized
     float* __restrict__ exp_avg_scales,   // [num_blocks] per-block FP32 scales

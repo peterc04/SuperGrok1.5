@@ -79,7 +79,7 @@ __device__ __forceinline__ void compute_rank_prefix(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 2)
-__global__ void distributed_prefix_apply_fused_elem_kernel(
+__global__ __launch_bounds__(256, 2) void distributed_prefix_apply_fused_elem_kernel(
     // From NCCL all-gather:
     const float* __restrict__ all_summaries_M,  // [world_size, 2, 2]
     const float* __restrict__ all_summaries_b,  // [world_size, 2]
@@ -172,7 +172,7 @@ __global__ void distributed_prefix_apply_fused_elem_kernel(
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 __launch_bounds__(256, 2)
-__global__ void distributed_prefix_apply_fused_elem_cpasync_kernel(
+__global__ __launch_bounds__(256, 2) void distributed_prefix_apply_fused_elem_cpasync_kernel(
     const float* __restrict__ all_summaries_M,
     const float* __restrict__ all_summaries_b,
     const float* __restrict__ scan_output,
@@ -249,7 +249,7 @@ __global__ void distributed_prefix_apply_fused_elem_cpasync_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 2)
-__global__ void distributed_prefix_apply_fused_elem_d16_kernel(
+__global__ __launch_bounds__(256, 2) void distributed_prefix_apply_fused_elem_d16_kernel(
     const float* __restrict__ all_summaries_M,
     const float* __restrict__ all_summaries_b,
     const float* __restrict__ scan_output,
@@ -314,7 +314,7 @@ __global__ void distributed_prefix_apply_fused_elem_d16_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 2)
-__global__ void distributed_prefix_apply_fused_elem_q4_kernel(
+__global__ __launch_bounds__(256, 2) void distributed_prefix_apply_fused_elem_q4_kernel(
     const float* __restrict__ all_summaries_M,
     const float* __restrict__ all_summaries_b,
     const float* __restrict__ scan_output,
@@ -379,7 +379,7 @@ __global__ void distributed_prefix_apply_fused_elem_q4_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 2)
-__global__ void distributed_prefix_apply_fused_elem_bwd_kernel(
+__global__ __launch_bounds__(256, 2) void distributed_prefix_apply_fused_elem_bwd_kernel(
     const float* __restrict__ all_bwd_summaries_M,
     const float* __restrict__ all_bwd_summaries_b,
     const float* __restrict__ grad_scan_output,
@@ -433,7 +433,7 @@ __global__ void distributed_prefix_apply_fused_elem_bwd_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 2)
-__global__ void distributed_prefix_apply_fused_elem_bwd_d16_kernel(
+__global__ __launch_bounds__(256, 2) void distributed_prefix_apply_fused_elem_bwd_d16_kernel(
     const float* __restrict__ all_bwd_summaries_M,
     const float* __restrict__ all_bwd_summaries_b,
     const float* __restrict__ grad_scan_output,

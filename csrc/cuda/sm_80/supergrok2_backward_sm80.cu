@@ -198,7 +198,7 @@ void launch_mamba3_peer_bilevel_fwd_save_batched_ampere(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ void mamba3_backward_dh_cpasync_kernel(
+__global__ __launch_bounds__(256, 2) void mamba3_backward_dh_cpasync_kernel(
     const scalar_t* __restrict__ saved_states,   // [N, d_inner, d_state]
     const scalar_t* __restrict__ saved_x_branch, // [N, d_inner]
     const scalar_t* __restrict__ saved_z,        // [N, d_inner]
