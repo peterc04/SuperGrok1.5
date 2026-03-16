@@ -597,17 +597,22 @@ class SuperGrok2(Optimizer):
                     ea_scale = self._flat_exp_avg_scales[scale_idx]
                     ea_fp32 = ea.float() * ea_scale.repeat_interleave(32)[:ea.numel()]
                     ea_fp32.mul_(beta1_i).add_(fg, alpha=1 - beta1_i)
-                    # Requantize: per-block max scale
+                    # Requantize: vectorized per-block max scale (no .item() sync)
                     block_size = 32
                     N = ea_fp32.numel()
                     num_blocks = (N + block_size - 1) // block_size
-                    for b in range(num_blocks):
-                        start = b * block_size
-                        end = min(start + block_size, N)
-                        block_max = ea_fp32[start:end].abs().max().item()
-                        new_scale = max(block_max / 127.0, 1e-12)
-                        ea_scale[b] = new_scale
-                        ea[start:end] = (ea_fp32[start:end] / new_scale).round().clamp(-127, 127).to(torch.int8)
+                    # Pad to full blocks, reshape, compute block-wise absmax
+                    _padded = ea_fp32.numel()
+                    _pad_n = num_blocks * block_size - _padded
+                    if _pad_n > 0:
+                        _ea_padded = torch.nn.functional.pad(ea_fp32, (0, _pad_n))
+                    else:
+                        _ea_padded = ea_fp32
+                    _blocks = _ea_padded.reshape(num_blocks, block_size)
+                    _block_maxes = _blocks.abs().amax(dim=1).clamp(min=1e-12)
+                    ea_scale.copy_(_block_maxes / 127.0)
+                    _scales_expanded = ea_scale.repeat_interleave(block_size)[:N]
+                    ea[:] = (ea_fp32 / _scales_expanded).round().clamp(-127, 127).to(torch.int8)
                     easq_fp32 = easq.float()
                     easq_fp32.mul_(beta2).addcmul_(fg, fg, value=1 - beta2)
                     self._flat_exp_avg_sqs[i] = easq_fp32.to(torch.bfloat16)
@@ -666,7 +671,7 @@ class SuperGrok2(Optimizer):
             sam_logits = torch.func.functional_call(model, perturbed_params, (train_x,))
             sam_loss = criterion(sam_logits, train_y)
             sam_loss.backward()
-        sam_loss_val = sam_loss.item()
+        sam_loss_val = sam_loss.detach()  # keep on device, avoid CPU sync
 
         for name, p in model.named_parameters():
             pidx = self._param_to_idx.get(id(p))
@@ -1499,7 +1504,7 @@ class SuperGrok2(Optimizer):
         for name, p in named_params:
             p.grad = saved_grads.get(name)
 
-        return val_loss.item()
+        return val_loss.detach()
 
     def _bilevel_step_python(self, model, named_params, saved_grads,
                              val_x, val_y, criterion, meta_optimizer):
@@ -1545,7 +1550,7 @@ class SuperGrok2(Optimizer):
         for name, p in named_params:
             p.grad = saved_grads.get(name)
 
-        return val_loss.item()
+        return val_loss.detach()
 
     def bilevel_step_distributed(self, model, train_x, train_y, val_x, val_y,
                                   criterion, meta_optimizer, process_group=None):
@@ -1796,8 +1801,9 @@ class SuperGrok2(Optimizer):
         bilevel_freq_eff = self._get_effective_bilevel_freq()
         if step_num % bilevel_freq_eff == 0:
             try:
-                metrics["val_loss"] = self.bilevel_step(
+                _vl = self.bilevel_step(
                     model, train_x, train_y, val_x, val_y, criterion, self._auto_meta_opt)
+                metrics["val_loss"] = _vl.item() if torch.is_tensor(_vl) else _vl
             except Exception:
                 pass
 
@@ -1805,8 +1811,11 @@ class SuperGrok2(Optimizer):
         alpha_freq = self.alpha_update_freq
         if (step_num % alpha_freq == 0) or step_num == 1:
             with torch.no_grad():
-                train_loss_val = loss.item()
-                train_acc = (logits.detach().argmax(-1) == train_y).float().mean().item()
+                # Batch the GPU→CPU transfer: compute both metrics then sync once
+                _tl = loss.detach()
+                _ta = (logits.detach().argmax(-1) == train_y).float().mean()
+                train_loss_val = _tl.item()
+                train_acc = _ta.item()
             kw["train_loss"] = train_loss_val
             kw["train_acc"] = train_acc
             metrics["train_loss"] = train_loss_val

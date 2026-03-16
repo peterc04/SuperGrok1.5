@@ -60,6 +60,8 @@ from .gradient_compression import INT8GradientCompressor, PowerSGDCompressor
 from .partial_graph import PartialGraphOptimizer
 from .sparse_gradients import SparseGradientHandler
 from .pipelined_optimizer import PipelinedOptimizer
+from .gradient_hook_optimizer import GradientHookOptimizer
+from .async_supergrok2 import AsyncSuperGrok2
 
 __all__ = [
     "SuperGrok15", "SharpnessMetaNet",
@@ -87,4 +89,6 @@ __all__ = [
     "PartialGraphOptimizer",
     "SparseGradientHandler",
     "PipelinedOptimizer",
+    "GradientHookOptimizer",
+    "AsyncSuperGrok2",
 ]
