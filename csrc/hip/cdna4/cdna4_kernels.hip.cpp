@@ -2174,3 +2174,276 @@ void cdna4_persistent_scan_fused_elem(
         );
     }
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Host Launchers for FP4 Expert Kernels
+// ═══════════════════════════════════════════════════════════════════════
+
+void cdna4_fp4_expert_load(
+    torch::Tensor weights_fp4, torch::Tensor scale_factors,
+    torch::Tensor weights_fp32,
+    int num_experts, int weight_numel, int packed_size
+) {
+    dim3 grid((packed_size + 255) / 256, num_experts);
+    dim3 block(256);
+    int smem = 256 * 8 * sizeof(float);
+    cdna4_fp4_expert_load_kernel<<<grid, block, smem>>>(
+        reinterpret_cast<const uint32_t*>(weights_fp4.data_ptr()),
+        scale_factors.data_ptr<float>(),
+        weights_fp32.data_ptr<float>(),
+        num_experts, weight_numel, packed_size
+    );
+}
+
+void cdna4_fp4_expert_fwd(
+    torch::Tensor input, torch::Tensor W1_fp4, torch::Tensor b1,
+    torch::Tensor W2_fp4, torch::Tensor b2,
+    torch::Tensor scale_W1, torch::Tensor scale_W2,
+    torch::Tensor expert_assign, torch::Tensor output,
+    int batch_size, int d_in, int expert_hidden, int d_out,
+    int packed_W1_row, int packed_W2_row
+) {
+    dim3 grid(batch_size);
+    dim3 block(256);
+    int smem = expert_hidden * sizeof(float);
+    cdna4_fp4_expert_fwd_kernel<<<grid, block, smem>>>(
+        input.data_ptr<float>(),
+        reinterpret_cast<const uint32_t*>(W1_fp4.data_ptr()),
+        b1.data_ptr<float>(),
+        reinterpret_cast<const uint32_t*>(W2_fp4.data_ptr()),
+        b2.data_ptr<float>(),
+        scale_W1.data_ptr<float>(), scale_W2.data_ptr<float>(),
+        expert_assign.data_ptr<int>(),
+        output.data_ptr<float>(),
+        batch_size, d_in, expert_hidden, d_out,
+        packed_W1_row, packed_W2_row
+    );
+}
+
+void cdna4_fp4_expert_bwd(
+    torch::Tensor grad_output, torch::Tensor input, torch::Tensor hidden_acts,
+    torch::Tensor W1_fp4, torch::Tensor W2_fp4,
+    torch::Tensor scale_W1, torch::Tensor scale_W2,
+    torch::Tensor expert_assign,
+    torch::Tensor grad_input, torch::Tensor grad_W1_accum, torch::Tensor grad_W2_accum,
+    torch::Tensor grad_b1, torch::Tensor grad_b2,
+    uint32_t rng_seed,
+    int batch_size, int d_in, int expert_hidden, int d_out,
+    int packed_W1_row, int packed_W2_row
+) {
+    dim3 grid(batch_size);
+    dim3 block(256);
+    int smem = expert_hidden * sizeof(float);
+    cdna4_fp4_expert_bwd_kernel<<<grid, block, smem>>>(
+        grad_output.data_ptr<float>(), input.data_ptr<float>(),
+        hidden_acts.data_ptr<float>(),
+        reinterpret_cast<const uint32_t*>(W1_fp4.data_ptr()),
+        reinterpret_cast<const uint32_t*>(W2_fp4.data_ptr()),
+        scale_W1.data_ptr<float>(), scale_W2.data_ptr<float>(),
+        expert_assign.data_ptr<int>(),
+        grad_input.data_ptr<float>(),
+        grad_W1_accum.data_ptr<float>(), grad_W2_accum.data_ptr<float>(),
+        grad_b1.data_ptr<float>(), grad_b2.data_ptr<float>(),
+        rng_seed, batch_size, d_in, expert_hidden, d_out,
+        packed_W1_row, packed_W2_row
+    );
+}
+
+void cdna4_fp4_quantize_experts(
+    torch::Tensor weights_fp32, torch::Tensor weights_fp4,
+    torch::Tensor scale_factors, uint32_t rng_seed,
+    int num_experts, int weight_numel, int packed_size
+) {
+    dim3 grid((packed_size + 255) / 256, num_experts);
+    dim3 block(256);
+    cdna4_fp4_quantize_experts_kernel<<<grid, block>>>(
+        weights_fp32.data_ptr<float>(),
+        reinterpret_cast<uint32_t*>(weights_fp4.data_ptr()),
+        scale_factors.data_ptr<float>(),
+        rng_seed, num_experts, weight_numel, packed_size
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Host Launchers for FP6 State Kernels
+// ═══════════════════════════════════════════════════════════════════════
+
+void cdna4_fp6_state_pack(
+    torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor exp_avg_fp6, torch::Tensor exp_avg_sq_fp6,
+    torch::Tensor state_scale_avg, torch::Tensor state_scale_sq,
+    int N
+) {
+    int num_groups = (N + 3) / 4;
+    dim3 grid((num_groups + 255) / 256);
+    dim3 block(256);
+    cdna4_fp6_state_pack_kernel<<<grid, block>>>(
+        exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+        exp_avg_fp6.data_ptr<uint8_t>(), exp_avg_sq_fp6.data_ptr<uint8_t>(),
+        state_scale_avg.data_ptr<float>(), state_scale_sq.data_ptr<float>(),
+        N
+    );
+}
+
+void cdna4_fp6_state_unpack(
+    torch::Tensor exp_avg_fp6, torch::Tensor exp_avg_sq_fp6,
+    torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor state_scale_avg, torch::Tensor state_scale_sq,
+    int N
+) {
+    int num_groups = (N + 3) / 4;
+    dim3 grid((num_groups + 255) / 256);
+    dim3 block(256);
+    cdna4_fp6_state_unpack_kernel<<<grid, block>>>(
+        exp_avg_fp6.data_ptr<uint8_t>(), exp_avg_sq_fp6.data_ptr<uint8_t>(),
+        exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+        state_scale_avg.data_ptr<float>(), state_scale_sq.data_ptr<float>(),
+        N
+    );
+}
+
+void cdna4_fp6_adam_step(
+    torch::Tensor param, torch::Tensor grad,
+    torch::Tensor exp_avg_fp6, torch::Tensor exp_avg_sq_fp6,
+    torch::Tensor state_scale_avg, torch::Tensor state_scale_sq,
+    float beta1, float beta2, float lr, float eps,
+    float weight_decay, float bc1, float bc2, int N
+) {
+    int num_groups = (N + 3) / 4;
+    dim3 grid((num_groups + 255) / 256);
+    dim3 block(256);
+    cdna4_fp6_adam_step_kernel<<<grid, block>>>(
+        param.data_ptr<float>(), grad.data_ptr<float>(),
+        exp_avg_fp6.data_ptr<uint8_t>(), exp_avg_sq_fp6.data_ptr<uint8_t>(),
+        state_scale_avg.data_ptr<float>(), state_scale_sq.data_ptr<float>(),
+        beta1, beta2, lr, eps, weight_decay, bc1, bc2, N
+    );
+}
+
+void cdna4_fp6_lamb_step(
+    torch::Tensor param, torch::Tensor grad,
+    torch::Tensor exp_avg_fp6, torch::Tensor exp_avg_sq_fp6,
+    torch::Tensor state_scale_avg, torch::Tensor state_scale_sq,
+    torch::Tensor param_norm_out, torch::Tensor update_norm_out,
+    float beta1, float beta2, float lr, float eps,
+    float weight_decay, float bc1, float bc2, float trust_ratio, int N
+) {
+    int num_groups = (N + 3) / 4;
+    dim3 grid((num_groups + 255) / 256);
+    dim3 block(256);
+    cdna4_fp6_lamb_step_kernel<<<grid, block>>>(
+        param.data_ptr<float>(), grad.data_ptr<float>(),
+        exp_avg_fp6.data_ptr<uint8_t>(), exp_avg_sq_fp6.data_ptr<uint8_t>(),
+        state_scale_avg.data_ptr<float>(), state_scale_sq.data_ptr<float>(),
+        param_norm_out.data_ptr<float>(), update_norm_out.data_ptr<float>(),
+        beta1, beta2, lr, eps, weight_decay, bc1, bc2, trust_ratio, N
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Host Launchers for 2:4 Sparsity Kernels
+// ═══════════════════════════════════════════════════════════════════════
+
+void cdna4_sparse24_select(
+    torch::Tensor dense, torch::Tensor sparse_values, torch::Tensor metadata, int N
+) {
+    int num_groups = N / 4;
+    dim3 grid((num_groups + 255) / 256);
+    dim3 block(256);
+    cdna4_sparse24_select_kernel<<<grid, block>>>(
+        dense.data_ptr<float>(), sparse_values.data_ptr<float>(),
+        metadata.data_ptr<uint8_t>(), N
+    );
+}
+
+void cdna4_sparse24_apply_mask(
+    torch::Tensor grad, torch::Tensor metadata, int N
+) {
+    int num_groups = N / 4;
+    dim3 grid((num_groups + 255) / 256);
+    dim3 block(256);
+    cdna4_sparse24_apply_mask_kernel<<<grid, block>>>(
+        grad.data_ptr<float>(), metadata.data_ptr<uint8_t>(), N
+    );
+}
+
+void cdna4_sparse24_project(
+    torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor metadata, int N
+) {
+    int num_groups = N / 4;
+    dim3 grid((num_groups + 255) / 256);
+    dim3 block(256);
+    cdna4_sparse24_project_kernel<<<grid, block>>>(
+        exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
+        metadata.data_ptr<uint8_t>(), N
+    );
+}
+
+void cdna4_sparse24_densify(
+    torch::Tensor sparse_values, torch::Tensor metadata, torch::Tensor dense, int N
+) {
+    int num_groups = N / 4;
+    dim3 grid((num_groups + 255) / 256);
+    dim3 block(256);
+    cdna4_sparse24_densify_kernel<<<grid, block>>>(
+        sparse_values.data_ptr<float>(), metadata.data_ptr<uint8_t>(),
+        dense.data_ptr<float>(), N
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Host Launchers for Fused Kernels
+// ═══════════════════════════════════════════════════════════════════════
+
+void cdna4_fp4_sparse24_fused_expert(
+    torch::Tensor input, torch::Tensor W1_fp4, torch::Tensor b1,
+    torch::Tensor W2_fp4, torch::Tensor b2,
+    torch::Tensor scale_W1, torch::Tensor scale_W2,
+    torch::Tensor W1_sparse_meta, torch::Tensor W2_sparse_meta,
+    torch::Tensor expert_assign, torch::Tensor output,
+    int batch_size, int d_in, int expert_hidden, int d_out,
+    int packed_W1_row, int packed_W2_row
+) {
+    dim3 grid(batch_size);
+    dim3 block(256);
+    int smem = expert_hidden * sizeof(float);
+    cdna4_fp4_sparse24_fused_expert_kernel<<<grid, block, smem>>>(
+        input.data_ptr<float>(),
+        reinterpret_cast<const uint32_t*>(W1_fp4.data_ptr()),
+        b1.data_ptr<float>(),
+        reinterpret_cast<const uint32_t*>(W2_fp4.data_ptr()),
+        b2.data_ptr<float>(),
+        scale_W1.data_ptr<float>(), scale_W2.data_ptr<float>(),
+        W1_sparse_meta.data_ptr<uint8_t>(), W2_sparse_meta.data_ptr<uint8_t>(),
+        expert_assign.data_ptr<int>(),
+        output.data_ptr<float>(),
+        batch_size, d_in, expert_hidden, d_out,
+        packed_W1_row, packed_W2_row
+    );
+}
+
+void cdna4_supergrok15_full_step(
+    torch::Tensor param, torch::Tensor grad,
+    torch::Tensor exp_avg_fp6, torch::Tensor exp_avg_sq_fp6,
+    torch::Tensor state_scale_avg, torch::Tensor state_scale_sq,
+    torch::Tensor sparse_metadata, torch::Tensor expert_fp4_out,
+    torch::Tensor expert_scale,
+    float beta1, float beta2, float lr, float eps,
+    float weight_decay, float bc1, float bc2,
+    int N, int is_sparse, int is_expert
+) {
+    int num_groups = (N + 3) / 4;
+    dim3 grid((num_groups + 255) / 256);
+    dim3 block(256);
+    cdna4_supergrok15_full_step_kernel<<<grid, block>>>(
+        param.data_ptr<float>(), grad.data_ptr<float>(),
+        exp_avg_fp6.data_ptr<uint8_t>(), exp_avg_sq_fp6.data_ptr<uint8_t>(),
+        state_scale_avg.data_ptr<float>(), state_scale_sq.data_ptr<float>(),
+        is_sparse ? sparse_metadata.data_ptr<uint8_t>() : nullptr,
+        is_expert ? reinterpret_cast<uint32_t*>(expert_fp4_out.data_ptr()) : nullptr,
+        is_expert ? expert_scale.data_ptr<float>() : nullptr,
+        beta1, beta2, lr, eps, weight_decay, bc1, bc2,
+        N, is_sparse, is_expert
+    );
+}

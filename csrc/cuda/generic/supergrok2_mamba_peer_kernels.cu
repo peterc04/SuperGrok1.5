@@ -2614,6 +2614,51 @@ void launch_mamba3_peer_batched_step(
             mamba_bwd_A_log, mamba_bwd_D, mamba_bwd_rope,
             initial_bwd, final_bwd, bwd_scan_packed, rev_bwd
         );
+    } else if (num_params >= 4 && max_N <= 256) {
+        // ===== SEQUENTIAL BATCHED SCAN for many small params =====
+        // Uses mamba3_scan_batched_kernel: one block per param, separate fwd/bwd
+        int scan_smem = (d_inner + 2*d_inner*d_model + d_inner*d_inner + d_inner + 2*d_state*d_inner) * sizeof(float);
+
+        auto rev_fwd = torch::zeros({num_params}, int_opts);
+        auto rev_bwd = torch::ones({num_params}, int_opts);
+
+        // Forward scan
+        mamba3_scan_batched_kernel<<<num_params, d_inner, scan_smem>>>(
+            x_sorted_packed.data_ptr<float>(),
+            fwd_scan_packed.data_ptr<float>(),
+            initial_fwd.data_ptr<float>(),
+            final_fwd.data_ptr<float>(),
+            offsets_t.data_ptr<int>(),
+            rev_fwd.data_ptr<int>(),
+            mamba_fwd_in_proj.data_ptr<float>(),
+            mamba_fwd_dt_W.data_ptr<float>(),
+            mamba_fwd_dt_b.data_ptr<float>(),
+            mamba_fwd_B_proj.data_ptr<float>(),
+            mamba_fwd_C_proj.data_ptr<float>(),
+            mamba_fwd_A_log.data_ptr<float>(),
+            mamba_fwd_D.data_ptr<float>(),
+            mamba_fwd_rope.data_ptr<float>(),
+            d_model, d_inner, d_state
+        );
+
+        // Backward scan (reverse)
+        mamba3_scan_batched_kernel<<<num_params, d_inner, scan_smem>>>(
+            x_sorted_packed.data_ptr<float>(),
+            bwd_scan_packed.data_ptr<float>(),
+            initial_bwd.data_ptr<float>(),
+            final_bwd.data_ptr<float>(),
+            offsets_t.data_ptr<int>(),
+            rev_bwd.data_ptr<int>(),
+            mamba_bwd_in_proj.data_ptr<float>(),
+            mamba_bwd_dt_W.data_ptr<float>(),
+            mamba_bwd_dt_b.data_ptr<float>(),
+            mamba_bwd_B_proj.data_ptr<float>(),
+            mamba_bwd_C_proj.data_ptr<float>(),
+            mamba_bwd_A_log.data_ptr<float>(),
+            mamba_bwd_D.data_ptr<float>(),
+            mamba_bwd_rope.data_ptr<float>(),
+            d_model, d_inner, d_state
+        );
     } else {
         // ===== SEQUENTIAL COMBINED SCAN for small N =====
         int scan_smem = (d_inner + 2*d_inner*d_model + d_inner*d_inner + d_inner + 2*d_state*d_inner) * sizeof(float);
