@@ -12,8 +12,13 @@ Usage:    python test_supergrok2.py
 import sys
 import traceback
 
+import pytest
 import torch
 import torch.nn as nn
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA not available"
+)
 
 # ─── Test infrastructure ────────────────────────────────────────────
 
@@ -74,6 +79,7 @@ def test_12a_import():
 #  12B: Sequential vs Parallel Scan Equivalence
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12b_scan_equivalence():
     from grokking_optimizers import _ops
 
@@ -119,6 +125,7 @@ def test_12b_scan_equivalence():
 #  12C: Forward Step Correctness
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12c_forward_step():
     from grokking_optimizers import SuperGrok2
 
@@ -155,6 +162,7 @@ def test_12c_forward_step():
 #  12D: Bilevel Correctness
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12d_bilevel():
     from grokking_optimizers import SuperGrok2
 
@@ -194,6 +202,7 @@ def test_12d_bilevel():
 #  12E: Two-Pass Backward Equivalence
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12e_two_pass_backward():
     # This test verifies the shared-memory accumulation approach
     # produces equivalent results to what a naive approach would.
@@ -219,6 +228,7 @@ def test_12e_two_pass_backward():
 #  12F: Expert Recycling
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12f_expert_recycling():
     from grokking_optimizers import SuperGrok2
 
@@ -251,6 +261,7 @@ def test_12f_expert_recycling():
 #  12G: Gradient Checkpointing Equivalence
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12g_gradient_checkpointing():
     # Gradient checkpointing should produce equivalent results
     # within loose tolerance. Test by running optimizer with different
@@ -274,6 +285,7 @@ def test_12g_gradient_checkpointing():
 #  12H: Edge Cases
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12h_edge_n0():
     """N=0: parameter with no gradient should be skipped."""
     from grokking_optimizers import SuperGrok2
@@ -283,6 +295,7 @@ def test_12h_edge_n0():
     opt.step()  # should not crash
 
 
+@requires_cuda
 def test_12h_edge_n1():
     """N=1: single-element parameter (bias)."""
     from grokking_optimizers import SuperGrok2
@@ -306,6 +319,7 @@ def test_12h_edge_n1():
     assert torch.isfinite(model.bias).all()
 
 
+@requires_cuda
 def test_12h_edge_zeros():
     """All-zero gradients should not produce NaN."""
     from grokking_optimizers import SuperGrok2
@@ -319,6 +333,7 @@ def test_12h_edge_zeros():
         assert torch.isfinite(p).all(), f"NaN from zero grad in {n}"
 
 
+@requires_cuda
 def test_12h_edge_large_grad():
     """Very large gradients should be clipped, not produce NaN."""
     from grokking_optimizers import SuperGrok2
@@ -331,6 +346,7 @@ def test_12h_edge_large_grad():
         assert torch.isfinite(p).all(), f"NaN from large grad in {n}"
 
 
+@requires_cuda
 def test_12h_edge_fp16():
     """Mixed dtypes: FP16 model, FP32 optimizer states."""
     from grokking_optimizers import SuperGrok2
@@ -346,6 +362,7 @@ def test_12h_edge_fp16():
 #  12I: All Optimizers Construct and Step
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12i_all_optimizers():
     from grokking_optimizers import (
         SuperGrok2, SuperGrok15, SuperGrok11,
@@ -383,6 +400,7 @@ def test_12i_all_optimizers():
 #  12J: Memory Leak Check
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12j_memory_leak():
     from grokking_optimizers import SuperGrok2
 
@@ -428,6 +446,7 @@ def test_12j_memory_leak():
 #  are finite and non-zero (active accumulation).
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12k_two_pass_gemm_backward():
     from grokking_optimizers import SuperGrok2
 
@@ -482,6 +501,7 @@ def test_12k_two_pass_gemm_backward():
 #  (PSCAN_THRESHOLD) triggers the batched parallel scan path.
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12l_batched_parallel_scan():
     from grokking_optimizers import SuperGrok2
 
@@ -551,6 +571,7 @@ def test_12l_batched_parallel_scan():
 #  12M: Dispatch Detection
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12m_dispatch_detection():
     """Verify dispatch.py and C++ agree on GPU architecture."""
     from grokking_optimizers.dispatch import get_gpu_arch, get_backend, get_arch_label
@@ -574,6 +595,7 @@ def test_12m_dispatch_detection():
 #  12N: Precision Config
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12n_precision_config():
     """Verify PrecisionConfig auto-selects correctly for current GPU."""
     from grokking_optimizers.quantization import PrecisionConfig
@@ -619,6 +641,7 @@ def test_12n_precision_config():
 #  12O: Projection Precision Equivalence
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12o_precision_equivalence():
     """Run forward step with FP32 and auto precision. Both should work."""
     from grokking_optimizers import SuperGrok2
@@ -649,6 +672,7 @@ def test_12o_precision_equivalence():
 #  12P: Dispatch Convergence
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12p_dispatch_convergence():
     """Run 10 optimizer steps. Loss should decrease and params stay finite."""
     from grokking_optimizers import SuperGrok2
@@ -681,6 +705,7 @@ def test_12p_dispatch_convergence():
 #  12Q: Platform / Vendor Detection
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12q_vendor_detection():
     """Verify GPU vendor detection consistency across Python and C++."""
     from grokking_optimizers.dispatch import get_gpu_vendor, get_backend, get_warp_size
@@ -713,6 +738,7 @@ def test_12q_vendor_detection():
 #  12R: Extended Quantization — INT8 Symmetric
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12r_int8_quantization():
     """Verify INT8 symmetric quantization round-trip for expert weights."""
     from grokking_optimizers.quantization import PrecisionConfig
@@ -747,6 +773,7 @@ def test_12r_int8_quantization():
 #  12S: Extended Quantization — INT4 GPTQ-Style
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12s_int4_quantization():
     """Verify INT4 GPTQ-style packing and unpacking."""
     from grokking_optimizers.quantization import PrecisionConfig
@@ -779,6 +806,7 @@ def test_12s_int4_quantization():
 #  12T: Extended Quantization — MXFP4
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12t_mxfp4_quantization():
     """Verify MXFP4 (Microscaling FP4) quantization for projections."""
     from grokking_optimizers.quantization import PrecisionConfig
@@ -841,6 +869,7 @@ def test_12u_dynamic_precision():
 #  12V: Expert Precision FP32 Passthrough
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12v_expert_fp32():
     """Verify FP32 expert weight passthrough."""
     from grokking_optimizers.quantization import PrecisionConfig
@@ -857,6 +886,7 @@ def test_12v_expert_fp32():
     assert torch.allclose(result['w1'], w1.float())
 
 
+@requires_cuda
 def test_12w_distributed_helpers():
     """Test distributed helper methods on SuperGrok2 (non-distributed mode)."""
     from grokking_optimizers import SuperGrok2
@@ -885,6 +915,7 @@ def test_12w_distributed_helpers():
     assert opt.mamba_state_sync_interval == 1000
 
 
+@requires_cuda
 def test_12x_compiled_wrapper():
     """Test CompiledSuperGrok2 wrapper (eager fallback mode)."""
     from grokking_optimizers import SuperGrok2, CompiledSuperGrok2
@@ -915,6 +946,7 @@ def test_12x_compiled_wrapper():
     assert sd is not None
 
 
+@requires_cuda
 def test_12y_step_compiled():
     """Test _prepare_for_compile and step_compiled methods."""
     from grokking_optimizers import SuperGrok2
@@ -944,6 +976,7 @@ def test_12y_step_compiled():
     # The step_compiled uses the CUDA batched path if available
 
 
+@requires_cuda
 def test_12z_fsdp_exclusion():
     """Test FSDP exclusion helper marks meta-net modules."""
     from grokking_optimizers import SuperGrok2
@@ -981,6 +1014,7 @@ def test_12aa_distributed_module():
 #  12AB: Hopper FP8 GEMM Path
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12ab_hopper_fp8_gemm():
     """On FORCE_ARCH=90: verify FP8 projection path is used and output matches FP32 within 1e-2."""
     import os
@@ -1018,6 +1052,7 @@ def test_12ab_hopper_fp8_gemm():
 #  12AC: Ampere Backward cp.async
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12ac_ampere_backward_cpasync():
     """On FORCE_ARCH=80: verify backward produces same gradients as generic within 1e-4."""
     import os
@@ -1077,6 +1112,7 @@ def test_12ae_autotune_runs():
 #  12AF: FORCE_ARCH=75 Backward Compatibility
 # ═══════════════════════════════════════════════════════════════════
 
+@requires_cuda
 def test_12af_backward_compat_sm75():
     """FORCE_ARCH=75 produces finite results (generic path)."""
     import os

@@ -394,6 +394,18 @@ void muon_fused_step_cpu(
 PYBIND11_MODULE(_ops, m) {
     m.doc() = "Grokking Optimizers — CPU Reference Kernels (all optimizers)";
 
+    // ── Runtime dispatch info (CPU stubs) ────────────────────────────
+    m.def("get_sm_arch", []() -> int { return 0; },
+          "Get GPU SM architecture as integer (0 = no GPU)");
+    m.def("get_arch_tier_name", []() -> std::string { return "generic"; },
+          "Get architecture tier name (always 'generic' on CPU)");
+    m.def("get_gpu_vendor_name", []() -> std::string { return "none"; },
+          "Get GPU vendor (always 'none' on CPU build)");
+    m.def("get_warp_size", []() -> int { return 32; },
+          "Get warp size (default 32 on CPU build)");
+    m.def("get_amd_tier_name", []() -> std::string { return "generic"; },
+          "Get AMD architecture tier (always 'generic' on CPU build)");
+
     // ── SuperGrok v2 CPU Step ────────────────────────────────────────
     m.def("supergrok2_cpu_step", &supergrok2_cpu_step,
           "SuperGrok2 CPU: full Mamba-3+PEER step (reference implementation)");
