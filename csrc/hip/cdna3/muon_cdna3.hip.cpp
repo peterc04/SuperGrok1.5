@@ -30,12 +30,15 @@ void launch_muon_fused_step_cdna3(
         // 1. Momentum update: buf = momentum * buf + grad
         momentum_buffer.mul_(momentum).add_(grad);
 
-        // 2. Normalize
-        float norm = momentum_buffer.norm().item<float>();
-        float inv_norm = (norm > 1e-8f) ? (1.0f / norm) : 0.0f;
+        // 2. Normalize — device-side, no .item() CPU-GPU sync
+        auto norm_tensor = momentum_buffer.norm();
+        auto inv_norm_tensor = torch::where(
+            norm_tensor > 1e-8f,
+            torch::reciprocal(norm_tensor),
+            torch::zeros_like(norm_tensor));
 
         // Convert to BF16 for NS iterations — MFMA BF16 gives ~2x throughput
-        auto G = (momentum_buffer * inv_norm).to(torch::kBFloat16);
+        auto G = (momentum_buffer * inv_norm_tensor).to(torch::kBFloat16);
         int N_dim = param.size(1);
         auto G_2d = G.view({static_cast<int64_t>(M), N_dim});
 

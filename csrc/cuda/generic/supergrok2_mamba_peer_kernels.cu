@@ -917,7 +917,8 @@ __global__ void fused_elem_step_kernel(
     // 2. GRU update (using shared memory weights)
     float h_old[MAX_GRU_HIDDEN];
     for (int j = 0; j < gru_hidden; j++) {
-        h_old[j] = gru_state[idx * gru_hidden + j];
+        // GRU state is optimizer state — non-temporal load to avoid L2 pollution
+        h_old[j] = stream_load(&gru_state[idx * gru_hidden + j]);
     }
 
     float h_new[MAX_GRU_HIDDEN];
@@ -968,9 +969,9 @@ __global__ void fused_elem_step_kernel(
         h_new[j] = (1.0f - z_gate[j]) * h_old[j] + z_gate[j] * h_tilde;
     }
 
-    // Write GRU state
+    // Write GRU state — non-temporal store (optimizer state)
     for (int j = 0; j < gru_hidden; j++) {
-        gru_state[idx * gru_hidden + j] = h_new[j];
+        stream_store(&gru_state[idx * gru_hidden + j], h_new[j]);
     }
 
     // 3. Multi-head PEER routing + expert evaluation
@@ -1044,20 +1045,21 @@ __global__ void fused_elem_step_kernel(
     float smart_grad = g + rescale * total_out / static_cast<float>(num_heads);
 
     // 4. mu update: mu = alpha * mu + (1 - alpha) * raw_grad
-    float mu_val = mu[idx];
+    // Optimizer state — non-temporal load/store to avoid L2 pollution
+    float mu_val = stream_load(&mu[idx]);
     mu_val = alpha * mu_val + (1.0f - alpha) * g;
-    mu[idx] = mu_val;
+    stream_store(&mu[idx], mu_val);
 
     // 5. effective_grad = smart_grad + lamb_eff * mu
     float fg = smart_grad + lamb_eff * mu_val;
 
-    // 6. Adam update
-    float ea = exp_avg[idx];
-    float easq = exp_avg_sq[idx];
+    // 6. Adam update — optimizer state, non-temporal load/store
+    float ea = stream_load(&exp_avg[idx]);
+    float easq = stream_load(&exp_avg_sq[idx]);
     ea = beta1 * ea + (1.0f - beta1) * fg;
     easq = beta2 * easq + (1.0f - beta2) * fg * fg;
-    exp_avg[idx] = ea;
-    exp_avg_sq[idx] = easq;
+    stream_store(&exp_avg[idx], ea);
+    stream_store(&exp_avg_sq[idx], easq);
 
     float step_size = lr / bc1;
     float denom = sqrtf(easq / bc2) + eps;
@@ -1191,7 +1193,7 @@ __global__ void fused_elem_step_int8_kernel(
 
     // 2. GRU update
     float h_old[MAX_GRU_HIDDEN], h_new[MAX_GRU_HIDDEN];
-    for (int j = 0; j < gru_hidden; j++) h_old[j] = gru_state[idx * gru_hidden + j];
+    for (int j = 0; j < gru_hidden; j++) h_old[j] = stream_load(&gru_state[idx * gru_hidden + j]);
 
     float z_gate[MAX_GRU_HIDDEN], r_gate[MAX_GRU_HIDDEN];
     for (int j = 0; j < gru_hidden; j++) {
@@ -1221,7 +1223,7 @@ __global__ void fused_elem_step_int8_kernel(
         for (int k = 0; k < gru_hidden; k++) val += s_gru_Wh[j * gru_row_len + 2 + 2*d_model + k] * (r_gate[k] * h_old[k]);
         h_new[j] = (1.0f - z_gate[j]) * h_old[j] + z_gate[j] * tanhf(val);
     }
-    for (int j = 0; j < gru_hidden; j++) gru_state[idx * gru_hidden + j] = h_new[j];
+    for (int j = 0; j < gru_hidden; j++) stream_store(&gru_state[idx * gru_hidden + j], h_new[j]);
 
     // 3. PEER routing + expert MLP (same compute, shared mem has dequantized weights)
     float total_out = 0.0f;
@@ -1265,14 +1267,14 @@ __global__ void fused_elem_step_int8_kernel(
         total_out += head_out;
     }
 
-    // 4-6. mu + Adam (identical)
+    // 4-6. mu + Adam (identical) — non-temporal load/store for optimizer state
     float smart_grad = g + rescale * total_out / static_cast<float>(num_heads);
-    float mu_val = alpha * mu[idx] + (1.0f - alpha) * g;
-    mu[idx] = mu_val;
+    float mu_val = alpha * stream_load(&mu[idx]) + (1.0f - alpha) * g;
+    stream_store(&mu[idx], mu_val);
     float fg = smart_grad + lamb_eff * mu_val;
-    float ea = beta1 * exp_avg[idx] + (1.0f - beta1) * fg;
-    float easq = beta2 * exp_avg_sq[idx] + (1.0f - beta2) * fg * fg;
-    exp_avg[idx] = ea; exp_avg_sq[idx] = easq;
+    float ea = beta1 * stream_load(&exp_avg[idx]) + (1.0f - beta1) * fg;
+    float easq = beta2 * stream_load(&exp_avg_sq[idx]) + (1.0f - beta2) * fg * fg;
+    stream_store(&exp_avg[idx], ea); stream_store(&exp_avg_sq[idx], easq);
     float p_val = static_cast<float>(param[idx]) * (1.0f - lr * wd_eff) - (lr / bc1) * ea / (sqrtf(easq / bc2) + eps);
     param[idx] = static_cast<scalar_t>(p_val);
 }
@@ -1418,7 +1420,7 @@ __global__ void fused_elem_step_int4_kernel(
     }
 
     float h_old[MAX_GRU_HIDDEN], h_new[MAX_GRU_HIDDEN];
-    for (int j = 0; j < gru_hidden; j++) h_old[j] = gru_state[idx * gru_hidden + j];
+    for (int j = 0; j < gru_hidden; j++) h_old[j] = stream_load(&gru_state[idx * gru_hidden + j]);
     float z_gate[MAX_GRU_HIDDEN], r_gate[MAX_GRU_HIDDEN];
     for (int j = 0; j < gru_hidden; j++) {
         float val_z = s_gru_bz[j], val_r = s_gru_br[j];
@@ -1437,7 +1439,7 @@ __global__ void fused_elem_step_int4_kernel(
         for (int k = 0; k < gru_hidden; k++) val += s_gru_Wh[j*gru_row_len+2+2*d_model+k]*(r_gate[k]*h_old[k]);
         h_new[j] = (1.0f-z_gate[j])*h_old[j] + z_gate[j]*tanhf(val);
     }
-    for (int j = 0; j < gru_hidden; j++) gru_state[idx*gru_hidden+j] = h_new[j];
+    for (int j = 0; j < gru_hidden; j++) stream_store(&gru_state[idx*gru_hidden+j], h_new[j]);
 
     float total_out = 0.0f;
     for (int head = 0; head < num_heads; head++) {
@@ -1472,11 +1474,11 @@ __global__ void fused_elem_step_int4_kernel(
         total_out += head_out;
     }
     float smart_grad = g + rescale*total_out/static_cast<float>(num_heads);
-    float mu_val = alpha*mu[idx] + (1.0f-alpha)*g; mu[idx] = mu_val;
+    float mu_val = alpha*stream_load(&mu[idx]) + (1.0f-alpha)*g; stream_store(&mu[idx], mu_val);
     float fg = smart_grad + lamb_eff*mu_val;
-    float ea = beta1*exp_avg[idx]+(1.0f-beta1)*fg;
-    float easq = beta2*exp_avg_sq[idx]+(1.0f-beta2)*fg*fg;
-    exp_avg[idx]=ea; exp_avg_sq[idx]=easq;
+    float ea = beta1*stream_load(&exp_avg[idx])+(1.0f-beta1)*fg;
+    float easq = beta2*stream_load(&exp_avg_sq[idx])+(1.0f-beta2)*fg*fg;
+    stream_store(&exp_avg[idx],ea); stream_store(&exp_avg_sq[idx],easq);
     float p_val = static_cast<float>(param[idx])*(1.0f-lr*wd_eff) - (lr/bc1)*ea/(sqrtf(easq/bc2)+eps);
     param[idx] = static_cast<scalar_t>(p_val);
 }
@@ -1619,7 +1621,7 @@ __global__ void fused_elem_step_mxfp4_kernel(
         fwd_ctx[d]=fv; bwd_ctx[d]=bv;
     }
     float h_old[MAX_GRU_HIDDEN], h_new[MAX_GRU_HIDDEN];
-    for (int j=0; j<gru_hidden; j++) h_old[j]=gru_state[idx*gru_hidden+j];
+    for (int j=0; j<gru_hidden; j++) h_old[j]=stream_load(&gru_state[idx*gru_hidden+j]);
     float z_gate[MAX_GRU_HIDDEN], r_gate[MAX_GRU_HIDDEN];
     for (int j=0; j<gru_hidden; j++) {
         float vz=s_gru_bz[j], vr=s_gru_br[j];
@@ -1638,7 +1640,7 @@ __global__ void fused_elem_step_mxfp4_kernel(
         for(int k=0;k<gru_hidden;k++) val+=s_gru_Wh[j*gru_row_len+2+2*d_model+k]*(r_gate[k]*h_old[k]);
         h_new[j]=(1.0f-z_gate[j])*h_old[j]+z_gate[j]*tanhf(val);
     }
-    for(int j=0;j<gru_hidden;j++) gru_state[idx*gru_hidden+j]=h_new[j];
+    for(int j=0;j<gru_hidden;j++) stream_store(&gru_state[idx*gru_hidden+j],h_new[j]);
 
     float total_out=0;
     for(int head=0;head<num_heads;head++){
@@ -1664,11 +1666,11 @@ __global__ void fused_elem_step_mxfp4_kernel(
         total_out+=ho;
     }
     float sg=g+rescale*total_out/static_cast<float>(num_heads);
-    float mv=alpha*mu[idx]+(1.0f-alpha)*g; mu[idx]=mv;
+    float mv=alpha*stream_load(&mu[idx])+(1.0f-alpha)*g; stream_store(&mu[idx],mv);
     float fg=sg+lamb_eff*mv;
-    float ea=beta1*exp_avg[idx]+(1.0f-beta1)*fg;
-    float easq=beta2*exp_avg_sq[idx]+(1.0f-beta2)*fg*fg;
-    exp_avg[idx]=ea; exp_avg_sq[idx]=easq;
+    float ea=beta1*stream_load(&exp_avg[idx])+(1.0f-beta1)*fg;
+    float easq=beta2*stream_load(&exp_avg_sq[idx])+(1.0f-beta2)*fg*fg;
+    stream_store(&exp_avg[idx],ea); stream_store(&exp_avg_sq[idx],easq);
     float pv=static_cast<float>(param[idx])*(1.0f-lr*wd_eff)-(lr/bc1)*ea/(sqrtf(easq/bc2)+eps);
     param[idx]=static_cast<scalar_t>(pv);
 }
@@ -3257,7 +3259,7 @@ __global__ void fused_elem_step_int8_kernel(
     // 2. GRU update (using shared memory weights)
     float h_old[MAX_GRU_HIDDEN];
     for (int j = 0; j < gru_hidden; j++)
-        h_old[j] = gru_state[idx * gru_hidden + j];
+        h_old[j] = stream_load(&gru_state[idx * gru_hidden + j]);
 
     float h_new[MAX_GRU_HIDDEN];
     float z_gate[MAX_GRU_HIDDEN], r_gate[MAX_GRU_HIDDEN];
@@ -3308,7 +3310,7 @@ __global__ void fused_elem_step_int8_kernel(
 
     // Write GRU state
     for (int j = 0; j < gru_hidden; j++)
-        gru_state[idx * gru_hidden + j] = h_new[j];
+        stream_store(&gru_state[idx * gru_hidden + j], h_new[j]);
 
     // 3. Multi-head PEER routing + expert evaluation
     //    (uses dequantized expert weights from smem — identical to fused_elem_step_kernel)
@@ -3370,20 +3372,20 @@ __global__ void fused_elem_step_int8_kernel(
     float smart_grad = g + rescale * total_out / static_cast<float>(num_heads);
 
     // 5. mu update
-    float mu_val = mu[idx];
+    float mu_val = stream_load(&mu[idx]);
     mu_val = alpha * mu_val + (1.0f - alpha) * g;
-    mu[idx] = mu_val;
+    stream_store(&mu[idx], mu_val);
 
     // 6. effective_grad = smart_grad + lamb_eff * mu
     float fg = smart_grad + lamb_eff * mu_val;
 
     // 7. Adam update
-    float ea = exp_avg[idx];
-    float easq = exp_avg_sq[idx];
+    float ea = stream_load(&exp_avg[idx]);
+    float easq = stream_load(&exp_avg_sq[idx]);
     ea = beta1 * ea + (1.0f - beta1) * fg;
     easq = beta2 * easq + (1.0f - beta2) * fg * fg;
-    exp_avg[idx] = ea;
-    exp_avg_sq[idx] = easq;
+    stream_store(&exp_avg[idx], ea);
+    stream_store(&exp_avg_sq[idx], easq);
 
     float step_size = lr / bc1;
     float denom = sqrtf(easq / bc2) + eps;

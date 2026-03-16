@@ -10,6 +10,7 @@
  */
 
 #include <torch/extension.h>
+#include <type_traits>
 
 #include "platform.h"
 
@@ -28,7 +29,14 @@ __global__ void looksam_direction_kernel(
     if (idx >= N) return;
     float sg = static_cast<float>(sam_grad[idx]);
     float ng = static_cast<float>(normal_grad[idx]);
-    v_dir[idx] = static_cast<scalar_t>((sg - ng) * inv_norm);
+    float result = (sg - ng) * inv_norm;
+    // v_dir is optimizer state (direction EMA) — use non-temporal store
+    // to avoid polluting L2 cache
+    if constexpr (std::is_same_v<scalar_t, float>) {
+        stream_store(reinterpret_cast<float*>(&v_dir[idx]), result);
+    } else {
+        v_dir[idx] = static_cast<scalar_t>(result);
+    }
 }
 
 template <typename scalar_t>
@@ -42,7 +50,13 @@ __global__ void looksam_adjust_kernel(
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
     float g = static_cast<float>(grad[idx]);
-    float v = static_cast<float>(v_dir[idx]);
+    // v_dir is optimizer state — non-temporal load (consumed once)
+    float v;
+    if constexpr (std::is_same_v<scalar_t, float>) {
+        v = stream_load(reinterpret_cast<const float*>(&v_dir[idx]));
+    } else {
+        v = static_cast<float>(v_dir[idx]);
+    }
     grad[idx] = static_cast<scalar_t>(g + la_times_gnorm * v);
 }
 
@@ -95,7 +109,8 @@ __global__ void looksam_direction_vec4_kernel(
     out.y = (sg.y - ng.y) * inv_norm;
     out.z = (sg.z - ng.z) * inv_norm;
     out.w = (sg.w - ng.w) * inv_norm;
-    v_dir4[i] = out;
+    // v_dir is optimizer state — non-temporal store to avoid L2 pollution
+    stream_store4(&v_dir4[i], out);
 }
 
 __launch_bounds__(256, 8)
@@ -108,7 +123,8 @@ __global__ void looksam_adjust_vec4_kernel(
     if (i >= N4) return;
 
     float4 g = grad4[i];
-    float4 v = v_dir4[i];
+    // v_dir is optimizer state — non-temporal load (consumed once)
+    float4 v = stream_load4(&v_dir4[i]);
 
     g.x = g.x + la_times_gnorm * v.x;
     g.y = g.y + la_times_gnorm * v.y;

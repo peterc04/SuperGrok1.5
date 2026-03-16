@@ -128,21 +128,29 @@ static void hopper_fp8_gemm(
     torch::Tensor output,      // [M, N] FP32
     int M, int N, int K
 ) {
-    // Per-tensor absmax scaling for FP8
-    float input_scale = input.abs().max().item<float>() / 448.0f;
-    float weight_scale = weight.abs().max().item<float>() / 448.0f;
+    // GPU-side absmax scaling — no .item() CPU-GPU sync
+    // Compute scales entirely on device, then use CUBLAS_POINTER_MODE_DEVICE
+    auto input_absmax = input.abs().max();    // stays on device
+    auto weight_absmax = weight.abs().max();  // stays on device
 
-    // Clamp scales to avoid division by zero
-    if (input_scale < 1e-12f) input_scale = 1e-12f;
-    if (weight_scale < 1e-12f) weight_scale = 1e-12f;
+    // Device-side scale tensors: scale = max(|x|) / 448.0
+    auto input_scale = torch::clamp_min(input_absmax / 448.0f, 1e-12f);
+    auto weight_scale = torch::clamp_min(weight_absmax / 448.0f, 1e-12f);
 
-    // Convert to FP8 E4M3
+    // Convert to FP8 E4M3 using device-side scales (no sync)
     auto input_fp8 = (input / input_scale).to(torch::kFloat8_e4m3fn).contiguous();
     auto weight_fp8 = (weight / weight_scale).to(torch::kFloat8_e4m3fn).contiguous();
 
-    // FP8 GEMM: output = (input_fp8 @ weight_fp8.T) * input_scale * weight_scale
-    float alpha = input_scale * weight_scale;
+    // Compute alpha = input_scale * weight_scale on device
+    auto alpha_tensor = (input_scale * weight_scale).to(torch::kFloat32).contiguous();
+
+    // Use CUBLAS_POINTER_MODE_DEVICE so alpha is read from device memory
+    cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_DEVICE);
+
     float beta = 0.0f;
+    // beta must be host pointer when using POINTER_MODE_DEVICE for alpha only.
+    // cuBLAS requires consistent pointer mode, so we set beta on device too.
+    auto beta_tensor = torch::zeros({1}, input.options().dtype(torch::kFloat32));
 
     // cuBLAS: C = alpha * op(A) * op(B) + beta * C
     // We want: output[M,N] = input[M,K] @ weight[N,K].T
@@ -150,13 +158,16 @@ static void hopper_fp8_gemm(
     cublasGemmEx(handle,
         CUBLAS_OP_T, CUBLAS_OP_N,
         N, M, K,
-        &alpha,
+        alpha_tensor.data_ptr<float>(),  // device pointer
         weight_fp8.data_ptr(), CUDA_R_8F_E4M3, K,
         input_fp8.data_ptr(), CUDA_R_8F_E4M3, K,
-        &beta,
+        beta_tensor.data_ptr<float>(),   // device pointer
         output.data_ptr<float>(), CUDA_R_32F, N,
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    // Restore host pointer mode for other cuBLAS calls
+    cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST);
 }
 
 static void hopper_precompute_fp8(
