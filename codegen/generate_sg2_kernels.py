@@ -111,6 +111,7 @@ COMMON_HEADER = """\
 #include <torch/extension.h>
 #include "platform.h"
 #include "types.h"
+#include "ptx_intrinsics.cuh"
 
 #include <cuda_bf16.h>
 
@@ -239,7 +240,7 @@ def smem_load_code(hw: str) -> str:
 def gen_fused_elem_kernel(v: dict) -> str:
     """Generate a single fused_elem kernel variant."""
     d_inner_const = "16" if v["d16"] else "d_inner"
-    d_inner_pragma = "#pragma unroll 16\n        " if v["d16"] else ""
+    d_inner_pragma = "#pragma unroll\n        " if v["d16"] else "#pragma unroll 4\n        "
     use_stream = v["state"] == "Q"
     moe_sparse = v["moe"] == "M"
     use_cpasync = v["hw"] == "sm80"
@@ -352,6 +353,7 @@ __global__ void {v['name']}(
     const int gru_off = idx * gru_hidden;
     float gru_input = g + scan_combined;
     float gru_new = 0.0f;
+    #pragma unroll 4
     for (int h = 0; h < gru_hidden; h++) {{
         {gru_read}
         // Simplified GRU: z-gate and candidate
@@ -364,11 +366,13 @@ __global__ void {v['name']}(
 
     // ── Multi-head PEER routing + Expert MLP ──
     float expert_output = 0.0f;
+    #pragma unroll 4
     for (int expert_idx = 0; expert_idx < num_experts; expert_idx++) {{
 {moe_gate_code}
 
         // Expert MLP: hidden = SiLU(W1 * input + b1), output = W2 * hidden + b2
         float hidden_sum = 0.0f;
+        #pragma unroll 4
         for (int eh = 0; eh < expert_hidden; eh++) {{
 {expert_load_code(v['expert'], v['hw'])}
             float h_val = w1_val * gru_new + b1_val;
@@ -425,7 +429,7 @@ def generate_fused_elem(output_dir: str) -> List[dict]:
 
 def gen_metanet_kernel(v: dict) -> str:
     d_inner_const = "16" if v["d16"] else "d_inner"
-    d_inner_pragma = "#pragma unroll 16\n        " if v["d16"] else ""
+    d_inner_pragma = "#pragma unroll\n        " if v["d16"] else "#pragma unroll 4\n        "
     exp_extra = extra_params_for_expert(v["expert"])
 
     kernel = f"""\
@@ -475,6 +479,7 @@ __global__ void {v['name']}(
     const int gru_off = idx * gru_hidden;
     float gru_input = g + scan_combined;
     float gru_new = 0.0f;
+    #pragma unroll 4
     for (int h = 0; h < gru_hidden; h++) {{
         float gru_val = gru_state[gru_off + h];
         float z = 1.0f / (1.0f + expf(-(gru_Wz[h] * gru_input + gru_bz[h])));
@@ -486,9 +491,11 @@ __global__ void {v['name']}(
 
     // ── Expert MLP ──
     float expert_output = 0.0f;
+    #pragma unroll 4
     for (int expert_idx = 0; expert_idx < num_experts; expert_idx++) {{
         float gate_score = 1.0f / (float)num_experts;
         float hidden_sum = 0.0f;
+        #pragma unroll 4
         for (int eh = 0; eh < expert_hidden; eh++) {{
 {expert_load_code(v['expert'], v['hw'])}
             float h_val = w1_val * gru_new + b1_val;
@@ -523,7 +530,7 @@ def generate_metanet_only(output_dir: str) -> List[dict]:
 
 def gen_persistent_scan_kernel(v: dict) -> str:
     d_inner_const = "16" if v["d16"] else "d_inner"
-    d_inner_pragma = "#pragma unroll 16\n        " if v["d16"] else ""
+    d_inner_pragma = "#pragma unroll\n        " if v["d16"] else "#pragma unroll 4\n        "
     use_stream = v["state"] == "Q"
     use_cpasync = v["hw"] == "sm80"
 
@@ -564,17 +571,21 @@ __global__ void {v['name']}(
     const int half_d_state = d_state / 2;
     float h[MAX_D_STATE];
     if (initial_state != nullptr) {{
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++)
             h[s] = initial_state[tid * d_state + s];
     }} else {{
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) h[s] = 0.0f;
     }}
 
     // Preload A and rope frequencies into registers
     float A[MAX_D_STATE];
     float freq[MAX_D_STATE / 2];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
-        A[s] = -expf(A_log[tid * d_state + s]);
+        A[s] = -fast_exp_ptx(A_log[tid * d_state + s]);
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++)
         freq[p] = rope_freq[tid * half_d_state + p];
 
@@ -590,18 +601,20 @@ __global__ void {v['name']}(
 
         // Compute dt via projection
         float dt_val = dt_proj_b[tid];
-        for (int d = 0; d < d_inner_val; d++)
+        {d_inner_pragma}for (int d = 0; d < d_inner_val; d++)
             dt_val += dt_proj_W[tid * d_inner_val + d] * x_branch;
-        dt_val = 1.0f / (1.0f + expf(-dt_val));  // softplus approximation
+        dt_val = softplus_ptx(dt_val);
 
         // Compute B, C projections
         float B_vals[MAX_D_STATE], C_vals[MAX_D_STATE];
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) {{
             B_vals[s] = B_proj_W[s * d_inner_val + tid] * x_branch;
             C_vals[s] = C_proj_W[s * d_inner_val + tid];
         }}
 
         // Trapezoidal discretization + RoPE + state update
+        #pragma unroll 4
         for (int p = 0; p < half_d_state; p++) {{
             int s0 = p * 2, s1 = p * 2 + 1;
             float theta = freq[p] * (float)t;
@@ -622,6 +635,7 @@ __global__ void {v['name']}(
 
         // Output: y = sum_s(C[s] * h[s]) + D * x_branch
         float y = D_param[tid] * x_branch;
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++)
             y += C_vals[s] * h[s];
 
@@ -631,6 +645,7 @@ __global__ void {v['name']}(
     // Write final state
     if (scan_state != nullptr) {{
         const int state_off = tid * d_state;
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) {{
             float h_new = h[s];
             {state_write}
@@ -899,23 +914,23 @@ constexpr int SG2_DISPATCH_BLOCK = 256;
         seen = set()
         for v in fused_variants:
             if v["name"] not in seen:
-                f.write(f"template <typename scalar_t>\n__launch_bounds__(256, 2)\n__global__ void {v['name']}(/* see sg2_fused_elem_generated.cu */);\n\n")
+                f.write(f"template <typename scalar_t>\n__global__ void {v['name']}(/* see sg2_fused_elem_generated.cu */);\n\n")
                 seen.add(v["name"])
 
-        # Forward declarations for metanet
+        # Forward declarations for metanet (no __launch_bounds__ on forward declarations)
         for v in metanet_variants:
             if v["name"] not in seen:
-                f.write(f"template <typename scalar_t>\n__launch_bounds__(256, 2)\n__global__ void {v['name']}(/* see sg2_metanet_only_generated.cu */);\n\n")
+                f.write(f"template <typename scalar_t>\n__global__ void {v['name']}(/* see sg2_metanet_only_generated.cu */);\n\n")
                 seen.add(v["name"])
 
-        # Forward declarations for pscan (non-template)
+        # Forward declarations for pscan (non-template, no __launch_bounds__)
         for v in pscan_variants:
             if v["name"] not in seen:
-                f.write(f"__launch_bounds__(16, 8)\n__global__ void {v['name']}(/* see sg2_persistent_scan_generated.cu */);\n\n")
+                f.write(f"__global__ void {v['name']}(/* see sg2_persistent_scan_generated.cu */);\n\n")
                 seen.add(v["name"])
 
         # d16 scan
-        f.write("__launch_bounds__(16, 8)\n__global__ void mamba3_parallel_scan_d16_kernel(/* see sg2_scan_d16_generated.cu */);\n\n")
+        f.write("__global__ void mamba3_parallel_scan_d16_kernel(/* see sg2_scan_d16_generated.cu */);\n\n")
 
         # ── Fused elem dispatch ──
         f.write("""\
