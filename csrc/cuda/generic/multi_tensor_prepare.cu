@@ -41,11 +41,13 @@ __global__ void multi_tensor_grad_prepare_kernel(
 
     // Step 1: Compute grad norm (parallel reduction within block)
     float local_sq = 0.0f;
+    #pragma unroll 4
     for (int i = threadIdx.x; i < N; i += blockDim.x) {
         float g = grad[i];
         local_sq += g * g;
     }
     // Warp reduce
+    #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
         local_sq += __shfl_down_sync(0xFFFFFFFF, local_sq, offset);
 
@@ -63,6 +65,7 @@ __global__ void multi_tensor_grad_prepare_kernel(
     if (threadIdx.x == 0) {
         float total = 0.0f;
         int num_warps = (blockDim.x + 31) / 32;
+        #pragma unroll 4
         for (int w = 0; w < num_warps; w++) {
             total += s_partial[w];
         }
@@ -74,6 +77,7 @@ __global__ void multi_tensor_grad_prepare_kernel(
     // Step 2: Clip + finite check (fused)
     if (grad_norm > gradient_clipping) {
         float scale = gradient_clipping / (grad_norm + 1e-12f);
+        #pragma unroll 4
         for (int i = threadIdx.x; i < N; i += blockDim.x) {
             float g = grad[i];
             g = isfinite(g) ? g * scale : 0.0f;  // Clip + finite in one pass
@@ -81,6 +85,7 @@ __global__ void multi_tensor_grad_prepare_kernel(
         }
     } else {
         // Just finite check
+        #pragma unroll 4
         for (int i = threadIdx.x; i < N; i += blockDim.x) {
             float g = grad[i];
             if (!isfinite(g)) grad[i] = 0.0f;
@@ -146,6 +151,7 @@ void supergrok2_prepare_and_batched_step(
     auto layer_beta1s_t = torch::zeros({num_params}, torch::TensorOptions().dtype(torch::kFloat32));
     auto steps_t = torch::zeros({num_params}, torch::TensorOptions().dtype(torch::kInt32));
 
+    #pragma unroll 4
     for (int i = 0; i < num_params; i++) {
         grad_ptrs_cpu.data_ptr<int64_t>()[i] = reinterpret_cast<int64_t>(grads[i].data_ptr<float>());
         sizes_cpu.data_ptr<int32_t>()[i] = static_cast<int32_t>(grads[i].numel());

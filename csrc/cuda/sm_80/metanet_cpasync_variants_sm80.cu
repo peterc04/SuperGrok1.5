@@ -66,12 +66,15 @@ __global__ void fused_supergrok15_full_step_cpasync_q4_kernel(
 
     const int tid = threadIdx.x;
 
+    #pragma unroll 4
     for (int i = tid; i < H * 2; i += blockDim.x)
         __pipeline_memcpy_async(&sW1[i], &W1[i], sizeof(float));
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sb1[i], &b1[i], sizeof(float));
     __pipeline_commit();
 
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sW2[i], &W2[i], sizeof(float));
     if (tid == 0)
@@ -92,6 +95,7 @@ __global__ void fused_supergrok15_full_step_cpasync_q4_kernel(
     mu[idx] = static_cast<scalar_t>(mu_new);
 
     float hidden[128];
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         float z = sW1[h * 2] * g + sW1[h * 2 + 1] * s + sb1[h];
         hidden[h] = z / (1.0f + expf(-1.702f * z));
@@ -101,6 +105,7 @@ __global__ void fused_supergrok15_full_step_cpasync_q4_kernel(
     __syncthreads();
 
     float mlp_out = 0.0f;
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         mlp_out += sW2[h] * hidden[h];
     }
@@ -171,12 +176,15 @@ __global__ void fused_supergrok15_full_step_cpasync_moe_kernel(
 
     const int tid = threadIdx.x;
 
+    #pragma unroll 4
     for (int i = tid; i < H * 2; i += blockDim.x)
         __pipeline_memcpy_async(&sW1[i], &W1[i], sizeof(float));
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sb1[i], &b1[i], sizeof(float));
     __pipeline_commit();
 
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sW2[i], &W2[i], sizeof(float));
     if (tid == 0)
@@ -198,6 +206,7 @@ __global__ void fused_supergrok15_full_step_cpasync_moe_kernel(
     mu[idx] = static_cast<scalar_t>(mu_new);
 
     float hidden[128];
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         float z = sW1[h * 2] * g + sW1[h * 2 + 1] * s + sb1[h];
         hidden[h] = z / (1.0f + expf(-1.702f * z));
@@ -207,6 +216,7 @@ __global__ void fused_supergrok15_full_step_cpasync_moe_kernel(
     __syncthreads();
 
     float mlp_out = 0.0f;
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         mlp_out += sW2[h] * hidden[h];
     }
@@ -266,12 +276,15 @@ __global__ void fused_supergrok15_full_step_cpasync_moe_q4_kernel(
 
     const int tid = threadIdx.x;
 
+    #pragma unroll 4
     for (int i = tid; i < H * 2; i += blockDim.x)
         __pipeline_memcpy_async(&sW1[i], &W1[i], sizeof(float));
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sb1[i], &b1[i], sizeof(float));
     __pipeline_commit();
 
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sW2[i], &W2[i], sizeof(float));
     if (tid == 0)
@@ -293,6 +306,7 @@ __global__ void fused_supergrok15_full_step_cpasync_moe_q4_kernel(
     mu[idx] = static_cast<scalar_t>(mu_new);
 
     float hidden[128];
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         float z = sW1[h * 2] * g + sW1[h * 2 + 1] * s + sb1[h];
         hidden[h] = z / (1.0f + expf(-1.702f * z));
@@ -302,6 +316,7 @@ __global__ void fused_supergrok15_full_step_cpasync_moe_q4_kernel(
     __syncthreads();
 
     float mlp_out = 0.0f;
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         mlp_out += sW2[h] * hidden[h];
     }
@@ -374,12 +389,15 @@ __global__ void fused_sg11_full_step_cpasync_q4_kernel(
 
     const int tid = threadIdx.x;
 
+    #pragma unroll 4
     for (int i = tid; i < H * 2; i += blockDim.x)
         __pipeline_memcpy_async(&sW1[i], &W1[i], sizeof(float));
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sb1[i], &b1[i], sizeof(float));
     __pipeline_commit();
 
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sW2[i], &W2[i], sizeof(float));
     if (tid == 0)
@@ -400,6 +418,7 @@ __global__ void fused_sg11_full_step_cpasync_q4_kernel(
     mu[idx] = static_cast<scalar_t>(mu_new);
 
     float hidden[128];
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         float z = sW1[h * 2] * g + sW1[h * 2 + 1] * s + sb1[h];
         hidden[h] = z / (1.0f + expf(-1.702f * z));
@@ -409,6 +428,7 @@ __global__ void fused_sg11_full_step_cpasync_q4_kernel(
     __syncthreads();
 
     float mlp_out = 0.0f;
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         mlp_out += sW2[h] * hidden[h];
     }
@@ -479,12 +499,15 @@ __global__ void fused_sg11_full_step_cpasync_moe_kernel(
 
     const int tid = threadIdx.x;
 
+    #pragma unroll 4
     for (int i = tid; i < H * 2; i += blockDim.x)
         __pipeline_memcpy_async(&sW1[i], &W1[i], sizeof(float));
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sb1[i], &b1[i], sizeof(float));
     __pipeline_commit();
 
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sW2[i], &W2[i], sizeof(float));
     if (tid == 0)
@@ -506,6 +529,7 @@ __global__ void fused_sg11_full_step_cpasync_moe_kernel(
     mu[idx] = static_cast<scalar_t>(mu_new);
 
     float hidden[128];
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         float z = sW1[h * 2] * g + sW1[h * 2 + 1] * s + sb1[h];
         hidden[h] = z / (1.0f + expf(-1.702f * z));
@@ -515,6 +539,7 @@ __global__ void fused_sg11_full_step_cpasync_moe_kernel(
     __syncthreads();
 
     float mlp_out = 0.0f;
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         mlp_out += sW2[h] * hidden[h];
     }
@@ -574,12 +599,15 @@ __global__ void fused_sg11_full_step_cpasync_moe_q4_kernel(
 
     const int tid = threadIdx.x;
 
+    #pragma unroll 4
     for (int i = tid; i < H * 2; i += blockDim.x)
         __pipeline_memcpy_async(&sW1[i], &W1[i], sizeof(float));
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sb1[i], &b1[i], sizeof(float));
     __pipeline_commit();
 
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sW2[i], &W2[i], sizeof(float));
     if (tid == 0)
@@ -601,6 +629,7 @@ __global__ void fused_sg11_full_step_cpasync_moe_q4_kernel(
     mu[idx] = static_cast<scalar_t>(mu_new);
 
     float hidden[128];
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         float z = sW1[h * 2] * g + sW1[h * 2 + 1] * s + sb1[h];
         hidden[h] = z / (1.0f + expf(-1.702f * z));
@@ -610,6 +639,7 @@ __global__ void fused_sg11_full_step_cpasync_moe_q4_kernel(
     __syncthreads();
 
     float mlp_out = 0.0f;
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         mlp_out += sW2[h] * hidden[h];
     }
@@ -680,12 +710,15 @@ __global__ void fused_neuralgrok_full_step_cpasync_q4_kernel(
 
     const int tid = threadIdx.x;
 
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sW1[i], &W1[i], sizeof(float));
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sb1[i], &b1[i], sizeof(float));
     __pipeline_commit();
 
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sW2[i], &W2[i], sizeof(float));
     if (tid == 0)
@@ -701,6 +734,7 @@ __global__ void fused_neuralgrok_full_step_cpasync_q4_kernel(
     const float g = static_cast<float>(grad[idx]);
 
     float hidden[128];
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         float z = sW1[h] * g + sb1[h];
         hidden[h] = (z > 0.0f) ? z : 0.0f;
@@ -710,6 +744,7 @@ __global__ void fused_neuralgrok_full_step_cpasync_q4_kernel(
     __syncthreads();
 
     float mlp_out = 0.0f;
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         mlp_out += sW2[h] * hidden[h];
     }
@@ -777,12 +812,15 @@ __global__ void fused_neuralgrok_full_step_cpasync_moe_kernel(
 
     const int tid = threadIdx.x;
 
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sW1[i], &W1[i], sizeof(float));
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sb1[i], &b1[i], sizeof(float));
     __pipeline_commit();
 
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sW2[i], &W2[i], sizeof(float));
     if (tid == 0)
@@ -799,6 +837,7 @@ __global__ void fused_neuralgrok_full_step_cpasync_moe_kernel(
     const float g = static_cast<float>(grad[idx]);
 
     float hidden[128];
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         float z = sW1[h] * g + sb1[h];
         hidden[h] = (z > 0.0f) ? z : 0.0f;
@@ -808,6 +847,7 @@ __global__ void fused_neuralgrok_full_step_cpasync_moe_kernel(
     __syncthreads();
 
     float mlp_out = 0.0f;
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         mlp_out += sW2[h] * hidden[h];
     }
@@ -868,12 +908,15 @@ __global__ void fused_neuralgrok_full_step_cpasync_moe_q4_kernel(
 
     const int tid = threadIdx.x;
 
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sW1[i], &W1[i], sizeof(float));
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sb1[i], &b1[i], sizeof(float));
     __pipeline_commit();
 
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sW2[i], &W2[i], sizeof(float));
     if (tid == 0)
@@ -890,6 +933,7 @@ __global__ void fused_neuralgrok_full_step_cpasync_moe_q4_kernel(
     const float g = static_cast<float>(grad[idx]);
 
     float hidden[128];
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         float z = sW1[h] * g + sb1[h];
         hidden[h] = (z > 0.0f) ? z : 0.0f;
@@ -899,6 +943,7 @@ __global__ void fused_neuralgrok_full_step_cpasync_moe_q4_kernel(
     __syncthreads();
 
     float mlp_out = 0.0f;
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         mlp_out += sW2[h] * hidden[h];
     }

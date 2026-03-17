@@ -117,13 +117,16 @@ __global__ void fused_supergrok15_full_step_cpasync_kernel(
 
 #if GROK_CUDA && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     // ── Phase 1: cp.async load W1 and b1 ────────────────────────────
+    #pragma unroll 4
     for (int i = tid; i < H * 2; i += blockDim.x)
         __pipeline_memcpy_async(&sW1[i], &W1[i], sizeof(float));
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sb1[i], &b1[i], sizeof(float));
     __pipeline_commit();
 
     // ── Phase 2: cp.async load W2 and b2 ────────────────────────────
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sW2[i], &W2[i], sizeof(float));
     if (tid == 0)
@@ -135,8 +138,11 @@ __global__ void fused_supergrok15_full_step_cpasync_kernel(
     __syncthreads();
 #else
     // Synchronous fallback for non-Ampere
+    #pragma unroll 4
     for (int i = tid; i < H * 2; i += blockDim.x) sW1[i] = W1[i];
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x) sb1[i] = b1[i];
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x) sW2[i] = W2[i];
     if (tid == 0) sb2[0] = b2[0];
     __syncthreads();
@@ -157,6 +163,7 @@ __global__ void fused_supergrok15_full_step_cpasync_kernel(
     // ── 3a. MLP Layer 1: Linear(2,H) -> GELU (uses W1, b1) ─────
     //    W2/b2 transfer overlaps with this computation.
     float hidden[128];  // register file; H <= 128 assumed
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         float z = sW1[h * 2] * g + sW1[h * 2 + 1] * s + sb1[h];
         // Fast GELU: sigmoid approximation (~2.5x faster, max error ~0.004)
@@ -171,6 +178,7 @@ __global__ void fused_supergrok15_full_step_cpasync_kernel(
 
     // ── 3b. MLP Layer 2: Linear(H,1) (uses W2, b2) ─────────────
     float mlp_out = 0.0f;
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         mlp_out += sW2[h] * hidden[h];
     }
@@ -247,13 +255,16 @@ __global__ void fused_sg11_full_step_cpasync_kernel(
 
 #if GROK_CUDA && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     // ── Phase 1: cp.async load W1 and b1 ────────────────────────────
+    #pragma unroll 4
     for (int i = tid; i < H * 2; i += blockDim.x)
         __pipeline_memcpy_async(&sW1[i], &W1[i], sizeof(float));
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sb1[i], &b1[i], sizeof(float));
     __pipeline_commit();
 
     // ── Phase 2: cp.async load W2 and b2 ────────────────────────────
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sW2[i], &W2[i], sizeof(float));
     if (tid == 0)
@@ -265,8 +276,11 @@ __global__ void fused_sg11_full_step_cpasync_kernel(
     __syncthreads();
 #else
     // Synchronous fallback for non-Ampere
+    #pragma unroll 4
     for (int i = tid; i < H * 2; i += blockDim.x) sW1[i] = W1[i];
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x) sb1[i] = b1[i];
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x) sW2[i] = W2[i];
     if (tid == 0) sb2[0] = b2[0];
     __syncthreads();
@@ -287,6 +301,7 @@ __global__ void fused_sg11_full_step_cpasync_kernel(
     // ── 3a. MLP Layer 1: Linear(2,H) -> GELU (uses W1, b1) ─────
     //    W2/b2 transfer overlaps with this computation.
     float hidden[128];  // register file; H <= 128 assumed
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         float z = sW1[h * 2] * g + sW1[h * 2 + 1] * s + sb1[h];
         // Fast GELU: sigmoid approximation (~2.5x faster, max error ~0.004)
@@ -301,6 +316,7 @@ __global__ void fused_sg11_full_step_cpasync_kernel(
 
     // ── 3b. MLP Layer 2: Linear(H,1) (uses W2, b2) ─────────────
     float mlp_out = 0.0f;
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         mlp_out += sW2[h] * hidden[h];
     }
@@ -374,13 +390,16 @@ __global__ void fused_neuralgrok_full_step_cpasync_kernel(
 
 #if GROK_CUDA && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     // ── Phase 1: cp.async load W1 and b1 ────────────────────────────
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sW1[i], &W1[i], sizeof(float));
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sb1[i], &b1[i], sizeof(float));
     __pipeline_commit();
 
     // ── Phase 2: cp.async load W2 and b2 ────────────────────────────
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         __pipeline_memcpy_async(&sW2[i], &W2[i], sizeof(float));
     if (tid == 0)
@@ -392,10 +411,13 @@ __global__ void fused_neuralgrok_full_step_cpasync_kernel(
     __syncthreads();
 #else
     // Synchronous fallback for non-Ampere
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         sW1[i] = W1[i];
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         sb1[i] = b1[i];
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         sW2[i] = W2[i];
     if (tid == 0)
@@ -411,6 +433,7 @@ __global__ void fused_neuralgrok_full_step_cpasync_kernel(
     const float g = static_cast<float>(grad[idx]);
 
     float hidden[128];  // register file; H <= 128 assumed
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         float z = sW1[h] * g + sb1[h];
         hidden[h] = (z > 0.0f) ? z : 0.0f;  // ReLU
@@ -424,6 +447,7 @@ __global__ void fused_neuralgrok_full_step_cpasync_kernel(
 
     // ── MLP Layer 2: Linear(H,1) (uses W2, b2) ─────────────────
     float mlp_out = 0.0f;
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         mlp_out += sW2[h] * hidden[h];
     }

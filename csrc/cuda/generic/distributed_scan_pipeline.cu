@@ -49,6 +49,7 @@ __device__ __forceinline__ void compute_rank_prefix(
     prefix_b[0] = 0.0f; prefix_b[1] = 0.0f;
 
     // Compose summaries from GPUs 0..rank-1
+    #pragma unroll 4
     for (int g = 0; g < rank; g++) {
         float r00 = all_summaries_M[g * 4 + 0];
         float r01 = all_summaries_M[g * 4 + 1];
@@ -122,6 +123,7 @@ __global__ void distributed_prefix_apply_fused_elem_kernel(
     }
 
     // Cooperative smem load (overlaps with thread 0's prefix computation)
+    #pragma unroll 4
     for (int i = threadIdx.x; i < weight_size; i += blockDim.x) {
         smem[i] = expert_W1[i];  // Simplified: all weights packed contiguously
     }
@@ -207,6 +209,7 @@ __global__ void distributed_prefix_apply_fused_elem_cpasync_kernel(
     }
 
     // cp.async: hardware-accelerated global->shared copy
+    #pragma unroll 4
     for (int i = threadIdx.x; i < weight_size; i += blockDim.x) {
         asm volatile(
             "cp.async.cg.shared.global [%0], [%1], 4;\n\t"
@@ -276,6 +279,7 @@ __global__ void distributed_prefix_apply_fused_elem_d16_kernel(
                            prefix_M, prefix_b, rank);
     }
 
+    #pragma unroll 4
     for (int i = threadIdx.x; i < weight_size; i += blockDim.x)
         smem[i] = expert_weights[i];
     __syncthreads();
@@ -340,6 +344,7 @@ __global__ void distributed_prefix_apply_fused_elem_q4_kernel(
                            prefix_M, prefix_b, rank);
     }
 
+    #pragma unroll 4
     for (int i = threadIdx.x; i < weight_size; i += blockDim.x)
         smem[i] = expert_weights[i];
     __syncthreads();
@@ -406,6 +411,7 @@ __global__ void distributed_prefix_apply_fused_elem_bwd_kernel(
                            prefix_M, prefix_b, rank);
     }
 
+    #pragma unroll 4
     for (int i = threadIdx.x; i < weight_size; i += blockDim.x)
         smem[i] = expert_weights[i];
     __syncthreads();
@@ -462,6 +468,7 @@ __global__ void distributed_prefix_apply_fused_elem_bwd_d16_kernel(
                            prefix_M, prefix_b, rank);
     }
 
+    #pragma unroll 4
     for (int i = threadIdx.x; i < weight_size; i += blockDim.x)
         smem[i] = expert_weights[i];
     __syncthreads();

@@ -297,6 +297,7 @@ void launch_muon_fused_step(
         int N_dim = X.size(1);
         auto X_2d = X.view({M, N_dim});
 
+        #pragma unroll 4
         for (int i = 0; i < ns_steps; i++) {
             auto AX = torch::mm(torch::mm(X_2d.t(), X_2d), X_2d.t()).t();
             auto AAX = torch::mm(torch::mm(X_2d.t(), torch::mm(X_2d, X_2d.t())), X_2d.t()).t();

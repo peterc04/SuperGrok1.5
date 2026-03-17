@@ -86,6 +86,7 @@ void launch_muon_fused_step_hopper(
     int N_dim = (X.dim() >= 2) ? X.size(1) : 1;
     auto X_2d = X.view({M, N_dim});
 
+    #pragma unroll 4
     for (int i = 0; i < ns_steps; i++) {
         // A = X^T @ X
         auto A = torch::empty({N_dim, N_dim}, X.options());

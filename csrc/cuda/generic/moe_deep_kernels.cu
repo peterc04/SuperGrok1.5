@@ -77,6 +77,7 @@ __global__ void moe_dynamic_expert_load_kernel(
     if (tid == 0) {
         *num_active = 0;
     }
+    #pragma unroll 4
     for (int e = tid; e < num_experts; e += block_size) {
         float logit = gate_logits[sample_idx * num_experts + e];
         // Softmax numerator: use exp for gating
@@ -87,6 +88,7 @@ __global__ void moe_dynamic_expert_load_kernel(
     // Step 2: Thread 0 compacts the active expert list
     if (tid == 0) {
         int count = 0;
+        #pragma unroll 4
         for (int e = 0; e < num_experts && count < MAX_TOPK; e++) {
             if (active_mask[e]) {
                 active_ids[count] = e;
@@ -108,11 +110,13 @@ __global__ void moe_dynamic_expert_load_kernel(
 
     // Step 4: Cooperatively load active expert weights into output buffers
     // Each thread handles a slice of the weight matrices
+    #pragma unroll 4
     for (int a = 0; a < n_active; a++) {
         int expert_id = active_ids[a];
 
         // Load W1: [expert_dim, input_dim]
         int w1_total = expert_dim * input_dim;
+        #pragma unroll 4
         for (int i = tid; i < w1_total; i += block_size) {
             int row = i / input_dim;
             int col = i % input_dim;
@@ -121,6 +125,7 @@ __global__ void moe_dynamic_expert_load_kernel(
         }
 
         // Load b1: [expert_dim]
+        #pragma unroll 4
         for (int i = tid; i < expert_dim; i += block_size) {
             loaded_b1[(sample_idx * MAX_TOPK + a) * expert_dim + i] =
                 LDG(&b1[expert_id * expert_dim + i]);
@@ -128,6 +133,7 @@ __global__ void moe_dynamic_expert_load_kernel(
 
         // Load W2: [input_dim, expert_dim]
         int w2_total = input_dim * expert_dim;
+        #pragma unroll 4
         for (int i = tid; i < w2_total; i += block_size) {
             int row = i / expert_dim;
             int col = i % expert_dim;
@@ -136,6 +142,7 @@ __global__ void moe_dynamic_expert_load_kernel(
         }
 
         // Load b2: [input_dim]
+        #pragma unroll 4
         for (int i = tid; i < input_dim; i += block_size) {
             loaded_b2[(sample_idx * MAX_TOPK + a) * input_dim + i] =
                 LDG(&b2[expert_id * input_dim + i]);
@@ -185,6 +192,7 @@ __global__ void moe_dynamic_expert_fwd_kernel(
 
     if (n_active == 0) {
         // Zero output for samples with no active experts
+        #pragma unroll 4
         for (int d = tid; d < input_dim; d += block_size) {
             output[sample_idx * input_dim + d] = 0.0f;
         }
@@ -192,6 +200,7 @@ __global__ void moe_dynamic_expert_fwd_kernel(
     }
 
     // Load input into shared memory
+    #pragma unroll 4
     for (int d = tid; d < input_dim; d += block_size) {
         s_input[d] = input[sample_idx * input_dim + d];
     }
@@ -199,12 +208,14 @@ __global__ void moe_dynamic_expert_fwd_kernel(
     // Compute softmax gate weights for active experts
     if (tid == 0) {
         float max_logit = -1e30f;
+        #pragma unroll 4
         for (int a = 0; a < n_active; a++) {
             int eid = active_expert_ids[sample_idx * MAX_TOPK + a];
             float logit = gate_logits[sample_idx * num_experts + eid];
             if (logit > max_logit) max_logit = logit;
         }
         float sum_exp = 0.0f;
+        #pragma unroll 4
         for (int a = 0; a < n_active; a++) {
             int eid = active_expert_ids[sample_idx * MAX_TOPK + a];
             float logit = gate_logits[sample_idx * num_experts + eid];
@@ -213,6 +224,7 @@ __global__ void moe_dynamic_expert_fwd_kernel(
             sum_exp += exp_val;
         }
         float inv_sum = 1.0f / (sum_exp + 1e-8f);
+        #pragma unroll 4
         for (int a = 0; a < n_active; a++) {
             s_gate_softmax[a] *= inv_sum;
         }
@@ -222,12 +234,14 @@ __global__ void moe_dynamic_expert_fwd_kernel(
     // Initialize output accumulators in shared memory
     // Reuse a portion of smem after s_gate_softmax for output accumulation
     float* s_output = s_gate_softmax + MAX_TOPK;  // [input_dim]
+    #pragma unroll 4
     for (int d = tid; d < input_dim; d += block_size) {
         s_output[d] = 0.0f;
     }
     __syncthreads();
 
     // Process each active expert
+    #pragma unroll 4
     for (int a = 0; a < n_active; a++) {
         float gate_w = s_gate_softmax[a];
         int base_w1 = (sample_idx * MAX_TOPK + a) * expert_dim * input_dim;
@@ -236,8 +250,10 @@ __global__ void moe_dynamic_expert_fwd_kernel(
         int base_b2 = (sample_idx * MAX_TOPK + a) * input_dim;
 
         // Compute hidden = ReLU(W1 * input + b1)
+        #pragma unroll 4
         for (int h = tid; h < expert_dim; h += block_size) {
             float acc = loaded_b1[base_b1 + h];
+            #pragma unroll 4
             for (int d = 0; d < input_dim; d++) {
                 acc += loaded_W1[base_w1 + h * input_dim + d] * s_input[d];
             }
@@ -247,8 +263,10 @@ __global__ void moe_dynamic_expert_fwd_kernel(
         __syncthreads();
 
         // Compute output contribution = gate_w * (W2 * hidden + b2)
+        #pragma unroll 4
         for (int d = tid; d < input_dim; d += block_size) {
             float acc = loaded_b2[base_b2 + d];
+            #pragma unroll 4
             for (int h = 0; h < expert_dim; h++) {
                 acc += loaded_W2[base_w2 + d * expert_dim + h] * s_hidden[h];
             }
@@ -258,6 +276,7 @@ __global__ void moe_dynamic_expert_fwd_kernel(
     }
 
     // Write output to global memory
+    #pragma unroll 4
     for (int d = tid; d < input_dim; d += block_size) {
         output[sample_idx * input_dim + d] = s_output[d];
     }
@@ -315,6 +334,7 @@ __global__ void moe_dynamic_expert_bwd_kernel(
     if (n_active == 0) return;
 
     // Load input and grad_output into shared memory
+    #pragma unroll 4
     for (int d = tid; d < input_dim; d += block_size) {
         s_input[d] = input[sample_idx * input_dim + d];
         s_grad_out[d] = grad_output[sample_idx * input_dim + d];
@@ -324,12 +344,14 @@ __global__ void moe_dynamic_expert_bwd_kernel(
     // Recompute gate softmax and per-expert outputs for gate gradient
     if (tid == 0) {
         float max_logit = -1e30f;
+        #pragma unroll 4
         for (int a = 0; a < n_active; a++) {
             int eid = active_expert_ids[sample_idx * MAX_TOPK + a];
             float logit = gate_logits[sample_idx * num_experts + eid];
             if (logit > max_logit) max_logit = logit;
         }
         float sum_exp = 0.0f;
+        #pragma unroll 4
         for (int a = 0; a < n_active; a++) {
             int eid = active_expert_ids[sample_idx * MAX_TOPK + a];
             float logit = gate_logits[sample_idx * num_experts + eid];
@@ -338,6 +360,7 @@ __global__ void moe_dynamic_expert_bwd_kernel(
             sum_exp += exp_val;
         }
         float inv_sum = 1.0f / (sum_exp + 1e-8f);
+        #pragma unroll 4
         for (int a = 0; a < n_active; a++) {
             s_gate_softmax[a] *= inv_sum;
         }
@@ -345,6 +368,7 @@ __global__ void moe_dynamic_expert_bwd_kernel(
     __syncthreads();
 
     // Forward recomputation and backward for each active expert
+    #pragma unroll 4
     for (int a = 0; a < n_active; a++) {
         int expert_id = active_expert_ids[sample_idx * MAX_TOPK + a];
         float gate_w = s_gate_softmax[a];
@@ -354,8 +378,10 @@ __global__ void moe_dynamic_expert_bwd_kernel(
         int base_b2 = (sample_idx * MAX_TOPK + a) * input_dim;
 
         // Recompute hidden = ReLU(W1 * input + b1)
+        #pragma unroll 4
         for (int h = tid; h < expert_dim; h += block_size) {
             float acc = loaded_b1[base_b1 + h];
+            #pragma unroll 4
             for (int d = 0; d < input_dim; d++) {
                 acc += loaded_W1[base_w1 + h * input_dim + d] * s_input[d];
             }
@@ -364,8 +390,10 @@ __global__ void moe_dynamic_expert_bwd_kernel(
         __syncthreads();
 
         // Compute per-expert output for gate gradient: expert_out = W2 * hidden + b2
+        #pragma unroll 4
         for (int d = tid; d < input_dim; d += block_size) {
             float acc = loaded_b2[base_b2 + d];
+            #pragma unroll 4
             for (int h = 0; h < expert_dim; h++) {
                 acc += loaded_W2[base_w2 + d * expert_dim + h] * s_hidden[h];
             }
@@ -375,6 +403,7 @@ __global__ void moe_dynamic_expert_bwd_kernel(
 
         // grad_W2: outer product of grad_output (scaled by gate) and hidden
         // Uses shared memory reduction
+        #pragma unroll 4
         for (int i = tid; i < input_dim * expert_dim; i += block_size) {
             int d = i / expert_dim;
             int h = i % expert_dim;
@@ -384,19 +413,23 @@ __global__ void moe_dynamic_expert_bwd_kernel(
         __syncthreads();
 
         // Atomically accumulate W2 gradients to global memory
+        #pragma unroll 4
         for (int i = tid; i < input_dim * expert_dim; i += block_size) {
             atomicAdd(&grad_W2[expert_id * input_dim * expert_dim + i], s_grad_w_reduce[i]);
         }
 
         // grad_b2: sum of grad_output scaled by gate weight
+        #pragma unroll 4
         for (int d = tid; d < input_dim; d += block_size) {
             atomicAdd(&grad_b2[expert_id * input_dim + d], gate_w * s_grad_out[d]);
         }
 
         // Backprop through W2 to get grad_hidden
         // grad_hidden[h] = sum_d(gate_w * grad_out[d] * W2[d, h]) * relu_mask
+        #pragma unroll 4
         for (int h = tid; h < expert_dim; h += block_size) {
             float acc = 0.0f;
+            #pragma unroll 4
             for (int d = 0; d < input_dim; d++) {
                 acc += s_grad_out[d] * loaded_W2[base_w2 + d * expert_dim + h];
             }
@@ -407,6 +440,7 @@ __global__ void moe_dynamic_expert_bwd_kernel(
             atomicAdd(&grad_b1[expert_id * expert_dim + h], grad_h);
 
             // grad_W1: outer product of grad_hidden and input
+            #pragma unroll 4
             for (int d = 0; d < input_dim; d++) {
                 atomicAdd(&grad_W1[expert_id * expert_dim * input_dim + h * input_dim + d],
                           grad_h * s_input[d]);
@@ -417,20 +451,24 @@ __global__ void moe_dynamic_expert_bwd_kernel(
 
     // Compute gate gradient: d_loss/d_gate_logit_i
     // For softmax: d_loss/d_z_i = sum_j (g_i * (delta_ij - g_j)) * dot(grad_out, expert_out_j)
+    #pragma unroll 4
     for (int a = tid; a < n_active; a += block_size) {
         int eid = active_expert_ids[sample_idx * MAX_TOPK + a];
         float g_a = s_gate_softmax[a];
 
         // Compute dot(grad_output, expert_output_a)
         float dot_a = 0.0f;
+        #pragma unroll 4
         for (int d = 0; d < input_dim; d++) {
             dot_a += s_grad_out[d] * s_expert_output[a * input_dim + d];
         }
 
         // Compute weighted sum of all dots
         float weighted_sum = 0.0f;
+        #pragma unroll 4
         for (int b = 0; b < n_active; b++) {
             float dot_b = 0.0f;
+            #pragma unroll 4
             for (int d = 0; d < input_dim; d++) {
                 dot_b += s_grad_out[d] * s_expert_output[b * input_dim + d];
             }
@@ -470,6 +508,7 @@ __global__ void moe_filter_active_params_kernel(
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = blockDim.x * gridDim.x;
 
+    #pragma unroll 4
     for (int i = tid; i < total_params; i += stride) {
         int expert_id = param_to_expert[i];
         if (expert_id >= 0 && expert_active[expert_id]) {
@@ -528,8 +567,10 @@ __global__ void moe_scan_compacted_kernel(
 
     // Load per-d_inner constants
     float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         A[s] = -expf(A_log[j * d_state + s]);
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++)
         freq[p] = rope_freq[j * half_d_state + p];
     float D_val = D_param[j];
@@ -537,9 +578,11 @@ __global__ void moe_scan_compacted_kernel(
     // Load initial state
     float h_init_all[MAX_D_STATE];
     if (initial_state != nullptr) {
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++)
             h_init_all[s] = initial_state[j * d_state + s];
     } else {
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++)
             h_init_all[s] = 0.0f;
     }
@@ -563,6 +606,7 @@ __global__ void moe_scan_compacted_kernel(
     } while(0)
 
     // Process each state pair
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++) {
         const int s_e = 2 * p;
         const int s_o = 2 * p + 1;
@@ -573,6 +617,7 @@ __global__ void moe_scan_compacted_kernel(
 
         // Step 1: Sequential scan within chunk -> chunk summary
         Affine2x2 summary = affine_identity();
+        #pragma unroll 4
         for (int step = 0; step < my_count; step++) {
             int t = my_start + step;
             Affine2x2 elem;
@@ -589,6 +634,7 @@ __global__ void moe_scan_compacted_kernel(
 
         // Step 2: Blelloch exclusive prefix scan on chunk summaries
         // Up-sweep (reduction)
+        #pragma unroll 4
         for (int stride = 1; stride < num_threads; stride *= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -618,6 +664,7 @@ __global__ void moe_scan_compacted_kernel(
         __syncthreads();
 
         // Down-sweep
+        #pragma unroll 4
         for (int stride = num_threads / 2; stride >= 1; stride /= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -651,6 +698,7 @@ __global__ void moe_scan_compacted_kernel(
         float h_o = prefix.m10 * h_init_e + prefix.m11 * h_init_o + prefix.b1;
 
         // Sequential scan within chunk using prefix
+        #pragma unroll 4
         for (int step = 0; step < my_count; step++) {
             int t = my_start + step;
             Affine2x2 elem;
@@ -681,6 +729,7 @@ __global__ void moe_scan_compacted_kernel(
     #undef MOE_BUILD_AFFINE
 
     // Add D * x[t] skip connection
+    #pragma unroll 4
     for (int step = 0; step < my_count; step++) {
         int t = my_start + step;
         float x_val = compact_x[t * d_inner + j];
@@ -710,6 +759,7 @@ __global__ void moe_scatter_results_kernel(
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = blockDim.x * gridDim.x;
 
+    #pragma unroll 4
     for (int i = tid; i < compact_N; i += stride) {
         int orig_idx = scatter_indices[i];
 
@@ -748,14 +798,17 @@ __global__ void moe_count_expert_activations_kernel(
     extern __shared__ int s_counts[];
 
     // Initialize shared histogram
+    #pragma unroll 4
     for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
         s_counts[e] = 0;
     }
     __syncthreads();
 
     // Each thread processes multiple parameters
+    #pragma unroll 4
     for (int i = tid; i < N; i += stride) {
         // Find which experts are active for this parameter
+        #pragma unroll 4
         for (int e = 0; e < num_experts; e++) {
             float logit = gate_logits[i * num_experts + e];
             if (logit > threshold) {
@@ -766,6 +819,7 @@ __global__ void moe_count_expert_activations_kernel(
     __syncthreads();
 
     // Flush shared histogram to global memory
+    #pragma unroll 4
     for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
         if (s_counts[e] > 0) {
             atomicAdd(&expert_counts[e], s_counts[e]);
@@ -803,25 +857,30 @@ __global__ void moe_compute_load_balance_loss_kernel(
 
     // Step 1: Compute mean gate probability per expert P_i = (1/N) * sum_n softmax(gate_logits[n])_i
     // Initialize accumulator
+    #pragma unroll 4
     for (int e = tid; e < num_experts; e += block_size) {
         s_gate_prob_sum[e] = 0.0f;
     }
     __syncthreads();
 
     // Each thread processes a subset of samples
+    #pragma unroll 4
     for (int n = tid; n < N; n += block_size) {
         // Compute softmax for this sample
         float max_logit = -1e30f;
+        #pragma unroll 4
         for (int e = 0; e < num_experts; e++) {
             float logit = gate_logits[n * num_experts + e];
             if (logit > max_logit) max_logit = logit;
         }
         float sum_exp = 0.0f;
+        #pragma unroll 4
         for (int e = 0; e < num_experts; e++) {
             sum_exp += expf(gate_logits[n * num_experts + e] - max_logit);
         }
         float inv_sum = 1.0f / (sum_exp + 1e-8f);
 
+        #pragma unroll 4
         for (int e = 0; e < num_experts; e++) {
             float prob = expf(gate_logits[n * num_experts + e] - max_logit) * inv_sum;
             atomicAdd(&s_gate_prob_sum[e], prob);
@@ -832,6 +891,7 @@ __global__ void moe_compute_load_balance_loss_kernel(
     // Step 2: Compute L_balance = num_experts * sum_i(f_i * P_i)
     float local_loss = 0.0f;
     float inv_N = 1.0f / (float)(N > 0 ? N : 1);
+    #pragma unroll 4
     for (int e = tid; e < num_experts; e += block_size) {
         float f_i = (float)expert_counts[e] * inv_N;    // fraction of tokens routed to expert i
         float P_i = s_gate_prob_sum[e] * inv_N;          // mean gate probability for expert i
@@ -842,6 +902,7 @@ __global__ void moe_compute_load_balance_loss_kernel(
     s_partial_loss[tid] = local_loss;
     __syncthreads();
 
+    #pragma unroll 4
     for (int s = block_size / 2; s > 0; s >>= 1) {
         if (tid < s) {
             s_partial_loss[tid] += s_partial_loss[tid + s];
@@ -882,6 +943,7 @@ __global__ void moe_apply_frequency_scaling_kernel(
     float expected_freq = 1.0f / (float)num_experts;
     float inv_total = 1.0f / (float)(total_activations > 0 ? total_activations : 1);
 
+    #pragma unroll 4
     for (int e = tid; e < num_experts; e += stride) {
         float actual_freq = (float)expert_counts[e] * inv_total;
 

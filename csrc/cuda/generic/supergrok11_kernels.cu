@@ -61,10 +61,13 @@ __global__ void fused_sg11_mu_metanet_kernel(
     const int tid = threadIdx.x;
 
     // Cooperative load of weights into shared memory
+    #pragma unroll 4
     for (int i = tid; i < H * 2; i += blockDim.x)
         sW1[i] = W1[i];
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         sb1[i] = b1[i];
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         sW2[i] = W2[i];
     if (tid == 0)
@@ -85,6 +88,7 @@ __global__ void fused_sg11_mu_metanet_kernel(
     // ── 2. Meta-net inference: Linear(2,H) → GELU → Linear(H,1) ─────
     float mlp_out = 0.0f;
 
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         // Linear(2, H): z = W1[h,0]*g + W1[h,1]*s + b1[h]
         float z = sW1[h * 2] * g + sW1[h * 2 + 1] * s + sb1[h];
@@ -338,6 +342,7 @@ __global__ void cosine_gate_reduce_kernel(
     float dot_acc = 0.0f, sg_sq_acc = 0.0f, mu_sq_acc = 0.0f;
 
     // Grid-stride loop
+    #pragma unroll 4
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += blockDim.x * gridDim.x) {
         float sg = smart_grad[i];
         float m = mu[i];
@@ -347,6 +352,7 @@ __global__ void cosine_gate_reduce_kernel(
     }
 
     // Warp shuffle reduction
+    #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
         dot_acc += SHFL_DOWN(dot_acc, offset);
         sg_sq_acc += SHFL_DOWN(sg_sq_acc, offset);
@@ -630,8 +636,11 @@ __global__ void fused_sg11_full_step_kernel(
     const int tid = threadIdx.x;
 
     // Cooperative weight load
+    #pragma unroll 4
     for (int i = tid; i < H * 2; i += blockDim.x) sW1[i] = W1[i];
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x) sb1[i] = b1[i];
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x) sW2[i] = W2[i];
     if (tid == 0) sb2[0] = b2[0];
     __syncthreads();
@@ -650,6 +659,7 @@ __global__ void fused_sg11_full_step_kernel(
 
     // ── 3. Meta-net: Linear(2,H) → GELU → Linear(H,1) ─────────
     float mlp_out = 0.0f;
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         float z = sW1[h * 2] * g + sW1[h * 2 + 1] * s + sb1[h];
         // Fast GELU: sigmoid approximation (~2.5x faster, max error ~0.004)

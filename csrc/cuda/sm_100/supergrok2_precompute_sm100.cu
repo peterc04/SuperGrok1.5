@@ -89,6 +89,7 @@ __global__ void compute_absmax_kernel(const float* __restrict__ data, float* __r
     __shared__ float smem[256];
     float local_max = 0.0f;
 
+    #pragma unroll 4
     for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < N; i += blockDim.x * gridDim.x) {
         local_max = fmaxf(local_max, fabsf(data[i]));
     }
@@ -97,6 +98,7 @@ __global__ void compute_absmax_kernel(const float* __restrict__ data, float* __r
     __syncthreads();
 
     // Warp reduce
+    #pragma unroll 4
     for (int s = 128; s > 0; s >>= 1) {
         if (threadIdx.x < s) {
             smem[threadIdx.x] = fmaxf(smem[threadIdx.x], smem[threadIdx.x + s]);

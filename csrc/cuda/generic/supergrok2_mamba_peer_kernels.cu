@@ -64,6 +64,7 @@ __global__ void input_proj_sort_kernel(
     if (!isfinite(g)) g = 0.0f;
     if (!isfinite(s)) s = 0.0f;
 
+    #pragma unroll 4
     for (int d = 0; d < d_model; d++) {
         x_out[idx * d_model + d] = proj_W[d * 2] * g + proj_W[d * 2 + 1] * s + proj_b[d];
     }
@@ -124,14 +125,19 @@ __global__ void mamba3_scan_kernel(
     float* s_C_proj_W = s_B_proj_W + d_state*d_inner;      // d_state * d_inner
 
     // Cooperatively load all projection weights into shared memory
+    #pragma unroll 4
     for (int i = tid; i < 2*d_inner*d_model; i += d_inner)
         s_in_proj_W[i] = in_proj_W[i];
+    #pragma unroll 4
     for (int i = tid; i < d_inner*d_inner; i += d_inner)
         s_dt_proj_W[i] = dt_proj_W[i];
+    #pragma unroll 4
     for (int i = tid; i < d_inner; i += d_inner)
         s_dt_proj_b[i] = dt_proj_b[i];
+    #pragma unroll 4
     for (int i = tid; i < d_state*d_inner; i += d_inner)
         s_B_proj_W[i] = B_proj_W[i];
+    #pragma unroll 4
     for (int i = tid; i < d_state*d_inner; i += d_inner)
         s_C_proj_W[i] = C_proj_W[i];
     __syncthreads();
@@ -140,26 +146,32 @@ __global__ void mamba3_scan_kernel(
     float h[MAX_D_STATE];
     float h_snap[MAX_D_STATE]; // snapshot for RoPE (fixes read-after-write)
     if (initial_state != nullptr) {
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) h[s] = initial_state[tid * d_state + s];
     } else {
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) h[s] = 0.0f;
     }
 
     const int half_d_state = d_state / 2;
     float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++) {
         A[s] = -fast_exp_ptx(A_log[tid * d_state + s]);
     }
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++) {
         freq[p] = rope_freq[tid * half_d_state + p];
     }
     float D_val = D_param[tid];
 
+    #pragma unroll 4
     for (int step = 0; step < N; step++) {
         int i = reverse ? (N - 1 - step) : step;
 
         // Input projection: each thread computes its own x and z (shared memory weights)
         float x_val = 0.0f, z_val = 0.0f;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             float inp = x_sorted[i * d_model + d];
             x_val += s_in_proj_W[tid * d_model + d] * inp;
@@ -172,20 +184,24 @@ __global__ void mamba3_scan_kernel(
 
         // FULL dt projection: dt[tid] = sum_j(dt_proj_W[tid, j] * x_branch[j]) + dt_proj_b[tid]
         float dt_raw = s_dt_proj_b[tid];
+        #pragma unroll 4
         for (int j = 0; j < d_inner; j++) {
             dt_raw += s_dt_proj_W[tid * d_inner + j] * s_x_branch[j];
         }
         float dt_val = softplus_ptx(dt_raw);
 
         // Snapshot h for RoPE (fixes read-after-write)
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
 
         // State update with trapezoidal + paired RoPE
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) {
             float A_bar = (1.0f + dt_val * A[s] / 2.0f) / (1.0f - dt_val * A[s] / 2.0f + 1e-8f);
 
             // FULL B projection: B[s] = sum_j(B_proj_W[s, j] * x_branch[j])
             float B_val = 0.0f;
+            #pragma unroll 4
             for (int j = 0; j < d_inner; j++) {
                 B_val += s_B_proj_W[s * d_inner + j] * s_x_branch[j];
             }
@@ -208,8 +224,10 @@ __global__ void mamba3_scan_kernel(
         // FULL C projection for output: y = sum_s(h[s] * C[s])
         // C[s] = sum_j(C_proj_W[s, j] * x_branch[j])
         float y_val = 0.0f;
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) {
             float C_val = 0.0f;
+            #pragma unroll 4
             for (int j = 0; j < d_inner; j++) {
                 C_val += s_C_proj_W[s * d_inner + j] * s_x_branch[j];
             }
@@ -224,6 +242,7 @@ __global__ void mamba3_scan_kernel(
         __syncthreads(); // ensure all threads done before next step
     }
 
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         final_state[tid * d_state + s] = h[s];
 }
@@ -266,13 +285,16 @@ __global__ void mamba3_parallel_precompute_kernel(
 
     // Load input for this timestep
     float inp[MAX_D_MODEL];
+    #pragma unroll 4
     for (int d = 0; d < d_model; d++)
         inp[d] = x_sorted[t * d_model + d];
 
     // Compute x_val[j] and z_val[j] for all d_inner
     float x_branch[MAX_D_INNER];
+    #pragma unroll 4
     for (int j = 0; j < d_inner; j++) {
         float x_val = 0.0f, z_val = 0.0f;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             x_val += in_proj_W[j * d_model + d] * inp[d];
             z_val += in_proj_W[(j + d_inner) * d_model + d] * inp[d];
@@ -283,8 +305,10 @@ __global__ void mamba3_parallel_precompute_kernel(
     }
 
     // Compute dt_val[j] for all d_inner (full projection: dt = softplus(W @ x + b))
+    #pragma unroll 4
     for (int j = 0; j < d_inner; j++) {
         float dt_raw = dt_proj_b[j];
+        #pragma unroll 4
         for (int k = 0; k < d_inner; k++)
             dt_raw += dt_proj_W[j * d_inner + k] * x_branch[k];
         float dt_val = softplus_ptx(dt_raw);
@@ -292,8 +316,10 @@ __global__ void mamba3_parallel_precompute_kernel(
     }
 
     // Compute B_val[s] and C_val[s] for all d_state
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++) {
         float B_val = 0.0f, C_val = 0.0f;
+        #pragma unroll 4
         for (int j = 0; j < d_inner; j++) {
             B_val += B_proj_W[s * d_inner + j] * x_branch[j];
             C_val += C_proj_W[s * d_inner + j] * x_branch[j];
@@ -364,8 +390,10 @@ __global__ void mamba3_parallel_scan_kernel(
 
     // Load per-d_inner constants
     float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         A[s] = -fast_exp_ptx(A_log[j * d_state + s]);
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++)
         freq[p] = rope_freq[j * half_d_state + p];
     float D_val = D_param[j];
@@ -373,9 +401,11 @@ __global__ void mamba3_parallel_scan_kernel(
     // Load initial state (read-only throughout)
     float h_init_all[MAX_D_STATE];
     if (initial_state != nullptr) {
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++)
             h_init_all[s] = initial_state[j * d_state + s];
     } else {
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++)
             h_init_all[s] = 0.0f;
     }
@@ -400,6 +430,7 @@ __global__ void mamba3_parallel_scan_kernel(
     } while(0)
 
     // Process each pair sequentially
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++) {
         const int s_e = 2 * p;
         const int s_o = 2 * p + 1;
@@ -410,6 +441,7 @@ __global__ void mamba3_parallel_scan_kernel(
 
         // === Step 1: Sequential scan within chunk → get chunk summary ===
         Affine2x2 summary = affine_identity();
+        #pragma unroll 4
         for (int step = 0; step < my_count; step++) {
             int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
             Affine2x2 elem;
@@ -430,6 +462,7 @@ __global__ void mamba3_parallel_scan_kernel(
         // in lockstep, so __syncthreads() is only needed when stride*2 crosses
         // the warp/wavefront boundary. On NVIDIA (WARP_SIZE=32) this skips
         // strides 1-16; on AMD CDNA (WARP_SIZE=64) this skips strides 1-32.
+        #pragma unroll 4
         for (int stride = 1; stride < num_threads; stride *= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -460,6 +493,7 @@ __global__ void mamba3_parallel_scan_kernel(
 
         // Down-sweep
         // Same WARP_SIZE-aware sync skip as up-sweep.
+        #pragma unroll 4
         for (int stride = num_threads / 2; stride >= 1; stride /= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -490,6 +524,7 @@ __global__ void mamba3_parallel_scan_kernel(
 
         // === Step 3: Re-scan chunk with prefix, compute output ===
         Affine2x2 running = prefix;
+        #pragma unroll 4
         for (int step = 0; step < my_count; step++) {
             int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
 
@@ -521,6 +556,7 @@ __global__ void mamba3_parallel_scan_kernel(
     #undef BUILD_AFFINE
 
     // === Phase C: Apply SiLU gating and D skip connection ===
+    #pragma unroll 4
     for (int step = 0; step < my_count; step++) {
         int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
         float z = pre_z_val[t * d_inner + j];
@@ -587,8 +623,10 @@ __global__ void mamba3_parallel_scan_batched_kernel(
 
     // Load per-d_inner constants
     float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         A[s] = -fast_exp_ptx(A_log[j * d_state + s]);
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++)
         freq[p] = rope_freq[j * half_d_state + p];
     float D_val = D_param[j];
@@ -596,6 +634,7 @@ __global__ void mamba3_parallel_scan_batched_kernel(
     // Load initial state for this param
     float h_init_all[MAX_D_STATE];
     const float* init_ptr = initial_states + param_idx * d_inner * d_state;
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         h_init_all[s] = init_ptr[j * d_state + s];
 
@@ -628,6 +667,7 @@ __global__ void mamba3_parallel_scan_batched_kernel(
     } while(0)
 
     // Process each pair sequentially
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++) {
         const int s_e = 2 * p;
         const int s_o = 2 * p + 1;
@@ -638,6 +678,7 @@ __global__ void mamba3_parallel_scan_batched_kernel(
 
         // === Step 1: Sequential scan within chunk → get chunk summary ===
         Affine2x2 summary = affine_identity();
+        #pragma unroll 4
         for (int step = 0; step < my_count; step++) {
             int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
             Affine2x2 elem;
@@ -658,6 +699,7 @@ __global__ void mamba3_parallel_scan_batched_kernel(
         // in lockstep, so __syncthreads() is only needed when stride*2 crosses
         // the warp/wavefront boundary. On NVIDIA (WARP_SIZE=32) this skips
         // strides 1-16; on AMD CDNA (WARP_SIZE=64) this skips strides 1-32.
+        #pragma unroll 4
         for (int stride = 1; stride < num_threads; stride *= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -688,6 +730,7 @@ __global__ void mamba3_parallel_scan_batched_kernel(
 
         // Down-sweep
         // Same WARP_SIZE-aware sync skip as up-sweep.
+        #pragma unroll 4
         for (int stride = num_threads / 2; stride >= 1; stride /= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -718,6 +761,7 @@ __global__ void mamba3_parallel_scan_batched_kernel(
 
         // === Step 3: Re-scan chunk with prefix, compute output ===
         Affine2x2 running = prefix;
+        #pragma unroll 4
         for (int step = 0; step < my_count; step++) {
             int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
 
@@ -749,6 +793,7 @@ __global__ void mamba3_parallel_scan_batched_kernel(
     #undef BUILD_AFFINE_BAT
 
     // === Phase C: Apply SiLU gating and D skip connection ===
+    #pragma unroll 4
     for (int step = 0; step < my_count; step++) {
         int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
         float z = my_pre_z[t * d_inner + j];
@@ -853,6 +898,7 @@ __global__ void fused_elem_step_kernel(
     const int block_size = blockDim.x;
 
     // Load out_proj weights
+    #pragma unroll 4
     for (int i = tid; i < 2 * op_size; i += block_size) {
         if (i < op_size)
             smem[i] = out_proj_fwd_W[i];
@@ -865,17 +911,21 @@ __global__ void fused_elem_step_kernel(
     const float* gru_gmem[] = {gru_Wz, gru_Wr, gru_Wh, gru_bz, gru_br, gru_bh};
     int gru_sizes[] = {gru_mat_size, gru_mat_size, gru_mat_size, gru_hidden, gru_hidden, gru_hidden};
     int gru_offset = 0;
+    #pragma unroll
     for (int seg = 0; seg < 6; seg++) {
+        #pragma unroll 4
         for (int i = tid; i < gru_sizes[seg]; i += block_size)
             gru_smem_start[gru_offset + i] = gru_gmem[seg][i];
         gru_offset += gru_sizes[seg];
     }
     // Load expert weights
+    #pragma unroll 4
     for (int i = tid; i < num_experts * expert_hidden; i += block_size) {
         s_expert_W1[i] = expert_W1[i];
         s_expert_b1[i] = expert_b1[i];
         s_expert_W2[i] = expert_W2[i];
     }
+    #pragma unroll 4
     for (int i = tid; i < num_experts; i += block_size) {
         s_expert_b2[i] = expert_b2[i];
     }
@@ -897,6 +947,7 @@ __global__ void fused_elem_step_kernel(
     // Preload scan outputs with float4 vectorized loads
     float fwd_scan[MAX_D_INNER];
     float bwd_scan[MAX_D_INNER];
+    #pragma unroll 4
     for (int j = 0; j < d_inner; j += 4) {
         float4 fwd4 = *reinterpret_cast<const float4*>(&fwd_scan_out[idx * d_inner + j]);
         float4 bwd4 = *reinterpret_cast<const float4*>(&bwd_scan_out[idx * d_inner + j]);
@@ -905,8 +956,10 @@ __global__ void fused_elem_step_kernel(
     }
 
     float fwd_ctx[MAX_D_MODEL], bwd_ctx[MAX_D_MODEL];
+    #pragma unroll 4
     for (int d = 0; d < d_model; d++) {
         float fwd_val = 0.0f, bwd_val = 0.0f;
+        #pragma unroll 4
         for (int j = 0; j < d_inner; j++) {
             fwd_val += s_out_fwd[d * d_inner + j] * fwd_scan[j];
             bwd_val += s_out_bwd[d * d_inner + j] * bwd_scan[j];
@@ -917,6 +970,7 @@ __global__ void fused_elem_step_kernel(
 
     // 2. GRU update (using shared memory weights)
     float h_old[MAX_GRU_HIDDEN];
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++) {
         // GRU state is optimizer state — non-temporal load to avoid L2 pollution
         h_old[j] = stream_load(&gru_state[idx * gru_hidden + j]);
@@ -924,6 +978,7 @@ __global__ void fused_elem_step_kernel(
 
     float h_new[MAX_GRU_HIDDEN];
     float z_gate[MAX_GRU_HIDDEN], r_gate[MAX_GRU_HIDDEN];
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++) {
         float val_z = s_gru_bz[j];
         float val_r = s_gru_br[j];
@@ -933,16 +988,19 @@ __global__ void fused_elem_step_kernel(
         val_r += s_gru_Wr[j * gru_row_len + 0] * g;
         val_r += s_gru_Wr[j * gru_row_len + 1] * s;
         offset = 2;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             val_z += s_gru_Wz[j * gru_row_len + offset + d] * fwd_ctx[d];
             val_r += s_gru_Wr[j * gru_row_len + offset + d] * fwd_ctx[d];
         }
         offset += d_model;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             val_z += s_gru_Wz[j * gru_row_len + offset + d] * bwd_ctx[d];
             val_r += s_gru_Wr[j * gru_row_len + offset + d] * bwd_ctx[d];
         }
         offset += d_model;
+        #pragma unroll 4
         for (int k = 0; k < gru_hidden; k++) {
             val_z += s_gru_Wz[j * gru_row_len + offset + k] * h_old[k];
             val_r += s_gru_Wr[j * gru_row_len + offset + k] * h_old[k];
@@ -951,18 +1009,22 @@ __global__ void fused_elem_step_kernel(
     }
 
     // Candidate: h_tilde = tanh(Wh @ [x, r*h] + bh)
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++) {
         float val = s_gru_bh[j];
         int offset = 0;
         val += s_gru_Wh[j * gru_row_len + 0] * g;
         val += s_gru_Wh[j * gru_row_len + 1] * s;
         offset = 2;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++)
             val += s_gru_Wh[j * gru_row_len + offset + d] * fwd_ctx[d];
         offset += d_model;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++)
             val += s_gru_Wh[j * gru_row_len + offset + d] * bwd_ctx[d];
         offset += d_model;
+        #pragma unroll 4
         for (int k = 0; k < gru_hidden; k++)
             val += s_gru_Wh[j * gru_row_len + offset + k] * (r_gate[k] * h_old[k]);
         float h_tilde = tanhf(val);
@@ -970,6 +1032,7 @@ __global__ void fused_elem_step_kernel(
     }
 
     // Write GRU state — non-temporal store (optimizer state)
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++) {
         stream_store(&gru_state[idx * gru_hidden + j], h_new[j]);
     }
@@ -977,22 +1040,27 @@ __global__ void fused_elem_step_kernel(
     // 3. Multi-head PEER routing + expert evaluation
     float total_out = 0.0f;
 
+    #pragma unroll 4
     for (int head = 0; head < num_heads; head++) {
         // Compute query for this head
         const float* pq_W = peer_query_Ws + head * d_model * peer_input_dim;
         float query[MAX_D_MODEL];
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             float val = 0.0f;
             int off = 0;
             // h_new part
+            #pragma unroll 4
             for (int k = 0; k < gru_hidden; k++)
                 val += pq_W[d * peer_input_dim + off + k] * h_new[k];
             off += gru_hidden;
             // fwd_ctx
+            #pragma unroll 4
             for (int k = 0; k < d_model; k++)
                 val += pq_W[d * peer_input_dim + off + k] * fwd_ctx[k];
             off += d_model;
             // bwd_ctx
+            #pragma unroll 4
             for (int k = 0; k < d_model; k++)
                 val += pq_W[d * peer_input_dim + off + k] * bwd_ctx[k];
             off += d_model;
@@ -1008,8 +1076,10 @@ __global__ void fused_elem_step_kernel(
 
         int best_a = 0;
         float best_score_a = -1e30f;
+        #pragma unroll 4
         for (int k = 0; k < pk_dim; k++) {
             float dot = 0.0f;
+            #pragma unroll 4
             for (int d = 0; d < half_d; d++)
                 dot += query[d] * LDG(&keys_A[k * half_d + d]);
             if (dot > best_score_a) { best_score_a = dot; best_a = k; }
@@ -1017,8 +1087,10 @@ __global__ void fused_elem_step_kernel(
 
         int best_b = 0;
         float best_score_b = -1e30f;
+        #pragma unroll 4
         for (int k = 0; k < pk_dim; k++) {
             float dot = 0.0f;
+            #pragma unroll 4
             for (int d = 0; d < half_d; d++)
                 dot += query[half_d + d] * LDG(&keys_B[k * half_d + d]);
             if (dot > best_score_b) { best_score_b = dot; best_b = k; }
@@ -1032,6 +1104,7 @@ __global__ void fused_elem_step_kernel(
         // Expert MLP: z = relu(W1 * g + b1), out = W2 @ z + b2
         // Use shared memory for expert weight reads
         float head_out = s_expert_b2[expert_idx];
+        #pragma unroll 4
         for (int h = 0; h < expert_hidden; h++) {
             float z_val = s_expert_W1[expert_idx * expert_hidden + h] * g
                         + s_expert_b1[expert_idx * expert_hidden + h];
@@ -1138,6 +1211,7 @@ __global__ void fused_elem_step_int8_kernel(
     const int block_size = blockDim.x;
 
     // Load out_proj weights (FP32, unchanged)
+    #pragma unroll 4
     for (int i = tid; i < 2 * op_size; i += block_size) {
         if (i < op_size) smem[i] = out_proj_fwd_W[i];
         else smem[i] = out_proj_bwd_W[i - op_size];
@@ -1147,17 +1221,21 @@ __global__ void fused_elem_step_int8_kernel(
     int gru_sizes[] = {gru_mat_size, gru_mat_size, gru_mat_size, gru_hidden, gru_hidden, gru_hidden};
     float* gru_smem_start = s_gru_Wz;
     int gru_offset = 0;
+    #pragma unroll
     for (int seg = 0; seg < 6; seg++) {
+        #pragma unroll 4
         for (int i = tid; i < gru_sizes[seg]; i += block_size)
             gru_smem_start[gru_offset + i] = gru_gmem[seg][i];
         gru_offset += gru_sizes[seg];
     }
     // INT8 dequantize expert weights on load into shared memory
+    #pragma unroll 4
     for (int i = tid; i < num_experts * expert_hidden; i += block_size) {
         s_expert_W1[i] = static_cast<float>(expert_W1_q[i]) * expert_W1_scale;
         s_expert_b1[i] = static_cast<float>(expert_b1_q[i]) * expert_b1_scale;
         s_expert_W2[i] = static_cast<float>(expert_W2_q[i]) * expert_W2_scale;
     }
+    #pragma unroll 4
     for (int i = tid; i < num_experts; i += block_size) {
         s_expert_b2[i] = static_cast<float>(expert_b2_q[i]) * expert_b2_scale;
     }
@@ -1177,13 +1255,16 @@ __global__ void fused_elem_step_int8_kernel(
 
     // 1. Mamba out_proj
     float fwd_scan[MAX_D_INNER], bwd_scan[MAX_D_INNER];
+    #pragma unroll 4
     for (int j = 0; j < d_inner; j++) {
         fwd_scan[j] = fwd_scan_out[idx * d_inner + j];
         bwd_scan[j] = bwd_scan_out[idx * d_inner + j];
     }
     float fwd_ctx[MAX_D_MODEL], bwd_ctx[MAX_D_MODEL];
+    #pragma unroll 4
     for (int d = 0; d < d_model; d++) {
         float fv = 0.0f, bv = 0.0f;
+        #pragma unroll 4
         for (int j = 0; j < d_inner; j++) {
             fv += s_out_fwd[d * d_inner + j] * fwd_scan[j];
             bv += s_out_bwd[d * d_inner + j] * bwd_scan[j];
@@ -1193,48 +1274,63 @@ __global__ void fused_elem_step_int8_kernel(
 
     // 2. GRU update
     float h_old[MAX_GRU_HIDDEN], h_new[MAX_GRU_HIDDEN];
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++) h_old[j] = stream_load(&gru_state[idx * gru_hidden + j]);
 
     float z_gate[MAX_GRU_HIDDEN], r_gate[MAX_GRU_HIDDEN];
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++) {
         float val_z = s_gru_bz[j], val_r = s_gru_br[j];
         val_z += s_gru_Wz[j * gru_row_len] * g + s_gru_Wz[j * gru_row_len + 1] * s;
         val_r += s_gru_Wr[j * gru_row_len] * g + s_gru_Wr[j * gru_row_len + 1] * s;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             val_z += s_gru_Wz[j * gru_row_len + 2 + d] * fwd_ctx[d];
             val_r += s_gru_Wr[j * gru_row_len + 2 + d] * fwd_ctx[d];
         }
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             val_z += s_gru_Wz[j * gru_row_len + 2 + d_model + d] * bwd_ctx[d];
             val_r += s_gru_Wr[j * gru_row_len + 2 + d_model + d] * bwd_ctx[d];
         }
+        #pragma unroll 4
         for (int k = 0; k < gru_hidden; k++) {
             val_z += s_gru_Wz[j * gru_row_len + 2 + 2*d_model + k] * h_old[k];
             val_r += s_gru_Wr[j * gru_row_len + 2 + 2*d_model + k] * h_old[k];
         }
         gru_gates_ptx(val_z, 0.0f, val_r, 0.0f, z_gate[j], r_gate[j]);
     }
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++) {
         float val = s_gru_bh[j];
         val += s_gru_Wh[j * gru_row_len] * g + s_gru_Wh[j * gru_row_len + 1] * s;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) val += s_gru_Wh[j * gru_row_len + 2 + d] * fwd_ctx[d];
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) val += s_gru_Wh[j * gru_row_len + 2 + d_model + d] * bwd_ctx[d];
+        #pragma unroll 4
         for (int k = 0; k < gru_hidden; k++) val += s_gru_Wh[j * gru_row_len + 2 + 2*d_model + k] * (r_gate[k] * h_old[k]);
         h_new[j] = (1.0f - z_gate[j]) * h_old[j] + z_gate[j] * tanhf(val);
     }
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++) stream_store(&gru_state[idx * gru_hidden + j], h_new[j]);
 
     // 3. PEER routing + expert MLP (same compute, shared mem has dequantized weights)
     float total_out = 0.0f;
+    #pragma unroll 4
     for (int head = 0; head < num_heads; head++) {
         const float* pq_W = peer_query_Ws + head * d_model * peer_input_dim;
         float query[MAX_D_MODEL];
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             float val = 0.0f;
+            #pragma unroll 4
             for (int k = 0; k < gru_hidden; k++) val += pq_W[d * peer_input_dim + k] * h_new[k];
             int off = gru_hidden;
+            #pragma unroll 4
             for (int k = 0; k < d_model; k++) val += pq_W[d * peer_input_dim + off + k] * fwd_ctx[k];
             off += d_model;
+            #pragma unroll 4
             for (int k = 0; k < d_model; k++) val += pq_W[d * peer_input_dim + off + k] * bwd_ctx[k];
             off += d_model;
             val += pq_W[d * peer_input_dim + off] * g + pq_W[d * peer_input_dim + off + 1] * s;
@@ -1243,14 +1339,18 @@ __global__ void fused_elem_step_int8_kernel(
         const float* keys_A = prod_keys_A + head * pk_dim * half_d;
         const float* keys_B = prod_keys_B + head * pk_dim * half_d;
         int best_a = 0; float best_sa = -1e30f;
+        #pragma unroll 4
         for (int k = 0; k < pk_dim; k++) {
             float dot = 0.0f;
+            #pragma unroll 4
             for (int d = 0; d < half_d; d++) dot += query[d] * LDG(&keys_A[k * half_d + d]);
             if (dot > best_sa) { best_sa = dot; best_a = k; }
         }
         int best_b = 0; float best_sb = -1e30f;
+        #pragma unroll 4
         for (int k = 0; k < pk_dim; k++) {
             float dot = 0.0f;
+            #pragma unroll 4
             for (int d = 0; d < half_d; d++) dot += query[half_d + d] * LDG(&keys_B[k * half_d + d]);
             if (dot > best_sb) { best_sb = dot; best_b = k; }
         }
@@ -1258,6 +1358,7 @@ __global__ void fused_elem_step_int8_kernel(
         if (eidx >= num_experts) eidx = num_experts - 1;
         if (expert_counts) atomicAdd(&expert_counts[eidx], 1);
         float head_out = s_expert_b2[eidx];
+        #pragma unroll 4
         for (int h = 0; h < expert_hidden; h++) {
             float z_val = s_expert_W1[eidx * expert_hidden + h] * g + s_expert_b1[eidx * expert_hidden + h];
             z_val = fmaxf(z_val, 0.0f);
@@ -1356,6 +1457,7 @@ __global__ void fused_elem_step_int4_kernel(
     const int block_size = blockDim.x;
 
     // Load FP32 weights (out_proj, GRU)
+    #pragma unroll 4
     for (int i = tid; i < 2 * op_size; i += block_size) {
         if (i < op_size) smem[i] = out_proj_fwd_W[i];
         else smem[i] = out_proj_bwd_W[i - op_size];
@@ -1364,13 +1466,16 @@ __global__ void fused_elem_step_int4_kernel(
     int gru_sizes[] = {gru_mat_size, gru_mat_size, gru_mat_size, gru_hidden, gru_hidden, gru_hidden};
     float* gru_smem_start = s_gru_Wz;
     int goff = 0;
+    #pragma unroll
     for (int seg = 0; seg < 6; seg++) {
+        #pragma unroll 4
         for (int i = tid; i < gru_sizes[seg]; i += block_size)
             gru_smem_start[goff + i] = gru_gmem[seg][i];
         goff += gru_sizes[seg];
     }
     // INT4 dequantize: unpack 2 values per byte into shared memory
     const int exp_total = num_experts * expert_hidden;
+    #pragma unroll 4
     for (int i = tid; i < (exp_total + 1) / 2; i += block_size) {
         float lo, hi;
         unpack_int4(expert_W1_q[i], expert_W1_scale, lo, hi);
@@ -1383,6 +1488,7 @@ __global__ void fused_elem_step_int4_kernel(
         s_expert_W2[2*i] = lo;
         if (2*i + 1 < exp_total) s_expert_W2[2*i + 1] = hi;
     }
+    #pragma unroll 4
     for (int i = tid; i < (num_experts + 1) / 2; i += block_size) {
         float lo, hi;
         unpack_int4(expert_b2_q[i], expert_b2_scale, lo, hi);
@@ -1404,13 +1510,16 @@ __global__ void fused_elem_step_int4_kernel(
     const int peer_input_dim = gru_hidden + 2 * d_model + 2;
 
     float fwd_scan[MAX_D_INNER], bwd_scan[MAX_D_INNER];
+    #pragma unroll 4
     for (int j = 0; j < d_inner; j++) {
         fwd_scan[j] = fwd_scan_out[idx * d_inner + j];
         bwd_scan[j] = bwd_scan_out[idx * d_inner + j];
     }
     float fwd_ctx[MAX_D_MODEL], bwd_ctx[MAX_D_MODEL];
+    #pragma unroll 4
     for (int d = 0; d < d_model; d++) {
         float fv = 0.0f, bv = 0.0f;
+        #pragma unroll 4
         for (int j = 0; j < d_inner; j++) {
             fv += s_out_fwd[d * d_inner + j] * fwd_scan[j];
             bv += s_out_bwd[d * d_inner + j] * bwd_scan[j];
@@ -1419,37 +1528,52 @@ __global__ void fused_elem_step_int4_kernel(
     }
 
     float h_old[MAX_GRU_HIDDEN], h_new[MAX_GRU_HIDDEN];
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++) h_old[j] = stream_load(&gru_state[idx * gru_hidden + j]);
     float z_gate[MAX_GRU_HIDDEN], r_gate[MAX_GRU_HIDDEN];
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++) {
         float val_z = s_gru_bz[j], val_r = s_gru_br[j];
         val_z += s_gru_Wz[j*gru_row_len]*g + s_gru_Wz[j*gru_row_len+1]*s;
         val_r += s_gru_Wr[j*gru_row_len]*g + s_gru_Wr[j*gru_row_len+1]*s;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) { val_z += s_gru_Wz[j*gru_row_len+2+d]*fwd_ctx[d]; val_r += s_gru_Wr[j*gru_row_len+2+d]*fwd_ctx[d]; }
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) { val_z += s_gru_Wz[j*gru_row_len+2+d_model+d]*bwd_ctx[d]; val_r += s_gru_Wr[j*gru_row_len+2+d_model+d]*bwd_ctx[d]; }
+        #pragma unroll 4
         for (int k = 0; k < gru_hidden; k++) { val_z += s_gru_Wz[j*gru_row_len+2+2*d_model+k]*h_old[k]; val_r += s_gru_Wr[j*gru_row_len+2+2*d_model+k]*h_old[k]; }
         gru_gates_ptx(val_z, 0.0f, val_r, 0.0f, z_gate[j], r_gate[j]);
     }
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++) {
         float val = s_gru_bh[j];
         val += s_gru_Wh[j*gru_row_len]*g + s_gru_Wh[j*gru_row_len+1]*s;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) val += s_gru_Wh[j*gru_row_len+2+d]*fwd_ctx[d];
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) val += s_gru_Wh[j*gru_row_len+2+d_model+d]*bwd_ctx[d];
+        #pragma unroll 4
         for (int k = 0; k < gru_hidden; k++) val += s_gru_Wh[j*gru_row_len+2+2*d_model+k]*(r_gate[k]*h_old[k]);
         h_new[j] = (1.0f-z_gate[j])*h_old[j] + z_gate[j]*tanhf(val);
     }
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++) stream_store(&gru_state[idx*gru_hidden+j], h_new[j]);
 
     float total_out = 0.0f;
+    #pragma unroll 4
     for (int head = 0; head < num_heads; head++) {
         const float* pq_W = peer_query_Ws + head*d_model*peer_input_dim;
         float query[MAX_D_MODEL];
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             float val = 0.0f;
+            #pragma unroll 4
             for (int k = 0; k < gru_hidden; k++) val += pq_W[d*peer_input_dim+k]*h_new[k];
             int off = gru_hidden;
+            #pragma unroll 4
             for (int k = 0; k < d_model; k++) val += pq_W[d*peer_input_dim+off+k]*fwd_ctx[k];
             off += d_model;
+            #pragma unroll 4
             for (int k = 0; k < d_model; k++) val += pq_W[d*peer_input_dim+off+k]*bwd_ctx[k];
             off += d_model;
             val += pq_W[d*peer_input_dim+off]*g + pq_W[d*peer_input_dim+off+1]*s;
@@ -1458,13 +1582,16 @@ __global__ void fused_elem_step_int4_kernel(
         const float* keys_A = prod_keys_A + head*pk_dim*half_d;
         const float* keys_B = prod_keys_B + head*pk_dim*half_d;
         int best_a=0; float best_sa=-1e30f;
+        #pragma unroll 4
         for (int k=0; k<pk_dim; k++) { float dot=0; for(int d=0;d<half_d;d++) dot+=query[d]*LDG(&keys_A[k*half_d+d]); if(dot>best_sa){best_sa=dot;best_a=k;} }
         int best_b=0; float best_sb=-1e30f;
+        #pragma unroll 4
         for (int k=0; k<pk_dim; k++) { float dot=0; for(int d=0;d<half_d;d++) dot+=query[half_d+d]*LDG(&keys_B[k*half_d+d]); if(dot>best_sb){best_sb=dot;best_b=k;} }
         int eidx = best_a*pk_dim+best_b;
         if (eidx>=num_experts) eidx=num_experts-1;
         if (expert_counts) atomicAdd(&expert_counts[eidx],1);
         float head_out = s_expert_b2[eidx];
+        #pragma unroll 4
         for (int h=0; h<expert_hidden; h++) {
             float z_val = s_expert_W1[eidx*expert_hidden+h]*g + s_expert_b1[eidx*expert_hidden+h];
             z_val = fmaxf(z_val,0.0f);
@@ -1561,6 +1688,7 @@ __global__ void fused_elem_step_mxfp4_kernel(
     const int exp_total = num_experts * expert_hidden;
 
     // Load FP32 weights
+    #pragma unroll 4
     for (int i = tid; i < 2 * op_size; i += block_size) {
         if (i < op_size) smem[i] = out_proj_fwd_W[i];
         else smem[i] = out_proj_bwd_W[i - op_size];
@@ -1569,12 +1697,15 @@ __global__ void fused_elem_step_mxfp4_kernel(
     int gru_sizes[] = {gru_mat_size, gru_mat_size, gru_mat_size, gru_hidden, gru_hidden, gru_hidden};
     float* gru_smem_start = s_gru_Wz;
     int goff = 0;
+    #pragma unroll
     for (int seg = 0; seg < 6; seg++) {
+        #pragma unroll 4
         for (int i = tid; i < gru_sizes[seg]; i += block_size)
             gru_smem_start[goff + i] = gru_gmem[seg][i];
         goff += gru_sizes[seg];
     }
     // MXFP4 dequantize into shared memory
+    #pragma unroll 4
     for (int i = tid; i < (exp_total + 1) / 2; i += block_size) {
         uint8_t packed_w1 = expert_W1_q[i];
         uint8_t packed_b1 = expert_b1_q[i];
@@ -1589,6 +1720,7 @@ __global__ void fused_elem_step_mxfp4_kernel(
         s_expert_W2[2*i] = dequant_mxfp4_element(packed_w2 & 0x0F, exp_w2, mxfp4_scale);
         if (2*i+1 < exp_total) s_expert_W2[2*i+1] = dequant_mxfp4_element((packed_w2>>4)&0x0F, exp_w2, mxfp4_scale);
     }
+    #pragma unroll 4
     for (int i = tid; i < (num_experts + 1) / 2; i += block_size) {
         uint8_t packed = expert_b2_q[i];
         uint8_t exp_val = expert_b2_exp[2*i / 32];
@@ -1609,47 +1741,65 @@ __global__ void fused_elem_step_mxfp4_kernel(
     const int peer_input_dim = gru_hidden + 2 * d_model + 2;
 
     float fwd_scan[MAX_D_INNER], bwd_scan[MAX_D_INNER];
+    #pragma unroll 4
     for (int j = 0; j < d_inner; j++) {
         fwd_scan[j] = fwd_scan_out[idx*d_inner+j];
         bwd_scan[j] = bwd_scan_out[idx*d_inner+j];
     }
     float fwd_ctx[MAX_D_MODEL], bwd_ctx[MAX_D_MODEL];
+    #pragma unroll 4
     for (int d = 0; d < d_model; d++) {
         float fv=0, bv=0;
+        #pragma unroll 4
         for (int j=0; j<d_inner; j++) { fv+=s_out_fwd[d*d_inner+j]*fwd_scan[j]; bv+=s_out_bwd[d*d_inner+j]*bwd_scan[j]; }
         fwd_ctx[d]=fv; bwd_ctx[d]=bv;
     }
     float h_old[MAX_GRU_HIDDEN], h_new[MAX_GRU_HIDDEN];
+    #pragma unroll 4
     for (int j=0; j<gru_hidden; j++) h_old[j]=stream_load(&gru_state[idx*gru_hidden+j]);
     float z_gate[MAX_GRU_HIDDEN], r_gate[MAX_GRU_HIDDEN];
+    #pragma unroll 4
     for (int j=0; j<gru_hidden; j++) {
         float vz=s_gru_bz[j], vr=s_gru_br[j];
         vz+=s_gru_Wz[j*gru_row_len]*g+s_gru_Wz[j*gru_row_len+1]*s;
         vr+=s_gru_Wr[j*gru_row_len]*g+s_gru_Wr[j*gru_row_len+1]*s;
+        #pragma unroll 4
         for(int d=0;d<d_model;d++){vz+=s_gru_Wz[j*gru_row_len+2+d]*fwd_ctx[d];vr+=s_gru_Wr[j*gru_row_len+2+d]*fwd_ctx[d];}
+        #pragma unroll 4
         for(int d=0;d<d_model;d++){vz+=s_gru_Wz[j*gru_row_len+2+d_model+d]*bwd_ctx[d];vr+=s_gru_Wr[j*gru_row_len+2+d_model+d]*bwd_ctx[d];}
+        #pragma unroll 4
         for(int k=0;k<gru_hidden;k++){vz+=s_gru_Wz[j*gru_row_len+2+2*d_model+k]*h_old[k];vr+=s_gru_Wr[j*gru_row_len+2+2*d_model+k]*h_old[k];}
         gru_gates_ptx(vz, 0.0f, vr, 0.0f, z_gate[j], r_gate[j]);
     }
+    #pragma unroll 4
     for(int j=0;j<gru_hidden;j++){
         float val=s_gru_bh[j];
         val+=s_gru_Wh[j*gru_row_len]*g+s_gru_Wh[j*gru_row_len+1]*s;
+        #pragma unroll 4
         for(int d=0;d<d_model;d++) val+=s_gru_Wh[j*gru_row_len+2+d]*fwd_ctx[d];
+        #pragma unroll 4
         for(int d=0;d<d_model;d++) val+=s_gru_Wh[j*gru_row_len+2+d_model+d]*bwd_ctx[d];
+        #pragma unroll 4
         for(int k=0;k<gru_hidden;k++) val+=s_gru_Wh[j*gru_row_len+2+2*d_model+k]*(r_gate[k]*h_old[k]);
         h_new[j]=(1.0f-z_gate[j])*h_old[j]+z_gate[j]*tanhf(val);
     }
+    #pragma unroll 4
     for(int j=0;j<gru_hidden;j++) stream_store(&gru_state[idx*gru_hidden+j],h_new[j]);
 
     float total_out=0;
+    #pragma unroll 4
     for(int head=0;head<num_heads;head++){
         const float* pq_W=peer_query_Ws+head*d_model*peer_input_dim;
         float query[MAX_D_MODEL];
+        #pragma unroll 4
         for(int d=0;d<d_model;d++){
             float val=0;
+            #pragma unroll 4
             for(int k=0;k<gru_hidden;k++) val+=pq_W[d*peer_input_dim+k]*h_new[k];
             int off=gru_hidden;
+            #pragma unroll 4
             for(int k=0;k<d_model;k++) val+=pq_W[d*peer_input_dim+off+k]*fwd_ctx[k]; off+=d_model;
+            #pragma unroll 4
             for(int k=0;k<d_model;k++) val+=pq_W[d*peer_input_dim+off+k]*bwd_ctx[k]; off+=d_model;
             val+=pq_W[d*peer_input_dim+off]*g+pq_W[d*peer_input_dim+off+1]*s;
             query[d]=val;
@@ -1661,6 +1811,7 @@ __global__ void fused_elem_step_mxfp4_kernel(
         int eidx=ba*pk_dim+bb; if(eidx>=num_experts) eidx=num_experts-1;
         if(expert_counts) atomicAdd(&expert_counts[eidx],1);
         float ho=s_expert_b2[eidx];
+        #pragma unroll 4
         for(int h=0;h<expert_hidden;h++){float zv=s_expert_W1[eidx*expert_hidden+h]*g+s_expert_b1[eidx*expert_hidden+h];zv=fmaxf(zv,0.0f);ho+=s_expert_W2[eidx*expert_hidden+h]*zv;}
         total_out+=ho;
     }
@@ -1748,14 +1899,19 @@ __global__ void mamba3_scan_batched_kernel(
     float* s_C_proj_W = s_B_proj_W + d_state*d_inner;      // d_state * d_inner
 
     // Cooperatively load all projection weights into shared memory
+    #pragma unroll 4
     for (int i = tid; i < 2*d_inner*d_model; i += d_inner)
         s_in_proj_W[i] = in_proj_W[i];
+    #pragma unroll 4
     for (int i = tid; i < d_inner*d_inner; i += d_inner)
         s_dt_proj_W[i] = dt_proj_W[i];
+    #pragma unroll 4
     for (int i = tid; i < d_inner; i += d_inner)
         s_dt_proj_b[i] = dt_proj_b[i];
+    #pragma unroll 4
     for (int i = tid; i < d_state*d_inner; i += d_inner)
         s_B_proj_W[i] = B_proj_W[i];
+    #pragma unroll 4
     for (int i = tid; i < d_state*d_inner; i += d_inner)
         s_C_proj_W[i] = C_proj_W[i];
     __syncthreads();
@@ -1763,13 +1919,16 @@ __global__ void mamba3_scan_batched_kernel(
     // State in registers — load from initial_state
     float h[MAX_D_STATE], h_snap[MAX_D_STATE];
     const float* my_init = initial_states + param_idx * d_inner * d_state;
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++) h[s] = my_init[tid * d_state + s];
 
     const int half_d_state = d_state / 2;
     float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++) {
         A[s] = -fast_exp_ptx(A_log[tid * d_state + s]);
     }
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++) {
         freq[p] = rope_freq[tid * half_d_state + p];
     }
@@ -1778,10 +1937,12 @@ __global__ void mamba3_scan_batched_kernel(
     const float* my_x = x_sorted_packed + start * d_model;
     float* my_out = scan_output_packed + start * d_inner;
 
+    #pragma unroll 4
     for (int step = 0; step < N; step++) {
         int i = reverse ? (N - 1 - step) : step;
 
         float x_val = 0.0f, z_val = 0.0f;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             float inp = my_x[i * d_model + d];
             x_val += s_in_proj_W[tid * d_model + d] * inp;
@@ -1792,15 +1953,19 @@ __global__ void mamba3_scan_batched_kernel(
         __syncthreads();
 
         float dt_raw = s_dt_proj_b[tid];
+        #pragma unroll 4
         for (int j = 0; j < d_inner; j++)
             dt_raw += s_dt_proj_W[tid * d_inner + j] * s_x_branch[j];
         float dt_val = softplus_ptx(dt_raw);
 
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
 
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) {
             float A_bar = (1.0f + dt_val * A[s] / 2.0f) / (1.0f - dt_val * A[s] / 2.0f + 1e-8f);
             float B_val = 0.0f;
+            #pragma unroll 4
             for (int j = 0; j < d_inner; j++)
                 B_val += s_B_proj_W[s * d_inner + j] * s_x_branch[j];
             float B_bar = dt_val * B_val;
@@ -1818,8 +1983,10 @@ __global__ void mamba3_scan_batched_kernel(
         }
 
         float y_val = 0.0f;
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) {
             float C_val = 0.0f;
+            #pragma unroll 4
             for (int j = 0; j < d_inner; j++)
                 C_val += s_C_proj_W[s * d_inner + j] * s_x_branch[j];
             y_val += h[s] * C_val;
@@ -1832,6 +1999,7 @@ __global__ void mamba3_scan_batched_kernel(
     }
 
     float* my_final = final_states + param_idx * d_inner * d_state;
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         my_final[tid * d_state + s] = h[s];
 }
@@ -1916,26 +2084,34 @@ __global__ void mamba3_scan_combined_kernel(
     float* s_C_proj_W = s_B_proj_W + d_state*d_inner;      // d_state * d_inner
 
     // Cooperatively load all projection weights into shared memory
+    #pragma unroll 4
     for (int i = tid; i < 2*d_inner*d_model; i += d_inner)
         s_in_proj_W[i] = in_proj_W[i];
+    #pragma unroll 4
     for (int i = tid; i < d_inner*d_inner; i += d_inner)
         s_dt_proj_W[i] = dt_proj_W[i];
+    #pragma unroll 4
     for (int i = tid; i < d_inner; i += d_inner)
         s_dt_proj_b[i] = dt_proj_b[i];
+    #pragma unroll 4
     for (int i = tid; i < d_state*d_inner; i += d_inner)
         s_B_proj_W[i] = B_proj_W[i];
+    #pragma unroll 4
     for (int i = tid; i < d_state*d_inner; i += d_inner)
         s_C_proj_W[i] = C_proj_W[i];
     __syncthreads();
 
     float h[MAX_D_STATE], h_snap[MAX_D_STATE];
     const float* my_init = init_states + param_idx * d_inner * d_state;
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++) h[s] = my_init[tid * d_state + s];
 
     const int half_d_state = d_state / 2;
     float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         A[s] = -fast_exp_ptx(A_log_ptr[tid * d_state + s]);
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++)
         freq[p] = rope_ptr[tid * half_d_state + p];
     float D_val = D_param_ptr[tid];
@@ -1943,10 +2119,12 @@ __global__ void mamba3_scan_combined_kernel(
     const float* my_x = x_sorted_packed + start * d_model;
     float* my_out = scan_output + start * d_inner;
 
+    #pragma unroll 4
     for (int step = 0; step < N; step++) {
         int i = reverse ? (N - 1 - step) : step;
 
         float x_val = 0.0f, z_val = 0.0f;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             float inp = my_x[i * d_model + d];
             x_val += s_in_proj_W[tid * d_model + d] * inp;
@@ -1957,15 +2135,19 @@ __global__ void mamba3_scan_combined_kernel(
         __syncthreads();
 
         float dt_raw = s_dt_proj_b[tid];
+        #pragma unroll 4
         for (int j = 0; j < d_inner; j++)
             dt_raw += s_dt_proj_W[tid * d_inner + j] * s_x_branch[j];
         float dt_val = softplus_ptx(dt_raw);
 
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
 
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) {
             float A_bar = (1.0f + dt_val * A[s] / 2.0f) / (1.0f - dt_val * A[s] / 2.0f + 1e-8f);
             float B_val = 0.0f;
+            #pragma unroll 4
             for (int j = 0; j < d_inner; j++)
                 B_val += s_B_proj_W[s * d_inner + j] * s_x_branch[j];
             float B_bar = dt_val * B_val;
@@ -1982,8 +2164,10 @@ __global__ void mamba3_scan_combined_kernel(
         }
 
         float y_val = 0.0f;
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) {
             float C_val = 0.0f;
+            #pragma unroll 4
             for (int j = 0; j < d_inner; j++)
                 C_val += s_C_proj_W[s * d_inner + j] * s_x_branch[j];
             y_val += h[s] * C_val;
@@ -1996,6 +2180,7 @@ __global__ void mamba3_scan_combined_kernel(
     }
 
     float* my_final = fin_states + param_idx * d_inner * d_state;
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         my_final[tid * d_state + s] = h[s];
 }
@@ -2424,6 +2609,7 @@ void launch_mamba3_peer_batched_step(
     int total_N = 0;
 
     // First pass: compute total_N and per-param sizes
+    #pragma unroll 4
     for (int p = 0; p < num_params; p++) {
         N_vec[p] = grads[p].numel();
         total_N += N_vec[p];
@@ -2433,6 +2619,7 @@ void launch_mamba3_peer_batched_step(
     // Build segment offsets for CUB segmented sort
     std::vector<int> seg_offsets_cpu(num_params + 1);
     seg_offsets_cpu[0] = 0;
+    #pragma unroll 4
     for (int p = 0; p < num_params; p++)
         seg_offsets_cpu[p + 1] = seg_offsets_cpu[p] + N_vec[p];
 
@@ -2443,6 +2630,7 @@ void launch_mamba3_peer_batched_step(
     auto all_indices_out = torch::empty({total_N}, int_opts);
 
     // Run input_proj_sort for all params, writing into packed arrays
+    #pragma unroll 4
     for (int p = 0; p < num_params; p++) {
         int N = N_vec[p];
         if (N == 0) continue;
@@ -2490,6 +2678,7 @@ void launch_mamba3_peer_batched_step(
         seg_offsets_t.data_ptr<int>(), seg_offsets_t.data_ptr<int>() + 1);
 
     // Extract per-param sorted data
+    #pragma unroll 4
     for (int p = 0; p < num_params; p++) {
         int N = N_vec[p];
         if (N == 0) continue;
@@ -2511,6 +2700,7 @@ void launch_mamba3_peer_batched_step(
 
     // Concatenate sorted data
     std::vector<torch::Tensor> valid_sorted;
+    #pragma unroll 4
     for (int p = 0; p < num_params; p++) {
         if (N_vec[p] > 0) valid_sorted.push_back(x_sorted_list[p]);
     }
@@ -2702,6 +2892,7 @@ void launch_mamba3_peer_batched_step(
     // Pre-compute unsorted scan outputs and copy final states
     std::vector<torch::Tensor> fwd_unsorted_list(num_params);
     std::vector<torch::Tensor> bwd_unsorted_list(num_params);
+    #pragma unroll 4
     for (int p = 0; p < num_params; p++) {
         int N = N_vec[p];
         if (N == 0) continue;
@@ -2721,11 +2912,13 @@ void launch_mamba3_peer_batched_step(
     static GpuStream_t streams[NUM_STREAMS] = {};
     static bool streams_initialized = false;
     if (!streams_initialized) {
+        #pragma unroll 4
         for (int s = 0; s < NUM_STREAMS; s++)
             gpuStreamCreate(&streams[s]);
         streams_initialized = true;
     }
 
+    #pragma unroll 4
     for (int p = 0; p < num_params; p++) {
         int N = N_vec[p];
         if (N == 0) continue;
@@ -2767,6 +2960,7 @@ void launch_mamba3_peer_batched_step(
     }
 
     // Sync all streams (persistent — no destroy)
+    #pragma unroll 4
     for (int s = 0; s < NUM_STREAMS; s++) {
         gpuStreamSynchronize(streams[s]);
     }
@@ -2814,6 +3008,7 @@ BatchedScanCtx batched_step_setup_and_sort(
     // Compute total_N and per-param sizes
     ctx.N_vec.resize(ctx.num_params);
     ctx.total_N = 0;
+    #pragma unroll 4
     for (int p = 0; p < ctx.num_params; p++) {
         ctx.N_vec[p] = grads[p].numel();
         ctx.total_N += ctx.N_vec[p];
@@ -2826,6 +3021,7 @@ BatchedScanCtx batched_step_setup_and_sort(
     // Segment offsets
     ctx.seg_offsets_cpu.resize(ctx.num_params + 1);
     ctx.seg_offsets_cpu[0] = 0;
+    #pragma unroll 4
     for (int p = 0; p < ctx.num_params; p++)
         ctx.seg_offsets_cpu[p + 1] = ctx.seg_offsets_cpu[p] + ctx.N_vec[p];
 
@@ -2840,6 +3036,7 @@ BatchedScanCtx batched_step_setup_and_sort(
     std::vector<torch::Tensor> x_sorted_list(ctx.num_params);
     ctx.unsort_idx_list.resize(ctx.num_params);
 
+    #pragma unroll 4
     for (int p = 0; p < ctx.num_params; p++) {
         int N = ctx.N_vec[p];
         if (N == 0) continue;
@@ -2887,6 +3084,7 @@ BatchedScanCtx batched_step_setup_and_sort(
         ctx.offsets_t.data_ptr<int>(), ctx.offsets_t.data_ptr<int>() + 1);
 
     // Extract sorted data and build unsort indices
+    #pragma unroll 4
     for (int p = 0; p < ctx.num_params; p++) {
         int N = ctx.N_vec[p];
         if (N == 0) continue;
@@ -2904,6 +3102,7 @@ BatchedScanCtx batched_step_setup_and_sort(
 
     // Pack sorted data
     std::vector<torch::Tensor> valid_sorted;
+    #pragma unroll 4
     for (int p = 0; p < ctx.num_params; p++) {
         if (ctx.N_vec[p] > 0) valid_sorted.push_back(x_sorted_list[p]);
     }
@@ -3099,6 +3298,7 @@ void batched_step_scan_and_fused_elem(
     // Pre-compute unsorted scan outputs and copy final states
     std::vector<torch::Tensor> fwd_unsorted_list(ctx.num_params);
     std::vector<torch::Tensor> bwd_unsorted_list(ctx.num_params);
+    #pragma unroll 4
     for (int p = 0; p < ctx.num_params; p++) {
         int N = ctx.N_vec[p];
         if (N == 0) continue;
@@ -3118,11 +3318,13 @@ void batched_step_scan_and_fused_elem(
     static GpuStream_t streams[NUM_STREAMS] = {};
     static bool streams_initialized = false;
     if (!streams_initialized) {
+        #pragma unroll 4
         for (int s = 0; s < NUM_STREAMS; s++)
             gpuStreamCreate(&streams[s]);
         streams_initialized = true;
     }
 
+    #pragma unroll 4
     for (int p = 0; p < ctx.num_params; p++) {
         int N = ctx.N_vec[p];
         if (N == 0) continue;
@@ -3163,6 +3365,7 @@ void batched_step_scan_and_fused_elem(
         }));
     }
 
+    #pragma unroll 4
     for (int s = 0; s < NUM_STREAMS; s++) {
         gpuStreamSynchronize(streams[s]);
     }
@@ -3243,23 +3446,33 @@ __global__ void fused_elem_step_int8_kernel(
     const int block_size = blockDim.x;
 
     // Load out_proj weights
+    #pragma unroll 4
     for (int i = tid; i < op_size; i += block_size) s_out_fwd[i] = out_proj_fwd_W[i];
+    #pragma unroll 4
     for (int i = tid; i < op_size; i += block_size) s_out_bwd[i] = out_proj_bwd_W[i];
     // Load GRU weights
+    #pragma unroll 4
     for (int i = tid; i < gru_mat_size; i += block_size) s_gru_Wz[i] = gru_Wz[i];
+    #pragma unroll 4
     for (int i = tid; i < gru_mat_size; i += block_size) s_gru_Wr[i] = gru_Wr[i];
+    #pragma unroll 4
     for (int i = tid; i < gru_mat_size; i += block_size) s_gru_Wh[i] = gru_Wh[i];
+    #pragma unroll 4
     for (int i = tid; i < gru_hidden; i += block_size) s_gru_bz[i] = gru_bz[i];
+    #pragma unroll 4
     for (int i = tid; i < gru_hidden; i += block_size) s_gru_br[i] = gru_br[i];
+    #pragma unroll 4
     for (int i = tid; i < gru_hidden; i += block_size) s_gru_bh[i] = gru_bh[i];
 
     // INT8 dequant-on-load for expert weights
+    #pragma unroll 4
     for (int i = tid; i < num_experts * expert_hidden; i += block_size) {
         int expert_idx = i / expert_hidden;
         s_expert_W1[i] = static_cast<float>(expert_W1_int8[i]) * expert_W1_scales[expert_idx];
         s_expert_b1[i] = static_cast<float>(expert_b1_int8[i]) * expert_b1_scales[expert_idx];
         s_expert_W2[i] = static_cast<float>(expert_W2_int8[i]) * expert_W2_scales[expert_idx];
     }
+    #pragma unroll 4
     for (int i = tid; i < num_experts; i += block_size)
         s_expert_b2[i] = static_cast<float>(expert_b2_int8[i]) * expert_b2_scales[i];
 
@@ -3282,6 +3495,7 @@ __global__ void fused_elem_step_int8_kernel(
     // 1. Apply Mamba out_proj to get fwd_ctx and bwd_ctx
     float fwd_scan[MAX_D_INNER];
     float bwd_scan[MAX_D_INNER];
+    #pragma unroll 4
     for (int j = 0; j < d_inner; j += 4) {
         float4 fwd4 = *reinterpret_cast<const float4*>(&fwd_scan_out[idx * d_inner + j]);
         float4 bwd4 = *reinterpret_cast<const float4*>(&bwd_scan_out[idx * d_inner + j]);
@@ -3290,8 +3504,10 @@ __global__ void fused_elem_step_int8_kernel(
     }
 
     float fwd_ctx[MAX_D_MODEL], bwd_ctx[MAX_D_MODEL];
+    #pragma unroll 4
     for (int d = 0; d < d_model; d++) {
         float fwd_val = 0.0f, bwd_val = 0.0f;
+        #pragma unroll 4
         for (int j = 0; j < d_inner; j++) {
             fwd_val += s_out_fwd[d * d_inner + j] * fwd_scan[j];
             bwd_val += s_out_bwd[d * d_inner + j] * bwd_scan[j];
@@ -3302,11 +3518,13 @@ __global__ void fused_elem_step_int8_kernel(
 
     // 2. GRU update (using shared memory weights)
     float h_old[MAX_GRU_HIDDEN];
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++)
         h_old[j] = stream_load(&gru_state[idx * gru_hidden + j]);
 
     float h_new[MAX_GRU_HIDDEN];
     float z_gate[MAX_GRU_HIDDEN], r_gate[MAX_GRU_HIDDEN];
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++) {
         float val_z = s_gru_bz[j];
         float val_r = s_gru_br[j];
@@ -3315,16 +3533,19 @@ __global__ void fused_elem_step_int8_kernel(
         val_r += s_gru_Wr[j * gru_row_len + 0] * g;
         val_r += s_gru_Wr[j * gru_row_len + 1] * s;
         int offset = 2;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             val_z += s_gru_Wz[j * gru_row_len + offset + d] * fwd_ctx[d];
             val_r += s_gru_Wr[j * gru_row_len + offset + d] * fwd_ctx[d];
         }
         offset += d_model;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             val_z += s_gru_Wz[j * gru_row_len + offset + d] * bwd_ctx[d];
             val_r += s_gru_Wr[j * gru_row_len + offset + d] * bwd_ctx[d];
         }
         offset += d_model;
+        #pragma unroll 4
         for (int k = 0; k < gru_hidden; k++) {
             val_z += s_gru_Wz[j * gru_row_len + offset + k] * h_old[k];
             val_r += s_gru_Wr[j * gru_row_len + offset + k] * h_old[k];
@@ -3333,18 +3554,22 @@ __global__ void fused_elem_step_int8_kernel(
     }
 
     // Candidate: h_tilde = tanh(Wh @ [x, r*h] + bh)
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++) {
         float val = s_gru_bh[j];
         int offset = 0;
         val += s_gru_Wh[j * gru_row_len + 0] * g;
         val += s_gru_Wh[j * gru_row_len + 1] * s;
         offset = 2;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++)
             val += s_gru_Wh[j * gru_row_len + offset + d] * fwd_ctx[d];
         offset += d_model;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++)
             val += s_gru_Wh[j * gru_row_len + offset + d] * bwd_ctx[d];
         offset += d_model;
+        #pragma unroll 4
         for (int k = 0; k < gru_hidden; k++)
             val += s_gru_Wh[j * gru_row_len + offset + k] * (r_gate[k] * h_old[k]);
         float h_tilde = tanhf(val);
@@ -3352,6 +3577,7 @@ __global__ void fused_elem_step_int8_kernel(
     }
 
     // Write GRU state
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++)
         stream_store(&gru_state[idx * gru_hidden + j], h_new[j]);
 
@@ -3359,18 +3585,23 @@ __global__ void fused_elem_step_int8_kernel(
     //    (uses dequantized expert weights from smem — identical to fused_elem_step_kernel)
     float total_out = 0.0f;
 
+    #pragma unroll 4
     for (int head = 0; head < num_heads; head++) {
         const float* pq_W = peer_query_Ws + head * d_model * peer_input_dim;
         float query[MAX_D_MODEL];
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             float val = 0.0f;
             int off = 0;
+            #pragma unroll 4
             for (int k = 0; k < gru_hidden; k++)
                 val += pq_W[d * peer_input_dim + off + k] * h_new[k];
             off += gru_hidden;
+            #pragma unroll 4
             for (int k = 0; k < d_model; k++)
                 val += pq_W[d * peer_input_dim + off + k] * fwd_ctx[k];
             off += d_model;
+            #pragma unroll 4
             for (int k = 0; k < d_model; k++)
                 val += pq_W[d * peer_input_dim + off + k] * bwd_ctx[k];
             off += d_model;
@@ -3385,8 +3616,10 @@ __global__ void fused_elem_step_int8_kernel(
 
         float best_score_a = -1e30f, best_score_b = -1e30f;
         int best_a = 0, best_b = 0;
+        #pragma unroll 4
         for (int k = 0; k < pk_dim; k++) {
             float dot_a = 0.0f, dot_b = 0.0f;
+            #pragma unroll 4
             for (int d = 0; d < half_d; d++) {
                 dot_a += keys_A[k * half_d + d] * query[d];
                 dot_b += keys_B[k * half_d + d] * query[half_d + d];
@@ -3402,6 +3635,7 @@ __global__ void fused_elem_step_int8_kernel(
 
         // Expert MLP: z = relu(W1 * g + b1), out = W2 @ z + b2
         float head_out = s_expert_b2[expert_idx];
+        #pragma unroll 4
         for (int h = 0; h < expert_hidden; h++) {
             float z_val = s_expert_W1[expert_idx * expert_hidden + h] * g
                         + s_expert_b1[expert_idx * expert_hidden + h];
@@ -3510,17 +3744,26 @@ __global__ void fused_elem_step_int4_kernel(
     const int block_size = blockDim.x;
 
     // Load out_proj and GRU weights (same as standard kernel)
+    #pragma unroll 4
     for (int i = tid; i < op_size; i += block_size) s_out_fwd[i] = out_proj_fwd_W[i];
+    #pragma unroll 4
     for (int i = tid; i < op_size; i += block_size) s_out_bwd[i] = out_proj_bwd_W[i];
+    #pragma unroll 4
     for (int i = tid; i < gru_mat_size; i += block_size) s_gru_Wz[i] = gru_Wz[i];
+    #pragma unroll 4
     for (int i = tid; i < gru_mat_size; i += block_size) s_gru_Wr[i] = gru_Wr[i];
+    #pragma unroll 4
     for (int i = tid; i < gru_mat_size; i += block_size) s_gru_Wh[i] = gru_Wh[i];
+    #pragma unroll 4
     for (int i = tid; i < gru_hidden; i += block_size) s_gru_bz[i] = gru_bz[i];
+    #pragma unroll 4
     for (int i = tid; i < gru_hidden; i += block_size) s_gru_br[i] = gru_br[i];
+    #pragma unroll 4
     for (int i = tid; i < gru_hidden; i += block_size) s_gru_bh[i] = gru_bh[i];
 
     // INT4 dequant-on-load: unpack 2 values per byte
     int packed_size = (num_experts * expert_hidden + 1) / 2;
+    #pragma unroll 4
     for (int i = tid; i < packed_size; i += block_size) {
         uint8_t packed = expert_W1_int4[i];
         int lo = (packed & 0x0F) - 8;
@@ -3537,6 +3780,7 @@ __global__ void fused_elem_step_int4_kernel(
         }
     }
     // Same for b1, W2
+    #pragma unroll 4
     for (int i = tid; i < packed_size; i += block_size) {
         uint8_t packed = expert_b1_int4[i];
         int lo = (packed & 0x0F) - 8;
@@ -3551,6 +3795,7 @@ __global__ void fused_elem_step_int4_kernel(
             s_expert_b1[idx1] = (float)hi * expert_b1_scales[eidx];
         }
     }
+    #pragma unroll 4
     for (int i = tid; i < packed_size; i += block_size) {
         uint8_t packed = expert_W2_int4[i];
         int lo = (packed & 0x0F) - 8;
@@ -3566,6 +3811,7 @@ __global__ void fused_elem_step_int4_kernel(
         }
     }
     int b2_packed = (num_experts + 1) / 2;
+    #pragma unroll 4
     for (int i = tid; i < b2_packed; i += block_size) {
         uint8_t packed = expert_b2_int4[i];
         int lo = (packed & 0x0F) - 8;
@@ -3591,6 +3837,7 @@ __global__ void fused_elem_step_int4_kernel(
     // 1. Apply Mamba out_proj to get fwd_ctx and bwd_ctx
     float fwd_scan[MAX_D_INNER];
     float bwd_scan[MAX_D_INNER];
+    #pragma unroll 4
     for (int j = 0; j < d_inner; j += 4) {
         float4 fwd4 = *reinterpret_cast<const float4*>(&fwd_scan_out[elem_idx * d_inner + j]);
         float4 bwd4 = *reinterpret_cast<const float4*>(&bwd_scan_out[elem_idx * d_inner + j]);
@@ -3599,8 +3846,10 @@ __global__ void fused_elem_step_int4_kernel(
     }
 
     float fwd_ctx[MAX_D_MODEL], bwd_ctx[MAX_D_MODEL];
+    #pragma unroll 4
     for (int d = 0; d < d_model; d++) {
         float fwd_val = 0.0f, bwd_val = 0.0f;
+        #pragma unroll 4
         for (int j = 0; j < d_inner; j++) {
             fwd_val += s_out_fwd[d * d_inner + j] * fwd_scan[j];
             bwd_val += s_out_bwd[d * d_inner + j] * bwd_scan[j];
@@ -3611,11 +3860,13 @@ __global__ void fused_elem_step_int4_kernel(
 
     // 2. GRU update
     float h_old[MAX_GRU_HIDDEN];
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++)
         h_old[j] = gru_state[elem_idx * gru_hidden + j];
 
     float h_new[MAX_GRU_HIDDEN];
     float z_gate[MAX_GRU_HIDDEN], r_gate[MAX_GRU_HIDDEN];
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++) {
         float val_z = s_gru_bz[j];
         float val_r = s_gru_br[j];
@@ -3624,16 +3875,19 @@ __global__ void fused_elem_step_int4_kernel(
         val_r += s_gru_Wr[j * gru_row_len + 0] * g;
         val_r += s_gru_Wr[j * gru_row_len + 1] * s_val;
         int offset = 2;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             val_z += s_gru_Wz[j * gru_row_len + offset + d] * fwd_ctx[d];
             val_r += s_gru_Wr[j * gru_row_len + offset + d] * fwd_ctx[d];
         }
         offset += d_model;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             val_z += s_gru_Wz[j * gru_row_len + offset + d] * bwd_ctx[d];
             val_r += s_gru_Wr[j * gru_row_len + offset + d] * bwd_ctx[d];
         }
         offset += d_model;
+        #pragma unroll 4
         for (int k = 0; k < gru_hidden; k++) {
             val_z += s_gru_Wz[j * gru_row_len + offset + k] * h_old[k];
             val_r += s_gru_Wr[j * gru_row_len + offset + k] * h_old[k];
@@ -3642,18 +3896,22 @@ __global__ void fused_elem_step_int4_kernel(
     }
 
     // Candidate: h_tilde = tanh(Wh @ [x, r*h] + bh)
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++) {
         float val = s_gru_bh[j];
         int offset = 0;
         val += s_gru_Wh[j * gru_row_len + 0] * g;
         val += s_gru_Wh[j * gru_row_len + 1] * s_val;
         offset = 2;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++)
             val += s_gru_Wh[j * gru_row_len + offset + d] * fwd_ctx[d];
         offset += d_model;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++)
             val += s_gru_Wh[j * gru_row_len + offset + d] * bwd_ctx[d];
         offset += d_model;
+        #pragma unroll 4
         for (int k = 0; k < gru_hidden; k++)
             val += s_gru_Wh[j * gru_row_len + offset + k] * (r_gate[k] * h_old[k]);
         float h_tilde = tanhf(val);
@@ -3661,23 +3919,29 @@ __global__ void fused_elem_step_int4_kernel(
     }
 
     // Write GRU state
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++)
         gru_state[elem_idx * gru_hidden + j] = h_new[j];
 
     // 3. Multi-head PEER routing + expert evaluation (uses dequantized smem)
     float total_out = 0.0f;
+    #pragma unroll 4
     for (int head = 0; head < num_heads; head++) {
         const float* pq_W = peer_query_Ws + head * d_model * peer_input_dim;
         float query[MAX_D_MODEL];
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             float val = 0.0f;
             int off = 0;
+            #pragma unroll 4
             for (int k = 0; k < gru_hidden; k++)
                 val += pq_W[d * peer_input_dim + off + k] * h_new[k];
             off += gru_hidden;
+            #pragma unroll 4
             for (int k = 0; k < d_model; k++)
                 val += pq_W[d * peer_input_dim + off + k] * fwd_ctx[k];
             off += d_model;
+            #pragma unroll 4
             for (int k = 0; k < d_model; k++)
                 val += pq_W[d * peer_input_dim + off + k] * bwd_ctx[k];
             off += d_model;
@@ -3690,8 +3954,10 @@ __global__ void fused_elem_step_int4_kernel(
         const float* keys_B = prod_keys_B + head * pk_dim * half_d;
         float best_score_a = -1e30f, best_score_b = -1e30f;
         int best_a = 0, best_b = 0;
+        #pragma unroll 4
         for (int k = 0; k < pk_dim; k++) {
             float dot_a = 0.0f, dot_b = 0.0f;
+            #pragma unroll 4
             for (int d = 0; d < half_d; d++) {
                 dot_a += keys_A[k * half_d + d] * query[d];
                 dot_b += keys_B[k * half_d + d] * query[half_d + d];
@@ -3707,6 +3973,7 @@ __global__ void fused_elem_step_int4_kernel(
 
         // Expert MLP: z = relu(W1 * g + b1), out = W2 @ z + b2
         float head_out = s_expert_b2[expert_id];
+        #pragma unroll 4
         for (int h = 0; h < expert_hidden; h++) {
             float z_val = s_expert_W1[expert_id * expert_hidden + h] * g
                         + s_expert_b1[expert_id * expert_hidden + h];
@@ -3881,18 +4148,23 @@ __global__ void persistent_scan_fused_elem_kernel(
     // State in registers
     float h[MAX_D_STATE], h_snap[MAX_D_STATE];
     if (initial_state != nullptr) {
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) h[s] = initial_state[tid * d_state + s];
     } else {
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) h[s] = 0.0f;
     }
 
     const int half_d_state = d_state / 2;
     float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++) A[s] = -fast_exp_ptx(A_log[tid * d_state + s]);
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++) freq[p] = rope_freq[tid * half_d_state + p];
     float D_val = D_param[tid];
 
     // Sequential scan loop — fused with elem step
+    #pragma unroll 4
     for (int step = 0; step < N; step++) {
         int i = reverse ? (N - 1 - step) : step;
 
@@ -3914,6 +4186,7 @@ __global__ void persistent_scan_fused_elem_kernel(
     }
 
     // Write final state
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         final_state[tid * d_state + s] = h[s];
 }

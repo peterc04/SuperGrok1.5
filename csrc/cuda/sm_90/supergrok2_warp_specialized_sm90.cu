@@ -138,6 +138,7 @@ __global__ void scan_warp_specialized_kernel(
     if (warp_id == PRODUCER_WARP_ID && lane_id == 0) {
         // ── PRODUCER WARP ──────────────────────────────────────────
         // Issue cp.async loads for each timestep into alternating buffers
+        #pragma unroll 4
         for (int t = 0; t < N; t++) {
             int buf = t % NUM_BUFFERS;
 
@@ -164,6 +165,7 @@ __global__ void scan_warp_specialized_kernel(
     } else if (warp_id == 1 && lane_id == 0) {
         // ── CONSUMER WARP ──────────────────────────────────────────
         // Execute scan recurrence using data loaded by producer
+        #pragma unroll 4
         for (int t = 0; t < N; t++) {
             int buf = t % NUM_BUFFERS;
 
@@ -290,6 +292,7 @@ __global__ void scan_warp_specialized_d16_kernel(
 
     if (warp_id == PRODUCER_WARP_ID) {
         // ── PRODUCER WARP ──────────────────────────────────────────
+        #pragma unroll 4
         for (int t = 0; t < N; t++) {
             int buf = t % NUM_BUFFERS;
 
@@ -317,6 +320,7 @@ __global__ void scan_warp_specialized_d16_kernel(
         }
     } else if (warp_id == 1) {
         // ── CONSUMER WARP (d_state=16 unrolled) ────────────────────
+        #pragma unroll 4
         for (int t = 0; t < N; t++) {
             int buf = t % NUM_BUFFERS;
 

@@ -63,12 +63,14 @@ __global__ void fused_elem_step_tma_kernel(
         // cuda::memcpy_async(smem, tensorMapExpert,
         //                    cuda::aligned_size_t<128>(weight_size * 4), barrier);
         // For now, cooperative load as TMA descriptor setup is done host-side
+        #pragma unroll
         for (int i = 0; i < weight_size && i < 32; i++) {
             smem[i] = expert_W1[i];
         }
     }
 
     // Cooperative smem load for remaining weights
+    #pragma unroll 4
     for (int i = threadIdx.x; i < weight_size; i += blockDim.x) {
         smem[i] = expert_W1[i];
     }
@@ -120,6 +122,7 @@ __global__ void fused_elem_step_tma_q4_kernel(
 ) {
     extern __shared__ float smem[];
 
+    #pragma unroll 4
     for (int i = threadIdx.x; i < weight_size; i += blockDim.x)
         smem[i] = expert_weights[i];
     __syncthreads();
@@ -177,6 +180,7 @@ __global__ void fused_elem_step_tma_moe_kernel(
 ) {
     extern __shared__ float smem[];
 
+    #pragma unroll 4
     for (int i = threadIdx.x; i < weight_size; i += blockDim.x)
         smem[i] = expert_W1[i];
     __syncthreads();
@@ -192,6 +196,7 @@ __global__ void fused_elem_step_tma_moe_kernel(
 
     // MoE: weighted sum of top-k expert outputs
     float expert_out = 0.0f;
+    #pragma unroll 4
     for (int k = 0; k < top_k; k++) {
         int eidx = expert_indices[idx * top_k + k];
         float gate = expert_gates[idx * top_k + k];
@@ -232,6 +237,7 @@ __global__ void fused_elem_step_tma_d16_kernel(
 ) {
     extern __shared__ float smem[];
 
+    #pragma unroll 4
     for (int i = threadIdx.x; i < weight_size; i += blockDim.x)
         smem[i] = expert_weights[i];
     __syncthreads();
@@ -279,6 +285,7 @@ __global__ void fused_elem_step_tma_q4_moe_kernel(
 ) {
     extern __shared__ float smem[];
 
+    #pragma unroll 4
     for (int i = threadIdx.x; i < weight_size; i += blockDim.x)
         smem[i] = expert_weights[i];
     __syncthreads();
@@ -327,6 +334,7 @@ __global__ void fused_elem_step_tma_q4_d16_kernel(
 ) {
     extern __shared__ float smem[];
 
+    #pragma unroll 4
     for (int i = threadIdx.x; i < weight_size; i += blockDim.x)
         smem[i] = expert_weights[i];
     __syncthreads();
@@ -376,6 +384,7 @@ __global__ void fused_elem_step_fp4_kernel(
 
     // Dequantize FP4 expert weights into smem
     int fp4_bytes = num_experts * expert_hidden * 3 / 2;  // 2 values per byte
+    #pragma unroll 4
     for (int i = threadIdx.x; i < fp4_bytes; i += blockDim.x) {
         // NVFP4 E2M1: 4-bit floating point
         uint8_t packed = expert_W1_fp4[i];
@@ -425,6 +434,7 @@ __global__ void fused_elem_step_fp4_d16_kernel(
     extern __shared__ float smem[];
 
     int fp4_bytes = num_experts * expert_hidden * 3 / 2;
+    #pragma unroll 4
     for (int i = threadIdx.x; i < fp4_bytes; i += blockDim.x) {
         uint8_t packed = expert_W1_fp4[i];
         int block_idx = i / 16;
@@ -471,6 +481,7 @@ __global__ void fused_elem_step_fp4_moe_kernel(
     extern __shared__ float smem[];
 
     int fp4_bytes = num_experts * expert_hidden * 3 / 2;
+    #pragma unroll 4
     for (int i = threadIdx.x; i < fp4_bytes; i += blockDim.x) {
         uint8_t packed = expert_W1_fp4[i];
         int block_idx = i / 16;
@@ -516,6 +527,7 @@ __global__ void fused_elem_step_fp4_q4_kernel(
     extern __shared__ float smem[];
 
     int fp4_bytes = num_experts * expert_hidden * 3 / 2;
+    #pragma unroll 4
     for (int i = threadIdx.x; i < fp4_bytes; i += blockDim.x) {
         uint8_t packed = expert_W1_fp4[i];
         int block_idx = i / 16;
@@ -573,16 +585,19 @@ __global__ void scan_tma_kernel(
 
     float D_val = D_param[j];
     float h[64];  // Max d_state
+    #pragma unroll 4
     for (int s = 0; s < d_state && s < 64; s++) {
         h[s] = (initial_state != nullptr) ? initial_state[j * d_state + s] : 0.0f;
     }
 
+    #pragma unroll 4
     for (int t = 0; t < N; t++) {
         float dt = pre_dt[t * d_inner + j];
         float x_val = pre_x[t * d_inner + j];
         float z_val = pre_z[t * d_inner + j];
         float y = 0.0f;
 
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) {
             float A_val = -__expf(A_log[j * d_state + s]);
             float A_bar = __expf(A_val * dt);
@@ -622,6 +637,7 @@ __global__ void scan_tma_d16_kernel(
         h[s] = (initial_state != nullptr) ? initial_state[j * 16 + s] : 0.0f;
     }
 
+    #pragma unroll 4
     for (int t = 0; t < N; t++) {
         float dt = pre_dt[t * D_INNER + j];
         float x_val = pre_x[t * D_INNER + j];
