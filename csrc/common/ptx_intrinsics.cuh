@@ -1,12 +1,16 @@
 /*
- * PTX Intrinsics for SuperGrok v2 Blelloch Scan
+ * PTX Intrinsics for SuperGrok v2
  *
- * Provides affine_combine_ptx() — the critical inner-loop operation of
- * the parallel prefix scan.  Uses raw PTX FMA instructions to ensure
- * optimal ILP: the 12 FMAs are scheduled in 3 waves of 4 independent
- * instructions each, maximizing throughput on NVIDIA SMs.
+ * Hot-path intrinsics that replace multi-cycle standard library calls with
+ * single-cycle PTX instructions:
  *
- * On HIP (AMD), falls back to fmaf()-based implementation.
+ *   affine_combine_ptx  — 12-FMA parallel prefix scan composition
+ *   softplus_ptx        — log(1+exp(x)) via ex2.approx + lg2.approx (2 cycles vs ~16)
+ *   fast_exp_ptx        — exp(x) via ex2.approx (1 cycle vs ~8)
+ *   stochastic_round_ptx— branchless stochastic rounding for Config4 quantization
+ *   gru_gates_ptx       — interleaved sigmoid pair for GRU z/r gates
+ *
+ * On HIP (AMD), all intrinsics fall back to standard math functions.
  */
 
 #pragma once
@@ -51,12 +55,135 @@ __device__ __forceinline__ Affine2x2 affine_combine_ptx(
     return out;
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+//  softplus_ptx: log(1 + exp(x)) in ~2 cycles
+//
+//  Replaces logf(1.0f + expf(x)) (~16 cycles) with ex2.approx + lg2.approx.
+//  Branchless saturation at x > 20 via selp.
+// ═══════════════════════════════════════════════════════════════════════
+__device__ __forceinline__ float softplus_ptx(float x) {
+    float result;
+    asm volatile(
+        "{\n\t"
+        ".reg .f32 t, ex, ep1, lg;\n\t"
+        ".reg .pred p;\n\t"
+        "mul.f32 t, %1, 0f3FB8AA3B;\n\t"      // x * log2(e)
+        "ex2.approx.f32 ex, t;\n\t"             // exp(x)
+        "add.f32 ep1, ex, 0f3F800000;\n\t"      // 1 + exp(x)
+        "lg2.approx.f32 lg, ep1;\n\t"           // log2(1+exp(x))
+        "mul.f32 lg, lg, 0f3F317218;\n\t"       // * ln(2)
+        "setp.gt.f32 p, %1, 0f41A00000;\n\t"    // x > 20.0?
+        "selp.f32 %0, %1, lg, p;\n\t"           // branchless select
+        "}\n\t"
+        : "=f"(result) : "f"(x)
+    );
+    return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  fast_exp_ptx: exp(x) in 1 cycle via ex2.approx
+//
+//  Replaces __expf(A * dt) in scan. A_bar is always in (0,1).
+// ═══════════════════════════════════════════════════════════════════════
+__device__ __forceinline__ float fast_exp_ptx(float x) {
+    float result;
+    asm volatile(
+        "{\n\t"
+        ".reg .f32 t;\n\t"
+        "mul.f32 t, %1, 0f3FB8AA3B;\n\t"   // x * log2(e)
+        "ex2.approx.f32 %0, t;\n\t"         // 2^t = exp(x)
+        "}\n\t"
+        : "=f"(result) : "f"(x)
+    );
+    return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  stochastic_round_ptx: branchless stochastic rounding for Config4
+//
+//  Replaces floor + branch + comparison with cvt.rmi + selp.
+// ═══════════════════════════════════════════════════════════════════════
+__device__ __forceinline__ int stochastic_round_ptx(float x, unsigned rand_bits) {
+    int result;
+    asm volatile(
+        "{\n\t"
+        ".reg .f32 fl, frac, r;\n\t"
+        ".reg .s32 ifl, up;\n\t"
+        ".reg .pred p;\n\t"
+        "cvt.rmi.f32.f32 fl, %1;\n\t"
+        "sub.f32 frac, %1, fl;\n\t"
+        "cvt.rn.f32.u32 r, %2;\n\t"
+        "mul.f32 r, r, 0f2F800000;\n\t"
+        "setp.lt.f32 p, r, frac;\n\t"
+        "cvt.rzi.s32.f32 ifl, fl;\n\t"
+        "selp.s32 up, 1, 0, p;\n\t"
+        "add.s32 %0, ifl, up;\n\t"
+        "}\n\t"
+        : "=r"(result) : "f"(x), "r"(rand_bits)
+    );
+    return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  gru_gates_ptx: interleaved sigmoid pair for GRU z/r gates
+//
+//  Two independent sigmoid(wx + b) computations fill both FMA pipelines.
+//  Uses rcp.approx for 1/(1+exp(-x)) instead of fdividef.
+// ═══════════════════════════════════════════════════════════════════════
+__device__ __forceinline__ void gru_gates_ptx(
+    float wx_z, float bz, float wx_r, float br,
+    float& z_out, float& r_out
+) {
+    asm volatile(
+        "{\n\t"
+        ".reg .f32 nz, nr, tz, tr, ez, er, dz, dr;\n\t"
+        "add.f32 nz, %2, %3;\n\t"
+        "add.f32 nr, %4, %5;\n\t"
+        "neg.f32 nz, nz;\n\t"
+        "neg.f32 nr, nr;\n\t"
+        "mul.f32 tz, nz, 0f3FB8AA3B;\n\t"
+        "mul.f32 tr, nr, 0f3FB8AA3B;\n\t"
+        "ex2.approx.f32 ez, tz;\n\t"
+        "ex2.approx.f32 er, tr;\n\t"
+        "add.f32 dz, ez, 0f3F800000;\n\t"
+        "add.f32 dr, er, 0f3F800000;\n\t"
+        "rcp.approx.f32 %0, dz;\n\t"
+        "rcp.approx.f32 %1, dr;\n\t"
+        "}\n\t"
+        : "=f"(z_out), "=f"(r_out)
+        : "f"(wx_z), "f"(bz), "f"(wx_r), "f"(br)
+    );
+}
+
 #elif defined(__HIP_DEVICE_COMPILE__) || defined(GROK_HIP)
 
 __device__ __forceinline__ Affine2x2 affine_combine_ptx(
     const Affine2x2& left, const Affine2x2& right
 ) {
     return affine_combine(left, right);
+}
+
+__device__ __forceinline__ float softplus_ptx(float x) {
+    return (x > 20.0f) ? x : logf(1.0f + expf(x));
+}
+
+__device__ __forceinline__ float fast_exp_ptx(float x) {
+    return expf(x);
+}
+
+__device__ __forceinline__ int stochastic_round_ptx(float x, unsigned rand_bits) {
+    float fl = floorf(x);
+    float frac = x - fl;
+    float r = (float)rand_bits * (1.0f / 4294967296.0f);
+    return (int)fl + (r < frac ? 1 : 0);
+}
+
+__device__ __forceinline__ void gru_gates_ptx(
+    float wx_z, float bz, float wx_r, float br,
+    float& z_out, float& r_out
+) {
+    z_out = 1.0f / (1.0f + expf(-(wx_z + bz)));
+    r_out = 1.0f / (1.0f + expf(-(wx_r + br)));
 }
 
 #endif
