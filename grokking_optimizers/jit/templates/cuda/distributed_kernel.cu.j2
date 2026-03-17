@@ -50,6 +50,7 @@ __global__ void jit_distributed_scan_with_summary_kernel(
     const float D_val = D_param[j];
     const int half_d_state = JIT_HALF_D_STATE;
 
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++) {
         int s_e = 2 * p;
         int s_o = 2 * p + 1;

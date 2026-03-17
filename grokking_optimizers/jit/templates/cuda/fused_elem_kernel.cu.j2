@@ -93,15 +93,20 @@ __global__ void jit_fused_elem_step_kernel(
     float* smem_gru = smem_b2 + JIT_SMEM_EXPERT_B2;
 
     // Load expert weights into shared memory (all threads cooperate)
+    #pragma unroll 4
     for (int i = threadIdx.x; i < JIT_SMEM_EXPERT_W1; i += JIT_ELEM_BLOCK)
         smem_W1[i] = expert_W1[i];
+    #pragma unroll 4
     for (int i = threadIdx.x; i < JIT_SMEM_EXPERT_B1; i += JIT_ELEM_BLOCK)
         smem_b1[i] = expert_b1[i];
+    #pragma unroll 4
     for (int i = threadIdx.x; i < JIT_SMEM_EXPERT_W2; i += JIT_ELEM_BLOCK)
         smem_W2[i] = expert_W2[i];
+    #pragma unroll 4
     for (int i = threadIdx.x; i < JIT_SMEM_EXPERT_B2; i += JIT_ELEM_BLOCK)
         smem_b2[i] = expert_b2[i];
     // Load GRU weights
+    #pragma unroll 4
     for (int i = threadIdx.x; i < JIT_SMEM_GRU; i += JIT_ELEM_BLOCK) {
         if (i < JIT_GRU_HIDDEN) smem_gru[i] = gru_Wz[i];
         else if (i < 2 * JIT_GRU_HIDDEN) smem_gru[i] = gru_bz[i - JIT_GRU_HIDDEN];

@@ -54,6 +54,7 @@ __global__ void jit_persistent_scan_elem_kernel(
     // Load expert weights into shared memory once
     // (reused across all parameter groups)
     int total_expert_weights = {{ NUM_EXPERTS }} * {{ EXPERT_HIDDEN }} * 3;
+    #pragma unroll 4
     for (int i = threadIdx.x; i < total_expert_weights; i += blockDim.x) {
         smem[i] = expert_W1[i];
     }
