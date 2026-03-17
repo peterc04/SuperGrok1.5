@@ -148,7 +148,7 @@ __global__ void mamba3_scan_kernel(
     const int half_d_state = d_state / 2;
     float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
     for (int s = 0; s < d_state; s++) {
-        A[s] = -expf(A_log[tid * d_state + s]);
+        A[s] = -fast_exp_ptx(A_log[tid * d_state + s]);
     }
     for (int p = 0; p < half_d_state; p++) {
         freq[p] = rope_freq[tid * half_d_state + p];
@@ -175,7 +175,7 @@ __global__ void mamba3_scan_kernel(
         for (int j = 0; j < d_inner; j++) {
             dt_raw += s_dt_proj_W[tid * d_inner + j] * s_x_branch[j];
         }
-        float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw)); // stable softplus
+        float dt_val = softplus_ptx(dt_raw);
 
         // Snapshot h for RoPE (fixes read-after-write)
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
@@ -287,7 +287,7 @@ __global__ void mamba3_parallel_precompute_kernel(
         float dt_raw = dt_proj_b[j];
         for (int k = 0; k < d_inner; k++)
             dt_raw += dt_proj_W[j * d_inner + k] * x_branch[k];
-        float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw));
+        float dt_val = softplus_ptx(dt_raw);
         pre_dt_val[t * d_inner + j] = dt_val;
     }
 
@@ -365,7 +365,7 @@ __global__ void mamba3_parallel_scan_kernel(
     // Load per-d_inner constants
     float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
     for (int s = 0; s < d_state; s++)
-        A[s] = -expf(A_log[j * d_state + s]);
+        A[s] = -fast_exp_ptx(A_log[j * d_state + s]);
     for (int p = 0; p < half_d_state; p++)
         freq[p] = rope_freq[j * half_d_state + p];
     float D_val = D_param[j];
@@ -588,7 +588,7 @@ __global__ void mamba3_parallel_scan_batched_kernel(
     // Load per-d_inner constants
     float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
     for (int s = 0; s < d_state; s++)
-        A[s] = -expf(A_log[j * d_state + s]);
+        A[s] = -fast_exp_ptx(A_log[j * d_state + s]);
     for (int p = 0; p < half_d_state; p++)
         freq[p] = rope_freq[j * half_d_state + p];
     float D_val = D_param[j];
@@ -947,8 +947,7 @@ __global__ void fused_elem_step_kernel(
             val_z += s_gru_Wz[j * gru_row_len + offset + k] * h_old[k];
             val_r += s_gru_Wr[j * gru_row_len + offset + k] * h_old[k];
         }
-        z_gate[j] = 1.0f / (1.0f + expf(-val_z));
-        r_gate[j] = 1.0f / (1.0f + expf(-val_r));
+        gru_gates_ptx(val_z, 0.0f, val_r, 0.0f, z_gate[j], r_gate[j]);
     }
 
     // Candidate: h_tilde = tanh(Wh @ [x, r*h] + bh)
@@ -1213,8 +1212,7 @@ __global__ void fused_elem_step_int8_kernel(
             val_z += s_gru_Wz[j * gru_row_len + 2 + 2*d_model + k] * h_old[k];
             val_r += s_gru_Wr[j * gru_row_len + 2 + 2*d_model + k] * h_old[k];
         }
-        z_gate[j] = 1.0f / (1.0f + expf(-val_z));
-        r_gate[j] = 1.0f / (1.0f + expf(-val_r));
+        gru_gates_ptx(val_z, 0.0f, val_r, 0.0f, z_gate[j], r_gate[j]);
     }
     for (int j = 0; j < gru_hidden; j++) {
         float val = s_gru_bh[j];
@@ -1430,7 +1428,7 @@ __global__ void fused_elem_step_int4_kernel(
         for (int d = 0; d < d_model; d++) { val_z += s_gru_Wz[j*gru_row_len+2+d]*fwd_ctx[d]; val_r += s_gru_Wr[j*gru_row_len+2+d]*fwd_ctx[d]; }
         for (int d = 0; d < d_model; d++) { val_z += s_gru_Wz[j*gru_row_len+2+d_model+d]*bwd_ctx[d]; val_r += s_gru_Wr[j*gru_row_len+2+d_model+d]*bwd_ctx[d]; }
         for (int k = 0; k < gru_hidden; k++) { val_z += s_gru_Wz[j*gru_row_len+2+2*d_model+k]*h_old[k]; val_r += s_gru_Wr[j*gru_row_len+2+2*d_model+k]*h_old[k]; }
-        z_gate[j] = 1.0f/(1.0f+expf(-val_z)); r_gate[j] = 1.0f/(1.0f+expf(-val_r));
+        gru_gates_ptx(val_z, 0.0f, val_r, 0.0f, z_gate[j], r_gate[j]);
     }
     for (int j = 0; j < gru_hidden; j++) {
         float val = s_gru_bh[j];
@@ -1631,7 +1629,7 @@ __global__ void fused_elem_step_mxfp4_kernel(
         for(int d=0;d<d_model;d++){vz+=s_gru_Wz[j*gru_row_len+2+d]*fwd_ctx[d];vr+=s_gru_Wr[j*gru_row_len+2+d]*fwd_ctx[d];}
         for(int d=0;d<d_model;d++){vz+=s_gru_Wz[j*gru_row_len+2+d_model+d]*bwd_ctx[d];vr+=s_gru_Wr[j*gru_row_len+2+d_model+d]*bwd_ctx[d];}
         for(int k=0;k<gru_hidden;k++){vz+=s_gru_Wz[j*gru_row_len+2+2*d_model+k]*h_old[k];vr+=s_gru_Wr[j*gru_row_len+2+2*d_model+k]*h_old[k];}
-        z_gate[j]=1.0f/(1.0f+expf(-vz)); r_gate[j]=1.0f/(1.0f+expf(-vr));
+        gru_gates_ptx(vz, 0.0f, vr, 0.0f, z_gate[j], r_gate[j]);
     }
     for(int j=0;j<gru_hidden;j++){
         float val=s_gru_bh[j];
@@ -1770,7 +1768,7 @@ __global__ void mamba3_scan_batched_kernel(
     const int half_d_state = d_state / 2;
     float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
     for (int s = 0; s < d_state; s++) {
-        A[s] = -expf(A_log[tid * d_state + s]);
+        A[s] = -fast_exp_ptx(A_log[tid * d_state + s]);
     }
     for (int p = 0; p < half_d_state; p++) {
         freq[p] = rope_freq[tid * half_d_state + p];
@@ -1796,7 +1794,7 @@ __global__ void mamba3_scan_batched_kernel(
         float dt_raw = s_dt_proj_b[tid];
         for (int j = 0; j < d_inner; j++)
             dt_raw += s_dt_proj_W[tid * d_inner + j] * s_x_branch[j];
-        float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw)); // stable softplus
+        float dt_val = softplus_ptx(dt_raw);
 
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
 
@@ -1937,7 +1935,7 @@ __global__ void mamba3_scan_combined_kernel(
     const int half_d_state = d_state / 2;
     float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
     for (int s = 0; s < d_state; s++)
-        A[s] = -expf(A_log_ptr[tid * d_state + s]);
+        A[s] = -fast_exp_ptx(A_log_ptr[tid * d_state + s]);
     for (int p = 0; p < half_d_state; p++)
         freq[p] = rope_ptr[tid * half_d_state + p];
     float D_val = D_param_ptr[tid];
@@ -1961,7 +1959,7 @@ __global__ void mamba3_scan_combined_kernel(
         float dt_raw = s_dt_proj_b[tid];
         for (int j = 0; j < d_inner; j++)
             dt_raw += s_dt_proj_W[tid * d_inner + j] * s_x_branch[j];
-        float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw)); // stable softplus
+        float dt_val = softplus_ptx(dt_raw);
 
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
 
@@ -3331,8 +3329,7 @@ __global__ void fused_elem_step_int8_kernel(
             val_z += s_gru_Wz[j * gru_row_len + offset + k] * h_old[k];
             val_r += s_gru_Wr[j * gru_row_len + offset + k] * h_old[k];
         }
-        z_gate[j] = 1.0f / (1.0f + expf(-val_z));
-        r_gate[j] = 1.0f / (1.0f + expf(-val_r));
+        gru_gates_ptx(val_z, 0.0f, val_r, 0.0f, z_gate[j], r_gate[j]);
     }
 
     // Candidate: h_tilde = tanh(Wh @ [x, r*h] + bh)
@@ -3641,8 +3638,7 @@ __global__ void fused_elem_step_int4_kernel(
             val_z += s_gru_Wz[j * gru_row_len + offset + k] * h_old[k];
             val_r += s_gru_Wr[j * gru_row_len + offset + k] * h_old[k];
         }
-        z_gate[j] = 1.0f / (1.0f + expf(-val_z));
-        r_gate[j] = 1.0f / (1.0f + expf(-val_r));
+        gru_gates_ptx(val_z, 0.0f, val_r, 0.0f, z_gate[j], r_gate[j]);
     }
 
     // Candidate: h_tilde = tanh(Wh @ [x, r*h] + bh)
@@ -3892,7 +3888,7 @@ __global__ void persistent_scan_fused_elem_kernel(
 
     const int half_d_state = d_state / 2;
     float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
-    for (int s = 0; s < d_state; s++) A[s] = -expf(A_log[tid * d_state + s]);
+    for (int s = 0; s < d_state; s++) A[s] = -fast_exp_ptx(A_log[tid * d_state + s]);
     for (int p = 0; p < half_d_state; p++) freq[p] = rope_freq[tid * half_d_state + p];
     float D_val = D_param[tid];
 

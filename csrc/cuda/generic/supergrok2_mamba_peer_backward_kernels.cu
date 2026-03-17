@@ -82,7 +82,7 @@ __global__ void bilevel_precompute_kernel(
         float dt_raw = dt_proj_b[j];
         for (int k = 0; k < d_inner; k++)
             dt_raw += dt_proj_W[j * d_inner + k] * x_branch[k];
-        float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw));
+        float dt_val = softplus_ptx(dt_raw);
         pre_dt_val[t * d_inner + j] = dt_val;
     }
 
@@ -114,7 +114,7 @@ __global__ void softplus_bias_kernel(
     if (idx >= N * d_inner) return;
     const int j = idx % d_inner;
     float dt_raw = dt_out[idx] + bias[j];
-    dt_out[idx] = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw));
+    dt_out[idx] = softplus_ptx(dt_raw);
 }
 
 
@@ -220,7 +220,7 @@ __global__ void mamba3_parallel_scan_fwd_save_kernel(
 
     float A[MAX_D_STATE], freq_arr[MAX_D_STATE / 2];
     for (int s = 0; s < d_state; s++)
-        A[s] = -expf(A_log[j * d_state + s]);
+        A[s] = -fast_exp_ptx(A_log[j * d_state + s]);
     for (int p = 0; p < half_d_state; p++)
         freq_arr[p] = rope_freq[j * half_d_state + p];
     float D_val = D_param[j];
@@ -447,7 +447,7 @@ __global__ void mamba3_batched_parallel_scan_fwd_save_kernel(
 
     float A[MAX_D_STATE], freq_arr[MAX_D_STATE / 2];
     for (int s = 0; s < d_state; s++)
-        A[s] = -expf(A_log[j * d_state + s]);
+        A[s] = -fast_exp_ptx(A_log[j * d_state + s]);
     for (int p = 0; p < half_d_state; p++)
         freq_arr[p] = rope_freq[j * half_d_state + p];
     float D_val = D_param[j];
@@ -727,7 +727,7 @@ __global__ void mamba3_scan_fwd_save_kernel(
 
     float A[MAX_D_STATE];
     for (int s = 0; s < d_state; s++)
-        A[s] = -expf(A_log[tid * d_state + s]);
+        A[s] = -fast_exp_ptx(A_log[tid * d_state + s]);
 
     const int half_d_state = d_state / 2;
     float freq[MAX_D_STATE / 2];  // paired RoPE: d_state/2 frequencies
@@ -761,7 +761,7 @@ __global__ void mamba3_scan_fwd_save_kernel(
         for (int j = 0; j < d_inner; j++) {
             dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
         }
-        float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw));
+        float dt_val = softplus_ptx(dt_raw);
         stream_store(&saved_dt[i * d_inner + tid], dt_val);
 
         // Snapshot h for RoPE (fixes read-after-write)
@@ -884,7 +884,7 @@ __global__ void mamba3_scan_fwd_save_batched_kernel(
 
     float A[MAX_D_STATE];
     for (int s = 0; s < d_state; s++)
-        A[s] = -expf(A_log[tid * d_state + s]);
+        A[s] = -fast_exp_ptx(A_log[tid * d_state + s]);
 
     const int half_d_state = d_state / 2;
     float freq[MAX_D_STATE / 2];
@@ -923,7 +923,7 @@ __global__ void mamba3_scan_fwd_save_batched_kernel(
         float dt_raw = dt_proj_b[tid];
         for (int j = 0; j < d_inner; j++)
             dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
-        float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw));
+        float dt_val = softplus_ptx(dt_raw);
         my_stream_store(&saved_dt[i * d_inner + tid], dt_val);
 
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
@@ -1038,7 +1038,7 @@ __global__ void mamba3_scan_backward_kernel(
 
     float A[MAX_D_STATE];
     for (int s = 0; s < d_state; s++)
-        A[s] = -expf(A_log[tid * d_state + s]);
+        A[s] = -fast_exp_ptx(A_log[tid * d_state + s]);
 
     const int half_d_state = d_state / 2;
     float freq[MAX_D_STATE / 2];  // paired RoPE: d_state/2 frequencies
@@ -1526,7 +1526,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
 
     float A[MAX_D_STATE];
     for (int s = 0; s < d_state; s++)
-        A[s] = -expf(A_log[tid * d_state + s]);
+        A[s] = -fast_exp_ptx(A_log[tid * d_state + s]);
 
     const int half_d_state = d_state / 2;
     float freq[MAX_D_STATE / 2];
