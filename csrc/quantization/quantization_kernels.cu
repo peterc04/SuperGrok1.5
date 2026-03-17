@@ -98,10 +98,21 @@ __global__ void quantize_fp8_e4m3_kernel(
     const int warp_id = tid / 32;
 
     float local_max = 0.0f;
+    // Vectorized float4 absmax scan (4x fewer memory transactions)
+    const int stride = gridDim.x * blockDim.x;
+    const int N4 = N / 4 * 4;  // float4-aligned count
+    const float4* input4 = reinterpret_cast<const float4*>(input);
     #pragma unroll 4
-    for (int i = gid; i < N; i += gridDim.x * blockDim.x) {
-        local_max = fmaxf(local_max, fabsf(input[i]));
+    for (int i = gid; i < N4 / 4; i += stride) {
+        float4 v = input4[i];
+        local_max = fmaxf(local_max, fabsf(v.x));
+        local_max = fmaxf(local_max, fabsf(v.y));
+        local_max = fmaxf(local_max, fabsf(v.z));
+        local_max = fmaxf(local_max, fabsf(v.w));
     }
+    // Scalar tail for remaining elements
+    for (int i = N4 + gid; i < N; i += stride)
+        local_max = fmaxf(local_max, fabsf(input[i]));
 
     // Warp-level reduction via shuffle (no shared memory needed for 32 elements)
     #pragma unroll
@@ -122,13 +133,21 @@ __global__ void quantize_fp8_e4m3_kernel(
     if (tid == 0) atomicMax((int*)scale, __float_as_int(local_max));
     __syncthreads();
 
-    // Phase 2: quantize
+    // Phase 2: quantize with vectorized input loads
     float s_val = *scale;
     if (s_val == 0.0f) s_val = 1.0f;
     float inv_scale = FP8_E4M3_MAX / s_val;
 
     #pragma unroll 4
-    for (int i = gid; i < N; i += gridDim.x * blockDim.x) {
+    for (int i = gid; i < N4 / 4; i += stride) {
+        float4 v = input4[i];
+        int base_idx = i * 4;
+        output[base_idx]     = float_to_fp8_e4m3(v.x, inv_scale);
+        output[base_idx + 1] = float_to_fp8_e4m3(v.y, inv_scale);
+        output[base_idx + 2] = float_to_fp8_e4m3(v.z, inv_scale);
+        output[base_idx + 3] = float_to_fp8_e4m3(v.w, inv_scale);
+    }
+    for (int i = N4 + gid; i < N; i += stride) {
         output[i] = float_to_fp8_e4m3(input[i], inv_scale);
     }
 
@@ -173,8 +192,19 @@ __global__ void quantize_int8_kernel(
     const int warp_id = tid / 32;
 
     float local_max = 0.0f;
+    // Vectorized float4 absmax scan (4x fewer memory transactions)
+    const int stride = gridDim.x * blockDim.x;
+    const int N4 = N / 4 * 4;
+    const float4* input4 = reinterpret_cast<const float4*>(input);
     #pragma unroll 4
-    for (int i = gid; i < N; i += gridDim.x * blockDim.x)
+    for (int i = gid; i < N4 / 4; i += stride) {
+        float4 v = input4[i];
+        local_max = fmaxf(local_max, fabsf(v.x));
+        local_max = fmaxf(local_max, fabsf(v.y));
+        local_max = fmaxf(local_max, fabsf(v.z));
+        local_max = fmaxf(local_max, fabsf(v.w));
+    }
+    for (int i = N4 + gid; i < N; i += stride)
         local_max = fmaxf(local_max, fabsf(input[i]));
 
     // Warp-level reduction via shuffle
@@ -193,7 +223,7 @@ __global__ void quantize_int8_kernel(
         for (int offset = 4; offset > 0; offset >>= 1)
             local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, offset));
     }
-    if (tid == 0) atomicMax((int*)scale, __float_as_int(smem_max[0]));
+    if (tid == 0) atomicMax((int*)scale, __float_as_int(local_max));
     __syncthreads();
 
     float s_val = *scale;
@@ -201,7 +231,15 @@ __global__ void quantize_int8_kernel(
     float inv_scale = 127.0f / s_val;
 
     #pragma unroll 4
-    for (int i = gid; i < N; i += gridDim.x * blockDim.x) {
+    for (int i = gid; i < N4 / 4; i += stride) {
+        float4 v = input4[i];
+        int base_idx = i * 4;
+        output[base_idx]     = (int8_t)fminf(fmaxf(rintf(v.x * inv_scale), -127.0f), 127.0f);
+        output[base_idx + 1] = (int8_t)fminf(fmaxf(rintf(v.y * inv_scale), -127.0f), 127.0f);
+        output[base_idx + 2] = (int8_t)fminf(fmaxf(rintf(v.z * inv_scale), -127.0f), 127.0f);
+        output[base_idx + 3] = (int8_t)fminf(fmaxf(rintf(v.w * inv_scale), -127.0f), 127.0f);
+    }
+    for (int i = N4 + gid; i < N; i += stride) {
         float v = rintf(input[i] * inv_scale);
         v = fminf(fmaxf(v, -127.0f), 127.0f);
         output[i] = (int8_t)v;
