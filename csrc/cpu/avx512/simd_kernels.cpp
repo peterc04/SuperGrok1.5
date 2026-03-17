@@ -27,13 +27,23 @@ static bool detect_avx512() {
     return (ebx & (1u << 16)) != 0;
 }
 
+static bool detect_avx2() {
+    unsigned int eax, ebx, ecx, edx;
+    if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx))
+        return false;
+    // AVX2 is bit 5 of EBX
+    return (ebx & (1u << 5)) != 0;
+}
+
 static bool _avx512_ok = detect_avx512();
+static bool _avx2_ok = detect_avx2();
 #else
 static bool _avx512_ok = false;
+static bool _avx2_ok = false;
 #endif
 
 bool simd_available() {
-    return _avx512_ok;
+    return _avx512_ok || _avx2_ok;
 }
 
 
@@ -171,6 +181,145 @@ static void matvec_avx512(const float* W, const float* x, float* out,
 }
 
 #endif  // __AVX512F__
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  AVX2 + FMA Kernels (middle tier for CPUs without AVX-512)
+// ═══════════════════════════════════════════════════════════════════
+
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+
+// AVX2 horizontal sum helper
+static inline float _mm256_reduce_add_ps(__m256 v) {
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 sum = _mm_add_ps(lo, hi);
+    sum = _mm_hadd_ps(sum, sum);
+    sum = _mm_hadd_ps(sum, sum);
+    return _mm_cvtss_f32(sum);
+}
+
+static void adam_update_avx2(
+    float* param, const float* ea, const float* easq,
+    float step_size, float bc2, float eps,
+    float lr, float wd, int N
+) {
+    __m256 v_step = _mm256_set1_ps(-step_size);
+    __m256 v_bc2 = _mm256_set1_ps(bc2);
+    __m256 v_eps = _mm256_set1_ps(eps);
+    __m256 v_decay = _mm256_set1_ps(1.0f - lr * wd);
+
+    int i = 0;
+    for (; i + 8 <= N; i += 8) {
+        __m256 p = _mm256_loadu_ps(param + i);
+        __m256 m = _mm256_loadu_ps(ea + i);
+        __m256 v = _mm256_loadu_ps(easq + i);
+
+        p = _mm256_mul_ps(p, v_decay);
+        __m256 denom = _mm256_add_ps(
+            _mm256_sqrt_ps(_mm256_div_ps(v, v_bc2)),
+            v_eps
+        );
+        p = _mm256_fmadd_ps(v_step, _mm256_div_ps(m, denom), p);
+        _mm256_storeu_ps(param + i, p);
+    }
+    for (; i < N; i++) {
+        param[i] = param[i] * (1.0f - lr * wd)
+                   - step_size * ea[i] / (std::sqrt(easq[i] / bc2) + eps);
+    }
+}
+
+static void lion_update_avx2(
+    float* param, const float* grad, float* momentum,
+    float lr, float beta1, float beta2, float wd, int N
+) {
+    __m256 v_lr = _mm256_set1_ps(lr);
+    __m256 v_b1 = _mm256_set1_ps(beta1);
+    __m256 v_1mb1 = _mm256_set1_ps(1.0f - beta1);
+    __m256 v_b2 = _mm256_set1_ps(beta2);
+    __m256 v_1mb2 = _mm256_set1_ps(1.0f - beta2);
+    __m256 v_decay = _mm256_set1_ps(1.0f - lr * wd);
+    __m256 v_zero = _mm256_setzero_ps();
+    __m256 v_one = _mm256_set1_ps(1.0f);
+    __m256 v_neg1 = _mm256_set1_ps(-1.0f);
+
+    int i = 0;
+    for (; i + 8 <= N; i += 8) {
+        __m256 p = _mm256_loadu_ps(param + i);
+        __m256 g = _mm256_loadu_ps(grad + i);
+        __m256 m = _mm256_loadu_ps(momentum + i);
+
+        // interp = beta1*m + (1-beta1)*g
+        __m256 interp = _mm256_fmadd_ps(v_b1, m, _mm256_mul_ps(v_1mb1, g));
+
+        // sign(interp)
+        __m256 pos_mask = _mm256_cmp_ps(interp, v_zero, _CMP_GT_OQ);
+        __m256 neg_mask = _mm256_cmp_ps(interp, v_zero, _CMP_LT_OQ);
+        __m256 sign_val = _mm256_blendv_ps(
+            _mm256_blendv_ps(v_zero, v_neg1, neg_mask),
+            v_one, pos_mask);
+
+        // p = p * decay - lr * sign
+        p = _mm256_mul_ps(p, v_decay);
+        p = _mm256_fnmadd_ps(v_lr, sign_val, p);
+        _mm256_storeu_ps(param + i, p);
+
+        // m = beta2*m + (1-beta2)*g
+        m = _mm256_fmadd_ps(v_b2, m, _mm256_mul_ps(v_1mb2, g));
+        _mm256_storeu_ps(momentum + i, m);
+    }
+    for (; i < N; i++) {
+        float g = grad[i];
+        float m_val = momentum[i];
+        float interp = beta1 * m_val + (1.0f - beta1) * g;
+        float sign_v = (interp > 0.0f) ? 1.0f : ((interp < 0.0f) ? -1.0f : 0.0f);
+        param[i] = param[i] * (1.0f - lr * wd) - lr * sign_v;
+        momentum[i] = beta2 * m_val + (1.0f - beta2) * g;
+    }
+}
+
+static void ema_amplify_avx2(float* grad, float* ema, float alpha, float lamb, int N) {
+    __m256 v_alpha = _mm256_set1_ps(alpha);
+    __m256 v_1ma = _mm256_set1_ps(1.0f - alpha);
+    __m256 v_lamb = _mm256_set1_ps(lamb);
+
+    int i = 0;
+    for (; i + 8 <= N; i += 8) {
+        __m256 g = _mm256_loadu_ps(grad + i);
+        __m256 e = _mm256_loadu_ps(ema + i);
+
+        e = _mm256_fmadd_ps(v_alpha, e, _mm256_mul_ps(v_1ma, g));
+        _mm256_storeu_ps(ema + i, e);
+
+        g = _mm256_fmadd_ps(v_lamb, e, g);
+        _mm256_storeu_ps(grad + i, g);
+    }
+    for (; i < N; i++) {
+        ema[i] = alpha * ema[i] + (1.0f - alpha) * grad[i];
+        grad[i] += lamb * ema[i];
+    }
+}
+
+static void matvec_avx2(const float* W, const float* x, float* out,
+                         int rows, int cols) {
+    for (int r = 0; r < rows; r++) {
+        __m256 acc = _mm256_setzero_ps();
+        const float* row = W + r * cols;
+        int c = 0;
+        for (; c + 8 <= cols; c += 8) {
+            __m256 w = _mm256_loadu_ps(row + c);
+            __m256 v = _mm256_loadu_ps(x + c);
+            acc = _mm256_fmadd_ps(w, v, acc);
+        }
+        float sum = _mm256_reduce_add_ps(acc);
+        for (; c < cols; c++)
+            sum += row[c] * x[c];
+        out[r] = sum;
+    }
+}
+
+#endif  // __AVX2__ && __FMA__
 
 
 // ═══════════════════════════════════════════════════════════════════
@@ -387,6 +536,12 @@ void simd_adam_update(float* param, const float* ea, const float* easq,
         return;
     }
 #endif
+#if defined(__AVX2__) && defined(__FMA__)
+    if (_avx2_ok) {
+        adam_update_avx2(param, ea, easq, step_size, bc2, eps, lr, wd, N);
+        return;
+    }
+#endif
     adam_update_scalar(param, ea, easq, step_size, bc2, eps, lr, wd, N);
 }
 
@@ -395,6 +550,12 @@ void simd_lion_update(float* param, const float* grad, float* momentum,
 #if defined(__AVX512F__)
     if (_avx512_ok) {
         lion_update_avx512(param, grad, momentum, lr, beta1, beta2, wd, N);
+        return;
+    }
+#endif
+#if defined(__AVX2__) && defined(__FMA__)
+    if (_avx2_ok) {
+        lion_update_avx2(param, grad, momentum, lr, beta1, beta2, wd, N);
         return;
     }
 #endif
@@ -408,6 +569,12 @@ void simd_ema_amplify(float* grad, float* ema, float alpha, float lamb, int N) {
         return;
     }
 #endif
+#if defined(__AVX2__) && defined(__FMA__)
+    if (_avx2_ok) {
+        ema_amplify_avx2(grad, ema, alpha, lamb, N);
+        return;
+    }
+#endif
     ema_amplify_scalar(grad, ema, alpha, lamb, N);
 }
 
@@ -416,6 +583,12 @@ void simd_matvec(const float* W, const float* x, float* out,
 #if defined(__AVX512F__)
     if (_avx512_ok) {
         matvec_avx512(W, x, out, rows, cols);
+        return;
+    }
+#endif
+#if defined(__AVX2__) && defined(__FMA__)
+    if (_avx2_ok) {
+        matvec_avx2(W, x, out, rows, cols);
         return;
     }
 #endif

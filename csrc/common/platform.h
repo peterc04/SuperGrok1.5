@@ -188,6 +188,27 @@ using GpuStream_t = cudaStream_t;
 #endif
 
 // ═══════════════════════════════════════════════════════════════════════
+//  GCN/CDNA scheduler hints (AMD-only occupancy control)
+//
+//  __attribute__((amdgpu_waves_per_eu(min, max))) controls occupancy
+//  on AMD GCN/CDNA by limiting waves per execution unit. On NVIDIA,
+//  __launch_bounds__ serves this purpose (already applied separately).
+//
+//  GROK_WAVES_PER_EU(min, max) — applies attribute on HIP, no-op on CUDA.
+//  GROK_FLAT_WORK_GROUP_SIZE(min, max) — hints block size range for AMD.
+// ═══════════════════════════════════════════════════════════════════════
+
+#if GROK_HIP
+  #define GROK_WAVES_PER_EU(min_waves, max_waves) \
+      __attribute__((amdgpu_waves_per_eu(min_waves, max_waves)))
+  #define GROK_FLAT_WORK_GROUP_SIZE(min_size, max_size) \
+      __attribute__((amdgpu_flat_work_group_size(min_size, max_size)))
+#else
+  #define GROK_WAVES_PER_EU(min_waves, max_waves)
+  #define GROK_FLAT_WORK_GROUP_SIZE(min_size, max_size)
+#endif
+
+// ═══════════════════════════════════════════════════════════════════════
 //  Kernel launch attribute (for configuring smem size)
 // ═══════════════════════════════════════════════════════════════════════
 
