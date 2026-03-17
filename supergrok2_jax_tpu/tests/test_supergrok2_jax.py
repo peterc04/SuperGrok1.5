@@ -671,6 +671,206 @@ def test_j17_jit_no_retrace():
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  J18: Bridge Round-Trip (_to_jnp then _to_torch preserves values)
+# ═══════════════════════════════════════════════════════════════════
+
+def test_j18_bridge_roundtrip():
+    """Verify _to_jnp -> _to_torch preserves values."""
+    import torch
+    from supergrok2_jax_tpu.bridge import _to_jnp, _to_torch
+
+    torch.manual_seed(42)
+    original = torch.randn(8, 4)
+
+    # PyTorch -> JAX -> PyTorch
+    jax_arr = _to_jnp(original)
+    roundtrip = _to_torch(jax_arr)
+
+    assert roundtrip.shape == original.shape, f"Shape mismatch: {roundtrip.shape} vs {original.shape}"
+    assert roundtrip.dtype == original.dtype, f"Dtype mismatch: {roundtrip.dtype} vs {original.dtype}"
+    max_err = (roundtrip - original).abs().max().item()
+    assert max_err < 1e-6, f"Round-trip max error {max_err} >= 1e-6"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  J19: Bridge pytorch_weights_to_jax produces valid MetaNetWeights
+# ═══════════════════════════════════════════════════════════════════
+
+def test_j19_bridge_weights_conversion():
+    """Verify pytorch_weights_to_jax produces a valid MetaNetWeights."""
+    import torch
+    from supergrok2_jax_tpu.bridge import pytorch_weights_to_jax
+    from supergrok2_jax_tpu.mamba3_peer_metanet_jax import MetaNetWeights, MetaNetConfig
+
+    config = MetaNetConfig()
+
+    # Build a minimal mock PyTorch meta-net with matching structure
+    class Linear:
+        def __init__(self, in_f, out_f):
+            self.weight = torch.randn(out_f, in_f)
+            self.bias = torch.randn(out_f)
+
+    class MambaBlock:
+        def __init__(self, cfg):
+            self.in_proj = Linear(cfg.d_model, cfg.d_inner)
+            self.dt_proj = Linear(cfg.d_inner, cfg.d_inner)
+            self.B_proj = Linear(cfg.d_inner, cfg.d_state)
+            self.C_proj = Linear(cfg.d_inner, cfg.d_state)
+            self.A_log = torch.randn(cfg.d_inner, cfg.d_state)
+            self.D = torch.randn(cfg.d_inner)
+            self.rope_freq = torch.randn(cfg.d_inner // 2)
+            self.out_proj = Linear(cfg.d_inner, cfg.d_model)
+
+    class GRUBlock:
+        def __init__(self, cfg):
+            self.W_z = Linear(cfg.d_model + cfg.gru_hidden, cfg.gru_hidden)
+            self.W_r = Linear(cfg.d_model + cfg.gru_hidden, cfg.gru_hidden)
+            self.W_h = Linear(cfg.d_model + cfg.gru_hidden, cfg.gru_hidden)
+
+    class MockMetaNet:
+        def __init__(self, cfg):
+            torch.manual_seed(42)
+            self.input_proj = Linear(2, cfg.d_model)
+            self.mamba_fwd = MambaBlock(cfg)
+            self.mamba_bwd = MambaBlock(cfg)
+            self.gru = GRUBlock(cfg)
+            self.peer_queries = [Linear(cfg.d_model, cfg.d_model) for _ in range(cfg.num_peer_heads)]
+            self.product_keys_A = [torch.randn(cfg.pk_dim, cfg.d_model // 2) for _ in range(cfg.num_peer_heads)]
+            self.product_keys_B = [torch.randn(cfg.pk_dim, cfg.d_model // 2) for _ in range(cfg.num_peer_heads)]
+            self.expert_W1 = torch.randn(cfg.num_experts, cfg.expert_hidden, 1)
+            self.expert_b1 = torch.randn(cfg.num_experts, cfg.expert_hidden)
+            self.expert_W2 = torch.randn(cfg.num_experts, 1, cfg.expert_hidden)
+            self.expert_b2 = torch.randn(cfg.num_experts, 1)
+            self.rescale = 0.1
+            self.expert_counts = torch.zeros(cfg.num_experts)
+
+    mock = MockMetaNet(config)
+    jax_w = pytorch_weights_to_jax(mock)
+
+    # Verify it's a MetaNetWeights
+    assert isinstance(jax_w, MetaNetWeights), f"Expected MetaNetWeights, got {type(jax_w)}"
+
+    # Verify all leaves are finite JAX arrays
+    leaves = jax.tree.leaves(jax_w)
+    assert len(leaves) > 0, "No leaves in MetaNetWeights"
+    for i, leaf in enumerate(leaves):
+        assert hasattr(leaf, 'shape'), f"Leaf {i} is not a JAX array"
+        assert jnp.all(jnp.isfinite(leaf)), f"Leaf {i} has non-finite values"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  J20: INT8 Quantize→Dequantize Max Error < 1/127
+# ═══════════════════════════════════════════════════════════════════
+
+def test_j20_int8_error_bound():
+    """Verify INT8 quantize→dequantize has max error < 1/127."""
+    from supergrok2_jax_tpu.quantization_jax import quantize_int8_symmetric, dequantize_int8
+
+    key = jax.random.PRNGKey(42)
+    # Test with various tensor shapes and value ranges
+    for shape in [(64,), (8, 8), (4, 4, 4)]:
+        original = jax.random.normal(key, shape)
+        key, _ = jax.random.split(key)
+
+        qt = quantize_int8_symmetric(original)
+        recovered = dequantize_int8(qt)
+
+        assert recovered.shape == original.shape, f"Shape mismatch for {shape}"
+        assert recovered.dtype == jnp.float32, f"Dtype not float32 for {shape}"
+
+        max_err = jnp.max(jnp.abs(recovered - original)).item()
+        bound = jnp.max(jnp.abs(original)).item() / 127.0
+        assert max_err <= bound + 1e-7, (
+            f"Max error {max_err:.6f} exceeds bound {bound:.6f} for shape {shape}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  J21: Simple Optimizer 10-Step Training (Loss Decreases)
+# ═══════════════════════════════════════════════════════════════════
+
+def test_j21_simple_optimizer_training():
+    """Verify 10 steps of GrokAdamW on a tiny model decreases loss."""
+    from supergrok2_jax_tpu.simple_optimizers_jax import (
+        GrokAdamWConfig, init_grokadamw_state, grokadamw_step,
+    )
+
+    key = jax.random.PRNGKey(123)
+    k1, k2, k3 = jax.random.split(key, 3)
+
+    # Tiny 2-layer model: y = relu(x @ W1) @ W2
+    W1 = jax.random.normal(k1, (4, 8)) * 0.1
+    W2 = jax.random.normal(k2, (8, 1)) * 0.1
+    x = jax.random.normal(k3, (16, 4))
+    target = jnp.ones((16, 1))
+
+    def loss_fn(W1, W2):
+        h = jax.nn.relu(x @ W1)
+        pred = h @ W2
+        return jnp.mean((pred - target) ** 2)
+
+    config = GrokAdamWConfig(lr=1e-2)
+    s1 = init_grokadamw_state(W1)
+    s2 = init_grokadamw_state(W2)
+
+    initial_loss = loss_fn(W1, W2)
+    for _ in range(10):
+        g1, g2 = jax.grad(loss_fn, argnums=(0, 1))(W1, W2)
+        W1, s1 = grokadamw_step(W1, g1, s1, config)
+        W2, s2 = grokadamw_step(W2, g2, s2, config)
+
+    final_loss = loss_fn(W1, W2)
+    assert final_loss < initial_loss, (
+        f"Loss did not decrease: {initial_loss:.6f} -> {final_loss:.6f}"
+    )
+    assert jnp.all(jnp.isfinite(W1)) and jnp.all(jnp.isfinite(W2)), "Non-finite params"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  J22: SG2 10-Step Training (Loss Decreases)
+# ═══════════════════════════════════════════════════════════════════
+
+def test_j22_sg2_training():
+    """Verify 10 steps of SuperGrok2 optimizer on a tiny model decreases loss."""
+    from supergrok2_jax_tpu.supergrok2_jax import OptimizerConfig, init_state, supergrok2_step
+    from supergrok2_jax_tpu.mamba3_peer_metanet_jax import MetaNetConfig, init_meta_weights
+
+    key = jax.random.PRNGKey(456)
+    k1, k2, k3, k4 = jax.random.split(key, 4)
+
+    # Tiny model
+    params = {
+        'w1': jax.random.normal(k1, (4, 8)) * 0.1,
+        'w2': jax.random.normal(k2, (8, 1)) * 0.1,
+    }
+    x = jax.random.normal(k3, (16, 4))
+    target = jnp.ones((16, 1))
+
+    def loss_fn(p):
+        h = jax.nn.relu(x @ p['w1'])
+        pred = h @ p['w2']
+        return jnp.mean((pred - target) ** 2)
+
+    config = OptimizerConfig(lr=1e-2, warmup_steps=0, warmup_ramp=1)
+    meta_config = MetaNetConfig()
+    meta_weights = init_meta_weights(meta_config, k4)
+    opt_state = init_state(params, config, meta_config)
+
+    initial_loss = loss_fn(params)
+    for _ in range(10):
+        grads = jax.grad(loss_fn)(params)
+        params, opt_state = supergrok2_step(
+            params, grads, opt_state, meta_weights, config, meta_config)
+
+    final_loss = loss_fn(params)
+    assert final_loss < initial_loss, (
+        f"Loss did not decrease: {initial_loss:.6f} -> {final_loss:.6f}"
+    )
+    for k, v in params.items():
+        assert jnp.all(jnp.isfinite(v)), f"Non-finite params[{k}]"
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Main
 # ═══════════════════════════════════════════════════════════════════
 
@@ -731,6 +931,21 @@ if __name__ == "__main__":
 
     print("\n--- J17: JIT No-Retrace ---")
     run_test("J17: JIT no-retrace", test_j17_jit_no_retrace)
+
+    print("\n--- J18: Bridge Round-Trip ---")
+    run_test("J18: _to_jnp/_to_torch round-trip", test_j18_bridge_roundtrip)
+
+    print("\n--- J19: Bridge pytorch_weights_to_jax ---")
+    run_test("J19: pytorch_weights_to_jax produces valid MetaNetWeights", test_j19_bridge_weights_conversion)
+
+    print("\n--- J20: INT8 Quantize/Dequantize Error ---")
+    run_test("J20: INT8 quantize→dequantize max error < 1/127", test_j20_int8_error_bound)
+
+    print("\n--- J21: Simple Optimizer Training ---")
+    run_test("J21: 10-step simple optimizer training loss decreases", test_j21_simple_optimizer_training)
+
+    print("\n--- J22: SG2 Training ---")
+    run_test("J22: 10-step SG2 training loss decreases", test_j22_sg2_training)
 
     # Summary
     print("\n" + "=" * 60)
