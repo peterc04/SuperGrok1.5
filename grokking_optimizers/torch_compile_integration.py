@@ -73,7 +73,7 @@ def _supergrok2_scan_step_impl(
 supergrok_lib.impl("supergrok2_scan_step", _supergrok2_scan_step_impl, "CUDA")
 
 
-@torch.library.impl_abstract("supergrok::supergrok2_scan_step")
+@torch.library.register_fake("supergrok::supergrok2_scan_step")
 def _supergrok2_scan_step_abstract(
     param, grad, exp_avg, exp_avg_sq, gru_hidden, scan_state,
     lr, beta1, beta2, eps, weight_decay, step,
@@ -123,7 +123,7 @@ def _supergrok2_batched_step_impl(
 supergrok_lib.impl("supergrok2_batched_step", _supergrok2_batched_step_impl, "CUDA")
 
 
-@torch.library.impl_abstract("supergrok::supergrok2_batched_step")
+@torch.library.register_fake("supergrok::supergrok2_batched_step")
 def _supergrok2_batched_step_abstract(
     params, grads, exp_avgs, exp_avg_sqs, gru_hiddens, scan_states,
     lr, beta1, beta2, eps, weight_decay, step,
@@ -171,7 +171,7 @@ supergrok_lib.impl(
 )
 
 
-@torch.library.impl_abstract("supergrok::supergrok2_distributed_scan")
+@torch.library.register_fake("supergrok::supergrok2_distributed_scan")
 def _supergrok2_distributed_scan_abstract(
     local_input, scan_state, A_log, D_param,
     d_inner, d_state, world_size, rank,
@@ -221,7 +221,7 @@ supergrok_lib.impl(
 )
 
 
-@torch.library.impl_abstract("supergrok::supergrok2_fused_elem_step")
+@torch.library.register_fake("supergrok::supergrok2_fused_elem_step")
 def _supergrok2_fused_elem_step_abstract(
     param, grad, exp_avg, exp_avg_sq, gru_h, meta_weight,
     lr, beta1, beta2, eps, weight_decay, meta_rescale, step,
@@ -267,7 +267,7 @@ supergrok_lib.impl(
 )
 
 
-@torch.library.impl_abstract("supergrok::supergrok2_scan_backward")
+@torch.library.register_fake("supergrok::supergrok2_scan_backward")
 def _supergrok2_scan_backward_abstract(
     grad_output, scan_state, A_log, D_param, input_cache,
     d_inner, d_state,
@@ -314,7 +314,7 @@ def _supergrok2_cpu_step_impl(
 supergrok_lib.impl("supergrok2_cpu_step", _supergrok2_cpu_step_impl, "CPU")
 
 
-@torch.library.impl_abstract("supergrok::supergrok2_cpu_step")
+@torch.library.register_fake("supergrok::supergrok2_cpu_step")
 def _supergrok2_cpu_step_abstract(
     param, grad, exp_avg, exp_avg_sq, gru_hidden,
     lr, beta1, beta2, eps, weight_decay, step,
