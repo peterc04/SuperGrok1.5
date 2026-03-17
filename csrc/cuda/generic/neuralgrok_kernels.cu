@@ -66,10 +66,13 @@ __global__ void fused_neuralgrok_amplifier_kernel(
     const int tid = threadIdx.x;
 
     // Cooperative load of weights into shared memory
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         sW1[i] = W1[i];
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         sb1[i] = b1[i];
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         sW2[i] = W2[i];
     if (tid == 0)
@@ -85,6 +88,7 @@ __global__ void fused_neuralgrok_amplifier_kernel(
     // -- MLP inference: Linear(1, H) -> ReLU -> Linear(H, 1) -----------
     float mlp_out = 0.0f;
 
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         // Linear(1, H): z = W1[h] * g + b1[h]
         float z = sW1[h] * g + sb1[h];
@@ -341,10 +345,13 @@ __global__ void fused_neuralgrok_full_step_kernel(
 
     const int tid = threadIdx.x;
 
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         sW1[i] = W1[i];
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         sb1[i] = b1[i];
+    #pragma unroll 4
     for (int i = tid; i < H; i += blockDim.x)
         sW2[i] = W2[i];
     if (tid == 0)
@@ -358,6 +365,7 @@ __global__ void fused_neuralgrok_full_step_kernel(
     const float g = static_cast<float>(grad[idx]);
 
     float mlp_out = 0.0f;
+    #pragma unroll 4
     for (int h = 0; h < H; h++) {
         float z = sW1[h] * g + sb1[h];
         z = (z > 0.0f) ? z : 0.0f;

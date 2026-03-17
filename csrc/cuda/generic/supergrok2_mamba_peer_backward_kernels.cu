@@ -63,12 +63,15 @@ __global__ void bilevel_precompute_kernel(
     if (t >= N) return;
 
     float inp[MAX_D_MODEL];
+    #pragma unroll 4
     for (int d = 0; d < d_model; d++)
         inp[d] = x_sorted[t * d_model + d];
 
     float x_branch[MAX_D_INNER];
+    #pragma unroll 4
     for (int j = 0; j < d_inner; j++) {
         float x_val = 0.0f, z_val = 0.0f;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             x_val += in_proj_W[j * d_model + d] * inp[d];
             z_val += in_proj_W[(j + d_inner) * d_model + d] * inp[d];
@@ -78,16 +81,20 @@ __global__ void bilevel_precompute_kernel(
         pre_z_val[t * d_inner + j] = z_val;
     }
 
+    #pragma unroll 4
     for (int j = 0; j < d_inner; j++) {
         float dt_raw = dt_proj_b[j];
+        #pragma unroll 4
         for (int k = 0; k < d_inner; k++)
             dt_raw += dt_proj_W[j * d_inner + k] * x_branch[k];
         float dt_val = softplus_ptx(dt_raw);
         pre_dt_val[t * d_inner + j] = dt_val;
     }
 
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++) {
         float B_val = 0.0f, C_val = 0.0f;
+        #pragma unroll 4
         for (int j = 0; j < d_inner; j++) {
             B_val += B_proj_W[s * d_inner + j] * x_branch[j];
             C_val += C_proj_W[s * d_inner + j] * x_branch[j];
@@ -219,17 +226,21 @@ __global__ void mamba3_parallel_scan_fwd_save_kernel(
     const int half_d_state = d_state / 2;
 
     float A[MAX_D_STATE], freq_arr[MAX_D_STATE / 2];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         A[s] = -fast_exp_ptx(A_log[j * d_state + s]);
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++)
         freq_arr[p] = rope_freq[j * half_d_state + p];
     float D_val = D_param[j];
 
     float h_init_all[MAX_D_STATE];
     if (initial_state != nullptr) {
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++)
             h_init_all[s] = initial_state[j * d_state + s];
     } else {
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++)
             h_init_all[s] = 0.0f;
     }
@@ -251,6 +262,7 @@ __global__ void mamba3_parallel_scan_fwd_save_kernel(
         (elem_out).b1 = dt * B_o * x_val; \
     } while(0)
 
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++) {
         const int s_e = 2 * p, s_o = 2 * p + 1;
         const float A_e = A[s_e], A_o = A[s_o];
@@ -259,6 +271,7 @@ __global__ void mamba3_parallel_scan_fwd_save_kernel(
 
         // Step 1: Sequential scan within chunk → get chunk summary
         Affine2x2 summary = affine_identity();
+        #pragma unroll 4
         for (int step = 0; step < my_count; step++) {
             int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
             Affine2x2 elem;
@@ -273,6 +286,7 @@ __global__ void mamba3_parallel_scan_fwd_save_kernel(
         __syncthreads();
 
         // Step 2: Blelloch exclusive prefix scan on chunk summaries
+        #pragma unroll 4
         for (int stride = 1; stride < num_threads; stride *= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -299,6 +313,7 @@ __global__ void mamba3_parallel_scan_fwd_save_kernel(
         __syncthreads();
 
         // Down-sweep
+        #pragma unroll 4
         for (int stride = num_threads / 2; stride >= 1; stride /= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -325,6 +340,7 @@ __global__ void mamba3_parallel_scan_fwd_save_kernel(
 
         // Step 3: Re-scan chunk with prefix, compute output + save states
         Affine2x2 running = prefix;
+        #pragma unroll 4
         for (int step = 0; step < my_count; step++) {
             int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
             int seq_step = my_start + step;  // sequential step index
@@ -370,6 +386,7 @@ __global__ void mamba3_parallel_scan_fwd_save_kernel(
     #undef BUILD_AFFINE_SAVE
 
     // Apply SiLU gating and D skip connection
+    #pragma unroll 4
     for (int step = 0; step < my_count; step++) {
         int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
         float z = pre_z_val[t * d_inner + j];
@@ -446,14 +463,17 @@ __global__ void mamba3_batched_parallel_scan_fwd_save_kernel(
     const int half_d_state = d_state / 2;
 
     float A[MAX_D_STATE], freq_arr[MAX_D_STATE / 2];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         A[s] = -fast_exp_ptx(A_log[j * d_state + s]);
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++)
         freq_arr[p] = rope_freq[j * half_d_state + p];
     float D_val = D_param[j];
 
     float h_init_all[MAX_D_STATE];
     const float* init_ptr = initial_states + param_idx * d_inner * d_state;
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         h_init_all[s] = init_ptr[j * d_state + s];
 
@@ -474,6 +494,7 @@ __global__ void mamba3_batched_parallel_scan_fwd_save_kernel(
         (elem_out).b1 = dt * B_o * x_val; \
     } while(0)
 
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++) {
         const int s_e = 2 * p, s_o = 2 * p + 1;
         const float A_e = A[s_e], A_o = A[s_o];
@@ -482,6 +503,7 @@ __global__ void mamba3_batched_parallel_scan_fwd_save_kernel(
 
         // Step 1: Sequential scan within chunk
         Affine2x2 summary = affine_identity();
+        #pragma unroll 4
         for (int step = 0; step < my_count; step++) {
             int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
             Affine2x2 elem;
@@ -496,6 +518,7 @@ __global__ void mamba3_batched_parallel_scan_fwd_save_kernel(
         __syncthreads();
 
         // Step 2: Blelloch exclusive prefix scan
+        #pragma unroll 4
         for (int stride = 1; stride < num_threads; stride *= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -519,6 +542,7 @@ __global__ void mamba3_batched_parallel_scan_fwd_save_kernel(
             smem[last+4] = 0.0f; smem[last+5] = 0.0f;
         }
         __syncthreads();
+        #pragma unroll 4
         for (int stride = num_threads / 2; stride >= 1; stride /= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -545,6 +569,7 @@ __global__ void mamba3_batched_parallel_scan_fwd_save_kernel(
 
         // Step 3: Re-scan with prefix, save states
         Affine2x2 running = prefix;
+        #pragma unroll 4
         for (int step = 0; step < my_count; step++) {
             int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
             int seq_step = my_start + step;
@@ -588,6 +613,7 @@ __global__ void mamba3_batched_parallel_scan_fwd_save_kernel(
     #undef BUILD_AFFINE_BATCH
 
     // SiLU gating + D skip connection
+    #pragma unroll 4
     for (int step = 0; step < my_count; step++) {
         int t = reverse ? (N - 1 - (my_start + step)) : (my_start + step);
         float z = my_pre_z[t * d_inner + j];
@@ -720,28 +746,34 @@ __global__ void mamba3_scan_fwd_save_kernel(
     float h[MAX_D_STATE];
     float h_snap[MAX_D_STATE]; // snapshot for RoPE
     if (initial_state != nullptr) {
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) h[s] = initial_state[tid * d_state + s];
     } else {
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) h[s] = 0.0f;
     }
 
     float A[MAX_D_STATE];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         A[s] = -fast_exp_ptx(A_log[tid * d_state + s]);
 
     const int half_d_state = d_state / 2;
     float freq[MAX_D_STATE / 2];  // paired RoPE: d_state/2 frequencies
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++)
         freq[p] = rope_freq[tid * half_d_state + p];
 
     float D_val = D_param[tid];
 
+    #pragma unroll 4
     for (int step = 0; step < N; step++) {
         int i = reverse ? (N - 1 - step) : step;
 
         // Input projection
         float x_val = 0.0f;
         float z_val = 0.0f;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             float inp = x_sorted[i * d_model + d];
             x_val += in_proj_W[tid * d_model + d] * inp;
@@ -758,6 +790,7 @@ __global__ void mamba3_scan_fwd_save_kernel(
 
         // FULL dt projection
         float dt_raw = dt_proj_b[tid];
+        #pragma unroll 4
         for (int j = 0; j < d_inner; j++) {
             dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
         }
@@ -765,14 +798,17 @@ __global__ void mamba3_scan_fwd_save_kernel(
         stream_store(&saved_dt[i * d_inner + tid], dt_val);
 
         // Snapshot h for RoPE (fixes read-after-write)
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
 
         // State update with trapezoidal + RoPE
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) {
             float A_bar = (1.0f + dt_val * A[s] / 2.0f) / (1.0f - dt_val * A[s] / 2.0f + 1e-8f);
 
             // FULL B projection
             float B_val = 0.0f;
+            #pragma unroll 4
             for (int j = 0; j < d_inner; j++) {
                 B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
             }
@@ -794,12 +830,14 @@ __global__ void mamba3_scan_fwd_save_kernel(
 
         // Save state after update (checkpointed or every step)
         if (checkpoint_interval <= 1) {
+            #pragma unroll 4
             for (int s = 0; s < d_state; s++)
                 stream_store(&saved_states[(i * d_inner + tid) * d_state + s], h[s]);
         } else {
             bool at_seg_end = ((step + 1) % checkpoint_interval == 0) || (step == N - 1);
             if (at_seg_end) {
                 int ckpt_idx = step / checkpoint_interval;
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++)
                     stream_store(&saved_states[(ckpt_idx * d_inner + tid) * d_state + s], h[s]);
             }
@@ -807,8 +845,10 @@ __global__ void mamba3_scan_fwd_save_kernel(
 
         // FULL C projection for output
         float y_val = 0.0f;
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) {
             float C_val = 0.0f;
+            #pragma unroll 4
             for (int j = 0; j < d_inner; j++) {
                 C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
             }
@@ -822,6 +862,7 @@ __global__ void mamba3_scan_fwd_save_kernel(
         __syncthreads(); // ensure all threads done before next step
     }
 
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         final_state[tid * d_state + s] = h[s];
 }
@@ -880,14 +921,17 @@ __global__ void mamba3_scan_fwd_save_batched_kernel(
     // State in registers — load from initial_state
     float h[MAX_D_STATE], h_snap[MAX_D_STATE];
     const float* my_init = initial_states + param_idx * d_inner * d_state;
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++) h[s] = my_init[tid * d_state + s];
 
     float A[MAX_D_STATE];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         A[s] = -fast_exp_ptx(A_log[tid * d_state + s]);
 
     const int half_d_state = d_state / 2;
     float freq[MAX_D_STATE / 2];
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++)
         freq[p] = rope_freq[tid * half_d_state + p];
 
@@ -903,10 +947,12 @@ __global__ void mamba3_scan_fwd_save_batched_kernel(
     float* my_saved_z = saved_z_packed + start * d_inner;
     float* my_saved_dt = saved_dt_packed + start * d_inner;
 
+    #pragma unroll 4
     for (int step = 0; step < N; step++) {
         int i = reverse ? (N - 1 - step) : step;
 
         float x_val = 0.0f, z_val = 0.0f;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             float inp = my_x[i * d_model + d];
             x_val += in_proj_W[tid * d_model + d] * inp;
@@ -921,16 +967,20 @@ __global__ void mamba3_scan_fwd_save_batched_kernel(
         __syncthreads();
 
         float dt_raw = dt_proj_b[tid];
+        #pragma unroll 4
         for (int j = 0; j < d_inner; j++)
             dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
         float dt_val = softplus_ptx(dt_raw);
         my_stream_store(&saved_dt[i * d_inner + tid], dt_val);
 
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
 
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) {
             float A_bar = (1.0f + dt_val * A[s] / 2.0f) / (1.0f - dt_val * A[s] / 2.0f + 1e-8f);
             float B_val = 0.0f;
+            #pragma unroll 4
             for (int j = 0; j < d_inner; j++)
                 B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
             float B_bar = dt_val * B_val;
@@ -949,12 +999,14 @@ __global__ void mamba3_scan_fwd_save_batched_kernel(
 
         // Save state after update (checkpointed or every step)
         if (checkpoint_interval <= 1) {
+            #pragma unroll 4
             for (int s = 0; s < d_state; s++)
                 my_stream_store(&saved_states[(i * d_inner + tid) * d_state + s], h[s]);
         } else {
             bool at_seg_end = ((step + 1) % checkpoint_interval == 0) || (step == N - 1);
             if (at_seg_end) {
                 int ckpt_idx = step / checkpoint_interval;
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++)
                     my_stream_store(&saved_states[(ckpt_idx * d_inner + tid) * d_state + s], h[s]);
             }
@@ -962,8 +1014,10 @@ __global__ void mamba3_scan_fwd_save_batched_kernel(
 
         // Output with C projection
         float y_val = 0.0f;
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) {
             float C_val = 0.0f;
+            #pragma unroll 4
             for (int j = 0; j < d_inner; j++)
                 C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
             y_val += h[s] * C_val;
@@ -976,6 +1030,7 @@ __global__ void mamba3_scan_fwd_save_batched_kernel(
     }
 
     float* my_final = final_states + param_idx * d_inner * d_state;
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         my_final[tid * d_state + s] = h[s];
 }
@@ -1037,11 +1092,13 @@ __global__ void mamba3_scan_backward_kernel(
     float* s_d_dt_raw = smem + d_inner;                       // [d_inner]
 
     float A[MAX_D_STATE];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         A[s] = -fast_exp_ptx(A_log[tid * d_state + s]);
 
     const int half_d_state = d_state / 2;
     float freq[MAX_D_STATE / 2];  // paired RoPE: d_state/2 frequencies
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++)
         freq[p] = rope_freq[tid * half_d_state + p];
 
@@ -1052,19 +1109,23 @@ __global__ void mamba3_scan_backward_kernel(
     float d_A_log_acc[MAX_D_STATE];
     float d_freq_acc[MAX_D_STATE / 2];  // paired: d_state/2 frequencies
     float d_dt_proj_b_acc = 0.0f;
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++) {
         d_A_log_acc[s] = 0.0f;
     }
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++) {
         d_freq_acc[p] = 0.0f;
     }
     // Full dt_proj_W gradient (not just diagonal)
     float d_dt_proj_W_row[MAX_D_INNER];
+    #pragma unroll 4
     for (int j = 0; j < d_inner; j++) d_dt_proj_W_row[j] = 0.0f;
 
     // Small per-thread accumulators (16 floats each — fit in registers)
     float d_in_proj_W_x_local[MAX_D_MODEL];  // row tid of d_in_proj_W
     float d_in_proj_W_z_local[MAX_D_MODEL];  // row (tid+d_inner) of d_in_proj_W
+    #pragma unroll 4
     for (int d = 0; d < d_model; d++) {
         d_in_proj_W_x_local[d] = 0.0f;
         d_in_proj_W_z_local[d] = 0.0f;
@@ -1072,6 +1133,7 @@ __global__ void mamba3_scan_backward_kernel(
 
     // Gradient of state: dh[s] propagated backward through time
     float dh[MAX_D_STATE];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++) dh[s] = 0.0f;
 
     // ---- Macro-like per-step backward block (used in both paths) ----
@@ -1083,6 +1145,7 @@ __global__ void mamba3_scan_backward_kernel(
         // ════════════════════════════════════════════════════════════
         //  ORIGINAL PATH: saved_states has all N states
         // ════════════════════════════════════════════════════════════
+        #pragma unroll 4
         for (int step = N - 1; step >= 0; step--) {
             int i = reverse ? (N - 1 - step) : step;
 
@@ -1098,8 +1161,10 @@ __global__ void mamba3_scan_backward_kernel(
             float silu_z = z_val * sig_z;
 
             float y_val = 0.0f;
+            #pragma unroll 4
             for (int s = 0; s < d_state; s++) {
                 float C_val = 0.0f;
+                #pragma unroll 4
                 for (int j = 0; j < d_inner; j++)
                     C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
                 y_val += saved_states[(i * d_inner + tid) * d_state + s] * C_val;
@@ -1112,9 +1177,11 @@ __global__ void mamba3_scan_backward_kernel(
             d_D_acc += d_out * x_val;
 
             float d_x_from_C = 0.0f;
+            #pragma unroll 4
             for (int s = 0; s < d_state; s++) {
                 float h_s = saved_states[(i * d_inner + tid) * d_state + s];
                 float C_val = 0.0f;
+                #pragma unroll 4
                 for (int j = 0; j < d_inner; j++)
                     C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
                 dh[s] += d_y_val * C_val;
@@ -1129,26 +1196,32 @@ __global__ void mamba3_scan_backward_kernel(
             float h_prev[MAX_D_STATE];
             if (step > 0) {
                 int i_prev = reverse ? (N - step) : (step - 1);
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++)
                     h_prev[s] = saved_states[(i_prev * d_inner + tid) * d_state + s];
             } else {
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++)
                     h_prev[s] = (initial_state != nullptr)
                         ? initial_state[tid * d_state + s] : 0.0f;
             }
 
             float dh_snap[MAX_D_STATE];
+            #pragma unroll 4
             for (int s = 0; s < d_state; s++) dh_snap[s] = dh[s];
+            #pragma unroll 4
             for (int s = 0; s < d_state; s++) dh[s] = 0.0f;
 
             float d_dt_val = 0.0f;
             float d_x_from_scan = 0.0f;
 
+            #pragma unroll 4
             for (int s = 0; s < d_state; s++) {
                 float half_dtA = dt_val * A[s] / 2.0f;
                 float denom_val = 1.0f - half_dtA + 1e-8f;
                 float A_bar = (1.0f + half_dtA) / denom_val;
                 float B_val = 0.0f;
+                #pragma unroll 4
                 for (int j = 0; j < d_inner; j++)
                     B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
                 float B_bar = dt_val * B_val;
@@ -1192,23 +1265,27 @@ __global__ void mamba3_scan_backward_kernel(
             }
 
             float dt_raw = dt_proj_b[tid];
+            #pragma unroll 4
             for (int j = 0; j < d_inner; j++)
                 dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
             float sig_dt = 1.0f / (1.0f + expf(-dt_raw));
             float d_dt_raw = d_dt_val * sig_dt;
 
             d_dt_proj_b_acc += d_dt_raw;
+            #pragma unroll 4
             for (int j = 0; j < d_inner; j++)
                 d_dt_proj_W_row[j] += d_dt_raw * s_x_branch[j];
 
             s_d_dt_raw[tid] = d_dt_raw;
             __syncthreads();
             float d_x_from_dt = 0.0f;
+            #pragma unroll 4
             for (int t = 0; t < d_inner; t++)
                 d_x_from_dt += s_d_dt_raw[t] * dt_proj_W[t * d_inner + tid];
 
             float d_x_val = d_x_from_D + d_x_from_C + d_x_from_scan + d_x_from_dt;
 
+            #pragma unroll 4
             for (int d = 0; d < d_model; d++) {
                 float inp = x_sorted[i * d_model + d];
                 d_in_proj_W_x_local[d] += d_x_val * inp;
@@ -1231,6 +1308,7 @@ __global__ void mamba3_scan_backward_kernel(
         // seg_h[k] = state after local step k-1 (for k >= 1)
         float seg_h[(MAX_CKPT_INTERVAL + 1) * MAX_D_STATE];
 
+        #pragma unroll 4
         for (int seg = num_segments - 1; seg >= 0; seg--) {
             int seg_start = seg * checkpoint_interval;
             int seg_end = (seg_start + checkpoint_interval < N)
@@ -1239,17 +1317,20 @@ __global__ void mamba3_scan_backward_kernel(
 
             // === Phase 1: Load checkpoint input state ===
             if (seg == 0) {
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++)
                     seg_h[s] = (initial_state != nullptr)
                                ? initial_state[tid * d_state + s] : 0.0f;
             } else {
                 // Checkpoint[seg-1] stores state at end of previous segment
                 int ckpt_idx = seg - 1;
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++)
                     seg_h[s] = saved_states[(ckpt_idx * d_inner + tid) * d_state + s];
             }
 
             // === Phase 2: Forward-recompute all states in this segment ===
+            #pragma unroll 4
             for (int local = 0; local < seg_len; local++) {
                 int step = seg_start + local;
                 int i = reverse ? (N - 1 - step) : step;
@@ -1262,13 +1343,16 @@ __global__ void mamba3_scan_backward_kernel(
 
                 // Snapshot for RoPE
                 float h_snap_r[MAX_D_STATE];
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++)
                     h_snap_r[s] = seg_h[local * MAX_D_STATE + s];
 
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++) {
                     float A_bar = (1.0f + dt_val * A[s] / 2.0f)
                                   / (1.0f - dt_val * A[s] / 2.0f + 1e-8f);
                     float B_val = 0.0f;
+                    #pragma unroll 4
                     for (int j = 0; j < d_inner; j++)
                         B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
                     float B_bar = dt_val * B_val;
@@ -1288,6 +1372,7 @@ __global__ void mamba3_scan_backward_kernel(
             }
 
             // === Phase 3: Backward through this segment (reverse order) ===
+            #pragma unroll 4
             for (int local = seg_len - 1; local >= 0; local--) {
                 int step = seg_start + local;
                 int i = reverse ? (N - 1 - step) : step;
@@ -1305,8 +1390,10 @@ __global__ void mamba3_scan_backward_kernel(
 
                 // Use recomputed state: seg_h[(local+1)*MAX_D_STATE + s]
                 float y_val = 0.0f;
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++) {
                     float C_val = 0.0f;
+                    #pragma unroll 4
                     for (int j = 0; j < d_inner; j++)
                         C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
                     y_val += seg_h[(local + 1) * MAX_D_STATE + s] * C_val;
@@ -1319,9 +1406,11 @@ __global__ void mamba3_scan_backward_kernel(
                 d_D_acc += d_out * x_val;
 
                 float d_x_from_C = 0.0f;
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++) {
                     float h_s = seg_h[(local + 1) * MAX_D_STATE + s];
                     float C_val = 0.0f;
+                    #pragma unroll 4
                     for (int j = 0; j < d_inner; j++)
                         C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
                     dh[s] += d_y_val * C_val;
@@ -1335,21 +1424,26 @@ __global__ void mamba3_scan_backward_kernel(
 
                 // h_prev from recomputed segment states
                 float h_prev[MAX_D_STATE];
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++)
                     h_prev[s] = seg_h[local * MAX_D_STATE + s];
 
                 float dh_snap[MAX_D_STATE];
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++) dh_snap[s] = dh[s];
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++) dh[s] = 0.0f;
 
                 float d_dt_val = 0.0f;
                 float d_x_from_scan = 0.0f;
 
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++) {
                     float half_dtA = dt_val * A[s] / 2.0f;
                     float denom_val = 1.0f - half_dtA + 1e-8f;
                     float A_bar = (1.0f + half_dtA) / denom_val;
                     float B_val = 0.0f;
+                    #pragma unroll 4
                     for (int j = 0; j < d_inner; j++)
                         B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
                     float B_bar = dt_val * B_val;
@@ -1393,23 +1487,27 @@ __global__ void mamba3_scan_backward_kernel(
                 }
 
                 float dt_raw = dt_proj_b[tid];
+                #pragma unroll 4
                 for (int j = 0; j < d_inner; j++)
                     dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
                 float sig_dt = 1.0f / (1.0f + expf(-dt_raw));
                 float d_dt_raw = d_dt_val * sig_dt;
 
                 d_dt_proj_b_acc += d_dt_raw;
+                #pragma unroll 4
                 for (int j = 0; j < d_inner; j++)
                     d_dt_proj_W_row[j] += d_dt_raw * s_x_branch[j];
 
                 s_d_dt_raw[tid] = d_dt_raw;
                 __syncthreads();
                 float d_x_from_dt = 0.0f;
+                #pragma unroll 4
                 for (int t = 0; t < d_inner; t++)
                     d_x_from_dt += s_d_dt_raw[t] * dt_proj_W[t * d_inner + tid];
 
                 float d_x_val = d_x_from_D + d_x_from_C + d_x_from_scan + d_x_from_dt;
 
+                #pragma unroll 4
                 for (int d = 0; d < d_model; d++) {
                     float inp = x_sorted[i * d_model + d];
                     d_in_proj_W_x_local[d] += d_x_val * inp;
@@ -1426,18 +1524,22 @@ __global__ void mamba3_scan_backward_kernel(
     // Write accumulated per-thread parameter gradients
     atomicAdd(&d_D_param[tid], d_D_acc);
     atomicAdd(&d_dt_proj_b[tid], d_dt_proj_b_acc);
+    #pragma unroll 4
     for (int j = 0; j < d_inner; j++) {
         atomicAdd(&d_dt_proj_W[tid * d_inner + j], d_dt_proj_W_row[j]);
     }
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++) {
         atomicAdd(&d_A_log[tid * d_state + s], d_A_log_acc[s]);
     }
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++) {
         atomicAdd(&d_rope_freq[tid * half_d_state + p], d_freq_acc[p]);
     }
     // Two-pass: C_proj_W and B_proj_W gradients are computed via GEMM in the launcher
     // (d_C_vals_buf and d_B_vals_buf were filled per-timestep above)
     // Write per-thread in_proj_W gradients
+    #pragma unroll 4
     for (int d = 0; d < d_model; d++) {
         atomicAdd(&d_in_proj_W[tid * d_model + d], d_in_proj_W_x_local[d]);
         atomicAdd(&d_in_proj_W[(tid + d_inner) * d_model + d], d_in_proj_W_z_local[d]);
@@ -1525,11 +1627,13 @@ __global__ void mamba3_scan_backward_batched_kernel(
     float* my_d_B_vals = d_B_vals_buf + start * d_state;
 
     float A[MAX_D_STATE];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         A[s] = -fast_exp_ptx(A_log[tid * d_state + s]);
 
     const int half_d_state = d_state / 2;
     float freq[MAX_D_STATE / 2];
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++)
         freq[p] = rope_freq[tid * half_d_state + p];
 
@@ -1539,20 +1643,25 @@ __global__ void mamba3_scan_backward_batched_kernel(
     float d_A_log_acc[MAX_D_STATE];
     float d_freq_acc[MAX_D_STATE / 2];
     float d_dt_proj_b_acc = 0.0f;
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++) d_A_log_acc[s] = 0.0f;
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++) d_freq_acc[p] = 0.0f;
     float d_dt_proj_W_row[MAX_D_INNER];
+    #pragma unroll 4
     for (int j = 0; j < d_inner; j++) d_dt_proj_W_row[j] = 0.0f;
 
     // Small per-thread accumulators (fit in registers)
     float d_in_proj_W_x_local[MAX_D_MODEL];
     float d_in_proj_W_z_local[MAX_D_MODEL];
+    #pragma unroll 4
     for (int d = 0; d < d_model; d++) {
         d_in_proj_W_x_local[d] = 0.0f;
         d_in_proj_W_z_local[d] = 0.0f;
     }
 
     float dh[MAX_D_STATE];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++) dh[s] = 0.0f;
 
     const float* my_init = initial_states + param_idx * d_inner * d_state;
@@ -1561,6 +1670,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
         // ════════════════════════════════════════════════════════
         //  ORIGINAL PATH: saved_states has all N states
         // ════════════════════════════════════════════════════════
+        #pragma unroll 4
         for (int step = N - 1; step >= 0; step--) {
             int i = reverse ? (N - 1 - step) : step;
 
@@ -1576,8 +1686,10 @@ __global__ void mamba3_scan_backward_batched_kernel(
             float silu_z = z_val * sig_z;
 
             float y_val = 0.0f;
+            #pragma unroll 4
             for (int s = 0; s < d_state; s++) {
                 float C_val = 0.0f;
+                #pragma unroll 4
                 for (int j = 0; j < d_inner; j++)
                     C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
                 y_val += my_stream_load(&saved_states[(i * d_inner + tid) * d_state + s]) * C_val;
@@ -1590,9 +1702,11 @@ __global__ void mamba3_scan_backward_batched_kernel(
             d_D_acc += d_out * x_val;
 
             float d_x_from_C = 0.0f;
+            #pragma unroll 4
             for (int s = 0; s < d_state; s++) {
                 float h_s = my_stream_load(&saved_states[(i * d_inner + tid) * d_state + s]);
                 float C_val = 0.0f;
+                #pragma unroll 4
                 for (int j = 0; j < d_inner; j++)
                     C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
                 dh[s] += d_y_val * C_val;
@@ -1607,25 +1721,31 @@ __global__ void mamba3_scan_backward_batched_kernel(
             float h_prev[MAX_D_STATE];
             if (step > 0) {
                 int i_prev = reverse ? (N - step) : (step - 1);
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++)
                     h_prev[s] = my_stream_load(&saved_states[(i_prev * d_inner + tid) * d_state + s]);
             } else {
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++)
                     h_prev[s] = my_init[tid * d_state + s];
             }
 
             float dh_snap[MAX_D_STATE];
+            #pragma unroll 4
             for (int s = 0; s < d_state; s++) dh_snap[s] = dh[s];
+            #pragma unroll 4
             for (int s = 0; s < d_state; s++) dh[s] = 0.0f;
 
             float d_dt_val = 0.0f;
             float d_x_from_scan = 0.0f;
 
+            #pragma unroll 4
             for (int s = 0; s < d_state; s++) {
                 float half_dtA = dt_val * A[s] / 2.0f;
                 float denom_val = 1.0f - half_dtA + 1e-8f;
                 float A_bar = (1.0f + half_dtA) / denom_val;
                 float B_val = 0.0f;
+                #pragma unroll 4
                 for (int j = 0; j < d_inner; j++)
                     B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
                 float B_bar = dt_val * B_val;
@@ -1669,23 +1789,27 @@ __global__ void mamba3_scan_backward_batched_kernel(
             }
 
             float dt_raw = dt_proj_b[tid];
+            #pragma unroll 4
             for (int j = 0; j < d_inner; j++)
                 dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
             float sig_dt = 1.0f / (1.0f + expf(-dt_raw));
             float d_dt_raw = d_dt_val * sig_dt;
 
             d_dt_proj_b_acc += d_dt_raw;
+            #pragma unroll 4
             for (int j = 0; j < d_inner; j++)
                 d_dt_proj_W_row[j] += d_dt_raw * s_x_branch[j];
 
             s_d_dt_raw[tid] = d_dt_raw;
             __syncthreads();
             float d_x_from_dt = 0.0f;
+            #pragma unroll 4
             for (int t = 0; t < d_inner; t++)
                 d_x_from_dt += s_d_dt_raw[t] * dt_proj_W[t * d_inner + tid];
 
             float d_x_val = d_x_from_D + d_x_from_C + d_x_from_scan + d_x_from_dt;
 
+            #pragma unroll 4
             for (int d = 0; d < d_model; d++) {
                 float inp = my_x_sorted[i * d_model + d];
                 d_in_proj_W_x_local[d] += d_x_val * inp;
@@ -1703,6 +1827,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
         int num_segments = (N + checkpoint_interval - 1) / checkpoint_interval;
         float seg_h[(MAX_CKPT_INTERVAL + 1) * MAX_D_STATE];
 
+        #pragma unroll 4
         for (int seg = num_segments - 1; seg >= 0; seg--) {
             int seg_start = seg * checkpoint_interval;
             int seg_end = (seg_start + checkpoint_interval < N)
@@ -1711,15 +1836,18 @@ __global__ void mamba3_scan_backward_batched_kernel(
 
             // Load checkpoint input state
             if (seg == 0) {
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++)
                     seg_h[s] = my_init[tid * d_state + s];
             } else {
                 int ckpt_idx = seg - 1;
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++)
                     seg_h[s] = my_stream_load(&saved_states[(ckpt_idx * d_inner + tid) * d_state + s]);
             }
 
             // Forward-recompute segment states
+            #pragma unroll 4
             for (int local = 0; local < seg_len; local++) {
                 int step = seg_start + local;
                 int i = reverse ? (N - 1 - step) : step;
@@ -1728,12 +1856,15 @@ __global__ void mamba3_scan_backward_batched_kernel(
                 s_x_branch[tid] = x_val;
                 __syncthreads();
                 float h_snap_r[MAX_D_STATE];
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++)
                     h_snap_r[s] = seg_h[local * MAX_D_STATE + s];
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++) {
                     float A_bar = (1.0f + dt_val * A[s] / 2.0f)
                                   / (1.0f - dt_val * A[s] / 2.0f + 1e-8f);
                     float B_val = 0.0f;
+                    #pragma unroll 4
                     for (int j = 0; j < d_inner; j++)
                         B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
                     float B_bar = dt_val * B_val;
@@ -1751,6 +1882,7 @@ __global__ void mamba3_scan_backward_batched_kernel(
             }
 
             // Backward through segment
+            #pragma unroll 4
             for (int local = seg_len - 1; local >= 0; local--) {
                 int step = seg_start + local;
                 int i = reverse ? (N - 1 - step) : step;
@@ -1763,8 +1895,10 @@ __global__ void mamba3_scan_backward_batched_kernel(
                 float sig_z = 1.0f / (1.0f + expf(-z_val));
                 float silu_z = z_val * sig_z;
                 float y_val = 0.0f;
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++) {
                     float C_val = 0.0f;
+                    #pragma unroll 4
                     for (int j = 0; j < d_inner; j++)
                         C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
                     y_val += seg_h[(local + 1) * MAX_D_STATE + s] * C_val;
@@ -1775,9 +1909,11 @@ __global__ void mamba3_scan_backward_batched_kernel(
                 float d_x_from_D = d_out * D_val;
                 d_D_acc += d_out * x_val;
                 float d_x_from_C = 0.0f;
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++) {
                     float h_s = seg_h[(local + 1) * MAX_D_STATE + s];
                     float C_val = 0.0f;
+                    #pragma unroll 4
                     for (int j = 0; j < d_inner; j++)
                         C_val += C_proj_W[s * d_inner + j] * s_x_branch[j];
                     dh[s] += d_y_val * C_val;
@@ -1789,18 +1925,23 @@ __global__ void mamba3_scan_backward_batched_kernel(
                     d_x_from_C += d_y_val * h_s * C_proj_W[s * d_inner + tid];
                 }
                 float h_prev[MAX_D_STATE];
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++)
                     h_prev[s] = seg_h[local * MAX_D_STATE + s];
                 float dh_snap[MAX_D_STATE];
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++) dh_snap[s] = dh[s];
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++) dh[s] = 0.0f;
                 float d_dt_val = 0.0f;
                 float d_x_from_scan = 0.0f;
+                #pragma unroll 4
                 for (int s = 0; s < d_state; s++) {
                     float half_dtA = dt_val * A[s] / 2.0f;
                     float denom_val = 1.0f - half_dtA + 1e-8f;
                     float A_bar = (1.0f + half_dtA) / denom_val;
                     float B_val = 0.0f;
+                    #pragma unroll 4
                     for (int j = 0; j < d_inner; j++)
                         B_val += B_proj_W[s * d_inner + j] * s_x_branch[j];
                     float B_bar = dt_val * B_val;
@@ -1843,19 +1984,23 @@ __global__ void mamba3_scan_backward_batched_kernel(
                     dh[partner] += d_h_prev_partner;
                 }
                 float dt_raw = dt_proj_b[tid];
+                #pragma unroll 4
                 for (int j = 0; j < d_inner; j++)
                     dt_raw += dt_proj_W[tid * d_inner + j] * s_x_branch[j];
                 float sig_dt = 1.0f / (1.0f + expf(-dt_raw));
                 float d_dt_raw = d_dt_val * sig_dt;
                 d_dt_proj_b_acc += d_dt_raw;
+                #pragma unroll 4
                 for (int j = 0; j < d_inner; j++)
                     d_dt_proj_W_row[j] += d_dt_raw * s_x_branch[j];
                 s_d_dt_raw[tid] = d_dt_raw;
                 __syncthreads();
                 float d_x_from_dt = 0.0f;
+                #pragma unroll 4
                 for (int t = 0; t < d_inner; t++)
                     d_x_from_dt += s_d_dt_raw[t] * dt_proj_W[t * d_inner + tid];
                 float d_x_val = d_x_from_D + d_x_from_C + d_x_from_scan + d_x_from_dt;
+                #pragma unroll 4
                 for (int d = 0; d < d_model; d++) {
                     float inp = my_x_sorted[i * d_model + d];
                     d_in_proj_W_x_local[d] += d_x_val * inp;
@@ -1871,15 +2016,19 @@ __global__ void mamba3_scan_backward_batched_kernel(
 
     atomicAdd(&d_D_param[tid], d_D_acc);
     atomicAdd(&d_dt_proj_b[tid], d_dt_proj_b_acc);
+    #pragma unroll 4
     for (int j = 0; j < d_inner; j++)
         atomicAdd(&d_dt_proj_W[tid * d_inner + j], d_dt_proj_W_row[j]);
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         atomicAdd(&d_A_log[tid * d_state + s], d_A_log_acc[s]);
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++)
         atomicAdd(&d_rope_freq[tid * half_d_state + p], d_freq_acc[p]);
     // Two-pass: C_proj_W and B_proj_W gradients are computed via GEMM in the launcher
     // (d_C_vals_buf and d_B_vals_buf were filled per-timestep above)
     // Write per-thread in_proj_W gradients
+    #pragma unroll 4
     for (int d = 0; d < d_model; d++) {
         atomicAdd(&d_in_proj_W[tid * d_model + d], d_in_proj_W_x_local[d]);
         atomicAdd(&d_in_proj_W[(tid + d_inner) * d_model + d], d_in_proj_W_z_local[d]);
@@ -1916,7 +2065,9 @@ __global__ void input_proj_backward_kernel(
     const int block_size = blockDim.x;
 
     // Initialize shared memory accumulators
+    #pragma unroll 4
     for (int i = tid; i < d_model * 2; i += block_size) s_d_proj_W[i] = 0.0f;
+    #pragma unroll 4
     for (int i = tid; i < d_model; i += block_size) s_d_proj_b[i] = 0.0f;
     __syncthreads();
 
@@ -1925,6 +2076,7 @@ __global__ void input_proj_backward_kernel(
         float g = static_cast<float>(grad[idx]);
         float s = static_cast<float>(sharpness[idx]);
 
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             float d_xd = d_x[idx * d_model + d];
             atomicAdd(&s_d_proj_W[d * 2 + 0], d_xd * g);
@@ -1935,10 +2087,12 @@ __global__ void input_proj_backward_kernel(
     __syncthreads();
 
     // Block-level reduction: one thread per shared memory element writes to global
+    #pragma unroll 4
     for (int i = tid; i < d_model * 2; i += block_size) {
         if (s_d_proj_W[i] != 0.0f)
             atomicAdd(&d_proj_W[i], s_d_proj_W[i]);
     }
+    #pragma unroll 4
     for (int i = tid; i < d_model; i += block_size) {
         if (s_d_proj_b[i] != 0.0f)
             atomicAdd(&d_proj_b[i], s_d_proj_b[i]);
@@ -2000,11 +2154,13 @@ __global__ void gru_backward_kernel(
     const int tid = threadIdx.x;
 
     // Zero shared accumulators
+    #pragma unroll 4
     for (int i = tid; i < smem_total; i += blockDim.x) smem[i] = 0.0f;
     __syncthreads();
 
     const int idx = blockIdx.x * blockDim.x + tid;
     if (idx < N) {
+        #pragma unroll 4
         for (int gh = 0; gh < gru_hidden; gh++) {
             float d_h = d_h_new[idx * gru_hidden + gh];
             float z_val = z_gate[idx * gru_hidden + gh];
@@ -2020,10 +2176,12 @@ __global__ void gru_backward_kernel(
 
             // Accumulate to shared memory instead of global
             atomicAdd(&s_d_bh[gh], d_tanh_input);
+            #pragma unroll 4
             for (int j = 0; j < input_dim; j++) {
                 float xj = gru_input[idx * input_dim + j];
                 atomicAdd(&s_d_Wh[gh * total_dim + j], d_tanh_input * xj);
             }
+            #pragma unroll 4
             for (int j = 0; j < gru_hidden; j++) {
                 float rh;
                 if (j == gh)
@@ -2034,6 +2192,7 @@ __global__ void gru_backward_kernel(
             }
 
             atomicAdd(&s_d_bz[gh], d_z_input);
+            #pragma unroll 4
             for (int j = 0; j < total_dim; j++) {
                 float xh_j;
                 if (j < input_dim)
@@ -2043,6 +2202,7 @@ __global__ void gru_backward_kernel(
                 atomicAdd(&s_d_Wz[gh * total_dim + j], d_z_input * xh_j);
             }
 
+            #pragma unroll 4
             for (int j = 0; j < gru_hidden; j++) {
                 float d_r_j = d_tanh_input * Wh[gh * total_dim + input_dim + j]
                             * h_old[idx * gru_hidden + j];
@@ -2050,6 +2210,7 @@ __global__ void gru_backward_kernel(
                 float d_r_j_input = d_r_j * r_j * (1.0f - r_j);
 
                 atomicAdd(&s_d_br[j], d_r_j_input);
+                #pragma unroll 4
                 for (int k = 0; k < total_dim; k++) {
                     float xh_k;
                     if (k < input_dim)
@@ -2058,12 +2219,14 @@ __global__ void gru_backward_kernel(
                         xh_k = h_old[idx * gru_hidden + (k - input_dim)];
                     atomicAdd(&s_d_Wr[j * total_dim + k], d_r_j_input * xh_k);
                 }
+                #pragma unroll 4
                 for (int k = 0; k < input_dim; k++) {
                     atomicAdd(&d_gru_input[idx * input_dim + k],
                               d_r_j_input * Wr[j * total_dim + k]);
                 }
             }
 
+            #pragma unroll 4
             for (int j = 0; j < input_dim; j++) {
                 float d_input_j = d_z_input * Wz[gh * total_dim + j]
                                 + d_tanh_input * Wh[gh * total_dim + j];
@@ -2074,11 +2237,13 @@ __global__ void gru_backward_kernel(
     __syncthreads();
 
     // Write block sums to global
+    #pragma unroll 4
     for (int i = tid; i < w_size; i += blockDim.x) {
         if (s_d_Wz[i] != 0.0f) atomicAdd(&d_Wz[i], s_d_Wz[i]);
         if (s_d_Wr[i] != 0.0f) atomicAdd(&d_Wr[i], s_d_Wr[i]);
         if (s_d_Wh[i] != 0.0f) atomicAdd(&d_Wh[i], s_d_Wh[i]);
     }
+    #pragma unroll 4
     for (int i = tid; i < gru_hidden; i += blockDim.x) {
         if (s_d_bz[i] != 0.0f) atomicAdd(&d_bz[i], s_d_bz[i]);
         if (s_d_br[i] != 0.0f) atomicAdd(&d_br[i], s_d_br[i]);
@@ -2161,6 +2326,7 @@ __global__ void expert_peer_backward_kernel(
     int total_smem = total_expert_smem + pqw_size + pka_size + pkb_size;
 
     // Zero shared accumulators cooperatively
+    #pragma unroll 4
     for (int i = threadIdx.x; i < total_smem; i += blockDim.x)
         smem[i] = 0.0f;
     __syncthreads();
@@ -2172,6 +2338,7 @@ __global__ void expert_peer_backward_kernel(
     float g_val = grad_vals[idx];
     int half_d = d_model / 2;
 
+    #pragma unroll 4
     for (int h = 0; h < num_heads; h++) {
         float d_head_out = d_out / (float)num_heads;
 
@@ -2179,6 +2346,7 @@ __global__ void expert_peer_backward_kernel(
         float dot_a[MAX_TOPK] = {};
         float dot_b[MAX_TOPK] = {};
 
+        #pragma unroll 4
         for (int k = 0; k < num_active; k++) {
             int a_local = k / topk;
             int b_local = k % topk;
@@ -2187,6 +2355,7 @@ __global__ void expert_peer_backward_kernel(
 
             // Recompute out_k
             float out_k = expert_b2_in[ei];
+            #pragma unroll 4
             for (int eh = 0; eh < expert_hidden; eh++) {
                 float z_val = saved_z_hidden[((idx * num_heads + h) * num_active + k) * expert_hidden + eh];
                 out_k += expert_W2[ei * expert_hidden + eh] * z_val;
@@ -2201,6 +2370,7 @@ __global__ void expert_peer_backward_kernel(
         }
 
         // Second pass: compute actual gradients with full softmax backward
+        #pragma unroll 4
         for (int k = 0; k < num_active; k++) {
             int a_local = k / topk;
             int b_local = k % topk;
@@ -2209,6 +2379,7 @@ __global__ void expert_peer_backward_kernel(
 
             // Recompute out_k
             float out_k = expert_b2_in[ei];
+            #pragma unroll 4
             for (int eh = 0; eh < expert_hidden; eh++) {
                 float z_val = saved_z_hidden[((idx * num_heads + h) * num_active + k) * expert_hidden + eh];
                 out_k += expert_W2[ei * expert_hidden + eh] * z_val;
@@ -2220,6 +2391,7 @@ __global__ void expert_peer_backward_kernel(
             // Backward through expert MLP (accumulate in shared memory)
             atomicAdd(&s_d_expert_b2[ei], d_out_k);
 
+            #pragma unroll 4
             for (int eh = 0; eh < expert_hidden; eh++) {
                 float z_val = saved_z_hidden[((idx * num_heads + h) * num_active + k) * expert_hidden + eh];
                 atomicAdd(&s_d_expert_W2[ei * expert_hidden + eh], d_out_k * z_val);
@@ -2242,9 +2414,11 @@ __global__ void expert_peer_backward_kernel(
             int a_key_idx = saved_top_a_idx[(idx * num_heads + h) * topk + a_local];
             int b_key_idx = saved_top_b_idx[(idx * num_heads + h) * topk + b_local];
 
+            #pragma unroll 4
             for (int d = 0; d < half_d; d++) {
                 float q_a_d = 0.0f;
                 float q_b_d = 0.0f;
+                #pragma unroll 4
                 for (int j = 0; j < peer_input_dim; j++) {
                     float pi_j = saved_peer_input[idx * peer_input_dim + j];
                     q_a_d += peer_query_Ws[(h * d_model + d) * peer_input_dim + j] * pi_j;
@@ -2257,6 +2431,7 @@ __global__ void expert_peer_backward_kernel(
                 float d_q_a_d = d_score_a * prod_keys_A[(h * pk_dim + a_key_idx) * half_d + d];
                 float d_q_b_d = d_score_b * prod_keys_B[(h * pk_dim + b_key_idx) * half_d + d];
 
+                #pragma unroll 4
                 for (int j = 0; j < peer_input_dim; j++) {
                     float pi_j = saved_peer_input[idx * peer_input_dim + j];
                     atomicAdd(&s_d_peer_query_Ws[(h * d_model + d) * peer_input_dim + j], d_q_a_d * pi_j);
@@ -2274,6 +2449,7 @@ __global__ void expert_peer_backward_kernel(
     __syncthreads();
 
     // Flush expert weight gradients
+    #pragma unroll 4
     for (int i = threadIdx.x; i < total_expert_smem; i += blockDim.x) {
         if (smem[i] != 0.0f) {
             if (i < num_experts * expert_hidden)
@@ -2288,14 +2464,17 @@ __global__ void expert_peer_backward_kernel(
     }
 
     // Flush routing weight gradients (peer_query_Ws, prod_keys_A, prod_keys_B)
+    #pragma unroll 4
     for (int i = threadIdx.x; i < pqw_size; i += blockDim.x) {
         if (s_d_peer_query_Ws[i] != 0.0f)
             atomicAdd(&d_peer_query_Ws[i], s_d_peer_query_Ws[i]);
     }
+    #pragma unroll 4
     for (int i = threadIdx.x; i < pka_size; i += blockDim.x) {
         if (s_d_prod_keys_A[i] != 0.0f)
             atomicAdd(&d_prod_keys_A[i], s_d_prod_keys_A[i]);
     }
+    #pragma unroll 4
     for (int i = threadIdx.x; i < pkb_size; i += blockDim.x) {
         if (s_d_prod_keys_B[i] != 0.0f)
             atomicAdd(&d_prod_keys_B[i], s_d_prod_keys_B[i]);
@@ -2328,14 +2507,17 @@ __global__ void out_proj_backward_kernel(
     const int op_size = d_model * d_inner;
 
     // Zero shared accumulators
+    #pragma unroll 4
     for (int i = tid; i < op_size; i += blockDim.x) s_d_out_proj_W[i] = 0.0f;
     __syncthreads();
 
     const int idx = blockIdx.x * blockDim.x + tid;
     if (idx < N) {
+        #pragma unroll 4
         for (int j = 0; j < d_inner; j++) {
             float d_scan_j = 0.0f;
             float so_j = scan_out[idx * d_inner + j];
+            #pragma unroll 4
             for (int d = 0; d < d_model; d++) {
                 float d_ctx = d_context[idx * d_model + d];
                 d_scan_j += d_ctx * out_proj_W[d * d_inner + j];
@@ -2347,6 +2529,7 @@ __global__ void out_proj_backward_kernel(
     __syncthreads();
 
     // Write block sums to global
+    #pragma unroll 4
     for (int i = tid; i < op_size; i += blockDim.x) {
         if (s_d_out_proj_W[i] != 0.0f)
             atomicAdd(&d_out_proj_W[i], s_d_out_proj_W[i]);
@@ -3125,6 +3308,7 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
     // Step 1: Input projection + sort per param, pack into x_sorted_packed
     std::vector<int> offsets_cpu(num_params + 1);
     offsets_cpu[0] = 0;
+    #pragma unroll 4
     for (int p = 0; p < num_params; p++) {
         int N = grads[p].numel();
         offsets_cpu[p + 1] = offsets_cpu[p] + N;
@@ -3169,6 +3353,7 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
     if (ckpt_int > 1) {
         std::vector<int> ckpt_offsets_cpu(num_params + 1);
         ckpt_offsets_cpu[0] = 0;
+        #pragma unroll 4
         for (int p = 0; p < num_params; p++) {
             int N = offsets_cpu[p + 1] - offsets_cpu[p];
             int num_ckpts = (N + ckpt_int - 1) / ckpt_int;
@@ -3180,6 +3365,7 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
 
     // Determine max N across params for parallel scan threshold
     int max_N = 0;
+    #pragma unroll 4
     for (int p = 0; p < num_params; p++) {
         int N = offsets_cpu[p + 1] - offsets_cpu[p];
         if (N > max_N) max_N = N;
@@ -3463,6 +3649,7 @@ void launch_mamba3_peer_backward_batched(
         auto offsets_ptr_tmp = offsets_cpu_tmp.data_ptr<int>();
         std::vector<int> ckpt_offsets_cpu(num_params + 1);
         ckpt_offsets_cpu[0] = 0;
+        #pragma unroll 4
         for (int p = 0; p < num_params; p++) {
             int N = offsets_ptr_tmp[p + 1] - offsets_ptr_tmp[p];
             int num_ckpts = (N + ckpt_int - 1) / ckpt_int;

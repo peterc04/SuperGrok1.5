@@ -175,14 +175,19 @@ __global__ void mamba3_scan_batched_cpasync_kernel(
     float* s_C_proj_W = s_B_proj_W + d_state*d_inner;        // [d_state*d_inner]
 
     // Cooperatively load projection weights into shared memory
+    #pragma unroll 4
     for (int i = tid; i < 2*d_inner*d_model; i += d_inner)
         s_in_proj_W[i] = in_proj_W[i];
+    #pragma unroll 4
     for (int i = tid; i < d_inner*d_inner; i += d_inner)
         s_dt_proj_W[i] = dt_proj_W[i];
+    #pragma unroll 4
     for (int i = tid; i < d_inner; i += d_inner)
         s_dt_proj_b[i] = dt_proj_b[i];
+    #pragma unroll 4
     for (int i = tid; i < d_state*d_inner; i += d_inner)
         s_B_proj_W[i] = B_proj_W[i];
+    #pragma unroll 4
     for (int i = tid; i < d_state*d_inner; i += d_inner)
         s_C_proj_W[i] = C_proj_W[i];
     __syncthreads();
@@ -190,12 +195,15 @@ __global__ void mamba3_scan_batched_cpasync_kernel(
     // ── Load state into registers ─────────────────────────────────────
     float h[MAX_D_STATE], h_snap[MAX_D_STATE];
     const float* my_init = initial_states + param_idx * d_inner * d_state;
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++) h[s] = my_init[tid * d_state + s];
 
     const int half_d_state = d_state / 2;
     float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         A[s] = -expf(A_log[tid * d_state + s]);
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++)
         freq[p] = rope_freq[tid * half_d_state + p];
     float D_val = D_param[tid];
@@ -211,6 +219,7 @@ __global__ void mamba3_scan_batched_cpasync_kernel(
         int first_i = reverse ? (N - 1) : 0;
         // cp.async: asynchronous global → shared memory copy
         // Each thread copies its share of d_model floats
+        #pragma unroll 4
         for (int d = tid; d < d_model; d += d_inner) {
 #if GROK_CUDA && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
             __pipeline_memcpy_async(
@@ -227,6 +236,7 @@ __global__ void mamba3_scan_batched_cpasync_kernel(
     }
 
     // ── Main scan loop with double-buffered prefetch ──────────────────
+    #pragma unroll 4
     for (int step = 0; step < N; step++) {
         int i = reverse ? (N - 1 - step) : step;
         int next_step = step + 1;
@@ -235,6 +245,7 @@ __global__ void mamba3_scan_batched_cpasync_kernel(
         // Start prefetch of next timestep into alternate buffer
         if (next_step < N) {
             int next_i = reverse ? (N - 1 - next_step) : next_step;
+            #pragma unroll 4
             for (int d = tid; d < d_model; d += d_inner) {
 #if GROK_CUDA && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
                 __pipeline_memcpy_async(
@@ -258,6 +269,7 @@ __global__ void mamba3_scan_batched_cpasync_kernel(
 
         // ── Input projection using prefetched data ────────────────────
         float x_val = 0.0f, z_val = 0.0f;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             float inp = buf[cur_buf][d];
             x_val += s_in_proj_W[tid * d_model + d] * inp;
@@ -269,16 +281,20 @@ __global__ void mamba3_scan_batched_cpasync_kernel(
 
         // ── dt projection (cross-thread via shared memory) ────────────
         float dt_raw = s_dt_proj_b[tid];
+        #pragma unroll 4
         for (int j = 0; j < d_inner; j++)
             dt_raw += s_dt_proj_W[tid * d_inner + j] * s_x_branch[j];
         float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw));
 
         // ── State update with trapezoidal discretization + RoPE ───────
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
 
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) {
             float A_bar = (1.0f + dt_val * A[s] / 2.0f) / (1.0f - dt_val * A[s] / 2.0f + 1e-8f);
             float B_val = 0.0f;
+            #pragma unroll 4
             for (int j = 0; j < d_inner; j++)
                 B_val += s_B_proj_W[s * d_inner + j] * s_x_branch[j];
             float B_bar = dt_val * B_val;
@@ -296,8 +312,10 @@ __global__ void mamba3_scan_batched_cpasync_kernel(
 
         // ── Output: y = C @ h, gated by SiLU(z) + D skip ────────────
         float y_val = 0.0f;
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) {
             float C_val = 0.0f;
+            #pragma unroll 4
             for (int j = 0; j < d_inner; j++)
                 C_val += s_C_proj_W[s * d_inner + j] * s_x_branch[j];
             y_val += h[s] * C_val;
@@ -314,6 +332,7 @@ __global__ void mamba3_scan_batched_cpasync_kernel(
 
     // ── Write final state ─────────────────────────────────────────────
     float* my_final = final_states + param_idx * d_inner * d_state;
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         my_final[tid * d_state + s] = h[s];
 }
@@ -394,14 +413,19 @@ __global__ void mamba3_scan_combined_cpasync_kernel(
     float* s_C_proj = s_B_proj + d_state*d_inner;
 
     // Load weights
+    #pragma unroll 4
     for (int i = tid; i < 2*d_inner*d_model; i += d_inner)
         s_in_proj[i] = in_proj_W[i];
+    #pragma unroll 4
     for (int i = tid; i < d_inner*d_inner; i += d_inner)
         s_dt_proj[i] = dt_proj_W_sel[i];
+    #pragma unroll 4
     for (int i = tid; i < d_inner; i += d_inner)
         s_dt_bias[i] = dt_proj_b_sel[i];
+    #pragma unroll 4
     for (int i = tid; i < d_state*d_inner; i += d_inner)
         s_B_proj[i] = B_proj_W_sel[i];
+    #pragma unroll 4
     for (int i = tid; i < d_state*d_inner; i += d_inner)
         s_C_proj[i] = C_proj_W_sel[i];
     __syncthreads();
@@ -409,11 +433,14 @@ __global__ void mamba3_scan_combined_cpasync_kernel(
     // Load state
     float h[MAX_D_STATE], h_snap[MAX_D_STATE];
     const float* my_init = init_states + param_idx * d_inner * d_state;
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++) h[s] = my_init[tid * d_state + s];
 
     const int half_d_state = d_state / 2;
     float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++) A[s] = -expf(A_log_sel[tid * d_state + s]);
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++) freq[p] = rope_sel[tid * half_d_state + p];
     float D_val = D_sel[tid];
 
@@ -426,6 +453,7 @@ __global__ void mamba3_scan_combined_cpasync_kernel(
 
     if (N > 0) {
         int first_i = reverse ? (N - 1) : 0;
+        #pragma unroll 4
         for (int d = tid; d < d_model; d += d_inner) {
 #if GROK_CUDA && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
             __pipeline_memcpy_async(&buf[cur_buf][d], &my_x[first_i * d_model + d], sizeof(float));
@@ -438,12 +466,14 @@ __global__ void mamba3_scan_combined_cpasync_kernel(
 #endif
     }
 
+    #pragma unroll 4
     for (int step = 0; step < N; step++) {
         int i = reverse ? (N - 1 - step) : step;
         int next_buf = 1 - cur_buf;
 
         if (step + 1 < N) {
             int next_i = reverse ? (N - 2 - step) : (step + 1);
+            #pragma unroll 4
             for (int d = tid; d < d_model; d += d_inner) {
 #if GROK_CUDA && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
                 __pipeline_memcpy_async(&buf[next_buf][d], &my_x[next_i * d_model + d], sizeof(float));
@@ -463,6 +493,7 @@ __global__ void mamba3_scan_combined_cpasync_kernel(
         __syncthreads();
 
         float x_val = 0.0f, z_val = 0.0f;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             float inp = buf[cur_buf][d];
             x_val += s_in_proj[tid * d_model + d] * inp;
@@ -473,14 +504,18 @@ __global__ void mamba3_scan_combined_cpasync_kernel(
         __syncthreads();
 
         float dt_raw = s_dt_bias[tid];
+        #pragma unroll 4
         for (int j = 0; j < d_inner; j++)
             dt_raw += s_dt_proj[tid * d_inner + j] * s_x_branch[j];
         float dt_val = (dt_raw > 20.0f) ? dt_raw : logf(1.0f + expf(dt_raw));
 
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) h_snap[s] = h[s];
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) {
             float A_bar = (1.0f + dt_val * A[s] / 2.0f) / (1.0f - dt_val * A[s] / 2.0f + 1e-8f);
             float B_val = 0.0f;
+            #pragma unroll 4
             for (int j = 0; j < d_inner; j++) B_val += s_B_proj[s * d_inner + j] * s_x_branch[j];
             float B_bar = dt_val * B_val;
             int pair_idx = s / 2;
@@ -493,8 +528,10 @@ __global__ void mamba3_scan_combined_cpasync_kernel(
         }
 
         float y_val = 0.0f;
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) {
             float C_val = 0.0f;
+            #pragma unroll 4
             for (int j = 0; j < d_inner; j++) C_val += s_C_proj[s * d_inner + j] * s_x_branch[j];
             y_val += h[s] * C_val;
         }
@@ -507,6 +544,7 @@ __global__ void mamba3_scan_combined_cpasync_kernel(
     }
 
     float* my_final = fin_states + param_idx * d_inner * d_state;
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         my_final[tid * d_state + s] = h[s];
 }
@@ -694,6 +732,7 @@ void ampere_batched_scan_and_fused_elem(
 
     std::vector<torch::Tensor> fwd_unsorted_list(ctx.num_params);
     std::vector<torch::Tensor> bwd_unsorted_list(ctx.num_params);
+    #pragma unroll 4
     for (int p = 0; p < ctx.num_params; p++) {
         int N = ctx.N_vec[p];
         if (N == 0) continue;
@@ -713,11 +752,13 @@ void ampere_batched_scan_and_fused_elem(
     static GpuStream_t streams[NUM_STREAMS] = {};
     static bool streams_initialized = false;
     if (!streams_initialized) {
+        #pragma unroll 4
         for (int s = 0; s < NUM_STREAMS; s++)
             gpuStreamCreate(&streams[s]);
         streams_initialized = true;
     }
 
+    #pragma unroll 4
     for (int p = 0; p < ctx.num_params; p++) {
         int N = ctx.N_vec[p];
         if (N == 0) continue;
@@ -758,6 +799,7 @@ void ampere_batched_scan_and_fused_elem(
         }));
     }
 
+    #pragma unroll 4
     for (int s = 0; s < NUM_STREAMS; s++) {
         gpuStreamSynchronize(streams[s]);
     }

@@ -232,6 +232,7 @@ __global__ void mamba3_backward_dh_cpasync_kernel(
 
     // Load A and D into registers for the full backward sweep
     float A[MAX_D_STATE];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         A[s] = -expf(A_log[tid * d_state + s]);
     float D_val = D_param[tid];
@@ -242,6 +243,7 @@ __global__ void mamba3_backward_dh_cpasync_kernel(
     // Use cp.async to asynchronously copy from global to shared memory.
     // Each thread copies its d_state entries of the state matrix plus
     // its scalar entries for xb, z, dt.
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++) {
 #if GROK_CUDA && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
         __pipeline_memcpy_async(
@@ -274,15 +276,18 @@ __global__ void mamba3_backward_dh_cpasync_kernel(
 
     // Running gradient for hidden state -- initialized to zero
     float d_h[MAX_D_STATE];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         d_h[s] = 0.0f;
 
     // -- Backward iteration: t = N-1 down to 0 --
+    #pragma unroll 4
     for (int step = N - 1; step >= 0; step--) {
 
         // Prefetch step-1 into alternate buffer (skip on final iteration)
         if (step > 0) {
             int next = step - 1;
+            #pragma unroll 4
             for (int s = 0; s < d_state; s++) {
 #if GROK_CUDA && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
                 __pipeline_memcpy_async(
@@ -332,6 +337,7 @@ __global__ void mamba3_backward_dh_cpasync_kernel(
         float d_xb_total = d_xb_D;
         float d_dt_total = 0.0f;
 
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++) {
             float h_val = s_states[buf][tid * d_state + s];
 

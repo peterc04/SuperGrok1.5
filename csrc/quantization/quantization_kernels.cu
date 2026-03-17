@@ -97,6 +97,7 @@ __global__ void quantize_fp8_e4m3_kernel(
     const int gid = blockIdx.x * blockDim.x + tid;
 
     float local_max = 0.0f;
+    #pragma unroll 4
     for (int i = gid; i < N; i += gridDim.x * blockDim.x) {
         local_max = fmaxf(local_max, fabsf(input[i]));
     }
@@ -104,6 +105,7 @@ __global__ void quantize_fp8_e4m3_kernel(
     __syncthreads();
 
     // Block reduction
+    #pragma unroll 4
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) smem_max[tid] = fmaxf(smem_max[tid], smem_max[tid + s]);
         __syncthreads();
@@ -116,6 +118,7 @@ __global__ void quantize_fp8_e4m3_kernel(
     if (s_val == 0.0f) s_val = 1.0f;
     float inv_scale = FP8_E4M3_MAX / s_val;
 
+    #pragma unroll 4
     for (int i = gid; i < N; i += gridDim.x * blockDim.x) {
         output[i] = float_to_fp8_e4m3(input[i], inv_scale);
     }
@@ -160,11 +163,13 @@ __global__ void quantize_int8_kernel(
     const int gid = blockIdx.x * blockDim.x + tid;
 
     float local_max = 0.0f;
+    #pragma unroll 4
     for (int i = gid; i < N; i += gridDim.x * blockDim.x)
         local_max = fmaxf(local_max, fabsf(input[i]));
     smem_max[tid] = local_max;
     __syncthreads();
 
+    #pragma unroll 4
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) smem_max[tid] = fmaxf(smem_max[tid], smem_max[tid + s]);
         __syncthreads();
@@ -176,6 +181,7 @@ __global__ void quantize_int8_kernel(
     if (s_val == 0.0f) s_val = 1.0f;
     float inv_scale = 127.0f / s_val;
 
+    #pragma unroll 4
     for (int i = gid; i < N; i += gridDim.x * blockDim.x) {
         float v = rintf(input[i] * inv_scale);
         v = fminf(fmaxf(v, -127.0f), 127.0f);
@@ -231,6 +237,7 @@ __global__ void quantize_int4_kernel(
     smem[tid] = local_max;
     __syncthreads();
 
+    #pragma unroll 4
     for (int s = 16; s > 0; s >>= 1) {
         if (tid < s) smem[tid] = fmaxf(smem[tid], smem[tid + s]);
         __syncthreads();
@@ -302,6 +309,7 @@ __device__ __forceinline__ uint8_t float_to_mxfp4(float val, float inv_block_sca
     // Find nearest codebook entry
     uint8_t best = 0;
     float best_err = abs_scaled;  // error vs 0.0
+    #pragma unroll
     for (int i = 1; i < 8; i++) {
         float err = fabsf(abs_scaled - MXFP4_CODEBOOK[i]);
         if (err < best_err) { best_err = err; best = (uint8_t)i; }
@@ -335,6 +343,7 @@ __global__ void quantize_mxfp4_kernel(
     smem[tid] = local_max;
     __syncthreads();
 
+    #pragma unroll 4
     for (int s = 16; s > 0; s >>= 1) {
         if (tid < s) smem[tid] = fmaxf(smem[tid], smem[tid + s]);
         __syncthreads();
@@ -414,6 +423,7 @@ __global__ void quantize_nvfp4_kernel(
     smem[tid] = local_max;
     __syncthreads();
 
+    #pragma unroll 4
     for (int s = 8; s > 0; s >>= 1) {
         if (tid < s) smem[tid] = fmaxf(smem[tid], smem[tid + s]);
         __syncthreads();

@@ -141,8 +141,10 @@ __global__ void mamba3_scan_local_with_summary_kernel(
 
     // Load per-d_inner constants
     float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         A[s] = -expf(stream_load(&A_log[j * d_state + s]));
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++)
         freq[p] = stream_load(&rope_freq[j * half_d_state + p]);
     float D_val = stream_load(&D_param[j]);
@@ -150,14 +152,17 @@ __global__ void mamba3_scan_local_with_summary_kernel(
     // Load initial state
     float h_init_all[MAX_D_STATE];
     if (initial_state != nullptr) {
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++)
             h_init_all[s] = stream_load(&initial_state[j * d_state + s]);
     } else {
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++)
             h_init_all[s] = 0.0f;
     }
 
     // Process each RoPE pair
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++) {
         const int s_e = 2 * p;
         const int s_o = 2 * p + 1;
@@ -168,6 +173,7 @@ __global__ void mamba3_scan_local_with_summary_kernel(
 
         // === Phase 1a: Sequential scan within thread's sub-chunk → chunk summary ===
         Affine2x2 summary = affine_identity();
+        #pragma unroll 4
         for (int step = 0; step < my_count; step++) {
             int t = reverse ? (N_local - 1 - (my_start + step)) : (my_start + step);
             float dt  = pre_dt_val[t * d_inner + j];
@@ -193,6 +199,7 @@ __global__ void mamba3_scan_local_with_summary_kernel(
         // Actually, the total is at position (num_threads-1) after up-sweep.
 
         // Up-sweep (reduction)
+        #pragma unroll 4
         for (int stride = 1; stride < num_threads; stride *= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -230,6 +237,7 @@ __global__ void mamba3_scan_local_with_summary_kernel(
         __syncthreads();
 
         // Down-sweep
+        #pragma unroll 4
         for (int stride = num_threads / 2; stride >= 1; stride /= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -258,6 +266,7 @@ __global__ void mamba3_scan_local_with_summary_kernel(
 
         // === Phase 1c: Re-scan chunk with prefix, compute local output ===
         Affine2x2 running = prefix;
+        #pragma unroll 4
         for (int step = 0; step < my_count; step++) {
             int t = reverse ? (N_local - 1 - (my_start + step)) : (my_start + step);
 
@@ -282,6 +291,7 @@ __global__ void mamba3_scan_local_with_summary_kernel(
     }
 
     // === Apply SiLU gating and D skip connection ===
+    #pragma unroll 4
     for (int step = 0; step < (N_local + num_threads - 1) / num_threads; step++) {
         int t_base = step * num_threads + ltid;
         if (t_base < N_local) {
@@ -362,17 +372,21 @@ __global__ void mamba3_apply_scan_prefix_kernel(
 
     // Load constants
     float A[MAX_D_STATE], freq_arr[MAX_D_STATE / 2];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         A[s] = -expf(stream_load(&A_log[j * d_state + s]));
+    #pragma unroll 4
     for (int pp = 0; pp < half_d_state; pp++)
         freq_arr[pp] = stream_load(&rope_freq[j * half_d_state + pp]);
 
     // Load local initial state
     float h_init_local[MAX_D_STATE];
     if (initial_state != nullptr) {
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++)
             h_init_local[s] = stream_load(&initial_state[j * d_state + s]);
     } else {
+        #pragma unroll 4
         for (int s = 0; s < d_state; s++)
             h_init_local[s] = 0.0f;
     }
@@ -385,6 +399,7 @@ __global__ void mamba3_apply_scan_prefix_kernel(
     // Then delta_h[t] = T_local[0..t].M * delta_init (just the matrix part)
     // And delta_y[t] += delta_h_e * C_e + delta_h_o * C_o
 
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++) {
         const int s_e = 2 * p;
         const int s_o = 2 * p + 1;
@@ -431,6 +446,7 @@ __global__ void mamba3_apply_scan_prefix_kernel(
 
         Affine2x2 mat_summary = affine_identity();
         // Zero out bias since we only need matrix propagation of delta
+        #pragma unroll 4
         for (int step = 0; step < my_count; step++) {
             int t = reverse ? (N_local - 1 - (my_start + step)) : (my_start + step);
             float dt  = pre_dt_val[t * d_inner + j];
@@ -450,6 +466,7 @@ __global__ void mamba3_apply_scan_prefix_kernel(
 
         // Blelloch exclusive prefix scan on thread summaries
         // Up-sweep
+        #pragma unroll 4
         for (int stride = 1; stride < num_threads; stride *= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -474,6 +491,7 @@ __global__ void mamba3_apply_scan_prefix_kernel(
         }
         __syncthreads();
         // Down-sweep
+        #pragma unroll 4
         for (int stride = num_threads / 2; stride >= 1; stride /= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -516,6 +534,7 @@ __global__ void mamba3_apply_scan_prefix_kernel(
         cur_delta_e = pfx_delta_e;
         cur_delta_o = pfx_delta_o;
 
+        #pragma unroll 4
         for (int step = 0; step < my_count; step++) {
             int t = reverse ? (N_local - 1 - (my_start + step)) : (my_start + step);
             float dt  = pre_dt_val[t * d_inner + j];
@@ -607,6 +626,7 @@ __global__ void scan_summary_prefix_kernel(
 
         Affine2x2 running = affine_identity();
 
+        #pragma unroll 4
         for (int k = 0; k < K; k++) {
             // Write exclusive prefix (running BEFORE incorporating summary[k])
             int pb = k * 6;
@@ -621,6 +641,7 @@ __global__ void scan_summary_prefix_kernel(
         }
 
         // Write results to global memory
+        #pragma unroll 4
         for (int k = 0; k < K; k++) {
             int dst_idx = (k * d_inner * half_d_state + j * half_d_state + p) * 6;
             int pb = k * 6;
@@ -695,8 +716,10 @@ __global__ void mamba3_scan_local_with_summary_bwd_kernel(
 
     // Load constants
     float A[MAX_D_STATE], freq[MAX_D_STATE / 2];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         A[s] = -expf(stream_load(&A_log[j * d_state + s]));
+    #pragma unroll 4
     for (int pp = 0; pp < half_d_state; pp++)
         freq[pp] = stream_load(&rope_freq[j * half_d_state + pp]);
     float D_val = stream_load(&D_param[j]);
@@ -706,6 +729,7 @@ __global__ void mamba3_scan_local_with_summary_bwd_kernel(
 
     // Backward: process each RoPE pair.
     // The backward scan uses transposed matrices running in reverse order.
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++) {
         const int s_e = 2 * p;
         const int s_o = 2 * p + 1;
@@ -721,6 +745,7 @@ __global__ void mamba3_scan_local_with_summary_bwd_kernel(
         // Threads process in reverse order (last timestep first)
         Affine2x2 bwd_summary = affine_identity();
 
+        #pragma unroll 4
         for (int step = my_count - 1; step >= 0; step--) {
             int t = reverse ? (N_local - 1 - (my_start + step)) : (my_start + step);
             float dt  = pre_dt_val[t * d_inner + j];
@@ -762,6 +787,7 @@ __global__ void mamba3_scan_local_with_summary_bwd_kernel(
         // Save total backward summary (at last position after up-sweep)
         // Blelloch exclusive prefix scan on backward summaries
         // Up-sweep
+        #pragma unroll 4
         for (int stride = 1; stride < num_threads; stride *= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -798,6 +824,7 @@ __global__ void mamba3_scan_local_with_summary_bwd_kernel(
         __syncthreads();
 
         // Down-sweep
+        #pragma unroll 4
         for (int stride = num_threads / 2; stride >= 1; stride /= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -827,6 +854,7 @@ __global__ void mamba3_scan_local_with_summary_bwd_kernel(
         // Then compute parameter gradients from dh[t].
         Affine2x2 bwd_running = bwd_prefix;
 
+        #pragma unroll 4
         for (int step = my_count - 1; step >= 0; step--) {
             int t = reverse ? (N_local - 1 - (my_start + step)) : (my_start + step);
             float dt  = pre_dt_val[t * d_inner + j];
@@ -948,11 +976,14 @@ __global__ void mamba3_apply_scan_prefix_bwd_kernel(
     const int half_d_state = d_state / 2;
 
     float A[MAX_D_STATE], freq_arr[MAX_D_STATE / 2];
+    #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         A[s] = -expf(stream_load(&A_log[j * d_state + s]));
+    #pragma unroll 4
     for (int pp = 0; pp < half_d_state; pp++)
         freq_arr[pp] = stream_load(&rope_freq[j * half_d_state + pp]);
 
+    #pragma unroll 4
     for (int p = 0; p < half_d_state; p++) {
         const int s_e = 2 * p;
         const int s_o = 2 * p + 1;
@@ -980,6 +1011,7 @@ __global__ void mamba3_apply_scan_prefix_bwd_kernel(
 
         // Build Blelloch scan of backward matrices for prefix within block
         Affine2x2 bwd_mat_summary = affine_identity();
+        #pragma unroll 4
         for (int step = my_count - 1; step >= 0; step--) {
             int t = reverse ? (N_local - 1 - (my_start + step)) : (my_start + step);
             float dt  = pre_dt_val[t * d_inner + j];
@@ -1006,6 +1038,7 @@ __global__ void mamba3_apply_scan_prefix_bwd_kernel(
         __syncthreads();
 
         // Blelloch exclusive prefix scan
+        #pragma unroll 4
         for (int stride = 1; stride < num_threads; stride *= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -1029,6 +1062,7 @@ __global__ void mamba3_apply_scan_prefix_bwd_kernel(
             smem[last+4] = 0.0f; smem[last+5] = 0.0f;
         }
         __syncthreads();
+        #pragma unroll 4
         for (int stride = num_threads / 2; stride >= 1; stride /= 2) {
             int idx = (ltid + 1) * stride * 2 - 1;
             if (idx < num_threads) {
@@ -1058,6 +1092,7 @@ __global__ void mamba3_apply_scan_prefix_bwd_kernel(
         float cur_dh_e = thread_prefix.m00 * delta_dh_e + thread_prefix.m01 * delta_dh_o;
         float cur_dh_o = thread_prefix.m10 * delta_dh_e + thread_prefix.m11 * delta_dh_o;
 
+        #pragma unroll 4
         for (int step = my_count - 1; step >= 0; step--) {
             int t = reverse ? (N_local - 1 - (my_start + step)) : (my_start + step);
             float dt  = pre_dt_val[t * d_inner + j];
@@ -1143,6 +1178,7 @@ __global__ void scan_summary_prefix_bwd_kernel(
         Affine2x2 running = affine_identity();
 
         // Scan from last GPU to first
+        #pragma unroll 4
         for (int k = K - 1; k >= 0; k--) {
             // Write exclusive prefix for GPU k
             int pb = k * 6;
@@ -1157,6 +1193,7 @@ __global__ void scan_summary_prefix_bwd_kernel(
         }
 
         // Write results to global memory
+        #pragma unroll 4
         for (int k = 0; k < K; k++) {
             int dst_idx = (k * d_inner * half_d_state + j * half_d_state + p) * 6;
             int pb = k * 6;

@@ -198,6 +198,7 @@ __global__ void prodigy_dlr_reduce_kernel(
     float local_den = 0.0f;
 
     // Grid-stride loop for large tensors
+    #pragma unroll 4
     for (int idx = blockIdx.x * blockDim.x + tid; idx < N;
          idx += gridDim.x * blockDim.x) {
         const float g = static_cast<float>(grad[idx]);
@@ -210,6 +211,7 @@ __global__ void prodigy_dlr_reduce_kernel(
     }
 
     // -- Warp-level reduction via shuffle --------------------------------
+    #pragma unroll
     for (int offset = PRODIGY_WARP_SIZE / 2; offset > 0; offset >>= 1) {
         local_num += SHFL_DOWN(local_num, offset);
         local_den += SHFL_DOWN(local_den, offset);
@@ -227,6 +229,7 @@ __global__ void prodigy_dlr_reduce_kernel(
         float warp_num = (lane_id < NUM_WARPS) ? shared_num[lane_id] : 0.0f;
         float warp_den = (lane_id < NUM_WARPS) ? shared_den[lane_id] : 0.0f;
 
+        #pragma unroll
         for (int offset = NUM_WARPS / 2; offset > 0; offset >>= 1) {
             warp_num += SHFL_DOWN(warp_num, offset);
             warp_den += SHFL_DOWN(warp_den, offset);

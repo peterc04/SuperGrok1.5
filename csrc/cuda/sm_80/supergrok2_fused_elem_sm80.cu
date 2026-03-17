@@ -95,6 +95,7 @@ __global__ void fused_elem_step_cpasync_kernel(
 
     // ── Phase 1: cp.async prefetch out_proj + GRU weights ─────────────
     // These are needed immediately for the out_proj and GRU computation.
+    #pragma unroll 4
     for (int i = tid; i < 2 * op_size; i += block_size) {
         const float* src = (i < op_size) ? &out_proj_fwd_W[i] : &out_proj_bwd_W[i - op_size];
 #if GROK_CUDA && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -109,7 +110,9 @@ __global__ void fused_elem_step_cpasync_kernel(
     int gru_sizes[] = {gru_mat_size, gru_mat_size, gru_mat_size, gru_hidden, gru_hidden, gru_hidden};
     float* gru_dst = s_gru_Wz;
     int gru_offset = 0;
+    #pragma unroll
     for (int seg = 0; seg < 6; seg++) {
+        #pragma unroll 4
         for (int i = tid; i < gru_sizes[seg]; i += block_size) {
 #if GROK_CUDA && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
             __pipeline_memcpy_async(&gru_dst[gru_offset + i], &gru_gmem[seg][i], sizeof(float));
@@ -125,6 +128,7 @@ __global__ void fused_elem_step_cpasync_kernel(
 #endif
 
     // ── Phase 2: cp.async prefetch expert weights (overlapped with GRU) ─
+    #pragma unroll 4
     for (int i = tid; i < num_experts * expert_hidden; i += block_size) {
 #if GROK_CUDA && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
         __pipeline_memcpy_async(&s_expert_W1[i], &expert_W1[i], sizeof(float));
@@ -136,6 +140,7 @@ __global__ void fused_elem_step_cpasync_kernel(
         s_expert_W2[i] = expert_W2[i];
 #endif
     }
+    #pragma unroll 4
     for (int i = tid; i < num_experts; i += block_size) {
 #if GROK_CUDA && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
         __pipeline_memcpy_async(&s_expert_b2[i], &expert_b2[i], sizeof(float));
@@ -164,6 +169,7 @@ __global__ void fused_elem_step_cpasync_kernel(
 
     // 1. Out_proj: fwd_ctx, bwd_ctx from scan outputs (using shared mem weights)
     float fwd_scan[MAX_D_INNER], bwd_scan[MAX_D_INNER];
+    #pragma unroll 4
     for (int j = 0; j < d_inner; j += 4) {
         float4 fwd4 = *reinterpret_cast<const float4*>(&fwd_scan_out[idx * d_inner + j]);
         float4 bwd4 = *reinterpret_cast<const float4*>(&bwd_scan_out[idx * d_inner + j]);
@@ -172,8 +178,10 @@ __global__ void fused_elem_step_cpasync_kernel(
     }
 
     float fwd_ctx[MAX_D_MODEL], bwd_ctx[MAX_D_MODEL];
+    #pragma unroll 4
     for (int d = 0; d < d_model; d++) {
         float fv = 0.0f, bv = 0.0f;
+        #pragma unroll 4
         for (int j = 0; j < d_inner; j++) {
             fv += s_out_fwd[d * d_inner + j] * fwd_scan[j];
             bv += s_out_bwd[d * d_inner + j] * bwd_scan[j];
@@ -184,25 +192,30 @@ __global__ void fused_elem_step_cpasync_kernel(
 
     // 2. GRU update
     float h_old[MAX_GRU_HIDDEN];
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++)
         h_old[j] = gru_state[idx * gru_hidden + j];
 
     float h_new[MAX_GRU_HIDDEN];
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++) {
         float val_z = s_gru_bz[j], val_r = s_gru_br[j];
         val_z += s_gru_Wz[j * gru_row_len + 0] * g + s_gru_Wz[j * gru_row_len + 1] * s;
         val_r += s_gru_Wr[j * gru_row_len + 0] * g + s_gru_Wr[j * gru_row_len + 1] * s;
         int offset = 2;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             val_z += s_gru_Wz[j * gru_row_len + offset + d] * fwd_ctx[d];
             val_r += s_gru_Wr[j * gru_row_len + offset + d] * fwd_ctx[d];
         }
         offset += d_model;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             val_z += s_gru_Wz[j * gru_row_len + offset + d] * bwd_ctx[d];
             val_r += s_gru_Wr[j * gru_row_len + offset + d] * bwd_ctx[d];
         }
         offset += d_model;
+        #pragma unroll 4
         for (int k = 0; k < gru_hidden; k++) {
             val_z += s_gru_Wz[j * gru_row_len + offset + k] * h_old[k];
             val_r += s_gru_Wr[j * gru_row_len + offset + k] * h_old[k];
@@ -213,15 +226,19 @@ __global__ void fused_elem_step_cpasync_kernel(
         float val_h = s_gru_bh[j];
         val_h += s_gru_Wh[j * gru_row_len + 0] * g + s_gru_Wh[j * gru_row_len + 1] * s;
         offset = 2;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) val_h += s_gru_Wh[j * gru_row_len + offset + d] * fwd_ctx[d];
         offset += d_model;
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) val_h += s_gru_Wh[j * gru_row_len + offset + d] * bwd_ctx[d];
         offset += d_model;
+        #pragma unroll 4
         for (int k = 0; k < gru_hidden; k++) val_h += s_gru_Wh[j * gru_row_len + offset + k] * (r_gate * h_old[k]);
         float h_tilde = tanhf(val_h);
         h_new[j] = (1.0f - z_gate) * h_old[j] + z_gate * h_tilde;
     }
 
+    #pragma unroll 4
     for (int j = 0; j < gru_hidden; j++)
         gru_state[idx * gru_hidden + j] = h_new[j];
 
@@ -233,16 +250,21 @@ __global__ void fused_elem_step_cpasync_kernel(
 
     // 3. Multi-head PEER routing + expert evaluation
     float total_out = 0.0f;
+    #pragma unroll 4
     for (int head = 0; head < num_heads; head++) {
         const float* pq_W = peer_query_Ws + head * d_model * peer_input_dim;
         float query[MAX_D_MODEL];
+        #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
             float val = 0.0f;
             int off = 0;
+            #pragma unroll 4
             for (int k = 0; k < gru_hidden; k++) val += pq_W[d * peer_input_dim + off + k] * h_new[k];
             off += gru_hidden;
+            #pragma unroll 4
             for (int k = 0; k < d_model; k++) val += pq_W[d * peer_input_dim + off + k] * fwd_ctx[k];
             off += d_model;
+            #pragma unroll 4
             for (int k = 0; k < d_model; k++) val += pq_W[d * peer_input_dim + off + k] * bwd_ctx[k];
             off += d_model;
             val += pq_W[d * peer_input_dim + off] * g + pq_W[d * peer_input_dim + off + 1] * s;
@@ -253,14 +275,18 @@ __global__ void fused_elem_step_cpasync_kernel(
         const float* keys_B = prod_keys_B + head * pk_dim * half_d;
 
         int best_a = 0; float best_sa = -1e30f;
+        #pragma unroll 4
         for (int k = 0; k < pk_dim; k++) {
             float dot = 0.0f;
+            #pragma unroll 4
             for (int d = 0; d < half_d; d++) dot += query[d] * LDG(&keys_A[k * half_d + d]);
             if (dot > best_sa) { best_sa = dot; best_a = k; }
         }
         int best_b = 0; float best_sb = -1e30f;
+        #pragma unroll 4
         for (int k = 0; k < pk_dim; k++) {
             float dot = 0.0f;
+            #pragma unroll 4
             for (int d = 0; d < half_d; d++) dot += query[half_d + d] * LDG(&keys_B[k * half_d + d]);
             if (dot > best_sb) { best_sb = dot; best_b = k; }
         }
@@ -271,6 +297,7 @@ __global__ void fused_elem_step_cpasync_kernel(
 
         // Expert MLP from shared memory
         float head_out = s_expert_b2[expert_idx];
+        #pragma unroll 4
         for (int h = 0; h < expert_hidden; h++) {
             float z_val = s_expert_W1[expert_idx * expert_hidden + h] * g
                         + s_expert_b1[expert_idx * expert_hidden + h];
