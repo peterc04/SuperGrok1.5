@@ -1179,3 +1179,7 @@ def tpu_auto_select_fused_scan_elem(
             Ms, bs, Cs, x_vals, z_vals, D_val,
             params, grads, sort_indices,
             exp_avg, exp_avg_sq, lr, beta1, beta2, eps, wd)
+
+
+# Public alias expected by test suite
+pallas_mamba3_scan = mamba3_scan_with_pallas
