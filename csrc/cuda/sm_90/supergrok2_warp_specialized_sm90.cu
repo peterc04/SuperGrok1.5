@@ -73,8 +73,8 @@ struct ScanBuffer {
 //  Kernel 1: Warp-specialized scan (generic d_state)
 // ═══════════════════════════════════════════════════════════════════════
 
-__global__ __launch_bounds__(BLOCK_SIZE, 2)
-void scan_warp_specialized_kernel(
+__launch_bounds__(64, 4)
+__global__ void scan_warp_specialized_kernel(
     // Scan inputs (pre-projected)
     const float* __restrict__ pre_x,     // [N, d_inner]
     const float* __restrict__ pre_z,     // [N, d_inner]
@@ -227,8 +227,8 @@ void scan_warp_specialized_kernel(
 #define D_STATE_16 16
 #define D_STATE_16_PAIRS 8
 
-__global__ __launch_bounds__(BLOCK_SIZE, 2)
-void scan_warp_specialized_d16_kernel(
+__launch_bounds__(64, 4)
+__global__ void scan_warp_specialized_d16_kernel(
     // Scan inputs (pre-projected)
     const float* __restrict__ pre_x,     // [N, d_inner]
     const float* __restrict__ pre_z,     // [N, d_inner]

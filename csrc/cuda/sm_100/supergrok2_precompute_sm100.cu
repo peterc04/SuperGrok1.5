@@ -84,8 +84,8 @@ static void blackwell_fp4_gemm(
 //  Per-tensor FP4 scaling
 // ═══════════════════════════════════════════════════════════════════════
 
-__global__ __launch_bounds__(256, 4)
-void compute_absmax_kernel(const float* __restrict__ data, float* __restrict__ absmax, int N) {
+__launch_bounds__(256, 8)
+__global__ void compute_absmax_kernel(const float* __restrict__ data, float* __restrict__ absmax, int N) {
     __shared__ float smem[256];
     float local_max = 0.0f;
 
@@ -110,8 +110,8 @@ void compute_absmax_kernel(const float* __restrict__ data, float* __restrict__ a
     }
 }
 
-__global__ __launch_bounds__(256, 4)
-void fp4_scale_kernel(
+__launch_bounds__(256, 4)
+__global__ void fp4_scale_kernel(
     const float* __restrict__ input,
     float* __restrict__ output,
     float scale, int N

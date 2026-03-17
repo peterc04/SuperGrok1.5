@@ -27,7 +27,7 @@ __device__ __forceinline__ int8_t float_to_int8_stochastic(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void sam_perturb_moe_kernel(
+__global__ void sam_perturb_moe_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     const bool* __restrict__ active_mask,
@@ -69,7 +69,7 @@ void launch_sam_perturb_moe(
 
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void sam_perturb_moe_vec4_kernel(
+__global__ void sam_perturb_moe_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ grad4,
     const bool* __restrict__ active_mask,
@@ -113,7 +113,7 @@ void launch_sam_perturb_moe_vec4(
 
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void fused_adam_decay_q4_vec4_kernel(
+__global__ void fused_adam_decay_q4_vec4_kernel(
     float4* __restrict__ param4,
     int8_t* __restrict__ exp_avg_q,
     float* __restrict__ exp_avg_scales,
@@ -308,7 +308,7 @@ void launch_fused_adam_decay_q4_vec4(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void sharpness_restore_moe_kernel(
+__global__ void sharpness_restore_moe_kernel(
     scalar_t* __restrict__ param,
     scalar_t* __restrict__ sharpness,
     const scalar_t* __restrict__ backup,
@@ -356,7 +356,7 @@ void launch_sharpness_restore_moe(
 /* Kernel 5: Sharpness restore MoE vec4 (float4, FP32-only) */
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void sharpness_restore_moe_vec4_kernel(
+__global__ void sharpness_restore_moe_vec4_kernel(
     float4* __restrict__ param4,
     float4* __restrict__ sharpness4,
     const float4* __restrict__ backup4,
@@ -408,7 +408,7 @@ void launch_sharpness_restore_moe_vec4(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void sg11_sam_perturb_moe_kernel(
+__global__ void sg11_sam_perturb_moe_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     const bool* __restrict__ active_mask,
@@ -449,7 +449,7 @@ void launch_sg11_sam_perturb_moe(
 /* Kernel 7: SG11 SAM perturb MoE vec4 (float4, FP32-only) */
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void sg11_sam_perturb_moe_vec4_kernel(
+__global__ void sg11_sam_perturb_moe_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ grad4,
     const bool* __restrict__ active_mask,
@@ -493,7 +493,7 @@ void launch_sg11_sam_perturb_moe_vec4(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void sg11_sharpness_restore_moe_kernel(
+__global__ void sg11_sharpness_restore_moe_kernel(
     scalar_t* __restrict__ param,
     scalar_t* __restrict__ sharpness,
     const scalar_t* __restrict__ backup,
@@ -541,7 +541,7 @@ void launch_sg11_sharpness_restore_moe(
 /* Kernel 9: SG11 sharpness restore MoE vec4 (float4, FP32-only) */
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void sg11_sharpness_restore_moe_vec4_kernel(
+__global__ void sg11_sharpness_restore_moe_vec4_kernel(
     float4* __restrict__ param4,
     float4* __restrict__ sharpness4,
     const float4* __restrict__ backup4,

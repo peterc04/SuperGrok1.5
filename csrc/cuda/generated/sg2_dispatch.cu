@@ -19,351 +19,262 @@ constexpr int SG2_DISPATCH_BLOCK = 256;
 
 // Forward declare all generated kernels
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_generic_D_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_fp32_generic_D_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_generic_D_d16_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_fp32_generic_D_d16_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_generic_M_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_fp32_generic_M_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_generic_M_d16_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_fp32_generic_M_d16_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_sm80_D_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_fp32_sm80_D_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_sm80_D_d16_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_fp32_sm80_D_d16_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_sm80_M_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_fp32_sm80_M_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_sm80_M_d16_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_fp32_sm80_M_d16_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_generic_D_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_int8_generic_D_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_generic_D_d16_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_int8_generic_D_d16_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_generic_M_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_int8_generic_M_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_generic_M_d16_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_int8_generic_M_d16_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_sm80_D_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_int8_sm80_D_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_sm80_D_d16_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_int8_sm80_D_d16_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_sm80_M_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_int8_sm80_M_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_sm80_M_d16_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_int8_sm80_M_d16_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_generic_D_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_int4_generic_D_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_generic_D_d16_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_int4_generic_D_d16_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_generic_M_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_int4_generic_M_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_generic_M_d16_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_int4_generic_M_d16_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_sm80_D_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_int4_sm80_D_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_sm80_D_d16_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_int4_sm80_D_d16_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_sm80_M_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_int4_sm80_M_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_sm80_M_d16_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_int4_sm80_M_d16_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_generic_D_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_mxfp4_generic_D_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_generic_D_d16_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_mxfp4_generic_D_d16_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_generic_M_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_mxfp4_generic_M_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_generic_M_d16_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_mxfp4_generic_M_d16_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_sm80_D_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_mxfp4_sm80_D_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_sm80_D_d16_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_mxfp4_sm80_D_d16_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_sm80_M_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_mxfp4_sm80_M_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_sm80_M_d16_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_F_mxfp4_sm80_M_d16_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_fp32_generic_D_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_Q_fp32_generic_D_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_fp32_generic_M_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_Q_fp32_generic_M_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_fp32_sm80_D_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_Q_fp32_sm80_D_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_fp32_sm80_M_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_Q_fp32_sm80_M_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int8_generic_D_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_Q_int8_generic_D_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int8_generic_M_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_Q_int8_generic_M_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int8_sm80_D_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_Q_int8_sm80_D_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int8_sm80_M_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_Q_int8_sm80_M_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int4_generic_D_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_Q_int4_generic_D_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int4_generic_M_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_Q_int4_generic_M_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int4_sm80_D_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_Q_int4_sm80_D_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int4_sm80_M_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_Q_int4_sm80_M_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_mxfp4_generic_D_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_Q_mxfp4_generic_D_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_mxfp4_generic_M_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_Q_mxfp4_generic_M_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_mxfp4_sm80_D_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_Q_mxfp4_sm80_D_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_mxfp4_sm80_M_kernel(/* see sg2_fused_elem_generated.cu */);
+__global__ void sg2_fused_elem_Q_mxfp4_sm80_M_kernel(/* see sg2_fused_elem_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_fp32_generic_D_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
+__global__ void sg2_fused_elem_Q_fp32_generic_D_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_fp32_generic_M_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
+__global__ void sg2_fused_elem_Q_fp32_generic_M_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_fp32_sm80_D_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
+__global__ void sg2_fused_elem_Q_fp32_sm80_D_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_fp32_sm80_M_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
+__global__ void sg2_fused_elem_Q_fp32_sm80_M_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int8_generic_D_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
+__global__ void sg2_fused_elem_Q_int8_generic_D_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int8_generic_M_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
+__global__ void sg2_fused_elem_Q_int8_generic_M_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int8_sm80_D_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
+__global__ void sg2_fused_elem_Q_int8_sm80_D_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int8_sm80_M_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
+__global__ void sg2_fused_elem_Q_int8_sm80_M_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int4_generic_D_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
+__global__ void sg2_fused_elem_Q_int4_generic_D_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int4_generic_M_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
+__global__ void sg2_fused_elem_Q_int4_generic_M_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int4_sm80_D_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
+__global__ void sg2_fused_elem_Q_int4_sm80_D_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int4_sm80_M_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
+__global__ void sg2_fused_elem_Q_int4_sm80_M_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_mxfp4_generic_D_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
+__global__ void sg2_fused_elem_Q_mxfp4_generic_D_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_mxfp4_generic_M_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
+__global__ void sg2_fused_elem_Q_mxfp4_generic_M_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_mxfp4_sm80_D_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
+__global__ void sg2_fused_elem_Q_mxfp4_sm80_D_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_mxfp4_sm80_M_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
+__global__ void sg2_fused_elem_Q_mxfp4_sm80_M_d16_kernel(/* see sg2_fused_elem_q_d16_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_fp32_generic_kernel(/* see sg2_metanet_only_generated.cu */);
+__global__ void sg2_metanet_fp32_generic_kernel(/* see sg2_metanet_only_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_fp32_generic_d16_kernel(/* see sg2_metanet_only_generated.cu */);
+__global__ void sg2_metanet_fp32_generic_d16_kernel(/* see sg2_metanet_only_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_fp32_sm80_kernel(/* see sg2_metanet_only_generated.cu */);
+__global__ void sg2_metanet_fp32_sm80_kernel(/* see sg2_metanet_only_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_fp32_sm80_d16_kernel(/* see sg2_metanet_only_generated.cu */);
+__global__ void sg2_metanet_fp32_sm80_d16_kernel(/* see sg2_metanet_only_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_int8_generic_kernel(/* see sg2_metanet_only_generated.cu */);
+__global__ void sg2_metanet_int8_generic_kernel(/* see sg2_metanet_only_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_int8_generic_d16_kernel(/* see sg2_metanet_only_generated.cu */);
+__global__ void sg2_metanet_int8_generic_d16_kernel(/* see sg2_metanet_only_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_int8_sm80_kernel(/* see sg2_metanet_only_generated.cu */);
+__global__ void sg2_metanet_int8_sm80_kernel(/* see sg2_metanet_only_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_int8_sm80_d16_kernel(/* see sg2_metanet_only_generated.cu */);
+__global__ void sg2_metanet_int8_sm80_d16_kernel(/* see sg2_metanet_only_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_int4_generic_kernel(/* see sg2_metanet_only_generated.cu */);
+__global__ void sg2_metanet_int4_generic_kernel(/* see sg2_metanet_only_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_int4_generic_d16_kernel(/* see sg2_metanet_only_generated.cu */);
+__global__ void sg2_metanet_int4_generic_d16_kernel(/* see sg2_metanet_only_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_int4_sm80_kernel(/* see sg2_metanet_only_generated.cu */);
+__global__ void sg2_metanet_int4_sm80_kernel(/* see sg2_metanet_only_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_int4_sm80_d16_kernel(/* see sg2_metanet_only_generated.cu */);
+__global__ void sg2_metanet_int4_sm80_d16_kernel(/* see sg2_metanet_only_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_mxfp4_generic_kernel(/* see sg2_metanet_only_generated.cu */);
+__global__ void sg2_metanet_mxfp4_generic_kernel(/* see sg2_metanet_only_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_mxfp4_generic_d16_kernel(/* see sg2_metanet_only_generated.cu */);
+__global__ void sg2_metanet_mxfp4_generic_d16_kernel(/* see sg2_metanet_only_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_mxfp4_sm80_kernel(/* see sg2_metanet_only_generated.cu */);
+__global__ void sg2_metanet_mxfp4_sm80_kernel(/* see sg2_metanet_only_generated.cu */);
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_mxfp4_sm80_d16_kernel(/* see sg2_metanet_only_generated.cu */);
+__global__ void sg2_metanet_mxfp4_sm80_d16_kernel(/* see sg2_metanet_only_generated.cu */);
 
-__launch_bounds__(16, 8)
-__global__ __launch_bounds__(256, 2) void sg2_persistent_scan_F_generic_kernel(/* see sg2_persistent_scan_generated.cu */);
+__global__ void sg2_persistent_scan_F_generic_kernel(/* see sg2_persistent_scan_generated.cu */);
 
-__launch_bounds__(16, 8)
-__global__ __launch_bounds__(256, 2) void sg2_persistent_scan_F_generic_d16_kernel(/* see sg2_persistent_scan_generated.cu */);
+__global__ void sg2_persistent_scan_F_generic_d16_kernel(/* see sg2_persistent_scan_generated.cu */);
 
-__launch_bounds__(16, 8)
-__global__ __launch_bounds__(256, 2) void sg2_persistent_scan_F_sm80_kernel(/* see sg2_persistent_scan_generated.cu */);
+__global__ void sg2_persistent_scan_F_sm80_kernel(/* see sg2_persistent_scan_generated.cu */);
 
-__launch_bounds__(16, 8)
-__global__ __launch_bounds__(256, 2) void sg2_persistent_scan_F_sm80_d16_kernel(/* see sg2_persistent_scan_generated.cu */);
+__global__ void sg2_persistent_scan_F_sm80_d16_kernel(/* see sg2_persistent_scan_generated.cu */);
 
-__launch_bounds__(16, 8)
-__global__ __launch_bounds__(256, 2) void sg2_persistent_scan_Q_generic_kernel(/* see sg2_persistent_scan_generated.cu */);
+__global__ void sg2_persistent_scan_Q_generic_kernel(/* see sg2_persistent_scan_generated.cu */);
 
-__launch_bounds__(16, 8)
-__global__ __launch_bounds__(256, 2) void sg2_persistent_scan_Q_generic_d16_kernel(/* see sg2_persistent_scan_generated.cu */);
+__global__ void sg2_persistent_scan_Q_generic_d16_kernel(/* see sg2_persistent_scan_generated.cu */);
 
-__launch_bounds__(16, 8)
-__global__ __launch_bounds__(256, 2) void sg2_persistent_scan_Q_sm80_kernel(/* see sg2_persistent_scan_generated.cu */);
+__global__ void sg2_persistent_scan_Q_sm80_kernel(/* see sg2_persistent_scan_generated.cu */);
 
-__launch_bounds__(16, 8)
-__global__ __launch_bounds__(256, 2) void sg2_persistent_scan_Q_sm80_d16_kernel(/* see sg2_persistent_scan_generated.cu */);
+__global__ void sg2_persistent_scan_Q_sm80_d16_kernel(/* see sg2_persistent_scan_generated.cu */);
 
-__launch_bounds__(16, 8)
-__global__ __launch_bounds__(256, 2) void mamba3_parallel_scan_d16_kernel(/* see sg2_scan_d16_generated.cu */);
+__global__ void mamba3_parallel_scan_d16_kernel(/* see sg2_scan_d16_generated.cu */);
 
 // ═══════════════════════════════════════════════════════════════════════
 //  launch_sg2_fused_elem_generated

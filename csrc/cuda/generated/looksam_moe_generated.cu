@@ -14,7 +14,7 @@ constexpr int LOOKSAM_BLOCK_SIZE = 256;
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void looksam_perturb_moe_kernel(
+__global__ void looksam_perturb_moe_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     const bool* __restrict__ active_mask,
@@ -56,7 +56,7 @@ void launch_looksam_perturb_moe(
 
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void looksam_perturb_moe_vec4_kernel(
+__global__ void looksam_perturb_moe_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ grad4,
     const bool* __restrict__ active_mask,
@@ -102,7 +102,7 @@ void launch_looksam_perturb_moe_vec4(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void looksam_adjust_moe_kernel(
+__global__ void looksam_adjust_moe_kernel(
     scalar_t* __restrict__ grad,
     const scalar_t* __restrict__ v_dir,
     const bool* __restrict__ active_mask,
@@ -148,7 +148,7 @@ void launch_looksam_adjust_moe(
 /* Kernel 4: LookSAM adjust MoE vec4 (float4, FP32-only) */
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void looksam_adjust_moe_vec4_kernel(
+__global__ void looksam_adjust_moe_vec4_kernel(
     float4* __restrict__ grad4,
     const float4* __restrict__ v_dir4,
     const bool* __restrict__ active_mask,
@@ -193,7 +193,7 @@ void launch_looksam_adjust_moe_vec4(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void looksam_restore_moe_kernel(
+__global__ void looksam_restore_moe_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ backup,
     const bool* __restrict__ active_mask,
@@ -229,7 +229,7 @@ void launch_looksam_restore_moe(
 /* Kernel 6: LookSAM restore MoE vec4 (float4, FP32-only) */
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void looksam_restore_moe_vec4_kernel(
+__global__ void looksam_restore_moe_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ backup4,
     const bool* __restrict__ active_mask,

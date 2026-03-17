@@ -49,7 +49,7 @@ __device__ __forceinline__ int8_t muon_q4_float_to_int8_sr(float val, float scal
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void muon_update_q4_kernel(
+__global__ void muon_update_q4_kernel(
     scalar_t* __restrict__ param,
     int8_t* __restrict__ momentum_q,
     float* __restrict__ momentum_scales,
@@ -87,7 +87,7 @@ __global__ __launch_bounds__(256, 2) void muon_update_q4_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void muon_update_q4_vec4_kernel(
+__global__ void muon_update_q4_vec4_kernel(
     float4* __restrict__ param4,
     int8_t* __restrict__ momentum_q,
     float* __restrict__ momentum_scales,
@@ -150,7 +150,7 @@ __global__ __launch_bounds__(256, 2) void muon_update_q4_vec4_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void muon_update_moe_kernel(
+__global__ void muon_update_moe_kernel(
     scalar_t* __restrict__ param,
     float* __restrict__ momentum_buffer,
     const scalar_t* __restrict__ orth,
@@ -183,7 +183,7 @@ __global__ __launch_bounds__(256, 2) void muon_update_moe_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void muon_update_moe_vec4_kernel(
+__global__ void muon_update_moe_vec4_kernel(
     float4* __restrict__ param4,
     float4* __restrict__ momentum_buffer4,
     const float4* __restrict__ orth4,
@@ -222,7 +222,7 @@ __global__ __launch_bounds__(256, 2) void muon_update_moe_vec4_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void muon_update_moe_q4_kernel(
+__global__ void muon_update_moe_q4_kernel(
     scalar_t* __restrict__ param,
     int8_t* __restrict__ momentum_q,
     float* __restrict__ momentum_scales,
@@ -262,7 +262,7 @@ __global__ __launch_bounds__(256, 2) void muon_update_moe_q4_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void muon_update_moe_q4_vec4_kernel(
+__global__ void muon_update_moe_q4_vec4_kernel(
     float4* __restrict__ param4,
     int8_t* __restrict__ momentum_q,
     float* __restrict__ momentum_scales,

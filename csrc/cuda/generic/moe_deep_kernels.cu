@@ -39,8 +39,8 @@
 //  Uses __syncthreads() after computing active_mask.
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void moe_dynamic_expert_load_kernel(
+__launch_bounds__(256, 8)
+__global__ void moe_dynamic_expert_load_kernel(
     const float* __restrict__ gate_logits,   // [N, num_experts]
     const float* __restrict__ W1,            // [num_experts, expert_dim, input_dim]
     const float* __restrict__ b1,            // [num_experts, expert_dim]
@@ -154,8 +154,8 @@ __global__ __launch_bounds__(256, 2) void moe_dynamic_expert_load_kernel(
 //    output = sum(gate_weight * (W2 * hidden + b2))
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void moe_dynamic_expert_fwd_kernel(
+__launch_bounds__(256, 8)
+__global__ void moe_dynamic_expert_fwd_kernel(
     const float* __restrict__ input,            // [N, input_dim]
     const float* __restrict__ gate_logits,      // [N, num_experts]
     const float* __restrict__ loaded_W1,        // [N, MAX_TOPK, expert_dim, input_dim]
@@ -272,8 +272,8 @@ __global__ __launch_bounds__(256, 2) void moe_dynamic_expert_fwd_kernel(
 //  memory reduction for weight gradient accumulation.
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void moe_dynamic_expert_bwd_kernel(
+__launch_bounds__(256, 8)
+__global__ void moe_dynamic_expert_bwd_kernel(
     const float* __restrict__ grad_output,       // [N, input_dim]
     const float* __restrict__ input,             // [N, input_dim]
     const float* __restrict__ gate_logits,       // [N, num_experts]
@@ -451,8 +451,8 @@ __global__ __launch_bounds__(256, 2) void moe_dynamic_expert_bwd_kernel(
 //  Output: compacted param/grad/state arrays + scatter indices.
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(256, 4)
-__global__ __launch_bounds__(256, 2) void moe_filter_active_params_kernel(
+__launch_bounds__(256, 8)
+__global__ void moe_filter_active_params_kernel(
     const float* __restrict__ params,          // [total_params]
     const float* __restrict__ grads,           // [total_params]
     const float* __restrict__ state_m,         // [total_params] — optimizer 1st moment
@@ -495,8 +495,8 @@ __global__ __launch_bounds__(256, 2) void moe_filter_active_params_kernel(
 //  Identical scan logic to parallel_scan but on smaller N.
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(16, 8)
-__global__ __launch_bounds__(256, 2) void moe_scan_compacted_kernel(
+__launch_bounds__(256, 8)
+__global__ void moe_scan_compacted_kernel(
     const float* __restrict__ compact_x,        // [compact_N, d_inner] — projected input
     const float* __restrict__ compact_dt,       // [compact_N, d_inner] — delta t
     const float* __restrict__ compact_B,        // [compact_N, d_state]
@@ -696,8 +696,8 @@ __global__ __launch_bounds__(256, 2) void moe_scan_compacted_kernel(
 //  using the scatter indices from kernel 4.
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(256, 4)
-__global__ __launch_bounds__(256, 2) void moe_scatter_results_kernel(
+__launch_bounds__(256, 8)
+__global__ void moe_scatter_results_kernel(
     const float* __restrict__ compact_params,    // [compact_N] — updated params
     const float* __restrict__ compact_state_m,   // [compact_N] — updated 1st moment
     const float* __restrict__ compact_state_v,   // [compact_N] — updated 2nd moment
@@ -733,8 +733,8 @@ __global__ __launch_bounds__(256, 2) void moe_scatter_results_kernel(
 //  Output: expert_counts[num_experts] array.
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(256, 4)
-__global__ __launch_bounds__(256, 2) void moe_count_expert_activations_kernel(
+__launch_bounds__(256, 8)
+__global__ void moe_count_expert_activations_kernel(
     const float* __restrict__ gate_logits,  // [N, num_experts]
     int* __restrict__ expert_counts,        // [num_experts] — output, must be pre-zeroed
     const float threshold,
@@ -783,8 +783,8 @@ __global__ __launch_bounds__(256, 2) void moe_count_expert_activations_kernel(
 //  Uses shared memory reduction.
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void moe_compute_load_balance_loss_kernel(
+__launch_bounds__(256, 8)
+__global__ void moe_compute_load_balance_loss_kernel(
     const int* __restrict__ expert_counts,   // [num_experts]
     const float* __restrict__ gate_logits,   // [N, num_experts]
     float* __restrict__ loss_out,            // [1] — scalar output
@@ -865,8 +865,8 @@ __global__ __launch_bounds__(256, 2) void moe_compute_load_balance_loss_kernel(
 //  Modifies the per-expert lr_scale buffer.
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(256, 4)
-__global__ __launch_bounds__(256, 2) void moe_apply_frequency_scaling_kernel(
+__launch_bounds__(256, 8)
+__global__ void moe_apply_frequency_scaling_kernel(
     const int* __restrict__ expert_counts,   // [num_experts] — activation counts
     float* __restrict__ lr_scale,            // [num_experts] — per-expert LR scale (in/out)
     const int num_experts,

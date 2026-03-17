@@ -22,7 +22,7 @@ constexpr int MUON_STREAM_BLOCK = 256;
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void muon_update_stream_kernel(
+__global__ void muon_update_stream_kernel(
     scalar_t* __restrict__ param,
     float* __restrict__ momentum_buffer,
     const scalar_t* __restrict__ orth,
@@ -60,7 +60,7 @@ __global__ __launch_bounds__(256, 2) void muon_update_stream_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void muon_update_stream_vec4_kernel(
+__global__ void muon_update_stream_vec4_kernel(
     float4* __restrict__ param4,
     float4* __restrict__ momentum_buffer4,
     const float4* __restrict__ orth4,

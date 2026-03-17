@@ -18,7 +18,7 @@
 // State: FP32, Expert: FP32, HW: GENERIC, MoE: DENSE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_generic_D_kernel(
+__global__ void sg2_fused_elem_F_fp32_generic_D_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -130,7 +130,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_generic_D_kernel
 // State: FP32, Expert: FP32, HW: GENERIC, MoE: DENSE, d16: True
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_generic_D_d16_kernel(
+__global__ void sg2_fused_elem_F_fp32_generic_D_d16_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -243,7 +243,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_generic_D_d16_ke
 // State: FP32, Expert: FP32, HW: GENERIC, MoE: MOE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_generic_M_kernel(
+__global__ void sg2_fused_elem_F_fp32_generic_M_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -357,7 +357,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_generic_M_kernel
 // State: FP32, Expert: FP32, HW: GENERIC, MoE: MOE, d16: True
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_generic_M_d16_kernel(
+__global__ void sg2_fused_elem_F_fp32_generic_M_d16_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -472,7 +472,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_generic_M_d16_ke
 // State: FP32, Expert: FP32, HW: AMPERE, MoE: DENSE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_sm80_D_kernel(
+__global__ void sg2_fused_elem_F_fp32_sm80_D_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -584,7 +584,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_sm80_D_kernel(
 // State: FP32, Expert: FP32, HW: AMPERE, MoE: DENSE, d16: True
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_sm80_D_d16_kernel(
+__global__ void sg2_fused_elem_F_fp32_sm80_D_d16_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -697,7 +697,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_sm80_D_d16_kerne
 // State: FP32, Expert: FP32, HW: AMPERE, MoE: MOE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_sm80_M_kernel(
+__global__ void sg2_fused_elem_F_fp32_sm80_M_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -811,7 +811,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_sm80_M_kernel(
 // State: FP32, Expert: FP32, HW: AMPERE, MoE: MOE, d16: True
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_sm80_M_d16_kernel(
+__global__ void sg2_fused_elem_F_fp32_sm80_M_d16_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -926,7 +926,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_fp32_sm80_M_d16_kerne
 // State: FP32, Expert: INT8, HW: GENERIC, MoE: DENSE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_generic_D_kernel(
+__global__ void sg2_fused_elem_F_int8_generic_D_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -1043,7 +1043,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_generic_D_kernel
 // State: FP32, Expert: INT8, HW: GENERIC, MoE: DENSE, d16: True
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_generic_D_d16_kernel(
+__global__ void sg2_fused_elem_F_int8_generic_D_d16_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -1161,7 +1161,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_generic_D_d16_ke
 // State: FP32, Expert: INT8, HW: GENERIC, MoE: MOE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_generic_M_kernel(
+__global__ void sg2_fused_elem_F_int8_generic_M_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -1280,7 +1280,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_generic_M_kernel
 // State: FP32, Expert: INT8, HW: GENERIC, MoE: MOE, d16: True
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_generic_M_d16_kernel(
+__global__ void sg2_fused_elem_F_int8_generic_M_d16_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -1400,7 +1400,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_generic_M_d16_ke
 // State: FP32, Expert: INT8, HW: AMPERE, MoE: DENSE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_sm80_D_kernel(
+__global__ void sg2_fused_elem_F_int8_sm80_D_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -1517,7 +1517,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_sm80_D_kernel(
 // State: FP32, Expert: INT8, HW: AMPERE, MoE: DENSE, d16: True
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_sm80_D_d16_kernel(
+__global__ void sg2_fused_elem_F_int8_sm80_D_d16_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -1635,7 +1635,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_sm80_D_d16_kerne
 // State: FP32, Expert: INT8, HW: AMPERE, MoE: MOE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_sm80_M_kernel(
+__global__ void sg2_fused_elem_F_int8_sm80_M_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -1754,7 +1754,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_sm80_M_kernel(
 // State: FP32, Expert: INT8, HW: AMPERE, MoE: MOE, d16: True
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_sm80_M_d16_kernel(
+__global__ void sg2_fused_elem_F_int8_sm80_M_d16_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -1874,7 +1874,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int8_sm80_M_d16_kerne
 // State: FP32, Expert: INT4, HW: GENERIC, MoE: DENSE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_generic_D_kernel(
+__global__ void sg2_fused_elem_F_int4_generic_D_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -2002,7 +2002,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_generic_D_kernel
 // State: FP32, Expert: INT4, HW: GENERIC, MoE: DENSE, d16: True
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_generic_D_d16_kernel(
+__global__ void sg2_fused_elem_F_int4_generic_D_d16_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -2131,7 +2131,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_generic_D_d16_ke
 // State: FP32, Expert: INT4, HW: GENERIC, MoE: MOE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_generic_M_kernel(
+__global__ void sg2_fused_elem_F_int4_generic_M_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -2261,7 +2261,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_generic_M_kernel
 // State: FP32, Expert: INT4, HW: GENERIC, MoE: MOE, d16: True
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_generic_M_d16_kernel(
+__global__ void sg2_fused_elem_F_int4_generic_M_d16_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -2392,7 +2392,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_generic_M_d16_ke
 // State: FP32, Expert: INT4, HW: AMPERE, MoE: DENSE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_sm80_D_kernel(
+__global__ void sg2_fused_elem_F_int4_sm80_D_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -2520,7 +2520,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_sm80_D_kernel(
 // State: FP32, Expert: INT4, HW: AMPERE, MoE: DENSE, d16: True
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_sm80_D_d16_kernel(
+__global__ void sg2_fused_elem_F_int4_sm80_D_d16_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -2649,7 +2649,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_sm80_D_d16_kerne
 // State: FP32, Expert: INT4, HW: AMPERE, MoE: MOE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_sm80_M_kernel(
+__global__ void sg2_fused_elem_F_int4_sm80_M_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -2779,7 +2779,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_sm80_M_kernel(
 // State: FP32, Expert: INT4, HW: AMPERE, MoE: MOE, d16: True
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_sm80_M_d16_kernel(
+__global__ void sg2_fused_elem_F_int4_sm80_M_d16_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -2910,7 +2910,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_int4_sm80_M_d16_kerne
 // State: FP32, Expert: MXFP4, HW: GENERIC, MoE: DENSE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_generic_D_kernel(
+__global__ void sg2_fused_elem_F_mxfp4_generic_D_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -3049,7 +3049,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_generic_D_kerne
 // State: FP32, Expert: MXFP4, HW: GENERIC, MoE: DENSE, d16: True
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_generic_D_d16_kernel(
+__global__ void sg2_fused_elem_F_mxfp4_generic_D_d16_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -3189,7 +3189,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_generic_D_d16_k
 // State: FP32, Expert: MXFP4, HW: GENERIC, MoE: MOE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_generic_M_kernel(
+__global__ void sg2_fused_elem_F_mxfp4_generic_M_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -3330,7 +3330,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_generic_M_kerne
 // State: FP32, Expert: MXFP4, HW: GENERIC, MoE: MOE, d16: True
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_generic_M_d16_kernel(
+__global__ void sg2_fused_elem_F_mxfp4_generic_M_d16_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -3472,7 +3472,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_generic_M_d16_k
 // State: FP32, Expert: MXFP4, HW: AMPERE, MoE: DENSE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_sm80_D_kernel(
+__global__ void sg2_fused_elem_F_mxfp4_sm80_D_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -3611,7 +3611,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_sm80_D_kernel(
 // State: FP32, Expert: MXFP4, HW: AMPERE, MoE: DENSE, d16: True
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_sm80_D_d16_kernel(
+__global__ void sg2_fused_elem_F_mxfp4_sm80_D_d16_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -3751,7 +3751,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_sm80_D_d16_kern
 // State: FP32, Expert: MXFP4, HW: AMPERE, MoE: MOE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_sm80_M_kernel(
+__global__ void sg2_fused_elem_F_mxfp4_sm80_M_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -3892,7 +3892,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_sm80_M_kernel(
 // State: FP32, Expert: MXFP4, HW: AMPERE, MoE: MOE, d16: True
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_sm80_M_d16_kernel(
+__global__ void sg2_fused_elem_F_mxfp4_sm80_M_d16_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -4034,7 +4034,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_F_mxfp4_sm80_M_d16_kern
 // State: CONFIG4, Expert: FP32, HW: GENERIC, MoE: DENSE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_fp32_generic_D_kernel(
+__global__ void sg2_fused_elem_Q_fp32_generic_D_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -4146,7 +4146,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_fp32_generic_D_kernel
 // State: CONFIG4, Expert: FP32, HW: GENERIC, MoE: MOE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_fp32_generic_M_kernel(
+__global__ void sg2_fused_elem_Q_fp32_generic_M_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -4260,7 +4260,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_fp32_generic_M_kernel
 // State: CONFIG4, Expert: FP32, HW: AMPERE, MoE: DENSE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_fp32_sm80_D_kernel(
+__global__ void sg2_fused_elem_Q_fp32_sm80_D_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -4372,7 +4372,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_fp32_sm80_D_kernel(
 // State: CONFIG4, Expert: FP32, HW: AMPERE, MoE: MOE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_fp32_sm80_M_kernel(
+__global__ void sg2_fused_elem_Q_fp32_sm80_M_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -4486,7 +4486,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_fp32_sm80_M_kernel(
 // State: CONFIG4, Expert: INT8, HW: GENERIC, MoE: DENSE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int8_generic_D_kernel(
+__global__ void sg2_fused_elem_Q_int8_generic_D_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -4603,7 +4603,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int8_generic_D_kernel
 // State: CONFIG4, Expert: INT8, HW: GENERIC, MoE: MOE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int8_generic_M_kernel(
+__global__ void sg2_fused_elem_Q_int8_generic_M_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -4722,7 +4722,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int8_generic_M_kernel
 // State: CONFIG4, Expert: INT8, HW: AMPERE, MoE: DENSE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int8_sm80_D_kernel(
+__global__ void sg2_fused_elem_Q_int8_sm80_D_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -4839,7 +4839,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int8_sm80_D_kernel(
 // State: CONFIG4, Expert: INT8, HW: AMPERE, MoE: MOE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int8_sm80_M_kernel(
+__global__ void sg2_fused_elem_Q_int8_sm80_M_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -4958,7 +4958,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int8_sm80_M_kernel(
 // State: CONFIG4, Expert: INT4, HW: GENERIC, MoE: DENSE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int4_generic_D_kernel(
+__global__ void sg2_fused_elem_Q_int4_generic_D_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -5086,7 +5086,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int4_generic_D_kernel
 // State: CONFIG4, Expert: INT4, HW: GENERIC, MoE: MOE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int4_generic_M_kernel(
+__global__ void sg2_fused_elem_Q_int4_generic_M_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -5216,7 +5216,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int4_generic_M_kernel
 // State: CONFIG4, Expert: INT4, HW: AMPERE, MoE: DENSE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int4_sm80_D_kernel(
+__global__ void sg2_fused_elem_Q_int4_sm80_D_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -5344,7 +5344,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int4_sm80_D_kernel(
 // State: CONFIG4, Expert: INT4, HW: AMPERE, MoE: MOE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int4_sm80_M_kernel(
+__global__ void sg2_fused_elem_Q_int4_sm80_M_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -5474,7 +5474,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_int4_sm80_M_kernel(
 // State: CONFIG4, Expert: MXFP4, HW: GENERIC, MoE: DENSE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_mxfp4_generic_D_kernel(
+__global__ void sg2_fused_elem_Q_mxfp4_generic_D_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -5613,7 +5613,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_mxfp4_generic_D_kerne
 // State: CONFIG4, Expert: MXFP4, HW: GENERIC, MoE: MOE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_mxfp4_generic_M_kernel(
+__global__ void sg2_fused_elem_Q_mxfp4_generic_M_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -5754,7 +5754,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_mxfp4_generic_M_kerne
 // State: CONFIG4, Expert: MXFP4, HW: AMPERE, MoE: DENSE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_mxfp4_sm80_D_kernel(
+__global__ void sg2_fused_elem_Q_mxfp4_sm80_D_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -5893,7 +5893,7 @@ __global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_mxfp4_sm80_D_kernel(
 // State: CONFIG4, Expert: MXFP4, HW: AMPERE, MoE: MOE, d16: False
 template <typename scalar_t>
 __launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_fused_elem_Q_mxfp4_sm80_M_kernel(
+__global__ void sg2_fused_elem_Q_mxfp4_sm80_M_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,

@@ -18,7 +18,7 @@ constexpr int BLOCK_SIZE = 256;
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void fused_adam_decay_moe_kernel(
+__global__ void fused_adam_decay_moe_kernel(
     scalar_t* __restrict__ param,
     float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq,
@@ -62,7 +62,7 @@ __global__ __launch_bounds__(256, 2) void fused_adam_decay_moe_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void fused_adam_decay_moe_vec4_kernel(
+__global__ void fused_adam_decay_moe_vec4_kernel(
     float4* __restrict__ param4,
     float4* __restrict__ exp_avg4,
     float4* __restrict__ exp_avg_sq4,
@@ -117,7 +117,7 @@ __global__ __launch_bounds__(256, 2) void fused_adam_decay_moe_vec4_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void fused_mu_metanet_moe_kernel(
+__global__ void fused_mu_metanet_moe_kernel(
     scalar_t* __restrict__ mu,
     const scalar_t* __restrict__ grad,
     const scalar_t* __restrict__ sharp,
@@ -178,7 +178,7 @@ __global__ __launch_bounds__(256, 2) void fused_mu_metanet_moe_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void fused_sg11_mu_metanet_moe_kernel(
+__global__ void fused_sg11_mu_metanet_moe_kernel(
     scalar_t* __restrict__ mu,
     const scalar_t* __restrict__ grad,
     const scalar_t* __restrict__ sharp,
@@ -240,7 +240,7 @@ __global__ __launch_bounds__(256, 2) void fused_sg11_mu_metanet_moe_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void fused_sg11_adam_cosine_gate_moe_kernel(
+__global__ void fused_sg11_adam_cosine_gate_moe_kernel(
     scalar_t* __restrict__ param,
     float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq,
@@ -285,7 +285,7 @@ __global__ __launch_bounds__(256, 2) void fused_sg11_adam_cosine_gate_moe_kernel
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void fused_sg11_adam_cosine_gate_moe_vec4_kernel(
+__global__ void fused_sg11_adam_cosine_gate_moe_vec4_kernel(
     float4* __restrict__ param4,
     float4* __restrict__ exp_avg4,
     float4* __restrict__ exp_avg_sq4,
@@ -340,7 +340,7 @@ __global__ __launch_bounds__(256, 2) void fused_sg11_adam_cosine_gate_moe_vec4_k
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void fused_neuralgrok_amplifier_moe_kernel(
+__global__ void fused_neuralgrok_amplifier_moe_kernel(
     const scalar_t* __restrict__ grad,
     scalar_t* __restrict__ amplified_grad,
     const bool* __restrict__ active_mask,
@@ -396,7 +396,7 @@ __global__ __launch_bounds__(256, 2) void fused_neuralgrok_amplifier_moe_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void muon_ns_combine_moe_kernel(
+__global__ void muon_ns_combine_moe_kernel(
     scalar_t* __restrict__ X_out,
     const scalar_t* __restrict__ X,
     const scalar_t* __restrict__ AX,
@@ -422,7 +422,7 @@ __global__ __launch_bounds__(256, 2) void muon_ns_combine_moe_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void muon_ns_combine_moe_vec4_kernel(
+__global__ void muon_ns_combine_moe_vec4_kernel(
     float4* __restrict__ X_out4,
     const float4* __restrict__ X4,
     const float4* __restrict__ AX4,

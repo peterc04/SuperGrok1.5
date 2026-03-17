@@ -81,8 +81,8 @@ void launch_fused_neuralgrok_full_step(
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
-__launch_bounds__(256, 4)
-__global__ __launch_bounds__(256, 2) void fused_supergrok15_full_step_cpasync_kernel(
+__launch_bounds__(256, 8)
+__global__ void fused_supergrok15_full_step_cpasync_kernel(
     scalar_t* __restrict__ param,         // [N] — updated
     float* __restrict__ exp_avg,          // [N] — FP32 state
     float* __restrict__ exp_avg_sq,       // [N] — FP32 state
@@ -211,8 +211,8 @@ __global__ __launch_bounds__(256, 2) void fused_supergrok15_full_step_cpasync_ke
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
-__launch_bounds__(256, 4)
-__global__ __launch_bounds__(256, 2) void fused_sg11_full_step_cpasync_kernel(
+__launch_bounds__(256, 8)
+__global__ void fused_sg11_full_step_cpasync_kernel(
     scalar_t* __restrict__ param,         // [N] — updated
     float* __restrict__ exp_avg,          // [N] — FP32 state
     float* __restrict__ exp_avg_sq,       // [N] — FP32 state
@@ -340,8 +340,8 @@ __global__ __launch_bounds__(256, 2) void fused_sg11_full_step_cpasync_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
-__launch_bounds__(256, 4)
-__global__ __launch_bounds__(256, 2) void fused_neuralgrok_full_step_cpasync_kernel(
+__launch_bounds__(256, 8)
+__global__ void fused_neuralgrok_full_step_cpasync_kernel(
     scalar_t* __restrict__ param,             // [N] -- updated in-place
     float* __restrict__ exp_avg,              // [N] -- updated in-place
     float* __restrict__ exp_avg_sq,           // [N] -- updated in-place
@@ -630,59 +630,50 @@ void launch_fused_neuralgrok_full_step_ampere(
 //  Explicit template instantiations
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(256, 4)
 template __global__ void fused_supergrok15_full_step_cpasync_kernel<float>(
     float*, float*, float*, float*, const float*, const float*,
     const float, const float*, const float*, const float*, const float*,
     const float, const float, const float, const float, const float,
     const float, const float, const float, const float, const int, const int);
-__launch_bounds__(256, 4)
 template __global__ void fused_supergrok15_full_step_cpasync_kernel<at::Half>(
     at::Half*, float*, float*, at::Half*, const at::Half*, const at::Half*,
     const float, const float*, const float*, const float*, const float*,
     const float, const float, const float, const float, const float,
     const float, const float, const float, const float, const int, const int);
-__launch_bounds__(256, 4)
 template __global__ void fused_supergrok15_full_step_cpasync_kernel<at::BFloat16>(
     at::BFloat16*, float*, float*, at::BFloat16*, const at::BFloat16*, const at::BFloat16*,
     const float, const float*, const float*, const float*, const float*,
     const float, const float, const float, const float, const float,
     const float, const float, const float, const float, const int, const int);
 
-__launch_bounds__(256, 4)
 template __global__ void fused_sg11_full_step_cpasync_kernel<float>(
     float*, float*, float*, float*, const float*, const float*,
     const float, const float*, const float*, const float*, const float*,
     const float, const float, const float, const float, const float,
     const float, const float, const float, const float, const int, const int);
-__launch_bounds__(256, 4)
 template __global__ void fused_sg11_full_step_cpasync_kernel<at::Half>(
     at::Half*, float*, float*, at::Half*, const at::Half*, const at::Half*,
     const float, const float*, const float*, const float*, const float*,
     const float, const float, const float, const float, const float,
     const float, const float, const float, const float, const int, const int);
-__launch_bounds__(256, 4)
 template __global__ void fused_sg11_full_step_cpasync_kernel<at::BFloat16>(
     at::BFloat16*, float*, float*, at::BFloat16*, const at::BFloat16*, const at::BFloat16*,
     const float, const float*, const float*, const float*, const float*,
     const float, const float, const float, const float, const float,
     const float, const float, const float, const float, const int, const int);
 
-__launch_bounds__(256, 4)
 template __global__ void fused_neuralgrok_full_step_cpasync_kernel<float>(
     float*, float*, float*, const float*,
     const float*, const float*, const float*, const float*,
     const float, const float, const int, const int,
     const float, const float, const float, const float, const float,
     const float, const float);
-__launch_bounds__(256, 4)
 template __global__ void fused_neuralgrok_full_step_cpasync_kernel<at::Half>(
     at::Half*, float*, float*, const at::Half*,
     const float*, const float*, const float*, const float*,
     const float, const float, const int, const int,
     const float, const float, const float, const float, const float,
     const float, const float);
-__launch_bounds__(256, 4)
 template __global__ void fused_neuralgrok_full_step_cpasync_kernel<at::BFloat16>(
     at::BFloat16*, float*, float*, const at::BFloat16*,
     const float*, const float*, const float*, const float*,
