@@ -511,7 +511,13 @@ __global__ void moe_filter_active_params_kernel(
     #pragma unroll 4
     for (int i = tid; i < total_params; i += stride) {
         int expert_id = param_to_expert[i];
-        if (expert_id >= 0 && expert_active[expert_id]) {
+        int is_active = (expert_id >= 0 && expert_active[expert_id]) ? 1 : 0;
+
+        // Warp ballot: skip work if no thread in this warp has active data
+        unsigned active_mask = __ballot_sync(0xFFFFFFFF, is_active);
+        if (active_mask == 0) continue;  // Entire warp inactive — skip
+
+        if (is_active) {
             // Atomically claim a slot in the compacted array
             int slot = atomicAdd(compact_count, 1);
 
@@ -811,7 +817,11 @@ __global__ void moe_count_expert_activations_kernel(
         #pragma unroll 4
         for (int e = 0; e < num_experts; e++) {
             float logit = gate_logits[i * num_experts + e];
-            if (logit > threshold) {
+            int above = (logit > threshold) ? 1 : 0;
+            // Warp ballot: skip atomicAdd if no thread in warp has an active expert
+            unsigned warp_active = __ballot_sync(0xFFFFFFFF, above);
+            if (warp_active == 0) continue;
+            if (above) {
                 atomicAdd(&s_counts[e], 1);
             }
         }

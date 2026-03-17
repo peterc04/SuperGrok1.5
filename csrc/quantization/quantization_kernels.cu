@@ -91,26 +91,35 @@ __global__ void quantize_fp8_e4m3_kernel(
     float* __restrict__ scale,         // [1] — per-tensor scale
     const int N
 ) {
-    // Phase 1: find absmax via block reduction
-    __shared__ float smem_max[QUANT_BLOCK];
+    // Phase 1: find absmax via warp shuffle + cross-warp shared memory reduction
     const int tid = threadIdx.x;
     const int gid = blockIdx.x * blockDim.x + tid;
+    const int lane_id = tid % 32;
+    const int warp_id = tid / 32;
 
     float local_max = 0.0f;
     #pragma unroll 4
     for (int i = gid; i < N; i += gridDim.x * blockDim.x) {
         local_max = fmaxf(local_max, fabsf(input[i]));
     }
-    smem_max[tid] = local_max;
+
+    // Warp-level reduction via shuffle (no shared memory needed for 32 elements)
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, offset));
+
+    // Cross-warp reduction via shared memory
+    __shared__ float smem_warp[8];  // 256/32 = 8 warps
+    if (lane_id == 0) smem_warp[warp_id] = local_max;
     __syncthreads();
 
-    // Block reduction
-    #pragma unroll 4
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) smem_max[tid] = fmaxf(smem_max[tid], smem_max[tid + s]);
-        __syncthreads();
+    if (warp_id == 0) {
+        local_max = (lane_id < 8) ? smem_warp[lane_id] : 0.0f;
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1)
+            local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, offset));
     }
-    if (tid == 0) atomicMax((int*)scale, __float_as_int(smem_max[0]));
+    if (tid == 0) atomicMax((int*)scale, __float_as_int(local_max));
     __syncthreads();
 
     // Phase 2: quantize
@@ -158,21 +167,31 @@ __global__ void quantize_int8_kernel(
     float* __restrict__ scale,
     const int N
 ) {
-    __shared__ float smem_max[QUANT_BLOCK];
     const int tid = threadIdx.x;
     const int gid = blockIdx.x * blockDim.x + tid;
+    const int lane_id = tid % 32;
+    const int warp_id = tid / 32;
 
     float local_max = 0.0f;
     #pragma unroll 4
     for (int i = gid; i < N; i += gridDim.x * blockDim.x)
         local_max = fmaxf(local_max, fabsf(input[i]));
-    smem_max[tid] = local_max;
+
+    // Warp-level reduction via shuffle
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, offset));
+
+    // Cross-warp reduction
+    __shared__ float smem_warp_i8[8];
+    if (lane_id == 0) smem_warp_i8[warp_id] = local_max;
     __syncthreads();
 
-    #pragma unroll 4
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) smem_max[tid] = fmaxf(smem_max[tid], smem_max[tid + s]);
-        __syncthreads();
+    if (warp_id == 0) {
+        local_max = (lane_id < 8) ? smem_warp_i8[lane_id] : 0.0f;
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1)
+            local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, offset));
     }
     if (tid == 0) atomicMax((int*)scale, __float_as_int(smem_max[0]));
     __syncthreads();
