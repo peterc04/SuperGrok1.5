@@ -132,8 +132,8 @@ void launch_mamba3_peer_batched_step(
 //  the memory access pattern changes.
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(16, 8)
-__global__ __launch_bounds__(256, 2) void mamba3_scan_batched_cpasync_kernel(
+__launch_bounds__(256, 8)
+__global__ void mamba3_scan_batched_cpasync_kernel(
     const float* __restrict__ x_sorted_packed,    // [total_N, d_model]
     float* __restrict__ scan_output_packed,        // [total_N, d_inner]
     const float* __restrict__ initial_states,      // [num_params, d_inner, d_state]
@@ -326,8 +326,8 @@ __global__ __launch_bounds__(256, 2) void mamba3_scan_batched_cpasync_kernel(
 //  Same cp.async double-buffering as the batched kernel above.
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(16, 8)
-__global__ __launch_bounds__(256, 2) void mamba3_scan_combined_cpasync_kernel(
+__launch_bounds__(256, 8)
+__global__ void mamba3_scan_combined_cpasync_kernel(
     const float* __restrict__ x_sorted_packed,
     float* __restrict__ fwd_scan_output,
     float* __restrict__ bwd_scan_output,
@@ -518,8 +518,8 @@ __global__ __launch_bounds__(256, 2) void mamba3_scan_combined_cpasync_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void fused_elem_step_cpasync_kernel(
+__launch_bounds__(256, 8)
+__global__ void fused_elem_step_cpasync_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     const scalar_t* __restrict__ sharpness,

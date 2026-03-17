@@ -19,7 +19,7 @@ constexpr int MUON_BLOCK_SIZE = 256;
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void muon_momentum_normalize_kernel(
+__global__ void muon_momentum_normalize_kernel(
     scalar_t* __restrict__ buf,
     scalar_t* __restrict__ X,
     const scalar_t* __restrict__ grad,
@@ -37,7 +37,7 @@ __global__ __launch_bounds__(256, 2) void muon_momentum_normalize_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void muon_ns_combine_kernel(
+__global__ void muon_ns_combine_kernel(
     scalar_t* __restrict__ X_out,
     const scalar_t* __restrict__ X,
     const scalar_t* __restrict__ AX,
@@ -58,7 +58,7 @@ __global__ __launch_bounds__(256, 2) void muon_ns_combine_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void muon_update_kernel(
+__global__ void muon_update_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ orth,
     const float neg_lr_scale,
@@ -80,7 +80,7 @@ __global__ __launch_bounds__(256, 2) void muon_update_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void muon_momentum_normalize_vec4_kernel(
+__global__ void muon_momentum_normalize_vec4_kernel(
     float4* __restrict__ buf4,
     float4* __restrict__ X4,
     const float4* __restrict__ grad4,
@@ -107,7 +107,7 @@ __global__ __launch_bounds__(256, 2) void muon_momentum_normalize_vec4_kernel(
 }
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void muon_ns_combine_vec4_kernel(
+__global__ void muon_ns_combine_vec4_kernel(
     float4* __restrict__ X_out4,
     const float4* __restrict__ X4,
     const float4* __restrict__ AX4,
@@ -130,7 +130,7 @@ __global__ __launch_bounds__(256, 2) void muon_ns_combine_vec4_kernel(
 }
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void muon_update_vec4_kernel(
+__global__ void muon_update_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ orth4,
     float neg_lr_scale, float decay_factor, int N4

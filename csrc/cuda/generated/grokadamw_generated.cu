@@ -69,7 +69,7 @@ __device__ __forceinline__ __nv_bfloat16 q4_float_to_bf16_sr(float val, unsigned
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void grokadamw_q4_scalar_kernel(
+__global__ void grokadamw_q4_scalar_kernel(
     scalar_t* __restrict__ param,
     int8_t* __restrict__ exp_avg_q,
     __nv_bfloat16* __restrict__ exp_avg_sq_bf16,
@@ -155,7 +155,7 @@ __global__ __launch_bounds__(256, 2) void grokadamw_q4_scalar_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void grokadamw_q4_vec4_kernel(
+__global__ void grokadamw_q4_vec4_kernel(
     float4* __restrict__ param4,
     int8_t* __restrict__ exp_avg_q,
     __nv_bfloat16* __restrict__ exp_avg_sq_bf16,

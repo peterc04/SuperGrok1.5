@@ -28,8 +28,8 @@ __device__ __forceinline__ int8_t sg15_meta_int8_stochastic(
 }
 
 template <typename scalar_t>
-__launch_bounds__(256, 4)
-__global__ __launch_bounds__(256, 2) void fused_supergrok15_full_step_q4_kernel(
+__launch_bounds__(256, 8)
+__global__ void fused_supergrok15_full_step_q4_kernel(
     scalar_t* __restrict__ param,
     int8_t* __restrict__ exp_avg_q,
     float* __restrict__ exp_avg_scales,
@@ -120,8 +120,8 @@ __global__ __launch_bounds__(256, 2) void fused_supergrok15_full_step_q4_kernel(
 }
 
 template <typename scalar_t>
-__launch_bounds__(256, 4)
-__global__ __launch_bounds__(256, 2) void fused_supergrok15_full_step_moe_kernel(
+__launch_bounds__(256, 8)
+__global__ void fused_supergrok15_full_step_moe_kernel(
     scalar_t* __restrict__ param,
     float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq,
@@ -196,8 +196,8 @@ __global__ __launch_bounds__(256, 2) void fused_supergrok15_full_step_moe_kernel
 }
 
 template <typename scalar_t>
-__launch_bounds__(256, 4)
-__global__ __launch_bounds__(256, 2) void fused_supergrok15_full_step_moe_q4_kernel(
+__launch_bounds__(256, 8)
+__global__ void fused_supergrok15_full_step_moe_q4_kernel(
     scalar_t* __restrict__ param,
     int8_t* __restrict__ exp_avg_q,
     float* __restrict__ exp_avg_scales,
@@ -290,8 +290,8 @@ __global__ __launch_bounds__(256, 2) void fused_supergrok15_full_step_moe_q4_ker
 }
 
 template <typename scalar_t>
-__launch_bounds__(256, 4)
-__global__ __launch_bounds__(256, 2) void sg15_metanet_forward_kernel(
+__launch_bounds__(256, 8)
+__global__ void sg15_metanet_forward_kernel(
     scalar_t* __restrict__ mu,
     const scalar_t* __restrict__ grad,
     const scalar_t* __restrict__ sharpness,

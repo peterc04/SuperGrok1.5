@@ -13,8 +13,8 @@
 // ── sg2_metanet_fp32_generic_kernel ──
 // Expert: FP32, HW: GENERIC, d16: False
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_fp32_generic_kernel(
+__launch_bounds__(256, 8)
+__global__ void sg2_metanet_fp32_generic_kernel(
     const scalar_t* __restrict__ grad,
     const float* __restrict__ fwd_scan_out,
     const float* __restrict__ bwd_scan_out,
@@ -90,8 +90,8 @@ __global__ __launch_bounds__(256, 2) void sg2_metanet_fp32_generic_kernel(
 // ── sg2_metanet_fp32_generic_d16_kernel ──
 // Expert: FP32, HW: GENERIC, d16: True
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_fp32_generic_d16_kernel(
+__launch_bounds__(256, 8)
+__global__ void sg2_metanet_fp32_generic_d16_kernel(
     const scalar_t* __restrict__ grad,
     const float* __restrict__ fwd_scan_out,
     const float* __restrict__ bwd_scan_out,
@@ -168,8 +168,8 @@ __global__ __launch_bounds__(256, 2) void sg2_metanet_fp32_generic_d16_kernel(
 // ── sg2_metanet_fp32_sm80_kernel ──
 // Expert: FP32, HW: AMPERE, d16: False
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_fp32_sm80_kernel(
+__launch_bounds__(256, 8)
+__global__ void sg2_metanet_fp32_sm80_kernel(
     const scalar_t* __restrict__ grad,
     const float* __restrict__ fwd_scan_out,
     const float* __restrict__ bwd_scan_out,
@@ -245,8 +245,8 @@ __global__ __launch_bounds__(256, 2) void sg2_metanet_fp32_sm80_kernel(
 // ── sg2_metanet_fp32_sm80_d16_kernel ──
 // Expert: FP32, HW: AMPERE, d16: True
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_fp32_sm80_d16_kernel(
+__launch_bounds__(256, 8)
+__global__ void sg2_metanet_fp32_sm80_d16_kernel(
     const scalar_t* __restrict__ grad,
     const float* __restrict__ fwd_scan_out,
     const float* __restrict__ bwd_scan_out,
@@ -323,8 +323,8 @@ __global__ __launch_bounds__(256, 2) void sg2_metanet_fp32_sm80_d16_kernel(
 // ── sg2_metanet_int8_generic_kernel ──
 // Expert: INT8, HW: GENERIC, d16: False
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_int8_generic_kernel(
+__launch_bounds__(256, 8)
+__global__ void sg2_metanet_int8_generic_kernel(
     const scalar_t* __restrict__ grad,
     const float* __restrict__ fwd_scan_out,
     const float* __restrict__ bwd_scan_out,
@@ -405,8 +405,8 @@ __global__ __launch_bounds__(256, 2) void sg2_metanet_int8_generic_kernel(
 // ── sg2_metanet_int8_generic_d16_kernel ──
 // Expert: INT8, HW: GENERIC, d16: True
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_int8_generic_d16_kernel(
+__launch_bounds__(256, 8)
+__global__ void sg2_metanet_int8_generic_d16_kernel(
     const scalar_t* __restrict__ grad,
     const float* __restrict__ fwd_scan_out,
     const float* __restrict__ bwd_scan_out,
@@ -488,8 +488,8 @@ __global__ __launch_bounds__(256, 2) void sg2_metanet_int8_generic_d16_kernel(
 // ── sg2_metanet_int8_sm80_kernel ──
 // Expert: INT8, HW: AMPERE, d16: False
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_int8_sm80_kernel(
+__launch_bounds__(256, 8)
+__global__ void sg2_metanet_int8_sm80_kernel(
     const scalar_t* __restrict__ grad,
     const float* __restrict__ fwd_scan_out,
     const float* __restrict__ bwd_scan_out,
@@ -570,8 +570,8 @@ __global__ __launch_bounds__(256, 2) void sg2_metanet_int8_sm80_kernel(
 // ── sg2_metanet_int8_sm80_d16_kernel ──
 // Expert: INT8, HW: AMPERE, d16: True
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_int8_sm80_d16_kernel(
+__launch_bounds__(256, 8)
+__global__ void sg2_metanet_int8_sm80_d16_kernel(
     const scalar_t* __restrict__ grad,
     const float* __restrict__ fwd_scan_out,
     const float* __restrict__ bwd_scan_out,
@@ -653,8 +653,8 @@ __global__ __launch_bounds__(256, 2) void sg2_metanet_int8_sm80_d16_kernel(
 // ── sg2_metanet_int4_generic_kernel ──
 // Expert: INT4, HW: GENERIC, d16: False
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_int4_generic_kernel(
+__launch_bounds__(256, 8)
+__global__ void sg2_metanet_int4_generic_kernel(
     const scalar_t* __restrict__ grad,
     const float* __restrict__ fwd_scan_out,
     const float* __restrict__ bwd_scan_out,
@@ -746,8 +746,8 @@ __global__ __launch_bounds__(256, 2) void sg2_metanet_int4_generic_kernel(
 // ── sg2_metanet_int4_generic_d16_kernel ──
 // Expert: INT4, HW: GENERIC, d16: True
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_int4_generic_d16_kernel(
+__launch_bounds__(256, 8)
+__global__ void sg2_metanet_int4_generic_d16_kernel(
     const scalar_t* __restrict__ grad,
     const float* __restrict__ fwd_scan_out,
     const float* __restrict__ bwd_scan_out,
@@ -840,8 +840,8 @@ __global__ __launch_bounds__(256, 2) void sg2_metanet_int4_generic_d16_kernel(
 // ── sg2_metanet_int4_sm80_kernel ──
 // Expert: INT4, HW: AMPERE, d16: False
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_int4_sm80_kernel(
+__launch_bounds__(256, 8)
+__global__ void sg2_metanet_int4_sm80_kernel(
     const scalar_t* __restrict__ grad,
     const float* __restrict__ fwd_scan_out,
     const float* __restrict__ bwd_scan_out,
@@ -933,8 +933,8 @@ __global__ __launch_bounds__(256, 2) void sg2_metanet_int4_sm80_kernel(
 // ── sg2_metanet_int4_sm80_d16_kernel ──
 // Expert: INT4, HW: AMPERE, d16: True
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_int4_sm80_d16_kernel(
+__launch_bounds__(256, 8)
+__global__ void sg2_metanet_int4_sm80_d16_kernel(
     const scalar_t* __restrict__ grad,
     const float* __restrict__ fwd_scan_out,
     const float* __restrict__ bwd_scan_out,
@@ -1027,8 +1027,8 @@ __global__ __launch_bounds__(256, 2) void sg2_metanet_int4_sm80_d16_kernel(
 // ── sg2_metanet_mxfp4_generic_kernel ──
 // Expert: MXFP4, HW: GENERIC, d16: False
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_mxfp4_generic_kernel(
+__launch_bounds__(256, 8)
+__global__ void sg2_metanet_mxfp4_generic_kernel(
     const scalar_t* __restrict__ grad,
     const float* __restrict__ fwd_scan_out,
     const float* __restrict__ bwd_scan_out,
@@ -1131,8 +1131,8 @@ __global__ __launch_bounds__(256, 2) void sg2_metanet_mxfp4_generic_kernel(
 // ── sg2_metanet_mxfp4_generic_d16_kernel ──
 // Expert: MXFP4, HW: GENERIC, d16: True
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_mxfp4_generic_d16_kernel(
+__launch_bounds__(256, 8)
+__global__ void sg2_metanet_mxfp4_generic_d16_kernel(
     const scalar_t* __restrict__ grad,
     const float* __restrict__ fwd_scan_out,
     const float* __restrict__ bwd_scan_out,
@@ -1236,8 +1236,8 @@ __global__ __launch_bounds__(256, 2) void sg2_metanet_mxfp4_generic_d16_kernel(
 // ── sg2_metanet_mxfp4_sm80_kernel ──
 // Expert: MXFP4, HW: AMPERE, d16: False
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_mxfp4_sm80_kernel(
+__launch_bounds__(256, 8)
+__global__ void sg2_metanet_mxfp4_sm80_kernel(
     const scalar_t* __restrict__ grad,
     const float* __restrict__ fwd_scan_out,
     const float* __restrict__ bwd_scan_out,
@@ -1340,8 +1340,8 @@ __global__ __launch_bounds__(256, 2) void sg2_metanet_mxfp4_sm80_kernel(
 // ── sg2_metanet_mxfp4_sm80_d16_kernel ──
 // Expert: MXFP4, HW: AMPERE, d16: True
 template <typename scalar_t>
-__launch_bounds__(256, 2)
-__global__ __launch_bounds__(256, 2) void sg2_metanet_mxfp4_sm80_d16_kernel(
+__launch_bounds__(256, 8)
+__global__ void sg2_metanet_mxfp4_sm80_d16_kernel(
     const scalar_t* __restrict__ grad,
     const float* __restrict__ fwd_scan_out,
     const float* __restrict__ bwd_scan_out,

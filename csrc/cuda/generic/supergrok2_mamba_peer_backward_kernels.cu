@@ -45,7 +45,7 @@
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void bilevel_precompute_kernel(
+__global__ void bilevel_precompute_kernel(
     const float* __restrict__ x_sorted,
     const float* __restrict__ in_proj_W,    // [2*d_inner, d_model]
     const float* __restrict__ dt_proj_W,    // [d_inner, d_inner]
@@ -105,7 +105,7 @@ __global__ __launch_bounds__(256, 2) void bilevel_precompute_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void softplus_bias_kernel(
+__global__ void softplus_bias_kernel(
     float* __restrict__ dt_out,       // [N, d_inner] — in-place
     const float* __restrict__ bias,   // [d_inner]
     const int N, const int d_inner
@@ -189,7 +189,7 @@ static void bilevel_precompute_gemm(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(16, 8)
-__global__ __launch_bounds__(256, 2) void mamba3_parallel_scan_fwd_save_kernel(
+__global__ void mamba3_parallel_scan_fwd_save_kernel(
     const float* __restrict__ pre_x_val,
     const float* __restrict__ pre_z_val,
     const float* __restrict__ pre_dt_val,
@@ -394,7 +394,7 @@ __global__ __launch_bounds__(256, 2) void mamba3_parallel_scan_fwd_save_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(16, 8)
-__global__ __launch_bounds__(256, 2) void mamba3_batched_parallel_scan_fwd_save_kernel(
+__global__ void mamba3_batched_parallel_scan_fwd_save_kernel(
     const float* __restrict__ pre_x_val,     // [total_N, d_inner]
     const float* __restrict__ pre_z_val,     // [total_N, d_inner]
     const float* __restrict__ pre_dt_val,    // [total_N, d_inner]
@@ -606,7 +606,7 @@ __global__ __launch_bounds__(256, 2) void mamba3_batched_parallel_scan_fwd_save_
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void reverse_segments_kernel(
+__global__ void reverse_segments_kernel(
     const float* __restrict__ src,
     float* __restrict__ dst,
     const int* __restrict__ offsets,
@@ -639,7 +639,7 @@ __global__ __launch_bounds__(256, 2) void reverse_segments_kernel(
 }
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void combine_fwd_bwd_kernel(
+__global__ void combine_fwd_bwd_kernel(
     const float* __restrict__ fwd,
     const float* __restrict__ bwd,
     float* __restrict__ out,
@@ -685,7 +685,7 @@ __global__ __launch_bounds__(256, 2) void combine_fwd_bwd_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(16, 8)
-__global__ __launch_bounds__(256, 2) void mamba3_scan_fwd_save_kernel(
+__global__ void mamba3_scan_fwd_save_kernel(
     const float* __restrict__ x_sorted,
     const float* __restrict__ in_proj_W,    // [2*d_inner, d_model]
     const float* __restrict__ dt_proj_W,    // [d_inner, d_inner]
@@ -838,7 +838,7 @@ __global__ __launch_bounds__(256, 2) void mamba3_scan_fwd_save_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(16, 8)
-__global__ __launch_bounds__(256, 2) void mamba3_scan_fwd_save_batched_kernel(
+__global__ void mamba3_scan_fwd_save_batched_kernel(
     const float* __restrict__ x_sorted_packed,    // [total_N, d_model]
     float* __restrict__ scan_output_packed,        // [total_N, d_inner]
     const float* __restrict__ initial_states,      // [num_params, d_inner, d_state]
@@ -993,7 +993,7 @@ __global__ __launch_bounds__(256, 2) void mamba3_scan_fwd_save_batched_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(16, 8)
-__global__ __launch_bounds__(256, 2) void mamba3_scan_backward_kernel(
+__global__ void mamba3_scan_backward_kernel(
     const float* __restrict__ d_scan_output,  // [N, d_inner] gradient from downstream
     const float* __restrict__ x_sorted,       // [N, d_model]
     const float* __restrict__ saved_states,   // [N, d_inner, d_state]
@@ -1457,7 +1457,7 @@ __global__ __launch_bounds__(256, 2) void mamba3_scan_backward_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(16, 8)
-__global__ __launch_bounds__(256, 2) void mamba3_scan_backward_batched_kernel(
+__global__ void mamba3_scan_backward_batched_kernel(
     const float* __restrict__ d_scan_output_packed,  // [total_N, d_inner]
     const float* __restrict__ x_sorted_packed,       // [total_N, d_model]
     const float* __restrict__ saved_states_packed,   // [total_N, d_inner, d_state]
@@ -1898,7 +1898,7 @@ __global__ __launch_bounds__(256, 2) void mamba3_scan_backward_batched_kernel(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void input_proj_backward_kernel(
+__global__ void input_proj_backward_kernel(
     const float* __restrict__ d_x,           // [N, d_model]
     const scalar_t* __restrict__ grad,       // [N]
     const scalar_t* __restrict__ sharpness,  // [N]
@@ -1961,7 +1961,7 @@ __global__ __launch_bounds__(256, 2) void input_proj_backward_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void gru_backward_kernel(
+__global__ void gru_backward_kernel(
     const float* __restrict__ d_h_new,       // [N, gru_hidden]
     const float* __restrict__ gru_input,     // [N, input_dim] (saved from forward)
     const float* __restrict__ h_old,         // [N, gru_hidden] (saved from forward)
@@ -2107,7 +2107,7 @@ __global__ __launch_bounds__(256, 2) void gru_backward_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void expert_peer_backward_kernel(
+__global__ void expert_peer_backward_kernel(
     const float* __restrict__ d_expert_out,    // [N, 1] (rescale * d_smart_grad)
     const float* __restrict__ grad_vals,       // [N] gradient values
     // Saved from bilevel forward
@@ -2313,7 +2313,7 @@ __global__ __launch_bounds__(256, 2) void expert_peer_backward_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void out_proj_backward_kernel(
+__global__ void out_proj_backward_kernel(
     const float* __restrict__ d_context,       // [N, d_model]
     const float* __restrict__ scan_out,        // [N, d_inner]
     const float* __restrict__ out_proj_W,      // [d_model, d_inner]

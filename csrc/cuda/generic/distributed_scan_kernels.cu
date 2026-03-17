@@ -105,8 +105,8 @@ __device__ __forceinline__ void affine_apply(
 //  After the global prefix is applied (kernel 3), results become globally correct.
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(DSCAN_BLOCK, 4)
-__global__ __launch_bounds__(256, 2) void mamba3_scan_local_with_summary_kernel(
+__launch_bounds__(16, 8)
+__global__ void mamba3_scan_local_with_summary_kernel(
     const float* __restrict__ pre_x_val,      // [N_local, d_inner]
     const float* __restrict__ pre_z_val,      // [N_local, d_inner]
     const float* __restrict__ pre_dt_val,     // [N_local, d_inner]
@@ -329,8 +329,8 @@ __global__ __launch_bounds__(256, 2) void mamba3_scan_local_with_summary_kernel(
 //  We re-run the scan with the correction bias to compute delta_y.
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(DSCAN_BLOCK, 4)
-__global__ __launch_bounds__(256, 2) void mamba3_apply_scan_prefix_kernel(
+__launch_bounds__(16, 8)
+__global__ void mamba3_apply_scan_prefix_kernel(
     const float* __restrict__ pre_x_val,      // [N_local, d_inner]
     const float* __restrict__ pre_z_val,      // [N_local, d_inner]
     const float* __restrict__ pre_dt_val,     // [N_local, d_inner]
@@ -567,8 +567,8 @@ __global__ __launch_bounds__(256, 2) void mamba3_apply_scan_prefix_kernel(
 //  we use one block per pair with K threads.
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(DSCAN_MAX_GPUS, 1)
-__global__ __launch_bounds__(256, 2) void scan_summary_prefix_kernel(
+__launch_bounds__(16, 8)
+__global__ void scan_summary_prefix_kernel(
     const float* __restrict__ all_summaries,   // [K, d_inner, half_d_state, 6]
     float* __restrict__ prefix_out,            // [K, d_inner, half_d_state, 6]
     const int K,                               // number of GPU chunks
@@ -655,8 +655,8 @@ __global__ __launch_bounds__(256, 2) void scan_summary_prefix_kernel(
 //  Grid: (d_inner) blocks, DSCAN_BLOCK threads.
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(DSCAN_BLOCK, 4)
-__global__ __launch_bounds__(256, 2) void mamba3_scan_local_with_summary_bwd_kernel(
+__launch_bounds__(16, 8)
+__global__ void mamba3_scan_local_with_summary_bwd_kernel(
     const float* __restrict__ pre_x_val,      // [N_local, d_inner]
     const float* __restrict__ pre_z_val,      // [N_local, d_inner]
     const float* __restrict__ pre_dt_val,     // [N_local, d_inner]
@@ -913,8 +913,8 @@ __global__ __launch_bounds__(256, 2) void mamba3_scan_local_with_summary_bwd_ker
 //  Grid: (d_inner) blocks, DSCAN_BLOCK threads.
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(DSCAN_BLOCK, 4)
-__global__ __launch_bounds__(256, 2) void mamba3_apply_scan_prefix_bwd_kernel(
+__launch_bounds__(16, 8)
+__global__ void mamba3_apply_scan_prefix_bwd_kernel(
     const float* __restrict__ pre_x_val,      // [N_local, d_inner]
     const float* __restrict__ pre_z_val,      // [N_local, d_inner]
     const float* __restrict__ pre_dt_val,     // [N_local, d_inner]
@@ -1104,8 +1104,8 @@ __global__ __launch_bounds__(256, 2) void mamba3_apply_scan_prefix_bwd_kernel(
 //  Grid: (num_pairs) blocks, up to DSCAN_MAX_GPUS threads.
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(DSCAN_MAX_GPUS, 1)
-__global__ __launch_bounds__(256, 2) void scan_summary_prefix_bwd_kernel(
+__launch_bounds__(16, 8)
+__global__ void scan_summary_prefix_bwd_kernel(
     const float* __restrict__ all_bwd_summaries, // [K, d_inner, half_d_state, 6]
     float* __restrict__ bwd_prefix_out,          // [K, d_inner, half_d_state, 6]
     const int K,

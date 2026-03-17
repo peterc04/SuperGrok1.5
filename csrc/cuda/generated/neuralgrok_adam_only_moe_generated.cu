@@ -27,7 +27,7 @@ __device__ __forceinline__ int8_t float_to_int8_stochastic(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void neuralgrok_adam_only_step_moe_kernel(
+__global__ void neuralgrok_adam_only_step_moe_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     float* __restrict__ exp_avg,
@@ -113,7 +113,7 @@ void launch_neuralgrok_adam_only_step_moe(
 
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void neuralgrok_adam_only_step_moe_vec4_kernel(
+__global__ void neuralgrok_adam_only_step_moe_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ grad4,
     float4* __restrict__ exp_avg4,
@@ -213,7 +213,7 @@ void launch_neuralgrok_adam_only_step_moe_vec4(
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void neuralgrok_adam_only_step_moe_q4_kernel(
+__global__ void neuralgrok_adam_only_step_moe_q4_kernel(
     scalar_t* __restrict__ param,
     const scalar_t* __restrict__ grad,
     int8_t* __restrict__ exp_avg_q,
@@ -328,7 +328,7 @@ void launch_neuralgrok_adam_only_step_moe_q4(
 
 
 __launch_bounds__(256, 8)
-__global__ __launch_bounds__(256, 2) void neuralgrok_adam_only_step_moe_q4_vec4_kernel(
+__global__ void neuralgrok_adam_only_step_moe_q4_vec4_kernel(
     float4* __restrict__ param4,
     const float4* __restrict__ grad4,
     int8_t* __restrict__ exp_avg_q,

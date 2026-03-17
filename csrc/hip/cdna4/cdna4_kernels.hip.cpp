@@ -207,7 +207,7 @@ __device__ __forceinline__ uint32_t philox_hash(uint32_t counter, uint32_t key) 
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__launch_bounds__(256, 2)
+__launch_bounds__(256, 8)
 __global__ void
 cdna4_fp4_expert_load_kernel(
     const uint32_t* __restrict__ weights_fp4,   // [num_experts, packed_size]
@@ -276,7 +276,7 @@ cdna4_fp4_expert_load_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__launch_bounds__(256, 2)
+__launch_bounds__(256, 8)
 __global__ void
 cdna4_fp4_expert_fwd_kernel(
     const float*    __restrict__ input,           // [batch_size, d_in]
@@ -368,7 +368,7 @@ cdna4_fp4_expert_fwd_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__launch_bounds__(256, 2)
+__launch_bounds__(256, 8)
 __global__ void
 cdna4_fp4_expert_bwd_kernel(
     const float*    __restrict__ grad_output,     // [batch_size, d_out]
@@ -479,7 +479,7 @@ cdna4_fp4_expert_bwd_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__launch_bounds__(256, 4)
+__launch_bounds__(256, 8)
 __global__ void
 cdna4_fp4_quantize_experts_kernel(
     const float*    __restrict__ weights_fp32,    // [num_experts, weight_numel]
@@ -571,7 +571,7 @@ cdna4_fp4_quantize_experts_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__launch_bounds__(256, 4)
+__launch_bounds__(256, 8)
 __global__ void
 cdna4_fp6_state_pack_kernel(
     const float*    __restrict__ exp_avg,         // [N]
@@ -617,7 +617,7 @@ cdna4_fp6_state_pack_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__launch_bounds__(256, 4)
+__launch_bounds__(256, 8)
 __global__ void
 cdna4_fp6_state_unpack_kernel(
     const uint8_t*  __restrict__ exp_avg_fp6,     // [N * 3 / 4] packed
@@ -668,7 +668,7 @@ cdna4_fp6_state_unpack_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__launch_bounds__(256, 2)
+__launch_bounds__(256, 8)
 __global__ void
 cdna4_fp6_adam_step_kernel(
     float*          __restrict__ param,           // [N]
@@ -774,7 +774,7 @@ cdna4_fp6_adam_step_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__launch_bounds__(256, 2)
+__launch_bounds__(256, 8)
 __global__ void
 cdna4_fp6_lamb_step_kernel(
     float*          __restrict__ param,
@@ -886,7 +886,7 @@ cdna4_fp6_lamb_step_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__launch_bounds__(256, 4)
+__launch_bounds__(256, 8)
 __global__ void
 cdna4_sparse24_select_kernel(
     const float*    __restrict__ dense,           // [N] — must be multiple of 4
@@ -946,7 +946,7 @@ cdna4_sparse24_select_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__launch_bounds__(256, 4)
+__launch_bounds__(256, 8)
 __global__ void
 cdna4_sparse24_apply_mask_kernel(
     float*          __restrict__ grad,            // [N] — modified in-place
@@ -979,7 +979,7 @@ cdna4_sparse24_apply_mask_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__launch_bounds__(256, 4)
+__launch_bounds__(256, 8)
 __global__ void
 cdna4_sparse24_project_kernel(
     float*          __restrict__ exp_avg,         // [N] — modified in-place
@@ -1012,7 +1012,7 @@ cdna4_sparse24_project_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__launch_bounds__(256, 4)
+__launch_bounds__(256, 8)
 __global__ void
 cdna4_sparse24_densify_kernel(
     const float*    __restrict__ sparse_values,   // [N/2]
@@ -1057,7 +1057,7 @@ cdna4_sparse24_densify_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__launch_bounds__(256, 2)
+__launch_bounds__(256, 8)
 __global__ void
 cdna4_fp4_sparse24_fused_expert_kernel(
     const float*    __restrict__ input,           // [batch_size, d_in]
@@ -1168,7 +1168,7 @@ cdna4_fp4_sparse24_fused_expert_kernel(
 // ═══════════════════════════════════════════════════════════════════════
 
 extern "C"
-__launch_bounds__(256, 2)
+__launch_bounds__(256, 8)
 __global__ void
 cdna4_supergrok15_full_step_kernel(
     float*          __restrict__ param,           // [N]
@@ -1520,7 +1520,7 @@ __global__ void cdna4_scan_local_with_summary_d16_kernel(
 //  5B: Backward with FP6 Saved States (1 kernel)
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(16, 8)
+__launch_bounds__(256, 8)
 __global__ void cdna4_backward_fp6_kernel(
     const float* __restrict__ grad_output,      // [N, d_inner]
     const float* __restrict__ pre_x_val,        // [N, d_inner]
@@ -1615,7 +1615,7 @@ __global__ void cdna4_backward_fp6_kernel(
 //  5C: Dynamic Expert with FP4 MFMA (2 kernels)
 // ═══════════════════════════════════════════════════════════════════════
 
-__launch_bounds__(256, 4)
+__launch_bounds__(256, 8)
 __global__ void cdna4_dynamic_expert_fp4_kernel(
     const float* __restrict__ scan_output,       // [N]
     float* __restrict__ param,                   // [N]
@@ -1704,7 +1704,7 @@ __global__ void cdna4_dynamic_expert_fp4_kernel(
 }
 
 
-__launch_bounds__(256, 4)
+__launch_bounds__(256, 8)
 __global__ void cdna4_dynamic_expert_fp4_d16_kernel(
     const float* __restrict__ scan_output,
     float* __restrict__ param,
