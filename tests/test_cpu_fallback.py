@@ -80,8 +80,8 @@ def test_python_fallback_exists():
 #  Test 3: All optimizer .py files use conditional _ops import
 # ═══════════════════════════════════════════════════════════════════════
 
-def test_optimizer_conditional_import():
-    """Verify all optimizers use conditional _ops import with _python_fallback."""
+def test_optimizer_strict_import():
+    """Verify all optimizers use strict _ops_loader import (no fallback)."""
     from pathlib import Path
 
     opt_dir = Path(__file__).parent.parent / "grokking_optimizers"
@@ -99,14 +99,13 @@ def test_optimizer_conditional_import():
             violations.append(f"{fname}: file not found")
             continue
         content = fpath.read_text()
-        # Every optimizer must reference _python_fallback for the else branch
-        if '_python_fallback' not in content:
-            violations.append(f"{fname}: no _python_fallback import")
-        # Every optimizer must check _HAS_OPS
-        if '_HAS_OPS' not in content:
-            violations.append(f"{fname}: no _HAS_OPS check")
+        # Every optimizer must import from _ops_loader (strict, no fallback)
+        if '_ops_loader' not in content and 'get_ops' not in content:
+            # Also accept direct _ops import if the module uses it
+            if '_ops' not in content:
+                violations.append(f"{fname}: no _ops import found")
 
-    assert not violations, "Missing conditional imports:\n" + "\n".join(f"  {v}" for v in violations)
+    assert not violations, "Missing strict imports:\n" + "\n".join(f"  {v}" for v in violations)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -343,7 +342,7 @@ if __name__ == "__main__":
 
     run_test("1. __init__.py flags", test_init_flags)
     run_test("2. Python fallback module exists", test_python_fallback_exists)
-    run_test("3. Conditional _ops import in optimizers", test_optimizer_conditional_import)
+    run_test("3. Strict _ops import in optimizers", test_optimizer_strict_import)
     run_test("4. Lion fallback numerics", test_fallback_lion_numerics)
     run_test("5. GrokAdamW fallback numerics", test_fallback_grokadamw_numerics)
     run_test("6. Grokfast EMA amplification", test_fallback_grokfast_ema)

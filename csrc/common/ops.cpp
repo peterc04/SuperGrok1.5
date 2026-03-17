@@ -1373,6 +1373,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("blackwell_precompute_fp4", &blackwell_precompute_fp4,
           "Blackwell: FP4 cuBLAS projection GEMMs");
 
+    // ── Multi-tensor gradient preparation + batched step ────────────
+    m.def("supergrok2_prepare_and_batched_step", &supergrok2_prepare_and_batched_step,
+          "Fused multi-tensor grad prepare (clip, finite, bias corrections) + batched step");
+
     // ── Problem 5: Hopper Warp-Specialized Scan ─────────────────────
     m.def("launch_scan_warp_specialized", &launch_scan_warp_specialized,
           "Hopper: warp-specialized scan (generic d_state)");

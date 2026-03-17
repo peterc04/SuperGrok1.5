@@ -46,6 +46,9 @@ if _has_gpu and _is_hip:
         "csrc/quantization/quantization_kernels.cu",
         "csrc/cuda/generic/moe_deep_kernels.cu",
         "csrc/cuda/generic/distributed_scan_kernels.cu",
+        "csrc/cuda/generic/distributed_pipeline.cu",
+        "csrc/cuda/generic/distributed_scan_pipeline.cu",
+        "csrc/cuda/generic/multi_tensor_prepare.cu",
     ]
 
     # Auto-detect CDNA specialization sources
@@ -110,6 +113,9 @@ elif _has_gpu:
         "csrc/cuda/generic/muon_kernels.cu",
         "csrc/cuda/generic/moe_deep_kernels.cu",
         "csrc/cuda/generic/distributed_scan_kernels.cu",
+        "csrc/cuda/generic/distributed_pipeline.cu",
+        "csrc/cuda/generic/distributed_scan_pipeline.cu",
+        "csrc/cuda/generic/multi_tensor_prepare.cu",
     ]
     nvidia_sources = [
         "csrc/cuda/sm_80/supergrok2_scan_sm80.cu",
@@ -122,7 +128,10 @@ elif _has_gpu:
         "csrc/cuda/sm_90/supergrok2_backward_sm90.cu",
         "csrc/cuda/sm_90/muon_sm90.cu",
         "csrc/cuda/sm_90/metanet_optimizers_sm90.cu",
+        "csrc/cuda/sm_90/supergrok2_warp_specialized_sm90.cu",
         "csrc/cuda/sm_100/supergrok2_sm100.cu",
+        "csrc/cuda/sm_100/supergrok2_precompute_sm100.cu",
+        "csrc/cuda/sm_100/supergrok2_scan_sm100.cu",
         "csrc/quantization/quantization_kernels.cu",
     ]
     # Auto-detect generated kernel sources
@@ -165,7 +174,16 @@ else:
         "csrc/cpu/cpu_kernels.cpp",
         "csrc/cpu/generic/all_optimizers_cpu.cpp",
         "csrc/cpu/generic/supergrok2_scan_cpu.cpp",
+        "csrc/cpu/sg2_fused_scan_elem_cpu.cpp",
+        "csrc/cpu/moe_cpu.cpp",
+        "csrc/cpu/distributed_scan_cpu.cpp",
     ]
+
+    # Auto-detect CPU generated sources
+    import glob as _glob_cpu
+    _cpu_generated = sorted(_glob_cpu.glob("csrc/cpu/generated/*.cpp"))
+    if _cpu_generated:
+        _cpu_sources += _cpu_generated
 
     _cpu_cxx_flags = [
         "-O3", "-std=c++17", "-DWITH_CPU",

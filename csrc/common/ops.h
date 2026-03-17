@@ -1785,6 +1785,38 @@ void batched_step_scan_and_fused_elem(
     int expert_hidden, int num_experts,
     torch::Tensor expert_counts);
 
+// Fused multi-tensor gradient preparation + batched step
+// Replaces per-parameter Python loop (grad norm, clip, finite check, bias corrections)
+// with a single kernel launch, then calls supergrok2_mamba_peer_batched_step.
+void supergrok2_prepare_and_batched_step(
+    std::vector<torch::Tensor> params,
+    std::vector<torch::Tensor> grads,
+    std::vector<torch::Tensor> exp_avgs,
+    std::vector<torch::Tensor> exp_avg_sqs,
+    std::vector<torch::Tensor> mamba_fwd_states,
+    std::vector<torch::Tensor> mamba_bwd_states,
+    std::vector<torch::Tensor> gru_states,
+    std::vector<torch::Tensor> mus,
+    std::vector<torch::Tensor> sharpnesses,
+    std::vector<int64_t> steps,
+    std::vector<double> layer_alphas,
+    std::vector<double> layer_beta1s,
+    double base_alpha, double gradient_clipping,
+    double beta2, double lr, double eps, double wd,
+    double lamb, double ramp, double gate_signal,
+    torch::Tensor mamba_fwd_A, torch::Tensor mamba_fwd_B,
+    torch::Tensor mamba_fwd_C, torch::Tensor mamba_fwd_D,
+    torch::Tensor mamba_fwd_dt,
+    torch::Tensor mamba_bwd_A, torch::Tensor mamba_bwd_B,
+    torch::Tensor mamba_bwd_C, torch::Tensor mamba_bwd_D,
+    torch::Tensor mamba_bwd_dt,
+    torch::Tensor gru_Wz, torch::Tensor gru_Wr, torch::Tensor gru_Wh,
+    torch::Tensor gru_bz, torch::Tensor gru_br, torch::Tensor gru_bh,
+    torch::Tensor peer_query_Ws,
+    torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+    torch::Tensor value_proj_W,
+    int64_t d_inner, int64_t d_state, int64_t n_experts, int64_t topk);
+
 // Ampere version: uses cp.async scan + cp.async fused_elem kernels
 void ampere_batched_scan_and_fused_elem(
     BatchedScanCtx& ctx,
