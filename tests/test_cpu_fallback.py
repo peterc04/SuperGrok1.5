@@ -125,7 +125,7 @@ def test_fallback_lion_numerics():
 
     lr, beta1, beta2, wd = 0.001, 0.9, 0.99, 0.1
 
-    lion_fused_step([p], [g], [m], lr, beta1, beta2, wd)
+    lion_fused_step([p], [g], [m], [1], beta1, beta2, lr, wd)
 
     # Verify: update = sign(beta1*m_old + (1-beta1)*g) = sign((1-beta1)*g) = sign(g)
     # Since m was zero initially

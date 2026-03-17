@@ -14,243 +14,244 @@
 #   moe: MoE-sparse with active_mask (D=dense, M=moe)
 #   cpu: CPU OpenMP variant
 
-# ═══════════════════════════════════════════════════════════════
-#  GrokAdamW
-# ═══════════════════════════════════════════════════════════════
-grokadamw:
-  block_size: 256
-  launch_bounds: [256, 8]
-  states:
-    exp_avg:    {q4_format: int8_block8}
-    exp_avg_sq: {q4_format: int8_block8}
-    ema:        {q4_format: bf16_sr}
-  scalars: [alpha, lamb, beta1, beta2, lr, weight_decay, eps, bc1, bc2]
-  pre_adam_math: |
-    // EMA gradient filter
-    const float e_old = STATE_LOAD(ema, idx);
-    const float filtered = alpha * e_old + (1.0f - alpha) * g;
-    STATE_STORE(ema, idx, filtered);
-    // Gradient amplification
-    const float amplified = g + lamb * filtered;
-  effective_grad: amplified
-  has_adam: true
-  variants:
-    gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D, S_F_M, V_F_M, S_Q_M, V_Q_M]
-    cpu: [cpu_F, cpu_Q]
+optimizers:
+  # ═══════════════════════════════════════════════════════════════
+  #  GrokAdamW
+  # ═══════════════════════════════════════════════════════════════
+  grokadamw:
+    block_size: 256
+    launch_bounds: [256, 8]
+    states:
+      exp_avg:    {q4_format: int8_block8}
+      exp_avg_sq: {q4_format: int8_block8}
+      ema:        {q4_format: bf16_sr}
+    scalars: [alpha, lamb, beta1, beta2, lr, weight_decay, eps, bc1, bc2]
+    pre_adam_math: |
+      // EMA gradient filter
+      const float e_old = STATE_LOAD(ema, idx);
+      const float filtered = alpha * e_old + (1.0f - alpha) * g;
+      STATE_STORE(ema, idx, filtered);
+      // Gradient amplification
+      const float amplified = g + lamb * filtered;
+    effective_grad: amplified
+    has_adam: true
+    variants:
+      gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D, S_F_M, V_F_M, S_Q_M, V_Q_M]
+      cpu: [cpu_F, cpu_Q]
 
-# ═══════════════════════════════════════════════════════════════
-#  Lion
-# ═══════════════════════════════════════════════════════════════
-lion:
-  block_size: 256
-  launch_bounds: [256, 8]
-  states:
-    exp_avg: {q4_format: int8_block8}
-  scalars: [lr, beta1, beta2, wd]
-  update_math: |
-    const float ea_old = STATE_LOAD(exp_avg, idx);
-    const float interp = beta1 * ea_old + (1.0f - beta1) * g;
-    const float sign_v = (interp > 0.0f) ? 1.0f : ((interp < 0.0f) ? -1.0f : 0.0f);
-    float pv = PARAM_LOAD(idx);
-    pv = pv - lr * (sign_v + wd * pv);
-    PARAM_STORE(idx, pv);
-    const float ea_new = beta2 * ea_old + (1.0f - beta2) * g;
-    STATE_STORE(exp_avg, idx, ea_new);
-  has_adam: false
-  variants:
-    gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D, S_F_M, V_F_M, S_Q_M, V_Q_M]
-    cpu: [cpu_F, cpu_Q]
+  # ═══════════════════════════════════════════════════════════════
+  #  Lion
+  # ═══════════════════════════════════════════════════════════════
+  lion:
+    block_size: 256
+    launch_bounds: [256, 8]
+    states:
+      exp_avg: {q4_format: int8_block8}
+    scalars: [lr, beta1, beta2, wd]
+    update_math: |
+      const float ea_old = STATE_LOAD(exp_avg, idx);
+      const float interp = beta1 * ea_old + (1.0f - beta1) * g;
+      const float sign_v = (interp > 0.0f) ? 1.0f : ((interp < 0.0f) ? -1.0f : 0.0f);
+      float pv = PARAM_LOAD(idx);
+      pv = pv - lr * (sign_v + wd * pv);
+      PARAM_STORE(idx, pv);
+      const float ea_new = beta2 * ea_old + (1.0f - beta2) * g;
+      STATE_STORE(exp_avg, idx, ea_new);
+    has_adam: false
+    variants:
+      gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D, S_F_M, V_F_M, S_Q_M, V_Q_M]
+      cpu: [cpu_F, cpu_Q]
 
-# ═══════════════════════════════════════════════════════════════
-#  Grokfast
-# ═══════════════════════════════════════════════════════════════
-grokfast:
-  block_size: 256
-  launch_bounds: [256, 8]
-  states:
-    ema: {q4_format: bf16_sr}
-  scalars: [alpha, lamb]
-  update_math: |
-    const float e_old = STATE_LOAD(ema, idx);
-    // EMA update
-    const float e_new = alpha * e_old + (1.0f - alpha) * g;
-    STATE_STORE(ema, idx, e_new);
-    // Gradient amplification (write back to grad)
-    GRAD_STORE(idx, g + lamb * e_new);
-  has_adam: false
-  variants:
-    gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D, S_F_M, V_F_M, S_Q_M, V_Q_M]
-    cpu: [cpu_F, cpu_Q]
+  # ═══════════════════════════════════════════════════════════════
+  #  Grokfast
+  # ═══════════════════════════════════════════════════════════════
+  grokfast:
+    block_size: 256
+    launch_bounds: [256, 8]
+    states:
+      ema: {q4_format: bf16_sr}
+    scalars: [alpha, lamb]
+    update_math: |
+      const float e_old = STATE_LOAD(ema, idx);
+      // EMA update
+      const float e_new = alpha * e_old + (1.0f - alpha) * g;
+      STATE_STORE(ema, idx, e_new);
+      // Gradient amplification (write back to grad)
+      GRAD_STORE(idx, g + lamb * e_new);
+    has_adam: false
+    variants:
+      gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D, S_F_M, V_F_M, S_Q_M, V_Q_M]
+      cpu: [cpu_F, cpu_Q]
 
-# ═══════════════════════════════════════════════════════════════
-#  Prodigy (step kernel only — DLR reduce is hand-written)
-# ═══════════════════════════════════════════════════════════════
-prodigy:
-  block_size: 256
-  launch_bounds: [256, 8]
-  states:
-    exp_avg:    {q4_format: int8_block8}
-    exp_avg_sq: {q4_format: int8_block8}
-    s:          {q4_format: bf16_sr}
-  scalars: [d_lr, beta1, beta2, lr, weight_decay, eps, bc1, bc2]
-  pre_adam_math: |
-    const float d_lr_g = d_lr * g;
-    const float d_lr_g_sq = d_lr * d_lr * g * g;
-    // Update s (EMA of d_lr-scaled squared gradients)
-    const float s_old = STATE_LOAD(s, idx);
-    const float s_new = beta2 * s_old + (1.0f - beta2) * d_lr_g_sq;
-    STATE_STORE(s, idx, s_new);
-  effective_grad: d_lr_g
-  effective_grad_sq: d_lr_g_sq
-  adam_denom_extra: "d_lr * "
-  adam_decay_extra: "d_lr * "
-  has_adam: true
-  variants:
-    gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D, S_F_M, V_F_M, S_Q_M, V_Q_M]
-    cpu: [cpu_F, cpu_Q]
+  # ═══════════════════════════════════════════════════════════════
+  #  Prodigy (step kernel only — DLR reduce is hand-written)
+  # ═══════════════════════════════════════════════════════════════
+  prodigy:
+    block_size: 256
+    launch_bounds: [256, 8]
+    states:
+      exp_avg:    {q4_format: int8_block8}
+      exp_avg_sq: {q4_format: int8_block8}
+      s:          {q4_format: bf16_sr}
+    scalars: [d_lr, beta1, beta2, lr, weight_decay, eps, bc1, bc2]
+    pre_adam_math: |
+      const float d_lr_g = d_lr * g;
+      const float d_lr_g_sq = d_lr * d_lr * g * g;
+      // Update s (EMA of d_lr-scaled squared gradients)
+      const float s_old = STATE_LOAD(s, idx);
+      const float s_new = beta2 * s_old + (1.0f - beta2) * d_lr_g_sq;
+      STATE_STORE(s, idx, s_new);
+    effective_grad: d_lr_g
+    effective_grad_sq: d_lr_g_sq
+    adam_denom_extra: "d_lr * "
+    adam_decay_extra: "d_lr * "
+    has_adam: true
+    variants:
+      gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D, S_F_M, V_F_M, S_Q_M, V_Q_M]
+      cpu: [cpu_F, cpu_Q]
 
-# ═══════════════════════════════════════════════════════════════
-#  LookSAM direction (the only LookSAM kernel needing Q4/MoE)
-# ═══════════════════════════════════════════════════════════════
-looksam_direction:
-  block_size: 256
-  launch_bounds: [256, 8]
-  states:
-    v_dir_ema: {q4_format: bf16_sr}
-  scalars: [ema_decay, inv_norm]
-  update_math: |
-    const float sg_val = EXTRA_LOAD(sam_grad, idx);
-    const float ng_val = EXTRA_LOAD(normal_grad, idx);
-    const float raw_dir = (sg_val - ng_val) * inv_norm;
-    const float old_ema_dir = STATE_LOAD(v_dir_ema, idx);
-    const float new_ema_dir = ema_decay * old_ema_dir + (1.0f - ema_decay) * raw_dir;
-    STATE_STORE(v_dir_ema, idx, new_ema_dir);
-    PARAM_STORE(idx, new_ema_dir);
-  extra_inputs:
-    sam_grad: {type: "const scalar_t*"}
-    normal_grad: {type: "const scalar_t*"}
-  has_adam: false
-  variants:
-    gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D, S_F_M, V_F_M, S_Q_M, V_Q_M]
-    cpu: [cpu_F, cpu_Q]
+  # ═══════════════════════════════════════════════════════════════
+  #  LookSAM direction (the only LookSAM kernel needing Q4/MoE)
+  # ═══════════════════════════════════════════════════════════════
+  looksam_direction:
+    block_size: 256
+    launch_bounds: [256, 8]
+    states:
+      v_dir_ema: {q4_format: bf16_sr}
+    scalars: [ema_decay, inv_norm]
+    update_math: |
+      const float sg_val = EXTRA_LOAD(sam_grad, idx);
+      const float ng_val = EXTRA_LOAD(normal_grad, idx);
+      const float raw_dir = (sg_val - ng_val) * inv_norm;
+      const float old_ema_dir = STATE_LOAD(v_dir_ema, idx);
+      const float new_ema_dir = ema_decay * old_ema_dir + (1.0f - ema_decay) * raw_dir;
+      STATE_STORE(v_dir_ema, idx, new_ema_dir);
+      PARAM_STORE(idx, new_ema_dir);
+    extra_inputs:
+      sam_grad: {type: "const scalar_t*"}
+      normal_grad: {type: "const scalar_t*"}
+    has_adam: false
+    variants:
+      gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D, S_F_M, V_F_M, S_Q_M, V_Q_M]
+      cpu: [cpu_F, cpu_Q]
 
-# ═══════════════════════════════════════════════════════════════
-#  Muon momentum_normalize (needs Q4/MoE variants)
-# ═══════════════════════════════════════════════════════════════
-muon_momentum_normalize:
-  block_size: 256
-  launch_bounds: [256, 8]
-  states:
-    buf: {q4_format: int8_block8}
-  scalars: [momentum, inv_norm]
-  update_math: |
-    const float bv_old = STATE_LOAD(buf, idx);
-    const float bv_new = momentum * bv_old + g;
-    STATE_STORE(buf, idx, bv_new);
-    PARAM_STORE(idx, bv_new * inv_norm);
-  has_adam: false
-  variants:
-    gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D, S_F_M, V_F_M, S_Q_M, V_Q_M]
-    cpu: [cpu_F, cpu_Q]
+  # ═══════════════════════════════════════════════════════════════
+  #  Muon momentum_normalize (needs Q4/MoE variants)
+  # ═══════════════════════════════════════════════════════════════
+  muon_momentum_normalize:
+    block_size: 256
+    launch_bounds: [256, 8]
+    states:
+      buf: {q4_format: int8_block8}
+    scalars: [momentum, inv_norm]
+    update_math: |
+      const float bv_old = STATE_LOAD(buf, idx);
+      const float bv_new = momentum * bv_old + g;
+      STATE_STORE(buf, idx, bv_new);
+      PARAM_STORE(idx, bv_new * inv_norm);
+    has_adam: false
+    variants:
+      gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D, S_F_M, V_F_M, S_Q_M, V_Q_M]
+      cpu: [cpu_F, cpu_Q]
 
-# ═══════════════════════════════════════════════════════════════
-#  Muon update (needs Q4/MoE variants)
-# ═══════════════════════════════════════════════════════════════
-muon_update:
-  block_size: 256
-  launch_bounds: [256, 8]
-  states: {}
-  scalars: [neg_lr_scale, decay_factor]
-  update_math: |
-    float pv = PARAM_LOAD(idx);
-    pv += neg_lr_scale * g;
-    pv *= decay_factor;
-    PARAM_STORE(idx, pv);
-  grad_name: orth
-  has_adam: false
-  variants:
-    gpu: [S_F_D, V_F_D, S_F_M, V_F_M]
-    cpu: [cpu_F]
+  # ═══════════════════════════════════════════════════════════════
+  #  Muon update (needs Q4/MoE variants)
+  # ═══════════════════════════════════════════════════════════════
+  muon_update:
+    block_size: 256
+    launch_bounds: [256, 8]
+    states: {}
+    scalars: [neg_lr_scale, decay_factor]
+    update_math: |
+      float pv = PARAM_LOAD(idx);
+      pv += neg_lr_scale * g;
+      pv *= decay_factor;
+      PARAM_STORE(idx, pv);
+    grad_name: orth
+    has_adam: false
+    variants:
+      gpu: [S_F_D, V_F_D, S_F_M, V_F_M]
+      cpu: [cpu_F]
 
-# ═══════════════════════════════════════════════════════════════
-#  SuperGrok v1.5 Adam-only (async split)
-# ═══════════════════════════════════════════════════════════════
-sg15_adam_only:
-  block_size: 256
-  launch_bounds: [256, 8]
-  states:
-    exp_avg:    {q4_format: int8_block8}
-    exp_avg_sq: {q4_format: int8_block8}
-  scalars: [beta1, beta2, lr, weight_decay, eps, bc1, bc2, lamb_eff]
-  pre_adam_math: |
-    // smart_grad comes from meta-net buffer
-    const float smart_g = EXTRA_LOAD(smart_grad, idx);
-    const float effective = smart_g + lamb_eff * g;
-  effective_grad: effective
-  extra_inputs:
-    smart_grad: {type: "const float*"}
-  has_adam: true
-  variants:
-    gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D]
-    cpu: [cpu_F, cpu_Q]
+  # ═══════════════════════════════════════════════════════════════
+  #  SuperGrok v1.5 Adam-only (async split)
+  # ═══════════════════════════════════════════════════════════════
+  sg15_adam_only:
+    block_size: 256
+    launch_bounds: [256, 8]
+    states:
+      exp_avg:    {q4_format: int8_block8}
+      exp_avg_sq: {q4_format: int8_block8}
+    scalars: [beta1, beta2, lr, weight_decay, eps, bc1, bc2, lamb_eff]
+    pre_adam_math: |
+      // smart_grad comes from meta-net buffer
+      const float smart_g = EXTRA_LOAD(smart_grad, idx);
+      const float effective = smart_g + lamb_eff * g;
+    effective_grad: effective
+    extra_inputs:
+      smart_grad: {type: "const float*"}
+    has_adam: true
+    variants:
+      gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D]
+      cpu: [cpu_F, cpu_Q]
 
-# ═══════════════════════════════════════════════════════════════
-#  SuperGrok v1.1 Adam-only (async split)
-# ═══════════════════════════════════════════════════════════════
-sg11_adam_only:
-  block_size: 256
-  launch_bounds: [256, 8]
-  states:
-    exp_avg:    {q4_format: int8_block8}
-    exp_avg_sq: {q4_format: int8_block8}
-  scalars: [beta1, beta2, lr, weight_decay, eps, bc1, bc2, lamb_eff]
-  pre_adam_math: |
-    const float smart_g = EXTRA_LOAD(smart_grad, idx);
-    const float effective = smart_g + lamb_eff * g;
-  effective_grad: effective
-  extra_inputs:
-    smart_grad: {type: "const float*"}
-  has_adam: true
-  variants:
-    gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D]
-    cpu: [cpu_F, cpu_Q]
+  # ═══════════════════════════════════════════════════════════════
+  #  SuperGrok v1.1 Adam-only (async split)
+  # ═══════════════════════════════════════════════════════════════
+  sg11_adam_only:
+    block_size: 256
+    launch_bounds: [256, 8]
+    states:
+      exp_avg:    {q4_format: int8_block8}
+      exp_avg_sq: {q4_format: int8_block8}
+    scalars: [beta1, beta2, lr, weight_decay, eps, bc1, bc2, lamb_eff]
+    pre_adam_math: |
+      const float smart_g = EXTRA_LOAD(smart_grad, idx);
+      const float effective = smart_g + lamb_eff * g;
+    effective_grad: effective
+    extra_inputs:
+      smart_grad: {type: "const float*"}
+    has_adam: true
+    variants:
+      gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D]
+      cpu: [cpu_F, cpu_Q]
 
-# ═══════════════════════════════════════════════════════════════
-#  NeuralGrok Adam-only (async split)
-# ═══════════════════════════════════════════════════════════════
-neuralgrok_adam_only:
-  block_size: 256
-  launch_bounds: [256, 8]
-  states:
-    exp_avg:    {q4_format: int8_block8}
-    exp_avg_sq: {q4_format: int8_block8}
-  scalars: [beta1, beta2, lr, weight_decay, eps, bc1, bc2]
-  pre_adam_math: |
-    const float amplified_g = EXTRA_LOAD(amplified_grad, idx);
-  effective_grad: amplified_g
-  extra_inputs:
-    amplified_grad: {type: "const float*"}
-  has_adam: true
-  variants:
-    gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D]
-    cpu: [cpu_F, cpu_Q]
+  # ═══════════════════════════════════════════════════════════════
+  #  NeuralGrok Adam-only (async split)
+  # ═══════════════════════════════════════════════════════════════
+  neuralgrok_adam_only:
+    block_size: 256
+    launch_bounds: [256, 8]
+    states:
+      exp_avg:    {q4_format: int8_block8}
+      exp_avg_sq: {q4_format: int8_block8}
+    scalars: [beta1, beta2, lr, weight_decay, eps, bc1, bc2]
+    pre_adam_math: |
+      const float amplified_g = EXTRA_LOAD(amplified_grad, idx);
+    effective_grad: amplified_g
+    extra_inputs:
+      amplified_grad: {type: "const float*"}
+    has_adam: true
+    variants:
+      gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D]
+      cpu: [cpu_F, cpu_Q]
 
-# ═══════════════════════════════════════════════════════════════
-#  SG2 Adam-only (async split for SuperGrok v2)
-# ═══════════════════════════════════════════════════════════════
-sg2_adam_only:
-  block_size: 256
-  launch_bounds: [256, 8]
-  states:
-    exp_avg:    {q4_format: int8_block8}
-    exp_avg_sq: {q4_format: int8_block8}
-  scalars: [beta1, beta2, lr, weight_decay, eps, bc1, bc2]
-  pre_adam_math: |
-    const float smart_g = EXTRA_LOAD(smart_grad, idx);
-  effective_grad: smart_g
-  extra_inputs:
-    smart_grad: {type: "const float*"}
-  has_adam: true
-  variants:
-    gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D, S_F_M, V_F_M, S_Q_M, V_Q_M]
-    cpu: [cpu_F, cpu_Q]
+  # ═══════════════════════════════════════════════════════════════
+  #  SG2 Adam-only (async split for SuperGrok v2)
+  # ═══════════════════════════════════════════════════════════════
+  sg2_adam_only:
+    block_size: 256
+    launch_bounds: [256, 8]
+    states:
+      exp_avg:    {q4_format: int8_block8}
+      exp_avg_sq: {q4_format: int8_block8}
+    scalars: [beta1, beta2, lr, weight_decay, eps, bc1, bc2]
+    pre_adam_math: |
+      const float smart_g = EXTRA_LOAD(smart_grad, idx);
+    effective_grad: smart_g
+    extra_inputs:
+      smart_grad: {type: "const float*"}
+    has_adam: true
+    variants:
+      gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D, S_F_M, V_F_M, S_Q_M, V_Q_M]
+      cpu: [cpu_F, cpu_Q]
