@@ -240,7 +240,7 @@ def grokfast_fused_step(grads, ema_bufs, alpha, lamb):
 # ═════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def lion_fused_step(params, grads, exp_avgs, lr, beta1, beta2, wd):
+def lion_fused_step(params, grads, exp_avgs, steps, beta1, beta2, lr, wd):
     for i in range(len(params)):
         g = grads[i].reshape(-1).float()
         m = exp_avgs[i].reshape(-1)
