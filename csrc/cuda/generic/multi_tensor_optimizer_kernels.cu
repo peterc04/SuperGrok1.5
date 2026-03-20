@@ -724,3 +724,130 @@ void launch_multi_tensor_prodigy_fused_reduce_step(
         })
     );
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Kernel 5: Fused AdamW (simple — no EMA/amplification)
+//
+//  Shared kernel used by LookSAM and Muon for their standard Adam path.
+//  Numerically identical to _adamw_helper.py but runs entirely on GPU.
+// ═══════════════════════════════════════════════════════════════════════
+
+template <typename scalar_t>
+__launch_bounds__(256, 8)
+__global__ void fused_adamw_simple_kernel(
+    scalar_t* __restrict__ param,
+    float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq,
+    const scalar_t* __restrict__ grad,
+    const float beta1,
+    const float beta2,
+    const float lr,
+    const float wd,
+    const float eps,
+    const float bc1,
+    const float bc2,
+    const int N
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+
+    const float g = static_cast<float>(grad[idx]);
+    const float ea = beta1 * stream_load(&exp_avg[idx]) + (1.0f - beta1) * g;
+    const float easq = beta2 * stream_load(&exp_avg_sq[idx]) + (1.0f - beta2) * g * g;
+    stream_store(&exp_avg[idx], ea);
+    stream_store(&exp_avg_sq[idx], easq);
+
+    const float step_size = lr / bc1;
+    const float denom = sqrtf(easq / bc2) + eps;
+    float p = static_cast<float>(param[idx]);
+    p *= (1.0f - lr * wd);
+    p -= step_size * ea / denom;
+    param[idx] = static_cast<scalar_t>(p);
+}
+
+__launch_bounds__(256, 8)
+__global__ void fused_adamw_simple_vec4_kernel(
+    float4* __restrict__ param4,
+    float4* __restrict__ exp_avg4,
+    float4* __restrict__ exp_avg_sq4,
+    const float4* __restrict__ grad4,
+    float beta1, float beta2, float lr, float wd, float eps,
+    float bc1, float bc2, int N4
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N4) return;
+
+    float4 g = grad4[i];
+    float4 p = param4[i];
+    float4 ea = stream_load4(&exp_avg4[i]);
+    float4 eas = stream_load4(&exp_avg_sq4[i]);
+
+    ea.x = beta1 * ea.x + (1.0f - beta1) * g.x;
+    ea.y = beta1 * ea.y + (1.0f - beta1) * g.y;
+    ea.z = beta1 * ea.z + (1.0f - beta1) * g.z;
+    ea.w = beta1 * ea.w + (1.0f - beta1) * g.w;
+
+    eas.x = beta2 * eas.x + (1.0f - beta2) * g.x * g.x;
+    eas.y = beta2 * eas.y + (1.0f - beta2) * g.y * g.y;
+    eas.z = beta2 * eas.z + (1.0f - beta2) * g.z * g.z;
+    eas.w = beta2 * eas.w + (1.0f - beta2) * g.w * g.w;
+
+    stream_store4(&exp_avg4[i], ea);
+    stream_store4(&exp_avg_sq4[i], eas);
+
+    float step_size = lr / bc1;
+    float decay = 1.0f - lr * wd;
+
+    #define ADAM_SIMPLE_STEP(comp) { \
+        float denom = sqrtf(eas.comp / bc2) + eps; \
+        p.comp = decay * p.comp - step_size * ea.comp / denom; \
+    }
+    ADAM_SIMPLE_STEP(x)
+    ADAM_SIMPLE_STEP(y)
+    ADAM_SIMPLE_STEP(z)
+    ADAM_SIMPLE_STEP(w)
+    #undef ADAM_SIMPLE_STEP
+
+    param4[i] = p;
+}
+
+void launch_fused_adamw_simple(
+    torch::Tensor param,
+    torch::Tensor grad,
+    torch::Tensor exp_avg,
+    torch::Tensor exp_avg_sq,
+    float beta1, float beta2, float lr, float wd, float eps,
+    float bc1, float bc2
+) {
+    const int N = param.numel();
+    if (N == 0) return;
+
+    if (param.scalar_type() == at::ScalarType::Float &&
+        N % 4 == 0 &&
+        reinterpret_cast<uintptr_t>(param.data_ptr()) % 16 == 0 &&
+        reinterpret_cast<uintptr_t>(grad.data_ptr()) % 16 == 0) {
+        const int N4 = N / 4;
+        const int grid4 = (N4 + MT_BLOCK_SIZE - 1) / MT_BLOCK_SIZE;
+        fused_adamw_simple_vec4_kernel<<<grid4, MT_BLOCK_SIZE>>>(
+            reinterpret_cast<float4*>(param.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg_sq.data_ptr<float>()),
+            reinterpret_cast<const float4*>(grad.data_ptr<float>()),
+            beta1, beta2, lr, wd, eps, bc1, bc2, N4);
+        return;
+    }
+
+    const int grid = (N + MT_BLOCK_SIZE - 1) / MT_BLOCK_SIZE;
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        param.scalar_type(), "fused_adamw_simple", ([&] {
+        fused_adamw_simple_kernel<scalar_t><<<grid, MT_BLOCK_SIZE>>>(
+            param.data_ptr<scalar_t>(),
+            exp_avg.data_ptr<float>(),
+            exp_avg_sq.data_ptr<float>(),
+            grad.data_ptr<scalar_t>(),
+            beta1, beta2, lr, wd, eps, bc1, bc2, N);
+    }));
+}

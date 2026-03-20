@@ -18,7 +18,6 @@ from torch.optim.optimizer import Optimizer
 from grokking_optimizers._ops_loader import get_ops
 
 _ops = get_ops()  # Fails loudly if C++ extension not built
-from grokking_optimizers._adamw_helper import adamw_step
 
 
 class LookSAM(Optimizer):
@@ -129,17 +128,17 @@ class LookSAM(Optimizer):
             if len(params_list) == 0:
                 continue
 
-            adamw_step(
+            _ops.fused_adamw_simple_step(
                 params_list,
                 grads_list,
                 exp_avg_list,
                 exp_avg_sq_list,
                 step_list,
-                group["lr"],
                 group["betas"][0],
                 group["betas"][1],
-                group["eps"],
+                group["lr"],
                 group["weight_decay"],
+                group["eps"],
             )
 
         return loss
@@ -220,17 +219,11 @@ class LookSAM(Optimizer):
             # Restore original parameters
             _ops.looksam_restore_all(params_list, backups)
 
-            # Compute sharpness-aware directions: (v_dirs, sam_grads, normal_grads)
-            _ops.looksam_compute_directions(
-                direction_list,
+            # Fused direction computation + gradient adjustment (batched norms)
+            _ops.looksam_compute_directions_and_adjust(
+                orig_grads_list,
                 perturbed_grads_list,
                 orig_grads_list,
-            )
-
-            # Adjust current gradients using the sharpness-aware directions
-            _ops.looksam_adjust_grads(
-                orig_grads_list,
-                direction_list,
                 group["alpha"],
             )
 
@@ -260,9 +253,8 @@ class LookSAM(Optimizer):
             state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
             state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
         state["step"] += 1
-        from grokking_optimizers._adamw_helper import adamw_step
-        adamw_step(
+        _ops.fused_adamw_simple_step(
             [param], [param.grad], [state["exp_avg"]], [state["exp_avg_sq"]],
-            [state["step"]], group["lr"], group["betas"][0], group["betas"][1],
-            group["eps"], group["weight_decay"],
+            [state["step"]], group["betas"][0], group["betas"][1],
+            group["lr"], group["weight_decay"], group["eps"],
         )

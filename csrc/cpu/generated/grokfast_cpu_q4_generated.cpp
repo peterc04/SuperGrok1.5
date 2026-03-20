@@ -24,7 +24,7 @@ static inline int8_t cpu_float_to_int8_sr(float val, float scale, unsigned rng) 
 }
 
 void grokfast_step_cpu_q4(
-    float* param, const float* grad,
+    float* param, float* grad,
     int8_t* ema_q, float* ema_scales,
     float alpha,
     float lamb,
