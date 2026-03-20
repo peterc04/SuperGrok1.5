@@ -149,8 +149,9 @@ if _HAS_PALLAS:
                 if t > 0:
                     prev_M = prefix_Ms[t - 1]
                     prev_b = prefix_bs[t - 1]
-                    tile_M = jnp.einsum('...ij,jk->...ik', tile_M, prev_M[None])
+                    corrected_M = jnp.einsum('...ij,jk->...ik', tile_M, prev_M[None])
                     tile_b = jnp.einsum('...ij,j->...i', tile_M, prev_b) + tile_b
+                    tile_M = corrected_M
 
                 result_Ms.append(tile_M)
                 result_bs.append(tile_b)
@@ -179,16 +180,8 @@ def mamba3_scan_with_pallas(x_sorted, weights, initial_state, reverse=False):
     """
     N = x_sorted.shape[0]
 
-    if _HAS_PALLAS and N >= 1024:
-        try:
-            # Extract affine matrices from weights
-            # This would need to match the specific Mamba-3 scan structure
-            # For now, delegate to pure JAX scan
-            pass
-        except Exception:
-            pass
-
-    # Pure JAX fallback — always correct
+    # Pure JAX path — Pallas affine scan integration deferred to
+    # when affine matrix extraction from Mamba-3 weights is implemented.
     from . import scan as scan_module
     return scan_module.mamba3_scan(x_sorted, weights, initial_state, reverse)
 
@@ -383,7 +376,7 @@ if _HAS_PALLAS:
             return smart_grad, gru_state_new
 
         except Exception:
-            # Fallback to pure JAX vmap
+            # Pallas API incompatibility — fall through to pure JAX vmap
             pass
 
         return _fused_gru_peer_jax(
@@ -752,7 +745,8 @@ def vmem_persistent_expert_mlp(
             )(x, expert_indices, expert_W1, expert_b1, expert_W2, expert_b2)
             return y
         except Exception:
-            pass  # fall through to JAX fallback
+            # Pallas API incompatibility — fall through to pure JAX fallback
+            pass
 
     # ── Pure JAX fallback ─────────────────────────────────────────
     def _expert_mlp_one(xi, eidx):
@@ -1011,11 +1005,22 @@ def _make_pallas_persistent_scan_fused_elem(tile_size: int):
                 ],
             )(Ms, bs, Cs, x_vals, z_vals)
         except Exception:
-            # Pallas API mismatch — pure JAX fallback
-            return _fused_scan_elem(
-                Ms[:N], bs[:N], Cs[:N], x_vals[:N], z_vals[:N], D_val,
-                params, grads, sort_indices, exp_avg, exp_avg_sq,
-                lr, beta1, beta2, eps, wd)
+            # Pallas API mismatch — pure JAX fallback (no Pallas)
+            _Ms = Ms[:N] if pad_len > 0 else Ms
+            _bs = bs[:N] if pad_len > 0 else bs
+            _Cs = Cs[:N] if pad_len > 0 else Cs
+            _x = x_vals[:N] if pad_len > 0 else x_vals
+            _z = z_vals[:N] if pad_len > 0 else z_vals
+            M_out, b_out = jax.lax.associative_scan(
+                _associative_combine, (_Ms, _bs))
+            y = _Cs[:, 0] * b_out[:, 0] + _Cs[:, 1] * b_out[:, 1]
+            silu_z = _z / (1.0 + jnp.exp(-_z))
+            scan_out = y * silu_z + D_val * _x
+            smart_grad = scan_out
+            m = beta1 * exp_avg + (1.0 - beta1) * smart_grad
+            v = beta2 * exp_avg_sq + (1.0 - beta2) * smart_grad ** 2
+            p = params * (1.0 - lr * wd) - lr * m / (jnp.sqrt(v) + eps)
+            return p, m, v
 
         # Cross-tile correction (same as _make_pallas_scan_kernel)
         prefix_Ms, prefix_bs = jax.lax.associative_scan(

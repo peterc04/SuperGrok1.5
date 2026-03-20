@@ -33,10 +33,8 @@ class GrokAdamW(Optimizer):
         alpha: EMA decay factor for gradient filter (default: 0.98).
         lamb: Amplification factor applied to the filtered gradient
             signal (default: 5.0).
-        gamma: Signal decay factor. Unused in the fused kernel but kept
-            for API compatibility with the reference implementation
-            (default: 0.1).
-        decay: Secondary decay parameter (default: 0.1).
+        gamma: Deprecated — unused. Kept for API backward compatibility.
+        decay: Deprecated — unused. Kept for API backward compatibility.
         grad_clip: Maximum gradient norm for per-parameter clipping
             (default: 1.0).
     """

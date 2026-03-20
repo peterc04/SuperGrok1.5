@@ -1857,8 +1857,9 @@ class SuperGrok2(Optimizer):
         if step_num % sam_freq_eff == 0:
             try:
                 metrics["sam_loss"] = self.sam_step(model, train_x, train_y, criterion)
-            except Exception:
-                pass
+            except RuntimeError as e:
+                import warnings
+                warnings.warn(f"SuperGrok2 SAM step failed at step {step_num}: {e}")
 
         bilevel_freq_eff = self._get_effective_bilevel_freq()
         if step_num % bilevel_freq_eff == 0:
@@ -1866,8 +1867,9 @@ class SuperGrok2(Optimizer):
                 _vl = self.bilevel_step(
                     model, train_x, train_y, val_x, val_y, criterion, self._auto_meta_opt)
                 metrics["val_loss"] = _vl.item() if torch.is_tensor(_vl) else _vl
-            except Exception:
-                pass
+            except RuntimeError as e:
+                import warnings
+                warnings.warn(f"SuperGrok2 bilevel step failed at step {step_num}: {e}")
 
         kw: Dict[str, float] = {}
         alpha_freq = self.alpha_update_freq

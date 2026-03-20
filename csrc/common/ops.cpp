@@ -37,11 +37,12 @@ static void clip_grad_norms_device_side(
         }
     }
 
-    // Accumulate norm^2 on device — all .norm() calls are async kernel launches
+    // Accumulate norm^2 on device — flatten+dot avoids per-tensor norm+pow chain
     auto norm_sq = torch::zeros({1}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
     for (size_t i = 0; i < n_params; i++) {
         if (grads[i].defined() && grads[i].numel() > 0) {
-            norm_sq.add_(grads[i].norm().to(torch::kFloat32).pow(2));
+            auto g_flat = grads[i].to(torch::kFloat32).reshape(-1);
+            norm_sq.add_(g_flat.dot(g_flat));
         }
     }
     // Single CPU sync
@@ -70,7 +71,8 @@ static float compute_sam_grad_norm_device_side(
     auto norm_sq = torch::zeros({1}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
     for (size_t i = 0; i < n_grads; i++) {
         if (grads[i].defined() && grads[i].numel() > 0) {
-            norm_sq.add_(grads[i].norm().to(torch::kFloat32).pow(2));
+            auto g_flat = grads[i].to(torch::kFloat32).reshape(-1);
+            norm_sq.add_(g_flat.dot(g_flat));
         }
     }
     return std::sqrt(norm_sq.item<float>()) + 1e-12f;
@@ -574,9 +576,10 @@ float prodigy_fused_step(
         float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
 
         auto g_f = grads[i].to(torch::kFloat32);
-        s_bufs[i].mul_(beta2).addcmul_(g_f * d_lr, g_f * d_lr, 1.0f - beta2);
-        exp_avgs[i].mul_(beta1).add_(g_f * d_lr, 1.0f - beta1);
-        exp_avg_sqs[i].mul_(beta2).addcmul_(g_f * d_lr, g_f * d_lr, 1.0f - beta2);
+        auto g_dlr = g_f * d_lr;
+        s_bufs[i].mul_(beta2).addcmul_(g_dlr, g_dlr, 1.0f - beta2);
+        exp_avgs[i].mul_(beta1).add_(g_dlr, 1.0f - beta1);
+        exp_avg_sqs[i].mul_(beta2).addcmul_(g_dlr, g_dlr, 1.0f - beta2);
         float step_size = lr / bc1;
         auto denom_t = (exp_avg_sqs[i] / bc2).sqrt_().add_(d_lr * eps);
         params[i].mul_(1.0f - lr * d_lr * wd);
@@ -716,12 +719,28 @@ void looksam_compute_directions(
     std::vector<torch::Tensor>& sam_grads,
     std::vector<torch::Tensor>& normal_grads
 ) {
+    // Compute diffs and norms with batched CPU sync
+    std::vector<torch::Tensor> diffs;
+    std::vector<torch::Tensor> norm_tensors;
+    std::vector<size_t> valid_idx;
+    diffs.reserve(v_dirs.size());
     for (size_t i = 0; i < v_dirs.size(); i++) {
         if (!sam_grads[i].defined() || !normal_grads[i].defined()
             || sam_grads[i].numel() == 0) continue;
-
         auto diff = (sam_grads[i] - normal_grads[i]).to(torch::kFloat32);
-        float norm = diff.norm().item<float>();
+        diffs.push_back(diff);
+        norm_tensors.push_back(diff.norm());  // async kernel launch
+        valid_idx.push_back(i);
+    }
+    if (valid_idx.empty()) return;
+
+    // Single CPU sync for all norms
+    auto norms_stacked = torch::stack(norm_tensors).cpu();
+    auto norms_ptr = norms_stacked.data_ptr<float>();
+
+    for (size_t vi = 0; vi < valid_idx.size(); vi++) {
+        size_t i = valid_idx[vi];
+        float norm = norms_ptr[vi];
         if (norm < 1e-12f) continue;
         float inv_norm = 1.0f / norm;
 
@@ -733,7 +752,7 @@ void looksam_compute_directions(
             continue;
         }
 #endif
-        v_dirs[i] = diff * inv_norm;
+        v_dirs[i] = diffs[vi] * inv_norm;
     }
 }
 
@@ -742,12 +761,24 @@ void looksam_adjust_grads(
     std::vector<torch::Tensor>& v_dirs,
     float la
 ) {
+    // Batch norm computation with single CPU sync
+    std::vector<torch::Tensor> norm_tensors;
+    std::vector<size_t> valid_idx;
     for (size_t i = 0; i < grads.size(); i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
         if (!v_dirs[i].defined() || v_dirs[i].numel() == 0) continue;
+        norm_tensors.push_back(grads[i].norm());  // async kernel launch
+        valid_idx.push_back(i);
+    }
+    if (valid_idx.empty()) return;
 
-        float grad_norm = grads[i].norm().item<float>();
-        float la_times_gnorm = la * grad_norm;
+    // Single CPU sync for all norms
+    auto norms_stacked = torch::stack(norm_tensors).cpu();
+    auto norms_ptr = norms_stacked.data_ptr<float>();
+
+    for (size_t vi = 0; vi < valid_idx.size(); vi++) {
+        size_t i = valid_idx[vi];
+        float la_times_gnorm = la * norms_ptr[vi];
 
 #if defined(WITH_CUDA) || defined(WITH_HIP)
         if (grads[i].is_cuda()) {
