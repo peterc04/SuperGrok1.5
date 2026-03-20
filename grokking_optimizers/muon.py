@@ -217,8 +217,9 @@ class Muon(Optimizer):
         if len(state) == 0:
             state["momentum_buffer"] = torch.zeros_like(param, dtype=torch.float32)
         _ops.muon_fused_step(
-            param, state["momentum_buffer"], param.grad,
-            group["lr"], group.get("momentum", 0.95),
-            group["weight_decay"], group.get("ns_steps", 5),
-            *group.get("ns_coeffs", (3.4445, -4.7750, 2.0315)),
+            [param], [param.grad], [state["momentum_buffer"]],
+            group.get("momentum", 0.95),
+            group["lr"],
+            group["weight_decay"],
+            group.get("ns_steps", 5),
         )
