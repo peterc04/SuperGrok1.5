@@ -187,6 +187,53 @@ void launch_muon_update(
     torch::Tensor param, torch::Tensor orth,
     float neg_lr_scale, float decay_factor);
 
+// ── Multi-Tensor Optimizer Kernels (multi_tensor_optimizer_kernels.cu) ──
+void launch_multi_tensor_grokadamw(
+    std::vector<torch::Tensor>& params,
+    std::vector<torch::Tensor>& exp_avgs,
+    std::vector<torch::Tensor>& exp_avg_sqs,
+    std::vector<torch::Tensor>& emas,
+    std::vector<torch::Tensor>& grads,
+    std::vector<float>& bc1s,
+    std::vector<float>& bc2s,
+    float alpha, float lamb, float beta1, float beta2,
+    float lr, float wd, float eps);
+
+void launch_multi_tensor_lion(
+    std::vector<torch::Tensor>& params,
+    std::vector<torch::Tensor>& exp_avgs,
+    std::vector<torch::Tensor>& grads,
+    float lr, float beta1, float beta2, float wd);
+
+void launch_multi_tensor_grokfast_ema(
+    std::vector<torch::Tensor>& grads,
+    std::vector<torch::Tensor>& emas,
+    float alpha, float lamb);
+
+void launch_multi_tensor_prodigy_step(
+    std::vector<torch::Tensor>& params,
+    std::vector<torch::Tensor>& exp_avgs,
+    std::vector<torch::Tensor>& exp_avg_sqs,
+    std::vector<torch::Tensor>& s_bufs,
+    std::vector<torch::Tensor>& grads,
+    std::vector<float>& bc1s,
+    std::vector<float>& bc2s,
+    float d_lr, float beta1, float beta2,
+    float lr, float wd, float eps);
+
+void launch_multi_tensor_prodigy_fused_reduce_step(
+    std::vector<torch::Tensor>& params,
+    std::vector<torch::Tensor>& grads,
+    std::vector<torch::Tensor>& param_inits,
+    std::vector<torch::Tensor>& exp_avgs,
+    std::vector<torch::Tensor>& exp_avg_sqs,
+    std::vector<torch::Tensor>& s_bufs,
+    std::vector<float>& bc1s,
+    std::vector<float>& bc2s,
+    torch::Tensor d_lr_buf,
+    float beta1, float beta2,
+    float lr, float wd, float eps);
+
 // ── Distributed Scan (distributed_scan_kernels.cu) ──────────────────
 void distributed_scan_local_with_summary(
     torch::Tensor pre_x_val, torch::Tensor pre_z_val, torch::Tensor pre_dt_val,
