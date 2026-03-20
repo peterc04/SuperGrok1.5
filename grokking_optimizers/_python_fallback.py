@@ -329,7 +329,7 @@ def muon_fused_step(params, grads, momentum_bufs, momentum, lr, wd, ns_steps):
 def _mamba3_scan_py(x_sorted, in_proj_W, dt_proj_W, dt_proj_b,
                     B_proj_W, C_proj_W, A_log, D_param, rope_freq,
                     initial_state, reverse=False):
-    """Pure-Python Mamba-3 scan matching CPU C++ kernel."""
+    """Pure-Python Mamba-3 scan matching CPU C++ kernel (vectorized)."""
     N, d_model = x_sorted.shape
     d_inner = D_param.shape[0]
     d_state = A_log.shape[1]
@@ -337,6 +337,9 @@ def _mamba3_scan_py(x_sorted, in_proj_W, dt_proj_W, dt_proj_b,
 
     h = initial_state.clone() if initial_state is not None else torch.zeros(d_inner, d_state)
     scan_out = torch.zeros(N, d_inner)
+
+    # Pre-compute A values: [d_inner, d_state]
+    A_vals = -torch.exp(A_log)
 
     indices = range(N - 1, -1, -1) if reverse else range(N)
     for i in indices:
@@ -346,45 +349,49 @@ def _mamba3_scan_py(x_sorted, in_proj_W, dt_proj_W, dt_proj_b,
         x_branch = proj[:d_inner]
         z_branch = proj[d_inner:]
 
-        # dt projection
+        # dt projection (softplus)
         dt_raw = dt_proj_W @ x_branch + dt_proj_b  # [d_inner]
         dt_val = torch.where(dt_raw > 20.0, dt_raw, torch.log1p(torch.exp(dt_raw)))
 
-        # State update
-        y = torch.zeros(d_inner)
-        for j in range(d_inner):
-            dt_j = dt_val[j].item()
-            x_j = x_branch[j].item()
+        # Vectorized state update over d_inner and half_ds
+        # B projections: [d_state, d_model] @ [d_model] -> [d_state]
+        B_all = B_proj_W @ x_branch  # [d_state]
 
-            for p in range(half_ds):
-                se, so = 2 * p, 2 * p + 1
-                A_e = -math.exp(A_log[j, se].item())
-                A_o = -math.exp(A_log[j, so].item())
-                A_bar_e = (1.0 + dt_j * A_e / 2.0) / (1.0 - dt_j * A_e / 2.0 + 1e-8)
-                A_bar_o = (1.0 + dt_j * A_o / 2.0) / (1.0 - dt_j * A_o / 2.0 + 1e-8)
+        # C projections: [d_state, d_model] @ [d_model] -> [d_state]
+        C_all = C_proj_W @ x_branch  # [d_state]
 
-                B_e = (B_proj_W[se] * x_branch).sum().item()
-                B_o = (B_proj_W[so] * x_branch).sum().item()
+        # Bilinear discretization: A_bar = (1 + dt*A/2) / (1 - dt*A/2)
+        # dt_val: [d_inner], A_vals: [d_inner, d_state]
+        dt_A = dt_val.unsqueeze(1) * A_vals  # [d_inner, d_state]
+        A_bar = (1.0 + dt_A / 2.0) / (1.0 - dt_A / 2.0 + 1e-8)  # [d_inner, d_state]
 
-                freq_p = rope_freq[j, p].item()
-                cos_p = math.cos(dt_j * freq_p)
-                sin_p = math.sin(dt_j * freq_p)
-                h_e = h[j, se].item()
-                h_o = h[j, so].item()
-                h_rot_e = h_e * cos_p - h_o * sin_p
-                h_rot_o = h_o * cos_p + h_e * sin_p
+        # RoPE rotation: apply to even/odd state pairs
+        # rope_freq: [d_inner, half_ds], dt_val: [d_inner]
+        theta = dt_val.unsqueeze(1) * rope_freq  # [d_inner, half_ds]
+        cos_theta = torch.cos(theta)  # [d_inner, half_ds]
+        sin_theta = torch.sin(theta)  # [d_inner, half_ds]
 
-                h[j, se] = A_bar_e * h_rot_e + dt_j * B_e * x_j
-                h[j, so] = A_bar_o * h_rot_o + dt_j * B_o * x_j
+        h_even = h[:, 0::2]  # [d_inner, half_ds]
+        h_odd = h[:, 1::2]   # [d_inner, half_ds]
+        h_rot_even = h_even * cos_theta - h_odd * sin_theta
+        h_rot_odd = h_odd * cos_theta + h_even * sin_theta
 
-                C_e = (C_proj_W[se] * x_branch).sum().item()
-                C_o = (C_proj_W[so] * x_branch).sum().item()
-                y[j] += h[j, se].item() * C_e + h[j, so].item() * C_o
+        # State update: h_new = A_bar * h_rot + dt * B * x
+        dt_Bx = dt_val.unsqueeze(1) * B_all.unsqueeze(0).expand(d_inner, -1) * x_branch.unsqueeze(1)
+        # But B_all is [d_state] not [d_inner, d_state], and x_branch is [d_inner]
+        # Actually: for each j, B_e = B_all[se], and the update uses x_branch[j]
+        # So dt_Bx[j, s] = dt_val[j] * B_all[s] * x_branch[j]
+        dt_Bx = (dt_val * x_branch).unsqueeze(1) * B_all.unsqueeze(0)  # [d_inner, d_state]
 
-            # Gated output
-            z_j = z_branch[j].item()
-            silu_z = z_j / (1.0 + math.exp(-z_j))
-            scan_out[i, j] = y[j].item() * silu_z + D_param[j].item() * x_j
+        h[:, 0::2] = A_bar[:, 0::2] * h_rot_even + dt_Bx[:, 0::2]
+        h[:, 1::2] = A_bar[:, 1::2] * h_rot_odd + dt_Bx[:, 1::2]
+
+        # Output: y[j] = sum_p (h[j,se]*C_all[se] + h[j,so]*C_all[so])
+        y = (h * C_all.unsqueeze(0)).sum(dim=1)  # [d_inner]
+
+        # Gated output: SiLU(z) * y + D * x
+        silu_z = z_branch * torch.sigmoid(z_branch)  # [d_inner]
+        scan_out[i] = y * silu_z + D_param * x_branch
 
     return scan_out, h
 

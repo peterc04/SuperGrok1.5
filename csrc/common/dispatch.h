@@ -77,11 +77,15 @@ inline int get_sm_arch() {
     gpuDeviceProp_t prop;
     if (gpuGetDeviceProperties(&prop, 0) == GPU_SUCCESS) {
         const char* name = prop.gcnArchName;
+        // Parse numeric portion of gcnArchName (e.g. "gfx942:sramecc+:xnack-")
+        // Supports both 2-digit (90) and 3-digit (908, 942, 950) arch codes.
         if (name[0] == 'g' && name[1] == 'f' && name[2] == 'x' &&
-            name[3] != '\0' && name[4] != '\0') {
-            int d1 = name[3] - '0';
-            int d2 = name[4] - '0';
-            cached = d1 * 10 + d2;
+            name[3] != '\0') {
+            int val = 0;
+            for (int k = 3; name[k] >= '0' && name[k] <= '9'; k++) {
+                val = val * 10 + (name[k] - '0');
+            }
+            cached = val;
         } else {
             cached = 0;
         }

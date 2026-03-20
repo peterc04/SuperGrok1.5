@@ -250,8 +250,10 @@ class GradientHookOptimizer(Optimizer):
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         """Load state into the base optimizer and restore hook metadata."""
-        meta = state_dict.pop('gradient_hook_meta', None)
-        self.base_optimizer.load_state_dict(state_dict)
+        meta = state_dict.get('gradient_hook_meta', None)
+        # Pass a copy without hook metadata to avoid mutating the caller's dict
+        base_state = {k: v for k, v in state_dict.items() if k != 'gradient_hook_meta'}
+        self.base_optimizer.load_state_dict(base_state)
 
         if meta is not None:
             self._global_step = meta.get('global_step', 0)
