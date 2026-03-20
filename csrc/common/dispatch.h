@@ -77,7 +77,8 @@ inline int get_sm_arch() {
     gpuDeviceProp_t prop;
     if (gpuGetDeviceProperties(&prop, 0) == GPU_SUCCESS) {
         const char* name = prop.gcnArchName;
-        if (name[0] == 'g' && name[1] == 'f' && name[2] == 'x') {
+        if (name[0] == 'g' && name[1] == 'f' && name[2] == 'x' &&
+            name[3] != '\0' && name[4] != '\0') {
             int d1 = name[3] - '0';
             int d2 = name[4] - '0';
             cached = d1 * 10 + d2;
