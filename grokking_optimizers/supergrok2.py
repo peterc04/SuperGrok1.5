@@ -467,12 +467,15 @@ class SuperGrok2(Optimizer):
             # Ensure weights are extracted and cached
             if self._weights_dirty:
                 w = self.meta_net.get_weights()
+                def _to_f32_contig(t):
+                    t = t if t.dtype == torch.float32 else t.float()
+                    return t if t.is_contiguous() else t.contiguous()
                 self._cached_peer_query_Ws = torch.stack(
-                    [q.weight.data.float().contiguous() for q in self.meta_net.peer_queries])
+                    [_to_f32_contig(q.weight.data) for q in self.meta_net.peer_queries])
                 self._cached_prod_keys_A = torch.stack(
-                    [k.data.float().contiguous() for k in self.meta_net.product_keys_A])
+                    [_to_f32_contig(k.data) for k in self.meta_net.product_keys_A])
                 self._cached_prod_keys_B = torch.stack(
-                    [k.data.float().contiguous() for k in self.meta_net.product_keys_B])
+                    [_to_f32_contig(k.data) for k in self.meta_net.product_keys_B])
                 self._cached_weights = w
                 self._weights_dirty = False
             w = self._cached_weights
@@ -569,7 +572,6 @@ class SuperGrok2(Optimizer):
                 else:
                     mu.mul_(alpha_i).add_(grad.reshape(-1), alpha=1.0 - alpha_i)
                 effective_grad = smart_grad.reshape(-1) + lamb_eff * mu
-                self._flat_mus[i] = self._flat_mus[i]  # already stored above
 
                 fg = effective_grad.reshape(-1).float()
                 ea = self._flat_exp_avgs[i]
@@ -585,8 +587,7 @@ class SuperGrok2(Optimizer):
                     N = ea_fp32.numel()
                     num_blocks = (N + block_size - 1) // block_size
                     # Pad to full blocks, reshape, compute block-wise absmax
-                    _padded = ea_fp32.numel()
-                    _pad_n = num_blocks * block_size - _padded
+                    _pad_n = num_blocks * block_size - N
                     if _pad_n > 0:
                         _ea_padded = torch.nn.functional.pad(ea_fp32, (0, _pad_n))
                     else:
@@ -719,21 +720,24 @@ class SuperGrok2(Optimizer):
         num_active = topk * topk
         rescale = float(mn.rescale)
 
-        # Stack PEER weights
+        # Stack PEER weights (skip .float() if already FP32)
+        def _f32c(t):
+            t = t if t.dtype == torch.float32 else t.float()
+            return t if t.is_contiguous() else t.contiguous()
         peer_query_Ws = torch.stack(
-            [q.weight.data.float().contiguous() for q in mn.peer_queries])
+            [_f32c(q.weight.data) for q in mn.peer_queries])
         prod_keys_A = torch.stack(
-            [k.data.float().contiguous() for k in mn.product_keys_A])
+            [_f32c(k.data) for k in mn.product_keys_A])
         prod_keys_B = torch.stack(
-            [k.data.float().contiguous() for k in mn.product_keys_B])
+            [_f32c(k.data) for k in mn.product_keys_B])
 
         # GRU weights
-        gru_Wz = mn.gru.W_z.weight.data.float().contiguous()
-        gru_bz = mn.gru.W_z.bias.data.float().contiguous()
-        gru_Wr = mn.gru.W_r.weight.data.float().contiguous()
-        gru_br = mn.gru.W_r.bias.data.float().contiguous()
-        gru_Wh = mn.gru.W_h.weight.data.float().contiguous()
-        gru_bh = mn.gru.W_h.bias.data.float().contiguous()
+        gru_Wz = _f32c(mn.gru.W_z.weight.data)
+        gru_bz = _f32c(mn.gru.W_z.bias.data)
+        gru_Wr = _f32c(mn.gru.W_r.weight.data)
+        gru_br = _f32c(mn.gru.W_r.bias.data)
+        gru_Wh = _f32c(mn.gru.W_h.weight.data)
+        gru_bh = _f32c(mn.gru.W_h.bias.data)
 
         # Expert weights (flattened for CUDA kernel)
         expert_W1_flat = w['expert_W1'].reshape(num_experts, expert_hidden)
@@ -1578,13 +1582,16 @@ class SuperGrok2(Optimizer):
         self._ensure_state()
 
         # Force weight extraction and cache
+        def _f32c(t):
+            t = t if t.dtype == torch.float32 else t.float()
+            return t if t.is_contiguous() else t.contiguous()
         w = self.meta_net.get_weights()
         self._cached_peer_query_Ws = torch.stack(
-            [q.weight.data.float().contiguous() for q in self.meta_net.peer_queries])
+            [_f32c(q.weight.data) for q in self.meta_net.peer_queries])
         self._cached_prod_keys_A = torch.stack(
-            [k.data.float().contiguous() for k in self.meta_net.product_keys_A])
+            [_f32c(k.data) for k in self.meta_net.product_keys_A])
         self._cached_prod_keys_B = torch.stack(
-            [k.data.float().contiguous() for k in self.meta_net.product_keys_B])
+            [_f32c(k.data) for k in self.meta_net.product_keys_B])
         self._cached_weights = w
         self._weights_dirty = False
 

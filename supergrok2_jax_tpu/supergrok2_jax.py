@@ -289,10 +289,10 @@ def supergrok2_step(
         new_opt_state: updated optimizer state
     """
     global_step = opt_state.global_step + 1
-    cached_acc = jnp.where(
-        train_acc is not None,
-        jnp.array(train_acc, dtype=jnp.float32) if train_acc is not None else opt_state.cached_train_acc,
-        opt_state.cached_train_acc,
+    cached_acc = (
+        jnp.array(train_acc, dtype=jnp.float32)
+        if train_acc is not None
+        else opt_state.cached_train_acc
     )
 
     # Compute adaptive scalars
