@@ -553,6 +553,7 @@ from grokking_optimizers import (
     GrokAdamW, NeuralGrok, Prodigy, Grokfast, Lion, LookSAM, Muon,
     CUDAGraphOptimizer,
 )
+from grokking_optimizers.gradient_hook_optimizer import GradientHookOptimizer
 
 def _maybe_wrap_cuda_graph(opt, c):
     """Wrap optimizer in CUDAGraphOptimizer if enabled in config."""
@@ -564,10 +565,17 @@ def _maybe_wrap_cuda_graph(opt, c):
         )
     return opt
 
+def _maybe_wrap_grad_hooks(opt, model, c):
+    """Wrap optimizer with GradientHookOptimizer if --grad-hooks flag is active."""
+    if c.get("use_grad_hooks", False):
+        return GradientHookOptimizer(model, opt)
+    return opt
+
 # ── 1. AdamW ──────────────────────────────────────────────────────────
 def train_adamw(c, init, tx, ty, vx, vy, dev, bp=0):
     r=_tr("AdamW",c); m=_load(c,dev,init)
-    opt=torch.optim.AdamW(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]), weight_decay=c["weight_decay"])
+    opt=torch.optim.AdamW(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]), weight_decay=c["weight_decay"], fused=True)
+    opt=_maybe_wrap_grad_hooks(opt, m, c)
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time()
@@ -597,6 +605,7 @@ def train_neuralgrok(c, init, tx, ty, vx, vy, dev, bp=0):
         grad_clip=c.get("neural_grad_clip",1.0))
     opt.amplifier=opt.amplifier.to(dev)
     aopt=opt.get_amplifier_optimizer(lr=1e-3)
+    opt=_maybe_wrap_grad_hooks(opt, m, c)
     ni=int(tx.size(0)*0.9); ix,ox,iy,oy = tx[:ni],tx[ni:],ty[:ni],ty[ni:]
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time()
@@ -620,6 +629,7 @@ def train_grokadamw(c, init, tx, ty, vx, vy, dev, bp=0):
         weight_decay=c["weight_decay"], alpha=c.get("grokadamw_alpha",0.98),
         lamb=c.get("grokadamw_lamb",5.0), gamma=c.get("grokadamw_gamma",0.1),
         decay=c.get("grokadamw_decay",0.1), grad_clip=c.get("grokadamw_grad_clip",1.0))
+    opt=_maybe_wrap_grad_hooks(opt, m, c)
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time()
@@ -841,6 +851,7 @@ def train_grokfast(c, init, tx, ty, vx, vy, dev, bp=0):
     opt=Grokfast(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
         weight_decay=c["weight_decay"], grokfast_alpha=c.get("grokfast_alpha",0.98),
         grokfast_lamb=c.get("grokfast_lamb",2.0))
+    opt=_maybe_wrap_grad_hooks(opt, m, c)
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time()
@@ -863,6 +874,7 @@ def train_muon(c, init, tx, ty, vx, vy, dev, bp=0):
         lr=c.get("muon_lr",0.02), momentum=c.get("muon_momentum",0.95),
         weight_decay=c["weight_decay"], adamw_lr=c["lr"],
         adamw_betas=(c["beta1"],c["beta2"]))
+    opt=_maybe_wrap_grad_hooks(opt, m, c)
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time()
@@ -880,6 +892,7 @@ def train_lion(c, init, tx, ty, vx, vy, dev, bp=0):
     r=_tr("Lion",c); m=_load(c,dev,init)
     opt=Lion(m.parameters(), lr=c.get("lion_lr",3e-4),
         betas=(c["beta1"],0.99), weight_decay=c.get("lion_wd",3.0))
+    opt=_maybe_wrap_grad_hooks(opt, m, c)
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time()
@@ -924,6 +937,7 @@ def train_looksam(c, init, tx, ty, vx, vy, dev, bp=0):
 def train_prodigy(c, init, tx, ty, vx, vy, dev, bp=0):
     r=_tr("Prodigy",c); m=_load(c,dev,init)
     opt=Prodigy(m.parameters(), lr=c.get("prodigy_lr",1.0), weight_decay=c["weight_decay"])
+    opt=_maybe_wrap_grad_hooks(opt, m, c)
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time()
@@ -1499,10 +1513,14 @@ if __name__ == "__main__":
                         help="Comma-separated GPU IDs for multi-GPU (e.g. 0,1,2,3). "
                              "Auto-detects all GPUs if set to 'auto'. "
                              "Single GPU for fair sequential benchmark if omitted.")
+    parser.add_argument("--grad-hooks", action="store_true",
+                        help="Use gradient hooks for L2-warm optimizer updates")
     args = parser.parse_args()
 
     if args.setup:
         run_setup()
+
+    DEFAULT_CONFIG["use_grad_hooks"] = args.grad_hooks if hasattr(args, 'grad_hooks') else False
 
     warnings.filterwarnings('ignore')
 

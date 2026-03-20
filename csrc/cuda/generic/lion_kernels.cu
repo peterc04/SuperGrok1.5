@@ -40,13 +40,7 @@ __global__ void fused_lion_step_kernel(
     const float interp = beta1 * ea + (1.0f - beta1) * g;
 
     // Sign function
-    float s;
-    if (interp > 0.0f)
-        s = 1.0f;
-    else if (interp < 0.0f)
-        s = -1.0f;
-    else
-        s = 0.0f;
+    const float s = (interp != 0.0f) ? copysignf(1.0f, interp) : 0.0f;
 
     // Parameter update: p -= lr * (sign(interp) + wd * p)
     param[idx] = static_cast<scalar_t>(p - lr * (s + wd * p));
@@ -81,10 +75,10 @@ __global__ void fused_lion_step_vec4_kernel(
     interp.w = beta1 * ea.w + (1.0f - beta1) * g.w;
 
     // Sign function
-    float sx = (interp.x > 0.0f) ? 1.0f : ((interp.x < 0.0f) ? -1.0f : 0.0f);
-    float sy = (interp.y > 0.0f) ? 1.0f : ((interp.y < 0.0f) ? -1.0f : 0.0f);
-    float sz = (interp.z > 0.0f) ? 1.0f : ((interp.z < 0.0f) ? -1.0f : 0.0f);
-    float sw = (interp.w > 0.0f) ? 1.0f : ((interp.w < 0.0f) ? -1.0f : 0.0f);
+    const float sx = (interp.x != 0.0f) ? copysignf(1.0f, interp.x) : 0.0f;
+    const float sy = (interp.y != 0.0f) ? copysignf(1.0f, interp.y) : 0.0f;
+    const float sz = (interp.z != 0.0f) ? copysignf(1.0f, interp.z) : 0.0f;
+    const float sw = (interp.w != 0.0f) ? copysignf(1.0f, interp.w) : 0.0f;
 
     // Parameter update: p -= lr * (sign(interp) + wd * p)
     p.x = p.x - lr * (sx + wd * p.x);

@@ -4468,3 +4468,172 @@ bool launch_persistent_scan_fused_elem(
     }));
     return true;
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Persistent multi-tensor fused_elem kernel
+//  Processes ALL parameters in a single kernel launch using
+//  device-side work stealing via atomic counter.
+// ═══════════════════════════════════════════════════════════════════════
+
+__launch_bounds__(256, 4)
+__global__ void persistent_fused_elem_multi_tensor_kernel(
+    // Pointer arrays (one per parameter)
+    float** __restrict__ param_ptrs,
+    const float** __restrict__ grad_ptrs,
+    float** __restrict__ exp_avg_ptrs,
+    float** __restrict__ exp_avg_sq_ptrs,
+    float** __restrict__ gru_h_ptrs,
+    const float** __restrict__ meta_weight_ptrs,
+    const int* __restrict__ sizes,           // [num_params] numel per param
+    const float* __restrict__ lrs,           // [num_params] per-param lr
+    const float* __restrict__ bc1s,          // [num_params]
+    const float* __restrict__ bc2s,          // [num_params]
+    const float* __restrict__ lamb_effs,     // [num_params]
+    const float beta1,
+    const float beta2,
+    const float eps,
+    const float weight_decay,
+    const float meta_rescale,
+    int* __restrict__ work_counter,          // atomic work counter
+    const int num_params
+) {
+    // Persistent: each block grabs a (param_idx, chunk_idx) work item
+    while (true) {
+        // Atomically grab next work item
+        int work_id;
+        if (threadIdx.x == 0) {
+            work_id = atomicAdd(work_counter, 1);
+        }
+        // Broadcast to all threads in block
+        __shared__ int s_work_id;
+        if (threadIdx.x == 0) s_work_id = work_id;
+        __syncthreads();
+        work_id = s_work_id;
+
+        // Decode work_id into (param_idx, chunk_offset)
+        // We pre-compute cumulative chunk counts, but for simplicity
+        // use linear scan (num_params is typically < 100)
+        int param_idx = 0;
+        int chunk_offset = work_id;
+        int chunks_per_param;
+        for (int pi = 0; pi < num_params; pi++) {
+            chunks_per_param = (sizes[pi] + blockDim.x - 1) / blockDim.x;
+            if (chunk_offset < chunks_per_param) {
+                param_idx = pi;
+                break;
+            }
+            chunk_offset -= chunks_per_param;
+        }
+
+        // Check if we've exhausted all work
+        if (param_idx >= num_params || chunk_offset >= ((sizes[param_idx] + blockDim.x - 1) / blockDim.x)) {
+            return;
+        }
+
+        int N = sizes[param_idx];
+        int idx = chunk_offset * blockDim.x + threadIdx.x;
+        if (idx >= N) continue;
+
+        float* param = param_ptrs[param_idx];
+        const float* grad = grad_ptrs[param_idx];
+        float* ea_ptr = exp_avg_ptrs[param_idx];
+        float* eas_ptr = exp_avg_sq_ptrs[param_idx];
+
+        float g = grad[idx];
+        float ea_old = ea_ptr[idx];
+        float eas_old = eas_ptr[idx];
+
+        float lr_i = lrs[param_idx];
+        float bc1_i = bc1s[param_idx];
+        float bc2_i = bc2s[param_idx];
+        float lamb_eff_i = lamb_effs[param_idx];
+
+        // Apply lamb_eff scaling (meta-net output already computed)
+        float effective_g = g;  // Simplified: meta-net output applied upstream
+        if (meta_weight_ptrs != nullptr && meta_weight_ptrs[param_idx] != nullptr) {
+            effective_g = g + lamb_eff_i * meta_weight_ptrs[param_idx][idx];
+        }
+
+        // Adam moments
+        float ea = beta1 * ea_old + (1.0f - beta1) * effective_g;
+        float eas = beta2 * eas_old + (1.0f - beta2) * effective_g * effective_g;
+        ea_ptr[idx] = ea;
+        eas_ptr[idx] = eas;
+
+        // Adam step with fast_rsqrt_nr
+        float step_size = lr_i / bc1_i;
+        float rsqrt_v = fast_rsqrt_nr(eas / bc2_i);
+        float p = param[idx];
+        p *= (1.0f - lr_i * weight_decay);
+        p -= step_size * ea * rsqrt_v / (1.0f + eps * rsqrt_v);
+        param[idx] = p;
+    }
+}
+
+void launch_persistent_fused_elem_multi_tensor(
+    std::vector<torch::Tensor> params,
+    std::vector<torch::Tensor> grads,
+    std::vector<torch::Tensor> exp_avgs,
+    std::vector<torch::Tensor> exp_avg_sqs,
+    torch::Tensor bc1s,
+    torch::Tensor bc2s,
+    torch::Tensor lrs_t,
+    torch::Tensor lamb_effs_t,
+    float beta1, float beta2, float eps, float weight_decay,
+    float meta_rescale
+) {
+    int num_params = static_cast<int>(params.size());
+    if (num_params == 0) return;
+
+    auto device = params[0].device();
+    auto opts_f = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+    auto opts_i = torch::TensorOptions().dtype(torch::kInt32).device(device);
+    auto opts_p = torch::TensorOptions().dtype(torch::kInt64).device(device);
+
+    // Pack pointer arrays on CPU then transfer
+    auto param_ptrs_cpu = torch::zeros({num_params}, torch::kInt64);
+    auto grad_ptrs_cpu = torch::zeros({num_params}, torch::kInt64);
+    auto ea_ptrs_cpu = torch::zeros({num_params}, torch::kInt64);
+    auto eas_ptrs_cpu = torch::zeros({num_params}, torch::kInt64);
+    auto sizes_cpu = torch::zeros({num_params}, torch::kInt32);
+
+    int total_chunks = 0;
+    for (int i = 0; i < num_params; i++) {
+        param_ptrs_cpu.data_ptr<int64_t>()[i] = reinterpret_cast<int64_t>(params[i].data_ptr<float>());
+        grad_ptrs_cpu.data_ptr<int64_t>()[i] = reinterpret_cast<int64_t>(grads[i].data_ptr<float>());
+        ea_ptrs_cpu.data_ptr<int64_t>()[i] = reinterpret_cast<int64_t>(exp_avgs[i].data_ptr<float>());
+        eas_ptrs_cpu.data_ptr<int64_t>()[i] = reinterpret_cast<int64_t>(exp_avg_sqs[i].data_ptr<float>());
+        int n = static_cast<int>(params[i].numel());
+        sizes_cpu.data_ptr<int32_t>()[i] = n;
+        total_chunks += (n + 255) / 256;
+    }
+
+    auto param_ptrs_d = param_ptrs_cpu.to(device);
+    auto grad_ptrs_d = grad_ptrs_cpu.to(device);
+    auto ea_ptrs_d = ea_ptrs_cpu.to(device);
+    auto eas_ptrs_d = eas_ptrs_cpu.to(device);
+    auto sizes_d = sizes_cpu.to(device);
+
+    // Atomic work counter (initialized to 0)
+    auto work_counter = torch::zeros({1}, opts_i);
+
+    // Launch with enough blocks to fill GPU (cap at total_chunks)
+    int num_blocks = std::min(total_chunks, 1024);
+
+    persistent_fused_elem_multi_tensor_kernel<<<num_blocks, 256>>>(
+        reinterpret_cast<float**>(param_ptrs_d.data_ptr<int64_t>()),
+        reinterpret_cast<const float**>(grad_ptrs_d.data_ptr<int64_t>()),
+        reinterpret_cast<float**>(ea_ptrs_d.data_ptr<int64_t>()),
+        reinterpret_cast<float**>(eas_ptrs_d.data_ptr<int64_t>()),
+        nullptr,  // gru_h_ptrs (not used in simplified version)
+        nullptr,  // meta_weight_ptrs
+        sizes_d.data_ptr<int32_t>(),
+        lrs_t.data_ptr<float>(),
+        bc1s.data_ptr<float>(),
+        bc2s.data_ptr<float>(),
+        lamb_effs_t.data_ptr<float>(),
+        beta1, beta2, eps, weight_decay, meta_rescale,
+        work_counter.data_ptr<int32_t>(),
+        num_params);
+}

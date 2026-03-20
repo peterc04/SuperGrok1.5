@@ -51,7 +51,7 @@ optimizers:
     update_math: |
       const float ea_old = STATE_LOAD(exp_avg, idx);
       const float interp = beta1 * ea_old + (1.0f - beta1) * g;
-      const float sign_v = (interp > 0.0f) ? 1.0f : ((interp < 0.0f) ? -1.0f : 0.0f);
+      const float sign_v = (interp != 0.0f) ? copysignf(1.0f, interp) : 0.0f;
       float pv = PARAM_LOAD(idx);
       pv = pv - lr * (sign_v + wd * pv);
       PARAM_STORE(idx, pv);
@@ -81,6 +81,30 @@ optimizers:
     has_adam: false
     variants:
       gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D, S_F_M, V_F_M, S_Q_M, V_Q_M]
+      cpu: [cpu_F, cpu_Q]
+
+  # ═══════════════════════════════════════════════════════════════
+  #  Grokfast + Adam fused (EMA + amplification + Adam in one pass)
+  # ═══════════════════════════════════════════════════════════════
+  grokfast_adam:
+    block_size: 256
+    launch_bounds: [256, 8]
+    states:
+      ema:        {q4_format: bf16_sr}
+      exp_avg:    {q4_format: int8_block8}
+      exp_avg_sq: {q4_format: int8_block8}
+    scalars: [alpha, lamb, beta1, beta2, lr, weight_decay, eps, bc1, bc2]
+    pre_adam_math: |
+      // EMA update
+      const float e_old = STATE_LOAD(ema, idx);
+      const float e_new = alpha * e_old + (1.0f - alpha) * g;
+      STATE_STORE(ema, idx, e_new);
+      // Gradient amplification
+      const float amplified = g + lamb * e_new;
+    effective_grad: amplified
+    has_adam: true
+    variants:
+      gpu: [S_F_D, V_F_D, S_Q_D, V_Q_D]
       cpu: [cpu_F, cpu_Q]
 
   # ═══════════════════════════════════════════════════════════════

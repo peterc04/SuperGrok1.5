@@ -146,12 +146,12 @@ __global__ void fused_sg11_adam_cosine_gate_kernel(
 
     // ── Bias-corrected step ──────────────────────────────────────────
     const float step_size = lr / bc1;
-    const float denom = sqrtf(easq / bc2) + eps;
+    const float rsqrt_v = fast_rsqrt_nr(easq / bc2);
 
     // ── Progressive weight decay + Adam step (fused) ─────────────────
     float p = static_cast<float>(param[idx]);
     p *= (1.0f - lr * wd_eff);
-    p -= step_size * ea / denom;
+    p -= step_size * ea * rsqrt_v / (1.0f + eps * rsqrt_v);
     param[idx] = static_cast<scalar_t>(p);
 }
 
@@ -247,10 +247,14 @@ __global__ void fused_sg11_adam_cosine_gate_vec4_kernel(
     float step_size = lr / bc1;
     float decay = 1.0f - lr * wd_eff;
     float4 p = param4[i];
-    p.x = decay * p.x - step_size * ea.x / (sqrtf(eas.x / bc2) + eps);
-    p.y = decay * p.y - step_size * ea.y / (sqrtf(eas.y / bc2) + eps);
-    p.z = decay * p.z - step_size * ea.z / (sqrtf(eas.z / bc2) + eps);
-    p.w = decay * p.w - step_size * ea.w / (sqrtf(eas.w / bc2) + eps);
+    float rsqrt_x = fast_rsqrt_nr(eas.x / bc2);
+    float rsqrt_y = fast_rsqrt_nr(eas.y / bc2);
+    float rsqrt_z = fast_rsqrt_nr(eas.z / bc2);
+    float rsqrt_w = fast_rsqrt_nr(eas.w / bc2);
+    p.x = decay * p.x - step_size * ea.x * rsqrt_x / (1.0f + eps * rsqrt_x);
+    p.y = decay * p.y - step_size * ea.y * rsqrt_y / (1.0f + eps * rsqrt_y);
+    p.z = decay * p.z - step_size * ea.z * rsqrt_z / (1.0f + eps * rsqrt_z);
+    p.w = decay * p.w - step_size * ea.w * rsqrt_w / (1.0f + eps * rsqrt_w);
     param4[i] = p;
 }
 
@@ -682,10 +686,92 @@ __global__ void fused_sg11_full_step_kernel(
 
     // ── 7. Bias-corrected step + progressive WD ─────────────────
     const float step_size = lr / bc1;
-    const float denom = sqrtf(easq / bc2) + eps;
+    const float rsqrt_v = fast_rsqrt_nr(easq / bc2);
     float p = static_cast<float>(param[idx]);
     p *= (1.0f - lr * wd_eff);
-    p -= step_size * ea / denom;
+    p -= step_size * ea * rsqrt_v / (1.0f + eps * rsqrt_v);
+    param[idx] = static_cast<scalar_t>(p);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Template-specialized fused kernel — H as compile-time constant
+//  enables #pragma unroll to fully unroll the MLP inner loop.
+// ═══════════════════════════════════════════════════════════════════════
+
+template <typename scalar_t, int H>
+__launch_bounds__(256, 8)
+__global__ void fused_sg11_full_step_templated_kernel(
+    scalar_t* __restrict__ param,
+    float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq,
+    scalar_t* __restrict__ mu,
+    const scalar_t* __restrict__ grad,
+    const scalar_t* __restrict__ sharpness,
+    const float alpha,
+    const float* __restrict__ W1,
+    const float* __restrict__ b1,
+    const float* __restrict__ W2,
+    const float* __restrict__ b2,
+    const float rescale,
+    const float lamb_eff,
+    const float beta1,
+    const float beta2,
+    const float lr,
+    const float wd_eff,
+    const float eps,
+    const float bc1,
+    const float bc2,
+    const int N
+) {
+    extern __shared__ float smem[];
+    float* sW1 = smem;
+    float* sb1 = sW1 + H * 2;
+    float* sW2 = sb1 + H;
+    float* sb2 = sW2 + H;
+
+    const int tid = threadIdx.x;
+
+    #pragma unroll
+    for (int i = tid; i < H * 2; i += blockDim.x) sW1[i] = W1[i];
+    #pragma unroll
+    for (int i = tid; i < H; i += blockDim.x) sb1[i] = b1[i];
+    #pragma unroll
+    for (int i = tid; i < H; i += blockDim.x) sW2[i] = W2[i];
+    if (tid == 0) sb2[0] = b2[0];
+    __syncthreads();
+
+    const int idx = blockIdx.x * blockDim.x + tid;
+    if (idx >= N) return;
+
+    const float g = static_cast<float>(grad[idx]);
+    const float s = static_cast<float>(sharpness[idx]);
+
+    const float mu_old = static_cast<float>(mu[idx]);
+    const float mu_new = alpha * mu_old + (1.0f - alpha) * g;
+    mu[idx] = static_cast<scalar_t>(mu_new);
+
+    float mlp_out = 0.0f;
+    #pragma unroll
+    for (int h = 0; h < H; h++) {
+        float z = sW1[h * 2] * g + sW1[h * 2 + 1] * s + sb1[h];
+        float gelu = z / (1.0f + expf(-1.702f * z));
+        mlp_out += sW2[h] * gelu;
+    }
+    mlp_out += sb2[0];
+
+    const float smart_grad = g + rescale * mlp_out;
+    const float fg = smart_grad + lamb_eff * mu_new;
+
+    const float ea = beta1 * stream_load(&exp_avg[idx]) + (1.0f - beta1) * fg;
+    const float easq = beta2 * stream_load(&exp_avg_sq[idx]) + (1.0f - beta2) * fg * fg;
+    stream_store(&exp_avg[idx], ea);
+    stream_store(&exp_avg_sq[idx], easq);
+
+    const float step_size = lr / bc1;
+    const float rsqrt_v = fast_rsqrt_nr(easq / bc2);
+    float p = static_cast<float>(param[idx]);
+    p *= (1.0f - lr * wd_eff);
+    p -= step_size * ea * rsqrt_v / (1.0f + eps * rsqrt_v);
     param[idx] = static_cast<scalar_t>(p);
 }
 
@@ -721,6 +807,37 @@ void launch_fused_sg11_full_step(
     auto b1_f = b1.dtype() == torch::kFloat32 ? b1.contiguous() : b1.to(torch::kFloat32).contiguous();
     auto W2_f = W2.dtype() == torch::kFloat32 ? W2.contiguous() : W2.to(torch::kFloat32).contiguous();
     auto b2_f = b2.dtype() == torch::kFloat32 ? b2.contiguous() : b2.to(torch::kFloat32).contiguous();
+
+    // Dispatch to templated kernel for common H values (enables full unrolling)
+    #define SG11_DISPATCH_H(H_VAL) \
+        case H_VAL: { \
+            AT_DISPATCH_FLOATING_TYPES_AND2( \
+                at::ScalarType::Half, at::ScalarType::BFloat16, \
+                grad.scalar_type(), "fused_sg11_full_step_t" #H_VAL, ([&] { \
+                fused_sg11_full_step_templated_kernel<scalar_t, H_VAL><<<grid, BLOCK_SIZE, smem_bytes>>>( \
+                    param.data_ptr<scalar_t>(), \
+                    exp_avg.data_ptr<float>(), \
+                    exp_avg_sq.data_ptr<float>(), \
+                    mu.data_ptr<scalar_t>(), \
+                    grad.data_ptr<scalar_t>(), \
+                    sharpness.data_ptr<scalar_t>(), \
+                    alpha, \
+                    W1_f.data_ptr<float>(), b1_f.data_ptr<float>(), \
+                    W2_f.data_ptr<float>(), b2_f.data_ptr<float>(), \
+                    rescale, lamb_eff, \
+                    beta1, beta2, lr, wd_eff, eps, bc1, bc2, N); \
+            })); \
+            return; \
+        }
+
+    switch (hidden_dim) {
+        SG11_DISPATCH_H(16)
+        SG11_DISPATCH_H(32)
+        SG11_DISPATCH_H(64)
+        SG11_DISPATCH_H(128)
+        default: break;  // Fall through to runtime version
+    }
+    #undef SG11_DISPATCH_H
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,

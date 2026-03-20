@@ -1748,6 +1748,78 @@ class SuperGrok2(Optimizer):
 
         self._step_counter += 1
 
+    def _single_param_step(self, param, group, state):
+        """Per-parameter step for GradientHookOptimizer integration.
+
+        Uses the Python fallback path (per-parameter meta-net forward + AdamW).
+        """
+        if param.grad is None:
+            return
+        self._ensure_state()
+        pidx = self._param_to_idx.get(id(param))
+        if pidx is None:
+            return
+
+        self._flat_steps[pidx] += 1
+
+        # Initialize Mamba states if needed
+        if self._flat_mamba_fwd_states[pidx] is None:
+            d_inner = self.meta_net.mamba_fwd.d_inner
+            d_state = self.meta_net.d_state
+            self._flat_mamba_fwd_states[pidx] = torch.zeros(
+                d_inner, d_state, dtype=torch.float32, device=param.device)
+            self._flat_mamba_bwd_states[pidx] = torch.zeros(
+                d_inner, d_state, dtype=torch.float32, device=param.device)
+
+        base_alpha = self._cached_alpha
+        ramp = self._get_ramp_factor()
+        gate_signal = self._get_gate_signal()
+        lamb_eff = self.lamb * ramp * gate_signal
+        beta2 = group["betas"][1]
+        lr = group["lr"]
+        eps = group["eps"]
+        wd_eff = self._get_effective_wd(group["weight_decay"])
+
+        grad = param.grad.data
+        # Gradient clipping + NaN guard
+        gn = grad.norm()
+        if gn > self.gradient_clipping:
+            grad = grad * (self.gradient_clipping / (gn + 1e-12))
+        if not torch.isfinite(grad).all():
+            grad = torch.where(torch.isfinite(grad), grad, torch.zeros_like(grad))
+
+        alpha_i = max(0.0, min(1.0, base_alpha * self._flat_layer_alphas[pidx]))
+        beta1_i = self._flat_layer_beta1s[pidx]
+        step_i = self._flat_steps[pidx]
+        bc1 = 1.0 - beta1_i ** step_i
+        bc2 = 1.0 - beta2 ** step_i
+
+        flat_grad = grad.reshape(-1)
+        flat_sharp = self._flat_sharpness[pidx].reshape(-1)
+
+        smart_grad, new_gru, new_fwd, new_bwd = self.meta_net(
+            flat_grad, flat_sharp,
+            self._flat_gru_states[pidx],
+            self._flat_mamba_fwd_states[pidx],
+            self._flat_mamba_bwd_states[pidx])
+        self._flat_gru_states[pidx] = new_gru.detach()
+        self._flat_mamba_fwd_states[pidx] = new_fwd.detach()
+        self._flat_mamba_bwd_states[pidx] = new_bwd.detach()
+
+        mu = self._flat_mus[pidx]
+        mu.mul_(alpha_i).add_(grad.reshape(-1), alpha=1.0 - alpha_i)
+        effective_grad = smart_grad.reshape(-1) + lamb_eff * mu
+
+        fg = effective_grad.reshape(-1).float()
+        ea = self._flat_exp_avgs[pidx]
+        easq = self._flat_exp_avg_sqs[pidx]
+        ea.mul_(beta1_i).add_(fg, alpha=1 - beta1_i)
+        easq.mul_(beta2).addcmul_(fg, fg, value=1 - beta2)
+        step_size = lr / bc1
+        denom = (easq / bc2).sqrt().add_(eps)
+        param.data.mul_(1 - lr * wd_eff)
+        param.data.addcdiv_(ea.reshape(param.data.shape), denom.reshape(param.data.shape), value=-step_size)
+
     def get_global_step(self):
         return self._global_step
 

@@ -89,11 +89,11 @@ __global__ void fused_prodigy_step_kernel(
     stream_store(&exp_avg_sq[idx], easq);
 
     // -- 3. Bias-corrected step with weight decay -----------------------
-    const float denom = sqrtf(easq / bc2) + d_lr * eps;
+    const float rsqrt_v = fast_rsqrt_nr(easq / bc2);
 
     float p = static_cast<float>(param[idx]);
     p *= (1.0f - lr * d_lr * weight_decay);
-    p -= lr * ea / (bc1 * denom);
+    p -= lr * ea * rsqrt_v / (bc1 * (1.0f + d_lr * eps * rsqrt_v));
     param[idx] = static_cast<scalar_t>(p);
 }
 
@@ -153,10 +153,14 @@ __global__ void fused_prodigy_step_vec4_kernel(
     float d_lr_eps = d_lr * eps;
     float decay = 1.0f - lr * d_lr * weight_decay;
 
-    p.x = decay * p.x - lr * ea.x / (bc1 * (sqrtf(eas.x / bc2) + d_lr_eps));
-    p.y = decay * p.y - lr * ea.y / (bc1 * (sqrtf(eas.y / bc2) + d_lr_eps));
-    p.z = decay * p.z - lr * ea.z / (bc1 * (sqrtf(eas.z / bc2) + d_lr_eps));
-    p.w = decay * p.w - lr * ea.w / (bc1 * (sqrtf(eas.w / bc2) + d_lr_eps));
+    float rsqrt_x = fast_rsqrt_nr(eas.x / bc2);
+    float rsqrt_y = fast_rsqrt_nr(eas.y / bc2);
+    float rsqrt_z = fast_rsqrt_nr(eas.z / bc2);
+    float rsqrt_w = fast_rsqrt_nr(eas.w / bc2);
+    p.x = decay * p.x - lr * ea.x * rsqrt_x / (bc1 * (1.0f + d_lr_eps * rsqrt_x));
+    p.y = decay * p.y - lr * ea.y * rsqrt_y / (bc1 * (1.0f + d_lr_eps * rsqrt_y));
+    p.z = decay * p.z - lr * ea.z * rsqrt_z / (bc1 * (1.0f + d_lr_eps * rsqrt_z));
+    p.w = decay * p.w - lr * ea.w * rsqrt_w / (bc1 * (1.0f + d_lr_eps * rsqrt_w));
     param4[i] = p;
 }
 

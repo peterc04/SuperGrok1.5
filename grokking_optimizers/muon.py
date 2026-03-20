@@ -210,3 +210,16 @@ class Muon(Optimizer):
             eps,
             group["weight_decay"],
         )
+
+    def _single_param_step(self, param, group, state):
+        """Per-parameter step for GradientHookOptimizer integration."""
+        if param.grad is None:
+            return
+        if len(state) == 0:
+            state["momentum_buffer"] = torch.zeros_like(param, dtype=torch.float32)
+        _ops.muon_fused_step(
+            param, state["momentum_buffer"], param.grad,
+            group["lr"], group.get("momentum", 0.95),
+            group["weight_decay"], group.get("ns_steps", 5),
+            *group.get("ns_coeffs", (3.4445, -4.7750, 2.0315)),
+        )

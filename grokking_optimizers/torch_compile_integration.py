@@ -325,3 +325,269 @@ def _supergrok2_cpu_step_abstract(
         torch.empty_like(exp_avg_sq),  # updated exp_avg_sq
         torch.empty_like(gru_hidden),  # updated gru_hidden
     )
+
+
+# ===================================================================
+# 7. grokadamw_fused_step  --  GrokAdamW single-parameter step
+# ===================================================================
+
+supergrok_lib.define(
+    "grokadamw_fused_step("
+    "    Tensor param,"
+    "    Tensor grad,"
+    "    Tensor exp_avg,"
+    "    Tensor exp_avg_sq,"
+    "    Tensor ema,"
+    "    float alpha,"
+    "    float lamb,"
+    "    float beta1,"
+    "    float beta2,"
+    "    float lr,"
+    "    float weight_decay,"
+    "    float eps,"
+    "    float bc1,"
+    "    float bc2"
+    ") -> (Tensor, Tensor, Tensor, Tensor)"
+)
+
+
+def _grokadamw_fused_step_impl(
+    param, grad, exp_avg, exp_avg_sq, ema,
+    alpha, lamb, beta1, beta2, lr, weight_decay, eps, bc1, bc2,
+):
+    ops = get_ops()
+    ops.grokadamw_fused_step(
+        [param], [grad], [exp_avg], [exp_avg_sq], [ema],
+        alpha, lamb, beta1, beta2, lr, weight_decay, eps, bc1, bc2,
+    )
+    return param, exp_avg, exp_avg_sq, ema
+
+
+supergrok_lib.impl("grokadamw_fused_step", _grokadamw_fused_step_impl, "CUDA")
+
+
+@torch.library.register_fake("supergrok::grokadamw_fused_step")
+def _grokadamw_fused_step_abstract(
+    param, grad, exp_avg, exp_avg_sq, ema,
+    alpha, lamb, beta1, beta2, lr, weight_decay, eps, bc1, bc2,
+):
+    return (
+        torch.empty_like(param),
+        torch.empty_like(exp_avg),
+        torch.empty_like(exp_avg_sq),
+        torch.empty_like(ema),
+    )
+
+
+# ===================================================================
+# 8. lion_fused_step  --  Lion single-parameter step
+# ===================================================================
+
+supergrok_lib.define(
+    "lion_fused_step("
+    "    Tensor param,"
+    "    Tensor grad,"
+    "    Tensor exp_avg,"
+    "    float lr,"
+    "    float beta1,"
+    "    float beta2,"
+    "    float weight_decay"
+    ") -> (Tensor, Tensor)"
+)
+
+
+def _lion_fused_step_impl(param, grad, exp_avg, lr, beta1, beta2, weight_decay):
+    ops = get_ops()
+    ops.lion_fused_step([param], [grad], [exp_avg], lr, beta1, beta2, weight_decay)
+    return param, exp_avg
+
+
+supergrok_lib.impl("lion_fused_step", _lion_fused_step_impl, "CUDA")
+
+
+@torch.library.register_fake("supergrok::lion_fused_step")
+def _lion_fused_step_abstract(param, grad, exp_avg, lr, beta1, beta2, weight_decay):
+    return (torch.empty_like(param), torch.empty_like(exp_avg))
+
+
+# ===================================================================
+# 9. grokfast_fused_step  --  Grokfast EMA amplification
+# ===================================================================
+
+supergrok_lib.define(
+    "grokfast_fused_step("
+    "    Tensor grad,"
+    "    Tensor ema,"
+    "    float alpha,"
+    "    float lamb"
+    ") -> (Tensor, Tensor)"
+)
+
+
+def _grokfast_fused_step_impl(grad, ema, alpha, lamb):
+    ops = get_ops()
+    ops.grokfast_fused_step([grad], [ema], alpha, lamb)
+    return grad, ema
+
+
+supergrok_lib.impl("grokfast_fused_step", _grokfast_fused_step_impl, "CUDA")
+
+
+@torch.library.register_fake("supergrok::grokfast_fused_step")
+def _grokfast_fused_step_abstract(grad, ema, alpha, lamb):
+    return (torch.empty_like(grad), torch.empty_like(ema))
+
+
+# ===================================================================
+# 10. prodigy_fused_step  --  Prodigy per-element step
+# ===================================================================
+
+supergrok_lib.define(
+    "prodigy_fused_step("
+    "    Tensor param,"
+    "    Tensor grad,"
+    "    Tensor exp_avg,"
+    "    Tensor exp_avg_sq,"
+    "    Tensor s,"
+    "    float d_lr,"
+    "    float beta1,"
+    "    float beta2,"
+    "    float lr,"
+    "    float weight_decay,"
+    "    float eps,"
+    "    float bc1,"
+    "    float bc2"
+    ") -> (Tensor, Tensor, Tensor, Tensor)"
+)
+
+
+def _prodigy_fused_step_impl(
+    param, grad, exp_avg, exp_avg_sq, s,
+    d_lr, beta1, beta2, lr, weight_decay, eps, bc1, bc2,
+):
+    ops = get_ops()
+    ops.prodigy_fused_step(
+        [param], [grad], [exp_avg], [exp_avg_sq], [s],
+        d_lr, beta1, beta2, lr, weight_decay, eps, bc1, bc2,
+    )
+    return param, exp_avg, exp_avg_sq, s
+
+
+supergrok_lib.impl("prodigy_fused_step", _prodigy_fused_step_impl, "CUDA")
+
+
+@torch.library.register_fake("supergrok::prodigy_fused_step")
+def _prodigy_fused_step_abstract(
+    param, grad, exp_avg, exp_avg_sq, s,
+    d_lr, beta1, beta2, lr, weight_decay, eps, bc1, bc2,
+):
+    return (
+        torch.empty_like(param),
+        torch.empty_like(exp_avg),
+        torch.empty_like(exp_avg_sq),
+        torch.empty_like(s),
+    )
+
+
+# ===================================================================
+# 11. neuralgrok_fused_full_step  --  NeuralGrok amplifier + Adam
+# ===================================================================
+
+supergrok_lib.define(
+    "neuralgrok_fused_full_step("
+    "    Tensor param,"
+    "    Tensor grad,"
+    "    Tensor exp_avg,"
+    "    Tensor exp_avg_sq,"
+    "    Tensor W1,"
+    "    Tensor b1,"
+    "    Tensor W2,"
+    "    Tensor b2,"
+    "    float alpha_amp,"
+    "    float beta_amp,"
+    "    int hidden_dim,"
+    "    float beta1,"
+    "    float beta2,"
+    "    float lr,"
+    "    float weight_decay,"
+    "    float eps,"
+    "    float bc1,"
+    "    float bc2"
+    ") -> (Tensor, Tensor, Tensor)"
+)
+
+
+def _neuralgrok_fused_full_step_impl(
+    param, grad, exp_avg, exp_avg_sq,
+    W1, b1, W2, b2,
+    alpha_amp, beta_amp, hidden_dim,
+    beta1, beta2, lr, weight_decay, eps, bc1, bc2,
+):
+    ops = get_ops()
+    ops.neuralgrok_fused_full_step(
+        [param], [grad], [exp_avg], [exp_avg_sq],
+        W1, b1, W2, b2,
+        alpha_amp, beta_amp, hidden_dim,
+        beta1, beta2, lr, weight_decay, eps, bc1, bc2,
+    )
+    return param, exp_avg, exp_avg_sq
+
+
+supergrok_lib.impl("neuralgrok_fused_full_step", _neuralgrok_fused_full_step_impl, "CUDA")
+
+
+@torch.library.register_fake("supergrok::neuralgrok_fused_full_step")
+def _neuralgrok_fused_full_step_abstract(
+    param, grad, exp_avg, exp_avg_sq,
+    W1, b1, W2, b2,
+    alpha_amp, beta_amp, hidden_dim,
+    beta1, beta2, lr, weight_decay, eps, bc1, bc2,
+):
+    return (
+        torch.empty_like(param),
+        torch.empty_like(exp_avg),
+        torch.empty_like(exp_avg_sq),
+    )
+
+
+# ===================================================================
+# 12. muon_fused_step  --  Muon momentum + NS + update
+# ===================================================================
+
+supergrok_lib.define(
+    "muon_fused_step("
+    "    Tensor param,"
+    "    Tensor momentum_buffer,"
+    "    Tensor grad,"
+    "    float lr,"
+    "    float momentum,"
+    "    float weight_decay,"
+    "    int ns_steps,"
+    "    float a,"
+    "    float b,"
+    "    float c"
+    ") -> (Tensor, Tensor)"
+)
+
+
+def _muon_fused_step_impl(
+    param, momentum_buffer, grad,
+    lr, momentum, weight_decay, ns_steps, a, b, c,
+):
+    ops = get_ops()
+    ops.muon_fused_step(
+        param, momentum_buffer, grad,
+        lr, momentum, weight_decay, ns_steps, a, b, c,
+    )
+    return param, momentum_buffer
+
+
+supergrok_lib.impl("muon_fused_step", _muon_fused_step_impl, "CUDA")
+
+
+@torch.library.register_fake("supergrok::muon_fused_step")
+def _muon_fused_step_abstract(
+    param, momentum_buffer, grad,
+    lr, momentum, weight_decay, ns_steps, a, b, c,
+):
+    return (torch.empty_like(param), torch.empty_like(momentum_buffer))
