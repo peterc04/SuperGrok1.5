@@ -141,16 +141,14 @@ class Prodigy(Optimizer):
             state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
             state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
             state["s"] = torch.zeros_like(param, dtype=torch.float32)
-            state["param_init"] = param.data.clone()
+            state["param_init"] = param.data.clone().float()
         state["step"] += 1
-        bc1 = 1 - group["betas"][0] ** state["step"]
-        bc2 = 1 - group["betas"][1] ** state["step"]
-        d_lr = getattr(self, '_d_lr', 1.0)
-        _ops.prodigy_fused_step(
+        self._d_lr = _ops.prodigy_fused_step(
             [param], [param.grad], [state["exp_avg"]], [state["exp_avg_sq"]],
-            [state["s"]], d_lr,
+            [state["s"]], [state["param_init"]], [state["step"]],
+            getattr(self, '_d_lr', 1e-6),
             group["betas"][0], group["betas"][1], group["lr"],
-            group["weight_decay"], group["eps"], bc1, bc2,
+            group["weight_decay"], group["eps"],
         )
 
     @property
