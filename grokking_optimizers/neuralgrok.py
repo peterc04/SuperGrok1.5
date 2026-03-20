@@ -246,14 +246,14 @@ class NeuralGrok(Optimizer):
         bc2 = 1 - group["betas"][1] ** state["step"]
         # Use the fused full-step kernel with cached amplifier weights
         amp = self.amplifier
-        W1 = amp.layers[0].weight.data
-        b1 = amp.layers[0].bias.data
-        W2 = amp.layers[-1].weight.data
-        b2 = amp.layers[-1].bias.data
+        W1 = amp.net[0].weight.data
+        b1 = amp.net[0].bias.data
+        W2 = amp.net[-1].weight.data
+        b2 = amp.net[-1].bias.data
         _ops.neuralgrok_fused_full_step(
             [param], [param.grad], [state["exp_avg"]], [state["exp_avg_sq"]],
             W1, b1, W2, b2, group["alpha"], group["beta"],
-            group["hidden_dim"], group["betas"][0], group["betas"][1],
+            amp.hidden_dim, group["betas"][0], group["betas"][1],
             group["lr"], group["weight_decay"], group["eps"], bc1, bc2,
         )
 

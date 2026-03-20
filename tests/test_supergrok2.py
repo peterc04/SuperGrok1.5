@@ -145,17 +145,13 @@ def test_12c_forward_step():
     for n, p in model.named_parameters():
         assert torch.isfinite(p).all(), f"NaN/Inf in param {n}"
 
-    # Optimizer state should be populated
-    for group in opt.param_groups:
-        for p in group["params"]:
-            state = opt.state[p]
-            if p.numel() == 0:
-                continue
-            assert "exp_avg" in state, "exp_avg missing from state"
-            assert "exp_avg_sq" in state, "exp_avg_sq missing from state"
-            assert "mu" in state, "mu missing from state"
-            # exp_avg should not be all zeros after one step
-            assert state["exp_avg"].abs().sum() > 0, "exp_avg is all zeros"
+    # Optimizer state should be populated (SuperGrok2 uses flat lists, not state dict)
+    assert len(opt._flat_exp_avgs) > 0, "exp_avg list empty"
+    assert len(opt._flat_exp_avg_sqs) > 0, "exp_avg_sq list empty"
+    assert len(opt._flat_mus) > 0, "mu list empty"
+    # exp_avg should not be all zeros after one step
+    assert any(ea.abs().sum() > 0 for ea in opt._flat_exp_avgs), \
+        "All exp_avg tensors are zeros"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -246,15 +242,11 @@ def test_12f_expert_recycling():
         assert torch.isfinite(p).all(), \
             f"NaN/Inf in param {n} after 50 steps"
 
-    # Check optimizer state is healthy
-    for group in opt.param_groups:
-        for p in group["params"]:
-            state = opt.state[p]
-            if "exp_avg" in state:
-                assert torch.isfinite(state["exp_avg"]).all(), \
-                    "NaN/Inf in exp_avg"
-                assert torch.isfinite(state["exp_avg_sq"]).all(), \
-                    "NaN/Inf in exp_avg_sq"
+    # Check optimizer state is healthy (SuperGrok2 uses flat lists)
+    for ea in opt._flat_exp_avgs:
+        assert torch.isfinite(ea).all(), "NaN/Inf in exp_avg"
+    for easq in opt._flat_exp_avg_sqs:
+        assert torch.isfinite(easq).all(), "NaN/Inf in exp_avg_sq"
 
 
 # ═══════════════════════════════════════════════════════════════════

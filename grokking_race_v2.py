@@ -671,9 +671,6 @@ def train_supergrok(c, init, tx, ty, vx, vy, dev, bp=0):
             _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
             if _has_inf:
                 scaler.update(); continue
-        train_loss_val=loss.item()
-        with torch.no_grad():
-            train_acc=(logits.detach()[:,:c["p"]].argmax(-1)==ty).float().mean().item()
         if step%muf==0:
             try: opt.meta_step(m, vx, vy, crit_sg, mopt)
             except Exception as e: warnings.warn(f"SuperGrok meta_step failed at step {step}: {e}")
@@ -682,11 +679,19 @@ def train_supergrok(c, init, tx, ty, vx, vy, dev, bp=0):
         if hasattr(opt, 'sam_step') and step % sam_freq == 0 and opt._get_effective_sam_freq() < 999999:
             try: opt.sam_step(m, tx, ty, crit_sg)
             except Exception as e: warnings.warn(f"SuperGrok sam_step failed at step {step}: {e}")
-        kw={"train_loss":train_loss_val, "train_acc":train_acc}
-        if step%c.get("supergrok_alpha_update_freq",50)==0:
+        # Deferred metrics — only compute .item() when needed
+        alpha_freq=c.get("supergrok_alpha_update_freq",50)
+        kw={}
+        needs_metrics=(step%alpha_freq==0) or (step%c["log_every"]==0) or step==1
+        if needs_metrics:
             with torch.no_grad():
-                vl_sg=F.cross_entropy(m(vx),vy).item()
-            kw["val_loss"]=vl_sg
+                train_loss_val=loss.item()
+                train_acc=(logits.detach()[:,:c["p"]].argmax(-1)==ty).float().mean().item()
+            kw["train_loss"]=train_loss_val; kw["train_acc"]=train_acc
+            if step%alpha_freq==0:
+                with torch.no_grad():
+                    vl_sg=F.cross_entropy(m(vx),vy).item()
+                kw["val_loss"]=vl_sg
         try: opt.step(**kw)
         except TypeError: opt.step()
         scaler.update()
