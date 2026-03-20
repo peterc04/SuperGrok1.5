@@ -145,3 +145,25 @@ class Grokfast(Optimizer):
             )
 
         return loss
+
+    def _single_param_step(self, param, group, state):
+        """Per-parameter step for GradientHookOptimizer integration."""
+        if param.grad is None:
+            return
+        if len(state) == 0:
+            state["step"] = 0
+            state["ema"] = torch.zeros_like(param, dtype=torch.float32)
+            state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
+            state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
+        state["step"] += 1
+        # Phase 1: Grokfast EMA amplification
+        _ops.grokfast_fused_step(
+            [param.grad], [state["ema"]],
+            group["grokfast_alpha"], group["grokfast_lamb"],
+        )
+        # Phase 2: AdamW
+        adamw_step(
+            [param], [param.grad], [state["exp_avg"]], [state["exp_avg_sq"]],
+            [state["step"]], group["lr"], group["betas"][0], group["betas"][1],
+            group["eps"], group["weight_decay"],
+        )

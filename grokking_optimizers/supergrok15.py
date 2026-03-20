@@ -421,6 +421,43 @@ class SuperGrok15(Optimizer):
         val_loss = self.bilevel_step(model, train_x, train_y, val_x, val_y, criterion, meta_optimizer)
         return sam_loss, val_loss
 
+    def _single_param_step(self, param, group, state):
+        """Per-parameter step for GradientHookOptimizer integration."""
+        if param.grad is None:
+            return
+        self._ensure_state()
+        pidx = self._param_to_idx.get(id(param))
+        if pidx is None:
+            return
+        self._flat_steps[pidx] += 1
+        base_alpha = self._cached_alpha
+        ramp = self._get_ramp_factor()
+        layer_alpha = max(0.0, min(1.0, base_alpha * self._flat_layer_alphas[pidx]))
+        wd_eff = self._get_effective_wd(group["weight_decay"])
+        gate_signal = self._get_gate_signal()
+
+        if self._weights_dirty:
+            self._cached_weights = self.meta_net.get_weights()
+            self._weights_dirty = False
+        W1, b1, W2, b2, rescale = self._cached_weights
+
+        ops_impl = _ops if param.is_cuda else _ops_cpu
+        ops_impl.supergrok15_fused_step(
+            [param.data],
+            [param.grad.data],
+            [self._flat_exp_avgs[pidx]],
+            [self._flat_exp_avg_sqs[pidx]],
+            [self._flat_mus[pidx]],
+            [self._flat_sharpness[pidx]],
+            [self._flat_steps[pidx]],
+            [layer_alpha],
+            [self._flat_layer_beta1s[pidx]],
+            W1, b1, W2, b2, rescale, self.meta_hidden_dim,
+            group["betas"][1], group["lr"], wd_eff, group["eps"],
+            self.lamb, ramp, gate_signal,
+            self.gradient_clipping,
+        )
+
     def get_global_step(self):
         return self._global_step
 

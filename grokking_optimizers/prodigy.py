@@ -132,6 +132,27 @@ class Prodigy(Optimizer):
 
         return loss
 
+    def _single_param_step(self, param, group, state):
+        """Per-parameter step for GradientHookOptimizer integration."""
+        if param.grad is None:
+            return
+        if len(state) == 0:
+            state["step"] = 0
+            state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
+            state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
+            state["s"] = torch.zeros_like(param, dtype=torch.float32)
+            state["param_init"] = param.data.clone()
+        state["step"] += 1
+        bc1 = 1 - group["betas"][0] ** state["step"]
+        bc2 = 1 - group["betas"][1] ** state["step"]
+        d_lr = getattr(self, '_d_lr', 1.0)
+        _ops.prodigy_fused_step(
+            [param], [param.grad], [state["exp_avg"]], [state["exp_avg_sq"]],
+            [state["s"]], d_lr,
+            group["betas"][0], group["betas"][1], group["lr"],
+            group["weight_decay"], group["eps"], bc1, bc2,
+        )
+
     @property
     def d_lr(self) -> float:
         """Current adaptive learning rate estimated by Prodigy."""

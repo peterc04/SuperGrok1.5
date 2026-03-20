@@ -84,11 +84,11 @@ __global__ void fused_grokadamw_step_kernel(
 
     // -- 4. Bias-corrected Adam step with decoupled weight decay --------
     const float step_size = lr / bc1;
-    const float denom = sqrtf(easq / bc2) + eps;
+    const float rsqrt_v = fast_rsqrt_nr(easq / bc2);
 
     float p = static_cast<float>(param[idx]);
     p *= (1.0f - lr * weight_decay);
-    p -= step_size * ea / denom;
+    p -= step_size * ea * rsqrt_v / (1.0f + eps * rsqrt_v);
     param[idx] = static_cast<scalar_t>(p);
 }
 
@@ -148,10 +148,14 @@ __global__ void fused_grokadamw_step_vec4_kernel(
     // Step
     float step_size = lr / bc1;
     float decay = 1.0f - lr * weight_decay;
-    p.x = decay * p.x - step_size * ea.x / (sqrtf(eas.x / bc2) + eps);
-    p.y = decay * p.y - step_size * ea.y / (sqrtf(eas.y / bc2) + eps);
-    p.z = decay * p.z - step_size * ea.z / (sqrtf(eas.z / bc2) + eps);
-    p.w = decay * p.w - step_size * ea.w / (sqrtf(eas.w / bc2) + eps);
+    float rsqrt_x = fast_rsqrt_nr(eas.x / bc2);
+    float rsqrt_y = fast_rsqrt_nr(eas.y / bc2);
+    float rsqrt_z = fast_rsqrt_nr(eas.z / bc2);
+    float rsqrt_w = fast_rsqrt_nr(eas.w / bc2);
+    p.x = decay * p.x - step_size * ea.x * rsqrt_x / (1.0f + eps * rsqrt_x);
+    p.y = decay * p.y - step_size * ea.y * rsqrt_y / (1.0f + eps * rsqrt_y);
+    p.z = decay * p.z - step_size * ea.z * rsqrt_z / (1.0f + eps * rsqrt_z);
+    p.w = decay * p.w - step_size * ea.w * rsqrt_w / (1.0f + eps * rsqrt_w);
     param4[i] = p;
 }
 
@@ -230,10 +234,10 @@ __global__ void fused_grokadamw_step_q3_kernel(
 
     // Adam step (computed in full FP32 precision)
     float step_size = lr / bc1;
-    float denom = sqrtf(easq / bc2) + eps;
+    float rsqrt_v = fast_rsqrt_nr(easq / bc2);
     float p = static_cast<float>(param[idx]);
     p *= (1.0f - lr * weight_decay);
-    p -= step_size * ea / denom;
+    p -= step_size * ea * rsqrt_v / (1.0f + eps * rsqrt_v);
     param[idx] = static_cast<scalar_t>(p);
 }
 
@@ -335,4 +339,151 @@ void launch_fused_grokadamw_step_q3(
             alpha, lamb, beta1, beta2, lr, weight_decay, eps, bc1, bc2,
             static_cast<unsigned>(global_step), N);
     }));
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Two-phase fused grad clipping + optimizer step
+//  Phase 1: Cooperative norm reduction (all blocks)
+//  Phase 2: Clip + fused GrokAdamW step
+//  Eliminates host-side grad clipping via ATen
+// ═══════════════════════════════════════════════════════════════════════
+
+__launch_bounds__(256, 4)
+__global__ void fused_grokadamw_clip_step_kernel(
+    float* __restrict__ param,
+    float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq,
+    float* __restrict__ ema,
+    const float* __restrict__ grad,
+    const float alpha, const float lamb,
+    const float beta1, const float beta2,
+    const float lr, const float weight_decay,
+    const float eps, const float bc1, const float bc2,
+    const float clip_threshold,
+    float* __restrict__ grad_norm_sq_global,  // [1] atomic accumulator
+    int* __restrict__ phase_counter,           // [1] for last-block detection
+    const int N,
+    const int total_blocks
+) {
+    __shared__ float s_partial[8];
+
+    // ── Phase 1: Compute gradient norm² ──────────────────────────────
+    float local_sq = 0.0f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += gridDim.x * blockDim.x) {
+        float g = grad[i];
+        local_sq += g * g;
+    }
+
+    // Warp reduction
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_sq += __shfl_down_sync(0xFFFFFFFF, local_sq, offset);
+
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+    if (lane_id == 0) s_partial[warp_id] = local_sq;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float block_sum = 0.0f;
+        int nw = (blockDim.x + 31) / 32;
+        for (int w = 0; w < nw; w++) block_sum += s_partial[w];
+        atomicAdd(grad_norm_sq_global, block_sum);
+    }
+
+    // Last-block detection
+    __shared__ bool s_is_last;
+    if (threadIdx.x == 0) {
+        int finished = atomicAdd(phase_counter, 1) + 1;
+        s_is_last = (finished == total_blocks);
+    }
+    __syncthreads();
+
+    // Only the last block computes the final norm (ensures all blocks contributed)
+    __shared__ float s_clip_scale;
+    if (s_is_last && threadIdx.x == 0) {
+        float norm = sqrtf(*grad_norm_sq_global);
+        s_clip_scale = (norm > clip_threshold) ? (clip_threshold / (norm + 1e-12f)) : 1.0f;
+    }
+    // All blocks need the clip scale — but only the last block has it.
+    // Use __threadfence() + second atomic for a lightweight broadcast.
+    // For simplicity, we do Phase 2 only in the last block's relaunch.
+    // Actually, let's just do a simpler 2-kernel approach encoded as one function.
+
+    if (!s_is_last) return;
+    __syncthreads();
+    float clip_scale = s_clip_scale;
+
+    // ── Phase 2: Clipped GrokAdamW step (grid-stride from last block) ─
+    for (int idx = threadIdx.x; idx < N; idx += blockDim.x) {
+        float g = grad[idx] * clip_scale;
+        float e = ema[idx];
+
+        float filtered = alpha * e + (1.0f - alpha) * g;
+        ema[idx] = filtered;
+
+        float amplified = g + lamb * filtered;
+
+        float ea_old = exp_avg[idx];
+        float easq_old = exp_avg_sq[idx];
+
+        float ea = beta1 * ea_old + (1.0f - beta1) * amplified;
+        float easq = beta2 * easq_old + (1.0f - beta2) * amplified * amplified;
+
+        exp_avg[idx] = ea;
+        exp_avg_sq[idx] = easq;
+
+        float step_size = lr / bc1;
+        float rsqrt_v = fast_rsqrt_nr(easq / bc2);
+        float p = param[idx];
+        p *= (1.0f - lr * weight_decay);
+        p -= step_size * ea * rsqrt_v / (1.0f + eps * rsqrt_v);
+        param[idx] = p;
+    }
+}
+
+void launch_fused_grokadamw_clip_step(
+    torch::Tensor param,
+    torch::Tensor exp_avg,
+    torch::Tensor exp_avg_sq,
+    torch::Tensor ema,
+    torch::Tensor grad,
+    float alpha, float lamb,
+    float beta1, float beta2,
+    float lr, float weight_decay,
+    float eps, float bc1, float bc2,
+    float clip_threshold
+) {
+    const int N = param.numel();
+    if (N == 0) return;
+
+    // Only works for FP32 (fused path)
+    if (param.scalar_type() != at::ScalarType::Float) {
+        // Fallback: clip on host, then call regular kernel
+        auto gn = grad.norm();
+        if (gn.item<float>() > clip_threshold) {
+            grad = grad * (clip_threshold / (gn + 1e-8f));
+        }
+        launch_fused_grokadamw_step(param, exp_avg, exp_avg_sq, ema, grad,
+            alpha, lamb, beta1, beta2, lr, weight_decay, eps, bc1, bc2);
+        return;
+    }
+
+    int grid = std::min((N + GROKADAMW_BLOCK_SIZE - 1) / GROKADAMW_BLOCK_SIZE, 1024);
+    auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(param.device());
+    auto grad_norm_sq = torch::zeros({1}, opts);
+    auto phase_counter = torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt32).device(param.device()));
+
+    fused_grokadamw_clip_step_kernel<<<grid, GROKADAMW_BLOCK_SIZE>>>(
+        param.data_ptr<float>(),
+        exp_avg.data_ptr<float>(),
+        exp_avg_sq.data_ptr<float>(),
+        ema.data_ptr<float>(),
+        grad.data_ptr<float>(),
+        alpha, lamb, beta1, beta2, lr, weight_decay, eps, bc1, bc2,
+        clip_threshold,
+        grad_norm_sq.data_ptr<float>(),
+        phase_counter.data_ptr<int32_t>(),
+        N, grid);
 }

@@ -247,3 +247,22 @@ class LookSAM(Optimizer):
         """Return ``True`` if SAM should be applied at the current step."""
         k = self.param_groups[0]["k"]
         return self._global_step % k == 0
+
+    def _single_param_step(self, param, group, state):
+        """Per-parameter step for GradientHookOptimizer integration.
+
+        Performs the AdamW step only (SAM perturbation must be done separately).
+        """
+        if param.grad is None:
+            return
+        if len(state) == 0:
+            state["step"] = 0
+            state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
+            state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
+        state["step"] += 1
+        from grokking_optimizers._adamw_helper import adamw_step
+        adamw_step(
+            [param], [param.grad], [state["exp_avg"]], [state["exp_avg_sq"]],
+            [state["step"]], group["lr"], group["betas"][0], group["betas"][1],
+            group["eps"], group["weight_decay"],
+        )

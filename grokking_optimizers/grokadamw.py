@@ -144,3 +144,27 @@ class GrokAdamW(Optimizer):
             )
 
         return loss
+
+    def _single_param_step(self, param, group, state):
+        """Per-parameter step for GradientHookOptimizer integration."""
+        if param.grad is None:
+            return
+        if len(state) == 0:
+            state["step"] = 0
+            state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
+            state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
+            state["ema"] = torch.zeros_like(param, dtype=torch.float32)
+        state["step"] += 1
+        bc1 = 1 - group["betas"][0] ** state["step"]
+        bc2 = 1 - group["betas"][1] ** state["step"]
+        grad = param.grad
+        if group.get("grad_clip", 0) > 0:
+            gn = grad.norm()
+            if gn > group["grad_clip"]:
+                grad = grad * (group["grad_clip"] / (gn + 1e-8))
+        _ops.grokadamw_fused_step(
+            [param], [grad], [state["exp_avg"]], [state["exp_avg_sq"]],
+            [state["ema"]], group["alpha"], group["lamb"],
+            group["betas"][0], group["betas"][1], group["lr"],
+            group["weight_decay"], group["eps"], bc1, bc2,
+        )

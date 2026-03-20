@@ -33,6 +33,7 @@ GROKADAMW_Q4_HEADER = r"""/*
 #include <torch/extension.h>
 #include "platform.h"
 #include "types.h"
+#include "utils.cuh"
 
 #include <cuda_bf16.h>
 
@@ -164,10 +165,10 @@ __global__ void grokadamw_q4_scalar_kernel(
 
     // 7. Adam step with decoupled weight decay
     const float step_size = lr / bc1;
-    const float denom = sqrtf(easq / bc2) + eps;
+    const float rsqrt_v = fast_rsqrt_nr(easq / bc2);
     float p = static_cast<float>(param[idx]);
     p *= (1.0f - lr * wd);
-    p -= step_size * ea / denom;
+    p -= step_size * ea * rsqrt_v / (1.0f + eps * rsqrt_v);
     param[idx] = static_cast<scalar_t>(p);
 }
 """
@@ -315,10 +316,10 @@ __global__ void grokadamw_q4_vec4_kernel(
     const float step_size = lr / bc1;
     const float decay = 1.0f - lr * wd;
 
-    p.x = decay * p.x - step_size * ea_x / (sqrtf(esq_x / bc2) + eps);
-    p.y = decay * p.y - step_size * ea_y / (sqrtf(esq_y / bc2) + eps);
-    p.z = decay * p.z - step_size * ea_z / (sqrtf(esq_z / bc2) + eps);
-    p.w = decay * p.w - step_size * ea_w / (sqrtf(esq_w / bc2) + eps);
+    { float rv = fast_rsqrt_nr(esq_x / bc2); p.x = decay * p.x - step_size * ea_x * rv / (1.0f + eps * rv); }
+    { float rv = fast_rsqrt_nr(esq_y / bc2); p.y = decay * p.y - step_size * ea_y * rv / (1.0f + eps * rv); }
+    { float rv = fast_rsqrt_nr(esq_z / bc2); p.z = decay * p.z - step_size * ea_z * rv / (1.0f + eps * rv); }
+    { float rv = fast_rsqrt_nr(esq_w / bc2); p.w = decay * p.w - step_size * ea_w * rv / (1.0f + eps * rv); }
     param4[i] = p;
 }
 """

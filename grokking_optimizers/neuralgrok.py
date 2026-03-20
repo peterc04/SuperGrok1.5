@@ -233,6 +233,30 @@ class NeuralGrok(Optimizer):
         """Return the gradient amplifier module."""
         return self.amplifier
 
+    def _single_param_step(self, param, group, state):
+        """Per-parameter step for GradientHookOptimizer integration."""
+        if param.grad is None:
+            return
+        if len(state) == 0:
+            state["step"] = 0
+            state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
+            state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
+        state["step"] += 1
+        bc1 = 1 - group["betas"][0] ** state["step"]
+        bc2 = 1 - group["betas"][1] ** state["step"]
+        # Use the fused full-step kernel with cached amplifier weights
+        amp = self.amplifier
+        W1 = amp.layers[0].weight.data
+        b1 = amp.layers[0].bias.data
+        W2 = amp.layers[-1].weight.data
+        b2 = amp.layers[-1].bias.data
+        _ops.neuralgrok_fused_full_step(
+            [param], [param.grad], [state["exp_avg"]], [state["exp_avg_sq"]],
+            W1, b1, W2, b2, group["alpha"], group["beta"],
+            group["hidden_dim"], group["betas"][0], group["betas"][1],
+            group["lr"], group["weight_decay"], group["eps"], bc1, bc2,
+        )
+
     def get_amplifier_optimizer(self, lr: float = 1e-4) -> torch.optim.Adam:
         """Create an Adam optimiser for the amplifier's parameters.
 

@@ -145,11 +145,11 @@ __global__ void fused_neuralgrok_adam_kernel(
 
     // -- Bias-corrected step with decoupled weight decay ----------------
     const float step_size = lr / bc1;
-    const float denom = sqrtf(easq / bc2) + eps;
+    const float rsqrt_v = fast_rsqrt_nr(easq / bc2);
 
     float p = static_cast<float>(param[idx]);
     p *= (1.0f - lr * weight_decay);
-    p -= step_size * ea / denom;
+    p -= step_size * ea * rsqrt_v / (1.0f + eps * rsqrt_v);
     param[idx] = static_cast<scalar_t>(p);
 }
 
@@ -190,10 +190,14 @@ __global__ void fused_neuralgrok_adam_vec4_kernel(
     float step_size = lr / bc1;
     float decay = 1.0f - lr * weight_decay;
     float4 p = param4[i];
-    p.x = decay * p.x - step_size * ea.x / (sqrtf(eas.x / bc2) + eps);
-    p.y = decay * p.y - step_size * ea.y / (sqrtf(eas.y / bc2) + eps);
-    p.z = decay * p.z - step_size * ea.z / (sqrtf(eas.z / bc2) + eps);
-    p.w = decay * p.w - step_size * ea.w / (sqrtf(eas.w / bc2) + eps);
+    float rsqrt_x = fast_rsqrt_nr(eas.x / bc2);
+    float rsqrt_y = fast_rsqrt_nr(eas.y / bc2);
+    float rsqrt_z = fast_rsqrt_nr(eas.z / bc2);
+    float rsqrt_w = fast_rsqrt_nr(eas.w / bc2);
+    p.x = decay * p.x - step_size * ea.x * rsqrt_x / (1.0f + eps * rsqrt_x);
+    p.y = decay * p.y - step_size * ea.y * rsqrt_y / (1.0f + eps * rsqrt_y);
+    p.z = decay * p.z - step_size * ea.z * rsqrt_z / (1.0f + eps * rsqrt_z);
+    p.w = decay * p.w - step_size * ea.w * rsqrt_w / (1.0f + eps * rsqrt_w);
     param4[i] = p;
 }
 
@@ -387,11 +391,91 @@ __global__ void fused_neuralgrok_full_step_kernel(
     stream_store(&exp_avg_sq[idx], easq);
 
     const float step_size = lr / bc1;
-    const float denom = sqrtf(easq / bc2) + eps;
+    const float rsqrt_v = fast_rsqrt_nr(easq / bc2);
 
     float p = static_cast<float>(param[idx]);
     p *= (1.0f - lr * weight_decay);
-    p -= step_size * ea / denom;
+    p -= step_size * ea * rsqrt_v / (1.0f + eps * rsqrt_v);
+    param[idx] = static_cast<scalar_t>(p);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Template-specialized fused kernel — H as compile-time constant
+//  enables #pragma unroll to fully unroll the MLP inner loop.
+// ═══════════════════════════════════════════════════════════════════════
+
+template <typename scalar_t, int H>
+__launch_bounds__(256, 8)
+__global__ void fused_neuralgrok_full_step_templated_kernel(
+    scalar_t* __restrict__ param,
+    float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq,
+    const scalar_t* __restrict__ grad,
+    const float* __restrict__ W1,
+    const float* __restrict__ b1,
+    const float* __restrict__ W2,
+    const float* __restrict__ b2,
+    const float alpha,
+    const float beta,
+    const int N,
+    const float beta1,
+    const float beta2,
+    const float lr,
+    const float weight_decay,
+    const float eps,
+    const float bc1,
+    const float bc2
+) {
+    extern __shared__ char smem_raw[];
+    float* smem = reinterpret_cast<float*>(smem_raw);
+    float* sW1 = smem;
+    float* sb1 = sW1 + H;
+    float* sW2 = sb1 + H;
+    float* sb2 = sW2 + H;
+
+    const int tid = threadIdx.x;
+
+    #pragma unroll
+    for (int i = tid; i < H; i += blockDim.x) sW1[i] = W1[i];
+    #pragma unroll
+    for (int i = tid; i < H; i += blockDim.x) sb1[i] = b1[i];
+    #pragma unroll
+    for (int i = tid; i < H; i += blockDim.x) sW2[i] = W2[i];
+    if (tid == 0) sb2[0] = b2[0];
+    __syncthreads();
+
+    const int idx = blockIdx.x * blockDim.x + tid;
+    if (idx >= N) return;
+
+    const float g = static_cast<float>(grad[idx]);
+
+    // MLP with compile-time unrolled loop
+    float mlp_out = sb2[0];
+    #pragma unroll
+    for (int h = 0; h < H; h++) {
+        float z = sW1[h] * g + sb1[h];
+        z = fmaxf(z, 0.0f);  // ReLU
+        mlp_out += sW2[h] * z;
+    }
+
+    const float ag = g * (alpha * mlp_out + beta);
+
+    const float ea_old = stream_load(&exp_avg[idx]);
+    const float easq_old = stream_load(&exp_avg_sq[idx]);
+
+    const float ea = beta1 * ea_old + (1.0f - beta1) * ag;
+    const float easq = beta2 * easq_old + (1.0f - beta2) * ag * ag;
+
+    stream_store(&exp_avg[idx], ea);
+    stream_store(&exp_avg_sq[idx], easq);
+
+    const float step_size = lr / bc1;
+    const float rsqrt_v = fast_rsqrt_nr(easq / bc2);
+
+    float p = static_cast<float>(param[idx]);
+    p *= (1.0f - lr * weight_decay);
+    p -= step_size * ea * rsqrt_v / (1.0f + eps * rsqrt_v);
     param[idx] = static_cast<scalar_t>(p);
 }
 
@@ -422,6 +506,34 @@ void launch_fused_neuralgrok_full_step(
     auto b1_f = b1.dtype() == torch::kFloat32 ? b1.contiguous() : b1.to(torch::kFloat32).contiguous();
     auto W2_f = W2.dtype() == torch::kFloat32 ? W2.contiguous() : W2.to(torch::kFloat32).contiguous();
     auto b2_f = b2.dtype() == torch::kFloat32 ? b2.contiguous() : b2.to(torch::kFloat32).contiguous();
+
+    // Dispatch to templated kernel for common H values (enables full unrolling)
+    #define NEURALGROK_DISPATCH_H(H_VAL) \
+        case H_VAL: { \
+            AT_DISPATCH_FLOATING_TYPES_AND2( \
+                at::ScalarType::Half, at::ScalarType::BFloat16, \
+                param.scalar_type(), "fused_neuralgrok_full_step_t" #H_VAL, ([&] { \
+                fused_neuralgrok_full_step_templated_kernel<scalar_t, H_VAL><<<grid, NEURALGROK_BLOCK_SIZE, smem_bytes>>>( \
+                    param.data_ptr<scalar_t>(), \
+                    exp_avg.data_ptr<float>(), \
+                    exp_avg_sq.data_ptr<float>(), \
+                    grad.data_ptr<scalar_t>(), \
+                    W1_f.data_ptr<float>(), b1_f.data_ptr<float>(), \
+                    W2_f.data_ptr<float>(), b2_f.data_ptr<float>(), \
+                    alpha_amp, beta_amp, N, \
+                    beta1, beta2, lr, weight_decay, eps, bc1, bc2); \
+            })); \
+            return; \
+        }
+
+    switch (hidden_dim) {
+        NEURALGROK_DISPATCH_H(16)
+        NEURALGROK_DISPATCH_H(32)
+        NEURALGROK_DISPATCH_H(64)
+        NEURALGROK_DISPATCH_H(128)
+        default: break;  // Fall through to runtime version
+    }
+    #undef NEURALGROK_DISPATCH_H
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
