@@ -231,6 +231,67 @@ void supergrok11_fused_step(
     // Gradient clipping (device-side — single CPU sync)
     clip_grad_norms_device_side(grads, n_params, grad_clip_norm);
 
+#if defined(WITH_CUDA) || defined(WITH_HIP)
+    // Check if all params on CUDA
+    bool all_cuda = true;
+    for (size_t i = 0; i < n_params; i++) {
+        if (params[i].defined() && params[i].numel() > 0 && !params[i].is_cuda()) {
+            all_cuda = false;
+            break;
+        }
+    }
+
+    if (all_cuda && n_params > 0) {
+        // Phase 1: Launch all mu_metanet + cosine gate reductions (async)
+        std::vector<torch::Tensor> smart_grads;
+        std::vector<float> gate_values;
+        std::vector<size_t> valid_indices;
+        std::vector<float> bc1_vec, bc2_vec, beta1_vec;
+        smart_grads.reserve(n_params);
+        gate_values.reserve(n_params);
+        valid_indices.reserve(n_params);
+
+        for (size_t i = 0; i < n_params; i++) {
+            if (!grads[i].defined() || grads[i].numel() == 0) continue;
+
+            steps[i] += 1;
+            float alpha = layer_alphas[i];
+            float beta1 = layer_beta1s[i];
+            float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
+            float bc2_v = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
+
+            auto smart_grad = torch::empty_like(params[i]);
+            launch_sg11_mu_metanet(
+                mus[i], grads[i], sharpness_cache[i], smart_grad, alpha,
+                W1, b1, W2, b2, rescale, hidden_dim);
+
+            // Cosine gate computation (still per-param sync for now)
+            float gate = compute_cosine_gate_fused(smart_grad, mus[i], gate_temperature);
+
+            smart_grads.push_back(smart_grad);
+            gate_values.push_back(gate);
+            valid_indices.push_back(i);
+            bc1_vec.push_back(bc1);
+            bc2_vec.push_back(bc2_v);
+            beta1_vec.push_back(beta1);
+        }
+
+        // Phase 2: Launch adam_decay with the computed gate values
+        for (size_t vi = 0; vi < valid_indices.size(); vi++) {
+            size_t i = valid_indices[vi];
+            float gate = gate_values[vi];
+            float lamb_eff = ramp > 0.0f ? ramp * gate * lamb : 0.0f;
+
+            launch_sg11_adam_decay(
+                params[i], exp_avgs[i], exp_avg_sqs[i], smart_grads[vi], mus[i],
+                lamb_eff, beta1_vec[vi], beta2, lr, wd_eff, eps,
+                bc1_vec[vi], bc2_vec[vi]);
+        }
+        return;
+    }
+#endif
+
+    // CPU fallback
     for (size_t i = 0; i < n_params; i++) {
         if (!grads[i].defined() || grads[i].numel() == 0)
             continue;
@@ -242,26 +303,6 @@ void supergrok11_fused_step(
         float bc1 = 1.0f - std::pow(beta1, static_cast<float>(step));
         float bc2 = 1.0f - std::pow(beta2, static_cast<float>(step));
 
-        auto smart_grad = torch::empty_like(params[i]);
-
-#if defined(WITH_CUDA) || defined(WITH_HIP)
-        if (params[i].is_cuda()) {
-            // Step 1: Fused mu EMA + meta-net to get smart_grad (used for cosine gate)
-            launch_sg11_mu_metanet(
-                mus[i], grads[i], sharpness_cache[i], smart_grad, alpha,
-                W1, b1, W2, b2, rescale, hidden_dim);
-
-            // Step 2: Fused cosine gate reduction (single kernel, single CPU sync)
-            float gate = compute_cosine_gate_fused(smart_grad, mus[i], gate_temperature);
-            float lamb_eff = ramp > 0.0f ? ramp * gate * lamb : 0.0f;
-
-            launch_sg11_adam_decay(
-                params[i], exp_avgs[i], exp_avg_sqs[i], smart_grad, mus[i],
-                lamb_eff, beta1, beta2, lr, wd_eff, eps, bc1, bc2);
-            continue;
-        }
-#endif
-        // CPU fallback
         mus[i].mul_(alpha).add_(grads[i], 1.0f - alpha);
         auto shape = grads[i].sizes().vec();
         auto flat_g = grads[i].reshape({-1, 1}).to(torch::kFloat32);
@@ -270,7 +311,7 @@ void supergrok11_fused_step(
         auto z = torch::addmm(b1.to(torch::kFloat32), inp, W1.to(torch::kFloat32).t());
         auto act = torch::gelu(z);
         auto out = torch::addmm(b2.to(torch::kFloat32), act, W2.to(torch::kFloat32).t());
-        smart_grad.copy_((flat_g + rescale * out).reshape(shape));
+        auto smart_grad = (flat_g + rescale * out).reshape(shape);
 
         // Cosine gating (batched reduction — single sync)
         auto sg_flat = smart_grad.reshape(-1).to(torch::kFloat32);
@@ -774,22 +815,6 @@ void muon_fused_step(
         bool use_cuda = false;
 #endif
 
-        for (int step = 0; step < ns_steps; step++) {
-            auto A = torch::mm(X, X.t());
-            auto AX = torch::mm(A, X);
-            auto AAX = torch::mm(A, AX);
-
-            if (use_cuda) {
-#if defined(WITH_CUDA) || defined(WITH_HIP)
-                auto X_new = torch::empty_like(X);
-                launch_muon_ns_combine(X_new, X, AX, AAX, NS_A, NS_B, NS_C);
-                X = X_new;
-#endif
-            } else {
-                X = NS_A * X + NS_B * AX + NS_C * AAX;
-            }
-        }
-
         int64_t rows = p.size(0);
         int64_t cols = p.size(1);
         float max_dim = static_cast<float>(std::max(rows, cols));
@@ -797,14 +822,49 @@ void muon_fused_step(
         float neg_lr_scale = -lr * scale_factor / std::sqrt(max_dim);
         float decay_factor = 1.0f - lr * wd;
 
-        if (use_cuda) {
+        for (int step = 0; step < ns_steps; step++) {
+            auto A = torch::mm(X, X.t());
+            auto AX = torch::mm(A, X);
+            auto AAX = torch::mm(A, AX);
+
+            if (step < ns_steps - 1) {
+                // Intermediate iterations: just ns_combine
+                if (use_cuda) {
 #if defined(WITH_CUDA) || defined(WITH_HIP)
-            auto X_typed = X.to(p.dtype());
-            launch_muon_update(p, X_typed, neg_lr_scale, decay_factor);
+                    auto X_new = torch::empty_like(X);
+                    launch_muon_ns_combine(X_new, X, AX, AAX, NS_A, NS_B, NS_C);
+                    X = X_new;
 #endif
-        } else {
-            p.add_(X, neg_lr_scale);
-            p.mul_(decay_factor);
+                } else {
+                    X = NS_A * X + NS_B * AX + NS_C * AAX;
+                }
+            } else {
+                // Final iteration: fused ns_combine + update (orth stays in register)
+                if (use_cuda) {
+#if defined(WITH_CUDA) || defined(WITH_HIP)
+                    launch_muon_ns_combine_update_fused(
+                        p, X, AX, AAX, NS_A, NS_B, NS_C,
+                        neg_lr_scale, decay_factor);
+#endif
+                } else {
+                    X = NS_A * X + NS_B * AX + NS_C * AAX;
+                    p.add_(X, neg_lr_scale);
+                    p.mul_(decay_factor);
+                }
+            }
+        }
+
+        // ns_steps == 0 fallback (unlikely but safe)
+        if (ns_steps == 0) {
+            if (use_cuda) {
+#if defined(WITH_CUDA) || defined(WITH_HIP)
+                auto X_typed = X.to(p.dtype());
+                launch_muon_update(p, X_typed, neg_lr_scale, decay_factor);
+#endif
+            } else {
+                p.add_(X, neg_lr_scale);
+                p.mul_(decay_factor);
+            }
         }
     }
 }
@@ -1102,6 +1162,144 @@ static void dispatch_bilevel_backward_batched(
 
 
 // ═══════════════════════════════════════════════════════════════════════
+//  Shared Fused AdamW Step (used by LookSAM and Muon)
+// ═══════════════════════════════════════════════════════════════════════
+
+void fused_adamw_simple_step(
+    std::vector<torch::Tensor>& params,
+    std::vector<torch::Tensor>& grads,
+    std::vector<torch::Tensor>& exp_avgs,
+    std::vector<torch::Tensor>& exp_avg_sqs,
+    std::vector<int64_t>& steps,
+    float beta1, float beta2, float lr, float wd, float eps
+) {
+    for (size_t i = 0; i < params.size(); i++) {
+        if (!grads[i].defined() || grads[i].numel() == 0) continue;
+        float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
+        float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
+#if defined(WITH_CUDA) || defined(WITH_HIP)
+        if (params[i].is_cuda()) {
+            launch_fused_adamw_simple(
+                params[i], grads[i], exp_avgs[i], exp_avg_sqs[i],
+                beta1, beta2, lr, wd, eps, bc1, bc2);
+            continue;
+        }
+#endif
+        // CPU fallback: same numerics as _adamw_helper.py
+        auto g_f = grads[i].to(torch::kFloat32);
+        exp_avgs[i].mul_(beta1).add_(g_f, 1.0f - beta1);
+        exp_avg_sqs[i].mul_(beta2).addcmul_(g_f, g_f, 1.0f - beta2);
+        float step_size = lr / bc1;
+        auto denom = (exp_avg_sqs[i] / bc2).sqrt_().add_(eps);
+        params[i].mul_(1.0f - lr * wd);
+        params[i].addcdiv_(exp_avgs[i], denom, -step_size);
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Grokfast Fused EMA+Adam Step
+// ═══════════════════════════════════════════════════════════════════════
+
+void grokfast_fused_ema_adam_step(
+    std::vector<torch::Tensor>& params,
+    std::vector<torch::Tensor>& grads,
+    std::vector<torch::Tensor>& emas,
+    std::vector<torch::Tensor>& exp_avgs,
+    std::vector<torch::Tensor>& exp_avg_sqs,
+    std::vector<int64_t>& steps,
+    float alpha, float lamb,
+    float beta1, float beta2, float lr, float wd, float eps
+) {
+    for (size_t i = 0; i < params.size(); i++) {
+        if (!grads[i].defined() || grads[i].numel() == 0) continue;
+        float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
+        float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
+#if defined(WITH_CUDA) || defined(WITH_HIP)
+        if (params[i].is_cuda()) {
+            launch_fused_grokfast_adam(
+                params[i], grads[i], emas[i], exp_avgs[i], exp_avg_sqs[i],
+                alpha, lamb, beta1, beta2, lr, wd, eps, bc1, bc2);
+            continue;
+        }
+#endif
+        // CPU fallback: EMA + amplification + Adam
+        auto g_f = grads[i].to(torch::kFloat32);
+        emas[i].mul_(alpha).add_(g_f, 1.0f - alpha);
+        auto amplified = g_f + lamb * emas[i];
+        exp_avgs[i].mul_(beta1).add_(amplified, 1.0f - beta1);
+        exp_avg_sqs[i].mul_(beta2).addcmul_(amplified, amplified, 1.0f - beta2);
+        float step_size = lr / bc1;
+        auto denom_t = (exp_avg_sqs[i] / bc2).sqrt_().add_(eps);
+        params[i].mul_(1.0f - lr * wd);
+        params[i].addcdiv_(exp_avgs[i], denom_t, -step_size);
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  LookSAM Fused Direction + Adjust (batched norms + fused kernel)
+// ═══════════════════════════════════════════════════════════════════════
+
+void looksam_compute_directions_and_adjust(
+    std::vector<torch::Tensor>& grads,
+    std::vector<torch::Tensor>& sam_grads,
+    std::vector<torch::Tensor>& normal_grads,
+    float la
+) {
+    // Identify valid parameters
+    std::vector<size_t> valid_indices;
+    for (size_t i = 0; i < grads.size(); i++) {
+        if (!sam_grads[i].defined() || !normal_grads[i].defined()
+            || sam_grads[i].numel() == 0) continue;
+        valid_indices.push_back(i);
+    }
+    if (valid_indices.empty()) return;
+
+    // Batch all norm computations: launch async, sync once
+    std::vector<torch::Tensor> diff_norm_tensors, grad_norm_tensors;
+    std::vector<torch::Tensor> diffs;
+    diff_norm_tensors.reserve(valid_indices.size());
+    grad_norm_tensors.reserve(valid_indices.size());
+    diffs.reserve(valid_indices.size());
+
+    for (size_t vi = 0; vi < valid_indices.size(); vi++) {
+        size_t i = valid_indices[vi];
+        auto diff = (sam_grads[i] - normal_grads[i]).to(torch::kFloat32);
+        diffs.push_back(diff);
+        diff_norm_tensors.push_back(diff.norm());
+        grad_norm_tensors.push_back(grads[i].norm());
+    }
+
+    // Two batched syncs instead of 2N individual syncs
+    auto diff_norms = torch::stack(diff_norm_tensors).cpu();
+    auto grad_norms = torch::stack(grad_norm_tensors).cpu();
+    auto diff_norms_ptr = diff_norms.data_ptr<float>();
+    auto grad_norms_ptr = grad_norms.data_ptr<float>();
+
+    for (size_t vi = 0; vi < valid_indices.size(); vi++) {
+        size_t i = valid_indices[vi];
+        float norm = diff_norms_ptr[vi];
+        if (norm < 1e-12f) continue;
+        float inv_norm = 1.0f / norm;
+        float grad_norm = grad_norms_ptr[vi];
+        float la_times_gnorm = la * grad_norm;
+
+#if defined(WITH_CUDA) || defined(WITH_HIP)
+        if (grads[i].is_cuda()) {
+            launch_looksam_direction_adjust_fused(
+                grads[i], sam_grads[i], normal_grads[i],
+                inv_norm, la_times_gnorm);
+            continue;
+        }
+#endif
+        auto v_dir = diffs[vi] * inv_norm;
+        grads[i].add_(v_dir, la_times_gnorm);
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
 //  pybind11 Bindings
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1217,6 +1415,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("grads"), py::arg("ema_bufs"),
           py::arg("alpha"), py::arg("lamb"));
 
+    m.def("grokfast_fused_ema_adam_step", &grokfast_fused_ema_adam_step,
+          "Grokfast: fused EMA + amplification + Adam in single pass",
+          py::arg("params"), py::arg("grads"),
+          py::arg("emas"), py::arg("exp_avgs"), py::arg("exp_avg_sqs"),
+          py::arg("steps"),
+          py::arg("alpha"), py::arg("lamb"),
+          py::arg("beta1"), py::arg("beta2"), py::arg("lr"),
+          py::arg("wd"), py::arg("eps"));
+
     // ── Lion ────────────────────────────────────────────────────────
     m.def("lion_fused_step", &lion_fused_step,
           "Lion: fused momentum interp + sign + update + decay",
@@ -1236,12 +1443,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("looksam_adjust_grads", &looksam_adjust_grads,
           py::arg("grads"), py::arg("v_dirs"), py::arg("la"));
 
+    m.def("looksam_compute_directions_and_adjust", &looksam_compute_directions_and_adjust,
+          "Fused LookSAM direction+adjust with batched norms",
+          py::arg("grads"), py::arg("sam_grads"), py::arg("normal_grads"),
+          py::arg("la"));
+
     // ── Muon ────────────────────────────────────────────────────────
     m.def("muon_fused_step", &muon_fused_step,
           "Muon: momentum + Newton-Schulz ortho + update + WD",
           py::arg("params"), py::arg("grads"), py::arg("bufs"),
           py::arg("momentum"), py::arg("lr"), py::arg("wd"),
           py::arg("ns_steps"));
+
+    // ── Shared Fused AdamW ────────────────────────────────────────
+    m.def("fused_adamw_simple_step", &fused_adamw_simple_step,
+          "Shared fused AdamW step (LookSAM/Muon)",
+          py::arg("params"), py::arg("grads"),
+          py::arg("exp_avgs"), py::arg("exp_avg_sqs"),
+          py::arg("steps"),
+          py::arg("beta1"), py::arg("beta2"), py::arg("lr"),
+          py::arg("wd"), py::arg("eps"));
 
     // ── SuperGrok v2 Mamba-3+PEER ────────────────────────────────────
     m.def("supergrok2_mamba_peer_step", &supergrok2_mamba_peer_step,

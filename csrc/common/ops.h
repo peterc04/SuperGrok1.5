@@ -151,6 +151,12 @@ void launch_fused_grokfast_ema(
     torch::Tensor grad, torch::Tensor ema,
     float alpha, float lamb);
 
+void launch_fused_grokfast_adam(
+    torch::Tensor param, torch::Tensor grad, torch::Tensor ema,
+    torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    float alpha, float lamb, float beta1, float beta2,
+    float lr, float wd, float eps, float bc1, float bc2);
+
 // ── Lion (lion_kernels.cu) ──────────────────────────────────────────
 void launch_fused_lion_step(
     torch::Tensor param, torch::Tensor exp_avg, torch::Tensor grad,
@@ -170,9 +176,15 @@ void launch_looksam_perturb(
 void launch_looksam_restore(
     torch::Tensor param, torch::Tensor backup);
 
+void launch_looksam_direction_adjust_fused(
+    torch::Tensor grad, torch::Tensor sam_grad, torch::Tensor normal_grad,
+    float inv_norm, float la_times_gnorm);
+
+void launch_looksam_norm_reduce(
+    torch::Tensor sam_grad, torch::Tensor normal_grad,
+    torch::Tensor grad, torch::Tensor results);
+
 // ── Muon (muon_kernels.cu) ─────────────────────────────────────────
-// NOTE: launch_muon_momentum_normalize is defined in muon_kernels.cu but not
-// called from ops.cpp (momentum + normalize done via ATen ops inline).
 
 void launch_muon_fused_step(
     torch::Tensor param, torch::Tensor momentum_buffer, torch::Tensor grad,
@@ -186,6 +198,17 @@ void launch_muon_ns_combine(
 void launch_muon_update(
     torch::Tensor param, torch::Tensor orth,
     float neg_lr_scale, float decay_factor);
+
+void launch_muon_ns_combine_update_fused(
+    torch::Tensor param, torch::Tensor X, torch::Tensor AX, torch::Tensor AAX,
+    float a, float b, float c, float neg_lr_scale, float decay_factor);
+
+// ── Shared Fused AdamW (multi_tensor_optimizer_kernels.cu) ──────────
+void launch_fused_adamw_simple(
+    torch::Tensor param, torch::Tensor grad,
+    torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    float beta1, float beta2, float lr, float wd, float eps,
+    float bc1, float bc2);
 
 // ── Multi-Tensor Optimizer Kernels (multi_tensor_optimizer_kernels.cu) ──
 void launch_multi_tensor_grokadamw(

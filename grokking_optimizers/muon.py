@@ -19,7 +19,6 @@ from torch.optim.optimizer import Optimizer
 from grokking_optimizers._ops_loader import get_ops
 
 _ops = get_ops()  # Fails loudly if C++ extension not built
-from grokking_optimizers._adamw_helper import adamw_step
 
 
 class Muon(Optimizer):
@@ -198,17 +197,17 @@ class Muon(Optimizer):
         betas = group.get("betas", (0.9, 0.98))
         eps = group.get("eps", 1e-8)
 
-        adamw_step(
+        _ops.fused_adamw_simple_step(
             params_list,
             grads_list,
             exp_avg_list,
             exp_avg_sq_list,
             step_list,
-            group["lr"],
             betas[0],
             betas[1],
-            eps,
+            group["lr"],
             group["weight_decay"],
+            eps,
         )
 
     def _single_param_step(self, param, group, state):

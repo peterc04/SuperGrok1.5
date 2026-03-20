@@ -9,7 +9,7 @@
 #endif
 
 void grokfast_step_cpu(
-    float* param, const float* grad,
+    float* param, float* grad,
     float* ema,
     float alpha,
     float lamb,
