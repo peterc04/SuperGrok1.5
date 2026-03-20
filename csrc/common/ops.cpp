@@ -331,6 +331,43 @@ void grokadamw_fused_step(
     // Gradient clipping (device-side — single CPU sync)
     clip_grad_norms_device_side(grads, n_params, grad_clip_norm);
 
+#if defined(WITH_CUDA) || defined(WITH_HIP)
+    // Check if all params on CUDA
+    bool all_cuda = true;
+    for (size_t i = 0; i < n_params; i++) {
+        if (params[i].defined() && params[i].numel() > 0 && !params[i].is_cuda()) {
+            all_cuda = false;
+            break;
+        }
+    }
+
+    if (all_cuda && n_params > 0) {
+        // Collect valid params and compute per-param scalars
+        std::vector<torch::Tensor> valid_params, valid_grads, valid_eas, valid_easqs, valid_emas;
+        std::vector<float> bc1_vec, bc2_vec;
+        for (size_t i = 0; i < n_params; i++) {
+            if (!grads[i].defined() || grads[i].numel() == 0) continue;
+            steps[i] += 1;
+            float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
+            float bc2_v = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
+            valid_params.push_back(params[i]);
+            valid_grads.push_back(grads[i]);
+            valid_eas.push_back(exp_avgs[i]);
+            valid_easqs.push_back(exp_avg_sqs[i]);
+            valid_emas.push_back(emas[i]);
+            bc1_vec.push_back(bc1);
+            bc2_vec.push_back(bc2_v);
+        }
+        if (!valid_params.empty()) {
+            launch_multi_tensor_grokadamw(
+                valid_params, valid_eas, valid_easqs, valid_emas, valid_grads,
+                bc1_vec, bc2_vec, alpha, lamb_grok, beta1, beta2, lr, wd, eps);
+        }
+        return;
+    }
+#endif
+
+    // CPU fallback: per-param loop
     for (size_t i = 0; i < n_params; i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
 
@@ -338,15 +375,6 @@ void grokadamw_fused_step(
         float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
         float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
 
-#if defined(WITH_CUDA) || defined(WITH_HIP)
-        if (params[i].is_cuda()) {
-            launch_fused_grokadamw_step(
-                params[i], exp_avgs[i], exp_avg_sqs[i], emas[i], grads[i],
-                alpha, lamb_grok, beta1, beta2, lr, wd, eps, bc1, bc2);
-            continue;
-        }
-#endif
-        // CPU fallback
         auto g_f = grads[i].to(torch::kFloat32);
         emas[i].mul_(alpha).add_(g_f, 1.0f - alpha);
         auto amplified = g_f + lamb_grok * emas[i];
@@ -437,7 +465,6 @@ float prodigy_fused_step(
 ) {
     const size_t n_params = params.size();
 
-    // Step 1: Compute d_lr update (device-side accumulation — single CPU sync)
     // Find device
     torch::Device dev(torch::kCPU);
     for (size_t i = 0; i < n_params; i++) {
@@ -447,37 +474,57 @@ float prodigy_fused_step(
         }
     }
 
+#if defined(WITH_CUDA) || defined(WITH_HIP)
+    // Fast path: fused reduction + d_lr compute + step, zero CPU-GPU syncs
+    {
+        bool all_cuda = (dev.type() == torch::kCUDA);
+        if (all_cuda) {
+            std::vector<torch::Tensor> vp, vg, vpi, vea, veasq, vs;
+            std::vector<float> bc1_vec, bc2_vec;
+            for (size_t i = 0; i < n_params; i++) {
+                if (!grads[i].defined() || grads[i].numel() == 0) continue;
+                float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
+                float bc2_v = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
+                vp.push_back(params[i]); vg.push_back(grads[i]);
+                vpi.push_back(param_inits[i]);
+                vea.push_back(exp_avgs[i]); veasq.push_back(exp_avg_sqs[i]);
+                vs.push_back(s_bufs[i]);
+                bc1_vec.push_back(bc1); bc2_vec.push_back(bc2_v);
+            }
+            if (!vp.empty()) {
+                // d_lr lives on device; updated in-place by fused kernel chain
+                auto d_lr_buf = torch::tensor({d_lr},
+                    torch::TensorOptions().device(dev).dtype(torch::kFloat32));
+                launch_multi_tensor_prodigy_fused_reduce_step(
+                    vp, vg, vpi, vea, veasq, vs,
+                    bc1_vec, bc2_vec, d_lr_buf,
+                    beta1, beta2, lr, wd, eps);
+                // Single sync only to return updated d_lr to Python
+                return d_lr_buf.item<float>();
+            }
+            return d_lr;
+        }
+    }
+#endif
+
+    // CPU fallback: reduction with single sync, then per-param step
     auto num_acc = torch::zeros({1}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
     auto den_acc = torch::zeros({1}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
-
     for (size_t i = 0; i < n_params; i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
-
-#if defined(WITH_CUDA) || defined(WITH_HIP)
-        if (params[i].is_cuda()) {
-            launch_prodigy_dlr_reduce(
-                grads[i], params[i], param_inits[i], s_bufs[i],
-                num_acc, den_acc);
-            continue;
-        }
-#endif
         auto g_f = grads[i].to(torch::kFloat32);
         auto diff = (params[i] - param_inits[i]).to(torch::kFloat32);
         num_acc.add_((g_f.flatten() * diff.flatten()).sum());
         den_acc.add_(s_bufs[i].to(torch::kFloat32).sum());
     }
-
-    // Single CPU sync for both values
     auto results = torch::cat({num_acc, den_acc}).cpu();
     float numerator = results[0].item<float>();
     float denominator = results[1].item<float>();
-
-    // Update d_lr
     if (denominator > 1e-30f) {
         d_lr = std::max(d_lr, std::abs(numerator) / (denominator + 1e-12f));
     }
 
-    // Step 2: Per-parameter Adam update with d_lr
+    // CPU fallback: per-param loop
     for (size_t i = 0; i < n_params; i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
 
@@ -485,15 +532,6 @@ float prodigy_fused_step(
         float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
         float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
 
-#if defined(WITH_CUDA) || defined(WITH_HIP)
-        if (params[i].is_cuda()) {
-            launch_fused_prodigy_step(
-                params[i], exp_avgs[i], exp_avg_sqs[i], s_bufs[i], grads[i],
-                d_lr, beta1, beta2, lr, wd, eps, bc1, bc2);
-            continue;
-        }
-#endif
-        // CPU fallback
         auto g_f = grads[i].to(torch::kFloat32);
         s_bufs[i].mul_(beta2).addcmul_(g_f * d_lr, g_f * d_lr, 1.0f - beta2);
         exp_avgs[i].mul_(beta1).add_(g_f * d_lr, 1.0f - beta1);
@@ -518,14 +556,27 @@ void grokfast_fused_step(
     float alpha,
     float lamb
 ) {
+#if defined(WITH_CUDA) || defined(WITH_HIP)
+    bool all_cuda = true;
+    for (size_t i = 0; i < grads.size(); i++) {
+        if (grads[i].defined() && grads[i].numel() > 0 && !grads[i].is_cuda()) {
+            all_cuda = false; break;
+        }
+    }
+    if (all_cuda && !grads.empty()) {
+        std::vector<torch::Tensor> vg, ve;
+        for (size_t i = 0; i < grads.size(); i++) {
+            if (!grads[i].defined() || grads[i].numel() == 0) continue;
+            vg.push_back(grads[i]); ve.push_back(ema_bufs[i]);
+        }
+        if (!vg.empty()) launch_multi_tensor_grokfast_ema(vg, ve, alpha, lamb);
+        return;
+    }
+#endif
+
+    // CPU fallback: per-param loop
     for (size_t i = 0; i < grads.size(); i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
-#if defined(WITH_CUDA) || defined(WITH_HIP)
-        if (grads[i].is_cuda()) {
-            launch_fused_grokfast_ema(grads[i], ema_bufs[i], alpha, lamb);
-            continue;
-        }
-#endif
         auto g_f = grads[i].to(torch::kFloat32);
         ema_bufs[i].mul_(alpha).add_(g_f, 1.0f - alpha);
         grads[i].copy_(g_f + lamb * ema_bufs[i]);
@@ -546,15 +597,27 @@ void lion_fused_step(
     float beta2,
     float wd
 ) {
+#if defined(WITH_CUDA) || defined(WITH_HIP)
+    bool all_cuda = true;
+    for (size_t i = 0; i < params.size(); i++) {
+        if (params[i].defined() && params[i].numel() > 0 && !params[i].is_cuda()) {
+            all_cuda = false; break;
+        }
+    }
+    if (all_cuda && !params.empty()) {
+        std::vector<torch::Tensor> vp, vg, vea;
+        for (size_t i = 0; i < params.size(); i++) {
+            if (!grads[i].defined() || grads[i].numel() == 0) continue;
+            vp.push_back(params[i]); vg.push_back(grads[i]); vea.push_back(exp_avgs[i]);
+        }
+        if (!vp.empty()) launch_multi_tensor_lion(vp, vea, vg, lr, beta1, beta2, wd);
+        return;
+    }
+#endif
+
+    // CPU fallback: per-param loop
     for (size_t i = 0; i < params.size(); i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
-#if defined(WITH_CUDA) || defined(WITH_HIP)
-        if (params[i].is_cuda()) {
-            launch_fused_lion_step(params[i], exp_avgs[i], grads[i],
-                                   lr, beta1, beta2, wd);
-            continue;
-        }
-#endif
         auto g_f = grads[i].to(torch::kFloat32);
         auto interp = beta1 * exp_avgs[i] + (1.0f - beta1) * g_f;
         params[i].add_(interp.sign_().add_(params[i], wd), -lr);

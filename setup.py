@@ -49,6 +49,7 @@ if _has_gpu and _is_hip:
         "csrc/cuda/generic/distributed_pipeline.cu",
         "csrc/cuda/generic/distributed_scan_pipeline.cu",
         "csrc/cuda/generic/multi_tensor_prepare.cu",
+        "csrc/cuda/generic/multi_tensor_optimizer_kernels.cu",
     ]
 
     # Auto-detect CDNA specialization sources
@@ -116,6 +117,7 @@ elif _has_gpu:
         "csrc/cuda/generic/distributed_pipeline.cu",
         "csrc/cuda/generic/distributed_scan_pipeline.cu",
         "csrc/cuda/generic/multi_tensor_prepare.cu",
+        "csrc/cuda/generic/multi_tensor_optimizer_kernels.cu",
     ]
     nvidia_sources = [
         "csrc/cuda/sm_80/supergrok2_scan_sm80.cu",
