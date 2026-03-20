@@ -4512,13 +4512,11 @@ __global__ void persistent_fused_elem_multi_tensor_kernel(
         work_id = s_work_id;
 
         // Decode work_id into (param_idx, chunk_offset)
-        // We pre-compute cumulative chunk counts, but for simplicity
-        // use linear scan (num_params is typically < 100)
-        int param_idx = 0;
+        // Linear scan (num_params is typically < 100)
+        int param_idx = -1;
         int chunk_offset = work_id;
-        int chunks_per_param;
         for (int pi = 0; pi < num_params; pi++) {
-            chunks_per_param = (sizes[pi] + blockDim.x - 1) / blockDim.x;
+            int chunks_per_param = (sizes[pi] + blockDim.x - 1) / blockDim.x;
             if (chunk_offset < chunks_per_param) {
                 param_idx = pi;
                 break;
@@ -4526,8 +4524,8 @@ __global__ void persistent_fused_elem_multi_tensor_kernel(
             chunk_offset -= chunks_per_param;
         }
 
-        // Check if we've exhausted all work
-        if (param_idx >= num_params || chunk_offset >= ((sizes[param_idx] + blockDim.x - 1) / blockDim.x)) {
+        // If param_idx was never set, all work is exhausted
+        if (param_idx < 0) {
             return;
         }
 
