@@ -153,6 +153,110 @@ void supergrok11_sharpness_restore_all(
     std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
     std::vector<torch::Tensor>&);
 
+// ── SuperGrok v2 ──────────────────────────────────────────────────────
+void supergrok2_mamba_peer_step(
+    torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    float, float, float, float, float, float, float, float, float, float,
+    int, int, int, int, int, int, int, int, torch::Tensor);
+void supergrok2_mamba_peer_batched_step(
+    std::vector<torch::Tensor>, std::vector<torch::Tensor>,
+    std::vector<torch::Tensor>, std::vector<torch::Tensor>,
+    std::vector<torch::Tensor>, std::vector<torch::Tensor>,
+    std::vector<torch::Tensor>, std::vector<torch::Tensor>,
+    std::vector<torch::Tensor>,
+    torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    std::vector<float>, std::vector<float>,
+    std::vector<float>, std::vector<float>, std::vector<float>,
+    float, float, float, float, float,
+    int, int, int, int, int, int, int, int, torch::Tensor);
+void supergrok2_bilevel_fwd_save(
+    torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    int, int, int,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, int);
+void supergrok2_bilevel_fwd_save_batched(
+    std::vector<torch::Tensor>, std::vector<torch::Tensor>,
+    torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    int, int, int,
+    torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, int);
+void supergrok2_bilevel_backward(
+    torch::Tensor, torch::Tensor, torch::Tensor, float,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor,
+    int, int, int, int, int, int, int, int, int, int, int, int);
+void supergrok2_bilevel_backward_batched(
+    torch::Tensor, torch::Tensor,
+    torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor,
+    torch::Tensor, torch::Tensor,
+    int, int, int, int, int);
+
 // ── MoE ───────────────────────────────────────────────────────────────
 void moe_dynamic_expert_load(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
@@ -291,11 +395,19 @@ PYBIND11_MODULE(_ops, m) {
     m.def("int4_gptq_quantize", &sg::int4_gptq_quantize);
     m.def("mxfp4_quantize", &sg::mxfp4_quantize);
 
-    // SuperGrok v2: per the explicit TODO in csrc/bindings/supergrok2.cpp,
-    // the SG v2 entry points (mamba_peer_step, mamba_peer_batched_step,
-    // bilevel_fwd_save{_batched}, bilevel_backward{_batched},
-    // prepare_and_batched_step) still need to be wired. Their per-arch
-    // launchers exist in csrc/kernels/<arch>/supergrok2_*.cu but the
-    // bindings are not yet defined. _ops.supergrok2_* will raise
-    // AttributeError until that work is done.
+    // SuperGrok v2 — Mamba-3+PEER meta-net entries.
+    // Wrappers in csrc/bindings/supergrok2.cpp dispatch to the per-arch
+    // launchers in csrc/kernels/{cuda/<sm>,hip/<gfx>}/supergrok2_{fwd,bwd}_<arch>.
+    m.def("supergrok2_mamba_peer_step", &sg::supergrok2_mamba_peer_step,
+          "SuperGrok2: per-param Mamba-3+PEER meta-net + mu + Adam + WD");
+    m.def("supergrok2_mamba_peer_batched_step", &sg::supergrok2_mamba_peer_batched_step,
+          "SuperGrok2: batched Mamba-3+PEER step for all params at once");
+    m.def("supergrok2_bilevel_fwd_save", &sg::supergrok2_bilevel_fwd_save,
+          "SuperGrok2 bilevel: forward scan with state saving for backward");
+    m.def("supergrok2_bilevel_fwd_save_batched", &sg::supergrok2_bilevel_fwd_save_batched,
+          "SuperGrok2 bilevel: batched forward scan with state saving");
+    m.def("supergrok2_bilevel_backward", &sg::supergrok2_bilevel_backward,
+          "SuperGrok2 bilevel: full backward through meta-net");
+    m.def("supergrok2_bilevel_backward_batched", &sg::supergrok2_bilevel_backward_batched,
+          "SuperGrok2 bilevel: batched full backward through meta-net");
 }
