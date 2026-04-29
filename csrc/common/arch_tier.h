@@ -27,6 +27,20 @@ enum class ArchTier {
     CDNA4,      // gfx950 — MI350X / MI355X
 };
 
+enum class StatePrecision {
+    FP32 = 0,
+    CONFIG4 = 1,
+    FP6 = 2,        // E3M2, CDNA4 (MI350X / MI355X)
+};
+
+enum class ExpertPrecision {
+    FP32 = 0,
+    INT8 = 1,
+    INT4 = 2,
+    MXFP4 = 3,
+    FP4 = 4,        // E2M1, CDNA4 native (MI350X / MI355X)
+};
+
 #if   defined(SG_ARCH_SM80) || defined(SG_ARCH_SM89)
 constexpr ArchTier kArchTier = ArchTier::AMPERE;
 #elif defined(SG_ARCH_SM90)
@@ -49,4 +63,6 @@ inline constexpr ArchTier get_arch_tier() { return kArchTier; }
 // Re-expose them at translation-unit scope so existing if/else chains
 // don't need rewriting.
 using ArchTier = ::sg::ArchTier;
+using StatePrecision = ::sg::StatePrecision;
+using ExpertPrecision = ::sg::ExpertPrecision;
 using ::sg::get_arch_tier;

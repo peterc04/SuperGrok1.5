@@ -29,6 +29,8 @@
 #include "platform.h"
 #include "types.h"
 #include "ptx_intrinsics.cuh"
+#define SG_ARCH_SM100
+#include "arch_tier.h"
 
 namespace sg { namespace sm100 {
 
