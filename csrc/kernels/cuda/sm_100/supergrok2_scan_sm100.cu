@@ -677,7 +677,7 @@ __global__ void scan_tma_d16_kernel(
 
 
 
-void launch_blackwell_scan_tma(
+void launch_scan_tma(
     torch::Tensor pre_x, torch::Tensor pre_z, torch::Tensor pre_dt,
     torch::Tensor pre_B, torch::Tensor pre_C,
     torch::Tensor A_log, torch::Tensor D_param,
@@ -709,7 +709,7 @@ void launch_blackwell_scan_tma(
     }
 }
 
-void launch_blackwell_fused_elem_tma_fp4(
+void launch_fused_elem_tma_fp4(
     torch::Tensor param, torch::Tensor grad, torch::Tensor scan_output,
     torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
     torch::Tensor exp_avg_q, torch::Tensor exp_avg_scale,
