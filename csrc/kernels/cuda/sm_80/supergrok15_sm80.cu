@@ -689,6 +689,23 @@ __global__ void fused_supergrok15_full_step_templated_kernel(
     param[idx] = static_cast<scalar_t>(p);
 }
 
+// Forward decl: cp.async kernel defined in metanet_optimizers_sm80.cu.
+// On sm_80+ runtime-H falls through to this; the templated H specializations
+// below remain as fast-paths for small H (compile-time unrolled).
+template <typename scalar_t>
+__global__ void fused_supergrok15_full_step_cpasync_kernel(
+    scalar_t* __restrict__ param, float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq, scalar_t* __restrict__ mu,
+    const scalar_t* __restrict__ grad, const scalar_t* __restrict__ sharpness,
+    const float alpha,
+    const float* __restrict__ W1, const float* __restrict__ b1,
+    const float* __restrict__ W2, const float* __restrict__ b2,
+    const float rescale, const float lamb_eff,
+    const float beta1, const float beta2,
+    const float lr, const float wd_eff, const float eps,
+    const float bc1, const float bc2,
+    const int N, const int H);
+
 void launch_fused_supergrok15_full_step(
     torch::Tensor param,
     torch::Tensor exp_avg,
@@ -717,6 +734,10 @@ void launch_fused_supergrok15_full_step(
     const int grid = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
     const int smem_bytes = (hidden_dim * 4 + 1) * sizeof(float);
 
+    // Ampere TF32 mode for any cuBLAS the surrounding pipeline performs.
+    auto handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
+
     auto W1_f = W1.dtype() == torch::kFloat32 ? W1.contiguous() : W1.to(torch::kFloat32).contiguous();
     auto b1_f = b1.dtype() == torch::kFloat32 ? b1.contiguous() : b1.to(torch::kFloat32).contiguous();
     auto W2_f = W2.dtype() == torch::kFloat32 ? W2.contiguous() : W2.to(torch::kFloat32).contiguous();
@@ -741,6 +762,7 @@ void launch_fused_supergrok15_full_step(
                     rescale, lamb_eff, \
                     beta1, beta2, lr, wd_eff, eps, bc1, bc2, N); \
             })); \
+            cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH); \
             return; \
         }
 
@@ -749,14 +771,16 @@ void launch_fused_supergrok15_full_step(
         SG15_DISPATCH_H(32)
         SG15_DISPATCH_H(64)
         SG15_DISPATCH_H(128)
-        default: break;  // Fall through to runtime version
+        default: break;  // Fall through to cp.async runtime version
     }
     #undef SG15_DISPATCH_H
 
+    // Ampere runtime-H path: cp.async two-phase weight prefetch
+    // (W1/b1 first, W2/b2 overlapped with MLP layer 1 GELU compute).
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
-        grad.scalar_type(), "fused_supergrok15_full_step", ([&] {
-        fused_supergrok15_full_step_kernel<scalar_t><<<grid, BLOCK_SIZE, smem_bytes>>>(
+        grad.scalar_type(), "fused_supergrok15_full_step_cpasync", ([&] {
+        fused_supergrok15_full_step_cpasync_kernel<scalar_t><<<grid, BLOCK_SIZE, smem_bytes>>>(
             param.data_ptr<scalar_t>(),
             exp_avg.data_ptr<float>(),
             exp_avg_sq.data_ptr<float>(),
@@ -773,6 +797,8 @@ void launch_fused_supergrok15_full_step(
             N, hidden_dim
         );
     }));
+
+    cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
 }
 
 

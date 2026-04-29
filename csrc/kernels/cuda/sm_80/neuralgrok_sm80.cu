@@ -28,6 +28,7 @@
  */
 
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 
 #include "platform.h"
 #include "utils.cuh"
@@ -499,6 +500,20 @@ __global__ void fused_neuralgrok_full_step_templated_kernel(
 //  Launcher for the fused full-step kernel
 // ===================================================================
 
+// Forward decl: cp.async kernel defined in metanet_optimizers_sm80.cu.
+template <typename scalar_t>
+__global__ void fused_neuralgrok_full_step_cpasync_kernel(
+    scalar_t* __restrict__ param,
+    float* __restrict__ exp_avg, float* __restrict__ exp_avg_sq,
+    const scalar_t* __restrict__ grad,
+    const float* __restrict__ W1, const float* __restrict__ b1,
+    const float* __restrict__ W2, const float* __restrict__ b2,
+    const float alpha, const float beta,
+    const int N, const int H,
+    const float beta1, const float beta2,
+    const float lr, const float weight_decay, const float eps,
+    const float bc1, const float bc2);
+
 void launch_fused_neuralgrok_full_step(
     torch::Tensor param,
     torch::Tensor exp_avg,
@@ -515,6 +530,10 @@ void launch_fused_neuralgrok_full_step(
     const int grid = (N + NEURALGROK_BLOCK_SIZE - 1) / NEURALGROK_BLOCK_SIZE;
     const int smem_elems = hidden_dim * 3 + 1;
     const int smem_bytes = smem_elems * sizeof(float);
+
+    // Ampere TF32 mode for any cuBLAS the surrounding pipeline performs.
+    auto handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
 
     // Convert weights to FP32 only if needed (avoid redundant copy)
     auto W1_f = W1.dtype() == torch::kFloat32 ? W1.contiguous() : W1.to(torch::kFloat32).contiguous();
@@ -538,6 +557,7 @@ void launch_fused_neuralgrok_full_step(
                     alpha_amp, beta_amp, N, \
                     beta1, beta2, lr, weight_decay, eps, bc1, bc2); \
             })); \
+            cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH); \
             return; \
         }
 
@@ -546,14 +566,15 @@ void launch_fused_neuralgrok_full_step(
         NEURALGROK_DISPATCH_H(32)
         NEURALGROK_DISPATCH_H(64)
         NEURALGROK_DISPATCH_H(128)
-        default: break;  // Fall through to runtime version
+        default: break;  // Fall through to cp.async runtime version
     }
     #undef NEURALGROK_DISPATCH_H
 
+    // Ampere runtime-H path: cp.async two-phase weight prefetch.
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
-        param.scalar_type(), "fused_neuralgrok_full_step", ([&] {
-            fused_neuralgrok_full_step_kernel<scalar_t><<<grid, NEURALGROK_BLOCK_SIZE, smem_bytes>>>(
+        param.scalar_type(), "fused_neuralgrok_full_step_cpasync", ([&] {
+            fused_neuralgrok_full_step_cpasync_kernel<scalar_t><<<grid, NEURALGROK_BLOCK_SIZE, smem_bytes>>>(
                 param.data_ptr<scalar_t>(),
                 exp_avg.data_ptr<float>(),
                 exp_avg_sq.data_ptr<float>(),
@@ -576,6 +597,8 @@ void launch_fused_neuralgrok_full_step(
             );
         })
     );
+
+    cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
 }
 
 
