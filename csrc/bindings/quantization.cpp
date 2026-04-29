@@ -24,6 +24,7 @@ namespace sg {
     }
 
 DECLARE_Q(sm80) DECLARE_Q(sm90) DECLARE_Q(sm100) DECLARE_Q(gfx942)
+DECLARE_Q(sm89) DECLARE_Q(sm103) DECLARE_Q(sm120) DECLARE_Q(gfx950)
 #undef DECLARE_Q
 
 void fp8_e4m3_quantize(torch::Tensor input, torch::Tensor q_out, torch::Tensor scale) {

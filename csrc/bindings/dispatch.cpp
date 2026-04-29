@@ -27,16 +27,27 @@ int detect_arch_from_env() {
     const char* force = std::getenv("FORCE_ARCH");
     if (!force) return -1;
     std::string s(force);
+    // Numeric forms.
     if (s == "80")  return 80;
+    if (s == "89")  return 89;
     if (s == "90")  return 90;
     if (s == "100") return 100;
+    if (s == "103") return 103;
+    if (s == "120") return 120;
     if (s == "942") return 942;
+    if (s == "950") return 950;
+    // Symbolic forms.
     if (s == "sm_80")  return 80;
+    if (s == "sm_89")  return 89;
     if (s == "sm_90")  return 90;
     if (s == "sm_100") return 100;
+    if (s == "sm_103") return 103;
+    if (s == "sm_120") return 120;
     if (s == "gfx942") return 942;
+    if (s == "gfx950") return 950;
     throw std::runtime_error(
-        "FORCE_ARCH=" + s + " not in supported set {80, 90, 100, 942}");
+        "FORCE_ARCH=" + s +
+        " not in supported set {80, 89, 90, 100, 103, 120, 942, 950}");
 }
 
 int detect_arch_from_device() {
@@ -55,12 +66,16 @@ int detect_arch_from_device() {
             cudaGetErrorString(err));
     }
     int sm = prop.major * 10 + prop.minor;
-    if (sm == 80 || sm == 86 || sm == 89) return 80;   // Ampere family routes to sm_80
-    if (sm == 90)  return 90;
-    if (sm >= 100) return 100;
+    if (sm == 80 || sm == 86)   return 80;   // A100/A30/A10/RTX 30 → sm_80 binding
+    if (sm == 89)               return 89;   // Ada (RTX 40, L40, L40S)
+    if (sm == 90)               return 90;   // Hopper (H100/H200)
+    if (sm == 100)              return 100;  // Datacenter Blackwell (B100/B200/GB200)
+    if (sm == 103)              return 103;  // Blackwell Ultra (B300, GB300 NVL72)
+    if (sm == 120 || sm > 120)  return 120;  // Consumer Blackwell (RTX 50, RTX PRO 6000)
     throw std::runtime_error(
         "Detected sm_" + std::to_string(sm) +
-        " is not in supported set {sm_80, sm_90, sm_100}. "
+        " is not in supported set "
+        "{sm_80, sm_89, sm_90, sm_100, sm_103, sm_120}. "
         "Build with FORCE_CUDA=1 or upgrade hardware.");
 #elif defined(WITH_HIP)
     int dev = 0;
@@ -80,9 +95,11 @@ int detect_arch_from_device() {
     auto colon = arch_name.find(':');
     if (colon != std::string::npos) arch_name = arch_name.substr(0, colon);
     if (arch_name == "gfx942") return 942;
+    if (arch_name == "gfx950") return 950;
     throw std::runtime_error(
         "Detected " + arch_name +
-        " is not in supported set {gfx942}. Use MI300X or upgrade.");
+        " is not in supported set {gfx942, gfx950}. "
+        "Use MI300X / MI350X / MI355X or upgrade.");
 #else
     throw std::runtime_error(
         "No GPU backend compiled in. Build with WITH_CUDA or WITH_HIP.");

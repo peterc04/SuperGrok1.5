@@ -21,16 +21,18 @@ namespace sg {
 // Arch detection
 // ---------------------------------------------------------------------
 
-// Returns one of: 80, 90, 100, 942. Throws std::runtime_error on
-// any other detected arch (e.g. sm_70/75/86/89, gfx908/90a/950, RDNA).
+// Returns one of the supported arches: 80, 89, 90, 100, 103, 120, 942, 950.
+// Throws std::runtime_error on anything else (sm_70/75/86, gfx908/gfx90a, RDNA).
 //
 // Honors FORCE_ARCH env var for cross-arch testing on a host that has
 // the target binding compiled in.
 int detect_arch();
 
 // Convenience predicates used by dispatch switches.
-inline bool is_cuda_arch(int a) { return a == 80 || a == 90 || a == 100; }
-inline bool is_hip_arch(int a)  { return a == 942; }
+inline bool is_cuda_arch(int a) {
+    return a == 80 || a == 89 || a == 90 || a == 100 || a == 103 || a == 120;
+}
+inline bool is_hip_arch(int a)  { return a == 942 || a == 950; }
 
 // ---------------------------------------------------------------------
 // Per-arch launcher declarations
@@ -42,8 +44,12 @@ inline bool is_hip_arch(int a)  { return a == 942; }
 // ---------------------------------------------------------------------
 
 namespace sm80   {}
+namespace sm89   {}
 namespace sm90   {}
 namespace sm100  {}
+namespace sm103  {}
+namespace sm120  {}
 namespace gfx942 {}
+namespace gfx950 {}
 
 } // namespace sg

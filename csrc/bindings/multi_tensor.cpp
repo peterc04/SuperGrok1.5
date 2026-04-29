@@ -46,6 +46,7 @@ namespace sg {
     }
 
 DECLARE_MT(sm80) DECLARE_MT(sm90) DECLARE_MT(sm100) DECLARE_MT(gfx942)
+DECLARE_MT(sm89) DECLARE_MT(sm103) DECLARE_MT(sm120) DECLARE_MT(gfx950)
 #undef DECLARE_MT
 
 void multi_tensor_grokadamw(

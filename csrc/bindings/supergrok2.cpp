@@ -50,6 +50,7 @@ namespace sg {
     }
 
 DECLARE_SG2(sm80) DECLARE_SG2(sm90) DECLARE_SG2(sm100) DECLARE_SG2(gfx942)
+DECLARE_SG2(sm89) DECLARE_SG2(sm103) DECLARE_SG2(sm120) DECLARE_SG2(gfx950)
 #undef DECLARE_SG2
 
 // TODO(structural-refactor): supergrok2 launcher signatures are large and

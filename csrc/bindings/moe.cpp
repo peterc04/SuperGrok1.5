@@ -33,6 +33,7 @@ namespace sg {
     }
 
 DECLARE_MOE(sm80) DECLARE_MOE(sm90) DECLARE_MOE(sm100) DECLARE_MOE(gfx942)
+DECLARE_MOE(sm89) DECLARE_MOE(sm103) DECLARE_MOE(sm120) DECLARE_MOE(gfx950)
 #undef DECLARE_MOE
 
 void moe_expert_fwd(

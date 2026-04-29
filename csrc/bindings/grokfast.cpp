@@ -20,6 +20,7 @@ namespace sg {
 
 DECLARE_GROKFAST(sm80) DECLARE_GROKFAST(sm90)
 DECLARE_GROKFAST(sm100) DECLARE_GROKFAST(gfx942)
+DECLARE_GROKFAST(sm89) DECLARE_GROKFAST(sm103) DECLARE_GROKFAST(sm120) DECLARE_GROKFAST(gfx950)
 #undef DECLARE_GROKFAST
 
 void grokfast_ema(torch::Tensor grad, torch::Tensor ema, float alpha, float lamb) {

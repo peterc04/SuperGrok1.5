@@ -20,9 +20,13 @@
         const int sg_arch_ = ::sg::detect_arch();                             \
         switch (sg_arch_) {                                                   \
             case 80:  return ::sg::sm80::METHOD(__VA_ARGS__);                 \
+            case 89:  return ::sg::sm89::METHOD(__VA_ARGS__);                 \
             case 90:  return ::sg::sm90::METHOD(__VA_ARGS__);                 \
             case 100: return ::sg::sm100::METHOD(__VA_ARGS__);                \
+            case 103: return ::sg::sm103::METHOD(__VA_ARGS__);                \
+            case 120: return ::sg::sm120::METHOD(__VA_ARGS__);                \
             case 942: return ::sg::gfx942::METHOD(__VA_ARGS__);               \
+            case 950: return ::sg::gfx950::METHOD(__VA_ARGS__);               \
             default:                                                          \
                 throw std::runtime_error(                                     \
                     std::string(#METHOD) + " dispatch: unsupported arch " +   \

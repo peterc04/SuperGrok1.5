@@ -59,6 +59,7 @@ DECLARE_GROKADAMW_LAUNCHERS(sm90)
 DECLARE_GROKADAMW_LAUNCHERS(sm100)
 DECLARE_GROKADAMW_LAUNCHERS(gfx942)
 
+DECLARE_GROKADAMW_LAUNCHERS(sm89) DECLARE_GROKADAMW_LAUNCHERS(sm103) DECLARE_GROKADAMW_LAUNCHERS(sm120) DECLARE_GROKADAMW_LAUNCHERS(gfx950)
 #undef DECLARE_GROKADAMW_LAUNCHERS
 
 // ---------------------------------------------------------------------
@@ -70,9 +71,13 @@ DECLARE_GROKADAMW_LAUNCHERS(gfx942)
         const int a = sg::detect_arch();                                      \
         switch (a) {                                                          \
             case 80:  return sg::sm80::METHOD(__VA_ARGS__);                   \
+            case 89:  return sg::sm89::METHOD(__VA_ARGS__);                   \
             case 90:  return sg::sm90::METHOD(__VA_ARGS__);                   \
             case 100: return sg::sm100::METHOD(__VA_ARGS__);                  \
+            case 103: return sg::sm103::METHOD(__VA_ARGS__);                  \
+            case 120: return sg::sm120::METHOD(__VA_ARGS__);                  \
             case 942: return sg::gfx942::METHOD(__VA_ARGS__);                 \
+            case 950: return sg::gfx950::METHOD(__VA_ARGS__);                 \
             default:                                                          \
                 throw std::runtime_error(                                     \
                     "GrokAdamW dispatch: unsupported arch " +                 \
