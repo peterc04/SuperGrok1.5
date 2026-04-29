@@ -16,8 +16,9 @@ import torch
 from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
-from grokking_optimizers import _ops
-from grokking_optimizers._adamw_helper import adamw_step
+from grokking_optimizers._ops_loader import get_ops
+
+_ops = get_ops()  # Fails loudly if C++ extension not built
 
 
 class Muon(Optimizer):
@@ -196,15 +197,29 @@ class Muon(Optimizer):
         betas = group.get("betas", (0.9, 0.98))
         eps = group.get("eps", 1e-8)
 
-        adamw_step(
+        _ops.fused_adamw_simple_step(
             params_list,
             grads_list,
             exp_avg_list,
             exp_avg_sq_list,
             step_list,
-            group["lr"],
             betas[0],
             betas[1],
-            eps,
+            group["lr"],
             group["weight_decay"],
+            eps,
+        )
+
+    def _single_param_step(self, param, group, state):
+        """Per-parameter step for GradientHookOptimizer integration."""
+        if param.grad is None:
+            return
+        if len(state) == 0:
+            state["momentum_buffer"] = torch.zeros_like(param, dtype=torch.float32)
+        _ops.muon_fused_step(
+            [param], [param.grad], [state["momentum_buffer"]],
+            group.get("momentum", 0.95),
+            group["lr"],
+            group["weight_decay"],
+            group.get("ns_steps", 5),
         )

@@ -11,7 +11,10 @@ import torch.nn as nn
 from torch.optim import Optimizer
 from typing import Optional, Callable, Dict, Tuple
 
-from grokking_optimizers import _ops
+from grokking_optimizers._ops_loader import get_ops
+
+_ops = get_ops()  # Fails loudly if C++ extension not built
+_ops_cpu = _ops  # CPU ops are part of the same extension
 from .supergrok15 import SharpnessMetaNet
 
 
@@ -179,7 +182,8 @@ class SuperGrok11(Optimizer):
             self._weights_dirty = False
         W1, b1, W2, b2, rescale = self._cached_weights
 
-        _ops.supergrok11_fused_step(
+        ops_impl = _ops if self._flat_params[0].is_cuda else _ops_cpu
+        ops_impl.supergrok11_fused_step(
             self._flat_param_data,
             grads,
             self._flat_exp_avgs,
@@ -297,6 +301,41 @@ class SuperGrok11(Optimizer):
             p.grad = saved_grads.get(name)
 
         return val_loss.item()
+
+    def _single_param_step(self, param, group, state):
+        """Per-parameter step for GradientHookOptimizer integration."""
+        if param.grad is None:
+            return
+        self._ensure_state()
+        pidx = self._param_to_idx.get(id(param))
+        if pidx is None:
+            return
+        self._flat_steps[pidx] += 1
+        base_alpha = self._cached_alpha
+        ramp = self._get_ramp_factor()
+        layer_alpha = max(0.0, min(1.0, base_alpha * self._flat_layer_alphas[pidx]))
+
+        if self._weights_dirty:
+            self._cached_weights = self.meta_net.get_weights()
+            self._weights_dirty = False
+        W1, b1, W2, b2, rescale = self._cached_weights
+
+        ops_impl = _ops if param.is_cuda else _ops_cpu
+        ops_impl.supergrok11_fused_step(
+            [param.data],
+            [param.grad.data],
+            [self._flat_exp_avgs[pidx]],
+            [self._flat_exp_avg_sqs[pidx]],
+            [self._flat_mus[pidx]],
+            [self._flat_sharpness[pidx]],
+            [self._flat_steps[pidx]],
+            [layer_alpha],
+            [self._flat_layer_beta1s[pidx]],
+            W1, b1, W2, b2, rescale, self.meta_hidden_dim,
+            group["betas"][1], group["lr"], group["weight_decay"], group["eps"],
+            self.lamb, ramp, self.gate_temperature,
+            self.gradient_clipping,
+        )
 
     def get_global_step(self):
         return self._global_step

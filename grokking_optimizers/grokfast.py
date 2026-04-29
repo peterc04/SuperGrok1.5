@@ -15,8 +15,9 @@ import torch
 from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
-from grokking_optimizers import _ops
-from grokking_optimizers._adamw_helper import adamw_step
+from grokking_optimizers._ops_loader import get_ops
+
+_ops = get_ops()  # Fails loudly if C++ extension not built
 
 
 class Grokfast(Optimizer):
@@ -120,26 +121,32 @@ class Grokfast(Optimizer):
             if len(params_list) == 0:
                 continue
 
-            # Phase 1: Grokfast EMA amplification (modifies grads in-place)
-            _ops.grokfast_fused_step(
-                grads_list,
-                ema_list,
-                group["grokfast_alpha"],
-                group["grokfast_lamb"],
-            )
-
-            # Phase 2: AdamW update with the amplified gradients
-            adamw_step(
-                params_list,
-                grads_list,
-                exp_avg_list,
-                exp_avg_sq_list,
-                step_list,
-                group["lr"],
-                group["betas"][0],
-                group["betas"][1],
-                group["eps"],
-                group["weight_decay"],
+            # Fused EMA + amplification + Adam in a single CUDA pass
+            _ops.grokfast_fused_ema_adam_step(
+                params_list, grads_list, ema_list,
+                exp_avg_list, exp_avg_sq_list, step_list,
+                group["grokfast_alpha"], group["grokfast_lamb"],
+                group["betas"][0], group["betas"][1],
+                group["lr"], group["weight_decay"], group["eps"],
             )
 
         return loss
+
+    def _single_param_step(self, param, group, state):
+        """Per-parameter step for GradientHookOptimizer integration."""
+        if param.grad is None:
+            return
+        if len(state) == 0:
+            state["step"] = 0
+            state["ema"] = torch.zeros_like(param, dtype=torch.float32)
+            state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
+            state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
+        state["step"] += 1
+        # Fused EMA + amplification + Adam in a single CUDA pass
+        _ops.grokfast_fused_ema_adam_step(
+            [param], [param.grad], [state["ema"]],
+            [state["exp_avg"]], [state["exp_avg_sq"]], [state["step"]],
+            group["grokfast_alpha"], group["grokfast_lamb"],
+            group["betas"][0], group["betas"][1],
+            group["lr"], group["weight_decay"], group["eps"],
+        )

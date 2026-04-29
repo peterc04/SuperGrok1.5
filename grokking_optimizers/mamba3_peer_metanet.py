@@ -34,11 +34,9 @@ import torch
 import torch.nn as nn
 from typing import Tuple, Optional
 
-try:
-    from grokking_optimizers import _ops as _ops
-    _HAS_CUDA_BACKWARD = hasattr(_ops, 'supergrok2_bilevel_fwd_save')
-except ImportError:
-    _HAS_CUDA_BACKWARD = False
+from grokking_optimizers._ops_loader import get_ops
+_ops = get_ops()
+_HAS_CUDA_BACKWARD = hasattr(_ops, 'supergrok2_bilevel_fwd_save')
 
 
 class Mamba3ScanBlock(nn.Module):
@@ -103,7 +101,7 @@ class Mamba3ScanBlock(nn.Module):
         x_branch, z = xz.chunk(2, dim=-1)  # each [N, d_inner]
 
         # Selective parameters (input-dependent)
-        dt = torch.softplus(self.dt_proj(x_branch))  # [N, d_inner] -- positive
+        dt = torch.nn.functional.softplus(self.dt_proj(x_branch))  # [N, d_inner] -- positive
         B = self.B_proj(x_branch)                       # [N, d_state]
         C = self.C_proj(x_branch)                       # [N, d_state]
 
@@ -149,7 +147,7 @@ class Mamba3ScanBlock(nn.Module):
         y = torch.stack(outputs, dim=0)  # [N, d_inner]
 
         # Gated output
-        y = y * torch.silu(z)  # [N, d_inner]
+        y = y * torch.nn.functional.silu(z)  # [N, d_inner]
 
         # Skip connection within SSM
         y = y + self.D.unsqueeze(0) * x_branch
