@@ -87,8 +87,25 @@ The `*_overlay.cu` (and `*_overlay.hip.cpp`) files are pre-existing arch-tuned k
 
 Pallas kernels moved from `supergrok2_jax_tpu/pallas_kernels.py` to `csrc/kernels/tpu/`. The shared implementation is `_pallas_kernels.py`; v5p re-exports the tile-128 variants, v6e re-exports the tile-256 variants. `csrc/kernels/tpu/__init__.py:get_kernels()` selects based on `detect_tpu_version()`. `supergrok2_jax_tpu/pallas_kernels.py` is now a backwards-compat shim that re-exports from the new path.
 
-### What is NOT yet done (deferred to hardware-validated sessions)
+### Code statistics (post-refactor)
 
+180,845 lines of code across 267 tracked files. Breakdown by language:
+
+| Language | Files | Lines | Notes |
+|----------|------:|------:|-------|
+| CUDA C++ (`.cu` / `.cuh`) | 119 | 112,822 | Per-arch wrapped baselines (17 optimizers × 6 NVIDIA arches = 102 files) + 14 `*_overlay.cu` files preserved as future-merge targets + 2 shared `.cuh` headers (`ptx_intrinsics.cuh`, `utils.cuh`) + 1 quantization kernel. |
+| HIP C++ (`.hip.cpp`) | 38 | 38,050 | Per-arch wrapped baselines for gfx942 + gfx950 (17 optimizers × 2 = 34) + 3 gfx942 `*_overlay` files + 1 recovered CDNA4 FP4/FP6/2:4 sparsity overlay (`cdna4_kernels_gfx950_overlay.hip.cpp`, 2491 lines). |
+| Python (`.py`) | 71 | 21,342 | `grokking_optimizers/` package (eleven optimizers + dispatch + bindings + distributed + quantization + cuda_graph wrappers), `supergrok2_jax_tpu/` JAX implementation, `csrc/kernels/tpu/_pallas_kernels.py` (1190 lines), `autotune/` scripts, tests. |
+| C++ host code (`.cpp` / `.h`) | 31 | 5,523 | `csrc/bindings/` per-optimizer dispatchers + module aggregator (~16 files), shared headers (`platform.h`, `types.h`, `quantization.h`, `tuned_configs.h`, `bindings.h`), CPU testing-only sources (`csrc/kernels/cpu/`). |
+| Markdown docs (`.md`) | 7 | 3,089 | `README.md`, `REFRESH.md` (this file), `REFACTOR_PLAN.md`, `ANALYSIS.md`, plus per-tree READMEs (`csrc/kernels/README.md`, `csrc/kernels/hip/README_HIP.md`, `autotune/README.md`). |
+| Config (TOML) | 1 | 19 | `pyproject.toml`. |
+| **Total** | **267** | **180,845** | |
+
+The CUDA + HIP totals include large amounts of structurally-identical baseline content (the 68 + 68 wrapped baselines from the original 4-arch refactor + the §10 expansion are byte-equivalent within each optimizer's per-arch family at this stage). Real divergence — cp.async vs TMA vs MFMA, FP8 vs NVFP4 vs FP4 paths, warp specialization — is added per-arch under hardware-validated tuning passes; the cross-arch numerical agreement test (`tests/test_cross_arch_agreement.py`) catches drift.
+
+Lines of code in the eight `*_overlay.*` pre-tuned files (Hopper FP8 / Ampere cp.async / Blackwell TMA / gfx942 BF16 MFMA / CDNA4 FP4-FP6) account for roughly 12,000 lines of the CUDA/HIP totals; these files are excluded from the build until merged into the canonical per-arch kernels.
+
+### What is NOT yet done (deferred to hardware-validated sessions)
 - **Per-arch kernel divergence**: the 68 wrapped baselines are byte-identical (modulo namespace banners). Hand-tuned cp.async vs TMA vs MFMA divergence happens later under benchmarks.
 - **CUTLASS migration**: SG2 projection GEMMs and Muon Newton-Schulz GEMMs currently inherit the cuBLAS / rocBLAS paths from the wrapped generic. The CUTLASS rewrite (with fused softplus epilogue for dt_proj) is scaffolded in `autotune/cutlass_profile.py` but not yet implemented.
 - **Overlay merges**: the `*_overlay.*` files contain real arch-specific work (Hopper FP8, Ampere cp.async, Blackwell TMA, gfx942 BF16 MFMA) that needs to be folded into the canonical per-arch kernels. They are excluded from the build until merged.
@@ -163,37 +180,46 @@ For navigation, the structural-refactor commits:
 
 ## 1. Repo layout
 
+(Post-refactor. The pre-refactor tree had `csrc/cuda/generic/`,
+`csrc/cuda/generated/`, `csrc/cpu/`, `csrc/hip/cdna2/3/4/`, `codegen/`,
+and `grokking_optimizers/jit/`. All deleted in the structural refactor —
+see §0 migration commit series.)
+
 - `grokking_optimizers/` — Python package, eleven optimizers plus infra
-- `supergrok2_jax_tpu/` — JAX/TPU port of the suite
-- `csrc/common/` — shared C++/CUDA/HIP headers and dispatch
-- `csrc/cuda/generic/` — kernels that compile under both CUDA and HIP
-- `csrc/cuda/sm_80/` `sm_90/` `sm_100/` — NVIDIA tier-specific kernels
-- `csrc/hip/cdna2/` `cdna3/` `cdna4/` — AMD tier-specific kernels
+- `supergrok2_jax_tpu/` — JAX/TPU port of the suite (Pallas kernels live in `csrc/kernels/tpu/`)
+- `csrc/common/` — shared headers (`platform.h`, `types.h`, `ptx_intrinsics.cuh`, `utils.cuh`, `quantization.h`) plus `tuned_configs.h` (autotune output)
+- `csrc/bindings/` — per-optimizer dispatchers (`grokadamw.cpp`, `lion.cpp`, …) + arch detection (`dispatch.cpp`) + pybind11 module aggregator (`module.cpp`)
+- `csrc/kernels/cuda/sm_80/` `sm_89/` `sm_90/` `sm_100/` `sm_103/` `sm_120/` — NVIDIA per-arch specialized kernels (six arches)
+- `csrc/kernels/hip/gfx942/` `gfx950/` — AMD per-arch specialized kernels (two arches)
+- `csrc/kernels/tpu/v5p/` `v6e/` — TPU Pallas kernels per version (re-export tile-128 / tile-256 from shared `_pallas_kernels.py`)
+- `csrc/kernels/cpu/` — CPU implementations with AVX-512 / NEON SIMD (testing only, not a runtime fallback)
 - `csrc/quantization/` — quantization kernels (FP8, INT8, INT4, MXFP4)
-- `csrc/cpu/` — CPU fallback with AVX-512 / NEON SIMD
-- `tests/` — eight test files
+- `autotune/` — offline tuning: `tune.py`, `grids.py`, `runner.py`, `cutlass_profile.py`. Replaces the deleted `grokking_optimizers/jit/`.
+- `tests/` — nine test files (the refactor added `test_cross_arch_agreement.py` and renamed `test_all_tiers.py` → `test_all_arches.py`)
 - `benchmarks/` — three benchmark scripts
-- `codegen/` — kernel generator scripts plus YAML spec
-- `setup.py` — build entry, detects backend
+- `setup.py` — build entry, detects backend, supports the eight GPU arches
 - `README.md` — user docs
-- `ANALYSIS.md` — internal review with bug findings and optimization opportunities
 - `REFRESH.md` — this file
+- `REFACTOR_PLAN.md` — refactor design (steps 1-9 + §10 arch expansion)
+- `ANALYSIS.md` — internal review with bug findings and optimization opportunities
 
 ## 2. Project state
 
 - Branch: `claude/custom-optimizer-analysis-HFYhg`
 - Working tree: clean
-- Size: ~60k LOC of C++/CUDA/HIP across 98 files
-- Backends supported: NVIDIA sm_70 → sm_100, AMD gfx908 → gfx950, CPU x86_64/ARM64, TPU v3 → v6e
-- Status: production-ready, no known correctness blockers
-- Recent focus: bug fixing, hot-path optimization, architecture coverage
-- Architecture: SuperGrok v2 design settled long ago; no structural changes recently
+- Size: 180,845 LOC across 267 tracked files (see §0 Code statistics for the per-language breakdown)
+- Package version: `3.0.0` (breaking refactor — bumped in commit `c8022cc`)
+- Backends supported: NVIDIA `sm_80, sm_89, sm_90, sm_100, sm_103, sm_120`; AMD `gfx942, gfx950`; TPU `v5p, v6e`. CPU build for testing only.
+- Permanently unsupported: V100, T4, RTX 20-series, MI100 (gfx908), MI200 (gfx90a), AMD RDNA, TPU v3/v4/v5e.
+- Status: structural refactor complete; per-arch hand-tuning + CUTLASS migration + autotune execution deferred to hardware-validated sessions (see §0 "What is NOT yet done").
+- Recent focus: arch matrix expansion (6 NVIDIA + 2 AMD = 8 GPU arches, up from 4); per-arch wrapped baselines; bindings layer split; autotune scaffolding.
+- Architecture: SuperGrok v2 design settled long ago; the refactor changes how kernels are organized (single per-arch source-of-truth instead of generic + overlay), not what they compute.
 - Last 5 commits, newest first:
-  - `ea968b6` — sweeping bug-fix and optimization pass
-  - `a6323c9` — fix `_single_param_step` in muon, prodigy, grokadamw
-  - `6c48166` — fix AMD gcnArchName parsing for 3-digit codes
-  - `dbe3ef4` — 9-bug fix pass with FP32 skip optimization
-  - `1d930db` — wire dead fused kernels, kill Python AdamW bottleneck
+  - `8a100ac` — REFRESH.md §0 with 8-arch supported set + expansion commits
+  - `58b9e54` — extend tests for sm_89/103/120 + gfx950
+  - `40954ae` — extend dispatch.py + autotune for new arches
+  - `0fe9cc4` — extend tuned_configs.h + setup.py for 8-arch matrix
+  - `5b4218b` — extend bindings layer to recognize 4 new arches
 
 ## 3. Optimizers
 
