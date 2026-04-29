@@ -1,3 +1,4 @@
+
 /*
  * SuperGrok v2 — Ampere-Optimized Backward Kernels (sm_80+)
  *
@@ -30,7 +31,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "platform.h"
 #include "types.h"
-#include "dispatch.h"
 
 // cp.async intrinsics (sm_80+): asynchronous global->shared memory copy
 // These are compiled conditionally and only used on Ampere+
@@ -38,9 +38,12 @@
 #include <cuda_pipeline.h>
 #endif
 
+namespace sg { namespace sm80 {
+
 // =====================================================================
 //  Forward declarations of generic launchers
 // =====================================================================
+
 
 void launch_mamba3_peer_bilevel_fwd_save_batched(
     std::vector<torch::Tensor> grads,
@@ -574,3 +577,5 @@ void launch_mamba3_peer_backward_batched_ampere(
 
     cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
 }
+
+} } // namespace sg::sm80

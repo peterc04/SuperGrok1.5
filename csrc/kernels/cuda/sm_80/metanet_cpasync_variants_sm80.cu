@@ -1,3 +1,4 @@
+
 #include <torch/extension.h>
 #include "platform.h"
 #include "utils.cuh"
@@ -5,6 +6,8 @@
 #if GROK_CUDA
 #include <cuda_pipeline.h>
 #endif
+
+namespace sg { namespace sm80 {
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 
@@ -982,6 +985,7 @@ __global__ void fused_neuralgrok_full_step_cpasync_moe_q4_kernel(
 
 
 
+
 void launch_fused_supergrok15_full_step_cpasync_q4(
     torch::Tensor param,
     torch::Tensor exp_avg_q,
@@ -1475,3 +1479,5 @@ template __global__ void fused_neuralgrok_full_step_cpasync_moe_kernel<at::BFloa
 template __global__ void fused_neuralgrok_full_step_cpasync_moe_q4_kernel<float>(float*, int8_t*, float*, int8_t*, float*, const float*, const bool*, const float*, const float*, const float*, const float*, const float, const float, const int, const int, const float, const float, const float, const float, const float, const float, const float, const unsigned);
 template __global__ void fused_neuralgrok_full_step_cpasync_moe_q4_kernel<at::Half>(at::Half*, int8_t*, float*, int8_t*, float*, const at::Half*, const bool*, const float*, const float*, const float*, const float*, const float, const float, const int, const int, const float, const float, const float, const float, const float, const float, const float, const unsigned);
 template __global__ void fused_neuralgrok_full_step_cpasync_moe_q4_kernel<at::BFloat16>(at::BFloat16*, int8_t*, float*, int8_t*, float*, const at::BFloat16*, const bool*, const float*, const float*, const float*, const float*, const float, const float, const int, const int, const float, const float, const float, const float, const float, const float, const float, const unsigned);
+
+} } // namespace sg::sm80

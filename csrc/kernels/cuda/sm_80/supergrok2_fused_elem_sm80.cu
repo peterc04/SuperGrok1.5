@@ -1,3 +1,4 @@
+
 /*
  * SuperGrok v2 — Ampere-Optimized Fused Element Step (sm_80+)
  *
@@ -24,6 +25,8 @@
 #include <cuda_pipeline.h>
 #endif
 
+namespace sg { namespace sm80 {
+
 
 // ═══════════════════════════════════════════════════════════════════════
 //  Ampere Fused Per-Element Step with cp.async Weight Prefetch
@@ -37,6 +40,7 @@
 //  This hides ~400 cycles of global memory latency for expert weights
 //  behind the GRU computation (~264 FMAs ≈ ~300 cycles on A100).
 // ═══════════════════════════════════════════════════════════════════════
+
 
 template <typename scalar_t>
 __launch_bounds__(256, 8)
@@ -356,3 +360,5 @@ template __global__ void fused_elem_step_cpasync_kernel<at::BFloat16>(
     const float*, const float*, const float*, const float*,
     float, float, float, float, float, float, float, float, float, float,
     int*, int, int, int, int, int, int, int, int);
+
+} } // namespace sg::sm80

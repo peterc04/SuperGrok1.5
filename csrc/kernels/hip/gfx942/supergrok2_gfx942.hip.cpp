@@ -1,3 +1,4 @@
+
 /*
  * SuperGrok v2 — CDNA3-Optimized Launchers (gfx942, MI300X)
  *
@@ -23,11 +24,13 @@
 #include <torch/extension.h>
 #include "platform.h"
 #include "types.h"
-#include "ops.h"
+
+namespace sg { namespace gfx942 {
 
 // ═══════════════════════════════════════════════════════════════════════
 //  Forward declarations of CDNA2 launchers
 // ═══════════════════════════════════════════════════════════════════════
+
 
 void launch_mamba3_peer_step_cdna2(
     torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness,
@@ -462,3 +465,5 @@ void launch_mamba3_peer_backward_batched_cdna3(
         d_model, d_state, d_inner, num_params,
         checkpoint_interval);
 }
+
+} } // namespace sg::gfx942

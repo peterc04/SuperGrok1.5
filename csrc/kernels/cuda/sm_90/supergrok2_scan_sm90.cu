@@ -1,3 +1,4 @@
+
 /*
  * SuperGrok v2 — Hopper Forward Kernels (sm_90+)
  *
@@ -30,16 +31,17 @@
 #include <cublas_v2.h>
 #include "platform.h"
 #include "types.h"
-#include "dispatch.h"
-#include "ops.h"
 
 #if GROK_CUDA
 #include <cuda_pipeline.h>
 #endif
 
+namespace sg { namespace sm90 {
+
 // ═══════════════════════════════════════════════════════════════════════
 //  Forward declarations of Ampere launchers
 // ═══════════════════════════════════════════════════════════════════════
+
 
 void launch_mamba3_peer_step_ampere(
     torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness,
@@ -429,3 +431,5 @@ void launch_mamba3_peer_batched_step_hopper(
 
     cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
 }
+
+} } // namespace sg::sm90

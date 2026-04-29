@@ -1,3 +1,4 @@
+
 /*
  * SuperGrok v2 — Hopper Backward Kernels (sm_90+) — Delegates to Ampere
  *
@@ -19,11 +20,13 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cublas_v2.h>
 #include "types.h"
-#include "dispatch.h"
+
+namespace sg { namespace sm90 {
 
 // ═══════════════════════════════════════════════════════════════════════
 //  Forward declarations of Ampere backward launchers
 // ═══════════════════════════════════════════════════════════════════════
+
 
 void launch_mamba3_peer_bilevel_fwd_save_batched_ampere(
     std::vector<torch::Tensor> grads,
@@ -201,3 +204,5 @@ void launch_mamba3_peer_backward_batched_hopper(
         d_model, d_state, d_inner, num_params,
         checkpoint_interval);
 }
+
+} } // namespace sg::sm90

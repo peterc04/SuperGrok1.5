@@ -1,3 +1,5 @@
+
+
 /*
  * SuperGrok v2 — Blackwell (sm_100+) FP4 Precompute
  *
@@ -27,6 +29,8 @@
 
 #include "platform.h"
 #include "types.h"
+
+namespace sg { namespace sm100 {
 
 #if GROK_CUDA
 
@@ -237,3 +241,5 @@ void blackwell_precompute_fp4(
 }
 
 #endif // GROK_CUDA
+
+} } // namespace sg::sm100

@@ -1,3 +1,5 @@
+
+
 /*
  * SuperGrok v2 — Hopper Warp Specialization (sm_90+)
  *
@@ -31,6 +33,8 @@
 
 #if GROK_CUDA
 #include <cuda_pipeline.h>
+
+namespace sg { namespace sm90 {
 
 // ═══════════════════════════════════════════════════════════════════════
 //  Warp role assignment
@@ -443,3 +447,5 @@ void launch_scan_warp_specialized_d16(
 }
 
 #endif  // GROK_CUDA
+
+} } // namespace sg::sm90

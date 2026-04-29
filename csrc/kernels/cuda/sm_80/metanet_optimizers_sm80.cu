@@ -1,3 +1,4 @@
+
 /*
  * SuperGrok v2 — Ampere-Optimized Meta-Net Optimizer Kernels (sm_80+)
  *
@@ -28,13 +29,15 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "platform.h"
 #include "types.h"
-#include "dispatch.h"
 
 #if GROK_CUDA
 #include <cuda_pipeline.h>
 #endif
 
+namespace sg { namespace sm80 {
+
 // Block sizes matching the generic kernels
+
 constexpr int BLOCK_SIZE = 256;
 constexpr int NEURALGROK_BLOCK_SIZE = 256;
 
@@ -704,3 +707,5 @@ template __global__ void fused_neuralgrok_full_step_cpasync_kernel<at::BFloat16>
     const float, const float, const int, const int,
     const float, const float, const float, const float, const float,
     const float, const float);
+
+} } // namespace sg::sm80

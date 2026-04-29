@@ -1,3 +1,4 @@
+
 /*
  * SuperGrok v2 — Blackwell (sm_100+) Real Kernels
  *
@@ -28,6 +29,8 @@
 #include "platform.h"
 #include "types.h"
 #include "ptx_intrinsics.cuh"
+
+namespace sg { namespace sm100 {
 
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -672,7 +675,7 @@ __global__ void scan_tma_d16_kernel(
 //    - d_inner:         generic vs d_inner=16 specialized
 // ═══════════════════════════════════════════════════════════════════════
 
-#include "dispatch.h"
+
 
 void launch_blackwell_scan_tma(
     torch::Tensor pre_x, torch::Tensor pre_z, torch::Tensor pre_dt,
@@ -860,3 +863,5 @@ void launch_blackwell_fused_elem_tma_fp4(
         }
     }
 }
+
+} } // namespace sg::sm100
