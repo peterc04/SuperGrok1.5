@@ -31,18 +31,26 @@ namespace sg {
 
 enum ArchId : int {
     ARCH_SM80   = 0,
-    ARCH_SM90   = 1,
-    ARCH_SM100  = 2,
-    ARCH_GFX942 = 3,
-    NUM_ARCHES  = 4,
+    ARCH_SM89   = 1,    // Ada Lovelace (RTX 40, L40, L40S)
+    ARCH_SM90   = 2,    // Hopper (H100, H200)
+    ARCH_SM100  = 3,    // Datacenter Blackwell (B100, B200, GB200)
+    ARCH_SM103  = 4,    // Blackwell Ultra (B300, GB300 NVL72)
+    ARCH_SM120  = 5,    // Consumer Blackwell (RTX 50, RTX PRO 6000)
+    ARCH_GFX942 = 6,    // CDNA3 (MI300X, MI300A)
+    ARCH_GFX950 = 7,    // CDNA4 (MI350X, MI355X)
+    NUM_ARCHES  = 8,
 };
 
 inline ArchId arch_id_from_int(int a) {
     switch (a) {
         case 80:  return ARCH_SM80;
+        case 89:  return ARCH_SM89;
         case 90:  return ARCH_SM90;
         case 100: return ARCH_SM100;
+        case 103: return ARCH_SM103;
+        case 120: return ARCH_SM120;
         case 942: return ARCH_GFX942;
+        case 950: return ARCH_GFX950;
         default:
             throw std::runtime_error(
                 "arch_id_from_int: unsupported arch " + std::to_string(a));
@@ -89,9 +97,13 @@ inline constexpr LaunchConfig DEFAULT_CONFIG = {
 
 inline constexpr LaunchConfig GROKADAMW_CONFIGS[NUM_ARCHES][5] = {
     /* sm_80   */ {DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG},
+    /* sm_89   */ {DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG},
     /* sm_90   */ {DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG},
     /* sm_100  */ {DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG},
+    /* sm_103  */ {DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG},
+    /* sm_120  */ {DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG},
     /* gfx942  */ {DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG},
+    /* gfx950  */ {DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG, DEFAULT_CONFIG},
 };
 
 // Helper to pick the bucket from N.

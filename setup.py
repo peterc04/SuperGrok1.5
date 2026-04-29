@@ -2,13 +2,19 @@
 Grokking Optimizers — All-Specialized Per-Arch Kernel Build
 
 Supported arches:
-  - NVIDIA: sm_80 (Ampere family), sm_90 (Hopper), sm_100 (Blackwell)
-  - AMD:    gfx942 (MI300X)
+  - NVIDIA: sm_80 (Ampere family: A100/A30/A10/RTX 30 routes here),
+            sm_89 (Ada: RTX 40, L40, L40S),
+            sm_90 (Hopper: H100/H200),
+            sm_100 (Datacenter Blackwell: B100/B200/GB200),
+            sm_103 (Blackwell Ultra: B300, GB300 NVL72),
+            sm_120 (Consumer Blackwell: RTX 50, RTX PRO 6000 Blackwell)
+  - AMD:    gfx942 (CDNA3: MI300X, MI300A),
+            gfx950 (CDNA4: MI350X, MI355X)
   - CPU:    x86_64 (AVX-512), aarch64 (NEON) -- testing only
 
 Build fails on unsupported arches. There is no generic-kernel fallback
-and no tier fallback chain. See REFACTOR_PLAN.md and csrc/kernels/README.md
-for the underlying policy.
+and no tier fallback chain. See REFACTOR_PLAN.md (esp. §10) and
+csrc/kernels/README.md for the underlying policy.
 
 Build:
     pip install -e .
@@ -79,7 +85,10 @@ if _has_gpu and _is_hip:
     print("Building Grokking Optimizers C++/HIP extension")
     print(f"  ROCm version: {torch.version.hip}")
 
-    sources = COMMON_BINDINGS + _collect(["csrc/kernels/hip/gfx942/*.hip.cpp"])
+    sources = COMMON_BINDINGS + _collect([
+        "csrc/kernels/hip/gfx942/*.hip.cpp",
+        "csrc/kernels/hip/gfx950/*.hip.cpp",
+    ])
 
     rocm_archs = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()
     if rocm_archs:
@@ -90,7 +99,10 @@ if _has_gpu and _is_hip:
                 offload.append(f"--offload-arch={a}")
         print(f"  ROCm archs (from TORCH_CUDA_ARCH_LIST): {rocm_archs}")
     else:
-        offload = ["--offload-arch=gfx942"]   # MI300X only
+        offload = [
+            "--offload-arch=gfx942",   # MI300X / MI300A
+            "--offload-arch=gfx950",   # MI350X / MI355X
+        ]
 
     ext = CUDAExtension(
         name="grokking_optimizers._ops",
@@ -111,8 +123,11 @@ elif _has_gpu:
 
     sources = COMMON_BINDINGS + _collect([
         "csrc/kernels/cuda/sm_80/*.cu",
+        "csrc/kernels/cuda/sm_89/*.cu",
         "csrc/kernels/cuda/sm_90/*.cu",
         "csrc/kernels/cuda/sm_100/*.cu",
+        "csrc/kernels/cuda/sm_103/*.cu",
+        "csrc/kernels/cuda/sm_120/*.cu",
         "csrc/quantization/*.cu",  # split per-arch in a follow-up
     ])
 
@@ -127,13 +142,16 @@ elif _has_gpu:
             gencode.append(f"-gencode=arch=compute_{a},code=sm_{a}")
         print(f"  CUDA archs (from TORCH_CUDA_ARCH_LIST): {nvcc_archs_env}")
     else:
-        # Supported set: sm_80, sm_90, sm_100. Pre-Ampere / sm_86 / sm_89
-        # not supported; users on those cards must upgrade or use FORCE_ARCH=80
-        # at runtime to route to the sm_80 binding (see grokking_optimizers/dispatch.py).
+        # Supported set: sm_80, sm_89, sm_90, sm_100, sm_103, sm_120.
+        # sm_86 (Ampere RTX 30) routes to the sm_80 binding at runtime via
+        # grokking_optimizers/dispatch.py. Pre-Ampere (sm_70/75) is unsupported.
         gencode = [
-            "-gencode=arch=compute_80,code=sm_80",   # A100 / Ampere family
-            "-gencode=arch=compute_90,code=sm_90",   # H100
-            "-gencode=arch=compute_100,code=sm_100", # B200
+            "-gencode=arch=compute_80,code=sm_80",     # A100, A30, A10 (Ampere family)
+            "-gencode=arch=compute_89,code=sm_89",     # RTX 40-series, L40, L40S (Ada)
+            "-gencode=arch=compute_90,code=sm_90",     # H100, H200 (Hopper)
+            "-gencode=arch=compute_100,code=sm_100",   # B100, B200, GB200 (datacenter Blackwell)
+            "-gencode=arch=compute_103,code=sm_103",   # B300, GB300 NVL72 (Blackwell Ultra)
+            "-gencode=arch=compute_120,code=sm_120",   # RTX 50-series, RTX PRO 6000 (consumer Blackwell)
         ]
 
     ext = CUDAExtension(
@@ -191,9 +209,10 @@ setup(
     version="3.0.0",
     description=(
         "All-specialized per-arch optimizer kernels. "
-        "Supported: NVIDIA sm_80/sm_90/sm_100 (CUDA), AMD gfx942 (HIP), "
-        "TPU v5p/v6e (Pallas via JAX). CPU build for testing only. "
-        "No generic-kernel fallback, no tier fallback chain."
+        "Supported: NVIDIA sm_80/sm_89/sm_90/sm_100/sm_103/sm_120 (CUDA), "
+        "AMD gfx942/gfx950 (HIP), TPU v5p/v6e (Pallas via JAX). "
+        "CPU build for testing only. No generic-kernel fallback, no tier "
+        "fallback chain."
     ),
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
