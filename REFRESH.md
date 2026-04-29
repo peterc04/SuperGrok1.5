@@ -2,7 +2,7 @@
 
 A compact, granular catch-up. Plain language. Each kernel, file, and optimizer gets its own entry. No fluff, no withholding.
 
-> **NOTE — STRUCTURAL REFACTOR IN PROGRESS.** The codebase is migrating to an all-specialized per-arch layout (commit series starting at `866d42b`). Generic kernels, generated kernels, the runtime jit specializer, the tier fallback chain, and unsupported arch directories have been deleted. New layout, new bindings layer, new autotune scaffolding. **§0 below covers the post-refactor state. Most of §1–§30 still describe the pre-refactor architecture and are being updated section-by-section.** See `REFACTOR_PLAN.md` for the migration plan and progress.
+> **POST-REFACTOR.** The all-specialized per-arch refactor + arch-matrix expansion is complete. Eight GPU arches + two TPU versions are first-class citizens; there is no fallback chain and no generic-kernel tier. Subsequently the per-arch overlays have been folded into per-arch namespaces, the high-level vector-signature bindings have been restored from the deleted `csrc/common/ops.cpp`, and the cross-arch agreement test bodies have been filled in. **§0 below is the current state.** §1–§20 remain the pre-refactor reference and are still useful for understanding individual kernels and optimizers; they are not the source of truth on layout, dispatch, or bindings. Engineering work picks up from §0.5 ("What is NOT yet done") + §21 (overlay merges) + §22 (bindings state).
 
 ---
 
@@ -33,43 +33,89 @@ Anything else raises `UnsupportedArchError` or fails the build. Permanently unsu
 csrc/
 ├── common/          (shared headers; tuned_configs.h with 8-row tables)
 ├── bindings/        (per-optimizer dispatchers + pybind11 module)
+│                     _helpers.h with clip-grad / SAM-norm host helpers
+│                     _dispatch_macro.h with SG_DISPATCH + SG_DISPATCH_CALL
 └── kernels/
     ├── cuda/
-    │   ├── sm_80/   (17 wrapped baselines + 6 *_overlay.cu pre-tuned)
+    │   ├── sm_80/   (17 wrapped baselines + 5 arch-tuned files in
+    │   │            sg::sm80 namespace: muon TF32 inlined into canonical;
+    │   │            metanet_optimizers, metanet_cpasync_variants,
+    │   │            supergrok2_{backward,fused_elem,scan} folded in)
     │   ├── sm_89/   (17 wrapped baselines, ported from sm_90)
-    │   ├── sm_90/   (17 wrapped baselines + 5 *_overlay.cu pre-tuned)
-    │   ├── sm_100/  (17 wrapped baselines + 3 *_overlay.cu pre-tuned)
+    │   ├── sm_90/   (17 wrapped baselines + 3 arch-tuned files in
+    │   │            sg::sm90 namespace: muon FP8 inlined into canonical;
+    │   │            supergrok2_{backward,scan,warp_specialized} folded in)
+    │   ├── sm_100/  (17 wrapped baselines + 2 arch-tuned files in
+    │   │            sg::sm100 namespace: supergrok2_{precompute,scan}
+    │   │            folded in. Blackwell delegating overlay deleted —
+    │   │            per-arch baselines are sufficient)
     │   ├── sm_103/  (17 wrapped baselines, ported from sm_100)
     │   └── sm_120/  (17 wrapped baselines, ported from sm_100)
     ├── hip/
-    │   ├── gfx942/  (17 wrapped baselines + 3 *_overlay.hip.cpp pre-tuned)
-    │   └── gfx950/  (17 wrapped baselines + cdna4_kernels overlay
-    │                 with FP4/FP6/2:4 sparsity, recovered from git)
+    │   ├── gfx942/  (17 wrapped baselines + 1 arch-tuned file in
+    │   │            sg::gfx942 namespace: muon BF16 MFMA inlined into
+    │   │            canonical; supergrok2_gfx942 folded in. Trivial
+    │   │            metanet delegating overlay deleted)
+    │   └── gfx950/  (17 wrapped baselines + cdna4_kernels_gfx950.hip.cpp
+    │                 in sg::gfx950 namespace: FP4/FP6/2:4 sparsity
+    │                 kernels recovered from git history. Per-feature
+    │                 split deferred — see §21)
     ├── tpu/
-    │   ├── _pallas_kernels.py  (shared Pallas implementation, 1190 lines)
-    │   ├── v5p/                 (TPU v4/v5e/v5p, 128-wide MXU re-export)
-    │   ├── v6e/                 (TPU v6e, 256-wide MXU re-export)
+    │   ├── _pallas_kernels.py  (shared Pallas implementation)
+    │   ├── v5p/                 (tile-128 re-export for v4/v5e/v5p)
+    │   ├── v6e/                 (tile-256 re-export for v6e)
     │   └── __init__.py          (detect_tpu_version + get_kernels)
     └── cpu/         (avx512/, neon/, scalar; testing only)
 autotune/            (tune.py, grids.py with NVFP4/FP4/FP6 entries,
                      cutlass_profile.py for sm_89/103a/120a, runner.py)
 ```
 
-Removed entirely: `csrc/cuda/generic/`, `csrc/cuda/generated/`, `csrc/cuda/sm_75/86/89/`, `csrc/hip/cdna2/cdna3/cdna4/`, `csrc/cpu/` (moved), `csrc/common/{ops.h,ops.cpp,dispatch.h}`, `grokking_optimizers/jit/`, `codegen/`.
+Removed entirely: `csrc/cuda/generic/`, `csrc/cuda/generated/`,
+`csrc/cuda/sm_75/86/89/`, `csrc/hip/cdna2/cdna3/cdna4/`, `csrc/cpu/`
+(moved to `csrc/kernels/cpu/`), `csrc/common/{ops.h,ops.cpp,dispatch.h}`,
+`grokking_optimizers/jit/`, `grokking_optimizers/jit_kernels.py`,
+`codegen/`. All `*_overlay.*` files have been merged into per-arch
+namespaced kernels (this session's work — see §21).
 
 ### Per-arch kernel pattern
 
-Each per-arch source file is wrapped in `namespace sg::<arch> { ... }` so the four translation units do not collide on launcher / kernel symbols at link time. The 68 wrapped baselines (17 generic kernels × 4 arches) start out with identical math; per-arch divergence (cp.async, TMA, MFMA, FP8 paths, warp specialization) happens in future hardware-validated tuning passes. Cross-arch numerical agreement is guarded by `tests/test_cross_arch_agreement.py`.
+Each per-arch source file is wrapped in `namespace sg::<arch> { ... }`
+so the eight translation units do not collide on launcher / kernel
+symbols at link time. The 8 × 17 = 136 wrapped baselines start out
+with identical math; per-arch divergence (cp.async, TMA, MFMA, FP8
+paths, warp specialization) is layered on top via the merged-overlay
+files in §21 and via direct edits to canonical launchers (e.g. the
+muon Ampere TF32 / Hopper FP8 / CDNA3 BF16 MFMA paths inlined this
+session — see §21). Cross-arch numerical agreement is guarded by
+`tests/test_cross_arch_agreement.py` (now with filled-in test bodies
+for every optimizer including a Muon 2D-param harness).
 
-The `*_overlay.cu` (and `*_overlay.hip.cpp`) files are pre-existing arch-tuned kernels (Ampere cp.async, Hopper FP8/warp-specialized, Blackwell TMA scaffolding, gfx942 BF16 MFMA) that predate the refactor. They are excluded from the build (filtered out by `setup.py`) and kept in-tree as future merge targets — when a future GPU-equipped session merges an overlay into the canonical per-arch kernel, the overlay file is deleted.
+The `*_overlay.*` naming convention is gone. All overlay files have
+been folded into per-arch namespaced canonical files.
 
 ### Bindings layer
 
 - `csrc/bindings/bindings.h` — shared declarations and arch namespace anchors
-- `csrc/bindings/dispatch.cpp` — `detect_arch()`: returns one of `{80, 90, 100, 942}` or raises (no fallback chain)
-- `csrc/bindings/_dispatch_macro.h` — `SG_DISPATCH(method, args...)` switch on `detect_arch()`
-- `csrc/bindings/<optimizer>.cpp` — per-optimizer dispatcher (one file per optimizer + multi_tensor + moe + distributed_scan + quantization)
-- `csrc/bindings/module.cpp` — pybind11 aggregator; replaces the old monolithic `csrc/common/ops.cpp`
+- `csrc/bindings/dispatch.cpp` — `detect_arch()`: returns one of
+  `{80, 89, 90, 100, 103, 120, 942, 950}` or raises (no fallback chain)
+- `csrc/bindings/_dispatch_macro.h` — two macros:
+  - `SG_DISPATCH(method, args...)` — early-returns from the enclosing
+    function. Use at the tail of a per-tensor wrapper.
+  - `SG_DISPATCH_CALL(method, args...)` — same dispatch with `break`
+    instead of `return`. Use inside loops.
+- `csrc/bindings/_helpers.h` — host-side helpers shared by per-optimizer
+  binding files: `clip_grad_norms_device_side`,
+  `compute_sam_grad_norm_device_side`. Both do single-CPU-sync norm
+  reductions over a `std::vector<torch::Tensor>` (extracted verbatim
+  from the deleted `csrc/common/ops.cpp`).
+- `csrc/bindings/<optimizer>.cpp` — per-optimizer dispatcher. Each file
+  exposes both per-tensor wrappers (escape hatches for tests) and
+  high-level vector-signature entry points matching the pre-refactor
+  `ops.cpp`. The Python optimizers in `grokking_optimizers/*.py` call
+  the latter (e.g. `_ops.muon_fused_step(params, grads, bufs, ...)`).
+- `csrc/bindings/module.cpp` — pybind11 aggregator. Registers every
+  vector-signature entry point + every per-tensor wrapper. SG v2 entry
+  points remain unregistered — see §22.
 
 ### dispatch.py / __init__.py changes
 
@@ -105,13 +151,44 @@ The CUDA + HIP totals include large amounts of structurally-identical baseline c
 
 Lines of code in the eight `*_overlay.*` pre-tuned files (Hopper FP8 / Ampere cp.async / Blackwell TMA / gfx942 BF16 MFMA / CDNA4 FP4-FP6) account for roughly 12,000 lines of the CUDA/HIP totals; these files are excluded from the build until merged into the canonical per-arch kernels.
 
-### What is NOT yet done (deferred to hardware-validated sessions)
-- **Per-arch kernel divergence**: the 68 wrapped baselines are byte-identical (modulo namespace banners). Hand-tuned cp.async vs TMA vs MFMA divergence happens later under benchmarks.
-- **CUTLASS migration**: SG2 projection GEMMs and Muon Newton-Schulz GEMMs currently inherit the cuBLAS / rocBLAS paths from the wrapped generic. The CUTLASS rewrite (with fused softplus epilogue for dt_proj) is scaffolded in `autotune/cutlass_profile.py` but not yet implemented.
-- **Overlay merges**: the `*_overlay.*` files contain real arch-specific work (Hopper FP8, Ampere cp.async, Blackwell TMA, gfx942 BF16 MFMA) that needs to be folded into the canonical per-arch kernels. They are excluded from the build until merged.
-- **Bindings completeness**: `csrc/bindings/supergrok2.cpp` declares but doesn't define entry points; secondary launchers in `moe.cpp` / `multi_tensor.cpp` are stubbed with TODO markers. Filling these in requires reading every launcher signature, which is mechanical but tedious; deferred.
-- **Autotune execution**: `tuned_configs.h` currently has default `LaunchConfig` placeholders matching the existing hand-coded `__launch_bounds__`. Real autotune output requires hardware.
-- **Test suite under new layout**: tests exist (`test_amd_hip.py`, `test_all_arches.py`, `test_cross_arch_agreement.py` rewritten) but cannot be run without `torch` + a GPU. CI will need updating to exercise the four-row arch matrix.
+### 0.5 What is NOT yet done
+
+The all-specialized refactor and arch-matrix expansion are complete.
+Remaining work is engineering-focused, deferred until hardware:
+
+- **Real per-arch kernel divergence beyond Muon**: the muon Ampere
+  TF32 / Hopper FP8 / CDNA3 BF16 MFMA paths are inlined into the
+  canonical launchers (this session — §21). For the rest of the
+  optimizers, the 8 × 17 = 136 wrapped baselines remain byte-identical
+  modulo namespace banners. Hand-tuned cp.async vs TMA vs MFMA
+  divergence per-optimizer requires hardware to benchmark.
+- **CUTLASS migration**: SG2 projection GEMMs and Muon Newton-Schulz
+  GEMMs currently use cuBLAS / rocBLAS via `torch::mm`. The CUTLASS
+  rewrite (with fused softplus epilogue for SG2 `dt_proj`) is
+  scaffolded in `autotune/cutlass_profile.py` but not yet implemented;
+  `profile_gemm()` raises `NotImplementedError`.
+- **Specialized→canonical inlining for the merged overlays**: the
+  arch-tuning overlays were renamed and namespace-wrapped this
+  session, but their bodies are not yet inlined into the matching
+  canonical launchers. The arch-suffixed variants (e.g.
+  `sg::sm80::launch_X_ampere`) coexist with the wrapped baselines
+  (`sg::sm80::launch_X`). Full inline replacement is per-launcher
+  manual work that needs build verification — deferred. See §21.
+- **SG v2 bindings**: `csrc/bindings/supergrok2.cpp` is scaffolded
+  but does not yet define the SG2 entry points
+  (`supergrok2_mamba_peer_batched_step`,
+  `supergrok2_bilevel_fwd_save{_batched}`,
+  `supergrok2_bilevel_backward{_batched}`,
+  `supergrok2_prepare_and_batched_step`). Their per-arch launchers
+  exist; only the binding wrappers are missing. See §22.
+- **Autotune execution**: `tuned_configs.h` has default `LaunchConfig`
+  placeholders matching existing hand-coded `__launch_bounds__`. Real
+  autotune output requires hardware.
+- **Test suite under new layout**: tests exist
+  (`test_amd_hip.py`, `test_all_arches.py`, `test_cross_arch_agreement.py`
+  with filled-in bodies including a Muon 2D-param harness) but cannot
+  be run without torch + a GPU. CI will need updating to exercise the
+  eight-row arch matrix.
 
 ### Migration commit series
 
@@ -153,7 +230,7 @@ For navigation, the structural-refactor commits:
 
 ---
 
-## Contents (pre-refactor; sections below describe the OLD layout)
+## Contents (pre-refactor reference; sections below describe the OLD layout — see §0, §21, §22, §23 for current state)
 
 1. Repo layout
 2. Project state
@@ -817,6 +894,21 @@ Functional rewrite of the suite. ~300 lines of core logic vs ~2000 lines of CUDA
 
 Eight files, ~2,964 LOC. README still says six (stale). Total test points ~82.
 
+> **Post-refactor update.** `tests/test_cross_arch_agreement.py` — the
+> safety net for the all-specialized refactor — is no longer a stub.
+> Every per-optimizer test (`test_<optimizer>_cross_arch`) runs the
+> optimizer for N steps under each available `FORCE_ARCH` and asserts
+> elementwise `allclose()` across arches with tolerance `1e-4`. Arches
+> not compiled into the local extension are skipped. The Muon harness
+> uses 2D params (64×64 matrix) since its Newton-Schulz orthogonalization
+> requires `dim ≥ 2`. The whole class skips if no GPU is available.
+> See §0.5 + §21 for what arches are expected to agree.
+
+> The legacy CPU-fallback test `tests/test_cpu_fallback.py` had a
+> `test_setup_cpu_sources` checker that referenced `csrc/cpu/generic/`
+> paths deleted in `95b77e0`. It is now `test_setup_kernel_sources`,
+> which checks `setup.py` walks the post-refactor `csrc/kernels/` tree.
+
 ### `test_supergrok2.py` (27 sections, 12A–12AA)
 - 12A — import and build
 - 12B — sequential vs parallel scan equivalence (N from 1 to 1024)
@@ -1112,3 +1204,140 @@ Newest first.
 - Build: `setup.py`
 - User docs: `README.md`
 - Internal review: `ANALYSIS.md`
+
+
+---
+
+## 21. Overlay merges (this session)
+
+The 19 `*_overlay.*` files that predated the all-specialized refactor have been folded into the per-arch kernel tree. Three patterns were used:
+
+### 21.1. Inlined into canonical launchers (math-mode-style overlays)
+
+For overlays that wrapped a canonical launcher with a Tensor-Core math mode change, the wrap behavior was inlined directly into the canonical `launch_X` body. The arch-suffixed wrapper function is gone.
+
+- `csrc/kernels/cuda/sm_80/muon_sm80.cu` — `launch_muon_fused_step` now opens an `AmpereTF32Scope` RAII helper at the top, setting cuBLAS to `CUBLAS_TF32_TENSOR_OP_MATH` for the Newton-Schulz GEMMs (~2× over FP32 on A100). Restored on scope exit.
+- `csrc/kernels/cuda/sm_90/muon_sm90.cu` — `launch_muon_fused_step` now uses a `hopper_fp8_mm` helper (`cublasGemmEx` with `CUDA_R_8F_E4M3` inputs, FP32 accumulation). The leading `X^T @ X` GEMM uses FP8 when both dims ≥ 64; smaller GEMMs stay FP32. ~4× over FP32 on H100.
+- `csrc/kernels/hip/gfx942/muon_gfx942.hip.cpp` — `launch_muon_fused_step` now has a CDNA3 BF16 MFMA fast path at the top: when M ≥ 128 and 2D, converts the buffer to BF16 and runs the full NS chain through `torch::mm` (rocBLAS dispatches to `MFMA_F32_32x32x8_BF16`, ~2×). Below M = 128 falls through to FP32.
+
+### 21.2. Deleted (trivial delegators)
+
+These overlays did nothing but delegate to a generic launcher — the wrap was a no-op once the canonical was renamed into a per-arch namespace.
+
+- `csrc/kernels/cuda/sm_90/metanet_optimizers_sm90_overlay.cu` (Hopper metanet wrappers that delegated to `*_ampere`)
+- `csrc/kernels/cuda/sm_100/supergrok2_sm100_overlay.cu` (Blackwell SG2 that delegated to `*_hopper`)
+- `csrc/kernels/hip/gfx942/metanet_optimizers_gfx942_overlay.hip.cpp` (CDNA3 metanet wrappers that delegated to generic)
+
+### 21.3. Renamed + namespace-wrapped (arch-tuned new code)
+
+These overlays added genuinely new kernels (cp.async pipelining, warp specialization, TMA scaffolding, FP4/FP6/2:4-sparsity). They could not be discarded without losing engineering work, and a clean inline-into-canonical replacement requires hardware to verify. Each was renamed (drop `_overlay` suffix), wrapped in `namespace sg::<arch> { ... }`, and had its `#include "dispatch.h"` / `#include "ops.h"` stripped.
+
+| Old path | New path | Arch | Lines |
+|----------|----------|------|------:|
+| `cuda/sm_80/metanet_optimizers_sm80_overlay.cu` | `metanet_optimizers_sm80.cu` | sm80 | 706 |
+| `cuda/sm_80/metanet_cpasync_variants_sm80_overlay.cu` | `metanet_cpasync_variants_sm80.cu` | sm80 | 1477 |
+| `cuda/sm_80/supergrok2_backward_sm80_overlay.cu` | `supergrok2_backward_sm80.cu` | sm80 | 576 |
+| `cuda/sm_80/supergrok2_fused_elem_sm80_overlay.cu` | `supergrok2_fused_elem_sm80.cu` | sm80 | 358 |
+| `cuda/sm_80/supergrok2_scan_sm80_overlay.cu` | `supergrok2_scan_sm80.cu` | sm80 | 980 |
+| `cuda/sm_90/supergrok2_backward_sm90_overlay.cu` | `supergrok2_backward_sm90.cu` | sm90 | 203 |
+| `cuda/sm_90/supergrok2_scan_sm90_overlay.cu` | `supergrok2_scan_sm90.cu` | sm90 | 431 |
+| `cuda/sm_90/supergrok2_warp_specialized_sm90_overlay.cu` | `supergrok2_warp_specialized_sm90.cu` | sm90 | 445 |
+| `cuda/sm_100/supergrok2_precompute_sm100_overlay.cu` | `supergrok2_precompute_sm100.cu` | sm100 | 239 |
+| `cuda/sm_100/supergrok2_scan_sm100_overlay.cu` | `supergrok2_scan_sm100.cu` | sm100 | 862 |
+| `hip/gfx942/supergrok2_gfx942_overlay.hip.cpp` | `supergrok2_gfx942.hip.cpp` | gfx942 | 464 |
+| `hip/gfx950/cdna4_kernels_gfx950_overlay.hip.cpp` | `cdna4_kernels_gfx950.hip.cpp` | gfx950 | 2491 |
+
+These files now participate in the build. The per-feature split of the cdna4 kernels file (FP4 expert / FP6 state / 2:4 sparsity / fused combos) is deferred — the 14 kernels in that file share FP4 helper functions at the top that would need either duplication or extraction into a header.
+
+### 21.4. Inlining the arch-suffixed variants into canonical (post-refactor)
+
+The arch-suffixed launcher variants in §21.3 (`launch_X_ampere`, `launch_X_hopper`, `launch_X_cdna3`) coexist with the wrapped baseline `launch_X` inside the same per-arch namespace. The bindings layer currently calls `launch_X` (the wrapped baseline). To activate the arch-tuned path, either:
+
+  a. Replace the canonical `launch_X` body with the arch-suffixed body (drop the suffix). This requires reading both bodies per kernel and verifying behavior identity — best done on hardware.
+  b. Update the per-optimizer binding to call the arch-suffixed launcher when the detected arch matches. Less invasive but adds a second dispatch decision.
+
+Both approaches are mechanical given a working build. Until then, the build links both and only the wrapped baseline is reachable from Python.
+
+---
+
+## 22. Bindings layer state
+
+The pybind11 module surface is restored from the deleted 1700-line `csrc/common/ops.cpp`. Every Python-facing entry point that the optimizers in `grokking_optimizers/*.py` call is registered, except SG v2.
+
+### 22.1. Registered entry points (callable from Python)
+
+Each per-optimizer `csrc/bindings/<optimizer>.cpp` defines two API surfaces:
+
+  - **High-level vector-signature** — primary contract. Takes
+    `std::vector<torch::Tensor>&`, runs host-side bookkeeping
+    (per-step `bc1/bc2`, gradient clipping, batched norm reductions
+    with single CPU sync), then dispatches into the per-arch
+    multi-tensor or per-tensor launcher via `SG_DISPATCH_CALL`.
+    Names match the deleted `ops.cpp` exactly so Python optimizers
+    work unchanged.
+  - **Per-tensor wrappers** — escape hatches for tests. Take individual
+    `torch::Tensor` args and use the early-returning `SG_DISPATCH`.
+
+Both are registered in `csrc/bindings/module.cpp`. The vector-signature names below match what `grokking_optimizers/*.py` calls via `_ops.<name>`:
+
+| Optimizer | Vector entry points (registered) |
+|-----------|----------------------------------|
+| GrokAdamW | `grokadamw_fused_step`, `fused_adamw_simple_step` |
+| Lion | `lion_fused_step` |
+| Grokfast | `grokfast_fused_step` (EMA only), `grokfast_fused_ema_adam_step` |
+| Prodigy | `prodigy_fused_step` (returns updated `d_lr`) |
+| NeuralGrok | `neuralgrok_fused_step` |
+| LookSAM | `looksam_perturb_all`, `looksam_restore_all`, `looksam_compute_directions_and_adjust` |
+| Muon | `muon_fused_step` |
+| SG v1.5 | `supergrok15_fused_step`, `supergrok15_sam_perturb_all`, `supergrok15_sharpness_restore_all` |
+| SG v1.1 | `supergrok11_fused_step`, `supergrok11_sam_perturb_all`, `supergrok11_sharpness_restore_all` |
+| MoE | `moe_dynamic_expert_{load,fwd,bwd}`, `moe_filter_active_params`, `moe_scan_compacted`, `moe_scatter_results`, `moe_count_expert_activations`, `moe_compute_load_balance_loss`, `moe_apply_frequency_scaling` |
+| Distributed scan | `distributed_scan_phase{1,2,3}` |
+| Quantization | `fp8_e4m3_quantize`, `int8_symmetric_quantize`, `int4_gptq_quantize`, `mxfp4_quantize` |
+
+### 22.2. Stubbed (NOT yet registered) — SG v2
+
+`csrc/bindings/supergrok2.cpp` is scaffolded with a `DECLARE_SG2(NS)` macro shape and a clear TODO block. The per-arch launchers exist:
+
+  - `sg::<arch>::launch_mamba3_peer_step` (50+ args)
+  - `sg::<arch>::launch_mamba3_peer_batched_step`
+  - `sg::<arch>::launch_mamba3_peer_bilevel_fwd_save`
+  - `sg::<arch>::launch_mamba3_peer_bilevel_fwd_save_batched`
+  - `sg::<arch>::launch_mamba3_peer_backward`
+  - `sg::<arch>::launch_mamba3_peer_backward_batched`
+
+in `csrc/kernels/<arch>/supergrok2_{fwd,bwd}_<arch>.{cu,hip.cpp}`. The bindings need thin SG_DISPATCH-style wrappers that take the same args as each per-arch launcher. The signatures are 30–60 args each — large but mechanical to fill in given a build to verify against. Until that work is done, `_ops.supergrok2_*` raises `AttributeError` and the SG v2 Python optimizer falls into its meta-net Python fallback path. Reference for exact wrapper bodies: `git show 682eab4^:csrc/common/ops.cpp` (lines 908–1199, 1499–1611 in `ops.cpp`).
+
+### 22.3. Stale-reference audit
+
+The following stale references were cleaned up:
+
+  - `grokking_optimizers/supergrok2.py` — removed `from grokking_optimizers.jit import create_specializer` (the JIT package was deleted in `104f3ff`).
+  - `grokking_optimizers/jit_kernels.py` — deleted (self-contained runtime JIT compiler that nothing imported; obsolete under the no-fallback policy).
+  - `tests/test_cpu_fallback.py:test_setup_cpu_sources` — replaced with `test_setup_kernel_sources` (the old test referenced `csrc/cpu/generic/` paths that were deleted in `95b77e0`).
+
+`csrc/bindings/supergrok2.cpp` and a handful of overlay files retain `TODO(post-refactor)` markers to flag work that needs hardware to complete.
+
+---
+
+## 23. Where engineering work picks up
+
+The codebase compiles to a working _ops Python extension if a build succeeds (this session has not run the build). Once the user runs `pip install -e .` and a GPU is available:
+
+1. **Verify build** — fix any signature drift in the bindings layer that the C++ compiler catches. The most likely sources of drift are the SG v1.1 `launch_sg11_*` signatures (rewritten to match canonical); muon launcher arg orders; SG v1.5 21-arg full-step signature.
+2. **Run cross-arch agreement** — `pytest tests/test_cross_arch_agreement.py`. This is the regression net for any future per-arch kernel divergence.
+3. **Wire SG v2 bindings** — fill in `csrc/bindings/supergrok2.cpp` per §22.2. Each entry point is ~50 lines (signature + SG_DISPATCH switch). After this, `python -m pytest tests/test_supergrok2.py` should run end-to-end.
+4. **Inline arch-suffixed launchers into canonical bodies** — for each merged overlay (§21.4), pick replacement option (a) or (b) and apply. Hand-validate against `test_cross_arch_agreement.py`.
+5. **Run autotune** — `python autotune/tune.py` to populate `csrc/common/tuned_configs.h` with real `LaunchConfig` values per (kernel, arch, shape). Currently placeholder.
+6. **CUTLASS migration** — wire `autotune/cutlass_profile.py:profile_gemm()` to the actual `cutlass_profiler` binary. Migrate SG2 projection GEMMs (sm_89/90/100/103/120 hot paths) and Muon NS GEMMs to CUTLASS-emitted code.
+
+For each kernel, the hot path lives in:
+
+| Kernel topic | sm_80 file | sm_90 file | sm_100 file | gfx942 file | gfx950 file |
+|---|---|---|---|---|---|
+| Muon (NS + update) | `muon_sm80.cu` (TF32) | `muon_sm90.cu` (FP8) | `muon_sm100.cu` (baseline) | `muon_gfx942.hip.cpp` (BF16 MFMA) | `muon_gfx950.hip.cpp` (baseline) |
+| SG2 forward/scan | `supergrok2_fwd_sm80.cu` + `supergrok2_scan_sm80.cu` (cp.async) + `metanet_cpasync_variants_sm80.cu` | `supergrok2_fwd_sm90.cu` + `supergrok2_warp_specialized_sm90.cu` | `supergrok2_fwd_sm100.cu` + `supergrok2_precompute_sm100.cu` (TMA scaffolding) | `supergrok2_fwd_gfx942.hip.cpp` + `supergrok2_gfx942.hip.cpp` (BF16 MFMA precompute) | `supergrok2_fwd_gfx950.hip.cpp` + `cdna4_kernels_gfx950.hip.cpp` (FP4 expert MFMA) |
+| SG2 backward | `supergrok2_bwd_sm80.cu` + `supergrok2_backward_sm80.cu` | `supergrok2_bwd_sm90.cu` + `supergrok2_backward_sm90.cu` | `supergrok2_bwd_sm100.cu` | `supergrok2_bwd_gfx942.hip.cpp` | `supergrok2_bwd_gfx950.hip.cpp` |
+| SG v1.5/1.1 metanet | `metanet_optimizers_sm80.cu` (cp.async pipelined weight load) | (baseline, FP8 deferred — small MLP) | (baseline) | (baseline, BF16 MFMA marginal — small MLP) | (baseline) |
+| FP6 state / FP4 expert / 2:4 sparsity | n/a | n/a | n/a | n/a | `cdna4_kernels_gfx950.hip.cpp` |
+
