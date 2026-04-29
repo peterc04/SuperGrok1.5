@@ -401,7 +401,33 @@ void launch_muon_fused_step(
     float lr, float momentum, float weight_decay, int ns_steps,
     float a, float b, float c
 ) {
-    // 1. Momentum update + normalize
+    // CDNA3 BF16 MFMA path merged from muon_gfx942_overlay.hip.cpp:
+    // for M >= 128 the MI300X's MFMA_F32_32x32x8_BF16 instructions give
+    // ~2× throughput over FP32 mm. Below M=128 the BF16 conversion
+    // overhead exceeds the speedup, so fall through to the FP32 path.
+    int64_t M_param = param.dim() >= 2 ? param.size(0) : param.numel();
+    if (M_param >= 128 && param.dim() >= 2) {
+        momentum_buffer.mul_(momentum).add_(grad);
+        auto norm_t = momentum_buffer.norm();
+        auto inv_norm_t = torch::where(
+            norm_t > 1e-8f, torch::reciprocal(norm_t),
+            torch::zeros_like(norm_t));
+        auto G = (momentum_buffer * inv_norm_t).to(torch::kBFloat16);
+        int N_dim = param.size(1);
+        auto G_2d = G.view({M_param, N_dim});
+        for (int i = 0; i < ns_steps; i++) {
+            auto A_mat = torch::mm(G_2d.t(), G_2d);  // BF16 -> MFMA
+            auto AG = torch::mm(G_2d, A_mat);
+            auto AAG = torch::mm(AG, A_mat);
+            G_2d = a * G_2d + b * AG + c * AAG;
+        }
+        auto orth = G_2d.to(torch::kFloat32).view_as(param);
+        param.mul_(1.0f - lr * weight_decay);
+        param.add_(orth, -lr);
+        return;
+    }
+
+    // FP32 fallback path — small matrices (M < 128) or 1D params.
     float norm = (momentum_buffer.mul_(momentum).add_(grad)).norm().item<float>();
     float inv_norm = (norm > 1e-8f) ? (1.0f / norm) : 0.0f;
     auto X = momentum_buffer * inv_norm;

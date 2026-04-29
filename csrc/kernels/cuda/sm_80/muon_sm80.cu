@@ -11,6 +11,8 @@
  */
 
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cublas_v2.h>
 
 #include "platform.h"
 #include "utils.cuh"
@@ -396,11 +398,27 @@ void launch_muon_ns_combine_update_fused(
 //  the custom kernels above (with float4 fast path when possible).
 // ═══════════════════════════════════════════════════════════════════════
 
+// Ampere-tuning merged from muon_sm80_overlay.cu: enable TF32 cuBLAS Tensor
+// Core math for the Newton-Schulz GEMMs (~2× throughput on A100 vs FP32).
+// Element-wise launchers below are unchanged — they are compute-bound on
+// FP32 ALUs and don't benefit from Tensor Cores.
+struct AmpereTF32Scope {
+    cublasHandle_t handle;
+    AmpereTF32Scope() : handle(at::cuda::getCurrentCUDABlasHandle()) {
+        cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
+    }
+    ~AmpereTF32Scope() {
+        cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
+    }
+};
+
 void launch_muon_fused_step(
     torch::Tensor param, torch::Tensor momentum_buffer, torch::Tensor grad,
     float lr, float momentum, float weight_decay, int ns_steps,
     float a, float b, float c
 ) {
+    AmpereTF32Scope tf32_scope;  // TF32 Tensor Core math for the NS torch::mm calls
+
     // 1. Momentum update + normalize
     float norm = (momentum_buffer.mul_(momentum).add_(grad)).norm().item<float>();
     float inv_norm = (norm > 1e-8f) ? (1.0f / norm) : 0.0f;

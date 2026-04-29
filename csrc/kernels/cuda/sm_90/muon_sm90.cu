@@ -11,6 +11,8 @@
  */
 
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cublas_v2.h>
 
 #include "platform.h"
 #include "utils.cuh"
@@ -396,46 +398,82 @@ void launch_muon_ns_combine_update_fused(
 //  the custom kernels above (with float4 fast path when possible).
 // ═══════════════════════════════════════════════════════════════════════
 
+// Hopper FP8 helper merged from muon_sm90_overlay.cu. Uses cublasGemmEx
+// with CUDA_R_8F_E4M3 inputs and FP32 accumulation for ~4× speedup over
+// FP32 mm on H100. Per-tensor amax scaling keeps numerics in range.
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 11080
+static void hopper_fp8_mm(
+    cublasHandle_t handle,
+    torch::Tensor A, torch::Tensor B, torch::Tensor C,
+    int M, int N, int K, bool transpose_b)
+{
+    float a_scale = A.abs().max().item<float>() / 448.0f;
+    float b_scale = B.abs().max().item<float>() / 448.0f;
+    if (a_scale < 1e-12f) a_scale = 1e-12f;
+    if (b_scale < 1e-12f) b_scale = 1e-12f;
+    auto a_fp8 = (A / a_scale).to(torch::kFloat8_e4m3fn).contiguous();
+    auto b_fp8 = (B / b_scale).to(torch::kFloat8_e4m3fn).contiguous();
+    float alpha = a_scale * b_scale;
+    float beta = 0.0f;
+    cublasGemmEx(handle,
+        transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N, CUBLAS_OP_N,
+        N, M, K, &alpha,
+        b_fp8.data_ptr(), CUDA_R_8F_E4M3, transpose_b ? K : N,
+        a_fp8.data_ptr(), CUDA_R_8F_E4M3, K,
+        &beta, C.data_ptr<float>(), CUDA_R_32F, N,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+#endif
+
 void launch_muon_fused_step(
     torch::Tensor param, torch::Tensor momentum_buffer, torch::Tensor grad,
     float lr, float momentum, float weight_decay, int ns_steps,
     float a, float b, float c
 ) {
+    auto handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
+
     // 1. Momentum update + normalize
     float norm = (momentum_buffer.mul_(momentum).add_(grad)).norm().item<float>();
     float inv_norm = (norm > 1e-8f) ? (1.0f / norm) : 0.0f;
     auto X = momentum_buffer * inv_norm;
 
-    // 2. Newton-Schulz iterations (for 2D weight matrices)
+    // 2. Newton-Schulz iterations (for 2D weight matrices). Hopper FP8
+    // path covers the leading X_2d.t() @ X_2d GEMM (the largest one);
+    // the smaller A·X and AX·A products stay in FP32.
     if (X.dim() >= 2) {
         int M = X.size(0);
         int N_dim = X.size(1);
         auto X_2d = X.view({M, N_dim});
-
         float neg_lr = -lr;
         float decay = 1.0f - weight_decay * lr;
-
         for (int i = 0; i < ns_steps; i++) {
-            auto AX = torch::mm(torch::mm(X_2d.t(), X_2d), X_2d.t()).t();
-            auto AAX = torch::mm(torch::mm(X_2d.t(), torch::mm(X_2d, X_2d.t())), X_2d.t()).t();
-
+            torch::Tensor A_mat;
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 11080
+            if (M >= 64 && N_dim >= 64) {
+                A_mat = torch::empty({N_dim, N_dim}, X.options());
+                hopper_fp8_mm(handle, X_2d.t().contiguous(), X_2d, A_mat,
+                    N_dim, N_dim, M, false);
+            } else
+#endif
+            { A_mat = torch::mm(X_2d.t(), X_2d); }
+            auto AX = torch::mm(X_2d, A_mat);
+            auto AAX = torch::mm(AX, A_mat);
             if (i < ns_steps - 1) {
-                // Intermediate iteration: just ns_combine
                 launch_muon_ns_combine(X_2d, X_2d, AX, AAX, a, b, c);
             } else {
-                // Last iteration: fused ns_combine + update (saves one global mem round-trip)
                 launch_muon_ns_combine_update_fused(
                     param.view({M, N_dim}), X_2d, AX, AAX, a, b, c, neg_lr, decay);
-                return;  // param already updated
+                cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
+                return;
             }
         }
         X = X_2d.view_as(param);
     }
-
-    // 3. Fallback for 1D params or ns_steps==0: separate update
     float neg_lr = -lr;
     float decay = 1.0f - weight_decay * lr;
     launch_muon_update(param, X, neg_lr, decay);
+    cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
 }
 
 
