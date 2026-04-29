@@ -18,6 +18,8 @@
 #include <torch/extension.h>
 #include "platform.h"
 
+namespace sg { namespace gfx950 {
+
 // ═══════════════════════════════════════════════════════════════════════
 //  FP4 helper functions
 //
@@ -2489,3 +2491,5 @@ void cdna4_supergrok15_full_step(
         N, is_sparse, is_expert
     );
 }
+
+} } // namespace sg::gfx950

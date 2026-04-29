@@ -53,10 +53,10 @@ def _collect(globs):
     out = []
     for g in globs:
         out.extend(sorted(glob.glob(g)))
-    # Filter out *_overlay.* files: they are partial pre-existing
-    # specializations that have not yet been merged into the canonical
-    # per-arch kernel. They are kept in-tree for reference but excluded
-    # from the build until merged in a hardware-validated tuning pass.
+    # All *_overlay.* files have been merged into per-arch canonical
+    # kernels in csrc/kernels/{cuda,hip}/<arch>/. The filter is
+    # retained as a no-op safety net in case a stray overlay file is
+    # checked in by accident.
     return [s for s in out if "_overlay" not in os.path.basename(s)]
 
 
