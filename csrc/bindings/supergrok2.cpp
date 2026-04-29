@@ -676,4 +676,52 @@ void supergrok2_bilevel_backward_batched(
         checkpoint_interval);
 }
 
+// Pre-refactor csrc/common/ops.cpp::supergrok2_prepare_and_batched_step.
+// Lives in csrc/kernels/{cuda,hip}/<arch>/multi_tensor_prepare_<arch>.{cu,hip.cpp}
+// (not a launch_X — the per-arch host wrapper for the multi_tensor prepare
+// kernel + batched-step pipeline). Each arch translates this to one
+// ::sg::<arch>::supergrok2_prepare_and_batched_step.
+void supergrok2_prepare_and_batched_step(
+    std::vector<torch::Tensor> params,
+    std::vector<torch::Tensor> grads,
+    std::vector<torch::Tensor> exp_avgs,
+    std::vector<torch::Tensor> exp_avg_sqs,
+    std::vector<torch::Tensor> mamba_fwd_states,
+    std::vector<torch::Tensor> mamba_bwd_states,
+    std::vector<torch::Tensor> gru_states,
+    std::vector<torch::Tensor> mus,
+    std::vector<torch::Tensor> sharpnesses,
+    std::vector<int64_t> steps,
+    std::vector<double> layer_alphas,
+    std::vector<double> layer_beta1s,
+    double base_alpha, double gradient_clipping,
+    double beta2, double lr, double eps, double wd,
+    double lamb, double ramp, double gate_signal,
+    torch::Tensor mamba_fwd_A, torch::Tensor mamba_fwd_B,
+    torch::Tensor mamba_fwd_C, torch::Tensor mamba_fwd_D,
+    torch::Tensor mamba_fwd_dt,
+    torch::Tensor mamba_bwd_A, torch::Tensor mamba_bwd_B,
+    torch::Tensor mamba_bwd_C, torch::Tensor mamba_bwd_D,
+    torch::Tensor mamba_bwd_dt,
+    torch::Tensor gru_Wz, torch::Tensor gru_Wr, torch::Tensor gru_Wh,
+    torch::Tensor gru_bz, torch::Tensor gru_br, torch::Tensor gru_bh,
+    torch::Tensor peer_query_Ws,
+    torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+    torch::Tensor value_proj_W,
+    int64_t d_inner, int64_t d_state, int64_t n_experts, int64_t topk
+) {
+    if (params.empty()) return;
+    SG_DISPATCH(supergrok2_prepare_and_batched_step,
+        params, grads, exp_avgs, exp_avg_sqs,
+        mamba_fwd_states, mamba_bwd_states, gru_states, mus, sharpnesses,
+        steps, layer_alphas, layer_beta1s,
+        base_alpha, gradient_clipping, beta2, lr, eps, wd,
+        lamb, ramp, gate_signal,
+        mamba_fwd_A, mamba_fwd_B, mamba_fwd_C, mamba_fwd_D, mamba_fwd_dt,
+        mamba_bwd_A, mamba_bwd_B, mamba_bwd_C, mamba_bwd_D, mamba_bwd_dt,
+        gru_Wz, gru_Wr, gru_Wh, gru_bz, gru_br, gru_bh,
+        peer_query_Ws, prod_keys_A, prod_keys_B, value_proj_W,
+        d_inner, d_state, n_experts, topk);
+}
+
 } // namespace sg

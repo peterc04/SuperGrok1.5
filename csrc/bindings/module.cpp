@@ -256,6 +256,21 @@ void supergrok2_bilevel_backward_batched(
     torch::Tensor,
     torch::Tensor, torch::Tensor,
     int, int, int, int, int);
+void supergrok2_prepare_and_batched_step(
+    std::vector<torch::Tensor>, std::vector<torch::Tensor>,
+    std::vector<torch::Tensor>, std::vector<torch::Tensor>,
+    std::vector<torch::Tensor>, std::vector<torch::Tensor>,
+    std::vector<torch::Tensor>, std::vector<torch::Tensor>,
+    std::vector<torch::Tensor>,
+    std::vector<int64_t>, std::vector<double>, std::vector<double>,
+    double, double, double, double, double, double,
+    double, double, double,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    int64_t, int64_t, int64_t, int64_t);
 
 // ── MoE ───────────────────────────────────────────────────────────────
 void moe_dynamic_expert_load(
@@ -410,4 +425,8 @@ PYBIND11_MODULE(_ops, m) {
           "SuperGrok2 bilevel: full backward through meta-net");
     m.def("supergrok2_bilevel_backward_batched", &sg::supergrok2_bilevel_backward_batched,
           "SuperGrok2 bilevel: batched full backward through meta-net");
+    m.def("supergrok2_prepare_and_batched_step", &sg::supergrok2_prepare_and_batched_step,
+          "Fused multi-tensor grad prepare (clip, finite, bias corrections) "
+          "+ batched mamba-3+PEER step. Replaces N per-parameter Python "
+          "iterations with one kernel launch.");
 }
