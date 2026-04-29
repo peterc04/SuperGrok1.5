@@ -153,42 +153,102 @@ Lines of code in the eight `*_overlay.*` pre-tuned files (Hopper FP8 / Ampere cp
 
 ### 0.5 What is NOT yet done
 
-The all-specialized refactor and arch-matrix expansion are complete.
-Remaining work is engineering-focused, deferred until hardware:
+The all-specialized refactor, arch-matrix expansion, overlay merges,
+SG v2 binding wiring, ninja build wrapper, autotune execution layer,
+and CUTLASS scaffolding are now all complete. Remaining work is
+engineering-focused, deferred until hardware. See §25 for a structured
+list and §24 for the per-arch per-optimizer plan.
 
-- **Real per-arch kernel divergence beyond Muon**: the muon Ampere
-  TF32 / Hopper FP8 / CDNA3 BF16 MFMA paths are inlined into the
-  canonical launchers (this session — §21). For the rest of the
-  optimizers, the 8 × 17 = 136 wrapped baselines remain byte-identical
-  modulo namespace banners. Hand-tuned cp.async vs TMA vs MFMA
-  divergence per-optimizer requires hardware to benchmark.
-- **CUTLASS migration**: SG2 projection GEMMs and Muon Newton-Schulz
-  GEMMs currently use cuBLAS / rocBLAS via `torch::mm`. The CUTLASS
-  rewrite (with fused softplus epilogue for SG2 `dt_proj`) is
-  scaffolded in `autotune/cutlass_profile.py` but not yet implemented;
-  `profile_gemm()` raises `NotImplementedError`.
-- **Specialized→canonical inlining for the merged overlays**: the
-  arch-tuning overlays were renamed and namespace-wrapped this
-  session, but their bodies are not yet inlined into the matching
-  canonical launchers. The arch-suffixed variants (e.g.
-  `sg::sm80::launch_X_ampere`) coexist with the wrapped baselines
-  (`sg::sm80::launch_X`). Full inline replacement is per-launcher
-  manual work that needs build verification — deferred. See §21.
-- **SG v2 bindings**: `csrc/bindings/supergrok2.cpp` is scaffolded
-  but does not yet define the SG2 entry points
-  (`supergrok2_mamba_peer_batched_step`,
+Items that have been **completed since the previous REFRESH.md edit**:
+
+- **SG v2 bindings**: all seven SG2 entry points
+  (`supergrok2_mamba_peer_step`, `supergrok2_mamba_peer_batched_step`,
   `supergrok2_bilevel_fwd_save{_batched}`,
   `supergrok2_bilevel_backward{_batched}`,
-  `supergrok2_prepare_and_batched_step`). Their per-arch launchers
-  exist; only the binding wrappers are missing. See §22.
-- **Autotune execution**: `tuned_configs.h` has default `LaunchConfig`
-  placeholders matching existing hand-coded `__launch_bounds__`. Real
-  autotune output requires hardware.
-- **Test suite under new layout**: tests exist
-  (`test_amd_hip.py`, `test_all_arches.py`, `test_cross_arch_agreement.py`
-  with filled-in bodies including a Muon 2D-param harness) but cannot
-  be run without torch + a GPU. CI will need updating to exercise the
-  eight-row arch matrix.
+  `supergrok2_prepare_and_batched_step`) are wired in
+  `csrc/bindings/supergrok2.cpp` and registered in
+  `csrc/bindings/module.cpp`. Each is a thin SG_DISPATCH wrapper
+  around the per-arch launcher. See §22.1.
+- **Inlining of arch-suffixed launchers**: the §21.4 inlining pass
+  is complete for sm_80 (Ampere TF32 wrap inlined into supergrok15 /
+  supergrok11 / neuralgrok / sg2 backward / sg2 scan canonicals),
+  sm_100 (Blackwell prefix dropped from supergrok2_precompute /
+  supergrok2_scan symbol names), and gfx942 (CDNA3 BF16 MFMA inlined
+  into mamba_peer_batched_step canonical). sm_90 cleaned up trivial
+  delegators; sm_90 FP8 fast-path inlining is **deferred** because
+  the existing hopper-suffixed launcher's non-FP8 fallback called
+  `ampere_*` symbols defined only in `sg::sm80` (not visible from
+  `sg::sm90`). Full FP8 inline requires the architecture restructuring
+  noted in §25.
+- **gfx950 CDNA4 split**: the 2491-line `cdna4_kernels_gfx950.hip.cpp`
+  monolith has been split into four per-feature files
+  (`fp4_expert_kernels`, `fp6_state_kernels`, `sparse24_kernels`,
+  `fused_combos`) with shared FP4/FP6 helpers extracted into
+  `csrc/common/fp4_helpers.hip.h`. All helpers are
+  `__device__ static __forceinline__` so each TU gets internal-linkage
+  copies and avoids ODR errors.
+- **Ninja-backed build with multi-arch AOT fatbin**: `setup.py` now
+  uses `BuildExtension.with_options(use_ninja=True)`, emits
+  `-gencode arch=compute_X,code=sm_X` for every supported arch plus
+  PTX embedding of `compute_120` for forward-compat driver JIT, and
+  detects ccache/sccache via `CMAKE_*_COMPILER_LAUNCHER`. `build.sh`
+  wraps `pip install -e . --no-build-isolation -v` with a tqdm
+  progress bar that parses ninja `[N/M]` lines, plus `--autotune`
+  (two-pass), `--debug` (cuda-gdb), and `--profile` (NCU) modes.
+  `pyproject.toml` adds `ninja` to build-system requires; bumped
+  to version 3.0.0.
+- **Autotune execution layer**: `autotune/runner.py:bench()` records
+  one `(start, stop)` CUDA event pair per iteration with a single
+  post-loop `torch.cuda.synchronize()`, returns median microseconds.
+  `autotune/cutlass_profile.py:profile_gemm()` invokes the
+  `cutlass_profiler` binary, parses CSV output (column-name drift
+  tolerant), returns sorted-by-latency results. `autotune/tune.py`
+  orchestrates per-arch grids and writes winners between
+  `// AUTOTUNE_BEGIN` / `// AUTOTUNE_END` markers in
+  `tuned_configs.h`. The C++ `LaunchConfig` table itself is left
+  intact for hand-tuned fallback values.
+- **CUTLASS migration scaffold**: `third_party/cutlass` is registered
+  as a v3.6.0 submodule (not cloned in this session — the user runs
+  `git submodule update --init` later). `setup.py` adds CUTLASS
+  include dirs + `-DCUTLASS_NVCC_ARCHS=90a/100a/103a/120a` + a new
+  `WITH_CUTLASS=1` opt-in flag. `csrc/kernels/cuda/_cutlass_gemm.cuh`
+  exposes `cutlass_gemm_fp16/bf16` and `cutlass_dt_proj_fused`
+  helpers (the latter currently runs the unfused linear-combo GEMM
+  and relies on the pre-existing `softplus_bias_kernel` post-pass —
+  fused softplus epilogue is deferred per §25). Muon Newton-Schulz
+  GEMMs (sm_90/100/103/120) and the SG2 five-projection set
+  (`in_proj_x`, `in_proj_z`, `dt_proj`, `B_proj`, `C_proj` — actually
+  in `supergrok2_bwd_*.cu`'s `bilevel_precompute_gemm` helper, not
+  the fwd files as initially expected) are wrapped in
+  `#ifdef WITH_CUTLASS` so the existing torch::mm path stays the
+  default until the user opts in. sm_80/sm_89 keep cuBLAS, gfx942/950
+  keep rocBLAS. `tests/test_cutlass_parity.py` asserts CUTLASS output
+  matches cuBLAS within 1e-3 (FP16) or 1e-4 (BF16).
+- **Build-error post-merge audit**: 41 stale `#include "ops.h"` and
+  `#include "dispatch.h"` references stripped from per-arch kernel
+  TUs (both headers were deleted in `682eab4` but the includes
+  survived). `BatchedScanCtx` struct (used by 9 SG2 forward TUs)
+  recovered into `csrc/common/types.h`. `ArchTier` /
+  `StatePrecision` / `ExpertPrecision` enums recovered into a new
+  `csrc/common/arch_tier.h` shim with constexpr `kArchTier` picked
+  per-TU via `SG_ARCH_<X>` preprocessor switches; legacy `ArchTier::X`
+  call sites in distributed_pipeline TUs continue to work without
+  body edits. The `csrc/kernels/hip/gfx942/supergrok2_gfx942.hip.cpp`
+  delegating overlay was deleted (its remaining bodies were trivial
+  passthrough wrappers to symbols that no longer exist).
+- **Cross-arch agreement test bodies**: filled in for every
+  optimizer including a Muon 2D-param harness (`tests/test_cross_arch_agreement.py`).
+
+Items that **remain deferred** (engineering work — see §25 for detail):
+
+- Real per-arch kernel divergence beyond Muon (the 8 × 17 = 136
+  wrapped baselines are still byte-identical modulo namespace).
+- Hopper FP8 fast-path inlining for SG2 (`launch_mamba3_peer_batched_step`
+  on sm_90) and Blackwell warp-specialized scan activation
+  beyond the renamed `_warp_specialized` declarators.
+- Fused softplus epilogue in CUTLASS for SG2 `dt_proj`.
+- Real autotune output (placeholders remain in `tuned_configs.h`).
+- CI updates for the eight-row arch matrix.
 
 ### Migration commit series
 
@@ -1322,14 +1382,22 @@ The following stale references were cleaned up:
 
 ## 23. Where engineering work picks up
 
-The codebase compiles to a working _ops Python extension if a build succeeds (this session has not run the build). Once the user runs `pip install -e .` and a GPU is available:
+This section was the original "what to do next" pointer. After the
+post-refactor sweep + CUTLASS scaffold + ninja build + autotune
+wiring + SG v2 binding completion, **§24 (per-arch per-optimizer
+rundown) and §25 (engineering remaining) supersede this section.**
+Items below are kept as historical reference for the navigation path
+that led to the current state. For the live work-remaining list,
+read §25.
 
-1. **Verify build** — fix any signature drift in the bindings layer that the C++ compiler catches. The most likely sources of drift are the SG v1.1 `launch_sg11_*` signatures (rewritten to match canonical); muon launcher arg orders; SG v1.5 21-arg full-step signature.
-2. **Run cross-arch agreement** — `pytest tests/test_cross_arch_agreement.py`. This is the regression net for any future per-arch kernel divergence.
-3. **Wire SG v2 bindings** — fill in `csrc/bindings/supergrok2.cpp` per §22.2. Each entry point is ~50 lines (signature + SG_DISPATCH switch). After this, `python -m pytest tests/test_supergrok2.py` should run end-to-end.
-4. **Inline arch-suffixed launchers into canonical bodies** — for each merged overlay (§21.4), pick replacement option (a) or (b) and apply. Hand-validate against `test_cross_arch_agreement.py`.
-5. **Run autotune** — `python autotune/tune.py` to populate `csrc/common/tuned_configs.h` with real `LaunchConfig` values per (kernel, arch, shape). Currently placeholder.
-6. **CUTLASS migration** — wire `autotune/cutlass_profile.py:profile_gemm()` to the actual `cutlass_profiler` binary. Migrate SG2 projection GEMMs (sm_89/90/100/103/120 hot paths) and Muon NS GEMMs to CUTLASS-emitted code.
+The codebase compiles to a working _ops Python extension if a build succeeds (this session has not run the build). Once the user runs `bash build.sh` (or `pip install -e .`) and a GPU is available:
+
+1. **Verify build** — `bash build.sh --no-autotune` runs `pip install -e . --no-build-isolation -v` through ninja with a tqdm progress bar. Any signature drift the C++ compiler catches will land in `build.log`. Most likely sources of build-time signature drift were the SG v1.1 `launch_sg11_*` signatures, muon launcher arg orders, and SG v1.5's 21-arg full-step signature — all rewritten this session to match the canonical kernel signatures (see §22.1).
+2. **Run cross-arch agreement** — `pytest tests/test_cross_arch_agreement.py`. This is the regression net for any future per-arch kernel divergence; `FORCE_ARCH=<n>` cycles through compiled-in arches.
+3. **Run CUTLASS parity** — `git submodule update --init --recursive third_party/cutlass`, then `WITH_CUTLASS=1 bash build.sh`, then `pytest tests/test_cutlass_parity.py`. Verifies CUTLASS GEMM output matches cuBLAS within FP tolerance for Muon NS and SG2 projections on Hopper+/Blackwell.
+4. **Run autotune** — `bash build.sh --autotune` does a stub-config build, runs `python autotune/tune.py` to sweep grids, writes winners between the `// AUTOTUNE_BEGIN` / `// AUTOTUNE_END` markers in `csrc/common/tuned_configs.h`, then rebuilds.
+5. **Profile hot paths** — `bash build.sh --profile` builds with `-lineinfo` and runs `ncu --set full` against `benchmarks/profile_smoke.py` (5 steps × 11 optimizers).
+6. **Walk the per-arch per-optimizer rundown** — see §24 for the hot-path-per-cell map; pick a (optimizer, arch) cell and start hand-tuning. §25 lists the highest-payoff items in priority order.
 
 For each kernel, the hot path lives in:
 
@@ -1340,4 +1408,660 @@ For each kernel, the hot path lives in:
 | SG2 backward | `supergrok2_bwd_sm80.cu` + `supergrok2_backward_sm80.cu` | `supergrok2_bwd_sm90.cu` + `supergrok2_backward_sm90.cu` | `supergrok2_bwd_sm100.cu` | `supergrok2_bwd_gfx942.hip.cpp` | `supergrok2_bwd_gfx950.hip.cpp` |
 | SG v1.5/1.1 metanet | `metanet_optimizers_sm80.cu` (cp.async pipelined weight load) | (baseline, FP8 deferred — small MLP) | (baseline) | (baseline, BF16 MFMA marginal — small MLP) | (baseline) |
 | FP6 state / FP4 expert / 2:4 sparsity | n/a | n/a | n/a | n/a | `cdna4_kernels_gfx950.hip.cpp` |
+
+
+---
+
+## 24. Per-arch per-optimizer rundown
+
+This section walks every optimizer over every supported arch and
+describes the shape of the hot path: what's identical to the
+canonical math, what's arch-specific, where tensor cores are wired,
+which precision is in flight, what memory tier holds what, and where
+hand-tuning is still pending. Pure English; no code or pseudocode.
+The goal is a printable map that lets a hardware-equipped engineer
+walk into any (optimizer, arch) cell and know what to expect before
+opening the file.
+
+### 24.1 SuperGrok v2 — Mamba-3+PEER+GRU meta-net
+
+The largest optimizer. Each step runs a recurrent affine prefix scan
+over packed segments, an in-place GRU, a PEER product-key router into
+a stack of FP32 expert MLPs, and an Adam+Lamb update. The hot paths
+are the prefix scan, the projection GEMMs (`in_proj_x`, `in_proj_z`,
+`dt_proj`, `B_proj`, `C_proj`), and the expert MLP.
+
+**sm_80 (Ampere — A100 / A30 / A10):** canonical math; uses Ampere
+TF32 tensor cores via cuBLAS for projection GEMMs; the prefix scan
+and expert MLP both have cp.async double-buffered shared-memory
+loads (the variants in `metanet_cpasync_variants_sm80.cu` were
+inlined into the canonical full-step launcher this session). Shared
+memory budget per SM is 164 KB on A100 / 100 KB on RTX 30; the scan
+kernel sizes its cp.async stages to fit either. Register pressure
+is high (~96 per thread); occupancy targets are 2 blocks/SM. Expert
+weights live in shared memory pinned with `__ldg` for L1 hits;
+`bc1`/`bc2` arrive as scalars. GEMMs go through cuBLAS (TF32).
+Hand-tune: pipeline-depth = 3 vs 4, segment block size for the
+prefix scan, expert-tile shape per `(num_experts, expert_hidden)`.
+Gotcha: A10 has only 24 GB; SG2 with `d_state=128` and large
+`expert_hidden` blows past the workspace limit — fall back to
+`d_state=64`.
+
+**sm_89 (Ada Lovelace — RTX 40 / L40 / L40S):** canonical math;
+identical to sm_80 today (the wrapped baseline was ported from
+sm_90 in commit `bf157b4`). FP8 E4M3 tensor cores are present on
+Ada but the SG2 projections currently use FP16 → no FP8 path is
+active. Shared memory per SM is 100 KB. cuBLAS TF32 path; CUTLASS
+not yet engaged on this arch (kept on cuBLAS — see §0.5 CUTLASS
+note). Hand-tune: small-batch occupancy (sm_89 has 128 SMs at most
+on L40S, often half on RTX 40-series); FP8 path for the projection
+GEMMs would give the largest wins on consumer Ada. Gotcha: L40S
+lacks NVLink, so the `distributed_*pipeline` files fall back to
+PCIe ring all-gather.
+
+**sm_90 (Hopper — H100 / H200):** canonical math plus FP8 E4M3
+CUTLASS GEMMs for the five projections when `WITH_CUTLASS=1` is
+set. The warp-specialized scan kernel
+(`launch_scan_warp_specialized` and `launch_scan_warp_specialized_d16`
+in `supergrok2_warp_specialized_sm90.cu`) is declared in the
+`sg::sm90` namespace but is **not yet wired** into the canonical
+`launch_mamba3_peer_batched_step` — see §25. Shared memory is 228
+KB per SM (Hopper's bonus); register pressure tighter (~80 per
+thread to keep 2 blocks/SM at the launch bounds). TMA descriptors
+are scaffolded in `supergrok2_precompute_sm100.cu` but not on
+sm_90. GEMMs: CUTLASS sm_90a (FP8 E4M3 inputs, FP32 accumulate)
+when opted in, else cuBLAS. Hand-tune: warp-specialization
+producer/consumer ratio; CTA cluster size (Hopper supports 16-CTA
+clusters via DSMEM); tail-effect on small batches. Gotcha: the
+suffixed-launcher's non-FP8 fallback referenced `ampere_*` symbols
+visible only from `sg::sm80`; full FP8 inline is deferred — see §25.
+
+**sm_100 (Datacenter Blackwell — B100 / B200 / GB200):** canonical
+math; TMA-pre-compute scaffolding lives in
+`supergrok2_precompute_sm100.cu` (was `_blackwell` suffix; renamed
+this session). Shared memory budget per SM is 228 KB (same as
+Hopper). Register pressure is very high (~112 per thread for the
+fused full-step launcher); occupancy is 1 block/SM at full feature
+set. NVFP4 is **not** yet active here — that lives on sm_103. GEMMs
+go through CUTLASS sm_100a when `WITH_CUTLASS=1`, else cuBLAS.
+Hand-tune: TMA descriptor reuse across scan segments; 4th-gen
+tensor core utilization for the dt_proj fused softplus epilogue
+(currently unfused — see §25). Gotcha: B100/GB200 cluster topology
+favors 16-CTA clusters; the scan kernel does not yet exploit
+DSMEM-shared cross-CTA reductions.
+
+**sm_103 (Blackwell Ultra — B300 / GB300 NVL72):** canonical math;
+the **NVFP4 hot path** lives here for the projections via CUTLASS
+sm_103a target (NVFP4 is a 4-bit FP format with shared exponent
+blocks of 16; native to Blackwell Ultra tensor cores). Shared memory
+per SM matches sm_100 (228 KB). Register pressure similar. GEMMs:
+CUTLASS sm_103a when `WITH_CUTLASS=1`, else cuBLAS (cuBLAS does NOT
+have NVFP4 on Blackwell Ultra at the time of this writing — opting
+out of CUTLASS here means falling back to FP16). Hand-tune: NVFP4
+block-scaling factor calibration; the autotune grid in
+`autotune/grids.py` already lists the sm_103a NVFP4 entries, the
+profiler binary needs running on hardware. Gotcha: NVFP4 requires
+careful per-block scale handling; numerical accuracy validation must
+guard against scale-overflow.
+
+**sm_120 (Consumer Blackwell — RTX 50 / RTX PRO 6000):** canonical
+math; uses CUTLASS sm_120a target when `WITH_CUTLASS=1`. **Shared
+memory is 128 KB per SM** — significantly less than sm_100 / sm_103's
+228 KB. The scan and full-step kernels need re-tuned tile sizes for
+this constraint; current placeholder values in `tuned_configs.h`
+match sm_100, which will under-occupy on sm_120. GEMMs: CUTLASS
+sm_120a or cuBLAS. Hand-tune: shared-memory tile reduction (likely
+halve the segment block size); FP4 / NVFP4 are present on RTX PRO
+6000 but the consumer RTX 50 cards have varying tensor-core mix.
+Gotcha: RTX PRO 6000 has 96 GB; consumer RTX 5090 has 32 GB —
+respect the workspace ceiling.
+
+**gfx942 (CDNA3 — MI300X / MI300A):** canonical math plus a CDNA3
+BF16 MFMA fast path inlined into `launch_mamba3_peer_batched_step`
+(this session — §21.1). The pipeline runs setup+sort →
+`cdna3_precompute_bf16` (BF16 MFMA via `torch::mm` →
+`MFMA_F32_32x32x8_BF16`) → scan+fused-elem. LDS budget per CU is
+64 KB; register pressure is moderate (~64 VGPRs). MI300X has 192 GB
+HBM3 — workspace effectively unlimited. GEMMs: rocBLAS
+(MFMA-backed BF16 matmul). Hand-tune: BF16 MFMA tile shape, LDS
+double-buffering depth, async copy queue depth. Gotcha: MI300X
+unified memory between CPU and GPU on MI300A means the `param`
+buffer can live in CPU memory pages; verify the kernel sees
+device pointers.
+
+**gfx950 (CDNA4 — MI350X / MI355X):** canonical math; the
+**FP4 expert MFMA** path lives in `fp4_expert_kernels_gfx950.hip.cpp`
+(post-split — §21.3). The expert weights are stored as packed FP4
+(8 values per uint32) in HBM; loaded and dequantized to FP32 via
+helpers in `csrc/common/fp4_helpers.hip.h`; the MMA itself uses
+`__builtin_amdgcn_mfma_f32_16x16x128_fp4`. FP6 E3M2 state packing
+lives in `fp6_state_kernels_gfx950.hip.cpp`; 2:4 structured sparsity
+in `sparse24_kernels_gfx950.hip.cpp`. LDS per CU is 64 KB. GEMMs:
+rocBLAS for the FP32 fallback; native FP4 MMA for expert weights;
+no CUTLASS here. Hand-tune: FP4 quant scale calibration, LDS-bank
+conflict avoidance, FP6 unpack throughput vs the affine-scan
+recurrence. Gotcha: stochastic rounding for FP4 quant uses a Philox
+hash (`philox_hash` in fp4_helpers); the seed must be deterministic
+across distributed ranks.
+
+**TPU v5p (128-wide MXU):** the JAX/Pallas implementation in
+`csrc/kernels/tpu/v5p/` (re-exports from `_pallas_kernels.py`) tiles
+the prefix scan and projections for the 128-lane MXU; `dt_proj`'s
+softplus epilogue is naturally fused in Pallas via XLA fusion. No
+FP4/FP6/FP8; uses BF16 throughout. HBM pressure is 32 GB per chip;
+v5p pods scale to 8960 chips. Hand-tune: pjit sharding spec for
+`d_state` and `num_experts`; the host XLA cache should be warmed.
+Gotcha: TPU v5p does NOT support custom CUDA kernels — the entire
+SG2 path runs through Pallas; `_ops.supergrok2_*` is unused on TPU.
+
+**TPU v6e (256-wide MXU):** identical math to v5p; tiled for the
+256-lane MXU instead. The Pallas kernel module re-exports tile-256
+variants via `csrc/kernels/tpu/v6e/`. Effective throughput per chip
+is roughly 2× v5p for projection GEMMs; the prefix scan is bound
+by HBM bandwidth in both cases and gains less. Hand-tune: lane-256
+tile shape for the expert MLP; this is wider than the typical
+expert hidden size (8–32) so most tiles will be padded — the Pallas
+kernel needs explicit tile slicing to avoid wasted MXU cycles.
+
+### 24.2 SuperGrok v1.5
+
+A grokking-aware optimizer with a small two-layer MLP meta-net
+(`hidden_dim` ∈ {16, 32, 64, 128} typical), Lamb-style trust-ratio
+update, fused SAM perturb / sharpness restore, and per-step
+gradient clipping. The hot path is the fused 21-arg full-step
+launcher.
+
+**sm_80:** canonical math; the cp.async-pipelined weight-load
+variant (formerly `_ampere`) is now the canonical body of
+`launch_fused_supergrok15_full_step` — sets cuBLAS to
+`CUBLAS_TF32_TENSOR_OP_MATH` via the `AmpereTF32Scope` RAII helper,
+then dispatches to one of four templated H={16,32,64,128} fast
+paths or the runtime-H cp.async kernel. Shared memory budget is
+~16 KB per block (4 weight tiles × hidden_dim floats + 1 scratch).
+Register pressure is low (~48); occupancy 4 blocks/SM. GEMMs go
+through cuBLAS (TF32) for the projection step, but the meta-net
+itself is small enough to fit in registers per block. Hand-tune:
+hidden_dim-specialized launch bounds; cp.async stages.
+
+**sm_89:** canonical math; baseline ported from sm_90. FP8 path on
+the meta-net is **not yet active** — the MLP is small (~64-256
+params) so FP8 buys little vs the cp.async weight-pipelining win.
+cuBLAS TF32 for the trust-ratio cuBLAS reduction. Hand-tune: at
+sm_89's 100 KB shared memory, slightly lower occupancy is OK because
+the per-block smem footprint is small.
+
+**sm_90:** canonical math; baseline. FP8 deferred — the meta-net
+weights (`W1`, `b1`, `W2`, `b2`) are FP32 in the current Python
+optimizer and do not benefit from FP8 conversion at scale. The
+warp-specialized scan does not apply (the SG1.5 step is element-wise
+in the param dimension, not a recurrence). GEMMs: none — the meta-net
+runs through the per-thread inline ALU. Hand-tune: hidden-dim 128
+specialization for Hopper's larger register file.
+
+**sm_100:** canonical math; baseline. TMA scaffolding does not apply
+(no large GEMM in the hot path). Smem budget ample (228 KB/SM).
+Hand-tune: launch bounds for B100/B200 SM count differences; not
+much to gain from Blackwell-specific features here vs sm_90.
+
+**sm_103:** canonical math; baseline. NVFP4 inapplicable to a small
+meta-net. Same as sm_100.
+
+**sm_120:** canonical math; baseline. Smem 128 KB/SM but the SG1.5
+per-block footprint is ~16 KB, so the constraint doesn't bite.
+Tile launch on RTX 50 / PRO 6000 should target high occupancy.
+
+**gfx942:** canonical math; baseline. BF16 MFMA marginal for the
+small MLP — the matmul is too small to amortize MFMA setup cost.
+LDS budget per CU is 64 KB; well under.
+
+**gfx950:** canonical math; baseline. FP4 expert MFMA path doesn't
+apply (no expert MoE in SG1.5). Inherits gfx942's "MFMA marginal"
+gotcha.
+
+**TPU v5p:** Pallas implementation tiles the meta-net 2-layer MLP
+across the 128-wide MXU; bias-corrections and Lamb trust-ratio run
+in parallel via XLA. BF16. SAM perturb/restore are fused into
+`pjit` graph regions.
+
+**TPU v6e:** identical to v5p; tile 256. The meta-net is small
+enough that v6e's 2× throughput advantage shows up only in the
+projection step, not the meta-net itself. Hand-tune: avoid padding
+the MXU below 256 lanes when `hidden_dim < 256` — pack multiple
+parameters' meta-nets into a single MXU launch.
+
+### 24.3 SuperGrok v1.1
+
+Predecessor of SG v1.5 — same grokking-aware MLP meta-net structure
+but with a simpler 2-phase pipeline: `launch_sg11_mu_metanet` →
+runtime cosine-gate computation → `launch_sg11_adam_decay`. SAM
+perturb/restore are also exposed.
+
+**sm_80:** canonical math; baseline mu_metanet kernel wraps in
+`AmpereTF32Scope` for the meta-net GEMM. Smem budget similar to
+SG1.5 (~16 KB/block). Register pressure low (~48). cuBLAS TF32 GEMM.
+Hand-tune: cosine-gate fusion into the metanet kernel (currently a
+separate kernel call).
+
+**sm_89:** baseline. Same notes as SG1.5/sm_89.
+
+**sm_90:** baseline. Hopper FP8 deferred for the same MLP-too-small
+reason as SG1.5.
+
+**sm_100:** baseline. TMA inapplicable.
+
+**sm_103:** baseline. NVFP4 inapplicable.
+
+**sm_120:** baseline. Smem 128 KB constraint doesn't bite.
+
+**gfx942:** baseline. BF16 MFMA marginal.
+
+**gfx950:** baseline.
+
+**TPU v5p:** Pallas tiling for 128-wide MXU. The mu_metanet → cosine
+gate → adam_decay pipeline runs as a single XLA graph, so the
+intermediate `cosine_gate` value never leaves SRAM.
+
+**TPU v6e:** tile-256. Same shape as v5p; 2× throughput on the
+metanet GEMM.
+
+### 24.4 GrokAdamW
+
+Plain AdamW with grokking-detection scheduling and slow/fast
+parameter ramps. The hot path is `grokadamw_fused_step` which
+merges the parameter update, decay, and bias-correction across all
+parameters in one launch.
+
+**sm_80:** canonical math; baseline. cp.async pipelining for the
+multi-tensor parameter list (each block handles one parameter).
+Cuda Graph capture friendly. Smem budget ~4 KB/block. Register
+pressure low. cuBLAS GEMM not used (purely element-wise).
+Hand-tune: per-block param batching to coalesce small parameter
+tensors into larger work units.
+
+**sm_89:** baseline. Identical to sm_80 today.
+
+**sm_90:** baseline. Could exploit DSMEM for cross-CTA reductions
+when computing the global gradient norm; not yet wired.
+
+**sm_100:** baseline. TMA inapplicable.
+
+**sm_103:** baseline. Lamb path could use NVFP4 for the trust-ratio
+GEMM; very low priority — small relative cost.
+
+**sm_120:** baseline. Smem 128 KB/SM is fine for this lightweight
+optimizer.
+
+**gfx942:** baseline. LDS budget under-used.
+
+**gfx950:** baseline. FP4 expert MFMA inapplicable.
+
+**TPU v5p:** the AdamW step is naturally vectorizable in Pallas;
+runs at MXU peak throughput when shape is divisible by 128.
+
+**TPU v6e:** tile-256.
+
+### 24.5 NeuralGrok
+
+Grokking optimizer with a two-layer MLP "amplifier" that scales the
+effective gradient direction. Smaller than SG1.5's meta-net but has
+a per-step amplifier-net pass.
+
+**sm_80:** canonical math; baseline amplifier kernel inherits the
+TF32 wrap from sm_80's metanet variant inlining. Smem ~8 KB/block.
+Hand-tune: amplifier hidden-dim specialization analogous to SG1.5.
+
+**sm_89:** baseline.
+
+**sm_90:** baseline. Same FP8-deferred reasoning as SG1.5.
+
+**sm_100:** baseline.
+
+**sm_103:** baseline. NVFP4 inapplicable.
+
+**sm_120:** baseline. Smem easy.
+
+**gfx942:** baseline.
+
+**gfx950:** baseline.
+
+**TPU v5p:** Pallas tile-128 for the amplifier 2-layer MLP.
+
+**TPU v6e:** tile-256.
+
+### 24.6 Prodigy
+
+Adaptive learning-rate optimizer with a `d_lr` adaptation that
+accumulates per-step. Returns the updated `d_lr` from the C++
+binding. Hot path: `prodigy_fused_step`.
+
+**sm_80:** canonical math; baseline. Element-wise update; no GEMM.
+Smem trivial. cp.async unhelpful (no shared-memory weight reuse).
+Hand-tune: warps-per-block for maximum occupancy on a single fused
+update + reduction.
+
+**sm_89:** baseline. Same.
+
+**sm_90:** baseline. DSMEM cross-CTA reductions could improve the
+adaptive-LR aggregation; deferred.
+
+**sm_100:** baseline.
+
+**sm_103:** baseline.
+
+**sm_120:** baseline. Smem inapplicable (no smem usage).
+
+**gfx942:** baseline. CDNA3 BF16 MFMA inapplicable (no GEMM).
+
+**gfx950:** baseline.
+
+**TPU v5p:** Pallas; the d_lr accumulation is a scalar reduction
+across all parameter tensors — a parallel reduction is implicit in
+Pallas via XLA.
+
+**TPU v6e:** tile-256.
+
+### 24.7 Grokfast
+
+Two-mode optimizer: an EMA-only mode (`grokfast_fused_step`) and a
+GrokFast-EMA + Adam variant (`grokfast_fused_ema_adam_step`). Both
+run a single fused element-wise pass per parameter.
+
+**sm_80:** canonical math; baseline. Element-wise; no GEMM. Smem
+trivial. Hand-tune: combined parameter batching for many small
+tensors (currently one block per parameter).
+
+**sm_89:** baseline.
+
+**sm_90:** baseline.
+
+**sm_100:** baseline.
+
+**sm_103:** baseline.
+
+**sm_120:** baseline.
+
+**gfx942:** baseline.
+
+**gfx950:** baseline.
+
+**TPU v5p:** trivially Pallas-vectorizable.
+
+**TPU v6e:** tile-256.
+
+### 24.8 Lion
+
+Sign-momentum optimizer. The simplest hot path: one fused
+sign(beta1·m + (1-beta1)·g) + decay update.
+
+**sm_80:** canonical math; baseline. Pure element-wise; no GEMM.
+Sign function compiles to a `selp` PTX instruction (branchless,
+warp-uniform).
+
+**sm_89:** baseline.
+
+**sm_90:** baseline.
+
+**sm_100:** baseline.
+
+**sm_103:** baseline.
+
+**sm_120:** baseline.
+
+**gfx942:** baseline. AMD's equivalent of `selp` — compiles to
+`v_cndmask_b32`.
+
+**gfx950:** baseline.
+
+**TPU v5p:** Pallas trivially vectorizable; sign function is a
+single XLA op.
+
+**TPU v6e:** tile-256.
+
+### 24.9 LookSAM
+
+Sharpness-Aware Minimization variant with periodic direction caching.
+Three entry points: `looksam_perturb_all` (param + clones backup),
+`looksam_restore_all` (param ← backup), and
+`looksam_compute_directions_and_adjust` (batched 2-sync norm
+reductions). The norm reductions are the bottleneck.
+
+**sm_80:** canonical math; baseline. The 2-sync reduction (vs N
+syncs in the naive form) is the key optimization: stacks all
+parameter norms into one device tensor and does a single CPU sync
+to read them. Smem trivial. Hand-tune: warp-shuffle reduction over
+the per-parameter chunks.
+
+**sm_89:** baseline.
+
+**sm_90:** baseline. DSMEM could combine all CTAs' reductions
+without going to global memory; deferred.
+
+**sm_100:** baseline.
+
+**sm_103:** baseline.
+
+**sm_120:** baseline.
+
+**gfx942:** baseline. Wave-reduction primitives on CDNA3 are
+similar to NVIDIA's warp-shuffle.
+
+**gfx950:** baseline.
+
+**TPU v5p:** Pallas; the global-norm reduction is a single XLA
+all-reduce at the host side.
+
+**TPU v6e:** tile-256.
+
+### 24.10 Muon
+
+Newton-Schulz orthogonalization optimizer for 2D parameters. The hot
+path is the 5-step iteration `X ← (a·X + b·X·Xᵀ·X + c·X·Xᵀ·X·Xᵀ·X)`
+with constants (a, b, c) = (3.4445, -4.7750, 2.0315). Two GEMMs
+per step. Has been the canonical worked-example for arch divergence:
+TF32 on Ampere, FP8 on Hopper, BF16 MFMA on CDNA3 — all inlined this
+session into the canonical `launch_muon_fused_step` body (§21.1).
+
+**sm_80:** canonical math + Ampere TF32 fast path. Opens an
+`AmpereTF32Scope` RAII helper, which sets the cuBLAS handle to
+`CUBLAS_TF32_TENSOR_OP_MATH` for the duration of the NS chain;
+restores on scope exit. ~2× speedup over plain FP32 on A100. cuBLAS
+is the GEMM engine; CUTLASS not engaged on sm_80 (kept on cuBLAS
+per the Task 5 spec). Hand-tune: NS-step granularity (current is
+unrolled across all 5 steps in one launcher).
+
+**sm_89:** canonical math + TF32 (same as sm_80). FP8 GEMMs not yet
+wired here — would buy ~4× over FP32 like Hopper, but consumer Ada's
+small SM count limits the absolute win.
+
+**sm_90:** canonical math + Hopper FP8 fast path. Uses a
+`hopper_fp8_mm` helper (`cublasGemmEx` with `CUDA_R_8F_E4M3` inputs,
+FP32 accumulation) for the leading `X·Xᵀ` GEMM when both dims ≥ 64;
+smaller GEMMs stay FP32. ~4× speedup on H100. With `WITH_CUTLASS=1`
+the GEMM goes through CUTLASS sm_90a's FP16/BF16 paths instead of
+cuBLAS FP8 — the choice between them is currently per-build, not
+per-shape; revisit on hardware. Hand-tune: when to cross over from
+cuBLAS-FP8 to CUTLASS-FP16; FP8 quant scale calibration.
+
+**sm_100:** canonical math; baseline (no FP8 wrap inlined). CUTLASS
+sm_100a routes the GEMMs when `WITH_CUTLASS=1`. The 4th-gen tensor
+core on Blackwell could use FP4, but the NS chain is small (typical
+2D param is 64×64 to 1024×1024) and FP4 quant overhead is non-trivial.
+Hand-tune: NS-iteration count for very small matrices (could drop
+from 5 to 3 with a tighter spectral-norm bound).
+
+**sm_103:** canonical math. NVFP4 hot path possible via CUTLASS
+sm_103a but not yet activated for Muon (deferred — the spectral norm
+bounds for NVFP4 vs FP16 NS are not yet validated).
+
+**sm_120:** canonical math; CUTLASS sm_120a path for the GEMM.
+Smem 128 KB — adequate.
+
+**gfx942:** canonical math + CDNA3 BF16 MFMA fast path. When M ≥ 128
+and the param is 2D, converts to BF16 and runs the full NS chain
+through `torch::mm` (rocBLAS dispatches to `MFMA_F32_32x32x8_BF16`).
+~2× speedup. Below M=128 falls back to FP32. CUTLASS not engaged on
+AMD.
+
+**gfx950:** canonical math; baseline. CDNA4 has FP4 MMA but Muon is
+not (yet) routed through it — same reason as sm_103: spectral-norm
+validation needed. rocBLAS for the GEMM.
+
+**TPU v5p:** Pallas; the NS chain is 5 matmuls per step, all
+naturally MXU-accelerated. BF16. Tile-128.
+
+**TPU v6e:** tile-256. The NS GEMMs are usually too small (64–1024)
+to fully fill the 256-wide MXU; expect modest speedup over v5p.
+
+### 24.11 MoE / Mamba3PEER (auxiliary entries)
+
+Beyond SG2's own MoE-routed expert MLP, a separate MoE binding
+surface exposes nine entries
+(`moe_dynamic_expert_{load,fwd,bwd}`, `moe_filter_active_params`,
+`moe_scan_compacted`, `moe_scatter_results`,
+`moe_count_expert_activations`, `moe_compute_load_balance_loss`,
+`moe_apply_frequency_scaling`) for use outside SG2. These power the
+Mamba3PEER block in `grokking_optimizers/mamba3_peer_metanet.py`
+which can run independently of any optimizer.
+
+**sm_80:** canonical math; baseline. Token routing uses a top-k
+selection kernel; expert weights loaded with cp.async pipelining.
+Hand-tune: top-k threshold for L1-vs-shared-memory expert weight
+caching.
+
+**sm_89:** baseline.
+
+**sm_90:** baseline. Hopper warp specialization is the highest-value
+wire-up here (each expert's MLP becomes a producer/consumer pipeline).
+
+**sm_100:** baseline. TMA descriptor reuse across expert loads is
+the highest-value Blackwell win.
+
+**sm_103:** baseline. NVFP4 expert weights on sm_103a would be a
+direct MoE quantization win — needs profiling against accuracy.
+
+**sm_120:** baseline. Smem 128 KB constrains how many experts fit
+in cache simultaneously.
+
+**gfx942:** baseline. BF16 MFMA expert MLP is the natural fit.
+
+**gfx950:** **the FP4 expert MFMA hot path** — uses
+`fp4_expert_kernels_gfx950.hip.cpp` directly via the MoE bindings;
+8 FP4 weights packed per uint32_t in HBM; dequantized to FP32 in
+LDS via `fp4_helpers.hip.h`. Stochastic rounding with Philox.
+This is the canonical "real divergence" implementation across the
+arch matrix.
+
+**TPU v5p:** Pallas; expert routing in a single XLA shard map; v5p's
+8-way TPU pod can hold the full expert table in HBM.
+
+**TPU v6e:** tile-256. v6e's 256-wide MXU pairs naturally with
+expert hidden dims of 256+; smaller experts pad and waste throughput.
+
+---
+
+## 25. Engineering work remaining
+
+The all-specialized refactor, eight-arch expansion, overlay merges,
+SG v2 binding wiring, ninja build wrapper, autotune execution layer,
+and CUTLASS migration scaffolding are now complete. What remains is
+real per-arch hand-tuning and a small set of items that need
+hardware to validate. Rough order of expected payoff:
+
+**1. Hopper FP8 fast-path inlining for SG2 batched step.** The
+`launch_mamba3_peer_batched_step_hopper` body had real FP8 E4M3
+projections via `cublasGemmEx` (helpers `hopper_fp8_gemm` and
+`hopper_precompute_fp8`) but its non-FP8 fallback called
+`ampere_batched_scan_and_fused_elem` — defined only in `sg::sm80`
+and invisible from `sg::sm90` at link time. To activate, the
+fallback path needs restructuring: either copy the `ampere_*`
+helpers into `sg::sm90` (preferred — keeps math identical), or
+replace the batched_step with a direct in-namespace pipeline that
+matches sm_80's structure. After that, the FP8 helpers can be
+inlined into the canonical body. Expected ~2× over the current
+torch::mm on H100.
+
+**2. Hopper warp-specialized scan activation.** The
+`launch_scan_warp_specialized` and `launch_scan_warp_specialized_d16`
+declarations in `supergrok2_warp_specialized_sm90.cu` are unwired
+from the canonical scan launcher. To activate, the canonical
+batched-step needs a code-path that picks the warp-specialized
+variant when `d_state` is uniform across all parameters in the
+batch — typically true for SG2. Expected ~1.5× on H100/H200 for
+long-segment workloads.
+
+**3. Real autotune output for tuned_configs.h.** All 17 optimizers
+× 8 GPU arches = 136 entries currently use placeholder
+`LaunchConfig` values that match hand-coded `__launch_bounds__` in
+the per-arch baselines. Run `bash build.sh --autotune` on hardware:
+this does a stub-config build, runs `python autotune/tune.py` to
+sweep grids, writes winners between the
+`// AUTOTUNE_BEGIN`/`// AUTOTUNE_END` markers in
+`csrc/common/tuned_configs.h`, then rebuilds. Expected 5–30%
+launch-config wins per arch.
+
+**4. Fused softplus epilogue in CUTLASS for SG2 dt_proj.** The
+current `cutlass_dt_proj_fused` runs the unfused linear-combo GEMM
+plus a separate `softplus_bias_kernel` post-pass. CUTLASS 3.x's
+`EpilogueOp` template can fuse `softplus(x + bias)` into the GEMM
+tail, saving one elementwise pass over the dt activation. Math is
+identical; the API surface change is internal to CUTLASS.
+
+**5. NVFP4 path for Blackwell Ultra (sm_103) projections.** The
+CUTLASS sm_103a target is wired in `setup.py` but the SG2 Python
+optimizer still passes FP16 / BF16 for the projection inputs. To
+activate, the projection precompute (in the Python pre-step) needs
+an NVFP4 quantization pass with proper block-scaling factors;
+`autotune/grids.py` already lists the sm_103a NVFP4 entries for
+the autotune sweep.
+
+**6. sm_120 retuned tile sizes.** Consumer Blackwell has 128 KB
+shared memory per SM versus sm_100 / sm_103's 228 KB. Current
+placeholder `tuned_configs.h` values for sm_120 mirror sm_100 and
+will under-occupy. The autotune sweep above will detect this; the
+specific kernels affected are SG2's batched scan and the metanet
+cp.async variants.
+
+**7. CDNA4 FP4 / FP6 / 2:4 sparsity engagement beyond MoE.**
+Currently only the MoE expert path uses gfx950's native FP4 MFMA.
+Wiring NVFP4-equivalent FP4 into the SG2 projections, FP6 state
+into the scan recurrence, and 2:4 sparsity into the dt_proj weights
+are all open per-experiment opportunities. Profiling required.
+
+**8. DSMEM for cross-CTA reductions on Hopper / Blackwell.** Norm
+reductions (LookSAM, GrokAdamW, Prodigy, the SAM step in SG1.5/1.1)
+all currently round-trip through global memory. DSMEM (distributed
+shared memory across CTA clusters, available on sm_90+) can do
+cross-CTA reductions without that round-trip. Expected ~5–10% on
+the global-norm step.
+
+**9. Per-feature gfx950 file split refinement.** The post-split
+gfx950 files (`fp4_expert`, `fp6_state`, `sparse24`, `fused_combos`)
+currently use `__device__ static __forceinline__` helpers in
+`fp4_helpers.hip.h` to avoid ODR. Each TU gets its own internal
+copy of every helper; the `__constant__` LUT is wrapped in an
+anonymous namespace for the same reason. If a future refactor wants
+shared helpers (single copy in the binary), they need to move to a
+non-template `.cpp` file with explicit `extern` declarations from
+each TU.
+
+**10. CI matrix for the eight-row arch sweep.** Tests
+(`test_amd_hip.py`, `test_all_arches.py`,
+`test_cross_arch_agreement.py` with the Muon 2D harness,
+`test_cutlass_parity.py`) exist but the CI runner needs configuring
+to exercise the full {sm_80, sm_89, sm_90, sm_100, sm_103, sm_120,
+gfx942, gfx950} × {test_*.py} matrix. The cross-arch agreement
+test honors `FORCE_ARCH=<n>` so a single multi-build CI image can
+run the full matrix.
+
+**11. CPU SIMD test paths.** The `csrc/kernels/cpu/{avx512,neon}/`
+files exist but are testing-only and not exercised under any
+public test. A small `tests/test_cpu_simd.py` that runs each
+optimizer for a few steps on CPU would catch SIMD regressions
+without needing a GPU. Low priority.
+
+**12. PyPI-distributable wheel.** Current build is `pip install -e .`
+only. An `auditwheel`-compatible binary wheel build for the
+eight-arch fatbin would make distribution trivial; needs a CI
+host with all toolchains (CUDA + ROCm + AVX-512). Not urgent
+while the project is under active iteration.
 
