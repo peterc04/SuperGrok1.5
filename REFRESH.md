@@ -2,9 +2,108 @@
 
 A compact, granular catch-up. Plain language. Each kernel, file, and optimizer gets its own entry. No fluff, no withholding.
 
+> **NOTE — STRUCTURAL REFACTOR IN PROGRESS.** The codebase is migrating to an all-specialized per-arch layout (commit series starting at `866d42b`). Generic kernels, generated kernels, the runtime jit specializer, the tier fallback chain, and unsupported arch directories have been deleted. New layout, new bindings layer, new autotune scaffolding. **§0 below covers the post-refactor state. Most of §1–§30 still describe the pre-refactor architecture and are being updated section-by-section.** See `REFACTOR_PLAN.md` for the migration plan and progress.
+
 ---
 
-## Contents
+## 0. Post-refactor state (NEW)
+
+### Supported arches (no fallback)
+
+- **NVIDIA**: `sm_80` (Ampere family — A100, A10, RTX 3090, L4, RTX 4090 all route here), `sm_90` (Hopper, H100), `sm_100` (Blackwell, B200)
+- **AMD**: `gfx942` (CDNA3, MI300X) only
+- **CPU**: testing only, not a runtime fallback
+- Anything else (`sm_70/75`, `gfx908/gfx90a/gfx950`, RDNA): build fails or `dispatch.get_gpu_arch()` raises `UnsupportedArchError`
+
+### Filesystem layout
+
+```
+csrc/
+├── common/          (shared headers; tuned_configs.h NEW)
+├── bindings/        (NEW: per-optimizer dispatchers + pybind11 module)
+└── kernels/         (NEW: all per-arch kernels)
+    ├── cuda/
+    │   ├── sm_80/   (17 wrapped baselines + 6 *_overlay.cu pre-tuned)
+    │   ├── sm_90/   (17 wrapped baselines + 5 *_overlay.cu pre-tuned)
+    │   └── sm_100/  (17 wrapped baselines + 3 *_overlay.cu pre-tuned)
+    ├── hip/
+    │   └── gfx942/  (17 wrapped baselines + 3 *_overlay.hip.cpp pre-tuned)
+    ├── tpu/
+    │   ├── _pallas_kernels.py  (shared Pallas implementation, 1190 lines)
+    │   ├── v5p/                 (TPU v4/v5e/v5p, 128-wide MXU re-export)
+    │   ├── v6e/                 (TPU v6e, 256-wide MXU re-export)
+    │   └── __init__.py          (detect_tpu_version + get_kernels)
+    └── cpu/         (avx512/, neon/, scalar; testing only)
+autotune/            (NEW: tune.py, grids.py, runner.py, cutlass_profile.py)
+```
+
+Removed entirely: `csrc/cuda/generic/`, `csrc/cuda/generated/`, `csrc/cuda/sm_75/86/89/`, `csrc/hip/cdna2/cdna3/cdna4/`, `csrc/cpu/` (moved), `csrc/common/{ops.h,ops.cpp,dispatch.h}`, `grokking_optimizers/jit/`, `codegen/`.
+
+### Per-arch kernel pattern
+
+Each per-arch source file is wrapped in `namespace sg::<arch> { ... }` so the four translation units do not collide on launcher / kernel symbols at link time. The 68 wrapped baselines (17 generic kernels × 4 arches) start out with identical math; per-arch divergence (cp.async, TMA, MFMA, FP8 paths, warp specialization) happens in future hardware-validated tuning passes. Cross-arch numerical agreement is guarded by `tests/test_cross_arch_agreement.py`.
+
+The `*_overlay.cu` (and `*_overlay.hip.cpp`) files are pre-existing arch-tuned kernels (Ampere cp.async, Hopper FP8/warp-specialized, Blackwell TMA scaffolding, gfx942 BF16 MFMA) that predate the refactor. They are excluded from the build (filtered out by `setup.py`) and kept in-tree as future merge targets — when a future GPU-equipped session merges an overlay into the canonical per-arch kernel, the overlay file is deleted.
+
+### Bindings layer
+
+- `csrc/bindings/bindings.h` — shared declarations and arch namespace anchors
+- `csrc/bindings/dispatch.cpp` — `detect_arch()`: returns one of `{80, 90, 100, 942}` or raises (no fallback chain)
+- `csrc/bindings/_dispatch_macro.h` — `SG_DISPATCH(method, args...)` switch on `detect_arch()`
+- `csrc/bindings/<optimizer>.cpp` — per-optimizer dispatcher (one file per optimizer + multi_tensor + moe + distributed_scan + quantization)
+- `csrc/bindings/module.cpp` — pybind11 aggregator; replaces the old monolithic `csrc/common/ops.cpp`
+
+### dispatch.py / __init__.py changes
+
+- `dispatch.get_gpu_arch()` returns one of `{80, 90, 100, 942}` or raises `UnsupportedArchError`
+- Tier helpers (`get_arch_tier`, `get_amd_tier`, `get_amd_label`) are gone
+- `assert_supported_arch()` and `SUPPORTED_ARCHES` are new public surface
+- `__version__` bumped to `3.0.0` (breaking)
+- `_HAS_OPS` simplified: extension or error
+
+### Autotune
+
+`autotune/tune.py` is the offline tuner: runs each kernel × arch × shape × config grid, picks the median-fastest, writes `csrc/common/tuned_configs.h`. The header is committed. CUTLASS GEMMs (SG2 projections, Muon Newton-Schulz) go through `cutlass_profile.py`. Currently scaffolding — `runner.py:bench()` and `cutlass_profile.py:profile_gemm()` raise `NotImplementedError`; they need a hardware-equipped session to wire to `torch.utils.cpp_extension` and the CUTLASS profiler binary.
+
+### TPU dispatch
+
+Pallas kernels moved from `supergrok2_jax_tpu/pallas_kernels.py` to `csrc/kernels/tpu/`. The shared implementation is `_pallas_kernels.py`; v5p re-exports the tile-128 variants, v6e re-exports the tile-256 variants. `csrc/kernels/tpu/__init__.py:get_kernels()` selects based on `detect_tpu_version()`. `supergrok2_jax_tpu/pallas_kernels.py` is now a backwards-compat shim that re-exports from the new path.
+
+### What is NOT yet done (deferred to hardware-validated sessions)
+
+- **Per-arch kernel divergence**: the 68 wrapped baselines are byte-identical (modulo namespace banners). Hand-tuned cp.async vs TMA vs MFMA divergence happens later under benchmarks.
+- **CUTLASS migration**: SG2 projection GEMMs and Muon Newton-Schulz GEMMs currently inherit the cuBLAS / rocBLAS paths from the wrapped generic. The CUTLASS rewrite (with fused softplus epilogue for dt_proj) is scaffolded in `autotune/cutlass_profile.py` but not yet implemented.
+- **Overlay merges**: the `*_overlay.*` files contain real arch-specific work (Hopper FP8, Ampere cp.async, Blackwell TMA, gfx942 BF16 MFMA) that needs to be folded into the canonical per-arch kernels. They are excluded from the build until merged.
+- **Bindings completeness**: `csrc/bindings/supergrok2.cpp` declares but doesn't define entry points; secondary launchers in `moe.cpp` / `multi_tensor.cpp` are stubbed with TODO markers. Filling these in requires reading every launcher signature, which is mechanical but tedious; deferred.
+- **Autotune execution**: `tuned_configs.h` currently has default `LaunchConfig` placeholders matching the existing hand-coded `__launch_bounds__`. Real autotune output requires hardware.
+- **Test suite under new layout**: tests exist (`test_amd_hip.py`, `test_all_arches.py`, `test_cross_arch_agreement.py` rewritten) but cannot be run without `torch` + a GPU. CI will need updating to exercise the four-row arch matrix.
+
+### Migration commit series
+
+For navigation, the structural-refactor commits:
+
+- `895c32e` — `REFACTOR_PLAN.md`
+- `866d42b` — create new directory tree
+- `864499c` — `git mv` 27 existing arch-specific files into new tree
+- `e180964` — rename pre-existing arch-tuned files to `*_overlay`
+- `5d8085a` — wrap 17 generic kernels into 68 per-arch baselines
+- `4f71d02` — bindings layer + worked-example GrokAdamW dispatcher
+- `9eb21d4` — per-optimizer bindings + pybind11 module aggregator
+- `c8022cc` — refactor dispatch.py / loader / __init__.py
+- `e9d22cf` — move Pallas TPU kernels to `csrc/kernels/tpu/`
+- `6a50d3e` — autotune scaffolding + `tuned_configs.h`
+- `f422ada` — rewrite `setup.py` for new tree
+- `3683945` — `tests/test_cross_arch_agreement.py`
+- `6307566` — refactor `tests/test_amd_hip.py` and `tests/test_all_arches.py`
+- `8c2280d` — delete unsupported arches (sm_75/86/89, cdna2/cdna4)
+- `8725e3a` — delete `csrc/cuda/generic/` (17 files) + `csrc/cuda/generated/` (30 files)
+- `95b77e0` — delete `csrc/cpu/` tree
+- `104f3ff` — delete `grokking_optimizers/jit/` and `codegen/`
+- `682eab4` — delete `csrc/common/{ops.h,ops.cpp,dispatch.h}`
+
+---
+
+## Contents (pre-refactor; sections below describe the OLD layout)
 
 1. Repo layout
 2. Project state
