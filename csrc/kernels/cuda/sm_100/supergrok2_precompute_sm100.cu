@@ -7,12 +7,12 @@
  * (E2M1) Tensor Core instructions. On sm_100, the FP4 Tensor Cores
  * deliver 2x throughput vs FP8 on Hopper for projection GEMMs.
  *
- * blackwell_fp4_gemm: A static helper that performs FP4 GEMM using
+ * fp4_gemm: A static helper that performs FP4 GEMM using
  *   cuBLAS with CUDA_R_4F_E2M1 input descriptors and FP32
  *   accumulation. Per-tensor absmax block scaling with scale_factor
  *   = max(|tensor|) / 6.0 (FP4 E2M1 max representable value).
  *
- * blackwell_precompute_fp4: Runs all 6 projection GEMMs in FP4:
+ * precompute_fp4: Runs all 6 projection GEMMs in FP4:
  *   x = input_proj(grad * sharpness)  [d_model -> d_inner]
  *   dt, B, C, z = scan_proj(x)        [d_inner -> d_state * 4]
  *
@@ -39,7 +39,7 @@ namespace sg { namespace sm100 {
 // ═══════════════════════════════════════════════════════════════════════
 
 /*
- * blackwell_fp4_gemm — FP4 E2M1 GEMM via cuBLAS on sm_100+.
+ * fp4_gemm — FP4 E2M1 GEMM via cuBLAS on sm_100+.
  *
  * Performs: C = alpha * A @ B^T + beta * C
  *   A: [M, K] FP32 -> quantized to FP4
@@ -56,7 +56,7 @@ namespace sg { namespace sm100 {
  * This function uses a compatibility path that works with
  * current cuBLAS versions.
  */
-static void blackwell_fp4_gemm(
+static void fp4_gemm(
     cublasHandle_t handle,
     const float* A, const float* B, float* C,
     int M, int N, int K,
@@ -133,7 +133,7 @@ __global__ void fp4_scale_kernel(
 //  Blackwell FP4 Precompute — 6 Projection GEMMs
 // ═══════════════════════════════════════════════════════════════════════
 
-void blackwell_precompute_fp4(
+void precompute_fp4(
     // Input
     torch::Tensor grad_flat,      // [N_total, d_model]
     torch::Tensor sharpness_flat, // [N_total]
@@ -185,7 +185,7 @@ void blackwell_precompute_fp4(
     // then use the GEMM.
 
     // GEMM 1: pre_x = scaled_grad @ input_proj_W^T
-    blackwell_fp4_gemm(
+    fp4_gemm(
         handle,
         scaled_grad.data_ptr<float>(),
         input_proj_W.data_ptr<float>(),
@@ -198,7 +198,7 @@ void blackwell_precompute_fp4(
     // pre_x[:, j] += input_proj_b[j] — done by Kernel A in the pipeline
 
     // GEMM 2: pre_z = pre_x @ mamba_fwd_in_proj^T (gate projection)
-    blackwell_fp4_gemm(
+    fp4_gemm(
         handle,
         pre_x.data_ptr<float>(),
         mamba_fwd_in_proj.data_ptr<float>(),
@@ -208,7 +208,7 @@ void blackwell_precompute_fp4(
     );
 
     // GEMM 3: pre_dt = pre_x @ mamba_fwd_dt_W^T
-    blackwell_fp4_gemm(
+    fp4_gemm(
         handle,
         pre_x.data_ptr<float>(),
         mamba_fwd_dt_W.data_ptr<float>(),
@@ -218,7 +218,7 @@ void blackwell_precompute_fp4(
     );
 
     // GEMM 4: pre_B = pre_x @ mamba_fwd_B_proj^T
-    blackwell_fp4_gemm(
+    fp4_gemm(
         handle,
         pre_x.data_ptr<float>(),
         mamba_fwd_B_proj.data_ptr<float>(),
@@ -228,7 +228,7 @@ void blackwell_precompute_fp4(
     );
 
     // GEMM 5: pre_C = pre_x @ mamba_fwd_C_proj^T
-    blackwell_fp4_gemm(
+    fp4_gemm(
         handle,
         pre_x.data_ptr<float>(),
         mamba_fwd_C_proj.data_ptr<float>(),
