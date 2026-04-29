@@ -10,20 +10,20 @@
  *   - mamba3_scan_combined_cpasync_kernel: sequential combined (fwd+bwd)
  *     scan with the same cp.async double-buffered prefetch pattern.
  *
- * These kernels are launched by ampere_batched_scan_and_fused_elem() in
- * this file, which is called from the Ampere batched step launcher.
+ * Plus the helper ampere_batched_scan_and_fused_elem() that orchestrates
+ * those kernels alongside fused_elem_step_cpasync_kernel (from
+ * supergrok2_fused_elem_sm80.cu).
  *
- * Batched step uses the refactored 3-phase pipeline:
- *   1. batched_step_setup_and_sort() — shared setup
- *   2. generic_batched_precompute() — FP32 precompute (TF32 math mode)
- *   3. ampere_batched_scan_and_fused_elem() — cp.async scan + cp.async
- *      fused_elem (uses fused_elem_step_cpasync_kernel from
- *      supergrok2_fused_elem_sm80.cu)
- *
- * Single-param step delegates to generic with TF32 mode set.
- *
- * Dispatch: ops.cpp calls these on sm_80+ GPUs.
- * Fallback: On sm_70/sm_75, the generic launchers are called instead.
+ * The TF32 cuBLAS-mode wraps that previously lived in
+ * launch_mamba3_peer_step_ampere / launch_mamba3_peer_batched_step_ampere
+ * have been folded directly into the canonical launchers in
+ * supergrok2_fwd_sm80.cu (which now open CUBLAS_TF32_TENSOR_OP_MATH at
+ * entry and restore on exit). Top-level activation of the refactored
+ * 3-phase batched pipeline (batched_step_setup_and_sort →
+ * generic_batched_precompute → ampere_batched_scan_and_fused_elem) is
+ * deferred — the canonical launch_mamba3_peer_batched_step still uses
+ * its inline pipeline. The cp.async kernels and helper here are
+ * preserved for that future activation.
  */
 
 #include <torch/extension.h>
@@ -38,77 +38,6 @@
 #endif
 
 namespace sg { namespace sm80 {
-
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Forward declarations of generic launchers (defined in generic/*.cu)
-// ═══════════════════════════════════════════════════════════════════════
-
-
-void launch_mamba3_peer_step(
-    torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness,
-    torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor mu,
-    torch::Tensor gru_state,
-    torch::Tensor mamba_fwd_state, torch::Tensor mamba_bwd_state,
-    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
-    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
-    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
-    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
-    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
-    torch::Tensor mamba_fwd_out_proj,
-    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
-    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
-    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
-    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
-    torch::Tensor mamba_bwd_out_proj,
-    torch::Tensor gru_Wz, torch::Tensor gru_bz,
-    torch::Tensor gru_Wr, torch::Tensor gru_br,
-    torch::Tensor gru_Wh, torch::Tensor gru_bh,
-    torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
-    torch::Tensor expert_W1, torch::Tensor expert_b1,
-    torch::Tensor expert_W2, torch::Tensor expert_b2,
-    float rescale, float alpha_mu, float lamb_eff,
-    float beta1, float beta2, float lr, float wd_eff, float eps,
-    float bc1, float bc2,
-    int d_model, int d_state, int d_inner,
-    int gru_hidden, int num_heads, int pk_dim,
-    int expert_hidden, int num_experts,
-    torch::Tensor expert_counts);
-
-void launch_mamba3_peer_batched_step(
-    std::vector<torch::Tensor> params,
-    std::vector<torch::Tensor> grads,
-    std::vector<torch::Tensor> sharpness_list,
-    std::vector<torch::Tensor> exp_avgs,
-    std::vector<torch::Tensor> exp_avg_sqs,
-    std::vector<torch::Tensor> mus,
-    std::vector<torch::Tensor> gru_states,
-    std::vector<torch::Tensor> mamba_fwd_states,
-    std::vector<torch::Tensor> mamba_bwd_states,
-    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
-    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
-    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
-    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
-    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
-    torch::Tensor mamba_fwd_out_proj,
-    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
-    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
-    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
-    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
-    torch::Tensor mamba_bwd_out_proj,
-    torch::Tensor gru_Wz, torch::Tensor gru_bz,
-    torch::Tensor gru_Wr, torch::Tensor gru_br,
-    torch::Tensor gru_Wh, torch::Tensor gru_bh,
-    torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
-    torch::Tensor expert_W1, torch::Tensor expert_b1,
-    torch::Tensor expert_W2, torch::Tensor expert_b2,
-    std::vector<float> alpha_mus, std::vector<float> lamb_effs,
-    std::vector<float> beta1s, std::vector<float> bc1s, std::vector<float> bc2s,
-    float rescale, float beta2, float lr, float wd_eff, float eps,
-    int d_model, int d_state, int d_inner,
-    int gru_hidden, int num_heads, int pk_dim,
-    int expert_hidden, int num_experts,
-    torch::Tensor expert_counts);
 
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -808,177 +737,5 @@ void ampere_batched_scan_and_fused_elem(
 }
 
 
-// ═══════════════════════════════════════════════════════════════════════
-//  Ampere Forward: Per-Parameter Step — delegates to generic
-//
-//  The generic single-param step uses only custom CUDA kernels
-//  (input_proj_sort_kernel, mamba3_scan_combined_kernel, fused_elem_step_kernel),
-//  not cuBLAS/torch::mm, so TF32 mode set here has no effect on the
-//  single-param path. The single-param path does not have a refactored
-//  pipeline split, so delegation to generic is the correct approach.
-//  TF32 mode is set for consistency with the architecture tier contract.
-// ═══════════════════════════════════════════════════════════════════════
-
-void launch_mamba3_peer_step_ampere(
-    torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness,
-    torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor mu,
-    torch::Tensor gru_state,
-    torch::Tensor mamba_fwd_state, torch::Tensor mamba_bwd_state,
-    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
-    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
-    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
-    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
-    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
-    torch::Tensor mamba_fwd_out_proj,
-    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
-    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
-    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
-    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
-    torch::Tensor mamba_bwd_out_proj,
-    torch::Tensor gru_Wz, torch::Tensor gru_bz,
-    torch::Tensor gru_Wr, torch::Tensor gru_br,
-    torch::Tensor gru_Wh, torch::Tensor gru_bh,
-    torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
-    torch::Tensor expert_W1, torch::Tensor expert_b1,
-    torch::Tensor expert_W2, torch::Tensor expert_b2,
-    float rescale, float alpha_mu, float lamb_eff,
-    float beta1, float beta2, float lr, float wd_eff, float eps,
-    float bc1, float bc2,
-    int d_model, int d_state, int d_inner,
-    int gru_hidden, int num_heads, int pk_dim,
-    int expert_hidden, int num_experts,
-    torch::Tensor expert_counts
-) {
-    auto handle = at::cuda::getCurrentCUDABlasHandle();
-    cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
-
-    launch_mamba3_peer_step(
-        param, grad, sharpness, exp_avg, exp_avg_sq, mu,
-        gru_state, mamba_fwd_state, mamba_bwd_state,
-        input_proj_W, input_proj_b,
-        mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
-        mamba_fwd_B_proj, mamba_fwd_C_proj, mamba_fwd_A_log,
-        mamba_fwd_D, mamba_fwd_rope, mamba_fwd_out_proj,
-        mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
-        mamba_bwd_B_proj, mamba_bwd_C_proj, mamba_bwd_A_log,
-        mamba_bwd_D, mamba_bwd_rope, mamba_bwd_out_proj,
-        gru_Wz, gru_bz, gru_Wr, gru_br, gru_Wh, gru_bh,
-        peer_query_Ws, prod_keys_A, prod_keys_B,
-        expert_W1, expert_b1, expert_W2, expert_b2,
-        rescale, alpha_mu, lamb_eff,
-        beta1, beta2, lr, wd_eff, eps, bc1, bc2,
-        d_model, d_state, d_inner,
-        gru_hidden, num_heads, pk_dim,
-        expert_hidden, num_experts,
-        expert_counts);
-
-    cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
-}
-
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Ampere Forward: Batched Step — refactored pipeline with cp.async
-//
-//  Uses the refactored 3-phase pipeline:
-//    1. batched_step_setup_and_sort — input projection, CUB sort, packing
-//    2. generic_batched_precompute — FP32 precompute (TF32 math mode)
-//    3. ampere_batched_scan_and_fused_elem — cp.async scan + cp.async fused_elem
-//
-//  The cp.async scan kernels (mamba3_scan_batched_cpasync_kernel,
-//  mamba3_scan_combined_cpasync_kernel) use double-buffered
-//  __pipeline_memcpy_async to overlap global memory loads with scan compute.
-//  The fused_elem_step_cpasync_kernel uses cp.async for weight prefetch.
-//  TF32 mode is set for cuBLAS math operations in the precompute phase.
-// ═══════════════════════════════════════════════════════════════════════
-
-void launch_mamba3_peer_batched_step_ampere(
-    std::vector<torch::Tensor> params,
-    std::vector<torch::Tensor> grads,
-    std::vector<torch::Tensor> sharpness_list,
-    std::vector<torch::Tensor> exp_avgs,
-    std::vector<torch::Tensor> exp_avg_sqs,
-    std::vector<torch::Tensor> mus,
-    std::vector<torch::Tensor> gru_states,
-    std::vector<torch::Tensor> mamba_fwd_states,
-    std::vector<torch::Tensor> mamba_bwd_states,
-    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
-    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
-    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
-    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
-    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
-    torch::Tensor mamba_fwd_out_proj,
-    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
-    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
-    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
-    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
-    torch::Tensor mamba_bwd_out_proj,
-    torch::Tensor gru_Wz, torch::Tensor gru_bz,
-    torch::Tensor gru_Wr, torch::Tensor gru_br,
-    torch::Tensor gru_Wh, torch::Tensor gru_bh,
-    torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
-    torch::Tensor expert_W1, torch::Tensor expert_b1,
-    torch::Tensor expert_W2, torch::Tensor expert_b2,
-    std::vector<float> alpha_mus, std::vector<float> lamb_effs,
-    std::vector<float> beta1s, std::vector<float> bc1s, std::vector<float> bc2s,
-    float rescale, float beta2, float lr, float wd_eff, float eps,
-    int d_model, int d_state, int d_inner,
-    int gru_hidden, int num_heads, int pk_dim,
-    int expert_hidden, int num_experts,
-    torch::Tensor expert_counts
-) {
-    auto handle = at::cuda::getCurrentCUDABlasHandle();
-    cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
-
-    // Phase 1: Setup + sort (shared with all tiers)
-    auto ctx = batched_step_setup_and_sort(
-        grads, sharpness_list, mamba_fwd_states, mamba_bwd_states,
-        input_proj_W, input_proj_b, d_model, d_state, d_inner);
-
-    if (ctx.total_N == 0) {
-        cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
-        return;
-    }
-
-    // Phase 2: Precompute projections (TF32 via cuBLAS math mode)
-    torch::Tensor fwd_pre_x, fwd_pre_z, fwd_pre_dt, fwd_pre_B, fwd_pre_C;
-    torch::Tensor bwd_pre_x, bwd_pre_z, bwd_pre_dt, bwd_pre_B, bwd_pre_C;
-
-    generic_batched_precompute(
-        ctx, mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
-        mamba_fwd_B_proj, mamba_fwd_C_proj,
-        fwd_pre_x, fwd_pre_z, fwd_pre_dt, fwd_pre_B, fwd_pre_C,
-        d_model, d_inner, d_state);
-
-    generic_batched_precompute(
-        ctx, mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
-        mamba_bwd_B_proj, mamba_bwd_C_proj,
-        bwd_pre_x, bwd_pre_z, bwd_pre_dt, bwd_pre_B, bwd_pre_C,
-        d_model, d_inner, d_state);
-
-    // Phase 3: cp.async scan + cp.async fused_elem (Ampere-specific)
-    ampere_batched_scan_and_fused_elem(
-        ctx,
-        fwd_pre_x, fwd_pre_z, fwd_pre_dt, fwd_pre_B, fwd_pre_C,
-        bwd_pre_x, bwd_pre_z, bwd_pre_dt, bwd_pre_B, bwd_pre_C,
-        params, grads, sharpness_list, exp_avgs, exp_avg_sqs, mus,
-        gru_states, mamba_fwd_states, mamba_bwd_states,
-        mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
-        mamba_fwd_B_proj, mamba_fwd_C_proj, mamba_fwd_A_log,
-        mamba_fwd_D, mamba_fwd_rope, mamba_fwd_out_proj,
-        mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
-        mamba_bwd_B_proj, mamba_bwd_C_proj, mamba_bwd_A_log,
-        mamba_bwd_D, mamba_bwd_rope, mamba_bwd_out_proj,
-        gru_Wz, gru_bz, gru_Wr, gru_br, gru_Wh, gru_bh,
-        peer_query_Ws, prod_keys_A, prod_keys_B,
-        expert_W1, expert_b1, expert_W2, expert_b2,
-        alpha_mus, lamb_effs, beta1s, bc1s, bc2s,
-        rescale, beta2, lr, wd_eff, eps,
-        d_model, d_state, d_inner,
-        gru_hidden, num_heads, pk_dim,
-        expert_hidden, num_experts,
-        expert_counts);
-
-    cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
-}
 
 } } // namespace sg::sm80

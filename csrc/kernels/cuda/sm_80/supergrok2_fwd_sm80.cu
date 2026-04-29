@@ -2309,6 +2309,11 @@ void launch_mamba3_peer_step(
     const int N = grad.numel();
     if (N == 0) return;
 
+    // Ampere TF32 cuBLAS mode for the projection GEMMs (in/out_proj,
+    // dt_proj, B/C_proj). Restored on exit.
+    auto handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
+
     TORCH_CHECK(d_state % 2 == 0, "d_state must be even for paired RoPE (got ", d_state, ")");
     TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
     TORCH_CHECK(d_model <= MAX_D_MODEL, "d_model exceeds MAX_D_MODEL (", d_model, " > ", MAX_D_MODEL, ")");
@@ -2552,6 +2557,8 @@ void launch_mamba3_peer_step(
             );
         }));
     }
+
+    cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
 }
 
 
@@ -2603,6 +2610,11 @@ void launch_mamba3_peer_batched_step(
 ) {
     const int num_params = params.size();
     if (num_params == 0) return;
+
+    // Ampere TF32 cuBLAS mode for the projection GEMMs + per-step
+    // precompute. Restored on exit.
+    auto handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
 
     TORCH_CHECK(d_state % 2 == 0, "d_state must be even for paired RoPE (got ", d_state, ")");
     TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
@@ -2979,6 +2991,8 @@ void launch_mamba3_peer_batched_step(
     for (int s = 0; s < NUM_STREAMS; s++) {
         gpuStreamSynchronize(streams[s]);
     }
+
+    cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
 }
 
 
