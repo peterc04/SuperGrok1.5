@@ -11,9 +11,46 @@
  */
 
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 
 #include "platform.h"
 #include "utils.cuh"
+
+#ifdef WITH_CUTLASS
+#include "../_cutlass_gemm.cuh"
+
+namespace sg { namespace sm100 {
+// CUTLASS-backed mm helper. FP16/BF16 → cutlass_gemm_*; FP32 falls
+// back to torch::mm. Output dtype matches the input; the FP32
+// accumulator is cast back via .to(dtype). Math is equivalent to
+// cuBLAS within FP tolerance.
+static inline torch::Tensor mm_cutlass(torch::Tensor A, torch::Tensor B) {
+    if (A.scalar_type() != at::ScalarType::Half &&
+        A.scalar_type() != at::ScalarType::BFloat16) {
+        return torch::mm(A, B);
+    }
+    auto Ac = A.contiguous();
+    auto Bc = B.contiguous();
+    int M = Ac.size(0), K = Ac.size(1), N = Bc.size(1);
+    auto Cf = torch::empty({M, N}, A.options().dtype(at::kFloat));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (A.scalar_type() == at::ScalarType::Half) {
+        sg::cutlass_gemm::cutlass_gemm_fp16(
+            M, N, K,
+            reinterpret_cast<const __half*>(Ac.data_ptr<at::Half>()),
+            reinterpret_cast<const __half*>(Bc.data_ptr<at::Half>()),
+            Cf.data_ptr<float>(), stream);
+    } else {
+        sg::cutlass_gemm::cutlass_gemm_bf16(
+            M, N, K,
+            reinterpret_cast<const __nv_bfloat16*>(Ac.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(Bc.data_ptr<at::BFloat16>()),
+            Cf.data_ptr<float>(), stream);
+    }
+    return Cf.to(A.scalar_type());
+}
+}}  // namespace sg::sm100
+#endif  // WITH_CUTLASS
 
 // =====================================================================
 //  BASELINE COPY -- sm100 variant of muon_kernels.cu
@@ -416,8 +453,16 @@ void launch_muon_fused_step(
         float decay = 1.0f - weight_decay * lr;
 
         for (int i = 0; i < ns_steps; i++) {
+#ifdef WITH_CUTLASS
+            auto Xt = X_2d.t().contiguous();
+            auto XtX = mm_cutlass(Xt, X_2d);
+            auto AX  = mm_cutlass(XtX, Xt).t();
+            auto XXt = mm_cutlass(X_2d, Xt);
+            auto AAX = mm_cutlass(mm_cutlass(Xt, XXt), Xt).t();
+#else
             auto AX = torch::mm(torch::mm(X_2d.t(), X_2d), X_2d.t()).t();
             auto AAX = torch::mm(torch::mm(X_2d.t(), torch::mm(X_2d, X_2d.t())), X_2d.t()).t();
+#endif
 
             if (i < ns_steps - 1) {
                 // Intermediate iteration: just ns_combine

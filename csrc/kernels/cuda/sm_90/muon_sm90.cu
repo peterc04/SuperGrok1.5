@@ -17,6 +17,44 @@
 #include "platform.h"
 #include "utils.cuh"
 
+#ifdef WITH_CUTLASS
+#include "../_cutlass_gemm.cuh"
+
+namespace sg { namespace sm90 {
+// CUTLASS-backed torch::mm replacement. Dispatches on input dtype:
+// FP16/BF16 inputs route to cutlass_gemm_fp16/bf16 with FP32 acc/out
+// (then cast back to input dtype to keep downstream tensor shapes
+// identical). FP32 inputs fall back to torch::mm — CUTLASS FP32 GEMM
+// is not used here because the muon FP32 path is already fast on
+// Hopper. Math is equivalent to cuBLAS within FP tolerance.
+static inline torch::Tensor mm_cutlass(torch::Tensor A, torch::Tensor B) {
+    if (A.scalar_type() != at::ScalarType::Half &&
+        A.scalar_type() != at::ScalarType::BFloat16) {
+        return torch::mm(A, B);
+    }
+    auto Ac = A.contiguous();
+    auto Bc = B.contiguous();
+    int M = Ac.size(0), K = Ac.size(1), N = Bc.size(1);
+    auto Cf = torch::empty({M, N}, A.options().dtype(at::kFloat));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (A.scalar_type() == at::ScalarType::Half) {
+        sg::cutlass_gemm::cutlass_gemm_fp16(
+            M, N, K,
+            reinterpret_cast<const __half*>(Ac.data_ptr<at::Half>()),
+            reinterpret_cast<const __half*>(Bc.data_ptr<at::Half>()),
+            Cf.data_ptr<float>(), stream);
+    } else {
+        sg::cutlass_gemm::cutlass_gemm_bf16(
+            M, N, K,
+            reinterpret_cast<const __nv_bfloat16*>(Ac.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(Bc.data_ptr<at::BFloat16>()),
+            Cf.data_ptr<float>(), stream);
+    }
+    return Cf.to(A.scalar_type());
+}
+}}  // namespace sg::sm90
+#endif  // WITH_CUTLASS
+
 // =====================================================================
 //  BASELINE COPY -- sm90 variant of muon_kernels.cu
 //
@@ -456,9 +494,20 @@ void launch_muon_fused_step(
                     N_dim, N_dim, M, false);
             } else
 #endif
-            { A_mat = torch::mm(X_2d.t(), X_2d); }
-            auto AX = torch::mm(X_2d, A_mat);
+            {
+#ifdef WITH_CUTLASS
+                A_mat = mm_cutlass(X_2d.t().contiguous(), X_2d);
+#else
+                A_mat = torch::mm(X_2d.t(), X_2d);
+#endif
+            }
+#ifdef WITH_CUTLASS
+            auto AX  = mm_cutlass(X_2d, A_mat);
+            auto AAX = mm_cutlass(AX, A_mat);
+#else
+            auto AX  = torch::mm(X_2d, A_mat);
             auto AAX = torch::mm(AX, A_mat);
+#endif
             if (i < ns_steps - 1) {
                 launch_muon_ns_combine(X_2d, X_2d, AX, AAX, a, b, c);
             } else {
