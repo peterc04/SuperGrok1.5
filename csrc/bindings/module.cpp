@@ -1,35 +1,30 @@
 // =====================================================================
 //  bindings/module.cpp — pybind11 module aggregator
 //
-//  Replaces the PYBIND11_MODULE block from csrc/common/ops.cpp.
-//  Each per-optimizer file (csrc/bindings/<optimizer>.cpp) defines a
-//  public C++ entry point in namespace sg::; this file registers them
-//  with the Python module.
+//  Replaces the PYBIND11_MODULE block from the deleted csrc/common/ops.cpp.
+//  Each per-optimizer file (csrc/bindings/<optimizer>.cpp) defines public
+//  entry points in namespace sg::; this file registers them with the
+//  Python module so they appear as _ops.<name>.
 //
-//  TODO(structural-refactor): the original ops.cpp registered a large
-//  surface (~50 entry points). The list below is the worked-example
-//  subset that matches the per-optimizer dispatchers added in this
-//  refactor pass. The remaining entry points (SG2 batched fwd-save,
-//  SG2 batched backward, MoE backward, etc.) should be added as the
-//  per-arch launcher signatures are filled in.
-//
-//  The Python loader (grokking_optimizers/_ops_loader.py) imports this
-//  module and exposes its entry points to the optimizer Python files.
+//  Two API surfaces are exposed:
+//   - vector-signature entry points (the primary contract — these match
+//     the pre-refactor ops.cpp signatures, taking std::vector<torch::Tensor>)
+//   - per-tensor wrappers (the legacy small-API; available as escape
+//     hatches for tests but not used by the Python optimizers)
 // =====================================================================
 
 #include "bindings.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <vector>
+
 namespace sg {
 
-// Forward declarations of the dispatcher entry points. Definitions are
-// in the per-optimizer csrc/bindings/<optimizer>.cpp files.
-//
 // Arch detection
 int detect_arch();
 
-// GrokAdamW
+// ── GrokAdamW ─────────────────────────────────────────────────────────
 void grokadamw_step(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                     torch::Tensor, float, float, float, float, float, float,
                     float, float, float);
@@ -39,88 +34,163 @@ void grokadamw_clip_step(torch::Tensor, torch::Tensor, torch::Tensor, torch::Ten
 void grokadamw_step_q3(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                        torch::Tensor, torch::Tensor, float, float, float, float,
                        float, float, float, float, float, unsigned);
+void grokadamw_fused_step(
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<torch::Tensor>&, std::vector<int64_t>&,
+    float, float, float, float, float, float, float, float);
+void fused_adamw_simple_step(
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<int64_t>&,
+    float, float, float, float, float);
 
-// Lion
+// ── Lion ──────────────────────────────────────────────────────────────
 void lion_step(torch::Tensor, torch::Tensor, torch::Tensor,
                float, float, float, float);
+void lion_fused_step(
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<torch::Tensor>&,
+    float, float, float, float);
 
-// Grokfast
+// ── Grokfast ──────────────────────────────────────────────────────────
 void grokfast_ema(torch::Tensor, torch::Tensor, float, float);
 void grokfast_adam(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                    torch::Tensor, float, float, float, float, float, float,
                    float, float, float);
+void grokfast_fused_step(
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    float, float);
+void grokfast_fused_ema_adam_step(
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<torch::Tensor>&, std::vector<int64_t>&,
+    float, float, float, float, float, float, float);
 
-// Prodigy
+// ── Prodigy ───────────────────────────────────────────────────────────
 void prodigy_step(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                   torch::Tensor, torch::Tensor, float, float, float, float,
                   float, float, float, float);
 void prodigy_dlr_reduce(torch::Tensor, torch::Tensor, torch::Tensor,
                         torch::Tensor, torch::Tensor, torch::Tensor, float);
+float prodigy_fused_step(
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<int64_t>&,
+    float, float, float, float, float, float);
 
-// NeuralGrok
+// ── NeuralGrok ────────────────────────────────────────────────────────
 void neuralgrok_amplifier(torch::Tensor, torch::Tensor, torch::Tensor,
                           torch::Tensor, torch::Tensor, torch::Tensor,
                           int, float, float);
 void neuralgrok_adam(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                      float, float, float, float, float, float, float);
+void neuralgrok_fused_step(
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<int64_t>&,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    float, float, int,
+    float, float, float, float, float, float);
 
-// LookSAM
+// ── LookSAM ───────────────────────────────────────────────────────────
 void looksam_perturb(torch::Tensor, torch::Tensor, torch::Tensor, float);
 void looksam_restore(torch::Tensor, torch::Tensor);
 void looksam_direction_adjust_fused(torch::Tensor, torch::Tensor, torch::Tensor,
                                     float, float, float);
 void looksam_norm_reduce(torch::Tensor, torch::Tensor, torch::Tensor);
+std::vector<torch::Tensor> looksam_perturb_all(
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&, float);
+void looksam_restore_all(
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&);
+void looksam_compute_directions_and_adjust(
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<torch::Tensor>&, float);
 
-// Muon
+// ── Muon ──────────────────────────────────────────────────────────────
 void muon_momentum_normalize(torch::Tensor, torch::Tensor, torch::Tensor,
                              float, float);
 void muon_ns_combine(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                      float, float, float);
 void muon_ns_combine_update_fused(torch::Tensor, torch::Tensor, torch::Tensor,
                                   torch::Tensor, float, float, float, float, float);
-void muon_fused_step(torch::Tensor, torch::Tensor, torch::Tensor,
-                     int, float, float, float);
+void muon_fused_step(
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<torch::Tensor>&,
+    float, float, float, int);
 
-// SuperGrok v1.5
-void sg15_fused_step(
-    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-    torch::Tensor, torch::Tensor, int, float, float, float,
-    float, float, float, float, float, float, float);
+// ── SuperGrok v1.5 ────────────────────────────────────────────────────
 void sg15_sam_perturb(torch::Tensor, torch::Tensor, float);
+void supergrok15_fused_step(
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<int64_t>&, std::vector<float>&, std::vector<float>&,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    float, int, float, float, float, float,
+    float, float, float, float);
+std::vector<torch::Tensor> supergrok15_sam_perturb_all(
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&, float);
+void supergrok15_sharpness_restore_all(
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<torch::Tensor>&);
 
-// SuperGrok v1.1
-void sg11_fused_step(
+// ── SuperGrok v1.1 ────────────────────────────────────────────────────
+void supergrok11_fused_step(
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<int64_t>&, std::vector<float>&, std::vector<float>&,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    float, int, float, float, float, float,
+    float, float, float, float);
+std::vector<torch::Tensor> supergrok11_sam_perturb_all(
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&, float);
+void supergrok11_sharpness_restore_all(
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<torch::Tensor>&, std::vector<torch::Tensor>&,
+    std::vector<torch::Tensor>&);
+
+// ── MoE ───────────────────────────────────────────────────────────────
+void moe_dynamic_expert_load(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor);
+torch::Tensor moe_dynamic_expert_fwd(
+    torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor);
+void moe_dynamic_expert_bwd(
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-    torch::Tensor, torch::Tensor, int, float, float, float,
-    float, float, float, float, float, float, float);
-void sg11_cosine_gate_reduce(torch::Tensor, torch::Tensor, torch::Tensor);
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor);
+void moe_filter_active_params(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int);
+void moe_scan_compacted(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, int, int, int);
+void moe_scatter_results(
+    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+    torch::Tensor, torch::Tensor, torch::Tensor, int);
+void moe_count_expert_activations(
+    torch::Tensor, torch::Tensor, float, int, int);
+torch::Tensor moe_compute_load_balance_loss(
+    torch::Tensor, torch::Tensor, int, int);
+void moe_apply_frequency_scaling(
+    torch::Tensor, torch::Tensor, int, int, float, float, float);
 
-// Multi-tensor
-void multi_tensor_grokadamw(
-    std::vector<torch::Tensor>, std::vector<torch::Tensor>,
-    std::vector<torch::Tensor>, std::vector<torch::Tensor>,
-    std::vector<torch::Tensor>,
-    float, float, float, float, float, float, float, float, float);
-void multi_tensor_lion(
-    std::vector<torch::Tensor>, std::vector<torch::Tensor>,
-    std::vector<torch::Tensor>, float, float, float, float);
-
-// Distributed scan (3 phases)
+// ── Distributed scan / Quantization / Multi-tensor / Misc ─────────────
+// Existing per-tensor entries from the original module.cpp stay registered
+// for tests; they remain unchanged.
 void distributed_scan_phase1(torch::Tensor, torch::Tensor, torch::Tensor,
                              torch::Tensor, torch::Tensor, torch::Tensor,
                              torch::Tensor, torch::Tensor, torch::Tensor,
                              torch::Tensor);
 void distributed_scan_phase2(torch::Tensor, torch::Tensor);
 void distributed_scan_phase3(torch::Tensor, torch::Tensor);
-
-// MoE (primary forward)
-void moe_expert_fwd(torch::Tensor, torch::Tensor, torch::Tensor,
-                    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-                    torch::Tensor);
-
-// Quantization
 void fp8_e4m3_quantize(torch::Tensor, torch::Tensor, torch::Tensor);
 void int8_symmetric_quantize(torch::Tensor, torch::Tensor, torch::Tensor);
 void int4_gptq_quantize(torch::Tensor, torch::Tensor, torch::Tensor,
@@ -133,57 +203,87 @@ PYBIND11_MODULE(_ops, m) {
     m.doc() = "Grokking Optimizers — specialized per-arch C++/CUDA/HIP kernels";
 
     m.def("detect_arch", &sg::detect_arch,
-          "Returns 80, 90, 100, or 942 for the detected GPU. Raises on unsupported.");
+          "Returns 80, 89, 90, 100, 103, 120, 942 or 950 for the detected GPU.");
 
     // GrokAdamW
     m.def("grokadamw_step", &sg::grokadamw_step);
     m.def("grokadamw_clip_step", &sg::grokadamw_clip_step);
     m.def("grokadamw_step_q3", &sg::grokadamw_step_q3);
+    m.def("grokadamw_fused_step", &sg::grokadamw_fused_step,
+          "Pre-refactor ops.cpp::grokadamw_fused_step (vector signature)");
+    m.def("fused_adamw_simple_step", &sg::fused_adamw_simple_step,
+          "Shared simple AdamW step (vector signature)");
 
     // Lion
     m.def("lion_step", &sg::lion_step);
+    m.def("lion_fused_step", &sg::lion_fused_step,
+          "Pre-refactor ops.cpp::lion_fused_step (vector signature)");
 
     // Grokfast
     m.def("grokfast_ema", &sg::grokfast_ema);
     m.def("grokfast_adam", &sg::grokfast_adam);
+    m.def("grokfast_fused_step", &sg::grokfast_fused_step,
+          "EMA-only multi-tensor grokfast (vector signature)");
+    m.def("grokfast_fused_ema_adam_step", &sg::grokfast_fused_ema_adam_step,
+          "Per-param EMA + amplification + Adam (vector signature)");
 
     // Prodigy
     m.def("prodigy_step", &sg::prodigy_step);
     m.def("prodigy_dlr_reduce", &sg::prodigy_dlr_reduce);
+    m.def("prodigy_fused_step", &sg::prodigy_fused_step,
+          "Pre-refactor ops.cpp::prodigy_fused_step (returns updated d_lr)");
 
     // NeuralGrok
     m.def("neuralgrok_amplifier", &sg::neuralgrok_amplifier);
     m.def("neuralgrok_adam", &sg::neuralgrok_adam);
+    m.def("neuralgrok_fused_step", &sg::neuralgrok_fused_step,
+          "Pre-refactor ops.cpp::neuralgrok_fused_step (vector signature)");
 
     // LookSAM
     m.def("looksam_perturb", &sg::looksam_perturb);
     m.def("looksam_restore", &sg::looksam_restore);
     m.def("looksam_direction_adjust_fused", &sg::looksam_direction_adjust_fused);
     m.def("looksam_norm_reduce", &sg::looksam_norm_reduce);
+    m.def("looksam_perturb_all", &sg::looksam_perturb_all,
+          "Vector SAM perturb; returns clones to restore from");
+    m.def("looksam_restore_all", &sg::looksam_restore_all);
+    m.def("looksam_compute_directions_and_adjust",
+          &sg::looksam_compute_directions_and_adjust,
+          "Fused direction + adjust over a list of params");
 
     // Muon
     m.def("muon_momentum_normalize", &sg::muon_momentum_normalize);
     m.def("muon_ns_combine", &sg::muon_ns_combine);
     m.def("muon_ns_combine_update_fused", &sg::muon_ns_combine_update_fused);
-    m.def("muon_fused_step", &sg::muon_fused_step);
+    m.def("muon_fused_step", &sg::muon_fused_step,
+          "Pre-refactor ops.cpp::muon_fused_step (vector signature)");
 
-    // SG v1.5 / v1.1
-    m.def("sg15_fused_step", &sg::sg15_fused_step);
+    // SG v1.5
     m.def("sg15_sam_perturb", &sg::sg15_sam_perturb);
-    m.def("sg11_fused_step", &sg::sg11_fused_step);
-    m.def("sg11_cosine_gate_reduce", &sg::sg11_cosine_gate_reduce);
+    m.def("supergrok15_fused_step", &sg::supergrok15_fused_step);
+    m.def("supergrok15_sam_perturb_all", &sg::supergrok15_sam_perturb_all);
+    m.def("supergrok15_sharpness_restore_all", &sg::supergrok15_sharpness_restore_all);
 
-    // Multi-tensor
-    m.def("multi_tensor_grokadamw", &sg::multi_tensor_grokadamw);
-    m.def("multi_tensor_lion", &sg::multi_tensor_lion);
+    // SG v1.1
+    m.def("supergrok11_fused_step", &sg::supergrok11_fused_step);
+    m.def("supergrok11_sam_perturb_all", &sg::supergrok11_sam_perturb_all);
+    m.def("supergrok11_sharpness_restore_all", &sg::supergrok11_sharpness_restore_all);
+
+    // MoE
+    m.def("moe_dynamic_expert_load", &sg::moe_dynamic_expert_load);
+    m.def("moe_dynamic_expert_fwd", &sg::moe_dynamic_expert_fwd);
+    m.def("moe_dynamic_expert_bwd", &sg::moe_dynamic_expert_bwd);
+    m.def("moe_filter_active_params", &sg::moe_filter_active_params);
+    m.def("moe_scan_compacted", &sg::moe_scan_compacted);
+    m.def("moe_scatter_results", &sg::moe_scatter_results);
+    m.def("moe_count_expert_activations", &sg::moe_count_expert_activations);
+    m.def("moe_compute_load_balance_loss", &sg::moe_compute_load_balance_loss);
+    m.def("moe_apply_frequency_scaling", &sg::moe_apply_frequency_scaling);
 
     // Distributed scan
     m.def("distributed_scan_phase1", &sg::distributed_scan_phase1);
     m.def("distributed_scan_phase2", &sg::distributed_scan_phase2);
     m.def("distributed_scan_phase3", &sg::distributed_scan_phase3);
-
-    // MoE
-    m.def("moe_expert_fwd", &sg::moe_expert_fwd);
 
     // Quantization
     m.def("fp8_e4m3_quantize", &sg::fp8_e4m3_quantize);
@@ -191,9 +291,11 @@ PYBIND11_MODULE(_ops, m) {
     m.def("int4_gptq_quantize", &sg::int4_gptq_quantize);
     m.def("mxfp4_quantize", &sg::mxfp4_quantize);
 
-    // TODO(structural-refactor): the original csrc/common/ops.cpp registered
-    // additional entry points (SG2 batched fwd-save, SG2 batched backward,
-    // MoE backward, secondary MoE kernels, gradient compression utilities,
-    // CUDA graph helpers). These are still served by csrc/common/ops.cpp
-    // until the per-optimizer bindings expand to cover them.
+    // SuperGrok v2: per the explicit TODO in csrc/bindings/supergrok2.cpp,
+    // the SG v2 entry points (mamba_peer_step, mamba_peer_batched_step,
+    // bilevel_fwd_save{_batched}, bilevel_backward{_batched},
+    // prepare_and_batched_step) still need to be wired. Their per-arch
+    // launchers exist in csrc/kernels/<arch>/supergrok2_*.cu but the
+    // bindings are not yet defined. _ops.supergrok2_* will raise
+    // AttributeError until that work is done.
 }
