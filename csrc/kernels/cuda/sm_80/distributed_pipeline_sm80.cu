@@ -14,6 +14,8 @@
  *   )
  */
 
+#define SG_ARCH_SM80
+#include "arch_tier.h"
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cstdint>

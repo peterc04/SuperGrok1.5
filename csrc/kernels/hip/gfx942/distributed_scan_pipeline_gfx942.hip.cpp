@@ -21,6 +21,8 @@
  *   6. distributed_prefix_apply_fused_elem_bwd_d16_kernel — Backward + d16
  */
 
+#define SG_ARCH_GFX942
+#include "arch_tier.h"
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cstdint>
