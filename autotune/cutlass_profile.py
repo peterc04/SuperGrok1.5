@@ -74,7 +74,19 @@ def profile_gemm(
     timeout_s: int = 600,
 ) -> list[CutlassConfig]:
     """Run cutlass_profiler over the GEMM tile-shape space and return all
-    candidate configs sorted by GFLOPS, fastest first."""
+    candidate configs sorted by GFLOPS, fastest first.
+
+    Supported arch targets:
+      80  -- Ampere (TF32, FP16, BF16; cuBLAS or CUTLASS sm_80)
+      89  -- Ada (FP8 E4M3/E5M2; CUTLASS sm_89; no TMA, no thread block clusters)
+      90  -- Hopper (FP8 + warp specialization; CUTLASS sm_90)
+      100 -- Datacenter Blackwell (NVFP4 + TMA; CUTLASS sm_100)
+      103 -- Blackwell Ultra (NVFP4 with 1.5x throughput; CUTLASS sm_103a)
+      120 -- Consumer Blackwell (CUTLASS sm_120a; smaller shared memory)
+    """
+    SUPPORTED = {80, 89, 90, 100, 103, 120}
+    if arch not in SUPPORTED:
+        raise ValueError(f"arch={arch} not in CUTLASS supported set {SUPPORTED}")
     raise NotImplementedError(
         "autotune/cutlass_profile.py is scaffolding. Wire to cutlass_profiler "
         "and parse its CSV output when running on hardware.")

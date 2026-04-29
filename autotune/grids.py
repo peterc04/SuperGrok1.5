@@ -151,4 +151,73 @@ GRIDS = {
             "WARPS_PER_BLOCK":     [4, 8, 16],
         },
     },
+    # ─── sm_103 NVFP4 hot path (Blackwell Ultra) ─────────────────────────
+    # SG2 projection GEMMs and Muon NS GEMMs benefit from NVFP4 tensor cores
+    # on sm_103 (1.5x throughput vs sm_100). Profiled via the CUTLASS
+    # sm_103a target with NVFP4 epilogue.
+    "sg2_nvfp4_proj_gemm": {
+        "shape_buckets": [(1024, 8, 16), (4096, 8, 16), (16384, 8, 16)],
+        "axes": "cutlass_profiler",
+        "cutlass_target": "sm_103a",
+        "epilogue": "nvfp4_linear",
+    },
+    "muon_nvfp4_ns_gemm": {
+        "shape_buckets": [(64, 64), (256, 256), (1024, 1024), (4096, 4096)],
+        "axes": "cutlass_profiler",
+        "cutlass_target": "sm_103a",
+    },
+    # ─── sm_120 consumer Blackwell (reduced shared memory) ───────────────
+    # sm_120 has 128KB shared memory vs 228KB on sm_100. SG2 fused-elem
+    # kernel + tile-resident expert weights need smaller tiles.
+    "sg2_fused_elem_step_sm120": {
+        "shape_buckets": ELEM_BUCKETS,
+        "axes": {
+            "BLOCK_SIZE":          [128, 192, 256],
+            "MIN_BLOCKS_PER_SM":   [1, 2],
+            "EXPERT_TILE_BYTES":   [16384, 32768, 65536, 98304],
+        },
+    },
+    "muon_sm120a_ns_gemm": {
+        "shape_buckets": [(64, 64), (256, 256), (1024, 1024), (4096, 4096)],
+        "axes": "cutlass_profiler",
+        "cutlass_target": "sm_120a",
+    },
+    # ─── gfx950 native FP4 expert MFMA (CDNA4) ───────────────────────────
+    # mfma_f32_32x32x8_fp4: 8x more elements per instruction vs FP32.
+    "expert_fp4_mfma_gfx950": {
+        "shape_buckets": [(64, 16), (256, 16), (1024, 16)],
+        "axes": {
+            "MFMA_TILE":           ["32x32x8", "16x16x8"],
+            "EXPERTS_PER_GROUP":   [4, 8, 16],
+        },
+    },
+    # ─── gfx950 FP6 (E3M2) optimizer state pack/unpack ───────────────────
+    "fp6_state_pack_gfx950": {
+        "shape_buckets": ELEM_BUCKETS,
+        "axes": {
+            "BLOCK_SIZE":          [128, 256, 512],
+            "ELEMS_PER_THREAD":    [4, 8, 16],
+            "BLOCK_GROUP_SIZE":    [16, 32, 64],
+        },
+    },
+    # ─── gfx950 2:4 structured sparsity ──────────────────────────────────
+    "sparse24_select_gfx950": {
+        "shape_buckets": ELEM_BUCKETS,
+        "axes": {
+            "BLOCK_SIZE":          [128, 256, 512],
+            "ELEMS_PER_THREAD":    [4, 8],
+        },
+    },
+    # ─── sm_89 Ada FP8 (no TMA, no DSMT) ─────────────────────────────────
+    # FP8 GEMMs via cuBLASLt or CUTLASS sm_89; cp.async carries from sm_80.
+    "sg2_fp8_proj_gemm_sm89": {
+        "shape_buckets": [(1024, 8, 16), (4096, 8, 16), (16384, 8, 16)],
+        "axes": "cutlass_profiler",
+        "cutlass_target": "sm_89",
+    },
+    "muon_sm89_ns_gemm": {
+        "shape_buckets": [(64, 64), (256, 256), (1024, 1024)],
+        "axes": "cutlass_profiler",
+        "cutlass_target": "sm_89",
+    },
 }

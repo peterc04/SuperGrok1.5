@@ -1,12 +1,15 @@
 """Runtime hardware detection for the all-specialized kernel architecture.
 
-Supported arches (post-refactor): sm_80, sm_90, sm_100, gfx942.
+Supported arches (8 GPU + 2 TPU):
+    NVIDIA: sm_80, sm_89, sm_90, sm_100, sm_103, sm_120
+    AMD:    gfx942, gfx950
+    TPU:    v5p, v6e (handled by csrc/kernels/tpu/, not this module)
 
 Anything else raises ``UnsupportedArchError``. There is no tier fallback chain
 and no generic-kernel path. ``FORCE_ARCH`` env var continues to work for
 testing on hosts that have multiple bindings compiled in.
 
-See REFACTOR_PLAN.md and csrc/kernels/README.md for the underlying policy.
+See REFACTOR_PLAN.md (esp. §10) and csrc/kernels/README.md for policy.
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ import os
 import torch
 
 
-SUPPORTED_ARCHES = (80, 90, 100, 942)
+SUPPORTED_ARCHES = (80, 89, 90, 100, 103, 120, 942, 950)
 
 
 class UnsupportedArchError(RuntimeError):
@@ -62,13 +65,12 @@ def get_warp_size() -> int:
 
 @functools.lru_cache(maxsize=1)
 def get_gpu_arch() -> int:
-    """Detected GPU arch as one of {80, 90, 100, 942}.
+    """Detected GPU arch as one of {80, 89, 90, 100, 103, 120, 942, 950}.
 
-    For NVIDIA, the SM number is rounded into one of the supported tiers:
-    sm_80/sm_86/sm_89 → 80 (Ampere family routes to sm_80 binding).
-    sm_90 → 90, sm_100+ → 100.
+    For NVIDIA: sm_80/sm_86 → 80 (Ampere family routes to sm_80 binding);
+    sm_89 → 89; sm_90 → 90; sm_100 → 100; sm_103 → 103; sm_120+ → 120.
 
-    For AMD, only gfx942 is supported.
+    For AMD: gfx942 → 942; gfx950 → 950. Anything else raises.
 
     Honors FORCE_ARCH env var.
 
@@ -88,23 +90,30 @@ def get_gpu_arch() -> int:
     if not torch.cuda.is_available():
         raise UnsupportedArchError(
             "No CUDA/HIP device available. SuperGrok kernels are GPU-only "
-            "(CPU build is for testing). Set FORCE_ARCH=<80|90|100|942> "
-            "for cross-arch testing.")
+            "(CPU build is for testing). Set FORCE_ARCH=<80|89|90|100|103|"
+            "120|942|950> for cross-arch testing.")
 
     vendor = get_gpu_vendor()
     if vendor == 'nvidia':
         major, minor = torch.cuda.get_device_capability()
         sm = major * 10 + minor
-        if sm in (80, 86, 89):
-            return 80   # Ampere family routes to the sm_80 binding
+        if sm in (80, 86):
+            return 80     # A100/A30/A10/RTX 30 (Ampere family) → sm_80 binding
+        if sm == 89:
+            return 89     # Ada (RTX 40, L40, L40S)
         if sm == 90:
-            return 90
-        if sm >= 100:
-            return 100
+            return 90     # Hopper (H100, H200)
+        if sm == 100:
+            return 100    # Datacenter Blackwell (B100/B200/GB200)
+        if sm == 103:
+            return 103    # Blackwell Ultra (B300, GB300 NVL72)
+        if sm == 120 or sm > 120:
+            return 120    # Consumer Blackwell (RTX 50, RTX PRO 6000)
         raise UnsupportedArchError(
-            f"Detected sm_{sm}; only sm_80, sm_90, sm_100 are supported. "
-            "sm_70/sm_75 (Volta/Turing) and pre-Ampere arches are no longer "
-            "supported. Use FORCE_CUDA=1 to force-build a binding.")
+            f"Detected sm_{sm}; supported NVIDIA arches are sm_80, sm_89, "
+            "sm_90, sm_100, sm_103, sm_120. Pre-Ampere (sm_70/75) is "
+            "permanently unsupported. Use FORCE_CUDA=1 to force-build a "
+            "binding.")
 
     if vendor == 'amd':
         prop = torch.cuda.get_device_properties(0)
@@ -112,9 +121,12 @@ def get_gpu_arch() -> int:
         arch_name = (prop.gcnArchName or '').split(':')[0]
         if arch_name == 'gfx942':
             return 942
+        if arch_name == 'gfx950':
+            return 950
         raise UnsupportedArchError(
-            f"Detected {arch_name!r}; only gfx942 (MI300X) is supported. "
-            "gfx908/gfx90a/gfx950 are no longer supported.")
+            f"Detected {arch_name!r}; supported AMD arches are gfx942 "
+            "(MI300X/MI300A) and gfx950 (MI350X/MI355X). gfx908/gfx90a "
+            "(MI100/MI200) and RDNA cards are unsupported.")
 
     raise UnsupportedArchError(f"Unknown GPU vendor {vendor!r}")
 
@@ -158,8 +170,33 @@ def supports_nvfp4() -> bool:
     return get_gpu_vendor() == 'nvidia' and get_gpu_arch() >= 100
 
 
+def supports_nvfp4_accelerated() -> bool:
+    """Blackwell Ultra (sm_103+) has 1.5x NVFP4 throughput vs sm_100."""
+    return get_gpu_vendor() == 'nvidia' and get_gpu_arch() == 103
+
+
+def supports_consumer_blackwell() -> bool:
+    """Consumer Blackwell (sm_120): 128KB shared memory, no DSMT."""
+    return get_gpu_vendor() == 'nvidia' and get_gpu_arch() == 120
+
+
+def supports_fp4_mfma() -> bool:
+    """Native FP4 expert MFMA (AMD CDNA4 / gfx950)."""
+    return get_gpu_vendor() == 'amd' and get_gpu_arch() == 950
+
+
+def supports_fp6_state() -> bool:
+    """Native FP6 E3M2 optimizer state (AMD CDNA4 / gfx950)."""
+    return get_gpu_vendor() == 'amd' and get_gpu_arch() == 950
+
+
+def supports_24_sparsity() -> bool:
+    """Hardware 2:4 structured sparsity (AMD CDNA4 / gfx950)."""
+    return get_gpu_vendor() == 'amd' and get_gpu_arch() == 950
+
+
 def supports_matrix_cores() -> bool:
-    """Matrix cores: AMD MFMA on gfx942, or NVIDIA Tensor Cores on sm_80+."""
+    """Matrix cores: AMD MFMA on gfx942/gfx950, or NVIDIA Tensor Cores on sm_80+."""
     return True
 
 
@@ -174,10 +211,14 @@ def get_arch_label() -> str:
     except UnsupportedArchError as exc:
         return f"unsupported ({exc})"
     return {
-        80:  "Ampere family (sm_80 binding)",
-        90:  "Hopper (sm_90)",
-        100: "Blackwell (sm_100)",
-        942: "MI300X (gfx942)",
+        80:  "Ampere family (sm_80 binding) — A100/A30/A10/RTX 30",
+        89:  "Ada (sm_89) — RTX 40, L40, L40S",
+        90:  "Hopper (sm_90) — H100, H200",
+        100: "Datacenter Blackwell (sm_100) — B100/B200/GB200",
+        103: "Blackwell Ultra (sm_103) — B300, GB300 NVL72",
+        120: "Consumer Blackwell (sm_120) — RTX 50, RTX PRO 6000 Blackwell",
+        942: "CDNA3 (gfx942) — MI300X / MI300A",
+        950: "CDNA4 (gfx950) — MI350X / MI355X",
     }[arch]
 
 

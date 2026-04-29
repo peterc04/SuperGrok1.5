@@ -27,7 +27,10 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from autotune.grids import GRIDS  # noqa: E402
 
-SUPPORTED_ARCHES = ("sm_80", "sm_90", "sm_100", "gfx942")
+SUPPORTED_ARCHES = (
+    "sm_80", "sm_89", "sm_90", "sm_100", "sm_103", "sm_120",
+    "gfx942", "gfx950",
+)
 
 
 def expand_grid(axes: dict) -> list[dict]:
