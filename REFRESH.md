@@ -10,31 +10,49 @@ A compact, granular catch-up. Plain language. Each kernel, file, and optimizer g
 
 ### Supported arches (no fallback)
 
-- **NVIDIA**: `sm_80` (Ampere family — A100, A10, RTX 3090, L4, RTX 4090 all route here), `sm_90` (Hopper, H100), `sm_100` (Blackwell, B200)
-- **AMD**: `gfx942` (CDNA3, MI300X) only
-- **CPU**: testing only, not a runtime fallback
-- Anything else (`sm_70/75`, `gfx908/gfx90a/gfx950`, RDNA): build fails or `dispatch.get_gpu_arch()` raises `UnsupportedArchError`
+After the §10 expansion, eight GPU arches plus two TPU versions are supported:
+
+- **NVIDIA**:
+  - `sm_80` — Ampere family. A100, A30, A10. RTX 30-series and sm_86 route here.
+  - `sm_89` — Ada Lovelace. RTX 40-series, L40, L40S.
+  - `sm_90` — Hopper. H100, H200.
+  - `sm_100` — Datacenter Blackwell. B100, B200, GB200.
+  - `sm_103` — Blackwell Ultra. B300, GB300 NVL72. NVFP4 hot path.
+  - `sm_120` — Consumer Blackwell. RTX 50-series, RTX PRO 6000 Blackwell. 128KB shared memory per SM.
+- **AMD**:
+  - `gfx942` — CDNA3. MI300X, MI300A.
+  - `gfx950` — CDNA4. MI350X, MI355X. Native FP4 expert MFMA, FP6 state, 2:4 sparsity.
+- **TPU** (JAX path): `v5p` (128-wide MXU), `v6e` (256-wide MXU).
+- **CPU**: testing only, not a runtime fallback.
+
+Anything else raises `UnsupportedArchError` or fails the build. Permanently unsupported: V100, T4, RTX 20-series, MI100 (gfx908), MI200 (gfx90a), AMD RDNA, TPU v3/v4/v5e.
 
 ### Filesystem layout
 
 ```
 csrc/
-├── common/          (shared headers; tuned_configs.h NEW)
-├── bindings/        (NEW: per-optimizer dispatchers + pybind11 module)
-└── kernels/         (NEW: all per-arch kernels)
+├── common/          (shared headers; tuned_configs.h with 8-row tables)
+├── bindings/        (per-optimizer dispatchers + pybind11 module)
+└── kernels/
     ├── cuda/
     │   ├── sm_80/   (17 wrapped baselines + 6 *_overlay.cu pre-tuned)
+    │   ├── sm_89/   (17 wrapped baselines, ported from sm_90)
     │   ├── sm_90/   (17 wrapped baselines + 5 *_overlay.cu pre-tuned)
-    │   └── sm_100/  (17 wrapped baselines + 3 *_overlay.cu pre-tuned)
+    │   ├── sm_100/  (17 wrapped baselines + 3 *_overlay.cu pre-tuned)
+    │   ├── sm_103/  (17 wrapped baselines, ported from sm_100)
+    │   └── sm_120/  (17 wrapped baselines, ported from sm_100)
     ├── hip/
-    │   └── gfx942/  (17 wrapped baselines + 3 *_overlay.hip.cpp pre-tuned)
+    │   ├── gfx942/  (17 wrapped baselines + 3 *_overlay.hip.cpp pre-tuned)
+    │   └── gfx950/  (17 wrapped baselines + cdna4_kernels overlay
+    │                 with FP4/FP6/2:4 sparsity, recovered from git)
     ├── tpu/
     │   ├── _pallas_kernels.py  (shared Pallas implementation, 1190 lines)
     │   ├── v5p/                 (TPU v4/v5e/v5p, 128-wide MXU re-export)
     │   ├── v6e/                 (TPU v6e, 256-wide MXU re-export)
     │   └── __init__.py          (detect_tpu_version + get_kernels)
     └── cpu/         (avx512/, neon/, scalar; testing only)
-autotune/            (NEW: tune.py, grids.py, runner.py, cutlass_profile.py)
+autotune/            (tune.py, grids.py with NVFP4/FP4/FP6 entries,
+                     cutlass_profile.py for sm_89/103a/120a, runner.py)
 ```
 
 Removed entirely: `csrc/cuda/generic/`, `csrc/cuda/generated/`, `csrc/cuda/sm_75/86/89/`, `csrc/hip/cdna2/cdna3/cdna4/`, `csrc/cpu/` (moved), `csrc/common/{ops.h,ops.cpp,dispatch.h}`, `grokking_optimizers/jit/`, `codegen/`.
@@ -100,6 +118,21 @@ For navigation, the structural-refactor commits:
 - `95b77e0` — delete `csrc/cpu/` tree
 - `104f3ff` — delete `grokking_optimizers/jit/` and `codegen/`
 - `682eab4` — delete `csrc/common/{ops.h,ops.cpp,dispatch.h}`
+
+§10 arch matrix expansion commits:
+
+- `dd1e0a6` — `REFACTOR_PLAN.md §10` (arch expansion plan)
+- `8da3d80` — create directory tree for sm_89, sm_103, sm_120, gfx950
+- `bf157b4` — port 17 sm_90 baselines → sm_89 (Ada Lovelace)
+- `e2545a8` — port 17 sm_100 baselines → sm_103 (Blackwell Ultra)
+- `50925ae` — port 17 sm_100 baselines → sm_120 (consumer Blackwell)
+- `98f8190` — port 17 gfx942 baselines → gfx950 (CDNA4)
+- `02348cc` — recover CDNA4 FP4/FP6/2:4 sparsity overlay (2491 lines) into gfx950
+- `813ffdb` — drop now-redundant `.gitkeep` placeholders
+- `5b4218b` — extend bindings layer (`bindings.h`, `_dispatch_macro.h`, `dispatch.cpp`, all per-optimizer dispatchers) to 8 arches
+- `0fe9cc4` — extend `tuned_configs.h` (`ArchId` enum + table widths 4→8) and `setup.py` (`-gencode` for sm_89/103/120, `--offload-arch=gfx950`)
+- `40954ae` — extend `dispatch.py` (SUPPORTED_ARCHES, detection, label table) and `autotune/` (NVFP4/FP4/FP6 grids, sm_89/103a/120a CUTLASS targets)
+- `58b9e54` — extend tests (`test_cross_arch_agreement.py`, `test_all_arches.py`, `test_amd_hip.py` covering both gfx942 + gfx950)
 
 ---
 
