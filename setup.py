@@ -1,228 +1,199 @@
 """
-Grokking Optimizers — C++/CUDA/HIP/CPU Extension Build Script
+Grokking Optimizers — All-Specialized Per-Arch Kernel Build
 
-Builds custom optimizer kernels. Supports:
-  - NVIDIA CUDA (sm_70-sm_90)
-  - AMD ROCm/HIP (gfx908, gfx90a, gfx942, gfx950)
-  - CPU-only (OpenMP, reference implementation for debugging/testing)
+Supported arches:
+  - NVIDIA: sm_80 (Ampere family), sm_90 (Hopper), sm_100 (Blackwell)
+  - AMD:    gfx942 (MI300X)
+  - CPU:    x86_64 (AVX-512), aarch64 (NEON) -- testing only
+
+Build fails on unsupported arches. There is no generic-kernel fallback
+and no tier fallback chain. See REFACTOR_PLAN.md and csrc/kernels/README.md
+for the underlying policy.
 
 Build:
     pip install -e .
 
-Or for development:
-    python setup.py build_ext --inplace
+For build-only without a physical GPU:
+    FORCE_CUDA=1 pip install -e .
+
+To build for a specific arch subset:
+    TORCH_CUDA_ARCH_LIST="9.0" pip install -e .            # Hopper only
+    TORCH_CUDA_ARCH_LIST="8.0;9.0;10.0" pip install -e .   # all NVIDIA
 """
 
+import glob
 import os
+import platform as _platform
+
 import torch
-from setuptools import setup, find_packages
+from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension
 
-# Detect backend: CUDA, ROCm/HIP, or CPU-only
-# FORCE_CUDA=1 allows building CUDA extension without a physical GPU
+
+# ----------------------------------------------------------------------
+# Backend detection. Same conventions as before; the supported set is
+# narrowed.
+# ----------------------------------------------------------------------
+
 _is_hip = hasattr(torch.version, 'hip') and torch.version.hip is not None
 _force_cuda = os.environ.get('FORCE_CUDA', '0') == '1'
 _has_gpu = torch.cuda.is_available() or (_force_cuda and torch.version.cuda is not None)
 
+# ----------------------------------------------------------------------
+# Source lists. Walk the new csrc/kernels/ tree; never csrc/cuda/generic/.
+# ----------------------------------------------------------------------
+
+def _collect(globs):
+    out = []
+    for g in globs:
+        out.extend(sorted(glob.glob(g)))
+    # Filter out *_overlay.* files: they are partial pre-existing
+    # specializations that have not yet been merged into the canonical
+    # per-arch kernel. They are kept in-tree for reference but excluded
+    # from the build until merged in a hardware-validated tuning pass.
+    return [s for s in out if "_overlay" not in os.path.basename(s)]
+
+
+COMMON_BINDINGS = [
+    "csrc/bindings/dispatch.cpp",
+    "csrc/bindings/grokadamw.cpp",
+    "csrc/bindings/grokfast.cpp",
+    "csrc/bindings/lion.cpp",
+    "csrc/bindings/looksam.cpp",
+    "csrc/bindings/moe.cpp",
+    "csrc/bindings/multi_tensor.cpp",
+    "csrc/bindings/muon.cpp",
+    "csrc/bindings/neuralgrok.cpp",
+    "csrc/bindings/prodigy.cpp",
+    "csrc/bindings/quantization.cpp",
+    "csrc/bindings/supergrok11.cpp",
+    "csrc/bindings/supergrok15.cpp",
+    "csrc/bindings/supergrok2.cpp",
+    "csrc/bindings/distributed_scan.cpp",
+    "csrc/bindings/module.cpp",
+]
+
 if _has_gpu and _is_hip:
     from torch.utils.cpp_extension import CUDAExtension
-    import glob as _glob
-    print(f"Building Grokking Optimizers C++/HIP extension")
+
+    print("Building Grokking Optimizers C++/HIP extension")
     print(f"  ROCm version: {torch.version.hip}")
 
-    generic_sources = [
-        "csrc/common/ops.cpp",
-        "csrc/cuda/generic/supergrok15_kernels.cu",
-        "csrc/cuda/generic/supergrok11_kernels.cu",
-        "csrc/cuda/generic/supergrok2_mamba_peer_kernels.cu",
-        "csrc/cuda/generic/supergrok2_mamba_peer_backward_kernels.cu",
-        "csrc/cuda/generic/grokadamw_kernels.cu",
-        "csrc/cuda/generic/neuralgrok_kernels.cu",
-        "csrc/cuda/generic/prodigy_kernels.cu",
-        "csrc/cuda/generic/grokfast_kernels.cu",
-        "csrc/cuda/generic/lion_kernels.cu",
-        "csrc/cuda/generic/looksam_kernels.cu",
-        "csrc/cuda/generic/muon_kernels.cu",
-        "csrc/quantization/quantization_kernels.cu",
-        "csrc/cuda/generic/moe_deep_kernels.cu",
-        "csrc/cuda/generic/distributed_scan_kernels.cu",
-        "csrc/cuda/generic/distributed_pipeline.cu",
-        "csrc/cuda/generic/distributed_scan_pipeline.cu",
-        "csrc/cuda/generic/multi_tensor_prepare.cu",
-        "csrc/cuda/generic/multi_tensor_optimizer_kernels.cu",
-    ]
+    sources = COMMON_BINDINGS + _collect(["csrc/kernels/hip/gfx942/*.hip.cpp"])
 
-    # Auto-detect CDNA specialization sources
-    cdna_sources = sorted(
-        _glob.glob("csrc/hip/cdna2/*.hip.cpp") +
-        _glob.glob("csrc/hip/cdna3/*.hip.cpp") +
-        _glob.glob("csrc/hip/cdna4/*.hip.cpp")
-    )
-    if cdna_sources:
-        print(f"  CDNA sources: {', '.join(os.path.basename(s) for s in cdna_sources)}")
-
-    # ROCm arch flags from TORCH_CUDA_ARCH_LIST or defaults
     rocm_archs = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()
     if rocm_archs:
-        hipcc_arch_flags = []
-        for arch in rocm_archs.replace(",", ";").split(";"):
-            arch = arch.strip()
-            if arch:
-                hipcc_arch_flags.append(f"--offload-arch={arch}")
+        offload = []
+        for a in rocm_archs.replace(",", ";").split(";"):
+            a = a.strip()
+            if a:
+                offload.append(f"--offload-arch={a}")
         print(f"  ROCm archs (from TORCH_CUDA_ARCH_LIST): {rocm_archs}")
     else:
-        hipcc_arch_flags = [
-            "--offload-arch=gfx908",    # MI100
-            "--offload-arch=gfx90a",    # MI250
-            "--offload-arch=gfx942",    # MI300X
-            "--offload-arch=gfx950",    # MI350X
-        ]
+        offload = ["--offload-arch=gfx942"]   # MI300X only
 
     ext = CUDAExtension(
         name="grokking_optimizers._ops",
-        sources=generic_sources + cdna_sources,
-        include_dirs=["csrc/common", "csrc"],
+        sources=sources,
+        include_dirs=["csrc/common", "csrc/bindings", "csrc"],
         define_macros=[("WITH_HIP", None)],
         extra_compile_args={
-            "cxx": [
-                "-O3", "-std=c++17", "-DWITH_HIP",
-                "-ffast-math", "-funroll-loops",
-            ],
-            "nvcc": [
-                "-O3", "-std=c++17", "-DWITH_HIP",
-            ] + hipcc_arch_flags,
+            "cxx":  ["-O3", "-std=c++17", "-DWITH_HIP", "-ffast-math", "-funroll-loops"],
+            "nvcc": ["-O3", "-std=c++17", "-DWITH_HIP"] + offload,
         },
     )
 
 elif _has_gpu:
     from torch.utils.cpp_extension import CUDAExtension
-    print(f"Building Grokking Optimizers C++/CUDA extension")
+
+    print("Building Grokking Optimizers C++/CUDA extension")
     print(f"  CUDA version: {torch.version.cuda}")
 
-    generic_sources = [
-        "csrc/common/ops.cpp",
-        "csrc/cuda/generic/supergrok15_kernels.cu",
-        "csrc/cuda/generic/supergrok11_kernels.cu",
-        "csrc/cuda/generic/supergrok2_mamba_peer_kernels.cu",
-        "csrc/cuda/generic/supergrok2_mamba_peer_backward_kernels.cu",
-        "csrc/cuda/generic/grokadamw_kernels.cu",
-        "csrc/cuda/generic/neuralgrok_kernels.cu",
-        "csrc/cuda/generic/prodigy_kernels.cu",
-        "csrc/cuda/generic/grokfast_kernels.cu",
-        "csrc/cuda/generic/lion_kernels.cu",
-        "csrc/cuda/generic/looksam_kernels.cu",
-        "csrc/cuda/generic/muon_kernels.cu",
-        "csrc/cuda/generic/moe_deep_kernels.cu",
-        "csrc/cuda/generic/distributed_scan_kernels.cu",
-        "csrc/cuda/generic/distributed_pipeline.cu",
-        "csrc/cuda/generic/distributed_scan_pipeline.cu",
-        "csrc/cuda/generic/multi_tensor_prepare.cu",
-        "csrc/cuda/generic/multi_tensor_optimizer_kernels.cu",
-    ]
-    nvidia_sources = [
-        "csrc/cuda/sm_80/supergrok2_scan_sm80.cu",
-        "csrc/cuda/sm_80/supergrok2_backward_sm80.cu",
-        "csrc/cuda/sm_80/supergrok2_fused_elem_sm80.cu",
-        "csrc/cuda/sm_80/metanet_optimizers_sm80.cu",
-        "csrc/cuda/sm_80/metanet_cpasync_variants_sm80.cu",
-        "csrc/cuda/sm_80/muon_sm80.cu",
-        "csrc/cuda/sm_90/supergrok2_scan_sm90.cu",
-        "csrc/cuda/sm_90/supergrok2_backward_sm90.cu",
-        "csrc/cuda/sm_90/muon_sm90.cu",
-        "csrc/cuda/sm_90/metanet_optimizers_sm90.cu",
-        "csrc/cuda/sm_90/supergrok2_warp_specialized_sm90.cu",
-        "csrc/cuda/sm_100/supergrok2_sm100.cu",
-        "csrc/cuda/sm_100/supergrok2_precompute_sm100.cu",
-        "csrc/cuda/sm_100/supergrok2_scan_sm100.cu",
-        "csrc/quantization/quantization_kernels.cu",
-    ]
-    # Auto-detect generated kernel sources
-    import glob as _glob_nv
-    generated_sources = sorted(_glob_nv.glob("csrc/cuda/generated/*.cu"))
-    if generated_sources:
-        print(f"  Generated sources: {', '.join(os.path.basename(s) for s in generated_sources)}")
-        nvidia_sources += generated_sources
+    sources = COMMON_BINDINGS + _collect([
+        "csrc/kernels/cuda/sm_80/*.cu",
+        "csrc/kernels/cuda/sm_90/*.cu",
+        "csrc/kernels/cuda/sm_100/*.cu",
+        "csrc/quantization/*.cu",  # split per-arch in a follow-up
+    ])
+
+    nvcc_archs_env = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()
+    if nvcc_archs_env:
+        # Honor user override; convert "8.0;9.0" to gencode flags.
+        gencode = []
+        for a in nvcc_archs_env.replace(",", ";").split(";"):
+            a = a.strip().replace(".", "")
+            if not a:
+                continue
+            gencode.append(f"-gencode=arch=compute_{a},code=sm_{a}")
+        print(f"  CUDA archs (from TORCH_CUDA_ARCH_LIST): {nvcc_archs_env}")
+    else:
+        # Supported set: sm_80, sm_90, sm_100. Pre-Ampere / sm_86 / sm_89
+        # not supported; users on those cards must upgrade or use FORCE_ARCH=80
+        # at runtime to route to the sm_80 binding (see grokking_optimizers/dispatch.py).
+        gencode = [
+            "-gencode=arch=compute_80,code=sm_80",   # A100 / Ampere family
+            "-gencode=arch=compute_90,code=sm_90",   # H100
+            "-gencode=arch=compute_100,code=sm_100", # B200
+        ]
+
     ext = CUDAExtension(
         name="grokking_optimizers._ops",
-        sources=generic_sources + nvidia_sources,
-        include_dirs=["csrc/common", "csrc"],
+        sources=sources,
+        include_dirs=["csrc/common", "csrc/bindings", "csrc"],
         define_macros=[("WITH_CUDA", None)],
         extra_compile_args={
-            "cxx": [
-                "-O3", "-std=c++17", "-DWITH_CUDA",
-                "-ffast-math", "-funroll-loops",
-            ],
+            "cxx":  ["-O3", "-std=c++17", "-DWITH_CUDA", "-ffast-math", "-funroll-loops"],
             "nvcc": [
                 "-O3", "--use_fast_math", "-std=c++17", "-DWITH_CUDA",
                 "--expt-relaxed-constexpr", "-lineinfo",
-                "-gencode=arch=compute_70,code=sm_70",   # V100
-                "-gencode=arch=compute_75,code=sm_75",   # T4
-                "-gencode=arch=compute_80,code=sm_80",   # A100
-                "-gencode=arch=compute_86,code=sm_86",   # A10, RTX 3090
-                "-gencode=arch=compute_89,code=sm_89",   # L4, RTX 4090
-                "-gencode=arch=compute_90,code=sm_90",   # H100
-            ],
+            ] + gencode,
         },
     )
 
 else:
+    # CPU build is testing-only. Not a runtime fallback.
     from torch.utils.cpp_extension import CppExtension
-    import platform as _platform
-    print("Building Grokking Optimizers C++ CPU-only extension")
-    print("  No GPU detected — building reference CPU kernels with OpenMP + SIMD.")
 
-    _cpu_sources = [
-        "csrc/cpu/cpu_ops.cpp",
-        "csrc/cpu/cpu_kernels.cpp",
-        "csrc/cpu/generic/all_optimizers_cpu.cpp",
-        "csrc/cpu/generic/supergrok2_scan_cpu.cpp",
-        "csrc/cpu/sg2_fused_scan_elem_cpu.cpp",
-        "csrc/cpu/moe_cpu.cpp",
-        "csrc/cpu/distributed_scan_cpu.cpp",
-    ]
+    print("Building Grokking Optimizers C++ CPU extension (testing only)")
+    print("  CPU build is for unit tests; not a runtime fallback path.")
 
-    # Auto-detect CPU generated sources
-    import glob as _glob_cpu
-    _cpu_generated = sorted(_glob_cpu.glob("csrc/cpu/generated/*.cpp"))
-    if _cpu_generated:
-        _cpu_sources += _cpu_generated
-
-    _cpu_cxx_flags = [
+    cpu_sources = _collect([
+        "csrc/kernels/cpu/*.cpp",
+    ])
+    cpu_cxx_flags = [
         "-O3", "-std=c++17", "-DWITH_CPU",
-        "-ffast-math", "-funroll-loops",
-        "-fopenmp",
+        "-ffast-math", "-funroll-loops", "-fopenmp",
     ]
 
-    _cpu_arch = _platform.machine().lower()
-    if _cpu_arch in ("x86_64", "amd64"):
-        _cpu_sources.append("csrc/cpu/avx512/simd_kernels.cpp")
-        _cpu_cxx_flags.append("-march=native")
-        print("  SIMD: x86_64 detected, AVX-512 auto-detected via -march=native")
-    elif _cpu_arch in ("aarch64", "arm64"):
-        _cpu_sources.append("csrc/cpu/neon/simd_kernels.cpp")
+    cpu_arch = _platform.machine().lower()
+    if cpu_arch in ("x86_64", "amd64"):
+        cpu_sources += _collect(["csrc/kernels/cpu/avx512/*.cpp"])
+        cpu_cxx_flags.append("-march=native")
+        print("  SIMD: x86_64 detected, AVX-512 via -march=native")
+    elif cpu_arch in ("aarch64", "arm64"):
+        cpu_sources += _collect(["csrc/kernels/cpu/neon/*.cpp"])
         print("  SIMD: ARM detected, NEON intrinsics enabled")
     else:
-        print(f"  SIMD: unknown arch '{_cpu_arch}', scalar fallback only")
+        print(f"  SIMD: unknown arch '{cpu_arch}', scalar fallback only")
 
     ext = CppExtension(
         name="grokking_optimizers._ops",
-        sources=_cpu_sources,
-        include_dirs=["csrc/common", "csrc", "csrc/cpu"],
+        sources=COMMON_BINDINGS + cpu_sources,
+        include_dirs=["csrc/common", "csrc/bindings", "csrc/kernels/cpu", "csrc"],
         define_macros=[("WITH_CPU", None)],
-        extra_compile_args={
-            "cxx": _cpu_cxx_flags,
-        },
+        extra_compile_args={"cxx": cpu_cxx_flags},
         extra_link_args=["-fopenmp"],
     )
 
+
 setup(
     name="grokking-optimizers",
-    version="2.1.0",
+    version="3.0.0",
     description=(
-        "C++/CUDA/HIP/JAX optimizer suite with SuperGrok v2 "
-        "(Mamba-3 + PEER + GRU meta-net). Supports NVIDIA (sm_70-100), "
-        "AMD (MI250/MI300X/MI350X), TPU (v4/v5), and CPU. "
-        "Multi-precision: FP32/TF32/BF16/FP8/INT8/INT4/MXFP4/NVFP4."
+        "All-specialized per-arch optimizer kernels. "
+        "Supported: NVIDIA sm_80/sm_90/sm_100 (CUDA), AMD gfx942 (HIP), "
+        "TPU v5p/v6e (Pallas via JAX). CPU build for testing only. "
+        "No generic-kernel fallback, no tier fallback chain."
     ),
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
@@ -239,10 +210,10 @@ setup(
     packages=find_packages(),
     ext_modules=[ext],
     cmdclass={"build_ext": BuildExtension},
-    python_requires=">=3.8",
+    python_requires=">=3.10",
     install_requires=["torch>=2.0.0"],
     extras_require={
-        "jax": ["jax>=0.4.0", "jaxlib>=0.4.0"],
+        "jax":  ["jax>=0.4.0", "jaxlib>=0.4.0"],
         "test": ["pytest", "numpy"],
     },
 )
