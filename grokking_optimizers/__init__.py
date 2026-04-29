@@ -1,19 +1,21 @@
 """
-Grokking Optimizers — C++/CUDA/HIP/CPU Accelerated Optimizer Suite
+Grokking Optimizers — All-Specialized Per-Arch Kernel Suite
 
-All optimizers use custom GPU kernels for maximum performance.
-Supports NVIDIA CUDA, AMD ROCm/HIP, and CPU-only (for debugging/testing).
-Supports FP32, FP16, and BF16 parameter tensors.
+Every optimizer is hand-written and fully specialized for one of:
+  sm_80 (Ampere family)  sm_90 (Hopper)  sm_100 (Blackwell)  gfx942 (MI300X)
+
+There is no generic-kernel fallback and no tier fallback chain. The build
+fails on unsupported arches; the CPU build is for testing only.
 
 Usage:
     from grokking_optimizers import SuperGrok15, SuperGrok2, GrokAdamW, ...
 """
 
-__version__ = "2.1.0"
+__version__ = "3.0.0"
 
 # ── Backend capability flags ─────────────────────────────────────────
-# No fallbacks. If the C++ extension is not built, get_ops() fails loudly.
-# _HAS_OPS is always True in production. Tests mock this.
+# No fallbacks. If the C++ extension is not built or the host arch is
+# not supported, get_ops() fails loudly.
 from grokking_optimizers._ops_loader import get_ops
 
 import torch  # noqa: F401 — must import torch first to load libc10.so
@@ -25,7 +27,11 @@ def _get_ops():
 
 try:
     _ops = get_ops()
-    _HAS_CUDA = hasattr(_ops, 'supergrok2_mamba_peer_batched_step')
+    # Capability probes used by some Python paths to skip features not
+    # registered in the current build (e.g. SG2 batched step is the
+    # primary entry point that gates the meta-net pipeline).
+    _HAS_CUDA = hasattr(_ops, 'supergrok2_mamba_peer_batched_step') or \
+                hasattr(_ops, 'sg15_fused_step')  # new bindings layer
     _HAS_CPU_OPS = hasattr(_ops, 'supergrok2_cpu_step')
 except RuntimeError:
     # Extension not built — flags remain for import-time checks,
@@ -49,7 +55,7 @@ from .dispatch import (
     get_gpu_arch, get_gpu_vendor, get_backend, get_arch_label,
     get_warp_size, supports_bf16, supports_fp8, supports_tf32,
     supports_matrix_cores, supports_nvfp4,
-    get_amd_tier, get_amd_label,
+    SUPPORTED_ARCHES, UnsupportedArchError, assert_supported_arch,
 )
 from .quantization import PrecisionConfig
 from .distributed import (
@@ -82,7 +88,7 @@ __all__ = [
     "get_gpu_arch", "get_gpu_vendor", "get_backend", "get_arch_label",
     "get_warp_size", "supports_bf16", "supports_fp8", "supports_tf32",
     "supports_matrix_cores", "supports_nvfp4",
-    "get_amd_tier", "get_amd_label",
+    "SUPPORTED_ARCHES", "UnsupportedArchError", "assert_supported_arch",
     "PrecisionConfig",
     "CompiledSuperGrok2",
     "setup_distributed", "cleanup_distributed",

@@ -1,20 +1,36 @@
-"""Runtime hardware detection and kernel dispatch.
+"""Runtime hardware detection for the all-specialized kernel architecture.
 
-Detects GPU vendor (NVIDIA/AMD) and architecture at import time.
-Provides dispatch helpers for selecting the optimal kernel variant per hardware.
+Supported arches (post-refactor): sm_80, sm_90, sm_100, gfx942.
 
-Set FORCE_ARCH=<sm_number> to override detected architecture for testing.
-E.g., FORCE_ARCH=80 forces Ampere tier on any GPU.
+Anything else raises ``UnsupportedArchError``. There is no tier fallback chain
+and no generic-kernel path. ``FORCE_ARCH`` env var continues to work for
+testing on hosts that have multiple bindings compiled in.
+
+See REFACTOR_PLAN.md and csrc/kernels/README.md for the underlying policy.
 """
+
+from __future__ import annotations
 
 import functools
 import os
+
 import torch
 
 
+SUPPORTED_ARCHES = (80, 90, 100, 942)
+
+
+class UnsupportedArchError(RuntimeError):
+    """Raised when the detected arch is not one of {sm_80, sm_90, sm_100, gfx942}."""
+
+
+# ----------------------------------------------------------------------
+# Vendor / backend
+# ----------------------------------------------------------------------
+
 @functools.lru_cache(maxsize=1)
 def get_gpu_vendor() -> str:
-    """GPU vendor: 'nvidia', 'amd', or 'none'."""
+    """GPU vendor: 'nvidia', 'amd', or 'none' (no GPU)."""
     if not torch.cuda.is_available():
         return 'none'
     if hasattr(torch.version, 'hip') and torch.version.hip is not None:
@@ -23,182 +39,153 @@ def get_gpu_vendor() -> str:
 
 
 @functools.lru_cache(maxsize=1)
-def get_gpu_arch() -> int:
-    """SM compute capability as integer (e.g., 75 for T4, 80 for A100).
-    For AMD, returns the GCN arch number (e.g., 90 for gfx90a, 94 for gfx942).
-    Returns 0 if no GPU available.
-    Honors FORCE_ARCH env var for testing."""
-    force = os.environ.get('FORCE_ARCH')
-    if force:
-        return int(force)
-    if not torch.cuda.is_available():
-        return 0
-    major, minor = torch.cuda.get_device_capability()
-    return major * 10 + minor
-
-
-@functools.lru_cache(maxsize=1)
 def get_backend() -> str:
     """Active backend: 'cuda', 'hip', or 'cpu'."""
-    if torch.cuda.is_available():
-        if hasattr(torch.version, 'hip') and torch.version.hip is not None:
-            return 'hip'
-        return 'cuda'
-    return 'cpu'
+    if not torch.cuda.is_available():
+        return 'cpu'
+    if hasattr(torch.version, 'hip') and torch.version.hip is not None:
+        return 'hip'
+    return 'cuda'
 
 
 @functools.lru_cache(maxsize=1)
 def get_warp_size() -> int:
-    """Warp/wavefront size for the current GPU.
-    NVIDIA: 32, AMD CDNA (MI100/200/300): 64, AMD RDNA: 32."""
+    """Warp/wavefront size: 32 (NVIDIA), 64 (AMD CDNA)."""
     if get_gpu_vendor() == 'amd':
-        # CDNA architectures use wavefront-64
-        # RDNA architectures use wavefront-32 but we target data center GPUs
-        prop = torch.cuda.get_device_properties(0)
-        name = prop.name.lower()
-        if 'rdna' in name or 'rx' in name:
-            return 32
-        return 64  # CDNA default
-    return 32  # NVIDIA
+        return 64
+    return 32
 
 
-def get_arch_tier() -> str:
-    """NVIDIA architecture tier: 'blackwell', 'hopper', 'ampere', or 'generic'."""
-    if get_gpu_vendor() == 'amd':
-        return 'generic'
-    arch = get_gpu_arch()
-    if arch >= 100:
-        return 'blackwell'
-    if arch >= 90:
-        return 'hopper'
-    if arch >= 80:
-        return 'ampere'
-    return 'generic'
-
+# ----------------------------------------------------------------------
+# Arch detection
+# ----------------------------------------------------------------------
 
 @functools.lru_cache(maxsize=1)
-def get_amd_tier() -> str:
-    """AMD architecture tier: 'cdna4', 'cdna3', 'cdna2', or 'generic'.
+def get_gpu_arch() -> int:
+    """Detected GPU arch as one of {80, 90, 100, 942}.
 
-    FORCE_ARCH convention (matches C++ get_amd_tier):
-      1200 → cdna4 (gfx1200, full GCN arch number)
-      120  → cdna4 (from get_device_capability major*10+minor)
-      942  → cdna3 (full GCN arch number)
-      94   → cdna3 (from get_device_capability major*10+minor)
-      90   → cdna2 (gfx90a)
-      908  → generic (MI100, full GCN arch)
-      else → generic
+    For NVIDIA, the SM number is rounded into one of the supported tiers:
+    sm_80/sm_86/sm_89 → 80 (Ampere family routes to sm_80 binding).
+    sm_90 → 90, sm_100+ → 100.
+
+    For AMD, only gfx942 is supported.
+
+    Honors FORCE_ARCH env var.
+
+    Raises ``UnsupportedArchError`` if the detected arch is not supported.
     """
-    if get_gpu_vendor() != 'amd':
-        return 'generic'
-
-    # Handle FORCE_ARCH directly to match C++ convention
     force = os.environ.get('FORCE_ARCH')
     if force:
-        arch = int(force)
-        if arch >= 1200: return 'cdna4'   # gfx1200/gfx1201 (full arch number)
-        if arch >= 942:  return 'cdna3'   # gfx942 (full arch number)
-        if arch == 120:  return 'cdna4'   # capability format (12, 0)
-        if arch == 94:   return 'cdna3'   # capability format (9, 4)
-        if arch == 90:   return 'cdna2'   # gfx90a
-        return 'generic'                   # gfx908, etc.
+        try:
+            arch = int(force)
+        except ValueError:
+            raise UnsupportedArchError(f"FORCE_ARCH={force!r} is not an integer")
+        if arch not in SUPPORTED_ARCHES:
+            raise UnsupportedArchError(
+                f"FORCE_ARCH={arch} not in supported set {SUPPORTED_ARCHES}")
+        return arch
 
-    # Real hardware: get_gpu_arch returns major*10+minor
-    arch = get_gpu_arch()
-    if arch >= 120:  # gfx1200 → (12, 0) → 120
-        return 'cdna4'
-    if arch >= 94:   # gfx942 → (9, 4) → 94
-        return 'cdna3'
-    if arch >= 90:   # gfx90a → (9, 0) → 90
-        return 'cdna2'
-    return 'generic'
+    if not torch.cuda.is_available():
+        raise UnsupportedArchError(
+            "No CUDA/HIP device available. SuperGrok kernels are GPU-only "
+            "(CPU build is for testing). Set FORCE_ARCH=<80|90|100|942> "
+            "for cross-arch testing.")
+
+    vendor = get_gpu_vendor()
+    if vendor == 'nvidia':
+        major, minor = torch.cuda.get_device_capability()
+        sm = major * 10 + minor
+        if sm in (80, 86, 89):
+            return 80   # Ampere family routes to the sm_80 binding
+        if sm == 90:
+            return 90
+        if sm >= 100:
+            return 100
+        raise UnsupportedArchError(
+            f"Detected sm_{sm}; only sm_80, sm_90, sm_100 are supported. "
+            "sm_70/sm_75 (Volta/Turing) and pre-Ampere arches are no longer "
+            "supported. Use FORCE_CUDA=1 to force-build a binding.")
+
+    if vendor == 'amd':
+        prop = torch.cuda.get_device_properties(0)
+        # gcnArchName looks like 'gfx942:sramecc+:xnack-'; take the prefix.
+        arch_name = (prop.gcnArchName or '').split(':')[0]
+        if arch_name == 'gfx942':
+            return 942
+        raise UnsupportedArchError(
+            f"Detected {arch_name!r}; only gfx942 (MI300X) is supported. "
+            "gfx908/gfx90a/gfx950 are no longer supported.")
+
+    raise UnsupportedArchError(f"Unknown GPU vendor {vendor!r}")
 
 
-def get_amd_label() -> str:
-    """Human-readable label for AMD GPU tier."""
-    tier = get_amd_tier()
-    labels = {
-        'cdna4': 'MI400 (gfx1200, CDNA4)',
-        'cdna3': 'MI300X (gfx942, CDNA3)',
-        'cdna2': 'MI250 (gfx90a, CDNA2)',
-        'generic': 'AMD GPU (generic CDNA)',
-    }
-    return labels.get(tier, 'AMD GPU')
-
-
-def supports_fp8() -> bool:
-    """FP8 Tensor Cores (Ada Lovelace sm_89+ or Hopper sm_90+)."""
-    return get_gpu_vendor() == 'nvidia' and get_gpu_arch() >= 89
-
+# ----------------------------------------------------------------------
+# Feature predicates (used by tests and Python-side precision pickers)
+# ----------------------------------------------------------------------
 
 def supports_bf16() -> bool:
-    """Native BF16 (Ampere sm_80+ or AMD CDNA gfx90a+)."""
-    if get_gpu_vendor() == 'amd':
-        return get_gpu_arch() >= 90  # gfx90a+ has BF16 matrix cores
-    return get_gpu_arch() >= 80
+    """Native BF16 matmul. True on every supported arch."""
+    return True
 
 
 def supports_tf32() -> bool:
-    """TF32 Tensor Core mode (Ampere sm_80+, NVIDIA only)."""
-    return get_gpu_vendor() == 'nvidia' and get_gpu_arch() >= 80
+    """TF32 tensor cores (NVIDIA Ampere+)."""
+    return get_gpu_vendor() == 'nvidia'
+
+
+def supports_fp8() -> bool:
+    """FP8 E4M3 tensor cores (Hopper sm_90+ or Blackwell sm_100+)."""
+    return get_gpu_vendor() == 'nvidia' and get_gpu_arch() >= 90
 
 
 def supports_async_copy() -> bool:
-    """cp.async global->shared (Ampere sm_80+, NVIDIA only)."""
-    return get_gpu_vendor() == 'nvidia' and get_gpu_arch() >= 80
+    """cp.async (Ampere+, NVIDIA only)."""
+    return get_gpu_vendor() == 'nvidia'
 
 
 def supports_tma() -> bool:
-    """Tensor Memory Accelerator (Hopper sm_90+, NVIDIA only)."""
+    """TMA bulk copy (Hopper sm_90+)."""
     return get_gpu_vendor() == 'nvidia' and get_gpu_arch() >= 90
 
 
 def supports_block_clusters() -> bool:
-    """Thread Block Clusters (Hopper sm_90+, NVIDIA only)."""
+    """Thread block clusters (Hopper sm_90+)."""
     return get_gpu_vendor() == 'nvidia' and get_gpu_arch() >= 90
 
 
 def supports_nvfp4() -> bool:
-    """NVFP4 native (Blackwell sm_100+, NVIDIA only)."""
+    """Native NVFP4 (Blackwell sm_100+)."""
     return get_gpu_vendor() == 'nvidia' and get_gpu_arch() >= 100
 
 
-def supports_fp4_mfma() -> bool:
-    """Native FP4 MFMA instructions (AMD CDNA4 gfx1200+)."""
-    return get_amd_tier() == 'cdna4'
-
-
-def supports_fp6() -> bool:
-    """Enhanced FP6 support (AMD CDNA3+: gfx940/gfx941/gfx942 and gfx1200+)."""
-    return get_amd_tier() in ('cdna3', 'cdna4')
-
-
 def supports_matrix_cores() -> bool:
-    """AMD Matrix Cores (CDNA gfx908+)."""
-    return get_gpu_vendor() == 'amd' and get_gpu_arch() >= 90
+    """Matrix cores: AMD MFMA on gfx942, or NVIDIA Tensor Cores on sm_80+."""
+    return True
 
+
+# ----------------------------------------------------------------------
+# Human-readable labels
+# ----------------------------------------------------------------------
 
 def get_arch_label() -> str:
-    """Human-readable label for the detected GPU."""
-    arch = get_gpu_arch()
-    vendor = get_gpu_vendor()
+    """Human-readable label for the detected arch."""
+    try:
+        arch = get_gpu_arch()
+    except UnsupportedArchError as exc:
+        return f"unsupported ({exc})"
+    return {
+        80:  "Ampere family (sm_80 binding)",
+        90:  "Hopper (sm_90)",
+        100: "Blackwell (sm_100)",
+        942: "MI300X (gfx942)",
+    }[arch]
 
-    if vendor == 'amd':
-        labels = {
-            120: "MI400 (gfx1200)",
-            90: "MI200 (gfx90a)",
-            94: "MI300X (gfx942)",
-        }
-        return labels.get(arch, f"AMD GPU (gfx{arch})")
 
-    labels = {
-        0: "CPU (no GPU)",
-        70: "V100 (sm_70)",
-        75: "T4 (sm_75)",
-        80: "A100 (sm_80)",
-        86: "RTX 3090 / A10 (sm_86)",
-        89: "L4 / RTX 4090 (sm_89)",
-        90: "H100 (sm_90)",
-        100: "B200 (sm_100)",
-    }
-    return labels.get(arch, f"Unknown (sm_{arch})")
+# ----------------------------------------------------------------------
+# Convenience for the optimizer code: assert the active arch is one we
+# have a binding for, and surface a clear error if not.
+# ----------------------------------------------------------------------
+
+def assert_supported_arch() -> int:
+    """Returns the detected arch or raises UnsupportedArchError."""
+    return get_gpu_arch()

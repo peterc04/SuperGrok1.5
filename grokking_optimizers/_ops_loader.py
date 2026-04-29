@@ -1,7 +1,11 @@
 """Strict ops loader — no fallbacks.
 
-If the C++ extension is not built, raises RuntimeError with instructions.
-The _python_fallback module is ONLY for unit testing (imported explicitly by tests).
+Loads the per-arch specialized C++ extension. Raises RuntimeError if the
+extension is not built or if the host arch is not in the supported set
+{sm_80, sm_90, sm_100, gfx942}.
+
+The _python_fallback module is ONLY for unit testing (imported explicitly
+by tests). It is not a runtime fallback path.
 """
 
 _cached_ops = None
@@ -18,8 +22,9 @@ def get_ops():
         return _ops
     except ImportError as e:
         raise RuntimeError(
-            "SuperGrok v2 C++ extension not built. "
+            "SuperGrok C++ extension not built. "
             "Run: pip install -e . "
-            "(requires CUDA toolkit or ROCm for GPU, or C++ compiler for CPU-only). "
+            "Supported arches: sm_80, sm_90, sm_100 (NVIDIA), gfx942 (AMD). "
+            "CPU build is for testing only -- not a runtime fallback. "
             f"Original error: {e}"
         ) from e
