@@ -30,10 +30,52 @@ To build for a specific arch subset:
 import glob
 import os
 import platform as _platform
+import shutil
 
 import torch
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension
+
+
+# ----------------------------------------------------------------------
+# Build-mode env vars (read by build.sh wrapper):
+#   CUDA_DEBUG=1     -> add -G -O0 -lineinfo, drop --use_fast_math
+#   AUTOTUNE_PASS=1  -> first-pass autotune build (informational only;
+#                       autotune writes tuned_configs.h between passes)
+#   FORCE_CUDA=1     -> permit configuring without a visible GPU
+# ----------------------------------------------------------------------
+
+_cuda_debug = os.environ.get("CUDA_DEBUG", "0") == "1"
+_autotune_pass = os.environ.get("AUTOTUNE_PASS", "0") == "1"
+
+
+# ----------------------------------------------------------------------
+# Compiler launcher detection: ccache/sccache wrap nvcc/hipcc cleanly.
+# torch's BuildExtension respects CXX/NVCC envs and PATH; we expose the
+# launcher via env vars that nvcc and hipcc honor through their wrapper
+# behavior, and additionally surface CMAKE_CUDA_COMPILER_LAUNCHER for
+# any cmake-driven sub-builds.
+# ----------------------------------------------------------------------
+
+def _detect_launcher():
+    for cand in ("ccache", "sccache"):
+        path = shutil.which(cand)
+        if path:
+            return cand, path
+    return None, None
+
+
+_launcher_name, _launcher_path = _detect_launcher()
+if _launcher_path:
+    print(f"  Compiler launcher: {_launcher_name} -> {_launcher_path}")
+    os.environ.setdefault("CMAKE_CUDA_COMPILER_LAUNCHER", _launcher_path)
+    os.environ.setdefault("CMAKE_CXX_COMPILER_LAUNCHER", _launcher_path)
+    # Torch's BuildExtension reads CUDA_NVCC_EXECUTABLE if set; pointing
+    # it at "<launcher> nvcc" is not portable across torch versions, so
+    # we instead rely on launcher-on-PATH masquerading (the standard
+    # ccache/sccache install style) and let torch invoke nvcc normally.
+else:
+    print("  Compiler launcher: none (ccache/sccache not found)")
 
 
 # ----------------------------------------------------------------------
@@ -104,15 +146,20 @@ if _has_gpu and _is_hip:
             "--offload-arch=gfx950",   # MI350X / MI355X
         ]
 
+    hip_cxx = ["-O3", "-std=c++17", "-DWITH_HIP", "-ffast-math", "-funroll-loops", "-fPIC"]
+    hip_nvcc = ["-O3", "-std=c++17", "-DWITH_HIP", "-ffast-math", "-fPIC"] + offload
+    if _cuda_debug:
+        # CUDA_DEBUG also affects HIP (hipcc) — drop fast-math, add -g -O0.
+        hip_cxx = [f for f in hip_cxx if f != "-ffast-math"] + ["-g", "-O0"]
+        hip_nvcc = [f for f in hip_nvcc if f != "-ffast-math"] + ["-g", "-O0"]
+        print("  HIP build mode: DEBUG (-g -O0, fast-math disabled)")
+
     ext = CUDAExtension(
         name="grokking_optimizers._ops",
         sources=sources,
         include_dirs=["csrc/common", "csrc/bindings", "csrc"],
         define_macros=[("WITH_HIP", None)],
-        extra_compile_args={
-            "cxx":  ["-O3", "-std=c++17", "-DWITH_HIP", "-ffast-math", "-funroll-loops"],
-            "nvcc": ["-O3", "-std=c++17", "-DWITH_HIP"] + offload,
-        },
+        extra_compile_args={"cxx": hip_cxx, "nvcc": hip_nvcc},
     )
 
 elif _has_gpu:
@@ -145,27 +192,49 @@ elif _has_gpu:
         # Supported set: sm_80, sm_89, sm_90, sm_100, sm_103, sm_120.
         # sm_86 (Ampere RTX 30) routes to the sm_80 binding at runtime via
         # grokking_optimizers/dispatch.py. Pre-Ampere (sm_70/75) is unsupported.
+        # AOT-only model: no NVRTC, no runtime compilation. Driver JIT
+        # provides forward-compat from the embedded PTX on the highest
+        # compute target (sm_120) for any future arch >= 12.0.
         gencode = [
-            "-gencode=arch=compute_80,code=sm_80",     # A100, A30, A10 (Ampere family)
-            "-gencode=arch=compute_89,code=sm_89",     # RTX 40-series, L40, L40S (Ada)
-            "-gencode=arch=compute_90,code=sm_90",     # H100, H200 (Hopper)
-            "-gencode=arch=compute_100,code=sm_100",   # B100, B200, GB200 (datacenter Blackwell)
-            "-gencode=arch=compute_103,code=sm_103",   # B300, GB300 NVL72 (Blackwell Ultra)
-            "-gencode=arch=compute_120,code=sm_120",   # RTX 50-series, RTX PRO 6000 (consumer Blackwell)
+            "-gencode=arch=compute_80,code=sm_80",         # A100, A30, A10 (Ampere family)
+            "-gencode=arch=compute_89,code=sm_89",         # RTX 40-series, L40, L40S (Ada)
+            "-gencode=arch=compute_90,code=sm_90",         # H100, H200 (Hopper)
+            "-gencode=arch=compute_100,code=sm_100",       # B100, B200, GB200 (datacenter Blackwell)
+            "-gencode=arch=compute_103,code=sm_103",       # B300, GB300 NVL72 (Blackwell Ultra)
+            "-gencode=arch=compute_120,code=sm_120",       # RTX 50-series, RTX PRO 6000 (consumer Blackwell)
+            "-gencode=arch=compute_120,code=compute_120",  # PTX for forward-compat JIT on > sm_120
         ]
+
+    cuda_cxx = ["-O3", "-std=c++17", "-DWITH_CUDA", "-ffast-math", "-funroll-loops", "-fPIC"]
+    cuda_nvcc = [
+        "-O3", "--use_fast_math", "-std=c++17", "-DWITH_CUDA",
+        "--expt-relaxed-constexpr", "-lineinfo",
+        "-Xptxas", "-O3",
+        "-Xptxas", "--warn-on-spills",
+        "-Xcompiler", "-fPIC",
+    ] + gencode
+
+    if _cuda_debug:
+        # Debug build: device debug info (-G), no opt, no fast-math.
+        cuda_cxx = [f for f in cuda_cxx if f != "-ffast-math"]
+        cuda_cxx = [f for f in cuda_cxx if f != "-O3"] + ["-O0", "-g"]
+        cuda_nvcc = [
+            "-O0", "-g", "-G", "-std=c++17", "-DWITH_CUDA",
+            "--expt-relaxed-constexpr", "-lineinfo",
+            "-Xptxas", "-O0",
+            "-Xptxas", "--warn-on-spills",
+            "-Xcompiler", "-fPIC",
+        ] + gencode
+        print("  CUDA build mode: DEBUG (-G -O0 -lineinfo, fast-math disabled)")
+    if _autotune_pass:
+        print("  CUDA build mode: AUTOTUNE_PASS=1 (first pass, stub configs)")
 
     ext = CUDAExtension(
         name="grokking_optimizers._ops",
         sources=sources,
         include_dirs=["csrc/common", "csrc/bindings", "csrc"],
         define_macros=[("WITH_CUDA", None)],
-        extra_compile_args={
-            "cxx":  ["-O3", "-std=c++17", "-DWITH_CUDA", "-ffast-math", "-funroll-loops"],
-            "nvcc": [
-                "-O3", "--use_fast_math", "-std=c++17", "-DWITH_CUDA",
-                "--expt-relaxed-constexpr", "-lineinfo",
-            ] + gencode,
-        },
+        extra_compile_args={"cxx": cuda_cxx, "nvcc": cuda_nvcc},
     )
 
 else:
@@ -228,7 +297,7 @@ setup(
     ],
     packages=find_packages(),
     ext_modules=[ext],
-    cmdclass={"build_ext": BuildExtension},
+    cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
     python_requires=">=3.10",
     install_requires=["torch>=2.0.0"],
     extras_require={
