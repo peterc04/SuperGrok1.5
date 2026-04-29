@@ -43,10 +43,18 @@ from torch.utils.cpp_extension import BuildExtension
 #   AUTOTUNE_PASS=1  -> first-pass autotune build (informational only;
 #                       autotune writes tuned_configs.h between passes)
 #   FORCE_CUDA=1     -> permit configuring without a visible GPU
+#   WITH_CUTLASS=1   -> route Hopper+/Blackwell GEMMs (SG2 projections +
+#                       Muon Newton-Schulz) through CUTLASS instead of
+#                       cuBLAS. Requires third_party/cutlass cloned via
+#                       `git submodule update --init`. Only emits CUTLASS
+#                       arch flags for sm_90/sm_100/sm_103/sm_120;
+#                       sm_80/sm_89 stay on cuBLAS, gfx942/gfx950 stay
+#                       on rocBLAS unconditionally.
 # ----------------------------------------------------------------------
 
 _cuda_debug = os.environ.get("CUDA_DEBUG", "0") == "1"
 _autotune_pass = os.environ.get("AUTOTUNE_PASS", "0") == "1"
+_with_cutlass = os.environ.get("WITH_CUTLASS", "0") == "1"
 
 
 # ----------------------------------------------------------------------
@@ -214,17 +222,60 @@ elif _has_gpu:
         "-Xcompiler", "-fPIC",
     ] + gencode
 
+    # ------------------------------------------------------------------
+    # CUTLASS opt-in. Only Hopper+ / Blackwell pass -DCUTLASS_NVCC_ARCHS
+    # (the "advanced" SM targets that emit sm_XXa instructions, e.g.
+    # 90a = Hopper TMA + WGMMA, 100a = datacenter Blackwell, 103a =
+    # Blackwell Ultra NVFP4, 120a = consumer Blackwell). sm_80/sm_89
+    # don't get the flag — they stay on cuBLAS.
+    #
+    # Arches present in TORCH_CUDA_ARCH_LIST (or the default supported
+    # set) are inspected: any of {9.0,10.0,10.3,12.0} triggers a
+    # corresponding CUTLASS_NVCC_ARCHS define. Multiple targets are
+    # encoded as a semicolon-joined list, matching CUTLASS conventions.
+    # ------------------------------------------------------------------
+    cuda_include_dirs = ["csrc/common", "csrc/bindings", "csrc"]
+    cuda_define_macros = [("WITH_CUDA", None)]
+    if _with_cutlass:
+        cutlass_archs = []
+        # Detect requested archs: same source as `gencode` selection.
+        archs_src = nvcc_archs_env if nvcc_archs_env else "8.0;8.9;9.0;10.0;10.3;12.0"
+        for a in archs_src.replace(",", ";").split(";"):
+            a = a.strip().replace(".", "")
+            if a == "90":
+                cutlass_archs.append("90a")
+            elif a == "100":
+                cutlass_archs.append("100a")
+            elif a == "103":
+                cutlass_archs.append("103a")
+            elif a == "120":
+                cutlass_archs.append("120a")
+        if cutlass_archs:
+            cuda_nvcc.append("-DWITH_CUTLASS")
+            cuda_cxx.append("-DWITH_CUTLASS")
+            cuda_nvcc.append(f"-DCUTLASS_NVCC_ARCHS={';'.join(cutlass_archs)}")
+            cuda_include_dirs += [
+                "third_party/cutlass/include",
+                "third_party/cutlass/tools/util/include",
+            ]
+            cuda_define_macros.append(("WITH_CUTLASS", None))
+            print(f"  CUTLASS enabled for archs: {cutlass_archs}")
+        else:
+            print("  WITH_CUTLASS=1 set but no Hopper+ archs in TORCH_CUDA_ARCH_LIST; ignoring")
+
     if _cuda_debug:
         # Debug build: device debug info (-G), no opt, no fast-math.
         cuda_cxx = [f for f in cuda_cxx if f != "-ffast-math"]
         cuda_cxx = [f for f in cuda_cxx if f != "-O3"] + ["-O0", "-g"]
+        # Preserve CUTLASS flags across the debug-mode rebuild.
+        _cutlass_dbg_flags = [f for f in cuda_nvcc if f.startswith("-DWITH_CUTLASS") or f.startswith("-DCUTLASS_NVCC_ARCHS")]
         cuda_nvcc = [
             "-O0", "-g", "-G", "-std=c++17", "-DWITH_CUDA",
             "--expt-relaxed-constexpr", "-lineinfo",
             "-Xptxas", "-O0",
             "-Xptxas", "--warn-on-spills",
             "-Xcompiler", "-fPIC",
-        ] + gencode
+        ] + gencode + _cutlass_dbg_flags
         print("  CUDA build mode: DEBUG (-G -O0 -lineinfo, fast-math disabled)")
     if _autotune_pass:
         print("  CUDA build mode: AUTOTUNE_PASS=1 (first pass, stub configs)")
@@ -232,8 +283,8 @@ elif _has_gpu:
     ext = CUDAExtension(
         name="grokking_optimizers._ops",
         sources=sources,
-        include_dirs=["csrc/common", "csrc/bindings", "csrc"],
-        define_macros=[("WITH_CUDA", None)],
+        include_dirs=cuda_include_dirs,
+        define_macros=cuda_define_macros,
         extra_compile_args={"cxx": cuda_cxx, "nvcc": cuda_nvcc},
     )
 
