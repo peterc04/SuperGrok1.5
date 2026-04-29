@@ -763,9 +763,114 @@ Each in its own commit with a clear "Delete X (replaced by Y)" message.
 
 ---
 
+## 10. Arch matrix expansion (planned follow-on)
+
+Triggered after the original 4-arch refactor (sm_80, sm_90, sm_100, gfx942) is fully complete and tested. Expands the supported set to eight GPU arches plus two TPU versions.
+
+### 10.1 Expanded supported set
+
+NVIDIA:
+- `sm_80` (Ampere) — A100, A30 (existing)
+- `sm_89` (Ada) — RTX 40-series, L40, L40S (NEW)
+- `sm_90` (Hopper) — H100, H200 (existing)
+- `sm_100` (Blackwell datacenter) — B100, B200, GB200 (existing)
+- `sm_103` (Blackwell Ultra) — B300, GB300 NVL72 (NEW)
+- `sm_120` (Blackwell consumer) — RTX 50-series, RTX PRO 6000 Blackwell (NEW)
+
+AMD:
+- `gfx942` (CDNA3) — MI300X, MI300A (existing)
+- `gfx950` (CDNA4) — MI350X, MI355X (NEW)
+
+TPU (JAX path, unchanged):
+- `v5p`, `v6e`
+
+Still unsupported (build fails or `dispatch.get_gpu_arch()` raises):
+- V100, T4 (sm_70/75)
+- Pre-Ada consumer (sm_86 — Ampere RTX 30-series)
+- MI100 (gfx908), MI200 (gfx90a), and explicitly NOT gfx950 prior to its first-class promotion in this expansion
+- AMD RDNA cards
+- TPU v3, v4, v5e
+
+### 10.2 Per-arch specialization notes
+
+**sm_89 (Ada Lovelace).** 4th-gen tensor cores with FP8 E4M3/E5M2. No TMA, no thread block clusters, no DSMT. Closest baseline is sm_90 minus Hopper-specific features. Strategy: port from `sm_90` and strip TMA / DSMT / warp-specialization paths. FP8 GEMMs go through cuBLASLt or the CUTLASS sm_89 path. `cp.async` carries over from sm_80, so the Ampere prefetch pattern stays. No CTA cluster intrinsics.
+
+**sm_103 (Blackwell Ultra).** `compute_100f` family, binary-compatible with sm_100 but with ~50% more NVFP4 compute and an accelerated softmax. Strategy: port the optimizer per-element kernels from `sm_100` unchanged (memory-bound, no win from extra tensor core throughput). Specialize SG2 projection GEMMs and Muon Newton-Schulz GEMMs via the CUTLASS `sm_103a` target to exploit native NVFP4. Custom NVFP4 epilogue paths feed into `tuned_configs.h` from `autotune/cutlass_profile.py`.
+
+**sm_120 (Blackwell consumer).** 128 KB shared memory per SM (vs 228 KB on sm_100). No DSMT. Different tensor core configuration than datacenter Blackwell. Strategy: port from `sm_100` with reduced shared-memory budgets in the tile-resident expert-weight kernels and the SG2 fused-elem kernel; switch to consumer tensor core paths for FP8 / FP16 GEMMs. CUTLASS `sm_120a` target for GEMMs.
+
+**gfx950 (CDNA4).** Native FP4 expert MFMA (`mfma_f32_32x32x8_fp4`), native FP6 E3M2 state, 2:4 sparsity. Earlier work in `csrc/hip/cdna4/cdna4_kernels.hip.cpp` (deleted in commit `8c2280d` but recoverable from git history) provides a starting point. Strategy: port the 17 baselines from `gfx942`, then promote the recovered FP4/FP6/2:4 paths to first-class status under `csrc/kernels/hip/gfx950/`. FP4 expert weights and FP6 optimizer state become the optimized path on this arch (cf. spec §3 quantization).
+
+### 10.3 Files to add
+
+Mirror the existing `csrc/kernels/<backend>/<arch>/` structure for each new arch. Per-arch counts match the existing sm_90 column (17 wrapped baselines per optimizer):
+
+- `csrc/kernels/cuda/sm_89/<optimizer>_sm89.cu` × 17, plus CUTLASS sm_89 SG2/Muon GEMMs
+- `csrc/kernels/cuda/sm_103/<optimizer>_sm103.cu` × 17, plus CUTLASS sm_103a NVFP4 SG2/Muon GEMMs
+- `csrc/kernels/cuda/sm_120/<optimizer>_sm120.cu` × 17, plus CUTLASS sm_120a SG2/Muon GEMMs
+- `csrc/kernels/hip/gfx950/<optimizer>_gfx950.hip.cpp` × 17, plus FP4 expert + FP6 state specializations
+
+### 10.4 Files to update
+
+- `csrc/bindings/dispatch.cpp` — add cases for 89, 103, 120, 950 in the supported-arch switch; `detect_arch_from_device()` recognizes each SM number explicitly; raise message lists the new supported set
+- `csrc/bindings/_dispatch_macro.h` — extend `SG_DISPATCH` switch to all 8 arches
+- `csrc/bindings/bindings.h` — anchor `namespace sm89`, `sm103`, `sm120`, `gfx950`
+- `csrc/bindings/<optimizer>.cpp` (every per-optimizer file) — declare per-arch launchers in the new namespaces; `SG_DISPATCH` macro picks up the new cases automatically once `_dispatch_macro.h` is updated
+- `csrc/common/tuned_configs.h` — extend `ArchId` enum with `ARCH_SM89=4, ARCH_SM103=5, ARCH_SM120=6, ARCH_GFX950=7`; bump `NUM_ARCHES` from 4 to 8; widen the per-kernel tables from `[4][buckets]` to `[8][buckets]`
+- `setup.py` — append `-gencode arch=compute_{89,103,120},code=sm_{89,103,120}` to the nvcc flags; append `--offload-arch=gfx950` to the hipcc flags
+- `autotune/grids.py` — per-kernel grids inherit the existing axes for sm_89/103/120; add NVFP4-specific entries for sm_103 (`tile_shape × split_K` for the SG2 GEMMs); add FP4/FP6 entries for gfx950 (`fp4_expert_tile`, `fp6_state_block_size`)
+- `autotune/cutlass_profile.py` — add sm_89, sm_103a, sm_120a as profiler targets; sm_103a needs the NVFP4 epilogue probe; sm_120a uses the consumer tensor core profile
+- `grokking_optimizers/dispatch.py` — `SUPPORTED_ARCHES = (80, 89, 90, 100, 103, 120, 942, 950)`; `get_gpu_arch()` recognizes sm_89/103/120 and gfx950 explicitly; `get_arch_label()` table grows to 8 entries
+- `tests/test_cross_arch_agreement.py` — `SUPPORTED` tuple grows to all 8; per-optimizer harnesses iterate them
+- `tests/test_amd_hip.py` — add a gfx950 detection test alongside gfx942; legacy reject list (gfx908/gfx90a) stays
+- `tests/test_all_arches.py` — `ARCHES` list grows from 4 to 8 rows; the FORCE_ARCH probe gates each per the `_arch_available` pattern
+- `REFRESH.md §0` — supported set, fallback chain, layout table, and migration commit series all updated
+
+### 10.5 Order of operations
+
+Each step is its own commit. Per-optimizer ports group into commit batches per arch.
+
+1. Show the updated REFACTOR_PLAN.md (this section). **Stop here for approval before proceeding.**
+2. Port each optimizer's `sm_90` kernel to `sm_89` (closest base). Strip TMA, DSMT, warp specialization. One commit per optimizer.
+3. Port each optimizer's `sm_100` kernel to `sm_103` and `sm_120`. For `sm_120`, additionally reduce shared-memory budgets to fit 128 KB SM.
+4. Port each optimizer's `gfx942` kernel to `gfx950`, then add the FP4/FP6 specializations (recovered from `csrc/hip/cdna4/cdna4_kernels.hip.cpp` git history).
+5. Extend `tests/test_cross_arch_agreement.py` to all 8 arches. Run on hardware as available.
+6. Migrate CUTLASS GEMMs (SG2 projections, Muon NS) to sm_89, sm_103a, sm_120a targets.
+7. Run autotune on each new arch on hardware; commit `tuned_configs.h` updates.
+
+### 10.6 Constraints (carried over from the original refactor)
+
+- One file per Write/Edit, ~150 lines max, commit per logical step. No codegen / no Jinja templates.
+- The original 4-arch refactor must be fully merged and tested before this expansion starts. Concretely: all bindings TODOs filled in (`csrc/bindings/supergrok2.cpp`, secondary `multi_tensor.cpp` / `moe.cpp` launchers), build verified on at least one arch, pytest passes the four-row arch matrix.
+- Affine2x2 PTX composition (`csrc/common/ptx_intrinsics.cuh`) remains untouched.
+- Blelloch parallel scan algorithm itself is untouched; tile sizes and prefetch may change.
+- Canonical reduction pattern (warp shuffle + per-warp atomicAdd) is untouched.
+- Math is identical across all 8 arches; arch-specific changes are limited to primitives (cp.async / TMA / MFMA / FP4/FP6/FP8 paths, shared memory layout, tensor core configuration).
+- Every per-arch kernel pulls `__launch_bounds__` from `csrc/common/tuned_configs.h`.
+- The cross-arch numerical agreement test (`tests/test_cross_arch_agreement.py`) is mandatory and gates every arch port.
+
+### 10.7 Final coverage target
+
+After expansion completes, the project supports:
+
+- A100, A30 (sm_80)
+- RTX 40-series, L40, L40S (sm_89)
+- H100, H200 (sm_90)
+- B100, B200, GB200 (sm_100)
+- B300, GB300 NVL72 (sm_103)
+- RTX 50-series, RTX PRO 6000 Blackwell (sm_120)
+- MI300X, MI300A (gfx942)
+- MI350X, MI355X (gfx950)
+- TPU v5p, v6e
+
+Permanently unsupported: V100, T4, RTX 20/30-series, MI100, MI200, RDNA, TPU v3/v4/v5e.
+
+---
+
 ## Stop here — review before execution
 
 Nothing destructive happens until this plan is approved. After approval:
 - Step 1 (this) is done.
-- Step 2 starts with `csrc/kernels/cuda/sm_90/grokadamw_sm90.cu`.
+- Step 2 of the original refactor begins with `csrc/kernels/cuda/sm_90/grokadamw_sm90.cu`.
+- The §10 expansion does NOT begin until the original 4-arch refactor is complete (per §10.6 gating).
 - I will pause and ask after each step for confirmation before continuing.
