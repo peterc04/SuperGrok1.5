@@ -398,4 +398,106 @@ void supergrok2_mamba_peer_batched_step(
         expert_hidden, num_experts, expert_counts);
 }
 
+// Pre-refactor csrc/common/ops.cpp::supergrok2_bilevel_fwd_save.
+// Forward scan with state-saving for the meta-net's bilevel backward.
+void supergrok2_bilevel_fwd_save(
+    torch::Tensor grad, torch::Tensor sharpness,
+    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
+    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
+    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
+    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
+    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
+    torch::Tensor mamba_fwd_out_proj,
+    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
+    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
+    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
+    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
+    torch::Tensor mamba_bwd_out_proj,
+    int d_model, int d_state, int d_inner,
+    torch::Tensor fwd_scan_out, torch::Tensor bwd_scan_out,
+    torch::Tensor fwd_final_state, torch::Tensor bwd_final_state,
+    torch::Tensor fwd_saved_states,
+    torch::Tensor fwd_saved_x_branch,
+    torch::Tensor fwd_saved_z, torch::Tensor fwd_saved_dt,
+    torch::Tensor bwd_saved_states,
+    torch::Tensor bwd_saved_x_branch,
+    torch::Tensor bwd_saved_z, torch::Tensor bwd_saved_dt,
+    torch::Tensor x_sorted, torch::Tensor sort_indices,
+    torch::Tensor fwd_initial_state,
+    torch::Tensor bwd_initial_state,
+    int checkpoint_interval
+) {
+    if (grad.numel() == 0) return;
+    SG_DISPATCH(launch_mamba3_peer_bilevel_fwd_save,
+        grad, sharpness,
+        input_proj_W, input_proj_b,
+        mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
+        mamba_fwd_B_proj, mamba_fwd_C_proj, mamba_fwd_A_log,
+        mamba_fwd_D, mamba_fwd_rope, mamba_fwd_out_proj,
+        mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
+        mamba_bwd_B_proj, mamba_bwd_C_proj, mamba_bwd_A_log,
+        mamba_bwd_D, mamba_bwd_rope, mamba_bwd_out_proj,
+        d_model, d_state, d_inner,
+        fwd_scan_out, bwd_scan_out,
+        fwd_final_state, bwd_final_state,
+        fwd_saved_states, fwd_saved_x_branch, fwd_saved_z, fwd_saved_dt,
+        bwd_saved_states, bwd_saved_x_branch, bwd_saved_z, bwd_saved_dt,
+        x_sorted, sort_indices,
+        fwd_initial_state, bwd_initial_state,
+        checkpoint_interval);
+}
+
+// Pre-refactor csrc/common/ops.cpp::supergrok2_bilevel_fwd_save_batched.
+void supergrok2_bilevel_fwd_save_batched(
+    std::vector<torch::Tensor> grads,
+    std::vector<torch::Tensor> sharpness_list,
+    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
+    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
+    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
+    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
+    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
+    torch::Tensor mamba_fwd_out_proj,
+    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
+    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
+    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
+    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
+    torch::Tensor mamba_bwd_out_proj,
+    int d_model, int d_state, int d_inner,
+    torch::Tensor fwd_scan_out_packed,
+    torch::Tensor bwd_scan_out_packed,
+    torch::Tensor fwd_saved_states_packed,
+    torch::Tensor fwd_saved_xb_packed,
+    torch::Tensor fwd_saved_z_packed,
+    torch::Tensor fwd_saved_dt_packed,
+    torch::Tensor bwd_saved_states_packed,
+    torch::Tensor bwd_saved_xb_packed,
+    torch::Tensor bwd_saved_z_packed,
+    torch::Tensor bwd_saved_dt_packed,
+    torch::Tensor x_sorted_packed, torch::Tensor offsets_t,
+    torch::Tensor sort_indices_packed,
+    torch::Tensor fwd_initial_states,
+    torch::Tensor bwd_initial_states,
+    int checkpoint_interval
+) {
+    if (grads.empty()) return;
+    SG_DISPATCH(launch_mamba3_peer_bilevel_fwd_save_batched,
+        grads, sharpness_list,
+        input_proj_W, input_proj_b,
+        mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
+        mamba_fwd_B_proj, mamba_fwd_C_proj, mamba_fwd_A_log,
+        mamba_fwd_D, mamba_fwd_rope, mamba_fwd_out_proj,
+        mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
+        mamba_bwd_B_proj, mamba_bwd_C_proj, mamba_bwd_A_log,
+        mamba_bwd_D, mamba_bwd_rope, mamba_bwd_out_proj,
+        d_model, d_state, d_inner,
+        fwd_scan_out_packed, bwd_scan_out_packed,
+        fwd_saved_states_packed, fwd_saved_xb_packed,
+        fwd_saved_z_packed, fwd_saved_dt_packed,
+        bwd_saved_states_packed, bwd_saved_xb_packed,
+        bwd_saved_z_packed, bwd_saved_dt_packed,
+        x_sorted_packed, offsets_t, sort_indices_packed,
+        fwd_initial_states, bwd_initial_states,
+        checkpoint_interval);
+}
+
 } // namespace sg
