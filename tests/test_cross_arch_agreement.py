@@ -58,19 +58,18 @@ def _arch_available(arch: int) -> bool:
 
 @unittest.skipUnless(HAS_GPU, "Cross-arch test requires a GPU.")
 class CrossArchAgreementTest(unittest.TestCase):
-    """Per-optimizer agreement across the four supported arches.
+    """Per-optimizer agreement across the eight supported arches.
 
-    TODO(structural-refactor): the per-optimizer test bodies below are
-    stubs that document the test pattern. They need a hardware-equipped
-    session to actually run (the arches not present on the host are
-    skipped). Each test_<optimizer>_cross_arch:
-
+    Each test_<optimizer>_cross_arch:
       1. Builds a small parameter tensor and gradient.
-      2. For each available arch, runs N optimizer steps under
-         FORCE_ARCH=<arch>.
-      3. Asserts torch.allclose(arch_a_param, arch_b_param) for every
-         (arch_a, arch_b) pair, with a tolerance that accounts for FP
-         rounding in fast-math intrinsics.
+      2. For each compiled-in arch, runs N optimizer steps under
+         FORCE_ARCH=<arch> and captures the resulting parameter tensor.
+      3. Asserts torch.allclose against the reference (first arch
+         present), with a tolerance that allows for FP rounding in
+         fast-math intrinsics.
+    Arches not compiled into the local extension are skipped. If fewer
+    than two arches are available the whole test skips (nothing to
+    compare).
     """
 
     TOLERANCE = 1e-4  # max abs diff per element
@@ -137,16 +136,41 @@ class CrossArchAgreementTest(unittest.TestCase):
         self._check_agreement(lambda ps: LookSAM(ps, lr=1e-3))
 
     def test_muon_cross_arch(self):
+        """Muon requires 2D params (Newton-Schulz orthogonalization).
+        Rebuild a 64x64 matrix per arch and compare element-wise.
+        """
         from grokking_optimizers import Muon
-        # Muon needs 2D params; rebuild with a matrix instead of vector.
-        def factory(_):
+
+        def run_arch(arch, steps=10):
+            if not _arch_available(arch):
+                return None
+            _set_force_arch(arch)
             torch.manual_seed(0)
             P = torch.randn(64, 64, device="cuda", requires_grad=True)
-            return [P], Muon([P], lr=0.02)
-        # Specialized harness: this case differs in parameter shape, so
-        # exercise it with a custom helper rather than _check_agreement.
-        # TODO(structural-refactor): implement Muon harness.
-        self.skipTest("Muon cross-arch harness pending (uses 2D params).")
+            opt = Muon([P], lr=0.02)
+            for _ in range(steps):
+                opt.zero_grad()
+                (P ** 2).sum().backward()
+                opt.step()
+            return P.detach().cpu().clone()
+
+        results = {}
+        for arch in SUPPORTED:
+            r = run_arch(arch)
+            if r is not None:
+                results[arch] = r
+        if len(results) < 2:
+            self.skipTest(
+                f"Muon: need >=2 arches with bindings; got {list(results)}")
+        ref_arch, ref = next(iter(results.items()))
+        for arch, p in results.items():
+            if arch == ref_arch:
+                continue
+            max_diff = (p - ref).abs().max().item()
+            self.assertLess(
+                max_diff, self.TOLERANCE,
+                f"Muon: sm_{arch} disagrees with sm_{ref_arch} "
+                f"by {max_diff:.6f}")
 
     def test_supergrok15_cross_arch(self):
         from grokking_optimizers import SuperGrok15
