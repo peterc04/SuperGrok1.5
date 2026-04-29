@@ -10,8 +10,6 @@
  * Replaces N per-parameter Python iterations + 4N kernel launches with 1 launch.
  */
 
-#include "ops.h"
-#include "dispatch.h"
 #include <cmath>
 
 // =====================================================================

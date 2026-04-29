@@ -28,7 +28,6 @@
 
 #include "platform.h"
 #include "types.h"
-#include "dispatch.h"
 #include "ptx_intrinsics.cuh"
 
 // =====================================================================

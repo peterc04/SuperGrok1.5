@@ -20,7 +20,6 @@
 
 #include "platform.h"
 #include "types.h"
-#include "dispatch.h"
 
 #ifdef GROK_USE_NCCL
 #include <nccl.h>

@@ -32,7 +32,6 @@
 #include "platform.h"
 #include "types.h"
 #include "ptx_intrinsics.cuh"
-#include "ops.h"
 
 // =====================================================================
 //  BASELINE COPY -- gfx942 variant of supergrok2_mamba_peer_kernels.cu
