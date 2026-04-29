@@ -446,6 +446,6 @@ void launch_scan_warp_specialized_d16(
     );
 }
 
-#endif  // GROK_CUDA
-
 } } // namespace sg::sm90
+
+#endif  // GROK_CUDA
