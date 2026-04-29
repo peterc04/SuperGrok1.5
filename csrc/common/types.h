@@ -9,6 +9,36 @@
 
 #include "platform.h"
 
+#include <vector>
+#include <torch/extension.h>
+
+// ═══════════════════════════════════════════════════════════════════════
+//  BatchedScanCtx — shared bookkeeping for the batched mamba peer step
+//
+//  Recovered from the deleted csrc/common/ops.h@682eab4^. The setup
+//  helper batched_step_setup_and_sort builds one of these per call;
+//  the scan + fused-elem helpers consume it. Per-arch variants in
+//  csrc/kernels/{cuda,hip}/<arch>/supergrok2_fwd_*.{cu,hip.cpp}
+//  expect this exact layout.
+// ═══════════════════════════════════════════════════════════════════════
+
+struct BatchedScanCtx {
+    int num_params;
+    int total_N;
+    int max_N;
+    std::vector<int> N_vec;
+    std::vector<int> seg_offsets_cpu;
+    torch::Tensor x_sorted_packed;
+    torch::Tensor offsets_t;
+    torch::Tensor initial_fwd;
+    torch::Tensor initial_bwd;
+    torch::Tensor final_fwd;
+    torch::Tensor final_bwd;
+    torch::Tensor fwd_scan_packed;
+    torch::Tensor bwd_scan_packed;
+    std::vector<torch::Tensor> unsort_idx_list;
+};
+
 // ═══════════════════════════════════════════════════════════════════════
 //  Compile-time constants
 // ═══════════════════════════════════════════════════════════════════════
