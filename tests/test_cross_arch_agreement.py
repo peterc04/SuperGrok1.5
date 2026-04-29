@@ -28,7 +28,7 @@ import torch
 # Skip the entire module gracefully if torch isn't built or if no GPU is
 # available. The test is hardware-gated; CI runs it per-arch.
 HAS_GPU = torch.cuda.is_available()
-SUPPORTED = (80, 90, 100, 942)
+SUPPORTED = (80, 89, 90, 100, 103, 120, 942, 950)
 
 
 def _set_force_arch(arch: int):

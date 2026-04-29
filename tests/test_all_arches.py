@@ -18,10 +18,14 @@ import sys
 # Supported set per the all-specialized refactor. See dispatch.py /
 # csrc/kernels/README.md / REFACTOR_PLAN.md.
 ARCHES = [
-    ('Ampere family (sm_80 binding)', '80'),
-    ('Hopper (sm_90)',                '90'),
-    ('Blackwell (sm_100)',            '100'),
-    ('AMD MI300X (gfx942)',           '942'),
+    ('Ampere family (sm_80 binding)',           '80'),
+    ('Ada / RTX 40, L40 (sm_89)',               '89'),
+    ('Hopper (sm_90)',                          '90'),
+    ('Datacenter Blackwell (sm_100)',           '100'),
+    ('Blackwell Ultra / B300 (sm_103)',         '103'),
+    ('Consumer Blackwell / RTX 50 (sm_120)',    '120'),
+    ('AMD MI300X (gfx942)',                     '942'),
+    ('AMD MI350X / MI355X (gfx950)',            '950'),
 ]
 
 
