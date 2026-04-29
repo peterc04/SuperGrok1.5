@@ -15,7 +15,9 @@ import torch
 from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
-from grokking_optimizers import _ops
+from grokking_optimizers._ops_loader import get_ops
+
+_ops = get_ops()  # Fails loudly if C++ extension not built
 
 
 class Lion(Optimizer):
@@ -99,3 +101,15 @@ class Lion(Optimizer):
             )
 
         return loss
+
+    def _single_param_step(self, param, group, state):
+        """Per-parameter step for GradientHookOptimizer integration."""
+        if param.grad is None:
+            return
+        if len(state) == 0:
+            state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
+        _ops.lion_fused_step(
+            [param], [param.grad], [state["exp_avg"]],
+            group["lr"], group["betas"][0], group["betas"][1],
+            group["weight_decay"],
+        )

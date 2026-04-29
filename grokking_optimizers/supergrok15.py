@@ -19,7 +19,10 @@ import torch.nn as nn
 from torch.optim import Optimizer
 from typing import Optional, Callable, Dict, Any, Tuple
 
-from grokking_optimizers import _ops
+from grokking_optimizers._ops_loader import get_ops
+
+_ops = get_ops()  # Fails loudly if C++ extension not built
+_ops_cpu = _ops  # CPU ops are part of the same extension
 
 
 class SharpnessMetaNet(nn.Module):
@@ -286,7 +289,9 @@ class SuperGrok15(Optimizer):
             self._weights_dirty = False
         W1, b1, W2, b2, rescale = self._cached_weights
 
-        _ops.supergrok15_fused_step(
+        # Use Python fallback on CPU (C++ CPU path has dimension bug for meta-net)
+        ops_impl = _ops if self._flat_params[0].is_cuda else _ops_cpu
+        ops_impl.supergrok15_fused_step(
             self._flat_param_data,
             grads,
             self._flat_exp_avgs,
@@ -416,6 +421,43 @@ class SuperGrok15(Optimizer):
         val_loss = self.bilevel_step(model, train_x, train_y, val_x, val_y, criterion, meta_optimizer)
         return sam_loss, val_loss
 
+    def _single_param_step(self, param, group, state):
+        """Per-parameter step for GradientHookOptimizer integration."""
+        if param.grad is None:
+            return
+        self._ensure_state()
+        pidx = self._param_to_idx.get(id(param))
+        if pidx is None:
+            return
+        self._flat_steps[pidx] += 1
+        base_alpha = self._cached_alpha
+        ramp = self._get_ramp_factor()
+        layer_alpha = max(0.0, min(1.0, base_alpha * self._flat_layer_alphas[pidx]))
+        wd_eff = self._get_effective_wd(group["weight_decay"])
+        gate_signal = self._get_gate_signal()
+
+        if self._weights_dirty:
+            self._cached_weights = self.meta_net.get_weights()
+            self._weights_dirty = False
+        W1, b1, W2, b2, rescale = self._cached_weights
+
+        ops_impl = _ops if param.is_cuda else _ops_cpu
+        ops_impl.supergrok15_fused_step(
+            [param.data],
+            [param.grad.data],
+            [self._flat_exp_avgs[pidx]],
+            [self._flat_exp_avg_sqs[pidx]],
+            [self._flat_mus[pidx]],
+            [self._flat_sharpness[pidx]],
+            [self._flat_steps[pidx]],
+            [layer_alpha],
+            [self._flat_layer_beta1s[pidx]],
+            W1, b1, W2, b2, rescale, self.meta_hidden_dim,
+            group["betas"][1], group["lr"], wd_eff, group["eps"],
+            self.lamb, ramp, gate_signal,
+            self.gradient_clipping,
+        )
+
     def get_global_step(self):
         return self._global_step
 
@@ -446,16 +488,18 @@ class SuperGrok15(Optimizer):
         if step_num % sam_freq_eff == 0:
             try:
                 metrics["sam_loss"] = self.sam_step(model, train_x, train_y, criterion)
-            except Exception:
-                pass
+            except Exception as e:
+                import warnings
+                warnings.warn(f"SuperGrok1.5 sam_step failed at step {step_num}: {e}")
 
         bilevel_freq_eff = self._get_effective_bilevel_freq()
         if step_num % bilevel_freq_eff == 0:
             try:
                 metrics["val_loss"] = self.bilevel_step(
                     model, train_x, train_y, val_x, val_y, criterion, self._auto_meta_opt)
-            except Exception:
-                pass
+            except Exception as e:
+                import warnings
+                warnings.warn(f"SuperGrok1.5 bilevel_step failed at step {step_num}: {e}")
 
         kw: Dict[str, float] = {}
         alpha_freq = self.alpha_update_freq

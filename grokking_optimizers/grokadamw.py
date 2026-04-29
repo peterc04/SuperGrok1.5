@@ -14,7 +14,9 @@ import torch
 from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
-from grokking_optimizers import _ops
+from grokking_optimizers._ops_loader import get_ops
+
+_ops = get_ops()  # Fails loudly if C++ extension not built
 
 
 class GrokAdamW(Optimizer):
@@ -31,10 +33,8 @@ class GrokAdamW(Optimizer):
         alpha: EMA decay factor for gradient filter (default: 0.98).
         lamb: Amplification factor applied to the filtered gradient
             signal (default: 5.0).
-        gamma: Signal decay factor. Unused in the fused kernel but kept
-            for API compatibility with the reference implementation
-            (default: 0.1).
-        decay: Secondary decay parameter (default: 0.1).
+        gamma: Deprecated — unused. Kept for API backward compatibility.
+        decay: Deprecated — unused. Kept for API backward compatibility.
         grad_clip: Maximum gradient norm for per-parameter clipping
             (default: 1.0).
     """
@@ -142,3 +142,22 @@ class GrokAdamW(Optimizer):
             )
 
         return loss
+
+    def _single_param_step(self, param, group, state):
+        """Per-parameter step for GradientHookOptimizer integration."""
+        if param.grad is None:
+            return
+        if len(state) == 0:
+            state["step"] = 0
+            state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
+            state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
+            state["ema"] = torch.zeros_like(param, dtype=torch.float32)
+        state["step"] += 1
+        _ops.grokadamw_fused_step(
+            [param], [param.grad], [state["exp_avg"]], [state["exp_avg_sq"]],
+            [state["ema"]], [state["step"]],
+            group["alpha"], group["lamb"],
+            group["betas"][0], group["betas"][1], group["lr"],
+            group["weight_decay"], group["eps"],
+            group["grad_clip"],
+        )

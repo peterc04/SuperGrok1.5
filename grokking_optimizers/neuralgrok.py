@@ -16,7 +16,9 @@ import torch.nn as nn
 from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
-from grokking_optimizers import _ops
+from grokking_optimizers._ops_loader import get_ops
+
+_ops = get_ops()  # Fails loudly if C++ extension not built
 
 
 class _Amplifier(nn.Module):
@@ -230,6 +232,31 @@ class NeuralGrok(Optimizer):
     def get_amplifier(self) -> _Amplifier:
         """Return the gradient amplifier module."""
         return self.amplifier
+
+    def _single_param_step(self, param, group, state):
+        """Per-parameter step for GradientHookOptimizer integration."""
+        if param.grad is None:
+            return
+        if len(state) == 0:
+            state["step"] = 0
+            state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
+            state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
+        state["step"] += 1
+        if self._meta_weights_dirty or self._cached_meta_weights is None:
+            self._cached_meta_weights = self.amplifier.get_weights()
+            self._meta_weights_dirty = False
+        W1, b1, W_last, b_last = self._cached_meta_weights
+        device = param.device
+        _ops.neuralgrok_fused_step(
+            [param], [param.grad], [state["exp_avg"]], [state["exp_avg_sq"]],
+            [state["step"]],
+            W1.to(device), b1.to(device), W_last.to(device), b_last.to(device),
+            group["alpha"], group["beta"],
+            self.amplifier.hidden_dim,
+            group["betas"][0], group["betas"][1],
+            group["lr"], group["weight_decay"], group["eps"],
+            group["grad_clip"],
+        )
 
     def get_amplifier_optimizer(self, lr: float = 1e-4) -> torch.optim.Adam:
         """Create an Adam optimiser for the amplifier's parameters.

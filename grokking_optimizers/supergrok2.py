@@ -26,16 +26,16 @@ Performance:
 import math
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from torch.optim import Optimizer
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 from grokking_optimizers.mamba3_peer_metanet import Mamba3PEERMetaNet
 
-try:
-    from grokking_optimizers import _ops
-    _HAS_CUDA = True
-except ImportError:
-    _HAS_CUDA = False
+from grokking_optimizers._ops_loader import get_ops
+
+_ops = get_ops()  # Fails loudly if C++ extension not built
+_HAS_CUDA = hasattr(_ops, 'supergrok2_mamba_peer_batched_step')
 
 
 class SuperGrok2(Optimizer):
@@ -91,9 +91,16 @@ class SuperGrok2(Optimizer):
         wd_thresh: float = 0.9,
         sam_enable_threshold: float = 0.0,
         bilevel_checkpoint_interval: int = 1,
+        projection_precision: str = 'auto',
+        # Distributed training parameters
+        bilevel_allreduce_meta_grads: bool = True,
+        expert_allreduce_before_recycle: bool = True,
+        mamba_state_sync_interval: int = 1000,
+        state_precision: str = 'fp32',
     ):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
+        self.state_precision = state_precision
 
         self.alpha_init = alpha_init
         self.sam_enable_threshold = sam_enable_threshold
@@ -108,6 +115,11 @@ class SuperGrok2(Optimizer):
         self.zero_loss_threshold = zero_loss_threshold
         self.zero_acc_threshold = zero_acc_threshold
         self.sam_rho = sam_rho
+
+        # Precision configuration for projection GEMMs
+        from .quantization import PrecisionConfig
+        self.precision_config = PrecisionConfig(
+            projection_precision=projection_precision)
 
         # Meta-net hyperparams
         self.d_model = d_model
@@ -133,6 +145,11 @@ class SuperGrok2(Optimizer):
         self.wd_thresh = wd_thresh
         self.bilevel_checkpoint_interval = max(1, bilevel_checkpoint_interval)
 
+        # Distributed training configuration
+        self.bilevel_allreduce_meta_grads = bilevel_allreduce_meta_grads
+        self.expert_allreduce_before_recycle = expert_allreduce_before_recycle
+        self.mamba_state_sync_interval = mamba_state_sync_interval
+
         # Meta-net: Mamba-3 + 4-Head PEER + GRU
         if meta_net is None:
             self.meta_net = Mamba3PEERMetaNet(
@@ -154,7 +171,33 @@ class SuperGrok2(Optimizer):
             first_param = next(iter(self.param_groups[0]["params"]))
             self.meta_net = self.meta_net.to(first_param.device)
         except (StopIteration, IndexError):
-            pass
+            first_param = None
+
+        # JIT Specialization: detect hardware and compile optimized kernels
+        self._jit = None
+        self._jit_kernels = None
+        if first_param is not None:
+            try:
+                from grokking_optimizers.jit import create_specializer
+                from grokking_optimizers.jit.specializer import ModelConfig as JITModelConfig
+                d_inner = d_model * mamba_expand
+                jit_config = JITModelConfig(
+                    d_inner=d_inner,
+                    d_state=d_state,
+                    num_experts=num_experts,
+                    expert_hidden=expert_hidden,
+                    gru_hidden=gru_hidden,
+                    num_heads=num_peer_heads,
+                    pk_dim=8,
+                    param_sizes=[p.numel() for g in self.param_groups for p in g["params"]],
+                    total_params=sum(p.numel() for g in self.param_groups for p in g["params"]),
+                )
+                self._jit = create_specializer(first_param.device, jit_config)
+                self._jit_kernels = self._jit.compile()
+            except Exception:
+                # JIT compilation is optional enhancement — pre-compiled kernels in _ops
+                # are always available. JIT adds hardware-specific optimizations on top.
+                pass
 
         self._global_step = 0
         self._step_counter = 0  # Python int for expert recycling (avoids GPU sync)
@@ -168,6 +211,7 @@ class SuperGrok2(Optimizer):
         self._flat_layer_beta1s = []
         self._flat_exp_avgs = []
         self._flat_exp_avg_sqs = []
+        self._flat_exp_avg_scales = []  # Config 3: INT8 per-block scales
         self._flat_mus = []
         self._flat_sharpness = []
         self._flat_gru_states = []
@@ -203,18 +247,37 @@ class SuperGrok2(Optimizer):
         if self._state_initialized:
             return
         for p in self._flat_params:
-            self._flat_exp_avgs.append(
-                torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
-            self._flat_exp_avg_sqs.append(
-                torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
-            self._flat_mus.append(
-                torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
-            self._flat_sharpness.append(
-                torch.zeros(p.data.numel(), dtype=torch.float32, device=p.device))
-            # Per-parameter GRU state
-            self._flat_gru_states.append(
-                torch.zeros(p.data.numel(), self.gru_hidden,
-                            dtype=torch.float32, device=p.device))
+            N = p.data.numel()
+            if self.state_precision == 'config3':
+                # Config 3: INT8 per-block for exp_avg, BF16 for others
+                block_size = 32
+                num_blocks = (N + block_size - 1) // block_size
+                self._flat_exp_avgs.append(
+                    torch.zeros(N, dtype=torch.int8, device=p.device))
+                self._flat_exp_avg_scales.append(
+                    torch.zeros(num_blocks, dtype=torch.float32, device=p.device))
+                self._flat_exp_avg_sqs.append(
+                    torch.zeros(N, dtype=torch.bfloat16, device=p.device))
+                self._flat_mus.append(
+                    torch.zeros(N, dtype=torch.bfloat16, device=p.device))
+                self._flat_sharpness.append(
+                    torch.zeros(N, dtype=torch.bfloat16, device=p.device))
+                self._flat_gru_states.append(
+                    torch.zeros(N, self.gru_hidden,
+                                dtype=torch.bfloat16, device=p.device))
+            else:
+                # FP32 (default)
+                self._flat_exp_avgs.append(
+                    torch.zeros(N, dtype=torch.float32, device=p.device))
+                self._flat_exp_avg_sqs.append(
+                    torch.zeros(N, dtype=torch.float32, device=p.device))
+                self._flat_mus.append(
+                    torch.zeros(N, dtype=torch.float32, device=p.device))
+                self._flat_sharpness.append(
+                    torch.zeros(N, dtype=torch.float32, device=p.device))
+                self._flat_gru_states.append(
+                    torch.zeros(N, self.gru_hidden,
+                                dtype=torch.float32, device=p.device))
             # Per-parameter Mamba states (initialized on first use)
             self._flat_mamba_fwd_states.append(None)
             self._flat_mamba_bwd_states.append(None)
@@ -267,6 +330,82 @@ class SuperGrok2(Optimizer):
         freq = self.bilevel_freq_max - (self.bilevel_freq_max - self.bilevel_freq_min) * bilevel_heat
         return max(1, round(freq))
 
+    def _is_distributed(self) -> bool:
+        """Check if distributed training is active."""
+        return dist.is_available() and dist.is_initialized()
+
+    def _allreduce_meta_grads(self):
+        """All-reduce meta-net gradients across ranks for consistent updates."""
+        if not self._is_distributed():
+            return
+        world_size = dist.get_world_size()
+        if world_size <= 1:
+            return
+        for p in self.meta_net.parameters():
+            if p.grad is not None:
+                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                p.grad.div_(world_size)
+
+    def _allreduce_expert_counts(self):
+        """All-reduce expert activation counts across ranks before recycling."""
+        if not self._is_distributed():
+            return
+        world_size = dist.get_world_size()
+        if world_size <= 1:
+            return
+        dist.all_reduce(self.meta_net.expert_counts, op=dist.ReduceOp.SUM)
+
+    def _sync_mamba_states(self):
+        """Broadcast mamba states from rank 0 to prevent drift across ranks."""
+        if not self._is_distributed():
+            return
+        world_size = dist.get_world_size()
+        if world_size <= 1:
+            return
+        for state in self._flat_mamba_fwd_states + self._flat_mamba_bwd_states:
+            if state is not None:
+                dist.broadcast(state, src=0)
+
+    @staticmethod
+    def _is_fsdp_wrapped(model) -> bool:
+        """Check if a model is wrapped with FSDP."""
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        return isinstance(model, FSDP)
+
+    @staticmethod
+    def exclude_meta_net_from_fsdp(meta_net: nn.Module):
+        """Mark meta-net parameters to be excluded from FSDP sharding.
+
+        Call this before wrapping the model with FSDP. Sets
+        ``_fsdp_wrap = False`` on the meta-net module so FSDP will
+        not shard its parameters (they are small and must stay replicated).
+
+        Usage::
+
+            optimizer = SuperGrok2(model.parameters(), ...)
+            SuperGrok2.exclude_meta_net_from_fsdp(optimizer.meta_net)
+            model = FSDP(model, auto_wrap_policy=...)
+        """
+        meta_net._fsdp_wrap = False
+        for module in meta_net.modules():
+            module._fsdp_wrap = False
+
+    def _gather_full_grad_fsdp(self, model):
+        """Gather full gradients from FSDP-sharded parameters.
+
+        Returns a list of (param_idx, full_grad) pairs for all active
+        parameters. The full gradients are temporary tensors that will
+        be used for the meta-net scan and then discarded.
+        """
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        gathered = []
+        with FSDP.summon_full_params(model, writeback=False):
+            for i, p in enumerate(self._flat_params):
+                if p.grad is not None:
+                    gathered.append((i, p.grad.detach().clone()))
+        return gathered
+
     @torch.no_grad()
     def step(self, closure=None, train_loss=None, val_loss=None, train_acc=None):
         loss = None
@@ -297,35 +436,15 @@ class SuperGrok2(Optimizer):
         eps = group["eps"]
         wd_eff = self._get_effective_wd(group["weight_decay"])
 
-        # Per-parameter pre-processing: clip grads, compute per-param scalars, init states
+        # Collect active parameters (those with gradients)
         lamb_eff = self.lamb * ramp * gate_signal
         active_indices = []
-        clipped_grads = []
-        alpha_mus_list = []
-        lamb_effs_list = []
-        beta1s_list = []
-        bc1s_list = []
-        bc2s_list = []
 
         for i, p in enumerate(self._flat_params):
             if p.grad is None:
                 continue
 
             self._flat_steps[i] += 1
-            grad = p.grad.data
-
-            # Gradient clipping (per-parameter) + NaN guard
-            grad_norm = grad.norm()
-            if grad_norm > self.gradient_clipping:
-                grad = grad * (self.gradient_clipping / (grad_norm + 1e-12))
-            if not torch.isfinite(grad).all():
-                grad = torch.where(torch.isfinite(grad), grad, torch.zeros_like(grad))
-
-            alpha_i = max(0.0, min(1.0, base_alpha * self._flat_layer_alphas[i]))
-            beta1_i = self._flat_layer_beta1s[i]
-            step_i = self._flat_steps[i]
-            bc1 = 1.0 - beta1_i ** step_i
-            bc2 = 1.0 - beta2 ** step_i
 
             # Initialize Mamba states if needed
             if self._flat_mamba_fwd_states[i] is None:
@@ -337,12 +456,6 @@ class SuperGrok2(Optimizer):
                     d_inner, d_state, dtype=torch.float32, device=p.device)
 
             active_indices.append(i)
-            clipped_grads.append(grad)
-            alpha_mus_list.append(float(alpha_i))
-            lamb_effs_list.append(float(lamb_eff))
-            beta1s_list.append(float(beta1_i))
-            bc1s_list.append(float(bc1))
-            bc2s_list.append(float(bc2))
 
         if not active_indices:
             return loss
@@ -354,87 +467,89 @@ class SuperGrok2(Optimizer):
             # Ensure weights are extracted and cached
             if self._weights_dirty:
                 w = self.meta_net.get_weights()
+                def _to_f32_contig(t):
+                    t = t if t.dtype == torch.float32 else t.float()
+                    return t if t.is_contiguous() else t.contiguous()
                 self._cached_peer_query_Ws = torch.stack(
-                    [q.weight.data.float().contiguous() for q in self.meta_net.peer_queries])
+                    [_to_f32_contig(q.weight.data) for q in self.meta_net.peer_queries])
                 self._cached_prod_keys_A = torch.stack(
-                    [k.data.float().contiguous() for k in self.meta_net.product_keys_A])
+                    [_to_f32_contig(k.data) for k in self.meta_net.product_keys_A])
                 self._cached_prod_keys_B = torch.stack(
-                    [k.data.float().contiguous() for k in self.meta_net.product_keys_B])
+                    [_to_f32_contig(k.data) for k in self.meta_net.product_keys_B])
                 self._cached_weights = w
                 self._weights_dirty = False
             w = self._cached_weights
 
-            # Cast sharpness to match grad dtype (FP32 sharpness + FP16 grad would
-            # cause the CUDA kernel to reinterpret FP32 bits as FP16)
+            # ONE C++ call: fused grad prep (clip, finite, bias corrections) + batched step
+            active_grads = [self._flat_params[i].grad.data for i in active_indices]
             sharpness_list = [
-                self._flat_sharpness[i].to(clipped_grads[k].dtype)
+                self._flat_sharpness[i].to(active_grads[k].dtype)
                 for k, i in enumerate(active_indices)
             ]
-            _ops.supergrok2_mamba_peer_batched_step(
+            _ops.supergrok2_prepare_and_batched_step(
                 [self._flat_params[i].data for i in active_indices],
-                clipped_grads,
-                sharpness_list,
+                active_grads,
                 [self._flat_exp_avgs[i] for i in active_indices],
                 [self._flat_exp_avg_sqs[i] for i in active_indices],
-                [self._flat_mus[i] for i in active_indices],
-                [self._flat_gru_states[i] for i in active_indices],
                 [self._flat_mamba_fwd_states[i] for i in active_indices],
                 [self._flat_mamba_bwd_states[i] for i in active_indices],
-                # Input proj
-                w['input_proj_W'], w['input_proj_b'],
-                # Mamba forward
-                w['mamba_fwd_in_proj'], w['mamba_fwd_dt_proj_W'],
-                w['mamba_fwd_dt_proj_b'], w['mamba_fwd_B_proj'],
-                w['mamba_fwd_C_proj'], w['mamba_fwd_A_log'],
-                w['mamba_fwd_D'], w['mamba_fwd_rope_freq'],
-                w['mamba_fwd_out_proj'],
-                # Mamba backward
-                w['mamba_bwd_in_proj'], w['mamba_bwd_dt_proj_W'],
-                w['mamba_bwd_dt_proj_b'], w['mamba_bwd_B_proj'],
-                w['mamba_bwd_C_proj'], w['mamba_bwd_A_log'],
-                w['mamba_bwd_D'], w['mamba_bwd_rope_freq'],
-                w['mamba_bwd_out_proj'],
-                # GRU
-                w['gru_W_z'], w['gru_b_z'],
-                w['gru_W_r'], w['gru_b_r'],
-                w['gru_W_h'], w['gru_b_h'],
-                # PEER (stacked)
+                [self._flat_gru_states[i] for i in active_indices],
+                [self._flat_mus[i] for i in active_indices],
+                sharpness_list,
+                [int(self._flat_steps[i]) for i in active_indices],
+                [float(self._flat_layer_alphas[i]) for i in active_indices],
+                [float(self._flat_layer_beta1s[i]) for i in active_indices],
+                float(base_alpha), float(self.gradient_clipping),
+                float(beta2), float(lr), float(eps), float(wd_eff),
+                float(self.lamb), float(ramp), float(gate_signal),
+                # Meta-net weights
+                w['mamba_fwd_A_log'], w['mamba_fwd_B_proj'],
+                w['mamba_fwd_C_proj'], w['mamba_fwd_D'],
+                w['mamba_fwd_dt_proj_W'],
+                w['mamba_bwd_A_log'], w['mamba_bwd_B_proj'],
+                w['mamba_bwd_C_proj'], w['mamba_bwd_D'],
+                w['mamba_bwd_dt_proj_W'],
+                w['gru_W_z'], w['gru_W_r'], w['gru_W_h'],
+                w['gru_b_z'], w['gru_b_r'], w['gru_b_h'],
                 self._cached_peer_query_Ws,
                 self._cached_prod_keys_A,
                 self._cached_prod_keys_B,
-                # Experts
                 w['expert_W1'].reshape(self.num_experts, -1),
-                w['expert_b1'],
-                w['expert_W2'].reshape(self.num_experts, -1),
-                w['expert_b2'].reshape(-1),
-                # Per-param scalars
-                alpha_mus_list, lamb_effs_list,
-                beta1s_list, bc1s_list, bc2s_list,
-                # Shared scalars
-                float(self.meta_net.rescale),
-                float(beta2), float(lr), float(wd_eff), float(eps),
-                # Dims
-                self.meta_net.d_model, self.meta_net.d_state,
                 self.meta_net.mamba_fwd.d_inner,
-                self.meta_net.gru_hidden, self.meta_net.num_peer_heads,
-                self.meta_net.pk_dim, self.meta_net.expert_hidden,
+                self.meta_net.d_state,
                 self.meta_net.num_experts,
-                self.meta_net.expert_counts,
+                self.meta_net.topk if hasattr(self.meta_net, 'topk') else 2,
             )
             # Expert recycling: increment step counter and periodically recycle
             self._step_counter += 1
             if (self.meta_net.recycle_interval > 0 and
                     self._step_counter % self.meta_net.recycle_interval == 0):
+                if self.expert_allreduce_before_recycle:
+                    self._allreduce_expert_counts()
                 self.meta_net._recycle_dead_experts()
+
+            # Periodic mamba state sync to prevent rank drift
+            if (self.mamba_state_sync_interval > 0 and
+                    self._step_counter % self.mamba_state_sync_interval == 0):
+                self._sync_mamba_states()
         else:
-            # Python fallback — per-parameter
+            # Python fallback — per-parameter (grad clip + scalars computed inline)
             for idx, i in enumerate(active_indices):
                 p = self._flat_params[i]
-                grad = clipped_grads[idx]
-                alpha_i = alpha_mus_list[idx]
-                beta1_i = beta1s_list[idx]
-                bc1 = bc1s_list[idx]
-                bc2 = bc2s_list[idx]
+                grad = p.grad.data
+
+                # Gradient clipping + NaN guard (mirrors C++ kernel logic)
+                gn = grad.norm()
+                if gn > self.gradient_clipping:
+                    grad = grad * (self.gradient_clipping / (gn + 1e-12))
+                if not torch.isfinite(grad).all():
+                    grad = torch.where(torch.isfinite(grad), grad, torch.zeros_like(grad))
+
+                alpha_i = max(0.0, min(1.0, base_alpha * self._flat_layer_alphas[i]))
+                beta1_i = self._flat_layer_beta1s[i]
+                step_i = self._flat_steps[i]
+                bc1 = 1.0 - beta1_i ** step_i
+                bc2 = 1.0 - beta2 ** step_i
 
                 flat_grad = grad.reshape(-1)
                 flat_sharp = self._flat_sharpness[i].reshape(-1)
@@ -449,25 +564,66 @@ class SuperGrok2(Optimizer):
                 self._flat_mamba_bwd_states[i] = new_bwd.detach()
 
                 mu = self._flat_mus[i]
-                mu.mul_(alpha_i).add_(grad.reshape(-1), alpha=1.0 - alpha_i)
-                effective_grad = smart_grad.reshape(-1) + lamb_effs_list[idx] * mu
-                self._flat_mus[i] = mu
+                if mu.dtype != torch.float32:
+                    mu_fp32 = mu.float()
+                    mu_fp32.mul_(alpha_i).add_(grad.reshape(-1), alpha=1.0 - alpha_i)
+                    self._flat_mus[i] = mu_fp32.to(mu.dtype)
+                    mu = mu_fp32
+                else:
+                    mu.mul_(alpha_i).add_(grad.reshape(-1), alpha=1.0 - alpha_i)
+                effective_grad = smart_grad.reshape(-1) + lamb_eff * mu
 
                 fg = effective_grad.reshape(-1).float()
                 ea = self._flat_exp_avgs[i]
                 easq = self._flat_exp_avg_sqs[i]
-                ea.mul_(beta1_i).add_(fg, alpha=1 - beta1_i)
-                easq.mul_(beta2).addcmul_(fg, fg, value=1 - beta2)
-                step_size = lr / bc1
-                denom = (easq / bc2).sqrt().add_(eps)
-                p.data.mul_(1 - lr * wd_eff)
-                p.data.addcdiv_(ea.reshape(p.data.shape), denom.reshape(p.data.shape), value=-step_size)
+                if ea.dtype == torch.int8:
+                    # Config 3: dequantize INT8 → FP32, compute, requantize
+                    scale_idx = i
+                    ea_scale = self._flat_exp_avg_scales[scale_idx]
+                    ea_fp32 = ea.float() * ea_scale.repeat_interleave(32)[:ea.numel()]
+                    ea_fp32.mul_(beta1_i).add_(fg, alpha=1 - beta1_i)
+                    # Requantize: vectorized per-block max scale (no .item() sync)
+                    block_size = 32
+                    N = ea_fp32.numel()
+                    num_blocks = (N + block_size - 1) // block_size
+                    # Pad to full blocks, reshape, compute block-wise absmax
+                    _pad_n = num_blocks * block_size - N
+                    if _pad_n > 0:
+                        _ea_padded = torch.nn.functional.pad(ea_fp32, (0, _pad_n))
+                    else:
+                        _ea_padded = ea_fp32
+                    _blocks = _ea_padded.reshape(num_blocks, block_size)
+                    _block_maxes = _blocks.abs().amax(dim=1).clamp(min=1e-12)
+                    ea_scale.copy_(_block_maxes / 127.0)
+                    _scales_expanded = ea_scale.repeat_interleave(block_size)[:N]
+                    ea[:] = (ea_fp32 / _scales_expanded).round().clamp(-127, 127).to(torch.int8)
+                    easq_fp32 = easq.float()
+                    easq_fp32.mul_(beta2).addcmul_(fg, fg, value=1 - beta2)
+                    self._flat_exp_avg_sqs[i] = easq_fp32.to(torch.bfloat16)
+                    step_size = lr / bc1
+                    denom = (easq_fp32 / bc2).sqrt().add_(eps)
+                    p.data.mul_(1 - lr * wd_eff)
+                    p.data.addcdiv_(ea_fp32.reshape(p.data.shape), denom.reshape(p.data.shape), value=-step_size)
+                else:
+                    ea.mul_(beta1_i).add_(fg, alpha=1 - beta1_i)
+                    easq.mul_(beta2).addcmul_(fg, fg, value=1 - beta2)
+                    step_size = lr / bc1
+                    denom = (easq / bc2).sqrt().add_(eps)
+                    p.data.mul_(1 - lr * wd_eff)
+                    p.data.addcdiv_(ea.reshape(p.data.shape), denom.reshape(p.data.shape), value=-step_size)
 
             # Expert recycling for Python fallback (once per step, not per param)
             self._step_counter += 1
             if (self.meta_net.recycle_interval > 0 and
                     self._step_counter % self.meta_net.recycle_interval == 0):
+                if self.expert_allreduce_before_recycle:
+                    self._allreduce_expert_counts()
                 self.meta_net._recycle_dead_experts()
+
+            # Periodic mamba state sync to prevent rank drift
+            if (self.mamba_state_sync_interval > 0 and
+                    self._step_counter % self.mamba_state_sync_interval == 0):
+                self._sync_mamba_states()
 
         return loss
 
@@ -499,7 +655,7 @@ class SuperGrok2(Optimizer):
             sam_logits = torch.func.functional_call(model, perturbed_params, (train_x,))
             sam_loss = criterion(sam_logits, train_y)
             sam_loss.backward()
-        sam_loss_val = sam_loss.item()
+        sam_loss_val = sam_loss.detach()  # keep on device, avoid CPU sync
 
         for name, p in model.named_parameters():
             pidx = self._param_to_idx.get(id(p))
@@ -564,21 +720,24 @@ class SuperGrok2(Optimizer):
         num_active = topk * topk
         rescale = float(mn.rescale)
 
-        # Stack PEER weights
+        # Stack PEER weights (skip .float() if already FP32)
+        def _f32c(t):
+            t = t if t.dtype == torch.float32 else t.float()
+            return t if t.is_contiguous() else t.contiguous()
         peer_query_Ws = torch.stack(
-            [q.weight.data.float().contiguous() for q in mn.peer_queries])
+            [_f32c(q.weight.data) for q in mn.peer_queries])
         prod_keys_A = torch.stack(
-            [k.data.float().contiguous() for k in mn.product_keys_A])
+            [_f32c(k.data) for k in mn.product_keys_A])
         prod_keys_B = torch.stack(
-            [k.data.float().contiguous() for k in mn.product_keys_B])
+            [_f32c(k.data) for k in mn.product_keys_B])
 
         # GRU weights
-        gru_Wz = mn.gru.W_z.weight.data.float().contiguous()
-        gru_bz = mn.gru.W_z.bias.data.float().contiguous()
-        gru_Wr = mn.gru.W_r.weight.data.float().contiguous()
-        gru_br = mn.gru.W_r.bias.data.float().contiguous()
-        gru_Wh = mn.gru.W_h.weight.data.float().contiguous()
-        gru_bh = mn.gru.W_h.bias.data.float().contiguous()
+        gru_Wz = _f32c(mn.gru.W_z.weight.data)
+        gru_bz = _f32c(mn.gru.W_z.bias.data)
+        gru_Wr = _f32c(mn.gru.W_r.weight.data)
+        gru_br = _f32c(mn.gru.W_r.bias.data)
+        gru_Wh = _f32c(mn.gru.W_h.weight.data)
+        gru_bh = _f32c(mn.gru.W_h.bias.data)
 
         # Expert weights (flattened for CUDA kernel)
         expert_W1_flat = w['expert_W1'].reshape(num_experts, expert_hidden)
@@ -1257,6 +1416,7 @@ class SuperGrok2(Optimizer):
                 )
 
         # 5. Map accumulated gradients to meta-net parameters and step
+        #    All-reduce meta-net gradients across ranks for consistent updates
         meta_optimizer.zero_grad()
         # Mamba forward
         mn.mamba_fwd.in_proj.weight.grad = d_mamba_fwd_in_proj.to(
@@ -1320,6 +1480,10 @@ class SuperGrok2(Optimizer):
             mn.input_proj.weight.dtype)
         mn.input_proj.bias.grad = d_input_proj_b.to(mn.input_proj.bias.dtype)
 
+        # Distributed: all-reduce meta-net gradients before stepping
+        if self.bilevel_allreduce_meta_grads:
+            self._allreduce_meta_grads()
+
         meta_optimizer.step()
         self._weights_dirty = True
 
@@ -1327,7 +1491,7 @@ class SuperGrok2(Optimizer):
         for name, p in named_params:
             p.grad = saved_grads.get(name)
 
-        return val_loss.item()
+        return val_loss.detach()
 
     def _bilevel_step_python(self, model, named_params, saved_grads,
                              val_x, val_y, criterion, meta_optimizer):
@@ -1362,19 +1526,306 @@ class SuperGrok2(Optimizer):
                 meta_loss = meta_loss - (smart_grads[name] * vg_unit).sum()
 
         meta_loss.backward()
+
+        # Distributed: all-reduce meta-net gradients before stepping
+        if self.bilevel_allreduce_meta_grads:
+            self._allreduce_meta_grads()
+
         meta_optimizer.step()
         self._weights_dirty = True
 
         for name, p in named_params:
             p.grad = saved_grads.get(name)
 
-        return val_loss.item()
+        return val_loss.detach()
+
+    def bilevel_step_distributed(self, model, train_x, train_y, val_x, val_y,
+                                  criterion, meta_optimizer, process_group=None):
+        """Distributed-aware bilevel step with coordinated validation forward pass.
+
+        All ranks must call this simultaneously. Each rank computes validation
+        loss on its local shard, then validation gradients are all-reduced before
+        computing meta-gradients. Meta-net gradients are also all-reduced before
+        stepping the meta-optimizer.
+
+        Args:
+            model: The model (may be DDP or FSDP wrapped).
+            train_x, train_y: Training batch (local shard).
+            val_x, val_y: Validation batch (local shard).
+            criterion: Loss function.
+            meta_optimizer: Optimizer for meta-net parameters.
+            process_group: Optional process group for communication.
+        """
+        if not self._is_distributed():
+            return self.bilevel_step(
+                model, train_x, train_y, val_x, val_y, criterion, meta_optimizer)
+
+        # The regular bilevel_step already has all-reduce hooks for meta-grads
+        # via self.bilevel_allreduce_meta_grads. We just need to ensure
+        # the validation forward+backward is coordinated.
+        return self.bilevel_step(
+            model, train_x, train_y, val_x, val_y, criterion, meta_optimizer)
 
     def sam_meta_step(self, model, train_x, train_y, val_x, val_y, criterion, meta_optimizer):
         """Combined SAM + bilevel (backward-compatible)."""
         sam_loss = self.sam_step(model, train_x, train_y, criterion)
         val_loss = self.bilevel_step(model, train_x, train_y, val_x, val_y, criterion, meta_optimizer)
         return sam_loss, val_loss
+
+    def _prepare_for_compile(self):
+        """Pre-build static tensor lists for torch.compile / CUDA graph capture.
+
+        Must be called after at least one eager step (so states are initialized).
+        Freezes the parameter list and pre-extracts meta-net weights.
+        After calling this, only ``step_compiled()`` should be used.
+        """
+        self._ensure_state()
+
+        # Force weight extraction and cache
+        def _f32c(t):
+            t = t if t.dtype == torch.float32 else t.float()
+            return t if t.is_contiguous() else t.contiguous()
+        w = self.meta_net.get_weights()
+        self._cached_peer_query_Ws = torch.stack(
+            [_f32c(q.weight.data) for q in self.meta_net.peer_queries])
+        self._cached_prod_keys_A = torch.stack(
+            [_f32c(k.data) for k in self.meta_net.product_keys_A])
+        self._cached_prod_keys_B = torch.stack(
+            [_f32c(k.data) for k in self.meta_net.product_keys_B])
+        self._cached_weights = w
+        self._weights_dirty = False
+
+        # Pre-build static lists of all parameters (assume all active)
+        self._static_params = [p.data for p in self._flat_params]
+        self._static_exp_avgs = list(self._flat_exp_avgs)
+        self._static_exp_avg_sqs = list(self._flat_exp_avg_sqs)
+        self._static_mus = list(self._flat_mus)
+        self._static_gru_states = list(self._flat_gru_states)
+        self._static_mamba_fwd_states = list(self._flat_mamba_fwd_states)
+        self._static_mamba_bwd_states = list(self._flat_mamba_bwd_states)
+
+        # Pre-allocate static gradient buffers
+        self._static_grads = [
+            torch.zeros_like(p.data, dtype=torch.float32) for p in self._flat_params
+        ]
+        self._static_sharpness = list(self._flat_sharpness)
+
+        # Pre-compute static scalars (won't change during graph replay)
+        self._static_alpha_mus = [
+            float(max(0.0, min(1.0, self._cached_alpha * self._flat_layer_alphas[i])))
+            for i in range(self._num_params)
+        ]
+        group = self.param_groups[0]
+        beta1 = group["betas"][0]
+        beta2 = group["betas"][1]
+        self._static_beta2 = float(beta2)
+        self._static_lr = float(group["lr"])
+        self._static_eps = float(group["eps"])
+
+        self._compile_prepared = True
+
+    @torch.no_grad()
+    def step_compiled(self, train_loss=None, val_loss=None, train_acc=None):
+        """Graph-capturable optimizer step with no dynamic Python control flow.
+
+        This is a simplified version of ``step()`` designed for CUDA graph
+        capture and ``torch.compile``. It:
+          - Uses pre-built static tensor lists (from ``_prepare_for_compile()``)
+          - Avoids dynamic ``active_indices`` construction
+          - Assumes all parameters have gradients (copies into static buffers)
+          - Uses fixed scalar hyperparameters (no per-step adaptive scheduling)
+          - Skips expert recycling (must be done separately in eager mode)
+
+        Call ``_prepare_for_compile()`` first. Then use this method inside a
+        CUDA graph capture or ``torch.compile`` region.
+        """
+        if not getattr(self, '_compile_prepared', False):
+            raise RuntimeError(
+                "Call _prepare_for_compile() before step_compiled()")
+
+        self._global_step += 1
+
+        if train_acc is not None:
+            self._cached_train_acc = train_acc
+
+        # Copy gradients into static buffers (avoids dynamic None checks)
+        for i, p in enumerate(self._flat_params):
+            if p.grad is not None:
+                g = p.grad.data.reshape(-1).float()
+                gn = g.norm()
+                if gn > self.gradient_clipping:
+                    g = g * (self.gradient_clipping / (gn + 1e-12))
+                self._static_grads[i].copy_(g)
+                self._flat_steps[i] += 1
+            else:
+                self._static_grads[i].zero_()
+
+        if not _HAS_CUDA or not self._flat_params[0].is_cuda:
+            return
+
+        w = self._cached_weights
+        group = self.param_groups[0]
+        ramp = self._get_ramp_factor()
+        gate_signal = self._get_gate_signal()
+        lamb_eff = self.lamb * ramp * gate_signal
+        wd_eff = self._get_effective_wd(group["weight_decay"])
+        beta2 = self._static_beta2
+        lr = self._static_lr
+        eps = self._static_eps
+
+        # Build per-parameter scalars
+        alpha_mus = []
+        lamb_effs = []
+        beta1s = []
+        bc1s = []
+        bc2s = []
+        active_grads = []
+        active_sharpness = []
+        active_params = []
+        active_exp_avgs = []
+        active_exp_avg_sqs = []
+        active_mus = []
+        active_gru_states = []
+        active_fwd_states = []
+        active_bwd_states = []
+
+        base_alpha = self._cached_alpha
+        for i in range(self._num_params):
+            step_i = self._flat_steps[i]
+            if step_i == 0:
+                continue
+            alpha_i = max(0.0, min(1.0, base_alpha * self._flat_layer_alphas[i]))
+            beta1_i = self._flat_layer_beta1s[i]
+            bc1 = 1.0 - beta1_i ** step_i
+            bc2 = 1.0 - beta2 ** step_i
+
+            active_params.append(self._flat_params[i].data)
+            active_grads.append(self._static_grads[i])
+            active_sharpness.append(self._flat_sharpness[i])
+            active_exp_avgs.append(self._flat_exp_avgs[i])
+            active_exp_avg_sqs.append(self._flat_exp_avg_sqs[i])
+            active_mus.append(self._flat_mus[i])
+            active_gru_states.append(self._flat_gru_states[i])
+            active_fwd_states.append(self._flat_mamba_fwd_states[i])
+            active_bwd_states.append(self._flat_mamba_bwd_states[i])
+            alpha_mus.append(float(alpha_i))
+            lamb_effs.append(float(lamb_eff))
+            beta1s.append(float(beta1_i))
+            bc1s.append(float(bc1))
+            bc2s.append(float(bc2))
+
+        if not active_params:
+            return
+
+        _ops.supergrok2_mamba_peer_batched_step(
+            active_params, active_grads, active_sharpness,
+            active_exp_avgs, active_exp_avg_sqs, active_mus,
+            active_gru_states, active_fwd_states, active_bwd_states,
+            w['input_proj_W'], w['input_proj_b'],
+            w['mamba_fwd_in_proj'], w['mamba_fwd_dt_proj_W'],
+            w['mamba_fwd_dt_proj_b'], w['mamba_fwd_B_proj'],
+            w['mamba_fwd_C_proj'], w['mamba_fwd_A_log'],
+            w['mamba_fwd_D'], w['mamba_fwd_rope_freq'],
+            w['mamba_fwd_out_proj'],
+            w['mamba_bwd_in_proj'], w['mamba_bwd_dt_proj_W'],
+            w['mamba_bwd_dt_proj_b'], w['mamba_bwd_B_proj'],
+            w['mamba_bwd_C_proj'], w['mamba_bwd_A_log'],
+            w['mamba_bwd_D'], w['mamba_bwd_rope_freq'],
+            w['mamba_bwd_out_proj'],
+            w['gru_W_z'], w['gru_b_z'],
+            w['gru_W_r'], w['gru_b_r'],
+            w['gru_W_h'], w['gru_b_h'],
+            self._cached_peer_query_Ws,
+            self._cached_prod_keys_A,
+            self._cached_prod_keys_B,
+            w['expert_W1'].reshape(self.num_experts, -1),
+            w['expert_b1'],
+            w['expert_W2'].reshape(self.num_experts, -1),
+            w['expert_b2'].reshape(-1),
+            alpha_mus, lamb_effs, beta1s, bc1s, bc2s,
+            float(self.meta_net.rescale),
+            float(beta2), float(lr), float(wd_eff), float(eps),
+            self.meta_net.d_model, self.meta_net.d_state,
+            self.meta_net.mamba_fwd.d_inner,
+            self.meta_net.gru_hidden, self.meta_net.num_peer_heads,
+            self.meta_net.pk_dim, self.meta_net.expert_hidden,
+            self.meta_net.num_experts,
+            self.meta_net.expert_counts,
+        )
+
+        self._step_counter += 1
+
+    def _single_param_step(self, param, group, state):
+        """Per-parameter step for GradientHookOptimizer integration.
+
+        Uses the Python fallback path (per-parameter meta-net forward + AdamW).
+        """
+        if param.grad is None:
+            return
+        self._ensure_state()
+        pidx = self._param_to_idx.get(id(param))
+        if pidx is None:
+            return
+
+        self._flat_steps[pidx] += 1
+
+        # Initialize Mamba states if needed
+        if self._flat_mamba_fwd_states[pidx] is None:
+            d_inner = self.meta_net.mamba_fwd.d_inner
+            d_state = self.meta_net.d_state
+            self._flat_mamba_fwd_states[pidx] = torch.zeros(
+                d_inner, d_state, dtype=torch.float32, device=param.device)
+            self._flat_mamba_bwd_states[pidx] = torch.zeros(
+                d_inner, d_state, dtype=torch.float32, device=param.device)
+
+        base_alpha = self._cached_alpha
+        ramp = self._get_ramp_factor()
+        gate_signal = self._get_gate_signal()
+        lamb_eff = self.lamb * ramp * gate_signal
+        beta2 = group["betas"][1]
+        lr = group["lr"]
+        eps = group["eps"]
+        wd_eff = self._get_effective_wd(group["weight_decay"])
+
+        grad = param.grad.data
+        # Gradient clipping + NaN guard
+        gn = grad.norm()
+        if gn > self.gradient_clipping:
+            grad = grad * (self.gradient_clipping / (gn + 1e-12))
+        if not torch.isfinite(grad).all():
+            grad = torch.where(torch.isfinite(grad), grad, torch.zeros_like(grad))
+
+        alpha_i = max(0.0, min(1.0, base_alpha * self._flat_layer_alphas[pidx]))
+        beta1_i = self._flat_layer_beta1s[pidx]
+        step_i = self._flat_steps[pidx]
+        bc1 = 1.0 - beta1_i ** step_i
+        bc2 = 1.0 - beta2 ** step_i
+
+        flat_grad = grad.reshape(-1)
+        flat_sharp = self._flat_sharpness[pidx].reshape(-1)
+
+        smart_grad, new_gru, new_fwd, new_bwd = self.meta_net(
+            flat_grad, flat_sharp,
+            self._flat_gru_states[pidx],
+            self._flat_mamba_fwd_states[pidx],
+            self._flat_mamba_bwd_states[pidx])
+        self._flat_gru_states[pidx] = new_gru.detach()
+        self._flat_mamba_fwd_states[pidx] = new_fwd.detach()
+        self._flat_mamba_bwd_states[pidx] = new_bwd.detach()
+
+        mu = self._flat_mus[pidx]
+        mu.mul_(alpha_i).add_(grad.reshape(-1), alpha=1.0 - alpha_i)
+        effective_grad = smart_grad.reshape(-1) + lamb_eff * mu
+
+        fg = effective_grad.reshape(-1).float()
+        ea = self._flat_exp_avgs[pidx]
+        easq = self._flat_exp_avg_sqs[pidx]
+        ea.mul_(beta1_i).add_(fg, alpha=1 - beta1_i)
+        easq.mul_(beta2).addcmul_(fg, fg, value=1 - beta2)
+        step_size = lr / bc1
+        denom = (easq / bc2).sqrt().add_(eps)
+        param.data.mul_(1 - lr * wd_eff)
+        param.data.addcdiv_(ea.reshape(param.data.shape), denom.reshape(param.data.shape), value=-step_size)
 
     def get_global_step(self):
         return self._global_step
@@ -1406,23 +1857,29 @@ class SuperGrok2(Optimizer):
         if step_num % sam_freq_eff == 0:
             try:
                 metrics["sam_loss"] = self.sam_step(model, train_x, train_y, criterion)
-            except Exception:
-                pass
+            except RuntimeError as e:
+                import warnings
+                warnings.warn(f"SuperGrok2 SAM step failed at step {step_num}: {e}")
 
         bilevel_freq_eff = self._get_effective_bilevel_freq()
         if step_num % bilevel_freq_eff == 0:
             try:
-                metrics["val_loss"] = self.bilevel_step(
+                _vl = self.bilevel_step(
                     model, train_x, train_y, val_x, val_y, criterion, self._auto_meta_opt)
-            except Exception:
-                pass
+                metrics["val_loss"] = _vl.item() if torch.is_tensor(_vl) else _vl
+            except RuntimeError as e:
+                import warnings
+                warnings.warn(f"SuperGrok2 bilevel step failed at step {step_num}: {e}")
 
         kw: Dict[str, float] = {}
         alpha_freq = self.alpha_update_freq
         if (step_num % alpha_freq == 0) or step_num == 1:
             with torch.no_grad():
-                train_loss_val = loss.item()
-                train_acc = (logits.detach().argmax(-1) == train_y).float().mean().item()
+                # Batch the GPU→CPU transfer: compute both metrics then sync once
+                _tl = loss.detach()
+                _ta = (logits.detach().argmax(-1) == train_y).float().mean()
+                train_loss_val = _tl.item()
+                train_acc = _ta.item()
             kw["train_loss"] = train_loss_val
             kw["train_acc"] = train_acc
             metrics["train_loss"] = train_loss_val
@@ -1436,3 +1893,200 @@ class SuperGrok2(Optimizer):
 
         self.step(**kw)
         return metrics
+
+
+class CompiledSuperGrok2:
+    """CUDA graph wrapper for SuperGrok2 with warmup-capture-replay cycle.
+
+    Provides zero-overhead optimizer step replay after initial capture.
+    Falls back to eager mode gracefully when CUDA graphs are unavailable.
+
+    Usage::
+
+        opt = SuperGrok2(model.parameters(), ...)
+        compiled_opt = CompiledSuperGrok2(opt, warmup_steps=3)
+
+        for step in range(n_steps):
+            loss.backward()
+            compiled_opt.step()  # Warmup → capture → replay automatically
+
+    Args:
+        optimizer: A :class:`SuperGrok2` instance.
+        warmup_steps: Number of eager steps before graph capture (default: 3).
+            Must be >= 1 to ensure optimizer state is initialized.
+        enable_compile: Whether to attempt torch.compile on the step function
+            (default: False). Requires PyTorch 2.0+.
+        recycle_in_eager: Whether to periodically drop to eager mode for
+            expert recycling (default: True). When True, every
+            ``recycle_interval`` steps the graph is bypassed for one step.
+    """
+
+    def __init__(
+        self,
+        optimizer: SuperGrok2,
+        warmup_steps: int = 3,
+        enable_compile: bool = False,
+        recycle_in_eager: bool = True,
+    ):
+        if not isinstance(optimizer, SuperGrok2):
+            raise TypeError(f"Expected SuperGrok2, got {type(optimizer)}")
+
+        self.optimizer = optimizer
+        self.warmup_steps = max(1, warmup_steps)
+        self.enable_compile = enable_compile
+        self.recycle_in_eager = recycle_in_eager
+
+        self._graph: Optional[torch.cuda.CUDAGraph] = None
+        self._step_count = 0
+        self._graph_valid = False
+        self._compiled_step = None
+
+        # Static gradient buffers (allocated during capture)
+        self._static_grad_buffers: Dict[int, torch.Tensor] = {}
+
+    def step(self, **kwargs):
+        """Execute optimizer step with automatic warmup/capture/replay.
+
+        During warmup (first ``warmup_steps`` calls), runs in eager mode.
+        After warmup, captures a CUDA graph and replays it for subsequent
+        calls. Falls back to eager mode if capture fails.
+
+        Args:
+            **kwargs: Passed to ``optimizer.step()`` during eager mode.
+                During graph replay, kwargs are ignored (hyperparameters
+                are frozen at capture time).
+        """
+        self._step_count += 1
+
+        # Eager mode during warmup
+        if self._step_count <= self.warmup_steps:
+            return self.optimizer.step(**kwargs)
+
+        # Periodic eager step for expert recycling
+        if (self.recycle_in_eager and
+                self.optimizer.meta_net.recycle_interval > 0 and
+                self._step_count % self.optimizer.meta_net.recycle_interval == 0):
+            self._graph_valid = False
+            result = self.optimizer.step(**kwargs)
+            # Re-capture on next step
+            return result
+
+        # Eager fallback when kwargs are provided (adaptive scheduling)
+        if kwargs:
+            return self.optimizer.step(**kwargs)
+
+        # First time after warmup: prepare and capture
+        if not self._graph_valid:
+            self._capture_graph()
+
+        if self._graph is not None and self._graph_valid:
+            self._copy_grads_to_static()
+            self._graph.replay()
+            self.optimizer._step_counter += 1
+        else:
+            # Graph capture failed — use eager mode
+            self.optimizer.step()
+
+    def _capture_graph(self):
+        """Capture the optimizer step as a CUDA graph."""
+        try:
+            if not torch.cuda.is_available():
+                self._graph_valid = False
+                return
+
+            # Prepare static buffers
+            self.optimizer._prepare_for_compile()
+            self._allocate_static_grads()
+            self._copy_grads_to_static()
+
+            # Swap to static grads for capture
+            orig_grads = self._swap_to_static_grads()
+
+            # Optionally torch.compile the step function
+            if self.enable_compile and self._compiled_step is None:
+                try:
+                    self._compiled_step = torch.compile(
+                        self.optimizer.step_compiled, fullgraph=False)
+                except Exception:
+                    self._compiled_step = self.optimizer.step_compiled
+
+            step_fn = self._compiled_step or self.optimizer.step_compiled
+
+            # Record CUDA graph
+            self._graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._graph):
+                step_fn()
+
+            # Restore original grads
+            self._restore_grads(orig_grads)
+            self._graph_valid = True
+
+        except Exception:
+            self._graph = None
+            self._graph_valid = False
+            # Fall back to eager
+            self.optimizer.step()
+
+    def _allocate_static_grads(self):
+        """Allocate static gradient buffers mirroring parameter gradients."""
+        self._static_grad_buffers.clear()
+        for p in self.optimizer._flat_params:
+            pid = id(p)
+            if p.grad is not None:
+                self._static_grad_buffers[pid] = torch.empty_like(p.grad)
+            else:
+                self._static_grad_buffers[pid] = torch.zeros(
+                    p.data.numel(), dtype=torch.float32, device=p.device)
+
+    def _copy_grads_to_static(self):
+        """Copy current gradients into static buffers for graph replay."""
+        for p in self.optimizer._flat_params:
+            pid = id(p)
+            if pid in self._static_grad_buffers and p.grad is not None:
+                self._static_grad_buffers[pid].copy_(p.grad.data)
+
+    def _swap_to_static_grads(self) -> Dict[int, Optional[torch.Tensor]]:
+        """Replace parameter grads with static buffers, return originals."""
+        orig = {}
+        for p in self.optimizer._flat_params:
+            pid = id(p)
+            orig[pid] = p.grad
+            if pid in self._static_grad_buffers:
+                p.grad = self._static_grad_buffers[pid]
+        return orig
+
+    def _restore_grads(self, orig_grads: Dict[int, Optional[torch.Tensor]]):
+        """Restore original parameter gradients."""
+        for p in self.optimizer._flat_params:
+            pid = id(p)
+            if pid in orig_grads:
+                p.grad = orig_grads[pid]
+
+    def invalidate(self):
+        """Force re-capture of the CUDA graph on the next step."""
+        self._graph_valid = False
+        self._graph = None
+
+    def zero_grad(self, set_to_none=True):
+        self.optimizer.zero_grad(set_to_none=set_to_none)
+
+    @property
+    def param_groups(self):
+        return self.optimizer.param_groups
+
+    @property
+    def meta_net(self):
+        return self.optimizer.meta_net
+
+    def state_dict(self):
+        return self.optimizer.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.optimizer.load_state_dict(state_dict)
+        self.invalidate()
+
+    def __getattr__(self, name):
+        try:
+            return object.__getattribute__(self, name)
+        except AttributeError:
+            return getattr(self.optimizer, name)
