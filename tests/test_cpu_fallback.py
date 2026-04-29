@@ -310,25 +310,24 @@ def test_fallback_prodigy_d_lr():
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Test 12: setup.py CPU path includes new source files
+#  Test 12: setup.py points to the post-refactor kernel tree
 # ═══════════════════════════════════════════════════════════════════════
 
-def test_setup_cpu_sources():
-    """Verify setup.py CPU path lists the new source files."""
+def test_setup_kernel_sources():
+    """Verify setup.py walks the post-refactor csrc/kernels/ tree.
+
+    Under the all-specialized policy there is no csrc/cpu/ tier; CPU
+    correctness is verified via _python_fallback under unit tests only.
+    setup.py must source the per-arch kernels in csrc/kernels/{cuda,hip}/.
+    """
     from pathlib import Path
     setup_py = Path(__file__).parent.parent / "setup.py"
     content = setup_py.read_text()
 
-    required_sources = [
-        "csrc/cpu/generic/all_optimizers_cpu.cpp",
-        "csrc/cpu/generic/supergrok2_scan_cpu.cpp",
-    ]
-    for src in required_sources:
-        assert src in content, f"setup.py missing CPU source: {src}"
-
-    # Check SIMD detection
-    assert "avx512" in content.lower() or "simd" in content.lower(), \
-        "setup.py missing SIMD/AVX-512 detection"
+    # At least one supported arch must appear as a source path.
+    expected = ["csrc/kernels/cuda/sm_80", "csrc/kernels/hip/gfx942"]
+    for src in expected:
+        assert src in content, f"setup.py missing kernel path: {src}"
 
 
 # ═══════════════════════════════════════════════════════════════════════
