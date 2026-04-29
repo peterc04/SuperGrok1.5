@@ -34,6 +34,45 @@
 #include "ptx_intrinsics.cuh"
 #include "utils.cuh"
 
+#ifdef WITH_CUTLASS
+#include "../_cutlass_gemm.cuh"
+
+namespace sg { namespace sm90 {
+// SG2 projection mm_out helper. When WITH_CUTLASS is set, FP16/BF16
+// inputs are routed through cutlass_gemm_*; FP32 inputs (which is the
+// SG2 default — meta-net weights are FP32) fall back to torch::mm_out
+// untouched. Math is equivalent to the cuBLAS path within FP tolerance.
+//
+// Output is in `out` (preallocated, FP32 today). When CUTLASS is
+// engaged, the FP32 accumulator is written directly to `out`, no
+// dtype cast needed.
+static inline void proj_mm_out(torch::Tensor out, torch::Tensor A, torch::Tensor B) {
+    if (A.scalar_type() != at::ScalarType::Half &&
+        A.scalar_type() != at::ScalarType::BFloat16) {
+        torch::mm_out(out, A, B);
+        return;
+    }
+    auto Ac = A.contiguous();
+    auto Bc = B.contiguous();
+    int M = Ac.size(0), K = Ac.size(1), N = Bc.size(1);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (A.scalar_type() == at::ScalarType::Half) {
+        sg::cutlass_gemm::cutlass_gemm_fp16(
+            M, N, K,
+            reinterpret_cast<const __half*>(Ac.data_ptr<at::Half>()),
+            reinterpret_cast<const __half*>(Bc.data_ptr<at::Half>()),
+            out.data_ptr<float>(), stream);
+    } else {
+        sg::cutlass_gemm::cutlass_gemm_bf16(
+            M, N, K,
+            reinterpret_cast<const __nv_bfloat16*>(Ac.data_ptr<at::BFloat16>()),
+            reinterpret_cast<const __nv_bfloat16*>(Bc.data_ptr<at::BFloat16>()),
+            out.data_ptr<float>(), stream);
+    }
+}
+}}  // namespace sg::sm90
+#endif  // WITH_CUTLASS
+
 // =====================================================================
 //  BASELINE COPY -- sm90 variant of supergrok2_mamba_peer_backward_kernels.cu
 //
@@ -176,13 +215,20 @@ static void bilevel_precompute_gemm(
     auto in_proj_z = in_proj_W.narrow(0, d_inner, d_inner);   // [d_inner, d_model]
 
     // x_branch = x_sorted @ in_proj_x.T → [N, d_inner] (written directly to pre_x_val)
+#ifdef WITH_CUTLASS
+    proj_mm_out(pre_x_val, x_sorted, in_proj_x.t());
+    proj_mm_out(pre_z_val, x_sorted, in_proj_z.t());
+    proj_mm_out(pre_dt_val, pre_x_val, dt_proj_W.t());
+#else
     torch::mm_out(pre_x_val, x_sorted, in_proj_x.t());
-
     // z = x_sorted @ in_proj_z.T → [N, d_inner]
     torch::mm_out(pre_z_val, x_sorted, in_proj_z.t());
-
     // dt_raw = x_branch @ dt_proj_W.T → [N, d_inner], then add bias + softplus
     torch::mm_out(pre_dt_val, pre_x_val, dt_proj_W.t());
+#endif
+    // dt softplus + bias: bit-identical to fused-CUTLASS path
+    // (cutlass_dt_proj_fused() currently runs unfused — see TODO in
+    // _cutlass_gemm.cuh — and softplus stays in this elementwise pass).
     int total_dt = N * d_inner;
     int dt_grid = (total_dt + SG2B_BLOCK - 1) / SG2B_BLOCK;
     softplus_bias_kernel<<<dt_grid, SG2B_BLOCK>>>(
@@ -191,11 +237,15 @@ static void bilevel_precompute_gemm(
         N, d_inner
     );
 
+#ifdef WITH_CUTLASS
+    proj_mm_out(pre_B_val, pre_x_val, B_proj_W.t());
+    proj_mm_out(pre_C_val, pre_x_val, C_proj_W.t());
+#else
     // B = x_branch @ B_proj_W.T → [N, d_state]
     torch::mm_out(pre_B_val, pre_x_val, B_proj_W.t());
-
     // C = x_branch @ C_proj_W.T → [N, d_state]
     torch::mm_out(pre_C_val, pre_x_val, C_proj_W.t());
+#endif
 }
 
 
