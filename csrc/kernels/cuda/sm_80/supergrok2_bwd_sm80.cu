@@ -3311,6 +3311,11 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
     const int num_params = grads.size();
     if (num_params == 0) return;
 
+    // Ampere TF32 cuBLAS mode for the projection GEMMs in this multi-phase
+    // pipeline (2x FP32 throughput on Tensor Cores). Restored on exit.
+    auto handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
+
     TORCH_CHECK(d_state % 2 == 0, "d_state must be even for paired RoPE (got ", d_state, ")");
     TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
     TORCH_CHECK(d_model <= MAX_D_MODEL, "d_model exceeds MAX_D_MODEL (", d_model, " > ", MAX_D_MODEL, ")");
@@ -3568,6 +3573,8 @@ void launch_mamba3_peer_bilevel_fwd_save_batched(
             d_model, d_inner, d_state, ckpt_int
         );
     }
+
+    cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
 }
 
 
@@ -3636,6 +3643,11 @@ void launch_mamba3_peer_backward_batched(
     int checkpoint_interval  // 0 = no checkpointing
 ) {
     if (num_params == 0) return;
+
+    // Ampere TF32 cuBLAS mode for the weight gradient GEMMs (torch::mm_out
+    // calls below). Restored on exit.
+    auto handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
 
     TORCH_CHECK(d_state % 2 == 0, "d_state must be even for paired RoPE (got ", d_state, ")");
     TORCH_CHECK(d_state <= MAX_D_STATE, "d_state exceeds MAX_D_STATE (", d_state, " > ", MAX_D_STATE, ")");
@@ -3781,6 +3793,8 @@ void launch_mamba3_peer_backward_batched(
             d_model, num_params
         );
     }
+
+    cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
 }
 
 

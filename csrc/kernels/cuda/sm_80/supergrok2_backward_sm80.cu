@@ -1,6 +1,6 @@
 
 /*
- * SuperGrok v2 — Ampere-Optimized Backward Kernels (sm_80+)
+ * SuperGrok v2 — Ampere-Optimized Backward Kernel (sm_80+)
  *
  * Real __global__ backward dh-propagation kernel with cp.async
  * double-buffered prefetch:
@@ -10,21 +10,17 @@
  *     While computing on timestep t, timestep t-1's data is prefetched
  *     into the alternate buffer asynchronously.
  *
- * TF32 wrapper for bilevel fwd_save (delegation):
- *   - launch_mamba3_peer_bilevel_fwd_save_batched_ampere: delegates to the
- *     generic bilevel fwd_save launcher with TF32 cuBLAS mode. This is an
- *     honest delegation — the bilevel forward-save is a complex multi-phase
- *     pipeline (projection GEMMs + sequential scan + state checkpointing)
- *     where TF32 mode on the cuBLAS GEMMs is the only Ampere-specific
- *     addition needed. The scan phase within the bilevel pipeline already
- *     dispatches to the Ampere cp.async scan kernel via the arch tier system.
+ * The TF32 cuBLAS-mode wraps that previously lived in
+ * launch_mamba3_peer_bilevel_fwd_save_batched_ampere /
+ * launch_mamba3_peer_backward_batched_ampere have been folded directly
+ * into the canonical launchers in supergrok2_bwd_sm80.cu (which now
+ * open CUBLAS_TF32_TENSOR_OP_MATH at entry and restore on exit).
  *
- * The cp.async prefetch pattern mirrors the forward scan in
- * supergrok2_scan_sm80.cu: double-buffered shared memory with
- * __pipeline_memcpy_async for overlapping memory loads with compute.
- *
- * Dispatch: ops.cpp calls these on sm_80+ GPUs.
- * Fallback: On sm_70/sm_75, the generic launchers are called instead.
+ * The cp.async kernel below is preserved for future activation. It is
+ * not currently called from the canonical bwd launcher — the previous
+ * Ampere wrapper allocated its own intermediate gradient buffers but
+ * never propagated them; the data path is deferred to a hardware-validated
+ * tuning pass.
  */
 
 #include <torch/extension.h>
@@ -39,133 +35,6 @@
 #endif
 
 namespace sg { namespace sm80 {
-
-// =====================================================================
-//  Forward declarations of generic launchers
-// =====================================================================
-
-
-void launch_mamba3_peer_bilevel_fwd_save_batched(
-    std::vector<torch::Tensor> grads,
-    std::vector<torch::Tensor> sharpness_list,
-    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
-    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
-    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
-    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
-    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
-    torch::Tensor mamba_fwd_out_proj,
-    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
-    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
-    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
-    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
-    torch::Tensor mamba_bwd_out_proj,
-    int d_model, int d_state, int d_inner,
-    torch::Tensor fwd_scan_out_packed, torch::Tensor bwd_scan_out_packed,
-    torch::Tensor fwd_saved_states_packed, torch::Tensor fwd_saved_xb_packed,
-    torch::Tensor fwd_saved_z_packed, torch::Tensor fwd_saved_dt_packed,
-    torch::Tensor bwd_saved_states_packed, torch::Tensor bwd_saved_xb_packed,
-    torch::Tensor bwd_saved_z_packed, torch::Tensor bwd_saved_dt_packed,
-    torch::Tensor x_sorted_packed, torch::Tensor offsets_t,
-    torch::Tensor sort_indices_packed,
-    torch::Tensor fwd_initial_states, torch::Tensor bwd_initial_states,
-    int checkpoint_interval);
-
-void launch_mamba3_peer_backward_batched(
-    torch::Tensor d_fwd_scan_out_packed, torch::Tensor d_bwd_scan_out_packed,
-    torch::Tensor x_sorted_packed,
-    torch::Tensor fwd_saved_states_packed, torch::Tensor fwd_saved_xb_packed,
-    torch::Tensor fwd_saved_z_packed, torch::Tensor fwd_saved_dt_packed,
-    torch::Tensor bwd_saved_states_packed, torch::Tensor bwd_saved_xb_packed,
-    torch::Tensor bwd_saved_z_packed, torch::Tensor bwd_saved_dt_packed,
-    torch::Tensor offsets_t,
-    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
-    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
-    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
-    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
-    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
-    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
-    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
-    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
-    torch::Tensor d_mamba_fwd_in_proj, torch::Tensor d_mamba_fwd_dt_W,
-    torch::Tensor d_mamba_fwd_dt_b, torch::Tensor d_mamba_fwd_B_proj,
-    torch::Tensor d_mamba_fwd_C_proj, torch::Tensor d_mamba_fwd_A_log,
-    torch::Tensor d_mamba_fwd_D, torch::Tensor d_mamba_fwd_rope,
-    torch::Tensor d_mamba_bwd_in_proj, torch::Tensor d_mamba_bwd_dt_W,
-    torch::Tensor d_mamba_bwd_dt_b, torch::Tensor d_mamba_bwd_B_proj,
-    torch::Tensor d_mamba_bwd_C_proj, torch::Tensor d_mamba_bwd_A_log,
-    torch::Tensor d_mamba_bwd_D, torch::Tensor d_mamba_bwd_rope,
-    torch::Tensor d_x_sorted_packed,
-    torch::Tensor fwd_initial_states, torch::Tensor bwd_initial_states,
-    int d_model, int d_state, int d_inner, int num_params,
-    int checkpoint_interval);
-
-// =====================================================================
-//  Ampere Backward: Bilevel Forward-Save (Batched)
-//
-//  Delegates to the generic bilevel fwd_save launcher with TF32 cuBLAS
-//  math mode. This delegation is intentional and honest: the bilevel
-//  forward-save is a complex multi-phase pipeline (projection GEMMs +
-//  sequential scan + state checkpointing) where:
-//    1. The projection GEMMs benefit from TF32 Tensor Cores (2x FP32
-//       throughput, set here via cuBLAS math mode).
-//    2. The sequential scan phase within the pipeline already dispatches
-//       to the Ampere cp.async scan kernel (supergrok2_scan_sm80.cu)
-//       through the arch tier system.
-//  Writing a monolithic Ampere bilevel fwd_save kernel would duplicate
-//  hundreds of lines of multi-phase orchestration for no additional
-//  benefit beyond what TF32 mode + scan kernel dispatch already provide.
-// =====================================================================
-
-void launch_mamba3_peer_bilevel_fwd_save_batched_ampere(
-    std::vector<torch::Tensor> grads,
-    std::vector<torch::Tensor> sharpness_list,
-    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
-    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
-    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
-    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
-    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
-    torch::Tensor mamba_fwd_out_proj,
-    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
-    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
-    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
-    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
-    torch::Tensor mamba_bwd_out_proj,
-    int d_model, int d_state, int d_inner,
-    torch::Tensor fwd_scan_out_packed, torch::Tensor bwd_scan_out_packed,
-    torch::Tensor fwd_saved_states_packed, torch::Tensor fwd_saved_xb_packed,
-    torch::Tensor fwd_saved_z_packed, torch::Tensor fwd_saved_dt_packed,
-    torch::Tensor bwd_saved_states_packed, torch::Tensor bwd_saved_xb_packed,
-    torch::Tensor bwd_saved_z_packed, torch::Tensor bwd_saved_dt_packed,
-    torch::Tensor x_sorted_packed, torch::Tensor offsets_t,
-    torch::Tensor sort_indices_packed,
-    torch::Tensor fwd_initial_states, torch::Tensor bwd_initial_states,
-    int checkpoint_interval
-) {
-    auto handle = at::cuda::getCurrentCUDABlasHandle();
-    cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
-
-    launch_mamba3_peer_bilevel_fwd_save_batched(
-        grads, sharpness_list,
-        input_proj_W, input_proj_b,
-        mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
-        mamba_fwd_B_proj, mamba_fwd_C_proj, mamba_fwd_A_log,
-        mamba_fwd_D, mamba_fwd_rope, mamba_fwd_out_proj,
-        mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
-        mamba_bwd_B_proj, mamba_bwd_C_proj, mamba_bwd_A_log,
-        mamba_bwd_D, mamba_bwd_rope, mamba_bwd_out_proj,
-        d_model, d_state, d_inner,
-        fwd_scan_out_packed, bwd_scan_out_packed,
-        fwd_saved_states_packed, fwd_saved_xb_packed,
-        fwd_saved_z_packed, fwd_saved_dt_packed,
-        bwd_saved_states_packed, bwd_saved_xb_packed,
-        bwd_saved_z_packed, bwd_saved_dt_packed,
-        x_sorted_packed, offsets_t, sort_indices_packed,
-        fwd_initial_states, bwd_initial_states,
-        checkpoint_interval);
-
-    cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
-}
-
 
 // =====================================================================
 //  Backward dh-propagation kernel with cp.async double-buffered prefetch
@@ -415,167 +284,5 @@ template __global__ void mamba3_backward_dh_cpasync_kernel<at::BFloat16>(
 #endif  // __CUDACC__
 
 
-// =====================================================================
-//  Ampere Backward: Bilevel Backward (Batched)
-//
-//  Phase 1: custom cp.async double-buffered dh-propagation kernel
-//           for both forward and backward scan directions. The kernel
-//           reads saved_states, saved_x_branch, saved_z, saved_dt at
-//           each timestep and double-buffers these reads so that while
-//           we compute on timestep t, we asynchronously prefetch timestep
-//           t-1 into the alternate shared memory buffer.
-//
-//  Phase 2: weight gradient GEMMs -- delegates to the generic backward
-//           launcher (which uses torch::mm_out, benefiting from TF32
-//           cuBLAS mode set here).
-//
-//  Type dispatch: AT_DISPATCH_FLOATING_TYPES_AND2 handles float, half,
-//  and bfloat16 parameter tensors. Optimizer state (A_log, D, C_proj)
-//  and gradient accumulators (d_B_accum, d_C_accum) are always float
-//  for numerical stability.
-// =====================================================================
-
-void launch_mamba3_peer_backward_batched_ampere(
-    torch::Tensor d_fwd_scan_out_packed, torch::Tensor d_bwd_scan_out_packed,
-    torch::Tensor x_sorted_packed,
-    torch::Tensor fwd_saved_states_packed, torch::Tensor fwd_saved_xb_packed,
-    torch::Tensor fwd_saved_z_packed, torch::Tensor fwd_saved_dt_packed,
-    torch::Tensor bwd_saved_states_packed, torch::Tensor bwd_saved_xb_packed,
-    torch::Tensor bwd_saved_z_packed, torch::Tensor bwd_saved_dt_packed,
-    torch::Tensor offsets_t,
-    torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
-    torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
-    torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
-    torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
-    torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
-    torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
-    torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
-    torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
-    torch::Tensor d_mamba_fwd_in_proj, torch::Tensor d_mamba_fwd_dt_W,
-    torch::Tensor d_mamba_fwd_dt_b, torch::Tensor d_mamba_fwd_B_proj,
-    torch::Tensor d_mamba_fwd_C_proj, torch::Tensor d_mamba_fwd_A_log,
-    torch::Tensor d_mamba_fwd_D, torch::Tensor d_mamba_fwd_rope,
-    torch::Tensor d_mamba_bwd_in_proj, torch::Tensor d_mamba_bwd_dt_W,
-    torch::Tensor d_mamba_bwd_dt_b, torch::Tensor d_mamba_bwd_B_proj,
-    torch::Tensor d_mamba_bwd_C_proj, torch::Tensor d_mamba_bwd_A_log,
-    torch::Tensor d_mamba_bwd_D, torch::Tensor d_mamba_bwd_rope,
-    torch::Tensor d_x_sorted_packed,
-    torch::Tensor fwd_initial_states, torch::Tensor bwd_initial_states,
-    int d_model, int d_state, int d_inner, int num_params,
-    int checkpoint_interval
-) {
-    auto handle = at::cuda::getCurrentCUDABlasHandle();
-    cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
-
-    // -- Phase 1: backward dh propagation with cp.async prefetch --
-    //
-    // Shared memory requirements for double-buffered state data:
-    //   2 * d_inner * d_state  (double-buffered saved states)
-    //   + 6 * d_inner          (double-buffered x_branch, z, dt)
-    int smem_bytes = (2 * d_inner * d_state + 6 * d_inner)
-                     * static_cast<int>(sizeof(float));
-
-    auto stream = at::cuda::getCurrentCUDAStream();
-
-    // The packed tensors contain N total timesteps across all sequences.
-    int N_total = static_cast<int>(fwd_saved_states_packed.size(0));
-
-    // Allocate intermediate buffers for Phase 1 outputs.
-    // d_B_accum and d_C_accum are always float for stable atomicAdd.
-    auto opts = fwd_saved_states_packed.options();
-    auto opts_f32 = opts.dtype(torch::kFloat32);
-
-    auto d_x_branch_fwd = torch::zeros({N_total, d_inner}, opts);
-    auto d_dt_fwd       = torch::zeros({N_total, d_inner}, opts);
-    auto d_B_accum_fwd  = torch::zeros({N_total, d_state}, opts_f32);
-    auto d_C_accum_fwd  = torch::zeros({N_total, d_state}, opts_f32);
-
-    auto d_x_branch_bwd = torch::zeros({N_total, d_inner}, opts);
-    auto d_dt_bwd       = torch::zeros({N_total, d_inner}, opts);
-    auto d_B_accum_bwd  = torch::zeros({N_total, d_state}, opts_f32);
-    auto d_C_accum_bwd  = torch::zeros({N_total, d_state}, opts_f32);
-
-    // Type-dispatched kernel launch for forward and backward directions
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
-        fwd_saved_states_packed.scalar_type(), "mamba3_backward_dh_cpasync", [&] {
-
-        // Configure max dynamic shared memory for the kernel
-        gpuFuncSetAttribute(
-            mamba3_backward_dh_cpasync_kernel<scalar_t>,
-            gpuFuncAttributeMaxDynamicSharedMemorySize,
-            smem_bytes);
-
-        // Launch backward dh kernel for the FORWARD direction saved states
-        mamba3_backward_dh_cpasync_kernel<scalar_t>
-            <<<num_params, d_inner, smem_bytes, stream>>>(
-            fwd_saved_states_packed.data_ptr<scalar_t>(),
-            fwd_saved_xb_packed.data_ptr<scalar_t>(),
-            fwd_saved_z_packed.data_ptr<scalar_t>(),
-            fwd_saved_dt_packed.data_ptr<scalar_t>(),
-            d_fwd_scan_out_packed.data_ptr<scalar_t>(),
-            mamba_fwd_A_log.data_ptr<float>(),
-            mamba_fwd_D.data_ptr<float>(),
-            mamba_fwd_C_proj.data_ptr<float>(),
-            d_x_branch_fwd.data_ptr<scalar_t>(),
-            d_dt_fwd.data_ptr<scalar_t>(),
-            d_B_accum_fwd.data_ptr<float>(),
-            d_C_accum_fwd.data_ptr<float>(),
-            N_total, d_inner, d_state);
-
-        // Launch backward dh kernel for the BACKWARD direction saved states
-        mamba3_backward_dh_cpasync_kernel<scalar_t>
-            <<<num_params, d_inner, smem_bytes, stream>>>(
-            bwd_saved_states_packed.data_ptr<scalar_t>(),
-            bwd_saved_xb_packed.data_ptr<scalar_t>(),
-            bwd_saved_z_packed.data_ptr<scalar_t>(),
-            bwd_saved_dt_packed.data_ptr<scalar_t>(),
-            d_bwd_scan_out_packed.data_ptr<scalar_t>(),
-            mamba_bwd_A_log.data_ptr<float>(),
-            mamba_bwd_D.data_ptr<float>(),
-            mamba_bwd_C_proj.data_ptr<float>(),
-            d_x_branch_bwd.data_ptr<scalar_t>(),
-            d_dt_bwd.data_ptr<scalar_t>(),
-            d_B_accum_bwd.data_ptr<float>(),
-            d_C_accum_bwd.data_ptr<float>(),
-            N_total, d_inner, d_state);
-    });
-
-    // -- Phase 2: weight gradient GEMMs (TF32 cuBLAS mode already set) --
-    //
-    // Delegate to the generic backward launcher for the GEMM-based
-    // projection weight gradient accumulation. The generic launcher
-    // runs its own Phase 1 (which we have replaced above with the
-    // cp.async kernel) and Phase 2. Since we need only the GEMM
-    // portion, we call the full generic launcher -- the Phase 1 results
-    // from our kernel above will be combined with the generic Phase 2
-    // weight gradient computation.
-    launch_mamba3_peer_backward_batched(
-        d_fwd_scan_out_packed, d_bwd_scan_out_packed,
-        x_sorted_packed,
-        fwd_saved_states_packed, fwd_saved_xb_packed,
-        fwd_saved_z_packed, fwd_saved_dt_packed,
-        bwd_saved_states_packed, bwd_saved_xb_packed,
-        bwd_saved_z_packed, bwd_saved_dt_packed,
-        offsets_t,
-        mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
-        mamba_fwd_B_proj, mamba_fwd_C_proj, mamba_fwd_A_log,
-        mamba_fwd_D, mamba_fwd_rope,
-        mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
-        mamba_bwd_B_proj, mamba_bwd_C_proj, mamba_bwd_A_log,
-        mamba_bwd_D, mamba_bwd_rope,
-        d_mamba_fwd_in_proj, d_mamba_fwd_dt_W, d_mamba_fwd_dt_b,
-        d_mamba_fwd_B_proj, d_mamba_fwd_C_proj, d_mamba_fwd_A_log,
-        d_mamba_fwd_D, d_mamba_fwd_rope,
-        d_mamba_bwd_in_proj, d_mamba_bwd_dt_W, d_mamba_bwd_dt_b,
-        d_mamba_bwd_B_proj, d_mamba_bwd_C_proj, d_mamba_bwd_A_log,
-        d_mamba_bwd_D, d_mamba_bwd_rope,
-        d_x_sorted_packed,
-        fwd_initial_states, bwd_initial_states,
-        d_model, d_state, d_inner, num_params,
-        checkpoint_interval);
-
-    cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
-}
 
 } } // namespace sg::sm80
