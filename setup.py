@@ -13,7 +13,7 @@ Supported arches:
   - CPU:    x86_64 (AVX-512), aarch64 (NEON) -- testing only
 
 Build fails on unsupported arches. There is no generic-kernel fallback
-and no tier fallback chain. See REFACTOR_PLAN.md (esp. §10) and
+and no tier fallback chain. See REFRESH.md §0 and
 csrc/kernels/README.md for the underlying policy.
 
 Build:

@@ -162,7 +162,7 @@ Pallas kernels moved from `supergrok2_jax_tpu/pallas_kernels.py` to `csrc/kernel
 | HIP C++ (`.hip.cpp`) | 38 | 38,050 | Per-arch wrapped baselines for gfx942 + gfx950 (17 optimizers × 2 = 34) + four gfx950 per-feature files (`fp4_expert`, `fp6_state`, `sparse24`, `fused_combos`). |
 | Python (`.py`) | 71 | 21,342 | `grokking_optimizers/` package (eleven optimizers + dispatch + bindings + distributed + quantization + cuda_graph wrappers), `supergrok2_jax_tpu/` JAX implementation, `csrc/kernels/tpu/_pallas_kernels.py` (1190 lines), `autotune/` scripts, tests. |
 | C++ host code (`.cpp` / `.h`) | 31 | 5,523 | `csrc/bindings/` per-optimizer dispatchers + module aggregator (~16 files), shared headers (`platform.h`, `types.h`, `arch_tier.h`, `quantization.h`, `tuned_configs.h`, `bindings.h`, `fp4_helpers.hip.h`), CPU testing-only sources (`csrc/kernels/cpu/`). |
-| Markdown docs (`.md`) | 7 | 3,089 | `README.md`, `REFRESH.md` (this file), `REFACTOR_PLAN.md`, `ANALYSIS.md`, plus per-tree READMEs (`csrc/kernels/README.md`, `csrc/kernels/hip/README_HIP.md`, `autotune/README.md`). |
+| Markdown docs (`.md`) | 6 | 2,213 | `README.md`, `REFRESH.md` (this file), `ANALYSIS.md`, plus per-tree READMEs (`csrc/kernels/README.md`, `csrc/kernels/hip/README_HIP.md`, `autotune/README.md`). |
 | Config (TOML) | 1 | 19 | `pyproject.toml`. |
 | **Total** | **267** | **180,845** | |
 
@@ -351,7 +351,6 @@ For navigation, the structural-refactor commits:
 - `third_party/cutlass` — CUTLASS v3.6.0 submodule for sm_90a / sm_100a / sm_103a / sm_120a GEMMs (opt-in via `WITH_CUTLASS=1`)
 - `README.md` — user docs
 - `REFRESH.md` — this file
-- `REFACTOR_PLAN.md` — refactor design (steps 1-9 + §10 arch expansion)
 - `ANALYSIS.md` — internal review with bug findings and optimization opportunities
 
 ## 2. Project state
