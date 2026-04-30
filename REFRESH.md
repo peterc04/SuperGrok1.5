@@ -1132,9 +1132,8 @@ phases). For the live engineering-remaining list, see §25.
 - Expert load balancing minimal
 
 ### Documentation staleness
-- README test count: says 6 files, actual 8
-- ANALYSIS.md test point count: says 67, actual ~82
-- Codegen relationship to setup.py not visible to readers
+- README test count may drift as new test files are added (§14 is the
+  source of truth; current count: 11 files / ~100 test points).
 
 ## 20. Quick reference
 
@@ -1155,14 +1154,19 @@ phases). For the live engineering-remaining list, see §25.
 
 ### Compile-time constants
 
+Sourced from `csrc/common/types.h`.
+
 | Constant | Value | Used where |
 |----------|-------|------------|
-| `MAX_D_STATE` | 32 | scan state dim cap |
-| `MAX_D_INNER` | 32 | Mamba inner dim cap |
-| `MAX_D_MODEL` | 16 | projection dim cap |
+| `MAX_D_STATE` | 128 | scan state dim cap |
+| `MAX_D_INNER` | 128 | Mamba inner dim cap |
+| `MAX_D_MODEL` | 64 | projection dim cap |
 | `MAX_GRU_HIDDEN` | 8 | GRU hidden cap |
 | `MAX_EXPERT_HIDDEN` | 16 | expert MLP cap |
 | `MAX_TOPK` | 4 | PEER top-k |
+| `MAX_CKPT_INTERVAL` | 32 | bilevel grad-checkpoint cap |
+| `SG2M_BLOCK` | 256 | SG2 forward block size |
+| `SG2B_BLOCK` | 256 | SG2 backward block size |
 | `PSCAN_BLOCK` | 512 | Blelloch threads/block |
 | `PSCAN_THRESHOLD` | 256 | seq vs parallel scan switch |
 | `GEMM_PRECOMPUTE_THRESHOLD` | 1024 | custom vs cuBLAS precompute switch |
@@ -1172,9 +1176,14 @@ phases). For the live engineering-remaining list, see §25.
 - 256 ≤ N < 1024 → `mamba3_parallel_precompute_kernel` + `mamba3_parallel_scan_kernel`
 - N ≥ 1024 → `bilevel_precompute_gemm` (cuBLAS) + `mamba3_parallel_scan_kernel`
 
-### Architecture tier fallback chains
-- NVIDIA: Blackwell → Hopper → Ampere → Generic
-- AMD: CDNA4 → CDNA3 → Generic
+### Architecture policy
+
+No-fallback. `grokking_optimizers/dispatch.py:get_gpu_arch()` returns
+the detected arch from `{80, 89, 90, 100, 103, 120, 942, 950}` or
+raises `UnsupportedArchError`. No tier walking, no generic baseline.
+Each arch links its own per-arch translation unit in `sg::sm<N>` or
+`sg::gfx<N>`; missing arch = build failure or runtime error, not a
+silent fallback to a different kernel.
 
 ### Precision auto-selection chain
 - nvfp4 → mxfp4 → fp8 → bf16 → fp32
@@ -1182,16 +1191,18 @@ phases). For the live engineering-remaining list, see §25.
 ### Where to find
 - Optimizer Python: `grokking_optimizers/<name>.py`
 - Optimizer JAX: `supergrok2_jax_tpu/<name>_jax.py` or in `simple_optimizers_jax.py`/`metanet_optimizers_jax.py`
-- Optimizer kernel: `csrc/cuda/generic/<name>_kernels.cu`
-- Arch-specific kernel: `csrc/cuda/sm_{80,90,100}/<name>_sm{80,90,100}.cu`
-- HIP kernel: `csrc/hip/cdna{2,3,4}/<name>_cdna{2,3,4}.hip.cpp`
-- Common headers: `csrc/common/`
+- Optimizer CUDA kernel (per arch): `csrc/kernels/cuda/sm_{80,89,90,100,103,120}/<name>_sm<N>.cu`
+- Optimizer HIP kernel (per arch): `csrc/kernels/hip/{gfx942,gfx950}/<name>_<arch>.hip.cpp`
+- Optimizer TPU kernel: `csrc/kernels/tpu/{v5p,v6e}/`
+- CPU kernel (testing only): `csrc/kernels/cpu/` + `csrc/kernels/cpu/{avx512,neon}/`
+- Bindings: `csrc/bindings/<optimizer>.cpp`, `csrc/bindings/module.cpp`
+- Common headers: `csrc/common/` (`types.h`, `platform.h`, `ptx_intrinsics.cuh`, `tuned_configs.h`, `fp4_helpers.hip.h`)
 - Quantization kernels: `csrc/quantization/`
-- C++ binding: `csrc/common/ops.h`, `csrc/common/ops.cpp`
-- Tests: `tests/test_<topic>.py`
-- Benchmarks: `benchmarks/<name>.py`
-- Codegen: `codegen/<name>.py` + `kernel_specs.yaml`
-- Build: `setup.py`
+- Autotune: `autotune/` (`tune.py`, `runner.py`, `grids.py`, `cutlass_profile.py`)
+- CUTLASS submodule: `third_party/cutlass/` (init via `git submodule update --init --recursive third_party/cutlass`)
+- Tests: `tests/test_<topic>.py` (see §14)
+- Benchmarks: `benchmarks/<name>.py` and `grokking_race_v2.py` (see §22)
+- Build: `setup.py`, `build.sh`, `pyproject.toml`
 - User docs: `README.md`
 - Internal review: `ANALYSIS.md`
 
