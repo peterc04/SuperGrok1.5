@@ -105,13 +105,13 @@ class TestRaceSplit(unittest.TestCase):
         self.assertTrue(es.step(0.5, 100))
         self.assertEqual(es.stopping_reason, "max_steps")
 
-    def test_early_stopper_val_threshold(self):
-        """EarlyStopper triggers on val_acc threshold with correct reason."""
+    def test_early_stopper_test_threshold(self):
+        """EarlyStopper triggers on test_acc threshold with correct reason."""
         from grokking_race_v2 import EarlyStopper
         es = EarlyStopper(threshold=0.95, max_steps=20000, patience=1)
         self.assertFalse(es.step(0.5, 1))
         self.assertTrue(es.step(0.96, 2))
-        self.assertEqual(es.stopping_reason, "val_acc_threshold")
+        self.assertEqual(es.stopping_reason, "test_acc_threshold")
 
     def test_val_ratio_auto_override_in_pipeline(self):
         """run_pipeline auto-overrides val_ratio to 0.05 on 10/90 when unset."""

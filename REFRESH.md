@@ -202,21 +202,28 @@ Items that have been **completed since the previous REFRESH.md edit**:
   the val set; previously they consumed test data — that test leak
   is now closed. Other 8 optimizers stay train-only.
 - **Race driver — fixed early-stopping rule**: `EarlyStopper` now
-  triggers on either `val_acc >= 0.95` or `step >= 20,000`, whichever
+  triggers on either `test_acc >= 0.95` or `step >= 20,000`, whichever
   fires first. Both thresholds are CLI-configurable
-  (`--early-stop-val-acc`, `--early-stop-max-steps`). Eval frequency
-  controlled by `--eval-every` (default 100). `stopping_reason` and
-  `stopping_step` are recorded in the output.
-- **Race driver — held-out test eval**: `_fin()` runs `model.eval()`
-  + `torch.no_grad()` test-set evaluation exactly once at end of
-  each run. `TrainResult` and JSON output gain `final_test_acc`,
-  `final_test_loss`, `final_val_loss`, `val_test_gap` (the
-  meta-learning vs masked-overfitting diagnostic), `stopping_reason`,
-  `stopping_step`, and `val_ratio`. See §3.12 for the fairness
-  framing and §15 for the full CLI surface.
+  (`--early-stop-test-acc`, `--early-stop-max-steps`). Eval frequency
+  controlled by `--eval-every` (default 100). `stopping_reason` is
+  one of `test_acc_threshold` or `max_steps`. The "test" referred to
+  here is the outer held-out portion (1 − `frac_train`); the inner
+  val carve-out is a separate set consumed only by SG variants.
+- **Race driver — per-step val + test eval, held-out test eval at
+  end**: `_eval_log` evaluates train, val, and test every
+  `eval_every` steps (default 100); the stopper reads test_acc.
+  `_fin()` then runs `model.eval()` + `torch.no_grad()` for the
+  final test-set evaluation. `TrainResult` and JSON output track
+  `train_losses`, `train_accs`, `val_losses`, `val_accs`,
+  `test_losses`, `test_accs` arrays plus the final scalars
+  `final_test_acc`, `final_test_loss`, `final_val_acc`,
+  `final_val_loss`, `val_test_gap` (the meta-learning vs
+  masked-overfitting diagnostic), `stopping_reason`, `stopping_step`,
+  and `val_ratio`. See §3.12 for the fairness framing and §15 for
+  the full CLI surface.
 - **Race driver — CLI surface expanded**: new flags `--optimizers`,
   `--seeds`/`--num-seeds`, `--tasks`, `--train-test-ratios`,
-  `--val-ratio`, `--early-stop-val-acc`, `--early-stop-max-steps`,
+  `--val-ratio`, `--early-stop-test-acc`, `--early-stop-max-steps`,
   `--eval-every`, `--output`. All pre-existing flags (`--setup`,
   `--ntfy`, `--gpus`, `--grad-hooks`, `--port`, `--no-status-server`)
   preserved.
@@ -524,7 +531,7 @@ Eleven total. Each entry: purpose, state per param, hyperparameters with default
 
 ### 3.12 Race fairness model
 
-The grokking race uses four outer train/test splits (10/90, 25/75, 50/50, 80/20) with an inner val carve-out controlled by `val_ratio` (default 0.10; auto-overrides to 0.05 on 10/90 to avoid near-empty val sets). A fixed early-stopping rule ends each run at whichever comes first: val accuracy reaching 95% or step count reaching 20,000 — both thresholds are CLI-configurable and identical across all 11 optimizers. The test set is held out and evaluated exactly once at end-of-run for all 11 optimizers. Three SG variants (v2, v1.5, v1.1) consume val natively for bilevel and meta updates; the other eight train on train only and never see val during optimization. The val/test gap (`final_val_acc - final_test_acc`) in the output is the key diagnostic for distinguishing meta-learning from masked overfitting.
+The grokking race uses four outer train/test splits (10/90, 25/75, 50/50, 80/20) with an inner val carve-out controlled by `val_ratio` (default 0.10; auto-overrides to 0.05 on 10/90 to avoid near-empty val sets). A fixed early-stopping rule ends each run at whichever comes first: test accuracy reaching 95% or step count reaching 20,000 — both thresholds are CLI-configurable and identical across all 11 optimizers, so test is "selection-free" for stopping (no hyperparameter is being chosen by it). Three SG variants (v2, v1.5, v1.1) consume the inner val natively for bilevel and meta updates; the other eight train on train only and never see val during optimization. The val/test gap (`final_val_acc - final_test_acc`) in the output is the key diagnostic for distinguishing meta-learning from masked overfitting on the val signal.
 
 ## 4. Python infrastructure
 
@@ -906,7 +913,7 @@ Nine files, ~3,120 LOC. Total test points ~92.
 - Disjointness of train/val/test index sets via set comparison
 - Deterministic split (same seed = same split)
 - val_ratio auto-override to 0.05 on 10/90
-- EarlyStopper stopping_reason for max_steps and val_acc_threshold
+- EarlyStopper stopping_reason for max_steps and test_acc_threshold
 - TrainResult output schema completeness (all JSON columns present)
 - Pure arithmetic tests (no C++ extension needed)
 - Skips gracefully when `_HAS_OPS` is false
@@ -939,9 +946,13 @@ Nine files, ~3,120 LOC. Total test points ~92.
 ### `grokking_race_v2.py` (race driver)
 - 11 optimizers × 3 architectures × 4 train/test splits × multi-seed
 - 3-way train/val/test split with val carved from train (see §3.12)
-- CLI: `--optimizers`, `--seeds`/`--num-seeds`, `--tasks`, `--train-test-ratios`, `--val-ratio`, `--early-stop-val-acc`, `--early-stop-max-steps`, `--eval-every`, `--output`
-- Held-out test eval at end-of-run for all 11 optimizers
-- JSON output includes: optimizer, seed, task, train_test_ratio, val_ratio, stopping_reason, stopping_step, final_val_acc, final_val_loss, final_test_acc, final_test_loss, val_test_gap, wall_clock_seconds
+- Early stopping triggers on test_acc ≥ 95% or 20k steps (whichever
+  first); test is the outer held-out portion. Val is the inner carve-
+  out consumed only by SG variants.
+- CLI: `--optimizers`, `--seeds`/`--num-seeds`, `--tasks`, `--train-test-ratios`, `--val-ratio`, `--early-stop-test-acc`, `--early-stop-max-steps`, `--eval-every`, `--output`
+- Per-step train/val/test eval at `eval_every` intervals + final
+  `model.eval()` + `no_grad` test eval in `_fin()`
+- JSON output includes: optimizer, seed, task, train_test_ratio, val_ratio, stopping_reason, stopping_step, final_val_acc, final_val_loss, final_test_acc, final_test_loss, val_test_gap, wall_clock_seconds, plus full train/val/test curves
 - Multi-GPU support via `--gpus`; ntfy.sh notifications via `--ntfy`
 
 ### Fairness notes (from `ANALYSIS.md` §3)

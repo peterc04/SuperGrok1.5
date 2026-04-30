@@ -464,16 +464,16 @@ def evaluate(model, x, y, p=97):
 class EarlyStopper:
     def __init__(self, threshold=0.95, max_steps=20_000, patience=500):
         self.threshold=threshold; self.max_steps=max_steps; self.patience=patience
-        self._triggered=False; self._counter=0; self.best_val_acc=0.
+        self._triggered=False; self._counter=0; self.best_test_acc=0.
         self.grokking_step=None; self.grokking_wall=None; self._t0=time.time()
         self.stopping_reason=None; self.stopping_step=None
-    def step(self, val_acc, current_step):
+    def step(self, test_acc, current_step):
         if current_step >= self.max_steps:
             if self.stopping_reason is None:
                 self.stopping_reason="max_steps"; self.stopping_step=current_step
             return True
-        self.best_val_acc = max(self.best_val_acc, val_acc)
-        if val_acc >= self.threshold:
+        self.best_test_acc = max(self.best_test_acc, test_acc)
+        if test_acc >= self.threshold:
             if not self._triggered:
                 if torch.cuda.is_available(): torch.cuda.synchronize()
                 self._triggered=True; self.grokking_step=current_step
@@ -481,7 +481,7 @@ class EarlyStopper:
             self._counter += 1
             if self._counter >= self.patience:
                 if self.stopping_reason is None:
-                    self.stopping_reason="val_acc_threshold"; self.stopping_step=current_step
+                    self.stopping_reason="test_acc_threshold"; self.stopping_step=current_step
                 return True
         else: self._counter=0
         return False
@@ -517,7 +517,8 @@ except Exception:
 
 class TrainResult:
     __slots__ = ("name","seed","steps","train_losses","train_accs",
-                 "val_losses","val_accs","wall_time","total_steps",
+                 "val_losses","val_accs","test_losses","test_accs",
+                 "wall_time","total_steps",
                  "grokking_step","grokking_wall","final_val_acc","final_train_acc",
                  "final_test_acc","final_test_loss","final_val_loss",
                  "stopping_reason","stopping_step","val_test_gap",
@@ -527,6 +528,7 @@ class TrainResult:
         self.frac_train=frac_train; self.val_ratio=val_ratio
         self.steps=[]; self.train_losses=[]; self.train_accs=[]
         self.val_losses=[]; self.val_accs=[]
+        self.test_losses=[]; self.test_accs=[]
         self.wall_time=0.; self.total_steps=0; self.grokking_step=None
         self.grokking_wall=None; self.final_val_acc=0.; self.final_train_acc=0.
         self.final_test_acc=0.; self.final_test_loss=0.; self.final_val_loss=0.
@@ -546,12 +548,15 @@ def _progressive_eval_freq(step, base_freq=10, max_freq=50, scale=0.01, thresh=5
     heat = 1.0 / (1.0 + math.exp(-scale * (step - thresh)))
     freq = max_freq - (max_freq - base_freq) * heat
     return max(base_freq, round(freq))
-def _eval_log(r, step, m, tx, ty, vax, vay, c, st, pb):
-    tl, ta = evaluate(m, tx, ty, c["p"]); vl, va = evaluate(m, vax, vay, c["p"])
+def _eval_log(r, step, m, tx, ty, vax, vay, tex, tey, c, st, pb):
+    tl, ta = evaluate(m, tx, ty, c["p"])
+    vl, va = evaluate(m, vax, vay, c["p"])
+    tel, tea = evaluate(m, tex, tey, c["p"])
     r.steps.append(step); r.train_losses.append(tl); r.train_accs.append(ta)
     r.val_losses.append(vl); r.val_accs.append(va)
-    pb.set_postfix({"trn":f"{ta:.3f}","val":f"{va:.3f}","tl":f"{tl:.3f}","vl":f"{vl:.3f}"}, refresh=False)
-    return st.step(va, step), tl, vl
+    r.test_losses.append(tel); r.test_accs.append(tea)
+    pb.set_postfix({"trn":f"{ta:.3f}","val":f"{va:.3f}","tst":f"{tea:.3f}","tl":f"{tl:.3f}"}, refresh=False)
+    return st.step(tea, step), tl, tel
 def _fin(r, st, step, t0, m, tex, tey, p=97):
     if torch.cuda.is_available(): torch.cuda.synchronize()
     r.wall_time=time.time()-t0; r.total_steps=step
@@ -613,7 +618,7 @@ def train_adamw(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
         if step%eval_every==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,c,st,pb)
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
     pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
@@ -647,7 +652,7 @@ def train_neuralgrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
             aloss=c.get("neural_beta",4.0)*F.cross_entropy(m(ox),oy)
         scaler.scale(aloss).backward(); scaler.step(aopt); scaler.update()
         if step%eval_every==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,c,st,pb)
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
     pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
@@ -667,7 +672,7 @@ def train_grokadamw(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
         if step%eval_every==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,c,st,pb)
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
     pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
@@ -722,7 +727,7 @@ def train_supergrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         except TypeError: opt.step()
         scaler.update()
         if step%eval_every==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,c,st,pb)
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
     pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
@@ -790,7 +795,7 @@ def train_supergrok15(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         except TypeError: opt.step()
         scaler.update()
         if step%eval_every==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,c,st,pb)
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
     pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
@@ -862,7 +867,7 @@ def train_supergrok2(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         except TypeError: opt.step()
         scaler.update()
         if step%eval_every==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,c,st,pb)
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
     pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
@@ -881,7 +886,7 @@ def train_grokfast(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
         if step%eval_every==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,c,st,pb)
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
     pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
@@ -904,7 +909,7 @@ def train_muon(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
         if step%eval_every==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,c,st,pb)
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
     pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
@@ -922,7 +927,7 @@ def train_lion(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
         if step%eval_every==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,c,st,pb)
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
     pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
@@ -949,7 +954,7 @@ def train_looksam(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         opt.step()
         scaler.update()
         if step%eval_every==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,c,st,pb)
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
     pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
@@ -966,7 +971,7 @@ def train_prodigy(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
         if step%eval_every==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,c,st,pb)
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
     pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
@@ -1099,7 +1104,9 @@ def save_json(rbo, save_dir="results", total_wall=None, model_type="decoder", fr
     d={"_meta":{"total_wall":total_wall,"model_type":model_type,"frac_train":frac_train}}
     for name,runs in rbo.items():
         d[name]=[{"seed":r.seed,"steps":r.steps,"train_losses":r.train_losses,"train_accs":r.train_accs,
-            "val_losses":r.val_losses,"val_accs":r.val_accs,"wall_time":r.wall_time,"total_steps":r.total_steps,
+            "val_losses":r.val_losses,"val_accs":r.val_accs,
+            "test_losses":r.test_losses,"test_accs":r.test_accs,
+            "wall_time":r.wall_time,"total_steps":r.total_steps,
             "grokking_step":r.grokking_step,"grokking_wall":r.grokking_wall,
             "final_val_acc":r.final_val_acc,"final_train_acc":r.final_train_acc,
             "final_test_acc":r.final_test_acc,"final_test_loss":r.final_test_loss,
@@ -1550,8 +1557,8 @@ if __name__ == "__main__":
                         help="Use gradient hooks for L2-warm optimizer updates")
     parser.add_argument("--val-ratio", type=float, default=None,
                         help="Fraction of train portion carved out as val (default: 0.10, auto 0.05 on 10/90)")
-    parser.add_argument("--early-stop-val-acc", type=float, default=0.95,
-                        help="Val accuracy threshold for early stopping (default: 0.95)")
+    parser.add_argument("--early-stop-test-acc", type=float, default=0.95,
+                        help="Test accuracy threshold for early stopping (default: 0.95)")
     parser.add_argument("--early-stop-max-steps", type=int, default=20000,
                         help="Max steps before forced stop (default: 20000)")
     parser.add_argument("--eval-every", type=int, default=100,
@@ -1574,7 +1581,7 @@ if __name__ == "__main__":
         run_setup()
 
     DEFAULT_CONFIG["use_grad_hooks"] = args.grad_hooks if hasattr(args, 'grad_hooks') else False
-    DEFAULT_CONFIG["early_stop_threshold"] = args.early_stop_val_acc
+    DEFAULT_CONFIG["early_stop_threshold"] = args.early_stop_test_acc
     DEFAULT_CONFIG["early_stop_max_steps"] = args.early_stop_max_steps
     DEFAULT_CONFIG["eval_every"] = args.eval_every
     if args.val_ratio is not None:
@@ -1685,7 +1692,7 @@ if __name__ == "__main__":
         parallel=False,
         max_steps=args.early_stop_max_steps,
         lr=1e-3,
-        threshold=args.early_stop_val_acc,
+        threshold=args.early_stop_test_acc,
         log_every=10,
         save_dir=args.output,
         gpu_ids=gpu_ids,
