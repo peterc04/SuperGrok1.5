@@ -1,432 +1,219 @@
-# Grokking Race v2 — 11-Optimizer Benchmark with Custom C++/CUDA Kernels
+# SuperGrok2
 
-A comprehensive benchmark suite for studying **grokking** (delayed generalization after memorization) across 11 optimizers, 3 model architectures, and multiple data splits. Includes **SuperGrok v2**, a novel optimizer with a Mamba-3 + PEER + GRU meta-network implemented in custom CUDA kernels.
+SuperGrok2 is a C++/CUDA/HIP optimizer suite for grokking-aware training of
+large neural networks. It ships eleven optimizers spanning AdamW variants,
+sign-momentum, sharpness-aware minimization, Newton-Schulz orthogonalization,
+and a Mamba-3 + PEER + GRU meta-network optimizer (SuperGrok v2 — the
+project's namesake).
 
-## Quick Start
+Every kernel is specialized per GPU architecture. There is no generic
+fallback. Each supported architecture has its own translation unit wrapped in
+its own C++ namespace, and dispatch is decided at runtime against the
+detected device.
 
-```bash
-# 1. Build the C++/CUDA optimizer extension
-pip install -e .
+A JAX/Pallas path provides equivalent semantics on Google TPU. A CPU path
+exists for reference and testing only — it is not a runtime fallback.
 
-# 2. Run the benchmark (single GPU)
-python grokking_race_v2.py
+For deep architecture and engineering notes see `REFRESH.md` (this README
+points to the relevant sections throughout).
 
-# 3. Run (multi-GPU — fast, still fair)
-python grokking_race_v2.py --gpus 0,1,2,3
-```
+## Hardware support
 
-## Optimizers (11)
-
-| Optimizer | Description |
-|-----------|-------------|
-| **SuperGrok v2** | Mamba-3 bidirectional scan + 4-head PEER routing + GRU + 144 experts (custom CUDA) |
-| **SuperGrok v1.5** | 2D sharpness meta-net + SAM + progressive WD (custom CUDA) |
-| **SuperGrok v1.1** | Meta-net with cosine similarity gating (custom CUDA) |
-| **GrokAdamW** | EMA gradient filter + amplification + AdamW (custom CUDA) |
-| **NeuralGrok** | MLP gradient amplifier + AdamW (custom CUDA) |
-| **Prodigy** | Distance-aware self-tuning AdamW (custom CUDA) |
-| **Grokfast** | EMA + gradient amplification (custom CUDA) |
-| **Lion** | Sign-based momentum optimizer (custom CUDA) |
-| **LookSAM** | Sharpness-Aware Minimization with direction caching (custom CUDA) |
-| **Muon** | Momentum + Newton-Schulz orthogonalization (custom CUDA) |
-| **AdamW** | Standard PyTorch AdamW (baseline) |
-
-## SuperGrok v2 Architecture
-
-The meta-network processes per-parameter gradient vectors through:
-
-1. **Sort** by gradient magnitude → creates meaningful sequence for scan
-2. **Bidirectional Mamba-3 Scan** (forward + backward) — trapezoidal discretization, paired RoPE, selective B/C/dt gating — captures cross-element gradient correlations
-3. **Per-element GRU** (4-dim hidden) — temporal memory across optimizer steps
-4. **4-Head PEER Routing** — product-key expert selection (top-4 per sub-key per head, 144 total experts)
-5. **Expert MLP** — per-expert gradient transformation (1 → 16 → 1)
-6. **Skip connection** — `smart_grad = grad + 0.1 * expert_output`
-7. **Adaptive Adam** — bias-corrected first/second moments + weight decay
-
-Additional features: dynamic expert recycling, sigmoid-driven SAM/bilevel/WD scheduling, functional_call SAM (no parameter modification), CUDA batched scan, AMP support.
-
-### Performance Optimizations
-
-- **Blelloch Parallel Prefix Scan**: For parameters with N >= 256 elements, the sequential O(N) scan is replaced with a work-efficient parallel scan achieving O(N/P + log N) time. Uses affine transform composition over paired RoPE state dimensions. Automatically falls back to sequential scan for small parameters.
-- **Expert Weights in Shared Memory**: All 144 expert MLP weights (W1, b1, W2, b2) are loaded into CUDA shared memory at block start, eliminating repeated global memory reads during per-element PEER evaluation.
-- **Expert Backward Shared-Memory Reduction**: Per-block accumulators in shared memory for expert weight gradients, with a single block-level `atomicAdd` at the end — reduces atomic contention by 256x.
-- **Two-Pass GEMM Backward for Projection Weights**: Backward scan weight gradients (d_C_proj_W, d_B_proj_W) use a two-pass approach: Pass 1 writes per-timestep warp-reduced derivative scalars to a global buffer via `__shfl_down_sync`; Pass 2 accumulates via cuBLAS GEMM (`torch::mm_out`). Eliminates N×d_state×d_inner shared-memory atomicAdds per scan direction, replacing them with a single matrix multiply.
-- **Batched Parallel Scan Single-Launch**: For parameters with N >= 256 elements, the per-parameter for-loop of parallel scan kernel launches is replaced with a single `mamba3_parallel_scan_batched_kernel` using a 2D grid `dim3(d_inner, num_params)`. Eliminates num_params kernel launch overhead and enables cross-parameter SM scheduling.
-- **Gradient Checkpointing for Bilevel**: Optional `bilevel_checkpoint_interval` parameter saves Mamba scan states every C steps instead of every step during bilevel forward-save. During backward, intermediate states are recomputed from the nearest checkpoint. With C=32, reduces bilevel saved-state memory by ~82% (1.2 GB → 224 MB for 50 parameters).
-- **Pre-Allocated Bilevel Workspace**: A `thread_local` `BilevelWorkspace` struct reuses temporary buffers (precompute outputs, reversed sort arrays, gradient accumulators) across optimizer steps, eliminating ~100 MB of per-step `torch::empty` allocations for 50 parameters.
-- **ATen GEMM for Projection Precompute**: For parameters with N >= 1024 elements, bilevel precompute projections (input, dt, B, C) use cuBLAS via `torch::mm_out` instead of a custom CUDA kernel. Automatically falls back to the custom kernel for small N where cuBLAS launch overhead dominates.
-- **Dimension Safety Guards**: Runtime `TORCH_CHECK` assertions validate that d_model, d_inner, and d_state do not exceed compile-time maximums (MAX_D_MODEL=16, MAX_D_INNER=32, MAX_D_STATE=32) in all forward and backward launchers.
-
-## Testing
-
-```bash
-python tests/test_supergrok2.py
-```
-
-The PyTorch test suite (`test_supergrok2.py`) covers 27 areas (plus 12 JAX tests in `supergrok2_jax_tpu/tests/`):
-
-| Test | Description |
-|------|-------------|
-| 12A | Import and build verification |
-| 12B | Sequential vs parallel scan numerical equivalence |
-| 12C | Forward step correctness (params changed, no NaN, state populated) |
-| 12D | Bilevel meta-learning correctness |
-| 12E | Two-pass backward equivalence |
-| 12F | Expert recycling stability (50 steps without crash) |
-| 12G | Gradient checkpointing equivalence (checkpoint_interval=1 vs 8) |
-| 12H | Edge cases (N=0, N=1, zero grads, large grads, FP16 params) |
-| 12I | All 11 optimizers construct + step |
-| 12J | Memory leak check (200 steps, <10% growth) |
-| 12K | Two-pass GEMM backward reproducibility (max diff < 1e-4 across seeded runs) |
-| 12L | Batched parallel scan single-launch (finite params, bitwise reproducibility) |
-| 12M | Dispatch detection (Python/C++ GPU architecture agreement) |
-| 12N | Precision config auto-selection |
-| 12O | Projection precision equivalence (FP32 vs auto) |
-| 12P | Dispatch convergence (10 steps) |
-| 12Q | Platform/vendor detection (Python/C++ agreement) |
-| 12R | INT8 symmetric quantization round-trip |
-| 12S | INT4 GPTQ-style packing correctness |
-| 12T | MXFP4 microscaling FP4 quantization |
-| 12U | Dynamic precision selection (stability-aware) |
-| 12V | Expert FP32 passthrough |
-| 12W | Distributed helper methods (DDP hooks, no-op without dist) |
-| 12X | CompiledSuperGrok2 wrapper (warmup/capture/replay) |
-| 12Y | step_compiled method (_prepare_for_compile + step) |
-| 12Z | FSDP exclusion helper (meta-net module marking) |
-| 12AA | Distributed module import and utilities |
-
-Each test reports PASS/FAIL. Exit code 0 = all pass, 1 = any failure.
-
-### Cross-Platform Test Matrix
-
-```bash
-# Test all optimizers on current GPU
-python tests/test_matrix.py
-
-# Test all NVIDIA architecture tiers via FORCE_ARCH
-python tests/test_all_tiers.py
-
-# Test all JAX optimizers
-python tests/test_jax_matrix.py
-```
-
-### Benchmarks
-
-```bash
-# Benchmark all optimizers (step time, memory, throughput)
-python benchmarks/benchmark_supergrok2.py
-
-# Benchmark a single optimizer with larger model
-python benchmarks/benchmark_supergrok2.py --optimizer SuperGrok2 --model-size 512
-
-# Auto-tune kernel configs for current GPU
-python benchmarks/autotune.py
-```
-
-## Model Architectures
-
-- **Decoder Transformer** — causal attention, standard for modular arithmetic grokking
-- **Vision Transformer (ViT)** — patch embeddings for image classification
-- **Mamba SSM** — selective state space model (linear-time sequence processing)
-
-## Directory Structure
-
-```
-./
-├── csrc/
-│   ├── common/                                 # Shared headers and pybind dispatch
-│   │   ├── platform.h                          # CUDA/HIP abstraction layer
-│   │   ├── types.h                             # Affine2x2, constants, common structs
-│   │   ├── utils.cuh                           # warp_reduce_sum, device helpers
-│   │   ├── dispatch.h                          # Runtime GPU arch detection (C++)
-│   │   ├── quantization.h                      # Quantization structs and device helpers
-│   │   ├── ops.h                               # Master C++ declarations
-│   │   └── ops.cpp                             # Pybind11 dispatch
-│   │
-│   ├── cuda/
-│   │   ├── generic/                            # Architecture-independent GPU kernels
-│   │   │   ├── supergrok2_mamba_peer_kernels.cu
-│   │   │   ├── supergrok2_mamba_peer_backward_kernels.cu
-│   │   │   ├── supergrok15_kernels.cu
-│   │   │   ├── supergrok11_kernels.cu
-│   │   │   ├── grokadamw_kernels.cu
-│   │   │   ├── neuralgrok_kernels.cu
-│   │   │   ├── prodigy_kernels.cu
-│   │   │   ├── grokfast_kernels.cu
-│   │   │   ├── lion_kernels.cu
-│   │   │   ├── looksam_kernels.cu
-│   │   │   └── muon_kernels.cu
-│   │   ├── sm_80/                              # Ampere-optimized kernels (TF32)
-│   │   └── sm_90/                              # Hopper-optimized kernels
-│   │
-│   ├── hip/                                    # AMD ROCm/HIP notes and optimizations
-│   │   └── README_HIP.md                       # Wavefront-64 architecture notes
-│   ├── cpu/                                    # CPU fallback kernels (future)
-│   └── quantization/                           # Quantization kernels (future)
-│
-├── supergrok2_jax_tpu/                          # TPU/JAX implementation
-│   ├── __init__.py                              # Package exports
-│   ├── scan.py                                  # Mamba-3 scan via lax.associative_scan
-│   ├── gru.py                                   # Per-element GRU cell
-│   ├── peer.py                                  # Multi-head PEER routing (soft + hard)
-│   ├── mamba3_peer_metanet_jax.py               # Full meta-net forward pass
-│   ├── supergrok2_jax.py                        # Optimizer step (functional)
-│   ├── bilevel.py                               # Bilevel optimization via jax.grad
-│   ├── sharding.py                              # TPU mesh + data-parallel sharding
-│   ├── quantization_jax.py                      # INT8 quantization utilities
-│   ├── bridge.py                                # PyTorch <-> JAX weight conversion
-│   ├── simple_optimizers_jax.py                  # JAX: GrokAdamW, Lion, Grokfast, Prodigy, Muon, LookSAM
-│   ├── metanet_optimizers_jax.py                 # JAX: SuperGrok v1.5, v1.1, NeuralGrok
-│   ├── pallas_kernels.py                         # Pallas custom kernels (with fallback stub)
-│   ├── distributed_example.py                    # Multi-TPU pod training example
-│   └── tests/
-│       └── test_supergrok2_jax.py                # 17-test JAX test suite
-│
-├── grokking_optimizers/                        # Python package
-│   ├── __init__.py                             # Package exports
-│   ├── dispatch.py                             # Runtime hardware + vendor detection
-│   ├── quantization.py                         # PrecisionConfig, INT8/INT4/MXFP4
-│   ├── supergrok2.py                           # SuperGrok v2 optimizer
-│   ├── mamba3_peer_metanet.py                  # Mamba-3+PEER+GRU meta-net
-│   ├── supergrok15.py                          # SuperGrok v1.5 optimizer
-│   ├── supergrok11.py                          # SuperGrok v1.1 optimizer
-│   ├── grokadamw.py                            # GrokAdamW
-│   ├── neuralgrok.py                           # NeuralGrok
-│   ├── prodigy.py                              # Prodigy
-│   ├── grokfast.py                             # Grokfast
-│   ├── lion.py                                 # Lion
-│   ├── looksam.py                              # LookSAM
-│   ├── muon.py                                 # Muon
-│   ├── cuda_graph_optimizer.py                 # CUDA graph wrapper
-│   └── distributed.py                          # DDP/FSDP training utilities
-│
-├── tests/                                      # Test suite
-│   ├── test_supergrok2.py                      # 27-area PyTorch test suite
-│   ├── test_matrix.py                          # Cross-platform optimizer matrix
-│   ├── test_all_tiers.py                       # Multi-tier FORCE_ARCH validation
-│   ├── test_jax_matrix.py                      # JAX optimizer test matrix (10 tests)
-│   ├── test_amd_hip.py                         # AMD ROCm/HIP-specific tests
-│   └── test_cpu_fallback.py                    # CPU fallback path tests
-│
-├── benchmarks/                                 # Performance benchmarks
-│   ├── benchmark_supergrok2.py                 # Step time, memory, throughput
-│   └── autotune.py                             # Per-GPU kernel auto-tuning
-│
-├── setup.py                                    # Build script (CUDA sm_70–sm_90 + ROCm)
-├── pyproject.toml
-├── grokking_race_v2.py                         # Benchmark harness
-├── README.md
-└── ANALYSIS.md
-```
-
-## Configuration
-
-Key SuperGrok v2 hyperparameters (defaults):
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `d_model` | 8 | Meta-net internal dimension |
-| `d_state` | 16 | Mamba state dimension (paired RoPE) |
-| `mamba_expand` | 2 | Expansion factor (d_inner = d_model × expand) |
-| `num_experts` | 144 | Total experts in PEER pool |
-| `expert_hidden` | 16 | Expert MLP hidden dimension |
-| `gru_hidden` | 4 | GRU temporal memory dimension |
-| `num_peer_heads` | 4 | PEER routing heads |
-| `meta_rescale` | 0.1 | Skip connection scale factor |
-| `sam_rho` | 0.05 | SAM perturbation radius |
-| `recycle_interval` | 100 | Steps between dead expert recycling |
-| `bilevel_checkpoint_interval` | 1 | Checkpoint interval for bilevel gradient checkpointing (1 = save every step, 32 = save every 32 steps) |
-| `projection_precision` | `'auto'` | Precision for projection GEMMs: `'fp32'`, `'tf32'`, `'bf16'`, `'fp8'`, `'mxfp4'`, or `'auto'` |
-| `expert_precision` | `'fp32'` | Expert weight quantization: `'fp32'`, `'int8'`, `'int4'`, or `'auto'` |
-| `dynamic` | `False` | Enable dynamic precision selection (progressively lowers precision as training stabilizes) |
-| `bilevel_allreduce_meta_grads` | `True` | All-reduce meta-net gradients across ranks in distributed training |
-| `expert_allreduce_before_recycle` | `True` | All-reduce expert counts before recycling in distributed training |
-| `mamba_state_sync_interval` | 1000 | Steps between mamba state broadcasts (0 = disable) |
-
-## Hardware Support
-
-Kernels are tiered by GPU architecture for automatic hardware-specific optimization:
+The build is AOT (ahead-of-time): kernels are compiled into a single fat
+binary that embeds machine code for every supported architecture. Driver
+JIT from embedded `sm_120` PTX provides forward-compatibility on newer
+NVIDIA hardware.
 
 ### NVIDIA (CUDA)
 
-| Tier | Architectures | Key Features |
-|------|--------------|--------------|
-| **Generic** | sm_70, sm_75 (V100, T4) | FP32 only, basic smem |
-| **Ampere** | sm_80, sm_86, sm_89 (A100, RTX 3090, L4, RTX 4090) | TF32 Tensor Cores, cp.async, 192KB smem, BF16 |
-| **Hopper** | sm_90 (H100) | All Ampere features + FP8 E4M3 cuBLAS GEMMs for projections (CUDA 11.8+), 228KB smem |
-| **Blackwell** | sm_100 (B200) | Hopper path (FP8 + cp.async). TMEM/MMA.2SM/NVFP4 deferred pending hardware access |
+| Arch     | Family                  | Cards                                  |
+|----------|-------------------------|----------------------------------------|
+| `sm_80`  | Ampere                  | A100, A30, A10                         |
+| `sm_89`  | Ada Lovelace            | RTX 40-series, L40, L40S               |
+| `sm_90`  | Hopper                  | H100, H200                             |
+| `sm_100` | Datacenter Blackwell    | B100, B200, GB200                      |
+| `sm_103` | Blackwell Ultra         | B300, GB300 NVL72                      |
+| `sm_120` | Consumer Blackwell      | RTX 50-series, RTX PRO 6000 Blackwell  |
 
 ### AMD (ROCm/HIP)
 
-| Architecture | GPU | Key Features |
-|-------------|-----|--------------|
-| gfx908 | MI100 | Matrix Cores, FP32/FP16 |
-| gfx90a (CDNA2) | MI200 (MI210, MI250, MI250X) | BF16 Matrix Cores, wavefront-64 sync skip in Blelloch scan (via platform.h WARP_SIZE=64) |
-| gfx942 (CDNA3) | MI300X | BF16 MFMA projections, 256MB L2 cache (meta-net weights L2-resident), wavefront-64 scan |
+| Arch     | Family | Cards                |
+|----------|--------|----------------------|
+| `gfx942` | CDNA3  | MI300X, MI300A       |
+| `gfx950` | CDNA4  | MI350X, MI355X       |
 
-All generic kernels compile for both CUDA and HIP via the `platform.h` abstraction layer. AMD uses wavefront-64 (vs CUDA warp-32) — handled automatically via `WARP_SIZE` in `platform.h`. CDNA2 gets intra-wavefront sync skip in the Blelloch scan (strides 1-32 skip `__syncthreads()`). CDNA3 adds BF16 MFMA projections for ~2x throughput. Ampere/Hopper tier kernels are NVIDIA-only.
+### TPU (JAX / Pallas)
 
-Runtime dispatch is automatic — the optimal kernel tier is selected based on the detected GPU.
+| Version | MXU width |
+|---------|-----------|
+| `v5p`   | 128       |
+| `v6e`   | 256       |
 
-## Quantization
+### Not supported
 
-### Projection Precision
+The following are intentionally not supported and the build or runtime
+dispatch will refuse them: V100, T4, RTX 20-series, `sm_86` (RTX 30-series
+silently routes to `sm_80`), MI100 (`gfx908`), MI200 (`gfx90a`), all AMD
+RDNA consumer GPUs, and TPU v3 / v4 / v5e. The CPU build path is for
+testing only.
 
-Projection GEMMs support multi-precision via `projection_precision`:
+## Installation
 
-| Format | Where | Benefit |
-|--------|-------|---------|
-| TF32 | Projections on sm_80+ | 2x FP32 throughput, transparent via cuBLAS |
-| BF16 | Projections on sm_80+ / gfx90a+ | Same range as FP32, 2x bandwidth |
-| FP8 (E4M3) | Projections on sm_89+/sm_90+ | 4x throughput vs FP32 on Tensor Cores |
-| MXFP4 | Projection weights (all GPUs) | 8x compression, Microscaling FP4 with shared exponents |
-
-### Expert Weight Quantization
-
-Expert MLP weights support weight-only quantization via `expert_precision`:
-
-| Format | Compression | Description |
-|--------|------------|-------------|
-| FP32 | 1x | Default, full precision |
-| INT8 | 4x | Symmetric per-tensor quantization (scale = max(\|w\|)/127) |
-| INT4 | 8x | GPTQ-style packing with group scales and zero-points |
-
-### Dynamic Precision Selection
-
-When `dynamic=True`, the optimizer monitors gradient norm stability (coefficient of variation) and progressively lowers precision as training stabilizes. If training becomes unstable, precision is raised back. This is inspired by Unsloth's progressive precision approach.
-
-Scan state accumulation always stays FP32 (numerical necessity for long recurrences).
-
-## Multi-GPU
-
-`--gpus 0,1,2,3` spawns one process per GPU. Tasks are distributed round-robin with exclusive GPU access for fair wall-clock measurements.
-
-## Distributed Training (DDP / FSDP)
-
-SuperGrok v2 supports PyTorch DDP and FSDP for multi-node training.
-
-### DDP
-
-```python
-from grokking_optimizers import SuperGrok2, setup_distributed, wrap_model_ddp
-
-setup_distributed()
-model = wrap_model_ddp(model.cuda())
-opt = SuperGrok2(model.parameters(), lr=1e-3)
-# Training loop works as normal — meta-grad all-reduce is automatic
+```
+git clone https://github.com/peterc04/SuperGrok1.5
+cd SuperGrok1.5
+git submodule update --init --recursive third_party/cutlass
+bash build.sh
 ```
 
-Key features:
-- **Meta-gradient all-reduce**: Bilevel meta-net gradients are averaged across ranks before stepping (controlled by `bilevel_allreduce_meta_grads=True`).
-- **Expert count sync**: Expert activation counts are all-reduced across ranks before recycling dead experts (`expert_allreduce_before_recycle=True`).
-- **Mamba state broadcast**: Periodic broadcast of Mamba scan states from rank 0 to prevent drift (`mamba_state_sync_interval=1000`).
+`build.sh` accepts:
 
-### FSDP
-
-```python
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
-opt = SuperGrok2(model.parameters(), lr=1e-3)
-SuperGrok2.exclude_meta_net_from_fsdp(opt.meta_net)  # Keep meta-net replicated
-model = FSDP(model, auto_wrap_policy=...)
+```
+bash build.sh                # default ninja-backed build
+bash build.sh --autotune     # two-pass build with autotune sweep
+bash build.sh --debug        # cuda-gdb friendly build (-G -O0)
+bash build.sh --profile      # NCU-friendly build + profile_smoke run
 ```
 
-Launch with `torchrun`:
-```bash
-torchrun --nproc_per_node=4 train.py
-```
+Notes:
 
-## torch.compile / CUDA Graph Support
+- Build is AOT only. There is no NVRTC and no runtime kernel compilation.
+- Driver JIT from embedded `sm_120` PTX provides forward-compatibility on
+  newer hardware.
+- `ccache` and `sccache` are auto-detected via
+  `CMAKE_*_COMPILER_LAUNCHER` if present.
+- `WITH_CUTLASS=1` opts into CUTLASS GEMMs on Hopper and Blackwell. The
+  default keeps cuBLAS / rocBLAS until you opt in.
 
-SuperGrok v2 provides a graph-capturable optimizer step via `CompiledSuperGrok2`:
+## Quickstart
+
+A minimal training loop with Lion (the simplest optimizer in the suite):
 
 ```python
-from grokking_optimizers import SuperGrok2, CompiledSuperGrok2
+import torch
+from grokking_optimizers import Lion
 
-opt = SuperGrok2(model.parameters(), lr=1e-3)
-compiled_opt = CompiledSuperGrok2(opt, warmup_steps=3)
+model = torch.nn.Linear(64, 32).cuda()
+opt = Lion(model.parameters(), lr=3e-4)
 
-for step in range(n_steps):
+for x, y in batches:
+    opt.zero_grad()
+    loss = ((model(x) - y) ** 2).mean()
     loss.backward()
-    compiled_opt.step()  # Warmup → capture → replay automatically
+    opt.step()
 ```
 
-Features:
-- **Warmup phase**: First N steps run in eager mode to initialize optimizer state.
-- **CUDA graph capture**: After warmup, the step is captured as a CUDA graph.
-- **Automatic replay**: Subsequent steps replay the graph with zero CPU overhead.
-- **Expert recycling**: Periodically drops to eager mode for dead expert recycling.
-- **Graceful fallback**: Falls back to eager mode if graph capture fails.
-- **torch.compile support**: Optional `enable_compile=True` for `torch.compile` integration.
+## Optimizers
 
-The low-level `step_compiled()` method on `SuperGrok2` is also available for custom graph capture pipelines.
+| Optimizer | Summary |
+|-----------|---------|
+| **Lion** | Sign-momentum optimizer; minimal memory footprint. |
+| **GrokAdamW** | AdamW with grokking-detection scheduling on top. |
+| **NeuralGrok** | Grokking optimizer with a learned 2-layer MLP gradient amplifier. |
+| **Prodigy** | Adaptive learning-rate optimizer that learns its own `d_lr` online. |
+| **Grokfast** | Slow-gradient EMA filter to accelerate the grokking transition. |
+| **LookSAM** | Sharpness-Aware Minimization with periodic perturbation-direction caching. |
+| **Muon** | Newton-Schulz orthogonalization step for 2D parameters. |
+| **SuperGrok v1.1** | Grokking-aware MLP meta-net optimizer (the v1.5 predecessor). |
+| **SuperGrok v1.5** | Grokking-aware MLP meta-net + Lamb trust-ratio + SAM. |
+| **SuperGrok v2** | Mamba-3 + PEER + GRU meta-net optimizer — the project's namesake. |
+| **MoE / Mamba3PEER bindings** | Auxiliary FP4 / FP6 / 2:4-sparsity kernels supporting SG v2 and the MoE expert path. |
 
-## JAX / TPU Support
+For full per-optimizer descriptions see `REFRESH.md §3`.
 
-A complete JAX rewrite of SuperGrok v2 for TPU (and JAX-on-GPU). Uses JAX native primitives instead of CUDA kernels.
+## Build modes
 
-### Key Differences from PyTorch/CUDA
+| Mode         | Effect |
+|--------------|--------|
+| (default)    | AOT fatbin build through ninja. Embeds machine code for every supported arch and `sm_120` PTX for forward-compat. |
+| `--autotune` | Two-pass build. Stub-config build first, then `python autotune/tune.py` sweeps grids and writes winners between the `// AUTOTUNE_BEGIN` / `// AUTOTUNE_END` markers in `csrc/common/tuned_configs.h`, then a final rebuild. |
+| `--debug`    | Compiles with `-G -O0`, suitable for `cuda-gdb` stepping through device code. |
+| `--profile`  | Compiles with `-lineinfo` and runs `ncu --set full` against `benchmarks/profile_smoke.py` (5 steps × all 11 optimizers) so the profile is dropped next to the build. |
 
-| Feature | PyTorch/CUDA | JAX/TPU |
-|---------|-------------|---------|
-| Mamba scan | Sequential CUDA kernel (Blelloch parallel for N>=256) | `lax.associative_scan` (O(log N) depth) |
-| Bilevel backward | 1000+ lines of custom backward CUDA kernels | `jax.grad` (automatic differentiation) |
-| State management | In-place mutation (`tensor.mul_()`) | Functional (explicit state in, state out) |
-| Compilation | `torch.compile` / CUDA graphs | `jax.jit` (XLA compilation) |
-| Multi-device | DDP/FSDP | `jax.sharding.Mesh` with data-parallel axis |
+## Architecture overview
 
-### Usage
+The codebase is split into three layers:
 
-```python
-import jax
-import jax.numpy as jnp
-from supergrok2_jax_tpu import (
-    OptimizerConfig, MetaNetConfig,
-    init_state, init_meta_weights, supergrok2_step,
-)
+- `csrc/bindings/` — per-optimizer dispatchers and the pybind11 module
+  aggregator (`module.cpp`). Each per-optimizer file exposes both a
+  high-level vector-signature entry point (the primary contract used by
+  the Python optimizers) and per-tensor escape hatches used by tests.
+- `csrc/kernels/{cuda,hip,tpu,cpu}/<arch>/` — per-architecture
+  translation units. Each file is wrapped in `namespace sg::<arch>` so
+  the eight GPU arches' kernel and launcher symbols can coexist in one
+  binary without link-time collisions.
+- `csrc/common/` — shared headers (`platform.h`, `types.h`,
+  `bindings.h`, `tuned_configs.h`, `quantization.h`, FP4 helpers).
 
-# Initialize
-config = OptimizerConfig(lr=1e-3)
-meta_config = MetaNetConfig()
-key = jax.random.PRNGKey(0)
-meta_weights = init_meta_weights(meta_config, key)
-opt_state = init_state(params, config, meta_config)
+Runtime architecture detection is centralized in
+`csrc/bindings/dispatch.cpp` in `detect_arch()`, which returns one of
+`{80, 89, 90, 100, 103, 120, 942, 950}` or raises an
+`UnsupportedArchError`. There is no fallback chain. The Python helper
+`grokking_optimizers.dispatch.get_gpu_arch()` mirrors the same contract
+on the Python side.
 
-# Training step (JIT-compatible)
-@jax.jit
-def train_step(params, grads, opt_state, meta_weights):
-    return supergrok2_step(params, grads, opt_state, meta_weights, config, meta_config)
+For the filesystem layout in detail see `REFRESH.md §0`. For the
+per-arch per-optimizer rundown (which kernel lives where, what is
+arch-specific) see `REFRESH.md §24`.
 
-new_params, new_opt_state = train_step(params, grads, opt_state, meta_weights)
+## Testing
+
+Run the full test suite with:
+
+```
+pytest tests/
 ```
 
-### PyTorch <-> JAX Bridge
+Notable test files:
 
-```python
-from supergrok2_jax_tpu import pytorch_weights_to_jax, jax_weights_to_pytorch
+- `tests/test_cross_arch_agreement.py` — verifies math equivalence
+  across every compiled-in architecture by cycling through
+  `FORCE_ARCH=<n>`. This is the regression net against per-arch
+  divergence.
+- `tests/test_all_arches.py` — basic dispatch sanity per arch.
+- `tests/test_amd_hip.py` — `gfx942` / `gfx950` specific paths.
+- `tests/test_cutlass_parity.py` — CUTLASS GEMM output matches cuBLAS
+  within FP tolerance. Skipped automatically when the build was made
+  without `WITH_CUTLASS=1`.
+- Per-optimizer suites such as `tests/test_supergrok2.py` cover
+  optimizer-specific correctness (forward / backward equivalence,
+  bilevel meta-learning, expert recycling, gradient checkpointing,
+  edge cases, memory-leak checks).
 
-# Convert trained PyTorch meta-net to JAX
-jax_weights = pytorch_weights_to_jax(pytorch_meta_net)
+## Contributing
 
-# Convert back
-jax_weights_to_pytorch(jax_weights, pytorch_meta_net)
-```
+To add a new kernel for an existing optimizer on an existing
+architecture:
 
-### JAX Tests
+1. Write the per-arch source under
+   `csrc/kernels/<lang>/<arch>/<your_kernel>.{cu,hip.cpp}` and wrap
+   the file in `namespace sg::<arch>`.
+2. Declare your launcher inside the `DECLARE_*(NS)` macro at the top
+   of the matching `csrc/bindings/<optimizer>.cpp`. The macro is
+   expanded once per supported architecture so every per-arch
+   namespace's launcher is visible to the dispatcher.
+3. Register the public Python-facing entry point in
+   `csrc/bindings/module.cpp` if the optimizer does not already
+   expose it.
+4. Run `pytest tests/test_cross_arch_agreement.py` to make sure your
+   new kernel agrees numerically with the other arches.
 
-```bash
-python supergrok2_jax_tpu/tests/test_supergrok2_jax.py
-```
+The bindings macro pattern (`SG_DISPATCH`, `SG_DISPATCH_CALL`,
+`DECLARE_*`) is described in `REFRESH.md §22`. The list of currently
+registered Python entry points is in `REFRESH.md §22.1`. Engineering
+work that is still open (real per-arch divergence, Hopper FP8 fast
+path, NVFP4 on Blackwell Ultra, autotune sweeps on hardware, CI
+matrix) is tracked in `REFRESH.md §25`.
 
-17 tests covering: imports, associative scan operator, Mamba scan, GRU cell, PEER routing, full forward, optimizer step, bilevel gradients, JIT compilation, INT8 quantization, sharding, pytree compatibility, cross-framework test vectors, all simple optimizers, meta-net optimizers, sharding utilities, and JIT no-retrace verification.
+## License
 
-### Requirements (JAX)
+This project is released under the MIT License. See the `LICENSE`
+file for the full text.
 
-- JAX 0.4+ (`pip install jax[tpu]` for TPU, `pip install jax[cuda12]` for GPU)
-- NumPy
+Acknowledgements:
 
-## Requirements
-
-- PyTorch 2.0+ with CUDA or ROCm support
-- **NVIDIA**: CUDA 11.8 or 12.x — GPU architectures: V100 (sm_70), T4 (sm_75), A100 (sm_80), RTX 3090 (sm_86), RTX 4090 (sm_89), H100 (sm_90)
-- **AMD**: ROCm 5.4+ (recommended 6.0+) — GPU architectures: MI100 (gfx908), MI200 (gfx90a), MI300X (gfx942)
+- The JAX and Pallas teams at Google for the TPU primitives that the
+  `csrc/kernels/tpu/` path is built on.
+- The NVIDIA CUTLASS team for the GEMM template library used in the
+  Hopper- and Blackwell-class projection and Newton-Schulz paths
+  (enabled with `WITH_CUTLASS=1`).
