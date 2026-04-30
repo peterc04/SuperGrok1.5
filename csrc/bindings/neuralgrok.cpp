@@ -1,9 +1,9 @@
 // bindings/neuralgrok.cpp — runtime dispatch to per-arch NeuralGrok launchers.
 //
-// TODO(structural-refactor): the amplifier MLP launchers vary by hidden-dim
-// templating; the current bindings expose the generic untemplated entry
-// point. Templated specializations (H=16/32/64/128) are dispatched inside
-// the per-arch launcher.
+// The amplifier MLP launchers vary by hidden-dim templating; the bindings
+// expose the generic untemplated entry point and the templated
+// specializations (H=16/32/64/128) are dispatched inside the per-arch
+// launcher itself rather than at the binding boundary.
 
 #include "_dispatch_macro.h"
 #include "_helpers.h"
