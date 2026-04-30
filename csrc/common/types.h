@@ -15,11 +15,14 @@
 // ═══════════════════════════════════════════════════════════════════════
 //  BatchedScanCtx — shared bookkeeping for the batched mamba peer step
 //
-//  Recovered from the deleted csrc/common/ops.h@682eab4^. The setup
-//  helper batched_step_setup_and_sort builds one of these per call;
+//  Recovered verbatim from the deleted csrc/common/ops.h@682eab4^. The
+//  setup helper batched_step_setup_and_sort builds one of these per call;
 //  the scan + fused-elem helpers consume it. Per-arch variants in
 //  csrc/kernels/{cuda,hip}/<arch>/supergrok2_fwd_*.{cu,hip.cpp}
 //  expect this exact layout.
+//
+//  Layout (14 members): 3 int + 2 std::vector<int>
+//                     + 8 torch::Tensor + 1 std::vector<torch::Tensor>.
 // ═══════════════════════════════════════════════════════════════════════
 
 struct BatchedScanCtx {
