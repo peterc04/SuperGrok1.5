@@ -944,29 +944,53 @@ Development-time scripts. Generated outputs are checked in; not run at build.
 
 ## 18. Recent commits
 
-Newest first.
+The full migration commit series lives in §0 ("Migration commit
+series"). High-level summary by phase, oldest first:
 
-- **`ea968b6`** — Fix critical bugs and apply optimizations across all optimizer components
-  - NeuralGrok: fix `_single_param_step` crash (wrong function name, missing `step_list`)
-  - JAX/TPU Pallas: fix tile corruption, infinite recursion in persistent scan
-  - SuperGrok v2: replace `except Exception: pass` with `RuntimeError` + warning
-  - C++ `dispatch.h`: fix AMD GCN arch parsing for 3-digit codes
-  - C++ `ops.cpp`: batch CPU syncs, vectorize Mamba-3 inner loops, cache `g × d_lr` in Prodigy
-  - Python fallback: eliminate `.item()` calls in hot path
+**Phase 1 — All-specialized refactor (4-arch).**
+`895c32e` REFACTOR_PLAN.md → `682eab4` delete `csrc/common/{ops.h,
+ops.cpp,dispatch.h}`. Created `csrc/{common,bindings,kernels}/`
+tree, namespaced 4 GPU arches (sm_80, sm_90, sm_100, gfx942), wrote
+the bindings layer with per-optimizer dispatchers, deleted the
+generic-kernel tier and the runtime JIT package. Cross-arch
+agreement test introduced.
 
-- **`a6323c9`** — Fix `_single_param_step` bugs in muon, prodigy, grokadamw
+**Phase 2 — §10 arch-matrix expansion.**
+`dd1e0a6` REFACTOR_PLAN §10 → `58b9e54` extend tests for sm_89/103/
+120 + gfx950. Added Ada (sm_89), Blackwell Ultra (sm_103), Consumer
+Blackwell (sm_120), and CDNA4 (gfx950) — total 8 GPU arches +
+2 TPU versions. Bindings layer extended; `tuned_configs.h` widened
+4→8 rows; CDNA4 FP4/FP6/2:4 sparsity overlay recovered.
 
-- **`6c48166`** — Fix potential out-of-bounds read in AMD `gcnArchName` parsing (3-digit codes)
+**Phase 3 — overlay merges + binding restoration.**
+`6c7eaac` clean stale Python imports → `f1e1f94` REFRESH.md sweep
+with §21–§23. Folded all 19 `*_overlay.*` files into per-arch
+namespaces (3 inlined into canonicals — Muon Ampere TF32 / Hopper
+FP8 / CDNA3 BF16 MFMA — 3 deleted as trivial delegators, 13 renamed
++ namespace-wrapped + their bodies inlined into canonicals).
+Restored the 11 high-level vector-signature entry points + 6 SG v2
+entries from the deleted `ops.cpp`. Wired ninja AOT build with
+multi-arch fatbin + tqdm progress bar in `build.sh`. Implemented
+autotune `bench()` and `cutlass_profile.profile_gemm()`. Scaffolded
+CUTLASS submodule (v3.6.0) with WITH_CUTLASS=1 opt-in and Muon NS +
+SG2 5-projection GEMM wiring.
 
-- **`dbe3ef4`** — Fix 9 bugs and apply FP32 skip optimization across optimizer suite (skip `.to(kFloat32)` when already FP32)
-
-- **`1d930db`** — Wire dead fused kernels and eliminate Python `adamw_step` bottleneck
+**Phase 4 — fix-up and documentation.**
+`382c239` BatchedScanCtx audit → this REFRESH.md restructure.
+Restored Hopper FP8 fast path on sm_90 by recovering the deleted
+helpers from git history (commit `980c2d8`) and inlining them into
+the canonical batched_step launcher. Audited SG11/SG15/Muon
+binding signatures (zero drift found). Audited BatchedScanCtx
+struct layout (zero drift; comment correction only). Rewrote
+README.md against post-refactor state. Restructured this file:
+deleted §6–§10 (pre-refactor arch-specific sections), folded §21
+/§22/§23 into §0/§0.5, refreshed §1–§5 against the current tree.
 
 ### Trajectory
-- Architecture settled, focus on hot-path performance and correctness
-- Recent: kernel fusions, register-resident intermediates, non-temporal I/O, reduction kernel improvements
-- Architecture coverage: Hopper FP8 added, CDNA3 BF16 MFMA added, Blackwell + CDNA4 scaffolded
-- Bug fix backlog draining: silent exception swallowing, redundant forward passes, meta-net device placement, `id`-based caching fragility, single-param-step bugs
+- Architecture is settled: 8 GPU arches + 2 TPU versions, no fallback chain, no generic kernels.
+- Build/test infrastructure complete: ninja, AOT fatbin, tqdm progress, autotune+profile modes, CUTLASS submodule, parity tests.
+- Real per-arch divergence: Muon (TF32/FP8/BF16 MFMA), SG2 (cp.async on sm_80, FP8 on sm_90, TMA scaffolding on sm_100, BF16 MFMA on gfx942, FP4 expert on gfx950), gfx950 CDNA4 split into per-feature files.
+- What's left is hand-tuning per cell, real autotune output on hardware, raising MAX_D_* caps to activate Hopper FP8, and CI matrix wiring. See §25.
 
 ## 19. Known gaps
 
@@ -1115,22 +1139,31 @@ GEMMs would give the largest wins on consumer Ada. Gotcha: L40S
 lacks NVLink, so the `distributed_*pipeline` files fall back to
 PCIe ring all-gather.
 
-**sm_90 (Hopper — H100 / H200):** canonical math plus FP8 E4M3
-CUTLASS GEMMs for the five projections when `WITH_CUTLASS=1` is
-set. The warp-specialized scan kernel
+**sm_90 (Hopper — H100 / H200):** canonical math plus a Hopper FP8
+E4M3 fast path inlined into the canonical `launch_mamba3_peer_batched_step`
+(§0.5 — Fix 1 of the latest session). FP8 helpers
+(`hopper_fp8_gemm`, `hopper_precompute_fp8` via `cublasGemmEx` with
+`CUDA_R_8F_E4M3` inputs and FP32 accumulation) live as `static`
+helpers inside `sg::sm90`, gated on `CUDA_VERSION >= 11080`. The FP8
+path activates when `total_N >= GEMM_PRECOMPUTE_THRESHOLD` (1024) and
+`d_inner / d_state / d_model >= 64`; otherwise the existing FP16/FP32
+precompute kernel runs. The warp-specialized scan kernel
 (`launch_scan_warp_specialized` and `launch_scan_warp_specialized_d16`
 in `supergrok2_warp_specialized_sm90.cu`) is declared in the
 `sg::sm90` namespace but is **not yet wired** into the canonical
-`launch_mamba3_peer_batched_step` — see §25. Shared memory is 228
+`launch_mamba3_peer_batched_step` — see §25. With `WITH_CUTLASS=1`
+the GEMM path can also go through CUTLASS sm_90a's FP16/BF16
+implementations as an alternative to cuBLAS FP8; both produce the
+correct output, the choice is per-build today. Shared memory is 228
 KB per SM (Hopper's bonus); register pressure tighter (~80 per
 thread to keep 2 blocks/SM at the launch bounds). TMA descriptors
 are scaffolded in `supergrok2_precompute_sm100.cu` but not on
-sm_90. GEMMs: CUTLASS sm_90a (FP8 E4M3 inputs, FP32 accumulate)
-when opted in, else cuBLAS. Hand-tune: warp-specialization
-producer/consumer ratio; CTA cluster size (Hopper supports 16-CTA
-clusters via DSMEM); tail-effect on small batches. Gotcha: the
-suffixed-launcher's non-FP8 fallback referenced `ampere_*` symbols
-visible only from `sg::sm80`; full FP8 inline is deferred — see §25.
+sm_90. Hand-tune: warp-specialization producer/consumer ratio; CTA
+cluster size (Hopper supports 16-CTA clusters via DSMEM); tail-effect
+on small batches. **Gotcha:** the FP8 path will not actually activate
+in practice until the `MAX_D_MODEL=16` / `MAX_D_STATE=32` /
+`MAX_D_INNER=32` caps in `csrc/common/types.h` are raised above 64
+(the FP8 dim threshold). See §25.
 
 **sm_100 (Datacenter Blackwell — B100 / B200 / GB200):** canonical
 math; TMA-pre-compute scaffolding lives in
@@ -1623,18 +1656,22 @@ and CUTLASS migration scaffolding are now complete. What remains is
 real per-arch hand-tuning and a small set of items that need
 hardware to validate. Rough order of expected payoff:
 
-**1. Hopper FP8 fast-path inlining for SG2 batched step.** The
-`launch_mamba3_peer_batched_step_hopper` body had real FP8 E4M3
-projections via `cublasGemmEx` (helpers `hopper_fp8_gemm` and
-`hopper_precompute_fp8`) but its non-FP8 fallback called
-`ampere_batched_scan_and_fused_elem` — defined only in `sg::sm80`
-and invisible from `sg::sm90` at link time. To activate, the
-fallback path needs restructuring: either copy the `ampere_*`
-helpers into `sg::sm90` (preferred — keeps math identical), or
-replace the batched_step with a direct in-namespace pipeline that
-matches sm_80's structure. After that, the FP8 helpers can be
-inlined into the canonical body. Expected ~2× over the current
-torch::mm on H100.
+**1. Raise type-cap constants so the Hopper FP8 path actually
+activates.** Fix 1 of the latest session restored the FP8 helpers
+(`hopper_fp8_gemm`, `hopper_precompute_fp8`) and inlined them into
+the canonical `launch_mamba3_peer_batched_step` on sm_90 with
+gating `total_N >= 1024 && d_inner/d_state/d_model >= 64`. However,
+`csrc/common/types.h` currently caps `MAX_D_MODEL = 16`,
+`MAX_D_STATE = 32`, `MAX_D_INNER = 32` — all below the 64 threshold.
+The FP8 fast path is therefore wired but unreachable in practice
+until those caps are raised. Raising the caps requires verifying
+that downstream kernels (sg::sm80 cp.async pipelined weight load,
+sg::gfx942 BF16 MFMA precompute, sg::gfx950 FP4 expert MFMA, etc.)
+all handle the larger templated shapes — most do, since the caps
+are consumed via `template <int D_INNER> __launch_bounds__(...)`
+and the per-arch baseline kernels iterate up to `MAX_D_*`. Expected
+~2× over the current FP16 torch::mm path on H100/H200 once the
+caps are raised, then real-world `d_state=128` workloads fit.
 
 **2. Hopper warp-specialized scan activation.** The
 `launch_scan_warp_specialized` and `launch_scan_warp_specialized_d16`
