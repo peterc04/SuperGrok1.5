@@ -810,7 +810,7 @@ Functional rewrite of the suite. ~300 lines of core logic vs ~2000 lines of CUDA
 
 ## 14. Tests
 
-Nine files, ~3,120 LOC. Total test points ~92.
+Eleven files, ~3,400 LOC. Total test points ~100.
 
 > **Post-refactor update.** `tests/test_cross_arch_agreement.py` — the
 > safety net for the all-specialized refactor — is no longer a stub.
@@ -820,7 +820,7 @@ Nine files, ~3,120 LOC. Total test points ~92.
 > not compiled into the local extension are skipped. The Muon harness
 > uses 2D params (64×64 matrix) since its Newton-Schulz orthogonalization
 > requires `dim ≥ 2`. The whole class skips if no GPU is available.
-> See §0.5 + §21 for what arches are expected to agree.
+> See §0.5 for what arches are expected to agree.
 
 > The legacy CPU-fallback test `tests/test_cpu_fallback.py` had a
 > `test_setup_cpu_sources` checker that referenced `csrc/cpu/generic/`
@@ -862,9 +862,25 @@ Nine files, ~3,120 LOC. Total test points ~92.
 - 5 steps per config, validates no NaN, measures step time
 - Honors `FORCE_ARCH` env var
 
-### `test_all_tiers.py`
-- Validates dispatch correctness across NVIDIA tiers (generic, Ampere, Hopper)
-- Sets `SUPERGROK_FORCE_ARCH` and runs `test_matrix.py` for each
+### `test_all_arches.py`
+- Validates dispatch correctness across the eight supported arches
+  (sm_80, sm_89, sm_90, sm_100, sm_103, sm_120, gfx942, gfx950)
+- Sets `FORCE_ARCH` and runs the per-arch step path for each
+- No tier walk — each arch tests its own per-arch TU directly
+
+### `test_cross_arch_agreement.py`
+- Asserts elementwise `allclose()` of optimizer step outputs across
+  every available `FORCE_ARCH` for each of the 11 optimizers
+- Tolerance `1e-4`; Muon harness uses 2D params (64×64) per its
+  Newton-Schulz dim ≥ 2 requirement
+- Arches not compiled into the local extension are skipped; class
+  skips if no GPU available (see prose block above)
+
+### `test_cutlass_parity.py`
+- Verifies CUTLASS-backed GEMM paths produce identical results to
+  the non-CUTLASS reference at FP32 / BF16 / FP16
+- Skipped unless `WITH_CUTLASS=1` was set at build time
+- Honors `FORCE_ARCH` for the sm_90a/sm_100a/sm_103a/sm_120a paths
 
 ### `test_cpu_fallback.py` (12 sections)
 - `_HAS_*` flag sanity
@@ -881,11 +897,11 @@ Nine files, ~3,120 LOC. Total test points ~92.
 - 10 JAX optimizers, validates param changes and no NaN
 
 ### `test_amd_hip.py` (6 sections)
-- `platform.h` adherence (no raw CUDA in generic)
-- AMD tier detection via FORCE_ARCH
-- PrecisionConfig auto for CDNA2/3 (BF16)
+- `platform.h` adherence (HIP-only; no raw CUDA)
+- AMD arch detection via FORCE_ARCH for `{942, 950}`
+- PrecisionConfig auto: gfx942 (CDNA3) → BF16, gfx950 (CDNA4) → FP4
 - `get_amd_label()` GPU labels
-- GCN arch parsing (MI100/MI250/MI300X, three-digit codes)
+- GCN arch parsing (gfx942 → MI300X; gfx950 → MI350X)
 - Wavefront-64 sync skip behavior
 
 ### `test_new_features.py` (7 sections)
