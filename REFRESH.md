@@ -1,4 +1,4 @@
-# REFRESH.md — SuperGrok1.5 Reference
+# REFRESH.md — SuperGrok2 Reference
 
 A compact, granular catch-up. Plain language. Each kernel, file, and optimizer gets its own entry. No fluff, no withholding.
 
