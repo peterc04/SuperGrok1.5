@@ -976,64 +976,113 @@ Eleven files, ~3,400 LOC. Total test points ~100.
 
 ## 16. Codegen
 
-Development-time scripts. Generated outputs are checked in; not run at build.
-
-### `generate_kernels.py`
-- Generates GrokAdamW Q3 kernels (INT8 per-block exp_avg + BF16 stochastic-rounded)
-- Generates `compute_absmax_scale_kernel.cu`
-- Generates `muon_update_generated.cu` with non-temporal I/O
-- Scalar (S) and float4 (V) variants
-
-### `generate_sg2_kernels.py`
-- Template-based from `kernel_specs.yaml`
-- Generates Ampere (sm_80) and Hopper (sm_90) optimizer kernel variants
-- Features: cp.async (Ampere), FP8 E4M3 (Hopper)
-- Output goes to `csrc/cuda/sm_80/` and `csrc/cuda/sm_90/`
-
-### `kernel_specs.yaml`
-- Lists 12+ optimizer specs
-- Each spec: block_size, launch_bounds, state vars + quantization formats, scalars, update math
-- Variant axes: GPU (S_F_D, V_F_D, S_Q_D, V_Q_D, S_F_M, V_F_M, S_Q_M, V_Q_M), CPU (cpu_F, cpu_Q)
-- Templates use placeholders: STATE_LOAD/STORE, PARAM_LOAD/STORE, GRAD_STORE, EXTRA_LOAD
-- GrokAdamW has 16 GPU + 2 CPU variants
-
-### `common_macros.j2`
-- Jinja2 macros: synchronization, warp reductions, memory access patterns
+Codegen tooling (`codegen/`, `kernel_specs.yaml`, `generate_kernels.py`,
+`generate_sg2_kernels.py`, `common_macros.j2`) was removed in commit
+`104f3ff`. Kernels are now hand-written per-arch under `csrc/kernels/`
+and there is no template-driven generation step.
 
 ## 17. Build
 
-`setup.py` at repo root.
+`setup.py` at repo root, wrapped by `build.sh`. AOT-only model: no
+NVRTC, no JIT codegen. Driver JIT is allowed for forward-compat
+(`compute_120` PTX is embedded so future arches above sm_120 can
+still launch the kernels).
 
-### Backend detection
-- HIP: `torch.version.hip is not None`
-- CUDA: `torch.cuda.is_available()` (or `FORCE_CUDA=1` for build-only)
-- Falls back to CPU otherwise
+### `build.sh` — wrapper modes
 
-### CUDA path (WITH_CUDA)
-- Generic sources: 18 files (optimizer kernels, distributed scan, MoE, quantization)
-- sm_80: 6 files (cp.async scan, backward, fused_elem, optimizers, cpasync variants, muon)
-- sm_90: 5 files (FP8 scan, backward, warp-specialized, optimizers, muon)
-- sm_100: 3 files (TMA kernels)
-- Auto-detects generated sources in `csrc/cuda/generated/`
-- Flags: `nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr`
-- Arches: `-gencode arch=compute_{70,75,80,86,89,90,100},code=sm_*`
-- Override: `TORCH_CUDA_ARCH_LIST` env var
+The wrapper is a thin shell over `pip install -e . --no-build-isolation -v`
+that adds tqdm-formatted ninja progress, log capture, and post-build
+steps. Modes:
 
-### HIP path (WITH_HIP)
-- Generic sources: same 18
-- CDNA-specific: gfx90a (CDNA2), gfx942 (CDNA3, 3 files), gfx950 (CDNA4, 1 file)
-- Flags: `hipcc -O3 -std=c++17 --offload-arch=gfx908,gfx90a,gfx942,gfx950`
+- `./build.sh` — default, plain release build.
+- `./build.sh --autotune` — two-pass: stub-config build, run
+  `python autotune/tune.py` to sweep grids on the local hardware,
+  write winners between `// AUTOTUNE_BEGIN` / `// AUTOTUNE_END`
+  markers in `csrc/common/tuned_configs.h`, then rebuild.
+- `./build.sh --no-autotune` — explicit single-pass (default).
+- `./build.sh --debug` — `CUDA_DEBUG=1`, `-G -O0 -lineinfo`,
+  fast-math off, retains debug symbols.
+- `./build.sh --profile` — release build, then runs `ncu --set full`
+  for a NCU profile capture.
+- `./build.sh --package` — build, then stage a redistributable
+  `dist/` tree (mirrors runtime layout: `grokking_optimizers/_ops*.so`,
+  Python sources, `supergrok2_jax_tpu/`, `csrc/kernels/tpu/`,
+  `csrc/common/tuned_configs.h`, `INSTALL.md`).
+- `./build.sh --package-tarball` — `--package` + writes
+  `supergrok2-3.0.0-<sha>.tar.gz`.
 
-### CPU path
-- 7 core sources + generated
-- SIMD: AVX-512 (x86_64) or NEON (ARM64) detected via `-march=native`
-- Flags: `g++ -O3 -std=c++17 -fopenmp -ffast-math -funroll-loops`
-- OpenMP parallelism at parameter level
+`MAX_JOBS=$(nproc)` parallel ninja jobs by default.
 
-### Total
-- ~67 source files on CUDA path
-- Clean CUDA build for full arch matrix: several minutes
-- Editable install: `pip install -e .`
+### `setup.py` — extension build
+
+`BuildExtension.with_options(use_ninja=True)` for parallel
+`[N/M]` progress that `build.sh` parses into a tqdm bar. Walks
+the new `csrc/kernels/` tree (never the deleted `csrc/cuda/generic/`).
+Source list:
+
+- `csrc/bindings/*.cpp` — pybind11 dispatchers (one per optimizer
+  + `module.cpp`)
+- `csrc/kernels/cuda/sm_{80,89,90,100,103,120}/*.cu` — eight per-arch
+  CUDA TUs each in its own `sg::sm<N>` namespace
+- `csrc/kernels/hip/{gfx942,gfx950}/*.hip.cpp` — two per-arch HIP
+  TUs in `sg::gfx<N>`
+- `csrc/kernels/cpu/*.cpp` plus `csrc/kernels/cpu/avx512/*.cpp`,
+  `csrc/kernels/cpu/neon/*.cpp` (testing-only; not a runtime fallback)
+- `csrc/quantization/*.cpp/*.cu` — quantization helpers
+- Include dirs: `csrc/common`, `csrc/bindings`, `csrc/kernels/cpu`, `csrc`
+
+### Compiler flags
+
+- nvcc: `-O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr
+  -lineinfo -Xptxas -O3 -Xptxas --warn-on-spills`
+- nvcc gencode (multi-arch fatbin AOT): `-gencode
+  arch=compute_X,code=sm_X` for every X in
+  `{80, 89, 90, 100, 103, 120}`, plus a final
+  `-gencode arch=compute_120,code=compute_120` to embed PTX for
+  forward-compat driver JIT.
+- hipcc: `--offload-arch=gfx942,gfx950 -O3 -std=c++17 -ffast-math`
+- g++ (CPU): `-O3 -std=c++17 -fopenmp -ffast-math -funroll-loops`
+  with auto-detected `-march=native` for AVX-512 / NEON.
+
+### ccache / sccache
+
+`CMAKE_C_COMPILER_LAUNCHER` and `CMAKE_CUDA_COMPILER_LAUNCHER` env
+vars are honored when set. Ninja accepts the launcher and routes
+calls through ccache or sccache transparently. Clean rebuilds drop
+to seconds with a warm cache.
+
+### CUTLASS (opt-in)
+
+`WITH_CUTLASS=1 ./build.sh` enables the CUTLASS-backed GEMM paths.
+Requires `git submodule update --init --recursive third_party/cutlass`
+first. `setup.py` adds CUTLASS include dirs and
+`-DCUTLASS_NVCC_ARCHS=90a/100a/103a/120a` when the flag is set. The
+`csrc/kernels/cuda/_cutlass_gemm.cuh` thin wrapper provides the
+canonical entry points; `tests/test_cutlass_parity.py` checks
+agreement against the non-CUTLASS path.
+
+### Tuned configs
+
+`csrc/common/tuned_configs.h` holds per-arch `LaunchConfig` tables
+(grid/block/smem) consumed by every per-arch launcher. The
+hand-coded baseline values match each arch's `__launch_bounds__`.
+Autotune output replaces values between the
+`// AUTOTUNE_BEGIN` / `// AUTOTUNE_END` markers; the rest of the
+table stays as the hand-tuned fallback.
+
+### `pyproject.toml`
+
+`build-system.requires` includes `ninja`, plus the standard pytorch
+extension build deps. Version pinned to `3.0.0` (breaking from the
+1.x → 2.x → 3.x refactor sequence).
+
+### Installation
+
+- Editable: `bash build.sh` then `pip install -e .` (handled by the
+  wrapper)
+- Distributable tarball: `bash build.sh --package-tarball` produces
+  `dist/` plus `supergrok2-3.0.0-<sha>.tar.gz` for direct GitHub
+  release upload. Three documented install paths in `dist/INSTALL.md`.
 
 ## 18. Recent commits
 
