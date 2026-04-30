@@ -178,6 +178,21 @@ list and §24 for the per-arch per-optimizer plan.
 
 Items that have been **completed since the previous REFRESH.md edit**:
 
+- **Fix 1 — Binding signature re-audit**: SG11, SG15, and Muon
+  binding signatures verified against all 8 per-arch launchers and
+  the pre-refactor `682eab4^:csrc/common/ops.cpp`. Zero drift found.
+- **Fix 2 — Muon neg_lr_scale anomaly**: the binding wrapper in
+  `muon.cpp` had an erroneous `/ sqrt(max_dim)` that cancelled the
+  spectral scaling, producing `-lr * 0.2` instead of the correct
+  `-lr * 0.2 * sqrt(max_dim)`. Bug was present since the original
+  `ops.cpp` and faithfully copied during refactor. Fixed in binding.
+- **Fix 3 — MAX_D caps raised**: `MAX_D_MODEL` 16→64,
+  `MAX_D_STATE` 32→128, `MAX_D_INNER` 32→128. Activates the Hopper
+  FP8 path (gated on `d_inner/d_state/d_model >= 64`) and supports
+  real-world `d_state=128` workloads. No shared memory overflow —
+  all MAX_D-sized arrays are thread-private. Four CPU kernel files
+  and one sm_90 warp-specialized file had local shadow constants
+  synced.
 - **SG v2 bindings**: all seven SG2 entry points
   (`supergrok2_mamba_peer_step`, `supergrok2_mamba_peer_batched_step`,
   `supergrok2_bilevel_fwd_save{_batched}`,
@@ -474,6 +489,10 @@ Eleven total. Each entry: purpose, state per param, hyperparameters with default
 - Trained by SuperGrok v2's bilevel update
 - Has full pure-PyTorch CPU fallback path
 
+### 3.12 Race fairness model
+
+The grokking race uses four outer train/test splits (10/90, 25/75, 50/50, 80/20) with an inner val carve-out controlled by `val_ratio` (default 0.10; auto-overrides to 0.05 on 10/90 to avoid near-empty val sets). A fixed early-stopping rule ends each run at whichever comes first: val accuracy reaching 95% or step count reaching 20,000 — both thresholds are CLI-configurable and identical across all 11 optimizers. The test set is held out and evaluated exactly once at end-of-run for all 11 optimizers. Three SG variants (v2, v1.5, v1.1) consume val natively for bilevel and meta updates; the other eight train on train only and never see val during optimization. The val/test gap (`final_val_acc - final_test_acc`) in the output is the key diagnostic for distinguishing meta-learning from masked overfitting.
+
 ## 4. Python infrastructure
 
 ### `dispatch.py`
@@ -753,7 +772,7 @@ Functional rewrite of the suite. ~300 lines of core logic vs ~2000 lines of CUDA
 
 ## 14. Tests
 
-Eight files, ~2,964 LOC. README still says six (stale). Total test points ~82.
+Nine files, ~3,120 LOC. Total test points ~92.
 
 > **Post-refactor update.** `tests/test_cross_arch_agreement.py` — the
 > safety net for the all-specialized refactor — is no longer a stub.
@@ -849,6 +868,16 @@ Eight files, ~2,964 LOC. README still says six (stale). Total test points ~82.
 - PipelinedOptimizer equivalence
 - training_benchmark script error-free
 
+### `test_race_split.py` (10 sections)
+- Split arithmetic for 80/20+10% and 10/90+5% configurations
+- Disjointness of train/val/test index sets via set comparison
+- Deterministic split (same seed = same split)
+- val_ratio auto-override to 0.05 on 10/90
+- EarlyStopper stopping_reason for max_steps and val_acc_threshold
+- TrainResult output schema completeness (all JSON columns present)
+- Pure arithmetic tests (no C++ extension needed)
+- Skips gracefully when `_HAS_OPS` is false
+
 ### Notable gap
 - No explicit fused-CUDA-vs-Python-fallback bitwise/numerical agreement test (called out in `ANALYSIS.md`)
 
@@ -874,10 +903,18 @@ Eight files, ~2,964 LOC. README still says six (stale). Total test points ~82.
 - Reports loss/accuracy curves over time
 - For comparing convergence speed and memory efficiency
 
+### `grokking_race_v2.py` (race driver)
+- 11 optimizers × 3 architectures × 4 train/test splits × multi-seed
+- 3-way train/val/test split with val carved from train (see §3.12)
+- CLI: `--optimizers`, `--seeds`/`--num-seeds`, `--tasks`, `--train-test-ratios`, `--val-ratio`, `--early-stop-val-acc`, `--early-stop-max-steps`, `--eval-every`, `--output`
+- Held-out test eval at end-of-run for all 11 optimizers
+- JSON output includes: optimizer, seed, task, train_test_ratio, val_ratio, stopping_reason, stopping_step, final_val_acc, final_val_loss, final_test_acc, final_test_loss, val_test_gap, wall_clock_seconds
+- Multi-GPU support via `--gpus`; ntfy.sh notifications via `--ntfy`
+
 ### Fairness notes (from `ANALYSIS.md` §3)
 - Same init, multi-GPU round-robin, multi-seed bands ✓
 - SuperGrok optimizers do extra per-step work (meta-net forward, SAM, bilevel) — wall-clock not directly comparable
-- SuperGrok bilevel uses validation data → information advantage vs other optimizers
+- SuperGrok bilevel uses validation data → information advantage vs other optimizers (now properly separated from test set)
 - Missing baseline: standalone SAM/GSAM
 
 ## 16. Codegen
@@ -1649,24 +1686,11 @@ and CUTLASS migration scaffolding are now complete. What remains is
 real per-arch hand-tuning and a small set of items that need
 hardware to validate. Rough order of expected payoff:
 
-**1. Raise type-cap constants so the Hopper FP8 path actually
-activates.** Fix 1 of the latest session restored the FP8 helpers
-(`hopper_fp8_gemm`, `hopper_precompute_fp8`) and inlined them into
-the canonical `launch_mamba3_peer_batched_step` on sm_90 with
-gating `total_N >= 1024 && d_inner/d_state/d_model >= 64`. However,
-`csrc/common/types.h` currently caps `MAX_D_MODEL = 16`,
-`MAX_D_STATE = 32`, `MAX_D_INNER = 32` — all below the 64 threshold.
-The FP8 fast path is therefore wired but unreachable in practice
-until those caps are raised. Raising the caps requires verifying
-that downstream kernels (sg::sm80 cp.async pipelined weight load,
-sg::gfx942 BF16 MFMA precompute, sg::gfx950 FP4 expert MFMA, etc.)
-all handle the larger templated shapes — most do, since the caps
-are consumed via `template <int D_INNER> __launch_bounds__(...)`
-and the per-arch baseline kernels iterate up to `MAX_D_*`. Expected
-~2× over the current FP16 torch::mm path on H100/H200 once the
-caps are raised, then real-world `d_state=128` workloads fit.
+~~**1. (DONE) Raise type-cap constants.**~~ Completed: MAX_D_MODEL
+16→64, MAX_D_STATE 32→128, MAX_D_INNER 32→128. No shared memory
+overflow. Hopper FP8 path now reachable.
 
-**2. Hopper warp-specialized scan activation.** The
+**1. Hopper warp-specialized scan activation.** The
 `launch_scan_warp_specialized` and `launch_scan_warp_specialized_d16`
 declarations in `supergrok2_warp_specialized_sm90.cu` are unwired
 from the canonical scan launcher. To activate, the canonical
@@ -1675,7 +1699,7 @@ variant when `d_state` is uniform across all parameters in the
 batch — typically true for SG2. Expected ~1.5× on H100/H200 for
 long-segment workloads.
 
-**3. Real autotune output for tuned_configs.h.** All 17 optimizers
+**2. Real autotune output for tuned_configs.h.** All 17 optimizers
 × 8 GPU arches = 136 entries currently use placeholder
 `LaunchConfig` values that match hand-coded `__launch_bounds__` in
 the per-arch baselines. Run `bash build.sh --autotune` on hardware:
@@ -1685,14 +1709,14 @@ sweep grids, writes winners between the
 `csrc/common/tuned_configs.h`, then rebuilds. Expected 5–30%
 launch-config wins per arch.
 
-**4. Fused softplus epilogue in CUTLASS for SG2 dt_proj.** The
+**3. Fused softplus epilogue in CUTLASS for SG2 dt_proj.** The
 current `cutlass_dt_proj_fused` runs the unfused linear-combo GEMM
 plus a separate `softplus_bias_kernel` post-pass. CUTLASS 3.x's
 `EpilogueOp` template can fuse `softplus(x + bias)` into the GEMM
 tail, saving one elementwise pass over the dt activation. Math is
 identical; the API surface change is internal to CUTLASS.
 
-**5. NVFP4 path for Blackwell Ultra (sm_103) projections.** The
+**4. NVFP4 path for Blackwell Ultra (sm_103) projections.** The
 CUTLASS sm_103a target is wired in `setup.py` but the SG2 Python
 optimizer still passes FP16 / BF16 for the projection inputs. To
 activate, the projection precompute (in the Python pre-step) needs
@@ -1700,27 +1724,27 @@ an NVFP4 quantization pass with proper block-scaling factors;
 `autotune/grids.py` already lists the sm_103a NVFP4 entries for
 the autotune sweep.
 
-**6. sm_120 retuned tile sizes.** Consumer Blackwell has 128 KB
+**5. sm_120 retuned tile sizes.** Consumer Blackwell has 128 KB
 shared memory per SM versus sm_100 / sm_103's 228 KB. Current
 placeholder `tuned_configs.h` values for sm_120 mirror sm_100 and
 will under-occupy. The autotune sweep above will detect this; the
 specific kernels affected are SG2's batched scan and the metanet
 cp.async variants.
 
-**7. CDNA4 FP4 / FP6 / 2:4 sparsity engagement beyond MoE.**
+**6. CDNA4 FP4 / FP6 / 2:4 sparsity engagement beyond MoE.**
 Currently only the MoE expert path uses gfx950's native FP4 MFMA.
 Wiring NVFP4-equivalent FP4 into the SG2 projections, FP6 state
 into the scan recurrence, and 2:4 sparsity into the dt_proj weights
 are all open per-experiment opportunities. Profiling required.
 
-**8. DSMEM for cross-CTA reductions on Hopper / Blackwell.** Norm
+**7. DSMEM for cross-CTA reductions on Hopper / Blackwell.** Norm
 reductions (LookSAM, GrokAdamW, Prodigy, the SAM step in SG1.5/1.1)
 all currently round-trip through global memory. DSMEM (distributed
 shared memory across CTA clusters, available on sm_90+) can do
 cross-CTA reductions without that round-trip. Expected ~5–10% on
 the global-norm step.
 
-**9. Per-feature gfx950 file split refinement.** The post-split
+**8. Per-feature gfx950 file split refinement.** The post-split
 gfx950 files (`fp4_expert`, `fp6_state`, `sparse24`, `fused_combos`)
 currently use `__device__ static __forceinline__` helpers in
 `fp4_helpers.hip.h` to avoid ODR. Each TU gets its own internal
@@ -1730,7 +1754,7 @@ shared helpers (single copy in the binary), they need to move to a
 non-template `.cpp` file with explicit `extern` declarations from
 each TU.
 
-**10. CI matrix for the eight-row arch sweep.** Tests
+**9. CI matrix for the eight-row arch sweep.** Tests
 (`test_amd_hip.py`, `test_all_arches.py`,
 `test_cross_arch_agreement.py` with the Muon 2D harness,
 `test_cutlass_parity.py`) exist but the CI runner needs configuring
@@ -1739,13 +1763,13 @@ gfx942, gfx950} × {test_*.py} matrix. The cross-arch agreement
 test honors `FORCE_ARCH=<n>` so a single multi-build CI image can
 run the full matrix.
 
-**11. CPU SIMD test paths.** The `csrc/kernels/cpu/{avx512,neon}/`
+**10. CPU SIMD test paths.** The `csrc/kernels/cpu/{avx512,neon}/`
 files exist but are testing-only and not exercised under any
 public test. A small `tests/test_cpu_simd.py` that runs each
 optimizer for a few steps on CPU would catch SIMD regressions
 without needing a GPU. Low priority.
 
-**12. PyPI-distributable wheel.** `bash build.sh --package-tarball`
+**11. PyPI-distributable wheel.** `bash build.sh --package-tarball`
 already produces a redistributable `dist/` tree plus a
 `supergrok2-3.0.0-<sha>.tar.gz` for direct GitHub release upload,
 with three documented install paths in `dist/INSTALL.md`. Going from
