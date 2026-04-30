@@ -305,51 +305,50 @@ For navigation, the structural-refactor commits:
 
 ---
 
-## Contents (pre-refactor reference; sections below describe the OLD layout — see §0, §21, §22, §23 for current state)
+## Contents
 
 1. Repo layout
 2. Project state
 3. Optimizers
 4. Python infrastructure
 5. csrc/common — shared headers
-6. csrc/cuda/generic — generic kernels
-7. csrc/cuda/sm_80 — Ampere
-8. csrc/cuda/sm_90 — Hopper
-9. csrc/cuda/sm_100 — Blackwell
-10. csrc/hip — AMD ROCm
-11. csrc/quantization — quantization kernels
-12. Algorithms
-13. JAX/TPU
-14. Tests
-15. Benchmarks
-16. Codegen
-17. Build
-18. Recent commits
-19. Known gaps
-20. Quick reference
+6. csrc/bindings — pybind11 layer
+7. csrc/kernels/cuda — NVIDIA per-arch kernels
+8. csrc/kernels/hip — AMD per-arch kernels
+9. csrc/kernels/tpu — TPU Pallas kernels
+10. csrc/quantization — quantization kernels
+11. Algorithms
+12. JAX/TPU
+13. Tests
+14. Benchmarks
+15. Autotune
+16. Build
+17. Recent commits
+18. Known gaps
+19. Quick reference
+
+§24 is the per-arch per-optimizer rundown; §25 is the engineering-remaining list.
 
 ---
 
 ## 1. Repo layout
 
-(Post-refactor. The pre-refactor tree had `csrc/cuda/generic/`,
-`csrc/cuda/generated/`, `csrc/cpu/`, `csrc/hip/cdna2/3/4/`, `codegen/`,
-and `grokking_optimizers/jit/`. All deleted in the structural refactor —
-see §0 migration commit series.)
-
 - `grokking_optimizers/` — Python package, eleven optimizers plus infra
 - `supergrok2_jax_tpu/` — JAX/TPU port of the suite (Pallas kernels live in `csrc/kernels/tpu/`)
-- `csrc/common/` — shared headers (`platform.h`, `types.h`, `ptx_intrinsics.cuh`, `utils.cuh`, `quantization.h`) plus `tuned_configs.h` (autotune output)
-- `csrc/bindings/` — per-optimizer dispatchers (`grokadamw.cpp`, `lion.cpp`, …) + arch detection (`dispatch.cpp`) + pybind11 module aggregator (`module.cpp`)
-- `csrc/kernels/cuda/sm_80/` `sm_89/` `sm_90/` `sm_100/` `sm_103/` `sm_120/` — NVIDIA per-arch specialized kernels (six arches)
-- `csrc/kernels/hip/gfx942/` `gfx950/` — AMD per-arch specialized kernels (two arches)
+- `csrc/common/` — shared headers (`platform.h`, `types.h`, `arch_tier.h`, `ptx_intrinsics.cuh`, `utils.cuh`, `quantization.h`, `fp4_helpers.hip.h`) plus `tuned_configs.h` (autotune output)
+- `csrc/bindings/` — per-optimizer dispatchers (`grokadamw.cpp`, `lion.cpp`, `supergrok2.cpp`, …) + arch detection (`dispatch.cpp`) + pybind11 module aggregator (`module.cpp`) + helpers (`_helpers.h`, `_dispatch_macro.h`, `bindings.h`)
+- `csrc/kernels/cuda/sm_80/` `sm_89/` `sm_90/` `sm_100/` `sm_103/` `sm_120/` — NVIDIA per-arch kernels (six arches), each in `namespace sg::sm<N>`
+- `csrc/kernels/hip/gfx942/` `gfx950/` — AMD per-arch kernels (two arches), each in `namespace sg::gfx<N>`
 - `csrc/kernels/tpu/v5p/` `v6e/` — TPU Pallas kernels per version (re-export tile-128 / tile-256 from shared `_pallas_kernels.py`)
 - `csrc/kernels/cpu/` — CPU implementations with AVX-512 / NEON SIMD (testing only, not a runtime fallback)
 - `csrc/quantization/` — quantization kernels (FP8, INT8, INT4, MXFP4)
-- `autotune/` — offline tuning: `tune.py`, `grids.py`, `runner.py`, `cutlass_profile.py`. Replaces the deleted `grokking_optimizers/jit/`.
-- `tests/` — nine test files (the refactor added `test_cross_arch_agreement.py` and renamed `test_all_tiers.py` → `test_all_arches.py`)
-- `benchmarks/` — three benchmark scripts
-- `setup.py` — build entry, detects backend, supports the eight GPU arches
+- `autotune/` — offline tuning: `tune.py`, `grids.py`, `runner.py`, `cutlass_profile.py`, `_wrap_kernel.py`
+- `tests/` — eleven test files including `test_cross_arch_agreement.py` (renamed from `test_all_tiers.py` → `test_all_arches.py`)
+- `benchmarks/` — `benchmark_supergrok2.py`, `autotune.py`, `training_benchmark.py`, `profile_smoke.py`
+- `setup.py` — build entry, ninja-backed, supports the eight GPU arches with multi-arch fatbin
+- `pyproject.toml` — build-system requires (ninja, torch); version 3.0.0
+- `build.sh` — tqdm-progress wrapper around `pip install -e . --no-build-isolation -v`
+- `third_party/cutlass` — CUTLASS v3.6.0 submodule for sm_90a / sm_100a / sm_103a / sm_120a GEMMs (opt-in via `WITH_CUTLASS=1`)
 - `README.md` — user docs
 - `REFRESH.md` — this file
 - `REFACTOR_PLAN.md` — refactor design (steps 1-9 + §10 arch expansion)
@@ -481,13 +480,13 @@ Eleven total. Each entry: purpose, state per param, hyperparameters with default
 ### `dispatch.py`
 - Detects backend at runtime, no GPU import required.
 - `get_gpu_vendor()` → 'nvidia' | 'amd' | 'none'
-- `get_gpu_arch()` → SM number (NVIDIA) or CDNA arch (AMD)
+- `get_gpu_arch()` → one of `{80, 89, 90, 100, 103, 120, 942, 950}` or raises `UnsupportedArchError`
 - `get_backend()` → 'cuda' | 'hip' | 'cpu'
 - `get_warp_size()` → 32 (NVIDIA) or 64 (AMD CDNA)
-- `get_arch_tier()` → 'blackwell'|'hopper'|'ampere'|'generic'
-- `get_amd_tier()` → 'cdna4'|'cdna3'|'cdna2'|'generic'
+- `assert_supported_arch()` and `SUPPORTED_ARCHES` constants — public surface for the no-fallback policy
 - `supports_bf16/fp8/tf32/tma/block_clusters/matrix_cores/nvfp4` predicates
 - Env override: `FORCE_ARCH=N`
+- Tier helpers (`get_arch_tier`, `get_amd_tier`, `get_amd_label`) are gone — the eight arches each compile their own per-arch kernel TUs, no tier fallback
 
 ### `quantization.py`
 - `PrecisionConfig` class with three knobs:
@@ -520,22 +519,17 @@ Eleven total. Each entry: purpose, state per param, hyperparameters with default
   - `_gather_full_grad_fsdp()` — context manager for FSDP
   - `exclude_meta_net_from_fsdp(meta_net)` — keep meta-net replicated
 
-### `jit/` directory
-- Optional runtime kernel specialization, cached in `~/.cache/supergrok2/`
-- `specializer.py` — base class + `ModelConfig`
-- `cuda_specializer.py`, `hip_specializer.py`, `tpu_specializer.py`, `cpu_specializer.py`
-- `smem_layout.py` — shared memory layout optimization
-- `block_size_optimizer.py` — tile size selection
-- `gcn_scheduler.py` — AMD GCN wavefront scheduling
-- `ptx_scheduler.py` — NVIDIA PTX instruction scheduling
-- Falls back to pre-compiled `_ops` if anything fails
+### `_ops_loader.py` and `_python_fallback.py`
+- `_ops_loader.py` imports the compiled `_ops` extension or raises a clear error if missing — there is no runtime JIT and no graceful "skip the kernel" path under the no-fallback policy.
+- `_python_fallback.py` provides pure-PyTorch correctness implementations for SG2's meta-net (used by `tests/` and as a development fallback when `_HAS_OPS` is false).
 
 ### `__init__.py`
 - Exports all eleven optimizers
 - Meta-net classes: Mamba3PEERMetaNet, Mamba3ScanBlock, MiniGRU, SharpnessMetaNet
 - Wrappers: CompiledSuperGrok2, CUDAGraphOptimizer, OverlappedOptimizer, PipelinedOptimizer, GradientHookOptimizer, AsyncSuperGrok2, MoEAwareSuperGrok2
 - Distributed helpers, dispatch helpers, PrecisionConfig
-- Flags: `_HAS_OPS`, `_HAS_CUDA`, `_HAS_CPU_OPS`
+- Flag: `_HAS_OPS` — extension or error (no `_HAS_CUDA` / `_HAS_CPU_OPS` split under the simplified loader)
+- `__version__ = "3.0.0"`
 
 ## 5. csrc/common — shared headers
 
@@ -588,13 +582,6 @@ Eleven total. Each entry: purpose, state per param, hyperparameters with default
 - `ptx_expert_mlp_forward<H>` — templated, fully unrollable
 - `ptx_int8_stochastic_round` — uses `prmt.b32` byte permutation
 
-### `ops.h` / `ops.cpp`
-- C++ binding layer; ~79 kernel launchers
-- `ops.h` declares all launchers
-- `ops.cpp` is high-level glue per optimizer step
-- Decides parallel vs sequential scan, GEMM vs custom precompute
-- CPU fallback via PyTorch ATen ops (correct, slow), guarded by `WITH_CUDA`/`WITH_HIP`
-
 ### `quantization.h`
 - `PrecisionMode` enum: FP32, TF32, BF16, FP8_E4M3, INT8_SYM, INT4_GPTQ, MXFP4
 - Device-side dequant helpers:
@@ -603,223 +590,23 @@ Eleven total. Each entry: purpose, state per param, hyperparameters with default
   - `dequant_mxfp4(packed, which, shared_exp)` — block_size=32 shared exponent
   - `fp4_e2m1_to_float` — lookup table {0, 0.5, 1, 1.5, 2, 3, 4, 6}
 
-### `dispatch.h`
-- C++ side of arch detection
-- NVIDIA tiers: GENERIC (sm_70/75), AMPERE (sm_80–89), HOPPER (sm_90), BLACKWELL (sm_100)
-- AMD tiers: GENERIC (gfx908/90a/942), CDNA4 (gfx950)
-- `get_sm_arch()` via `cudaGetDeviceProperties`, respects `FORCE_ARCH` env var
-- `StatePrecision` enum: FP32, CONFIG4 (INT8 state), FP6 (CDNA4)
-- `ExpertPrecision` enum: FP32, INT8, INT4, MXFP4, FP4 (CDNA4)
+### `arch_tier.h`
+- Lightweight shim providing `ArchTier` / `StatePrecision` / `ExpertPrecision` enums and a per-TU constexpr `kArchTier` selected by `SG_ARCH_<X>` preprocessor switches.
+- Recovered for distributed-pipeline TUs that referenced the deleted `dispatch.h`. Lets legacy `ArchTier::HOPPER`-style call sites keep compiling without body edits.
+- `StatePrecision`: FP32, CONFIG4 (INT8 state), FP6 (CDNA4)
+- `ExpertPrecision`: FP32, INT8, INT4, MXFP4, FP4 (CDNA4)
 
-## 6. csrc/cuda/generic — generic kernels
+### `tuned_configs.h`
+- Auto-generated launch-config table indexed by `(ArchId, KernelId)`.
+- `ArchId` enum spans 8 arches: `{kSm80, kSm89, kSm90, kSm100, kSm103, kSm120, kGfx942, kGfx950}`.
+- Each entry: `LaunchConfig { int block; int grid; int warps_per_block; int smem_bytes; }`.
+- The autotune sweep writes winners between `// AUTOTUNE_BEGIN` / `// AUTOTUNE_END` markers; hand-tuned defaults remain outside the markers.
 
-### `supergrok2_mamba_peer_kernels.cu` (forward path)
+### `fp4_helpers.hip.h`
+- Shared FP4/FP6 dequant + Philox stochastic-rounding helpers used by all four post-split gfx950 per-feature files (`fp4_expert`, `fp6_state`, `sparse24`, `fused_combos`).
+- All helpers `__device__ static __forceinline__` so each TU gets internal-linkage copies (avoids ODR errors). The `__constant__` LUT is wrapped in an anonymous namespace.
 
-- **`input_proj_sort_kernel`** — projects `[grad, sharpness]` to `[N, d_model]`, emits `|grad|` as sort key plus identity index permutation. Clips NaN/Inf to zero. 256 threads/block, one element per thread, `#pragma unroll 4` on d_model loop.
-- **`mamba3_scan_kernel`** — sequential selective scan, used when N < 256. 16 threads per param (one per d_inner). Per timestep: x-branch and z-gate via shared in_proj_W, dt via softplus_ptx, B and C projections via shared x_branch, trapezoidal state recurrence with paired RoPE rotation via FAST_SINCOSF, gated output `y * silu(z) + D * x`. Reverse flag drives backward bidirectional pass.
-- **`mamba3_parallel_precompute_kernel`** — precomputes `pre_x_val`, `pre_z_val`, `pre_dt_val`, `pre_B_val`, `pre_C_val` for all timesteps in parallel, no inter-timestep dependencies. Used when 256 ≤ N < 1024. 256 threads/block, one timestep per thread.
-- **`mamba3_parallel_scan_kernel`** — Blelloch parallel prefix scan over Affine2x2 transforms. PSCAN_BLOCK=512 threads/block. Three phases:
-  1. Each thread sequentially scans a chunk to produce one Affine2x2 summary
-  2. Up-sweep + down-sweep on summaries in shared memory (12KB for 6 floats × 512 threads)
-  3. Each thread re-scans its chunk applying its prefix, accumulates into output
-  Skips `__syncthreads()` for stride < WARP_SIZE.
-- **`fused_elem_step_kernel`** — the per-element step. One thread per element. Sequence: load fwd/bwd Mamba scan outputs (float4 vectorized for d_inner ≤ 4), project to d_model contexts, non-temporal load of GRU state, GRU update with `gru_gates_ptx` for sigmoid pair, non-temporal store of new GRU state, build query per PEER head, score against 12 product keys per half via `LDG` cached loads, hard-route to one expert per head, evaluate 2-layer expert MLP from shared memory, accumulate weighted output, atomic-add expert counter, smart_grad = grad + rescale × meta_out, slow EMA update, effective grad = smart + λ × mu, Adam moment updates, parameter update with decoupled weight decay. Shared memory ~8.5 KB per block.
-
-### `supergrok2_mamba_peer_backward_kernels.cu` (backward path)
-
-- **`bilevel_precompute_kernel`** — same as forward parallel precompute, used for backward replay
-- **`softplus_bias_kernel`** — applies `softplus(x + bias)` element-wise, used after cuBLAS dt projection
-- **`bilevel_precompute_gemm`** — wraps `torch::mm_out` calls (cuBLAS path) when N ≥ 1024. Splits in_proj into x and z halves; runs in_proj_x, in_proj_z, dt_proj, B_proj, C_proj as 5 GEMMs. Calls `softplus_bias_kernel` after dt.
-- **`mamba3_parallel_scan_fwd_save_kernel`** — same as forward parallel scan but saves selected hidden states to `saved_states` for backward. Checkpoint policy: save every state if `checkpoint_interval ≤ 1`, else save every Cth state.
-- **`mamba3_scan_fwd_save_kernel`** — sequential variant for small N
-- **`mamba3_scan_backward_kernel`** — backward scan. Walks timesteps in reverse. Per step: backprop through SiLU gating, through C projection (two-pass with warp reductions to a `d_C_vals_buf`, then backward GEMM for d_C_proj_W), through trapezoidal-discretized affine recurrence and RoPE, through dt projection, through B projection, through input projection. Block-local shared-memory accumulators for weight gradients, atomicAdd flush at block end.
-- **`input_proj_backward_kernel`** — outer-product accumulation of `d_x` against `[grad, sharpness]` into proj_W and proj_b. Block-local accumulator + atomic flush.
-- **`gru_backward_kernel`** — gradients w.r.t. Wz, Wr, Wh and bz, br, bh and gru_input. Unrolls gate logic carefully, accumulates via shared memory.
-- **`expert_peer_backward_kernel`** — two-pass for softmax-backward coupling:
-  - Pass 1: accumulate softmax dot products
-  - Pass 2: full softmax-backward + gradient accumulation into expert weights, product keys, query weights
-- **`out_proj_backward_kernel`** — outer-product accumulation for d_out_proj_W
-
-### `supergrok15_kernels.cu`
-
-- **`fused_mu_metanet_kernel`** — updates mu EMA, evaluates 2-input MLP per element with weights in shared memory, fast-GELU activation, output is smart_grad = grad + rescale × mlp_out
-- **`fused_adam_decay_kernel`** — final blend with mu, Adam moments update with `fast_rsqrt_nr`, progressive decoupled weight decay. Non-temporal stores. Float4 fast path.
-- **`sam_perturb_kernel`** — `param[i] += rho_over_norm × grad[i]`. Float4 fast path.
-- **`sharpness_restore_kernel`** — `sharpness[i] = |sam_grad - normal_grad|`, restore param from backup
-- **`fused_supergrok15_full_step_kernel`** — fuses mu_metanet + adam_decay. Smart_grad is register-resident, never hits global memory. ~50% bandwidth reduction.
-- Templated specializations for H=16/32/64/128 with full unrolling. Runtime variant uses `#pragma unroll 4`.
-
-### `supergrok11_kernels.cu`
-
-- **`launch_sg11_mu_metanet`** — same as v1.5 mu_metanet but with cosine gating
-- **`compute_cosine_gate`** — ATen helper that computes cos_sim between smart_grad and mu, passes through temperature sigmoid
-- **`cosine_gate_reduce_kernel`** — fused 3-quantity reduction (dot, |sg|², |mu|²). Warp shuffle within warp, atomicAdd per warp into globals.
-- **`compute_cosine_gate_fused`** — ATen wrapper around the reduce kernel
-- **`launch_sg11_adam_decay`** — same shape as v1.5, takes lamb_eff = ramp × cos_gate × base_lamb
-- **`fused_sg11_full_step_kernel`** — fused full step with cosine gate input
-
-### `grokadamw_kernels.cu`
-
-- **`fused_grokadamw_step_kernel`** — EMA update, gradient amplification, Adam moments, decoupled WD, parameter update. Non-temporal I/O for state. Float4 fast path.
-- **`fused_grokadamw_step_q3_kernel`** — quantized variant. INT8 per-block exp_avg with FP32 per-block scales (block_size=8). BF16 stochastic-rounded exp_avg_sq and ema using `hash_prng`. ~50% optimizer state memory reduction.
-
-### `neuralgrok_kernels.cu`
-
-- **`fused_neuralgrok_amplifier_kernel`** — amplifier MLP per element. Linear(1→H), ReLU, Linear(H→1). Weights cooperatively loaded into shared memory. `amplified_grad = grad × (alpha × mlp_out + beta)`.
-- **`fused_neuralgrok_full_step_kernel`** — fuses amplifier + Adam, amplified_grad register-resident
-- Templated H=16/32/64/128
-
-### `prodigy_kernels.cu`
-
-- **`prodigy_dlr_reduce_kernel`** — global reduction, computes numerator (Σ grad × distance) and denominator (Σ s) via warp shuffles and per-warp atomicAdd. New `d_lr = sqrt(num / denom + eps)`.
-- **`fused_prodigy_step_kernel`** — moment updates scaled by `d_lr`, s update, parameter update with `lr × d_lr × wd`.
-
-### `grokfast_kernels.cu`
-
-- **`fused_grokfast_ema_kernel`** — standalone EMA update + amplification (used in non-fused paths)
-- **`fused_grokfast_adam_kernel`** — fused full step. Amplified grad register-resident.
-
-### `lion_kernels.cu`
-
-- **`fused_lion_step_kernel`** — interpolated direction `β1 × m + (1-β1) × grad`, sign extraction via `copysignf`, parameter update with decoupled WD, momentum EMA update with β2. Non-temporal I/O. Float4 fast path.
-
-### `looksam_kernels.cu`
-
-- **`looksam_norm_reduce_kernel`** — fused two-norm reduction: `|sam_grad - normal_grad|²` and `|grad|²` in one pass. Warp shuffles + per-warp atomic.
-- **`looksam_direction_kernel`** — `v_dir[i] = (sam_grad - normal_grad) × inv_norm`
-- **`looksam_direction_adjust_fused_kernel`** — fused direction + gradient adjustment. v_dir register-resident.
-
-### `muon_kernels.cu`
-
-- **`muon_momentum_normalize_kernel`** — momentum EMA update + division by Frobenius norm
-- **`muon_ns_combine_kernel`** — Newton-Schulz inner: `out = a × X + b × AX + c × AAX` with hand-tuned coefficients (a=3, b=-3, c=1 default). AX and AAX are computed by separate cuBLAS matmul calls outside this kernel.
-- **`muon_ns_combine_update_fused_kernel`** — final NS iteration combine + parameter update fused. Orthogonalized direction register-resident.
-
-### `moe_deep_kernels.cu`
-
-- **`moe_dynamic_expert_load_kernel`** — load only active experts' weights into shared memory based on gate logits
-- **`moe_dynamic_expert_fwd_kernel`** — forward through dynamically loaded subset
-- **`moe_dynamic_expert_bwd_kernel`** — backward through dynamic loading
-- **`moe_filter_active_params_kernel`** — compact parameter index list to active experts only
-- **`moe_scan_compacted_kernel`** — Mamba scan on compacted subset
-- **`moe_scatter_results_kernel`** — scatter results back to full positions
-- **`moe_count_expert_activations_kernel`** — atomicAdd per expert
-- **`moe_compute_load_balance_loss_kernel`** — auxiliary loss for uniform expert utilization
-- **`moe_apply_frequency_scaling_kernel`** — per-expert lr scaling by activation frequency
-
-### `multi_tensor_optimizer_kernels.cu`
-
-- Single kernel launch for many small parameter tensors. 2D grid: blockIdx.y selects param, threads in row iterate via grid-stride.
-- Supports: GrokAdamW, Lion, Grokfast EMA, Prodigy step
-- Pointer-packing: param pointers packed once on host, transferred to device, indexed by blockIdx.y
-- Saves 100-500 ms/step on transformers with many small params
-
-### `multi_tensor_prepare.cu`
-
-- Fuses per-step preparation into one kernel: gradient norm, clipping, NaN/Inf replace, bias correction, per-param scalars
-- One block per parameter, parallel reduction within block via warp shuffles + shared memory
-
-### `distributed_scan_kernels.cu`
-
-- **`mamba3_scan_local_with_summary_kernel`** — each GPU runs local Blelloch scan on its chunk, produces one Affine2x2 summary
-- **`scan_summary_prefix_kernel`** — gathers summaries on rank 0, computes per-GPU prefix corrections via small prefix scan
-- **`mamba3_apply_scan_prefix_kernel`** — each GPU applies its prefix to local output
-- Communication: ~6 floats per GPU per scan
-- Backward variants for gradient computation
-
-## 7. csrc/cuda/sm_80 — Ampere
-
-Headline optimization: `cp.async` double-buffered prefetch. Overlaps multi-hundred-cycle global memory latency with scan compute, hides ~50% of memory stalls.
-
-- **`supergrok2_scan_sm80.cu`** — sequential scan with cp.async prefetch
-  - **`mamba3_scan_batched_cpasync_kernel`** — batched sequential scan, double-buffered shared memory
-  - **`mamba3_scan_combined_cpasync_kernel`** — forward + backward scan fused
-- **`supergrok2_backward_sm80.cu`** — backward scan with cp.async
-- **`supergrok2_fused_elem_sm80.cu`**
-  - **`fused_elem_step_cpasync_kernel`** — per-element step with cp.async-prefetched expert weights
-- **`metanet_optimizers_sm80.cu`** — Ampere-tuned optimizer kernel templates
-- **`metanet_cpasync_variants_sm80.cu`** — cp.async variants for the meta-net optimizers
-- **`muon_sm80.cu`** — Muon for Ampere with TF32 GEMMs via cuBLAS
-
-Precision: TF32 for projection matmuls (transparent via cuBLAS). 192KB shared memory per SM.
-
-## 8. csrc/cuda/sm_90 — Hopper
-
-Headline optimization: FP8 E4M3 projection precompute via cuBLAS for N ≥ 4096. ~2× speedup vs BF16 (905 vs 452 TFLOPS on H100). Device-side absmax computation avoids host-device sync.
-
-- **`supergrok2_scan_sm90.cu`** — FP8 precompute integrated with scan
-  - **`hopper_fp8_gemm`** — cuBLAS GEMM with FP8 inputs and FP32 accumulation, scale = absmax / 448.0 (FP8 E4M3 max)
-- **`supergrok2_backward_sm90.cu`** — backward with FP8 projection backward GEMMs
-- **`supergrok2_warp_specialized_sm90.cu`** — uses Hopper distributed shared memory; producer/consumer warp specialization (one warp loads, another computes)
-- **`metanet_optimizers_sm90.cu`** — Hopper-tuned optimizer kernels
-- **`muon_sm90.cu`** — Muon for Hopper with FP8 GEMMs
-
-Note: TMA is **not** used for the scan because per-timestep scattered reads (sort permutation) are poorly suited to TMA's bulk-copy descriptor model.
-
-228KB shared memory. Thread block clusters supported.
-
-## 9. csrc/cuda/sm_100 — Blackwell
-
-Conservative tier. Most heavy features (TMEM, MMA.2SM, native NVFP4) deferred to Hopper FP8 fallback with documented delegation.
-
-- **`supergrok2_sm100.cu`** — TMA bulk-copy kernels for expert weights
-  - **`fused_elem_step_tma_kernel`** — per-element step with TMA-prefetched expert weights (single-thread initiation, hardware-managed transfer)
-- **`supergrok2_precompute_sm100.cu`** — FP4 precompute scaffolding
-- **`supergrok2_scan_sm100.cu`** — scan with TMA
-
-Hardware features available:
-- TMA (Tensor Memory Accelerator): hardware-managed asynchronous bulk copy via descriptors
-- FP4 E2M1 native matrix multiply: `mfma_f32_32x32x8_fp4`, 8× elements per instruction
-- TMEM: on-chip tensor memory (currently unused)
-
-Fallback chain: Blackwell → Hopper FP8 → Ampere → Generic.
-
-## 10. csrc/hip — AMD ROCm
-
-Wavefront 64 throughout (CDNA). All kernels use `WARP_SIZE` from `platform.h` for portability.
-
-### `cdna2/` (gfx90a, MI250)
-
-- **`supergrok2_scan_cdna2.hip.cpp`** — baseline CDNA scan, MFMA `mfma_f32_16x16x4` for matrix ops
-- 8MB L2, 220 CUs
-
-### `cdna3/` (gfx942, MI300X)
-
-- **`supergrok2_cdna3.hip.cpp`** — BF16 MFMA projection precompute
-  - **`cdna3_precompute_bf16`** — runs in_proj_x, in_proj_z, dt_proj, B_proj, C_proj as BF16 matmuls via rocBLAS, output cast back to FP32. Dispatches to `MFMA_F32_32x32x8_BF16`, ~2× FP32 MFMA throughput.
-- 304 CUs, 256MB L2 (meta-net always resident)
-
-### `cdna4/` (gfx950, MI350X)
-
-- **`cdna4_kernels.hip.cpp`** — native FP4/FP6/2:4 sparsity scaffolding
-
-FP4 expert kernels:
-- **`cdna4_fp4_expert_load`** — dequantize FP4 weights to FP32
-- **`cdna4_fp4_expert_fwd`** — forward with FP4 expert weights via `mfma_f32_32x32x8_fp4`
-- **`cdna4_fp4_expert_bwd`** — backward with gradient accumulation
-- **`cdna4_fp4_quantize_experts`** — re-quantize expert gradients
-
-FP6 state kernels (E3M2 native):
-- **`cdna4_fp6_state_pack`** — FP32 → FP6 + per-block scale
-- **`cdna4_fp6_state_unpack`** — FP6 → FP32
-- **`cdna4_fp6_adam_step`** — Adam directly on FP6 state
-- **`cdna4_fp6_lamb_step`** — LAMB on FP6 state
-
-2:4 sparsity:
-- **`cdna4_sparse24_select`** — select 2 non-zeros from each group of 4
-- **`cdna4_sparse24_apply_mask`** — mask gradients to 2:4 pattern
-- **`cdna4_sparse24_project`** — project momentum to sparse pattern
-- **`cdna4_sparse24_densify`** — convert sparse → dense
-
-Fused combos:
-- **`cdna4_fp4_sparse24_fused_expert`** — expert MLP with FP4 weights + 2:4 sparsity
-- **`cdna4_supergrok15_full_step`** — full v1.5 step on FP6 state + FP4 experts
-
-512 CUs, 288MB L2.
-
-### `README_HIP.md`
-
-- Notes on wavefront-64 specific tuning, sync-skip behavior, MFMA dispatch
+(The deleted `csrc/common/{ops.h,ops.cpp,dispatch.h}` headers are replaced by the bindings layer described in §6.)
 
 ## 11. csrc/quantization — quantization kernels
 
