@@ -138,7 +138,7 @@ Registered vector-signature entry points (callable from Python via `_ops.<name>`
 
 ### dispatch.py / __init__.py changes
 
-- `dispatch.get_gpu_arch()` returns one of `{80, 90, 100, 942}` or raises `UnsupportedArchError`
+- `dispatch.get_gpu_arch()` returns one of `{80, 89, 90, 100, 103, 120, 942, 950}` or raises `UnsupportedArchError`
 - Tier helpers (`get_arch_tier`, `get_amd_tier`, `get_amd_label`) are gone
 - `assert_supported_arch()` and `SUPPORTED_ARCHES` are new public surface
 - `__version__` bumped to `3.0.0` (breaking)
@@ -609,9 +609,9 @@ The grokking race uses four outer train/test splits (10/90, 25/75, 50/50, 80/20)
 
 ### `types.h`
 - Compile-time constants:
-  - `MAX_D_STATE = 32`
-  - `MAX_D_INNER = 32`
-  - `MAX_D_MODEL = 16`
+  - `MAX_D_STATE = 128`
+  - `MAX_D_INNER = 128`
+  - `MAX_D_MODEL = 64`
   - `MAX_GRU_HIDDEN = 8`
   - `MAX_EXPERT_HIDDEN = 16`
   - `MAX_TOPK = 4`
