@@ -10,7 +10,7 @@ A compact, granular catch-up. Plain language. Each kernel, file, and optimizer g
 
 ### Supported arches (no fallback)
 
-After the §10 expansion, eight GPU arches plus two TPU versions are supported:
+After the eight-arch expansion (commit batch listed below), eight GPU arches plus two TPU versions are supported:
 
 - **NVIDIA**:
   - `sm_80` — Ampere family. A100, A30, A10. RTX 30-series and sm_86 route here.
@@ -341,9 +341,9 @@ For navigation, the structural-refactor commits:
 - `104f3ff` — delete `grokking_optimizers/jit/` and `codegen/`
 - `682eab4` — delete `csrc/common/{ops.h,ops.cpp,dispatch.h}`
 
-§10 arch matrix expansion commits:
+Eight-arch matrix expansion commits (originally tracked as REFACTOR_PLAN §10 — REFACTOR_PLAN was deleted post-merge):
 
-- `dd1e0a6` — `REFACTOR_PLAN.md §10` (arch expansion plan)
+- `dd1e0a6` — initial arch expansion plan
 - `8da3d80` — create directory tree for sm_89, sm_103, sm_120, gfx950
 - `bf157b4` — port 17 sm_90 baselines → sm_89 (Ada Lovelace)
 - `e2545a8` — port 17 sm_100 baselines → sm_103 (Blackwell Ultra)
@@ -360,27 +360,35 @@ For navigation, the structural-refactor commits:
 
 ## Contents
 
-1. Repo layout
-2. Project state
-3. Optimizers
-4. Python infrastructure
-5. csrc/common — shared headers
-6. csrc/bindings — pybind11 layer
-7. csrc/kernels/cuda — NVIDIA per-arch kernels
-8. csrc/kernels/hip — AMD per-arch kernels
-9. csrc/kernels/tpu — TPU Pallas kernels
-10. csrc/quantization — quantization kernels
-11. Algorithms
-12. JAX/TPU
-13. Tests
-14. Benchmarks
-15. Autotune
-16. Build
-17. Recent commits
-18. Known gaps
-19. Quick reference
+§0 is post-refactor state; §0.5 is what's deferred. Both are the
+authoritative specs; rest of the doc keeps detail.
 
-§22 is the comprehensive grokking race driver reference; §24 is the per-arch per-optimizer rundown; §25 is the engineering-remaining list.
+- §1 Repo layout
+- §2 Project state
+- §3 Optimizers (3.1 SuperGrok2 → 3.12 Race fairness model)
+- §4 Python infrastructure
+- §5 csrc/common — shared headers
+- §6 csrc/bindings — pybind11 layer
+- §7 csrc/kernels/cuda — NVIDIA per-arch kernels
+- §8 csrc/kernels/hip — AMD per-arch kernels
+- §9 csrc/kernels/tpu — TPU Pallas kernels
+- §10 csrc/quantization — pointer to §11
+- §11 csrc/quantization — quantization kernels
+- §12 Algorithms
+- §13 JAX/TPU
+- §14 Tests
+- §15 Benchmarks
+- §16 Codegen (deleted; one-line note)
+- §17 Build
+- §18 Recent commits
+- §19 Known gaps
+- §20 Quick reference
+- §22 Grokking race driver (comprehensive)
+- §24 Per-arch per-optimizer rundown
+- §25 Engineering work remaining
+
+Numbering gaps at §21 and §23 are intentional placeholders, not
+missing content.
 
 ---
 
@@ -663,6 +671,52 @@ The grokking race uses four outer train/test splits (10/90, 25/75, 50/50, 80/20)
 - All helpers `__device__ static __forceinline__` so each TU gets internal-linkage copies (avoids ODR errors). The `__constant__` LUT is wrapped in an anonymous namespace.
 
 (The deleted `csrc/common/{ops.h,ops.cpp,dispatch.h}` headers are replaced by the bindings layer described in §6.)
+
+## 6. csrc/bindings — pybind11 layer
+
+The dispatcher + per-optimizer pybind11 dispatchers live at
+`csrc/bindings/`. See §0 (Filesystem layout) for the file inventory
+and §22.5 for how each binding plugs into the dispatcher. The header
+`_dispatch_macro.h` defines `SG_DISPATCH` and `SG_DISPATCH_CALL` —
+the macros that route a call by `dispatch.get_gpu_arch()` to the
+appropriate `sg::<arch>::launch_*` symbol. `_helpers.h` holds the
+clip-grad / SAM-norm host helpers shared across optimizer bindings.
+`module.cpp` is the pybind11 entry point that registers every
+launcher under `_ops.<launcher_name>`.
+
+## 7. csrc/kernels/cuda — NVIDIA per-arch kernels
+
+Eight per-arch translation units under
+`csrc/kernels/cuda/sm_{80,89,90,100,103,120}/`, each wrapped in its
+own `sg::sm<N>` namespace so the linker can link all eight into the
+same `_ops.so` without ODR collisions. See §0 (Filesystem layout) for
+the inlining notes per arch (e.g., sm_80 Ampere TF32 wrap inlined
+into supergrok15/11/neuralgrok canonicals; sm_90 Hopper FP8 fast path
+inlined into `launch_mamba3_peer_batched_step`) and §24 for the
+per-arch per-optimizer hot-path detail.
+
+## 8. csrc/kernels/hip — AMD per-arch kernels
+
+Two per-arch translation units under
+`csrc/kernels/hip/{gfx942,gfx950}/`, each in `sg::gfx<N>`. gfx942 is
+CDNA3 (MI300X / MI300A) with BF16 MFMA inlined into the canonical
+`mamba_peer_batched_step`. gfx950 is CDNA4 (MI350X / MI355X) with
+native FP4 expert MFMA, FP6 state, and 2:4 sparsity. The post-split
+gfx950 layout is four per-feature files plus shared `fp4_helpers.hip.h`
+(see §5). See §24 for per-optimizer detail.
+
+## 9. csrc/kernels/tpu — TPU Pallas kernels
+
+TPU-only kernels for v5p (128-wide MXU pod) and v6e (256-wide MXU,
+tile-256). Used by the JAX port at `supergrok2_jax_tpu/`. The Pallas
+kernels are invoked via `jax.experimental.pallas` and dispatched
+based on `jax.devices()[0].kind`. See §13 (JAX/TPU) for full detail.
+
+## 10. csrc/quantization — pointer
+
+Pointer stub. Quantization kernels (INT8 symmetric, INT4 GPTQ, MXFP4,
+NVFP4, FP8 E4M3) live at `csrc/quantization/`. See §11 for the full
+enumeration of files and per-format support.
 
 ## 11. csrc/quantization — quantization kernels
 
