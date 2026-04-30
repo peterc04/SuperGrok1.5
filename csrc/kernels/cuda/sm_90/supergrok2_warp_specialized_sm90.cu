@@ -62,7 +62,7 @@ namespace sg { namespace sm90 {
 
 // Max supported dimensions for static smem allocation
 #define MAX_D_INNER 128
-#define MAX_D_STATE 32
+#define MAX_D_STATE 128
 
 struct ScanBuffer {
     float x[MAX_D_INNER];

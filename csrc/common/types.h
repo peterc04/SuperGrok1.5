@@ -46,9 +46,9 @@ struct BatchedScanCtx {
 //  Compile-time constants
 // ═══════════════════════════════════════════════════════════════════════
 
-constexpr int MAX_D_STATE = 32;
-constexpr int MAX_D_INNER = 32;
-constexpr int MAX_D_MODEL = 16;
+constexpr int MAX_D_STATE = 128;
+constexpr int MAX_D_INNER = 128;
+constexpr int MAX_D_MODEL = 64;
 constexpr int MAX_GRU_HIDDEN = 8;
 constexpr int MAX_EXPERT_HIDDEN = 16;
 constexpr int MAX_TOPK = 4;

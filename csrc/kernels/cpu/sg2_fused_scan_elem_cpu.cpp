@@ -20,9 +20,9 @@
 #include <omp.h>
 #endif
 
-static constexpr int MAX_D_STATE = 32;
-static constexpr int MAX_D_INNER = 32;
-static constexpr int MAX_D_MODEL = 16;
+static constexpr int MAX_D_STATE = 128;
+static constexpr int MAX_D_INNER = 128;
+static constexpr int MAX_D_MODEL = 64;
 static constexpr int MAX_GRU_HIDDEN = 8;
 static constexpr int MAX_TOPK = 4;
 
