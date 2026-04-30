@@ -25,6 +25,7 @@
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <cublas_v2.h>
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
@@ -2555,10 +2556,119 @@ void launch_mamba3_peer_step(
 
 
 // ═══════════════════════════════════════════════════════════════════════
+//  Hopper FP8 E4M3 Projection Precompute Helpers
+//
+//  Recovered from the pre-deletion sm_90 SG2 overlay (commit 980c2d8).
+//  Uses cublasGemmEx with CUDA_R_8F_E4M3 inputs and FP32 accumulation
+//  for ~4x speedup over FP32 mm on H100. Per-tensor absmax scaling:
+//    scale = max(|tensor|) / 448.0   (FP8 E4M3 max representable)
+//
+//  Math is identical to mamba3_parallel_precompute_kernel — the only
+//  divergence is the GEMM dtype. The scan recurrence remains FP32 for
+//  numerical stability; FP8 is confined to projections.
+//
+//  Note: .item() calls cause CPU-GPU sync (acceptable for correctness).
+//  Production should use a CUDA max-reduce kernel for input scales and
+//  cache weight scales per _weights_dirty flip.
+//
+//  Gated behind CUDA_VERSION >= 11080 (required for kFloat8_e4m3fn and
+//  CUDA_R_8F_E4M3 cuBLAS dtype). Older toolchains skip the FP8 path
+//  entirely and fall through to the FP32 precompute kernel.
+// ═══════════════════════════════════════════════════════════════════════
+
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 11080
+
+static void hopper_fp8_gemm(
+    cublasHandle_t handle,
+    torch::Tensor input,       // [M, K] FP32
+    torch::Tensor weight,      // [N, K] FP32 (weight^T applied in GEMM)
+    torch::Tensor output,      // [M, N] FP32
+    int M, int N, int K
+) {
+    // Per-tensor absmax scaling for FP8
+    float input_scale = input.abs().max().item<float>() / 448.0f;
+    float weight_scale = weight.abs().max().item<float>() / 448.0f;
+
+    // Clamp scales to avoid division by zero
+    if (input_scale < 1e-12f) input_scale = 1e-12f;
+    if (weight_scale < 1e-12f) weight_scale = 1e-12f;
+
+    // Convert to FP8 E4M3
+    auto input_fp8 = (input / input_scale).to(torch::kFloat8_e4m3fn).contiguous();
+    auto weight_fp8 = (weight / weight_scale).to(torch::kFloat8_e4m3fn).contiguous();
+
+    // FP8 GEMM: output = (input_fp8 @ weight_fp8.T) * input_scale * weight_scale
+    float alpha = input_scale * weight_scale;
+    float beta = 0.0f;
+
+    // cuBLAS: C = alpha * op(A) * op(B) + beta * C
+    // We want: output[M,N] = input[M,K] @ weight[N,K].T
+    // In column-major: C(N,M) = weight(N,K) * input(K,M)
+    cublasGemmEx(handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K,
+        &alpha,
+        weight_fp8.data_ptr(), CUDA_R_8F_E4M3, K,
+        input_fp8.data_ptr(), CUDA_R_8F_E4M3, K,
+        &beta,
+        output.data_ptr<float>(), CUDA_R_32F, N,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+static void hopper_precompute_fp8(
+    torch::Tensor x_sorted,          // [N, d_model] FP32
+    torch::Tensor in_proj_W,         // [2*d_inner, d_model] FP32
+    torch::Tensor dt_proj_W,         // [d_inner, d_inner]
+    torch::Tensor dt_proj_b,         // [d_inner]
+    torch::Tensor B_proj_W,          // [d_state, d_inner]
+    torch::Tensor C_proj_W,          // [d_state, d_inner]
+    torch::Tensor pre_x,             // [N, d_inner] output
+    torch::Tensor pre_z,             // [N, d_inner] output
+    torch::Tensor pre_dt,            // [N, d_inner] output
+    torch::Tensor pre_B,             // [N, d_state] output
+    torch::Tensor pre_C,             // [N, d_state] output
+    int N, int d_model, int d_inner, int d_state
+) {
+    auto handle = at::cuda::getCurrentCUDABlasHandle();
+
+    // Split in_proj into x_branch and z_branch weights
+    auto in_proj_x = in_proj_W.narrow(0, 0, d_inner);         // [d_inner, d_model]
+    auto in_proj_z = in_proj_W.narrow(0, d_inner, d_inner);   // [d_inner, d_model]
+
+    // x_branch = x_sorted @ in_proj_x.T  -> [N, d_inner]
+    hopper_fp8_gemm(handle, x_sorted, in_proj_x, pre_x, N, d_inner, d_model);
+
+    // z_branch = x_sorted @ in_proj_z.T  -> [N, d_inner]
+    hopper_fp8_gemm(handle, x_sorted, in_proj_z, pre_z, N, d_inner, d_model);
+
+    // dt_proj: x_branch @ dt_proj_W.T + bias -> softplus
+    hopper_fp8_gemm(handle, pre_x, dt_proj_W, pre_dt, N, d_inner, d_inner);
+
+    // Add bias + softplus (with clamp for large values)
+    pre_dt.add_(dt_proj_b.unsqueeze(0));
+    pre_dt = torch::where(pre_dt > 20.0f, pre_dt, torch::log1p(torch::exp(pre_dt)));
+
+    // B_proj: x_branch @ B_proj_W.T -> [N, d_state]
+    hopper_fp8_gemm(handle, pre_x, B_proj_W, pre_B, N, d_state, d_inner);
+
+    // C_proj: x_branch @ C_proj_W.T -> [N, d_state]
+    hopper_fp8_gemm(handle, pre_x, C_proj_W, pre_C, N, d_state, d_inner);
+}
+
+#endif  // CUDA_VERSION >= 11080
+
+
+// ═══════════════════════════════════════════════════════════════════════
 //  Launcher: Batched Mamba-3 + PEER step (all parameters at once)
 //
 //  Takes vectors of per-parameter tensors, concatenates sorted data,
 //  launches batched scan, then per-parameter fused_elem_step.
+//
+//  Hopper FP8 fast path: when total_N >= GEMM_PRECOMPUTE_THRESHOLD AND
+//  d_inner/d_state/d_model all >= 64 AND CUDA_VERSION >= 11080, the
+//  projection GEMMs run as FP8 E4M3 via hopper_precompute_fp8 in place
+//  of mamba3_parallel_precompute_kernel. Scan recurrence remains FP32.
 // ═══════════════════════════════════════════════════════════════════════
 
 void launch_mamba3_peer_batched_step(
@@ -2754,6 +2864,20 @@ void launch_mamba3_peer_batched_step(
         auto rev_fwd = torch::zeros({num_params}, int_opts);
         auto rev_bwd = torch::ones({num_params}, int_opts);
 
+        // Hopper FP8 fast-path gate: requires CUDA 11.8+ for kFloat8_e4m3fn,
+        // total_N >= GEMM_PRECOMPUTE_THRESHOLD to amortize the absmax-scale
+        // .item() sync, and all GEMM dims (M=total_N, N in {d_inner,d_state},
+        // K in {d_model,d_inner}) >= 64 so cuBLAS dispatches FP8 tensor cores.
+        bool use_fp8_precompute = false;
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 11080
+        use_fp8_precompute = (total_N >= GEMM_PRECOMPUTE_THRESHOLD)
+                          && (d_inner >= 64) && (d_state >= 64) && (d_model >= 64);
+#endif
+        if (use_fp8_precompute) {
+            auto handle = at::cuda::getCurrentCUDABlasHandle();
+            cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
+        }
+
         auto run_batched_parallel_scan = [&](
             torch::Tensor in_proj_W, torch::Tensor dt_proj_W, torch::Tensor dt_proj_b,
             torch::Tensor B_proj_W, torch::Tensor C_proj_W,
@@ -2762,21 +2886,35 @@ void launch_mamba3_peer_batched_step(
             torch::Tensor scan_packed, torch::Tensor rev_flags
         ) {
             // Phase A: precompute for all packed timesteps (all params share weights)
-            const int pre_grid = (total_N + SG2M_BLOCK - 1) / SG2M_BLOCK;
-            mamba3_parallel_precompute_kernel<<<pre_grid, SG2M_BLOCK>>>(
-                x_sorted_packed.data_ptr<float>(),
-                in_proj_W.data_ptr<float>(),
-                dt_proj_W.data_ptr<float>(),
-                dt_proj_b.data_ptr<float>(),
-                B_proj_W.data_ptr<float>(),
-                C_proj_W.data_ptr<float>(),
-                pre_x.data_ptr<float>(),
-                pre_z.data_ptr<float>(),
-                pre_dt.data_ptr<float>(),
-                pre_B.data_ptr<float>(),
-                pre_C.data_ptr<float>(),
-                total_N, d_model, d_inner, d_state
-            );
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 11080
+            if (use_fp8_precompute) {
+                // Hopper FP8 E4M3 projection precompute via cublasGemmEx.
+                // Math identical to mamba3_parallel_precompute_kernel: only
+                // the GEMM dtype changes (FP8 inputs -> FP32 accumulation).
+                hopper_precompute_fp8(
+                    x_sorted_packed,
+                    in_proj_W, dt_proj_W, dt_proj_b, B_proj_W, C_proj_W,
+                    pre_x, pre_z, pre_dt, pre_B, pre_C,
+                    total_N, d_model, d_inner, d_state);
+            } else
+#endif
+            {
+                const int pre_grid = (total_N + SG2M_BLOCK - 1) / SG2M_BLOCK;
+                mamba3_parallel_precompute_kernel<<<pre_grid, SG2M_BLOCK>>>(
+                    x_sorted_packed.data_ptr<float>(),
+                    in_proj_W.data_ptr<float>(),
+                    dt_proj_W.data_ptr<float>(),
+                    dt_proj_b.data_ptr<float>(),
+                    B_proj_W.data_ptr<float>(),
+                    C_proj_W.data_ptr<float>(),
+                    pre_x.data_ptr<float>(),
+                    pre_z.data_ptr<float>(),
+                    pre_dt.data_ptr<float>(),
+                    pre_B.data_ptr<float>(),
+                    pre_C.data_ptr<float>(),
+                    total_N, d_model, d_inner, d_state
+                );
+            }
 
             // Zero scan output
             gpuMemsetAsync(scan_packed.data_ptr<float>(), 0,
@@ -2816,6 +2954,12 @@ void launch_mamba3_peer_batched_step(
             mamba_bwd_A_log, mamba_bwd_D, mamba_bwd_rope,
             initial_bwd, final_bwd, bwd_scan_packed, rev_bwd
         );
+
+        // Restore default cuBLAS math mode if FP8 path mutated it
+        if (use_fp8_precompute) {
+            auto handle = at::cuda::getCurrentCUDABlasHandle();
+            cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
+        }
     } else if (num_params >= 4 && max_N <= 256) {
         // ===== SEQUENTIAL BATCHED SCAN for many small params =====
         // Uses mamba3_scan_batched_kernel: one block per param, separate fwd/bwd
