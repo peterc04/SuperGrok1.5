@@ -193,6 +193,39 @@ Items that have been **completed since the previous REFRESH.md edit**:
   all MAX_D-sized arrays are thread-private. Four CPU kernel files
   and one sm_90 warp-specialized file had local shadow constants
   synced.
+- **Race driver — 3-way train/val/test split**: `grokking_race_v2.py`
+  refactored to carve a val set out of the train portion (controlled
+  by `--val-ratio`, default 0.10, auto-overrides to 0.05 on 10/90).
+  All `make_data*` functions return six tensors instead of four. All
+  11 training functions take `(c, init, tx, ty, vax, vay, tex, tey,
+  dev, bp)`. SG2 / SG1.5 / SG1.1 bilevel and meta updates now consume
+  the val set; previously they consumed test data — that test leak
+  is now closed. Other 8 optimizers stay train-only.
+- **Race driver — fixed early-stopping rule**: `EarlyStopper` now
+  triggers on either `val_acc >= 0.95` or `step >= 20,000`, whichever
+  fires first. Both thresholds are CLI-configurable
+  (`--early-stop-val-acc`, `--early-stop-max-steps`). Eval frequency
+  controlled by `--eval-every` (default 100). `stopping_reason` and
+  `stopping_step` are recorded in the output.
+- **Race driver — held-out test eval**: `_fin()` runs `model.eval()`
+  + `torch.no_grad()` test-set evaluation exactly once at end of
+  each run. `TrainResult` and JSON output gain `final_test_acc`,
+  `final_test_loss`, `final_val_loss`, `val_test_gap` (the
+  meta-learning vs masked-overfitting diagnostic), `stopping_reason`,
+  `stopping_step`, and `val_ratio`. See §3.12 for the fairness
+  framing and §15 for the full CLI surface.
+- **Race driver — CLI surface expanded**: new flags `--optimizers`,
+  `--seeds`/`--num-seeds`, `--tasks`, `--train-test-ratios`,
+  `--val-ratio`, `--early-stop-val-acc`, `--early-stop-max-steps`,
+  `--eval-every`, `--output`. All pre-existing flags (`--setup`,
+  `--ntfy`, `--gpus`, `--grad-hooks`, `--port`, `--no-status-server`)
+  preserved.
+- **Race driver — split sanity tests**: new `tests/test_race_split.py`
+  with 10 sections covering split arithmetic for both 80/20+10% and
+  10/90+5%, disjointness via index sets, deterministic split,
+  val_ratio auto-override, EarlyStopper stopping_reason for both
+  triggers, and TrainResult output schema completeness. Skip-marks
+  gracefully when `_HAS_OPS` is false.
 - **SG v2 bindings**: all seven SG2 entry points
   (`supergrok2_mamba_peer_step`, `supergrok2_mamba_peer_batched_step`,
   `supergrok2_bilevel_fwd_save{_batched}`,
