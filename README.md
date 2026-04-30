@@ -69,10 +69,12 @@ bash build.sh
 `build.sh` accepts:
 
 ```
-bash build.sh                # default ninja-backed build
-bash build.sh --autotune     # two-pass build with autotune sweep
-bash build.sh --debug        # cuda-gdb friendly build (-G -O0)
-bash build.sh --profile      # NCU-friendly build + profile_smoke run
+bash build.sh                    # default ninja-backed build
+bash build.sh --autotune         # two-pass build with autotune sweep
+bash build.sh --debug            # cuda-gdb friendly build (-G -O0)
+bash build.sh --profile          # NCU-friendly build + profile_smoke run
+bash build.sh --package          # build + stage redistributable dist/ tree
+bash build.sh --package-tarball  # --package + supergrok2-VERSION-SHA.tar.gz
 ```
 
 Notes:
@@ -82,6 +84,23 @@ Notes:
   newer hardware.
 - `ccache` and `sccache` are auto-detected via
   `CMAKE_*_COMPILER_LAUNCHER` if present.
+
+### Pre-built distribution
+
+`bash build.sh --package` runs the full build, then stages a `dist/` tree
+that mirrors the runtime import layout (`grokking_optimizers/`,
+`supergrok2_jax_tpu/`, `csrc/kernels/tpu/`, `csrc/common/tuned_configs.h`,
+plus an auto-generated `INSTALL.md`). Debug symbols are stripped unless
+`--debug` was also passed. The compiled `_ops.*.so` is a multi-arch
+fatbin containing cubin and PTX for every supported arch.
+
+`bash build.sh --package-tarball` does the same and additionally produces
+`supergrok2-3.0.0-<git-sha>.tar.gz` suitable for direct upload as a
+GitHub release asset. Consumers extract the tarball and follow
+`dist/INSTALL.md` — three install paths are documented (drop into
+`PYTHONPATH`, copy into `site-packages`, or build a wheel from the
+staged tree). No source compilation is needed on the consumer side as
+long as the consumer's GPU is in the supported arch set.
 - `WITH_CUTLASS=1` opts into CUTLASS GEMMs on Hopper and Blackwell. The
   default keeps cuBLAS / rocBLAS until you opt in.
 
@@ -123,12 +142,14 @@ For full per-optimizer descriptions see `REFRESH.md §3`.
 
 ## Build modes
 
-| Mode         | Effect |
-|--------------|--------|
-| (default)    | AOT fatbin build through ninja. Embeds machine code for every supported arch and `sm_120` PTX for forward-compat. |
-| `--autotune` | Two-pass build. Stub-config build first, then `python autotune/tune.py` sweeps grids and writes winners between the `// AUTOTUNE_BEGIN` / `// AUTOTUNE_END` markers in `csrc/common/tuned_configs.h`, then a final rebuild. |
-| `--debug`    | Compiles with `-G -O0`, suitable for `cuda-gdb` stepping through device code. |
-| `--profile`  | Compiles with `-lineinfo` and runs `ncu --set full` against `benchmarks/profile_smoke.py` (5 steps × all 11 optimizers) so the profile is dropped next to the build. |
+| Mode                 | Effect |
+|----------------------|--------|
+| (default)            | AOT fatbin build through ninja. Embeds machine code for every supported arch and `sm_120` PTX for forward-compat. |
+| `--autotune`         | Two-pass build. Stub-config build first, then `python autotune/tune.py` sweeps grids and writes winners between the `// AUTOTUNE_BEGIN` / `// AUTOTUNE_END` markers in `csrc/common/tuned_configs.h`, then a final rebuild. |
+| `--debug`            | Compiles with `-G -O0`, suitable for `cuda-gdb` stepping through device code. |
+| `--profile`          | Compiles with `-lineinfo` and runs `ncu --set full` against `benchmarks/profile_smoke.py` (5 steps × all 11 optimizers) so the profile is dropped next to the build. |
+| `--package`          | Runs the build, then stages a redistributable `dist/` tree mirroring the runtime import layout. Strips debug symbols unless combined with `--debug`. Compatible with `--autotune` (ships the post-tune `tuned_configs.h`). |
+| `--package-tarball`  | `--package` plus a `supergrok2-VERSION-SHA.tar.gz` suitable for direct GitHub release upload. Consumers extract and follow the auto-generated `dist/INSTALL.md`. |
 
 ## Architecture overview
 
