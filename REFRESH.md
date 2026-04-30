@@ -312,8 +312,6 @@ Items that **remain deferred** (engineering work — see §25 for detail):
 
 - Real per-arch kernel divergence beyond Muon and SG2-on-sm_90 / sm_80 / gfx942
   (most of the 8 × 17 wrapped baselines are still byte-identical modulo namespace).
-- Raising `MAX_D_MODEL/MAX_D_STATE/MAX_D_INNER` caps in `csrc/common/types.h`
-  above 64 to actually activate the Hopper FP8 path (currently capped at 16/32/32).
 - Hopper warp-specialized scan activation
   beyond the renamed `_warp_specialized` declarators.
 - Fused softplus epilogue in CUTLASS for SG2 `dt_proj`.
