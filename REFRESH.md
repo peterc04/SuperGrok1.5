@@ -382,7 +382,7 @@ For navigation, the structural-refactor commits:
 18. Known gaps
 19. Quick reference
 
-§24 is the per-arch per-optimizer rundown; §25 is the engineering-remaining list.
+§22 is the comprehensive grokking race driver reference; §24 is the per-arch per-optimizer rundown; §25 is the engineering-remaining list.
 
 ---
 
@@ -949,11 +949,10 @@ Nine files, ~3,120 LOC. Total test points ~92.
 - Early stopping triggers on test_acc ≥ 95% or 20k steps (whichever
   first); test is the outer held-out portion. Val is the inner carve-
   out consumed only by SG variants.
-- CLI: `--optimizers`, `--seeds`/`--num-seeds`, `--tasks`, `--train-test-ratios`, `--val-ratio`, `--early-stop-test-acc`, `--early-stop-max-steps`, `--eval-every`, `--output`
-- Per-step train/val/test eval at `eval_every` intervals + final
-  `model.eval()` + `no_grad` test eval in `_fin()`
-- JSON output includes: optimizer, seed, task, train_test_ratio, val_ratio, stopping_reason, stopping_step, final_val_acc, final_val_loss, final_test_acc, final_test_loss, val_test_gap, wall_clock_seconds, plus full train/val/test curves
 - Multi-GPU support via `--gpus`; ntfy.sh notifications via `--ntfy`
+- **See §22 for comprehensive details**: tasks, models, split tables,
+  optimizer-to-loader mapping, run modes, full CLI, output schema,
+  multi-GPU dispatch, and notifications.
 
 ### Fairness notes (from `ANALYSIS.md` §3)
 - Same init, multi-GPU round-robin, multi-seed bands ✓
@@ -1132,6 +1131,280 @@ phases). For the live engineering-remaining list, see §25.
 - Build: `setup.py`
 - User docs: `README.md`
 - Internal review: `ANALYSIS.md`
+
+
+## 22. Grokking race driver
+
+The 11-optimizer, 3-architecture, 4-split grokking race lives in
+`grokking_race_v2.py` (1700+ lines, single-file). It is the project's
+flagship empirical comparison harness. This section enumerates every
+moving piece in detail; §15 contains a one-paragraph summary and §3.12
+the fairness model.
+
+### 22.1 Purpose
+
+Compare 11 optimizers head-to-head on three algorithmic grokking
+tasks across four train/test splits, holding initialization, model
+architecture, eval cadence, early-stopping rule, and seed bands fixed
+across all runs. Output is a structured JSON of per-run statistics
+plus a deterministic set of plots (loss/accuracy curves, time-to-grok
+bars, success-rate heatmaps). The full sweep is 11 × 3 × 4 × 5 seeds
+= 660 runs.
+
+### 22.2 Tasks (data generators)
+
+Three tasks, each on integers mod p=97 (configurable). All produce
+the same canonical 6-tensor return shape `(train_x, train_y, val_x,
+val_y, test_x, test_y)` after the train/val/test split machinery.
+
+- **Decoder task — modular division.** Generates every `(a, b)` with
+  `a ∈ [0, p), b ∈ [1, p)` and computes `(a · b⁻¹) mod p` using
+  Fermat's little theorem (`b⁻¹ = b^(p-2) mod p`). 4-token sequence
+  `[a, op, b, eq]` per example, total `p × (p-1) = 9312` examples.
+- **ViT task — MNIST-addition.** Renders `(a + b) mod p` from MNIST
+  digit images. Each integer `n ∈ [0, p)` is laid out as a tens-ones
+  digit pair (concatenated horizontally), so two operands tile to a
+  `28×14` image which `unfold` slices into 16 non-overlapping `7×7`
+  patches of dimension 49. Total `p² = 9409` examples.
+- **Mamba task — sequential chained division.** A length-`chain_length`
+  (default 3) chain `a / b₁ / b₂ / b₃ mod p` with sequence layout
+  `[a, op, b₁, op, b₂, op, b₃, eq]`. Sample size capped at
+  `p × (p-1)` for parity with the decoder task; chains are deduplicated
+  by tuple-key.
+
+All three deterministically derive shuffling order from `seed`. Token
+vocab is `p + 2` (operators get tokens `p` and `p+1`).
+
+### 22.3 Models
+
+Per-task model classes, all built from the same primitives.
+
+- **`Transformer`** (decoder task). 2-layer (configurable) decoder
+  with multi-head causal attention + feedforward block (4× expansion,
+  GELU). Token embedding + positional embedding. Final layer-norm,
+  linear head to vocab size. Causal mask precomputed in the block.
+  Defaults: 128-dim, 4 heads, 2 layers, seq_len=4. Param count ~430K
+  for the small scale.
+- **`ViT`** (ViT task). Patch projection from 49-dim patches to
+  embedding, prepended `[CLS]` token, additive positional embedding
+  over `num_patches+1` positions, full-attention (non-causal)
+  encoder blocks, final layer-norm, classification head reading the
+  `[CLS]` position only. Defaults: same dim/head/layer count.
+- **`MambaModel`** (mamba task). Stacked `SelectiveSSMLayer` blocks.
+  Each block: in-projection to 2× inner dim (split into x and z),
+  depthwise 1D conv (kernel=3, groups=`d_inner`), SiLU, B/C/dt
+  projection, selective scan, output projection, residual + layer-
+  norm. Optional CUDA scan kernel via `mamba_scan_ext` (JIT-compiled
+  from `mamba_scan_kernel.cu` if present); falls back to a Python
+  scan loop. Defaults: 128-dim, expand_factor=2, state_dim=16.
+
+Three sizes are configurable via `MODEL_SCALES`:
+- `small` — 128-dim, 4 heads, 2 layers (~420K params)
+- `medium` — 256-dim, 8 heads, 4 layers (~3.5M params)
+- `large` — 512-dim, 8 heads, 6 layers (~20M params)
+
+`build_model()` optionally wraps the model in `torch.compile` with
+`mode="reduce-overhead"`; `get_init_state()` snapshots the initial
+state dict per-seed so all 11 optimizers see identical starting
+weights for fairness.
+
+### 22.4 Train/val/test split
+
+Two-step split, deterministic per `(task, frac_train, val_ratio,
+seed)`:
+
+1. **Outer split** at `frac_train`: one of 0.10 / 0.25 / 0.50 / 0.80
+   train ratios, with the complement held out as test.
+2. **Inner split** of the train portion at `val_ratio` (default 0.10):
+   the carved val set is used only by SG variants for bilevel/meta
+   updates. The remaining train portion is what every optimizer
+   actually trains on.
+
+Auto-override: when `val_ratio` is unset and `frac_train == 0.10`,
+the val ratio drops to 0.05 to avoid near-empty val sets (5 examples
+on a 10% train of a 9300-example task).
+
+Concrete sizes for a 9312-example decoder task:
+
+| frac_train | val_ratio | train | val | test |
+|------------|-----------|-------|-----|------|
+| 0.10       | 0.05 (auto) | 884 | 46 | 8382 |
+| 0.25       | 0.10      | 2095 | 232 | 6985 |
+| 0.50       | 0.10      | 4190 | 466 | 4656 |
+| 0.80       | 0.10      | 6704 | 745 | 1863 |
+
+### 22.5 The 11 optimizers
+
+Built from the `grokking_optimizers` C++/CUDA package (see §3 for
+internals). Per-optimizer training functions live in `grokking_race_v2.py`
+in section "PART 2: TRAINING LOOPS"; signature is
+`(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0)` for all 11.
+
+- **AdamW** — pytorch fused AdamW baseline, train-only.
+- **NeuralGrok** — does its own 90/10 inner split of the train portion
+  for the amplifier MLP's outer loop; the carved val set is unused.
+- **GrokAdamW** — train-only, with EMA gradient filter and persistent-
+  direction amplification.
+- **SuperGrok v1.1** — consumes val for `meta_step` (every
+  `meta_update_freq=5` steps) and val for SAM step. Cosine-similarity
+  gating.
+- **SuperGrok v1.5** — consumes val for `bilevel_step` (adaptive
+  frequency from sigmoid schedule). Train-only SAM. Per-step val_loss
+  feedback into `opt.step(val_loss=...)` at `alpha_update_freq` (50).
+- **SuperGrok v2** — same val-consumption pattern as v1.5 but with
+  Mamba-3 + PEER metanet + 144-expert pool internally.
+- **Grokfast** — train-only, EMA-filtered gradient accumulator.
+- **Muon** — dual: Newton-Schulz orthogonalization for 2D weights,
+  AdamW for 1D. Train-only.
+- **Lion** — train-only signSGD-with-momentum.
+- **LookSAM** — train-only, periodic SAM step every `k=5` steps.
+- **Prodigy** — train-only, learning-rate-free adaptive optimizer.
+
+The three SG variants are the only optimizers that take `val_x, val_y`
+as input to their internal updates. The other eight ignore val.
+
+### 22.6 Eval cadence and early stopping
+
+`_eval_log` is invoked every `eval_every` steps (default 100) and
+evaluates train, val, and test in sequence. All three loss/accuracy
+arrays are recorded into `TrainResult`. `EarlyStopper.step(test_acc,
+current_step)` is called with the just-computed `test_acc` and
+returns True (stop) when either:
+
+- `test_acc >= early_stop_test_acc` (default 0.95) for `patience`
+  consecutive checks, OR
+- `current_step >= early_stop_max_steps` (default 20,000)
+
+The stopper records `stopping_reason` (`test_acc_threshold` or
+`max_steps`), `stopping_step`, and the first-grok event
+(`grokking_step`, `grokking_wall`) for diagnostic output. The rule
+is fixed and identical across all 11 optimizers, which means test is
+"selection-free" — no hyperparameter is being chosen by it.
+
+`_fin()` runs a final `model.eval()` + `torch.no_grad()` test
+evaluation and stores `final_test_acc`, `final_test_loss`, the
+matching `final_val_acc` / `final_val_loss`, and the diagnostic
+`val_test_gap = final_val_acc - final_test_acc`.
+
+### 22.7 Run modes
+
+Selected via the `MODE` constant near the bottom of the file (no CLI
+flag — change the source line). Five modes:
+
+- **A** — Single architecture × single split. Defaults: decoder task,
+  25/75, 6 seeds (`SEEDS_A`).
+- **B** — Multi-split. One architecture × all four splits × 5 seeds.
+- **C** — Architecture comparison. Three architectures × one split
+  (25/75) × 5 seeds.
+- **D** — Full sweep. Three architectures × four splits × 5 seeds =
+  660 runs. Default mode.
+- **E** — Scale comparison. One architecture × three model scales
+  (small/medium/large) × 5 seeds.
+
+Total run counts are computed up-front for ETA estimation; the status
+server and ntfy notifications use this to project completion time.
+
+### 22.8 CLI surface (full)
+
+| Flag | Type | Default | Effect |
+|------|------|---------|--------|
+| `--setup` | flag | off | Install deps via pip and exit. |
+| `--gpus` | str | None | Comma-separated GPU IDs ("0,1,2,3") or "auto". Activates multi-GPU spawn-mode worker pool. |
+| `--ntfy` | str | None | ntfy.sh topic for push notifications. |
+| `--port` | int | 8080 | HTTP status server port. |
+| `--no-status-server` | flag | off | Disable HTTP status server. |
+| `--grad-hooks` | flag | off | Enable `GradientHookOptimizer` wrapper. |
+| `--val-ratio` | float | None | Fraction of train carved as val. None = 0.10, auto-override to 0.05 on 10/90. |
+| `--early-stop-test-acc` | float | 0.95 | Test accuracy threshold for stopping. |
+| `--early-stop-max-steps` | int | 20000 | Hard step cap. |
+| `--eval-every` | int | 100 | Eval frequency in training steps. |
+| `--optimizers` | str | None | Comma-separated subset of the 11 optimizer names. |
+| `--seeds` | str | None | Comma-separated seed list (overrides defaults). |
+| `--num-seeds` | int | None | Take first N from default seed list. |
+| `--tasks` | str | None | Comma-separated subset of `decoder,vit,mamba`. |
+| `--train-test-ratios` | str | None | Comma-separated `"10/90,25/75,50/50,80/20"` style. |
+| `--output` | str | "results" | Output directory. |
+
+### 22.9 Output
+
+For each `(task, frac_train)` combination, written to
+`<output>/results_<task>_ft<frac>.json`:
+
+```
+{
+  "_meta": {"total_wall": float, "model_type": str, "frac_train": float},
+  "<optimizer>": [
+    {
+      "seed": int,
+      "steps": [int, ...],
+      "train_losses": [float, ...], "train_accs": [float, ...],
+      "val_losses":   [float, ...], "val_accs":   [float, ...],
+      "test_losses":  [float, ...], "test_accs":  [float, ...],
+      "wall_time": float, "total_steps": int,
+      "grokking_step": int|null, "grokking_wall": float|null,
+      "final_train_acc": float,
+      "final_val_acc": float, "final_val_loss": float,
+      "final_test_acc": float, "final_test_loss": float,
+      "val_test_gap": float,
+      "stopping_reason": "test_acc_threshold" | "max_steps",
+      "stopping_step": int,
+      "val_ratio": float, "frac_train": float, "model_type": str
+    },
+    ...
+  ]
+}
+```
+
+Plus PNG plots in the same directory:
+- `curves_<task>_ft<n>.png` — 2×2 grid of train/val acc + train/val
+  loss curves with mean ± std bands across seeds.
+- `race_<task>_ft<n>.png` — horizontal bar chart of time-to-grok and
+  steps-to-grok per optimizer.
+- `split_comparison_<task>.png`, `split_heatmap_<task>.png` — when
+  multi-split mode runs (B / D).
+- `architecture_comparison.png`, `architecture_val_curves.png`,
+  `architecture_heatmap.png` — when multi-arch mode runs (C / D).
+- `full_sweep_heatmap.png` — when MODE=D.
+
+### 22.10 Multi-GPU mode
+
+When `--gpus` lists ≥ 2 devices, `mp.set_start_method("spawn",
+force=True)` activates and one worker process per GPU is spawned.
+Tasks `(optimizer_name, seed)` are distributed via a shared `MPQueue`
+with poison-pill termination; fast GPUs naturally pick up more work.
+Each worker lazily creates the per-seed data and init-state on its
+own GPU to avoid cross-device tensor issues. Results are collected via
+a return queue with a 2-hour per-task timeout.
+
+Single-GPU and CPU paths share the same per-seed data caching logic
+but run sequentially in-process.
+
+### 22.11 Status server and notifications
+
+A daemon HTTP server starts on `--port` (default 8080) and serves
+`GET /` with a JSON snapshot of `_PROGRESS` (current run, total runs,
+ETA, completed runs, error log, summary string). External polling:
+`curl http://<host>:8080/status`.
+
+ntfy.sh integration: `--ntfy <topic>` registers a topic for both
+push notifications (race start, per-grok, per-error, race complete)
+and a listener that responds to `status` / `progress` / `eta`
+messages with a formatted progress report.
+
+### 22.12 Setup and installation
+
+`python grokking_race_v2.py --setup` installs runtime deps
+(`torch torchvision matplotlib numpy tqdm requests`), pip-installs
+`grokking_optimizers/` in editable mode (which compiles the C++/CUDA
+extension), and pre-downloads MNIST. Idempotent.
+
+### 22.13 Sanity tests
+
+`tests/test_race_split.py` (10 sections) covers split arithmetic,
+disjointness, determinism, val_ratio auto-override on 10/90,
+EarlyStopper stopping_reason for both triggers, and TrainResult
+output schema completeness. Skips gracefully when `_HAS_OPS` is
+false. See §14 for the full test inventory.
 
 
 ## 24. Per-arch per-optimizer rundown
