@@ -1,6 +1,6 @@
 // bindings/muon.cpp — runtime dispatch to per-arch Muon launchers.
 //
-// Per-arch namespaces define five launchers (signatures must match the
+// Per-arch namespaces define four launchers (signatures must match the
 // definitions in csrc/kernels/{cuda/<sm>,hip/gfx{942,950}}/muon_<arch>.cu):
 //
 //   launch_muon_momentum_normalize(buf, X, grad, momentum, inv_norm)
@@ -8,12 +8,12 @@
 //   launch_muon_update(param, orth, neg_lr_scale, decay_factor)
 //   launch_muon_ns_combine_update_fused(
 //       param, X, AX, AAX, a, b, c, neg_lr_scale, decay_factor)
-//   launch_muon_fused_step(
-//       param, momentum_buffer, grad,
-//       lr, momentum, weight_decay, ns_steps, a, b, c)
 //
-// The Newton-Schulz coefficients (3.4445, -4.7750, 2.0315) come from the
-// pre-refactor ops.cpp constants and are passed as a, b, c.
+// The vector-API muon_fused_step in this file orchestrates the per-tensor
+// pipeline (norm reduction, NS iterations, fused final step) and is the
+// only Python-callable Muon entry. The Newton-Schulz coefficients
+// (3.4445, -4.7750, 2.0315) come from the pre-refactor ops.cpp constants
+// and are passed as a, b, c.
 
 #include "_dispatch_macro.h"
 #include "_helpers.h"
@@ -40,11 +40,6 @@ namespace sg {
             torch::Tensor AX, torch::Tensor AAX,                              \
             float a, float b, float c,                                        \
             float neg_lr_scale, float decay_factor);                          \
-        void launch_muon_fused_step(                                          \
-            torch::Tensor param, torch::Tensor momentum_buffer,               \
-            torch::Tensor grad,                                               \
-            float lr, float momentum, float weight_decay, int ns_steps,       \
-            float a, float b, float c);                                       \
     }
 
 DECLARE_MUON(sm80) DECLARE_MUON(sm89) DECLARE_MUON(sm90)

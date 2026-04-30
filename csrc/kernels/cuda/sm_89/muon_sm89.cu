@@ -395,48 +395,4 @@ void launch_muon_ns_combine_update_fused(
 //  Newton-Schulz uses ATen torch::mm (cuBLAS). Element-wise ops use
 //  the custom kernels above (with float4 fast path when possible).
 // ═══════════════════════════════════════════════════════════════════════
-
-void launch_muon_fused_step(
-    torch::Tensor param, torch::Tensor momentum_buffer, torch::Tensor grad,
-    float lr, float momentum, float weight_decay, int ns_steps,
-    float a, float b, float c
-) {
-    // 1. Momentum update + normalize
-    float norm = (momentum_buffer.mul_(momentum).add_(grad)).norm().item<float>();
-    float inv_norm = (norm > 1e-8f) ? (1.0f / norm) : 0.0f;
-    auto X = momentum_buffer * inv_norm;
-
-    // 2. Newton-Schulz iterations (for 2D weight matrices)
-    if (X.dim() >= 2) {
-        int M = X.size(0);
-        int N_dim = X.size(1);
-        auto X_2d = X.view({M, N_dim});
-
-        float neg_lr = -lr;
-        float decay = 1.0f - weight_decay * lr;
-
-        for (int i = 0; i < ns_steps; i++) {
-            auto AX = torch::mm(torch::mm(X_2d.t(), X_2d), X_2d.t()).t();
-            auto AAX = torch::mm(torch::mm(X_2d.t(), torch::mm(X_2d, X_2d.t())), X_2d.t()).t();
-
-            if (i < ns_steps - 1) {
-                // Intermediate iteration: just ns_combine
-                launch_muon_ns_combine(X_2d, X_2d, AX, AAX, a, b, c);
-            } else {
-                // Last iteration: fused ns_combine + update (saves one global mem round-trip)
-                launch_muon_ns_combine_update_fused(
-                    param.view({M, N_dim}), X_2d, AX, AAX, a, b, c, neg_lr, decay);
-                return;  // param already updated
-            }
-        }
-        X = X_2d.view_as(param);
-    }
-
-    // 3. Fallback for 1D params or ns_steps==0: separate update
-    float neg_lr = -lr;
-    float decay = 1.0f - weight_decay * lr;
-    launch_muon_update(param, X, neg_lr, decay);
-}
-
-
 } } // namespace sg::sm89
