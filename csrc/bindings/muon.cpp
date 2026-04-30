@@ -121,7 +121,7 @@ void muon_fused_step(
         int64_t cols = p.size(1);
         float max_dim = static_cast<float>(std::max(rows, cols));
         float scale_factor = 0.2f * std::sqrt(max_dim);
-        float neg_lr_scale = -lr * scale_factor / std::sqrt(max_dim);
+        float neg_lr_scale = -lr * scale_factor;
         float decay_factor = 1.0f - lr * wd;
 
         for (int step = 0; step < ns_steps; step++) {
