@@ -1,7 +1,18 @@
 // csrc/kernels/hip/gfx942/models/attention.hip.h
-// Shared attention kernel for gfx942 (CDNA3 / MI300X). Mirrors sm_90
-// attention.cuh with HIP types, wave-64, CK/AITER backends.
-// LDS-based path for tiny seq_len. BF16 activations, FP32 accumulation.
+// Shared attention kernel for gfx942 (CDNA3 / MI300X). Serves both Decoder
+// (causal, seq_len=4) and ViT (non-causal, seq_len=17) via kCausal template.
+//
+// Key differences from sm_90:
+//   - Wave size 64: reductions use __shfl_xor with strides {32,16,8,4,2,1}
+//   - No WGMMA/TMA: BF16 MFMA via __builtin_amdgcn_mfma_f32_16x16x16bf16
+//   - 64 KB LDS per CU (not 228 KB SMEM)
+//   - FULL_WARP_MASK is 0 on HIP (all 64 lanes lockstep)
+//   - CK FMHA gated behind WITH_CK; fallback to hand-written MFMA path
+//   - Occupancy via GROK_WAVES_PER_EU / GROK_FLAT_WORK_GROUP_SIZE
+//   - warp_reduce_sum from utils.cuh (already wave-64 aware)
+//
+// For grokking shapes (d_head=32, seq_len=4/17), QK^T fits in regs/LDS.
+// One workgroup per (batch, head) pair.
 #pragma once
 #include "csrc/common/platform.h"
 #include "csrc/common/types.h"
@@ -23,6 +34,27 @@ struct AttentionLaunchConfig {
     bool use_aiter;
     int waves_per_eu;  // occupancy hint for CDNA3 scheduler
 };
+
+// -- Wave-64 XOR butterfly reductions ----------------------------------------
+__device__ __forceinline__ float wave64_reduce_sum(float val) {
+    val += __shfl_xor(val, 32);
+    val += __shfl_xor(val, 16);
+    val += __shfl_xor(val, 8);
+    val += __shfl_xor(val, 4);
+    val += __shfl_xor(val, 2);
+    val += __shfl_xor(val, 1);
+    return val;
+}
+
+__device__ __forceinline__ float wave64_reduce_max(float val) {
+    val = fmaxf(val, __shfl_xor(val, 32));
+    val = fmaxf(val, __shfl_xor(val, 16));
+    val = fmaxf(val, __shfl_xor(val, 8));
+    val = fmaxf(val, __shfl_xor(val, 4));
+    val = fmaxf(val, __shfl_xor(val, 2));
+    val = fmaxf(val, __shfl_xor(val, 1));
+    return val;
+}
 
 // -- External backend forward declarations ------------------------------------
 #ifdef WITH_CK
