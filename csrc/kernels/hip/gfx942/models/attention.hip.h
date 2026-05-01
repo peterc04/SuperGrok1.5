@@ -160,17 +160,123 @@ hipError_t attention_forward(
 #endif
 }
 
-// -- Backward (stub -- full impl in a separate TU) ----------------------------
+// -- Backward kernel ----------------------------------------------------------
+// Recomputes attention weights from softmax_lse (log-sum-exp saved in fwd).
+// dV = A^T dO, dA = dO V^T, backprop through softmax, dQ = dA' K * scale,
+// dK = dA'^T Q * scale. All in LDS for these tiny sequence lengths.
+
+template <typename ActT, int kHeadDim, bool kCausal>
+__global__
+GROK_FLAT_WORK_GROUP_SIZE(64, 256)
+GROK_WAVES_PER_EU(1, 4)
+void lds_attention_bwd_kernel(
+    const ActT* __restrict__ grad_out,   // [B, H, N, D]
+    const ActT* __restrict__ q,
+    const ActT* __restrict__ k,
+    const ActT* __restrict__ v,
+    const ActT* __restrict__ attn_out,   // saved forward output
+    const float* __restrict__ softmax_lse, // [B, H, N]
+    ActT* __restrict__ grad_q,
+    ActT* __restrict__ grad_k,
+    ActT* __restrict__ grad_v,
+    int seq_len, float scale
+) {
+    const int bh = blockIdx.x, tid = threadIdx.x;
+    const int N = seq_len, D = kHeadDim, base = bh * N * D;
+
+    extern __shared__ float lds[];
+    float* scores = lds;             // N * N (attention weights)
+    float* dA     = scores + N * N;  // N * N (grad through attn weights)
+
+    // Recompute attention weights from softmax_lse
+    for (int idx = tid; idx < N * N; idx += blockDim.x) {
+        int i = idx / N, j = idx % N;
+        if constexpr (kCausal) {
+            if (j > i) { scores[idx] = 0.0f; continue; }
+        }
+        float dot = 0.0f;
+        for (int d = 0; d < D; d++)
+            dot += static_cast<float>(q[base + i * D + d])
+                 * static_cast<float>(k[base + j * D + d]);
+        float lse = softmax_lse[bh * N + i];
+        scores[idx] = ptx_expf(dot * scale - lse);
+    }
+    __syncthreads();
+
+    // dV = A^T dO
+    for (int idx = tid; idx < N * D; idx += blockDim.x) {
+        int j = idx / D, d = idx % D;
+        float acc = 0.0f;
+        for (int i = 0; i < N; i++)
+            acc += scores[i * N + j]
+                 * static_cast<float>(grad_out[base + i * D + d]);
+        grad_v[base + idx] = static_cast<ActT>(acc);
+    }
+    __syncthreads();
+
+    // dA = dO V^T
+    for (int idx = tid; idx < N * N; idx += blockDim.x) {
+        int i = idx / N, j = idx % N;
+        float acc = 0.0f;
+        for (int d = 0; d < D; d++)
+            acc += static_cast<float>(grad_out[base + i * D + d])
+                 * static_cast<float>(v[base + j * D + d]);
+        dA[idx] = acc;
+    }
+    __syncthreads();
+
+    // Backprop through softmax: dS_ij = A_ij * (dA_ij - sum_k(A_ik * dA_ik))
+    for (int i = tid; i < N; i += blockDim.x) {
+        float dot_sum = 0.0f;
+        for (int j = 0; j < N; j++)
+            dot_sum += scores[i * N + j] * dA[i * N + j];
+        for (int j = 0; j < N; j++) {
+            float ds = scores[i * N + j] * (dA[i * N + j] - dot_sum) * scale;
+            if constexpr (kCausal) { if (j > i) ds = 0.0f; }
+            dA[i * N + j] = ds;  // reuse dA for dS
+        }
+    }
+    __syncthreads();
+
+    // dQ = dS K
+    for (int idx = tid; idx < N * D; idx += blockDim.x) {
+        int i = idx / D, d = idx % D;
+        float acc = 0.0f;
+        for (int j = 0; j < N; j++)
+            acc += dA[i * N + j] * static_cast<float>(k[base + j * D + d]);
+        grad_q[base + idx] = static_cast<ActT>(acc);
+    }
+
+    // dK = dS^T Q
+    for (int idx = tid; idx < N * D; idx += blockDim.x) {
+        int j = idx / D, d = idx % D;
+        float acc = 0.0f;
+        for (int i = 0; i < N; i++)
+            acc += dA[i * N + j] * static_cast<float>(q[base + i * D + d]);
+        grad_k[base + idx] = static_cast<ActT>(acc);
+    }
+}
+
+// -- Backward dispatch --------------------------------------------------------
 template <typename ActT, int kHeadDim, bool kCausal>
 hipError_t attention_backward(
     const ActT* grad_out,
     const ActT* q, const ActT* k, const ActT* v,
     const ActT* out, const ActT* softmax_lse_act,
     ActT* grad_q, ActT* grad_k, ActT* grad_v,
-    int batch, int n_heads, int seq_len, float scale,
-    hipStream_t stream
+    int batch, int n_heads, int seq_len,
+    float scale, hipStream_t stream
 ) {
-    return hipErrorNotReady;  // TODO: LDS-based backward for gfx942
+    const float* softmax_lse = reinterpret_cast<const float*>(softmax_lse_act);
+    int grid = batch * n_heads;
+    int block = WARP_SIZE * 2;  // 128 threads = 2 waves on CDNA3
+    int N = seq_len;
+    int lds_bytes = 2 * N * N * sizeof(float);  // scores + dA
+    lds_attention_bwd_kernel<ActT, kHeadDim, kCausal>
+        <<<grid, block, lds_bytes, stream>>>(
+            grad_out, q, k, v, out, softmax_lse,
+            grad_q, grad_k, grad_v, seq_len, scale);
+    return hipGetLastError();
 }
 
 }}}}  // namespace sg::gfx942::models::attention
