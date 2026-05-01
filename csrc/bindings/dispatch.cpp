@@ -1,9 +1,9 @@
 // =====================================================================
-//  dispatch.cpp — single-source arch detection
+//  dispatch.cpp — single-source arch detection + fused_step dispatch
 //
-//  Replaces csrc/common/dispatch.h's tier fallback chain. Detects exactly
-//  one of the supported arches {sm_80, sm_90, sm_100, gfx942} and raises
-//  on anything else. No fallback.
+//  3-arch active set: sm_90, gfx942, tpu_v5p.
+//  Detects exactly one of {sm_90, gfx942} on GPU and raises on anything
+//  else. No fallback. TPU arch is handled in Python via JAX.
 // =====================================================================
 
 #include "bindings.h"
@@ -28,26 +28,21 @@ int detect_arch_from_env() {
     if (!force) return -1;
     std::string s(force);
     // Numeric forms.
-    if (s == "80")  return 80;
-    if (s == "89")  return 89;
     if (s == "90")  return 90;
-    if (s == "100") return 100;
-    if (s == "103") return 103;
-    if (s == "120") return 120;
     if (s == "942") return 942;
-    if (s == "950") return 950;
     // Symbolic forms.
-    if (s == "sm_80")  return 80;
-    if (s == "sm_89")  return 89;
     if (s == "sm_90")  return 90;
-    if (s == "sm_100") return 100;
-    if (s == "sm_103") return 103;
-    if (s == "sm_120") return 120;
     if (s == "gfx942") return 942;
-    if (s == "gfx950") return 950;
+    // tpu_v5p is handled in Python; not valid for C++ dispatch.
+    if (s == "tpu_v5p") {
+        throw std::runtime_error(
+            "FORCE_ARCH=tpu_v5p is not a GPU arch; TPU dispatch is handled "
+            "in Python via JAX.");
+    }
     throw std::runtime_error(
         "FORCE_ARCH=" + s +
-        " not in supported set {80, 89, 90, 100, 103, 120, 942, 950}");
+        " not in supported 3-arch active set {90, 942, tpu_v5p}. "
+        "Only sm_90 (Hopper) and gfx942 (MI300X/MI300A) are supported on GPU.");
 }
 
 int detect_arch_from_device() {
@@ -66,17 +61,12 @@ int detect_arch_from_device() {
             cudaGetErrorString(err));
     }
     int sm = prop.major * 10 + prop.minor;
-    if (sm == 80 || sm == 86)   return 80;   // A100/A30/A10/RTX 30 → sm_80 binding
-    if (sm == 89)               return 89;   // Ada (RTX 40, L40, L40S)
-    if (sm == 90)               return 90;   // Hopper (H100/H200)
-    if (sm == 100)              return 100;  // Datacenter Blackwell (B100/B200/GB200)
-    if (sm == 103)              return 103;  // Blackwell Ultra (B300, GB300 NVL72)
-    if (sm == 120 || sm > 120)  return 120;  // Consumer Blackwell (RTX 50, RTX PRO 6000)
+    if (sm == 90) return 90;   // Hopper (H100/H200)
     throw std::runtime_error(
         "Detected sm_" + std::to_string(sm) +
-        " is not in supported set "
-        "{sm_80, sm_89, sm_90, sm_100, sm_103, sm_120}. "
-        "Build with FORCE_CUDA=1 or upgrade hardware.");
+        "; only sm_90 (Hopper) is supported in the 3-arch active set. "
+        "Other NVIDIA arches (sm_80, sm_89, sm_100, sm_103, sm_120) "
+        "have been removed from the active set.");
 #elif defined(WITH_HIP)
     int dev = 0;
     hipError_t err = hipGetDevice(&dev);
@@ -95,14 +85,14 @@ int detect_arch_from_device() {
     auto colon = arch_name.find(':');
     if (colon != std::string::npos) arch_name = arch_name.substr(0, colon);
     if (arch_name == "gfx942") return 942;
-    if (arch_name == "gfx950") return 950;
     throw std::runtime_error(
         "Detected " + arch_name +
-        " is not in supported set {gfx942, gfx950}. "
-        "Use MI300X / MI350X / MI355X or upgrade.");
+        "; only gfx942 (MI300X/MI300A) is supported in the 3-arch active "
+        "set. gfx950 and other AMD arches have been removed.");
 #else
     throw std::runtime_error(
-        "No GPU backend compiled in. Build with WITH_CUDA or WITH_HIP.");
+        "No GPU backend compiled in. Build with WITH_CUDA or WITH_HIP. "
+        "3-arch active set: sm_90, gfx942, tpu_v5p.");
 #endif
 }
 
@@ -112,6 +102,23 @@ int detect_arch() {
     int env_arch = detect_arch_from_env();
     if (env_arch >= 0) return env_arch;
     return detect_arch_from_device();
+}
+
+// =====================================================================
+//  fused_step — routes (model, optimizer, arch) triples to fused TUs
+//
+//  All 99 combinations (3 models x 11 optimizers x 3 arches) are stubs
+//  until the fused kernels are compiled. TPU arch is dispatched in Python.
+// =====================================================================
+
+void fused_step(const std::string& model, const std::string& optimizer,
+                torch::Tensor params, torch::Tensor input,
+                torch::Tensor grad, torch::Tensor state, float lr) {
+    int arch = detect_arch();
+    std::string arch_str = (arch == 90) ? "sm_90" : "gfx942";
+    throw std::runtime_error(
+        "fused kernel not yet compiled for (" + model + ", " + optimizer +
+        ", " + arch_str + ")");
 }
 
 } // namespace sg

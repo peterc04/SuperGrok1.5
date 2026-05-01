@@ -24,6 +24,11 @@ namespace sg {
 // Arch detection
 int detect_arch();
 
+// Fused (model, optimizer, arch) dispatch
+void fused_step(const std::string& model, const std::string& optimizer,
+                torch::Tensor params, torch::Tensor input,
+                torch::Tensor grad, torch::Tensor state, float lr);
+
 // ── GrokAdamW ─────────────────────────────────────────────────────────
 void grokadamw_step(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                     torch::Tensor, float, float, float, float, float, float,
@@ -322,7 +327,13 @@ PYBIND11_MODULE(_ops, m) {
     m.doc() = "Grokking Optimizers — specialized per-arch C++/CUDA/HIP kernels";
 
     m.def("detect_arch", &sg::detect_arch,
-          "Returns 80, 89, 90, 100, 103, 120, 942 or 950 for the detected GPU.");
+          "Returns 90 or 942 for the detected GPU (3-arch active set: "
+          "sm_90, gfx942, tpu_v5p). TPU handled in Python.");
+
+    // Fused (model, optimizer, arch) dispatch
+    m.def("fused_step", &sg::fused_step,
+          "Fused (model, optimizer, arch) kernel dispatch. Routes to the "
+          "appropriate fused TU based on detected hardware.");
 
     // GrokAdamW
     m.def("grokadamw_step", &sg::grokadamw_step);
