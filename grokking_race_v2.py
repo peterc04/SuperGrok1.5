@@ -696,6 +696,11 @@ def train_grokadamw(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("GrokAdamW",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "grokadamw", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
@@ -725,6 +730,11 @@ def train_supergrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("SuperGrok",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "supergrok11", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             logits=m(tx); loss=F.cross_entropy(logits,ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
@@ -793,6 +803,11 @@ def train_supergrok15(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("SuperGrok1.5",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "supergrok15", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             logits=m(tx); loss=F.cross_entropy(logits,ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
@@ -865,6 +880,11 @@ def train_supergrok2(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("SuperGrok2",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "supergrok2", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             logits=m(tx); loss=F.cross_entropy(logits,ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
@@ -910,6 +930,11 @@ def train_grokfast(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("Grokfast",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "grokfast", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
@@ -933,6 +958,11 @@ def train_muon(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("Muon",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "muon", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
@@ -951,6 +981,11 @@ def train_lion(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("Lion",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "lion", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
@@ -970,6 +1005,11 @@ def train_looksam(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("LookSAM",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "looksam", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
@@ -995,6 +1035,11 @@ def train_prodigy(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("Prodigy",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "prodigy", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
@@ -1583,6 +1628,8 @@ if __name__ == "__main__":
                              "Single GPU for fair sequential benchmark if omitted.")
     parser.add_argument("--grad-hooks", action="store_true",
                         help="Use gradient hooks for L2-warm optimizer updates")
+    parser.add_argument("--no-fused", action="store_true",
+                        help="Disable fused (model, optimizer, arch) dispatch kernels")
     parser.add_argument("--val-ratio", type=float, default=None,
                         help="Fraction of train portion carved out as val (default: 0.10, auto 0.05 on 10/90)")
     parser.add_argument("--early-stop-test-acc", type=float, default=0.95,
@@ -1609,6 +1656,8 @@ if __name__ == "__main__":
         run_setup()
 
     DEFAULT_CONFIG["use_grad_hooks"] = args.grad_hooks if hasattr(args, 'grad_hooks') else False
+    if args.no_fused:
+        DEFAULT_CONFIG["use_fused"] = False
     DEFAULT_CONFIG["early_stop_threshold"] = args.early_stop_test_acc
     DEFAULT_CONFIG["early_stop_max_steps"] = args.early_stop_max_steps
     DEFAULT_CONFIG["eval_every"] = args.eval_every
