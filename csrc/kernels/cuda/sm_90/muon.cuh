@@ -262,24 +262,25 @@ void muon_momentum_normalize_kernel(
 // iteration's GEMMs read the same precision as X_0.
 // ---------------------------------------------------------------------
 
+// Note: in the binding-orchestrated path, X/AX/AAX share dtype with
+// X_out (the upstream torch::mm preserves the input dtype). So we
+// template on a single combined working dtype StateT and load in that.
 template <typename StateT, int BLOCK_SIZE>
 __global__ __launch_bounds__(BLOCK_SIZE, 2)
 void muon_ns_combine_kernel(
     StateT* __restrict__ X_out,
-    const float* __restrict__ X,
-    const float* __restrict__ AX,
-    const float* __restrict__ A2X,
+    const StateT* __restrict__ X,
+    const StateT* __restrict__ AX,
+    const StateT* __restrict__ A2X,
     float a, float b, float c,
     int64_t numel
 ) {
-    static_assert(is_state_dtype<StateT>::value, "Muon: invalid StateT");
-
     const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          i < numel; i += stride) {
-        const float x   = LDG(X   + i);
-        const float ax  = LDG(AX  + i);
-        const float a2x = LDG(A2X + i);
+        const float x   = ld_f32<StateT>(X   + i);
+        const float ax  = ld_f32<StateT>(AX  + i);
+        const float a2x = ld_f32<StateT>(A2X + i);
         st_f32<StateT>(X_out + i, a * x + b * ax + c * a2x);
     }
 }
@@ -295,13 +296,13 @@ void muon_ns_combine_kernel(
 // X_orth stays in registers — no global write/read of the orth result.
 // ---------------------------------------------------------------------
 
-template <typename ParamT, int BLOCK_SIZE>
+template <typename ParamT, typename XT, int BLOCK_SIZE>
 __global__ __launch_bounds__(BLOCK_SIZE, 2)
 void muon_ns_combine_apply_kernel(
     ParamT* __restrict__ param,
-    const float* __restrict__ X,
-    const float* __restrict__ AX,
-    const float* __restrict__ A2X,
+    const XT* __restrict__ X,
+    const XT* __restrict__ AX,
+    const XT* __restrict__ A2X,
     float a, float b, float c,
     float neg_lr_scale,
     float decay_factor,
@@ -312,9 +313,9 @@ void muon_ns_combine_apply_kernel(
     const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          i < numel; i += stride) {
-        const float x    = LDG(X   + i);
-        const float ax   = LDG(AX  + i);
-        const float a2x  = LDG(A2X + i);
+        const float x    = ld_f32<XT>(X   + i);
+        const float ax   = ld_f32<XT>(AX  + i);
+        const float a2x  = ld_f32<XT>(A2X + i);
         const float orth = a * x + b * ax + c * a2x;
         float p = ld_f32<ParamT>(param + i);
         p = (p + neg_lr_scale * orth) * decay_factor;
@@ -692,23 +693,23 @@ inline void ns_combine_typed(
     if (block == 128) {
         muon_ns_combine_kernel<StateT, 128><<<grid, 128, 0, stream>>>(
             reinterpret_cast<StateT*>(X_out.data_ptr()),
-            reinterpret_cast<const float*>(X.data_ptr()),
-            reinterpret_cast<const float*>(AX.data_ptr()),
-            reinterpret_cast<const float*>(AAX.data_ptr()),
+            reinterpret_cast<const StateT*>(X.data_ptr()),
+            reinterpret_cast<const StateT*>(AX.data_ptr()),
+            reinterpret_cast<const StateT*>(AAX.data_ptr()),
             a, b, c, N);
     } else if (block == 512) {
         muon_ns_combine_kernel<StateT, 512><<<grid, 512, 0, stream>>>(
             reinterpret_cast<StateT*>(X_out.data_ptr()),
-            reinterpret_cast<const float*>(X.data_ptr()),
-            reinterpret_cast<const float*>(AX.data_ptr()),
-            reinterpret_cast<const float*>(AAX.data_ptr()),
+            reinterpret_cast<const StateT*>(X.data_ptr()),
+            reinterpret_cast<const StateT*>(AX.data_ptr()),
+            reinterpret_cast<const StateT*>(AAX.data_ptr()),
             a, b, c, N);
     } else {
         muon_ns_combine_kernel<StateT, 256><<<grid, 256, 0, stream>>>(
             reinterpret_cast<StateT*>(X_out.data_ptr()),
-            reinterpret_cast<const float*>(X.data_ptr()),
-            reinterpret_cast<const float*>(AX.data_ptr()),
-            reinterpret_cast<const float*>(AAX.data_ptr()),
+            reinterpret_cast<const StateT*>(X.data_ptr()),
+            reinterpret_cast<const StateT*>(AX.data_ptr()),
+            reinterpret_cast<const StateT*>(AAX.data_ptr()),
             a, b, c, N);
     }
 }
@@ -718,7 +719,7 @@ inline void ns_combine_typed(
 namespace sg { namespace sm90 {
 
 // ---- launch_muon_momentum_normalize ---------------------------------
-inline void launch_muon_momentum_normalize(
+void launch_muon_momentum_normalize(
     torch::Tensor buf, torch::Tensor X, torch::Tensor grad,
     float momentum, float inv_norm
 ) {
@@ -727,7 +728,7 @@ inline void launch_muon_momentum_normalize(
 }
 
 // ---- launch_muon_ns_combine ----------------------------------------
-inline void launch_muon_ns_combine(
+void launch_muon_ns_combine(
     torch::Tensor X_out, torch::Tensor X,
     torch::Tensor AX, torch::Tensor AAX,
     float a, float b, float c
@@ -741,7 +742,7 @@ inline void launch_muon_ns_combine(
             sg::sm90::muon::detail::ns_combine_typed<__nv_bfloat16>(
                 X_out, X, AX, AAX, a, b, c, stream); break;
         case at::kHalf:
-            sg::sm90::muon::detail::ns_combine_typed<__nv_bfloat16>(
+            sg::sm90::muon::detail::ns_combine_typed<__half>(
                 X_out, X, AX, AAX, a, b, c, stream); break;
         default:
             TORCH_CHECK(false, "muon ns_combine: unsupported X_out dtype");
@@ -749,7 +750,7 @@ inline void launch_muon_ns_combine(
 }
 
 // ---- launch_muon_update --------------------------------------------
-inline void launch_muon_update(
+void launch_muon_update(
     torch::Tensor param, torch::Tensor orth,
     float neg_lr_scale, float decay_factor
 ) {
@@ -789,7 +790,7 @@ inline void launch_muon_update(
 }
 
 // ---- launch_muon_ns_combine_update_fused ---------------------------
-inline void launch_muon_ns_combine_update_fused(
+void launch_muon_ns_combine_update_fused(
     torch::Tensor param, torch::Tensor X,
     torch::Tensor AX, torch::Tensor AAX,
     float a, float b, float c,
@@ -803,29 +804,33 @@ inline void launch_muon_ns_combine_update_fused(
     const int block = get_muon_config(N).block_size;
     const int grid  = ew_grid(N, block);
 
+    // Binding contract: X/AX/AAX share dtype with param (torch::mm
+    // preserves the input dtype, and X = buf*inv_norm is taken at the
+    // buf dtype which is the same as param in muon.cpp).
     #define _NSU_DISPATCH(BLOCK)                                                             \
         if (param.scalar_type() == at::kFloat) {                                             \
-            muon_ns_combine_apply_kernel<float, BLOCK><<<grid, BLOCK, 0, stream>>>(          \
-                param.data_ptr<float>(),                                                     \
-                reinterpret_cast<const float*>(X.data_ptr()),                                \
-                reinterpret_cast<const float*>(AX.data_ptr()),                               \
-                reinterpret_cast<const float*>(AAX.data_ptr()),                              \
-                a, b, c, neg_lr_scale, decay_factor, N);                                     \
-        } else if (param.scalar_type() == at::kBFloat16) {                                   \
-            muon_ns_combine_apply_kernel<__nv_bfloat16, BLOCK>                               \
+            muon_ns_combine_apply_kernel<float, float, BLOCK>                                \
                 <<<grid, BLOCK, 0, stream>>>(                                                \
-                    reinterpret_cast<__nv_bfloat16*>(param.data_ptr()),                      \
+                    param.data_ptr<float>(),                                                 \
                     reinterpret_cast<const float*>(X.data_ptr()),                            \
                     reinterpret_cast<const float*>(AX.data_ptr()),                           \
                     reinterpret_cast<const float*>(AAX.data_ptr()),                          \
                     a, b, c, neg_lr_scale, decay_factor, N);                                 \
+        } else if (param.scalar_type() == at::kBFloat16) {                                   \
+            muon_ns_combine_apply_kernel<__nv_bfloat16, __nv_bfloat16, BLOCK>                \
+                <<<grid, BLOCK, 0, stream>>>(                                                \
+                    reinterpret_cast<__nv_bfloat16*>(param.data_ptr()),                      \
+                    reinterpret_cast<const __nv_bfloat16*>(X.data_ptr()),                    \
+                    reinterpret_cast<const __nv_bfloat16*>(AX.data_ptr()),                   \
+                    reinterpret_cast<const __nv_bfloat16*>(AAX.data_ptr()),                  \
+                    a, b, c, neg_lr_scale, decay_factor, N);                                 \
         } else if (param.scalar_type() == at::kHalf) {                                       \
-            muon_ns_combine_apply_kernel<__half, BLOCK>                                      \
+            muon_ns_combine_apply_kernel<__half, __half, BLOCK>                              \
                 <<<grid, BLOCK, 0, stream>>>(                                                \
                     reinterpret_cast<__half*>(param.data_ptr()),                             \
-                    reinterpret_cast<const float*>(X.data_ptr()),                            \
-                    reinterpret_cast<const float*>(AX.data_ptr()),                           \
-                    reinterpret_cast<const float*>(AAX.data_ptr()),                          \
+                    reinterpret_cast<const __half*>(X.data_ptr()),                           \
+                    reinterpret_cast<const __half*>(AX.data_ptr()),                          \
+                    reinterpret_cast<const __half*>(AAX.data_ptr()),                         \
                     a, b, c, neg_lr_scale, decay_factor, N);                                 \
         } else {                                                                             \
             TORCH_CHECK(false, "muon ns_combine_update_fused: unsupported param dtype");     \
