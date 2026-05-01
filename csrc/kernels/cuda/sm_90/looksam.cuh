@@ -139,18 +139,19 @@ __device__ __forceinline__ void store_state_nt(float* p, float v)         { stre
 __device__ __forceinline__ void store_state_nt(__nv_bfloat16* p, float v) { *p = __float2bfloat16_rn(v); }
 
 // =====================================================================
-//  Kernel 1: perturb — param_pert = param + rho_over_norm * grad
-//                       backup    = param (original)
+//  Kernel 1: perturb — param += rho_over_norm * grad
 //
-//  Three-tensor element-wise; backup is written non-temporally because
-//  it's only consumed once on the matching restore call (no L2 reuse).
+//  The binding pre-clones the backup tensor on the host before calling
+//  this launcher (looksam.cpp:73 — `backups.push_back(params[i].clone())`).
+//  The kernel therefore only reads param + grad and writes param;
+//  the backup pointer is accepted in the launcher signature for API
+//  symmetry but is not touched in the inner loop.
 // =====================================================================
 
 template <typename ParamT, typename GradT>
 __launch_bounds__(LOOKSAM_BLOCK_SIZE, LOOKSAM_MIN_BLOCKS_PER_SM)
 __global__ void perturb_kernel(
     ParamT* __restrict__ param,
-    ParamT* __restrict__ backup,
     const GradT* __restrict__ grad,
     const float rho_over_norm,
     const int64_t N)
@@ -159,31 +160,23 @@ __global__ void perturb_kernel(
     if (idx >= N) return;
     float p = load_as_float<ParamT>(param + idx);
     float g = load_as_float<GradT>(grad + idx);
-    // backup is consumed exactly once by the matching restore call —
-    // bypass L2 allocation. For BF16/FP16 backup, fallthrough store.
-    if constexpr (std::is_same_v<ParamT, float>) {
-        stream_store(backup + idx, p);
-    } else {
-        store_from_float<ParamT>(backup + idx, p);
-    }
     store_from_float<ParamT>(param + idx, p + rho_over_norm * g);
 }
 
-// FP32-only float4 fast path (param == backup == grad in dtype). The
-// vector path saturates HBM by issuing 16 B per lane per memory op.
+// FP32-only float4 fast path (param + grad both FP32). 2 reads / 1 write
+// per element — the vector path saturates HBM by issuing 16 B per lane
+// per memory op.
 __launch_bounds__(LOOKSAM_BLOCK_SIZE, LOOKSAM_MIN_BLOCKS_PER_SM)
 __global__ void perturb_vec4_kernel(
     float4* __restrict__ param4,
-    float4* __restrict__ backup4,
     const float4* __restrict__ grad4,
     const float rho_over_norm,
     const int64_t N4)
 {
     const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= N4) return;
-    float4 p = stream_load4(param4 + i);
+    float4 p = param4[i];
     float4 g = stream_load4(grad4 + i);
-    stream_store4(backup4 + i, p);
     p.x += rho_over_norm * g.x;
     p.y += rho_over_norm * g.y;
     p.z += rho_over_norm * g.z;

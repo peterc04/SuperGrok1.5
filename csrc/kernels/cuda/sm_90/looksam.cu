@@ -52,87 +52,81 @@ void launch_looksam_perturb(
     const int64_t N = param.numel();
     if (N == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream();
+    // backup is host-cloned by the binding before this call; the kernel
+    // does not touch it. The arg is here for API symmetry only.
+    (void)backup;
 
-    // FP32 vec4 fast path (param == backup == grad dtype, all aligned).
+    // FP32 vec4 fast path: param + grad both FP32 and aligned.
     if (param.scalar_type() == at::ScalarType::Float &&
-        backup.scalar_type() == at::ScalarType::Float &&
         grad.scalar_type() == at::ScalarType::Float &&
-        lk::vec4_eligible_3(param, backup, grad))
+        lk::vec4_eligible_2(param, grad))
     {
         const int64_t N4 = N / 4;
         const int grid = compute_grid(N4, lk::LOOKSAM_BLOCK_SIZE);
         lk::perturb_vec4_kernel<<<grid, lk::LOOKSAM_BLOCK_SIZE, 0, stream>>>(
             reinterpret_cast<float4*>(param.data_ptr<float>()),
-            reinterpret_cast<float4*>(backup.data_ptr<float>()),
             reinterpret_cast<const float4*>(grad.data_ptr<float>()),
             rho_over_norm, N4);
         return;
     }
 
     const int grid = compute_grid(N, lk::LOOKSAM_BLOCK_SIZE);
-    // ParamT == backup dtype (assumed to match param). GradT may differ.
+
+    // Helper macro to keep the 3 x 3 ParamT x GradT dispatch readable.
+    // FP8 grads are not exposed at the launcher boundary today (torch
+    // tensors don't carry FP8 scalar types in the binding) but the
+    // perturb_kernel<ParamT, FP8> instantiations are still emitted in
+    // this TU for future linkage.
+    #define LOOKSAM_PERTURB_LAUNCH(ParamT, ParamPtr, GradT, GradPtr) \
+        lk::perturb_kernel<ParamT, GradT> \
+            <<<grid, lk::LOOKSAM_BLOCK_SIZE, 0, stream>>>( \
+            (ParamPtr), (GradPtr), rho_over_norm, N)
+
     AT_DISPATCH_SWITCH(param.scalar_type(), "looksam_perturb_param",
         AT_DISPATCH_CASE(at::ScalarType::Float, [&] {
-            using ParamT = float;
-            AT_DISPATCH_SWITCH(grad.scalar_type(), "looksam_perturb_grad",
-                AT_DISPATCH_CASE(at::ScalarType::Float, [&] {
-                    lk::perturb_kernel<ParamT, float><<<grid, lk::LOOKSAM_BLOCK_SIZE, 0, stream>>>(
-                        param.data_ptr<ParamT>(), backup.data_ptr<ParamT>(),
-                        grad.data_ptr<float>(), rho_over_norm, N);
-                })
-                AT_DISPATCH_CASE(at::ScalarType::BFloat16, [&] {
-                    lk::perturb_kernel<ParamT, __nv_bfloat16><<<grid, lk::LOOKSAM_BLOCK_SIZE, 0, stream>>>(
-                        param.data_ptr<ParamT>(), backup.data_ptr<ParamT>(),
-                        reinterpret_cast<const __nv_bfloat16*>(grad.data_ptr<at::BFloat16>()),
-                        rho_over_norm, N);
-                })
-                AT_DISPATCH_CASE(at::ScalarType::Half, [&] {
-                    lk::perturb_kernel<ParamT, __half><<<grid, lk::LOOKSAM_BLOCK_SIZE, 0, stream>>>(
-                        param.data_ptr<ParamT>(), backup.data_ptr<ParamT>(),
-                        reinterpret_cast<const __half*>(grad.data_ptr<at::Half>()),
-                        rho_over_norm, N);
-                })
-            );
+            float* pp = param.data_ptr<float>();
+            if (grad.scalar_type() == at::ScalarType::Float) {
+                LOOKSAM_PERTURB_LAUNCH(float, pp, float, grad.data_ptr<float>());
+            } else if (grad.scalar_type() == at::ScalarType::BFloat16) {
+                LOOKSAM_PERTURB_LAUNCH(float, pp, __nv_bfloat16,
+                    reinterpret_cast<const __nv_bfloat16*>(grad.data_ptr<at::BFloat16>()));
+            } else if (grad.scalar_type() == at::ScalarType::Half) {
+                LOOKSAM_PERTURB_LAUNCH(float, pp, __half,
+                    reinterpret_cast<const __half*>(grad.data_ptr<at::Half>()));
+            } else {
+                TORCH_CHECK(false, "looksam_perturb: unsupported grad dtype");
+            }
         })
         AT_DISPATCH_CASE(at::ScalarType::BFloat16, [&] {
-            using ParamT = __nv_bfloat16;
-            auto* p = reinterpret_cast<ParamT*>(param.data_ptr<at::BFloat16>());
-            auto* b = reinterpret_cast<ParamT*>(backup.data_ptr<at::BFloat16>());
+            __nv_bfloat16* pp = reinterpret_cast<__nv_bfloat16*>(param.data_ptr<at::BFloat16>());
             if (grad.scalar_type() == at::ScalarType::Float) {
-                lk::perturb_kernel<ParamT, float><<<grid, lk::LOOKSAM_BLOCK_SIZE, 0, stream>>>(
-                    p, b, grad.data_ptr<float>(), rho_over_norm, N);
+                LOOKSAM_PERTURB_LAUNCH(__nv_bfloat16, pp, float, grad.data_ptr<float>());
             } else if (grad.scalar_type() == at::ScalarType::BFloat16) {
-                lk::perturb_kernel<ParamT, __nv_bfloat16><<<grid, lk::LOOKSAM_BLOCK_SIZE, 0, stream>>>(
-                    p, b, reinterpret_cast<const __nv_bfloat16*>(grad.data_ptr<at::BFloat16>()),
-                    rho_over_norm, N);
+                LOOKSAM_PERTURB_LAUNCH(__nv_bfloat16, pp, __nv_bfloat16,
+                    reinterpret_cast<const __nv_bfloat16*>(grad.data_ptr<at::BFloat16>()));
             } else if (grad.scalar_type() == at::ScalarType::Half) {
-                lk::perturb_kernel<ParamT, __half><<<grid, lk::LOOKSAM_BLOCK_SIZE, 0, stream>>>(
-                    p, b, reinterpret_cast<const __half*>(grad.data_ptr<at::Half>()),
-                    rho_over_norm, N);
+                LOOKSAM_PERTURB_LAUNCH(__nv_bfloat16, pp, __half,
+                    reinterpret_cast<const __half*>(grad.data_ptr<at::Half>()));
             } else {
                 TORCH_CHECK(false, "looksam_perturb: unsupported grad dtype");
             }
         })
         AT_DISPATCH_CASE(at::ScalarType::Half, [&] {
-            using ParamT = __half;
-            auto* p = reinterpret_cast<ParamT*>(param.data_ptr<at::Half>());
-            auto* b = reinterpret_cast<ParamT*>(backup.data_ptr<at::Half>());
+            __half* pp = reinterpret_cast<__half*>(param.data_ptr<at::Half>());
             if (grad.scalar_type() == at::ScalarType::Float) {
-                lk::perturb_kernel<ParamT, float><<<grid, lk::LOOKSAM_BLOCK_SIZE, 0, stream>>>(
-                    p, b, grad.data_ptr<float>(), rho_over_norm, N);
+                LOOKSAM_PERTURB_LAUNCH(__half, pp, float, grad.data_ptr<float>());
             } else if (grad.scalar_type() == at::ScalarType::BFloat16) {
-                lk::perturb_kernel<ParamT, __nv_bfloat16><<<grid, lk::LOOKSAM_BLOCK_SIZE, 0, stream>>>(
-                    p, b, reinterpret_cast<const __nv_bfloat16*>(grad.data_ptr<at::BFloat16>()),
-                    rho_over_norm, N);
+                LOOKSAM_PERTURB_LAUNCH(__half, pp, __nv_bfloat16,
+                    reinterpret_cast<const __nv_bfloat16*>(grad.data_ptr<at::BFloat16>()));
             } else if (grad.scalar_type() == at::ScalarType::Half) {
-                lk::perturb_kernel<ParamT, __half><<<grid, lk::LOOKSAM_BLOCK_SIZE, 0, stream>>>(
-                    p, b, reinterpret_cast<const __half*>(grad.data_ptr<at::Half>()),
-                    rho_over_norm, N);
+                LOOKSAM_PERTURB_LAUNCH(__half, pp, __half,
+                    reinterpret_cast<const __half*>(grad.data_ptr<at::Half>()));
             } else {
                 TORCH_CHECK(false, "looksam_perturb: unsupported grad dtype");
             }
         })
     );
+    #undef LOOKSAM_PERTURB_LAUNCH
 }
 
 // =====================================================================
@@ -292,29 +286,30 @@ void launch_looksam_norm_reduce(
 // =====================================================================
 //  Explicit template instantiations — dtype matrix.
 //
-//  ParamT in {float, __nv_bfloat16, __half}     -> 3
-//  StateT in {float, __nv_bfloat16}              -> 2  (used by norm
-//                                                       state slot via
-//                                                       store_state_nt)
+//  ParamT in {float, __nv_bfloat16, __half}                        (3)
+//  StateT in {float, __nv_bfloat16}                                (2)
+//      — exposed via store_state_nt; LookSAM v_dir is FP32 in the
+//        current binding so StateT only matters in a future pass.
 //  GradT  in {float, __nv_bfloat16, __half,
-//             __nv_fp8_e4m3, __nv_fp8_e5m2}      -> 5
-//  Refresh/cached doubling for direction_adjust  -> ×2
+//             __nv_fp8_e4m3, __nv_fp8_e5m2}                        (5)
+//  Refresh/cached doubling for direction_adjust_fused              (x2)
 //
-//  These instantiations are mostly already triggered from the AT_DISPATCH
-//  blocks above; the explicit `template ...;` lines below ensure FP8 grad
-//  variants and the cached-path direction kernel are emitted into this
-//  TU even though the launchers don't currently invoke them, so a future
-//  binding pass can call them without a relink.
+//  Most instantiations are forced by the AT_DISPATCH blocks above; the
+//  explicit `template ...;` lines below force the FP8 grad variants and
+//  both kRefresh paths to be emitted into this TU so a future binding
+//  pass can call them without a relink.
 //
-//  Counts (header includes both compile-time variants of each kernel):
-//    perturb_kernel<ParamT, GradT>     : 3 * 5  = 15
-//    restore_kernel<ParamT>            : 3
+//  Counts:
+//    perturb_kernel<ParamT, GradT>          : 3 * 5     = 15
+//    restore_kernel<ParamT>                 :              3
 //    direction_adjust_fused_kernel
-//        <kRefresh, GradT>              : 2 * 5 = 10  (FP8 grads also)
-//    norm_reduce_kernel<GradT>         : 5
-//    Total kernel instantiations       : 33
-//    Plus vec4 fast paths              : 4 (refresh+cached vec4 ×2,
-//                                            perturb_vec4, restore_vec4)
+//        <kRefresh, GradT, VDirT>           :              10
+//        - cached  (kRefresh=false, VDirT=float): GradT ×5 = 5
+//        - refresh (kRefresh=true,  VDirT=GradT): GradT ×5 = 5
+//    norm_reduce_kernel<GradT>              :              5
+//    direction_adjust_fused_vec4_kernel<R>  :              2
+//    perturb_vec4_kernel, restore_vec4_kernel:             2
+//  Total instantiations                     :              37
 // =====================================================================
 
 namespace sg { namespace sm90 { namespace looksam {
@@ -323,7 +318,7 @@ namespace sg { namespace sm90 { namespace looksam {
 //                          GradT  in {fp32, bf16, fp16, fp8e4m3, fp8e5m2})
 #define INST_PERTURB(P, G) \
     template __global__ void perturb_kernel<P, G>( \
-        P*, P*, const G*, const float, const int64_t);
+        P*, const G*, const float, const int64_t);
 INST_PERTURB(float,         float)
 INST_PERTURB(float,         __nv_bfloat16)
 INST_PERTURB(float,         __half)
