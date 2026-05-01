@@ -1,16 +1,10 @@
 """
 Grokking Optimizers — All-Specialized Per-Arch Kernel Build
 
-Supported arches:
-  - NVIDIA: sm_80 (Ampere family: A100/A30/A10/RTX 30 routes here),
-            sm_89 (Ada: RTX 40, L40, L40S),
-            sm_90 (Hopper: H100/H200),
-            sm_100 (Datacenter Blackwell: B100/B200/GB200),
-            sm_103 (Blackwell Ultra: B300, GB300 NVL72),
-            sm_120 (Consumer Blackwell: RTX 50, RTX PRO 6000 Blackwell)
-  - AMD:    gfx942 (CDNA3: MI300X, MI300A),
-            gfx950 (CDNA4: MI350X, MI355X)
-  - CPU:    x86_64 (AVX-512), aarch64 (NEON) -- testing only
+Supported arches (3-arch active set):
+  - NVIDIA: sm_90 (Hopper: H100/H200)
+  - AMD:    gfx942 (CDNA3: MI300X, MI300A)
+  - TPU:    v5p (Pallas via JAX)
 
 Build fails on unsupported arches. There is no generic-kernel fallback
 and no tier fallback chain. See REFRESH.md §0 and
@@ -24,12 +18,10 @@ For build-only without a physical GPU:
 
 To build for a specific arch subset:
     TORCH_CUDA_ARCH_LIST="9.0" pip install -e .            # Hopper only
-    TORCH_CUDA_ARCH_LIST="8.0;9.0;10.0" pip install -e .   # all NVIDIA
 """
 
 import glob
 import os
-import platform as _platform
 import shutil
 
 import torch
@@ -43,13 +35,12 @@ from torch.utils.cpp_extension import BuildExtension
 #   AUTOTUNE_PASS=1  -> first-pass autotune build (informational only;
 #                       autotune writes tuned_configs.h between passes)
 #   FORCE_CUDA=1     -> permit configuring without a visible GPU
-#   WITH_CUTLASS=1   -> route Hopper+/Blackwell GEMMs (SG2 projections +
+#   WITH_CUTLASS=1   -> route Hopper GEMMs (SG2 projections +
 #                       Muon Newton-Schulz) through CUTLASS instead of
 #                       cuBLAS. Requires third_party/cutlass cloned via
 #                       `git submodule update --init`. Only emits CUTLASS
-#                       arch flags for sm_90/sm_100/sm_103/sm_120;
-#                       sm_80/sm_89 stay on cuBLAS, gfx942/gfx950 stay
-#                       on rocBLAS unconditionally.
+#                       arch flags for sm_90; gfx942 stays on rocBLAS
+#                       unconditionally.
 # ----------------------------------------------------------------------
 
 _cuda_debug = os.environ.get("CUDA_DEBUG", "0") == "1"
@@ -137,7 +128,6 @@ if _has_gpu and _is_hip:
 
     sources = COMMON_BINDINGS + _collect([
         "csrc/kernels/hip/gfx942/*.hip.cpp",
-        "csrc/kernels/hip/gfx950/*.hip.cpp",
     ])
 
     rocm_archs = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()
@@ -151,7 +141,6 @@ if _has_gpu and _is_hip:
     else:
         offload = [
             "--offload-arch=gfx942",   # MI300X / MI300A
-            "--offload-arch=gfx950",   # MI350X / MI355X
         ]
 
     hip_cxx = ["-O3", "-std=c++17", "-DWITH_HIP", "-ffast-math", "-funroll-loops", "-fPIC"]
@@ -177,13 +166,8 @@ elif _has_gpu:
     print(f"  CUDA version: {torch.version.cuda}")
 
     sources = COMMON_BINDINGS + _collect([
-        "csrc/kernels/cuda/sm_80/*.cu",
-        "csrc/kernels/cuda/sm_89/*.cu",
         "csrc/kernels/cuda/sm_90/*.cu",
-        "csrc/kernels/cuda/sm_100/*.cu",
-        "csrc/kernels/cuda/sm_103/*.cu",
-        "csrc/kernels/cuda/sm_120/*.cu",
-        "csrc/quantization/*.cu",  # split per-arch in a follow-up
+        "csrc/quantization/*.cu",
     ])
 
     nvcc_archs_env = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()
@@ -197,20 +181,12 @@ elif _has_gpu:
             gencode.append(f"-gencode=arch=compute_{a},code=sm_{a}")
         print(f"  CUDA archs (from TORCH_CUDA_ARCH_LIST): {nvcc_archs_env}")
     else:
-        # Supported set: sm_80, sm_89, sm_90, sm_100, sm_103, sm_120.
-        # sm_86 (Ampere RTX 30) routes to the sm_80 binding at runtime via
-        # grokking_optimizers/dispatch.py. Pre-Ampere (sm_70/75) is unsupported.
+        # Supported set: sm_90 only.
         # AOT-only model: no NVRTC, no runtime compilation. Driver JIT
-        # provides forward-compat from the embedded PTX on the highest
-        # compute target (sm_120) for any future arch >= 12.0.
+        # provides forward-compat from the embedded PTX.
         gencode = [
-            "-gencode=arch=compute_80,code=sm_80",         # A100, A30, A10 (Ampere family)
-            "-gencode=arch=compute_89,code=sm_89",         # RTX 40-series, L40, L40S (Ada)
             "-gencode=arch=compute_90,code=sm_90",         # H100, H200 (Hopper)
-            "-gencode=arch=compute_100,code=sm_100",       # B100, B200, GB200 (datacenter Blackwell)
-            "-gencode=arch=compute_103,code=sm_103",       # B300, GB300 NVL72 (Blackwell Ultra)
-            "-gencode=arch=compute_120,code=sm_120",       # RTX 50-series, RTX PRO 6000 (consumer Blackwell)
-            "-gencode=arch=compute_120,code=compute_120",  # PTX for forward-compat JIT on > sm_120
+            "-gencode=arch=compute_90,code=compute_90",    # PTX for forward-compat
         ]
 
     cuda_cxx = ["-O3", "-std=c++17", "-DWITH_CUDA", "-ffast-math", "-funroll-loops", "-fPIC"]
@@ -239,17 +215,11 @@ elif _has_gpu:
     if _with_cutlass:
         cutlass_archs = []
         # Detect requested archs: same source as `gencode` selection.
-        archs_src = nvcc_archs_env if nvcc_archs_env else "8.0;8.9;9.0;10.0;10.3;12.0"
+        archs_src = nvcc_archs_env if nvcc_archs_env else "9.0"
         for a in archs_src.replace(",", ";").split(";"):
             a = a.strip().replace(".", "")
             if a == "90":
                 cutlass_archs.append("90a")
-            elif a == "100":
-                cutlass_archs.append("100a")
-            elif a == "103":
-                cutlass_archs.append("103a")
-            elif a == "120":
-                cutlass_archs.append("120a")
         if cutlass_archs:
             cuda_nvcc.append("-DWITH_CUTLASS")
             cuda_cxx.append("-DWITH_CUTLASS")
@@ -261,7 +231,7 @@ elif _has_gpu:
             cuda_define_macros.append(("WITH_CUTLASS", None))
             print(f"  CUTLASS enabled for archs: {cutlass_archs}")
         else:
-            print("  WITH_CUTLASS=1 set but no Hopper+ archs in TORCH_CUDA_ARCH_LIST; ignoring")
+            print("  WITH_CUTLASS=1 set but no sm_90 arch in TORCH_CUDA_ARCH_LIST; ignoring")
 
     if _cuda_debug:
         # Debug build: device debug info (-G), no opt, no fast-math.
@@ -289,38 +259,11 @@ elif _has_gpu:
     )
 
 else:
-    # CPU build is testing-only. Not a runtime fallback.
-    from torch.utils.cpp_extension import CppExtension
-
-    print("Building Grokking Optimizers C++ CPU extension (testing only)")
-    print("  CPU build is for unit tests; not a runtime fallback path.")
-
-    cpu_sources = _collect([
-        "csrc/kernels/cpu/*.cpp",
-    ])
-    cpu_cxx_flags = [
-        "-O3", "-std=c++17", "-DWITH_CPU",
-        "-ffast-math", "-funroll-loops", "-fopenmp",
-    ]
-
-    cpu_arch = _platform.machine().lower()
-    if cpu_arch in ("x86_64", "amd64"):
-        cpu_sources += _collect(["csrc/kernels/cpu/avx512/*.cpp"])
-        cpu_cxx_flags.append("-march=native")
-        print("  SIMD: x86_64 detected, AVX-512 via -march=native")
-    elif cpu_arch in ("aarch64", "arm64"):
-        cpu_sources += _collect(["csrc/kernels/cpu/neon/*.cpp"])
-        print("  SIMD: ARM detected, NEON intrinsics enabled")
-    else:
-        print(f"  SIMD: unknown arch '{cpu_arch}', scalar fallback only")
-
-    ext = CppExtension(
-        name="grokking_optimizers._ops",
-        sources=COMMON_BINDINGS + cpu_sources,
-        include_dirs=["csrc/common", "csrc/bindings", "csrc/kernels/cpu", "csrc"],
-        define_macros=[("WITH_CPU", None)],
-        extra_compile_args={"cxx": cpu_cxx_flags},
-        extra_link_args=["-fopenmp"],
+    raise RuntimeError(
+        "No supported GPU backend detected. "
+        "Grokking Optimizers requires CUDA (sm_90) or ROCm/HIP (gfx942). "
+        "CPU builds are no longer supported. Set FORCE_CUDA=1 to build "
+        "without a visible GPU."
     )
 
 
@@ -329,10 +272,7 @@ setup(
     version="3.0.0",
     description=(
         "All-specialized per-arch optimizer kernels. "
-        "Supported: NVIDIA sm_80/sm_89/sm_90/sm_100/sm_103/sm_120 (CUDA), "
-        "AMD gfx942/gfx950 (HIP), TPU v5p/v6e (Pallas via JAX). "
-        "CPU build for testing only. No generic-kernel fallback, no tier "
-        "fallback chain."
+        "Supported: NVIDIA sm_90 (CUDA), AMD gfx942 (HIP), TPU v5p (Pallas via JAX)."
     ),
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
