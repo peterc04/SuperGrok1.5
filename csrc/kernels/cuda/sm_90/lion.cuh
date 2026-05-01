@@ -263,9 +263,10 @@ __global__ void fused_lion_step_vec4_kernel(
 // ---------------------------------------------------------------------
 // Multi-tensor kernel: one launch covers all packed tensors. Each thread
 // resolves (tensor_id, local_idx) via upper_bound on the offsets prefix
-// sum stored in __constant__ memory. The table is small (kMaxTensors * 32
-// bytes per arr * 3 + 8 * (kMaxTensors+1) ~= 9.7 KB at 96 tensors), well
-// within the 64 KB constant-memory budget per device.
+// sum. The table is passed by value as a kernel argument (placed in CUDA
+// constant memory automatically). Size = 3 * 8 * 96 (pointers) + 8 * 97
+// (offsets) + 4 (num) = ~3.1 KB, well under the 4 KB pre-Hopper kernel-
+// arg limit (and 32 KB on Hopper).
 //
 // Cooperative-groups are not strictly required (no cross-block sync), but
 // we use a flat 1D grid sized to total elements; blocks past the last

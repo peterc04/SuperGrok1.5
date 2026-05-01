@@ -5,7 +5,8 @@
 //  __global__ + __device__ code lives in lion.cuh; this TU just emits
 //  - explicit template instantiations for every coherent dtype combo,
 //  - the torch::Tensor-facing launchers (single-tensor + multi-tensor),
-//  - the AT_DISPATCH glue that routes runtime ScalarType -> typed call.
+//  - a runtime-ScalarType -> typed-call dispatch (3 nested switches, no
+//    runtime dtype branches inside the kernel itself).
 //
 //  See lion.cuh header comment for the algorithm, roofline, and dtype
 //  matrix. No additional optimizations are added here.
@@ -80,53 +81,12 @@ INSTANTIATE_LION(__half,        __nv_bfloat16, __nv_fp8_e5m2)
 #undef INSTANTIATE_LION
 
 // ---------------------------------------------------------------------
-// AT_DISPATCH glue: at::ScalarType -> typed C++ type.
+// Helpers visible to anything in this TU (anonymous namespace gives
+// internal linkage; reachable from the public sg::sm90::launch_*
+// functions defined later in the same TU).
 // ---------------------------------------------------------------------
 
 namespace {
-
-// Dispatch on (param, state, grad) ScalarType. State only supports FP32 /
-// BF16; we throw on anything else. ParamT is FP32 / BF16 / FP16; GradT is
-// any dtype in the matrix. Bool/int dtypes are rejected.
-template <typename Fn>
-void dispatch_lion(
-    at::ScalarType param_dtype,
-    at::ScalarType state_dtype,
-    at::ScalarType grad_dtype,
-    Fn&& fn
-) {
-#define DTYPE_CASE_GRAD(P, S)                                                  \
-    switch (grad_dtype) {                                                      \
-        case at::ScalarType::Float:           fn.template operator()<P, S, float>();          break; \
-        case at::ScalarType::BFloat16:        fn.template operator()<P, S, __nv_bfloat16>();  break; \
-        case at::ScalarType::Half:            fn.template operator()<P, S, __half>();         break; \
-        case at::ScalarType::Float8_e4m3fn:   fn.template operator()<P, S, __nv_fp8_e4m3>();  break; \
-        case at::ScalarType::Float8_e5m2:     fn.template operator()<P, S, __nv_fp8_e5m2>();  break; \
-        default: throw std::runtime_error(                                     \
-            std::string("lion: unsupported grad dtype ") +                     \
-            c10::toString(grad_dtype));                                        \
-    }
-
-#define DTYPE_CASE_STATE(P)                                                    \
-    switch (state_dtype) {                                                     \
-        case at::ScalarType::Float:    { DTYPE_CASE_GRAD(P, float)         break; } \
-        case at::ScalarType::BFloat16: { DTYPE_CASE_GRAD(P, __nv_bfloat16) break; } \
-        default: throw std::runtime_error(                                     \
-            std::string("lion: unsupported state dtype ") +                    \
-            c10::toString(state_dtype) + " (must be FP32 or BF16)");           \
-    }
-
-    switch (param_dtype) {
-        case at::ScalarType::Float:    { DTYPE_CASE_STATE(float)         break; }
-        case at::ScalarType::BFloat16: { DTYPE_CASE_STATE(__nv_bfloat16) break; }
-        case at::ScalarType::Half:     { DTYPE_CASE_STATE(__half)        break; }
-        default: throw std::runtime_error(
-            std::string("lion: unsupported param dtype ") +
-            c10::toString(param_dtype) + " (must be FP32, BF16, or FP16)");
-    }
-#undef DTYPE_CASE_STATE
-#undef DTYPE_CASE_GRAD
-}
 
 inline void check_cuda(cudaError_t e, const char* where) {
     if (e != cudaSuccess) {
@@ -140,8 +100,144 @@ inline void check_cuda(cudaError_t e, const char* where) {
 }}} // namespace sg::sm90::lion
 
 // =====================================================================
+// Dispatch (C++17 compatible -- no C++20 generic lambdas).
+//
+// dispatch_lion<Functor>(p_dt, s_dt, g_dt, args...) calls
+// Functor::template run<ParamT, StateT, GradT>(args...) for the
+// resolved dtype triple. Three nested switch-statements; every case is a
+// compile-time-typed call so the compiler emits 30 specialized paths.
+// =====================================================================
+
+namespace sg { namespace sm90 { namespace lion {
+
+namespace {
+
+template <typename Functor, typename ParamT, typename StateT, typename... Args>
+inline void dispatch_grad(at::ScalarType g, Args&&... args) {
+    switch (g) {
+        case at::ScalarType::Float:
+            Functor::template run<ParamT, StateT, float>(std::forward<Args>(args)...);
+            break;
+        case at::ScalarType::BFloat16:
+            Functor::template run<ParamT, StateT, __nv_bfloat16>(std::forward<Args>(args)...);
+            break;
+        case at::ScalarType::Half:
+            Functor::template run<ParamT, StateT, __half>(std::forward<Args>(args)...);
+            break;
+        case at::ScalarType::Float8_e4m3fn:
+            Functor::template run<ParamT, StateT, __nv_fp8_e4m3>(std::forward<Args>(args)...);
+            break;
+        case at::ScalarType::Float8_e5m2:
+            Functor::template run<ParamT, StateT, __nv_fp8_e5m2>(std::forward<Args>(args)...);
+            break;
+        default:
+            throw std::runtime_error(
+                std::string("lion: unsupported grad dtype ") + c10::toString(g));
+    }
+}
+
+template <typename Functor, typename ParamT, typename... Args>
+inline void dispatch_state(at::ScalarType s, at::ScalarType g, Args&&... args) {
+    switch (s) {
+        case at::ScalarType::Float:
+            dispatch_grad<Functor, ParamT, float>(g, std::forward<Args>(args)...);
+            break;
+        case at::ScalarType::BFloat16:
+            dispatch_grad<Functor, ParamT, __nv_bfloat16>(g, std::forward<Args>(args)...);
+            break;
+        default:
+            throw std::runtime_error(
+                std::string("lion: unsupported state dtype ") + c10::toString(s) +
+                " (must be FP32 or BF16)");
+    }
+}
+
+template <typename Functor, typename... Args>
+inline void dispatch_lion(at::ScalarType p, at::ScalarType s, at::ScalarType g,
+                          Args&&... args) {
+    switch (p) {
+        case at::ScalarType::Float:
+            dispatch_state<Functor, float>(s, g, std::forward<Args>(args)...);
+            break;
+        case at::ScalarType::BFloat16:
+            dispatch_state<Functor, __nv_bfloat16>(s, g, std::forward<Args>(args)...);
+            break;
+        case at::ScalarType::Half:
+            dispatch_state<Functor, __half>(s, g, std::forward<Args>(args)...);
+            break;
+        default:
+            throw std::runtime_error(
+                std::string("lion: unsupported param dtype ") + c10::toString(p) +
+                " (must be FP32, BF16, or FP16)");
+    }
+}
+
+// ---------------------------------------------------------------------
+// Functors -- each implements a templated static run<P,S,G>(args...).
+// ---------------------------------------------------------------------
+
+struct SingleStep {
+    template <typename ParamT, typename StateT, typename GradT>
+    static void run(
+        torch::Tensor& param,
+        torch::Tensor& exp_avg,
+        torch::Tensor& grad,
+        float lr, float beta1, float beta2, float wd,
+        int64_t N,
+        cudaStream_t stream
+    ) {
+        cudaError_t e = launch_lion_typed<ParamT, StateT, GradT>(
+            static_cast<ParamT*>(param.data_ptr()),
+            static_cast<StateT*>(exp_avg.data_ptr()),
+            static_cast<const GradT*>(grad.data_ptr()),
+            lr, beta1, beta2, wd,
+            N, stream);
+        check_cuda(e, "launch_fused_lion_step");
+    }
+};
+
+struct MultiTensor {
+    template <typename ParamT, typename StateT, typename GradT>
+    static void run(
+        const std::vector<torch::Tensor>& params,
+        const std::vector<torch::Tensor>& exp_avgs,
+        const std::vector<torch::Tensor>& grads,
+        const std::vector<size_t>& idxs,
+        float lr, float beta1, float beta2, float wd,
+        cudaStream_t stream
+    ) {
+        using Tbl = LionTensorTable<ParamT, StateT, GradT>;
+        constexpr int kMax = kMaxTensorsPerLaunch;
+        for (size_t base = 0; base < idxs.size(); base += kMax) {
+            Tbl tbl{};
+            int64_t cum = 0;
+            tbl.offsets[0] = 0;
+            int n = 0;
+            for (size_t j = base; j < idxs.size() && n < kMax; ++j, ++n) {
+                const size_t i = idxs[j];
+                tbl.param[n]   = static_cast<ParamT*>(params[i].data_ptr());
+                tbl.exp_avg[n] = static_cast<StateT*>(exp_avgs[i].data_ptr());
+                tbl.grad[n]    = static_cast<const GradT*>(grads[i].data_ptr());
+                cum += params[i].numel();
+                tbl.offsets[n + 1] = cum;
+            }
+            tbl.num_tensors = n;
+            cudaError_t e =
+                launch_multi_tensor_lion_typed<ParamT, StateT, GradT>(
+                    tbl, cum, lr, beta1, beta2, wd, stream);
+            check_cuda(e, "launch_multi_tensor_lion");
+        }
+    }
+};
+
+} // anonymous namespace
+
+}}} // namespace sg::sm90::lion
+
+// =====================================================================
 // Public torch::Tensor launchers in namespace sg::sm90.
-// Forward-declared by csrc/bindings/lion.cpp DECLARE_LION(sm90).
+// Forward-declared by csrc/bindings/lion.cpp DECLARE_LION(sm90)
+// and csrc/bindings/multi_tensor.cpp DECLARE_MT(sm90).
 // =====================================================================
 
 namespace sg { namespace sm90 {
@@ -169,24 +265,17 @@ void launch_fused_lion_step(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    lion::dispatch_lion(
+    sg::sm90::lion::dispatch_lion<sg::sm90::lion::SingleStep>(
         param.scalar_type(), exp_avg.scalar_type(), grad.scalar_type(),
-        [&]<typename ParamT, typename StateT, typename GradT>() {
-            cudaError_t e = lion::launch_lion_typed<ParamT, StateT, GradT>(
-                static_cast<ParamT*>(param.data_ptr()),
-                static_cast<StateT*>(exp_avg.data_ptr()),
-                static_cast<const GradT*>(grad.data_ptr()),
-                lr, beta1, beta2, weight_decay,
-                N, stream);
-            lion::check_cuda(e, "launch_fused_lion_step");
-        });
+        param, exp_avg, grad, lr, beta1, beta2, weight_decay, N, stream);
 }
 
 // ---------------------------------------------------------------------
-// Multi-tensor implementation. Packs all input tensors into batches of
-// kMaxTensorsPerLaunch and issues one kernel per batch. All tensors in a
-// single batch must share the (param, state, grad) dtype triple; the
-// outer loop groups by dtype-triple before packing.
+// Multi-tensor entry. Groups inputs by (param,state,grad) dtype triple,
+// then launches one or more batched kernels per group (kMaxTensorsPerLaunch
+// tensors per launch). All input vectors are forwarded as const refs into
+// the MultiTensor functor; data_ptr() is read inside the functor with the
+// resolved dtype, ensuring no runtime dtype branches inside the kernel.
 // ---------------------------------------------------------------------
 
 namespace {
@@ -211,7 +300,6 @@ void launch_multi_tensor_lion_impl(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // Group indices by (param, state, grad) dtype triple.
     std::vector<DtypeKey> keys;
     std::vector<std::vector<size_t>> groups;
     for (size_t i = 0; i < T; ++i) {
@@ -235,34 +323,11 @@ void launch_multi_tensor_lion_impl(
     }
 
     for (size_t gi = 0; gi < keys.size(); ++gi) {
-        const auto& idxs = groups[gi];
         const DtypeKey& k = keys[gi];
-
-        sg::sm90::lion::dispatch_lion(
+        sg::sm90::lion::dispatch_lion<sg::sm90::lion::MultiTensor>(
             k.p, k.s, k.g,
-            [&]<typename ParamT, typename StateT, typename GradT>() {
-                using Tbl = sg::sm90::lion::LionTensorTable<ParamT, StateT, GradT>;
-                constexpr int kMax = sg::sm90::lion::kMaxTensorsPerLaunch;
-                for (size_t base = 0; base < idxs.size(); base += kMax) {
-                    Tbl tbl{};
-                    int64_t cum = 0;
-                    tbl.offsets[0] = 0;
-                    int n = 0;
-                    for (size_t j = base; j < idxs.size() && n < kMax; ++j, ++n) {
-                        const size_t i = idxs[j];
-                        tbl.param[n]   = static_cast<ParamT*>(params[i].data_ptr());
-                        tbl.exp_avg[n] = static_cast<StateT*>(exp_avgs[i].data_ptr());
-                        tbl.grad[n]    = static_cast<const GradT*>(grads[i].data_ptr());
-                        cum += params[i].numel();
-                        tbl.offsets[n + 1] = cum;
-                    }
-                    tbl.num_tensors = n;
-                    cudaError_t e =
-                        sg::sm90::lion::launch_multi_tensor_lion_typed<ParamT, StateT, GradT>(
-                            tbl, cum, lr, beta1, beta2, wd, stream);
-                    sg::sm90::lion::check_cuda(e, "launch_multi_tensor_lion");
-                }
-            });
+            params, exp_avgs, grads, groups[gi],
+            lr, beta1, beta2, wd, stream);
     }
 }
 

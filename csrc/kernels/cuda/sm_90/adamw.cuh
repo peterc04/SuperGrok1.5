@@ -441,7 +441,27 @@ cudaError_t launch_fused_adamw_simple_step(
 
 namespace sg { namespace sm90 {
 
-inline void launch_fused_adamw_simple(
+// Declared in the header so adamw.cu can define it (single TU emission)
+// and so external readers can find the entry point next to the kernel.
+// The matching forward declaration in csrc/bindings/grokadamw.cpp must
+// stay byte-identical (return type, parameter list, ref-qualifiers).
+void launch_fused_adamw_simple(
+    std::vector<torch::Tensor>& params,
+    std::vector<torch::Tensor>& exp_avgs,
+    std::vector<torch::Tensor>& exp_avg_sqs,
+    std::vector<torch::Tensor>& grads,
+    std::vector<int64_t>& steps,
+    float beta1, float beta2, float lr, float wd, float eps);
+
+}} // namespace sg::sm90
+
+// Body deferred to adamw.cu (single TU). Below is the implementation,
+// guarded so subsequent header inclusions remain header-only.
+#ifdef SG_SM90_ADAMW_DEFINE_LAUNCHER
+
+namespace sg { namespace sm90 {
+
+void launch_fused_adamw_simple(
     std::vector<torch::Tensor>& params,
     std::vector<torch::Tensor>& exp_avgs,
     std::vector<torch::Tensor>& exp_avg_sqs,
@@ -523,3 +543,5 @@ inline void launch_fused_adamw_simple(
 }
 
 }} // namespace sg::sm90
+
+#endif // SG_SM90_ADAMW_DEFINE_LAUNCHER

@@ -225,29 +225,36 @@ __global__ void restore_vec4_kernel(
 // =====================================================================
 //  Kernel 3: direction + adjust (fused)
 //
-//  kRefresh = true  (every K steps):
-//      v_dir <- (sam_grad - normal_grad) * inv_norm           (in regs)
-//      grad  += la_times_gnorm * v_dir
-//      v_dir is NOT written to GMEM — it stays in registers and is
-//      consumed in the same cycle as the adjust. Saves R(v_dir)+W(v_dir).
+//  Per the current binding contract (csrc/bindings/looksam.cpp lines
+//  113, 132): the host pre-computes diff = (sam_grad - normal_grad)
+//  cast to FP32 and passes it as the "v_dir" tensor along with
+//  inv_norm = 1/||diff||. The launcher's job is therefore the apply:
 //
-//  kRefresh = false (cached path; not exercised by the current binding
-//                    but compiled so the host can switch by template):
-//      v_dir <- load(v_dir_state)
-//      grad  += la_times_gnorm * v_dir
-//      Saves the (sam_grad, normal_grad) round-trip but reads v_dir
-//      from GMEM. The binding owns the host-side dispatch on (t % k).
+//      grad[i] += lambda * grad_norm * (v_dir[i] * inv_norm)
 //
-//  All math FP32; loads/stores typed.
+//  kRefresh template bool:
+//    - kRefresh = false (used by today's binding):
+//        v_dir is loaded directly from GMEM (it's already FP32 diff).
+//    - kRefresh = true  (compiled but not yet wired):
+//        Future fused path that takes (grad, sam_grad, normal_grad)
+//        and computes diff in-register, saving the .to(float32) +
+//        materialisation of the diff tensor on the host. Reuses the
+//        same kernel slot via the third-tensor pointer being read as
+//        normal_grad of dtype GradT.
+//
+//  Two dtypes are exposed:
+//    GradT — the dtype of grad[] (loaded + stored)
+//    VDirT — the dtype of the third tensor (FP32 in cached, GradT
+//             in refresh-future). All math FP32.
 // =====================================================================
 
-template <bool kRefresh, typename GradT>
+template <bool kRefresh, typename GradT, typename VDirT>
 __launch_bounds__(LOOKSAM_BLOCK_SIZE, LOOKSAM_MIN_BLOCKS_PER_SM)
 __global__ void direction_adjust_fused_kernel(
     GradT* __restrict__ grad,
-    const GradT* __restrict__ sam_grad,
-    const GradT* __restrict__ v_dir_or_normal,  // refresh: normal_grad
-                                                 // cached:  v_dir state
+    const GradT* __restrict__ sam_grad,         // refresh-future only
+    const VDirT* __restrict__ v_dir_or_normal,  // cached: v_dir (FP32)
+                                                // refresh: normal_grad
     const float inv_norm,
     const float la_times_gnorm,
     const int64_t N)
@@ -257,15 +264,20 @@ __global__ void direction_adjust_fused_kernel(
     float v;
     if constexpr (kRefresh) {
         float sg = load_as_float<GradT>(sam_grad + idx);
-        float ng = load_as_float<GradT>(v_dir_or_normal + idx);
+        float ng = load_as_float<VDirT>(v_dir_or_normal + idx);
         v = (sg - ng) * inv_norm;
     } else {
-        v = load_as_float<GradT>(v_dir_or_normal + idx);
+        // Cached: v_dir already pre-multiplied by 1 (raw diff). The
+        // inv_norm scaling happens here so that lambda*grad_norm
+        // sees a unit direction.
+        v = load_as_float<VDirT>(v_dir_or_normal + idx) * inv_norm;
     }
     float g = load_as_float<GradT>(grad + idx);
     store_from_float<GradT>(grad + idx, g + la_times_gnorm * v);
 }
 
+// FP32-only float4 fast path. Both refresh and cached share the same
+// vec4 layout (all three tensors FP32 + 16 B aligned).
 template <bool kRefresh>
 __launch_bounds__(LOOKSAM_BLOCK_SIZE, LOOKSAM_MIN_BLOCKS_PER_SM)
 __global__ void direction_adjust_fused_vec4_kernel(
@@ -288,6 +300,8 @@ __global__ void direction_adjust_fused_vec4_kernel(
         v.w = (sg.w - ng.w) * inv_norm;
     } else {
         v = stream_load4(v_dir_or_normal4 + i);
+        v.x *= inv_norm; v.y *= inv_norm;
+        v.z *= inv_norm; v.w *= inv_norm;
     }
     float4 g = grad4[i];
     g.x += la_times_gnorm * v.x;
