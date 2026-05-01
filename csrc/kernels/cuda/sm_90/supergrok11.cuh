@@ -669,7 +669,22 @@ cudaError_t sg11_launch_fused_step_H(
         kfn = (void*)&sg11_sweep_b_kernel<ParamT, StateT, GradT, 512>;
         b_block = 512;
     }
-    err = cudaLaunchCooperativeKernel(kfn, grid, b_block, args, 0, stream);
+
+    // Cooperative launch grid is bounded by the occupancy limit; query and
+    // clamp. CUDA refuses launches larger than max_active_blocks * num_SMs.
+    int max_blocks_per_sm = 0;
+    err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks_per_sm, kfn, b_block, /*dynamicSMemBytes=*/0);
+    if (err != cudaSuccess) return err;
+    int dev = 0; (void)cudaGetDevice(&dev);
+    int num_sm = 0; (void)cudaDeviceGetAttribute(&num_sm,
+        cudaDevAttrMultiProcessorCount, dev);
+    const int coop_grid_cap = max_blocks_per_sm * num_sm;
+    int b_grid = grid;
+    if (b_grid > coop_grid_cap) b_grid = coop_grid_cap;
+    if (b_grid < 1) b_grid = 1;
+
+    err = cudaLaunchCooperativeKernel(kfn, b_grid, b_block, args, 0, stream);
     return err;
 }
 
