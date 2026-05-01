@@ -5,6 +5,10 @@ Drives test_matrix.py once per supported arch in {sm_90, gfx942}.
 tpu_v5p is tested separately via the JAX bridge (test_tpu_jax_bridge.py).
 Skips arches whose binding is not built into the local extension.
 
+3-arch active set: sm_90, gfx942, tpu_v5p.
+All other arches (sm_80, sm_89, sm_100, sm_103, sm_120, gfx950) have been
+removed from the active set.
+
 Replaces the old test_all_tiers.py which tested a generic-tier fallback;
 under the all-specialized policy there is no generic tier.
 
@@ -16,17 +20,12 @@ import os
 import subprocess
 import sys
 
-# Supported set per the all-specialized refactor. See dispatch.py /
-# csrc/kernels/README.md / REFACTOR_PLAN.md.
+# Supported set per the all-specialized refactor (3-arch active set).
+# See dispatch.py / csrc/kernels/README.md / REFACTOR_PLAN.md.
+# tpu_v5p is tested separately via test_tpu_jax_bridge.py.
 ARCHES = [
-    ('Ampere family (sm_80 binding)',           '80'),
-    ('Ada / RTX 40, L40 (sm_89)',               '89'),
     ('Hopper (sm_90)',                          '90'),
-    ('Datacenter Blackwell (sm_100)',           '100'),
-    ('Blackwell Ultra / B300 (sm_103)',         '103'),
-    ('Consumer Blackwell / RTX 50 (sm_120)',    '120'),
     ('AMD MI300X (gfx942)',                     '942'),
-    ('AMD MI350X / MI355X (gfx950)',            '950'),
 ]
 
 
