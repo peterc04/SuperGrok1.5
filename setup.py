@@ -7,8 +7,8 @@ Supported arches (3-arch active set):
   - TPU:    v5p (Pallas via JAX)
 
 Build fails on unsupported arches. There is no generic-kernel fallback
-and no tier fallback chain. See REFRESH.md §0 and
-csrc/kernels/README.md for the underlying policy.
+and no tier fallback chain. See README.md (Architecture section)
+and csrc/kernels/README.md for the underlying policy.
 
 Build:
     pip install -e .
