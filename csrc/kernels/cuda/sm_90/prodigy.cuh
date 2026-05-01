@@ -280,4 +280,191 @@ __global__ void prodigy_d_update_kernel(
     }
 }
 
+// =====================================================================
+// Kernel 2: Fused per-element apply with the new d_t.
+//
+// Per element (FP32 math; only loads/stores are typed):
+//     g    = grad[i]
+//     m_t  = b1 * m_{t-1} + (1-b1) * d_t * g
+//     v_t  = b2 * v_{t-1} + (1-b2) * d_t^2 * g^2
+//     r_t  = sqrt(b2) * r_{t-1}
+//          + (1 - sqrt(b2)) * d_t^2 * g * (theta0[i] - theta_{t-1}[i])
+//     s_t  = sqrt(b2) * s_{t-1}
+//          + (1 - sqrt(b2)) * d_t * g
+//     theta_t = theta_{t-1}
+//             - lr * d_t * (m_t / (sqrt(v_t) + d_t * eps) + wd * theta)
+//
+// d_t is read from a single-element device pointer (filled by
+// prodigy_d_update_kernel). Note: bc1 / bc2 are NOT applied here —
+// Prodigy's convergence is driven by the d_t schedule.
+// =====================================================================
+
+template <typename ParamT, typename StateT, typename GradT, int BLOCK_SIZE>
+__global__ __launch_bounds__(BLOCK_SIZE, 2)
+void prodigy_apply_kernel(
+    ParamT*       __restrict__ params,
+    const ParamT* __restrict__ params_init,
+    StateT*       __restrict__ exp_avg,
+    StateT*       __restrict__ exp_avg_sq,
+    StateT*       __restrict__ r_state,
+    StateT*       __restrict__ s_state,
+    const GradT*  __restrict__ grads,
+    const float*  __restrict__ d_lr_ptr,
+    float lr, float beta1, float beta2, float eps, float weight_decay,
+    int64_t n_elements
+) {
+    static_assert(is_param_dtype<ParamT>::value, "Prodigy: invalid ParamT");
+    static_assert(is_state_dtype<StateT>::value, "Prodigy: invalid StateT");
+    static_assert(is_grad_dtype<GradT>::value,   "Prodigy: invalid GradT");
+    static_assert(is_coherent_combo<ParamT, GradT>::value,
+        "Prodigy: FP8 grad with FP32 param requires explicit rescale");
+
+    // Broadcast d_t and beta-derived scalars once per block.
+    __shared__ float s_d;
+    __shared__ float s_sqrt_b2;
+    __shared__ float s_one_minus_sqrt_b2;
+    if (threadIdx.x == 0) {
+        s_d = *d_lr_ptr;
+        s_sqrt_b2 = sqrtf(beta2);
+        s_one_minus_sqrt_b2 = 1.0f - s_sqrt_b2;
+    }
+    __syncthreads();
+    const float d_t      = s_d;
+    const float sqrt_b2  = s_sqrt_b2;
+    const float omsqrtb2 = s_one_minus_sqrt_b2;
+    const float d_t_sq   = d_t * d_t;
+    const float one_minus_b1 = 1.0f - beta1;
+    const float one_minus_b2 = 1.0f - beta2;
+
+    const int64_t stride =
+        static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < n_elements; i += stride) {
+        const float g  = load_as_float(grads        + i);
+        const float p  = load_as_float(params       + i);
+        const float p0 = load_as_float(params_init  + i);
+        const float m0 = load_state(exp_avg    + i);
+        const float v0 = load_state(exp_avg_sq + i);
+        const float r0 = load_state(r_state    + i);
+        const float s0 = load_state(s_state    + i);
+
+        const float dg   = d_t * g;
+        const float dgsq = d_t_sq * g * g;
+
+        const float m1 = beta1 * m0 + one_minus_b1 * dg;
+        const float v1 = beta2 * v0 + one_minus_b2 * dgsq;
+        const float r1 = sqrt_b2 * r0 + omsqrtb2 * d_t_sq * g * (p0 - p);
+        const float s1 = sqrt_b2 * s0 + omsqrtb2 * dg;
+
+        // theta update with coupled-style scaling: lr_eff = lr * d_t.
+        const float rsv = fast_rsqrt_nr(fmaxf(v1, 0.0f));
+        // 1 / (sqrt(v_t) + d_t * eps) = rsv / (1 + d_t * eps * rsv).
+        const float denom_inv = rsv / (1.0f + d_t * eps * rsv);
+        const float u  = m1 * denom_inv + weight_decay * p;
+        const float p1 = p - lr * d_t * u;
+
+        store_state(exp_avg    + i, m1);
+        store_state(exp_avg_sq + i, v1);
+        store_state(r_state    + i, r1);
+        store_state(s_state    + i, s1);
+        store_from_float(params + i, p1);
+    }
+}
+
+// =====================================================================
+// Per-tensor templated launcher.
+//
+// Signature exactly as documented in the build spec. Orchestration:
+//   (a) zero-init r_partial_out / s_partial_out via cudaMemsetAsync
+//   (b) prodigy_dlr_reduce_kernel  -> r_partial / s_partial (device)
+//   (c) prodigy_d_update_kernel    -> updates *d_lr_inout (device)
+//   (d) prodigy_apply_kernel       -> moments / r / s / params
+// d_t stays fully on-device — no per-step host CPU sync.
+//
+// Block size is pulled from tuned_configs.h::GROKADAMW_CONFIGS[ARCH_SM90]
+// (Prodigy shares the same BW-bound profile until autotune adds a row).
+// =====================================================================
+
+template <typename ParamT, typename StateT, typename GradT>
+cudaError_t launch_prodigy_fused_step(
+    ParamT* params, ParamT* params_init,
+    StateT* exp_avg, StateT* exp_avg_sq,
+    StateT* r_state, StateT* s_state,
+    const GradT* grads,
+    float* d_lr_inout,
+    float* r_partial_out, float* s_partial_out,
+    float lr, float beta1, float beta2, float eps, float weight_decay,
+    int64_t n_elements, int64_t step_count,
+    cudaStream_t stream
+) {
+    static_assert(is_param_dtype<ParamT>::value, "Prodigy: invalid ParamT");
+    static_assert(is_state_dtype<StateT>::value, "Prodigy: invalid StateT");
+    static_assert(is_grad_dtype<GradT>::value,   "Prodigy: invalid GradT");
+    static_assert(is_coherent_combo<ParamT, GradT>::value,
+        "Prodigy: FP8 grad with FP32 param requires an explicit rescale");
+
+    if (n_elements <= 0) return cudaSuccess;
+
+    // Block size pulled from the autotuned table; do NOT hardcode.
+    const LaunchConfig cfg =
+        get_grokadamw_config(/*arch=*/90, static_cast<int>(n_elements));
+    const int block = cfg.block_size;
+
+    constexpr int MAX_BLOCKS = 8192;
+    const int64_t needed = (n_elements + block - 1) / block;
+    const int grid = static_cast<int>(needed < MAX_BLOCKS ? needed : MAX_BLOCKS);
+
+    // (a) Zero the partial accumulators before the reduce kernel atomics.
+    cudaError_t err = cudaMemsetAsync(r_partial_out, 0, sizeof(float), stream);
+    if (err != cudaSuccess) return err;
+    err = cudaMemsetAsync(s_partial_out, 0, sizeof(float), stream);
+    if (err != cudaSuccess) return err;
+
+    // (b) Multi-output reduce: r_partial / s_partial -> device scalars.
+    auto launch_reduce = [&](auto block_constant) {
+        constexpr int BS = decltype(block_constant)::value;
+        prodigy_dlr_reduce_kernel<ParamT, GradT, StateT, BS>
+            <<<grid, BS, 0, stream>>>(
+                params, params_init, s_state, grads,
+                d_lr_inout, r_partial_out, s_partial_out,
+                beta2, n_elements);
+    };
+    if (block == 128) {
+        launch_reduce(std::integral_constant<int, 128>{});
+    } else if (block == 512) {
+        launch_reduce(std::integral_constant<int, 512>{});
+    } else {
+        launch_reduce(std::integral_constant<int, 256>{});
+    }
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    // (c) Device-side scalar update of d_t — preferred over host sync.
+    prodigy_d_update_kernel<<<1, 1, 0, stream>>>(
+        r_partial_out, s_partial_out, d_lr_inout);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    // (d) Fused apply with the freshly-updated d_t.
+    auto launch_apply = [&](auto block_constant) {
+        constexpr int BS = decltype(block_constant)::value;
+        prodigy_apply_kernel<ParamT, StateT, GradT, BS>
+            <<<grid, BS, 0, stream>>>(
+                params, params_init,
+                exp_avg, exp_avg_sq, r_state, s_state, grads,
+                d_lr_inout,
+                lr, beta1, beta2, eps, weight_decay,
+                n_elements);
+    };
+    if (block == 128) {
+        launch_apply(std::integral_constant<int, 128>{});
+    } else if (block == 512) {
+        launch_apply(std::integral_constant<int, 512>{});
+    } else {
+        launch_apply(std::integral_constant<int, 256>{});
+    }
+    (void) step_count;  // reserved for future SR / PRNG seeding.
+    return cudaGetLastError();
+}
+
 }}} // namespace sg::sm90::prodigy
