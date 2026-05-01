@@ -22,22 +22,33 @@ from ._pallas_kernels import (
 )
 
 
-def get_kernels():
-    """Return the per-version kernel module for the active TPU.
+def get_kernels(kind=None):
+    """Return the per-version kernel module (or kernel dict) for the active TPU.
 
-    Raises ``ImportError`` if the TPU version is unknown or no Pallas
-    backend is available.
+    Args:
+        kind: optional string — ``'optimizers'`` or ``'models'``.  When
+            provided, returns a *dict* of kernel callables from the
+            per-version sub-module's ``get_kernels(kind)``.  When
+            ``None`` (the default, for backward compatibility), returns
+            the sub-module itself.
+
+    Raises:
+        ``ImportError`` if the TPU version is unknown or no Pallas
+        backend is available.
     """
     version = detect_tpu_version()
     if version in ("v4", "v5e", "v5p"):
         from . import v5p as mod
-        return mod
-    if version == "v6e":
+    elif version == "v6e":
         from . import v6e as mod
-        return mod
-    raise ImportError(
-        f"Unknown TPU version {version!r}; supported: v4/v5e/v5p, v6e. "
-        "Set PALLAS_TPU_VERSION env var to override.")
+    else:
+        raise ImportError(
+            f"Unknown TPU version {version!r}; supported: v4/v5e/v5p, v6e. "
+            "Set PALLAS_TPU_VERSION env var to override.")
+
+    if kind is not None:
+        return mod.get_kernels(kind)
+    return mod
 
 
 __all__ = ["detect_tpu_version", "get_kernels", "_HAS_PALLAS"]
