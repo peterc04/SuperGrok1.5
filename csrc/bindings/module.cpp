@@ -323,6 +323,9 @@ void mxfp4_quantize(torch::Tensor, torch::Tensor, torch::Tensor, int);
 
 } // namespace sg
 
+// Forward declaration for model bindings aggregator (models_module.cpp)
+void register_model_bindings(pybind11::module_& m);
+
 PYBIND11_MODULE(_ops, m) {
     m.doc() = "Grokking Optimizers — specialized per-arch C++/CUDA/HIP kernels";
 
@@ -440,4 +443,7 @@ PYBIND11_MODULE(_ops, m) {
           "Fused multi-tensor grad prepare (clip, finite, bias corrections) "
           "+ batched mamba-3+PEER step. Replaces N per-parameter Python "
           "iterations with one kernel launch.");
+
+    // Model bindings (decoder, vit, mamba) — registered as _ops.models.*
+    register_model_bindings(m);
 }

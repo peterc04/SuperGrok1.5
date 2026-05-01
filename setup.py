@@ -117,6 +117,10 @@ COMMON_BINDINGS = [
     "csrc/bindings/supergrok15.cpp",
     "csrc/bindings/supergrok2.cpp",
     "csrc/bindings/distributed_scan.cpp",
+    "csrc/bindings/models_decoder.cpp",
+    "csrc/bindings/models_vit.cpp",
+    "csrc/bindings/models_mamba.cpp",
+    "csrc/bindings/models_module.cpp",
     "csrc/bindings/module.cpp",
 ]
 
