@@ -1013,3 +1013,194 @@ __global__ void gru_backward_kernel(
 
 }}} // namespace sg::sm90::supergrok2 (close GRU bwd block)
 #endif // GROK_CUDA
+
+// ---------------------------------------------------------------------
+//  CHUNK 6 — Expert+PEER backward + Out-projection backward kernels.
+// ---------------------------------------------------------------------
+
+#if GROK_CUDA
+namespace sg { namespace sm90 { namespace supergrok2 {
+
+__launch_bounds__(SG2B_BLOCK, 8)
+__global__ void expert_peer_backward_kernel(
+    const float* __restrict__ d_expert_out,
+    const float* __restrict__ grad_vals,
+    const int*   __restrict__ expert_indices,
+    const float* __restrict__ routing_weights,
+    const float* __restrict__ saved_z_hidden,
+    const float* __restrict__ saved_peer_input,
+    const float* __restrict__ peer_query_Ws,
+    const float* __restrict__ prod_keys_A,
+    const float* __restrict__ prod_keys_B,
+    const float* __restrict__ saved_scores_a,
+    const float* __restrict__ saved_scores_b,
+    const int*   __restrict__ saved_top_a_idx,
+    const int*   __restrict__ saved_top_b_idx,
+    const float* __restrict__ saved_soft_a,
+    const float* __restrict__ saved_soft_b,
+    const float* __restrict__ expert_W1,
+    const float* __restrict__ expert_W2,
+    const float* __restrict__ expert_b2_in,
+    float*       __restrict__ d_expert_W1,
+    float*       __restrict__ d_expert_b1,
+    float*       __restrict__ d_expert_W2,
+    float*       __restrict__ d_expert_b2,
+    float*       __restrict__ d_peer_query_Ws,
+    float*       __restrict__ d_prod_keys_A,
+    float*       __restrict__ d_prod_keys_B,
+    float*       __restrict__ d_peer_input,
+    const int N, const int num_heads, const int topk, const int num_active,
+    const int d_model, const int pk_dim, const int expert_hidden,
+    const int peer_input_dim, const int num_experts
+) {
+    extern __shared__ float smem[];
+    float* s_d_expert_W1 = smem;
+    float* s_d_expert_b1 = s_d_expert_W1 + num_experts * expert_hidden;
+    float* s_d_expert_W2 = s_d_expert_b1 + num_experts * expert_hidden;
+    float* s_d_expert_b2 = s_d_expert_W2 + num_experts * expert_hidden;
+    int total_expert_smem = 3 * num_experts * expert_hidden + num_experts;
+    int half_d_smem = d_model / 2;
+    int pqw_size = num_heads * d_model * peer_input_dim;
+    int pka_size = num_heads * pk_dim * half_d_smem;
+    int pkb_size = pka_size;
+    float* s_d_peer_query_Ws = smem + total_expert_smem;
+    float* s_d_prod_keys_A   = s_d_peer_query_Ws + pqw_size;
+    float* s_d_prod_keys_B   = s_d_prod_keys_A + pka_size;
+    int total_smem = total_expert_smem + pqw_size + pka_size + pkb_size;
+
+    for (int i = threadIdx.x; i < total_smem; i += blockDim.x) smem[i] = 0.0f;
+    __syncthreads();
+
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        float d_out = d_expert_out[idx];
+        float g_val = grad_vals[idx];
+        int half_d  = d_model / 2;
+
+        for (int h = 0; h < num_heads; h++) {
+            float d_head_out = d_out / (float)num_heads;
+            float dot_a[MAX_TOPK] = {};
+            float dot_b[MAX_TOPK] = {};
+            for (int k = 0; k < num_active; k++) {
+                int a_local = k / topk;
+                int b_local = k % topk;
+                int ei = expert_indices[(idx * num_heads + h) * num_active + k];
+                float out_k = expert_b2_in[ei];
+                for (int eh = 0; eh < expert_hidden; eh++) {
+                    float zv = saved_z_hidden[((idx * num_heads + h) * num_active + k) * expert_hidden + eh];
+                    out_k += expert_W2[ei * expert_hidden + eh] * zv;
+                }
+                float d_rw = d_head_out * out_k;
+                float sa = saved_soft_a[(idx * num_heads + h) * topk + a_local];
+                float sb = saved_soft_b[(idx * num_heads + h) * topk + b_local];
+                dot_a[a_local] += (d_rw * sb) * sa;
+                dot_b[b_local] += (d_rw * sa) * sb;
+            }
+            for (int k = 0; k < num_active; k++) {
+                int a_local = k / topk;
+                int b_local = k % topk;
+                int ei = expert_indices[(idx * num_heads + h) * num_active + k];
+                float rw = routing_weights[(idx * num_heads + h) * num_active + k];
+                float out_k = expert_b2_in[ei];
+                for (int eh = 0; eh < expert_hidden; eh++) {
+                    float zv = saved_z_hidden[((idx * num_heads + h) * num_active + k) * expert_hidden + eh];
+                    out_k += expert_W2[ei * expert_hidden + eh] * zv;
+                }
+                float d_rw    = d_head_out * out_k;
+                float d_out_k = d_head_out * rw;
+                atomicAdd(&s_d_expert_b2[ei], d_out_k);
+                for (int eh = 0; eh < expert_hidden; eh++) {
+                    float zv = saved_z_hidden[((idx * num_heads + h) * num_active + k) * expert_hidden + eh];
+                    atomicAdd(&s_d_expert_W2[ei * expert_hidden + eh], d_out_k * zv);
+                    float d_z = d_out_k * expert_W2[ei * expert_hidden + eh];
+                    float d_pre_relu = (zv > 0.0f) ? d_z : 0.0f;
+                    atomicAdd(&s_d_expert_W1[ei * expert_hidden + eh], d_pre_relu * g_val);
+                    atomicAdd(&s_d_expert_b1[ei * expert_hidden + eh], d_pre_relu);
+                }
+                float sa = saved_soft_a[(idx * num_heads + h) * topk + a_local];
+                float sb = saved_soft_b[(idx * num_heads + h) * topk + b_local];
+                float d_score_a = 10.0f * sa * (d_rw * sb - dot_a[a_local]);
+                float d_score_b = 10.0f * sb * (d_rw * sa - dot_b[b_local]);
+                int a_key_idx = saved_top_a_idx[(idx * num_heads + h) * topk + a_local];
+                int b_key_idx = saved_top_b_idx[(idx * num_heads + h) * topk + b_local];
+                for (int d = 0; d < half_d; d++) {
+                    float q_a_d = 0.0f, q_b_d = 0.0f;
+                    for (int j = 0; j < peer_input_dim; j++) {
+                        float pi_j = saved_peer_input[idx * peer_input_dim + j];
+                        q_a_d += peer_query_Ws[(h * d_model + d) * peer_input_dim + j] * pi_j;
+                        q_b_d += peer_query_Ws[(h * d_model + half_d + d) * peer_input_dim + j] * pi_j;
+                    }
+                    atomicAdd(&s_d_prod_keys_A[(h * pk_dim + a_key_idx) * half_d + d], d_score_a * q_a_d);
+                    atomicAdd(&s_d_prod_keys_B[(h * pk_dim + b_key_idx) * half_d + d], d_score_b * q_b_d);
+                    float d_q_a_d = d_score_a * prod_keys_A[(h * pk_dim + a_key_idx) * half_d + d];
+                    float d_q_b_d = d_score_b * prod_keys_B[(h * pk_dim + b_key_idx) * half_d + d];
+                    for (int j = 0; j < peer_input_dim; j++) {
+                        float pi_j = saved_peer_input[idx * peer_input_dim + j];
+                        atomicAdd(&s_d_peer_query_Ws[(h * d_model + d) * peer_input_dim + j], d_q_a_d * pi_j);
+                        atomicAdd(&s_d_peer_query_Ws[(h * d_model + half_d + d) * peer_input_dim + j], d_q_b_d * pi_j);
+                        atomicAdd(&d_peer_input[idx * peer_input_dim + j],
+                                  d_q_a_d * peer_query_Ws[(h * d_model + d) * peer_input_dim + j] +
+                                  d_q_b_d * peer_query_Ws[(h * d_model + half_d + d) * peer_input_dim + j]);
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    // Flush expert weight grads
+    for (int i = threadIdx.x; i < total_expert_smem; i += blockDim.x) {
+        if (smem[i] != 0.0f) {
+            if      (i < num_experts * expert_hidden)
+                atomicAdd(&d_expert_W1[i], smem[i]);
+            else if (i < 2 * num_experts * expert_hidden)
+                atomicAdd(&d_expert_b1[i - num_experts * expert_hidden], smem[i]);
+            else if (i < 3 * num_experts * expert_hidden)
+                atomicAdd(&d_expert_W2[i - 2 * num_experts * expert_hidden], smem[i]);
+            else
+                atomicAdd(&d_expert_b2[i - 3 * num_experts * expert_hidden], smem[i]);
+        }
+    }
+    for (int i = threadIdx.x; i < pqw_size; i += blockDim.x)
+        if (s_d_peer_query_Ws[i] != 0.0f) atomicAdd(&d_peer_query_Ws[i], s_d_peer_query_Ws[i]);
+    for (int i = threadIdx.x; i < pka_size; i += blockDim.x)
+        if (s_d_prod_keys_A[i] != 0.0f) atomicAdd(&d_prod_keys_A[i], s_d_prod_keys_A[i]);
+    for (int i = threadIdx.x; i < pkb_size; i += blockDim.x)
+        if (s_d_prod_keys_B[i] != 0.0f) atomicAdd(&d_prod_keys_B[i], s_d_prod_keys_B[i]);
+}
+
+__launch_bounds__(SG2B_BLOCK, 8)
+__global__ void out_proj_backward_kernel(
+    const float* __restrict__ d_context,
+    const float* __restrict__ scan_out,
+    const float* __restrict__ out_proj_W,
+    float*       __restrict__ d_out_proj_W,
+    float*       __restrict__ d_scan_out,
+    const int N, const int d_model, const int d_inner
+) {
+    extern __shared__ float smem[];
+    float* s_d_out_proj_W = smem;
+    const int tid = threadIdx.x;
+    const int op_size = d_model * d_inner;
+    for (int i = tid; i < op_size; i += blockDim.x) s_d_out_proj_W[i] = 0.0f;
+    __syncthreads();
+    const int idx = blockIdx.x * blockDim.x + tid;
+    if (idx < N) {
+        for (int j = 0; j < d_inner; j++) {
+            float d_scan_j = 0.0f;
+            float so_j = scan_out[idx * d_inner + j];
+            for (int d = 0; d < d_model; d++) {
+                float d_ctx = d_context[idx * d_model + d];
+                d_scan_j += d_ctx * out_proj_W[d * d_inner + j];
+                atomicAdd(&s_d_out_proj_W[d * d_inner + j], d_ctx * so_j);
+            }
+            d_scan_out[idx * d_inner + j] = d_scan_j;
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < op_size; i += blockDim.x)
+        if (s_d_out_proj_W[i] != 0.0f) atomicAdd(&d_out_proj_W[i], s_d_out_proj_W[i]);
+}
+
+}}} // namespace sg::sm90::supergrok2 (close chunk 6)
+#endif // GROK_CUDA
