@@ -5,11 +5,13 @@ elementwise-equal output (modulo FP tolerance) on the same input. Skips
 arches that aren't compiled into the local extension.
 
 This test is the safety net for the all-specialized refactor: the math
-must remain identical across sm_80, sm_90, sm_100, gfx942 even as
-arch-specific primitives (cp.async, TMA, MFMA, FP8 paths) diverge for
-performance.
+must remain identical across sm_90, gfx942 even as arch-specific
+primitives (TMA, MFMA, FP8 paths) diverge for performance.
 
-Set FORCE_ARCH=<80|90|100|942> to switch dispatch between arches without
+NOTE: tpu_v5p is the third active arch but uses the JAX bridge and is
+tested separately via test_tpu_jax_bridge.py.
+
+Set FORCE_ARCH=<90|942> to switch dispatch between arches without
 changing hardware (the per-arch binding for that arch must be in the
 build).
 
@@ -28,7 +30,7 @@ import torch
 # Skip the entire module gracefully if torch isn't built or if no GPU is
 # available. The test is hardware-gated; CI runs it per-arch.
 HAS_GPU = torch.cuda.is_available()
-SUPPORTED = (80, 89, 90, 100, 103, 120, 942, 950)
+SUPPORTED = (90, 942)
 
 
 def _set_force_arch(arch: int):
@@ -58,7 +60,7 @@ def _arch_available(arch: int) -> bool:
 
 @unittest.skipUnless(HAS_GPU, "Cross-arch test requires a GPU.")
 class CrossArchAgreementTest(unittest.TestCase):
-    """Per-optimizer agreement across the eight supported arches.
+    """Per-optimizer agreement across the active arch set (sm_90, gfx942).
 
     Each test_<optimizer>_cross_arch:
       1. Builds a small parameter tensor and gradient.

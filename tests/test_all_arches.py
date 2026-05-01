@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Test all supported arches on one GPU using FORCE_ARCH.
 
-Drives test_matrix.py once per supported arch in {sm_80, sm_90, sm_100, gfx942}.
+Drives test_matrix.py once per supported arch in {sm_90, gfx942}.
+tpu_v5p is tested separately via the JAX bridge (test_tpu_jax_bridge.py).
 Skips arches whose binding is not built into the local extension.
 
 Replaces the old test_all_tiers.py which tested a generic-tier fallback;

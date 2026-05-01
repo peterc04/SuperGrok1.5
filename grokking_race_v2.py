@@ -226,6 +226,7 @@ DEFAULT_CONFIG: Dict = {
     "compile_model": False, "use_amp": False, "model_type": "decoder",
     "patch_dim": 49, "num_patches": 16,
     "chain_length": 3, "seq_len": 8,
+    "use_fused": True,
 }
 
 # ── Data 1: Modular Division (a ÷ b) mod p  [Decoder] ────────────────
@@ -588,6 +589,8 @@ from grokking_optimizers import (
     CUDAGraphOptimizer,
 )
 from grokking_optimizers.gradient_hook_optimizer import GradientHookOptimizer
+from grokking_optimizers.fused_dispatch import has_fused, dispatch_fused
+from grokking_optimizers.dispatch import detect_arch
 
 def _maybe_wrap_cuda_graph(opt, c):
     """Wrap optimizer in CUDAGraphOptimizer if enabled in config."""
@@ -605,6 +608,21 @@ def _maybe_wrap_grad_hooks(opt, model, c):
         return GradientHookOptimizer(model, opt)
     return opt
 
+def _try_fused_step(model_name, opt_name, model, optimizer, x_batch, y_batch, c):
+    """Attempt fused (model, optimizer, arch) kernel; return True if used, False to fallback."""
+    if not c.get("use_fused", True):
+        return False
+    if not has_fused(model_name, opt_name):
+        return False
+    try:
+        params = {n: p for n, p in model.named_parameters()}
+        # Fused kernel handles forward + backward + optimizer step in one launch
+        dispatch_fused(model_name, opt_name, params, x_batch, None, optimizer.state,
+                       optimizer.defaults.get('lr', 1e-3))
+        return True
+    except (KeyError, NotImplementedError):
+        return False
+
 # ── 1. AdamW ──────────────────────────────────────────────────────────
 def train_adamw(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("AdamW",c); m=_load(c,dev,init)
@@ -614,6 +632,11 @@ def train_adamw(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("AdamW",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "grokadamw", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
@@ -644,6 +667,11 @@ def train_neuralgrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("NeuralGrok",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "neuralgrok", m, opt, ix, iy, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             loss=F.cross_entropy(m(ix),iy)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt)
