@@ -30,9 +30,9 @@ template <typename ActT, int kHeadDim, bool kCausal>
 struct AttentionLaunchConfig {
     int block;
     int lds_bytes;
+    int waves_per_eu;       // occupancy hint for CDNA3 scheduler
     bool use_ck_fmha;
     bool use_aiter;
-    int waves_per_eu;  // occupancy hint for CDNA3 scheduler
 };
 
 // -- Wave-64 XOR butterfly reductions ----------------------------------------
