@@ -1,0 +1,144 @@
+// csrc/kernels/hip/gfx942/models/attention.hip.h
+// Shared attention kernel for gfx942 (CDNA3 / MI300X). Mirrors sm_90
+// attention.cuh with HIP types, wave-64, CK/AITER backends.
+// LDS-based path for tiny seq_len. BF16 activations, FP32 accumulation.
+#pragma once
+#include "csrc/common/platform.h"
+#include "csrc/common/types.h"
+#include "csrc/common/utils.cuh"
+#include "csrc/common/tuned_configs.h"
+#ifdef WITH_CK
+#include <ck_tile/ops/fmha.hpp>
+#endif
+
+namespace sg { namespace gfx942 { namespace models { namespace attention {
+
+constexpr int kMaxLdsBytes = 65536;  // 64 KB LDS per CU on gfx942
+
+template <typename ActT, int kHeadDim, bool kCausal>
+struct AttentionLaunchConfig {
+    int block;
+    int lds_bytes;
+    bool use_ck_fmha;
+    bool use_aiter;
+    int waves_per_eu;  // occupancy hint for CDNA3 scheduler
+};
+
+// -- External backend forward declarations ------------------------------------
+#ifdef WITH_CK
+template <typename ActT, int kHeadDim, bool kCausal>
+hipError_t ck_fmha_forward(
+    const ActT* q, const ActT* k, const ActT* v, ActT* out, ActT* softmax_lse,
+    int batch, int n_heads, int seq_len, float scale, hipStream_t stream);
+#endif
+#ifdef WITH_AITER
+template <typename ActT, int kHeadDim, bool kCausal>
+hipError_t aiter_fmha_forward(
+    const ActT* q, const ActT* k, const ActT* v, ActT* out, ActT* softmax_lse,
+    int batch, int n_heads, int seq_len, float scale, hipStream_t stream);
+#endif
+
+// -- LDS-based attention kernel (default for tiny seq_len) ---------------------
+// One block per (batch, head). Wave-64 cooperative matmul. Max seq_len: 32.
+template <typename ActT, int kHeadDim, bool kCausal>
+__global__ void
+GROK_FLAT_WORK_GROUP_SIZE(64, 256)
+GROK_WAVES_PER_EU(1, 4)
+lds_attention_fwd_kernel(
+    const ActT* __restrict__ q,      // [B, H, N, D]
+    const ActT* __restrict__ k,
+    const ActT* __restrict__ v,
+    ActT* __restrict__ out,
+    float* __restrict__ softmax_lse,  // [B, H, N] or nullptr
+    int seq_len, float scale
+) {
+    const int bh = blockIdx.x, tid = threadIdx.x;
+    const int N = seq_len, D = kHeadDim, base = bh * N * D;
+    extern __shared__ float lds[];
+    float* scores  = lds;
+    float* row_max = scores + N * N;
+    float* row_sum = row_max + N;
+    // S = Q K^T * scale, optional causal mask
+    for (int idx = tid; idx < N * N; idx += blockDim.x) {
+        int i = idx / N, j = idx % N;
+        if constexpr (kCausal) {
+            if (j > i) { scores[idx] = -1e9f; continue; }
+        }
+        float dot = 0.0f;
+        for (int d = 0; d < D; d++)
+            dot += static_cast<float>(q[base + i * D + d])
+                 * static_cast<float>(k[base + j * D + d]);
+        scores[idx] = dot * scale;
+    }
+    __syncthreads();
+    // Row-wise stable softmax
+    for (int i = tid; i < N; i += blockDim.x) {
+        float m = -1e9f;
+        for (int j = 0; j < N; j++) m = fmaxf(m, scores[i * N + j]);
+        row_max[i] = m;
+        float s = 0.0f;
+        for (int j = 0; j < N; j++) {
+            float e = expf(scores[i * N + j] - m);
+            scores[i * N + j] = e;
+            s += e;
+        }
+        float inv_s = 1.0f / fmaxf(s, 1e-12f);
+        for (int j = 0; j < N; j++) scores[i * N + j] *= inv_s;
+        row_sum[i] = s;
+        if (softmax_lse != nullptr)
+            softmax_lse[bh * N + i] = m + logf(fmaxf(s, 1e-12f));
+    }
+    __syncthreads();
+    // Out = Softmax(S) * V
+    for (int idx = tid; idx < N * D; idx += blockDim.x) {
+        int i = idx / D, d = idx % D;
+        float acc = 0.0f;
+        for (int j = 0; j < N; j++)
+            acc += scores[i * N + j] * static_cast<float>(v[base + j * D + d]);
+        out[base + idx] = static_cast<ActT>(acc);
+    }
+}
+
+// -- Forward dispatch ----------------------------------------------------------
+template <typename ActT, int kHeadDim, bool kCausal>
+hipError_t attention_forward(
+    const ActT* q, const ActT* k, const ActT* v,
+    ActT* out, ActT* softmax_lse_act,
+    int batch, int n_heads, int seq_len, float scale,
+    hipStream_t stream
+) {
+    float* softmax_lse = reinterpret_cast<float*>(softmax_lse_act);
+#ifdef WITH_CK
+    return ck_fmha_forward<ActT, kHeadDim, kCausal>(
+        q, k, v, out, reinterpret_cast<ActT*>(softmax_lse),
+        batch, n_heads, seq_len, scale, stream);
+#elif defined(WITH_AITER)
+    return aiter_fmha_forward<ActT, kHeadDim, kCausal>(
+        q, k, v, out, reinterpret_cast<ActT*>(softmax_lse),
+        batch, n_heads, seq_len, scale, stream);
+#else
+    int grid = batch * n_heads;
+    int block = WARP_SIZE * 2;  // 128 threads = 2 waves on CDNA3
+    int N = seq_len;
+    int lds_bytes = (N * N + 2 * N) * sizeof(float);
+    lds_attention_fwd_kernel<ActT, kHeadDim, kCausal>
+        <<<grid, block, lds_bytes, stream>>>(
+            q, k, v, out, softmax_lse, seq_len, scale);
+    return hipGetLastError();
+#endif
+}
+
+// -- Backward (stub -- full impl in a separate TU) ----------------------------
+template <typename ActT, int kHeadDim, bool kCausal>
+hipError_t attention_backward(
+    const ActT* grad_out,
+    const ActT* q, const ActT* k, const ActT* v,
+    const ActT* out, const ActT* softmax_lse_act,
+    ActT* grad_q, ActT* grad_k, ActT* grad_v,
+    int batch, int n_heads, int seq_len, float scale,
+    hipStream_t stream
+) {
+    return hipErrorNotReady;  // TODO: LDS-based backward for gfx942
+}
+
+}}}}  // namespace sg::gfx942::models::attention
