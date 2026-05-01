@@ -1,9 +1,9 @@
-"""Runtime hardware detection for the all-specialized kernel architecture.
+"""Runtime hardware detection for the 3-arch fused kernel architecture.
 
-Supported arches (8 GPU + 2 TPU):
-    NVIDIA: sm_80, sm_89, sm_90, sm_100, sm_103, sm_120
-    AMD:    gfx942, gfx950
-    TPU:    v5p, v6e (handled by csrc/kernels/tpu/, not this module)
+Supported arches (3-arch active set):
+    NVIDIA: sm_90 (Hopper — H100, H200)
+    AMD:    gfx942 (CDNA3 — MI300X, MI300A)
+    TPU:    v5p (handled via JAX backend)
 
 Anything else raises ``UnsupportedArchError``. There is no tier fallback chain
 and no generic-kernel path. ``FORCE_ARCH`` env var continues to work for
@@ -16,15 +16,16 @@ from __future__ import annotations
 
 import functools
 import os
+from typing import Union
 
 import torch
 
 
-SUPPORTED_ARCHES = (80, 89, 90, 100, 103, 120, 942, 950)
+SUPPORTED_ARCHES = (90, 942, "tpu_v5p")
 
 
 class UnsupportedArchError(RuntimeError):
-    """Raised when the detected arch is not one of {sm_80, sm_90, sm_100, gfx942}."""
+    """Raised when the detected arch is not one of {sm_90, gfx942, tpu_v5p}."""
 
 
 # ----------------------------------------------------------------------
@@ -65,12 +66,11 @@ def get_warp_size() -> int:
 
 @functools.lru_cache(maxsize=1)
 def get_gpu_arch() -> int:
-    """Detected GPU arch as one of {80, 89, 90, 100, 103, 120, 942, 950}.
+    """Detected GPU arch as one of {90, 942}.
 
-    For NVIDIA: sm_80/sm_86 → 80 (Ampere family routes to sm_80 binding);
-    sm_89 → 89; sm_90 → 90; sm_100 → 100; sm_103 → 103; sm_120+ → 120.
+    For NVIDIA: only sm_90 (Hopper) is supported. Everything else raises.
 
-    For AMD: gfx942 → 942; gfx950 → 950. Anything else raises.
+    For AMD: only gfx942 is supported. Everything else raises.
 
     Honors FORCE_ARCH env var.
 
@@ -78,42 +78,37 @@ def get_gpu_arch() -> int:
     """
     force = os.environ.get('FORCE_ARCH')
     if force:
+        # Allow "tpu_v5p" to pass through for detect_arch(), but not here
+        if force == "tpu_v5p":
+            raise UnsupportedArchError(
+                "FORCE_ARCH=tpu_v5p is not a GPU arch; use detect_arch() instead")
         try:
             arch = int(force)
         except ValueError:
-            raise UnsupportedArchError(f"FORCE_ARCH={force!r} is not an integer")
-        if arch not in SUPPORTED_ARCHES:
             raise UnsupportedArchError(
-                f"FORCE_ARCH={arch} not in supported set {SUPPORTED_ARCHES}")
+                f"FORCE_ARCH={force!r} is not a valid arch identifier")
+        if arch not in (90, 942):
+            raise UnsupportedArchError(
+                f"FORCE_ARCH={arch} not in supported GPU set {{90, 942}}. "
+                f"3-arch active set is: sm_90, gfx942, tpu_v5p.")
         return arch
 
     if not torch.cuda.is_available():
         raise UnsupportedArchError(
-            "No CUDA/HIP device available. SuperGrok kernels are GPU-only "
-            "(CPU build is for testing). Set FORCE_ARCH=<80|89|90|100|103|"
-            "120|942|950> for cross-arch testing.")
+            "No CUDA/HIP device available. SuperGrok kernels require sm_90 "
+            "(Hopper) or gfx942 (MI300X/MI300A). Set FORCE_ARCH=<90|942> "
+            "for cross-arch testing.")
 
     vendor = get_gpu_vendor()
     if vendor == 'nvidia':
         major, minor = torch.cuda.get_device_capability()
         sm = major * 10 + minor
-        if sm in (80, 86):
-            return 80     # A100/A30/A10/RTX 30 (Ampere family) → sm_80 binding
-        if sm == 89:
-            return 89     # Ada (RTX 40, L40, L40S)
         if sm == 90:
             return 90     # Hopper (H100, H200)
-        if sm == 100:
-            return 100    # Datacenter Blackwell (B100/B200/GB200)
-        if sm == 103:
-            return 103    # Blackwell Ultra (B300, GB300 NVL72)
-        if sm == 120 or sm > 120:
-            return 120    # Consumer Blackwell (RTX 50, RTX PRO 6000)
         raise UnsupportedArchError(
-            f"Detected sm_{sm}; supported NVIDIA arches are sm_80, sm_89, "
-            "sm_90, sm_100, sm_103, sm_120. Pre-Ampere (sm_70/75) is "
-            "permanently unsupported. Use FORCE_CUDA=1 to force-build a "
-            "binding.")
+            f"Detected sm_{sm}; only sm_90 (Hopper) is supported in the "
+            "3-arch active set. Other NVIDIA arches (sm_80, sm_89, sm_100, "
+            "sm_103, sm_120) have been removed from the active set.")
 
     if vendor == 'amd':
         prop = torch.cuda.get_device_properties(0)
@@ -121,14 +116,51 @@ def get_gpu_arch() -> int:
         arch_name = (prop.gcnArchName or '').split(':')[0]
         if arch_name == 'gfx942':
             return 942
-        if arch_name == 'gfx950':
-            return 950
         raise UnsupportedArchError(
-            f"Detected {arch_name!r}; supported AMD arches are gfx942 "
-            "(MI300X/MI300A) and gfx950 (MI350X/MI355X). gfx908/gfx90a "
-            "(MI100/MI200) and RDNA cards are unsupported.")
+            f"Detected {arch_name!r}; only gfx942 (MI300X/MI300A) is "
+            "supported in the 3-arch active set. gfx950 (MI350X/MI355X) "
+            "and other AMD arches have been removed from the active set.")
 
     raise UnsupportedArchError(f"Unknown GPU vendor {vendor!r}")
+
+
+@functools.lru_cache(maxsize=1)
+def detect_arch() -> Union[int, str]:
+    """Detect active arch: returns 90, 942, or "tpu_v5p".
+
+    Detection order:
+      1. FORCE_ARCH env var (accepts 90, 942, or "tpu_v5p")
+      2. TPU detection via JAX
+      3. GPU detection via get_gpu_arch()
+
+    Raises ``UnsupportedArchError`` if no supported arch is found.
+    """
+    force = os.environ.get('FORCE_ARCH')
+    if force:
+        if force == "tpu_v5p":
+            return "tpu_v5p"
+        try:
+            arch = int(force)
+        except ValueError:
+            raise UnsupportedArchError(
+                f"FORCE_ARCH={force!r} not in supported set {{90, 942, tpu_v5p}}")
+        if arch not in (90, 942):
+            raise UnsupportedArchError(
+                f"FORCE_ARCH={arch} not in supported set {{90, 942, tpu_v5p}}")
+        return arch
+
+    # Try TPU detection first (check if JAX is available and running on TPU)
+    try:
+        import jax  # noqa: F401
+        import jax.devices
+        devices = jax.devices()
+        if devices and any(d.platform == 'tpu' for d in devices):
+            return "tpu_v5p"
+    except (ImportError, RuntimeError):
+        pass
+
+    # Fall back to GPU detection
+    return get_gpu_arch()
 
 
 # ----------------------------------------------------------------------
@@ -146,57 +178,27 @@ def supports_tf32() -> bool:
 
 
 def supports_fp8() -> bool:
-    """FP8 E4M3 tensor cores (Hopper sm_90+ or Blackwell sm_100+)."""
+    """FP8 E4M3 tensor cores (Hopper sm_90+)."""
     return get_gpu_vendor() == 'nvidia' and get_gpu_arch() >= 90
 
 
 def supports_async_copy() -> bool:
-    """cp.async (Ampere+, NVIDIA only)."""
+    """cp.async (NVIDIA only)."""
     return get_gpu_vendor() == 'nvidia'
 
 
 def supports_tma() -> bool:
-    """TMA bulk copy (Hopper sm_90+)."""
+    """TMA bulk copy (Hopper sm_90)."""
     return get_gpu_vendor() == 'nvidia' and get_gpu_arch() >= 90
 
 
 def supports_block_clusters() -> bool:
-    """Thread block clusters (Hopper sm_90+)."""
+    """Thread block clusters (Hopper sm_90)."""
     return get_gpu_vendor() == 'nvidia' and get_gpu_arch() >= 90
 
 
-def supports_nvfp4() -> bool:
-    """Native NVFP4 (Blackwell sm_100+)."""
-    return get_gpu_vendor() == 'nvidia' and get_gpu_arch() >= 100
-
-
-def supports_nvfp4_accelerated() -> bool:
-    """Blackwell Ultra (sm_103+) has 1.5x NVFP4 throughput vs sm_100."""
-    return get_gpu_vendor() == 'nvidia' and get_gpu_arch() == 103
-
-
-def supports_consumer_blackwell() -> bool:
-    """Consumer Blackwell (sm_120): 128KB shared memory, no DSMT."""
-    return get_gpu_vendor() == 'nvidia' and get_gpu_arch() == 120
-
-
-def supports_fp4_mfma() -> bool:
-    """Native FP4 expert MFMA (AMD CDNA4 / gfx950)."""
-    return get_gpu_vendor() == 'amd' and get_gpu_arch() == 950
-
-
-def supports_fp6_state() -> bool:
-    """Native FP6 E3M2 optimizer state (AMD CDNA4 / gfx950)."""
-    return get_gpu_vendor() == 'amd' and get_gpu_arch() == 950
-
-
-def supports_24_sparsity() -> bool:
-    """Hardware 2:4 structured sparsity (AMD CDNA4 / gfx950)."""
-    return get_gpu_vendor() == 'amd' and get_gpu_arch() == 950
-
-
 def supports_matrix_cores() -> bool:
-    """Matrix cores: AMD MFMA on gfx942/gfx950, or NVIDIA Tensor Cores on sm_80+."""
+    """Matrix cores: AMD MFMA on gfx942, or NVIDIA Tensor Cores on sm_90."""
     return True
 
 
@@ -207,18 +209,13 @@ def supports_matrix_cores() -> bool:
 def get_arch_label() -> str:
     """Human-readable label for the detected arch."""
     try:
-        arch = get_gpu_arch()
+        arch = detect_arch()
     except UnsupportedArchError as exc:
         return f"unsupported ({exc})"
     return {
-        80:  "Ampere family (sm_80 binding) — A100/A30/A10/RTX 30",
-        89:  "Ada (sm_89) — RTX 40, L40, L40S",
-        90:  "Hopper (sm_90) — H100, H200",
-        100: "Datacenter Blackwell (sm_100) — B100/B200/GB200",
-        103: "Blackwell Ultra (sm_103) — B300, GB300 NVL72",
-        120: "Consumer Blackwell (sm_120) — RTX 50, RTX PRO 6000 Blackwell",
-        942: "CDNA3 (gfx942) — MI300X / MI300A",
-        950: "CDNA4 (gfx950) — MI350X / MI355X",
+        90:       "Hopper (sm_90) — H100, H200",
+        942:      "CDNA3 (gfx942) — MI300X / MI300A",
+        "tpu_v5p": "TPU v5p",
     }[arch]
 
 
@@ -227,6 +224,6 @@ def get_arch_label() -> str:
 # have a binding for, and surface a clear error if not.
 # ----------------------------------------------------------------------
 
-def assert_supported_arch() -> int:
+def assert_supported_arch() -> Union[int, str]:
     """Returns the detected arch or raises UnsupportedArchError."""
-    return get_gpu_arch()
+    return detect_arch()
