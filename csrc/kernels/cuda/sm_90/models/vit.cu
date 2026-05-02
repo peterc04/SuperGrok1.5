@@ -47,3 +47,41 @@ INSTANTIATE_VIT(__half, __half);
 #undef INSTANTIATE_VIT
 
 }}}} // namespace sg::sm90::models::vit
+
+// ---------------------------------------------------------------------
+// Re-emit the non-causal attention<float/bf16/fp16, 32> instantiations
+// so the binding TU (csrc/bindings/models_vit.cpp), which can only see
+// forward declarations, resolves at link time. These mirror what
+// vit::forward/backward already implicitly instantiate, but are made
+// explicit here to harden against link order.
+// ---------------------------------------------------------------------
+namespace sg { namespace sm90 { namespace models { namespace attention {
+
+template cudaError_t attention_forward<float, 32, false>(
+    const float*, const float*, const float*, float*, float*,
+    int, int, int, float, cudaStream_t);
+template cudaError_t attention_forward<__nv_bfloat16, 32, false>(
+    const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
+    __nv_bfloat16*, __nv_bfloat16*,
+    int, int, int, float, cudaStream_t);
+template cudaError_t attention_forward<__half, 32, false>(
+    const __half*, const __half*, const __half*, __half*, __half*,
+    int, int, int, float, cudaStream_t);
+
+template cudaError_t attention_backward<float, 32, false>(
+    const float*, const float*, const float*, const float*,
+    const float*, const float*,
+    float*, float*, float*,
+    int, int, int, float, cudaStream_t);
+template cudaError_t attention_backward<__nv_bfloat16, 32, false>(
+    const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
+    const __nv_bfloat16*, const __nv_bfloat16*,
+    __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*,
+    int, int, int, float, cudaStream_t);
+template cudaError_t attention_backward<__half, 32, false>(
+    const __half*, const __half*, const __half*, const __half*,
+    const __half*, const __half*,
+    __half*, __half*, __half*,
+    int, int, int, float, cudaStream_t);
+
+}}}}

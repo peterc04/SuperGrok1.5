@@ -1235,12 +1235,9 @@ cudaError_t backward(
             batch, n_heads, seq_len, scale, stream);
         if (err != cudaSuccess) return err;
 
-        // Merge dQ/dK/dV [B,H,S,Dh] -> dqkv [B,S,3*HD]
-        ActT* d_qkv_buf = d_attn_bhsd;  // bhsd*3 = bsh ; we need bsh slots
-        // d_attn_bhsd has bhsd slots, not enough for bsh = 3*bhsd. Use a
-        // dedicated aliased region of scratch instead. We have d_q,d_k,d_v
-        // contiguous (3*bhsd = bsh slots). Reuse them as the output region.
-        d_qkv_buf = d_q;  // contiguous 3*bhsd
+        // Merge dQ/dK/dV [B,H,S,Dh] -> dqkv [B,S,3*HD]. We need bsh = 3*bhsd
+        // contiguous slots; use d_q region (d_q,d_k,d_v are contiguous).
+        ActT* d_qkv_buf = d_q;
         {
             dim3 grid(seq_len, batch);
             int block = 128;
@@ -1253,9 +1250,8 @@ cudaError_t backward(
         //   d_pre_attn_in (attn path) = d_qkv @ qkv_W
         //   d_qkv_W = d_qkv^T @ pre_attn_in
         //   d_qkv_b = sum d_qkv
-        ActT* d_pre_in_attn = d_attn_bhsd;  // reuse [B,S,D]; but bhsd<bsd in general.
-        // Need bsd; use d_attn_o region (bsd slots, currently unused after this point).
-        d_pre_in_attn = d_attn_o;
+        // Use d_attn_o region (bsd slots) for the [B,S,D] grad output.
+        ActT* d_pre_in_attn = d_attn_o;
         err = launch_gemm_grad_input<ActT, WeightT>(
             d_qkv_buf, w.qkv_W(L), d_pre_in_attn, M, 3 * HD, d_model, stream);
         if (err != cudaSuccess) return err;

@@ -82,21 +82,8 @@ namespace sg {
 
 namespace {
 
-// Dispatch helper: route on tensor scalar type, then on detected arch.
-// Templated on the kernel type tag to keep the body small.
-struct ViTKernelTag { enum { Forward, Backward }; };
-
 inline cudaStream_t default_stream() {
     return at::cuda::getCurrentCUDAStream().stream();
-}
-
-// Helper to enforce we're on a CUDA arch we have a launcher for.
-inline void require_cuda_or_hip() {
-    int a = ::sg::detect_arch();
-    if (a != 90 && a != 942) {
-        throw std::runtime_error(
-            "vit: dispatch unsupported arch " + std::to_string(a));
-    }
 }
 
 template <typename ActT>
@@ -118,7 +105,6 @@ cudaError_t do_forward(
             patch_size, d_model, n_heads, d_head,
             n_layers, n_classes, ffn_expansion, stream);
     }
-#ifdef WITH_HIP_GFX942
     if (a == 942) {
         return sg::gfx942::models::vit::forward<ActT, ActT>(
             static_cast<const ActT*>(input),
@@ -129,7 +115,6 @@ cudaError_t do_forward(
             patch_size, d_model, n_heads, d_head,
             n_layers, n_classes, ffn_expansion, stream);
     }
-#endif
     throw std::runtime_error("vit_forward: unsupported arch " + std::to_string(a));
 }
 
@@ -154,7 +139,6 @@ cudaError_t do_backward(
             patch_size, d_model, n_heads, d_head,
             n_layers, n_classes, ffn_expansion, stream);
     }
-#ifdef WITH_HIP_GFX942
     if (a == 942) {
         return sg::gfx942::models::vit::backward<ActT, ActT>(
             static_cast<const ActT*>(grad_output),
@@ -166,7 +150,6 @@ cudaError_t do_backward(
             patch_size, d_model, n_heads, d_head,
             n_layers, n_classes, ffn_expansion, stream);
     }
-#endif
     throw std::runtime_error("vit_backward: unsupported arch " + std::to_string(a));
 }
 
@@ -274,7 +257,7 @@ void vit_attention_forward(
         float, /*kHeadDim=*/32, /*kCausal=*/false>(
         q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
         out.data_ptr<float>(),
-        reinterpret_cast<float*>(softmax_lse.data_ptr<float>()),
+        softmax_lse.data_ptr<float>(),
         batch, n_heads, seq_len, scale, stream);
     check_cuda(err, "vit_attention_forward");
 }
@@ -295,7 +278,7 @@ void vit_attention_backward(
         grad_out.data_ptr<float>(),
         q.data_ptr<float>(), k.data_ptr<float>(), v.data_ptr<float>(),
         out.data_ptr<float>(),
-        reinterpret_cast<float*>(softmax_lse.data_ptr<float>()),
+        softmax_lse.data_ptr<float>(),
         grad_q.data_ptr<float>(), grad_k.data_ptr<float>(), grad_v.data_ptr<float>(),
         batch, n_heads, seq_len, scale, stream);
     check_cuda(err, "vit_attention_backward");

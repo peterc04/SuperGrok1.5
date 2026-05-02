@@ -171,6 +171,7 @@ elif _has_gpu:
 
     sources = COMMON_BINDINGS + _collect([
         "csrc/kernels/cuda/sm_90/*.cu",
+        "csrc/kernels/cuda/sm_90/models/*.cu",
         "csrc/quantization/*.cu",
     ])
 
