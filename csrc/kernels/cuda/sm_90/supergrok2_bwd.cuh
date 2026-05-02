@@ -1233,19 +1233,7 @@ namespace sg { namespace sm90 { namespace supergrok2 {
 // run on any arch.
 
 __device__ __forceinline__ float cluster_dsmem_reduce(float val) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    namespace cg = cooperative_groups;
-    auto cluster = cg::this_cluster();
-    // Block-local warp reduction first.
-    val = warp_reduce_sum(val, WARP_SIZE, threadIdx.x & (WARP_SIZE - 1));
-    // Cluster-wide reduce via DSMEM. The cluster must have been launched
-    // with a non-trivial cluster shape; if not, this falls through to
-    // the warp-reduced value.
-    val = cg::reduce(cluster, val, cg::plus<float>());
-    return val;
-#else
-    return warp_reduce_sum(val, WARP_SIZE, threadIdx.x & (WARP_SIZE - 1));
-#endif
+    return cluster_dsmem_reduce_sum(val);
 }
 
 // ---- Sequential reverse-scan + backward (N < PSCAN_THRESHOLD) ----

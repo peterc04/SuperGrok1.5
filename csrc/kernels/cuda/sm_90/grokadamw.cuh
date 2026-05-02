@@ -732,6 +732,16 @@ void launch_multi_tensor_grokadamw(
     float alpha, float lamb, float beta1, float beta2,
     float lr, float wd, float eps);
 
+void launch_multi_tensor_grokadamw(
+    std::vector<torch::Tensor> params,
+    std::vector<torch::Tensor> exp_avgs,
+    std::vector<torch::Tensor> exp_avg_sqs,
+    std::vector<torch::Tensor> emas,
+    std::vector<torch::Tensor> grads,
+    float alpha, float lamb, float beta1, float beta2,
+    float lr, float weight_decay,
+    float eps, float bc1, float bc2);
+
 }} // namespace sg::sm90
 
 // =====================================================================
@@ -990,6 +1000,25 @@ void launch_multi_tensor_grokadamw(
             bc1s[i], bc2s[i], _gaw_detail::NO_CLAMP,
             step_count, stream);
     }
+}
+
+// Scalar bc1/bc2 overload — broadcasts to per-param vectors.
+void launch_multi_tensor_grokadamw(
+    std::vector<torch::Tensor> params,
+    std::vector<torch::Tensor> exp_avgs,
+    std::vector<torch::Tensor> exp_avg_sqs,
+    std::vector<torch::Tensor> emas,
+    std::vector<torch::Tensor> grads,
+    float alpha, float lamb, float beta1, float beta2,
+    float lr, float weight_decay,
+    float eps, float bc1, float bc2
+) {
+    const size_t n = params.size();
+    std::vector<float> bc1s(n, bc1), bc2s(n, bc2);
+    launch_multi_tensor_grokadamw(
+        params, exp_avgs, exp_avg_sqs, emas, grads,
+        bc1s, bc2s, alpha, lamb, beta1, beta2,
+        lr, weight_decay, eps);
 }
 
 }} // namespace sg::sm90

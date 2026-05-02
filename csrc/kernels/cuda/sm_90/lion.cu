@@ -42,17 +42,13 @@ namespace sg { namespace sm90 { namespace lion {
         const LionTensorTable<P, S, G>&, int64_t,                              \
         float, float, float, float, cudaStream_t);
 
-// ParamT = float (FP32)
+// ParamT = float (FP32) — FP8 grad + FP32 param rejected by is_coherent_combo
 INSTANTIATE_LION(float,         float,         float)
 INSTANTIATE_LION(float,         float,         __nv_bfloat16)
 INSTANTIATE_LION(float,         float,         __half)
-INSTANTIATE_LION(float,         float,         __nv_fp8_e4m3)
-INSTANTIATE_LION(float,         float,         __nv_fp8_e5m2)
 INSTANTIATE_LION(float,         __nv_bfloat16, float)
 INSTANTIATE_LION(float,         __nv_bfloat16, __nv_bfloat16)
 INSTANTIATE_LION(float,         __nv_bfloat16, __half)
-INSTANTIATE_LION(float,         __nv_bfloat16, __nv_fp8_e4m3)
-INSTANTIATE_LION(float,         __nv_bfloat16, __nv_fp8_e5m2)
 
 // ParamT = __nv_bfloat16 (BF16)
 INSTANTIATE_LION(__nv_bfloat16, float,         float)

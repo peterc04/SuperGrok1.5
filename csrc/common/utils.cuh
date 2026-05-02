@@ -9,6 +9,11 @@
 #include "platform.h"
 #include "types.h"
 
+#if GROK_CUDA
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+#endif
+
 // ═══════════════════════════════════════════════════════════════════════
 //  Warp-level reduction helper
 //
@@ -188,6 +193,21 @@ __device__ __forceinline__ int8_t ptx_int8_stochastic_round(
     float threshold = (float)lo16 / 65536.0f;
     if (frac > threshold) tr += (scaled > 0) ? 1.0f : -1.0f;
     return (int8_t)fmaxf(-127.0f, fminf(127.0f, tr));
+}
+
+// §25.7 DSMEM cluster reduce (sm_90+ Hopper distributed shared memory).
+// Block-local warp reduce first, then cluster-wide reduce via cooperative
+// groups. Falls back to warp reduce on pre-Hopper.
+__device__ __forceinline__ float cluster_dsmem_reduce_sum(float val) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    namespace cg = cooperative_groups;
+    val = warp_reduce_sum(val, WARP_SIZE, threadIdx.x & (WARP_SIZE - 1));
+    auto cluster = cg::this_cluster();
+    val = cg::reduce(cluster, val, cg::plus<float>());
+    return val;
+#else
+    return warp_reduce_sum(val, WARP_SIZE, threadIdx.x & (WARP_SIZE - 1));
+#endif
 }
 
 #endif // GROK_CUDA

@@ -93,7 +93,10 @@ struct is_coherent_combo
     : std::integral_constant<bool,
         is_param_dtype<ParamT>::value &&
         is_state_dtype<StateT>::value &&
-        is_grad_dtype<GradT>::value> {};
+        is_grad_dtype<GradT>::value &&
+        !((std::is_same<GradT, __nv_fp8_e4m3>::value ||
+           std::is_same<GradT, __nv_fp8_e5m2>::value) &&
+          std::is_same<ParamT, float>::value)> {};
 
 // ---------------------------------------------------------------------
 // Type-erased load helpers -- all math is FP32. Reads are routed through

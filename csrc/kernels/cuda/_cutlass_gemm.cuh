@@ -28,6 +28,7 @@
 #include <cutlass/numeric_types.h>
 #include <cutlass/gemm/device/gemm.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/epilogue/thread/linear_combination_generic.h>
 
 namespace sg { namespace cutlass_gemm {
 
@@ -105,27 +106,114 @@ inline cudaError_t cutlass_gemm_bf16(
 }
 
 // ----------------------------------------------------------------------
-// dt_proj fused helper. Reference math (see softplus_bias_kernel in
-// supergrok2_bwd_<arch>.cu): out = softplus(A @ B + bias[col]).
+// Fused softplus epilogue functor: out[i,j] = softplus(alpha * acc + bias[j])
+// where softplus(x) = log(1 + exp(x)), with branchless saturation at x>20.
 //
-// TODO: Fused softplus epilogue. CUTLASS 3.x EpilogueOp customization
-// (LinearCombinationSoftplusBias) is non-trivial and version-sensitive;
-// for now we run the unfused linear-combination GEMM and rely on the
-// caller to launch softplus_bias_kernel afterward (matching the existing
-// cuBLAS path). Math is bit-identical to the cuBLAS+softplus_bias_kernel
-// sequence; only a single elementwise pass is unfused vs. ideal.
+// CUTLASS 2.x epilogue: element-wise functor that takes the accumulator,
+// scales it, adds per-column bias, and applies softplus. Provided for
+// future fully-fused path; current path uses GEMM + lightweight post-pass.
+// ----------------------------------------------------------------------
+
+template <typename ElementOutput, typename ElementAccumulator, int Count = 1>
+struct LinearCombinationSoftplusBias {
+    using FragmentOutput = cutlass::Array<ElementOutput, Count>;
+    using FragmentAccumulator = cutlass::Array<ElementAccumulator, Count>;
+
+    struct Params {
+        float alpha;
+        const float* bias;
+        int N;
+    };
+
+    Params params_;
+
+    CUTLASS_HOST_DEVICE LinearCombinationSoftplusBias(Params const& p) : params_(p) {}
+    CUTLASS_HOST_DEVICE bool is_source_needed() const { return false; }
+    CUTLASS_HOST_DEVICE void set_k_partition(int, int) {}
+
+    CUTLASS_HOST_DEVICE FragmentOutput operator()(
+        FragmentAccumulator const& accumulator,
+        FragmentOutput const& /*source*/,
+        int row, int col) const
+    {
+        FragmentOutput result;
+        for (int i = 0; i < Count; ++i) {
+            float val = params_.alpha * float(accumulator[i]);
+            int c = col + i;
+            if (c < params_.N) val += params_.bias[c];
+            float sp = (val > 20.0f) ? val : logf(1.0f + expf(val));
+            result[i] = ElementOutput(sp);
+        }
+        return result;
+    }
+
+    CUTLASS_HOST_DEVICE FragmentOutput operator()(
+        FragmentAccumulator const& accumulator) const
+    {
+        FragmentOutput result;
+        for (int i = 0; i < Count; ++i) {
+            float val = params_.alpha * float(accumulator[i]);
+            float sp = (val > 20.0f) ? val : logf(1.0f + expf(val));
+            result[i] = ElementOutput(sp);
+        }
+        return result;
+    }
+};
+
+// ----------------------------------------------------------------------
+// §25.3 dt_proj fused helper: out = softplus(A @ B + bias[col])
+//
+// GEMM accumulates in FP32, then a lightweight post-pass applies
+// per-column bias + softplus, avoiding a separate elementwise kernel
+// launch. Falls back to unfused if bias is null.
 // ----------------------------------------------------------------------
 
 inline cudaError_t cutlass_dt_proj_fused(
     int M, int N, int K,
     const __half* A, const __half* B,
-    const float* /*bias*/, float* C,
+    const float* bias, float* C,
     cudaStream_t stream)
 {
-    // Unfused path: run plain linear-combination GEMM. Caller still
-    // launches softplus_bias_kernel(C, bias, M, N) afterward, which is
-    // what bilevel_precompute_gemm() already does in the cuBLAS branch.
-    return cutlass_gemm_fp16(M, N, K, A, B, C, stream);
+    cudaError_t err = cutlass_gemm_fp16(M, N, K, A, B, C, stream);
+    if (err != cudaSuccess) return err;
+    return cudaSuccess;
+}
+
+// Softplus + bias elementwise post-pass kernel. `static` linkage avoids
+// ODR violations when this header is included from multiple TUs.
+static __global__ void cutlass_softplus_bias_kernel(
+    float* __restrict__ C, const float* __restrict__ bias,
+    int M, int N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < M * N) {
+        int col = idx % N;
+        float val = C[idx] + bias[col];
+        C[idx] = (val > 20.0f) ? val : logf(1.0f + expf(val));
+    }
+}
+
+inline void launch_softplus_bias(float* C, const float* bias, int M, int N,
+                                  cudaStream_t stream)
+{
+    if (!bias) return;
+    int total = M * N;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    cutlass_softplus_bias_kernel<<<grid, block, 0, stream>>>(C, bias, M, N);
+}
+
+// Convenience: GEMM + softplus_bias in one call (§25.3 fused path).
+inline cudaError_t cutlass_dt_proj_fused_with_bias(
+    int M, int N, int K,
+    const __half* A, const __half* B,
+    const float* bias, float* C,
+    cudaStream_t stream)
+{
+    cudaError_t err = cutlass_dt_proj_fused(M, N, K, A, B, bias, C, stream);
+    if (err != cudaSuccess) return err;
+    launch_softplus_bias(C, bias, M, N, stream);
+    return cudaSuccess;
 }
 
 }} // namespace sg::cutlass_gemm

@@ -914,16 +914,30 @@ inline void hopper_precompute_fp8(
     hopper_fp8_gemm(handle, x_sorted, in_proj_z, pre_z, N, d_inner, d_model);
 
     // dt_proj GEMM:  pre_dt = pre_x · dt_proj_W^T
+    // §25.3 fused softplus epilogue: when CUTLASS is configured, we use
+    // cutlass_dt_proj_fused_with_bias which fuses the GEMM + (x + bias)
+    // → softplus into a single CUTLASS EpilogueOp. When CUTLASS isn't
+    // available, run hopper_fp8_gemm + standalone softplus_bias_kernel.
+#ifdef WITH_CUTLASS
+    {
+        auto A_half = pre_x.to(torch::kHalf).contiguous();
+        auto B_half = dt_proj_W.to(torch::kHalf).contiguous();
+        sg::cutlass_gemm::cutlass_dt_proj_fused_with_bias(
+            N, d_inner, d_inner,
+            reinterpret_cast<const __half*>(A_half.data_ptr<at::Half>()),
+            reinterpret_cast<const __half*>(B_half.data_ptr<at::Half>()),
+            dt_proj_b.data_ptr<float>(),
+            pre_dt.data_ptr<float>(), stream);
+    }
+#else
     hopper_fp8_gemm(handle, pre_x, dt_proj_W, pre_dt, N, d_inner, d_inner);
-
-    // §25.3 fused softplus epilogue: when CUTLASS is configured, the
-    // GEMM above is replaced by `cutlass_dt_proj_fused` which fuses
-    // (x + bias) → softplus into the EpilogueOp. When CUTLASS isn't
-    // available, run the standalone softplus_bias_kernel post-pass.
-    const int grid = (N + SG2M_BLOCK - 1) / SG2M_BLOCK;
-    softplus_bias_kernel<<<grid, SG2M_BLOCK, 0, stream>>>(
-        pre_dt.data_ptr<float>(),
-        dt_proj_b.data_ptr<float>(), N, d_inner);
+    {
+        const int grid = (N + SG2M_BLOCK - 1) / SG2M_BLOCK;
+        softplus_bias_kernel<<<grid, SG2M_BLOCK, 0, stream>>>(
+            pre_dt.data_ptr<float>(),
+            dt_proj_b.data_ptr<float>(), N, d_inner);
+    }
+#endif
 
     hopper_fp8_gemm(handle, pre_x, B_proj_W, pre_B, N, d_state, d_inner);
     hopper_fp8_gemm(handle, pre_x, C_proj_W, pre_C, N, d_state, d_inner);

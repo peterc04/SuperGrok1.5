@@ -49,6 +49,7 @@
 #include "csrc/common/tuned_configs.h"
 #include "csrc/device/optimizers/sm_90/looksam_sm90.cuh"
 
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #if __CUDA_ARCH__ >= 890 || !defined(__CUDA_ARCH__)
@@ -331,6 +332,18 @@ __global__ void norm_reduce_kernel(
         diff_sq += d * d;
         grad_sq += g * g;
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    diff_sq = cluster_dsmem_reduce_sum(diff_sq);
+    grad_sq = cluster_dsmem_reduce_sum(grad_sq);
+    if (threadIdx.x == 0) {
+        namespace cg = cooperative_groups;
+        auto cluster = cg::this_cluster();
+        if (cluster.block_rank() == 0) {
+            atomicAdd(&results[0], diff_sq);
+            atomicAdd(&results[1], grad_sq);
+        }
+    }
+#else
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
         diff_sq += SHFL_DOWN(diff_sq, offset);
@@ -340,6 +353,7 @@ __global__ void norm_reduce_kernel(
         atomicAdd(&results[0], diff_sq);
         atomicAdd(&results[1], grad_sq);
     }
+#endif
 }
 
 // =====================================================================

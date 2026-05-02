@@ -66,6 +66,9 @@
   #include <cuda_fp8.h>
 #endif
 
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+
 #include <cstdint>
 #include <type_traits>
 
@@ -250,10 +253,23 @@ void prodigy_dlr_reduce_kernel(
             wr += SHFL_DOWN(wr, offset);
             ws += SHFL_DOWN(ws, offset);
         }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        if (lane_id == 0) {
+            namespace cg = cooperative_groups;
+            auto cluster = cg::this_cluster();
+            wr = cg::reduce(cluster, wr, cg::plus<float>());
+            ws = cg::reduce(cluster, ws, cg::plus<float>());
+            if (cluster.block_rank() == 0) {
+                atomicAdd(r_partial_out, wr);
+                atomicAdd(s_partial_out, ws);
+            }
+        }
+#else
         if (lane_id == 0) {
             atomicAdd(r_partial_out, wr);
             atomicAdd(s_partial_out, ws);
         }
+#endif
     }
 }
 
