@@ -52,7 +52,9 @@
 //     softmax_lse      [B, H, S]      (FP32 bit-aliased)
 //   final_norm_out     [B, S, d]
 //   logits_full        [B, S, vocab]
-//   workspace          extra slack used by backward (re-derived activations)
+//
+// Total scratch (in T elements):
+//   B*S + B*S*D + n_layers * per_layer_total + B*S*D + B*S*V
 //
 // All multi-token GEMMs go through cuBLAS; LayerNorm + residual is fused
 // in a single warp-reduction kernel; GELU is a separate elementwise kernel.
