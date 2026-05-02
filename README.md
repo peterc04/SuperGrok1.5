@@ -43,6 +43,100 @@ Anything else raises `UnsupportedArchError`. There is no tier fallback chain.
 
 ---
 
+## Build status
+
+Per-arch coverage of the 11 optimizers and 3 models. A cell is **done** when
+the per-arch device template is wired through to a real implementation
+(no `NotImplementedError`, no `TODO` body). The table reflects the state
+after Phases 1–6 of the all-specialized rebuild.
+
+### Optimizer × arch matrix
+
+| Optimizer       | sm_90 (Hopper) | gfx942 (CDNA3) | tpu_v5p (JAX/Pallas) |
+|-----------------|:--------------:|:--------------:|:--------------------:|
+| SuperGrok2      | done           | done           | done                 |
+| SuperGrok15     | done           | done           | done                 |
+| SuperGrok11     | done           | done           | done                 |
+| GrokAdamW       | done           | done           | done                 |
+| NeuralGrok      | done           | done           | done                 |
+| Prodigy         | done           | done           | done                 |
+| Grokfast        | done           | done           | done                 |
+| Lion            | done           | done           | done                 |
+| LookSAM         | done           | done           | done                 |
+| Muon            | done           | done           | done                 |
+| MoE / Adam mt   | done           | done           | done                 |
+
+### Model × arch matrix
+
+The three race models — Decoder Transformer (causal LM), Vision Transformer
+(ViT), and Mamba (selective SSM) — each have a forward + backward
+specialization per arch. Phase 3 closed the sm_90 model row; Phase 5
+closed the tpu_v5p model row.
+
+| Model       | sm_90 (Hopper) | gfx942 (CDNA3) | tpu_v5p (JAX/Pallas) |
+|-------------|:--------------:|:--------------:|:--------------------:|
+| Decoder     | done (Phase 3) | done           | done (Phase 5)       |
+| ViT         | done (Phase 3) | done           | done (Phase 5)       |
+| Mamba       | done (Phase 3) | done           | done (Phase 5)       |
+
+**sm_90 model implementation details**
+- `csrc/kernels/cuda/sm_90/models/decoder.cuh`  (~1,180 LOC)
+- `csrc/kernels/cuda/sm_90/models/vit.cuh`      (~1,345 LOC)
+- `csrc/kernels/cuda/sm_90/models/mamba.cuh`    (~679 LOC)
+- shared `attention.cuh` (~269 LOC) used by Decoder + ViT
+- `mamba_scan_adapter.cuh` (~407 LOC) bridges Mamba to the Affine2x2 scan kernels
+
+**tpu_v5p model implementation details**
+- `csrc/kernels/tpu/_pallas_models.py` (~666 LOC) — shared Pallas/JAX
+  `decoder_*`, `vit_*`, `mamba_*` forward/backward
+- `csrc/kernels/tpu/_pallas_kernels.py` (~1,190 LOC) — tile-128
+  affine prefix scan, fused GRU+PEER, VMEM-persistent expert MLP
+- `csrc/kernels/tpu/v5p/__init__.py` re-exports the tile-128 variants and
+  exposes `get_kernels(kind='optimizers'|'models')` per-version surface
+- the `csrc/device/models/tpu_v5p/{transformer,vit,mamba}_tpu_v5p.py`
+  device-template files re-export from `_pallas_models.py` so the
+  per-arch dispatch path stays uniform across CUDA / HIP / TPU
+
+### Bindings (`_ops.models.*` Python API)
+
+`csrc/bindings/models_module.cpp` registers a `models` submodule on the
+compiled extension so model entry points appear as `_ops.models.<name>`.
+The shape mirrors the per-arch device templates and gives the race
+driver a single CUDA/HIP launch site per (model, arch).
+
+```python
+from grokking_optimizers import _get_ops
+_ops = _get_ops()
+
+# Decoder Transformer (causal LM head, last-token logits)
+_ops.models.decoder_forward(...)
+_ops.models.decoder_backward(...)
+_ops.models.decoder_attention_forward(...)   # component test surface
+_ops.models.decoder_attention_backward(...)
+
+# Vision Transformer (full attention, [CLS] classify head)
+_ops.models.vit_forward(...)
+_ops.models.vit_backward(...)
+_ops.models.vit_attention_forward(...)
+_ops.models.vit_attention_backward(...)
+_ops.models.vit_patch_project(...)            # component test surface
+
+# Mamba (selective SSM, last-token logits)
+_ops.models.mamba_forward(...)
+_ops.models.mamba_backward(...)
+_ops.models.mamba_layer_forward(...)              # component test surface
+_ops.models.mamba_selective_scan_forward(...)
+_ops.models.mamba_selective_scan_backward(...)
+```
+
+Each function dispatches at runtime to the arch reported by
+`grokking_optimizers.dispatch.get_arch_label()`. The `*_attention_*`,
+`*_patch_project`, `*_layer_forward`, and `*_selective_scan_*` entries
+are component-level test surfaces that the parity tests use to isolate
+sub-kernels without running the full forward.
+
+---
+
 ## Architecture
 
 99 fused (model, optimizer, arch) compile-time instantiations from 42 device
@@ -60,11 +154,15 @@ csrc/
 │       ├── sm_90/      (3 .cuh headers)
 │       ├── gfx942/     (3 .hip.cuh headers)
 │       └── tpu_v5p/    (3 .py headers)
+├── kernels/
+│   ├── cuda/sm_90/models/   (decoder.cuh, vit.cuh, mamba.cuh, attention.cuh — sm_90 real impls)
+│   ├── hip/gfx942/models/   (gfx942 model headers)
+│   └── tpu/                 (_pallas_kernels.py, _pallas_models.py + v5p/__init__.py)
 ├── fused/
 │   ├── sm_90/          (33 .cu TUs)
 │   ├── gfx942/         (33 .hip.cpp TUs)
 │   └── tpu_v5p/        (33 .py TUs)
-├── bindings/           (pybind11 dispatchers + fused_step entry)
+├── bindings/           (pybind11 dispatchers + fused_step + models submodule)
 └── common/             (types.h, platform.h, ptx_intrinsics.cuh, tuned_configs.h)
 ```
 
@@ -415,13 +513,32 @@ Functional rewrite of the suite (~300 lines core logic vs ~2000 CUDA).
 - `metanet_optimizers_jax.py` — SuperGrok v1.5, v1.1, NeuralGrok
 - `quantization_jax.py`, `sharding.py`, `bridge.py`
 
-### Pallas kernels
-- `pallas_affine_scan` — tiled for 128-element blocks (v5p)
-- `pallas_fused_gru_peer` — GRU + PEER + expert MLP fused in VMEM
-- `vmem_persistent_expert_mlp` — weights resident across tiles
+### Pallas kernels (`csrc/kernels/tpu/_pallas_kernels.py`)
+- `mamba3_scan_pallas_tile128` — affine prefix scan, 128-wide MXU tiles (v4/v5e/v5p)
+- `mamba3_scan_pallas_tile256` — same algorithm, 256-wide tiles for v6e
+- `pallas_persistent_scan_fused_elem_tile{128,256}` — fused
+  scan + output projection + Adam, scan output stays in VMEM
+- `vmem_persistent_expert_mlp` — expert weights pinned in VMEM with
+  `eviction_policy="none"` on v5p / v6e
+- `pallas_fused_gru_peer` — GRU + PEER routing + expert MLP fused in one kernel
+- `sharded_mamba3_scan` — multi-device 3-phase prefix scan via
+  `shard_map` (local scan → summary all-gather → correction)
+- `tpu_auto_select_scan` / `tpu_auto_select_fused_scan_elem` — runtime
+  dispatch keyed on `detect_tpu_version()`
+
+### Pallas models (`csrc/kernels/tpu/_pallas_models.py`)
+- `decoder_forward` / `decoder_backward` (causal Decoder Transformer)
+- `vit_forward` / `vit_backward` / `vit_patch_project`
+- `mamba_forward` / `mamba_backward` / `mamba_layer_forward` /
+  `mamba_selective_scan`
+- `attention_forward` / `attention_backward` — splash-attention path
+  with hand-tiled BF16 fallback
+
+All Pallas paths are wrapped in `try`/`except` with a pure-JAX fallback
+so the module remains importable when the Pallas API drifts.
 
 ### Feature gaps vs CUDA
-- SAM perturbation not fully integrated
+- SAM perturbation not fully integrated into the JAX optimizer harness
 - Quantization INT8 only (no FP8/INT4/MXFP4)
 - Expert load balancing minimal
 
@@ -444,6 +561,7 @@ Eleven files, ~3,400 LOC, ~100 test points.
 | `test_new_features.py` | float4 vectorized, OverlappedOptimizer, compression, Pallas |
 | `test_training_aware.py` | Non-temporal I/O, Q3 states, stochastic rounding, pipelining |
 | `test_race_split.py` | Split arithmetic, disjointness, determinism, EarlyStopper |
+| `test_models_sm_90.py` | Smoke test that `_ops.models.{decoder,vit,mamba}_forward/backward` are registered (no kernel run) |
 
 Run: `pytest tests/`
 
@@ -453,6 +571,9 @@ Run: `pytest tests/`
 
 For each optimizer, what each active arch does. Only sm_90, gfx942, and
 tpu_v5p are currently compiled; other arches will be added post-expansion.
+After Phases 1–6 every cell in the optimizer × arch and model × arch
+matrices above has a real implementation — see the
+[Build status](#build-status) tables.
 
 ### SuperGrok v2
 
@@ -547,12 +668,16 @@ nvfp4 → mxfp4 → fp8 → bf16 → fp32
 
 ### Active (3-arch set)
 
-**1. Write the 33 optimizer device headers.** Most sm_90 and gfx942 stubs
-have TODO bodies needing real per-arch divergence math (only muon, supergrok2,
-grokadamw, lion are fully migrated).
+**1. Optimizer device headers — DONE for the 3-arch active set.** All 11
+optimizers have real per-arch implementations under
+`csrc/device/optimizers/{sm_90,gfx942,tpu_v5p}/`. Phase 4 closed the
+gfx942 row; Phase 5 closed tpu_v5p.
 
-**2. Write the 9 model device headers.** Transformer, ViT, MambaModel forward
-+ backward templates for each of the 3 arches.
+**2. Model device headers — DONE for the 3-arch active set.** Decoder
+Transformer, ViT, and Mamba forward + backward templates exist for all
+three arches. Phase 3 closed sm_90; Phase 5 closed tpu_v5p (the v5p
+device-template files now re-export from
+`csrc/kernels/tpu/_pallas_models.py`).
 
 **3. Compile-time instantiation of 99 fused TUs.** Verify build, link, and
 numerical parity against the separate-kernel path.
