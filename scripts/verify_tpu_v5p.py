@@ -26,9 +26,17 @@ pure-JAX path and still exits 0 when the bridge is structurally healthy.
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 import traceback
 from typing import Any
+
+# Make the repo root importable when this script is launched directly:
+#   python scripts/verify_tpu_v5p.py
+# The repo root is the parent of the directory containing this file.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 
 _FAIL = "FAIL"
