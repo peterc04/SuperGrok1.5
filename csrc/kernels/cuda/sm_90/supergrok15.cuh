@@ -248,9 +248,19 @@ template <int BLOCK_SIZE>
 __device__ __forceinline__ void block_reduce1_atomic(
     float a, float* __restrict__ scalars   // scalars[0]
 ) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    a = cluster_dsmem_reduce_sum(a);
+    if (threadIdx.x == 0) {
+        namespace cg = cooperative_groups;
+        auto cluster = cg::this_cluster();
+        if (cluster.block_rank() == 0)
+            atomicAdd(&scalars[0], a);
+    }
+#else
     const int lane = threadIdx.x & 31;
     a = warp_reduce_sum(a, 32, lane);
     if (lane == 0) atomicAdd(&scalars[0], a);
+#endif
 }
 
 // Block-wide pair reduction → 2 atomicAdds per warp into a caller-supplied
@@ -259,6 +269,18 @@ template <int BLOCK_SIZE>
 __device__ __forceinline__ void block_reduce2_atomic(
     float a, float b, float* __restrict__ pair   // pair[0..1]
 ) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    a = cluster_dsmem_reduce_sum(a);
+    b = cluster_dsmem_reduce_sum(b);
+    if (threadIdx.x == 0) {
+        namespace cg = cooperative_groups;
+        auto cluster = cg::this_cluster();
+        if (cluster.block_rank() == 0) {
+            atomicAdd(&pair[0], a);
+            atomicAdd(&pair[1], b);
+        }
+    }
+#else
     const int lane = threadIdx.x & 31;
     a = warp_reduce_sum(a, 32, lane);
     b = warp_reduce_sum(b, 32, lane);
@@ -266,6 +288,7 @@ __device__ __forceinline__ void block_reduce2_atomic(
         atomicAdd(&pair[0], a);
         atomicAdd(&pair[1], b);
     }
+#endif
 }
 
 // ---------------------------------------------------------------------
