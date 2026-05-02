@@ -132,6 +132,7 @@ if _has_gpu and _is_hip:
 
     sources = COMMON_BINDINGS + _collect([
         "csrc/kernels/hip/gfx942/*.hip.cpp",
+        "csrc/kernels/hip/gfx942/models/*.hip.cpp",
     ])
 
     rocm_archs = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()
