@@ -95,8 +95,6 @@ targets.
 │   │   ├── supergrok2.py       grokadamw.py    looksam.py    prodigy.py
 │   │   ├── supergrok15.py      grokfast.py     muon.py       moe_adam.py
 │   │   └── supergrok11.py      lion.py         neuralgrok.py
-│   └── extensions/             (distributed, CUDA Graphs, quantization, ...)
-├── supergrok2_jax_tpu/         (JAX functional rewrite)
 └── csrc/
     ├── algorithms/             (12 vendor-neutral algorithm headers)
     │   ├── adamw.h             grokfast.h    looksam.h     prodigy.h
@@ -629,31 +627,33 @@ Pure-Python reference implementations live in
 `grokking_optimizers/fallback.py` and are used both as the dispatch fallback
 and as ground-truth for parity tests.
 
-Auxiliary extensions (CUDA Graph wrapper, distributed training, gradient
-hooks, quantization, etc.) live under `grokking_optimizers/extensions/`.
+`GradientHookOptimizer` (a thin wrapper that runs per-parameter steps via
+`register_post_accumulate_grad_hook`) lives at
+`grokking_optimizers/optimizers/gradient_hook.py` and is the only "extension"
+that survived the post-refactor cleanup.
 
 ---
 
 ## JAX/TPU
 
-Functional rewrite of the suite for TPU v5p, kept as a separate package
-(`supergrok2_jax_tpu/`). Used by both the race driver (when running on TPU)
-and the Pallas backend launchers.
+The TPU functional rewrite that previously lived under `supergrok2_jax_tpu/`
+was folded into the Pallas backend itself. Each
+`csrc/backends/pallas/launch_<optimizer>.py` is now fully self-contained:
 
-Top-level modules:
-- `supergrok2_jax.py` — main optimizer loop
-- `mamba3_peer_metanet_jax.py` — meta-net architecture
-- `scan.py` — `jax.lax.associative_scan` with Affine2x2 operator
-- `simple_optimizers_jax.py` — GrokAdamW, Lion, Grokfast, Prodigy, Muon, LookSAM
-- `metanet_optimizers_jax.py` — SuperGrok v1.5, v1.1, NeuralGrok
-- Plus `gru.py`, `peer.py`, `bilevel.py`, `quantization_jax.py`, `sharding.py`, `bridge.py`
+- All 11 launch files carry their own `State` / `Config` namedtuples and
+  the canonical per-parameter step function (Lion, Muon, Prodigy, …).
+- `launch_supergrok2.py` (≈875 lines) absorbs the full SG2 functional
+  rewrite: bidirectional Mamba-3 scan, per-element GRU, multi-head PEER
+  routing (soft + hard), meta-net composition, the SG2 optimizer step,
+  the bilevel meta-update, and INT8/INT4 quantization helpers.
+- `primitives.py` is now slim — just TPU version detection and re-exports
+  of the Pallas kernels in `_pallas_kernels.py` / `_pallas_models.py`.
 
 Pallas kernels (`csrc/backends/pallas/_pallas_kernels.py` and
 `_pallas_models.py`) provide tile-128 affine prefix scan, fused GRU+PEER,
 VMEM-persistent expert MLP, sharded multi-device scan, and the three model
-forward/backward functions. The `csrc/backends/pallas/launch_*.py` files
-re-export or wrap these through the same launcher contract the C++ launchers
-follow.
+forward/backward functions. The race driver calls into the launch_*.py files
+directly when running on TPU.
 
 ---
 
