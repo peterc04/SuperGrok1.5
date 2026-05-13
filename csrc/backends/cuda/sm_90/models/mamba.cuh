@@ -1942,7 +1942,7 @@ cudaError_t selective_scan_backward(
 #include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/epilogue/thread/linear_combination_generic.h>
 
-namespace sg { namespace cuda_sm90 { namespace mma {
+namespace sg { namespace sm90 { namespace mma {
 
 // FP16 in / FP32 acc / FP32 out, row-major A * row-major B, row-major C.
 inline cudaError_t gemm_fp16(
@@ -2047,7 +2047,7 @@ inline cudaError_t dt_proj_fused_with_bias(
     return cudaSuccess;
 }
 
-}}} // namespace sg::cuda_sm90::mma
+}}} // namespace sg::sm90::mma
 
 #else  // !WITH_CUTLASS
 

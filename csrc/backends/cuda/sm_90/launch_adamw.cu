@@ -5,7 +5,7 @@
 //   csrc/backends/cuda/sm_90/primitives.cuh — grid-stride, vec4, reductions
 //
 // Exposes:
-//   sg::cuda_sm90::launch_adamw_step(...)   — multi-tensor launcher
+//   sg::sm90::launch_adamw_step(...)   — multi-tensor launcher
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -914,7 +914,7 @@ __device__ __forceinline__ void gru_gates_ptx(
 #endif
 // ── end inlined csrc/common/ptx_intrinsics.cuh ──
 
-namespace sg { namespace cuda_sm90 { namespace primitives {
+namespace sg { namespace sm90 { namespace primitives {
 
 namespace cg = cooperative_groups;
 
@@ -1050,12 +1050,12 @@ __device__ __forceinline__ float adam_denom_fast(float v, float eps) {
     return sqrtf(v) + eps;
 }
 
-}}} // namespace sg::cuda_sm90::primitives
+}}} // namespace sg::sm90::primitives
 // ── end inlined csrc/backends/cuda/sm_90/primitives.cuh ──
 
-namespace sg { namespace cuda_sm90 {
+namespace sg { namespace sm90 {
 
-namespace prim = ::sg::cuda_sm90::primitives;
+namespace prim = ::sg::sm90::primitives;
 using ::sg::algorithms::adamw_step;
 using ::sg::algorithms::adamw_step_vec4;
 
@@ -1141,4 +1141,4 @@ void launch_adamw_step(
         });
 }
 
-}} // namespace sg::cuda_sm90
+}} // namespace sg::sm90

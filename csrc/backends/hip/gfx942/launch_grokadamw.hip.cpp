@@ -35,7 +35,7 @@
 #include <vector>
 #include <cstdint>
 
-namespace sg { namespace hip_gfx942 { namespace primitives {
+namespace sg { namespace gfx942 { namespace primitives {
 
 // =========================================================================
 //  Validate that a tensor is on the active HIP/CUDA device.
@@ -116,12 +116,12 @@ inline TensorPack pack_valid(
     return out;
 }
 
-}}} // namespace sg::hip_gfx942::primitives
+}}} // namespace sg::gfx942::primitives
 // ── end inlined csrc/backends/hip/gfx942/primitives.hpp ──
 
-namespace sg { namespace hip_gfx942 {
+namespace sg { namespace gfx942 {
 
-namespace prim = ::sg::hip_gfx942::primitives;
+namespace prim = ::sg::gfx942::primitives;
 
 void launch_grokadamw_step(
     std::vector<torch::Tensor>& params,
@@ -152,4 +152,4 @@ void launch_grokadamw_step(
     }
 }
 
-}} // namespace sg::hip_gfx942
+}} // namespace sg::gfx942

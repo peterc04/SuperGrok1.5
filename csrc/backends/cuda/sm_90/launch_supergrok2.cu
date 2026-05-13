@@ -924,7 +924,7 @@ __device__ __forceinline__ void gru_gates_ptx(
 #endif
 // ── end inlined csrc/common/ptx_intrinsics.cuh ──
 
-namespace sg { namespace cuda_sm90 { namespace primitives {
+namespace sg { namespace sm90 { namespace primitives {
 
 namespace cg = cooperative_groups;
 
@@ -1060,7 +1060,7 @@ __device__ __forceinline__ float adam_denom_fast(float v, float eps) {
     return sqrtf(v) + eps;
 }
 
-}}} // namespace sg::cuda_sm90::primitives
+}}} // namespace sg::sm90::primitives
 // ── end inlined csrc/backends/cuda/sm_90/primitives.cuh ──
 // ── inlined from former csrc/scan/mamba_scan_adapter.cuh ──
 // csrc/scan/mamba_scan_adapter.cuh — CUDA scan adapter.
@@ -2262,7 +2262,7 @@ cudaError_t selective_scan_backward(
 #include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/epilogue/thread/linear_combination_generic.h>
 
-namespace sg { namespace cuda_sm90 { namespace mma {
+namespace sg { namespace sm90 { namespace mma {
 
 // FP16 in / FP32 acc / FP32 out, row-major A * row-major B, row-major C.
 inline cudaError_t gemm_fp16(
@@ -2367,7 +2367,7 @@ inline cudaError_t dt_proj_fused_with_bias(
     return cudaSuccess;
 }
 
-}}} // namespace sg::cuda_sm90::mma
+}}} // namespace sg::sm90::mma
 
 #else  // !WITH_CUTLASS
 
@@ -2377,9 +2377,9 @@ inline cudaError_t dt_proj_fused_with_bias(
 // ── end inlined csrc/backends/cuda/sm_90/mma.cuh ──
 #endif
 
-namespace sg { namespace cuda_sm90 {
+namespace sg { namespace sm90 {
 
-namespace prim = ::sg::cuda_sm90::primitives;
+namespace prim = ::sg::sm90::primitives;
 
 // =========================================================================
 //  Forward kernel 1: input projection + sort
@@ -2585,4 +2585,4 @@ void launch_moe_adam_step(
         });
 }
 
-}} // namespace sg::cuda_sm90
+}} // namespace sg::sm90

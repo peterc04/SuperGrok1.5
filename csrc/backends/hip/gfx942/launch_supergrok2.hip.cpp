@@ -58,7 +58,7 @@
 
 #include <cstdint>
 
-namespace sg { namespace hip_gfx942 { namespace primitives {
+namespace sg { namespace gfx942 { namespace primitives {
 
 inline void check_device(const torch::Tensor& t, const char* name) {
     TORCH_CHECK(t.is_cuda(), name, " must be on a HIP/CUDA device");
@@ -116,12 +116,12 @@ inline TensorPack pack_valid(
     return out;
 }
 
-}}} // namespace sg::hip_gfx942::primitives
+}}} // namespace sg::gfx942::primitives
 // ── end inlined csrc/backends/hip/gfx942/primitives.hpp ──
 
-namespace sg { namespace hip_gfx942 {
+namespace sg { namespace gfx942 {
 
-namespace prim = ::sg::hip_gfx942::primitives;
+namespace prim = ::sg::gfx942::primitives;
 
 // ═══════════════════════════════════════════════════════════════════════
 //  SuperGrok v2 — gfx942 functional port.
@@ -570,11 +570,9 @@ static void sg2_step_one_param(
 // ═══════════════════════════════════════════════════════════════════════
 //  Public launchers — bindings-expected entry points.
 //
-//  These match the signatures in csrc/bindings/bindings.cpp::DECLARE_SG2.
-//  Note: pre-existing systemic issue — the bindings expect symbols in
-//  `sg::sm90::*` and `sg::gfx942::*`, but the codebase convention is
-//  `sg::cuda_sm90::*` and `sg::hip_gfx942::*`. We follow the existing
-//  convention; resolving the namespace alias is a separate task.
+//  These match the signatures in csrc/bindings/bindings.cpp::DECLARE_SG2
+//  and live in `sg::gfx942::*` (matched against bindings via
+//  csrc/bindings/helpers.h's DISPATCH_SG2 macro).
 // ═══════════════════════════════════════════════════════════════════════
 
 void launch_mamba3_peer_step(
@@ -879,4 +877,4 @@ void launch_moe_adam_step(
     }
 }
 
-}} // namespace sg::hip_gfx942
+}} // namespace sg::gfx942

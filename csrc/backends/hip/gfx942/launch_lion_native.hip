@@ -37,7 +37,7 @@
 #include <vector>
 #include <cstdint>
 
-namespace sg { namespace hip_gfx942 {
+namespace sg { namespace gfx942 {
 
 // Wavefront size for CDNA3 is 64 (vs 32 on NVIDIA / RDNA).
 // Block size = 256 = 4 wavefronts per block — a reasonable occupancy target.
@@ -105,4 +105,4 @@ void launch_lion_step_native(
     }
 }
 
-}} // namespace sg::hip_gfx942
+}} // namespace sg::gfx942

@@ -47,7 +47,7 @@
 #include <vector>
 #include <cstdint>
 
-namespace sg { namespace hip_gfx942 { namespace primitives {
+namespace sg { namespace gfx942 { namespace primitives {
 
 // =========================================================================
 //  Validate that a tensor is on the active HIP/CUDA device.
@@ -128,12 +128,12 @@ inline TensorPack pack_valid(
     return out;
 }
 
-}}} // namespace sg::hip_gfx942::primitives
+}}} // namespace sg::gfx942::primitives
 // ── end inlined csrc/backends/hip/gfx942/primitives.hpp ──
 
-namespace sg { namespace hip_gfx942 {
+namespace sg { namespace gfx942 {
 
-namespace prim = ::sg::hip_gfx942::primitives;
+namespace prim = ::sg::gfx942::primitives;
 
 static inline torch::Tensor newton_schulz_iterate(
     torch::Tensor X, int ns_steps, float a, float b, float c
@@ -174,4 +174,4 @@ void launch_muon_step(
     }
 }
 
-}} // namespace sg::hip_gfx942
+}} // namespace sg::gfx942
