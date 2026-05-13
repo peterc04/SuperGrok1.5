@@ -133,7 +133,6 @@ if _has_gpu and _is_hip:
     sources = COMMON_BINDINGS + _collect([
         "csrc/backends/hip/gfx942/*.hip.cpp",
         "csrc/backends/hip/gfx942/models/*.hip.cpp",
-        "csrc/fused/gfx942/*.hip.cpp",
     ])
 
     rocm_archs = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()
@@ -174,7 +173,6 @@ elif _has_gpu:
     sources = COMMON_BINDINGS + _collect([
         "csrc/backends/cuda/sm_90/*.cu",
         "csrc/backends/cuda/sm_90/models/*.cu",
-        "csrc/fused/sm_90/*.cu",
     ])
 
     nvcc_archs_env = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()

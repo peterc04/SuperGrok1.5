@@ -97,14 +97,13 @@ H100, MI300X, or TPU v5p before any cell can be promoted to ✅.
 
 ## Filesystem
 
-50 source files compose into 99 fused (model × optimizer × arch) build
-targets.
+The codebase splits along three orthogonal axes: **algorithm** (the
+vendor-neutral math), **backend** (per-arch launchers + primitives), and
+**model** (decoder / ViT / mamba). Each axis owns its own directory.
 
 ```
 .
 ├── README.md
-├── REFACTOR_AUDIT.md     (Phase 1 inventory)
-├── REFACTOR_NOTES.md     (cross-phase decisions and gaps)
 ├── grokking_race_v2.py   (race driver — 11 optimizers × 3 models × 4 splits)
 ├── setup.py / build.sh / pyproject.toml
 ├── grokking_optimizers/
@@ -133,13 +132,13 @@ targets.
     │   ├── cuda/sm_90/         (primitives.cuh + mma.cuh + 11 launch_*.cu + models/)
     │   ├── hip/gfx942/         (primitives.hpp + 11 launch_*.hip.cpp + models/)
     │   └── pallas/             (primitives.py + 12 launch_*.py + models/ + v5p/)
-    ├── bindings/               (pybind11 dispatchers + dispatch macro + helpers)
-    └── fused/                  (99 fused TUs — 33 .cu + 33 .hip.cpp + 33 .py)
+    └── bindings/               (pybind11 dispatchers + dispatch macro + helpers)
 ```
 
-Each fused TU includes one algorithm header, one model header, and the
-relevant backend primitives. The launch glue files contain the `__global__`
-kernels (CUDA) or ATen-driven implementations (HIP) or JAX wrappers (Pallas).
+Launch glue files contain the `__global__` kernels (CUDA) or ATen-driven
+implementations (HIP) or JAX wrappers (Pallas). When fused megakernels
+ever get written, they'll live under `csrc/fused/<arch>/` with real
+content — the prior placeholder stubs were removed.
 
 Runtime dispatch via `grokking_optimizers/dispatch.py`:
 - `detect_arch()` → `90`, `942`, or `"tpu_v5p"`
@@ -486,18 +485,18 @@ tensors), plus per-expert activation counts when used in MoE mode.
 
 ## Architecture
 
-The codebase is organized along three orthogonal axes:
+The codebase is organized along two orthogonal axes:
 
 1. **Algorithm** (what math to compute) — `csrc/algorithms/*.h`
 2. **Backend** (which hardware to use) — `csrc/backends/<vendor>/<arch>/`
-3. **Fusion** (model × optimizer combinations) — `csrc/fused/<arch>/`
 
 Algorithm headers are vendor-neutral: they declare `__device__ __forceinline__`
 template functions that compile under both nvcc and hipcc, plus pure-JAX
-mirrors in `csrc/backends/pallas/primitives.py`. Backend launch files are
-non-templated glue that calls into the algorithm functions inside grid-stride
-loops. Fused TUs are the 99 build targets that combine one model + one
-optimizer + one arch into a single compilation unit.
+mirrors inside each `csrc/backends/pallas/launch_<opt>.py`. Backend launch
+files are non-templated glue that calls into the algorithm functions inside
+grid-stride loops. If fused megakernels (one TU per model × optimizer × arch)
+ever land, they'll live under `csrc/fused/<arch>/` — there are no placeholder
+stubs in the meantime.
 
 ### Algorithm headers (`csrc/algorithms/`)
 
@@ -598,18 +597,6 @@ Pybind11 entry points that connect Python to the C++ launchers:
 Per-optimizer dispatcher .cpp files in `csrc/bindings/` filter undefined
 gradients, pack tensors into vectors, and call `SG_DISPATCH(launcher, ...)`
 which picks the right backend at runtime.
-
-### Fused TUs (`csrc/fused/`)
-
-99 build targets: 3 models × 11 optimizers × 3 arches. Each TU includes:
-1. The relevant algorithm header
-2. The relevant model header
-3. The backend primitives header
-
-At the current refactor stage these TUs are placeholders that include the
-right headers but do not yet emit a fused megakernel. Their existence
-guarantees that every (model, optimizer, arch) triple has a build target and
-a namespace anchor (`sg::fused::<arch>`).
 
 ---
 
@@ -822,12 +809,9 @@ When this branch lands on a machine with a real sm_90 GPU and an MI300X:
 - [ ] If anything fails, add a follow-up commit with the fix and re-test
 
 **Out-of-scope items (deferred)**
-- Fused megakernel instantiation in `csrc/fused/<arch>/*` (the 99 build
-  targets currently include the right headers but do not yet emit a fused
-  model+optimizer kernel — they're build-target placeholders)
-- Per-optimizer C++ dispatcher consolidation into `bindings.cpp`
+- Fused megakernels (`csrc/fused/<arch>/`) — directory currently absent;
+  any future fusion work will recreate it with real content.
 - Warp-specialized SG2 scan as a runtime-detected branch
-- Real autotune output for `tuned_configs.h`
 - CUDA Graph capture for the SG2 pipeline
 - DSMEM cross-CTA reductions wired into LookSAM / Prodigy norm kernels
 - CI matrix (no `tests/` directory at the moment)
@@ -843,12 +827,11 @@ To add a new optimizer:
    - `csrc/backends/cuda/sm_90/launch_<optimizer>.cu`
    - `csrc/backends/hip/gfx942/launch_<optimizer>.hip.cpp`
    - `csrc/backends/pallas/launch_<optimizer>.py`
-3. Add 3 fused TU stubs (one per model) under `csrc/fused/<arch>/`
-4. Add a Python wrapper under `grokking_optimizers/optimizers/<name>.py`
-5. Add a pure-Python reference in `grokking_optimizers/fallback.py`
-6. Re-export in `grokking_optimizers/__init__.py`
-7. Verify import: `python -c "from grokking_optimizers import <Class>"`
-8. Run a 20-step training loop on a tiny model to confirm convergence
+3. Add a Python wrapper under `grokking_optimizers/optimizers/<name>.py`
+4. Add a pure-Python reference in `grokking_optimizers/fallback.py`
+5. Re-export in `grokking_optimizers/__init__.py`
+6. Verify import: `python -c "from grokking_optimizers import <Class>"`
+7. Run a 20-step training loop on a tiny model to confirm convergence
 
 ---
 
