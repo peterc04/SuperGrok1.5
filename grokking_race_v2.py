@@ -587,18 +587,11 @@ from grokking_optimizers import (
     SuperGrok15, SuperGrok2, SuperGrok11,
     GrokAdamW, NeuralGrok, Prodigy, Grokfast, Lion, LookSAM, Muon,
 )
-from grokking_optimizers.optimizers.gradient_hook import GradientHookOptimizer
 from grokking_optimizers.dispatch import detect_arch, has_fused, dispatch_fused
 
 def _maybe_wrap_cuda_graph(opt, c):
     """No-op shim. CUDA Graph wrapping was removed in the post-refactor
     cleanup; the race is single-node and does not need graph capture."""
-    return opt
-
-def _maybe_wrap_grad_hooks(opt, model, c):
-    """Wrap optimizer with GradientHookOptimizer if --grad-hooks flag is active."""
-    if c.get("use_grad_hooks", False):
-        return GradientHookOptimizer(model, opt)
     return opt
 
 def _try_fused_step(model_name, opt_name, model, optimizer, x_batch, y_batch, c):
@@ -620,7 +613,7 @@ def _try_fused_step(model_name, opt_name, model, optimizer, x_batch, y_batch, c)
 def train_adamw(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("AdamW",c); m=_load(c,dev,init)
     opt=torch.optim.AdamW(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]), weight_decay=c["weight_decay"], fused=True)
-    opt=_maybe_wrap_grad_hooks(opt, m, c)
+    # AdamW baseline does not support use_grad_hooks (no _single_param_step API).
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
@@ -652,10 +645,10 @@ def train_neuralgrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         weight_decay=c["weight_decay"], alpha=c.get("neural_alpha",10.0),
         beta=c.get("neural_beta",4.0), num_layers=c.get("neural_layers",3),
         hidden_dim=c.get("neural_hidden",128), inner_steps=c.get("inner_steps",1),
-        grad_clip=c.get("neural_grad_clip",1.0))
+        grad_clip=c.get("neural_grad_clip",1.0),
+        use_grad_hooks=c.get("use_grad_hooks",False))
     opt.amplifier=opt.amplifier.to(dev)
     aopt=opt.get_amplifier_optimizer(lr=1e-3)
-    opt=_maybe_wrap_grad_hooks(opt, m, c)
     ni=int(tx.size(0)*0.9); ix,ox,iy,oy = tx[:ni],tx[ni:],ty[:ni],ty[ni:]
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
@@ -683,8 +676,8 @@ def train_grokadamw(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     opt=GrokAdamW(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
         weight_decay=c["weight_decay"], alpha=c.get("grokadamw_alpha",0.98),
         lamb=c.get("grokadamw_lamb",5.0), gamma=c.get("grokadamw_gamma",0.1),
-        decay=c.get("grokadamw_decay",0.1), grad_clip=c.get("grokadamw_grad_clip",1.0))
-    opt=_maybe_wrap_grad_hooks(opt, m, c)
+        decay=c.get("grokadamw_decay",0.1), grad_clip=c.get("grokadamw_grad_clip",1.0),
+        use_grad_hooks=c.get("use_grad_hooks",False))
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
@@ -716,7 +709,8 @@ def train_supergrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         gate_temperature=c.get("supergrok_gate_temp",5.0),
         zero_loss_threshold=c.get("supergrok_zero_loss_thresh",1e-4),
         zero_acc_threshold=c.get("supergrok_zero_acc_thresh",0.995),
-        meta_hidden_dim=c.get("supergrok_meta_dim",32))
+        meta_hidden_dim=c.get("supergrok_meta_dim",32),
+        use_grad_hooks=c.get("use_grad_hooks",False))
     opt.meta_net=opt.meta_net.to(dev)
     mopt=torch.optim.Adam(opt.meta_net.parameters(), lr=1e-4)
     crit_sg=nn.CrossEntropyLoss()
@@ -788,7 +782,8 @@ def train_supergrok15(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         bilevel_thresh=c.get("supergrok15_bilevel_thresh",0.9),
         wd_ramp=c.get("supergrok15_wd_ramp",4.0),
         wd_scale=c.get("supergrok15_wd_scale",20.0),
-        wd_thresh=c.get("supergrok15_wd_thresh",0.9))
+        wd_thresh=c.get("supergrok15_wd_thresh",0.9),
+        use_grad_hooks=c.get("use_grad_hooks",False))
     opt.meta_net=opt.meta_net.to(dev)
     mopt=torch.optim.Adam(opt.meta_net.parameters(), lr=1e-4)
     crit_s15=nn.CrossEntropyLoss()
@@ -865,7 +860,8 @@ def train_supergrok2(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         bilevel_scale=c.get("sg2_bilevel_scale",20.0), bilevel_thresh=c.get("sg2_bilevel_thresh",0.9),
         wd_ramp=c.get("sg2_wd_ramp",4.0), wd_scale=c.get("sg2_wd_scale",20.0),
         wd_thresh=c.get("sg2_wd_thresh",0.9),
-        sam_enable_threshold=c.get("sg2_sam_enable_threshold",0.0))
+        sam_enable_threshold=c.get("sg2_sam_enable_threshold",0.0),
+        use_grad_hooks=c.get("use_grad_hooks",False))
     opt.meta_net=opt.meta_net.to(dev)
     mopt=torch.optim.Adam(opt.meta_net.parameters(), lr=1e-4)
     crit_s2=nn.CrossEntropyLoss()
@@ -917,8 +913,8 @@ def train_grokfast(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("Grokfast",c); m=_load(c,dev,init)
     opt=Grokfast(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
         weight_decay=c["weight_decay"], grokfast_alpha=c.get("grokfast_alpha",0.98),
-        grokfast_lamb=c.get("grokfast_lamb",2.0))
-    opt=_maybe_wrap_grad_hooks(opt, m, c)
+        grokfast_lamb=c.get("grokfast_lamb",2.0),
+        use_grad_hooks=c.get("use_grad_hooks",False))
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
@@ -945,8 +941,8 @@ def train_muon(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     opt=Muon(muon_params, params_1d=adam_params if adam_params else None,
         lr=c.get("muon_lr",0.02), momentum=c.get("muon_momentum",0.95),
         weight_decay=c["weight_decay"], adamw_lr=c["lr"],
-        adamw_betas=(c["beta1"],c["beta2"]))
-    opt=_maybe_wrap_grad_hooks(opt, m, c)
+        adamw_betas=(c["beta1"],c["beta2"]),
+        use_grad_hooks=c.get("use_grad_hooks",False))
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
@@ -968,8 +964,8 @@ def train_muon(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
 def train_lion(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("Lion",c); m=_load(c,dev,init)
     opt=Lion(m.parameters(), lr=c.get("lion_lr",3e-4),
-        betas=(c["beta1"],0.99), weight_decay=c.get("lion_wd",3.0))
-    opt=_maybe_wrap_grad_hooks(opt, m, c)
+        betas=(c["beta1"],0.99), weight_decay=c.get("lion_wd",3.0),
+        use_grad_hooks=c.get("use_grad_hooks",False))
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
@@ -993,7 +989,8 @@ def train_looksam(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     k=c.get("looksam_k",5)
     opt=LookSAM(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
         weight_decay=c["weight_decay"], rho=c.get("looksam_rho",0.05),
-        k=k, alpha=c.get("looksam_alpha",0.7))
+        k=k, alpha=c.get("looksam_alpha",0.7),
+        use_grad_hooks=c.get("use_grad_hooks",False))
     crit_ls=nn.CrossEntropyLoss()
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
@@ -1022,8 +1019,8 @@ def train_looksam(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
 # ── 10. Prodigy ───────────────────────────────────────────────────────
 def train_prodigy(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("Prodigy",c); m=_load(c,dev,init)
-    opt=Prodigy(m.parameters(), lr=c.get("prodigy_lr",1.0), weight_decay=c["weight_decay"])
-    opt=_maybe_wrap_grad_hooks(opt, m, c)
+    opt=Prodigy(m.parameters(), lr=c.get("prodigy_lr",1.0), weight_decay=c["weight_decay"],
+        use_grad_hooks=c.get("use_grad_hooks",False))
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)

@@ -66,13 +66,6 @@ from grokking_optimizers.optimizers.moe_adam import MoEAwareSuperGrok2
 
 
 # --------------------------------------------------------------------------
-# GradientHookOptimizer — race driver uses this directly
-# --------------------------------------------------------------------------
-
-from grokking_optimizers.optimizers.gradient_hook import GradientHookOptimizer
-
-
-# --------------------------------------------------------------------------
 # Dispatch / arch helpers
 # --------------------------------------------------------------------------
 
@@ -97,9 +90,6 @@ __all__ = [
     "NeuralGrok",
     "Prodigy",
     "MoEAwareSuperGrok2",
-
-    # GradientHookOptimizer (race-driver wrapper)
-    "GradientHookOptimizer",
 
     # Dispatch helpers
     "get_gpu_arch", "get_gpu_vendor", "get_backend", "get_arch_label",

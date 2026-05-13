@@ -51,6 +51,7 @@ class Grokfast(Optimizer):
         weight_decay: float = 1.0,
         grokfast_alpha: float = 0.98,
         grokfast_lamb: float = 2.0,
+        use_grad_hooks: bool = False,
     ) -> None:
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -73,6 +74,10 @@ class Grokfast(Optimizer):
         )
         super().__init__(params, defaults)
 
+        self._use_grad_hooks = use_grad_hooks
+        if use_grad_hooks:
+            _register_grad_hooks(self)
+
     @torch.no_grad()
     def step(self, closure=None) -> Optional[float]:
         """Perform a single optimisation step.
@@ -88,6 +93,9 @@ class Grokfast(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        if self._use_grad_hooks:
+            return loss
 
         for group in self.param_groups:
             params_list = []
@@ -133,7 +141,7 @@ class Grokfast(Optimizer):
         return loss
 
     def _single_param_step(self, param, group, state):
-        """Per-parameter step for GradientHookOptimizer integration."""
+        """Per-parameter step used by the `use_grad_hooks=True` path."""
         if param.grad is None:
             return
         if len(state) == 0:
@@ -150,3 +158,26 @@ class Grokfast(Optimizer):
             group["betas"][0], group["betas"][1],
             group["lr"], group["weight_decay"], group["eps"],
         )
+
+
+# ── Shared (inlined) helper: register post_accumulate_grad_hook on each param.
+# Each hook calls back into the optimizer's `_single_param_step` so the update
+# runs while gradient data is still L2-warm. Duplicated across every optimizer
+# file by design (self-containment); requires PyTorch >= 2.1.
+def _register_grad_hooks(optimizer):
+    _pt = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+    if _pt < (2, 1):
+        raise RuntimeError(
+            f"use_grad_hooks requires PyTorch >= 2.1 for "
+            f"register_post_accumulate_grad_hook. Current: {torch.__version__}.")
+    optimizer._grad_hook_handles = []
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            if not p.requires_grad:
+                continue
+            def _hook(param, _g=group, _opt=optimizer):
+                if param.grad is None:
+                    return
+                _opt._single_param_step(param, _g, _opt.state[param])
+            optimizer._grad_hook_handles.append(
+                p.register_post_accumulate_grad_hook(_hook))

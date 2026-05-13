@@ -739,6 +739,7 @@ class SuperGrok2(Optimizer):
         expert_allreduce_before_recycle: bool = True,
         mamba_state_sync_interval: int = 1000,
         state_precision: str = 'fp32',
+        use_grad_hooks: bool = False,
     ):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
@@ -864,6 +865,10 @@ class SuperGrok2(Optimizer):
         self._flat_param_data = [p.data for p in self._flat_params]
         self._weights_dirty = True
         self._cached_weights = None
+
+        self._use_grad_hooks = use_grad_hooks
+        if use_grad_hooks:
+            _register_grad_hooks(self)
 
     def _ensure_state(self):
         if self._state_initialized:
@@ -1034,6 +1039,10 @@ class SuperGrok2(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        if self._use_grad_hooks:
+            self._global_step += 1
+            return loss
 
         self._ensure_state()
         self._global_step += 1
@@ -2580,3 +2589,26 @@ class CompiledSuperGrok2:
             return object.__getattribute__(self, name)
         except AttributeError:
             return getattr(self.optimizer, name)
+
+
+# ── Shared (inlined) helper: register post_accumulate_grad_hook on each param.
+# Each hook calls back into the optimizer's `_single_param_step` so the update
+# runs while gradient data is still L2-warm. Duplicated across every optimizer
+# file by design (self-containment); requires PyTorch >= 2.1.
+def _register_grad_hooks(optimizer):
+    _pt = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+    if _pt < (2, 1):
+        raise RuntimeError(
+            f"use_grad_hooks requires PyTorch >= 2.1 for "
+            f"register_post_accumulate_grad_hook. Current: {torch.__version__}.")
+    optimizer._grad_hook_handles = []
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            if not p.requires_grad:
+                continue
+            def _hook(param, _g=group, _opt=optimizer):
+                if param.grad is None:
+                    return
+                _opt._single_param_step(param, _g, _opt.state[param])
+            optimizer._grad_hook_handles.append(
+                p.register_post_accumulate_grad_hook(_hook))

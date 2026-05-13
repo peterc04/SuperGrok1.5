@@ -50,6 +50,9 @@ class MoEAwareSuperGrok2(SuperGrok2):
             threshold: Gate logit threshold for expert activation counting.
             **kwargs: Forwarded to SuperGrok2.step().
         """
+        if getattr(self, "_use_grad_hooks", False):
+            return super().step(closure=closure, **kwargs)
+
         if (active_expert_indices is not None and
                 _HAS_CUDA and
                 hasattr(_ops, 'moe_filter_active_params')):
