@@ -143,7 +143,11 @@ if _has_gpu and _is_hip:
     ext = CUDAExtension(
         name="grokking_optimizers._ops",
         sources=sources,
-        include_dirs=["csrc/common", "csrc/bindings", "csrc"],
+        # csrc/common/ and csrc/scan/ were deleted; their content is
+        # inlined into every backend file. Only csrc/bindings/ (the one
+        # surviving cross-file boundary) and csrc/ (for algorithm-header
+        # absolute-path includes from launch files) remain.
+        include_dirs=["csrc/bindings", "csrc"],
         define_macros=[("WITH_HIP", None)],
         extra_compile_args={"cxx": hip_cxx, "nvcc": hip_nvcc},
     )
@@ -197,7 +201,10 @@ elif _has_gpu:
     # corresponding CUTLASS_NVCC_ARCHS define. Multiple targets are
     # encoded as a semicolon-joined list, matching CUTLASS conventions.
     # ------------------------------------------------------------------
-    cuda_include_dirs = ["csrc/common", "csrc/bindings", "csrc"]
+    # csrc/common/ and csrc/scan/ were deleted; their content is inlined
+    # into every backend file. Only csrc/bindings/ (the one surviving
+    # cross-file boundary) and csrc/ remain.
+    cuda_include_dirs = ["csrc/bindings", "csrc"]
     cuda_define_macros = [("WITH_CUDA", None)]
     if _with_cutlass:
         cutlass_archs = []
