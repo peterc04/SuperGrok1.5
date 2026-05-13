@@ -79,61 +79,8 @@ closed the tpu_v5p model row.
 | ViT         | done (Phase 3) | done           | done (Phase 5)       |
 | Mamba       | done (Phase 3) | done           | done (Phase 5)       |
 
-**sm_90 model implementation details**
-- `csrc/kernels/cuda/sm_90/models/decoder.cuh`  (~1,180 LOC)
-- `csrc/kernels/cuda/sm_90/models/vit.cuh`      (~1,345 LOC)
-- `csrc/kernels/cuda/sm_90/models/mamba.cuh`    (~679 LOC)
-- shared `attention.cuh` (~269 LOC) used by Decoder + ViT
-- `mamba_scan_adapter.cuh` (~407 LOC) bridges Mamba to the Affine2x2 scan kernels
-
-**tpu_v5p model implementation details**
-- `csrc/kernels/tpu/_pallas_models.py` (~666 LOC) — shared Pallas/JAX
-  `decoder_*`, `vit_*`, `mamba_*` forward/backward
-- `csrc/kernels/tpu/_pallas_kernels.py` (~1,190 LOC) — tile-128
-  affine prefix scan, fused GRU+PEER, VMEM-persistent expert MLP
-- `csrc/kernels/tpu/v5p/__init__.py` re-exports the tile-128 variants and
-  exposes `get_kernels(kind='optimizers'|'models')` per-version surface
-- the `csrc/device/models/tpu_v5p/{transformer,vit,mamba}_tpu_v5p.py`
-  device-template files re-export from `_pallas_models.py` so the
-  per-arch dispatch path stays uniform across CUDA / HIP / TPU
-
-### Bindings (`_ops.models.*` Python API)
-
-`csrc/bindings/models_module.cpp` registers a `models` submodule on the
-compiled extension so model entry points appear as `_ops.models.<name>`.
-The shape mirrors the per-arch device templates and gives the race
-driver a single CUDA/HIP launch site per (model, arch).
-
-```python
-from grokking_optimizers import _get_ops
-_ops = _get_ops()
-
-# Decoder Transformer (causal LM head, last-token logits)
-_ops.models.decoder_forward(...)
-_ops.models.decoder_backward(...)
-_ops.models.decoder_attention_forward(...)   # component test surface
-_ops.models.decoder_attention_backward(...)
-
-# Vision Transformer (full attention, [CLS] classify head)
-_ops.models.vit_forward(...)
-_ops.models.vit_backward(...)
-_ops.models.vit_attention_forward(...)
-_ops.models.vit_attention_backward(...)
-_ops.models.vit_patch_project(...)            # component test surface
-
-# Mamba (selective SSM, last-token logits)
-_ops.models.mamba_forward(...)
-_ops.models.mamba_backward(...)
-_ops.models.mamba_layer_forward(...)              # component test surface
-_ops.models.mamba_selective_scan_forward(...)
-_ops.models.mamba_selective_scan_backward(...)
-```
-
-Each function dispatches at runtime to the arch reported by
-`grokking_optimizers.dispatch.get_arch_label()`. The `*_attention_*`,
-`*_patch_project`, `*_layer_forward`, and `*_selective_scan_*` entries
-are component-level test surfaces that the parity tests use to isolate
-sub-kernels without running the full forward.
+See the [Header file architecture](#header-file-architecture) section for
+detailed descriptions of each kernel file.
 
 ---
 
@@ -144,26 +91,44 @@ headers (9 model + 33 optimizer). Three models × eleven optimizers × three
 arches.
 
 ```
-csrc/
-├── device/
-│   ├── optimizers/
-│   │   ├── sm_90/      (11 .cuh headers)
-│   │   ├── gfx942/     (11 .hip.cuh headers)
-│   │   └── tpu_v5p/    (11 .py headers)
-│   └── models/
-│       ├── sm_90/      (3 .cuh headers)
-│       ├── gfx942/     (3 .hip.cuh headers)
-│       └── tpu_v5p/    (3 .py headers)
-├── kernels/
-│   ├── cuda/sm_90/models/   (decoder.cuh, vit.cuh, mamba.cuh, attention.cuh — sm_90 real impls)
-│   ├── hip/gfx942/models/   (gfx942 model headers)
-│   └── tpu/                 (_pallas_kernels.py, _pallas_models.py + v5p/__init__.py)
-├── fused/
-│   ├── sm_90/          (33 .cu TUs)
-│   ├── gfx942/         (33 .hip.cpp TUs)
-│   └── tpu_v5p/        (33 .py TUs)
-├── bindings/           (pybind11 dispatchers + fused_step + models submodule)
-└── common/             (types.h, platform.h, ptx_intrinsics.cuh, tuned_configs.h)
+.
+├── README.md
+├── grokking_race_v2.py           (race driver — 11 optimizers × 3 models × 4 splits)
+├── setup.py / build.sh / pyproject.toml
+├── grokking_optimizers/          (Python optimizer implementations, dispatch, fallbacks)
+├── supergrok2_jax_tpu/           (JAX/Pallas functional rewrite for TPU)
+├── csrc/
+│   ├── common/                   (platform.h, types.h, utils.cuh, ptx_intrinsics.cuh,
+│   │                              tuned_configs.h, quantization.h, arch_tier.h,
+│   │                              fp4_helpers.hip.h)
+│   ├── bindings/                 (pybind11 dispatchers + models submodule)
+│   ├── device/
+│   │   ├── optimizers/
+│   │   │   ├── sm_90/            (11 .cuh device-function templates)
+│   │   │   ├── gfx942/           (11 .hip.cuh device-function templates)
+│   │   │   └── tpu_v5p/          (11 .py device-function templates)
+│   │   └── models/
+│   │       ├── sm_90/            (3 .cuh — transformer, vit, mamba)
+│   │       ├── gfx942/           (3 .hip.cuh)
+│   │       └── tpu_v5p/          (3 .py)
+│   ├── kernels/
+│   │   ├── cuda/
+│   │   │   ├── _cutlass_gemm.cuh (CUTLASS GEMM + fused softplus epilogue)
+│   │   │   └── sm_90/
+│   │   │       ├── *.cuh + *.cu  (11 optimizer kernel headers + TUs)
+│   │   │       └── models/       (decoder, vit, mamba, attention, scan adapter)
+│   │   ├── hip/gfx942/
+│   │   │   ├── *.hip.h + *.hip.cpp (11 optimizer HIP launchers)
+│   │   │   └── models/           (decoder, vit, mamba delegation wrappers)
+│   │   └── tpu/
+│   │       ├── _pallas_kernels.py (tile-128 scan, fused GRU+PEER, expert MLP)
+│   │       ├── _pallas_models.py  (decoder, vit, mamba forward/backward)
+│   │       └── v5p/__init__.py    (per-version re-exports)
+│   └── fused/                    (99 fused TUs: 3 models × 11 optimizers × 3 arches)
+│       ├── sm_90/                (33 .cu)
+│       ├── gfx942/               (33 .hip.cpp)
+│       └── tpu_v5p/              (33 .py)
+└── third_party/                  (CUTLASS submodule)
 ```
 
 Each device header provides `__device__ __forceinline__` template functions.
@@ -695,84 +660,295 @@ for x, y in batches:
 
 ## Optimizers
 
-Eleven total. Each entry: purpose, state per param, hyperparameters, fused kernel name.
+Eleven optimizers, each taking a different approach to accelerating
+generalization beyond memorization. They range from simple modifications of
+Adam to complex learned meta-networks that transform gradients on the fly.
 
-### SuperGrok v2 (`supergrok2.py`)
+### SuperGrok v2
 
-Flagship. Mamba-3 + 4-head PEER + per-element GRU + 144-expert pool, per-element learned gradient correction, on top of Adam with SAM and bilevel meta-learning.
-- State: `exp_avg`, `exp_avg_sq`, `mus`, `sharpness`, `gru_states`, `mamba_fwd_states`, `mamba_bwd_states`
-- Key hyperparams: lr=1e-3, betas=(0.9, 0.999), d_model=8, d_state=16, num_experts=144, sam_rho=0.05
-- Fused kernel: `_ops.supergrok2_prepare_and_batched_step`
-- Python fallback: full
+The flagship optimizer. SuperGrok v2 wraps a standard Adam optimizer with a
+sophisticated meta-network that learns how to transform gradients before they
+are applied. At every training step, the raw gradient for each parameter is
+fed through a bidirectional Mamba-3 selective state space scan that captures
+relationships between gradient elements across the parameter vector. The scan
+runs forward and backward through the gradient, building a compressed
+representation of the gradient's spatial structure.
 
-### SuperGrok v1.5 (`supergrok15.py`)
+After the scan, each gradient element is routed through a Product-Key Expert
+Routing system (PEER) with 144 learned experts. The routing works by splitting
+each element's representation into two halves, matching each half against a
+bank of learned keys, and picking the top experts from the outer product of
+the two key matches. This gives each element access to four specialized expert
+networks simultaneously, without the cost of evaluating all 144.
 
-Simpler v2. Replaces Mamba+PEER+GRU with a 2-input 2-layer MLP.
-- State: `exp_avg`, `exp_avg_sq`, `mus`, `sharpness`
-- Key hyperparams: lr=1e-3, betas=(0.9, 0.98), hidden_dim=32, sam_rho=0.05
-- Fused kernel: `supergrok15_fused_step`
+A per-element GRU (Gated Recurrent Unit) then integrates the current
+expert-modified gradient with a temporal memory of previous steps. The GRU
+decides how much of the old memory to keep and how much new information to
+incorporate, giving the optimizer a sense of gradient history at each
+coordinate.
 
-### SuperGrok v1.1 (`supergrok11.py`)
+The transformed gradient is then used in standard Adam momentum and variance
+tracking, with decoupled weight decay. On top of this, SuperGrok v2
+periodically runs Sharpness-Aware Minimization (SAM): it perturbs the
+parameters in the gradient direction, computes the loss at the perturbed
+point, and measures the difference between the perturbed and original
+gradients. This difference quantifies loss landscape sharpness; the optimizer
+steers toward flatter regions that generalize better.
 
-v1.5 with cosine-similarity gating instead of sigmoid-on-accuracy.
-- Fused kernel: `supergrok11_fused_step`
-- Reduction: `cosine_gate_reduce_kernel`
+Every few steps, a bilevel optimization pass trains the meta-network itself
+using validation loss as the objective. This means the meta-network learns to
+produce gradient transformations that specifically improve generalization, not
+just training loss. The frequency of SAM and bilevel updates is controlled by
+sigmoid schedules tied to training accuracy: early in training (during
+memorization), these expensive operations are skipped; once accuracy rises
+toward the grokking transition, they activate.
 
-### GrokAdamW (`grokadamw.py`)
+Dead experts (those rarely selected by the router) are periodically recycled
+by cloning the weights of the best-performing expert, preventing capacity
+waste. Weight decay increases sigmoidally with accuracy, applying stronger
+regularization as the network begins to generalize.
 
-AdamW with EMA gradient filter and persistent-direction amplification.
-- State: `exp_avg`, `exp_avg_sq`, `ema`
-- Key hyperparams: lr=1e-3, alpha=0.98, lamb=5.0
-- Fused kernel: `grokadamw_fused_step`
-- Quantized variant: `_q3` kernel (INT8 + BF16 stochastic-rounded)
+Per-parameter state: gradient momentum, squared gradient average, update
+buffer, sharpness estimate, GRU hidden states, forward Mamba scan state,
+backward Mamba scan state (seven tensors total).
 
-### NeuralGrok (`neuralgrok.py`)
+### SuperGrok v1.5
 
-AdamW with learned MLP amplifier on |grad|.
-- Key hyperparams: alpha=10.0, beta=4.0, num_layers=3, hidden_dim=128
-- Fused kernel: `neuralgrok_fused_step`
+A simplified version of SuperGrok v2 that replaces the Mamba scan, PEER
+routing, and GRU with a small two-layer feedforward network (MLP). At each
+step, the MLP takes two inputs for each parameter element: the raw gradient
+and the current sharpness estimate. It outputs a correction term that is added
+to the gradient before the Adam update.
 
-### Prodigy (`prodigy.py`)
+The key simplification is that gradient transformation happens independently
+per element through the MLP, rather than through the spatially-aware scan and
+routing of v2. This makes the optimizer much cheaper to run while retaining
+the core idea of learned gradient modification.
 
-Self-tuning Adam. Estimates `d_lr` from cumulative parameter-space distance. Set lr=1.0.
-- State: `exp_avg`, `exp_avg_sq`, `s`, `param_init`
-- Fused kernel: `prodigy_fused_step`
-- Reduction: `prodigy_dlr_reduce_kernel`
+Like v2, it uses sigmoid-scheduled SAM perturbations and bilevel
+meta-learning to train the MLP on validation loss. An adaptive alpha
+parameter controls how much of the MLP correction to mix into the gradient;
+this alpha decreases over time, allowing the optimizer to rely more on raw
+gradients once the meta-network has done its work. Per-layer decay factors
+reduce the alpha exponentially across deeper layers.
 
-### Grokfast (`grokfast.py`)
+The amplified gradient stays entirely in GPU registers from the moment it is
+computed through the Adam update, avoiding unnecessary memory round-trips.
 
-Simplest grokking-aware AdamW. EMA + amplification.
-- State: `ema`, `exp_avg`, `exp_avg_sq`
-- Key hyperparams: grokfast_alpha=0.98, grokfast_lamb=2.0
-- Fused kernel: `grokfast_fused_ema_adam_step`
+Per-parameter state: gradient momentum, squared gradient average, update
+buffer, sharpness estimate (four tensors).
 
-### Lion (`lion.py`)
+### SuperGrok v1.1
 
-Sign-based Adam alternative (EvoLved Sign Momentum).
-- State: `exp_avg`
-- Key hyperparams: lr=3e-4, betas=(0.9, 0.99), weight_decay=3.0
-- Fused kernel: `lion_fused_step`
-- Python fallback: yes
+Nearly identical to SuperGrok v1.5 in structure and cost. The difference is
+in how it decides how much of the MLP correction to apply. Where v1.5 uses a
+global sigmoid gating function based on training accuracy, v1.1 uses
+per-parameter cosine similarity between the gradient direction and the
+momentum direction.
 
-### LookSAM (`looksam.py`)
+When the gradient and momentum point in similar directions (high cosine
+similarity), the optimizer trusts the gradient more and applies less MLP
+correction. When they diverge (low cosine similarity), the optimizer amplifies
+the MLP correction to steer the update. This gives v1.1 more granular,
+per-parameter control compared to v1.5's global accuracy-based gating.
 
-AdamW with periodic SAM (every k steps) instead of every-step SAM.
-- State: `exp_avg`, `exp_avg_sq`, `sam_direction`
-- Key hyperparams: rho=0.05, k=5, alpha=0.7
-- Python fallback: yes
+Everything else — the MLP architecture, SAM scheduling, bilevel training, and
+Adam base optimizer — is the same as v1.5.
 
-### Muon (`muon.py`)
+Per-parameter state: gradient momentum, squared gradient average, update
+buffer, sharpness estimate (four tensors).
 
-Dual optimizer. Newton-Schulz orthogonalization for 2D weights, AdamW for 1D.
-- State (2D): `momentum_buffer`; State (1D): `exp_avg`, `exp_avg_sq`
-- Key hyperparams: lr=0.02, momentum=0.95, ns_steps=5
-- Fused kernels: `muon_fused_step` (2D), `fused_adamw_simple_step` (1D)
-- Python fallback: yes
+### GrokAdamW
 
-### Mamba3PEERMetaNet (`mamba3_peer_metanet.py`)
+An extension of AdamW with an exponential moving average (EMA) gradient
+filter designed to accelerate the grokking transition. In addition to the
+standard Adam momentum and squared gradient buffers, GrokAdamW maintains a
+slow-moving average of each gradient element.
 
-Meta-net used internally by SuperGrok v2; not a standalone optimizer.
-Submodules: `Mamba3ScanBlock`, `MiniGRU`, PEER router, expert MLP pool.
+At each step, the EMA is updated with a high decay factor (typically 0.98),
+so it tracks persistent gradient directions while filtering out noise. The
+current gradient is then amplified by adding a scaled version of this EMA
+back into it. The amplification factor (lambda) controls how strongly
+persistent signals are boosted.
+
+The intuition is that during the memorization phase, gradients are noisy and
+inconsistent, so the EMA stays small and amplification has little effect.
+During the grokking transition, gradients begin pointing consistently toward
+the generalizing solution, the EMA accumulates this signal, and amplification
+accelerates convergence to the generalizing minimum.
+
+A quantized variant (Q3) stores the momentum buffer in INT8 with per-block
+scaling and uses stochastic rounding for BF16 state, reducing memory
+footprint by roughly half with minimal accuracy loss.
+
+Per-parameter state: gradient momentum, squared gradient average, gradient
+EMA (three tensors).
+
+### NeuralGrok
+
+Adam with a learned per-element gradient amplifier. NeuralGrok trains a
+separate small neural network (the "psi network") alongside the main model.
+This amplifier network is a two-layer MLP that takes the absolute value of
+each gradient element as input and outputs a multiplicative scaling factor.
+
+At each step, every gradient element is independently scaled by the
+amplifier's output before being used in the standard Adam update. The
+amplifier is trained with its own optimizer to learn which gradient magnitudes
+should be boosted and which should be dampened. The amplifier's output passes
+through an affine transformation controlled by two hyperparameters (alpha and
+beta) that set the overall scale and offset.
+
+The amplifier weights are stored in GPU constant memory for fast access and
+are cached across steps to avoid redundant transfers. The kernel supports CUDA
+Graph capture: once the shapes and hyperparameters are fixed, the entire
+amplifier-forward plus Adam-apply sequence is recorded as a graph and replayed
+without launch overhead.
+
+Per-parameter state: gradient momentum, squared gradient average (two tensors,
+plus the amplifier network weights stored separately).
+
+### Prodigy
+
+A self-tuning variant of Adam that automatically adjusts its learning rate
+without manual configuration. The recommended initial learning rate is 1.0
+because Prodigy internally manages the effective step size.
+
+The core idea is to estimate how far the parameters have traveled from their
+initial values and use that distance to calibrate the learning rate. Prodigy
+maintains a copy of the initial parameter values and a running trajectory
+estimate. At each step, it computes two global statistics across all
+parameters: a numerator (r) measuring alignment between gradients and the
+parameter trajectory, and a denominator (s) measuring the overall trajectory
+magnitude. The adaptive learning rate d is updated as the ratio of these two
+quantities.
+
+The entire d computation runs on-device without any GPU-to-CPU
+synchronization. A three-kernel orchestration handles this: the first kernel
+block-reduces the partial sums using warp shuffles and shared memory, the
+second kernel updates the d scalar on a single thread, and the third kernel
+applies the Adam step using the new d value read directly from device memory.
+
+Per-parameter state: gradient momentum, squared gradient average, trajectory
+estimate, initial parameter snapshot (four tensors).
+
+### Grokfast
+
+The simplest grokking-aware optimizer. Grokfast wraps standard AdamW with an
+exponential moving average filter that amplifies persistent gradient
+directions.
+
+Each step has two phases. First, the per-element gradient EMA is updated with
+a decay factor (alpha), smoothing out noise while accumulating consistent
+signals. Second, the current gradient is amplified by adding a scaled copy of
+the EMA (multiplied by lambda) to it. This amplified gradient then goes
+through normal AdamW: momentum averaging, second-moment tracking, adaptive
+per-element scaling, and decoupled weight decay.
+
+A fully-fused kernel variant performs both the EMA update and the Adam step in
+a single GPU pass, keeping the amplified gradient in registers throughout. On
+BF16 state, stochastic rounding prevents small EMA deltas from being
+truncated to zero and silently stalling the filter.
+
+Per-parameter state: gradient EMA, gradient momentum, squared gradient
+average (three tensors).
+
+### Lion
+
+A sign-based optimizer that uses only the direction, not the magnitude, of
+gradient information. Lion maintains a single momentum buffer per parameter
+(no squared gradient tracking, unlike Adam).
+
+At each step, Lion computes a weighted interpolation between the current
+gradient and the stored momentum. It then takes the element-wise sign of this
+interpolation — every element becomes exactly positive one or negative one.
+The parameter update uses this sign vector multiplied by the learning rate,
+giving every parameter element a uniform-magnitude update. Weight decay is
+applied separately before the sign step.
+
+After computing the update, Lion refreshes the momentum buffer with a
+different interpolation ratio (beta2 instead of beta1), creating an asymmetry
+between the "update direction" blend and the "stored momentum" blend.
+
+The sign-based approach provides implicit regularization because all updates
+have equal magnitude regardless of gradient scale. This means Lion is less
+sensitive to gradient magnitude outliers and typically works well with
+stronger weight decay. It also uses roughly half the memory of Adam since
+there is no second-moment buffer.
+
+Per-parameter state: momentum buffer (one tensor).
+
+### LookSAM
+
+AdamW enhanced with periodic Sharpness-Aware Minimization. Standard SAM
+requires two forward-backward passes per step, doubling training cost.
+LookSAM reduces this by performing the SAM computation only every k steps
+(default 5), using cached direction information for the steps in between.
+
+On a SAM step: the optimizer perturbs each parameter in the direction of its
+gradient (scaled by rho), computes the loss at the perturbed point, measures
+the gradient difference between the perturbed and original points, and stores
+this difference as the SAM direction. On non-SAM steps: the cached SAM
+direction is blended with the current gradient using interpolation factor
+alpha, steering the update toward flatter regions of the loss landscape
+without recomputing the perturbation.
+
+The perturbation, restoration, direction adjustment, and norm reduction are
+each separate kernels. The norm reduction uses Hopper's distributed shared
+memory for cross-CTA communication on sm_90, avoiding global memory
+round-trips.
+
+Per-parameter state: gradient momentum, squared gradient average, cached SAM
+direction (three tensors).
+
+### Muon
+
+A dual-strategy optimizer that uses different update rules for different
+parameter shapes. Two-dimensional weight matrices (the bulk of a neural
+network's parameters) are updated using momentum followed by Newton-Schulz
+orthogonalization, while one-dimensional parameters (biases, layer norm
+scales, embeddings) fall back to standard AdamW.
+
+For 2D weights: Muon maintains a momentum buffer and normalizes it by its
+Frobenius norm. It then runs several iterations (default 5) of Newton-Schulz
+refinement, which iteratively orthogonalizes the momentum matrix. Each
+iteration involves matrix multiplications (through CUTLASS on Hopper or
+cuBLAS/rocBLAS on other backends) that push the momentum toward the nearest
+orthogonal matrix. The orthogonalized update is then applied to the
+parameters with a trust-ratio scaling factor.
+
+The idea is that orthogonal weight updates preserve the conditioning of weight
+matrices throughout training, preventing the rank collapse and gradient
+vanishing that plague deep networks. The Newton-Schulz iterations converge
+rapidly (5 iterations is typically sufficient) and the matrix multiplications
+are efficiently handled by hardware GEMM units.
+
+Per-parameter state: momentum buffer for 2D weights; gradient momentum and
+squared gradient average for 1D parameters.
+
+### MoE-Aware SuperGrok2
+
+An extension of SuperGrok v2 specifically designed for Mixture-of-Experts
+models. In standard MoE training, most expert parameters receive zero
+gradients on any given step because the router only activates a small subset
+of experts per input. Running the full SuperGrok v2 meta-network on the entire
+parameter set wastes computation on the inactive experts.
+
+MoE-Aware SuperGrok2 solves this by compacting: it identifies which expert
+parameters received non-zero gradients (the active set), gathers only those
+into a dense buffer, runs the Mamba scan, PEER routing, and GRU on this
+smaller active set, then scatters the results back to the full parameter
+tensor. For top-2 routing with 64 experts, this means processing roughly
+three percent of expert parameters instead of one hundred percent.
+
+Additionally, it tracks per-expert activation counts and adjusts learning
+rates based on usage frequency. Rarely-activated experts receive higher
+learning rates to accelerate their training, while frequently-activated
+experts are dampened to prevent them from dominating. Dead experts (those
+that go unused for extended periods) are recycled by cloning the
+best-performing expert's weights.
+
+Per-parameter state: all seven SuperGrok v2 tensors, plus per-expert
+activation counts and learning rate scale factors.
 
 ---
 
@@ -898,56 +1074,6 @@ naturally pick up more work.
 Daemon HTTP on `--port`, serves JSON progress at `GET /`. ntfy.sh integration
 for push notifications on start, grok events, errors, and completion.
 
-### Sanity tests
-
-`tests/test_race_split.py` (10 sections): split arithmetic, disjointness,
-determinism, auto-override, EarlyStopper, TrainResult schema.
-
----
-
-## Algorithms
-
-### Affine2x2 Mamba encoding
-Mamba-3 recurrence encoded as 2×2 affine maps (6 floats per element).
-Associative → eligible for parallel prefix scan.
-
-### 12-FMA composition
-Inline PTX `affine_combine_ptx`: 8 FMAs for matrix product + 4 for bias = 12
-total, arranged in 3 waves of 4 for pipeline utilization. ~10 cycles.
-
-### Blelloch parallel prefix scan
-Two-phase: up-sweep combines pairs at doubling strides, down-sweep distributes
-exclusive prefixes. O(N) work, O(log N) depth.
-
-### Bilevel checkpointing
-Checkpoint every C-th scan state, recompute intermediates from nearest
-checkpoint. Memory savings ~(C-1)/C. Default C=1 (full save), tunable.
-
-### Register-resident smart_grad
-Amplified/orthogonalized gradient held in CUDA register, immediately consumed
-by Adam update in same kernel. ~50% bandwidth reduction.
-
-### Non-temporal I/O
-PTX `ld.global.nc` / `st.global.wt` (CUDA) or `__builtin_nontemporal_*` (HIP).
-Bypasses L2 for read-once optimizer state.
-
-### PTX hot-path intrinsics
-`ex2.approx` (1 cycle), `lg2.approx` (1 cycle), `rcp.approx` (1 cycle),
-`softplus_ptx` (2 cycles), `gru_gates_ptx` (interleaved sigmoid pair),
-`stochastic_round_ptx` (branchless). 1-2 ULP error.
-
-### Warp-shuffle reductions
-`__shfl_down_sync` butterfly (CUDA) or wave-reduction (HIP). Per-warp atomic
-to global accumulator. Avoids shared memory bottlenecks.
-
-### Product-key PEER routing
-Score N elements against E experts in O(√E). Split query into halves, top-K
-each against √E sub-keys, outer product candidates.
-
-### Cooperative shared-memory weight loading
-All threads load disjoint weight slices into shared memory, one
-`__syncthreads()`, then per-thread access at ~5 cycle latency.
-
 ---
 
 ## JAX/TPU
@@ -995,199 +1121,6 @@ so the module remains importable when the Pallas API drifts.
 
 ---
 
-## Tests
-
-Eleven files, ~3,400 LOC, ~100 test points.
-
-| File | Focus |
-|------|-------|
-| `test_supergrok2.py` | 27 sections covering scan, forward, bilevel, recycling, checkpointing, edge cases, memory, dispatch, quantization, distributed |
-| `test_matrix.py` | Cross-platform correctness (10 optimizers × 5 steps) |
-| `test_all_arches.py` | Dispatch sanity for sm_90, gfx942 |
-| `test_cross_arch_agreement.py` | Elementwise allclose across FORCE_ARCH (tolerance 1e-4) |
-| `test_cutlass_parity.py` | CUTLASS GEMM vs reference (sm_90 only, skipped without WITH_CUTLASS=1) |
-| `test_cpu_fallback.py` | Python fallback validation, import sanity |
-| `test_jax_matrix.py` | JAX optimizer correctness |
-| `test_amd_hip.py` | gfx942 paths, precision config, arch detection |
-| `test_new_features.py` | float4 vectorized, OverlappedOptimizer, compression, Pallas |
-| `test_training_aware.py` | Non-temporal I/O, Q3 states, stochastic rounding, pipelining |
-| `test_race_split.py` | Split arithmetic, disjointness, determinism, EarlyStopper |
-| `test_models_sm_90.py` | Smoke test that `_ops.models.{decoder,vit,mamba}_forward/backward` are registered (no kernel run) |
-
-Run: `pytest tests/`
-
----
-
-## Per-arch per-optimizer rundown
-
-For each optimizer, what each active arch does. Only sm_90, gfx942, and
-tpu_v5p are currently compiled; other arches will be added post-expansion.
-After Phases 1–6 every cell in the optimizer × arch and model × arch
-matrices above has a real implementation — see the
-[Build status](#build-status) tables.
-
-### SuperGrok v2
-
-**sm_90 (Hopper):** Canonical math + FP8 fast path for projection matmuls
-(gated behind dim ≥ 64 check). Warp-specialized scan kernels declared but
-unwired from canonical batched-step. CUTLASS sm_90a optional. 228 KB smem,
-~80 regs/thread.
-
-**gfx942 (CDNA3):** Canonical math + BF16 MFMA fast path. rocBLAS for
-matmuls. 64 KB LDS, ~64 vGPRs. MI300X 192 GB HBM.
-
-**tpu_v5p:** JAX-Pallas tiled scan for 128-lane MXU. BF16 throughout. XLA
-fusion handles softplus epilogue.
-
-### SuperGrok v1.5 / v1.1
-
-**sm_90:** Register-resident smart_grad in fused full-step kernel. Hopper FP8
-projection path available.
-
-**gfx942:** BF16 MFMA for the MLP meta-net forward. Wave-reduction for
-cosine gate (v1.1).
-
-**tpu_v5p:** Pure JAX functional implementation.
-
-### GrokAdamW
-
-**sm_90:** Fused step + vec4 variant + Q3 quantized variant (INT8/BF16).
-
-**gfx942:** Same math, BF16 accumulation for EMA filter.
-
-**tpu_v5p:** JAX implementation in `simple_optimizers_jax.py`.
-
-### Muon
-
-**sm_90:** Newton-Schulz with CUTLASS mm (optional) or cuBLAS. FP8 scale
-helper for spectral normalization. `neg_lr_scale = -lr * 0.2 * sqrt(max_dim)`.
-
-**gfx942:** rocBLAS for matmuls. BF16 MFMA available for the NS combine step.
-
-**tpu_v5p:** JAX orthogonalization via `jnp.linalg` + custom NS iteration.
-
-### Lion / Grokfast / LookSAM / Prodigy / NeuralGrok
-
-All follow the same pattern: fused element-wise kernel on sm_90 and gfx942,
-JAX functional on tpu_v5p. Arch-specific divergence is minimal (vec4
-vectorization on CUDA, wave-width adaptation on HIP).
-
----
-
-## Quick reference
-
-### Optimizer feature matrix
-
-| Optimizer | Meta-net | State tensors | SAM | Bilevel | Fused kernel | Fallback |
-|-----------|----------|---------------|-----|---------|--------------|----------|
-| SuperGrok2 | Mamba3+PEER+GRU | 7 | ✓ | ✓ | ✓ | ✓ full |
-| SuperGrok15 | MLP 2-layer | 4 | ✓ | ✓ | ✓ | ✗ |
-| SuperGrok11 | MLP + cosine gate | 4 | ✓ | ✓ | ✓ | ✗ |
-| GrokAdamW | EMA filter | 3 | ✗ | ✗ | ✓ | ✗ |
-| NeuralGrok | Learned MLP | 2 | ✗ | ✗ | ✓ | ✗ |
-| Prodigy | distance-aware | 4+init | ✗ | ✗ | ✓ | ✗ |
-| Grokfast | EMA amplify | 3 | ✗ | ✗ | ✓ | ✗ |
-| Lion | momentum | 1 | ✗ | ✗ | ✓ | ✓ |
-| LookSAM | periodic SAM | 3 | ✓ | ✗ | ✓ | ✓ |
-| Muon | NS ortho 2D | 1-3 | ✗ | ✗ | ✓ | ✓ |
-
-### Compile-time constants (csrc/common/types.h)
-
-| Constant | Value | Purpose |
-|----------|-------|---------|
-| `MAX_D_STATE` | 128 | Scan state dim cap |
-| `MAX_D_INNER` | 128 | Mamba inner dim cap |
-| `MAX_D_MODEL` | 64 | Projection dim cap |
-| `MAX_GRU_HIDDEN` | 8 | GRU hidden cap |
-| `MAX_EXPERT_HIDDEN` | 16 | Expert MLP cap |
-| `PSCAN_BLOCK` | 512 | Blelloch threads/block |
-| `PSCAN_THRESHOLD` | 256 | Sequential vs parallel scan switch |
-
-### Architecture policy
-
-No-fallback. `detect_arch()` returns 90, 942, or "tpu_v5p" or raises
-`UnsupportedArchError`. No tier walking. Missing arch = build failure or
-runtime error.
-
-### Precision auto-selection chain
-
-nvfp4 → mxfp4 → fp8 → bf16 → fp32
-
----
-
-## Engineering work remaining
-
-### Active (3-arch set)
-
-**1. Optimizer device headers — DONE for the 3-arch active set.** All 11
-optimizers have real per-arch implementations under
-`csrc/device/optimizers/{sm_90,gfx942,tpu_v5p}/`. Phase 4 closed the
-gfx942 row; Phase 5 closed tpu_v5p.
-
-**2. Model device headers — DONE for the 3-arch active set.** Decoder
-Transformer, ViT, and Mamba forward + backward templates exist for all
-three arches. Phase 3 closed sm_90; Phase 5 closed tpu_v5p (the v5p
-device-template files now re-export from
-`csrc/kernels/tpu/_pallas_models.py`).
-
-**3. Compile-time instantiation of 99 fused TUs.** Verify build, link, and
-numerical parity against the separate-kernel path.
-
-**4. Hopper warp-specialized scan activation.** The
-`launch_scan_warp_specialized` and `_d16` declarations in sm_90 are unwired.
-Expected ~1.5× on H100/H200 for long-segment workloads.
-
-**5. Real autotune output for tuned_configs.h.** Run `build.sh --autotune` on
-hardware to populate launch-config winners.
-
-**6. Fused softplus epilogue in CUTLASS for SG2 dt_proj.** CUTLASS 3.x
-EpilogueOp can fuse `softplus(x + bias)` into the GEMM tail.
-
-**7. DSMEM for cross-CTA reductions on Hopper.** Norm reductions (LookSAM,
-GrokAdamW, Prodigy, SG1.5/1.1) currently round-trip through global memory.
-
-**8. CI matrix.** Configure runner for {sm_90, gfx942} × {test_*.py} matrix
-via FORCE_ARCH.
-
-**9. PyPI wheel.** From `--package-tarball` to `auditwheel`-compatible wheel.
-
-### Future arch expansion (deferred to post-winner)
-
-**A. NVFP4 path for sm_103.** Block-scaling factor calibration for Blackwell
-Ultra projections.
-
-**B. sm_120 retuned tile sizes.** Consumer Blackwell has 128 KB smem vs 228 KB;
-placeholder configs will under-occupy.
-
-**C. CDNA4 FP4/FP6/2:4 sparsity.** Native FP4 MFMA, FP6 state packing,
-structured sparsity on gfx950.
-
-**D. Per-feature gfx950 file split refinement.** ODR-safe helpers via
-non-template `.cpp` with explicit extern declarations.
-
-**E. Quantization device-template variants.** Will multiply kernel count when
-added to the fused instantiation matrix.
-
----
-
-## Contributing
-
-To add a new fused kernel:
-
-1. Write the device-function template under
-   `csrc/device/optimizers/<arch>/<optimizer>_<arch>.cuh` (or model equivalent).
-2. Create the fused TU under `csrc/fused/<arch>/fused_<model>_<optimizer>_<arch>.cu`
-   that includes both model and optimizer headers.
-3. Register the fused kernel in `grokking_optimizers/fused_dispatch.py` via
-   `@register_fused(model, optimizer, arch)`.
-4. Run `pytest tests/test_cross_arch_agreement.py` to verify numerical parity.
-
----
-
 ## License
 
 MIT License. See `LICENSE`.
-
-Acknowledgements:
-- JAX and Pallas teams at Google for TPU primitives.
-- NVIDIA CUTLASS team for the GEMM template library (enabled with `WITH_CUTLASS=1`).
