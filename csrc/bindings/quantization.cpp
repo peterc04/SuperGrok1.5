@@ -4,7 +4,7 @@
 // formats were removed in the post-refactor cleanup (3-arch active set
 // has no Blackwell / CDNA4 hardware).
 
-#include "_dispatch_macro.h"
+#include "helpers.h"
 
 namespace sg {
 

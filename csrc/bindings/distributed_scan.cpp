@@ -6,7 +6,7 @@
 // 3. apply per-GPU prefix correction to local output
 // Backward variants follow the same shape.
 
-#include "_dispatch_macro.h"
+#include "helpers.h"
 
 namespace sg {
 

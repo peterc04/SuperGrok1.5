@@ -6,7 +6,7 @@
 // else. No fallback. TPU arch is handled in Python via JAX.
 // =====================================================================
 
-#include "bindings.h"
+#include "helpers.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -102,10 +102,11 @@ int detect_arch() {
 }
 
 // =====================================================================
-// fused_step — routes (model, optimizer, arch) triples to fused TUs
+// fused_step — placeholder for future fused (model, optimizer, arch) TUs
 //
-// All 99 combinations (3 models x 11 optimizers x 3 arches) are stubs
-// until the fused kernels are compiled. TPU arch is dispatched in Python.
+// The csrc/fused/ stub directory was removed; this function exists only
+// to keep the pybind11 surface stable for callers that probed for it.
+// Re-implementing it requires landing real fused TUs first.
 // =====================================================================
 
 void fused_step(const std::string& model, const std::string& optimizer,

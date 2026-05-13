@@ -102,26 +102,10 @@ def _collect(globs):
 
 
 COMMON_BINDINGS = [
+    "csrc/bindings/bindings.cpp",
     "csrc/bindings/dispatch.cpp",
-    "csrc/bindings/grokadamw.cpp",
-    "csrc/bindings/grokfast.cpp",
-    "csrc/bindings/lion.cpp",
-    "csrc/bindings/looksam.cpp",
-    "csrc/bindings/moe.cpp",
-    "csrc/bindings/multi_tensor.cpp",
-    "csrc/bindings/muon.cpp",
-    "csrc/bindings/neuralgrok.cpp",
-    "csrc/bindings/prodigy.cpp",
-    "csrc/bindings/quantization.cpp",
-    "csrc/bindings/supergrok11.cpp",
-    "csrc/bindings/supergrok15.cpp",
-    "csrc/bindings/supergrok2.cpp",
     "csrc/bindings/distributed_scan.cpp",
-    "csrc/bindings/models_decoder.cpp",
-    "csrc/bindings/models_vit.cpp",
-    "csrc/bindings/models_mamba.cpp",
-    "csrc/bindings/models_module.cpp",
-    "csrc/bindings/module.cpp",
+    "csrc/bindings/quantization.cpp",
 ]
 
 if _has_gpu and _is_hip:

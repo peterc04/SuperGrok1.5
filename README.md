@@ -586,15 +586,24 @@ Each launch file:
 
 ### Bindings (`csrc/bindings/`)
 
-Pybind11 entry points that connect Python to the C++ launchers:
+Pybind11 entry points that connect Python to the C++ launchers. Five
+files:
 
-- **bindings.cpp** (formerly `module.cpp`) — pybind11 module entry
-- **dispatch.cpp** — arch detection + `fused_step` router
-- **helpers.h** (formerly `_helpers.h`) — gradient clipping + SAM norm
+- **bindings.cpp** — all per-optimizer dispatchers (forward declarations
+  + vector-signature entry points) plus the single `PYBIND11_MODULE(_ops, m)`
+  registration block. Sections inside this file preserve the original
+  per-file boundaries with `// ─── csrc/bindings/<filename>.cpp ───` markers
+  so the diff against the pre-consolidation layout stays legible.
+- **dispatch.cpp** — `int sg::detect_arch()` (CUDA/HIP probes + FORCE_ARCH
+  env var) and the `fused_step` placeholder.
+- **distributed_scan.cpp** — the three-phase multi-GPU Mamba-3 scan dispatch.
+- **quantization.cpp** — FP8 / INT8 / INT4 quantize launchers.
+- **helpers.h** — `SG_DISPATCH` macro, the `sg::detect_arch()` forward decl,
+  and the device-side gradient norm helpers.
 
-Per-optimizer dispatcher .cpp files in `csrc/bindings/` filter undefined
-gradients, pack tensors into vectors, and call `SG_DISPATCH(launcher, ...)`
-which picks the right backend at runtime.
+Each dispatcher inside `bindings.cpp` filters undefined gradients, packs
+tensors into vectors, and calls `SG_DISPATCH(launcher, ...)` which picks
+the right backend at runtime.
 
 ---
 
