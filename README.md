@@ -276,6 +276,38 @@ Per-parameter state: gradient momentum, squared gradient average, update
 buffer, sharpness estimate, GRU hidden states, forward Mamba scan state,
 backward Mamba scan state (seven tensors total).
 
+**Compute pattern.** Mixed — the most varied of the optimizers. Per parameter
+(length N): argsort by |g| (O(N log N) sort), input projection ([N, 2] @ [2, d_model]
+= [N, d_model] GEMM), bidirectional Mamba-3 scan (N sequential timesteps,
+each timestep is a per-element FMA + RoPE rotation across d_inner × d_state
+state pairs), out_proj GEMM ([N, d_inner] @ [d_inner, d_model]), unsort
+(O(N) gather), PEER routing (num_heads × topk² candidate evaluations, each
+a small expert MLP), per-element GRU step, AdamW. Bilevel backward is
+saved-activations + adjoint scan + meta-net backward through autograd.
+
+**Dependency chain.** The scan is the serial bottleneck: each timestep
+depends on the previous (no parallelism across t without Blelloch). PEER
+routing and the GRU step are fully parallel across N once the scan finishes.
+The bidirectional scans (forward + backward over t) are independent of
+each other — they can run on different streams in principle. AdamW
+trails everything; depends on the smart_grad output of PEER+GRU.
+
+**State.** Per-element: param, grad, sharpness, exp_avg, exp_avg_sq, mu,
+gru_state (size gru_hidden ≈ 8). Per-tensor: mamba_fwd_state and
+mamba_bwd_state (one [d_inner, d_state] matrix per param). Per-step:
+bc1, bc2, alpha_mu, lamb_eff, ramp, gate_signal (scalars). Meta-net
+weights (in_proj, dt_proj, B/C_proj, A_log, D, rope_freq, out_proj, GRU
+linears, expert MLPs, product keys) are shared across all params for the
+whole training run.
+
+**Precision.** FP32 accumulators throughout (scan state h, GRU state,
+Adam moments). Projection GEMMs accept BF16 input with FP32 accumulate
+(MFMA-friendly on CDNA3, WGMMA-friendly on Hopper). The sort, RoPE
+rotation, and PEER softmax stay in FP32 — quantizing them risks losing
+the top-k selection. INT8/INT4 quantization is supported for the expert
+MLP weights and param storage (with stochastic rounding on the
+quantization step).
+
 ### SuperGrok v1.5
 
 A simplified version of SuperGrok v2 that replaces the Mamba scan, PEER
@@ -301,6 +333,27 @@ computed through the Adam update, avoiding unnecessary memory round-trips.
 Per-parameter state: gradient momentum, squared gradient average, update
 buffer, sharpness estimate (four tensors).
 
+**Compute pattern.** Mixed — small per-element MLP + AdamW. Per element:
+2-input → meta_hidden → 1-output MLP (two GEMMs of size [N, 2] @ [2, H]
+and [N, H] @ [H, 1] when batched across N), sigmoid gate on training
+accuracy (scalar, host-side), then AdamW per element. No scan, no sort.
+
+**Dependency chain.** MLP layer 2 depends on layer 1's ReLU output.
+Otherwise all parameters are independent — fully embarrassingly parallel
+across elements within one tensor and across tensors. The bilevel
+meta-update runs autograd through the MLP at validation time; that
+dependency chain is meta-net-internal and doesn't pin params.
+
+**State.** Per-element: param, grad, sharpness, exp_avg, exp_avg_sq.
+Per-tensor: none. Per-step: bc1, bc2, alpha (after sigmoid gate),
+lamb_eff, lr, wd_eff (scalars). Meta-net weights (W1, b1, W2, b2,
+rescale) are shared across all params and updated only on bilevel steps.
+
+**Precision.** FP32 for the Adam accumulators (m, v) and the MLP hidden
+activations. The MLP forward can run BF16 with FP32 accumulate (MFMA
+applies when batched across N ≥ 16). Sharpness estimate can be BF16
+since it's only used as MLP input, not as a precise reduction target.
+
 ### SuperGrok v1.1
 
 Nearly identical to SuperGrok v1.5 in structure and cost. The difference is
@@ -317,6 +370,26 @@ per-parameter control compared to v1.5's global accuracy-based gating.
 
 Per-parameter state: gradient momentum, squared gradient average, update
 buffer, sharpness estimate (four tensors).
+
+**Compute pattern.** Mixed — identical shape to SuperGrok v1.5 (per-element
+MLP + AdamW) plus three per-tensor reductions for the cosine gate:
+sum(g·m), sum(g²), sum(m²). The cosine = num / sqrt(den_g * den_m) is
+computed once per parameter tensor, then broadcast to the per-element
+update.
+
+**Dependency chain.** The cosine reduction is a barrier: every element's
+update depends on the per-tensor scalar. After the reduction, all
+elements are independent. Across tensors: independent. The MLP forward
+runs in parallel with the cosine reduction once the gradient is known.
+
+**State.** Per-element: param, grad, sharpness, momentum (mu), exp_avg,
+exp_avg_sq. Per-tensor: cosine gate scalar (one FP32 per tensor, scratch).
+Per-step: bc1, bc2, alpha (meta-net scale), lamb_eff. Meta-net weights
+shared across all params.
+
+**Precision.** Same as v1.5 — FP32 accumulators, BF16 MLP input/output
+with FP32 accumulate (MFMA-amenable). The cosine reduction wants FP32
+to avoid catastrophic cancellation when g and m have similar magnitude.
 
 ### GrokAdamW
 
@@ -340,6 +413,26 @@ accelerates convergence to the generalizing minimum.
 Per-parameter state: gradient momentum, squared gradient average, gradient
 EMA (three tensors).
 
+**Compute pattern.** Pure elementwise. Per element:
+  ema = alpha * ema + (1-alpha) * g
+  g_amp = g + lamb * ema
+  m = beta1 * m + (1-beta1) * g_amp
+  v = beta2 * v + (1-beta2) * g_amp²
+  p -= lr * (m/bc1 / (sqrt(v/bc2) + eps) + wd * p)
+No reduction, no GEMM. Bandwidth-bound (~10 mem ops per element).
+
+**Dependency chain.** EMA update → g_amp computation → Adam (m, v) update
+→ param update. All sequential WITHIN an element but fully parallel
+ACROSS elements. Across tensors: independent.
+
+**State.** Per-element: param, grad, ema, exp_avg, exp_avg_sq. Per-tensor:
+none. Per-step: alpha, lamb, bc1, bc2, beta1, beta2, lr, wd, eps (scalars).
+
+**Precision.** FP32 accumulators (ema, exp_avg, exp_avg_sq). Params can
+live in BF16 with stochastic rounding on writeback. The ema needs FP32
+to avoid drift over the long persistence horizon (alpha=0.98 → effective
+window of ≈ 50 steps).
+
 ### NeuralGrok
 
 Adam with a learned per-element gradient amplifier. NeuralGrok trains a
@@ -360,6 +453,26 @@ without launch overhead.
 
 Per-parameter state: gradient momentum, squared gradient average (two tensors,
 plus the amplifier network weights stored separately).
+
+**Compute pattern.** Mixed — per-element MLP + AdamW. Per element:
+  h = relu(W1 * |g| + b1)         — 1×1 @ 1×H elementwise broadcast (no MFMA win on layer 1)
+  s = sum(W2 * h + b2)            — 1×H @ H×1 reduce-along-H
+  g_amp = (alpha * s + beta) * g
+  AdamW on g_amp.
+
+**Dependency chain.** MLP layer 2 depends on layer 1's ReLU output. The
+multiplicative scaling `g_amp = (alpha*s + beta) * g` is the join point.
+Then AdamW. Within an element, the chain is fully sequential; across
+elements, fully parallel.
+
+**State.** Per-element: param, grad, exp_avg, exp_avg_sq. Per-tensor: none.
+Per-step: amplifier weights (W1, b1, W2, b2 — shared across all params),
+alpha, beta, hidden_dim, bc1, bc2, beta1, beta2, lr, wd, eps.
+
+**Precision.** FP32 accumulators (m, v). Amplifier MLP forward can run
+BF16 with FP32 accumulate; layer 2 is the MFMA-amenable contraction
+(across the hidden dim H ≥ 16 — but we batch it across N for the MFMA
+win to materialize).
 
 ### Prodigy
 
@@ -385,6 +498,29 @@ applies the Adam step using the new d value read directly from device memory.
 Per-parameter state: gradient momentum, squared gradient average, trajectory
 estimate, initial parameter snapshot (four tensors).
 
+**Compute pattern.** Mixed — elementwise + two global reductions. Per element:
+  r_local += g * (p_init - p) * d            — 1 sub, 2 muls
+  s_local += d² * g                          — 1 mul
+  trajectory accumulator update              — elementwise
+  AdamW with `d` as the effective lr scale.
+Then GLOBAL reduce: r_global = sum(r_local) across all elements + tensors;
+s_global = sum(s_local). d_new = max(d_prev, r_global / |s_global|).
+
+**Dependency chain.** The d update is a barrier — every element's update
+depends on the global scalars r_global and s_global. So: per-element
+partial-reduce → cross-block reduce → d update → per-element AdamW
+(now using the updated d). Three-kernel orchestration on the Hopper side
+to avoid host syncs.
+
+**State.** Per-element: param, grad, exp_avg, exp_avg_sq, s_track, param_init.
+Per-tensor: none (the reductions go straight to global scalars).
+Per-step: r_global, s_global, d (three scalars carried across steps).
+
+**Precision.** FP32 EVERYWHERE — the reductions must be FP32 because (a)
+they accumulate across millions of elements (catastrophic cancellation in
+BF16 is real here), and (b) the d update is a divide r/s which amplifies
+any per-step noise. Param can be BF16 with FP32 accumulators.
+
 ### Grokfast
 
 The simplest grokking-aware optimizer. Grokfast wraps standard AdamW with an
@@ -403,6 +539,21 @@ a single GPU pass, keeping the amplified gradient in registers throughout.
 
 Per-parameter state: gradient EMA, gradient momentum, squared gradient
 average (three tensors).
+
+**Compute pattern.** Pure elementwise. Structurally identical to GrokAdamW
+(EMA filter → amplify → AdamW). Per element: ~10 mem ops, 8-10 FMAs. No
+reduction, no GEMM. Bandwidth-bound.
+
+**Dependency chain.** EMA update → amplify → Adam apply, sequential within
+an element, fully parallel across elements. Across tensors: independent.
+
+**State.** Per-element: param, grad, ema, exp_avg, exp_avg_sq. Per-tensor:
+none. Per-step: grokfast_alpha, grokfast_lamb, bc1, bc2, beta1, beta2,
+lr, wd, eps (scalars).
+
+**Precision.** FP32 for the EMA (long-window accumulator), Adam moments,
+and amplification computation. Param storage can be BF16 with stochastic
+rounding.
 
 ### Lion
 
@@ -429,6 +580,24 @@ no second-moment buffer.
 
 Per-parameter state: momentum buffer (one tensor).
 
+**Compute pattern.** Pure elementwise. Each parameter element reads its
+gradient + momentum, writes the new momentum and the new param. No
+reduction, no GEMM.
+
+**Dependency chain.** Update = sign(β₁·m + (1-β₁)·g) — fully parallel
+across elements within one tensor. Momentum update m ← β₂·m + (1-β₂)·g
+happens after the param update and is also fully parallel. Between
+tensors: independent. No cross-step dependencies inside a single
+`step()` call.
+
+**State.** Per-element: momentum buffer (one tensor), parameter (one tensor).
+Per-tensor: none. Per-step: lr, β₁, β₂, weight_decay (4 scalars).
+
+**Precision.** Momentum can live in BF16 with FP32 accumulation during the
+β-blend; the sign() collapses magnitude so output precision is irrelevant.
+Param update is FP32-accumulate, can store back to BF16 params with
+stochastic rounding.
+
 ### LookSAM
 
 AdamW enhanced with periodic Sharpness-Aware Minimization. Standard SAM
@@ -452,6 +621,27 @@ round-trips.
 Per-parameter state: gradient momentum, squared gradient average, cached SAM
 direction (three tensors).
 
+**Compute pattern.** Mixed — four sequential phases on a SAM step:
+  (1) perturb: p_pert = p + rho * g / ||g||                 — needs ||g|| reduce
+  (2) loss + grad at perturbed point (model forward+backward; external)
+  (3) restore + set_direction: sam_dir = g_sam - g           — elementwise
+  (4) AdamW with g_adj = (1-alpha)*g + alpha*sam_dir         — elementwise
+On non-SAM steps: just (4) using the cached sam_dir from the last SAM step.
+
+**Dependency chain.** ||g|| computation is a global reduction (single
+FP32 scalar per parameter tensor). Steps 1-3 must serialize against the
+model-level forward+backward in between. Step 4 is fully parallel across
+elements. The "k-step cache" trades a 2× cost on SAM steps for k-1
+SAM-free steps that reuse sam_dir.
+
+**State.** Per-element: param, grad, sam_dir, exp_avg, exp_avg_sq.
+Per-tensor: ||g|| (during perturb), backup of param (during perturb+restore).
+Per-step: rho, k, alpha (interp weight), bc1, bc2, lr, wd, eps.
+
+**Precision.** FP32 for ||g|| reduce (avoid underflow on tiny grads).
+FP32 for Adam moments. SAM direction can be BF16 since it's a unit-norm
+direction (magnitude info is in the alpha multiplier).
+
 ### Muon
 
 A dual-strategy optimizer that uses different update rules for different
@@ -474,6 +664,35 @@ vanishing that plague deep networks.
 
 Per-parameter state: momentum buffer for 2D weights; gradient momentum and
 squared gradient average for 1D parameters.
+
+**Compute pattern.** Mixed and GEMM-heavy on 2D params. Per 2D weight
+matrix (shape [rows, cols], typically 96×96 to 1024×1024 for grokking
+models):
+  buf = momentum * buf + grad                       — elementwise
+  inv_norm = 1 / ||buf||_F                          — global reduction
+  X = buf * inv_norm                                — elementwise broadcast
+  for step in {0..4}:
+    A   = X @ X.T                                   — GEMM [rows, cols] · [cols, rows]
+    AX  = A @ X                                     — GEMM [rows, rows] · [rows, cols]
+    AAX = A @ AX                                    — GEMM [rows, rows] · [rows, cols]
+    X   = 3.4445*X - 4.7750*AX + 2.0315*AAX         — elementwise FMA
+  p = (1-lr*wd) * p - lr * scale * X                — elementwise
+1D params: standard AdamW (see below).
+
+**Dependency chain.** The Newton-Schulz iteration is serial: each iter
+depends on the previous X. WITHIN each iter, AX waits on A, and AAX
+waits on AX (three serial GEMMs per iter). 5 iters × 3 GEMMs = 15
+sequential GEMMs per 2D param per step. Across 2D params: independent.
+1D params can run AdamW in parallel with the NS iterations.
+
+**State.** Per 2D param: momentum buffer + 3 scratch matrices (A, AX, AAX,
+each [rows, rows] or [rows, cols]). The scratch can be reused across NS
+iters. Per 1D param: exp_avg, exp_avg_sq.
+
+**Precision.** Newton-Schulz GEMMs use BF16 inputs with FP32 accumulate
+(WGMMA on Hopper, MFMA on CDNA3). The Frobenius norm needs FP32 accum.
+Trust-ratio scale `scale_factor = 0.2 * sqrt(max(rows, cols))` is a
+scalar, FP32. Param update: FP32 internally, can write back BF16.
 
 ### MoE/Adam multi-tensor
 
@@ -505,6 +724,29 @@ Auxiliary features carried alongside the compaction:
   `moe_scatter_results`) live in `csrc/algorithms/supergrok2.h` (the
   former `moe_adam.h` was folded in alongside the MoE variant) plus
   the per-arch launchers folded into `launch_supergrok2.{cu,hip.cpp,py}`.
+
+**Compute pattern.** Mixed — preprocessing reductions + scatter + then the
+full SG2 step (see SuperGrok v2 compute pattern). Preprocessing:
+  expert_counts[e] = sum_{N_gate} (gate_logits[n, e] > threshold)   — count reduce
+  load_balance_loss = SUM_e (count_e * P_e * num_experts)            — scalar reduction
+  per-expert lr_scale[e] = sigmoid(EMA(activation_freq[e]))          — elementwise
+Then compaction: for each parameter tensor, gather active expert params into
+a dense buffer (filtered scatter), run SG2 scan + GRU on the smaller set,
+scatter results back to full-tensor positions.
+
+**Dependency chain.** expert_counts must finish before lr_scale update.
+Compaction needs param_to_expert mapping (static, provided by the model).
+The compacted SG2 step has the same internal dependency chain as SG2.
+Scatter-back depends on the compacted output. Across expert tensors:
+independent if the gather/scatter operates per-param.
+
+**State.** Same as SG2 per-param, plus per-expert _expert_counts (int32)
+and _lr_scale (FP32), both of length num_experts. Compaction scratch
+buffers (compact_params, compact_grads, compact_state_m/v, scatter_indices,
+compact_count) are allocated per-step.
+
+**Precision.** Same as SG2. expert_counts is int32 (atomic-add safe).
+Load-balance loss is FP32. lr_scale is FP32 with sigmoid smoothing.
 
 ---
 
