@@ -21,7 +21,27 @@ The build targets a **3-arch active set**:
 | `tpu_v5p` | TPU v5p | 128-wide MXU | JAX/Pallas |
 
 Anything else raises `UnsupportedArchError`. There is no tier fallback chain
-and no future-arch scaffolding — the active set is the only set.
+for production runs — the active set is the only compiled set.
+
+### Future arches (scaffolded in dispatch, not compiled)
+
+These arches are recognized by `grokking_optimizers.dispatch.detect_arch`
+and will route to a `NotImplementedError` with a descriptive message
+until the corresponding kernels are added. They are not part of the
+current build matrix.
+
+| Arch    | Family               | Cards                          | Status   |
+|---------|----------------------|--------------------------------|----------|
+| sm_80   | Ampere               | A100, A30, A10                 | future   |
+| sm_89   | Ada Lovelace         | RTX 40, L40, L40S              | future   |
+| sm_100  | Datacenter Blackwell | B100, B200, GB200              | future   |
+| sm_103  | Blackwell Ultra      | B300, GB300 NVL72              | future   |
+| sm_120  | Consumer Blackwell   | RTX 50, RTX PRO 6000           | future   |
+| gfx950  | CDNA4                | MI350X, MI355X                 | future   |
+| tpu_v6e | TPU v6e              | 256-wide MXU                   | future   |
+
+The active set narrowed to sm_90 + gfx942 + tpu_v5p during refactor to
+focus on what's runnable now; future arches return when kernels are added.
 
 ---
 
