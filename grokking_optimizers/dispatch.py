@@ -227,29 +227,71 @@ def assert_supported_arch() -> Union[int, str]:
 
 # ----------------------------------------------------------------------
 # C++ extension loader (consolidated from _ops_loader.py).
-# Loads the per-arch specialized C++ extension. Raises RuntimeError if
-# the extension is not built — there is no Python fallback path.
+# Loads the per-arch specialized C++ extension. Raises on first kernel
+# attribute access if the extension isn't built — there is no Python
+# fallback path, but `import grokking_optimizers` succeeds either way so
+# that profiling / tooling code can introspect the package without a
+# working build.
 # ----------------------------------------------------------------------
 
-_cached_ops = None
+
+class _LazyOps:
+    """Lazy proxy for the compiled `grokking_optimizers._ops` extension.
+
+    Resolves on first attribute access. `hasattr(_ops, "foo")` correctly
+    returns False when the extension isn't built; direct attribute access
+    raises AttributeError with a descriptive build hint. This preserves the
+    no-fallback contract (kernels are unreachable without a build) while
+    allowing import-time introspection.
+    """
+    __slots__ = ("_real", "_error")
+
+    def __init__(self):
+        object.__setattr__(self, "_real", None)
+        object.__setattr__(self, "_error", None)
+
+    def _resolve(self):
+        if self._real is not None:
+            return self._real
+        if self._error is not None:
+            return None  # cached failure
+        try:
+            import importlib
+            real = importlib.import_module("grokking_optimizers._ops")
+            object.__setattr__(self, "_real", real)
+            return real
+        except ImportError as e:
+            object.__setattr__(self, "_error", e)
+            return None
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        real = self._resolve()
+        if real is None:
+            raise AttributeError(
+                f"grokking_optimizers._ops.{name}: C++ extension not built. "
+                f"Run `pip install -e .` (supported arches: {SUPPORTED_ARCHES}). "
+                f"Original ImportError: {self._error}"
+            )
+        return getattr(real, name)
+
+    def __bool__(self):
+        return self._resolve() is not None
+
+    def __repr__(self):
+        real = self._resolve()
+        if real is None:
+            return f"<_LazyOps unbuilt: {self._error}>"
+        return f"<_LazyOps wrapping {real!r}>"
+
+
+_cached_ops = _LazyOps()
 
 
 def get_ops():
-    """Return the compiled _ops extension module, or raise."""
-    global _cached_ops
-    if _cached_ops is not None:
-        return _cached_ops
-    try:
-        from grokking_optimizers import _ops
-        _cached_ops = _ops
-        return _ops
-    except ImportError as e:
-        raise RuntimeError(
-            "SuperGrok C++ extension not built. "
-            "Run: pip install -e . "
-            f"Supported arches: {SUPPORTED_ARCHES}. "
-            f"Original error: {e}"
-        ) from e
+    """Return the lazy `_ops` proxy. Never raises at call time."""
+    return _cached_ops
 
 
 # ----------------------------------------------------------------------

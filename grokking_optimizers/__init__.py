@@ -31,21 +31,15 @@ import torch  # noqa: F401 — load libc10.so first
 from grokking_optimizers.dispatch import get_ops, detect_arch, UnsupportedArchError
 
 
-_HAS_OPS = True
+_ops = get_ops()
+_HAS_OPS = bool(_ops)
+_HAS_CUDA = hasattr(_ops, "supergrok2_mamba_peer_batched_step") or \
+            hasattr(_ops, "sg15_fused_step")
+_HAS_CPU_OPS = hasattr(_ops, "supergrok2_cpu_step")
 
 
 def _get_ops():
     return get_ops()
-
-
-try:
-    _ops = get_ops()
-    _HAS_CUDA = hasattr(_ops, "supergrok2_mamba_peer_batched_step") or \
-                hasattr(_ops, "sg15_fused_step")
-    _HAS_CPU_OPS = hasattr(_ops, "supergrok2_cpu_step")
-except RuntimeError:
-    _HAS_CUDA = False
-    _HAS_CPU_OPS = False
 
 
 # --------------------------------------------------------------------------
