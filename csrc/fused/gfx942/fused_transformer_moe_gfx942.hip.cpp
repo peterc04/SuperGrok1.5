@@ -1,10 +1,25 @@
-// Fused (model, optimizer, arch) instantiation: transformer + moe on gfx942.
+// Fused (transformer + moe) instantiation for gfx942 (HIP / CDNA3).
+//
+// This TU is the compile-time fusion point that wires the model forward/
+// backward kernel with the optimizer launch glue. The actual kernel
+// implementations live in:
+//   csrc/algorithms/moe_adam.h                            — optimizer math spec
+//   csrc/models/decoder.h                                 — model contract
+//   csrc/backends/hip/gfx942/launch_moe_adam.hip.cpp      — optimizer launchers
+//   csrc/backends/hip/gfx942/models/decoder.hip.cpp       — model kernels
+//   csrc/backends/hip/gfx942/primitives.hpp             — vendor primitives
+//
+// Note: .hip.cpp files route through the host compiler, NOT hipcc. Any
+// __global__ kernel must live in a launch_*.hip.cpp file that uses ATen
+// tensor ops instead of <<<...>>> launch syntax.
 
-#include "csrc/device/models/gfx942/transformer_gfx942.hip.cuh"
-#include "csrc/device/optimizers/gfx942/moe_gfx942.hip.cuh"
+#include "csrc/models/decoder.h"
+#include "csrc/algorithms/moe_adam.h"
+#include "csrc/backends/hip/gfx942/primitives.hpp"
 
 namespace sg { namespace fused { namespace gfx942 {
 
 // TODO: Instantiate fused forward-backward-update kernel
+// combining decoder forward/backward with moe_adam per-element step.
 
 }}} // namespace sg::fused::gfx942

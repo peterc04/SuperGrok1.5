@@ -1,9 +1,25 @@
-"""Fused (model, optimizer, arch) instantiation: mamba + looksam on TPU v5p."""
+"""Fused (mamba + looksam) instantiation for TPU v5p (Pallas / JAX).
 
-from csrc.device.models.tpu_v5p.mamba_tpu_v5p import mamba_forward, mamba_backward
-from csrc.device.optimizers.tpu_v5p.looksam_tpu_v5p import looksam_step
+This file is the fusion point that wires the model forward/backward
+with the optimizer launch glue. Real implementations live in:
+
+  csrc/algorithms/looksam.h                      C++ math spec (mirrored in primitives.py)
+  csrc/models/mamba.h                           model contract
+  csrc/backends/pallas/launch_looksam.py         optimizer launchers
+  csrc/backends/pallas/models/mamba.py          model kernels
+  csrc/backends/pallas/primitives.py            shared JAX/Pallas helpers
+
+At this stage the fused step is a placeholder that raises NotImplementedError.
+The race driver routes around it via the per-optimizer launch_*.py files.
+"""
+
+from csrc.backends.pallas.launch_looksam import (
+    launch_looksam_step,
+)
 
 
-def fused_mamba_looksam_step(params, inputs, state, lr):
-    """TODO: Fused forward-backward-update for mamba + looksam on TPU v5p."""
-    raise NotImplementedError("fused_mamba_looksam_tpu_v5p")
+def fused_mamba_looksam_step(*args, **kwargs):
+    raise NotImplementedError(
+        "fused mamba+looksam for tpu_v5p is not implemented; "
+        "use csrc.backends.pallas.launch_looksam.launch_looksam_step directly."
+    )

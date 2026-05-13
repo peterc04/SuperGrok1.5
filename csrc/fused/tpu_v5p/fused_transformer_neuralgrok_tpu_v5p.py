@@ -1,9 +1,25 @@
-"""Fused (model, optimizer, arch) instantiation: transformer + neuralgrok on TPU v5p."""
+"""Fused (transformer + neuralgrok) instantiation for TPU v5p (Pallas / JAX).
 
-from csrc.device.models.tpu_v5p.transformer_tpu_v5p import transformer_forward, transformer_backward
-from csrc.device.optimizers.tpu_v5p.neuralgrok_tpu_v5p import neuralgrok_step
+This file is the fusion point that wires the model forward/backward
+with the optimizer launch glue. Real implementations live in:
+
+  csrc/algorithms/neuralgrok.h                      C++ math spec (mirrored in primitives.py)
+  csrc/models/decoder.h                           model contract
+  csrc/backends/pallas/launch_neuralgrok.py         optimizer launchers
+  csrc/backends/pallas/models/decoder.py          model kernels
+  csrc/backends/pallas/primitives.py            shared JAX/Pallas helpers
+
+At this stage the fused step is a placeholder that raises NotImplementedError.
+The race driver routes around it via the per-optimizer launch_*.py files.
+"""
+
+from csrc.backends.pallas.launch_neuralgrok import (
+    launch_neuralgrok_step,
+)
 
 
-def fused_transformer_neuralgrok_step(params, inputs, state, lr):
-    """TODO: Fused forward-backward-update for transformer + neuralgrok on TPU v5p."""
-    raise NotImplementedError("fused_transformer_neuralgrok_tpu_v5p")
+def fused_transformer_neuralgrok_step(*args, **kwargs):
+    raise NotImplementedError(
+        "fused decoder+neuralgrok for tpu_v5p is not implemented; "
+        "use csrc.backends.pallas.launch_neuralgrok.launch_neuralgrok_step directly."
+    )

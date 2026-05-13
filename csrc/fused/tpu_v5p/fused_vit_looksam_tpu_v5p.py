@@ -1,9 +1,25 @@
-"""Fused (model, optimizer, arch) instantiation: vit + looksam on TPU v5p."""
+"""Fused (vit + looksam) instantiation for TPU v5p (Pallas / JAX).
 
-from csrc.device.models.tpu_v5p.vit_tpu_v5p import vit_forward, vit_backward
-from csrc.device.optimizers.tpu_v5p.looksam_tpu_v5p import looksam_step
+This file is the fusion point that wires the model forward/backward
+with the optimizer launch glue. Real implementations live in:
+
+  csrc/algorithms/looksam.h                      C++ math spec (mirrored in primitives.py)
+  csrc/models/vit.h                           model contract
+  csrc/backends/pallas/launch_looksam.py         optimizer launchers
+  csrc/backends/pallas/models/vit.py          model kernels
+  csrc/backends/pallas/primitives.py            shared JAX/Pallas helpers
+
+At this stage the fused step is a placeholder that raises NotImplementedError.
+The race driver routes around it via the per-optimizer launch_*.py files.
+"""
+
+from csrc.backends.pallas.launch_looksam import (
+    launch_looksam_step,
+)
 
 
-def fused_vit_looksam_step(params, inputs, state, lr):
-    """TODO: Fused forward-backward-update for vit + looksam on TPU v5p."""
-    raise NotImplementedError("fused_vit_looksam_tpu_v5p")
+def fused_vit_looksam_step(*args, **kwargs):
+    raise NotImplementedError(
+        "fused vit+looksam for tpu_v5p is not implemented; "
+        "use csrc.backends.pallas.launch_looksam.launch_looksam_step directly."
+    )

@@ -1,9 +1,25 @@
-"""Fused (model, optimizer, arch) instantiation: vit + supergrok2 on TPU v5p."""
+"""Fused (vit + supergrok2) instantiation for TPU v5p (Pallas / JAX).
 
-from csrc.device.models.tpu_v5p.vit_tpu_v5p import vit_forward, vit_backward
-from csrc.device.optimizers.tpu_v5p.supergrok2_tpu_v5p import supergrok2_step
+This file is the fusion point that wires the model forward/backward
+with the optimizer launch glue. Real implementations live in:
+
+  csrc/algorithms/supergrok2.h                      C++ math spec (mirrored in primitives.py)
+  csrc/models/vit.h                           model contract
+  csrc/backends/pallas/launch_supergrok2.py         optimizer launchers
+  csrc/backends/pallas/models/vit.py          model kernels
+  csrc/backends/pallas/primitives.py            shared JAX/Pallas helpers
+
+At this stage the fused step is a placeholder that raises NotImplementedError.
+The race driver routes around it via the per-optimizer launch_*.py files.
+"""
+
+from csrc.backends.pallas.launch_supergrok2 import (
+    launch_supergrok2_step,
+)
 
 
-def fused_vit_supergrok2_step(params, inputs, state, lr):
-    """TODO: Fused forward-backward-update for vit + supergrok2 on TPU v5p."""
-    raise NotImplementedError("fused_vit_supergrok2_tpu_v5p")
+def fused_vit_supergrok2_step(*args, **kwargs):
+    raise NotImplementedError(
+        "fused vit+supergrok2 for tpu_v5p is not implemented; "
+        "use csrc.backends.pallas.launch_supergrok2.launch_supergrok2_step directly."
+    )

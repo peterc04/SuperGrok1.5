@@ -1,9 +1,25 @@
-"""Fused (model, optimizer, arch) instantiation: mamba + prodigy on TPU v5p."""
+"""Fused (mamba + prodigy) instantiation for TPU v5p (Pallas / JAX).
 
-from csrc.device.models.tpu_v5p.mamba_tpu_v5p import mamba_forward, mamba_backward
-from csrc.device.optimizers.tpu_v5p.prodigy_tpu_v5p import prodigy_step
+This file is the fusion point that wires the model forward/backward
+with the optimizer launch glue. Real implementations live in:
+
+  csrc/algorithms/prodigy.h                      C++ math spec (mirrored in primitives.py)
+  csrc/models/mamba.h                           model contract
+  csrc/backends/pallas/launch_prodigy.py         optimizer launchers
+  csrc/backends/pallas/models/mamba.py          model kernels
+  csrc/backends/pallas/primitives.py            shared JAX/Pallas helpers
+
+At this stage the fused step is a placeholder that raises NotImplementedError.
+The race driver routes around it via the per-optimizer launch_*.py files.
+"""
+
+from csrc.backends.pallas.launch_prodigy import (
+    launch_prodigy_step,
+)
 
 
-def fused_mamba_prodigy_step(params, inputs, state, lr):
-    """TODO: Fused forward-backward-update for mamba + prodigy on TPU v5p."""
-    raise NotImplementedError("fused_mamba_prodigy_tpu_v5p")
+def fused_mamba_prodigy_step(*args, **kwargs):
+    raise NotImplementedError(
+        "fused mamba+prodigy for tpu_v5p is not implemented; "
+        "use csrc.backends.pallas.launch_prodigy.launch_prodigy_step directly."
+    )
