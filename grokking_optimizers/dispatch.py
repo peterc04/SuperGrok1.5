@@ -202,6 +202,36 @@ def supports_matrix_cores() -> bool:
     return True
 
 
+def supports_nvfp4() -> bool:
+    """NVFP4 (4-bit FP) tensor cores — future Blackwell arches only."""
+    return False
+
+
+def supports_nvfp4_accelerated() -> bool:
+    """Native NVFP4 acceleration (sm_103 Blackwell Ultra)."""
+    return False
+
+
+def supports_consumer_blackwell() -> bool:
+    """Consumer Blackwell (sm_120) feature set."""
+    return False
+
+
+def supports_fp4_mfma() -> bool:
+    """FP4 MFMA on CDNA4 (gfx950)."""
+    return False
+
+
+def supports_fp6_state() -> bool:
+    """FP6 state packing on CDNA4 (gfx950)."""
+    return False
+
+
+def supports_24_sparsity() -> bool:
+    """2:4 structured sparsity (CDNA4 + Ampere+)."""
+    return False
+
+
 # ----------------------------------------------------------------------
 # Human-readable labels
 # ----------------------------------------------------------------------

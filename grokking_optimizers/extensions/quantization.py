@@ -16,10 +16,15 @@ import torch
 import math
 from dataclasses import dataclass
 from typing import Optional, Callable, Dict
-from .dispatch import (
-    get_gpu_arch, get_gpu_vendor, get_amd_tier,
+from grokking_optimizers.dispatch import (
+    get_gpu_arch, get_gpu_vendor,
     supports_bf16, supports_fp8, supports_tf32, supports_nvfp4,
 )
+# Backwards-compat shim (extensions/quantization used to reference
+# get_amd_tier; the function was removed from dispatch.py during the
+# 3-arch active-set narrowing — provide a no-op stub).
+def get_amd_tier():
+    return None
 
 
 class PrecisionConfig:
