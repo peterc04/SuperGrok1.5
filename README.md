@@ -1,12 +1,13 @@
 # SuperGrok2
 
 SuperGrok2 is a C++/CUDA/HIP/Pallas optimizer suite for grokking-aware
-training of large neural networks. It ships eleven optimizers spanning AdamW
-variants, sign-momentum, sharpness-aware minimization, Newton-Schulz
-orthogonalization, and a Mamba-3 + PEER + GRU meta-network optimizer
-(SuperGrok v2 — the project's namesake). The grokking race driver
-(`grokking_race_v2.py`) compares all eleven head-to-head on three algorithmic
-learning tasks under controlled conditions.
+training of large neural networks. It ships twelve optimizers — a plain
+AdamW baseline plus eleven grokking-aware variants spanning sign-momentum,
+sharpness-aware minimization, Newton-Schulz orthogonalization, and a
+Mamba-3 + PEER + GRU meta-network optimizer (SuperGrok v2 — the project's
+namesake). The grokking race driver (`grokking_race_v2.py`) compares all
+twelve head-to-head on three algorithmic learning tasks under controlled
+conditions.
 
 ---
 
@@ -47,7 +48,7 @@ focus on what's runnable now; future arches return when kernels are added.
 
 ## Build status
 
-Per-arch coverage of the 11 optimizers and 3 models. Honest legend:
+Per-arch coverage of the 12 optimizers and 3 models. Honest legend:
 
 - ✅ **done & validated on hardware** — implemented, build-checked, parity
   confirmed against a reference path
@@ -60,6 +61,7 @@ Per-arch coverage of the 11 optimizers and 3 models. Honest legend:
 
 | Optimizer | sm_90 (Hopper) | gfx942 (CDNA3) | tpu_v5p (Pallas) |
 |-----------|:--------------:|:--------------:|:----------------:|
+| AdamW         | 🟡 | 🟡 | 🟡 |
 | SuperGrok v2  | 🟡 | 🟡 | 🟡 |
 | SuperGrok v1.5 | 🟡 | 🟡 | 🟡 |
 | SuperGrok v1.1 | 🟡 | 🟡 | 🟡 |
@@ -109,7 +111,7 @@ self-containment" below.
 ```
 .
 ├── README.md
-├── grokking_race_v2.py   (race driver — 11 optimizers × 3 models × 4 splits)
+├── grokking_race_v2.py   (race driver — 12 optimizers × 3 models × 4 splits)
 ├── setup.py / build.sh / pyproject.toml
 ├── autotune/                   (kernel auto-tuning utilities)
 ├── scripts/                    (build / dev helpers)
@@ -118,13 +120,14 @@ self-containment" below.
 │       └── models/
 ├── third_party/                (cutlass git submodule for WITH_CUTLASS=1)
 ├── grokking_optimizers/
-│   ├── __init__.py             (re-exports the 11 optimizers + helpers)
+│   ├── __init__.py             (re-exports the 12 optimizers + helpers)
 │   ├── dispatch.py             (arch detection + fused kernel registry + get_ops)
-│   └── optimizers/             (10 torch.optim.Optimizer subclasses; MoE-aware
+│   └── optimizers/             (11 torch.optim.Optimizer subclasses; MoE-aware
 │       │                       SG2 lives inside supergrok2.py)
-│       ├── supergrok2.py       grokadamw.py    looksam.py    prodigy.py
-│       ├── supergrok15.py      grokfast.py     muon.py       neuralgrok.py
-│       └── supergrok11.py      lion.py
+│       ├── adamw.py            grokfast.py     muon.py       prodigy.py
+│       ├── supergrok2.py       grokadamw.py    looksam.py    neuralgrok.py
+│       ├── supergrok15.py      lion.py
+│       └── supergrok11.py
 └── csrc/
     ├── algorithms/             (11 algorithm headers, MoE folded into SG2)
     │   ├── adamw.h             grokfast.h    looksam.h     prodigy.h
@@ -898,8 +901,8 @@ native is the same three-step recipe in the file header.
 
 ## Python frontend
 
-The 11 optimizers under `grokking_optimizers/optimizers/` are
-`torch.optim.Optimizer` subclasses. Each stores hyperparameters in
+The 12 optimizers under `grokking_optimizers/optimizers/` (1 AdamW
+baseline + 11 grokking variants) are `torch.optim.Optimizer` subclasses. Each stores hyperparameters in
 `param_groups` in `__init__` and dispatches in `step()`:
 
 ```python
@@ -973,8 +976,8 @@ The grokking race uses four outer train/test splits (10/90, 25/75, 50/50,
 80/20) with an inner val carve-out controlled by `val_ratio` (default 0.10;
 auto-overrides to 0.05 on 10/90). A fixed early-stopping rule ends each run
 at whichever comes first: test accuracy reaching 95% or step count reaching
-20,000 — identical across all 11 optimizers. Three SG variants (v2, v1.5,
-v1.1) consume the inner val for bilevel and meta updates; the other eight
+20,000 — identical across all 12 optimizers. Three SG variants (v2, v1.5,
+v1.1) consume the inner val for bilevel and meta updates; the other nine
 train on train only. The `val_test_gap` in output is the key diagnostic for
 meta-learning vs. masked overfitting.
 
@@ -1106,7 +1109,7 @@ When this branch lands on a machine with a real sm_90 GPU and an MI300X:
 
 **Import smoke test**
 - [ ] `python -c "from grokking_optimizers import SuperGrok2, Lion"` works
-- [ ] All 11 optimizers in `grokking_optimizers/optimizers/` instantiate
+- [ ] All 12 optimizers in `grokking_optimizers/optimizers/` instantiate
       without error
 - [ ] `grokking_race_v2.py --help` runs cleanly
 
