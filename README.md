@@ -60,7 +60,7 @@ Per-arch coverage of the 11 optimizers and 3 models. Honest legend:
 
 | Optimizer | sm_90 (Hopper) | gfx942 (CDNA3) | tpu_v5p (Pallas) |
 |-----------|:--------------:|:--------------:|:----------------:|
-| SuperGrok v2  | 🟡 | ⛔ | 🟡 |
+| SuperGrok v2  | 🟡 | 🟡 | 🟡 |
 | SuperGrok v1.5 | 🟡 | 🟡 | 🟡 |
 | SuperGrok v1.1 | 🟡 | 🟡 | 🟡 |
 | GrokAdamW     | 🟡 | 🟡 | 🟡 |
@@ -80,13 +80,17 @@ Per-arch coverage of the 11 optimizers and 3 models. Honest legend:
 | ViT      | 🟡 | 🟡 | 🟡 |
 | Mamba    | 🟡 | 🟡 | 🟡 |
 
-**SuperGrok v2 on gfx942 is honestly marked ⛔.** The launcher
-(`csrc/backends/hip/gfx942/launch_supergrok2.hip.cpp`) raises
-`std::runtime_error` with a clear message: the full Mamba + GRU + PEER
-pipeline relies on Hopper-specific features (DSMEM cluster reductions, WGMMA,
-4-warp-scheduler specialization) that have no direct CDNA3 equivalent. A
-complete CDNA3 port using MFMA + LDS-resident scan + manual producer/consumer
-synchronization would be weeks of additional work.
+**SuperGrok v2 on gfx942 is 🟡 (functional, perf not verified).** The launcher
+(`csrc/backends/hip/gfx942/launch_supergrok2.hip.cpp`) implements the full
+Mamba + GRU + PEER pipeline via ATen tensor ops. Projection GEMMs go through
+rocBLAS (which dispatches to MFMA `v_mfma_f32_16x16x16_bf16` internally for
+BF16/FP16 at sizes ≥ 16), so the dense-linear-algebra portion does exercise
+the MFMA pipeline. The scan recurrence runs as a host-side sequential loop —
+slower than the Hopper warp-specialized parallel scan but mathematically
+equivalent. The bilevel backward path is not yet implemented on gfx942 and
+will raise; only the forward `supergrok2_prepare_and_batched_step` path is
+functional. Promotion to ✅ requires elementwise allclose validation against
+the sm_90 path on an MI300X.
 
 Everything marked 🟡 is implemented end-to-end in the refactored tree but has
 not been run on real hardware in this environment. Phase 12 of the refactor
@@ -742,7 +746,7 @@ git history.
 
 | Cell | Before | After | Reason |
 |------|--------|-------|--------|
-| SuperGrok2 / gfx942 | done | ⛔ | `launch_supergrok2.hip.cpp` raises `std::runtime_error`. The full Mamba+GRU+PEER pipeline needs Hopper-specific features (DSMEM cluster reductions, WGMMA, 4-warp specialization) with no direct CDNA3 equivalent. |
+| SuperGrok2 / gfx942 | ⛔ → 🟡 | 🟡 | Functional port via ATen + rocBLAS (MFMA for projection GEMMs). Scan recurrence is sequential ATen loop, slower than Hopper Blelloch + 4-warp specialization. Bilevel backward path raises (forward path is functional). Promotion to ✅ requires hardware validation. |
 | All other optimizer × arch cells | done | 🟡 | Implemented end-to-end in the refactored tree, but not run on real hardware in this environment. Promotion to ✅ gated on the action items below. |
 | All model × arch cells | done | 🟡 | Same — implementation exists, hardware validation pending. |
 
@@ -822,8 +826,9 @@ When this branch lands on a machine with a real sm_90 GPU and an MI300X:
       Python reference implementation.
 
 **Honest stub test (gfx942)**
-- [ ] On MI300X: `SuperGrok2(...).step()` raises `std::runtime_error` with
-      the message from `launch_supergrok2.hip.cpp`
+- [ ] On MI300X: `SuperGrok2(...).step()` completes without error (forward
+      path) — bilevel meta-update will raise until the saved-activations
+      backward kernel is implemented.
 
 **Matrix promotion**
 - [ ] After each above test passes, promote the corresponding cell in the
