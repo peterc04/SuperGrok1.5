@@ -9,7 +9,9 @@ Package layout:
 
 Each optimizer file is fully self-contained — the Mamba3+PEER metanet and
 PrecisionConfig live inside supergrok2.py; SharpnessMetaNet is duplicated
-between supergrok15.py and supergrok11.py.
+between supergrok15.py and supergrok11.py. Those implementation-detail
+classes are reachable via
+`from grokking_optimizers.optimizers.supergrok2 import X` when needed.
 
 Usage:
     from grokking_optimizers import SuperGrok2, Lion, GrokAdamW, ...
@@ -61,12 +63,9 @@ from grokking_optimizers.optimizers.moe_adam import MoEAwareSuperGrok2
 
 
 # --------------------------------------------------------------------------
-# Re-exports of inlined classes (live inside the optimizer files)
+# GradientHookOptimizer — race driver uses this directly
 # --------------------------------------------------------------------------
 
-from grokking_optimizers.optimizers.supergrok2 import (
-    Mamba3PEERMetaNet, Mamba3ScanBlock, MiniGRU, PrecisionConfig,
-)
 from grokking_optimizers.optimizers.gradient_hook import GradientHookOptimizer
 
 
@@ -96,9 +95,7 @@ __all__ = [
     "Prodigy",
     "MoEAwareSuperGrok2",
 
-    # Extensions (shared infrastructure)
-    "Mamba3PEERMetaNet", "Mamba3ScanBlock", "MiniGRU",
-    "PrecisionConfig",
+    # GradientHookOptimizer (race-driver wrapper)
     "GradientHookOptimizer",
 
     # Dispatch helpers
