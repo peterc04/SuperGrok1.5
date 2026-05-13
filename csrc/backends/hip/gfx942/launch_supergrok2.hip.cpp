@@ -10,11 +10,11 @@
 //
 // This launcher raises std::runtime_error with a descriptive message.
 // Non-SG2 workflows on MI300X are fully functional via the other 10
-// launch files. Python frontends (grokking_optimizers/supergrok2.py)
-// fall back to the pure-Python reference implementation when this
-// runtime error is raised.
+// launch files. There is no Python reference fallback — the kernel is
+// the only execution path, and a runtime error is the only outcome.
 
 #include <torch/extension.h>
+#include <vector>
 #include <stdexcept>
 #include <string>
 
@@ -22,14 +22,15 @@
 
 namespace sg { namespace hip_gfx942 {
 
+namespace prim = ::sg::hip_gfx942::primitives;
+
 [[noreturn]] static void sg2_not_implemented(const char* op) {
     throw std::runtime_error(
         std::string("SuperGrok v2 is not implemented on gfx942 (CDNA3). ") +
         "Requested op: " + op + ". " +
         "The Mamba + PEER + GRU pipeline requires Hopper-specific features " +
         "(DSMEM cluster reductions, WGMMA, 4-warp-scheduler specialization) " +
-        "that have no direct CDNA3 equivalent. Use sm_90 for SG2 workflows, " +
-        "or run with --no-fused to use the Python reference fallback.");
+        "that have no direct CDNA3 equivalent. Use sm_90 for SG2 workflows.");
 }
 
 void launch_supergrok2_input_proj_sort(...) {
@@ -42,6 +43,34 @@ void launch_supergrok2_apply(...) {
 
 void launch_supergrok2_step(...) {
     sg2_not_implemented("step");
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  MoE/Adam multi-tensor — folded in from former launch_moe_adam.hip.cpp.
+//
+//  Caller passes pre-gathered active expert parameters. Math is identical
+//  to AdamW (no SG2 metanet involvement on the multi-tensor path).
+// ═════════════════════════════════════════════════════════════════════════
+
+void launch_moe_adam_step(
+    std::vector<torch::Tensor>& params,
+    std::vector<torch::Tensor>& exp_avgs,
+    std::vector<torch::Tensor>& exp_avg_sqs,
+    std::vector<torch::Tensor>& grads,
+    float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2
+) {
+    for (size_t i = 0; i < params.size(); i++) {
+        if (!grads[i].defined() || grads[i].numel() == 0) continue;
+        auto& p = params[i];
+        auto& g = grads[i];
+        auto& m = exp_avgs[i];
+        auto& v = exp_avg_sqs[i];
+
+        prim::ema_update_inplace(m, g, beta1);
+        prim::ema_sq_update_inplace(v, g, beta2);
+        prim::adam_apply_inplace(p, m, v, lr, bc1, bc2, eps, wd);
+    }
 }
 
 }} // namespace sg::hip_gfx942
