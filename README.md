@@ -111,6 +111,12 @@ self-containment" below.
 ├── README.md
 ├── grokking_race_v2.py   (race driver — 11 optimizers × 3 models × 4 splits)
 ├── setup.py / build.sh / pyproject.toml
+├── autotune/                   (kernel auto-tuning utilities)
+├── scripts/                    (build / dev helpers)
+├── tests/                      (correctness tests + JAX/Triton reference impls)
+│   └── reference/
+│       └── models/
+├── third_party/                (cutlass git submodule for WITH_CUTLASS=1)
 ├── grokking_optimizers/
 │   ├── __init__.py             (re-exports the 11 optimizers + helpers)
 │   ├── dispatch.py             (arch detection + fused kernel registry + get_ops)
@@ -124,15 +130,12 @@ self-containment" below.
     │   ├── adamw.h             grokfast.h    looksam.h     prodigy.h
     │   ├── grokadamw.h         lion.h        supergrok2.h  supergrok11.h
     │   └── neuralgrok.h        muon.h        supergrok15.h
-    ├── models/                 (3 vendor-neutral model contracts)
-    │   ├── decoder.h
-    │   ├── vit.h
-    │   └── mamba.h
     ├── backends/
-    │   ├── cuda/sm_90/         (10 launch_*.cu, fully self-contained, + models/)
-    │   ├── hip/gfx942/         (10 launch_*.hip.cpp, fully self-contained, + models/)
-    │   └── pallas/             (10 launch_*.py, fully self-contained, + models/)
-    └── bindings/               (pybind11 entry points)
+    │   ├── cuda/sm_90/         (11 launch_*.cu + models/{decoder,vit,mamba,attention})
+    │   ├── hip/gfx942/         (11 launch_*.hip.cpp + 1 launch_lion_native.hip
+    │   │                       + models/{decoder,vit,mamba,attention})
+    │   └── pallas/             (10 launch_*.py + v5p/ TPU-specific helpers)
+    └── bindings/               (5 pybind11 entry-point files)
 ```
 
 Launch glue files contain the `__global__` kernels (CUDA) or ATen-driven
@@ -786,17 +789,25 @@ each header so they're self-contained:
   plus the folded-in MoE multi-tensor compact/scan/scatter helpers
   (formerly `moe_adam.h`)
 
-### Model headers (`csrc/models/`)
+### Model implementations (`csrc/backends/<vendor>/<arch>/models/`)
 
-Three vendor-neutral model contracts:
+Three model architectures (decoder, vit, mamba) plus a shared attention
+kernel live directly inside each backend rather than behind a
+vendor-neutral header contract. Each backend's `models/` directory is
+self-contained:
 
-- **decoder.h** — autoregressive transformer (causal self-attention + FFN)
-- **vit.h** — vision transformer (patch projection + non-causal attention)
-- **mamba.h** — selective state-space model (depthwise conv + scan + gate)
+- **CUDA sm_90** (`csrc/backends/cuda/sm_90/models/`) — `.cuh` files
+  hold template implementations; matched `.cu` files emit explicit
+  instantiations for float/bfloat16/half so PyTorch's pybind link step
+  has stable symbols.
+- **HIP gfx942** (`csrc/backends/hip/gfx942/models/`) — `.hip.h`
+  shim headers delegate to the sm_90 templates via inline wrappers;
+  `.hip.cpp` files re-instantiate the templates under hipcc.
+- **Pallas** — JAX/TPU model code lives inline inside each
+  `launch_<opt>.py` rather than separate model files.
 
-Each defines a `<Model>Config` struct and a `<Model>LayerWeights` pointer
-layout. Per-backend forward/backward implementations live under
-`csrc/backends/<vendor>/<arch>/models/`.
+Model symbols are exposed through `sg::sm90::models::*` and
+`sg::gfx942::models::*` to match the bindings' DISPATCH macros.
 
 ### Launch glue (10 files per backend)
 
