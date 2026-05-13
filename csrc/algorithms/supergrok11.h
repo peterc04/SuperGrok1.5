@@ -1,9 +1,17 @@
 #pragma once
 // SuperGrok v1.1 — vendor-neutral algorithm header.
 //
+// Reference: internal algorithm. The Python source of truth is
+// `grokking_optimizers/optimizers/supergrok11.py` — this header
+// reproduces the per-parameter math from `_single_param_step` and the
+// batched fused-kernel logic from supergrok11_fused_step.
+//
 // Element-wise MLP gradient transformation with cosine-similarity gating.
 // Same structure as v1.5 but the gating term is the cosine between grad
 // and momentum (computed per-parameter), not a sigmoid of training accuracy.
+//
+// Calling convention: bc1, bc2 are passed un-inverted —
+//   bc1 = 1 - beta1^t,  bc2 = 1 - beta2^t.
 //
 // Pipeline per step (two cooperative sweeps):
 //
@@ -415,7 +423,8 @@ __device__ __forceinline__ void sg11_sweep_b_step(
     exp_avg[idx]    = m;
     exp_avg_sq[idx] = v;
 
-    const float update = (m * bc1) / (sqrtf(v * bc2) + eps);
+    // bc1, bc2 un-inverted (= 1 - beta^t): divide for bias correction.
+    const float update = (m / bc1) / (sqrtf(v / bc2) + eps);
     param[idx] = static_cast<ParamT>(p - lr * (update + wd * p));
 }
 

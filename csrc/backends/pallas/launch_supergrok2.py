@@ -905,7 +905,7 @@ def launch_supergrok2_step(
     smart = grad + alpha * mu_state
     m = beta1 * exp_avg + (1.0 - beta1) * smart
     v = beta2 * exp_avg_sq + (1.0 - beta2) * smart * smart
-    update = (m * bc1) / (jnp.sqrt(v * bc2) + eps)
+    update = (m / bc1) / (jnp.sqrt(v / bc2) + eps)
     new_param = param - lr * (update + wd * param)
     new_mu = gru_decay * mu_state + (1.0 - gru_decay) * smart
     return new_param, m, v, new_mu
@@ -936,7 +936,7 @@ def launch_moe_adam_step(
     """Per-tensor AdamW step for MoE-aware optimizer."""
     m = beta1 * exp_avg + (1.0 - beta1) * grad
     v = beta2 * exp_avg_sq + (1.0 - beta2) * grad * grad
-    update = (m * bc1) / (jnp.sqrt(v * bc2) + eps)
+    update = (m / bc1) / (jnp.sqrt(v / bc2) + eps)
     new_param = param - lr * (update + wd * param)
     return new_param, m, v
 

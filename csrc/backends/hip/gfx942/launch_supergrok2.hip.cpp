@@ -79,8 +79,8 @@ inline void adam_apply_inplace(
     torch::Tensor& p, const torch::Tensor& m, const torch::Tensor& v,
     float lr, float bc1, float bc2, float eps, float wd
 ) {
-    auto m_hat = m * bc1;
-    auto v_hat = v * bc2;
+    auto m_hat = m / bc1;  // bc1 = 1 - beta1^t (un-inverted)
+    auto v_hat = v / bc2;  // bc2 = 1 - beta2^t (un-inverted)
     auto denom = v_hat.sqrt().add_(eps);
     auto update = m_hat.div_(denom).add_(p, wd);
     p.add_(update, -lr);

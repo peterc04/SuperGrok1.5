@@ -1,6 +1,10 @@
 #pragma once
 // Grokfast — vendor-neutral algorithm header.
 //
+// Reference: Lee et al. 2024, "Grokfast: Accelerated Grokking by
+// Amplifying Slow Gradients" (https://arxiv.org/abs/2405.20233),
+// EMA-amplified gradient form.
+//
 // Simplest grokking-aware AdamW: EMA filter + amplification, then standard
 // Adam. Two operational modes:
 //
@@ -8,6 +12,9 @@
 //                   grad_out = g + lamb * ema       (consumed by downstream Adam)
 //
 //   (B) fused:      same EMA update, then immediately run Adam on g_amp.
+//
+// Calling convention: bc1, bc2 are passed un-inverted —
+//   bc1 = 1 - beta1^t,  bc2 = 1 - beta2^t.
 
 // ── inlined from former csrc/common/types.h ──
 /*
@@ -383,7 +390,8 @@ __device__ __forceinline__ void grokfast_fused_step(
     exp_avg[idx]    = m;
     exp_avg_sq[idx] = v;
 
-    const float update = (m * bc1) / (sqrtf(v * bc2) + eps);
+    // bc1, bc2 un-inverted (= 1 - beta^t): divide for bias correction.
+    const float update = (m / bc1) / (sqrtf(v / bc2) + eps);
     param[idx] = static_cast<ParamT>(p - lr * (update + wd * p));
 }
 

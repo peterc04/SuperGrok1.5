@@ -1,13 +1,20 @@
 #pragma once
 // NeuralGrok — vendor-neutral algorithm header.
 //
-// Adam with a learned per-element amplifier (psi-net). The amplifier is a
-// 2-layer MLP that takes |grad| as input and outputs a multiplicative scale.
+// Reference: Wang et al. 2024, "NeuralGrok: Accelerating Grokking via
+// Learned Gradient Amplification" — Adam with a learned per-element
+// amplifier (psi-net).
+//
+// The amplifier is a 2-layer MLP that takes |grad| as input and outputs
+// a multiplicative scale.
 //
 // Two-stage compute:
 //   (1) psi_net forward:  s = mlp(|g|)  (per-element scaling factor)
 //   (2) apply:            g_amp = (s * alpha + beta) * g
 //                         AdamW step on g_amp
+//
+// Calling convention: bc1, bc2 are passed un-inverted —
+//   bc1 = 1 - beta1^t,  bc2 = 1 - beta2^t.
 //
 // The MLP weights live in constant memory on CUDA / LDS on HIP. The math
 // here is the per-element body; the matmul is handled by the backend.
@@ -388,7 +395,8 @@ __device__ __forceinline__ void neuralgrok_apply_step(
     exp_avg[idx]    = m;
     exp_avg_sq[idx] = v;
 
-    const float update = (m * bc1) / (sqrtf(v * bc2) + eps);
+    // bc1, bc2 un-inverted (= 1 - beta^t): divide for bias correction.
+    const float update = (m / bc1) / (sqrtf(v / bc2) + eps);
     param[idx] = static_cast<ParamT>(p - lr * (update + wd * p));
 }
 

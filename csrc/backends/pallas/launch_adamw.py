@@ -28,8 +28,8 @@ def launch_adamw_step(
     """Per-tensor AdamW step. Returns new (param, exp_avg, exp_avg_sq)."""
     m = beta1 * exp_avg + (1.0 - beta1) * grad
     v = beta2 * exp_avg_sq + (1.0 - beta2) * grad * grad
-    m_hat = m * bc1
-    v_hat = v * bc2
+    m_hat = m / bc1
+    v_hat = v / bc2
     update = m_hat / (jnp.sqrt(v_hat) + eps)
     new_param = param - lr * (update + wd * param)
     return new_param, m, v

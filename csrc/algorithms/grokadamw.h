@@ -1,16 +1,22 @@
 #pragma once
 // GrokAdamW — vendor-neutral algorithm header.
 //
-// AdamW with an EMA gradient filter that amplifies persistent directions.
+// Reference: Lee et al. 2024, "GrokAdamW: A Faster Optimizer for Late
+// Generalization" — AdamW with an EMA gradient filter that amplifies
+// persistent directions (the slow-changing components of the gradient
+// signal).
 //
-// Math:
+// Math (decoupled weight decay variant; bias correction via division):
 //   ema_t = alpha * ema_{t-1} + (1 - alpha) * g
 //   g_amp = g + lamb * ema_t
 //   m_t   = beta1 * m_{t-1} + (1 - beta1) * g_amp
 //   v_t   = beta2 * v_{t-1} + (1 - beta2) * g_amp^2
-//   m_hat = m_t * bc1
-//   v_hat = v_t * bc2
+//   m_hat = m_t / (1 - beta1^t)
+//   v_hat = v_t / (1 - beta2^t)
 //   p    -= lr * (m_hat / (sqrt(v_hat) + eps) + wd * p)
+//
+// Calling convention: bc1, bc2 are passed un-inverted —
+//   bc1 = 1 - beta1^t,  bc2 = 1 - beta2^t.
 
 // ── inlined from former csrc/common/types.h ──
 /*
@@ -372,8 +378,9 @@ __device__ __forceinline__ void grokadamw_step(
     exp_avg[idx]    = m;
     exp_avg_sq[idx] = v;
 
-    // Bias-corrected update with decoupled weight decay
-    const float update = (m * bc1) / (sqrtf(v * bc2) + eps);
+    // Bias-corrected update with decoupled weight decay.
+    // bc1, bc2 are passed un-inverted (= 1 - beta^t), so divide.
+    const float update = (m / bc1) / (sqrtf(v / bc2) + eps);
     param[idx] = static_cast<ParamT>(p - lr * (update + wd * p));
 }
 

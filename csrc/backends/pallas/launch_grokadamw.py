@@ -96,7 +96,7 @@ def launch_grokadamw_step(
     g_amp = grad + lamb * new_ema
     m = beta1 * exp_avg + (1.0 - beta1) * g_amp
     v = beta2 * exp_avg_sq + (1.0 - beta2) * g_amp * g_amp
-    update = (m * bc1) / (jnp.sqrt(v * bc2) + eps)
+    update = (m / bc1) / (jnp.sqrt(v / bc2) + eps)
     new_param = param - lr * (update + wd * param)
     return new_param, m, v, new_ema
 

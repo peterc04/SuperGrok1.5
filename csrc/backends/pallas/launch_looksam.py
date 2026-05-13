@@ -144,6 +144,6 @@ def launch_looksam_apply(
     g_adj = (1.0 - alpha) * grad + alpha * sam_dir
     m = beta1 * exp_avg + (1.0 - beta1) * g_adj
     v = beta2 * exp_avg_sq + (1.0 - beta2) * g_adj * g_adj
-    update = (m * bc1) / (jnp.sqrt(v * bc2) + eps)
+    update = (m / bc1) / (jnp.sqrt(v / bc2) + eps)
     new_param = param - lr * (update + wd * param)
     return new_param, m, v

@@ -144,6 +144,6 @@ def launch_supergrok15_step(
 
     m = beta1 * exp_avg + (1.0 - beta1) * smart
     v = beta2 * exp_avg_sq + (1.0 - beta2) * smart * smart
-    update = (m * bc1) / (jnp.sqrt(v * bc2) + eps)
+    update = (m / bc1) / (jnp.sqrt(v / bc2) + eps)
     new_param = param - lr * (update + wd * param)
     return new_param, m, v, mu

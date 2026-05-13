@@ -569,7 +569,10 @@ __device__ __forceinline__ void sg2_apply_step(
     exp_avg[idx]    = m;
     exp_avg_sq[idx] = v;
 
-    const float update = (m * bc1) / (sqrtf(v * bc2) + eps);
+    // bc1, bc2 un-inverted (= 1 - beta^t): divide for bias correction.
+    // Matches the convention used by adamw.h / grokadamw.h / etc. and the
+    // Python `_single_param_step` in grokking_optimizers/optimizers/supergrok2.py.
+    const float update = (m / bc1) / (sqrtf(v / bc2) + eps);
     param[idx] = static_cast<ParamT>(p - lr * (update + wd * p));
 }
 

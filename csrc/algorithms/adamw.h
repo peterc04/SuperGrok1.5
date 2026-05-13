@@ -1,7 +1,10 @@
 #pragma once
 // AdamW — vendor-neutral algorithm header.
 //
-// Math:
+// Reference: Loshchilov & Hutter 2017, "Decoupled Weight Decay
+// Regularization" (https://arxiv.org/abs/1711.05101), Algorithm 2.
+//
+// Math (decoupled weight decay variant):
 //   m_t = beta1 * m_{t-1} + (1 - beta1) * g
 //   v_t = beta2 * v_{t-1} + (1 - beta2) * g^2
 //   m_hat = m_t / (1 - beta1^t)        [bias correction]
@@ -11,6 +14,12 @@
 // Per-element step function called from inside a grid-stride loop in the
 // per-backend launch kernel. Compiles under nvcc (CUDA) and hipcc (HIP).
 // Pallas/JAX implements the same math directly in launch_adamw.py.
+//
+// Calling convention: bc1, bc2 are passed un-inverted —
+//   bc1 = 1 - beta1^t,  bc2 = 1 - beta2^t
+// — matching the binding code in csrc/bindings/bindings.cpp and the Python
+// reference (`bc1 = 1.0 - beta1 ** step`). The step function divides by
+// them to obtain the bias-corrected moments.
 
 // ── inlined from former csrc/common/types.h ──
 /*
@@ -349,8 +358,8 @@ __device__ __forceinline__ void adamw_step(
     const float beta2,
     const float eps,
     const float wd,
-    const float bc1,   // 1 / (1 - beta1^t)
-    const float bc2,   // 1 / (1 - beta2^t)
+    const float bc1,   // 1 - beta1^t (un-inverted; header divides by it)
+    const float bc2,   // 1 - beta2^t (un-inverted; header divides by it)
     const int idx
 ) {
     const float g  = static_cast<float>(grad[idx]);
@@ -361,8 +370,9 @@ __device__ __forceinline__ void adamw_step(
     const float m = beta1 * m0 + (1.0f - beta1) * g;
     const float v = beta2 * v0 + (1.0f - beta2) * g * g;
 
-    const float m_hat = m * bc1;
-    const float v_hat = v * bc2;
+    // Bias correction: m_hat = m / (1 - beta1^t), v_hat = v / (1 - beta2^t).
+    const float m_hat = m / bc1;
+    const float v_hat = v / bc2;
 
     const float denom = sqrtf(v_hat) + eps;
     const float update = m_hat / denom;
@@ -404,10 +414,11 @@ __device__ __forceinline__ void adamw_step_vec4(
     v.z = beta2 * v0.z + (1.0f - beta2) * g.z * g.z;
     v.w = beta2 * v0.w + (1.0f - beta2) * g.w * g.w;
 
-    p.x -= lr * (m.x * bc1 / (sqrtf(v.x * bc2) + eps) + wd * p.x);
-    p.y -= lr * (m.y * bc1 / (sqrtf(v.y * bc2) + eps) + wd * p.y);
-    p.z -= lr * (m.z * bc1 / (sqrtf(v.z * bc2) + eps) + wd * p.z);
-    p.w -= lr * (m.w * bc1 / (sqrtf(v.w * bc2) + eps) + wd * p.w);
+    // bc1, bc2 un-inverted: divide for bias correction.
+    p.x -= lr * ((m.x / bc1) / (sqrtf(v.x / bc2) + eps) + wd * p.x);
+    p.y -= lr * ((m.y / bc1) / (sqrtf(v.y / bc2) + eps) + wd * p.y);
+    p.z -= lr * ((m.z / bc1) / (sqrtf(v.z / bc2) + eps) + wd * p.z);
+    p.w -= lr * ((m.w / bc1) / (sqrtf(v.w / bc2) + eps) + wd * p.w);
 
     param4[i]      = p;
     exp_avg4[i]    = m;

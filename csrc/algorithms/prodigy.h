@@ -1,6 +1,10 @@
 #pragma once
 // Prodigy — vendor-neutral algorithm header.
 //
+// Reference: Mishchenko & Defazio 2023, "Prodigy: An Expeditiously
+// Adaptive Parameter-Free Learner" (https://arxiv.org/abs/2306.06101),
+// Algorithm 1 (D-Adaptation-style trajectory estimator + AdamW apply).
+//
 // Self-tuning Adam. Estimates its own learning rate d from the cumulative
 // parameter trajectory: d_new = max(d_prev, r / |s|), where r and s are
 // global reductions across all parameters:
@@ -11,6 +15,9 @@
 //   (1) reduce: compute partial r, s sums (block-level)
 //   (2) update: combine partials, update d on a single device thread
 //   (3) apply:  AdamW step using d (loaded from device memory)
+//
+// Calling convention: bc1, bc2 are passed un-inverted —
+//   bc1 = 1 - beta1^t,  bc2 = 1 - beta2^t.
 
 // ── inlined from former csrc/common/types.h ──
 /*
@@ -396,7 +403,8 @@ __device__ __forceinline__ void prodigy_apply_step(
     exp_avg_sq[idx] = v;
     s_track[idx]   += d * g;
 
-    const float update = (m * bc1) / (sqrtf(v * bc2) + eps);
+    // bc1, bc2 un-inverted (= 1 - beta^t): divide for bias correction.
+    const float update = (m / bc1) / (sqrtf(v / bc2) + eps);
     param[idx] = static_cast<ParamT>(p - d * (update + wd * p));
 }
 

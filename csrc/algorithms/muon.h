@@ -340,7 +340,15 @@ __device__ __forceinline__ Affine2x2 ptx_affine_combine(
 
 namespace sg { namespace algorithms {
 
-// Momentum normalize: buf = momentum * buf + (1-momentum) * grad, then X = buf * inv_norm.
+// Momentum normalize: buf = momentum * buf + grad, then X = buf * inv_norm.
+//
+// Reference: Jordan et al. 2024, "Muon: An optimizer for the orthogonal
+// manifold" (https://kellerjordan.github.io/posts/muon/). The momentum
+// update is plain SGD-momentum (no (1-momentum) factor on the gradient),
+// matching the active multi-tensor path in
+// csrc/bindings/bindings.cpp::muon_fused_step (bufs[i].mul_(momentum).add_(grads[i])).
+// Newton-Schulz iteration (5 steps by default) follows the standard
+// (3.4445, -4.7750, 2.0315) polynomial recurrence from the same source.
 template <typename GradT>
 __device__ __forceinline__ void muon_momentum_normalize_step(
     float* __restrict__ buf,
@@ -351,7 +359,7 @@ __device__ __forceinline__ void muon_momentum_normalize_step(
     const int idx
 ) {
     const float g = static_cast<float>(grad[idx]);
-    const float b = momentum * buf[idx] + (1.0f - momentum) * g;
+    const float b = momentum * buf[idx] + g;
     buf[idx] = b;
     X[idx] = b * inv_norm;
 }

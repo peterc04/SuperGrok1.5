@@ -107,7 +107,7 @@ def launch_prodigy_step(
     g_scaled = d * grad
     m = beta1 * exp_avg + (1.0 - beta1) * g_scaled
     v = beta2 * exp_avg_sq + (1.0 - beta2) * g_scaled * g_scaled
-    update = (m * bc1) / (jnp.sqrt(v * bc2) + eps)
+    update = (m / bc1) / (jnp.sqrt(v / bc2) + eps)
     new_param = param - d * (update + wd * param)
     new_s = s_track + d * grad
     return new_param, m, v, new_s, d

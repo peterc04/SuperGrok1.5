@@ -1,6 +1,11 @@
 #pragma once
 // LookSAM — vendor-neutral algorithm header.
 //
+// Reference: Liu et al. 2022, "Towards Efficient and Scalable Sharpness-
+// Aware Minimization" (https://arxiv.org/abs/2203.02714), Algorithm 1
+// (periodic-perturbation variant — SAM gradient is recomputed every k
+// steps, then reused as a cached direction for intervening steps).
+//
 // AdamW with periodic Sharpness-Aware Minimization (every k steps).
 //
 // Four operations:
@@ -9,6 +14,9 @@
 //   (3) direction adjust:  on SAM step,    sam_dir = g_sam - g
 //                          on normal step, g_adj   = (1-alpha)*g + alpha*sam_dir
 //   (4) standard AdamW update with g_adj.
+//
+// Calling convention: bc1, bc2 are passed un-inverted —
+//   bc1 = 1 - beta1^t,  bc2 = 1 - beta2^t.
 
 // ── inlined from former csrc/common/types.h ──
 /*
@@ -398,7 +406,8 @@ __device__ __forceinline__ void looksam_apply_step(
     exp_avg[idx]    = m;
     exp_avg_sq[idx] = v;
 
-    const float update = (m * bc1) / (sqrtf(v * bc2) + eps);
+    // bc1, bc2 un-inverted (= 1 - beta^t): divide for bias correction.
+    const float update = (m / bc1) / (sqrtf(v / bc2) + eps);
     param[idx] = static_cast<ParamT>(p - lr * (update + wd * p));
 }
 
