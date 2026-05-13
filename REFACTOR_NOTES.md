@@ -376,9 +376,9 @@ The remaining MXFP4/NVFP4 mentions in `arch_tier.h` and `quantization.cpp`
 comments are explicit "intentionally out of scope" markers and stay per the
 prompt's exception clause.
 
-### Final Python file count
+### Python file count after the 3-task cleanup (before final inlining)
 
-After all three cleanup tasks, `grokking_optimizers/` contains **22 .py files**:
+After the 3-task cleanup, `grokking_optimizers/` contained **22 .py files**:
 
 ```
 grokking_optimizers/
@@ -408,5 +408,113 @@ Smoke test continues to pass:
 from grokking_optimizers import SuperGrok2, Lion, GrokAdamW,
                                 GradientHookOptimizer, PrecisionConfig,
                                 Mamba3PEERMetaNet
+→ ok
+```
+
+---
+
+## Final inlining cleanup (16-file target)
+
+A second cleanup pass collapsed shared private modules into the optimizer
+files that use them, making every optimizer file fully self-contained.
+
+### Task 1 — inlining
+
+| Class(es) inlined                                            | Source file        | Now lives in                          |
+|--------------------------------------------------------------|--------------------|---------------------------------------|
+| `Mamba3ScanBlock`, `MiniGRU`, `Mamba3PEERMetaNet`            | `_metanet.py`      | `optimizers/supergrok2.py`            |
+| `PrecisionConfig` (with `_quantize_expert_int8`/`int4`)      | `_quantization.py` | `optimizers/supergrok2.py`            |
+| `SharpnessMetaNet` (duplicated)                              | `optimizers/supergrok15.py` | `optimizers/supergrok11.py` (kept also in `supergrok15.py`) |
+| `_adamw_step_reference` (pure-Python AdamW)                  | `_adamw_helper.py` | `optimizers/grokadamw.py`             |
+
+Deleted: `_metanet.py`, `_quantization.py`, `_adamw_helper.py`.
+
+**Accepted duplication.** `SharpnessMetaNet` exists in both
+`supergrok15.py` (lines 28-67) and `supergrok11.py` (lines 20-61). Future
+changes to the metanet architecture must touch both files. The
+`SharpnessMetaNet` symbol was removed from the public `grokking_optimizers`
+re-exports because no external consumer (race driver included) uses it
+directly — it's an implementation detail.
+
+**Dropped without inlining.** `_quantization.py` also contained
+`UnslothDynamicPrecision`, `QuantFormat`, `QUANT_REGISTRY`, and
+`resolve_format`. A grep across the repo found no consumers, so they were
+not carried forward. The latent `get_amd_tier()` reference in the old
+`PrecisionConfig.__init__` (from earlier MXFP4 cleanup) was replaced with
+a direct `supports_bf16()` check while inlining, since the only AMD arch
+in the 3-arch active set is gfx942 (CDNA3), which has BF16 MFMA.
+
+### Task 2 — gradient_hook_optimizer
+
+**Case A applied** — `grokking_race_v2.py` line 590 imports
+`GradientHookOptimizer`, so the file moved into the optimizers subpackage:
+- `_gradient_hook.py` → `optimizers/gradient_hook.py` (via `git mv`).
+- `gradient_hook_optimizer.py` shim deleted.
+- Race driver updated to
+  `from grokking_optimizers.optimizers.gradient_hook import GradientHookOptimizer`.
+- Public `__init__.py` re-export now points at the new path.
+
+### Task 3 — backward-compat shims dropped
+
+Deleted `_ops_loader.py` and `fused_dispatch.py`. All 11 optimizer files
+were rewritten to import `get_ops` directly from
+`grokking_optimizers.dispatch`. The race driver had its
+`fused_dispatch`-style import folded into the single `dispatch` import line
+during Task 2 (`from grokking_optimizers.dispatch import detect_arch,
+has_fused, dispatch_fused`).
+
+### Final directory layout (16 files)
+
+```
+grokking_optimizers/
+├── __init__.py            (public API; re-exports from optimizers/*)
+├── dispatch.py            (detect_arch, get_ops, fused registry)
+├── fallback.py            (pure-Python reference implementations)
+└── optimizers/
+    ├── __init__.py
+    ├── gradient_hook.py   (GradientHookOptimizer — used by race driver)
+    ├── grokadamw.py       (+ _adamw_step_reference inline)
+    ├── grokfast.py
+    ├── lion.py
+    ├── looksam.py
+    ├── moe_adam.py
+    ├── muon.py
+    ├── neuralgrok.py
+    ├── prodigy.py
+    ├── supergrok11.py     (+ SharpnessMetaNet duplicated from SG1.5)
+    ├── supergrok15.py     (+ SharpnessMetaNet original)
+    └── supergrok2.py      (+ Mamba3PEERMetaNet, MiniGRU, Mamba3ScanBlock,
+                             PrecisionConfig all inline)
+```
+
+Down from 22 → 16 files. No underscored private modules, no shim files.
+One file above the 15-file target because `gradient_hook` landed inside
+`optimizers/` (Case A of Task 2).
+
+### Callers missed by the initial grep
+
+None. The grep passes covered every `from grokking_optimizers._ops_loader`,
+`from grokking_optimizers.fused_dispatch`, `_metanet`, `_quantization`, and
+`_adamw_helper` import in `.py` files under the repo root, and the smoke
+test confirms the public surface still resolves after deletion.
+
+### Public surface change summary
+
+- `SharpnessMetaNet` removed from `grokking_optimizers` and
+  `grokking_optimizers.optimizers` `__all__` (implementation detail).
+- `Mamba3PEERMetaNet`, `Mamba3ScanBlock`, `MiniGRU`, `PrecisionConfig`,
+  `GradientHookOptimizer` — still importable from `grokking_optimizers`
+  (re-exported from their new home), so external code continues to work
+  without changes.
+
+Smoke test continues to pass:
+```
+from grokking_optimizers import (
+    SuperGrok2, SuperGrok15, SuperGrok11,
+    GrokAdamW, Lion, Grokfast, LookSAM, Muon,
+    NeuralGrok, Prodigy, MoEAwareSuperGrok2,
+    PrecisionConfig, Mamba3PEERMetaNet, Mamba3ScanBlock, MiniGRU,
+    GradientHookOptimizer,
+)
 → ok
 ```
