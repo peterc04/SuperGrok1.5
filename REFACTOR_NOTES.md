@@ -287,3 +287,126 @@ break earlier phases. Reverting Phase 7 (the big delete) would restore the
 placeholder tree but require also reverting Phase 8 (which depends on the
 new include paths). Phases 2–6 are additive (they only create new files);
 Phases 7–9 are destructive/reorganizing.
+
+---
+
+## Post-refactor cleanup (Tasks 1–3)
+
+After the 12-phase refactor landed, a three-task cleanup pass tightened the
+codebase to match what the grokking race actually needs.
+
+### Task 1 — Deleted unused extension modules
+
+Removed 11 modules under `grokking_optimizers/extensions/` that added
+maintenance surface without serving the single-node grokking race:
+
+| File | Reason |
+|------|--------|
+| `async_supergrok2.py` | no async pipeline in the race |
+| `cuda_graph_optimizer.py` | no graph capture needed |
+| `partial_graph.py` | same |
+| `pipelined_optimizer.py` | no pipeline parallelism |
+| `gradient_compression.py` | no distributed comms |
+| `sparse_gradients.py` | not used by any of the 11 optimizers |
+| `overlap_distributed.py` | no distributed overlap |
+| `distributed.py` | single-node race |
+| `distributed_scan.py` | same |
+| `torch_compile_integration.py` | race uses fused kernels directly |
+| `interleaved_states.py` | not referenced |
+
+Also dropped the `__init__.py` re-exports for `CUDAGraphOptimizer`,
+`OverlappedOptimizer`, `INT8GradientCompressor`, `PowerSGDCompressor`,
+`PartialGraphOptimizer`, `SparseGradientHandler`, `PipelinedOptimizer`,
+`AsyncSuperGrok2`, and the 7 distributed-helper functions. The race driver's
+`_maybe_wrap_cuda_graph` became a no-op shim (kept to avoid touching 7 call
+sites).
+
+### Task 2 — Inlined keepers, dropped extensions/
+
+Three modules remained useful enough to keep, moved to top-level underscored
+private modules:
+
+| Old path | New path | Used by |
+|----------|----------|---------|
+| `extensions/mamba3_peer_metanet.py` | `_metanet.py` | SG2, SG1.5, SG1.1 |
+| `extensions/quantization.py` | `_quantization.py` | SG2 family precision config |
+| `extensions/gradient_hook_optimizer.py` | `_gradient_hook.py` | race driver `--grad-hooks` |
+
+After moving, `grokking_optimizers/extensions/` was empty and got removed.
+Internal imports across 7 files updated to use the new paths.
+
+### Task 3 — Removed NVFP4 / Blackwell / future-arch scaffolding
+
+The active set is `sm_90 + gfx942 + tpu_v5p`. Future-arch scaffolding for
+Ampere, Blackwell, and CDNA4 was removed:
+
+- `csrc/common/fp4_helpers.hip.h` — deleted (CDNA4 FP4/FP6 helpers; no callers)
+- `csrc/common/quantization.h` — stripped MXFP4 struct + encode/decode + the
+  `PrecisionMode::MXFP4` enum value. FP8/INT8/INT4 retained.
+- `csrc/common/arch_tier.h` — removed `BLACKWELL` and `CDNA4` enum values
+  and their per-arch macro arms. Kept the "intentionally out of scope"
+  comment per the prompt.
+- `csrc/common/tuned_configs.h` — collapsed `ArchId` enum from 8 values down
+  to 2 (`ARCH_SM90`, `ARCH_GFX942`). Per-kernel config tables shrunk to
+  2 rows. `arch_id_from_int` rejects everything else with a clear message.
+- `csrc/bindings/_dispatch_macro.h`, `dispatch.cpp`, and 21 other binding
+  .cpp files — stripped `DECLARE_<X>(sm89)`, `DECLARE_<X>(sm100)`,
+  `DECLARE_<X>(sm103)`, `DECLARE_<X>(sm120)`, `DECLARE_<X>(gfx950)`, and
+  associated `case` lines in `SG_DISPATCH` macros (23 files cleaned by
+  script). Error messages tightened.
+- `csrc/bindings/quantization.cpp` and `module.cpp` — removed the
+  `mxfp4_quantize` binding.
+- `grokking_optimizers/dispatch.py` — removed 6 `supports_*` stub
+  predicates (`supports_nvfp4`, `supports_nvfp4_accelerated`,
+  `supports_consumer_blackwell`, `supports_fp4_mfma`, `supports_fp6_state`,
+  `supports_24_sparsity`). Error messages tightened.
+- `grokking_optimizers/__init__.py` — dropped the 6 `supports_*` re-exports.
+- `grokking_optimizers/_quantization.py` — removed `_quantize_mxfp4` and
+  `_quantize_nvfp4` methods, `nvfp4`/`mxfp4` modes from `PROJECTION_MODES`,
+  `projection_mxfp4`/`projection_nvfp4` entries from `QUANT_REGISTRY`,
+  the `get_amd_tier` no-op stub, and the `supports_nvfp4` import.
+- `setup.py` — tightened the CUTLASS comment from "Hopper+ / Blackwell"
+  to just Hopper.
+- `README.md` — removed the "future arches" line and the `fp4_helpers.hip.h`
+  bullet in the common headers list.
+- `supergrok2_jax_tpu/quantization_jax.py` — updated docstring to drop the
+  MXFP4 mention and fix the cross-reference to `_quantization.py`.
+
+The remaining MXFP4/NVFP4 mentions in `arch_tier.h` and `quantization.cpp`
+comments are explicit "intentionally out of scope" markers and stay per the
+prompt's exception clause.
+
+### Final Python file count
+
+After all three cleanup tasks, `grokking_optimizers/` contains **22 .py files**:
+
+```
+grokking_optimizers/
+├── __init__.py                      (public API surface)
+├── dispatch.py                      (detect_arch, get_ops, fused registry)
+├── fallback.py                      (pure-Python reference implementations)
+├── _adamw_helper.py                 (AdamW helper utilities)
+├── _gradient_hook.py                (GradientHookOptimizer, used by race driver)
+├── _metanet.py                      (Mamba3 + PEER + GRU meta-net)
+├── _ops_loader.py                   (backward-compat shim → dispatch.get_ops)
+├── _quantization.py                 (PrecisionConfig + INT8/INT4 helpers)
+├── _gradient_hook.py                (GradientHookOptimizer)
+├── fused_dispatch.py                (backward-compat shim → dispatch.*)
+├── gradient_hook_optimizer.py       (backward-compat shim → _gradient_hook)
+└── optimizers/
+    ├── __init__.py
+    ├── supergrok2.py                grokadamw.py    looksam.py
+    ├── supergrok15.py               grokfast.py     muon.py
+    ├── supergrok11.py               lion.py         neuralgrok.py
+    └── moe_adam.py                  prodigy.py
+```
+
+Down from the 30 files at the end of the 12-phase refactor.
+
+Smoke test continues to pass:
+```
+from grokking_optimizers import SuperGrok2, Lion, GrokAdamW,
+                                GradientHookOptimizer, PrecisionConfig,
+                                Mamba3PEERMetaNet
+→ ok
+```

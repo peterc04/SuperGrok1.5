@@ -77,9 +77,7 @@ from grokking_optimizers._gradient_hook import GradientHookOptimizer
 from grokking_optimizers.dispatch import (
     get_gpu_arch, get_gpu_vendor, get_backend, get_arch_label,
     get_warp_size, supports_bf16, supports_fp8, supports_tf32,
-    supports_matrix_cores, supports_nvfp4,
-    supports_nvfp4_accelerated, supports_consumer_blackwell,
-    supports_fp4_mfma, supports_fp6_state, supports_24_sparsity,
+    supports_matrix_cores,
     SUPPORTED_ARCHES, assert_supported_arch,
 )
 
@@ -106,9 +104,7 @@ __all__ = [
     # Dispatch helpers
     "get_gpu_arch", "get_gpu_vendor", "get_backend", "get_arch_label",
     "get_warp_size", "supports_bf16", "supports_fp8", "supports_tf32",
-    "supports_matrix_cores", "supports_nvfp4",
-    "supports_nvfp4_accelerated", "supports_consumer_blackwell",
-    "supports_fp4_mfma", "supports_fp6_state", "supports_24_sparsity",
+    "supports_matrix_cores",
     "SUPPORTED_ARCHES", "UnsupportedArchError", "assert_supported_arch",
     "detect_arch",
 

@@ -3,8 +3,8 @@
 Handles weight conversion, precision selection, and calibration for
 multi-precision kernel dispatch.
 
-Supported precision modes:
-  Projections: fp32, tf32, bf16, fp8, mxfp4, nvfp4
+Supported precision modes (3-arch active set):
+  Projections: fp32, tf32, bf16, fp8
   Expert weights: fp32, int8, int4
   Scan state: always fp32 (numerical necessity)
 
@@ -18,20 +18,15 @@ from dataclasses import dataclass
 from typing import Optional, Callable, Dict
 from grokking_optimizers.dispatch import (
     get_gpu_arch, get_gpu_vendor,
-    supports_bf16, supports_fp8, supports_tf32, supports_nvfp4,
+    supports_bf16, supports_fp8, supports_tf32,
 )
-# Backwards-compat shim (extensions/quantization used to reference
-# get_amd_tier; the function was removed from dispatch.py during the
-# 3-arch active-set narrowing — provide a no-op stub).
-def get_amd_tier():
-    return None
 
 
 class PrecisionConfig:
     """Configures precision for different components of the optimizer."""
 
     # Valid precision modes by component
-    PROJECTION_MODES = ('fp32', 'tf32', 'bf16', 'fp8', 'mxfp4', 'nvfp4', 'auto')
+    PROJECTION_MODES = ('fp32', 'tf32', 'bf16', 'fp8', 'auto')
     EXPERT_MODES = ('fp32', 'int8', 'int4', 'auto')
 
     def __init__(
@@ -43,7 +38,7 @@ class PrecisionConfig:
     ):
         """
         Args:
-            projection_precision: 'fp32', 'tf32', 'bf16', 'fp8', 'mxfp4', or 'auto'.
+            projection_precision: 'fp32', 'tf32', 'bf16', 'fp8', or 'auto'.
                 'auto' selects the best available for the current GPU.
             expert_precision: 'fp32', 'int8', 'int4', or 'auto'.
                 Controls expert MLP weight quantization.
@@ -106,7 +101,6 @@ class PrecisionConfig:
             For fp32/tf32: (tensor, None) — TF32 is transparent via cuBLAS
             For bf16: (tensor_bf16, None)
             For fp8: (tensor_fp8, scale)
-            For mxfp4: (packed_tensor, shared_exponents)
         """
         if self.projection_precision in ('fp32', 'tf32'):
             return w.float().contiguous(), None
@@ -123,20 +117,6 @@ class PrecisionConfig:
             w_scaled = w.float().div(scale)
             w_fp8 = w_scaled.to(torch.float8_e4m3fn)
             return w_fp8, scale
-        elif self.projection_precision == 'mxfp4':
-            return self._quantize_mxfp4(w)
-        elif self.projection_precision == 'nvfp4':
-            if not supports_nvfp4():
-                # Fall back through chain: nvfp4 -> mxfp4 -> fp8 -> bf16 -> fp32
-                if supports_fp8():
-                    scale = w.abs().max().clamp(min=1e-12)
-                    w_scaled = w.float().div(scale)
-                    w_fp8 = w_scaled.to(torch.float8_e4m3fn)
-                    return w_fp8, scale
-                if supports_bf16():
-                    return w.bfloat16().contiguous(), None
-                return w.float().contiguous(), None
-            return self._quantize_nvfp4(w)
         else:
             raise ValueError(f"Unknown precision: {self.projection_precision}")
 
@@ -224,45 +204,6 @@ class PrecisionConfig:
             'b2': b2.float().contiguous(),
             'mode': 'int4',
         }
-
-    def _quantize_mxfp4(self, w, block_size=32):
-        """Microscaling FP4 (E2M1) quantization for projection weights."""
-        w_flat = w.reshape(-1).float()
-        N = w_flat.numel()
-        N_padded = ((N + block_size - 1) // block_size) * block_size
-        if N_padded > N:
-            w_flat = torch.nn.functional.pad(w_flat, (0, N_padded - N))
-
-        num_blocks = N_padded // block_size
-        w_blocked = w_flat.reshape(num_blocks, block_size)
-
-        # Shared exponent per block
-        block_max = w_blocked.abs().max(dim=1).values.clamp(min=1e-12)
-        shared_exp_f = torch.floor(torch.log2(block_max)) + 127.0
-        shared_exp_f = shared_exp_f.clamp(0.0, 255.0)
-        shared_exp = shared_exp_f.to(torch.uint8)
-
-        # Scale each block by shared exponent
-        block_scale = torch.exp2(shared_exp_f - 127.0).unsqueeze(1)
-        w_scaled = w_blocked / block_scale
-
-        # FP4 E2M1 magnitude values: 0, 0.5, 1, 1.5, 2, 3, 4, 6
-        fp4_vals = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-        signs = (w_scaled < 0).to(torch.uint8)
-        magnitudes = w_scaled.abs()
-
-        # Nearest-value quantization
-        diffs = (magnitudes.unsqueeze(-1) - fp4_vals.unsqueeze(0).unsqueeze(0)).abs()
-        indices = diffs.argmin(-1).to(torch.uint8)
-        encoded = (signs << 3) | indices
-        encoded = encoded.reshape(-1)
-
-        # Pack pairs into uint8
-        even = encoded[0::2]
-        odd = encoded[1::2]
-        packed = even | (odd << 4)
-
-        return packed.contiguous(), shared_exp.contiguous()
 
     # ═══════════════════════════════════════════════════════════════════
     #  Dynamic Precision Selection
@@ -364,46 +305,6 @@ class PrecisionConfig:
             return float('inf')
         return math.sqrt(self._grad_norm_var_ema) / max(self._grad_norm_ema, 1e-12)
 
-    def _quantize_nvfp4(self, w, block_size=16):
-        """NVFP4 quantization with per-block scaling.
-
-        On sm_100 (Blackwell): cuBLAS accepts NVFP4 inputs natively.
-        On sm_90 and below: requires software dequantization (same as MXFP4).
-
-        NVFP4 uses 16-element blocks (vs 32 for MXFP4).
-        Same E2M1 codebook: {0, 0.5, 1, 1.5, 2, 3, 4, 6}.
-        """
-        w_flat = w.reshape(-1).float()
-        N = w_flat.numel()
-        N_padded = ((N + block_size - 1) // block_size) * block_size
-        if N_padded > N:
-            w_flat = torch.nn.functional.pad(w_flat, (0, N_padded - N))
-
-        num_blocks = N_padded // block_size
-        w_blocked = w_flat.reshape(num_blocks, block_size)
-
-        # Per-block scale: max representable is 6.0
-        block_max = w_blocked.abs().max(dim=1).values.clamp(min=1e-12)
-        scales = block_max / 6.0
-
-        # Quantize to nearest NVFP4 value
-        w_scaled = w_blocked / scales.unsqueeze(1)
-        fp4_vals = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-        signs = (w_scaled < 0).to(torch.uint8)
-        magnitudes = w_scaled.abs()
-
-        diffs = (magnitudes.unsqueeze(-1) - fp4_vals.unsqueeze(0).unsqueeze(0)).abs()
-        indices = diffs.argmin(-1).to(torch.uint8)
-        encoded = (signs << 3) | indices
-        encoded = encoded.reshape(-1)
-
-        # Pack pairs
-        even = encoded[0::2]
-        odd = encoded[1::2]
-        packed = even | (odd << 4)
-
-        return packed.contiguous(), scales.contiguous()
-
     def report_memory(self, num_experts=144, expert_hidden=16,
                       d_model=8, d_inner=16, d_state=16, N=65536):
         """Print memory usage breakdown by precision.
@@ -426,8 +327,8 @@ class PrecisionConfig:
                     + d_inner * (d_state // 2)  # rope
                     + d_model * d_inner)  # out_proj
         )
-        proj_bits = {'fp32': 32, 'tf32': 32, 'bf16': 16, 'fp8': 8,
-                     'mxfp4': 4, 'nvfp4': 4}.get(self.projection_precision, 32)
+        proj_bits = {'fp32': 32, 'tf32': 32, 'bf16': 16, 'fp8': 8}.get(
+            self.projection_precision, 32)
         proj_bytes = proj_elems * proj_bits // 8
 
         # Expert weights memory
@@ -590,12 +491,10 @@ class QuantFormat:
 
 QUANT_REGISTRY: Dict[str, QuantFormat] = {
     # Projection formats (ordered by aggressiveness)
-    'projection_fp32':  QuantFormat('FP32',  32, 'projection', 0,   0,   None),
-    'projection_tf32':  QuantFormat('TF32',  32, 'projection', 80,  80,  'projection_fp32'),
-    'projection_bf16':  QuantFormat('BF16',  16, 'projection', 80,  80,  'projection_tf32'),
-    'projection_fp8':   QuantFormat('FP8',   8,  'projection', 89,  90,  'projection_bf16'),
-    'projection_mxfp4': QuantFormat('MXFP4', 4,  'projection', 0,   100, 'projection_fp8'),
-    'projection_nvfp4': QuantFormat('NVFP4', 4,  'projection', 100, 100, 'projection_mxfp4'),
+    'projection_fp32': QuantFormat('FP32', 32, 'projection', 0,  0,  None),
+    'projection_tf32': QuantFormat('TF32', 32, 'projection', 80, 80, 'projection_fp32'),
+    'projection_bf16': QuantFormat('BF16', 16, 'projection', 80, 80, 'projection_tf32'),
+    'projection_fp8':  QuantFormat('FP8',  8,  'projection', 89, 90, 'projection_bf16'),
 
     # Expert weight formats
     'expert_fp32': QuantFormat('FP32', 32, 'expert', 0, 0, None),
@@ -610,7 +509,7 @@ def resolve_format(requested: str, component: str) -> QuantFormat:
     Walks the fallback chain until finding a format supported by current GPU.
 
     Args:
-        requested: format name (e.g. 'fp8', 'int8', 'nvfp4')
+        requested: format name (e.g. 'fp8', 'int8', 'int4')
         component: 'projection' or 'expert'
 
     Returns:

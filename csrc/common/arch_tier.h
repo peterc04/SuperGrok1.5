@@ -1,17 +1,10 @@
 // =====================================================================
-//  arch_tier.h — minimal compile-time arch tier shim.
+//  arch_tier.h — compile-time arch tier shim.
 //
-//  Recovered from the deleted csrc/common/dispatch.h@682eab4^. The
-//  per-arch namespace refactor made runtime tier dispatch obsolete
-//  (each TU knows its arch statically), but a few legacy sites in
-//  csrc/kernels/{cuda,hip}/<arch>/distributed_{,scan_}pipeline_<arch>.*
-//  still ask `get_arch_tier()` to pick between cp.async / TMA / generic
-//  smem-load variants. Those files now include this header and consume
-//  `kArchTier` (a constexpr) instead of the deleted runtime function.
-//
-//  The enum mirrors the pre-refactor one so the existing if/else chains
-//  in those files still compile. Adding a new tier means extending the
-//  enum and the per-arch macro switch below.
+//  3-arch active set: sm_90 (Hopper), gfx942 (CDNA3), tpu_v5p.
+//  Other arches (Ampere, Blackwell, CDNA4, etc.) are intentionally out
+//  of scope; they would re-enter the enum as future winners-expansion
+//  work and are not part of the current build.
 // =====================================================================
 
 #pragma once
@@ -19,38 +12,26 @@
 namespace sg {
 
 enum class ArchTier {
-    GENERIC,    // pre-Ampere NVIDIA, CDNA1-3 AMD (legacy bucket)
-    AMPERE,     // sm_80, sm_86, sm_89 (Ada uses Ampere-tier dispatch)
+    GENERIC,    // catch-all (CPU build / unsupported arch)
     HOPPER,     // sm_90 — H100 / H200
-    BLACKWELL,  // sm_100, sm_103, sm_120 — datacenter + ultra + consumer
     CDNA3,      // gfx942 — MI300X / MI300A
-    CDNA4,      // gfx950 — MI350X / MI355X
 };
 
 enum class StatePrecision {
     FP32 = 0,
     CONFIG4 = 1,
-    FP6 = 2,        // E3M2, CDNA4 (MI350X / MI355X)
 };
 
 enum class ExpertPrecision {
     FP32 = 0,
     INT8 = 1,
     INT4 = 2,
-    MXFP4 = 3,
-    FP4 = 4,        // E2M1, CDNA4 native (MI350X / MI355X)
 };
 
-#if   defined(SG_ARCH_SM80) || defined(SG_ARCH_SM89)
-constexpr ArchTier kArchTier = ArchTier::AMPERE;
-#elif defined(SG_ARCH_SM90)
+#if   defined(SG_ARCH_SM90)
 constexpr ArchTier kArchTier = ArchTier::HOPPER;
-#elif defined(SG_ARCH_SM100) || defined(SG_ARCH_SM103) || defined(SG_ARCH_SM120)
-constexpr ArchTier kArchTier = ArchTier::BLACKWELL;
 #elif defined(SG_ARCH_GFX942)
 constexpr ArchTier kArchTier = ArchTier::CDNA3;
-#elif defined(SG_ARCH_GFX950)
-constexpr ArchTier kArchTier = ArchTier::CDNA4;
 #else
 constexpr ArchTier kArchTier = ArchTier::GENERIC;
 #endif
@@ -59,9 +40,7 @@ inline constexpr ArchTier get_arch_tier() { return kArchTier; }
 
 } // namespace sg
 
-// The legacy code paths use unqualified `ArchTier::X` and `get_arch_tier()`.
-// Re-expose them at translation-unit scope so existing if/else chains
-// don't need rewriting.
+// Re-expose at translation-unit scope for legacy if/else chains.
 using ArchTier = ::sg::ArchTier;
 using StatePrecision = ::sg::StatePrecision;
 using ExpertPrecision = ::sg::ExpertPrecision;

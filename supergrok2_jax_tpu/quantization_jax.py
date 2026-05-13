@@ -2,10 +2,9 @@
 Quantization Utilities for SuperGrok v2 (JAX)
 
 Mirrors the quantization formats from the PyTorch implementation
-(grokking_optimizers/quantization.py):
+(grokking_optimizers/_quantization.py):
   - INT8 symmetric per-tensor quantization
-  - INT4 GPTQ-style packing (future)
-  - MXFP4 microscaling FP4 (future)
+  - INT4 GPTQ-style packing
 
 On TPU, these are primarily useful for reducing memory footprint of
 expert weights. XLA handles the dequantization fusion.

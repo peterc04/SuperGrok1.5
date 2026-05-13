@@ -20,9 +20,8 @@ The build targets a **3-arch active set**:
 | `gfx942` | CDNA3 | MI300X, MI300A | HIP |
 | `tpu_v5p` | TPU v5p | 128-wide MXU | JAX/Pallas |
 
-Anything else raises `UnsupportedArchError`. There is no tier fallback chain.
-The dispatch layer also recognizes future arches (sm_80, sm_89, sm_100, sm_103,
-sm_120, gfx950, tpu_v6e) but they are not compiled in this build.
+Anything else raises `UnsupportedArchError`. There is no tier fallback chain
+and no future-arch scaffolding — the active set is the only set.
 
 ---
 
@@ -534,9 +533,8 @@ Shared infrastructure unchanged in spirit by the refactor:
 - **utils.cuh** — warp/cluster reductions, hash PRNG, PTX wrappers
 - **ptx_intrinsics.cuh** — hot-path PTX (softplus, exp, stochastic round, GRU gates)
 - **tuned_configs.h** — autotuned launch configurations (currently all defaults)
-- **quantization.h** — FP8/INT8/INT4/MXFP4 quantization helpers
+- **quantization.h** — FP8/INT8/INT4 quantization helpers
 - **arch_tier.h** — compile-time architecture tier classification
-- **fp4_helpers.hip.h** — FP4 / FP6 helpers (CDNA4 future arch)
 
 ### Backend primitives
 

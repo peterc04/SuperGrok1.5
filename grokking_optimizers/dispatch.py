@@ -106,20 +106,16 @@ def get_gpu_arch() -> int:
         if sm == 90:
             return 90     # Hopper (H100, H200)
         raise UnsupportedArchError(
-            f"Detected sm_{sm}; only sm_90 (Hopper) is supported in the "
-            "3-arch active set. Other NVIDIA arches (sm_80, sm_89, sm_100, "
-            "sm_103, sm_120) have been removed from the active set.")
+            f"Detected sm_{sm}; only sm_90 (Hopper) is in the active set.")
 
     if vendor == 'amd':
         prop = torch.cuda.get_device_properties(0)
-        # gcnArchName looks like 'gfx942:sramecc+:xnack-'; take the prefix.
         arch_name = (prop.gcnArchName or '').split(':')[0]
         if arch_name == 'gfx942':
             return 942
         raise UnsupportedArchError(
             f"Detected {arch_name!r}; only gfx942 (MI300X/MI300A) is "
-            "supported in the 3-arch active set. gfx950 (MI350X/MI355X) "
-            "and other AMD arches have been removed from the active set.")
+            "in the active set.")
 
     raise UnsupportedArchError(f"Unknown GPU vendor {vendor!r}")
 
@@ -200,36 +196,6 @@ def supports_block_clusters() -> bool:
 def supports_matrix_cores() -> bool:
     """Matrix cores: AMD MFMA on gfx942, or NVIDIA Tensor Cores on sm_90."""
     return True
-
-
-def supports_nvfp4() -> bool:
-    """NVFP4 (4-bit FP) tensor cores — future Blackwell arches only."""
-    return False
-
-
-def supports_nvfp4_accelerated() -> bool:
-    """Native NVFP4 acceleration (sm_103 Blackwell Ultra)."""
-    return False
-
-
-def supports_consumer_blackwell() -> bool:
-    """Consumer Blackwell (sm_120) feature set."""
-    return False
-
-
-def supports_fp4_mfma() -> bool:
-    """FP4 MFMA on CDNA4 (gfx950)."""
-    return False
-
-
-def supports_fp6_state() -> bool:
-    """FP6 state packing on CDNA4 (gfx950)."""
-    return False
-
-
-def supports_24_sparsity() -> bool:
-    """2:4 structured sparsity (CDNA4 + Ampere+)."""
-    return False
 
 
 # ----------------------------------------------------------------------

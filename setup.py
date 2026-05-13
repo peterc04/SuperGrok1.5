@@ -206,11 +206,9 @@ elif _has_gpu:
     ] + gencode
 
     # ------------------------------------------------------------------
-    # CUTLASS opt-in. Only Hopper+ / Blackwell pass -DCUTLASS_NVCC_ARCHS
-    # (the "advanced" SM targets that emit sm_XXa instructions, e.g.
-    # 90a = Hopper TMA + WGMMA, 100a = datacenter Blackwell, 103a =
-    # Blackwell Ultra NVFP4, 120a = consumer Blackwell). sm_80/sm_89
-    # don't get the flag — they stay on cuBLAS.
+    # CUTLASS opt-in. Hopper passes -DCUTLASS_NVCC_ARCHS=90a, which emits
+    # the "advanced" SM target (TMA + WGMMA). Without -DWITH_CUTLASS=1
+    # Muon and SG2 stay on cuBLAS via torch::mm.
     #
     # Arches present in TORCH_CUDA_ARCH_LIST (or the default supported
     # set) are inspected: any of {9.0,10.0,10.3,12.0} triggers a
