@@ -1,11 +1,11 @@
-// csrc/kernels/cuda/sm_90/models/mamba.cu
+// csrc/backends/cuda/sm_90/models/mamba.cu
 // Translation unit that instantiates the Mamba model templates declared in
 // mamba.cuh for {float, __half, __nv_bfloat16}. The header contains the
 // full implementation; this TU only forces explicit instantiation so the
 // binding (csrc/bindings/models_mamba.cpp) can link against concrete
 // symbols.
 
-#include "csrc/kernels/cuda/sm_90/models/mamba.cuh"
+#include "csrc/backends/cuda/sm_90/models/mamba.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>

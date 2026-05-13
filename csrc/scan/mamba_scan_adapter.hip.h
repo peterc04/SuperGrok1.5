@@ -4,8 +4,7 @@
 // model-layer use. Same interface as the sm_90 adapter but delegates to
 // gfx942 primitives.
 //
-// The actual scan device functions live in:
-//   csrc/device/optimizers/gfx942/supergrok2_gfx942.hip.cuh
+// Algorithm spec for SG2 lives in csrc/algorithms/supergrok2.h.
 //
 // Key differences from sm_90:
 //   - Wave-64 scan butterfly (strides start at 32, not 16)
@@ -21,7 +20,8 @@
 #include "csrc/common/platform.h"
 #include "csrc/common/types.h"
 #include "csrc/common/utils.cuh"
-#include "csrc/device/optimizers/gfx942/supergrok2_gfx942.hip.cuh"
+#include "csrc/algorithms/supergrok2.h"
+#include "csrc/scan/affine2x2.h"
 
 namespace sg { namespace gfx942 { namespace models { namespace mamba_adapter {
 

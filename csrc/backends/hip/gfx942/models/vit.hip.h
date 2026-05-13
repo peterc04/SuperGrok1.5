@@ -1,4 +1,4 @@
-// csrc/kernels/hip/gfx942/models/vit.hip.h
+// csrc/backends/hip/gfx942/models/vit.hip.h
 // Vision Transformer model header for gfx942 (CDNA3 / MI300X).
 //
 // Strategy: this is a thin wrapper around the sm_90 implementation.
@@ -16,7 +16,7 @@
 #include "csrc/common/types.h"
 // Bring in the full sm_90 ViT template implementation. On HIP the cuBLAS
 // includes are hipified to rocBLAS by PyTorch's CUDAExtension.
-#include "csrc/kernels/cuda/sm_90/models/vit.cuh"
+#include "csrc/backends/cuda/sm_90/models/vit.cuh"
 
 namespace sg { namespace gfx942 { namespace models { namespace vit {
 

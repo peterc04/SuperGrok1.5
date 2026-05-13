@@ -1,5 +1,5 @@
 // =====================================================================
-//  csrc/kernels/cuda/sm_90/models/decoder.cu
+//  csrc/backends/cuda/sm_90/models/decoder.cu
 //
 //  sm_90 (Hopper) Decoder Transformer — explicit template instantiation TU.
 //
@@ -16,7 +16,7 @@
 //  GEMMs use cuBLAS with matching CublasTraits<T>.)
 // =====================================================================
 
-#include "csrc/kernels/cuda/sm_90/models/decoder.cuh"
+#include "csrc/backends/cuda/sm_90/models/decoder.cuh"
 
 namespace sg { namespace sm90 { namespace models { namespace decoder {
 

@@ -1,4 +1,4 @@
-// csrc/kernels/cuda/sm_90/models/vit.cuh
+// csrc/backends/cuda/sm_90/models/vit.cuh
 // Vision Transformer model header for sm_90 (Hopper).
 //
 // Implements the post-norm ViT from grokking_race_v2.py:ViT/EncoderBlock:
@@ -49,7 +49,7 @@
 #include "csrc/common/platform.h"
 #include "csrc/common/types.h"
 #include "csrc/common/utils.cuh"
-#include "csrc/kernels/cuda/sm_90/models/attention.cuh"
+#include "csrc/backends/cuda/sm_90/models/attention.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

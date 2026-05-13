@@ -1,4 +1,4 @@
-// csrc/kernels/cuda/sm_90/models/mamba.cuh
+// csrc/backends/cuda/sm_90/models/mamba.cuh
 // Mamba (selective state-space) model header for sm_90 (Hopper).
 //
 // Full forward/backward implementation. Mirrors the Python reference in
@@ -55,7 +55,7 @@
 #include <algorithm>
 
 #ifdef WITH_CUTLASS
-#include "csrc/kernels/cuda/_cutlass_gemm.cuh"
+#include "csrc/backends/cuda/sm_90/mma.cuh"
 #endif
 
 namespace sg { namespace sm90 { namespace models { namespace mamba {

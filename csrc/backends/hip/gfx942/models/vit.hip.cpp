@@ -1,8 +1,8 @@
 // =====================================================================
-//  csrc/kernels/hip/gfx942/models/vit.hip.cpp
+//  csrc/backends/hip/gfx942/models/vit.hip.cpp
 //
 //  gfx942 (CDNA3 / MI300X) ViT — explicit template instantiation TU.
-//  Mirrors csrc/kernels/cuda/sm_90/models/vit.cu but for the HIP build.
+//  Mirrors csrc/backends/cuda/sm_90/models/vit.cu but for the HIP build.
 //
 //  Instantiates:
 //    1. gfx942 wrappers (sg::gfx942::models::vit::forward/backward/patch_project)
@@ -15,8 +15,8 @@
 //  Dtype matrix (homogeneous): {float, __nv_bfloat16, __half}.
 // =====================================================================
 
-#include "csrc/kernels/hip/gfx942/models/vit.hip.h"
-// vit.hip.h pulls in csrc/kernels/cuda/sm_90/models/vit.cuh which itself
+#include "csrc/backends/hip/gfx942/models/vit.hip.h"
+// vit.hip.h pulls in csrc/backends/cuda/sm_90/models/vit.cuh which itself
 // includes attention.cuh, so the sm_90 attention templates are already
 // visible here.
 

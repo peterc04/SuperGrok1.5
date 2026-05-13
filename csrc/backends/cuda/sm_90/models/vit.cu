@@ -1,5 +1,5 @@
 // =====================================================================
-//  csrc/kernels/cuda/sm_90/models/vit.cu
+//  csrc/backends/cuda/sm_90/models/vit.cu
 //
 //  sm_90 (Hopper) Vision Transformer — explicit template instantiation TU.
 //
@@ -17,7 +17,7 @@
 //  in practice via SG_DISPATCH on the input dtype.
 // =====================================================================
 
-#include "csrc/kernels/cuda/sm_90/models/vit.cuh"
+#include "csrc/backends/cuda/sm_90/models/vit.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

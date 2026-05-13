@@ -1,10 +1,10 @@
 // =====================================================================
-//  csrc/kernels/hip/gfx942/models/decoder.hip.cpp
+//  csrc/backends/hip/gfx942/models/decoder.hip.cpp
 //
 //  gfx942 (CDNA3 / MI300X) Decoder Transformer — explicit template
 //  instantiation TU.
 //
-//  This TU mirrors csrc/kernels/cuda/sm_90/models/decoder.cu but in the
+//  This TU mirrors csrc/backends/cuda/sm_90/models/decoder.cu but in the
 //  HIP build. It instantiates:
 //
 //    1. The gfx942 wrappers (sg::gfx942::models::decoder::forward/backward)
@@ -24,8 +24,8 @@
 //  PyTorch's hipification of <cuda_bf16.h> / <cuda_fp16.h>.
 // =====================================================================
 
-#include "csrc/kernels/hip/gfx942/models/decoder.hip.h"
-// decoder.hip.h pulls in csrc/kernels/cuda/sm_90/models/decoder.cuh
+#include "csrc/backends/hip/gfx942/models/decoder.hip.h"
+// decoder.hip.h pulls in csrc/backends/cuda/sm_90/models/decoder.cuh
 // which itself includes attention.cuh, so the sm_90 attention templates
 // are already visible here.
 

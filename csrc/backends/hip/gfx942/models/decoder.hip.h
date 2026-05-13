@@ -1,4 +1,4 @@
-// csrc/kernels/hip/gfx942/models/decoder.hip.h
+// csrc/backends/hip/gfx942/models/decoder.hip.h
 // Decoder model header for gfx942 (CDNA3 / MI300X).
 //
 // Strategy: this is a thin wrapper around the sm_90 implementation. The
@@ -25,7 +25,7 @@
 // Bring in the full sm_90 decoder template implementation. On HIP the
 // includes (cublas_v2.h, cuda_bf16.h, etc.) are remapped to their ROCm
 // equivalents by PyTorch's hipification step.
-#include "csrc/kernels/cuda/sm_90/models/decoder.cuh"
+#include "csrc/backends/cuda/sm_90/models/decoder.cuh"
 
 namespace sg { namespace gfx942 { namespace models { namespace decoder {
 

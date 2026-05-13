@@ -1,4 +1,4 @@
-// csrc/kernels/cuda/sm_90/models/decoder.cuh
+// csrc/backends/cuda/sm_90/models/decoder.cuh
 // Autoregressive Decoder Transformer for sm_90 (Hopper).
 //
 // Reference (grokking_race_v2.py lines 318-340):
@@ -63,7 +63,7 @@
 #include "csrc/common/platform.h"
 #include "csrc/common/types.h"
 #include "csrc/common/utils.cuh"
-#include "csrc/kernels/cuda/sm_90/models/attention.cuh"
+#include "csrc/backends/cuda/sm_90/models/attention.cuh"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>

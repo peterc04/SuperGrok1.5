@@ -23,8 +23,11 @@
 #include "csrc/common/types.h"
 #include "csrc/common/utils.cuh"
 
-// Device-level scan primitives from the SG2 optimizer kernels
-#include "csrc/device/optimizers/sm_90/supergrok2_sm90.cuh"
+// Algorithm spec for SG2 — kept as a documentation anchor for the scan
+// recurrence definition. This adapter's scan kernels are self-contained
+// and only need MAX_D_STATE / PSCAN_THRESHOLD / ptx_expf from common/.
+#include "csrc/algorithms/supergrok2.h"
+#include "csrc/scan/affine2x2.h"
 
 namespace sg { namespace sm90 { namespace models { namespace mamba_adapter {
 

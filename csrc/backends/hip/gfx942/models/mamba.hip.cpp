@@ -1,8 +1,8 @@
 // =====================================================================
-//  csrc/kernels/hip/gfx942/models/mamba.hip.cpp
+//  csrc/backends/hip/gfx942/models/mamba.hip.cpp
 //
 //  gfx942 (CDNA3 / MI300X) Mamba — explicit template instantiation TU.
-//  Mirrors csrc/kernels/cuda/sm_90/models/mamba.cu but for the HIP build.
+//  Mirrors csrc/backends/cuda/sm_90/models/mamba.cu but for the HIP build.
 //
 //  Instantiates:
 //    1. gfx942 wrappers (sg::gfx942::models::mamba::{forward, backward,
@@ -16,7 +16,7 @@
 //  Dtype matrix: {float, __nv_bfloat16, __half}.
 // =====================================================================
 
-#include "csrc/kernels/hip/gfx942/models/mamba.hip.h"
+#include "csrc/backends/hip/gfx942/models/mamba.hip.h"
 
 // ─── gfx942 wrapper instantiations ───────────────────────────────────
 namespace sg { namespace gfx942 { namespace models { namespace mamba {
