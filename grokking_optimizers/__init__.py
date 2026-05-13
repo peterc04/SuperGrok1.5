@@ -6,9 +6,10 @@ Package layout:
     optimizers/         11 torch.optim.Optimizer subclasses (the race optimizers)
     dispatch.py         arch detection + fused kernel routing + get_ops()
     fallback.py         pure-Python reference implementations (testing only)
-    _metanet.py         Mamba3 + PEER + GRU meta-net (used by SG2 / 1.5 / 1.1)
-    _quantization.py    precision-mode helpers used by SG2 family
-    _gradient_hook.py   GradientHookOptimizer wrapper
+
+Each optimizer file is fully self-contained — the Mamba3+PEER metanet and
+PrecisionConfig live inside supergrok2.py; SharpnessMetaNet is duplicated
+between supergrok15.py and supergrok11.py.
 
 Usage:
     from grokking_optimizers import SuperGrok2, Lion, GrokAdamW, ...
@@ -47,7 +48,7 @@ except RuntimeError:
 # --------------------------------------------------------------------------
 
 from grokking_optimizers.optimizers.supergrok2 import SuperGrok2, CompiledSuperGrok2
-from grokking_optimizers.optimizers.supergrok15 import SuperGrok15, SharpnessMetaNet
+from grokking_optimizers.optimizers.supergrok15 import SuperGrok15
 from grokking_optimizers.optimizers.supergrok11 import SuperGrok11
 from grokking_optimizers.optimizers.grokadamw import GrokAdamW
 from grokking_optimizers.optimizers.grokfast import Grokfast
@@ -60,13 +61,12 @@ from grokking_optimizers.optimizers.moe_adam import MoEAwareSuperGrok2
 
 
 # --------------------------------------------------------------------------
-# Extensions (auxiliary — shared infrastructure used by SG2 family)
+# Re-exports of inlined classes (live inside the optimizer files)
 # --------------------------------------------------------------------------
 
-from grokking_optimizers._metanet import (
-    Mamba3PEERMetaNet, Mamba3ScanBlock, MiniGRU,
+from grokking_optimizers.optimizers.supergrok2 import (
+    Mamba3PEERMetaNet, Mamba3ScanBlock, MiniGRU, PrecisionConfig,
 )
-from grokking_optimizers._quantization import PrecisionConfig
 from grokking_optimizers._gradient_hook import GradientHookOptimizer
 
 
@@ -85,7 +85,7 @@ from grokking_optimizers.dispatch import (
 __all__ = [
     # 11 core optimizers
     "SuperGrok2", "CompiledSuperGrok2",
-    "SuperGrok15", "SharpnessMetaNet",
+    "SuperGrok15",
     "SuperGrok11",
     "GrokAdamW",
     "Grokfast",

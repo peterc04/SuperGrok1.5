@@ -28,14 +28,656 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.optim import Optimizer
-from typing import Optional, Dict, List
-
-from grokking_optimizers._metanet import Mamba3PEERMetaNet
+from typing import Optional, Dict, List, Tuple
 
 from grokking_optimizers._ops_loader import get_ops
+from grokking_optimizers.dispatch import (
+    get_gpu_arch, get_gpu_vendor,
+    supports_bf16, supports_fp8, supports_tf32,
+)
 
 _ops = get_ops()  # Fails loudly if C++ extension not built
 _HAS_CUDA = hasattr(_ops, 'supergrok2_mamba_peer_batched_step')
+_HAS_CUDA_BACKWARD = hasattr(_ops, 'supergrok2_bilevel_fwd_save')
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Precision configuration (formerly grokking_optimizers/_quantization.py)
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class PrecisionConfig:
+    """Configures precision for different components of the optimizer.
+
+    Supported precision modes (3-arch active set):
+      Projections: fp32, tf32, bf16, fp8
+      Expert weights: fp32, int8, int4
+      Scan state: always fp32 (numerical necessity)
+    """
+
+    PROJECTION_MODES = ('fp32', 'tf32', 'bf16', 'fp8', 'auto')
+    EXPERT_MODES = ('fp32', 'int8', 'int4', 'auto')
+
+    def __init__(
+        self,
+        projection_precision='auto',
+        expert_precision='fp32',
+        scan_precision='fp32',
+        dynamic=False,
+    ):
+        self.scan_precision = 'fp32'
+        self.dynamic = dynamic
+
+        if projection_precision == 'auto':
+            arch = get_gpu_arch()
+            vendor = get_gpu_vendor()
+            if vendor == 'amd':
+                # gfx942 (CDNA3, MI300X) supports BF16 MFMA; we don't target
+                # older AMD archs in the 3-arch active set.
+                self.projection_precision = 'bf16' if supports_bf16() else 'fp32'
+            elif arch >= 90:
+                self.projection_precision = 'fp8'
+            elif arch >= 80:
+                self.projection_precision = 'bf16'
+            else:
+                self.projection_precision = 'fp32'
+        else:
+            if projection_precision not in self.PROJECTION_MODES:
+                raise ValueError(
+                    f"Unknown projection precision: {projection_precision}. "
+                    f"Must be one of {self.PROJECTION_MODES}"
+                )
+            self.projection_precision = projection_precision
+
+        if expert_precision == 'auto':
+            self.expert_precision = 'int8'
+        else:
+            if expert_precision not in self.EXPERT_MODES:
+                raise ValueError(
+                    f"Unknown expert precision: {expert_precision}. "
+                    f"Must be one of {self.EXPERT_MODES}"
+                )
+            self.expert_precision = expert_precision
+
+        self._step_count = 0
+        self._grad_norm_ema = None
+        self._grad_norm_var_ema = None
+        self._precision_tier = 0
+
+    def convert_projection_weights(self, w):
+        """Convert a projection weight matrix to the target precision."""
+        if self.projection_precision in ('fp32', 'tf32'):
+            return w.float().contiguous(), None
+        elif self.projection_precision == 'bf16':
+            if not supports_bf16():
+                return w.float().contiguous(), None
+            return w.bfloat16().contiguous(), None
+        elif self.projection_precision == 'fp8':
+            if not supports_fp8():
+                if supports_bf16():
+                    return w.bfloat16().contiguous(), None
+                return w.float().contiguous(), None
+            scale = w.abs().max().clamp(min=1e-12)
+            w_scaled = w.float().div(scale)
+            w_fp8 = w_scaled.to(torch.float8_e4m3fn)
+            return w_fp8, scale
+        else:
+            raise ValueError(f"Unknown precision: {self.projection_precision}")
+
+    def convert_expert_weights(self, w1, b1, w2, b2):
+        """Convert expert MLP weights to target precision."""
+        if self.expert_precision == 'fp32':
+            return {
+                'w1': w1.float().contiguous(),
+                'b1': b1.float().contiguous(),
+                'w2': w2.float().contiguous(),
+                'b2': b2.float().contiguous(),
+                'mode': 'fp32',
+            }
+        elif self.expert_precision == 'int8':
+            return self._quantize_expert_int8(w1, b1, w2, b2)
+        elif self.expert_precision == 'int4':
+            return self._quantize_expert_int4(w1, b1, w2, b2)
+        else:
+            raise ValueError(f"Unknown expert precision: {self.expert_precision}")
+
+    def _quantize_expert_int8(self, w1, b1, w2, b2):
+        def sym_quant(w):
+            absmax = w.abs().max().clamp(min=1e-12)
+            scale = absmax / 127.0
+            q = (w / scale).round().clamp(-127, 127).to(torch.int8)
+            return q, scale
+
+        w1_q, w1_s = sym_quant(w1.float())
+        w2_q, w2_s = sym_quant(w2.float())
+        return {
+            'w1_q': w1_q.contiguous(), 'w1_s': w1_s,
+            'b1': b1.float().contiguous(),
+            'w2_q': w2_q.contiguous(), 'w2_s': w2_s,
+            'b2': b2.float().contiguous(),
+            'mode': 'int8',
+        }
+
+    def _quantize_expert_int4(self, w1, b1, w2, b2):
+        def int4_quant(w, group_size=32):
+            w_flat = w.reshape(-1).float()
+            N = w_flat.numel()
+            N_padded = ((N + 1) // 2) * 2
+            if N_padded > N:
+                w_flat = torch.nn.functional.pad(w_flat, (0, N_padded - N))
+
+            num_groups = (N_padded + group_size - 1) // group_size
+            actual_gs = N_padded // num_groups
+            w_grouped = w_flat.reshape(num_groups, actual_gs)
+
+            gmax = w_grouped.max(dim=1).values
+            gmin = w_grouped.min(dim=1).values
+            scales = ((gmax - gmin) / 15.0).clamp(min=1e-12)
+            zeros = gmin
+
+            q = ((w_grouped - zeros.unsqueeze(1)) / scales.unsqueeze(1))
+            q = q.round().clamp(0, 15).to(torch.uint8).reshape(-1)
+
+            even = q[0::2]
+            odd = q[1::2]
+            packed = even | (odd << 4)
+            return packed, scales, zeros
+
+        w1_p, w1_s, w1_z = int4_quant(w1)
+        w2_p, w2_s, w2_z = int4_quant(w2)
+        return {
+            'w1_packed': w1_p.contiguous(), 'w1_scales': w1_s, 'w1_zeros': w1_z,
+            'b1': b1.float().contiguous(),
+            'w2_packed': w2_p.contiguous(), 'w2_scales': w2_s, 'w2_zeros': w2_z,
+            'b2': b2.float().contiguous(),
+            'mode': 'int4',
+        }
+
+    def update_dynamic(self, grad_norm):
+        """Update dynamic precision state based on gradient norm stability."""
+        if not self.dynamic:
+            return False
+
+        self._step_count += 1
+        alpha = 0.01
+
+        if self._grad_norm_ema is None:
+            self._grad_norm_ema = grad_norm
+            self._grad_norm_var_ema = 0.0
+            return False
+
+        self._grad_norm_ema = (1 - alpha) * self._grad_norm_ema + alpha * grad_norm
+        deviation = (grad_norm - self._grad_norm_ema) ** 2
+        self._grad_norm_var_ema = (1 - alpha) * self._grad_norm_var_ema + alpha * deviation
+
+        cv = math.sqrt(self._grad_norm_var_ema) / max(self._grad_norm_ema, 1e-12)
+
+        if self._step_count < 500:
+            return False
+
+        changed = False
+        if cv < 0.05 and self._precision_tier < 3:
+            self._precision_tier = 3
+            changed = True
+        elif cv < 0.10 and self._precision_tier < 2:
+            self._precision_tier = 2
+            changed = True
+        elif cv < 0.20 and self._precision_tier < 1:
+            self._precision_tier = 1
+            changed = True
+        elif cv > 0.30 and self._precision_tier > 0:
+            self._precision_tier = 0
+            changed = True
+
+        if changed:
+            self._apply_dynamic_tier()
+        return changed
+
+    def _apply_dynamic_tier(self):
+        vendor = get_gpu_vendor()
+        if vendor == 'nvidia':
+            proj_tiers = ['fp32', 'tf32', 'bf16', 'fp8']
+        else:
+            proj_tiers = ['fp32', 'fp32', 'bf16', 'bf16']
+        expert_tiers = ['fp32', 'fp32', 'int8', 'int4']
+
+        tier = min(self._precision_tier, len(proj_tiers) - 1)
+        new_proj = proj_tiers[tier]
+        if new_proj == 'fp8' and not supports_fp8():
+            new_proj = 'bf16'
+        if new_proj == 'bf16' and not supports_bf16():
+            new_proj = 'fp32'
+        if new_proj == 'tf32' and not supports_tf32():
+            new_proj = 'fp32'
+        self.projection_precision = new_proj
+        self.expert_precision = expert_tiers[min(tier, len(expert_tiers) - 1)]
+
+    @property
+    def stability_cv(self):
+        if self._grad_norm_ema is None or self._grad_norm_var_ema is None:
+            return float('inf')
+        return math.sqrt(self._grad_norm_var_ema) / max(self._grad_norm_ema, 1e-12)
+
+    def __repr__(self):
+        parts = [
+            f"projection={self.projection_precision}",
+            f"expert={self.expert_precision}",
+            f"scan={self.scan_precision}",
+        ]
+        if self.dynamic:
+            parts.append(f"dynamic=True (tier={self._precision_tier})")
+        return f"PrecisionConfig({', '.join(parts)})"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Mamba-3 + 4-Head PEER + GRU meta-network
+#  (formerly grokking_optimizers/_metanet.py)
+#
+#  Architecture per optimizer step, per parameter:
+#    1. SORT by |gradient|
+#    2. MAMBA-3 BIDIRECTIONAL SCAN — cross-element awareness via SSM
+#    3. PER-ELEMENT GRU — temporal memory across optimizer steps
+#    4. 4-HEAD PEER ROUTING — product-key lookup, 4 experts per element
+#    5. EXPERT MLP — 144 experts, hidden=16 default
+#    6. DYNAMIC EXPERT RECYCLING — dead experts cloned from top performer
+#    7. SKIP CONNECTION — smart_grad = grad + rescale * sum(expert_outputs)
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class Mamba3ScanBlock(nn.Module):
+    """Simplified Mamba-3 selective scan for per-parameter gradient processing."""
+
+    def __init__(self, d_model: int = 8, d_state: int = 16, expand: int = 2):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_inner = d_model * expand
+
+        self.in_proj = nn.Linear(d_model, 2 * self.d_inner, bias=False)
+        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=True)
+        self.B_proj = nn.Linear(self.d_inner, d_state, bias=False)
+        self.C_proj = nn.Linear(self.d_inner, d_state, bias=False)
+        self.A_log = nn.Parameter(
+            torch.log(torch.linspace(1, d_state, d_state)).unsqueeze(0).repeat(self.d_inner, 1))
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+
+        assert d_state % 2 == 0, "d_state must be even for paired RoPE"
+        self.rope_freq = nn.Parameter(torch.randn(self.d_inner, d_state // 2) * 0.01)
+
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor, initial_state: Optional[torch.Tensor] = None):
+        N = x.shape[0]
+        xz = self.in_proj(x)
+        x_branch, z = xz.chunk(2, dim=-1)
+
+        dt = torch.nn.functional.softplus(self.dt_proj(x_branch))
+        B = self.B_proj(x_branch)
+        C = self.C_proj(x_branch)
+
+        A = -torch.exp(self.A_log)
+        phase = self.rope_freq
+
+        if initial_state is not None:
+            h = initial_state.clone()
+        else:
+            h = torch.zeros(self.d_inner, self.d_state, device=x.device, dtype=x.dtype)
+
+        outputs = []
+        for i in range(N):
+            dt_i = dt[i].unsqueeze(-1)
+            A_bar = (1.0 + dt_i * A / 2.0) / (1.0 - dt_i * A / 2.0 + 1e-8)
+            B_bar = dt_i * B[i].unsqueeze(0)
+
+            angle = dt_i * phase
+            cos_a = torch.cos(angle)
+            sin_a = torch.sin(angle)
+            h_even = h[:, 0::2]
+            h_odd = h[:, 1::2]
+            h_rot = torch.zeros_like(h)
+            h_rot[:, 0::2] = h_even * cos_a - h_odd * sin_a
+            h_rot[:, 1::2] = h_odd * cos_a + h_even * sin_a
+
+            h = A_bar * h_rot + B_bar * x_branch[i].unsqueeze(-1)
+            y_i = (h * C[i].unsqueeze(0)).sum(dim=-1)
+            outputs.append(y_i)
+
+        y = torch.stack(outputs, dim=0)
+        y = y * torch.nn.functional.silu(z)
+        y = y + self.D.unsqueeze(0) * x_branch
+        output = self.out_proj(y)
+        return output, h
+
+
+class MiniGRU(nn.Module):
+    """Tiny per-element GRU for temporal memory across optimizer steps."""
+
+    def __init__(self, input_dim: int, hidden_dim: int = 4):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.W_z = nn.Linear(input_dim + hidden_dim, hidden_dim)
+        self.W_r = nn.Linear(input_dim + hidden_dim, hidden_dim)
+        self.W_h = nn.Linear(input_dim + hidden_dim, hidden_dim)
+
+    def forward(self, x: torch.Tensor, h: torch.Tensor):
+        xh = torch.cat([x, h], dim=-1)
+        z = torch.sigmoid(self.W_z(xh))
+        r = torch.sigmoid(self.W_r(xh))
+        xrh = torch.cat([x, r * h], dim=-1)
+        h_tilde = torch.tanh(self.W_h(xrh))
+        h_new = (1 - z) * h + z * h_tilde
+        return h_new
+
+
+class Mamba3PEERMetaNet(nn.Module):
+    """Mamba-3 + 4-Head PEER + Per-Element GRU meta-network."""
+
+    def __init__(
+        self,
+        d_model: int = 8,
+        d_state: int = 16,
+        mamba_expand: int = 2,
+        num_peer_heads: int = 4,
+        num_experts: int = 144,
+        expert_hidden: int = 16,
+        gru_hidden: int = 4,
+        rescale: float = 0.1,
+        recycle_interval: int = 100,
+        recycle_threshold: float = 0.001,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.num_peer_heads = num_peer_heads
+        self.num_experts = num_experts
+        self.expert_hidden = expert_hidden
+        self.gru_hidden = gru_hidden
+        self.rescale = rescale
+        self.recycle_interval = recycle_interval
+        self.recycle_threshold = recycle_threshold
+
+        self.pk_dim = int(math.sqrt(num_experts))
+        assert self.pk_dim * self.pk_dim == num_experts, \
+            f"num_experts must be perfect square, got {num_experts}"
+
+        self.input_proj = nn.Linear(2, d_model, bias=True)
+        self.mamba_fwd = Mamba3ScanBlock(d_model, d_state, mamba_expand)
+        self.mamba_bwd = Mamba3ScanBlock(d_model, d_state, mamba_expand)
+
+        gru_input_dim = 2 + 2 * d_model
+        self.gru = MiniGRU(gru_input_dim, gru_hidden)
+
+        peer_input_dim = gru_hidden + 2 * d_model + 2
+        self.peer_queries = nn.ModuleList([
+            nn.Linear(peer_input_dim, d_model, bias=False)
+            for _ in range(num_peer_heads)
+        ])
+        self.product_keys_A = nn.ParameterList([
+            nn.Parameter(torch.randn(self.pk_dim, d_model // 2) * 0.02)
+            for _ in range(num_peer_heads)
+        ])
+        self.product_keys_B = nn.ParameterList([
+            nn.Parameter(torch.randn(self.pk_dim, d_model // 2) * 0.02)
+            for _ in range(num_peer_heads)
+        ])
+
+        self.expert_W1 = nn.Parameter(torch.randn(num_experts, expert_hidden, 1) * 0.02)
+        self.expert_b1 = nn.Parameter(torch.zeros(num_experts, expert_hidden))
+        self.expert_W2 = nn.Parameter(torch.randn(num_experts, 1, expert_hidden) * 0.02)
+        self.expert_b2 = nn.Parameter(torch.zeros(num_experts, 1))
+
+        self.register_buffer('expert_counts', torch.zeros(num_experts, dtype=torch.int32))
+        self.register_buffer('step_counter', torch.tensor(0, dtype=torch.long))
+
+    def forward(
+        self,
+        grad: torch.Tensor,
+        sharpness: torch.Tensor,
+        gru_state: torch.Tensor,
+        mamba_fwd_state: Optional[torch.Tensor] = None,
+        mamba_bwd_state: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        N = grad.numel()
+        g = grad.reshape(-1).float()
+        s = sharpness.reshape(-1).float()
+
+        sort_idx = g.abs().argsort()
+        g_sorted = g[sort_idx]
+        s_sorted = s[sort_idx]
+
+        inp = torch.stack([g_sorted, s_sorted], dim=-1)
+        x = self.input_proj(inp)
+
+        fwd_out, new_fwd_state = self.mamba_fwd(x, mamba_fwd_state)
+        bwd_out, new_bwd_state = self.mamba_bwd(x.flip(0), mamba_bwd_state)
+        bwd_out = bwd_out.flip(0)
+
+        unsort_idx = sort_idx.argsort()
+        fwd_ctx = fwd_out[unsort_idx]
+        bwd_ctx = bwd_out[unsort_idx]
+
+        gru_input = torch.cat([
+            g.unsqueeze(-1), s.unsqueeze(-1),
+            fwd_ctx, bwd_ctx
+        ], dim=-1)
+        new_gru = self.gru(gru_input, gru_state.float())
+
+        peer_input = torch.cat([
+            new_gru, fwd_ctx, bwd_ctx,
+            g.unsqueeze(-1), s.unsqueeze(-1)
+        ], dim=-1)
+
+        total_expert_out = torch.zeros(N, 1, device=grad.device, dtype=torch.float32)
+
+        for h in range(self.num_peer_heads):
+            query = self.peer_queries[h](peer_input)
+            q_a = query[:, :self.d_model // 2]
+            q_b = query[:, self.d_model // 2:]
+
+            idx_a = (q_a @ self.product_keys_A[h].T).argmax(dim=-1)
+            idx_b = (q_b @ self.product_keys_B[h].T).argmax(dim=-1)
+            expert_idx = idx_a * self.pk_dim + idx_b
+
+            if self.training:
+                with torch.no_grad():
+                    self.expert_counts.scatter_add_(
+                        0, expert_idx,
+                        torch.ones_like(expert_idx, dtype=torch.int32))
+
+            W1 = self.expert_W1[expert_idx]
+            b1 = self.expert_b1[expert_idx]
+            W2 = self.expert_W2[expert_idx]
+            b2 = self.expert_b2[expert_idx]
+
+            z = torch.relu(torch.bmm(W1, g.unsqueeze(-1).unsqueeze(-1)).squeeze(-1) + b1)
+            out = torch.bmm(W2, z.unsqueeze(-1)).squeeze(-1) + b2
+            total_expert_out = total_expert_out + out
+
+        total_expert_out = total_expert_out / self.num_peer_heads
+        smart_grad = (g.unsqueeze(-1) + self.rescale * total_expert_out).squeeze(-1)
+        smart_grad = smart_grad.reshape(grad.shape).to(grad.dtype)
+
+        return smart_grad, new_gru, new_fwd_state, new_bwd_state
+
+    def forward_for_bilevel(
+        self, grad, sharpness, gru_state,
+        mamba_fwd_state=None, mamba_bwd_state=None,
+    ):
+        """Differentiable forward with top-k sparse soft PEER routing."""
+        N = grad.numel()
+        g = grad.reshape(-1).float()
+        s = sharpness.reshape(-1).float()
+
+        sort_idx = g.abs().argsort()
+        g_sorted = g[sort_idx]
+        s_sorted = s[sort_idx]
+
+        inp = torch.stack([g_sorted, s_sorted], dim=-1)
+        x = self.input_proj(inp)
+
+        fwd_out, new_fwd = self.mamba_fwd(x, mamba_fwd_state)
+        bwd_out, new_bwd = self.mamba_bwd(x.flip(0), mamba_bwd_state)
+        bwd_out = bwd_out.flip(0)
+
+        unsort_idx = sort_idx.argsort()
+        fwd_ctx = fwd_out[unsort_idx]
+        bwd_ctx = bwd_out[unsort_idx]
+
+        gru_input = torch.cat([g.unsqueeze(-1), s.unsqueeze(-1), fwd_ctx, bwd_ctx], dim=-1)
+        new_gru = self.gru(gru_input, gru_state.float())
+
+        peer_input = torch.cat([new_gru, fwd_ctx, bwd_ctx, g.unsqueeze(-1), s.unsqueeze(-1)], dim=-1)
+
+        total_expert_out = torch.zeros(N, 1, device=grad.device, dtype=torch.float32)
+        topk = 4
+
+        for h in range(self.num_peer_heads):
+            query = self.peer_queries[h](peer_input)
+            q_a = query[:, :self.d_model // 2]
+            q_b = query[:, self.d_model // 2:]
+
+            scores_a = q_a @ self.product_keys_A[h].T
+            scores_b = q_b @ self.product_keys_B[h].T
+
+            top_a_vals, top_a_idx = scores_a.topk(topk, dim=-1)
+            top_b_vals, top_b_idx = scores_b.topk(topk, dim=-1)
+
+            soft_a = torch.softmax(top_a_vals * 10.0, dim=-1)
+            soft_b = torch.softmax(top_b_vals * 10.0, dim=-1)
+
+            expert_indices = (top_a_idx.unsqueeze(2) * self.pk_dim + top_b_idx.unsqueeze(1)).reshape(N, -1)
+            routing_weights = (soft_a.unsqueeze(2) * soft_b.unsqueeze(1)).reshape(N, -1)
+
+            W1 = self.expert_W1[expert_indices]
+            b1 = self.expert_b1[expert_indices]
+            W2 = self.expert_W2[expert_indices]
+            b2 = self.expert_b2[expert_indices]
+
+            num_active = topk * topk
+            g_exp = g.unsqueeze(1).unsqueeze(-1).unsqueeze(-1).expand(-1, num_active, -1, -1)
+            z = torch.relu(torch.matmul(W1, g_exp).squeeze(-1) + b1)
+            out = torch.matmul(W2, z.unsqueeze(-1)).squeeze(-1).squeeze(-1) + b2.squeeze(-1)
+            head_out = (routing_weights * out).sum(dim=1, keepdim=True)
+            total_expert_out = total_expert_out + head_out
+
+        total_expert_out = total_expert_out / self.num_peer_heads
+        smart_grad = (g.unsqueeze(-1) + self.rescale * total_expert_out).squeeze(-1)
+        return smart_grad.reshape(grad.shape).to(grad.dtype), new_gru, new_fwd, new_bwd
+
+    @torch.no_grad()
+    def _recycle_dead_experts(self):
+        """Replace dead experts with mutated clones of top performers."""
+        total_activations = self.expert_counts.sum().item()
+        if total_activations == 0:
+            return
+
+        fractions = self.expert_counts.float() / total_activations
+        dead_mask = fractions < self.recycle_threshold
+
+        if not dead_mask.any():
+            self.expert_counts.zero_()
+            return
+
+        counts_f = self.expert_counts.float()
+        top_expert = torch.multinomial(counts_f, 1).item()
+        dead_indices = dead_mask.nonzero(as_tuple=True)[0]
+
+        for idx in dead_indices:
+            i = idx.item()
+            noise_scale = 0.01
+            self.expert_W1.data[i] = self.expert_W1.data[top_expert] + \
+                noise_scale * torch.randn_like(self.expert_W1.data[i])
+            self.expert_b1.data[i] = self.expert_b1.data[top_expert] + \
+                noise_scale * torch.randn_like(self.expert_b1.data[i])
+            self.expert_W2.data[i] = self.expert_W2.data[top_expert] + \
+                noise_scale * torch.randn_like(self.expert_W2.data[i])
+            self.expert_b2.data[i] = self.expert_b2.data[top_expert] + \
+                noise_scale * torch.randn_like(self.expert_b2.data[i])
+
+            a_idx = i // self.pk_dim
+            b_idx = i % self.pk_dim
+
+            row_start = a_idx * self.pk_dim
+            row_end = row_start + self.pk_dim
+            if dead_mask[row_start:row_end].all():
+                for h in range(self.num_peer_heads):
+                    self.product_keys_A[h].data[a_idx] = torch.randn_like(
+                        self.product_keys_A[h].data[a_idx]) * 0.02
+
+            col_indices = torch.arange(0, self.num_experts, self.pk_dim,
+                                       device=dead_mask.device) + b_idx
+            col_indices = col_indices[col_indices < self.num_experts]
+            if dead_mask[col_indices].all():
+                for h in range(self.num_peer_heads):
+                    self.product_keys_B[h].data[b_idx] = torch.randn_like(
+                        self.product_keys_B[h].data[b_idx]) * 0.02
+
+        self.expert_counts.zero_()
+
+    @property
+    def has_cuda_bilevel(self):
+        """Whether CUDA bilevel backward kernels are available."""
+        return _HAS_CUDA_BACKWARD and next(self.parameters()).is_cuda
+
+    def forward_for_bilevel_cuda(
+        self, grad, sharpness, gru_state,
+        mamba_fwd_state=None, mamba_bwd_state=None,
+    ):
+        """Bilevel forward; falls back to forward_for_bilevel."""
+        return self.forward_for_bilevel(
+            grad, sharpness, gru_state, mamba_fwd_state, mamba_bwd_state)
+
+    def get_weights(self):
+        """Extract all weights for CUDA kernel."""
+        return {
+            'input_proj_W': self.input_proj.weight.detach().float().contiguous(),
+            'input_proj_b': self.input_proj.bias.detach().float().contiguous(),
+            'mamba_fwd_in_proj': self.mamba_fwd.in_proj.weight.detach().float().contiguous(),
+            'mamba_fwd_dt_proj_W': self.mamba_fwd.dt_proj.weight.detach().float().contiguous(),
+            'mamba_fwd_dt_proj_b': self.mamba_fwd.dt_proj.bias.detach().float().contiguous(),
+            'mamba_fwd_B_proj': self.mamba_fwd.B_proj.weight.detach().float().contiguous(),
+            'mamba_fwd_C_proj': self.mamba_fwd.C_proj.weight.detach().float().contiguous(),
+            'mamba_fwd_A_log': self.mamba_fwd.A_log.detach().float().contiguous(),
+            'mamba_fwd_D': self.mamba_fwd.D.detach().float().contiguous(),
+            'mamba_fwd_rope_freq': self.mamba_fwd.rope_freq.detach().float().contiguous(),
+            'mamba_fwd_out_proj': self.mamba_fwd.out_proj.weight.detach().float().contiguous(),
+            'mamba_bwd_in_proj': self.mamba_bwd.in_proj.weight.detach().float().contiguous(),
+            'mamba_bwd_dt_proj_W': self.mamba_bwd.dt_proj.weight.detach().float().contiguous(),
+            'mamba_bwd_dt_proj_b': self.mamba_bwd.dt_proj.bias.detach().float().contiguous(),
+            'mamba_bwd_B_proj': self.mamba_bwd.B_proj.weight.detach().float().contiguous(),
+            'mamba_bwd_C_proj': self.mamba_bwd.C_proj.weight.detach().float().contiguous(),
+            'mamba_bwd_A_log': self.mamba_bwd.A_log.detach().float().contiguous(),
+            'mamba_bwd_D': self.mamba_bwd.D.detach().float().contiguous(),
+            'mamba_bwd_rope_freq': self.mamba_bwd.rope_freq.detach().float().contiguous(),
+            'mamba_bwd_out_proj': self.mamba_bwd.out_proj.weight.detach().float().contiguous(),
+            'gru_W_z': self.gru.W_z.weight.detach().float().contiguous(),
+            'gru_b_z': self.gru.W_z.bias.detach().float().contiguous(),
+            'gru_W_r': self.gru.W_r.weight.detach().float().contiguous(),
+            'gru_b_r': self.gru.W_r.bias.detach().float().contiguous(),
+            'gru_W_h': self.gru.W_h.weight.detach().float().contiguous(),
+            'gru_b_h': self.gru.W_h.bias.detach().float().contiguous(),
+            'peer_queries': [q.weight.detach().float().contiguous() for q in self.peer_queries],
+            'product_keys_A': [k.detach().float().contiguous() for k in self.product_keys_A],
+            'product_keys_B': [k.detach().float().contiguous() for k in self.product_keys_B],
+            'expert_W1': self.expert_W1.detach().float().contiguous(),
+            'expert_b1': self.expert_b1.detach().float().contiguous(),
+            'expert_W2': self.expert_W2.detach().float().contiguous(),
+            'expert_b2': self.expert_b2.detach().float().contiguous(),
+            'rescale': self.rescale,
+            'd_model': self.d_model,
+            'd_state': self.d_state,
+            'd_inner': self.mamba_fwd.d_inner,
+            'pk_dim': self.pk_dim,
+            'expert_hidden': self.expert_hidden,
+            'gru_hidden': self.gru_hidden,
+            'num_peer_heads': self.num_peer_heads,
+            'num_experts': self.num_experts,
+        }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SuperGrok v2 optimizer
+# ════════════════════════════════════════════════════════════════════════════
 
 
 class SuperGrok2(Optimizer):
@@ -117,7 +759,6 @@ class SuperGrok2(Optimizer):
         self.sam_rho = sam_rho
 
         # Precision configuration for projection GEMMs
-        from grokking_optimizers._quantization import PrecisionConfig
         self.precision_config = PrecisionConfig(
             projection_precision=projection_precision)
 

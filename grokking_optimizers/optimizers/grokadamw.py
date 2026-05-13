@@ -19,6 +19,26 @@ from grokking_optimizers._ops_loader import get_ops
 _ops = get_ops()  # Fails loudly if C++ extension not built
 
 
+@torch.no_grad()
+def _adamw_step_reference(params, grads, exp_avgs, exp_avg_sqs, steps,
+                          lr, beta1, beta2, eps, wd):
+    """Pure-Python AdamW reference step (decoupled weight decay).
+
+    Kept as documentation of the math the fused kernel implements; not
+    invoked on the hot path (the C++ extension's grokadamw_fused_step
+    handles every GPU/CPU case).
+    """
+    for p, g, ea, easq, step in zip(params, grads, exp_avgs, exp_avg_sqs, steps):
+        bc1 = 1.0 - beta1 ** step
+        bc2 = 1.0 - beta2 ** step
+        ea.mul_(beta1).add_(g, alpha=1 - beta1)
+        easq.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+        step_size = lr / bc1
+        denom = (easq / bc2).sqrt().add_(eps)
+        p.mul_(1 - lr * wd)
+        p.addcdiv_(ea, denom, value=-step_size)
+
+
 class GrokAdamW(Optimizer):
     """Adam with grokking-aware EMA gradient filtering and amplification.
 

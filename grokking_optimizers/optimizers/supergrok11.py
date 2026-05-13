@@ -15,7 +15,50 @@ from grokking_optimizers._ops_loader import get_ops
 
 _ops = get_ops()  # Fails loudly if C++ extension not built
 _ops_cpu = _ops  # CPU ops are part of the same extension
-from .supergrok15 import SharpnessMetaNet
+
+
+class SharpnessMetaNet(nn.Module):
+    """Element-wise gradient transformation conditioned on sharpness.
+
+    Architecture: output = grad + rescale * MLP(grad, sharpness)
+    MLP: Linear(2, H) -> GELU -> Linear(H, 1)
+
+    Duplicated verbatim from supergrok15.py so each optimizer file is fully
+    self-contained. If the metanet architecture changes, update both copies.
+    """
+
+    def __init__(self, hidden_dim: int = 32):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.net = nn.Sequential(
+            nn.Linear(2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.rescale = nn.Parameter(torch.zeros(1))
+        with torch.no_grad():
+            self.net[0].weight.normal_(0, 0.01)
+            self.net[0].bias.zero_()
+            self.net[2].weight.normal_(0, 0.01)
+            self.net[2].bias.zero_()
+
+    def forward(self, grad: torch.Tensor, sharpness: torch.Tensor) -> torch.Tensor:
+        if grad.numel() == 0:
+            return grad
+        shape = grad.shape
+        flat_g = grad.reshape(-1, 1)
+        flat_s = sharpness.reshape(-1, 1)
+        inp = torch.cat([flat_g, flat_s], dim=1)
+        correction = self.rescale * self.net(inp)
+        return (flat_g + correction).reshape(shape)
+
+    def get_weights(self):
+        W1 = self.net[0].weight.data.contiguous()
+        b1 = self.net[0].bias.data.contiguous()
+        W2 = self.net[2].weight.data.contiguous()
+        b2 = self.net[2].bias.data.contiguous()
+        rescale = self.rescale.data.item()
+        return W1, b1, W2, b2, rescale
 
 
 class SuperGrok11(Optimizer):

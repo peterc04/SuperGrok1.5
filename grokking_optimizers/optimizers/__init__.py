@@ -13,7 +13,7 @@ Public classes (re-exported by grokking_optimizers/__init__.py):
 """
 
 from .supergrok2 import SuperGrok2, CompiledSuperGrok2
-from .supergrok15 import SuperGrok15, SharpnessMetaNet
+from .supergrok15 import SuperGrok15
 from .supergrok11 import SuperGrok11
 from .grokadamw import GrokAdamW
 from .grokfast import Grokfast
@@ -26,7 +26,7 @@ from .moe_adam import MoEAwareSuperGrok2
 
 __all__ = [
     "SuperGrok2", "CompiledSuperGrok2",
-    "SuperGrok15", "SharpnessMetaNet",
+    "SuperGrok15",
     "SuperGrok11",
     "GrokAdamW",
     "Grokfast",
