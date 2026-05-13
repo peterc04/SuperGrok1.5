@@ -1,8 +1,27 @@
 // HIP gfx942 launch glue for NeuralGrok.
 // Algorithm: csrc/algorithms/neuralgrok.h
 //
-// Two-stage: psi-net MLP forward (via torch::matmul + ReLU), then
-// Adam apply on amplified gradient.
+// COMPUTE PATTERN
+// Mixed: per-element psi-net MLP + AdamW.
+//   Per element:
+//     h = W1 * |g| + b1     — 1×1 × 1×H → 1×H GEMM (per element)
+//     h = relu(h)
+//     s = W2 * h + b2       — 1×H × H×1 → 1×1 GEMM (per element)
+//     g_amp = (s * alpha + beta) * g
+//     AdamW(g_amp)
+//
+// MFMA APPLICABILITY: partial.
+// The per-element MLP is structurally GEMM-shaped but the contraction
+// dimension is too small (H typically 16-32) for MFMA's 16×16×16 tile to
+// give a clean win on the FIRST layer (input is 1-D scalar). The SECOND
+// layer (N × H × 1) is a true matrix-vector op: if we batch across N,
+// MFMA can run at full pipe.
+//
+// WHY ATEN HERE
+// ATen + rocBLAS handles the batched layer-2 GEMM via MFMA already. The
+// layer-1 (input is per-element scalar) doesn't benefit from MFMA; ATen
+// emits a broadcast elementwise kernel. Hand-written fusion would save
+// 1 kernel launch (≈ 3 µs).
 
 #include <torch/extension.h>
 #include <vector>

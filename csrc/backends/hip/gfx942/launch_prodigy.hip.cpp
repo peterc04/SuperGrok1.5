@@ -1,8 +1,28 @@
 // HIP gfx942 launch glue for Prodigy.
 // Algorithm: csrc/algorithms/prodigy.h
 //
-// Three-stage: (1) reduce r,s partials, (2) update d, (3) apply Adam with d.
-// On HIP, the device-resident d_t scalar is kept as a 1-element tensor.
+// COMPUTE PATTERN
+// Mixed: per-element + reduction.
+//   Per element: r_local += g * (p_init - p) * d
+//                s_local += d² * |g|
+//                AdamW apply with d as the lr scale
+//   Reduction:   r_global = sum(r_local) across all elements (single FP32 scalar)
+//                s_global = sum(s_local) across all elements
+//                d_new = max(d_prev, r_global / |s_global|)
+// The reduction is the bottleneck: needs wavefront reduce → LDS tree reduce
+// → cross-block (cooperative or atomic) final reduce.
+//
+// MFMA APPLICABILITY: none.
+// The reduction needs wave-reduce (`__shfl_xor` with mask=64 on CDNA3),
+// then LDS-tree across waves in a block, then a single `atomicAdd` to a
+// global counter. No GEMM, no MFMA.
+//
+// WHY ATEN HERE
+// ATen's `.sum()` dispatches to rocPRIM's segmented reduction, which on
+// MI300X already uses wave-reduce + LDS-tree internally. The hand-written
+// version would save the kernel launch overhead (~3 µs per launch) and
+// fuse the partial r/s accumulation with the AdamW apply. Modest gain
+// (~2×) that is hardware-verified or not at all.
 
 #include <torch/extension.h>
 #include <vector>

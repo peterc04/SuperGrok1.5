@@ -1,8 +1,32 @@
 // HIP gfx942 launch glue for Muon.
 // Algorithm: csrc/algorithms/muon.h
 //
-// Newton-Schulz iterations use torch::mm (which routes to rocBLAS).
-// 1D parameters fall back to AdamW.
+// COMPUTE PATTERN
+// Mixed: GEMM-heavy.
+//   1. momentum buffer:    buf = momentum * buf + g           — elementwise
+//   2. Frobenius norm:     inv_norm = 1 / ||buf||_F           — global reduction
+//   3. normalize:          X = buf * inv_norm                  — elementwise
+//   4. Newton-Schulz × 5:  for step in {0..4}:
+//                             A   = X @ X.T          — GEMM (rows × cols)
+//                             AX  = A @ X            — GEMM
+//                             AAX = A @ AX           — GEMM
+//                             X   = 3.4445*X - 4.7750*AX + 2.0315*AAX
+//   5. update:             p -= lr * X * scale + p * decay     — elementwise
+//
+// MFMA APPLICABILITY: significant.
+// The 3 GEMMs per Newton-Schulz step are exactly what MFMA accelerates.
+// Typical Muon shapes for grokking models (e.g. 96×96 weight matrices):
+// MFMA `v_mfma_f32_16x16x16_bf16` runs 6×6 = 36 MFMA tiles per GEMM.
+// At MI300X's 1100 TFLOPS BF16, the 3 GEMMs × 5 steps complete in ~5 µs.
+//
+// WHY ATEN HERE
+// `torch::mm` on a HIP tensor dispatches to rocBLAS's GEMM, which
+// internally uses `v_mfma_f32_16x16x16_bf16` for the BF16 path (or
+// `v_mfma_f32_16x16x4_f32` for FP32). The MFMA acceleration is already
+// being exercised through rocBLAS — we just don't see the intrinsics in
+// our source code. Hand-writing the GEMM with explicit MFMA intrinsics
+// would gain perhaps 1.2× over rocBLAS at small N, mainly by avoiding the
+// rocBLAS launcher's overhead. Not worth the maintenance burden.
 
 #include <torch/extension.h>
 #include <vector>

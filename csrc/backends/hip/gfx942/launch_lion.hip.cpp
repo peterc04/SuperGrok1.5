@@ -1,5 +1,32 @@
 // HIP gfx942 launch glue for Lion.
 // Algorithm: csrc/algorithms/lion.h
+//
+// COMPUTE PATTERN
+// Pure elementwise. For each param element:
+//   interp  = beta1 * ema + (1 - beta1) * g       — 2 reads, 1 FMA
+//   update  = sign(interp)                         — 1 op
+//   param  -= lr * (update + wd * param)           — 1 FMA + 1 mul + 1 sub
+//   ema     = beta2 * ema + (1 - beta2) * g        — 2 reads, 1 FMA
+// No reduction, no GEMM. Bandwidth-bound (~6 mem ops per element).
+//
+// MFMA APPLICABILITY: none.
+// MFMA pipes operate on 16×16×16 tiles for matrix-matrix multiply. Lion has
+// no GEMM, so there is nothing for MFMA to accelerate. The optimal CDNA3
+// kernel would use 256-byte (vec4 FP32 × 64-lane wavefront) coalesced
+// loads/stores via `buffer_load_dword_x4`, with sign computation in
+// registers. Bandwidth (≈ 1.6 TB/s on MI300X HBM3) is the bound.
+//
+// WHY ATEN HERE
+// `.hip.cpp` files are routed through the host compiler (g++/clang++) by
+// PyTorch's cpp_extension, not through hipcc. We cannot define `__global__`
+// kernels here; all GPU work goes through ATen. ATen tensor ops dispatch
+// to rocPRIM / rocPRIM-thrust which already produces coalesced vectorized
+// kernels for elementwise math. A hand-written `__global__` kernel would
+// be slightly faster (saving 2-3 kernel launches by fusing) but the
+// bandwidth bound is the same. To migrate to a hand-written kernel:
+//   1. Rename `.hip.cpp` → `.hip` (PyTorch routes `.hip` through hipcc).
+//   2. Add `*.hip` to the source glob in setup.py for the HIP branch.
+//   3. Implement `__global__ void lion_kernel(...)` + `hipLaunchKernelGGL(...)`.
 
 #include <torch/extension.h>
 #include <vector>

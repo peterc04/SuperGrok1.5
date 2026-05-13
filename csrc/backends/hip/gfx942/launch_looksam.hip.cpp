@@ -1,5 +1,21 @@
-// HIP gfx942 launch glue for LookSAM (4 operations).
+// HIP gfx942 launch glue for LookSAM.
 // Algorithm: csrc/algorithms/looksam.h
+//
+// COMPUTE PATTERN
+// Four separate ops (matches the algorithm-header structure):
+//   1. perturb:     p_pert = p + rho * (g / ||g||)              — elementwise + 1 reduction
+//   2. restore:     p = p_pert - rho * (g / ||g||)              — elementwise
+//   3. set_direction: sam_dir = g_sam - g                       — elementwise
+//   4. apply:       g_adj = (1-alpha)*g + alpha*sam_dir; AdamW(g_adj)
+// The ||g|| computation in steps 1 + 2 is a global reduction.
+//
+// MFMA APPLICABILITY: none. Elementwise + scalar reduction.
+//
+// WHY ATEN HERE
+// Each op is a chain of broadcasted tensor expressions. ATen + rocPRIM
+// handles the elementwise + reduction patterns natively. Hand-written
+// fusion would chain perturb + reduce + apply into 1 kernel instead of 3;
+// gain is ≈ 1.7× and needs hardware verification.
 
 #include <torch/extension.h>
 #include <vector>

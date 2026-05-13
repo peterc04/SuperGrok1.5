@@ -115,8 +115,17 @@ if _has_gpu and _is_hip:
     print(f"  ROCm version: {torch.version.hip}")
 
     sources = COMMON_BINDINGS + _collect([
+        # `.hip.cpp` files go through the host compiler (PyTorch's
+        # cpp_extension._is_cuda_file() doesn't match this suffix). They use
+        # ATen tensor ops + rocBLAS — see each launcher's "WHY ATEN HERE"
+        # block.
         "csrc/backends/hip/gfx942/*.hip.cpp",
         "csrc/backends/hip/gfx942/models/*.hip.cpp",
+        # `.hip` files go through hipcc (PyTorch routes the extension to its
+        # HIP/CUDA pipeline). Use this for hand-written `__global__` kernels
+        # with `hipLaunchKernelGGL` launch syntax. Currently only
+        # launch_lion_native.hip lives here, as a template/demonstration.
+        "csrc/backends/hip/gfx942/*.hip",
     ])
 
     rocm_archs = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()

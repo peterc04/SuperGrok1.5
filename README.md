@@ -601,6 +601,52 @@ Each dispatcher inside `bindings.cpp` filters undefined gradients, packs
 tensors into vectors, and calls `SG_DISPATCH(launcher, ...)` which picks
 the right backend at runtime.
 
+### HIP backend: ATen + rocBLAS-MFMA design
+
+The HIP gfx942 launchers (`csrc/backends/hip/gfx942/launch_*.hip.cpp`) use
+ATen tensor ops + rocBLAS rather than hand-written `__global__` HIP kernels.
+This is a deliberate constraint of PyTorch's `cpp_extension`:
+
+- `_is_cuda_file()` only matches `.cu`, `.cuh`, and `.hip` extensions for
+  hipcc routing. Files with the `.hip.cpp` suffix go through the host
+  compiler (g++/clang++), which cannot compile `__global__` decorations or
+  `<<<grid, block>>>` launch syntax.
+
+- ATen tensor ops on a HIP tensor dispatch to **rocBLAS** for GEMMs and
+  **rocPRIM** (rocPRIM-thrust) for elementwise / reduction patterns.
+  rocBLAS internally uses `v_mfma_f32_16x16x16_bf16` MFMA instructions on
+  CDNA3 for BF16/FP16 inputs at sizes ≥ 16, so the dense-linear-algebra
+  portion of every HIP launcher already exercises the MFMA pipeline —
+  it just isn't visible in our source code.
+
+Per-optimizer MFMA applicability (analysis in each launcher's file header):
+
+| Optimizer       | Pattern              | MFMA via rocBLAS | Hand-written kernel win |
+|-----------------|----------------------|------------------|-------------------------|
+| Lion            | elementwise          | n/a — no GEMM    | ~1.3× (kernel fusion)   |
+| AdamW           | elementwise          | n/a — no GEMM    | ~1.3× (kernel fusion)   |
+| GrokAdamW       | elementwise          | n/a — no GEMM    | ~1.5× (fuse EMA+Adam)   |
+| Grokfast        | elementwise          | n/a — no GEMM    | ~1.5× (fuse EMA+Adam)   |
+| LookSAM         | elementwise + reduce | n/a              | ~1.7× (fuse 3 kernels)  |
+| Prodigy         | elementwise + reduce | n/a              | ~2× (fuse reduce+apply) |
+| Muon            | elementwise + GEMM   | ✓ (5 NS GEMMs)   | ~1.2× (skip rocBLAS overhead) |
+| NeuralGrok      | per-element MLP      | ✓ (layer 2)      | ~1.5× (fuse MLP+Adam)   |
+| SuperGrok v1.1  | per-param MLP + Adam | ✓ (MLP forward)  | ~1.5× (fuse)            |
+| SuperGrok v1.5  | per-param MLP + Adam | ✓ (MLP forward)  | ~1.5× (fuse)            |
+| SuperGrok v2    | scan + GEMM + GRU    | ✓ (projections)  | substantial (LDS scan)  |
+
+Each launcher's file header contains a four-block analysis: COMPUTE PATTERN,
+MFMA APPLICABILITY, WHY ATEN HERE, and the three-step migration recipe to
+a hand-written kernel.
+
+A reference native HIP kernel implementation lives in
+`csrc/backends/hip/gfx942/launch_lion_native.hip` — a `.hip` file (routes
+through hipcc) with a real `__global__ void lion_kernel(...)` launched via
+`hipLaunchKernelGGL`. It demonstrates the wavefront-64 grid-stride pattern
++ FP32 accumulation + BF16/FP16 storage. The bindings still dispatch to
+the ATen `launch_lion_step` from `launch_lion.hip.cpp`; promoting to native
+is a one-line bindings change after MI300X validation.
+
 ---
 
 ## Python frontend

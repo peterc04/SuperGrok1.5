@@ -1,5 +1,17 @@
 // HIP gfx942 launch glue for SuperGrok v1.5.
 // Algorithm: csrc/algorithms/supergrok15.h
+//
+// COMPUTE PATTERN
+// Mixed: meta-MLP + per-coord alpha gate + sharpness backward + AdamW.
+//   Per element:
+//     mu = phi_mlp(grad, sharpness)        — 2-input × H × 1 MLP
+//     alpha = clamp(alpha_base * (1 + mu), 0, alpha_max)
+//     smart_grad = g + gate_signal * alpha * mu
+//     AdamW(smart_grad)
+//   Plus: sharpness EMA update (separate kernel).
+//
+// MFMA APPLICABILITY: same as NeuralGrok / SG11 — partial via rocBLAS dispatch
+// for the MLP.
 
 #include <torch/extension.h>
 #include <vector>

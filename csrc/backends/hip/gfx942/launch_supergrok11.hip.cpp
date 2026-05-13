@@ -1,8 +1,19 @@
 // HIP gfx942 launch glue for SuperGrok v1.1.
 // Algorithm: csrc/algorithms/supergrok11.h
 //
-// Two-sweep pattern via sequential ATen calls (cooperative launch not
-// available on HIP without explicit stream sync).
+// COMPUTE PATTERN
+// Mixed: per-parameter meta-MLP + cosine-similarity gating + AdamW.
+//   Per element:
+//     mu = phi_mlp(grad, sharpness)        — 2-input × H × 1 MLP
+//     cosine = sum(grad * momentum) / (||grad|| * ||momentum||)
+//     gate   = clamp(cosine, 0, 1)
+//     smart_grad = g + (1-gate) * alpha * mu
+//     AdamW(smart_grad)
+// The cosine numerator + two denominators are global reductions.
+//
+// MFMA APPLICABILITY: partial (same as NeuralGrok).
+// The MLP forward could route through MFMA if we batch across N; in
+// practice ATen + rocBLAS already does this via the rocBLAS dispatch.
 
 #include <torch/extension.h>
 #include <vector>

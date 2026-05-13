@@ -1,5 +1,11 @@
-// HIP gfx942 launch glue for Grokfast (fused EMA + Adam).
+// HIP gfx942 launch glue for Grokfast.
 // Algorithm: csrc/algorithms/grokfast.h
+//
+// COMPUTE PATTERN
+// Identical to GrokAdamW (EMA amplification + AdamW). Hyperparameters differ;
+// math is structurally the same.
+//
+// MFMA APPLICABILITY: none. Elementwise.
 
 #include <torch/extension.h>
 #include <vector>

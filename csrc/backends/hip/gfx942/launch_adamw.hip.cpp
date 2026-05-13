@@ -1,11 +1,21 @@
-// HIP gfx942 launch glue for AdamW.
-// Algorithm: csrc/algorithms/adamw.h (math spec)
-// Primitives: csrc/backends/hip/gfx942/primitives.hpp (ATen helpers)
+// HIP gfx942 launch glue for AdamW (simple, used by Muon 1D params + LookSAM).
+// Algorithm: csrc/algorithms/adamw.h
 //
-// Note: .hip.cpp files route through the host compiler (g++/clang++), NOT
-// hipcc. Therefore this file cannot contain __global__ kernels. Instead
-// we implement AdamW via ATen tensor ops, which PyTorch dispatches to
-// hipBLAS / rocBLAS / internal HIP kernels.
+// COMPUTE PATTERN
+// Pure elementwise. Per element:
+//   m = beta1 * m + (1-beta1) * g         — 1 FMA, 2 reads, 1 write
+//   v = beta2 * v + (1-beta2) * g²        — 1 FMA + 1 mul, 2 reads, 1 write
+//   p -= lr * (m / bc1 / (sqrt(v/bc2) + eps) + wd * p)  — div, sqrt, FMA
+// Bandwidth-bound (≈ 12 mem ops per element including p, m, v, g).
+//
+// MFMA APPLICABILITY: none.
+// AdamW is pure elementwise SIMD. No matrix multiplies. CDNA3 v_mfma_*
+// instructions would be unused.
+//
+// WHY ATEN HERE
+// Same constraint as launch_lion: `.hip.cpp` → host compiler. The ATen
+// path uses `mul_().addcmul_().sqrt_()` which dispatches to rocPRIM
+// elementwise kernels. Bandwidth is the bound either way.
 
 #include <torch/extension.h>
 #include <vector>

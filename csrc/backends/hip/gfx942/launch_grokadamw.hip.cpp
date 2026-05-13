@@ -1,5 +1,20 @@
 // HIP gfx942 launch glue for GrokAdamW.
 // Algorithm: csrc/algorithms/grokadamw.h
+//
+// COMPUTE PATTERN
+// Elementwise EMA-amplified Adam. Per element:
+//   ema = alpha * ema + (1-alpha) * g
+//   g_amp = g + lamb * ema
+//   then AdamW(g_amp) per launch_adamw.
+// 4 state tensors (p, m, v, ema) + grad → 5 mem reads + 4 writes per element.
+//
+// MFMA APPLICABILITY: none. Pure elementwise.
+//
+// WHY ATEN HERE
+// Same as launch_adamw. The ema update fuses with the Adam apply only if
+// we hand-write a `__global__` kernel — the ATen path generates 2 kernel
+// launches (one for ema, one for adam). The fusion gain is ~1.5×; the
+// bandwidth bound stays the same.
 
 #include <torch/extension.h>
 #include <vector>
