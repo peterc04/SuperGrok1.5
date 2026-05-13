@@ -16,7 +16,7 @@ import torch.nn as nn
 from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
-from grokking_optimizers._ops_loader import get_ops
+from grokking_optimizers.dispatch import get_ops
 
 _ops = get_ops()  # Fails loudly if C++ extension not built
 

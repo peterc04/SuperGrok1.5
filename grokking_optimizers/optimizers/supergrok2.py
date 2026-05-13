@@ -30,7 +30,7 @@ import torch.distributed as dist
 from torch.optim import Optimizer
 from typing import Optional, Dict, List, Tuple
 
-from grokking_optimizers._ops_loader import get_ops
+from grokking_optimizers.dispatch import get_ops
 from grokking_optimizers.dispatch import (
     get_gpu_arch, get_gpu_vendor,
     supports_bf16, supports_fp8, supports_tf32,

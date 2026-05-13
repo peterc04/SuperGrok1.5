@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.optim import Optimizer
 from typing import Optional, Callable, Dict, Tuple
 
-from grokking_optimizers._ops_loader import get_ops
+from grokking_optimizers.dispatch import get_ops
 
 _ops = get_ops()  # Fails loudly if C++ extension not built
 _ops_cpu = _ops  # CPU ops are part of the same extension
