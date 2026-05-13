@@ -586,20 +586,14 @@ def _tr(name, c):
 from grokking_optimizers import (
     SuperGrok15, SuperGrok2, SuperGrok11,
     GrokAdamW, NeuralGrok, Prodigy, Grokfast, Lion, LookSAM, Muon,
-    CUDAGraphOptimizer,
 )
 from grokking_optimizers.gradient_hook_optimizer import GradientHookOptimizer
 from grokking_optimizers.fused_dispatch import has_fused, dispatch_fused
 from grokking_optimizers.dispatch import detect_arch
 
 def _maybe_wrap_cuda_graph(opt, c):
-    """Wrap optimizer in CUDAGraphOptimizer if enabled in config."""
-    if c.get("use_cuda_graph", False):
-        return CUDAGraphOptimizer(
-            opt,
-            warmup_steps=c.get("cuda_graph_warmup", 3),
-            max_graph_age=c.get("cuda_graph_max_age", 0),
-        )
+    """No-op shim. CUDA Graph wrapping was removed in the post-refactor
+    cleanup; the race is single-node and does not need graph capture."""
     return opt
 
 def _maybe_wrap_grad_hooks(opt, model, c):

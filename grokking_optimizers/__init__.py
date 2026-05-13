@@ -1,11 +1,11 @@
 """Grokking Optimizers — vendor-neutral algorithm + per-vendor backend.
 
-After the Phase 9 refactor the package is organized as:
+Package layout:
 
   grokking_optimizers/
     optimizers/      11 torch.optim.Optimizer subclasses (the race optimizers)
-    extensions/      auxiliary infrastructure (distributed, CUDA Graphs,
-                     quantization, async pipelines, gradient hooks, ...)
+    extensions/      shared infrastructure used by the SG2 family
+                     (Mamba3 meta-net, quantization, gradient hooks)
     dispatch.py      arch detection + fused kernel routing + get_ops()
     fallback.py      pure-Python reference implementations (testing only)
 
@@ -59,28 +59,14 @@ from grokking_optimizers.optimizers.moe_adam import MoEAwareSuperGrok2
 
 
 # --------------------------------------------------------------------------
-# Extensions (auxiliary)
+# Extensions (auxiliary — shared infrastructure used by SG2 family)
 # --------------------------------------------------------------------------
 
 from grokking_optimizers.extensions.mamba3_peer_metanet import (
     Mamba3PEERMetaNet, Mamba3ScanBlock, MiniGRU,
 )
-from grokking_optimizers.extensions.cuda_graph_optimizer import CUDAGraphOptimizer
 from grokking_optimizers.extensions.quantization import PrecisionConfig
-from grokking_optimizers.extensions.distributed import (
-    setup_distributed, cleanup_distributed,
-    get_rank, get_world_size, is_main_process,
-    broadcast_optimizer_state, wrap_model_ddp,
-)
-from grokking_optimizers.extensions.overlap_distributed import OverlappedOptimizer
-from grokking_optimizers.extensions.gradient_compression import (
-    INT8GradientCompressor, PowerSGDCompressor,
-)
-from grokking_optimizers.extensions.partial_graph import PartialGraphOptimizer
-from grokking_optimizers.extensions.sparse_gradients import SparseGradientHandler
-from grokking_optimizers.extensions.pipelined_optimizer import PipelinedOptimizer
 from grokking_optimizers.extensions.gradient_hook_optimizer import GradientHookOptimizer
-from grokking_optimizers.extensions.async_supergrok2 import AsyncSuperGrok2
 
 
 # --------------------------------------------------------------------------
@@ -111,20 +97,10 @@ __all__ = [
     "Prodigy",
     "MoEAwareSuperGrok2",
 
-    # Extensions
+    # Extensions (shared infrastructure)
     "Mamba3PEERMetaNet", "Mamba3ScanBlock", "MiniGRU",
-    "CUDAGraphOptimizer",
     "PrecisionConfig",
-    "setup_distributed", "cleanup_distributed",
-    "get_rank", "get_world_size", "is_main_process",
-    "broadcast_optimizer_state", "wrap_model_ddp",
-    "OverlappedOptimizer",
-    "INT8GradientCompressor", "PowerSGDCompressor",
-    "PartialGraphOptimizer",
-    "SparseGradientHandler",
-    "PipelinedOptimizer",
     "GradientHookOptimizer",
-    "AsyncSuperGrok2",
 
     # Dispatch helpers
     "get_gpu_arch", "get_gpu_vendor", "get_backend", "get_arch_label",
