@@ -52,7 +52,9 @@ except RuntimeError:
 # Core optimizers (11)
 # --------------------------------------------------------------------------
 
-from grokking_optimizers.optimizers.supergrok2 import SuperGrok2, CompiledSuperGrok2
+from grokking_optimizers.optimizers.supergrok2 import (
+    SuperGrok2, CompiledSuperGrok2, MoEAwareSuperGrok2,
+)
 from grokking_optimizers.optimizers.supergrok15 import SuperGrok15
 from grokking_optimizers.optimizers.supergrok11 import SuperGrok11
 from grokking_optimizers.optimizers.grokadamw import GrokAdamW
@@ -62,7 +64,6 @@ from grokking_optimizers.optimizers.looksam import LookSAM
 from grokking_optimizers.optimizers.muon import Muon
 from grokking_optimizers.optimizers.neuralgrok import NeuralGrok
 from grokking_optimizers.optimizers.prodigy import Prodigy
-from grokking_optimizers.optimizers.moe_adam import MoEAwareSuperGrok2
 
 
 # --------------------------------------------------------------------------
