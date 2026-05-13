@@ -228,8 +228,7 @@ def assert_supported_arch() -> Union[int, str]:
 # ----------------------------------------------------------------------
 # C++ extension loader (consolidated from _ops_loader.py).
 # Loads the per-arch specialized C++ extension. Raises RuntimeError if
-# the extension is not built. fallback.py provides Python-only reference
-# implementations for unit testing.
+# the extension is not built — there is no Python fallback path.
 # ----------------------------------------------------------------------
 
 _cached_ops = None
@@ -249,7 +248,6 @@ def get_ops():
             "SuperGrok C++ extension not built. "
             "Run: pip install -e . "
             f"Supported arches: {SUPPORTED_ARCHES}. "
-            "CPU build is for testing only — not a runtime fallback. "
             f"Original error: {e}"
         ) from e
 

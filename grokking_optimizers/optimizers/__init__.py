@@ -2,8 +2,8 @@
 
 Math: each optimizer's per-element step is documented in csrc/algorithms/.
 On GPU, .step() dispatches to the compiled C++ extension via
-grokking_optimizers.dispatch.get_ops; pure-Python fallbacks live in
-grokking_optimizers.fallback.
+grokking_optimizers.dispatch.get_ops. The kernel is the only execution
+path; there is no Python reference fallback.
 
 Public classes (re-exported by grokking_optimizers/__init__.py):
   SuperGrok2, SuperGrok15, SuperGrok11

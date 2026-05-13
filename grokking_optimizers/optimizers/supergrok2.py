@@ -12,7 +12,7 @@ Key features:
   - Dynamic expert recycling (dead experts cloned from top performer)
   - All adaptive scheduling from v1.5 (sigmoid SAM/bilevel/WD, alpha updates)
   - functional_call SAM (no parameter modification)
-  - Python fallback path (CUDA kernels in Phase C)
+  - CUDA-only execution path (no Python reference fallback)
 
 Performance:
   - Blelloch parallel prefix scan for N >= 256 (O(N/P + log N) vs O(N))
@@ -1155,97 +1155,11 @@ class SuperGrok2(Optimizer):
                     self._step_counter % self.mamba_state_sync_interval == 0):
                 self._sync_mamba_states()
         else:
-            # Python fallback — per-parameter (grad clip + scalars computed inline)
-            for idx, i in enumerate(active_indices):
-                p = self._flat_params[i]
-                grad = p.grad.data
-
-                # Gradient clipping + NaN guard (mirrors C++ kernel logic)
-                gn = grad.norm()
-                if gn > self.gradient_clipping:
-                    grad = grad * (self.gradient_clipping / (gn + 1e-12))
-                if not torch.isfinite(grad).all():
-                    grad = torch.where(torch.isfinite(grad), grad, torch.zeros_like(grad))
-
-                alpha_i = max(0.0, min(1.0, base_alpha * self._flat_layer_alphas[i]))
-                beta1_i = self._flat_layer_beta1s[i]
-                step_i = self._flat_steps[i]
-                bc1 = 1.0 - beta1_i ** step_i
-                bc2 = 1.0 - beta2 ** step_i
-
-                flat_grad = grad.reshape(-1)
-                flat_sharp = self._flat_sharpness[i].reshape(-1)
-
-                smart_grad, new_gru, new_fwd, new_bwd = self.meta_net(
-                    flat_grad, flat_sharp,
-                    self._flat_gru_states[i],
-                    self._flat_mamba_fwd_states[i],
-                    self._flat_mamba_bwd_states[i])
-                self._flat_gru_states[i] = new_gru.detach()
-                self._flat_mamba_fwd_states[i] = new_fwd.detach()
-                self._flat_mamba_bwd_states[i] = new_bwd.detach()
-
-                mu = self._flat_mus[i]
-                if mu.dtype != torch.float32:
-                    mu_fp32 = mu.float()
-                    mu_fp32.mul_(alpha_i).add_(grad.reshape(-1), alpha=1.0 - alpha_i)
-                    self._flat_mus[i] = mu_fp32.to(mu.dtype)
-                    mu = mu_fp32
-                else:
-                    mu.mul_(alpha_i).add_(grad.reshape(-1), alpha=1.0 - alpha_i)
-                effective_grad = smart_grad.reshape(-1) + lamb_eff * mu
-
-                fg = effective_grad.reshape(-1).float()
-                ea = self._flat_exp_avgs[i]
-                easq = self._flat_exp_avg_sqs[i]
-                if ea.dtype == torch.int8:
-                    # Config 3: dequantize INT8 → FP32, compute, requantize
-                    scale_idx = i
-                    ea_scale = self._flat_exp_avg_scales[scale_idx]
-                    ea_fp32 = ea.float() * ea_scale.repeat_interleave(32)[:ea.numel()]
-                    ea_fp32.mul_(beta1_i).add_(fg, alpha=1 - beta1_i)
-                    # Requantize: vectorized per-block max scale (no .item() sync)
-                    block_size = 32
-                    N = ea_fp32.numel()
-                    num_blocks = (N + block_size - 1) // block_size
-                    # Pad to full blocks, reshape, compute block-wise absmax
-                    _pad_n = num_blocks * block_size - N
-                    if _pad_n > 0:
-                        _ea_padded = torch.nn.functional.pad(ea_fp32, (0, _pad_n))
-                    else:
-                        _ea_padded = ea_fp32
-                    _blocks = _ea_padded.reshape(num_blocks, block_size)
-                    _block_maxes = _blocks.abs().amax(dim=1).clamp(min=1e-12)
-                    ea_scale.copy_(_block_maxes / 127.0)
-                    _scales_expanded = ea_scale.repeat_interleave(block_size)[:N]
-                    ea[:] = (ea_fp32 / _scales_expanded).round().clamp(-127, 127).to(torch.int8)
-                    easq_fp32 = easq.float()
-                    easq_fp32.mul_(beta2).addcmul_(fg, fg, value=1 - beta2)
-                    self._flat_exp_avg_sqs[i] = easq_fp32.to(torch.bfloat16)
-                    step_size = lr / bc1
-                    denom = (easq_fp32 / bc2).sqrt().add_(eps)
-                    p.data.mul_(1 - lr * wd_eff)
-                    p.data.addcdiv_(ea_fp32.reshape(p.data.shape), denom.reshape(p.data.shape), value=-step_size)
-                else:
-                    ea.mul_(beta1_i).add_(fg, alpha=1 - beta1_i)
-                    easq.mul_(beta2).addcmul_(fg, fg, value=1 - beta2)
-                    step_size = lr / bc1
-                    denom = (easq / bc2).sqrt().add_(eps)
-                    p.data.mul_(1 - lr * wd_eff)
-                    p.data.addcdiv_(ea.reshape(p.data.shape), denom.reshape(p.data.shape), value=-step_size)
-
-            # Expert recycling for Python fallback (once per step, not per param)
-            self._step_counter += 1
-            if (self.meta_net.recycle_interval > 0 and
-                    self._step_counter % self.meta_net.recycle_interval == 0):
-                if self.expert_allreduce_before_recycle:
-                    self._allreduce_expert_counts()
-                self.meta_net._recycle_dead_experts()
-
-            # Periodic mamba state sync to prevent rank drift
-            if (self.mamba_state_sync_interval > 0 and
-                    self._step_counter % self.mamba_state_sync_interval == 0):
-                self._sync_mamba_states()
+            raise RuntimeError(
+                "SuperGrok2.step() requires CUDA and the compiled C++ extension. "
+                "There is no Python fallback path. For per-parameter execution "
+                "(e.g. gradient hooks), use `use_grad_hooks=True` which routes "
+                "through `_single_param_step`.")
 
         return loss
 
@@ -1292,11 +1206,11 @@ class SuperGrok2(Optimizer):
         return sam_loss_val
 
     def bilevel_step(self, model, train_x, train_y, val_x, val_y, criterion, meta_optimizer):
-        """Bilevel meta-net training.
+        """Bilevel meta-net training (CUDA-only).
 
-        CUDA path: uses _ops.supergrok2_bilevel_fwd_save for fast scan forward
+        Uses _ops.supergrok2_bilevel_fwd_save for fast scan forward
         and _ops.supergrok2_bilevel_backward for full backward through meta-net.
-        Python fallback: uses forward_for_bilevel with autograd.
+        Raises if CUDA + compiled extension is unavailable — no Python fallback.
         """
         self._ensure_state()
         named_params = list(model.named_parameters())
@@ -1307,7 +1221,6 @@ class SuperGrok2(Optimizer):
             if p.grad is not None:
                 saved_grads[name] = p.grad.detach().clone()
 
-        # Decide whether to use CUDA bilevel path
         use_cuda = (
             _HAS_CUDA
             and hasattr(_ops, 'supergrok2_bilevel_fwd_save')
@@ -1316,10 +1229,10 @@ class SuperGrok2(Optimizer):
         )
 
         if not use_cuda:
-            return self._bilevel_step_python(
-                model, named_params, saved_grads,
-                val_x, val_y, criterion, meta_optimizer,
-            )
+            raise RuntimeError(
+                "SuperGrok2.bilevel_step() requires CUDA and the compiled "
+                "C++ extension exposing supergrok2_bilevel_fwd_save / "
+                "supergrok2_bilevel_backward. No Python fallback.")
 
         # ═══════════════════════════════════════════════════════════════
         #  CUDA BILEVEL PATH
@@ -2115,52 +2028,6 @@ class SuperGrok2(Optimizer):
 
         return val_loss.detach()
 
-    def _bilevel_step_python(self, model, named_params, saved_grads,
-                             val_x, val_y, criterion, meta_optimizer):
-        """Python autograd fallback for bilevel meta-net training."""
-        smart_grads = {}
-        for name, p in named_params:
-            if name in saved_grads:
-                pidx = self._param_to_idx.get(id(p))
-                if pidx is None:
-                    continue
-                sg, _, _, _ = self.meta_net.forward_for_bilevel(
-                    saved_grads[name].reshape(-1),
-                    self._flat_sharpness[pidx].reshape(-1),
-                    self._flat_gru_states[pidx],
-                    self._flat_mamba_fwd_states[pidx],
-                    self._flat_mamba_bwd_states[pidx])
-                smart_grads[name] = sg.reshape(saved_grads[name].shape)
-
-        model.zero_grad()
-        with torch.enable_grad():
-            val_loss = criterion(model(val_x), val_y)
-            val_loss.backward()
-
-        meta_optimizer.zero_grad()
-        device = val_x.device
-        meta_loss = torch.tensor(0.0, device=device)
-        for name, p in named_params:
-            if name in smart_grads and p.grad is not None:
-                vg = p.grad.detach()
-                vg_norm = vg.norm()
-                vg_unit = vg / vg_norm if vg_norm > 1e-12 else vg
-                meta_loss = meta_loss - (smart_grads[name] * vg_unit).sum()
-
-        meta_loss.backward()
-
-        # Distributed: all-reduce meta-net gradients before stepping
-        if self.bilevel_allreduce_meta_grads:
-            self._allreduce_meta_grads()
-
-        meta_optimizer.step()
-        self._weights_dirty = True
-
-        for name, p in named_params:
-            p.grad = saved_grads.get(name)
-
-        return val_loss.detach()
-
     def bilevel_step_distributed(self, model, train_x, train_y, val_x, val_y,
                                   criterion, meta_optimizer, process_group=None):
         """Distributed-aware bilevel step with coordinated validation forward pass.
@@ -2378,9 +2245,10 @@ class SuperGrok2(Optimizer):
         self._step_counter += 1
 
     def _single_param_step(self, param, group, state):
-        """Per-parameter step for GradientHookOptimizer integration.
+        """Per-parameter step used by `use_grad_hooks=True`.
 
-        Uses the Python fallback path (per-parameter meta-net forward + AdamW).
+        Per-parameter meta-net forward + AdamW. Called from a post-accumulate
+        gradient hook for each parameter individually.
         """
         if param.grad is None:
             return
@@ -2593,7 +2461,7 @@ class CompiledSuperGrok2:
             # Re-capture on next step
             return result
 
-        # Eager fallback when kwargs are provided (adaptive scheduling)
+        # Eager path when kwargs are provided (CUDA-graph capture requires fixed args)
         if kwargs:
             return self.optimizer.step(**kwargs)
 

@@ -289,7 +289,7 @@ class SuperGrok15(Optimizer):
             self._weights_dirty = False
         W1, b1, W2, b2, rescale = self._cached_weights
 
-        # Use Python fallback on CPU (C++ CPU path has dimension bug for meta-net)
+        # CPU build dispatches to _ops_cpu (testing only — no Python reference path).
         ops_impl = _ops if self._flat_params[0].is_cuda else _ops_cpu
         ops_impl.supergrok15_fused_step(
             self._flat_param_data,

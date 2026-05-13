@@ -5,13 +5,16 @@ Package layout:
   grokking_optimizers/
     optimizers/         11 torch.optim.Optimizer subclasses (the race optimizers)
     dispatch.py         arch detection + fused kernel routing + get_ops()
-    fallback.py         pure-Python reference implementations (testing only)
 
 Each optimizer file is fully self-contained — the Mamba3+PEER metanet and
 PrecisionConfig live inside supergrok2.py; SharpnessMetaNet is duplicated
 between supergrok15.py and supergrok11.py. Those implementation-detail
 classes are reachable via
 `from grokking_optimizers.optimizers.supergrok2 import X` when needed.
+
+The C++ kernel is the only execution path — if the extension isn't built or
+a kernel raises, the exception propagates. There is no Python reference
+fallback.
 
 Usage:
     from grokking_optimizers import SuperGrok2, Lion, GrokAdamW, ...
