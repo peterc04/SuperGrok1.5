@@ -12,7 +12,6 @@
 #include "csrc/common/platform.h"
 #include "csrc/common/types.h"
 #include "csrc/common/utils.cuh"
-#include "csrc/common/tuned_configs.h"
 
 namespace sg { namespace sm90 { namespace models { namespace attention {
 

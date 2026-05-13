@@ -22,7 +22,6 @@
 #include "csrc/common/types.h"
 #include "csrc/common/utils.cuh"
 #include "csrc/common/ptx_intrinsics.cuh"
-#include "csrc/common/tuned_configs.h"
 
 namespace sg { namespace cuda_sm90 { namespace primitives {
 

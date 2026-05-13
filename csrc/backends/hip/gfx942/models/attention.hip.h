@@ -17,7 +17,6 @@
 #include "csrc/common/platform.h"
 #include "csrc/common/types.h"
 #include "csrc/common/utils.cuh"
-#include "csrc/common/tuned_configs.h"
 #ifdef WITH_CK
 #include <ck_tile/ops/fmha.hpp>
 #endif

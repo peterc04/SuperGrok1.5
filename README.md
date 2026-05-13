@@ -543,15 +543,13 @@ Shared between the Mamba model and the SuperGrok v2 optimizer:
 
 ### Common headers (`csrc/common/`)
 
-Shared infrastructure unchanged in spirit by the refactor:
+Shared infrastructure used by every backend:
 
 - **platform.h** — CUDA/HIP portability macros (warp size, shuffle, non-temporal)
 - **types.h** — `BatchedScanCtx`, dimension caps, branchless stochastic rounding
 - **utils.cuh** — warp/cluster reductions, hash PRNG, PTX wrappers
 - **ptx_intrinsics.cuh** — hot-path PTX (softplus, exp, stochastic round, GRU gates)
-- **tuned_configs.h** — autotuned launch configurations (currently all defaults)
 - **quantization.h** — FP8/INT8/INT4 quantization helpers
-- **arch_tier.h** — compile-time architecture tier classification
 
 ### Backend primitives
 
