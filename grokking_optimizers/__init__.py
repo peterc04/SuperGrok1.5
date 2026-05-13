@@ -67,7 +67,7 @@ from grokking_optimizers.optimizers.moe_adam import MoEAwareSuperGrok2
 from grokking_optimizers.optimizers.supergrok2 import (
     Mamba3PEERMetaNet, Mamba3ScanBlock, MiniGRU, PrecisionConfig,
 )
-from grokking_optimizers._gradient_hook import GradientHookOptimizer
+from grokking_optimizers.optimizers.gradient_hook import GradientHookOptimizer
 
 
 # --------------------------------------------------------------------------

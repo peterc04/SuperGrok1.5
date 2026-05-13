@@ -587,9 +587,8 @@ from grokking_optimizers import (
     SuperGrok15, SuperGrok2, SuperGrok11,
     GrokAdamW, NeuralGrok, Prodigy, Grokfast, Lion, LookSAM, Muon,
 )
-from grokking_optimizers.gradient_hook_optimizer import GradientHookOptimizer
-from grokking_optimizers.fused_dispatch import has_fused, dispatch_fused
-from grokking_optimizers.dispatch import detect_arch
+from grokking_optimizers.optimizers.gradient_hook import GradientHookOptimizer
+from grokking_optimizers.dispatch import detect_arch, has_fused, dispatch_fused
 
 def _maybe_wrap_cuda_graph(opt, c):
     """No-op shim. CUDA Graph wrapping was removed in the post-refactor
