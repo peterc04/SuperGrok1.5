@@ -97,9 +97,10 @@ H100, MI300X, or TPU v5p before any cell can be promoted to ✅.
 
 ## Filesystem
 
-The codebase splits along three orthogonal axes: **algorithm** (the
-vendor-neutral math), **backend** (per-arch launchers + primitives), and
-**model** (decoder / ViT / mamba). Each axis owns its own directory.
+The codebase splits along two orthogonal axes: **algorithm** (the
+vendor-neutral math) and **backend** (per-arch launchers). Each backend
+launch file is fully self-contained — see "Design choice: per-file
+self-containment" below.
 
 ```
 .
@@ -109,36 +110,46 @@ vendor-neutral math), **backend** (per-arch launchers + primitives), and
 ├── grokking_optimizers/
 │   ├── __init__.py             (re-exports the 11 optimizers + helpers)
 │   ├── dispatch.py             (arch detection + fused kernel registry + get_ops)
-│   ├── fallback.py             (pure-Python reference implementations)
-│   ├── optimizers/             (11 torch.optim.Optimizer subclasses)
-│   │   ├── supergrok2.py       grokadamw.py    looksam.py    prodigy.py
-│   │   ├── supergrok15.py      grokfast.py     muon.py       moe_adam.py
-│   │   └── supergrok11.py      lion.py         neuralgrok.py
+│   └── optimizers/             (10 torch.optim.Optimizer subclasses; MoE-aware
+│       │                       SG2 lives inside supergrok2.py)
+│       ├── supergrok2.py       grokadamw.py    looksam.py    prodigy.py
+│       ├── supergrok15.py      grokfast.py     muon.py       neuralgrok.py
+│       └── supergrok11.py      lion.py
 └── csrc/
-    ├── algorithms/             (12 vendor-neutral algorithm headers)
+    ├── algorithms/             (11 algorithm headers, MoE folded into SG2)
     │   ├── adamw.h             grokfast.h    looksam.h     prodigy.h
-    │   ├── grokadamw.h         lion.h        moe_adam.h    supergrok11.h
-    │   └── neuralgrok.h        muon.h        supergrok2.h  supergrok15.h
-    ├── models/                 (3 vendor-neutral model definitions)
+    │   ├── grokadamw.h         lion.h        supergrok2.h  supergrok11.h
+    │   └── neuralgrok.h        muon.h        supergrok15.h
+    ├── models/                 (3 vendor-neutral model contracts)
     │   ├── decoder.h
     │   ├── vit.h
     │   └── mamba.h
-    ├── common/                 (platform.h, types.h, utils.cuh, ...)
-    ├── scan/                   (Affine2x2 + mamba_scan_adapter)
-    │   ├── affine2x2.h
-    │   ├── mamba_scan_adapter.cuh
-    │   └── mamba_scan_adapter.hip.h
     ├── backends/
-    │   ├── cuda/sm_90/         (primitives.cuh + mma.cuh + 11 launch_*.cu + models/)
-    │   ├── hip/gfx942/         (primitives.hpp + 11 launch_*.hip.cpp + models/)
-    │   └── pallas/             (primitives.py + 12 launch_*.py + models/ + v5p/)
-    └── bindings/               (pybind11 dispatchers + dispatch macro + helpers)
+    │   ├── cuda/sm_90/         (10 launch_*.cu, fully self-contained, + models/)
+    │   ├── hip/gfx942/         (10 launch_*.hip.cpp, fully self-contained, + models/)
+    │   └── pallas/             (10 launch_*.py, fully self-contained, + models/)
+    └── bindings/               (pybind11 entry points)
 ```
 
 Launch glue files contain the `__global__` kernels (CUDA) or ATen-driven
-implementations (HIP) or JAX wrappers (Pallas). When fused megakernels
-ever get written, they'll live under `csrc/fused/<arch>/` with real
-content — the prior placeholder stubs were removed.
+implementations (HIP) or JAX wrappers (Pallas). Every launch file inlines
+the platform/types/utils/PTX-intrinsic/quantization/primitives helpers it
+needs — there is no shared `csrc/common/`, `csrc/scan/`, or
+`primitives.*` directory. Modifications to a shared primitive must be
+replicated across every consumer; the codebase deliberately accepts this
+cost for zero cross-file coupling.
+
+### Design choice: per-file self-containment
+
+Every backend launch file embeds its own copies of platform macros, warp
+helpers, PTX intrinsics, quantization helpers, scan adapters, CUTLASS MMA
+wrappers, and any primitives it uses — wrapped in clearly-marked
+`// ── inlined from former <path> ──` blocks. This trades code duplication
+for zero cross-file coupling: touching one optimizer's kernel cannot
+affect another's. The duplicated content is reviewable because each
+inlined block carries the original path as a comment header. The one
+surviving shared boundary is `csrc/bindings/` — pybind11 entry points
+that need to call into every backend.
 
 Runtime dispatch via `grokking_optimizers/dispatch.py`:
 - `detect_arch()` → `90`, `942`, or `"tpu_v5p"`
@@ -206,9 +217,10 @@ for x, y in batches:
 ```
 
 `opt.step()` dispatches through `grokking_optimizers.dispatch.detect_arch()`
-to the compiled fused kernel for the active arch. On `NotImplementedError` or
-a missing kernel, the optimizer falls back to the pure-Python reference in
-`grokking_optimizers/fallback.py`.
+to the compiled fused kernel for the active arch. **The kernel runs or
+raises** — there is no Python reference fallback. If the C++ extension
+isn't built, `get_ops()` raises `RuntimeError`; if a per-arch launcher
+isn't implemented, the per-arch namespace raises with a descriptive error.
 
 ---
 
@@ -462,10 +474,10 @@ squared gradient average for 1D parameters.
 ### MoE/Adam multi-tensor
 
 `MoEAwareSuperGrok2` — a SuperGrok v2 subclass that compacts active
-expert parameters before running the full SG2 metanet. The wrapper is
-defined in `grokking_optimizers/optimizers/moe_adam.py` and inherits its
-hyperparameters (learning rate, betas, weight decay, metanet config) from
-`SuperGrok2.__init__`.
+expert parameters before running the full SG2 metanet. The class is
+defined at the bottom of `grokking_optimizers/optimizers/supergrok2.py`
+(below `CompiledSuperGrok2`) and inherits its hyperparameters (learning
+rate, betas, weight decay, metanet config) from `SuperGrok2.__init__`.
 
 In standard Mixture-of-Experts training, most expert parameters receive
 zero gradients on any given step because the router only activates a
@@ -485,9 +497,10 @@ straight to `SuperGrok2.step()`.
 Auxiliary features carried alongside the compaction:
 - Per-expert activation counts feed a load-balancing auxiliary loss.
 - Per-expert learning-rate scaling smooths activation frequency.
-- The C++ kernels (`moe_filter_active_params`, `moe_scan_compacted`,
-  `moe_scatter_results`) live in `csrc/algorithms/moe_adam.h` plus the
-  per-arch launchers.
+- The C++ helpers (`moe_filter_active_params`, `moe_scan_compacted`,
+  `moe_scatter_results`) live in `csrc/algorithms/supergrok2.h` (the
+  former `moe_adam.h` was folded in alongside the MoE variant) plus
+  the per-arch launchers folded into `launch_supergrok2.{cu,hip.cpp,py}`.
 
 ---
 
@@ -508,23 +521,24 @@ stubs in the meantime.
 
 ### Algorithm headers (`csrc/algorithms/`)
 
-Twelve vendor-neutral headers, one per optimizer math family. Each provides
-per-element step functions plus any vectorized fast paths:
+Eleven vendor-neutral headers, one per optimizer math family. Each
+provides per-element step functions plus any vectorized fast paths; all
+helper types/macros from the former `csrc/common/` are inlined inside
+each header so they're self-contained:
 
 - **adamw.h** — standard AdamW + float4 vec4 fast path
 - **grokadamw.h** — EMA gradient filter + Adam
 - **grokfast.h** — fused EMA + Adam
 - **lion.h** — sign-based interpolated momentum + vec4 fast path
 - **looksam.h** — 4 ops: perturb, restore, set_direction, apply
-- **moe_adam.h** — MoE-aware compact/scan/scatter primitives used by
-  `MoEAwareSuperGrok2`; the actual optimizer math is SuperGrok v2
 - **muon.h** — momentum normalize, Newton-Schulz combine, parameter update
 - **neuralgrok.h** — psi-net MLP forward + Adam apply
 - **prodigy.h** — partial reductions, d update, Adam with d as lr
 - **supergrok11.h** — meta-MLP + cosine gate + Adam
 - **supergrok15.h** — meta-MLP + per-coord alpha + Adam
-- **supergrok2.h** — Mamba scan + warp-spec consumer + bilevel precompute
-  (consolidated; one file holds fwd, bwd, and warp-spec math)
+- **supergrok2.h** — Mamba scan + warp-spec consumer + bilevel precompute,
+  plus the folded-in MoE multi-tensor compact/scan/scatter helpers
+  (formerly `moe_adam.h`)
 
 ### Model headers (`csrc/models/`)
 
@@ -538,60 +552,29 @@ Each defines a `<Model>Config` struct and a `<Model>LayerWeights` pointer
 layout. Per-backend forward/backward implementations live under
 `csrc/backends/<vendor>/<arch>/models/`.
 
-### Scan infrastructure (`csrc/scan/`)
+### Launch glue (10 files per backend)
 
-Shared between the Mamba model and the SuperGrok v2 optimizer:
-
-- **affine2x2.h** — `Affine2x2` struct + 12-FMA composition (PTX on CUDA,
-  C++ fallback on HIP). Used as the associative operator for parallel prefix
-  scan over Mamba's selective recurrence.
-- **mamba_scan_adapter.cuh** — CUDA scan adapter (packs model-level
-  parameters into `Affine2x2` maps, dispatches to sequential or parallel
-  scan).
-- **mamba_scan_adapter.hip.h** — HIP equivalent.
-
-### Common headers (`csrc/common/`)
-
-Shared infrastructure used by every backend:
-
-- **platform.h** — CUDA/HIP portability macros (warp size, shuffle, non-temporal)
-- **types.h** — `BatchedScanCtx`, dimension caps, branchless stochastic rounding
-- **utils.cuh** — warp/cluster reductions, hash PRNG, PTX wrappers
-- **ptx_intrinsics.cuh** — hot-path PTX (softplus, exp, stochastic round, GRU gates)
-- **quantization.h** — FP8/INT8/INT4 quantization helpers
-
-### Backend primitives
-
-Per-vendor helpers that the launch files share:
-
-- **cuda/sm_90/primitives.cuh** — grid-stride helpers, warp/block/cluster
-  reductions, RoPE pair rotation, vec4 alignment check, non-temporal load/
-  store, stochastic rounding, last-block-finished pattern.
-- **cuda/sm_90/mma.cuh** — CUTLASS GEMM wrappers (FP16/BF16) + fused softplus
-  epilogue. Gated on `-DWITH_CUTLASS`.
-- **hip/gfx942/primitives.hpp** — host-side ATen tensor-op helpers
-  (`ema_update_inplace`, `adam_apply_inplace`, `pack_valid`). HIP launchers
-  cannot define `__global__` kernels because `.hip.cpp` files route through
-  the host compiler, not hipcc.
-- **pallas/primitives.py** — pure JAX `adamw_step` / `lion_step` /
-  `ema_update`, TPU version detection, and re-exports of working Pallas
-  kernels (`mamba3_scan_pallas_tile128`, `pallas_fused_gru_peer`, etc.).
-
-### Launch glue (33 files per backend)
-
-For each backend, one launch file per optimizer:
+For each backend, one launch file per optimizer (MoEAwareSuperGrok2 is
+folded into SuperGrok v2):
 
 ```
-csrc/backends/cuda/sm_90/launch_<opt>.cu       (11 files + SG2 fwd+bwd+warp-spec consolidated)
-csrc/backends/hip/gfx942/launch_<opt>.hip.cpp  (11 files; SG2 raises NotImplementedError)
-csrc/backends/pallas/launch_<opt>.py           (11 files + grokadamw)
+csrc/backends/cuda/sm_90/launch_<opt>.cu       (10 files; SG2 absorbed MoE)
+csrc/backends/hip/gfx942/launch_<opt>.hip.cpp  (10 files; SG2 raises std::runtime_error)
+csrc/backends/pallas/launch_<opt>.py           (10 files)
 ```
 
-Each launch file:
-1. Includes the algorithm header + backend primitives
-2. Defines `__global__` kernels (CUDA only) that wrap the per-element step in
-   a grid-stride loop
-3. Provides the host-side launcher function called from bindings
+Each launch file is **fully self-contained**:
+
+1. Inlines `csrc/common/*` helpers it needs (platform macros, warp
+   reductions, PTX intrinsics, quantization, BatchedScanCtx, …).
+2. Inlines the per-backend primitives it needs (grid-stride loop,
+   vec4 alignment, ATen tensor-op helpers, JAX scan kernels).
+3. For Muon and SG2 (CUDA): inlines `mma.cuh` (CUTLASS wrappers + fused
+   softplus epilogue) directly.
+4. For SG2 (all backends): inlines `affine2x2.h` + the scan adapter.
+5. Defines `__global__` kernels (CUDA only) that wrap the per-element step
+   in a grid-stride loop.
+6. Provides the host-side launcher function called from bindings.
 
 ### Bindings (`csrc/bindings/`)
 
@@ -624,19 +607,24 @@ The 11 optimizers under `grokking_optimizers/optimizers/` are
 
 ```python
 class Lion(torch.optim.Optimizer):
-    def __init__(self, params, lr=3e-4, betas=(0.9, 0.99), weight_decay=3.0):
+    def __init__(self, params, lr=3e-4, betas=(0.9, 0.99),
+                 weight_decay=3.0, use_grad_hooks=False):
         super().__init__(params, dict(lr=lr, betas=betas, weight_decay=weight_decay))
+        self._use_grad_hooks = use_grad_hooks
+        if use_grad_hooks:
+            _register_grad_hooks(self)
 
     @torch.no_grad()
     def step(self, closure=None):
+        if self._use_grad_hooks:
+            return None  # hooks already ran during backward()
         for group in self.param_groups:
             params, grads, exp_avgs = self._pack_group(group)
-            try:
-                _ops.lion_fused_step(params, grads, exp_avgs, **group_hyperparams)
-            except NotImplementedError:
-                from grokking_optimizers.fallback import lion_fallback
-                lion_fallback(params, grads, exp_avgs, **group_hyperparams)
+            _ops.lion_fused_step(params, grads, exp_avgs, **group_hyperparams)
 ```
+
+The kernel call is the only execution path. If `_ops` is missing or a
+launcher raises, the exception propagates — there is no Python fallback.
 
 `grokking_optimizers/dispatch.py` provides:
 - `detect_arch()` — returns `90`, `942`, or `"tpu_v5p"`
@@ -646,14 +634,11 @@ class Lion(torch.optim.Optimizer):
   kernel registry
 - Capability predicates: `supports_bf16`, `supports_fp8`, etc.
 
-Pure-Python reference implementations live in
-`grokking_optimizers/fallback.py` and are used both as the dispatch fallback
-and as ground-truth for parity tests.
-
-`GradientHookOptimizer` (a thin wrapper that runs per-parameter steps via
-`register_post_accumulate_grad_hook`) lives at
-`grokking_optimizers/optimizers/gradient_hook.py` and is the only "extension"
-that survived the post-refactor cleanup.
+`GradientHookOptimizer` (the former wrapper class) was removed. Each
+optimizer now accepts `use_grad_hooks=True` directly in its constructor,
+which registers `register_post_accumulate_grad_hook` on every parameter so
+the update runs while gradient data is still L2-warm. `step()` is a no-op
+once hooks are active.
 
 ---
 
@@ -663,14 +648,19 @@ The TPU functional rewrite that previously lived under `supergrok2_jax_tpu/`
 was folded into the Pallas backend itself. Each
 `csrc/backends/pallas/launch_<optimizer>.py` is now fully self-contained:
 
-- All 11 launch files carry their own `State` / `Config` namedtuples and
-  the canonical per-parameter step function (Lion, Muon, Prodigy, …).
-- `launch_supergrok2.py` (≈875 lines) absorbs the full SG2 functional
-  rewrite: bidirectional Mamba-3 scan, per-element GRU, multi-head PEER
-  routing (soft + hard), meta-net composition, the SG2 optimizer step,
-  the bilevel meta-update, and INT8/INT4 quantization helpers.
-- `primitives.py` is now slim — just TPU version detection and re-exports
-  of the Pallas kernels in `_pallas_kernels.py` / `_pallas_models.py`.
+- All 10 launch files carry their own `State` / `Config` namedtuples and
+  the canonical per-parameter step function (Lion, Muon, Prodigy, …),
+  plus inlined copies of TPU detection + Pallas-kernel re-exports
+  (formerly in `primitives.py`).
+- `launch_supergrok2.py` absorbs the full SG2 functional rewrite:
+  bidirectional Mamba-3 scan, per-element GRU, multi-head PEER routing
+  (soft + hard), meta-net composition, the SG2 optimizer step, the
+  bilevel meta-update, INT8/INT4 quantization helpers, and the folded-in
+  MoE multi-tensor launcher (`launch_moe_adam_step`).
+- The former `primitives.py` is deleted — TPU detection and Pallas-kernel
+  imports are inlined into every `launch_*.py`. Pallas kernels themselves
+  still live in `_pallas_kernels.py` / `_pallas_models.py` (these are
+  re-export targets, not shared helper code).
 
 Pallas kernels (`csrc/backends/pallas/_pallas_kernels.py` and
 `_pallas_models.py`) provide tile-128 affine prefix scan, fused GRU+PEER,
@@ -739,12 +729,12 @@ git history.
 - Consolidated SuperGrok v2's three CUDA files into one algorithm header +
   one launch file per backend
 - Extracted vendor-neutral algorithm math from per-arch kernels into
-  `csrc/algorithms/` (12 headers — `moe_adam.h` is a thin AdamW wrapper kept
-  separate for naming symmetry)
-- Reclassified the Mamba scan adapter as scan infrastructure (shared by both
-  the model and the SG2 optimizer) under `csrc/scan/`
+  `csrc/algorithms/` (11 headers; MoE compaction helpers later folded
+  into `supergrok2.h`)
+- Reclassified the Mamba scan adapter as scan infrastructure (later inlined
+  into the SG2 launchers + Mamba model files)
 - Renamed `csrc/kernels/cuda/_cutlass_gemm.cuh` to
-  `csrc/backends/cuda/sm_90/mma.cuh`
+  `csrc/backends/cuda/sm_90/mma.cuh` (later inlined into Muon + SG2 launchers)
 - Reorganized Python frontend into `optimizers/` subpackage
 - Updated build matrix from optimistic "✓ done" to honest ✅/🟡/⛔ legend
 
@@ -775,21 +765,36 @@ Every optimizer file is now fully self-contained:
 | `PrecisionConfig` (with int8/int4 expert quantization)       | `optimizers/supergrok2.py`            |
 | `SharpnessMetaNet` (duplicated, accepted cost)               | `optimizers/supergrok11.py` *and* `supergrok15.py` |
 | `_adamw_step_reference` (pure-Python AdamW)                  | `optimizers/grokadamw.py`             |
-| `GradientHookOptimizer`                                      | `optimizers/gradient_hook.py`         |
+| `GradientHookOptimizer` wrapper class                        | Replaced by `use_grad_hooks=True` constructor flag on every optimizer |
+| `MoEAwareSuperGrok2` (subclass of SuperGrok v2)              | `optimizers/supergrok2.py` (folded in) |
 
-Result: `grokking_optimizers/` shrank from 30 → 16 files. No underscored
-private modules, no backward-compat shims. The public API surface trimmed
-down to the 11 optimizers plus `GradientHookOptimizer`.
+Result: `grokking_optimizers/` shrank to 13 files (2 top-level —
+`__init__.py` + `dispatch.py` — plus 11 in `optimizers/`:
+`__init__.py` + 10 optimizer files, since MoEAwareSuperGrok2 lives
+inside `supergrok2.py`). No fallback module, no underscored private
+modules, no backward-compat shims. The public API surface is the
+11 race optimizer classes only.
 
-### JAX collapse pass
+### Full inlining + no-fallback pass
 
-The `supergrok2_jax_tpu/` package was folded into the Pallas backend.
-Each `csrc/backends/pallas/launch_<opt>.py` now carries its own JAX
-implementation (State, Config, step function). `launch_supergrok2.py`
-absorbed seven JAX files (≈875 lines): bidirectional Mamba-3 scan, GRU
-cell, PEER routing (soft + hard), meta-net composition, optimizer step,
-bilevel meta-update, INT8/INT4 quantization. `primitives.py` is now slim
-(TPU detection + Pallas kernel re-exports).
+The final structural pass deletes every shared cross-file boundary on the
+C++ side and removes the Python fallback path entirely.
+
+- **`grokking_optimizers/fallback.py` deleted.** The kernel call is the
+  only execution path; if `_ops` is missing or a launcher raises, the
+  exception propagates. Race optimizers no longer have try/except → fallback
+  patterns or CPU Python branches inside `step()` / `bilevel_step()`.
+- **`csrc/common/` (5 headers), `csrc/scan/` (3 files), `primitives.cuh`,
+  `mma.cuh`, `primitives.hpp`, and `primitives.py` were deleted.** Their
+  content is inlined into every backend launch file, model file, and
+  algorithm header — wrapped in `// ── inlined from former <path> ──`
+  blocks for reviewability.
+- **Only `csrc/bindings/` survives as a shared cross-file directory** —
+  it has to, because pybind11 needs a single registration entry point.
+
+The Pallas backend collapse (former `supergrok2_jax_tpu/` package) was
+folded into `csrc/backends/pallas/launch_*.py` earlier in the cleanup;
+each launch file is self-contained at the Python level too.
 
 ---
 
@@ -812,11 +817,12 @@ When this branch lands on a machine with a real sm_90 GPU and an MI300X:
 - [ ] 20-step training loop on the decoder modular-division task with Lion
       converges (loss decreases)
 - [ ] 20-step training loop with SuperGrok v2 converges
-- [ ] Both above tests pass elementwise allclose vs the Python fallback to
-      within 1e-3
+- [ ] (Optional) Compare against a hand-written PyTorch reference outside
+      the package to validate math; the package itself no longer ships a
+      Python reference implementation.
 
 **Honest stub test (gfx942)**
-- [ ] On MI300X: `SuperGrok2(...).step()` raises `NotImplementedError` with
+- [ ] On MI300X: `SuperGrok2(...).step()` raises `std::runtime_error` with
       the message from `launch_supergrok2.hip.cpp`
 
 **Matrix promotion**
@@ -838,16 +844,21 @@ When this branch lands on a machine with a real sm_90 GPU and an MI300X:
 
 To add a new optimizer:
 
-1. Add per-element math template to `csrc/algorithms/<optimizer>.h`
-2. Add launch glue for each backend:
+1. Add per-element math template to `csrc/algorithms/<optimizer>.h`.
+   Inline whatever shared types/helpers it needs (BatchedScanCtx,
+   warp_reduce_sum, etc.) — there is no `csrc/common/`.
+2. Add launch glue for each backend, each fully self-contained:
    - `csrc/backends/cuda/sm_90/launch_<optimizer>.cu`
    - `csrc/backends/hip/gfx942/launch_<optimizer>.hip.cpp`
    - `csrc/backends/pallas/launch_<optimizer>.py`
-3. Add a Python wrapper under `grokking_optimizers/optimizers/<name>.py`
-4. Add a pure-Python reference in `grokking_optimizers/fallback.py`
-5. Re-export in `grokking_optimizers/__init__.py`
-6. Verify import: `python -c "from grokking_optimizers import <Class>"`
-7. Run a 20-step training loop on a tiny model to confirm convergence
+3. Add a Python wrapper under `grokking_optimizers/optimizers/<name>.py`.
+   Include the `use_grad_hooks: bool = False` constructor flag + a
+   `_single_param_step(param, group, state)` method so the gradient-hook
+   path works.
+4. Re-export in `grokking_optimizers/__init__.py` and
+   `grokking_optimizers/optimizers/__init__.py`.
+5. Verify import: `python -c "from grokking_optimizers import <Class>"`.
+6. Run a 20-step training loop on a tiny model to confirm convergence.
 
 ---
 
