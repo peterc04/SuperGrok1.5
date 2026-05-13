@@ -8,7 +8,7 @@ FSDP parameter gathering for the Mamba scan.
 Usage with DDP::
 
     import torch.distributed as dist
-    from grokking_optimizers.distributed import setup_distributed, cleanup_distributed
+    from grokking_optimizers.extensions.distributed import setup_distributed, cleanup_distributed
 
     setup_distributed()
     model = DDP(model, device_ids=[local_rank])
@@ -18,7 +18,7 @@ Usage with DDP::
 Usage with FSDP::
 
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-    from grokking_optimizers.distributed import setup_distributed
+    from grokking_optimizers.extensions.distributed import setup_distributed
 
     setup_distributed()
     opt = SuperGrok2(model.parameters(), ...)
@@ -117,7 +117,7 @@ def broadcast_optimizer_state(optimizer, src: int = 0):
     if dist.get_world_size() <= 1:
         return
 
-    from .supergrok2 import SuperGrok2
+    from grokking_optimizers.optimizers.supergrok2 import SuperGrok2
 
     if isinstance(optimizer, SuperGrok2):
         # Broadcast flat state tensors

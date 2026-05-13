@@ -227,3 +227,68 @@ def get_arch_label() -> str:
 def assert_supported_arch() -> Union[int, str]:
     """Returns the detected arch or raises UnsupportedArchError."""
     return detect_arch()
+
+
+# ----------------------------------------------------------------------
+# C++ extension loader (consolidated from _ops_loader.py).
+# Loads the per-arch specialized C++ extension. Raises RuntimeError if
+# the extension is not built. fallback.py provides Python-only reference
+# implementations for unit testing.
+# ----------------------------------------------------------------------
+
+_cached_ops = None
+
+
+def get_ops():
+    """Return the compiled _ops extension module, or raise."""
+    global _cached_ops
+    if _cached_ops is not None:
+        return _cached_ops
+    try:
+        from grokking_optimizers import _ops
+        _cached_ops = _ops
+        return _ops
+    except ImportError as e:
+        raise RuntimeError(
+            "SuperGrok C++ extension not built. "
+            "Run: pip install -e . "
+            f"Supported arches: {SUPPORTED_ARCHES}. "
+            "CPU build is for testing only — not a runtime fallback. "
+            f"Original error: {e}"
+        ) from e
+
+
+# ----------------------------------------------------------------------
+# Fused (model, optimizer, arch) kernel registry (from fused_dispatch.py).
+# ----------------------------------------------------------------------
+
+MODELS = ("transformer", "vit", "mamba")
+OPTIMIZERS = ("grokadamw", "grokfast", "lion", "looksam", "moe_adam", "muon",
+              "neuralgrok", "prodigy", "supergrok2", "supergrok15", "supergrok11")
+
+_FUSED_REGISTRY = {}
+
+
+def register_fused(model, optimizer, arch):
+    def decorator(fn):
+        _FUSED_REGISTRY[(model, optimizer, arch)] = fn
+        return fn
+    return decorator
+
+
+def has_fused(model, optimizer, arch=None):
+    if arch is None:
+        arch = detect_arch()
+    return (model, optimizer, arch) in _FUSED_REGISTRY
+
+
+def dispatch_fused(model, optimizer, params, inputs, grads, state, lr, arch=None):
+    if arch is None:
+        arch = detect_arch()
+    key = (model, optimizer, arch)
+    if key not in _FUSED_REGISTRY:
+        raise KeyError(
+            f"No fused kernel for {key}. "
+            f"Available: {list(_FUSED_REGISTRY.keys())}"
+        )
+    return _FUSED_REGISTRY[key](params, inputs, grads, state, lr)

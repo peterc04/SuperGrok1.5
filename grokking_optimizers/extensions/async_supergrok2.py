@@ -29,7 +29,7 @@ import copy
 import torch
 from torch.optim import Optimizer
 
-from grokking_optimizers.supergrok2 import SuperGrok2
+from grokking_optimizers.optimizers.supergrok2 import SuperGrok2
 
 
 class AsyncSuperGrok2(Optimizer):

@@ -11,7 +11,7 @@ instead of 100% -> ~30x speedup on the scan for expert parameters.
 import torch
 from typing import Optional, Dict, Any
 
-from grokking_optimizers.supergrok2 import SuperGrok2
+from grokking_optimizers.optimizers.supergrok2 import SuperGrok2
 
 from grokking_optimizers._ops_loader import get_ops
 

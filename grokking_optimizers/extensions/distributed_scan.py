@@ -13,7 +13,7 @@ Composition is associative, enabling parallel prefix scan.
 
 Usage::
 
-    from grokking_optimizers.distributed_scan import distributed_mamba3_scan
+    from grokking_optimizers.extensions.distributed_scan import distributed_mamba3_scan
 
     # chunks: list of dicts, one per GPU, each containing precomputed tensors
     scan_outputs = distributed_mamba3_scan(
