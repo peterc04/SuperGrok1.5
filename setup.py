@@ -122,9 +122,8 @@ if _has_gpu and _is_hip:
         "csrc/backends/hip/gfx942/*.hip.cpp",
         "csrc/backends/hip/gfx942/models/*.hip.cpp",
         # `.hip` files go through hipcc (PyTorch routes the extension to its
-        # HIP/CUDA pipeline). Use this for hand-written `__global__` kernels
-        # with `hipLaunchKernelGGL` launch syntax. Currently only
-        # launch_lion_native.hip lives here, as a template/demonstration.
+        # HIP/CUDA pipeline). Use this extension for hand-written
+        # `__global__` kernels with `hipLaunchKernelGGL` launch syntax.
         "csrc/backends/hip/gfx942/*.hip",
     ])
 

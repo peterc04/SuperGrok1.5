@@ -132,9 +132,8 @@ self-containment" below.
     │   └── neuralgrok.h        muon.h        supergrok15.h
     ├── backends/
     │   ├── cuda/sm_90/         (11 launch_*.cu + models/{decoder,vit,mamba,attention})
-    │   ├── hip/gfx942/         (11 launch_*.hip.cpp + 1 launch_lion_native.hip
-    │   │                       + models/{decoder,vit,mamba,attention})
-    │   └── pallas/             (10 launch_*.py + v5p/ TPU-specific helpers)
+    │   ├── hip/gfx942/         (11 launch_*.hip.cpp + models/{decoder,vit,mamba,attention})
+    │   └── pallas/             (11 launch_*.py + v5p/ TPU-specific helpers)
     └── bindings/               (5 pybind11 entry-point files)
 ```
 
@@ -890,15 +889,10 @@ Per-optimizer MFMA applicability (analysis in each launcher's file header):
 
 Each launcher's file header contains a four-block analysis: COMPUTE PATTERN,
 MFMA APPLICABILITY, WHY ATEN HERE, and the three-step migration recipe to
-a hand-written kernel.
-
-A reference native HIP kernel implementation lives in
-`csrc/backends/hip/gfx942/launch_lion_native.hip` — a `.hip` file (routes
-through hipcc) with a real `__global__ void lion_kernel(...)` launched via
-`hipLaunchKernelGGL`. It demonstrates the wavefront-64 grid-stride pattern
-+ FP32 accumulation + BF16/FP16 storage. The bindings still dispatch to
-the ATen `launch_lion_step` from `launch_lion.hip.cpp`; promoting to native
-is a one-line bindings change after MI300X validation.
+a hand-written kernel. The setup.py source glob picks up both `*.hip.cpp`
+(host-compiler-routed, ATen+rocBLAS) and `*.hip` (hipcc-routed, real
+`__global__` kernels via `hipLaunchKernelGGL`); migrating a launcher to
+native is the same three-step recipe in the file header.
 
 ---
 

@@ -51,6 +51,7 @@ from grokking_optimizers.optimizers.supergrok2 import (
 )
 from grokking_optimizers.optimizers.supergrok15 import SuperGrok15
 from grokking_optimizers.optimizers.supergrok11 import SuperGrok11
+from grokking_optimizers.optimizers.adamw import AdamW
 from grokking_optimizers.optimizers.grokadamw import GrokAdamW
 from grokking_optimizers.optimizers.grokfast import Grokfast
 from grokking_optimizers.optimizers.lion import Lion
@@ -73,7 +74,8 @@ from grokking_optimizers.dispatch import (
 
 
 __all__ = [
-    # 11 core optimizers
+    # 12 core optimizers (11 grokking + AdamW baseline)
+    "AdamW",
     "SuperGrok2", "CompiledSuperGrok2",
     "SuperGrok15",
     "SuperGrok11",

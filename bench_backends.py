@@ -59,7 +59,7 @@ NCPUS = multiprocessing.cpu_count()
 
 # (launcher_short_name, optimizer_class, source_module)
 OPTIMIZERS: List[Tuple[str, str, str]] = [
-    ("adamw",       "AdamW",       "torch.optim"),
+    ("adamw",       "AdamW",       "grokking_optimizers"),
     ("grokadamw",   "GrokAdamW",   "grokking_optimizers"),
     ("grokfast",    "Grokfast",    "grokking_optimizers"),
     ("lion",        "Lion",        "grokking_optimizers"),
@@ -313,14 +313,12 @@ def profile_pallas(script: str, report, opt_name: str) -> None:
 def opt_for_launcher(path: Path) -> Optional[Tuple[str, str, str]]:
     """Map csrc/.../launch_<NAME>(.cu|.hip.cpp|.hip|.py) → optimizer tuple."""
     stem = path.stem
-    if stem.endswith(".hip"):           # launch_lion_native.hip → stem='launch_lion_native.hip'
+    if stem.endswith(".hip"):
         stem = stem[: -len(".hip")]
     stem = stem.replace("launch_", "")
-    # exact match
     for tup in OPTIMIZERS:
         if tup[0] == stem:
             return tup
-    # prefix match (e.g. lion_native → lion)
     for tup in OPTIMIZERS:
         if stem.startswith(tup[0] + "_") or stem.startswith(tup[0]):
             return tup
