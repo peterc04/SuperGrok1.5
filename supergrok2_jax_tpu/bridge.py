@@ -24,7 +24,7 @@ from typing import Any, Dict, Optional
 
 from .scan import MambaScanWeights
 from .gru import GRUWeights
-from .mamba3_peer_metanet_jax import MetaNetWeights
+from grokking_optimizers._metanet_jax import MetaNetWeights
 
 
 def _to_jnp(tensor) -> jnp.ndarray:

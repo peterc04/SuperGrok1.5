@@ -30,7 +30,7 @@ import torch.distributed as dist
 from torch.optim import Optimizer
 from typing import Optional, Dict, List
 
-from grokking_optimizers.extensions.mamba3_peer_metanet import Mamba3PEERMetaNet
+from grokking_optimizers._metanet import Mamba3PEERMetaNet
 
 from grokking_optimizers._ops_loader import get_ops
 
@@ -117,7 +117,7 @@ class SuperGrok2(Optimizer):
         self.sam_rho = sam_rho
 
         # Precision configuration for projection GEMMs
-        from grokking_optimizers.extensions.quantization import PrecisionConfig
+        from grokking_optimizers._quantization import PrecisionConfig
         self.precision_config = PrecisionConfig(
             projection_precision=projection_precision)
 

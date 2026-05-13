@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 from typing import Any, Callable, Tuple, Optional
 
-from .mamba3_peer_metanet_jax import MetaNetWeights, MetaNetConfig, meta_net_forward
+from grokking_optimizers._metanet_jax import MetaNetWeights, MetaNetConfig, meta_net_forward
 from .supergrok2_jax import SuperGrok2State
 
 

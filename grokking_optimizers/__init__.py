@@ -3,11 +3,12 @@
 Package layout:
 
   grokking_optimizers/
-    optimizers/      11 torch.optim.Optimizer subclasses (the race optimizers)
-    extensions/      shared infrastructure used by the SG2 family
-                     (Mamba3 meta-net, quantization, gradient hooks)
-    dispatch.py      arch detection + fused kernel routing + get_ops()
-    fallback.py      pure-Python reference implementations (testing only)
+    optimizers/         11 torch.optim.Optimizer subclasses (the race optimizers)
+    dispatch.py         arch detection + fused kernel routing + get_ops()
+    fallback.py         pure-Python reference implementations (testing only)
+    _metanet.py         Mamba3 + PEER + GRU meta-net (used by SG2 / 1.5 / 1.1)
+    _quantization.py    precision-mode helpers used by SG2 family
+    _gradient_hook.py   GradientHookOptimizer wrapper
 
 Usage:
     from grokking_optimizers import SuperGrok2, Lion, GrokAdamW, ...
@@ -62,11 +63,11 @@ from grokking_optimizers.optimizers.moe_adam import MoEAwareSuperGrok2
 # Extensions (auxiliary — shared infrastructure used by SG2 family)
 # --------------------------------------------------------------------------
 
-from grokking_optimizers.extensions.mamba3_peer_metanet import (
+from grokking_optimizers._metanet import (
     Mamba3PEERMetaNet, Mamba3ScanBlock, MiniGRU,
 )
-from grokking_optimizers.extensions.quantization import PrecisionConfig
-from grokking_optimizers.extensions.gradient_hook_optimizer import GradientHookOptimizer
+from grokking_optimizers._quantization import PrecisionConfig
+from grokking_optimizers._gradient_hook import GradientHookOptimizer
 
 
 # --------------------------------------------------------------------------

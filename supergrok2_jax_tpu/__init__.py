@@ -41,7 +41,7 @@ from .supergrok2_jax import (
     init_per_param_state,
     supergrok2_step,
 )
-from .mamba3_peer_metanet_jax import (
+from grokking_optimizers._metanet_jax import (
     MetaNetWeights,
     MambaScanWeights,
     GRUWeights,
