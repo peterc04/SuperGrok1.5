@@ -1,7 +1,10 @@
-// csrc/kernels/cuda/sm_90/models/mamba_scan_adapter.cuh
+// csrc/scan/mamba_scan_adapter.cuh — CUDA scan adapter.
+// Moved here in Phase 4 of the refactor because the Mamba selective scan is
+// shared between the Mamba model kernels and the SuperGrok v2 optimizer.
+//
 // Thin adapter wrapping SG2's existing mamba3_* scan kernels for model-context
-// use.  No reimplementation of the core scan algorithm -- reuses the Affine2x2
-// parallel-prefix infrastructure from csrc/common/types.h.
+// use. No reimplementation of the core scan algorithm — reuses the Affine2x2
+// parallel-prefix infrastructure from csrc/scan/affine2x2.h.
 //
 // The adapter packs model-level (x, dt, A_log, B, C) into Affine2x2 maps:
 //   A_bar = exp(dt * A),  B_bar = dt * B

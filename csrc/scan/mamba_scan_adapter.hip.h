@@ -1,6 +1,8 @@
-// csrc/kernels/hip/gfx942/models/mamba_scan_adapter.hip.h
-// Thin adapter wrapping SG2's gfx942 mamba3_* scan kernels for model-layer
-// use. Same interface as the sm_90 adapter but delegates to gfx942 primitives.
+// csrc/scan/mamba_scan_adapter.hip.h — HIP scan adapter.
+// Moved here in Phase 4 of the refactor (shared between Mamba model and SG2
+// optimizer). Thin adapter wrapping SG2's gfx942 mamba3_* scan kernels for
+// model-layer use. Same interface as the sm_90 adapter but delegates to
+// gfx942 primitives.
 //
 // The actual scan device functions live in:
 //   csrc/device/optimizers/gfx942/supergrok2_gfx942.hip.cuh

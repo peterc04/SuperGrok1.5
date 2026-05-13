@@ -45,7 +45,7 @@
 #include "csrc/common/platform.h"
 #include "csrc/common/types.h"
 #include "csrc/common/utils.cuh"
-#include "csrc/kernels/cuda/sm_90/models/mamba_scan_adapter.cuh"
+#include "csrc/scan/mamba_scan_adapter.cuh"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cublas_v2.h>
