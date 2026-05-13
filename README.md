@@ -461,25 +461,33 @@ squared gradient average for 1D parameters.
 
 ### MoE/Adam multi-tensor
 
-A multi-tensor batched Adam variant optimized for Mixture-of-Experts models.
-In standard MoE training, most expert parameters receive zero gradients on
-any given step because the router only activates a small subset of experts
-per input. Running a full optimizer pass over all expert parameters wastes
-computation on the inactive experts.
+`MoEAwareSuperGrok2` — a SuperGrok v2 subclass that compacts active
+expert parameters before running the full SG2 metanet. The wrapper is
+defined in `grokking_optimizers/optimizers/moe_adam.py` and inherits its
+hyperparameters (learning rate, betas, weight decay, metanet config) from
+`SuperGrok2.__init__`.
 
-MoE/Adam solves this by compacting: it identifies which expert parameters
-received non-zero gradients (the active set), gathers only those into a dense
-buffer, runs the Adam step on this smaller active set, then scatters the
-results back to the full parameter tensor. For top-2 routing with 64 experts,
-this means processing roughly three percent of expert parameters instead of
-one hundred percent.
+In standard Mixture-of-Experts training, most expert parameters receive
+zero gradients on any given step because the router only activates a
+small subset of experts per input. Running the Mamba-3 scan over all
+expert parameters wastes the cross-element correlation work on the
+inactive experts.
 
-The same launcher also serves as the multi-tensor variant of plain AdamW for
-non-MoE models — when all parameters receive gradients, the compaction is a
-no-op and the math degenerates to standard AdamW.
+MoEAwareSuperGrok2 solves this by compacting: when `active_expert_indices`
+are provided, it identifies which expert parameters received non-zero
+gradients, gathers only those into a dense buffer, runs the SG2 metanet
+scan on the smaller active set, then scatters the results back to the
+full parameter tensor. For top-2 routing with 64 experts, this means
+processing roughly three percent of expert parameters instead of one
+hundred percent. When no active set is provided, the class delegates
+straight to `SuperGrok2.step()`.
 
-Per-parameter state: gradient momentum, squared gradient average (two
-tensors), plus per-expert activation counts when used in MoE mode.
+Auxiliary features carried alongside the compaction:
+- Per-expert activation counts feed a load-balancing auxiliary loss.
+- Per-expert learning-rate scaling smooths activation frequency.
+- The C++ kernels (`moe_filter_active_params`, `moe_scan_compacted`,
+  `moe_scatter_results`) live in `csrc/algorithms/moe_adam.h` plus the
+  per-arch launchers.
 
 ---
 
@@ -508,7 +516,8 @@ per-element step functions plus any vectorized fast paths:
 - **grokfast.h** — fused EMA + Adam
 - **lion.h** — sign-based interpolated momentum + vec4 fast path
 - **looksam.h** — 4 ops: perturb, restore, set_direction, apply
-- **moe_adam.h** — multi-tensor AdamW wrapper
+- **moe_adam.h** — MoE-aware compact/scan/scatter primitives used by
+  `MoEAwareSuperGrok2`; the actual optimizer math is SuperGrok v2
 - **muon.h** — momentum normalize, Newton-Schulz combine, parameter update
 - **neuralgrok.h** — psi-net MLP forward + Adam apply
 - **prodigy.h** — partial reductions, d update, Adam with d as lr

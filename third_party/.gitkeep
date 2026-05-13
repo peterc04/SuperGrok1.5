@@ -1,4 +1,0 @@
-# Keep third_party/ tracked even when no submodules are checked out.
-# CUTLASS is registered as a submodule (see ../.gitmodules); run
-#   git submodule update --init --recursive third_party/cutlass
-# to populate it. WITH_CUTLASS=1 builds require the submodule cloned.
