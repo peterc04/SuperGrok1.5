@@ -723,23 +723,114 @@ common: `--gpus`, `--optimizers`, `--tasks`, `--train-test-ratios`,
 
 ## Refactor history
 
-This repository underwent a major structural refactor (see `REFACTOR_AUDIT.md`
-and `REFACTOR_NOTES.md`) that reorganized the codebase into three orthogonal
-axes (algorithm, backend, fusion). Key changes:
+This repository underwent a major structural refactor that reorganized the
+codebase into three orthogonal axes (algorithm, backend, fusion), then a
+post-refactor cleanup pass, a final inlining pass, and a JAX collapse pass.
+Refactor commits are tagged `refactor(phase-N): ...` and `cleanup: ...` in
+the git log; the per-phase commit graph and per-file move tables live in
+git history.
+
+### 12-phase structural refactor
 
 - Deleted the `csrc/device/` placeholder tree (~37 files, mostly TODO bodies)
 - Consolidated SuperGrok v2's three CUDA files into one algorithm header +
   one launch file per backend
 - Extracted vendor-neutral algorithm math from per-arch kernels into
-  `csrc/algorithms/`
+  `csrc/algorithms/` (12 headers — `moe_adam.h` is a thin AdamW wrapper kept
+  separate for naming symmetry)
 - Reclassified the Mamba scan adapter as scan infrastructure (shared by both
   the model and the SG2 optimizer) under `csrc/scan/`
 - Renamed `csrc/kernels/cuda/_cutlass_gemm.cuh` to
   `csrc/backends/cuda/sm_90/mma.cuh`
-- Reorganized Python frontend into `optimizers/` + `extensions/` subpackages
+- Reorganized Python frontend into `optimizers/` subpackage
 - Updated build matrix from optimistic "✓ done" to honest ✅/🟡/⛔ legend
 
-Refactor commits are tagged `refactor(phase-N): ...` in the git log.
+### Honest status reclassification
+
+| Cell | Before | After | Reason |
+|------|--------|-------|--------|
+| SuperGrok2 / gfx942 | done | ⛔ | `launch_supergrok2.hip.cpp` raises `std::runtime_error`. The full Mamba+GRU+PEER pipeline needs Hopper-specific features (DSMEM cluster reductions, WGMMA, 4-warp specialization) with no direct CDNA3 equivalent. |
+| All other optimizer × arch cells | done | 🟡 | Implemented end-to-end in the refactored tree, but not run on real hardware in this environment. Promotion to ✅ gated on the action items below. |
+| All model × arch cells | done | 🟡 | Same — implementation exists, hardware validation pending. |
+
+### Post-refactor cleanup pass
+
+- Removed 11 unused extension modules (async, CUDA Graph, distributed, etc.)
+- Inlined the remaining keepers (`Mamba3PEERMetaNet`, `PrecisionConfig`,
+  `gradient_hook_optimizer`) directly into their consumer optimizers
+- Dropped the NVFP4 / MXFP4 / FP4 / Blackwell / CDNA4 scaffolding from
+  code (it was never compiled). The future-arch table in "Hardware support"
+  above is documentation only.
+
+### Final inlining pass
+
+Every optimizer file is now fully self-contained:
+
+| Class(es) inlined                                            | Now lives in                          |
+|--------------------------------------------------------------|---------------------------------------|
+| `Mamba3ScanBlock`, `MiniGRU`, `Mamba3PEERMetaNet`            | `optimizers/supergrok2.py`            |
+| `PrecisionConfig` (with int8/int4 expert quantization)       | `optimizers/supergrok2.py`            |
+| `SharpnessMetaNet` (duplicated, accepted cost)               | `optimizers/supergrok11.py` *and* `supergrok15.py` |
+| `_adamw_step_reference` (pure-Python AdamW)                  | `optimizers/grokadamw.py`             |
+| `GradientHookOptimizer`                                      | `optimizers/gradient_hook.py`         |
+
+Result: `grokking_optimizers/` shrank from 30 → 16 files. No underscored
+private modules, no backward-compat shims. The public API surface trimmed
+down to the 11 optimizers plus `GradientHookOptimizer`.
+
+### JAX collapse pass
+
+The `supergrok2_jax_tpu/` package was folded into the Pallas backend.
+Each `csrc/backends/pallas/launch_<opt>.py` now carries its own JAX
+implementation (State, Config, step function). `launch_supergrok2.py`
+absorbed seven JAX files (≈875 lines): bidirectional Mamba-3 scan, GRU
+cell, PEER routing (soft + hard), meta-net composition, optimizer step,
+bilevel meta-update, INT8/INT4 quantization. `primitives.py` is now slim
+(TPU detection + Pallas kernel re-exports).
+
+---
+
+## Action items for hardware validation
+
+When this branch lands on a machine with a real sm_90 GPU and an MI300X:
+
+**Build smoke test**
+- [ ] `./build.sh` succeeds on sm_90 (H100/H200)
+- [ ] `./build.sh` succeeds on gfx942 (MI300X) after `export USE_HIP=1`
+- [ ] `pip install -e .` produces an importable `_ops` extension
+
+**Import smoke test**
+- [ ] `python -c "from grokking_optimizers import SuperGrok2, Lion"` works
+- [ ] All 11 optimizers in `grokking_optimizers/optimizers/` instantiate
+      without error
+- [ ] `grokking_race_v2.py --help` runs cleanly
+
+**Functional smoke test (sm_90)**
+- [ ] 20-step training loop on the decoder modular-division task with Lion
+      converges (loss decreases)
+- [ ] 20-step training loop with SuperGrok v2 converges
+- [ ] Both above tests pass elementwise allclose vs the Python fallback to
+      within 1e-3
+
+**Honest stub test (gfx942)**
+- [ ] On MI300X: `SuperGrok2(...).step()` raises `NotImplementedError` with
+      the message from `launch_supergrok2.hip.cpp`
+
+**Matrix promotion**
+- [ ] After each above test passes, promote the corresponding cell in the
+      build matrix from 🟡 → ✅
+- [ ] If anything fails, add a follow-up commit with the fix and re-test
+
+**Out-of-scope items (deferred)**
+- Fused megakernel instantiation in `csrc/fused/<arch>/*` (the 99 build
+  targets currently include the right headers but do not yet emit a fused
+  model+optimizer kernel — they're build-target placeholders)
+- Per-optimizer C++ dispatcher consolidation into `bindings.cpp`
+- Warp-specialized SG2 scan as a runtime-detected branch
+- Real autotune output for `tuned_configs.h`
+- CUDA Graph capture for the SG2 pipeline
+- DSMEM cross-CTA reductions wired into LookSAM / Prodigy norm kernels
+- CI matrix (no `tests/` directory at the moment)
 
 ---
 
