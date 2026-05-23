@@ -3,7 +3,10 @@
 Dev-time companion to ``setup.py``. Where ``pip install -e .`` builds the
 full ``grokking_optimizers._ops`` extension with the default arch flags,
 this module compiles a focused, maximally-optimised build for a single
-``(optimizer, model, arch)`` triple and writes a full diagnostic report.
+``(optimizer, model, arch)`` triple. It owns the **build + autotune**
+half of the dev pipeline; the **profile** half lives in the sibling
+module ``grokking_optimizers.profile`` (which can also be invoked
+standalone against any pre-built artefact).
 
 What it does, in order:
 
@@ -21,9 +24,6 @@ What it does, in order:
        -DSG_BUILD_MODEL_<UPPER>=1
        -DSG_BUILD_ARCH_<SM90|GFX942|TPU_V5P>=1
        -DSG_VERBOSE=1
-     Algorithm headers in ``csrc/algorithms/`` and model headers in
-     ``csrc/backends/*/models/`` can guard heavy template specialisations
-     on these and emit dead-code-eliminated kernels for the chosen combo.
 
   3. **Build with Ninja, ``-j$(nproc)``.** Drives
      ``torch.utils.cpp_extension.load`` with ``MAX_JOBS=NCPUS`` so the
@@ -41,17 +41,10 @@ What it does, in order:
      stub configs, then rewrites ``csrc/algorithms/tuned_configs.h`` so a
      subsequent build picks up the tuned constants.
 
-  6. **Optional profile pass.** Runs the arch-native profiler:
-       sm_90    -> ncu (Nsight Compute) ``--set full`` with 7 sections,
-                   ``--import-source yes --source-folders csrc``
-       gfx942   -> rocprof-compute / rocprofv2 / rocprof (first available)
-                   with ``--hip-trace --hsa-trace --stats``
-       tpu_v5p  -> ``jax.profiler.start_trace / stop_trace`` in-process
-     All profiler output is captured to the report file; nothing goes to
-     stdout except the final report path.
-
-  7. **Progress.** A tqdm bar with elapsed/ETA on stderr; if tqdm is
-     missing, a built-in ``[i/N elapsed=Xs eta=Ys]`` fallback.
+  6. **Optional profile pass.** Delegates to
+     ``grokking_optimizers.profile.profile`` (ncu / rocprof / jax.profiler).
+     Pass ``--no-profile`` to skip this step and invoke ``profile`` later
+     against the produced .so.
 
 CLI:
     python -m grokking_optimizers.compile \\
@@ -62,99 +55,33 @@ Importable:
     from grokking_optimizers.compile import build
     so_path = build(optimizer="supergrok2", model="mamba", arch="sm_90")
 
-The compile pass is dev-only — the production race driver (``grokking_race``)
-continues to load the full ``grokking_optimizers._ops`` built by ``setup.py``.
+The compile pass is dev-only — the production race driver continues to
+load the full ``grokking_optimizers._ops`` built by ``setup.py``.
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
 import datetime
-import multiprocessing
-import os
-import shutil
-import subprocess
 import sys
-import tempfile
 import textwrap
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional
 
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-NCPUS = multiprocessing.cpu_count()
-
-OPTIMIZERS: Tuple[str, ...] = (
-    "adamw", "grokadamw", "grokfast", "lion", "looksam", "muon",
-    "neuralgrok", "prodigy", "supergrok11", "supergrok15", "supergrok2",
+from grokking_optimizers.profile import (
+    ARCH_INFO,
+    ARCHES,
+    MODELS,
+    NCPUS,
+    OPTIMIZERS,
+    OPT_CLASS,  # noqa: F401  (re-exported for back-compat)
+    REPO_ROOT,
+    _dispatch_profile,
+    env_overlay,
+    make_progress,
 )
-
-MODELS: Tuple[str, ...] = ("mamba", "decoder", "vit")
-
-ARCHES: Tuple[str, ...] = ("sm_90", "gfx942", "tpu_v5p")
-
-OPT_CLASS = {
-    "adamw":       "AdamW",
-    "grokadamw":   "GrokAdamW",
-    "grokfast":    "Grokfast",
-    "lion":        "Lion",
-    "looksam":     "LookSAM",
-    "muon":        "Muon",
-    "neuralgrok":  "NeuralGrok",
-    "prodigy":     "Prodigy",
-    "supergrok11": "SuperGrok11",
-    "supergrok15": "SuperGrok15",
-    "supergrok2":  "SuperGrok2",
-}
-
-ARCH_INFO = {
-    "sm_90": {
-        "vendor": "cuda",
-        "subdir": "cuda/sm_90",
-        "launcher_glob": ("launch_*.cu",),
-        "model_glob":    ("*.cu",),
-        "macro":         "SG_BUILD_ARCH_SM90",
-        "host_define":   "WITH_CUDA",
-    },
-    "gfx942": {
-        "vendor": "hip",
-        "subdir": "hip/gfx942",
-        "launcher_glob": ("launch_*.hip.cpp", "launch_*.hip"),
-        "model_glob":    ("*.hip.cpp",),
-        "macro":         "SG_BUILD_ARCH_GFX942",
-        "host_define":   "WITH_HIP",
-    },
-    "tpu_v5p": {
-        "vendor": "pallas",
-        "subdir": "pallas",
-        "launcher_glob": ("launch_*.py",),
-        "model_glob":    (),
-        "macro":         "SG_BUILD_ARCH_TPU_V5P",
-        "host_define":   None,
-    },
-}
-
-NCU_FLAGS: List[str] = [
-    "--set", "full",
-    "--target-processes", "all",
-    "--import-source", "yes",
-    "--source-folders", str(REPO_ROOT / "csrc"),
-    "--section", "ComputeWorkloadAnalysis",
-    "--section", "LaunchStats",
-    "--section", "MemoryWorkloadAnalysis",
-    "--section", "SchedulerStats",
-    "--section", "WarpStateStats",
-    "--section", "InstructionStats",
-    "--section", "Occupancy",
-]
-
-ROCPROF_FLAGS: List[str] = [
-    "--hip-trace", "--hsa-trace", "--stats",
-    "--basenames", "on", "--timestamp", "on",
-]
 
 
 @dataclass
@@ -267,53 +194,6 @@ def _include_paths() -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Environment / subprocess helpers
-# ---------------------------------------------------------------------------
-
-@contextlib.contextmanager
-def _env_overlay(**kw):
-    saved = {k: os.environ.get(k) for k in kw}
-    os.environ.update({k: str(v) for k, v in kw.items()})
-    try:
-        yield
-    finally:
-        for k, prev in saved.items():
-            if prev is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = prev
-
-
-def _child_env() -> dict:
-    env = os.environ.copy()
-    existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = (
-        f"{REPO_ROOT}{os.pathsep}{existing}" if existing else str(REPO_ROOT)
-    )
-    return env
-
-
-def _run_capture(cmd: List[str], report, timeout: int = 900) -> int:
-    report.write(f"\n$ {' '.join(str(c) for c in cmd)}\n")
-    report.flush()
-    try:
-        proc = subprocess.run(
-            cmd, cwd=REPO_ROOT, env=_child_env(),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=timeout,
-        )
-        report.write(proc.stdout or "")
-        report.write(f"\n[exit: {proc.returncode}]\n")
-        return proc.returncode
-    except subprocess.TimeoutExpired:
-        report.write(f"\n[TIMEOUT after {timeout}s]\n")
-        return -1
-    except FileNotFoundError as exc:
-        report.write(f"\n[command not found: {exc}]\n")
-        return -2
-
-
-# ---------------------------------------------------------------------------
 # Build (torch.utils.cpp_extension.load with ninja)
 # ---------------------------------------------------------------------------
 
@@ -344,7 +224,7 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
     report.flush()
 
     with_cuda = ARCH_INFO[spec.arch]["vendor"] in ("cuda", "hip")
-    with _env_overlay(
+    with env_overlay(
         MAX_JOBS=NCPUS,
         NINJA_STATUS="[%f/%t %es] ",
         TORCH_CUDA_VERBOSE_BUILD="1",
@@ -390,7 +270,7 @@ def _autotune_pass(spec: BuildSpec, sources: List[Path],
     sensible per-arch defaults so the final pass can pick them up.
     """
     report.write("\n--- AUTOTUNE PASS 1 (AUTOTUNE_PASS=1, stub configs) ---\n")
-    with _env_overlay(AUTOTUNE_PASS=1):
+    with env_overlay(AUTOTUNE_PASS=1):
         so = _torch_load(
             spec, sources,
             host_cflags + ["-DAUTOTUNE_PASS=1"],
@@ -432,150 +312,6 @@ def _autotune_pass(spec: BuildSpec, sources: List[Path],
 
 
 # ---------------------------------------------------------------------------
-# Profile pass
-# ---------------------------------------------------------------------------
-
-def _smoke_script(spec: BuildSpec) -> str:
-    cls = OPT_CLASS[spec.optimizer]
-    return textwrap.dedent(f"""\
-        import sys, traceback
-        try:
-            import torch
-            from grokking_optimizers import {cls}
-            torch.manual_seed(0)
-            device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            p = torch.nn.Parameter(
-                torch.randn(64, 64, device=device, dtype=torch.float32))
-            (p * p).sum().backward()
-            opt = {cls}([p], lr=1e-3)
-            opt.step()
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            print('smoke OK ({spec.optimizer}/{spec.model}/{spec.arch})')
-        except Exception:
-            traceback.print_exc()
-            sys.exit(1)
-    """)
-
-
-def _write_temp_script(body: str) -> str:
-    fd, path = tempfile.mkstemp(suffix=".py")
-    os.write(fd, body.encode())
-    os.close(fd)
-    return path
-
-
-def _profile_cuda(spec: BuildSpec, report) -> None:
-    script = _write_temp_script(_smoke_script(spec))
-    try:
-        if shutil.which("ncu") is None:
-            report.write("  [profile] ncu not in PATH; running smoke only.\n")
-            _run_capture([sys.executable, script], report)
-            return
-        cmd = ["ncu"] + NCU_FLAGS + [sys.executable, script]
-        _run_capture(cmd, report)
-    finally:
-        os.unlink(script)
-
-
-def _profile_hip(spec: BuildSpec, report) -> None:
-    script = _write_temp_script(_smoke_script(spec))
-    tool = (shutil.which("rocprof-compute")
-            or shutil.which("rocprofv2")
-            or shutil.which("rocprof"))
-    try:
-        if tool is None:
-            report.write(
-                "  [profile] no rocprof tool in PATH; running smoke only.\n")
-            _run_capture([sys.executable, script], report)
-            return
-        with tempfile.TemporaryDirectory() as tdir:
-            out_csv = Path(tdir) / f"{spec.optimizer}.csv"
-            cmd = [tool] + ROCPROF_FLAGS + [
-                "-o", str(out_csv), sys.executable, script,
-            ]
-            _run_capture(cmd, report)
-            for f in sorted(Path(tdir).iterdir()):
-                report.write(f"\n--- {f.name} ---\n")
-                try:
-                    report.write(f.read_text())
-                except UnicodeDecodeError:
-                    report.write(f"[binary, {f.stat().st_size}B]\n")
-    finally:
-        os.unlink(script)
-
-
-def _profile_pallas(spec: BuildSpec, report) -> None:
-    body = _smoke_script(spec)
-    wrapper = textwrap.dedent(f"""\
-        import sys, os, tempfile, traceback
-        try:
-            import jax.profiler
-        except ImportError:
-            print('[skip] jax.profiler not available', file=sys.stderr)
-            sys.exit(0)
-        with tempfile.TemporaryDirectory() as tdir:
-            jax.profiler.start_trace(tdir)
-            try:
-                exec(compile({body!r}, '<smoke>', 'exec'))
-            except Exception:
-                traceback.print_exc()
-            finally:
-                jax.profiler.stop_trace()
-            print('--- jax.profiler trace contents ---')
-            for root, _, files in os.walk(tdir):
-                for f in files:
-                    fp = os.path.join(root, f)
-                    print(f'{{f}}: {{os.path.getsize(fp)}} bytes')
-    """)
-    _run_capture([sys.executable, "-c", wrapper], report)
-
-
-# ---------------------------------------------------------------------------
-# Progress UI
-# ---------------------------------------------------------------------------
-
-def _make_progress(total: int, title: str) -> Tuple[Callable[[str], None],
-                                                    Callable[[], None]]:
-    try:
-        from tqdm import tqdm
-        bar = tqdm(
-            total=total, desc=title, file=sys.stderr, unit="phase",
-            bar_format=(
-                "{l_bar}{bar}| {n_fmt}/{total_fmt} "
-                "[{elapsed}<{remaining}, {rate_fmt}] {postfix}"
-            ),
-        )
-
-        def step(label: str) -> None:
-            bar.set_postfix_str(label, refresh=True)
-            bar.update(1)
-
-        def close() -> None:
-            bar.close()
-
-        return step, close
-    except ImportError:
-        t0 = time.monotonic()
-        done = [0]
-
-        def step(label: str) -> None:
-            done[0] += 1
-            elapsed = time.monotonic() - t0
-            eta = (elapsed / done[0]) * (total - done[0]) if done[0] else 0.0
-            sys.stderr.write(
-                f"\r[{done[0]}/{total} elapsed={elapsed:5.1f}s "
-                f"eta={eta:5.1f}s] {label:40s}"
-            )
-            sys.stderr.flush()
-
-        def close() -> None:
-            sys.stderr.write("\n")
-
-        return step, close
-
-
-# ---------------------------------------------------------------------------
 # Public entry
 # ---------------------------------------------------------------------------
 
@@ -594,8 +330,11 @@ def build(
     """Compile the (optimizer × model × arch) pipeline.
 
     Returns the path to the built .so (or ``None`` for pallas / on failure).
-    Full diagnostics — sources, flags, ninja/nvcc/hipcc output, profiler
-    results — are written to ``report_path``.
+    Full diagnostics — sources, flags, ninja/nvcc/hipcc output, and the
+    optional profile capture — are written to ``report_path``. The profile
+    capture is delegated to ``grokking_optimizers.profile``; pass
+    ``profile=False`` to skip it and run ``python -m grokking_optimizers.profile``
+    separately.
     """
     spec = BuildSpec(
         optimizer=optimizer,
@@ -625,7 +364,7 @@ def build(
     if profile:
         phases += ["profile"]
 
-    step, close = _make_progress(len(phases), f"{optimizer}/{model}/{arch}")
+    step, close = make_progress(len(phases), f"{optimizer}/{model}/{arch}")
 
     so_path: Optional[Path] = None
     try:
@@ -667,13 +406,9 @@ def build(
                 step("build")
 
             if profile:
-                report.write("\n--- PROFILE PASS ---\n")
-                if info["vendor"] == "cuda":
-                    _profile_cuda(spec, report)
-                elif info["vendor"] == "hip":
-                    _profile_hip(spec, report)
-                else:
-                    _profile_pallas(spec, report)
+                report.write("\n--- PROFILE PASS "
+                             "(via grokking_optimizers.profile) ---\n")
+                _dispatch_profile(optimizer, model, arch, report)
                 step("profile")
 
             report.write(f"\n# Final .so: {so_path}\n")
@@ -707,7 +442,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--no-autotune", action="store_true",
                         help="Skip the AUTOTUNE_PASS pre-build")
     parser.add_argument("--no-profile", action="store_true",
-                        help="Skip the ncu/rocprof/jax.profiler pass")
+                        help="Skip the ncu/rocprof/jax.profiler pass "
+                             "(run `python -m grokking_optimizers.profile` "
+                             "later against the produced .so)")
     parser.add_argument("-D", dest="extra_macros", action="append", default=[],
                         help="Extra -D<MACRO[=VALUE]> to inject into both "
                              "host and device cflags. Repeatable.")
@@ -734,7 +471,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.out / f"compile_{args.optimizer}_{args.model}_{args.arch}.txt"
     )
     sys.stdout.write(f"{report}\n")
-    # Pallas has no .so so success there is just "report produced".
     return 0 if (so is not None or ARCH_INFO[args.arch]["vendor"] == "pallas") else 1
 
 

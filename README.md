@@ -122,7 +122,8 @@ self-containment" below.
 ├── grokking_optimizers/
 │   ├── __init__.py             (re-exports the 12 optimizers + helpers)
 │   ├── dispatch.py             (arch detection + fused kernel registry + get_ops)
-│   ├── compile.py              (targeted (opt, model, arch) ninja build + autotune + profile)
+│   ├── compile.py              (targeted (opt, model, arch) ninja build + autotune)
+│   ├── profile.py              (standalone ncu / rocprof / jax.profiler capture)
 │   └── optimizers/             (11 torch.optim.Optimizer subclasses; MoE-aware
 │       │                       SG2 lives inside supergrok2.py)
 │       ├── adamw.py            grokfast.py     muon.py       prodigy.py
@@ -211,11 +212,13 @@ local development; CUTLASS is the production-deployment knob.
 ### Targeted build: `grokking_optimizers.compile`
 
 Dev-time companion to `setup.py`. Given an `(optimizer, model, arch)` triple,
-compiles the matching subset of `csrc/` with arch-tuned codegen, LTO, an
-optional autotune pre-pass, and a profile capture — all driven through
-ninja with `MAX_JOBS=$(nproc)`. Use this when iterating on a specific
-combo; use `setup.py` (the default `pip install -e .` path) when building
-the full production extension consumed by the race driver.
+compiles the matching subset of `csrc/` with arch-tuned codegen, LTO, and an
+optional autotune pre-pass — all driven through ninja with
+`MAX_JOBS=$(nproc)`. The profile capture is delegated to the sibling module
+`grokking_optimizers.profile`, which can also be invoked standalone against
+any pre-built artefact (see next subsection). Use these when iterating on a
+specific combo; use `setup.py` (the default `pip install -e .` path) when
+building the full production extension consumed by the race driver.
 
 ```bash
 # CLI
@@ -250,8 +253,9 @@ What runs, in order:
    `csrc/algorithms/tuned_configs.h` with per-arch
    `SG_TUNED_BLOCK_SIZE / VEC_WIDTH / UNROLL` constants so the final
    build picks them up.
-5. **Profile pass** (`--no-profile` to skip) using the arch-native
-   profiler — full diagnostics captured to the report file.
+5. **Profile pass** (`--no-profile` to skip) — delegates to
+   `grokking_optimizers.profile`; see below for the standalone CLI and
+   what each arch's profiler captures.
 
 Output goes to a single text report (default
 `build/compiled/compile_<O>_<M>_<A>.txt`); stdout only prints the report
@@ -295,14 +299,83 @@ Notes on the autotune pass:
   (matching warp width × occupancy targets); a real micro-bench sweep
   would refine these per-`(opt, model)` combo.
 
-#### When to reach for `compile.py` vs `setup.py`
+### Standalone profiling: `grokking_optimizers.profile`
+
+Lives right next to `compile.py` at `grokking_optimizers/profile.py`. The
+profile pass that `compile.py` runs is just a call into this module — but
+you can also invoke it directly when you already have a launcher source
+file or a `compile.py`-produced `.so` and want the full native-profiler
+capture without rebuilding.
+
+```bash
+# Profile by path — optimizer + arch are inferred from the path
+python -m grokking_optimizers.profile \
+    --path csrc/backends/cuda/sm_90/launch_supergrok2.cu
+
+# Profile a compile.py-produced .so directly
+python -m grokking_optimizers.profile \
+    --path build/compiled/grokking_compiled_lion_mamba_gfx942/grokking_compiled_lion_mamba_gfx942.cpython-310-x86_64-linux-gnu.so
+
+# Profile by explicit name (no path)
+python -m grokking_optimizers.profile \
+    --optimizer supergrok2 --model mamba --arch sm_90 \
+    [--report profile.txt] [--timeout 1800]
+```
+
+```python
+# Importable
+from grokking_optimizers.profile import profile
+report = profile(path="csrc/backends/cuda/sm_90/launch_supergrok2.cu")
+# or
+report = profile(optimizer="lion", arch="gfx942")
+```
+
+**Path inference** — when `--path` is given, the module recognises:
+
+| Path | Inferred |
+|---|---|
+| `csrc/backends/cuda/sm_90/launch_<opt>.cu` | optimizer=`<opt>`, arch=`sm_90` |
+| `csrc/backends/hip/gfx942/launch_<opt>.hip.cpp` (or `.hip`) | optimizer=`<opt>`, arch=`gfx942` |
+| `csrc/backends/pallas/launch_<opt>.py` | optimizer=`<opt>`, arch=`tpu_v5p` |
+| `build/.../grokking_compiled_<opt>_<model>_<arch>/*.so` | optimizer + model + arch |
+| any other `.py` | needs explicit `--arch` |
+
+The profiler runs the standard one-step smoke (import the optimizer class,
+single `opt.step()` on a 64×64 tensor) — the path is the **identifier** of
+what to profile; the kernels actually exercised come from the installed
+`grokking_optimizers._ops` (or, for `tpu_v5p`, the matching
+`launch_*.py`). So if you want to profile a specific compiled `.so`,
+make sure that combo is the one currently installed (`pip install -e .`)
+or that the `.so`'s build dir is on `PYTHONPATH`.
+
+#### Profile requirements per arch
+
+Same hardware story as compile — but the run-and-profile side is what
+matters here, since there's no build step.
+
+| `--arch` (inferred or explicit) | Hardware required | Profiler binary / call |
+|---|---|---|
+| `sm_90` | NVIDIA Hopper (H100 / H200) + the kernels already built for it | `ncu --set full --target-processes all --import-source yes --source-folders csrc` + 7 sections (ComputeWorkloadAnalysis, LaunchStats, MemoryWorkloadAnalysis, SchedulerStats, WarpStateStats, InstructionStats, Occupancy) |
+| `gfx942` | AMD CDNA3 (MI300X / MI300A) + the kernels already built for it | `rocprof-compute` (preferred) → `rocprofv2` → `rocprof` with `--hip-trace --hsa-trace --stats --basenames on --timestamp on`; all emitted CSV/JSON files inlined into the report |
+| `tpu_v5p` | TPU v5p host with `jax[tpu]` installed | `jax.profiler.start_trace / stop_trace` in-process; XLA HLO + op-level capture; trace dir listing summarised in the report |
+
+If the expected profiler binary isn't on `PATH`, the smoke still runs and
+the report records `[skip] ncu not in PATH; running smoke only.` (or
+equivalent) — useful as a sanity check on a machine that can run the
+kernel but can't profile it.
+
+Output goes to a single text report (default
+`build/profiled/profile_<O>_<M>_<A>.txt`); stdout only prints the report
+path. Same tqdm-with-ETA progress UI as `compile.py`.
+
+#### When to reach for `compile.py` vs `setup.py` vs `profile.py`
 
 | You want… | Use |
 |---|---|
 | The production `grokking_optimizers._ops` consumed by the race driver | `pip install -e .` (setup.py) |
 | To iterate on one optimizer × one model × one arch with full diagnostics | `python -m grokking_optimizers.compile -O <opt> -M <model> -A <arch>` |
-| To capture an `ncu --set full` / `rocprof` / `jax.profiler` trace into a single text file | `compile.py` (the profile pass is the only built-in capture path) |
-| To rebuild every backend launcher and capture per-launcher profiles | `bench_backends.py` (still ships at repo root, complements `compile.py`) |
+| To re-profile something already built without rebuilding | `python -m grokking_optimizers.profile --path <file>` |
+| To rebuild every backend launcher and capture per-launcher profiles | `bench_backends.py` (still ships at repo root, complements both) |
 
 ---
 
