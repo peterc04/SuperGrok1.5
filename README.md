@@ -212,66 +212,150 @@ local development; CUTLASS is the production-deployment knob.
 ### Targeted build: `grokking_optimizers.compile`
 
 Dev-time companion to `setup.py`. Given an `(optimizer, model, arch)` triple,
-compiles the matching subset of `csrc/` with arch-tuned codegen, LTO, and an
-optional autotune pre-pass — all driven through ninja with
-`MAX_JOBS=$(nproc)`. The profile capture is delegated to the sibling module
-`grokking_optimizers.profile`, which can also be invoked standalone against
-any pre-built artefact (see next subsection). Use these when iterating on a
-specific combo; use `setup.py` (the default `pip install -e .` path) when
-building the full production extension consumed by the race driver.
+compiles the matching subset of `csrc/` with arch-tuned codegen, LTO, and a
+two-phase **AOT-then-JIT autotune** with a portable JSON cache — all driven
+through ninja with `MAX_JOBS=$(nproc)`. The profile capture is delegated to
+the sibling module `grokking_optimizers.profile`, which can also be invoked
+standalone against any pre-built artefact (see next subsection). Use these
+when iterating on a specific combo; use `setup.py` (the default
+`pip install -e .` path) when building the full production extension
+consumed by the race driver.
 
 ```bash
-# CLI
+# End-to-end on a GPU host (AOT + JIT autotune + profile)
 python -m grokking_optimizers.compile \
     --optimizer supergrok2 --model mamba --arch sm_90 \
-    [--no-autotune] [--no-profile] [--out build/compiled] \
-    [--report build_report.txt] [-D MY_FLAG=1]
+    --cache build/.compile_cache.json --exhaustive
 
+# AOT-only on a CPU host (no GPU needed) — writes cache, ship to GPU host
+python -m grokking_optimizers.compile \
+    --optimizer supergrok2 --model mamba --arch sm_90 \
+    --cache build/.compile_cache.json --aot-only
+
+# JIT autotune only — consumes the cache produced above
+python -m grokking_optimizers.compile \
+    --optimizer supergrok2 --model mamba --arch sm_90 \
+    --cache build/.compile_cache.json --jit-only --exhaustive
+```
+
+```python
 # Importable
-from grokking_optimizers.compile import build
-so_path = build(optimizer="supergrok2", model="mamba", arch="sm_90")
+from grokking_optimizers.compile import build, CompileCache
+cache = CompileCache(Path("build/.compile_cache.json"))   # held in memory
+so   = build(optimizer="supergrok2", model="mamba", arch="sm_90",
+             cache=cache, autotune_mode="exhaustive")
 ```
 
 What runs, in order:
 
 1. **Resolve sources** — bindings + every launcher and model TU for the
-   chosen arch (18 files), so the bindings link cleanly.
+   chosen arch (18 files), so the bindings link cleanly. Compute the
+   SHA-256 hashes of the source set + host/device cflags.
 2. **Inject metaprog macros** so headers can `#if` out unused
    specialisations for the chosen combo:
    `-DSG_BUILD_OPTIMIZER_<UPPER>=1`,
    `-DSG_BUILD_MODEL_<UPPER>=1`,
    `-DSG_BUILD_ARCH_<…>=1`,
    `-DSG_VERBOSE=1`.
-3. **Build with ninja `-j$(nproc)`** via
+3. **AOT phase** (any host — CPU is fine). Look up the combo in the
+   cache. **Cache hit** = matching source + flag hashes and a recorded
+   primary artefact that still exists → reuse the `.so` and skip the
+   build. **Cache miss** → build with ninja `-j$(nproc)` via
    `torch.utils.cpp_extension.load`, with arch-tuned flags + LTO
    (sm_90: `--maxrregcount=255 -gencode arch=compute_90,code=sm_90 -dlto
    -Xcompiler -flto`, CUTLASS auto-enabled if `third_party/cutlass/` is
    present; gfx942: `--offload-arch=gfx942 -Rpass-analysis=kernel-resource-usage
-   -flto`).
-4. **Autotune pass** (`--no-autotune` to skip): pre-build with
-   `AUTOTUNE_PASS=1` stub configs, then rewrite
-   `csrc/algorithms/tuned_configs.h` with per-arch
-   `SG_TUNED_BLOCK_SIZE / VEC_WIDTH / UNROLL` constants so the final
-   build picks them up.
-5. **Profile pass** (`--no-profile` to skip) — delegates to
+   -flto`). Persist the artefact path / size / SHA-256 in the cache,
+   stamp `aot_completed_at`, save to disk.
+4. **JIT autotune phase** (`--no-autotune` to skip; runs only when
+   `torch.cuda.is_available()` returns `True`). Sweep the per-arch config
+   grid — `--quick` (8), default (36), or `--exhaustive` (75) combos of
+   `block_size × vec_width × unroll`. For each combo, JIT-build a variant
+   `.so` with `-DSG_TUNED_BLOCK_SIZE/-DSG_TUNED_VEC_WIDTH/-DSG_TUNED_UNROLL`,
+   load it as `grokking_optimizers._ops` in a clean subprocess, time
+   `opt.step()` on a 4096×4096 tensor with `torch.cuda.Event` over 21
+   iterations + 5 warmup, take the median. The variant's `build_directory`
+   is unique per config so ninja's per-file cache hits on the second+
+   variant builds. Record each result in `cache.sweep_history`.
+5. **Final pass** — when a winner exists, rewrite
+   `csrc/algorithms/tuned_configs.h` with the winning macros (so downstream
+   builds pick them up), rebuild the primary `.so` with those macros baked
+   into the flags, replace the cached primary artefact.
+6. **Profile pass** (`--no-profile` to skip) — delegates to
    `grokking_optimizers.profile`; see below for the standalone CLI and
    what each arch's profiler captures.
+
+The cache is loaded once at `build()` start into an **in-memory dict** and
+mutated in place throughout; the only disk writes are atomic
+tmp-file-rename saves at phase boundaries (end of AOT, end of JIT, end of
+final, end of run). No per-step file I/O, so the cache itself is never
+the bottleneck.
 
 Output goes to a single text report (default
 `build/compiled/compile_<O>_<M>_<A>.txt`); stdout only prints the report
 path. Progress is reported on stderr via a tqdm bar with elapsed/ETA,
 falling back to a `[i/N elapsed=Xs eta=Ys]` line when tqdm is missing.
 
+#### Cache file format and portability
+
+The cache lives as a single JSON file (default
+`<out>/.compile_cache.json`; override with `--cache <path>`). It survives
+across processes, so two `compile.py` runs against the same combo only
+build once. Per-entry schema:
+
+```jsonc
+{
+  "version": 2,
+  "created_at": "2026-…",
+  "host_history": [{ "platform": "Linux-…", "torch": "2.…", "cuda": "13.0", "ncpus": 4, "recorded_at": "…" }],
+  "entries": {
+    "supergrok2/mamba/sm_90": {
+      "source_hash":         "abc…",   // SHA-256 of source-set contents
+      "host_cflags_hash":    "def…",
+      "device_cflags_hash":  "ghi…",
+      "primary_artifact":    { "path": "/…/*.so", "size": …, "mtime": …, "sha256": "…" },
+      "variant_artifacts":   { "b256_v4_u8": { "path": "…", "size": …, "mtime": … }, … },
+      "sweep_history":       [{ "config": {"block":256,"vec":4,"unroll":8}, "timing_ms": 0.412, "min_ms":…, "max_ms":…, "n":21, "host": {…}, "config_key":"b256_v4_u8" }, …],
+      "tuned_config":        { "block":256, "vec":4, "unroll":8, "timing_ms":0.412, "config_key":"b256_v4_u8" },
+      "aot_completed_at":    "2026-…",
+      "jit_completed_at":    "2026-…",
+      "aot_host":            { … },     // host that ran the AOT phase
+      "jit_host":            { … }      // host that ran the JIT phase
+    }
+  }
+}
+```
+
+**Cross-host portability**: the hashes, sweep history, and tuned config
+are portable — they travel with the JSON file. The local artefact paths
+(`primary_artifact.path` and `variant_artifacts[*].path`) are host-local
+and get rebuilt on first AOT run on a new machine. JIT-sweep results
+carry across hosts of the same arch, so a fresh GPU host that already
+has a winning config in the cache reuses it directly (skipping the
+sweep). Schema upgrades archive the old file as `.v<N>.bak`; corrupted
+JSON is archived as `.corrupt.bak`.
+
+**Typical cross-machine workflow** (CPU build farm → GPU runner):
+
+| Step | Where | Command | Cache state after |
+|---|---|---|---|
+| 1. AOT build | CPU host with nvcc/hipcc | `compile.py --aot-only --cache shared.json` | `aot_completed_at` set; artefact local |
+| 2. Ship cache | git / rsync / artefact store | `cp shared.json <gpu-host>:…` | knowledge portable |
+| 3. JIT autotune | Target GPU host | `compile.py --jit-only --exhaustive --cache shared.json` | `jit_completed_at` set; `tuned_config` resolved |
+| 4. Re-run anywhere | Either host | `compile.py --cache shared.json` | both phases cache-hit |
+
 #### Compile requirements per arch
 
 The triple selected determines what hardware/toolchain must be present.
-Builds without the optional profiler still succeed; only the profile
-capture is skipped with a `[skip]` line in the report.
+With `--aot-only`, only the compile toolchain is needed; the GPU
+hardware is only required for the JIT autotune sweep and the profile
+capture. Builds without the optional profiler still succeed; only the
+profile capture is skipped with a `[skip]` line in the report.
 
-| Selected `--arch` | Hardware required to build | Hardware required to run + profile | Required compiler | Optional profiler |
+| Selected `--arch` | AOT phase (build only) | JIT autotune + profile (run) | Required compiler | Optional profiler |
 |---|---|---|---|---|
-| `sm_90` | None for build (set `FORCE_CUDA=1` to compile without a visible GPU); CUDA Toolkit ≥ 12.0 + nvcc on `PATH` | NVIDIA Hopper (H100 / H200) for `opt.step()` and `ncu` capture | `nvcc` (CUDA Toolkit) + `g++` ≥ 9 | `ncu` (Nsight Compute, `--set full` + 7 sections) |
-| `gfx942` | None for build (PyTorch ROCm install); ROCm ≥ 6.0 + hipcc on `PATH` | AMD CDNA3 (MI300X / MI300A) for `opt.step()` and rocprof capture | `hipcc` (ROCm) + host C++ for `.hip.cpp` | `rocprof-compute` ≫ `rocprofv2` ≫ `rocprof` (first found on `PATH`) |
+| `sm_90` | None for build (set `FORCE_CUDA=1` to compile without a visible GPU); CUDA Toolkit ≥ 12.0 + nvcc on `PATH` | NVIDIA Hopper (H100 / H200) for `opt.step()` timing and `ncu` capture | `nvcc` (CUDA Toolkit) + `g++` ≥ 9 | `ncu` (Nsight Compute, `--set full` + 7 sections) |
+| `gfx942` | None for build (PyTorch ROCm install); ROCm ≥ 6.0 + hipcc on `PATH` | AMD CDNA3 (MI300X / MI300A) for `opt.step()` timing and rocprof capture | `hipcc` (ROCm) + host C++ for `.hip.cpp` | `rocprof-compute` ≫ `rocprofv2` ≫ `rocprof` (first found on `PATH`) |
 | `tpu_v5p` | None — Python-only, no C++ compile (the launcher is `csrc/backends/pallas/launch_<opt>.py`) | TPU v5p host with `jax[tpu]` for `opt.step()` and trace capture | n/a | `jax.profiler.start_trace / stop_trace` (in-process) |
 
 Common requirements (all arches):
@@ -288,16 +372,32 @@ Common requirements (all arches):
   present, the sm_90 build auto-adds `-DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a`
   so Muon Newton-Schulz and SuperGrok v2 dt_proj route through CUTLASS GEMMs.
 
-Notes on the autotune pass:
+#### Autotune search space (maximally optimised, exhaustive)
 
-- The pre-pass build sets `AUTOTUNE_PASS=1`, so any header guarded by
-  `#ifdef AUTOTUNE_PASS` can swap in stub configs to make the build cheap
-  even on a hot kernel.
-- The rewritten `csrc/algorithms/tuned_configs.h` is the only mutating
-  side-effect — re-run the command (or pass `--no-autotune`) to leave it
-  alone. The defaults are 256-block on sm_90 and 512-block on gfx942
-  (matching warp width × occupancy targets); a real micro-bench sweep
-  would refine these per-`(opt, model)` combo.
+The JIT sweep covers `block_size × vec_width × unroll`. The targets are
+~100% SM/CU utilisation: warp-width-aligned blocks, the largest viable
+vector load width per arch, and unroll factors that keep ILP saturated
+without blowing the register budget (`--maxrregcount=255` on sm_90,
+hipcc default on gfx942).
+
+| Mode | sm_90 configs (block × vec × unroll) | gfx942 configs | Total |
+|---|---|---|---|
+| `--quick` | {128, 256} × {2, 4} × {4, 8} | {256, 512} × {2, 4} × {4, 8} | 8 |
+| default (no flag) | {128, 256, 512, 1024} × {1, 2, 4} × {4, 8, 16} | same | 36 |
+| `--exhaustive` | {64, 128, 256, 512, 1024} × {1, 2, 4} × {1, 2, 4, 8, 16} | same | 75 |
+
+Each variant build reuses the same `build_directory` family so ninja's
+per-file cache amortises the cost — after the first variant builds the
+full source set, subsequent variants only rebuild the .o files affected
+by the changed `-DSG_TUNED_*` macros. Build artefacts and timing results
+are stored in the cache; re-runs of the same combo on the same host
+skip both the rebuild and the timing run.
+
+Timing isolation: each variant is timed in a **fresh subprocess** that
+loads the variant `.so` as `grokking_optimizers._ops` via
+`importlib.util.spec_from_file_location`, runs 5 warmup steps + 21 timed
+steps with `torch.cuda.Event`, and reports the median + min/max + n.
+Subprocess isolation prevents module-cache contamination across variants.
 
 ### Standalone profiling: `grokking_optimizers.profile`
 
@@ -374,6 +474,8 @@ path. Same tqdm-with-ETA progress UI as `compile.py`.
 |---|---|
 | The production `grokking_optimizers._ops` consumed by the race driver | `pip install -e .` (setup.py) |
 | To iterate on one optimizer × one model × one arch with full diagnostics | `python -m grokking_optimizers.compile -O <opt> -M <model> -A <arch>` |
+| To build kernels on a CPU host and ship the build knowledge to a GPU host | `compile.py --aot-only --cache shared.json` → ship JSON → `compile.py --jit-only --cache shared.json` |
+| Maximally-tuned `.so` (sweep all 75 block × vec × unroll combos) | `compile.py --exhaustive` (or `--quick` for 8 combos, default = 36) |
 | To re-profile something already built without rebuilding | `python -m grokking_optimizers.profile --path <file>` |
 | To rebuild every backend launcher and capture per-launcher profiles | `bench_backends.py` (still ships at repo root, complements both) |
 
