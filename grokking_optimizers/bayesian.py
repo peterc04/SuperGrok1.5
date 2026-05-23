@@ -41,6 +41,25 @@ from grokking_optimizers.search_space import (
 )
 
 
+# ---------------------------------------------------------------------------
+# §12 A1 — Pruner factory (Hyperband / Median / None)
+# ---------------------------------------------------------------------------
+
+def _make_pruner(name: str):
+    """Return an Optuna pruner. ``name`` ∈ {none, median, hyperband}."""
+    name = (name or "none").lower()
+    if name == "none":
+        return optuna.pruners.NopPruner()
+    if name == "median":
+        return optuna.pruners.MedianPruner(n_warmup_steps=2)
+    if name == "hyperband":
+        # min_resource=1 rep, max_resource=21 reps (matches our default
+        # iters), reduction_factor=3 (standard SHA).
+        return optuna.pruners.HyperbandPruner(
+            min_resource=1, max_resource=21, reduction_factor=3)
+    raise ValueError(f"unknown pruner {name!r}")
+
+
 TimerResult = Optional[Dict[str, Any]]
 Timer = Callable[[Dict[str, Any]], TimerResult]
 ProgressCb = Optional[Callable[[int, int, Dict[str, Any]], None]]
@@ -89,12 +108,26 @@ def run_bayesian(
     progress: ProgressCb = None,
     host: Optional[Dict[str, Any]] = None,
     prefiltered: Optional[List[Dict[str, Any]]] = None,
+    pruner: str = "none",
+    seed_trials: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Run the TPE stage. Returns the list of trial records.
 
     If ``prefiltered`` is given, every suggested config that is not in
     that set is reported as a failed trial (Optuna's TPE only operates
     over the categorical product; static feasibility is enforced here).
+
+    ``pruner`` selects an Optuna pruner: ``"none"`` (default),
+    ``"median"``, or ``"hyperband"`` (§12 A1 — Hyperband / Successive
+    Halving). Pruning only triggers if the timer reports intermediate
+    values; the current single-shot timer does not, so the pruner is
+    effectively a no-op for now. Code path is landed for forward
+    compatibility.
+
+    ``seed_trials`` (§12 A2 — transfer learning) is a list of prior
+    trial records (same shape as the return value) used to warm-start
+    the TPE surrogate via ``study.add_trials``. Typical use: pass
+    AdamW's winners when tuning SuperGrok-2 on the same (model, arch).
     """
     dims = space[arch]["dims"]
     feasible = {_ckey(c) for c in (prefiltered or [])}
@@ -115,10 +148,53 @@ def run_bayesian(
     study = optuna.create_study(
         direction="minimize",
         sampler=sampler,
+        pruner=_make_pruner(pruner),
         study_name=study_name,
         storage=storage_url,
         load_if_exists=True,
     )
+
+    # §12 A2 — Transfer learning: seed the study with sibling-optimizer
+    # winners. Optuna treats these as completed trials, so the TPE
+    # surrogate sees them as prior knowledge before any new trial fires.
+    if seed_trials:
+        dim_names = [d["name"] for d in dims]
+        dim_value_sets = {d["name"]: [tuple(v) if isinstance(v, list) else v
+                                      for v in d["values"]]
+                          for d in dims}
+        seeded = 0
+        for t in seed_trials:
+            cfg = t.get("config") or {}
+            tms = t.get("timing_ms")
+            if tms is None:
+                continue
+            # Only seed if every dim is present in our current space.
+            params: Dict[str, Any] = {}
+            distributions: Dict[str, optuna.distributions.BaseDistribution] = {}
+            ok = True
+            for name in dim_names:
+                if name not in cfg:
+                    ok = False
+                    break
+                val = cfg[name]
+                val = tuple(val) if isinstance(val, list) else val
+                if val not in dim_value_sets[name]:
+                    ok = False
+                    break
+                params[name] = val
+                distributions[name] = optuna.distributions.CategoricalDistribution(
+                    dim_value_sets[name])
+            if not ok:
+                continue
+            try:
+                study.add_trial(optuna.trial.create_trial(
+                    params=params,
+                    distributions=distributions,
+                    value=float(tms),
+                ))
+                seeded += 1
+            except Exception:
+                continue
 
     records: List[Dict[str, Any]] = []
 

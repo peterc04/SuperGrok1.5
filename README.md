@@ -114,7 +114,13 @@ self-containment" below.
 ├── grokking_race_v2.py   (race driver — 12 optimizers × 3 models × 4 splits)
 ├── setup.py / build.sh / pyproject.toml
 ├── autotune/                   (kernel auto-tuning utilities)
-├── scripts/                    (build / dev helpers)
+├── configs/
+│   └── search_space.yaml       (YAML-driven autotune search space per arch)
+├── docs/
+│   ├── autotune.md             (autotune guide — modes, PGO, YAML, troubleshooting)
+│   └── optimization_matrix.md  (§12 candidate evaluation matrix with citations)
+├── INTERFACES.md               (module coordination contract for compile.py)
+├── scripts/                    (build / dev helpers — incl. pgo_workload.py)
 ├── tests/                      (correctness tests + JAX/Triton reference impls)
 │   └── reference/
 │       └── models/
@@ -122,8 +128,15 @@ self-containment" below.
 ├── grokking_optimizers/
 │   ├── __init__.py             (re-exports the 12 optimizers + helpers)
 │   ├── dispatch.py             (arch detection + fused kernel registry + get_ops)
-│   ├── compile.py              (targeted (opt, model, arch) ninja build + autotune)
+│   ├── compile.py              (targeted (opt, model, arch) ninja build +
+│   │                           AOT/JIT runtime split + Bayesian/Exhaustive
+│   │                           autotune + optional PGO loop)
 │   ├── profile.py              (standalone ncu / rocprof / jax.profiler capture)
+│   ├── search_space.py         (YAML loader + pre-filter + macro resolver)
+│   ├── bayesian.py             (Optuna TPE + ±2-step neighbour refinement)
+│   ├── timing_worker.py        (persistent CUDA/HIP-warm subprocess)
+│   ├── bench_graph.py          (CUDA-graph / HIP-graph capture+replay)
+│   ├── pgo.py                  (instrument / collect / use flag plumbing)
 │   └── optimizers/             (11 torch.optim.Optimizer subclasses; MoE-aware
 │       │                       SG2 lives inside supergrok2.py)
 │       ├── adamw.py            grokfast.py     muon.py       prodigy.py
@@ -211,31 +224,54 @@ local development; CUTLASS is the production-deployment knob.
 
 ### Targeted build: `grokking_optimizers.compile`
 
-Dev-time companion to `setup.py`. Given an `(optimizer, model, arch)` triple,
-compiles the matching subset of `csrc/` with arch-tuned codegen, LTO, and a
-two-phase **AOT-then-JIT autotune** with a portable JSON cache — all driven
-through ninja with `MAX_JOBS=$(nproc)`. The profile capture is delegated to
-the sibling module `grokking_optimizers.profile`, which can also be invoked
-standalone against any pre-built artefact (see next subsection). Use these
-when iterating on a specific combo; use `setup.py` (the default
+Dev-time companion to `setup.py`. Given an `(optimizer, model, arch)`
+triple, compiles the matching subset of `csrc/` with arch-tuned codegen,
+full LTO, and a two-phase **AOT-then-JIT autotune** with a portable JSON
+cache (v3) — all driven through ninja with `MAX_JOBS=$(nproc)`. The
+search space is YAML-driven (`configs/search_space.yaml`); the autotune
+defaults to **Bayesian** (Optuna TPE + ±2-step neighbour refinement) and
+also supports **Exhaustive** sweeps; optional **PGO** loop instruments
+→ runs a workload → rebuilds with `-fprofile-use`. AOT and JIT can run
+in **separate subprocesses** so a CPU host can do AOT and a GPU host
+can take the JIT half. Profile capture is delegated to
+`grokking_optimizers.profile` (see next subsection). Use these when
+iterating on a specific combo; use `setup.py` (the default
 `pip install -e .` path) when building the full production extension
 consumed by the race driver.
 
 ```bash
-# End-to-end on a GPU host (AOT + JIT autotune + profile)
+# End-to-end (default: bayesian, 500 trials, top-K=20, both runtimes)
 python -m grokking_optimizers.compile \
     --optimizer supergrok2 --model mamba --arch sm_90 \
-    --cache build/.compile_cache.json --exhaustive
+    --cache build/.compile_cache.json
+
+# Exhaustive — every config that survives the YAML pre-filter
+python -m grokking_optimizers.compile \
+    --optimizer supergrok2 --model mamba --arch sm_90 \
+    --cache build/.compile_cache.json --mode exhaustive
 
 # AOT-only on a CPU host (no GPU needed) — writes cache, ship to GPU host
 python -m grokking_optimizers.compile \
     --optimizer supergrok2 --model mamba --arch sm_90 \
-    --cache build/.compile_cache.json --aot-only
+    --cache build/.compile_cache.json --aot-only \
+    --aot-artifact-dir build/compiled/aot_artifacts
 
 # JIT autotune only — consumes the cache produced above
 python -m grokking_optimizers.compile \
     --optimizer supergrok2 --model mamba --arch sm_90 \
-    --cache build/.compile_cache.json --jit-only --exhaustive
+    --cache build/.compile_cache.json --jit-only --mode bayesian
+
+# PGO-flavoured AOT (3-pass instrument → workload → use)
+python -m grokking_optimizers.compile \
+    --optimizer supergrok2 --model mamba --arch sm_90 \
+    --cache build/.compile_cache.json --pgo --pgo-steps 1000
+
+# Quick debug sweep (25 Bayesian trials, no PGO)
+python -m grokking_optimizers.compile -O lion -M mamba -A sm_90 --quick
+
+# Transfer learning — seed TPE from sibling-optimizer studies
+python -m grokking_optimizers.compile -O supergrok2 -M mamba -A sm_90 \
+    --transfer-learning --cache build/.compile_cache.json
 ```
 
 ```python
@@ -243,14 +279,16 @@ python -m grokking_optimizers.compile \
 from grokking_optimizers.compile import build, CompileCache
 cache = CompileCache(Path("build/.compile_cache.json"))   # held in memory
 so   = build(optimizer="supergrok2", model="mamba", arch="sm_90",
-             cache=cache, autotune_mode="exhaustive")
+             cache=cache, autotune_mode="bayesian",
+             bayesian_trials=500, top_k=20, pgo=False)
 ```
 
 What runs, in order:
 
 1. **Resolve sources** — bindings + every launcher and model TU for the
-   chosen arch (18 files), so the bindings link cleanly. Compute the
-   SHA-256 hashes of the source set + host/device cflags.
+   chosen arch (18 files), so the bindings link cleanly. Compute SHA-256
+   hashes of the source set, host/device cflags, the resolved YAML
+   search space, and the PGO state.
 2. **Inject metaprog macros** so headers can `#if` out unused
    specialisations for the chosen combo:
    `-DSG_BUILD_OPTIMIZER_<UPPER>=1`,
@@ -258,29 +296,35 @@ What runs, in order:
    `-DSG_BUILD_ARCH_<…>=1`,
    `-DSG_VERBOSE=1`.
 3. **AOT phase** (any host — CPU is fine). Look up the combo in the
-   cache. **Cache hit** = matching source + flag hashes and a recorded
-   primary artefact that still exists → reuse the `.so` and skip the
-   build. **Cache miss** → build with ninja `-j$(nproc)` via
-   `torch.utils.cpp_extension.load`, with arch-tuned flags + LTO
-   (sm_90: `--maxrregcount=255 -gencode arch=compute_90,code=sm_90 -dlto
-   -Xcompiler -flto`, CUTLASS auto-enabled if `third_party/cutlass/` is
-   present; gfx942: `--offload-arch=gfx942 -Rpass-analysis=kernel-resource-usage
-   -flto`). Persist the artefact path / size / SHA-256 in the cache,
-   stamp `aot_completed_at`, save to disk.
+   cache. **Cache hit** = matching source + flag + search-space +
+   PGO-state hashes and a recorded primary artefact that still exists
+   → reuse the `.so` and skip the build. **Cache miss** → build with
+   ninja `-j$(nproc)` via `torch.utils.cpp_extension.load`, with the
+   maximally optimised flag bases (see "Flag bases" below). Persist the
+   artefact path / size / SHA-256 in the cache, stamp
+   `aot_completed_at`, save to disk. With `--pgo`, the AOT phase runs
+   the 3-pass loop **instrument → workload → use** (the workload is
+   `scripts/pgo_workload.py` by default; override via `--pgo-workload`).
 4. **JIT autotune phase** (`--no-autotune` to skip; runs only when
-   `torch.cuda.is_available()` returns `True`). Sweep the per-arch config
-   grid — `--quick` (8), default (36), or `--exhaustive` (75) combos of
-   `block_size × vec_width × unroll`. For each combo, JIT-build a variant
-   `.so` with `-DSG_TUNED_BLOCK_SIZE/-DSG_TUNED_VEC_WIDTH/-DSG_TUNED_UNROLL`,
-   load it as `grokking_optimizers._ops` in a clean subprocess, time
-   `opt.step()` on a 4096×4096 tensor with `torch.cuda.Event` over 21
-   iterations + 5 warmup, take the median. The variant's `build_directory`
-   is unique per config so ninja's per-file cache hits on the second+
-   variant builds. Record each result in `cache.sweep_history`.
+   `torch.cuda.is_available()` returns `True`). Load the YAML search
+   space, apply static **pre-filter** rules (alignment, occupancy
+   ceilings, TMA/warp-spec block thresholds; logged as
+   `[prefilter] N candidates → M survivors (K eliminated)`), then sweep:
+   - **`--mode bayesian`** (default): Optuna TPE multivariate sampler
+     for `--bayesian-trials` iterations (default 500), then ±2-step
+     neighbour refinement on the top-K (default 20). The study persists
+     to `<out>/optuna_<opt>_<model>_<arch>.db` for cross-run resume.
+   - **`--mode exhaustive`**: every surviving config is built and timed.
+     Cache flushes every 5 trials so a Ctrl-C is recoverable.
+   Each variant is timed by a **persistent subprocess worker** that
+   holds a warm CUDA/HIP context for the entire sweep and uses
+   **CUDA-graph capture+replay** for sm_90 (HIP-graph reuses the same
+   wrapper on ROCm). On worker crash, the sweep falls back to one-shot
+   subprocess timing for that variant, then restarts the worker.
 5. **Final pass** — when a winner exists, rewrite
-   `csrc/algorithms/tuned_configs.h` with the winning macros (so downstream
-   builds pick them up), rebuild the primary `.so` with those macros baked
-   into the flags, replace the cached primary artefact.
+   `csrc/algorithms/tuned_configs.h` with the winning macros (so
+   downstream builds pick them up), rebuild the primary `.so` with
+   those macros baked in, and update the cached primary artefact.
 6. **Profile pass** (`--no-profile` to skip) — delegates to
    `grokking_optimizers.profile`; see below for the standalone CLI and
    what each arch's profiler captures.
@@ -299,13 +343,14 @@ falling back to a `[i/N elapsed=Xs eta=Ys]` line when tqdm is missing.
 #### Cache file format and portability
 
 The cache lives as a single JSON file (default
-`<out>/.compile_cache.json`; override with `--cache <path>`). It survives
-across processes, so two `compile.py` runs against the same combo only
-build once. Per-entry schema:
+`<out>/.compile_cache.json`; override with `--cache <path>`). It
+survives across processes, so two `compile.py` runs against the same
+combo only build once. The schema is **v3** (forward-migrated from v2
+on load; the v2 file is archived as `<cache>.v2.bak`). Per-entry shape:
 
 ```jsonc
 {
-  "version": 2,
+  "version": 3,
   "created_at": "2026-…",
   "host_history": [{ "platform": "Linux-…", "torch": "2.…", "cuda": "13.0", "ncpus": 4, "recorded_at": "…" }],
   "entries": {
@@ -313,35 +358,50 @@ build once. Per-entry schema:
       "source_hash":         "abc…",   // SHA-256 of source-set contents
       "host_cflags_hash":    "def…",
       "device_cflags_hash":  "ghi…",
+      "search_space_hash":   "jkl…",   // SHA-256 of resolved YAML space
       "primary_artifact":    { "path": "/…/*.so", "size": …, "mtime": …, "sha256": "…" },
-      "variant_artifacts":   { "b256_v4_u8": { "path": "…", "size": …, "mtime": … }, … },
-      "sweep_history":       [{ "config": {"block":256,"vec":4,"unroll":8}, "timing_ms": 0.412, "min_ms":…, "max_ms":…, "n":21, "host": {…}, "config_key":"b256_v4_u8" }, …],
-      "tuned_config":        { "block":256, "vec":4, "unroll":8, "timing_ms":0.412, "config_key":"b256_v4_u8" },
+      "variant_artifacts":   { "block=256_unroll=8_vec=4": { "path": "…", "size": …, "mtime": … }, … },
+      "sweep_history":       [{ "stage":"tpe", "config": {…}, "timing_ms": 0.412, "min_ms":…, "max_ms":…, "n":21, "host": {…}, "config_key":"…" }, …],
+      "bayesian_trials":     [/* same shape as sweep_history; stage ∈ {"tpe","refine","exhaustive"} */],
+      "mode":                "bayesian",
+      "tuned_config":        { "block":256, "vec":4, "unroll":8, "timing_ms":0.412, "config_key":"…", "stage_won":"refine" },
       "aot_completed_at":    "2026-…",
       "jit_completed_at":    "2026-…",
-      "aot_host":            { … },     // host that ran the AOT phase
-      "jit_host":            { … }      // host that ran the JIT phase
+      "aot_host":            { … },
+      "jit_host":            { … },
+      "pgo_enabled":         true,
+      "pgo_profile_dir":     "build/compiled/pgo_profile",
+      "pgo_workload_hash":   "sha256(workload-contents + steps)",
+      "pgo_completed_at":    "2026-…",
+      "pgo_host":            { … }
     }
   }
 }
 ```
 
-**Cross-host portability**: the hashes, sweep history, and tuned config
-are portable — they travel with the JSON file. The local artefact paths
-(`primary_artifact.path` and `variant_artifacts[*].path`) are host-local
-and get rebuilt on first AOT run on a new machine. JIT-sweep results
-carry across hosts of the same arch, so a fresh GPU host that already
-has a winning config in the cache reuses it directly (skipping the
-sweep). Schema upgrades archive the old file as `.v<N>.bak`; corrupted
-JSON is archived as `.corrupt.bak`.
+**Cross-host portability**: hashes, sweep history, Bayesian trial list,
+and the tuned config are portable — they travel with the JSON file.
+The local artefact paths (`primary_artifact.path` and
+`variant_artifacts[*].path`) are host-local; on a fresh GPU host they
+get rebuilt on first AOT run (or, if AOT was done on a different
+machine, they get picked up via `--aot-artifact-dir <shared-path>`).
+JIT-sweep results carry across hosts of the same arch, so a fresh GPU
+host that already has a winning config in the cache reuses it
+directly. Schema upgrades archive the old file as `<cache>.v<N>.bak`;
+corrupted JSON is archived as `<cache>.corrupt.bak`. `pgo_enabled`,
+`pgo_workload_hash`, and `search_space_hash` all gate AOT freshness so
+a PGO build is never confused with a non-PGO build, and a YAML edit
+forces a fresh sweep.
 
-**Typical cross-machine workflow** (CPU build farm → GPU runner):
+**Typical cross-machine workflow** (CPU build farm → GPU runner). The
+default `--runtime both` spawns AOT then JIT subprocesses in the same
+session; the split below is for genuine cross-machine pipelines:
 
 | Step | Where | Command | Cache state after |
 |---|---|---|---|
-| 1. AOT build | CPU host with nvcc/hipcc | `compile.py --aot-only --cache shared.json` | `aot_completed_at` set; artefact local |
-| 2. Ship cache | git / rsync / artefact store | `cp shared.json <gpu-host>:…` | knowledge portable |
-| 3. JIT autotune | Target GPU host | `compile.py --jit-only --exhaustive --cache shared.json` | `jit_completed_at` set; `tuned_config` resolved |
+| 1. AOT build | CPU host with nvcc/hipcc | `compile.py --aot-only --aot-artifact-dir shared/ --cache shared.json` | `aot_completed_at` set; artefact published |
+| 2. Ship cache + artefact | git / rsync / artefact store | `rsync -av shared/ <gpu-host>:shared/ && cp shared.json <gpu-host>:` | both portable |
+| 3. JIT autotune | Target GPU host | `compile.py --jit-only --mode bayesian --cache shared.json` | `jit_completed_at`, `tuned_config`, `bayesian_trials` populated |
 | 4. Re-run anywhere | Either host | `compile.py --cache shared.json` | both phases cache-hit |
 
 #### Compile requirements per arch
@@ -372,32 +432,74 @@ Common requirements (all arches):
   present, the sm_90 build auto-adds `-DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a`
   so Muon Newton-Schulz and SuperGrok v2 dt_proj route through CUTLASS GEMMs.
 
-#### Autotune search space (maximally optimised, exhaustive)
+#### Autotune search space (YAML-driven)
 
-The JIT sweep covers `block_size × vec_width × unroll`. The targets are
-~100% SM/CU utilisation: warp-width-aligned blocks, the largest viable
-vector load width per arch, and unroll factors that keep ILP saturated
-without blowing the register budget (`--maxrregcount=255` on sm_90,
-hipcc default on gfx942).
+The full search space lives at [`configs/search_space.yaml`](configs/search_space.yaml).
+The targets are ~100% SM/CU utilisation: warp-aligned blocks, vector
+widths matched to the arch's load instructions, unroll factors that
+keep ILP saturated without blowing the register budget, plus the
+hardware-specific knobs (TMA, warp specialization, cluster shapes,
+async-copy depth on sm_90; LDS swizzle, MFMA shape, waves-per-EU on
+gfx942). Each YAML dim carries a name, type, value list, `-D` macro
+name, and an `applies_to` list (`host` / `device`). Static pre-filter
+rules (alignment, occupancy, TMA/warp-spec block thresholds, cluster
+volume cap, etc.) eliminate infeasible configs **before** any compile;
+the elimination count is logged at sweep start.
 
-| Mode | sm_90 configs (block × vec × unroll) | gfx942 configs | Total |
-|---|---|---|---|
-| `--quick` | {128, 256} × {2, 4} × {4, 8} | {256, 512} × {2, 4} × {4, 8} | 8 |
-| default (no flag) | {128, 256, 512, 1024} × {1, 2, 4} × {4, 8, 16} | same | 36 |
-| `--exhaustive` | {64, 128, 256, 512, 1024} × {1, 2, 4} × {1, 2, 4, 8, 16} | same | 75 |
+| Mode | What runs |
+|---|---|
+| `--mode bayesian` (default) | Optuna TPE for `--bayesian-trials` (default 500) + ±2-step neighbour refinement on top-K (default 20). Optuna study persisted for cross-run resume. |
+| `--mode exhaustive` | Every config that survives the pre-filter is built and timed. Cache flush every 5 trials. |
+| `--quick` | Debug shortcut: bayesian mode, 25 trials. |
 
 Each variant build reuses the same `build_directory` family so ninja's
 per-file cache amortises the cost — after the first variant builds the
 full source set, subsequent variants only rebuild the .o files affected
-by the changed `-DSG_TUNED_*` macros. Build artefacts and timing results
-are stored in the cache; re-runs of the same combo on the same host
-skip both the rebuild and the timing run.
+by the changed macros. Build artefacts and timing results are stored
+in the cache; re-runs of the same combo on the same host skip both the
+rebuild and the timing run.
 
-Timing isolation: each variant is timed in a **fresh subprocess** that
-loads the variant `.so` as `grokking_optimizers._ops` via
-`importlib.util.spec_from_file_location`, runs 5 warmup steps + 21 timed
-steps with `torch.cuda.Event`, and reports the median + min/max + n.
-Subprocess isolation prevents module-cache contamination across variants.
+Timing infrastructure:
+
+- A **persistent subprocess worker** holds a warm CUDA/HIP context for
+  the entire sweep — no per-variant Python startup cost, no per-variant
+  CUDA-init cost.
+- The worker uses **CUDA-graph capture+replay** (sm_90) and the same
+  wrapper on ROCm's HIP-graph (gfx942), so timing measures kernel work
+  not launch overhead. Per-iter event timing is the fallback when
+  graph capture fails.
+- Each variant `.so` is loaded into the worker via
+  `importlib.util.spec_from_file_location` as `grokking_optimizers._ops`;
+  the previous module is unloaded between variants to avoid op-registration
+  collisions.
+- 5 warmup + 21 timed iterations; report median + min/max + n. Worker
+  crash → one-shot subprocess fallback + worker restart.
+
+See [`docs/autotune.md`](docs/autotune.md) for full mode comparison,
+YAML schema reference, PGO guidance, and troubleshooting.
+
+#### Performance optimizations
+
+The decided baseline (full LTO, `-march=native`, sccache wiring,
+NVCC `--threads 8`, NVCC `-Xfatbin -compress-all`, NVCC
+`--allow-expensive-optimizations`, NVCC `--def-load-cache=ca` /
+`--def-store-cache=wb`, HIPCC `-mllvm -amdgpu-early-inline-all`,
+`-Wl,--gc-sections -Wl,--icf=all`, the persistent timing worker, and
+CUDA/HIP graphs) is always on. See
+[`docs/optimization_matrix.md`](docs/optimization_matrix.md) for the
+full §12 evaluation matrix of additional candidates with published
+impact numbers, integration costs, and risk assessments — including
+which are now on by default vs. behind-flag.
+
+Auto-enabled additions landed in this PR:
+
+| Candidate | Flag / env | Effect |
+|---|---|---|
+| Newer-compiler probe | (auto) | logs nvcc/hipcc version; appends `--split-compile=$(nproc)` to NVCC when ≥12.6 |
+| ccache fallback alongside sccache | (auto) | ccache takes host `CC`/`CXX` when on PATH; sccache always handles NVCC; ~3-4.5× faster than sccache on local host TUs |
+| Redis-backed shared sccache | `SCCACHE_REDIS_ENDPOINT` env | propagates into child builds for cluster-wide cache sharing |
+| Hyperband pruner | `--pruner hyperband` | Successive Halving brackets for Bayesian TPE (Li et al. 2018) |
+| Transfer learning | `--transfer-learning` | seeds TPE study with sibling-optimizer trials on the same (model, arch) |
 
 ### Standalone profiling: `grokking_optimizers.profile`
 

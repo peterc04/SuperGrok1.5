@@ -524,6 +524,9 @@ class BuildSpec:
     top_k: int = 20
     seed: int = 0
     debug_symbols: bool = False
+    # §12 A1 / A2 — Hyperband pruner + transfer learning
+    pruner: str = "none"              # "none" | "median" | "hyperband"
+    transfer_learning: bool = False
 
 
 def _validate(spec: BuildSpec) -> None:
@@ -541,6 +544,32 @@ def _validate(spec: BuildSpec) -> None:
     if spec.runtime not in ("aot", "jit", "both"):
         raise ValueError(
             f"runtime={spec.runtime!r} not in {{'aot', 'jit', 'both'}}")
+    if spec.pruner not in ("none", "median", "hyperband"):
+        raise ValueError(
+            f"pruner={spec.pruner!r} not in {{'none', 'median', 'hyperband'}}")
+
+
+def _collect_sibling_trials(cache: CompileCache, opt: str, model: str,
+                            arch: str) -> List[Dict[str, Any]]:
+    """§12 A2 — transfer learning: gather successful trials from
+    sibling-optimizer studies on the same (model, arch). The returned
+    list is ready to pass to ``bayesian.run_bayesian(seed_trials=...)``.
+
+    Sibling = same (model, arch), different optimizer. Failed trials
+    (``timing_ms is None``) are skipped so the surrogate isn't poisoned.
+    """
+    sibling_trials: List[Dict[str, Any]] = []
+    entries = cache._data.get("entries", {})
+    suffix = f"/{model}/{arch}"
+    for key, entry in entries.items():
+        if not key.endswith(suffix):
+            continue
+        if key.startswith(f"{opt}/"):
+            continue  # don't reseed from the same optimizer
+        for t in entry.get("bayesian_trials", []):
+            if t.get("timing_ms") is not None and "config" in t:
+                sibling_trials.append(t)
+    return sibling_trials
 
 
 # ---------------------------------------------------------------------------
@@ -658,34 +687,126 @@ def _include_paths() -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# sccache / env wiring
+# Compile-wrapper env wiring — ccache → sccache → unwrapped (§12 C2 / I1)
 # ---------------------------------------------------------------------------
 
-def _sccache_env() -> Dict[str, str]:
-    """Detect sccache on PATH and return env overrides if present."""
-    out: Dict[str, str] = {}
-    sccache = shutil.which("sccache")
-    if not sccache:
-        return out
-    # Decide cache dir: prefer /dev/shm (ramdisk) when writable.
-    candidate = Path("/dev/shm/sccache")
-    use = candidate
-    try:
-        candidate.mkdir(parents=True, exist_ok=True)
-        probe = candidate / ".probe"
-        probe.write_text("ok")
-        probe.unlink()
-    except OSError:
-        use = Path.home() / ".cache" / "sccache"
+def _writable_cache_dir(name: str) -> Optional[Path]:
+    """Prefer /dev/shm/<name> (ramdisk); fall back to ~/.cache/<name>."""
+    for candidate in (Path(f"/dev/shm/{name}"), Path.home() / ".cache" / name):
         try:
-            use.mkdir(parents=True, exist_ok=True)
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".probe"
+            probe.write_text("ok")
+            probe.unlink()
+            return candidate
         except OSError:
-            return {}  # no usable cache dir
-    out["SCCACHE_DIR"] = str(use)
-    out["CC"] = f"{sccache} {os.environ.get('CC', 'cc')}"
-    out["CXX"] = f"{sccache} {os.environ.get('CXX', 'c++')}"
-    out["CUDA_NVCC_EXECUTABLE"] = f"{sccache} nvcc"
+            continue
+    return None
+
+
+def _sccache_env() -> Dict[str, str]:
+    """Detect ccache (preferred for host TUs) and sccache (preferred for
+    NVCC), wire whichever is present. Honour ``SCCACHE_REDIS_ENDPOINT``
+    if set (§12 I1 — Redis-backed shared cache across hosts).
+
+    The host CC/CXX get ccache when it's on PATH (3-4.5× faster than
+    sccache on local C/C++ object retrieval per the sccache project's
+    own measurements). NVCC always goes through sccache when sccache is
+    on PATH (after vllm#13697 the CUDA hash bug is fixed)."""
+    out: Dict[str, str] = {}
+    ccache = shutil.which("ccache")
+    sccache = shutil.which("sccache")
+
+    if ccache:
+        host_dir = _writable_cache_dir("ccache")
+        if host_dir is not None:
+            out["CCACHE_DIR"] = str(host_dir)
+            out["CC"]  = f"{ccache} {os.environ.get('CC',  'cc')}"
+            out["CXX"] = f"{ccache} {os.environ.get('CXX', 'c++')}"
+
+    if sccache:
+        sc_dir = _writable_cache_dir("sccache")
+        if sc_dir is not None:
+            out.setdefault("SCCACHE_DIR", str(sc_dir))
+            # If ccache didn't claim host wrappers, sccache takes them.
+            out.setdefault("CC",  f"{sccache} {os.environ.get('CC',  'cc')}")
+            out.setdefault("CXX", f"{sccache} {os.environ.get('CXX', 'c++')}")
+            out["CUDA_NVCC_EXECUTABLE"] = f"{sccache} nvcc"
+        # Redis backend (§12 I1) propagates unconditionally if user set it.
+        for k in ("SCCACHE_REDIS_ENDPOINT", "SCCACHE_REDIS", "SCCACHE_S3_BUCKET"):
+            if k in os.environ:
+                out[k] = os.environ[k]
+
     return out
+
+
+# ---------------------------------------------------------------------------
+# Toolchain version probe — §12 C1
+# ---------------------------------------------------------------------------
+
+def _probe_nvcc_version() -> Optional[Tuple[int, int]]:
+    """Return (major, minor) of nvcc on PATH, or None."""
+    nvcc = shutil.which("nvcc")
+    if not nvcc:
+        return None
+    try:
+        out = subprocess.check_output([nvcc, "--version"], text=True,
+                                      timeout=10, stderr=subprocess.STDOUT)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    # Format: "release 12.6, V12.6.85"
+    import re
+    m = re.search(r"release\s+(\d+)\.(\d+)", out)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def _probe_hipcc_version() -> Optional[Tuple[int, int]]:
+    """Return (major, minor) of HIP on PATH, or None."""
+    hipcc = shutil.which("hipcc")
+    if not hipcc:
+        return None
+    try:
+        out = subprocess.check_output([hipcc, "--version"], text=True,
+                                      timeout=10, stderr=subprocess.STDOUT)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    import re
+    m = re.search(r"HIP version[:\s]+(\d+)\.(\d+)", out)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def _newer_compiler_flags(arch: str, report=None) -> Tuple[List[str], List[str]]:
+    """Return (extra_host, extra_device) flags that are safe additions
+    when the detected toolchain is new enough. §12 C1 — pure autodetect,
+    no-op on older toolchains."""
+    extra_host: List[str] = []
+    extra_device: List[str] = []
+    if arch in ("sm_90",):
+        ver = _probe_nvcc_version()
+        if ver:
+            if report:
+                report.write(f"  [toolchain] nvcc {ver[0]}.{ver[1]}\n")
+            if ver >= (12, 6):
+                # NVCC 12.6+ supports --split-compile for opt-phase parallelism.
+                extra_device += [f"--split-compile={NCPUS}"]
+                if report:
+                    report.write(f"  [toolchain] enabling "
+                                 f"--split-compile={NCPUS} (NVCC ≥12.6)\n")
+        elif report:
+            report.write("  [toolchain] nvcc not on PATH; "
+                         "skipping version-gated flags\n")
+    elif arch == "gfx942":
+        ver = _probe_hipcc_version()
+        if ver and report:
+            report.write(f"  [toolchain] HIP {ver[0]}.{ver[1]}\n")
+        elif report:
+            report.write("  [toolchain] hipcc not on PATH; "
+                         "skipping version-gated flags\n")
+    return extra_host, extra_device
 
 
 # ---------------------------------------------------------------------------
@@ -719,6 +840,12 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
     report.flush()
 
     with_cuda = ARCH_INFO[spec.arch]["vendor"] in ("cuda", "hip")
+    # §12 C1 — newer compiler probe; auto-append --split-compile etc.
+    extra_host, extra_device = _newer_compiler_flags(spec.arch, report)
+    if extra_host:
+        host_cflags = list(host_cflags) + extra_host
+    if extra_device:
+        device_cflags = list(device_cflags) + extra_device
     overlay = {
         "MAX_JOBS": NCPUS,
         "NINJA_STATUS": "[%f/%t %es] ",
@@ -727,8 +854,12 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
         "NVCC_THREADS": "8",
         **_sccache_env(),
     }
+    if "CCACHE_DIR" in overlay:
+        report.write(f"  ccache:    {overlay['CCACHE_DIR']}\n")
     if "SCCACHE_DIR" in overlay:
         report.write(f"  sccache:   {overlay['SCCACHE_DIR']}\n")
+    if "SCCACHE_REDIS_ENDPOINT" in overlay:
+        report.write(f"  sccache Redis: {overlay['SCCACHE_REDIS_ENDPOINT']}\n")
     with env_overlay(**overlay):
         t0 = time.monotonic()
         try:
@@ -1063,7 +1194,20 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
 
     n_trials = spec.bayesian_trials
     report.write(f"\n  [bayesian] TPE stage with n_trials={n_trials}, "
-                 f"seed={spec.seed}\n")
+                 f"seed={spec.seed}, pruner={spec.pruner}\n")
+
+    # §12 A2 — Transfer learning: seed from sibling-optimizer trials.
+    seed_trials: Optional[List[Dict[str, Any]]] = None
+    if spec.transfer_learning:
+        siblings = _collect_sibling_trials(cache, spec.optimizer,
+                                           spec.model, spec.arch)
+        if siblings:
+            report.write(f"  [bayesian] transfer-learning: seeding from "
+                         f"{len(siblings)} sibling-optimizer trials\n")
+            seed_trials = siblings
+        else:
+            report.write("  [bayesian] transfer-learning: no sibling "
+                         "trials available; cold-starting\n")
 
     # Optuna study persistence (resumable across runs).
     storage = (spec.out_dir
@@ -1081,6 +1225,8 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
             study_name=f"sg_{spec.optimizer}_{spec.model}_{spec.arch}",
             timer=timer, progress=progress1, host=_current_host(),
             prefiltered=prefiltered,
+            pruner=spec.pruner,
+            seed_trials=seed_trials,
         )
     finally:
         close1()
@@ -1475,6 +1621,8 @@ def build(
     top_k: int = 20,
     seed: int = 0,
     debug_symbols: bool = False,
+    pruner: str = "none",
+    transfer_learning: bool = False,
 ) -> Optional[Path]:
     """In-process orchestrator. ``main`` handles subprocess split.
 
@@ -1499,6 +1647,7 @@ def build(
         pgo=pgo, pgo_workload=pgo_workload, pgo_steps=pgo_steps,
         bayesian_trials=bayesian_trials, top_k=top_k, seed=seed,
         debug_symbols=debug_symbols,
+        pruner=pruner, transfer_learning=transfer_learning,
     )
     _validate(spec)
     spec.out_dir.mkdir(parents=True, exist_ok=True)
@@ -1655,6 +1804,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="Bayesian sampler seed (default: 0).")
     parser.add_argument("--no-autotune", action="store_true",
                         help="Skip JIT autotune even when a GPU is visible.")
+    # §12 A1 — Hyperband / median pruner option
+    parser.add_argument("--pruner", choices=("none", "median", "hyperband"),
+                        default="none",
+                        help="Optuna pruner. Default: none. 'hyperband' "
+                             "enables Successive Halving (§12 A1).")
+    # §12 A2 — Transfer learning seeding
+    parser.add_argument("--transfer-learning", action="store_true",
+                        help="Seed Bayesian TPE from sibling-optimizer "
+                             "trials on the same (model, arch). §12 A2.")
 
     # ── Search space + PGO ──────────────────────────────────────────
     parser.add_argument("--search-space", type=Path,
@@ -1732,6 +1890,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         top_k=args.top_k,
         seed=args.seed,
         debug_symbols=args.debug_symbols,
+        pruner=args.pruner,
+        transfer_learning=args.transfer_learning,
     )
 
     report = args.report or (
