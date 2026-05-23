@@ -1,113 +1,120 @@
 """grokking_optimizers.compile — Targeted per-(optimizer, model, arch) build
-with a portable AOT-then-JIT cache.
+with a portable AOT-then-JIT cache, YAML-driven search space, Bayesian
+or Exhaustive autotune, optional PGO, and runtime-split AOT/JIT
+subprocesses.
 
-Companion to ``setup.py``. Where ``pip install -e .`` builds the full
-``grokking_optimizers._ops`` extension with the default arch flags, this
-module compiles a focused, maximally-optimised build for a single
-``(optimizer, model, arch)`` triple. The pipeline is split into two halves
-so a CPU-only host can do the heavy AOT compile and ship a cache file to
-the target GPU host, which then does the JIT autotune sweep.
+This is the development-time companion to ``setup.py``. Where
+``pip install -e .`` builds the full ``grokking_optimizers._ops``
+extension with default flags, this module compiles a focused,
+**maximally optimised** build for a single ``(optimizer, model, arch)``
+triple. The pipeline is split into two halves so a CPU-only host can
+do the heavy AOT compile and ship a cache file to the target GPU host,
+which then does the JIT autotune sweep.
 
 Two-phase pipeline
 ==================
 
-**AOT phase (runs on any host with the toolchain — no GPU required).**
+**AOT phase (any host with the toolchain — no GPU required).**
 
-  1. Resolve sources for the chosen arch (bindings + every launcher + every
-     model TU = 18 files).
-  2. Hash the source set, the host cflags, and the device cflags.
-  3. Look up ``(optimizer, model, arch)`` in the cache file. If all three
-     hashes match an entry with ``aot_completed_at != None`` and the
-     recorded primary artefact still exists with the recorded size →
-     **cache hit**, skip rebuild and reuse the .so.
-  4. Otherwise build with ``torch.utils.cpp_extension.load`` (ninja,
-     ``MAX_JOBS=$(nproc)``), arch-tuned codegen + LTO, and the
-     ``SG_BUILD_*`` metaprog macros so headers can ``#if`` out unused
-     specialisations.
+  1. Resolve sources for the chosen arch (bindings + every launcher +
+     every model TU).
+  2. Hash the source set, the host cflags, the device cflags, the
+     resolved search-space, and the PGO state. Look up
+     ``(optimizer, model, arch)`` in the cache. If all hashes match an
+     entry with ``aot_completed_at != None`` and ``pgo_enabled`` agrees
+     and the recorded artefact still exists → **cache hit**.
+  3. Otherwise build with ``torch.utils.cpp_extension.load`` (ninja,
+     ``MAX_JOBS=$(nproc)``, sccache wiring when on PATH), arch-tuned
+     codegen + LTO + perf flags, and the ``SG_BUILD_*`` macros so
+     headers can ``#if`` out unused specialisations.
+  4. If ``--pgo`` is set, the AOT phase runs the 3-pass loop:
+       instrument → workload → use. The PGO state is recorded so
+       subsequent runs short-circuit when the workload hash matches.
   5. Record the artefact path, size, mtime, and SHA-256 in the cache.
      Mark ``aot_completed_at``. Save cache to disk.
 
-  The AOT artefact is portable in *knowledge* (hashes, tuned configs)
-  across machines; the ``.so`` path itself is host-local and gets
-  re-validated on each run.
+**JIT autotune phase (target GPU only).**
 
-**JIT autotune phase (runs only when ``torch.cuda.is_available()``).**
+  1. Load the resolved search space from ``configs/search_space.yaml``.
+     Generate the cartesian product → apply static pre-filter rules →
+     log the elimination count.
+  2. Two autotune modes:
+       - ``--mode exhaustive``: every survivor is built and timed.
+         Cache is written every N trials so a Ctrl-C is recoverable.
+       - ``--mode bayesian`` (default): Optuna TPE for ``--bayesian-trials``
+         iterations + top-K refinement with ±2-step neighbours. The
+         Optuna study persists to ``<cache_dir>/optuna_<opt>_<model>_<arch>.db``
+         for cross-run resume.
+  3. Timing is done by a **persistent subprocess worker** that holds a
+     warm CUDA / HIP context for the full sweep, using CUDA-graph
+     replay where the kernel supports it. Per-variant timeout falls
+     back to one-shot subprocess timing on worker crash.
+  4. Pick the winning combo (lowest median ms). Set ``cache.tuned_config``.
+     Mark ``jit_completed_at``.
+  5. Rewrite ``csrc/algorithms/tuned_configs.h`` with the winning
+     macros so downstream consumers (setup.py builds, IDE Intellisense)
+     pick up the tuned defaults.
+  6. Rebuild the primary artefact with the tuned configs baked in.
 
-  1. Choose a search space: ``--exhaustive`` (75 configs),
-     ``--default`` (36 configs), or ``--quick`` (8 configs).
-  2. For each ``(block_size, vec_width, unroll)`` combo:
-       - Build a variant .so with
-         ``-DSG_TUNED_BLOCK_SIZE=B -DSG_TUNED_VEC_WIDTH=V -DSG_TUNED_UNROLL=U``
-         (each variant gets its own module name and build_directory so the
-         ninja per-file cache hits on the second+ build). The cache also
-         remembers which variant configs have been built before.
-       - Load that .so as ``grokking_optimizers._ops`` into a fresh
-         subprocess, run ``opt.step()`` on a 4096×4096 tensor, time it
-         with ``torch.cuda.Event``, take the median of N iterations.
-       - Record ``config, timing_ms`` in ``cache.sweep_history``.
-  3. Pick the winning combo (lowest median timing). Set
-     ``cache.tuned_config``. Mark ``jit_completed_at``.
-  4. Rewrite ``csrc/algorithms/tuned_configs.h`` with the winning macros
-     so downstream consumers (setup.py builds, IDE Intellisense) pick up
-     the tuned defaults.
-  5. Rebuild the primary artefact with the tuned configs baked in.
-  6. Save cache to disk.
+Runtime split
+=============
+``--runtime {aot, jit, both}`` controls which subprocesses run.
+``both`` (default) spawns an AOT subprocess (CPU-only env) followed by
+a JIT subprocess (GPU env). Each subprocess re-enters ``main`` with
+the single-phase flag and reads/writes the same on-disk cache. This
+means AOT and JIT can be tuned independently (env vars, library
+versions, memory limits) without their settings bleeding into each
+other. ``--aot-only`` / ``--jit-only`` remain as aliases.
 
-The cache is loaded once at the start of ``build()`` into an in-memory
-dict and mutated throughout — no per-step file I/O — then written back
-atomically at the end. Pass ``--cache <path>`` to use a specific cache
-file; the default lives at ``<out>/.compile_cache.json``.
+Cache schema v3
+===============
+The on-disk format is JSON; ``CACHE_VERSION == 3``. Forward-compatible
+with v2 (auto-migrated on load). See ``INTERFACES.md`` for the full
+shape. Headline additions over v2:
 
-Cache portability
-=================
+    mode                 "exhaustive" | "bayesian" | None
+    pgo_enabled          bool
+    pgo_profile_dir      str | None
+    pgo_workload_hash    str | None
+    pgo_completed_at     str | None
+    pgo_host             host dict
+    search_space_hash    str (SHA-256 of resolved YAML space)
+    bayesian_trials      [trial_record, …]   (stage="tpe" | "refine")
 
-The on-disk format is JSON keyed by ``optimizer/model/arch``. Each entry
-stores:
-
-    source_hash        SHA-256 of the source-set contents and order.
-    host_cflags_hash   SHA-256 of the host C++ flag string.
-    device_cflags_hash SHA-256 of the CUDA/HIP flag string.
-    primary_artifact   {path, size, mtime, sha256}  — host-local.
-    variant_artifacts  {config_key -> {path, size, mtime}} — host-local.
-    sweep_history      [{config, timing_ms, host, recorded_at}]
-    tuned_config       {block, vec, unroll, timing_ms} or None.
-    aot_completed_at   ISO timestamp or None.
-    jit_completed_at   ISO timestamp or None.
-    aot_host           {platform, python, torch, cuda, hip, ncpus}
-    jit_host           same shape, populated on the GPU host
-
-When the cache moves to a new machine, the hashes + tuned configs +
-sweep history travel; the local artefact paths get rebuilt on first AOT
-run there. JIT-sweep results carry across hosts of the same arch, so a
-machine that's already swept doesn't need to repeat the sweep — a fresh
-GPU host of the same arch reuses the winning config directly.
+Per-entry hashes (``source_hash``, ``host_cflags_hash``,
+``device_cflags_hash``, ``search_space_hash``, plus ``pgo_enabled``)
+all gate AOT freshness; any change invalidates the entry.
 
 Usage
 =====
 
 CLI::
 
-    # End-to-end on a GPU host (AOT + JIT autotune + profile)
+    # End-to-end on a GPU host (AOT + Bayesian JIT autotune + profile)
     python -m grokking_optimizers.compile \\
         --optimizer supergrok2 --model mamba --arch sm_90 \\
-        --cache build/.compile_cache.json --exhaustive
+        --cache build/.compile_cache.json \\
+        --mode bayesian --bayesian-trials 500
 
-    # AOT-only on a CPU host (writes cache; no GPU needed)
+    # AOT-only on a CPU host with PGO (ships the cache)
     python -m grokking_optimizers.compile \\
         --optimizer supergrok2 --model mamba --arch sm_90 \\
-        --cache build/.compile_cache.json --aot-only
+        --cache build/.compile_cache.json --aot-only --pgo \\
+        --pgo-workload scripts/pgo_workload.py --pgo-steps 1000 \\
+        --aot-artifact-dir build/compiled/aot_artifacts
 
-    # JIT autotune only on the GPU host (consumes the cache from the CPU host)
+    # JIT autotune only on the GPU host (consumes the cache)
     python -m grokking_optimizers.compile \\
         --optimizer supergrok2 --model mamba --arch sm_90 \\
-        --cache build/.compile_cache.json --jit-only
+        --cache build/.compile_cache.json --jit-only --mode exhaustive
 
 Importable::
 
-    from grokking_optimizers.compile import build, CompileCache
+    from grokking_optimizers.compile import build, build_aot, build_jit, CompileCache
     cache = CompileCache(Path("build/.compile_cache.json"))
     so_path = build(optimizer="supergrok2", model="mamba", arch="sm_90",
-                    cache=cache, autotune_mode="exhaustive")
+                    cache=cache, autotune_mode="bayesian",
+                    bayesian_trials=500, pgo=False)
 """
 
 from __future__ import annotations
@@ -118,6 +125,7 @@ import hashlib
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -126,7 +134,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from grokking_optimizers.profile import (
     ARCH_INFO,
@@ -142,35 +150,18 @@ from grokking_optimizers.profile import (
     make_progress,
 )
 
+from grokking_optimizers import search_space as _ss
+from grokking_optimizers import pgo as _pgo
 
-CACHE_VERSION = 2
+
+CACHE_VERSION = 3
 DEFAULT_CACHE_NAME = ".compile_cache.json"
+DEFAULT_SEARCH_SPACE = REPO_ROOT / "configs" / "search_space.yaml"
+DEFAULT_PGO_WORKLOAD = REPO_ROOT / "scripts" / "pgo_workload.py"
+JIT_CACHE_FLUSH_EVERY = 5   # save cache every N completed JIT trials
 
-# Per-arch autotune search spaces. The CDNA3 wavefront is 64 so larger
-# blocks pay off; sm_90's warp is 32 so 128–512 hits the sweet spot.
-# Vec widths reflect the available vector-load width on each arch.
-EXHAUSTIVE_SPACE = {
-    "sm_90":  {"block": [64, 128, 256, 512, 1024],
-               "vec":   [1, 2, 4],
-               "unroll":[1, 2, 4, 8, 16]},
-    "gfx942": {"block": [64, 128, 256, 512, 1024],
-               "vec":   [1, 2, 4],
-               "unroll":[1, 2, 4, 8, 16]},
-}
-
-DEFAULT_SPACE = {
-    "sm_90":  {"block": [128, 256, 512, 1024],
-               "vec":   [1, 2, 4],
-               "unroll":[4, 8, 16]},
-    "gfx942": {"block": [128, 256, 512, 1024],
-               "vec":   [1, 2, 4],
-               "unroll":[4, 8, 16]},
-}
-
-QUICK_SPACE = {
-    "sm_90":  {"block": [128, 256], "vec": [2, 4], "unroll": [4, 8]},
-    "gfx942": {"block": [256, 512], "vec": [2, 4], "unroll": [4, 8]},
-}
+# How many trials Bayesian "quick" mode runs (vs the full 500 default).
+QUICK_BAYESIAN_TRIALS = 25
 
 
 # ---------------------------------------------------------------------------
@@ -192,8 +183,8 @@ def _sha256_str(s: str) -> str:
 def _hash_sources(paths: List[Path]) -> str:
     h = hashlib.sha256()
     for p in sorted(paths):
-        rel = str(p.relative_to(REPO_ROOT) if str(p).startswith(str(REPO_ROOT))
-                  else p)
+        rel = (str(p.relative_to(REPO_ROOT))
+               if str(p).startswith(str(REPO_ROOT)) else str(p))
         h.update(rel.encode("utf-8"))
         h.update(b"\0")
         h.update(_sha256_file(p).encode("ascii"))
@@ -206,7 +197,7 @@ def _hash_flags(flags: List[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Persistent cache (in-memory dict, JSON on disk, atomic save)
+# Persistent cache (in-memory dict, JSON on disk, atomic save) — v3 schema
 # ---------------------------------------------------------------------------
 
 def _current_host() -> dict:
@@ -229,17 +220,58 @@ def _current_host() -> dict:
     }
 
 
+_V3_DEFAULTS: Dict[str, Any] = {
+    "mode":               None,
+    "pgo_enabled":        False,
+    "pgo_profile_dir":    None,
+    "pgo_workload_hash":  None,
+    "pgo_completed_at":   None,
+    "pgo_host":           None,
+    "search_space_hash":  None,
+    "bayesian_trials":    [],
+}
+
+
+def _fresh_entry() -> dict:
+    return {
+        "source_hash":         None,
+        "host_cflags_hash":    None,
+        "device_cflags_hash":  None,
+        "primary_artifact":    None,
+        "variant_artifacts":   {},
+        "sweep_history":       [],
+        "tuned_config":        None,
+        "aot_completed_at":    None,
+        "jit_completed_at":    None,
+        "aot_host":            None,
+        "jit_host":            None,
+        **{k: (list(v) if isinstance(v, list) else dict(v) if isinstance(v, dict) else v)
+           for k, v in _V3_DEFAULTS.items()},
+    }
+
+
+def _migrate_v2_to_v3(data: dict) -> dict:
+    """Forward-migrate a v2 cache: add v3 keys with defaults, bump version."""
+    data["version"] = CACHE_VERSION
+    data.setdefault("entries", {})
+    for k, entry in list(data["entries"].items()):
+        if not isinstance(entry, dict):
+            continue
+        for nk, nv in _V3_DEFAULTS.items():
+            entry.setdefault(nk, list(nv) if isinstance(nv, list)
+                             else dict(nv) if isinstance(nv, dict) else nv)
+    data["migrated_from_v2_at"] = datetime.datetime.now().isoformat()
+    return data
+
+
 class CompileCache:
     """Persistent build cache.
 
     The cache lives in-memory as a Python dict for the duration of a
     ``build()`` call and is written back to disk atomically at the end
     (or via explicit ``.save()``). Mutations are tracked via the
-    ``_dirty`` flag so a no-op build doesn't touch the file.
-
-    Schema is JSON; see module docstring for the field list. Cross-host
-    portability: source / flag hashes and sweep history travel; local
-    artefact paths get re-validated on each host.
+    ``_dirty`` flag so a no-op build doesn't touch the file. The cache
+    is JSON; see module docstring + ``INTERFACES.md`` for the v3 shape.
     """
 
     def __init__(self, path: Optional[Path]):
@@ -272,18 +304,30 @@ class CompileCache:
             data = self._fresh()
             self._dirty = True
             return data
-        if data.get("version") != CACHE_VERSION:
-            backup = self.path.with_suffix(
-                self.path.suffix + f".v{data.get('version', 0)}.bak")
-            try:
-                self.path.rename(backup)
-            except OSError:
-                pass
-            data = self._fresh()
+        version = data.get("version")
+        if version == CACHE_VERSION:
+            data.setdefault("host_history", []).append(_current_host())
             self._dirty = True
             return data
-        # Append current host to provenance trail.
-        data.setdefault("host_history", []).append(_current_host())
+        if version == 2:
+            # Back up the v2 file untouched, then migrate the loaded data.
+            backup = self.path.with_suffix(self.path.suffix + ".v2.bak")
+            try:
+                shutil.copy2(self.path, backup)
+            except OSError:
+                pass
+            data = _migrate_v2_to_v3(data)
+            data.setdefault("host_history", []).append(_current_host())
+            self._dirty = True
+            return data
+        # Older / unknown version → archive and start fresh.
+        backup = self.path.with_suffix(
+            self.path.suffix + f".v{version or 0}.bak")
+        try:
+            shutil.move(self.path, backup)
+        except OSError:
+            pass
+        data = self._fresh()
         self._dirty = True
         return data
 
@@ -302,29 +346,24 @@ class CompileCache:
         return f"{opt}/{model}/{arch}"
 
     def get(self, opt: str, model: str, arch: str) -> dict:
-        """Get-or-create the entry for this combo. Returns a live dict
-        reference; mutations propagate."""
         with self._lock:
             k = self.key(opt, model, arch)
-            entry = self._data["entries"].setdefault(k, {
-                "source_hash":         None,
-                "host_cflags_hash":    None,
-                "device_cflags_hash":  None,
-                "primary_artifact":    None,
-                "variant_artifacts":   {},
-                "sweep_history":       [],
-                "tuned_config":        None,
-                "aot_completed_at":    None,
-                "jit_completed_at":    None,
-                "aot_host":            None,
-                "jit_host":            None,
-            })
+            entry = self._data["entries"].setdefault(k, _fresh_entry())
+            # Defensive: stale v2 entries that escaped migration.
+            for nk, nv in _V3_DEFAULTS.items():
+                entry.setdefault(nk, list(nv) if isinstance(nv, list)
+                                 else dict(nv) if isinstance(nv, dict) else nv)
             self._dirty = True
             return entry
 
+    # ── Freshness ────────────────────────────────────────────────────
+
     def is_aot_fresh(self, opt: str, model: str, arch: str,
                      source_hash: str, host_flags_hash: str,
-                     device_flags_hash: str) -> bool:
+                     device_flags_hash: str,
+                     pgo_enabled: bool = False,
+                     pgo_workload_hash: Optional[str] = None,
+                     search_space_hash: Optional[str] = None) -> bool:
         e = self.get(opt, model, arch)
         if not e["aot_completed_at"]:
             return False
@@ -333,6 +372,14 @@ class CompileCache:
         if e["host_cflags_hash"] != host_flags_hash:
             return False
         if e["device_cflags_hash"] != device_flags_hash:
+            return False
+        if bool(e.get("pgo_enabled")) != bool(pgo_enabled):
+            return False
+        if pgo_enabled and pgo_workload_hash is not None:
+            if e.get("pgo_workload_hash") != pgo_workload_hash:
+                return False
+        if (search_space_hash is not None
+                and e.get("search_space_hash") not in (None, search_space_hash)):
             return False
         art = e["primary_artifact"]
         if not art:
@@ -343,36 +390,67 @@ class CompileCache:
         except OSError:
             return False
 
-    def is_jit_fresh(self, opt: str, model: str, arch: str) -> bool:
+    def is_jit_fresh(self, opt: str, model: str, arch: str,
+                     search_space_hash: Optional[str] = None) -> bool:
         e = self.get(opt, model, arch)
-        return bool(e["jit_completed_at"] and e["tuned_config"])
+        if not (e["jit_completed_at"] and e["tuned_config"]):
+            return False
+        if (search_space_hash is not None
+                and e.get("search_space_hash") not in (None, search_space_hash)):
+            return False
+        return True
+
+    # ── Recorders ────────────────────────────────────────────────────
 
     def record_aot(self, opt: str, model: str, arch: str, *,
                    source_hash: str, host_flags_hash: str,
-                   device_flags_hash: str, so_path: Optional[Path]) -> None:
+                   device_flags_hash: str,
+                   so_path: Optional[Path],
+                   pgo_enabled: bool = False,
+                   pgo_profile_dir: Optional[Path] = None,
+                   pgo_workload_hash: Optional[str] = None,
+                   search_space_hash: Optional[str] = None) -> None:
         with self._lock:
             e = self.get(opt, model, arch)
             e["source_hash"]        = source_hash
             e["host_cflags_hash"]   = host_flags_hash
             e["device_cflags_hash"] = device_flags_hash
-            if so_path is not None and so_path.exists():
-                stat = so_path.stat()
+            e["pgo_enabled"]        = bool(pgo_enabled)
+            if pgo_profile_dir is not None:
+                e["pgo_profile_dir"] = str(pgo_profile_dir)
+            if pgo_workload_hash is not None:
+                e["pgo_workload_hash"] = pgo_workload_hash
+            if search_space_hash is not None:
+                e["search_space_hash"] = search_space_hash
+            if so_path is not None and Path(so_path).exists():
+                stat = Path(so_path).stat()
                 e["primary_artifact"] = {
                     "path":   str(so_path),
                     "size":   stat.st_size,
                     "mtime":  stat.st_mtime,
-                    "sha256": _sha256_file(so_path),
+                    "sha256": _sha256_file(Path(so_path)),
                 }
             e["aot_completed_at"] = datetime.datetime.now().isoformat()
             e["aot_host"]         = _current_host()
+            self._dirty = True
+
+    def record_pgo(self, opt: str, model: str, arch: str, *,
+                   profile_dir: Path, workload_hash: str) -> None:
+        with self._lock:
+            e = self.get(opt, model, arch)
+            e["pgo_enabled"]        = True
+            e["pgo_profile_dir"]    = str(profile_dir)
+            e["pgo_workload_hash"]  = workload_hash
+            e["pgo_completed_at"]   = datetime.datetime.now().isoformat()
+            e["pgo_host"]           = _current_host()
             self._dirty = True
 
     def record_variant(self, opt: str, model: str, arch: str,
                        config_key: str, so_path: Optional[Path]) -> None:
         with self._lock:
             e = self.get(opt, model, arch)
-            if so_path is not None and so_path.exists():
-                stat = so_path.stat()
+            if so_path is not None and Path(so_path).exists():
+                stat = Path(so_path).stat()
                 e["variant_artifacts"][config_key] = {
                     "path":  str(so_path),
                     "size":  stat.st_size,
@@ -380,25 +458,42 @@ class CompileCache:
                 }
                 self._dirty = True
 
+    def record_trial(self, opt: str, model: str, arch: str,
+                     trial: Dict[str, Any]) -> None:
+        """Append a trial record to both bayesian_trials and sweep_history."""
+        with self._lock:
+            e = self.get(opt, model, arch)
+            e["bayesian_trials"].append(trial)
+            e["sweep_history"].append(trial)
+            self._dirty = True
+
     def record_sweep(self, opt: str, model: str, arch: str, *,
                      config: dict, timing_ms: float, **extras) -> None:
+        """Back-compat: simple grid record for non-bayesian sweeps."""
         with self._lock:
             e = self.get(opt, model, arch)
             e["sweep_history"].append({
+                "stage":        "exhaustive",
                 "config":       config,
                 "timing_ms":    timing_ms,
                 "host":         _current_host(),
+                "recorded_at":  datetime.datetime.now().isoformat(),
                 **extras,
             })
             self._dirty = True
 
     def set_tuned(self, opt: str, model: str, arch: str,
-                  config: dict) -> None:
+                  config: dict, *, mode: Optional[str] = None,
+                  search_space_hash: Optional[str] = None) -> None:
         with self._lock:
             e = self.get(opt, model, arch)
             e["tuned_config"]      = config
             e["jit_completed_at"]  = datetime.datetime.now().isoformat()
             e["jit_host"]          = _current_host()
+            if mode is not None:
+                e["mode"] = mode
+            if search_space_hash is not None:
+                e["search_space_hash"] = search_space_hash
             self._dirty = True
 
 
@@ -413,12 +508,22 @@ class BuildSpec:
     arch: str
     out_dir: Path
     autotune: bool = True
-    autotune_mode: str = "default"   # "quick" | "default" | "exhaustive"
+    autotune_mode: str = "bayesian"   # "exhaustive" | "bayesian"
     profile: bool = True
     verbose: bool = False
     extra_macros: List[str] = field(default_factory=list)
+    runtime: str = "both"             # "aot" | "jit" | "both"
     aot_only: bool = False
     jit_only: bool = False
+    search_space_path: Optional[Path] = None
+    aot_artifact_dir: Optional[Path] = None
+    pgo: bool = False
+    pgo_workload: Optional[Path] = None
+    pgo_steps: int = 1000
+    bayesian_trials: int = 500
+    top_k: int = 20
+    seed: int = 0
+    debug_symbols: bool = False
 
 
 def _validate(spec: BuildSpec) -> None:
@@ -429,10 +534,13 @@ def _validate(spec: BuildSpec) -> None:
         raise ValueError(f"model={spec.model!r} not in {list(MODELS)}")
     if spec.arch not in ARCHES:
         raise ValueError(f"arch={spec.arch!r} not in {list(ARCHES)}")
-    if spec.autotune_mode not in ("quick", "default", "exhaustive"):
+    if spec.autotune_mode not in ("exhaustive", "bayesian"):
         raise ValueError(
             f"autotune_mode={spec.autotune_mode!r} not in "
-            "{'quick', 'default', 'exhaustive'}")
+            "{'exhaustive', 'bayesian'}")
+    if spec.runtime not in ("aot", "jit", "both"):
+        raise ValueError(
+            f"runtime={spec.runtime!r} not in {{'aot', 'jit', 'both'}}")
 
 
 # ---------------------------------------------------------------------------
@@ -464,62 +572,120 @@ def _build_macros(spec: BuildSpec) -> List[str]:
     return macros + list(spec.extra_macros)
 
 
+# ---- Performance flag bases (see INTERFACES.md §9) ------------------------
+
+HOST_CFLAGS_BASE = [
+    "-O3", "-std=c++17", "-fPIC",
+    "-flto=full", "-march=native", "-mtune=native",
+    "-fno-semantic-interposition", "-fvisibility=hidden",
+    "-fdata-sections", "-ffunction-sections",
+    "-fno-math-errno", "-fno-trapping-math",
+    "-fomit-frame-pointer",
+    "-ffast-math", "-funroll-loops",
+]
+
+NVCC_DEVICE_BASE = [
+    "-O3", "--use_fast_math", "-std=c++17", "-DWITH_CUDA",
+    "--expt-relaxed-constexpr",
+    "--threads", "8",
+    "-Xfatbin", "-compress-all",
+    "-Xptxas", "-O3", "-Xptxas", "-v", "-Xptxas", "--warn-on-spills",
+    "-Xptxas", "--allow-expensive-optimizations=true",
+    "-Xptxas", "--def-load-cache=ca",
+    "-Xptxas", "--def-store-cache=wb",
+    "--extra-device-vectorization",
+    "-Xcompiler", "-fPIC", "-Xcompiler", "-flto=full",
+    "--resource-usage",
+    "-gencode=arch=compute_90,code=sm_90",
+    "-gencode=arch=compute_90,code=compute_90",
+    "-dlto",
+]
+
+HIPCC_DEVICE_BASE = [
+    "-O3", "-std=c++17", "-DWITH_HIP",
+    "-ffast-math", "-fPIC",
+    "--offload-arch=gfx942",
+    "-mllvm", "-amdgpu-early-inline-all=true",
+    "-mllvm", "-amdgpu-function-calls=false",
+    "-mllvm", "-amdgpu-internalize-symbols",
+    "-fgpu-flush-denormals-to-zero",
+    "-Rpass-analysis=kernel-resource-usage",
+    "-flto",
+]
+
+LDFLAGS_BASE = [
+    "-flto=full", "-Wl,--as-needed",
+    "-Wl,--gc-sections", "-Wl,-O3",
+    "-Wl,--icf=all",
+]
+
+
 def _host_cflags(spec: BuildSpec) -> List[str]:
     info = ARCH_INFO[spec.arch]
     if info["vendor"] == "pallas":
         return []
-    base = [
-        "-O3", "-std=c++17", f"-D{info['host_define']}",
-        "-ffast-math", "-funroll-loops", "-fPIC",
-        "-flto",
-    ]
+    base = list(HOST_CFLAGS_BASE) + [f"-D{info['host_define']}"]
+    if spec.debug_symbols or spec.profile:
+        base += ["-ggdb"]
     return base + _build_macros(spec)
 
 
 def _device_cflags(spec: BuildSpec) -> List[str]:
     info = ARCH_INFO[spec.arch]
     if info["vendor"] == "cuda":
-        base = [
-            "-O3", "--use_fast_math", "-std=c++17", "-DWITH_CUDA",
-            "--expt-relaxed-constexpr", "-lineinfo",
-            "-Xptxas", "-O3",
-            "-Xptxas", "-v",
-            "-Xptxas", "--warn-on-spills",
-            "-Xcompiler", "-fPIC",
-            "-Xcompiler", "-flto",
-            "--resource-usage",
-            "--generate-line-info",
-            "--maxrregcount=255",
-            "-gencode=arch=compute_90,code=sm_90",
-            "-gencode=arch=compute_90,code=compute_90",
-            "-dlto",
-        ]
+        base = list(NVCC_DEVICE_BASE)
+        if spec.debug_symbols or spec.profile:
+            base += ["-lineinfo", "--generate-line-info"]
         if (REPO_ROOT / "third_party/cutlass/include").exists():
             base += ["-DWITH_CUTLASS", "-DCUTLASS_NVCC_ARCHS=90a"]
         return base + _build_macros(spec)
     if info["vendor"] == "hip":
-        return [
-            "-O3", "-std=c++17", "-DWITH_HIP",
-            "-ffast-math", "-fPIC",
-            "--offload-arch=gfx942",
-            "-Rpass-analysis=kernel-resource-usage",
-            "-ggdb",
-            "-flto",
-        ] + _build_macros(spec)
+        base = list(HIPCC_DEVICE_BASE)
+        if spec.debug_symbols or spec.profile:
+            base += ["-ggdb"]
+        return base + _build_macros(spec)
     return []
 
 
 def _ldflags(spec: BuildSpec) -> List[str]:
     if ARCH_INFO[spec.arch]["vendor"] == "pallas":
         return []
-    return ["-flto", "-Wl,--as-needed"]
+    return list(LDFLAGS_BASE)
 
 
 def _include_paths() -> List[str]:
-    return [
-        str(REPO_ROOT / "csrc/bindings"),
-        str(REPO_ROOT),
-    ]
+    return [str(REPO_ROOT / "csrc/bindings"), str(REPO_ROOT)]
+
+
+# ---------------------------------------------------------------------------
+# sccache / env wiring
+# ---------------------------------------------------------------------------
+
+def _sccache_env() -> Dict[str, str]:
+    """Detect sccache on PATH and return env overrides if present."""
+    out: Dict[str, str] = {}
+    sccache = shutil.which("sccache")
+    if not sccache:
+        return out
+    # Decide cache dir: prefer /dev/shm (ramdisk) when writable.
+    candidate = Path("/dev/shm/sccache")
+    use = candidate
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        probe = candidate / ".probe"
+        probe.write_text("ok")
+        probe.unlink()
+    except OSError:
+        use = Path.home() / ".cache" / "sccache"
+        try:
+            use.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return {}  # no usable cache dir
+    out["SCCACHE_DIR"] = str(use)
+    out["CC"] = f"{sccache} {os.environ.get('CC', 'cc')}"
+    out["CXX"] = f"{sccache} {os.environ.get('CXX', 'c++')}"
+    out["CUDA_NVCC_EXECUTABLE"] = f"{sccache} nvcc"
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -553,12 +719,17 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
     report.flush()
 
     with_cuda = ARCH_INFO[spec.arch]["vendor"] in ("cuda", "hip")
-    with env_overlay(
-        MAX_JOBS=NCPUS,
-        NINJA_STATUS="[%f/%t %es] ",
-        TORCH_CUDA_VERBOSE_BUILD="1",
-        CMAKE_BUILD_PARALLEL_LEVEL=NCPUS,
-    ):
+    overlay = {
+        "MAX_JOBS": NCPUS,
+        "NINJA_STATUS": "[%f/%t %es] ",
+        "TORCH_CUDA_VERBOSE_BUILD": "1",
+        "CMAKE_BUILD_PARALLEL_LEVEL": NCPUS,
+        "NVCC_THREADS": "8",
+        **_sccache_env(),
+    }
+    if "SCCACHE_DIR" in overlay:
+        report.write(f"  sccache:   {overlay['SCCACHE_DIR']}\n")
+    with env_overlay(**overlay):
         t0 = time.monotonic()
         try:
             load(
@@ -584,10 +755,84 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
 
 
 # ---------------------------------------------------------------------------
-# JIT autotune: variant build + on-device timing in an isolated subprocess
+# JIT autotune — orchestrates Bayesian / Exhaustive sweep + worker
 # ---------------------------------------------------------------------------
 
-TIMING_SCRIPT = r"""
+def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
+                    target: str) -> List[str]:
+    """Macros + extra-flag overrides for one config × target."""
+    macros = _ss.resolve_macros(config, dims, target)
+    extra = _ss.resolve_extra_nvcc_flags(config, dims) if target == "device" else []
+    extra_hip = _ss.resolve_extra_hipcc_flags(config, dims) if target == "device" else []
+    # Only one of CUDA / HIP applies per arch.
+    return macros + (extra if "--maxrregcount" not in " ".join(extra_hip) else extra_hip)
+
+
+def _make_variant_timer(spec: BuildSpec, sources: List[Path],
+                        host_cflags_base: List[str],
+                        device_cflags_base: List[str],
+                        ldflags: List[str], dims: List[Dict[str, Any]],
+                        cache: CompileCache,
+                        worker,                       # Optional[TimingWorker]
+                        report,
+                        progress_state: Dict[str, Any]):
+    """Return a closure ``timer(config) -> result dict | None`` for the
+    Bayesian/Exhaustive driver. Builds the variant .so, records it in
+    the cache, then asks the worker to time it (fallback: one-shot
+    subprocess)."""
+
+    def timer(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        ckey = _ss.config_key(config)
+        host_extra = _variant_macros(config, dims, "host")
+        device_extra = _variant_macros(config, dims, "device")
+
+        # Per-variant flush of the running ETA window.
+        progress_state["last_start"] = time.monotonic()
+
+        variant_so = _torch_load(
+            spec, sources,
+            host_cflags_base + host_extra,
+            device_cflags_base + device_extra,
+            ldflags, report,
+            module_suffix=f"_{_short_key(ckey)}",
+        )
+        if variant_so is None:
+            return None
+        cache.record_variant(spec.optimizer, spec.model, spec.arch,
+                             ckey, variant_so)
+
+        result = None
+        if worker is not None and worker.alive():
+            result = worker.time(variant_so)
+            if result is None:
+                report.write(f"    [worker time failed for {ckey}; "
+                             "restart + fallback]\n")
+                worker.restart()
+        if result is None:
+            result = _time_variant_oneshot(
+                variant_so, OPT_CLASS[spec.optimizer], report=report)
+        # Update rolling window
+        elapsed = time.monotonic() - progress_state["last_start"]
+        progress_state["window"].append(elapsed)
+        if len(progress_state["window"]) > 20:
+            progress_state["window"].pop(0)
+        return result
+
+    return timer
+
+
+def _short_key(ckey: str) -> str:
+    """Shorten a config key for use in a directory name (avoids OS path limits)."""
+    if len(ckey) <= 80:
+        return ckey
+    return hashlib.sha1(ckey.encode("utf-8")).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# One-shot timing fallback (kept from v2 for worker-crash resilience)
+# ---------------------------------------------------------------------------
+
+_TIMING_SCRIPT = r"""
 import sys, json, importlib.util, traceback
 try:
     import torch
@@ -595,6 +840,8 @@ try:
         print(json.dumps({"error": "torch.cuda.is_available() == False"}))
         sys.exit(1)
     so_path = {so_path!r}
+    if "grokking_optimizers._ops" in sys.modules:
+        del sys.modules["grokking_optimizers._ops"]
     spec = importlib.util.spec_from_file_location("grokking_optimizers._ops", so_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -603,13 +850,11 @@ try:
     torch.manual_seed(0)
     p = torch.nn.Parameter(torch.randn({size}, {size}, device="cuda", dtype=torch.float32))
     g = torch.randn_like(p)
-    # Warmup
     for _ in range({warmup}):
         p.grad = g.clone()
         opt = {opt_class}([p], lr=1e-3)
         opt.step()
     torch.cuda.synchronize()
-    # Time N iterations; report median for robustness against jitter
     timings = []
     for _ in range({iters}):
         p.grad = g.clone()
@@ -622,9 +867,8 @@ try:
         torch.cuda.synchronize()
         timings.append(s.elapsed_time(e))
     timings.sort()
-    median = timings[len(timings) // 2]
     print(json.dumps({
-        "timing_ms": median,
+        "timing_ms": timings[len(timings) // 2],
         "min_ms":    timings[0],
         "max_ms":    timings[-1],
         "n":         len(timings),
@@ -635,20 +879,12 @@ except Exception as exc:
 """
 
 
-def _time_variant(variant_so: Path, opt_class: str, *,
-                  size: int = 4096, warmup: int = 5, iters: int = 21,
-                  timeout: int = 180, report=None) -> Optional[dict]:
-    """Subprocess-isolate the timing of ``variant_so`` so each variant
-    starts from a clean Python module state.
-
-    Returns ``{timing_ms, min_ms, max_ms, n}`` or ``None`` on failure.
-    """
-    body = TIMING_SCRIPT.format(
+def _time_variant_oneshot(variant_so: Path, opt_class: str, *,
+                          size: int = 4096, warmup: int = 5, iters: int = 21,
+                          timeout: int = 180, report=None) -> Optional[Dict[str, Any]]:
+    body = _TIMING_SCRIPT.format(
         so_path=str(variant_so),
-        opt_class=opt_class,
-        size=size,
-        warmup=warmup,
-        iters=iters,
+        opt_class=opt_class, size=size, warmup=warmup, iters=iters,
     )
     fd, path = tempfile.mkstemp(suffix="_time.py")
     os.write(fd, body.encode("utf-8"))
@@ -660,29 +896,26 @@ def _time_variant(variant_so: Path, opt_class: str, *,
             text=True, timeout=timeout,
         )
         out = (proc.stdout or "").strip()
-        if report is not None:
-            report.write(f"    [time-subprocess exit={proc.returncode}]\n")
-        # Parse the last JSON line (script prints one line on success)
         last = next((ln for ln in reversed(out.splitlines())
                      if ln.startswith("{")), None)
         if last is None:
             if report is not None:
-                report.write(f"    [time-subprocess no-json output]\n{out}\n")
+                report.write(f"    [oneshot no-json]\n{out}\n")
             return None
         try:
             result = json.loads(last)
         except json.JSONDecodeError:
             if report is not None:
-                report.write(f"    [time-subprocess json-decode error]\n{out}\n")
+                report.write(f"    [oneshot json-decode error]\n{out}\n")
             return None
         if "error" in result:
             if report is not None:
-                report.write(f"    [time-subprocess error: {result['error']}]\n")
+                report.write(f"    [oneshot error: {result['error']}]\n")
             return None
         return result
     except subprocess.TimeoutExpired:
         if report is not None:
-            report.write(f"    [time-subprocess timeout after {timeout}s]\n")
+            report.write(f"    [oneshot timeout after {timeout}s]\n")
         return None
     finally:
         try:
@@ -691,147 +924,529 @@ def _time_variant(variant_so: Path, opt_class: str, *,
             pass
 
 
-def _select_search_space(arch: str, mode: str) -> dict:
-    table = {
-        "quick":      QUICK_SPACE,
-        "default":    DEFAULT_SPACE,
-        "exhaustive": EXHAUSTIVE_SPACE,
-    }[mode]
-    if arch not in table:
-        raise ValueError(f"no search space for arch={arch}")
-    return table[arch]
-
-
-def _config_key(b: int, v: int, u: int) -> str:
-    return f"b{b}_v{v}_u{u}"
-
+# ---------------------------------------------------------------------------
+# Autotune drivers
+# ---------------------------------------------------------------------------
 
 def _jit_autotune(spec: BuildSpec, sources: List[Path],
                   host_cflags: List[str], device_cflags: List[str],
                   ldflags: List[str], cache: CompileCache,
-                  report) -> Optional[dict]:
-    """Sweep the per-arch config grid on the live GPU and pick the
-    fastest median timing.
-
-    Each variant build reuses the same ``build_directory`` family so
-    ninja's per-file cache makes the second-and-later variant builds
-    near-instant (only the .o files affected by the changed
-    ``-DSG_TUNED_*`` macros rebuild).
-    """
+                  report) -> Optional[Dict[str, Any]]:
+    """Load the YAML space, prefilter, then dispatch to bayesian or
+    exhaustive driver. Returns the winning config dict (with at least
+    the dims set as the search space + ``timing_ms``)."""
     try:
         import torch
         gpu_ok = torch.cuda.is_available()
     except ImportError:
         gpu_ok = False
     if not gpu_ok:
-        report.write("  [jit-autotune] no GPU visible — skipping; run on "
-                     "target arch with this cache to complete JIT phase.\n")
+        report.write("  [jit-autotune] no GPU visible — skipping. Run JIT "
+                     "phase on the target GPU host with this cache.\n")
         return None
     if ARCH_INFO[spec.arch]["vendor"] == "pallas":
         report.write("  [jit-autotune] pallas backend; no C++ tuning.\n")
         return None
 
-    if cache.is_jit_fresh(spec.optimizer, spec.model, spec.arch):
+    yaml_path = (spec.search_space_path or DEFAULT_SEARCH_SPACE)
+    report.write(f"  [search-space] {yaml_path}\n")
+    space = _ss.load_yaml(yaml_path)
+    if spec.arch not in space:
+        report.write(f"  [jit-autotune] no search space for arch={spec.arch}\n")
+        return None
+    space_hash = _ss.hash_space(space, spec.arch)
+    report.write(f"  [search-space] hash={space_hash[:16]}\n")
+
+    if cache.is_jit_fresh(spec.optimizer, spec.model, spec.arch,
+                          search_space_hash=space_hash):
         tuned = cache.get(spec.optimizer, spec.model, spec.arch)["tuned_config"]
         report.write(f"  [jit-autotune] cache hit: tuned={tuned}\n")
         return tuned
 
-    space = _select_search_space(spec.arch, spec.autotune_mode)
-    combos = [(b, v, u)
-              for b in space["block"]
-              for v in space["vec"]
-              for u in space["unroll"]]
-    report.write(f"  [jit-autotune] mode={spec.autotune_mode} — sweeping "
-                 f"{len(combos)} configs "
-                 f"({len(space['block'])}×{len(space['vec'])}×"
-                 f"{len(space['unroll'])} = block × vec × unroll)\n")
-
-    opt_class = OPT_CLASS[spec.optimizer]
-    best: Optional[dict] = None
-    for i, (b, v, u) in enumerate(combos, 1):
-        ckey = _config_key(b, v, u)
-        cfg_macros = [
-            f"-DSG_TUNED_BLOCK_SIZE={b}",
-            f"-DSG_TUNED_VEC_WIDTH={v}",
-            f"-DSG_TUNED_UNROLL={u}",
-        ]
-        report.write(f"\n  [{i}/{len(combos)}] variant {ckey}: building... ")
-        report.flush()
-        variant_so = _torch_load(
-            spec, sources,
-            host_cflags + cfg_macros,
-            device_cflags + cfg_macros,
-            ldflags, report,
-            module_suffix=f"_{ckey}",
-        )
-        if variant_so is None:
-            report.write(f"  [{ckey}] variant build FAILED; skipping.\n")
-            continue
-        cache.record_variant(spec.optimizer, spec.model, spec.arch,
-                             ckey, variant_so)
-        report.write(f"  [{ckey}] timing... ")
-        report.flush()
-        timing = _time_variant(variant_so, opt_class, report=report)
-        if timing is None:
-            report.write(f"  [{ckey}] timing FAILED; skipping.\n")
-            continue
-        ms = timing["timing_ms"]
-        report.write(f"  [{ckey}] median={ms:.4f}ms "
-                     f"(min={timing['min_ms']:.4f} max={timing['max_ms']:.4f} "
-                     f"n={timing['n']})\n")
-        cache.record_sweep(
-            spec.optimizer, spec.model, spec.arch,
-            config={"block": b, "vec": v, "unroll": u},
-            timing_ms=ms, min_ms=timing["min_ms"], max_ms=timing["max_ms"],
-            n=timing["n"], config_key=ckey,
-        )
-        if best is None or ms < best["timing_ms"]:
-            best = {"block": b, "vec": v, "unroll": u,
-                    "timing_ms": ms, "config_key": ckey}
-
-    if best is None:
-        report.write("\n  [jit-autotune] no successful variants — "
-                     "leaving tuned_config unset.\n")
+    all_configs = _ss.cartesian(space, spec.arch)
+    survivors, eliminated = _ss.prefilter(
+        all_configs, space[spec.arch].get("prefilter", {}))
+    report.write(f"  [prefilter] {len(all_configs)} candidates → "
+                 f"{len(survivors)} survivors ({eliminated} eliminated)\n")
+    if not survivors:
+        report.write("  [jit-autotune] no survivors after prefilter.\n")
         return None
 
-    report.write(f"\n  [jit-autotune] WINNER: {best['config_key']} "
-                 f"@ {best['timing_ms']:.4f}ms median\n")
-    cache.set_tuned(spec.optimizer, spec.model, spec.arch, best)
+    # Spawn the persistent worker.
+    from grokking_optimizers.timing_worker import TimingWorker
+    worker = TimingWorker(opt_class=OPT_CLASS[spec.optimizer])
+    if not worker.start():
+        report.write("  [worker] start FAILED; falling back to one-shot per variant.\n")
+        worker = None
+    else:
+        report.write("  [worker] persistent timing worker is up.\n")
+
+    progress_state = {"last_start": time.monotonic(), "window": []}
+    timer = _make_variant_timer(
+        spec, sources, host_cflags, device_cflags, ldflags,
+        space[spec.arch]["dims"], cache, worker, report, progress_state)
+
+    dims = space[spec.arch]["dims"]
+    try:
+        if spec.autotune_mode == "exhaustive":
+            winning = _run_exhaustive(spec, survivors, dims, timer, cache,
+                                      space_hash, report)
+        else:
+            winning = _run_bayesian(spec, survivors, space, dims, timer, cache,
+                                    space_hash, report)
+    finally:
+        if worker is not None:
+            worker.stop()
+    return winning
+
+
+def _run_exhaustive(spec: BuildSpec, configs: List[Dict[str, Any]],
+                    dims: List[Dict[str, Any]],
+                    timer, cache: CompileCache, space_hash: str,
+                    report) -> Optional[Dict[str, Any]]:
+    report.write(f"\n  [exhaustive] sweeping {len(configs)} survivors\n")
+    step, close = make_progress(len(configs),
+                                f"jit-exhaustive {spec.optimizer}/{spec.arch}")
+    best: Optional[Dict[str, Any]] = None
+    try:
+        for i, cfg in enumerate(configs, 1):
+            ckey = _ss.config_key(cfg)
+            report.write(f"\n  [{i}/{len(configs)}] {ckey}\n")
+            report.flush()
+            t0 = time.monotonic()
+            result = timer(cfg)
+            elapsed = time.monotonic() - t0
+            trial = {
+                "trial_num":   i,
+                "stage":       "exhaustive",
+                "config":      cfg,
+                "config_key":  ckey,
+                "timing_ms":   result["timing_ms"] if result else None,
+                "min_ms":      result["min_ms"]    if result else None,
+                "max_ms":      result["max_ms"]    if result else None,
+                "n":           result["n"]         if result else None,
+                "host":        _current_host(),
+                "recorded_at": datetime.datetime.now().isoformat(),
+                "status":      "ok" if result else "fail",
+                "build_s":     elapsed,
+            }
+            cache.record_trial(spec.optimizer, spec.model, spec.arch, trial)
+            if result is not None:
+                ms = result["timing_ms"]
+                report.write(f"    median={ms:.4f}ms\n")
+                if best is None or ms < (best.get("timing_ms") or float("inf")):
+                    best = {**cfg, "timing_ms": ms, "config_key": ckey}
+            else:
+                report.write(f"    FAIL ({elapsed:.1f}s)\n")
+            step(f"best={best['timing_ms']:.3f}ms" if best else "no winner yet")
+            if (i % JIT_CACHE_FLUSH_EVERY) == 0:
+                cache.save()
+    finally:
+        close()
+    if best is None:
+        report.write("\n  [exhaustive] no successful variants — "
+                     "leaving tuned_config unset.\n")
+        return None
+    report.write(f"\n  [exhaustive] WINNER: {best['config_key']} "
+                 f"@ {best['timing_ms']:.4f}ms\n")
+    cache.set_tuned(spec.optimizer, spec.model, spec.arch, best,
+                    mode="exhaustive", search_space_hash=space_hash)
     return best
+
+
+def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
+                  space: Dict[str, Any], dims: List[Dict[str, Any]],
+                  timer, cache: CompileCache, space_hash: str,
+                  report) -> Optional[Dict[str, Any]]:
+    from grokking_optimizers.bayesian import (
+        run_bayesian, topk_refine, pick_winner)
+
+    n_trials = spec.bayesian_trials
+    report.write(f"\n  [bayesian] TPE stage with n_trials={n_trials}, "
+                 f"seed={spec.seed}\n")
+
+    # Optuna study persistence (resumable across runs).
+    storage = (spec.out_dir
+               / f"optuna_{spec.optimizer}_{spec.model}_{spec.arch}.db")
+    step1, close1 = make_progress(
+        n_trials, f"jit-tpe {spec.optimizer}/{spec.arch}")
+
+    def progress1(done, total, cfg):
+        step1(f"trial {done}/{total} key={_ss.config_key(cfg)[:24]}…")
+
+    try:
+        tpe_trials = run_bayesian(
+            spec.arch, space, n_trials=n_trials, seed=spec.seed,
+            storage=storage,
+            study_name=f"sg_{spec.optimizer}_{spec.model}_{spec.arch}",
+            timer=timer, progress=progress1, host=_current_host(),
+            prefiltered=prefiltered,
+        )
+    finally:
+        close1()
+
+    for t in tpe_trials:
+        cache.record_trial(spec.optimizer, spec.model, spec.arch, t)
+    cache.save()
+
+    report.write(f"  [bayesian] TPE produced {len(tpe_trials)} trials; "
+                 f"{sum(1 for t in tpe_trials if t['timing_ms'] is not None)} "
+                 "succeeded.\n")
+
+    # Stage 2: refine the top-K with ±2-step neighbours.
+    report.write(f"\n  [bayesian] refine stage top_k={spec.top_k}\n")
+    refine_inputs = [t for t in tpe_trials if t["timing_ms"] is not None]
+    refine_inputs.sort(key=lambda t: t["timing_ms"])
+    n_refine_est = sum(1 for _ in _neighbour_estimate(
+        refine_inputs[:spec.top_k], dims, prefiltered))
+    step2, close2 = make_progress(
+        max(n_refine_est, 1), f"jit-refine {spec.optimizer}/{spec.arch}")
+
+    def progress2(done, total, cfg):
+        step2(f"refine {done}/{total} key={_ss.config_key(cfg)[:24]}…")
+
+    try:
+        refine_trials = topk_refine(
+            tpe_trials, space, spec.arch,
+            top_k=spec.top_k, timer=timer,
+            progress=progress2, host=_current_host(),
+            prefiltered=prefiltered,
+        )
+    finally:
+        close2()
+    for t in refine_trials:
+        cache.record_trial(spec.optimizer, spec.model, spec.arch, t)
+    cache.save()
+
+    winner = pick_winner(tpe_trials + refine_trials)
+    if winner is None:
+        report.write("\n  [bayesian] no successful trials — "
+                     "leaving tuned_config unset.\n")
+        return None
+    out = dict(winner["config"])
+    out["timing_ms"] = winner["timing_ms"]
+    out["config_key"] = _ss.config_key(out)
+    out["stage_won"] = winner["stage"]
+    report.write(f"\n  [bayesian] WINNER ({winner['stage']}): "
+                 f"{out['config_key']} @ {out['timing_ms']:.4f}ms\n")
+    cache.set_tuned(spec.optimizer, spec.model, spec.arch, out,
+                    mode="bayesian", search_space_hash=space_hash)
+    return out
+
+
+def _neighbour_estimate(seeds: List[Dict[str, Any]],
+                        dims: List[Dict[str, Any]],
+                        prefiltered: List[Dict[str, Any]]):
+    """Estimate the refine-stage trial count (best-effort, for progress bar)."""
+    feasible = {_ss.config_key(c) for c in prefiltered}
+    seen = set()
+    from grokking_optimizers.bayesian import _step_neighbours
+    for s in seeds:
+        base = {k: (tuple(v) if isinstance(v, list) else v)
+                for k, v in s["config"].items()}
+        for d in dims:
+            for nb in _step_neighbours(base.get(d["name"]), d["values"], 2):
+                cfg = dict(base)
+                cfg[d["name"]] = nb
+                k = _ss.config_key(cfg)
+                if k in seen or (feasible and k not in feasible):
+                    continue
+                seen.add(k)
+                yield cfg
 
 
 # ---------------------------------------------------------------------------
 # tuned_configs.h — written from the cache's winning config
 # ---------------------------------------------------------------------------
 
-def _write_tuned_configs_header(combo: dict, optimizer: str, model: str,
-                                arch: str, report) -> Path:
+def _write_tuned_configs_header(combo: Dict[str, Any], optimizer: str,
+                                model: str, arch: str, report) -> Path:
     tuned_h = REPO_ROOT / "csrc/algorithms/tuned_configs.h"
-    tuned_h.write_text(textwrap.dedent(f"""\
-        // Auto-generated by grokking_optimizers.compile JIT autotune.
-        // Do not edit by hand — re-run with --jit-only to refresh.
-        //
-        // Winning combo: optimizer={optimizer} model={model} arch={arch}
-        // block_size={combo['block']} vec_width={combo['vec']} unroll={combo['unroll']}
-        // median timing: {combo['timing_ms']:.4f} ms
-        // Generated: {datetime.datetime.now().isoformat()}
-        #pragma once
-        #ifndef SG_TUNED_BLOCK_SIZE
-        #define SG_TUNED_BLOCK_SIZE {combo['block']}
-        #endif
-        #ifndef SG_TUNED_VEC_WIDTH
-        #define SG_TUNED_VEC_WIDTH {combo['vec']}
-        #endif
-        #ifndef SG_TUNED_UNROLL
-        #define SG_TUNED_UNROLL {combo['unroll']}
-        #endif
-    """))
+    tuned_h.parent.mkdir(parents=True, exist_ok=True)
+    macros: List[str] = []
+    # Try to load the space to map dim -> macro
+    try:
+        space = _ss.load_yaml(DEFAULT_SEARCH_SPACE)
+        dims = space.get(arch, {}).get("dims", [])
+    except Exception:
+        dims = []
+    name_to_macro = {d["name"]: d.get("macro") for d in dims}
+    for k, v in combo.items():
+        if k in ("timing_ms", "config_key", "stage_won"):
+            continue
+        macro = name_to_macro.get(k)
+        if not macro:
+            # Fallback for back-compat keys (block / vec / unroll).
+            backcompat = {
+                "block":  "SG_TUNED_BLOCK_SIZE",
+                "vec":    "SG_TUNED_VEC_WIDTH",
+                "unroll": "SG_TUNED_UNROLL",
+            }
+            macro = backcompat.get(k)
+        if macro:
+            macros.append((macro, v))
+    body = ["// Auto-generated by grokking_optimizers.compile JIT autotune.",
+            "// Do not edit by hand — re-run with --jit-only to refresh.",
+            f"// Winning combo: optimizer={optimizer} model={model} arch={arch}",
+            f"// Median timing: {combo.get('timing_ms', 0.0):.4f} ms",
+            f"// Generated: {datetime.datetime.now().isoformat()}",
+            "#pragma once"]
+    for macro, value in macros:
+        if isinstance(value, bool):
+            val_text = "1" if value else "0"
+        elif isinstance(value, tuple):
+            val_text = "{" + ", ".join(str(x) for x in value) + "}"
+        else:
+            val_text = str(value)
+        body.append(f"#ifndef {macro}")
+        body.append(f"#define {macro} {val_text}")
+        body.append("#endif")
+    tuned_h.write_text("\n".join(body) + "\n")
     report.write(f"  [tuned_configs.h] wrote {tuned_h.relative_to(REPO_ROOT)}\n")
     return tuned_h
 
 
 # ---------------------------------------------------------------------------
-# Public entry
+# AOT and JIT halves (importable; called by main() in single-phase mode)
+# ---------------------------------------------------------------------------
+
+def build_aot(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
+    """Run only the AOT portion of the build. No GPU access needed.
+
+    When ``spec.pgo`` is True, runs the 3-pass instrument → workload →
+    use loop. Otherwise a single AOT build."""
+    info = ARCH_INFO[spec.arch]
+    if info["vendor"] == "pallas":
+        launcher = (REPO_ROOT / "csrc/backends/pallas"
+                    / f"launch_{spec.optimizer}.py")
+        report.write("\n[pallas] no C++ compile; Python launcher only\n")
+        report.write(f"  launcher: {launcher}\n")
+        report.write(f"  exists:   {launcher.exists()}\n")
+        return None
+
+    sources = _resolve_sources(spec)
+    host_cflags = _host_cflags(spec)
+    device_cflags = _device_cflags(spec)
+    ldflags = _ldflags(spec)
+    source_hash = _hash_sources(sources) if sources else "pallas"
+    host_hash = _hash_flags(host_cflags)
+    device_hash = _hash_flags(device_cflags)
+
+    # Resolve search-space hash (gates AOT freshness too)
+    space_hash = None
+    yaml_path = spec.search_space_path or DEFAULT_SEARCH_SPACE
+    try:
+        space_hash = _ss.hash_space(_ss.load_yaml(yaml_path), spec.arch)
+    except Exception as exc:
+        report.write(f"  [search-space] could not hash: {exc}\n")
+
+    workload_hash = None
+    if spec.pgo:
+        workload = spec.pgo_workload or DEFAULT_PGO_WORKLOAD
+        workload_hash = _pgo.hash_workload(workload, spec.pgo_steps)
+        report.write(f"  [pgo] workload={workload} steps={spec.pgo_steps} "
+                     f"hash={workload_hash[:16]}\n")
+
+    if cache.is_aot_fresh(spec.optimizer, spec.model, spec.arch,
+                          source_hash, host_hash, device_hash,
+                          pgo_enabled=spec.pgo,
+                          pgo_workload_hash=workload_hash,
+                          search_space_hash=space_hash):
+        art = cache.get(spec.optimizer, spec.model, spec.arch)["primary_artifact"]
+        so_path = Path(art["path"])
+        report.write(f"  [aot cache HIT] reusing {so_path} "
+                     f"(size={art['size']} "
+                     f"sha256={art['sha256'][:16]}…)\n")
+        return so_path
+
+    if spec.pgo:
+        return _build_aot_pgo(spec, cache, sources, host_cflags, device_cflags,
+                              ldflags, source_hash, host_hash, device_hash,
+                              workload_hash, space_hash, report)
+
+    report.write("  [aot cache MISS] building primary artefact...\n")
+    so_path = _torch_load(spec, sources, host_cflags, device_cflags, ldflags,
+                          report)
+    if so_path is None:
+        return None
+    so_path = _publish_aot_artifact(spec, so_path, report)
+    cache.record_aot(
+        spec.optimizer, spec.model, spec.arch,
+        source_hash=source_hash,
+        host_flags_hash=host_hash,
+        device_flags_hash=device_hash,
+        so_path=so_path,
+        pgo_enabled=False,
+        search_space_hash=space_hash,
+    )
+    cache.save()
+    return so_path
+
+
+def _build_aot_pgo(spec: BuildSpec, cache: CompileCache, sources: List[Path],
+                   host_cflags: List[str], device_cflags: List[str],
+                   ldflags: List[str], source_hash: str, host_hash: str,
+                   device_hash: str, workload_hash: str,
+                   space_hash: Optional[str], report) -> Optional[Path]:
+    """Three-pass PGO loop: instrument → collect → use."""
+    profile_dir = spec.out_dir / "pgo_profile"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Pass 1: instrumented build ────────────────────────────────────
+    report.write("\n  [pgo 1/3] building instrumented .so\n")
+    inst_host, inst_device, inst_ld = _pgo.instrument_flags(
+        spec.arch, profile_dir, host_cflags, device_cflags, ldflags)
+    inst_spec = BuildSpec(**{**spec.__dict__})
+    inst_spec.extra_macros = list(spec.extra_macros) + ["-DSG_PGO_INSTRUMENT=1"]
+    inst_so = _torch_load(inst_spec, sources, inst_host, inst_device,
+                          inst_ld, report, module_suffix="_pgo_instrument")
+    if inst_so is None:
+        report.write("  [pgo 1/3] instrumented build FAILED\n")
+        return None
+
+    # ── Pass 2: collect workload ──────────────────────────────────────
+    report.write("\n  [pgo 2/3] running workload to collect profile data\n")
+    workload = spec.pgo_workload or DEFAULT_PGO_WORKLOAD
+    ok = _pgo.collect_workload(
+        workload,
+        so_path=inst_so,
+        opt_class=OPT_CLASS[spec.optimizer],
+        model=spec.model,
+        arch=spec.arch,
+        profile_dir=profile_dir,
+        steps=spec.pgo_steps,
+        report=report,
+    )
+    if not ok:
+        report.write("  [pgo 2/3] workload FAILED or produced no profile data\n")
+        return None
+    cache.record_pgo(spec.optimizer, spec.model, spec.arch,
+                     profile_dir=profile_dir, workload_hash=workload_hash)
+    cache.save()
+
+    # ── Pass 3: profile-use build ─────────────────────────────────────
+    report.write("\n  [pgo 3/3] rebuilding with -fprofile-use\n")
+    use_host, use_device, use_ld = _pgo.use_flags(
+        spec.arch, profile_dir, host_cflags, device_cflags, ldflags)
+    so_path = _torch_load(spec, sources, use_host, use_device, use_ld,
+                          report, module_suffix="_pgo")
+    if so_path is None:
+        report.write("  [pgo 3/3] profile-use build FAILED\n")
+        return None
+    so_path = _publish_aot_artifact(spec, so_path, report)
+    cache.record_aot(
+        spec.optimizer, spec.model, spec.arch,
+        source_hash=source_hash,
+        host_flags_hash=_hash_flags(use_host),
+        device_flags_hash=_hash_flags(use_device),
+        so_path=so_path,
+        pgo_enabled=True,
+        pgo_profile_dir=profile_dir,
+        pgo_workload_hash=workload_hash,
+        search_space_hash=space_hash,
+    )
+    cache.save()
+    return so_path
+
+
+def _publish_aot_artifact(spec: BuildSpec, so_path: Path, report) -> Path:
+    """If ``--aot-artifact-dir`` is set, copy the .so into the shared dir
+    so a downstream JIT runtime (possibly on another host) can pick it up.
+    Returns the published path (or the original)."""
+    if spec.aot_artifact_dir is None:
+        return so_path
+    dest_dir = Path(spec.aot_artifact_dir).resolve()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / so_path.name
+    if dest.resolve() != so_path.resolve():
+        try:
+            shutil.copy2(so_path, dest)
+        except OSError as exc:
+            report.write(f"  [aot publish] copy failed: {exc} (keeping {so_path})\n")
+            return so_path
+        report.write(f"  [aot publish] {so_path} -> {dest}\n")
+    return dest
+
+
+def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
+    """Run only the JIT autotune + final-link half. Requires GPU."""
+    info = ARCH_INFO[spec.arch]
+    if info["vendor"] == "pallas":
+        report.write("\n[pallas] JIT phase no-op (Python-only backend)\n")
+        return None
+
+    # Sanity: AOT must have run already on some host with matching hashes.
+    e = cache.get(spec.optimizer, spec.model, spec.arch)
+    if not e["aot_completed_at"]:
+        report.write("  [jit] cache has no AOT entry; running AOT now.\n")
+        so_aot = build_aot(spec, cache, report)
+        if so_aot is None:
+            return None
+
+    sources = _resolve_sources(spec)
+    host_cflags = _host_cflags(spec)
+    device_cflags = _device_cflags(spec)
+    ldflags = _ldflags(spec)
+
+    tuned = _jit_autotune(spec, sources, host_cflags, device_cflags, ldflags,
+                          cache, report)
+    cache.save()
+
+    if tuned is None:
+        report.write("  [jit] no tuned config — keeping AOT primary artefact.\n")
+        # Return the AOT primary artefact if present.
+        art = e.get("primary_artifact")
+        return Path(art["path"]) if art else None
+
+    # Final pass: rebuild with tuned macros baked in.
+    space_hash = e.get("search_space_hash")
+    _write_tuned_configs_header(tuned, spec.optimizer, spec.model, spec.arch,
+                                report)
+
+    # Try to assemble macros via the resolved YAML space; fall back to
+    # the tuned dict's literal keys.
+    extra_host: List[str] = []
+    extra_device: List[str] = []
+    try:
+        space = _ss.load_yaml(spec.search_space_path or DEFAULT_SEARCH_SPACE)
+        dims = space.get(spec.arch, {}).get("dims", [])
+        extra_host = _variant_macros(tuned, dims, "host")
+        extra_device = _variant_macros(tuned, dims, "device")
+    except Exception:
+        for k, v in tuned.items():
+            if k in ("timing_ms", "config_key", "stage_won"):
+                continue
+            macro = {"block": "SG_TUNED_BLOCK_SIZE",
+                     "vec": "SG_TUNED_VEC_WIDTH",
+                     "unroll": "SG_TUNED_UNROLL"}.get(k)
+            if macro:
+                flag = f"-D{macro}={v}"
+                extra_host.append(flag)
+                extra_device.append(flag)
+
+    so_path = _torch_load(spec, sources,
+                          host_cflags + extra_host,
+                          device_cflags + extra_device,
+                          ldflags, report, module_suffix="_tuned")
+    if so_path is not None:
+        so_path = _publish_aot_artifact(spec, so_path, report)
+        # Record this as the "current primary" — its hashes include the tuned macros
+        cache.record_aot(
+            spec.optimizer, spec.model, spec.arch,
+            source_hash=_hash_sources(sources),
+            host_flags_hash=_hash_flags(host_cflags + extra_host),
+            device_flags_hash=_hash_flags(device_cflags + extra_device),
+            so_path=so_path,
+            pgo_enabled=bool(e.get("pgo_enabled")),
+            pgo_workload_hash=e.get("pgo_workload_hash"),
+            search_space_hash=space_hash,
+        )
+        cache.save()
+    return so_path
+
+
+# ---------------------------------------------------------------------------
+# Public entry — orchestrates AOT and JIT (in-process or via subprocess split)
 # ---------------------------------------------------------------------------
 
 def build(
@@ -844,41 +1459,46 @@ def build(
     out_dir: Optional[Path] = None,
     aot_only: bool = False,
     jit_only: bool = False,
+    runtime: str = "both",
     autotune: bool = True,
-    autotune_mode: str = "default",
+    autotune_mode: str = "bayesian",
     profile: bool = True,
     report_path: Optional[Path] = None,
     verbose: bool = False,
     extra_macros: Optional[Iterable[str]] = None,
+    search_space_path: Optional[Path] = None,
+    aot_artifact_dir: Optional[Path] = None,
+    pgo: bool = False,
+    pgo_workload: Optional[Path] = None,
+    pgo_steps: int = 1000,
+    bayesian_trials: int = 500,
+    top_k: int = 20,
+    seed: int = 0,
+    debug_symbols: bool = False,
 ) -> Optional[Path]:
-    """Run the targeted compile pipeline.
+    """In-process orchestrator. ``main`` handles subprocess split.
 
-    Either pass an existing ``cache`` (a ``CompileCache`` instance held
-    in memory across multiple ``build()`` calls) or ``cache_path`` (the
-    path will be loaded once into memory and saved at the end). If
-    neither is given, a cache is loaded from ``<out_dir>/.compile_cache.json``.
+    When called from Python, this does not fork: AOT and JIT run in the
+    same process. Use ``main(['--runtime', 'both', ...])`` for the
+    subprocess-isolated workflow."""
+    if aot_only:
+        runtime = "aot"
+    if jit_only:
+        runtime = "jit"
 
-    ``aot_only=True`` runs the CPU-portable AOT half only (writes cache
-    with ``aot_completed_at`` set; leaves ``jit_completed_at = None``).
-    ``jit_only=True`` skips the AOT phase (cache must already have a
-    matching AOT entry from a previous run / shipped from another host)
-    and only runs the JIT autotune sweep on the active GPU.
-
-    Returns the path to the produced .so, or ``None`` for pallas /
-    on failure.
-    """
     spec = BuildSpec(
-        optimizer=optimizer,
-        model=model,
-        arch=arch,
+        optimizer=optimizer, model=model, arch=arch,
         out_dir=(out_dir or (REPO_ROOT / "build" / "compiled")).resolve(),
-        autotune=autotune,
-        autotune_mode=autotune_mode,
-        profile=profile,
-        verbose=verbose,
-        extra_macros=list(extra_macros or []),
-        aot_only=aot_only,
-        jit_only=jit_only,
+        autotune=autotune, autotune_mode=autotune_mode, profile=profile,
+        verbose=verbose, extra_macros=list(extra_macros or []),
+        runtime=runtime,
+        aot_only=(runtime == "aot"),
+        jit_only=(runtime == "jit"),
+        search_space_path=search_space_path,
+        aot_artifact_dir=aot_artifact_dir,
+        pgo=pgo, pgo_workload=pgo_workload, pgo_steps=pgo_steps,
+        bayesian_trials=bayesian_trials, top_k=top_k, seed=seed,
+        debug_symbols=debug_symbols,
     )
     _validate(spec)
     spec.out_dir.mkdir(parents=True, exist_ok=True)
@@ -888,146 +1508,63 @@ def build(
         cache = CompileCache(cp)
 
     report_path = report_path or (
-        spec.out_dir / f"compile_{optimizer}_{model}_{arch}.txt"
-    )
+        spec.out_dir / f"compile_{optimizer}_{model}_{arch}.txt")
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
     info = ARCH_INFO[arch]
-    phases: List[str] = ["resolve"]
+    phases = ["resolve"]
     if info["vendor"] != "pallas":
-        if not jit_only:
-            phases += ["aot"]
-        if autotune and not aot_only and info["vendor"] != "pallas":
-            phases += ["jit-autotune"]
-        if not aot_only:
-            phases += ["final"]
-    if profile and not aot_only:
-        phases += ["profile"]
-
+        if runtime in ("aot", "both"):
+            phases.append("aot")
+        if runtime in ("jit", "both") and autotune:
+            phases.append("jit-autotune")
+        if runtime in ("jit", "both"):
+            phases.append("final")
+    if profile and runtime != "aot":
+        phases.append("profile")
     step, close = make_progress(len(phases), f"{optimizer}/{model}/{arch}")
     so_path: Optional[Path] = None
 
     try:
         with open(report_path, "w") as report:
             report.write("# grokking_optimizers.compile — targeted build\n")
-            report.write(f"# Generated:   {datetime.datetime.now().isoformat()}\n")
-            report.write(f"# Optimizer:   {optimizer}\n")
-            report.write(f"# Model:       {model}\n")
-            report.write(f"# Arch:        {arch} (vendor={info['vendor']})\n")
-            report.write(f"# CPU cores:   {NCPUS} (ninja -j)\n")
-            report.write(f"# Out dir:     {spec.out_dir}\n")
-            report.write(f"# Cache:       {cache.path}\n")
-            report.write(f"# AOT only:    {aot_only}\n")
-            report.write(f"# JIT only:    {jit_only}\n")
-            report.write(f"# Autotune:    {autotune} (mode={autotune_mode})\n")
-            report.write(f"# Profile:     {profile}\n")
-
-            sources = _resolve_sources(spec)
-            host_cflags = _host_cflags(spec)
-            device_cflags = _device_cflags(spec)
-            ldflags = _ldflags(spec)
-            source_hash = (_hash_sources(sources) if sources else "pallas")
-            host_hash   = _hash_flags(host_cflags)
-            device_hash = _hash_flags(device_cflags)
-            report.write(f"\n[resolve] sources={len(sources)} "
-                         f"source_hash={source_hash[:16]} "
-                         f"host_hash={host_hash[:16]} "
-                         f"device_hash={device_hash[:16]}\n")
+            report.write(f"# Generated:        {datetime.datetime.now().isoformat()}\n")
+            report.write(f"# Optimizer:        {optimizer}\n")
+            report.write(f"# Model:            {model}\n")
+            report.write(f"# Arch:             {arch} (vendor={info['vendor']})\n")
+            report.write(f"# CPU cores:        {NCPUS} (ninja -j)\n")
+            report.write(f"# Out dir:          {spec.out_dir}\n")
+            report.write(f"# Cache:            {cache.path}\n")
+            report.write(f"# Runtime:          {runtime}\n")
+            report.write(f"# Autotune:         {autotune} (mode={autotune_mode})\n")
+            report.write(f"# Bayesian trials:  {bayesian_trials} (top_k={top_k})\n")
+            report.write(f"# PGO:              {pgo}\n")
+            if pgo:
+                report.write(f"#   workload:       {pgo_workload or DEFAULT_PGO_WORKLOAD}\n")
+                report.write(f"#   steps:          {pgo_steps}\n")
+            report.write(f"# Search space:     {search_space_path or DEFAULT_SEARCH_SPACE}\n")
+            report.write(f"# AOT artefact dir: {aot_artifact_dir}\n")
+            report.write(f"# Debug symbols:    {debug_symbols}\n")
+            report.write(f"# Profile:          {profile}\n")
             step("resolve")
 
             if info["vendor"] == "pallas":
-                launcher = (REPO_ROOT / "csrc/backends/pallas"
-                            / f"launch_{optimizer}.py")
-                report.write("\n[pallas] no C++ compile; Python launcher only\n")
-                report.write(f"  launcher: {launcher}\n")
-                report.write(f"  exists:   {launcher.exists()}\n")
-                cache.save()
+                build_aot(spec, cache, report)  # logs pallas no-op
             else:
-                # ─── AOT phase ───────────────────────────────────────────
-                if not jit_only:
+                if runtime in ("aot", "both"):
                     report.write("\n--- AOT PHASE ---\n")
-                    if cache.is_aot_fresh(optimizer, model, arch,
-                                          source_hash, host_hash, device_hash):
-                        art = cache.get(optimizer, model, arch)["primary_artifact"]
-                        so_path = Path(art["path"])
-                        report.write(f"  [cache HIT] reusing primary "
-                                     f"artefact: {so_path}\n"
-                                     f"             size={art['size']} "
-                                     f"sha256={art['sha256'][:16]}…\n")
-                    else:
-                        report.write("  [cache MISS] building primary "
-                                     "artefact...\n")
-                        so_path = _torch_load(
-                            spec, sources, host_cflags, device_cflags,
-                            ldflags, report,
-                        )
-                        cache.record_aot(
-                            optimizer, model, arch,
-                            source_hash=source_hash,
-                            host_flags_hash=host_hash,
-                            device_flags_hash=device_hash,
-                            so_path=so_path,
-                        )
-                        cache.save()  # persist AOT result before JIT begins
+                    so_path = build_aot(spec, cache, report)
                     step("aot")
-
-                # ─── JIT autotune phase (target hardware only) ───────────
-                tuned: Optional[dict] = None
-                if autotune and not aot_only:
+                if runtime in ("jit", "both") and autotune:
                     report.write("\n--- JIT AUTOTUNE PHASE ---\n")
-                    tuned = _jit_autotune(
-                        spec, sources, host_cflags, device_cflags,
-                        ldflags, cache, report,
-                    )
-                    cache.save()
+                    so_path = build_jit(spec, cache, report) or so_path
                     step("jit-autotune")
+                if runtime in ("jit", "both"):
+                    if "final" in phases:
+                        step("final")
 
-                # ─── Final build with tuned configs baked into header ────
-                if not aot_only:
-                    report.write("\n--- FINAL PASS ---\n")
-                    if tuned is not None:
-                        _write_tuned_configs_header(
-                            tuned, optimizer, model, arch, report)
-                        so_path = _torch_load(
-                            spec, sources,
-                            host_cflags + [
-                                f"-DSG_TUNED_BLOCK_SIZE={tuned['block']}",
-                                f"-DSG_TUNED_VEC_WIDTH={tuned['vec']}",
-                                f"-DSG_TUNED_UNROLL={tuned['unroll']}",
-                            ],
-                            device_cflags + [
-                                f"-DSG_TUNED_BLOCK_SIZE={tuned['block']}",
-                                f"-DSG_TUNED_VEC_WIDTH={tuned['vec']}",
-                                f"-DSG_TUNED_UNROLL={tuned['unroll']}",
-                            ],
-                            ldflags, report,
-                            module_suffix="_tuned",
-                        )
-                        cache.record_aot(
-                            optimizer, model, arch,
-                            source_hash=source_hash,
-                            host_flags_hash=_hash_flags(host_cflags + [
-                                f"-DSG_TUNED_BLOCK_SIZE={tuned['block']}",
-                                f"-DSG_TUNED_VEC_WIDTH={tuned['vec']}",
-                                f"-DSG_TUNED_UNROLL={tuned['unroll']}",
-                            ]),
-                            device_flags_hash=_hash_flags(device_cflags + [
-                                f"-DSG_TUNED_BLOCK_SIZE={tuned['block']}",
-                                f"-DSG_TUNED_VEC_WIDTH={tuned['vec']}",
-                                f"-DSG_TUNED_UNROLL={tuned['unroll']}",
-                            ]),
-                            so_path=so_path,
-                        )
-                    else:
-                        report.write("  [final] no tuned config — keeping "
-                                     "AOT primary artefact as final.\n")
-                    cache.save()
-                    step("final")
-
-            # ─── Profile pass (delegated) ────────────────────────────────
-            if profile and not aot_only:
-                report.write("\n--- PROFILE PASS "
-                             "(via grokking_optimizers.profile) ---\n")
+            if profile and runtime != "aot":
+                report.write("\n--- PROFILE PASS ---\n")
                 _dispatch_profile(optimizer, model, arch, report)
                 step("profile")
 
@@ -1036,19 +1573,45 @@ def build(
     finally:
         cache.save()
         close()
-
     return so_path
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI — runtime split happens here
 # ---------------------------------------------------------------------------
+
+def _spawn_phase(argv: List[str], phase: str) -> int:
+    """Re-exec self with the chosen phase. Returns the subprocess returncode."""
+    phase_flag = {"aot": "--aot-only", "jit": "--jit-only"}[phase]
+    # Strip any prior --runtime / --aot-only / --jit-only flags from the
+    # user's argv so we don't double-spec.
+    cleaned: List[str] = []
+    skip_next = False
+    for tok in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in ("--runtime",):
+            skip_next = True
+            continue
+        if tok in ("--aot-only", "--jit-only"):
+            continue
+        if tok.startswith("--runtime="):
+            continue
+        cleaned.append(tok)
+    cmd = [sys.executable, "-m", "grokking_optimizers.compile",
+           phase_flag] + cleaned
+    sys.stdout.write(f"[runtime split] spawning {phase}: {' '.join(cmd)}\n")
+    sys.stdout.flush()
+    return subprocess.call(cmd, env=os.environ.copy())
+
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m grokking_optimizers.compile",
-        description="Targeted per-(optimizer, model, arch) build pipeline "
-                    "with portable AOT-then-JIT cache.",
+        description="Targeted per-(optimizer, model, arch) build pipeline. "
+                    "v3 cache · YAML search space · Bayesian/Exhaustive · PGO · "
+                    "split AOT/JIT runtimes.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--optimizer", "-O", required=True, choices=OPTIMIZERS,
@@ -1061,62 +1624,122 @@ def main(argv: Optional[List[str]] = None) -> int:
                         default=REPO_ROOT / "build" / "compiled",
                         help="Build artifact directory (default: build/compiled)")
     parser.add_argument("--cache", type=Path, default=None,
-                        help="Cache file path (default: <out>/.compile_cache.json). "
-                             "Loaded into memory at start; written atomically at end.")
+                        help="Cache file path (default: <out>/.compile_cache.json).")
     parser.add_argument("--report", type=Path, default=None,
                         help="Report file path (default: <out>/compile_<O>_<M>_<A>.txt)")
+
+    # ── Runtime / phase ──────────────────────────────────────────────
+    parser.add_argument("--runtime", choices=("aot", "jit", "both"),
+                        default="both",
+                        help="Which phase to run in this process. 'both' "
+                             "spawns AOT then JIT subprocesses sequentially.")
     phase = parser.add_mutually_exclusive_group()
     phase.add_argument("--aot-only", action="store_true",
-                       help="Run only the AOT (CPU-portable) phase. No GPU required. "
-                            "Cache gets aot_completed_at; ship it to the GPU host.")
+                       help="Alias for --runtime aot.")
     phase.add_argument("--jit-only", action="store_true",
-                       help="Skip AOT (assume the cache already has it from "
-                            "a previous run / another host); run only the "
-                            "JIT autotune sweep on the active GPU.")
+                       help="Alias for --runtime jit.")
+
+    # ── Autotune mode ────────────────────────────────────────────────
+    parser.add_argument("--mode", choices=("exhaustive", "bayesian"),
+                        default="bayesian",
+                        help="Autotune mode (default: bayesian).")
+    parser.add_argument("--bayesian-trials", type=int, default=500,
+                        help="Trials for Bayesian TPE stage (default: 500).")
+    parser.add_argument("--top-k", type=int, default=20,
+                        help="Top-K winners refined in the second stage "
+                             "(default: 20).")
+    parser.add_argument("--quick", action="store_true",
+                        help=f"Debug shortcut: bayesian mode with "
+                             f"{QUICK_BAYESIAN_TRIALS} trials.")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Bayesian sampler seed (default: 0).")
     parser.add_argument("--no-autotune", action="store_true",
-                       help="Skip the JIT autotune sweep even when a GPU "
-                            "is visible (build with default tuned configs).")
-    space = parser.add_mutually_exclusive_group()
-    space.add_argument("--quick", dest="autotune_mode", action="store_const",
-                       const="quick",
-                       help="Quick autotune (8 configs).")
-    space.add_argument("--exhaustive", dest="autotune_mode",
-                       action="store_const", const="exhaustive",
-                       help="Exhaustive autotune (75 configs — maximally "
-                            "optimised, targets ~100%% utilisation).")
+                        help="Skip JIT autotune even when a GPU is visible.")
+
+    # ── Search space + PGO ──────────────────────────────────────────
+    parser.add_argument("--search-space", type=Path,
+                        default=DEFAULT_SEARCH_SPACE,
+                        help="YAML search-space file "
+                             "(default: configs/search_space.yaml).")
+    parser.add_argument("--pgo", action="store_true",
+                        help="Enable 3-pass PGO loop (instrument → "
+                             "workload → use). Doubles AOT compile time.")
+    parser.add_argument("--pgo-workload", type=Path,
+                        default=DEFAULT_PGO_WORKLOAD,
+                        help="PGO workload script.")
+    parser.add_argument("--pgo-steps", type=int, default=1000,
+                        help="N optimizer.step() calls during profile "
+                             "collection (default: 1000).")
+
+    # ── Cross-host artefact dir ─────────────────────────────────────
+    parser.add_argument("--aot-artifact-dir", type=Path, default=None,
+                        help="Directory to publish the AOT .so to so a "
+                             "JIT host on another machine can pick it up.")
+
+    # ── Misc ────────────────────────────────────────────────────────
     parser.add_argument("--no-profile", action="store_true",
-                        help="Skip the ncu/rocprof/jax.profiler pass.")
+                        help="Skip ncu/rocprof/jax.profiler pass.")
+    parser.add_argument("--debug-symbols", action="store_true",
+                        help="Add -ggdb / -lineinfo (auto-on with --profile).")
     parser.add_argument("-D", dest="extra_macros", action="append", default=[],
                         help="Extra -D<MACRO[=VALUE]>. Repeatable.")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Verbose torch cpp_extension output")
     args = parser.parse_args(argv)
 
+    # Resolve aliases.
+    if args.aot_only:
+        args.runtime = "aot"
+    if args.jit_only:
+        args.runtime = "jit"
+    if args.quick:
+        args.mode = "bayesian"
+        args.bayesian_trials = QUICK_BAYESIAN_TRIALS
+
+    # ── Runtime split: spawn AOT then JIT, then return ──────────────
+    if args.runtime == "both":
+        argv_in = list(argv) if argv is not None else sys.argv[1:]
+        rc_aot = _spawn_phase(argv_in, "aot")
+        if rc_aot != 0:
+            sys.stderr.write(f"[runtime split] AOT subprocess returned "
+                             f"{rc_aot}; skipping JIT.\n")
+            return rc_aot
+        rc_jit = _spawn_phase(argv_in, "jit")
+        return rc_jit
+
     extra = [m if m.startswith("-D") else f"-D{m}"
              for m in args.extra_macros]
-    autotune_mode = args.autotune_mode or "default"
 
     so = build(
         optimizer=args.optimizer, model=args.model, arch=args.arch,
         cache_path=args.cache,
         out_dir=args.out,
-        aot_only=args.aot_only,
-        jit_only=args.jit_only,
+        aot_only=(args.runtime == "aot"),
+        jit_only=(args.runtime == "jit"),
+        runtime=args.runtime,
         autotune=not args.no_autotune,
-        autotune_mode=autotune_mode,
+        autotune_mode=args.mode,
         profile=not args.no_profile,
         report_path=args.report,
         verbose=args.verbose,
         extra_macros=extra,
+        search_space_path=args.search_space,
+        aot_artifact_dir=args.aot_artifact_dir,
+        pgo=args.pgo,
+        pgo_workload=args.pgo_workload,
+        pgo_steps=args.pgo_steps,
+        bayesian_trials=args.bayesian_trials,
+        top_k=args.top_k,
+        seed=args.seed,
+        debug_symbols=args.debug_symbols,
     )
 
     report = args.report or (
-        args.out / f"compile_{args.optimizer}_{args.model}_{args.arch}.txt"
-    )
+        args.out / f"compile_{args.optimizer}_{args.model}_{args.arch}.txt")
     sys.stdout.write(f"{report}\n")
     return 0 if (so is not None
                  or ARCH_INFO[args.arch]["vendor"] == "pallas"
-                 or args.aot_only) else 1
+                 or args.runtime == "aot") else 1
 
 
 if __name__ == "__main__":
