@@ -122,6 +122,7 @@ self-containment" below.
 ├── grokking_optimizers/
 │   ├── __init__.py             (re-exports the 12 optimizers + helpers)
 │   ├── dispatch.py             (arch detection + fused kernel registry + get_ops)
+│   ├── compile.py              (targeted (opt, model, arch) ninja build + autotune + profile)
 │   └── optimizers/             (11 torch.optim.Optimizer subclasses; MoE-aware
 │       │                       SG2 lives inside supergrok2.py)
 │       ├── adamw.py            grokfast.py     muon.py       prodigy.py
@@ -206,6 +207,102 @@ fused softplus). **Without `WITH_CUTLASS=1`**, Muon falls back to cuBLAS via
 `torch::mm` and SuperGrok v2 uses cuBLAS + a separate softplus kernel —
 slightly slower but fully functional. The fall-back path is the default for
 local development; CUTLASS is the production-deployment knob.
+
+### Targeted build: `grokking_optimizers.compile`
+
+Dev-time companion to `setup.py`. Given an `(optimizer, model, arch)` triple,
+compiles the matching subset of `csrc/` with arch-tuned codegen, LTO, an
+optional autotune pre-pass, and a profile capture — all driven through
+ninja with `MAX_JOBS=$(nproc)`. Use this when iterating on a specific
+combo; use `setup.py` (the default `pip install -e .` path) when building
+the full production extension consumed by the race driver.
+
+```bash
+# CLI
+python -m grokking_optimizers.compile \
+    --optimizer supergrok2 --model mamba --arch sm_90 \
+    [--no-autotune] [--no-profile] [--out build/compiled] \
+    [--report build_report.txt] [-D MY_FLAG=1]
+
+# Importable
+from grokking_optimizers.compile import build
+so_path = build(optimizer="supergrok2", model="mamba", arch="sm_90")
+```
+
+What runs, in order:
+
+1. **Resolve sources** — bindings + every launcher and model TU for the
+   chosen arch (18 files), so the bindings link cleanly.
+2. **Inject metaprog macros** so headers can `#if` out unused
+   specialisations for the chosen combo:
+   `-DSG_BUILD_OPTIMIZER_<UPPER>=1`,
+   `-DSG_BUILD_MODEL_<UPPER>=1`,
+   `-DSG_BUILD_ARCH_<…>=1`,
+   `-DSG_VERBOSE=1`.
+3. **Build with ninja `-j$(nproc)`** via
+   `torch.utils.cpp_extension.load`, with arch-tuned flags + LTO
+   (sm_90: `--maxrregcount=255 -gencode arch=compute_90,code=sm_90 -dlto
+   -Xcompiler -flto`, CUTLASS auto-enabled if `third_party/cutlass/` is
+   present; gfx942: `--offload-arch=gfx942 -Rpass-analysis=kernel-resource-usage
+   -flto`).
+4. **Autotune pass** (`--no-autotune` to skip): pre-build with
+   `AUTOTUNE_PASS=1` stub configs, then rewrite
+   `csrc/algorithms/tuned_configs.h` with per-arch
+   `SG_TUNED_BLOCK_SIZE / VEC_WIDTH / UNROLL` constants so the final
+   build picks them up.
+5. **Profile pass** (`--no-profile` to skip) using the arch-native
+   profiler — full diagnostics captured to the report file.
+
+Output goes to a single text report (default
+`build/compiled/compile_<O>_<M>_<A>.txt`); stdout only prints the report
+path. Progress is reported on stderr via a tqdm bar with elapsed/ETA,
+falling back to a `[i/N elapsed=Xs eta=Ys]` line when tqdm is missing.
+
+#### Compile requirements per arch
+
+The triple selected determines what hardware/toolchain must be present.
+Builds without the optional profiler still succeed; only the profile
+capture is skipped with a `[skip]` line in the report.
+
+| Selected `--arch` | Hardware required to build | Hardware required to run + profile | Required compiler | Optional profiler |
+|---|---|---|---|---|
+| `sm_90` | None for build (set `FORCE_CUDA=1` to compile without a visible GPU); CUDA Toolkit ≥ 12.0 + nvcc on `PATH` | NVIDIA Hopper (H100 / H200) for `opt.step()` and `ncu` capture | `nvcc` (CUDA Toolkit) + `g++` ≥ 9 | `ncu` (Nsight Compute, `--set full` + 7 sections) |
+| `gfx942` | None for build (PyTorch ROCm install); ROCm ≥ 6.0 + hipcc on `PATH` | AMD CDNA3 (MI300X / MI300A) for `opt.step()` and rocprof capture | `hipcc` (ROCm) + host C++ for `.hip.cpp` | `rocprof-compute` ≫ `rocprofv2` ≫ `rocprof` (first found on `PATH`) |
+| `tpu_v5p` | None — Python-only, no C++ compile (the launcher is `csrc/backends/pallas/launch_<opt>.py`) | TPU v5p host with `jax[tpu]` for `opt.step()` and trace capture | n/a | `jax.profiler.start_trace / stop_trace` (in-process) |
+
+Common requirements (all arches):
+
+- **Python ≥ 3.10**, **PyTorch ≥ 2.0** (and `jax + jaxlib` for `tpu_v5p`),
+  **Ninja** (`pip install ninja` or system pkg) — `compile.py` drives it
+  via `torch.utils.cpp_extension.load` with `MAX_JOBS=$(nproc)`.
+- Optional: **`tqdm`** for a nicer progress bar; absent → built-in
+  `[i/N elapsed=Xs eta=Ys]` fallback.
+- Optional: **`ccache` / `sccache`** on `PATH` for warm-rebuild speedups
+  (auto-detected by `setup.py`; not configured by `compile.py`).
+- Optional: **`third_party/cutlass`** checked out (
+  `git submodule update --init --recursive third_party/cutlass`) — when
+  present, the sm_90 build auto-adds `-DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a`
+  so Muon Newton-Schulz and SuperGrok v2 dt_proj route through CUTLASS GEMMs.
+
+Notes on the autotune pass:
+
+- The pre-pass build sets `AUTOTUNE_PASS=1`, so any header guarded by
+  `#ifdef AUTOTUNE_PASS` can swap in stub configs to make the build cheap
+  even on a hot kernel.
+- The rewritten `csrc/algorithms/tuned_configs.h` is the only mutating
+  side-effect — re-run the command (or pass `--no-autotune`) to leave it
+  alone. The defaults are 256-block on sm_90 and 512-block on gfx942
+  (matching warp width × occupancy targets); a real micro-bench sweep
+  would refine these per-`(opt, model)` combo.
+
+#### When to reach for `compile.py` vs `setup.py`
+
+| You want… | Use |
+|---|---|
+| The production `grokking_optimizers._ops` consumed by the race driver | `pip install -e .` (setup.py) |
+| To iterate on one optimizer × one model × one arch with full diagnostics | `python -m grokking_optimizers.compile -O <opt> -M <model> -A <arch>` |
+| To capture an `ncu --set full` / `rocprof` / `jax.profiler` trace into a single text file | `compile.py` (the profile pass is the only built-in capture path) |
+| To rebuild every backend launcher and capture per-launcher profiles | `bench_backends.py` (still ships at repo root, complements `compile.py`) |
 
 ---
 
