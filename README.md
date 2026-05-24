@@ -99,6 +99,24 @@ not been run on real hardware in this environment. Phase 12 of the refactor
 (see `REFACTOR_NOTES.md`) documents the smoke tests that must run on a real
 H100, MI300X, or TPU v5p before any cell can be promoted to ✅.
 
+### Kernel header status
+
+Elementwise kernel headers in `grokking_optimizers/kernels/`. Each header
+provides a templated `__forceinline__ __device__` update function, a
+vectorized `_vec4` variant for float params, and a `__global__` launcher
+kernel. All headers share a common NanPolicy enum and type-cast helpers
+via arch-specific common headers.
+
+| Optimizer | sm_90 `.cuh` | gfx942 `.hip.hpp` | State tensors | Bytes/elem |
+|-----------|:---:|:---:|:---:|:---:|
+| AdamW     | 🟡 | 🟡 | 2 (m, v) | 8 |
+| Lion      | 🟡 | 🟡 | 1 (m) | 4 |
+| Grokfast  | 🟡 | 🟡 | 3 (ema, m, v) | 12 |
+| GrokAdamW | 🟡 | 🟡 | 3 (ema, m, v) | 12 |
+
+Legend: 🟡 = written, structurally validated (143 tests pass), not compiled
+on device (no CUDA/HIP toolchain in this environment).
+
 ---
 
 ## Filesystem
@@ -137,6 +155,15 @@ self-containment" below.
 │   ├── timing_worker.py        (persistent CUDA/HIP-warm subprocess)
 │   ├── bench_graph.py          (CUDA-graph / HIP-graph capture+replay)
 │   ├── pgo.py                  (instrument / collect / use flag plumbing)
+│   ├── kernels/                (elementwise kernel headers per arch)
+│   │   ├── sm_90/              (CUDA Hopper headers)
+│   │   │   ├── common_sm90.cuh           (shared NanPolicy + type-cast helpers)
+│   │   │   ├── adamw_sm90.cuh            lion_sm90.cuh
+│   │   │   └── grokfast_sm90.cuh         grokadamw_sm90.cuh
+│   │   └── gfx942/             (HIP CDNA3 headers)
+│   │       ├── common_gfx942.hip.hpp     (shared NanPolicy + type-cast helpers)
+│   │       ├── adamw_gfx942.hip.hpp      lion_gfx942.hip.hpp
+│   │       └── grokfast_gfx942.hip.hpp   grokadamw_gfx942.hip.hpp
 │   └── optimizers/             (11 torch.optim.Optimizer subclasses; MoE-aware
 │       │                       SG2 lives inside supergrok2.py)
 │       ├── adamw.py            grokfast.py     muon.py       prodigy.py
