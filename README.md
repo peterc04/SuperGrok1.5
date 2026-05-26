@@ -137,6 +137,217 @@ on device (no CUDA/HIP/TPU toolchain in this environment).
 
 ---
 
+### Compile cache schema (v3)
+
+The compile cache (`build/.compile_cache.json`) uses schema **v3**
+(forward-migrated from v2 on load; the old file is archived as
+`<cache>.v2.bak`). Per-entry shape:
+
+```jsonc
+{
+  "version": 3,
+  "entries": {
+    "<optimizer>/<model>/<arch>": {
+      // Identity
+      "source_hash": "…",  "host_cflags_hash": "…",  "device_cflags_hash": "…",
+      "search_space_hash": "…",
+      // Artefacts
+      "primary_artifact": { "path": "…", "size": …, "mtime": …, "sha256": "…" },
+      "variant_artifacts": { "<config_key>": { "path": "…", "size": …, "mtime": … } },
+      // Phase timestamps
+      "aot_completed_at": "…",  "jit_completed_at": "…",  "pgo_completed_at": "…",
+      // Tuning
+      "mode": "bayesian" | "exhaustive",
+      "tuned_config": { "block": 256, "vec": 4, "unroll": 8, "timing_ms": 0.412, "stage_won": "refine" },
+      "bayesian_trials": [{ "stage": "tpe"|"refine"|"exhaustive", "config": {…}, "timing_ms": … }],
+      "sweep_history": [/* same shape as bayesian_trials */],
+      // PGO
+      "pgo_enabled": bool,  "pgo_profile_dir": "…",  "pgo_workload_hash": "…"
+    }
+  }
+}
+```
+
+### CLI surface (`compile.py`)
+
+```
+python -m grokking_optimizers.compile \
+  -O <optimizer> -M <model> -A <arch> \
+  --mode {bayesian,exhaustive} \
+  --bayesian-trials 500 --top-k 20 \
+  --pgo [--pgo-workload <script>] [--pgo-steps 1000] \
+  --search-space configs/search_space.yaml \
+  --cache build/.compile_cache.json \
+  --runtime {aot,jit,both} [--aot-only | --jit-only] \
+  [--aot-artifact-dir <path>] \
+  [--quick] [--no-autotune] [--no-profile] \
+  [--transfer-learning] [--pruner {none,hyperband,median}] \
+  [--debug-symbols] [--seed N] [-D MACRO[=VALUE]] [-v]
+```
+
+### Output flag bases
+
+```python
+HOST_CFLAGS_BASE = [
+    "-O3", "-std=c++17", "-fPIC", "-flto=full", "-march=native",
+    "-fno-semantic-interposition", "-fvisibility=hidden",
+    "-fdata-sections", "-ffunction-sections", "-ffast-math", "-funroll-loops",
+]
+NVCC_DEVICE_BASE = [
+    "-O3", "--use_fast_math", "-std=c++17", "-DWITH_CUDA",
+    "--threads", "8", "-Xfatbin", "-compress-all",
+    "-Xptxas", "-O3", "--allow-expensive-optimizations=true",
+    "--extra-device-vectorization", "-dlto",
+    "-gencode=arch=compute_90,code=sm_90",
+    "-gencode=arch=compute_90,code=compute_90",
+]
+HIPCC_DEVICE_BASE = [
+    "-O3", "-std=c++17", "-DWITH_HIP", "-ffast-math",
+    "--offload-arch=gfx942",
+    "-mllvm", "-amdgpu-early-inline-all=true",
+    "-mllvm", "-amdgpu-function-calls=false",
+    "-mllvm", "-amdgpu-internalize-symbols", "-flto",
+]
+LDFLAGS_BASE = ["-flto=full", "-Wl,--as-needed", "-Wl,--gc-sections", "-Wl,-O3", "-Wl,--icf=all"]
+```
+
+---
+
+### Autotune guide
+
+#### TL;DR workflows
+
+```bash
+# End-to-end (Bayesian, 500 trials, top-K=20)
+python -m grokking_optimizers.compile -O supergrok2 -M mamba -A sm_90 \
+    --cache build/.compile_cache.json
+
+# CPU-only AOT → ship cache to GPU host → JIT autotune
+python -m grokking_optimizers.compile … --aot-only --aot-artifact-dir build/compiled/aot_artifacts
+# (on GPU host)
+python -m grokking_optimizers.compile … --jit-only
+
+# PGO-flavoured build
+python -m grokking_optimizers.compile … --pgo --pgo-steps 1000
+
+# Quick debug (25 trials)
+python -m grokking_optimizers.compile -O lion -M mamba -A sm_90 --quick
+
+# Exhaustive (every pre-filter survivor)
+python -m grokking_optimizers.compile -O lion -M mamba -A sm_90 --mode exhaustive
+```
+
+#### Autotune modes
+
+| Mode | Behaviour |
+|------|-----------|
+| `--mode bayesian` (default) | Optuna TPE for N trials (default 500); top-K (default 20) neighbours refined at ±2 steps per dim. Study persists to SQLite for cross-run resume. |
+| `--mode exhaustive` | Every config surviving the static pre-filter is built and timed. Cache flushes every 5 trials (Ctrl-C safe). |
+| `--quick` | Alias: bayesian with 25 trials. |
+
+#### Search-space YAML schema (`configs/search_space.yaml`)
+
+```yaml
+<arch>:
+  dims:
+    - name: <id>          # e.g. "block"
+      type: int|bool|enum|tuple
+      values: [64, 128, 256, 512, 1024]
+      macro: SG_TUNED_BLOCK_SIZE   # -D name; null to skip
+      applies_to: [host, device]   # which flag list receives the macro
+  prefilter:
+    register_pressure_max: 255
+    smem_budget_bytes: 232448
+    rules:
+      - name: vec_block_alignment
+        expr: "block % (vec * 4) == 0"
+```
+
+Static pre-filter rules eliminate infeasible configs before any compile;
+the elimination count is logged as `[prefilter] N candidates → M survivors`.
+
+#### PGO loop (`--pgo`)
+
+Three-pass build: **instrument** (AOT with `-fprofile-generate`) →
+**collect** (run `scripts/pgo_workload.py` for N steps; profile files
+land under `<out>/pgo_profile/`) → **use** (rebuild with
+`-fprofile-use`). The cache stores `pgo_workload_hash` and `pgo_enabled`
+as freshness factors so PGO and non-PGO artefacts are never confused.
+
+#### Troubleshooting
+
+- **sccache 0% hit on NVCC** — upgrade sccache to >= 0.8 (CUDA hash instability fix).
+- **Optuna study won't resume** — verify `<out>/optuna_<opt>_<model>_<arch>.db` exists; changing any of (opt, model, arch) starts a new study.
+- **`.gcda` empty after PGO collect** — ensure `LLVM_PROFILE_FILE` is exported (done automatically by `pgo.collect_workload`); verify the workload exercises the hot path.
+- **AOT/JIT cache mismatch across hosts** — copy both the cache JSON and the artefact dir; `is_aot_fresh` factors in source, flags, PGO, and search-space hashes.
+- **Worker crash mid-sweep** — the sweep falls back to one-shot subprocess timing and restarts the worker automatically.
+- **Transfer-learning no effect** — run the sibling optimizer first (e.g. `-O adamw`) so its trials exist in the cache before invoking `--transfer-learning`.
+
+---
+
+### Optimization candidate matrix
+
+Evaluation of additional compile/runtime optimizations beyond the
+baseline (full LTO, sccache, NVCC `--threads 8`, Bayesian+Exhaustive
+autotune, PGO, persistent timing worker, CUDA/HIP graphs). Score =
+`(perf_gain × confidence) / (cost × risk)`. Reported numbers are from
+cited sources (no real A/B — CPU-only environment; rerun with
+`--bayesian-trials 500` on a GPU host to populate "Measured here").
+
+#### Compile-speed candidates
+
+| # | Candidate | Est. impact | Cost (h) | Risk | Recommendation |
+|---|---|---|---|---|---|
+| C1 | Newer compiler probe (NVCC 12.6+ `--split-compile`) | -5 to -15% heavy TUs | 2-4 | Low | **enable-by-default** |
+| C2 | ccache alongside sccache (ccache for host, sccache for NVCC) | -20 to -60% warm | 3-5 | Low | **enable-by-default** |
+| C3 | PCH for binding TUs | -5 to -12% | 4-8 | Med | behind-flag (`--use-pch`) |
+| C4 | Split heavy templated TUs | -10 to -25% | 16-24 | Med | behind-flag (`--split-launchers`) |
+| C5 | BOLT post-link on compiler binaries | -8 to -15% | 12-20 | Med-High | behind-flag (`GROK_BOLT_TOOLCHAIN=1`) |
+| C6 | C++20 modules for binding headers | -3 to -8% | 30-50 | High | not-worth-it |
+
+#### Output-perf candidates
+
+| # | Candidate | Est. kernel-perf | Cost (h) | Risk | Recommendation |
+|---|---|---|---|---|---|
+| O1 | Register-pressure pruning (parse ptxas spill counts) | search converges 20-40% faster | 5-8 | Low | **enable-by-default** |
+| O2 | Per-variant `__launch_bounds__` | 5-20% occupancy-bound | 3-5 | Low | **enable-by-default** |
+| O3 | Async copy depth tuning (sm_90) | 3-15% memory-bound | 4-6 | Low | **enable-by-default** |
+| O4 | LDS swizzle tuning (gfx942) — bias toward XOR-swizzle | up to 28% | 2-4 | Low | **enable-by-default** |
+| O5 | MFMA shape tuning (gfx942) — bias toward 16x16x16 | 5-15% | 1-2 | Low | **enable-by-default** |
+| O6 | CUTLASS for sm_90 matmul shapes (TMA + WGMMA) | 30-100% over hand-written | 12-20 | Med | **enable-by-default** |
+| O7 | Composable Kernel on gfx942 matmul | 20-100% | 16-24 | Med | **enable-by-default** |
+| O8 | TMA descriptor reuse on sm_90 | 10-50% memory-bound | 12-18 | Med | enable-by-default (feature-flagged) |
+| O9 | Mixed-precision FP8/BF16/TF32 variants | up to ~2× peak | 10-16 | High | behind-flag (`--mixed-precision`) |
+| O10 | Persistent kernel pattern | 60-211× fine-grained | 20-30 | High | behind-flag (`--persistent-kernel`) |
+| O11 | BOLT post-link on produced .so | 2-15% host-side | 6-10 | Low | behind-flag (`--bolt-post-link`) |
+| O12 | AutoFDO vs instrumented PGO | 5-15% host | 8-12 | Low | behind-flag (`--pgo-mode=autofdo`) |
+| O13 | Auto-vectorize tuning (host TUs) | 3-8% host | 2-4 | Low | **enable-by-default** |
+| O14 | Polly / MLIR polyhedral | 10-100% affine | 40-80 | High | not-worth-it |
+| O15 | Souper superoptimization | 0-3% peephole | 20-30 | Med | not-worth-it |
+
+#### Autotune-quality candidates
+
+| # | Candidate | Trial-budget savings | Cost (h) | Risk | Recommendation |
+|---|---|---|---|---|---|
+| A1 | Hyperband / Successive Halving | -30 to -50% | 8-12 | Low | **enable-by-default** (`--pruner hyperband`) |
+| A2 | Transfer learning across optimizers | -20 to -40% | 4-6 | Low | **enable-by-default** (`--transfer-learning`) |
+| A3 | Multi-fidelity tuning (small tensor first) | -40 to -60% wall-time | 12-20 | Med | behind-flag (`--multi-fidelity`) |
+| A4 | Cost-aware Bayesian (EIpu) | -15 to -25% compile-time | 10-14 | Low-Med | behind-flag (`--cost-aware`) |
+| A5 | BoTorch GP vs TPE | marginal/negative | 6-10 | Med | not-worth-it |
+| A6 | Per-shape autotune (LUT) | +5-15% aggregate | 16-24 | Med | behind-flag (`--per-shape`) |
+| A7 | Ensemble-of-winners runtime dispatch | +3-10% aggregate | 20-30 | Med | blocked-by-telemetry |
+
+#### Infrastructure candidates
+
+| # | Candidate | Throughput | Cost (h) | Risk | Recommendation |
+|---|---|---|---|---|---|
+| I1 | Redis-backed shared sccache | +20-60% cluster | 2-4 | Low | **enable-by-default** (when `SCCACHE_REDIS_ENDPOINT` set) |
+| I2 | GHA cache warming on push | +40-80% first-build | 3-5 | Low | blocked-by-infra |
+| I3 | Ray for distributed autotune | ~N× linear | 16-24 | High | behind-flag (`--executor=ray`) |
+| I4 | Per-variant Docker isolation | -5 to -15% | 6-10 | Med | not-worth-it |
+
+---
+
 ## Filesystem
 
 The codebase splits along two orthogonal axes: **algorithm** (the
@@ -152,10 +363,6 @@ self-containment" below.
 ├── autotune/                   (kernel auto-tuning utilities)
 ├── configs/
 │   └── search_space.yaml       (YAML-driven autotune search space per arch)
-├── docs/
-│   ├── autotune.md             (autotune guide — modes, PGO, YAML, troubleshooting)
-│   └── optimization_matrix.md  (§12 candidate evaluation matrix with citations)
-├── INTERFACES.md               (module coordination contract for compile.py)
 ├── scripts/                    (build / dev helpers — incl. pgo_workload.py)
 ├── tests/                      (correctness tests + JAX/Triton reference impls)
 │   └── reference/
@@ -520,7 +727,7 @@ Timing infrastructure:
 - 5 warmup + 21 timed iterations; report median + min/max + n. Worker
   crash → one-shot subprocess fallback + worker restart.
 
-See [`docs/autotune.md`](docs/autotune.md) for full mode comparison,
+See the "Autotune guide" section above for full mode comparison,
 YAML schema reference, PGO guidance, and troubleshooting.
 
 #### Performance optimizations
@@ -531,7 +738,7 @@ NVCC `--threads 8`, NVCC `-Xfatbin -compress-all`, NVCC
 `--def-store-cache=wb`, HIPCC `-mllvm -amdgpu-early-inline-all`,
 `-Wl,--gc-sections -Wl,--icf=all`, the persistent timing worker, and
 CUDA/HIP graphs) is always on. See
-[`docs/optimization_matrix.md`](docs/optimization_matrix.md) for the
+the "Optimization candidate matrix" section above for the
 full §12 evaluation matrix of additional candidates with published
 impact numbers, integration costs, and risk assessments — including
 which are now on by default vs. behind-flag.
