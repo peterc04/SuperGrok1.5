@@ -1908,67 +1908,157 @@ def _ensure_nvcc_on_path() -> Optional[str]:
     return None
 
 
-def bootstrap_cuda_toolkit(stream=None) -> bool:
-    """Install the CUDA toolkit (nvcc + runtime + headers) on demand.
+def _sudo_prefix() -> List[str]:
+    """Return ['sudo'] when needed, [] when running as root, [] when
+    sudo doesn't exist (we'll try the bare command and let it fail)."""
+    try:
+        if os.geteuid() == 0:
+            return []
+    except AttributeError:
+        pass  # Windows
+    s = shutil.which("sudo")
+    return [s] if s else []
 
-    Use this when you're on a Colab CPU runtime, a fresh CI worker, or
-    any machine without a system CUDA install. Returns True on success.
 
-    Strategy:
-      1. apt-get install nvidia-cuda-toolkit (Debian/Ubuntu — works on
-         Colab CPU runtimes). This is the only path that actually
-         supplies the nvcc driver binary; the NVIDIA PyPI wheels ship
-         ptxas + headers + libnvvm but NOT nvcc itself.
-      2. Fall back to NVIDIA PyPI wheels (provides headers + ptxas +
-         runtime) — useful for runtimes where apt isn't available, but
-         requires the user to obtain nvcc separately.
+def _bootstrap_cuda_via_conda(stream) -> bool:
+    """Install via conda from the nvidia channel. Works on Linux, macOS,
+    Windows — no sudo. Best when CONDA_PREFIX is set (active env)."""
+    conda = shutil.which("mamba") or shutil.which("conda")
+    if not conda:
+        return False
+    in_env = bool(os.environ.get("CONDA_PREFIX"))
+    stream.write(f"[bootstrap] trying {Path(conda).name} install "
+                 f"(in conda env: {in_env}) — cross-platform, no sudo\n")
+    stream.flush()
+    rc = subprocess.call([
+        conda, "install", "-y", "-c", "nvidia",
+        "cuda-nvcc", "cuda-runtime", "cuda-cccl", "cuda-nvrtc",
+    ])
+    return rc == 0 and _ensure_nvcc_on_path() is not None
 
-    Pulls ~2 GB and takes 2-5 minutes on a typical Colab CPU runtime.
-    """
-    if stream is None:
-        stream = sys.stderr
-    if shutil.which("nvcc") or _ensure_nvcc_on_path():
-        stream.write("[bootstrap] nvcc already available; skipping install\n")
-        return True
 
-    # Path 1: apt-get install nvidia-cuda-toolkit (this DOES ship nvcc).
+def _bootstrap_cuda_via_apt(stream) -> bool:
+    """Debian / Ubuntu / Colab / Mint."""
     apt = shutil.which("apt-get") or shutil.which("apt")
-    if apt:
-        stream.write("[bootstrap] installing nvidia-cuda-toolkit via apt "
-                     "(this will take a few minutes and pull ~2 GB)\n")
-        stream.flush()
-        # `sudo` is optional — Colab runs as root.
-        sudo_prefix = [] if os.geteuid() == 0 else (
-            [shutil.which("sudo") or "sudo"] if shutil.which("sudo") else [])
-        env = os.environ.copy()
-        env["DEBIAN_FRONTEND"] = "noninteractive"
-        try:
-            rc = subprocess.call(sudo_prefix + [apt, "update", "-qq"], env=env)
-            if rc == 0:
-                rc = subprocess.call(
-                    sudo_prefix + [apt, "install", "-y", "-qq",
-                                   "nvidia-cuda-toolkit"],
-                    env=env)
-        except FileNotFoundError as e:
-            rc = -1
-            stream.write(f"[bootstrap] apt invocation FAILED: {e}\n")
-        if rc == 0:
-            found = _ensure_nvcc_on_path()
-            if found:
-                _refresh_torch_cuda_home()
-                stream.write(f"[bootstrap] OK (apt) — nvcc at {found}\n")
-                return True
-            stream.write("[bootstrap] apt install succeeded but nvcc still "
-                         "not findable. Common locations:\n"
-                         "  /usr/bin/nvcc  /usr/local/cuda/bin/nvcc\n")
-        else:
-            stream.write(f"[bootstrap] apt install FAILED (rc={rc}); "
-                         "trying PyPI wheels as a partial fallback\n")
+    if not apt:
+        return False
+    stream.write("[bootstrap] trying apt-get install nvidia-cuda-toolkit "
+                 "(~2 GB, 2-5 min)\n")
+    stream.flush()
+    env = os.environ.copy()
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    sudo = _sudo_prefix()
+    subprocess.call(sudo + [apt, "update", "-qq"], env=env)
+    rc = subprocess.call(
+        sudo + [apt, "install", "-y", "-qq", "nvidia-cuda-toolkit"], env=env)
+    return rc == 0 and _ensure_nvcc_on_path() is not None
 
-    # Path 2: NVIDIA PyPI wheels (does NOT provide nvcc; only ptxas +
-    # libs + headers). Install them anyway so torch.utils.cpp_extension
-    # can find libcudart and the headers even if nvcc had to be installed
-    # separately.
+
+def _bootstrap_cuda_via_dnf(stream) -> bool:
+    """Fedora / RHEL 8+ / Rocky / Alma. Tries `cuda` first
+    (works once NVIDIA repo is added), then `nvidia-cuda-toolkit`
+    (RPMFusion)."""
+    dnf = shutil.which("dnf")
+    if not dnf:
+        return False
+    sudo = _sudo_prefix()
+    for pkg in ("cuda", "nvidia-cuda-toolkit"):
+        stream.write(f"[bootstrap] trying dnf install {pkg}\n")
+        stream.flush()
+        rc = subprocess.call(sudo + [dnf, "install", "-y", pkg])
+        if rc == 0 and _ensure_nvcc_on_path():
+            return True
+    return False
+
+
+def _bootstrap_cuda_via_yum(stream) -> bool:
+    """RHEL 7 / CentOS 7."""
+    yum = shutil.which("yum")
+    if not yum:
+        return False
+    sudo = _sudo_prefix()
+    for pkg in ("cuda", "nvidia-cuda-toolkit"):
+        stream.write(f"[bootstrap] trying yum install {pkg}\n")
+        stream.flush()
+        rc = subprocess.call(sudo + [yum, "install", "-y", pkg])
+        if rc == 0 and _ensure_nvcc_on_path():
+            return True
+    return False
+
+
+def _bootstrap_cuda_via_zypper(stream) -> bool:
+    """openSUSE / SLES."""
+    zypper = shutil.which("zypper")
+    if not zypper:
+        return False
+    sudo = _sudo_prefix()
+    for pkg in ("cuda", "nvidia-cuda-toolkit"):
+        stream.write(f"[bootstrap] trying zypper install {pkg}\n")
+        stream.flush()
+        rc = subprocess.call(sudo + [zypper, "--non-interactive", "install",
+                                     "-y", pkg])
+        if rc == 0 and _ensure_nvcc_on_path():
+            return True
+    return False
+
+
+def _bootstrap_cuda_via_pacman(stream) -> bool:
+    """Arch / Manjaro / EndeavourOS — `cuda` is in extra repo."""
+    pac = shutil.which("pacman")
+    if not pac:
+        return False
+    stream.write("[bootstrap] trying pacman -S cuda\n")
+    stream.flush()
+    sudo = _sudo_prefix()
+    rc = subprocess.call(sudo + [pac, "-S", "--noconfirm", "cuda"])
+    return rc == 0 and _ensure_nvcc_on_path() is not None
+
+
+def _bootstrap_cuda_via_apk(stream) -> bool:
+    """Alpine Linux — `cuda` is in the testing repo."""
+    apk = shutil.which("apk")
+    if not apk:
+        return False
+    stream.write("[bootstrap] trying apk add cuda\n")
+    stream.flush()
+    sudo = _sudo_prefix()
+    rc = subprocess.call(sudo + [apk, "add", "--no-cache", "cuda"])
+    return rc == 0 and _ensure_nvcc_on_path() is not None
+
+
+def _bootstrap_cuda_via_brew(stream) -> bool:
+    """macOS. CUDA was discontinued on Mac after 10.13 / CUDA 10.2, so
+    this almost never succeeds — but we try the Homebrew formula in
+    case the user has an old Tesla-era Mac."""
+    brew = shutil.which("brew")
+    if not brew:
+        return False
+    stream.write("[bootstrap] trying brew install --cask cuda "
+                 "(macOS — typically only works on pre-2019 systems)\n")
+    stream.flush()
+    rc = subprocess.call([brew, "install", "--cask", "cuda"])
+    return rc == 0 and _ensure_nvcc_on_path() is not None
+
+
+def _bootstrap_cuda_via_winget(stream) -> bool:
+    """Windows — Microsoft App Installer / winget."""
+    winget = shutil.which("winget")
+    if not winget:
+        return False
+    stream.write("[bootstrap] trying winget install Nvidia.CUDA\n")
+    stream.flush()
+    rc = subprocess.call([winget, "install", "--id", "Nvidia.CUDA",
+                          "--silent", "--accept-package-agreements",
+                          "--accept-source-agreements"])
+    return rc == 0 and _ensure_nvcc_on_path() is not None
+
+
+def _bootstrap_cuda_via_pypi_wheels(stream) -> bool:
+    """LAST RESORT: NVIDIA's PyPI wheels. These ship ptxas, libnvvm,
+    libcudart, and the headers — but NOT the nvcc compiler driver.
+    Useful for filling in the dependency surface AFTER nvcc has been
+    installed by another method. Listed as a fallback for the rare
+    case where the wheels include enough to satisfy build attempts."""
     preferred = "cu12"
     try:
         import torch
@@ -1981,40 +2071,108 @@ def bootstrap_cuda_toolkit(stream=None) -> bool:
             preferred = "cu11"
     except Exception:
         pass
-    ordered: List[str] = []
+    seen: List[str] = []
     for tag in (preferred, "cu12", "cu11"):
-        if tag not in ordered:
-            ordered.append(tag)
-    for cu_tag in ordered:
-        pkgs = [
-            f"nvidia-cuda-nvcc-{cu_tag}",
-            f"nvidia-cuda-runtime-{cu_tag}",
-            f"nvidia-cuda-cccl-{cu_tag}",
-            f"nvidia-cuda-nvrtc-{cu_tag}",
-        ]
-        stream.write(f"[bootstrap] trying NVIDIA PyPI wheels ({cu_tag}): "
-                     "ptxas + libs + headers (no nvcc binary)\n")
+        if tag in seen:
+            continue
+        seen.append(tag)
+        pkgs = [f"nvidia-cuda-nvcc-{tag}", f"nvidia-cuda-runtime-{tag}",
+                f"nvidia-cuda-cccl-{tag}", f"nvidia-cuda-nvrtc-{tag}"]
+        stream.write(f"[bootstrap] trying NVIDIA PyPI wheels ({tag}) — "
+                     "note: does NOT include nvcc binary\n")
         stream.flush()
         rc = subprocess.call([sys.executable, "-m", "pip", "install", "-q",
                               *pkgs])
-        if rc == 0:
+        if rc == 0 and _ensure_nvcc_on_path():
+            return True
+    return False
+
+
+def bootstrap_cuda_toolkit(stream=None) -> bool:
+    """Install the CUDA toolkit (nvcc + runtime + headers) on demand.
+
+    Works on any host where one of these is available:
+      - conda  (preferred — cross-platform, no sudo, no repo setup)
+      - apt-get/apt  (Debian / Ubuntu / Colab / Mint)
+      - dnf  (Fedora / RHEL 8+ / Rocky / Alma)
+      - yum  (RHEL 7 / CentOS 7)
+      - zypper  (openSUSE / SLES)
+      - pacman  (Arch / Manjaro / EndeavourOS)
+      - apk  (Alpine Linux)
+      - brew  (macOS — legacy CUDA only)
+      - winget  (Windows 10+)
+      - pip + NVIDIA PyPI wheels  (partial — no nvcc, but useful libs)
+
+    Probes them in priority order: conda first if you're in a conda env
+    (no sudo), then any system package manager that's on PATH, then
+    PyPI wheels as a partial fallback. Returns True iff nvcc is on PATH
+    afterwards.
+    """
+    if stream is None:
+        stream = sys.stderr
+    if shutil.which("nvcc") or _ensure_nvcc_on_path():
+        stream.write("[bootstrap] nvcc already available; skipping install\n")
+        return True
+
+    in_conda_env = bool(os.environ.get("CONDA_PREFIX"))
+    # Priority order: prefer conda when we're in an active env (no sudo,
+    # cross-platform). Otherwise prefer the host's native package manager.
+    methods: List[Tuple[str, Any]] = []
+    if in_conda_env:
+        methods.append(("conda", _bootstrap_cuda_via_conda))
+    # Native system package managers — one of these matches on any
+    # Linux/macOS/Windows host.
+    methods.extend([
+        ("apt",      _bootstrap_cuda_via_apt),
+        ("dnf",      _bootstrap_cuda_via_dnf),
+        ("yum",      _bootstrap_cuda_via_yum),
+        ("zypper",   _bootstrap_cuda_via_zypper),
+        ("pacman",   _bootstrap_cuda_via_pacman),
+        ("apk",      _bootstrap_cuda_via_apk),
+        ("brew",     _bootstrap_cuda_via_brew),
+        ("winget",   _bootstrap_cuda_via_winget),
+    ])
+    # If we have conda available but weren't in an env, try it as a
+    # late fallback (creates / modifies base env, less ideal).
+    if not in_conda_env and (shutil.which("mamba") or shutil.which("conda")):
+        methods.append(("conda", _bootstrap_cuda_via_conda))
+    # PyPI as final, partial fallback.
+    methods.append(("pip-wheels", _bootstrap_cuda_via_pypi_wheels))
+
+    tried: List[str] = []
+    for name, fn in methods:
+        try:
+            ok = fn(stream)
+        except Exception as exc:
+            stream.write(f"[bootstrap] {name} raised {type(exc).__name__}: "
+                         f"{exc}\n")
+            tried.append(f"{name} (errored)")
+            continue
+        tried.append(name)
+        if ok:
             found = _ensure_nvcc_on_path()
             if found:
                 _refresh_torch_cuda_home()
-                stream.write(f"[bootstrap] OK (wheels {cu_tag}) — nvcc at {found}\n")
+                stream.write(f"[bootstrap] OK ({name}) — nvcc at {found}\n")
                 return True
-            stream.write(f"[bootstrap] {cu_tag} wheels installed (ptxas + "
-                         "libs + headers) but no nvcc driver. NVIDIA's PyPI "
-                         "wheels don't ship the nvcc binary — only apt/conda "
-                         "or the official .run installer do.\n")
-            break
+            stream.write(f"[bootstrap] {name} reported success but nvcc "
+                         "still not findable; continuing\n")
+
     stream.write(
-        "\n[bootstrap] FAILED to obtain nvcc. Manual install options:\n"
-        "  Colab CPU runtime: switch to a GPU runtime (Runtime → Change\n"
-        "    runtime type → Hardware accelerator: GPU). nvcc is preinstalled.\n"
-        "  Ubuntu/Debian:     sudo apt-get install nvidia-cuda-toolkit\n"
-        "  Conda env:         conda install -c nvidia cuda-nvcc cuda-runtime\n"
-        "  NVIDIA installer:  https://developer.nvidia.com/cuda-downloads\n"
+        "\n[bootstrap] FAILED to obtain nvcc on this host.\n"
+        f"  Attempted: {tried}\n"
+        "  Manual install — pick the one that matches your environment:\n"
+        "    conda install -c nvidia cuda-nvcc cuda-runtime    # any OS, conda env\n"
+        "    sudo apt-get install nvidia-cuda-toolkit          # Debian / Ubuntu / Colab\n"
+        "    sudo dnf install cuda                             # Fedora / RHEL 8+ (NVIDIA repo)\n"
+        "    sudo zypper install cuda                          # openSUSE / SLES\n"
+        "    sudo pacman -S cuda                               # Arch / Manjaro\n"
+        "    sudo apk add cuda                                 # Alpine\n"
+        "    winget install Nvidia.CUDA                        # Windows 10+\n"
+        "    https://developer.nvidia.com/cuda-downloads       # official .run installer\n"
+        "  NOTE: NVIDIA's PyPI wheels (nvidia-cuda-nvcc-cuXX) ship ptxas, libnvvm,\n"
+        "  libcudart, and headers — but NOT the nvcc compiler driver. The bootstrap\n"
+        "  attempts them as a partial fallback to populate the dependency surface.\n"
     )
     return False
 
@@ -3315,27 +3473,40 @@ def build(
     if ARCH_INFO[arch]["vendor"] == "cuda" and not shutil.which("nvcc"):
         raise RuntimeError(
             "nvcc not found on PATH and could not be auto-discovered.\n"
-            "FIX (Colab CPU runtime or any Debian/Ubuntu without CUDA):\n"
-            "  Call build(..., bootstrap_cuda=True) — runs `apt-get install\n"
-            "  nvidia-cuda-toolkit` for you (~2 GB, 2-5 min).\n"
-            "FIX (Colab GPU runtime / hardware with installed CUDA):\n"
-            "  Switch to a GPU runtime (Runtime → Change runtime type → GPU);\n"
-            "  nvcc is preinstalled at /usr/local/cuda/bin/nvcc.\n"
-            "FIX (manual install):\n"
-            "  sudo apt-get install nvidia-cuda-toolkit             # Debian/Ubuntu\n"
-            "  conda install -c nvidia cuda-nvcc cuda-runtime       # conda env\n"
-            "  https://developer.nvidia.com/cuda-downloads          # .run installer\n"
-            "NOTE: NVIDIA's PyPI wheels (nvidia-cuda-nvcc-cuXX) only ship\n"
-            "ptxas + headers + libnvvm — they do NOT include the nvcc driver\n"
-            "binary. apt/conda/.run-installer are the only sources for nvcc.\n"
+            "\n"
+            "AUTO-FIX: call build(..., bootstrap_cuda=True). This probes\n"
+            "conda / apt / dnf / yum / zypper / pacman / apk / brew / winget\n"
+            "in priority order and installs nvcc via whichever is available.\n"
+            "\n"
+            "MANUAL OPTIONS — pick the one that matches your environment:\n"
+            "  conda install -c nvidia cuda-nvcc cuda-runtime    # any OS, conda env\n"
+            "  sudo apt-get install nvidia-cuda-toolkit          # Debian / Ubuntu / Colab\n"
+            "  sudo dnf install cuda                             # Fedora / RHEL 8+ (NVIDIA repo)\n"
+            "  sudo yum install cuda                             # RHEL / CentOS 7\n"
+            "  sudo zypper install cuda                          # openSUSE / SLES\n"
+            "  sudo pacman -S cuda                               # Arch / Manjaro\n"
+            "  sudo apk add cuda                                 # Alpine Linux\n"
+            "  winget install Nvidia.CUDA                        # Windows 10+\n"
+            "  https://developer.nvidia.com/cuda-downloads       # official .run installer\n"
+            "\n"
+            "NOTE: NVIDIA's PyPI wheels (nvidia-cuda-nvcc-cuXX) ship ptxas,\n"
+            "libnvvm, libcudart, and headers — but NOT the nvcc compiler\n"
+            "driver. Use one of the above to get nvcc.\n"
+            "\n"
             "Re-run with debug=True to see the [preflight] / [CUDA_HOME probe]\n"
             "blocks that show exactly what compile.py searched."
         )
     if ARCH_INFO[arch]["vendor"] == "hip" and not shutil.which("hipcc"):
         raise RuntimeError(
-            "hipcc not found on PATH. Install ROCm ≥ 6.0 and set "
-            "os.environ['ROCM_PATH'] = '/opt/rocm' (or wherever ROCm lives), "
-            "then prepend $ROCM_PATH/bin to PATH."
+            "hipcc not found on PATH. ROCm install — pick the one matching\n"
+            "your environment:\n"
+            "  sudo apt-get install rocm-hip-sdk                 # Debian / Ubuntu\n"
+            "  sudo dnf install rocm-hip-devel                   # Fedora / RHEL\n"
+            "  sudo zypper install rocm-hip                      # openSUSE\n"
+            "  sudo pacman -S rocm-hip-sdk                       # Arch\n"
+            "  https://rocm.docs.amd.com/projects/install-on-linux/\n"
+            "Then set os.environ['ROCM_PATH'] = '/opt/rocm' (or wherever it\n"
+            "lives) and prepend $ROCM_PATH/bin to PATH."
         )
 
     if debug:
