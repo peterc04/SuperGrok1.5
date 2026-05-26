@@ -125,11 +125,13 @@ Importable::
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime
 import hashlib
 import json
 import os
 import platform
+import queue
 import shutil
 import subprocess
 import sys
@@ -3030,16 +3032,22 @@ class TimingWorker:
 
 
 class MultiGPUTimingPool:
-    """Fan a JIT autotune sweep across every visible GPU.
+    """Fan a JIT autotune sweep across every visible GPU via work-stealing.
 
     When ``CUDA_VISIBLE_DEVICES`` (or ``HIP_VISIBLE_DEVICES`` for HIP)
     enumerates more than one device, this pool spawns one
     :class:`TimingWorker` per device with that device pinned via
-    ``*_VISIBLE_DEVICES`` in the worker's env overlay. Round-robin
-    ``time(...)`` calls distribute variants across workers so all GPUs
-    stay busy. The public surface is the same as ``TimingWorker.time`` /
-    ``start`` / ``stop`` / ``alive`` so callers can swap one for the
-    other.
+    ``*_VISIBLE_DEVICES`` in the worker's env overlay.
+
+    Dispatch model: each worker has a dedicated dispatcher thread that
+    pulls items off a shared ``queue.Queue``. A fast worker that finishes
+    early grabs the next pending item ahead of a slow sibling — no
+    round-robin starvation. Items submitted to a dead worker are bounced
+    back onto the queue for a live sibling to pick up.
+
+    The public surface (``start`` / ``stop`` / ``alive`` / ``time(variant_so)``)
+    matches :class:`TimingWorker` so callers can swap one for the other.
+    Multiple producer threads may call ``time()`` concurrently.
     """
 
     _CUDA = "CUDA_VISIBLE_DEVICES"
@@ -3071,18 +3079,27 @@ class MultiGPUTimingPool:
                 **worker_kwargs,
             )
             self.workers.append(w)
-        self._rr = 0
-        self._rr_lock = threading.Lock()
+        # Work-stealing dispatch plumbing — set up lazily in start() so
+        # that workers that failed to spawn are dropped from the
+        # dispatcher rotation before any threads are launched.
+        self._queue: "queue.Queue" = queue.Queue()
+        self._stopped = threading.Event()
+        self._dispatch_threads: List[threading.Thread] = []
+        self._started = False
 
     # ---- lifecycle mirroring TimingWorker ----------------------------
 
     def start(self) -> bool:
-        """Start every per-device worker. Returns True iff all came up.
+        """Start every per-device worker. Returns True iff at least one
+        came up.
 
         Failed workers are dropped from the rotation but the pool is
         still considered usable as long as ≥1 worker is alive — matches
         the existing ``TimingWorker`` fallback semantics in
-        ``_make_variant_timer``."""
+        ``_make_variant_timer``. After workers are up, spawn one
+        dispatcher thread per live worker that pulls from the shared
+        work queue (work-stealing).
+        """
         any_ok = False
         live: List[TimingWorker] = []
         for w in self.workers:
@@ -3090,12 +3107,43 @@ class MultiGPUTimingPool:
                 live.append(w)
                 any_ok = True
         self.workers = live
+        self._spawn_dispatchers()
+        self._started = True
         return any_ok
+
+    def _spawn_dispatchers(self) -> None:
+        """Start one dispatcher thread per live worker (idempotent)."""
+        if self._dispatch_threads:
+            return
+        for idx, w in enumerate(self.workers):
+            name = f"MultiGPUPool-dispatch-{idx}-{self.devices[idx] if idx < len(self.devices) else idx}"
+            t = threading.Thread(
+                target=self._dispatch_loop,
+                args=(idx, w),
+                daemon=True,
+                name=name,
+            )
+            t.start()
+            self._dispatch_threads.append(t)
 
     def alive(self) -> bool:
         return any(w.alive() for w in self.workers)
 
     def stop(self) -> None:
+        # Signal dispatchers to drain & exit, then enqueue one sentinel
+        # per dispatcher so each loop wakes up from its blocking ``get()``.
+        self._stopped.set()
+        for _ in self._dispatch_threads:
+            try:
+                self._queue.put(None)
+            except Exception:
+                pass
+        for t in self._dispatch_threads:
+            try:
+                t.join(timeout=5.0)
+            except Exception:
+                pass
+        self._dispatch_threads = []
         for w in self.workers:
             try:
                 w.stop()
@@ -3112,23 +3160,92 @@ class MultiGPUTimingPool:
                 pass
         return any_ok
 
+    # ---- work-stealing dispatcher -----------------------------------
+
+    def _dispatch_loop(self, idx: int, worker: Any) -> None:
+        """Per-worker thread: pull (payload, future) tuples off the
+        shared queue, run them on ``worker``, fulfil the future.
+
+        If the assigned worker is dead, re-enqueue the item so a live
+        sibling can grab it, then briefly yield. A ``None`` sentinel
+        exits the loop (drain-on-shutdown).
+        """
+        while not self._stopped.is_set():
+            try:
+                item = self._queue.get()
+            except Exception:
+                return
+            if item is None:
+                # Sentinel: graceful shutdown.
+                try:
+                    self._queue.task_done()
+                except Exception:
+                    pass
+                return
+            payload, fut = item
+            try:
+                if not worker.alive():
+                    # Bounce the item back so a sibling can pick it up.
+                    # If we're the last one standing, fail the future
+                    # rather than busy-looping forever.
+                    live_siblings = sum(
+                        1 for w in self.workers
+                        if w is not worker and w.alive()
+                    )
+                    if live_siblings == 0:
+                        fut.set_exception(
+                            RuntimeError(
+                                "MultiGPUTimingPool: no live workers"))
+                    else:
+                        self._queue.put(item)
+                        time.sleep(0.05)
+                    try:
+                        self._queue.task_done()
+                    except Exception:
+                        pass
+                    continue
+                variant_so, opt_class, kwargs = payload
+                # Real TimingWorker.time only takes variant_so (opt_class
+                # was bound at construction). Pass extras only when the
+                # caller supplied something, to keep both production and
+                # mock-worker test paths working.
+                if not opt_class and not kwargs:
+                    result = worker.time(variant_so)
+                else:
+                    result = worker.time(variant_so, opt_class, **kwargs)
+                fut.set_result(result)
+            except Exception as exc:  # noqa: BLE001 — propagate to caller
+                try:
+                    fut.set_exception(exc)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    self._queue.task_done()
+                except Exception:
+                    pass
+
     # ---- timing API mirroring TimingWorker ---------------------------
 
-    def time(self, variant_so: Path) -> Optional[Dict[str, Any]]:
-        # Pick the next live worker via round-robin. Skip dead workers
-        # so a wedge on one GPU doesn't stall the whole sweep.
-        n = len(self.workers)
-        if n == 0:
+    def time(self, variant_so: Path, opt_class: str = "", **kwargs):
+        """Enqueue a timing request and block until any dispatcher
+        returns a result. Thread-safe: multiple producer threads may
+        call ``time()`` concurrently — the queue serialises submissions
+        and the dispatchers steal work as they become idle.
+
+        Returns the dict from the underlying worker, ``None`` if the
+        worker reported a failure, or raises if no live worker remains.
+        """
+        if not self.workers:
             return None
-        with self._rr_lock:
-            start_idx = self._rr % n
-            self._rr += 1
-        for offset in range(n):
-            w = self.workers[(start_idx + offset) % n]
-            if not w.alive():
-                continue
-            return w.time(variant_so)
-        return None
+        # Lazy dispatcher spawn — supports callers that construct the
+        # pool and call .time() without an explicit .start() (e.g. tests
+        # that splice in mock workers via __new__).
+        if not self._dispatch_threads:
+            self._spawn_dispatchers()
+        fut: "concurrent.futures.Future" = concurrent.futures.Future()
+        self._queue.put(((variant_so, opt_class, kwargs), fut))
+        return fut.result()
 
     @property
     def error_log(self) -> list:
@@ -8718,6 +8835,72 @@ def _self_test() -> int:
     _run("visible_devices_multi", test_visible_devices_multi)
     _run("visible_devices_hip", test_visible_devices_hip)
     _run("pool_constructs_per_device_workers", test_pool_constructs_per_device_workers)
+
+    def test_work_stealing_fast_worker_dominates():
+        """Build a 2-worker pool with mock workers of different latencies.
+        Submit 10 jobs; assert fast worker handles >=6 of them and total
+        wall-clock is < (slow worker × number of jobs) ≈ no serialization."""
+
+        class _MockWorker:
+            def __init__(self, latency_s: float, name: str):
+                self.latency = latency_s
+                self.name = name
+                self.calls = 0
+                self._dead = False
+
+            def alive(self) -> bool:
+                return not self._dead
+
+            def time(self, variant_so, opt_class="", **kw):
+                self.calls += 1
+                time.sleep(self.latency)
+                return {"variant_so": str(variant_so),
+                        "median_ms": self.latency * 1000,
+                        "worker": self.name}
+
+            def stop(self):
+                self._dead = True
+
+        fast = _MockWorker(0.01, "fast")
+        slow = _MockWorker(0.10, "slow")
+
+        # Build a pool but skip the real TimingWorker spawn — splice mocks in.
+        pool = MultiGPUTimingPool.__new__(MultiGPUTimingPool)
+        pool.vendor = "cuda"
+        pool.devices = ["0", "1"]
+        pool.workers = [fast, slow]
+        pool._queue = queue.Queue()
+        pool._stopped = threading.Event()
+        pool._dispatch_threads = []
+        for idx, w in enumerate(pool.workers):
+            t = threading.Thread(
+                target=pool._dispatch_loop, args=(idx, w), daemon=True)
+            t.start()
+            pool._dispatch_threads.append(t)
+
+        t0 = time.time()
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            futs = [ex.submit(pool.time, Path(f"/tmp/variant_{i}.so"), "Adamw")
+                    for i in range(10)]
+            results = [f.result() for f in futs]
+        wall = time.time() - t0
+        pool.stop()
+
+        fast_calls = sum(1 for r in results if r["worker"] == "fast")
+        slow_calls = sum(1 for r in results if r["worker"] == "slow")
+        assert fast_calls + slow_calls == 10, (fast_calls, slow_calls)
+        assert fast_calls >= 6, (
+            f"work-stealing failed — fast={fast_calls} slow={slow_calls}; "
+            f"fast worker should drain the queue ahead of the slow one")
+        # Pure serialization would take 10*0.1=1.0s. Work-stealing should be
+        # bounded by ceil(10/2) * slow_latency = 5*0.1 = 0.5s — give us 2x
+        # slack for thread scheduling.
+        assert wall < 1.0, f"wall-clock {wall:.3f}s suggests serialization"
+        sys.stdout.write(
+            f"    (fast={fast_calls} slow={slow_calls} wall={wall:.3f}s)\n")
+
+    _run("multigpu_work_stealing", test_work_stealing_fast_worker_dominates)
 
     sys.stdout.write("[self-test] kernel_headers\n")
 
