@@ -88,6 +88,8 @@ PGO_STEPS       = 1000         # # of opt.step() calls during PGO collect
 DEBUG_SYMBOLS   = False        # -ggdb / -lineinfo (auto-on with profile)
 SEED            = 0            # Optuna sampler seed (reproducibility)
 PROFILE_AFTER   = True         # run ncu/rocprof/jax.profiler after final link
+BOOTSTRAP_CUDA  = True         # apt-get install nvidia-cuda-toolkit if nvcc
+                               # is missing (Colab CPU runtime, fresh CI host)
 
 # ─── TOOLCHAIN ENV — set BEFORE the grokking_optimizers import so torch's ─
 #     cpp_extension picks up CUDA_HOME / ROCM_HOME at its first import.    ─
@@ -120,6 +122,7 @@ so_path = build(
     profile=PROFILE_AFTER,
     debug_symbols=DEBUG_SYMBOLS,
     seed=SEED,
+    bootstrap_cuda=BOOTSTRAP_CUDA,    # auto-install nvcc if missing
     # search_space_path=Path("my_search_space.yaml"),    # use your own YAML
     # aot_only=True, aot_artifact_dir=Path("build/aot"), # CPU-host AOT only
     # jit_only=True,                                     # GPU-host JIT only
@@ -247,7 +250,8 @@ assert compile_main(["--self-test"]) == 0  # prints "[self-test] 18 passed, 0 fa
 | `ModuleNotFoundError: No module named 'grokking_optimizers'` | You're running Python from outside the cloned `SuperGrok1.5/` directory, or `sys.path` doesn't include it. Add `sys.path.insert(0, str(Path.cwd()))` (Step 3 block already does this) before any `from grokking_optimizers...` import — or point `REPO_ROOT` at the absolute path of the cloned repo. No `pip install -e .` required just to run `compile.py` / `profile.py`. |
 | `CUDA_HOME environment variable is not set` | `os.environ["CUDA_HOME"] = "/usr/local/cuda"` (Step 3 block already does this). Required even when `nvcc` is on `PATH`. |
 | `CUDA_HOME environment variable is not set` **but the debug banner shows it IS set** | Stale torch cache. `torch.utils.cpp_extension` reads `CUDA_HOME` at *its* import time; if torch was already loaded before you set the env var (common in Colab/Jupyter), the cached value is `None` and the build fails despite `os.environ` being correct. `build()` now calls `_refresh_torch_cuda_home()` on entry to patch the stale cache from `os.environ`. Pull the latest commit; this is fixed. |
-| `[preflight] WARNING: nvcc NOT found` (Colab) | You're on a Colab CPU runtime. There is no `nvcc` binary even though `/usr/local/cuda/` exists as a stub. Switch via *Runtime → Change runtime type → Hardware accelerator: GPU* and re-run. **Colab GPU runtimes are T4/L4/A100/V100 — none are sm_90 (Hopper)**, so the resulting `.so` won't load on the Colab GPU at runtime, but the AOT compile + autotune will succeed and produce a valid sm_90 artefact for Hopper deployment. |
+| `[preflight] WARNING: nvcc NOT found` (Colab CPU runtime) | Pass `bootstrap_cuda=True` to `build()` — it runs `apt-get install nvidia-cuda-toolkit` for you (~2 GB, 2-5 min). Alternatively, switch to a Colab GPU runtime (*Runtime → Change runtime type → Hardware accelerator: GPU*) where nvcc is preinstalled. **Colab GPU runtimes are T4/L4/A100/V100 — none are sm_90 (Hopper)** — but the AOT compile + autotune still produces a valid sm_90 artefact for Hopper deployment, it just won't load on the Colab GPU at runtime. |
+| `nvidia-cuda-nvcc-cuXX wheels installed but nvcc still not findable` | NVIDIA's PyPI wheels ship `ptxas + libnvvm + headers` but NOT the `nvcc` compiler driver itself. The driver only comes from `apt-get install nvidia-cuda-toolkit`, conda's `cuda-nvcc`, or the official `.run` installer from `developer.nvidia.com/cuda-downloads`. `bootstrap_cuda=True` already prefers apt and only falls back to wheels for the headers/libs. |
 | `[build FAILED]` and the report shows the full traceback but I can't tell what's wrong | The traceback's deepest frame points at the actual torch/cpp_extension failure. Below that, the report dumps the `build.ninja`, `.ninja_log`, and a direct `ninja -C <build_dir> -v` stderr capture. Search the report for `error:`/`fatal error:` to find the real compiler diagnostic. |
 | `No supported GPU backend detected` from setup.py | `env["FORCE_CUDA"] = "1"` before the `pip install -e .` subprocess. |
 | `nvcc not on PATH; skipping version-gated flags` in the streamed report | Install CUDA Toolkit ≥ 12.0 and prepend `$CUDA_HOME/bin` to `PATH`. Build still runs but won't auto-add `--split-compile`. |

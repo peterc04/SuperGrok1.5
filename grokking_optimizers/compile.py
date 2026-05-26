@@ -1827,11 +1827,18 @@ class BuildSpec:
 def _ensure_nvcc_on_path() -> Optional[str]:
     """Locate nvcc and prepend its directory to PATH if it's missing.
 
-    Handles the common case where CUDA is installed under a versioned
-    directory (e.g. ``/usr/local/cuda-12.2/``) and the user only added
-    the bare ``/usr/local/cuda/bin`` to PATH. Also fixes the case where
-    ``CUDA_HOME`` is unset but nvcc IS at a discoverable location.
-    Returns the resolved nvcc path, or None if nothing was found.
+    Searches in priority order:
+      1. PATH (already there)
+      2. $CUDA_HOME/bin/nvcc, $CUDA_PATH/bin/nvcc
+      3. Standard system locations: /usr/local/cuda/bin, /opt/cuda/bin
+      4. Versioned dirs: /usr/local/cuda-<ver>/bin (sorted newest first)
+      5. **NVIDIA PyPI wheels**: <site-packages>/nvidia/cuda_nvcc/bin/nvcc
+         (this is the only nvcc available on Colab CPU runtimes after
+         ``pip install nvidia-cuda-nvcc-cu12``)
+
+    When found, prepends the bin dir to PATH and sets CUDA_HOME (and
+    ``LD_LIBRARY_PATH`` for the wheel-install case where libcudart is
+    in a sibling directory). Returns the resolved nvcc path or None.
     """
     if shutil.which("nvcc"):
         return shutil.which("nvcc")
@@ -1850,6 +1857,26 @@ def _ensure_nvcc_on_path() -> Optional[str]:
                         candidates.append(child / "bin" / "nvcc")
             except (OSError, PermissionError):
                 pass
+    # NVIDIA PyPI wheels — the rescue path for Colab CPU runtimes.
+    try:
+        import site
+        site_dirs: List[Path] = []
+        for getter in (site.getsitepackages, site.getusersitepackages):
+            try:
+                got = getter()
+                if isinstance(got, str):
+                    site_dirs.append(Path(got))
+                else:
+                    site_dirs.extend(Path(p) for p in got)
+            except Exception:
+                pass
+        for sd in site_dirs:
+            for cuda_pkg in ("cuda_nvcc", "cuda-nvcc"):
+                nvcc_p = sd / "nvidia" / cuda_pkg / "bin" / "nvcc"
+                candidates.append(nvcc_p)
+    except Exception:
+        pass
+
     for nvcc in candidates:
         try:
             if nvcc.is_file() and os.access(nvcc, os.X_OK):
@@ -1859,11 +1886,137 @@ def _ensure_nvcc_on_path() -> Optional[str]:
                     os.environ["PATH"] = f"{nvcc_dir}{os.pathsep}{current_path}"
                 if not os.environ.get("CUDA_HOME"):
                     os.environ["CUDA_HOME"] = str(nvcc.parent.parent)
+                # For PyPI wheels, libcudart lives in a sibling nvidia/cuda_runtime
+                # directory; make sure LD_LIBRARY_PATH and CUDA_HOME's lib64
+                # discovery work.
+                if "nvidia" in nvcc.parts:
+                    nvidia_root = nvcc.parents[2]  # <site>/nvidia
+                    lib_dirs = []
+                    for pkg in ("cuda_runtime", "cuda_cudart", "cuda_nvrtc",
+                                "cuda_cccl"):
+                        ld = nvidia_root / pkg / "lib"
+                        if ld.is_dir():
+                            lib_dirs.append(str(ld))
+                    if lib_dirs:
+                        existing = os.environ.get("LD_LIBRARY_PATH", "")
+                        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(
+                            lib_dirs + ([existing] if existing else []))
                 sys.stderr.write(f"[compile] discovered nvcc at {nvcc}\n")
                 return str(nvcc)
         except (OSError, PermissionError):
             continue
     return None
+
+
+def bootstrap_cuda_toolkit(stream=None) -> bool:
+    """Install the CUDA toolkit (nvcc + runtime + headers) on demand.
+
+    Use this when you're on a Colab CPU runtime, a fresh CI worker, or
+    any machine without a system CUDA install. Returns True on success.
+
+    Strategy:
+      1. apt-get install nvidia-cuda-toolkit (Debian/Ubuntu — works on
+         Colab CPU runtimes). This is the only path that actually
+         supplies the nvcc driver binary; the NVIDIA PyPI wheels ship
+         ptxas + headers + libnvvm but NOT nvcc itself.
+      2. Fall back to NVIDIA PyPI wheels (provides headers + ptxas +
+         runtime) — useful for runtimes where apt isn't available, but
+         requires the user to obtain nvcc separately.
+
+    Pulls ~2 GB and takes 2-5 minutes on a typical Colab CPU runtime.
+    """
+    if stream is None:
+        stream = sys.stderr
+    if shutil.which("nvcc") or _ensure_nvcc_on_path():
+        stream.write("[bootstrap] nvcc already available; skipping install\n")
+        return True
+
+    # Path 1: apt-get install nvidia-cuda-toolkit (this DOES ship nvcc).
+    apt = shutil.which("apt-get") or shutil.which("apt")
+    if apt:
+        stream.write("[bootstrap] installing nvidia-cuda-toolkit via apt "
+                     "(this will take a few minutes and pull ~2 GB)\n")
+        stream.flush()
+        # `sudo` is optional — Colab runs as root.
+        sudo_prefix = [] if os.geteuid() == 0 else (
+            [shutil.which("sudo") or "sudo"] if shutil.which("sudo") else [])
+        env = os.environ.copy()
+        env["DEBIAN_FRONTEND"] = "noninteractive"
+        try:
+            rc = subprocess.call(sudo_prefix + [apt, "update", "-qq"], env=env)
+            if rc == 0:
+                rc = subprocess.call(
+                    sudo_prefix + [apt, "install", "-y", "-qq",
+                                   "nvidia-cuda-toolkit"],
+                    env=env)
+        except FileNotFoundError as e:
+            rc = -1
+            stream.write(f"[bootstrap] apt invocation FAILED: {e}\n")
+        if rc == 0:
+            found = _ensure_nvcc_on_path()
+            if found:
+                _refresh_torch_cuda_home()
+                stream.write(f"[bootstrap] OK (apt) — nvcc at {found}\n")
+                return True
+            stream.write("[bootstrap] apt install succeeded but nvcc still "
+                         "not findable. Common locations:\n"
+                         "  /usr/bin/nvcc  /usr/local/cuda/bin/nvcc\n")
+        else:
+            stream.write(f"[bootstrap] apt install FAILED (rc={rc}); "
+                         "trying PyPI wheels as a partial fallback\n")
+
+    # Path 2: NVIDIA PyPI wheels (does NOT provide nvcc; only ptxas +
+    # libs + headers). Install them anyway so torch.utils.cpp_extension
+    # can find libcudart and the headers even if nvcc had to be installed
+    # separately.
+    preferred = "cu12"
+    try:
+        import torch
+        v = (torch.version.cuda or "").strip()
+        if v.startswith("13"):
+            preferred = "cu13"
+        elif v.startswith("12"):
+            preferred = "cu12"
+        elif v.startswith("11"):
+            preferred = "cu11"
+    except Exception:
+        pass
+    ordered: List[str] = []
+    for tag in (preferred, "cu12", "cu11"):
+        if tag not in ordered:
+            ordered.append(tag)
+    for cu_tag in ordered:
+        pkgs = [
+            f"nvidia-cuda-nvcc-{cu_tag}",
+            f"nvidia-cuda-runtime-{cu_tag}",
+            f"nvidia-cuda-cccl-{cu_tag}",
+            f"nvidia-cuda-nvrtc-{cu_tag}",
+        ]
+        stream.write(f"[bootstrap] trying NVIDIA PyPI wheels ({cu_tag}): "
+                     "ptxas + libs + headers (no nvcc binary)\n")
+        stream.flush()
+        rc = subprocess.call([sys.executable, "-m", "pip", "install", "-q",
+                              *pkgs])
+        if rc == 0:
+            found = _ensure_nvcc_on_path()
+            if found:
+                _refresh_torch_cuda_home()
+                stream.write(f"[bootstrap] OK (wheels {cu_tag}) — nvcc at {found}\n")
+                return True
+            stream.write(f"[bootstrap] {cu_tag} wheels installed (ptxas + "
+                         "libs + headers) but no nvcc driver. NVIDIA's PyPI "
+                         "wheels don't ship the nvcc binary — only apt/conda "
+                         "or the official .run installer do.\n")
+            break
+    stream.write(
+        "\n[bootstrap] FAILED to obtain nvcc. Manual install options:\n"
+        "  Colab CPU runtime: switch to a GPU runtime (Runtime → Change\n"
+        "    runtime type → Hardware accelerator: GPU). nvcc is preinstalled.\n"
+        "  Ubuntu/Debian:     sudo apt-get install nvidia-cuda-toolkit\n"
+        "  Conda env:         conda install -c nvidia cuda-nvcc cuda-runtime\n"
+        "  NVIDIA installer:  https://developer.nvidia.com/cuda-downloads\n"
+    )
+    return False
 
 
 def _refresh_torch_cuda_home() -> None:
@@ -3125,6 +3278,7 @@ def build(
     seed: int = 0,
     debug_symbols: bool = False,
     debug: bool = False,
+    bootstrap_cuda: bool = False,
     pruner: str = "none",
     transfer_learning: bool = False,
 ) -> Optional[Path]:
@@ -3143,12 +3297,46 @@ def build(
         runtime = "jit"
 
     # Discover nvcc on the filesystem if it's not on PATH (common when
-    # CUDA lives at /usr/local/cuda-<ver>/ and the user only added the
-    # bare /usr/local/cuda/bin to PATH). Auto-prepends the found dir.
+    # CUDA lives at /usr/local/cuda-<ver>/, in a pip-installed nvidia
+    # wheel, or under the bare /usr/local/cuda/bin the user added).
     _ensure_nvcc_on_path()
+    # On-demand: pip-install the NVIDIA wheels if nvcc is still missing
+    # and the caller opted in. Handles Colab CPU runtimes, fresh CI, etc.
+    if bootstrap_cuda and ARCH_INFO[arch]["vendor"] == "cuda":
+        if not shutil.which("nvcc"):
+            bootstrap_cuda_toolkit()
     # Force torch to re-read CUDA_HOME / ROCM_HOME from os.environ even if
     # it was imported (and cached None) before the user set the env vars.
     _refresh_torch_cuda_home()
+
+    # Hard pre-flight: if we're targeting a C++-compiled arch and the
+    # toolchain is genuinely missing, fail loudly NOW with the install
+    # recipe instead of letting ninja produce a confusing exit-127 error.
+    if ARCH_INFO[arch]["vendor"] == "cuda" and not shutil.which("nvcc"):
+        raise RuntimeError(
+            "nvcc not found on PATH and could not be auto-discovered.\n"
+            "FIX (Colab CPU runtime or any Debian/Ubuntu without CUDA):\n"
+            "  Call build(..., bootstrap_cuda=True) — runs `apt-get install\n"
+            "  nvidia-cuda-toolkit` for you (~2 GB, 2-5 min).\n"
+            "FIX (Colab GPU runtime / hardware with installed CUDA):\n"
+            "  Switch to a GPU runtime (Runtime → Change runtime type → GPU);\n"
+            "  nvcc is preinstalled at /usr/local/cuda/bin/nvcc.\n"
+            "FIX (manual install):\n"
+            "  sudo apt-get install nvidia-cuda-toolkit             # Debian/Ubuntu\n"
+            "  conda install -c nvidia cuda-nvcc cuda-runtime       # conda env\n"
+            "  https://developer.nvidia.com/cuda-downloads          # .run installer\n"
+            "NOTE: NVIDIA's PyPI wheels (nvidia-cuda-nvcc-cuXX) only ship\n"
+            "ptxas + headers + libnvvm — they do NOT include the nvcc driver\n"
+            "binary. apt/conda/.run-installer are the only sources for nvcc.\n"
+            "Re-run with debug=True to see the [preflight] / [CUDA_HOME probe]\n"
+            "blocks that show exactly what compile.py searched."
+        )
+    if ARCH_INFO[arch]["vendor"] == "hip" and not shutil.which("hipcc"):
+        raise RuntimeError(
+            "hipcc not found on PATH. Install ROCm ≥ 6.0 and set "
+            "os.environ['ROCM_PATH'] = '/opt/rocm' (or wherever ROCm lives), "
+            "then prepend $ROCM_PATH/bin to PATH."
+        )
 
     if debug:
         verbose = True
@@ -3402,6 +3590,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "time, force --verbose, print every spawned "
                              "subprocess + every nvcc/g++/hipcc invocation, "
                              "and emit per-phase banners with timestamps.")
+    parser.add_argument("--bootstrap-cuda", action="store_true",
+                        help="If nvcc isn't found after probing the usual "
+                             "locations, pip-install the NVIDIA CUDA toolkit "
+                             "wheels (nvcc + runtime + CCCL + NVRTC) and "
+                             "retry. Use this on Colab CPU runtimes or any "
+                             "fresh host without a system CUDA install.")
     args = parser.parse_args(argv)
     if args.debug:
         args.verbose = True
@@ -3417,6 +3611,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # ── Runtime split: spawn AOT then JIT, then return ──────────────
     if args.runtime == "both":
+        # Do the (possibly slow) CUDA toolkit bootstrap ONCE in the
+        # parent so AOT and JIT subprocesses inherit the discovered
+        # nvcc via PATH/CUDA_HOME — no per-subprocess re-install.
+        if args.bootstrap_cuda and ARCH_INFO[args.arch]["vendor"] == "cuda":
+            if not shutil.which("nvcc"):
+                _ensure_nvcc_on_path() or bootstrap_cuda_toolkit()
         argv_in = list(argv) if argv is not None else sys.argv[1:]
         rc_aot = _spawn_phase(argv_in, "aot")
         if rc_aot != 0:
@@ -3452,6 +3652,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         seed=args.seed,
         debug_symbols=args.debug_symbols,
         debug=args.debug,
+        bootstrap_cuda=args.bootstrap_cuda,
         pruner=args.pruner,
         transfer_learning=args.transfer_learning,
     )
