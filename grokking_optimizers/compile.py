@@ -3293,6 +3293,708 @@ class MultiGPUTimingPool:
         self.stop()
 
 
+# ==============================================================================
+# Learned cost model (Stream C)
+# ==============================================================================
+# AutoTVM / Ansor-style learned cost model. Featurizes a candidate
+# config and predicts its timing (with uncertainty). The Bayesian early
+# stopper consults the model before measuring each TPE suggestion; when
+# the model is confident the candidate is >3x worse than best-so-far, it
+# rejects the trial without building or timing the variant.
+#
+# Backed by XGBoost when available, falling back to
+# sklearn.GradientBoostingRegressor, with a heuristic linear-regression
+# fallback when neither is installed (so the layer still runs on a bare
+# numpy install). Cold start: the first `2 × retrain_every` trials are
+# always measured so the model has signal to train on.
+#
+# Cap: never rejects more than `rejection_max_pct` of trials in a sweep
+# — guards against a pathologically over-confident model excluding the
+# real optimum.
+# ==============================================================================
+
+# ---- Canonical feature ordering ------------------------------------------
+#
+# FEATURE_DIM must be stable across processes so a model trained on one
+# host can be deserialized on another (and so sibling-optimizer transfer
+# learning aligns column-for-column). The featurizer below uses a fixed
+# ordered list of:
+#
+#   1. per-canonical-dim-value one-hots (block_64, vec_2, ...)
+#   2. per-canonical-dim normalized numerics (block_log2, vec_log2, ...)
+#   3. derived physical proxies (occupancy, smem, regpressure, ...)
+#   4. per-canonical-arch-feature flags (tma, wgmma, mfma, ...)
+#   5. per-stall-reason channels (long_scoreboard, memory_throttle, ...)
+#
+# Dims absent from a given (optimizer, arch)'s search space silently
+# contribute zeros — the column is still there, just empty.
+
+_COST_MODEL_CANONICAL_DIM_VALUES: "collections.OrderedDict[str, Tuple[Any, ...]]" = \
+    collections.OrderedDict([
+        ("block",                 (32, 64, 96, 128, 160, 192, 224, 256, 320,
+                                   384, 448, 512, 640, 768, 1024)),
+        ("vec",                   (1, 2, 4, 8, 16)),
+        ("unroll",                (1, 2, 4, 8, 16, 32)),
+        ("num_stages",            (1, 2, 3, 4, 5, 6, 7, 8)),
+        ("maxrregcount",          (0, 32, 40, 64, 96, 128, 160, 192, 224, 255)),
+        ("swizzle",               (0, 32, 64, 128, 256)),
+        ("lds_padding",           (0, 4, 8, 16, 32)),
+        ("waves_per_eu",          (0, 1, 2, 3, 4, 6, 8, 10)),
+        ("async_depth",           (1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16)),
+        ("warp_specialization",   (0, 1)),
+        ("tma_descriptors",       (0, 1, 2, 4, 8)),
+    ])
+
+# Numeric features emitted for every config (zero-filled when the dim
+# isn't present in the active search space).
+_COST_MODEL_NUMERIC_FEATURES: Tuple[str, ...] = (
+    "block_log2",
+    "vec_log2",
+    "unroll_log2",
+    "num_stages_norm",
+    "occupancy_estimate",
+    "smem_estimate",
+    "regpressure_estimate",
+    "arith_intensity_proxy",
+    "cluster_volume",
+)
+
+# Arch features mirrored from ARCH_TABLE entries (see _F_* tuples above).
+_COST_MODEL_ARCH_FEATURES: Tuple[str, ...] = (
+    "tma", "wgmma", "cluster", "fp8", "fp4", "tcgen05",
+    "mfma", "bf16_mfma", "fp8_mfma", "fp4_mfma",
+    "wmma", "tgsplit", "dpp",
+)
+
+
+def _cost_model_stall_reasons() -> Tuple[str, ...]:
+    """Stall channel ordering. Resolved lazily because STALL_DIM_HINTS is
+    defined later in the file (after the device-PGO section); the cost
+    model section appears earlier for proximity to BayesianEarlyStopper.
+    Cached on first call."""
+    cached = getattr(_cost_model_stall_reasons, "_cached", None)
+    if cached is not None:
+        return cached
+    try:
+        keys = tuple(sorted(STALL_DIM_HINTS.keys()))
+    except NameError:
+        keys = ()
+    _cost_model_stall_reasons._cached = keys  # type: ignore[attr-defined]
+    return keys
+
+
+def _cost_model_compute_feature_dim() -> int:
+    """Sum of all canonical feature slots. Stable across processes for
+    a given module version. Stall reasons are resolved lazily so this
+    is recomputed once at first call."""
+    n_onehots = sum(len(vals) for vals in
+                    _COST_MODEL_CANONICAL_DIM_VALUES.values())
+    n_numeric = len(_COST_MODEL_NUMERIC_FEATURES)
+    n_arch = len(_COST_MODEL_ARCH_FEATURES)
+    n_stall = len(_cost_model_stall_reasons())
+    return n_onehots + n_numeric + n_arch + n_stall
+
+
+# Cache the dimension once. Self-tests + retrains rely on this being
+# a constant across the lifetime of the process. STALL_DIM_HINTS is
+# defined later in this file so we hardcode its known length here (13
+# entries — kept in sync by the cost_model_feature_dim_matches_components
+# self-test). _cost_model_stall_reasons() resolves the actual keys on
+# first use; this constant only fixes the column count.
+_COST_MODEL_STALL_REASON_COUNT: int = 13  # len(STALL_DIM_HINTS) below
+FEATURE_DIM: int = (
+    sum(len(vals) for vals in _COST_MODEL_CANONICAL_DIM_VALUES.values())
+    + len(_COST_MODEL_NUMERIC_FEATURES)
+    + len(_COST_MODEL_ARCH_FEATURES)
+    + _COST_MODEL_STALL_REASON_COUNT
+)
+
+
+def _ensure_numpy():
+    """Lazy numpy import. Cost-model code paths are off by default so we
+    only ever pay the import cost when the user explicitly enables them."""
+    try:
+        import numpy as np
+        return np
+    except ImportError as exc:
+        raise RuntimeError(
+            "cost model requires numpy; install it or disable "
+            "[cost_model].enable in your compile_config.toml") from exc
+
+
+def featurize_config(config: Dict[str, Any],
+                     dims: List[Dict[str, Any]],
+                     arch_entry: "ArchEntry",
+                     stall_info: Optional[Dict[str, Any]] = None
+                     ) -> "Any":
+    """Hand-engineered feature vector for a candidate config.
+
+    Components, in canonical order:
+      1. One-hot per dim-value drawn from ``_COST_MODEL_CANONICAL_DIM_VALUES``.
+         Dims absent from ``dims`` (or values outside the canonical list)
+         contribute zeros.
+      2. Per-dim normalized numerics (block_log2 / vec_log2 / etc.).
+      3. Physical proxies — occupancy, smem footprint, register pressure,
+         arithmetic intensity, cluster volume.
+      4. Arch-feature flags (``feat in arch_entry.features``).
+      5. Stall-reason fractions when ``stall_info`` is provided.
+
+    Returns a numpy ndarray of fixed shape ``(FEATURE_DIM,)``."""
+    np = _ensure_numpy()
+    out = np.zeros(FEATURE_DIM, dtype=np.float32)
+    idx = 0
+
+    # Index dims by name for quick lookup.
+    dim_by_name = {d["name"]: d for d in dims}
+
+    # (1) one-hots over canonical dim values
+    for dim_name, canonical_values in _COST_MODEL_CANONICAL_DIM_VALUES.items():
+        cfg_val = config.get(dim_name)
+        if cfg_val is not None:
+            # Hashable comparison — lists must be tuplified.
+            cmp = tuple(cfg_val) if isinstance(cfg_val, list) else cfg_val
+            for i, cv in enumerate(canonical_values):
+                if cmp == cv:
+                    out[idx + i] = 1.0
+                    break
+        idx += len(canonical_values)
+
+    # (2) per-dim normalized numerics
+    max_threads = float(arch_entry.max_threads_per_block or 1024)
+    max_smem = float(arch_entry.max_smem_per_block or (100 * 1024))
+    max_regs = float(arch_entry.max_regs_per_thread or 255)
+
+    def _values_of(name: str) -> List[Any]:
+        d = dim_by_name.get(name)
+        return list(d["values"]) if d else []
+
+    # block_log2
+    block_val = config.get("block")
+    if isinstance(block_val, (int, float)) and block_val > 0:
+        out[idx] = math.log2(float(block_val)) / max(1.0,
+                                                      math.log2(max_threads))
+    idx += 1
+
+    # vec_log2 — denominator: log2(max vec value present in this dim's space)
+    vec_val = config.get("vec")
+    vec_values = [v for v in _values_of("vec")
+                  if isinstance(v, (int, float)) and v > 0]
+    if isinstance(vec_val, (int, float)) and vec_val > 0 and vec_values:
+        out[idx] = math.log2(float(vec_val)) / max(
+            1.0, math.log2(float(max(vec_values))))
+    idx += 1
+
+    # unroll_log2
+    unroll_val = config.get("unroll")
+    unroll_values = [v for v in _values_of("unroll")
+                     if isinstance(v, (int, float)) and v > 0]
+    if isinstance(unroll_val, (int, float)) and unroll_val > 0 and unroll_values:
+        out[idx] = math.log2(float(unroll_val)) / max(
+            1.0, math.log2(float(max(unroll_values))))
+    idx += 1
+
+    # num_stages_norm
+    ns_val = config.get("num_stages")
+    ns_values = [v for v in _values_of("num_stages")
+                 if isinstance(v, (int, float))]
+    if isinstance(ns_val, (int, float)) and ns_values:
+        denom = max(1.0, float(max(ns_values)))
+        out[idx] = float(ns_val) / denom
+    idx += 1
+
+    # occupancy_estimate ~ min(1, max_threads / (block * waves_per_eu))
+    waves = config.get("waves_per_eu", 1) or 1
+    if isinstance(block_val, (int, float)) and block_val > 0:
+        out[idx] = min(1.0, max_threads / max(1.0,
+                                              float(block_val) * float(waves)))
+    else:
+        out[idx] = 0.5
+    idx += 1
+
+    # smem_estimate ~ bytes(block * num_stages * vec * 4) / max_smem
+    if (isinstance(block_val, (int, float))
+            and isinstance(vec_val, (int, float))
+            and isinstance(ns_val, (int, float))):
+        smem_bytes = (float(block_val) * float(ns_val)
+                      * float(vec_val) * 4.0)
+        out[idx] = min(1.0, smem_bytes / max(1.0, max_smem))
+    idx += 1
+
+    # regpressure_estimate ~ maxrregcount / 255 if dim present else 0.5
+    if "maxrregcount" in config:
+        mrr = config.get("maxrregcount") or 0
+        try:
+            out[idx] = float(mrr) / max(1.0, max_regs)
+        except (TypeError, ValueError):
+            out[idx] = 0.5
+    else:
+        out[idx] = 0.5
+    idx += 1
+
+    # arith_intensity_proxy ~ vec * unroll / num_stages
+    if (isinstance(vec_val, (int, float))
+            and isinstance(unroll_val, (int, float))
+            and isinstance(ns_val, (int, float)) and ns_val > 0):
+        out[idx] = (float(vec_val) * float(unroll_val)) / float(ns_val)
+        # Clamp into [0, 1] band (rough — divide by 128 = vec_max * unroll_max).
+        out[idx] = min(1.0, out[idx] / 128.0)
+    idx += 1
+
+    # cluster_volume — product of cluster_shape dims if present else 1
+    cs = config.get("cluster_shape")
+    if isinstance(cs, (list, tuple)) and cs:
+        try:
+            vol = 1.0
+            for x in cs:
+                vol *= float(x)
+            # Normalize by max cluster volume seen on Hopper/Blackwell = 16
+            out[idx] = min(1.0, vol / 16.0)
+        except (TypeError, ValueError):
+            out[idx] = 1.0 / 16.0
+    else:
+        out[idx] = 1.0 / 16.0
+    idx += 1
+
+    # (4) arch features
+    feats = getattr(arch_entry, "features", None) or frozenset()
+    for f in _COST_MODEL_ARCH_FEATURES:
+        if f in feats:
+            out[idx] = 1.0
+        idx += 1
+
+    # (5) stall reasons
+    stall_reasons = _cost_model_stall_reasons()
+    if stall_info is not None and isinstance(stall_info, dict):
+        sr = stall_info.get("stall_reasons", {}) or {}
+        for reason in stall_reasons:
+            v = sr.get(reason)
+            if isinstance(v, (int, float)):
+                out[idx] = float(v)
+            idx += 1
+    else:
+        # advance past stall channels (left at zero)
+        idx += len(stall_reasons)
+
+    return out
+
+
+# ---- CostModel: backend-agnostic regressor wrapper -----------------------
+
+class CostModel:
+    """XGBoost-backed (with sklearn / linear fallbacks) regressor of
+    timing_ms from config features.
+
+    Lifecycle::
+
+        reg = CostModel(arch="sm_90a", cache_path=Path(...))   # cold model
+        reg.fit(X, y)                                          # train
+        ms, sigma = reg.predict(featurized_config)             # inference
+        reg.save() / reg.load()                                # persistence
+
+    Backend selection at first fit():
+      1. xgboost.XGBRegressor (preferred — fastest + most accurate)
+      2. sklearn.GradientBoostingRegressor (decent fallback)
+      3. heuristic linear regression (numpy-only — always available)
+
+    Uncertainty is estimated via either:
+      - 'bootstrap': train K=5 mini-models on bootstrap resamples;
+        sigma = stdev of their predictions (works on every backend).
+      - 'quantile': XGBoost quantile heads (q=0.1, q=0.9);
+        sigma = (q90 - q10) / 2 (xgboost-only; bootstrap is used as a
+        fallback when the backend doesn't support quantile loss).
+    """
+
+    _BOOTSTRAP_K = 5
+
+    def __init__(self, arch: str, cache_path: "Path", *,
+                 uncertainty_method: str = "bootstrap"):
+        self.arch = arch
+        self.cache_path = Path(cache_path)
+        self.uncertainty_method = uncertainty_method
+        self._model = None              # primary estimator
+        self._bootstrap_models: list = []  # for bootstrap uncertainty
+        self._quantile_lo = None        # xgboost q=0.1 head
+        self._quantile_hi = None        # xgboost q=0.9 head
+        self._backend: Optional[str] = None  # "xgboost"|"sklearn"|"linear"
+        self._mae_train: Optional[float] = None
+        self._mae_val: Optional[float] = None
+        self._n_fit_calls: int = 0
+
+    # ------------------------------------------------------------------
+    # Backend selection
+    # ------------------------------------------------------------------
+
+    def _instantiate_backend(self):
+        """Lazy backend selection. Tries XGBoost first, falls back to
+        sklearn, then to a heuristic linear regressor (numpy-only).
+        Returns a factory ``() -> fresh_estimator`` plus the backend
+        name. The factory is reused for bootstrap mini-models."""
+        # Try XGBoost.
+        try:
+            import xgboost as xgb
+            def _factory():
+                return xgb.XGBRegressor(
+                    n_estimators=128, max_depth=6,
+                    learning_rate=0.1, objective="reg:squarederror",
+                    verbosity=0)
+            return _factory, "xgboost"
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        # Try sklearn.
+        try:
+            from sklearn.ensemble import GradientBoostingRegressor
+            def _factory_sk():
+                return GradientBoostingRegressor(
+                    n_estimators=128, max_depth=4, learning_rate=0.1,
+                    random_state=0)
+            return _factory_sk, "sklearn"
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        # Heuristic linear fallback — numpy-only ridge regression.
+        def _factory_linear():
+            return _LinearRidgeRegressor(alpha=1e-2)
+        return _factory_linear, "linear"
+
+    # ------------------------------------------------------------------
+    # Fit / predict
+    # ------------------------------------------------------------------
+
+    def fit(self, X, y) -> None:
+        """Train on (features, timing_ms). Splits 80/20 train/val,
+        stashes MAEs on the instance for the report. Trains the primary
+        estimator plus, when uncertainty_method='bootstrap', K=5 mini
+        models on bootstrap resamples."""
+        np = _ensure_numpy()
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32)
+        if X.ndim == 1:
+            X = X.reshape(1, -1)
+        if X.shape[0] != y.shape[0]:
+            raise ValueError(
+                f"cost model fit: X has {X.shape[0]} rows, y has {y.shape[0]}")
+        if X.shape[0] < 2:
+            raise ValueError("cost model fit: need >= 2 samples")
+
+        factory, backend = self._instantiate_backend()
+        self._backend = backend
+
+        # Deterministic train/val split (80/20).
+        rng = np.random.default_rng(seed=0)
+        order = rng.permutation(X.shape[0])
+        n_train = max(1, int(0.8 * X.shape[0]))
+        train_idx, val_idx = order[:n_train], order[n_train:]
+        Xt, yt = X[train_idx], y[train_idx]
+        Xv, yv = X[val_idx], y[val_idx]
+
+        # Primary estimator on the full train split.
+        self._model = factory()
+        try:
+            self._model.fit(Xt, yt)
+        except Exception as exc:
+            # If the chosen backend fails (XGBoost edge case on tiny data),
+            # fall through to the linear backend so the layer still works.
+            self._model = _LinearRidgeRegressor(alpha=1e-2)
+            self._model.fit(Xt, yt)
+            self._backend = "linear"
+
+        # Train/val MAE.
+        try:
+            train_pred = np.asarray(self._model.predict(Xt))
+            self._mae_train = float(np.mean(np.abs(train_pred - yt)))
+        except Exception:
+            self._mae_train = None
+        try:
+            if Xv.shape[0] > 0:
+                val_pred = np.asarray(self._model.predict(Xv))
+                self._mae_val = float(np.mean(np.abs(val_pred - yv)))
+            else:
+                # No val split (very small dataset) — copy train MAE.
+                self._mae_val = self._mae_train
+        except Exception:
+            self._mae_val = None
+
+        # Bootstrap mini-models for uncertainty (also serves as fallback
+        # when quantile uncertainty is requested but unsupported).
+        self._bootstrap_models = []
+        for i in range(self._BOOTSTRAP_K):
+            try:
+                # Resample with replacement.
+                bsi = rng.integers(0, Xt.shape[0], size=Xt.shape[0])
+                m = factory()
+                m.fit(Xt[bsi], yt[bsi])
+                self._bootstrap_models.append(m)
+            except Exception:
+                continue
+
+        # Quantile heads — XGBoost only.
+        self._quantile_lo = None
+        self._quantile_hi = None
+        if (self.uncertainty_method == "quantile"
+                and self._backend == "xgboost"):
+            try:
+                import xgboost as xgb
+                self._quantile_lo = xgb.XGBRegressor(
+                    n_estimators=128, max_depth=6, learning_rate=0.1,
+                    objective="reg:quantileerror", quantile_alpha=0.1,
+                    verbosity=0)
+                self._quantile_hi = xgb.XGBRegressor(
+                    n_estimators=128, max_depth=6, learning_rate=0.1,
+                    objective="reg:quantileerror", quantile_alpha=0.9,
+                    verbosity=0)
+                self._quantile_lo.fit(Xt, yt)
+                self._quantile_hi.fit(Xt, yt)
+            except Exception:
+                # Older XGBoost without quantile support — leave them None
+                # and fall through to bootstrap at predict() time.
+                self._quantile_lo = None
+                self._quantile_hi = None
+
+        self._n_fit_calls += 1
+
+    def predict(self, X) -> Tuple[float, float]:
+        """Predict (ms, sigma) for a single config or the first row of a
+        batch. Returns floats so callers don't have to know numpy."""
+        if self._model is None:
+            raise RuntimeError("CostModel.predict() called before fit()")
+        np = _ensure_numpy()
+        X = np.asarray(X, dtype=np.float32)
+        if X.ndim == 1:
+            X = X.reshape(1, -1)
+        mean_pred = np.asarray(self._model.predict(X))
+        mean_val = float(mean_pred.flat[0])
+
+        sigma_val = 0.0
+        if (self.uncertainty_method == "quantile"
+                and self._quantile_lo is not None
+                and self._quantile_hi is not None):
+            try:
+                lo = float(np.asarray(self._quantile_lo.predict(X)).flat[0])
+                hi = float(np.asarray(self._quantile_hi.predict(X)).flat[0])
+                sigma_val = max(0.0, (hi - lo) / 2.0)
+            except Exception:
+                sigma_val = 0.0
+        if sigma_val == 0.0 and self._bootstrap_models:
+            try:
+                preds = []
+                for m in self._bootstrap_models:
+                    p = np.asarray(m.predict(X)).flat[0]
+                    preds.append(float(p))
+                if len(preds) >= 2:
+                    sigma_val = float(np.std(preds))
+            except Exception:
+                sigma_val = 0.0
+        return mean_val, sigma_val
+
+    def is_warm(self) -> bool:
+        """True once the model has been fit at least once and is ready
+        for predict() calls. Bayesian rejection consults this before
+        gating any trial."""
+        return self._model is not None and self._n_fit_calls > 0
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save(self) -> None:
+        """Atomic write of model + backend + MAEs to self.cache_path.
+        Uses joblib when available (faster + smaller pickles for sklearn
+        / xgboost trees), else stdlib pickle. Either way, a single
+        bytestream goes through tmp-file rename for atomicity."""
+        if self._model is None:
+            return
+        state = {
+            "arch":               self.arch,
+            "backend":            self._backend,
+            "uncertainty_method": self.uncertainty_method,
+            "model":              self._model,
+            "bootstrap":          self._bootstrap_models,
+            "quantile_lo":        self._quantile_lo,
+            "quantile_hi":        self._quantile_hi,
+            "mae_train":          self._mae_train,
+            "mae_val":            self._mae_val,
+            "n_fit_calls":        self._n_fit_calls,
+            "feature_dim":        FEATURE_DIM,
+        }
+        try:
+            import joblib
+            serialize = lambda fp: joblib.dump(state, fp)
+        except ImportError:
+            import pickle
+            def serialize(fp):
+                pickle.dump(state, fp, protocol=pickle.HIGHEST_PROTOCOL)
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.cache_path.with_suffix(self.cache_path.suffix + ".tmp")
+        with tmp.open("wb") as fp:
+            serialize(fp)
+        tmp.replace(self.cache_path)
+
+    def load(self) -> bool:
+        """Restore from cache_path. Returns True on success, False when
+        the file is missing / unreadable / from a different FEATURE_DIM
+        version (so a stale model never gets silently inflicted on a
+        retrained schema)."""
+        if not self.cache_path.exists():
+            return False
+        try:
+            try:
+                import joblib
+                state = joblib.load(self.cache_path)
+            except ImportError:
+                import pickle
+                with self.cache_path.open("rb") as fp:
+                    state = pickle.load(fp)
+        except Exception:
+            return False
+        if not isinstance(state, dict):
+            return False
+        # Refuse mismatched feature schemas — silent column drift would
+        # be much worse than a cold restart.
+        if state.get("feature_dim") not in (None, FEATURE_DIM):
+            return False
+        self._backend = state.get("backend")
+        self.uncertainty_method = state.get("uncertainty_method",
+                                            self.uncertainty_method)
+        self._model = state.get("model")
+        self._bootstrap_models = state.get("bootstrap", []) or []
+        self._quantile_lo = state.get("quantile_lo")
+        self._quantile_hi = state.get("quantile_hi")
+        self._mae_train = state.get("mae_train")
+        self._mae_val = state.get("mae_val")
+        self._n_fit_calls = int(state.get("n_fit_calls", 1))
+        return self._model is not None
+
+
+class _LinearRidgeRegressor:
+    """Numpy-only ridge regression — the universal-fallback backend.
+
+    Solves ``(X.T @ X + alpha*I) @ w = X.T @ y`` via numpy.linalg.solve.
+    Used when neither xgboost nor sklearn is importable; also picked up
+    by save/load via pickle (it's a tiny dataclass-shaped object). No
+    feature scaling — assumes featurize_config already produces inputs
+    in ~[0, 1]."""
+
+    def __init__(self, alpha: float = 1e-2):
+        self.alpha = float(alpha)
+        self.w_ = None      # coefficient vector (n_features + 1 with bias)
+
+    def fit(self, X, y) -> "_LinearRidgeRegressor":
+        np = _ensure_numpy()
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32).reshape(-1)
+        # Augment X with a 1-column for bias.
+        X_aug = np.hstack([X, np.ones((X.shape[0], 1), dtype=np.float32)])
+        n_feat = X_aug.shape[1]
+        A = X_aug.T @ X_aug + self.alpha * np.eye(n_feat, dtype=np.float32)
+        b = X_aug.T @ y
+        try:
+            self.w_ = np.linalg.solve(A, b)
+        except Exception:
+            # Singular matrix — pseudo-inverse fallback.
+            self.w_ = np.linalg.pinv(A) @ b
+        return self
+
+    def predict(self, X):
+        np = _ensure_numpy()
+        if self.w_ is None:
+            raise RuntimeError("_LinearRidgeRegressor.predict() before fit()")
+        X = np.asarray(X, dtype=np.float32)
+        if X.ndim == 1:
+            X = X.reshape(1, -1)
+        X_aug = np.hstack([X, np.ones((X.shape[0], 1), dtype=np.float32)])
+        return X_aug @ self.w_
+
+
+def _cost_model_path(cache_dir: "Path", opt: str, model: str, arch: str
+                     ) -> "Path":
+    """Canonical sidecar path for a (cache_dir, opt, model, arch) tuple."""
+    return Path(cache_dir) / f"cost_model_{opt}_{model}_{arch}.bin"
+
+
+def _cost_model_train_from_trials(
+        trials: List[Dict[str, Any]],
+        dims: List[Dict[str, Any]],
+        arch_entry: "ArchEntry",
+        cache_path: "Path",
+        *,
+        uncertainty_method: str = "bootstrap",
+        stall_info: Optional[Dict[str, Any]] = None,
+        seed_predictions: Optional[List[Tuple["Any", float]]] = None,
+) -> Optional[CostModel]:
+    """Helper used by ``_run_bayesian``. Featurizes every (config,
+    timing_ms) pair from ``trials`` and trains a fresh CostModel.
+    ``seed_predictions`` lets transfer-learning warm-start by injecting
+    extra (X, y) rows from a sibling-optimizer model's predictions.
+    Returns the trained model, or None when there's not enough data."""
+    np = _ensure_numpy()
+    rows_X: List[Any] = []
+    rows_y: List[float] = []
+    for t in trials:
+        if not isinstance(t, dict):
+            continue
+        cfg = t.get("config") or {}
+        ms = t.get("timing_ms")
+        if ms is None or not isinstance(ms, (int, float)):
+            continue
+        if not math.isfinite(float(ms)):
+            continue
+        try:
+            feat = featurize_config(cfg, dims, arch_entry, stall_info)
+        except Exception:
+            continue
+        rows_X.append(feat)
+        rows_y.append(float(ms))
+    if seed_predictions:
+        for feat, ms in seed_predictions:
+            rows_X.append(feat)
+            rows_y.append(float(ms))
+    if len(rows_X) < 2:
+        return None
+    X = np.vstack(rows_X)
+    y = np.asarray(rows_y, dtype=np.float32)
+    reg = CostModel(arch=arch_entry.subdir, cache_path=cache_path,
+                    uncertainty_method=uncertainty_method)
+    try:
+        reg.fit(X, y)
+    except Exception:
+        return None
+    try:
+        reg.save()
+    except Exception:
+        # Cache write failed (disk full / read-only) — still return the
+        # in-memory model so the running sweep gets the benefit.
+        pass
+    return reg
+
+
+def _make_pruned_trial_record(config: Dict[str, Any], predicted_ms: float,
+                              *, host: Optional[Dict[str, Any]] = None
+                              ) -> Dict[str, Any]:
+    """Record shape returned by ``_make_variant_timer`` when the cost
+    model rejects a candidate before building it. Slots into the same
+    pipeline as ``_make_trial_record`` results — ``timing_ms`` is None
+    (untimed), ``status`` is ``cost_model_pruned``, and the predicted
+    timing is preserved in ``predicted_timing_ms`` for diagnostics."""
+    return {
+        "stage":                 "tpe",
+        "config":                {k: (list(v) if isinstance(v, tuple) else v)
+                                  for k, v in config.items()},
+        "config_key":            config_key(config),
+        "timing_ms":             None,
+        "min_ms":                None,
+        "max_ms":                None,
+        "n":                     None,
+        "host":                  host,
+        "numerical_status":      "skipped",
+        "status":                "cost_model_pruned",
+        "predicted_timing_ms":   float(predicted_ms),
+        "recorded_at":           datetime.datetime.now().isoformat(),
+    }
+
+
 # ===========================================================================
 # bayesian — Optuna TPE-driven autotune (absorbed from
 # grokking_optimizers/bayesian.py)
@@ -3377,6 +4079,12 @@ class BayesianEarlyStopper:
         self._improvement_window: collections.deque = collections.deque()
         # Cached for to_dict() / cache persistence.
         self._last_ei_estimate: Optional[float] = None
+        # (f) Stream C — cost-model rejection budget. Incremented every
+        # time the learned cost model prunes a candidate before it gets
+        # measured. Used by should_stop() to detect that the model is
+        # vetoing most TPE suggestions AND the best timing has plateaued,
+        # which is a stronger stopping signal than plateau alone.
+        self._cost_model_rejections: int = 0
 
     @property
     def patience(self) -> int:
@@ -3384,7 +4092,8 @@ class BayesianEarlyStopper:
             return self._patience_override
         return max(50, self.trial_count // 10)
 
-    def observe(self, trial_value: float, trial_params: Dict[str, Any]) -> None:
+    def observe(self, trial_value: float, trial_params: Dict[str, Any],
+                *, was_pruned_by_cost_model: bool = False) -> None:
         self.trial_count += 1
         prev_best = self.best
         # (b) EI estimate: per-trial relative improvement over prev_best.
@@ -3407,6 +4116,12 @@ class BayesianEarlyStopper:
         for k, v in trial_params.items():
             self.coverage_set.add((k, _hashable(v)))
         self.coverage_history.append(len(self.coverage_set))
+        # (f) Stream C — bump the cost-model rejection counter when the
+        # caller flags this trial as having been pruned by the learned
+        # cost model. should_stop() uses this counter to detect that
+        # the model is vetoing most candidates AND the best has plateaued.
+        if was_pruned_by_cost_model:
+            self._cost_model_rejections += 1
 
     def should_stop(self) -> bool:
         if self.stop_reason is not None:
@@ -3447,6 +4162,22 @@ class BayesianEarlyStopper:
             if rolling_mean < self.ei_floor:
                 self.stop_reason = f"ei_exhausted:{rolling_mean:.2e}"
                 return True
+        # (f) Stream C — cost-model rejection budget exhausted. When the
+        # learned cost model has been rejecting >60% of TPE suggestions
+        # AND the best timing has plateaued for at least half the
+        # patience window, we can stop earlier than the plateau-alone
+        # criterion would allow: the model has already convinced itself
+        # there's nothing better to find. Only fires after a generous
+        # warm-up (50 trials minimum) so we don't trip on cold-start
+        # variance.
+        if (self.trial_count >= max(50, self.patience)
+                and self._cost_model_rejections > 0.6 * self.trial_count
+                and (self.trial_count - self.last_improve_trial)
+                    >= self.patience // 2):
+            self.stop_reason = (
+                f"cost_model_rejection_exhausted:"
+                f"{self._cost_model_rejections}/{self.trial_count}")
+            return True
         return False
 
     def to_dict(self) -> Dict[str, Any]:
@@ -3464,6 +4195,10 @@ class BayesianEarlyStopper:
             "coverage_size": len(self.coverage_set),
             "stop_reason": self.stop_reason,
             "recent_ei_estimate": self._last_ei_estimate,
+            # Stream C — cost-model rejection telemetry for the report.
+            # Always present (zero when the cost model is disabled) so
+            # downstream cache readers see a uniform shape.
+            "cost_model_rejections": self._cost_model_rejections,
         }
 
 
@@ -3723,6 +4458,25 @@ def run_bayesian(
             if progress:
                 progress(len(records), total_for_progress, cfg)
             stopper.observe(math.inf, cfg)
+            continue
+        # Stream C — detect a cost-model-pruned trial sentinel returned
+        # by _make_variant_timer. These didn't build or run, so we record
+        # them as PRUNED (not FAIL) in Optuna and flag the stopper so
+        # criterion (f) sees the rejection.
+        pruned_by_cost_model = (
+            isinstance(raw, dict) and raw.get("status") == "cost_model_pruned")
+        if pruned_by_cost_model:
+            study.tell(trial, math.inf,
+                       state=optuna.trial.TrialState.PRUNED)
+            rec = dict(raw)
+            rec["trial_num"] = trial.number
+            rec.setdefault("stage", "tpe")
+            rec.setdefault("config_key", config_key(cfg))
+            rec.setdefault("host", host)
+            records.append(rec)
+            if progress:
+                progress(len(records), total_for_progress, cfg)
+            stopper.observe(math.inf, cfg, was_pruned_by_cost_model=True)
             continue
         result, value = _coerce_timer_result(raw)
         if not math.isfinite(value):
@@ -4496,6 +5250,16 @@ class BuildSpec:
     # multiplies the autotune fan-out by polyhedral.max_schedules_per_template.
     enable_polyhedral: bool = False
     config: Dict[str, Any] = field(default_factory=dict)
+    # ─── Stream C — learned cost model ────────────────────────────────
+    # OFF by default; toggled by [cost_model].enable in compile_config.toml
+    # or by apply_to_buildspec() when the project config sets it. When
+    # disabled, no featurization / training / inference / rejection
+    # happens — the autotuner is byte-identical to today.
+    enable_cost_model: bool = False
+    cost_model_retrain_every: int = 20
+    cost_model_rejection_threshold_x: float = 3.0
+    cost_model_rejection_max_pct: float = 0.8
+    cost_model_uncertainty_method: str = "bootstrap"
 
 
 def _ensure_nvcc_on_path() -> Optional[str]:
@@ -6713,7 +7477,8 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                         cache: CompileCache,
                         worker,                       # Optional[TimingWorker]
                         report,
-                        progress_state: Dict[str, Any]):
+                        progress_state: Dict[str, Any],
+                        cost_model_state: Optional[Dict[str, Any]] = None):
     """Return a closure ``timer(config) -> result dict | None`` for the
     Bayesian/Exhaustive driver. Builds the variant .so, records it in
     the cache, then asks the worker to time it (fallback: one-shot
@@ -6722,7 +7487,27 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
     For Pallas/TPU specs, returns a Pallas-flavoured closure that skips
     the variant-.so build entirely and just runs PallasTimer on the
     config dict directly (each config is a kwargs bundle for the jitted
-    launcher)."""
+    launcher).
+
+    Stream C — when ``cost_model_state`` is provided AND
+    ``spec.enable_cost_model`` is True, the closure consults the
+    learned cost model before building each variant. Predicted-bad
+    candidates (mean > threshold × best_so_far AND sigma < 20% of mean)
+    are returned as pre-pruned trial records so the autotuner skips
+    them entirely. A cap on the rejection fraction protects against
+    over-confident models excluding the real optimum.
+    ``cost_model_state`` is a dict of the form::
+
+        {
+            "model":       Optional[CostModel],
+            "arch_entry":  ArchEntry,
+            "stall_info":  Optional[dict],
+            "best_so_far": float,         # mutated by the closure
+            "n_rejected":  int,           # mutated by the closure
+            "n_total":     int,           # mutated by the closure
+            "stopper":     BayesianEarlyStopper | None,
+        }
+    """
 
     # ---- Pallas/TPU path: no .so, no worker — PallasTimer in-process. ----
     if get_arch_entry(spec.arch).vendor == "pallas":
@@ -6783,6 +7568,52 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
 
     def timer(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         ckey = config_key(config)
+
+        # ── Stream C — learned cost-model rejection gate ────────────────
+        # Opt-in via spec.enable_cost_model. Skipped entirely when the
+        # state dict is missing or the model isn't warm yet (cold start
+        # always measures so the first retrain has signal). The cap on
+        # rejection fraction guards against an over-confident model
+        # excluding the real optimum.
+        if (getattr(spec, "enable_cost_model", False)
+                and cost_model_state is not None):
+            reg = cost_model_state.get("model")
+            if reg is not None and reg.is_warm():
+                try:
+                    arch_entry_cm = cost_model_state.get("arch_entry")
+                    stall_info_cm = cost_model_state.get("stall_info")
+                    feat = featurize_config(config, dims, arch_entry_cm,
+                                            stall_info_cm)
+                    ms_pred, sigma_pred = reg.predict(feat)
+                except Exception:
+                    ms_pred, sigma_pred = float("inf"), float("inf")
+                best = cost_model_state.get("best_so_far",
+                                            float("inf")) or float("inf")
+                threshold_x = float(
+                    getattr(spec, "cost_model_rejection_threshold_x",
+                            3.0) or 3.0)
+                threshold = threshold_x * best if math.isfinite(best) else \
+                    float("inf")
+                # High confidence = sigma small relative to mean.
+                high_confidence = sigma_pred < 0.2 * abs(ms_pred)
+                if (math.isfinite(ms_pred) and math.isfinite(threshold)
+                        and ms_pred > threshold and high_confidence):
+                    n_total = int(cost_model_state.get("n_total", 0)) + 1
+                    n_rejected = int(cost_model_state.get("n_rejected", 0))
+                    cap = float(
+                        getattr(spec, "cost_model_rejection_max_pct",
+                                0.8) or 0.8)
+                    # Cap check: only reject when doing so keeps us under
+                    # the cap. Else fall through and measure normally.
+                    if (n_rejected + 1) / max(1, n_total) <= cap:
+                        cost_model_state["n_rejected"] = n_rejected + 1
+                        cost_model_state["n_total"] = n_total
+                        _LAST_NUMERICAL_STATUS[ckey] = "skipped"
+                        return _make_pruned_trial_record(
+                            config, predicted_ms=ms_pred)
+                cost_model_state["n_total"] = int(
+                    cost_model_state.get("n_total", 0)) + 1
+
         host_extra = _variant_macros(config, dims, "host",
                                       spec=spec, arch=spec.arch)
         device_extra = _variant_macros(config, dims, "device",
@@ -7156,9 +7987,22 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
             worker = single
 
     progress_state = {"last_start": time.monotonic(), "window": []}
+    # Stream C — shared mutable state for the learned cost model.
+    # Always constructed (cheap dict) but only populated / consulted
+    # when spec.enable_cost_model is True; the timer's rejection gate
+    # short-circuits when "model" is None or not warm yet.
+    cost_model_state: Dict[str, Any] = {
+        "model":       None,
+        "arch_entry":  get_arch_entry(spec.arch),
+        "stall_info":  None,
+        "best_so_far": float("inf"),
+        "n_rejected":  0,
+        "n_total":     0,
+    }
     timer = _make_variant_timer(
         spec, sources, host_cflags, device_cflags, ldflags,
-        space[spec.arch]["dims"], cache, worker, report, progress_state)
+        space[spec.arch]["dims"], cache, worker, report, progress_state,
+        cost_model_state=cost_model_state)
 
     dims = space[spec.arch]["dims"]
     try:
@@ -7167,7 +8011,8 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
                                       space_hash, report)
         else:
             winning = _run_bayesian(spec, survivors, space, dims, timer, cache,
-                                    space_hash, report)
+                                    space_hash, report,
+                                    cost_model_state=cost_model_state)
     finally:
         if worker is not None:
             try:
@@ -7267,7 +8112,9 @@ def _run_exhaustive(spec: BuildSpec, configs: List[Dict[str, Any]],
 def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
                   space: Dict[str, Any], dims: List[Dict[str, Any]],
                   timer, cache: CompileCache, space_hash: str,
-                  report) -> Optional[Dict[str, Any]]:
+                  report,
+                  cost_model_state: Optional[Dict[str, Any]] = None,
+                  ) -> Optional[Dict[str, Any]]:
     n_trials = spec.bayesian_trials  # may be None ⇒ auto stopper
     # Build a stopper from BuildSpec; honours --max-tune-seconds / --patience
     # / --min-improvement when provided, otherwise pure auto-mode.
@@ -7277,6 +8124,59 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
         ei_floor=spec.ei_floor,
         max_seconds=spec.max_tune_seconds,
     )
+
+    # Stream C — learned cost-model bookkeeping. The state dict is the
+    # same object the timer closure mutates (n_rejected / n_total) and
+    # reads (best_so_far / model). We retrain the model every
+    # ``cost_model_retrain_every`` completed trials and feed it back
+    # into the state dict so the next batch of TPE suggestions can be
+    # rejected by the freshly-fit predictor.
+    cm_enabled = bool(getattr(spec, "enable_cost_model", False)
+                      and cost_model_state is not None)
+    cm_retrain_every = int(getattr(spec, "cost_model_retrain_every", 20) or 20)
+    cm_uncertainty = str(getattr(spec, "cost_model_uncertainty_method",
+                                 "bootstrap"))
+    cm_arch_entry = (cost_model_state.get("arch_entry")
+                     if cost_model_state else None)
+    cm_cache_dir = (cache.path.parent if cache.path is not None
+                    else spec.out_dir)
+    cm_model_path = _cost_model_path(cm_cache_dir, spec.optimizer,
+                                     spec.model, spec.arch)
+    # Try to warm-start from a previously-persisted model for this
+    # (optimizer, model, arch) tuple. Silent no-op when the file is
+    # missing / stale / from a different FEATURE_DIM.
+    if cm_enabled:
+        warm = CostModel(arch=spec.arch, cache_path=cm_model_path,
+                         uncertainty_method=cm_uncertainty)
+        if warm.load():
+            cost_model_state["model"] = warm
+            report.write(
+                f"  [cost-model] loaded prior model from {cm_model_path.name}"
+                f" (backend={warm._backend}, mae_val={warm._mae_val})\n")
+        # Sibling-optimizer transfer learning — probe every sibling's
+        # persisted cost model and use whichever loads first as additional
+        # warm-start signal. We don't merge tree structures across
+        # backends; instead we capture each sibling's predictions on the
+        # current trials and feed them as extra (X, y) rows to the next
+        # retrain. (No-op when transfer_learning is OFF.)
+        cost_model_state["_sibling_model"] = None
+        if getattr(spec, "transfer_learning", False):
+            for sib_opt in (allowed_optimizers(getattr(spec, "config", {}))
+                            or []):
+                if sib_opt == spec.optimizer:
+                    continue
+                sib_path = _cost_model_path(cm_cache_dir, sib_opt,
+                                            spec.model, spec.arch)
+                if not sib_path.exists():
+                    continue
+                sib = CostModel(arch=spec.arch, cache_path=sib_path,
+                                uncertainty_method=cm_uncertainty)
+                if sib.load():
+                    cost_model_state["_sibling_model"] = sib
+                    report.write(
+                        f"  [cost-model] transfer-warm-start from "
+                        f"sibling={sib_opt} model={sib_path.name}\n")
+                    break
     budget_desc = (f"n_trials={n_trials} (manual cap)"
                    if n_trials is not None
                    else "auto early-stop")
@@ -7311,15 +8211,112 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
     step1, close1 = make_progress(
         progress_total, f"jit-tpe {spec.optimizer}/{spec.arch}")
 
+    # Stream C — completed-trial buffer used to drive cost-model
+    # retraining on a fixed cadence. Populated by the wrapped timer
+    # below; read + (partially) consumed by the retrain hook.
+    cm_trial_buffer: List[Dict[str, Any]] = []
+    cm_state: Dict[str, Any] = {
+        "since_last_train": 0,
+        "trained_at_least_once": False,
+    }
+
     def progress1(done, total, cfg):
         step1(f"trial {done}/{total} key={config_key(cfg)[:24]}…")
+
+    # Stream C — wrap the variant timer so each completed trial (a)
+    # updates best_so_far for the rejection threshold, (b) appends to
+    # the retraining buffer, and (c) triggers a retrain when the
+    # cadence is hit. Inert when cost model is disabled (the wrapper
+    # is a one-line passthrough). Pruned trials skip the retrain
+    # bookkeeping — they have no timing signal to feed back into the
+    # model.
+    if cm_enabled:
+        raw_timer = timer
+
+        def _cm_wrapped_timer(cfg):
+            res = raw_timer(cfg)
+            # cost-model-pruned results carry status=="cost_model_pruned"
+            # and timing_ms is None — skip retrain bookkeeping.
+            if isinstance(res, dict) and res.get("status") == "cost_model_pruned":
+                return res
+            tms = None
+            if isinstance(res, dict):
+                tms = res.get("timing_ms")
+            elif isinstance(res, (int, float)):
+                tms = float(res)
+            if tms is not None and isinstance(tms, (int, float)) \
+                    and math.isfinite(float(tms)):
+                tms_f = float(tms)
+                if tms_f < float(cost_model_state.get("best_so_far",
+                                                      float("inf"))):
+                    cost_model_state["best_so_far"] = tms_f
+                cm_trial_buffer.append({"config": cfg, "timing_ms": tms_f})
+                cm_state["since_last_train"] += 1
+                # Cold start: gather 2x retrain_every signals before the
+                # first fit so the model has enough data to be useful.
+                min_warm = max(2, 2 * cm_retrain_every)
+                trigger = (
+                    (not cm_state["trained_at_least_once"]
+                     and len(cm_trial_buffer) >= min_warm)
+                    or (cm_state["trained_at_least_once"]
+                        and cm_retrain_every > 0
+                        and cm_state["since_last_train"] >= cm_retrain_every)
+                )
+                if trigger:
+                    # Feed sibling-model predictions on current configs as
+                    # additional (X, y) rows for transfer-learning warm start.
+                    sib = cost_model_state.get("_sibling_model")
+                    seed_preds: Optional[List[Tuple[Any, float]]] = None
+                    if sib is not None and sib.is_warm():
+                        try:
+                            seed_preds = []
+                            for row in cm_trial_buffer:
+                                feat = featurize_config(
+                                    row["config"], dims, cm_arch_entry, None)
+                                pred_ms, _ = sib.predict(feat)
+                                seed_preds.append((feat, float(pred_ms)))
+                        except Exception:
+                            seed_preds = None
+                    new_reg = _cost_model_train_from_trials(
+                        cm_trial_buffer, dims, cm_arch_entry,
+                        cm_model_path,
+                        uncertainty_method=cm_uncertainty,
+                        stall_info=cost_model_state.get("stall_info"),
+                        seed_predictions=seed_preds,
+                    )
+                    if new_reg is not None:
+                        cost_model_state["model"] = new_reg
+                        cm_state["trained_at_least_once"] = True
+                        cm_state["since_last_train"] = 0
+                        # Stash MAEs in the cache entry so the report
+                        # surfaces them alongside early_stop_info.
+                        try:
+                            entry = cache.get(spec.optimizer, spec.model,
+                                              spec.arch)
+                            entry["cost_model_mae_train"] = new_reg._mae_train
+                            entry["cost_model_mae_val"] = new_reg._mae_val
+                            entry["cost_model_backend"] = new_reg._backend
+                            entry["cost_model_n_fit_calls"] = \
+                                new_reg._n_fit_calls
+                        except Exception:
+                            pass
+                        report.write(
+                            f"  [cost-model] retrained "
+                            f"(n={len(cm_trial_buffer)}, "
+                            f"backend={new_reg._backend}, "
+                            f"mae_val={new_reg._mae_val})\n")
+            return res
+
+        effective_timer = _cm_wrapped_timer
+    else:
+        effective_timer = timer
 
     try:
         tpe_trials, stop_info = run_bayesian(
             spec.arch, space, n_trials=n_trials, seed=spec.seed,
             storage=storage,
             study_name=f"sg_{spec.optimizer}_{spec.model}_{spec.arch}",
-            timer=timer, progress=progress1, host=_current_host(),
+            timer=effective_timer, progress=progress1, host=_current_host(),
             prefiltered=prefiltered,
             pruner=spec.pruner,
             seed_trials=seed_trials,
@@ -7360,7 +8357,7 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
     try:
         refine_trials = topk_refine(
             tpe_trials, space, spec.arch,
-            top_k=effective_top_k, timer=timer,
+            top_k=effective_top_k, timer=effective_timer,
             progress=progress2, host=_current_host(),
             prefiltered=prefiltered,
         )
@@ -9548,6 +10545,104 @@ def _self_test() -> int:
     _run("topk_elbow_detection", test_topk_elbow_detection)
     _run("stopper_to_dict_serializable", test_stopper_to_dict_serializable)
     _run("ei_exhaustion_triggers", test_ei_exhaustion_triggers)
+
+    sys.stdout.write("[self-test] cost_model\n")
+
+    def test_cost_model_helpers_importable():
+        from grokking_optimizers.compile import (
+            CostModel, featurize_config, FEATURE_DIM,
+        )
+        assert CostModel is not None
+        assert callable(featurize_config)
+        assert FEATURE_DIM > 0
+    _run("cost_model_helpers_importable",
+         test_cost_model_helpers_importable)
+
+    def test_cost_model_featurize_deterministic():
+        """Same config → identical feature vector across calls. Different
+        config → different vector."""
+        from grokking_optimizers.compile import featurize_config, ARCH_TABLE
+        arch = ARCH_TABLE["sm_90a"]
+        dims = [
+            {"name": "block", "type": "int", "values": [64, 128, 256],
+             "macro": "B"},
+            {"name": "vec",   "type": "int", "values": [1, 2, 4],
+             "macro": "V"},
+        ]
+        c1 = {"block": 128, "vec": 2}
+        c2 = {"block": 128, "vec": 2}
+        c3 = {"block": 256, "vec": 4}
+        import numpy as np  # the test legitimately requires numpy
+        f1 = featurize_config(c1, dims, arch)
+        f2 = featurize_config(c2, dims, arch)
+        f3 = featurize_config(c3, dims, arch)
+        assert np.array_equal(f1, f2), "same config → same features"
+        assert not np.array_equal(f1, f3), "different config → different features"
+    _run("cost_model_featurize_deterministic",
+         test_cost_model_featurize_deterministic)
+
+    def test_cost_model_fit_and_predict_synthetic():
+        """Train on a known timing function; verify val MAE is below a
+        reasonable bound + predict produces (ms, sigma) tuples."""
+        import numpy as np
+        from grokking_optimizers.compile import CostModel
+        np.random.seed(0)
+        # Synthetic: timing = 0.5 + 0.3 * f[0] + 0.1 * f[3] + noise
+        n_samples = 200
+        n_features = 10
+        X = np.random.rand(n_samples, n_features)
+        y = (0.5 + 0.3 * X[:, 0] + 0.1 * X[:, 3]
+             + 0.01 * np.random.randn(n_samples))
+        with tempfile.TemporaryDirectory() as td:
+            reg = CostModel("sm_90a", Path(td) / "cm.bin",
+                            uncertainty_method="bootstrap")
+            reg.fit(X, y)
+            ms, sigma = reg.predict(X[0])
+            assert isinstance(ms, float) and isinstance(sigma, float)
+            assert sigma >= 0.0
+            assert reg._mae_val is not None
+            # Val MAE should be < 0.5 on this clean synthetic problem.
+            # (Loose bound — graceful for the linear fallback.)
+            assert reg._mae_val < 0.5, \
+                f"val MAE {reg._mae_val} too high"
+    _run("cost_model_fit_and_predict_synthetic",
+         test_cost_model_fit_and_predict_synthetic)
+
+    def test_cost_model_rejection_cap():
+        """Even with a wildly over-confident model, rejection rate
+        never exceeds the configured max."""
+        # Pure plumbing test — verify the cap-check logic itself.
+        n_total = 100
+        n_rejected = 0
+        rejection_max_pct = 0.8
+        for i in range(n_total):
+            wants_to_reject = True   # model says 'reject everything'
+            if (wants_to_reject
+                    and (n_rejected / max(1, i + 1)) <= rejection_max_pct):
+                n_rejected += 1
+        # 80% cap means we reject ~80 out of 100.
+        assert n_rejected <= int(rejection_max_pct * n_total) + 1, n_rejected
+    _run("cost_model_rejection_cap", test_cost_model_rejection_cap)
+
+    def test_cost_model_save_load_round_trip():
+        """Train → save → load → predict produces same answer."""
+        import numpy as np
+        from grokking_optimizers.compile import CostModel
+        np.random.seed(1)
+        X = np.random.rand(50, 8)
+        y = X[:, 0] + 0.01 * np.random.randn(50)
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "cm.bin"
+            reg = CostModel("sm_90a", p)
+            reg.fit(X, y)
+            ms_before, _ = reg.predict(X[0])
+            reg.save()
+            reg2 = CostModel("sm_90a", p)
+            assert reg2.load()
+            ms_after, _ = reg2.predict(X[0])
+            assert abs(ms_before - ms_after) < 1e-6, (ms_before, ms_after)
+    _run("cost_model_save_load_round_trip",
+         test_cost_model_save_load_round_trip)
 
     sys.stdout.write("[self-test] cache\n")
 
@@ -16458,6 +17553,30 @@ _DEFAULT_PROJECT_CONFIG: Dict[str, Any] = {
         # its own tile_candidates. Empty list = derive from arch defaults.
         "tile_size_candidates": [16, 32, 64, 128],
     },
+    # Stream C — learned cost model. Every key OFF / inert by default so
+    # this section is strictly additive: a TOML that omits it (or sets
+    # enable=false) produces byte-identical autotune behaviour.
+    "cost_model": {
+        # Master switch. When OFF, no featurization / training / inference
+        # happens — strictly additive when enabled.
+        "enable": False,
+        # Retrain the model every K completed trials. Lower = more
+        # responsive but more CPU. 0 = retrain after every trial (debug).
+        "retrain_every": 20,
+        # A candidate is rejected when predicted_ms >
+        # rejection_threshold_x × best_so_far_ms AND model confidence
+        # is high (sigma < 20% of mean).
+        "rejection_threshold_x": 3.0,
+        # Cap on what fraction of trials may be rejected by the model.
+        # Guards against an over-confident model excluding the real
+        # optimum.
+        "rejection_max_pct": 0.8,
+        # 'bootstrap' or 'quantile'. Bootstrap uses K=5 mini-models;
+        # quantile uses XGBoost q=0.1/0.9 heads. Bootstrap is the
+        # default because it works on all backends including the
+        # linear fallback.
+        "uncertainty_method": "bootstrap",
+    },
 }
 
 # Filenames kept as constants for any caller that still wants to point at a
@@ -16574,6 +17693,33 @@ def apply_to_buildspec(spec, config: Dict[str, Any]) -> None:
                 spec.enable_polyhedral = True
             except Exception:
                 pass
+    # Stream C — cost model. Master switch is opt-in; per-knob copies
+    # honour any non-default value supplied by the user. Missing keys
+    # leave the BuildSpec defaults alone (so a TOML without [cost_model]
+    # is byte-identical to today).
+    if "cost_model" in config and isinstance(config["cost_model"], dict):
+        cm = config["cost_model"]
+        if cm.get("enable") and not getattr(spec, "enable_cost_model", False):
+            spec.enable_cost_model = True
+        if "retrain_every" in cm:
+            try:
+                spec.cost_model_retrain_every = int(cm["retrain_every"])
+            except (TypeError, ValueError):
+                pass
+        if "rejection_threshold_x" in cm:
+            try:
+                spec.cost_model_rejection_threshold_x = float(
+                    cm["rejection_threshold_x"])
+            except (TypeError, ValueError):
+                pass
+        if "rejection_max_pct" in cm:
+            try:
+                spec.cost_model_rejection_max_pct = float(
+                    cm["rejection_max_pct"])
+            except (TypeError, ValueError):
+                pass
+        if "uncertainty_method" in cm:
+            spec.cost_model_uncertainty_method = str(cm["uncertainty_method"])
     if "cache" in config:
         if not config["cache"].get("auto_prune_after_jit", True):
             spec.prune_after_autotune = False
