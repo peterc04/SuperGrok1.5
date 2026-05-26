@@ -167,7 +167,7 @@ from optuna.samplers import TPESampler
 import yaml
 
 
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 DEFAULT_CACHE_NAME = ".compile_cache.json"
 DEFAULT_PGO_WORKLOAD = Path(__file__).resolve()  # absorbed from scripts/pgo_workload.py
 JIT_CACHE_FLUSH_EVERY = 5   # save cache every N completed JIT trials
@@ -3852,6 +3852,19 @@ _V3_DEFAULTS: Dict[str, Any] = {
     "bayesian_trials":    [],
 }
 
+# v4 adds two per-entry keys that point at the .jsonl trial sidecar and
+# carry a tiny summary so callers don't have to re-read the sidecar to
+# answer "how many trials did we run / what was the best?".
+_V4_DEFAULTS: Dict[str, Any] = {
+    "trial_log_path":    None,
+    "trial_log_summary": {
+        "n_trials":         0,
+        "best_timing_ms":   None,
+        "stop_reason":      None,
+        "last_updated_unix": 0.0,
+    },
+}
+
 
 def _fresh_entry() -> dict:
     return {
@@ -3860,6 +3873,9 @@ def _fresh_entry() -> dict:
         "device_cflags_hash":  None,
         "primary_artifact":    None,
         "variant_artifacts":   {},
+        # v3 legacy lists. Kept as empty lists for back-compat readers
+        # (profile.py, downstream tools). The actual trial data now lives
+        # in the .jsonl sidecar pointed to by "trial_log_path".
         "sweep_history":       [],
         "tuned_config":        None,
         "aot_completed_at":    None,
@@ -3868,12 +3884,18 @@ def _fresh_entry() -> dict:
         "jit_host":            None,
         **{k: (list(v) if isinstance(v, list) else dict(v) if isinstance(v, dict) else v)
            for k, v in _V3_DEFAULTS.items()},
+        **{k: (list(v) if isinstance(v, list) else dict(v) if isinstance(v, dict) else v)
+           for k, v in _V4_DEFAULTS.items()},
     }
 
 
 def _migrate_v2_to_v3(data: dict) -> dict:
-    """Forward-migrate a v2 cache: add v3 keys with defaults, bump version."""
-    data["version"] = CACHE_VERSION
+    """Forward-migrate a v2 cache: add v3 keys with defaults, bump version.
+
+    Note: this stops at v3. Chain through ``_migrate_v3_to_v4`` afterwards
+    for the full upgrade to the current schema.
+    """
+    data["version"] = 3
     data.setdefault("entries", {})
     for k, entry in list(data["entries"].items()):
         if not isinstance(entry, dict):
@@ -3882,6 +3904,77 @@ def _migrate_v2_to_v3(data: dict) -> dict:
             entry.setdefault(nk, list(nv) if isinstance(nv, list)
                              else dict(nv) if isinstance(nv, dict) else nv)
     data["migrated_from_v2_at"] = datetime.datetime.now().isoformat()
+    return data
+
+
+def _migrate_v3_to_v4(data: dict, cache_dir: Optional[Path]) -> dict:
+    """Move per-entry ``bayesian_trials`` / ``sweep_history`` lists into
+    ``<cache_dir>/trials_<opt>_<model>_<arch>.jsonl`` sidecars.
+
+    The main JSON keeps the legacy keys as empty lists for back-compat
+    readers and gains two new per-entry fields: ``trial_log_path``
+    (relative path to the sidecar, or ``None`` if the entry never had any
+    trials) and ``trial_log_summary``.
+
+    No-op if the cache is already v4 or has no entries. ``cache_dir`` is
+    the directory the main JSON lives in; if ``None``, the migration
+    still bumps version and adds the new keys but skips writing sidecars.
+    """
+    if data.get("version") != 3:
+        return data
+    for entry_key, entry in data.get("entries", {}).items():
+        if not isinstance(entry, dict):
+            continue
+        bayesian = entry.get("bayesian_trials") or []
+        sweep = entry.get("sweep_history") or []
+        if not (bayesian or sweep):
+            entry["trial_log_path"] = None
+            entry["trial_log_summary"] = {
+                "n_trials":         0,
+                "best_timing_ms":   None,
+                "stop_reason":      (entry.get("early_stop_info") or {}).get("stop_reason"),
+                "last_updated_unix": 0.0,
+            }
+            entry["bayesian_trials"] = []
+            entry["sweep_history"] = []
+            continue
+        slug = entry_key.replace("/", "_")
+        if cache_dir is not None:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            sidecar = cache_dir / f"trials_{slug}.jsonl"
+            bayesian_ids = {id(t) for t in bayesian}
+            with sidecar.open("a", encoding="utf-8") as f:
+                for trial in bayesian + sweep:
+                    if isinstance(trial, dict) and "stage" not in trial:
+                        trial["stage"] = ("bayesian" if id(trial) in bayesian_ids
+                                          else "sweep")
+                    f.write(json.dumps(trial, default=str) + "\n")
+            entry["trial_log_path"] = str(sidecar.relative_to(cache_dir))
+        else:
+            entry["trial_log_path"] = None
+        all_trials = bayesian + sweep
+        times: List[float] = []
+        for t in all_trials:
+            if not isinstance(t, dict):
+                continue
+            if t.get("status") not in (None, "ok"):
+                continue
+            ms = t.get("value_ms") or t.get("timing_ms")
+            if ms is not None:
+                try:
+                    times.append(float(ms))
+                except (TypeError, ValueError):
+                    pass
+        entry["trial_log_summary"] = {
+            "n_trials":          len(all_trials),
+            "best_timing_ms":    (min(times) if times else None),
+            "stop_reason":       (entry.get("early_stop_info") or {}).get("stop_reason"),
+            "last_updated_unix": time.time(),
+        }
+        entry["bayesian_trials"] = []
+        entry["sweep_history"] = []
+    data["version"] = 4
+    data["migrated_from_v3_at"] = datetime.datetime.now().isoformat()
     return data
 
 
@@ -3956,18 +4049,31 @@ class CompileCache:
             self._dirty = True
             return data
         version = data.get("version")
+        cache_dir = self.path.parent if self.path is not None else None
         if version == CACHE_VERSION:
             data.setdefault("host_history", []).append(_current_host())
             self._dirty = True
             return data
         if version == 2:
-            # Back up the v2 file untouched, then migrate the loaded data.
+            # Back up the v2 file untouched, then chain v2 → v3 → v4.
             backup = self.path.with_suffix(self.path.suffix + ".v2.bak")
             try:
                 shutil.copy2(self.path, backup)
             except OSError:
                 pass
             data = _migrate_v2_to_v3(data)
+            data = _migrate_v3_to_v4(data, cache_dir)
+            data.setdefault("host_history", []).append(_current_host())
+            self._dirty = True
+            return data
+        if version == 3:
+            # Back up the v3 file untouched, then migrate to v4.
+            backup = self.path.with_suffix(self.path.suffix + ".v3.bak")
+            try:
+                shutil.copy2(self.path, backup)
+            except OSError:
+                pass
+            data = _migrate_v3_to_v4(data, cache_dir)
             data.setdefault("host_history", []).append(_current_host())
             self._dirty = True
             return data
@@ -9179,6 +9285,75 @@ def _self_test() -> int:
 
     _run("v2_to_v3_migration", test_v2_to_v3_migration)
     _run("cache_round_trips", test_cache_round_trips)
+
+    def test_v3_to_v4_migration():
+        """Synthetic v3 cache with bayesian_trials migrates cleanly to v4."""
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "cache.json"
+            v3 = {
+                "version": 3,
+                "host": {"os": "linux", "python": "3.11"},
+                "entries": {
+                    "lion/mamba/sm_90": {
+                        "tuned_config": {"timing_ms": 0.5, "block": 256,
+                                         "vec": 4, "unroll": 8},
+                        "variant_artifacts": {},
+                        "sweep_history": [],
+                        "bayesian_trials": [
+                            {"stage": "tpe", "trial_num": i,
+                             "config": {"block": 64 * (i + 1),
+                                        "vec": 2, "unroll": 4},
+                             "status": "ok",
+                             "value_ms": 1.0 - i * 0.05,
+                             "error": None}
+                            for i in range(10)
+                        ],
+                    },
+                },
+            }
+            p.write_text(json.dumps(v3))
+            cache = CompileCache(p)
+            e = cache._data["entries"]["lion/mamba/sm_90"]
+            assert cache._data["version"] == 4, cache._data.get("version")
+            assert e["bayesian_trials"] == [], e["bayesian_trials"]
+            assert e["trial_log_path"], e
+            sidecar = Path(td) / e["trial_log_path"]
+            assert sidecar.exists()
+            lines = [ln for ln in sidecar.read_text().splitlines() if ln.strip()]
+            assert len(lines) == 10, f"expected 10 trial lines, got {len(lines)}"
+            s = e["trial_log_summary"]
+            assert s["n_trials"] == 10, s
+            assert s["best_timing_ms"] is not None
+            assert abs(s["best_timing_ms"] - 0.55) < 1e-9, s
+
+    def test_v2_to_v4_chain_migration():
+        """v2 → v3 → v4 chain migration produces a clean v4 cache."""
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "cache.json"
+            v2 = {
+                "version": 2,
+                "host": {},
+                "entries": {
+                    "muon/mamba/gfx942": {
+                        "tuned_config": {"timing_ms": 0.3},
+                        "variant_artifacts": {},
+                        "bayesian_trials": [
+                            {"stage": "tpe", "trial_num": 0,
+                             "config": {"block": 64}, "status": "ok",
+                             "value_ms": 0.4, "error": None},
+                        ],
+                    },
+                },
+            }
+            p.write_text(json.dumps(v2))
+            cache = CompileCache(p)
+            assert cache._data["version"] == 4
+            e = cache._data["entries"]["muon/mamba/gfx942"]
+            sidecar = Path(td) / e["trial_log_path"]
+            assert sidecar.exists()
+
+    _run("v3_to_v4_migration", test_v3_to_v4_migration)
+    _run("v2_to_v4_chain_migration", test_v2_to_v4_chain_migration)
 
     def test_cache_prune():
         """Populate 5 variants, prune to top-2 by timing, verify 3 dropped
