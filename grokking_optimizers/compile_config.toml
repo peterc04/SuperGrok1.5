@@ -1,0 +1,71 @@
+# Default project config for grokking_optimizers.compile.
+# Override by passing --config /path/to/your.toml, or by placing a file
+# named "compile_config.toml" in the current working directory.
+#
+# All fields are optional; omitted fields fall back to in-code defaults.
+
+[project]
+name = "supergrok"
+version = "2.0.0"
+
+[sources]
+# Glob patterns relative to repo root, per vendor.
+cuda_root = "csrc/backends/cuda"
+hip_root  = "csrc/backends/hip"
+pallas_root = "csrc/backends/pallas"
+algorithms_dir = "csrc/algorithms"
+bindings_dir = "csrc/bindings"
+
+[sources.include_paths]
+# Additional -I include paths
+extra = []
+
+[optimizers]
+# Canonical optimizer names. Empty list = use built-in defaults.
+enabled = ["adamw", "lion", "muon", "prodigy", "grokadamw", "grokfast",
+           "looksam", "neuralgrok", "supergrok11", "supergrok15", "supergrok2"]
+
+[models]
+# Canonical model names.
+enabled = ["mamba3", "transformer_decoder", "vit"]
+
+[archs]
+# Default arch when none is specified.
+default = "sm_90a"
+# Restrict allowed archs; empty = allow all in ARCH_TABLE.
+allowed = []
+
+[pgo]
+# Default PGO workload script. Empty = use built-in __file__.
+workload_script = ""
+steps = 1000
+
+[autotune]
+# Manual override for stopper defaults — these are read by Stream 5.
+min_improvement = 0.005
+patience = 0  # 0 = auto
+max_seconds = 0  # 0 = unlimited
+
+[codegen]
+# Stream 6 feature flag
+enable_emitter = false
+template_dir = "grokking_optimizers/templates"
+
+[runtime_specialization]
+# Stream 7 feature flag
+enable = false
+cache_dir = ""  # empty = ~/.cache/supergrok/nvrtc
+
+[device_pgo]
+# Stream 8 feature flag
+enable = false
+
+[cache]
+# Stream 9 prune defaults
+auto_prune_after_jit = true
+max_age_days = 30
+keep_top_n = 100
+
+[numerics]
+# Stream 10
+strict = false
