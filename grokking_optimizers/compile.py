@@ -7910,9 +7910,29 @@ def _spawn_phase(argv: List[str], phase: str) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    _argv = argv if argv is not None else sys.argv[1:]
+    _argv = list(argv) if argv is not None else sys.argv[1:]
     if "--self-test" in _argv:
         return _self_test()
+    # Stream H — handle --e2e-smoke before argparse so we don't need to
+    # supply the required --optimizer / --model / --arch triple (the smoke
+    # test detects them itself).
+    if "--e2e-smoke" in _argv:
+        out_dir = REPO_ROOT / "build" / "compiled"
+        max_seconds = 120.0
+        if "--out" in _argv:
+            idx = _argv.index("--out")
+            if idx + 1 < len(_argv):
+                out_dir = Path(_argv[idx + 1])
+        if "--e2e-max-seconds" in _argv:
+            idx = _argv.index("--e2e-max-seconds")
+            if idx + 1 < len(_argv):
+                try:
+                    max_seconds = float(_argv[idx + 1])
+                except ValueError:
+                    pass
+        out_dir = Path(out_dir).resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return _e2e_smoke(out_dir, max_seconds=max_seconds)
 
     # Early intercept: --dry-run-all-archs doesn't need --optimizer/-M/-A
     # (those are required=True in the main parser). We parse just --out
@@ -8061,6 +8081,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "wheels (nvcc + runtime + CCCL + NVRTC) and "
                              "retry. Use this on Colab CPU runtimes or any "
                              "fresh host without a system CUDA install.")
+    # Stream H — end-to-end smoke test mode.
+    parser.add_argument("--e2e-smoke", action="store_true",
+                        help="Run an end-to-end smoke test: build adamw / mamba "
+                             "for the locally-detected GPU arch with a bounded "
+                             "auto-stop autotune sweep. Verifies tuned_config "
+                             "is written, early-stop info is recorded, "
+                             "tuned_configs.h is regenerated, and the final .so "
+                             "loads. Skips cleanly with a SKIP message on "
+                             "CPU-only hosts.")
+    parser.add_argument("--e2e-max-seconds", type=float, default=120.0,
+                        help="Wall-clock cap for --e2e-smoke autotune phase "
+                             "(default 120s).")
     # Stream 7 — runtime kernel specialization via NVRTC / hipRTC.
     parser.add_argument("--enable-runtime-specialization", action="store_true",
                         help="Pre-warm a per-arch KernelRegistry that JIT-"
@@ -8137,6 +8169,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"device_cflags={len(m['device_cflags']):>3d} "
                 f"judgment={m.get('preflight_judgment','?')}\n")
         return 0
+
+    # Stream H — defensive: if argparse ever yields --e2e-smoke (e.g.
+    # because the early pre-argparse branch above changed), still honour
+    # it here. In normal use the early branch already returned.
+    if getattr(args, "e2e_smoke", False):
+        out = Path(args.out or REPO_ROOT / "build" / "compiled").resolve()
+        out.mkdir(parents=True, exist_ok=True)
+        return _e2e_smoke(out, max_seconds=args.e2e_max_seconds)
 
     # Stream 11: pre-load the project config so module-level defaults can be
     # consulted by downstream consumers. Behavior is identical to today when
@@ -8254,6 +8294,184 @@ def main(argv: Optional[List[str]] = None) -> int:
     return 0 if (so is not None
                  or get_arch_entry(args.arch).vendor == "pallas"
                  or args.runtime == "aot") else 1
+
+
+def _e2e_smoke(out_dir: Path, *, max_seconds: float = 120.0) -> int:
+    """End-to-end smoke test: build adamw / mamba(3) for the locally
+    detected GPU arch with a bounded auto-stop autotune sweep.
+
+    Verifies that:
+      1. A tuned_config is written into the cache entry.
+      2. early_stop_info is recorded by the Bayesian stopper (Stream 5).
+      3. csrc/algorithms/tuned_configs.h is (re)written.
+      4. The final .so loads via ctypes / torch.ops.
+
+    Returns 0 on success or a clean SKIP (no GPU / unsupported arch);
+    returns non-zero only when an assertion actually fails. A SKIP is a
+    pass, not a fail — this lets the same code path run on CPU-only
+    self-test hosts and on GPU CI without branching elsewhere.
+    """
+    import ctypes
+    import time as _time
+
+    smoke_start = _time.time()
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── 1. GPU detection ───────────────────────────────────────────────
+    try:
+        import torch  # noqa: F401
+        cuda_avail = bool(torch.cuda.is_available())
+    except Exception as exc:
+        sys.stdout.write(
+            f"[e2e-smoke] torch import / cuda probe failed ({exc}) — "
+            f"skipping (this is expected on CPU-only hosts)\n")
+        return 0
+    if not cuda_avail:
+        sys.stdout.write(
+            "[e2e-smoke] no CUDA device — skipping (this is expected on "
+            "CPU-only hosts)\n")
+        return 0
+
+    # ── 2. Arch detection ──────────────────────────────────────────────
+    try:
+        major, minor = torch.cuda.get_device_capability(0)
+    except Exception as exc:
+        sys.stdout.write(
+            f"[e2e-smoke] torch.cuda.get_device_capability failed ({exc}) — "
+            f"skipping\n")
+        return 0
+    detected_arch = f"sm_{major}{minor}"
+    if detected_arch not in ARCH_TABLE:
+        suffixed = f"{detected_arch}a"
+        if suffixed in ARCH_TABLE:
+            detected_arch = suffixed
+        else:
+            sys.stdout.write(
+                f"[e2e-smoke] detected arch sm_{major}{minor} (and "
+                f"{suffixed}) not in ARCH_TABLE — skipping\n")
+            return 0
+    sys.stdout.write(
+        f"[e2e-smoke] GPU detected, arch={detected_arch}, "
+        f"max_seconds={max_seconds}\n")
+
+    # ── 3. Run a real build ────────────────────────────────────────────
+    cache_path = out_dir / "e2e_smoke_cache.json"
+    cache = CompileCache(cache_path)
+    tuned_h = REPO_ROOT / "csrc/algorithms/tuned_configs.h"
+
+    # Be defensive about model name: prefer the new "mamba3" enum, fall
+    # back to legacy "mamba" if the OPT-side MODELS list doesn't have it.
+    chosen_model: Optional[str] = None
+    so: Optional[Path] = None
+    last_exc: Optional[BaseException] = None
+    for candidate_model in ("mamba3", "mamba"):
+        try:
+            so = build(
+                optimizer="adamw",
+                model=candidate_model,
+                arch=detected_arch,
+                out_dir=out_dir,
+                cache=cache,
+                autotune=True,
+                autotune_mode="bayesian",
+                bayesian_trials=None,         # auto early-stop
+                max_tune_seconds=max_seconds, # cap wall-clock
+                profile=False,
+                pgo=False,
+                debug=True,
+            )
+            chosen_model = candidate_model
+            break
+        except ValueError as exc:
+            last_exc = exc
+            sys.stdout.write(
+                f"[e2e-smoke] model={candidate_model!r} rejected "
+                f"({exc}); trying fallback...\n")
+            continue
+    if chosen_model is None:
+        sys.stdout.write(
+            f"[e2e-smoke] FAIL: neither 'mamba3' nor 'mamba' is a valid "
+            f"model (last error: {last_exc})\n")
+        return 1
+
+    # ── 4. Assertions ──────────────────────────────────────────────────
+    entry_key = cache.key("adamw", chosen_model, detected_arch)
+    entry = cache._data.get("entries", {}).get(entry_key, {})
+
+    # 4a. tuned_config written.
+    tuned_cfg = entry.get("tuned_config")
+    a1_ok = tuned_cfg is not None
+    sys.stdout.write(
+        f"[e2e-smoke] assert tuned_config_written: "
+        f"{'PASS' if a1_ok else 'FAIL'} "
+        f"(key={entry_key}, value={'<set>' if a1_ok else None})\n")
+
+    # 4b. early_stop_info present (entry-level OR nested in tuned_config).
+    esi = entry.get("early_stop_info")
+    if esi is None and isinstance(tuned_cfg, dict):
+        esi = tuned_cfg.get("early_stop_info")
+    a2_ok = esi is not None
+    sys.stdout.write(
+        f"[e2e-smoke] assert early_stop_info_recorded: "
+        f"{'PASS' if a2_ok else 'FAIL'} "
+        f"(reason={esi.get('reason') if isinstance(esi, dict) else esi})\n")
+
+    # 4c. tuned_configs.h mtime newer than smoke start.
+    if tuned_h.exists():
+        try:
+            mtime = tuned_h.stat().st_mtime
+            a3_ok = mtime >= smoke_start - 1.0  # 1s slop for clock skew
+        except Exception:
+            a3_ok = False
+        mtime_repr = (datetime.datetime.fromtimestamp(mtime).isoformat()
+                      if a3_ok or tuned_h.exists() else "n/a")
+    else:
+        a3_ok = False
+        mtime_repr = "missing"
+    sys.stdout.write(
+        f"[e2e-smoke] assert tuned_configs_h_rewritten: "
+        f"{'PASS' if a3_ok else 'FAIL'} "
+        f"(path={tuned_h}, mtime={mtime_repr})\n")
+
+    # 4d. Final .so importable.
+    a4_ok = False
+    a4_detail = ""
+    if so is None:
+        a4_detail = "build() returned None"
+    elif not Path(so).exists():
+        a4_detail = f"so path does not exist: {so}"
+    else:
+        # Prefer torch.ops.load_library when available; fall back to ctypes.
+        try:
+            try:
+                import torch as _torch
+                _torch.ops.load_library(str(so))
+                a4_ok = True
+                a4_detail = "torch.ops.load_library OK"
+            except Exception:
+                ctypes.CDLL(str(so))
+                a4_ok = True
+                a4_detail = "ctypes.CDLL OK"
+        except Exception as exc:
+            a4_detail = f"load failed: {exc}"
+    sys.stdout.write(
+        f"[e2e-smoke] assert so_loads: "
+        f"{'PASS' if a4_ok else 'FAIL'} "
+        f"(so={so}, detail={a4_detail})\n")
+
+    # ── 5. Final summary ───────────────────────────────────────────────
+    wall = _time.time() - smoke_start
+    all_ok = a1_ok and a2_ok and a3_ok and a4_ok
+    sys.stdout.write(
+        f"\n[e2e-smoke] SUMMARY "
+        f"tuned_config={'PASS' if a1_ok else 'FAIL'} "
+        f"early_stop_info={'PASS' if a2_ok else 'FAIL'} "
+        f"tuned_configs_h={'PASS' if a3_ok else 'FAIL'} "
+        f"so_loads={'PASS' if a4_ok else 'FAIL'} "
+        f"wall={wall:.2f}s "
+        f"=> {'OK' if all_ok else 'FAIL'}\n")
+    return 0 if all_ok else 1
 
 
 def _self_test() -> int:
@@ -10140,6 +10358,27 @@ def _self_test() -> int:
          test_pick_winner_strict_returns_none_when_no_deterministic)
     _run("make_trial_record_propagates_numerical_status",
          test_make_trial_record_pulls_numerical_status)
+
+    # Stream H — final wrapper: only runs the e2e smoke when a GPU is
+    # visible; SKIPs cleanly (and counts as PASS) otherwise.
+    sys.stdout.write("[self-test] e2e_smoke (gated on GPU availability)\n")
+
+    def test_e2e_smoke_gated():
+        """E2E smoke — only runs when a GPU is visible; SKIPs cleanly
+        otherwise."""
+        try:
+            import torch  # noqa: F401
+            gpu_visible = torch.cuda.is_available()
+        except Exception:
+            gpu_visible = False
+        if not gpu_visible:
+            sys.stdout.write("    [e2e-smoke] no CUDA device — skipping\n")
+            return
+        with tempfile.TemporaryDirectory() as td:
+            rc = _e2e_smoke(Path(td), max_seconds=60)
+            assert rc == 0, f"_e2e_smoke returned {rc}"
+
+    _run("e2e_smoke_gated", test_e2e_smoke_gated)
 
     sys.stdout.write(f"\n[self-test] {passed} passed, {failures} failed\n")
     return 1 if failures else 0
