@@ -117,6 +117,24 @@ via arch-specific common headers.
 Legend: 🟡 = written, structurally validated (143 tests pass), not compiled
 on device (no CUDA/HIP toolchain in this environment).
 
+### Model kernel header status
+
+Per-model kernel headers in `grokking_optimizers/kernels/`. Each header
+provides templated per-layer `__device__` forward and backward functions,
+a state struct with raw pointers, constexpr size helpers, and
+arch-specific instructions (wgmma/CUTLASS on sm_90, MFMA on gfx942,
+Pallas/JAX on TPU). All headers share NanPolicy and type-cast helpers
+via arch-specific common headers.
+
+| Model | sm_90 `.cuh` | gfx942 `.hip.hpp` | TPU `.py` | Layers (fwd+bwd) |
+|-------|:---:|:---:|:---:|:---:|
+| Transformer Decoder | 🟡 | 🟡 | 🟡 | 9+8 |
+| Mamba-3 (SSM)       | 🟡 | 🟡 | 🟡 | 8+7 |
+| ViT                 | 🟡 | 🟡 | 🟡 | 10+8 |
+
+Legend: 🟡 = written, structurally validated (247 tests pass), not compiled
+on device (no CUDA/HIP/TPU toolchain in this environment).
+
 ---
 
 ## Filesystem
