@@ -2738,26 +2738,55 @@ class PallasTimer:
 
 
 class TimingWorker:
-    """Persistent timing subprocess; one warm CUDA context for an entire sweep."""
+    """Persistent timing subprocess; one warm CUDA context for an entire sweep.
+
+    A background watchdog thread pings the worker every 30s. If a ping
+    fails or no pong arrives, and the last good pong was >60s ago, the
+    subprocess is SIGKILL'd and re-started transparently so callers can
+    keep using the same worker object across a sweep even when the
+    target GPU wedges or OOMs.
+    """
 
     def __init__(self, opt_class: str, *,
                  size: int = 4096, warmup: int = 5, iters: int = 21,
                  use_cuda_graph: bool = True,
                  timeout_per_variant: int = 180,
                  env: Optional[Dict[str, str]] = None,
+                 env_overlay: Optional[Dict[str, str]] = None,
                  cwd: Optional[Path] = None,
-                 python: Optional[str] = None):
+                 python: Optional[str] = None,
+                 watchdog_interval_s: float = 30.0,
+                 watchdog_grace_s: float = 60.0,
+                 enable_watchdog: bool = True):
         self.opt_class = opt_class
         self.size = size
         self.warmup = warmup
         self.iters = iters
         self.use_cuda_graph = use_cuda_graph
         self.timeout = timeout_per_variant
-        self.env = env or os.environ.copy()
+        # Merge env_overlay (per-GPU overrides) on top of the base env so
+        # MultiGPUTimingPool can pin each worker to a single device via
+        # CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES without mutating the
+        # parent process env.
+        base_env = env if env is not None else os.environ.copy()
+        if env_overlay:
+            base_env = dict(base_env)
+            base_env.update(env_overlay)
+        self.env = base_env
+        self.env_overlay = dict(env_overlay) if env_overlay else None
         self.cwd = cwd
         self.python = python or sys.executable
         self._proc: Optional[subprocess.Popen] = None
         self._error_log: list = []
+        # ---- watchdog ----
+        self._watchdog_interval = float(watchdog_interval_s)
+        self._watchdog_grace = float(watchdog_grace_s)
+        self._enable_watchdog = bool(enable_watchdog)
+        self._watchdog_stop = threading.Event()
+        self._last_pong_ts = time.time()
+        self._watchdog_lock = threading.Lock()
+        self._io_lock = threading.Lock()
+        self._watchdog_thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -2783,16 +2812,31 @@ class TimingWorker:
             self._error_log.append(("start", err))
             self.stop()
             return False
+        self._last_pong_ts = time.time()
+        self._ensure_watchdog()
         return True
 
     def alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
     def restart(self) -> bool:
-        self.stop()
-        return self.start()
+        # Preserve watchdog across restarts: only stop the subprocess,
+        # not the watchdog thread.
+        self._terminate_proc()
+        ok = self.start()
+        return ok
 
     def stop(self) -> None:
+        # Tell the watchdog to exit first so it doesn't race with the
+        # shutdown handshake below by trying to send a ping mid-tear-down.
+        self._watchdog_stop.set()
+        wd = self._watchdog_thread
+        if wd is not None and wd.is_alive() and wd is not threading.current_thread():
+            wd.join(timeout=2.0)
+        self._watchdog_thread = None
+        self._terminate_proc()
+
+    def _terminate_proc(self) -> None:
         if self._proc is None:
             return
         try:
@@ -2815,6 +2859,83 @@ class TimingWorker:
             self._proc = None
 
     # ------------------------------------------------------------------
+    # Watchdog — pings the worker every ``watchdog_interval_s``. If no
+    # pong arrives within ``watchdog_grace_s`` of the last good pong,
+    # SIGKILL the subprocess and restart it.
+    # ------------------------------------------------------------------
+
+    def _ensure_watchdog(self) -> None:
+        if not self._enable_watchdog:
+            return
+        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+            return
+        self._watchdog_stop.clear()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop, daemon=True,
+            name=f"TimingWorker-watchdog-{id(self):x}")
+        self._watchdog_thread.start()
+
+    def _watchdog_loop(self) -> None:
+        while not self._watchdog_stop.is_set():
+            # wait() returns True if the event was set (stop signal)
+            if self._watchdog_stop.wait(self._watchdog_interval):
+                return
+            try:
+                ok = self.ping(_from_watchdog=True)
+                if ok:
+                    self._last_pong_ts = time.time()
+                    continue
+            except Exception as exc:  # noqa: BLE001 — log + continue to age check
+                self._error_log.append(("watchdog_ping", str(exc)))
+            # No pong this cycle — check how stale the last good pong is.
+            age = time.time() - self._last_pong_ts
+            if age > self._watchdog_grace:
+                self._error_log.append(("watchdog", f"no pong for {age:.1f}s; SIGKILL+restart"))
+                self._force_restart()
+                # After restart, prime the timestamp so we don't immediately
+                # re-trigger on the next missed-cycle wraparound.
+                self._last_pong_ts = time.time()
+
+    def _force_restart(self) -> None:
+        """SIGKILL the subprocess (no graceful shutdown) and respawn."""
+        import signal
+        with self._watchdog_lock:
+            try:
+                if self._proc and self._proc.poll() is None:
+                    os.kill(self._proc.pid, signal.SIGKILL)
+            except Exception:
+                pass
+            try:
+                if self._proc:
+                    self._proc.wait(timeout=2.0)
+            except Exception:
+                pass
+            self._proc = None
+            # Re-spawn without re-entering the watchdog plumbing.
+            try:
+                self._proc = subprocess.Popen(
+                    [self.python, "-u", "-c", _WORKER_BODY],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    env=self.env,
+                    cwd=str(self.cwd) if self.cwd else None,
+                )
+                ready = self._read_line(timeout=30)
+                if not ready or ready.get("ready") is not True:
+                    err = ready.get("error") if ready else "no response"
+                    self._error_log.append(("watchdog_restart", err))
+                    if self._proc:
+                        try: self._proc.kill()
+                        except Exception: pass
+                    self._proc = None
+            except Exception as exc:  # noqa: BLE001
+                self._error_log.append(("watchdog_restart_spawn", str(exc)))
+                self._proc = None
+
+    # ------------------------------------------------------------------
     # API
     # ------------------------------------------------------------------
 
@@ -2832,31 +2953,43 @@ class TimingWorker:
             "iters":          self.iters,
             "use_cuda_graph": self.use_cuda_graph,
         }
-        try:
-            assert self._proc and self._proc.stdin
-            self._proc.stdin.write(json.dumps(req) + "\n")
-            self._proc.stdin.flush()
-        except (BrokenPipeError, OSError) as exc:
-            self._error_log.append(("write", str(exc)))
-            return None
-        result = self._read_line(timeout=self.timeout)
+        with self._io_lock:
+            try:
+                assert self._proc and self._proc.stdin
+                self._proc.stdin.write(json.dumps(req) + "\n")
+                self._proc.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                self._error_log.append(("write", str(exc)))
+                return None
+            result = self._read_line(timeout=self.timeout)
         if result is None:
             return None
         if "error" in result:
             self._error_log.append(("time", result.get("error", "?")))
             return None
+        # A successful timing call doubles as a liveness signal for the
+        # watchdog — refresh the pong timestamp so we don't trip the grace
+        # period during a long-running compile burst.
+        self._last_pong_ts = time.time()
         return result
 
-    def ping(self) -> bool:
+    def ping(self, *, _from_watchdog: bool = False) -> bool:
+        """Send a no-op ping to the worker; return True on pong within 5s.
+
+        Sharing the same stdin/stdout requires serialising against any
+        concurrent ``time()`` request — both are short, so a single mutex
+        suffices.
+        """
         if not self.alive():
             return False
-        try:
-            assert self._proc and self._proc.stdin
-            self._proc.stdin.write(json.dumps({"op": "ping"}) + "\n")
-            self._proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            return False
-        line = self._read_line(timeout=5)
+        with self._io_lock:
+            try:
+                assert self._proc and self._proc.stdin
+                self._proc.stdin.write(json.dumps({"op": "ping"}) + "\n")
+                self._proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                return False
+            line = self._read_line(timeout=5)
         return bool(line and line.get("ok"))
 
     @property
@@ -2894,6 +3027,123 @@ class TimingWorker:
             line += ch
         self._error_log.append(("timeout", f"after {timeout}s"))
         return None
+
+
+class MultiGPUTimingPool:
+    """Fan a JIT autotune sweep across every visible GPU.
+
+    When ``CUDA_VISIBLE_DEVICES`` (or ``HIP_VISIBLE_DEVICES`` for HIP)
+    enumerates more than one device, this pool spawns one
+    :class:`TimingWorker` per device with that device pinned via
+    ``*_VISIBLE_DEVICES`` in the worker's env overlay. Round-robin
+    ``time(...)`` calls distribute variants across workers so all GPUs
+    stay busy. The public surface is the same as ``TimingWorker.time`` /
+    ``start`` / ``stop`` / ``alive`` so callers can swap one for the
+    other.
+    """
+
+    _CUDA = "CUDA_VISIBLE_DEVICES"
+    _HIP = "HIP_VISIBLE_DEVICES"
+
+    @classmethod
+    def env_var_for(cls, vendor: str) -> str:
+        return cls._HIP if vendor == "hip" else cls._CUDA
+
+    @classmethod
+    def visible_devices(cls, vendor: str) -> List[str]:
+        """Parse ``CUDA_/HIP_VISIBLE_DEVICES``. Falls back to ``["0"]``
+        when the variable is unset or empty (single-GPU default)."""
+        env_var = cls.env_var_for(vendor)
+        raw = os.environ.get(env_var, "")
+        devices = [d.strip() for d in raw.split(",") if d.strip()]
+        return devices or ["0"]
+
+    def __init__(self, opt_class: str, vendor: str = "cuda", **worker_kwargs):
+        self.opt_class = opt_class
+        self.vendor = vendor
+        self.devices = self.visible_devices(vendor)
+        self._env_var = self.env_var_for(vendor)
+        self.workers: List[TimingWorker] = []
+        for dev in self.devices:
+            w = TimingWorker(
+                opt_class,
+                env_overlay={self._env_var: dev},
+                **worker_kwargs,
+            )
+            self.workers.append(w)
+        self._rr = 0
+        self._rr_lock = threading.Lock()
+
+    # ---- lifecycle mirroring TimingWorker ----------------------------
+
+    def start(self) -> bool:
+        """Start every per-device worker. Returns True iff all came up.
+
+        Failed workers are dropped from the rotation but the pool is
+        still considered usable as long as ≥1 worker is alive — matches
+        the existing ``TimingWorker`` fallback semantics in
+        ``_make_variant_timer``."""
+        any_ok = False
+        live: List[TimingWorker] = []
+        for w in self.workers:
+            if w.start():
+                live.append(w)
+                any_ok = True
+        self.workers = live
+        return any_ok
+
+    def alive(self) -> bool:
+        return any(w.alive() for w in self.workers)
+
+    def stop(self) -> None:
+        for w in self.workers:
+            try:
+                w.stop()
+            except Exception:
+                pass
+
+    def restart(self) -> bool:
+        any_ok = False
+        for w in self.workers:
+            try:
+                if w.restart():
+                    any_ok = True
+            except Exception:
+                pass
+        return any_ok
+
+    # ---- timing API mirroring TimingWorker ---------------------------
+
+    def time(self, variant_so: Path) -> Optional[Dict[str, Any]]:
+        # Pick the next live worker via round-robin. Skip dead workers
+        # so a wedge on one GPU doesn't stall the whole sweep.
+        n = len(self.workers)
+        if n == 0:
+            return None
+        with self._rr_lock:
+            start_idx = self._rr % n
+            self._rr += 1
+        for offset in range(n):
+            w = self.workers[(start_idx + offset) % n]
+            if not w.alive():
+                continue
+            return w.time(variant_so)
+        return None
+
+    @property
+    def error_log(self) -> list:
+        merged: list = []
+        for i, w in enumerate(self.workers):
+            for entry in w.error_log:
+                merged.append((f"gpu{i}",) + tuple(entry))
+        return merged
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.stop()
 
 
 # ===========================================================================
@@ -3723,6 +3973,131 @@ class CompileCache:
                 e["early_stop_info"] = early_stop_info
             self._dirty = True
 
+    # ── Garbage collection ────────────────────────────────────────────
+
+    def prune(self, *, max_age_days: int = 30, keep_top_n: int = 100,
+              dry_run: bool = False) -> Dict[str, Any]:
+        """Drop variant_artifacts older than ``max_age_days`` AND those not
+        in the top-N timings per ``(opt, model, arch)`` group.
+
+        Returns a summary dict ``{dropped, kept, bytes_freed,
+        max_age_days, keep_top_n, dry_run, entries_scanned}``.
+
+        Timing rank is taken from each entry's ``sweep_history`` +
+        ``bayesian_trials`` (matched by ``config_key``); variants with
+        no recorded timing are treated as ``inf`` and pruned first.
+        Pruning is conservative: the tuned winner (``tuned_config``) is
+        always kept, even if it falls outside ``keep_top_n`` or is older
+        than ``max_age_days``.
+        """
+        now = time.time()
+        cutoff_ts = now - max_age_days * 86400
+        dropped = 0
+        kept = 0
+        bytes_freed = 0
+        entries_scanned = 0
+
+        with self._lock:
+            entries = self._data.get("entries", {})
+            for entry_key, entry in entries.items():
+                # Cache key format: "<opt>/<model>/<arch>". Skip anything
+                # that doesn't match — defensive against bad data.
+                parts = entry_key.split("/")
+                if len(parts) != 3:
+                    continue
+                entries_scanned += 1
+                variants = entry.get("variant_artifacts") or {}
+                if not isinstance(variants, dict) or not variants:
+                    continue
+
+                # Per-ckey best timing from trial history. We scan both
+                # buckets so a v2-style cache (sweep_history only) still
+                # gets ranked correctly.
+                best_ms: Dict[str, float] = {}
+                for src in ("sweep_history", "bayesian_trials"):
+                    for t in entry.get(src) or []:
+                        if not isinstance(t, dict):
+                            continue
+                        ck = t.get("config_key")
+                        tms = t.get("timing_ms")
+                        if ck is None or tms is None:
+                            continue
+                        prior = best_ms.get(ck, math.inf)
+                        if tms < prior:
+                            best_ms[ck] = tms
+
+                # Always preserve the tuned winner's ckey if present.
+                tuned = entry.get("tuned_config") or {}
+                tuned_ckey = tuned.get("config_key") if isinstance(tuned, dict) else None
+
+                # Rank ckeys by best timing (ascending); unscored ckeys
+                # go to the tail with inf so they're prunable first.
+                ranked = sorted(
+                    variants.keys(),
+                    key=lambda ck: best_ms.get(ck, math.inf),
+                )
+                top_keep = set(ranked[:max(0, int(keep_top_n))])
+                if tuned_ckey:
+                    top_keep.add(tuned_ckey)
+
+                # Pass 1: classify + delete .so files.
+                to_drop_keys: List[str] = []
+                for ckey, vrec in list(variants.items()):
+                    if not isinstance(vrec, dict):
+                        # Garbage — drop on sight.
+                        to_drop_keys.append(ckey)
+                        continue
+                    mtime = vrec.get("mtime")
+                    if mtime is None:
+                        # Treat unknown mtime as "old" so we don't keep
+                        # ancient garbage forever, but spare the tuned
+                        # winner.
+                        age_ok = (ckey == tuned_ckey)
+                    else:
+                        age_ok = mtime >= cutoff_ts or (ckey == tuned_ckey)
+                    rank_ok = ckey in top_keep
+
+                    if age_ok and rank_ok:
+                        kept += 1
+                        continue
+
+                    # Drop: try to unlink the .so, then forget the record.
+                    so_path = vrec.get("path") or vrec.get("so_path")
+                    if so_path:
+                        p = Path(so_path)
+                        try:
+                            if p.exists():
+                                sz = p.stat().st_size
+                                bytes_freed += sz
+                                if not dry_run:
+                                    try:
+                                        p.unlink()
+                                    except OSError:
+                                        pass
+                        except OSError:
+                            pass
+                    to_drop_keys.append(ckey)
+                    dropped += 1
+
+                # Pass 2: actually remove the records from the entry.
+                if not dry_run and to_drop_keys:
+                    for ckey in to_drop_keys:
+                        variants.pop(ckey, None)
+                    self._dirty = True
+
+            if not dry_run and self._dirty:
+                self.save()
+
+        return {
+            "dropped":         dropped,
+            "kept":            kept,
+            "bytes_freed":     bytes_freed,
+            "max_age_days":    max_age_days,
+            "keep_top_n":      keep_top_n,
+            "dry_run":         bool(dry_run),
+            "entries_scanned": entries_scanned,
+        }
+
 
 # ---------------------------------------------------------------------------
 # BuildSpec
@@ -3774,6 +4149,11 @@ class BuildSpec:
     _emitted_sources: Dict[str, Path] = field(default_factory=dict)
     # Stream 8 — device-side PGO (CUPTI / rocprof / XLA HLO dump)
     enable_device_pgo: bool = False
+    # Stream 9 — variant cache GC. Auto-prune runs at the END of a
+    # successful JIT autotune pass; controls map 1:1 to CompileCache.prune().
+    prune_after_autotune: bool = True
+    prune_max_age_days: int = 30
+    prune_keep_top_n: int = 100
 
 
 def _ensure_nvcc_on_path() -> Optional[str]:
@@ -5801,13 +6181,33 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
                      f"pass rate); Bayesian TPE samples directly — no "
                      f"materialization\n")
 
-    # Spawn the persistent worker.
-    worker = TimingWorker(opt_class=OPT_CLASS[spec.optimizer])
-    if not worker.start():
-        report.write("  [worker] start FAILED; falling back to one-shot per variant.\n")
-        worker = None
-    else:
-        report.write("  [worker] persistent timing worker is up.\n")
+    # Spawn the persistent worker(s). When CUDA_VISIBLE_DEVICES /
+    # HIP_VISIBLE_DEVICES enumerates >1 device, fan the sweep across
+    # every device via MultiGPUTimingPool. The pool's public surface
+    # matches TimingWorker, so the timer closure below is unchanged.
+    vendor = get_arch_entry(spec.arch).vendor
+    visible = MultiGPUTimingPool.visible_devices(vendor)
+    worker: Optional[Any] = None
+    if len(visible) > 1:
+        report.write(f"  [worker] {len(visible)} GPUs visible "
+                     f"({','.join(visible)}); spawning MultiGPUTimingPool.\n")
+        pool = MultiGPUTimingPool(OPT_CLASS[spec.optimizer], vendor=vendor)
+        if pool.start():
+            worker = pool
+            report.write(f"  [worker] multi-GPU pool up with "
+                         f"{len(pool.workers)} worker(s).\n")
+        else:
+            report.write("  [worker] multi-GPU pool failed to start; "
+                         "falling back to single worker.\n")
+    if worker is None:
+        single = TimingWorker(opt_class=OPT_CLASS[spec.optimizer])
+        if not single.start():
+            report.write("  [worker] start FAILED; falling back to "
+                         "one-shot per variant.\n")
+            worker = None
+        else:
+            report.write("  [worker] persistent timing worker is up.\n")
+            worker = single
 
     progress_state = {"last_start": time.monotonic(), "window": []}
     timer = _make_variant_timer(
@@ -5824,7 +6224,29 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
                                     space_hash, report)
     finally:
         if worker is not None:
-            worker.stop()
+            try:
+                worker.stop()
+            except Exception:
+                pass
+
+    # Auto-prune the variant cache so a long-running autotune campaign
+    # doesn't accumulate gigabytes of stale .so files. Only runs on a
+    # successful sweep; opt out with spec.prune_after_autotune=False.
+    if winning is not None and getattr(spec, "prune_after_autotune", True):
+        try:
+            summary = cache.prune(
+                max_age_days=spec.prune_max_age_days,
+                keep_top_n=spec.prune_keep_top_n,
+            )
+            report.write(
+                f"  [auto-prune] dropped={summary['dropped']} "
+                f"kept={summary['kept']} "
+                f"freed={summary['bytes_freed']/1e6:.2f} MB "
+                f"(max_age_days={summary['max_age_days']}, "
+                f"keep_top_n={summary['keep_top_n']})\n")
+        except Exception as exc:  # noqa: BLE001 — never let GC fail the build
+            report.write(f"  [auto-prune] skipped: {exc}\n")
+
     return winning
 
 
@@ -6565,6 +6987,9 @@ def build(
     config: Optional[Any] = None,
     enable_emitter: bool = False,
     enable_device_pgo: bool = False,
+    prune_after_autotune: bool = True,
+    prune_max_age_days: int = 30,
+    prune_keep_top_n: int = 100,
 ) -> Optional[Path]:
     """In-process orchestrator. ``main`` handles subprocess split.
 
@@ -6667,6 +7092,9 @@ def build(
         enable_runtime_specialization=enable_runtime_specialization,
         enable_emitter=enable_emitter,
         enable_device_pgo=enable_device_pgo,
+        prune_after_autotune=prune_after_autotune,
+        prune_max_age_days=prune_max_age_days,
+        prune_keep_top_n=prune_keep_top_n,
     )
 
     # Stream 11: optionally load project config and apply to spec. Strictly
@@ -6992,6 +7420,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="Install jax[tpu] from the libtpu_releases "
                              "bucket if no TPU device is visible. Pallas/TPU "
                              "archs (tpu_v*) only.")
+
+    # ── Variant-cache GC (Stream 9) ─────────────────────────────────
+    parser.add_argument("--prune", action="store_true",
+                        help="Prune the variant cache and exit (no build). "
+                             "Honours --prune-max-age-days / --prune-keep-top-n.")
+    parser.add_argument("--prune-max-age-days", type=int, default=30,
+                        help="Variants older than N days are dropped "
+                             "(default: 30).")
+    parser.add_argument("--prune-keep-top-n", type=int, default=100,
+                        help="Per (opt, model, arch) keep only the top-N "
+                             "fastest variants (default: 100).")
+    parser.add_argument("--no-auto-prune", action="store_true",
+                        help="Skip the auto-prune step at the end of a "
+                             "successful JIT autotune pass.")
     args = parser.parse_args(argv)
 
     # Stream 11: pre-load the project config so module-level defaults can be
@@ -7017,6 +7459,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.quick:
         args.mode = "bayesian"
         args.bayesian_trials = QUICK_BAYESIAN_TRIALS
+
+    # ── --prune mode: GC the variant cache and exit, no build ──────
+    if args.prune:
+        cache_path = args.cache or (args.out / DEFAULT_CACHE_NAME)
+        cache = CompileCache(cache_path)
+        summary = cache.prune(
+            max_age_days=args.prune_max_age_days,
+            keep_top_n=args.prune_keep_top_n,
+        )
+        sys.stdout.write(
+            f"[prune] cache={cache_path} "
+            f"entries_scanned={summary['entries_scanned']} "
+            f"dropped={summary['dropped']} kept={summary['kept']} "
+            f"freed={summary['bytes_freed']/1e6:.2f}MB "
+            f"(max_age_days={summary['max_age_days']}, "
+            f"keep_top_n={summary['keep_top_n']})\n")
+        return 0
 
     # ── Runtime split: spawn AOT then JIT, then return ──────────────
     if args.runtime == "both":
@@ -7080,6 +7539,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         config=project_cfg,
         enable_emitter=args.enable_emitter,
         enable_device_pgo=args.enable_device_pgo,
+        prune_after_autotune=not args.no_auto_prune,
+        prune_max_age_days=args.prune_max_age_days,
+        prune_keep_top_n=args.prune_keep_top_n,
     )
 
     report = args.report or (
@@ -7750,6 +8212,157 @@ def _self_test() -> int:
 
     _run("v2_to_v3_migration", test_v2_to_v3_migration)
     _run("cache_round_trips", test_cache_round_trips)
+
+    def test_cache_prune():
+        """Populate 5 variants, prune to top-2 by timing, verify 3 dropped
+        + .so files unlinked + bytes_freed accounted for."""
+        td = Path(tempfile.mkdtemp())
+        try:
+            cp = td / "cache.json"
+            cache = CompileCache(cp)
+            # Create 5 fake .so files with content so bytes_freed is non-zero.
+            so_paths: List[Path] = []
+            for i in range(5):
+                p = td / f"v{i}.so"
+                p.write_bytes(b"x" * (1024 * (i + 1)))
+                so_paths.append(p)
+                cache.record_variant("lion", "mamba", "sm_90",
+                                     config_key=f"block-{128 + i*32}",
+                                     so_path=p)
+                # And synthesise a trial record so prune can rank by timing.
+                cache.record_trial("lion", "mamba", "sm_90", {
+                    "trial_num":   i,
+                    "stage":       "exhaustive",
+                    "config":      {"block": 128 + i*32},
+                    "config_key":  f"block-{128 + i*32}",
+                    # i=0 is the fastest, i=4 is the slowest.
+                    "timing_ms":   0.1 + i * 0.5,
+                    "min_ms":      0.09 + i * 0.5,
+                    "max_ms":      0.12 + i * 0.5,
+                    "n":           21,
+                    "host":        {},
+                    "recorded_at": datetime.datetime.now().isoformat(),
+                })
+            summary = cache.prune(max_age_days=30, keep_top_n=2)
+            assert summary["kept"] == 2, summary
+            assert summary["dropped"] == 3, summary
+            # bytes_freed should be the sum of sizes for v2/v3/v4
+            # (i=2 → 3KB, i=3 → 4KB, i=4 → 5KB = 12KB total).
+            assert summary["bytes_freed"] == (3 + 4 + 5) * 1024, summary
+            # The three pruned .so files are gone; the top-2 survive.
+            assert not so_paths[2].exists()
+            assert not so_paths[3].exists()
+            assert not so_paths[4].exists()
+            assert so_paths[0].exists()
+            assert so_paths[1].exists()
+            # Entry's variant_artifacts now has only the kept ckeys.
+            e = cache.get("lion", "mamba", "sm_90")
+            assert set(e["variant_artifacts"].keys()) == {"block-128", "block-160"}, \
+                list(e["variant_artifacts"].keys())
+        finally:
+            shutil.rmtree(td)
+
+    def test_cache_prune_dry_run():
+        """dry_run reports what *would* be dropped without touching anything."""
+        td = Path(tempfile.mkdtemp())
+        try:
+            cp = td / "cache.json"
+            cache = CompileCache(cp)
+            for i in range(3):
+                p = td / f"v{i}.so"
+                p.write_bytes(b"z" * 100)
+                cache.record_variant("lion", "mamba", "sm_90",
+                                     config_key=f"k{i}", so_path=p)
+                cache.record_trial("lion", "mamba", "sm_90", {
+                    "trial_num": i, "stage": "exhaustive",
+                    "config": {"i": i}, "config_key": f"k{i}",
+                    "timing_ms": float(i + 1), "min_ms": float(i),
+                    "max_ms": float(i + 2), "n": 21, "host": {},
+                    "recorded_at": datetime.datetime.now().isoformat(),
+                })
+            summary = cache.prune(max_age_days=30, keep_top_n=1, dry_run=True)
+            assert summary["dropped"] == 2 and summary["kept"] == 1, summary
+            assert summary["dry_run"] is True
+            # Nothing actually removed.
+            assert (td / "v0.so").exists()
+            assert (td / "v1.so").exists()
+            assert (td / "v2.so").exists()
+            e = cache.get("lion", "mamba", "sm_90")
+            assert len(e["variant_artifacts"]) == 3
+        finally:
+            shutil.rmtree(td)
+
+    _run("cache_prune", test_cache_prune)
+    _run("cache_prune_dry_run", test_cache_prune_dry_run)
+
+    sys.stdout.write("[self-test] multi_gpu_pool\n")
+
+    def test_visible_devices_default():
+        """With CUDA_VISIBLE_DEVICES unset, default to a single '0' device."""
+        saved = os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        try:
+            devs = MultiGPUTimingPool.visible_devices("cuda")
+            assert devs == ["0"], devs
+        finally:
+            if saved is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = saved
+
+    def test_visible_devices_multi():
+        """Comma-separated env var → list of devices in order."""
+        saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,3"
+        try:
+            devs = MultiGPUTimingPool.visible_devices("cuda")
+            assert devs == ["0", "1", "3"], devs
+        finally:
+            if saved is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = saved
+
+    def test_visible_devices_hip():
+        """HIP backend reads HIP_VISIBLE_DEVICES, not CUDA_VISIBLE_DEVICES."""
+        saved_hip = os.environ.get("HIP_VISIBLE_DEVICES")
+        saved_cuda = os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        os.environ["HIP_VISIBLE_DEVICES"] = "2,4"
+        try:
+            devs = MultiGPUTimingPool.visible_devices("hip")
+            assert devs == ["2", "4"], devs
+            # CUDA env var is irrelevant for HIP.
+            assert MultiGPUTimingPool.env_var_for("hip") == "HIP_VISIBLE_DEVICES"
+            assert MultiGPUTimingPool.env_var_for("cuda") == "CUDA_VISIBLE_DEVICES"
+        finally:
+            if saved_hip is None:
+                os.environ.pop("HIP_VISIBLE_DEVICES", None)
+            else:
+                os.environ["HIP_VISIBLE_DEVICES"] = saved_hip
+            if saved_cuda is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = saved_cuda
+
+    def test_pool_constructs_per_device_workers():
+        """Constructing the pool spawns one TimingWorker per visible device,
+        each with the appropriate env_overlay (no subprocesses are started
+        because we never call .start())."""
+        saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+        try:
+            pool = MultiGPUTimingPool("Lion", vendor="cuda",
+                                      enable_watchdog=False)
+            assert len(pool.workers) == 2
+            assert pool.workers[0].env_overlay == {"CUDA_VISIBLE_DEVICES": "0"}
+            assert pool.workers[1].env_overlay == {"CUDA_VISIBLE_DEVICES": "1"}
+            assert pool.workers[0].env["CUDA_VISIBLE_DEVICES"] == "0"
+            assert pool.workers[1].env["CUDA_VISIBLE_DEVICES"] == "1"
+        finally:
+            if saved is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = saved
+
+    _run("visible_devices_default", test_visible_devices_default)
+    _run("visible_devices_multi", test_visible_devices_multi)
+    _run("visible_devices_hip", test_visible_devices_hip)
+    _run("pool_constructs_per_device_workers", test_pool_constructs_per_device_workers)
 
     sys.stdout.write("[self-test] kernel_headers\n")
 
