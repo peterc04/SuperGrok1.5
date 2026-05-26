@@ -367,16 +367,16 @@ distribution is detected automatically.
 ### Codegen / Jinja2 kernel emission backend
 
 `--enable-emitter`. Compiles per-variant kernels from Jinja2 templates
-under `grokking_optimizers/templates/` instead of re-compiling one
-fixed source with `-D` macros. Templates emit **structurally
-different** kernels (warp-specialized vs cooperative vs persistent vs
-stream-K mainloop; different wgmma/tcgen05/MFMA shapes; baked-in
-swizzle patterns; epilogue fusions).
+**bundled inside compile.py** (`_BUNDLED_TEMPLATES` dict) instead of
+re-compiling one fixed source with `-D` macros. Templates emit
+**structurally different** kernels (warp-specialized vs cooperative vs
+persistent vs stream-K mainloop; different wgmma/tcgen05/MFMA shapes;
+baked-in swizzle patterns; epilogue fusions).
 
 Cache key: SHA256(template source + JSON config). Identical configs
 produce the same emitted file. Optional `nvcc --cuda --dryrun`
 validation when nvcc is on PATH. CUTLASS profiler integration for
-GEMM-shaped subproblems is scaffolded (see `codegen.emit_cutlass_gemm_variants`).
+GEMM-shaped subproblems is scaffolded (see `emit_cutlass_gemm_variants`).
 
 ### Runtime kernel specialization — NVRTC / hipRTC
 
@@ -444,12 +444,14 @@ process if a `ping` times out (60s).
 
 ### TOML project config
 
-`--config path/to/your.toml`. Loader (`grokking_optimizers.compile_config`)
-merges in priority order:
+`--config path/to/your.toml`. Loader (`load_config`, exposed via the
+legacy `grokking_optimizers.compile_config` shim) merges in priority
+order:
 
 1. Path passed via `build(config=…)` / `--config`
 2. `./compile_config.toml` in CWD
-3. Packaged default at `grokking_optimizers/compile_config.toml`
+3. Packaged defaults — now inlined inside compile.py as the
+   `_DEFAULT_PROJECT_CONFIG` dict (no external TOML file needed)
 
 12 sections: `[project]`, `[sources]`, `[optimizers]`, `[models]`,
 `[archs]`, `[pgo]`, `[autotune]`, `[codegen]`, `[runtime_specialization]`,
@@ -477,11 +479,25 @@ optimizer kernels (`csrc/algorithms/`) and model kernels
 architecture. The search spaces, dim names, feature flags, prefilter
 rules, NVRTC kernel templates, and PGO workload are all calibrated for
 SuperGrok v2 / Mamba-3 / PEER / GRU meta-net optimizer workloads. To
-adapt it for a different project, you would override
-`compile_config.toml`'s `[sources]` / `[optimizers]` / `[models]`
-sections, write your own per-op Jinja2 templates under
-`grokking_optimizers/templates/`, and add per-arch search-space
-builders to `_populate_search_space_builders()`.
+adapt it for a different project, drop a `compile_config.toml` next to
+your invocation overriding `[sources]` / `[optimizers]` / `[models]`,
+add per-op Jinja2 templates to the `_BUNDLED_TEMPLATES` dict at the
+top of compile.py, and extend `_populate_search_space_builders()` with
+your per-arch dim lists.
+
+### Everything lives in one file
+
+All MAXIMAL pipeline features — Jinja2 codegen, NVRTC/hipRTC kernel
+registry, CUPTI/rocprof device PGO, TOML config loader, Pallas backend
+— are inlined into `grokking_optimizers/compile.py` itself. There are
+no extra Python modules in `grokking_optimizers/` for these features.
+For backward compatibility the legacy import paths
+(`from grokking_optimizers.codegen import …`,
+`from grokking_optimizers.kernel_registry import …`,
+`from grokking_optimizers.device_profiling import …`,
+`from grokking_optimizers.compile_config import …`) still resolve —
+each is registered as a `sys.modules` alias pointing at
+`compile.py` so existing callers keep working unchanged.
 
 ---
 
