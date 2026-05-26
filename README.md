@@ -52,9 +52,23 @@ pass — all streamed to your terminal in real time so you can see every
 compiler invocation, every autotune trial, every cache hit/miss, and
 the full env state.
 
+**Important:** run Python from the repo root (the directory `cd`'d into
+in Step 1). The block below adds the repo root to `sys.path` so the
+import works whether you're in a REPL, a script saved elsewhere, or
+running with `python -c`.
+
 ```python
 import os, sys
 from pathlib import Path
+
+# ─── make the cloned source importable (no pip install required) ──────────
+REPO_ROOT = Path.cwd()                                     # change if needed
+assert (REPO_ROOT / "grokking_optimizers" / "compile.py").is_file(), (
+    f"grokking_optimizers/ not found under {REPO_ROOT}. "
+    "Either `cd` into the cloned SuperGrok1.5/ first, or set "
+    "REPO_ROOT = Path('/absolute/path/to/SuperGrok1.5')."
+)
+sys.path.insert(0, str(REPO_ROOT))
 
 # ─── your selection ───────────────────────────────────────────────────────
 OPTIMIZER = "adamw"            # adamw | lion | grokfast | grokadamw | looksam |
@@ -143,11 +157,19 @@ handles this.
 ### Step 4 — Profile (one step, also fully debug-able)
 
 ```python
+# If running this in a fresh Python session (not the same one as Step 3),
+# re-add the repo root so the import resolves:
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd()))   # assumes you're in SuperGrok1.5/
+
 from grokking_optimizers.profile import profile
 
 report = profile(
-    optimizer=OPTIMIZER, model=MODEL, arch=ARCH,
-    debug=True,                # stream ncu/rocprof/jax.profiler live
+    optimizer="adamw",   # same OPTIMIZER you compiled in Step 3
+    model="decoder",     # same MODEL
+    arch="sm_90",        # same ARCH
+    debug=True,          # stream ncu/rocprof/jax.profiler live
 )
 print("profile report:", report)
 
@@ -179,6 +201,10 @@ If anything in Step 3 goes wrong before the compile actually starts,
 run the inline self-test to confirm the Python install is sound:
 
 ```python
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd()))   # assumes you're in SuperGrok1.5/
+
 from grokking_optimizers.compile import main as compile_main
 assert compile_main(["--self-test"]) == 0  # prints "[self-test] 18 passed, 0 failed"
 ```
@@ -187,6 +213,7 @@ assert compile_main(["--self-test"]) == 0  # prints "[self-test] 18 passed, 0 fa
 
 | Symptom | Fix |
 |---------|-----|
+| `ModuleNotFoundError: No module named 'grokking_optimizers'` | You're running Python from outside the cloned `SuperGrok1.5/` directory, or `sys.path` doesn't include it. Add `sys.path.insert(0, str(Path.cwd()))` (Step 3 block already does this) before any `from grokking_optimizers...` import — or point `REPO_ROOT` at the absolute path of the cloned repo. No `pip install -e .` required just to run `compile.py` / `profile.py`. |
 | `CUDA_HOME environment variable is not set` | `os.environ["CUDA_HOME"] = "/usr/local/cuda"` (Step 3 block already does this). Required even when `nvcc` is on `PATH`. |
 | `No supported GPU backend detected` from setup.py | `env["FORCE_CUDA"] = "1"` before the `pip install -e .` subprocess. |
 | `nvcc not on PATH; skipping version-gated flags` in the streamed report | Install CUDA Toolkit ≥ 12.0 and prepend `$CUDA_HOME/bin` to `PATH`. Build still runs but won't auto-add `--split-compile`. |
