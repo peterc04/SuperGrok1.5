@@ -117,7 +117,9 @@ Importable::
     cache = CompileCache(Path("build/.compile_cache.json"))
     so_path = build(optimizer="supergrok2", model="mamba", arch="sm_90",
                     cache=cache, autotune_mode="bayesian",
-                    bayesian_trials=500, pgo=False)
+                    bayesian_trials=None,  # None = multi-criterion auto-stop
+                    max_tune_seconds=900,  # 15-minute wall-clock cap
+                    pgo=False)
 """
 
 from __future__ import annotations
@@ -2012,6 +2014,184 @@ class TimingWorker:
 # grokking_optimizers/bayesian.py)
 # ===========================================================================
 
+# ---------------------------------------------------------------------------
+# Stream 5 — Bayesian early-stopping (BayesianEarlyStopper, elbow detector)
+# ---------------------------------------------------------------------------
+#
+# Replaces hardcoded ``bayesian_trials=500`` / ``top_k=20`` knobs with a
+# multi-criterion auto-stop loop. The class exposes ``observe(value, params)``
+# (called per completed trial) and ``should_stop()`` (polled before asking
+# Optuna for the next trial). Triggers, evaluated in order:
+#
+#   (a) best-so-far plateau   — no relative improvement > ``min_delta_rel``
+#                               for ``patience`` consecutive trials.
+#   (b) EI exhaustion         — rolling Expected-Improvement estimate falls
+#                               below ``ei_floor`` (currently a no-op slot —
+#                               TPE doesn't expose EI directly; reserved for
+#                               a Stream-future GP sampler).
+#   (c) coverage saturation   — count of distinct (dim_name, value) pairs
+#                               grows by less than ``coverage_growth_floor``
+#                               per trial over the trailing ``patience``
+#                               window — i.e. TPE is just resampling the
+#                               same handful of corners.
+#   (d) wall-clock budget     — ``max_seconds`` from stopper construction.
+#   (e) hard ceiling          — ``max_trials`` (sanity guard, default 1M).
+#
+# Auto patience: ``max(50, trial_count // 10)`` so the patience window
+# scales with how much exploration has already happened.
+
+def _hashable(v):
+    """Make a search-space value hashable for the coverage set."""
+    if isinstance(v, list):
+        return tuple(v)
+    return v
+
+
+class BayesianEarlyStopper:
+    """Multi-criterion stopper for Optuna autotune.
+
+    Stops when ANY of the following triggers (whichever fires first):
+      (a) Best-so-far plateau: no improvement > ``min_delta_rel`` for
+          ``patience`` trials.
+      (b) EI exhaustion: rolling EI estimate falls below ``ei_floor``
+          (reserved; TPE samplers don't expose EI here).
+      (c) Coverage saturation: new-(dim_name, value) tuples per trial
+          < ``coverage_growth_floor``.
+      (d) Wall-clock budget: ``time.time() - start_time > max_seconds``.
+      (e) Hard ceiling: ``trial_count >= max_trials`` (sanity, default 1M).
+    """
+
+    def __init__(self, *,
+                 min_delta_rel: float = 0.005,
+                 patience: Optional[int] = None,
+                 ei_floor: float = 1e-6,
+                 coverage_growth_floor: float = 0.001,
+                 max_seconds: Optional[float] = None,
+                 max_trials: int = 1_000_000):
+        self.min_delta_rel = min_delta_rel
+        self._patience_override = patience  # None → auto = max(50, 0.1*N)
+        self.ei_floor = ei_floor
+        self.coverage_growth_floor = coverage_growth_floor
+        self.max_seconds = max_seconds
+        self.max_trials = max_trials
+        self.start_time = time.time()
+        self.best = math.inf
+        self.last_improve_trial = 0
+        self.coverage_set: set = set()  # (dim_name, value) tuples
+        self.coverage_history: List[int] = []  # cumulative |coverage_set| per trial
+        self.trial_count = 0
+        self.stop_reason: Optional[str] = None
+
+    @property
+    def patience(self) -> int:
+        if self._patience_override is not None:
+            return self._patience_override
+        return max(50, self.trial_count // 10)
+
+    def observe(self, trial_value: float, trial_params: Dict[str, Any]) -> None:
+        self.trial_count += 1
+        # Plateau tracking — only count finite improvements as such.
+        if math.isfinite(trial_value) and \
+                trial_value < self.best * (1 - self.min_delta_rel):
+            self.best = trial_value
+            self.last_improve_trial = self.trial_count
+        # Coverage tracking
+        for k, v in trial_params.items():
+            self.coverage_set.add((k, _hashable(v)))
+        self.coverage_history.append(len(self.coverage_set))
+
+    def should_stop(self) -> bool:
+        if self.stop_reason is not None:
+            return True
+        # (e) hard ceiling
+        if self.trial_count >= self.max_trials:
+            self.stop_reason = f"hard_ceiling:{self.max_trials}"
+            return True
+        # (d) wall-clock
+        if self.max_seconds is not None:
+            elapsed = time.time() - self.start_time
+            if elapsed >= self.max_seconds:
+                self.stop_reason = f"max_seconds:{int(elapsed)}s"
+                return True
+        # Need a warm-up of at least patience+10 trials before other criteria fire
+        if self.trial_count < self.patience + 10:
+            return False
+        # (a) best-so-far plateau
+        if (self.trial_count - self.last_improve_trial) >= self.patience:
+            self.stop_reason = f"plateau:no_improvement_in_{self.patience}"
+            return True
+        # (c) coverage saturation: growth over last `patience` trials
+        if len(self.coverage_history) >= self.patience:
+            window_growth = (self.coverage_history[-1]
+                             - self.coverage_history[-self.patience])
+            growth_rate = window_growth / max(1, self.patience)
+            if growth_rate < self.coverage_growth_floor:
+                self.stop_reason = (
+                    f"coverage_saturated:growth_rate={growth_rate:.4f}")
+                return True
+        return False
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize stopper state for cache persistence."""
+        return {
+            "min_delta_rel": self.min_delta_rel,
+            "patience_override": self._patience_override,
+            "ei_floor": self.ei_floor,
+            "coverage_growth_floor": self.coverage_growth_floor,
+            "max_seconds": self.max_seconds,
+            "max_trials": self.max_trials,
+            "trial_count": self.trial_count,
+            "best": self.best,
+            "last_improve_trial": self.last_improve_trial,
+            "coverage_size": len(self.coverage_set),
+            "stop_reason": self.stop_reason,
+        }
+
+
+def _detect_topk_elbow(records: List[Dict[str, Any]]) -> int:
+    """Detect the elbow in a sorted-by-timing trial list.
+
+    Sort successful records by ``timing_ms`` (ascending), compute the
+    second discrete differences over the timing series, return the index
+    where the curvature peaks (i.e. the knee where good trials end and
+    long-tail trials begin). Capped at 50 and at len(records).
+
+    Fallback: ``min(50, len(records) // 4)`` when there's too little
+    data to fit a curvature estimate or all timings are degenerate.
+    """
+    ok = [r for r in records if (r.get("status") == "ok"
+                                  or r.get("timing_ms") is not None)]
+    n = len(ok)
+    if n == 0:
+        return 0
+    if n < 5:
+        return min(50, max(1, n))
+    # Extract timings (records may use 'timing_ms' or 'value_ms')
+    def _val(r):
+        v = r.get("timing_ms")
+        if v is None:
+            v = r.get("value_ms")
+        return float(v) if v is not None else math.inf
+    times = sorted(_val(r) for r in ok)
+    times = [t for t in times if math.isfinite(t)]
+    if len(times) < 5:
+        return min(50, max(1, len(times) or 1))
+    # Second discrete differences: t[i-1] - 2*t[i] + t[i+1]
+    d2 = [times[i - 1] - 2.0 * times[i] + times[i + 1]
+          for i in range(1, len(times) - 1)]
+    # Peak negative curvature would be a max of |d2|; we want the first
+    # index where d2 spikes substantially. Take argmax of -d2 (since
+    # the knee is where the second derivative becomes large and negative
+    # in a convex-then-flat curve).
+    if not d2 or all(abs(x) < 1e-12 for x in d2):
+        return min(50, max(1, len(times) // 4))
+    # The knee index in the original 'times' array is d2_idx + 1
+    knee = max(range(len(d2)), key=lambda i: -d2[i]) + 1
+    # Ensure at least a few seeds even if curvature is shallow
+    knee = max(knee, min(3, len(times)))
+    return min(50, knee)
+
+
 def _make_pruner(name: str):
     """Return an Optuna pruner. ``name`` in {none, median, hyperband}."""
     name = (name or "none").lower()
@@ -2059,11 +2239,30 @@ def _make_trial_record(stage: str, trial_num: int, cfg: Dict[str, Any],
     }
 
 
+def _coerce_timer_result(raw: Any) -> Tuple[Optional[Dict[str, Any]], float]:
+    """Normalise a timer return value.
+
+    The C++/CUDA variant timer returns ``{"timing_ms": float, ...}`` (or
+    ``None`` on failure). Synthetic test timers may return a bare float.
+    Returns ``(result_dict_or_None, scalar_value_for_optuna)``.
+    """
+    if raw is None:
+        return None, math.inf
+    if isinstance(raw, dict):
+        v = raw.get("timing_ms")
+        return raw, float(v) if v is not None else math.inf
+    if isinstance(raw, (int, float)):
+        v = float(raw)
+        return ({"timing_ms": v, "min_ms": v, "max_ms": v, "n": 1},
+                v if math.isfinite(v) else math.inf)
+    raise TypeError(f"timer returned unsupported type {type(raw).__name__}")
+
+
 def run_bayesian(
     arch: str,
     space: Dict[str, Any],
     *,
-    n_trials: int = 500,
+    n_trials: Optional[int] = None,
     seed: int = 0,
     storage: Optional[Path] = None,
     study_name: str = "sg_tune",
@@ -2073,8 +2272,20 @@ def run_bayesian(
     prefiltered: Optional[List[Dict[str, Any]]] = None,
     pruner: str = "none",
     seed_trials: Optional[List[Dict[str, Any]]] = None,
-) -> List[Dict[str, Any]]:
-    """Run the TPE stage. Returns the list of trial records."""
+    stopper: Optional["BayesianEarlyStopper"] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Run the TPE stage with multi-criterion early stopping.
+
+    Returns ``(records, stop_info)`` where ``stop_info`` is the
+    ``BayesianEarlyStopper.to_dict()`` snapshot capturing why the loop
+    halted (plateau / coverage saturated / wall-clock budget / manual
+    ``n_trials`` cap).
+
+    ``n_trials`` is now optional: when ``None`` (default), the loop
+    runs until the stopper fires. When set, it acts as a hard cap on
+    top of the stopper's other criteria — useful for explicit
+    reproducible budgets (and for the ``--quick`` and self-test paths).
+    """
     dims = space[arch]["dims"]
     # Build a per-config feasibility predicate from the prefilter rules
     # so we can validate TPE suggestions in O(rules) without enumerating
@@ -2082,9 +2293,19 @@ def run_bayesian(
     is_feasible = compile_feasibility_check(
         space[arch].get("prefilter", {}))
 
+    if stopper is None:
+        stopper = BayesianEarlyStopper()
+
+    # Startup trials: enough to cold-start TPE. When n_trials is set
+    # use the historical 10% heuristic; otherwise lean on the stopper's
+    # min-warmup (patience + 10) for the same effect.
+    if n_trials is not None:
+        startup = max(10, n_trials // 10)
+    else:
+        startup = max(10, (stopper.patience + 10) // 5)
     sampler = TPESampler(
         seed=seed,
-        n_startup_trials=max(10, n_trials // 10),
+        n_startup_trials=startup,
         multivariate=True,
         constant_liar=False,
     )
@@ -2109,7 +2330,6 @@ def run_bayesian(
         dim_value_sets = {d["name"]: [tuple(v) if isinstance(v, list) else v
                                       for v in d["values"]]
                           for d in dims}
-        seeded = 0
         for t in seed_trials:
             cfg = t.get("config") or {}
             tms = t.get("timing_ms")
@@ -2138,34 +2358,60 @@ def run_bayesian(
                     distributions=distributions,
                     value=float(tms),
                 ))
-                seeded += 1
             except Exception:
                 continue
 
     records: List[Dict[str, Any]] = []
+    # For progress reporting when no manual cap, use stopper's hard ceiling
+    # as the denominator — it'll never be reached, but the bar shows movement.
+    total_for_progress = n_trials if n_trials is not None else stopper.max_trials
 
-    def objective(trial: optuna.Trial) -> float:
+    while True:
+        if n_trials is not None and len(records) >= n_trials:
+            if stopper.stop_reason is None:
+                stopper.stop_reason = f"manual_n_trials:{n_trials}"
+            break
+        if stopper.should_stop():
+            break
+        trial = study.ask()
         cfg = _suggest(trial, dims)
         if not is_feasible(cfg):
+            study.tell(trial, math.inf,
+                       state=optuna.trial.TrialState.PRUNED)
             rec = _make_trial_record("tpe", trial.number, cfg, None, host=host)
             rec["status"] = "infeasible"
             records.append(rec)
             if progress:
-                progress(trial.number + 1, n_trials, cfg)
-            return math.inf
-        result = timer(cfg)
+                progress(len(records), total_for_progress, cfg)
+            stopper.observe(math.inf, cfg)
+            continue
+        try:
+            raw = timer(cfg)
+        except Exception as exc:
+            study.tell(trial, math.inf,
+                       state=optuna.trial.TrialState.FAIL)
+            rec = _make_trial_record("tpe", trial.number, cfg, None, host=host)
+            rec["status"] = "fail"
+            rec["error"] = str(exc)
+            records.append(rec)
+            if progress:
+                progress(len(records), total_for_progress, cfg)
+            stopper.observe(math.inf, cfg)
+            continue
+        result, value = _coerce_timer_result(raw)
+        if not math.isfinite(value):
+            study.tell(trial, math.inf,
+                       state=optuna.trial.TrialState.FAIL)
+        else:
+            study.tell(trial, value)
         rec = _make_trial_record("tpe", trial.number, cfg, result, host=host)
-        rec["status"] = "ok" if result else "build_or_time_fail"
+        rec["status"] = "ok" if result is not None else "build_or_time_fail"
         records.append(rec)
         if progress:
-            progress(trial.number + 1, n_trials, cfg)
-        if result is None:
-            return math.inf
-        return float(result["timing_ms"])
+            progress(len(records), total_for_progress, cfg)
+        stopper.observe(value, cfg)
 
-    study.optimize(objective, n_trials=n_trials, gc_after_trial=True,
-                   show_progress_bar=False)
-    return records
+    return records, stopper.to_dict()
 
 
 def _step_neighbours(value: Any, values: List[Any], radius: int = 2
@@ -2187,7 +2433,7 @@ def topk_refine(
     space: Dict[str, Any],
     arch: str,
     *,
-    top_k: int = 20,
+    top_k: Optional[int] = None,
     radius: int = 2,
     timer: Timer,
     progress: ProgressCb = None,
@@ -2195,13 +2441,19 @@ def topk_refine(
     prefiltered: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """For each of the top-K TPE trials, time the +/-radius-step
-    neighbours along every dim. Returns the refine-stage records."""
+    neighbours along every dim. Returns the refine-stage records.
+
+    When ``top_k`` is ``None`` the seed count is chosen automatically
+    via ``_detect_topk_elbow`` over the sorted success list — small for
+    sharply-peaked spaces, larger when the curve flattens late."""
     dims = space[arch]["dims"]
     is_feasible = compile_feasibility_check(
         space[arch].get("prefilter", {}))
 
-    successes = [t for t in bayes_trials if t["timing_ms"] is not None]
+    successes = [t for t in bayes_trials if t.get("timing_ms") is not None]
     successes.sort(key=lambda t: t["timing_ms"])
+    if top_k is None:
+        top_k = _detect_topk_elbow(successes) or min(50, max(1, len(successes) // 4 or 1))
     seeds = successes[:top_k]
 
     seen_keys: set = {t["config_key"] for t in bayes_trials}
@@ -2226,7 +2478,11 @@ def topk_refine(
     records: List[Dict[str, Any]] = []
     total = len(candidate_cfgs)
     for i, cfg in enumerate(candidate_cfgs, 1):
-        result = timer(cfg)
+        raw = timer(cfg)
+        try:
+            result, _ = _coerce_timer_result(raw)
+        except TypeError:
+            result = raw if isinstance(raw, dict) else None
         rec = _make_trial_record("refine", i, cfg, result, host=host)
         rec["status"] = "ok" if result else "build_or_time_fail"
         records.append(rec)
@@ -2562,7 +2818,8 @@ class CompileCache:
 
     def set_tuned(self, opt: str, model: str, arch: str,
                   config: dict, *, mode: Optional[str] = None,
-                  search_space_hash: Optional[str] = None) -> None:
+                  search_space_hash: Optional[str] = None,
+                  early_stop_info: Optional[Dict[str, Any]] = None) -> None:
         with self._lock:
             e = self.get(opt, model, arch)
             e["tuned_config"]      = config
@@ -2572,6 +2829,11 @@ class CompileCache:
                 e["mode"] = mode
             if search_space_hash is not None:
                 e["search_space_hash"] = search_space_hash
+            # Stream-5 additive field: stopper diagnostics for this run.
+            # Backward-compatible — readers that don't know about it just
+            # ignore the extra key.
+            if early_stop_info is not None:
+                e["early_stop_info"] = early_stop_info
             self._dirty = True
 
 
@@ -2598,8 +2860,15 @@ class BuildSpec:
     pgo: bool = False
     pgo_workload: Optional[Path] = None
     pgo_steps: int = 1000
-    bayesian_trials: int = 500
-    top_k: int = 20
+    # Bayesian autotune budget.
+    # bayesian_trials=None ⇒ Stream-5 multi-criterion auto early-stop.
+    # An integer here acts as a hard cap on top of the stopper.
+    bayesian_trials: Optional[int] = None
+    top_k: Optional[int] = None       # None ⇒ elbow detection in topk_refine
+    # Stream-5 stopper knobs (only consulted when bayesian_trials is None).
+    max_tune_seconds: Optional[float] = None
+    min_improvement: float = 0.005
+    patience: Optional[int] = None    # None ⇒ auto = max(50, 0.1*N)
     seed: int = 0
     debug_symbols: bool = False
     debug: bool = False               # mirror report to stderr + print every subproc
@@ -4049,8 +4318,23 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
                   space: Dict[str, Any], dims: List[Dict[str, Any]],
                   timer, cache: CompileCache, space_hash: str,
                   report) -> Optional[Dict[str, Any]]:
-    n_trials = spec.bayesian_trials
-    report.write(f"\n  [bayesian] TPE stage with n_trials={n_trials}, "
+    n_trials = spec.bayesian_trials  # may be None ⇒ auto stopper
+    # Build a stopper from BuildSpec; honours --max-tune-seconds / --patience
+    # / --min-improvement when provided, otherwise pure auto-mode.
+    stopper = BayesianEarlyStopper(
+        min_delta_rel=spec.min_improvement,
+        patience=spec.patience,
+        max_seconds=spec.max_tune_seconds,
+    )
+    budget_desc = (f"n_trials={n_trials} (manual cap)"
+                   if n_trials is not None
+                   else "auto early-stop")
+    if spec.max_tune_seconds is not None:
+        budget_desc += f", max_tune_seconds={spec.max_tune_seconds}"
+    if spec.patience is not None:
+        budget_desc += f", patience={spec.patience}"
+    budget_desc += f", min_improvement={spec.min_improvement}"
+    report.write(f"\n  [bayesian] TPE stage with {budget_desc}, "
                  f"seed={spec.seed}, pruner={spec.pruner}\n")
 
     # §12 A2 — Transfer learning: seed from sibling-optimizer trials.
@@ -4069,14 +4353,17 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
     # Optuna study persistence (resumable across runs).
     storage = (spec.out_dir
                / f"optuna_{spec.optimizer}_{spec.model}_{spec.arch}.db")
+    # Progress bar denominator: explicit cap if set, else the stopper's
+    # hard ceiling (the bar will simply move slowly; it's a UX hint).
+    progress_total = n_trials if n_trials is not None else 1000
     step1, close1 = make_progress(
-        n_trials, f"jit-tpe {spec.optimizer}/{spec.arch}")
+        progress_total, f"jit-tpe {spec.optimizer}/{spec.arch}")
 
     def progress1(done, total, cfg):
         step1(f"trial {done}/{total} key={config_key(cfg)[:24]}…")
 
     try:
-        tpe_trials = run_bayesian(
+        tpe_trials, stop_info = run_bayesian(
             spec.arch, space, n_trials=n_trials, seed=spec.seed,
             storage=storage,
             study_name=f"sg_{spec.optimizer}_{spec.model}_{spec.arch}",
@@ -4084,6 +4371,7 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
             prefiltered=prefiltered,
             pruner=spec.pruner,
             seed_trials=seed_trials,
+            stopper=stopper,
         )
     finally:
         close1()
@@ -4092,18 +4380,25 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
         cache.record_trial(spec.optimizer, spec.model, spec.arch, t)
     cache.save()
 
+    n_ok = sum(1 for t in tpe_trials if t['timing_ms'] is not None)
     report.write(f"  [bayesian] TPE produced {len(tpe_trials)} trials; "
-                 f"{sum(1 for t in tpe_trials if t['timing_ms'] is not None)} "
-                 "succeeded.\n")
+                 f"{n_ok} succeeded. "
+                 f"stop_reason={stop_info.get('stop_reason')}\n")
 
     # Stage 2: refine the top-K with ±2-step neighbours.
-    report.write(f"\n  [bayesian] refine stage top_k={spec.top_k}\n")
+    # spec.top_k=None ⇒ topk_refine uses elbow detection.
     refine_inputs = [t for t in tpe_trials if t["timing_ms"] is not None]
     refine_inputs.sort(key=lambda t: t["timing_ms"])
+    # Pre-compute effective top_k for progress estimation + reporting.
+    effective_top_k = (spec.top_k if spec.top_k is not None
+                       else _detect_topk_elbow(refine_inputs))
+    report.write(
+        f"\n  [bayesian] refine stage top_k={effective_top_k}"
+        f"{' (elbow-detected)' if spec.top_k is None else ''}\n")
     feasibility_check = compile_feasibility_check(
         space[spec.arch].get("prefilter", {}))
     n_refine_est = sum(1 for _ in _neighbour_estimate(
-        refine_inputs[:spec.top_k], dims, feasibility_check))
+        refine_inputs[:effective_top_k], dims, feasibility_check))
     step2, close2 = make_progress(
         max(n_refine_est, 1), f"jit-refine {spec.optimizer}/{spec.arch}")
 
@@ -4113,7 +4408,7 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
     try:
         refine_trials = topk_refine(
             tpe_trials, space, spec.arch,
-            top_k=spec.top_k, timer=timer,
+            top_k=effective_top_k, timer=timer,
             progress=progress2, host=_current_host(),
             prefiltered=prefiltered,
         )
@@ -4135,7 +4430,8 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
     report.write(f"\n  [bayesian] WINNER ({winner['stage']}): "
                  f"{out['config_key']} @ {out['timing_ms']:.4f}ms\n")
     cache.set_tuned(spec.optimizer, spec.model, spec.arch, out,
-                    mode="bayesian", search_space_hash=space_hash)
+                    mode="bayesian", search_space_hash=space_hash,
+                    early_stop_info=stop_info)
     return out
 
 
@@ -4477,8 +4773,11 @@ def build(
     pgo: bool = False,
     pgo_workload: Optional[Path] = None,
     pgo_steps: int = 1000,
-    bayesian_trials: int = 500,
-    top_k: int = 20,
+    bayesian_trials: Optional[int] = None,
+    top_k: Optional[int] = None,
+    max_tune_seconds: Optional[float] = None,
+    min_improvement: float = 0.005,
+    patience: Optional[int] = None,
     seed: int = 0,
     debug_symbols: bool = False,
     debug: bool = False,
@@ -4569,7 +4868,11 @@ def build(
         search_space_path=search_space_path,
         aot_artifact_dir=aot_artifact_dir,
         pgo=pgo, pgo_workload=pgo_workload, pgo_steps=pgo_steps,
-        bayesian_trials=bayesian_trials, top_k=top_k, seed=seed,
+        bayesian_trials=bayesian_trials, top_k=top_k,
+        max_tune_seconds=max_tune_seconds,
+        min_improvement=min_improvement,
+        patience=patience,
+        seed=seed,
         debug_symbols=debug_symbols, debug=debug,
         pruner=pruner, transfer_learning=transfer_learning,
     )
@@ -4636,7 +4939,12 @@ def build(
             report.write(f"# Cache:            {cache.path}\n")
             report.write(f"# Runtime:          {runtime}\n")
             report.write(f"# Autotune:         {autotune} (mode={autotune_mode})\n")
-            report.write(f"# Bayesian trials:  {bayesian_trials} (top_k={top_k})\n")
+            bt_disp = bayesian_trials if bayesian_trials is not None else "auto"
+            tk_disp = top_k if top_k is not None else "auto"
+            report.write(f"# Bayesian trials:  {bt_disp} (top_k={tk_disp}"
+                         f" patience={patience or 'auto'}"
+                         f" max_tune_seconds={max_tune_seconds or 'unbounded'}"
+                         f" min_improvement={min_improvement})\n")
             report.write(f"# PGO:              {pgo}\n")
             if pgo:
                 report.write(f"#   workload:       {pgo_workload or DEFAULT_PGO_WORKLOAD}\n")
@@ -4751,11 +5059,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--mode", choices=("exhaustive", "bayesian"),
                         default="bayesian",
                         help="Autotune mode (default: bayesian).")
-    parser.add_argument("--bayesian-trials", type=int, default=500,
-                        help="Trials for Bayesian TPE stage (default: 500).")
-    parser.add_argument("--top-k", type=int, default=20,
+    parser.add_argument("--bayesian-trials", type=int, default=None,
+                        help="Manual trial-count override; default = "
+                             "multi-criterion auto early-stop "
+                             "(plateau + coverage saturation + wall-clock).")
+    parser.add_argument("--top-k", type=int, default=None,
                         help="Top-K winners refined in the second stage "
-                             "(default: 20).")
+                             "(default: auto elbow detection).")
+    parser.add_argument("--max-tune-seconds", type=float, default=None,
+                        help="Wall-clock budget for auto autotune (seconds). "
+                             "Stops the TPE loop when exceeded.")
+    parser.add_argument("--min-improvement", type=float, default=0.005,
+                        help="Min relative improvement to reset the plateau "
+                             "counter (default: 0.005 = 0.5%%).")
+    parser.add_argument("--patience", type=int, default=None,
+                        help="Trial patience for plateau detection "
+                             "(default: auto = max(50, 0.1 * n_completed)).")
     parser.add_argument("--quick", action="store_true",
                         help=f"Debug shortcut: bayesian mode with "
                              f"{QUICK_BAYESIAN_TRIALS} trials.")
@@ -4868,6 +5187,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         pgo_steps=args.pgo_steps,
         bayesian_trials=args.bayesian_trials,
         top_k=args.top_k,
+        max_tune_seconds=args.max_tune_seconds,
+        min_improvement=args.min_improvement,
+        patience=args.patience,
         seed=args.seed,
         debug_symbols=args.debug_symbols,
         debug=args.debug,
@@ -5066,7 +5388,7 @@ def _self_test() -> int:
     def test_bayesian_finds_winner():
         td = Path(tempfile.mkdtemp())
         try:
-            trials = run_bayesian(
+            trials, _stop_info = run_bayesian(
                 "sm_90", _tiny_space(), n_trials=40, seed=0,
                 storage=td / "study.db", timer=_synthetic_timer)
             assert len(trials) == 40
@@ -5078,7 +5400,7 @@ def _self_test() -> int:
     def test_topk_refine_generates_neighbours():
         td = Path(tempfile.mkdtemp())
         try:
-            trials = run_bayesian(
+            trials, _stop_info = run_bayesian(
                 "sm_90", _tiny_space(), n_trials=20, seed=0,
                 storage=td / "study.db", timer=_synthetic_timer)
             refines = topk_refine(trials, _tiny_space(), "sm_90",
@@ -5089,6 +5411,80 @@ def _self_test() -> int:
 
     _run("bayesian_finds_winner", test_bayesian_finds_winner)
     _run("topk_refine_generates_neighbours", test_topk_refine_generates_neighbours)
+
+    sys.stdout.write("[self-test] early_stopping\n")
+
+    import random
+
+    def _es_tiny_space():
+        return {"sm_90": {"dims": [
+            {"name": "block", "type": "int",
+             "values": [64, 128, 192, 256, 320, 384, 512],
+             "macro": "BLOCK", "applies_to": ["host", "device"]},
+            {"name": "vec", "type": "int",
+             "values": [1, 2, 4, 8],
+             "macro": "VEC", "applies_to": ["host", "device"]},
+        ], "prefilter": {"rules": []}}}
+
+    def test_early_stopper_triggers():
+        random.seed(0)
+
+        def _es_synthetic_timer(cfg):
+            # Optimum at block=256, vec=4. Distance-based timing.
+            bd = abs(cfg.get("block", 128) - 256) / 256.0
+            vd = abs(cfg.get("vec", 1) - 4) / 4.0
+            return 0.1 + bd + vd + 0.01 * random.random()
+
+        stopper = BayesianEarlyStopper(
+            min_delta_rel=0.005, patience=50, max_trials=2000)
+        records, stop_info = run_bayesian(
+            "sm_90", _es_tiny_space(), n_trials=None, seed=0,
+            timer=_es_synthetic_timer, stopper=stopper)
+        assert 30 <= len(records) <= 1500, \
+            f"unexpected trial count {len(records)}"
+        assert stop_info["stop_reason"] is not None, \
+            f"stopper did not record a reason: {stop_info}"
+        sys.stdout.write(
+            f"    (stopper triggered after {len(records)} trials, "
+            f"reason={stop_info['stop_reason']})\n")
+
+    def test_early_stopper_wall_clock():
+        stopper2 = BayesianEarlyStopper(max_seconds=0.5)
+        records2, stop_info2 = run_bayesian(
+            "sm_90", _es_tiny_space(), n_trials=None, seed=0,
+            timer=lambda c: (time.sleep(0.05) or 0.1),
+            stopper=stopper2)
+        assert "max_seconds" in (stop_info2.get("stop_reason") or ""), \
+            f"expected max_seconds stop, got {stop_info2.get('stop_reason')}"
+        sys.stdout.write(
+            f"    (wall-clock stop after {len(records2)} trials)\n")
+
+    def test_topk_elbow_detection():
+        fake_records = [
+            {"status": "ok", "timing_ms": v, "stage": "bayesian",
+             "trial_num": i, "config": {"block": 128 * (i + 1)},
+             "error": None}
+            for i, v in enumerate([0.1, 0.11, 0.12, 0.5, 0.6, 0.7, 0.8])
+        ]
+        elbow = _detect_topk_elbow(fake_records)
+        assert 1 <= elbow <= 5, f"elbow={elbow}"
+        sys.stdout.write(f"    (topk elbow detected at index {elbow})\n")
+
+    def test_stopper_to_dict_serializable():
+        s = BayesianEarlyStopper(max_seconds=1.0, patience=10)
+        s.observe(0.5, {"block": 128, "vec": 4})
+        s.observe(0.4, {"block": 256, "vec": 4})
+        d = s.to_dict()
+        # Round-trip through JSON to confirm cache-persistence safety.
+        round_tripped = json.loads(json.dumps(d))
+        assert round_tripped["trial_count"] == 2
+        assert round_tripped["best"] == 0.4
+        assert round_tripped["coverage_size"] == 3  # (block,128), (block,256), (vec,4)
+
+    _run("early_stopper_triggers", test_early_stopper_triggers)
+    _run("early_stopper_wall_clock", test_early_stopper_wall_clock)
+    _run("topk_elbow_detection", test_topk_elbow_detection)
+    _run("stopper_to_dict_serializable", test_stopper_to_dict_serializable)
 
     sys.stdout.write("[self-test] cache\n")
 
