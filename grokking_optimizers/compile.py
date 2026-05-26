@@ -9204,6 +9204,46 @@ def _self_test() -> int:
         finally:
             shutil.rmtree(td)
 
+    def test_cutlass_gemm_emitter_or_skip():
+        """CUTLASS GEMM emitter: skip cleanly without cutlass-python."""
+        from grokking_optimizers import codegen as _cg
+        try:
+            import cutlass  # type: ignore  # noqa: F401
+        except ImportError:
+            # Expected on CPU-only / minimal hosts. Verify the stub raises
+            # the right error.
+            td = Path(tempfile.mkdtemp())
+            try:
+                try:
+                    _cg.emit_cutlass_gemm_variants(
+                        "sm_90a", (256, 256, 256), "fp16", td)
+                    raise AssertionError("expected CodegenError without cutlass-python")
+                except _cg.CodegenError as exc:
+                    assert "cutlass" in str(exc).lower()
+            finally:
+                shutil.rmtree(td)
+            return
+        # cutlass-python IS installed — assert a real variant is emitted.
+        td = Path(tempfile.mkdtemp())
+        try:
+            variants = _cg.emit_cutlass_gemm_variants(
+                "sm_90a", (256, 256, 256), "fp16", td)
+            assert len(variants) >= 1, f"expected >= 1 variant, got {len(variants)}"
+            path, meta = variants[0]
+            assert path.exists() and path.suffix == ".cu"
+            assert "tile" in meta or "tile_shape" in meta or "tile_description" in meta
+            src = path.read_text()
+            assert "GemmUniversal" in src or "Gemm" in src
+            assert "extern \"C\"" in src or "extern \"C\"" in src.replace('\\"', '"')
+            # Unsupported arch must raise.
+            try:
+                _cg.emit_cutlass_gemm_variants("sm_75", (256, 256, 256), "fp16", td)
+                raise AssertionError("expected CodegenError for unsupported arch sm_75")
+            except _cg.CodegenError:
+                pass
+        finally:
+            shutil.rmtree(td)
+
     _run("codegen_import", test_codegen_import)
     _run("codegen_templates_dir", test_codegen_templates_dir)
     _run("codegen_template_count", test_codegen_template_count)
@@ -9214,6 +9254,7 @@ def _self_test() -> int:
     _run("codegen_find_template_fallback", test_codegen_find_template_fallback)
     _run("codegen_unknown_template_raises", test_codegen_unknown_template_raises)
     _run("codegen_variant_macros_hook", test_codegen_variant_macros_hook)
+    _run("cutlass_gemm_emitter_or_skip", test_cutlass_gemm_emitter_or_skip)
 
     # ── Stream 12: toolchain bootstrap ──────────────────────────────
     sys.stdout.write("[self-test] toolchain_bootstrap\n")
@@ -10046,20 +10087,427 @@ def validate_with_nvcc_dryrun(emitted: Path) -> Tuple[bool, str]:
         return True, f"nvcc invocation failed ({type(exc).__name__}): {exc}"
 
 
+# ---- CUTLASS GEMM emitter helpers -----------------------------------------
+#
+# AMD CK equivalent: TODO — when the ROCm composable-kernel Python frontend
+# stabilises, mirror this function as emit_ck_gemm_variants(arch, ...)
+# for gfx9xx/gfx12xx targets. Do NOT silently fall back to CUTLASS for HIP.
+
+# Hand-curated fallback sweep used when cutlass.op.Gemm.tile_descriptions()
+# is unavailable on the installed cutlass-python release. Each entry is
+# (threadblock_shape, cluster_shape, stages, kernel_schedule, epilogue_schedule).
+_CUTLASS_FALLBACK_VARIANTS: Tuple[Tuple[Tuple[int, int, int],
+                                        Tuple[int, int, int],
+                                        int, str, str], ...] = (
+    ((128, 128, 32), (1, 1, 1), 3,
+     "KernelTmaWarpSpecializedCooperative", "EpilogueTmaWarpSpecialized"),
+    ((128, 128, 64), (1, 1, 1), 3,
+     "KernelTmaWarpSpecializedCooperative", "EpilogueTmaWarpSpecialized"),
+    ((256, 128, 32), (2, 1, 1), 3,
+     "KernelTmaWarpSpecializedCooperative", "EpilogueTmaWarpSpecialized"),
+    ((256, 128, 64), (2, 1, 1), 3,
+     "KernelTmaWarpSpecializedCooperative", "EpilogueTmaWarpSpecialized"),
+)
+
+# Map our dtype strings → (CUTLASS C++ type, CUTLASS python element enum name).
+_CUTLASS_DTYPE_MAP: Dict[str, Tuple[str, str]] = {
+    "fp16":     ("cutlass::half_t",     "float16"),
+    "f16":      ("cutlass::half_t",     "float16"),
+    "half":     ("cutlass::half_t",     "float16"),
+    "bf16":     ("cutlass::bfloat16_t", "bfloat16"),
+    "bfloat16": ("cutlass::bfloat16_t", "bfloat16"),
+    "fp32":     ("float",               "float32"),
+    "f32":      ("float",               "float32"),
+    "float":    ("float",               "float32"),
+    "tf32":     ("cutlass::tfloat32_t", "tfloat32"),
+    "fp8":      ("cutlass::float_e4m3_t", "float_e4m3"),
+    "e4m3":     ("cutlass::float_e4m3_t", "float_e4m3"),
+    "e5m2":     ("cutlass::float_e5m2_t", "float_e5m2"),
+}
+
+
+def _cutlass_variant_key(tile: Tuple[int, int, int],
+                         cluster: Tuple[int, int, int],
+                         stages: int,
+                         schedule: str) -> str:
+    """Build a filesystem- and C-identifier-safe variant key."""
+    t = "x".join(str(int(v)) for v in tile)
+    c = "x".join(str(int(v)) for v in cluster)
+    sch = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in schedule)
+    sch = sch.strip("_") or "default"
+    return f"t{t}_c{c}_s{int(stages)}_{sch}"
+
+
+def _cutlass_tuple3(obj: Any, default: Tuple[int, int, int]
+                    ) -> Tuple[int, int, int]:
+    """Best-effort extraction of a 3-tuple from a cutlass shape object."""
+    if obj is None:
+        return default
+    # Plain iterable.
+    try:
+        seq = tuple(int(x) for x in obj)
+        if len(seq) >= 3:
+            return (seq[0], seq[1], seq[2])
+        if len(seq) == 2:
+            return (seq[0], seq[1], default[2])
+    except (TypeError, ValueError):
+        pass
+    # Attribute style (.m/.n/.k, .x/.y/.z).
+    for triple in (("m", "n", "k"), ("x", "y", "z")):
+        try:
+            return (int(getattr(obj, triple[0])),
+                    int(getattr(obj, triple[1])),
+                    int(getattr(obj, triple[2])))
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return default
+
+
+def _cutlass_schedule_str(obj: Any, default: str) -> str:
+    """Best-effort name extraction from a cutlass schedule enum / object."""
+    if obj is None:
+        return default
+    for attr in ("name", "value", "__name__"):
+        v = getattr(obj, attr, None)
+        if isinstance(v, str) and v:
+            return v
+    s = str(obj)
+    return s if s else default
+
+
+def _enumerate_cutlass_variants(arch: str,
+                                problem_shape: Tuple[int, int, int],
+                                dtype: str
+                                ) -> List[Dict[str, Any]]:
+    """Probe cutlass.op.Gemm.tile_descriptions(); fall back to a curated sweep.
+
+    Returns a list of metadata dicts; one per variant.
+    """
+    fallback: List[Dict[str, Any]] = []
+    for tile, cluster, stages, ksched, esched in _CUTLASS_FALLBACK_VARIANTS:
+        fallback.append({
+            "tile": tile, "cluster": cluster, "stages": stages,
+            "schedule": ksched, "epilogue": esched, "source": "fallback",
+        })
+
+    try:
+        import cutlass  # type: ignore
+    except ImportError:
+        # Caller already guarded against this — defensive return.
+        return fallback
+
+    cc = ARCH_TABLE[arch].cutlass_arch
+    cpp_dt, py_dt_name = _CUTLASS_DTYPE_MAP.get(
+        dtype, ("float", "float32"))
+    M, N, K = (int(problem_shape[0]),
+               int(problem_shape[1]),
+               int(problem_shape[2]))
+
+    # Resolve dtype on the cutlass module — fall back to fp32 if missing.
+    elem = None
+    try:
+        elem = getattr(cutlass.DataType, py_dt_name, None) \
+            if hasattr(cutlass, "DataType") else None
+    except Exception:
+        elem = None
+
+    # Build a Gemm op as defensively as possible — different cutlass-python
+    # releases (2.x/3.x/4.x) accept slightly different kwargs.
+    gemm = None
+    for kwargs in (
+        {"element": elem, "cc": cc} if elem is not None
+            else {"cc": cc},
+        {"element_A": elem, "element_B": elem, "element_C": elem,
+         "element_D": elem, "cc": cc} if elem is not None
+            else {"cc": cc},
+        {"cc": cc},
+        {},
+    ):
+        try:
+            gemm = cutlass.op.Gemm(**kwargs)
+            break
+        except Exception:
+            continue
+    if gemm is None:
+        return fallback
+
+    # Probe tile_descriptions() — if unavailable, return curated fallback.
+    tds = None
+    try:
+        tds_fn = getattr(gemm, "tile_descriptions", None)
+        if callable(tds_fn):
+            tds = tds_fn()
+    except Exception:
+        tds = None
+    if not tds:
+        return fallback
+
+    out: List[Dict[str, Any]] = []
+    seen_keys: set = set()
+    for td in tds:
+        tile = _cutlass_tuple3(
+            getattr(td, "threadblock_shape", None), (128, 128, 32))
+        cluster = _cutlass_tuple3(
+            getattr(td, "cluster_shape", None), (1, 1, 1))
+        stages = 3
+        try:
+            stages = int(getattr(td, "stages", 3) or 3)
+        except (TypeError, ValueError):
+            stages = 3
+        ksched = _cutlass_schedule_str(
+            getattr(td, "kernel_schedule", None),
+            "KernelTmaWarpSpecializedCooperative")
+        esched = _cutlass_schedule_str(
+            getattr(td, "epilogue_schedule", None),
+            "EpilogueTmaWarpSpecialized")
+        key = _cutlass_variant_key(tile, cluster, stages, ksched)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        out.append({
+            "tile": tile, "cluster": cluster, "stages": stages,
+            "schedule": ksched, "epilogue": esched, "source": "tile_descriptions",
+        })
+        # Cap the sweep so a single call doesn't emit thousands of files.
+        if len(out) >= 64:
+            break
+
+    _ = (cpp_dt, M, N, K)  # used by caller for source emission
+    return out if out else fallback
+
+
+def _render_cutlass_gemm_source(arch: str,
+                                problem_shape: Tuple[int, int, int],
+                                dtype: str,
+                                variant: Dict[str, Any],
+                                variant_key: str) -> str:
+    """Render a standalone .cu source for one (arch, dtype, tile-variant)."""
+    cpp_dt, _ = _CUTLASS_DTYPE_MAP.get(dtype, ("float", "float32"))
+    cc = ARCH_TABLE[arch].cutlass_arch or 90
+    tile = variant["tile"]
+    cluster = variant["cluster"]
+    stages = int(variant["stages"])
+    ksched = str(variant["schedule"])
+    esched = str(variant["epilogue"])
+    M, N, K = problem_shape
+    fn_name = f"launch_{variant_key}"
+    return f"""// AUTO-GENERATED by emit_cutlass_gemm_variants — DO NOT EDIT
+// Arch:        {arch} (CUTLASS_ARCH_MMA_SM{cc})
+// Dtype:       {dtype}  (C++ type: {cpp_dt})
+// Problem:     M={M}, N={N}, K={K}
+// Tile:        {tile[0]}x{tile[1]}x{tile[2]}
+// Cluster:     {cluster[0]}x{cluster[1]}x{cluster[2]}
+// Stages:      {stages}
+// Schedule:    {ksched}
+// Epilogue:    {esched}
+
+#include <cuda_runtime.h>
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
+#include <cutlass/gemm/device/gemm_universal.h>
+#include <cutlass/gemm/device/gemm_universal_adapter.h>
+#include <cutlass/gemm/collective/collective_builder.hpp>
+#include <cutlass/epilogue/collective/collective_builder.hpp>
+#include <cutlass/util/host_tensor.h>
+
+namespace sg_cutlass_gen {{
+
+using ElementA       = {cpp_dt};
+using ElementB       = {cpp_dt};
+using ElementC       = {cpp_dt};
+using ElementD       = {cpp_dt};
+using ElementAccum   = float;
+using ElementCompute = float;
+
+using LayoutA = cutlass::layout::RowMajor;
+using LayoutB = cutlass::layout::ColumnMajor;
+using LayoutC = cutlass::layout::RowMajor;
+using LayoutD = cutlass::layout::RowMajor;
+
+using TileShape    = cute::Shape<cute::Int<{tile[0]}>, cute::Int<{tile[1]}>, cute::Int<{tile[2]}>>;
+using ClusterShape = cute::Shape<cute::Int<{cluster[0]}>, cute::Int<{cluster[1]}>, cute::Int<{cluster[2]}>>;
+
+using ArchTag        = cutlass::arch::Sm{cc};
+using OperatorClass  = cutlass::arch::OpClassTensorOp;
+
+using CollectiveEpilogue =
+    typename cutlass::epilogue::collective::CollectiveBuilder<
+        ArchTag, OperatorClass,
+        TileShape, ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccum, ElementCompute,
+        ElementC, LayoutC, 128 / cutlass::sizeof_bits<ElementC>::value,
+        ElementD, LayoutD, 128 / cutlass::sizeof_bits<ElementD>::value,
+        cutlass::epilogue::collective::EpilogueScheduleAuto
+    >::CollectiveOp;
+
+using CollectiveMainloop =
+    typename cutlass::gemm::collective::CollectiveBuilder<
+        ArchTag, OperatorClass,
+        ElementA, LayoutA, 128 / cutlass::sizeof_bits<ElementA>::value,
+        ElementB, LayoutB, 128 / cutlass::sizeof_bits<ElementB>::value,
+        ElementAccum,
+        TileShape, ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        cutlass::gemm::collective::KernelScheduleAuto
+    >::CollectiveOp;
+
+using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+    cute::Shape<int, int, int, int>,
+    CollectiveMainloop,
+    CollectiveEpilogue
+>;
+
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+}}  // namespace sg_cutlass_gen
+
+extern "C" int {fn_name}(void* A, void* B, void* C, void* D,
+                         int M, int N, int K,
+                         float alpha, float beta,
+                         cudaStream_t stream) {{
+    using namespace sg_cutlass_gen;
+    typename Gemm::Arguments args{{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {{M, N, K, 1}},
+        {{
+            static_cast<ElementA const*>(A), {{K, cute::Int<1>{{}}, 0}},
+            static_cast<ElementB const*>(B), {{K, cute::Int<1>{{}}, 0}},
+        }},
+        {{
+            {{ElementCompute(alpha), ElementCompute(beta)}},
+            static_cast<ElementC const*>(C), {{N, cute::Int<1>{{}}, 0}},
+            static_cast<ElementD*>(D),       {{N, cute::Int<1>{{}}, 0}},
+        }}
+    }};
+    Gemm gemm;
+    auto status = gemm.can_implement(args);
+    if (status != cutlass::Status::kSuccess) {{
+        return static_cast<int>(status);
+    }}
+    size_t workspace_size = Gemm::get_workspace_size(args);
+    void* workspace = nullptr;
+    if (workspace_size > 0) {{
+        cudaError_t merr = cudaMallocAsync(&workspace, workspace_size, stream);
+        if (merr != cudaSuccess) {{
+            return static_cast<int>(cutlass::Status::kErrorMemoryAllocation);
+        }}
+    }}
+    status = gemm.initialize(args, workspace, stream);
+    if (status == cutlass::Status::kSuccess) {{
+        status = gemm(stream);
+    }}
+    if (workspace != nullptr) {{
+        cudaFreeAsync(workspace, stream);
+    }}
+    return static_cast<int>(status);
+}}
+"""
+
+
 def emit_cutlass_gemm_variants(arch: str,
                                problem_shape: Tuple[int, int, int],
                                dtype: str,
                                out_dir: Path
                                ) -> List[Tuple[Path, Dict[str, Any]]]:
-    """CUTLASS GEMM emitter stub — raises until cutlass-python is wired in."""
+    """Emit standalone CUTLASS GEMM ``.cu`` files for one (arch, dtype, MNK).
+
+    Enumerates {tile x cluster x stages x schedule x epilogue} variants the
+    locally-installed cutlass-python supports for the target. Each variant
+    becomes one ``.cu`` file under ``out_dir`` exporting a ``extern "C"``
+    launcher; the returned list pairs the emitted path with a metadata dict.
+
+    Re-invocation with the same variant key skips re-emission (filename-based
+    cache). Errors inside the cutlass-python call path (other than
+    ``ImportError``) are wrapped as ``CodegenError`` so callers can fall back
+    to the template-only emitter gracefully.
+
+    Scope: NVIDIA sm_90a (Hopper) and sm_100a (Blackwell) only — the cluster /
+    TMA / wgmma plumbing assumed below isn't valid on earlier SMs and there's
+    no clean AMD CK equivalent in-tree yet (see module-level TODO above).
+    """
     try:
         import cutlass  # type: ignore  # noqa: F401
     except ImportError as exc:
         raise CodegenError(
-            "cutlass-python required for GEMM emitter") from exc
-    _ = (problem_shape, dtype, out_dir)
-    raise CodegenError(
-        "emit_cutlass_gemm_variants is a stub — wire cutlass.op.Gemm.profile()")
+            "cutlass-python required for GEMM emitter — install with "
+            "`pip install nvidia-cutlass` (3.5+) on a CUDA-capable host"
+        ) from exc
+
+    if arch not in ("sm_90a", "sm_100a"):
+        raise CodegenError(
+            "CUTLASS GEMM emitter supports sm_90a and sm_100a only")
+
+    if arch not in ARCH_TABLE:
+        raise CodegenError(f"unknown arch {arch!r}")
+
+    if dtype not in _CUTLASS_DTYPE_MAP:
+        raise CodegenError(
+            f"unsupported dtype {dtype!r} for CUTLASS GEMM emitter; "
+            f"known: {sorted(_CUTLASS_DTYPE_MAP)}")
+
+    try:
+        M, N, K = (int(problem_shape[0]),
+                   int(problem_shape[1]),
+                   int(problem_shape[2]))
+    except (TypeError, ValueError, IndexError) as exc:
+        raise CodegenError(
+            f"problem_shape must be a 3-tuple (M, N, K), got {problem_shape!r}"
+        ) from exc
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        variants = _enumerate_cutlass_variants(arch, (M, N, K), dtype)
+    except Exception as exc:  # wrap any cutlass-python failure as CodegenError
+        raise CodegenError(
+            f"cutlass-python variant enumeration failed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    if not variants:
+        raise CodegenError(
+            f"no CUTLASS GEMM variants emitted for arch={arch} dtype={dtype} "
+            f"shape={(M, N, K)}")
+
+    emitted: List[Tuple[Path, Dict[str, Any]]] = []
+    for var in variants:
+        var_key = _cutlass_variant_key(
+            var["tile"], var["cluster"], var["stages"], var["schedule"])
+        fname = (f"cutlass_gemm_{arch}_{dtype}_"
+                 f"{M}x{N}x{K}_{var_key}.cu")
+        out_path = out_dir / fname
+        meta = {
+            "tile": var["tile"],
+            "cluster": var["cluster"],
+            "stages": var["stages"],
+            "schedule": var["schedule"],
+            "epilogue": var["epilogue"],
+            "arch": arch,
+            "dtype": dtype,
+            "mnk": (M, N, K),
+            "variant_key": var_key,
+            "source": var.get("source", "unknown"),
+        }
+        if out_path.exists() and out_path.stat().st_size > 0:
+            emitted.append((out_path, meta))
+            continue
+        try:
+            src = _render_cutlass_gemm_source(
+                arch, (M, N, K), dtype, var, var_key)
+        except Exception as exc:
+            raise CodegenError(
+                f"CUTLASS GEMM source render failed for variant {var_key}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+        tmp.write_text(src, encoding="utf-8")
+        tmp.replace(out_path)
+        emitted.append((out_path, meta))
+
+    return emitted
 
 
 # ------------------------------------------------------------------------------
