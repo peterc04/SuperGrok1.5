@@ -2196,7 +2196,12 @@ def collect_workload(
 # ===========================================================================
 
 def _pgo_workload_main() -> int:
-    """Default PGO workload entry point (was scripts/pgo_workload.py)."""
+    """Default PGO workload entry point (was scripts/pgo_workload.py).
+
+    Stream A: ``--python-package`` overrides the default
+    ``grokking_optimizers`` import target so a third-party project that
+    re-uses compile.py's PGO loop can point at its own package.
+    """
     import argparse as _ap
     parser = _ap.ArgumentParser(
         description="Default PGO workload — runs N optimizer steps")
@@ -2212,23 +2217,27 @@ def _pgo_workload_main() -> int:
                         help="Number of optimizer.step() calls")
     parser.add_argument("--size", type=int, default=2048,
                         help="Parameter size (size x size float32 tensor)")
+    parser.add_argument("--python-package", default="grokking_optimizers",
+                        help="Python package to import OptCls from "
+                             "(default: grokking_optimizers).")
     args = parser.parse_args()
+    pkg = args.python_package or "grokking_optimizers"
 
     if args.so:
         import importlib.util as _ilu
-        if "grokking_optimizers._ops" in sys.modules:
-            del sys.modules["grokking_optimizers._ops"]
-        _spec = _ilu.spec_from_file_location(
-            "grokking_optimizers._ops", str(args.so))
+        ops_mod = f"{pkg}._ops"
+        if ops_mod in sys.modules:
+            del sys.modules[ops_mod]
+        _spec = _ilu.spec_from_file_location(ops_mod, str(args.so))
         if _spec is None or _spec.loader is None:
             raise RuntimeError(f"could not load .so: {args.so}")
         _mod = _ilu.module_from_spec(_spec)
         _spec.loader.exec_module(_mod)  # type: ignore[arg-type]
-        sys.modules["grokking_optimizers._ops"] = _mod
+        sys.modules[ops_mod] = _mod
 
     import torch
     from importlib import import_module
-    grok = import_module("grokking_optimizers")
+    grok = import_module(pkg)
     OptCls = getattr(grok, args.opt)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -2374,13 +2383,13 @@ except ImportError as exc:
 
 
 def _load_so(so_path):
-    if "grokking_optimizers._ops" in sys.modules:
-        del sys.modules["grokking_optimizers._ops"]
+    if "__PKG__._ops" in sys.modules:
+        del sys.modules["__PKG__._ops"]
     spec = importlib.util.spec_from_file_location(
-        "grokking_optimizers._ops", so_path)
+        "__PKG__._ops", so_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    sys.modules["grokking_optimizers._ops"] = mod
+    sys.modules["__PKG__._ops"] = mod
     return mod
 
 
@@ -2396,9 +2405,9 @@ def _bg_build_param(opt_class_name, size):
 def _bg_cuda_graph_median_ms(opt_class, *, size=4096, warmup=5, iters=21):
     if not torch.cuda.is_available():
         raise RuntimeError("cuda_graph_median_ms requires torch.cuda.is_available()")
-    from grokking_optimizers import _ops  # noqa: F401
+    from __PKG__ import _ops  # noqa: F401
     from importlib import import_module
-    grok = import_module("grokking_optimizers")
+    grok = import_module("__PKG__")
     OptCls = getattr(grok, opt_class)
 
     p, g = _bg_build_param(opt_class, size)
@@ -2450,7 +2459,7 @@ def _time_with_graph(opt_class, size, warmup, iters):
 
 def _time_with_events(opt_class, size, warmup, iters):
     from importlib import import_module
-    grok = import_module("grokking_optimizers")
+    grok = import_module("__PKG__")
     OptCls = getattr(grok, opt_class)
     torch.manual_seed(0)
     p = torch.nn.Parameter(
@@ -2539,6 +2548,19 @@ def main():
 
 main()
 """
+
+
+def _render_worker_body(python_package: Optional[str] = None) -> str:
+    """Stream A — render ``_WORKER_BODY`` with the user-supplied Python
+    package name substituted in.
+
+    The template uses the literal token ``__PKG__`` wherever the imported
+    package or submodule name appears (e.g. ``from __PKG__ import _ops``).
+    With ``python_package=None`` the result is byte-identical to the
+    historical hardcoded ``grokking_optimizers`` form.
+    """
+    pkg = python_package or "grokking_optimizers"
+    return _WORKER_BODY.replace("__PKG__", pkg)
 
 
 # ---------------------------------------------------------------------------
@@ -2760,7 +2782,14 @@ class TimingWorker:
                  python: Optional[str] = None,
                  watchdog_interval_s: float = 30.0,
                  watchdog_grace_s: float = 60.0,
-                 enable_watchdog: bool = True):
+                 enable_watchdog: bool = True,
+                 python_package: Optional[str] = None):
+        # Stream A: python_package threads through to the worker body so
+        # the subprocess imports the correct package for OptCls lookup.
+        # ``None`` preserves the historical "grokking_optimizers" name
+        # exactly.
+        self._worker_body = _render_worker_body(python_package)
+        self.python_package = python_package or "grokking_optimizers"
         self.opt_class = opt_class
         self.size = size
         self.warmup = warmup
@@ -2800,7 +2829,7 @@ class TimingWorker:
         if self._proc is not None and self._proc.poll() is None:
             return True
         self._proc = subprocess.Popen(
-            [self.python, "-u", "-c", _WORKER_BODY],
+            [self.python, "-u", "-c", self._worker_body],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -2917,7 +2946,7 @@ class TimingWorker:
             # Re-spawn without re-entering the watchdog plumbing.
             try:
                 self._proc = subprocess.Popen(
-                    [self.python, "-u", "-c", _WORKER_BODY],
+                    [self.python, "-u", "-c", self._worker_body],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
@@ -4447,6 +4476,19 @@ class BuildSpec:
     # Stream 10 — per-variant numerical / differential validation
     strict_numerics: bool = False     # require bit-identical determinism for winner
     aot_so_path: Optional[Path] = None  # populated by build_aot; used by variant timer
+    # ─── Stream A — portability (config-driven naming + layout) ──────
+    # All defaults below REPLICATE the historical SuperGrok-hardcoded
+    # values, so a build with no config file produces byte-identical
+    # output. apply_to_buildspec(spec, project_cfg) populates these from
+    # _DEFAULT_PROJECT_CONFIG ⊕ user TOML when a config is supplied.
+    macro_prefix: str = "SG_BUILD_"
+    fused_op_template: str = (
+        "torch.ops.grokking_optimizers.fused_{opt_lower}_simple_step")
+    python_package: str = "grokking_optimizers"
+    project_namespace: str = ""
+    tuned_header_path: str = "csrc/algorithms/tuned_configs.h"
+    source_roots: Dict[str, Any] = field(default_factory=dict)
+    config: Dict[str, Any] = field(default_factory=dict)
 
 
 def _ensure_nvcc_on_path() -> Optional[str]:
@@ -5697,27 +5739,84 @@ def _collect_sibling_trials(cache: CompileCache, opt: str, model: str,
 # Source / flag resolution
 # ---------------------------------------------------------------------------
 
+def _resolve_path(spec: BuildSpec, raw: str) -> Path:
+    """Stream A helper. Turn a config-supplied path string into an
+    absolute Path.
+
+    - Absolute paths are returned as-is.
+    - Relative paths are anchored at ``REPO_ROOT`` (matches the historical
+      behaviour of constants like ``csrc/backends/cuda``).
+    """
+    p = Path(raw)
+    if p.is_absolute():
+        return p
+    return (REPO_ROOT / p).resolve() if (REPO_ROOT / p).exists() \
+        else REPO_ROOT / p
+
+
 def _resolve_sources(spec: BuildSpec) -> List[Path]:
+    """Resolve the per-build source file list.
+
+    Stream A: every directory probed here now comes from
+    ``spec.source_roots`` (populated by ``apply_to_buildspec`` from the
+    TOML config). With no config file the dict is empty, so we fall back
+    to the historical ``csrc/backends/<entry.subdir>`` / ``csrc/bindings``
+    layout — behaviour is byte-identical to today.
+    """
     entry = get_arch_entry(spec.arch)
     if entry.vendor == "pallas":
         return []
-    backend = REPO_ROOT / "csrc/backends" / entry.subdir
-    bindings = sorted((REPO_ROOT / "csrc/bindings").glob("*.cpp"))
+    roots = getattr(spec, "source_roots", {}) or {}
+    # ── backend (launcher + models) ──────────────────────────────────
+    vendor_root_raw = roots.get(entry.vendor)
+    if vendor_root_raw:
+        vendor_root = _resolve_path(spec, vendor_root_raw)
+        # If the user pointed at csrc/backends/cuda we still want the
+        # arch subdir; if they pointed at the arch dir directly (e.g.
+        # myproj/src/cuda/sm_90a) we don't double-append it.
+        candidate = vendor_root / entry.subdir.split("/", 1)[-1] \
+            if (vendor_root / entry.subdir.split("/", 1)[-1]).exists() \
+            else vendor_root
+        backend = candidate
+    else:
+        backend = REPO_ROOT / "csrc/backends" / entry.subdir
+    # ── bindings dir ──────────────────────────────────────────────────
+    bindings_root_raw = roots.get("bindings")
+    if bindings_root_raw:
+        bindings_root = _resolve_path(spec, bindings_root_raw)
+    else:
+        bindings_root = REPO_ROOT / "csrc/bindings"
+    bindings = sorted(bindings_root.glob("*.cpp")) if bindings_root.exists() \
+        else []
     launchers: List[Path] = []
     for g in entry.launcher_glob:
         launchers.extend(sorted(backend.glob(g)))
     models: List[Path] = []
-    for g in entry.model_glob:
-        models.extend(sorted((backend / "models").glob(g)))
+    models_dir = backend / "models"
+    if models_dir.exists():
+        for g in entry.model_glob:
+            models.extend(sorted(models_dir.glob(g)))
     return bindings + launchers + models
 
 
 def _build_macros(spec: BuildSpec) -> List[str]:
+    """Emit ``-D<PREFIX>OPTIMIZER_<NAME> -D<PREFIX>MODEL_<NAME>
+    -D<PREFIX>VERBOSE -D<arch_macro>`` plus any caller extras.
+
+    Stream A: the ``<PREFIX>`` (default ``SG_BUILD_``) is taken from
+    ``spec.macro_prefix`` so a downstream project can pick its own
+    namespace (e.g. ``MP_`` → ``MP_OPTIMIZER_LION``). Behaviour with no
+    config is byte-identical to today.
+    """
     entry = get_arch_entry(spec.arch)
+    prefix = getattr(spec, "macro_prefix", "SG_BUILD_") or "SG_BUILD_"
     macros = [
-        f"-DSG_BUILD_OPTIMIZER_{spec.optimizer.upper()}=1",
-        f"-DSG_BUILD_MODEL_{spec.model.upper()}=1",
+        f"-D{prefix}OPTIMIZER_{spec.optimizer.upper()}=1",
+        f"-D{prefix}MODEL_{spec.model.upper()}=1",
         f"-D{entry.macro}=1",
+        # Historical name kept exactly as-is — this is a global "any
+        # supergrok build" verbosity flag, not an optimizer / model gate,
+        # so it does NOT take the project prefix.
         "-DSG_VERBOSE=1",
     ]
     return macros + list(spec.extra_macros)
@@ -5974,7 +6073,27 @@ def _xla_env(arch: str, out_dir: Path) -> Dict[str, str]:
     }
 
 
-def _include_paths() -> List[str]:
+def _include_paths(spec: Optional["BuildSpec"] = None) -> List[str]:
+    """Resolve the ``-I`` include-path list torch's cpp_extension feeds nvcc.
+
+    Stream A: ``spec.source_roots["bindings"]`` (if set) overrides the
+    historical ``REPO_ROOT/csrc/bindings`` path, and any
+    ``spec.source_roots["extra_includes"]`` entries are appended. With no
+    spec (or an empty source_roots dict) the return value is exactly
+    ``[REPO_ROOT/csrc/bindings, REPO_ROOT]`` — byte-identical to today.
+    """
+    paths: List[str] = []
+    if spec is not None:
+        roots = getattr(spec, "source_roots", {}) or {}
+        bindings_raw = roots.get("bindings")
+        if bindings_raw:
+            paths.append(str(_resolve_path(spec, bindings_raw)))
+        else:
+            paths.append(str(REPO_ROOT / "csrc/bindings"))
+        paths.append(str(REPO_ROOT))
+        for extra in roots.get("extra_includes", []) or []:
+            paths.append(str(_resolve_path(spec, extra)))
+        return paths
     return [str(REPO_ROOT / "csrc/bindings"), str(REPO_ROOT)]
 
 
@@ -6193,7 +6312,7 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
                 extra_cflags=host_cflags,
                 extra_cuda_cflags=device_cflags,
                 extra_ldflags=ldflags,
-                extra_include_paths=_include_paths(),
+                extra_include_paths=_include_paths(spec),
                 build_directory=str(build_dir),
                 verbose=spec.verbose,
                 with_cuda=with_cuda,
@@ -6321,16 +6440,70 @@ TOLERANCES: Dict[str, Tuple[float, float]] = {
 _LAST_NUMERICAL_STATUS: Dict[str, str] = {}
 
 
+_DEFAULT_FUSED_OP_TEMPLATE = (
+    "torch.ops.grokking_optimizers.fused_{opt_lower}_simple_step")
+
+
+def _format_fused_op_template(template: str, opt_class: str) -> str:
+    """Stream A — render the configured fused-op dotted path.
+
+    Substitutes the placeholders ``{opt}`` (raw optimizer-class name),
+    ``{opt_lower}`` (.lower()), and ``{opt_upper}`` (.upper()). Unknown
+    placeholders are left intact so a future SDK can add more without
+    breaking older configs.
+    """
+    fmt_map = {
+        "opt":       opt_class,
+        "opt_lower": opt_class.lower(),
+        "opt_upper": opt_class.upper(),
+    }
+    try:
+        return template.format(**fmt_map)
+    except (KeyError, IndexError):
+        return template
+
+
+def _split_fused_op_dotted(dotted: str) -> Tuple[str, str]:
+    """Split a torch.ops.<ns>.<op> path into (root_expr, attr_chain).
+
+    The ``root_expr`` is the prefix we eval (e.g. ``"torch.ops"``); the
+    ``attr_chain`` is the dotted remainder that the subprocess walks via
+    ``getattr`` (e.g. ``"grokking_optimizers.fused_lion_simple_step"``).
+
+    We always keep ``"torch.ops"`` (or ``"torch.ops.<ns>"`` when the user
+    template uses a different root) on the ROOT side so the subprocess
+    only needs ``import torch`` to resolve it — no extra imports.
+    """
+    parts = dotted.split(".")
+    if len(parts) >= 3 and parts[0] == "torch" and parts[1] == "ops":
+        return ("torch.ops", ".".join(parts[2:]))
+    if len(parts) == 1:
+        return ("torch", parts[0])
+    return (".".join(parts[:1]), ".".join(parts[1:]))
+
+
 def _capture_reference_output(aot_so_path: Path, opt_class: str,
                               size: int, dtype: str,
-                              out_dir: Path) -> Path:
+                              out_dir: Path,
+                              fused_op_template: Optional[str] = None) -> Path:
     """Run the AOT optimiser once and save the post-step parameter tensor
     as a .npy file. Cached per (opt, size, dtype) — re-uses an existing
-    snapshot if one is already on disk."""
+    snapshot if one is already on disk.
+
+    Stream A: ``fused_op_template`` (default
+    ``torch.ops.grokking_optimizers.fused_{opt_lower}_simple_step``) is
+    the dotted path the subprocess walks via ``getattr`` to find the
+    fused-step op registered by ``torch.ops.load_library``. Pass a custom
+    template (e.g. ``torch.ops.myproj.fused_{opt_lower}_step``) for a
+    third-party project that registers ops in its own namespace.
+    """
     ref_path = out_dir / f"ref_output_{opt_class}_{size}_{dtype}.npy"
     if ref_path.exists():
         return ref_path
     out_dir.mkdir(parents=True, exist_ok=True)
+    tmpl = fused_op_template or _DEFAULT_FUSED_OP_TEMPLATE
+    dotted = _format_fused_op_template(tmpl, opt_class)
+    root_expr, attr_chain = _split_fused_op_dotted(dotted)
     # Tiny subprocess: load the AOT .so via torch.ops.load_library, run a
     # single fused-step call, dump the resulting param tensor with numpy.
     # Wrapped in a try/except so a missing torch op falls through to
@@ -6346,11 +6519,17 @@ def _capture_reference_output(aot_so_path: Path, opt_class: str,
         grad  = torch.ones( {size}, dtype=dtype, device='cuda')
         m     = torch.zeros({size}, dtype=dtype, device='cuda')
         v     = torch.zeros({size}, dtype=dtype, device='cuda')
-        op = getattr(torch.ops.grokking_optimizers,
-                     'fused_{opt_class.lower()}_simple_step', None)
-        if op is None:
-            sys.stderr.write('no fused op registered for {opt_class}\\n')
-            sys.exit(2)
+        # Stream A: walk the configured fused-op dotted path via getattr
+        # so a custom namespace (torch.ops.myproj.*) works the same as
+        # the default torch.ops.grokking_optimizers.*.
+        root = {root_expr}
+        attr = {attr_chain!r}
+        op = root
+        for _part in attr.split('.'):
+            op = getattr(op, _part, None)
+            if op is None:
+                sys.stderr.write('no fused op for {opt_class} at {dotted}\\n')
+                sys.exit(2)
         op(param, grad, m, v, 1e-3, 0.9, 0.999, 1e-8, 0.01, 1.0)
         np.save(r'''{ref_path}''', param.detach().cpu().numpy())
         print('OK')
@@ -6391,9 +6570,17 @@ def _compare_outputs(ref_path: Path, candidate_path: Path,
 
 def _dump_variant_output(variant_so: Path, opt_class: str, size: int,
                          dtype: str, out_path: Path,
-                         timeout: int = 120) -> bool:
+                         timeout: int = 120,
+                         fused_op_template: Optional[str] = None) -> bool:
     """Run the variant .so once and dump its post-step param tensor to
-    ``out_path``. Returns True on success."""
+    ``out_path``. Returns True on success.
+
+    Stream A: ``fused_op_template`` mirrors ``_capture_reference_output``
+    — same default, same placeholder syntax, same getattr walk.
+    """
+    tmpl = fused_op_template or _DEFAULT_FUSED_OP_TEMPLATE
+    dotted = _format_fused_op_template(tmpl, opt_class)
+    root_expr, attr_chain = _split_fused_op_dotted(dotted)
     script = textwrap.dedent(f"""
         import os, sys, numpy as np
         os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
@@ -6405,10 +6592,13 @@ def _dump_variant_output(variant_so: Path, opt_class: str, size: int,
         grad  = torch.ones( {size}, dtype=dtype, device='cuda')
         m     = torch.zeros({size}, dtype=dtype, device='cuda')
         v     = torch.zeros({size}, dtype=dtype, device='cuda')
-        op = getattr(torch.ops.grokking_optimizers,
-                     'fused_{opt_class.lower()}_simple_step', None)
-        if op is None:
-            sys.exit(2)
+        root = {root_expr}
+        attr = {attr_chain!r}
+        op = root
+        for _part in attr.split('.'):
+            op = getattr(op, _part, None)
+            if op is None:
+                sys.exit(2)
         op(param, grad, m, v, 1e-3, 0.9, 0.999, 1e-8, 0.01, 1.0)
         np.save(r'''{out_path}''', param.detach().cpu().numpy())
         print('OK')
@@ -6422,9 +6612,13 @@ def _dump_variant_output(variant_so: Path, opt_class: str, size: int,
 
 
 def _check_determinism_3x(variant_so: Path, opt_class: str, size: int,
-                          dtype: str, out_dir: Path) -> bool:
+                          dtype: str, out_dir: Path,
+                          fused_op_template: Optional[str] = None) -> bool:
     """Run the variant 3 times; return True iff all 3 outputs are
-    bit-identical to each other."""
+    bit-identical to each other.
+
+    Stream A: ``fused_op_template`` is forwarded to
+    ``_dump_variant_output``."""
     import numpy as np
     paths: List[Path] = []
     for i in range(3):
@@ -6434,7 +6628,8 @@ def _check_determinism_3x(variant_so: Path, opt_class: str, size: int,
                 p.unlink()
             except OSError:
                 pass
-        if not _dump_variant_output(variant_so, opt_class, size, dtype, p):
+        if not _dump_variant_output(variant_so, opt_class, size, dtype, p,
+                                    fused_op_template=fused_op_template):
             return False
         paths.append(p)
     if len(paths) < 2:
@@ -6472,8 +6667,16 @@ def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
         try:
             from grokking_optimizers.codegen import (
                 emit_variant_source, CodegenError)
+            # Stream A: forward the template_overrides map from spec.config
+            # so a user-supplied TOML can redirect (opt, arch) pairs at
+            # custom .j2 files. Falls back to None when the spec has no
+            # config attached → historical probe order.
+            spec_cfg = getattr(spec, "config", {}) or {}
+            overrides = (spec_cfg.get("codegen", {}) or {}).get(
+                "template_overrides") or None
             emitted_path, residual = emit_variant_source(
-                config, dims, spec.optimizer, spec.arch, spec.out_dir)
+                config, dims, spec.optimizer, spec.arch, spec.out_dir,
+                template_overrides=overrides)
             spec._emitted_sources[config_key(config)] = emitted_path
             macros_only = resolve_macros(config, dims, target)
             return macros_only + residual
@@ -6563,7 +6766,8 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         try:
             p = _capture_reference_output(
                 Path(aot_so), OPT_CLASS[spec.optimizer],
-                ref_state["size"], ref_state["dtype"], spec.out_dir)
+                ref_state["size"], ref_state["dtype"], spec.out_dir,
+                fused_op_template=getattr(spec, "fused_op_template", None))
             ref_state["path"] = p
             return p
         except Exception as exc:
@@ -6615,7 +6819,8 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                     worker.restart()
             if result is None:
                 result = _time_variant_oneshot(
-                    variant_so, OPT_CLASS[spec.optimizer], report=report)
+                    variant_so, OPT_CLASS[spec.optimizer], report=report,
+                    python_package=getattr(spec, "python_package", None))
         finally:
             if prior_dump is None:
                 os.environ.pop("SG_DUMP_OUTPUT", None)
@@ -6648,7 +6853,9 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                         det = _check_determinism_3x(
                             variant_so, OPT_CLASS[spec.optimizer],
                             ref_state["size"], ref_state["dtype"],
-                            variant_dump_dir)
+                            variant_dump_dir,
+                            fused_op_template=getattr(
+                                spec, "fused_op_template", None))
                         num_status = ("deterministic" if det
                                       else "non_deterministic")
                         report.write(
@@ -6683,13 +6890,13 @@ try:
         print(json.dumps({"error": "torch.cuda.is_available() == False"}))
         sys.exit(1)
     so_path = {so_path!r}
-    if "grokking_optimizers._ops" in sys.modules:
-        del sys.modules["grokking_optimizers._ops"]
-    spec = importlib.util.spec_from_file_location("grokking_optimizers._ops", so_path)
+    if "{package}._ops" in sys.modules:
+        del sys.modules["{package}._ops"]
+    spec = importlib.util.spec_from_file_location("{package}._ops", so_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    sys.modules["grokking_optimizers._ops"] = mod
-    from grokking_optimizers import {opt_class}
+    sys.modules["{package}._ops"] = mod
+    from {package} import {opt_class}
     torch.manual_seed(0)
     p = torch.nn.Parameter(torch.randn({size}, {size}, device="cuda", dtype=torch.float32))
     g = torch.randn_like(p)
@@ -6736,10 +6943,17 @@ except Exception as exc:
 
 def _time_variant_oneshot(variant_so: Path, opt_class: str, *,
                           size: int = 4096, warmup: int = 5, iters: int = 21,
-                          timeout: int = 180, report=None) -> Optional[Dict[str, Any]]:
+                          timeout: int = 180, report=None,
+                          python_package: Optional[str] = None
+                          ) -> Optional[Dict[str, Any]]:
+    """One-shot timing fallback. Stream A: ``python_package`` (default
+    ``grokking_optimizers``) is substituted into the script so the
+    subprocess imports OptCls from the configured project package."""
+    pkg = python_package or "grokking_optimizers"
     body = _TIMING_SCRIPT.format(
         so_path=str(variant_so),
         opt_class=opt_class, size=size, warmup=warmup, iters=iters,
+        package=pkg,
     )
     fd, path = tempfile.mkstemp(suffix="_time.py")
     os.write(fd, body.encode("utf-8"))
@@ -6886,7 +7100,9 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
     if len(visible) > 1:
         report.write(f"  [worker] {len(visible)} GPUs visible "
                      f"({','.join(visible)}); spawning MultiGPUTimingPool.\n")
-        pool = MultiGPUTimingPool(OPT_CLASS[spec.optimizer], vendor=vendor)
+        pool = MultiGPUTimingPool(
+            OPT_CLASS[spec.optimizer], vendor=vendor,
+            python_package=getattr(spec, "python_package", None))
         if pool.start():
             worker = pool
             report.write(f"  [worker] multi-GPU pool up with "
@@ -6895,7 +7111,9 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
             report.write("  [worker] multi-GPU pool failed to start; "
                          "falling back to single worker.\n")
     if worker is None:
-        single = TimingWorker(opt_class=OPT_CLASS[spec.optimizer])
+        single = TimingWorker(
+            opt_class=OPT_CLASS[spec.optimizer],
+            python_package=getattr(spec, "python_package", None))
         if not single.start():
             report.write("  [worker] start FAILED; falling back to "
                          "one-shot per variant.\n")
@@ -7323,8 +7541,20 @@ def _neighbour_estimate(seeds: List[Dict[str, Any]],
 # ---------------------------------------------------------------------------
 
 def _write_tuned_configs_header(combo: Dict[str, Any], optimizer: str,
-                                model: str, arch: str, report) -> Path:
-    tuned_h = REPO_ROOT / "csrc/algorithms/tuned_configs.h"
+                                model: str, arch: str, report,
+                                spec: Optional["BuildSpec"] = None) -> Path:
+    """Materialise the JIT-winner combo to a C++ header of #define macros.
+
+    Stream A: the output path is read from
+    ``spec.tuned_header_path`` (default
+    ``csrc/algorithms/tuned_configs.h``). When ``spec`` is None the legacy
+    REPO_ROOT-relative path is used so older callers keep working.
+    """
+    raw = (getattr(spec, "tuned_header_path", None)
+           if spec is not None else None) or "csrc/algorithms/tuned_configs.h"
+    tuned_h = Path(raw)
+    if not tuned_h.is_absolute():
+        tuned_h = REPO_ROOT / tuned_h
     tuned_h.parent.mkdir(parents=True, exist_ok=True)
     macros: List[str] = []
     # Try to load the space to map dim -> macro
@@ -7365,7 +7595,13 @@ def _write_tuned_configs_header(combo: Dict[str, Any], optimizer: str,
         body.append(f"#define {macro} {val_text}")
         body.append("#endif")
     tuned_h.write_text("\n".join(body) + "\n")
-    report.write(f"  [tuned_configs.h] wrote {tuned_h.relative_to(REPO_ROOT)}\n")
+    # Stream A: a config-supplied absolute path may live outside REPO_ROOT;
+    # only print a repo-relative form when it actually is.
+    try:
+        disp = tuned_h.relative_to(REPO_ROOT)
+    except ValueError:
+        disp = tuned_h
+    report.write(f"  [tuned_configs.h] wrote {disp}\n")
     return tuned_h
 
 
@@ -7625,7 +7861,7 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
     # Final pass: rebuild with tuned macros baked in.
     space_hash = e.get("search_space_hash")
     _write_tuned_configs_header(tuned, spec.optimizer, spec.model, spec.arch,
-                                report)
+                                report, spec=spec)
 
     # Try to assemble macros via the resolved YAML space; fall back to
     # the tuned dict's literal keys.
@@ -7848,6 +8084,13 @@ def build(
         _apply_cfg2(spec, project_cfg)
     except Exception:
         pass
+    # Stream A: make sure spec.config carries the full loaded config even
+    # if apply_to_buildspec couldn't (e.g. read-only spec / older signature).
+    try:
+        if not getattr(spec, "config", None) and isinstance(project_cfg, dict):
+            spec.config = dict(project_cfg)
+    except Exception:
+        pass
 
     _validate(spec)
     spec.out_dir.mkdir(parents=True, exist_ok=True)
@@ -8062,6 +8305,28 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"judgment={m.get('preflight_judgment','?')}\n")
         return 0
 
+    # Stream A — pre-parse --config / --project-config BEFORE the main
+    # argparse runs so the optimizer / model / arch ``choices=`` can
+    # reflect the active project configuration. With no config file the
+    # resolved lists fall back to grokking_optimizers.profile.{OPTIMIZERS,
+    # MODELS, ARCHES} so the CLI accepts exactly today's set of names.
+    _pre = argparse.ArgumentParser(add_help=False)
+    _pre.add_argument("--config", default=None)
+    _pre.add_argument("--project-config", default=None,
+                      dest="project_config")
+    _pre_args, _ = _pre.parse_known_args(_argv)
+    # --project-config wins when both are given.
+    _cfg_path = _pre_args.project_config or _pre_args.config
+    try:
+        _early_cfg = load_config(Path(_cfg_path) if _cfg_path else None)
+    except FileNotFoundError:
+        raise
+    except Exception:
+        _early_cfg = {}
+    _choice_opts = _resolve_enabled_optimizers(_early_cfg)
+    _choice_models = _resolve_enabled_models(_early_cfg)
+    _choice_archs = _resolve_allowed_archs(_early_cfg)
+
     parser = argparse.ArgumentParser(
         prog="python -m grokking_optimizers.compile",
         description="Targeted per-(optimizer, model, arch) build pipeline. "
@@ -8069,11 +8334,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "split AOT/JIT runtimes.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--optimizer", "-O", required=True, choices=OPTIMIZERS,
+    parser.add_argument("--optimizer", "-O", required=True,
+                        choices=_choice_opts,
                         help="Optimizer name (csrc/algorithms/<name>.h)")
-    parser.add_argument("--model", "-M", required=True, choices=MODELS,
+    parser.add_argument("--model", "-M", required=True,
+                        choices=_choice_models,
                         help="Model name (csrc/backends/*/models/<name>.*)")
-    parser.add_argument("--arch", "-A", required=True, choices=ARCHES,
+    parser.add_argument("--arch", "-A", required=True,
+                        choices=_choice_archs,
                         help="Target arch")
     parser.add_argument("--out", type=Path,
                         default=REPO_ROOT / "build" / "compiled",
@@ -8208,10 +8476,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "<out>/nvrtc_cache. CPU-only hosts without "
                              "cuda-python degrade gracefully — the build "
                              "still succeeds.")
-    # Stream 11 — TOML project config
+    # Stream 11 — TOML project config (Stream A added --project-config alias)
     parser.add_argument("--config", default=None,
                         help="Path to project config TOML "
                              "(default: ./compile_config.toml or packaged default)")
+    parser.add_argument("--project-config", default=None,
+                        dest="project_config",
+                        help="Stream A: alias of --config. When both are "
+                             "given, --project-config wins.")
     # Stream 6 — kernel emission backend
     parser.add_argument("--enable-emitter", action="store_true",
                         help="Route each variant through "
@@ -8287,9 +8559,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Stream 11: pre-load the project config so module-level defaults can be
     # consulted by downstream consumers. Behavior is identical to today when
     # no config is present (the loader returns {}).
+    # Stream A: --project-config wins over --config when both are given.
+    _cfg_path_final = (getattr(args, "project_config", None)
+                       or args.config)
     try:
         from grokking_optimizers.compile_config import load_config as _load_cfg
-        project_cfg = _load_cfg(Path(args.config) if args.config else None)
+        project_cfg = _load_cfg(
+            Path(_cfg_path_final) if _cfg_path_final else None)
     except FileNotFoundError:
         raise
     except Exception:
@@ -9967,6 +10243,166 @@ def _self_test() -> int:
     _run("compile_config_cwd_override", test_compile_config_cwd_override)
     _run("compile_config_apply_noop_on_empty",
          test_compile_config_apply_noop_on_empty)
+
+    # ─────────────────────────────────────────────────────────────────
+    # Stream A — portability: TOML config flows through the 12 historical
+    # hardcoded sites (macro prefix, fused-op template, python package,
+    # source layout, tuned-header path, template overrides, enabled
+    # optimizers/models, project namespace, etc.). We don't shell out to
+    # nvcc; we exercise the config-resolution + flag-emission + template
+    # selection paths and assert they reflect a fully-custom project.
+    # ─────────────────────────────────────────────────────────────────
+    sys.stdout.write("[self-test] portability\n")
+
+    def test_portability_custom_project():
+        """Build a synthetic 'myproj' with a different macro prefix /
+        source layout / namespace / optimizer & model lists and confirm
+        every config-driven Stream A site honours it."""
+        with tempfile.TemporaryDirectory() as td:
+            custom_root = Path(td) / "myproj"
+            (custom_root / "src" / "cuda" / "sm_90a").mkdir(parents=True)
+            (custom_root / "src" / "hip" / "gfx942").mkdir(parents=True)
+            (custom_root / "src" / "bindings").mkdir(parents=True)
+            (custom_root / "include").mkdir(parents=True)
+            (custom_root / "algorithms").mkdir(parents=True)
+            # Stub sources so _resolve_sources finds SOMETHING.
+            (custom_root / "src" / "cuda" / "sm_90a"
+             / "launcher.cu").write_text(
+                'extern "C" void launch_myop_step() {}\n')
+            (custom_root / "src" / "bindings"
+             / "bindings.cpp").write_text("// stub\n")
+
+            cwd_cfg = custom_root / "compile_config.toml"
+            cwd_cfg.write_text(
+                "[project]\n"
+                'name = "myproj"\n'
+                'macro_prefix = "MP_"\n'
+                'namespace = "mp::kernels"\n'
+                'fused_op_template = "torch.ops.myproj.fused_{opt_lower}_step"\n'
+                'python_package = "myproj"\n'
+                "\n"
+                "[sources]\n"
+                f'cuda_root = "{custom_root / "src" / "cuda"}"\n'
+                f'hip_root = "{custom_root / "src" / "hip"}"\n'
+                'pallas_root = ""\n'
+                f'bindings_dir = "{custom_root / "src" / "bindings"}"\n'
+                f'algorithms_dir = "{custom_root / "algorithms"}"\n'
+                f'tuned_header_path = "{custom_root / "tuned.h"}"\n'
+                "\n"
+                "[sources.include_paths]\n"
+                f'extra = ["{custom_root / "include"}"]\n'
+                "\n"
+                "[optimizers]\n"
+                'enabled = ["myop"]\n'
+                "\n"
+                "[models]\n"
+                'enabled = ["mymodel"]\n'
+                "\n"
+                "[codegen]\n"
+                "[codegen.template_overrides]\n"
+                '"myop:sm_90a" = "adamw_sm_90a.cu.j2"\n'
+            )
+
+            saved_cwd = os.getcwd()
+            try:
+                os.chdir(custom_root)
+                cfg = load_config()
+                # apply_to_buildspec carries every new field across.
+
+                class _SimSpec:
+                    arch = "sm_90a"
+                    optimizer = "myop"
+                    model = "mymodel"
+                    out_dir = custom_root
+                    extra_macros: list = []
+                    # Portability defaults — pre-apply_to_buildspec.
+                    macro_prefix = "SG_BUILD_"
+                    fused_op_template = (
+                        "torch.ops.grokking_optimizers."
+                        "fused_{opt_lower}_simple_step")
+                    python_package = "grokking_optimizers"
+                    project_namespace = ""
+                    tuned_header_path = "csrc/algorithms/tuned_configs.h"
+                    source_roots: dict = {}
+                    config: dict = {}
+                    # Other minimum fields the apply_to_buildspec branches
+                    # may read on the way through.
+                    enable_emitter = False
+                    enable_runtime_specialization = False
+                    enable_device_pgo = False
+                    strict_numerics = False
+                    prune_after_autotune = True
+                    prune_max_age_days = 30
+                    prune_keep_top_n = 100
+
+                spec = _SimSpec()
+                apply_to_buildspec(spec, cfg)
+                # ---- Portability fields propagated onto spec ----------
+                assert spec.macro_prefix == "MP_", spec.macro_prefix
+                assert spec.python_package == "myproj", spec.python_package
+                assert spec.project_namespace == "mp::kernels", \
+                    spec.project_namespace
+                assert spec.fused_op_template.startswith(
+                    "torch.ops.myproj"), spec.fused_op_template
+                # tuned_header_path absorbs the absolute path verbatim.
+                assert str(spec.tuned_header_path).endswith("tuned.h"), \
+                    spec.tuned_header_path
+                # source_roots got flattened properly.
+                assert "cuda" in spec.source_roots, spec.source_roots
+                assert "bindings" in spec.source_roots, spec.source_roots
+                assert "extra_includes" in spec.source_roots, \
+                    spec.source_roots
+                # spec.config stashed verbatim.
+                assert isinstance(spec.config, dict) and spec.config, \
+                    type(spec.config)
+
+                # ---- _build_macros reflects the custom prefix ---------
+                # We only assert OPTIMIZER_ / MODEL_ macros honour the
+                # prefix — the per-arch macro (e.g. SG_BUILD_ARCH_SM90)
+                # comes from ARCH_TABLE and is independent of the project
+                # prefix, by design.
+                macros = _build_macros(spec)
+                assert any(m.startswith("-DMP_OPTIMIZER_MYOP")
+                           for m in macros), macros
+                assert any(m.startswith("-DMP_MODEL_MYMODEL")
+                           for m in macros), macros
+                assert not any(m.startswith("-DSG_BUILD_OPTIMIZER_")
+                               for m in macros), macros
+                assert not any(m.startswith("-DSG_BUILD_MODEL_")
+                               for m in macros), macros
+
+                # ---- find_template honours the override map -----------
+                tpl = find_template(
+                    "myop", "sm_90a",
+                    overrides=cfg["codegen"]["template_overrides"])
+                assert tpl == "adamw_sm_90a.cu.j2", tpl
+                # No override → falls back to the default probe order
+                # (which will return None for the unknown 'myop' name).
+                assert find_template("myop", "sm_90a") is None
+
+                # ---- Enabled lists are config-driven ------------------
+                assert _resolve_enabled_optimizers(cfg) == ["myop"]
+                assert _resolve_enabled_models(cfg) == ["mymodel"]
+
+                # ---- Fused-op template substitution -------------------
+                rendered = _format_fused_op_template(
+                    spec.fused_op_template, "MyOp")
+                assert rendered == "torch.ops.myproj.fused_myop_step", \
+                    rendered
+
+                # ---- _include_paths picks up extra_includes -----------
+                inc = _include_paths(spec)
+                assert any("include" in p and "myproj" in p
+                           for p in inc), inc
+
+                # ---- _build_context surfaces project_namespace --------
+                ctx = _build_context(cfg, "sm_90a")
+                assert ctx["project_namespace"] == "mp::kernels", \
+                    ctx["project_namespace"]
+            finally:
+                os.chdir(saved_cwd)
+
+    _run("portability_custom_project", test_portability_custom_project)
 
     # ─────────────────────────────────────────────────────────────────
     # Stream 6 — codegen / Jinja2 kernel emitter
@@ -13719,18 +14155,53 @@ def _candidate_template_names(optimizer: str, arch: str,
 
 
 def find_template(optimizer: str, arch: str,
-                  vendor: Optional[str] = None) -> Optional[str]:
+                  vendor: Optional[str] = None,
+                  overrides: Optional[Dict[str, str]] = None) -> Optional[str]:
     """Locate the highest-priority bundled template name for (optimizer, arch).
 
     Returns the template KEY (e.g. ``"adamw_sm_90a.cu.j2"``) into
     ``_BUNDLED_TEMPLATES`` — NOT a filesystem path — or ``None`` when no
     matching template is bundled.
+
+    Stream A: ``overrides`` is a mapping consulted FIRST. Keys are either
+    ``"<optimizer>"`` (matches any arch / vendor) or
+    ``"<optimizer>:<arch_or_vendor>"``. Values are either:
+
+      * a bundled-template KEY already present in ``_BUNDLED_TEMPLATES``
+        (returned verbatim);
+      * a path to an external ``.j2`` file (slurped into
+        ``_BUNDLED_TEMPLATES`` on first hit, then returned by basename).
+
+    With ``overrides=None`` (or an empty dict) the historical probe
+    order is preserved unchanged.
     """
     if vendor is None:
         try:
             vendor = get_arch_entry(arch).vendor
         except KeyError:
             vendor = "cuda"
+    if overrides:
+        for k in (f"{optimizer}:{arch}", f"{optimizer}:{vendor}", optimizer):
+            if k in overrides:
+                v = overrides[k]
+                if not v:
+                    continue
+                # Bundled name → return directly.
+                if v in _BUNDLED_TEMPLATES:
+                    return v
+                # Filesystem path → slurp + cache + return basename.
+                p = Path(v).expanduser()
+                if p.is_file():
+                    key = p.name
+                    if key not in _BUNDLED_TEMPLATES:
+                        try:
+                            _BUNDLED_TEMPLATES[key] = p.read_text(
+                                encoding="utf-8")
+                        except OSError:
+                            continue
+                    return key
+                # Bare name not present and not a file — skip + fall
+                # through to the default probe order rather than fail.
     for name in _candidate_template_names(optimizer, arch, vendor):
         if name in _BUNDLED_TEMPLATES:
             return name
@@ -13753,7 +14224,18 @@ def _canonical_json(ctx: Dict[str, Any]) -> str:
 
 
 def _build_context(config: Dict[str, Any], arch: str) -> Dict[str, Any]:
+    """Build the Jinja2 render context for one (config, arch) pair.
+
+    Stream A: the context exposes an extra ``project_namespace`` key
+    (default ``""``) carrying ``project.namespace`` from the TOML config.
+    New project-specific templates can opt in via, e.g.,
+    ``{{ project_namespace | default("sg::" + arch_short) }}``. The 44
+    existing bundled templates DO NOT reference this key and are
+    therefore unaffected.
+    """
     entry = get_arch_entry(arch)
+    proj = (config.get("project") or {}) if isinstance(config, dict) else {}
+    namespace = str(proj.get("namespace") or "")
     ctx: Dict[str, Any] = {
         "config": dict(config),
         "arch": arch,
@@ -13765,6 +14247,8 @@ def _build_context(config: Dict[str, Any], arch: str) -> Dict[str, Any]:
         "max_threads_per_block": entry.max_threads_per_block,
         "macro": entry.macro,
         "display_name": entry.display_name,
+        # Stream A — opt-in for project-specific templates.
+        "project_namespace": namespace,
     }
     for k, v in config.items():
         if k not in ctx:
@@ -13776,12 +14260,18 @@ def emit_variant_source(config: Dict[str, Any],
                         dims: List[Dict[str, Any]],
                         optimizer: str,
                         arch: str,
-                        out_dir: Path) -> Tuple[Path, List[str]]:
+                        out_dir: Path,
+                        template_overrides: Optional[Dict[str, str]] = None,
+                        ) -> Tuple[Path, List[str]]:
     """Render a bundled template; return (emitted_path, residual_macros).
 
     Files cached by SHA-256(template_source + canonical-JSON ctx).
+
+    Stream A: ``template_overrides`` is forwarded to ``find_template`` so
+    a project-config TOML can point a (optimizer, arch) pair at a custom
+    bundled template or external ``.j2`` file.
     """
-    tpl_name = find_template(optimizer, arch)
+    tpl_name = find_template(optimizer, arch, overrides=template_overrides)
     if tpl_name is None:
         raise CodegenError(
             f"no bundled template for optimizer={optimizer!r} arch={arch!r}")
@@ -15124,8 +15614,42 @@ def run_device_pgo_round(spec, workload_cmd: List[str],
 # ------------------------------------------------------------------------------
 
 # Default config — was grokking_optimizers/compile_config.toml.
+#
+# Stream A — portability: every hardcoded "this is what supergrok looks
+# like" value that USED to live as a Python constant or a literal in some
+# helper now also has a representation in this dict. The defaults below
+# REPLICATE today's behaviour byte-for-byte — a user with no config file
+# sees zero behavioural change. A user with a custom TOML can repoint
+# every one of these at their own project layout, macro naming, fused-op
+# namespace, and python package without touching compile.py at all.
 _DEFAULT_PROJECT_CONFIG: Dict[str, Any] = {
-    "project": {"name": "supergrok", "version": "2.0.0"},
+    "project": {
+        "name":    "supergrok",
+        "version": "2.0.0",
+        # Stream A — portability knobs (see Stream A header in this file
+        # for the full list of refactor sites). Defaults preserve the
+        # SuperGrok project's historical behaviour exactly.
+        # Prefix prepended to every -D macro emitted by _build_macros for
+        # optimizer / model / verbosity gating
+        # (e.g. "SG_BUILD_OPTIMIZER_LION").
+        "macro_prefix":      "SG_BUILD_",
+        # torch.ops template used by numerical-validation subprocesses
+        # to look up the AOT / variant fused step kernel. Placeholders:
+        #   {opt}        — original optimizer-class string
+        #   {opt_lower}  — .lower() of {opt}
+        #   {opt_upper}  — .upper() of {opt}
+        "fused_op_template": "torch.ops.grokking_optimizers.fused_{opt_lower}_simple_step",
+        # Python package imported by the worker / timing / pgo
+        # subprocesses to resolve the optimizer class
+        # (e.g. `from <python_package> import Lion`).
+        "python_package":    "grokking_optimizers",
+        # C++ namespace surfaced into the Jinja2 template context as
+        # `project_namespace`. Empty string preserves today's templates
+        # (none of which reference {{ project_namespace }}); new
+        # project-specific templates can opt in with
+        # `{{ project_namespace | default("sg::" + arch_short) }}`.
+        "namespace":         "",
+    },
     "sources": {
         "cuda_root":      "csrc/backends/cuda",
         "hip_root":       "csrc/backends/hip",
@@ -15133,6 +15657,10 @@ _DEFAULT_PROJECT_CONFIG: Dict[str, Any] = {
         "algorithms_dir": "csrc/algorithms",
         "bindings_dir":   "csrc/bindings",
         "include_paths":  {"extra": []},
+        # Stream A — destination path for _write_tuned_configs_header. May
+        # be absolute, or repo-root-relative when relative. Default
+        # preserves the historical csrc/algorithms/tuned_configs.h.
+        "tuned_header_path": "csrc/algorithms/tuned_configs.h",
     },
     "optimizers": {
         "enabled": ["adamw", "lion", "muon", "prodigy", "grokadamw",
@@ -15150,6 +15678,14 @@ _DEFAULT_PROJECT_CONFIG: Dict[str, Any] = {
     "codegen": {
         "enable_emitter": False,
         "template_dir": "grokking_optimizers/templates",
+        # Stream A — template override map. Keys are either
+        # ``"<optimizer>"`` (matches any arch / vendor) or
+        # ``"<optimizer>:<arch_or_vendor>"``; values are either bundled
+        # template names (e.g. ``"adamw_sm_90a.cu.j2"``) OR absolute
+        # filesystem paths to a .j2 file. External files are slurped into
+        # ``_BUNDLED_TEMPLATES`` on first lookup and cached thereafter.
+        # Empty dict (the default) preserves the historical probe order.
+        "template_overrides": {},
     },
     "runtime_specialization": {"enable": False, "cache_dir": ""},
     "device_pgo": {"enable": False},
@@ -15236,7 +15772,16 @@ def _deep_merge(*dicts: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def apply_to_buildspec(spec, config: Dict[str, Any]) -> None:
-    """Mutate spec in place: apply config feature toggles when off in spec."""
+    """Mutate spec in place: apply config feature toggles when off in spec.
+
+    Stream A — portability: every NEW field added to ``_DEFAULT_PROJECT_CONFIG``
+    by this stream is also copied through onto ``spec`` here so call sites
+    that read ``spec.<field>`` directly stay agnostic to whether the value
+    came from the config or the historical hardcoded default. Existing
+    behaviour is preserved exactly: keys absent from ``config`` (or absent
+    from the spec dataclass — see e.g. ``_SimSpec`` in the portability
+    self-test) leave the corresponding spec attribute alone.
+    """
     if "codegen" in config:
         if not getattr(spec, "enable_emitter", False) and \
                 config["codegen"].get("enable_emitter"):
@@ -15260,11 +15805,62 @@ def apply_to_buildspec(spec, config: Dict[str, Any]) -> None:
             config["cache"].get("max_age_days", 30))
         spec.prune_keep_top_n = int(
             config["cache"].get("keep_top_n", 100))
+    # ---------------- Stream A portability fields ------------------
+    proj = config.get("project", {}) if isinstance(config, dict) else {}
+    if proj.get("macro_prefix"):
+        spec.macro_prefix = str(proj["macro_prefix"])
+    if proj.get("fused_op_template"):
+        spec.fused_op_template = str(proj["fused_op_template"])
+    if proj.get("python_package"):
+        spec.python_package = str(proj["python_package"])
+    # ``namespace`` defaults to "" — we still copy that through so a
+    # user that sets it to empty intentionally overrides any earlier
+    # spec value.
+    if "namespace" in proj:
+        spec.project_namespace = str(proj.get("namespace") or "")
+    src = config.get("sources", {}) if isinstance(config, dict) else {}
+    if src.get("tuned_header_path"):
+        spec.tuned_header_path = str(src["tuned_header_path"])
+    if src:
+        # Flatten sources into a single dict keyed by vendor + bindings +
+        # algorithms + extra_includes. _resolve_sources / _include_paths
+        # read from spec.source_roots before consulting the historical
+        # csrc/backends/<vendor>/<arch> default layout.
+        sr: Dict[str, Any] = dict(getattr(spec, "source_roots", {}) or {})
+        if src.get("cuda_root"):
+            sr["cuda"] = str(src["cuda_root"])
+        if src.get("hip_root"):
+            sr["hip"] = str(src["hip_root"])
+        if src.get("pallas_root"):
+            sr["pallas"] = str(src["pallas_root"])
+        if src.get("bindings_dir"):
+            sr["bindings"] = str(src["bindings_dir"])
+        if src.get("algorithms_dir"):
+            sr["algorithms"] = str(src["algorithms_dir"])
+        extra_inc = (src.get("include_paths", {}) or {}).get("extra", [])
+        if extra_inc:
+            sr["extra_includes"] = [str(p) for p in extra_inc]
+        spec.source_roots = sr
+    # Stash the full config on the spec so deeply-nested call sites (e.g.
+    # find_template's override map, _build_context's project_namespace,
+    # _capture_reference_output's fused_op_template) can fetch sub-keys
+    # without having to plumb a separate argument through every layer.
+    try:
+        spec.config = dict(config) if isinstance(config, dict) else {}
+    except Exception:
+        # Read-only spec (rare; defensive). Skip.
+        pass
 
 
 def project_sources(config: Dict[str, Any], vendor: str,
                     arch: str) -> Dict[str, Path]:
-    src = config.get("sources", {})
+    """Resolve the per-vendor source tree for a given arch.
+
+    Stream A: ``config["sources"]`` (or a spec.source_roots dict produced
+    by ``apply_to_buildspec``) overrides the historical
+    ``csrc/backends/<vendor>`` layout when a custom root is set.
+    """
+    src = config.get("sources", {}) if isinstance(config, dict) else {}
     root_key = {"cuda": "cuda_root", "hip": "hip_root",
                 "pallas": "pallas_root"}[vendor]
     root = src.get(root_key, f"csrc/backends/{vendor}")
@@ -15290,6 +15886,59 @@ def allowed_archs(config: Dict[str, Any]) -> Optional[list]:
 
 def default_arch(config: Dict[str, Any]) -> Optional[str]:
     return config.get("archs", {}).get("default") or None
+
+
+# ----- Stream A: config-driven enum resolvers ---------------------------
+#
+# These wrap ``allowed_*`` with a profile-module fallback so the CLI
+# ``choices=`` declarations can read from either. They also normalise
+# the return type to ``list`` (never ``None`` — callers want something
+# to iterate). The order is:
+#   1. Honour ``config["<section>"]["enabled" / "allowed"]`` if non-empty.
+#   2. Fall back to ``grokking_optimizers.profile.<CONSTANT>``.
+# This means a TOML that omits a section still lights up the full
+# historical list; a TOML that supplies one restricts the CLI to it.
+
+def _resolve_enabled_optimizers(
+        config: Optional[Dict[str, Any]] = None) -> list:
+    """Return the list of optimizers the CLI should accept."""
+    if isinstance(config, dict):
+        opts = allowed_optimizers(config)
+        if opts:
+            return list(opts)
+    try:
+        from grokking_optimizers.profile import OPTIMIZERS as _O
+        return list(_O)
+    except Exception:
+        return []
+
+
+def _resolve_enabled_models(
+        config: Optional[Dict[str, Any]] = None) -> list:
+    """Return the list of models the CLI should accept."""
+    if isinstance(config, dict):
+        mds = allowed_models(config)
+        if mds:
+            return list(mds)
+    try:
+        from grokking_optimizers.profile import MODELS as _M
+        return list(_M)
+    except Exception:
+        return []
+
+
+def _resolve_allowed_archs(
+        config: Optional[Dict[str, Any]] = None) -> list:
+    """Return the list of arches the CLI should accept."""
+    if isinstance(config, dict):
+        ar = allowed_archs(config)
+        if ar:
+            return list(ar)
+    try:
+        from grokking_optimizers.profile import ARCHES as _A
+        return list(_A)
+    except Exception:
+        return []
 
 
 # ------------------------------------------------------------------------------
