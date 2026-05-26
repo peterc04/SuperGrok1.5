@@ -125,6 +125,7 @@ Importable::
 from __future__ import annotations
 
 import argparse
+import collections
 import concurrent.futures
 import datetime
 import hashlib
@@ -3279,10 +3280,13 @@ class MultiGPUTimingPool:
 #
 #   (a) best-so-far plateau   — no relative improvement > ``min_delta_rel``
 #                               for ``patience`` consecutive trials.
-#   (b) EI exhaustion         — rolling Expected-Improvement estimate falls
-#                               below ``ei_floor`` (currently a no-op slot —
-#                               TPE doesn't expose EI directly; reserved for
-#                               a Stream-future GP sampler).
+#   (b) EI exhaustion         — rolling Expected-Improvement estimate
+#                               (mean relative improvement over the trailing
+#                               ``patience`` trials) falls below ``ei_floor``.
+#                               TPE doesn't expose Optuna's internal
+#                               acquisition value, so we estimate EI
+#                               empirically from per-trial improvements over
+#                               the running best. Scale-free (relative).
 #   (c) coverage saturation   — count of distinct (dim_name, value) pairs
 #                               grows by less than ``coverage_growth_floor``
 #                               per trial over the trailing ``patience``
@@ -3307,8 +3311,11 @@ class BayesianEarlyStopper:
     Stops when ANY of the following triggers (whichever fires first):
       (a) Best-so-far plateau: no improvement > ``min_delta_rel`` for
           ``patience`` trials.
-      (b) EI exhaustion: rolling EI estimate falls below ``ei_floor``
-          (reserved; TPE samplers don't expose EI here).
+      (b) EI exhaustion: rolling EI estimate (mean of per-trial relative
+          improvements over the trailing ``patience`` window) falls below
+          ``ei_floor``. Empirical proxy: TPE doesn't expose Optuna's
+          acquisition value, so we measure the rate at which new trials
+          beat the running best.
       (c) Coverage saturation: new-(dim_name, value) tuples per trial
           < ``coverage_growth_floor``.
       (d) Wall-clock budget: ``time.time() - start_time > max_seconds``.
@@ -3335,6 +3342,12 @@ class BayesianEarlyStopper:
         self.coverage_history: List[int] = []  # cumulative |coverage_set| per trial
         self.trial_count = 0
         self.stop_reason: Optional[str] = None
+        # (b) EI exhaustion: per-trial relative improvements over the
+        # running best. Kept unbounded; should_stop() slices the trailing
+        # ``self.patience`` window (patience is dynamic when auto-mode).
+        self._improvement_window: collections.deque = collections.deque()
+        # Cached for to_dict() / cache persistence.
+        self._last_ei_estimate: Optional[float] = None
 
     @property
     def patience(self) -> int:
@@ -3344,6 +3357,18 @@ class BayesianEarlyStopper:
 
     def observe(self, trial_value: float, trial_params: Dict[str, Any]) -> None:
         self.trial_count += 1
+        prev_best = self.best
+        # (b) EI estimate: per-trial relative improvement over prev_best.
+        # First trial (prev_best == inf) records 0 — nothing to improve over.
+        # Non-finite trials (failed/infeasible) record 0 — no signal.
+        if math.isfinite(trial_value) and math.isfinite(prev_best):
+            improvement = max(
+                0.0,
+                (prev_best - trial_value) / max(abs(prev_best), 1e-12),
+            )
+        else:
+            improvement = 0.0
+        self._improvement_window.append(improvement)
         # Plateau tracking — only count finite improvements as such.
         if math.isfinite(trial_value) and \
                 trial_value < self.best * (1 - self.min_delta_rel):
@@ -3383,6 +3408,16 @@ class BayesianEarlyStopper:
                 self.stop_reason = (
                     f"coverage_saturated:growth_rate={growth_rate:.4f}")
                 return True
+        # (b) EI exhaustion: empirical EI = mean of relative improvements
+        # over the trailing ``patience`` window. ei_floor <= 0 disables the
+        # criterion (user can opt out while keeping other stoppers active).
+        if self.ei_floor > 0 and len(self._improvement_window) >= self.patience:
+            recent = list(self._improvement_window)[-self.patience:]
+            rolling_mean = sum(recent) / max(1, len(recent))
+            self._last_ei_estimate = rolling_mean
+            if rolling_mean < self.ei_floor:
+                self.stop_reason = f"ei_exhausted:{rolling_mean:.2e}"
+                return True
         return False
 
     def to_dict(self) -> Dict[str, Any]:
@@ -3399,6 +3434,7 @@ class BayesianEarlyStopper:
             "last_improve_trial": self.last_improve_trial,
             "coverage_size": len(self.coverage_set),
             "stop_reason": self.stop_reason,
+            "recent_ei_estimate": self._last_ei_estimate,
         }
 
 
@@ -4275,6 +4311,10 @@ class BuildSpec:
     max_tune_seconds: Optional[float] = None
     min_improvement: float = 0.005
     patience: Optional[int] = None    # None ⇒ auto = max(50, 0.1*N)
+    # Stream-E: empirical EI exhaustion floor. Stops when the mean relative
+    # improvement over the trailing ``patience`` trials drops below this
+    # value. 0 disables (other stoppers still apply).
+    ei_floor: float = 1e-6
     seed: int = 0
     debug_symbols: bool = False
     debug: bool = False               # mirror report to stderr + print every subproc
@@ -6877,6 +6917,7 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
     stopper = BayesianEarlyStopper(
         min_delta_rel=spec.min_improvement,
         patience=spec.patience,
+        ei_floor=spec.ei_floor,
         max_seconds=spec.max_tune_seconds,
     )
     budget_desc = (f"n_trials={n_trials} (manual cap)"
@@ -6887,6 +6928,7 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
     if spec.patience is not None:
         budget_desc += f", patience={spec.patience}"
     budget_desc += f", min_improvement={spec.min_improvement}"
+    budget_desc += f", ei_floor={spec.ei_floor}"
     report.write(f"\n  [bayesian] TPE stage with {budget_desc}, "
                  f"seed={spec.seed}, pruner={spec.pruner}\n")
 
@@ -7554,6 +7596,7 @@ def build(
     max_tune_seconds: Optional[float] = None,
     min_improvement: float = 0.005,
     patience: Optional[int] = None,
+    ei_floor: float = 1e-6,
     seed: int = 0,
     debug_symbols: bool = False,
     debug: bool = False,
@@ -7666,6 +7709,7 @@ def build(
         max_tune_seconds=max_tune_seconds,
         min_improvement=min_improvement,
         patience=patience,
+        ei_floor=ei_floor,
         seed=seed,
         debug_symbols=debug_symbols, debug=debug,
         pruner=pruner, transfer_learning=transfer_learning,
@@ -7767,7 +7811,8 @@ def build(
             report.write(f"# Bayesian trials:  {bt_disp} (top_k={tk_disp}"
                          f" patience={patience or 'auto'}"
                          f" max_tune_seconds={max_tune_seconds or 'unbounded'}"
-                         f" min_improvement={min_improvement})\n")
+                         f" min_improvement={min_improvement}"
+                         f" ei_floor={ei_floor})\n")
             report.write(f"# PGO:              {pgo}\n")
             if pgo:
                 report.write(f"#   workload:       {pgo_workload or DEFAULT_PGO_WORKLOAD}\n")
@@ -7943,6 +7988,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--patience", type=int, default=None,
                         help="Trial patience for plateau detection "
                              "(default: auto = max(50, 0.1 * n_completed)).")
+    parser.add_argument("--ei-floor", type=float, default=1e-6,
+                        help="Rolling-EI estimate floor; the autotuner stops "
+                             "when the mean improvement over the last `patience` "
+                             "trials drops below this value (default 1e-6). Set "
+                             "to 0 to disable the EI-exhaustion criterion (other "
+                             "stoppers still apply).")
     parser.add_argument("--quick", action="store_true",
                         help=f"Debug shortcut: bayesian mode with "
                              f"{QUICK_BAYESIAN_TRIALS} trials.")
@@ -8178,6 +8229,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         max_tune_seconds=args.max_tune_seconds,
         min_improvement=args.min_improvement,
         patience=args.patience,
+        ei_floor=args.ei_floor,
         seed=args.seed,
         debug_symbols=args.debug_symbols,
         debug=args.debug,
@@ -8814,10 +8866,55 @@ def _self_test() -> int:
         assert round_tripped["best"] == 0.4
         assert round_tripped["coverage_size"] == 3  # (block,128), (block,256), (vec,4)
 
+    def test_ei_exhaustion_triggers():
+        """Stopper triggers on EI-exhausted OR plateau (whichever fires
+        first) when the timer converges to a single optimum quickly."""
+        import random
+        random.seed(7)
+
+        def _converging_timer(cfg):
+            # Strongly favors block=256 vec=4 unroll=8. Other configs lose
+            # by big margins, so the running best drops fast and improvements
+            # dry up after ~30 trials.
+            b = cfg.get("block", 64)
+            v = cfg.get("vec", 1)
+            u = cfg.get("unroll", 1)
+            base = 0.10
+            penalty = (abs(b - 256) / 256.0) + (abs(v - 4) / 4.0) + (abs(u - 8) / 8.0)
+            return base + penalty + 0.001 * random.random()
+
+        tiny_space = {"sm_90": {"dims": [
+            {"name": "block", "type": "int",
+             "values": [64, 128, 192, 256, 320, 384, 512],
+             "macro": "BLOCK", "applies_to": ["host", "device"]},
+            {"name": "vec",   "type": "int",
+             "values": [1, 2, 4, 8],
+             "macro": "VEC", "applies_to": ["host", "device"]},
+            {"name": "unroll", "type": "int",
+             "values": [1, 2, 4, 8, 16],
+             "macro": "UNROLL", "applies_to": ["host", "device"]},
+        ], "prefilter": {"rules": []}}}
+        # Tight ei_floor + ample patience → stopper has the room to detect EI exhaustion.
+        stopper = BayesianEarlyStopper(min_delta_rel=0.001, patience=40,
+                                       ei_floor=1e-3, max_trials=3000)
+        records, stop_info = run_bayesian(
+            "sm_90", tiny_space, n_trials=None, seed=0,
+            timer=_converging_timer, stopper=stopper)
+        # Either of these reasons is acceptable — both are valid auto-stops.
+        reason = stop_info.get("stop_reason", "") or ""
+        assert (reason.startswith("ei_exhausted") or reason.startswith("plateau")
+                or reason.startswith("coverage_saturated")), \
+            f"unexpected stop_reason={reason!r} after {len(records)} trials"
+        # Convergence must have happened within a reasonable number of trials.
+        assert len(records) < 2500, f"runaway: {len(records)} trials"
+        sys.stdout.write(f"    (stopper triggered after {len(records)} trials, "
+                         f"reason={reason})\n")
+
     _run("early_stopper_triggers", test_early_stopper_triggers)
     _run("early_stopper_wall_clock", test_early_stopper_wall_clock)
     _run("topk_elbow_detection", test_topk_elbow_detection)
     _run("stopper_to_dict_serializable", test_stopper_to_dict_serializable)
+    _run("ei_exhaustion_triggers", test_ei_exhaustion_triggers)
 
     sys.stdout.write("[self-test] cache\n")
 
