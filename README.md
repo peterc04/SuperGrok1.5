@@ -11,224 +11,188 @@ conditions.
 
 ---
 
-## Quickstart: clone, install, compile
+## Quickstart: clone → install → compile → profile
 
-Every step from "install dependencies" onward is shown as Python so the
-whole flow can be driven from a single script (or pasted into a REPL).
-The only shell command is `git clone`, since you need the repo on disk
-before you can `import grokking_optimizers`.
+Four steps from a fresh machine to a profiled artifact. Every step
+from "install dependencies" onward is Python so the whole flow can
+live in one script.
 
-### 1. Clone the repo
+### Step 1 — Clone the repo
 
 ```bash
 git clone https://github.com/peterc04/SuperGrok1.5
 cd SuperGrok1.5
 ```
 
-### 2. Install Python dependencies
+### Step 2 — Install Python dependencies
 
 ```python
-import subprocess
-import sys
+import subprocess, sys
 
-def pip_install(*pkgs: str) -> None:
+def pip_install(*pkgs):
     subprocess.run([sys.executable, "-m", "pip", "install", *pkgs], check=True)
 
-# Core deps — required on every host
-pip_install("torch", "optuna", "pyyaml")
+pip_install("torch", "optuna", "pyyaml", "ninja", "tqdm")
+# Add 'jax[tpu]' only if you target arch="tpu_v5p":
+#   pip_install("jax[tpu]", "-f",
+#               "https://storage.googleapis.com/jax-releases/libtpu_releases.html")
 
-# Ninja: either the system package (apt/brew/dnf install ninja-build) OR
-# the pip wrapper. torch's cpp_extension auto-detects either.
-pip_install("ninja")
-
-# Optional but recommended
-pip_install("tqdm")                 # nicer progress bars during autotune
-# pip_install("jax[tpu]")           # only if you target --arch tpu_v5p
-
-# (Optional) Initialize the CUTLASS submodule for sm_90 CUTLASS GEMMs
-subprocess.run(
-    ["git", "submodule", "update", "--init", "--recursive", "third_party/cutlass"],
-    check=False,
-)
-
-# Verify the imports load cleanly
-import torch, optuna, yaml
-print(f"torch {torch.__version__} | optuna {optuna.__version__} | pyyaml {yaml.__version__}")
+# Optional: CUTLASS submodule for sm_90 CUTLASS GEMMs
+subprocess.run(["git", "submodule", "update", "--init", "--recursive",
+                "third_party/cutlass"], check=False)
 ```
 
-### 3. Set up the toolchain for your target arch
+### Step 3 — Compile (one step, full debug output)
 
-Only the toolchain matching your target is needed. Set env vars in
-Python so they propagate to every subprocess spawned in this session:
+Pick your `(optimizer, model, arch)` triple, set the toolchain env vars
+for your arch, and call `build(...)` with `debug=True`. This single
+block does AOT compile, Bayesian autotune (or exhaustive / PGO if you
+ask for it), final rebuild with the winning macros, and the profile
+pass — all streamed to your terminal in real time so you can see every
+compiler invocation, every autotune trial, every cache hit/miss, and
+the full env state.
 
 ```python
-import os
-import shutil
-import subprocess
+import os, sys
+from pathlib import Path
 
-ARCH = "sm_90"   # one of: "sm_90", "gfx942", "tpu_v5p"
+# ─── your selection ───────────────────────────────────────────────────────
+OPTIMIZER = "adamw"            # adamw | lion | grokfast | grokadamw | looksam |
+                               # muon | neuralgrok | prodigy | supergrok11 |
+                               # supergrok15 | supergrok2
+MODEL     = "decoder"          # mamba | decoder | vit
+ARCH      = "sm_90"            # sm_90 | gfx942 | tpu_v5p
 
+# ─── toolchain env (only the one matching ARCH is consulted) ──────────────
 if ARCH == "sm_90":
-    # CUDA Toolkit ≥ 12.0 — nvcc must be on PATH AND CUDA_HOME must be exported
     os.environ["CUDA_HOME"] = "/usr/local/cuda"          # adjust to your install
     os.environ["PATH"] = f"{os.environ['CUDA_HOME']}/bin:{os.environ['PATH']}"
-    assert shutil.which("nvcc"), "nvcc not on PATH after setting CUDA_HOME/bin"
-    subprocess.run(["nvcc", "--version"], check=True)
-
 elif ARCH == "gfx942":
-    # ROCm ≥ 6.0 — hipcc must be on PATH AND ROCM_PATH must be exported
     os.environ["ROCM_PATH"] = "/opt/rocm"                # adjust to your install
     os.environ["PATH"] = f"{os.environ['ROCM_PATH']}/bin:{os.environ['PATH']}"
-    assert shutil.which("hipcc"), "hipcc not on PATH after setting ROCM_PATH/bin"
-    subprocess.run(["hipcc", "--version"], check=True)
+# tpu_v5p needs no C++ toolchain — JAX/Pallas does codegen at runtime
 
-elif ARCH == "tpu_v5p":
-    # No C++ toolchain — JAX/Pallas does codegen at runtime
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "jax[tpu]",
-         "-f", "https://storage.googleapis.com/jax-releases/libtpu_releases.html"],
-        check=True,
-    )
-```
+# ─── compile (debug=True prints every step to stderr in real time) ────────
+from grokking_optimizers.compile import build, CompileCache
 
-**Common gotcha:** `compile.py` AOT will fail with
-`CUDA_HOME environment variable is not set` even when `nvcc` is on
-`PATH` — torch's `cpp_extension` reads `CUDA_HOME` directly.
-
-### 4. Verify the install (no GPU or toolchain needed)
-
-```python
-# Runs 18 inline self-tests covering search space, PGO, Bayesian, cache,
-# and kernel headers. Pure-Python — works on any host.
-from grokking_optimizers.compile import main as compile_main
-exit_code = compile_main(["--self-test"])
-assert exit_code == 0, "self-test failed; fix the install before moving on"
-```
-
-Expected output ends with `[self-test] 18 passed, 0 failed`.
-
-### 5. Compile an `(optimizer, model, arch)` triple
-
-The targeted build pipeline lives at `grokking_optimizers/compile.py`.
-It runs ninja-driven AOT compilation, optional Bayesian/Exhaustive
-autotuning over a 10-dim search space (embedded in the file as
-`DEFAULT_SEARCH_SPACE_YAML`), an optional 3-pass PGO loop, and an
-optional native-profiler capture.
-
-Use the importable `build()` API for in-process orchestration, or call
-`main(argv)` to mirror the CLI exactly (which spawns AOT and JIT as
-isolated subprocesses, matching `python -m grokking_optimizers.compile`):
-
-```python
-from pathlib import Path
-from grokking_optimizers.compile import build, main as compile_main, CompileCache
-
-# Default: bayesian autotune (500 trials, top-K=20), AOT+JIT, profile pass
 cache = CompileCache(Path("build/.compile_cache.json"))
 so_path = build(
-    optimizer="adamw", model="decoder", arch="sm_90",
+    optimizer=OPTIMIZER,
+    model=MODEL,
+    arch=ARCH,
     cache=cache,
+    debug=True,                # ◀── stream the full report to stderr
+    # autotune_mode="bayesian", bayesian_trials=500, top_k=20,  # defaults
+    # autotune_mode="exhaustive",                # try every prefilter survivor
+    # bayesian_trials=25,                        # "quick" debug run
+    # pgo=True, pgo_steps=1000,                  # 3-pass PGO build
+    # aot_only=True, aot_artifact_dir=Path("build/aot"),   # CPU-host AOT
+    # jit_only=True,                                       # GPU-host JIT
+    # search_space_path=Path("my_search_space.yaml"),      # custom YAML
+    # debug_symbols=True,                                  # -ggdb / -lineinfo
 )
 print("built:", so_path)
-
-# Quick debug run (25 trials, no PGO, skip profile)
-build(optimizer="lion", model="mamba", arch="sm_90",
-      autotune_mode="bayesian", bayesian_trials=25, profile=False)
-
-# Exhaustive — every config that survives the static pre-filter
-build(optimizer="grokfast", model="vit", arch="gfx942",
-      autotune_mode="exhaustive")
-
-# AOT only (CPU host with nvcc + CUDA_HOME) — publish artefact for a GPU host
-build(optimizer="adamw", model="decoder", arch="sm_90",
-      aot_only=True, aot_artifact_dir=Path("build/aot"))
-
-# JIT autotune only (GPU host) — consumes the artefact from above
-build(optimizer="adamw", model="decoder", arch="sm_90",
-      jit_only=True, cache_path=Path("build/.compile_cache.json"))
-
-# 3-pass PGO build (instrument → workload → use)
-build(optimizer="grokadamw", model="decoder", arch="sm_90",
-      pgo=True, pgo_steps=1000)
-
-# Use your own YAML search space instead of the embedded one
-build(optimizer="lion", model="vit", arch="sm_90",
-      search_space_path=Path("my_search_space.yaml"))
-
-# Mirror the CLI exactly (subprocess-isolated AOT + JIT split)
-compile_main([
-    "--optimizer", "adamw", "--model", "decoder", "--arch", "sm_90",
-    "--cache", "build/.compile_cache.json",
-])
 ```
 
-Supported values:
+What you will see streaming to your terminal with `debug=True`:
 
-- `optimizer`: `adamw`, `lion`, `grokfast`, `grokadamw`,
-  `looksam`, `muon`, `neuralgrok`, `prodigy`, `supergrok11`, `supergrok15`, `supergrok2`
-- `model`: `mamba`, `decoder`, `vit`
-- `arch`: `sm_90`, `gfx942`, `tpu_v5p`
+```
+========================================================================
+[debug] grokking_optimizers.compile starting at 2026-05-26T...
+[debug] target:   adamw/decoder/sm_90 (vendor=cuda)
+[debug] runtime:  both  autotune=True (bayesian)  pgo=False  profile=True
+[debug] phases:   ['resolve', 'aot', 'jit-autotune', 'final', 'profile']
+[debug] out_dir:  /home/you/SuperGrok1.5/build/compiled
+[debug] cache:    /home/you/SuperGrok1.5/build/.compile_cache.json
+[debug] report:   /home/you/SuperGrok1.5/build/compiled/compile_adamw_decoder_sm_90.txt
+[debug] env:      CUDA_HOME=/usr/local/cuda  ROCM_PATH=<unset>
+[debug] env:      PATH=...
+[debug] env:      FORCE_CUDA=<unset>  TORCH_CUDA_ARCH_LIST=<unset>
+========================================================================
 
-Output: a single text report at `build/compiled/compile_<O>_<M>_<A>.txt`
-plus the built `.so` (CUDA/HIP) or compiled Pallas module (TPU). The
-report is always written, even on build failure — open it first when
-something goes wrong. The JSON cache survives across runs, so repeating
-the same combo is a cache-hit on every phase.
+# grokking_optimizers.compile — targeted build
+# Generated: ...
+... (full report contents, every line tee'd live) ...
+--- AOT PHASE ---
+  module:    grokking_compiled_adamw_decoder_sm_90
+  sources:   18 files
+  host:      -O3 -std=c++17 ... (every cflag)
+  device:    -O3 --use_fast_math ... (every nvcc/hipcc flag)
+  [toolchain] nvcc 12.6
+  ... (verbose=True is auto-set, so every nvcc command + ninja line is printed)
+--- JIT AUTOTUNE PHASE ---
+  [prefilter] 24000 candidates → 384 survivors (23616 eliminated)
+  ... (every Optuna trial: config + timing) ...
+--- PROFILE PASS ---
+  ... (ncu / rocprof / jax.profiler output) ...
+```
 
-For the full reference (Optuna study persistence, transfer learning,
-Hyperband pruner, debug symbols, etc.), see
-[CLI surface](#cli-surface-compilepy) below — every CLI flag maps to a
-keyword argument on `build()`.
+Outputs (also written even without `debug=True`):
 
-### 6. Profile a compiled artifact
+- `build/compiled/compile_<O>_<M>_<A>.txt` — full text report (the same
+  thing you saw stream by)
+- `build/compiled/grokking_compiled_<O>_<M>_<A>/*.so` — the built kernel
+- `build/.compile_cache.json` — survives across runs; same combo is a
+  cache-hit on every phase
+
+Common gotcha: `compile` AOT will fail with `CUDA_HOME environment
+variable is not set` even when `nvcc` is on `PATH` — torch's
+`cpp_extension` reads `CUDA_HOME` directly. The toolchain block above
+handles this.
+
+### Step 4 — Profile (one step, also fully debug-able)
 
 ```python
 from grokking_optimizers.profile import profile
 
-# Re-profile without rebuilding
-# (ncu on sm_90, rocprof on gfx942, jax.profiler on tpu_v5p)
-report = profile(optimizer="adamw", model="decoder", arch="sm_90")
+report = profile(
+    optimizer=OPTIMIZER, model=MODEL, arch=ARCH,
+    debug=True,                # stream ncu/rocprof/jax.profiler live
+)
 print("profile report:", report)
 
-# Or profile a specific .so / launcher source directly
-report = profile(path="build/compiled/grokking_compiled_adamw_decoder_sm_90/"
-                      "grokking_compiled_adamw_decoder_sm_90.cpython-311-x86_64-linux-gnu.so")
+# Or profile a specific .so / launcher source directly:
+# report = profile(path="build/compiled/grokking_compiled_adamw_decoder_sm_90/"
+#                        "grokking_compiled_adamw_decoder_sm_90.cpython-311-x86_64-linux-gnu.so",
+#                  debug=True)
 ```
 
-### 7. Run the production install
+### (Optional) Production install for the race driver
 
-The `build()` flow is for iterating on one combo with full diagnostics.
-For the production `grokking_optimizers._ops` extension consumed by the
-race driver, install the package itself:
+`build()` is for iterating on one combo with full diagnostics. If you
+also want the production `grokking_optimizers._ops` extension consumed
+by `grokking_race_v2.py`, install the package itself once:
 
 ```python
-import os
-import subprocess
-import sys
-
+import os, subprocess, sys
 env = os.environ.copy()
-# Standard install assumes a visible GPU. On a CPU build host, force-build
-# the CUDA extension and (optionally) limit the gencode list to Hopper:
-# env["FORCE_CUDA"] = "1"
-# env["TORCH_CUDA_ARCH_LIST"] = "9.0"
-
+# env["FORCE_CUDA"] = "1"               # CPU host with no visible GPU
+# env["TORCH_CUDA_ARCH_LIST"] = "9.0"   # Hopper-only gencode (faster build)
 subprocess.run([sys.executable, "-m", "pip", "install", "-e", "."],
                check=True, env=env)
-
-# Race driver entry point
 subprocess.run([sys.executable, "grokking_race_v2.py", "--help"], check=True)
+```
+
+### Verifying the install (no GPU or toolchain needed)
+
+If anything in Step 3 goes wrong before the compile actually starts,
+run the inline self-test to confirm the Python install is sound:
+
+```python
+from grokking_optimizers.compile import main as compile_main
+assert compile_main(["--self-test"]) == 0  # prints "[self-test] 18 passed, 0 failed"
 ```
 
 ### Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
-| `CUDA_HOME environment variable is not set` | `os.environ["CUDA_HOME"] = "/usr/local/cuda"` (or wherever your install lives). Required even when `nvcc` is on `PATH`. |
-| `No supported GPU backend detected` from setup.py | Either install CUDA/ROCm + visible GPU, or set `env["FORCE_CUDA"] = "1"` before the `pip install -e .` subprocess to force-build the CUDA extension on a CPU host. |
-| `nvcc not on PATH; skipping version-gated flags` in the report | Install CUDA Toolkit ≥ 12.0 and prepend `$CUDA_HOME/bin` to `PATH`. The build will still run but won't auto-add `--split-compile`. |
-| Self-test fails with `ModuleNotFoundError` | `pip_install("torch", "optuna", "pyyaml")` — make sure the imports work before calling `compile_main(["--self-test"])`. |
-| Compile silently hangs at "jit-autotune" | First-time Optuna study creation needs SQLite write access to `<out>/optuna_<O>_<M>_<A>.db`. Check directory permissions on `--out` / `out_dir=`. |
-| `[build FAILED after 0.0s]` in the report | Open `build/compiled/compile_<O>_<M>_<A>.txt` — the actual compiler error is logged after the `[build FAILED]` line. |
+| `CUDA_HOME environment variable is not set` | `os.environ["CUDA_HOME"] = "/usr/local/cuda"` (Step 3 block already does this). Required even when `nvcc` is on `PATH`. |
+| `No supported GPU backend detected` from setup.py | `env["FORCE_CUDA"] = "1"` before the `pip install -e .` subprocess. |
+| `nvcc not on PATH; skipping version-gated flags` in the streamed report | Install CUDA Toolkit ≥ 12.0 and prepend `$CUDA_HOME/bin` to `PATH`. Build still runs but won't auto-add `--split-compile`. |
+| Self-test fails with `ModuleNotFoundError` | Repeat Step 2 — `pip_install("torch", "optuna", "pyyaml", "ninja", "tqdm")`. |
+| Compile silently hangs at "jit-autotune" | First-time Optuna study creation needs SQLite write access to `<out>/optuna_<O>_<M>_<A>.db`. With `debug=True` the SQLite error would have streamed; check `out_dir=` permissions. |
+| `[build FAILED after 0.0s]` and you missed the error | Re-run with `debug=True` — the actual compiler error streams to your terminal and is also persisted in `build/compiled/compile_<O>_<M>_<A>.txt`. |
 
 ---
 
@@ -434,9 +398,14 @@ python -m grokking_optimizers.compile \
   [--aot-artifact-dir <path>] \
   [--quick] [--no-autotune] [--no-profile] \
   [--transfer-learning] [--pruner {none,hyperband,median}] \
-  [--debug-symbols] [--seed N] [-D MACRO[=VALUE]] [-v]
+  [--debug-symbols] [--seed N] [-D MACRO[=VALUE]] [-v] [--debug]
   [--self-test]
 ```
+
+`--debug` mirrors the full build report to stderr in real time,
+auto-enables `-v`, and propagates through the AOT/JIT subprocess split
+so every nvcc/hipcc invocation and Optuna trial is streamed live. Use
+`debug=True` on the importable `build()` API for the same effect.
 
 ### Output flag bases
 

@@ -1528,6 +1528,36 @@ def _migrate_v2_to_v3(data: dict) -> dict:
     return data
 
 
+class _DebugTee:
+    """File-like wrapper that mirrors every write to a secondary stream.
+
+    Used when --debug is enabled to stream the build report to stderr in
+    real time without changing the existing report.write(...) call sites.
+    """
+    __slots__ = ("primary", "mirror")
+
+    def __init__(self, primary, mirror):
+        self.primary = primary
+        self.mirror = mirror
+
+    def write(self, s):
+        self.primary.write(s)
+        self.primary.flush()
+        try:
+            self.mirror.write(s)
+            self.mirror.flush()
+        except Exception:
+            pass
+        return len(s) if isinstance(s, str) else 0
+
+    def flush(self):
+        self.primary.flush()
+        try:
+            self.mirror.flush()
+        except Exception:
+            pass
+
+
 class CompileCache:
     """Persistent build cache.
 
@@ -1788,6 +1818,7 @@ class BuildSpec:
     top_k: int = 20
     seed: int = 0
     debug_symbols: bool = False
+    debug: bool = False               # mirror report to stderr + print every subproc
     # §12 A1 / A2 — Hyperband pruner + transfer learning
     pruner: str = "none"              # "none" | "median" | "hyperband"
     transfer_learning: bool = False
@@ -2879,6 +2910,7 @@ def build(
     top_k: int = 20,
     seed: int = 0,
     debug_symbols: bool = False,
+    debug: bool = False,
     pruner: str = "none",
     transfer_learning: bool = False,
 ) -> Optional[Path]:
@@ -2886,11 +2918,18 @@ def build(
 
     When called from Python, this does not fork: AOT and JIT run in the
     same process. Use ``main(['--runtime', 'both', ...])`` for the
-    subprocess-isolated workflow."""
+    subprocess-isolated workflow.
+
+    ``debug=True`` mirrors every line of the build report to stderr in
+    real time, prints every spawned subprocess and ninja invocation
+    (via verbose=True), and emits per-phase banners with timestamps."""
     if aot_only:
         runtime = "aot"
     if jit_only:
         runtime = "jit"
+
+    if debug:
+        verbose = True
 
     spec = BuildSpec(
         optimizer=optimizer, model=model, arch=arch,
@@ -2904,7 +2943,7 @@ def build(
         aot_artifact_dir=aot_artifact_dir,
         pgo=pgo, pgo_workload=pgo_workload, pgo_steps=pgo_steps,
         bayesian_trials=bayesian_trials, top_k=top_k, seed=seed,
-        debug_symbols=debug_symbols,
+        debug_symbols=debug_symbols, debug=debug,
         pruner=pruner, transfer_learning=transfer_learning,
     )
     _validate(spec)
@@ -2932,8 +2971,34 @@ def build(
     step, close = make_progress(len(phases), f"{optimizer}/{model}/{arch}")
     so_path: Optional[Path] = None
 
+    if debug:
+        bar = "=" * 72
+        _ts = datetime.datetime.now().isoformat()
+        _cuda = os.environ.get("CUDA_HOME", "<unset>")
+        _rocm = os.environ.get("ROCM_PATH", "<unset>")
+        _path = os.environ.get("PATH", "")[:200]
+        _fc = os.environ.get("FORCE_CUDA", "<unset>")
+        _tcal = os.environ.get("TORCH_CUDA_ARCH_LIST", "<unset>")
+        sys.stderr.write(
+            f"\n{bar}\n"
+            f"[debug] grokking_optimizers.compile starting at {_ts}\n"
+            f"[debug] target:   {optimizer}/{model}/{arch} (vendor={info['vendor']})\n"
+            f"[debug] runtime:  {runtime}  autotune={autotune} ({autotune_mode})  "
+            f"pgo={pgo}  profile={profile}\n"
+            f"[debug] phases:   {phases}\n"
+            f"[debug] out_dir:  {spec.out_dir}\n"
+            f"[debug] cache:    {cache.path}\n"
+            f"[debug] report:   {report_path}\n"
+            f"[debug] env:      CUDA_HOME={_cuda}  ROCM_PATH={_rocm}\n"
+            f"[debug] env:      PATH={_path}...\n"
+            f"[debug] env:      FORCE_CUDA={_fc}  TORCH_CUDA_ARCH_LIST={_tcal}\n"
+            f"{bar}\n\n"
+        )
+        sys.stderr.flush()
+
     try:
-        with open(report_path, "w") as report:
+        with open(report_path, "w") as report_file:
+            report = _DebugTee(report_file, sys.stderr) if debug else report_file
             report.write("# grokking_optimizers.compile — targeted build\n")
             report.write(f"# Generated:        {datetime.datetime.now().isoformat()}\n")
             report.write(f"# Optimizer:        {optimizer}\n")
@@ -3104,7 +3169,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="Extra -D<MACRO[=VALUE]>. Repeatable.")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Verbose torch cpp_extension output")
+    parser.add_argument("--debug", action="store_true",
+                        help="Mirror the full build report to stderr in real "
+                             "time, force --verbose, print every spawned "
+                             "subprocess + every nvcc/g++/hipcc invocation, "
+                             "and emit per-phase banners with timestamps.")
     args = parser.parse_args(argv)
+    if args.debug:
+        args.verbose = True
 
     # Resolve aliases.
     if args.aot_only:
@@ -3151,6 +3223,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         top_k=args.top_k,
         seed=args.seed,
         debug_symbols=args.debug_symbols,
+        debug=args.debug,
         pruner=args.pruner,
         transfer_learning=args.transfer_learning,
     )

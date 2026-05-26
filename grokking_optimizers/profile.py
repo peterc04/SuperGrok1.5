@@ -421,6 +421,36 @@ def _dispatch_profile(optimizer: str, model: str, arch: str, report,
 # Public entry
 # ---------------------------------------------------------------------------
 
+class _DebugTee:
+    """File-like wrapper that mirrors every write to a secondary stream.
+
+    Used when debug=True to stream the profile report to stderr in real
+    time without changing existing report.write(...) call sites.
+    """
+    __slots__ = ("primary", "mirror")
+
+    def __init__(self, primary, mirror):
+        self.primary = primary
+        self.mirror = mirror
+
+    def write(self, s):
+        self.primary.write(s)
+        self.primary.flush()
+        try:
+            self.mirror.write(s)
+            self.mirror.flush()
+        except Exception:
+            pass
+        return len(s) if isinstance(s, str) else 0
+
+    def flush(self):
+        self.primary.flush()
+        try:
+            self.mirror.flush()
+        except Exception:
+            pass
+
+
 def profile(
     *,
     path: Optional[Path] = None,
@@ -429,6 +459,7 @@ def profile(
     arch: Optional[str] = None,
     report_path: Optional[Path] = None,
     timeout: int = 900,
+    debug: bool = False,
 ) -> Path:
     """Run the arch-native profiler against the target and write a report.
 
@@ -436,6 +467,9 @@ def profile(
     ``grokking_optimizers.compile``, or any Python script — with ``--arch``
     in the last case) **or** pass the ``(optimizer, model, arch)`` triple
     explicitly. Returns the path to the written report.
+
+    ``debug=True`` mirrors the report to stderr in real time so every
+    ncu/rocprof/jax.profiler subcommand and its output is visible live.
     """
     inferred = {"optimizer": None, "model": None, "arch": None}
     path_obj: Optional[Path] = None
@@ -474,9 +508,24 @@ def profile(
         report_path = Path(report_path)
         report_path.parent.mkdir(parents=True, exist_ok=True)
 
+    if debug:
+        bar = "=" * 72
+        _ts = datetime.datetime.now().isoformat()
+        sys.stderr.write(
+            f"\n{bar}\n"
+            f"[debug] grokking_optimizers.profile starting at {_ts}\n"
+            f"[debug] target:   {optimizer}/{model}/{arch} "
+            f"(vendor={ARCH_INFO[arch]['vendor']})\n"
+            f"[debug] report:   {report_path}\n"
+            f"[debug] timeout:  {timeout}s\n"
+            f"{bar}\n\n"
+        )
+        sys.stderr.flush()
+
     step, close = make_progress(2, f"profile {optimizer}/{model}/{arch}")
     try:
-        with open(report_path, "w") as report:
+        with open(report_path, "w") as report_file:
+            report = _DebugTee(report_file, sys.stderr) if debug else report_file
             report.write("# grokking_optimizers.profile — capture report\n")
             report.write(f"# Generated: {datetime.datetime.now().isoformat()}\n")
             report.write(f"# Optimizer: {optimizer}\n")
@@ -534,6 +583,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--timeout", type=int, default=900,
         help="Per-command timeout in seconds (default 900)")
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Mirror the full profile report to stderr in real time so "
+             "every ncu/rocprof/jax.profiler subcommand and its output is "
+             "visible live.")
     args = parser.parse_args(argv)
 
     if args.path is None and args.optimizer is None:
@@ -546,6 +600,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         arch=args.arch,
         report_path=args.report,
         timeout=args.timeout,
+        debug=args.debug,
     )
     sys.stdout.write(f"{report}\n")
     return 0
