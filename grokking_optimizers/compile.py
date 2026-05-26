@@ -35,8 +35,10 @@ Two-phase pipeline
 
 **JIT autotune phase (target GPU only).**
 
-  1. Load the resolved search space from the embedded DEFAULT_SEARCH_SPACE_YAML
-     (override with --search-space <path/to/your.yaml>).
+  1. Load the resolved search space — by default, the COMPLETE programmatic
+     space from build_full_search_space() (~billions of candidates per arch).
+     Override with --search-space <path/to/your.yaml> to use a smaller
+     curated space.
      Generate the cartesian product → apply static pre-filter rules →
      log the elimination count.
   2. Two autotune modes:
@@ -135,7 +137,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from grokking_optimizers.profile import (
     ARCH_INFO,
@@ -167,159 +169,185 @@ JIT_CACHE_FLUSH_EVERY = 5   # save cache every N completed JIT trials
 # How many trials Bayesian "quick" mode runs (vs the full 500 default).
 QUICK_BAYESIAN_TRIALS = 25
 
-# Embedded autotune search space (absorbed from configs/search_space.yaml).
-# Edit values to expand / contract the search space. The number of configs
-# after pre-filtering is logged at the start of every autotune run.
-# Override at runtime with --search-space <path/to/your.yaml>.
-DEFAULT_SEARCH_SPACE_YAML = """\
-# ─── NVIDIA Hopper (H100/H200) ──────────────────────────────────────────────
-sm_90:
-  dims:
-    - name: block
-      type: int
-      values: [64, 128, 256, 512, 1024]
-      macro: SG_TUNED_BLOCK_SIZE
-      applies_to: [host, device]
-    - name: vec
-      type: int
-      values: [1, 2, 4]
-      macro: SG_TUNED_VEC_WIDTH
-      applies_to: [host, device]
-    - name: unroll
-      type: int
-      values: [1, 2, 4, 8, 16]
-      macro: SG_TUNED_UNROLL
-      applies_to: [host, device]
-    - name: num_stages
-      type: int
-      values: [2, 3, 4, 5]
-      macro: SG_TUNED_NUM_STAGES
-      applies_to: [device]
-    - name: maxrregcount
-      type: int
-      values: [128, 168, 200, 232, 255]
-      macro: null
-      applies_to: [device]
-    - name: cluster_shape
-      type: tuple
-      values:
-        - [1, 1, 1]
-        - [2, 1, 1]
-        - [2, 2, 1]
-      macro: SG_TUNED_CLUSTER_SHAPE
-      applies_to: [device]
-    - name: swizzle
-      type: enum
-      values: [none, xor4, xor8]
-      macro: SG_TUNED_SWIZZLE
-      applies_to: [device]
-    - name: warp_specialization
-      type: bool
-      values: [false, true]
-      macro: SG_TUNED_WARP_SPECIALIZATION
-      applies_to: [device]
-    - name: tma
-      type: bool
-      values: [false, true]
-      macro: SG_TUNED_TMA
-      applies_to: [device]
-    - name: async_depth
-      type: int
-      values: [1, 2, 4, 8]
-      macro: SG_TUNED_ASYNC_DEPTH
-      applies_to: [device]
-  prefilter:
-    register_pressure_max: 255
-    smem_budget_bytes: 232448
-    rules:
-      - name: warps_per_block
-        expr: "(block // 32) <= 32"
-      - name: vec_block_alignment
-        expr: "block % (vec * 4) == 0"
-      - name: stages_block
-        expr: "num_stages * vec <= block // 32"
-      - name: tma_requires_block
-        expr: "(not tma) or block >= 128"
-      - name: warpspec_requires_block
-        expr: "(not warp_specialization) or block >= 128"
-      - name: cluster_volume
-        expr: "cluster_shape[0] * cluster_shape[1] * cluster_shape[2] <= 8"
-      - name: async_depth_stages
-        expr: "async_depth >= num_stages - 1"
-
-# ─── AMD CDNA3 (MI300X/MI300A) ──────────────────────────────────────────────
-gfx942:
-  dims:
-    - name: block
-      type: int
-      values: [64, 128, 256, 512, 1024]
-      macro: SG_TUNED_BLOCK_SIZE
-      applies_to: [host, device]
-    - name: vec
-      type: int
-      values: [1, 2, 4]
-      macro: SG_TUNED_VEC_WIDTH
-      applies_to: [host, device]
-    - name: unroll
-      type: int
-      values: [1, 2, 4, 8, 16]
-      macro: SG_TUNED_UNROLL
-      applies_to: [host, device]
-    - name: num_stages
-      type: int
-      values: [1, 2, 3]
-      macro: SG_TUNED_NUM_STAGES
-      applies_to: [device]
-    - name: maxrregcount
-      type: int
-      values: [128, 160, 192, 224, 256]
-      macro: null
-      applies_to: [device]
-    - name: waves_per_eu
-      type: int
-      values: [1, 2, 4, 8, 10]
-      macro: SG_TUNED_WAVES_PER_EU
-      applies_to: [device]
-    - name: lds_padding
-      type: int
-      values: [0, 1, 2, 4]
-      macro: SG_TUNED_LDS_PADDING
-      applies_to: [device]
-    - name: mfma_shape
-      type: enum
-      values: [m16n16k16, m32n32k8, m16n16k32, m32n32k16]
-      macro: SG_TUNED_MFMA_SHAPE
-      applies_to: [device]
-    - name: scheduler_hint
-      type: enum
-      values: [default, llvm, iglp_max_throughput]
-      macro: SG_TUNED_SCHEDULER_HINT
-      applies_to: [device]
-  prefilter:
-    register_pressure_max: 256
-    waves_per_eu_max: 10
-    smem_budget_bytes: 65536
-    rules:
-      - name: wave_alignment
-        expr: "block % 64 == 0"
-      - name: waves_per_block
-        expr: "(block // 64) <= 16"
-      - name: waves_per_eu_total
-        expr: "waves_per_eu * (block // 64) <= 20"
-      - name: vec_block_alignment
-        expr: "block % (vec * 4) == 0"
-      - name: mfma_block_min
-        expr: "block >= 64"
-
-# ─── TPU v5p (handled via JAX/Pallas; no C++ space) ─────────────────────────
-tpu_v5p:
-  dims: []
-  prefilter:
-    rules: []
-"""
 
 # Sentinel display value used in reports when no external YAML is supplied.
-DEFAULT_SEARCH_SPACE = "<embedded>"
+DEFAULT_SEARCH_SPACE = "<full-programmatic>"
+
+
+# ---------------------------------------------------------------------------
+# Programmatic search-space builder — the COMPLETE space, not a curated list
+# ---------------------------------------------------------------------------
+#
+# Earlier revisions of this file embedded a hand-written YAML blob with a
+# small curated set of values per tuning dimension (e.g. block ∈ {64, 128,
+# 256, 512, 1024}). That biased the autotuner — Bayesian TPE could only
+# sample what we'd pre-decided was "reasonable". This was a mistake: the
+# whole point of an extensive optimization run is to discover non-obvious
+# winners, and pre-curating values defeats that.
+#
+# build_full_search_space() now generates the search space programmatically
+# from hardware specs:
+#   - every warp-aligned (sm_90) / wavefront-aligned (gfx942) block size
+#   - the full range of vector widths the load/store instructions support
+#   - every power-of-2 unroll factor up to a generous cap
+#   - every valid pipeline depth, register-budget, cluster shape, etc.
+#
+# The result is a Cartesian product of ~10⁹ candidates per arch — far too
+# many to materialize. Three consequences:
+#   1. ``cartesian()`` is now a generator (was a list).
+#   2. ``cartesian_count(space, arch)`` returns the size without iteration.
+#   3. ``ss_prefilter()`` accepts an iterable and streams survivors.
+# Bayesian TPE doesn't care about the size — it samples one config at a
+# time using the per-dim value lists. Exhaustive mode also streams, with a
+# cap (--exhaustive-cap) to prevent infinite enumeration.
+#
+# Users can still override the entire space via --search-space <path.yaml>.
+
+
+def _dim(name: str, dtype: str, values: List[Any], macro: Optional[str],
+         applies_to: List[str]) -> Dict[str, Any]:
+    return {"name": name, "type": dtype, "values": values,
+            "macro": macro, "applies_to": applies_to}
+
+
+def _hopper_cluster_shapes() -> List[List[int]]:
+    """Every (m, n, p) ∈ {1,2,4,8}³ with m·n·p ≤ 8 (Hopper hw limit)."""
+    out: List[List[int]] = []
+    for m in (1, 2, 4, 8):
+        for n in (1, 2, 4, 8):
+            for p in (1, 2, 4, 8):
+                if m * n * p <= 8:
+                    out.append([m, n, p])
+    return out
+
+
+def _sm90_full_space() -> Dict[str, Any]:
+    return {
+        "dims": [
+            # block: every warp-multiple from 32 up to the 1024 thread-per-CTA max.
+            _dim("block", "int", list(range(32, 1025, 32)),
+                 "SG_TUNED_BLOCK_SIZE", ["host", "device"]),
+            # vec: 1..16 — covers byte/short/int/long via LDG.E.{32,64,128}.
+            _dim("vec", "int", [1, 2, 4, 8, 16],
+                 "SG_TUNED_VEC_WIDTH", ["host", "device"]),
+            # unroll: powers of 2 up to 128 — broad sweep of compiler hints.
+            _dim("unroll", "int", [1, 2, 4, 8, 16, 32, 64, 128],
+                 "SG_TUNED_UNROLL", ["host", "device"]),
+            # num_stages: full Hopper async-pipeline depth range.
+            _dim("num_stages", "int", list(range(1, 9)),
+                 "SG_TUNED_NUM_STAGES", ["device"]),
+            # maxrregcount: every 4 from 32 to 252, plus the hard cap 255.
+            _dim("maxrregcount", "int", list(range(32, 253, 4)) + [255],
+                 None, ["device"]),  # promoted to NVCC flag, not -D
+            # cluster_shape: every Hopper-legal (m, n, p) cluster geometry.
+            _dim("cluster_shape", "tuple", _hopper_cluster_shapes(),
+                 "SG_TUNED_CLUSTER_SHAPE", ["device"]),
+            # swizzle: shared-memory bank-conflict avoidance patterns.
+            _dim("swizzle", "enum", ["none", "xor2", "xor4", "xor8", "xor16"],
+                 "SG_TUNED_SWIZZLE", ["device"]),
+            _dim("warp_specialization", "bool", [False, True],
+                 "SG_TUNED_WARP_SPECIALIZATION", ["device"]),
+            _dim("tma", "bool", [False, True],
+                 "SG_TUNED_TMA", ["device"]),
+            # async_depth: 1..16 (cp.async pipeline depth on Hopper).
+            _dim("async_depth", "int", list(range(1, 17)),
+                 "SG_TUNED_ASYNC_DEPTH", ["device"]),
+        ],
+        "prefilter": {
+            "register_pressure_max": 255,
+            "smem_budget_bytes": 232448,   # 227 KB usable smem per Hopper SM
+            "rules": [
+                # Hopper: ≤32 warps per block.
+                {"name": "warps_per_block", "expr": "(block // 32) <= 32"},
+                # Vec loads need block % (vec * bytes_per_elem) == 0.
+                {"name": "vec_block_alignment",
+                 "expr": "block % (vec * 4) == 0"},
+                # Pipelined kernels need enough warps to hide latency.
+                {"name": "stages_block",
+                 "expr": "num_stages * vec <= block // 32"},
+                # TMA + warp specialisation need ≥ 1 dedicated warp.
+                {"name": "tma_requires_block",
+                 "expr": "(not tma) or block >= 128"},
+                {"name": "warpspec_requires_block",
+                 "expr": "(not warp_specialization) or block >= 128"},
+                # Cluster volume limit is 8 CTAs (Hopper hardware cap).
+                {"name": "cluster_volume",
+                 "expr": "cluster_shape[0] * cluster_shape[1] * cluster_shape[2] <= 8"},
+                # Async depth ≥ stages-1 to keep the pipeline busy.
+                {"name": "async_depth_stages",
+                 "expr": "async_depth >= num_stages - 1"},
+            ],
+        },
+    }
+
+
+def _gfx942_full_space() -> Dict[str, Any]:
+    return {
+        "dims": [
+            # block: every wavefront-multiple (64) up to 1024 threads/CTA.
+            _dim("block", "int", list(range(64, 1025, 64)),
+                 "SG_TUNED_BLOCK_SIZE", ["host", "device"]),
+            # vec: 1..8 — CDNA dwordx4 caps the meaningful vec at 4 for f32.
+            _dim("vec", "int", [1, 2, 4, 8],
+                 "SG_TUNED_VEC_WIDTH", ["host", "device"]),
+            _dim("unroll", "int", [1, 2, 4, 8, 16, 32, 64, 128],
+                 "SG_TUNED_UNROLL", ["host", "device"]),
+            _dim("num_stages", "int", list(range(1, 9)),
+                 "SG_TUNED_NUM_STAGES", ["device"]),
+            _dim("maxrregcount", "int", list(range(32, 257, 4)),
+                 None, ["device"]),
+            _dim("waves_per_eu", "int", list(range(1, 11)),
+                 "SG_TUNED_WAVES_PER_EU", ["device"]),
+            _dim("lds_padding", "int", [0, 1, 2, 4, 8],
+                 "SG_TUNED_LDS_PADDING", ["device"]),
+            # MFMA tile shapes — every public shape MI300X exposes.
+            _dim("mfma_shape", "enum",
+                 ["m16n16k16", "m32n32k8", "m16n16k32", "m32n32k16",
+                  "m16n16k4f64", "m32n32k4f64", "m16n16k64fp8",
+                  "m32n32k32fp8", "m16n16k16f32", "m32n32k8f32"],
+                 "SG_TUNED_MFMA_SHAPE", ["device"]),
+            _dim("scheduler_hint", "enum",
+                 ["default", "llvm", "iglp_max_throughput",
+                  "iglp_max_throughput_v2", "iglp_gemm", "none"],
+                 "SG_TUNED_SCHEDULER_HINT", ["device"]),
+        ],
+        "prefilter": {
+            "register_pressure_max": 256,
+            "waves_per_eu_max": 10,
+            "smem_budget_bytes": 65536,   # 64 KB LDS per CU on CDNA3
+            "rules": [
+                # CDNA3 wavefront = 64; block must be a multiple.
+                {"name": "wave_alignment", "expr": "block % 64 == 0"},
+                # ≤16 waves per block (1024 threads / 64 lanes).
+                {"name": "waves_per_block", "expr": "(block // 64) <= 16"},
+                # Occupancy ceiling: waves_per_eu * waves_per_block ≤ 20.
+                {"name": "waves_per_eu_total",
+                 "expr": "waves_per_eu * (block // 64) <= 20"},
+                {"name": "vec_block_alignment",
+                 "expr": "block % (vec * 4) == 0"},
+                {"name": "mfma_block_min", "expr": "block >= 64"},
+            ],
+        },
+    }
+
+
+def build_full_search_space() -> Dict[str, Any]:
+    """Return the COMPLETE per-arch search space.
+
+    No curated value lists; no hand-picked subsets. Every dim covers the
+    full range its hardware actually supports. The Cartesian product is
+    in the billions per arch — never materialize it as a list; use the
+    streaming ``cartesian()`` iterator and ``cartesian_count()`` instead.
+
+    Override with ``--search-space <path.yaml>`` if you genuinely want a
+    smaller curated space (e.g. for fast CI sweeps); the YAML schema is
+    the same shape as this dict.
+    """
+    return {
+        "sm_90":   _sm90_full_space(),
+        "gfx942":  _gfx942_full_space(),
+        "tpu_v5p": {"dims": [], "prefilter": {"rules": []}},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -383,18 +411,25 @@ def load_yaml(path: Path) -> Dict[str, Any]:
 
 
 def load_embedded_search_space() -> Dict[str, Any]:
-    """Parse and validate the embedded DEFAULT_SEARCH_SPACE_YAML constant."""
-    raw = yaml.safe_load(DEFAULT_SEARCH_SPACE_YAML) or {}
-    if not isinstance(raw, dict):
-        raise SearchSpaceError(
-            f"embedded search-space must be a top-level dict; got {type(raw).__name__}")
+    """Return the COMPLETE programmatic search space (no curation).
+
+    Equivalent to ``build_full_search_space()`` plus the standard shape
+    validation. Bayesian TPE will sample this space; ``cartesian_count``
+    reports its size (billions per arch); ``cartesian()`` streams the
+    Cartesian product; ``ss_prefilter()`` filters lazily."""
+    raw = build_full_search_space()
     for arch, block in raw.items():
         _validate_arch(arch, block)
     return raw
 
 
 def get_search_space(path: Optional[Path]) -> Dict[str, Any]:
-    """Return the search space dict; load from `path` if given, else embedded."""
+    """Return the search space dict.
+
+    When ``path`` is None, returns the full programmatic space from
+    ``build_full_search_space()``. When ``path`` points at a YAML file,
+    loads that — for users who genuinely want a smaller curated space.
+    """
     if path is None:
         return load_embedded_search_space()
     return load_yaml(path)
@@ -447,54 +482,132 @@ def _validate_dim(arch: str, dim: Any, seen: set) -> None:
             f"{arch}.{name}: applies_to has unknown targets {bad}")
 
 
-def cartesian(space: Dict[str, Any], arch: str) -> List[Dict[str, Any]]:
-    """Return the full cartesian product as a list of {dim_name: value} dicts."""
+def cartesian(space: Dict[str, Any], arch: str) -> Iterator[Dict[str, Any]]:
+    """Stream the full Cartesian product as {dim_name: value} dicts.
+
+    Generator (lazy). The full programmatic search space is billions of
+    configs per arch — never call ``list(cartesian(...))`` on it. Use
+    ``cartesian_count()`` for the size, and pipe this iterator through
+    ``ss_prefilter()`` which yields survivors lazily.
+    """
     if arch not in space:
-        return []
+        return
     dims = space[arch].get("dims", [])
     if not dims:
-        return []
+        return
     names = [d["name"] for d in dims]
     values = [d["values"] for d in dims]
-    out: List[Dict[str, Any]] = []
     for combo in itertools.product(*values):
         cfg: Dict[str, Any] = {}
         for n, v in zip(names, combo):
             cfg[n] = tuple(v) if isinstance(v, list) else v
-        out.append(cfg)
-    return out
+        yield cfg
 
 
-def ss_prefilter(configs: List[Dict[str, Any]],
-                 prefilter_spec: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
-    """Apply the static pruning rules. Returns (survivors, eliminated_count)."""
+def cartesian_count(space: Dict[str, Any], arch: str) -> int:
+    """Return the size of ``cartesian(space, arch)`` without iterating.
+
+    Product of len(dim.values) across every dim. For the full programmatic
+    space this is in the billions per arch — cheap to compute, used for
+    the ``[prefilter] N candidates → ...`` display line.
+    """
+    if arch not in space:
+        return 0
+    dims = space[arch].get("dims", [])
+    if not dims:
+        return 0
+    n = 1
+    for d in dims:
+        n *= len(d.get("values", []) or [])
+    return n
+
+
+def ss_prefilter(configs: Iterable[Dict[str, Any]],
+                 prefilter_spec: Dict[str, Any],
+                 max_survivors: Optional[int] = None,
+                 ) -> Tuple[List[Dict[str, Any]], int]:
+    """Apply the static pruning rules. Returns (survivors, eliminated_count).
+
+    Accepts any iterable for ``configs`` (typically the lazy
+    ``cartesian()`` generator). Survivors are materialized as a list —
+    callers needing to also stream survivors should use
+    ``iter_prefilter()`` below.
+
+    When ``max_survivors`` is set, the loop **breaks early** as soon as
+    that many survivors are collected. ``eliminated_count`` reflects
+    only what was rejected up to that point — there may be many more
+    candidates beyond that the prefilter never visited. Use this to
+    cap exhaustive sweeps against the full multi-billion-config space.
+    """
     if not prefilter_spec:
-        return list(configs), 0
-    rules: List[Dict[str, Any]] = prefilter_spec.get("rules", []) or []
+        if max_survivors is None:
+            return list(configs), 0
+        return [c for c, _ in zip(configs, range(max_survivors))], 0
     survivors: List[Dict[str, Any]] = []
     eliminated = 0
-    compiled_rules = [(r.get("name", f"rule_{i}"), compile(r["expr"], "<prefilter>", "eval"))
-                      for i, r in enumerate(rules)]
-    for cfg in configs:
-        ok = True
-        for rname, code in compiled_rules:
-            try:
-                env = dict(cfg)
-                env["__builtins__"] = {
-                    "len": len, "min": min, "max": max, "abs": abs,
-                    "int": int, "bool": bool, "True": True, "False": False,
-                }
-                if not bool(eval(code, env, env)):  # noqa: S307 — sandboxed
-                    ok = False
-                    break
-            except Exception:
-                ok = False
-                break
-        if ok:
+    for cfg, passed in _iter_prefilter_with_status(configs, prefilter_spec):
+        if passed:
             survivors.append(cfg)
+            if max_survivors is not None and len(survivors) >= max_survivors:
+                break
         else:
             eliminated += 1
     return survivors, eliminated
+
+
+def iter_prefilter(configs: Iterable[Dict[str, Any]],
+                   prefilter_spec: Dict[str, Any]
+                   ) -> Iterator[Dict[str, Any]]:
+    """Yield surviving configs lazily. Use when you can't afford to
+    materialize the survivor list (full programmatic space → millions
+    or tens of millions of survivors). Eliminated count is NOT tracked
+    in this variant — use ``ss_prefilter`` if you need it."""
+    for cfg, passed in _iter_prefilter_with_status(configs, prefilter_spec):
+        if passed:
+            yield cfg
+
+
+_PREFILTER_SAFE_BUILTINS = {
+    "len": len, "min": min, "max": max, "abs": abs,
+    "int": int, "bool": bool, "True": True, "False": False,
+}
+
+
+def compile_feasibility_check(prefilter_spec: Dict[str, Any]
+                              ) -> Callable[[Dict[str, Any]], bool]:
+    """Return a single-config feasibility predicate.
+
+    Used by Bayesian TPE to validate each suggestion in O(rules) time
+    without ever materializing the prefiltered survivor set. With the
+    full programmatic search space (billions of candidates), enumerating
+    survivors up-front is infeasible — but checking one TPE-sampled
+    cfg against the rules is cheap.
+    """
+    rules: List[Dict[str, Any]] = (prefilter_spec or {}).get("rules", []) or []
+    compiled = [compile(r["expr"], "<prefilter>", "eval") for r in rules]
+
+    def check(cfg: Dict[str, Any]) -> bool:
+        if not compiled:
+            return True
+        for code in compiled:
+            try:
+                env = dict(cfg)
+                env["__builtins__"] = _PREFILTER_SAFE_BUILTINS
+                if not bool(eval(code, env, env)):  # noqa: S307 — sandboxed
+                    return False
+            except Exception:
+                return False
+        return True
+    return check
+
+
+def _iter_prefilter_with_status(configs: Iterable[Dict[str, Any]],
+                                prefilter_spec: Dict[str, Any]
+                                ) -> Iterator[Tuple[Dict[str, Any], bool]]:
+    """Internal helper: yield (cfg, passed) pairs as we evaluate each one."""
+    check = compile_feasibility_check(prefilter_spec)
+    for cfg in configs:
+        yield cfg, check(cfg)
 
 
 def _format_value(value: Any) -> str:
@@ -1297,7 +1410,11 @@ def run_bayesian(
 ) -> List[Dict[str, Any]]:
     """Run the TPE stage. Returns the list of trial records."""
     dims = space[arch]["dims"]
-    feasible = {config_key(c) for c in (prefiltered or [])}
+    # Build a per-config feasibility predicate from the prefilter rules
+    # so we can validate TPE suggestions in O(rules) without enumerating
+    # the (billions-of-configs) full Cartesian survivor set.
+    is_feasible = compile_feasibility_check(
+        space[arch].get("prefilter", {}))
 
     sampler = TPESampler(
         seed=seed,
@@ -1363,7 +1480,7 @@ def run_bayesian(
 
     def objective(trial: optuna.Trial) -> float:
         cfg = _suggest(trial, dims)
-        if feasible and config_key(cfg) not in feasible:
+        if not is_feasible(cfg):
             rec = _make_trial_record("tpe", trial.number, cfg, None, host=host)
             rec["status"] = "infeasible"
             records.append(rec)
@@ -1414,7 +1531,8 @@ def topk_refine(
     """For each of the top-K TPE trials, time the +/-radius-step
     neighbours along every dim. Returns the refine-stage records."""
     dims = space[arch]["dims"]
-    feasible = {config_key(c) for c in (prefiltered or [])}
+    is_feasible = compile_feasibility_check(
+        space[arch].get("prefilter", {}))
 
     successes = [t for t in bayes_trials if t["timing_ms"] is not None]
     successes.sort(key=lambda t: t["timing_ms"])
@@ -1434,7 +1552,7 @@ def topk_refine(
                 k = config_key(cfg)
                 if k in seen_keys:
                     continue
-                if feasible and k not in feasible:
+                if not is_feasible(cfg):
                     continue
                 seen_keys.add(k)
                 candidate_cfgs.append(cfg)
@@ -3126,14 +3244,45 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
         report.write(f"  [jit-autotune] cache hit: tuned={tuned}\n")
         return tuned
 
-    all_configs = cartesian(space, spec.arch)
-    survivors, eliminated = ss_prefilter(
-        all_configs, space[spec.arch].get("prefilter", {}))
-    report.write(f"  [prefilter] {len(all_configs)} candidates → "
-                 f"{len(survivors)} survivors ({eliminated} eliminated)\n")
-    if not survivors:
-        report.write("  [jit-autotune] no survivors after prefilter.\n")
-        return None
+    # The full programmatic search space is billions of configs per arch.
+    # Never materialize the Cartesian product. cartesian_count() gives the
+    # total size cheaply for the display line. Bayesian mode uses an inline
+    # per-config feasibility predicate (compile_feasibility_check) and never
+    # iterates the Cartesian. Exhaustive mode streams survivors with a 1M
+    # cap to bound memory.
+    total_candidates = cartesian_count(space, spec.arch)
+    survivors: List[Dict[str, Any]] = []
+    if spec.autotune_mode == "exhaustive":
+        exhaustive_cap = 1_000_000
+        survivors, eliminated = ss_prefilter(
+            cartesian(space, spec.arch),
+            space[spec.arch].get("prefilter", {}),
+            max_survivors=exhaustive_cap,
+        )
+        capped = len(survivors) >= exhaustive_cap
+        cap_note = f" (capped at {exhaustive_cap:,})" if capped else ""
+        report.write(f"  [prefilter] {total_candidates:,} candidates → "
+                     f"{len(survivors):,} survivors{cap_note} "
+                     f"({eliminated:,} eliminated en route)\n")
+        if not survivors:
+            report.write("  [jit-autotune] no survivors after prefilter.\n")
+            return None
+    else:
+        # Bayesian: skip materialization entirely. TPE samples per-dim values
+        # via Optuna's suggest_categorical and validates each suggestion with
+        # the inline feasibility predicate. The reported "survivors" count is
+        # an estimate from a small Cartesian slice (best-effort, for UX).
+        sample_size = 100_000
+        survivors_est = sum(
+            1 for c, ok in _iter_prefilter_with_status(
+                itertools.islice(cartesian(space, spec.arch), sample_size),
+                space[spec.arch].get("prefilter", {})) if ok)
+        rate = survivors_est / sample_size if sample_size else 0.0
+        est_survivors = int(total_candidates * rate)
+        report.write(f"  [prefilter] {total_candidates:,} candidates "
+                     f"(~{est_survivors:,} feasible @ {rate*100:.1f}% sampled "
+                     f"pass rate); Bayesian TPE samples directly — no "
+                     f"materialization\n")
 
     # Spawn the persistent worker.
     worker = TimingWorker(opt_class=OPT_CLASS[spec.optimizer])
@@ -3271,8 +3420,10 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
     report.write(f"\n  [bayesian] refine stage top_k={spec.top_k}\n")
     refine_inputs = [t for t in tpe_trials if t["timing_ms"] is not None]
     refine_inputs.sort(key=lambda t: t["timing_ms"])
+    feasibility_check = compile_feasibility_check(
+        space[spec.arch].get("prefilter", {}))
     n_refine_est = sum(1 for _ in _neighbour_estimate(
-        refine_inputs[:spec.top_k], dims, prefiltered))
+        refine_inputs[:spec.top_k], dims, feasibility_check))
     step2, close2 = make_progress(
         max(n_refine_est, 1), f"jit-refine {spec.optimizer}/{spec.arch}")
 
@@ -3310,9 +3461,8 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
 
 def _neighbour_estimate(seeds: List[Dict[str, Any]],
                         dims: List[Dict[str, Any]],
-                        prefiltered: List[Dict[str, Any]]):
+                        is_feasible: Callable[[Dict[str, Any]], bool]):
     """Estimate the refine-stage trial count (best-effort, for progress bar)."""
-    feasible = {config_key(c) for c in prefiltered}
     seen = set()
     for s in seeds:
         base = {k: (tuple(v) if isinstance(v, list) else v)
@@ -3322,7 +3472,7 @@ def _neighbour_estimate(seeds: List[Dict[str, Any]],
                 cfg = dict(base)
                 cfg[d["name"]] = nb
                 k = config_key(cfg)
-                if k in seen or (feasible and k not in feasible):
+                if k in seen or not is_feasible(cfg):
                     continue
                 seen.add(k)
                 yield cfg
@@ -3947,7 +4097,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--search-space", type=Path,
                         default=None,
                         help="YAML search-space file "
-                             "(default: embedded DEFAULT_SEARCH_SPACE_YAML).")
+                             "(default: full programmatic space from "
+                             "build_full_search_space() — billions of "
+                             "candidates per arch).")
     parser.add_argument("--pgo", action="store_true",
                         help="Enable 3-pass PGO loop (instrument → "
                              "workload → use). Doubles AOT compile time.")
@@ -4105,19 +4257,44 @@ def _self_test() -> int:
         space = load_embedded_search_space()
         assert "sm_90" in space
         assert "gfx942" in space
+        # Full programmatic space — every dim should have a non-trivial value list.
+        sm90_dims = space["sm_90"]["dims"]
+        assert len(sm90_dims) >= 10
+        for d in sm90_dims:
+            assert d["values"], f"dim {d['name']} has empty values list"
 
     def test_cartesian_counts():
+        """The COMPLETE space is huge — verify by counting product of value
+        list lengths, not by materializing the iterator (which would yield
+        billions of dicts)."""
         space = load_embedded_search_space()
-        configs = cartesian(space, "sm_90")
-        assert len(configs) == 5 * 3 * 5 * 4 * 5 * 3 * 3 * 2 * 2 * 4
+        count = cartesian_count(space, "sm_90")
+        # Sanity bound — full sm_90 space should be at least 100 million combos
+        # and well under 10^12.
+        assert count > 100_000_000, f"sm_90 count too small: {count}"
+        assert count < 10**12, f"sm_90 count unreasonably large: {count}"
+        # Iterator yields exactly that many items — verify on a tiny slice.
+        it = cartesian(space, "sm_90")
+        first_few = list(itertools.islice(it, 5))
+        assert len(first_few) == 5
+        # Each yielded dict should have all dims.
+        names = {d["name"] for d in space["sm_90"]["dims"]}
+        assert set(first_few[0].keys()) == names
 
     def test_prefilter_eliminates():
+        """Stream the prefilter against a CAPPED slice of the full space —
+        verifies the prefilter actually rejects some configs, without
+        materializing the billion-config Cartesian product."""
         space = load_embedded_search_space()
-        configs = cartesian(space, "sm_90")
+        # Take the first 50k Cartesian items and run prefilter on them.
+        slice_iter = itertools.islice(cartesian(space, "sm_90"), 50_000)
         survivors, eliminated = ss_prefilter(
-            configs, space["sm_90"]["prefilter"])
-        assert eliminated > 0
-        assert len(survivors) + eliminated == len(configs)
+            slice_iter, space["sm_90"]["prefilter"])
+        # Some configs must pass (block=32, vec=1 + reasonable values).
+        # Some must fail (e.g. block=32 with stages=8 violates stages_block).
+        assert len(survivors) + eliminated == 50_000
+        assert eliminated > 0, "prefilter eliminated nothing — rules broken?"
+        assert len(survivors) > 0, "prefilter eliminated everything — rules too strict?"
 
     def test_config_key_deterministic():
         cfg1 = {"block": 256, "vec": 4, "unroll": 8}

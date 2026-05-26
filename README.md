@@ -136,8 +136,9 @@ Why none of these are hardcoded: **the autotune is exactly what searches
 over the actual kernel parameters** (block size, vector width, unroll
 factor, num_stages, cluster shape, swizzle, warp-specialization, TMA,
 async-copy depth on sm_90; LDS padding, waves-per-EU, MFMA shape,
-scheduler hint on gfx942 — see `DEFAULT_SEARCH_SPACE_YAML` in
-`compile.py` for the full 10-dim grid). The values above are the
+scheduler hint on gfx942 — see `build_full_search_space()` in
+`compile.py` for the complete programmatic grid: **~3.7 billion sm_90
+candidates, ~700 M gfx942 candidates** before prefilter). The values above are the
 **budget** for that search (how many trials, which pruner, whether to
 warm-start from siblings); the autotune itself picks the kernel
 parameters from the search space. The winning config gets baked into
@@ -537,11 +538,15 @@ python -m grokking_optimizers.compile -O lion -M mamba -A sm_90 --mode exhaustiv
 | `--mode exhaustive` | Every config surviving the static pre-filter is built and timed. Cache flushes every 5 trials (Ctrl-C safe). |
 | `--quick` | Alias: bayesian with 25 trials. |
 
-#### Search-space YAML schema
+#### Search-space schema
 
-The default search space is embedded in `compile.py` as the
-`DEFAULT_SEARCH_SPACE_YAML` constant. Override at runtime with
-`--search-space <path/to/your.yaml>`. Schema:
+The default search space is built programmatically by
+`build_full_search_space()` in `compile.py` — the COMPLETE space, not
+a curated subset (~3.7 B sm_90 candidates, ~700 M gfx942). Bayesian
+TPE samples this directly via Optuna's `suggest_categorical` over the
+per-dim value lists; the Cartesian product is never materialized.
+Override with `--search-space <path/to/your.yaml>` to provide a
+smaller curated YAML space using the schema below:
 
 ```yaml
 <arch>:
@@ -778,8 +783,10 @@ Dev-time companion to `setup.py`. Given an `(optimizer, model, arch)`
 triple, compiles the matching subset of `csrc/` with arch-tuned codegen,
 full LTO, and a two-phase **AOT-then-JIT autotune** with a portable JSON
 cache (v3) — all driven through ninja with `MAX_JOBS=$(nproc)`. The
-search space is YAML-driven (embedded in `compile.py` as
-`DEFAULT_SEARCH_SPACE_YAML`; override with `--search-space <path>`); the autotune
+search space is built programmatically by `build_full_search_space()`
+(billions of candidates per arch, no curation; override with
+`--search-space <path.yaml>` if you want a smaller hand-picked space);
+the autotune
 defaults to **Bayesian** (Optuna TPE + ±2-step neighbour refinement) and
 also supports **Exhaustive** sweeps; optional **PGO** loop instruments
 → runs a workload → rebuilds with `-fprofile-use`. AOT and JIT can run
@@ -983,11 +990,28 @@ Common requirements (all arches):
   present, the sm_90 build auto-adds `-DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a`
   so Muon Newton-Schulz and SuperGrok v2 dt_proj route through CUTLASS GEMMs.
 
-#### Autotune search space (YAML-driven)
+#### Autotune search space (programmatic, not YAML)
 
-The full search space is embedded in `compile.py` as the
-`DEFAULT_SEARCH_SPACE_YAML` constant (override at runtime with
-`--search-space <path/to/your.yaml>`).
+The default search space is the **complete one** — every value the
+target hardware actually supports, no hand-curated subset. Built by
+`build_full_search_space()` in `compile.py` and verified to be:
+
+- **sm_90**: ~3.7 billion Cartesian candidates (32 block sizes × 5 vec
+  widths × 8 unrolls × 8 pipeline depths × 57 reg counts × 20 cluster
+  shapes × 5 swizzles × 2 warp-spec × 2 TMA × 16 async depths)
+- **gfx942**: ~700 million candidates (16 block × 4 vec × 8 unroll ×
+  8 stages × 57 regs × 10 waves/EU × 5 LDS pad × 10 MFMA × 6 sched)
+- **tpu_v5p**: 0 (Pallas is Python-only — no C++ tuning surface)
+
+Because the full Cartesian is in the billions, `cartesian()` is a
+generator (never materializes), `cartesian_count()` returns the size
+without iteration, and `ss_prefilter()` streams survivors. Bayesian
+TPE samples the per-dim value lists directly through Optuna's
+`suggest_categorical` — no enumeration needed. Exhaustive sweeps cap
+at 1M survivors (`--mode exhaustive`).
+
+Override the default with `--search-space <path/to/your.yaml>` if you
+want a smaller hand-picked space (e.g. for fast CI sweeps).
 The targets are ~100% SM/CU utilisation: warp-aligned blocks, vector
 widths matched to the arch's load instructions, unroll factors that
 keep ILP saturated without blowing the register budget, plus the
@@ -2118,7 +2142,7 @@ and eliminate cross-module coupling:
 | `grokking_optimizers/bench_graph.py` | `compile.py` — CUDA/HIP graph capture+replay |
 | `grokking_optimizers/pgo.py` | `compile.py` — instrument/collect/use flag plumbing |
 | `scripts/pgo_workload.py` | `compile.py` — PGO workload entry point |
-| `configs/search_space.yaml` | `compile.py` — `DEFAULT_SEARCH_SPACE_YAML` constant |
+| `configs/search_space.yaml` | `compile.py` — `build_full_search_space()` programmatic builder (replaces the earlier embedded YAML) |
 | `INTERFACES.md` | `README.md` — compile cache schema, CLI surface |
 | `docs/autotune.md` | `README.md` — autotune guide, YAML schema, PGO |
 | `docs/optimization_matrix.md` | `README.md` — optimization candidate matrix |
