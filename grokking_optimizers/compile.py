@@ -5271,6 +5271,142 @@ def _preflight_toolchain(arch: str) -> List[str]:
     return lines
 
 
+# ---------------------------------------------------------------------------
+# Per-arch dry-run sweep harness (Stream D)
+# ---------------------------------------------------------------------------
+#
+# `_dry_run_all_archs` exercises the ENTIRE pre-`_torch_load` slice of the
+# build pipeline (preflight + source resolution + host/device/ldflag emission)
+# against every canonical entry in ARCH_TABLE and writes one JSON manifest
+# per arch under ``<out_dir>/dry_run_<arch>.json``. The intent is CI / dev-
+# host verification of ARCH_TABLE coverage WITHOUT requiring nvcc, hipcc,
+# or the actual kernel sources under ``csrc/backends/<vendor>/<arch>/``.
+#
+# Failures during _resolve_sources (e.g. missing kernel dir on an arch we
+# only have flags for, not code) are captured per-arch — one arch's error
+# never aborts the sweep. The manifest distinguishes "no sources" from
+# "preflight FAILed" via separate fields so a CI grep can target either.
+
+def _dry_run_all_archs(out_dir: Path) -> Dict[str, Dict]:
+    """Run preflight + source-resolution + flag-emission for every CANONICAL
+    arch in ARCH_TABLE. Aliases are skipped (they point at the same ArchEntry
+    object as their canonical key — including both would duplicate work).
+
+    For each arch, writes ``<out_dir>/dry_run_<arch>.json`` AND returns a
+    dict keyed by arch. The returned manifests carry the same payload as
+    the on-disk JSON sidecars.
+
+    Robustness:
+      * ``_resolve_sources`` may raise on archs whose
+        ``csrc/backends/<vendor>/<arch>/`` directory doesn't exist on disk
+        yet — recorded as ``sources=[]`` plus ``error=str(exc)`` so the
+        sweep keeps going.
+      * Pallas archs intentionally return ``sources=[]`` and
+        ``device_cflags=[]``; that's the expected shape for vendor=pallas.
+      * Never invokes ``_torch_load`` / torch.cpp_extension — safe to run
+        on a CPU-only / no-nvcc host.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Dedupe aliases: keep only canonical keys (one per unique ArchEntry id).
+    canonical_for: Dict[int, str] = {}
+    for k, v in ARCH_TABLE.items():
+        canonical_for.setdefault(id(v), k)
+    canonical_archs = sorted(canonical_for.values())
+
+    manifests: Dict[str, Dict] = {}
+    for arch in canonical_archs:
+        entry = ARCH_TABLE[arch]
+        spec = BuildSpec(
+            optimizer="adamw",
+            model="mamba3",
+            arch=arch,
+            out_dir=out_dir,
+            runtime="aot",
+            autotune=False,
+            profile=False,
+            extra_macros=[],
+        )
+
+        # --- preflight (capture all diagnostic lines) ---
+        preflight_lines: List[str] = []
+        preflight_judgment = "?"
+        try:
+            preflight_lines = list(_preflight_toolchain(arch))
+        except Exception as exc:  # noqa: BLE001 — preflight must never abort sweep
+            preflight_lines = [f"[preflight] arch={arch} EXCEPTION {exc!r}"]
+        # Parse PASS / FAIL from the per-arch judgment line(s).
+        for ln in preflight_lines:
+            if f"arch={arch}" in ln:
+                if "PASS" in ln:
+                    preflight_judgment = "PASS"
+                    break
+                if "FAIL" in ln:
+                    preflight_judgment = "FAIL"
+                    break
+
+        # --- source resolution (may raise on archs without a kernel dir) ---
+        sources: List[str] = []
+        resolve_error: Optional[str] = None
+        try:
+            resolved = _resolve_sources(spec)
+            sources = [str(p) for p in resolved]
+        except Exception as exc:  # noqa: BLE001 — one arch failure must not abort
+            resolve_error = f"{type(exc).__name__}: {exc}"
+
+        # --- flag emission (host / device / ld) ---
+        host_cflags: List[str] = []
+        device_cflags: List[str] = []
+        ldflags: List[str] = []
+        cflag_error: Optional[str] = None
+        try:
+            host_cflags = list(_host_cflags(spec))
+        except Exception as exc:  # noqa: BLE001
+            cflag_error = f"host_cflags: {type(exc).__name__}: {exc}"
+        try:
+            device_cflags = list(_device_cflags(spec))
+        except Exception as exc:  # noqa: BLE001
+            cflag_error = (cflag_error or "") + (
+                f"; device_cflags: {type(exc).__name__}: {exc}")
+        try:
+            ldflags = list(_ldflags(spec))
+        except Exception as exc:  # noqa: BLE001
+            cflag_error = (cflag_error or "") + (
+                f"; ldflags: {type(exc).__name__}: {exc}")
+
+        manifest: Dict[str, Any] = {
+            "arch":                  arch,
+            "vendor":                entry.vendor,
+            "display_name":          entry.display_name,
+            "min_toolchain":         list(entry.min_toolchain_version),
+            "preflight_lines":       preflight_lines,
+            "preflight_judgment":    preflight_judgment,
+            "sources":               sources,
+            "host_cflags":           host_cflags,
+            "device_cflags":         device_cflags,
+            "ldflags":               ldflags,
+            "expected_gencode":      list(entry.nvcc_gencode) if entry.vendor == "cuda" else [],
+            "expected_offload_arch": entry.hipcc_offload_arch if entry.vendor == "hip" else "",
+        }
+        if resolve_error is not None:
+            manifest["error"] = resolve_error
+        if cflag_error is not None:
+            # Don't overwrite resolve_error; merge into the same field.
+            manifest["error"] = (
+                (manifest.get("error", "") + "; " + cflag_error).lstrip("; "))
+
+        sidecar = out_dir / f"dry_run_{arch}.json"
+        try:
+            sidecar.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        except Exception as exc:  # noqa: BLE001 — sidecar IO must not abort sweep
+            manifest["sidecar_write_error"] = f"{type(exc).__name__}: {exc}"
+
+        manifests[arch] = manifest
+
+    return manifests
+
+
 def _collect_sibling_trials(cache: CompileCache, opt: str, model: str,
                             arch: str) -> List[Dict[str, Any]]:
     """§12 A2 — transfer learning: gather successful trials from
@@ -7612,8 +7748,31 @@ def _spawn_phase(argv: List[str], phase: str) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    if "--self-test" in (argv if argv is not None else sys.argv[1:]):
+    _argv = argv if argv is not None else sys.argv[1:]
+    if "--self-test" in _argv:
         return _self_test()
+
+    # Early intercept: --dry-run-all-archs doesn't need --optimizer/-M/-A
+    # (those are required=True in the main parser). We parse just --out
+    # here so the sweep can write to the user-requested directory.
+    if "--dry-run-all-archs" in _argv:
+        dry_parser = argparse.ArgumentParser(add_help=False)
+        dry_parser.add_argument("--dry-run-all-archs", action="store_true")
+        dry_parser.add_argument("--out", type=Path, default=None)
+        dry_args, _ = dry_parser.parse_known_args(_argv)
+        out_dir = Path(dry_args.out or REPO_ROOT / "build" / "compiled").resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifests = _dry_run_all_archs(out_dir)
+        sys.stdout.write(
+            f"[dry-run-all-archs] wrote {len(manifests)} manifests to {out_dir}\n")
+        for arch in sorted(manifests):
+            m = manifests[arch]
+            sys.stdout.write(
+                f"  {arch:<10s} vendor={m['vendor']:<7s} "
+                f"sources={len(m['sources']):>3d} "
+                f"device_cflags={len(m['device_cflags']):>3d} "
+                f"judgment={m.get('preflight_judgment','?')}\n")
+        return 0
 
     parser = argparse.ArgumentParser(
         prog="python -m grokking_optimizers.compile",
@@ -7788,7 +7947,28 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "output as the AOT reference AND are "
                              "bit-identical across a 3x re-run "
                              "(tag=deterministic) are eligible.")
+    parser.add_argument("--dry-run-all-archs", action="store_true",
+                        help="Run the preflight + source-resolution + flag-emission "
+                             "pipeline for every canonical arch in ARCH_TABLE. "
+                             "Writes one JSON manifest per arch under "
+                             "<out>/dry_run_<arch>.json. Useful for CI verification "
+                             "on hosts without nvcc/hipcc.")
     args = parser.parse_args(argv)
+
+    if args.dry_run_all_archs:
+        out_dir = Path(args.out or REPO_ROOT / "build" / "compiled").resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifests = _dry_run_all_archs(out_dir)
+        sys.stdout.write(
+            f"[dry-run-all-archs] wrote {len(manifests)} manifests to {out_dir}\n")
+        for arch in sorted(manifests):
+            m = manifests[arch]
+            sys.stdout.write(
+                f"  {arch:<10s} vendor={m['vendor']:<7s} "
+                f"sources={len(m['sources']):>3d} "
+                f"device_cflags={len(m['device_cflags']):>3d} "
+                f"judgment={m.get('preflight_judgment','?')}\n")
+        return 0
 
     # Stream 11: pre-load the project config so module-level defaults can be
     # consulted by downstream consumers. Behavior is identical to today when
@@ -9315,6 +9495,46 @@ def _self_test() -> int:
          test_preflight_emits_judgment_per_arch)
     _run("bootstrap_toolchain_dispatch_no_crash",
          test_bootstrap_toolchain_dispatch_no_crash)
+
+    sys.stdout.write("[self-test] dry_run_all_archs\n")
+
+    def test_dry_run_all_archs():
+        """Every canonical arch produces a valid manifest with the right
+        -gencode / --offload-arch / preflight judgment."""
+        with tempfile.TemporaryDirectory() as td:
+            manifests = _dry_run_all_archs(Path(td))
+            # Dedupe aliases — only canonical entries.
+            seen = {}
+            for k, v in ARCH_TABLE.items():
+                seen.setdefault(id(v), k)
+            canonical = sorted(seen.values())
+            assert len(manifests) == len(canonical), (
+                f"expected {len(canonical)} manifests, got {len(manifests)}: "
+                f"{sorted(manifests.keys())}")
+            for arch in canonical:
+                m = manifests[arch]
+                entry = ARCH_TABLE[arch]
+                assert m["vendor"] == entry.vendor, arch
+                assert "preflight_judgment" in m, arch
+                if entry.vendor == "cuda":
+                    joined = " ".join(m["device_cflags"])
+                    want = f"sm_{entry.cutlass_arch}{entry.arch_suffix}"
+                    assert f"code={want}" in joined or want in joined, \
+                        f"{arch}: missing gencode token for {want}"
+                elif entry.vendor == "hip":
+                    joined = " ".join(m["device_cflags"])
+                    want = entry.hipcc_offload_arch
+                    assert want and f"--offload-arch={want}" in joined, \
+                        f"{arch}: missing --offload-arch={want}"
+                elif entry.vendor == "pallas":
+                    # Pallas has no cflags but must still report cleanly.
+                    assert m["device_cflags"] == [], arch
+                sidecar = Path(td) / f"dry_run_{arch}.json"
+                assert sidecar.exists(), f"{arch}: sidecar missing"
+                payload = json.loads(sidecar.read_text())
+                assert payload["arch"] == arch
+
+    _run("dry_run_all_archs", test_dry_run_all_archs)
 
     sys.stdout.write("[self-test] pallas\n")
 
