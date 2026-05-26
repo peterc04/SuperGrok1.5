@@ -25,29 +25,58 @@ git submodule update --init --recursive third_party/cutlass  # optional, for CUT
 
 ```bash
 # Core deps — required on every host
-pip install torch ninja optuna pyyaml
+pip install torch optuna pyyaml
+
+# Ninja: either the system package (apt/brew/dnf install ninja-build) OR
+# the pip wrapper. torch's cpp_extension auto-detects either.
+pip install ninja        # if you don't already have ninja-build installed
 
 # Optional but recommended
 pip install tqdm                    # nicer progress bars during autotune
 pip install 'jax[tpu]'              # only if --arch tpu_v5p
 ```
 
-Toolchain requirements per arch (only the one matching your target is needed):
-
-- `sm_90` — CUDA Toolkit ≥ 12.0 with `nvcc` on `PATH`, g++ ≥ 9
-- `gfx942` — ROCm ≥ 6.0 with `hipcc` on `PATH`
-- `tpu_v5p` — no C++ compile; JAX/Pallas handles codegen at runtime
-
-### 3. Verify the install (no GPU needed)
+Verify the imports load cleanly:
 
 ```bash
-# Runs 18 inline self-tests covering search space, PGO, Bayesian, cache, and kernel headers
+python -c "import torch, optuna, yaml; print('torch', torch.__version__, '| optuna', optuna.__version__)"
+```
+
+### 3. Set up the toolchain for your target arch
+
+Only the toolchain matching your target is needed:
+
+```bash
+# sm_90 (CUDA): nvcc on PATH AND CUDA_HOME exported
+export CUDA_HOME=/usr/local/cuda            # or wherever your CUDA Toolkit lives
+export PATH="$CUDA_HOME/bin:$PATH"
+nvcc --version                              # should print CUDA 12.0+
+
+# gfx942 (ROCm): hipcc on PATH AND ROCM_PATH exported
+export ROCM_PATH=/opt/rocm                  # or wherever your ROCm install lives
+export PATH="$ROCM_PATH/bin:$PATH"
+hipcc --version                             # should print ROCm 6.0+
+
+# tpu_v5p: no C++ toolchain; JAX/Pallas does codegen at runtime
+pip install 'jax[tpu]' -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+```
+
+**Common gotcha:** `compile.py` AOT will fail with
+`CUDA_HOME environment variable is not set` even when `nvcc` is on
+`PATH` — torch's cpp_extension reads `CUDA_HOME` directly.
+
+### 4. Verify the install (no GPU or toolchain needed)
+
+```bash
+# Runs 18 inline self-tests covering search space, PGO, Bayesian, cache,
+# and kernel headers. Pure-Python — works on any host.
 python -m grokking_optimizers.compile --self-test
 ```
 
-Expected output ends with: `[self-test] 18 passed, 0 failed`.
+Expected output ends with: `[self-test] 18 passed, 0 failed`. If this
+fails, the install is broken; fix it before moving on.
 
-### 4. Compile an `(optimizer, model, arch)` triple
+### 5. Compile an `(optimizer, model, arch)` triple
 
 The targeted build pipeline lives at `grokking_optimizers/compile.py`.
 It runs ninja-driven AOT compilation, optional Bayesian/Exhaustive
@@ -61,13 +90,13 @@ python -m grokking_optimizers.compile \
     --optimizer adamw --model decoder --arch sm_90 \
     --cache build/.compile_cache.json
 
-# Quick debug run (25 trials, no PGO)
-python -m grokking_optimizers.compile -O lion -M mamba -A sm_90 --quick
+# Quick debug run (25 trials, no PGO, skip profile)
+python -m grokking_optimizers.compile -O lion -M mamba -A sm_90 --quick --no-profile
 
 # Exhaustive — every config that survives the static pre-filter
 python -m grokking_optimizers.compile -O grokfast -M vit -A gfx942 --mode exhaustive
 
-# AOT only (CPU host, no GPU needed) — publish artefact for a GPU host
+# AOT only (CPU host with nvcc + CUDA_HOME) — publish artefact for a GPU host
 python -m grokking_optimizers.compile -O adamw -M decoder -A sm_90 \
     --aot-only --aot-artifact-dir build/aot
 
@@ -88,19 +117,21 @@ Supported values:
 
 - `--optimizer / -O`: `adamw`, `lion`, `grokfast`, `grokadamw`,
   `looksam`, `muon`, `neuralgrok`, `prodigy`, `supergrok11`, `supergrok15`, `supergrok2`
-- `--model / -M`: `decoder`, `mamba`, `vit`
+- `--model / -M`: `mamba`, `decoder`, `vit`
 - `--arch / -A`: `sm_90`, `gfx942`, `tpu_v5p`
 
 Output: a single text report at `build/compiled/compile_<O>_<M>_<A>.txt`
 plus the built `.so` (CUDA/HIP) or compiled Pallas module (TPU). The
-JSON cache at `--cache <path>` survives across runs, so repeating the
-same combo is a cache-hit on every phase.
+report is always written, even on build failure — open it first when
+something goes wrong. The JSON cache at `--cache <path>` survives
+across runs, so repeating the same combo is a cache-hit on every
+phase.
 
 For the full CLI reference (Optuna study persistence, transfer
 learning, Hyperband pruner, debug symbols, etc.), see
 [CLI surface](#cli-surface-compilepy) below.
 
-### 5. Profile a compiled artifact
+### 6. Profile a compiled artifact
 
 ```bash
 # Re-profile without rebuilding (ncu on sm_90, rocprof on gfx942, jax.profiler on tpu)
@@ -108,16 +139,35 @@ python -m grokking_optimizers.profile \
     --optimizer adamw --model decoder --arch sm_90
 ```
 
-### 6. Run the production install
+### 7. Run the production install
 
 The `compile.py` flow is for iterating on one combo with full diagnostics.
 For the production `grokking_optimizers._ops` extension consumed by the
-race driver, use `pip install -e .` from the repo root.
+race driver, use `pip install -e .` from the repo root:
 
 ```bash
+# Standard install (GPU visible, CUDA_HOME set)
 pip install -e .
+
+# CPU host with no visible GPU (build farm) — requires nvcc + CUDA_HOME still
+FORCE_CUDA=1 pip install -e .
+
+# Limit the gencode list to just Hopper (faster build)
+TORCH_CUDA_ARCH_LIST="9.0" pip install -e .
+
 python grokking_race_v2.py --help   # race driver entry point
 ```
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| `CUDA_HOME environment variable is not set` | `export CUDA_HOME=/usr/local/cuda` (or wherever your install lives). Required even when `nvcc` is on `PATH`. |
+| `No supported GPU backend detected` from setup.py | Either install CUDA/ROCm + visible GPU, or `FORCE_CUDA=1 pip install -e .` to force-build the CUDA extension on a CPU host. |
+| `nvcc not on PATH; skipping version-gated flags` in the report | Install CUDA Toolkit ≥ 12.0 and add `$CUDA_HOME/bin` to `PATH`. The build will still run but won't auto-add `--split-compile`. |
+| Self-test fails with `ModuleNotFoundError` | `pip install torch optuna pyyaml` — make sure the imports work before running `--self-test`. |
+| Compile silently hangs at "jit-autotune" | First-time Optuna study creation needs SQLite write access to `<out>/optuna_<O>_<M>_<A>.db`. Check directory permissions on `--out`. |
+| `[build FAILED after 0.0s]` in the report | Open `build/compiled/compile_<O>_<M>_<A>.txt` — the actual compiler error is logged after the `[build FAILED]` line. |
 
 ---
 
