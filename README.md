@@ -24,6 +24,23 @@ git clone https://github.com/peterc04/SuperGrok1.5
 cd SuperGrok1.5
 ```
 
+**Running in Google Colab / Jupyter?** Use these instead of `cd`:
+
+```python
+# In a notebook cell:
+!git clone https://github.com/peterc04/SuperGrok1.5.git
+# (no `cd` needed — Step 3 auto-detects the repo at /content/SuperGrok1.5/)
+```
+
+> **Colab GPU caveat:** Colab typically gives you a **T4 (sm_75)**,
+> **L4 (sm_89)**, **A100 (sm_80)**, or **V100 (sm_70)** — none of which
+> are in this project's active build set (`sm_90` / `gfx942` / `tpu_v5p`).
+> You can still run `compile_main(["--self-test"])` and inspect the
+> kernels, but the actual AOT compile for `--arch sm_90` won't produce
+> a runnable `.so` on a non-Hopper GPU. Use a Colab Pro+ A100 *only* if
+> you also pass `--arch sm_90` for cross-compile (the resulting `.so`
+> won't run there but will be valid for Hopper deployment).
+
 ### Step 2 — Install Python dependencies
 
 ```python
@@ -61,14 +78,35 @@ running with `python -c`.
 import os, sys
 from pathlib import Path
 
-# ─── make the cloned source importable (no pip install required) ──────────
-REPO_ROOT = Path.cwd()                                     # change if needed
-assert (REPO_ROOT / "grokking_optimizers" / "compile.py").is_file(), (
-    f"grokking_optimizers/ not found under {REPO_ROOT}. "
-    "Either `cd` into the cloned SuperGrok1.5/ first, or set "
-    "REPO_ROOT = Path('/absolute/path/to/SuperGrok1.5')."
-)
+# ─── locate the cloned source (auto-detects Colab/Jupyter where cwd is the parent of the repo) ───
+def _find_repo_root() -> Path:
+    here = Path.cwd().resolve()
+    candidates = [
+        here,                          # ran from inside the repo
+        here / "SuperGrok1.5",         # Colab/Jupyter default: cloned under cwd
+        Path("/content/SuperGrok1.5"), # Colab explicit
+    ]
+    # Walk up from cwd in case Python was started in a subdir of the repo
+    p = here
+    for _ in range(6):
+        candidates.append(p)
+        if p.parent == p:
+            break
+        p = p.parent
+    for c in candidates:
+        if (c / "grokking_optimizers" / "compile.py").is_file():
+            return c.resolve()
+    raise FileNotFoundError(
+        "Could not find grokking_optimizers/ in any of:\n  " +
+        "\n  ".join(str(c) for c in candidates) +
+        "\n\nSet REPO_ROOT manually, e.g.:\n"
+        "    REPO_ROOT = Path('/content/SuperGrok1.5')   # Colab\n"
+        "    REPO_ROOT = Path('/home/you/SuperGrok1.5')  # local"
+    )
+
+REPO_ROOT = _find_repo_root()
 sys.path.insert(0, str(REPO_ROOT))
+print(f"using REPO_ROOT = {REPO_ROOT}")
 
 # ─── your selection ───────────────────────────────────────────────────────
 OPTIMIZER = "adamw"            # adamw | lion | grokfast | grokadamw | looksam |
@@ -161,7 +199,10 @@ handles this.
 # re-add the repo root so the import resolves:
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path.cwd()))   # assumes you're in SuperGrok1.5/
+for c in (Path.cwd(), Path.cwd() / "SuperGrok1.5", Path("/content/SuperGrok1.5")):
+    if (c / "grokking_optimizers" / "compile.py").is_file():
+        sys.path.insert(0, str(c.resolve()))
+        break
 
 from grokking_optimizers.profile import profile
 
@@ -203,7 +244,10 @@ run the inline self-test to confirm the Python install is sound:
 ```python
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path.cwd()))   # assumes you're in SuperGrok1.5/
+for c in (Path.cwd(), Path.cwd() / "SuperGrok1.5", Path("/content/SuperGrok1.5")):
+    if (c / "grokking_optimizers" / "compile.py").is_file():
+        sys.path.insert(0, str(c.resolve()))
+        break
 
 from grokking_optimizers.compile import main as compile_main
 assert compile_main(["--self-test"]) == 0  # prints "[self-test] 18 passed, 0 failed"
@@ -213,7 +257,9 @@ assert compile_main(["--self-test"]) == 0  # prints "[self-test] 18 passed, 0 fa
 
 | Symptom | Fix |
 |---------|-----|
-| `ModuleNotFoundError: No module named 'grokking_optimizers'` | You're running Python from outside the cloned `SuperGrok1.5/` directory, or `sys.path` doesn't include it. Add `sys.path.insert(0, str(Path.cwd()))` (Step 3 block already does this) before any `from grokking_optimizers...` import — or point `REPO_ROOT` at the absolute path of the cloned repo. No `pip install -e .` required just to run `compile.py` / `profile.py`. |
+| `ModuleNotFoundError: No module named 'grokking_optimizers'` | You're running Python from outside the cloned `SuperGrok1.5/` directory. The Step 3 block uses `_find_repo_root()` which already handles cwd, `cwd/SuperGrok1.5/`, `/content/SuperGrok1.5/` (Colab), and walks up from cwd. If you're still stuck, set `REPO_ROOT = Path('/absolute/path/to/SuperGrok1.5')` explicitly before `sys.path.insert(...)`. No `pip install -e .` required. |
+| `AssertionError: grokking_optimizers/ not found under /content` (Colab) | You ran the OLD Step 3 block. Pull the latest README — the current block auto-detects `/content/SuperGrok1.5/`. Or just set `REPO_ROOT = Path("/content/SuperGrok1.5")` manually. |
+| `UnsupportedArchError` on Colab | Colab GPUs (T4, L4, A100, V100) aren't in the active set. Either switch to Hopper hardware, or use `compile_main(["--self-test"])` to validate the kernels statically without building. |
 | `CUDA_HOME environment variable is not set` | `os.environ["CUDA_HOME"] = "/usr/local/cuda"` (Step 3 block already does this). Required even when `nvcc` is on `PATH`. |
 | `No supported GPU backend detected` from setup.py | `env["FORCE_CUDA"] = "1"` before the `pip install -e .` subprocess. |
 | `nvcc not on PATH; skipping version-gated flags` in the streamed report | Install CUDA Toolkit ≥ 12.0 and prepend `$CUDA_HOME/bin` to `PATH`. Build still runs but won't auto-add `--split-compile`. |
