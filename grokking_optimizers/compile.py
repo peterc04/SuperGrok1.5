@@ -1836,12 +1836,17 @@ def _ensure_nvcc_on_path() -> Optional[str]:
          (this is the only nvcc available on Colab CPU runtimes after
          ``pip install nvidia-cuda-nvcc-cu12``)
 
-    When found, prepends the bin dir to PATH and sets CUDA_HOME (and
-    ``LD_LIBRARY_PATH`` for the wheel-install case where libcudart is
-    in a sibling directory). Returns the resolved nvcc path or None.
+    When found, prepends the bin dir to PATH and AUTO-CORRECTS
+    ``CUDA_HOME`` if it points at a non-existent path. (Common case:
+    user manually set ``os.environ["CUDA_HOME"] = "/usr/local/cuda"``
+    but apt installed nvcc to ``/usr/bin/nvcc`` — without this fix,
+    torch's cpp_extension writes ninja with the stale phantom path.)
+    Returns the resolved nvcc path or None.
     """
-    if shutil.which("nvcc"):
-        return shutil.which("nvcc")
+    nvcc = shutil.which("nvcc")
+    if nvcc:
+        _reconcile_cuda_home(nvcc)
+        return nvcc
     candidates: List[Path] = []
     cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
     if cuda_home:
@@ -1877,20 +1882,18 @@ def _ensure_nvcc_on_path() -> Optional[str]:
     except Exception:
         pass
 
-    for nvcc in candidates:
+    for nvcc_p in candidates:
         try:
-            if nvcc.is_file() and os.access(nvcc, os.X_OK):
-                nvcc_dir = str(nvcc.parent)
+            if nvcc_p.is_file() and os.access(nvcc_p, os.X_OK):
+                nvcc_dir = str(nvcc_p.parent)
                 current_path = os.environ.get("PATH", "")
                 if nvcc_dir not in current_path.split(os.pathsep):
                     os.environ["PATH"] = f"{nvcc_dir}{os.pathsep}{current_path}"
-                if not os.environ.get("CUDA_HOME"):
-                    os.environ["CUDA_HOME"] = str(nvcc.parent.parent)
                 # For PyPI wheels, libcudart lives in a sibling nvidia/cuda_runtime
                 # directory; make sure LD_LIBRARY_PATH and CUDA_HOME's lib64
                 # discovery work.
-                if "nvidia" in nvcc.parts:
-                    nvidia_root = nvcc.parents[2]  # <site>/nvidia
+                if "nvidia" in nvcc_p.parts:
+                    nvidia_root = nvcc_p.parents[2]  # <site>/nvidia
                     lib_dirs = []
                     for pkg in ("cuda_runtime", "cuda_cudart", "cuda_nvrtc",
                                 "cuda_cccl"):
@@ -1901,11 +1904,83 @@ def _ensure_nvcc_on_path() -> Optional[str]:
                         existing = os.environ.get("LD_LIBRARY_PATH", "")
                         os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(
                             lib_dirs + ([existing] if existing else []))
-                sys.stderr.write(f"[compile] discovered nvcc at {nvcc}\n")
-                return str(nvcc)
+                sys.stderr.write(f"[compile] discovered nvcc at {nvcc_p}\n")
+                _reconcile_cuda_home(str(nvcc_p))
+                return str(nvcc_p)
         except (OSError, PermissionError):
             continue
     return None
+
+
+def _reconcile_cuda_home(nvcc_path: str) -> None:
+    """Make ``os.environ["CUDA_HOME"]`` consistent with the actual nvcc
+    location. Sets/overwrites CUDA_HOME when it points at a path that
+    doesn't contain the real nvcc binary, then forces torch's
+    cpp_extension to re-read it.
+
+    Example fix: user sets ``CUDA_HOME=/usr/local/cuda`` (which doesn't
+    exist) but apt installs nvcc to ``/usr/bin/nvcc``. Without this,
+    torch joins the stale CUDA_HOME with ``/bin/nvcc`` and writes a
+    bad path into build.ninja → exit-127.
+    """
+    nvcc = Path(nvcc_path).resolve()
+    if not nvcc.is_file():
+        return
+    # Derive the "CUDA root" — parent of bin/. For NVIDIA's standard
+    # layout (/usr/local/cuda-12.6/bin/nvcc), root = /usr/local/cuda-12.6.
+    # For Debian's multiarch layout (/usr/bin/nvcc), root = /usr.
+    actual_root = nvcc.parent.parent
+    env_root = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH") or ""
+    needs_fix = (
+        not env_root
+        or not Path(env_root).is_dir()
+        or not (Path(env_root) / "bin" / "nvcc").is_file()
+    )
+    if needs_fix:
+        sys.stderr.write(
+            f"[compile] correcting CUDA_HOME: {env_root or '<unset>'} -> "
+            f"{actual_root} (derived from {nvcc})\n"
+        )
+        os.environ["CUDA_HOME"] = str(actual_root)
+        # Make sure $CUDA_HOME/bin is also on PATH so subprocess shells
+        # invoking nvcc by its bin dir work.
+        bin_dir = str(actual_root / "bin")
+        current = os.environ.get("PATH", "")
+        if bin_dir not in current.split(os.pathsep):
+            os.environ["PATH"] = f"{bin_dir}{os.pathsep}{current}"
+        _refresh_torch_cuda_home(force=True)
+
+
+def _refresh_torch_cuda_home(force: bool = False) -> None:
+    """Force ``torch.utils.cpp_extension`` to re-read CUDA_HOME / ROCM_HOME.
+
+    torch caches these at module-import time. If a user sets
+    ``os.environ["CUDA_HOME"]`` AFTER torch was imported (common in
+    Colab/Jupyter where torch is pre-loaded at kernel startup), the
+    cached value stays at ``None`` and the build fails with
+    "CUDA_HOME environment variable is not set" even though the env
+    var is present. This patches the cached values from os.environ.
+
+    With ``force=True``, overwrites the cache even when it already has
+    a non-None value (used after ``_reconcile_cuda_home`` corrected a
+    stale CUDA_HOME).
+    """
+    try:
+        import torch.utils.cpp_extension as cppext
+    except Exception:
+        return
+    cuda = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if cuda:
+        cached = getattr(cppext, "CUDA_HOME", None)
+        if force or cached in (None, "") or cached != cuda:
+            cppext.CUDA_HOME = cuda
+            sys.stderr.write(f"[compile] refreshed torch CUDA_HOME = {cuda}\n")
+    rocm = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
+    if rocm:
+        cached = getattr(cppext, "ROCM_HOME", None)
+        if force or cached in (None, "") or cached != rocm:
+            cppext.ROCM_HOME = rocm
+            sys.stderr.write(f"[compile] refreshed torch ROCM_HOME = {rocm}\n")
 
 
 def _sudo_prefix() -> List[str]:
@@ -1937,13 +2012,146 @@ def _bootstrap_cuda_via_conda(stream) -> bool:
     return rc == 0 and _ensure_nvcc_on_path() is not None
 
 
+def _bootstrap_cuda_via_nvidia_apt_repo(stream) -> bool:
+    """Add NVIDIA's official CUDA apt repo and install cuda-toolkit-XX-Y.
+
+    Preferred over stock ``nvidia-cuda-toolkit`` on Debian/Ubuntu because:
+      - Stock package is often years old (CUDA 11.5 on Ubuntu 22.04 —
+        too old for sm_90, which needs CUDA 12.0+).
+      - NVIDIA's repo installs to ``/usr/local/cuda-<ver>/`` with a
+        ``/usr/local/cuda`` symlink — the exact layout torch's
+        ``cpp_extension`` expects (bin/, lib64/, include/).
+      - Version is picked to match ``torch.version.cuda`` when possible.
+
+    Probes the available cuda-toolkit packages and installs the newest
+    one ≥12.0 that matches torch's bundled CUDA. Falls back to 12.6,
+    12.4 if no exact match exists in the repo metadata.
+    """
+    apt = shutil.which("apt-get") or shutil.which("apt")
+    if not apt:
+        return False
+    # Detect distro + arch via /etc/os-release + uname
+    os_release: Dict[str, str] = {}
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    os_release[k] = v.strip('"')
+    except Exception:
+        return False
+    distro_id = os_release.get("ID", "").lower()
+    version_id = os_release.get("VERSION_ID", "").replace(".", "")
+    if distro_id == "ubuntu":
+        if version_id not in ("1804", "2004", "2204", "2404"):
+            return False
+        repo_path = f"ubuntu{version_id}"
+    elif distro_id == "debian":
+        if version_id not in ("11", "12"):
+            return False
+        repo_path = f"debian{version_id}"
+    else:
+        return False
+    import platform as _plat
+    machine = _plat.machine().lower()
+    if machine in ("x86_64", "amd64"):
+        arch_seg = "x86_64"
+    elif machine in ("aarch64", "arm64"):
+        arch_seg = "sbsa"
+    else:
+        return False
+
+    # Pick CUDA toolkit version matching torch's bundled CUDA when possible.
+    target_ver = "12-6"
+    try:
+        import torch
+        v = (torch.version.cuda or "").strip()
+        parts = v.split(".")
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            if int(parts[0]) >= 12:
+                target_ver = f"{parts[0]}-{parts[1]}"
+    except Exception:
+        pass
+
+    keyring_url = (f"https://developer.download.nvidia.com/compute/cuda/repos/"
+                   f"{repo_path}/{arch_seg}/cuda-keyring_1.1-1_all.deb")
+    stream.write(f"[bootstrap] trying NVIDIA's official apt repo for "
+                 f"{distro_id} {version_id} ({arch_seg}); target "
+                 f"cuda-toolkit-{target_ver}\n")
+    stream.flush()
+
+    import tempfile
+    env = os.environ.copy()
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    sudo = _sudo_prefix()
+    fetched = False
+    keyring_deb = tempfile.NamedTemporaryFile(suffix=".deb", delete=False).name
+    try:
+        for downloader in (["wget", "-q", "-O", keyring_deb, keyring_url],
+                           ["curl", "-sLfo", keyring_deb, keyring_url]):
+            if shutil.which(downloader[0]):
+                if subprocess.call(downloader) == 0 and \
+                        os.path.getsize(keyring_deb) > 0:
+                    fetched = True
+                    break
+        if not fetched:
+            stream.write(f"[bootstrap] could not download keyring from "
+                         f"{keyring_url}; skipping NVIDIA-repo path\n")
+            return False
+        rc = subprocess.call(sudo + ["dpkg", "-i", keyring_deb], env=env)
+        if rc != 0:
+            stream.write("[bootstrap] dpkg -i cuda-keyring FAILED\n")
+            return False
+        if subprocess.call(sudo + [apt, "update", "-qq"], env=env) != 0:
+            stream.write("[bootstrap] apt update after adding NVIDIA repo "
+                         "FAILED\n")
+            return False
+        candidates = [f"cuda-toolkit-{target_ver}", "cuda-toolkit-12-6",
+                      "cuda-toolkit-12-4", "cuda-toolkit-12-3",
+                      "cuda-toolkit-12-2", "cuda-toolkit-12-1",
+                      "cuda-toolkit-12-0", "cuda-toolkit"]
+        seen: set = set()
+        for pkg in candidates:
+            if pkg in seen:
+                continue
+            seen.add(pkg)
+            stream.write(f"[bootstrap] apt install {pkg}\n")
+            stream.flush()
+            rc = subprocess.call(sudo + [apt, "install", "-y", "-qq", pkg],
+                                 env=env)
+            if rc == 0:
+                # NVIDIA's package puts everything under /usr/local/cuda-<ver>/
+                for cuda_dir in [Path("/usr/local/cuda")] + sorted(
+                        Path("/usr/local").glob("cuda-*"), reverse=True):
+                    if (cuda_dir / "bin" / "nvcc").is_file():
+                        os.environ["CUDA_HOME"] = str(cuda_dir)
+                        bin_path = str(cuda_dir / "bin")
+                        current = os.environ.get("PATH", "")
+                        if bin_path not in current.split(os.pathsep):
+                            os.environ["PATH"] = f"{bin_path}{os.pathsep}{current}"
+                        break
+                if _ensure_nvcc_on_path():
+                    return True
+    finally:
+        try:
+            os.unlink(keyring_deb)
+        except OSError:
+            pass
+    return False
+
+
 def _bootstrap_cuda_via_apt(stream) -> bool:
-    """Debian / Ubuntu / Colab / Mint."""
+    """Debian / Ubuntu / Colab / Mint — stock distro package.
+
+    Note: this is often years behind (e.g. CUDA 11.5 on Ubuntu 22.04),
+    so ``_bootstrap_cuda_via_nvidia_apt_repo`` is preferred for sm_90
+    and other newer arches. Kept as a fallback for hosts where adding
+    NVIDIA's repo failed (corp firewall, custom apt config, etc.)."""
     apt = shutil.which("apt-get") or shutil.which("apt")
     if not apt:
         return False
     stream.write("[bootstrap] trying apt-get install nvidia-cuda-toolkit "
-                 "(~2 GB, 2-5 min)\n")
+                 "(stock distro package; may be older than CUDA 12)\n")
     stream.flush()
     env = os.environ.copy()
     env["DEBIAN_FRONTEND"] = "noninteractive"
@@ -2111,8 +2319,16 @@ def bootstrap_cuda_toolkit(stream=None) -> bool:
     if stream is None:
         stream = sys.stderr
     if shutil.which("nvcc") or _ensure_nvcc_on_path():
-        stream.write("[bootstrap] nvcc already available; skipping install\n")
-        return True
+        # Already have nvcc — but if it's < CUDA 12.0 we may still want
+        # to upgrade since sm_90 / sm_100 / sm_103 / sm_120 won't build.
+        ver = _probe_nvcc_version()
+        if ver and ver < (12, 0):
+            stream.write(f"[bootstrap] found nvcc {ver[0]}.{ver[1]} but it's "
+                         "older than CUDA 12.0 (required for sm_90+); will "
+                         "still try to install a newer toolkit\n")
+        else:
+            stream.write("[bootstrap] nvcc already available; skipping install\n")
+            return True
 
     in_conda_env = bool(os.environ.get("CONDA_PREFIX"))
     # Priority order: prefer conda when we're in an active env (no sudo,
@@ -2123,6 +2339,10 @@ def bootstrap_cuda_toolkit(stream=None) -> bool:
     # Native system package managers — one of these matches on any
     # Linux/macOS/Windows host.
     methods.extend([
+        # Prefer NVIDIA's official apt repo on Debian/Ubuntu — it
+        # installs CUDA 12.x to /usr/local/cuda/ (the layout torch
+        # expects), whereas the stock package is often CUDA 11.x.
+        ("nvidia-apt", _bootstrap_cuda_via_nvidia_apt_repo),
         ("apt",      _bootstrap_cuda_via_apt),
         ("dnf",      _bootstrap_cuda_via_dnf),
         ("yum",      _bootstrap_cuda_via_yum),
@@ -2177,30 +2397,6 @@ def bootstrap_cuda_toolkit(stream=None) -> bool:
     return False
 
 
-def _refresh_torch_cuda_home() -> None:
-    """Force ``torch.utils.cpp_extension`` to re-read CUDA_HOME / ROCM_HOME.
-
-    torch caches these at module-import time. If a user sets
-    ``os.environ["CUDA_HOME"]`` AFTER torch was imported (common in
-    Colab/Jupyter where torch is pre-loaded at kernel startup), the
-    cached value stays at ``None`` and the build fails with
-    "CUDA_HOME environment variable is not set" even though the env
-    var is present. This patches the cached values from os.environ.
-    """
-    try:
-        import torch.utils.cpp_extension as cppext
-    except Exception:
-        return
-    cuda = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
-    if cuda and getattr(cppext, "CUDA_HOME", None) in (None, ""):
-        cppext.CUDA_HOME = cuda
-        sys.stderr.write(f"[compile] refreshed torch CUDA_HOME = {cuda}\n")
-    rocm = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
-    if rocm and getattr(cppext, "ROCM_HOME", None) in (None, ""):
-        cppext.ROCM_HOME = rocm
-        sys.stderr.write(f"[compile] refreshed torch ROCM_HOME = {rocm}\n")
-
-
 def _validate(spec: BuildSpec) -> None:
     if spec.optimizer not in OPTIMIZERS:
         raise ValueError(
@@ -2241,6 +2437,7 @@ def _preflight_toolchain(arch: str) -> List[str]:
         lines.append(f"[preflight] CUDA_HOME={cuda_home or '<unset>'}")
         if nvcc:
             lines.append(f"[preflight] nvcc={nvcc}")
+            nvcc_ver = _probe_nvcc_version()
             try:
                 out = subprocess.check_output([nvcc, "--version"], text=True,
                                               timeout=10).strip().splitlines()
@@ -2248,6 +2445,25 @@ def _preflight_toolchain(arch: str) -> List[str]:
                     lines.append(f"[preflight] {out[-1]}")
             except Exception:
                 pass
+            # Hard requirement: sm_90 (Hopper) needs CUDA 12.0+; sm_120
+            # (consumer Blackwell) needs 12.8+. Warn loudly if version is
+            # too old — otherwise the build dies with cryptic ptxas errors.
+            min_cuda_for_arch = {
+                "sm_90": (12, 0), "sm_100": (12, 4), "sm_103": (12, 8),
+                "sm_120": (12, 8),
+            }
+            need = min_cuda_for_arch.get(arch)
+            if nvcc_ver and need and nvcc_ver < need:
+                lines.append(
+                    f"[preflight] WARNING: nvcc {nvcc_ver[0]}.{nvcc_ver[1]} "
+                    f"is too old for {arch} (needs CUDA {need[0]}.{need[1]}+).\n"
+                    f"  This is usually the stock distro package "
+                    f"(nvidia-cuda-toolkit on Ubuntu 22.04 = CUDA 11.5).\n"
+                    f"  Fix: install NVIDIA's official cuda-toolkit-12-x via\n"
+                    f"  their apt repo, or call build(bootstrap_cuda=True)\n"
+                    f"  which prefers nvidia-apt over stock apt and pulls\n"
+                    f"  a CUDA 12.x that supports {arch}."
+                )
         else:
             lines.append(
                 "[preflight] WARNING: nvcc NOT found. The build will fail "
