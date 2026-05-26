@@ -24,23 +24,6 @@ git clone https://github.com/peterc04/SuperGrok1.5
 cd SuperGrok1.5
 ```
 
-**Running in Google Colab / Jupyter?** Use these instead of `cd`:
-
-```python
-# In a notebook cell:
-!git clone https://github.com/peterc04/SuperGrok1.5.git
-# (no `cd` needed — Step 3 auto-detects the repo at /content/SuperGrok1.5/)
-```
-
-> **Colab GPU caveat:** Colab typically gives you a **T4 (sm_75)**,
-> **L4 (sm_89)**, **A100 (sm_80)**, or **V100 (sm_70)** — none of which
-> are in this project's active build set (`sm_90` / `gfx942` / `tpu_v5p`).
-> You can still run `compile_main(["--self-test"])` and inspect the
-> kernels, but the actual AOT compile for `--arch sm_90` won't produce
-> a runnable `.so` on a non-Hopper GPU. Use a Colab Pro+ A100 *only* if
-> you also pass `--arch sm_90` for cross-compile (the resulting `.so`
-> won't run there but will be valid for Hopper deployment).
-
 ### Step 2 — Install Python dependencies
 
 ```python
@@ -78,44 +61,36 @@ running with `python -c`.
 import os, sys
 from pathlib import Path
 
-# ─── locate the cloned source (auto-detects Colab/Jupyter where cwd is the parent of the repo) ───
-def _find_repo_root() -> Path:
-    here = Path.cwd().resolve()
-    candidates = [
-        here,                          # ran from inside the repo
-        here / "SuperGrok1.5",         # Colab/Jupyter default: cloned under cwd
-        Path("/content/SuperGrok1.5"), # Colab explicit
-    ]
-    # Walk up from cwd in case Python was started in a subdir of the repo
-    p = here
-    for _ in range(6):
-        candidates.append(p)
-        if p.parent == p:
-            break
-        p = p.parent
-    for c in candidates:
-        if (c / "grokking_optimizers" / "compile.py").is_file():
-            return c.resolve()
-    raise FileNotFoundError(
-        "Could not find grokking_optimizers/ in any of:\n  " +
-        "\n  ".join(str(c) for c in candidates) +
-        "\n\nSet REPO_ROOT manually, e.g.:\n"
-        "    REPO_ROOT = Path('/content/SuperGrok1.5')   # Colab\n"
-        "    REPO_ROOT = Path('/home/you/SuperGrok1.5')  # local"
-    )
-
-REPO_ROOT = _find_repo_root()
+# ─── make the cloned source importable (no pip install required) ──────────
+REPO_ROOT = Path.cwd()                                     # change if needed
+assert (REPO_ROOT / "grokking_optimizers" / "compile.py").is_file(), (
+    f"grokking_optimizers/ not found under {REPO_ROOT}. "
+    "Either `cd` into the cloned SuperGrok1.5/ first, or set "
+    "REPO_ROOT = Path('/absolute/path/to/SuperGrok1.5')."
+)
 sys.path.insert(0, str(REPO_ROOT))
-print(f"using REPO_ROOT = {REPO_ROOT}")
 
-# ─── your selection ───────────────────────────────────────────────────────
+# ─── YOUR SELECTION ───────────────────────────────────────────────────────
 OPTIMIZER = "adamw"            # adamw | lion | grokfast | grokadamw | looksam |
                                # muon | neuralgrok | prodigy | supergrok11 |
                                # supergrok15 | supergrok2
 MODEL     = "decoder"          # mamba | decoder | vit
 ARCH      = "sm_90"            # sm_90 | gfx942 | tpu_v5p
 
-# ─── toolchain env (only the one matching ARCH is consulted) ──────────────
+# ─── TUNING KNOBS — all explicit so you can dial in what you want ─────────
+AUTOTUNE_MODE   = "bayesian"   # "bayesian" (TPE) | "exhaustive" (full sweep)
+BAYESIAN_TRIALS = 500          # # of Optuna TPE trials (try 1000+ for production)
+TOP_K           = 20           # # of top configs refined with ±2-step neighbours
+PRUNER          = "hyperband"  # "none" | "median" | "hyperband"  (§12 A1)
+TRANSFER        = True         # seed TPE from sibling-optimizer trials  (§12 A2)
+PGO             = True         # 3-pass instrument → workload → use     ◀───
+PGO_STEPS       = 1000         # # of opt.step() calls during PGO collect
+DEBUG_SYMBOLS   = False        # -ggdb / -lineinfo (auto-on with profile)
+SEED            = 0            # Optuna sampler seed (reproducibility)
+PROFILE_AFTER   = True         # run ncu/rocprof/jax.profiler after final link
+
+# ─── TOOLCHAIN ENV — set BEFORE the grokking_optimizers import so torch's ─
+#     cpp_extension picks up CUDA_HOME / ROCM_HOME at its first import.    ─
 if ARCH == "sm_90":
     os.environ["CUDA_HOME"] = "/usr/local/cuda"          # adjust to your install
     os.environ["PATH"] = f"{os.environ['CUDA_HOME']}/bin:{os.environ['PATH']}"
@@ -124,7 +99,7 @@ elif ARCH == "gfx942":
     os.environ["PATH"] = f"{os.environ['ROCM_PATH']}/bin:{os.environ['PATH']}"
 # tpu_v5p needs no C++ toolchain — JAX/Pallas does codegen at runtime
 
-# ─── compile (debug=True prints every step to stderr in real time) ────────
+# ─── COMPILE — debug=True streams every step to stderr in real time ──────
 from grokking_optimizers.compile import build, CompileCache
 
 cache = CompileCache(Path("build/.compile_cache.json"))
@@ -133,18 +108,36 @@ so_path = build(
     model=MODEL,
     arch=ARCH,
     cache=cache,
-    debug=True,                # ◀── stream the full report to stderr
-    # autotune_mode="bayesian", bayesian_trials=500, top_k=20,  # defaults
-    # autotune_mode="exhaustive",                # try every prefilter survivor
-    # bayesian_trials=25,                        # "quick" debug run
-    # pgo=True, pgo_steps=1000,                  # 3-pass PGO build
-    # aot_only=True, aot_artifact_dir=Path("build/aot"),   # CPU-host AOT
-    # jit_only=True,                                       # GPU-host JIT
-    # search_space_path=Path("my_search_space.yaml"),      # custom YAML
-    # debug_symbols=True,                                  # -ggdb / -lineinfo
+    debug=True,                       # stream the full report to stderr
+    autotune=True,
+    autotune_mode=AUTOTUNE_MODE,
+    bayesian_trials=BAYESIAN_TRIALS,
+    top_k=TOP_K,
+    pruner=PRUNER,
+    transfer_learning=TRANSFER,
+    pgo=PGO,
+    pgo_steps=PGO_STEPS,
+    profile=PROFILE_AFTER,
+    debug_symbols=DEBUG_SYMBOLS,
+    seed=SEED,
+    # search_space_path=Path("my_search_space.yaml"),    # use your own YAML
+    # aot_only=True, aot_artifact_dir=Path("build/aot"), # CPU-host AOT only
+    # jit_only=True,                                     # GPU-host JIT only
 )
 print("built:", so_path)
 ```
+
+Why none of these are hardcoded: **the autotune is exactly what searches
+over the actual kernel parameters** (block size, vector width, unroll
+factor, num_stages, cluster shape, swizzle, warp-specialization, TMA,
+async-copy depth on sm_90; LDS padding, waves-per-EU, MFMA shape,
+scheduler hint on gfx942 — see `DEFAULT_SEARCH_SPACE_YAML` in
+`compile.py` for the full 10-dim grid). The values above are the
+**budget** for that search (how many trials, which pruner, whether to
+warm-start from siblings); the autotune itself picks the kernel
+parameters from the search space. The winning config gets baked into
+`csrc/algorithms/tuned_configs.h` and the primary `.so` is rebuilt with
+those macros.
 
 What you will see streaming to your terminal with `debug=True`:
 
@@ -199,10 +192,7 @@ handles this.
 # re-add the repo root so the import resolves:
 import sys
 from pathlib import Path
-for c in (Path.cwd(), Path.cwd() / "SuperGrok1.5", Path("/content/SuperGrok1.5")):
-    if (c / "grokking_optimizers" / "compile.py").is_file():
-        sys.path.insert(0, str(c.resolve()))
-        break
+sys.path.insert(0, str(Path.cwd()))   # assumes you're in SuperGrok1.5/
 
 from grokking_optimizers.profile import profile
 
@@ -244,10 +234,7 @@ run the inline self-test to confirm the Python install is sound:
 ```python
 import sys
 from pathlib import Path
-for c in (Path.cwd(), Path.cwd() / "SuperGrok1.5", Path("/content/SuperGrok1.5")):
-    if (c / "grokking_optimizers" / "compile.py").is_file():
-        sys.path.insert(0, str(c.resolve()))
-        break
+sys.path.insert(0, str(Path.cwd()))   # assumes you're in SuperGrok1.5/
 
 from grokking_optimizers.compile import main as compile_main
 assert compile_main(["--self-test"]) == 0  # prints "[self-test] 18 passed, 0 failed"
@@ -257,10 +244,9 @@ assert compile_main(["--self-test"]) == 0  # prints "[self-test] 18 passed, 0 fa
 
 | Symptom | Fix |
 |---------|-----|
-| `ModuleNotFoundError: No module named 'grokking_optimizers'` | You're running Python from outside the cloned `SuperGrok1.5/` directory. The Step 3 block uses `_find_repo_root()` which already handles cwd, `cwd/SuperGrok1.5/`, `/content/SuperGrok1.5/` (Colab), and walks up from cwd. If you're still stuck, set `REPO_ROOT = Path('/absolute/path/to/SuperGrok1.5')` explicitly before `sys.path.insert(...)`. No `pip install -e .` required. |
-| `AssertionError: grokking_optimizers/ not found under /content` (Colab) | You ran the OLD Step 3 block. Pull the latest README — the current block auto-detects `/content/SuperGrok1.5/`. Or just set `REPO_ROOT = Path("/content/SuperGrok1.5")` manually. |
-| `UnsupportedArchError` on Colab | Colab GPUs (T4, L4, A100, V100) aren't in the active set. Either switch to Hopper hardware, or use `compile_main(["--self-test"])` to validate the kernels statically without building. |
+| `ModuleNotFoundError: No module named 'grokking_optimizers'` | You're running Python from outside the cloned `SuperGrok1.5/` directory, or `sys.path` doesn't include it. Add `sys.path.insert(0, str(Path.cwd()))` (Step 3 block already does this) before any `from grokking_optimizers...` import — or point `REPO_ROOT` at the absolute path of the cloned repo. No `pip install -e .` required just to run `compile.py` / `profile.py`. |
 | `CUDA_HOME environment variable is not set` | `os.environ["CUDA_HOME"] = "/usr/local/cuda"` (Step 3 block already does this). Required even when `nvcc` is on `PATH`. |
+| `CUDA_HOME environment variable is not set` **but the debug banner shows it IS set** | Stale torch cache. `torch.utils.cpp_extension` reads `CUDA_HOME` at *its* import time; if torch was already loaded before you set the env var (common in Colab/Jupyter), the cached value is `None` and the build fails despite `os.environ` being correct. `build()` now calls `_refresh_torch_cuda_home()` on entry to patch the stale cache from `os.environ`. Pull the latest commit; this is fixed. |
 | `No supported GPU backend detected` from setup.py | `env["FORCE_CUDA"] = "1"` before the `pip install -e .` subprocess. |
 | `nvcc not on PATH; skipping version-gated flags` in the streamed report | Install CUDA Toolkit ≥ 12.0 and prepend `$CUDA_HOME/bin` to `PATH`. Build still runs but won't auto-add `--split-compile`. |
 | Self-test fails with `ModuleNotFoundError` | Repeat Step 2 — `pip_install("torch", "optuna", "pyyaml", "ninja", "tqdm")`. |

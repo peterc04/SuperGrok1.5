@@ -1824,6 +1824,30 @@ class BuildSpec:
     transfer_learning: bool = False
 
 
+def _refresh_torch_cuda_home() -> None:
+    """Force ``torch.utils.cpp_extension`` to re-read CUDA_HOME / ROCM_HOME.
+
+    torch caches these at module-import time. If a user sets
+    ``os.environ["CUDA_HOME"]`` AFTER torch was imported (common in
+    Colab/Jupyter where torch is pre-loaded at kernel startup), the
+    cached value stays at ``None`` and the build fails with
+    "CUDA_HOME environment variable is not set" even though the env
+    var is present. This patches the cached values from os.environ.
+    """
+    try:
+        import torch.utils.cpp_extension as cppext
+    except Exception:
+        return
+    cuda = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if cuda and getattr(cppext, "CUDA_HOME", None) in (None, ""):
+        cppext.CUDA_HOME = cuda
+        sys.stderr.write(f"[compile] refreshed torch CUDA_HOME = {cuda}\n")
+    rocm = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
+    if rocm and getattr(cppext, "ROCM_HOME", None) in (None, ""):
+        cppext.ROCM_HOME = rocm
+        sys.stderr.write(f"[compile] refreshed torch ROCM_HOME = {rocm}\n")
+
+
 def _validate(spec: BuildSpec) -> None:
     if spec.optimizer not in OPTIMIZERS:
         raise ValueError(
@@ -2651,6 +2675,7 @@ def build_aot(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
 
     When ``spec.pgo`` is True, runs the 3-pass instrument → workload →
     use loop. Otherwise a single AOT build."""
+    _refresh_torch_cuda_home()
     info = ARCH_INFO[spec.arch]
     if info["vendor"] == "pallas":
         launcher = (REPO_ROOT / "csrc/backends/pallas"
@@ -2805,6 +2830,7 @@ def _publish_aot_artifact(spec: BuildSpec, so_path: Path, report) -> Path:
 
 def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
     """Run only the JIT autotune + final-link half. Requires GPU."""
+    _refresh_torch_cuda_home()
     info = ARCH_INFO[spec.arch]
     if info["vendor"] == "pallas":
         report.write("\n[pallas] JIT phase no-op (Python-only backend)\n")
@@ -2927,6 +2953,10 @@ def build(
         runtime = "aot"
     if jit_only:
         runtime = "jit"
+
+    # Force torch to re-read CUDA_HOME / ROCM_HOME from os.environ even if
+    # it was imported (and cached None) before the user set the env vars.
+    _refresh_torch_cuda_home()
 
     if debug:
         verbose = True
