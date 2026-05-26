@@ -4490,6 +4490,7 @@ def build(
     pruner: str = "none",
     transfer_learning: bool = False,
     enable_runtime_specialization: bool = False,
+    config: Optional[Any] = None,
 ) -> Optional[Path]:
     """In-process orchestrator. ``main`` handles subprocess split.
 
@@ -4579,6 +4580,28 @@ def build(
         pruner=pruner, transfer_learning=transfer_learning,
         enable_runtime_specialization=enable_runtime_specialization,
     )
+
+    # Stream 11: optionally load project config and apply to spec. Strictly
+    # backward-compatible — if no override is present in the config, the
+    # spec is left untouched.
+    if config is None or not isinstance(config, dict):
+        try:
+            from grokking_optimizers.compile_config import (
+                load_config as _load_cfg,
+                apply_to_buildspec as _apply_cfg,
+            )
+            _cfg_arg = config if isinstance(config, (str, Path)) else None
+            project_cfg = _load_cfg(Path(_cfg_arg) if _cfg_arg else None)
+        except Exception:
+            project_cfg = {}
+    else:
+        project_cfg = config
+    try:
+        from grokking_optimizers.compile_config import apply_to_buildspec as _apply_cfg2
+        _apply_cfg2(spec, project_cfg)
+    except Exception:
+        pass
+
     _validate(spec)
     spec.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -4835,7 +4858,24 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "<out>/nvrtc_cache. CPU-only hosts without "
                              "cuda-python degrade gracefully — the build "
                              "still succeeds.")
+    # Stream 11 — TOML project config
+    parser.add_argument("--config", default=None,
+                        help="Path to project config TOML "
+                             "(default: ./compile_config.toml or packaged default)")
     args = parser.parse_args(argv)
+
+    # Stream 11: pre-load the project config so module-level defaults can be
+    # consulted by downstream consumers. Behavior is identical to today when
+    # no config is present (the loader returns {}).
+    try:
+        from grokking_optimizers.compile_config import load_config as _load_cfg
+        project_cfg = _load_cfg(Path(args.config) if args.config else None)
+    except FileNotFoundError:
+        raise
+    except Exception:
+        project_cfg = {}
+    # Note: we deliberately do NOT auto-override args.arch, even when
+    # archs.default is set — that would surprise users who passed --arch.
     if args.debug:
         args.verbose = True
 
@@ -4895,6 +4935,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         pruner=args.pruner,
         transfer_learning=args.transfer_learning,
         enable_runtime_specialization=args.enable_runtime_specialization,
+        config=project_cfg,
     )
 
     report = args.report or (
@@ -5435,6 +5476,60 @@ def _self_test() -> int:
          test_kernel_registry_nvrtc_compile_or_skip)
     _run("kernel_registry_initialize_disabled",
          test_initialize_registry_disabled_by_default)
+
+    # ----- Stream 11: compile_config -----
+    sys.stdout.write("[self-test] compile_config\n")
+
+    def test_compile_config_default_loads():
+        from grokking_optimizers import compile_config
+        cfg = compile_config.load_config()
+        assert isinstance(cfg, dict), type(cfg)
+        assert "project" in cfg
+        sys.stdout.write(
+            f"    (default config has {len(cfg)} sections)\n")
+
+    def test_compile_config_cwd_override():
+        from grokking_optimizers import compile_config
+        with tempfile.TemporaryDirectory() as td:
+            cwd_cfg = Path(td) / "compile_config.toml"
+            cwd_cfg.write_text(
+                "[codegen]\n"
+                "enable_emitter = true\n"
+                "[archs]\n"
+                'default = "sm_100a"\n'
+            )
+            saved_cwd = os.getcwd()
+            try:
+                os.chdir(td)
+                cfg2 = compile_config.load_config()
+                assert cfg2.get("codegen", {}).get("enable_emitter") is True
+                assert cfg2.get("archs", {}).get("default") == "sm_100a"
+            finally:
+                os.chdir(saved_cwd)
+
+    def test_compile_config_apply_noop_on_empty():
+        from grokking_optimizers import compile_config
+
+        class _MockSpec:
+            enable_emitter = False
+            enable_runtime_specialization = False
+            enable_device_pgo = False
+            strict_numerics = False
+            prune_after_autotune = True
+            prune_max_age_days = 30
+            prune_keep_top_n = 100
+
+        ms = _MockSpec()
+        compile_config.apply_to_buildspec(ms, {})
+        assert ms.enable_emitter is False
+        assert ms.enable_runtime_specialization is False
+        assert ms.enable_device_pgo is False
+        assert ms.strict_numerics is False
+
+    _run("compile_config_default_loads", test_compile_config_default_loads)
+    _run("compile_config_cwd_override", test_compile_config_cwd_override)
+    _run("compile_config_apply_noop_on_empty",
+         test_compile_config_apply_noop_on_empty)
 
     sys.stdout.write(f"\n[self-test] {passed} passed, {failures} failed\n")
     return 1 if failures else 0
