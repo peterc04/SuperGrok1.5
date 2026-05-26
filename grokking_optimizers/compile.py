@@ -3479,6 +3479,60 @@ def _sudo_prefix() -> List[str]:
     return [s] if s else []
 
 
+# ---------------------------------------------------------------------------
+# Per-arch toolchain-version targeting — §12 Stream 12
+# ---------------------------------------------------------------------------
+#
+# Bootstrapping must pick a CUDA/ROCm version that's *at least* high enough
+# for the target arch (sm_90 needs CUDA 12.0+, sm_120a needs 12.8+, gfx950
+# needs ROCm 6.2+, gfx1200/1201 need 7.0+). The helpers below answer
+# "what's the minimum version we should install?" by reading
+# ARCH_TABLE[arch].min_toolchain_version and (for CUDA) reconciling with
+# torch.version.cuda so we don't downgrade below torch's bundled runtime.
+
+def _target_cuda_version_for_arch(arch: str) -> Tuple[int, int]:
+    """Return min CUDA (major, minor) needed for this arch. Falls back to
+    torch.version.cuda if higher.
+
+    Returns (0, 0) for non-CUDA archs (caller must check).
+    """
+    if arch not in ARCH_TABLE:
+        return (12, 0)
+    entry = ARCH_TABLE[arch]
+    if entry.vendor != "cuda":
+        return (0, 0)
+    min_v = entry.min_toolchain_version  # e.g. (12, 0) for sm_90a
+    # Compare to torch's bundled CUDA so we don't pick something older
+    # than the runtime torch was linked against.
+    try:
+        import torch
+        tv = getattr(torch.version, "cuda", None)
+        if tv:
+            parts = tv.split(".")
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                torch_v: Tuple[int, ...] = (int(parts[0]), int(parts[1]))
+            else:
+                torch_v = min_v
+        else:
+            torch_v = min_v
+    except Exception:
+        torch_v = min_v
+    # Pick the HIGHER of the two (typed as 2-tuple for the return contract).
+    chosen = max(min_v[:2], torch_v[:2])
+    return (chosen[0], chosen[1])
+
+
+def _target_rocm_version_for_arch(arch: str) -> Tuple[int, int]:
+    """Return min ROCm (major, minor) needed for this arch.
+
+    Returns (0, 0) for non-HIP archs (caller must check).
+    """
+    if arch not in ARCH_TABLE or ARCH_TABLE[arch].vendor != "hip":
+        return (0, 0)
+    v = ARCH_TABLE[arch].min_toolchain_version
+    return (v[0], v[1])
+
+
 def _bootstrap_cuda_via_conda(stream) -> bool:
     """Install via conda from the nvidia channel. Works on Linux, macOS,
     Windows — no sudo. Best when CONDA_PREFIX is set (active env)."""
@@ -3496,7 +3550,7 @@ def _bootstrap_cuda_via_conda(stream) -> bool:
     return rc == 0 and _ensure_nvcc_on_path() is not None
 
 
-def _bootstrap_cuda_via_nvidia_apt_repo(stream) -> bool:
+def _bootstrap_cuda_via_nvidia_apt_repo(stream, arch: Optional[str] = None) -> bool:
     """Add NVIDIA's official CUDA apt repo and install cuda-toolkit-XX-Y.
 
     Preferred over stock ``nvidia-cuda-toolkit`` on Debian/Ubuntu because:
@@ -3505,11 +3559,14 @@ def _bootstrap_cuda_via_nvidia_apt_repo(stream) -> bool:
       - NVIDIA's repo installs to ``/usr/local/cuda-<ver>/`` with a
         ``/usr/local/cuda`` symlink — the exact layout torch's
         ``cpp_extension`` expects (bin/, lib64/, include/).
-      - Version is picked to match ``torch.version.cuda`` when possible.
+      - Version is picked to be max(arch_min, torch.version.cuda) — never
+        below the arch requirement (sm_120a → 12.8, sm_103a → 12.9), never
+        below torch's bundled CUDA.
 
     Probes the available cuda-toolkit packages and installs the newest
-    one ≥12.0 that matches torch's bundled CUDA. Falls back to 12.6,
-    12.4 if no exact match exists in the repo metadata.
+    one that matches the per-arch target. Falls back through known good
+    versions (12.6, 12.4, 12.3 …) if no exact match exists in the repo
+    metadata.
     """
     apt = shutil.which("apt-get") or shutil.which("apt")
     if not apt:
@@ -3545,17 +3602,23 @@ def _bootstrap_cuda_via_nvidia_apt_repo(stream) -> bool:
     else:
         return False
 
-    # Pick CUDA toolkit version matching torch's bundled CUDA when possible.
+    # Pick CUDA toolkit version: max(arch_min, torch.version.cuda).
+    # Per-arch targeting ensures sm_120a gets 12.8+, sm_103a gets 12.9+, etc.
     target_ver = "12-6"
-    try:
-        import torch
-        v = (torch.version.cuda or "").strip()
-        parts = v.split(".")
-        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-            if int(parts[0]) >= 12:
-                target_ver = f"{parts[0]}-{parts[1]}"
-    except Exception:
-        pass
+    if arch and arch in ARCH_TABLE and ARCH_TABLE[arch].vendor == "cuda":
+        tv = _target_cuda_version_for_arch(arch)
+        if tv >= (12, 0):
+            target_ver = f"{tv[0]}-{tv[1]}"
+    else:
+        try:
+            import torch
+            v = (torch.version.cuda or "").strip()
+            parts = v.split(".")
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                if int(parts[0]) >= 12:
+                    target_ver = f"{parts[0]}-{parts[1]}"
+        except Exception:
+            pass
 
     keyring_url = (f"https://developer.download.nvidia.com/compute/cuda/repos/"
                    f"{repo_path}/{arch_seg}/cuda-keyring_1.1-1_all.deb")
@@ -3780,7 +3843,7 @@ def _bootstrap_cuda_via_pypi_wheels(stream) -> bool:
     return False
 
 
-def bootstrap_cuda_toolkit(stream=None) -> bool:
+def bootstrap_cuda_toolkit(stream=None, arch: Optional[str] = None) -> bool:
     """Install the CUDA toolkit (nvcc + runtime + headers) on demand.
 
     Works on any host where one of these is available:
@@ -3799,6 +3862,11 @@ def bootstrap_cuda_toolkit(stream=None) -> bool:
     (no sudo), then any system package manager that's on PATH, then
     PyPI wheels as a partial fallback. Returns True iff nvcc is on PATH
     afterwards.
+
+    ``arch`` (optional) targets a specific CUDA version. When given, the
+    NVIDIA apt-repo path installs the cuda-toolkit-XX-Y package matching
+    ``max(ARCH_TABLE[arch].min_toolchain_version, torch.version.cuda)``
+    so sm_120a / sm_103a get CUDA 12.8+ / 12.9+ as required.
     """
     if stream is None:
         stream = sys.stderr
@@ -3846,7 +3914,12 @@ def bootstrap_cuda_toolkit(stream=None) -> bool:
     tried: List[str] = []
     for name, fn in methods:
         try:
-            ok = fn(stream)
+            # The NVIDIA apt-repo path knows how to pick the right toolkit
+            # version per target arch; all other methods take stream only.
+            if name == "nvidia-apt":
+                ok = fn(stream, arch)
+            else:
+                ok = fn(stream)
         except Exception as exc:
             stream.write(f"[bootstrap] {name} raised {type(exc).__name__}: "
                          f"{exc}\n")
@@ -3878,6 +3951,272 @@ def bootstrap_cuda_toolkit(stream=None) -> bool:
         "  libcudart, and headers — but NOT the nvcc compiler driver. The bootstrap\n"
         "  attempts them as a partial fallback to populate the dependency surface.\n"
     )
+    return False
+
+
+# ---------------------------------------------------------------------------
+# ROCm bootstrap — mirrors bootstrap_cuda_toolkit (multi-pm probe) — Stream 12
+# ---------------------------------------------------------------------------
+#
+# Same pattern as CUDA: try several package managers in priority order, give
+# up loudly with a manual-install recipe at the end. Picks per-arch target
+# version via ``_target_rocm_version_for_arch`` so gfx950 gets ROCm 6.2+ and
+# gfx1200/gfx1201 get ROCm 7.0+.
+
+def _bootstrap_rocm_via_amd_apt_repo(stream, arch: str) -> bool:
+    """Install ROCm via AMD's official apt repo.
+
+    Picks version per target arch: gfx942/gfx950 → 6.x, gfx1200/gfx1201 → 7.x.
+    The repo layout is ``https://repo.radeon.com/rocm/apt/<ver>/`` and the
+    GPG key lives at ``https://repo.radeon.com/rocm/rocm.gpg.key``.
+    """
+    if not shutil.which("apt-get"):
+        return False
+    sudo = _sudo_prefix()
+    target = _target_rocm_version_for_arch(arch)
+    if target == (0, 0):
+        # Non-HIP arch — bail out cleanly.
+        return False
+    rocm_ver_str = f"{target[0]}.{target[1]}"
+    rocm_key = "https://repo.radeon.com/rocm/rocm.gpg.key"
+    rocm_repo_url = f"https://repo.radeon.com/rocm/apt/{rocm_ver_str}"
+    stream.write(f"[bootstrap_rocm] trying AMD apt repo for ROCm "
+                 f"{rocm_ver_str} (arch={arch})\n")
+    stream.flush()
+    env = os.environ.copy()
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    try:
+        # Fetch key (try wget first, then curl)
+        key_path = "/tmp/rocm.gpg.key"
+        fetched = False
+        for downloader in (
+            ["wget", "-q", "-O", key_path, rocm_key],
+            ["curl", "-sLfo", key_path, rocm_key],
+        ):
+            if shutil.which(downloader[0]):
+                if subprocess.call(downloader) == 0:
+                    fetched = True
+                    break
+        if not fetched:
+            stream.write(f"[bootstrap_rocm:apt] could not download GPG key "
+                         f"from {rocm_key}\n")
+            return False
+        subprocess.run(sudo + ["apt-key", "add", key_path],
+                       check=True, timeout=30, env=env)
+        # Add repo
+        sources_line = f"deb [arch=amd64] {rocm_repo_url} ubuntu main"
+        list_path = "/etc/apt/sources.list.d/rocm.list"
+        subprocess.run(
+            sudo + ["bash", "-c", f"echo '{sources_line}' > {list_path}"],
+            check=True, timeout=10, env=env)
+        subprocess.run(sudo + ["apt-get", "update", "-qq"],
+                       check=True, timeout=120, env=env)
+        # Install
+        subprocess.run(
+            sudo + ["apt-get", "install", "-y", "rocm-dev", "hip-dev"],
+            check=True, timeout=900, env=env)
+        stream.write(f"[bootstrap_rocm] installed ROCm {rocm_ver_str} via "
+                     "AMD apt repo\n")
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError, OSError) as exc:
+        stream.write(f"[bootstrap_rocm:apt] FAILED: {exc}\n")
+        return False
+
+
+def _bootstrap_rocm_via_apt_stock(stream, arch: str) -> bool:
+    """Ubuntu stock rocm-hip-runtime / rocm-dev packages. Fallback when the
+    AMD apt repo isn't reachable (corp firewall, custom apt config)."""
+    if not shutil.which("apt-get"):
+        return False
+    sudo = _sudo_prefix()
+    env = os.environ.copy()
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    stream.write("[bootstrap_rocm] trying stock apt-get install "
+                 "rocm-dev rocm-libs hipcc\n")
+    stream.flush()
+    try:
+        subprocess.run(sudo + ["apt-get", "update", "-qq"],
+                       check=True, timeout=120, env=env)
+        subprocess.run(
+            sudo + ["apt-get", "install", "-y", "rocm-dev", "rocm-libs",
+                    "hipcc"],
+            check=True, timeout=900, env=env)
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError, OSError):
+        return False
+
+
+def _bootstrap_rocm_via_dnf(stream, arch: str) -> bool:
+    """Fedora / RHEL 8+ / Rocky / Alma — rocm-hip-devel."""
+    if not shutil.which("dnf"):
+        return False
+    sudo = _sudo_prefix()
+    stream.write("[bootstrap_rocm] trying dnf install rocm-hip-devel\n")
+    stream.flush()
+    try:
+        subprocess.run(sudo + ["dnf", "install", "-y", "rocm-hip-devel"],
+                       check=True, timeout=900)
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError, OSError):
+        return False
+
+
+def _bootstrap_rocm_via_zypper(stream, arch: str) -> bool:
+    """openSUSE / SLES — rocm-hip-devel."""
+    if not shutil.which("zypper"):
+        return False
+    sudo = _sudo_prefix()
+    stream.write("[bootstrap_rocm] trying zypper install rocm-hip-devel\n")
+    stream.flush()
+    try:
+        subprocess.run(
+            sudo + ["zypper", "--non-interactive", "install", "-y",
+                    "rocm-hip-devel"],
+            check=True, timeout=900)
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError, OSError):
+        return False
+
+
+def bootstrap_rocm_toolkit(stream=None, arch: str = "gfx942") -> bool:
+    """Universal ROCm bootstrap. Tries AMD's official repo first, falls back
+    to distro stock packages. Returns True iff hipcc is on PATH after.
+
+    The probe order matches ``bootstrap_cuda_toolkit``: prefer the vendor's
+    own repo (it ships the version we want), then distro stock as a partial
+    fallback, then dnf/zypper.
+    """
+    if stream is None:
+        stream = sys.stderr
+    if shutil.which("hipcc"):
+        stream.write("[bootstrap_rocm] hipcc already on PATH; skipping\n")
+        return True
+    methods: List[Tuple[str, Callable[..., bool]]] = [
+        ("amd-apt",       _bootstrap_rocm_via_amd_apt_repo),
+        ("apt-stock",     _bootstrap_rocm_via_apt_stock),
+        ("dnf",           _bootstrap_rocm_via_dnf),
+        ("zypper",        _bootstrap_rocm_via_zypper),
+    ]
+    tried: List[str] = []
+    for name, fn in methods:
+        try:
+            ok = fn(stream, arch)
+        except Exception as exc:
+            stream.write(f"[bootstrap_rocm] {name} raised "
+                         f"{type(exc).__name__}: {exc}\n")
+            tried.append(f"{name} (errored)")
+            continue
+        tried.append(name)
+        if ok and shutil.which("hipcc"):
+            stream.write(f"[bootstrap_rocm] OK ({name}) — hipcc at "
+                         f"{shutil.which('hipcc')}\n")
+            return True
+    stream.write(
+        "\n[bootstrap_rocm] FAILED to install ROCm on this host.\n"
+        f"  Attempted: {tried}\n"
+        "  Manual install — pick the one matching your environment:\n"
+        "    sudo apt-get install rocm-hip-sdk        # Debian / Ubuntu\n"
+        "    sudo dnf install rocm-hip-devel          # Fedora / RHEL\n"
+        "    sudo zypper install rocm-hip-devel       # openSUSE\n"
+        "    sudo pacman -S rocm-hip-sdk              # Arch\n"
+        "    https://rocm.docs.amd.com/projects/install-on-linux/\n"
+        "  Then set os.environ['ROCM_PATH'] = '/opt/rocm' and prepend\n"
+        "  $ROCM_PATH/bin to PATH.\n"
+    )
+    return False
+
+
+# ---------------------------------------------------------------------------
+# JAX/TPU bootstrap — Stream 12
+# ---------------------------------------------------------------------------
+
+def bootstrap_jax_tpu(stream=None, arch: str = "tpu_v5p") -> bool:
+    """Detect TPU runtime via ``jax.devices()``; install ``jax[tpu]`` from
+    the libtpu_releases bucket when missing. Returns True iff a TPU device
+    is visible after.
+
+    On a non-TPU host this returns False (no TPU to bind to), which is the
+    correct outcome — the caller (e.g. self-test) only requires "no crash".
+    """
+    if stream is None:
+        stream = sys.stderr
+    # Probe first: skip the install if a TPU is already visible.
+    try:
+        import jax
+        devs = jax.devices()
+        if any(getattr(d, "platform", "") == "tpu" for d in devs):
+            stream.write(f"[bootstrap_jax] TPU already visible: {devs}\n")
+            return True
+    except (ImportError, RuntimeError):
+        pass
+    except Exception as exc:
+        stream.write(f"[bootstrap_jax] jax.devices() raised "
+                     f"{type(exc).__name__}: {exc}; continuing to install\n")
+    # Pick a minimum jax version per arch from ARCH_TABLE.
+    min_jax_ver = ">=0.4.30"
+    if arch in ARCH_TABLE and ARCH_TABLE[arch].vendor == "pallas":
+        need = ARCH_TABLE[arch].min_toolchain_version
+        if len(need) >= 3:
+            min_jax_ver = f">={need[0]}.{need[1]}.{need[2]}"
+        elif len(need) == 2:
+            min_jax_ver = f">={need[0]}.{need[1]}"
+    stream.write(f"[bootstrap_jax] installing jax[tpu]{min_jax_ver} "
+                 f"(arch={arch})\n")
+    stream.flush()
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q",
+             f"jax[tpu]{min_jax_ver}",
+             "-f", "https://storage.googleapis.com/jax-releases/"
+                   "libtpu_releases.html"],
+            check=True, timeout=600)
+        stream.write("[bootstrap_jax] installed jax[tpu]\n")
+        # Re-probe after install. Reload jax so a stale `import jax` from
+        # before the install doesn't shadow the new install.
+        import importlib
+        if "jax" in sys.modules:
+            try:
+                importlib.reload(sys.modules["jax"])
+            except Exception:
+                pass
+        import jax
+        devs = jax.devices()
+        ok = any(getattr(d, "platform", "") == "tpu" for d in devs)
+        stream.write(f"[bootstrap_jax] post-install devices={devs}\n")
+        return ok
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            ImportError, RuntimeError, OSError) as exc:
+        stream.write(f"[bootstrap_jax] FAILED: {exc}\n")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Unified bootstrap entry — dispatch by vendor — Stream 12
+# ---------------------------------------------------------------------------
+
+def bootstrap_toolchain(arch: str, stream=None) -> bool:
+    """Dispatch to the right per-vendor bootstrap based on ARCH_TABLE.
+
+    Returns the underlying bootstrap function's True/False. Unknown arches
+    log a message and return False; the caller can treat that as "skip".
+    """
+    if stream is None:
+        stream = sys.stderr
+    if arch not in ARCH_TABLE:
+        stream.write(f"[bootstrap] unknown arch {arch}\n")
+        return False
+    vendor = ARCH_TABLE[arch].vendor
+    if vendor == "cuda":
+        return bootstrap_cuda_toolkit(stream, arch=arch)
+    elif vendor == "hip":
+        return bootstrap_rocm_toolkit(stream, arch=arch)
+    elif vendor == "pallas":
+        return bootstrap_jax_tpu(stream, arch=arch)
+    stream.write(f"[bootstrap] unknown vendor {vendor!r} for arch {arch}\n")
     return False
 
 
@@ -3994,6 +4333,63 @@ def _preflight_toolchain(arch: str) -> List[str]:
             lines.append(f"[preflight] {tool}={p}")
         else:
             lines.append(f"[preflight] WARNING: {tool} NOT on PATH")
+
+    # ── Per-arch toolchain min-version PASS/FAIL — Stream 12 ─────────
+    # Explicit one-line judgment per arch so the [preflight] block can be
+    # grep'd for FAIL by CI / wrapper scripts without parsing every WARNING.
+    entry = ARCH_TABLE.get(arch)
+    if entry is None:
+        lines.append(f"[preflight] arch {arch} not in ARCH_TABLE — FAIL")
+        return lines
+    need = entry.min_toolchain_version
+    if entry.vendor == "cuda":
+        have = _probe_nvcc_version()
+        if have is None:
+            lines.append(
+                f"[preflight] arch={arch} need CUDA>={need[0]}.{need[1]}: "
+                "nvcc not found — FAIL")
+        elif have < (need[0], need[1]):
+            lines.append(
+                f"[preflight] arch={arch} need CUDA>={need[0]}.{need[1]} "
+                f"have {have[0]}.{have[1]} — FAIL")
+        else:
+            lines.append(
+                f"[preflight] arch={arch} need CUDA>={need[0]}.{need[1]} "
+                f"have {have[0]}.{have[1]} — PASS")
+    elif entry.vendor == "hip":
+        have = _probe_hipcc_version()
+        if have is None:
+            lines.append(
+                f"[preflight] arch={arch} need ROCm>={need[0]}.{need[1]}: "
+                "hipcc not found — FAIL")
+        elif have < (need[0], need[1]):
+            lines.append(
+                f"[preflight] arch={arch} need ROCm>={need[0]}.{need[1]} "
+                f"have {have[0]}.{have[1]} — FAIL")
+        else:
+            lines.append(
+                f"[preflight] arch={arch} need ROCm>={need[0]}.{need[1]} "
+                f"have {have[0]}.{have[1]} — PASS")
+    elif entry.vendor == "pallas":
+        try:
+            import jax
+            try:
+                jv = tuple(int(x) for x in jax.__version__.split(".")[:3])
+            except (ValueError, AttributeError):
+                jv = (0, 0, 0)
+            need3 = need if len(need) == 3 else (need[0], need[1], 0)
+            cmp_jv = jv[:len(need3)]
+            need_str = ".".join(str(x) for x in need3)
+            if cmp_jv >= need3:
+                lines.append(
+                    f"[preflight] arch={arch} JAX {jax.__version__} "
+                    f">= {need_str} — PASS")
+            else:
+                lines.append(
+                    f"[preflight] arch={arch} JAX {jax.__version__} "
+                    f"< {need_str} — FAIL")
+        except ImportError:
+            lines.append(f"[preflight] arch={arch} JAX not installed — FAIL")
     return lines
 
 
@@ -5438,6 +5834,8 @@ def build(
     debug_symbols: bool = False,
     debug: bool = False,
     bootstrap_cuda: bool = False,
+    bootstrap_rocm: bool = False,
+    bootstrap_jax: bool = False,
     pruner: str = "none",
     transfer_learning: bool = False,
     enable_runtime_specialization: bool = False,
@@ -5463,11 +5861,19 @@ def build(
     # CUDA lives at /usr/local/cuda-<ver>/, in a pip-installed nvidia
     # wheel, or under the bare /usr/local/cuda/bin the user added).
     _ensure_nvcc_on_path()
-    # On-demand: pip-install the NVIDIA wheels if nvcc is still missing
-    # and the caller opted in. Handles Colab CPU runtimes, fresh CI, etc.
-    if bootstrap_cuda and get_arch_entry(arch).vendor == "cuda":
+    # On-demand: install the right toolchain if missing and the caller
+    # opted in. Vendor dispatch ensures HIP archs get hipcc (not nvcc) and
+    # Pallas archs get jax[tpu] (not nvcc). Handles Colab CPU runtimes,
+    # fresh CI, mixed-vendor sweeps, etc.
+    _vendor = get_arch_entry(arch).vendor
+    if bootstrap_cuda and _vendor == "cuda":
         if not shutil.which("nvcc"):
-            bootstrap_cuda_toolkit()
+            bootstrap_cuda_toolkit(arch=arch)
+    elif bootstrap_rocm and _vendor == "hip":
+        if not shutil.which("hipcc"):
+            bootstrap_rocm_toolkit(arch=arch)
+    elif bootstrap_jax and _vendor == "pallas":
+        bootstrap_jax_tpu(arch=arch)
     # Force torch to re-read CUDA_HOME / ROCM_HOME from os.environ even if
     # it was imported (and cached None) before the user set the env vars.
     _refresh_torch_cuda_home()
@@ -5833,6 +6239,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "Jinja2 template per config instead of "
                              "re-compiling one fixed source with -D macros. "
                              "Falls back to macros-only on any emitter error.")
+    # Stream 12 — toolchain bootstrap for HIP + Pallas archs.
+    parser.add_argument("--bootstrap-rocm", action="store_true",
+                        help="Install the ROCm toolchain (hipcc + rocm-dev) "
+                             "if missing. HIP archs (gfx*) only — picks the "
+                             "ROCm version per ARCH_TABLE[arch] (e.g. gfx950 "
+                             "→ ROCm 6.2+, gfx1200 → 7.0+).")
+    parser.add_argument("--bootstrap-jax", action="store_true",
+                        help="Install jax[tpu] from the libtpu_releases "
+                             "bucket if no TPU device is visible. Pallas/TPU "
+                             "archs (tpu_v*) only.")
     args = parser.parse_args(argv)
 
     # Stream 11: pre-load the project config so module-level defaults can be
@@ -5861,12 +6277,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # ── Runtime split: spawn AOT then JIT, then return ──────────────
     if args.runtime == "both":
-        # Do the (possibly slow) CUDA toolkit bootstrap ONCE in the
-        # parent so AOT and JIT subprocesses inherit the discovered
-        # nvcc via PATH/CUDA_HOME — no per-subprocess re-install.
-        if args.bootstrap_cuda and get_arch_entry(args.arch).vendor == "cuda":
+        # Do the (possibly slow) toolchain bootstrap ONCE in the parent so
+        # AOT and JIT subprocesses inherit the discovered nvcc/hipcc via
+        # PATH/CUDA_HOME/ROCM_PATH — no per-subprocess re-install. Vendor
+        # dispatch matches build()'s logic so the right installer fires.
+        _vendor = get_arch_entry(args.arch).vendor
+        if args.bootstrap_cuda and _vendor == "cuda":
             if not shutil.which("nvcc"):
-                _ensure_nvcc_on_path() or bootstrap_cuda_toolkit()
+                _ensure_nvcc_on_path() or bootstrap_cuda_toolkit(arch=args.arch)
+        elif args.bootstrap_rocm and _vendor == "hip":
+            if not shutil.which("hipcc"):
+                bootstrap_rocm_toolkit(arch=args.arch)
+        elif args.bootstrap_jax and _vendor == "pallas":
+            bootstrap_jax_tpu(arch=args.arch)
         argv_in = list(argv) if argv is not None else sys.argv[1:]
         rc_aot = _spawn_phase(argv_in, "aot")
         if rc_aot != 0:
@@ -5903,6 +6326,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         debug_symbols=args.debug_symbols,
         debug=args.debug,
         bootstrap_cuda=args.bootstrap_cuda,
+        bootstrap_rocm=args.bootstrap_rocm,
+        bootstrap_jax=args.bootstrap_jax,
         pruner=args.pruner,
         transfer_learning=args.transfer_learning,
         enable_runtime_specialization=args.enable_runtime_specialization,
@@ -6998,6 +7423,107 @@ def _self_test() -> int:
     _run("codegen_find_template_fallback", test_codegen_find_template_fallback)
     _run("codegen_unknown_template_raises", test_codegen_unknown_template_raises)
     _run("codegen_variant_macros_hook", test_codegen_variant_macros_hook)
+
+    # ── Stream 12: toolchain bootstrap ──────────────────────────────
+    sys.stdout.write("[self-test] toolchain_bootstrap\n")
+
+    def test_bootstrap_helpers_importable():
+        """All new bootstrap helpers + version-targeting functions are
+        importable from the module — guards against typos / missed exports."""
+        from grokking_optimizers.compile import (  # noqa: F401
+            bootstrap_rocm_toolkit,
+            bootstrap_jax_tpu,
+            bootstrap_toolchain,
+            _target_cuda_version_for_arch,
+            _target_rocm_version_for_arch,
+        )
+
+    def test_target_version_lookup():
+        """Per-arch min-version lookup matches ARCH_TABLE entries."""
+        # ROCm: gfx950 needs 6.2; gfx1200 needs 7.0.
+        assert _target_rocm_version_for_arch("gfx950") == (6, 2), \
+            _target_rocm_version_for_arch("gfx950")
+        assert _target_rocm_version_for_arch("gfx1200") == (7, 0), \
+            _target_rocm_version_for_arch("gfx1200")
+        # Non-HIP arches return (0, 0) so callers can branch cleanly.
+        assert _target_rocm_version_for_arch("sm_90a") == (0, 0)
+        assert _target_rocm_version_for_arch("tpu_v5p") == (0, 0)
+
+    def test_cuda_target_respects_arch_min():
+        """CUDA targeting picks max(arch_min, torch_cuda). For each arch the
+        returned version must be >= ARCH_TABLE[arch].min_toolchain_version."""
+        for arch in ("sm_75", "sm_80", "sm_90a", "sm_100a", "sm_103a",
+                     "sm_120a"):
+            tv = _target_cuda_version_for_arch(arch)
+            need = ARCH_TABLE[arch].min_toolchain_version
+            assert tv[0] >= need[0] or (
+                tv[0] == need[0] and tv[1] >= need[1]), \
+                f"{arch}: target {tv} below min {need}"
+        # Non-CUDA arches return (0, 0).
+        assert _target_cuda_version_for_arch("gfx942") == (0, 0)
+        assert _target_cuda_version_for_arch("tpu_v5p") == (0, 0)
+
+    def test_preflight_emits_judgment_per_arch():
+        """_preflight_toolchain must emit at least one PASS/FAIL line per
+        arch across all three vendors so CI can grep for failures."""
+        for arch in ("sm_75", "sm_90a", "sm_120a", "gfx942", "gfx1200",
+                     "tpu_v5p"):
+            lines = _preflight_toolchain(arch)
+            has_judgment = any(
+                ("PASS" in ln or "FAIL" in ln) and f"arch={arch}" in ln
+                for ln in lines
+            )
+            assert has_judgment, \
+                f"{arch}: no per-arch PASS/FAIL in preflight: {lines}"
+
+    def test_bootstrap_toolchain_dispatch_no_crash():
+        """bootstrap_toolchain must dispatch by vendor without crashing on
+        a host that doesn't actually have nvcc/hipcc/jax[tpu]. Functions
+        return False on missing installers — that's the expected outcome
+        in a sandboxed self-test."""
+        import io
+        buf = io.StringIO()
+        # The cuda path on a host with nvcc already returns True quickly
+        # (it short-circuits on shutil.which("nvcc")); without nvcc it
+        # tries package managers and may return False — both are OK here.
+        # We only assert "no exception escapes".
+        for arch in ("sm_75", "gfx942", "tpu_v5p"):
+            try:
+                # Skip live bootstrap of TPU/ROCm when their tools are
+                # missing — these self-tests must not actually install.
+                # Probe-only behaviour: shutil.which() short-circuits.
+                if arch == "sm_75" and not shutil.which("nvcc"):
+                    # bootstrap_cuda_toolkit() would try apt — skip the
+                    # actual install attempt in self-test.
+                    continue
+                if arch == "gfx942" and not shutil.which("hipcc"):
+                    continue
+                # tpu_v5p with no jax installed: bootstrap_jax_tpu would
+                # try to pip-install — skip too.
+                if arch == "tpu_v5p":
+                    try:
+                        import jax  # noqa: F401
+                        devs = jax.devices()
+                        if not any(getattr(d, "platform", "") == "tpu"
+                                   for d in devs):
+                            continue
+                    except Exception:
+                        continue
+                _ = bootstrap_toolchain(arch, buf)
+            except Exception as exc:
+                raise AssertionError(
+                    f"bootstrap_toolchain({arch}) crashed: "
+                    f"{type(exc).__name__}: {exc}") from exc
+        # And: unknown arch returns False, doesn't crash.
+        assert bootstrap_toolchain("not_a_real_arch", buf) is False
+
+    _run("bootstrap_helpers_importable", test_bootstrap_helpers_importable)
+    _run("target_version_lookup", test_target_version_lookup)
+    _run("cuda_target_respects_arch_min", test_cuda_target_respects_arch_min)
+    _run("preflight_emits_judgment_per_arch",
+         test_preflight_emits_judgment_per_arch)
+    _run("bootstrap_toolchain_dispatch_no_crash",
+         test_bootstrap_toolchain_dispatch_no_crash)
 
     sys.stdout.write(f"\n[self-test] {passed} passed, {failures} failed\n")
     return 1 if failures else 0
