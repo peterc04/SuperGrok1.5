@@ -140,7 +140,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from grokking_optimizers.profile import (
-    ARCH_INFO,
     ARCHES,
     MODELS,
     NCPUS,
@@ -152,6 +151,8 @@ from grokking_optimizers.profile import (
     env_overlay,
     make_progress,
 )
+# ARCH_INFO / ARCH_TABLE are defined later in this file (single source of
+# truth); profile.py imports them lazily to avoid a circular import.
 
 import itertools
 import math
@@ -165,6 +166,660 @@ CACHE_VERSION = 3
 DEFAULT_CACHE_NAME = ".compile_cache.json"
 DEFAULT_PGO_WORKLOAD = Path(__file__).resolve()  # absorbed from scripts/pgo_workload.py
 JIT_CACHE_FLUSH_EVERY = 5   # save cache every N completed JIT trials
+
+
+# ---------------------------------------------------------------------------
+# ARCH_TABLE — single source of truth for every GPU / TPU architecture
+# ---------------------------------------------------------------------------
+#
+# Every codepath that needs to know "what arch are we building for?" reads
+# from this table. The previous design had three separate sources (the
+# ``ARCH_INFO`` dict in profile.py, the ``min_cuda_for_arch`` dict in
+# _preflight_toolchain, and hardcoded `-gencode=arch=compute_90,code=sm_90`
+# / ``--offload-arch=gfx942`` strings in NVCC_DEVICE_BASE / HIPCC_DEVICE_BASE).
+# Adding a new arch meant editing all three plus a handful of ``if arch ==
+# "sm_90"`` branches scattered through the file. ARCH_TABLE collapses all of
+# that into one declarative dataclass per arch.
+#
+# Per-arch search-space builders are wired in *after* ``_sm90_full_space``
+# / ``_gfx942_full_space`` are defined (further down in this file). Other
+# archs leave ``search_space_builder=None`` until Stream 2 fills them in;
+# this is intentional and not a bug.
+
+from dataclasses import dataclass, field  # noqa: E402  (re-import for clarity)
+
+
+@dataclass
+class ArchEntry:
+    """Declarative spec for one GPU/TPU architecture.
+
+    Every consumer in compile.py / profile.py reads from this; never
+    hardcode arch-specific behaviour outside this table.
+    """
+    vendor: str                                # "cuda" | "hip" | "pallas"
+    display_name: str
+    subdir: str
+    launcher_glob: Tuple[str, ...]
+    model_glob: Tuple[str, ...]
+    macro: str                                 # SG_BUILD_ARCH_*
+    host_define: Optional[str]                 # WITH_CUDA / WITH_HIP / None
+    min_toolchain_version: Tuple[int, ...]     # (M, m) CUDA/ROCm; (M, m, p) JAX
+    arch_suffix: str                           # "a" for Hopper/Blackwell, else ""
+    nvcc_gencode: List[str]                    # per-arch -gencode flags (empty for non-CUDA)
+    hipcc_offload_arch: str                    # e.g. "gfx942"; "" for non-HIP
+    cutlass_arch: Optional[int]                # CUTLASS_ARCH_MMA_SM* int; None for non-CUDA
+    max_smem_per_block: Optional[int]          # bytes (CUDA smem / HIP LDS); None for Pallas
+    warp_size: Optional[int]                   # 32 CUDA/RDNA, 64 CDNA, None Pallas
+    max_regs_per_thread: Optional[int]         # 255 CUDA/HIP, None Pallas
+    max_threads_per_block: Optional[int]       # 1024 CUDA/HIP, None Pallas
+    features: frozenset                        # capability flag strings (see docstring)
+    search_space_builder: Optional[Callable[[], Dict[str, Any]]] = None
+
+
+# ---- NVCC gencode helper -------------------------------------------------
+#
+# For each CUDA arch we emit two -gencode flags:
+#   1. compute_XX[a],code=sm_XX[a]  — SASS for the target SM
+#   2. compute_XX,code=compute_XX   — PTX fallback so older drivers can JIT
+#      forward to newer hardware that didn't exist at compile time.
+# The "a" suffix on Hopper+ tells NVCC to emit arch-specific instructions
+# (TMA, wgmma, tcgen05 etc.) that the non-"a" variant rejects.
+
+def _nvcc_gencode_pair(num: int, suffix: str = "") -> List[str]:
+    sm = f"sm_{num}{suffix}"
+    compute = f"compute_{num}{suffix}"
+    compute_fallback = f"compute_{num}"   # PTX fallback is always non-"a"
+    return [
+        f"-gencode=arch={compute},code={sm}",
+        f"-gencode=arch={compute_fallback},code={compute_fallback}",
+    ]
+
+
+# ---- Feature-flag mnemonics (see ARCH_TABLE.features) --------------------
+#
+# tma, wgmma, cluster ......... Hopper (sm_90a) async-copy + cluster launch
+# fp8 ........................ Ada (sm_89) / Blackwell / RDNA4
+# fp4, tcgen05 ............... Blackwell datacenter (sm_100a/103a)
+# mfma ....................... CDNA matrix-fused-multiply-add
+# bf16_mfma / fp8_mfma / fp4_mfma ... CDNA2/3/4 type-specific MFMA
+# wmma ....................... RDNA wave-matrix-multiply-accumulate
+# sparsecore ................. TPU sparse embedding co-processor
+# async_copy ................. cp.async (Ampere+)
+# dpp, tgsplit ............... RDNA wave32 primitives
+# cuda_graph, cooperative_groups, dyn_parallelism ... universal CUDA features
+
+# Tuple form of feature flags used to build frozensets compactly below.
+_F_BASE_CUDA = ("cuda_graph", "cooperative_groups", "dyn_parallelism")
+_F_AMPERE    = _F_BASE_CUDA + ("async_copy", "bf16")
+_F_ADA       = _F_AMPERE + ("fp8",)
+_F_HOPPER    = _F_ADA + ("tma", "wgmma", "cluster")
+_F_BLACKWELL = _F_HOPPER + ("fp4", "tcgen05")
+_F_BLACKWELL_CONSUMER = _F_ADA + ("fp4",)     # sm_120a: fp8+fp4, no tma/wgmma/cluster
+
+
+_ARCH_TABLE_PRIMARY: Dict[str, ArchEntry] = {
+
+    # =================== NVIDIA / CUDA ===================
+    "sm_75": ArchEntry(
+        vendor="cuda",
+        display_name="NVIDIA T4 (Turing)",
+        subdir="cuda/sm_75",
+        launcher_glob=("launch_*.cu",),
+        model_glob=("*.cu",),
+        macro="SG_BUILD_ARCH_SM75",
+        host_define="WITH_CUDA",
+        min_toolchain_version=(10, 0),
+        arch_suffix="",
+        nvcc_gencode=_nvcc_gencode_pair(75),
+        hipcc_offload_arch="",
+        cutlass_arch=75,
+        max_smem_per_block=100 * 1024,
+        warp_size=32,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset(_F_BASE_CUDA),
+    ),
+
+    "sm_80": ArchEntry(
+        vendor="cuda",
+        display_name="NVIDIA A100 (Ampere)",
+        subdir="cuda/sm_80",
+        launcher_glob=("launch_*.cu",),
+        model_glob=("*.cu",),
+        macro="SG_BUILD_ARCH_SM80",
+        host_define="WITH_CUDA",
+        min_toolchain_version=(11, 0),
+        arch_suffix="",
+        nvcc_gencode=_nvcc_gencode_pair(80),
+        hipcc_offload_arch="",
+        cutlass_arch=80,
+        max_smem_per_block=164 * 1024,
+        warp_size=32,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset(_F_AMPERE),
+    ),
+
+    "sm_86": ArchEntry(
+        vendor="cuda",
+        display_name="NVIDIA A10/RTX 30xx (Ampere)",
+        subdir="cuda/sm_86",
+        launcher_glob=("launch_*.cu",),
+        model_glob=("*.cu",),
+        macro="SG_BUILD_ARCH_SM86",
+        host_define="WITH_CUDA",
+        min_toolchain_version=(11, 1),
+        arch_suffix="",
+        nvcc_gencode=_nvcc_gencode_pair(86),
+        hipcc_offload_arch="",
+        cutlass_arch=86,
+        max_smem_per_block=164 * 1024,
+        warp_size=32,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset(_F_AMPERE),
+    ),
+
+    "sm_89": ArchEntry(
+        vendor="cuda",
+        display_name="NVIDIA L4/L40/RTX 40xx (Ada Lovelace)",
+        subdir="cuda/sm_89",
+        launcher_glob=("launch_*.cu",),
+        model_glob=("*.cu",),
+        macro="SG_BUILD_ARCH_SM89",
+        host_define="WITH_CUDA",
+        min_toolchain_version=(11, 8),
+        arch_suffix="",
+        nvcc_gencode=_nvcc_gencode_pair(89),
+        hipcc_offload_arch="",
+        cutlass_arch=89,
+        max_smem_per_block=164 * 1024,
+        warp_size=32,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset(_F_ADA),
+    ),
+
+    "sm_90a": ArchEntry(
+        vendor="cuda",
+        display_name="NVIDIA H100/H200 (Hopper)",
+        subdir="cuda/sm_90",
+        launcher_glob=("launch_*.cu",),
+        model_glob=("*.cu",),
+        macro="SG_BUILD_ARCH_SM90",
+        host_define="WITH_CUDA",
+        min_toolchain_version=(12, 0),
+        arch_suffix="a",
+        nvcc_gencode=_nvcc_gencode_pair(90, "a"),
+        hipcc_offload_arch="",
+        cutlass_arch=90,
+        max_smem_per_block=228 * 1024,
+        warp_size=32,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset(_F_HOPPER),
+    ),
+
+    "sm_100a": ArchEntry(
+        vendor="cuda",
+        display_name="NVIDIA B100/B200/GB200 (Blackwell)",
+        subdir="cuda/sm_100",
+        launcher_glob=("launch_*.cu",),
+        model_glob=("*.cu",),
+        macro="SG_BUILD_ARCH_SM100",
+        host_define="WITH_CUDA",
+        min_toolchain_version=(12, 8),
+        arch_suffix="a",
+        nvcc_gencode=_nvcc_gencode_pair(100, "a"),
+        hipcc_offload_arch="",
+        cutlass_arch=100,
+        max_smem_per_block=232 * 1024,
+        warp_size=32,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset(_F_BLACKWELL),
+    ),
+
+    "sm_103a": ArchEntry(
+        vendor="cuda",
+        display_name="NVIDIA B300 (Blackwell Ultra)",
+        subdir="cuda/sm_103",
+        launcher_glob=("launch_*.cu",),
+        model_glob=("*.cu",),
+        macro="SG_BUILD_ARCH_SM103",
+        host_define="WITH_CUDA",
+        min_toolchain_version=(12, 9),
+        arch_suffix="a",
+        nvcc_gencode=_nvcc_gencode_pair(103, "a"),
+        hipcc_offload_arch="",
+        cutlass_arch=103,
+        max_smem_per_block=232 * 1024,
+        warp_size=32,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset(_F_BLACKWELL),
+    ),
+
+    "sm_120a": ArchEntry(
+        vendor="cuda",
+        display_name="NVIDIA RTX 50xx / RTX 6000 Pro Blackwell (consumer)",
+        subdir="cuda/sm_120",
+        launcher_glob=("launch_*.cu",),
+        model_glob=("*.cu",),
+        macro="SG_BUILD_ARCH_SM120",
+        host_define="WITH_CUDA",
+        min_toolchain_version=(12, 8),
+        arch_suffix="a",
+        nvcc_gencode=_nvcc_gencode_pair(120, "a"),
+        hipcc_offload_arch="",
+        cutlass_arch=120,
+        max_smem_per_block=100 * 1024,
+        warp_size=32,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset(_F_BLACKWELL_CONSUMER),
+    ),
+
+    # =================== AMD / HIP / ROCm ===================
+    "gfx906": ArchEntry(
+        vendor="hip",
+        display_name="AMD MI50 (Vega20)",
+        subdir="hip/gfx906",
+        launcher_glob=("launch_*.hip.cpp", "launch_*.hip"),
+        model_glob=("*.hip.cpp",),
+        macro="SG_BUILD_ARCH_GFX906",
+        host_define="WITH_HIP",
+        min_toolchain_version=(3, 0),
+        arch_suffix="",
+        nvcc_gencode=[],
+        hipcc_offload_arch="gfx906",
+        cutlass_arch=None,
+        max_smem_per_block=64 * 1024,
+        warp_size=64,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset({"mfma"}),
+    ),
+
+    "gfx908": ArchEntry(
+        vendor="hip",
+        display_name="AMD MI100 (CDNA1)",
+        subdir="hip/gfx908",
+        launcher_glob=("launch_*.hip.cpp", "launch_*.hip"),
+        model_glob=("*.hip.cpp",),
+        macro="SG_BUILD_ARCH_GFX908",
+        host_define="WITH_HIP",
+        min_toolchain_version=(3, 5),
+        arch_suffix="",
+        nvcc_gencode=[],
+        hipcc_offload_arch="gfx908",
+        cutlass_arch=None,
+        max_smem_per_block=64 * 1024,
+        warp_size=64,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset({"mfma", "bf16_mfma"}),
+    ),
+
+    "gfx90a": ArchEntry(
+        vendor="hip",
+        display_name="AMD MI200/MI250 (CDNA2)",
+        subdir="hip/gfx90a",
+        launcher_glob=("launch_*.hip.cpp", "launch_*.hip"),
+        model_glob=("*.hip.cpp",),
+        macro="SG_BUILD_ARCH_GFX90A",
+        host_define="WITH_HIP",
+        min_toolchain_version=(4, 5),
+        arch_suffix="",
+        nvcc_gencode=[],
+        hipcc_offload_arch="gfx90a",
+        cutlass_arch=None,
+        max_smem_per_block=64 * 1024,
+        warp_size=64,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset({"mfma", "bf16_mfma", "mfma_xdl"}),
+    ),
+
+    "gfx942": ArchEntry(
+        vendor="hip",
+        display_name="AMD MI300X/MI300A (CDNA3)",
+        subdir="hip/gfx942",
+        launcher_glob=("launch_*.hip.cpp", "launch_*.hip"),
+        model_glob=("*.hip.cpp",),
+        macro="SG_BUILD_ARCH_GFX942",
+        host_define="WITH_HIP",
+        min_toolchain_version=(6, 0),
+        arch_suffix="",
+        nvcc_gencode=[],
+        hipcc_offload_arch="gfx942",
+        cutlass_arch=None,
+        max_smem_per_block=64 * 1024,
+        warp_size=64,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset({"mfma", "bf16_mfma", "fp8_mfma", "mfma_xdl"}),
+    ),
+
+    "gfx950": ArchEntry(
+        vendor="hip",
+        display_name="AMD MI350X/MI355X (CDNA4)",
+        subdir="hip/gfx950",
+        launcher_glob=("launch_*.hip.cpp", "launch_*.hip"),
+        model_glob=("*.hip.cpp",),
+        macro="SG_BUILD_ARCH_GFX950",
+        host_define="WITH_HIP",
+        min_toolchain_version=(6, 2),
+        arch_suffix="",
+        nvcc_gencode=[],
+        hipcc_offload_arch="gfx950",
+        cutlass_arch=None,
+        max_smem_per_block=64 * 1024,
+        warp_size=64,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset({"mfma", "bf16_mfma", "fp8_mfma", "fp4_mfma",
+                            "mfma_xdl", "mfma_4x_smfmac"}),
+    ),
+
+    "gfx1030": ArchEntry(
+        vendor="hip",
+        display_name="AMD RX 6000 (RDNA2)",
+        subdir="hip/gfx1030",
+        launcher_glob=("launch_*.hip.cpp", "launch_*.hip"),
+        model_glob=("*.hip.cpp",),
+        macro="SG_BUILD_ARCH_GFX1030",
+        host_define="WITH_HIP",
+        min_toolchain_version=(4, 0),
+        arch_suffix="",
+        nvcc_gencode=[],
+        hipcc_offload_arch="gfx1030",
+        cutlass_arch=None,
+        max_smem_per_block=64 * 1024,
+        warp_size=32,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset({"wmma"}),
+    ),
+
+    "gfx1100": ArchEntry(
+        vendor="hip",
+        display_name="AMD RX 7900 (RDNA3)",
+        subdir="hip/gfx1100",
+        launcher_glob=("launch_*.hip.cpp", "launch_*.hip"),
+        model_glob=("*.hip.cpp",),
+        macro="SG_BUILD_ARCH_GFX1100",
+        host_define="WITH_HIP",
+        min_toolchain_version=(5, 5),
+        arch_suffix="",
+        nvcc_gencode=[],
+        hipcc_offload_arch="gfx1100",
+        cutlass_arch=None,
+        max_smem_per_block=64 * 1024,
+        warp_size=32,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset({"wmma", "dpp", "tgsplit"}),
+    ),
+
+    "gfx1101": ArchEntry(
+        vendor="hip",
+        display_name="AMD RX 7800 (RDNA3)",
+        subdir="hip/gfx1101",
+        launcher_glob=("launch_*.hip.cpp", "launch_*.hip"),
+        model_glob=("*.hip.cpp",),
+        macro="SG_BUILD_ARCH_GFX1101",
+        host_define="WITH_HIP",
+        min_toolchain_version=(5, 5),
+        arch_suffix="",
+        nvcc_gencode=[],
+        hipcc_offload_arch="gfx1101",
+        cutlass_arch=None,
+        max_smem_per_block=64 * 1024,
+        warp_size=32,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset({"wmma", "dpp", "tgsplit"}),
+    ),
+
+    "gfx1102": ArchEntry(
+        vendor="hip",
+        display_name="AMD RX 7600 (RDNA3)",
+        subdir="hip/gfx1102",
+        launcher_glob=("launch_*.hip.cpp", "launch_*.hip"),
+        model_glob=("*.hip.cpp",),
+        macro="SG_BUILD_ARCH_GFX1102",
+        host_define="WITH_HIP",
+        min_toolchain_version=(5, 5),
+        arch_suffix="",
+        nvcc_gencode=[],
+        hipcc_offload_arch="gfx1102",
+        cutlass_arch=None,
+        max_smem_per_block=64 * 1024,
+        warp_size=32,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset({"wmma", "dpp", "tgsplit"}),
+    ),
+
+    "gfx1151": ArchEntry(
+        vendor="hip",
+        display_name="AMD Strix Halo (RDNA3.5)",
+        subdir="hip/gfx1151",
+        launcher_glob=("launch_*.hip.cpp", "launch_*.hip"),
+        model_glob=("*.hip.cpp",),
+        macro="SG_BUILD_ARCH_GFX1151",
+        host_define="WITH_HIP",
+        min_toolchain_version=(6, 1),
+        arch_suffix="",
+        nvcc_gencode=[],
+        hipcc_offload_arch="gfx1151",
+        cutlass_arch=None,
+        max_smem_per_block=64 * 1024,
+        warp_size=32,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset({"wmma", "dpp", "tgsplit"}),
+    ),
+
+    "gfx1200": ArchEntry(
+        vendor="hip",
+        display_name="AMD RX 9000 (RDNA4)",
+        subdir="hip/gfx1200",
+        launcher_glob=("launch_*.hip.cpp", "launch_*.hip"),
+        model_glob=("*.hip.cpp",),
+        macro="SG_BUILD_ARCH_GFX1200",
+        host_define="WITH_HIP",
+        min_toolchain_version=(7, 0),
+        arch_suffix="",
+        nvcc_gencode=[],
+        hipcc_offload_arch="gfx1200",
+        cutlass_arch=None,
+        max_smem_per_block=64 * 1024,
+        warp_size=32,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset({"wmma", "dpp", "tgsplit", "fp8"}),
+    ),
+
+    "gfx1201": ArchEntry(
+        vendor="hip",
+        display_name="AMD RX 9070 (RDNA4)",
+        subdir="hip/gfx1201",
+        launcher_glob=("launch_*.hip.cpp", "launch_*.hip"),
+        model_glob=("*.hip.cpp",),
+        macro="SG_BUILD_ARCH_GFX1201",
+        host_define="WITH_HIP",
+        min_toolchain_version=(7, 0),
+        arch_suffix="",
+        nvcc_gencode=[],
+        hipcc_offload_arch="gfx1201",
+        cutlass_arch=None,
+        max_smem_per_block=64 * 1024,
+        warp_size=32,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset({"wmma", "dpp", "tgsplit", "fp8"}),
+    ),
+
+    # =================== Google / Pallas / XLA / Mosaic ===================
+    "tpu_v4": ArchEntry(
+        vendor="pallas",
+        display_name="Google TPU v4",
+        subdir="pallas",
+        launcher_glob=("launch_*.py",),
+        model_glob=(),
+        macro="SG_BUILD_ARCH_TPU_V4",
+        host_define=None,
+        min_toolchain_version=(0, 4, 0),
+        arch_suffix="",
+        nvcc_gencode=[],
+        hipcc_offload_arch="",
+        cutlass_arch=None,
+        max_smem_per_block=None,
+        warp_size=None,
+        max_regs_per_thread=None,
+        max_threads_per_block=None,
+        features=frozenset(),
+    ),
+
+    "tpu_v5e": ArchEntry(
+        vendor="pallas",
+        display_name="Google TPU v5e",
+        subdir="pallas",
+        launcher_glob=("launch_*.py",),
+        model_glob=(),
+        macro="SG_BUILD_ARCH_TPU_V5E",
+        host_define=None,
+        min_toolchain_version=(0, 4, 0),
+        arch_suffix="",
+        nvcc_gencode=[],
+        hipcc_offload_arch="",
+        cutlass_arch=None,
+        max_smem_per_block=None,
+        warp_size=None,
+        max_regs_per_thread=None,
+        max_threads_per_block=None,
+        features=frozenset(),
+    ),
+
+    "tpu_v5p": ArchEntry(
+        vendor="pallas",
+        display_name="Google TPU v5p",
+        subdir="pallas",
+        launcher_glob=("launch_*.py",),
+        model_glob=(),
+        macro="SG_BUILD_ARCH_TPU_V5P",
+        host_define=None,
+        min_toolchain_version=(0, 4, 0),
+        arch_suffix="",
+        nvcc_gencode=[],
+        hipcc_offload_arch="",
+        cutlass_arch=None,
+        max_smem_per_block=None,
+        warp_size=None,
+        max_regs_per_thread=None,
+        max_threads_per_block=None,
+        features=frozenset({"sparsecore"}),
+    ),
+
+    "tpu_v6e": ArchEntry(
+        vendor="pallas",
+        display_name="Google TPU v6e (Trillium)",
+        subdir="pallas",
+        launcher_glob=("launch_*.py",),
+        model_glob=(),
+        macro="SG_BUILD_ARCH_TPU_V6E",
+        host_define=None,
+        min_toolchain_version=(0, 4, 30),
+        arch_suffix="",
+        nvcc_gencode=[],
+        hipcc_offload_arch="",
+        cutlass_arch=None,
+        max_smem_per_block=None,
+        warp_size=None,
+        max_regs_per_thread=None,
+        max_threads_per_block=None,
+        features=frozenset(),
+    ),
+
+    "tpu_v7": ArchEntry(
+        vendor="pallas",
+        display_name="Google TPU v7 (Ironwood)",
+        subdir="pallas",
+        launcher_glob=("launch_*.py",),
+        model_glob=(),
+        macro="SG_BUILD_ARCH_TPU_V7",
+        host_define=None,
+        min_toolchain_version=(0, 5, 0),
+        arch_suffix="",
+        nvcc_gencode=[],
+        hipcc_offload_arch="",
+        cutlass_arch=None,
+        max_smem_per_block=None,
+        warp_size=None,
+        max_regs_per_thread=None,
+        max_threads_per_block=None,
+        features=frozenset(),
+    ),
+}
+
+
+# ---- Backward-compat aliases (canonical -> alias) ------------------------
+# Users typing "--arch sm_90" continue to work; the canonical entry is the
+# "a"-suffixed variant. Both keys map to the SAME ArchEntry object, so
+# later patches (e.g. ``search_space_builder=_sm90_full_space``) propagate
+# transparently. Tested by test_arch_table_completeness below.
+_ARCH_TABLE_ALIASES: Dict[str, str] = {
+    "sm_90":  "sm_90a",
+    "sm_100": "sm_100a",
+    "sm_103": "sm_103a",
+    "sm_120": "sm_120a",
+}
+
+
+# Full ARCH_TABLE with both canonical and alias keys pointing at the same
+# ArchEntry instances. Order: primary entries first, then aliases.
+ARCH_TABLE: Dict[str, ArchEntry] = {
+    **_ARCH_TABLE_PRIMARY,
+    **{alias: _ARCH_TABLE_PRIMARY[canonical]
+       for alias, canonical in _ARCH_TABLE_ALIASES.items()},
+}
+
+
+# ---- Legacy 6-key view (ARCH_INFO) — keep all old call sites working -----
+# Every read like ``ARCH_INFO[arch]["vendor"]`` continues to resolve. The
+# derived dict is built from ARCH_TABLE so it stays in sync; profile.py
+# imports this shim instead of defining its own ARCH_INFO.
+def _build_legacy_arch_info() -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for arch, entry in ARCH_TABLE.items():
+        out[arch] = {
+            "vendor":        entry.vendor,
+            "subdir":        entry.subdir,
+            "launcher_glob": entry.launcher_glob,
+            "model_glob":    entry.model_glob,
+            "macro":         entry.macro,
+            "host_define":   entry.host_define,
+        }
+    return out
+
+
+ARCH_INFO: Dict[str, Dict[str, Any]] = _build_legacy_arch_info()
+
+
+def get_arch_entry(arch: str) -> ArchEntry:
+    """Look up the ArchEntry for ``arch``, resolving aliases.
+
+    Raises KeyError with the list of valid arches if the lookup fails.
+    """
+    try:
+        return ARCH_TABLE[arch]
+    except KeyError:
+        raise KeyError(
+            f"arch={arch!r} not in ARCH_TABLE; "
+            f"valid: {sorted(ARCH_TABLE.keys())}")
+
 
 # How many trials Bayesian "quick" mode runs (vs the full 500 default).
 QUICK_BAYESIAN_TRIALS = 25
@@ -348,6 +1003,13 @@ def build_full_search_space() -> Dict[str, Any]:
         "gfx942":  _gfx942_full_space(),
         "tpu_v5p": {"dims": [], "prefilter": {"rules": []}},
     }
+
+
+# Wire the existing search-space builders into the ARCH_TABLE entries.
+# Stream 2 owns extending these to the rest of the arches; the assignment
+# propagates through aliases because both keys reference the same ArchEntry.
+ARCH_TABLE["sm_90a"].search_space_builder = _sm90_full_space
+ARCH_TABLE["gfx942"].search_space_builder = _gfx942_full_space
 
 
 # ---------------------------------------------------------------------------
@@ -704,12 +1366,15 @@ def instrument_flags(
         "-fprofile-update=atomic",
     ]
     d: List[str] = list(device_cflags)
-    if arch == "sm_90":
+    entry = get_arch_entry(arch) if arch in ARCH_TABLE else None
+    if entry is not None and entry.vendor == "cuda":
+        # NVCC needs -Xcompiler to forward flags to the host compiler.
         d += [
             "-Xcompiler", f"-fprofile-generate={profile_dir}",
             "-Xcompiler", "-fprofile-update=atomic",
         ]
-    elif arch == "gfx942":
+    elif entry is not None and entry.vendor == "hip":
+        # HIPCC drives clang directly; flags pass straight through.
         d += [
             f"-fprofile-generate={profile_dir}",
             "-fprofile-update=atomic",
@@ -733,12 +1398,13 @@ def use_flags(
         "-fprofile-correction",
     ]
     d: List[str] = list(device_cflags)
-    if arch == "sm_90":
+    entry = get_arch_entry(arch) if arch in ARCH_TABLE else None
+    if entry is not None and entry.vendor == "cuda":
         d += [
             "-Xcompiler", f"-fprofile-use={profile_dir}",
             "-Xcompiler", "-fprofile-correction",
         ]
-    elif arch == "gfx942":
+    elif entry is not None and entry.vendor == "hip":
         d += [
             f"-fprofile-use={profile_dir}",
             "-fprofile-correction",
@@ -2546,7 +3212,7 @@ def _preflight_toolchain(arch: str) -> List[str]:
     so they can spot a missing dependency before waiting for the build
     to fail."""
     lines: List[str] = []
-    vendor = ARCH_INFO[arch]["vendor"]
+    vendor = get_arch_entry(arch).vendor
     lines.append(f"[preflight] arch={arch} vendor={vendor}")
 
     if vendor == "cuda":
@@ -2563,14 +3229,11 @@ def _preflight_toolchain(arch: str) -> List[str]:
                     lines.append(f"[preflight] {out[-1]}")
             except Exception:
                 pass
-            # Hard requirement: sm_90 (Hopper) needs CUDA 12.0+; sm_120
-            # (consumer Blackwell) needs 12.8+. Warn loudly if version is
-            # too old — otherwise the build dies with cryptic ptxas errors.
-            min_cuda_for_arch = {
-                "sm_90": (12, 0), "sm_100": (12, 4), "sm_103": (12, 8),
-                "sm_120": (12, 8),
-            }
-            need = min_cuda_for_arch.get(arch)
+            # Hard requirement: each CUDA arch has a min nvcc version (see
+            # ARCH_TABLE[arch].min_toolchain_version). Warn loudly if the
+            # detected nvcc is too old — otherwise the build dies with
+            # cryptic ptxas errors.
+            need = get_arch_entry(arch).min_toolchain_version
             if nvcc_ver and need and nvcc_ver < need:
                 lines.append(
                     f"[preflight] WARNING: nvcc {nvcc_ver[0]}.{nvcc_ver[1]} "
@@ -2662,25 +3325,26 @@ def _collect_sibling_trials(cache: CompileCache, opt: str, model: str,
 # ---------------------------------------------------------------------------
 
 def _resolve_sources(spec: BuildSpec) -> List[Path]:
-    info = ARCH_INFO[spec.arch]
-    if info["vendor"] == "pallas":
+    entry = get_arch_entry(spec.arch)
+    if entry.vendor == "pallas":
         return []
-    backend = REPO_ROOT / "csrc/backends" / info["subdir"]
+    backend = REPO_ROOT / "csrc/backends" / entry.subdir
     bindings = sorted((REPO_ROOT / "csrc/bindings").glob("*.cpp"))
     launchers: List[Path] = []
-    for g in info["launcher_glob"]:
+    for g in entry.launcher_glob:
         launchers.extend(sorted(backend.glob(g)))
     models: List[Path] = []
-    for g in info["model_glob"]:
+    for g in entry.model_glob:
         models.extend(sorted((backend / "models").glob(g)))
     return bindings + launchers + models
 
 
 def _build_macros(spec: BuildSpec) -> List[str]:
+    entry = get_arch_entry(spec.arch)
     macros = [
         f"-DSG_BUILD_OPTIMIZER_{spec.optimizer.upper()}=1",
         f"-DSG_BUILD_MODEL_{spec.model.upper()}=1",
-        f"-D{ARCH_INFO[spec.arch]['macro']}=1",
+        f"-D{entry.macro}=1",
         "-DSG_VERBOSE=1",
     ]
     return macros + list(spec.extra_macros)
@@ -2698,6 +3362,10 @@ HOST_CFLAGS_BASE = [
     "-ffast-math", "-funroll-loops",
 ]
 
+# NVCC base flags — arch-specific -gencode is appended per-build from
+# ARCH_TABLE[arch].nvcc_gencode in _device_cflags(). Keeping the base
+# table arch-agnostic means a new CUDA arch is one ARCH_TABLE entry, not
+# a code change here.
 NVCC_DEVICE_BASE = [
     "-O3", "--use_fast_math", "-std=c++17", "-DWITH_CUDA",
     "--expt-relaxed-constexpr",
@@ -2710,15 +3378,14 @@ NVCC_DEVICE_BASE = [
     "--extra-device-vectorization",
     "-Xcompiler", "-fPIC", "-Xcompiler", "-flto=full",
     "--resource-usage",
-    "-gencode=arch=compute_90,code=sm_90",
-    "-gencode=arch=compute_90,code=compute_90",
     "-dlto",
 ]
 
+# HIPCC base flags — --offload-arch is appended per-build from
+# ARCH_TABLE[arch].hipcc_offload_arch in _device_cflags().
 HIPCC_DEVICE_BASE = [
     "-O3", "-std=c++17", "-DWITH_HIP",
     "-ffast-math", "-fPIC",
-    "--offload-arch=gfx942",
     "-mllvm", "-amdgpu-early-inline-all=true",
     "-mllvm", "-amdgpu-function-calls=false",
     "-mllvm", "-amdgpu-internalize-symbols",
@@ -2735,26 +3402,35 @@ LDFLAGS_BASE = [
 
 
 def _host_cflags(spec: BuildSpec) -> List[str]:
-    info = ARCH_INFO[spec.arch]
-    if info["vendor"] == "pallas":
+    entry = get_arch_entry(spec.arch)
+    if entry.vendor == "pallas":
         return []
-    base = list(HOST_CFLAGS_BASE) + [f"-D{info['host_define']}"]
+    base = list(HOST_CFLAGS_BASE) + [f"-D{entry.host_define}"]
     if spec.debug_symbols or spec.profile:
         base += ["-ggdb"]
     return base + _build_macros(spec)
 
 
 def _device_cflags(spec: BuildSpec) -> List[str]:
-    info = ARCH_INFO[spec.arch]
-    if info["vendor"] == "cuda":
+    entry = get_arch_entry(spec.arch)
+    if entry.vendor == "cuda":
         base = list(NVCC_DEVICE_BASE)
+        # Per-arch -gencode pair (target SASS + PTX fallback) from ARCH_TABLE.
+        base += list(entry.nvcc_gencode)
         if spec.debug_symbols or spec.profile:
             base += ["-lineinfo", "--generate-line-info"]
         if (REPO_ROOT / "third_party/cutlass/include").exists():
-            base += ["-DWITH_CUTLASS", "-DCUTLASS_NVCC_ARCHS=90a"]
+            cutlass_arch_token = (
+                f"{entry.cutlass_arch}{entry.arch_suffix}"
+                if entry.cutlass_arch is not None else "")
+            base += ["-DWITH_CUTLASS",
+                     f"-DCUTLASS_NVCC_ARCHS={cutlass_arch_token}"]
         return base + _build_macros(spec)
-    if info["vendor"] == "hip":
+    if entry.vendor == "hip":
         base = list(HIPCC_DEVICE_BASE)
+        # Per-arch --offload-arch from ARCH_TABLE.
+        if entry.hipcc_offload_arch:
+            base += [f"--offload-arch={entry.hipcc_offload_arch}"]
         if spec.debug_symbols or spec.profile:
             base += ["-ggdb"]
         return base + _build_macros(spec)
@@ -2762,7 +3438,7 @@ def _device_cflags(spec: BuildSpec) -> List[str]:
 
 
 def _ldflags(spec: BuildSpec) -> List[str]:
-    if ARCH_INFO[spec.arch]["vendor"] == "pallas":
+    if get_arch_entry(spec.arch).vendor == "pallas":
         return []
     return list(LDFLAGS_BASE)
 
@@ -2867,10 +3543,14 @@ def _probe_hipcc_version() -> Optional[Tuple[int, int]]:
 def _newer_compiler_flags(arch: str, report=None) -> Tuple[List[str], List[str]]:
     """Return (extra_host, extra_device) flags that are safe additions
     when the detected toolchain is new enough. §12 C1 — pure autodetect,
-    no-op on older toolchains."""
+    no-op on older toolchains. Dispatch is by ARCH_TABLE vendor so every
+    CUDA arch (not just sm_90) benefits from version-gated flags."""
     extra_host: List[str] = []
     extra_device: List[str] = []
-    if arch in ("sm_90",):
+    if arch not in ARCH_TABLE:
+        return extra_host, extra_device
+    entry = get_arch_entry(arch)
+    if entry.vendor == "cuda":
         ver = _probe_nvcc_version()
         if ver:
             if report:
@@ -2884,7 +3564,7 @@ def _newer_compiler_flags(arch: str, report=None) -> Tuple[List[str], List[str]]
         elif report:
             report.write("  [toolchain] nvcc not on PATH; "
                          "skipping version-gated flags\n")
-    elif arch == "gfx942":
+    elif entry.vendor == "hip":
         ver = _probe_hipcc_version()
         if ver and report:
             report.write(f"  [toolchain] HIP {ver[0]}.{ver[1]}\n")
@@ -2924,7 +3604,7 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
     report.write(f"  ldflags:   {' '.join(ldflags)}\n")
     report.flush()
 
-    with_cuda = ARCH_INFO[spec.arch]["vendor"] in ("cuda", "hip")
+    with_cuda = get_arch_entry(spec.arch).vendor in ("cuda", "hip")
     # §12 C1 — newer compiler probe; auto-append --split-compile etc.
     extra_host, extra_device = _newer_compiler_flags(spec.arch, report)
     if extra_host:
@@ -3225,7 +3905,7 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
         report.write("  [jit-autotune] no GPU visible — skipping. Run JIT "
                      "phase on the target GPU host with this cache.\n")
         return None
-    if ARCH_INFO[spec.arch]["vendor"] == "pallas":
+    if get_arch_entry(spec.arch).vendor == "pallas":
         report.write("  [jit-autotune] pallas backend; no C++ tuning.\n")
         return None
 
@@ -3540,8 +4220,8 @@ def build_aot(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
     use loop. Otherwise a single AOT build."""
     _ensure_nvcc_on_path()
     _refresh_torch_cuda_home()
-    info = ARCH_INFO[spec.arch]
-    if info["vendor"] == "pallas":
+    entry = get_arch_entry(spec.arch)
+    if entry.vendor == "pallas":
         launcher = (REPO_ROOT / "csrc/backends/pallas"
                     / f"launch_{spec.optimizer}.py")
         report.write("\n[pallas] no C++ compile; Python launcher only\n")
@@ -3696,8 +4376,8 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
     """Run only the JIT autotune + final-link half. Requires GPU."""
     _ensure_nvcc_on_path()
     _refresh_torch_cuda_home()
-    info = ARCH_INFO[spec.arch]
-    if info["vendor"] == "pallas":
+    entry = get_arch_entry(spec.arch)
+    if entry.vendor == "pallas":
         report.write("\n[pallas] JIT phase no-op (Python-only backend)\n")
         return None
 
@@ -3826,7 +4506,7 @@ def build(
     _ensure_nvcc_on_path()
     # On-demand: pip-install the NVIDIA wheels if nvcc is still missing
     # and the caller opted in. Handles Colab CPU runtimes, fresh CI, etc.
-    if bootstrap_cuda and ARCH_INFO[arch]["vendor"] == "cuda":
+    if bootstrap_cuda and get_arch_entry(arch).vendor == "cuda":
         if not shutil.which("nvcc"):
             bootstrap_cuda_toolkit()
     # Force torch to re-read CUDA_HOME / ROCM_HOME from os.environ even if
@@ -3836,7 +4516,7 @@ def build(
     # Hard pre-flight: if we're targeting a C++-compiled arch and the
     # toolchain is genuinely missing, fail loudly NOW with the install
     # recipe instead of letting ninja produce a confusing exit-127 error.
-    if ARCH_INFO[arch]["vendor"] == "cuda" and not shutil.which("nvcc"):
+    if get_arch_entry(arch).vendor == "cuda" and not shutil.which("nvcc"):
         raise RuntimeError(
             "nvcc not found on PATH and could not be auto-discovered.\n"
             "\n"
@@ -3862,7 +4542,7 @@ def build(
             "Re-run with debug=True to see the [preflight] / [CUDA_HOME probe]\n"
             "blocks that show exactly what compile.py searched."
         )
-    if ARCH_INFO[arch]["vendor"] == "hip" and not shutil.which("hipcc"):
+    if get_arch_entry(arch).vendor == "hip" and not shutil.which("hipcc"):
         raise RuntimeError(
             "hipcc not found on PATH. ROCm install — pick the one matching\n"
             "your environment:\n"
@@ -3904,9 +4584,9 @@ def build(
         spec.out_dir / f"compile_{optimizer}_{model}_{arch}.txt")
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
-    info = ARCH_INFO[arch]
+    entry = get_arch_entry(arch)
     phases = ["resolve"]
-    if info["vendor"] != "pallas":
+    if entry.vendor != "pallas":
         if runtime in ("aot", "both"):
             phases.append("aot")
         if runtime in ("jit", "both") and autotune:
@@ -3929,7 +4609,7 @@ def build(
         sys.stderr.write(
             f"\n{bar}\n"
             f"[debug] grokking_optimizers.compile starting at {_ts}\n"
-            f"[debug] target:   {optimizer}/{model}/{arch} (vendor={info['vendor']})\n"
+            f"[debug] target:   {optimizer}/{model}/{arch} (vendor={entry.vendor})\n"
             f"[debug] runtime:  {runtime}  autotune={autotune} ({autotune_mode})  "
             f"pgo={pgo}  profile={profile}\n"
             f"[debug] phases:   {phases}\n"
@@ -3950,7 +4630,7 @@ def build(
             report.write(f"# Generated:        {datetime.datetime.now().isoformat()}\n")
             report.write(f"# Optimizer:        {optimizer}\n")
             report.write(f"# Model:            {model}\n")
-            report.write(f"# Arch:             {arch} (vendor={info['vendor']})\n")
+            report.write(f"# Arch:             {arch} (vendor={entry.vendor})\n")
             report.write(f"# CPU cores:        {NCPUS} (ninja -j)\n")
             report.write(f"# Out dir:          {spec.out_dir}\n")
             report.write(f"# Cache:            {cache.path}\n")
@@ -3973,7 +4653,7 @@ def build(
                 report.write(line + "\n")
             step("resolve")
 
-            if info["vendor"] == "pallas":
+            if entry.vendor == "pallas":
                 build_aot(spec, cache, report)  # logs pallas no-op
             else:
                 if runtime in ("aot", "both"):
@@ -4153,7 +4833,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Do the (possibly slow) CUDA toolkit bootstrap ONCE in the
         # parent so AOT and JIT subprocesses inherit the discovered
         # nvcc via PATH/CUDA_HOME — no per-subprocess re-install.
-        if args.bootstrap_cuda and ARCH_INFO[args.arch]["vendor"] == "cuda":
+        if args.bootstrap_cuda and get_arch_entry(args.arch).vendor == "cuda":
             if not shutil.which("nvcc"):
                 _ensure_nvcc_on_path() or bootstrap_cuda_toolkit()
         argv_in = list(argv) if argv is not None else sys.argv[1:]
@@ -4200,7 +4880,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.out / f"compile_{args.optimizer}_{args.model}_{args.arch}.txt")
     sys.stdout.write(f"{report}\n")
     return 0 if (so is not None
-                 or ARCH_INFO[args.arch]["vendor"] == "pallas"
+                 or get_arch_entry(args.arch).vendor == "pallas"
                  or args.runtime == "aot") else 1
 
 
@@ -4524,6 +5204,124 @@ def _self_test() -> int:
     _run("elementwise_headers", test_elementwise_headers)
     _run("model_headers", test_model_headers)
     _run("optimizer_model_cross", test_optimizer_model_cross)
+
+    sys.stdout.write("[self-test] arch_table\n")
+
+    def test_arch_table_completeness():
+        """Every arch in scope is present with all required fields filled,
+        alias resolution works, and the ARCH_INFO derived view exposes the
+        legacy 6 keys for backward compatibility."""
+        expected_canonical = {
+            # NVIDIA / CUDA
+            "sm_75", "sm_80", "sm_86", "sm_89",
+            "sm_90a", "sm_100a", "sm_103a", "sm_120a",
+            # AMD / HIP
+            "gfx906", "gfx908", "gfx90a", "gfx942", "gfx950",
+            "gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1151",
+            "gfx1200", "gfx1201",
+            # Google / Pallas
+            "tpu_v4", "tpu_v5e", "tpu_v5p", "tpu_v6e", "tpu_v7",
+        }
+        missing = expected_canonical - set(ARCH_TABLE.keys())
+        assert not missing, f"ARCH_TABLE missing canonical arches: {missing}"
+
+        # Every entry must have every required field non-None where applicable
+        # to its vendor.
+        for arch, entry in ARCH_TABLE.items():
+            assert entry.vendor in ("cuda", "hip", "pallas"), \
+                f"{arch}: bad vendor {entry.vendor!r}"
+            assert entry.display_name, f"{arch}: empty display_name"
+            assert entry.subdir, f"{arch}: empty subdir"
+            assert entry.macro.startswith("SG_BUILD_ARCH_"), \
+                f"{arch}: bad macro {entry.macro!r}"
+            assert isinstance(entry.min_toolchain_version, tuple) and \
+                len(entry.min_toolchain_version) >= 2, \
+                f"{arch}: bad min_toolchain_version"
+            assert isinstance(entry.features, frozenset), \
+                f"{arch}: features must be a frozenset"
+            if entry.vendor == "cuda":
+                assert entry.host_define == "WITH_CUDA", \
+                    f"{arch}: host_define={entry.host_define!r}"
+                assert entry.nvcc_gencode, f"{arch}: empty nvcc_gencode"
+                assert entry.cutlass_arch is not None, \
+                    f"{arch}: cutlass_arch must be set for CUDA"
+                assert entry.warp_size == 32, f"{arch}: warp_size!=32"
+            elif entry.vendor == "hip":
+                assert entry.host_define == "WITH_HIP", \
+                    f"{arch}: host_define={entry.host_define!r}"
+                assert entry.hipcc_offload_arch, \
+                    f"{arch}: empty hipcc_offload_arch"
+                assert entry.warp_size in (32, 64), \
+                    f"{arch}: warp_size={entry.warp_size!r}"
+            else:  # pallas
+                assert entry.host_define is None, \
+                    f"{arch}: pallas host_define must be None"
+                assert entry.warp_size is None
+                assert entry.max_threads_per_block is None
+
+        # Alias resolution: sm_90 → sm_90a (same object), etc.
+        assert ARCH_TABLE["sm_90"] is ARCH_TABLE["sm_90a"], \
+            "sm_90 alias must resolve to sm_90a"
+        assert ARCH_TABLE["sm_100"] is ARCH_TABLE["sm_100a"]
+        assert ARCH_TABLE["sm_103"] is ARCH_TABLE["sm_103a"]
+        assert ARCH_TABLE["sm_120"] is ARCH_TABLE["sm_120a"]
+
+        # get_arch_entry must work for aliases too.
+        assert get_arch_entry("sm_90").macro == "SG_BUILD_ARCH_SM90"
+        assert get_arch_entry("sm_120a").vendor == "cuda"
+
+        # Legacy 6-key derived view must contain the expected keys.
+        legacy_keys = {"vendor", "subdir", "launcher_glob", "model_glob",
+                       "macro", "host_define"}
+        for arch in ARCH_TABLE:
+            assert arch in ARCH_INFO, f"ARCH_INFO missing {arch}"
+            assert set(ARCH_INFO[arch].keys()) == legacy_keys, \
+                f"ARCH_INFO[{arch}] keys {sorted(ARCH_INFO[arch].keys())} " \
+                f"!= {sorted(legacy_keys)}"
+            # And the values must match the ArchEntry source.
+            assert ARCH_INFO[arch]["vendor"] == ARCH_TABLE[arch].vendor
+            assert ARCH_INFO[arch]["macro"] == ARCH_TABLE[arch].macro
+
+        # Spot-check min_toolchain_version values.
+        assert get_arch_entry("sm_90a").min_toolchain_version == (12, 0)
+        assert get_arch_entry("sm_120a").min_toolchain_version == (12, 8)
+        assert get_arch_entry("gfx942").min_toolchain_version == (6, 0)
+        assert get_arch_entry("tpu_v6e").min_toolchain_version == (0, 4, 30)
+
+        # Feature-flag spot-checks.
+        assert "tma" in get_arch_entry("sm_90a").features
+        assert "fp4" in get_arch_entry("sm_100a").features
+        assert "tma" not in get_arch_entry("sm_120a").features  # consumer Blackwell
+        assert "fp8" in get_arch_entry("sm_89").features
+        assert "fp8_mfma" in get_arch_entry("gfx942").features
+        assert "fp4_mfma" in get_arch_entry("gfx950").features
+        assert "wmma" in get_arch_entry("gfx1100").features
+        assert "sparsecore" in get_arch_entry("tpu_v5p").features
+
+        # Existing search-space builders are wired into ARCH_TABLE.
+        assert ARCH_TABLE["sm_90a"].search_space_builder is _sm90_full_space
+        assert ARCH_TABLE["gfx942"].search_space_builder is _gfx942_full_space
+
+    def test_arch_table_gencode_format():
+        """nvcc_gencode entries must follow the documented format and include
+        BOTH a SASS pair and a PTX fallback for each CUDA arch."""
+        for arch, entry in ARCH_TABLE.items():
+            if entry.vendor != "cuda":
+                assert entry.nvcc_gencode == [], \
+                    f"{arch}: non-CUDA entries must have empty nvcc_gencode"
+                continue
+            assert len(entry.nvcc_gencode) == 2, \
+                f"{arch}: expected 2 -gencode flags, got {entry.nvcc_gencode}"
+            sass, ptx = entry.nvcc_gencode
+            assert sass.startswith("-gencode=arch=compute_"), sass
+            assert ptx.startswith("-gencode=arch=compute_"), ptx
+            # PTX fallback compute_XX,code=compute_XX (non-"a" — drivers
+            # forward to newer hw via JIT).
+            assert ",code=compute_" in ptx, \
+                f"{arch}: PTX fallback malformed: {ptx}"
+
+    _run("arch_table_completeness", test_arch_table_completeness)
+    _run("arch_table_gencode_format", test_arch_table_gencode_format)
 
     sys.stdout.write(f"\n[self-test] {passed} passed, {failures} failed\n")
     return 1 if failures else 0

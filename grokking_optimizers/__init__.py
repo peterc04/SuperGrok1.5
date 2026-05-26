@@ -73,6 +73,15 @@ from grokking_optimizers.dispatch import (
 )
 
 
+# Single source of truth for every supported GPU/TPU architecture. See
+# grokking_optimizers/compile.py for the ArchEntry dataclass and the table
+# itself. ARCH_INFO is a derived 6-key dict kept for backward compatibility
+# with older call sites that read e.g. ARCH_INFO[arch]["vendor"].
+from grokking_optimizers.compile import (
+    ARCH_TABLE, ARCH_INFO, ArchEntry, get_arch_entry,
+)
+
+
 __all__ = [
     # 12 core optimizers (11 grokking + AdamW baseline)
     "AdamW",
@@ -94,6 +103,9 @@ __all__ = [
     "supports_matrix_cores",
     "SUPPORTED_ARCHES", "UnsupportedArchError", "assert_supported_arch",
     "detect_arch",
+
+    # ARCH_TABLE — single source of truth for every supported arch
+    "ARCH_TABLE", "ARCH_INFO", "ArchEntry", "get_arch_entry",
 
     # Capability flags
     "_HAS_OPS", "_HAS_CUDA", "_HAS_CPU_OPS",

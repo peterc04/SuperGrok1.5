@@ -78,7 +78,27 @@ OPTIMIZERS: Tuple[str, ...] = (
 
 MODELS: Tuple[str, ...] = ("mamba", "decoder", "vit")
 
-ARCHES: Tuple[str, ...] = ("sm_90", "gfx942", "tpu_v5p")
+# ARCHES — all GPU/TPU architectures the build/profile pipeline accepts.
+# This MUST stay in sync with grokking_optimizers.compile.ARCH_TABLE; the
+# self-test ``test_arch_table_completeness`` verifies the relationship.
+# Includes both the canonical "a"-suffixed CUDA arches and their aliases
+# (sm_90, sm_100, sm_103, sm_120) so legacy --arch sm_90 invocations keep
+# working. Defined here (rather than imported from compile.py) because
+# compile.py imports several names from this module at load time.
+ARCHES: Tuple[str, ...] = (
+    # NVIDIA / CUDA
+    "sm_75", "sm_80", "sm_86", "sm_89",
+    "sm_90", "sm_90a",
+    "sm_100", "sm_100a",
+    "sm_103", "sm_103a",
+    "sm_120", "sm_120a",
+    # AMD / HIP
+    "gfx906", "gfx908", "gfx90a", "gfx942", "gfx950",
+    "gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1151",
+    "gfx1200", "gfx1201",
+    # Google / Pallas
+    "tpu_v4", "tpu_v5e", "tpu_v5p", "tpu_v6e", "tpu_v7",
+)
 
 OPT_CLASS = {
     "adamw":       "AdamW",
@@ -94,32 +114,15 @@ OPT_CLASS = {
     "supergrok2":  "SuperGrok2",
 }
 
-ARCH_INFO = {
-    "sm_90": {
-        "vendor": "cuda",
-        "subdir": "cuda/sm_90",
-        "launcher_glob": ("launch_*.cu",),
-        "model_glob":    ("*.cu",),
-        "macro":         "SG_BUILD_ARCH_SM90",
-        "host_define":   "WITH_CUDA",
-    },
-    "gfx942": {
-        "vendor": "hip",
-        "subdir": "hip/gfx942",
-        "launcher_glob": ("launch_*.hip.cpp", "launch_*.hip"),
-        "model_glob":    ("*.hip.cpp",),
-        "macro":         "SG_BUILD_ARCH_GFX942",
-        "host_define":   "WITH_HIP",
-    },
-    "tpu_v5p": {
-        "vendor": "pallas",
-        "subdir": "pallas",
-        "launcher_glob": ("launch_*.py",),
-        "model_glob":    (),
-        "macro":         "SG_BUILD_ARCH_TPU_V5P",
-        "host_define":   None,
-    },
-}
+# ARCH_INFO is owned by grokking_optimizers.compile (the single source of
+# truth — see ARCH_TABLE there). It is imported lazily by the helper below
+# to avoid a circular import (compile.py imports several names from this
+# module at module-load time).
+
+def _arch_info():
+    """Lazy accessor for the legacy ARCH_INFO dict, owned by compile.py."""
+    from grokking_optimizers.compile import ARCH_INFO as _AI  # noqa: WPS433
+    return _AI
 
 NCU_FLAGS: List[str] = [
     "--set", "full",
@@ -248,7 +251,7 @@ def smoke_script(optimizer: str, model: str, arch: str) -> str:
     grokking_optimizers._ops entirely (which only exists after
     ``pip install -e .``).
     """
-    if arch == "tpu_v5p" or ARCH_INFO.get(arch, {}).get("vendor") == "pallas":
+    if arch == "tpu_v5p" or _arch_info().get(arch, {}).get("vendor") == "pallas":
         return _pallas_smoke_script(optimizer)
     cls = OPT_CLASS[optimizer]
     return textwrap.dedent(f"""\
@@ -520,7 +523,7 @@ def profile_pallas(optimizer: str, model: str, arch: str, report,
 
 def _dispatch_profile(optimizer: str, model: str, arch: str, report,
                       timeout: int = 900) -> int:
-    vendor = ARCH_INFO[arch]["vendor"]
+    vendor = _arch_info()[arch]["vendor"]
     if vendor == "cuda":
         return profile_cuda(optimizer, model, arch, report, timeout=timeout)
     if vendor == "hip":
@@ -626,7 +629,7 @@ def profile(
             f"\n{bar}\n"
             f"[debug] grokking_optimizers.profile starting at {_ts}\n"
             f"[debug] target:   {optimizer}/{model}/{arch} "
-            f"(vendor={ARCH_INFO[arch]['vendor']})\n"
+            f"(vendor={_arch_info()[arch]['vendor']})\n"
             f"[debug] report:   {report_path}\n"
             f"[debug] timeout:  {timeout}s\n"
             f"{bar}\n\n"
@@ -642,7 +645,7 @@ def profile(
             report.write(f"# Optimizer: {optimizer}\n")
             report.write(f"# Model:     {model}\n")
             report.write(f"# Arch:      {arch} "
-                         f"(vendor={ARCH_INFO[arch]['vendor']})\n")
+                         f"(vendor={_arch_info()[arch]['vendor']})\n")
             if path_obj is not None:
                 report.write(f"# Path:      {path_obj}\n")
             report.write(f"# CPU cores: {NCPUS}\n")
@@ -651,7 +654,7 @@ def profile(
                 "cuda":   "ncu (Nsight Compute)",
                 "hip":    "rocprof-compute / rocprofv2 / rocprof",
                 "pallas": "jax.profiler",
-            }[ARCH_INFO[arch]["vendor"]]
+            }[_arch_info()[arch]["vendor"]]
             report.write(f"# Profiler:  {tool_name}\n")
             step("setup")
 
