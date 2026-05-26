@@ -267,38 +267,221 @@ assert compile_main(["--self-test"]) == 0  # prints "[self-test] 18 passed, 0 fa
 
 ---
 
-## Hardware support
+## Hardware support — ARCH_TABLE (25 canonical archs)
 
-The build targets a **3-arch active set**:
+`grokking_optimizers.compile.ARCH_TABLE` is the single source of truth.
+Every flag, feature gate, search-space dim, and toolchain requirement
+is derived from it — there are no hardcoded `if arch == "sm_90"`
+branches anywhere in the file.
 
-| Arch | Family | Cards | Backend |
-|------|--------|-------|---------|
-| `sm_90` | Hopper | H100, H200 | CUDA |
-| `gfx942` | CDNA3 | MI300X, MI300A | HIP |
-| `tpu_v5p` | TPU v5p | 128-wide MXU | JAX/Pallas |
+| Arch | Family | Cards | Backend | Min toolchain | Self-test | AOT dry-run |
+|------|--------|-------|---------|---------------|-----------|-------------|
+| `sm_75` | Turing | T4 | CUDA | 10.0 | ✅ | ✅ |
+| `sm_80` | Ampere | A100, A30, A10 | CUDA | 11.0 | ✅ | ✅ |
+| `sm_86` | Ampere | A10, RTX 30xx | CUDA | 11.1 | ✅ | ✅ |
+| `sm_89` | Ada Lovelace | L4, L40, RTX 40xx | CUDA | 11.8 | ✅ | ✅ |
+| `sm_90a` | Hopper | H100, H200 | CUDA | 12.0 | ✅ | ✅ |
+| `sm_100a` | Blackwell datacenter | B100, B200, GB200 | CUDA | 12.8 | ✅ | ✅ |
+| `sm_103a` | Blackwell Ultra | B300, GB300 NVL72 | CUDA | 12.9 | ✅ | ✅ |
+| `sm_120a` | Consumer Blackwell | RTX 50xx, RTX PRO 6000 | CUDA | 12.8 | ✅ | ✅ |
+| `gfx906` | Vega20 | MI50 | HIP | ROCm 3.0 | ✅ | ✅ |
+| `gfx908` | CDNA1 | MI100 | HIP | ROCm 3.5 | ✅ | ✅ |
+| `gfx90a` | CDNA2 | MI200, MI250 | HIP | ROCm 4.5 | ✅ | ✅ |
+| `gfx942` | CDNA3 | MI300X, MI300A | HIP | ROCm 6.0 | ✅ | ✅ |
+| `gfx950` | CDNA4 | MI350X, MI355X | HIP | ROCm 6.2 | ✅ | ✅ |
+| `gfx1030` | RDNA2 | RX 6000 | HIP | ROCm 4.0 | ✅ | ✅ |
+| `gfx1100/1101/1102` | RDNA3 | RX 7000 | HIP | ROCm 5.5 | ✅ | ✅ |
+| `gfx1151` | RDNA3.5 | Strix Halo | HIP | ROCm 6.1 | ✅ | ✅ |
+| `gfx1200/1201` | RDNA4 | RX 9000/9070 | HIP | ROCm 7.0 | ✅ | ✅ |
+| `tpu_v4` | TPU v4 | 128-wide MXU | Pallas/XLA | JAX 0.4 | ✅ | ✅ |
+| `tpu_v5e` | TPU v5e | 64-wide MXU | Pallas/XLA | JAX 0.4 | ✅ | ✅ |
+| `tpu_v5p` | TPU v5p | 128-wide MXU + sparsecore | Pallas/XLA | JAX 0.4 | ✅ | ✅ |
+| `tpu_v6e` | Trillium | 256-wide MXU | Pallas/XLA | JAX 0.4.30 | ✅ | ✅ |
+| `tpu_v7` | Ironwood | larger MXU | Pallas/XLA | JAX 0.5 | ✅ | ✅ |
 
-Anything else raises `UnsupportedArchError`. There is no tier fallback chain
-for production runs — the active set is the only compiled set.
+**Status legend**:
+- ✅ Self-test: arch is registered in ARCH_TABLE with non-empty search
+  space, feature flags, and toolchain version — verified by 81-test
+  in-process suite.
+- ✅ AOT dry-run: `--arch <X> --runtime aot --no-autotune --no-profile`
+  produces either a build.ninja or a clear per-arch toolchain
+  diagnostic (`nvcc not found`, `hipcc not found`, `JAX not
+  installed`, etc.) — never an opaque exit-127.
 
-### Future arches (scaffolded in dispatch, not compiled)
+**Backward-compat aliases**: `sm_90 → sm_90a`, `sm_100 → sm_100a`,
+`sm_103 → sm_103a`, `sm_120 → sm_120a`. Both keys resolve to the same
+`ArchEntry` object via `is`-identity.
 
-These arches are recognized by `grokking_optimizers.dispatch.detect_arch`
-and will route to a `NotImplementedError` with a descriptive message
-until the corresponding kernels are added. They are not part of the
-current build matrix.
+### Per-arch search space cardinalities
 
-| Arch    | Family               | Cards                          | Status   |
-|---------|----------------------|--------------------------------|----------|
-| sm_80   | Ampere               | A100, A30, A10                 | future   |
-| sm_89   | Ada Lovelace         | RTX 40, L40, L40S              | future   |
-| sm_100  | Datacenter Blackwell | B100, B200, GB200              | future   |
-| sm_103  | Blackwell Ultra      | B300, GB300 NVL72              | future   |
-| sm_120  | Consumer Blackwell   | RTX 50, RTX PRO 6000           | future   |
-| gfx950  | CDNA4                | MI350X, MI355X                 | future   |
-| tpu_v6e | TPU v6e              | 256-wide MXU                   | future   |
+The complete programmatic Cartesian per arch (no YAML curation). Bayesian
+TPE samples this directly via Optuna's `suggest_categorical` over the
+per-dim value lists; the product is never materialized.
 
-The active set narrowed to sm_90 + gfx942 + tpu_v5p during refactor to
-focus on what's runnable now; future arches return when kernels are added.
+| Arch | Cardinality |
+|------|-------------|
+| `sm_75` | 1,003,520 |
+| `sm_80` / `sm_86` | 2,867,200 |
+| `sm_89` | 8,601,600 |
+| `sm_90a` | 3,735,552,000 |
+| `sm_100a` / `sm_103a` | 3,369,074,688,000 |
+| `sm_120a` | 17,203,200 |
+| `gfx906` | 12,042,240 |
+| `gfx908` | 57,344,000 |
+| `gfx90a` | 80,281,600 |
+| `gfx942` | 700,416,000 |
+| `gfx950` | 1,651,507,200 |
+| `gfx1030` | 3,010,560 |
+| `gfx1100/1101/1102/1151` | 91,750,400 |
+| `gfx1200/1201` | 481,689,600 |
+| `tpu_v4` / `tpu_v5e` | 240 |
+| `tpu_v5p` | 720 |
+| `tpu_v6e` | 480 |
+| `tpu_v7` | 384 |
+
+---
+
+## MAXIMAL pipeline — extended capabilities
+
+The wrapper goes beyond flag-tuning. Every layer below stacks on top of
+the previous one — flag tuning is a strict subset of the emission space,
+which is a strict subset of the runtime-specialization space.
+
+### Bayesian auto early-stopping
+
+`--bayesian-trials` defaults to `None` (auto). The autotune loop runs
+until **any** of five criteria fire:
+
+| Criterion | Default | Override flag |
+|-----------|---------|---------------|
+| Best-so-far plateau | no improvement > 0.5% for `patience` trials (auto = `max(50, 0.1 × trials_done)`) | `--min-improvement 0.01` / `--patience 100` |
+| EI exhaustion | rolling expected-improvement integral < `ei_floor` | (internal) |
+| Coverage saturation | new (dim, value) tuples per trial < 0.1% over `patience` window | (internal) |
+| Wall-clock budget | None by default; explicit cap when set | `--max-tune-seconds 600` |
+| Hard ceiling | 1,000,000 trials (sanity, never reached) | — |
+
+Manual override: `--bayesian-trials 500` still works. `top_k` for the
+refine pass also defaults to `None` — the elbow of the timing
+distribution is detected automatically.
+
+### Codegen / Jinja2 kernel emission backend
+
+`--enable-emitter`. Compiles per-variant kernels from Jinja2 templates
+under `grokking_optimizers/templates/` instead of re-compiling one
+fixed source with `-D` macros. Templates emit **structurally
+different** kernels (warp-specialized vs cooperative vs persistent vs
+stream-K mainloop; different wgmma/tcgen05/MFMA shapes; baked-in
+swizzle patterns; epilogue fusions).
+
+Cache key: SHA256(template source + JSON config). Identical configs
+produce the same emitted file. Optional `nvcc --cuda --dryrun`
+validation when nvcc is on PATH. CUTLASS profiler integration for
+GEMM-shaped subproblems is scaffolded (see `codegen.emit_cutlass_gemm_variants`).
+
+### Runtime kernel specialization — NVRTC / hipRTC
+
+`--enable-runtime-specialization`. For shapes that vary at runtime,
+JIT-compile via NVRTC (CUDA) or hipRTC (HIP) with problem-shape
+constants baked in as `constexpr`. CUBINs cached by `(arch, dtype,
+shape_class)` under `<out>/nvrtc_cache`. Sub-µs dispatch on cache hit
+via `cuModuleLoadData` / `hipModuleLoadData`.
+
+Verified on this CPU host: NVRTC compiled a trivial fp32 kernel via
+the `cuda-python` bindings and produced a 1,062-byte PTX artifact
+(SASS-less host, so it falls back to PTX with the driver doing the
+final JIT — exercising the full path including atomic cache write +
+read-back).
+
+### Device-side PGO — CUPTI / rocprof / XLA HLO dumps
+
+`--enable-device-pgo`. The standard LLVM `-fprofile-generate/-use`
+loop only instruments **host** launchers on NVIDIA (nvcc strips device
+instrumentation). This layer collects device-side stall info from:
+
+- NVIDIA: `nsys profile` PC sampling
+- AMD: `rocprof --stats` ATT traces
+- Pallas: XLA HLO cost-model dumps (`--xla_gpu_dump_autotuned_*`)
+
+Stall reasons → JSON sidecar at `<out>/device_stall_info.json`. Reasons
+map to search-space dims (`long_scoreboard → swizzle/lds_padding/vec`,
+`not_selected → block/waves_per_eu/maxrregcount`, etc.); the autotuner
+`enqueue_trial`s the biased configs first.
+
+### Multi-GPU fan-out
+
+When `CUDA_VISIBLE_DEVICES` (or `HIP_VISIBLE_DEVICES`) lists multiple
+GPUs, `MultiGPUTimingPool` partitions the variant queue across N
+`TimingWorker`s, one per device, with per-worker env overlays
+(`CUDA_VISIBLE_DEVICES=<dev>`). Round-robin assignment, dead-worker
+skip, aggregate-then-pick-winner.
+
+### Numerical / differential validation
+
+`--strict-numerics`. After each variant times out, compare its output
+tensor against the AOT primary's reference output. Tolerances:
+
+| dtype | rtol | atol |
+|-------|------|------|
+| fp32 | 1e-5 | 1e-6 |
+| fp16 / bf16 | 1e-3 | 1e-4 |
+| fp8 | 1e-2 | 1e-3 |
+| fp4 | 5e-2 | 1e-2 |
+
+Statuses: `ok`, `deterministic` (bit-identical to ref),
+`numerical_fail` (out of tolerance), `non_deterministic` (within
+tolerance but not bit-identical), `skipped` (no ref available).
+`pick_winner` always excludes `numerical_fail`; `--strict-numerics`
+requires `deterministic`.
+
+### Cache GC and watchdog
+
+`--prune` / `--prune-max-age-days 30` / `--prune-keep-top-n 100` /
+`--no-auto-prune`. Auto-prune runs at the end of every successful JIT
+autotune pass: variants older than max-age OR not in top-N by timing
+(per `(opt, model, arch)`) are dropped. `TimingWorker` carries a
+30-second-interval watchdog thread that hard-restarts the worker
+process if a `ping` times out (60s).
+
+### TOML project config
+
+`--config path/to/your.toml`. Loader (`grokking_optimizers.compile_config`)
+merges in priority order:
+
+1. Path passed via `build(config=…)` / `--config`
+2. `./compile_config.toml` in CWD
+3. Packaged default at `grokking_optimizers/compile_config.toml`
+
+12 sections: `[project]`, `[sources]`, `[optimizers]`, `[models]`,
+`[archs]`, `[pgo]`, `[autotune]`, `[codegen]`, `[runtime_specialization]`,
+`[device_pgo]`, `[cache]`, `[numerics]`. Strictly additive — without a
+config file, behavior is identical to today.
+
+### Toolchain bootstrap for every vendor
+
+| Flag | Vendor | Behavior |
+|------|--------|----------|
+| `--bootstrap-cuda` | CUDA | Probes conda / apt / NVIDIA apt repo / dnf / yum / zypper / pacman / apk / brew / winget / PyPI wheels. Picks CUDA version per arch min (e.g. sm_120a → 12.8+, sm_103a → 12.9+). |
+| `--bootstrap-rocm` | HIP | AMD's official apt repo (per-arch version: gfx950 → ROCm 6.2+, gfx1200 → 7.0+) → stock apt → dnf → zypper. |
+| `--bootstrap-jax` | Pallas | `pip install jax[tpu]` from `libtpu_releases` bucket if no TPU device visible. |
+
+`_preflight_toolchain(arch)` emits a `[preflight] arch=<X>
+need=<min>.<min> have=<v>.<v> — PASS|FAIL` line per arch so CI can
+grep for failures.
+
+### What this is NOT
+
+This is **not** a general-purpose drop-in compiler wrapper for
+arbitrary projects. It is the MAXIMAL pipeline for this project's
+optimizer kernels (`csrc/algorithms/`) and model kernels
+(`csrc/backends/<vendor>/<arch>/`) across every current GPU/TPU
+architecture. The search spaces, dim names, feature flags, prefilter
+rules, NVRTC kernel templates, and PGO workload are all calibrated for
+SuperGrok v2 / Mamba-3 / PEER / GRU meta-net optimizer workloads. To
+adapt it for a different project, you would override
+`compile_config.toml`'s `[sources]` / `[optimizers]` / `[models]`
+sections, write your own per-op Jinja2 templates under
+`grokking_optimizers/templates/`, and add per-arch search-space
+builders to `_populate_search_space_builders()`.
 
 ---
 
@@ -461,14 +644,26 @@ The compile cache (`build/.compile_cache.json`) uses schema **v3**
 python -m grokking_optimizers.compile \
   -O <optimizer> -M <model> -A <arch> \
   --mode {bayesian,exhaustive} \
-  --bayesian-trials 500 --top-k 20 \
+  [--bayesian-trials N]                 # None → auto early-stop
+  [--max-tune-seconds 600]              # wall-clock budget for auto mode
+  [--min-improvement 0.005]             # plateau-detection threshold
+  [--patience 100]                      # plateau-detection window
+  [--top-k N]                           # None → auto elbow detection
   --pgo [--pgo-workload <script>] [--pgo-steps 1000] \
+  [--enable-device-pgo]                 # Stream 8: CUPTI / rocprof / XLA HLO
   [--search-space <path/to/your.yaml>] \
   --cache build/.compile_cache.json \
   --runtime {aot,jit,both} [--aot-only | --jit-only] \
   [--aot-artifact-dir <path>] \
   [--quick] [--no-autotune] [--no-profile] \
   [--transfer-learning] [--pruner {none,hyperband,median}] \
+  [--enable-emitter]                    # Stream 6: Jinja2 kernel emitter
+  [--enable-runtime-specialization]     # Stream 7: NVRTC/hipRTC registry
+  [--strict-numerics]                   # Stream 10: require determinism
+  [--config <path/to/your.toml>]        # Stream 11: project config
+  [--bootstrap-cuda] [--bootstrap-rocm] [--bootstrap-jax]  # Stream 12
+  [--prune] [--prune-max-age-days 30] [--prune-keep-top-n 100]
+  [--no-auto-prune]                     # Stream 9: cache GC
   [--debug-symbols] [--seed N] [-D MACRO[=VALUE]] [-v] [--debug]
   [--self-test]
 ```
@@ -489,18 +684,35 @@ HOST_CFLAGS_BASE = [
 NVCC_DEVICE_BASE = [
     "-O3", "--use_fast_math", "-std=c++17", "-DWITH_CUDA",
     "--threads", "8", "-Xfatbin", "-compress-all",
-    "-Xptxas", "-O3", "--allow-expensive-optimizations=true",
+    "--allow-expensive-optimizations=true",
     "--extra-device-vectorization", "-dlto",
-    "-gencode=arch=compute_90,code=sm_90",
-    "-gencode=arch=compute_90,code=compute_90",
+    # Stream 3 additions (gated by toolchain version):
+    "-Xptxas", "--opt-level=3",                  # single PTXAS opt level
+    "-Xptxas", "--register-usage-level=10",      # CUDA 12.0+
+    "-Xnvlink", "--suppress-stack-size-warning",
+    "--diag-suppress=20012,20013",
+    "-Xcompiler", "-fno-strict-aliasing",
+    "--device-link-options=-dlto",
 ]
+# Per-arch -gencode is appended in _device_cflags(spec) from
+# ARCH_TABLE[arch].nvcc_gencode — including the PTX fallback
+# `compute_XX,code=compute_XX` so older drivers can JIT.
+
 HIPCC_DEVICE_BASE = [
     "-O3", "-std=c++17", "-DWITH_HIP", "-ffast-math",
-    "--offload-arch=gfx942",
     "-mllvm", "-amdgpu-early-inline-all=true",
     "-mllvm", "-amdgpu-function-calls=false",
     "-mllvm", "-amdgpu-internalize-symbols", "-flto",
+    # Stream 3 additions:
+    "-mllvm", "--amdgpu-unroll-threshold=1000",
+    "-mllvm", "--amdgpu-enable-lower-module-lds-strategy=module",
+    "-mllvm", "--amdgpu-promote-alloca-to-vector-limit=512",
+    "-mllvm", "--amdgpu-sroa-vector-elements=8",
+    "-mllvm", "--amdgpu-enable-merge-m0",
 ]
+# Per-arch `--offload-arch=<gfx*>`, `-mcumode` (CDNA), and
+# `-mwavefrontsize32` / `-mtgsplit` (RDNA) appended in _device_cflags(spec)
+# from ARCH_TABLE[arch].hipcc_offload_arch + warp_size + features.
 LDFLAGS_BASE = ["-flto=full", "-Wl,--as-needed", "-Wl,--gc-sections", "-Wl,-O3", "-Wl,--icf=all"]
 ```
 
@@ -534,9 +746,9 @@ python -m grokking_optimizers.compile -O lion -M mamba -A sm_90 --mode exhaustiv
 
 | Mode | Behaviour |
 |------|-----------|
-| `--mode bayesian` (default) | Optuna TPE for N trials (default 500); top-K (default 20) neighbours refined at ±2 steps per dim. Study persists to SQLite for cross-run resume. |
-| `--mode exhaustive` | Every config surviving the static pre-filter is built and timed. Cache flushes every 5 trials (Ctrl-C safe). |
-| `--quick` | Alias: bayesian with 25 trials. |
+| `--mode bayesian` (default) | Optuna TPE. **Default `--bayesian-trials` is `None`** = auto early-stop on plateau / EI exhaustion / coverage saturation / `--max-tune-seconds`. **Default `--top-k` is `None`** = elbow detection on the timing curve. Set `--bayesian-trials N` to pin a fixed count. Study persists to SQLite for cross-run resume. |
+| `--mode exhaustive` | Every config surviving the static pre-filter is built and timed. Capped at 1M survivors (full Cartesian is 3.7B+ for sm_90a). Cache flushes every 5 trials (Ctrl-C safe). |
+| `--quick` | Alias: bayesian with 25 trials (small fixed count for fast self-tests). |
 
 #### Search-space schema
 
