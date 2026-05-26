@@ -2044,17 +2044,24 @@ def _suggest(trial: optuna.Trial, dims: List[Dict[str, Any]]) -> Dict[str, Any]:
 def _make_trial_record(stage: str, trial_num: int, cfg: Dict[str, Any],
                        result: TimerResult, host: Optional[Dict[str, Any]] = None
                        ) -> Dict[str, Any]:
+    # Stream 10: pull the per-variant numerical-validation tag set by
+    # _make_variant_timer (keyed by config_key). Trials that never went
+    # through the variant timer (e.g. synthetic self-test trials, or
+    # infeasible / build-fail trials) get "skipped" by default.
+    ckey = config_key(cfg)
+    num_status = _LAST_NUMERICAL_STATUS.get(ckey, "skipped")
     return {
         "trial_num":   trial_num,
         "stage":       stage,
         "config":      {k: (list(v) if isinstance(v, tuple) else v)
                         for k, v in cfg.items()},
-        "config_key":  config_key(cfg),
+        "config_key":  ckey,
         "timing_ms":   result["timing_ms"] if result else None,
         "min_ms":      result["min_ms"]    if result else None,
         "max_ms":      result["max_ms"]    if result else None,
         "n":           result["n"]         if result else None,
         "host":        host,
+        "numerical_status": num_status,
         "recorded_at": datetime.datetime.now().isoformat(),
     }
 
@@ -2235,13 +2242,33 @@ def topk_refine(
     return records
 
 
-def pick_winner(all_trials: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Lowest timing across all stages. Returns the winning trial record
-    (with ``config`` and ``timing_ms``) or ``None``."""
-    finished = [t for t in all_trials if t["timing_ms"] is not None]
-    if not finished:
+def pick_winner(all_trials: List[Dict[str, Any]], *,
+                strict_numerics: bool = False) -> Optional[Dict[str, Any]]:
+    """Lowest timing across all stages, after numerical-validation filtering.
+
+    Stream 10 filter rules:
+      * Always exclude trials whose ``numerical_status`` is
+        ``"numerical_fail"`` — that variant produced an output outside
+        tolerance vs. the reference and is unsafe to ship as the winner.
+      * When ``strict_numerics=True``, only trials tagged
+        ``"deterministic"`` are eligible (i.e. bit-identical to the
+        reference AND bit-identical across a 3x re-run).
+
+    Returns the winning trial record (with ``config`` and ``timing_ms``)
+    or ``None`` if no trial is eligible.
+    """
+    finished = [t for t in all_trials if t.get("timing_ms") is not None]
+    # Trials produced before Stream 10 lack the numerical_status field;
+    # treat them as "skipped" so the existing winner-selection logic
+    # behaves identically for legacy caches.
+    eligible = [t for t in finished
+                if t.get("numerical_status", "skipped") != "numerical_fail"]
+    if strict_numerics:
+        eligible = [t for t in eligible
+                    if t.get("numerical_status") == "deterministic"]
+    if not eligible:
         return None
-    return min(finished, key=lambda t: t["timing_ms"])
+    return min(eligible, key=lambda t: t["timing_ms"])
 
 
 # ---------------------------------------------------------------------------
@@ -2606,6 +2633,9 @@ class BuildSpec:
     # §12 A1 / A2 — Hyperband pruner + transfer learning
     pruner: str = "none"              # "none" | "median" | "hyperband"
     transfer_learning: bool = False
+    # Stream 10 — per-variant numerical / differential validation
+    strict_numerics: bool = False     # require bit-identical determinism for winner
+    aot_so_path: Optional[Path] = None  # populated by build_aot; used by variant timer
 
 
 def _ensure_nvcc_on_path() -> Optional[str]:
@@ -3719,6 +3749,174 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
 # JIT autotune — orchestrates Bayesian / Exhaustive sweep + worker
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Stream 10 — per-variant numerical / differential validation
+# ---------------------------------------------------------------------------
+#
+# For each candidate variant we time we also do a forward pass on a fixed
+# input and compare the post-step parameter tensor against a known-good
+# reference output (captured once from the unoptimised AOT primary
+# artefact). Each variant is tagged with one of:
+#
+#   "ok"                 — output is within tolerance for its dtype
+#   "numerical_fail"     — output is outside tolerance
+#   "deterministic"      — bit-identical to reference (or 3 re-runs are
+#                          bit-identical when --strict-numerics is set)
+#   "non_deterministic"  — within-tolerance but not bit-identical under
+#                          3x re-run (only set in strict mode)
+#   "skipped"            — no reference available (e.g. Pallas), or the
+#                          numerical check itself errored
+#
+# Variants tagged "numerical_fail" are excluded from the winner pool in
+# ``pick_winner``. When ``--strict-numerics`` is set, only variants tagged
+# "deterministic" are eligible.
+#
+# Per-dtype tolerances (rtol, atol). Looser as the dtype gets narrower;
+# fp4 is the loosest because rounding error is huge. fp32 is tight: any
+# kernel that disagrees here is almost certainly wrong.
+TOLERANCES: Dict[str, Tuple[float, float]] = {
+    "fp32":    (1e-5, 1e-6),
+    "float32": (1e-5, 1e-6),
+    "fp16":    (1e-3, 1e-4),
+    "float16": (1e-3, 1e-4),
+    "bf16":    (1e-3, 1e-4),
+    "bfloat16":(1e-3, 1e-4),
+    "fp8":     (1e-2, 1e-3),
+    "fp4":     (5e-2, 1e-2),
+}
+
+
+# Sidecar dict — the variant timer writes a numerical_status entry here
+# keyed by config_key(); _make_trial_record reads it back so the existing
+# ``timer(cfg) -> result-dict`` signature stays unchanged.
+_LAST_NUMERICAL_STATUS: Dict[str, str] = {}
+
+
+def _capture_reference_output(aot_so_path: Path, opt_class: str,
+                              size: int, dtype: str,
+                              out_dir: Path) -> Path:
+    """Run the AOT optimiser once and save the post-step parameter tensor
+    as a .npy file. Cached per (opt, size, dtype) — re-uses an existing
+    snapshot if one is already on disk."""
+    ref_path = out_dir / f"ref_output_{opt_class}_{size}_{dtype}.npy"
+    if ref_path.exists():
+        return ref_path
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Tiny subprocess: load the AOT .so via torch.ops.load_library, run a
+    # single fused-step call, dump the resulting param tensor with numpy.
+    # Wrapped in a try/except so a missing torch op falls through to
+    # "skipped" upstream rather than crashing the entire autotune.
+    script = textwrap.dedent(f"""
+        import os, sys, numpy as np
+        os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
+        import torch
+        torch.ops.load_library(r'''{aot_so_path}''')
+        torch.manual_seed(0)
+        dtype = getattr(torch, '{dtype}')
+        param = torch.zeros({size}, dtype=dtype, device='cuda')
+        grad  = torch.ones( {size}, dtype=dtype, device='cuda')
+        m     = torch.zeros({size}, dtype=dtype, device='cuda')
+        v     = torch.zeros({size}, dtype=dtype, device='cuda')
+        op = getattr(torch.ops.grokking_optimizers,
+                     'fused_{opt_class.lower()}_simple_step', None)
+        if op is None:
+            sys.stderr.write('no fused op registered for {opt_class}\\n')
+            sys.exit(2)
+        op(param, grad, m, v, 1e-3, 0.9, 0.999, 1e-8, 0.01, 1.0)
+        np.save(r'''{ref_path}''', param.detach().cpu().numpy())
+        print('OK')
+    """)
+    r = subprocess.run([sys.executable, "-c", script],
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode != 0 or not ref_path.exists():
+        raise RuntimeError(
+            f"reference capture failed (rc={r.returncode}): "
+            f"stderr={r.stderr[-500:]}")
+    return ref_path
+
+
+def _compare_outputs(ref_path: Path, candidate_path: Path,
+                     dtype: str) -> Tuple[str, float]:
+    """Compare two .npy tensors. Returns (status, max_relative_error).
+
+    status is one of "ok" | "numerical_fail" | "deterministic". The
+    "deterministic" tag is set only when the two arrays are bit-identical
+    (np.array_equal). Strict-mode 3x re-run determinism is checked
+    separately by _check_determinism_3x.
+    """
+    import numpy as np
+    rtol, atol = TOLERANCES.get(dtype, (1e-3, 1e-4))
+    a = np.load(ref_path)
+    b = np.load(candidate_path)
+    if a.shape != b.shape:
+        return ("numerical_fail", float("inf"))
+    diff = np.abs(a.astype(np.float64) - b.astype(np.float64))
+    rel = diff / (np.abs(a).astype(np.float64) + atol)
+    max_rel = float(rel.max()) if rel.size else 0.0
+    if np.allclose(a, b, rtol=rtol, atol=atol, equal_nan=False):
+        if np.array_equal(a, b):
+            return ("deterministic", max_rel)
+        return ("ok", max_rel)
+    return ("numerical_fail", max_rel)
+
+
+def _dump_variant_output(variant_so: Path, opt_class: str, size: int,
+                         dtype: str, out_path: Path,
+                         timeout: int = 120) -> bool:
+    """Run the variant .so once and dump its post-step param tensor to
+    ``out_path``. Returns True on success."""
+    script = textwrap.dedent(f"""
+        import os, sys, numpy as np
+        os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
+        import torch
+        torch.ops.load_library(r'''{variant_so}''')
+        torch.manual_seed(0)
+        dtype = getattr(torch, '{dtype}')
+        param = torch.zeros({size}, dtype=dtype, device='cuda')
+        grad  = torch.ones( {size}, dtype=dtype, device='cuda')
+        m     = torch.zeros({size}, dtype=dtype, device='cuda')
+        v     = torch.zeros({size}, dtype=dtype, device='cuda')
+        op = getattr(torch.ops.grokking_optimizers,
+                     'fused_{opt_class.lower()}_simple_step', None)
+        if op is None:
+            sys.exit(2)
+        op(param, grad, m, v, 1e-3, 0.9, 0.999, 1e-8, 0.01, 1.0)
+        np.save(r'''{out_path}''', param.detach().cpu().numpy())
+        print('OK')
+    """)
+    try:
+        r = subprocess.run([sys.executable, "-c", script],
+                           capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0 and out_path.exists()
+    except Exception:
+        return False
+
+
+def _check_determinism_3x(variant_so: Path, opt_class: str, size: int,
+                          dtype: str, out_dir: Path) -> bool:
+    """Run the variant 3 times; return True iff all 3 outputs are
+    bit-identical to each other."""
+    import numpy as np
+    paths: List[Path] = []
+    for i in range(3):
+        p = out_dir / f"_det_check_{i}_{opt_class}_{size}_{dtype}.npy"
+        if p.exists():
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        if not _dump_variant_output(variant_so, opt_class, size, dtype, p):
+            return False
+        paths.append(p)
+    if len(paths) < 2:
+        return False
+    a = np.load(paths[0])
+    for p in paths[1:]:
+        if not np.array_equal(a, np.load(p)):
+            return False
+    return True
+
+
 def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
                     target: str) -> List[str]:
     """Macros + extra-flag overrides for one config × target."""
@@ -3742,6 +3940,40 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
     the cache, then asks the worker to time it (fallback: one-shot
     subprocess)."""
 
+    # Stream 10 — numerical validation context.
+    arch_entry = get_arch_entry(spec.arch)
+    aot_so = getattr(spec, "aot_so_path", None)
+    strict = bool(getattr(spec, "strict_numerics", False))
+    # Pallas has no per-variant .so; skip numerical validation entirely.
+    numerics_enabled = (arch_entry.vendor != "pallas"
+                        and aot_so is not None
+                        and Path(aot_so).exists())
+    variant_dump_dir = spec.out_dir / "variants"
+    variant_dump_dir.mkdir(parents=True, exist_ok=True)
+    # The reference output is captured lazily on the first variant so we
+    # don't pay for it when the autotune cache hits AOT-only or when the
+    # AOT .so doesn't expose the expected fused op.
+    ref_state: Dict[str, Any] = {"path": None, "tried": False,
+                                 "size": 4096, "dtype": "float32"}
+
+    def _resolve_ref() -> Optional[Path]:
+        if not numerics_enabled:
+            return None
+        if ref_state["path"] is not None:
+            return ref_state["path"]
+        if ref_state["tried"]:
+            return None
+        ref_state["tried"] = True
+        try:
+            p = _capture_reference_output(
+                Path(aot_so), OPT_CLASS[spec.optimizer],
+                ref_state["size"], ref_state["dtype"], spec.out_dir)
+            ref_state["path"] = p
+            return p
+        except Exception as exc:
+            report.write(f"  [numerical] reference capture skipped: {exc}\n")
+            return None
+
     def timer(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         ckey = config_key(config)
         host_extra = _variant_macros(config, dims, "host")
@@ -3758,25 +3990,77 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
             module_suffix=f"_{_short_key(ckey)}",
         )
         if variant_so is None:
+            _LAST_NUMERICAL_STATUS[ckey] = "skipped"
             return None
         cache.record_variant(spec.optimizer, spec.model, spec.arch,
                              ckey, variant_so)
 
-        result = None
-        if worker is not None and worker.alive():
-            result = worker.time(variant_so)
+        # Tell the inline timing script to dump the post-step param tensor
+        # so we can numerically compare against the reference. The env var
+        # is consumed by both the persistent worker subprocess and the
+        # one-shot fallback (they re-exec child Python with child_env()).
+        out_dump = variant_dump_dir / f"_out_{_short_key(ckey)}.npy"
+        if out_dump.exists():
+            try:
+                out_dump.unlink()
+            except OSError:
+                pass
+        prior_dump = os.environ.get("SG_DUMP_OUTPUT")
+        os.environ["SG_DUMP_OUTPUT"] = str(out_dump)
+        try:
+            result = None
+            if worker is not None and worker.alive():
+                result = worker.time(variant_so)
+                if result is None:
+                    report.write(f"    [worker time failed for {ckey}; "
+                                 "restart + fallback]\n")
+                    worker.restart()
             if result is None:
-                report.write(f"    [worker time failed for {ckey}; "
-                             "restart + fallback]\n")
-                worker.restart()
-        if result is None:
-            result = _time_variant_oneshot(
-                variant_so, OPT_CLASS[spec.optimizer], report=report)
-        # Update rolling window
+                result = _time_variant_oneshot(
+                    variant_so, OPT_CLASS[spec.optimizer], report=report)
+        finally:
+            if prior_dump is None:
+                os.environ.pop("SG_DUMP_OUTPUT", None)
+            else:
+                os.environ["SG_DUMP_OUTPUT"] = prior_dump
+
+        # Update rolling window before we do the numerical work — the
+        # numerical phase is sequential and we don't want it polluting
+        # the per-variant ETA estimate.
         elapsed = time.monotonic() - progress_state["last_start"]
         progress_state["window"].append(elapsed)
         if len(progress_state["window"]) > 20:
             progress_state["window"].pop(0)
+
+        # ── Numerical validation pass ───────────────────────────────────
+        num_status = "skipped"
+        if result is not None and numerics_enabled:
+            ref_path = _resolve_ref()
+            if ref_path is not None and out_dump.exists():
+                try:
+                    num_status, max_rel = _compare_outputs(
+                        ref_path, out_dump, ref_state["dtype"])
+                    report.write(
+                        f"    [numerical] {ckey[:24]} {num_status} "
+                        f"(max_rel={max_rel:.3e})\n")
+                    # Strict mode: only "deterministic" trials are eligible
+                    # to win, so promote within-tolerance variants by
+                    # re-running 3x and checking for bit-identical outputs.
+                    if (strict and num_status in ("ok", "deterministic")):
+                        det = _check_determinism_3x(
+                            variant_so, OPT_CLASS[spec.optimizer],
+                            ref_state["size"], ref_state["dtype"],
+                            variant_dump_dir)
+                        num_status = ("deterministic" if det
+                                      else "non_deterministic")
+                        report.write(
+                            f"    [numerical:strict] {ckey[:24]} "
+                            f"3x re-run -> {num_status}\n")
+                except Exception as exc:
+                    report.write(
+                        f"    [numerical] {ckey[:24]} skipped: {exc}\n")
+                    num_status = "skipped"
+        _LAST_NUMERICAL_STATUS[ckey] = num_status
         return result
 
     return timer
@@ -3794,7 +4078,7 @@ def _short_key(ckey: str) -> str:
 # ---------------------------------------------------------------------------
 
 _TIMING_SCRIPT = r"""
-import sys, json, importlib.util, traceback
+import sys, os, json, importlib.util, traceback
 try:
     import torch
     if not torch.cuda.is_available():
@@ -3828,6 +4112,18 @@ try:
         torch.cuda.synchronize()
         timings.append(s.elapsed_time(e))
     timings.sort()
+    # Stream 10: dump post-step parameter tensor for numerical validation
+    # when SG_DUMP_OUTPUT is set. Side-effect only — does NOT change the
+    # JSON timing output that the caller parses.
+    dump_path = os.environ.get("SG_DUMP_OUTPUT")
+    if dump_path:
+        try:
+            import numpy as _np
+            _np.save(dump_path, p.detach().cpu().numpy())
+        except Exception as _dexc:
+            # Don't let a dump failure mask the timing result — the
+            # numerical layer will see the missing file and tag "skipped".
+            sys.stderr.write("[dump-output] " + repr(_dexc) + "\n")
     print(json.dumps({
         "timing_ms": timings[len(timings) // 2],
         "min_ms":    timings[0],
@@ -4007,6 +4303,9 @@ def _run_exhaustive(spec: BuildSpec, configs: List[Dict[str, Any]],
             t0 = time.monotonic()
             result = timer(cfg)
             elapsed = time.monotonic() - t0
+            # Stream 10: per-variant numerical-validation tag is stashed
+            # by the variant timer under config_key(cfg).
+            num_status = _LAST_NUMERICAL_STATUS.get(ckey, "skipped")
             trial = {
                 "trial_num":   i,
                 "stage":       "exhaustive",
@@ -4017,6 +4316,7 @@ def _run_exhaustive(spec: BuildSpec, configs: List[Dict[str, Any]],
                 "max_ms":      result["max_ms"]    if result else None,
                 "n":           result["n"]         if result else None,
                 "host":        _current_host(),
+                "numerical_status": num_status,
                 "recorded_at": datetime.datetime.now().isoformat(),
                 "status":      "ok" if result else "fail",
                 "build_s":     elapsed,
@@ -4024,9 +4324,19 @@ def _run_exhaustive(spec: BuildSpec, configs: List[Dict[str, Any]],
             cache.record_trial(spec.optimizer, spec.model, spec.arch, trial)
             if result is not None:
                 ms = result["timing_ms"]
-                report.write(f"    median={ms:.4f}ms\n")
-                if best is None or ms < (best.get("timing_ms") or float("inf")):
-                    best = {**cfg, "timing_ms": ms, "config_key": ckey}
+                # Stream 10 — exclude numerically failing variants from
+                # the running best; in strict mode require deterministic.
+                if num_status == "numerical_fail":
+                    report.write(f"    median={ms:.4f}ms  "
+                                 f"[EXCLUDED: numerical_fail]\n")
+                elif spec.strict_numerics and num_status != "deterministic":
+                    report.write(f"    median={ms:.4f}ms  "
+                                 f"[EXCLUDED: strict requires deterministic, "
+                                 f"got {num_status}]\n")
+                else:
+                    report.write(f"    median={ms:.4f}ms ({num_status})\n")
+                    if best is None or ms < (best.get("timing_ms") or float("inf")):
+                        best = {**cfg, "timing_ms": ms, "config_key": ckey}
             else:
                 report.write(f"    FAIL ({elapsed:.1f}s)\n")
             step(f"best={best['timing_ms']:.3f}ms" if best else "no winner yet")
@@ -4123,10 +4433,26 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
         cache.record_trial(spec.optimizer, spec.model, spec.arch, t)
     cache.save()
 
-    winner = pick_winner(tpe_trials + refine_trials)
+    winner = pick_winner(tpe_trials + refine_trials,
+                         strict_numerics=spec.strict_numerics)
     if winner is None:
-        report.write("\n  [bayesian] no successful trials — "
-                     "leaving tuned_config unset.\n")
+        # Note: pick_winner may have returned None purely because no
+        # surviving trial passed numerical validation (or, in strict
+        # mode, no trial was bit-identical-deterministic across the
+        # 3x re-run). Report the breakdown so the user can lower
+        # --strict-numerics or widen the search space.
+        finished = [t for t in (tpe_trials + refine_trials)
+                    if t.get("timing_ms") is not None]
+        ns_counts: Dict[str, int] = {}
+        for t in finished:
+            s = t.get("numerical_status", "skipped")
+            ns_counts[s] = ns_counts.get(s, 0) + 1
+        report.write(
+            f"\n  [bayesian] no successful trials — "
+            f"leaving tuned_config unset.\n"
+            f"  [bayesian] numerical_status breakdown of "
+            f"timed trials: {ns_counts} "
+            f"(strict_numerics={spec.strict_numerics})\n")
         return None
     out = dict(winner["config"])
     out["timing_ms"] = winner["timing_ms"]
@@ -4485,6 +4811,7 @@ def build(
     bootstrap_cuda: bool = False,
     pruner: str = "none",
     transfer_learning: bool = False,
+    strict_numerics: bool = False,
 ) -> Optional[Path]:
     """In-process orchestrator. ``main`` handles subprocess split.
 
@@ -4572,6 +4899,7 @@ def build(
         bayesian_trials=bayesian_trials, top_k=top_k, seed=seed,
         debug_symbols=debug_symbols, debug=debug,
         pruner=pruner, transfer_learning=transfer_learning,
+        strict_numerics=strict_numerics,
     )
     _validate(spec)
     spec.out_dir.mkdir(parents=True, exist_ok=True)
@@ -4659,9 +4987,26 @@ def build(
                 if runtime in ("aot", "both"):
                     report.write("\n--- AOT PHASE ---\n")
                     so_path = build_aot(spec, cache, report)
+                    # Stream 10: stash the AOT primary artefact path on
+                    # the spec so the variant timer can use it as the
+                    # numerical-validation reference.
+                    if so_path is not None:
+                        spec.aot_so_path = so_path
                     step("aot")
                 if runtime in ("jit", "both") and autotune:
                     report.write("\n--- JIT AUTOTUNE PHASE ---\n")
+                    # If we entered jit-only without a fresh AOT this run,
+                    # try to surface the cached AOT primary artefact for
+                    # the numerical-validation reference.
+                    if spec.aot_so_path is None:
+                        try:
+                            _e = cache.get(spec.optimizer, spec.model,
+                                           spec.arch)
+                            _art = _e.get("primary_artifact") if _e else None
+                            if _art and _art.get("path"):
+                                spec.aot_so_path = Path(_art["path"])
+                        except Exception:
+                            pass
                     so_path = build_jit(spec, cache, report) or so_path
                     step("jit-autotune")
                 if runtime in ("jit", "both"):
@@ -4815,6 +5160,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "wheels (nvcc + runtime + CCCL + NVRTC) and "
                              "retry. Use this on Colab CPU runtimes or any "
                              "fresh host without a system CUDA install.")
+    # Stream 10 — numerical / differential validation
+    parser.add_argument("--strict-numerics", action="store_true",
+                        help="Require bit-identical determinism for the "
+                             "winning variant. Variants tagged "
+                             "numerical_fail are always excluded; with this "
+                             "flag, only variants that produce the same "
+                             "output as the AOT reference AND are "
+                             "bit-identical across a 3x re-run "
+                             "(tag=deterministic) are eligible.")
     args = parser.parse_args(argv)
     if args.debug:
         args.verbose = True
@@ -4874,6 +5228,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         bootstrap_cuda=args.bootstrap_cuda,
         pruner=args.pruner,
         transfer_learning=args.transfer_learning,
+        strict_numerics=args.strict_numerics,
     )
 
     report = args.report or (
@@ -5322,6 +5677,134 @@ def _self_test() -> int:
 
     _run("arch_table_completeness", test_arch_table_completeness)
     _run("arch_table_gencode_format", test_arch_table_gencode_format)
+
+    # ── Stream 10 — numerical / differential validation ──────────────
+    sys.stdout.write("[self-test] numerical_validation\n")
+
+    def test_compare_outputs_tolerant():
+        import numpy as np
+        td = Path(tempfile.mkdtemp())
+        try:
+            ref = td / "ref.npy"
+            cand_ok = td / "ok.npy"
+            np.save(ref,     np.array([1.0, 2.0, 3.0], dtype=np.float32))
+            np.save(cand_ok, np.array([1.0, 2.0, 3.0 + 1e-7],
+                                      dtype=np.float32))
+            status, _ = _compare_outputs(ref, cand_ok, "fp32")
+            assert status in ("ok", "deterministic"), status
+        finally:
+            shutil.rmtree(td)
+
+    def test_compare_outputs_fail():
+        import numpy as np
+        td = Path(tempfile.mkdtemp())
+        try:
+            ref = td / "ref.npy"
+            cand_bad = td / "bad.npy"
+            np.save(ref,      np.array([1.0, 2.0, 3.0], dtype=np.float32))
+            np.save(cand_bad, np.array([1.0, 2.0, 100.0], dtype=np.float32))
+            status, _ = _compare_outputs(ref, cand_bad, "fp32")
+            assert status == "numerical_fail", status
+        finally:
+            shutil.rmtree(td)
+
+    def test_compare_outputs_deterministic():
+        import numpy as np
+        td = Path(tempfile.mkdtemp())
+        try:
+            ref = td / "ref.npy"
+            cand_det = td / "det.npy"
+            np.save(ref,      np.array([1.0, 2.0, 3.0], dtype=np.float32))
+            np.save(cand_det, np.array([1.0, 2.0, 3.0], dtype=np.float32))
+            status, _ = _compare_outputs(ref, cand_det, "fp32")
+            assert status == "deterministic", status
+        finally:
+            shutil.rmtree(td)
+
+    def test_compare_outputs_shape_mismatch():
+        import numpy as np
+        td = Path(tempfile.mkdtemp())
+        try:
+            ref = td / "ref.npy"
+            cand = td / "cand.npy"
+            np.save(ref,  np.array([1.0, 2.0, 3.0], dtype=np.float32))
+            np.save(cand, np.array([1.0, 2.0],      dtype=np.float32))
+            status, rel = _compare_outputs(ref, cand, "fp32")
+            assert status == "numerical_fail" and rel == float("inf")
+        finally:
+            shutil.rmtree(td)
+
+    def test_tolerances_table_shape():
+        # Both narrow and wide dtypes must be present and (rtol, atol)
+        # tuples. fp4 must be looser than fp32.
+        for k in ("fp32", "fp16", "bf16", "fp8", "fp4"):
+            assert k in TOLERANCES, k
+            rtol, atol = TOLERANCES[k]
+            assert rtol > 0 and atol > 0
+        assert TOLERANCES["fp4"][0] > TOLERANCES["fp32"][0]
+
+    def test_pick_winner_filters_numerical_fail():
+        trials = [
+            {"status": "ok", "value_ms": 0.5, "timing_ms": 0.5,
+             "numerical_status": "deterministic",
+             "stage": "b", "trial_num": 0, "config": {}, "error": None},
+            {"status": "ok", "value_ms": 0.3, "timing_ms": 0.3,
+             "numerical_status": "numerical_fail",
+             "stage": "b", "trial_num": 1, "config": {}, "error": None},
+            {"status": "ok", "value_ms": 0.4, "timing_ms": 0.4,
+             "numerical_status": "ok",
+             "stage": "b", "trial_num": 2, "config": {}, "error": None},
+        ]
+        w = pick_winner(trials)
+        assert w is not None and w["timing_ms"] == 0.4, w
+        w_strict = pick_winner(trials, strict_numerics=True)
+        assert w_strict is not None and w_strict["timing_ms"] == 0.5, w_strict
+
+    def test_pick_winner_strict_returns_none_when_no_deterministic():
+        trials = [
+            {"status": "ok", "timing_ms": 0.3,
+             "numerical_status": "ok",
+             "stage": "b", "trial_num": 0, "config": {}},
+            {"status": "ok", "timing_ms": 0.4,
+             "numerical_status": "non_deterministic",
+             "stage": "b", "trial_num": 1, "config": {}},
+        ]
+        # Non-strict mode picks the faster "ok" trial.
+        w = pick_winner(trials)
+        assert w is not None and w["timing_ms"] == 0.3
+        # Strict mode requires "deterministic" — neither qualifies.
+        assert pick_winner(trials, strict_numerics=True) is None
+
+    def test_make_trial_record_pulls_numerical_status():
+        # Prime the sidecar.
+        cfg = {"block": 128, "vec": 2, "unroll": 4}
+        ck = config_key(cfg)
+        _LAST_NUMERICAL_STATUS[ck] = "ok"
+        try:
+            rec = _make_trial_record("tpe", 0, cfg,
+                                     {"timing_ms": 1.0, "min_ms": 0.9,
+                                      "max_ms": 1.1, "n": 21})
+            assert rec["numerical_status"] == "ok", rec
+            # Unknown config_key falls back to "skipped".
+            rec2 = _make_trial_record("tpe", 1, {"block": 999, "vec": 1,
+                                                 "unroll": 1},
+                                      {"timing_ms": 1.0, "min_ms": 0.9,
+                                       "max_ms": 1.1, "n": 21})
+            assert rec2["numerical_status"] == "skipped", rec2
+        finally:
+            _LAST_NUMERICAL_STATUS.pop(ck, None)
+
+    _run("tolerances_table_shape", test_tolerances_table_shape)
+    _run("compare_outputs_tolerant", test_compare_outputs_tolerant)
+    _run("compare_outputs_numerical_fail", test_compare_outputs_fail)
+    _run("compare_outputs_deterministic", test_compare_outputs_deterministic)
+    _run("compare_outputs_shape_mismatch", test_compare_outputs_shape_mismatch)
+    _run("pick_winner_excludes_numerical_fail",
+         test_pick_winner_filters_numerical_fail)
+    _run("pick_winner_strict_requires_deterministic",
+         test_pick_winner_strict_returns_none_when_no_deterministic)
+    _run("make_trial_record_propagates_numerical_status",
+         test_make_trial_record_pulls_numerical_status)
 
     sys.stdout.write(f"\n[self-test] {passed} passed, {failures} failed\n")
     return 1 if failures else 0
