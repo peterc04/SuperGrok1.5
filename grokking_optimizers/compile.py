@@ -860,9 +860,67 @@ DEFAULT_SEARCH_SPACE = "<full-programmatic>"
 
 
 def _dim(name: str, dtype: str, values: List[Any], macro: Optional[str],
-         applies_to: List[str]) -> Dict[str, Any]:
+         applies_to: List[str], kind: str = "macro") -> Dict[str, Any]:
+    """One tuning dimension.
+
+    ``kind`` is one of:
+      - ``"macro"`` (default): becomes a ``-DSG_TUNED_*=VAL`` flag passed to nvcc/hipcc.
+      - ``"pallas_kwarg"``: passed as a keyword argument to ``pl.pallas_call``.
+      - ``"nvcc_flag"`` / ``"hipcc_flag"``: promoted to a bare compiler flag
+        (handled out-of-band, e.g. ``maxrregcount``).
+    """
     return {"name": name, "type": dtype, "values": values,
-            "macro": macro, "applies_to": applies_to}
+            "macro": macro, "applies_to": applies_to, "kind": kind}
+
+
+# ===========================================================================
+# Stream 2: per-arch search-space builders
+# ===========================================================================
+#
+# Each ``_xxx_full_space()`` consults ``ARCH_TABLE[arch].features`` to decide
+# which dims to emit. The builders share infrastructure via helper functions
+# below; arch-specific logic lives in the per-arch builder.
+#
+# Cardinality target: 10^6 .. 10^13 per CUDA/HIP arch; 10 .. 10^6 per Pallas
+# arch (the Pallas spaces are kwargs to ``pl.pallas_call`` not -D macros).
+
+
+# ---- Shared dim builders --------------------------------------------------
+
+def _maxrregcount_values(arch_key: str) -> List[int]:
+    """Per-arch maxrregcount range, capped at max_regs_per_thread."""
+    entry = ARCH_TABLE[arch_key]
+    cap = entry.max_regs_per_thread or 255
+    # Per spec: [24, 28, 32, ..., 248] in 4-step increments, capped per arch.
+    floor_n = max(24, (cap // 8) * 4 // 4 * 4)  # at least max_regs/8 *4 step
+    floor_n = max(24, (cap // 8))
+    # Snap floor to a multiple of 4.
+    floor_n = max(24, (floor_n + 3) // 4 * 4)
+    vals = list(range(floor_n, min(249, cap + 1), 4))
+    if cap >= 255 and 255 not in vals:
+        vals.append(255)
+    return vals or [cap]
+
+
+def _cuda_block_values(arch_key: str) -> List[int]:
+    entry = ARCH_TABLE[arch_key]
+    max_threads = entry.max_threads_per_block or 1024
+    # CUDA: warp_size=32, step 32.
+    return list(range(32, max_threads + 1, 32))
+
+
+def _cdna_block_values(arch_key: str) -> List[int]:
+    entry = ARCH_TABLE[arch_key]
+    max_threads = entry.max_threads_per_block or 1024
+    # CDNA: wavefront=64, step 64.
+    return list(range(64, max_threads + 1, 64))
+
+
+def _rdna_block_values(arch_key: str) -> List[int]:
+    entry = ARCH_TABLE[arch_key]
+    max_threads = entry.max_threads_per_block or 1024
+    # RDNA: wave32 native, but blocks step in 32.
+    return list(range(32, max_threads + 1, 32))
 
 
 def _hopper_cluster_shapes() -> List[List[int]]:
@@ -876,59 +934,361 @@ def _hopper_cluster_shapes() -> List[List[int]]:
     return out
 
 
+def _blackwell_cluster_shapes() -> List[List[int]]:
+    """Blackwell datacenter — cluster volume up to 16 CTAs (vs Hopper's 8)."""
+    out: List[List[int]] = []
+    for m in (1, 2, 4, 8, 16):
+        for n in (1, 2, 4, 8, 16):
+            for p in (1, 2, 4, 8):
+                if m * n * p <= 16:
+                    out.append([m, n, p])
+    return out
+
+
+# ---- Shared prefilter rule builders --------------------------------------
+
+def _cuda_common_rules(arch_key: str) -> List[Dict[str, str]]:
+    entry = ARCH_TABLE[arch_key]
+    warp = entry.warp_size or 32
+    max_threads = entry.max_threads_per_block or 1024
+    smem = entry.max_smem_per_block or (48 * 1024)
+    return [
+        {"name": "block_le_max_threads",
+         "expr": f"block <= {max_threads}"},
+        {"name": "block_warp_aligned",
+         "expr": f"block % {warp} == 0"},
+        {"name": "vec_block_alignment",
+         "expr": "block % (vec * 4) == 0"},
+        # Smem heuristic: block * num_stages * 4 * vec ≤ max_smem_per_block.
+        {"name": "smem_budget",
+         "expr": f"(block * num_stages * 4 * vec) <= {smem}"},
+    ]
+
+
+def _cdna_common_rules(arch_key: str) -> List[Dict[str, str]]:
+    entry = ARCH_TABLE[arch_key]
+    max_threads = entry.max_threads_per_block or 1024
+    smem = entry.max_smem_per_block or (64 * 1024)
+    return [
+        {"name": "block_le_max_threads",
+         "expr": f"block <= {max_threads}"},
+        {"name": "block_wave64_aligned",
+         "expr": "block % 64 == 0"},
+        {"name": "vec_block_alignment",
+         "expr": "block % (vec * 4) == 0"},
+        {"name": "lds_budget",
+         "expr": f"(block * num_stages * 4 * vec) <= {smem}"},
+        # Combined waves_per_eu × per-thread reg budget heuristic.
+        {"name": "occupancy_budget",
+         "expr": "(block * (waves_per_eu if waves_per_eu else 1) * vec * 4) <= 65536"},
+    ]
+
+
+def _rdna_common_rules(arch_key: str) -> List[Dict[str, str]]:
+    entry = ARCH_TABLE[arch_key]
+    max_threads = entry.max_threads_per_block or 1024
+    smem = entry.max_smem_per_block or (64 * 1024)
+    return [
+        {"name": "block_le_max_threads",
+         "expr": f"block <= {max_threads}"},
+        {"name": "block_wave_aligned",
+         "expr": "block % 32 == 0"},
+        {"name": "vec_block_alignment",
+         "expr": "block % (vec * 4) == 0"},
+        {"name": "lds_budget",
+         "expr": f"(block * num_stages * 4 * vec) <= {smem}"},
+    ]
+
+
+# ---- Generic CUDA builder -------------------------------------------------
+
+def _build_cuda_space(arch_key: str,
+                     vec_values: Optional[List[int]] = None,
+                     unroll_values: Optional[List[int]] = None,
+                     stages_values: Optional[List[int]] = None,
+                     ) -> Dict[str, Any]:
+    """Construct a CUDA arch's full search space from feature flags."""
+    entry = ARCH_TABLE[arch_key]
+    features = entry.features
+
+    if vec_values is None:
+        vec_values = [1, 2, 4, 8, 16]
+    if unroll_values is None:
+        unroll_values = [1, 2, 4, 8, 16, 32, 64, 128]
+    if stages_values is None:
+        stages_values = list(range(1, 9))
+
+    dims: List[Dict[str, Any]] = [
+        _dim("block", "int", _cuda_block_values(arch_key),
+             "SG_TUNED_BLOCK_SIZE", ["host", "device"]),
+        _dim("vec", "int", vec_values,
+             "SG_TUNED_VEC_WIDTH", ["host", "device"]),
+        _dim("unroll", "int", unroll_values,
+             "SG_TUNED_UNROLL", ["host", "device"]),
+        _dim("num_stages", "int", stages_values,
+             "SG_TUNED_NUM_STAGES", ["device"]),
+        _dim("maxrregcount", "int", _maxrregcount_values(arch_key),
+             None, ["device"]),
+        _dim("swizzle", "int", [0, 32, 64, 128, 256],
+             "SG_TUNED_SWIZZLE", ["device"]),
+    ]
+
+    rules = list(_cuda_common_rules(arch_key))
+
+    if "tma" in features:
+        dims.append(_dim("tma_descriptors", "int", [0, 1, 2, 4, 8],
+                         "SG_TUNED_TMA_DESCRIPTORS", ["device"]))
+        dims.append(_dim("async_depth", "int", list(range(1, 17)),
+                         "SG_TUNED_ASYNC_DEPTH", ["device"]))
+        rules.append({"name": "async_depth_stages",
+                      "expr": "async_depth >= num_stages - 1"})
+
+    if "wgmma" in features:
+        # sm_90a: base wgmma shapes; sm_100a/103a add tcgen05 variants.
+        wgmma_shapes = ["m64n8k16", "m64n16k16", "m64n32k16",
+                        "m64n64k16", "m64n128k16", "m64n256k16"]
+        if "tcgen05" in features:
+            wgmma_shapes += ["m128n128k16_tcgen05", "m128n256k16_tcgen05",
+                             "m256n256k16_tcgen05"]
+        dims.append(_dim("wgmma_shape", "enum", wgmma_shapes,
+                         "SG_TUNED_WGMMA_SHAPE", ["device"]))
+        dims.append(_dim("warp_specialization", "int", [0, 1],
+                         "SG_TUNED_WARP_SPECIALIZATION", ["device"]))
+
+    if "cluster" in features:
+        if "tcgen05" in features:
+            cluster_shapes = _blackwell_cluster_shapes()
+            volume_cap = 16
+        else:
+            cluster_shapes = _hopper_cluster_shapes()
+            volume_cap = 8
+        dims.append(_dim("cluster_shape", "tuple", cluster_shapes,
+                         "SG_TUNED_CLUSTER_SHAPE", ["device"]))
+        rules.append({"name": "cluster_volume",
+                      "expr": f"cluster_shape[0] * cluster_shape[1] * cluster_shape[2] <= {volume_cap}"})
+
+    if "fp8" in features:
+        dims.append(_dim("fp8_layout", "enum", ["none", "e4m3", "e5m2"],
+                         "SG_TUNED_FP8_LAYOUT", ["device"]))
+
+    if "fp4" in features:
+        dims.append(_dim("fp4_layout", "enum", ["none", "e2m1"],
+                         "SG_TUNED_FP4_LAYOUT", ["device"]))
+
+    if "tcgen05" in features:
+        dims.append(_dim("tcgen05_variant", "enum",
+                         ["tma_a", "tma_b", "mma", "tma_mma"],
+                         "SG_TUNED_TCGEN05_VARIANT", ["device"]))
+
+    return {
+        "dims": dims,
+        "prefilter": {
+            "register_pressure_max": entry.max_regs_per_thread or 255,
+            "smem_budget_bytes": entry.max_smem_per_block or (48 * 1024),
+            "rules": rules,
+        },
+    }
+
+
+# ---- Generic HIP builders -------------------------------------------------
+
+def _build_cdna_space(arch_key: str,
+                     mfma_shapes: Optional[List[str]] = None,
+                     vec_values: Optional[List[int]] = None,
+                     unroll_values: Optional[List[int]] = None,
+                     stages_values: Optional[List[int]] = None,
+                     extra_features: Optional[List[str]] = None,
+                     ) -> Dict[str, Any]:
+    """CDNA (gfx9xx) builder. Includes waves_per_eu, mfma, no tgsplit."""
+    entry = ARCH_TABLE[arch_key]
+    features = entry.features
+    extras = set(extra_features or [])
+
+    if vec_values is None:
+        vec_values = [1, 2, 4, 8, 16]
+    if unroll_values is None:
+        unroll_values = [1, 2, 4, 8, 16, 32, 64, 128]
+    if stages_values is None:
+        stages_values = list(range(1, 9))
+
+    dims: List[Dict[str, Any]] = [
+        _dim("block", "int", _cdna_block_values(arch_key),
+             "SG_TUNED_BLOCK_SIZE", ["host", "device"]),
+        _dim("vec", "int", vec_values,
+             "SG_TUNED_VEC_WIDTH", ["host", "device"]),
+        _dim("unroll", "int", unroll_values,
+             "SG_TUNED_UNROLL", ["host", "device"]),
+        _dim("num_stages", "int", stages_values,
+             "SG_TUNED_NUM_STAGES", ["device"]),
+        _dim("maxrregcount", "int", _maxrregcount_values(arch_key),
+             None, ["device"]),
+        _dim("lds_padding", "int", [0, 4, 8, 16, 32],
+             "SG_TUNED_LDS_PADDING", ["device"]),
+        _dim("waves_per_eu", "int", [0, 1, 2, 3, 4, 6, 8, 10],
+             "SG_TUNED_WAVES_PER_EU", ["device"]),
+    ]
+
+    if "mfma" in features:
+        if mfma_shapes is None:
+            mfma_shapes = ["m16n16k4", "m32n32k2", "m4n4k1"]
+        dims.append(_dim("mfma_shape", "enum", mfma_shapes,
+                         "SG_TUNED_MFMA_SHAPE", ["device"]))
+
+    if "fp8_mfma" in features:
+        dims.append(_dim("fp8_mfma_layout", "enum",
+                         ["none", "e4m3", "e5m2"],
+                         "SG_TUNED_FP8_MFMA_LAYOUT", ["device"]))
+
+    if "fp4_mfma" in features:
+        dims.append(_dim("fp4_mfma_layout", "enum",
+                         ["none", "e2m1"],
+                         "SG_TUNED_FP4_MFMA_LAYOUT", ["device"]))
+
+    # CDNA3+ scheduler hints.
+    if "cdna3_plus" in extras:
+        dims.append(_dim("scheduler_hint", "enum",
+                         ["none", "iglp", "sched_group_barrier"],
+                         "SG_TUNED_SCHEDULER_HINT", ["device"]))
+
+    return {
+        "dims": dims,
+        "prefilter": {
+            "register_pressure_max": entry.max_regs_per_thread or 255,
+            "waves_per_eu_max": 10,
+            "smem_budget_bytes": entry.max_smem_per_block or (64 * 1024),
+            "rules": _cdna_common_rules(arch_key),
+        },
+    }
+
+
+def _build_rdna_space(arch_key: str,
+                     vec_values: Optional[List[int]] = None,
+                     unroll_values: Optional[List[int]] = None,
+                     stages_values: Optional[List[int]] = None,
+                     wmma_shapes: Optional[List[str]] = None,
+                     ) -> Dict[str, Any]:
+    """RDNA (gfx10xx+) builder. Includes wmma, dpp, tgsplit; no waves_per_eu."""
+    entry = ARCH_TABLE[arch_key]
+    features = entry.features
+
+    if vec_values is None:
+        vec_values = [1, 2, 4, 8, 16]
+    if unroll_values is None:
+        unroll_values = [1, 2, 4, 8, 16, 32, 64, 128]
+    if stages_values is None:
+        stages_values = list(range(1, 9))
+
+    dims: List[Dict[str, Any]] = [
+        _dim("block", "int", _rdna_block_values(arch_key),
+             "SG_TUNED_BLOCK_SIZE", ["host", "device"]),
+        _dim("vec", "int", vec_values,
+             "SG_TUNED_VEC_WIDTH", ["host", "device"]),
+        _dim("unroll", "int", unroll_values,
+             "SG_TUNED_UNROLL", ["host", "device"]),
+        _dim("num_stages", "int", stages_values,
+             "SG_TUNED_NUM_STAGES", ["device"]),
+        _dim("maxrregcount", "int", _maxrregcount_values(arch_key),
+             None, ["device"]),
+        _dim("lds_padding", "int", [0, 4, 8, 16, 32],
+             "SG_TUNED_LDS_PADDING", ["device"]),
+    ]
+
+    if "wmma" in features:
+        if wmma_shapes is None:
+            wmma_shapes = ["m16n16k16_fp16", "m16n16k16_bf16",
+                           "m16n16k32_int8"]
+        dims.append(_dim("wmma_shape", "enum", wmma_shapes,
+                         "SG_TUNED_WMMA_SHAPE", ["device"]))
+
+    if "dpp" in features:
+        dims.append(_dim("dpp_modifier", "enum",
+                         ["none", "quad_perm", "row_shr", "wave_shr"],
+                         "SG_TUNED_DPP_MODIFIER", ["device"]))
+
+    if "tgsplit" in features:
+        dims.append(_dim("tgsplit", "int", [0, 1],
+                         "SG_TUNED_TGSPLIT", ["device"]))
+
+    if "fp8" in features:
+        dims.append(_dim("fp8_layout", "enum", ["none", "e4m3", "e5m2"],
+                         "SG_TUNED_FP8_LAYOUT", ["device"]))
+
+    return {
+        "dims": dims,
+        "prefilter": {
+            "register_pressure_max": entry.max_regs_per_thread or 255,
+            "smem_budget_bytes": entry.max_smem_per_block or (64 * 1024),
+            "rules": _rdna_common_rules(arch_key),
+        },
+    }
+
+
+# ---- Per-arch CUDA builders ----------------------------------------------
+
+def _sm75_full_space() -> Dict[str, Any]:
+    # Turing: no async_copy/bf16; smaller smem (100 KB); drop vec=16 and large unroll.
+    return _build_cuda_space(
+        "sm_75",
+        vec_values=[1, 2, 4, 8],
+        unroll_values=[1, 2, 4, 8, 16, 32, 64],
+        stages_values=[1, 2, 3, 4],
+    )
+
+
+def _sm80_full_space() -> Dict[str, Any]:
+    return _build_cuda_space("sm_80")
+
+
+def _sm86_full_space() -> Dict[str, Any]:
+    return _build_cuda_space("sm_86")
+
+
+def _sm89_full_space() -> Dict[str, Any]:
+    return _build_cuda_space("sm_89")
+
+
 def _sm90_full_space() -> Dict[str, Any]:
+    """Hopper: tma + wgmma + cluster + fp8. Keep the original tight shape."""
+    arch_key = "sm_90a"
+    entry = ARCH_TABLE[arch_key]
     return {
         "dims": [
-            # block: every warp-multiple from 32 up to the 1024 thread-per-CTA max.
             _dim("block", "int", list(range(32, 1025, 32)),
                  "SG_TUNED_BLOCK_SIZE", ["host", "device"]),
-            # vec: 1..16 — covers byte/short/int/long via LDG.E.{32,64,128}.
             _dim("vec", "int", [1, 2, 4, 8, 16],
                  "SG_TUNED_VEC_WIDTH", ["host", "device"]),
-            # unroll: powers of 2 up to 128 — broad sweep of compiler hints.
             _dim("unroll", "int", [1, 2, 4, 8, 16, 32, 64, 128],
                  "SG_TUNED_UNROLL", ["host", "device"]),
-            # num_stages: full Hopper async-pipeline depth range.
             _dim("num_stages", "int", list(range(1, 9)),
                  "SG_TUNED_NUM_STAGES", ["device"]),
-            # maxrregcount: every 4 from 32 to 252, plus the hard cap 255.
             _dim("maxrregcount", "int", list(range(32, 253, 4)) + [255],
-                 None, ["device"]),  # promoted to NVCC flag, not -D
-            # cluster_shape: every Hopper-legal (m, n, p) cluster geometry.
+                 None, ["device"]),
             _dim("cluster_shape", "tuple", _hopper_cluster_shapes(),
                  "SG_TUNED_CLUSTER_SHAPE", ["device"]),
-            # swizzle: shared-memory bank-conflict avoidance patterns.
             _dim("swizzle", "enum", ["none", "xor2", "xor4", "xor8", "xor16"],
                  "SG_TUNED_SWIZZLE", ["device"]),
             _dim("warp_specialization", "bool", [False, True],
                  "SG_TUNED_WARP_SPECIALIZATION", ["device"]),
             _dim("tma", "bool", [False, True],
                  "SG_TUNED_TMA", ["device"]),
-            # async_depth: 1..16 (cp.async pipeline depth on Hopper).
             _dim("async_depth", "int", list(range(1, 17)),
                  "SG_TUNED_ASYNC_DEPTH", ["device"]),
         ],
         "prefilter": {
             "register_pressure_max": 255,
-            "smem_budget_bytes": 232448,   # 227 KB usable smem per Hopper SM
+            "smem_budget_bytes": entry.max_smem_per_block or 232448,
             "rules": [
-                # Hopper: ≤32 warps per block.
                 {"name": "warps_per_block", "expr": "(block // 32) <= 32"},
-                # Vec loads need block % (vec * bytes_per_elem) == 0.
                 {"name": "vec_block_alignment",
                  "expr": "block % (vec * 4) == 0"},
-                # Pipelined kernels need enough warps to hide latency.
                 {"name": "stages_block",
                  "expr": "num_stages * vec <= block // 32"},
-                # TMA + warp specialisation need ≥ 1 dedicated warp.
                 {"name": "tma_requires_block",
                  "expr": "(not tma) or block >= 128"},
                 {"name": "warpspec_requires_block",
                  "expr": "(not warp_specialization) or block >= 128"},
-                # Cluster volume limit is 8 CTAs (Hopper hardware cap).
                 {"name": "cluster_volume",
                  "expr": "cluster_shape[0] * cluster_shape[1] * cluster_shape[2] <= 8"},
-                # Async depth ≥ stages-1 to keep the pipeline busy.
                 {"name": "async_depth_stages",
                  "expr": "async_depth >= num_stages - 1"},
             ],
@@ -936,13 +1296,57 @@ def _sm90_full_space() -> Dict[str, Any]:
     }
 
 
+def _sm100a_full_space() -> Dict[str, Any]:
+    return _build_cuda_space("sm_100a")
+
+
+def _sm103a_full_space() -> Dict[str, Any]:
+    return _build_cuda_space("sm_103a")
+
+
+def _sm120a_full_space() -> Dict[str, Any]:
+    # Blackwell consumer: fp8 + fp4 but no tma/wgmma/cluster/tcgen05.
+    return _build_cuda_space("sm_120a")
+
+
+# ---- Per-arch HIP builders -----------------------------------------------
+
+def _gfx906_full_space() -> Dict[str, Any]:
+    # Vega20: minimal MFMA shapes, shorter pipeline, drop vec=16.
+    return _build_cdna_space(
+        "gfx906",
+        mfma_shapes=["m16n16k4", "m32n32k2", "m4n4k1"],
+        vec_values=[1, 2, 4, 8],
+        unroll_values=[1, 2, 4, 8, 16, 32, 64],
+        stages_values=[1, 2, 3, 4],
+    )
+
+
+def _gfx908_full_space() -> Dict[str, Any]:
+    return _build_cdna_space(
+        "gfx908",
+        mfma_shapes=["m16n16k4", "m32n32k2", "m4n4k1",
+                     "m16n16k16_bf16", "m32n32k8_bf16"],
+    )
+
+
+def _gfx90a_full_space() -> Dict[str, Any]:
+    return _build_cdna_space(
+        "gfx90a",
+        mfma_shapes=["m16n16k4", "m32n32k2", "m4n4k1",
+                     "m16n16k16_bf16", "m32n32k8_bf16",
+                     "m16n16k4_fp64", "m32n32k4_fp64"],
+    )
+
+
 def _gfx942_full_space() -> Dict[str, Any]:
+    """CDNA3 (MI300X): full MFMA matrix + fp8 + scheduler hints."""
+    arch_key = "gfx942"
+    entry = ARCH_TABLE[arch_key]
     return {
         "dims": [
-            # block: every wavefront-multiple (64) up to 1024 threads/CTA.
             _dim("block", "int", list(range(64, 1025, 64)),
                  "SG_TUNED_BLOCK_SIZE", ["host", "device"]),
-            # vec: 1..8 — CDNA dwordx4 caps the meaningful vec at 4 for f32.
             _dim("vec", "int", [1, 2, 4, 8],
                  "SG_TUNED_VEC_WIDTH", ["host", "device"]),
             _dim("unroll", "int", [1, 2, 4, 8, 16, 32, 64, 128],
@@ -955,7 +1359,6 @@ def _gfx942_full_space() -> Dict[str, Any]:
                  "SG_TUNED_WAVES_PER_EU", ["device"]),
             _dim("lds_padding", "int", [0, 1, 2, 4, 8],
                  "SG_TUNED_LDS_PADDING", ["device"]),
-            # MFMA tile shapes — every public shape MI300X exposes.
             _dim("mfma_shape", "enum",
                  ["m16n16k16", "m32n32k8", "m16n16k32", "m32n32k16",
                   "m16n16k4f64", "m32n32k4f64", "m16n16k64fp8",
@@ -969,13 +1372,10 @@ def _gfx942_full_space() -> Dict[str, Any]:
         "prefilter": {
             "register_pressure_max": 256,
             "waves_per_eu_max": 10,
-            "smem_budget_bytes": 65536,   # 64 KB LDS per CU on CDNA3
+            "smem_budget_bytes": entry.max_smem_per_block or 65536,
             "rules": [
-                # CDNA3 wavefront = 64; block must be a multiple.
                 {"name": "wave_alignment", "expr": "block % 64 == 0"},
-                # ≤16 waves per block (1024 threads / 64 lanes).
                 {"name": "waves_per_block", "expr": "(block // 64) <= 16"},
-                # Occupancy ceiling: waves_per_eu * waves_per_block ≤ 20.
                 {"name": "waves_per_eu_total",
                  "expr": "waves_per_eu * (block // 64) <= 20"},
                 {"name": "vec_block_alignment",
@@ -986,30 +1386,247 @@ def _gfx942_full_space() -> Dict[str, Any]:
     }
 
 
-def build_full_search_space() -> Dict[str, Any]:
-    """Return the COMPLETE per-arch search space.
+def _gfx950_full_space() -> Dict[str, Any]:
+    # CDNA4 (MI350X): adds fp4_mfma.
+    return _build_cdna_space(
+        "gfx950",
+        mfma_shapes=["m16n16k16", "m32n32k8", "m16n16k32",
+                     "m32n32k16", "m16n16k64fp8", "m32n32k32fp8",
+                     "m16n16k128fp4", "m32n32k64fp4"],
+        extra_features=["cdna3_plus"],
+    )
 
-    No curated value lists; no hand-picked subsets. Every dim covers the
-    full range its hardware actually supports. The Cartesian product is
-    in the billions per arch — never materialize it as a list; use the
-    streaming ``cartesian()`` iterator and ``cartesian_count()`` instead.
 
-    Override with ``--search-space <path.yaml>`` if you genuinely want a
-    smaller curated space (e.g. for fast CI sweeps); the YAML schema is
-    the same shape as this dict.
-    """
+def _gfx1030_full_space() -> Dict[str, Any]:
+    # RDNA2: no wmma, no dpp/tgsplit features; minimal RDNA shape.
+    return _build_rdna_space(
+        "gfx1030",
+        vec_values=[1, 2, 4, 8],
+        unroll_values=[1, 2, 4, 8, 16, 32, 64],
+        stages_values=[1, 2, 3, 4],
+        wmma_shapes=None,  # gfx1030 has wmma feature flag
+    )
+
+
+def _gfx1100_full_space() -> Dict[str, Any]:
+    """RDNA3 (RX 7900, also reused for gfx1101/gfx1102)."""
+    return _build_rdna_space(
+        "gfx1100",
+        wmma_shapes=["m16n16k16_fp16", "m16n16k16_bf16",
+                     "m16n16k32_int8", "m16n16k32_int4"],
+    )
+
+
+def _gfx1151_full_space() -> Dict[str, Any]:
+    # RDNA3.5 (Strix Halo APU): same WMMA shapes as RDNA3.
+    return _build_rdna_space(
+        "gfx1151",
+        wmma_shapes=["m16n16k16_fp16", "m16n16k16_bf16",
+                     "m16n16k32_int8", "m16n16k32_int4"],
+    )
+
+
+def _gfx1200_full_space() -> Dict[str, Any]:
+    """RDNA4 (RX 9000, also reused for gfx1201). Adds fp8 + new WMMA shapes."""
+    return _build_rdna_space(
+        "gfx1200",
+        wmma_shapes=["m16n16k16_fp16", "m16n16k16_bf16",
+                     "m16n16k32_int8", "m16n16k32_int4",
+                     "m16n16k32_fp8_e4m3", "m16n16k32_fp8_e5m2",
+                     "m16n16k64_fp4"],
+    )
+
+
+# ---- Per-arch Pallas builders --------------------------------------------
+
+def _pallas_common_dims(extra_block_shapes: Optional[List[Tuple[int, int]]] = None,
+                       num_warps: Optional[List[int]] = None,
+                       num_stages: Optional[List[int]] = None,
+                       ) -> List[Dict[str, Any]]:
+    block_shapes = [(64, 64), (128, 128), (256, 256), (64, 256), (256, 64)]
+    if extra_block_shapes:
+        block_shapes = block_shapes + list(extra_block_shapes)
+    if num_warps is None:
+        num_warps = [1, 2, 4, 8]
+    if num_stages is None:
+        num_stages = [1, 2, 3, 4]
+    return [
+        _dim("block_shape", "tuple", block_shapes,
+             None, ["device"], kind="pallas_kwarg"),
+        _dim("num_warps", "int", num_warps,
+             None, ["device"], kind="pallas_kwarg"),
+        _dim("num_stages", "int", num_stages,
+             None, ["device"], kind="pallas_kwarg"),
+        _dim("dimension_semantics", "tuple",
+             [("parallel", "parallel"),
+              ("parallel", "sequential"),
+              ("sequential", "parallel")],
+             None, ["device"], kind="pallas_kwarg"),
+    ]
+
+
+def _pallas_common_prefilter() -> Dict[str, Any]:
+    # Pallas spaces are already tiny — just basic positivity.
     return {
-        "sm_90":   _sm90_full_space(),
-        "gfx942":  _gfx942_full_space(),
-        "tpu_v5p": {"dims": [], "prefilter": {"rules": []}},
+        "rules": [
+            {"name": "warps_positive", "expr": "num_warps >= 1"},
+            {"name": "stages_positive", "expr": "num_stages >= 1"},
+        ],
     }
 
 
-# Wire the existing search-space builders into the ARCH_TABLE entries.
-# Stream 2 owns extending these to the rest of the arches; the assignment
-# propagates through aliases because both keys reference the same ArchEntry.
-ARCH_TABLE["sm_90a"].search_space_builder = _sm90_full_space
-ARCH_TABLE["gfx942"].search_space_builder = _gfx942_full_space
+def _tpu_v4_full_space() -> Dict[str, Any]:
+    return {
+        "dims": _pallas_common_dims(),
+        "prefilter": _pallas_common_prefilter(),
+    }
+
+
+def _tpu_v5e_full_space() -> Dict[str, Any]:
+    return {
+        "dims": _pallas_common_dims(),
+        "prefilter": _pallas_common_prefilter(),
+    }
+
+
+def _tpu_v5p_full_space() -> Dict[str, Any]:
+    dims = _pallas_common_dims()
+    # sparsecore feature → optional sparsecore_axis dim.
+    if "sparsecore" in ARCH_TABLE["tpu_v5p"].features:
+        dims.append(_dim("sparsecore_axis", "enum", ["none", "0", "1"],
+                         None, ["device"], kind="pallas_kwarg"))
+    return {
+        "dims": dims,
+        "prefilter": _pallas_common_prefilter(),
+    }
+
+
+def _tpu_v6e_full_space() -> Dict[str, Any]:
+    # Trillium: add core_count.
+    dims = _pallas_common_dims()
+    dims.append(_dim("core_count", "int", [1, 2],
+                     None, ["device"], kind="pallas_kwarg"))
+    return {
+        "dims": dims,
+        "prefilter": _pallas_common_prefilter(),
+    }
+
+
+def _tpu_v7_full_space() -> Dict[str, Any]:
+    # Ironwood: larger blocks.
+    dims = _pallas_common_dims(
+        extra_block_shapes=[(512, 512), (1024, 256), (256, 1024)],
+    )
+    return {
+        "dims": dims,
+        "prefilter": _pallas_common_prefilter(),
+    }
+
+
+# ---- Wire builders into ARCH_TABLE ---------------------------------------
+
+# Maps canonical arch keys to their builder. RDNA3 variants (gfx1101/gfx1102)
+# reuse the gfx1100 builder; RDNA4 gfx1201 reuses gfx1200.
+_ARCH_BUILDERS: Dict[str, Callable[[], Dict[str, Any]]] = {
+    "sm_75":    _sm75_full_space,
+    "sm_80":    _sm80_full_space,
+    "sm_86":    _sm86_full_space,
+    "sm_89":    _sm89_full_space,
+    "sm_90a":   _sm90_full_space,
+    "sm_100a":  _sm100a_full_space,
+    "sm_103a":  _sm103a_full_space,
+    "sm_120a":  _sm120a_full_space,
+    "gfx906":   _gfx906_full_space,
+    "gfx908":   _gfx908_full_space,
+    "gfx90a":   _gfx90a_full_space,
+    "gfx942":   _gfx942_full_space,
+    "gfx950":   _gfx950_full_space,
+    "gfx1030":  _gfx1030_full_space,
+    "gfx1100":  _gfx1100_full_space,
+    "gfx1101":  _gfx1100_full_space,
+    "gfx1102":  _gfx1100_full_space,
+    "gfx1151":  _gfx1151_full_space,
+    "gfx1200":  _gfx1200_full_space,
+    "gfx1201":  _gfx1200_full_space,
+    "tpu_v4":   _tpu_v4_full_space,
+    "tpu_v5e":  _tpu_v5e_full_space,
+    "tpu_v5p":  _tpu_v5p_full_space,
+    "tpu_v6e":  _tpu_v6e_full_space,
+    "tpu_v7":   _tpu_v7_full_space,
+}
+
+
+def _populate_search_space_builders() -> None:
+    """Attach the per-arch search-space builder to every ArchEntry.
+
+    Runs at module import time, after ARCH_TABLE is fully defined and after
+    every ``_xxx_full_space()`` function exists. Both the canonical key and
+    any aliases share the same ArchEntry instance, so assigning once is
+    sufficient — but the dict-iteration form below is robust either way.
+    Falls back to ``object.__setattr__`` if ArchEntry ever becomes frozen.
+    """
+    for arch, builder in _ARCH_BUILDERS.items():
+        if arch not in ARCH_TABLE:
+            continue
+        entry = ARCH_TABLE[arch]
+        try:
+            entry.search_space_builder = builder
+        except (AttributeError, TypeError):
+            object.__setattr__(entry, "search_space_builder", builder)
+
+
+_populate_search_space_builders()
+
+
+def _canonical_arches() -> List[str]:
+    """Distinct canonical arch keys (skips aliases that share an entry)."""
+    seen_ids: set = set()
+    out: List[str] = []
+    for arch, entry in ARCH_TABLE.items():
+        if id(entry) in seen_ids:
+            continue
+        seen_ids.add(id(entry))
+        out.append(arch)
+    return out
+
+
+def build_full_search_space() -> Dict[str, Any]:
+    """Return the COMPLETE per-arch search space for every arch in ARCH_TABLE.
+
+    Iterates ``ARCH_TABLE.keys()`` (skipping alias entries that share the
+    same ``ArchEntry`` instance as a canonical key) and calls each entry's
+    ``search_space_builder``. Result is ``{arch: builder_result}``.
+
+    For backward compatibility, alias keys (``sm_90``, ``sm_100``, etc.)
+    receive the SAME built dict as their canonical counterpart so a call
+    like ``--arch sm_90`` still resolves a search space via ``space[arch]``.
+    The canonical 'a'-suffixed key is the source of truth; aliases reuse it.
+
+    Per-arch Cartesian product is enormous (10^6..10^13 per CUDA/HIP, 10..10^6
+    per Pallas) — never materialize as a list; use ``cartesian()`` /
+    ``cartesian_count()`` / ``ss_prefilter()`` instead.
+
+    Override the whole thing with ``--search-space <path.yaml>`` if you
+    genuinely want a smaller curated space (e.g. for fast CI sweeps).
+    """
+    out: Dict[str, Any] = {}
+    # First pass: build for each canonical arch.
+    canonical_built: Dict[int, Dict[str, Any]] = {}  # id(entry) -> built dict
+    for arch in _canonical_arches():
+        entry = ARCH_TABLE[arch]
+        builder = entry.search_space_builder
+        if builder is None:
+            continue
+        built = builder()
+        out[arch] = built
+        canonical_built[id(entry)] = built
+    # Second pass: replicate to aliases (shares the same ArchEntry instance).
+    for arch, entry in ARCH_TABLE.items():
+        if arch in out:
+            continue
+        if id(entry) in canonical_built:
+            out[arch] = canonical_built[id(entry)]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -4988,6 +5605,38 @@ def _self_test() -> int:
         assert h1 == h2
         assert h1 != hash_space(space, "gfx942")
 
+    def test_per_arch_search_space():
+        """Stream 2: every canonical arch in ARCH_TABLE has a builder
+        wired in, and its Cartesian product cardinality falls in the
+        arch-appropriate bounds (CUDA/HIP: 10^6..10^13; Pallas: 10..10^6)."""
+        space = build_full_search_space()
+        all_arches = _canonical_arches()
+        assert len(all_arches) >= 20, f"only {len(all_arches)} canonical arches"
+        for arch in all_arches:
+            assert arch in space, f"{arch} missing from full search space"
+            cnt = cartesian_count(space, arch)
+            vendor = ARCH_TABLE[arch].vendor
+            if vendor in ("cuda", "hip"):
+                assert 1_000_000 <= cnt <= 10**13, (
+                    f"{arch}: count {cnt} out of CUDA/HIP bounds")
+            else:  # pallas
+                assert 10 <= cnt <= 10**6, (
+                    f"{arch}: pallas count {cnt} out of bounds")
+            sys.stdout.write(
+                f"    [per_arch] {arch}({vendor}) cardinality={cnt:,}\n")
+
+    def test_alias_search_space_consistency():
+        """Aliases (sm_90, sm_100, ...) must return the same space dict
+        object as their canonical 'a' counterpart."""
+        space = build_full_search_space()
+        for alias, canonical in [("sm_90", "sm_90a"),
+                                  ("sm_100", "sm_100a"),
+                                  ("sm_103", "sm_103a"),
+                                  ("sm_120", "sm_120a")]:
+            assert alias in space and canonical in space
+            assert space[alias] is space[canonical], (
+                f"alias {alias} doesn't share dict with {canonical}")
+
     _run("load_yaml_validates_shape", test_load_yaml_validates_shape)
     _run("load_yaml_rejects_duplicate_dim", test_load_yaml_rejects_duplicate_dim)
     _run("embedded_yaml_loads", test_real_yaml_loads)
@@ -4995,6 +5644,8 @@ def _self_test() -> int:
     _run("prefilter_eliminates", test_prefilter_eliminates)
     _run("config_key_deterministic", test_config_key_deterministic)
     _run("hash_space_stable", test_hash_space_stable)
+    _run("per_arch_search_space", test_per_arch_search_space)
+    _run("alias_search_space_consistency", test_alias_search_space_consistency)
 
     sys.stdout.write("[self-test] pgo\n")
 
