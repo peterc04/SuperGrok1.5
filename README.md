@@ -13,9 +13,12 @@ conditions.
 
 ## Quickstart: clone → install → compile → profile
 
-Four steps from a fresh machine to a profiled artifact. Every step
-from "install dependencies" onward is Python so the whole flow can
-live in one script.
+Four Python steps from a fresh machine to a profiled artifact. Everything
+after Step 1 runs inside one Python session — no shell wrappers, no
+external config files, no extra modules in `grokking_optimizers/`. The
+entire MAXIMAL pipeline (codegen, NVRTC, device PGO, multi-GPU,
+numerical validation, TOML config loader, Pallas backend) lives inside
+`grokking_optimizers/compile.py`.
 
 ### Step 1 — Clone the repo
 
@@ -32,25 +35,30 @@ import subprocess, sys
 def pip_install(*pkgs):
     subprocess.run([sys.executable, "-m", "pip", "install", *pkgs], check=True)
 
+# Core deps for every arch.
 pip_install("torch", "optuna", "pyyaml", "ninja", "tqdm")
-# Add 'jax[tpu]' only if you target arch="tpu_v5p":
-#   pip_install("jax[tpu]", "-f",
-#               "https://storage.googleapis.com/jax-releases/libtpu_releases.html")
 
-# Optional: CUTLASS submodule for sm_90 CUTLASS GEMMs
+# Optional, only when the feature is enabled below:
+#   ENABLE_EMITTER       → pip_install("jinja2")
+#   ENABLE_RUNTIME_SPEC  → pip_install("cuda-python")    # NVRTC bindings
+#   STRICT_NUMERICS      → pip_install("numpy")          # almost certainly already present
+#   arch="tpu_v*"        → pip_install("jax[tpu]", "-f",
+#                            "https://storage.googleapis.com/jax-releases/libtpu_releases.html")
+
+# Optional: CUTLASS submodule for sm_90a CUTLASS GEMMs
 subprocess.run(["git", "submodule", "update", "--init", "--recursive",
                 "third_party/cutlass"], check=False)
 ```
 
-### Step 3 — Compile (one step, full debug output)
+### Step 3 — Compile (one Python block, every MAXIMAL feature available)
 
-Pick your `(optimizer, model, arch)` triple, set the toolchain env vars
-for your arch, and call `build(...)` with `debug=True`. This single
-block does AOT compile, Bayesian autotune (or exhaustive / PGO if you
-ask for it), final rebuild with the winning macros, and the profile
-pass — all streamed to your terminal in real time so you can see every
-compiler invocation, every autotune trial, every cache hit/miss, and
-the full env state.
+Pick your `(optimizer, model, arch)` triple, flip the feature toggles you
+want, and call `build(...)` with `debug=True`. The single block below
+does AOT compile, Bayesian autotune with **auto early-stop**, 3-pass
+PGO (plus optional CUPTI/rocprof device-PGO sidecar), final rebuild with
+the winning macros, and the profile pass — all streamed to your
+terminal so you can see every compiler invocation, every autotune trial,
+every cache hit/miss, and the full env state.
 
 **Important:** run Python from the repo root (the directory `cd`'d into
 in Step 1). The block below adds the repo root to `sys.path` so the
@@ -75,33 +83,86 @@ OPTIMIZER = "adamw"            # adamw | lion | grokfast | grokadamw | looksam |
                                # muon | neuralgrok | prodigy | supergrok11 |
                                # supergrok15 | supergrok2
 MODEL     = "decoder"          # mamba | decoder | vit
-ARCH      = "sm_90"            # sm_90 | gfx942 | tpu_v5p
+ARCH      = "sm_90a"           # See README "Hardware support — ARCH_TABLE" for
+                               # all 25 canonical archs. The "a" suffix is the
+                               # canonical Hopper/Blackwell form; bare "sm_90"
+                               # still works as an alias.
 
-# ─── TUNING KNOBS — all explicit so you can dial in what you want ─────────
-AUTOTUNE_MODE   = "bayesian"   # "bayesian" (TPE) | "exhaustive" (full sweep)
-BAYESIAN_TRIALS = 500          # # of Optuna TPE trials (try 1000+ for production)
-TOP_K           = 20           # # of top configs refined with ±2-step neighbours
-PRUNER          = "hyperband"  # "none" | "median" | "hyperband"  (§12 A1)
-TRANSFER        = True         # seed TPE from sibling-optimizer trials  (§12 A2)
-PGO             = True         # 3-pass instrument → workload → use     ◀───
-PGO_STEPS       = 1000         # # of opt.step() calls during PGO collect
-DEBUG_SYMBOLS   = False        # -ggdb / -lineinfo (auto-on with profile)
-SEED            = 0            # Optuna sampler seed (reproducibility)
-PROFILE_AFTER   = True         # run ncu/rocprof/jax.profiler after final link
-BOOTSTRAP_CUDA  = True         # auto-install nvcc if missing — probes conda /
+# ─── AUTOTUNE BUDGET — every value below is a CEILING / KNOB, not a target.
+#     The autotuner picks the actual kernel parameters from a per-arch
+#     programmatic space that's billions of candidates wide (build_full_
+#     search_space() in compile.py — sm_90a alone has ~3.7B configs).
+BAYESIAN_TRIALS = None         # None  ⇒ auto early-stop on plateau / EI
+                               # exhaustion / coverage saturation /
+                               # MAX_TUNE_SECONDS. Set to an int to pin a
+                               # fixed trial count.
+TOP_K           = None         # None  ⇒ elbow-of-timing-curve detection.
+                               # Set to an int to pin top-K refinement size.
+MAX_TUNE_SECONDS = None        # None  ⇒ no wall-clock cap. Set e.g. 900
+                               # to hard-stop after 15 min regardless of
+                               # convergence state.
+MIN_IMPROVEMENT  = 0.005       # plateau threshold (0.5% relative)
+PATIENCE         = None        # None  ⇒ auto = max(50, 0.1 × trials_done)
+PRUNER           = "hyperband" # "none" | "median" | "hyperband"
+TRANSFER         = True        # seed TPE from sibling-optimizer trials
+SEED             = 0           # Optuna sampler seed
+
+# ─── BUILD-TIME FEATURE TOGGLES (all default OFF; flip what you want) ────
+PGO                       = True   # host-side LLVM PGO 3-pass loop
+PGO_STEPS                 = 1000   # # of opt.step() calls during PGO collect
+ENABLE_DEVICE_PGO         = False  # CUPTI (NVIDIA) / rocprof (AMD) / XLA
+                                   # HLO (Pallas) stall-info sidecar — biases
+                                   # the autotuner toward stall-relieving
+                                   # configs. Needs nsys / rocprof on PATH.
+ENABLE_EMITTER            = False  # Render per-variant kernels from the
+                                   # bundled Jinja2 templates instead of -D
+                                   # macros. Needs jinja2.
+ENABLE_RUNTIME_SPEC       = False  # NVRTC / hipRTC runtime kernel
+                                   # specialization (KernelRegistry). Needs
+                                   # cuda-python or hip-python.
+STRICT_NUMERICS           = False  # Require bit-identical determinism for
+                                   # the winning variant (excludes
+                                   # numerical_fail; demands deterministic
+                                   # status on a 3x re-run).
+
+# ─── CACHE-GC KNOBS (Stream 9 — auto-prune runs after JIT autotune) ──────
+PRUNE_MAX_AGE_DAYS = 30        # drop variant_artifacts older than N days
+PRUNE_KEEP_TOP_N   = 100       # per (opt, model, arch) keep top-N fastest
+AUTO_PRUNE         = True      # disable with False if you want to keep
+                               # every variant_artifact across runs
+
+# ─── TOOLCHAIN BOOTSTRAP — all default OFF; flip if your host is missing.
+BOOTSTRAP_CUDA   = True        # NVIDIA: probes conda / NVIDIA apt repo /
                                # apt / dnf / yum / zypper / pacman / apk /
-                               # brew / winget on any Linux / macOS / Windows
-                               # / Colab / CI host (~1-2 GB, 2-5 min)
+                               # brew / winget / PyPI wheels — picks CUDA
+                               # version per arch (sm_120a → 12.8+,
+                               # sm_103a → 12.9+, sm_90a → 12.0+).
+BOOTSTRAP_ROCM   = False       # AMD: AMD's official apt repo per-arch
+                               # (gfx950 → ROCm 6.2+, gfx1200 → 7.0+),
+                               # falls back to stock apt / dnf / zypper.
+BOOTSTRAP_JAX    = False       # Pallas: pip install jax[tpu] from the
+                               # libtpu_releases bucket if no TPU device
+                               # is visible.
 
-# ─── TOOLCHAIN ENV — set BEFORE the grokking_optimizers import so torch's ─
-#     cpp_extension picks up CUDA_HOME / ROCM_HOME at its first import.    ─
-if ARCH == "sm_90":
-    os.environ["CUDA_HOME"] = "/usr/local/cuda"          # adjust to your install
+# ─── OTHER ────────────────────────────────────────────────────────────────
+DEBUG_SYMBOLS  = False         # -ggdb / -lineinfo (auto-on with profile)
+PROFILE_AFTER  = True          # run ncu/rocprof/jax.profiler after final link
+CONFIG_TOML    = None          # Path to your own compile_config.toml that
+                               # overrides _DEFAULT_PROJECT_CONFIG inside
+                               # compile.py. None ⇒ use inlined defaults.
+
+# ─── TOOLCHAIN ENV — set BEFORE the grokking_optimizers import so torch's
+#     cpp_extension picks up CUDA_HOME / ROCM_HOME at its first import. ──
+from grokking_optimizers.compile import get_arch_entry
+_vendor = get_arch_entry(ARCH).vendor
+if _vendor == "cuda":
+    os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")  # adjust to your install
     os.environ["PATH"] = f"{os.environ['CUDA_HOME']}/bin:{os.environ['PATH']}"
-elif ARCH == "gfx942":
-    os.environ["ROCM_PATH"] = "/opt/rocm"                # adjust to your install
+elif _vendor == "hip":
+    os.environ.setdefault("ROCM_PATH", "/opt/rocm")        # adjust to your install
     os.environ["PATH"] = f"{os.environ['ROCM_PATH']}/bin:{os.environ['PATH']}"
-# tpu_v5p needs no C++ toolchain — JAX/Pallas does codegen at runtime
+# Pallas (tpu_v4 / tpu_v5e / tpu_v5p / tpu_v6e / tpu_v7) needs no C++
+# toolchain — JAX/Pallas does codegen at runtime. BOOTSTRAP_JAX handles it.
 
 # ─── COMPILE — debug=True streams every step to stderr in real time ──────
 from grokking_optimizers.compile import build, CompileCache
@@ -112,19 +173,40 @@ so_path = build(
     model=MODEL,
     arch=ARCH,
     cache=cache,
-    debug=True,                       # stream the full report to stderr
+    debug=True,                                  # stream the full report
     autotune=True,
-    autotune_mode=AUTOTUNE_MODE,
+    autotune_mode="bayesian",                    # "bayesian" | "exhaustive"
+    # ── Autotune budget (auto by default) ──
     bayesian_trials=BAYESIAN_TRIALS,
     top_k=TOP_K,
+    max_tune_seconds=MAX_TUNE_SECONDS,
+    min_improvement=MIN_IMPROVEMENT,
+    patience=PATIENCE,
     pruner=PRUNER,
     transfer_learning=TRANSFER,
+    seed=SEED,
+    # ── PGO (host + optional device) ──
     pgo=PGO,
     pgo_steps=PGO_STEPS,
+    enable_device_pgo=ENABLE_DEVICE_PGO,         # CUPTI / rocprof / XLA HLO
+    # ── Codegen + runtime specialization ──
+    enable_emitter=ENABLE_EMITTER,               # Jinja2 per-variant emitter
+    enable_runtime_specialization=ENABLE_RUNTIME_SPEC,  # NVRTC / hipRTC
+    # ── Numerical validation ──
+    strict_numerics=STRICT_NUMERICS,
+    # ── Cache GC ──
+    prune_after_autotune=AUTO_PRUNE,
+    prune_max_age_days=PRUNE_MAX_AGE_DAYS,
+    prune_keep_top_n=PRUNE_KEEP_TOP_N,
+    # ── Toolchain bootstrap (vendor-dispatched) ──
+    bootstrap_cuda=BOOTSTRAP_CUDA,
+    bootstrap_rocm=BOOTSTRAP_ROCM,
+    bootstrap_jax=BOOTSTRAP_JAX,
+    # ── Outputs / misc ──
     profile=PROFILE_AFTER,
     debug_symbols=DEBUG_SYMBOLS,
-    seed=SEED,
-    bootstrap_cuda=BOOTSTRAP_CUDA,    # auto-install nvcc if missing
+    config=CONFIG_TOML,                          # None ⇒ inlined defaults
+    # ── CPU/GPU host split (uncomment for split deployments) ──
     # search_space_path=Path("my_search_space.yaml"),    # use your own YAML
     # aot_only=True, aot_artifact_dir=Path("build/aot"), # CPU-host AOT only
     # jit_only=True,                                     # GPU-host JIT only
@@ -132,30 +214,31 @@ so_path = build(
 print("built:", so_path)
 ```
 
-Why none of these are hardcoded: **the autotune is exactly what searches
-over the actual kernel parameters** (block size, vector width, unroll
-factor, num_stages, cluster shape, swizzle, warp-specialization, TMA,
-async-copy depth on sm_90; LDS padding, waves-per-EU, MFMA shape,
-scheduler hint on gfx942 — see `build_full_search_space()` in
-`compile.py` for the complete programmatic grid: **~3.7 billion sm_90
-candidates, ~700 M gfx942 candidates** before prefilter). The values above are the
-**budget** for that search (how many trials, which pruner, whether to
-warm-start from siblings); the autotune itself picks the kernel
-parameters from the search space. The winning config gets baked into
-`csrc/algorithms/tuned_configs.h` and the primary `.so` is rebuilt with
-those macros.
+Why most of these are `None` / `False` by default: **the autotune is
+exactly what searches over the actual kernel parameters** (block size,
+vector width, unroll factor, num_stages, cluster shape, swizzle,
+warp-specialization, TMA, async-copy depth on sm_90a; LDS padding,
+waves-per-EU, MFMA shape, scheduler hint on gfx942 — see
+`build_full_search_space()` in `compile.py` for the complete
+programmatic grid: **billions of candidates per arch** before prefilter,
+sampled directly via Optuna's `suggest_categorical` rather than
+materialized). The values above are the **budget** for that search (when
+to stop, which pruner, what to bootstrap, what extra layers to enable);
+the autotuner picks the kernel parameters from the search space. The
+winning config gets baked into `csrc/algorithms/tuned_configs.h` and the
+primary `.so` is rebuilt with those macros.
 
 What you will see streaming to your terminal with `debug=True`:
 
 ```
 ========================================================================
 [debug] grokking_optimizers.compile starting at 2026-05-26T...
-[debug] target:   adamw/decoder/sm_90 (vendor=cuda)
-[debug] runtime:  both  autotune=True (bayesian)  pgo=False  profile=True
+[debug] target:   adamw/decoder/sm_90a (vendor=cuda)
+[debug] runtime:  both  autotune=True (bayesian, auto-stop)  pgo=True  profile=True
 [debug] phases:   ['resolve', 'aot', 'jit-autotune', 'final', 'profile']
 [debug] out_dir:  /home/you/SuperGrok1.5/build/compiled
 [debug] cache:    /home/you/SuperGrok1.5/build/.compile_cache.json
-[debug] report:   /home/you/SuperGrok1.5/build/compiled/compile_adamw_decoder_sm_90.txt
+[debug] report:   /home/you/SuperGrok1.5/build/compiled/compile_adamw_decoder_sm_90a.txt
 [debug] env:      CUDA_HOME=/usr/local/cuda  ROCM_PATH=<unset>
 [debug] env:      PATH=...
 [debug] env:      FORCE_CUDA=<unset>  TORCH_CUDA_ARCH_LIST=<unset>
@@ -163,17 +246,23 @@ What you will see streaming to your terminal with `debug=True`:
 
 # grokking_optimizers.compile — targeted build
 # Generated: ...
+[preflight] arch=sm_90a need CUDA>=12.0 have 12.6 — PASS
 ... (full report contents, every line tee'd live) ...
 --- AOT PHASE ---
-  module:    grokking_compiled_adamw_decoder_sm_90
+  module:    grokking_compiled_adamw_decoder_sm_90a
   sources:   18 files
   host:      -O3 -std=c++17 ... (every cflag)
-  device:    -O3 --use_fast_math ... (every nvcc/hipcc flag)
+  device:    -O3 --use_fast_math -gencode=arch=compute_90a,code=sm_90a ...
   [toolchain] nvcc 12.6
   ... (verbose=True is auto-set, so every nvcc command + ninja line is printed)
 --- JIT AUTOTUNE PHASE ---
-  [prefilter] 24000 candidates → 384 survivors (23616 eliminated)
-  ... (every Optuna trial: config + timing) ...
+  [prefilter] 3,735,552,000 candidates → streaming (sm_90a full space)
+  Trial 1: block=128 vec=2 unroll=4 num_stages=3 ... → 1.42 ms
+  Trial 2: block=256 vec=4 unroll=8 num_stages=4 ... → 0.91 ms (new best)
+  ... (Optuna trials stream live with their numerical_status tag) ...
+  [early-stop] plateau:no_improvement_in_67 — stopped after 117 trials
+  [topk-refine] elbow detected at index 14 — refining 14 configs
+  [cache-prune] dropped 23 stale variant_artifacts, freed 412 MB
 --- PROFILE PASS ---
   ... (ncu / rocprof / jax.profiler output) ...
 ```
@@ -183,8 +272,13 @@ Outputs (also written even without `debug=True`):
 - `build/compiled/compile_<O>_<M>_<A>.txt` — full text report (the same
   thing you saw stream by)
 - `build/compiled/grokking_compiled_<O>_<M>_<A>/*.so` — the built kernel
+  (for Pallas archs: `tuned_pallas_<O>_<M>_<A>.json` instead — no `.so`)
 - `build/.compile_cache.json` — survives across runs; same combo is a
   cache-hit on every phase
+- `build/compiled/device_stall_info.json` — only when
+  `ENABLE_DEVICE_PGO=True` and CUPTI/rocprof produced something
+- `build/compiled/nvrtc_cache/*.cubin` — only when
+  `ENABLE_RUNTIME_SPEC=True`
 
 Common gotcha: `compile` AOT will fail with `CUDA_HOME environment
 variable is not set` even when `nvcc` is on `PATH` — torch's
@@ -205,14 +299,14 @@ from grokking_optimizers.profile import profile
 report = profile(
     optimizer="adamw",   # same OPTIMIZER you compiled in Step 3
     model="decoder",     # same MODEL
-    arch="sm_90",        # same ARCH
+    arch="sm_90a",       # same ARCH (canonical form with the "a" suffix)
     debug=True,          # stream ncu/rocprof/jax.profiler live
 )
 print("profile report:", report)
 
 # Or profile a specific .so / launcher source directly:
-# report = profile(path="build/compiled/grokking_compiled_adamw_decoder_sm_90/"
-#                        "grokking_compiled_adamw_decoder_sm_90.cpython-311-x86_64-linux-gnu.so",
+# report = profile(path="build/compiled/grokking_compiled_adamw_decoder_sm_90a/"
+#                        "grokking_compiled_adamw_decoder_sm_90a.cpython-311-x86_64-linux-gnu.so",
 #                  debug=True)
 ```
 
@@ -243,8 +337,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path.cwd()))   # assumes you're in SuperGrok1.5/
 
 from grokking_optimizers.compile import main as compile_main
-assert compile_main(["--self-test"]) == 0  # prints "[self-test] 18 passed, 0 failed"
+assert compile_main(["--self-test"]) == 0  # prints "[self-test] 81 passed, 0 failed"
 ```
+
+The self-test covers ARCH_TABLE completeness for all 25 archs,
+per-arch search-space cardinalities, native compiler flags, autotune
+early-stopping criteria, the bundled Jinja2 templates, NVRTC compile
+path (gated on cuda-python), device-PGO stall-to-bias mapping, cache
+GC, the multi-GPU pool, Pallas backend sentinels, numerical-validation
+tolerances, the TOML config loader, and toolchain-bootstrap dispatch —
+no GPU, nvcc, hipcc, or jax[tpu] required to pass it.
 
 ### Troubleshooting
 
@@ -254,6 +356,8 @@ assert compile_main(["--self-test"]) == 0  # prints "[self-test] 18 passed, 0 fa
 | `CUDA_HOME environment variable is not set` | `os.environ["CUDA_HOME"] = "/usr/local/cuda"` (Step 3 block already does this). Required even when `nvcc` is on `PATH`. |
 | `CUDA_HOME environment variable is not set` **but the debug banner shows it IS set** | Stale torch cache. `torch.utils.cpp_extension` reads `CUDA_HOME` at *its* import time; if torch was already loaded before you set the env var (common in Colab/Jupyter), the cached value is `None` and the build fails despite `os.environ` being correct. `build()` now calls `_refresh_torch_cuda_home()` on entry to patch the stale cache from `os.environ`. Pull the latest commit; this is fixed. |
 | `[preflight] WARNING: nvcc NOT found` | Pass `bootstrap_cuda=True` to `build()`. It probes `conda` / `apt-get` / `dnf` / `yum` / `zypper` / `pacman` / `apk` / `brew` / `winget` in priority order and installs nvcc via whichever your environment has — works on Colab, any Linux distro, macOS (legacy CUDA only), and Windows 10+. Pulls 1-2 GB and takes 2-5 min. |
+| `[preflight] arch=gfx942 ... hipcc not found — FAIL` | Pass `bootstrap_rocm=True` to `build()`. It probes AMD's official apt repo first (per-arch version: gfx950 → ROCm 6.2+, gfx1200 → ROCm 7.0+) then falls back to stock apt / dnf / zypper. |
+| `[preflight] arch=tpu_v5p JAX not installed — FAIL` | Pass `bootstrap_jax=True` to `build()`. It pip-installs `jax[tpu]` from the `libtpu_releases` bucket if no TPU device is currently visible to `jax.devices()`. |
 | `nvidia-cuda-nvcc-cuXX wheels installed but nvcc still not findable` | NVIDIA's PyPI wheels ship `ptxas + libnvvm + libcudart + headers` but NOT the `nvcc` compiler driver itself. The driver only comes from a native package manager (apt/dnf/yum/zypper/pacman/apk), `conda install -c nvidia cuda-nvcc`, `winget install Nvidia.CUDA`, or the official `.run` installer from `developer.nvidia.com/cuda-downloads`. `bootstrap_cuda=True` tries all of these and only falls back to wheels for the headers/libs. |
 | Build dies with `sh: /usr/local/cuda/bin/nvcc: not found` even though nvcc IS installed | Stale `CUDA_HOME`. You set `os.environ["CUDA_HOME"]` to a path (e.g. `/usr/local/cuda`) that doesn't actually contain `bin/nvcc` — but `nvcc` lives elsewhere (e.g. `/usr/bin/nvcc` from `apt`). `_ensure_nvcc_on_path()` now calls `_reconcile_cuda_home()` after every discovery to overwrite the stale env var with the actual nvcc parent. Pull the latest commit; this is fixed. |
 | `[preflight] WARNING: nvcc X.Y is too old for sm_90 (needs CUDA 12.0+)` | Stock distro packages are often years behind (Ubuntu 22.04's `nvidia-cuda-toolkit` = CUDA 11.5; sm_90 needs 12.0+). `bootstrap_cuda=True` now prefers NVIDIA's **official apt repo** (`developer.download.nvidia.com/compute/cuda/repos/...`) over the stock package, installing `cuda-toolkit-12-X` to `/usr/local/cuda/` — exactly what torch's cpp_extension expects. Manual recipe: download `cuda-keyring_1.1-1_all.deb`, `dpkg -i` it, `apt update`, then `apt install cuda-toolkit-12-6`. |
