@@ -2606,6 +2606,8 @@ class BuildSpec:
     # §12 A1 / A2 — Hyperband pruner + transfer learning
     pruner: str = "none"              # "none" | "median" | "hyperband"
     transfer_learning: bool = False
+    # Stream 8 — device-side PGO (CUPTI / rocprof / XLA HLO dump)
+    enable_device_pgo: bool = False
 
 
 def _ensure_nvcc_on_path() -> Optional[str]:
@@ -4350,6 +4352,31 @@ def _build_aot_pgo(spec: BuildSpec, cache: CompileCache, sources: List[Path],
         search_space_hash=space_hash,
     )
     cache.save()
+
+    # ── Stream 8 hook: device-side PGO (CUPTI / rocprof / XLA HLO) ────
+    # NVCC strips LLVM PGO from device code, so the 3-pass loop above only
+    # optimizes the host launchers. This hook complements it with vendor-
+    # specific stall sampling whose output (a JSON sidecar) the Bayesian
+    # autotuner can use to enqueue biased trials. The hook is a no-op
+    # unless ``spec.enable_device_pgo`` is True.
+    if getattr(spec, "enable_device_pgo", False):
+        try:
+            from grokking_optimizers.device_profiling import (
+                run_device_pgo_round,
+            )
+            device_workload_cmd = [
+                sys.executable, str(workload),
+                "--so",    str(so_path),
+                "--opt",   OPT_CLASS[spec.optimizer],
+                "--model", spec.model,
+                "--arch",  spec.arch,
+                "--steps", str(int(spec.pgo_steps)),
+            ]
+            run_device_pgo_round(
+                spec, device_workload_cmd, spec.out_dir, report)
+        except ImportError:
+            pass
+
     return so_path
 
 
@@ -4485,6 +4512,7 @@ def build(
     bootstrap_cuda: bool = False,
     pruner: str = "none",
     transfer_learning: bool = False,
+    enable_device_pgo: bool = False,
 ) -> Optional[Path]:
     """In-process orchestrator. ``main`` handles subprocess split.
 
@@ -4572,6 +4600,7 @@ def build(
         bayesian_trials=bayesian_trials, top_k=top_k, seed=seed,
         debug_symbols=debug_symbols, debug=debug,
         pruner=pruner, transfer_learning=transfer_learning,
+        enable_device_pgo=enable_device_pgo,
     )
     _validate(spec)
     spec.out_dir.mkdir(parents=True, exist_ok=True)
@@ -4789,6 +4818,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--pgo-steps", type=int, default=1000,
                         help="N optimizer.step() calls during profile "
                              "collection (default: 1000).")
+    # Stream 8 — device-side PGO (complements LLVM PGO which nvcc strips
+    # from device code). Collects CUPTI / rocprof / XLA stall info into a
+    # JSON sidecar consumed by the Bayesian autotuner.
+    parser.add_argument("--enable-device-pgo", action="store_true",
+                        help="Collect CUPTI / rocprof / XLA stall info as a "
+                             "PGO sidecar after the standard 3-pass loop. "
+                             "No-op when --pgo is off or the profiler tool "
+                             "(nsys / rocprof) is unavailable.")
 
     # ── Cross-host artefact dir ─────────────────────────────────────
     parser.add_argument("--aot-artifact-dir", type=Path, default=None,
@@ -4874,6 +4911,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         bootstrap_cuda=args.bootstrap_cuda,
         pruner=args.pruner,
         transfer_learning=args.transfer_learning,
+        enable_device_pgo=args.enable_device_pgo,
     )
 
     report = args.report or (
@@ -5042,6 +5080,131 @@ def _self_test() -> int:
     _run("hash_workload_changes", test_hash_workload_changes)
     _run("instrument_flags_cuda", test_instrument_flags_cuda)
     _run("use_flags_round_trip", test_use_flags_round_trip)
+
+    sys.stdout.write("[self-test] device_profiling\n")
+
+    def test_device_profiling_import():
+        from grokking_optimizers import device_profiling  # noqa: F401
+
+    def test_stall_to_bias_mapping():
+        from grokking_optimizers import device_profiling
+        hints = device_profiling._stall_to_bias_hints({
+            "long_scoreboard": 0.4,
+            "not_selected": 0.2,
+        })
+        assert "swizzle" in hints, hints
+        assert "waves_per_eu" in hints, hints
+        # Specific value recommendations must populate concrete values.
+        assert 64 in hints["swizzle"], hints["swizzle"]
+        assert 128 in hints["swizzle"], hints["swizzle"]
+
+    def test_stall_to_bias_empty_input():
+        from grokking_optimizers import device_profiling
+        assert device_profiling._stall_to_bias_hints({}) == {}
+        # All-low fractions: dim names still seeded (top-5 above 5%
+        # threshold), but no specific value recommendations.
+        h = device_profiling._stall_to_bias_hints({"long_scoreboard": 0.01})
+        assert h == {}, f"low-fraction stall should not bias: {h}"
+
+    def test_bias_trial_queue_enqueues():
+        from grokking_optimizers import device_profiling
+
+        class _MockStudy:
+            def __init__(self):
+                self.queued = []
+
+            def enqueue_trial(self, cfg):
+                self.queued.append(cfg)
+
+        ms = _MockStudy()
+        tiny_space = {"dims": [
+            {"name": "swizzle", "type": "int",
+             "values": [0, 64, 128, 256],
+             "target": "device", "macro": "SWZ"},
+            {"name": "block", "type": "int",
+             "values": [32, 64, 128, 256],
+             "target": "device", "macro": "BLK"},
+        ]}
+        fake_stall = {"bias_hints": {"swizzle": [64, 128]}}
+        n = device_profiling.bias_trial_queue(
+            ms, fake_stall, tiny_space, "sm_90a")
+        assert n == 2, f"expected 2 enqueued, got {n}"
+        assert len(ms.queued) == 2
+        for cfg in ms.queued:
+            assert cfg["swizzle"] in (64, 128)
+            assert cfg["block"] == 128  # middle value of [32,64,128,256]
+
+    def test_bias_trial_queue_empty():
+        from grokking_optimizers import device_profiling
+
+        class _MockStudy:
+            def __init__(self): self.queued = []
+            def enqueue_trial(self, cfg): self.queued.append(cfg)
+
+        ms = _MockStudy()
+        assert device_profiling.bias_trial_queue(
+            ms, None, {"dims": []}, "sm_90a") == 0
+        assert device_profiling.bias_trial_queue(
+            ms, {}, {"dims": []}, "sm_90a") == 0
+        assert device_profiling.bias_trial_queue(
+            ms, {"bias_hints": {}}, {"dims": []}, "sm_90a") == 0
+
+    def test_run_device_pgo_round_disabled():
+        """When spec.enable_device_pgo=False, hook returns None and emits
+        no work — critical because every existing PGO build path runs
+        through here."""
+        from grokking_optimizers import device_profiling
+
+        class _DummySpec:
+            arch = "sm_90"
+            enable_device_pgo = False
+
+        import io as _io
+        rep = _io.StringIO()
+        result = device_profiling.run_device_pgo_round(
+            _DummySpec(), ["echo", "ignored"], Path(tempfile.mkdtemp()), rep)
+        assert result is None
+        assert rep.getvalue() == "", f"expected silent no-op, got {rep.getvalue()!r}"
+
+    def test_stall_sidecar_round_trip():
+        from grokking_optimizers import device_profiling
+        td = Path(tempfile.mkdtemp())
+        try:
+            info = {
+                "arch": "sm_90a",
+                "tool": "nsys",
+                "stall_reasons": {"long_scoreboard": 0.42},
+                "bias_hints": {"swizzle": [64, 128]},
+            }
+            p = device_profiling.write_stall_sidecar(info, td)
+            assert p.exists()
+            assert p.name == "device_stall_info.json"
+            loaded = device_profiling.read_stall_sidecar(td)
+            assert loaded == info
+        finally:
+            shutil.rmtree(td)
+
+    def test_buildspec_has_device_pgo_field():
+        """Stream 8 wiring: BuildSpec must carry the flag so it propagates
+        from CLI -> build() -> spec -> _build_aot_pgo -> hook."""
+        spec = BuildSpec(
+            optimizer="lion", model="mamba", arch="sm_90",
+            out_dir=Path("/tmp"))
+        assert hasattr(spec, "enable_device_pgo")
+        assert spec.enable_device_pgo is False
+        spec2 = BuildSpec(
+            optimizer="lion", model="mamba", arch="sm_90",
+            out_dir=Path("/tmp"), enable_device_pgo=True)
+        assert spec2.enable_device_pgo is True
+
+    _run("device_profiling_import", test_device_profiling_import)
+    _run("stall_to_bias_mapping", test_stall_to_bias_mapping)
+    _run("stall_to_bias_empty_input", test_stall_to_bias_empty_input)
+    _run("bias_trial_queue_enqueues", test_bias_trial_queue_enqueues)
+    _run("bias_trial_queue_empty", test_bias_trial_queue_empty)
+    _run("run_device_pgo_round_disabled", test_run_device_pgo_round_disabled)
+    _run("stall_sidecar_round_trip", test_stall_sidecar_round_trip)
+    _run("buildspec_has_device_pgo_field", test_buildspec_has_device_pgo_field)
 
     sys.stdout.write("[self-test] bayesian\n")
 
