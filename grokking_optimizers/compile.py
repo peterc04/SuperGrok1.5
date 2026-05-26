@@ -1824,6 +1824,48 @@ class BuildSpec:
     transfer_learning: bool = False
 
 
+def _ensure_nvcc_on_path() -> Optional[str]:
+    """Locate nvcc and prepend its directory to PATH if it's missing.
+
+    Handles the common case where CUDA is installed under a versioned
+    directory (e.g. ``/usr/local/cuda-12.2/``) and the user only added
+    the bare ``/usr/local/cuda/bin`` to PATH. Also fixes the case where
+    ``CUDA_HOME`` is unset but nvcc IS at a discoverable location.
+    Returns the resolved nvcc path, or None if nothing was found.
+    """
+    if shutil.which("nvcc"):
+        return shutil.which("nvcc")
+    candidates: List[Path] = []
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if cuda_home:
+        candidates.append(Path(cuda_home) / "bin" / "nvcc")
+    candidates.append(Path("/usr/local/cuda/bin/nvcc"))
+    candidates.append(Path("/usr/local/nvidia/cuda/bin/nvcc"))
+    candidates.append(Path("/opt/cuda/bin/nvcc"))
+    for parent in (Path("/usr/local"), Path("/opt")):
+        if parent.is_dir():
+            try:
+                for child in sorted(parent.iterdir(), reverse=True):
+                    if child.name.startswith("cuda-") or child.name.startswith("cuda_"):
+                        candidates.append(child / "bin" / "nvcc")
+            except (OSError, PermissionError):
+                pass
+    for nvcc in candidates:
+        try:
+            if nvcc.is_file() and os.access(nvcc, os.X_OK):
+                nvcc_dir = str(nvcc.parent)
+                current_path = os.environ.get("PATH", "")
+                if nvcc_dir not in current_path.split(os.pathsep):
+                    os.environ["PATH"] = f"{nvcc_dir}{os.pathsep}{current_path}"
+                if not os.environ.get("CUDA_HOME"):
+                    os.environ["CUDA_HOME"] = str(nvcc.parent.parent)
+                sys.stderr.write(f"[compile] discovered nvcc at {nvcc}\n")
+                return str(nvcc)
+        except (OSError, PermissionError):
+            continue
+    return None
+
+
 def _refresh_torch_cuda_home() -> None:
     """Force ``torch.utils.cpp_extension`` to re-read CUDA_HOME / ROCM_HOME.
 
@@ -1866,6 +1908,85 @@ def _validate(spec: BuildSpec) -> None:
     if spec.pruner not in ("none", "median", "hyperband"):
         raise ValueError(
             f"pruner={spec.pruner!r} not in {{'none', 'median', 'hyperband'}}")
+
+
+def _preflight_toolchain(arch: str) -> List[str]:
+    """Pre-flight: probe the toolchain for the chosen arch.
+
+    Returns a list of human-readable diagnostic lines (warnings, paths,
+    versions) — the build proceeds whether or not the toolchain looks
+    healthy; failures get surfaced by build_aot() with a much louder
+    error including the actual compiler stderr. The purpose here is to
+    give the user a clear ``[preflight]`` block at the top of the run
+    so they can spot a missing dependency before waiting for the build
+    to fail."""
+    lines: List[str] = []
+    vendor = ARCH_INFO[arch]["vendor"]
+    lines.append(f"[preflight] arch={arch} vendor={vendor}")
+
+    if vendor == "cuda":
+        nvcc = _ensure_nvcc_on_path()
+        cuda_home = os.environ.get("CUDA_HOME", "")
+        lines.append(f"[preflight] CUDA_HOME={cuda_home or '<unset>'}")
+        if nvcc:
+            lines.append(f"[preflight] nvcc={nvcc}")
+            try:
+                out = subprocess.check_output([nvcc, "--version"], text=True,
+                                              timeout=10).strip().splitlines()
+                if out:
+                    lines.append(f"[preflight] {out[-1]}")
+            except Exception:
+                pass
+        else:
+            lines.append(
+                "[preflight] WARNING: nvcc NOT found. The build will fail "
+                "with 'CUDA_HOME environment variable is not set' or "
+                "similar. To fix:\n"
+                "  - Verify the CUDA Toolkit is installed (look for "
+                "/usr/local/cuda*/bin/nvcc).\n"
+                "  - On Colab CPU runtimes there's no nvcc; switch to a "
+                "GPU runtime (Runtime → Change runtime type → GPU).\n"
+                "  - On hosts where nvcc lives at a versioned path, "
+                "set CUDA_HOME accordingly:\n"
+                "      os.environ['CUDA_HOME'] = '/usr/local/cuda-12.2'"
+            )
+        # Check libcudart presence (cpp_extension needs it to link)
+        if cuda_home:
+            for lib in ("lib64/libcudart.so", "lib/libcudart.so"):
+                if (Path(cuda_home) / lib).exists():
+                    lines.append(f"[preflight] libcudart: {Path(cuda_home) / lib}")
+                    break
+            else:
+                lines.append(f"[preflight] WARNING: libcudart.so not under {cuda_home}/lib[64]")
+    elif vendor == "hip":
+        hipcc = shutil.which("hipcc")
+        rocm = os.environ.get("ROCM_PATH") or os.environ.get("ROCM_HOME", "")
+        lines.append(f"[preflight] ROCM_PATH={rocm or '<unset>'}")
+        if hipcc:
+            lines.append(f"[preflight] hipcc={hipcc}")
+        else:
+            lines.append(
+                "[preflight] WARNING: hipcc NOT found. Install ROCm and "
+                "set os.environ['ROCM_PATH'] = '/opt/rocm' (or wherever "
+                "it lives) then prepend $ROCM_PATH/bin to PATH.")
+    elif vendor == "pallas":
+        try:
+            import jax  # noqa: F401
+            lines.append(f"[preflight] jax={jax.__version__}")
+        except Exception as e:
+            lines.append(
+                f"[preflight] WARNING: jax not importable: {e}. "
+                "For TPU, pip install 'jax[tpu]' -f "
+                "https://storage.googleapis.com/jax-releases/libtpu_releases.html")
+
+    # Universal checks
+    for tool in ("ninja", "g++"):
+        p = shutil.which(tool)
+        if p:
+            lines.append(f"[preflight] {tool}={p}")
+        else:
+            lines.append(f"[preflight] WARNING: {tool} NOT on PATH")
+    return lines
 
 
 def _collect_sibling_trials(cache: CompileCache, opt: str, model: str,
@@ -2196,6 +2317,71 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
         except Exception as exc:
             elapsed = time.monotonic() - t0
             report.write(f"\n[build FAILED after {elapsed:.1f}s]\n{exc}\n")
+            # Surface the actual compiler/linker error that torch's
+            # cpp_extension swallowed. Look in the build directory for
+            # ninja's stderr/log capture; these have the real diagnostics.
+            try:
+                import traceback as _tb
+                tb_str = _tb.format_exc()
+                report.write("\n[build FAILED — full traceback]\n")
+                report.write(tb_str)
+            except Exception:
+                pass
+            # Dump every log-like file in the build dir
+            for log_name in ("build.ninja", ".ninja_log", "build.log",
+                             "compile_commands.json"):
+                lp = build_dir / log_name
+                if lp.is_file():
+                    try:
+                        content = lp.read_text(errors="replace")
+                    except Exception as read_exc:
+                        report.write(f"\n[could not read {log_name}: {read_exc}]\n")
+                        continue
+                    report.write(f"\n[{log_name}] (head 4000 chars)\n")
+                    report.write(content[:4000])
+                    if len(content) > 4000:
+                        report.write(f"\n... ({len(content) - 4000} more chars truncated)\n")
+            # Try invoking ninja directly to capture stderr from the
+            # actual nvcc/g++/hipcc subprocess — this is the gold path
+            # for diagnosing "Error building extension" from torch.
+            try:
+                ninja_bin = shutil.which("ninja")
+                if ninja_bin and (build_dir / "build.ninja").is_file():
+                    report.write(f"\n[re-running ninja directly: {ninja_bin} -C {build_dir}]\n")
+                    proc = subprocess.run(
+                        [ninja_bin, "-C", str(build_dir), "-v"],
+                        capture_output=True, text=True, timeout=120,
+                    )
+                    if proc.stdout:
+                        report.write(f"\n[ninja stdout]\n{proc.stdout[:6000]}\n")
+                    if proc.stderr:
+                        report.write(f"\n[ninja stderr]\n{proc.stderr[:6000]}\n")
+                    report.write(f"\n[ninja exit code: {proc.returncode}]\n")
+            except Exception as re_exc:
+                report.write(f"\n[ninja re-run failed: {re_exc}]\n")
+            # Toolchain sanity check (so the user can see what's missing)
+            report.write("\n[toolchain probe]\n")
+            for tool in ("nvcc", "hipcc", "g++", "gcc", "ld", "ninja"):
+                pth = shutil.which(tool)
+                report.write(f"  {tool}: {pth or '<NOT FOUND on PATH>'}\n")
+                if pth:
+                    try:
+                        ver = subprocess.run([pth, "--version"],
+                                             capture_output=True, text=True,
+                                             timeout=10)
+                        first_line = (ver.stdout or ver.stderr).splitlines()[:1]
+                        if first_line:
+                            report.write(f"    -> {first_line[0]}\n")
+                    except Exception:
+                        pass
+            cuda_home = os.environ.get("CUDA_HOME", "")
+            if cuda_home:
+                report.write(f"\n[CUDA_HOME probe: {cuda_home}]\n")
+                for sub in ("", "bin/nvcc", "lib64/libcudart.so",
+                            "include/cuda_runtime.h"):
+                    p = Path(cuda_home) / sub if sub else Path(cuda_home)
+                    report.write(f"  {p}: "
+                                 f"{'EXISTS' if p.exists() else '<MISSING>'}\n")
             return None
 
     elapsed = time.monotonic() - t0
@@ -2675,6 +2861,7 @@ def build_aot(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
 
     When ``spec.pgo`` is True, runs the 3-pass instrument → workload →
     use loop. Otherwise a single AOT build."""
+    _ensure_nvcc_on_path()
     _refresh_torch_cuda_home()
     info = ARCH_INFO[spec.arch]
     if info["vendor"] == "pallas":
@@ -2830,6 +3017,7 @@ def _publish_aot_artifact(spec: BuildSpec, so_path: Path, report) -> Path:
 
 def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
     """Run only the JIT autotune + final-link half. Requires GPU."""
+    _ensure_nvcc_on_path()
     _refresh_torch_cuda_home()
     info = ARCH_INFO[spec.arch]
     if info["vendor"] == "pallas":
@@ -2954,6 +3142,10 @@ def build(
     if jit_only:
         runtime = "jit"
 
+    # Discover nvcc on the filesystem if it's not on PATH (common when
+    # CUDA lives at /usr/local/cuda-<ver>/ and the user only added the
+    # bare /usr/local/cuda/bin to PATH). Auto-prepends the found dir.
+    _ensure_nvcc_on_path()
     # Force torch to re-read CUDA_HOME / ROCM_HOME from os.environ even if
     # it was imported (and cached None) before the user set the env vars.
     _refresh_torch_cuda_home()
@@ -3048,6 +3240,12 @@ def build(
             report.write(f"# AOT artefact dir: {aot_artifact_dir}\n")
             report.write(f"# Debug symbols:    {debug_symbols}\n")
             report.write(f"# Profile:          {profile}\n")
+
+            # Pre-flight: dump toolchain visibility so the user sees what
+            # the build can actually find BEFORE we waste 4 phases.
+            report.write("\n")
+            for line in _preflight_toolchain(arch):
+                report.write(line + "\n")
             step("resolve")
 
             if info["vendor"] == "pallas":
