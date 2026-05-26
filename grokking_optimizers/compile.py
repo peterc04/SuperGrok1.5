@@ -134,7 +134,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from grokking_optimizers.profile import (
     ARCH_INFO,
@@ -150,14 +150,18 @@ from grokking_optimizers.profile import (
     make_progress,
 )
 
-from grokking_optimizers import search_space as _ss
-from grokking_optimizers import pgo as _pgo
+import itertools
+import math
+
+import optuna
+from optuna.samplers import TPESampler
+import yaml
 
 
 CACHE_VERSION = 3
 DEFAULT_CACHE_NAME = ".compile_cache.json"
 DEFAULT_SEARCH_SPACE = REPO_ROOT / "configs" / "search_space.yaml"
-DEFAULT_PGO_WORKLOAD = REPO_ROOT / "scripts" / "pgo_workload.py"
+DEFAULT_PGO_WORKLOAD = Path(__file__).resolve()  # absorbed from scripts/pgo_workload.py
 JIT_CACHE_FLUSH_EVERY = 5   # save cache every N completed JIT trials
 
 # How many trials Bayesian "quick" mode runs (vs the full 500 default).
@@ -194,6 +198,1094 @@ def _hash_sources(paths: List[Path]) -> str:
 
 def _hash_flags(flags: List[str]) -> str:
     return _sha256_str("\0".join(flags))
+
+
+# ===========================================================================
+# search_space — YAML-driven autotune search space (absorbed from
+# grokking_optimizers/search_space.py)
+# ===========================================================================
+
+class SearchSpaceError(ValueError):
+    """Raised when the YAML is missing required keys or has a bad type."""
+
+
+_VALID_TYPES = {"int", "bool", "enum", "tuple"}
+_VALID_TARGETS = {"host", "device"}
+
+
+def load_yaml(path: Path) -> Dict[str, Any]:
+    """Load the YAML file and validate the per-arch shape."""
+    path = Path(path)
+    if not path.exists():
+        raise SearchSpaceError(f"search-space YAML not found: {path}")
+    with open(path) as f:
+        raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        raise SearchSpaceError(
+            f"search-space YAML must be a top-level dict; got {type(raw).__name__}")
+    for arch, block in raw.items():
+        _validate_arch(arch, block)
+    return raw
+
+
+def _validate_arch(arch: str, block: Any) -> None:
+    if not isinstance(block, dict):
+        raise SearchSpaceError(f"{arch}: expected dict, got {type(block).__name__}")
+    dims = block.get("dims", [])
+    if not isinstance(dims, list):
+        raise SearchSpaceError(f"{arch}.dims must be a list")
+    seen_names: set = set()
+    for dim in dims:
+        _validate_dim(arch, dim, seen_names)
+        seen_names.add(dim["name"])
+    prefilter_block = block.get("prefilter", {})
+    if prefilter_block and not isinstance(prefilter_block, dict):
+        raise SearchSpaceError(f"{arch}.prefilter must be a dict")
+    rules = prefilter_block.get("rules", []) if prefilter_block else []
+    if rules and not isinstance(rules, list):
+        raise SearchSpaceError(f"{arch}.prefilter.rules must be a list")
+    for rule in rules:
+        if not isinstance(rule, dict) or "expr" not in rule:
+            raise SearchSpaceError(
+                f"{arch}.prefilter.rules each entry must be a dict with 'expr'")
+
+
+def _validate_dim(arch: str, dim: Any, seen: set) -> None:
+    if not isinstance(dim, dict):
+        raise SearchSpaceError(f"{arch}: dim entry must be a dict, got {type(dim).__name__}")
+    for required in ("name", "type", "values"):
+        if required not in dim:
+            raise SearchSpaceError(f"{arch}: dim missing '{required}': {dim}")
+    name = dim["name"]
+    if not isinstance(name, str):
+        raise SearchSpaceError(f"{arch}: dim 'name' must be a str: {dim}")
+    if name in seen:
+        raise SearchSpaceError(f"{arch}: duplicate dim name {name!r}")
+    if dim["type"] not in _VALID_TYPES:
+        raise SearchSpaceError(
+            f"{arch}.{name}: type {dim['type']!r} not in {_VALID_TYPES}")
+    if not isinstance(dim["values"], list) or not dim["values"]:
+        raise SearchSpaceError(f"{arch}.{name}: values must be a non-empty list")
+    applies_to = dim.get("applies_to", ["host", "device"])
+    if not isinstance(applies_to, list):
+        raise SearchSpaceError(f"{arch}.{name}: applies_to must be a list")
+    bad = set(applies_to) - _VALID_TARGETS
+    if bad:
+        raise SearchSpaceError(
+            f"{arch}.{name}: applies_to has unknown targets {bad}")
+
+
+def cartesian(space: Dict[str, Any], arch: str) -> List[Dict[str, Any]]:
+    """Return the full cartesian product as a list of {dim_name: value} dicts."""
+    if arch not in space:
+        return []
+    dims = space[arch].get("dims", [])
+    if not dims:
+        return []
+    names = [d["name"] for d in dims]
+    values = [d["values"] for d in dims]
+    out: List[Dict[str, Any]] = []
+    for combo in itertools.product(*values):
+        cfg: Dict[str, Any] = {}
+        for n, v in zip(names, combo):
+            cfg[n] = tuple(v) if isinstance(v, list) else v
+        out.append(cfg)
+    return out
+
+
+def ss_prefilter(configs: List[Dict[str, Any]],
+                 prefilter_spec: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
+    """Apply the static pruning rules. Returns (survivors, eliminated_count)."""
+    if not prefilter_spec:
+        return list(configs), 0
+    rules: List[Dict[str, Any]] = prefilter_spec.get("rules", []) or []
+    survivors: List[Dict[str, Any]] = []
+    eliminated = 0
+    compiled_rules = [(r.get("name", f"rule_{i}"), compile(r["expr"], "<prefilter>", "eval"))
+                      for i, r in enumerate(rules)]
+    for cfg in configs:
+        ok = True
+        for rname, code in compiled_rules:
+            try:
+                env = dict(cfg)
+                env["__builtins__"] = {
+                    "len": len, "min": min, "max": max, "abs": abs,
+                    "int": int, "bool": bool, "True": True, "False": False,
+                }
+                if not bool(eval(code, env, env)):  # noqa: S307 — sandboxed
+                    ok = False
+                    break
+            except Exception:
+                ok = False
+                break
+        if ok:
+            survivors.append(cfg)
+        else:
+            eliminated += 1
+    return survivors, eliminated
+
+
+def _format_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, tuple):
+        return ",".join(str(v) for v in value)
+    return str(value)
+
+
+def resolve_macros(config: Dict[str, Any], dim_specs: List[Dict[str, Any]],
+                   target: str) -> List[str]:
+    """Return the ``-DFOO=VAL`` flags for a config restricted to ``target``."""
+    if target not in _VALID_TARGETS:
+        raise ValueError(f"target={target!r} not in {_VALID_TARGETS}")
+    out: List[str] = []
+    for spec in dim_specs:
+        macro = spec.get("macro")
+        applies_to = spec.get("applies_to", ["host", "device"])
+        if target not in applies_to:
+            continue
+        if not macro:
+            continue
+        name = spec["name"]
+        if name not in config:
+            continue
+        out.append(f"-D{macro}={_format_value(config[name])}")
+    return out
+
+
+def resolve_extra_nvcc_flags(config: Dict[str, Any],
+                             dim_specs: List[Dict[str, Any]]) -> List[str]:
+    """Some dims become bare NVCC/HIPCC flags rather than ``-D`` macros.
+    Currently: ``maxrregcount`` -> ``--maxrregcount=N``."""
+    out: List[str] = []
+    for spec in dim_specs:
+        if spec.get("macro") is None and spec["name"] == "maxrregcount":
+            v = config.get("maxrregcount")
+            if v is not None:
+                out.append(f"--maxrregcount={int(v)}")
+    return out
+
+
+def resolve_extra_hipcc_flags(config: Dict[str, Any],
+                              dim_specs: List[Dict[str, Any]]) -> List[str]:
+    """HIPCC analogue. ``maxrregcount`` -> ``-mllvm -amdgpu-max-num-vgprs=N``."""
+    out: List[str] = []
+    for spec in dim_specs:
+        if spec.get("macro") is None and spec["name"] == "maxrregcount":
+            v = config.get("maxrregcount")
+            if v is not None:
+                out.extend(["-mllvm", f"-amdgpu-max-num-vgprs={int(v)}"])
+    return out
+
+
+def hash_space(space: Dict[str, Any], arch: str) -> str:
+    """Stable SHA-256 of the per-arch space (sorted JSON, no whitespace)."""
+    if arch not in space:
+        return hashlib.sha256(b"").hexdigest()
+    block = space[arch]
+    payload = json.dumps(block, sort_keys=True, separators=(",", ":"),
+                         default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def config_key(config: Dict[str, Any]) -> str:
+    """Compact, deterministic key — used as cache.variant_artifacts subkey."""
+    parts = []
+    for k in sorted(config.keys()):
+        parts.append(f"{k}={_format_value(config[k])}")
+    return "_".join(parts)
+
+
+# ===========================================================================
+# pgo — Profile-Guided Optimisation driver (absorbed from
+# grokking_optimizers/pgo.py)
+# ===========================================================================
+
+def instrument_flags(
+    arch: str,
+    profile_dir: Path,
+    host_cflags: List[str],
+    device_cflags: List[str],
+    ldflags: List[str],
+) -> Tuple[List[str], List[str], List[str]]:
+    """Append profile-generate flags. ``profile_dir`` is the .gcda output dir."""
+    profile_dir = Path(profile_dir).resolve()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    h = list(host_cflags) + [
+        f"-fprofile-generate={profile_dir}",
+        "-fprofile-update=atomic",
+    ]
+    d: List[str] = list(device_cflags)
+    if arch == "sm_90":
+        d += [
+            "-Xcompiler", f"-fprofile-generate={profile_dir}",
+            "-Xcompiler", "-fprofile-update=atomic",
+        ]
+    elif arch == "gfx942":
+        d += [
+            f"-fprofile-generate={profile_dir}",
+            "-fprofile-update=atomic",
+        ]
+    l = list(ldflags) + [f"-fprofile-generate={profile_dir}"]
+    return h, d, l
+
+
+def use_flags(
+    arch: str,
+    profile_dir: Path,
+    host_cflags: List[str],
+    device_cflags: List[str],
+    ldflags: List[str],
+) -> Tuple[List[str], List[str], List[str]]:
+    """Append profile-use flags."""
+    profile_dir = Path(profile_dir).resolve()
+
+    h = list(host_cflags) + [
+        f"-fprofile-use={profile_dir}",
+        "-fprofile-correction",
+    ]
+    d: List[str] = list(device_cflags)
+    if arch == "sm_90":
+        d += [
+            "-Xcompiler", f"-fprofile-use={profile_dir}",
+            "-Xcompiler", "-fprofile-correction",
+        ]
+    elif arch == "gfx942":
+        d += [
+            f"-fprofile-use={profile_dir}",
+            "-fprofile-correction",
+        ]
+    l = list(ldflags) + [f"-fprofile-use={profile_dir}"]
+    return h, d, l
+
+
+def hash_workload(workload_script: Path, steps: int) -> str:
+    """SHA-256 of (workload file contents, step count)."""
+    h = hashlib.sha256()
+    try:
+        h.update(Path(workload_script).read_bytes())
+    except OSError:
+        h.update(b"<missing-workload>")
+    h.update(b"\0")
+    h.update(str(int(steps)).encode("ascii"))
+    return h.hexdigest()
+
+
+def collect_workload(
+    workload_script: Path,
+    *,
+    so_path: Path,
+    opt_class: str,
+    model: str,
+    arch: str,
+    profile_dir: Path,
+    steps: int = 1000,
+    env: Optional[Dict[str, str]] = None,
+    timeout: int = 600,
+    report=None,
+) -> bool:
+    """Run the workload subprocess and confirm profile files appear.
+
+    Returns ``True`` if at least one ``.gcda`` (or any file) was created
+    in ``profile_dir`` and the workload exited cleanly.
+    """
+    workload_script = Path(workload_script).resolve()
+    if not workload_script.exists():
+        if report:
+            report.write(f"  [pgo collect] workload not found: {workload_script}\n")
+        return False
+    profile_dir = Path(profile_dir).resolve()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    before = {p: p.stat().st_size for p in profile_dir.glob("**/*") if p.is_file()}
+
+    sub_env = (env or os.environ).copy()
+    sub_env["LLVM_PROFILE_FILE"] = str(profile_dir / "default_%p.profraw")
+    sub_env["GCOV_PREFIX"] = str(profile_dir)
+
+    cmd = [
+        sys.executable, str(workload_script),
+        "--so",   str(so_path),
+        "--opt",  opt_class,
+        "--model", model,
+        "--arch", arch,
+        "--steps", str(int(steps)),
+    ]
+    if report:
+        report.write(f"\n$ {' '.join(cmd)}\n")
+        report.flush()
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=timeout, env=sub_env,
+        )
+    except subprocess.TimeoutExpired:
+        if report:
+            report.write(f"  [pgo collect] TIMEOUT after {timeout}s\n")
+        return False
+    elapsed = time.monotonic() - t0
+    if report:
+        report.write(proc.stdout or "")
+        report.write(f"\n[exit {proc.returncode} in {elapsed:.1f}s]\n")
+    if proc.returncode != 0:
+        return False
+
+    after = {p: p.stat().st_size for p in profile_dir.glob("**/*") if p.is_file()}
+    new_or_grown = [p for p, sz in after.items()
+                    if before.get(p, -1) != sz]
+    if not new_or_grown:
+        if report:
+            report.write(
+                f"  [pgo collect] no profile files appeared under {profile_dir}\n")
+        return False
+    if report:
+        report.write(
+            f"  [pgo collect] {len(new_or_grown)} profile file(s) updated\n")
+    return True
+
+
+# ===========================================================================
+# pgo_workload — default PGO workload (absorbed from scripts/pgo_workload.py)
+# ===========================================================================
+
+def _pgo_workload_main() -> int:
+    """Default PGO workload entry point (was scripts/pgo_workload.py)."""
+    import argparse as _ap
+    parser = _ap.ArgumentParser(
+        description="Default PGO workload — runs N optimizer steps")
+    parser.add_argument("--so", type=Path, required=True,
+                        help="Path to the instrumented .so")
+    parser.add_argument("--opt", required=True,
+                        help="Optimizer class name (e.g. Lion, AdamW)")
+    parser.add_argument("--model", default="mamba",
+                        help="Model identifier (informational; not loaded)")
+    parser.add_argument("--arch", default="sm_90",
+                        help="Arch identifier (informational; not loaded)")
+    parser.add_argument("--steps", type=int, default=1000,
+                        help="Number of optimizer.step() calls")
+    parser.add_argument("--size", type=int, default=2048,
+                        help="Parameter size (size x size float32 tensor)")
+    args = parser.parse_args()
+
+    if args.so:
+        import importlib.util as _ilu
+        if "grokking_optimizers._ops" in sys.modules:
+            del sys.modules["grokking_optimizers._ops"]
+        _spec = _ilu.spec_from_file_location(
+            "grokking_optimizers._ops", str(args.so))
+        if _spec is None or _spec.loader is None:
+            raise RuntimeError(f"could not load .so: {args.so}")
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)  # type: ignore[arg-type]
+        sys.modules["grokking_optimizers._ops"] = _mod
+
+    import torch
+    from importlib import import_module
+    grok = import_module("grokking_optimizers")
+    OptCls = getattr(grok, args.opt)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(0)
+    p = torch.nn.Parameter(
+        torch.randn(args.size, args.size, device=device, dtype=torch.float32))
+    target = torch.randn_like(p)
+
+    opt = OptCls([p], lr=1e-3)
+    for _ in range(args.steps):
+        loss = ((p - target) ** 2).sum()
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+    if device == "cuda":
+        torch.cuda.synchronize()
+    print(f"PGO workload OK ({args.opt}/{args.model}/{args.arch}): "
+          f"{args.steps} steps, size={args.size}, device={device}")
+    return 0
+
+
+# ===========================================================================
+# bench_graph — CUDA / HIP graph-replay timing (absorbed from
+# grokking_optimizers/bench_graph.py)
+# ===========================================================================
+
+def _build_param(opt_class_name: str, size: int) -> Any:
+    import torch
+    torch.manual_seed(0)
+    p = torch.nn.Parameter(
+        torch.randn(size, size, device="cuda", dtype=torch.float32))
+    g = torch.randn_like(p)
+    p.grad = g
+    return p, g
+
+
+def cuda_graph_median_ms(opt_class: str, *, size: int = 4096,
+                         warmup: int = 5, iters: int = 21) -> Dict[str, float]:
+    """Time ``opt.step()`` under a CUDA graph replay."""
+    import torch
+    if not torch.cuda.is_available():
+        raise RuntimeError("cuda_graph_median_ms requires torch.cuda.is_available()")
+    from grokking_optimizers import _ops  # noqa: F401 — must be loaded first
+    from importlib import import_module
+    grok = import_module("grokking_optimizers")
+    OptCls = getattr(grok, opt_class)
+
+    p, g = _build_param(opt_class, size)
+    opt = OptCls([p], lr=1e-3)
+
+    for _ in range(max(1, warmup)):
+        p.grad = g.clone()
+        opt.step()
+    torch.cuda.synchronize()
+
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        p.grad = g.clone()
+        opt.step()
+    torch.cuda.current_stream().wait_stream(side_stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side_stream):
+        p.grad.copy_(g)
+        opt.step()
+
+    timings = []
+    for _ in range(iters):
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        s.record()
+        graph.replay()
+        e.record()
+        torch.cuda.synchronize()
+        timings.append(s.elapsed_time(e))
+    timings.sort()
+    return {
+        "timing_ms": float(timings[len(timings) // 2]),
+        "min_ms":    float(timings[0]),
+        "max_ms":    float(timings[-1]),
+        "n":         len(timings),
+    }
+
+
+def hip_graph_median_ms(opt_class: str, *, size: int = 4096,
+                        warmup: int = 5, iters: int = 21) -> Dict[str, float]:
+    """HIP analogue — reuses cuda_graph_median_ms (ROCm uses same namespace)."""
+    return cuda_graph_median_ms(opt_class, size=size, warmup=warmup, iters=iters)
+
+
+def event_median_ms(opt_class: str, *, size: int = 4096,
+                    warmup: int = 5, iters: int = 21) -> Dict[str, float]:
+    """Fallback timer for archs / backends that do not support graph capture."""
+    import torch
+    if not torch.cuda.is_available():
+        raise RuntimeError("event_median_ms requires torch.cuda.is_available()")
+    from importlib import import_module
+    grok = import_module("grokking_optimizers")
+    OptCls = getattr(grok, opt_class)
+
+    p, g = _build_param(opt_class, size)
+    for _ in range(max(1, warmup)):
+        p.grad = g.clone()
+        opt = OptCls([p], lr=1e-3)
+        opt.step()
+    torch.cuda.synchronize()
+
+    timings = []
+    for _ in range(iters):
+        p.grad = g.clone()
+        opt = OptCls([p], lr=1e-3)
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        s.record()
+        opt.step()
+        e.record()
+        torch.cuda.synchronize()
+        timings.append(s.elapsed_time(e))
+    timings.sort()
+    return {
+        "timing_ms": float(timings[len(timings) // 2]),
+        "min_ms":    float(timings[0]),
+        "max_ms":    float(timings[-1]),
+        "n":         len(timings),
+    }
+
+
+# ===========================================================================
+# timing_worker — persistent timing subprocess (absorbed from
+# grokking_optimizers/timing_worker.py)
+# ===========================================================================
+
+_WORKER_BODY = r"""
+import sys, json, importlib.util, traceback, time
+try:
+    import torch
+except ImportError as exc:
+    sys.stdout.write(json.dumps({"error": "torch import failed: " + str(exc)}) + "\n")
+    sys.stdout.flush()
+    sys.exit(1)
+
+
+def _load_so(so_path):
+    if "grokking_optimizers._ops" in sys.modules:
+        del sys.modules["grokking_optimizers._ops"]
+    spec = importlib.util.spec_from_file_location(
+        "grokking_optimizers._ops", so_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    sys.modules["grokking_optimizers._ops"] = mod
+    return mod
+
+
+def _bg_build_param(opt_class_name, size):
+    torch.manual_seed(0)
+    p = torch.nn.Parameter(
+        torch.randn(size, size, device="cuda", dtype=torch.float32))
+    g = torch.randn_like(p)
+    p.grad = g
+    return p, g
+
+
+def _bg_cuda_graph_median_ms(opt_class, *, size=4096, warmup=5, iters=21):
+    if not torch.cuda.is_available():
+        raise RuntimeError("cuda_graph_median_ms requires torch.cuda.is_available()")
+    from grokking_optimizers import _ops  # noqa: F401
+    from importlib import import_module
+    grok = import_module("grokking_optimizers")
+    OptCls = getattr(grok, opt_class)
+
+    p, g = _bg_build_param(opt_class, size)
+    opt = OptCls([p], lr=1e-3)
+
+    for _ in range(max(1, warmup)):
+        p.grad = g.clone()
+        opt.step()
+    torch.cuda.synchronize()
+
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        p.grad = g.clone()
+        opt.step()
+    torch.cuda.current_stream().wait_stream(side_stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side_stream):
+        p.grad.copy_(g)
+        opt.step()
+
+    timings = []
+    for _ in range(iters):
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        s.record()
+        graph.replay()
+        e.record()
+        torch.cuda.synchronize()
+        timings.append(s.elapsed_time(e))
+    timings.sort()
+    return {
+        "timing_ms": float(timings[len(timings) // 2]),
+        "min_ms":    float(timings[0]),
+        "max_ms":    float(timings[-1]),
+        "n":         len(timings),
+    }
+
+
+def _time_with_graph(opt_class, size, warmup, iters):
+    try:
+        return _bg_cuda_graph_median_ms(
+            opt_class, size=size, warmup=warmup, iters=iters)
+    except Exception:
+        return None
+
+
+def _time_with_events(opt_class, size, warmup, iters):
+    from importlib import import_module
+    grok = import_module("grokking_optimizers")
+    OptCls = getattr(grok, opt_class)
+    torch.manual_seed(0)
+    p = torch.nn.Parameter(
+        torch.randn(size, size, device="cuda", dtype=torch.float32))
+    g = torch.randn_like(p)
+    for _ in range(max(1, warmup)):
+        p.grad = g.clone()
+        opt = OptCls([p], lr=1e-3)
+        opt.step()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(iters):
+        p.grad = g.clone()
+        opt = OptCls([p], lr=1e-3)
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        s.record()
+        opt.step()
+        e.record()
+        torch.cuda.synchronize()
+        times.append(s.elapsed_time(e))
+    times.sort()
+    return {
+        "timing_ms": float(times[len(times) // 2]),
+        "min_ms":    float(times[0]),
+        "max_ms":    float(times[-1]),
+        "n":         len(times),
+    }
+
+
+def main():
+    if not torch.cuda.is_available():
+        sys.stdout.write(json.dumps(
+            {"error": "torch.cuda.is_available() == False"}) + "\n")
+        sys.stdout.flush()
+        sys.exit(2)
+    torch.cuda.synchronize()
+    sys.stdout.write(json.dumps({"ready": True}) + "\n")
+    sys.stdout.flush()
+
+    use_graph = True
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except Exception as exc:
+            sys.stdout.write(json.dumps(
+                {"error": "bad request: " + str(exc)}) + "\n")
+            sys.stdout.flush()
+            continue
+        op = req.get("op")
+        if op == "ping":
+            sys.stdout.write(json.dumps({"ok": True}) + "\n")
+            sys.stdout.flush()
+            continue
+        if op == "shutdown":
+            sys.stdout.write(json.dumps({"bye": True}) + "\n")
+            sys.stdout.flush()
+            return
+        if op != "time":
+            sys.stdout.write(json.dumps(
+                {"error": "unknown op " + str(op)}) + "\n")
+            sys.stdout.flush()
+            continue
+        try:
+            so_path = req["so_path"]
+            opt_class = req["opt_class"]
+            size = int(req.get("size", 4096))
+            warmup = int(req.get("warmup", 5))
+            iters = int(req.get("iters", 21))
+            _load_so(so_path)
+            result = None
+            if use_graph and req.get("use_cuda_graph", True):
+                result = _time_with_graph(opt_class, size, warmup, iters)
+            if result is None:
+                result = _time_with_events(opt_class, size, warmup, iters)
+            sys.stdout.write(json.dumps(result) + "\n")
+            sys.stdout.flush()
+        except Exception as exc:
+            sys.stdout.write(json.dumps(
+                {"error": str(exc), "tb": traceback.format_exc()}) + "\n")
+            sys.stdout.flush()
+
+
+main()
+"""
+
+
+class TimingWorker:
+    """Persistent timing subprocess; one warm CUDA context for an entire sweep."""
+
+    def __init__(self, opt_class: str, *,
+                 size: int = 4096, warmup: int = 5, iters: int = 21,
+                 use_cuda_graph: bool = True,
+                 timeout_per_variant: int = 180,
+                 env: Optional[Dict[str, str]] = None,
+                 cwd: Optional[Path] = None,
+                 python: Optional[str] = None):
+        self.opt_class = opt_class
+        self.size = size
+        self.warmup = warmup
+        self.iters = iters
+        self.use_cuda_graph = use_cuda_graph
+        self.timeout = timeout_per_variant
+        self.env = env or os.environ.copy()
+        self.cwd = cwd
+        self.python = python or sys.executable
+        self._proc: Optional[subprocess.Popen] = None
+        self._error_log: list = []
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self) -> bool:
+        """Spawn the subprocess and wait for its ``{"ready": true}`` ack."""
+        if self._proc is not None and self._proc.poll() is None:
+            return True
+        self._proc = subprocess.Popen(
+            [self.python, "-u", "-c", _WORKER_BODY],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=self.env,
+            cwd=str(self.cwd) if self.cwd else None,
+        )
+        ready = self._read_line(timeout=30)
+        if not ready or ready.get("ready") is not True:
+            err = ready.get("error") if ready else "no response"
+            self._error_log.append(("start", err))
+            self.stop()
+            return False
+        return True
+
+    def alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def restart(self) -> bool:
+        self.stop()
+        return self.start()
+
+    def stop(self) -> None:
+        if self._proc is None:
+            return
+        try:
+            if self._proc.poll() is None and self._proc.stdin:
+                try:
+                    self._proc.stdin.write(json.dumps({"op": "shutdown"}) + "\n")
+                    self._proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    pass
+                try:
+                    self._proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+        except Exception:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+        finally:
+            self._proc = None
+
+    # ------------------------------------------------------------------
+    # API
+    # ------------------------------------------------------------------
+
+    def time(self, variant_so: Path) -> Optional[Dict[str, Any]]:
+        """Time a variant .so. Returns the result dict or ``None`` on failure."""
+        if not self.alive():
+            self._error_log.append(("time", "worker not alive"))
+            return None
+        req = {
+            "op":             "time",
+            "so_path":        str(variant_so),
+            "opt_class":      self.opt_class,
+            "size":           self.size,
+            "warmup":         self.warmup,
+            "iters":          self.iters,
+            "use_cuda_graph": self.use_cuda_graph,
+        }
+        try:
+            assert self._proc and self._proc.stdin
+            self._proc.stdin.write(json.dumps(req) + "\n")
+            self._proc.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            self._error_log.append(("write", str(exc)))
+            return None
+        result = self._read_line(timeout=self.timeout)
+        if result is None:
+            return None
+        if "error" in result:
+            self._error_log.append(("time", result.get("error", "?")))
+            return None
+        return result
+
+    def ping(self) -> bool:
+        if not self.alive():
+            return False
+        try:
+            assert self._proc and self._proc.stdin
+            self._proc.stdin.write(json.dumps({"op": "ping"}) + "\n")
+            self._proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return False
+        line = self._read_line(timeout=5)
+        return bool(line and line.get("ok"))
+
+    @property
+    def error_log(self) -> list:
+        return list(self._error_log)
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _read_line(self, timeout: float) -> Optional[Dict[str, Any]]:
+        assert self._proc and self._proc.stdout
+        import time as _time
+        deadline = _time.monotonic() + timeout
+        line = ""
+        while _time.monotonic() < deadline:
+            if self._proc.poll() is not None:
+                tail = self._proc.stdout.read() or ""
+                if tail:
+                    self._error_log.append(("died", tail.strip()[-2000:]))
+                return None
+            ch = self._proc.stdout.read(1)
+            if not ch:
+                _time.sleep(0.01)
+                continue
+            if ch == "\n":
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    return json.loads(line)
+                except json.JSONDecodeError:
+                    self._error_log.append(("decode", line[:500]))
+                    return None
+            line += ch
+        self._error_log.append(("timeout", f"after {timeout}s"))
+        return None
+
+
+# ===========================================================================
+# bayesian — Optuna TPE-driven autotune (absorbed from
+# grokking_optimizers/bayesian.py)
+# ===========================================================================
+
+def _make_pruner(name: str):
+    """Return an Optuna pruner. ``name`` in {none, median, hyperband}."""
+    name = (name or "none").lower()
+    if name == "none":
+        return optuna.pruners.NopPruner()
+    if name == "median":
+        return optuna.pruners.MedianPruner(n_warmup_steps=2)
+    if name == "hyperband":
+        return optuna.pruners.HyperbandPruner(
+            min_resource=1, max_resource=21, reduction_factor=3)
+    raise ValueError(f"unknown pruner {name!r}")
+
+
+TimerResult = Optional[Dict[str, Any]]
+Timer = Callable[[Dict[str, Any]], TimerResult]
+ProgressCb = Optional[Callable[[int, int, Dict[str, Any]], None]]
+
+
+def _suggest(trial: optuna.Trial, dims: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Translate dim specs into Optuna ``suggest_*`` calls."""
+    cfg: Dict[str, Any] = {}
+    for dim in dims:
+        name = dim["name"]
+        values = dim["values"]
+        suggest_vals = [tuple(v) if isinstance(v, list) else v for v in values]
+        cfg[name] = trial.suggest_categorical(name, suggest_vals)
+    return cfg
+
+
+def _make_trial_record(stage: str, trial_num: int, cfg: Dict[str, Any],
+                       result: TimerResult, host: Optional[Dict[str, Any]] = None
+                       ) -> Dict[str, Any]:
+    return {
+        "trial_num":   trial_num,
+        "stage":       stage,
+        "config":      {k: (list(v) if isinstance(v, tuple) else v)
+                        for k, v in cfg.items()},
+        "config_key":  config_key(cfg),
+        "timing_ms":   result["timing_ms"] if result else None,
+        "min_ms":      result["min_ms"]    if result else None,
+        "max_ms":      result["max_ms"]    if result else None,
+        "n":           result["n"]         if result else None,
+        "host":        host,
+        "recorded_at": datetime.datetime.now().isoformat(),
+    }
+
+
+def run_bayesian(
+    arch: str,
+    space: Dict[str, Any],
+    *,
+    n_trials: int = 500,
+    seed: int = 0,
+    storage: Optional[Path] = None,
+    study_name: str = "sg_tune",
+    timer: Timer,
+    progress: ProgressCb = None,
+    host: Optional[Dict[str, Any]] = None,
+    prefiltered: Optional[List[Dict[str, Any]]] = None,
+    pruner: str = "none",
+    seed_trials: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Run the TPE stage. Returns the list of trial records."""
+    dims = space[arch]["dims"]
+    feasible = {config_key(c) for c in (prefiltered or [])}
+
+    sampler = TPESampler(
+        seed=seed,
+        n_startup_trials=max(10, n_trials // 10),
+        multivariate=True,
+        constant_liar=False,
+    )
+
+    storage_url = None
+    if storage is not None:
+        storage = Path(storage)
+        storage.parent.mkdir(parents=True, exist_ok=True)
+        storage_url = f"sqlite:///{storage}"
+
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=sampler,
+        pruner=_make_pruner(pruner),
+        study_name=study_name,
+        storage=storage_url,
+        load_if_exists=True,
+    )
+
+    if seed_trials:
+        dim_names = [d["name"] for d in dims]
+        dim_value_sets = {d["name"]: [tuple(v) if isinstance(v, list) else v
+                                      for v in d["values"]]
+                          for d in dims}
+        seeded = 0
+        for t in seed_trials:
+            cfg = t.get("config") or {}
+            tms = t.get("timing_ms")
+            if tms is None:
+                continue
+            params: Dict[str, Any] = {}
+            distributions: Dict[str, optuna.distributions.BaseDistribution] = {}
+            ok = True
+            for name in dim_names:
+                if name not in cfg:
+                    ok = False
+                    break
+                val = cfg[name]
+                val = tuple(val) if isinstance(val, list) else val
+                if val not in dim_value_sets[name]:
+                    ok = False
+                    break
+                params[name] = val
+                distributions[name] = optuna.distributions.CategoricalDistribution(
+                    dim_value_sets[name])
+            if not ok:
+                continue
+            try:
+                study.add_trial(optuna.trial.create_trial(
+                    params=params,
+                    distributions=distributions,
+                    value=float(tms),
+                ))
+                seeded += 1
+            except Exception:
+                continue
+
+    records: List[Dict[str, Any]] = []
+
+    def objective(trial: optuna.Trial) -> float:
+        cfg = _suggest(trial, dims)
+        if feasible and config_key(cfg) not in feasible:
+            rec = _make_trial_record("tpe", trial.number, cfg, None, host=host)
+            rec["status"] = "infeasible"
+            records.append(rec)
+            if progress:
+                progress(trial.number + 1, n_trials, cfg)
+            return math.inf
+        result = timer(cfg)
+        rec = _make_trial_record("tpe", trial.number, cfg, result, host=host)
+        rec["status"] = "ok" if result else "build_or_time_fail"
+        records.append(rec)
+        if progress:
+            progress(trial.number + 1, n_trials, cfg)
+        if result is None:
+            return math.inf
+        return float(result["timing_ms"])
+
+    study.optimize(objective, n_trials=n_trials, gc_after_trial=True,
+                   show_progress_bar=False)
+    return records
+
+
+def _step_neighbours(value: Any, values: List[Any], radius: int = 2
+                     ) -> List[Any]:
+    """Return up to ``2*radius`` neighbours of ``value`` along its dim's
+    ordered ``values`` list (radius-2 = +/-2 steps)."""
+    normed = [tuple(v) if isinstance(v, list) else v for v in values]
+    val = tuple(value) if isinstance(value, list) else value
+    if val not in normed:
+        return []
+    idx = normed.index(val)
+    lo = max(0, idx - radius)
+    hi = min(len(normed), idx + radius + 1)
+    return [normed[i] for i in range(lo, hi) if normed[i] != val]
+
+
+def topk_refine(
+    bayes_trials: List[Dict[str, Any]],
+    space: Dict[str, Any],
+    arch: str,
+    *,
+    top_k: int = 20,
+    radius: int = 2,
+    timer: Timer,
+    progress: ProgressCb = None,
+    host: Optional[Dict[str, Any]] = None,
+    prefiltered: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """For each of the top-K TPE trials, time the +/-radius-step
+    neighbours along every dim. Returns the refine-stage records."""
+    dims = space[arch]["dims"]
+    feasible = {config_key(c) for c in (prefiltered or [])}
+
+    successes = [t for t in bayes_trials if t["timing_ms"] is not None]
+    successes.sort(key=lambda t: t["timing_ms"])
+    seeds = successes[:top_k]
+
+    seen_keys: set = {t["config_key"] for t in bayes_trials}
+    candidate_cfgs: List[Dict[str, Any]] = []
+
+    for seed_trial in seeds:
+        base = {k: (tuple(v) if isinstance(v, list) else v)
+                for k, v in seed_trial["config"].items()}
+        for dim in dims:
+            name = dim["name"]
+            for nb in _step_neighbours(base.get(name), dim["values"], radius):
+                cfg = dict(base)
+                cfg[name] = nb
+                k = config_key(cfg)
+                if k in seen_keys:
+                    continue
+                if feasible and k not in feasible:
+                    continue
+                seen_keys.add(k)
+                candidate_cfgs.append(cfg)
+
+    records: List[Dict[str, Any]] = []
+    total = len(candidate_cfgs)
+    for i, cfg in enumerate(candidate_cfgs, 1):
+        result = timer(cfg)
+        rec = _make_trial_record("refine", i, cfg, result, host=host)
+        rec["status"] = "ok" if result else "build_or_time_fail"
+        records.append(rec)
+        if progress:
+            progress(i, total, cfg)
+    return records
+
+
+def pick_winner(all_trials: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Lowest timing across all stages. Returns the winning trial record
+    (with ``config`` and ``timing_ms``) or ``None``."""
+    finished = [t for t in all_trials if t["timing_ms"] is not None]
+    if not finished:
+        return None
+    return min(finished, key=lambda t: t["timing_ms"])
 
 
 # ---------------------------------------------------------------------------
@@ -892,9 +1984,9 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
 def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
                     target: str) -> List[str]:
     """Macros + extra-flag overrides for one config × target."""
-    macros = _ss.resolve_macros(config, dims, target)
-    extra = _ss.resolve_extra_nvcc_flags(config, dims) if target == "device" else []
-    extra_hip = _ss.resolve_extra_hipcc_flags(config, dims) if target == "device" else []
+    macros = resolve_macros(config, dims, target)
+    extra = resolve_extra_nvcc_flags(config, dims) if target == "device" else []
+    extra_hip = resolve_extra_hipcc_flags(config, dims) if target == "device" else []
     # Only one of CUDA / HIP applies per arch.
     return macros + (extra if "--maxrregcount" not in " ".join(extra_hip) else extra_hip)
 
@@ -913,7 +2005,7 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
     subprocess)."""
 
     def timer(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        ckey = _ss.config_key(config)
+        ckey = config_key(config)
         host_extra = _variant_macros(config, dims, "host")
         device_extra = _variant_macros(config, dims, "device")
 
@@ -1081,11 +2173,11 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
 
     yaml_path = (spec.search_space_path or DEFAULT_SEARCH_SPACE)
     report.write(f"  [search-space] {yaml_path}\n")
-    space = _ss.load_yaml(yaml_path)
+    space = load_yaml(yaml_path)
     if spec.arch not in space:
         report.write(f"  [jit-autotune] no search space for arch={spec.arch}\n")
         return None
-    space_hash = _ss.hash_space(space, spec.arch)
+    space_hash = hash_space(space, spec.arch)
     report.write(f"  [search-space] hash={space_hash[:16]}\n")
 
     if cache.is_jit_fresh(spec.optimizer, spec.model, spec.arch,
@@ -1094,8 +2186,8 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
         report.write(f"  [jit-autotune] cache hit: tuned={tuned}\n")
         return tuned
 
-    all_configs = _ss.cartesian(space, spec.arch)
-    survivors, eliminated = _ss.prefilter(
+    all_configs = cartesian(space, spec.arch)
+    survivors, eliminated = ss_prefilter(
         all_configs, space[spec.arch].get("prefilter", {}))
     report.write(f"  [prefilter] {len(all_configs)} candidates → "
                  f"{len(survivors)} survivors ({eliminated} eliminated)\n")
@@ -1104,7 +2196,6 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
         return None
 
     # Spawn the persistent worker.
-    from grokking_optimizers.timing_worker import TimingWorker
     worker = TimingWorker(opt_class=OPT_CLASS[spec.optimizer])
     if not worker.start():
         report.write("  [worker] start FAILED; falling back to one-shot per variant.\n")
@@ -1141,7 +2232,7 @@ def _run_exhaustive(spec: BuildSpec, configs: List[Dict[str, Any]],
     best: Optional[Dict[str, Any]] = None
     try:
         for i, cfg in enumerate(configs, 1):
-            ckey = _ss.config_key(cfg)
+            ckey = config_key(cfg)
             report.write(f"\n  [{i}/{len(configs)}] {ckey}\n")
             report.flush()
             t0 = time.monotonic()
@@ -1189,9 +2280,6 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
                   space: Dict[str, Any], dims: List[Dict[str, Any]],
                   timer, cache: CompileCache, space_hash: str,
                   report) -> Optional[Dict[str, Any]]:
-    from grokking_optimizers.bayesian import (
-        run_bayesian, topk_refine, pick_winner)
-
     n_trials = spec.bayesian_trials
     report.write(f"\n  [bayesian] TPE stage with n_trials={n_trials}, "
                  f"seed={spec.seed}, pruner={spec.pruner}\n")
@@ -1216,7 +2304,7 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
         n_trials, f"jit-tpe {spec.optimizer}/{spec.arch}")
 
     def progress1(done, total, cfg):
-        step1(f"trial {done}/{total} key={_ss.config_key(cfg)[:24]}…")
+        step1(f"trial {done}/{total} key={config_key(cfg)[:24]}…")
 
     try:
         tpe_trials = run_bayesian(
@@ -1249,7 +2337,7 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
         max(n_refine_est, 1), f"jit-refine {spec.optimizer}/{spec.arch}")
 
     def progress2(done, total, cfg):
-        step2(f"refine {done}/{total} key={_ss.config_key(cfg)[:24]}…")
+        step2(f"refine {done}/{total} key={config_key(cfg)[:24]}…")
 
     try:
         refine_trials = topk_refine(
@@ -1271,7 +2359,7 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
         return None
     out = dict(winner["config"])
     out["timing_ms"] = winner["timing_ms"]
-    out["config_key"] = _ss.config_key(out)
+    out["config_key"] = config_key(out)
     out["stage_won"] = winner["stage"]
     report.write(f"\n  [bayesian] WINNER ({winner['stage']}): "
                  f"{out['config_key']} @ {out['timing_ms']:.4f}ms\n")
@@ -1284,9 +2372,8 @@ def _neighbour_estimate(seeds: List[Dict[str, Any]],
                         dims: List[Dict[str, Any]],
                         prefiltered: List[Dict[str, Any]]):
     """Estimate the refine-stage trial count (best-effort, for progress bar)."""
-    feasible = {_ss.config_key(c) for c in prefiltered}
+    feasible = {config_key(c) for c in prefiltered}
     seen = set()
-    from grokking_optimizers.bayesian import _step_neighbours
     for s in seeds:
         base = {k: (tuple(v) if isinstance(v, list) else v)
                 for k, v in s["config"].items()}
@@ -1294,7 +2381,7 @@ def _neighbour_estimate(seeds: List[Dict[str, Any]],
             for nb in _step_neighbours(base.get(d["name"]), d["values"], 2):
                 cfg = dict(base)
                 cfg[d["name"]] = nb
-                k = _ss.config_key(cfg)
+                k = config_key(cfg)
                 if k in seen or (feasible and k not in feasible):
                     continue
                 seen.add(k)
@@ -1312,7 +2399,7 @@ def _write_tuned_configs_header(combo: Dict[str, Any], optimizer: str,
     macros: List[str] = []
     # Try to load the space to map dim -> macro
     try:
-        space = _ss.load_yaml(DEFAULT_SEARCH_SPACE)
+        space = load_yaml(DEFAULT_SEARCH_SPACE)
         dims = space.get(arch, {}).get("dims", [])
     except Exception:
         dims = []
@@ -1382,14 +2469,14 @@ def build_aot(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
     space_hash = None
     yaml_path = spec.search_space_path or DEFAULT_SEARCH_SPACE
     try:
-        space_hash = _ss.hash_space(_ss.load_yaml(yaml_path), spec.arch)
+        space_hash = hash_space(load_yaml(yaml_path), spec.arch)
     except Exception as exc:
         report.write(f"  [search-space] could not hash: {exc}\n")
 
     workload_hash = None
     if spec.pgo:
         workload = spec.pgo_workload or DEFAULT_PGO_WORKLOAD
-        workload_hash = _pgo.hash_workload(workload, spec.pgo_steps)
+        workload_hash = hash_workload(workload, spec.pgo_steps)
         report.write(f"  [pgo] workload={workload} steps={spec.pgo_steps} "
                      f"hash={workload_hash[:16]}\n")
 
@@ -1440,7 +2527,7 @@ def _build_aot_pgo(spec: BuildSpec, cache: CompileCache, sources: List[Path],
 
     # ── Pass 1: instrumented build ────────────────────────────────────
     report.write("\n  [pgo 1/3] building instrumented .so\n")
-    inst_host, inst_device, inst_ld = _pgo.instrument_flags(
+    inst_host, inst_device, inst_ld = instrument_flags(
         spec.arch, profile_dir, host_cflags, device_cflags, ldflags)
     inst_spec = BuildSpec(**{**spec.__dict__})
     inst_spec.extra_macros = list(spec.extra_macros) + ["-DSG_PGO_INSTRUMENT=1"]
@@ -1453,7 +2540,7 @@ def _build_aot_pgo(spec: BuildSpec, cache: CompileCache, sources: List[Path],
     # ── Pass 2: collect workload ──────────────────────────────────────
     report.write("\n  [pgo 2/3] running workload to collect profile data\n")
     workload = spec.pgo_workload or DEFAULT_PGO_WORKLOAD
-    ok = _pgo.collect_workload(
+    ok = collect_workload(
         workload,
         so_path=inst_so,
         opt_class=OPT_CLASS[spec.optimizer],
@@ -1472,7 +2559,7 @@ def _build_aot_pgo(spec: BuildSpec, cache: CompileCache, sources: List[Path],
 
     # ── Pass 3: profile-use build ─────────────────────────────────────
     report.write("\n  [pgo 3/3] rebuilding with -fprofile-use\n")
-    use_host, use_device, use_ld = _pgo.use_flags(
+    use_host, use_device, use_ld = use_flags(
         spec.arch, profile_dir, host_cflags, device_cflags, ldflags)
     so_path = _torch_load(spec, sources, use_host, use_device, use_ld,
                           report, module_suffix="_pgo")
@@ -1554,7 +2641,7 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
     extra_host: List[str] = []
     extra_device: List[str] = []
     try:
-        space = _ss.load_yaml(spec.search_space_path or DEFAULT_SEARCH_SPACE)
+        space = load_yaml(spec.search_space_path or DEFAULT_SEARCH_SPACE)
         dims = space.get(spec.arch, {}).get("dims", [])
         extra_host = _variant_macros(tuned, dims, "host")
         extra_device = _variant_macros(tuned, dims, "device")
@@ -1756,6 +2843,9 @@ def _spawn_phase(argv: List[str], phase: str) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    if "--self-test" in (argv if argv is not None else sys.argv[1:]):
+        return _self_test()
+
     parser = argparse.ArgumentParser(
         prog="python -m grokking_optimizers.compile",
         description="Targeted per-(optimizer, model, arch) build pipeline. "
@@ -1900,6 +2990,306 @@ def main(argv: Optional[List[str]] = None) -> int:
     return 0 if (so is not None
                  or ARCH_INFO[args.arch]["vendor"] == "pallas"
                  or args.runtime == "aot") else 1
+
+
+def _self_test() -> int:
+    """Run inline self-checks. Returns 0 on success, 1 on failure."""
+    import shutil
+    import tempfile
+
+    failures = 0
+    passed = 0
+
+    def _run(name, fn):
+        nonlocal failures, passed
+        try:
+            fn()
+            sys.stdout.write(f"  PASS: {name}\n")
+            passed += 1
+        except Exception as exc:
+            sys.stdout.write(f"  FAIL: {name}: {exc}\n")
+            failures += 1
+
+    sys.stdout.write("[self-test] search_space\n")
+
+    def test_load_yaml_validates_shape():
+        td = Path(tempfile.mkdtemp())
+        try:
+            p = td / "bad.yaml"
+            p.write_text("sm_90:\n  dims:\n    - name: block\n")
+            try:
+                load_yaml(p)
+                raise AssertionError("expected SearchSpaceError")
+            except SearchSpaceError:
+                pass
+        finally:
+            shutil.rmtree(td)
+
+    def test_load_yaml_rejects_duplicate_dim():
+        td = Path(tempfile.mkdtemp())
+        try:
+            p = td / "dup.yaml"
+            p.write_text(
+                "sm_90:\n  dims:\n"
+                "    - {name: block, type: int, values: [64]}\n"
+                "    - {name: block, type: int, values: [128]}\n")
+            try:
+                load_yaml(p)
+                raise AssertionError("expected SearchSpaceError")
+            except SearchSpaceError:
+                pass
+        finally:
+            shutil.rmtree(td)
+
+    def test_real_yaml_loads():
+        space = load_yaml(REPO_ROOT / "configs" / "search_space.yaml")
+        assert "sm_90" in space
+        assert "gfx942" in space
+
+    def test_cartesian_counts():
+        space = load_yaml(REPO_ROOT / "configs" / "search_space.yaml")
+        configs = cartesian(space, "sm_90")
+        assert len(configs) == 5 * 3 * 5 * 4 * 5 * 3 * 3 * 2 * 2 * 4
+
+    def test_prefilter_eliminates():
+        space = load_yaml(REPO_ROOT / "configs" / "search_space.yaml")
+        configs = cartesian(space, "sm_90")
+        survivors, eliminated = ss_prefilter(
+            configs, space["sm_90"]["prefilter"])
+        assert eliminated > 0
+        assert len(survivors) + eliminated == len(configs)
+
+    def test_config_key_deterministic():
+        cfg1 = {"block": 256, "vec": 4, "unroll": 8}
+        cfg2 = {"unroll": 8, "block": 256, "vec": 4}
+        assert config_key(cfg1) == config_key(cfg2)
+
+    def test_hash_space_stable():
+        space = load_yaml(REPO_ROOT / "configs" / "search_space.yaml")
+        h1 = hash_space(space, "sm_90")
+        h2 = hash_space(space, "sm_90")
+        assert h1 == h2
+        assert h1 != hash_space(space, "gfx942")
+
+    _run("load_yaml_validates_shape", test_load_yaml_validates_shape)
+    _run("load_yaml_rejects_duplicate_dim", test_load_yaml_rejects_duplicate_dim)
+    _run("real_yaml_loads", test_real_yaml_loads)
+    _run("cartesian_counts", test_cartesian_counts)
+    _run("prefilter_eliminates", test_prefilter_eliminates)
+    _run("config_key_deterministic", test_config_key_deterministic)
+    _run("hash_space_stable", test_hash_space_stable)
+
+    sys.stdout.write("[self-test] pgo\n")
+
+    def test_hash_workload_deterministic():
+        td = Path(tempfile.mkdtemp())
+        try:
+            s = td / "w.py"
+            s.write_text("print('hi')")
+            assert hash_workload(s, 1000) == hash_workload(s, 1000)
+        finally:
+            shutil.rmtree(td)
+
+    def test_hash_workload_changes():
+        td = Path(tempfile.mkdtemp())
+        try:
+            s = td / "w.py"
+            s.write_text("a = 1")
+            h1 = hash_workload(s, 1000)
+            s.write_text("a = 2")
+            h2 = hash_workload(s, 1000)
+            assert h1 != h2
+            assert hash_workload(s, 1000) != hash_workload(s, 2000)
+        finally:
+            shutil.rmtree(td)
+
+    def test_instrument_flags_cuda():
+        td = Path(tempfile.mkdtemp())
+        try:
+            h, d, l = instrument_flags("sm_90", td, ["-O3"], ["-O3"], ["-flto"])
+            assert any("-fprofile-generate" in f for f in h)
+            assert any("-fprofile-generate" in f for f in d)
+        finally:
+            shutil.rmtree(td)
+
+    def test_use_flags_round_trip():
+        td = Path(tempfile.mkdtemp())
+        try:
+            h, d, l = use_flags("sm_90", td, ["-O3"], ["-O3"], ["-flto"])
+            assert any("-fprofile-use" in f for f in h)
+            assert any("-fprofile-correction" in f for f in h)
+        finally:
+            shutil.rmtree(td)
+
+    _run("hash_workload_deterministic", test_hash_workload_deterministic)
+    _run("hash_workload_changes", test_hash_workload_changes)
+    _run("instrument_flags_cuda", test_instrument_flags_cuda)
+    _run("use_flags_round_trip", test_use_flags_round_trip)
+
+    sys.stdout.write("[self-test] bayesian\n")
+
+    def _tiny_space():
+        return {"sm_90": {"dims": [
+            {"name": "block", "type": "int", "values": [64, 128, 256, 512],
+             "macro": "SG_TUNED_BLOCK_SIZE", "applies_to": ["host", "device"]},
+            {"name": "vec", "type": "int", "values": [1, 2, 4],
+             "macro": "SG_TUNED_VEC_WIDTH", "applies_to": ["host", "device"]},
+            {"name": "unroll", "type": "int", "values": [1, 2, 4, 8],
+             "macro": "SG_TUNED_UNROLL", "applies_to": ["host", "device"]},
+        ], "prefilter": {"rules": []}}}
+
+    def _synthetic_timer(cfg):
+        score = ((cfg["block"] - 256) / 256.0) ** 2
+        score += ((cfg["vec"] - 4) / 4.0) ** 2
+        score += ((cfg["unroll"] - 8) / 8.0) ** 2
+        score += 0.05
+        return {"timing_ms": score, "min_ms": score - 0.01,
+                "max_ms": score + 0.01, "n": 21}
+
+    def test_bayesian_finds_winner():
+        td = Path(tempfile.mkdtemp())
+        try:
+            trials = run_bayesian(
+                "sm_90", _tiny_space(), n_trials=40, seed=0,
+                storage=td / "study.db", timer=_synthetic_timer)
+            assert len(trials) == 40
+            w = pick_winner(trials)
+            assert w is not None and w["timing_ms"] < 0.5
+        finally:
+            shutil.rmtree(td)
+
+    def test_topk_refine_generates_neighbours():
+        td = Path(tempfile.mkdtemp())
+        try:
+            trials = run_bayesian(
+                "sm_90", _tiny_space(), n_trials=20, seed=0,
+                storage=td / "study.db", timer=_synthetic_timer)
+            refines = topk_refine(trials, _tiny_space(), "sm_90",
+                                  top_k=5, radius=2, timer=_synthetic_timer)
+            assert all(t["stage"] == "refine" for t in refines)
+        finally:
+            shutil.rmtree(td)
+
+    _run("bayesian_finds_winner", test_bayesian_finds_winner)
+    _run("topk_refine_generates_neighbours", test_topk_refine_generates_neighbours)
+
+    sys.stdout.write("[self-test] cache\n")
+
+    def test_v2_to_v3_migration():
+        td = Path(tempfile.mkdtemp())
+        try:
+            cp = td / "cache.json"
+            cp.write_text(json.dumps({
+                "version": 2, "created_at": "2026-04-10T12:00:00",
+                "host_history": [{"platform": "old"}],
+                "entries": {"lion/mamba/sm_90": {
+                    "source_hash": "abc", "host_cflags_hash": "def",
+                    "device_cflags_hash": "ghi", "primary_artifact": None,
+                    "variant_artifacts": {}, "sweep_history": [],
+                    "tuned_config": None,
+                    "aot_completed_at": "2026-04-10T12:00:00",
+                    "jit_completed_at": None, "aot_host": {}, "jit_host": None,
+                }}}, indent=2))
+            cache = CompileCache(cp)
+            assert cache._data["version"] == CACHE_VERSION
+            e = cache._data["entries"]["lion/mamba/sm_90"]
+            assert e["pgo_enabled"] is False
+            assert e["bayesian_trials"] == []
+        finally:
+            shutil.rmtree(td)
+
+    def test_cache_round_trips():
+        td = Path(tempfile.mkdtemp())
+        try:
+            cp = td / "fresh.json"
+            cache = CompileCache(cp)
+            cache.record_aot("lion", "mamba", "sm_90",
+                             source_hash="s", host_flags_hash="h",
+                             device_flags_hash="d", so_path=None,
+                             pgo_enabled=True, pgo_workload_hash="w",
+                             search_space_hash="ss")
+            cache.save()
+            reloaded = CompileCache(cp)
+            e = reloaded._data["entries"]["lion/mamba/sm_90"]
+            assert e["pgo_enabled"] is True
+            assert e["pgo_workload_hash"] == "w"
+        finally:
+            shutil.rmtree(td)
+
+    _run("v2_to_v3_migration", test_v2_to_v3_migration)
+    _run("cache_round_trips", test_cache_round_trips)
+
+    sys.stdout.write("[self-test] kernel_headers\n")
+
+    def _read_kernel(p: Path) -> str:
+        return p.read_text(encoding="utf-8")
+
+    KERNEL_DIR = REPO_ROOT / "grokking_optimizers" / "kernels"
+
+    def test_elementwise_headers():
+        sm90_dir = KERNEL_DIR / "sm_90"
+        gfx942_dir = KERNEL_DIR / "gfx942"
+        for opt in ("adamw", "lion", "grokfast", "grokadamw"):
+            sm = sm90_dir / f"{opt}_sm90.cuh"
+            gfx = gfx942_dir / f"{opt}_gfx942.hip.hpp"
+            assert sm.is_file(), f"Missing {sm}"
+            assert gfx.is_file(), f"Missing {gfx}"
+            sm_src = _read_kernel(sm)
+            gfx_src = _read_kernel(gfx)
+            assert f"{opt}_update(" in sm_src
+            assert f"{opt}_update(" in gfx_src
+            assert f"{opt}_kernel(" in sm_src
+            assert f"{opt}_kernel(" in gfx_src
+            assert "namespace grokking" in sm_src
+            assert "namespace grokking" in gfx_src
+
+    def test_model_headers():
+        models = [
+            ("transformer_decoder", "sm_90", "transformer_decoder_sm90.cuh"),
+            ("transformer_decoder", "gfx942", "transformer_decoder_gfx942.hip.hpp"),
+            ("transformer_decoder", "tpu", "transformer_decoder_tpu.py"),
+            ("mamba3", "sm_90", "mamba3_sm90.cuh"),
+            ("mamba3", "gfx942", "mamba3_gfx942.hip.hpp"),
+            ("mamba3", "tpu", "mamba3_tpu.py"),
+            ("vit", "sm_90", "vit_sm90.cuh"),
+            ("vit", "gfx942", "vit_gfx942.hip.hpp"),
+            ("vit", "tpu", "vit_tpu.py"),
+        ]
+        for model, arch, fname in models:
+            p = KERNEL_DIR / arch / fname
+            assert p.is_file(), f"Missing {p}"
+            src = _read_kernel(p)
+            assert "param_bytes" in src or "Sizes" in src or "SMEM_BYTES" in src, \
+                f"{fname} missing size helpers"
+
+    def test_optimizer_model_cross():
+        sm90_dir = KERNEL_DIR / "sm_90"
+        gfx942_dir = KERNEL_DIR / "gfx942"
+        tpu_dir = KERNEL_DIR / "tpu"
+        opts = ("adamw", "lion", "grokfast", "grokadamw")
+        models_sm90 = ("transformer_decoder_sm90.cuh", "mamba3_sm90.cuh", "vit_sm90.cuh")
+        models_gfx = ("transformer_decoder_gfx942.hip.hpp", "mamba3_gfx942.hip.hpp",
+                      "vit_gfx942.hip.hpp")
+        models_tpu = ("transformer_decoder_tpu.py", "mamba3_tpu.py", "vit_tpu.py")
+        for opt in opts:
+            assert (sm90_dir / f"{opt}_sm90.cuh").is_file()
+            assert (gfx942_dir / f"{opt}_gfx942.hip.hpp").is_file()
+        for m in models_sm90:
+            assert (sm90_dir / m).is_file()
+        for m in models_gfx:
+            assert (gfx942_dir / m).is_file()
+        for m in models_tpu:
+            assert (tpu_dir / m).is_file()
+        assert (sm90_dir / "common_sm90.cuh").is_file()
+        assert (gfx942_dir / "common_gfx942.hip.hpp").is_file()
+        assert (tpu_dir / "common_tpu.py").is_file()
+
+    _run("elementwise_headers", test_elementwise_headers)
+    _run("model_headers", test_model_headers)
+    _run("optimizer_model_cross", test_optimizer_model_cross)
+
+    sys.stdout.write(f"\n[self-test] {passed} passed, {failures} failed\n")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
