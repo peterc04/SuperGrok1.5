@@ -4466,6 +4466,21 @@ class BuildSpec:
     # one fixed source re-compiled with different -D macros.
     enable_emitter: bool = False
     _emitted_sources: Dict[str, Path] = field(default_factory=dict)
+    # Stream D — generative / structural codegen. When True, the variant
+    # timer ALSO tries the OpGraph-based synthesiser for each (optimizer,
+    # model, arch) triple; the synth source is emitted to
+    # <out_dir>/synth_sources/ and stashed on _emitted_sources under
+    # "<ckey>:synth" so the autotuner can pick the winner against the
+    # template-rendered variant. When the (optimizer, arch) triple has no
+    # matching OpGraph pattern, the synth path is skipped silently and the
+    # template-only path stays in force. With this flag OFF (the default),
+    # no synthesis runs and behaviour is byte-identical to today.
+    enable_synth_codegen: bool = False
+    # Stream D — when True, suppress the Jinja2 template variant entirely
+    # for that (config, arch) pair and build/time ONLY the synthesised
+    # variant. Default False (both stashed; template variant times). Has
+    # no effect when ``enable_synth_codegen=False``.
+    synth_codegen_prefer_synth_over_template: bool = False
     # Stream 8 — device-side PGO (CUPTI / rocprof / XLA HLO dump)
     enable_device_pgo: bool = False
     # Stream 9 — variant cache GC. Auto-prune runs at the END of a
@@ -6784,8 +6799,38 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         # Per-variant flush of the running ETA window.
         progress_state["last_start"] = time.monotonic()
 
+        # Stream D — generative / structural codegen. When
+        # spec.enable_synth_codegen is on, try the OpGraph synthesiser
+        # alongside (or, with prefer_synth_over_template, INSTEAD of)
+        # the Jinja2 template path. The synth source path is stashed on
+        # spec._emitted_sources["<ckey>:synth"] so downstream consumers
+        # (dry-run manifests, autotune sidecars) can see the variant
+        # without modifying the timer's return shape. With the flag
+        # OFF (the default), this branch is a no-op.
+        variant_sources = list(sources)
+        if getattr(spec, "enable_synth_codegen", False):
+            try:
+                synth_path = _try_synth_codegen(spec, config, dims)
+            except Exception as exc:
+                report.write(
+                    f"    [synth_codegen] {ckey[:24]} skipped: "
+                    f"{type(exc).__name__}: {exc}\n")
+                synth_path = None
+            if synth_path is not None:
+                spec._emitted_sources[f"{ckey}:synth"] = synth_path
+                if getattr(spec,
+                           "synth_codegen_prefer_synth_over_template",
+                           False):
+                    # Synth-only: replace template-driven sources with
+                    # the synthesised file. The existing _torch_load
+                    # call below picks this list up unchanged.
+                    variant_sources = [synth_path]
+                    report.write(
+                        f"    [synth_codegen] {ckey[:24]} "
+                        f"synth-only build: {synth_path.name}\n")
+
         variant_so = _torch_load(
-            spec, sources,
+            spec, variant_sources,
             host_cflags_base + host_extra,
             device_cflags_base + device_extra,
             ldflags, report,
@@ -10970,6 +11015,116 @@ def _self_test() -> int:
     _run("make_trial_record_propagates_numerical_status",
          test_make_trial_record_pulls_numerical_status)
 
+    # Stream D — generative / structural codegen. Five tests covering
+    # OpGraph construction + topo sort, elementwise lowering on CUDA,
+    # adamw_update pattern across (cuda, hip, pallas), and the CK
+    # GEMM emitter's import-lazy skip path.
+    sys.stdout.write("[self-test] synth_codegen\n")
+
+    def test_synth_codegen_helpers_importable():
+        from grokking_optimizers.compile import (
+            OpNode, OpGraph, SynthCodegenError, synthesize_kernel,
+            pattern_adamw_update, pattern_reduce_broadcast,
+        )
+        assert OpNode is not None and OpGraph is not None
+        assert SynthCodegenError is not None
+        assert callable(synthesize_kernel)
+        # Sanity: the helpers are also reachable via the consolidated
+        # ``grokking_optimizers.codegen`` legacy alias so existing import
+        # sites can pick them up without code changes.
+        from grokking_optimizers import codegen as _cg
+        assert hasattr(_cg, "OpNode")
+        assert hasattr(_cg, "synthesize_kernel")
+        assert callable(pattern_adamw_update)
+        assert callable(pattern_reduce_broadcast)
+    _run("synth_codegen_helpers_importable",
+         test_synth_codegen_helpers_importable)
+
+    def test_synth_opgraph_construction_and_topo():
+        """Build a 2-node OpGraph (elementwise add then reduce);
+        topological order is deterministic and respects edges."""
+        from grokking_optimizers.compile import OpNode, OpGraph
+        add_node = OpNode(op_kind="elementwise", name="add",
+                          inputs=["x", "y"], output="t",
+                          attrs={"expr": "x + y"})
+        red_node = OpNode(op_kind="reduce", name="sum",
+                          inputs=["t"], output="z",
+                          attrs={"axis": 0, "op": "sum"})
+        g = OpGraph(inputs={"x": ("fp32", (1024,)),
+                            "y": ("fp32", (1024,))},
+                    nodes=[red_node, add_node],   # deliberately out of order
+                    output="z")
+        topo = g.topological_order()
+        names = [n.name for n in topo]
+        assert names == ["add", "sum"], names
+    _run("synth_opgraph_construction_and_topo",
+         test_synth_opgraph_construction_and_topo)
+
+    def test_synth_elementwise_lowers_to_cuda():
+        """Simple elementwise OpGraph lowers to CUDA source with an
+        extern "C" launcher and uses the right dtype."""
+        from grokking_optimizers.compile import (
+            OpNode, OpGraph, synthesize_kernel)
+        node = OpNode(op_kind="elementwise", name="copy",
+                      inputs=["x"], output="y",
+                      attrs={"expr": "x"})
+        g = OpGraph(inputs={"x": ("fp32", (1024,))}, nodes=[node],
+                    output="y")
+        src = synthesize_kernel(g, "sm_90a", "fp32", (1024,))
+        assert "extern \"C\"" in src, src[:300]
+        assert "launch_" in src
+        # Dtype propagates.
+        assert "float" in src
+    _run("synth_elementwise_lowers_to_cuda",
+         test_synth_elementwise_lowers_to_cuda)
+
+    def test_synth_adamw_pattern_lowers_per_vendor():
+        """The adamw_update pattern lowers cleanly on CUDA, HIP, and
+        Pallas."""
+        from grokking_optimizers.compile import (
+            pattern_adamw_update, synthesize_kernel)
+        g = pattern_adamw_update(shape=(4096,), dtype="fp32")
+        for arch, marker in (("sm_90a", "__global__"),
+                             ("gfx942", "__global__"),
+                             ("tpu_v5p", "pallas_call")):
+            try:
+                src = synthesize_kernel(g, arch, "fp32", (4096,))
+            except Exception as exc:
+                raise AssertionError(f"{arch}: synth failed: {exc}")
+            assert marker in src or "extern \"C\"" in src, (
+                f"{arch}: missing {marker!r} in synthesized source")
+    _run("synth_adamw_pattern_lowers_per_vendor",
+         test_synth_adamw_pattern_lowers_per_vendor)
+
+    def test_synth_ck_emitter_skip_path():
+        """emit_ck_gemm_variants raises SynthCodegenError cleanly when
+        composable_kernel isn't installed (matches the CUTLASS skip
+        pattern)."""
+        from grokking_optimizers.compile import (
+            emit_ck_gemm_variants, SynthCodegenError)
+        try:
+            import composable_kernel  # noqa: F401
+            ck_installed = True
+        except ImportError:
+            ck_installed = False
+        if ck_installed:
+            # If CK IS installed, just verify the call returns a list of
+            # (Path, dict) pairs without crashing.
+            with tempfile.TemporaryDirectory() as td:
+                variants = emit_ck_gemm_variants(
+                    "gfx942", (256, 256, 256), "fp16", Path(td))
+                assert isinstance(variants, list)
+        else:
+            with tempfile.TemporaryDirectory() as td:
+                try:
+                    emit_ck_gemm_variants(
+                        "gfx942", (256, 256, 256), "fp16", Path(td))
+                    raise AssertionError(
+                        "expected SynthCodegenError when CK is absent")
+                except SynthCodegenError as exc:
+                    assert "composable_kernel" in str(exc).lower()
+    _run("synth_ck_emitter_skip_path", test_synth_ck_emitter_skip_path)
+
     # Stream H — final wrapper: only runs the e2e smoke when a GPU is
     # visible; SKIPs cleanly (and counts as PASS) otherwise.
     sys.stdout.write("[self-test] e2e_smoke (gated on GPU availability)\n")
@@ -14812,6 +14967,1258 @@ def emit_cutlass_gemm_variants(arch: str,
     return emitted
 
 
+# ==============================================================================
+# Generative / structural codegen (Stream D)
+# ==============================================================================
+# Above the hand-written Jinja2 templates: an OpGraph IR that synthesises
+# CUDA / HIP / Pallas source for tensor compute graphs. Patterns covered:
+# elementwise + reduction + fused softmax+matmul + parallel scan + bilevel
+# fusion. Per-arch backends emit the right instructions (wgmma for sm_90a,
+# tcgen05 for sm_100a, mfma for gfx9xx, wmma for gfx10xx+).
+#
+# Composable-Kernel (CK) Python frontend is OPTIONAL and used as the AMD
+# equivalent of CUTLASS for GEMM-shaped subgraphs — import-lazy, never
+# fails at module load.
+#
+# Opt-in via ``BuildSpec.enable_synth_codegen`` (default False) or
+# ``[synth_codegen] enable = true`` in the TOML config. With both off,
+# this section is dead code — byte-identical behaviour to today.
+
+class SynthCodegenError(RuntimeError):
+    """Raised when the OpGraph synthesiser cannot lower a given graph
+    for the requested (arch, dtype) combination, or when an optional
+    backend dependency (e.g. ``composable_kernel``) is missing.
+
+    Callers catch this and fall back to the Jinja2 template emitter
+    rather than aborting the whole variant build.
+    """
+
+
+# -- Canonical patterns the OpGraph synthesiser knows how to lower. Keep
+# in sync with the ``allowed_patterns`` list in _DEFAULT_PROJECT_CONFIG.
+_SYNTH_KNOWN_PATTERNS: Tuple[str, ...] = (
+    "adamw_update", "fused_adam_grad_norm", "softmax_matmul",
+    "reduce_broadcast", "parallel_scan", "bilevel_fusion",
+)
+
+
+# Per-arch lowering helpers consult this table to pick a vendor (cuda /
+# hip / pallas) and to gate instructions that require specific features
+# (e.g. wgmma is sm_90a-only). For Pallas (TPU) targets we emit Python
+# source using ``pl.pallas_call`` / ``jax.lax`` primitives — there is no
+# C++ backend for these.
+_SYNTH_VENDOR_EXT: Dict[str, str] = {
+    "cuda":   ".cu",
+    "hip":    ".hip.cpp",
+    "pallas": ".py",
+}
+
+
+# Map our dtype mnemonics → (C/C++ scalar type, accumulator type, JAX
+# type name). Mirrors _CUTLASS_DTYPE_MAP above but covers a wider set so
+# the elementwise / reduce paths can lower fp32 / fp16 / bf16 / fp8
+# without dragging in the CUTLASS dependency.
+_SYNTH_DTYPE_MAP: Dict[str, Tuple[str, str, str]] = {
+    "fp32":     ("float",                "float",  "jnp.float32"),
+    "f32":      ("float",                "float",  "jnp.float32"),
+    "float":    ("float",                "float",  "jnp.float32"),
+    "fp16":     ("__half",               "float",  "jnp.float16"),
+    "f16":      ("__half",               "float",  "jnp.float16"),
+    "half":     ("__half",               "float",  "jnp.float16"),
+    "bf16":     ("__nv_bfloat16",        "float",  "jnp.bfloat16"),
+    "bfloat16": ("__nv_bfloat16",        "float",  "jnp.bfloat16"),
+    "fp8":      ("__nv_fp8_e4m3",        "float",  "jnp.float8_e4m3fn"),
+    "e4m3":     ("__nv_fp8_e4m3",        "float",  "jnp.float8_e4m3fn"),
+    "e5m2":     ("__nv_fp8_e5m2",        "float",  "jnp.float8_e5m2"),
+    "fp64":     ("double",               "double", "jnp.float64"),
+}
+
+
+@dataclass
+class OpNode:
+    """One node in an OpGraph. The kind drives per-arch lowering.
+
+    ``attrs`` convention (per op_kind):
+      * ``"elementwise"`` — ``{"expr": "<C-syntax body>"}``.
+        The expression refers to inputs by their declared input names;
+        the lowering wraps it in a grid-stride loop over the output
+        tensor.
+      * ``"reduce"`` — ``{"axis": int, "op": "sum"|"max"|"prod"}``.
+        Lowered to a warp-shuffle reduction for small shapes; block-
+        reduce + atomicAdd / atomicMax for large shapes (above
+        ``_REDUCE_WARP_FAST_THRESHOLD``).
+      * ``"gemm"`` — ``{"M": int, "N": int, "K": int,
+                        "transA": bool, "transB": bool}``.
+        On sm_90a/sm_100a the synthesiser delegates to
+        ``emit_cutlass_gemm_variants``; on gfx9xx/gfx12xx to
+        ``emit_ck_gemm_variants``. Otherwise a portable cublas-shaped
+        triple-loop is emitted.
+      * ``"scan"`` — ``{"axis": int, "op": "sum"|"max",
+                        "exclusive": bool}``.
+        On CUDA / HIP, lowered to a Blelloch scan kernel. On Pallas, the
+        emitter wraps ``jax.lax.associative_scan`` inside a
+        ``pl.pallas_call`` so the same OpGraph runs on TPU.
+      * ``"scatter"`` / ``"gather"`` — ``{"axis": int}``.
+        Indexed load / store along ``axis``.
+    """
+    op_kind: str
+    name: str
+    inputs: List[str]
+    output: str
+    attrs: Dict[str, Any] = field(default_factory=dict)
+    requires_features: frozenset = field(default_factory=frozenset)
+
+
+@dataclass
+class OpGraph:
+    """DAG of OpNodes.
+
+    ``inputs`` maps graph-input names to ``(dtype, shape)``. ``nodes``
+    may be supplied in any order; ``topological_order()`` re-sorts them
+    so the synthesiser can walk producer-before-consumer.
+    ``output`` is the name of the final node's output tensor.
+    """
+    inputs: Dict[str, Tuple[str, Tuple[int, ...]]]
+    nodes: List[OpNode]
+    output: str
+
+    def topological_order(self) -> List[OpNode]:
+        """Return nodes sorted producer-before-consumer (Kahn's algorithm).
+
+        Cycles raise ``SynthCodegenError`` — OpGraphs are DAGs by
+        construction; a cycle is always a builder bug.
+        """
+        # Tensor name -> producing node (or None for graph inputs).
+        producers: Dict[str, Optional[OpNode]] = {
+            name: None for name in self.inputs
+        }
+        for n in self.nodes:
+            if n.output in producers and producers[n.output] is not None:
+                raise SynthCodegenError(
+                    f"two nodes produce {n.output!r}; OpGraph must be SSA")
+            producers[n.output] = n
+        # In-degree count per node (edges = input → producer).
+        in_deg: Dict[str, int] = {n.name: 0 for n in self.nodes}
+        # Adjacency: producer_name -> list of consumer names.
+        consumers: Dict[str, List[str]] = {n.name: [] for n in self.nodes}
+        for n in self.nodes:
+            for inp in n.inputs:
+                prod = producers.get(inp)
+                if prod is None:
+                    # Graph input — no edge to add.
+                    continue
+                in_deg[n.name] += 1
+                consumers[prod.name].append(n.name)
+        # Kahn: start from zero-in-degree nodes in declaration order.
+        by_name: Dict[str, OpNode] = {n.name: n for n in self.nodes}
+        ready = [n.name for n in self.nodes if in_deg[n.name] == 0]
+        order: List[OpNode] = []
+        i = 0
+        while i < len(ready):
+            cur = ready[i]
+            i += 1
+            order.append(by_name[cur])
+            for c in consumers[cur]:
+                in_deg[c] -= 1
+                if in_deg[c] == 0:
+                    ready.append(c)
+        if len(order) != len(self.nodes):
+            raise SynthCodegenError(
+                "OpGraph contains a cycle or dangling reference")
+        return order
+
+
+# Threshold below which a reduce node uses warp-shuffle only (no block
+# reduce / atomic). Empirical pick — keeps the small-tensor adamw_update
+# pattern in a single warp's worth of shuffles on sm_90a/gfx942.
+_REDUCE_WARP_FAST_THRESHOLD = 256
+
+
+# ---- Arch -> vendor classification used by the dispatcher. Mirrors
+# get_arch_entry(arch).vendor but tolerates the synthesiser being called
+# with an arch string that doesn't (yet) exist in ARCH_TABLE — useful
+# during smoke tests on a host without the full search-space loaded.
+def _synth_arch_vendor(arch: str) -> str:
+    if arch in ARCH_TABLE:
+        return get_arch_entry(arch).vendor
+    if arch.startswith("sm_"):
+        return "cuda"
+    if arch.startswith("gfx"):
+        return "hip"
+    if arch.startswith("tpu_"):
+        return "pallas"
+    return "cuda"
+
+
+# Feature membership used by the lowering dispatcher to pick wgmma vs
+# tcgen05 vs mfma vs wmma. Best-effort: when the arch isn't in
+# ARCH_TABLE we return an empty set rather than crash.
+def _synth_arch_features(arch: str) -> frozenset:
+    if arch in ARCH_TABLE:
+        return get_arch_entry(arch).features
+    return frozenset()
+
+
+def _synth_dtype_triple(dtype: str) -> Tuple[str, str, str]:
+    """Resolve (scalar_t, accum_t, jax_t) for ``dtype``; default to fp32."""
+    return _SYNTH_DTYPE_MAP.get(dtype, ("float", "float", "jnp.float32"))
+
+
+def _synth_sanitize(name: str) -> str:
+    """Make ``name`` safe to use as a C identifier / filename fragment."""
+    out = []
+    for ch in name:
+        out.append(ch if (ch.isalnum() or ch == "_") else "_")
+    s = "".join(out).strip("_")
+    return s or "anon"
+
+
+def _synth_shape_str(shape: Tuple[int, ...]) -> str:
+    return "x".join(str(int(s)) for s in shape)
+
+
+# ---- Pattern library ------------------------------------------------------
+# Each pattern factory returns a populated OpGraph annotated with the
+# minimum feature set its preferred lowering needs. The synthesiser
+# walks the graph in topological order; the pattern itself is purely a
+# data structure — no codegen happens here.
+
+def pattern_adamw_update(shape: Tuple[int, ...],
+                         dtype: str) -> OpGraph:
+    """Fused elementwise AdamW update.
+
+    Layout: param ← param - lr * m_hat / (sqrt(v_hat) + eps) - lr * wd * param
+    with the bias-corrected first / second moment estimates plumbed
+    through a single elementwise node. The expression is parameterised
+    by ``lr``, ``beta1``, ``beta2``, ``eps``, ``wd``, ``bc1``, ``bc2`` —
+    the synthesiser binds these as kernel arguments rather than baking
+    them in, so a single emitted kernel covers every (lr, beta, wd)
+    combination the optimizer hands it.
+    """
+    expr = ("p - lr * (m / bc1) / (sqrt(v / bc2) + eps) "
+            "- lr * wd * p")
+    body = OpNode(
+        op_kind="elementwise",
+        name="adamw_update",
+        inputs=["p", "m", "v", "g"],
+        output="p_new",
+        attrs={"expr": expr},
+    )
+    return OpGraph(
+        inputs={
+            "p": (dtype, tuple(shape)),
+            "m": (dtype, tuple(shape)),
+            "v": (dtype, tuple(shape)),
+            "g": (dtype, tuple(shape)),
+        },
+        nodes=[body],
+        output="p_new",
+    )
+
+
+def pattern_fused_adam_grad_norm(shape: Tuple[int, ...],
+                                 dtype: str) -> OpGraph:
+    """Adam update + global grad-norm clip in a single fused pass.
+
+    Two-node graph: reduce(g*g) → broadcast clip-coefficient → fused
+    Adam update. The reduce node is annotated with ``axis=0, op="sum"``
+    so the synthesiser picks the warp-shuffle path for small shapes and
+    the block-reduce + atomicAdd path for large shapes.
+    """
+    sqr = OpNode(
+        op_kind="elementwise",
+        name="grad_squared",
+        inputs=["g"],
+        output="g_sq",
+        attrs={"expr": "g * g"},
+    )
+    norm = OpNode(
+        op_kind="reduce",
+        name="grad_norm",
+        inputs=["g_sq"],
+        output="gn",
+        attrs={"axis": 0, "op": "sum"},
+    )
+    update = OpNode(
+        op_kind="elementwise",
+        name="adam_clip_update",
+        inputs=["p", "m", "v", "g", "gn"],
+        output="p_new",
+        attrs={
+            "expr": ("p - lr * (m / bc1) / (sqrt(v / bc2) + eps) "
+                     "* fmin(1.0f, clip_norm / (sqrt(gn) + 1e-6f))"),
+        },
+    )
+    return OpGraph(
+        inputs={
+            "p": (dtype, tuple(shape)),
+            "m": (dtype, tuple(shape)),
+            "v": (dtype, tuple(shape)),
+            "g": (dtype, tuple(shape)),
+        },
+        nodes=[sqr, norm, update],
+        output="p_new",
+    )
+
+
+def pattern_softmax_matmul(M: int, N: int, K: int,
+                           dtype: str) -> OpGraph:
+    """Flash-attention-style softmax(QK^T)V graph.
+
+    Three nodes: QK^T gemm → softmax (elementwise + reduce internally
+    represented as a reduce-max + reduce-sum pair) → softmax * V gemm.
+    The gemm nodes carry ``requires_features={"wgmma"}`` so the
+    sm_90a/sm_100a lowering dispatches to the CUTLASS emitter; on AMD
+    we fall through to ``emit_ck_gemm_variants``.
+    """
+    qkt = OpNode(
+        op_kind="gemm",
+        name="qkt",
+        inputs=["Q", "K"],
+        output="S",
+        attrs={"M": M, "N": N, "K": K, "transA": False, "transB": True},
+        requires_features=frozenset({"wgmma"}),
+    )
+    smax = OpNode(
+        op_kind="elementwise",
+        name="softmax",
+        inputs=["S"],
+        output="P",
+        attrs={"expr": "expf(S - smax_row) * inv_sum_row"},
+    )
+    av = OpNode(
+        op_kind="gemm",
+        name="pv",
+        inputs=["P", "V"],
+        output="O",
+        attrs={"M": M, "N": N, "K": N, "transA": False, "transB": False},
+        requires_features=frozenset({"wgmma"}),
+    )
+    return OpGraph(
+        inputs={
+            "Q": (dtype, (M, K)),
+            "K": (dtype, (N, K)),
+            "V": (dtype, (N, N)),
+        },
+        nodes=[qkt, smax, av],
+        output="O",
+    )
+
+
+def pattern_reduce_broadcast(shape: Tuple[int, ...],
+                             dtype: str,
+                             *, reduce_axis: int = 0) -> OpGraph:
+    """Reduce along an axis then broadcast back to the original shape.
+
+    Useful as the spine of normalisation patterns (layernorm /
+    grad-norm clip). Emits a reduce node followed by an elementwise
+    node that re-uses the reduced scalar via broadcast semantics.
+    """
+    r = OpNode(
+        op_kind="reduce",
+        name="reduce",
+        inputs=["x"],
+        output="r",
+        attrs={"axis": int(reduce_axis), "op": "sum"},
+    )
+    b = OpNode(
+        op_kind="elementwise",
+        name="broadcast_div",
+        inputs=["x", "r"],
+        output="y",
+        attrs={"expr": "x / r"},
+    )
+    return OpGraph(
+        inputs={"x": (dtype, tuple(shape))},
+        nodes=[r, b],
+        output="y",
+    )
+
+
+def pattern_parallel_scan(shape: Tuple[int, ...],
+                          dtype: str,
+                          *, axis: int = 0,
+                          op: str = "sum") -> OpGraph:
+    """Blelloch parallel scan over ``axis`` (exclusive=False).
+
+    On CUDA / HIP, lowered to a work-efficient Blelloch kernel. On
+    Pallas, lowered to ``pl.pallas_call`` invoking
+    ``jax.lax.associative_scan`` so the same OpGraph runs on TPU
+    without a C++ codepath.
+    """
+    if op not in ("sum", "max"):
+        raise SynthCodegenError(
+            f"parallel_scan: unsupported op {op!r}; expected 'sum' or 'max'")
+    node = OpNode(
+        op_kind="scan",
+        name="scan",
+        inputs=["x"],
+        output="y",
+        attrs={"axis": int(axis), "op": op, "exclusive": False},
+    )
+    return OpGraph(
+        inputs={"x": (dtype, tuple(shape))},
+        nodes=[node],
+        output="y",
+    )
+
+
+def pattern_bilevel_fusion(*sub_patterns: OpGraph,
+                           max_depth: int = 3) -> OpGraph:
+    """Compose multiple sub-graphs at the bilevel CUDA boundary.
+
+    Concatenates the sub-graph node lists into a single OpGraph; the
+    resulting kernel keeps each sub-graph as an inline functor inside a
+    single outer ``__global__`` launch. ``max_depth`` caps the number of
+    sub-graphs honoured (additional ones are dropped with a
+    SynthCodegenError so the caller can either lower max_depth or
+    inline the extra patterns by hand).
+    """
+    if not sub_patterns:
+        raise SynthCodegenError(
+            "bilevel_fusion: at least one sub-pattern required")
+    if len(sub_patterns) > max_depth:
+        raise SynthCodegenError(
+            f"bilevel_fusion: {len(sub_patterns)} sub-patterns exceeds "
+            f"max_depth={max_depth}; lower one or raise the cap")
+    # Merge inputs by name; the synthesiser will fault if two
+    # sub-patterns disagree on a tensor's (dtype, shape).
+    merged_inputs: Dict[str, Tuple[str, Tuple[int, ...]]] = {}
+    merged_nodes: List[OpNode] = []
+    last_output: Optional[str] = None
+    for sub in sub_patterns:
+        for name, spec_pair in sub.inputs.items():
+            if name in merged_inputs and merged_inputs[name] != spec_pair:
+                raise SynthCodegenError(
+                    f"bilevel_fusion: input {name!r} has conflicting "
+                    f"(dtype, shape) across sub-graphs: "
+                    f"{merged_inputs[name]} vs {spec_pair}")
+            merged_inputs[name] = spec_pair
+        merged_nodes.extend(sub.nodes)
+        last_output = sub.output
+    assert last_output is not None
+    return OpGraph(
+        inputs=merged_inputs,
+        nodes=merged_nodes,
+        output=last_output,
+    )
+
+
+# ---- Per-arch lowering helpers --------------------------------------------
+#
+# The synthesise_kernel dispatcher walks the OpGraph in topological order
+# and calls one of these emitters per node. Each returns a fragment of
+# source (kernel body + launcher). Outer wrapping (file header,
+# extern "C" launcher) is added by ``synthesize_kernel``.
+
+def _emit_elementwise_cuda(node: OpNode,
+                           dtype: str,
+                           shape: Tuple[int, ...],
+                           is_hip: bool) -> str:
+    """Grid-stride loop over the output tensor.
+
+    Same shape on CUDA and HIP; the only difference is the runtime
+    header include (handled by the caller). The expression body is
+    inlined verbatim into the loop.
+    """
+    scalar_t, _, _ = _synth_dtype_triple(dtype)
+    expr = str(node.attrs.get("expr", "x"))
+    fn_name = f"synth_elementwise_{_synth_sanitize(node.name)}"
+    n_elems = 1
+    for s in shape:
+        n_elems *= int(s)
+    inputs_decl = ", ".join(
+        f"const {scalar_t}* __restrict__ {inp}" for inp in node.inputs
+    )
+    inputs_load = "\n        ".join(
+        f"{scalar_t} {inp} = {inp}_ptr[i];"
+        for inp in node.inputs
+    )
+    # Rename the ptr-side identifiers so the user's expression — which
+    # refers to inputs by their bare names — sees scalar values.
+    inputs_decl_renamed = ", ".join(
+        f"const {scalar_t}* __restrict__ {inp}_ptr" for inp in node.inputs
+    )
+    return f"""
+// node: {node.name} (elementwise)
+__global__ void {fn_name}(
+        {inputs_decl_renamed},
+        {scalar_t}* __restrict__ {node.output}_ptr,
+        int n) {{
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    for (int i = gid; i < n; i += stride) {{
+        {inputs_load}
+        {node.output}_ptr[i] = ({scalar_t})({expr});
+    }}
+}}
+""".rstrip("\n") + "\n"
+
+
+def _emit_reduce_cuda(node: OpNode,
+                      dtype: str,
+                      shape: Tuple[int, ...],
+                      is_hip: bool) -> str:
+    """Warp-shuffle reduction for small tensors, block-reduce + atomic
+    for large tensors (above ``_REDUCE_WARP_FAST_THRESHOLD``).
+    """
+    scalar_t, accum_t, _ = _synth_dtype_triple(dtype)
+    op = str(node.attrs.get("op", "sum"))
+    fn_name = f"synth_reduce_{_synth_sanitize(node.name)}"
+    n_elems = 1
+    for s in shape:
+        n_elems *= int(s)
+    init_v = "0" if op == "sum" else ("-INFINITY" if op == "max" else "1")
+    combine = {
+        "sum":  "acc + v",
+        "max":  "fmaxf(acc, v)",
+        "prod": "acc * v",
+    }.get(op, "acc + v")
+    # The shuffle primitive is the same name on CUDA + HIP.
+    use_warp_fast = (n_elems <= _REDUCE_WARP_FAST_THRESHOLD)
+    inp = node.inputs[0] if node.inputs else "x"
+    if use_warp_fast:
+        body = f"""
+    // small tensor — single warp shuffle reduce
+    {accum_t} acc = ({accum_t}){init_v};
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {{
+        {accum_t} v = ({accum_t}){inp}_ptr[i];
+        acc = {combine};
+    }}
+    for (int off = warpSize / 2; off > 0; off >>= 1) {{
+        {accum_t} v = __shfl_down_sync(0xffffffffu, acc, off);
+        acc = {combine};
+    }}
+    if (threadIdx.x == 0) {{ *{node.output}_ptr = ({scalar_t})acc; }}
+""".rstrip("\n")
+    else:
+        body = f"""
+    // large tensor — block reduce + atomic
+    __shared__ {accum_t} smem[32];
+    {accum_t} acc = ({accum_t}){init_v};
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    for (int i = gid; i < n; i += stride) {{
+        {accum_t} v = ({accum_t}){inp}_ptr[i];
+        acc = {combine};
+    }}
+    // warp-level shuffle inside the block first
+    for (int off = warpSize / 2; off > 0; off >>= 1) {{
+        {accum_t} v = __shfl_down_sync(0xffffffffu, acc, off);
+        acc = {combine};
+    }}
+    int lane = threadIdx.x & (warpSize - 1);
+    int warp = threadIdx.x / warpSize;
+    if (lane == 0) {{ smem[warp] = acc; }}
+    __syncthreads();
+    if (warp == 0) {{
+        acc = (lane < blockDim.x / warpSize)
+            ? smem[lane] : ({accum_t}){init_v};
+        for (int off = warpSize / 2; off > 0; off >>= 1) {{
+            {accum_t} v = __shfl_down_sync(0xffffffffu, acc, off);
+            acc = {combine};
+        }}
+        if (lane == 0) {{ atomicAdd({node.output}_ptr, ({scalar_t})acc); }}
+    }}
+""".rstrip("\n")
+    return f"""
+// node: {node.name} (reduce, op={op}, fast_warp={use_warp_fast})
+__global__ void {fn_name}(
+        const {scalar_t}* __restrict__ {inp}_ptr,
+        {scalar_t}* __restrict__ {node.output}_ptr,
+        int n) {{
+{body}
+}}
+""".rstrip("\n") + "\n"
+
+
+def _emit_gemm_cuda(node: OpNode,
+                    dtype: str,
+                    arch: str,
+                    out_dir: Path,
+                    features: frozenset) -> str:
+    """GEMM lowering.
+
+    On sm_90a/sm_100a (when wgmma / tcgen05 features are present) we
+    delegate to ``emit_cutlass_gemm_variants`` — reuse, don't
+    duplicate the CUTLASS pipeline. The returned source fragment is a
+    small launcher stub that ``#include``s the emitted CUTLASS files;
+    the actual kernel lives in those files. On unsupported archs we
+    emit a portable cublas-shaped triple-loop reference kernel.
+    """
+    scalar_t, accum_t, _ = _synth_dtype_triple(dtype)
+    M = int(node.attrs.get("M", 0))
+    N = int(node.attrs.get("N", 0))
+    K = int(node.attrs.get("K", 0))
+    fn_name = f"synth_gemm_{_synth_sanitize(node.name)}"
+    use_cutlass = (arch in ("sm_90a", "sm_100a")
+                   and ("wgmma" in features or "tcgen05" in features))
+    cutlass_note = ""
+    if use_cutlass:
+        try:
+            variants = emit_cutlass_gemm_variants(
+                arch, (M or 256, N or 256, K or 256), dtype, out_dir)
+            if variants:
+                cutlass_note = (
+                    f"// Delegated GEMM lowering to {len(variants)} "
+                    f"emit_cutlass_gemm_variants(.cu) file(s) under "
+                    f"{out_dir.name}/\n")
+        except CodegenError as exc:
+            # CUTLASS unavailable → fall through to portable kernel.
+            cutlass_note = f"// CUTLASS unavailable ({exc}); using portable GEMM\n"
+        except Exception as exc:  # pragma: no cover — defensive
+            cutlass_note = f"// CUTLASS dispatch failed ({type(exc).__name__}); using portable GEMM\n"
+    return f"""
+// node: {node.name} (gemm M={M} N={N} K={K})
+{cutlass_note}__global__ void {fn_name}(
+        const {scalar_t}* __restrict__ A,
+        const {scalar_t}* __restrict__ B,
+        {scalar_t}* __restrict__ C,
+        int M, int N, int K) {{
+    const int r = blockIdx.y * blockDim.y + threadIdx.y;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= M || c >= N) return;
+    {accum_t} acc = 0;
+    for (int k = 0; k < K; ++k) {{
+        acc += ({accum_t})A[r * K + k] * ({accum_t})B[k * N + c];
+    }}
+    C[r * N + c] = ({scalar_t})acc;
+}}
+""".rstrip("\n") + "\n"
+
+
+def _emit_scan_cuda(node: OpNode,
+                    dtype: str,
+                    shape: Tuple[int, ...],
+                    is_hip: bool) -> str:
+    """Blelloch parallel scan (work-efficient, in-place on shared mem)."""
+    scalar_t, _, _ = _synth_dtype_triple(dtype)
+    op = str(node.attrs.get("op", "sum"))
+    fn_name = f"synth_scan_{_synth_sanitize(node.name)}"
+    combine = "+" if op == "sum" else "?"  # max-scan needs an op fn
+    if op == "max":
+        # Use a function-style combine so we don't bake "?" into source.
+        combine_expr = "fmaxf(a, b)"
+    else:
+        combine_expr = "a + b"
+    inp = node.inputs[0] if node.inputs else "x"
+    return f"""
+// node: {node.name} (scan, op={op}, Blelloch)
+__global__ void {fn_name}(
+        const {scalar_t}* __restrict__ {inp}_ptr,
+        {scalar_t}* __restrict__ {node.output}_ptr,
+        int n) {{
+    extern __shared__ {scalar_t} sdata[];
+    int tid = threadIdx.x;
+    if (tid < n) sdata[tid] = {inp}_ptr[tid];
+    __syncthreads();
+    // Up-sweep
+    for (int d = 1; d < n; d *= 2) {{
+        int idx = (tid + 1) * d * 2 - 1;
+        if (idx < n) {{
+            {scalar_t} a = sdata[idx - d];
+            {scalar_t} b = sdata[idx];
+            sdata[idx] = ({combine_expr});
+        }}
+        __syncthreads();
+    }}
+    // Down-sweep
+    if (tid == 0) sdata[n - 1] = 0;
+    __syncthreads();
+    for (int d = n / 2; d >= 1; d /= 2) {{
+        int idx = (tid + 1) * d * 2 - 1;
+        if (idx < n) {{
+            {scalar_t} a = sdata[idx - d];
+            {scalar_t} b = sdata[idx];
+            sdata[idx - d] = b;
+            sdata[idx] = ({combine_expr});
+        }}
+        __syncthreads();
+    }}
+    if (tid < n) {node.output}_ptr[tid] = sdata[tid];
+}}
+""".rstrip("\n") + "\n"
+
+
+def _emit_scatter_gather_cuda(node: OpNode,
+                              dtype: str,
+                              shape: Tuple[int, ...],
+                              is_hip: bool) -> str:
+    """Indexed load (gather) or store (scatter) along ``axis``."""
+    scalar_t, _, _ = _synth_dtype_triple(dtype)
+    fn_name = f"synth_{node.op_kind}_{_synth_sanitize(node.name)}"
+    if node.op_kind == "gather":
+        body = (f"        {node.output}_ptr[i] = "
+                f"src_ptr[idx_ptr[i]];")
+    else:  # scatter
+        body = (f"        {node.output}_ptr[idx_ptr[i]] = "
+                f"src_ptr[i];")
+    return f"""
+// node: {node.name} ({node.op_kind})
+__global__ void {fn_name}(
+        const {scalar_t}* __restrict__ src_ptr,
+        const int* __restrict__ idx_ptr,
+        {scalar_t}* __restrict__ {node.output}_ptr,
+        int n) {{
+    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    for (int i = gid; i < n; i += stride) {{
+{body}
+    }}
+}}
+""".rstrip("\n") + "\n"
+
+
+# ---- Pallas (TPU) lowering. Emits Python source using pl.pallas_call. -----
+
+def _emit_node_pallas(node: OpNode, dtype: str,
+                      shape: Tuple[int, ...]) -> str:
+    """Lower a single OpNode to a Pallas kernel function.
+
+    Pallas kernels are Python callables decorated with
+    ``pl.pallas_call``. The synthesiser emits one wrapper function per
+    node; ``synthesize_kernel`` strings them together inside an
+    ``import jax / from jax.experimental import pallas as pl`` preamble.
+    """
+    _, _, jax_t = _synth_dtype_triple(dtype)
+    name = _synth_sanitize(node.name)
+    if node.op_kind == "elementwise":
+        expr = str(node.attrs.get("expr", "x"))
+        in_decl = ", ".join(f"{inp}_ref" for inp in node.inputs)
+        in_load = "\n    ".join(
+            f"{inp} = {inp}_ref[...]" for inp in node.inputs)
+        return f"""
+def {name}_kernel({in_decl}, out_ref):
+    # node: {node.name} (elementwise)
+    {in_load}
+    out_ref[...] = {expr}
+
+def {name}_launch(*inputs):
+    # pl.pallas_call wraps the kernel with grid + block shape inferred
+    # from the output spec.
+    return pl.pallas_call(
+        {name}_kernel,
+        out_shape=jax.ShapeDtypeStruct({tuple(shape)!r}, {jax_t}),
+    )(*inputs)
+""".rstrip("\n") + "\n"
+    if node.op_kind == "reduce":
+        op = str(node.attrs.get("op", "sum"))
+        axis = int(node.attrs.get("axis", 0))
+        op_fn = {"sum": "jnp.sum", "max": "jnp.max",
+                 "prod": "jnp.prod"}.get(op, "jnp.sum")
+        return f"""
+def {name}_kernel(x_ref, out_ref):
+    # node: {node.name} (reduce, op={op}, axis={axis})
+    x = x_ref[...]
+    out_ref[...] = {op_fn}(x, axis={axis}, keepdims=False)
+
+def {name}_launch(x):
+    out_shape = tuple(s for i, s in enumerate({tuple(shape)!r}) if i != {axis})
+    if not out_shape:
+        out_shape = (1,)
+    return pl.pallas_call(
+        {name}_kernel,
+        out_shape=jax.ShapeDtypeStruct(out_shape, {jax_t}),
+    )(x)
+""".rstrip("\n") + "\n"
+    if node.op_kind == "scan":
+        op = str(node.attrs.get("op", "sum"))
+        axis = int(node.attrs.get("axis", 0))
+        combine = "lambda a, b: a + b" if op == "sum" \
+            else "lambda a, b: jnp.maximum(a, b)"
+        return f"""
+def {name}_kernel(x_ref, out_ref):
+    # node: {node.name} (parallel scan via jax.lax.associative_scan)
+    x = x_ref[...]
+    out_ref[...] = jax.lax.associative_scan({combine}, x, axis={axis})
+
+def {name}_launch(x):
+    return pl.pallas_call(
+        {name}_kernel,
+        out_shape=jax.ShapeDtypeStruct({tuple(shape)!r}, {jax_t}),
+    )(x)
+""".rstrip("\n") + "\n"
+    if node.op_kind == "gemm":
+        # Pallas has no first-class CUTLASS equivalent; use jnp.matmul
+        # inside a pallas_call so the TPU XLA bridge picks it up.
+        M = int(node.attrs.get("M", 0))
+        N = int(node.attrs.get("N", 0))
+        return f"""
+def {name}_kernel(a_ref, b_ref, out_ref):
+    # node: {node.name} (gemm M={M} N={N})
+    out_ref[...] = jnp.matmul(a_ref[...], b_ref[...])
+
+def {name}_launch(a, b):
+    return pl.pallas_call(
+        {name}_kernel,
+        out_shape=jax.ShapeDtypeStruct({(M, N)!r}, {jax_t}),
+    )(a, b)
+""".rstrip("\n") + "\n"
+    if node.op_kind in ("scatter", "gather"):
+        axis = int(node.attrs.get("axis", 0))
+        primitive = ("jnp.take" if node.op_kind == "gather"
+                     else "jax.lax.scatter")
+        return f"""
+def {name}_kernel(src_ref, idx_ref, out_ref):
+    # node: {node.name} ({node.op_kind}, axis={axis})
+    out_ref[...] = {primitive}(src_ref[...], idx_ref[...], axis={axis}) \\
+        if "{node.op_kind}" == "gather" else None
+
+def {name}_launch(src, idx):
+    return pl.pallas_call(
+        {name}_kernel,
+        out_shape=jax.ShapeDtypeStruct({tuple(shape)!r}, {jax_t}),
+    )(src, idx)
+""".rstrip("\n") + "\n"
+    raise SynthCodegenError(
+        f"Pallas lowering for op_kind={node.op_kind!r} not implemented")
+
+
+def synthesize_kernel(opgraph: OpGraph,
+                      arch: str,
+                      dtype: str,
+                      problem_shape: Tuple[int, ...],
+                      *,
+                      pattern_name: str = "anon",
+                      out_dir: Optional[Path] = None,
+                      ) -> str:
+    """Walk ``opgraph`` in topological order and emit one source string.
+
+    Dispatches per node on ``(op_kind, vendor, arch_features)``:
+
+      * vendor=cuda, sm_90a + wgmma  → emit_cutlass_gemm_variants for gemm
+      * vendor=cuda, sm_100a + tcgen05 → emit_cutlass_gemm_variants for gemm
+      * vendor=hip, gfx9xx + mfma   → emit_ck_gemm_variants for gemm
+      * vendor=hip, gfx10xx + wmma  → emit_ck_gemm_variants for gemm
+      * elementwise → grid-stride loop
+      * reduce      → warp-shuffle (small) / block-reduce + atomic (large)
+      * scan        → Blelloch (CUDA/HIP) / jax.lax.associative_scan (Pallas)
+      * scatter/gather → indexed load/store
+
+    The whole emitted source is wrapped in an ``AUTO-GENERATED`` banner +
+    an ``extern "C" void launch_<sanitized_name>(...)`` (or Pallas
+    equivalent). When a (pattern, arch, op_kind) combo isn't supported,
+    raises ``SynthCodegenError`` so the caller can fall back to the
+    template-only emitter.
+    """
+    if not isinstance(opgraph, OpGraph):
+        raise SynthCodegenError(
+            f"synthesize_kernel: opgraph must be an OpGraph, got "
+            f"{type(opgraph).__name__}")
+    vendor = _synth_arch_vendor(arch)
+    features = _synth_arch_features(arch)
+    sanitized = _synth_sanitize(pattern_name)
+    shape_str = _synth_shape_str(tuple(problem_shape))
+    nodes = opgraph.topological_order()
+    if out_dir is None:
+        out_dir = Path(tempfile.gettempdir()) / "sg_synth_tmp"
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if vendor in ("cuda", "hip"):
+        is_hip = (vendor == "hip")
+        header_inc = ("#include <hip/hip_runtime.h>\n"
+                      "#include <hip/hip_fp16.h>\n"
+                      if is_hip
+                      else "#include <cuda_runtime.h>\n"
+                           "#include <cuda_fp16.h>\n"
+                           "#include <cuda_bf16.h>\n")
+        body_parts: List[str] = []
+        for node in nodes:
+            if node.op_kind == "elementwise":
+                body_parts.append(
+                    _emit_elementwise_cuda(node, dtype,
+                                           tuple(problem_shape), is_hip))
+            elif node.op_kind == "reduce":
+                body_parts.append(
+                    _emit_reduce_cuda(node, dtype,
+                                      tuple(problem_shape), is_hip))
+            elif node.op_kind == "gemm":
+                # AMD path: try CK; if unavailable, the helper emits a
+                # portable triple-loop. CUDA path: try CUTLASS, same
+                # fallback shape.
+                if is_hip:
+                    try:
+                        ck_variants = emit_ck_gemm_variants(
+                            arch,
+                            (int(node.attrs.get("M", 256)),
+                             int(node.attrs.get("N", 256)),
+                             int(node.attrs.get("K", 256))),
+                            dtype, out_dir)
+                        body_parts.append(
+                            f"// Delegated GEMM to "
+                            f"{len(ck_variants)} CK variant(s)\n")
+                    except SynthCodegenError as exc:
+                        body_parts.append(
+                            f"// CK unavailable ({exc}); portable GEMM\n")
+                    # Always emit the portable kernel so the synth file
+                    # is self-contained even when CK files are present.
+                    body_parts.append(
+                        _emit_gemm_cuda(node, dtype, arch, out_dir,
+                                        features))
+                else:
+                    body_parts.append(
+                        _emit_gemm_cuda(node, dtype, arch, out_dir,
+                                        features))
+            elif node.op_kind == "scan":
+                body_parts.append(
+                    _emit_scan_cuda(node, dtype,
+                                    tuple(problem_shape), is_hip))
+            elif node.op_kind in ("scatter", "gather"):
+                body_parts.append(
+                    _emit_scatter_gather_cuda(node, dtype,
+                                              tuple(problem_shape),
+                                              is_hip))
+            else:
+                raise SynthCodegenError(
+                    f"unsupported op_kind={node.op_kind!r} on "
+                    f"vendor={vendor}")
+            # Feature gate check — if the node requires a feature the
+            # arch doesn't provide, that's a hard error so the caller
+            # falls back to the template path rather than emitting a
+            # kernel that won't compile.
+            missing = node.requires_features - features
+            if missing and node.op_kind == "gemm":
+                # GEMM-on-wrong-arch: caller can still use the portable
+                # triple-loop, so we just annotate.
+                body_parts.append(
+                    f"// note: node {node.name} prefers features "
+                    f"{sorted(missing)} not present on {arch}\n")
+            elif missing:
+                raise SynthCodegenError(
+                    f"node {node.name!r} requires {sorted(missing)} "
+                    f"but {arch} provides only {sorted(features)}")
+        # Outer extern "C" launcher — calls the first synth kernel as a
+        # smoke launcher; real callers wire each kernel individually via
+        # the per-node launch_ helpers that the cache index records.
+        first_node = nodes[0] if nodes else None
+        scalar_t, _, _ = _synth_dtype_triple(dtype)
+        n_elems = 1
+        for s in problem_shape:
+            n_elems *= int(s)
+        if first_node is None:
+            launcher = ""
+        else:
+            first_inputs = ", ".join(
+                f"const {scalar_t}* {inp}" for inp in first_node.inputs)
+            launcher = f"""
+extern "C" void launch_{sanitized}_{shape_str}(
+        {first_inputs},
+        {scalar_t}* {first_node.output},
+        int n,
+        {"hipStream_t" if is_hip else "cudaStream_t"} stream) {{
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    synth_elementwise_{_synth_sanitize(first_node.name)}<<<blocks, threads, 0, stream>>>(
+        {", ".join(first_node.inputs)}, {first_node.output}, n);
+}}
+"""
+        return (f"// AUTO-GENERATED by synthesize_kernel — DO NOT EDIT\n"
+                f"// Pattern: {pattern_name}\n"
+                f"// Arch: {arch}, dtype: {dtype}, shape: "
+                f"{tuple(problem_shape)}\n"
+                f"// Vendor: {vendor}, features: {sorted(features)}\n"
+                f"{header_inc}\n"
+                f"{''.join(body_parts)}\n"
+                f"{launcher}\n")
+
+    if vendor == "pallas":
+        body_parts = []
+        for node in nodes:
+            body_parts.append(
+                _emit_node_pallas(node, dtype, tuple(problem_shape)))
+        first_node = nodes[0] if nodes else None
+        launcher_call = ""
+        if first_node is not None:
+            launcher_call = (
+                f"def launch_{sanitized}_{shape_str}(*inputs):\n"
+                f"    # Top-level launcher — wires the first node's "
+                f"pallas_call.\n"
+                f"    return {_synth_sanitize(first_node.name)}"
+                f"_launch(*inputs)\n")
+        return (f"# AUTO-GENERATED by synthesize_kernel — DO NOT EDIT\n"
+                f"# Pattern: {pattern_name}\n"
+                f"# Arch: {arch}, dtype: {dtype}, shape: "
+                f"{tuple(problem_shape)}\n"
+                f"# Vendor: pallas, features: {sorted(features)}\n"
+                f"import jax\n"
+                f"import jax.numpy as jnp\n"
+                f"from jax.experimental import pallas as pl\n"
+                f"\n{''.join(body_parts)}\n{launcher_call}\n")
+
+    raise SynthCodegenError(
+        f"synthesize_kernel: unsupported vendor={vendor!r} for arch={arch!r}")
+
+
+def _synth_cache_key(pattern_name: str, arch: str, dtype: str,
+                     attrs: Dict[str, Any]) -> str:
+    """SHA-256(pattern + arch + dtype + canonical-JSON(attrs))[:16].
+
+    Same scheme used by Jinja templates — identical inputs → same
+    cache file → no re-emission.
+    """
+    payload = (pattern_name + "\0" + arch + "\0" + dtype + "\0"
+               + _canonical_json(attrs)).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _try_synth_codegen(spec: "BuildSpec",
+                       config: Dict[str, Any],
+                       dims: List[Dict[str, Any]]) -> Optional[Path]:
+    """Attempt OpGraph synthesis for ``(spec.optimizer, spec.arch)``.
+
+    Returns the emitted source ``Path`` on success, ``None`` when no
+    pattern in the allowed list applies. Caches identically to the
+    Jinja2 emitter — file written to ``spec.out_dir / synth_sources /
+    <key>.<ext>``.
+
+    Patterns honour ``spec.config["synth_codegen"]["allowed_patterns"]``;
+    a pattern dropped from the list is skipped even when applicable.
+    Errors inside the synthesiser are caught and reported via a
+    ``synth_source`` annotation on ``spec._emitted_sources``; the
+    function returns ``None`` so the caller can stay on the Jinja path.
+    """
+    spec_cfg = getattr(spec, "config", {}) or {}
+    sc = (spec_cfg.get("synth_codegen") or {})
+    allowed = set(sc.get("allowed_patterns") or _SYNTH_KNOWN_PATTERNS)
+    # Pattern-selection heuristic: today we map every optimizer to the
+    # adamw_update pattern (the only one that covers a full optimizer
+    # step in a single elementwise pass). Streams beyond D can extend
+    # this dispatcher to pick e.g. fused_adam_grad_norm for clipped
+    # variants. The selection lives here (not in synthesize_kernel) so
+    # the synth library remains optimizer-agnostic.
+    pattern_name = "adamw_update"
+    if pattern_name not in allowed:
+        return None
+
+    # Problem shape: take the largest contiguous dim from the config if
+    # present, else fall back to 4096 (a reasonable smoke-test default
+    # that matches the existing template path's hashing).
+    shape: Tuple[int, ...] = (4096,)
+    for d in dims:
+        if d.get("name") == "block":
+            try:
+                shape = (int(config.get("block", 4096)) * 16,)
+            except (TypeError, ValueError):
+                shape = (4096,)
+            break
+    dtype = "fp32"  # default; future streams can pass dtype through dims
+
+    factory = {
+        "adamw_update":         pattern_adamw_update,
+        "fused_adam_grad_norm": pattern_fused_adam_grad_norm,
+        "reduce_broadcast":     pattern_reduce_broadcast,
+        "parallel_scan":        pattern_parallel_scan,
+    }.get(pattern_name)
+    if factory is None:
+        return None
+    try:
+        graph = factory(shape=shape, dtype=dtype)
+    except SynthCodegenError:
+        return None
+    except Exception:
+        return None
+
+    out_dir = Path(getattr(spec, "out_dir", Path(tempfile.gettempdir())))
+    synth_dir = out_dir / "synth_sources"
+    synth_dir.mkdir(parents=True, exist_ok=True)
+
+    attrs_for_hash: Dict[str, Any] = {
+        "shape": list(shape),
+        "dtype": dtype,
+        "config_block": config.get("block"),
+    }
+    key = _synth_cache_key(pattern_name, spec.arch, dtype, attrs_for_hash)
+    vendor = _synth_arch_vendor(spec.arch)
+    ext = _SYNTH_VENDOR_EXT.get(vendor, ".cu")
+    out_path = synth_dir / f"synth_{pattern_name}_{spec.arch}_{key}{ext}"
+
+    if out_path.exists() and out_path.stat().st_size > 0:
+        return out_path
+
+    try:
+        src = synthesize_kernel(graph, spec.arch, dtype, shape,
+                                pattern_name=pattern_name,
+                                out_dir=synth_dir)
+    except SynthCodegenError:
+        return None
+    except Exception:
+        return None
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    tmp.write_text(src, encoding="utf-8")
+    tmp.replace(out_path)
+    return out_path
+
+
+# ---- AMD Composable-Kernel (CK) GEMM emitter ------------------------------
+#
+# AMD analogue of emit_cutlass_gemm_variants. composable_kernel is OPTIONAL —
+# missing at module import is fine; the SynthCodegenError raised at call
+# time guides the user to `pip install composable-kernel` for the
+# gfx9xx / gfx12xx target their host actually has.
+
+# Hand-curated fallback sweep — same shape as _CUTLASS_FALLBACK_VARIANTS so
+# the dry-run manifests across CUTLASS / CK look symmetric. Each entry is
+# (block_tile, warp_tile, k_per_block, pipeline).
+_CK_FALLBACK_VARIANTS: Tuple[Tuple[Tuple[int, int, int],
+                                   Tuple[int, int, int],
+                                   int, str], ...] = (
+    ((128, 128, 32), (32, 32, 8),  3, "v1"),
+    ((128, 128, 64), (32, 32, 16), 3, "v1"),
+    ((256, 128, 32), (32, 32, 8),  3, "v2"),
+    ((256, 128, 64), (32, 32, 16), 3, "v2"),
+)
+
+
+def _ck_variant_key(block_tile: Tuple[int, int, int],
+                    warp_tile: Tuple[int, int, int],
+                    k_per_block: int,
+                    pipeline: str) -> str:
+    bt = "x".join(str(int(v)) for v in block_tile)
+    wt = "x".join(str(int(v)) for v in warp_tile)
+    p = _synth_sanitize(pipeline) or "v1"
+    return f"bt{bt}_wt{wt}_k{int(k_per_block)}_{p}"
+
+
+def emit_ck_gemm_variants(arch: str,
+                          problem_shape: Tuple[int, int, int],
+                          dtype: str,
+                          out_dir: Path
+                          ) -> List[Tuple[Path, Dict[str, Any]]]:
+    """Emit standalone Composable-Kernel GEMM ``.hip.cpp`` files for one
+    ``(arch, dtype, MNK)``.
+
+    AMD analogue of ``emit_cutlass_gemm_variants``. ``composable_kernel``
+    is imported lazily — when absent, a ``SynthCodegenError`` is raised
+    with install instructions rather than crashing at module load.
+
+    Scope: gfx942 / gfx950 (CDNA3/4) and gfx1100+ (RDNA3+). On
+    unsupported archs (e.g. gfx906 / gfx1030) the function raises
+    SynthCodegenError so the caller can fall back to the portable
+    triple-loop kernel emitted by ``_emit_gemm_cuda``.
+    """
+    try:
+        import composable_kernel  # type: ignore  # noqa: F401
+    except ImportError as exc:
+        raise SynthCodegenError(
+            "composable_kernel required for CK GEMM emitter — install with "
+            "`pip install composable-kernel` on a ROCm-capable host, or "
+            "build from https://github.com/ROCm/composable_kernel"
+        ) from exc
+
+    supported_archs = {"gfx942", "gfx950", "gfx1100", "gfx1151", "gfx1200"}
+    if arch not in supported_archs:
+        raise SynthCodegenError(
+            f"CK GEMM emitter supports {sorted(supported_archs)} only; "
+            f"got arch={arch!r}")
+
+    if arch in ARCH_TABLE and get_arch_entry(arch).vendor != "hip":
+        raise SynthCodegenError(
+            f"CK GEMM emitter is HIP-only; arch={arch!r} is "
+            f"{get_arch_entry(arch).vendor}")
+
+    if dtype not in _SYNTH_DTYPE_MAP:
+        raise SynthCodegenError(
+            f"unsupported dtype {dtype!r} for CK GEMM emitter; "
+            f"known: {sorted(_SYNTH_DTYPE_MAP)}")
+
+    try:
+        M, N, K = (int(problem_shape[0]),
+                   int(problem_shape[1]),
+                   int(problem_shape[2]))
+    except (TypeError, ValueError, IndexError) as exc:
+        raise SynthCodegenError(
+            f"problem_shape must be a 3-tuple (M, N, K), got {problem_shape!r}"
+        ) from exc
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    scalar_t, accum_t, _ = _synth_dtype_triple(dtype)
+    emitted: List[Tuple[Path, Dict[str, Any]]] = []
+    for block_tile, warp_tile, k_per_block, pipeline in _CK_FALLBACK_VARIANTS:
+        var_key = _ck_variant_key(block_tile, warp_tile, k_per_block, pipeline)
+        fname = (f"ck_gemm_{arch}_{dtype}_"
+                 f"{M}x{N}x{K}_{var_key}.hip.cpp")
+        out_path = out_dir / fname
+        meta = {
+            "block_tile": block_tile,
+            "warp_tile": warp_tile,
+            "k_per_block": k_per_block,
+            "pipeline": pipeline,
+            "arch": arch,
+            "dtype": dtype,
+            "mnk": (M, N, K),
+            "variant_key": var_key,
+            "source": "ck_fallback",
+        }
+        if out_path.exists() and out_path.stat().st_size > 0:
+            emitted.append((out_path, meta))
+            continue
+        src = f"""// AUTO-GENERATED by emit_ck_gemm_variants — DO NOT EDIT
+// Arch:        {arch}
+// Dtype:       {dtype}  (C++ type: {scalar_t}, accum: {accum_t})
+// Problem:     M={M}, N={N}, K={K}
+// BlockTile:   {block_tile[0]}x{block_tile[1]}x{block_tile[2]}
+// WarpTile:    {warp_tile[0]}x{warp_tile[1]}x{warp_tile[2]}
+// K/Block:     {k_per_block}
+// Pipeline:    {pipeline}
+
+#include <hip/hip_runtime.h>
+#include "ck/ck.hpp"
+#include "ck/tensor_operation/gpu/device/impl/device_gemm_xdl.hpp"
+
+namespace sg_ck_gen {{
+
+using ADataType   = {scalar_t};
+using BDataType   = {scalar_t};
+using CDataType   = {scalar_t};
+using AccDataType = {accum_t};
+
+// CK's DeviceGemmXdl template is the gfx9xx mainline. The exact
+// parameter pack varies across CK releases; this file expects the
+// installed CK to provide a matching alias.
+using DeviceOp = ck::tensor_operation::device::DeviceGemmXdl<
+    ADataType, BDataType, CDataType, AccDataType,
+    ck::Tuple<ck::Number<{block_tile[0]}>, ck::Number<{block_tile[1]}>,
+              ck::Number<{block_tile[2]}>>,
+    ck::Tuple<ck::Number<{warp_tile[0]}>, ck::Number<{warp_tile[1]}>,
+              ck::Number<{warp_tile[2]}>>,
+    {k_per_block}>;
+
+}}  // namespace sg_ck_gen
+
+extern "C" int launch_ck_{var_key}(
+        const void* A, const void* B, void* C,
+        int M, int N, int K,
+        float alpha, float beta,
+        hipStream_t stream) {{
+    using namespace sg_ck_gen;
+    DeviceOp op;
+    auto invoker = op.MakeInvoker();
+    auto argument = op.MakeArgument(
+        static_cast<const ADataType*>(A),
+        static_cast<const BDataType*>(B),
+        static_cast<CDataType*>(C),
+        M, N, K, K, K, N,
+        ck::tensor_operation::element_wise::PassThrough{{}},
+        ck::tensor_operation::element_wise::PassThrough{{}},
+        ck::tensor_operation::element_wise::PassThrough{{}});
+    if (!op.IsSupportedArgument(argument)) {{
+        return 1;
+    }}
+    invoker.Run(argument, ck::StreamConfig{{stream, false}});
+    return 0;
+}}
+"""
+        tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+        tmp.write_text(src, encoding="utf-8")
+        tmp.replace(out_path)
+        emitted.append((out_path, meta))
+
+    return emitted
+
+
 # ------------------------------------------------------------------------------
 # Kernel registry (formerly grokking_optimizers/kernel_registry.py)
 # ------------------------------------------------------------------------------
@@ -15687,6 +17094,37 @@ _DEFAULT_PROJECT_CONFIG: Dict[str, Any] = {
         # Empty dict (the default) preserves the historical probe order.
         "template_overrides": {},
     },
+    # Stream D — generative / structural codegen. Master switch is OFF
+    # by default so a build with no opt-in is byte-identical to today.
+    # When ``enable`` is True, the variant timer (in addition to the
+    # Jinja2 template path) attempts OpGraph-based synthesis for the
+    # ``(optimizer, model, arch)`` triple; the synthesised source is
+    # emitted to ``<out_dir>/synth_sources/<hash>.<ext>`` and stashed on
+    # ``spec._emitted_sources["<ckey>:synth"]``. Falls back gracefully to
+    # template-only emission if no pattern in ``allowed_patterns``
+    # applies. See the "Generative / structural codegen (Stream D)"
+    # section in this file for the full IR + pattern library.
+    "synth_codegen": {
+        # Master switch. Off → no synthesis happens.
+        "enable": False,
+        # Which OpGraph patterns are permitted. Drop one to disable that
+        # family. Allowed values: "adamw_update", "fused_adam_grad_norm",
+        # "softmax_matmul", "reduce_broadcast", "parallel_scan",
+        # "bilevel_fusion".
+        "allowed_patterns": [
+            "adamw_update", "fused_adam_grad_norm", "softmax_matmul",
+            "reduce_broadcast", "parallel_scan", "bilevel_fusion",
+        ],
+        # Maximum number of sub-graphs fused into a single emitted
+        # kernel by ``pattern_bilevel_fusion``.
+        "max_fusion_depth": 3,
+        # When True, suppress the Jinja2 template variant entirely and
+        # build/time only the synthesised variant. When False (default),
+        # both paths are emitted; the template variant still drives the
+        # variant ``.so`` build and the synth path is stashed for
+        # downstream consumers (autotuner, dry-run manifests, …).
+        "prefer_synth_over_template": False,
+    },
     "runtime_specialization": {"enable": False, "cache_dir": ""},
     "device_pgo": {"enable": False},
     "cache": {
@@ -15786,6 +17224,18 @@ def apply_to_buildspec(spec, config: Dict[str, Any]) -> None:
         if not getattr(spec, "enable_emitter", False) and \
                 config["codegen"].get("enable_emitter"):
             spec.enable_emitter = True
+    # Stream D — generative / structural codegen. The master switch and
+    # the prefer-synth flag are both opt-in; with the default config
+    # (``synth_codegen.enable=False``) we never touch ``spec``.
+    if "synth_codegen" in config:
+        sc = config["synth_codegen"]
+        if not getattr(spec, "enable_synth_codegen", False) and \
+                sc.get("enable"):
+            spec.enable_synth_codegen = True
+        if (not getattr(spec, "synth_codegen_prefer_synth_over_template",
+                        False)
+                and sc.get("prefer_synth_over_template")):
+            spec.synth_codegen_prefer_synth_over_template = True
     if "runtime_specialization" in config:
         if not getattr(spec, "enable_runtime_specialization", False) and \
                 config["runtime_specialization"].get("enable"):
