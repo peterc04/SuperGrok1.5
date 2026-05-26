@@ -337,14 +337,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path.cwd()))   # assumes you're in SuperGrok1.5/
 
 from grokking_optimizers.compile import main as compile_main
-assert compile_main(["--self-test"]) == 0  # prints "[self-test] 81 passed, 0 failed"
+assert compile_main(["--self-test"]) == 0  # prints "[self-test] 90 passed, 0 failed"
 ```
 
-The self-test covers ARCH_TABLE completeness for all 25 archs,
-per-arch search-space cardinalities, native compiler flags, autotune
-early-stopping criteria, the bundled Jinja2 templates, NVRTC compile
-path (gated on cuda-python), device-PGO stall-to-bias mapping, cache
-GC, the multi-GPU pool, Pallas backend sentinels, numerical-validation
+The self-test covers ARCH_TABLE completeness for all 25 archs, per-arch
+search-space cardinalities (billions per CUDA/HIP arch), native compiler
+flags, the four Bayesian early-stopping criteria (plateau, EI-exhaustion,
+coverage saturation, wall-clock), all 44 bundled Jinja2 templates
+(11 optimizers × 4 archs), the CUTLASS GEMM emitter (skip path on hosts
+without cutlass-python), NVRTC compile + live `cuLaunchKernel` dispatch
+(gated on cuda-python + GPU), device-PGO stall-to-bias mapping, the
+work-stealing multi-GPU pool, cache schema migrations (v2 → v3 → v4),
+the v4 `.jsonl` trial sidecar plumbing, the per-arch dry-run manifest
+sweep, the e2e smoke gate, Pallas backend sentinels, numerical-validation
 tolerances, the TOML config loader, and toolchain-bootstrap dispatch —
 no GPU, nvcc, hipcc, or jax[tpu] required to pass it.
 
@@ -405,12 +410,14 @@ branches anywhere in the file.
 
 **Status legend**:
 - ✅ Self-test: arch is registered in ARCH_TABLE with non-empty search
-  space, feature flags, and toolchain version — verified by 81-test
+  space, feature flags, and toolchain version — verified by the 90-test
   in-process suite.
 - ✅ AOT dry-run: `--arch <X> --runtime aot --no-autotune --no-profile`
   produces either a build.ninja or a clear per-arch toolchain
   diagnostic (`nvcc not found`, `hipcc not found`, `JAX not
-  installed`, etc.) — never an opaque exit-127.
+  installed`, etc.) — never an opaque exit-127. Also exhaustively
+  covered by `python -m grokking_optimizers.compile --dry-run-all-archs`
+  which writes one JSON manifest per arch under `<out>/dry_run_<arch>.json`.
 
 **Backward-compat aliases**: `sm_90 → sm_90a`, `sm_100 → sm_100a`,
 `sm_103 → sm_103a`, `sm_120 → sm_120a`. Both keys resolve to the same
@@ -459,10 +466,17 @@ until **any** of five criteria fire:
 | Criterion | Default | Override flag |
 |-----------|---------|---------------|
 | Best-so-far plateau | no improvement > 0.5% for `patience` trials (auto = `max(50, 0.1 × trials_done)`) | `--min-improvement 0.01` / `--patience 100` |
-| EI exhaustion | rolling expected-improvement integral < `ei_floor` | (internal) |
+| **EI exhaustion** | rolling mean of per-trial **relative** improvement over the last `patience` trials drops below `ei_floor` | `--ei-floor 1e-6` (set 0 to disable) |
 | Coverage saturation | new (dim, value) tuples per trial < 0.1% over `patience` window | (internal) |
 | Wall-clock budget | None by default; explicit cap when set | `--max-tune-seconds 600` |
 | Hard ceiling | 1,000,000 trials (sanity, never reached) | — |
+
+EI estimator details: TPE doesn't expose Optuna's internal acquisition
+value, so the wrapper estimates expected improvement empirically as
+`max(0, prev_best - trial_value) / max(|prev_best|, 1e-12)` per trial,
+keeps a deque of the last `patience` improvements, and stops when the
+rolling mean drops below `ei_floor`. Scale-free (relative units) so the
+threshold is dtype/problem-size independent.
 
 Manual override: `--bayesian-trials 500` still works. `top_k` for the
 refine pass also defaults to `None` — the elbow of the timing
@@ -477,10 +491,50 @@ re-compiling one fixed source with `-D` macros. Templates emit
 persistent vs stream-K mainloop; different wgmma/tcgen05/MFMA shapes;
 baked-in swizzle patterns; epilogue fusions).
 
-Cache key: SHA256(template source + JSON config). Identical configs
-produce the same emitted file. Optional `nvcc --cuda --dryrun`
-validation when nvcc is on PATH. CUTLASS profiler integration for
-GEMM-shaped subproblems is scaffolded (see `emit_cutlass_gemm_variants`).
+**Template coverage**: **44 bundled templates** covering all 11
+optimizers × 4 arch variants:
+
+| Optimizer | sm_90a (Hopper) | generic CUDA (sm_75/80/86/89/100a/103a/120a) | gfx942 (CDNA3 HIP) | tpu_v5p (Pallas) |
+|-----------|:---:|:---:|:---:|:---:|
+| `adamw` | ✅ | ✅ | ✅ | ✅ |
+| `lion` | ✅ | ✅ | ✅ | ✅ |
+| `muon` | ✅ | ✅ | ✅ | ✅ |
+| `prodigy` | ✅ | ✅ | ✅ | ✅ |
+| `grokadamw` | ✅ | ✅ | ✅ | ✅ |
+| `grokfast` | ✅ | ✅ | ✅ | ✅ |
+| `looksam` | ✅ | ✅ | ✅ | ✅ |
+| `neuralgrok` | ✅ | ✅ | ✅ | ✅ |
+| `supergrok11` | ✅ | ✅ | ✅ | ✅ |
+| `supergrok15` | ✅ | ✅ | ✅ | ✅ |
+| `supergrok2` | ✅ | ✅ | ✅ | ✅ |
+
+`find_template(opt, arch)` walks `<opt>_<arch>.<ext>.j2` →
+`<opt>_<vendor>.<ext>.j2` → `<opt>_generic.<ext>.j2`. Cache key:
+SHA256(template source + JSON config). Identical configs produce the
+same emitted file. Optional `nvcc --cuda --dryrun` validation when nvcc
+is on PATH.
+
+### CUTLASS GEMM emitter
+
+`emit_cutlass_gemm_variants(arch, problem_shape, dtype, out_dir)`
+generates a sweep of CUTLASS GemmUniversal variants for sm_90a /
+sm_100a:
+
+- Tries `cutlass.op.Gemm(...).tile_descriptions()` when available
+  (cutlass-python 3.x+) to enumerate every supported {tile × cluster ×
+  stages × schedule × epilogue} variant.
+- Falls back to a curated 4-variant sweep (tiles 128×128×{32,64} and
+  256×128×{32,64}) when the introspection API isn't exposed.
+- Emits one `.cu` per variant: `cutlass_gemm_<arch>_<dtype>_<MxNxK>_<key>.cu`
+  with `extern "C" int launch_<key>(void* A, void* B, void* C, void* D,
+  int M, int N, int K, float alpha, float beta, cudaStream_t stream)`.
+- Cached by filename — re-invoking with the same variant key skips
+  re-emission. Any `ImportError` from `cutlass` → `CodegenError` with
+  install instructions; any other exception → wrapped `CodegenError`
+  so the autotuner falls back to template-only emission.
+
+AMD Composable Kernel (CK) equivalent: tracked as a TODO comment at
+the module level — not implemented in this stream.
 
 ### Runtime kernel specialization — NVRTC / hipRTC
 
@@ -490,11 +544,20 @@ constants baked in as `constexpr`. CUBINs cached by `(arch, dtype,
 shape_class)` under `<out>/nvrtc_cache`. Sub-µs dispatch on cache hit
 via `cuModuleLoadData` / `hipModuleLoadData`.
 
-Verified on this CPU host: NVRTC compiled a trivial fp32 kernel via
-the `cuda-python` bindings and produced a 1,062-byte PTX artifact
-(SASS-less host, so it falls back to PTX with the driver doing the
-final JIT — exercising the full path including atomic cache write +
-read-back).
+**Live dispatch**: `_LoadedKernel.__call__(*args, grid=..., block=...,
+shared=0, stream=0)` packs args via ctypes, calls `cuLaunchKernel` /
+`hipModuleLaunchKernel` on the loaded module, and returns. Both modern
+(`cuda.bindings.driver`) and legacy (`cuda.cuda`) cuda-python paths are
+tried. Missing bindings at call time raise `RegistryError` with install
+instructions (not a bare `ImportError`).
+
+Verified end-to-end on a CPU host: NVRTC compiled a trivial fp32
+kernel via the `cuda-python` bindings and produced a 1,062-byte PTX
+artifact (SASS-less host, so it falls back to PTX with the driver doing
+the final JIT — exercising the full path including atomic cache write
++ read-back). The live-launch self-test (`loaded_kernel_call_or_skip`)
+round-trips a 64-element copy kernel through `cuModuleLoadData` →
+`cuLaunchKernel` when a GPU is visible; skips cleanly otherwise.
 
 ### Device-side PGO — CUPTI / rocprof / XLA HLO dumps
 
@@ -511,13 +574,30 @@ map to search-space dims (`long_scoreboard → swizzle/lds_padding/vec`,
 `not_selected → block/waves_per_eu/maxrregcount`, etc.); the autotuner
 `enqueue_trial`s the biased configs first.
 
-### Multi-GPU fan-out
+### Multi-GPU fan-out — work-stealing
 
 When `CUDA_VISIBLE_DEVICES` (or `HIP_VISIBLE_DEVICES`) lists multiple
 GPUs, `MultiGPUTimingPool` partitions the variant queue across N
 `TimingWorker`s, one per device, with per-worker env overlays
-(`CUDA_VISIBLE_DEVICES=<dev>`). Round-robin assignment, dead-worker
-skip, aggregate-then-pick-winner.
+(`CUDA_VISIBLE_DEVICES=<dev>`).
+
+**Work-stealing dispatcher** (replaced the earlier round-robin):
+
+- Internal `queue.Queue` of pending `(variant_so, opt_class, kwargs, future)`
+  work items.
+- One dedicated dispatcher thread per worker. Each thread pops work
+  whenever it's idle and immediately starts the next variant.
+- If a worker is mid-call when 5 more come in, a fast sibling drains
+  those 5 while the slow one finishes its first — no head-of-line
+  blocking.
+- Dead-worker items are bounced back to the queue for siblings to pick up.
+- Public `pool.time(variant_so)` API is unchanged (still synchronous);
+  internally it submits a `concurrent.futures.Future` and blocks until
+  the dispatcher fulfils it.
+
+Self-test (`multigpu_work_stealing`) on a 2-mock-worker pool: 10 jobs
+× (fast 10ms, slow 100ms) ⇒ fast=9 / slow=1 / wall=0.103s vs naive
+serialization ≈1.0s. Confirms work-stealing semantics.
 
 ### Numerical / differential validation
 
@@ -546,6 +626,37 @@ autotune pass: variants older than max-age OR not in top-N by timing
 30-second-interval watchdog thread that hard-restarts the worker
 process if a `ping` times out (60s).
 
+### Cache schema v4 — `.jsonl` trial sidecars
+
+`CACHE_VERSION = 4`. The bulky `bayesian_trials` and `sweep_history`
+arrays no longer live inside the main JSON — at autotune scale they
+were pushing the cache to hundreds of MB, fighting `json.loads` /
+`json.dumps`, and slowing every `save()`. They now live in append-only
+newline-delimited JSON sidecars next to the cache file:
+
+```
+<cache_dir>/<cache>.json                   # main: tuned_config, hashes, summaries
+<cache_dir>/trials_<opt>_<model>_<arch>.jsonl   # one line per trial
+```
+
+Per-entry, the main JSON keeps:
+- `trial_log_path: str | None` — relative path to the sidecar (or
+  `None` when the entry never recorded any trials).
+- `trial_log_summary: {n_trials, best_timing_ms, stop_reason,
+  last_updated_unix}` — small fixed-size dict so callers can answer
+  "how many trials / what was the best / why did we stop?" without
+  re-reading the sidecar.
+- `bayesian_trials: []` and `sweep_history: []` — kept as empty
+  placeholders so v3-reader code (older `profile.py`, downstream
+  tools) doesn't `KeyError`.
+
+**Migration**: `CompileCache._load` chains `v2 → v3 → v4` automatically.
+v3 caches are migrated lazily on first load: trials are flushed to the
+sidecar with auto-tagged `stage`, the in-memory lists are zeroed, and
+the v3 file is backed up to `<cache>.json.v3.bak` before the v4 file
+overwrites it. Self-tests cover both `v3 → v4` and the full `v2 → v4`
+chain.
+
 ### TOML project config
 
 `--config path/to/your.toml`. Loader (`load_config`, exposed via the
@@ -561,6 +672,19 @@ order:
 `[archs]`, `[pgo]`, `[autotune]`, `[codegen]`, `[runtime_specialization]`,
 `[device_pgo]`, `[cache]`, `[numerics]`. Strictly additive — without a
 config file, behavior is identical to today.
+
+### Verification harnesses
+
+Two built-in CI modes for sanity-checking the build pipeline without
+needing a target GPU:
+
+| Flag | Behaviour |
+|------|-----------|
+| `--dry-run-all-archs` | For every canonical arch in `ARCH_TABLE`: run preflight + `_resolve_sources` + `_host_cflags` + `_device_cflags` + `_ldflags` without invoking `torch.cpp_extension`. Writes one JSON manifest per arch under `<out>/dry_run_<arch>.json` with the full flag list, source globs, preflight PASS/FAIL line, expected `-gencode` / `--offload-arch` tokens. Sweeps all 25 canonical archs on a CPU-only host in ~3 seconds. |
+| `--e2e-smoke` | End-to-end smoke: detects the local GPU via `torch.cuda.get_device_capability()`, maps to ARCH_TABLE, runs `build(adamw, mamba3, <detected>, autotune=bayesian, max_tune_seconds=120)`, and asserts `tuned_config` is written, `early_stop_info` is recorded, `tuned_configs.h` is regenerated, and the final `.so` loads. Skips cleanly with `[e2e-smoke] no CUDA device — skipping` on CPU-only hosts. `--e2e-max-seconds N` adjusts the autotune wall-clock cap. |
+
+Both modes are wired into `_self_test` so they exercise automatically
+(dry-run-all-archs runs always; e2e-smoke gates on `torch.cuda.is_available()`).
 
 ### Toolchain bootstrap for every vendor
 
@@ -727,15 +851,15 @@ updates rather than fused kernels.
 
 ---
 
-### Compile cache schema (v3)
+### Compile cache schema (v4)
 
-The compile cache (`build/.compile_cache.json`) uses schema **v3**
-(forward-migrated from v2 on load; the old file is archived as
-`<cache>.v2.bak`). Per-entry shape:
+The compile cache (`build/.compile_cache.json`) uses schema **v4**
+(auto-migrated v2 → v3 → v4 on load; old files archived as
+`<cache>.v2.bak` / `<cache>.v3.bak`). Per-entry shape:
 
 ```jsonc
 {
-  "version": 3,
+  "version": 4,
   "entries": {
     "<optimizer>/<model>/<arch>": {
       // Identity
@@ -746,17 +870,32 @@ The compile cache (`build/.compile_cache.json`) uses schema **v3**
       "variant_artifacts": { "<config_key>": { "path": "…", "size": …, "mtime": … } },
       // Phase timestamps
       "aot_completed_at": "…",  "jit_completed_at": "…",  "pgo_completed_at": "…",
-      // Tuning
+      // Tuning (winner only — full trial log lives in the sidecar)
       "mode": "bayesian" | "exhaustive",
       "tuned_config": { "block": 256, "vec": 4, "unroll": 8, "timing_ms": 0.412, "stage_won": "refine" },
-      "bayesian_trials": [{ "stage": "tpe"|"refine"|"exhaustive", "config": {…}, "timing_ms": … }],
-      "sweep_history": [/* same shape as bayesian_trials */],
+      // v4: trial log moved out to a .jsonl sidecar
+      "trial_log_path": "trials_<opt>_<model>_<arch>.jsonl",  // relative to cache dir
+      "trial_log_summary": {
+        "n_trials": 173, "best_timing_ms": 0.412,
+        "stop_reason": "ei_exhausted:5.2e-07", "last_updated_unix": 1734567890.0
+      },
+      // Kept empty for v3-reader back-compat — real data is in the sidecar
+      "bayesian_trials": [],
+      "sweep_history": [],
       // PGO
-      "pgo_enabled": bool,  "pgo_profile_dir": "…",  "pgo_workload_hash": "…"
+      "pgo_enabled": bool,  "pgo_profile_dir": "…",  "pgo_workload_hash": "…",
+      "early_stop_info": { "stop_reason": "ei_exhausted:5.2e-07", "trial_count": 173, "best": 0.412 }
     }
   }
 }
 ```
+
+Sidecar format (`trials_<opt>_<model>_<arch>.jsonl`): one trial per
+line, JSON-encoded `_make_trial_record(...)` output. Append-only,
+written via `with open(..., 'a')` on each `record_trial` call so a
+crashed autotune sweep loses at most the in-flight trial. Total wall-
+clock for trial appending is O(1) per trial vs the previous O(N) of
+re-serializing the entire `bayesian_trials` list.
 
 ### CLI surface (`compile.py`)
 
@@ -768,24 +907,27 @@ python -m grokking_optimizers.compile \
   [--max-tune-seconds 600]              # wall-clock budget for auto mode
   [--min-improvement 0.005]             # plateau-detection threshold
   [--patience 100]                      # plateau-detection window
+  [--ei-floor 1e-6]                     # rolling EI-exhaustion threshold (0 disables)
   [--top-k N]                           # None → auto elbow detection
   --pgo [--pgo-workload <script>] [--pgo-steps 1000] \
-  [--enable-device-pgo]                 # Stream 8: CUPTI / rocprof / XLA HLO
+  [--enable-device-pgo]                 # CUPTI / rocprof / XLA HLO sidecar
   [--search-space <path/to/your.yaml>] \
   --cache build/.compile_cache.json \
   --runtime {aot,jit,both} [--aot-only | --jit-only] \
   [--aot-artifact-dir <path>] \
   [--quick] [--no-autotune] [--no-profile] \
   [--transfer-learning] [--pruner {none,hyperband,median}] \
-  [--enable-emitter]                    # Stream 6: Jinja2 kernel emitter
-  [--enable-runtime-specialization]     # Stream 7: NVRTC/hipRTC registry
-  [--strict-numerics]                   # Stream 10: require determinism
-  [--config <path/to/your.toml>]        # Stream 11: project config
-  [--bootstrap-cuda] [--bootstrap-rocm] [--bootstrap-jax]  # Stream 12
+  [--enable-emitter]                    # Jinja2 per-variant emitter (44 templates)
+  [--enable-runtime-specialization]     # NVRTC/hipRTC live KernelRegistry
+  [--strict-numerics]                   # require bit-identical determinism
+  [--config <path/to/your.toml>]        # TOML project config override
+  [--bootstrap-cuda] [--bootstrap-rocm] [--bootstrap-jax]
   [--prune] [--prune-max-age-days 30] [--prune-keep-top-n 100]
-  [--no-auto-prune]                     # Stream 9: cache GC
+  [--no-auto-prune]                     # cache GC
   [--debug-symbols] [--seed N] [-D MACRO[=VALUE]] [-v] [--debug]
-  [--self-test]
+  [--self-test]                         # 90-test in-process suite
+  [--dry-run-all-archs]                 # write JSON manifests for all 25 archs
+  [--e2e-smoke] [--e2e-max-seconds 120] # end-to-end build smoke (GPU-gated)
 ```
 
 `--debug` mirrors the full build report to stderr in real time,
