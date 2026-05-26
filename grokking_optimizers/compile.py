@@ -1920,27 +1920,98 @@ def resolve_macros(config: Dict[str, Any], dim_specs: List[Dict[str, Any]],
 
 
 def resolve_extra_nvcc_flags(config: Dict[str, Any],
-                             dim_specs: List[Dict[str, Any]]) -> List[str]:
-    """Some dims become bare NVCC/HIPCC flags rather than ``-D`` macros.
-    Currently: ``maxrregcount`` -> ``--maxrregcount=N``."""
+                              dim_specs: List[Dict[str, Any]],
+                              arch: Optional[str] = None) -> List[str]:
+    """Some dims become bare NVCC flags rather than ``-D`` macros, plus
+    per-arch feature gates and per-config dtype/layout flags.
+
+    Stream 3: replaces the previous ``if arch == "sm_90"`` branching
+    with feature-table lookups so any NVIDIA arch with the right
+    capability picks up the corresponding macro automatically.
+
+    Currently emits:
+      - ``maxrregcount`` -> ``--maxrregcount=N``
+      - feature macros for arch capabilities (TMA, fp4/fp8, cluster, ...)
+      - layout macros for tuned dtypes (e.g. ``fp8_layout=e4m3`` -> ``-DCUDA_FP8_E4M3=1``)
+    """
     out: List[str] = []
     for spec in dim_specs:
         if spec.get("macro") is None and spec["name"] == "maxrregcount":
             v = config.get("maxrregcount")
             if v is not None:
                 out.append(f"--maxrregcount={int(v)}")
+
+    if arch and arch in ARCH_TABLE:
+        entry = get_arch_entry(arch)
+        if entry.vendor == "cuda":
+            feats = entry.features
+            if "tma" in feats:
+                out.append("-DCUDA_TMA_ENABLED=1")
+            if "wgmma" in feats:
+                out.append("-DCUDA_WGMMA_ENABLED=1")
+            if "cluster" in feats:
+                out.append("-DCUDA_CLUSTER_ENABLED=1")
+            if "fp8" in feats:
+                out.append("-DCUDA_FP8_ENABLED=1")
+            if "fp4" in feats:
+                out.append("-DCUDA_FP4_ENABLED=1")
+            if "tcgen05" in feats:
+                out.append("-DCUDA_TCGEN05_ENABLED=1")
+            # FP8 / FP4 sub-format layouts driven by search-space dim values.
+            # Stream 2's space exposes these as tunables; map the chosen
+            # variant to a -D so the header picks the right template.
+            fp8 = str(config.get("fp8_layout", "")).lower()
+            if fp8 in ("e4m3", "e5m2"):
+                out.append(f"-DCUDA_FP8_{fp8.upper()}=1")
+            fp4 = str(config.get("fp4_layout", "")).lower()
+            if fp4 in ("e2m1", "mx"):
+                out.append(f"-DCUDA_FP4_{fp4.upper()}=1")
     return out
 
 
 def resolve_extra_hipcc_flags(config: Dict[str, Any],
-                              dim_specs: List[Dict[str, Any]]) -> List[str]:
-    """HIPCC analogue. ``maxrregcount`` -> ``-mllvm -amdgpu-max-num-vgprs=N``."""
+                               dim_specs: List[Dict[str, Any]],
+                               arch: Optional[str] = None) -> List[str]:
+    """HIPCC analogue of resolve_extra_nvcc_flags.
+
+    Currently emits:
+      - ``maxrregcount`` -> ``-mllvm -amdgpu-max-num-vgprs=N``
+      - feature macros for AMDGPU capabilities (MFMA / WMMA / fp8 / fp4 / dpp / tgsplit)
+      - layout macros for tuned dtypes (``fp8_layout``, ``fp4_layout``)
+    """
     out: List[str] = []
     for spec in dim_specs:
         if spec.get("macro") is None and spec["name"] == "maxrregcount":
             v = config.get("maxrregcount")
             if v is not None:
                 out.extend(["-mllvm", f"-amdgpu-max-num-vgprs={int(v)}"])
+
+    if arch and arch in ARCH_TABLE:
+        entry = get_arch_entry(arch)
+        if entry.vendor == "hip":
+            feats = entry.features
+            if "mfma" in feats:
+                out.append("-DAMDGPU_MFMA_ENABLED=1")
+            if "wmma" in feats:
+                out.append("-DAMDGPU_WMMA_ENABLED=1")
+            if "bf16_mfma" in feats:
+                out.append("-DAMDGPU_BF16_MFMA=1")
+            if "fp8_mfma" in feats:
+                out.append("-DAMDGPU_FP8_MFMA=1")
+            if "fp4_mfma" in feats:
+                out.append("-DAMDGPU_FP4_MFMA=1")
+            if "tgsplit" in feats:
+                out.append("-DAMDGPU_TGSPLIT=1")
+            if "dpp" in feats:
+                out.append("-DAMDGPU_DPP=1")
+            if "fp8" in feats:
+                out.append("-DAMDGPU_FP8_ENABLED=1")
+            fp8 = str(config.get("fp8_layout", "")).lower()
+            if fp8 in ("e4m3", "e5m2", "bf8", "fnuz"):
+                out.append(f"-DAMDGPU_FP8_{fp8.upper()}=1")
+            fp4 = str(config.get("fp4_layout", "")).lower()
+            if fp4 in ("e2m1", "mx", "ocp"):
+                out.append(f"-DAMDGPU_FP4_{fp4.upper()}=1")
     return out
 
 
@@ -3995,29 +4066,65 @@ HOST_CFLAGS_BASE = [
 # ARCH_TABLE[arch].nvcc_gencode in _device_cflags(). Keeping the base
 # table arch-agnostic means a new CUDA arch is one ARCH_TABLE entry, not
 # a code change here.
+#
+# Stream 3: every PTXAS / fatbin / device-link knob that helps perf is
+# pulled into this list. There is exactly ONE ``-Xptxas --opt-level=3``
+# (the duplicate ``-Xptxas -O3`` from earlier revisions was removed —
+# nvcc treats both spellings identically and warns about the duplicate).
+# Version-gated additions (CUDA 12.0+ register-usage-level, 13.0+
+# --minimal, 12.6+ --split-compile) live in ``_newer_compiler_flags``.
 NVCC_DEVICE_BASE = [
     "-O3", "--use_fast_math", "-std=c++17", "-DWITH_CUDA",
     "--expt-relaxed-constexpr",
     "--threads", "8",
     "-Xfatbin", "-compress-all",
-    "-Xptxas", "-O3", "-Xptxas", "-v", "-Xptxas", "--warn-on-spills",
+    # NOTE: keep exactly one PTXAS opt-level flag. ``--opt-level=3`` is the
+    # documented long form; earlier revisions also had ``-Xptxas -O3`` which
+    # nvcc accepted but warned was redundant.
+    "-Xptxas", "--opt-level=3",
+    "-Xptxas", "-v", "-Xptxas", "--warn-on-spills",
     "-Xptxas", "--allow-expensive-optimizations=true",
     "-Xptxas", "--def-load-cache=ca",
     "-Xptxas", "--def-store-cache=wb",
     "--extra-device-vectorization",
     "-Xcompiler", "-fPIC", "-Xcompiler", "-flto=full",
+    "-Xcompiler", "-fno-strict-aliasing",
+    # Quiet the linker on big templated kernels — these warnings are
+    # CUTLASS/cuBLASLt routine and never actionable.
+    "-Xnvlink", "--suppress-stack-size-warning",
+    # CUDA 12+ deprecates a couple of constexpr-related diags that fire
+    # in third-party headers (CCCL, CUTLASS). Suppress so build logs stay
+    # actionable. --diag-suppress is silently ignored by older nvcc.
+    "--diag-suppress=20012,20013",
     "--resource-usage",
     "-dlto",
+    # Pin the device-link step to LTO too (idempotent with -dlto on the
+    # main line but explicit so the device link doesn't silently downgrade
+    # when the host driver passes its own --device-link-options).
+    "--device-link-options=-dlto",
 ]
 
 # HIPCC base flags — --offload-arch is appended per-build from
 # ARCH_TABLE[arch].hipcc_offload_arch in _device_cflags().
+#
+# Stream 3: every AMDGPU LLVM knob that helps perf is in this list. The
+# wave-size / cumode toggles (which are NOT arch-agnostic) live in
+# _device_cflags(spec) and are gated by ARCH_TABLE[arch].warp_size.
 HIPCC_DEVICE_BASE = [
     "-O3", "-std=c++17", "-DWITH_HIP",
     "-ffast-math", "-fPIC",
     "-mllvm", "-amdgpu-early-inline-all=true",
     "-mllvm", "-amdgpu-function-calls=false",
     "-mllvm", "-amdgpu-internalize-symbols",
+    # ROCm-LLVM perf knobs (Stream 3): aggressive unroll, module-scope
+    # LDS lowering, larger alloca-to-vector promotion limit, vector SROA
+    # element bump, and merge-m0 transform. All five are documented
+    # AMDGPU backend options safe on every gfx target.
+    "-mllvm", "--amdgpu-unroll-threshold=1000",
+    "-mllvm", "--amdgpu-enable-lower-module-lds-strategy=module",
+    "-mllvm", "--amdgpu-promote-alloca-to-vector-limit=512",
+    "-mllvm", "--amdgpu-sroa-vector-elements=8",
+    "-mllvm", "--amdgpu-enable-merge-m0",
     "-fgpu-flush-denormals-to-zero",
     "-Rpass-analysis=kernel-resource-usage",
     "-flto",
@@ -4041,25 +4148,104 @@ def _host_cflags(spec: BuildSpec) -> List[str]:
 
 
 def _device_cflags(spec: BuildSpec) -> List[str]:
+    """Build the full per-arch device-compiler flag list.
+
+    Stream 3: every arch-specific knob (gencode, offload-arch, CDNA/RDNA
+    wave-size selection, fp4/fp8/cluster macros) is appended here based
+    on ARCH_TABLE[spec.arch] — there are no remaining ``if arch == "sm_90"``
+    branches scattered through the file. Version-gated additions (CUDA
+    12.0+ register-usage-level, CUDA 13.0+ --minimal, etc.) live in
+    ``_newer_compiler_flags`` so the gate is colocated with the probe.
+    """
     entry = get_arch_entry(spec.arch)
+    feats = entry.features
+
     if entry.vendor == "cuda":
         base = list(NVCC_DEVICE_BASE)
         # Per-arch -gencode pair (target SASS + PTX fallback) from ARCH_TABLE.
-        base += list(entry.nvcc_gencode)
+        # Stream 1 wired the SASS pair. Stream 3 guarantees a PTX fallback is
+        # always present (defensive: if a future ARCH_TABLE edit drops the
+        # fallback, splice it in here so older drivers can still JIT).
+        gencodes = list(entry.nvcc_gencode)
+        sm_num = entry.cutlass_arch
+        if (sm_num is not None
+                and not any(",code=compute_" in g for g in gencodes)):
+            gencodes.append(
+                f"-gencode=arch=compute_{sm_num},code=compute_{sm_num}")
+        base += gencodes
+
         if spec.debug_symbols or spec.profile:
             base += ["-lineinfo", "--generate-line-info"]
+
+        # CUTLASS integration: emit both the legacy single-arch token and
+        # the modern multi-arch list (CUTLASS_NVCC_ARCHS_SUPPORTED). The
+        # arch_suffix encodes the "a" qualifier needed for Hopper+ to
+        # unlock TMA / wgmma / tcgen05 instructions.
+        cutlass_arch_token = (
+            f"{entry.cutlass_arch}{entry.arch_suffix}"
+            if entry.cutlass_arch is not None else "")
         if (REPO_ROOT / "third_party/cutlass/include").exists():
-            cutlass_arch_token = (
-                f"{entry.cutlass_arch}{entry.arch_suffix}"
-                if entry.cutlass_arch is not None else "")
             base += ["-DWITH_CUTLASS",
                      f"-DCUTLASS_NVCC_ARCHS={cutlass_arch_token}"]
+        if cutlass_arch_token:
+            # Independent of whether CUTLASS headers are vendored — the
+            # supported-arch macro is consumed by host code that probes
+            # availability at compile time.
+            base += [f"-DCUTLASS_NVCC_ARCHS_SUPPORTED={cutlass_arch_token}"]
+
+        # Feature-gated capability macros consumed by template specialisations.
+        if "tma" in feats:
+            base += ["-DCUDA_TMA_ENABLED=1"]
+        if "wgmma" in feats:
+            base += ["-DCUDA_WGMMA_ENABLED=1"]
+        if "cluster" in feats:
+            base += ["-DCUDA_CLUSTER_ENABLED=1"]
+        if "fp8" in feats:
+            base += ["-DCUDA_FP8_ENABLED=1"]
+        if "fp4" in feats:
+            base += ["-DCUDA_FP4_ENABLED=1"]
+        if "tcgen05" in feats:
+            base += ["-DCUDA_TCGEN05_ENABLED=1"]
+        if "dyn_parallelism" in feats:
+            base += ["-DCUDA_FORCE_CDP1_IF_SUPPORTED"]
+
         return base + _build_macros(spec)
+
     if entry.vendor == "hip":
         base = list(HIPCC_DEVICE_BASE)
         # Per-arch --offload-arch from ARCH_TABLE.
         if entry.hipcc_offload_arch:
             base += [f"--offload-arch={entry.hipcc_offload_arch}"]
+
+        # CDNA (gfx9xx, wave64) gets -mcumode for compute-unit mode (vs the
+        # default WGP mode that pairs CUs in RDNA). RDNA (gfx10xx+, wave32)
+        # instead gets the wave32 enable + tgsplit toggle.
+        if entry.warp_size == 64:
+            base += ["-mcumode"]
+        elif entry.warp_size == 32:
+            base += ["-mtgsplit", "-mwavefrontsize32"]
+
+        # Feature-gated AMDGPU capability macros (consumed by header specs).
+        if "mfma" in feats:
+            base += ["-DAMDGPU_MFMA_ENABLED=1"]
+        if "wmma" in feats:
+            base += ["-DAMDGPU_WMMA_ENABLED=1"]
+        if "bf16_mfma" in feats:
+            base += ["-DAMDGPU_BF16_MFMA=1"]
+        if "fp8_mfma" in feats:
+            base += ["-DAMDGPU_FP8_MFMA=1"]
+        if "fp4_mfma" in feats:
+            base += ["-DAMDGPU_FP4_MFMA=1"]
+        if "tgsplit" in feats:
+            base += ["-DAMDGPU_TGSPLIT=1"]
+        if "dpp" in feats:
+            base += ["-DAMDGPU_DPP=1"]
+        if "fp8" in feats:
+            base += ["-DAMDGPU_FP8_ENABLED=1"]
+
+        # Debug-only: -fgpu-sanitize is opt-in (it adds nontrivial overhead).
+        if spec.debug_symbols:
+            base += ["-fgpu-sanitize"]
         if spec.debug_symbols or spec.profile:
             base += ["-ggdb"]
         return base + _build_macros(spec)
@@ -4070,6 +4256,49 @@ def _ldflags(spec: BuildSpec) -> List[str]:
     if get_arch_entry(spec.arch).vendor == "pallas":
         return []
     return list(LDFLAGS_BASE)
+
+
+# ---- XLA / Pallas worker env (Stream 3) ----------------------------------
+# When the build target is a Pallas / XLA arch (tpu_*) we don't emit C++
+# flags — there is no host compiler. Instead, the perf knobs live in the
+# environment variables consumed by the XLA backend at JIT time. The
+# orchestrator merges this dict into the worker env at call sites; this
+# helper is the single source of truth for which flags we set.
+
+_XLA_FLAGS_BASE: Tuple[str, ...] = (
+    "--xla_gpu_autotune_level=4",
+    "--xla_gpu_dump_autotuned_gemm_fusions=true",
+    "--xla_gpu_enable_triton_gemm=true",
+    "--xla_gpu_enable_cublaslt=true",
+    "--xla_gpu_enable_cudnn_fmha=true",
+    "--xla_gpu_enable_async_collectives=true",
+    "--xla_gpu_enable_latency_hiding_scheduler=true",
+    "--xla_gpu_enable_command_buffer=FUSION,CUSTOM_CALL,CUBLAS,CUDNN,COLLECTIVES",
+    "--xla_gpu_graph_level=3",
+)
+
+
+def _xla_env(arch: str, out_dir: Path) -> Dict[str, str]:
+    """Return env-var dict for the XLA / Pallas worker subprocess.
+
+    Empty dict for non-Pallas archs (so callers can unconditionally
+    ``env.update(_xla_env(arch, out_dir))``). Stream 3 callers: the AOT
+    + JIT subprocess spawners merge this on top of ``child_env()`` for
+    tpu_* targets.
+    """
+    if arch not in ARCH_TABLE:
+        return {}
+    entry = get_arch_entry(arch)
+    if entry.vendor != "pallas":
+        return {}
+    cache_dir = Path(out_dir) / "jax_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "XLA_FLAGS": " ".join(_XLA_FLAGS_BASE),
+        "JAX_COMPILATION_CACHE_DIR": str(cache_dir),
+        # Cache every compile — default skips short ones (≥1s by default).
+        "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
+    }
 
 
 def _include_paths() -> List[str]:
@@ -4173,7 +4402,13 @@ def _newer_compiler_flags(arch: str, report=None) -> Tuple[List[str], List[str]]
     """Return (extra_host, extra_device) flags that are safe additions
     when the detected toolchain is new enough. §12 C1 — pure autodetect,
     no-op on older toolchains. Dispatch is by ARCH_TABLE vendor so every
-    CUDA arch (not just sm_90) benefits from version-gated flags."""
+    CUDA arch (not just sm_90) benefits from version-gated flags.
+
+    Stream 3: this is the single home for every version-gated NVCC / HIPCC
+    flag. Arch-feature-gated flags (TMA, fp8, MFMA macros, cumode, etc.)
+    live in ``_device_cflags(spec)`` since those depend on the static
+    ArchEntry, not on the runtime toolchain probe.
+    """
     extra_host: List[str] = []
     extra_device: List[str] = []
     if arch not in ARCH_TABLE:
@@ -4184,12 +4419,34 @@ def _newer_compiler_flags(arch: str, report=None) -> Tuple[List[str], List[str]]
         if ver:
             if report:
                 report.write(f"  [toolchain] nvcc {ver[0]}.{ver[1]}\n")
+            # CUDA 12.0+: --register-usage-level=10 enables PTXAS to use
+            # the full register budget (default 5 leaves slots on the table).
+            if ver >= (12, 0):
+                extra_device += ["-Xptxas", "--register-usage-level=10"]
+                if report:
+                    report.write("  [toolchain] enabling "
+                                 "-Xptxas --register-usage-level=10 "
+                                 "(CUDA ≥12.0)\n")
+            # CUDA 11.4+: explicit device-link-options=-dlto belt-and-suspenders.
+            # (NVCC_DEVICE_BASE already passes it on the main line; this is a
+            # second copy with an explicit option-name spelling for the rare
+            # multi-stage link.) Idempotent — nvcc dedupes.
+            if ver >= (11, 4):
+                extra_device += ["--device-link-options=-dlto"]
             if ver >= (12, 6):
                 # NVCC 12.6+ supports --split-compile for opt-phase parallelism.
                 extra_device += [f"--split-compile={NCPUS}"]
                 if report:
                     report.write(f"  [toolchain] enabling "
                                  f"--split-compile={NCPUS} (NVCC ≥12.6)\n")
+            # CUDA 13.0+: --minimal disables features the build doesn't need
+            # (cuRTC, cudadevrt) to shrink the fatbin. Strict gate — earlier
+            # nvcc rejects the flag.
+            if ver >= (13, 0):
+                extra_device += ["--minimal"]
+                if report:
+                    report.write("  [toolchain] enabling --minimal "
+                                 "(NVCC ≥13.0)\n")
         elif report:
             report.write("  [toolchain] nvcc not on PATH; "
                          "skipping version-gated flags\n")
@@ -4350,8 +4607,12 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
 
 def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
                     target: str,
-                    spec: Optional["BuildSpec"] = None) -> List[str]:
+                    spec: Optional["BuildSpec"] = None,
+                    arch: Optional[str] = None) -> List[str]:
     """Macros + extra-flag overrides for one config × target.
+
+    Stream 3: ``arch`` is threaded through so the NVCC/HIPCC extra
+    resolvers can emit per-arch feature macros (TMA, MFMA, fp8/fp4, ...).
 
     Stream 6 hook: when ``spec.enable_emitter`` is True, the device-side
     call routes through ``grokking_optimizers.codegen.emit_variant_source``
@@ -4360,7 +4621,11 @@ def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
     ``_make_variant_timer`` can swap it into its ``sources`` list without
     a signature change. Residual host-side macros are still appended to
     the cflags so host code that needs them keeps working. On any
-    emitter failure we fall through to the legacy macros-only path."""
+    emitter failure we fall through to the legacy macros-only path.
+    """
+    # Stream 3 — if arch wasn't passed explicitly, lift it off spec.
+    if arch is None and spec is not None:
+        arch = getattr(spec, "arch", None)
     if spec is not None and getattr(spec, "enable_emitter", False) \
             and target == "device":
         try:
@@ -4369,18 +4634,24 @@ def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
             emitted_path, residual = emit_variant_source(
                 config, dims, spec.optimizer, spec.arch, spec.out_dir)
             spec._emitted_sources[config_key(config)] = emitted_path
-            # Residual macros augment whatever the macros-only path would
-            # produce (host-side dims especially), so combine.
             macros_only = resolve_macros(config, dims, target)
             return macros_only + residual
         except Exception:
-            # Any emitter failure (no jinja2, bad template, render
-            # error) silently degrades to the macros-only build below.
             pass
     macros = resolve_macros(config, dims, target)
-    extra = resolve_extra_nvcc_flags(config, dims) if target == "device" else []
-    extra_hip = resolve_extra_hipcc_flags(config, dims) if target == "device" else []
-    # Only one of CUDA / HIP applies per arch.
+    if target != "device":
+        return macros
+    # Pick the resolver that matches the arch's vendor.
+    if arch and arch in ARCH_TABLE:
+        vendor = get_arch_entry(arch).vendor
+        if vendor == "cuda":
+            return macros + resolve_extra_nvcc_flags(config, dims, arch)
+        if vendor == "hip":
+            return macros + resolve_extra_hipcc_flags(config, dims, arch)
+        return macros  # pallas — no native device flags
+    # Backward-compat fallback: emit whichever resolver produced a maxrregcount.
+    extra = resolve_extra_nvcc_flags(config, dims)
+    extra_hip = resolve_extra_hipcc_flags(config, dims)
     return macros + (extra if "--maxrregcount" not in " ".join(extra_hip) else extra_hip)
 
 
@@ -4399,8 +4670,10 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
 
     def timer(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         ckey = config_key(config)
-        host_extra = _variant_macros(config, dims, "host", spec=spec)
-        device_extra = _variant_macros(config, dims, "device", spec=spec)
+        host_extra = _variant_macros(config, dims, "host",
+                                      spec=spec, arch=spec.arch)
+        device_extra = _variant_macros(config, dims, "device",
+                                        spec=spec, arch=spec.arch)
 
         # Per-variant flush of the running ETA window.
         progress_state["last_start"] = time.monotonic()
@@ -5096,8 +5369,10 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
     try:
         space = get_search_space(spec.search_space_path)
         dims = space.get(spec.arch, {}).get("dims", [])
-        extra_host = _variant_macros(tuned, dims, "host", spec=spec)
-        extra_device = _variant_macros(tuned, dims, "device", spec=spec)
+        extra_host = _variant_macros(tuned, dims, "host",
+                                      spec=spec, arch=spec.arch)
+        extra_device = _variant_macros(tuned, dims, "device",
+                                        spec=spec, arch=spec.arch)
     except Exception:
         for k, v in tuned.items():
             if k in ("timing_ms", "config_key", "stage_won"):
@@ -5961,6 +6236,182 @@ def _self_test() -> int:
     _run("run_device_pgo_round_disabled", test_run_device_pgo_round_disabled)
     _run("stall_sidecar_round_trip", test_stall_sidecar_round_trip)
     _run("buildspec_has_device_pgo_field", test_buildspec_has_device_pgo_field)
+
+    # ---- Stream 3: per-arch native flag emission ----
+    sys.stdout.write("[self-test] flags\n")
+
+    def _spec(arch: str) -> "BuildSpec":
+        return BuildSpec(
+            optimizer="supergrok2",
+            model="mamba",
+            arch=arch,
+            out_dir=Path(tempfile.gettempdir()) / f"sg_st_{arch}",
+        )
+
+    # Canonical archs we expect Stream 1 + 3 to fully support. Aliases
+    # (sm_90, sm_100, ...) are tested via their canonical entries.
+    _CANONICAL_ARCHES_S3 = [
+        # NVIDIA
+        "sm_75", "sm_80", "sm_86", "sm_89",
+        "sm_90a", "sm_100a", "sm_103a", "sm_120a",
+        # AMD
+        "gfx906", "gfx908", "gfx90a", "gfx942", "gfx950",
+        "gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1151",
+        "gfx1200", "gfx1201",
+    ]
+
+    def test_per_arch_native_flags():
+        """_device_cflags must produce a non-empty, arch-correct flag list
+        for every canonical NVIDIA/AMD arch, with no cross-contamination."""
+        for arch in _CANONICAL_ARCHES_S3:
+            flags = _device_cflags(_spec(arch))
+            assert flags, f"{arch}: empty device cflags"
+            entry = get_arch_entry(arch)
+
+            if entry.vendor == "cuda":
+                joined = " ".join(flags)
+                # Correct -gencode for this arch (canonical entry already
+                # carries the suffix-bearing token).
+                expect_sm = f"sm_{entry.cutlass_arch}{entry.arch_suffix}"
+                assert f"code={expect_sm}" in joined, \
+                    f"{arch}: missing code={expect_sm} in {joined[:200]}"
+                # No --offload-arch (that's HIP).
+                assert "--offload-arch" not in joined, \
+                    f"{arch}: CUDA arch leaked HIP --offload-arch"
+                # No OTHER CUDA arch's SASS code= token appears.
+                for other in _CANONICAL_ARCHES_S3:
+                    o_entry = get_arch_entry(other)
+                    if o_entry.vendor != "cuda":
+                        continue
+                    if o_entry.cutlass_arch == entry.cutlass_arch:
+                        continue
+                    other_sm = f"code=sm_{o_entry.cutlass_arch}{o_entry.arch_suffix}"
+                    assert other_sm not in joined, \
+                        f"{arch}: leaked {other_sm}"
+                # Feature gating — Hopper+ gets TMA, Blackwell gets fp4.
+                if "tma" in entry.features:
+                    assert "-DCUDA_TMA_ENABLED=1" in flags
+                else:
+                    assert "-DCUDA_TMA_ENABLED=1" not in flags
+                if "fp4" in entry.features:
+                    assert "-DCUDA_FP4_ENABLED=1" in flags
+
+            elif entry.vendor == "hip":
+                joined = " ".join(flags)
+                assert f"--offload-arch={entry.hipcc_offload_arch}" in joined, \
+                    f"{arch}: missing --offload-arch={entry.hipcc_offload_arch}"
+                assert "-gencode" not in joined, \
+                    f"{arch}: HIP arch leaked CUDA -gencode"
+                # Wave-size gating.
+                if entry.warp_size == 64:
+                    assert "-mcumode" in flags, f"{arch}: CDNA missing -mcumode"
+                    assert "-mwavefrontsize32" not in flags
+                elif entry.warp_size == 32:
+                    assert "-mwavefrontsize32" in flags, \
+                        f"{arch}: RDNA missing -mwavefrontsize32"
+                    assert "-mcumode" not in flags
+                # MFMA / WMMA macro gating.
+                if "mfma" in entry.features:
+                    assert "-DAMDGPU_MFMA_ENABLED=1" in flags
+                if "wmma" in entry.features:
+                    assert "-DAMDGPU_WMMA_ENABLED=1" in flags
+
+    def test_flag_base_superset_regression():
+        """The current sm_90 / gfx942 flag lists must be a STRICT superset
+        of the pre-Stream-3 base flag list. Guards against accidental
+        regressions on these two canonical archs.
+        """
+        sm90 = set(_device_cflags(_spec("sm_90a")))
+        legacy_sm90 = {
+            "-O3", "--use_fast_math", "-std=c++17", "-DWITH_CUDA",
+            "--expt-relaxed-constexpr", "--extra-device-vectorization",
+            "--resource-usage", "-dlto",
+        }
+        missing = legacy_sm90 - sm90
+        assert not missing, f"sm_90 lost legacy flags: {missing}"
+
+        gfx942 = set(_device_cflags(_spec("gfx942")))
+        legacy_gfx942 = {
+            "-O3", "-std=c++17", "-DWITH_HIP", "-ffast-math", "-fPIC",
+            "-fgpu-flush-denormals-to-zero", "-flto",
+            "--offload-arch=gfx942",
+        }
+        missing_amd = legacy_gfx942 - gfx942
+        assert not missing_amd, f"gfx942 lost legacy flags: {missing_amd}"
+
+    def test_nvcc_no_duplicate_ptxas_o3():
+        """Exactly one PTXAS opt-level flag — duplicate -Xptxas -O3 must
+        not reappear after the Stream 3 cleanup."""
+        flags = _device_cflags(_spec("sm_90a"))
+        opt_hits = sum(1 for f in flags
+                       if f in ("--opt-level=3",) or f == "-O3")
+        # We expect one "-O3" (top-level NVCC) and one "--opt-level=3" (PTXAS)
+        # — never two of the same thing.
+        assert flags.count("-O3") == 1, \
+            f"sm_90 has {flags.count('-O3')} -O3 flags, expected 1"
+        assert flags.count("--opt-level=3") == 1, \
+            f"sm_90 has {flags.count('--opt-level=3')} --opt-level=3 flags"
+
+    def test_resolve_extra_feature_macros():
+        """resolve_extra_nvcc_flags / resolve_extra_hipcc_flags emit
+        per-arch feature macros driven by ARCH_TABLE.features (not by
+        if-arch-==-string branches)."""
+        # Hopper TMA / wgmma
+        flags = resolve_extra_nvcc_flags({}, [], "sm_90a")
+        assert "-DCUDA_TMA_ENABLED=1" in flags
+        assert "-DCUDA_WGMMA_ENABLED=1" in flags
+        assert "-DCUDA_CLUSTER_ENABLED=1" in flags
+        # Blackwell fp4 + tcgen05
+        flags = resolve_extra_nvcc_flags({}, [], "sm_100a")
+        assert "-DCUDA_FP4_ENABLED=1" in flags
+        assert "-DCUDA_TCGEN05_ENABLED=1" in flags
+        # Consumer Blackwell has fp4 but no tma/wgmma/cluster.
+        flags = resolve_extra_nvcc_flags({}, [], "sm_120a")
+        assert "-DCUDA_FP4_ENABLED=1" in flags
+        assert "-DCUDA_TMA_ENABLED=1" not in flags
+        # CDNA3 has fp8 MFMA.
+        flags = resolve_extra_hipcc_flags({}, [], "gfx942")
+        assert "-DAMDGPU_FP8_MFMA=1" in flags
+        assert "-DAMDGPU_MFMA_ENABLED=1" in flags
+        # RDNA3 has WMMA + dpp + tgsplit, but not MFMA.
+        flags = resolve_extra_hipcc_flags({}, [], "gfx1100")
+        assert "-DAMDGPU_WMMA_ENABLED=1" in flags
+        assert "-DAMDGPU_DPP=1" in flags
+        assert "-DAMDGPU_TGSPLIT=1" in flags
+        assert "-DAMDGPU_MFMA_ENABLED=1" not in flags
+        # Layout dim values map to dtype macros.
+        flags = resolve_extra_nvcc_flags({"fp8_layout": "e4m3"}, [], "sm_90a")
+        assert "-DCUDA_FP8_E4M3=1" in flags
+        flags = resolve_extra_hipcc_flags({"fp4_layout": "ocp"}, [], "gfx950")
+        assert "-DAMDGPU_FP4_OCP=1" in flags
+
+    def test_xla_env():
+        """_xla_env returns the canonical XLA_FLAGS for Pallas archs and
+        an empty dict for non-Pallas archs."""
+        td = Path(tempfile.mkdtemp())
+        try:
+            env = _xla_env("tpu_v5p", td)
+            assert env, "tpu_v5p should produce a non-empty env"
+            assert "XLA_FLAGS" in env
+            assert "xla_gpu_autotune_level" in env["XLA_FLAGS"]
+            assert "xla_gpu_enable_triton_gemm=true" in env["XLA_FLAGS"]
+            assert "xla_gpu_graph_level=3" in env["XLA_FLAGS"]
+            assert env["JAX_COMPILATION_CACHE_DIR"] == str(td / "jax_cache")
+            assert env["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] == "0"
+            # Cache dir is created lazily.
+            assert (td / "jax_cache").is_dir()
+            # Non-Pallas arch returns empty.
+            assert _xla_env("sm_90a", td) == {}
+            assert _xla_env("gfx942", td) == {}
+            assert _xla_env("nonexistent", td) == {}
+        finally:
+            shutil.rmtree(td)
+
+    _run("per_arch_native_flags", test_per_arch_native_flags)
+    _run("flag_base_superset_regression", test_flag_base_superset_regression)
+    _run("nvcc_no_duplicate_ptxas_o3", test_nvcc_no_duplicate_ptxas_o3)
+    _run("resolve_extra_feature_macros", test_resolve_extra_feature_macros)
+    _run("xla_env", test_xla_env)
 
     sys.stdout.write("[self-test] bayesian\n")
 
