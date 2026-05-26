@@ -1848,6 +1848,205 @@ main()
 """
 
 
+# ---------------------------------------------------------------------------
+# PallasTimer — TPU/Pallas analog of TimingWorker
+# ---------------------------------------------------------------------------
+#
+# CUDA/HIP backends time a variant by building a .so and replaying it via a
+# warm subprocess. Pallas has no .so — every "build" is a JAX trace + XLA
+# compile. PallasTimer caches the jitted callable per kwargs combo, then
+# replays N iterations in-process with jax.block_until_ready() to force
+# device sync. JAX is imported lazily so this class is importable on
+# CPU-only / no-JAX hosts; time_config() raises RuntimeError if JAX or the
+# launcher module is unavailable.
+
+class PallasTimer:
+    """Time a Pallas kernel by JIT-compiling pl.pallas_call(...) and replaying
+    N iterations. Python-only, no .so to load."""
+
+    def __init__(self, launcher_path: Path, optimizer: str, *,
+                 warmup: int = 5, iters: int = 21, problem_size: int = 4096):
+        self.launcher_path = Path(launcher_path)
+        self.optimizer = optimizer
+        self.warmup = warmup
+        self.iters = iters
+        self.problem_size = problem_size
+        self._cached_jit: Dict[Tuple, Any] = {}   # key (kwargs frozen) -> jit-compiled fn
+        self._launch_fn = None
+        self._launch_sig = None
+
+    def _load_launcher(self):
+        """Lazily import jax + the launcher module. Raises RuntimeError on
+        failure (so PallasTimer stays importable on hosts without JAX)."""
+        if self._launch_fn is not None:
+            return
+        try:
+            import importlib.util
+            import inspect
+        except ImportError as exc:  # pragma: no cover (stdlib)
+            raise RuntimeError(f"Pallas requires importlib/inspect: {exc}")
+        try:
+            import jax  # noqa: F401
+            import jax.numpy as jnp  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(f"Pallas requires jax: {exc}")
+        if not self.launcher_path.is_file():
+            raise RuntimeError(
+                f"Pallas launcher not found: {self.launcher_path}")
+        spec = importlib.util.spec_from_file_location(
+            f"_pallas_launcher_{self.optimizer}", str(self.launcher_path))
+        if spec is None or spec.loader is None:
+            raise RuntimeError(
+                f"could not load spec for {self.launcher_path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        # Auto-discover launch_<opt>_step_jit / launch_<opt>_step / first launch_*
+        launch_fn = None
+        for cand in (f"launch_{self.optimizer}_step_jit",
+                     f"launch_{self.optimizer}_step"):
+            if hasattr(mod, cand):
+                launch_fn = getattr(mod, cand)
+                break
+        if launch_fn is None:
+            for name in sorted(dir(mod)):
+                if name.startswith("launch_") and callable(getattr(mod, name)):
+                    launch_fn = getattr(mod, name)
+                    break
+        if launch_fn is None:
+            raise RuntimeError(f"no launch_* in {self.launcher_path}")
+        self._launch_fn = launch_fn
+        try:
+            self._launch_sig = inspect.signature(launch_fn)
+        except (TypeError, ValueError):
+            self._launch_sig = None
+
+    def _build_args(self, kwargs: Dict[str, Any]) -> Tuple[List[Any], Dict[str, Any]]:
+        """Synthesize positional+scalar arguments for the launcher based on
+        its signature. Tensor-shaped params get a problem_size vector;
+        scalar params draw from a small defaults table; any kwargs the
+        caller passed override those defaults."""
+        import jax.numpy as jnp
+
+        N = self.problem_size
+        scalar_defaults: Dict[str, Any] = {
+            "lr": 1e-3, "beta1": 0.9, "beta2": 0.999, "eps": 1e-8,
+            "wd": 0.01, "bc1": 1.0, "bc2": 1.0,
+            "alpha": 0.98, "lamb": 5.0, "gamma": 0.01,
+            "rho": 0.05, "d_coef": 1.0, "scale": 1.0, "step": 1,
+            "t": 1, "k": 1,
+        }
+        dummy_arr_fn = lambda: jnp.zeros((N,), dtype=jnp.float32)
+        dummy_grad_fn = lambda: jnp.ones((N,), dtype=jnp.float32)
+
+        # If we have a signature, walk it and fill each param.
+        pos_args: List[Any] = []
+        kw_args: Dict[str, Any] = {}
+        if self._launch_sig is not None:
+            tensor_slot = 0
+            tensor_makers = [dummy_arr_fn, dummy_grad_fn, dummy_arr_fn,
+                             dummy_arr_fn, dummy_arr_fn, dummy_arr_fn]
+            for name, p in self._launch_sig.parameters.items():
+                if name in kwargs:
+                    val = kwargs[name]
+                elif name in scalar_defaults:
+                    val = scalar_defaults[name]
+                else:
+                    ann = p.annotation
+                    if ann is float or "float" in str(ann):
+                        val = 1e-3
+                    elif ann is int or "int" in str(ann):
+                        val = 1
+                    else:
+                        maker = tensor_makers[tensor_slot] \
+                            if tensor_slot < len(tensor_makers) else dummy_arr_fn
+                        val = maker()
+                        tensor_slot += 1
+                # If callable (closure-bound), evaluate.
+                if callable(val) and not isinstance(val, (int, float, bool, str)):
+                    try:
+                        val = val()
+                    except Exception:
+                        pass
+                kw_args[name] = val
+            return pos_args, kw_args
+
+        # No signature — fall back to a minimal AdamW-style argpack.
+        pos_args = [dummy_arr_fn(), dummy_grad_fn(),
+                    dummy_arr_fn(), dummy_arr_fn(), jnp.float32(1e-3)]
+        return pos_args, dict(kwargs)
+
+    def time_config(self, kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Return median ms over self.iters replays as a result dict, or
+        None on launcher signature mismatch / runtime error."""
+        self._load_launcher()
+        import jax
+        import jax.numpy as jnp  # noqa: F401
+        import functools
+        import time as _time
+
+        # Freeze kwargs into a hashable cache key.
+        key = tuple(sorted((k, (tuple(v) if isinstance(v, list) else v))
+                           for k, v in kwargs.items()))
+        if key not in self._cached_jit:
+            # Build the call (kwargs are NOT static_argnames-friendly across
+            # arbitrary launcher signatures; bake them in via partial then
+            # jit the resulting tensor-only callable).
+            launch_fn = self._launch_fn
+            assert launch_fn is not None
+
+            def _call(*args, **kw):
+                return launch_fn(*args, **kw)
+
+            self._cached_jit[key] = jax.jit(_call)
+
+        jit_fn = self._cached_jit[key]
+        pos_args, kw_args = self._build_args(kwargs)
+
+        # Warmup — also catches signature mismatches early.
+        try:
+            for _ in range(self.warmup):
+                out = jit_fn(*pos_args, **kw_args)
+                jax.tree_util.tree_map(
+                    lambda x: x.block_until_ready()
+                    if hasattr(x, "block_until_ready") else x, out)
+        except TypeError:
+            # Signature mismatch — retry with positional-only fallback.
+            try:
+                if self._launch_sig is not None:
+                    # Drop kwargs that aren't in signature; use positional.
+                    pos_args = list(kw_args.values())
+                    kw_args = {}
+                for _ in range(self.warmup):
+                    out = jit_fn(*pos_args, **kw_args)
+                    jax.tree_util.tree_map(
+                        lambda x: x.block_until_ready()
+                        if hasattr(x, "block_until_ready") else x, out)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+        # Timed iterations.
+        times: List[float] = []
+        try:
+            for _ in range(self.iters):
+                t0 = _time.perf_counter()
+                out = jit_fn(*pos_args, **kw_args)
+                jax.tree_util.tree_map(
+                    lambda x: x.block_until_ready()
+                    if hasattr(x, "block_until_ready") else x, out)
+                times.append((_time.perf_counter() - t0) * 1000.0)
+        except Exception:
+            return None
+        times.sort()
+        return {
+            "timing_ms": times[len(times) // 2],
+            "min_ms":    times[0],
+            "max_ms":    times[-1],
+            "n":         len(times),
+        }
+
+
 class TimingWorker:
     """Persistent timing subprocess; one warm CUDA context for an entire sweep."""
 
@@ -3740,7 +3939,34 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
     """Return a closure ``timer(config) -> result dict | None`` for the
     Bayesian/Exhaustive driver. Builds the variant .so, records it in
     the cache, then asks the worker to time it (fallback: one-shot
-    subprocess)."""
+    subprocess).
+
+    For Pallas/TPU specs, returns a Pallas-flavoured closure that skips
+    the variant-.so build entirely and just runs PallasTimer on the
+    config dict directly (each config is a kwargs bundle for the jitted
+    launcher)."""
+
+    # ---- Pallas/TPU path: no .so, no worker — PallasTimer in-process. ----
+    if get_arch_entry(spec.arch).vendor == "pallas":
+        launcher_path = (REPO_ROOT / "csrc/backends/pallas"
+                         / f"launch_{spec.optimizer}.py")
+        pallas_timer = PallasTimer(launcher_path, spec.optimizer)
+
+        def pallas_closure(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            ckey = config_key(config)
+            progress_state["last_start"] = time.monotonic()
+            try:
+                result = pallas_timer.time_config(config)
+            except RuntimeError as exc:
+                report.write(f"    [pallas time error {ckey}: {exc}]\n")
+                result = None
+            elapsed = time.monotonic() - progress_state["last_start"]
+            progress_state["window"].append(elapsed)
+            if len(progress_state["window"]) > 20:
+                progress_state["window"].pop(0)
+            return result
+
+        return pallas_closure
 
     def timer(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         ckey = config_key(config)
@@ -3901,12 +4127,30 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
         gpu_ok = torch.cuda.is_available()
     except ImportError:
         gpu_ok = False
+    # Pallas/TPU has no torch.cuda; route to the Pallas autotune driver,
+    # which uses PallasTimer (JAX in-process) instead of variant .so timing.
+    if get_arch_entry(spec.arch).vendor == "pallas":
+        report.write("  [jit-autotune] pallas backend — using PallasTimer.\n")
+        try:
+            space = get_search_space(spec.search_space_path)
+        except Exception as exc:
+            report.write(f"  [jit-autotune] search space load failed: {exc}\n")
+            space = {spec.arch: {"dims": [], "prefilter": {"rules": []}}}
+        arch_space = space.get(spec.arch, {"dims": [], "prefilter": {"rules": []}})
+        if arch_space.get("dims"):
+            try:
+                configs = list(itertools.islice(
+                    cartesian({spec.arch: arch_space}, spec.arch),
+                    1_000_000))
+            except Exception as exc:
+                report.write(f"  [jit-autotune] cartesian failed: {exc}\n")
+                configs = []
+        else:
+            configs = []
+        return _pallas_autotune(spec, sources, configs, report, cache)
     if not gpu_ok:
         report.write("  [jit-autotune] no GPU visible — skipping. Run JIT "
                      "phase on the target GPU host with this cache.\n")
-        return None
-    if get_arch_entry(spec.arch).vendor == "pallas":
-        report.write("  [jit-autotune] pallas backend; no C++ tuning.\n")
         return None
 
     yaml_path = spec.search_space_path or DEFAULT_SEARCH_SPACE
@@ -4139,6 +4383,153 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
     return out
 
 
+# ---------------------------------------------------------------------------
+# Pallas/TPU autotune driver — Python-only, no .so build, JSON manifest output
+# ---------------------------------------------------------------------------
+#
+# Mirrors _run_bayesian's contract but skips the variant-build step entirely:
+# each "config" is just a kwargs dict that PallasTimer feeds into the jitted
+# launcher. The winning config is persisted as a JSON manifest under
+# ``out_dir / tuned_pallas_<opt>_<model>_<arch>.json`` so the runtime side
+# (or another host) can re-import it without re-tuning.
+#
+# Cache key tuple: (optimizer, model, tpu_arch, block_spec, jax_version,
+# libtpu_version). The same compile-cache machinery is used; the block_spec
+# and version pieces are derived best-effort and folded into the search-space
+# hash so changes invalidate.
+
+def _pallas_versions() -> Dict[str, str]:
+    """Best-effort probe of the local jax + libtpu install. Used as part of
+    the Pallas autotune cache key — different JAX/libtpu pairings can produce
+    different optimal kwargs."""
+    out: Dict[str, str] = {}
+    try:
+        import jax
+        out["jax"] = getattr(jax, "__version__", "unknown")
+    except ImportError:
+        out["jax"] = "absent"
+    try:
+        import libtpu  # type: ignore
+        out["libtpu"] = getattr(libtpu, "__version__", "unknown")
+    except ImportError:
+        out["libtpu"] = "absent"
+    return out
+
+
+def _pallas_autotune(spec: BuildSpec, sources: List[Path],
+                     configs: List[Dict[str, Any]], report,
+                     cache: CompileCache) -> Optional[Dict[str, Any]]:
+    """Pallas analog of _run_bayesian. Times every config via PallasTimer
+    (or, for empty/tiny spaces, just times the no-kwargs default once) and
+    writes the winner as a JSON manifest. Returns the winning config dict
+    or ``None`` if every trial failed."""
+    versions = _pallas_versions()
+    block_spec = "default"   # placeholder for future Pallas BlockSpec tuning
+    report.write(f"\n  [pallas-autotune] jax={versions['jax']} "
+                 f"libtpu={versions['libtpu']} block_spec={block_spec}\n")
+
+    launcher_path = (REPO_ROOT / "csrc/backends/pallas"
+                     / f"launch_{spec.optimizer}.py")
+    if not launcher_path.is_file():
+        report.write(f"  [pallas-autotune] launcher missing: {launcher_path}\n")
+        return None
+
+    # Materialize the config list (Pallas search spaces are small — < 1M).
+    if not configs:
+        # No dimensions in the Pallas space yet (Stream 2 will fill them in).
+        # Time the zero-kwargs default so we still produce a winner and a
+        # manifest with median timing.
+        configs = [{}]
+    report.write(f"  [pallas-autotune] candidates: {len(configs)}\n")
+
+    # Build the per-trial timer.
+    progress_state: Dict[str, Any] = {"last_start": time.monotonic(), "window": []}
+    timer = _make_variant_timer(
+        spec, sources, [], [], [], [], cache, None, report, progress_state)
+
+    step, close = make_progress(
+        len(configs), f"pallas-autotune {spec.optimizer}/{spec.arch}")
+
+    all_trials: List[Dict[str, Any]] = []
+    best: Optional[Dict[str, Any]] = None
+    try:
+        for i, cfg in enumerate(configs, 1):
+            ckey = config_key(cfg)
+            report.write(f"  [{i}/{len(configs)}] {ckey or '<default>'}\n")
+            report.flush()
+            result = timer(cfg)
+            trial = {
+                "trial_num":   i,
+                "stage":       "pallas",
+                "config":      cfg,
+                "config_key":  ckey,
+                "timing_ms":   result["timing_ms"] if result else None,
+                "min_ms":      result["min_ms"]    if result else None,
+                "max_ms":      result["max_ms"]    if result else None,
+                "n":           result["n"]         if result else None,
+                "host":        _current_host(),
+                "recorded_at": datetime.datetime.now().isoformat(),
+                "status":      "ok" if result else "fail",
+            }
+            all_trials.append(trial)
+            cache.record_trial(spec.optimizer, spec.model, spec.arch, trial)
+            if result is not None and (best is None
+                                       or result["timing_ms"] < best["timing_ms"]):
+                best = {"config": cfg, "timing_ms": result["timing_ms"],
+                        "trial_num": i}
+            step(f"trial {i}/{len(configs)} key={ckey[:24] or '<default>'}…")
+            if i % JIT_CACHE_FLUSH_EVERY == 0:
+                cache.save()
+    finally:
+        close()
+        cache.save()
+
+    if best is None:
+        report.write("\n  [pallas-autotune] no successful trials.\n")
+        return None
+
+    winner = dict(best["config"])
+    winner["timing_ms"] = best["timing_ms"]
+    winner["config_key"] = config_key(best["config"])
+    winner["stage_won"] = "pallas"
+
+    # Persist the JSON manifest the runtime will consume.
+    manifest_path = (spec.out_dir
+                     / f"tuned_pallas_{spec.optimizer}_{spec.model}_{spec.arch}.json")
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "optimizer":  spec.optimizer,
+        "model":      spec.model,
+        "tpu_arch":   spec.arch,
+        "block_spec": block_spec,
+        "jax_version":    versions["jax"],
+        "libtpu_version": versions["libtpu"],
+        "launcher":   str(launcher_path),
+        "tuned_kwargs": {k: v for k, v in winner.items()
+                         if k not in ("timing_ms", "config_key", "stage_won")},
+        "timing_ms":  winner["timing_ms"],
+        "n_trials":   len(all_trials),
+        "n_ok":       sum(1 for t in all_trials if t["status"] == "ok"),
+        "host":       _current_host(),
+        "recorded_at": datetime.datetime.now().isoformat(),
+    }
+    try:
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        report.write(f"  [pallas-autotune] manifest: {manifest_path}\n")
+    except OSError as exc:
+        report.write(f"  [pallas-autotune] manifest write failed: {exc}\n")
+
+    # Roll the same fact into the compile cache for downstream consumers.
+    space_key = _sha256_str(json.dumps(
+        {"opt": spec.optimizer, "model": spec.model, "arch": spec.arch,
+         "block_spec": block_spec, **versions}, sort_keys=True))
+    cache.set_tuned(spec.optimizer, spec.model, spec.arch, winner,
+                    mode="pallas", search_space_hash=space_key)
+    report.write(f"  [pallas-autotune] WINNER: {winner['config_key'] or '<default>'} "
+                 f"@ {winner['timing_ms']:.4f}ms\n")
+    return winner
+
+
 def _neighbour_estimate(seeds: List[Dict[str, Any]],
                         dims: List[Dict[str, Any]],
                         is_feasible: Callable[[Dict[str, Any]], bool]):
@@ -4222,12 +4613,15 @@ def build_aot(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
     _refresh_torch_cuda_home()
     entry = get_arch_entry(spec.arch)
     if entry.vendor == "pallas":
+        # TPU/Pallas has no AOT phase — no nvcc, no .so, no cpp_extension.
+        # Return a sentinel Path so downstream consumers (_publish_aot_artifact,
+        # build_jit) can detect the no-op without crashing on a missing file.
         launcher = (REPO_ROOT / "csrc/backends/pallas"
                     / f"launch_{spec.optimizer}.py")
-        report.write("\n[pallas] no C++ compile; Python launcher only\n")
+        report.write("\n[build_aot] no-op for Pallas (TPU has no AOT phase)\n")
         report.write(f"  launcher: {launcher}\n")
         report.write(f"  exists:   {launcher.exists()}\n")
-        return None
+        return Path("pallas-noop")
 
     sources = _resolve_sources(spec)
     host_cflags = _host_cflags(spec)
@@ -4357,6 +4751,9 @@ def _publish_aot_artifact(spec: BuildSpec, so_path: Path, report) -> Path:
     """If ``--aot-artifact-dir`` is set, copy the .so into the shared dir
     so a downstream JIT runtime (possibly on another host) can pick it up.
     Returns the published path (or the original)."""
+    # Pallas sentinel — nothing to publish.
+    if str(so_path) == "pallas-noop":
+        return so_path
     if spec.aot_artifact_dir is None:
         return so_path
     dest_dir = Path(spec.aot_artifact_dir).resolve()
@@ -4378,8 +4775,35 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
     _refresh_torch_cuda_home()
     entry = get_arch_entry(spec.arch)
     if entry.vendor == "pallas":
-        report.write("\n[pallas] JIT phase no-op (Python-only backend)\n")
-        return None
+        # Pallas/TPU JIT phase = PallasTimer-driven autotune. No .so output;
+        # winning kwargs are persisted as a JSON manifest under spec.out_dir.
+        report.write("\n[build_jit] pallas path — routing to _pallas_autotune\n")
+        # Sources are conceptual here (a single .py launcher); pass an empty
+        # list — _pallas_autotune locates the launcher itself.
+        try:
+            space = build_full_search_space()
+        except Exception as exc:
+            report.write(f"  [pallas] build_full_search_space failed: {exc}\n")
+            space = {spec.arch: {"dims": [], "prefilter": {"rules": []}}}
+        arch_space = space.get(spec.arch, {"dims": [], "prefilter": {"rules": []}})
+        if arch_space.get("dims"):
+            try:
+                configs = list(itertools.islice(
+                    cartesian({spec.arch: arch_space}, spec.arch),
+                    1_000_000))
+            except Exception as exc:
+                report.write(f"  [pallas] cartesian failed: {exc}\n")
+                configs = []
+        else:
+            configs = []
+        winner = _pallas_autotune(spec, [], configs, report, cache)
+        cache.save()
+        manifest_path = (spec.out_dir /
+                         f"tuned_pallas_{spec.optimizer}_{spec.model}_{spec.arch}.json")
+        if winner is None:
+            report.write("  [pallas] no winner produced.\n")
+            return None
+        return manifest_path if manifest_path.is_file() else Path("pallas-noop")
 
     # Sanity: AOT must have run already on some host with matching hashes.
     e = cache.get(spec.optimizer, spec.model, spec.arch)
@@ -5322,6 +5746,74 @@ def _self_test() -> int:
 
     _run("arch_table_completeness", test_arch_table_completeness)
     _run("arch_table_gencode_format", test_arch_table_gencode_format)
+
+    sys.stdout.write("[self-test] pallas\n")
+
+    def test_pallas_timer_importable_without_jax():
+        # PallasTimer must be importable on hosts that don't have JAX.
+        # We can't really uninstall JAX here, but we can verify the class
+        # constructs and only raises when time_config() is actually called.
+        td = Path(tempfile.mkdtemp())
+        try:
+            t = PallasTimer(td / "nonexistent_launcher.py", "adamw")
+            assert t.optimizer == "adamw"
+            assert t._launch_fn is None       # lazy — not yet loaded
+            assert t._cached_jit == {}
+            # time_config should raise RuntimeError, not crash on import.
+            try:
+                t.time_config({})
+            except RuntimeError:
+                pass
+            else:
+                # If JAX is installed AND the launcher path doesn't exist,
+                # _load_launcher() raises RuntimeError("launcher not found").
+                # Either way RuntimeError is the expected failure mode.
+                raise AssertionError(
+                    "time_config should have raised RuntimeError")
+        finally:
+            shutil.rmtree(td)
+
+    def test_pallas_build_aot_noop():
+        # build_aot must return the Path("pallas-noop") sentinel for tpu_v5p
+        # without trying to load nvcc or torch.cpp_extension.
+        with tempfile.TemporaryDirectory() as td:
+            tdp = Path(td)
+            spec = BuildSpec(
+                optimizer="adamw", model="mamba3", arch="tpu_v5p",
+                out_dir=tdp,
+            )
+
+            class _DummyReport:
+                def write(self, s): pass
+                def flush(self): pass
+
+            cache_path = tdp / "cache.json"
+            cache = CompileCache(cache_path)
+            out = build_aot(spec, cache, _DummyReport())
+            assert out is not None, "build_aot returned None for pallas"
+            assert str(out) == "pallas-noop", \
+                f"expected pallas-noop, got {out!r}"
+
+    def test_pallas_publish_handles_sentinel():
+        # _publish_aot_artifact must accept the sentinel without copying.
+        with tempfile.TemporaryDirectory() as td:
+            tdp = Path(td)
+            spec = BuildSpec(
+                optimizer="adamw", model="mamba3", arch="tpu_v5p",
+                out_dir=tdp, aot_artifact_dir=tdp / "published",
+            )
+
+            class _DummyReport:
+                def write(self, s): pass
+                def flush(self): pass
+
+            out = _publish_aot_artifact(spec, Path("pallas-noop"),
+                                        _DummyReport())
+            assert str(out) == "pallas-noop"
+
+    _run("pallas_timer_importable", test_pallas_timer_importable_without_jax)
+    _run("pallas_build_aot_noop", test_pallas_build_aot_noop)
+    _run("pallas_publish_handles_sentinel", test_pallas_publish_handles_sentinel)
 
     sys.stdout.write(f"\n[self-test] {passed} passed, {failures} failed\n")
     return 1 if failures else 0
