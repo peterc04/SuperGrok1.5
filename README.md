@@ -11,6 +11,116 @@ conditions.
 
 ---
 
+## Quickstart: clone, install, compile
+
+### 1. Clone the repo
+
+```bash
+git clone https://github.com/peterc04/SuperGrok1.5
+cd SuperGrok1.5
+git submodule update --init --recursive third_party/cutlass  # optional, for CUTLASS GEMMs on sm_90
+```
+
+### 2. Install Python dependencies
+
+```bash
+# Core deps — required on every host
+pip install torch ninja optuna pyyaml
+
+# Optional but recommended
+pip install tqdm                    # nicer progress bars during autotune
+pip install 'jax[tpu]'              # only if --arch tpu_v5p
+```
+
+Toolchain requirements per arch (only the one matching your target is needed):
+
+- `sm_90` — CUDA Toolkit ≥ 12.0 with `nvcc` on `PATH`, g++ ≥ 9
+- `gfx942` — ROCm ≥ 6.0 with `hipcc` on `PATH`
+- `tpu_v5p` — no C++ compile; JAX/Pallas handles codegen at runtime
+
+### 3. Verify the install (no GPU needed)
+
+```bash
+# Runs 18 inline self-tests covering search space, PGO, Bayesian, cache, and kernel headers
+python -m grokking_optimizers.compile --self-test
+```
+
+Expected output ends with: `[self-test] 18 passed, 0 failed`.
+
+### 4. Compile an `(optimizer, model, arch)` triple
+
+The targeted build pipeline lives at `grokking_optimizers/compile.py`.
+It runs ninja-driven AOT compilation, optional Bayesian/Exhaustive
+autotuning over a 10-dim search space (embedded in the file as
+`DEFAULT_SEARCH_SPACE_YAML`), an optional 3-pass PGO loop, and an
+optional native-profiler capture.
+
+```bash
+# Default: bayesian autotune (500 trials, top-K=20), AOT+JIT, profile pass
+python -m grokking_optimizers.compile \
+    --optimizer adamw --model decoder --arch sm_90 \
+    --cache build/.compile_cache.json
+
+# Quick debug run (25 trials, no PGO)
+python -m grokking_optimizers.compile -O lion -M mamba -A sm_90 --quick
+
+# Exhaustive — every config that survives the static pre-filter
+python -m grokking_optimizers.compile -O grokfast -M vit -A gfx942 --mode exhaustive
+
+# AOT only (CPU host, no GPU needed) — publish artefact for a GPU host
+python -m grokking_optimizers.compile -O adamw -M decoder -A sm_90 \
+    --aot-only --aot-artifact-dir build/aot
+
+# JIT autotune only (GPU host) — consumes the artefact from above
+python -m grokking_optimizers.compile -O adamw -M decoder -A sm_90 \
+    --jit-only --cache build/.compile_cache.json
+
+# 3-pass PGO build (instrument → workload → use)
+python -m grokking_optimizers.compile -O grokadamw -M decoder -A sm_90 \
+    --pgo --pgo-steps 1000
+
+# Use your own YAML search space instead of the embedded one
+python -m grokking_optimizers.compile -O lion -M vit -A sm_90 \
+    --search-space my_search_space.yaml
+```
+
+Supported values:
+
+- `--optimizer / -O`: `adamw`, `lion`, `grokfast`, `grokadamw`,
+  `looksam`, `muon`, `neuralgrok`, `prodigy`, `supergrok11`, `supergrok15`, `supergrok2`
+- `--model / -M`: `decoder`, `mamba`, `vit`
+- `--arch / -A`: `sm_90`, `gfx942`, `tpu_v5p`
+
+Output: a single text report at `build/compiled/compile_<O>_<M>_<A>.txt`
+plus the built `.so` (CUDA/HIP) or compiled Pallas module (TPU). The
+JSON cache at `--cache <path>` survives across runs, so repeating the
+same combo is a cache-hit on every phase.
+
+For the full CLI reference (Optuna study persistence, transfer
+learning, Hyperband pruner, debug symbols, etc.), see
+[CLI surface](#cli-surface-compilepy) below.
+
+### 5. Profile a compiled artifact
+
+```bash
+# Re-profile without rebuilding (ncu on sm_90, rocprof on gfx942, jax.profiler on tpu)
+python -m grokking_optimizers.profile \
+    --optimizer adamw --model decoder --arch sm_90
+```
+
+### 6. Run the production install
+
+The `compile.py` flow is for iterating on one combo with full diagnostics.
+For the production `grokking_optimizers._ops` extension consumed by the
+race driver, use `pip install -e .` from the repo root.
+
+```bash
+pip install -e .
+python grokking_race_v2.py --help   # race driver entry point
+```
+
+---
+
 ## Hardware support
 
 The build targets a **3-arch active set**:
