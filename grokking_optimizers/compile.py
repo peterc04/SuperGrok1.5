@@ -2606,6 +2606,10 @@ class BuildSpec:
     # §12 A1 / A2 — Hyperband pruner + transfer learning
     pruner: str = "none"              # "none" | "median" | "hyperband"
     transfer_learning: bool = False
+    # Stream 7 — NVRTC / hipRTC runtime kernel specialization.
+    # When True, build() calls kernel_registry.initialize_registry() at the
+    # tail of the orchestrator to pre-warm a per-arch KernelRegistry.
+    enable_runtime_specialization: bool = False
 
 
 def _ensure_nvcc_on_path() -> Optional[str]:
@@ -4485,6 +4489,7 @@ def build(
     bootstrap_cuda: bool = False,
     pruner: str = "none",
     transfer_learning: bool = False,
+    enable_runtime_specialization: bool = False,
 ) -> Optional[Path]:
     """In-process orchestrator. ``main`` handles subprocess split.
 
@@ -4572,6 +4577,7 @@ def build(
         bayesian_trials=bayesian_trials, top_k=top_k, seed=seed,
         debug_symbols=debug_symbols, debug=debug,
         pruner=pruner, transfer_learning=transfer_learning,
+        enable_runtime_specialization=enable_runtime_specialization,
     )
     _validate(spec)
     spec.out_dir.mkdir(parents=True, exist_ok=True)
@@ -4672,6 +4678,11 @@ def build(
                 report.write("\n--- PROFILE PASS ---\n")
                 _dispatch_profile(optimizer, model, arch, report)
                 step("profile")
+
+            # Stream 7 — NVRTC / hipRTC kernel-registry pre-warm.
+            if enable_runtime_specialization:
+                from grokking_optimizers.kernel_registry import initialize_registry
+                initialize_registry(spec, report)
 
             report.write(f"\n# Cache:    {cache.path}\n")
             report.write(f"# Final .so: {so_path}\n")
@@ -4815,6 +4826,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "wheels (nvcc + runtime + CCCL + NVRTC) and "
                              "retry. Use this on Colab CPU runtimes or any "
                              "fresh host without a system CUDA install.")
+    # Stream 7 — runtime kernel specialization via NVRTC / hipRTC.
+    parser.add_argument("--enable-runtime-specialization", action="store_true",
+                        help="Pre-warm a per-arch KernelRegistry that JIT-"
+                             "specializes hot kernels via NVRTC (CUDA) / "
+                             "hipRTC (HIP) with shape-class constants baked "
+                             "in. CUBINs are cached under "
+                             "<out>/nvrtc_cache. CPU-only hosts without "
+                             "cuda-python degrade gracefully — the build "
+                             "still succeeds.")
     args = parser.parse_args(argv)
     if args.debug:
         args.verbose = True
@@ -4874,6 +4894,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         bootstrap_cuda=args.bootstrap_cuda,
         pruner=args.pruner,
         transfer_learning=args.transfer_learning,
+        enable_runtime_specialization=args.enable_runtime_specialization,
     )
 
     report = args.report or (
@@ -5322,6 +5343,98 @@ def _self_test() -> int:
 
     _run("arch_table_completeness", test_arch_table_completeness)
     _run("arch_table_gencode_format", test_arch_table_gencode_format)
+
+    sys.stdout.write("[self-test] kernel_registry\n")
+
+    def test_kernel_registry_importable():
+        from grokking_optimizers import kernel_registry  # noqa: F401
+
+    def test_shape_class_buckets():
+        from grokking_optimizers.kernel_registry import _shape_class
+        assert _shape_class((100,)) == "tiny"
+        assert _shape_class(()) == "tiny"        # scalar == 1 element
+        # 256 elements is still inside the < 1024 tiny bucket.
+        assert _shape_class((256,)) == "tiny"
+        assert _shape_class((4096,)) == "small"
+        assert _shape_class((512, 512)) == "medium"
+        assert _shape_class((4096, 4096)) in ("large", "huge")
+        assert _shape_class((1 << 30,)) == "huge"
+
+    def test_kernel_registry_construct_cuda():
+        from grokking_optimizers import kernel_registry
+        td = Path(tempfile.mkdtemp())
+        try:
+            reg = kernel_registry.KernelRegistry("sm_90a", td)
+            assert reg.vendor == "cuda"
+            assert reg.cache_dir == td
+        finally:
+            shutil.rmtree(td)
+
+    def test_kernel_registry_rejects_pallas():
+        from grokking_optimizers import kernel_registry
+        td = Path(tempfile.mkdtemp())
+        try:
+            try:
+                kernel_registry.KernelRegistry("tpu_v5p", td)
+            except kernel_registry.RegistryError:
+                return
+            raise AssertionError(
+                "expected RegistryError for pallas arch tpu_v5p")
+        finally:
+            shutil.rmtree(td)
+
+    def test_kernel_registry_rejects_unknown_arch():
+        from grokking_optimizers import kernel_registry
+        td = Path(tempfile.mkdtemp())
+        try:
+            try:
+                kernel_registry.KernelRegistry("sm_bogus", td)
+            except kernel_registry.RegistryError:
+                return
+            raise AssertionError("expected RegistryError for unknown arch")
+        finally:
+            shutil.rmtree(td)
+
+    def test_kernel_registry_nvrtc_compile_or_skip():
+        """NVRTC compile path — skip cleanly on hosts without cuda-python."""
+        from grokking_optimizers import kernel_registry
+        td = Path(tempfile.mkdtemp())
+        try:
+            reg = kernel_registry.KernelRegistry("sm_90a", td)
+            try:
+                handle = reg.dispatch("adamw", "fp32", (4096,))
+            except kernel_registry.RegistryError as exc:
+                # Acceptable on CPU-only hosts without cuda-python.
+                sys.stdout.write(f"    [nvrtc skipped] {exc}\n")
+                return
+            cubin_path = handle.cubin_path
+            assert cubin_path.exists()
+            assert cubin_path.stat().st_size > 0
+            sys.stdout.write(
+                f"    [nvrtc compiled] {cubin_path.stat().st_size}B cubin\n")
+        finally:
+            shutil.rmtree(td)
+
+    def test_initialize_registry_disabled_by_default():
+        from grokking_optimizers import kernel_registry
+        td = Path(tempfile.mkdtemp())
+        try:
+            spec = BuildSpec(optimizer="adamw", model="mamba", arch="sm_90a",
+                             out_dir=Path(td))
+            assert kernel_registry.initialize_registry(spec) is None
+        finally:
+            shutil.rmtree(td)
+
+    _run("kernel_registry_importable", test_kernel_registry_importable)
+    _run("kernel_registry_shape_buckets", test_shape_class_buckets)
+    _run("kernel_registry_construct_cuda", test_kernel_registry_construct_cuda)
+    _run("kernel_registry_rejects_pallas", test_kernel_registry_rejects_pallas)
+    _run("kernel_registry_rejects_unknown_arch",
+         test_kernel_registry_rejects_unknown_arch)
+    _run("kernel_registry_nvrtc_compile_or_skip",
+         test_kernel_registry_nvrtc_compile_or_skip)
+    _run("kernel_registry_initialize_disabled",
+         test_initialize_registry_disabled_by_default)
 
     sys.stdout.write(f"\n[self-test] {passed} passed, {failures} failed\n")
     return 1 if failures else 0
