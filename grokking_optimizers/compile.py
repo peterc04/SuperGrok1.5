@@ -8987,6 +8987,68 @@ def _self_test() -> int:
         finally:
             shutil.rmtree(td)
 
+    def test_loaded_kernel_call_or_skip():
+        """Live NVRTC → cuModuleLoadData → cuLaunchKernel round-trip.
+
+        Skips cleanly if cuda-python or a CUDA-capable GPU isn't available.
+        """
+        # Gate 1: cuda-python
+        try:
+            try:
+                from cuda.bindings import driver as _drv  # noqa: F401
+                from cuda.bindings import nvrtc as _nvrtc  # noqa: F401
+            except ImportError:
+                from cuda import cuda as _drv  # noqa: F401
+                from cuda import nvrtc as _nvrtc  # noqa: F401
+        except ImportError:
+            sys.stdout.write("    [nvrtc-live] cuda-python unavailable — skip\n")
+            return
+        # Gate 2: GPU visibility (be defensive — torch.cuda is the easy probe).
+        try:
+            import torch  # noqa: F401
+            if not torch.cuda.is_available():
+                sys.stdout.write("    [nvrtc-live] no CUDA device — skip\n")
+                return
+        except Exception:
+            sys.stdout.write("    [nvrtc-live] torch probe failed — skip\n")
+            return
+        # Gate 3: ARCH_TABLE entry for the local SKU.
+        try:
+            major, minor = torch.cuda.get_device_capability(0)
+        except Exception as exc:
+            sys.stdout.write(
+                f"    [nvrtc-live] get_device_capability failed: {exc} — skip\n")
+            return
+        sm = f"sm_{major}{minor}"
+        if sm not in ARCH_TABLE:
+            # Try the "a" variant.
+            if (sm + "a") in ARCH_TABLE:
+                sm = sm + "a"
+            else:
+                sys.stdout.write(
+                    f"    [nvrtc-live] {sm} not in ARCH_TABLE — skip\n")
+                return
+        # Compile + load + launch.
+        from grokking_optimizers import kernel_registry
+        td = Path(tempfile.mkdtemp())
+        try:
+            reg = kernel_registry.KernelRegistry(sm, td)
+            handle = reg.dispatch("copy", "fp32", (64,))
+            # Allocate device memory via torch as a convenience wrapper.
+            n = 64
+            d_in = torch.arange(n, dtype=torch.float32, device="cuda")
+            d_out = torch.zeros(n, dtype=torch.float32, device="cuda")
+            handle(d_out.data_ptr(), d_in.data_ptr(), n,
+                   grid=((n + 31) // 32, 1, 1), block=(32, 1, 1))
+            torch.cuda.synchronize()
+            assert torch.allclose(d_out, d_in), \
+                f"copy kernel output mismatch: out={d_out[:4]} in={d_in[:4]}"
+            sys.stdout.write(
+                f"    [nvrtc-live] {sm} copy kernel round-tripped "
+                f"{n} fp32 elements\n")
+        finally:
+            shutil.rmtree(td)
+
     _run("kernel_registry_importable", test_kernel_registry_importable)
     _run("kernel_registry_shape_buckets", test_shape_class_buckets)
     _run("kernel_registry_construct_cuda", test_kernel_registry_construct_cuda)
@@ -8997,6 +9059,7 @@ def _self_test() -> int:
          test_kernel_registry_nvrtc_compile_or_skip)
     _run("kernel_registry_initialize_disabled",
          test_initialize_registry_disabled_by_default)
+    _run("loaded_kernel_call_or_skip", test_loaded_kernel_call_or_skip)
 
     # ----- Stream 11: compile_config -----
     sys.stdout.write("[self-test] compile_config\n")
@@ -10698,7 +10761,7 @@ class KernelRegistry:
         return bytes(buf)
 
     def _load_cubin(self, cubin_path: Path, op: str):
-        return _LoadedKernel(cubin_path, op)
+        return _LoadedKernel(cubin_path, op, vendor=self.vendor)
 
 
 def _first_payload(res):
@@ -10720,19 +10783,239 @@ def _err_value(res) -> int:
     return 0
 
 
-class _LoadedKernel:
-    __slots__ = ("cubin_path", "op")
+def _load_cuda_driver():
+    """Import cuda-python driver bindings (modern path first, legacy fallback).
 
-    def __init__(self, cubin_path: Path, op: str):
+    Returns the bindings module (e.g. ``cuda.bindings.driver`` or
+    ``cuda.cuda``). Raises :class:`RegistryError` if neither is installed.
+    """
+    try:
+        from cuda.bindings import driver as _drv  # type: ignore
+        return _drv
+    except ImportError:
+        pass
+    try:
+        from cuda import cuda as _drv  # type: ignore
+        return _drv
+    except ImportError as exc:
+        raise RegistryError(
+            "cuda-python required for live launch "
+            "(pip install cuda-python)") from exc
+
+
+def _load_hip_driver():
+    """Import hip-python driver bindings. Raises RegistryError on miss."""
+    try:
+        from hip import hip as _hip_drv  # type: ignore
+        return _hip_drv
+    except ImportError as exc:
+        raise RegistryError(
+            "hip-python required for live launch "
+            "(pip install hip-python)") from exc
+
+
+class _LoadedKernel:
+    """Loaded cubin handle. Real cuModule / hipModule lookup happens lazily
+    on the first __call__ so construction stays cheap and stays importable
+    on hosts without cuda-python / hip-python."""
+
+    __slots__ = ("cubin_path", "op", "vendor", "_module", "_function", "_lock")
+
+    def __init__(self, cubin_path: Path, op: str, vendor: str = "cuda"):
         self.cubin_path = cubin_path
         self.op = op
+        self.vendor = vendor
+        self._module = None
+        self._function = None
+        self._lock = threading.Lock()
 
     def __repr__(self) -> str:
-        return f"<Kernel op={self.op} cubin={self.cubin_path.name}>"
+        return (f"<Kernel op={self.op} cubin={self.cubin_path.name} "
+                f"vendor={self.vendor}>")
 
-    def __call__(self, *args, **kwargs):
-        raise NotImplementedError(
-            "live kernel invocation requires a GPU + cuda-python context")
+    def _load(self) -> None:
+        """Lazy module load + function lookup. Idempotent under the lock."""
+        if self._function is not None:
+            return
+        with self._lock:
+            if self._function is not None:
+                return
+            cubin_bytes = self.cubin_path.read_bytes()
+            fn_name = f"specialized_{self.op}_kernel".encode()
+            if self.vendor == "cuda":
+                drv = _load_cuda_driver()
+                if not hasattr(drv, "cuModuleLoadData") \
+                        or not hasattr(drv, "cuModuleGetFunction"):
+                    raise RegistryError(
+                        "cuda-python bindings missing cuModuleLoadData / "
+                        "cuModuleGetFunction — please upgrade cuda-python")
+                mod_res = drv.cuModuleLoadData(cubin_bytes)
+                if _err_value(mod_res) != 0:
+                    raise RegistryError(
+                        f"cuModuleLoadData failed: {mod_res!r}")
+                module = _first_payload(mod_res)
+                if module is None:
+                    raise RegistryError(
+                        f"cuModuleLoadData returned no module: {mod_res!r}")
+                fn_res = drv.cuModuleGetFunction(module, fn_name)
+                if _err_value(fn_res) != 0:
+                    raise RegistryError(
+                        f"cuModuleGetFunction({fn_name!r}) failed: {fn_res!r}")
+                function = _first_payload(fn_res)
+                if function is None:
+                    raise RegistryError(
+                        f"cuModuleGetFunction returned nothing: {fn_res!r}")
+                self._module = module
+                self._function = function
+            elif self.vendor == "hip":
+                drv = _load_hip_driver()
+                if not hasattr(drv, "hipModuleLoadData") \
+                        or not hasattr(drv, "hipModuleGetFunction"):
+                    raise RegistryError(
+                        "hip-python bindings missing hipModuleLoadData / "
+                        "hipModuleGetFunction — please upgrade hip-python")
+                mod_res = drv.hipModuleLoadData(cubin_bytes)
+                if _err_value(mod_res) != 0:
+                    raise RegistryError(
+                        f"hipModuleLoadData failed: {mod_res!r}")
+                module = _first_payload(mod_res)
+                if module is None:
+                    raise RegistryError(
+                        f"hipModuleLoadData returned no module: {mod_res!r}")
+                fn_res = drv.hipModuleGetFunction(module, fn_name)
+                if _err_value(fn_res) != 0:
+                    raise RegistryError(
+                        f"hipModuleGetFunction({fn_name!r}) failed: "
+                        f"{fn_res!r}")
+                function = _first_payload(fn_res)
+                if function is None:
+                    raise RegistryError(
+                        f"hipModuleGetFunction returned nothing: {fn_res!r}")
+                self._module = module
+                self._function = function
+            else:
+                raise RegistryError(
+                    f"_LoadedKernel: unsupported vendor {self.vendor!r}")
+
+    def _pack_args(self, args):
+        """Pack Python args into a ctypes void** array suitable for
+        cuLaunchKernel / hipModuleLaunchKernel.
+
+        Each Python int is treated as a raw device-pointer-sized integer
+        (CUdeviceptr / uint64). Floats become C doubles. Already-prepared
+        ctypes objects pass through unchanged. Bools become ints.
+        """
+        import ctypes
+        boxed = []
+        for a in args:
+            if isinstance(a, bool):
+                boxed.append(ctypes.c_int(int(a)))
+            elif isinstance(a, int):
+                # Treat int as 64-bit (device pointer OR scalar int). cubin
+                # kernels we generate take `int n` (32-bit) plus pointers
+                # (64-bit). Use c_int for ints that fit, c_uint64 otherwise.
+                if -(1 << 31) <= a < (1 << 31):
+                    boxed.append(ctypes.c_int(a))
+                else:
+                    boxed.append(ctypes.c_uint64(a))
+            elif isinstance(a, float):
+                boxed.append(ctypes.c_double(a))
+            else:
+                # Already a ctypes object (or buffer); pass through.
+                boxed.append(a)
+        # Heuristic: kernels emitted by _default_template_provider take
+        # (out_ptr, in_ptr, int n). Coerce the first two ints to c_uint64
+        # if they were demoted to c_int above (likely raw device pointers).
+        # We can only know this from the kernel signature; the caller knows,
+        # so we leave it to the caller to pass real ctypes objects when they
+        # need a specific layout.
+        ptr_array = (ctypes.c_void_p * len(boxed))()
+        # Keep refs alive via a list returned alongside.
+        for i, b in enumerate(boxed):
+            ptr_array[i] = ctypes.cast(ctypes.pointer(b), ctypes.c_void_p)
+        return ptr_array, boxed
+
+    def __call__(self, *args, grid=(1, 1, 1), block=(1, 1, 1),
+                 shared: int = 0, stream: int = 0) -> None:
+        """Pack args via ctypes void**, call cuLaunchKernel /
+        hipModuleLaunchKernel.
+
+        ``args`` must be Python ints (treated as raw device pointers /
+        scalar ints), floats, or already-allocated ctypes objects.
+        Tensors should be unwrapped to their ``.data_ptr()`` ints by the
+        caller.
+        """
+        import ctypes
+        self._load()
+        # Default-template kernels take (out_ptr*, in_ptr*, int n). Caller
+        # passes plain ints for the pointers AND the count, but pointers
+        # must be 64-bit while n must be 32-bit. Re-coerce by position.
+        coerced = []
+        for idx, a in enumerate(args):
+            if isinstance(a, int) and not isinstance(a, bool):
+                # By convention, the last int arg is the scalar count
+                # (32-bit). Everything else that's an int is treated as a
+                # device pointer (64-bit). This matches the
+                # _default_template_provider kernel signature.
+                if idx == len(args) - 1:
+                    coerced.append(ctypes.c_int(a))
+                else:
+                    coerced.append(ctypes.c_uint64(a))
+            elif isinstance(a, float):
+                coerced.append(ctypes.c_float(a))
+            elif isinstance(a, bool):
+                coerced.append(ctypes.c_int(int(a)))
+            else:
+                coerced.append(a)
+        n = len(coerced)
+        ptr_array = (ctypes.c_void_p * n)()
+        for i, b in enumerate(coerced):
+            ptr_array[i] = ctypes.cast(ctypes.pointer(b), ctypes.c_void_p)
+
+        gx, gy, gz = (int(grid[0]), int(grid[1]), int(grid[2]))
+        bx, by, bz = (int(block[0]), int(block[1]), int(block[2]))
+
+        if self.vendor == "cuda":
+            drv = _load_cuda_driver()
+            if not hasattr(drv, "cuLaunchKernel"):
+                raise RegistryError(
+                    "cuda-python bindings missing cuLaunchKernel — "
+                    "please upgrade cuda-python")
+            kernel_params = ctypes.addressof(ptr_array)
+            launch_res = drv.cuLaunchKernel(
+                self._function,
+                gx, gy, gz,
+                bx, by, bz,
+                int(shared),
+                int(stream),
+                kernel_params,
+                0,  # extra
+            )
+            if _err_value(launch_res) != 0:
+                raise RegistryError(
+                    f"cuLaunchKernel failed: {launch_res!r}")
+        elif self.vendor == "hip":
+            drv = _load_hip_driver()
+            if not hasattr(drv, "hipModuleLaunchKernel"):
+                raise RegistryError(
+                    "hip-python bindings missing hipModuleLaunchKernel — "
+                    "please upgrade hip-python")
+            kernel_params = ctypes.addressof(ptr_array)
+            launch_res = drv.hipModuleLaunchKernel(
+                self._function,
+                gx, gy, gz,
+                bx, by, bz,
+                int(shared),
+                int(stream),
+                kernel_params,
+                0,  # extra
+            )
+            if _err_value(launch_res) != 0:
+                raise RegistryError(
+                    f"hipModuleLaunchKernel failed: {launch_res!r}")
+        else:
+            raise RegistryError(
+                f"_LoadedKernel.__call__: unsupported vendor {self.vendor!r}")
 
 
 _REGISTRY: Dict[str, KernelRegistry] = {}
