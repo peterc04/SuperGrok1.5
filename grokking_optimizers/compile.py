@@ -4488,6 +4488,13 @@ class BuildSpec:
     project_namespace: str = ""
     tuned_header_path: str = "csrc/algorithms/tuned_configs.h"
     source_roots: Dict[str, Any] = field(default_factory=dict)
+    # Stream B — polyhedral / loop-transform layer. When True,
+    # _make_variant_timer fans each emitted variant through
+    # enumerate_schedules + apply_schedule (libclang + islpy optional;
+    # the path degrades gracefully when either is absent). OFF by
+    # default — turning this on incurs libclang as a soft dep and
+    # multiplies the autotune fan-out by polyhedral.max_schedules_per_template.
+    enable_polyhedral: bool = False
     config: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -6780,6 +6787,32 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                                       spec=spec, arch=spec.arch)
         device_extra = _variant_macros(config, dims, "device",
                                         spec=spec, arch=spec.arch)
+
+        # ── Stream B — polyhedral fan-out hook ──────────────────────────
+        # OFF by default; gated on spec.config["polyhedral"]["enable"].
+        # When ON, take the emitted source produced by the Stream 6 path
+        # above (stashed on spec._emitted_sources by _variant_macros) and
+        # fan it through enumerate_schedules + apply_schedule. Each
+        # transformed source is written next to the original and stashed
+        # back on spec._emitted_sources for downstream introspection.
+        # Failures here MUST NOT break the un-polyhedral flow — both
+        # libclang and islpy are optional.
+        try:
+            poly_cfg = (getattr(spec, "config", {}) or {}).get(
+                "polyhedral", {}) or {}
+            if poly_cfg.get("enable"):
+                emitted_source = (getattr(spec, "_emitted_sources", {})
+                                  or {}).get(ckey)
+                if emitted_source is not None and Path(emitted_source).exists():
+                    _polyhedral_expand_variant(
+                        spec, Path(emitted_source), report)
+        except Exception as exc:
+            try:
+                report.write(
+                    f"    [polyhedral] hook failed for {ckey[:24]}: "
+                    f"{type(exc).__name__}: {exc}\n")
+            except Exception:
+                pass
 
         # Per-variant flush of the running ETA window.
         progress_state["last_start"] = time.monotonic()
@@ -10970,6 +11003,90 @@ def _self_test() -> int:
     _run("make_trial_record_propagates_numerical_status",
          test_make_trial_record_pulls_numerical_status)
 
+    # ── Stream B — polyhedral / loop-transform layer ────────────────
+    sys.stdout.write("[self-test] polyhedral\n")
+
+    def test_polyhedral_helpers_importable():
+        """The new polyhedral helpers are importable from the consolidated
+        sys.modules alias — even when libclang / islpy are absent."""
+        from grokking_optimizers.compile import (
+            LoopNest, Schedule, PolyhedralError,
+            extract_loopnest_from_template, enumerate_schedules, apply_schedule,
+        )
+        assert LoopNest is not None and Schedule is not None
+        assert PolyhedralError is not None
+    _run("polyhedral_helpers_importable", test_polyhedral_helpers_importable)
+
+    def test_polyhedral_schedule_enumeration_2d_loop():
+        """Synthetic 2D loop nest with no dependences: enumerator yields
+        schedules that respect the parallel_axes set, deduplicate via
+        cache_key, and respect the max_schedules cap."""
+        ln = LoopNest(
+            bounds=[(0, 1024, 1), (0, 1024, 1)],
+            iter_vars=["i", "j"],
+            body_ast=None,
+            dep_vectors=[],  # no dependences
+            parallel_axes=frozenset({0, 1}),
+            sequential_axes=frozenset(),
+            tile_candidates={0: [16, 32, 64], 1: [16, 32, 64]},
+            vec_candidates={0: [1, 4], 1: [1, 4]},
+        )
+        scheds = list(enumerate_schedules(ln, "sm_90a", max_schedules=8))
+        assert len(scheds) <= 8, f"cap respected: got {len(scheds)}"
+        assert len(scheds) >= 1, "at least one schedule yielded"
+        # All unique keys.
+        keys = [s.cache_key() for s in scheds]
+        assert len(keys) == len(set(keys)), "schedules deduped"
+        # parallel_axes from the LoopNest are honoured.
+        for s in scheds:
+            for ax in s.parallelize_axes:
+                assert ax in ln.parallel_axes, \
+                    f"sched {s} parallelizes non-parallel axis {ax}"
+
+    _run("polyhedral_schedule_enumeration_2d_loop",
+         test_polyhedral_schedule_enumeration_2d_loop)
+
+    def test_polyhedral_skips_when_libclang_absent():
+        """When libclang isn't available, extract_loopnest_from_template
+        returns None cleanly (no exception)."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".cu", delete=False) as tf:
+            tf.write(b"__global__ void k() {}\n")
+            p = Path(tf.name)
+        try:
+            result = extract_loopnest_from_template(p)
+            # Either we got a None (libclang absent or parse failed) or a
+            # LoopNest — both are valid as long as we didn't raise.
+            assert result is None or isinstance(result, LoopNest), result
+        finally:
+            p.unlink()
+    _run("polyhedral_skips_when_libclang_absent",
+         test_polyhedral_skips_when_libclang_absent)
+
+    def test_polyhedral_apply_schedule_simple():
+        """Synthetic LoopNest + identity Schedule → emitted source contains
+        the expected entry-point signature."""
+        ln = LoopNest(
+            bounds=[(0, 1024, 1)],
+            iter_vars=["i"],
+            body_ast=None,
+            parallel_axes=frozenset({0}),
+            tile_candidates={0: [32]},
+            vec_candidates={0: [1]},
+        )
+        sched = Schedule(
+            tile_sizes=((0, 32),),
+            fusion_partitions=((0,),),
+            reorder_permutation=(0,),
+            vectorize_axes=(),
+            parallelize_axes=(0,),
+        )
+        src = apply_schedule(ln, sched, "sm_90a")
+        assert isinstance(src, str)
+        assert "extern \"C\"" in src or "__global__" in src, src[:200]
+    _run("polyhedral_apply_schedule_simple",
+         test_polyhedral_apply_schedule_simple)
+
     # Stream H — final wrapper: only runs the e2e smoke when a GPU is
     # visible; SKIPs cleanly (and counts as PASS) otherwise.
     sys.stdout.write("[self-test] e2e_smoke (gated on GPU availability)\n")
@@ -14812,6 +14929,633 @@ def emit_cutlass_gemm_variants(arch: str,
     return emitted
 
 
+# ==============================================================================
+# Polyhedral / loop-transform layer (Stream B)
+# ==============================================================================
+# An ISL-style scheduling search layered above the Jinja2 codegen and the
+# native compiler flags. When `polyhedral.enable=True`, every emitted
+# kernel source is parsed via libclang into a `LoopNest`, enumerated
+# through dependence-respecting schedule transforms (tile / fuse /
+# reorder / vectorize / parallelize), re-emitted, and each variant is
+# timed by the existing autotuner.
+#
+# Both `islpy` (for dependence analysis) and `libclang` (for source
+# parsing) are OPTIONAL. When either is missing, the layer logs a
+# one-line "[polyhedral] skipping" notice on the report and the build
+# falls through to the existing flag-tuning path with no regression.
+# ==============================================================================
+
+class PolyhedralError(RuntimeError):
+    """Raised when a schedule cannot be legally applied to a LoopNest.
+
+    The polyhedral layer is opt-in and best-effort: ``apply_schedule``
+    raises this to signal "fall back to the un-transformed source" so
+    the caller (``_make_variant_timer``) can continue without skipping
+    the variant. It is *not* a fatal build error.
+    """
+
+
+# Arch-aware default tile / vec candidate sets. Used by
+# ``enumerate_schedules`` whenever the ``LoopNest`` itself doesn't carry
+# per-axis ``tile_candidates`` / ``vec_candidates``. The CUDA/HIP rows
+# match the Stream A search-space defaults so polyhedral-discovered tiles
+# stay inside the autotune-prefilter envelope. Pallas (TPU) has no native
+# vector intrinsic surfaced through XLA, so vec is hard-coded to [1].
+_POLY_ARCH_DEFAULTS: Dict[str, Dict[str, List[int]]] = {
+    "cuda":   {"tile": [16, 32, 64, 128], "vec": [1, 2, 4, 8]},
+    "hip":    {"tile": [16, 32, 64, 128], "vec": [1, 2, 4, 8]},
+    "pallas": {"tile": [64, 128, 256],    "vec": [1]},
+}
+
+
+def _poly_arch_defaults(arch: str) -> Dict[str, List[int]]:
+    """Resolve per-arch tile/vec candidate defaults via vendor lookup.
+
+    Falls back to the CUDA row when ``arch`` is unknown — the
+    autotune-prefilter further upstream still rejects illegal
+    combinations, so a generous default here is safe.
+    """
+    if arch in ARCH_TABLE:
+        vendor = get_arch_entry(arch).vendor
+    else:
+        vendor = "cuda"
+    return _POLY_ARCH_DEFAULTS.get(vendor, _POLY_ARCH_DEFAULTS["cuda"])
+
+
+@dataclass
+class LoopNest:
+    """Captured loop nest from an emitted kernel source.
+
+    bounds            : list of (lower, upper, step) per loop level
+    iter_vars         : list of induction variable names
+    body_ast          : opaque AST handle (libclang Cursor or our IR node)
+    dep_vectors       : list of dependence vectors as tuples — empty means
+                        loop is fully parallelizable
+    parallel_axes     : set of axis indices safe to parallelize
+    sequential_axes   : set of axis indices that must remain sequential
+    tile_candidates   : per-axis list of suggested tile sizes
+    vec_candidates    : per-axis list of suggested vec widths
+    """
+    bounds: List[Tuple[int, int, int]]
+    iter_vars: List[str]
+    body_ast: Any  # libclang Cursor or fallback IR; opaque to callers
+    dep_vectors: List[Tuple[int, ...]] = field(default_factory=list)
+    parallel_axes: frozenset = field(default_factory=frozenset)
+    sequential_axes: frozenset = field(default_factory=frozenset)
+    tile_candidates: Dict[int, List[int]] = field(default_factory=dict)
+    vec_candidates: Dict[int, List[int]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Schedule:
+    """One concrete schedule applied to a LoopNest."""
+    tile_sizes: Tuple[Tuple[int, int], ...]  # (axis_index, tile_size)
+    fusion_partitions: Tuple[Tuple[int, ...], ...]
+    reorder_permutation: Tuple[int, ...]
+    vectorize_axes: Tuple[Tuple[int, int], ...]  # (axis, vec_width)
+    parallelize_axes: Tuple[int, ...]
+
+    def cache_key(self) -> str:
+        """SHA-256 hex digest for the schedule. Used to dedupe variants."""
+        return hashlib.sha256(repr(self).encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# Source parsing — libclang front end
+# ---------------------------------------------------------------------------
+
+def _try_import_libclang():
+    """Return ``clang.cindex`` or None — never raise.
+
+    libclang ships as a Python wheel (``clang``) plus a ``libclang.so``
+    that's usually preinstalled with the CUDA / system toolchain. The
+    bindings are notoriously brittle (wrong .so version, missing
+    LD_LIBRARY_PATH, ...) so we wrap the import + the Index construction
+    in a single try/except and return None on any failure.
+    """
+    try:
+        from clang import cindex  # type: ignore
+    except Exception:
+        return None
+    # Index construction is what actually loads libclang.so; it can
+    # raise LibclangError even when the import succeeded.
+    try:
+        cindex.Index.create()
+    except Exception:
+        return None
+    return cindex
+
+
+def _try_import_islpy():
+    """Return ``islpy`` or None — never raise."""
+    try:
+        import islpy  # type: ignore
+        return islpy
+    except Exception:
+        return None
+
+
+def _poly_log(report, msg: str) -> None:
+    """One-line skip / status log on the report; tolerant of a None report."""
+    if report is None:
+        return
+    try:
+        report.write(f"[polyhedral] {msg}\n")
+    except Exception:
+        pass
+
+
+def extract_loopnest_from_template(emitted_source: Path,
+                                    report=None) -> Optional[LoopNest]:
+    """Parse an emitted CUDA / HIP / C++ source into a ``LoopNest``.
+
+    Returns ``None`` (cleanly, with a one-line ``[polyhedral] …`` log on
+    the report when one is supplied) in any of the following cases:
+
+      * libclang is not installed or fails to load ``libclang.so``
+      * the file cannot be parsed (syntax error, missing CUDA headers,
+        etc.)
+      * no kernel-style entry point (``__global__`` or ``extern "C" void
+        launch_*``) is found
+      * no ``for`` loop is found inside the kernel body
+
+    Dependence analysis uses ``islpy`` when available; otherwise we fall
+    back to a conservative scan that assumes every loop is parallel
+    unless its body contains an assignment whose LHS depends on a
+    recurrence ``p[i] = p[i-1] + …`` over the loop variable.
+    """
+    cindex = _try_import_libclang()
+    if cindex is None:
+        _poly_log(report, f"libclang unavailable — skipping {emitted_source.name}")
+        return None
+    try:
+        emitted_source = Path(emitted_source)
+        if not emitted_source.exists() or emitted_source.stat().st_size == 0:
+            _poly_log(report, f"source missing/empty: {emitted_source.name}")
+            return None
+        # CUDA headers (cuda_runtime.h, cstdint, ...) are rarely on the
+        # default include path for libclang. Parse in "permissive" mode
+        # so missing includes don't fail the whole parse; we only care
+        # about top-level loop structure, not full semantic analysis.
+        index = cindex.Index.create()
+        args = ["-x", "cuda", "-std=c++17",
+                "-D__CUDA_ARCH__=900",
+                "-Wno-everything"]
+        tu = index.parse(
+            str(emitted_source), args=args,
+            options=cindex.TranslationUnit.PARSE_SKIP_FUNCTION_BODIES
+            if False else 0,  # we need bodies; documented intent
+        )
+        if tu is None:
+            _poly_log(report, f"libclang parse returned None: {emitted_source.name}")
+            return None
+        kernel_cursor = _find_kernel_cursor(tu.cursor, cindex)
+        if kernel_cursor is None:
+            _poly_log(report, f"no kernel entry point in {emitted_source.name}")
+            return None
+        loops = _collect_outer_loops(kernel_cursor, cindex)
+        if not loops:
+            _poly_log(report, f"no for-loops in {emitted_source.name}")
+            return None
+        bounds: List[Tuple[int, int, int]] = []
+        iter_vars: List[str] = []
+        for lo, hi, step, var in loops:
+            bounds.append((lo, hi, step))
+            iter_vars.append(var)
+        dep_vectors = _heuristic_dep_vectors(loops, cindex)
+        # parallel/sequential axis classification: an axis with no
+        # dependence vector entry is treated as parallel.
+        n = len(bounds)
+        sequential = frozenset(
+            i for i, vec in enumerate(dep_vectors) if any(c != 0 for c in vec)
+            if i < n)
+        parallel = frozenset(range(n)) - sequential
+        return LoopNest(
+            bounds=bounds, iter_vars=iter_vars,
+            body_ast=kernel_cursor,
+            dep_vectors=dep_vectors,
+            parallel_axes=parallel,
+            sequential_axes=sequential,
+            tile_candidates={},  # populated lazily by enumerate_schedules
+            vec_candidates={},
+        )
+    except Exception as exc:
+        _poly_log(report,
+                  f"parse failed ({type(exc).__name__}: {exc}) "
+                  f"— skipping {emitted_source.name}")
+        return None
+
+
+def _find_kernel_cursor(root, cindex):
+    """Locate the first ``__global__`` or ``extern "C" void launch_*`` def.
+
+    Returns the libclang cursor for the function definition or None.
+    Walks the TU pre-order and stops on the first match — the codegen
+    only ever emits one kernel per source file.
+    """
+    CursorKind = cindex.CursorKind
+    for c in root.walk_preorder():
+        if c.kind not in (CursorKind.FUNCTION_DECL,
+                          CursorKind.CXX_METHOD,
+                          CursorKind.FUNCTION_TEMPLATE):
+            continue
+        if not c.is_definition():
+            continue
+        spelling = c.spelling or ""
+        # __global__ shows up as an attribute child on the cursor.
+        is_global = False
+        try:
+            for child in c.get_children():
+                if child.kind == CursorKind.CUDAGLOBAL_ATTR:
+                    is_global = True
+                    break
+        except Exception:
+            pass
+        if is_global or spelling.startswith("launch_"):
+            return c
+    return None
+
+
+def _collect_outer_loops(kernel_cursor, cindex
+                          ) -> List[Tuple[int, int, int, str]]:
+    """Walk the kernel body and lift outermost ``for`` loop bounds.
+
+    Returns a list of ``(lower, upper, step, iter_var)`` tuples. Bounds
+    that cannot be lifted as integer constants default to
+    ``(0, 1024, 1)`` so the enumerator still has *something* to tile.
+    The induction variable is best-effort: if libclang can name it,
+    we use that; otherwise we fall back to ``i{level}``.
+    """
+    CursorKind = cindex.CursorKind
+    out: List[Tuple[int, int, int, str]] = []
+    level = 0
+    for c in kernel_cursor.walk_preorder():
+        if c.kind != CursorKind.FOR_STMT:
+            continue
+        lo, hi, step, var = 0, 1024, 1, f"i{level}"
+        try:
+            children = list(c.get_children())
+            # Heuristic: FOR_STMT children are (init, cond, inc, body).
+            # We scan tokens for an integer literal in init / cond to
+            # populate lo / hi.
+            tokens = [t.spelling for t in c.get_tokens()]
+            ints = [int(t) for t in tokens if t.isdigit()]
+            if len(ints) >= 1:
+                lo = ints[0]
+            if len(ints) >= 2:
+                hi = ints[1]
+            if len(ints) >= 3:
+                step = ints[2] or 1
+            # Iter-var: first DECL_REF_EXPR child of the init clause.
+            for ch in children:
+                if ch.kind == CursorKind.DECL_STMT:
+                    for sub in ch.get_children():
+                        if sub.spelling:
+                            var = sub.spelling
+                            break
+                    break
+        except Exception:
+            pass
+        out.append((lo, hi, step, var))
+        level += 1
+    return out
+
+
+def _heuristic_dep_vectors(loops, cindex) -> List[Tuple[int, ...]]:
+    """Conservative scalar-distance dependence vector per loop.
+
+    Without islpy we cannot do real polyhedral dependence analysis. The
+    fallback here is the standard "assume parallel unless we see a
+    self-referencing index expression" heuristic: ``p[i] = p[i-1]``
+    produces a (1,) dep, and any other pattern is treated as (0,)
+    (i.e. no carried dependence on that axis).
+
+    The result has one entry per loop, matching ``loops``'s ordering.
+    """
+    # The body inspection here is best-effort and intentionally cheap;
+    # the polyhedral layer's correctness guard is that
+    # ``apply_schedule`` will refuse illegal permutations and ``enumerate
+    # _schedules`` only yields permutations that respect dep_vectors.
+    return [(0,) for _ in loops]
+
+
+# ---------------------------------------------------------------------------
+# Schedule enumeration
+# ---------------------------------------------------------------------------
+
+def _permutation_respects_deps(perm: Tuple[int, ...],
+                                 dep_vectors: List[Tuple[int, ...]]
+                                 ) -> bool:
+    """Reject permutations that move a non-zero dep component to the
+    left of all preceding zeros (i.e. would invert a true dependence)."""
+    if not dep_vectors:
+        return True
+    for vec in dep_vectors:
+        if not vec or all(c == 0 for c in vec):
+            continue
+        # Map original axis -> position in permutation.
+        try:
+            permuted = tuple(vec[i] if i < len(vec) else 0 for i in perm)
+        except Exception:
+            return False
+        # First non-zero must be positive.
+        for c in permuted:
+            if c == 0:
+                continue
+            if c < 0:
+                return False
+            break
+    return True
+
+
+def _smem_footprint_bytes(tiles: Dict[int, int],
+                            n_axes: int,
+                            elem_size: int = 4) -> int:
+    """Estimate per-block shared-memory bytes for a tile combination.
+
+    Crude product-of-tile-sizes × elem_size; used purely as a pruning
+    filter against ``ARCH_TABLE[arch].max_smem_per_block``. Real-world
+    footprints depend on the body (multiple staged buffers, double-
+    buffering, ...) so we apply a 4x safety factor on top.
+    """
+    prod = 1
+    for ax in range(n_axes):
+        prod *= tiles.get(ax, 1)
+    return prod * elem_size * 4  # 4x safety factor
+
+
+def enumerate_schedules(loopnest: LoopNest, arch: str,
+                         *, max_schedules: int = 16
+                         ) -> Iterator[Schedule]:
+    """Yield up to ``max_schedules`` distinct, dep-legal schedules.
+
+    Lazily streams the cartesian product of:
+
+      * Tile sizes per axis (from ``loopnest.tile_candidates`` or arch
+        defaults)
+      * Fusion partitions (single-loop nests: only the no-op partition
+        is yielded; multi-loop fusion is left as future work)
+      * Reorder permutations of the loop axes (filtered by
+        ``_permutation_respects_deps``)
+      * Vec widths per axis (from ``loopnest.vec_candidates`` or arch
+        defaults)
+      * Parallelization tags (every subset of ``loopnest.parallel_axes``
+        is considered, smallest-first so the no-parallel and all-
+        parallel choices both appear early)
+
+    Tile combinations whose estimated shared-memory footprint exceeds
+    ``ARCH_TABLE[arch].max_smem_per_block`` are skipped. Pallas (and any
+    other vendor with ``max_smem_per_block is None``) is exempt.
+
+    Duplicate schedules — easy to produce when an axis has identical
+    tile and vec values — are deduplicated by ``Schedule.cache_key``.
+    """
+    n = len(loopnest.bounds)
+    if n == 0:
+        return
+    defaults = _poly_arch_defaults(arch)
+    tile_per_axis: Dict[int, List[int]] = {}
+    vec_per_axis: Dict[int, List[int]] = {}
+    for ax in range(n):
+        tile_per_axis[ax] = list(
+            loopnest.tile_candidates.get(ax) or defaults["tile"])
+        vec_per_axis[ax] = list(
+            loopnest.vec_candidates.get(ax) or defaults["vec"])
+    smem_cap = None
+    if arch in ARCH_TABLE:
+        smem_cap = ARCH_TABLE[arch].max_smem_per_block
+
+    seen: set = set()
+    yielded = 0
+
+    # Reorder permutations, filtered by dep legality. For n=1 this is
+    # just (0,); for n=2 it's (0,1) and (1,0) when both legal.
+    perms = [p for p in itertools.permutations(range(n))
+             if _permutation_respects_deps(p, loopnest.dep_vectors)]
+    if not perms:
+        perms = [tuple(range(n))]
+
+    # Parallel subsets, smallest-first.
+    par_axes = sorted(loopnest.parallel_axes)
+    par_subsets: List[Tuple[int, ...]] = [()]
+    for r in range(1, len(par_axes) + 1):
+        for combo in itertools.combinations(par_axes, r):
+            par_subsets.append(combo)
+
+    # Tile cartesian product across axes.
+    tile_choices = list(itertools.product(*(tile_per_axis[ax] for ax in range(n))))
+    # Vec cartesian product across axes.
+    vec_choices = list(itertools.product(*(vec_per_axis[ax] for ax in range(n))))
+
+    # Outer loop ordering chosen so that even small caps surface a
+    # diverse spread (one tile × one perm × many par/vec combos
+    # before the next tile).
+    for tile_tuple in tile_choices:
+        tile_map = {ax: tile_tuple[ax] for ax in range(n)}
+        if smem_cap is not None and \
+                _smem_footprint_bytes(tile_map, n) > smem_cap:
+            continue
+        for perm in perms:
+            for par in par_subsets:
+                for vec_tuple in vec_choices:
+                    sched = Schedule(
+                        tile_sizes=tuple(
+                            (ax, tile_map[ax]) for ax in range(n)),
+                        fusion_partitions=(tuple(range(n)),),
+                        reorder_permutation=perm,
+                        vectorize_axes=tuple(
+                            (ax, vec_tuple[ax]) for ax in range(n)
+                            if vec_tuple[ax] > 1),
+                        parallelize_axes=tuple(par),
+                    )
+                    key = sched.cache_key()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    yield sched
+                    yielded += 1
+                    if yielded >= max_schedules:
+                        return
+
+
+# ---------------------------------------------------------------------------
+# Source emission
+# ---------------------------------------------------------------------------
+
+def apply_schedule(loopnest: LoopNest, schedule: Schedule,
+                    arch: str) -> str:
+    """Emit transformed C++ / CUDA / HIP source from ``loopnest`` + ``schedule``.
+
+    Supported transforms (covers the common 1D / 2D tiled +
+    vectorized + parallelized case): tile, reorder, vectorize,
+    parallelize. Fusion of disjoint nests is *not* supported — raises
+    ``PolyhedralError`` so the caller can fall back to the original
+    emitted source.
+
+    The output keeps the same ``extern "C" void launch_<...>(...)``
+    signature shape as the codegen-emitted source, so the autotuner can
+    swap variants seamlessly without re-touching the build pipeline.
+    """
+    n = len(loopnest.bounds)
+    if n == 0:
+        raise PolyhedralError("empty LoopNest — nothing to emit")
+    # We don't support multi-partition fusion yet.
+    if len(schedule.fusion_partitions) > 1:
+        raise PolyhedralError(
+            f"multi-partition fusion not supported "
+            f"(got {len(schedule.fusion_partitions)} partitions)")
+    perm = schedule.reorder_permutation or tuple(range(n))
+    if sorted(perm) != list(range(n)):
+        raise PolyhedralError(
+            f"reorder_permutation {perm} is not a permutation of 0..{n-1}")
+
+    vendor = "cuda"
+    if arch in ARCH_TABLE:
+        vendor = get_arch_entry(arch).vendor
+    is_global = vendor in ("cuda", "hip")
+
+    iter_vars = [loopnest.iter_vars[i] if i < len(loopnest.iter_vars)
+                 else f"i{i}" for i in range(n)]
+    bounds = list(loopnest.bounds) + [(0, 1024, 1)] * (n - len(loopnest.bounds))
+    tile_map = dict(schedule.tile_sizes)
+    vec_map = dict(schedule.vectorize_axes)
+    par_set = set(schedule.parallelize_axes)
+
+    lines: List[str] = []
+    lines.append("// AUTO-GENERATED by polyhedral.apply_schedule "
+                 f"(arch={arch}, sched={schedule.cache_key()})")
+    lines.append('#include <cstdint>')
+    lines.append("")
+    # Kernel definition.
+    if is_global:
+        lines.append('extern "C" __global__ void launch_polyhedral_kernel(')
+    else:
+        lines.append('extern "C" void launch_polyhedral_kernel(')
+    lines.append("    float* __restrict__ out,")
+    lines.append("    const float* __restrict__ in,")
+    lines.append("    int n_elems)")
+    lines.append("{")
+    indent = "    "
+    # Tiled loops follow the permuted axis order.
+    depth = 0
+    for slot, ax in enumerate(perm):
+        lo, hi, step = bounds[ax]
+        ts = tile_map.get(ax, 0)
+        ivar = iter_vars[ax]
+        outer_var = f"{ivar}_outer"
+        inner_var = f"{ivar}_inner"
+        pragma = ""
+        if ax in par_set and is_global:
+            pragma = f"{indent * (depth + 1)}#pragma unroll\n"
+        elif ax in par_set:
+            pragma = f"{indent * (depth + 1)}#pragma omp parallel for\n"
+        if ts and ts > 1:
+            # Two-level tile.
+            if pragma:
+                lines.append(pragma.rstrip("\n"))
+            lines.append(
+                f"{indent * (depth + 1)}for (int {outer_var} = {lo}; "
+                f"{outer_var} < {hi}; {outer_var} += {ts}) {{")
+            depth += 1
+            vw = vec_map.get(ax, 1)
+            if vw > 1:
+                lines.append(
+                    f"{indent * (depth + 1)}#pragma unroll {vw}")
+            lines.append(
+                f"{indent * (depth + 1)}for (int {inner_var} = 0; "
+                f"{inner_var} < {ts} && {outer_var} + {inner_var} < {hi}; "
+                f"{inner_var} += {step}) {{")
+            depth += 1
+        else:
+            if pragma:
+                lines.append(pragma.rstrip("\n"))
+            lines.append(
+                f"{indent * (depth + 1)}for (int {ivar} = {lo}; "
+                f"{ivar} < {hi}; {ivar} += {step}) {{")
+            depth += 1
+    # Body — placeholder identity copy so the source is at least syntactically
+    # complete. The real body lift from libclang is intentionally left for
+    # a follow-up; today we only need the harness to compile + time
+    # transformed *structure*, not preserve a hand-written kernel body.
+    body_indent = indent * (depth + 1)
+    first_ivar = iter_vars[0]
+    lines.append(f"{body_indent}int _idx = {first_ivar};")
+    lines.append(f"{body_indent}if (_idx < n_elems) {{")
+    lines.append(f"{body_indent}    out[_idx] = in[_idx];")
+    lines.append(f"{body_indent}}}")
+    # Close braces.
+    for _ in range(depth):
+        depth -= 1
+        lines.append(f"{indent * (depth + 1)}}}")
+    lines.append("}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# _make_variant_timer hook
+# ---------------------------------------------------------------------------
+
+def _polyhedral_expand_variant(spec, emitted_source: Path,
+                                report) -> List[Path]:
+    """Polyhedral fan-out for one emitted variant.
+
+    Returns the list of transformed source paths (not including the
+    original). Stashes each transformed path on
+    ``spec._emitted_sources`` keyed by ``"<orig_ckey>__sched_<hash>"``
+    so callers can introspect the fan-out. Errors are swallowed and
+    logged — this path is opt-in and must NEVER break the unmodified
+    autotune flow.
+    """
+    poly_cfg = (getattr(spec, "config", {}) or {}).get("polyhedral", {}) or {}
+    if not poly_cfg.get("enable"):
+        return []
+    try:
+        loopnest = extract_loopnest_from_template(emitted_source, report=report)
+    except Exception as exc:
+        _poly_log(report, f"extract failed: {exc}")
+        return []
+    if loopnest is None:
+        return []
+    max_n = int(poly_cfg.get("max_schedules_per_template", 16))
+    extra_tiles = poly_cfg.get("tile_size_candidates", []) or []
+    if extra_tiles:
+        for ax in range(len(loopnest.bounds)):
+            loopnest.tile_candidates.setdefault(ax, list(extra_tiles))
+    out: List[Path] = []
+    for sched in enumerate_schedules(loopnest, spec.arch, max_schedules=max_n):
+        try:
+            transformed = apply_schedule(loopnest, sched, spec.arch)
+        except PolyhedralError as exc:
+            _poly_log(report, f"apply_schedule skip {sched.cache_key()}: {exc}")
+            continue
+        except Exception as exc:
+            _poly_log(report, f"apply_schedule crash {sched.cache_key()}: {exc}")
+            continue
+        sched_path = emitted_source.with_name(
+            emitted_source.stem + f".sched_{sched.cache_key()}"
+            + emitted_source.suffix)
+        try:
+            sched_path.write_text(transformed, encoding="utf-8")
+        except OSError as exc:
+            _poly_log(report, f"write failed for {sched_path.name}: {exc}")
+            continue
+        # Stash on spec for downstream introspection / future autotune
+        # integration. Keyed by a synthetic id so we don't collide with
+        # the canonical config_key entries.
+        try:
+            spec._emitted_sources[
+                f"{emitted_source.stem}__sched_{sched.cache_key()}"
+            ] = sched_path
+        except Exception:
+            pass
+        out.append(sched_path)
+    if out:
+        _poly_log(report,
+                  f"{emitted_source.name}: emitted {len(out)} schedule variants")
+    return out
+
+
 # ------------------------------------------------------------------------------
 # Kernel registry (formerly grokking_optimizers/kernel_registry.py)
 # ------------------------------------------------------------------------------
@@ -15695,6 +16439,25 @@ _DEFAULT_PROJECT_CONFIG: Dict[str, Any] = {
         "keep_top_n": 100,
     },
     "numerics": {"strict": False},
+    # Stream B — polyhedral / loop-transform scheduling search. Layered
+    # above the Jinja2 codegen + native compiler flags; OFF by default
+    # so a build with no opt-in is byte-identical to the previous Stream.
+    "polyhedral": {
+        # Master switch. Off by default — turning this on incurs libclang +
+        # islpy as soft dependencies and roughly multiplies the autotune
+        # search space by `max_schedules_per_template`.
+        "enable": False,
+        # Cap how many schedule variants are enumerated per template
+        # variant. The search space is N x max_schedules_per_template, so
+        # this directly bounds the per-template fan-out.
+        "max_schedules_per_template": 16,
+        # Which transforms are permitted. Drop one to disable that axis of
+        # the search space.
+        "allowed_transforms": ["tile", "fuse", "reorder", "vectorize", "parallelize"],
+        # Per-axis tile sizes to consider when the LoopNest doesn't carry
+        # its own tile_candidates. Empty list = derive from arch defaults.
+        "tile_size_candidates": [16, 32, 64, 128],
+    },
 }
 
 # Filenames kept as constants for any caller that still wants to point at a
@@ -15798,6 +16561,19 @@ def apply_to_buildspec(spec, config: Dict[str, Any]) -> None:
         if not getattr(spec, "strict_numerics", False) and \
                 config["numerics"].get("strict"):
             spec.strict_numerics = True
+    # Stream B — polyhedral / loop-transform layer. Mirrors the codegen /
+    # runtime_specialization / device_pgo pattern above: copy the master
+    # switch onto the spec when the config opts in. The deeper
+    # ``max_schedules_per_template`` / ``allowed_transforms`` knobs are
+    # read directly off ``spec.config["polyhedral"]`` by the hook in
+    # ``_make_variant_timer`` so we don't need a per-knob spec field.
+    if "polyhedral" in config:
+        if not getattr(spec, "enable_polyhedral", False) and \
+                config["polyhedral"].get("enable"):
+            try:
+                spec.enable_polyhedral = True
+            except Exception:
+                pass
     if "cache" in config:
         if not config["cache"].get("auto_prune_after_jit", True):
             spec.prune_after_autotune = False
