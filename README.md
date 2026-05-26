@@ -207,7 +207,7 @@ python -m grokking_optimizers.compile \
   --mode {bayesian,exhaustive} \
   --bayesian-trials 500 --top-k 20 \
   --pgo [--pgo-workload <script>] [--pgo-steps 1000] \
-  --search-space configs/search_space.yaml \
+  [--search-space <path/to/your.yaml>] \
   --cache build/.compile_cache.json \
   --runtime {aot,jit,both} [--aot-only | --jit-only] \
   [--aot-artifact-dir <path>] \
@@ -277,7 +277,11 @@ python -m grokking_optimizers.compile -O lion -M mamba -A sm_90 --mode exhaustiv
 | `--mode exhaustive` | Every config surviving the static pre-filter is built and timed. Cache flushes every 5 trials (Ctrl-C safe). |
 | `--quick` | Alias: bayesian with 25 trials. |
 
-#### Search-space YAML schema (`configs/search_space.yaml`)
+#### Search-space YAML schema
+
+The default search space is embedded in `compile.py` as the
+`DEFAULT_SEARCH_SPACE_YAML` constant. Override at runtime with
+`--search-space <path/to/your.yaml>`. Schema:
 
 ```yaml
 <arch>:
@@ -393,8 +397,6 @@ self-containment" below.
 ├── grokking_race_v2.py   (race driver — 12 optimizers × 3 models × 4 splits)
 ├── setup.py / build.sh / pyproject.toml
 ├── autotune/                   (kernel auto-tuning utilities)
-├── configs/
-│   └── search_space.yaml       (YAML-driven autotune search space per arch)
 ├── third_party/                (cutlass git submodule for WITH_CUTLASS=1)
 ├── grokking_optimizers/
 │   ├── __init__.py             (re-exports the 12 optimizers + helpers)
@@ -516,7 +518,8 @@ Dev-time companion to `setup.py`. Given an `(optimizer, model, arch)`
 triple, compiles the matching subset of `csrc/` with arch-tuned codegen,
 full LTO, and a two-phase **AOT-then-JIT autotune** with a portable JSON
 cache (v3) — all driven through ninja with `MAX_JOBS=$(nproc)`. The
-search space is YAML-driven (`configs/search_space.yaml`); the autotune
+search space is YAML-driven (embedded in `compile.py` as
+`DEFAULT_SEARCH_SPACE_YAML`; override with `--search-space <path>`); the autotune
 defaults to **Bayesian** (Optuna TPE + ±2-step neighbour refinement) and
 also supports **Exhaustive** sweeps; optional **PGO** loop instruments
 → runs a workload → rebuilds with `-fprofile-use`. AOT and JIT can run
@@ -722,7 +725,9 @@ Common requirements (all arches):
 
 #### Autotune search space (YAML-driven)
 
-The full search space lives at [`configs/search_space.yaml`](configs/search_space.yaml).
+The full search space is embedded in `compile.py` as the
+`DEFAULT_SEARCH_SPACE_YAML` constant (override at runtime with
+`--search-space <path/to/your.yaml>`).
 The targets are ~100% SM/CU utilisation: warp-aligned blocks, vector
 widths matched to the arch's load instructions, unroll factors that
 keep ILP saturated without blowing the register budget, plus the
@@ -1853,6 +1858,7 @@ and eliminate cross-module coupling:
 | `grokking_optimizers/bench_graph.py` | `compile.py` — CUDA/HIP graph capture+replay |
 | `grokking_optimizers/pgo.py` | `compile.py` — instrument/collect/use flag plumbing |
 | `scripts/pgo_workload.py` | `compile.py` — PGO workload entry point |
+| `configs/search_space.yaml` | `compile.py` — `DEFAULT_SEARCH_SPACE_YAML` constant |
 | `INTERFACES.md` | `README.md` — compile cache schema, CLI surface |
 | `docs/autotune.md` | `README.md` — autotune guide, YAML schema, PGO |
 | `docs/optimization_matrix.md` | `README.md` — optimization candidate matrix |

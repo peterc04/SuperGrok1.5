@@ -35,7 +35,8 @@ Two-phase pipeline
 
 **JIT autotune phase (target GPU only).**
 
-  1. Load the resolved search space from ``configs/search_space.yaml``.
+  1. Load the resolved search space from the embedded DEFAULT_SEARCH_SPACE_YAML
+     (override with --search-space <path/to/your.yaml>).
      Generate the cartesian product → apply static pre-filter rules →
      log the elimination count.
   2. Two autotune modes:
@@ -160,12 +161,165 @@ import yaml
 
 CACHE_VERSION = 3
 DEFAULT_CACHE_NAME = ".compile_cache.json"
-DEFAULT_SEARCH_SPACE = REPO_ROOT / "configs" / "search_space.yaml"
 DEFAULT_PGO_WORKLOAD = Path(__file__).resolve()  # absorbed from scripts/pgo_workload.py
 JIT_CACHE_FLUSH_EVERY = 5   # save cache every N completed JIT trials
 
 # How many trials Bayesian "quick" mode runs (vs the full 500 default).
 QUICK_BAYESIAN_TRIALS = 25
+
+# Embedded autotune search space (absorbed from configs/search_space.yaml).
+# Edit values to expand / contract the search space. The number of configs
+# after pre-filtering is logged at the start of every autotune run.
+# Override at runtime with --search-space <path/to/your.yaml>.
+DEFAULT_SEARCH_SPACE_YAML = """\
+# ─── NVIDIA Hopper (H100/H200) ──────────────────────────────────────────────
+sm_90:
+  dims:
+    - name: block
+      type: int
+      values: [64, 128, 256, 512, 1024]
+      macro: SG_TUNED_BLOCK_SIZE
+      applies_to: [host, device]
+    - name: vec
+      type: int
+      values: [1, 2, 4]
+      macro: SG_TUNED_VEC_WIDTH
+      applies_to: [host, device]
+    - name: unroll
+      type: int
+      values: [1, 2, 4, 8, 16]
+      macro: SG_TUNED_UNROLL
+      applies_to: [host, device]
+    - name: num_stages
+      type: int
+      values: [2, 3, 4, 5]
+      macro: SG_TUNED_NUM_STAGES
+      applies_to: [device]
+    - name: maxrregcount
+      type: int
+      values: [128, 168, 200, 232, 255]
+      macro: null
+      applies_to: [device]
+    - name: cluster_shape
+      type: tuple
+      values:
+        - [1, 1, 1]
+        - [2, 1, 1]
+        - [2, 2, 1]
+      macro: SG_TUNED_CLUSTER_SHAPE
+      applies_to: [device]
+    - name: swizzle
+      type: enum
+      values: [none, xor4, xor8]
+      macro: SG_TUNED_SWIZZLE
+      applies_to: [device]
+    - name: warp_specialization
+      type: bool
+      values: [false, true]
+      macro: SG_TUNED_WARP_SPECIALIZATION
+      applies_to: [device]
+    - name: tma
+      type: bool
+      values: [false, true]
+      macro: SG_TUNED_TMA
+      applies_to: [device]
+    - name: async_depth
+      type: int
+      values: [1, 2, 4, 8]
+      macro: SG_TUNED_ASYNC_DEPTH
+      applies_to: [device]
+  prefilter:
+    register_pressure_max: 255
+    smem_budget_bytes: 232448
+    rules:
+      - name: warps_per_block
+        expr: "(block // 32) <= 32"
+      - name: vec_block_alignment
+        expr: "block % (vec * 4) == 0"
+      - name: stages_block
+        expr: "num_stages * vec <= block // 32"
+      - name: tma_requires_block
+        expr: "(not tma) or block >= 128"
+      - name: warpspec_requires_block
+        expr: "(not warp_specialization) or block >= 128"
+      - name: cluster_volume
+        expr: "cluster_shape[0] * cluster_shape[1] * cluster_shape[2] <= 8"
+      - name: async_depth_stages
+        expr: "async_depth >= num_stages - 1"
+
+# ─── AMD CDNA3 (MI300X/MI300A) ──────────────────────────────────────────────
+gfx942:
+  dims:
+    - name: block
+      type: int
+      values: [64, 128, 256, 512, 1024]
+      macro: SG_TUNED_BLOCK_SIZE
+      applies_to: [host, device]
+    - name: vec
+      type: int
+      values: [1, 2, 4]
+      macro: SG_TUNED_VEC_WIDTH
+      applies_to: [host, device]
+    - name: unroll
+      type: int
+      values: [1, 2, 4, 8, 16]
+      macro: SG_TUNED_UNROLL
+      applies_to: [host, device]
+    - name: num_stages
+      type: int
+      values: [1, 2, 3]
+      macro: SG_TUNED_NUM_STAGES
+      applies_to: [device]
+    - name: maxrregcount
+      type: int
+      values: [128, 160, 192, 224, 256]
+      macro: null
+      applies_to: [device]
+    - name: waves_per_eu
+      type: int
+      values: [1, 2, 4, 8, 10]
+      macro: SG_TUNED_WAVES_PER_EU
+      applies_to: [device]
+    - name: lds_padding
+      type: int
+      values: [0, 1, 2, 4]
+      macro: SG_TUNED_LDS_PADDING
+      applies_to: [device]
+    - name: mfma_shape
+      type: enum
+      values: [m16n16k16, m32n32k8, m16n16k32, m32n32k16]
+      macro: SG_TUNED_MFMA_SHAPE
+      applies_to: [device]
+    - name: scheduler_hint
+      type: enum
+      values: [default, llvm, iglp_max_throughput]
+      macro: SG_TUNED_SCHEDULER_HINT
+      applies_to: [device]
+  prefilter:
+    register_pressure_max: 256
+    waves_per_eu_max: 10
+    smem_budget_bytes: 65536
+    rules:
+      - name: wave_alignment
+        expr: "block % 64 == 0"
+      - name: waves_per_block
+        expr: "(block // 64) <= 16"
+      - name: waves_per_eu_total
+        expr: "waves_per_eu * (block // 64) <= 20"
+      - name: vec_block_alignment
+        expr: "block % (vec * 4) == 0"
+      - name: mfma_block_min
+        expr: "block >= 64"
+
+# ─── TPU v5p (handled via JAX/Pallas; no C++ space) ─────────────────────────
+tpu_v5p:
+  dims: []
+  prefilter:
+    rules: []
+"""
+
+# Sentinel display value used in reports when no external YAML is supplied.
+DEFAULT_SEARCH_SPACE = "<embedded>"
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +380,24 @@ def load_yaml(path: Path) -> Dict[str, Any]:
     for arch, block in raw.items():
         _validate_arch(arch, block)
     return raw
+
+
+def load_embedded_search_space() -> Dict[str, Any]:
+    """Parse and validate the embedded DEFAULT_SEARCH_SPACE_YAML constant."""
+    raw = yaml.safe_load(DEFAULT_SEARCH_SPACE_YAML) or {}
+    if not isinstance(raw, dict):
+        raise SearchSpaceError(
+            f"embedded search-space must be a top-level dict; got {type(raw).__name__}")
+    for arch, block in raw.items():
+        _validate_arch(arch, block)
+    return raw
+
+
+def get_search_space(path: Optional[Path]) -> Dict[str, Any]:
+    """Return the search space dict; load from `path` if given, else embedded."""
+    if path is None:
+        return load_embedded_search_space()
+    return load_yaml(path)
 
 
 def _validate_arch(arch: str, block: Any) -> None:
@@ -2171,9 +2343,9 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
         report.write("  [jit-autotune] pallas backend; no C++ tuning.\n")
         return None
 
-    yaml_path = (spec.search_space_path or DEFAULT_SEARCH_SPACE)
+    yaml_path = spec.search_space_path or DEFAULT_SEARCH_SPACE
     report.write(f"  [search-space] {yaml_path}\n")
-    space = load_yaml(yaml_path)
+    space = get_search_space(spec.search_space_path)
     if spec.arch not in space:
         report.write(f"  [jit-autotune] no search space for arch={spec.arch}\n")
         return None
@@ -2399,7 +2571,7 @@ def _write_tuned_configs_header(combo: Dict[str, Any], optimizer: str,
     macros: List[str] = []
     # Try to load the space to map dim -> macro
     try:
-        space = load_yaml(DEFAULT_SEARCH_SPACE)
+        space = load_embedded_search_space()
         dims = space.get(arch, {}).get("dims", [])
     except Exception:
         dims = []
@@ -2467,9 +2639,8 @@ def build_aot(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
 
     # Resolve search-space hash (gates AOT freshness too)
     space_hash = None
-    yaml_path = spec.search_space_path or DEFAULT_SEARCH_SPACE
     try:
-        space_hash = hash_space(load_yaml(yaml_path), spec.arch)
+        space_hash = hash_space(get_search_space(spec.search_space_path), spec.arch)
     except Exception as exc:
         report.write(f"  [search-space] could not hash: {exc}\n")
 
@@ -2641,7 +2812,7 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
     extra_host: List[str] = []
     extra_device: List[str] = []
     try:
-        space = load_yaml(spec.search_space_path or DEFAULT_SEARCH_SPACE)
+        space = get_search_space(spec.search_space_path)
         dims = space.get(spec.arch, {}).get("dims", [])
         extra_host = _variant_macros(tuned, dims, "host")
         extra_device = _variant_macros(tuned, dims, "device")
@@ -2906,9 +3077,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # ── Search space + PGO ──────────────────────────────────────────
     parser.add_argument("--search-space", type=Path,
-                        default=DEFAULT_SEARCH_SPACE,
+                        default=None,
                         help="YAML search-space file "
-                             "(default: configs/search_space.yaml).")
+                             "(default: embedded DEFAULT_SEARCH_SPACE_YAML).")
     parser.add_argument("--pgo", action="store_true",
                         help="Enable 3-pass PGO loop (instrument → "
                              "workload → use). Doubles AOT compile time.")
@@ -3042,17 +3213,17 @@ def _self_test() -> int:
             shutil.rmtree(td)
 
     def test_real_yaml_loads():
-        space = load_yaml(REPO_ROOT / "configs" / "search_space.yaml")
+        space = load_embedded_search_space()
         assert "sm_90" in space
         assert "gfx942" in space
 
     def test_cartesian_counts():
-        space = load_yaml(REPO_ROOT / "configs" / "search_space.yaml")
+        space = load_embedded_search_space()
         configs = cartesian(space, "sm_90")
         assert len(configs) == 5 * 3 * 5 * 4 * 5 * 3 * 3 * 2 * 2 * 4
 
     def test_prefilter_eliminates():
-        space = load_yaml(REPO_ROOT / "configs" / "search_space.yaml")
+        space = load_embedded_search_space()
         configs = cartesian(space, "sm_90")
         survivors, eliminated = ss_prefilter(
             configs, space["sm_90"]["prefilter"])
@@ -3065,7 +3236,7 @@ def _self_test() -> int:
         assert config_key(cfg1) == config_key(cfg2)
 
     def test_hash_space_stable():
-        space = load_yaml(REPO_ROOT / "configs" / "search_space.yaml")
+        space = load_embedded_search_space()
         h1 = hash_space(space, "sm_90")
         h2 = hash_space(space, "sm_90")
         assert h1 == h2
@@ -3073,7 +3244,7 @@ def _self_test() -> int:
 
     _run("load_yaml_validates_shape", test_load_yaml_validates_shape)
     _run("load_yaml_rejects_duplicate_dim", test_load_yaml_rejects_duplicate_dim)
-    _run("real_yaml_loads", test_real_yaml_loads)
+    _run("embedded_yaml_loads", test_real_yaml_loads)
     _run("cartesian_counts", test_cartesian_counts)
     _run("prefilter_eliminates", test_prefilter_eliminates)
     _run("config_key_deterministic", test_config_key_deterministic)
