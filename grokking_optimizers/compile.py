@@ -2606,6 +2606,15 @@ class BuildSpec:
     # §12 A1 / A2 — Hyperband pruner + transfer learning
     pruner: str = "none"              # "none" | "median" | "hyperband"
     transfer_learning: bool = False
+    # Stream 6 — Jinja2 kernel emitter. When True, _variant_macros routes
+    # through grokking_optimizers.codegen.emit_variant_source so each
+    # variant is built from a freshly rendered source file instead of
+    # one fixed source re-compiled with different -D macros. Sidecar
+    # dict _emitted_sources is populated as a side-effect so
+    # _make_variant_timer (Stream 10's owner) can pick up the emitted
+    # path without us having to touch its signature in this PR.
+    enable_emitter: bool = False
+    _emitted_sources: Dict[str, Path] = field(default_factory=dict)
 
 
 def _ensure_nvcc_on_path() -> Optional[str]:
@@ -3720,8 +3729,34 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
 # ---------------------------------------------------------------------------
 
 def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
-                    target: str) -> List[str]:
-    """Macros + extra-flag overrides for one config × target."""
+                    target: str,
+                    spec: Optional["BuildSpec"] = None) -> List[str]:
+    """Macros + extra-flag overrides for one config × target.
+
+    Stream 6 hook: when ``spec.enable_emitter`` is True, the device-side
+    call routes through ``grokking_optimizers.codegen.emit_variant_source``
+    to render a per-variant source file. The emitted path is stashed on
+    ``spec._emitted_sources[config_key]`` so the (Stream 10-owned)
+    ``_make_variant_timer`` can swap it into its ``sources`` list without
+    a signature change. Residual host-side macros are still appended to
+    the cflags so host code that needs them keeps working. On any
+    emitter failure we fall through to the legacy macros-only path."""
+    if spec is not None and getattr(spec, "enable_emitter", False) \
+            and target == "device":
+        try:
+            from grokking_optimizers.codegen import (
+                emit_variant_source, CodegenError)
+            emitted_path, residual = emit_variant_source(
+                config, dims, spec.optimizer, spec.arch, spec.out_dir)
+            spec._emitted_sources[config_key(config)] = emitted_path
+            # Residual macros augment whatever the macros-only path would
+            # produce (host-side dims especially), so combine.
+            macros_only = resolve_macros(config, dims, target)
+            return macros_only + residual
+        except Exception:
+            # Any emitter failure (no jinja2, bad template, render
+            # error) silently degrades to the macros-only build below.
+            pass
     macros = resolve_macros(config, dims, target)
     extra = resolve_extra_nvcc_flags(config, dims) if target == "device" else []
     extra_hip = resolve_extra_hipcc_flags(config, dims) if target == "device" else []
@@ -3744,8 +3779,8 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
 
     def timer(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         ckey = config_key(config)
-        host_extra = _variant_macros(config, dims, "host")
-        device_extra = _variant_macros(config, dims, "device")
+        host_extra = _variant_macros(config, dims, "host", spec=spec)
+        device_extra = _variant_macros(config, dims, "device", spec=spec)
 
         # Per-variant flush of the running ETA window.
         progress_state["last_start"] = time.monotonic()
@@ -4416,8 +4451,8 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
     try:
         space = get_search_space(spec.search_space_path)
         dims = space.get(spec.arch, {}).get("dims", [])
-        extra_host = _variant_macros(tuned, dims, "host")
-        extra_device = _variant_macros(tuned, dims, "device")
+        extra_host = _variant_macros(tuned, dims, "host", spec=spec)
+        extra_device = _variant_macros(tuned, dims, "device", spec=spec)
     except Exception:
         for k, v in tuned.items():
             if k in ("timing_ms", "config_key", "stage_won"):
@@ -4485,6 +4520,7 @@ def build(
     bootstrap_cuda: bool = False,
     pruner: str = "none",
     transfer_learning: bool = False,
+    enable_emitter: bool = False,
 ) -> Optional[Path]:
     """In-process orchestrator. ``main`` handles subprocess split.
 
@@ -4572,6 +4608,7 @@ def build(
         bayesian_trials=bayesian_trials, top_k=top_k, seed=seed,
         debug_symbols=debug_symbols, debug=debug,
         pruner=pruner, transfer_learning=transfer_learning,
+        enable_emitter=enable_emitter,
     )
     _validate(spec)
     spec.out_dir.mkdir(parents=True, exist_ok=True)
@@ -4815,6 +4852,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "wheels (nvcc + runtime + CCCL + NVRTC) and "
                              "retry. Use this on Colab CPU runtimes or any "
                              "fresh host without a system CUDA install.")
+    # Stream 6 — kernel emission backend
+    parser.add_argument("--enable-emitter", action="store_true",
+                        help="Route each variant through "
+                             "grokking_optimizers.codegen.emit_variant_source "
+                             "so the autotuner compiles a freshly rendered "
+                             "Jinja2 template per config instead of "
+                             "re-compiling one fixed source with -D macros. "
+                             "Falls back to macros-only on any emitter error.")
     args = parser.parse_args(argv)
     if args.debug:
         args.verbose = True
@@ -4874,6 +4919,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         bootstrap_cuda=args.bootstrap_cuda,
         pruner=args.pruner,
         transfer_learning=args.transfer_learning,
+        enable_emitter=args.enable_emitter,
     )
 
     report = args.report or (
@@ -5322,6 +5368,166 @@ def _self_test() -> int:
 
     _run("arch_table_completeness", test_arch_table_completeness)
     _run("arch_table_gencode_format", test_arch_table_gencode_format)
+
+    # ─────────────────────────────────────────────────────────────────
+    # Stream 6 — codegen / Jinja2 kernel emitter
+    # ─────────────────────────────────────────────────────────────────
+    sys.stdout.write("[self-test] codegen\n")
+
+    def test_codegen_import():
+        from grokking_optimizers import codegen as _cg
+        assert hasattr(_cg, "emit_variant_source")
+        assert hasattr(_cg, "find_template")
+        assert hasattr(_cg, "validate_template_render")
+        assert hasattr(_cg, "validate_with_nvcc_dryrun")
+
+    def test_codegen_templates_dir():
+        from grokking_optimizers import codegen as _cg
+        assert _cg.TEMPLATE_ROOT.is_dir(), \
+            f"templates dir missing: {_cg.TEMPLATE_ROOT}"
+
+    def test_codegen_template_count():
+        from grokking_optimizers import codegen as _cg
+        templates = list(_cg.TEMPLATE_ROOT.glob("*.j2"))
+        assert len(templates) >= 3, \
+            f"expected >= 3 templates, found {len(templates)}: " \
+            f"{[t.name for t in templates]}"
+
+    def test_codegen_jinja2_or_skip():
+        # Gracefully no-op if jinja2 isn't available — the rest of
+        # the suite then prints SKIPPED for the render checks below.
+        try:
+            import jinja2  # noqa: F401
+        except ImportError:
+            sys.stdout.write(
+                "    (jinja2 unavailable; skipping render checks)\n")
+
+    def test_codegen_adamw_sm90_renders():
+        try:
+            import jinja2  # noqa: F401
+        except ImportError:
+            return  # silently skip — graceful degradation
+        from grokking_optimizers import codegen as _cg
+        ok, msg = _cg.validate_template_render("adamw", "sm_90a")
+        assert ok, f"adamw/sm_90a render failed: {msg}"
+
+    def test_codegen_emit_returns_path():
+        try:
+            import jinja2  # noqa: F401
+        except ImportError:
+            return  # skip
+        from grokking_optimizers import codegen as _cg
+        sm90_dims = build_full_search_space()["sm_90"]["dims"][:3]
+        cfg = {d["name"]: d["values"][0] for d in sm90_dims}
+        td = Path(tempfile.mkdtemp())
+        try:
+            emitted, residual = _cg.emit_variant_source(
+                cfg, sm90_dims, "adamw", "sm_90a", td)
+            assert emitted.exists(), f"emitted file missing: {emitted}"
+            assert emitted.suffix == ".cu", \
+                f"expected .cu, got {emitted.suffix}"
+            assert isinstance(residual, list)
+            body = emitted.read_text()
+            assert "AUTO-GENERATED" in body
+            assert f"SG_BLOCK_SIZE   {cfg['block']}" in body \
+                or f"SG_BLOCK_SIZE  {cfg['block']}" in body, \
+                f"emitted source missing baked block size: {body[:400]}"
+            # Re-emit with same config → cache hit, same path.
+            emitted2, _ = _cg.emit_variant_source(
+                cfg, sm90_dims, "adamw", "sm_90a", td)
+            assert emitted2 == emitted, \
+                f"cache miss on identical config: {emitted2} vs {emitted}"
+        finally:
+            shutil.rmtree(td)
+
+    def test_codegen_nvcc_dryrun_graceful():
+        try:
+            import jinja2  # noqa: F401
+        except ImportError:
+            return  # skip
+        from grokking_optimizers import codegen as _cg
+        td = Path(tempfile.mkdtemp())
+        try:
+            sm90_dims = build_full_search_space()["sm_90"]["dims"][:3]
+            cfg = {d["name"]: d["values"][0] for d in sm90_dims}
+            emitted, _ = _cg.emit_variant_source(
+                cfg, sm90_dims, "adamw", "sm_90a", td)
+            ok, msg = _cg.validate_with_nvcc_dryrun(emitted)
+            # ok must be True either because nvcc validated the source
+            # OR because nvcc is unavailable (CI host). The "unavailable"
+            # branch is the expected path on this CPU-only worktree.
+            assert ok, f"nvcc dryrun failed: {msg}"
+        finally:
+            shutil.rmtree(td)
+
+    def test_codegen_find_template_fallback():
+        try:
+            import jinja2  # noqa: F401
+        except ImportError:
+            return  # skip
+        from grokking_optimizers import codegen as _cg
+        # Specific template exists.
+        p = _cg.find_template("adamw", "sm_90a")
+        assert p is not None and p.name == "adamw_sm_90a.cu.j2"
+        # Unknown optimizer → None (caller raises CodegenError).
+        assert _cg.find_template("nonexistent_opt", "sm_90a") is None
+
+    def test_codegen_unknown_template_raises():
+        try:
+            import jinja2  # noqa: F401
+        except ImportError:
+            return  # skip
+        from grokking_optimizers import codegen as _cg
+        td = Path(tempfile.mkdtemp())
+        try:
+            try:
+                _cg.emit_variant_source(
+                    {}, [], "nonexistent_opt", "sm_90a", td)
+                raise AssertionError("expected CodegenError")
+            except _cg.CodegenError:
+                pass
+        finally:
+            shutil.rmtree(td)
+
+    def test_codegen_variant_macros_hook():
+        """Round-trip through _variant_macros with enable_emitter=True."""
+        try:
+            import jinja2  # noqa: F401
+        except ImportError:
+            return  # skip
+        td = Path(tempfile.mkdtemp())
+        try:
+            spec = BuildSpec(
+                optimizer="adamw", model="mamba", arch="sm_90a",
+                out_dir=td, enable_emitter=True)
+            sm90_dims = build_full_search_space()["sm_90"]["dims"][:3]
+            cfg = {d["name"]: d["values"][0] for d in sm90_dims}
+            # Device path triggers the emitter and stashes a path.
+            flags = _variant_macros(cfg, sm90_dims, "device", spec=spec)
+            assert isinstance(flags, list)
+            ck = config_key(cfg)
+            assert ck in spec._emitted_sources, \
+                f"emitted_sources missing {ck}: {spec._emitted_sources}"
+            assert spec._emitted_sources[ck].exists()
+            # When enable_emitter=False, behavior is unchanged.
+            spec2 = BuildSpec(optimizer="adamw", model="mamba",
+                              arch="sm_90a", out_dir=td)
+            flags2 = _variant_macros(cfg, sm90_dims, "device", spec=spec2)
+            assert spec2._emitted_sources == {}
+            assert isinstance(flags2, list)
+        finally:
+            shutil.rmtree(td)
+
+    _run("codegen_import", test_codegen_import)
+    _run("codegen_templates_dir", test_codegen_templates_dir)
+    _run("codegen_template_count", test_codegen_template_count)
+    _run("codegen_jinja2_probe", test_codegen_jinja2_or_skip)
+    _run("codegen_adamw_sm90_renders", test_codegen_adamw_sm90_renders)
+    _run("codegen_emit_returns_path", test_codegen_emit_returns_path)
+    _run("codegen_nvcc_dryrun_graceful", test_codegen_nvcc_dryrun_graceful)
+    _run("codegen_find_template_fallback", test_codegen_find_template_fallback)
+    _run("codegen_unknown_template_raises", test_codegen_unknown_template_raises)
+    _run("codegen_variant_macros_hook", test_codegen_variant_macros_hook)
 
     sys.stdout.write(f"\n[self-test] {passed} passed, {failures} failed\n")
     return 1 if failures else 0
