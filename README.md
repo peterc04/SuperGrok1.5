@@ -114,8 +114,9 @@ via arch-specific common headers.
 | Grokfast  | 🟡 | 🟡 | 3 (ema, m, v) | 12 |
 | GrokAdamW | 🟡 | 🟡 | 3 (ema, m, v) | 12 |
 
-Legend: 🟡 = written, structurally validated (143 tests pass), not compiled
-on device (no CUDA/HIP toolchain in this environment).
+Legend: 🟡 = written, structurally validated (18 inline self-tests pass via
+`python -m grokking_optimizers.compile --self-test`), not compiled on device
+(no CUDA/HIP toolchain in this environment).
 
 ### Model kernel header status
 
@@ -132,8 +133,38 @@ via arch-specific common headers.
 | Mamba-3 (SSM)       | 🟡 | 🟡 | 🟡 | 8+7 |
 | ViT                 | 🟡 | 🟡 | 🟡 | 10+8 |
 
-Legend: 🟡 = written, structurally validated (247 tests pass), not compiled
-on device (no CUDA/HIP/TPU toolchain in this environment).
+Legend: 🟡 = written, structurally validated (18 inline self-tests pass via
+`python -m grokking_optimizers.compile --self-test`), not compiled on device
+(no CUDA/HIP/TPU toolchain in this environment).
+
+### Cross-validation: optimizer × model × arch
+
+All 4 elementwise optimizers verified against all 3 models across all 3
+architectures (36 combinations total). Verification confirms: file
+existence, function signatures (`{opt}_update(`, `{opt}_kernel(`), common
+header inclusion, namespace consistency (`grokking::{arch}`), and `ParamT`
+template compatibility.
+
+| Optimizer × Model | sm_90 | gfx942 | TPU |
+|-------------------|:-----:|:------:|:---:|
+| AdamW × Decoder   | PASS | PASS | PASS |
+| AdamW × Mamba-3   | PASS | PASS | PASS |
+| AdamW × ViT       | PASS | PASS | PASS |
+| Lion × Decoder    | PASS | PASS | PASS |
+| Lion × Mamba-3    | PASS | PASS | PASS |
+| Lion × ViT        | PASS | PASS | PASS |
+| Grokfast × Decoder | PASS | PASS | PASS |
+| Grokfast × Mamba-3 | PASS | PASS | PASS |
+| Grokfast × ViT    | PASS | PASS | PASS |
+| GrokAdamW × Decoder | PASS | PASS | PASS |
+| GrokAdamW × Mamba-3 | PASS | PASS | PASS |
+| GrokAdamW × ViT   | PASS | PASS | PASS |
+
+GPU kernels share interfaces via `common_sm90.cuh` / `common_gfx942.hip.hpp`
+(NanPolicy enum, `to_float<ParamT>` / `from_float<ParamT>` conversions).
+TPU models import from `common_tpu.py` (NanPolicy IntEnum, `PARAM_DTYPE`,
+`ACCUM_DTYPE`, dtype helpers); TPU optimizers use JAX-level parameter
+updates rather than fused kernels.
 
 ---
 
@@ -183,6 +214,7 @@ python -m grokking_optimizers.compile \
   [--quick] [--no-autotune] [--no-profile] \
   [--transfer-learning] [--pruner {none,hyperband,median}] \
   [--debug-symbols] [--seed N] [-D MACRO[=VALUE]] [-v]
+  [--self-test]
 ```
 
 ### Output flag bases
@@ -269,7 +301,7 @@ the elimination count is logged as `[prefilter] N candidates → M survivors`.
 #### PGO loop (`--pgo`)
 
 Three-pass build: **instrument** (AOT with `-fprofile-generate`) →
-**collect** (run `scripts/pgo_workload.py` for N steps; profile files
+**collect** (run the built-in PGO workload for N steps; profile files
 land under `<out>/pgo_profile/`) → **use** (rebuild with
 `-fprofile-use`). The cache stores `pgo_workload_hash` and `pgo_enabled`
 as freshness factors so PGO and non-PGO artefacts are never confused.
@@ -363,32 +395,36 @@ self-containment" below.
 ├── autotune/                   (kernel auto-tuning utilities)
 ├── configs/
 │   └── search_space.yaml       (YAML-driven autotune search space per arch)
-├── scripts/                    (build / dev helpers — incl. pgo_workload.py)
-├── tests/                      (correctness tests + JAX/Triton reference impls)
-│   └── reference/
-│       └── models/
 ├── third_party/                (cutlass git submodule for WITH_CUTLASS=1)
 ├── grokking_optimizers/
 │   ├── __init__.py             (re-exports the 12 optimizers + helpers)
 │   ├── dispatch.py             (arch detection + fused kernel registry + get_ops)
-│   ├── compile.py              (targeted (opt, model, arch) ninja build +
+│   ├── compile.py              (consolidated build pipeline — ninja build +
 │   │                           AOT/JIT runtime split + Bayesian/Exhaustive
-│   │                           autotune + optional PGO loop)
+│   │                           autotune + PGO loop + YAML search space +
+│   │                           persistent timing worker + CUDA/HIP graph
+│   │                           bench + inline self-tests via --self-test)
 │   ├── profile.py              (standalone ncu / rocprof / jax.profiler capture)
-│   ├── search_space.py         (YAML loader + pre-filter + macro resolver)
-│   ├── bayesian.py             (Optuna TPE + ±2-step neighbour refinement)
-│   ├── timing_worker.py        (persistent CUDA/HIP-warm subprocess)
-│   ├── bench_graph.py          (CUDA-graph / HIP-graph capture+replay)
-│   ├── pgo.py                  (instrument / collect / use flag plumbing)
-│   ├── kernels/                (elementwise kernel headers per arch)
+│   ├── kernels/                (per-arch kernel headers)
 │   │   ├── sm_90/              (CUDA Hopper headers)
 │   │   │   ├── common_sm90.cuh           (shared NanPolicy + type-cast helpers)
 │   │   │   ├── adamw_sm90.cuh            lion_sm90.cuh
-│   │   │   └── grokfast_sm90.cuh         grokadamw_sm90.cuh
-│   │   └── gfx942/             (HIP CDNA3 headers)
-│   │       ├── common_gfx942.hip.hpp     (shared NanPolicy + type-cast helpers)
-│   │       ├── adamw_gfx942.hip.hpp      lion_gfx942.hip.hpp
-│   │       └── grokfast_gfx942.hip.hpp   grokadamw_gfx942.hip.hpp
+│   │   │   ├── grokfast_sm90.cuh         grokadamw_sm90.cuh
+│   │   │   ├── transformer_decoder_sm90.cuh
+│   │   │   ├── mamba3_sm90.cuh
+│   │   │   └── vit_sm90.cuh
+│   │   ├── gfx942/             (HIP CDNA3 headers)
+│   │   │   ├── common_gfx942.hip.hpp     (shared NanPolicy + type-cast helpers)
+│   │   │   ├── adamw_gfx942.hip.hpp      lion_gfx942.hip.hpp
+│   │   │   ├── grokfast_gfx942.hip.hpp   grokadamw_gfx942.hip.hpp
+│   │   │   ├── transformer_decoder_gfx942.hip.hpp
+│   │   │   ├── mamba3_gfx942.hip.hpp
+│   │   │   └── vit_gfx942.hip.hpp
+│   │   └── tpu/                (JAX/Pallas Python headers)
+│   │       ├── common_tpu.py             (shared NanPolicy + dtype helpers)
+│   │       ├── transformer_decoder_tpu.py
+│   │       ├── mamba3_tpu.py
+│   │       └── vit_tpu.py
 │   └── optimizers/             (11 torch.optim.Optimizer subclasses; MoE-aware
 │       │                       SG2 lives inside supergrok2.py)
 │       ├── adamw.py            grokfast.py     muon.py       prodigy.py
@@ -556,7 +592,7 @@ What runs, in order:
    artefact path / size / SHA-256 in the cache, stamp
    `aot_completed_at`, save to disk. With `--pgo`, the AOT phase runs
    the 3-pass loop **instrument → workload → use** (the workload is
-   `scripts/pgo_workload.py` by default; override via `--pgo-workload`).
+   the built-in PGO workload; override via `--pgo-workload`).
 4. **JIT autotune phase** (`--no-autotune` to skip; runs only when
    `torch.cuda.is_available()` returns `True`). Load the YAML search
    space, apply static **pre-filter** rules (alignment, occupancy
@@ -1763,7 +1799,7 @@ When this branch lands on a machine with a real sm_90 GPU and an MI300X:
 - Warp-specialized SG2 scan as a runtime-detected branch
 - CUDA Graph capture for the SG2 pipeline
 - DSMEM cross-CTA reductions wired into LookSAM / Prodigy norm kernels
-- CI matrix (no `tests/` directory at the moment)
+- CI matrix (tests are inline via `--self-test`; no external test suite)
 
 ---
 
@@ -1786,6 +1822,41 @@ To add a new optimizer:
    `grokking_optimizers/optimizers/__init__.py`.
 5. Verify import: `python -c "from grokking_optimizers import <Class>"`.
 6. Run a 20-step training loop on a tiny model to confirm convergence.
+
+### Testing
+
+Run the inline self-test suite:
+
+```bash
+python -m grokking_optimizers.compile --self-test
+```
+
+This runs 18 checks covering: YAML search space loading/validation/hashing,
+PGO workload hashing and flag plumbing, Bayesian TPE optimization and
+top-K refinement, compile cache v2→v3 migration and round-trip,
+elementwise kernel header structure (4 optimizers × 2 GPU arches), model
+kernel header existence (3 models × 3 arches), and optimizer × model
+cross-validation (file existence + size helpers for all combinations).
+
+---
+
+## Codebase consolidation
+
+The following modules were merged into `compile.py` to reduce file count
+and eliminate cross-module coupling:
+
+| Former module | Absorbed into |
+|---------------|---------------|
+| `grokking_optimizers/search_space.py` | `compile.py` — YAML loader, pre-filter, macro resolver |
+| `grokking_optimizers/bayesian.py` | `compile.py` — Optuna TPE + neighbour refinement |
+| `grokking_optimizers/timing_worker.py` | `compile.py` — persistent subprocess worker |
+| `grokking_optimizers/bench_graph.py` | `compile.py` — CUDA/HIP graph capture+replay |
+| `grokking_optimizers/pgo.py` | `compile.py` — instrument/collect/use flag plumbing |
+| `scripts/pgo_workload.py` | `compile.py` — PGO workload entry point |
+| `INTERFACES.md` | `README.md` — compile cache schema, CLI surface |
+| `docs/autotune.md` | `README.md` — autotune guide, YAML schema, PGO |
+| `docs/optimization_matrix.md` | `README.md` — optimization candidate matrix |
+| `tests/` (all files) | `compile.py --self-test` — 18 inline checks |
 
 ---
 
