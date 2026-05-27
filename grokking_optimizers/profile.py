@@ -197,19 +197,39 @@ def run_capture(cmd: List[str], report, timeout: int = 900) -> int:
 def make_progress(total: int, title: str) -> Tuple[Callable[[str], None],
                                                    Callable[[], None]]:
     """Return (step, close). Uses tqdm if available; falls back to a
-    plain ``[i/N elapsed=Xs eta=Ys]`` stderr line."""
+    plain ``[i/N elapsed=Xs eta=Ys]`` stderr line.
+
+    In Jupyter/Colab, uses ``tqdm.auto`` so the bar renders as an
+    HTML widget that updates in place. In a real TTY, regular tqdm
+    uses carriage returns. When stderr is captured (CI, redirected
+    log, or notebook without IPython display), we throttle updates
+    to one per 5 s so a long autotune loop doesn't spam thousands
+    of bar repaints into a captured log buffer.
+    """
     try:
-        from tqdm import tqdm
+        # tqdm.auto auto-detects IPython/Jupyter and picks the widget
+        # backend (single in-place HTML element) over the TTY backend
+        # (newline-per-repaint when stderr isn't a TTY).
+        from tqdm.auto import tqdm
+        # If stderr is a real TTY, tqdm's default 0.1 s mininterval
+        # is fine — carriage-return repaints are free. Otherwise
+        # throttle hard so a captured stderr doesn't accumulate one
+        # giant bar line per update.
+        is_tty = getattr(sys.stderr, "isatty", lambda: False)()
         bar = tqdm(
-            total=total, desc=title, file=sys.stderr, unit="phase",
+            total=total, desc=title, unit="phase",
             bar_format=(
                 "{l_bar}{bar}| {n_fmt}/{total_fmt} "
                 "[{elapsed}<{remaining}, {rate_fmt}] {postfix}"
             ),
+            mininterval=0.1 if is_tty else 5.0,
+            miniters=1,
+            leave=True,
+            dynamic_ncols=True,
         )
 
         def step(label: str) -> None:
-            bar.set_postfix_str(label, refresh=True)
+            bar.set_postfix_str(label, refresh=False)
             bar.update(1)
 
         def close() -> None:
