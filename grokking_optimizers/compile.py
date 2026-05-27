@@ -172,6 +172,31 @@ DEFAULT_CACHE_NAME = ".compile_cache.json"
 DEFAULT_PGO_WORKLOAD = Path(__file__).resolve()  # absorbed from scripts/pgo_workload.py
 JIT_CACHE_FLUSH_EVERY = 5   # save cache every N completed JIT trials
 
+# ---- Compile-log verbosity (Stream — debug-flags / flag-audit) ----------
+# Module-level int controlling how much per-flag detail the emission helpers
+# log. Bumped by ``--debug`` (level 1) or ``--debug-flags`` (level 2) on the
+# CLI, and consulted by ``_device_cflags`` / ``_host_cflags`` / ``_xla_env``
+# (and the version-gated probe in ``_newer_compiler_flags``) to decide whether
+# to build + dump a per-flag trace.
+#
+#   0 = silent (default; today's behaviour byte-identical)
+#   1 = trace collected when spec.debug=True or spec.debug_symbols=True
+#       (i.e. anyone already opted into debug output)
+#   2 = trace always collected and dumped to stderr — used by --debug-flags
+#
+# The trace block is one ``[device_cflags] +<flag>   reason: <why>`` line per
+# decision, then ``[device_cflags] FINAL: N flags accepted, M skipped`` at the
+# end. Same shape for [host_cflags] and [xla_env].
+_COMPILE_LOG_LEVEL: int = 0
+
+# Type alias — each tuple is (flag_repr, status, reason).
+#   flag_repr — the literal token(s) the helper would emit (or wanted to)
+#   status    — "kept" if the flag is in the final list, "skipped" if a
+#               version/feature gate vetoed it
+#   reason    — short human-readable explanation (e.g. "base nvcc, no version
+#               gate" or "gated CUDA>=12.5, have 12.0 → SKIP")
+_FlagTrace = List[Tuple[str, str, str]]
+
 
 # ---------------------------------------------------------------------------
 # ARCH_TABLE — single source of truth for every GPU / TPU architecture
@@ -6984,21 +7009,42 @@ HOST_CFLAGS_BASE = [
 # pulled into this list. There is exactly ONE ``-Xptxas --opt-level=3``
 # (the duplicate ``-Xptxas -O3`` from earlier revisions was removed —
 # nvcc treats both spellings identically and warns about the duplicate).
-# Version-gated additions (CUDA 12.0+ register-usage-level, 13.0+
-# --minimal, 12.6+ --split-compile) live in ``_newer_compiler_flags``.
+#
+# Version-gated additions live in ``_newer_compiler_flags`` (runtime
+# nvcc-version probe). The current ladder:
+#
+#   * CUDA 11.2+  : --threads 8  (already in base — universally supported
+#                   on CUDA ≥10; the flag dates from 11.2 but older nvcc
+#                   silently accepts and ignores it, so the base list is
+#                   safe).
+#   * CUDA 11.5+  : -Xptxas --def-load-cache=ca / --def-store-cache=wb
+#                   (gated to 12.0+ conservatively).
+#   * CUDA 12.3+  : -Xptxas --register-usage-level=10
+#   * CUDA 12.5+  : -Xptxas --allow-expensive-optimizations=true
+#   * CUDA 12.5+  : -Xptxas --maxrregcount-list=...
+#   * CUDA 12.6+  : --split-compile=N
+#   * CUDA 13.0+  : --minimal
+#
+# LINK-only flags (``--device-link-options=-dlto``) live in
+# ``_device_ldflags(spec)``, NEVER in this list — nvcc -c rejects them
+# at the per-TU compile step ("Unknown option").
 NVCC_DEVICE_BASE = [
     "-O3", "--use_fast_math", "-std=c++17", "-DWITH_CUDA",
     "--expt-relaxed-constexpr",
-    "--threads", "8",
+    # NOTE: ``--threads N`` is a CUDA 11.2+ flag (parallel TU compilation).
+    # Gated emission lives in ``_newer_compiler_flags``; the base list
+    # stays compatible with CUDA 11.0/11.1 (torch's minimum supported
+    # toolchain for some old PyTorch builds).
     "-Xfatbin", "-compress-all",
     # NOTE: keep exactly one PTXAS opt-level flag. ``--opt-level=3`` is the
     # documented long form; earlier revisions also had ``-Xptxas -O3`` which
     # nvcc accepted but warned was redundant.
     "-Xptxas", "--opt-level=3",
     "-Xptxas", "-v", "-Xptxas", "--warn-on-spills",
-    "-Xptxas", "--allow-expensive-optimizations=true",
-    "-Xptxas", "--def-load-cache=ca",
-    "-Xptxas", "--def-store-cache=wb",
+    # NOTE: --allow-expensive-optimizations is a CUDA 12.5+ ptxas flag.
+    # Older toolchains reject it with "Unknown option". The gated emission
+    # lives in ``_newer_compiler_flags`` (probes nvcc at runtime); keeping
+    # it out of the base list means CUDA 11/12.0–12.4 builds still succeed.
     "--extra-device-vectorization",
     "-Xcompiler", "-fPIC", "-Xcompiler", "-flto=full",
     "-Xcompiler", "-fno-strict-aliasing",
@@ -7010,11 +7056,18 @@ NVCC_DEVICE_BASE = [
     # actionable. --diag-suppress is silently ignored by older nvcc.
     "--diag-suppress=20012,20013",
     "--resource-usage",
+    # ``-dlto`` (bare, short-form) is valid at *compile* time on CUDA 11.2+
+    # whenever ``-rdc=true`` is also passed — it asks nvcc to emit the
+    # device LTO bitcode into the per-TU object. The matching
+    # ``--device-link-options=-dlto`` is a LINK-only flag and lives in
+    # ``_device_ldflags(spec)``; emitting it here would make nvcc abort
+    # the per-file compile with "Unknown option '--device-link-options=-dlto'"
+    # (nvcc -c rejects link-only options).
     "-dlto",
-    # Pin the device-link step to LTO too (idempotent with -dlto on the
-    # main line but explicit so the device link doesn't silently downgrade
-    # when the host driver passes its own --device-link-options).
-    "--device-link-options=-dlto",
+    # NOTE: --def-load-cache / --def-store-cache are CUDA 11.5+ ptxas flags
+    # but older drivers/ptxas reject them silently — gated in
+    # ``_newer_compiler_flags`` to CUDA 12.0+ (first canonical Hopper
+    # toolchain) to stay conservative.
     # Stream α: cross-TU relocatable device code is required for -dlto to
     # actually link across translation units. nvcc accepts this on every
     # CUDA toolchain ≥10; project-agnostic — single-TU builds still work
@@ -7091,17 +7144,60 @@ LDFLAGS_BASE = [
 ]
 
 
-def _host_cflags(spec: BuildSpec) -> List[str]:
+def _host_cflags(spec: BuildSpec,
+                 trace: Optional[_FlagTrace] = None) -> List[str]:
+    """Build the host-compiler flag list (g++/clang++).
+
+    When ``trace`` is supplied (or when ``spec.debug``/``spec.debug_symbols``
+    or ``_COMPILE_LOG_LEVEL>=2`` is set), the function appends one
+    ``(flag, status, reason)`` tuple per decision to the trace list AND
+    (if trace was created internally) dumps a single ``[host_cflags] ...``
+    block to stderr after the list is finalized.
+    """
     entry = get_arch_entry(spec.arch)
+    # Internal trace bookkeeping: when the caller didn't pass a trace but
+    # the verbosity gate fires, we still build one and emit the block.
+    own_trace = trace is None and _trace_enabled(spec)
+    if own_trace:
+        trace = []
+
     if entry.vendor == "pallas":
+        _trace_add(trace, "(no host cflags)", "kept",
+                   f"vendor={entry.vendor}: Pallas/XLA — no host compiler")
+        if own_trace and trace is not None:
+            _emit_flag_trace_block("host_cflags", trace)
         return []
-    base = list(HOST_CFLAGS_BASE) + [f"-D{entry.host_define}"]
+
+    base = list(HOST_CFLAGS_BASE)
+    _trace_add_many(trace, list(HOST_CFLAGS_BASE),
+                    "base host-cflag (always on)")
+    host_def = f"-D{entry.host_define}"
+    base.append(host_def)
+    _trace_add(trace, host_def, "kept",
+               f"vendor={entry.vendor} → defines {entry.host_define}")
+
     if spec.debug_symbols or spec.profile:
         base += ["-ggdb"]
-    return base + _build_macros(spec)
+        _trace_add(trace, "-ggdb", "kept",
+                   f"spec.debug_symbols={spec.debug_symbols} "
+                   f"spec.profile={spec.profile} → DWARF debug info")
+    else:
+        _trace_add(trace, "-ggdb", "skipped",
+                   "spec.debug_symbols=False spec.profile=False")
+
+    macros = _build_macros(spec)
+    if macros:
+        _trace_add_many(trace, macros,
+                        f"-D macros derived from BuildSpec "
+                        f"(macro_prefix={spec.macro_prefix!r})")
+    if own_trace and trace is not None:
+        _emit_flag_trace_block("host_cflags", trace)
+    return base + macros
 
 
-def _device_cflags(spec: BuildSpec) -> List[str]:
+def _device_cflags(spec: BuildSpec,
+                   trace: Optional[_FlagTrace] = None,
+                   *, include_version_gated: bool = False) -> List[str]:
     """Build the full per-arch device-compiler flag list.
 
     Stream 3: every arch-specific knob (gencode, offload-arch, CDNA/RDNA
@@ -7110,12 +7206,28 @@ def _device_cflags(spec: BuildSpec) -> List[str]:
     branches scattered through the file. Version-gated additions (CUDA
     12.0+ register-usage-level, CUDA 13.0+ --minimal, etc.) live in
     ``_newer_compiler_flags`` so the gate is colocated with the probe.
+
+    Stream — debug-flags: when ``trace`` is supplied or the global
+    ``_COMPILE_LOG_LEVEL>=2`` / spec debug flags are set, one
+    ``(flag, status, reason)`` tuple per decision is appended to ``trace``
+    and a ``[device_cflags] ...`` block is dumped to stderr after the list
+    is finalised. The same machinery powers the ``--flag-audit`` mode.
+
+    ``include_version_gated``: when True (the audit path) the
+    version-gated additions from ``_newer_compiler_flags`` are also appended
+    AND traced inline. Default False — the regular build path leaves that
+    job to ``_torch_load`` (which calls ``_newer_compiler_flags`` itself).
     """
     entry = get_arch_entry(spec.arch)
     feats = entry.features
+    own_trace = trace is None and _trace_enabled(spec)
+    if own_trace:
+        trace = []
 
     if entry.vendor == "cuda":
         base = list(NVCC_DEVICE_BASE)
+        _trace_add_many(trace, list(NVCC_DEVICE_BASE),
+                        "base nvcc flag (NVCC_DEVICE_BASE, no version gate)")
         # Per-arch -gencode pair (target SASS + PTX fallback) from ARCH_TABLE.
         # Stream 1 wired the SASS pair. Stream 3 guarantees a PTX fallback is
         # always present (defensive: if a future ARCH_TABLE edit drops the
@@ -7124,12 +7236,23 @@ def _device_cflags(spec: BuildSpec) -> List[str]:
         sm_num = entry.cutlass_arch
         if (sm_num is not None
                 and not any(",code=compute_" in g for g in gencodes)):
-            gencodes.append(
-                f"-gencode=arch=compute_{sm_num},code=compute_{sm_num}")
+            extra_g = f"-gencode=arch=compute_{sm_num},code=compute_{sm_num}"
+            gencodes.append(extra_g)
+            _trace_add(trace, extra_g, "kept",
+                       f"PTX fallback for compute_{sm_num} "
+                       f"(ARCH_TABLE entry lacked one)")
         base += gencodes
+        _trace_add_many(trace, list(entry.nvcc_gencode),
+                        f"-gencode per ARCH_TABLE[{spec.arch!r}].nvcc_gencode")
 
         if spec.debug_symbols or spec.profile:
             base += ["-lineinfo", "--generate-line-info"]
+            _trace_add_many(trace, ["-lineinfo", "--generate-line-info"],
+                            f"spec.debug_symbols={spec.debug_symbols} "
+                            f"spec.profile={spec.profile} → source-line PC map")
+        else:
+            _trace_add(trace, "-lineinfo --generate-line-info", "skipped",
+                       "spec.debug_symbols=False spec.profile=False")
 
         # Stream α: --keep + --keep-dir preserves the nvcc intermediates
         # (.cubin, .ptx, .fatbin, .sass dumps) under <out_dir>/nvcc_intermediate
@@ -7145,6 +7268,11 @@ def _device_cflags(spec: BuildSpec) -> List[str]:
                 # nvcc's default temp behaviour silently.
                 pass
             base += ["--keep", f"--keep-dir={keep_dir}"]
+            _trace_add(trace, f"--keep --keep-dir={keep_dir}", "kept",
+                       "spec.debug_symbols=True → preserve nvcc intermediates")
+        else:
+            _trace_add(trace, "--keep --keep-dir=<out>", "skipped",
+                       "spec.debug_symbols=False")
 
         # Stream α: --use-local-env tells nvcc to honour the cl.exe env on
         # Windows (vsdevcmd-style) instead of trying to spawn its own. No-op
@@ -7152,6 +7280,11 @@ def _device_cflags(spec: BuildSpec) -> List[str]:
         # older nvcc that doesn't recognise it.
         if sys.platform.startswith("win"):
             base += ["--use-local-env"]
+            _trace_add(trace, "--use-local-env", "kept",
+                       f"sys.platform={sys.platform!r} → Windows MSVC env")
+        else:
+            _trace_add(trace, "--use-local-env", "skipped",
+                       f"sys.platform={sys.platform!r} (Linux/macOS — no MSVC)")
 
         # CUTLASS integration: emit both the legacy single-arch token and
         # the modern multi-arch list (CUTLASS_NVCC_ARCHS_SUPPORTED). The
@@ -7438,6 +7571,215 @@ def _probe_hipcc_version() -> Optional[Tuple[int, int]]:
     if not m:
         return None
     return int(m.group(1)), int(m.group(2))
+
+
+# ---------------------------------------------------------------------------
+# Extended toolchain version strings (Stream — debug-flags)
+# ---------------------------------------------------------------------------
+# The (major, minor) probes above suffice for version-gate dispatch, but the
+# debug banner and the build-failure summary want the FULL version string
+# ("nvcc 12.0.r12.0 (compiler.32267302_0)"), so users can spot e.g. a stale
+# nvcc binary on PATH versus the system CUDA they think they have.
+
+def _probe_nvcc_version_string() -> Optional[str]:
+    """Return the full ``nvcc --version`` first-non-banner line, or None."""
+    nvcc = shutil.which("nvcc")
+    if not nvcc:
+        return None
+    try:
+        out = subprocess.check_output([nvcc, "--version"], text=True,
+                                      timeout=10, stderr=subprocess.STDOUT)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    # The interesting line is "Cuda compilation tools, release 12.0, V12.0.85"
+    # or on newer toolchains "Build cuda_12.0.r12.0/compiler.32267302_0".
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    summary_bits: List[str] = []
+    for ln in lines:
+        if "release" in ln.lower() or "build" in ln.lower():
+            summary_bits.append(ln)
+    if summary_bits:
+        return " | ".join(summary_bits)
+    return lines[0] if lines else None
+
+
+def _probe_hipcc_version_string() -> Optional[str]:
+    """Return the full ``hipcc --version`` first-non-banner line, or None."""
+    hipcc = shutil.which("hipcc")
+    if not hipcc:
+        return None
+    try:
+        out = subprocess.check_output([hipcc, "--version"], text=True,
+                                      timeout=10, stderr=subprocess.STDOUT)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    summary_bits: List[str] = []
+    for ln in lines:
+        low = ln.lower()
+        if ("hip version" in low or "rocm" in low
+                or "amd clang" in low or "llvm version" in low):
+            summary_bits.append(ln)
+    if summary_bits:
+        return " | ".join(summary_bits)
+    return lines[0] if lines else None
+
+
+def _probe_jax_version_string() -> Optional[str]:
+    """Return ``jax.__version__`` + jaxlib version, or None on import failure."""
+    try:
+        import jax  # type: ignore
+    except Exception:
+        return None
+    bits: List[str] = []
+    try:
+        bits.append(f"jax {jax.__version__}")
+    except Exception:
+        pass
+    try:
+        import jaxlib  # type: ignore
+        bits.append(f"jaxlib {jaxlib.__version__}")
+    except Exception:
+        pass
+    return " | ".join(bits) if bits else None
+
+
+def _disk_free_human(path: Path) -> str:
+    """Return ``<free>/<total>`` (e.g. ``"12.3GiB/512.0GiB"``) for ``path``
+    via ``shutil.disk_usage``. Returns ``"<unknown>"`` on any error
+    (path doesn't exist, permission denied, etc.)."""
+    try:
+        usage = shutil.disk_usage(str(path))
+    except (OSError, FileNotFoundError):
+        # Walk up to the nearest existing parent — useful for not-yet-created
+        # out_dirs / cache dirs.
+        try:
+            p = Path(path)
+            while not p.exists() and p.parent != p:
+                p = p.parent
+            if p.exists():
+                usage = shutil.disk_usage(str(p))
+            else:
+                return "<unknown>"
+        except Exception:
+            return "<unknown>"
+
+    def _h(n: int) -> str:
+        for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+            if n < 1024.0:
+                return f"{n:.1f}{unit}"
+            n = int(n / 1024)
+        return f"{n:.1f}PiB"
+
+    return f"{_h(usage.free)}/{_h(usage.total)}"
+
+
+# ---------------------------------------------------------------------------
+# Flag trace emit + format (Stream — debug-flags)
+# ---------------------------------------------------------------------------
+# Trace pattern: helpers below append (flag_repr, status, reason) tuples to
+# an optional ``trace`` list. ``_emit_flag_trace_block`` then formats and
+# writes a block-style log to a stream (sys.stderr by default).
+
+def _trace_add(trace: Optional[_FlagTrace],
+               flag_repr: str, status: str, reason: str) -> None:
+    """Append ``(flag_repr, status, reason)`` to ``trace`` if non-None.
+    Status is one of ``"kept"`` (flag landed in the final list) or
+    ``"skipped"`` (a gate vetoed it)."""
+    if trace is None:
+        return
+    trace.append((flag_repr, status, reason))
+
+
+def _trace_add_many(trace: Optional[_FlagTrace],
+                    flags: List[str], reason: str,
+                    *, status: str = "kept") -> None:
+    """Convenience: trace every token in ``flags`` with the same reason."""
+    if trace is None:
+        return
+    for f in flags:
+        trace.append((f, status, reason))
+
+
+def _trace_add_pair(trace: Optional[_FlagTrace],
+                    pair: List[str], reason: str,
+                    *, status: str = "kept") -> None:
+    """Trace a multi-token group (e.g. ``["-Xptxas", "--warn-on-spills"]``)
+    as a single entry — keeps the trace readable when ``-Xptxas`` is the
+    chooser prefix for a sub-flag."""
+    if trace is None:
+        return
+    if not pair:
+        return
+    trace.append((" ".join(pair), status, reason))
+
+
+def _emit_flag_trace_block(label: str,
+                           trace: _FlagTrace,
+                           stream=None) -> None:
+    """Print a single block ``[label] ...`` of trace lines to ``stream``.
+
+    Each line:
+      ``[label] +<flag>     reason: <why>``           when kept
+      ``[label] -SKIP <flag>  reason: <why>``         when skipped
+
+    Plus a final summary:
+      ``[label] FINAL: N flags accepted, M skipped due to version gates``
+
+    ``label`` is the bracketed prefix — e.g. ``"device_cflags"``,
+    ``"host_cflags"``, ``"xla_env"``.
+    """
+    if stream is None:
+        stream = sys.stderr
+    if not trace:
+        stream.write(f"[{label}] (no flag decisions recorded)\n")
+        return
+    kept = 0
+    skipped = 0
+    # Compute alignment width across all flag tokens for tidy output.
+    max_flag_w = 0
+    for flag_repr, status, _reason in trace:
+        token = (f"+{flag_repr}" if status == "kept"
+                 else f"-SKIP {flag_repr}")
+        if len(token) > max_flag_w:
+            max_flag_w = len(token)
+    max_flag_w = min(max_flag_w, 60)  # cap so a runaway flag doesn't blow up
+    for flag_repr, status, reason in trace:
+        if status == "kept":
+            token = f"+{flag_repr}"
+            kept += 1
+        else:
+            token = f"-SKIP {flag_repr}"
+            skipped += 1
+        stream.write(f"[{label}] {token:<{max_flag_w}}  reason: {reason}\n")
+    stream.write(
+        f"[{label}] FINAL: {kept} flags accepted, "
+        f"{skipped} skipped due to version gates\n")
+    try:
+        stream.flush()
+    except Exception:
+        pass
+
+
+def _trace_enabled(spec: Optional["BuildSpec"]) -> bool:
+    """Return True iff the per-helper trace machinery should run.
+
+    Honours both the global ``_COMPILE_LOG_LEVEL`` and per-spec flags
+    (``spec.debug`` / ``spec.debug_symbols``). When called with ``spec=None``
+    the global level alone decides — useful for ``--flag-audit`` which
+    builds a throwaway spec per arch but wants the trace unconditionally.
+    """
+    if _COMPILE_LOG_LEVEL >= 2:
+        return True
+    if spec is None:
+        return _COMPILE_LOG_LEVEL >= 1
+    if _COMPILE_LOG_LEVEL >= 1:
+        return True
+    try:
+        return bool(getattr(spec, "debug", False)
+                    or getattr(spec, "debug_symbols", False))
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
