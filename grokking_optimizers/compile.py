@@ -200,6 +200,143 @@ _FlagTrace = List[Tuple[str, str, str]]
 
 
 # ---------------------------------------------------------------------------
+# Optional dependency auto-install — used by every opt-in feature toggle
+# ---------------------------------------------------------------------------
+#
+# Project-agnostic UX fix: when a user opts into a feature whose Python
+# dependency isn't installed (cuda-python for NVRTC, jinja2 for the
+# emitter, scikit-learn for the cost model, libclang for the polyhedral
+# layer) the original behavior was to silently skip the feature with a
+# terse log line. That's bad UX — the user has to read the source to
+# discover *why* their toggle didn't take effect.
+#
+# ``_ensure_optional_dep`` makes the wrapper try to install the missing
+# package once (via ``pip install --quiet <pkg>``) and then retry the
+# import. If install fails (offline, locked pip, no network) the call
+# falls back to a *clearly actionable* skip log block that names the
+# exact ``pip install`` command and the CLI flag to suppress the message.
+#
+# Auto-install is on by default (``BuildSpec.auto_install_optional_deps``)
+# because the only users hit by missing-dep skips are the ones who
+# explicitly enabled the feature in the first place. ``--no-auto-install``
+# on the CLI flips it off for CI / offline / air-gapped environments.
+#
+# A module-level ``_DEP_CHECKED`` cache deduplicates work: each
+# (pkg, install) tuple is probed at most once per process. The cache is
+# cleared by the self-tests so they can simulate fresh state without
+# touching the user's environment.
+
+_DEP_CHECKED: Dict[Tuple[str, bool], bool] = {}
+_DEP_LOCK = threading.Lock()
+
+
+def _ensure_optional_dep(pkg: str, feature: str,
+                         *, install: bool = True,
+                         pip_name: Optional[str] = None) -> bool:
+    """Probe (and optionally pip-install) an optional dependency.
+
+    Try to ``importlib.import_module(pkg)``. If that succeeds, return
+    True immediately. If it fails:
+
+      * ``install=False``  → log a one-line actionable skip and return
+        False without touching pip.
+      * ``install=True``   → attempt ``pip install --quiet <pip_name>``
+        (defaults to ``pkg``) once with a 120 s timeout, then retry the
+        import. Return True if the retry succeeds, False otherwise.
+
+    Every step is logged to stderr with the ``[deps]`` prefix and the
+    feature tag so a build log makes it obvious which knob asked for
+    which package. Successful auto-installs are cached per-process so a
+    second call for the same (pkg, install) tuple is free.
+
+    Designed to be safe to call from cold paths (the slow case is the
+    pip subprocess, gated by ``install`` and the cache) and from hot
+    paths (the cache turns subsequent hits into a dict lookup + a single
+    importlib call).
+    """
+    cache_key = (pkg, bool(install))
+    with _DEP_LOCK:
+        cached = _DEP_CHECKED.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # Fast path — already importable.
+    try:
+        importlib.import_module(pkg)
+        with _DEP_LOCK:
+            _DEP_CHECKED[cache_key] = True
+        return True
+    except ImportError:
+        pass
+
+    pip_target = pip_name or pkg
+    if not install:
+        sys.stderr.write(
+            f"[deps] {feature}: {pkg} not installed — skipping. "
+            f"To enable: pip install {pip_target} "
+            f"(or pass --auto-install / set "
+            f"BuildSpec.auto_install_optional_deps=True).\n")
+        with _DEP_LOCK:
+            _DEP_CHECKED[cache_key] = False
+        return False
+
+    sys.stderr.write(
+        f"[deps] {feature}: {pkg} missing — attempting "
+        f"pip install {pip_target}...\n")
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", pip_target],
+            check=True, timeout=120)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError, OSError) as exc:
+        sys.stderr.write(
+            f"[deps] {feature}: pip install {pip_target} failed ({exc}); "
+            f"skipping. To enable manually:\n"
+            f"[deps]   pip install {pip_target}\n"
+            f"[deps] Or pass --no-auto-install to silence this attempt.\n")
+        with _DEP_LOCK:
+            _DEP_CHECKED[cache_key] = False
+        return False
+
+    try:
+        importlib.import_module(pkg)
+    except ImportError as exc:
+        sys.stderr.write(
+            f"[deps] {feature}: {pkg} installed but import still fails "
+            f"({exc}); skipping.\n")
+        with _DEP_LOCK:
+            _DEP_CHECKED[cache_key] = False
+        return False
+    sys.stderr.write(
+        f"[deps] {feature}: {pkg} installed and ready.\n")
+    with _DEP_LOCK:
+        _DEP_CHECKED[cache_key] = True
+    return True
+
+
+# Module-level switch. Set by ``build()`` / CLI from the BuildSpec field
+# of the same name BEFORE any feature-gated import runs. Defaults to
+# True so the README quickstart works for a user who enables a feature
+# without pre-installing every soft dep. ``--no-auto-install`` (CLI) or
+# ``BuildSpec(auto_install_optional_deps=False)`` flips this off for CI
+# / offline / air-gapped builds.
+_AUTO_INSTALL_OPTIONAL_DEPS: bool = True
+
+
+def _auto_install_enabled() -> bool:
+    """Read the process-wide auto-install switch."""
+    return bool(_AUTO_INSTALL_OPTIONAL_DEPS)
+
+
+def _set_auto_install(enabled: bool) -> None:
+    """Set the process-wide auto-install switch. Called by ``build()`` /
+    CLI before any feature-gated import. Thread-safe (single assignment
+    to a module global; no compound state)."""
+    global _AUTO_INSTALL_OPTIONAL_DEPS
+    _AUTO_INSTALL_OPTIONAL_DEPS = bool(enabled)
+
+
+# ---------------------------------------------------------------------------
 # ARCH_TABLE — single source of truth for every GPU / TPU architecture
 # ---------------------------------------------------------------------------
 #
@@ -3663,8 +3800,17 @@ class CostModel:
         """Lazy backend selection. Tries XGBoost first, falls back to
         sklearn, then to a heuristic linear regressor (numpy-only).
         Returns a factory ``() -> fresh_estimator`` plus the backend
-        name. The factory is reused for bootstrap mini-models."""
-        # Try XGBoost.
+        name. The factory is reused for bootstrap mini-models.
+
+        Auto-install: when xgboost / sklearn aren't importable but the
+        process-wide auto-install switch is on, attempts ``pip install
+        scikit-learn`` once before falling back to the numpy-linear
+        ridge regressor. xgboost is deliberately NOT auto-installed
+        (heavy CUDA-linked wheels); the fallback chain handles its
+        absence gracefully.
+        """
+        # Try XGBoost (no auto-install — too heavy; the fallback chain
+        # below covers its absence).
         try:
             import xgboost as xgb
             def _factory():
@@ -3677,18 +3823,30 @@ class CostModel:
             pass
         except Exception:
             pass
-        # Try sklearn.
-        try:
-            from sklearn.ensemble import GradientBoostingRegressor
-            def _factory_sk():
-                return GradientBoostingRegressor(
-                    n_estimators=128, max_depth=4, learning_rate=0.1,
-                    random_state=0)
-            return _factory_sk, "sklearn"
-        except ImportError:
-            pass
-        except Exception:
-            pass
+        # Try sklearn — auto-install on miss when the process-wide
+        # switch is on. The Python package name is ``sklearn`` but the
+        # pip distribution name is ``scikit-learn``.
+        if _ensure_optional_dep(
+                "sklearn", "cost_model",
+                install=_auto_install_enabled(),
+                pip_name="scikit-learn"):
+            try:
+                from sklearn.ensemble import GradientBoostingRegressor
+                def _factory_sk():
+                    return GradientBoostingRegressor(
+                        n_estimators=128, max_depth=4, learning_rate=0.1,
+                        random_state=0)
+                return _factory_sk, "sklearn"
+            except ImportError:
+                pass
+            except Exception:
+                pass
+        else:
+            sys.stderr.write(
+                "[cost_model] sklearn unavailable and auto-install off "
+                "or failed; falling back to numpy-linear ridge regressor.\n"
+                "[cost_model]   pip install scikit-learn   "
+                "# to enable the boosted-tree backend\n")
         # Heuristic linear fallback — numpy-only ridge regression.
         def _factory_linear():
             return _LinearRidgeRegressor(alpha=1e-2)
@@ -5502,6 +5660,15 @@ class BuildSpec:
     # effect so downstream consumers (preflight, dry-run manifest) can
     # report on what was filtered without re-running the probe.
     flag_probe_dropped: List[Tuple[str, str]] = field(default_factory=list)
+    # ─── Optional-dependency auto-install ─────────────────────────────
+    # When True (default), an opt-in feature whose Python dep is missing
+    # tries ``pip install <dep>`` once before falling back to the
+    # graceful-skip path. Set to False for CI / offline / air-gapped
+    # builds where unexpected network/pip calls are unacceptable. Wired
+    # into _ensure_optional_dep via _set_auto_install() at the top of
+    # ``build()`` so every feature site (NVRTC, jinja2 emitter,
+    # learned cost model, polyhedral / libclang) sees the same switch.
+    auto_install_optional_deps: bool = True
 
 
 def _ensure_nvcc_on_path() -> Optional[str]:
@@ -16600,12 +16767,24 @@ class CodegenError(RuntimeError):
 
 
 def _jinja_env():
-    """Construct a Jinja2 Environment backed by the bundled-template dict."""
-    try:
-        import jinja2
-    except ImportError as exc:
+    """Construct a Jinja2 Environment backed by the bundled-template dict.
+
+    When jinja2 isn't importable, the auto-install layer
+    (``_ensure_optional_dep``) tries ``pip install jinja2`` once before
+    falling through to the actionable-skip CodegenError. The caller
+    (e.g. ``_variant_macros`` with ``spec.enable_emitter=True``) catches
+    that exception and degrades to the macros-only legacy path.
+    """
+    ok = _ensure_optional_dep(
+        "jinja2", "emitter", install=_auto_install_enabled())
+    if not ok:
         raise CodegenError(
-            "codegen requires jinja2 — pip install jinja2") from exc
+            "[emitter] codegen SKIPPED — jinja2 not installed. To enable:\n"
+            "[emitter]   pip install jinja2\n"
+            "[emitter] Or pass --no-emitter to silence this message.\n"
+            "[emitter] Or pass --auto-install (default ON in build()) "
+            "to install it automatically.")
+    import jinja2  # safe — _ensure_optional_dep just guaranteed it.
     return jinja2.Environment(
         loader=jinja2.DictLoader(_BUNDLED_TEMPLATES),
         undefined=jinja2.StrictUndefined,
@@ -17419,11 +17598,33 @@ def _try_import_libclang():
     bindings are notoriously brittle (wrong .so version, missing
     LD_LIBRARY_PATH, ...) so we wrap the import + the Index construction
     in a single try/except and return None on any failure.
+
+    Auto-install: when the ``clang`` Python package isn't importable and
+    the process-wide auto-install switch is on, we attempt
+    ``pip install libclang`` (the wheel name) once before giving up.
+    The Index.create() probe still runs after install — a wheel can be
+    installed yet still fail to find ``libclang.so`` if the system is
+    missing the runtime library entirely; in that case the polyhedral
+    layer falls through to its honest "schedule shape only; libclang
+    absent" path (Stream γ).
     """
     try:
         from clang import cindex  # type: ignore
     except Exception:
-        return None
+        # Try to auto-install libclang. The pip distribution name is
+        # ``libclang``; once installed, the wheel ships a ``clang``
+        # Python package + bundled ``libclang.so`` so the second import
+        # attempt below usually succeeds.
+        ok = _ensure_optional_dep(
+            "clang", "polyhedral",
+            install=_auto_install_enabled(),
+            pip_name="libclang")
+        if not ok:
+            return None
+        try:
+            from clang import cindex  # type: ignore
+        except Exception:
+            return None
     # Index construction is what actually loads libclang.so; it can
     # raise LibclangError even when the import succeeded.
     try:
