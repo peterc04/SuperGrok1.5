@@ -11466,10 +11466,104 @@ def _spawn_phase(argv: List[str], phase: str) -> int:
     return subprocess.call(cmd, env=os.environ.copy())
 
 
+def _flag_audit_main(argv: List[str]) -> int:
+    """Implementation of the ``--flag-audit`` CLI mode.
+
+    Iterates every canonical arch in ARCH_TABLE, runs the four flag-emission
+    helpers (``_host_cflags`` / ``_device_cflags`` / ``_ldflags`` /
+    ``_xla_env``) with a trace list, and prints one block-style section per
+    arch. Writes ``<out>/flag_audit.txt`` and echoes to stdout.
+    """
+    fa_parser = argparse.ArgumentParser(add_help=False)
+    fa_parser.add_argument("--flag-audit", action="store_true",
+                           dest="flag_audit")
+    fa_parser.add_argument("--out", type=Path, default=None)
+    fa_args, _ = fa_parser.parse_known_args(argv)
+    out_dir = Path(fa_args.out or REPO_ROOT / "build" / "compiled").resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    audit_path = out_dir / "flag_audit.txt"
+    try:
+        audit_fh = open(audit_path, "w")
+    except OSError as exc:
+        sys.stderr.write(
+            f"[flag-audit] could not open {audit_path}: {exc}\n")
+        return 2
+    try:
+        import io as _io
+        nv_str = _probe_nvcc_version_string() or "<not on PATH>"
+        hip_str = _probe_hipcc_version_string() or "<not on PATH>"
+        jax_str = _probe_jax_version_string() or "<not importable>"
+        for _stream in (sys.stdout, audit_fh):
+            _stream.write("=" * 72 + "\n")
+            _stream.write(
+                "grokking_optimizers.compile  --flag-audit  "
+                f"({datetime.datetime.now().isoformat()})\n")
+            _stream.write(f"detected nvcc : {nv_str}\n")
+            _stream.write(f"detected hipcc: {hip_str}\n")
+            _stream.write(f"detected jax  : {jax_str}\n")
+            _stream.write("=" * 72 + "\n\n")
+        canonical_for: Dict[int, str] = {}
+        for _k, _v in ARCH_TABLE.items():
+            canonical_for.setdefault(id(_v), _k)
+        for arch in sorted(canonical_for.values()):
+            entry = ARCH_TABLE[arch]
+            for _stream in (sys.stdout, audit_fh):
+                _stream.write(
+                    f"==== {arch} (vendor={entry.vendor}) ====\n")
+                if entry.vendor == "cuda":
+                    _stream.write(f"  detected: nvcc {nv_str}\n")
+                elif entry.vendor == "hip":
+                    _stream.write(f"  detected: hipcc {hip_str}\n")
+                elif entry.vendor == "pallas":
+                    _stream.write(f"  detected: {jax_str}\n")
+            spec = BuildSpec(
+                optimizer="adamw", model="mamba3", arch=arch,
+                out_dir=out_dir, runtime="aot",
+                autotune=False, profile=False, debug=True,
+            )
+            for label, fn in (
+                ("host_cflags",
+                 lambda t: _host_cflags(spec, trace=t)),
+                ("device_cflags",
+                 lambda t: _device_cflags(spec, trace=t,
+                                          include_version_gated=True)),
+                ("ldflags",
+                 lambda t: _ldflags(spec, trace=t)),
+                ("xla_env",
+                 lambda t: _xla_env(arch, out_dir, trace=t)),
+            ):
+                trace: _FlagTrace = []
+                try:
+                    fn(trace)
+                except Exception as _exc:
+                    trace.append(
+                        (f"(EXC: {type(_exc).__name__}: {_exc})",
+                         "skipped", "helper raised — sweep continues"))
+                buf = _io.StringIO()
+                _emit_flag_trace_block(label, trace, stream=buf)
+                txt = buf.getvalue()
+                for _stream in (sys.stdout, audit_fh):
+                    _stream.write(txt)
+            for _stream in (sys.stdout, audit_fh):
+                _stream.write("\n")
+        audit_fh.flush()
+    finally:
+        audit_fh.close()
+    sys.stdout.write(f"[flag-audit] wrote {audit_path}\n")
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     _argv = list(argv) if argv is not None else sys.argv[1:]
     if "--self-test" in _argv:
         return _self_test()
+    # Stream — debug-flags: bump _COMPILE_LOG_LEVEL globally BEFORE any
+    # early-intercept path runs, so --flag-audit and the regular build
+    # path all see the bumped level.
+    if "--debug-flags" in _argv or "--verbose-flags" in _argv:
+        globals()["_COMPILE_LOG_LEVEL"] = 2
+    if "--flag-audit" in _argv:
+        return _flag_audit_main(_argv)
     # Stream H — handle --e2e-smoke before argparse so we don't need to
     # supply the required --optimizer / --model / --arch triple (the smoke
     # test detects them itself).
@@ -11789,6 +11883,27 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "Incurs libclang + islpy as soft dependencies and "
                              "roughly multiplies the autotune fan-out by "
                              "polyhedral.max_schedules_per_template.")
+    # Optional-dependency auto-install — wires into _ensure_optional_dep
+    # at every feature site (NVRTC / Jinja2 emitter / cost model /
+    # libclang). On by default so the README quickstart works on a
+    # fresh host; the flag below flips it off for CI / offline /
+    # air-gapped environments where unexpected pip calls are
+    # unacceptable.
+    _ai = parser.add_mutually_exclusive_group()
+    _ai.add_argument("--auto-install", dest="auto_install_optional_deps",
+                     action="store_true", default=True,
+                     help="Auto-install soft Python deps when an opt-in "
+                          "feature toggle (e.g. --enable-runtime-"
+                          "specialization, --enable-emitter, --enable-"
+                          "polyhedral) needs one that isn't installed. "
+                          "Runs ``pip install <dep>`` once per process. "
+                          "Default ON.")
+    _ai.add_argument("--no-auto-install", dest="auto_install_optional_deps",
+                     action="store_false",
+                     help="Disable auto-install of soft Python deps. "
+                          "Feature toggles whose dep is missing degrade "
+                          "to an actionable skip log line. Use this for "
+                          "CI / offline / air-gapped builds.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Single-arch dry run: produce one preflight + "
                              "source-resolution + flag-emission manifest for the "
@@ -12056,6 +12171,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         strict_numerics=args.strict_numerics,
         enable_synth_codegen=args.enable_synth_codegen,
         enable_polyhedral=args.enable_polyhedral,
+        auto_install_optional_deps=bool(
+            getattr(args, "auto_install_optional_deps", True)),
     )
 
     report = args.report or (
