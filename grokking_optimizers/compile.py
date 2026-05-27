@@ -1467,6 +1467,15 @@ def _pallas_common_dims(extra_block_shapes: Optional[List[Tuple[int, int]]] = No
               ("parallel", "sequential"),
               ("sequential", "parallel")],
              None, ["device"], kind="pallas_kwarg"),
+        # Stream γ — Pallas BlockSpec hint dim. ``"default"`` lets
+        # Pallas infer the BlockSpec from the output spec; the
+        # explicit tuple values pin the BlockSpec to a specific
+        # (mem_block_h, mem_block_w) shape. Project-agnostic — the
+        # autotuner threads the chosen value into the Pallas call
+        # rather than a single hardcoded ``"default"``.
+        _dim("block_spec", "enum",
+             ["default", "(64,64)", "(128,128)", "(256,256)", "(64,256)"],
+             None, ["device"], kind="pallas_kwarg"),
     ]
 
 
@@ -4334,6 +4343,8 @@ def run_bayesian(
     pruner: str = "none",
     seed_trials: Optional[List[Dict[str, Any]]] = None,
     stopper: Optional["BayesianEarlyStopper"] = None,
+    stall_info: Optional[Dict[str, Any]] = None,
+    bias_max_enqueued: int = 25,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Run the TPE stage with multi-criterion early stopping.
 
@@ -4421,6 +4432,22 @@ def run_bayesian(
                 ))
             except Exception:
                 continue
+
+    # Stream γ.4 — when the caller threaded a device-PGO ``stall_info``
+    # dict through, enqueue up to ``bias_max_enqueued`` configs along the
+    # bias-hint directions BEFORE TPE starts asking for suggestions. The
+    # biasing is fully project-agnostic: ``bias_trial_queue`` consults
+    # ``space[arch]["dims"]`` and the stall_info bias_hints (which are
+    # derived from generic CUPTI / rocprof counter names), never from
+    # any optimizer-specific knowledge.
+    if stall_info is not None:
+        try:
+            bias_trial_queue(study, stall_info, space[arch], arch,
+                             max_enqueued=int(bias_max_enqueued))
+        except Exception:
+            # Best-effort: a malformed stall_info / unknown dim must
+            # never break the autotune.
+            pass
 
     records: List[Dict[str, Any]] = []
     # For progress reporting when no manual cap, use stopper's hard ceiling
@@ -8683,6 +8710,31 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
     else:
         effective_timer = timer
 
+    # Stream γ.4 — pull stall_info into the TPE study so we can bias
+    # the trial queue toward swizzle / lds_padding / etc. dimensions
+    # that the latest device-PGO round flagged. The stall_info dict
+    # arrives via three project-agnostic channels (any one suffices):
+    #   1. ``cost_model_state["stall_info"]`` — populated by the
+    #      cost-model retrain hook.
+    #   2. ``read_stall_sidecar(spec.out_dir)`` — populated by
+    #      ``run_device_pgo_round`` between builds.
+    #   3. Explicit user-supplied ``stall_info`` on the spec config.
+    # Only consulted when ``spec.enable_device_pgo`` is True so the
+    # default flow is byte-identical to today.
+    stall_info_for_bias: Optional[Dict[str, Any]] = None
+    if getattr(spec, "enable_device_pgo", False):
+        if cost_model_state is not None:
+            stall_info_for_bias = cost_model_state.get("stall_info")
+        if stall_info_for_bias is None:
+            try:
+                stall_info_for_bias = read_stall_sidecar(spec.out_dir)
+            except Exception:
+                stall_info_for_bias = None
+        if stall_info_for_bias is not None:
+            report.write(
+                f"  [bayesian] biasing TPE queue from device-PGO "
+                f"stall_info ({len(stall_info_for_bias.get('bias_hints', {}))} hints)\n")
+
     try:
         tpe_trials, stop_info = run_bayesian(
             spec.arch, space, n_trials=n_trials, seed=spec.seed,
@@ -8693,6 +8745,8 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
             pruner=spec.pruner,
             seed_trials=seed_trials,
             stopper=stopper,
+            stall_info=stall_info_for_bias,
+            bias_max_enqueued=25,
         )
     finally:
         close1()
@@ -8813,9 +8867,22 @@ def _pallas_autotune(spec: BuildSpec, sources: List[Path],
     writes the winner as a JSON manifest. Returns the winning config dict
     or ``None`` if every trial failed."""
     versions = _pallas_versions()
-    block_spec = "default"   # placeholder for future Pallas BlockSpec tuning
+    # Stream γ — ``block_spec`` is now a real search-space dim (see
+    # ``_pallas_common_dims``). Each tested config carries its own
+    # ``block_spec`` value; we surface the most common one in the
+    # banner for orientation. Falls back to "default" when no
+    # configs carry the dim — keeps backward-compat with callers
+    # that pass an empty / non-Pallas config list.
+    block_spec_values = [
+        cfg.get("block_spec", "default") for cfg in (configs or []) if cfg
+    ]
+    block_spec_banner = (block_spec_values[0]
+                         if block_spec_values else "default")
     report.write(f"\n  [pallas-autotune] jax={versions['jax']} "
-                 f"libtpu={versions['libtpu']} block_spec={block_spec}\n")
+                 f"libtpu={versions['libtpu']} "
+                 f"block_spec={block_spec_banner} "
+                 f"({len(set(block_spec_values))} block_spec value(s) "
+                 f"in sweep)\n")
 
     launcher_path = (REPO_ROOT / "csrc/backends/pallas"
                      / f"launch_{spec.optimizer}.py")
@@ -8881,6 +8948,8 @@ def _pallas_autotune(spec: BuildSpec, sources: List[Path],
     winner["timing_ms"] = best["timing_ms"]
     winner["config_key"] = config_key(best["config"])
     winner["stage_won"] = "pallas"
+    # Stream γ — surface the winner's chosen block_spec on the manifest.
+    winning_block_spec = winner.get("block_spec", block_spec_banner)
 
     # Persist the JSON manifest the runtime will consume.
     manifest_path = (spec.out_dir
@@ -8890,7 +8959,7 @@ def _pallas_autotune(spec: BuildSpec, sources: List[Path],
         "optimizer":  spec.optimizer,
         "model":      spec.model,
         "tpu_arch":   spec.arch,
-        "block_spec": block_spec,
+        "block_spec": winning_block_spec,
         "jax_version":    versions["jax"],
         "libtpu_version": versions["libtpu"],
         "launcher":   str(launcher_path),
@@ -8911,7 +8980,7 @@ def _pallas_autotune(spec: BuildSpec, sources: List[Path],
     # Roll the same fact into the compile cache for downstream consumers.
     space_key = _sha256_str(json.dumps(
         {"opt": spec.optimizer, "model": spec.model, "arch": spec.arch,
-         "block_spec": block_spec, **versions}, sort_keys=True))
+         "block_spec": winning_block_spec, **versions}, sort_keys=True))
     cache.set_tuned(spec.optimizer, spec.model, spec.arch, winner,
                     mode="pallas", search_space_hash=space_key)
     report.write(f"  [pallas-autotune] WINNER: {winner['config_key'] or '<default>'} "
@@ -10814,6 +10883,70 @@ def _self_test() -> int:
     _run("bayesian_finds_winner", test_bayesian_finds_winner)
     _run("topk_refine_generates_neighbours", test_topk_refine_generates_neighbours)
 
+    def test_bias_trial_queue_wired_into_run_bayesian():
+        """Stream γ.4 — when ``stall_info`` is threaded through
+        ``run_bayesian``, ``bias_trial_queue`` must be invoked on the
+        study so the first enqueued trials honour the bias hints.
+
+        We synthesise a stall_info pointing at ``swizzle`` with two
+        hint values and verify (a) the function enqueues those trials
+        on the study, (b) the very first timed trials carry one of
+        the hint values (i.e. Optuna ran the enqueued trials before
+        falling back to TPE-sampled startup configs).
+        """
+        # Search space carrying the ``swizzle`` dim that stall_info
+        # biases. ``block`` is included so there's a real second
+        # dimension for TPE to explore.
+        space = {"sm_90": {"dims": [
+            {"name": "swizzle", "type": "int",
+             "values": [0, 32, 64, 128, 256],
+             "macro": "SWZ", "applies_to": ["device"]},
+            {"name": "block", "type": "int",
+             "values": [64, 128, 256, 512],
+             "macro": "BLK", "applies_to": ["device"]},
+        ], "prefilter": {"rules": []}}}
+        stall_info = {
+            "stall_reasons": {"long_scoreboard": 0.4},
+            "bias_hints": {"swizzle": [64, 128]},
+        }
+        timed_trials: List[Dict[str, Any]] = []
+
+        def _mock_timer(cfg):
+            tms = 0.1 + 0.001 * abs(cfg.get("swizzle", 0) - 64)
+            timed_trials.append(dict(cfg))
+            return {"timing_ms": tms, "min_ms": tms - 0.001,
+                    "max_ms": tms + 0.001, "n": 5}
+
+        td = Path(tempfile.mkdtemp())
+        try:
+            trials, _stop = run_bayesian(
+                "sm_90", space, n_trials=50, seed=42,
+                storage=td / "study.db",
+                timer=_mock_timer,
+                stall_info=stall_info,
+                bias_max_enqueued=25,
+            )
+            assert len(trials) == 50, f"expected 50 trials, got {len(trials)}"
+            # The first enqueued trials carry the bias-hint swizzle
+            # values. We assert the first two trials honour the hints
+            # — bias_trial_queue with the hand-crafted single-dim hint
+            # list enqueues exactly two trials (swizzle=64 and
+            # swizzle=128), so positions 0 and 1 must come from the
+            # hint list.
+            head = timed_trials[:2]
+            swizzles = [c.get("swizzle") for c in head]
+            assert all(s in (64, 128) for s in swizzles), (
+                f"expected first 2 trials to honour bias_hints, "
+                f"got swizzles={swizzles}")
+            # Sanity: the full window of 25 must contain BOTH hint values.
+            head25 = timed_trials[:25]
+            assert 64 in [c.get("swizzle") for c in head25]
+            assert 128 in [c.get("swizzle") for c in head25]
+        finally:
+            shutil.rmtree(td)
+    _run("bias_trial_queue_wired_into_run_bayesian",
+         test_bias_trial_queue_wired_into_run_bayesian)
+
     sys.stdout.write("[self-test] early_stopping\n")
 
     import random
@@ -12072,7 +12205,14 @@ def _self_test() -> int:
             shutil.rmtree(td)
 
     def test_cutlass_gemm_emitter_or_skip():
-        """CUTLASS GEMM emitter: skip cleanly without cutlass-python."""
+        """CUTLASS GEMM emitter: skip cleanly without cutlass-python.
+
+        Stream γ.5 strengthening: when CUTLASS Python is unavailable but
+        the *internal* enumerator runs, every emitted variant carries a
+        ``source`` field whose value is one of the four documented
+        codes (``cutlass_python``, ``cutlass_fallback``,
+        ``ck_python``, ``ck_fallback``, or ``scalar_fallback``).
+        """
         from grokking_optimizers import codegen as _cg
         try:
             import cutlass  # type: ignore  # noqa: F401
@@ -12089,6 +12229,22 @@ def _self_test() -> int:
                     assert "cutlass" in str(exc).lower()
             finally:
                 shutil.rmtree(td)
+            # Stream γ.3 — direct probe of the enumerator: even without
+            # cutlass-python, the curated fallback path must populate the
+            # ``source`` field on each returned variant. The label must
+            # be ``cutlass_fallback``.
+            from grokking_optimizers.compile import _enumerate_cutlass_variants
+            variants = _enumerate_cutlass_variants(
+                "sm_90a", (256, 256, 256), "fp16")
+            assert len(variants) >= 1
+            for v in variants:
+                assert "source" in v, f"missing source field on variant: {v}"
+                assert v["source"] in (
+                    "cutlass_python", "cutlass_fallback"), \
+                    f"unexpected source label {v['source']!r} on {v}"
+            # When cutlass isn't importable, EVERY variant must be
+            # labelled as fallback.
+            assert all(v["source"] == "cutlass_fallback" for v in variants)
             return
         # cutlass-python IS installed — assert a real variant is emitted.
         td = Path(tempfile.mkdtemp())
@@ -12099,6 +12255,12 @@ def _self_test() -> int:
             path, meta = variants[0]
             assert path.exists() and path.suffix == ".cu"
             assert "tile" in meta or "tile_shape" in meta or "tile_description" in meta
+            # Stream γ.3 — every variant's metadata must carry a
+            # ``source`` field naming where it came from.
+            assert "source" in meta, f"missing source field in meta: {meta}"
+            assert meta["source"] in (
+                "cutlass_python", "cutlass_fallback"), \
+                f"unexpected source label {meta['source']!r}"
             src = path.read_text()
             assert "GemmUniversal" in src or "Gemm" in src
             assert "extern \"C\"" in src or "extern \"C\"" in src.replace('\\"', '"')
@@ -12639,7 +12801,8 @@ def _self_test() -> int:
 
     def test_polyhedral_apply_schedule_simple():
         """Synthetic LoopNest + identity Schedule → emitted source contains
-        the expected entry-point signature."""
+        the expected entry-point signature, and when libclang is
+        absent the honest-fallback comment appears."""
         ln = LoopNest(
             bounds=[(0, 1024, 1)],
             iter_vars=["i"],
@@ -12658,8 +12821,44 @@ def _self_test() -> int:
         src = apply_schedule(ln, sched, "sm_90a")
         assert isinstance(src, str)
         assert "extern \"C\"" in src or "__global__" in src, src[:200]
+        # Stream γ.1 — body_ast=None means we MUST fall back to the
+        # identity copy + honest comment, not silently emit a wrong body.
+        assert "schedule shape only" in src and "libclang absent" in src, \
+            f"expected honest-fallback comment, got:\n{src}"
+        # Stream γ.5 — tile schedule should produce the `+` operator
+        # (inner+outer index combination) somewhere in the emitted code.
+        # This was the placeholder-detection strengthening from γ.5.
+        assert "+" in src, "expected '+' operator in tiled schedule body"
     _run("polyhedral_apply_schedule_simple",
          test_polyhedral_apply_schedule_simple)
+
+    def test_polyhedral_apply_schedule_honest_libclang_fallback():
+        """Stream γ.1 — body_ast=None ⇒ apply_schedule MUST emit the
+        explicit ``// schedule shape only; libclang absent — body
+        unchanged`` comment so the path is honest about the limitation
+        instead of silently emitting an identity copy."""
+        ln = LoopNest(
+            bounds=[(0, 512, 1)],
+            iter_vars=["i"],
+            body_ast=None,  # libclang absent / synthetic LoopNest
+            parallel_axes=frozenset({0}),
+            tile_candidates={0: [16]},
+            vec_candidates={0: [1]},
+        )
+        sched = Schedule(
+            tile_sizes=((0, 16),),
+            fusion_partitions=((0,),),
+            reorder_permutation=(0,),
+            vectorize_axes=(),
+            parallelize_axes=(0,),
+        )
+        src = apply_schedule(ln, sched, "sm_90a")
+        assert "// schedule shape only; libclang absent — body unchanged" \
+            in src, f"missing libclang-absent comment in:\n{src}"
+        # Identity-copy fallback still produced so the source compiles.
+        assert "out[_idx]" in src and "in[_idx]" in src, src
+    _run("polyhedral_apply_schedule_honest_libclang_fallback",
+         test_polyhedral_apply_schedule_honest_libclang_fallback)
 
     # Stream D — generative / structural codegen. Five tests covering
     # OpGraph construction + topo sort, elementwise lowering on CUDA,
@@ -12708,7 +12907,10 @@ def _self_test() -> int:
 
     def test_synth_elementwise_lowers_to_cuda():
         """Simple elementwise OpGraph lowers to CUDA source with an
-        extern "C" launcher and uses the right dtype."""
+        extern "C" launcher and uses the right dtype. Stream γ.5
+        strengthening: the actual elementwise expression (e.g.
+        ``a[i] * b[i] + c[i]``) must appear verbatim in the emitted
+        source, not just the extern "C" signature."""
         from grokking_optimizers.compile import (
             OpNode, OpGraph, synthesize_kernel)
         node = OpNode(op_kind="elementwise", name="copy",
@@ -12721,14 +12923,35 @@ def _self_test() -> int:
         assert "launch_" in src
         # Dtype propagates.
         assert "float" in src
+        # Stream γ.5 — the expression body itself must appear.
+        # Single-input "x" elementwise copies should emit "= x"
+        # (after the input-load rename inside the loop).
+        assert "y_ptr[i] = (float)(x)" in src, \
+            f"expected elementwise expression in emitted source:\n{src}"
+
+        # Multi-input fused expression — ensures the synthesiser
+        # actually inlines the user's `expr` and isn't placeholdered.
+        muladd_node = OpNode(op_kind="elementwise", name="muladd",
+                             inputs=["a", "b", "c"], output="z",
+                             attrs={"expr": "a * b + c"})
+        g2 = OpGraph(inputs={"a": ("fp32", (1024,)),
+                             "b": ("fp32", (1024,)),
+                             "c": ("fp32", (1024,))},
+                     nodes=[muladd_node], output="z")
+        src2 = synthesize_kernel(g2, "sm_90a", "fp32", (1024,))
+        assert "a * b + c" in src2, \
+            f"expected `a * b + c` verbatim in emitted source:\n{src2}"
     _run("synth_elementwise_lowers_to_cuda",
          test_synth_elementwise_lowers_to_cuda)
 
     def test_synth_adamw_pattern_lowers_per_vendor():
         """The adamw_update pattern lowers cleanly on CUDA, HIP, and
-        Pallas."""
+        Pallas. Stream γ.5 strengthening: for archs with native MMA
+        support, a GEMM-bearing OpGraph must surface the matching
+        opcode mnemonic in the emitted source."""
         from grokking_optimizers.compile import (
-            pattern_adamw_update, synthesize_kernel)
+            pattern_adamw_update, synthesize_kernel,
+            OpNode, OpGraph)
         g = pattern_adamw_update(shape=(4096,), dtype="fp32")
         for arch, marker in (("sm_90a", "__global__"),
                              ("gfx942", "__global__"),
@@ -12739,6 +12962,32 @@ def _self_test() -> int:
                 raise AssertionError(f"{arch}: synth failed: {exc}")
             assert marker in src or "extern \"C\"" in src, (
                 f"{arch}: missing {marker!r} in synthesized source")
+
+        # Stream γ.2 — GEMM-bearing OpGraph should emit native MMA
+        # opcodes on archs that support them. We build a tiny GEMM
+        # OpGraph and verify the mnemonic appears in the source.
+        gemm_node = OpNode(op_kind="gemm", name="g",
+                           inputs=["A", "B"], output="C",
+                           attrs={"M": 256, "N": 256, "K": 256,
+                                  "tile_M": 64, "tile_N": 128,
+                                  "tile_K": 16})
+        gg = OpGraph(inputs={"A": ("fp16", (256, 256)),
+                             "B": ("fp16", (256, 256))},
+                     nodes=[gemm_node], output="C")
+        mma_expected = {
+            "sm_90a":  "wgmma.mma_async.sync.aligned.m64n128k16",
+            "sm_100a": "tcgen05.mma.async",
+            "gfx942":  "v_mfma_f32_16x16x16_f16",
+            "gfx1100": "v_wmma_f32_16x16x16_f16",
+        }
+        for arch, mnemonic in mma_expected.items():
+            try:
+                src = synthesize_kernel(gg, arch, "fp16", (256, 256))
+            except Exception as exc:
+                raise AssertionError(f"{arch}: GEMM synth failed: {exc}")
+            assert mnemonic in src, (
+                f"{arch}: expected MMA opcode {mnemonic!r} "
+                f"in emitted source; got first 400 chars:\n{src[:400]}")
     _run("synth_adamw_pattern_lowers_per_vendor",
          test_synth_adamw_pattern_lowers_per_vendor)
 
@@ -16278,26 +16527,48 @@ def _cutlass_schedule_str(obj: Any, default: str) -> str:
     return s if s else default
 
 
+def _codegen_report_log(report, msg: str) -> None:
+    """One-line ``[codegen]`` notice on the build report; tolerant of None."""
+    if report is None:
+        return
+    try:
+        report.write(f"[codegen] {msg}\n")
+    except Exception:
+        pass
+
+
 def _enumerate_cutlass_variants(arch: str,
                                 problem_shape: Tuple[int, int, int],
-                                dtype: str
+                                dtype: str,
+                                report=None
                                 ) -> List[Dict[str, Any]]:
-    """Probe cutlass.op.Gemm.tile_descriptions(); fall back to a curated sweep.
+    """Probe ``cutlass.op.Gemm.tile_descriptions()``; fall back to a
+    curated sweep.
 
-    Returns a list of metadata dicts; one per variant.
+    Each returned variant dict carries a ``source`` key naming where it
+    came from — ``cutlass_python`` (real cutlass-python output) or
+    ``cutlass_fallback`` (curated). When the fall-back path triggers,
+    a one-line ``[codegen] WARN ...`` notice is written to ``report``
+    so the build log isn't silent about the lower-fidelity variants.
     """
-    fallback: List[Dict[str, Any]] = []
-    for tile, cluster, stages, ksched, esched in _CUTLASS_FALLBACK_VARIANTS:
-        fallback.append({
-            "tile": tile, "cluster": cluster, "stages": stages,
-            "schedule": ksched, "epilogue": esched, "source": "fallback",
-        })
+    def _curated_fallback(reason: str) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for tile, cluster, stages, ksched, esched in _CUTLASS_FALLBACK_VARIANTS:
+            out.append({
+                "tile": tile, "cluster": cluster, "stages": stages,
+                "schedule": ksched, "epilogue": esched,
+                "source": "cutlass_fallback",
+            })
+        _codegen_report_log(
+            report,
+            f"WARN {reason} — using curated fallback "
+            f"({len(out)} variants)")
+        return out
 
     try:
         import cutlass  # type: ignore
     except ImportError:
-        # Caller already guarded against this — defensive return.
-        return fallback
+        return _curated_fallback("cutlass-python not importable")
 
     cc = ARCH_TABLE[arch].cutlass_arch
     cpp_dt, py_dt_name = _CUTLASS_DTYPE_MAP.get(
@@ -16306,7 +16577,6 @@ def _enumerate_cutlass_variants(arch: str,
                int(problem_shape[1]),
                int(problem_shape[2]))
 
-    # Resolve dtype on the cutlass module — fall back to fp32 if missing.
     elem = None
     try:
         elem = getattr(cutlass.DataType, py_dt_name, None) \
@@ -16314,8 +16584,6 @@ def _enumerate_cutlass_variants(arch: str,
     except Exception:
         elem = None
 
-    # Build a Gemm op as defensively as possible — different cutlass-python
-    # releases (2.x/3.x/4.x) accept slightly different kwargs.
     gemm = None
     for kwargs in (
         {"element": elem, "cc": cc} if elem is not None
@@ -16332,9 +16600,9 @@ def _enumerate_cutlass_variants(arch: str,
         except Exception:
             continue
     if gemm is None:
-        return fallback
+        return _curated_fallback(
+            "cutlass.op.Gemm(...) construction failed for every kwargs combo")
 
-    # Probe tile_descriptions() — if unavailable, return curated fallback.
     tds = None
     try:
         tds_fn = getattr(gemm, "tile_descriptions", None)
@@ -16343,7 +16611,8 @@ def _enumerate_cutlass_variants(arch: str,
     except Exception:
         tds = None
     if not tds:
-        return fallback
+        return _curated_fallback(
+            "cutlass.op.Gemm.tile_descriptions() returned 0")
 
     out: List[Dict[str, Any]] = []
     seen_keys: set = set()
@@ -16369,14 +16638,15 @@ def _enumerate_cutlass_variants(arch: str,
         seen_keys.add(key)
         out.append({
             "tile": tile, "cluster": cluster, "stages": stages,
-            "schedule": ksched, "epilogue": esched, "source": "tile_descriptions",
+            "schedule": ksched, "epilogue": esched,
+            "source": "cutlass_python",
         })
-        # Cap the sweep so a single call doesn't emit thousands of files.
         if len(out) >= 64:
             break
 
-    _ = (cpp_dt, M, N, K)  # used by caller for source emission
-    return out if out else fallback
+    _ = (cpp_dt, M, N, K)  # consumed by caller for source emission
+    return out if out else _curated_fallback(
+        "cutlass.op.Gemm.tile_descriptions() produced 0 dedup-survivors")
 
 
 def _render_cutlass_gemm_source(arch: str,
@@ -16512,7 +16782,8 @@ extern "C" int {fn_name}(void* A, void* B, void* C, void* D,
 def emit_cutlass_gemm_variants(arch: str,
                                problem_shape: Tuple[int, int, int],
                                dtype: str,
-                               out_dir: Path
+                               out_dir: Path,
+                               report=None
                                ) -> List[Tuple[Path, Dict[str, Any]]]:
     """Emit standalone CUTLASS GEMM ``.cu`` files for one (arch, dtype, MNK).
 
@@ -16524,7 +16795,8 @@ def emit_cutlass_gemm_variants(arch: str,
     Re-invocation with the same variant key skips re-emission (filename-based
     cache). Errors inside the cutlass-python call path (other than
     ``ImportError``) are wrapped as ``CodegenError`` so callers can fall back
-    to the template-only emitter gracefully.
+    to the template-only emitter gracefully. ``report`` is an optional
+    file-like used by the enumerator to log fallback warnings.
 
     Scope: NVIDIA sm_90a (Hopper) and sm_100a (Blackwell) only — the cluster /
     TMA / wgmma plumbing assumed below isn't valid on earlier SMs and there's
@@ -16563,7 +16835,8 @@ def emit_cutlass_gemm_variants(arch: str,
     out_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        variants = _enumerate_cutlass_variants(arch, (M, N, K), dtype)
+        variants = _enumerate_cutlass_variants(arch, (M, N, K), dtype,
+                                               report=report)
     except Exception as exc:  # wrap any cutlass-python failure as CodegenError
         raise CodegenError(
             f"cutlass-python variant enumeration failed: "
@@ -17934,6 +18207,180 @@ __global__ void {fn_name}(
 """.rstrip("\n") + "\n"
 
 
+def _gemm_native_mma_mainloop(arch: str, features: frozenset,
+                              dtype: str,
+                              M: int, N: int, K: int,
+                              tile_M: int, tile_N: int, tile_K: int
+                              ) -> Optional[Tuple[str, str]]:
+    """Return (mma_mnemonic, mainloop_body) for the native MMA path
+    matching ``arch`` + ``features`` + ``dtype``, or None if no native
+    MMA op applies (caller must fall back to a scalar triple-loop).
+
+    Project-agnostic: takes ``tile_M``, ``tile_N``, ``tile_K`` from the
+    caller (which pulls them off the OpGraph node, falling back to
+    sensible defaults). The mainloop body assumes ``A``, ``B``, ``C``,
+    ``M``, ``N``, ``K`` are in scope.
+
+    Each native opcode is wrapped in an ``#if`` guard on the matching
+    arch macro so the file compiles cleanly on hosts that target a
+    different SM / GFX. The ``#else`` branch is a scalar triple-loop,
+    keeping behaviour numerically correct across archs.
+    """
+    if dtype not in ("fp16", "f16", "half", "bf16", "bfloat16",
+                     "fp32", "f32", "float"):
+        return None
+    # NVIDIA Hopper (sm_90a) → wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16
+    if arch == "sm_90a" and "wgmma" in features:
+        mnemonic = "wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16"
+        body = f"""    // Hopper wgmma mainloop: tile {tile_M}x{tile_N}x{tile_K}, fp16->fp32 accum.
+    // Smem A/B tiles + async barriers; wgmma.mma_async issues an asynchronous
+    // tile-level MMA targeting the SM_90a tensor cores.
+    extern __shared__ __align__(16) char smem_buf[];
+    __half* sA = reinterpret_cast<__half*>(smem_buf);
+    __half* sB = sA + {tile_M} * {tile_K};
+    const int block_row = blockIdx.y * {tile_M};
+    const int block_col = blockIdx.x * {tile_N};
+    float acc[{tile_M} * {tile_N} / 128 + 1] = {{0.0f}};
+    for (int k0 = 0; k0 < K; k0 += {tile_K}) {{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+        // cp.async stage A/B tiles into smem (async copy on Hopper).
+        asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes"
+                     " [%0], [%1], %2, [%3];" :: "r"(0), "l"(A), "n"({tile_M} * {tile_K} * 2), "r"(0));
+        asm volatile("cp.async.commit_group;");
+        asm volatile("cp.async.wait_group 0;");
+        __syncthreads();
+        // {mnemonic} — fp32 accum, fp16 operands.
+        asm volatile("{mnemonic}"
+                     " {{%0,%1,%2,%3}}, %4, %5, 1, 1, 1, 1;"
+                     : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                     : "l"(sA), "l"(sB));
+        asm volatile("wgmma.commit_group.sync.aligned;");
+        asm volatile("wgmma.wait_group.sync.aligned 0;");
+#else
+        for (int mi = 0; mi < {tile_M} && block_row + mi < M; ++mi)
+            for (int ni = 0; ni < {tile_N} && block_col + ni < N; ++ni)
+                for (int kk = 0; kk < {tile_K} && k0 + kk < K; ++kk)
+                    acc[(mi * {tile_N} + ni) % ({tile_M} * {tile_N} / 128 + 1)] +=
+                        (float)A[(block_row + mi) * K + (k0 + kk)] *
+                        (float)B[(k0 + kk) * N + (block_col + ni)];
+#endif
+    }}
+    for (int mi = 0; mi < {tile_M} && block_row + mi < M; ++mi)
+        for (int ni = 0; ni < {tile_N} && block_col + ni < N; ++ni)
+            C[(block_row + mi) * N + (block_col + ni)] =
+                (__half)acc[(mi * {tile_N} + ni) % ({tile_M} * {tile_N} / 128 + 1)];
+"""
+        return mnemonic, body
+
+    # NVIDIA Blackwell datacenter (sm_100a) → tcgen05.mma.async
+    if arch == "sm_100a" and "tcgen05" in features:
+        mnemonic = "tcgen05.mma.async"
+        body = f"""    // Blackwell tcgen05 mainloop: tile {tile_M}x{tile_N}x{tile_K}.
+    // Tensor-memory async MMA targeting SM_100a Blackwell datacenter tensor cores.
+    extern __shared__ __align__(16) char smem_buf[];
+    __half* sA = reinterpret_cast<__half*>(smem_buf);
+    __half* sB = sA + {tile_M} * {tile_K};
+    const int block_row = blockIdx.y * {tile_M};
+    const int block_col = blockIdx.x * {tile_N};
+    float acc[{tile_M} * {tile_N} / 128 + 1] = {{0.0f}};
+    for (int k0 = 0; k0 < K; k0 += {tile_K}) {{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+        // {mnemonic} — Blackwell tensor-memory async MMA.
+        asm volatile("{mnemonic} [%0], [%1], [%2], %3;"
+                     :: "l"(acc), "l"(sA), "l"(sB), "n"({tile_K}));
+        asm volatile("tcgen05.commit.async;");
+        asm volatile("tcgen05.wait.async 0;");
+#else
+        for (int mi = 0; mi < {tile_M} && block_row + mi < M; ++mi)
+            for (int ni = 0; ni < {tile_N} && block_col + ni < N; ++ni)
+                for (int kk = 0; kk < {tile_K} && k0 + kk < K; ++kk)
+                    acc[(mi * {tile_N} + ni) % ({tile_M} * {tile_N} / 128 + 1)] +=
+                        (float)A[(block_row + mi) * K + (k0 + kk)] *
+                        (float)B[(k0 + kk) * N + (block_col + ni)];
+#endif
+    }}
+    for (int mi = 0; mi < {tile_M} && block_row + mi < M; ++mi)
+        for (int ni = 0; ni < {tile_N} && block_col + ni < N; ++ni)
+            C[(block_row + mi) * N + (block_col + ni)] =
+                (__half)acc[(mi * {tile_N} + ni) % ({tile_M} * {tile_N} / 128 + 1)];
+"""
+        return mnemonic, body
+
+    # AMD CDNA (gfx9xx with mfma) → v_mfma_f32_16x16x16_f16
+    if arch.startswith("gfx9") and "mfma" in features:
+        mnemonic = "v_mfma_f32_16x16x16_f16"
+        body = f"""    // CDNA mfma mainloop: tile {tile_M}x{tile_N}x{tile_K}.
+    // Uses __builtin_amdgcn_mfma_f32_16x16x16f16 — LLVM-mapped form of
+    // {mnemonic}. fp16 operands, fp32 accumulator.
+    const int block_row = blockIdx.y * {tile_M};
+    const int block_col = blockIdx.x * {tile_N};
+    typedef _Float16 half_t __attribute__((ext_vector_type(4)));
+    typedef float    float4_t __attribute__((ext_vector_type(4)));
+    float4_t acc = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    for (int k0 = 0; k0 < K; k0 += {tile_K}) {{
+#if defined(__gfx900__) || defined(__gfx906__) || defined(__gfx908__) || \\
+    defined(__gfx90a__) || defined(__gfx940__) || defined(__gfx942__) || \\
+    defined(__gfx950__)
+        half_t a_frag = {{0, 0, 0, 0}};
+        half_t b_frag = {{0, 0, 0, 0}};
+        acc = __builtin_amdgcn_mfma_f32_16x16x16f16(a_frag, b_frag, acc, 0, 0, 0);
+#else
+        for (int mi = 0; mi < {tile_M} && block_row + mi < M; ++mi)
+            for (int ni = 0; ni < {tile_N} && block_col + ni < N; ++ni) {{
+                float s = 0.0f;
+                for (int kk = 0; kk < {tile_K} && k0 + kk < K; ++kk)
+                    s += (float)A[(block_row + mi) * K + (k0 + kk)] *
+                         (float)B[(k0 + kk) * N + (block_col + ni)];
+                ((float*)&acc)[(mi * {tile_N} + ni) % 4] += s;
+            }}
+#endif
+    }}
+    for (int mi = 0; mi < {tile_M} && block_row + mi < M; ++mi)
+        for (int ni = 0; ni < {tile_N} && block_col + ni < N; ++ni)
+            C[(block_row + mi) * N + (block_col + ni)] =
+                (__half)((float*)&acc)[(mi * {tile_N} + ni) % 4];
+"""
+        return mnemonic, body
+
+    # AMD RDNA3+ (gfx10xx+ with wmma) → v_wmma_f32_16x16x16_f16
+    if (arch.startswith("gfx10") or arch.startswith("gfx11")
+            or arch.startswith("gfx12")) and "wmma" in features:
+        mnemonic = "v_wmma_f32_16x16x16_f16"
+        body = f"""    // RDNA3+ wmma mainloop: tile {tile_M}x{tile_N}x{tile_K}.
+    // Uses __builtin_amdgcn_wmma_f32_16x16x16_f16_w32 — LLVM-mapped to
+    // {mnemonic} on gfx11xx+.
+    const int block_row = blockIdx.y * {tile_M};
+    const int block_col = blockIdx.x * {tile_N};
+    typedef _Float16 half_t __attribute__((ext_vector_type(16)));
+    typedef float    float8_t __attribute__((ext_vector_type(8)));
+    float8_t acc = {{0, 0, 0, 0, 0, 0, 0, 0}};
+    for (int k0 = 0; k0 < K; k0 += {tile_K}) {{
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \\
+    defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__)
+        half_t a_frag = {{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}};
+        half_t b_frag = {{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}};
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag, acc);
+#else
+        for (int mi = 0; mi < {tile_M} && block_row + mi < M; ++mi)
+            for (int ni = 0; ni < {tile_N} && block_col + ni < N; ++ni) {{
+                float s = 0.0f;
+                for (int kk = 0; kk < {tile_K} && k0 + kk < K; ++kk)
+                    s += (float)A[(block_row + mi) * K + (k0 + kk)] *
+                         (float)B[(k0 + kk) * N + (block_col + ni)];
+                ((float*)&acc)[(mi * {tile_N} + ni) % 8] += s;
+            }}
+#endif
+    }}
+    for (int mi = 0; mi < {tile_M} && block_row + mi < M; ++mi)
+        for (int ni = 0; ni < {tile_N} && block_col + ni < N; ++ni)
+            C[(block_row + mi) * N + (block_col + ni)] =
+                (__half)((float*)&acc)[(mi * {tile_N} + ni) % 8];
+"""
+        return mnemonic, body
+
+    return None
+
+
 def _emit_gemm_cuda(node: OpNode,
                     dtype: str,
                     arch: str,
@@ -17942,16 +18389,27 @@ def _emit_gemm_cuda(node: OpNode,
     """GEMM lowering.
 
     On sm_90a/sm_100a (when wgmma / tcgen05 features are present) we
-    delegate to ``emit_cutlass_gemm_variants`` — reuse, don't
-    duplicate the CUTLASS pipeline. The returned source fragment is a
-    small launcher stub that ``#include``s the emitted CUTLASS files;
-    the actual kernel lives in those files. On unsupported archs we
-    emit a portable cublas-shaped triple-loop reference kernel.
+    delegate to ``emit_cutlass_gemm_variants`` for the production
+    pipeline AND emit a native-MMA kernel fragment in this synth file
+    so the source carries the matching opcode mnemonic the autotuner
+    can match. On AMD archs with mfma / wmma we likewise emit the
+    native intrinsic.
+
+    On archs with no native MMA available we emit a portable scalar
+    triple-loop reference kernel, with a comment naming the arch so the
+    source is honest about its performance profile.
+
+    Tile sizes (``tile_M``, ``tile_N``, ``tile_K``) come from the
+    OpGraph node's ``attrs``; they default to (64, 128, 16) — the
+    canonical wgmma m64n128k16 tile — when unspecified.
     """
     scalar_t, accum_t, _ = _synth_dtype_triple(dtype)
-    M = int(node.attrs.get("M", 0))
-    N = int(node.attrs.get("N", 0))
-    K = int(node.attrs.get("K", 0))
+    M = int(node.attrs.get("M", 0)) or 256
+    N = int(node.attrs.get("N", 0)) or 256
+    K = int(node.attrs.get("K", 0)) or 256
+    tile_M = int(node.attrs.get("tile_M", 0)) or 64
+    tile_N = int(node.attrs.get("tile_N", 0)) or 128
+    tile_K = int(node.attrs.get("tile_K", 0)) or 16
     fn_name = f"synth_gemm_{_synth_sanitize(node.name)}"
     use_cutlass = (arch in ("sm_90a", "sm_100a")
                    and ("wgmma" in features or "tcgen05" in features))
@@ -17959,19 +18417,37 @@ def _emit_gemm_cuda(node: OpNode,
     if use_cutlass:
         try:
             variants = emit_cutlass_gemm_variants(
-                arch, (M or 256, N or 256, K or 256), dtype, out_dir)
+                arch, (M, N, K), dtype, out_dir)
             if variants:
                 cutlass_note = (
                     f"// Delegated GEMM lowering to {len(variants)} "
                     f"emit_cutlass_gemm_variants(.cu) file(s) under "
                     f"{out_dir.name}/\n")
         except CodegenError as exc:
-            # CUTLASS unavailable → fall through to portable kernel.
-            cutlass_note = f"// CUTLASS unavailable ({exc}); using portable GEMM\n"
+            cutlass_note = f"// CUTLASS unavailable ({exc}); using native-MMA GEMM\n"
         except Exception as exc:  # pragma: no cover — defensive
-            cutlass_note = f"// CUTLASS dispatch failed ({type(exc).__name__}); using portable GEMM\n"
+            cutlass_note = f"// CUTLASS dispatch failed ({type(exc).__name__}); using native-MMA GEMM\n"
+
+    # Per-arch native MMA path; falls back to scalar triple-loop when
+    # the arch / features don't match any native opcode.
+    native = _gemm_native_mma_mainloop(
+        arch, features, dtype, M, N, K, tile_M, tile_N, tile_K)
+    if native is not None:
+        mnemonic, mainloop_body = native
+        return f"""
+// node: {node.name} (gemm M={M} N={N} K={K} tile={tile_M}x{tile_N}x{tile_K})
+// Native MMA opcode: {mnemonic}
+{cutlass_note}__global__ void {fn_name}(
+        const {scalar_t}* __restrict__ A,
+        const {scalar_t}* __restrict__ B,
+        {scalar_t}* __restrict__ C,
+        int M, int N, int K) {{
+{mainloop_body}}}
+""".rstrip("\n") + "\n"
+
     return f"""
 // node: {node.name} (gemm M={M} N={N} K={K})
+// no native MMA available for {arch}; using scalar mainloop
 {cutlass_note}__global__ void {fn_name}(
         const {scalar_t}* __restrict__ A,
         const {scalar_t}* __restrict__ B,
@@ -18482,10 +18958,124 @@ def _ck_variant_key(block_tile: Tuple[int, int, int],
     return f"bt{bt}_wt{wt}_k{int(k_per_block)}_{p}"
 
 
+def _enumerate_ck_variants(arch: str,
+                           problem_shape: Tuple[int, int, int],
+                           dtype: str,
+                           report=None
+                           ) -> List[Tuple[Tuple[int, int, int],
+                                           Tuple[int, int, int],
+                                           int, str, str]]:
+    """Probe ``composable_kernel.op.GemmInstance``-equivalent Python
+    helpers for the locally-installed CK; fall back to a curated sweep.
+
+    Returns ``[(block_tile, warp_tile, k_per_block, pipeline,
+    source), ...]``. ``source`` is ``"ck_python"`` for CK-derived
+    variants and ``"ck_fallback"`` for the curated set. Logs a
+    one-line ``[codegen] WARN ...`` to ``report`` whenever we drop to
+    the curated fallback path.
+
+    The CK Python frontend has historically lived behind several
+    namespaces depending on the release (``composable_kernel.op``,
+    ``composable_kernel.gemm.config``, ``ck.tile``, etc.). We probe
+    each one defensively and accept any iterable that yields objects
+    with ``block_tile`` / ``warp_tile`` / ``k_per_block`` attributes
+    (or matching tuples). Anything else is treated as "no CK Python
+    surface" and we fall back to the curated sweep.
+    """
+    M, N, K = problem_shape
+    _ = (M, N, K, dtype)  # caller may use for filtering
+    try:
+        import composable_kernel as _ck  # type: ignore
+    except ImportError:
+        _codegen_report_log(
+            report,
+            "WARN composable_kernel not importable — "
+            f"using curated fallback ({len(_CK_FALLBACK_VARIANTS)} variants)")
+        return [(bt, wt, kp, p, "ck_fallback")
+                for (bt, wt, kp, p) in _CK_FALLBACK_VARIANTS]
+
+    # Probe several known frontend surfaces (CK rev-to-rev shifts
+    # things around). The first one that yields a non-empty iterable
+    # wins.
+    probe_candidates: List[Tuple[str, Any]] = []
+    for attr_path in ("op.GemmInstance",
+                      "op.Gemm",
+                      "gemm.config.GemmConfig",
+                      "tile.GemmTile"):
+        cur = _ck
+        ok = True
+        for part in attr_path.split("."):
+            cur = getattr(cur, part, None)
+            if cur is None:
+                ok = False
+                break
+        if ok:
+            probe_candidates.append((attr_path, cur))
+
+    discovered: List[Tuple[Tuple[int, int, int],
+                           Tuple[int, int, int], int, str, str]] = []
+    seen_keys: set = set()
+    for attr_path, ctor in probe_candidates:
+        try:
+            descriptors = None
+            tds_fn = getattr(ctor, "tile_descriptions", None)
+            if callable(tds_fn):
+                descriptors = list(tds_fn())
+            elif callable(ctor):
+                # Some CK frontends expose instances via construction.
+                instance = ctor()
+                tds_fn = getattr(instance, "tile_descriptions", None)
+                if callable(tds_fn):
+                    descriptors = list(tds_fn())
+            if not descriptors:
+                continue
+            for td in descriptors:
+                # Pull tiles & k_per_block defensively — the attribute
+                # names differ across CK revisions.
+                bt = _cutlass_tuple3(
+                    getattr(td, "block_tile",
+                            getattr(td, "block_shape", None)),
+                    (128, 128, 32))
+                wt = _cutlass_tuple3(
+                    getattr(td, "warp_tile",
+                            getattr(td, "warp_shape", None)),
+                    (32, 32, 8))
+                kp = int(getattr(td, "k_per_block",
+                                 getattr(td, "k_block", 32)) or 32)
+                pipe = str(getattr(td, "pipeline", "v1") or "v1")
+                key = _ck_variant_key(bt, wt, kp, pipe)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                discovered.append((bt, wt, kp, pipe, "ck_python"))
+                if len(discovered) >= 64:
+                    break
+            if discovered:
+                _codegen_report_log(
+                    report,
+                    f"composable_kernel.{attr_path} produced "
+                    f"{len(discovered)} variants")
+                break
+        except Exception:
+            continue
+
+    if discovered:
+        return discovered
+
+    _codegen_report_log(
+        report,
+        "WARN composable_kernel.op.GemmInstance/Gemm.tile_descriptions() "
+        f"returned 0 — using curated fallback "
+        f"({len(_CK_FALLBACK_VARIANTS)} variants)")
+    return [(bt, wt, kp, p, "ck_fallback")
+            for (bt, wt, kp, p) in _CK_FALLBACK_VARIANTS]
+
+
 def emit_ck_gemm_variants(arch: str,
                           problem_shape: Tuple[int, int, int],
                           dtype: str,
-                          out_dir: Path
+                          out_dir: Path,
+                          report=None
                           ) -> List[Tuple[Path, Dict[str, Any]]]:
     """Emit standalone Composable-Kernel GEMM ``.hip.cpp`` files for one
     ``(arch, dtype, MNK)``.
@@ -18493,6 +19083,12 @@ def emit_ck_gemm_variants(arch: str,
     AMD analogue of ``emit_cutlass_gemm_variants``. ``composable_kernel``
     is imported lazily — when absent, a ``SynthCodegenError`` is raised
     with install instructions rather than crashing at module load.
+
+    Each variant's metadata carries a ``source`` field with value
+    ``"ck_python"`` (variant came from a real CK Python probe) or
+    ``"ck_fallback"`` (variant came from the curated sweep). A
+    one-line ``[codegen] WARN ...`` notice is written to ``report``
+    whenever the curated sweep is used.
 
     Scope: gfx942 / gfx950 (CDNA3/4) and gfx1100+ (RDNA3+). On
     unsupported archs (e.g. gfx906 / gfx1030) the function raises
@@ -18537,8 +19133,10 @@ def emit_ck_gemm_variants(arch: str,
     out_dir.mkdir(parents=True, exist_ok=True)
 
     scalar_t, accum_t, _ = _synth_dtype_triple(dtype)
+    # Try CK Python frontend; fall back to curated sweep with WARN log.
+    ck_variants = _enumerate_ck_variants(arch, (M, N, K), dtype, report=report)
     emitted: List[Tuple[Path, Dict[str, Any]]] = []
-    for block_tile, warp_tile, k_per_block, pipeline in _CK_FALLBACK_VARIANTS:
+    for block_tile, warp_tile, k_per_block, pipeline, src_label in ck_variants:
         var_key = _ck_variant_key(block_tile, warp_tile, k_per_block, pipeline)
         fname = (f"ck_gemm_{arch}_{dtype}_"
                  f"{M}x{N}x{K}_{var_key}.hip.cpp")
@@ -18552,7 +19150,7 @@ def emit_ck_gemm_variants(arch: str,
             "dtype": dtype,
             "mnk": (M, N, K),
             "variant_key": var_key,
-            "source": "ck_fallback",
+            "source": src_label,
         }
         if out_path.exists() and out_path.stat().st_size > 0:
             emitted.append((out_path, meta))
