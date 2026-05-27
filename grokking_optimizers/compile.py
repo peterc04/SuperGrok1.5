@@ -680,7 +680,17 @@ _ARCH_TABLE_PRIMARY: Dict[str, ArchEntry] = {
         min_toolchain_version=(6, 2),
         arch_suffix="",
         nvcc_gencode=[],
-        hipcc_offload_arch="gfx950",
+        # Group A.6 — encode the SRAM-ECC + XNACK suffix into the
+        # canonical ArchEntry so the dry-run manifest's
+        # ``expected_offload_arch`` field and the
+        # ``--offload-arch=<…>`` token emitted by ``_device_cflags`` agree.
+        # Previously the bare ``gfx950`` was stored here and the
+        # _device_cflags branch appended ``:sramecc+:xnack-``, causing the
+        # manifest to report ``gfx950`` while the actual cflag had the
+        # suffix. CDNA4 bitcode-library selection uses these bits so the
+        # suffix is required at compile time; this consolidation is
+        # additive — every other gfx* arch keeps its bare offload-arch.
+        hipcc_offload_arch="gfx950:sramecc+:xnack-",
         cutlass_arch=None,
         max_smem_per_block=64 * 1024,
         warp_size=64,
@@ -7036,6 +7046,8 @@ def _dry_run_all_archs(out_dir: Path,
         host_cflags: List[str] = []
         device_cflags: List[str] = []
         ldflags: List[str] = []
+        device_ldflags: List[str] = []
+        version_gated_device_cflags: List[str] = []
         cflag_error: Optional[str] = None
         try:
             host_cflags = list(_host_cflags(spec))
@@ -7051,6 +7063,29 @@ def _dry_run_all_archs(out_dir: Path,
         except Exception as exc:  # noqa: BLE001
             cflag_error = (cflag_error or "") + (
                 f"; ldflags: {type(exc).__name__}: {exc}")
+        # Group A.4 — surface device-link-only flags (nvcc -dlink step)
+        # in the dry-run manifest. Today torch.cpp_extension.load() does
+        # not invoke -dlink, but downstream consumers (any future build
+        # driver, CI flag-audit scripts) want to see the canonical set so
+        # we record it. _device_ldflags returns [] for non-CUDA archs.
+        try:
+            device_ldflags = list(_device_ldflags(spec))
+        except Exception as exc:  # noqa: BLE001 — never abort sweep
+            cflag_error = (cflag_error or "") + (
+                f"; device_ldflags: {type(exc).__name__}: {exc}")
+        # Group A.5 — surface version-gated device cflags from
+        # _newer_compiler_flags so the manifest reflects what nvcc/hipcc
+        # would ACTUALLY receive at build time on this host. Returns ([],
+        # []) when no compiler is on PATH OR the version is too old for
+        # any gated flag to fire, so the field is empty on CPU-only CI
+        # hosts (which is the right "don't pretend to add these" answer).
+        try:
+            _vgh, _vgd = _newer_compiler_flags(arch)
+            version_gated_device_cflags = list(_vgd)
+        except Exception as exc:  # noqa: BLE001 — never abort sweep
+            cflag_error = (cflag_error or "") + (
+                f"; version_gated_device_cflags: "
+                f"{type(exc).__name__}: {exc}")
 
         manifest: Dict[str, Any] = {
             "arch":                  arch,
@@ -7063,6 +7098,16 @@ def _dry_run_all_archs(out_dir: Path,
             "host_cflags":           host_cflags,
             "device_cflags":         device_cflags,
             "ldflags":               ldflags,
+            # Group A.4 — device-link-only flag list (nvcc -dlink step).
+            # Empty on non-CUDA archs and on CUDA archs where -dlto is not
+            # in device_cflags (the gate inside _device_ldflags).
+            "device_ldflags":        device_ldflags,
+            # Group A.5 — version-gated device cflags that
+            # _newer_compiler_flags would add when the installed toolchain
+            # is new enough. Empty on CPU-only hosts (no nvcc/hipcc). This
+            # is reported alongside device_cflags so CI / users can see
+            # what will actually be passed at build time on this host.
+            "version_gated_device_cflags": version_gated_device_cflags,
             "expected_gencode":      list(entry.nvcc_gencode) if entry.vendor == "cuda" else [],
             "expected_offload_arch": entry.hipcc_offload_arch if entry.vendor == "hip" else "",
             # Surface the effective opt-in feature toggle state for this
@@ -7086,6 +7131,15 @@ def _dry_run_all_archs(out_dir: Path,
                     getattr(spec, "enable_emitter", False)),
                 "strict_numerics":               bool(
                     getattr(spec, "strict_numerics", False)),
+                # Group A.7 — surface the host-side LLVM PGO 3-pass loop
+                # opt-in. ``spec.pgo`` is driven by the --pgo CLI flag and
+                # by the build() ``pgo=`` kwarg; the corresponding TOML
+                # path is [pgo].workload_script (config-driven workload),
+                # but the master switch is the BuildSpec field. We mirror
+                # it into the manifest so CI / users can grep for it the
+                # same way as the other enable_* toggles.
+                "pgo":                           bool(
+                    getattr(spec, "pgo", False)),
             },
         }
         # Category 3b — surface XLA env flags in the dry-run manifest for
@@ -7623,22 +7677,20 @@ def _device_cflags(spec: BuildSpec,
                         "base hipcc flag (HIPCC_DEVICE_BASE, no version gate)")
         # Per-arch --offload-arch from ARCH_TABLE. Stream α: gfx950 (CDNA4)
         # benefits from explicit SRAM-ECC + XNACK suffixes — the bitcode
-        # library picker uses those bits to choose the right variant. Other
-        # arches stay with the bare offload-arch token (the LLVM default
-        # suffix selection is correct everywhere else).
+        # library picker uses those bits to choose the right variant. As of
+        # Group A.6 those suffixes are baked into the ArchEntry's
+        # ``hipcc_offload_arch`` value (``gfx950:sramecc+:xnack-``) so the
+        # dry-run manifest's ``expected_offload_arch`` and the emitted
+        # ``--offload-arch=`` token agree. Other arches stay with their
+        # bare offload-arch token (the LLVM default suffix selection is
+        # correct everywhere else).
         if entry.hipcc_offload_arch:
             offload = entry.hipcc_offload_arch
-            if offload == "gfx950":
-                tok = f"--offload-arch={offload}:sramecc+:xnack-"
-                base += [tok]
-                _trace_add(trace, tok, "kept",
-                           "gfx950 (CDNA4) → explicit SRAM-ECC + XNACK suffix")
-            else:
-                tok = f"--offload-arch={offload}"
-                base += [tok]
-                _trace_add(trace, tok, "kept",
-                           f"ARCH_TABLE[{spec.arch!r}]"
-                           f".hipcc_offload_arch={offload!r}")
+            tok = f"--offload-arch={offload}"
+            base += [tok]
+            _trace_add(trace, tok, "kept",
+                       f"ARCH_TABLE[{spec.arch!r}]"
+                       f".hipcc_offload_arch={offload!r}")
         else:
             _trace_add(trace, "--offload-arch=…", "skipped",
                        f"ARCH_TABLE[{spec.arch!r}].hipcc_offload_arch empty")
@@ -11024,6 +11076,43 @@ def _build_aot_pgo(spec: BuildSpec, cache: CompileCache, sources: List[Path],
     profile_dir = spec.out_dir / "pgo_profile"
     profile_dir.mkdir(parents=True, exist_ok=True)
 
+    # Group A.15 — when any pass of the 3-pass loop fails, fall back to
+    # a plain (non-PGO) AOT build rather than failing the whole build.
+    # This is a UX win: the user requested PGO as an optimisation,
+    # but a flaky workload / missing tool should not block the build
+    # entirely. The fallback path is identical to the no-PGO branch in
+    # build_aot. Each early-return inside the loop now logs an
+    # actionable line announcing the abort plus the fallback before
+    # returning to build_aot's caller — which checks for None and
+    # invokes the non-PGO path.
+    def _pgo_fallback(reason: str) -> Optional[Path]:
+        """Drop PGO and build a plain AOT .so so the user gets *something*."""
+        report.write(
+            f"  [pgo] aborting — {reason}; falling back to non-PGO AOT build\n"
+            f"  [pgo] see report above for compiler/workload errors\n")
+        try:
+            fallback_so = _torch_load(spec, sources, host_cflags,
+                                      device_cflags, ldflags, report)
+        except Exception as exc:  # noqa: BLE001
+            report.write(f"  [pgo fallback] _torch_load raised "
+                         f"{type(exc).__name__}: {exc}\n")
+            return None
+        if fallback_so is None:
+            report.write("  [pgo fallback] non-PGO build also FAILED\n")
+            return None
+        fallback_so = _publish_aot_artifact(spec, fallback_so, report)
+        cache.record_aot(
+            spec.optimizer, spec.model, spec.arch,
+            source_hash=source_hash,
+            host_flags_hash=host_hash,
+            device_flags_hash=device_hash,
+            so_path=fallback_so,
+            pgo_enabled=False,   # we landed without PGO
+            search_space_hash=space_hash,
+        )
+        cache.save()
+        return fallback_so
+
     # ── Pass 1: instrumented build ────────────────────────────────────
     report.write("\n  [pgo 1/3] building instrumented .so\n")
     inst_host, inst_device, inst_ld = instrument_flags(
@@ -11033,8 +11122,14 @@ def _build_aot_pgo(spec: BuildSpec, cache: CompileCache, sources: List[Path],
     inst_so = _torch_load(inst_spec, sources, inst_host, inst_device,
                           inst_ld, report, module_suffix="_pgo_instrument")
     if inst_so is None:
-        report.write("  [pgo 1/3] instrumented build FAILED\n")
-        return None
+        # Group A.15 — make the abort explicit so a user grepping the
+        # report can spot "PGO said 3 passes but only ran 1" without
+        # spelunking the line history.
+        report.write(
+            "  [pgo 1/3] instrumented build FAILED\n"
+            "  [pgo] aborting after pass 1 failure — see report for "
+            "compiler errors\n")
+        return _pgo_fallback("instrumented build failed at pass 1")
 
     # ── Pass 2: collect workload ──────────────────────────────────────
     report.write("\n  [pgo 2/3] running workload to collect profile data\n")
@@ -11050,8 +11145,11 @@ def _build_aot_pgo(spec: BuildSpec, cache: CompileCache, sources: List[Path],
         report=report,
     )
     if not ok:
-        report.write("  [pgo 2/3] workload FAILED or produced no profile data\n")
-        return None
+        report.write(
+            "  [pgo 2/3] workload FAILED or produced no profile data\n"
+            "  [pgo] aborting after pass 2 failure — see report for "
+            "workload errors\n")
+        return _pgo_fallback("workload collection failed at pass 2")
     cache.record_pgo(spec.optimizer, spec.model, spec.arch,
                      profile_dir=profile_dir, workload_hash=workload_hash)
     cache.save()
@@ -11063,8 +11161,11 @@ def _build_aot_pgo(spec: BuildSpec, cache: CompileCache, sources: List[Path],
     so_path = _torch_load(spec, sources, use_host, use_device, use_ld,
                           report, module_suffix="_pgo")
     if so_path is None:
-        report.write("  [pgo 3/3] profile-use build FAILED\n")
-        return None
+        report.write(
+            "  [pgo 3/3] profile-use build FAILED\n"
+            "  [pgo] aborting after pass 3 failure — see report for "
+            "compiler errors\n")
+        return _pgo_fallback("profile-use build failed at pass 3")
     so_path = _publish_aot_artifact(spec, so_path, report)
     cache.record_aot(
         spec.optimizer, spec.model, spec.arch,
@@ -11438,6 +11539,38 @@ def build(
     except Exception:
         pass
 
+    # ── Group A.1 — mirror BuildSpec feature toggles into spec.config so
+    # the runtime gates that read spec.config["<section>"]["enable"] (e.g.
+    # the polyhedral hook at the _make_variant_timer site) see the same
+    # state the CLI / build() kwargs requested. Without this mirror the
+    # CLI flag --enable-polyhedral / --enable-emitter / etc. would set
+    # spec.<field>=True but spec.config["<section>"]["enable"] would stay
+    # False (since apply_to_buildspec only copies config→spec, never the
+    # reverse), and the runtime gate would never fire. ApplyToBuildSpec
+    # already won when the TOML had the section set; this mirror lets the
+    # explicit CLI / kwarg request layer on top so a True spec field
+    # always lights the corresponding config gate. Bool coerced because a
+    # forgiving caller may pass non-bool truthy values.
+    try:
+        for _fld, _section, _key in (
+            ("enable_polyhedral", "polyhedral", "enable"),
+            ("enable_synth_codegen", "synth_codegen", "enable"),
+            ("enable_emitter", "codegen", "enable_emitter"),
+            ("enable_runtime_specialization",
+             "runtime_specialization", "enable"),
+            ("enable_device_pgo", "device_pgo", "enable"),
+            ("enable_cost_model", "cost_model", "enable"),
+        ):
+            if bool(getattr(spec, _fld, False)):
+                if not isinstance(spec.config, dict):
+                    spec.config = {}
+                spec.config.setdefault(_section, {})[_key] = True
+    except Exception:
+        # Read-only spec / hostile config object — never abort the build
+        # over an introspection failure here. The downstream gate will
+        # simply read False (the historical behaviour pre-mirror).
+        pass
+
     _validate(spec)
     spec.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -11618,13 +11751,33 @@ def build(
                     if "final" in phases:
                         step("final")
 
-            if profile and runtime != "aot":
+            # Group A.14 — when the entire build loop produced no .so
+            # (so_path is None AND we're not on a no-op Pallas path),
+            # skip the profile pass and emit an actionable failure line
+            # pointing at the report. Previously the profile pass would
+            # still run against a missing .so and either crash or
+            # silently produce garbage. We still let the function return
+            # None (existing contract; main() converts to non-zero exit
+            # code) but make the failure visible to the user.
+            build_produced_nothing = (
+                so_path is None
+                and entry.vendor != "pallas"
+                and runtime != "aot")
+            if build_produced_nothing:
+                msg = (f"[build] FAILED — no .so produced; see "
+                       f"{report_path} for the full error log\n")
+                report.write("\n" + msg)
+                try:
+                    sys.stderr.write(msg)
+                except Exception:
+                    pass
+            if profile and runtime != "aot" and not build_produced_nothing:
                 report.write("\n--- PROFILE PASS ---\n")
                 _dispatch_profile(optimizer, model, arch, report)
                 step("profile")
 
             # Stream 7 — NVRTC / hipRTC kernel-registry pre-warm.
-            if enable_runtime_specialization:
+            if enable_runtime_specialization and not build_produced_nothing:
                 from grokking_optimizers.kernel_registry import initialize_registry
                 initialize_registry(spec, report)
 
@@ -11754,6 +11907,12 @@ def _flag_audit_main(argv: List[str]) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    # Group A.3 / A.10 — multiple branches inside main() write to
+    # ``_FLAG_PROBE_DISABLED`` (the early --dry-run-all-archs intercept,
+    # and the post-args-parse wiring). Python requires a single ``global``
+    # declaration to precede every assignment in the function body, so
+    # hoist it to the top.
+    global _FLAG_PROBE_DISABLED
     _argv = list(argv) if argv is not None else sys.argv[1:]
     if "--self-test" in _argv:
         return _self_test()
@@ -11789,6 +11948,35 @@ def main(argv: Optional[List[str]] = None) -> int:
     # need --optimizer/-M/-A. Dump the ARCH_TABLE and exit before the
     # main parser requires those flags.
     if "--list-archs" in _argv:
+        # Group A.9 — surface unknown args alongside --list-archs so
+        # ``--list-archs --foo=bar`` doesn't silently ignore the typo.
+        # We can't run the full parser (it requires --optimizer / --model
+        # / --arch); we run a minimal parser that knows the few flags
+        # that legitimately combine with --list-archs and warn on
+        # anything left over. We do NOT abort — listing should still
+        # work even with a stray flag — but the warning makes typos
+        # discoverable.
+        _la_parser = argparse.ArgumentParser(add_help=False)
+        _la_parser.add_argument("--list-archs", action="store_true")
+        _la_parser.add_argument("--config", default=None)
+        _la_parser.add_argument("--project-config", default=None,
+                                dest="project_config")
+        _la_parser.add_argument("--no-flag-probe", action="store_true",
+                                dest="no_flag_probe")
+        _la_parser.add_argument("--no-auto-install",
+                                dest="auto_install_optional_deps",
+                                action="store_false", default=True)
+        _la_parser.add_argument("--auto-install",
+                                dest="auto_install_optional_deps",
+                                action="store_true")
+        _, _la_unknown = _la_parser.parse_known_args(_argv)
+        if _la_unknown:
+            sys.stderr.write(
+                f"[list-archs] WARNING: ignoring unrecognized argument(s): "
+                f"{' '.join(_la_unknown)}\n"
+                f"[list-archs] --list-archs accepts --config / "
+                f"--project-config / --no-flag-probe / --no-auto-install "
+                f"only.\n")
         _seen: Dict[int, str] = {}
         for _k, _v in ARCH_TABLE.items():
             _seen.setdefault(id(_v), _k)
@@ -11807,15 +11995,43 @@ def main(argv: Optional[List[str]] = None) -> int:
     # user-requested directory AND so a downstream project's TOML
     # (macro_prefix, source_roots, …) flows through into each manifest.
     if "--dry-run-all-archs" in _argv:
+        # Group A.10 — even at the early intercept, reject the combo with
+        # --dry-run so a user passing both gets a loud error instead of
+        # the silent "all-archs wins" historical behaviour. The full
+        # parser also rejects this combo (see post-args-parse check) but
+        # we never get there when --dry-run-all-archs is present in argv.
+        if "--dry-run" in _argv:
+            sys.stderr.write(
+                "python -m grokking_optimizers.compile: error: argument "
+                "--dry-run-all-archs: not allowed with argument --dry-run "
+                "(single-arch vs all-arch dry runs are mutually exclusive "
+                "— pick one)\n")
+            return 2
         dry_parser = argparse.ArgumentParser(add_help=False)
         dry_parser.add_argument("--dry-run-all-archs", action="store_true")
         dry_parser.add_argument("--out", type=Path, default=None)
         dry_parser.add_argument("--config", default=None)
         dry_parser.add_argument("--project-config", default=None,
                                 dest="project_config")
+        # Group A.3 — accept --no-flag-probe in the early dry-run-all-archs
+        # intercept so the flag is honoured BEFORE _dry_run_all_archs starts
+        # running per-arch flag probes. The main parser also wires the
+        # global at args parse time, but the early intercept runs before
+        # that — so we must set the global here too. --no-auto-install is
+        # also accepted to keep the early-exit branch in sync with main()'s
+        # behaviour.
+        dry_parser.add_argument("--no-flag-probe", action="store_true",
+                                dest="no_flag_probe")
+        dry_parser.add_argument("--no-auto-install",
+                                dest="auto_install_optional_deps",
+                                action="store_false", default=True)
         dry_args, _ = dry_parser.parse_known_args(_argv)
         out_dir = Path(dry_args.out or REPO_ROOT / "build" / "compiled").resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
+        if getattr(dry_args, "no_flag_probe", False):
+            _FLAG_PROBE_DISABLED = True
+        _set_auto_install(bool(getattr(dry_args,
+                                       "auto_install_optional_deps", True)))
         _dry_cfg_path = dry_args.project_config or dry_args.config
         try:
             _dry_cfg = load_config(
@@ -12129,11 +12345,35 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "compatible.")
     args = parser.parse_args(argv)
 
+    # Group A.10 — argparse already declares --dry-run and
+    # --dry-run-all-archs as independent flags (history: they were added
+    # in two different streams). Make them mutually exclusive at parse
+    # time so ``--dry-run --dry-run-all-archs`` errors loudly instead of
+    # silently letting --dry-run-all-archs win (the historical behaviour
+    # because the all-archs branch executed first). We can't add them to
+    # a real mutually-exclusive group without reflowing the parser, so
+    # we do a post-parse check that emits the same error format as
+    # argparse's own conflict message.
+    if (getattr(args, "dry_run", False)
+            and getattr(args, "dry_run_all_archs", False)):
+        parser.error(
+            "argument --dry-run-all-archs: not allowed with argument "
+            "--dry-run (single-arch vs all-arch dry runs are mutually "
+            "exclusive — pick one)")
+
+    # Group A.2 — wire --no-auto-install for paths that don't go through
+    # build() (dry-run, list-archs, dry-run-all-archs, prune, e2e-smoke).
+    # build() also calls _set_auto_install internally, but those early-
+    # exit branches bypass it; mirror the user's choice here so every CLI
+    # entrypoint honours the flag uniformly.
+    _set_auto_install(bool(getattr(args, "auto_install_optional_deps", True)))
+
     # Agent-F2 — wire the --no-flag-probe global. Set BEFORE any path
     # that calls _device_cflags / _preflight_toolchain (every code branch
-    # below this point) so the flag is honoured uniformly.
+    # below this point) so the flag is honoured uniformly. The ``global``
+    # declaration lives at the top of main() (see Group A.3 / A.10 header
+    # above) — re-declaring here would be a SyntaxError.
     if getattr(args, "no_flag_probe", False):
-        global _FLAG_PROBE_DISABLED
         _FLAG_PROBE_DISABLED = True
 
     # Category 3a — --list-archs: dump every canonical ArchEntry and exit.
@@ -17205,10 +17445,17 @@ def _jinja_env():
     ok = _ensure_optional_dep(
         "jinja2", "emitter", install=_auto_install_enabled())
     if not ok:
+        # Group A.8 — there is no --no-emitter inverse CLI flag; the way
+        # to silence this message is to omit --enable-emitter (the
+        # default is OFF), or to explicitly set [codegen].enable_emitter
+        # = false in the project TOML. The previous message claimed a
+        # --no-emitter flag that argparse never declared — confusing
+        # because passing it would have been a parse error.
         raise CodegenError(
             "[emitter] codegen SKIPPED — jinja2 not installed. To enable:\n"
             "[emitter]   pip install jinja2\n"
-            "[emitter] Or pass --no-emitter to silence this message.\n"
+            "[emitter] To silence this message, omit --enable-emitter or "
+            "set [codegen].enable_emitter = false in your TOML config.\n"
             "[emitter] Or pass --auto-install (default ON in build()) "
             "to install it automatically.")
     import jinja2  # safe — _ensure_optional_dep just guaranteed it.
@@ -20415,11 +20662,17 @@ class KernelRegistry:
                     install=_auto_install_enabled(),
                     pip_name="cuda-python")
                 if not ok:
+                    # Group A.8 — no --no-runtime-specialization inverse
+                    # exists. To silence: omit --enable-runtime-
+                    # specialization (default OFF) or set
+                    # [runtime_specialization].enable = false in the TOML.
                     raise RegistryError(
                         "[nvrtc] SKIPPED — cuda-python not installed. "
                         "To enable: pip install cuda-python. "
-                        "Or pass --no-runtime-specialization to silence "
-                        "this message. Or pass --auto-install (default "
+                        "To silence this message, omit "
+                        "--enable-runtime-specialization or set "
+                        "[runtime_specialization].enable = false in your "
+                        "TOML config. Or pass --auto-install (default "
                         "ON in build()) to install it automatically."
                     )
                 # Retry the import paths now that the package is in.
@@ -20843,12 +21096,15 @@ def initialize_registry(spec, report=None) -> Optional[KernelRegistry]:
     for dtype in ("fp32", "fp64"):
         if not cuda_python_ok:
             if report is not None:
+                # Group A.8 — no --no-runtime-specialization inverse exists.
                 report.write(
                     f"[nvrtc] {dtype} prewarm SKIPPED — cuda-python "
                     f"not installed. To enable:\n"
                     f"[nvrtc]   pip install cuda-python\n"
-                    f"[nvrtc] Or pass --no-runtime-specialization to "
-                    f"silence this message.\n"
+                    f"[nvrtc] To silence this message, omit "
+                    f"--enable-runtime-specialization or set "
+                    f"[runtime_specialization].enable = false in your "
+                    f"TOML config.\n"
                     f"[nvrtc] Or pass --auto-install (default ON in "
                     f"build()) to install it automatically.\n")
             continue
@@ -20859,7 +21115,7 @@ def initialize_registry(spec, report=None) -> Optional[KernelRegistry]:
                 report.write(
                     f"[nvrtc] {dtype} prewarm skipped: {exc}\n"
                     f"[nvrtc]   pip install cuda-python   "
-                    f"# (or pass --no-runtime-specialization)\n")
+                    f"# (or omit --enable-runtime-specialization)\n")
     if report is not None:
         report.write(f"[nvrtc] registry initialized for {spec.arch} "
                      f"(cache={reg.cache_dir})\n")
@@ -21244,7 +21500,13 @@ _DEFAULT_PROJECT_CONFIG: Dict[str, Any] = {
     "autotune": {
         "min_improvement": 0.005,
         "patience": 0,
-        "max_seconds": 0,
+        # Group A.12 — None ⇒ "no wall-clock cap" (BayesianEarlyStopper
+        # treats None as unbounded; 0 used to mean "stop now" because
+        # ``time.time() - start_time >= 0`` fires on the first trial).
+        # The corresponding CLI flag (--max-tune-seconds) and build()
+        # kwarg both already default to None for the same reason; the
+        # TOML default was an outlier and has been aligned.
+        "max_seconds": None,
     },
     "codegen": {
         "enable_emitter": False,
@@ -21512,7 +21774,29 @@ def apply_to_buildspec(spec, config: Dict[str, Any]) -> None:
     # both are set so the canonical placement is unambiguous.
     macro_prefix = proj.get("macro_prefix") or src.get("macro_prefix")
     if macro_prefix:
-        spec.macro_prefix = str(macro_prefix)
+        # Group A.11 — validate the prefix is a legal C identifier
+        # fragment AND that it ends with '_'. Without these checks a
+        # downstream preprocessor will reject the emitted -D flag with a
+        # cryptic error, or worse, accept it and create ambiguous
+        # macros (-D{prefix}OPTIMIZER_ADAMW is unambiguous only when
+        # {prefix} ends with an underscore; otherwise it merges with the
+        # next token). The warning is non-fatal so existing user TOMLs
+        # that just happen to omit the trailing '_' keep working — they
+        # just get a heads-up at config-apply time.
+        macro_prefix_str = str(macro_prefix)
+        if not _re_consolidated.match(
+                r"^[A-Za-z_][A-Za-z0-9_]*$", macro_prefix_str):
+            sys.stderr.write(
+                f"[config] WARNING: macro_prefix={macro_prefix_str!r} "
+                f"contains invalid C identifier characters; "
+                f"emitted -D flags will likely be rejected by the "
+                f"preprocessor.\n")
+        if not macro_prefix_str.endswith("_"):
+            sys.stderr.write(
+                f"[config] WARNING: macro_prefix={macro_prefix_str!r} "
+                f"lacks trailing '_'; emitted macros will be ambiguous "
+                f"(e.g. -D{macro_prefix_str}OPTIMIZER_ADAMW).\n")
+        spec.macro_prefix = macro_prefix_str
     fused_op_template = (proj.get("fused_op_template")
                          or src.get("fused_op_template"))
     if fused_op_template:
@@ -21544,6 +21828,19 @@ def apply_to_buildspec(spec, config: Dict[str, Any]) -> None:
         if src.get("algorithms_dir"):
             sr["algorithms"] = str(src["algorithms_dir"])
         extra_inc = (src.get("include_paths", {}) or {}).get("extra", [])
+        # Group A.13 — type-check the TOML schema. ``include_paths.extra``
+        # MUST be a list of strings. Accepting a dict / scalar silently
+        # would either crash later (in [str(p) for p in {...}]) or
+        # iterate over dict keys, producing surprising include paths.
+        # We emit a warning and ignore the malformed value so the build
+        # proceeds without arbitrary mis-resolved -I flags.
+        if extra_inc and not isinstance(extra_inc, list):
+            sys.stderr.write(
+                f"[config] WARNING: sources.include_paths.extra must be a "
+                f"list of strings; got {type(extra_inc).__name__} "
+                f"({extra_inc!r}). Ignoring this entry — no extra "
+                f"-I flags will be added.\n")
+            extra_inc = []
         if extra_inc:
             sr["extra_includes"] = [str(p) for p in extra_inc]
         spec.source_roots = sr
