@@ -3209,8 +3209,10 @@ class TimingWorker:
                     err = ready.get("error") if ready else "no response"
                     self._error_log.append(("watchdog_restart", err))
                     if self._proc:
-                        try: self._proc.kill()
-                        except Exception: pass
+                        try:
+                            self._proc.kill()
+                        except Exception:
+                            pass
                     self._proc = None
             except Exception as exc:  # noqa: BLE001
                 self._error_log.append(("watchdog_restart_spawn", str(exc)))
@@ -8031,7 +8033,7 @@ def _device_cflags(spec: BuildSpec,
         if entry.warp_size == 64:
             base += ["-mcumode"]
             _trace_add(trace, "-mcumode", "kept",
-                       f"warp_size=64 (CDNA) → CU mode (not WGP)")
+                       "warp_size=64 (CDNA) → CU mode (not WGP)")
             _trace_add(trace, "-mtgsplit -mwavefrontsize32", "skipped",
                        "warp_size=64 (CDNA, not RDNA)")
         elif entry.warp_size == 32:
