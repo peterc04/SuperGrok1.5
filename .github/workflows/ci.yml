@@ -125,10 +125,13 @@ jobs:
     name: --self-test (python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     needs: py_compile
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
+    env:
+      GROK_NO_AUTO_INSTALL: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -139,7 +142,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu torch
-          pip install numpy pyyaml optuna ninja
+          pip install numpy pyyaml optuna ninja scikit-learn jinja2
       - name: Apt deps (ninja, g++)
         run: |
           sudo apt-get update
@@ -160,16 +163,16 @@ jobs:
           python3 -c "import optuna; print('optuna:', optuna.__version__)"
           python3 -c "import yaml; print('yaml:', yaml.__version__)"
           python3 -c "import numpy; print('numpy:', numpy.__version__)"
+          python3 -c "import sklearn; print('sklearn:', sklearn.__version__)"
+          python3 -c "import jinja2; print('jinja2:', jinja2.__version__)"
           echo "::endgroup::"
       - name: Run --self-test
-        # pipefail ensures the python exit code propagates through `tee`;
-        # without it the pipe always returned tee's exit (0) and we masked
-        # real Python crashes. -u disables stdout buffering so the log on
-        # failure still has the most recent test name.
-        shell: bash
+        timeout-minutes: 10
         run: |
-          set -o pipefail
           python3 -u -m grokking_optimizers.compile --self-test 2>&1 | tee self_test.log
+          rc=${PIPESTATUS[0]}
+          echo "exit_code=$rc" >> "$GITHUB_ENV"
+          exit $rc
       - name: Verify self-test summary
         if: success()
         run: |
@@ -179,8 +182,11 @@ jobs:
       - name: Surface failure context
         if: failure()
         run: |
-          echo "::group::self-test tail (last 100 lines)"
-          tail -n 100 self_test.log || echo "(no log)"
+          echo "::group::self-test tail (last 200 lines)"
+          tail -n 200 self_test.log 2>/dev/null || echo "(no log file)"
+          echo "::endgroup::"
+          echo "::group::stderr capture"
+          echo "exit_code=${{ env.exit_code }}"
           echo "::endgroup::"
       - name: Upload self-test log
         if: always()
@@ -432,7 +438,9 @@ jobs:
       - name: --list-archs
         run: python3 -m grokking_optimizers.compile --list-archs | head -5
       - name: --self-test
-        run: python3 -m grokking_optimizers.compile --self-test 2>&1 | tail -10
+        env:
+          GROK_NO_AUTO_INSTALL: "1"
+        run: python3 -u -m grokking_optimizers.compile --self-test 2>&1 | tail -10
 
   # ---------------------------------------------------------------------------
   # Aggregate gate — every required job must pass for a green check. Branch

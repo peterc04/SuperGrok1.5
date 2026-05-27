@@ -12554,6 +12554,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     global _FLAG_PROBE_DISABLED
     _argv = list(argv) if argv is not None else sys.argv[1:]
     if "--self-test" in _argv:
+        if os.environ.get("GROK_NO_AUTO_INSTALL"):
+            _set_auto_install(False)
         return _self_test()
     # Stream — debug-flags: bump _COMPILE_LOG_LEVEL globally BEFORE any
     # early-intercept path runs, so --flag-audit and the regular build
