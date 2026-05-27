@@ -216,7 +216,7 @@ _COMPILE_LOG_LEVEL: int = 0
 # the auto-detect probe chain picks a value. Tests / harnesses can read
 # this to confirm what was actually targeted. ``None`` means no
 # ``build()`` call has occurred (or one entered with an explicit arch).
-_LAST_BUILD_RESOLVED_ARCH: Optional[str] = None
+_LAST_BUILD_RESOLVED_ARCH: Optional[Tuple[str, str]] = None
 
 # Type alias — each tuple is (flag_repr, status, reason).
 #   flag_repr — the literal token(s) the helper would emit (or wanted to)
@@ -4963,6 +4963,11 @@ def _current_host() -> dict:
         hip_v = getattr(torch.version, "hip", None)
     except ImportError:
         torch_v = cuda_v = hip_v = None
+    try:
+        import jax
+        jax_v = getattr(jax, "__version__", None)
+    except ImportError:
+        jax_v = None
     return {
         "recorded_at": datetime.datetime.now().isoformat(),
         "platform":    platform.platform(),
@@ -4970,6 +4975,7 @@ def _current_host() -> dict:
         "torch":       torch_v,
         "cuda":        cuda_v,
         "hip":         hip_v,
+        "jax":         jax_v,
         "ncpus":       NCPUS,
     }
 
@@ -7662,8 +7668,8 @@ HOST_CFLAGS_BASE = [
 #                   on CUDA ≥10; the flag dates from 11.2 but older nvcc
 #                   silently accepts and ignores it, so the base list is
 #                   safe).
-#   * CUDA 11.5+  : -Xptxas --def-load-cache=ca / --def-store-cache=wb
-#                   (gated to 12.0+ conservatively).
+#   * CUDA 11.0+  : -Xptxas --def-load-cache=ca
+#   * CUDA 11.5+  : -Xptxas --def-store-cache=wb
 #   * CUDA 12.3+  : -Xptxas --register-usage-level=10
 #   * CUDA 12.5+  : -Xptxas --allow-expensive-optimizations=true
 #   * CUDA 12.5+  : -Xptxas --maxrregcount-list=...
@@ -8209,47 +8215,32 @@ def _device_ldflags(spec: BuildSpec) -> List[str]:
 # orchestrator merges this dict into the worker env at call sites; this
 # helper is the single source of truth for which flags we set.
 
-_XLA_FLAGS_BASE: Tuple[str, ...] = (
+_XLA_FLAGS_GPU: Tuple[str, ...] = (
     "--xla_gpu_autotune_level=4",
-    # F-F — was ``--xla_gpu_dump_autotuned_gemm_fusions`` (deprecated in
-    # OpenXLA's debug_options_flags.cc); renamed to the supported
-    # ``--xla_gpu_dump_autotuned_instructions`` per the upstream rename.
-    # The new spelling dumps the same per-instruction autotune info plus
-    # any non-GEMM fusions that XLA decided to autotune.
     "--xla_gpu_dump_autotuned_instructions=true",
     "--xla_gpu_enable_triton_gemm=true",
     "--xla_gpu_enable_cublaslt=true",
-    # F-F — ``--xla_gpu_enable_cudnn_fmha`` is a deprecated NO-OP in
-    # current OpenXLA (the FMHA path is always-on). Removed so the flag
-    # list doesn't accumulate cruft.
     "--xla_gpu_enable_async_collectives=true",
     "--xla_gpu_enable_latency_hiding_scheduler=true",
-    # Stream α: extend the command-buffer scope to include CUBLASLT (the
-    # cuBLAS-Lt variant). Without it, cuBLASLt GEMMs fall outside the CUDA
-    # graph and trigger per-call host/device sync.
     "--xla_gpu_enable_command_buffer=FUSION,CUSTOM_CALL,CUBLAS,CUBLASLT,CUDNN,COLLECTIVES",
     "--xla_gpu_graph_level=3",
-    # Stream α: per-XLA-2025 perf flags. All of these are documented in
-    # third_party/xla/xla/debug_options_flags.cc and are pure-perf or
-    # numerically inert on the workloads we care about (no compile/runtime
-    # behaviour changes for projects that don't use the relevant codepath).
-    # F-F — ``--xla_gpu_enable_persistent_temp_buffers`` was REMOVED /
-    # RESERVED in OpenXLA debug_options_flags.cc; setting it is a NO-OP
-    # at best and a hard parse error on newer XLA. Removed.
     "--xla_gpu_enable_priority_fusion=true",
     "--xla_gpu_enable_pipelined_all_reduce=true",
     "--xla_gpu_enable_pipelined_all_gather=true",
     "--xla_gpu_enable_pipelined_reduce_scatter=true",
-    # 8 MiB redzone padding around device allocations — catches OOB writes
-    # in memcheck workflows, no overhead in release.
     "--xla_gpu_redzone_padding_bytes=8388608",
-    # Capture every fused region into a CUDA graph (default min_size=2
-    # leaves trivial single-op regions out of the graph and pays per-call
-    # launch overhead).
     "--xla_gpu_graph_min_graph_size=1",
-    # Widen the GEMM autotune solution pool from the default 32 to 128 so
-    # the tuner can see more cuBLASLt / Triton candidates per fusion.
     "--xla_gpu_autotune_max_solutions=128",
+)
+
+_XLA_FLAGS_TPU: Tuple[str, ...] = (
+    "--xla_tpu_enable_async_collective_fusion=true",
+    "--xla_tpu_enable_async_collective_fusion_multiple_steps=true",
+    "--xla_enable_async_all_gather=true",
+    "--xla_tpu_enable_latency_hiding_scheduler=true",
+    "--xla_tpu_megacore_fusion_allow_ags=false",
+    "--xla_tpu_spmd_rng_bit_generator_unsafe=true",
+    "--xla_dump_hlo_as_text=true",
 )
 
 
@@ -8269,8 +8260,9 @@ def _xla_env(arch: str, out_dir: Path,
         return {}
     cache_dir = Path(out_dir) / "jax_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
+    xla_flags = _XLA_FLAGS_TPU if arch.startswith("tpu_") else _XLA_FLAGS_GPU
     env: Dict[str, str] = {
-        "XLA_FLAGS": " ".join(_XLA_FLAGS_BASE),
+        "XLA_FLAGS": " ".join(xla_flags),
         "JAX_COMPILATION_CACHE_DIR": str(cache_dir),
         # Cache every compile — default skips short ones (≥1s by default).
         "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
@@ -11230,6 +11222,11 @@ def _pallas_versions() -> Dict[str, str]:
     except ImportError:
         out["jax"] = "absent"
     try:
+        import jaxlib  # type: ignore
+        out["jaxlib"] = getattr(jaxlib, "__version__", "unknown")
+    except ImportError:
+        out["jaxlib"] = "absent"
+    try:
         import libtpu  # type: ignore
         out["libtpu"] = getattr(libtpu, "__version__", "unknown")
     except ImportError:
@@ -11463,9 +11460,10 @@ def build_aot(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
 
     When ``spec.pgo`` is True, runs the 3-pass instrument → workload →
     use loop. Otherwise a single AOT build."""
-    _ensure_nvcc_on_path()
-    _refresh_torch_cuda_home()
     entry = get_arch_entry(spec.arch)
+    if entry.vendor != "pallas":
+        _ensure_nvcc_on_path()
+        _refresh_torch_cuda_home()
     if entry.vendor == "pallas":
         # TPU/Pallas has no AOT phase — no nvcc, no .so, no cpp_extension.
         # Return a sentinel Path so downstream consumers (_publish_aot_artifact,
@@ -11481,7 +11479,7 @@ def build_aot(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
     host_cflags = _host_cflags(spec)
     device_cflags = _device_cflags(spec)
     ldflags = _ldflags(spec)
-    source_hash = _hash_sources(sources) if sources else "pallas"
+    source_hash = _hash_sources(sources) if sources else "empty"
     host_hash = _hash_flags(host_cflags)
     device_hash = _hash_flags(device_cflags)
 
@@ -11723,9 +11721,10 @@ def _publish_aot_artifact(spec: BuildSpec, so_path: Path, report) -> Path:
 
 def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
     """Run only the JIT autotune + final-link half. Requires GPU."""
-    _ensure_nvcc_on_path()
-    _refresh_torch_cuda_home()
     entry = get_arch_entry(spec.arch)
+    if entry.vendor != "pallas":
+        _ensure_nvcc_on_path()
+        _refresh_torch_cuda_home()
     if entry.vendor == "pallas":
         # Pallas/TPU JIT phase = PallasTimer-driven autotune. No .so output;
         # winning kwargs are persisted as a JSON manifest under spec.out_dir.
@@ -11836,7 +11835,7 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
 def build(
     optimizer: str,
     model: str,
-    arch: str,
+    arch: Optional[str] = None,
     *,
     cache: Optional[CompileCache] = None,
     cache_path: Optional[Path] = None,
@@ -11927,7 +11926,10 @@ def build(
     # Expose the resolved arch as a module-level attribute so tests, the
     # harness, and downstream callers can verify what build() actually
     # used after a None/auto resolution.
-    globals()["_LAST_BUILD_RESOLVED_ARCH"] = arch
+    if not (isinstance(_LAST_BUILD_RESOLVED_ARCH, tuple)
+            and len(_LAST_BUILD_RESOLVED_ARCH) == 2
+            and _LAST_BUILD_RESOLVED_ARCH[0] == arch):
+        globals()["_LAST_BUILD_RESOLVED_ARCH"] = (arch, "explicit")
 
     # Discover nvcc on the filesystem if it's not on PATH (common when
     # CUDA lives at /usr/local/cuda-<ver>/, in a pip-installed nvidia
@@ -12267,7 +12269,17 @@ def build(
             step("resolve")
 
             if entry.vendor == "pallas":
-                build_aot(spec, cache, report)  # logs pallas no-op
+                if runtime in ("aot", "both"):
+                    so_path = build_aot(spec, cache, report)  # returns pallas-noop sentinel
+                if runtime in ("jit", "both") and autotune:
+                    report.write("\n--- PALLAS AUTOTUNE PHASE ---\n")
+                    pallas_result = build_jit(spec, cache, report)
+                    if pallas_result is not None:
+                        so_path = pallas_result
+                        report.write(f"  [pallas] autotune manifest: {so_path}\n")
+                    else:
+                        report.write("  [pallas] autotune produced no manifest "
+                                     "(expected for dry-run or missing device)\n")
             else:
                 if runtime in ("aot", "both"):
                     report.write("\n--- AOT PHASE ---\n")
@@ -12320,16 +12332,33 @@ def build(
                     pass
             if profile and runtime != "aot" and not build_produced_nothing:
                 report.write("\n--- PROFILE PASS ---\n")
-                _dispatch_profile(optimizer, model, arch, report)
+                if entry.vendor == "pallas":
+                    report.write("  [profile] Pallas/TPU: skipping subprocess "
+                                 "profiler (TPU device cannot be shared with "
+                                 "a child process). Use jax.profiler in your "
+                                 "training script for XLA HLO traces.\n")
+                else:
+                    _dispatch_profile(optimizer, model, arch, report)
                 step("profile")
 
             # Stream 7 — NVRTC / hipRTC kernel-registry pre-warm.
-            if enable_runtime_specialization and not build_produced_nothing:
+            # Pallas has no NVRTC/hipRTC path — skip entirely.
+            if (enable_runtime_specialization
+                    and not build_produced_nothing
+                    and entry.vendor in ("cuda", "hip")):
                 from grokking_optimizers.kernel_registry import initialize_registry
                 initialize_registry(spec, report)
 
             report.write(f"\n# Cache:    {cache.path}\n")
-            report.write(f"# Final .so: {so_path}\n")
+            if entry.vendor == "pallas":
+                if so_path is not None and str(so_path) != "pallas-noop":
+                    report.write(f"# Pallas manifest: {so_path}\n")
+                else:
+                    report.write("# Pallas: no AOT artifact (JAX compiles "
+                                 "at runtime). Autotune config saved to "
+                                 f"cache at {cache.path}\n")
+            else:
+                report.write(f"# Final .so: {so_path}\n")
     finally:
         cache.save()
         close()
@@ -12426,7 +12455,7 @@ def _flag_audit_main(argv: List[str]) -> int:
             f"defaults.\n")
         _fa_cfg = {}
     _fa_opt0 = "adamw"
-    _fa_model0 = "mamba3"
+    _fa_model0 = "mamba"
     try:
         _opts = _resolve_enabled_optimizers(_fa_cfg)
         if _opts:
@@ -13055,8 +13084,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"min_toolchain={_min_tc:<8s} features={_features}\n")
         return 0
 
-    # Category 3a — --dry-run: single-arch manifest. Requires --arch
-    # (auto-detect filled in args.arch above if user omitted it).
+    # Stream β.1 — auto-detect --arch when omitted on the CLI. We must do
+    # this BEFORE any branch that reads args.arch (--dry-run, --dry-run-
+    # all-archs is arch-agnostic, the runtime split + build path below all
+    # need a resolved arch). Identical to passing --arch explicitly when
+    # the user does supply one.
+    if getattr(args, "arch", None) is None:
+        args.arch = _resolve_default_arch(_early_cfg)
+
+    # Category 3a — --dry-run: single-arch manifest. --arch is now
+    # guaranteed to be non-None (auto-detected above if user omitted it).
     if getattr(args, "dry_run", False):
         out_dir = Path(args.out or REPO_ROOT / "build" / "compiled").resolve()
         rc = _ensure_out_dir(out_dir)
@@ -13108,14 +13145,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             if "flag-probe" in ln or "WARN flag" in ln:
                 sys.stdout.write(f"  {ln}\n")
         return 0
-
-    # Stream β.1 — auto-detect --arch when omitted on the CLI. We must do
-    # this BEFORE any branch that reads args.arch (dry-run-all-archs is
-    # arch-agnostic; the runtime split + build path below all need a
-    # resolved arch). Identical to passing --arch explicitly when the
-    # user does supply one.
-    if getattr(args, "arch", None) is None:
-        args.arch = _resolve_default_arch(_early_cfg)
 
     if args.dry_run_all_archs:
         out_dir = Path(args.out or REPO_ROOT / "build" / "compiled").resolve()
@@ -13301,10 +13330,20 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     report = args.report or (
         args.out / f"compile_{args.optimizer}_{args.model}_{args.arch}.txt")
-    sys.stdout.write(f"{report}\n")
-    return 0 if (so is not None
-                 or get_arch_entry(args.arch).vendor == "pallas"
-                 or args.runtime == "aot") else 1
+    _is_pallas = get_arch_entry(args.arch).vendor == "pallas"
+    _ok = (so is not None or _is_pallas or args.runtime == "aot")
+    if _ok:
+        if _is_pallas:
+            sys.stdout.write(f"built: {so} (pallas — no .so; see report)\n")
+        else:
+            sys.stdout.write(f"built: {so}\n")
+    else:
+        sys.stderr.write(
+            f"[compile] FAILED — build() returned None for "
+            f"{args.optimizer}/{args.model}/{args.arch} "
+            f"(runtime={args.runtime}). See {report} for details.\n")
+    sys.stdout.write(f"report: {report}\n")
+    return 0 if _ok else 1
 
 
 def _e2e_smoke(out_dir: Path, *, max_seconds: float = 120.0) -> int:
@@ -13371,12 +13410,10 @@ def _e2e_smoke(out_dir: Path, *, max_seconds: float = 120.0) -> int:
     cache = CompileCache(cache_path)
     tuned_h = REPO_ROOT / "csrc/algorithms/tuned_configs.h"
 
-    # Be defensive about model name: prefer the new "mamba3" enum, fall
-    # back to legacy "mamba" if the OPT-side MODELS list doesn't have it.
     chosen_model: Optional[str] = None
     so: Optional[Path] = None
     last_exc: Optional[BaseException] = None
-    for candidate_model in ("mamba3", "mamba"):
+    for candidate_model in ("mamba", "mamba3"):
         try:
             so = build(
                 optimizer="adamw",
@@ -13991,12 +14028,12 @@ def _self_test_flags(run) -> None:
             env = _xla_env("tpu_v5p", td)
             assert env, "tpu_v5p should produce a non-empty env"
             assert "XLA_FLAGS" in env
-            assert "xla_gpu_autotune_level" in env["XLA_FLAGS"]
-            assert "xla_gpu_enable_triton_gemm=true" in env["XLA_FLAGS"]
-            assert "xla_gpu_graph_level=3" in env["XLA_FLAGS"]
+            assert "xla_tpu_enable_latency_hiding_scheduler" in env["XLA_FLAGS"]
+            assert "xla_enable_async_all_gather" in env["XLA_FLAGS"]
+            assert "xla_gpu_autotune_level" not in env["XLA_FLAGS"], \
+                "GPU-specific flags must not appear in TPU XLA_FLAGS"
             assert env["JAX_COMPILATION_CACHE_DIR"] == str(td / "jax_cache")
             assert env["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"] == "0"
-            # Cache dir is created lazily.
             assert (td / "jax_cache").is_dir()
             # Non-Pallas arch returns empty.
             assert _xla_env("sm_90a", td) == {}
@@ -14088,33 +14125,28 @@ def _self_test_flags(run) -> None:
             "gfx950 leaked bare --offload-arch=gfx950 alongside suffixed form"
 
     def test_stream_alpha_xla_flags():
-        """Stream α: every new XLA flag appears in the env dict for Pallas
-        archs; none of the flags leak into non-Pallas archs."""
+        """Stream α: TPU archs get TPU-specific flags; GPU flags don't
+        leak into TPU; deprecated flags are absent."""
         td = Path(tempfile.mkdtemp())
         try:
             env = _xla_env("tpu_v5p", td)
             xf = env.get("XLA_FLAGS", "")
-            # F-F — ``--xla_gpu_enable_persistent_temp_buffers``,
-            # ``--xla_gpu_enable_cudnn_fmha`` and
-            # ``--xla_gpu_dump_autotuned_gemm_fusions`` were removed /
-            # renamed from this base list (the first two are NO-OPs /
-            # RESERVED in current OpenXLA; the third was renamed to
-            # ``--xla_gpu_dump_autotuned_instructions``). We assert the
-            # NEW spelling is present AND the deprecated spellings are
-            # absent so downstream env merges don't accumulate cruft.
             for required in (
-                "--xla_gpu_enable_priority_fusion=true",
-                "--xla_gpu_enable_pipelined_all_reduce=true",
-                "--xla_gpu_enable_pipelined_all_gather=true",
-                "--xla_gpu_enable_pipelined_reduce_scatter=true",
-                "--xla_gpu_redzone_padding_bytes=8388608",
-                "--xla_gpu_graph_min_graph_size=1",
-                "--xla_gpu_autotune_max_solutions=128",
-                "--xla_gpu_dump_autotuned_instructions=true",
-                "CUBLASLT",  # command-buffer scope extension
+                "--xla_tpu_enable_latency_hiding_scheduler=true",
+                "--xla_enable_async_all_gather=true",
+                "--xla_tpu_enable_async_collective_fusion=true",
+                "--xla_dump_hlo_as_text=true",
             ):
                 assert required in xf, \
                     f"tpu_v5p XLA_FLAGS missing {required!r}"
+            for gpu_only in (
+                "--xla_gpu_autotune_level",
+                "--xla_gpu_enable_triton_gemm",
+                "--xla_gpu_graph_level",
+                "CUBLASLT",
+            ):
+                assert gpu_only not in xf, \
+                    f"tpu_v5p XLA_FLAGS has GPU-only flag {gpu_only!r}"
             for forbidden in (
                 "--xla_gpu_enable_persistent_temp_buffers",
                 "--xla_gpu_enable_cudnn_fmha",
@@ -14122,10 +14154,8 @@ def _self_test_flags(run) -> None:
             ):
                 assert forbidden not in xf, \
                     f"tpu_v5p XLA_FLAGS still carries deprecated {forbidden!r}"
-            # JAX_PLATFORMS pinned to tpu for tpu_* archs.
             assert env.get("JAX_PLATFORMS") == "tpu", \
                 "tpu_v5p missing JAX_PLATFORMS=tpu"
-            # LIBTPU_INIT_ARGS passthrough — when set in the environment.
             saved = os.environ.get("LIBTPU_INIT_ARGS")
             os.environ["LIBTPU_INIT_ARGS"] = "--xla_tpu_test=1"
             try:
@@ -14137,7 +14167,6 @@ def _self_test_flags(run) -> None:
                     os.environ.pop("LIBTPU_INIT_ARGS", None)
                 else:
                     os.environ["LIBTPU_INIT_ARGS"] = saved
-            # Non-Pallas archs still return empty.
             assert _xla_env("sm_90a", td) == {}
             assert _xla_env("gfx942", td) == {}
         finally:
@@ -14999,7 +15028,7 @@ def _self_test_cache(run) -> None:
             cache = CompileCache(cache_path)
             # Three trials, mimicking a small autotune burst.
             for i in range(3):
-                cache.record_trial("lion", "mamba3", "sm_90a", {
+                cache.record_trial("lion", "mamba", "sm_90a", {
                     "config":     {"block": 64 * (i + 1), "vec": 2, "unroll": 4},
                     "timing_ms":  0.5 + 0.01 * i,
                     "trial_num":  i,
@@ -15010,7 +15039,7 @@ def _self_test_cache(run) -> None:
             cache.save()
 
             # 1) Sidecar exists with exactly 3 lines.
-            sidecar = tdp / "trials_lion_mamba3_sm_90a.jsonl"
+            sidecar = tdp / "trials_lion_mamba_sm_90a.jsonl"
             assert sidecar.exists(), \
                 f"expected sidecar at {sidecar}, dir contents: {list(tdp.iterdir())}"
             lines = [ln for ln in sidecar.read_text().splitlines() if ln.strip()]
@@ -15024,12 +15053,12 @@ def _self_test_cache(run) -> None:
             # 2) Main JSON's bayesian_trials/sweep_history are empty
             #    placeholders (NOT the full trial payload).
             on_disk = json.loads(cache_path.read_text())
-            entry = on_disk["entries"]["lion/mamba3/sm_90a"]
+            entry = on_disk["entries"]["lion/mamba/sm_90a"]
             assert entry["bayesian_trials"] == [], entry["bayesian_trials"]
             assert entry["sweep_history"] == [], entry["sweep_history"]
 
             # 3) trial_log_path / trial_log_summary populated.
-            assert entry["trial_log_path"] == "trials_lion_mamba3_sm_90a.jsonl", \
+            assert entry["trial_log_path"] == "trials_lion_mamba_sm_90a.jsonl", \
                 entry["trial_log_path"]
             tls = entry["trial_log_summary"]
             assert tls["n_trials"] == 3, tls
@@ -15039,8 +15068,8 @@ def _self_test_cache(run) -> None:
             # 4) Roundtrip: re-load cache from disk; verify sidecar
             #    summary persists and matches _read_trial_log_summary.
             reloaded = CompileCache(cache_path)
-            re_entry = reloaded._data["entries"]["lion/mamba3/sm_90a"]
-            assert re_entry["trial_log_path"] == "trials_lion_mamba3_sm_90a.jsonl"
+            re_entry = reloaded._data["entries"]["lion/mamba/sm_90a"]
+            assert re_entry["trial_log_path"] == "trials_lion_mamba_sm_90a.jsonl"
             assert re_entry["trial_log_summary"]["n_trials"] == 3
             recomputed = _read_trial_log_summary(sidecar)
             assert recomputed["n_trials"] == 3, recomputed
@@ -15049,7 +15078,7 @@ def _self_test_cache(run) -> None:
 
             # 5) In-memory state on the ORIGINAL cache still has the
             #    trials (save() must not mutate the in-memory dict).
-            in_mem = cache._data["entries"]["lion/mamba3/sm_90a"]
+            in_mem = cache._data["entries"]["lion/mamba/sm_90a"]
             assert len(in_mem["bayesian_trials"]) == 3, \
                 "save() must not mutate in-memory bayesian_trials"
             assert len(in_mem["sweep_history"]) == 3, \
@@ -15077,7 +15106,7 @@ def _self_test_cache(run) -> None:
 
             def writer(opt: str):
                 c = CompileCache(cp)
-                c.record_aot(opt, "mamba3", "sm_90a",
+                c.record_aot(opt, "mamba", "sm_90a",
                              source_hash="s_" + opt,
                              host_flags_hash="h_" + opt,
                              device_flags_hash="d_" + opt,
@@ -15096,10 +15125,10 @@ def _self_test_cache(run) -> None:
 
             on_disk = json.loads(cp.read_text())
             entries = on_disk.get("entries", {})
-            assert "lion/mamba3/sm_90a" in entries, \
+            assert "lion/mamba/sm_90a" in entries, \
                 f"lion entry lost — concurrent write race! Keys: " \
                 f"{sorted(entries.keys())}"
-            assert "muon/mamba3/sm_90a" in entries, \
+            assert "muon/mamba/sm_90a" in entries, \
                 f"muon entry lost — concurrent write race! Keys: " \
                 f"{sorted(entries.keys())}"
         finally:
@@ -15146,11 +15175,11 @@ def _self_test_cache(run) -> None:
             ro_dir.mkdir()
             cp = ro_dir / "ro_cache.json"
             cache = CompileCache(cp)
-            cache.record_aot("lion", "mamba3", "sm_90a",
+            cache.record_aot("lion", "mamba", "sm_90a",
                              source_hash="s", host_flags_hash="h",
                              device_flags_hash="d", so_path=None)
             cache.save()  # baseline write should succeed
-            cache.record_aot("muon", "mamba3", "sm_90a",
+            cache.record_aot("muon", "mamba", "sm_90a",
                              source_hash="s2", host_flags_hash="h2",
                              device_flags_hash="d2", so_path=None)
             # Strip write permissions to force OSError on rename.
@@ -15172,8 +15201,8 @@ def _self_test_cache(run) -> None:
                 except OSError:
                     pass
             # In-memory state is preserved either way (lion AND muon).
-            e_lion = cache._data["entries"].get("lion/mamba3/sm_90a")
-            e_muon = cache._data["entries"].get("muon/mamba3/sm_90a")
+            e_lion = cache._data["entries"].get("lion/mamba/sm_90a")
+            e_muon = cache._data["entries"].get("muon/mamba/sm_90a")
             assert e_lion is not None, "in-memory lion entry lost"
             assert e_muon is not None, "in-memory muon entry lost"
         finally:
@@ -16819,7 +16848,7 @@ def _self_test_pallas(run) -> None:
         with tempfile.TemporaryDirectory() as td:
             tdp = Path(td)
             spec = BuildSpec(
-                optimizer="adamw", model="mamba3", arch="tpu_v5p",
+                optimizer="adamw", model="mamba", arch="tpu_v5p",
                 out_dir=tdp,
             )
 
@@ -16839,7 +16868,7 @@ def _self_test_pallas(run) -> None:
         with tempfile.TemporaryDirectory() as td:
             tdp = Path(td)
             spec = BuildSpec(
-                optimizer="adamw", model="mamba3", arch="tpu_v5p",
+                optimizer="adamw", model="mamba", arch="tpu_v5p",
                 out_dir=tdp, aot_artifact_dir=tdp / "published",
             )
 
@@ -22064,6 +22093,9 @@ def initialize_registry(spec, report=None) -> Optional[KernelRegistry]:
     """
     if not spec.enable_runtime_specialization:
         return None
+    vendor = get_arch_entry(spec.arch).vendor
+    if vendor not in ("cuda", "hip"):
+        return None
     # Honor the spec-level toggle. _ensure_optional_dep reads the module
     # global; setting it here means every NVRTC site (this prewarm loop
     # plus any later live dispatch) sees the same switch.
@@ -22254,12 +22286,8 @@ def collect_pallas_stalls(workload_cmd: List[str], out_dir: Path,
     dump_dir = out_dir / "xla_dump"
     dump_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
-    # F-F — use the supported ``--xla_gpu_dump_autotuned_instructions``
-    # spelling here too. The deprecated ``_gemm_fusions`` variant was
-    # renamed in OpenXLA debug_options_flags.cc and no longer emits any
-    # dump on recent XLA releases.
     extra_flags = (
-        f"--xla_gpu_dump_autotuned_instructions=true "
+        f"--xla_dump_hlo_as_text=true "
         f"--xla_dump_to={dump_dir}"
     )
     env["XLA_FLAGS"] = (env.get("XLA_FLAGS", "") + " " + extra_flags).strip()
