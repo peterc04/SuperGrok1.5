@@ -20,6 +20,66 @@ entire MAXIMAL pipeline (codegen, NVRTC, device PGO, multi-GPU,
 numerical validation, TOML config loader, Pallas backend) lives inside
 `grokking_optimizers/compile.py`.
 
+### Tiny shell-only quickstart (sanity check + arch dump)
+
+Before the four-Python-step flow below, three one-line CLI commands let
+you confirm the wrapper is healthy on the current host without
+installing anything but Python and the package itself:
+
+```bash
+# 1. Run the inline self-test suite (116 checks, no GPU needed)
+python3 -m grokking_optimizers.compile --self-test
+
+# 2. List every supported arch with its vendor / min toolchain / features
+python3 -m grokking_optimizers.compile --list-archs
+
+# 3. Sweep all 25 archs into per-arch JSON manifests (no compile, no GPU)
+python3 -m grokking_optimizers.compile --dry-run-all-archs --out /tmp/manifests
+```
+
+Auto-arch detection: every CLI invocation now treats `--arch` as
+**optional**. When omitted, the wrapper probes `torch.cuda` → `rocm-smi` →
+`jax.devices()` → your TOML config's `[archs].default` → built-in
+fallback (`sm_90a`), prints a `[arch] auto-detected <arch> from <source>`
+line, and proceeds. Pass `--arch sm_90a` (or any other) to override.
+
+Single-arch dry-run: `python3 -m grokking_optimizers.compile -O adamw -M
+mamba3 --arch sm_90a --dry-run --out /tmp/probe --enable-synth-codegen
+--enable-polyhedral` writes one manifest for that arch (mirror of
+`--dry-run-all-archs` but scoped to one entry), exercises the synthetic
+codegen / polyhedral layers if you flip them on, and exits without
+invoking nvcc/hipcc.
+
+### Using this wrapper for a *different* project (no SuperGrok assumptions)
+
+`compile.py` is project-agnostic — write a tiny TOML config and every
+emitted macro, cache directory, source layout, and template lookup
+re-prefixes for your project. Example:
+
+```toml
+# myproject.toml
+[project]
+name          = "myproject"      # → ~/.cache/myproject/nvrtc, NVRTC cache namespace
+namespace     = "myproject"      # → C++ namespace in emitted code
+python_package = "myproject"      # → import path the registry uses
+
+[sources]
+source_layout = "src/myproject/{name}"        # where your .cu / .hip.cpp / .py live
+macro_prefix  = "MYPROJ_"                     # → -DMYPROJ_OPTIMIZER_*, -DMYPROJ_ARCH_*, -DMYPROJ_VERBOSE
+fused_op_template = "fused_{name}_step.cpp.j2"
+
+[archs]
+default = "sm_86"                # used when --arch is omitted and no GPU probe succeeds
+
+[optimizers]
+enabled = ["adamw", "lion", "my_custom_opt"]  # any optimizer name; not restricted to the SuperGrok 11
+```
+
+Then drive `compile.py` exactly as below but with `--config myproject.toml`
+or `build(..., config="myproject.toml")`. Verified end-to-end: emits
+`-DMYPROJ_OPTIMIZER_ADAMW`, `-DMYPROJ_ARCH_SM_86`, `-DMYPROJ_VERBOSE`
+with **zero `SG_BUILD_` leakage** across all 25 archs.
+
 ### Step 1 — Clone the repo
 
 ```bash
@@ -337,21 +397,35 @@ from pathlib import Path
 sys.path.insert(0, str(Path.cwd()))   # assumes you're in SuperGrok1.5/
 
 from grokking_optimizers.compile import main as compile_main
-assert compile_main(["--self-test"]) == 0  # prints "[self-test] 90 passed, 0 failed"
+assert compile_main(["--self-test"]) == 0  # prints "[self-test] 116 passed, 0 failed"
 ```
 
-The self-test covers ARCH_TABLE completeness for all 25 archs, per-arch
-search-space cardinalities (billions per CUDA/HIP arch), native compiler
-flags, the four Bayesian early-stopping criteria (plateau, EI-exhaustion,
-coverage saturation, wall-clock), all 44 bundled Jinja2 templates
-(11 optimizers × 4 archs), the CUTLASS GEMM emitter (skip path on hosts
-without cutlass-python), NVRTC compile + live `cuLaunchKernel` dispatch
-(gated on cuda-python + GPU), device-PGO stall-to-bias mapping, the
-work-stealing multi-GPU pool, cache schema migrations (v2 → v3 → v4),
-the v4 `.jsonl` trial sidecar plumbing, the per-arch dry-run manifest
-sweep, the e2e smoke gate, Pallas backend sentinels, numerical-validation
-tolerances, the TOML config loader, and toolchain-bootstrap dispatch —
-no GPU, nvcc, hipcc, or jax[tpu] required to pass it.
+The 116-test self-test covers: ARCH_TABLE completeness for all 25 archs,
+per-arch search-space cardinalities (billions per CUDA/HIP arch, ~3.4T for
+sm_100a), the new Stream α native flag emission (`--warn-on-spills`,
+`--default-stream per-thread`, `-rdc=true`, `--source-in-ptx` on NVIDIA;
+`-fgpu-rdc`, `-mllvm --enable-newgvn`, `--inline-threshold=275` on AMD;
+`--xla_gpu_enable_priority_fusion`, pipelined collectives,
+`autotune_max_solutions=128` on JAX), the ptxas-v stderr parser, the five
+Bayesian early-stopping criteria (plateau, EI-exhaustion, coverage
+saturation, wall-clock, hard ceiling), all 44 bundled Jinja2 templates
+(11 optimizers × 4 arch families), the polyhedral `apply_schedule` body
+lift (real libclang Cursor walk + honest fallback comment when libclang
+absent), the arch-native MMA emission in synth GEMM (`wgmma.mma_async`,
+`tcgen05.mma`, `mfma_f32_16x16x16`, `wmma_f32_16x16x16`), the CUTLASS/CK
+fallback `source=` tagging, the bias_trial_queue device-PGO wiring into
+`run_bayesian`, NVRTC compile + live `cuLaunchKernel` dispatch (gated on
+cuda-python + GPU), the work-stealing multi-GPU pool, cache schema
+migrations (v2 → v3 → v4), the v4 `.jsonl` trial sidecar plumbing, the
+Stream β auto-arch resolver (torch.cuda → rocm-smi → jax.devices → TOML →
+fallback), the preflight version-mismatch suggestion lines, the per-arch
+dry-run manifest sweep, the e2e smoke gate, Pallas backend sentinels with
+the `block_spec` search-space dim, numerical-validation tolerances, the
+TOML config loader (with project-agnostic macro-prefix override), the
+Optuna 4.0+ `study.tell(state=PRUNED)` regression test, the
+buildspec-field AST guardrail (catches field renames at test time), and
+toolchain-bootstrap dispatch — no GPU, nvcc, hipcc, or jax[tpu] required
+to pass it.
 
 ### Troubleshooting
 
@@ -458,6 +532,165 @@ The wrapper goes beyond flag-tuning. Every layer below stacks on top of
 the previous one — flag tuning is a strict subset of the emission space,
 which is a strict subset of the runtime-specialization space.
 
+### Native compiler flag coverage (Stream α)
+
+The wrapper emits every published version+arch-gated flag for the three
+target compilers it can find a reason to add. Nothing project-specific
+about these — they apply to any kernel source. The lists below are what
+ships out-of-the-box; everything is gated through `ARCH_TABLE[arch]
+.features` + detected toolchain version so older toolchains skip flags
+they don't support.
+
+**nvcc** (gated on detected CUDA version):
+- `-Xptxas --warn-on-spills` (CUDA 11.0+) — spill diagnostics for any kernel
+- `-Xptxas --def-load-cache=ca` / `--def-store-cache=wb` — per-arch cache policy
+- `-Xptxas --maxrregcount-list=…` (CUDA 12.5+) — finer than the single-value flag
+- `-Xptxas --opt-level=3 --allow-expensive-optimizations=true`
+- `--default-stream per-thread` — perf win for any multi-stream launcher
+- `-rdc=true` + `--device-link-options=-dlto` — cross-TU LTO
+- `--minimal` (CUDA 13.0+) when available
+- `--source-in-ptx` + `-lineinfo`
+- `--keep --keep-dir <out>/nvcc_intermediate` when `debug_symbols=True`
+- `--use-local-env` on Windows
+- **ptxas -v stderr parser**: `regs_used`, `smem_bytes`, `stack_frame`,
+  `spill_stores`, `spill_loads` parsed out of the `-Xptxas -v` log and
+  written into the trial sidecar as `ptxas_info`. Feeds the learned
+  cost model + the rejection budget.
+
+**hipcc** (gated on detected ROCm version):
+- `-fgpu-rdc` for cross-TU LTO
+- `-mllvm --enable-newgvn` — better global value numbering on CDNA3
+- `-mllvm --inline-threshold=275` — higher than clang default 225 for GPU
+- `-mllvm --amdgpu-coerce-illegal-types=1` — fp8 / fp4 paths
+- `--save-temps=cwd` when `debug_symbols=True`
+- `-Wno-pass-failed=transform-warning` — suppress RDNA wavefront noise
+- Per-arch: `gfx950 → --offload-arch=gfx950:sramecc+:xnack-`
+
+**JAX / XLA** (Pallas archs):
+- `--xla_gpu_enable_persistent_temp_buffers=true`
+- `--xla_gpu_enable_priority_fusion=true`
+- `--xla_gpu_enable_pipelined_all_reduce=true` / `all_gather` / `reduce_scatter`
+- `--xla_gpu_redzone_padding_bytes=8388608` — 8 MiB redzone for memcheck
+- `--xla_gpu_enable_command_buffer=FUSION,CUSTOM_CALL,CUBLAS,CUBLASLT,CUDNN,COLLECTIVES`
+- `--xla_gpu_graph_min_graph_size=1` — always graph
+- `--xla_gpu_autotune_max_solutions=128`
+- Env: `JAX_PLATFORMS=tpu` when arch starts with `tpu_`; `LIBTPU_INIT_ARGS` pass-through
+
+### Zero-config arch routing (Stream β)
+
+`--arch` is now optional. When omitted, `_resolve_default_arch()` probes
+in order: `torch.cuda.get_device_capability(0)` → map to canonical
+`sm_XYa` / `sm_XY` via ARCH_TABLE → `subprocess.run(["rocm-smi",
+"--showproductname"])` → parse via the bundled `_ROCM_CARD_TO_GFX`
+lookup table (MI50 through MI355X, RX 6000 through RX 9000, Strix
+Halo) → `jax.devices()` → map TPU device kind to `tpu_vN` →
+TOML `[archs].default` → built-in fallback (`sm_90a`). Prints a
+`[arch] auto-detected <arch> from <source>` line so you see what won.
+
+Every probe is wrapped in `try/except` and never crashes auto-detect.
+
+**Preflight version-mismatch suggestions**: when `_preflight_toolchain`
+detects an arch / toolchain mismatch, in addition to the existing
+`[preflight] arch=sm_90a need CUDA>=12.0 have 11.5 — FAIL` line it now
+also emits `[preflight] suggestion: install CUDA 12.0+ via
+--bootstrap-cuda, OR retry with --arch sm_86 (highest compatible with
+your CUDA 11.5)`. The suggested arch comes from iterating ARCH_TABLE for
+the highest-capability arch whose `min_toolchain_version` is ≤ detected.
+
+### Honest wrapper-layer features (Stream γ)
+
+These are wrapper-level features (above what nvcc / hipcc / JAX can do
+themselves). Stream γ replaced placeholder bodies in each one so the
+output matches what the feature claims to do, for any kernel — not just
+SuperGrok optimizers:
+
+- **Polyhedral `apply_schedule` body lift**: walks `LoopNest.body_ast`
+  via `clang.cindex.Cursor` traversal, rewrites identifier names + index
+  expressions per the schedule (tile / fuse / reorder / vectorize /
+  parallelize). When libclang is unavailable, emits an explicit
+  `// schedule shape only; libclang absent — body unchanged` comment
+  alongside the identity-copy fallback so the path is honest.
+- **Architecture-native MMA in synth GEMM**: per (arch, dtype), emits a
+  real MMA mainloop instead of a scalar O(MNK) triple-loop:
+  - sm_90a → `wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16` with
+    smem A/B tiles + async barriers
+  - sm_100a → `tcgen05.mma.async` (Blackwell tensor memory)
+  - gfx9xx (`mfma` feature) → `__builtin_amdgcn_mfma_f32_16x16x16f16`
+  - gfx10xx+ (`wmma` feature) → `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`
+  - other archs → scalar fallback with an explicit `// no native MMA
+    available for {arch}; using scalar mainloop` comment
+- **Transparent CUTLASS / CK fallback**: every emitted variant now
+  carries a `source` field with values `cutlass_python` /
+  `cutlass_fallback` / `ck_python` / `ck_fallback` / `scalar_fallback`.
+  When the Python frontend returns empty `tile_descriptions()` the
+  wrapper logs `[codegen] WARN cutlass.op.Gemm.tile_descriptions()
+  returned 0 — using curated fallback (N variants)` to the build report
+  instead of silently swapping in 4 hardcoded tiles.
+- **`bias_trial_queue` wired into autotune**: when `enable_device_pgo=True`,
+  after each PGO round produces `stall_info`, `_run_bayesian` calls
+  `bias_trial_queue(study, stall_info, space, arch, max_enqueued=25)`
+  before the next TPE batch. Previously `bias_trial_queue` was
+  implemented + unit-tested but never called — pure dead-letter helper.
+  Now the device-PGO feedback loop is closed.
+- **Pallas `block_spec` search-space dim**: for `tpu_v*` archs the
+  Pallas search space includes a real `block_spec` enum dim with values
+  `["default", "(64,64)", "(128,128)", "(256,256)", "(64,256)"]`
+  (replacing a hardcoded `"default"` placeholder).
+
+### Structural cleanup (Stream δ)
+
+Refactor pass that net-removed 1,984 LOC while keeping behavior
+byte-identical:
+- `_self_test` (2,900 → 46 LOC orchestrator): split into 22
+  per-section `_self_test_*` helpers. Test names + banner format + pass
+  summary line preserved exactly.
+- `_BUNDLED_TEMPLATES` (3,092 LOC → 863 LOC, 72% reduction): 4 base
+  templates + 11 per-optimizer specs + assembler. Each of the 44
+  emitted dict entries is byte-identical to the legacy verbatim form.
+- `_bootstrap_cuda_via_*`: dnf / yum / zypper / pacman / apk collapsed
+  into one `_bootstrap_via_pkg_manager(name, install_cmd, packages,
+  stream, verb)`. conda / nvidia-apt-repo / pypi-wheels left distinct
+  (different flow shapes).
+- `getattr(spec, …, default)` tightening: 35 sites in
+  `BuildSpec`-annotated functions converted to direct `spec.X` access
+  so field renames hard-fail. 9 sites in `apply_to_buildspec` (which
+  accepts duck-typed mock specs) intentionally kept as `getattr`. New
+  AST-walk self-test `buildspec_advertises_all_fields_read_by_production_code`
+  catches rename drift at test time.
+
+### Post-verification fixes (Optuna 4.0 compat + project-agnosticism plug + CLI surface)
+
+After Streams α/β/γ/δ landed, eight parallel verification agents
+exercised the full surface (CLI, codegen, autotune, cache, portability,
+NVRTC registry, self-test integrity, end-to-end dry-run) and found
+issues the self-test alone had missed. A fix-up pass plugged all of
+them:
+
+- **Optuna ≥ 4.0 `study.tell` crash**: four call sites in `run_bayesian`
+  passed `math.inf` together with `state=PRUNED|FAIL`, which Optuna 4.0+
+  rejects (`ValueError: Values were told. Values cannot be specified
+  when state is TrialState.PRUNED or TrialState.FAIL`). Hidden from the
+  self-test because synthetic timers never raised. Fix: drop the value
+  arg. Regression test added.
+- **`_dry_run_all_archs` ignored TOML config**: the all-archs sweep
+  constructed a `BuildSpec` without calling `apply_to_buildspec`, so a
+  downstream project's `macro_prefix="MYPROJ_"` was silently dropped.
+  Fix: thread `config` through, call `apply_to_buildspec` per arch.
+- **`ArchEntry.macro` hardcoded as `SG_BUILD_ARCH_*`**: `spec.macro_prefix`
+  only affected optimizer/model macros. Fix: `_build_macros` rewrites
+  the prefix at emit time when it differs from the default.
+- **`-DSG_VERBOSE=1` hardcoded**: now emits as
+  `-D<spec.macro_prefix>VERBOSE=1`, with backward-compat byte-identity
+  preserved when the prefix is the default `SG_BUILD_`.
+- **NVRTC cache dir hardcoded to `~/.cache/supergrok/nvrtc`**: now
+  derives from `config["project"]["name"]` (or default `supergrok` for
+  back-compat).
+- Plus CLI completeness: `--enable-synth-codegen`, `--enable-polyhedral`,
+  `--dry-run` (single-arch, requires `--arch`), `--list-archs` added to
+  argparse. `xla_env` dict surfaced in dry-run manifests for Pallas
+  archs (previously invisible). `[autotune] early stop: <reason>`
+  printed to stdout (previously only in returned dict).
+
 ### Bayesian auto early-stopping
 
 `--bayesian-trials` defaults to `None` (auto). The autotune loop runs
@@ -514,27 +747,43 @@ SHA256(template source + JSON config). Identical configs produce the
 same emitted file. Optional `nvcc --cuda --dryrun` validation when nvcc
 is on PATH.
 
-### CUTLASS GEMM emitter
+### CUTLASS / CK GEMM emitter (with transparent fallback labeling)
 
-`emit_cutlass_gemm_variants(arch, problem_shape, dtype, out_dir)`
-generates a sweep of CUTLASS GemmUniversal variants for sm_90a /
-sm_100a:
+`emit_cutlass_gemm_variants(arch, problem_shape, dtype, out_dir)` for
+sm_90a / sm_100a and `emit_ck_gemm_variants(arch, problem_shape, dtype,
+out_dir)` for gfx9xx / gfx10xx:
 
-- Tries `cutlass.op.Gemm(...).tile_descriptions()` when available
-  (cutlass-python 3.x+) to enumerate every supported {tile × cluster ×
-  stages × schedule × epilogue} variant.
-- Falls back to a curated 4-variant sweep (tiles 128×128×{32,64} and
-  256×128×{32,64}) when the introspection API isn't exposed.
-- Emits one `.cu` per variant: `cutlass_gemm_<arch>_<dtype>_<MxNxK>_<key>.cu`
-  with `extern "C" int launch_<key>(void* A, void* B, void* C, void* D,
-  int M, int N, int K, float alpha, float beta, cudaStream_t stream)`.
+- **CUTLASS**: tries `cutlass.op.Gemm(...).tile_descriptions()` when
+  available (cutlass-python 3.x+) to enumerate every supported {tile ×
+  cluster × stages × schedule × epilogue} variant. Falls back to a
+  curated 4-variant sweep (tiles 128×128×{32,64} and 256×128×{32,64})
+  when the introspection API isn't exposed.
+- **Composable Kernel** (AMD): probes `composable_kernel.op.GemmInstance`
+  / `.Gemm` / `gemm.config.GemmConfig` / `tile.GemmTile` before falling
+  back to the curated tile sweep.
+- **Transparent labeling** (Stream γ): every emitted variant now
+  carries a `source` field — `cutlass_python` / `cutlass_fallback` /
+  `ck_python` / `ck_fallback` / `scalar_fallback` — so the autotune
+  output makes clear which variants came from the library frontend vs.
+  the curated fallback. When the frontend returns empty
+  `tile_descriptions()` the wrapper logs `[codegen] WARN
+  cutlass.op.Gemm.tile_descriptions() returned 0 — using curated
+  fallback (N variants)` to the build report.
+- **Public emitter contract**: `emit_cutlass_gemm_variants` /
+  `emit_ck_gemm_variants` deliberately raise `CodegenError` /
+  `SynthCodegenError` when the Python frontend is missing (file
+  emission needs the real backend). The synth-codegen dispatcher
+  catches these and falls through to the native MMA path (`wgmma` /
+  `tcgen05` / `mfma` / `wmma`) emitted by `synthesize_kernel`,
+  followed by the portable scalar fallback if no MMA is available
+  on the target arch.
+- Emits one `.cu` / `.hip.cpp` per variant:
+  `cutlass_gemm_<arch>_<dtype>_<MxNxK>_<key>.cu` (or
+  `ck_gemm_<arch>_<dtype>_<MxNxK>_<key>.hip.cpp`) with `extern "C" int
+  launch_<key>(void* A, void* B, void* C, void* D, int M, int N, int K,
+  float alpha, float beta, <stream_type> stream)`.
 - Cached by filename — re-invoking with the same variant key skips
-  re-emission. Any `ImportError` from `cutlass` → `CodegenError` with
-  install instructions; any other exception → wrapped `CodegenError`
-  so the autotuner falls back to template-only emission.
-
-AMD Composable Kernel (CK) equivalent: tracked as a TODO comment at
-the module level — not implemented in this stream.
+  re-emission.
 
 ### Runtime kernel specialization — NVRTC / hipRTC
 
@@ -569,10 +818,20 @@ instrumentation). This layer collects device-side stall info from:
 - AMD: `rocprof --stats` ATT traces
 - Pallas: XLA HLO cost-model dumps (`--xla_gpu_dump_autotuned_*`)
 
-Stall reasons → JSON sidecar at `<out>/device_stall_info.json`. Reasons
-map to search-space dims (`long_scoreboard → swizzle/lds_padding/vec`,
-`not_selected → block/waves_per_eu/maxrregcount`, etc.); the autotuner
-`enqueue_trial`s the biased configs first.
+Stall reasons → JSON sidecar at `<out>/device_stall_info.json`. The
+wrapper recognizes 13 reason keys: `long_scoreboard`, `not_selected`,
+`math_pipe_throttle`, `memory_throttle`, `tex_throttle`, `barrier`,
+`wait`, `imc_miss`, `lg_throttle`, `dispatch_stall`, `vmem_lat`,
+`lds_bank_conflict`, `valu_dep`. Each maps to a set of search-space
+dims (`long_scoreboard → swizzle/lds_padding/vec`, `not_selected →
+block/waves_per_eu/maxrregcount`, etc.).
+
+**Live feedback loop (Stream γ)**: after each PGO round produces
+`stall_info`, `_run_bayesian` calls `bias_trial_queue(study, stall_info,
+space, arch, max_enqueued=25)` before the next TPE batch. The
+biased configs get `study.enqueue_trial`'d so they're tried first.
+This closes the loop that was previously dead-letter
+(`bias_trial_queue` was implemented + unit-tested but never called).
 
 ### Multi-GPU fan-out — work-stealing
 
@@ -675,15 +934,18 @@ config file, behavior is identical to today.
 
 ### Verification harnesses
 
-Two built-in CI modes for sanity-checking the build pipeline without
+Built-in CI modes for sanity-checking the build pipeline without
 needing a target GPU:
 
 | Flag | Behaviour |
 |------|-----------|
-| `--dry-run-all-archs` | For every canonical arch in `ARCH_TABLE`: run preflight + `_resolve_sources` + `_host_cflags` + `_device_cflags` + `_ldflags` without invoking `torch.cpp_extension`. Writes one JSON manifest per arch under `<out>/dry_run_<arch>.json` with the full flag list, source globs, preflight PASS/FAIL line, expected `-gencode` / `--offload-arch` tokens. Sweeps all 25 canonical archs on a CPU-only host in ~3 seconds. |
+| `--self-test` | 116-test inline suite covering every layer of the wrapper (ARCH_TABLE, search spaces, codegen, autotune, cache v4, polyhedral, synth codegen, Stream α/β/γ regression tests). Runs in ~30s on a CPU-only host. |
+| `--list-archs` | Dumps every entry in ARCH_TABLE — one line per arch with vendor, min toolchain version, and feature set (wgmma / tcgen05 / mfma / wmma / sparsecore / etc.). Exits 0; no `--optimizer` / `--model` required. |
+| `--dry-run --arch <arch>` | Single-arch dry-run: runs preflight + `_resolve_sources` + `_host_cflags` + `_device_cflags` + `_ldflags` for the named arch without invoking `torch.cpp_extension`. Writes `<out>/dry_run_<arch>.json`. Pair with `--enable-synth-codegen --enable-polyhedral` to also exercise the synth/polyhedral layers. |
+| `--dry-run-all-archs` | Same as above but sweeps every canonical arch in ARCH_TABLE. Writes one JSON manifest per arch under `<out>/dry_run_<arch>.json`. Sweeps all 25 archs on a CPU-only host in ~3 seconds. For Pallas archs the manifest now includes the resolved `xla_env` dict (previously empty). |
 | `--e2e-smoke` | End-to-end smoke: detects the local GPU via `torch.cuda.get_device_capability()`, maps to ARCH_TABLE, runs `build(adamw, mamba3, <detected>, autotune=bayesian, max_tune_seconds=120)`, and asserts `tuned_config` is written, `early_stop_info` is recorded, `tuned_configs.h` is regenerated, and the final `.so` loads. Skips cleanly with `[e2e-smoke] no CUDA device — skipping` on CPU-only hosts. `--e2e-max-seconds N` adjusts the autotune wall-clock cap. |
 
-Both modes are wired into `_self_test` so they exercise automatically
+All modes are wired into `_self_test` so they exercise automatically
 (dry-run-all-archs runs always; e2e-smoke gates on `torch.cuda.is_available()`).
 
 ### Toolchain bootstrap for every vendor
@@ -698,20 +960,48 @@ Both modes are wired into `_self_test` so they exercise automatically
 need=<min>.<min> have=<v>.<v> — PASS|FAIL` line per arch so CI can
 grep for failures.
 
-### What this is NOT
+### Using this wrapper for any project
 
-This is **not** a general-purpose drop-in compiler wrapper for
-arbitrary projects. It is the MAXIMAL pipeline for this project's
-optimizer kernels (`csrc/algorithms/`) and model kernels
-(`csrc/backends/<vendor>/<arch>/`) across every current GPU/TPU
-architecture. The search spaces, dim names, feature flags, prefilter
-rules, NVRTC kernel templates, and PGO workload are all calibrated for
-SuperGrok v2 / Mamba-3 / PEER / GRU meta-net optimizer workloads. To
-adapt it for a different project, drop a `compile_config.toml` next to
-your invocation overriding `[sources]` / `[optimizers]` / `[models]`,
-add per-op Jinja2 templates to the `_BUNDLED_TEMPLATES` dict at the
-top of compile.py, and extend `_populate_search_space_builders()` with
-your per-arch dim lists.
+`compile.py` is a **project-agnostic, portable compiler wrapper** that
+drives nvcc / hipcc / JAX (Pallas) maximally. It ships in this repo
+configured for SuperGrok's optimizer + model kernels, but it works
+out-of-the-box for any project via a TOML config override (see
+the *Using this wrapper for a different project* block at the top of
+the quickstart).
+
+What carries over verbatim to any project:
+- All 25 archs (8 NVIDIA + 12 AMD + 5 TPU), their feature gates, and
+  the per-arch search spaces (~3.7B candidates on sm_90a, ~3.4T on
+  sm_100a) — these come from the hardware spec, not from SuperGrok.
+- Every flag the wrapper emits for nvcc / hipcc / JAX (Stream α native
+  maximization — `--warn-on-spills`, `--default-stream per-thread`,
+  `-fgpu-rdc`, `--xla_gpu_enable_priority_fusion`, etc.).
+- Auto-arch detection, preflight version-mismatch suggestions,
+  toolchain bootstrap dispatch — all derive from the local host, not
+  the project.
+- The wrapper-extras: Bayesian autotune with 5-criterion early-stop,
+  polyhedral schedule search, OpGraph synth codegen with arch-native
+  MMA (`wgmma` / `tcgen05` / `mfma` / `wmma`), CUTLASS / CK delegation
+  with transparent `source=` fallback labels, NVRTC / hipRTC kernel
+  registry, work-stealing multi-GPU pool, cache v4 with `.jsonl` trial
+  sidecars, numerical validation, learned cost model with rejection
+  budget, device-PGO via CUPTI / rocprof feedback into bias_trial_queue.
+- The single-file constraint: everything inlined into `compile.py` so
+  vendoring the wrapper into another project is one file copy.
+
+What you supply per-project via TOML:
+- `[project] name` → cache namespace (`~/.cache/<name>/nvrtc`)
+- `[sources] macro_prefix` → emitted macros (`-D<PREFIX>VERBOSE`,
+  `-D<PREFIX>OPTIMIZER_*`, `-D<PREFIX>ARCH_*`)
+- `[sources] source_layout` → where your kernels live
+- `[optimizers] enabled` / `[models] enabled` → the names your project
+  exposes (no hardcoded list)
+- `[archs] default` → auto-arch fallback when no GPU is visible
+
+Per-op Jinja2 kernel templates are only required if you opt into
+`--enable-emitter` (the structurally-different mainloop emission
+backend); without that flag, `-D` macros into a single fused source
+are enough.
 
 ### Everything lives in one file
 
@@ -797,7 +1087,7 @@ via arch-specific common headers.
 | Grokfast  | 🟡 | 🟡 | 3 (ema, m, v) | 12 |
 | GrokAdamW | 🟡 | 🟡 | 3 (ema, m, v) | 12 |
 
-Legend: 🟡 = written, structurally validated (18 inline self-tests pass via
+Legend: 🟡 = written, structurally validated (116 inline self-tests pass via
 `python -m grokking_optimizers.compile --self-test`), not compiled on device
 (no CUDA/HIP toolchain in this environment).
 
@@ -925,7 +1215,7 @@ python -m grokking_optimizers.compile \
   [--prune] [--prune-max-age-days 30] [--prune-keep-top-n 100]
   [--no-auto-prune]                     # cache GC
   [--debug-symbols] [--seed N] [-D MACRO[=VALUE]] [-v] [--debug]
-  [--self-test]                         # 90-test in-process suite
+  [--self-test]                         # 116-test in-process suite
   [--dry-run-all-archs]                 # write JSON manifests for all 25 archs
   [--e2e-smoke] [--e2e-max-seconds 120] # end-to-end build smoke (GPU-gated)
 ```
@@ -2620,7 +2910,7 @@ and eliminate cross-module coupling:
 | `INTERFACES.md` | `README.md` — compile cache schema, CLI surface |
 | `docs/autotune.md` | `README.md` — autotune guide, YAML schema, PGO |
 | `docs/optimization_matrix.md` | `README.md` — optimization candidate matrix |
-| `tests/` (all files) | `compile.py --self-test` — 18 inline checks |
+| `tests/` (all files) | `compile.py --self-test` — 116 inline checks |
 
 ---
 
