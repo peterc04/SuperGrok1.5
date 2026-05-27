@@ -11091,6 +11091,54 @@ def build(
         _path = os.environ.get("PATH", "")[:200]
         _fc = os.environ.get("FORCE_CUDA", "<unset>")
         _tcal = os.environ.get("TORCH_CUDA_ARCH_LIST", "<unset>")
+        # Stream — debug-flags: detected toolchain version strings (full,
+        # not just (major, minor)) so users can spot stale binaries on PATH.
+        _nv_str = _probe_nvcc_version_string() or "<not on PATH>"
+        _hip_str = _probe_hipcc_version_string() or "<not on PATH>"
+        _jax_str = _probe_jax_version_string() or "<not importable>"
+        # Per-arch eligibility verdict.
+        _verdict = "<n/a>"
+        try:
+            _nv_t = _probe_nvcc_version()
+            _hip_t = _probe_hipcc_version()
+            _need = entry.min_toolchain_version
+            _have: Tuple[int, ...] = ()
+            if entry.vendor == "cuda" and _nv_t:
+                _have = _nv_t
+            elif entry.vendor == "hip" and _hip_t:
+                _have = _hip_t
+            if _have:
+                _nn = max(len(_need), len(_have))
+                _np = tuple(list(_need) + [0] * (_nn - len(_need)))
+                _hp = tuple(list(_have) + [0] * (_nn - len(_have)))
+                _verdict = (
+                    f"ELIGIBLE (have "
+                    f"{'.'.join(str(x) for x in _have)} >= need "
+                    f"{'.'.join(str(x) for x in _need)})"
+                    if _hp >= _np
+                    else f"INELIGIBLE (have "
+                         f"{'.'.join(str(x) for x in _have)} < need "
+                         f"{'.'.join(str(x) for x in _need)})")
+            elif entry.vendor in ("cuda", "hip"):
+                _verdict = (
+                    f"<toolchain probe failed; need "
+                    f"{'.'.join(str(x) for x in _need)}>")
+        except Exception as _vex:
+            _verdict = f"<error: {_vex}>"
+        # Cache stats — entry count for this run.
+        _cache_entries = 0
+        try:
+            _cache_entries = len(cache._data.get("entries", {}))
+        except Exception:
+            pass
+        # Free disk space at <out_dir> and ~/.cache/<project>/nvrtc.
+        _df_out = _disk_free_human(spec.out_dir)
+        try:
+            _pkg = spec.python_package or "grokking_optimizers"
+        except Exception:
+            _pkg = "grokking_optimizers"
+        _nvrtc_cache = Path.home() / ".cache" / _pkg / "nvrtc"
+        _df_nvrtc = _disk_free_human(_nvrtc_cache)
         sys.stderr.write(
             f"\n{bar}\n"
             f"[debug] grokking_optimizers.compile starting at {_ts}\n"
@@ -11104,6 +11152,16 @@ def build(
             f"[debug] env:      CUDA_HOME={_cuda}  ROCM_PATH={_rocm}\n"
             f"[debug] env:      PATH={_path}...\n"
             f"[debug] env:      FORCE_CUDA={_fc}  TORCH_CUDA_ARCH_LIST={_tcal}\n"
+            f"[debug] nvcc:     {_nv_str}\n"
+            f"[debug] hipcc:    {_hip_str}\n"
+            f"[debug] jax:      {_jax_str}\n"
+            f"[debug] arch-eligibility ({arch}): {_verdict}\n"
+            f"[debug] flag-probe: enabled (version-gated via "
+            f"_newer_compiler_flags)\n"
+            f"[debug] log-level: _COMPILE_LOG_LEVEL={_COMPILE_LOG_LEVEL}\n"
+            f"[debug] cache:    entries={_cache_entries}\n"
+            f"[debug] disk:     out_dir free/total = {_df_out}\n"
+            f"[debug] disk:     {_nvrtc_cache} free/total = {_df_nvrtc}\n"
             f"{bar}\n\n"
         )
         sys.stderr.flush()
@@ -11712,6 +11770,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     # archs.default is set — that would surprise users who passed --arch.
     if args.debug:
         args.verbose = True
+        # Bump to level 1 when --debug is set so the flag-trace path fires
+        # (helpers consult _COMPILE_LOG_LEVEL >= 1 alongside spec.debug). The
+        # --debug-flags / --flag-audit early intercept above already bumped
+        # this to 2 if the user asked for the heavier trace; don't downgrade.
+        if _COMPILE_LOG_LEVEL < 1:
+            globals()["_COMPILE_LOG_LEVEL"] = 1
+    # Independent --debug-flags handling (already handled in the early
+    # intercept above, but be defensive in case argv was re-shuffled).
+    if getattr(args, "debug_flags", False) and _COMPILE_LOG_LEVEL < 2:
+        globals()["_COMPILE_LOG_LEVEL"] = 2
 
     # Resolve aliases.
     if args.aot_only:
