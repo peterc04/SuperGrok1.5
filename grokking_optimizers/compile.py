@@ -69,11 +69,11 @@ means AOT and JIT can be tuned independently (env vars, library
 versions, memory limits) without their settings bleeding into each
 other. ``--aot-only`` / ``--jit-only`` remain as aliases.
 
-Cache schema v3
+Cache schema v4
 ===============
-The on-disk format is JSON; ``CACHE_VERSION == 3``. Forward-compatible
-with v2 (auto-migrated on load). See ``INTERFACES.md`` for the full
-shape. Headline additions over v2:
+The on-disk format is JSON; ``CACHE_VERSION == 4``. Forward-compatible
+with v2 + v3 (auto-migrated on load). See ``INTERFACES.md`` for the
+full shape. Headline additions over v2:
 
     mode                 "exhaustive" | "bayesian" | None
     pgo_enabled          bool
@@ -141,9 +141,30 @@ import tempfile
 import textwrap
 import threading
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+
+# POSIX-only file locking for inter-process cache safety. On Windows we
+# fall back to a sentinel .lock file (see ``CompileCache._save_locked``).
+try:
+    import fcntl as _fcntl  # type: ignore[import]
+except ImportError:  # pragma: no cover — Windows
+    _fcntl = None  # type: ignore[assignment]
+
+# Suppress the runpy RuntimeWarning that fires every invocation due to
+# grokking_optimizers/__init__.py importing ``compile`` at package load
+# time (i.e. ``python -m grokking_optimizers.compile`` re-imports a
+# module that's already in sys.modules under a different name). We can
+# only patch this from compile.py because we're forbidden from editing
+# __init__.py. The filter is narrow enough that no other RuntimeWarning
+# is hidden.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*grokking_optimizers\.compile.*",
+    category=RuntimeWarning,
+)
 
 from grokking_optimizers.profile import (
     ARCHES,
@@ -3899,9 +3920,9 @@ class CostModel:
                 pass
         else:
             sys.stderr.write(
-                "[cost_model] sklearn unavailable and auto-install off "
+                "[cost-model] sklearn unavailable and auto-install off "
                 "or failed; falling back to numpy-linear ridge regressor.\n"
-                "[cost_model]   pip install scikit-learn   "
+                "[cost-model]   pip install scikit-learn   "
                 "# to enable the boosted-tree backend\n")
         # Heuristic linear fallback — numpy-only ridge regression.
         def _factory_linear():
@@ -4527,10 +4548,43 @@ def _suggest(trial: optuna.Trial, dims: List[Dict[str, Any]]) -> Dict[str, Any]:
 def _make_trial_record(stage: str, trial_num: int, cfg: Dict[str, Any],
                        result: TimerResult, host: Optional[Dict[str, Any]] = None
                        ) -> Dict[str, Any]:
-    # Stream 10: pull the per-variant numerical-validation tag set by
-    # _make_variant_timer (keyed by config_key). Trials that never went
-    # through the variant timer (e.g. synthetic self-test trials, or
-    # infeasible / build-fail trials) get "skipped" by default.
+    """Build one v4 trial-sidecar record.
+
+    The returned dict is the canonical row written to the per-entry
+    ``trials_<opt>_<model>_<arch>.jsonl`` sidecar (one record per JSON
+    line). The schema is stable across v4 and is consumed by
+    ``_read_trial_log_summary`` + the autotune resume logic.
+
+    Keys (every record carries all of them; values may be ``None``):
+
+      * ``trial_num``         — monotonic per-stage trial index.
+      * ``stage``             — ``"tpe"`` | ``"refine"`` | ``"sweep"`` |
+                                ``"exhaustive"`` (caller-supplied).
+      * ``config``            — the per-variant dimension dict (tuples
+                                converted to lists for JSON round-trip).
+      * ``config_key``        — deterministic string hash of ``config``
+                                (see ``config_key()``); the variant
+                                timer / numerical tracker key.
+      * ``timing_ms``         — best median timing (ms) from the timer,
+                                or ``None`` when the variant failed.
+      * ``min_ms``            — minimum per-iteration timing observed.
+      * ``max_ms``            — maximum per-iteration timing observed.
+      * ``n``                 — number of timed iterations.
+      * ``host``              — caller-supplied host descriptor dict
+                                (matches ``_current_host()`` shape) so
+                                the sidecar is self-describing.
+      * ``numerical_status``  — ``"ok" | "fail" | "skipped"`` from the
+                                per-variant numerical-validation pass.
+      * ``ptxas_info``        — dict of ptxas-v extracted fields
+                                (``regs_used``, ``smem_bytes``, …) — ``{}``
+                                when no compiler invocation was parsed.
+      * ``recorded_at``       — ISO-8601 timestamp of record creation.
+
+    Stream 10: pull the per-variant numerical-validation tag set by
+    _make_variant_timer (keyed by config_key). Trials that never went
+    through the variant timer (e.g. synthetic self-test trials, or
+    infeasible / build-fail trials) get "skipped" by default.
+    """
     ckey = config_key(cfg)
     num_status = _LAST_NUMERICAL_STATUS.get(ckey, "skipped")
     # Stream α: pull per-variant ptxas-v info (regs_used, smem_bytes, etc.).
@@ -4774,8 +4828,16 @@ def run_bayesian(
     # never abort the autotune.
     stop_info = stopper.to_dict()
     out_stream = stream if stream is not None else sys.stdout
+    # Group C19 — distinguish "completed N trials normally" from
+    # "stopped early due to plateau / wall-clock / coverage". The
+    # pre-fix message always said "early stop" even when the user
+    # passed --bayesian-trials N and the loop ran to N completion.
     try:
-        print(f"[autotune] early stop: {stop_info['stop_reason']}",
+        reason = stop_info.get('stop_reason') or 'unknown'
+        tag = ('completed' if isinstance(reason, str)
+               and reason.startswith('manual_n_trials')
+               else 'early-stopped')
+        print(f"[autotune] {tag}: {reason} after {len(records)} trials",
               file=out_stream)
     except Exception:
         pass
@@ -5044,7 +5106,7 @@ def _migrate_v3_to_v4(data: dict, cache_dir: Optional[Path]) -> dict:
         }
         entry["bayesian_trials"] = []
         entry["sweep_history"] = []
-    data["version"] = 4
+    data["version"] = CACHE_VERSION
     data["migrated_from_v3_at"] = datetime.datetime.now().isoformat()
     return data
 
@@ -5158,12 +5220,15 @@ class CompileCache:
             return data
         try:
             data = json.loads(self.path.read_text())
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError) as exc:
             backup = self.path.with_suffix(self.path.suffix + ".corrupt.bak")
             try:
                 self.path.rename(backup)
             except OSError:
                 pass
+            sys.stderr.write(
+                f"[cache] {self.path} unreadable ({type(exc).__name__}: "
+                f"{exc}); rotated to {backup}; starting fresh.\n")
             data = self._fresh()
             self._dirty = True
             return data
@@ -5208,7 +5273,8 @@ class CompileCache:
         return data
 
     def save(self) -> None:
-        """Atomically write to disk via tmp-file rename.
+        """Atomically write to disk via tmp-file rename, holding an
+        inter-process lock for the load+merge+write cycle.
 
         v4 layout: the main JSON does NOT carry the full
         ``bayesian_trials`` / ``sweep_history`` payload — those lists
@@ -5217,11 +5283,100 @@ class CompileCache:
         to ``[]`` placeholders, and serialize the result. The in-memory
         state is left intact so same-process callers can keep reading
         the full trial lists after save().
+
+        Inter-process safety (added to fix the AOT/JIT subprocess
+        split lost-write race): a sidecar ``.lock`` file guards the
+        full read-modify-write sequence. On POSIX we use
+        ``fcntl.flock(LOCK_EX)`` (no external deps required); on
+        Windows we fall back to a sentinel-file create/cleanup with a
+        short retry loop. Inside the lock we re-read the on-disk
+        cache and merge any concurrent writer's entries into our
+        in-memory view BEFORE writing — this is what prevents two
+        sibling subprocesses (e.g. AOT + JIT) from clobbering each
+        other.
+
+        Disk-full / permission errors: ``OSError`` from
+        ``tmp.write_text`` or ``tmp.replace`` is caught, retried once,
+        and on second failure surfaced as a warning. The in-memory
+        state is preserved so the process can keep running — only the
+        on-disk persistence is dropped for this save() call.
         """
         if self.path is None or not self._dirty:
             return
         with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                sys.stderr.write(
+                    f"[cache] WARNING: could not create parent dir for "
+                    f"{self.path}: {type(exc).__name__}: {exc}; "
+                    f"in-memory state preserved for this process only\n")
+                return
+            self._save_locked()
+
+    def _save_locked(self) -> None:
+        """Inner save: holds the inter-process lock + writes atomically.
+
+        Split out from ``save()`` so the lock-acquisition can wrap the
+        full read-modify-write cycle (re-read on-disk → merge → write)
+        instead of just the write step.
+        """
+        lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        lock_fh = None
+        acquired = False
+        try:
+            try:
+                lock_fh = open(lock_path, "a+")
+            except OSError as exc:
+                sys.stderr.write(
+                    f"[cache] WARNING: could not open lock file "
+                    f"{lock_path}: {type(exc).__name__}: {exc}; "
+                    f"continuing without inter-process lock\n")
+                lock_fh = None
+
+            if lock_fh is not None and _fcntl is not None:
+                # POSIX: fcntl.flock(LOCK_EX) — blocks until acquired.
+                try:
+                    _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_EX)
+                    acquired = True
+                except OSError as exc:
+                    sys.stderr.write(
+                        f"[cache] WARNING: flock failed on "
+                        f"{lock_path}: {type(exc).__name__}: {exc}; "
+                        f"continuing without inter-process lock\n")
+            elif lock_fh is not None:
+                # Windows fallback: O_EXCL sentinel with short retry.
+                sentinel = self.path.with_suffix(self.path.suffix + ".lock.sentinel")
+                deadline = time.monotonic() + 30.0
+                while time.monotonic() < deadline:
+                    try:
+                        fd = os.open(str(sentinel),
+                                     os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                        os.close(fd)
+                        acquired = True
+                        break
+                    except FileExistsError:
+                        time.sleep(0.05)
+                    except OSError:
+                        break
+                if not acquired:
+                    sys.stderr.write(
+                        f"[cache] WARNING: could not acquire lock at "
+                        f"{sentinel} within 30s; continuing without "
+                        f"inter-process lock\n")
+
+            # CRITICAL: re-read on-disk and merge concurrent writers'
+            # entries into our in-memory view before serialising. This
+            # is what prevents the AOT subprocess from clobbering the
+            # JIT subprocess's entries (or vice versa).
+            if self.path.exists():
+                try:
+                    on_disk = json.loads(self.path.read_text())
+                except (json.JSONDecodeError, OSError):
+                    on_disk = None
+                if isinstance(on_disk, dict):
+                    self._merge_disk_entries(on_disk)
+
             tmp = self.path.with_suffix(self.path.suffix + ".tmp")
             # Build a serialization view that elides the trial lists —
             # they live in the sidecar now. The shallow-then-per-entry
@@ -5242,9 +5397,130 @@ class CompileCache:
                     else:
                         ser_entries[k] = e
                 serialized["entries"] = ser_entries
-            tmp.write_text(json.dumps(serialized, indent=2, sort_keys=True))
-            tmp.replace(self.path)
+            payload = json.dumps(serialized, indent=2, sort_keys=True)
+
+            wrote = False
+            last_exc: Optional[BaseException] = None
+            for attempt in range(2):
+                try:
+                    tmp.write_text(payload)
+                    tmp.replace(self.path)
+                    wrote = True
+                    break
+                except OSError as exc:
+                    last_exc = exc
+                    # Best-effort cleanup of the half-written tmp before
+                    # the retry so we don't leave debris on disk.
+                    try:
+                        if tmp.exists():
+                            tmp.unlink()
+                    except OSError:
+                        pass
+            if not wrote:
+                sys.stderr.write(
+                    f"[cache] WARNING: could not persist to {self.path}: "
+                    f"{type(last_exc).__name__ if last_exc else 'OSError'}: "
+                    f"{last_exc}; in-memory state preserved for this "
+                    f"process only\n")
+                return
             self._dirty = False
+            # Debug-mode log line — guarded so it only fires when the
+            # user opted into compile-log verbosity (default-off).
+            if _COMPILE_LOG_LEVEL >= 1:
+                try:
+                    sz = self.path.stat().st_size / 1024.0
+                except OSError:
+                    sz = 0.0
+                n_entries = len(self._data.get("entries", {}))
+                sys.stderr.write(
+                    f"[cache] saved {self.path.name} "
+                    f"({n_entries} entries, {sz:.1f} KiB)\n")
+        finally:
+            if acquired and lock_fh is not None and _fcntl is not None:
+                try:
+                    _fcntl.flock(lock_fh.fileno(), _fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            elif acquired and _fcntl is None:
+                # Windows sentinel cleanup.
+                sentinel = self.path.with_suffix(self.path.suffix + ".lock.sentinel")
+                try:
+                    if sentinel.exists():
+                        sentinel.unlink()
+                except OSError:
+                    pass
+            if lock_fh is not None:
+                try:
+                    lock_fh.close()
+                except OSError:
+                    pass
+
+    def _merge_disk_entries(self, on_disk: Dict[str, Any]) -> None:
+        """Merge ``entries`` from a freshly-read on-disk cache into
+        ``self._data``. Newer (by ``aot_completed_at`` / ``jit_completed_at``
+        ISO timestamps) wins; ties keep the in-memory entry because the
+        caller is mid-write and presumed authoritative for keys it
+        explicitly touched. Used inside the locked save cycle to make
+        concurrent AOT + JIT subprocesses combine their work rather
+        than clobber each other.
+        """
+        disk_entries = on_disk.get("entries")
+        if not isinstance(disk_entries, dict):
+            return
+        mem_entries = self._data.setdefault("entries", {})
+        for k, de in disk_entries.items():
+            if not isinstance(de, dict):
+                continue
+            me = mem_entries.get(k)
+            if me is None:
+                # New entry from a sibling writer — just adopt it.
+                mem_entries[k] = de
+                continue
+            # Both sides have the key. Newer ISO timestamps win per-
+            # phase; the JIT half doesn't touch aot_completed_at and
+            # vice versa, so the field-level "max ISO" merge is safe.
+            for ts_field in ("aot_completed_at", "jit_completed_at",
+                             "pgo_completed_at"):
+                d_ts = de.get(ts_field)
+                m_ts = me.get(ts_field)
+                if d_ts and (not m_ts or d_ts > m_ts):
+                    me[ts_field] = d_ts
+                    # Adopt the matching companion fields too — the
+                    # writer that landed the newer timestamp owns the
+                    # corresponding hashes / artefact path.
+                    if ts_field == "aot_completed_at":
+                        for f in ("source_hash", "host_cflags_hash",
+                                  "device_cflags_hash", "primary_artifact",
+                                  "aot_host", "pgo_enabled",
+                                  "pgo_workload_hash", "pgo_profile_dir"):
+                            if f in de:
+                                me[f] = de[f]
+                    elif ts_field == "jit_completed_at":
+                        for f in ("tuned_config", "jit_host",
+                                  "search_space_hash"):
+                            if f in de:
+                                me[f] = de[f]
+            # Variant artefacts: union (different timer subprocesses
+            # may have populated different ckeys).
+            d_va = de.get("variant_artifacts")
+            m_va = me.get("variant_artifacts")
+            if isinstance(d_va, dict):
+                if not isinstance(m_va, dict):
+                    me["variant_artifacts"] = dict(d_va)
+                else:
+                    for vk, vv in d_va.items():
+                        m_va.setdefault(vk, vv)
+            # host_history: append disk's new entries to in-memory.
+        # Cache-level host_history merge: keep both sides' history.
+        disk_hh = on_disk.get("host_history")
+        mem_hh = self._data.setdefault("host_history", [])
+        if isinstance(disk_hh, list) and isinstance(mem_hh, list):
+            seen = {json.dumps(h, sort_keys=True, default=str) for h in mem_hh}
+            for h in disk_hh:
+                key = json.dumps(h, sort_keys=True, default=str)
+                if key not in seen:
+                    mem_hh.append(h)
+                    seen.add(key)
 
     def key(self, opt: str, model: str, arch: str) -> str:
         return f"{opt}/{model}/{arch}"
@@ -8376,6 +8652,13 @@ _FLAG_PROBE_STATS: Dict[str, int] = {"hits": 0, "misses": 0, "errors": 0}
 # ``_validate_flag_set`` is a no-op (returns input unchanged, no logging).
 _FLAG_PROBE_DISABLED: bool = False
 
+# ---- _resolve_default_arch bookkeeping (Group C23) ---------------------
+# When _resolve_default_arch returns, we stash the (arch, source) pair so
+# the debug banner downstream can report which probe won. ``source`` is
+# one of: torch.cuda | rocm-smi | jax | config | fallback | None (not
+# auto-detected — user passed --arch explicitly).
+_LAST_BUILD_RESOLVED_ARCH: Optional[Tuple[str, str]] = None
+
 # Flags that NEVER need a compiler dry-run probe. These are either:
 #   * universal across every nvcc / hipcc release we care about (-O3,
 #     -std=c++17, -fPIC, -ggdb, -DXXX, -I..., -L..., -l..., -isystem),
@@ -8875,6 +9158,7 @@ def _resolve_default_arch(
     """
     if stream is None:
         stream = sys.stdout
+    global _LAST_BUILD_RESOLVED_ARCH
     # 1. torch.cuda
     try:
         arch = _probe_torch_cuda_arch()
@@ -8883,6 +9167,7 @@ def _resolve_default_arch(
     if arch:
         stream.write(f"[arch] auto-detected {arch} from "
                      f"torch.cuda.get_device_capability()\n")
+        _LAST_BUILD_RESOLVED_ARCH = (arch, "torch.cuda")
         return arch
     # 2. rocm-smi
     try:
@@ -8892,6 +9177,7 @@ def _resolve_default_arch(
     if arch:
         stream.write(f"[arch] auto-detected {arch} from "
                      f"rocm-smi --showproductname\n")
+        _LAST_BUILD_RESOLVED_ARCH = (arch, "rocm-smi")
         return arch
     # 3. jax.devices (TPU)
     try:
@@ -8901,6 +9187,7 @@ def _resolve_default_arch(
     if arch:
         stream.write(f"[arch] auto-detected {arch} from "
                      f"jax.devices()\n")
+        _LAST_BUILD_RESOLVED_ARCH = (arch, "jax")
         return arch
     # 4. TOML config archs.default
     if isinstance(config, dict):
@@ -8909,13 +9196,24 @@ def _resolve_default_arch(
         except Exception:
             cfg_arch = None
         if cfg_arch:
-            stream.write(f"[arch] auto-detected {cfg_arch} from config "
-                         f"[archs].default\n")
-            return cfg_arch
+            # Group B9 — validate against ARCH_TABLE before returning so a
+            # typo in the user's TOML doesn't produce a 13-line traceback
+            # downstream. On miss, log a one-liner and fall through to
+            # the next probe (i.e. the hardcoded fallback).
+            if cfg_arch in ARCH_TABLE:
+                stream.write(f"[arch] auto-detected {cfg_arch} from config "
+                             f"[archs].default\n")
+                _LAST_BUILD_RESOLVED_ARCH = (cfg_arch, "config")
+                return cfg_arch
+            stream.write(
+                f"[arch] config [archs].default={cfg_arch!r} is not a "
+                f"known arch (see --list-archs); ignoring and falling "
+                f"back to the built-in default.\n")
     # 5. Final hardcoded fallback.
     fallback = "sm_90a"
     stream.write(f"[arch] auto-detected {fallback} from built-in default "
                  f"(no GPU/TPU probe matched)\n")
+    _LAST_BUILD_RESOLVED_ARCH = (fallback, "fallback")
     return fallback
 
 
@@ -9160,25 +9458,46 @@ def _newer_compiler_flags(arch: str, report=None,
 def _summarize_build_failure(exc, collected_text, module_name, elapsed, arch):
     """Build a list of human-readable summary lines for a failed build.
 
-    Scans ``collected_text`` for the first nvcc/hipcc error line AND for
-    any ``nvcc fatal: Unknown option '<flag>'`` patterns. Returns the
-    lines to write at the TOP of the failure block.
+    Scans ``collected_text`` for the first compiler error line AND for
+    any ``Unknown option '<flag>'`` patterns. Returns the lines to
+    write at the TOP of the failure block.
+
+    Group B11 — broadened from "nvcc fatal: Unknown option" only to
+    also detect:
+
+      * ``cc1plus: error:``        (GCC frontend rejecting a flag)
+      * ``ptxas fatal:`` /
+        ``ptxas error:``           (PTX assembler errors)
+      * ``error:`` followed by a
+        ``<file>:<line>:`` prefix  (general clang/gcc errors)
+
+    so a host-side ``-flto=full`` failure now produces a meaningful
+    summary instead of falling through to the bare ``Exception`` repr.
     """
     import re as _re
     lines = []
     error_lines = []
     fatal_unknown_flags = []
     nvcc_error_count = 0
+    # Broadened error detection: cc1plus, ptxas fatal, and gcc/clang
+    # ``<file>:<line>: error:`` lines all count toward nvcc_error_count.
+    _file_loc_err = _re.compile(r"^\S.*?:\d+(?::\d+)?:\s*(?:fatal\s+)?error:",
+                                _re.IGNORECASE)
     for ln in collected_text.splitlines():
         low = ln.lower()
         if ("nvcc fatal" in low or "nvcc error" in low
-                or "hipcc fatal" in low
-                or low.startswith("error:") or " error:" in low):
+                or "hipcc fatal" in low or "hipcc error" in low
+                or "ptxas fatal" in low or "ptxas error" in low
+                or "cc1plus: error" in low or "cc1: error" in low
+                or "cc1plus: fatal error" in low
+                or low.startswith("error:") or " error:" in low
+                or _file_loc_err.match(ln) is not None):
             nvcc_error_count += 1
             if len(error_lines) < 1:
                 error_lines.append(ln.strip())
         m = _re.search(
-            r"""(?:nvcc|hipcc|ptxas)\s+(?:fatal|error)\s*:\s*Unknown option\s*"""
+            r"""(?:nvcc|hipcc|ptxas|cc1plus|cc1)\s+(?:fatal|error)\s*:\s*"""
+            r"""(?:Unknown option|unrecognized\s+(?:command[-\s]*line\s+)?(?:option|argument))\s*"""
             r"""['"]?([^'"
 ]+?)['"]?(?:$|\s*\(|\s+at )""",
             ln, _re.IGNORECASE)
@@ -9205,20 +9524,59 @@ def _summarize_build_failure(exc, collected_text, module_name, elapsed, arch):
             f"[suggestion] flag {fl!r} may be too new for nvcc "
             f"{nvcc_ver_str}. Add --no-validate-flags to bypass, or "
             f"upgrade CUDA.")
-    lines.append("")
-    lines.append("[common causes]")
-    lines.append(
-        f"  - Mismatched CUDA + nvcc versions. Detected: nvcc "
-        f"{nvcc_ver_str}. Try `--bootstrap-cuda` to install a fresher "
-        f"toolchain.")
+    # Group B12 + B13 — fire common-causes suggestions only when there's
+    # actual evidence the cause is plausible. "Detected nvcc 13.0" used
+    # to fire on every failure (even AMD / TPU builds where nvcc isn't
+    # involved); "Stale CUDA_HOME" used to fire even when CUDA_HOME was
+    # unset. Also: the prior message suggested ``--arch auto`` which is
+    # rejected by argparse (--arch defaults to None when omitted to
+    # trigger auto-detect; there's no literal "auto" choice).
     cuda_home = os.environ.get("CUDA_HOME", "")
+    text_blob = collected_text.lower()
+    # Heuristics for "is this plausibly the cause?":
+    #   version-related   → toolchain mentioned in the failure text OR
+    #                       a fatal_unknown_flag was detected.
+    #   cuda-home-related → CUDA_HOME set AND points at a path that
+    #                       doesn't exist on disk (= truly stale) OR
+    #                       failure text mentions "cuda" / "nvcc" / a
+    #                       path that doesn't match CUDA_HOME.
+    cuda_arch = arch in ARCH_TABLE and ARCH_TABLE[arch].vendor == "cuda"
+    version_evidence = (
+        bool(fatal_unknown_flags)
+        or "nvcc fatal" in text_blob
+        or "ptxas fatal" in text_blob
+        or "unsupported gpu" in text_blob
+        or "unsupported compute" in text_blob
+    )
+    cuda_home_stale = False
     if cuda_home:
-        lines.append(
-            f"  - Stale `CUDA_HOME` env var. Detected: {cuda_home}. "
-            f"Run `_reconcile_cuda_home()` (see compile.py) or unset "
-            f"CUDA_HOME and re-run.")
-    else:
-        lines.append(
+        try:
+            cuda_home_stale = not Path(cuda_home).exists()
+        except OSError:
+            cuda_home_stale = True
+    cuda_home_referenced = (
+        cuda_home and (cuda_home.lower() in text_blob
+                       or "cuda_home" in text_blob))
+
+    common_causes: List[str] = []
+    if cuda_arch and (version_evidence or not nvcc_ver):
+        common_causes.append(
+            f"  - Possible CUDA + nvcc version mismatch. Detected: nvcc "
+            f"{nvcc_ver_str}. Try `--bootstrap-cuda` to install a "
+            f"fresher toolchain.")
+    if cuda_home and (cuda_home_stale or cuda_home_referenced):
+        if cuda_home_stale:
+            common_causes.append(
+                f"  - Stale `CUDA_HOME` env var (path does not exist on "
+                f"disk): {cuda_home}. Unset CUDA_HOME or `export "
+                f"CUDA_HOME=/usr/local/cuda` to a real install.")
+        else:
+            common_causes.append(
+                f"  - CUDA_HOME is set to {cuda_home} and appears in "
+                f"the failure log; double-check the path matches the "
+                f"nvcc on PATH.")
+    elif cuda_arch and not cuda_home:
+        common_causes.append(
             "  - CUDA_HOME is not set in the env. If the build expected "
             "a specific install, `export CUDA_HOME=/usr/local/cuda` and "
             "re-run.")
@@ -9229,10 +9587,23 @@ def _summarize_build_failure(exc, collected_text, module_name, elapsed, arch):
             detected_gpu = torch.cuda.get_device_name(0)
     except Exception:
         pass
-    lines.append(
-        f"  - Wrong arch for this GPU. Detected GPU: {detected_gpu}. "
-        f"Try `--arch auto` or specify `--arch <correct>` (target was "
-        f"{arch!r}).")
+    # Only suggest "wrong arch" when the failure plausibly looks like
+    # an arch / capability mismatch — otherwise it's noise on flag
+    # / linker / source-file errors that have nothing to do with arch.
+    arch_evidence = (
+        "unsupported gpu" in text_blob
+        or "compute capability" in text_blob
+        or "sm_" in text_blob and "not supported" in text_blob
+    )
+    if cuda_arch and (arch_evidence or version_evidence):
+        common_causes.append(
+            f"  - Wrong arch for this GPU. Detected GPU: {detected_gpu}. "
+            f"Omit --arch to enable auto-detect (or pass --arch <name>; "
+            f"target was {arch!r}).")
+    if common_causes:
+        lines.append("")
+        lines.append("[common causes]")
+        lines.extend(common_causes)
     return lines
 
 
@@ -11145,7 +11516,15 @@ def build_aot(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
                               ldflags, source_hash, host_hash, device_hash,
                               workload_hash, space_hash, report)
 
-    report.write("  [aot cache MISS] building primary artefact...\n")
+    # Group C21 — name what we're actually building so the user can
+    # correlate the cache miss with a specific module / arch / source
+    # set. ``_torch_load`` derives the same module_name string.
+    _module_name = (
+        f"grokking_compiled_{spec.optimizer}_{spec.model}_{spec.arch}")
+    entry = get_arch_entry(spec.arch)
+    report.write(
+        f"  [aot cache MISS] building {_module_name} for {spec.arch} "
+        f"(vendor={entry.vendor}, sources={len(sources)})\n")
     so_path = _torch_load(spec, sources, host_cflags, device_cflags, ldflags,
                           report)
     if so_path is None:
@@ -11162,6 +11541,22 @@ def build_aot(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
     )
     cache.save()
     return so_path
+
+
+def _report_path_hint(report) -> str:
+    """Best-effort extract the on-disk path of the report writer for
+    error-message UX. ``report`` may be a raw file handle, a
+    ``_DebugTee`` wrapper, or None. Returns a relative-friendly string
+    or ``"<report>"`` when no path is recoverable.
+    """
+    if report is None:
+        return "<report>"
+    # _DebugTee wraps a primary file handle that owns the name.
+    primary = getattr(report, "primary", report)
+    name = getattr(primary, "name", None)
+    if isinstance(name, (str, bytes)):
+        return str(name)
+    return "<report>"
 
 
 def _build_aot_pgo(spec: BuildSpec, cache: CompileCache, sources: List[Path],
@@ -11784,6 +12179,26 @@ def build(
             _pkg = "grokking_optimizers"
         _nvrtc_cache = Path.home() / ".cache" / _pkg / "nvrtc"
         _df_nvrtc = _disk_free_human(_nvrtc_cache)
+        # Group C17 — accurate flag-probe state. The pre-fix banner
+        # always said "enabled" even when --no-flag-probe had flipped
+        # _FLAG_PROBE_DISABLED True; now we report the true state and
+        # surface the running probe-cache hit/miss/error counts.
+        if _FLAG_PROBE_DISABLED:
+            fp_state = "DISABLED via --no-flag-probe"
+        else:
+            fp_state = (
+                f"enabled (cache hits={_FLAG_PROBE_STATS['hits']} "
+                f"misses={_FLAG_PROBE_STATS['misses']} "
+                f"errors={_FLAG_PROBE_STATS['errors']})")
+        # Group C23 — surface the auto-detect source if --arch was
+        # resolved by _resolve_default_arch (else the line is omitted
+        # so users who supplied --arch explicitly don't see noise).
+        if _LAST_BUILD_RESOLVED_ARCH is not None and \
+                _LAST_BUILD_RESOLVED_ARCH[0] == arch:
+            arch_source_line = (
+                f"[debug] arch source: {_LAST_BUILD_RESOLVED_ARCH[1]}\n")
+        else:
+            arch_source_line = ""
         sys.stderr.write(
             f"\n{bar}\n"
             f"[debug] grokking_optimizers.compile starting at {_ts}\n"
@@ -11801,8 +12216,8 @@ def build(
             f"[debug] hipcc:    {_hip_str}\n"
             f"[debug] jax:      {_jax_str}\n"
             f"[debug] arch-eligibility ({arch}): {_verdict}\n"
-            f"[debug] flag-probe: enabled (version-gated via "
-            f"_newer_compiler_flags)\n"
+            f"{arch_source_line}"
+            f"[debug] flag-probe: {fp_state}\n"
             f"[debug] log-level: _COMPILE_LOG_LEVEL={_COMPILE_LOG_LEVEL}\n"
             f"[debug] cache:    entries={_cache_entries}\n"
             f"[debug] disk:     out_dir free/total = {_df_out}\n"
@@ -11951,6 +12366,27 @@ def _spawn_phase(argv: List[str], phase: str) -> int:
     return subprocess.call(cmd, env=os.environ.copy())
 
 
+def _ensure_out_dir(out_dir: Path) -> Optional[int]:
+    """Create ``out_dir`` (and parents). Return None on success, exit code
+    on failure. Emits a one-line actionable diagnostic on PermissionError
+    / OSError instead of the 16-line bare traceback.
+    """
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return None
+    except PermissionError as exc:
+        sys.stderr.write(
+            f"[compile] cannot create --out {out_dir}: {exc}. "
+            f"Pick a writable directory, e.g. --out $HOME/build/compiled.\n")
+        return 2
+    except OSError as exc:
+        sys.stderr.write(
+            f"[compile] cannot create --out {out_dir}: "
+            f"{type(exc).__name__}: {exc}. "
+            f"Pick a writable directory, e.g. --out $HOME/build/compiled.\n")
+        return 2
+
+
 def _flag_audit_main(argv: List[str]) -> int:
     """Implementation of the ``--flag-audit`` CLI mode.
 
@@ -11963,9 +12399,43 @@ def _flag_audit_main(argv: List[str]) -> int:
     fa_parser.add_argument("--flag-audit", action="store_true",
                            dest="flag_audit")
     fa_parser.add_argument("--out", type=Path, default=None)
+    fa_parser.add_argument("--config", default=None)
+    fa_parser.add_argument("--project-config", default=None,
+                           dest="project_config")
     fa_args, _ = fa_parser.parse_known_args(argv)
     out_dir = Path(fa_args.out or REPO_ROOT / "build" / "compiled").resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    rc = _ensure_out_dir(out_dir)
+    if rc is not None:
+        return rc
+    # Group B15 — honour project config so the audit spec uses the
+    # downstream project's (optimizer, model) instead of mamba3/adamw.
+    _fa_cfg_path = fa_args.project_config or fa_args.config
+    try:
+        _fa_cfg = load_config(
+            Path(_fa_cfg_path) if _fa_cfg_path else None)
+    except FileNotFoundError as _fnf:
+        _flag = ("--project-config" if fa_args.project_config
+                 else "--config")
+        sys.stderr.write(
+            f"[flag-audit] {_flag} file not found: {_fnf}\n")
+        return 2
+    except Exception as exc:
+        sys.stderr.write(
+            f"[flag-audit] WARNING: failed to parse {_fa_cfg_path}: "
+            f"{type(exc).__name__}: {exc}; continuing with built-in "
+            f"defaults.\n")
+        _fa_cfg = {}
+    _fa_opt0 = "adamw"
+    _fa_model0 = "mamba3"
+    try:
+        _opts = _resolve_enabled_optimizers(_fa_cfg)
+        if _opts:
+            _fa_opt0 = _opts[0]
+        _mds = _resolve_enabled_models(_fa_cfg)
+        if _mds:
+            _fa_model0 = _mds[0]
+    except Exception:
+        pass
     audit_path = out_dir / "flag_audit.txt"
     try:
         audit_fh = open(audit_path, "w")
@@ -12079,7 +12549,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 except ValueError:
                     pass
         out_dir = Path(out_dir).resolve()
-        out_dir.mkdir(parents=True, exist_ok=True)
+        rc = _ensure_out_dir(out_dir)
+        if rc is not None:
+            return rc
         return _e2e_smoke(out_dir, max_seconds=max_seconds)
 
     # Early intercept: --list-archs is purely informational and doesn't
@@ -12204,9 +12676,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     _cfg_path = _pre_args.project_config or _pre_args.config
     try:
         _early_cfg = load_config(Path(_cfg_path) if _cfg_path else None)
-    except FileNotFoundError:
-        raise
-    except Exception:
+    except FileNotFoundError as _fnf:
+        # Use the actual flag the user typed in the error message so
+        # they don't have to guess which alias we accepted.
+        _flag = ("--project-config" if _pre_args.project_config
+                 else "--config")
+        sys.stderr.write(
+            f"[config] {_flag} file not found: {_fnf}; pass a path to "
+            f"an existing TOML file or omit the flag to use built-in "
+            f"defaults.\n")
+        return 2
+    except Exception as exc:
+        sys.stderr.write(
+            f"[config] WARNING: failed to parse {_cfg_path}: "
+            f"{type(exc).__name__}: {exc}; continuing with built-in "
+            f"defaults.\n")
         _early_cfg = {}
     _choice_opts = _resolve_enabled_optimizers(_early_cfg)
     _choice_models = _resolve_enabled_models(_early_cfg)
@@ -12575,7 +13059,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # (auto-detect filled in args.arch above if user omitted it).
     if getattr(args, "dry_run", False):
         out_dir = Path(args.out or REPO_ROOT / "build" / "compiled").resolve()
-        out_dir.mkdir(parents=True, exist_ok=True)
+        rc = _ensure_out_dir(out_dir)
+        if rc is not None:
+            return rc
         target_arch = args.arch
         if target_arch is None or target_arch not in ARCH_TABLE:
             sys.stderr.write(
@@ -12633,7 +13119,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.dry_run_all_archs:
         out_dir = Path(args.out or REPO_ROOT / "build" / "compiled").resolve()
-        out_dir.mkdir(parents=True, exist_ok=True)
+        rc = _ensure_out_dir(out_dir)
+        if rc is not None:
+            return rc
         manifests = _dry_run_all_archs(
             out_dir, config=_early_cfg,
             enable_synth_codegen=bool(
@@ -12665,7 +13153,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # it here. In normal use the early branch already returned.
     if getattr(args, "e2e_smoke", False):
         out = Path(args.out or REPO_ROOT / "build" / "compiled").resolve()
-        out.mkdir(parents=True, exist_ok=True)
+        rc = _ensure_out_dir(out)
+        if rc is not None:
+            return rc
         return _e2e_smoke(out, max_seconds=args.e2e_max_seconds)
 
     # Stream 11: pre-load the project config so module-level defaults can be
@@ -12741,8 +13231,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         argv_in = list(argv) if argv is not None else sys.argv[1:]
         rc_aot = _spawn_phase(argv_in, "aot")
         if rc_aot != 0:
-            sys.stderr.write(f"[runtime split] AOT subprocess returned "
-                             f"{rc_aot}; skipping JIT.\n")
+            # Group C22 — make the failure mode loud + actionable. The
+            # AOT subprocess captures its compiler stderr to the report
+            # file; surface the path so the user knows where to look.
+            _report_hint = args.report
+            if _report_hint is None:
+                _out = Path(args.out or REPO_ROOT / "build" / "compiled")
+                _report_hint = _out / (
+                    f"compile_{args.optimizer}_{args.model}_{args.arch}.txt")
+            sys.stderr.write(
+                f"[runtime split] ERROR AOT subprocess for "
+                f"{args.arch} failed with rc={rc_aot}. JIT phase "
+                f"skipped. See {_report_hint} for the captured "
+                f"compiler stderr.\n")
             return rc_aot
         rc_jit = _spawn_phase(argv_in, "jit")
         return rc_jit
@@ -13718,9 +14219,17 @@ def _self_test_flags(run) -> None:
     def test_build_failure_summary_lists_first_nvcc_error():
         """_summarize_build_failure extracts the first nvcc error,
         emits a per-flag suggestion for any 'Unknown option' line, and
-        appends a common-causes footer."""
+        appends a common-causes footer.
+
+        Group B13 — common-causes are now conditional on actual
+        evidence in ``collected_text``. The sample below contains an
+        "Unsupported gpu architecture" line so the "Wrong arch" hint
+        is plausible and DOES fire; a bare flag failure (no GPU
+        evidence) would not produce that suggestion any more.
+        """
         sample = (
             "nvcc fatal   : Unknown option '--device-link-options=-dlto'\n"
+            "nvcc fatal   : Unsupported gpu architecture 'compute_90'\n"
             "ninja: build stopped: subcommand failed.\n"
         )
         lines = _summarize_build_failure(
@@ -13734,11 +14243,64 @@ def _self_test_flags(run) -> None:
         assert "[suggestion]" in joined, \
             "missing per-flag suggestion for Unknown option"
         assert "[common causes]" in joined, "missing common-causes footer"
-        assert "Mismatched CUDA + nvcc" in joined
+        assert ("Possible CUDA + nvcc version mismatch" in joined
+                or "Mismatched CUDA + nvcc" in joined), \
+            "missing CUDA / nvcc version hint"
         assert "Wrong arch for this GPU" in joined
+        # Group B12 — must NOT suggest the (invalid) ``--arch auto``.
+        assert "--arch auto" not in joined, \
+            "should not suggest --arch auto (argparse rejects it)"
         assert "Total compile errors detected:" in joined
         assert "grokking_compiled_x" in joined
         assert "12.3s" in joined
+
+    def test_build_failure_summary_catches_cc1plus_error():
+        """Group B11 — when a host-side GCC build dies with
+        ``cc1plus: error: unrecognized argument``, the summary must
+        promote that line to ``First compiler error:`` instead of
+        falling through to the bare Exception repr.
+        """
+        sample = (
+            "cc1plus: error: unrecognized command line option '-flto=full'\n"
+            "make[1]: *** [foo.o] Error 1\n"
+        )
+        lines = _summarize_build_failure(
+            RuntimeError("Error building extension 'foo'"),
+            sample, module_name="grokking_compiled_x", elapsed=4.5,
+            arch="sm_90a")
+        joined = "\n".join(lines)
+        assert "cc1plus" in joined, \
+            f"cc1plus error not surfaced in summary; got: {joined!r}"
+        # The fatal_unknown_flags regex should pick up `-flto=full`.
+        assert "-flto=full" in joined, \
+            f"flag name not extracted from cc1plus error; got: {joined!r}"
+
+    def test_build_failure_summary_conditional_common_causes():
+        """Group B13 — common-causes block must NOT spam suggestions
+        on failures where the cause is unrelated. A bare linker
+        ``undefined reference`` error has no CUDA version / arch /
+        CUDA_HOME signal, so none of those suggestions should fire.
+        """
+        sample = (
+            "/usr/bin/ld: foo.o: in function `bar':\n"
+            "foo.o:foo.cpp:(.text+0x10): undefined reference to `baz'\n"
+            "collect2: error: ld returned 1 exit status\n"
+        )
+        # Snapshot CUDA_HOME so we don't depend on the host env.
+        _saved = os.environ.pop("CUDA_HOME", None)
+        try:
+            lines = _summarize_build_failure(
+                RuntimeError("Error building extension 'foo'"),
+                sample, module_name="grokking_compiled_x", elapsed=2.0,
+                arch="sm_90a")
+        finally:
+            if _saved is not None:
+                os.environ["CUDA_HOME"] = _saved
+        joined = "\n".join(lines)
+        # The bare linker failure offers no evidence of an arch
+        # mismatch, so the "Wrong arch" suggestion must stay quiet.
+        assert "Wrong arch for this GPU" not in joined, \
+            "arch hint fired on a linker-only failure (regression)"
 
     run("flag_trace_recorded_per_decision",
         test_flag_trace_recorded_per_decision)
@@ -13747,6 +14309,10 @@ def _self_test_flags(run) -> None:
         test_debug_banner_includes_toolchain_versions)
     run("build_failure_summary_lists_first_nvcc_error",
         test_build_failure_summary_lists_first_nvcc_error)
+    run("build_failure_summary_catches_cc1plus_error",
+        test_build_failure_summary_catches_cc1plus_error)
+    run("build_failure_summary_conditional_common_causes",
+        test_build_failure_summary_conditional_common_causes)
 
 
 def _self_test_bayesian(run) -> None:
@@ -14491,6 +15057,169 @@ def _self_test_cache(run) -> None:
 
     run("cache_v4_fresh_record_trial_writes_sidecar",
         test_cache_v4_fresh_record_trial_writes_sidecar)
+
+    def test_cache_concurrent_writes_both_survive():
+        """Group A1 — two threads writing to the same cache file MUST
+        both have their entries survive. The pre-fix bug was: each
+        thread loaded the same on-disk snapshot, applied its mutation,
+        and atomically replaced — losing the OTHER thread's entry.
+        With ``_save_locked`` holding an exclusive flock for the
+        load-merge-write cycle, both keys must be present after the
+        join.
+        """
+        import shutil as _shutil
+        td = Path(tempfile.mkdtemp())
+        try:
+            cp = td / "race.json"
+            # Seed the cache file so both threads load from the same
+            # baseline (mirrors the AOT/JIT subprocess split path).
+            CompileCache(cp).save()
+
+            def writer(opt: str):
+                c = CompileCache(cp)
+                c.record_aot(opt, "mamba3", "sm_90a",
+                             source_hash="s_" + opt,
+                             host_flags_hash="h_" + opt,
+                             device_flags_hash="d_" + opt,
+                             so_path=None,
+                             pgo_enabled=False,
+                             search_space_hash="ss_" + opt)
+                c.save()
+
+            t1 = threading.Thread(target=writer, args=("lion",))
+            t2 = threading.Thread(target=writer, args=("muon",))
+            t1.start()
+            t2.start()
+            t1.join(timeout=30)
+            t2.join(timeout=30)
+            assert not t1.is_alive() and not t2.is_alive(), "thread hang"
+
+            on_disk = json.loads(cp.read_text())
+            entries = on_disk.get("entries", {})
+            assert "lion/mamba3/sm_90a" in entries, \
+                f"lion entry lost — concurrent write race! Keys: " \
+                f"{sorted(entries.keys())}"
+            assert "muon/mamba3/sm_90a" in entries, \
+                f"muon entry lost — concurrent write race! Keys: " \
+                f"{sorted(entries.keys())}"
+        finally:
+            _shutil.rmtree(td)
+
+    def test_cache_corruption_emits_stderr_notice():
+        """Group A3 — when the on-disk cache is unreadable, ensure we
+        rotate to .corrupt.bak AND emit a stderr line so the user
+        knows their cache was wiped. The pre-fix behaviour silently
+        rotated then proceeded with a fresh dict.
+        """
+        import io as _io
+        import shutil as _shutil
+        td = Path(tempfile.mkdtemp())
+        try:
+            cp = td / "broken.json"
+            cp.write_text("{not valid json")
+            buf = _io.StringIO()
+            saved_stderr = sys.stderr
+            sys.stderr = buf
+            try:
+                _ = CompileCache(cp)
+            finally:
+                sys.stderr = saved_stderr
+            out = buf.getvalue()
+            assert "[cache]" in out and "rotated" in out, \
+                f"expected '[cache] ... rotated' on stderr, got: {out!r}"
+            backup = cp.with_suffix(cp.suffix + ".corrupt.bak")
+            assert backup.exists(), "corrupt cache should be rotated to .bak"
+        finally:
+            _shutil.rmtree(td)
+
+    def test_cache_disk_full_warning_does_not_crash():
+        """Group A2 — when the on-disk save fails (e.g. disk full or
+        read-only volume), CompileCache.save() MUST emit a warning
+        and continue, NOT propagate the OSError to the caller. We
+        simulate by pointing the cache at a read-only directory.
+        """
+        import io as _io
+        import shutil as _shutil
+        td = Path(tempfile.mkdtemp())
+        try:
+            ro_dir = td / "ro"
+            ro_dir.mkdir()
+            cp = ro_dir / "ro_cache.json"
+            cache = CompileCache(cp)
+            cache.record_aot("lion", "mamba3", "sm_90a",
+                             source_hash="s", host_flags_hash="h",
+                             device_flags_hash="d", so_path=None)
+            cache.save()  # baseline write should succeed
+            cache.record_aot("muon", "mamba3", "sm_90a",
+                             source_hash="s2", host_flags_hash="h2",
+                             device_flags_hash="d2", so_path=None)
+            # Strip write permissions to force OSError on rename.
+            try:
+                ro_dir.chmod(0o500)
+            except OSError:
+                # Some filesystems / containers won't honour chmod;
+                # skip this test cleanly in that case.
+                return
+            buf = _io.StringIO()
+            saved_stderr = sys.stderr
+            sys.stderr = buf
+            try:
+                cache.save()  # MUST NOT raise
+            finally:
+                sys.stderr = saved_stderr
+                try:
+                    ro_dir.chmod(0o700)
+                except OSError:
+                    pass
+            # In-memory state is preserved either way (lion AND muon).
+            e_lion = cache._data["entries"].get("lion/mamba3/sm_90a")
+            e_muon = cache._data["entries"].get("muon/mamba3/sm_90a")
+            assert e_lion is not None, "in-memory lion entry lost"
+            assert e_muon is not None, "in-memory muon entry lost"
+        finally:
+            try:
+                if (td / "ro").exists():
+                    (td / "ro").chmod(0o700)
+            except OSError:
+                pass
+            _shutil.rmtree(td, ignore_errors=True)
+
+    def test_cache_migrate_v3_uses_cache_version_constant():
+        """Group A4 — _migrate_v3_to_v4 must stamp ``data["version"]``
+        with the CACHE_VERSION module constant, not a literal 4. The
+        pre-fix bug was that a future bump of CACHE_VERSION would
+        leave migrated caches at v4 instead of the new version.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "cache.json"
+            v3 = {"version": 3, "entries": {},
+                  "host_history": [], "created_at": "2026-01-01"}
+            p.write_text(json.dumps(v3))
+            migrated = _migrate_v3_to_v4(v3, Path(td))
+            assert migrated["version"] == CACHE_VERSION, \
+                f"expected version={CACHE_VERSION}, got {migrated['version']}"
+
+    def test_make_trial_record_documents_v4_schema():
+        """Group A6 — _make_trial_record's docstring must list every
+        v4 sidecar field so downstream consumers + the v4 migrator
+        have a single source of truth.
+        """
+        doc = _make_trial_record.__doc__ or ""
+        for key in ("trial_num", "stage", "config", "config_key",
+                    "timing_ms", "min_ms", "max_ms", "n", "host",
+                    "numerical_status", "ptxas_info", "recorded_at"):
+            assert key in doc, f"docstring missing key {key!r}"
+
+    run("cache_concurrent_writes_both_survive",
+        test_cache_concurrent_writes_both_survive)
+    run("cache_corruption_emits_stderr_notice",
+        test_cache_corruption_emits_stderr_notice)
+    run("cache_disk_full_warning_does_not_crash",
+        test_cache_disk_full_warning_does_not_crash)
+    run("cache_migrate_v3_uses_cache_version_constant",
+        test_cache_migrate_v3_uses_cache_version_constant)
+    run("make_trial_record_documents_v4_schema",
+        test_make_trial_record_documents_v4_schema)
 
 
 def _self_test_multi_gpu_pool(run) -> None:
@@ -21929,8 +22658,14 @@ def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
     if cwd_path.exists():
         try:
             layers.append(_load_toml_file(cwd_path))
-        except Exception:
+        except FileNotFoundError:
+            # Shouldn't fire — we just checked .exists() — but defensive.
             pass
+        except Exception as exc:
+            sys.stderr.write(
+                f"[config] WARNING: failed to parse {cwd_path}: "
+                f"{type(exc).__name__}: {exc}; continuing with built-in "
+                f"defaults.\n")
     if path is not None:
         p = Path(path).expanduser().resolve()
         if not p.exists():
