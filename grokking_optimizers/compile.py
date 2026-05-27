@@ -8871,36 +8871,50 @@ def _newer_compiler_flags(arch: str, report=None,
     extra_device: List[str] = []
     if arch not in ARCH_TABLE:
         return extra_host, extra_device
+
+    def _gate(flag: str, gate_str: str, fired: bool, reason: str) -> None:
+        """Helper: append a trace decision for a version-gated flag."""
+        if trace is None:
+            return
+        status = "kept" if fired else "skipped"
+        trace.append((flag, status, reason))
+
     entry = get_arch_entry(arch)
     if entry.vendor == "cuda":
         ver = _probe_nvcc_version()
         if ver:
             if report:
                 report.write(f"  [toolchain] nvcc {ver[0]}.{ver[1]}\n")
+            ver_str = f"{ver[0]}.{ver[1]}"
             # CUDA 12.3+: --register-usage-level=10 enables PTXAS to use
             # the full register budget (default 5 leaves slots on the table).
             # Per CUDA Toolkit Release Notes, this flag was added in 12.3 —
             # CUDA 12.0–12.2 ptxas rejects it with "Unknown option". (Fixed
             # from an earlier (12,0) gate that bit a Colab CUDA 12.0 user.)
-            if ver >= (12, 3):
+            fired = ver >= (12, 3)
+            if fired:
                 extra_device += ["-Xptxas", "--register-usage-level=10"]
                 if report:
                     report.write("  [toolchain] enabling "
                                  "-Xptxas --register-usage-level=10 "
                                  "(CUDA ≥12.3)\n")
-            # CUDA 11.4+: explicit device-link-options=-dlto belt-and-suspenders.
-            # (NVCC_DEVICE_BASE already passes it on the main line; this is a
-            # second copy with an explicit option-name spelling for the rare
-            # multi-stage link.) Idempotent — nvcc dedupes.
-            if ver >= (11, 4):
-                extra_device += ["--device-link-options=-dlto"]
+            _gate("-Xptxas --register-usage-level=10",
+                  "12.3", fired,
+                  f"gated CUDA>=12.3, have {ver_str}")
+            # NOTE: ``--device-link-options=-dlto`` is NOT emitted here. It
+            # is a *link-only* flag — nvcc -c rejects it during the per-TU
+            # compile step with "Unknown option" (exactly the Colab CUDA 12.0
+            # failure mode this audit fixes). It now lives in
+            # ``_device_ldflags(spec)`` for any downstream consumer that
+            # invokes ``nvcc -dlink`` directly.
             # CUDA 12.5+: --maxrregcount-list accepts a comma-separated set
             # of register caps and lets ptxas pick the best per-kernel,
             # finer-grained than the single-value --maxrregcount. The list
             # is derived from ARCH_TABLE[arch].max_regs_per_thread so the
             # caps respect the per-arch register file. Strict gate — older
             # nvcc rejects the flag.
-            if ver >= (12, 5):
+            fired = ver >= (12, 5)
+            if fired:
                 cap = entry.max_regs_per_thread or 255
                 # Three well-spaced caps below the per-arch limit; ptxas
                 # picks whichever wastes the fewest cycles on spills.
@@ -8920,23 +8934,66 @@ def _newer_compiler_flags(arch: str, report=None,
                             "  [toolchain] enabling "
                             f"-Xptxas --maxrregcount-list={','.join(str(c) for c in seen)} "
                             "(CUDA ≥12.5)\n")
-            if ver >= (12, 6):
+            _gate("-Xptxas --maxrregcount-list=...",
+                  "12.5", fired,
+                  f"gated CUDA>=12.5, have {ver_str}")
+            # CUDA 12.5+: --allow-expensive-optimizations enables PTXAS
+            # optimization passes that older toolchains reject.
+            fired = ver >= (12, 5)
+            if fired:
+                extra_device += ["-Xptxas",
+                                 "--allow-expensive-optimizations=true"]
+            _gate("-Xptxas --allow-expensive-optimizations=true",
+                  "12.5", fired,
+                  f"gated CUDA>=12.5, have {ver_str}")
+            # CUDA 12.0+: --def-load-cache / --def-store-cache (conservative
+            # gate; technically older, but only the canonical Hopper
+            # toolchain is guaranteed to accept these spellings).
+            fired = ver >= (12, 0)
+            if fired:
+                extra_device += ["-Xptxas", "--def-load-cache=ca",
+                                 "-Xptxas", "--def-store-cache=wb"]
+            _gate("-Xptxas --def-load-cache=ca / --def-store-cache=wb",
+                  "12.0", fired,
+                  f"gated CUDA>=12.0, have {ver_str}")
+            # CUDA 11.2+: --threads N parallel TU compilation.
+            fired = ver >= (11, 2)
+            if fired:
+                extra_device += ["--threads", str(min(NCPUS, 8))]
+            _gate("--threads N",
+                  "11.2", fired,
+                  f"gated CUDA>=11.2, have {ver_str}")
+            fired = ver >= (12, 6)
+            if fired:
                 # NVCC 12.6+ supports --split-compile for opt-phase parallelism.
                 extra_device += [f"--split-compile={NCPUS}"]
                 if report:
                     report.write(f"  [toolchain] enabling "
                                  f"--split-compile={NCPUS} (NVCC ≥12.6)\n")
+            _gate("--split-compile=N",
+                  "12.6", fired,
+                  f"gated CUDA>=12.6, have {ver_str}")
             # CUDA 13.0+: --minimal disables features the build doesn't need
             # (cuRTC, cudadevrt) to shrink the fatbin. Strict gate — earlier
             # nvcc rejects the flag.
-            if ver >= (13, 0):
+            fired = ver >= (13, 0)
+            if fired:
                 extra_device += ["--minimal"]
                 if report:
                     report.write("  [toolchain] enabling --minimal "
                                  "(NVCC ≥13.0)\n")
-        elif report:
-            report.write("  [toolchain] nvcc not on PATH; "
-                         "skipping version-gated flags\n")
+            _gate("--minimal",
+                  "13.0", fired,
+                  f"gated CUDA>=13.0, have {ver_str}")
+        else:
+            # No nvcc on PATH — record this so the trace shows the gate
+            # was consulted but couldn't fire.
+            if trace is not None:
+                trace.append(("version-gated nvcc flags", "skipped",
+                              "nvcc not on PATH"))
+            if report:
+                report.write("  [toolchain] nvcc not on PATH; "
+                             "skipping version-gated flags\n")
     elif entry.vendor == "hip":
         ver = _probe_hipcc_version()
         if ver and report:
