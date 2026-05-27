@@ -139,248 +139,68 @@ subprocess.run(["git", "submodule", "update", "--init", "--recursive",
                 "third_party/cutlass"], check=False)
 ```
 
-### Step 3 — Compile (one Python block, every MAXIMAL feature available)
+### Step 3 — Compile
 
-> **Before you start**: `compile.py` auto-detects your GPU. On Colab
-> (T4 / L4 / A100) you don't need to set `ARCH` — leave it as
-> `None` and the resolver runs the same probe chain as the CLI
-> (`torch.cuda` → `rocm-smi` → `jax.devices` → TOML → built-in
-> fallback). The quickstart works on **any GPU vendor / arch** out of
-> the box. Set `ARCH` to a specific value only if you want to
-> cross-compile for a different GPU than the one this process is
-> running on.
+Pick an `(optimizer, model)` pair and call `build(...)`. That's the
+whole quickstart. Every MAXIMAL feature — host PGO, device PGO
+(CUPTI / rocprof / XLA HLO), Jinja2 emitter, NVRTC/hipRTC runtime
+specialization, OpGraph synthesis codegen, polyhedral schedule
+search, learned cost model with rejection budget, Hyperband pruning,
+sibling-optimizer transfer learning, vendor-dispatched toolchain
+bootstrap — is **ON by default** in `build()`. Each layer has a
+graceful skip path when its soft dep or hardware is missing, so the
+same block runs unchanged on T4 / L4 / A100 / H100 / MI300 / TPU.
 
-Pick your `(optimizer, model)` pair (leave `ARCH = None` for
-auto-detect, or override it), flip the feature toggles you want, and
-call `build(...)` with `debug=True`. The single block below does AOT
-compile, Bayesian autotune with **auto early-stop**, 3-pass PGO (plus
-optional CUPTI/rocprof device-PGO sidecar), final rebuild with the
-winning macros, and the profile pass — all streamed to your terminal
-so you can see every compiler invocation, every autotune trial, every
-cache hit/miss, and the full env state.
+The autotune budget is **auto** by default: no fixed trial count, no
+wall-clock cap. The 5-criterion early-stop (plateau / EI floor /
+coverage saturation / time-cap / patience) decides when to halt while
+the autotuner samples from the full per-arch programmatic search
+space — sm_90a alone is ~3.7B candidates wide before prefilter
+(`build_full_search_space()` in `compile.py`). Arch is auto-detected
+via the probe chain (`torch.cuda` → `rocm-smi` → `jax.devices` → TOML
+→ built-in fallback) so you don't set it on Colab.
 
-**Important:** run Python from the repo root (the directory `cd`'d into
-in Step 1). The block below adds the repo root to `sys.path` so the
-import works whether you're in a REPL, a script saved elsewhere, or
-running with `python -c`.
+Run Python from the repo root (the directory `cd`'d into in Step 1):
 
 ```python
-import os, sys
+import sys
 from pathlib import Path
+sys.path.insert(0, str(Path.cwd()))   # make the cloned source importable
 
-# ─── make the cloned source importable (no pip install required) ──────────
-REPO_ROOT = Path.cwd()                                     # change if needed
-assert (REPO_ROOT / "grokking_optimizers" / "compile.py").is_file(), (
-    f"grokking_optimizers/ not found under {REPO_ROOT}. "
-    "Either `cd` into the cloned SuperGrok1.5/ first, or set "
-    "REPO_ROOT = Path('/absolute/path/to/SuperGrok1.5')."
-)
-sys.path.insert(0, str(REPO_ROOT))
-
-# ─── YOUR SELECTION ───────────────────────────────────────────────────────
-OPTIMIZER = "adamw"            # adamw | lion | grokfast | grokadamw | looksam |
-                               # muon | neuralgrok | prodigy | supergrok11 |
-                               # supergrok15 | supergrok2
-MODEL     = "vit"              # mamba | decoder | vit  (per
-                               # grokking_optimizers.profile.MODELS)
-                               # NOTE: the CLI parser's --model choices come
-                               # from [models].enabled in the active TOML
-                               # config (default _DEFAULT_PROJECT_CONFIG
-                               # advertises ["mamba", "decoder", "vit"]);
-                               # ``_validate(spec)`` enforces the same
-                               # triple. All three values pass both layers
-                               # override. To use ``mamba`` or ``decoder``
-                               # from the CLI, supply ``--config`` with a
-                               # TOML that sets [models].enabled = ["mamba",
-                               # "decoder", "vit"].
-ARCH      = None               # None  ⇒ auto-detect via build()'s probe chain
-                               # (torch.cuda → rocm-smi → jax → TOML →
-                               # built-in fallback `sm_90a`). Override ONLY
-                               # if cross-compiling for a different arch
-                               # than the GPU this process is on. Common
-                               # Colab GPUs map to: T4=sm_75, A100=sm_80,
-                               # L4=sm_89, H100=sm_90a, V100=sm_70.
-                               # See "Hardware support — ARCH_TABLE" for
-                               # the full list of 26 canonical archs.
-
-# ─── AUTOTUNE BUDGET — every value below is a CEILING / KNOB, not a target.
-#     The autotuner picks the actual kernel parameters from a per-arch
-#     programmatic space that's billions of candidates wide (build_full_
-#     search_space() in compile.py — sm_90a alone has ~3.7B configs).
-BAYESIAN_TRIALS = None         # None  ⇒ auto early-stop on plateau / EI
-                               # exhaustion / coverage saturation /
-                               # MAX_TUNE_SECONDS. Set to an int to pin a
-                               # fixed trial count. TIP: for first-run
-                               # sanity-checking, try BAYESIAN_TRIALS = 25
-                               # (quick mode) before letting it run to
-                               # full convergence.
-TOP_K           = None         # None  ⇒ elbow-of-timing-curve detection.
-                               # Set to an int to pin top-K refinement size.
-MAX_TUNE_SECONDS = None        # None  ⇒ no wall-clock cap. Set e.g. 900
-                               # to hard-stop after 15 min regardless of
-                               # convergence state.
-MIN_IMPROVEMENT  = 0.005       # plateau threshold (0.5% relative)
-PATIENCE         = None        # None  ⇒ auto = max(50, 0.1 × trials_done)
-PRUNER           = "hyperband" # "none" | "median" | "hyperband"
-TRANSFER         = True        # seed TPE from sibling-optimizer trials
-SEED             = 0           # Optuna sampler seed
-
-# ─── BUILD-TIME FEATURE TOGGLES — defaulted ON for max performance. ──────
-#     Every toggle below has a graceful no-op skip path when its
-#     dependency is missing (e.g. ENABLE_POLYHEDRAL silently skips if
-#     libclang isn't installed). Leaving them ON gives users maximum
-#     performance out of the box without breakage.
-PGO                       = True   # host-side LLVM PGO 3-pass loop —
-                                   # always a win, no external dep
-PGO_STEPS                 = 1000   # # of opt.step() calls during PGO collect
-ENABLE_DEVICE_PGO         = True   # CUPTI (NVIDIA) / rocprof (AMD) / XLA
-                                   # HLO (Pallas) stall-info sidecar — biases
-                                   # the autotuner toward stall-relieving
-                                   # configs. Gated on nsys / rocprof
-                                   # availability — graceful skip otherwise.
-ENABLE_EMITTER            = True   # Render per-variant kernels from the
-                                   # bundled Jinja2 templates instead of -D
-                                   # macros. Gated on jinja2 availability.
-ENABLE_RUNTIME_SPEC       = True   # NVRTC / hipRTC runtime kernel
-                                   # specialization (KernelRegistry). Gated
-                                   # on cuda-python / hip-python.
-ENABLE_SYNTH_CODEGEN      = True   # OpGraph-based synthesis codegen
-                                   # (Stream γ) — emit fully fused kernel
-                                   # sources from a pattern library.
-                                   # No external dep; always safe.
-ENABLE_POLYHEDRAL         = True   # Polyhedral schedule search — extra
-                                   # loop-restructuring candidates fed to
-                                   # the autotuner. Gated on libclang
-                                   # availability — graceful skip otherwise.
-ENABLE_COST_MODEL         = True   # Learned cost model + rejection budget
-                                   # (Stream C) — predicted-bad configs
-                                   # are skipped without timing them, so
-                                   # the autotuner spends its budget on
-                                   # promising candidates.
-STRICT_NUMERICS           = False  # KEEP OFF for first run — opt in only
-                                   # after a healthy baseline. Requires
-                                   # bit-identical determinism for the
-                                   # winning variant (excludes
-                                   # numerical_fail; demands deterministic
-                                   # status on a 3x re-run).
-
-# ─── CACHE-GC KNOBS (Stream 9 — auto-prune runs after JIT autotune) ──────
-PRUNE_MAX_AGE_DAYS = 30        # drop variant_artifacts older than N days
-PRUNE_KEEP_TOP_N   = 100       # per (opt, model, arch) keep top-N fastest
-AUTO_PRUNE         = True      # disable with False if you want to keep
-                               # every variant_artifact across runs
-
-# ─── TOOLCHAIN BOOTSTRAP — all default OFF; flip if your host is missing.
-BOOTSTRAP_CUDA   = True        # NVIDIA: probes conda / NVIDIA apt repo /
-                               # apt / dnf / yum / zypper / pacman / apk /
-                               # brew / winget / PyPI wheels — picks CUDA
-                               # version per arch (sm_120a → 12.8+,
-                               # sm_103a → 12.9+, sm_90a → 12.0+).
-BOOTSTRAP_ROCM   = False       # AMD: AMD's official apt repo per-arch
-                               # (gfx950 → ROCm 6.2+, gfx1200 → 7.0+),
-                               # falls back to stock apt / dnf / zypper.
-BOOTSTRAP_JAX    = True        # Pallas: pip install jax[tpu] from the
-                               # libtpu_releases bucket if no TPU device
-                               # is visible.
-
-# ─── OTHER ────────────────────────────────────────────────────────────────
-DEBUG_SYMBOLS  = False         # -ggdb / -lineinfo (auto-on with profile)
-PROFILE_AFTER  = True          # run ncu/rocprof/jax.profiler after final link
-CONFIG_TOML    = None          # Path to your own compile_config.toml that
-                               # overrides _DEFAULT_PROJECT_CONFIG inside
-                               # compile.py. None ⇒ use inlined defaults.
-
-# ─── TOOLCHAIN ENV — set BEFORE the grokking_optimizers import so torch's
-#     cpp_extension picks up CUDA_HOME / ROCM_HOME at its first import.
-#     When ARCH is None (auto-detect), resolve it here so the env-setup
-#     below knows which toolchain to wire in. The same probe chain runs
-#     again inside build() — both calls are idempotent and cheap. ─────
-from grokking_optimizers.compile import (
-    get_arch_entry, _resolve_default_arch,
-)
-_resolved_arch = ARCH if ARCH not in (None, "auto") else _resolve_default_arch()
-_vendor = get_arch_entry(_resolved_arch).vendor
-if _vendor == "cuda":
-    os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")  # adjust to your install
-    os.environ["PATH"] = f"{os.environ['CUDA_HOME']}/bin:{os.environ['PATH']}"
-elif _vendor == "hip":
-    os.environ.setdefault("ROCM_PATH", "/opt/rocm")        # adjust to your install
-    os.environ["PATH"] = f"{os.environ['ROCM_PATH']}/bin:{os.environ['PATH']}"
-# Pallas (tpu_v4 / tpu_v5e / tpu_v5p / tpu_v6e / tpu_v7) needs no C++
-# toolchain — JAX/Pallas does codegen at runtime. BOOTSTRAP_JAX handles it.
-
-# ─── COMPILE — debug=True streams every step to stderr in real time ──────
 from grokking_optimizers.compile import build, CompileCache
 
-cache = CompileCache(Path("build/.compile_cache.json"))
 so_path = build(
-    optimizer=OPTIMIZER,
-    model=MODEL,
-    arch=ARCH,                                   # None ⇒ build() auto-detects
-                                                 # via the same probe chain
-                                                 # used by the CLI.
-    cache=cache,
-    debug=True,                                  # stream the full report
-    autotune=True,
-    autotune_mode="bayesian",                    # "bayesian" | "exhaustive"
-    # ── Autotune budget (auto by default) ──
-    bayesian_trials=BAYESIAN_TRIALS,
-    top_k=TOP_K,
-    max_tune_seconds=MAX_TUNE_SECONDS,
-    min_improvement=MIN_IMPROVEMENT,
-    patience=PATIENCE,
-    pruner=PRUNER,
-    transfer_learning=TRANSFER,
-    seed=SEED,
-    # ── PGO (host + optional device) ──
-    pgo=PGO,
-    pgo_steps=PGO_STEPS,
-    enable_device_pgo=ENABLE_DEVICE_PGO,         # CUPTI / rocprof / XLA HLO
-    # ── Codegen + runtime specialization ──
-    enable_emitter=ENABLE_EMITTER,               # Jinja2 per-variant emitter
-    enable_runtime_specialization=ENABLE_RUNTIME_SPEC,  # NVRTC / hipRTC
-    enable_synth_codegen=ENABLE_SYNTH_CODEGEN,   # OpGraph synthesis codegen
-    enable_polyhedral=ENABLE_POLYHEDRAL,         # polyhedral schedule search
-    enable_cost_model=ENABLE_COST_MODEL,
-    # ── Numerical validation ──
-    strict_numerics=STRICT_NUMERICS,
-    # ── Cache GC ──
-    prune_after_autotune=AUTO_PRUNE,
-    prune_max_age_days=PRUNE_MAX_AGE_DAYS,
-    prune_keep_top_n=PRUNE_KEEP_TOP_N,
-    # ── Toolchain bootstrap (vendor-dispatched) ──
-    bootstrap_cuda=BOOTSTRAP_CUDA,
-    bootstrap_rocm=BOOTSTRAP_ROCM,
-    bootstrap_jax=BOOTSTRAP_JAX,
-    # ── Outputs / misc ──
-    profile=PROFILE_AFTER,
-    debug_symbols=DEBUG_SYMBOLS,
-    config=CONFIG_TOML,                          # None ⇒ inlined defaults
-    # ── CPU/GPU host split (uncomment for split deployments) ──
-    # search_space_path=Path("my_search_space.yaml"),    # use your own YAML
-    # aot_only=True, aot_artifact_dir=Path("build/aot"), # CPU-host AOT only
-    # jit_only=True,                                     # GPU-host JIT only
+    optimizer="adamw",     # adamw | lion | grokfast | grokadamw | looksam |
+                           # muon | neuralgrok | prodigy | supergrok11 |
+                           # supergrok15 | supergrok2
+    model="vit",           # mamba | decoder | vit
+    cache=CompileCache(Path("build/.compile_cache.json")),
+    debug=True,            # stream the full report to stderr in real time
 )
 print("built:", so_path)
 ```
 
-Why the autotune budget values default to `None` and the feature
-toggles default to `True`: **the autotune is exactly what searches
-over the actual kernel parameters** (block size, vector width, unroll
-factor, num_stages, cluster shape, swizzle, warp-specialization, TMA,
-async-copy depth on sm_90a; LDS padding, waves-per-EU, MFMA shape,
-scheduler hint on gfx942 — see `build_full_search_space()` in
-`compile.py` for the complete programmatic grid: **billions of
-candidates per arch** before prefilter, sampled directly via Optuna's
-`suggest_categorical` rather than materialized). The `None` budget
-values above let the **5-criterion early-stop** (plateau / EI floor /
-coverage saturation / time-cap / patience) decide when to halt — that
-beats a hardcoded trial count on every workload we've measured. The
-`True` feature toggles enable every layer that has a graceful skip
-path when its dependency is missing, so users get max performance on
-whatever toolchain they have without breakage. The winning config
-gets baked into `csrc/algorithms/tuned_configs.h` and the primary
-`.so` is rebuilt with those macros.
+That's it. The block does AOT compile, Bayesian autotune with auto
+early-stop, 3-pass host PGO, device-PGO sidecar (when CUPTI/rocprof
+are available), final rebuild with the winning macros, and the
+profile pass — all streamed live with `debug=True`. Outputs land in
+`build/compiled/` and the cache survives across runs.
+
+**Power-user overrides** (rarely needed — every default is the best
+setting we've measured):
+
+```python
+so_path = build(
+    optimizer="supergrok2", model="mamba",
+    arch="sm_90a",                 # override auto-detect
+    bayesian_trials=200,           # pin a fixed trial count
+    max_tune_seconds=900,          # 15-minute wall-clock cap
+    strict_numerics=True,          # require bit-identical determinism
+    enable_polyhedral=False,       # disable any specific layer
+    cache=CompileCache(Path("build/.compile_cache.json")),
+    debug=True,
+)
+```
 
 What you will see streaming to your terminal with `debug=True`:
 
@@ -429,15 +249,19 @@ Outputs (also written even without `debug=True`):
   (for Pallas archs: `tuned_pallas_<O>_<M>_<A>.json` instead — no `.so`)
 - `build/.compile_cache.json` — survives across runs; same combo is a
   cache-hit on every phase
-- `build/compiled/device_stall_info.json` — only when
-  `ENABLE_DEVICE_PGO=True` and CUPTI/rocprof produced something
-- `build/compiled/nvrtc_cache/*.cubin` — only when
-  `ENABLE_RUNTIME_SPEC=True`
+- `build/compiled/device_stall_info.json` — when CUPTI/rocprof
+  produced something (device-PGO is on by default; degrades silently
+  when the profiler isn't installed)
+- `build/compiled/nvrtc_cache/*.cubin` — when cuda-python / hip-python
+  is available (runtime specialization is on by default)
 
-Common gotcha: `compile` AOT will fail with `CUDA_HOME environment
-variable is not set` even when `nvcc` is on `PATH` — torch's
-`cpp_extension` reads `CUDA_HOME` directly. The toolchain block above
-handles this.
+`build()` auto-discovers `nvcc` / `hipcc` (searches `PATH`, then
+`$CUDA_HOME`, then `/usr/local/cuda-*`, then NVIDIA's PyPI wheels) and
+auto-fixes a stale `CUDA_HOME` env var before torch's `cpp_extension`
+reads it. On a fresh Colab CPU runtime, `bootstrap_cuda=True` (the
+default) installs nvcc via conda / apt / dnf / yum / zypper / pacman /
+apk / brew / winget / PyPI wheels — whichever is available — before
+the AOT phase runs.
 
 ### Step 4 — Profile (one step, also fully debug-able)
 

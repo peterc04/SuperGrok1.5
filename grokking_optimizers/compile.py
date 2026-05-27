@@ -11853,7 +11853,12 @@ def build(
     extra_macros: Optional[Iterable[str]] = None,
     search_space_path: Optional[Path] = None,
     aot_artifact_dir: Optional[Path] = None,
-    pgo: bool = False,
+    # ── MAXIMAL defaults ────────────────────────────────────────────
+    # Every opt-in layer is ON by default. Each one has a graceful
+    # no-op skip when its soft dep / device is missing, so flipping
+    # them on costs nothing on hosts that can't use them and earns
+    # everything on hosts that can. Pass False to disable individually.
+    pgo: bool = True,
     pgo_workload: Optional[Path] = None,
     pgo_steps: int = 1000,
     bayesian_trials: Optional[int] = None,
@@ -11865,25 +11870,41 @@ def build(
     seed: int = 0,
     debug_symbols: bool = False,
     debug: bool = False,
-    bootstrap_cuda: bool = False,
-    bootstrap_rocm: bool = False,
-    bootstrap_jax: bool = False,
-    pruner: str = "none",
-    transfer_learning: bool = False,
-    enable_runtime_specialization: bool = False,
+    bootstrap_cuda: bool = True,
+    bootstrap_rocm: bool = True,
+    bootstrap_jax: bool = True,
+    pruner: str = "hyperband",
+    transfer_learning: bool = True,
+    enable_runtime_specialization: bool = True,
     config: Optional[Any] = None,
-    enable_emitter: bool = False,
-    enable_device_pgo: bool = False,
+    enable_emitter: bool = True,
+    enable_device_pgo: bool = True,
     prune_after_autotune: bool = True,
     prune_max_age_days: int = 30,
     prune_keep_top_n: int = 100,
     strict_numerics: bool = False,
-    enable_synth_codegen: bool = False,
-    enable_polyhedral: bool = False,
-    enable_cost_model: bool = False,
+    enable_synth_codegen: bool = True,
+    enable_polyhedral: bool = True,
+    enable_cost_model: bool = True,
     auto_install_optional_deps: bool = True,
 ) -> Optional[Path]:
     """In-process orchestrator. ``main`` handles subprocess split.
+
+    Every feature toggle defaults to MAXIMAL performance — host PGO,
+    device PGO, Jinja2 emitter, NVRTC runtime specialization, OpGraph
+    synth codegen, polyhedral schedule search, learned cost model,
+    Hyperband pruning, transfer learning, vendor-dispatched toolchain
+    bootstrap. Each layer has a graceful skip path when its soft
+    dependency or hardware is absent, so leaving them on costs nothing
+    on hosts that can't use them. Pass ``False`` for any individual
+    knob to opt out.
+
+    The autotune budget (``bayesian_trials``, ``top_k``,
+    ``max_tune_seconds``, ``patience``) defaults to ``None`` so the
+    5-criterion auto early-stop (plateau / EI floor / coverage
+    saturation / time-cap / patience) decides when to halt, and the
+    autotuner samples from the full per-arch programmatic search space
+    (billions of candidates on sm_90a; see ``build_full_search_space``).
 
     When called from Python, this does not fork: AOT and JIT run in the
     same process. Use ``main(['--runtime', 'both', ...])`` for the
