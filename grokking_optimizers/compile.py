@@ -4293,6 +4293,10 @@ def _make_trial_record(stage: str, trial_num: int, cfg: Dict[str, Any],
     # infeasible / build-fail trials) get "skipped" by default.
     ckey = config_key(cfg)
     num_status = _LAST_NUMERICAL_STATUS.get(ckey, "skipped")
+    # Stream α: pull per-variant ptxas-v info (regs_used, smem_bytes, etc.).
+    # Empty dict (not None) when the variant never went through a compiler
+    # invocation we parsed — keeps the sidecar schema stable.
+    ptxas_info = dict(_LAST_PTXAS_INFO.get(ckey, {}))
     return {
         "trial_num":   trial_num,
         "stage":       stage,
@@ -4305,6 +4309,7 @@ def _make_trial_record(stage: str, trial_num: int, cfg: Dict[str, Any],
         "n":           result["n"]         if result else None,
         "host":        host,
         "numerical_status": num_status,
+        "ptxas_info":  ptxas_info,
         "recorded_at": datetime.datetime.now().isoformat(),
     }
 
@@ -6747,6 +6752,24 @@ NVCC_DEVICE_BASE = [
     # main line but explicit so the device link doesn't silently downgrade
     # when the host driver passes its own --device-link-options).
     "--device-link-options=-dlto",
+    # Stream α: cross-TU relocatable device code is required for -dlto to
+    # actually link across translation units. nvcc accepts this on every
+    # CUDA toolchain ≥10; project-agnostic — single-TU builds still work
+    # (rdc=true is a no-op when there's only one device object). Pair this
+    # with ``-rdc=true`` (option-name form) for ninja drivers that strip
+    # short-form flags from the link line.
+    "-rdc=true",
+    # Stream α: --default-stream per-thread gives each host thread its own
+    # CUDA stream by default. Multi-stream launchers (the only callers that
+    # care) get genuine concurrency; single-threaded kernels are unaffected
+    # since they were already using the legacy stream. Documented per-arch
+    # perf win in the CUDA Programming Guide §C.4.
+    "--default-stream", "per-thread",
+    # Stream α: --source-in-ptx is the modern spelling of -src-in-ptx; pair
+    # with the -lineinfo / --generate-line-info emitted in _device_cflags()
+    # when debug_symbols/profile is on. Free on release builds (nvcc emits
+    # a single extra debug section, stripped by the linker).
+    "--source-in-ptx",
 ]
 
 # HIPCC base flags — --offload-arch is appended per-build from
@@ -6770,9 +6793,32 @@ HIPCC_DEVICE_BASE = [
     "-mllvm", "--amdgpu-promote-alloca-to-vector-limit=512",
     "-mllvm", "--amdgpu-sroa-vector-elements=8",
     "-mllvm", "--amdgpu-enable-merge-m0",
+    # Stream α: NewGVN gives noticeably better global value numbering on
+    # register-heavy CDNA3 kernels (GEMM tails, attention MLPs). Safe on
+    # every gfx target — falls back to legacy GVN for arches where it's
+    # less helpful.
+    "-mllvm", "--enable-newgvn",
+    # Stream α: bump the LLVM inline threshold from clang's default 225 to
+    # 275 (matches the AMDGPU back-end's own recommendation). Inline-heavy
+    # GPU kernels see noticeable codegen wins; CPU host code never sees
+    # this because hipcc only forwards -mllvm to the device pipeline.
+    "-mllvm", "--inline-threshold=275",
+    # Stream α: explicit coercion of illegal types (fp8/fp4 today, future
+    # fpXX) avoids the back-end emitting bitcast+vector-scalarise sequences
+    # that crush throughput on CDNA3/4. Set to 1 unconditionally because
+    # the back-end is a no-op on arches without fp8/fp4 hardware.
+    "-mllvm", "--amdgpu-coerce-illegal-types=1",
     "-fgpu-flush-denormals-to-zero",
     "-Rpass-analysis=kernel-resource-usage",
     "-flto",
+    # Stream α: -fgpu-rdc emits relocatable device code so cross-TU LTO
+    # actually has objects to link across. Single-TU builds are unaffected
+    # (hipcc treats -fgpu-rdc as a no-op when there's only one device TU).
+    "-fgpu-rdc",
+    # Stream α: silence the RDNA wavefront-size transform-pass warning
+    # that fires on every kernel built with -mwavefrontsize32. The warning
+    # is informational and never actionable in our build flow.
+    "-Wno-pass-failed=transform-warning",
 ]
 
 LDFLAGS_BASE = [
@@ -6822,6 +6868,28 @@ def _device_cflags(spec: BuildSpec) -> List[str]:
         if spec.debug_symbols or spec.profile:
             base += ["-lineinfo", "--generate-line-info"]
 
+        # Stream α: --keep + --keep-dir preserves the nvcc intermediates
+        # (.cubin, .ptx, .fatbin, .sass dumps) under <out_dir>/nvcc_intermediate
+        # when debug_symbols is requested. Project-agnostic: the dir is
+        # derived from spec.out_dir, so any consumer of BuildSpec gets the
+        # same treatment without code edits here.
+        if spec.debug_symbols:
+            keep_dir = Path(spec.out_dir) / "nvcc_intermediate"
+            try:
+                keep_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                # Filesystem read-only / permission denied → fall back to
+                # nvcc's default temp behaviour silently.
+                pass
+            base += ["--keep", f"--keep-dir={keep_dir}"]
+
+        # Stream α: --use-local-env tells nvcc to honour the cl.exe env on
+        # Windows (vsdevcmd-style) instead of trying to spawn its own. No-op
+        # on Linux/macOS — gated to avoid an "unknown option" diag on
+        # older nvcc that doesn't recognise it.
+        if sys.platform.startswith("win"):
+            base += ["--use-local-env"]
+
         # CUTLASS integration: emit both the legacy single-arch token and
         # the modern multi-arch list (CUTLASS_NVCC_ARCHS_SUPPORTED). The
         # arch_suffix encodes the "a" qualifier needed for Hopper+ to
@@ -6858,9 +6926,17 @@ def _device_cflags(spec: BuildSpec) -> List[str]:
 
     if entry.vendor == "hip":
         base = list(HIPCC_DEVICE_BASE)
-        # Per-arch --offload-arch from ARCH_TABLE.
+        # Per-arch --offload-arch from ARCH_TABLE. Stream α: gfx950 (CDNA4)
+        # benefits from explicit SRAM-ECC + XNACK suffixes — the bitcode
+        # library picker uses those bits to choose the right variant. Other
+        # arches stay with the bare offload-arch token (the LLVM default
+        # suffix selection is correct everywhere else).
         if entry.hipcc_offload_arch:
-            base += [f"--offload-arch={entry.hipcc_offload_arch}"]
+            offload = entry.hipcc_offload_arch
+            if offload == "gfx950":
+                base += [f"--offload-arch={offload}:sramecc+:xnack-"]
+            else:
+                base += [f"--offload-arch={offload}"]
 
         # CDNA (gfx9xx, wave64) gets -mcumode for compute-unit mode (vs the
         # default WGP mode that pairs CUs in RDNA). RDNA (gfx10xx+, wave32)
@@ -6891,6 +6967,10 @@ def _device_cflags(spec: BuildSpec) -> List[str]:
         # Debug-only: -fgpu-sanitize is opt-in (it adds nontrivial overhead).
         if spec.debug_symbols:
             base += ["-fgpu-sanitize"]
+            # Stream α: --save-temps=cwd preserves the device IR / object
+            # artefacts in the build CWD for post-mortem disassembly. Only
+            # enabled in debug mode (it inflates build-dir size noticeably).
+            base += ["--save-temps=cwd"]
         if spec.debug_symbols or spec.profile:
             base += ["-ggdb"]
         return base + _build_macros(spec)
@@ -6918,8 +6998,30 @@ _XLA_FLAGS_BASE: Tuple[str, ...] = (
     "--xla_gpu_enable_cudnn_fmha=true",
     "--xla_gpu_enable_async_collectives=true",
     "--xla_gpu_enable_latency_hiding_scheduler=true",
-    "--xla_gpu_enable_command_buffer=FUSION,CUSTOM_CALL,CUBLAS,CUDNN,COLLECTIVES",
+    # Stream α: extend the command-buffer scope to include CUBLASLT (the
+    # cuBLAS-Lt variant). Without it, cuBLASLt GEMMs fall outside the CUDA
+    # graph and trigger per-call host/device sync.
+    "--xla_gpu_enable_command_buffer=FUSION,CUSTOM_CALL,CUBLAS,CUBLASLT,CUDNN,COLLECTIVES",
     "--xla_gpu_graph_level=3",
+    # Stream α: per-XLA-2025 perf flags. All of these are documented in
+    # third_party/xla/xla/debug_options_flags.cc and are pure-perf or
+    # numerically inert on the workloads we care about (no compile/runtime
+    # behaviour changes for projects that don't use the relevant codepath).
+    "--xla_gpu_enable_persistent_temp_buffers=true",
+    "--xla_gpu_enable_priority_fusion=true",
+    "--xla_gpu_enable_pipelined_all_reduce=true",
+    "--xla_gpu_enable_pipelined_all_gather=true",
+    "--xla_gpu_enable_pipelined_reduce_scatter=true",
+    # 8 MiB redzone padding around device allocations — catches OOB writes
+    # in memcheck workflows, no overhead in release.
+    "--xla_gpu_redzone_padding_bytes=8388608",
+    # Capture every fused region into a CUDA graph (default min_size=2
+    # leaves trivial single-op regions out of the graph and pays per-call
+    # launch overhead).
+    "--xla_gpu_graph_min_graph_size=1",
+    # Widen the GEMM autotune solution pool from the default 32 to 128 so
+    # the tuner can see more cuBLASLt / Triton candidates per fusion.
+    "--xla_gpu_autotune_max_solutions=128",
 )
 
 
@@ -6938,12 +7040,24 @@ def _xla_env(arch: str, out_dir: Path) -> Dict[str, str]:
         return {}
     cache_dir = Path(out_dir) / "jax_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return {
+    env: Dict[str, str] = {
         "XLA_FLAGS": " ".join(_XLA_FLAGS_BASE),
         "JAX_COMPILATION_CACHE_DIR": str(cache_dir),
         # Cache every compile — default skips short ones (≥1s by default).
         "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
     }
+    # Stream α: pin JAX_PLATFORMS=tpu for tpu_* archs so the JAX runtime
+    # never accidentally selects the CPU / GPU backend on a host that
+    # also exposes a CUDA device (multi-accelerator boxes).
+    if arch.startswith("tpu_"):
+        env["JAX_PLATFORMS"] = "tpu"
+    # Stream α: pass LIBTPU_INIT_ARGS through if the user set it in their
+    # shell. This is the only way to influence libtpu's per-chip init
+    # (megachip topology, runtime debug flags, etc.) — picking it up here
+    # avoids requiring every downstream invocation to re-export it.
+    if "LIBTPU_INIT_ARGS" in os.environ:
+        env["LIBTPU_INIT_ARGS"] = os.environ["LIBTPU_INIT_ARGS"]
+    return env
 
 
 def _include_paths(spec: Optional["BuildSpec"] = None) -> List[str]:
@@ -7365,6 +7479,32 @@ def _newer_compiler_flags(arch: str, report=None) -> Tuple[List[str], List[str]]
             # multi-stage link.) Idempotent — nvcc dedupes.
             if ver >= (11, 4):
                 extra_device += ["--device-link-options=-dlto"]
+            # CUDA 12.5+: --maxrregcount-list accepts a comma-separated set
+            # of register caps and lets ptxas pick the best per-kernel,
+            # finer-grained than the single-value --maxrregcount. The list
+            # is derived from ARCH_TABLE[arch].max_regs_per_thread so the
+            # caps respect the per-arch register file. Strict gate — older
+            # nvcc rejects the flag.
+            if ver >= (12, 5):
+                cap = entry.max_regs_per_thread or 255
+                # Three well-spaced caps below the per-arch limit; ptxas
+                # picks whichever wastes the fewest cycles on spills.
+                caps = [c for c in (64, 128, 192, cap) if c <= cap]
+                # De-duplicate while preserving order (cap may equal 192).
+                seen: List[int] = []
+                for c in caps:
+                    if c not in seen:
+                        seen.append(c)
+                if seen:
+                    extra_device += [
+                        "-Xptxas",
+                        f"--maxrregcount-list={','.join(str(c) for c in seen)}",
+                    ]
+                    if report:
+                        report.write(
+                            "  [toolchain] enabling "
+                            f"-Xptxas --maxrregcount-list={','.join(str(c) for c in seen)} "
+                            "(CUDA ≥12.5)\n")
             if ver >= (12, 6):
                 # NVCC 12.6+ supports --split-compile for opt-phase parallelism.
                 extra_device += [f"--split-compile={NCPUS}"]
@@ -7530,6 +7670,32 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
     elapsed = time.monotonic() - t0
     so = next(build_dir.glob(f"{module_name}*.so"), None)
     report.write(f"\n[build OK in {elapsed:.1f}s] -> {so}\n")
+    # Stream α — opportunistic ptxas-v parsing. After a successful build,
+    # look for any captured stderr that ninja / torch may have written into
+    # the build dir (different torch versions keep this in different
+    # places; we try a few). Parsed info is stashed on a per-build-dir
+    # cache so downstream sites (e.g. the variant timer) can pick it up
+    # by build_dir without re-running the compiler. Failures here are
+    # non-fatal — ptxas_info just stays empty for that variant.
+    try:
+        candidates = [
+            build_dir / "ninja_build.log",
+            build_dir / "build.log",
+            build_dir / ".ninja_log",
+        ]
+        captured = ""
+        for c in candidates:
+            if c.is_file():
+                try:
+                    captured += c.read_text(errors="replace")
+                except OSError:
+                    pass
+        if captured:
+            parsed = _parse_ptxas_v_stderr(captured)
+            if parsed:
+                _LAST_PTXAS_INFO_BY_BUILD_DIR[str(build_dir)] = parsed
+    except Exception:
+        pass
     return so
 
 
@@ -7578,6 +7744,118 @@ TOLERANCES: Dict[str, Tuple[float, float]] = {
 # keyed by config_key(); _make_trial_record reads it back so the existing
 # ``timer(cfg) -> result-dict`` signature stays unchanged.
 _LAST_NUMERICAL_STATUS: Dict[str, str] = {}
+
+# Stream α — parsed ptxas-v info per-variant (regs_used, smem_bytes, etc.).
+# Populated by callers that have ptxas/hipcc stderr, read by
+# ``_make_trial_record`` so cost-model / autotune can consume the metrics.
+_LAST_PTXAS_INFO: Dict[str, Dict[str, Any]] = {}
+
+# Stream α — opportunistic ptxas info indexed by absolute build_dir path.
+# Populated by ``_torch_load`` when it can recover the ninja/torch build
+# log; the variant timer maps build_dir -> config_key after the build to
+# promote entries into ``_LAST_PTXAS_INFO``. Module-level so the two
+# call-sites can rendezvous without a passing-thread argument.
+_LAST_PTXAS_INFO_BY_BUILD_DIR: Dict[str, Dict[str, Any]] = {}
+
+
+def _parse_ptxas_v_stderr(text: str) -> Dict[str, Any]:
+    """Parse ``-Xptxas -v`` (NVCC) or ``-Rpass-analysis=kernel-resource-usage``
+    (HIPCC) stderr into a metrics dict.
+
+    Returns a dict with any of the following keys that the text contains:
+
+      ``regs_used``      — peak register count per thread
+      ``smem_bytes``     — static shared memory per block (bytes)
+      ``stack_frame``    — stack frame in bytes
+      ``spill_stores``   — bytes of spill stores
+      ``spill_loads``    — bytes of spill loads
+      ``kernels``        — list of per-kernel dicts (same keys) when the
+                           build produced multiple entry points
+
+    Project-agnostic: only parses the documented ptxas / AMDGPU pass-analysis
+    line formats, so the function works for any CUDA / HIP project that
+    pipes the compiler stderr in.
+    """
+    info: Dict[str, Any] = {}
+    if not text:
+        return info
+    import re as _re
+
+    # ---- NVCC ptxas -v format (CUDA 11+) ---------------------------------
+    # Example lines:
+    #   ptxas info    : Used 64 registers, 4096 bytes smem, 376 bytes cmem[0]
+    #   ptxas info    : Compiling entry function '_Z...' for 'sm_90'
+    #   ptxas info    : 256 bytes stack frame, 128 bytes spill stores, 96 bytes spill loads
+    kernels: List[Dict[str, Any]] = []
+    cur: Dict[str, Any] = {}
+    for line in text.splitlines():
+        m = _re.search(r"Compiling entry function\s+'([^']+)'", line)
+        if m:
+            if cur:
+                kernels.append(cur)
+            cur = {"name": m.group(1)}
+            continue
+        m = _re.search(r"Used\s+(\d+)\s+registers", line)
+        if m:
+            cur["regs_used"] = int(m.group(1))
+            info["regs_used"] = max(info.get("regs_used", 0), int(m.group(1)))
+        m = _re.search(r"(\d+)\s+bytes\s+smem", line)
+        if m:
+            cur["smem_bytes"] = int(m.group(1))
+            info["smem_bytes"] = max(info.get("smem_bytes", 0), int(m.group(1)))
+        m = _re.search(r"(\d+)\s+bytes\s+stack frame", line)
+        if m:
+            cur["stack_frame"] = int(m.group(1))
+            info["stack_frame"] = max(info.get("stack_frame", 0), int(m.group(1)))
+        m = _re.search(r"(\d+)\s+bytes\s+spill stores", line)
+        if m:
+            cur["spill_stores"] = int(m.group(1))
+            info["spill_stores"] = (
+                info.get("spill_stores", 0) + int(m.group(1)))
+        m = _re.search(r"(\d+)\s+bytes\s+spill loads", line)
+        if m:
+            cur["spill_loads"] = int(m.group(1))
+            info["spill_loads"] = (
+                info.get("spill_loads", 0) + int(m.group(1)))
+
+        # ---- HIPCC -Rpass-analysis=kernel-resource-usage --------------
+        # Example: remark: <file>:<line>: SGPRs: 80 VGPRs: 64 AGPRs: 0
+        #          ScratchSize [bytes/lane]: 0 ...
+        m = _re.search(r"VGPRs:\s*(\d+)", line)
+        if m:
+            cur.setdefault("name", "(hip-kernel)")
+            cur["regs_used"] = int(m.group(1))
+            info["regs_used"] = max(info.get("regs_used", 0), int(m.group(1)))
+        m = _re.search(r"LDSByteSize:\s*(\d+)", line)
+        if m:
+            cur["smem_bytes"] = int(m.group(1))
+            info["smem_bytes"] = max(info.get("smem_bytes", 0), int(m.group(1)))
+        m = _re.search(r"ScratchSize\s*\[bytes/lane\]:\s*(\d+)", line)
+        if m:
+            cur["stack_frame"] = int(m.group(1))
+            info["stack_frame"] = max(info.get("stack_frame", 0), int(m.group(1)))
+    if cur:
+        kernels.append(cur)
+    if kernels:
+        info["kernels"] = kernels
+    return info
+
+
+def _record_ptxas_info_for_cfg(cfg: Dict[str, Any],
+                               stderr_text: str) -> Dict[str, Any]:
+    """Parse compiler stderr and stash the result in ``_LAST_PTXAS_INFO``
+    keyed by ``config_key(cfg)``. Returns the parsed dict (possibly empty)
+    so callers can also log it directly.
+
+    Idempotent — re-calling for the same cfg merges the new keys over the
+    old (last writer wins per key)."""
+    info = _parse_ptxas_v_stderr(stderr_text)
+    if info:
+        ckey = config_key(cfg)
+        existing = _LAST_PTXAS_INFO.get(ckey, {})
+        existing.update(info)
+        _LAST_PTXAS_INFO[ckey] = existing
+    return info
 
 
 _DEFAULT_FUSED_OP_TEMPLATE = (
@@ -8059,6 +8337,20 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
             return None
         cache.record_variant(spec.optimizer, spec.model, spec.arch,
                              ckey, variant_so)
+
+        # Stream α — promote any ptxas-v info that _torch_load captured for
+        # this variant's build directory into the per-config sidecar so
+        # _make_trial_record picks it up.
+        try:
+            vsuffix = f"_{_short_key(ckey)}"
+            mname = (f"grokking_compiled_{spec.optimizer}_"
+                     f"{spec.model}_{spec.arch}{vsuffix}")
+            bdir = str(spec.out_dir / mname)
+            parsed = _LAST_PTXAS_INFO_BY_BUILD_DIR.pop(bdir, None)
+            if parsed:
+                _LAST_PTXAS_INFO[ckey] = parsed
+        except Exception:
+            pass
 
         # Tell the inline timing script to dump the post-step param tensor
         # so we can numerically compare against the reference. The env var
@@ -10830,11 +11122,114 @@ def _self_test() -> int:
         finally:
             shutil.rmtree(td)
 
+    def test_stream_alpha_nvcc_flags():
+        """Stream α: sm_90a build line must include the new NVCC perf flags
+        (--warn-on-spills, --default-stream per-thread, --source-in-ptx,
+        -rdc=true), and the ptxas-v stderr parser must populate a non-empty
+        ptxas_info dict in the trial sidecar."""
+        flags = _device_cflags(_spec("sm_90a"))
+        joined = " ".join(flags)
+        assert "--warn-on-spills" in joined, \
+            "sm_90a missing --warn-on-spills"
+        # NB: the canonical spelling pairs the two tokens with a space.
+        assert "--default-stream per-thread" in joined, \
+            "sm_90a missing --default-stream per-thread"
+        assert "--source-in-ptx" in joined, \
+            "sm_90a missing --source-in-ptx"
+        assert "-rdc=true" in joined, "sm_90a missing -rdc=true"
+        # ---- ptxas-v stderr parser populates per-variant sidecar ---------
+        synthetic = (
+            "ptxas info    : Compiling entry function '_Znopkernel' for 'sm_90'\n"
+            "ptxas info    : Used 80 registers, 4096 bytes smem, 376 bytes cmem[0]\n"
+            "ptxas info    : 256 bytes stack frame, 128 bytes spill stores, "
+            "96 bytes spill loads\n"
+        )
+        cfg = {"block": 128, "vec": 4, "unroll": 4}
+        parsed = _record_ptxas_info_for_cfg(cfg, synthetic)
+        assert parsed, "ptxas-v parser returned empty dict on canonical input"
+        assert parsed["regs_used"] == 80
+        assert parsed["smem_bytes"] == 4096
+        assert parsed["stack_frame"] == 256
+        assert parsed["spill_stores"] == 128
+        assert parsed["spill_loads"] == 96
+        rec = _make_trial_record("tpe", 0, cfg, None)
+        assert rec.get("ptxas_info"), \
+            "trial sidecar missing populated ptxas_info"
+        assert rec["ptxas_info"]["regs_used"] == 80
+
+    def test_stream_alpha_hipcc_flags():
+        """Stream α: gfx942 build line must include -fgpu-rdc and
+        --enable-newgvn (and the other new HIPCC perf flags). gfx950 must
+        carry the sramecc+:xnack- offload suffix."""
+        flags = _device_cflags(_spec("gfx942"))
+        joined = " ".join(flags)
+        assert "-fgpu-rdc" in joined, "gfx942 missing -fgpu-rdc"
+        assert "--enable-newgvn" in joined, \
+            "gfx942 missing -mllvm --enable-newgvn"
+        assert "--inline-threshold=275" in joined, \
+            "gfx942 missing --inline-threshold=275"
+        assert "--amdgpu-coerce-illegal-types=1" in joined, \
+            "gfx942 missing --amdgpu-coerce-illegal-types=1"
+        assert "-Wno-pass-failed=transform-warning" in joined, \
+            "gfx942 missing -Wno-pass-failed=transform-warning"
+        # gfx950 should carry the sramecc+:xnack- suffix.
+        flags_950 = _device_cflags(_spec("gfx950"))
+        joined_950 = " ".join(flags_950)
+        assert "--offload-arch=gfx950:sramecc+:xnack-" in joined_950, \
+            "gfx950 missing sramecc+:xnack- offload-arch suffix"
+        # And the bare suffix should NOT appear on its own.
+        assert "--offload-arch=gfx950 " not in (joined_950 + " "), \
+            "gfx950 leaked bare --offload-arch=gfx950 alongside suffixed form"
+
+    def test_stream_alpha_xla_flags():
+        """Stream α: every new XLA flag appears in the env dict for Pallas
+        archs; none of the flags leak into non-Pallas archs."""
+        td = Path(tempfile.mkdtemp())
+        try:
+            env = _xla_env("tpu_v5p", td)
+            xf = env.get("XLA_FLAGS", "")
+            for required in (
+                "--xla_gpu_enable_persistent_temp_buffers=true",
+                "--xla_gpu_enable_priority_fusion=true",
+                "--xla_gpu_enable_pipelined_all_reduce=true",
+                "--xla_gpu_enable_pipelined_all_gather=true",
+                "--xla_gpu_enable_pipelined_reduce_scatter=true",
+                "--xla_gpu_redzone_padding_bytes=8388608",
+                "--xla_gpu_graph_min_graph_size=1",
+                "--xla_gpu_autotune_max_solutions=128",
+                "CUBLASLT",  # command-buffer scope extension
+            ):
+                assert required in xf, \
+                    f"tpu_v5p XLA_FLAGS missing {required!r}"
+            # JAX_PLATFORMS pinned to tpu for tpu_* archs.
+            assert env.get("JAX_PLATFORMS") == "tpu", \
+                "tpu_v5p missing JAX_PLATFORMS=tpu"
+            # LIBTPU_INIT_ARGS passthrough — when set in the environment.
+            saved = os.environ.get("LIBTPU_INIT_ARGS")
+            os.environ["LIBTPU_INIT_ARGS"] = "--xla_tpu_test=1"
+            try:
+                env2 = _xla_env("tpu_v5p", td)
+                assert env2.get("LIBTPU_INIT_ARGS") == "--xla_tpu_test=1", \
+                    "LIBTPU_INIT_ARGS not threaded through _xla_env"
+            finally:
+                if saved is None:
+                    os.environ.pop("LIBTPU_INIT_ARGS", None)
+                else:
+                    os.environ["LIBTPU_INIT_ARGS"] = saved
+            # Non-Pallas archs still return empty.
+            assert _xla_env("sm_90a", td) == {}
+            assert _xla_env("gfx942", td) == {}
+        finally:
+            shutil.rmtree(td)
+
     _run("per_arch_native_flags", test_per_arch_native_flags)
     _run("flag_base_superset_regression", test_flag_base_superset_regression)
     _run("nvcc_no_duplicate_ptxas_o3", test_nvcc_no_duplicate_ptxas_o3)
     _run("resolve_extra_feature_macros", test_resolve_extra_feature_macros)
     _run("xla_env", test_xla_env)
+    _run("stream_alpha_nvcc_flags", test_stream_alpha_nvcc_flags)
+    _run("stream_alpha_hipcc_flags", test_stream_alpha_hipcc_flags)
+    _run("stream_alpha_xla_flags", test_stream_alpha_xla_flags)
 
     sys.stdout.write("[self-test] bayesian\n")
 
