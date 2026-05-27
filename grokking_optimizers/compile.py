@@ -190,6 +190,13 @@ JIT_CACHE_FLUSH_EVERY = 5   # save cache every N completed JIT trials
 # end. Same shape for [host_cflags] and [xla_env].
 _COMPILE_LOG_LEVEL: int = 0
 
+# Module-level cache of the arch that the last ``build()`` call resolved.
+# Set whenever ``build()`` enters with ``arch in (None, "auto", "")`` and
+# the auto-detect probe chain picks a value. Tests / harnesses can read
+# this to confirm what was actually targeted. ``None`` means no
+# ``build()`` call has occurred (or one entered with an explicit arch).
+_LAST_BUILD_RESOLVED_ARCH: Optional[str] = None
+
 # Type alias — each tuple is (flag_repr, status, reason).
 #   flag_repr — the literal token(s) the helper would emit (or wanted to)
 #   status    — "kept" if the flag is in the final list, "skipped" if a
@@ -428,6 +435,32 @@ _F_BLACKWELL_CONSUMER = _F_ADA + ("fp4",)     # sm_120a: fp8+fp4, no tma/wgmma/c
 _ARCH_TABLE_PRIMARY: Dict[str, ArchEntry] = {
 
     # =================== NVIDIA / CUDA ===================
+    # BLOCKER 4 — sm_70 (V100/Volta) is the GPU class of older Colab and
+    # Kaggle runtimes. Volta has first-gen tensor cores (wmma fp16/fp32
+    # accumulate) but no async-copy / no bf16 / no fp8 — so we extend the
+    # base CUDA feature set with only ``tensor_cores`` + ``wmma`` and stop
+    # short of Ampere's ``async_copy + bf16``. CUDA 10.0+ has supported
+    # compute capability 7.0 from launch.
+    "sm_70": ArchEntry(
+        vendor="cuda",
+        display_name="NVIDIA V100 (Volta)",
+        subdir="cuda/sm_70",
+        launcher_glob=("launch_*.cu",),
+        model_glob=("*.cu",),
+        macro="SG_BUILD_ARCH_SM70",
+        host_define="WITH_CUDA",
+        min_toolchain_version=(10, 0),
+        arch_suffix="",
+        nvcc_gencode=_nvcc_gencode_pair(70),
+        hipcc_offload_arch="",
+        cutlass_arch=70,
+        max_smem_per_block=96 * 1024,
+        warp_size=32,
+        max_regs_per_thread=255,
+        max_threads_per_block=1024,
+        features=frozenset(_F_BASE_CUDA + ("tensor_cores", "wmma")),
+    ),
+
     "sm_75": ArchEntry(
         vendor="cuda",
         display_name="NVIDIA T4 (Turing)",
@@ -1403,6 +1436,18 @@ def _build_rdna_space(arch_key: str,
 
 # ---- Per-arch CUDA builders ----------------------------------------------
 
+def _sm70_full_space() -> Dict[str, Any]:
+    # BLOCKER 4 — Volta: first-gen tensor cores via wmma but no async_copy
+    # / no bf16. Even smaller smem than Turing (96 KB); drop vec=16,
+    # cap unroll/stages conservatively to match the per-block budget.
+    return _build_cuda_space(
+        "sm_70",
+        vec_values=[1, 2, 4, 8],
+        unroll_values=[1, 2, 4, 8, 16, 32, 64],
+        stages_values=[1, 2, 3, 4],
+    )
+
+
 def _sm75_full_space() -> Dict[str, Any]:
     # Turing: no async_copy/bf16; smaller smem (100 KB); drop vec=16 and large unroll.
     return _build_cuda_space(
@@ -1715,6 +1760,7 @@ def _tpu_v7_full_space() -> Dict[str, Any]:
 # Maps canonical arch keys to their builder. RDNA3 variants (gfx1101/gfx1102)
 # reuse the gfx1100 builder; RDNA4 gfx1201 reuses gfx1200.
 _ARCH_BUILDERS: Dict[str, Callable[[], Dict[str, Any]]] = {
+    "sm_70":    _sm70_full_space,
     "sm_75":    _sm75_full_space,
     "sm_80":    _sm80_full_space,
     "sm_86":    _sm86_full_space,
@@ -6976,9 +7022,13 @@ def _dry_run_all_archs(out_dir: Path,
     manifests: Dict[str, Dict] = {}
     for arch in canonical_archs:
         entry = ARCH_TABLE[arch]
+        # BLOCKER 7 — use the canonical short model name ("mamba") so
+        # the dry-run manifests carry macros that match the runtime
+        # dispatch (profile.MODELS). The legacy "mamba3" string was not
+        # in MODELS and never round-tripped through _validate.
         spec = BuildSpec(
             optimizer="adamw",
-            model="mamba3",
+            model="mamba",
             arch=arch,
             out_dir=out_dir,
             runtime="aot",
@@ -7311,7 +7361,7 @@ def _build_macros(spec: BuildSpec) -> List[str]:
 
 HOST_CFLAGS_BASE = [
     "-O3", "-std=c++17", "-fPIC",
-    "-flto=full", "-march=native", "-mtune=native",
+    "-flto=auto", "-march=native", "-mtune=native",
     "-fno-semantic-interposition", "-fvisibility=hidden",
     "-fdata-sections", "-ffunction-sections",
     "-fno-math-errno", "-fno-trapping-math",
@@ -7365,46 +7415,33 @@ NVCC_DEVICE_BASE = [
     # lives in ``_newer_compiler_flags`` (probes nvcc at runtime); keeping
     # it out of the base list means CUDA 11/12.0–12.4 builds still succeed.
     "--extra-device-vectorization",
-    "-Xcompiler", "-fPIC", "-Xcompiler", "-flto=full",
+    "-Xcompiler", "-fPIC", "-Xcompiler", "-flto=auto",
     "-Xcompiler", "-fno-strict-aliasing",
     # Quiet the linker on big templated kernels — these warnings are
     # CUTLASS/cuBLASLt routine and never actionable.
     "-Xnvlink", "--suppress-stack-size-warning",
-    # CUDA 12+ deprecates a couple of constexpr-related diags that fire
-    # in third-party headers (CCCL, CUTLASS). Suppress so build logs stay
-    # actionable. --diag-suppress is silently ignored by older nvcc.
-    "--diag-suppress=20012,20013",
     "--resource-usage",
-    # ``-dlto`` (bare, short-form) is valid at *compile* time on CUDA 11.2+
-    # whenever ``-rdc=true`` is also passed — it asks nvcc to emit the
-    # device LTO bitcode into the per-TU object. The matching
-    # ``--device-link-options=-dlto`` is a LINK-only flag and lives in
-    # ``_device_ldflags(spec)``; emitting it here would make nvcc abort
-    # the per-file compile with "Unknown option '--device-link-options=-dlto'"
-    # (nvcc -c rejects link-only options).
-    "-dlto",
-    # NOTE: --def-load-cache / --def-store-cache are CUDA 11.5+ ptxas flags
-    # but older drivers/ptxas reject them silently — gated in
-    # ``_newer_compiler_flags`` to CUDA 12.0+ (first canonical Hopper
-    # toolchain) to stay conservative.
-    # Stream α: cross-TU relocatable device code is required for -dlto to
-    # actually link across translation units. nvcc accepts this on every
-    # CUDA toolchain ≥10; project-agnostic — single-TU builds still work
-    # (rdc=true is a no-op when there's only one device object). Pair this
-    # with ``-rdc=true`` (option-name form) for ninja drivers that strip
-    # short-form flags from the link line.
-    "-rdc=true",
+    # F-A — ``-dlto`` / ``-rdc=true`` MOVED to ``_newer_compiler_flags``
+    # gated at CUDA >= 11.4. Per the CUDA Toolkit Features Archive,
+    # device-LTO landed in CUDA 11.4, NOT 11.2 as the previous comment
+    # claimed. CUDA 11.0/11.1/11.2/11.3 nvcc rejects the pair with
+    # "Unknown option '-dlto'" and breaks the per-TU compile entirely.
+    # F-D — ``--source-in-ptx`` MOVED to ``_device_cflags(spec)`` and is
+    # only emitted when ``spec.debug_symbols or spec.profile`` is True
+    # (paired with the existing ``-lineinfo`` / ``--generate-line-info``
+    # emission). nvcc warns when ``--source-in-ptx`` is supplied without
+    # one of those — moving it under the same gate eliminates the warning
+    # noise on release builds.
+    # F-C — ``--diag-suppress=20012,20013`` MOVED to
+    # ``_newer_compiler_flags`` gated at CUDA >= 11.2. CUDA 11.0/11.1
+    # nvcc reject the spelling — the prior comment claiming "silently
+    # ignored by older nvcc" was incorrect.
     # Stream α: --default-stream per-thread gives each host thread its own
     # CUDA stream by default. Multi-stream launchers (the only callers that
     # care) get genuine concurrency; single-threaded kernels are unaffected
     # since they were already using the legacy stream. Documented per-arch
     # perf win in the CUDA Programming Guide §C.4.
     "--default-stream", "per-thread",
-    # Stream α: --source-in-ptx is the modern spelling of -src-in-ptx; pair
-    # with the -lineinfo / --generate-line-info emitted in _device_cflags()
-    # when debug_symbols/profile is on. Free on release builds (nvcc emits
-    # a single extra debug section, stripped by the linker).
-    "--source-in-ptx",
 ]
 
 # HIPCC base flags — --offload-arch is appended per-build from
@@ -7457,7 +7494,7 @@ HIPCC_DEVICE_BASE = [
 ]
 
 LDFLAGS_BASE = [
-    "-flto=full", "-Wl,--as-needed",
+    "-flto=auto", "-Wl,--as-needed",
     "-Wl,--gc-sections", "-Wl,-O3",
     "-Wl,--icf=all",
 ]
@@ -7565,12 +7602,23 @@ def _device_cflags(spec: BuildSpec,
                         f"-gencode per ARCH_TABLE[{spec.arch!r}].nvcc_gencode")
 
         if spec.debug_symbols or spec.profile:
-            base += ["-lineinfo", "--generate-line-info"]
-            _trace_add_many(trace, ["-lineinfo", "--generate-line-info"],
-                            f"spec.debug_symbols={spec.debug_symbols} "
-                            f"spec.profile={spec.profile} → source-line PC map")
+            # F-D — ``--source-in-ptx`` is paired with the line-info
+            # flags. nvcc warns ("ignoring --source-in-ptx without
+            # -lineinfo or --device-debug") when emitted alone, so we
+            # only add it here under the same gate. Free on release
+            # builds when debug_symbols=profile=False (no .ptx bloat,
+            # no warning noise).
+            base += ["-lineinfo", "--generate-line-info", "--source-in-ptx"]
+            _trace_add_many(
+                trace,
+                ["-lineinfo", "--generate-line-info", "--source-in-ptx"],
+                f"spec.debug_symbols={spec.debug_symbols} "
+                f"spec.profile={spec.profile} → source-line PC map "
+                "(F-D: --source-in-ptx only when paired with -lineinfo)")
         else:
-            _trace_add(trace, "-lineinfo --generate-line-info", "skipped",
+            _trace_add(trace,
+                       "-lineinfo --generate-line-info --source-in-ptx",
+                       "skipped",
                        "spec.debug_symbols=False spec.profile=False")
 
         # Stream α: --keep + --keep-dir preserves the nvcc intermediates
@@ -7865,11 +7913,15 @@ def _device_ldflags(spec: BuildSpec) -> List[str]:
     entry = get_arch_entry(spec.arch)
     if entry.vendor != "cuda":
         return []
-    cflags = _device_cflags(spec)
-    has_dlto = "-dlto" in cflags
-    has_rdc = any(f == "-rdc=true" or f == "--relocatable-device-code=true"
-                  for f in cflags)
-    if has_dlto and has_rdc:
+    # F-B — test the version gate DIRECTLY via ``_probe_nvcc_version()``
+    # instead of recursively building the full _device_cflags() list and
+    # grepping it. The recursive call caused the flag-probe pass to run
+    # TWICE per build (once for the cflags, again here) and inflated
+    # ``spec.flag_probe_dropped`` with duplicates. The gate (CUDA >= 11.4,
+    # set in ``_newer_compiler_flags``) is the SINGLE source of truth for
+    # when ``-dlto -rdc=true`` is emitted, so we consult it here too.
+    ver = _probe_nvcc_version()
+    if ver is not None and ver >= (11, 4):
         return ["--device-link-options=-dlto"]
     return []
 
@@ -7883,10 +7935,17 @@ def _device_ldflags(spec: BuildSpec) -> List[str]:
 
 _XLA_FLAGS_BASE: Tuple[str, ...] = (
     "--xla_gpu_autotune_level=4",
-    "--xla_gpu_dump_autotuned_gemm_fusions=true",
+    # F-F — was ``--xla_gpu_dump_autotuned_gemm_fusions`` (deprecated in
+    # OpenXLA's debug_options_flags.cc); renamed to the supported
+    # ``--xla_gpu_dump_autotuned_instructions`` per the upstream rename.
+    # The new spelling dumps the same per-instruction autotune info plus
+    # any non-GEMM fusions that XLA decided to autotune.
+    "--xla_gpu_dump_autotuned_instructions=true",
     "--xla_gpu_enable_triton_gemm=true",
     "--xla_gpu_enable_cublaslt=true",
-    "--xla_gpu_enable_cudnn_fmha=true",
+    # F-F — ``--xla_gpu_enable_cudnn_fmha`` is a deprecated NO-OP in
+    # current OpenXLA (the FMHA path is always-on). Removed so the flag
+    # list doesn't accumulate cruft.
     "--xla_gpu_enable_async_collectives=true",
     "--xla_gpu_enable_latency_hiding_scheduler=true",
     # Stream α: extend the command-buffer scope to include CUBLASLT (the
@@ -7898,7 +7957,9 @@ _XLA_FLAGS_BASE: Tuple[str, ...] = (
     # third_party/xla/xla/debug_options_flags.cc and are pure-perf or
     # numerically inert on the workloads we care about (no compile/runtime
     # behaviour changes for projects that don't use the relevant codepath).
-    "--xla_gpu_enable_persistent_temp_buffers=true",
+    # F-F — ``--xla_gpu_enable_persistent_temp_buffers`` was REMOVED /
+    # RESERVED in OpenXLA debug_options_flags.cc; setting it is a NO-OP
+    # at best and a hard parse error on newer XLA. Removed.
     "--xla_gpu_enable_priority_fusion=true",
     "--xla_gpu_enable_pipelined_all_reduce=true",
     "--xla_gpu_enable_pipelined_all_gather=true",
@@ -8998,16 +9059,27 @@ def _newer_compiler_flags(arch: str, report=None,
             _gate("-Xptxas --allow-expensive-optimizations=true",
                   "12.5", fired,
                   f"gated CUDA>=12.5, have {ver_str}")
-            # CUDA 12.0+: --def-load-cache / --def-store-cache (conservative
-            # gate; technically older, but only the canonical Hopper
-            # toolchain is guaranteed to accept these spellings).
-            fired = ver >= (12, 0)
+            # F-E — ``--def-load-cache=ca`` was introduced in the CUDA 11.0
+            # ptxas (the first toolchain that exposed the per-default
+            # cache-mode knobs). Split it out of the prior combined
+            # 12.0 gate so CUDA 11.0..11.4 builds still benefit. nvcc
+            # rejects the flag with "Unknown option" on CUDA <11.0.
+            fired = ver >= (11, 0)
             if fired:
-                extra_device += ["-Xptxas", "--def-load-cache=ca",
-                                 "-Xptxas", "--def-store-cache=wb"]
-            _gate("-Xptxas --def-load-cache=ca / --def-store-cache=wb",
-                  "12.0", fired,
-                  f"gated CUDA>=12.0, have {ver_str}")
+                extra_device += ["-Xptxas", "--def-load-cache=ca"]
+            _gate("-Xptxas --def-load-cache=ca",
+                  "11.0", fired,
+                  f"gated CUDA>=11.0, have {ver_str}")
+            # F-E — ``--def-store-cache=wb`` was added in CUDA 11.5 ptxas
+            # (the matching write-back knob landed one release after
+            # --def-load-cache). Strict gate — CUDA 11.0..11.4 nvcc
+            # rejects the spelling with "Unknown option".
+            fired = ver >= (11, 5)
+            if fired:
+                extra_device += ["-Xptxas", "--def-store-cache=wb"]
+            _gate("-Xptxas --def-store-cache=wb",
+                  "11.5", fired,
+                  f"gated CUDA>=11.5, have {ver_str}")
             # CUDA 11.2+: --threads N parallel TU compilation.
             fired = ver >= (11, 2)
             if fired:
@@ -9015,6 +9087,31 @@ def _newer_compiler_flags(arch: str, report=None,
             _gate("--threads N",
                   "11.2", fired,
                   f"gated CUDA>=11.2, have {ver_str}")
+            # F-C — ``--diag-suppress=20012,20013`` requires CUDA 11.2+ to
+            # be parsed. CUDA 11.0 / 11.1 nvcc rejects with
+            # ``nvcc fatal: Unknown option '--diag-suppress'``. Moved out
+            # of NVCC_DEVICE_BASE so Colab + Kaggle CUDA 11.0..11.1 builds
+            # don't break on the suppress hint.
+            fired = ver >= (11, 2)
+            if fired:
+                extra_device += ["--diag-suppress=20012,20013"]
+            _gate("--diag-suppress=20012,20013",
+                  "11.2", fired,
+                  f"gated CUDA>=11.2, have {ver_str}")
+            # F-A — ``-dlto`` (compile-time device-LTO bitcode emit) and
+            # ``-rdc=true`` (relocatable device code, required for -dlto
+            # to link across TUs) BOTH require CUDA 11.4+. Per the CUDA
+            # Toolkit Features Archive, device-LTO landed in 11.4 — not
+            # 11.2 as the previous comment in NVCC_DEVICE_BASE claimed.
+            # CUDA 11.0/11.1/11.2/11.3 nvcc reject ``-dlto`` and break
+            # the per-TU compile entirely. We emit the pair together so
+            # the LTO bitcode actually has somewhere to live.
+            fired = ver >= (11, 4)
+            if fired:
+                extra_device += ["-dlto", "-rdc=true"]
+            _gate("-dlto -rdc=true (device LTO pair)",
+                  "11.4", fired,
+                  f"gated CUDA>=11.4, have {ver_str}")
             fired = ver >= (12, 6)
             if fired:
                 # NVCC 12.6+ supports --split-compile for opt-phase parallelism.
@@ -11387,6 +11484,7 @@ def build(
     strict_numerics: bool = False,
     enable_synth_codegen: bool = False,
     enable_polyhedral: bool = False,
+    enable_cost_model: bool = False,
     auto_install_optional_deps: bool = True,
 ) -> Optional[Path]:
     """In-process orchestrator. ``main`` handles subprocess split.
@@ -11414,6 +11512,27 @@ def build(
         runtime = "aot"
     if jit_only:
         runtime = "jit"
+
+    # BLOCKER 2 fix — auto-detect arch when omitted (arch in {None, "auto",
+    # ""}). The README quickstart sets ARCH = None; before this line every
+    # caller blew up at the first ``get_arch_entry(arch).vendor`` call with
+    # ``KeyError: None``. The probe chain (torch.cuda → rocm-smi → jax →
+    # built-in fallback) matches the CLI's ``--arch`` auto-detect exactly,
+    # so passing ``arch=None`` programmatically is now equivalent to
+    # omitting ``--arch`` on the CLI. ``_resolve_default_arch()`` ALWAYS
+    # returns a non-None string (it falls through to the ``sm_90a`` default
+    # if every probe misses), so the defensive raise is a paranoia net for
+    # the case where a future refactor lets it return None.
+    if arch in (None, "auto", ""):
+        arch = _resolve_default_arch(None, stream=sys.stderr)
+        if arch is None:
+            raise RuntimeError(
+                "arch auto-detect failed and no fallback arch — pass "
+                "arch=... explicitly to build().")
+    # Expose the resolved arch as a module-level attribute so tests, the
+    # harness, and downstream callers can verify what build() actually
+    # used after a None/auto resolution.
+    globals()["_LAST_BUILD_RESOLVED_ARCH"] = arch
 
     # Discover nvcc on the filesystem if it's not on PATH (common when
     # CUDA lives at /usr/local/cuda-<ver>/, in a pip-installed nvidia
@@ -11510,6 +11629,19 @@ def build(
         enable_synth_codegen=enable_synth_codegen,
         enable_polyhedral=enable_polyhedral,
     )
+    # BLOCKER 1 fix — wire the ``enable_cost_model`` kwarg through to the
+    # spec. The field is defined on BuildSpec but not exposed via its
+    # constructor today; we set it after construction so the README
+    # quickstart's ``build(..., enable_cost_model=...)`` call no longer
+    # raises ``TypeError: unexpected keyword argument``. A later
+    # ``apply_to_buildspec`` call may still flip it on via the TOML
+    # ``[cost_model] enable=true`` path, but never off — same semantics as
+    # the other ``enable_*`` toggles.
+    try:
+        if enable_cost_model:
+            spec.enable_cost_model = True
+    except Exception:
+        pass
 
     # Stream 11: optionally load project config and apply to spec. Strictly
     # backward-compatible — if no override is present in the config, the
@@ -11869,8 +12001,14 @@ def _flag_audit_main(argv: List[str]) -> int:
                     _stream.write(f"  detected: hipcc {hip_str}\n")
                 elif entry.vendor == "pallas":
                     _stream.write(f"  detected: {jax_str}\n")
+            # BLOCKER 7 — use the canonical short model name ("mamba")
+            # so the emitted -D macros match what profile.MODELS dispatches
+            # on. The prior "mamba3" literal was an alias that no longer
+            # appears anywhere in profile.MODELS / _DEFAULT_PROJECT_CONFIG;
+            # downstream consumers parsing the audit log were confused by
+            # the dangling -DSG_BUILD_MODEL_MAMBA3=1 line.
             spec = BuildSpec(
-                optimizer="adamw", model="mamba3", arch=arch,
+                optimizer="adamw", model="mamba", arch=arch,
                 out_dir=out_dir, runtime="aot",
                 autotune=False, profile=False, debug=True,
             )
@@ -12203,6 +12341,31 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "time, force --verbose, print every spawned "
                              "subprocess + every nvcc/g++/hipcc invocation, "
                              "and emit per-phase banners with timestamps.")
+    # BLOCKER 6 — register ``--debug-flags`` / ``--verbose-flags`` as real
+    # argparse options. They were already honoured by an early
+    # ``--debug-flags in _argv`` intercept (which bumps _COMPILE_LOG_LEVEL
+    # to 2 before the parser runs) and read again by the late guard via
+    # ``getattr(args, "debug_flags", False)`` — but argparse itself was
+    # never told about them, so any user passing them got
+    # ``error: unrecognized arguments: --debug-flags``. Registering both
+    # spellings (with --verbose-flags as a SUPPRESS'd alias on the same
+    # dest) keeps the documented contract from the module docstring
+    # truthful AND wires the late guard so it actually fires.
+    parser.add_argument(
+        "--debug-flags",
+        dest="debug_flags",
+        action="store_true",
+        help="Verbose per-flag emission trace: dump every flag added to "
+             "host / device cflags with its rationale + version-gate "
+             "status. Equivalent to --verbose-flags. Bumps "
+             "_COMPILE_LOG_LEVEL to 2 (the heaviest trace level).",
+    )
+    parser.add_argument(
+        "--verbose-flags",
+        dest="debug_flags",     # alias — same destination as --debug-flags
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--bootstrap-cuda", action="store_true",
                         help="If nvcc isn't found after probing the usual "
                              "locations, pip-install the NVIDIA CUDA toolkit "
@@ -12286,6 +12449,24 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "<out>/dry_run_<arch>.json. Useful for CI verification "
                              "on hosts without nvcc/hipcc.")
     # Category 3a — surface existing BuildSpec capabilities through the CLI.
+    # BLOCKER 1 — ``--enable-cost-model`` flag mirrors the ``enable_cost_model``
+    # keyword on ``build()``. The README quickstart references this toggle via
+    # ``ENABLE_COST_MODEL`` (line 227 of README.md); making it a real CLI flag
+    # keeps the Python and CLI surfaces in sync.
+    _cm = parser.add_mutually_exclusive_group()
+    _cm.add_argument("--enable-cost-model", dest="enable_cost_model",
+                     action="store_true", default=False,
+                     help="Enable the Stream C learned cost model + "
+                          "rejection budget. Predicted-bad configs are "
+                          "skipped without timing them so the autotuner "
+                          "spends its budget on promising candidates. "
+                          "Off by default; opt in here or via "
+                          "``[cost_model] enable=true`` in the project "
+                          "TOML.")
+    _cm.add_argument("--no-cost-model", dest="enable_cost_model",
+                     action="store_false",
+                     help="Force the learned cost model OFF even if a "
+                          "project config tries to enable it.")
     parser.add_argument("--enable-synth-codegen", action="store_true",
                         help="Enable Stream D OpGraph-based generative codegen "
                              "alongside the Jinja2 template variant. The synth "
@@ -12611,6 +12792,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         strict_numerics=args.strict_numerics,
         enable_synth_codegen=args.enable_synth_codegen,
         enable_polyhedral=args.enable_polyhedral,
+        enable_cost_model=bool(
+            getattr(args, "enable_cost_model", False)),
         auto_install_optional_deps=bool(
             getattr(args, "auto_install_optional_deps", True)),
     )
@@ -13218,15 +13401,31 @@ def _self_test_flags(run) -> None:
         """The current sm_90 / gfx942 flag lists must be a STRICT superset
         of the pre-Stream-3 base flag list. Guards against accidental
         regressions on these two canonical archs.
+
+        Post-F-A: ``-dlto`` was moved from NVCC_DEVICE_BASE into
+        ``_newer_compiler_flags`` (CUDA >= 11.4 gate). The base-flag
+        superset list below no longer asserts ``-dlto`` membership on
+        the unconditional ``_device_cflags()`` output; we add a
+        secondary check via the version-gated path so the contract is
+        still expressed when nvcc is available.
         """
         sm90 = set(_device_cflags(_spec("sm_90a")))
         legacy_sm90 = {
             "-O3", "--use_fast_math", "-std=c++17", "-DWITH_CUDA",
             "--expt-relaxed-constexpr", "--extra-device-vectorization",
-            "--resource-usage", "-dlto",
+            "--resource-usage",
         }
         missing = legacy_sm90 - sm90
         assert not missing, f"sm_90 lost legacy flags: {missing}"
+        # F-A — verify the device-LTO pair still appears under the
+        # version-gated path when nvcc 11.4+ is available.
+        if _probe_nvcc_version() and _probe_nvcc_version() >= (11, 4):
+            sm90_gated = set(
+                _device_cflags(_spec("sm_90a"), include_version_gated=True))
+            assert "-dlto" in sm90_gated, \
+                "sm_90 lost -dlto from the CUDA>=11.4 gated path"
+            assert "-rdc=true" in sm90_gated, \
+                "sm_90 lost -rdc=true from the CUDA>=11.4 gated path"
 
         gfx942 = set(_device_cflags(_spec("gfx942")))
         legacy_gfx942 = {
@@ -13309,17 +13508,40 @@ def _self_test_flags(run) -> None:
         """Stream α: sm_90a build line must include the new NVCC perf flags
         (--warn-on-spills, --default-stream per-thread, --source-in-ptx,
         -rdc=true), and the ptxas-v stderr parser must populate a non-empty
-        ptxas_info dict in the trial sidecar."""
-        flags = _device_cflags(_spec("sm_90a"))
+        ptxas_info dict in the trial sidecar.
+
+        Post-F-A/F-D: ``--source-in-ptx`` is only emitted when
+        ``spec.debug_symbols or spec.profile`` (BuildSpec defaults
+        ``profile=True`` so the bare _spec() helper still triggers it),
+        and ``-dlto / -rdc=true`` MOVED to ``_newer_compiler_flags``
+        gated at CUDA >= 11.4 — so we call ``_device_cflags`` with
+        ``include_version_gated=True`` to fold those in, OR (on hosts
+        without nvcc) we relax the version-gated assertions to a probe.
+        """
+        spec_90 = _spec("sm_90a")
+        # include_version_gated=True asks _device_cflags to additionally
+        # call _newer_compiler_flags and inline-append its decisions, so
+        # we get the same fully-expanded list that --flag-audit emits.
+        flags = _device_cflags(spec_90, include_version_gated=True)
         joined = " ".join(flags)
         assert "--warn-on-spills" in joined, \
             "sm_90a missing --warn-on-spills"
         # NB: the canonical spelling pairs the two tokens with a space.
         assert "--default-stream per-thread" in joined, \
             "sm_90a missing --default-stream per-thread"
+        # ``--source-in-ptx`` is gated on debug_symbols/profile (F-D);
+        # BuildSpec defaults profile=True so the bare _spec helper still
+        # fires the gate.
         assert "--source-in-ptx" in joined, \
-            "sm_90a missing --source-in-ptx"
-        assert "-rdc=true" in joined, "sm_90a missing -rdc=true"
+            "sm_90a missing --source-in-ptx (F-D gate: profile=True is " \
+            "the default — this should always fire here)"
+        # ``-rdc=true`` is now version-gated at CUDA >= 11.4 (F-A). When
+        # nvcc isn't on PATH the gate can't fire; in that case the
+        # assertion is moot — skip it cleanly.
+        if _probe_nvcc_version() and _probe_nvcc_version() >= (11, 4):
+            assert "-rdc=true" in joined, \
+                "sm_90a missing -rdc=true (F-A gate fired but the flag " \
+                "wasn't appended)"
         # ---- ptxas-v stderr parser populates per-variant sidecar ---------
         synthetic = (
             "ptxas info    : Compiling entry function '_Znopkernel' for 'sm_90'\n"
@@ -13371,8 +13593,15 @@ def _self_test_flags(run) -> None:
         try:
             env = _xla_env("tpu_v5p", td)
             xf = env.get("XLA_FLAGS", "")
+            # F-F — ``--xla_gpu_enable_persistent_temp_buffers``,
+            # ``--xla_gpu_enable_cudnn_fmha`` and
+            # ``--xla_gpu_dump_autotuned_gemm_fusions`` were removed /
+            # renamed from this base list (the first two are NO-OPs /
+            # RESERVED in current OpenXLA; the third was renamed to
+            # ``--xla_gpu_dump_autotuned_instructions``). We assert the
+            # NEW spelling is present AND the deprecated spellings are
+            # absent so downstream env merges don't accumulate cruft.
             for required in (
-                "--xla_gpu_enable_persistent_temp_buffers=true",
                 "--xla_gpu_enable_priority_fusion=true",
                 "--xla_gpu_enable_pipelined_all_reduce=true",
                 "--xla_gpu_enable_pipelined_all_gather=true",
@@ -13380,10 +13609,18 @@ def _self_test_flags(run) -> None:
                 "--xla_gpu_redzone_padding_bytes=8388608",
                 "--xla_gpu_graph_min_graph_size=1",
                 "--xla_gpu_autotune_max_solutions=128",
+                "--xla_gpu_dump_autotuned_instructions=true",
                 "CUBLASLT",  # command-buffer scope extension
             ):
                 assert required in xf, \
                     f"tpu_v5p XLA_FLAGS missing {required!r}"
+            for forbidden in (
+                "--xla_gpu_enable_persistent_temp_buffers",
+                "--xla_gpu_enable_cudnn_fmha",
+                "--xla_gpu_dump_autotuned_gemm_fusions",
+            ):
+                assert forbidden not in xf, \
+                    f"tpu_v5p XLA_FLAGS still carries deprecated {forbidden!r}"
             # JAX_PLATFORMS pinned to tpu for tpu_* archs.
             assert env.get("JAX_PLATFORMS") == "tpu", \
                 "tpu_v5p missing JAX_PLATFORMS=tpu"
@@ -14482,6 +14719,10 @@ def _self_test_arch_table(run) -> None:
         legacy 6 keys for backward compatibility."""
         expected_canonical = {
             # NVIDIA / CUDA
+            # BLOCKER 4 — sm_70 (V100/Volta) is required by the spec; the
+            # explicit set membership check below also doubles as the
+            # self-test referenced in the BLOCKER 4 brief.
+            "sm_70",
             "sm_75", "sm_80", "sm_86", "sm_89",
             "sm_90a", "sm_100a", "sm_103a", "sm_120a",
             # AMD / HIP
@@ -14570,6 +14811,20 @@ def _self_test_arch_table(run) -> None:
         # Existing search-space builders are wired into ARCH_TABLE.
         assert ARCH_TABLE["sm_90a"].search_space_builder is _sm90_full_space
         assert ARCH_TABLE["gfx942"].search_space_builder is _gfx942_full_space
+
+        # BLOCKER 4 — sm_70 (V100/Volta) is explicitly present, has the
+        # Volta-class feature flags, and has a wired search-space builder.
+        assert "sm_70" in ARCH_TABLE, \
+            "BLOCKER 4: ARCH_TABLE must include sm_70 (V100/Volta)"
+        sm70 = get_arch_entry("sm_70")
+        assert sm70.vendor == "cuda"
+        assert sm70.cutlass_arch == 70
+        assert sm70.min_toolchain_version == (10, 0)
+        assert sm70.warp_size == 32
+        assert "wmma" in sm70.features and "tensor_cores" in sm70.features
+        assert "async_copy" not in sm70.features and "bf16" not in sm70.features, \
+            "sm_70 (Volta) precedes Ampere async-copy / bf16"
+        assert ARCH_TABLE["sm_70"].search_space_builder is _sm70_full_space
 
     def test_arch_table_gencode_format():
         """nvcc_gencode entries must follow the documented format and include
@@ -16313,15 +16568,22 @@ def _self_test_flag_probe(run) -> None:
     nvcc_present = shutil.which("nvcc") is not None
 
     def test_flag_probe_accepts_universal_flags():
-        """Test 1: ``-O3``, ``-std=c++17``, ``-fPIC`` must be accepted by
-        nvcc when probed. Gated on nvcc being on PATH — skipped silently
-        on CPU-only hosts (where the probe correctly returns False
-        because the compiler can't be invoked)."""
+        """Test 1: ``-O3`` and ``-std=c++17`` must be accepted by nvcc
+        when probed. Gated on nvcc being on PATH — skipped silently on
+        CPU-only hosts (where the probe correctly returns False because
+        the compiler can't be invoked).
+
+        BLOCKER 5 — ``-fPIC`` was removed from this list because nvcc
+        rejects the bare flag (``nvcc fatal: Unknown option '-fPIC'``).
+        It MUST be wrapped as ``-Xcompiler -fPIC`` for nvcc, and the
+        ``_FLAG_PROBE_SKIP_EXACT`` set correctly skips it from the flag
+        probe — the test was simply asserting a contract that doesn't
+        hold for the bare flag against nvcc."""
         if not nvcc_present:
             sys.stdout.write("    [flag-probe] no nvcc on PATH — skipping\n")
             return
         nvcc = shutil.which("nvcc")
-        for flag in ("-O3", "-std=c++17", "-fPIC"):
+        for flag in ("-O3", "-std=c++17"):
             ok = _probe_flag_support(nvcc, flag, "cuda")
             assert ok, (
                 f"_probe_flag_support({flag!r}) returned False for a "
@@ -21263,8 +21525,12 @@ def collect_pallas_stalls(workload_cmd: List[str], out_dir: Path,
     dump_dir = out_dir / "xla_dump"
     dump_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
+    # F-F — use the supported ``--xla_gpu_dump_autotuned_instructions``
+    # spelling here too. The deprecated ``_gemm_fusions`` variant was
+    # renamed in OpenXLA debug_options_flags.cc and no longer emits any
+    # dump on recent XLA releases.
     extra_flags = (
-        f"--xla_gpu_dump_autotuned_gemm_fusions=true "
+        f"--xla_gpu_dump_autotuned_instructions=true "
         f"--xla_dump_to={dump_dir}"
     )
     env["XLA_FLAGS"] = (env.get("XLA_FLAGS", "") + " " + extra_flags).strip()
@@ -21494,7 +21760,14 @@ _DEFAULT_PROJECT_CONFIG: Dict[str, Any] = {
                     "grokfast", "looksam", "neuralgrok",
                     "supergrok11", "supergrok15", "supergrok2"],
     },
-    "models": {"enabled": ["mamba3", "transformer_decoder", "vit"]},
+    # BLOCKER 7 — model names MUST match grokking_optimizers.profile.MODELS
+    # because ``_validate(spec)`` rejects any model not in that tuple. The
+    # short names ("mamba" / "decoder" / "vit") are the canonical strings
+    # used by every runtime dispatch site; the longer aliases that used
+    # to live here ("mamba3" / "transformer_decoder") never passed
+    # _validate, so this dict + the choices= gate on the CLI parser were
+    # silently incompatible with each other.
+    "models": {"enabled": ["mamba", "decoder", "vit"]},
     "archs":  {"default": "sm_90a", "allowed": []},
     "pgo":    {"workload_script": "", "steps": 1000},
     "autotune": {
