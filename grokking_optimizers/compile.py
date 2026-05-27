@@ -4350,6 +4350,7 @@ def run_bayesian(
     stopper: Optional["BayesianEarlyStopper"] = None,
     stall_info: Optional[Dict[str, Any]] = None,
     bias_max_enqueued: int = 25,
+    stream: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Run the TPE stage with multi-criterion early stopping.
 
@@ -4469,8 +4470,10 @@ def run_bayesian(
         trial = study.ask()
         cfg = _suggest(trial, dims)
         if not is_feasible(cfg):
-            study.tell(trial, math.inf,
-                       state=optuna.trial.TrialState.PRUNED)
+            # Optuna ≥ 4.0 forbids passing a value when state is
+            # PRUNED / FAIL — it raises ValueError. Drop the value arg
+            # (the prefilter rejection has no meaningful objective).
+            study.tell(trial, state=optuna.trial.TrialState.PRUNED)
             rec = _make_trial_record("tpe", trial.number, cfg, None, host=host)
             rec["status"] = "infeasible"
             records.append(rec)
@@ -4481,8 +4484,8 @@ def run_bayesian(
         try:
             raw = timer(cfg)
         except Exception as exc:
-            study.tell(trial, math.inf,
-                       state=optuna.trial.TrialState.FAIL)
+            # Optuna ≥ 4.0 forbids passing a value with state=FAIL.
+            study.tell(trial, state=optuna.trial.TrialState.FAIL)
             rec = _make_trial_record("tpe", trial.number, cfg, None, host=host)
             rec["status"] = "fail"
             rec["error"] = str(exc)
@@ -4498,8 +4501,8 @@ def run_bayesian(
         pruned_by_cost_model = (
             isinstance(raw, dict) and raw.get("status") == "cost_model_pruned")
         if pruned_by_cost_model:
-            study.tell(trial, math.inf,
-                       state=optuna.trial.TrialState.PRUNED)
+            # Optuna ≥ 4.0 forbids passing a value with state=PRUNED.
+            study.tell(trial, state=optuna.trial.TrialState.PRUNED)
             rec = dict(raw)
             rec["trial_num"] = trial.number
             rec.setdefault("stage", "tpe")
@@ -4512,8 +4515,9 @@ def run_bayesian(
             continue
         result, value = _coerce_timer_result(raw)
         if not math.isfinite(value):
-            study.tell(trial, math.inf,
-                       state=optuna.trial.TrialState.FAIL)
+            # Optuna ≥ 4.0 forbids passing a value with state=FAIL —
+            # the non-finite timing has no meaningful objective.
+            study.tell(trial, state=optuna.trial.TrialState.FAIL)
         else:
             study.tell(trial, value)
         rec = _make_trial_record("tpe", trial.number, cfg, result, host=host)
@@ -4523,7 +4527,19 @@ def run_bayesian(
             progress(len(records), total_for_progress, cfg)
         stopper.observe(value, cfg)
 
-    return records, stopper.to_dict()
+    # Category 3c — emit the early-stop reason to stdout (or the caller-
+    # supplied stream) so users see WHY the autotune halted. Today the
+    # reason is only available via the returned dict; many CLI users
+    # never see it. The print is best-effort: a broken stream must
+    # never abort the autotune.
+    stop_info = stopper.to_dict()
+    out_stream = stream if stream is not None else sys.stdout
+    try:
+        print(f"[autotune] early stop: {stop_info['stop_reason']}",
+              file=out_stream)
+    except Exception:
+        pass
+    return records, stop_info
 
 
 def _step_neighbours(value: Any, values: List[Any], radius: int = 2
@@ -6466,7 +6482,9 @@ def _preflight_toolchain(arch: str) -> List[str]:
 # never aborts the sweep. The manifest distinguishes "no sources" from
 # "preflight FAILed" via separate fields so a CI grep can target either.
 
-def _dry_run_all_archs(out_dir: Path) -> Dict[str, Dict]:
+def _dry_run_all_archs(out_dir: Path,
+                       config: Optional[Dict[str, Any]] = None
+                       ) -> Dict[str, Dict]:
     """Run preflight + source-resolution + flag-emission for every CANONICAL
     arch in ARCH_TABLE. Aliases are skipped (they point at the same ArchEntry
     object as their canonical key — including both would duplicate work).
@@ -6475,6 +6493,13 @@ def _dry_run_all_archs(out_dir: Path) -> Dict[str, Dict]:
     dict keyed by arch. The returned manifests carry the same payload as
     the on-disk JSON sidecars.
 
+    Project-agnosticism: when ``config`` is supplied, ``apply_to_buildspec``
+    is called on each per-arch BuildSpec BEFORE flag emission so a
+    downstream project's TOML (macro_prefix, source_roots, fused_op_template,
+    …) flows through into the dry-run output. With ``config=None`` (or
+    an empty dict) the manifest is byte-identical to the historical
+    SuperGrok behaviour.
+
     Robustness:
       * ``_resolve_sources`` may raise on archs whose
         ``csrc/backends/<vendor>/<arch>/`` directory doesn't exist on disk
@@ -6482,6 +6507,10 @@ def _dry_run_all_archs(out_dir: Path) -> Dict[str, Dict]:
         sweep keeps going.
       * Pallas archs intentionally return ``sources=[]`` and
         ``device_cflags=[]``; that's the expected shape for vendor=pallas.
+        For vendor=pallas archs we additionally surface the ``_xla_env``
+        dict under manifest["xla_env"] so the dry-run shows the XLA
+        flags / cache dir / JAX platform pin even though the device
+        cflags are empty.
       * Never invokes ``_torch_load`` / torch.cpp_extension — safe to run
         on a CPU-only / no-nvcc host.
     """
@@ -6507,6 +6536,17 @@ def _dry_run_all_archs(out_dir: Path) -> Dict[str, Dict]:
             profile=False,
             extra_macros=[],
         )
+        # Project-agnosticism: thread the user's TOML config (macro_prefix,
+        # source_roots, etc.) onto the spec before any flag emission.
+        # Behaviour with ``config in (None, {})`` is byte-identical to the
+        # historical SuperGrok-hardcoded path.
+        if config:
+            try:
+                apply_to_buildspec(spec, config)
+            except Exception:
+                # apply_to_buildspec is best-effort; a malformed user
+                # config must never abort the sweep.
+                pass
 
         # --- preflight (capture all diagnostic lines) ---
         preflight_lines: List[str] = []
@@ -6568,6 +6608,19 @@ def _dry_run_all_archs(out_dir: Path) -> Dict[str, Dict]:
             "expected_gencode":      list(entry.nvcc_gencode) if entry.vendor == "cuda" else [],
             "expected_offload_arch": entry.hipcc_offload_arch if entry.vendor == "hip" else "",
         }
+        # Category 3b — surface XLA env flags in the dry-run manifest for
+        # Pallas archs. ``device_cflags`` is intentionally empty for
+        # vendor=pallas (there is no nvcc/hipcc invocation), but the
+        # XLA / JAX env vars are still important configuration users
+        # want to see at preflight. ``_xla_env`` returns ``{}`` for any
+        # non-Pallas arch, so the key is only present when meaningful.
+        if entry.vendor == "pallas":
+            try:
+                manifest["xla_env"] = _xla_env(arch, out_dir)
+            except Exception as exc:  # noqa: BLE001 — never abort sweep
+                manifest["xla_env"] = {}
+                manifest["xla_env_error"] = (
+                    f"{type(exc).__name__}: {exc}")
         if resolve_error is not None:
             manifest["error"] = resolve_error
         if cflag_error is not None:
@@ -6675,23 +6728,47 @@ def _resolve_sources(spec: BuildSpec) -> List[Path]:
 
 def _build_macros(spec: BuildSpec) -> List[str]:
     """Emit ``-D<PREFIX>OPTIMIZER_<NAME> -D<PREFIX>MODEL_<NAME>
-    -D<PREFIX>VERBOSE -D<arch_macro>`` plus any caller extras.
+    -D<PREFIX>VERBOSE -D<PREFIX>ARCH_<TAG>`` plus any caller extras.
 
     Stream A: the ``<PREFIX>`` (default ``SG_BUILD_``) is taken from
     ``spec.macro_prefix`` so a downstream project can pick its own
     namespace (e.g. ``MP_`` → ``MP_OPTIMIZER_LION``). Behaviour with no
-    config is byte-identical to today.
+    config (or with ``macro_prefix="SG_BUILD_"``) is byte-identical to
+    today.
+
+    Project-agnosticism fixes (2b, 2c):
+      * The arch macro stored on ``ArchEntry.macro`` is declared as
+        ``"SG_BUILD_ARCH_*"`` in the table. We rewrite the ``SG_BUILD_``
+        prefix at emit time so a downstream project with
+        ``macro_prefix="MYPROJ_"`` gets ``-DMYPROJ_ARCH_SM_90A=1``
+        instead of leaking ``SG_BUILD_ARCH_*`` into a foreign namespace.
+      * The verbosity macro is now project-prefixed (``-D<PREFIX>VERBOSE=1``)
+        for portability. Projects that depended on the historical
+        ``-DSG_VERBOSE=1`` literal will continue to get exactly that
+        when ``macro_prefix`` defaults to ``"SG_BUILD_"`` (since
+        ``"SG_BUILD_" + "VERBOSE" → "SG_BUILD_VERBOSE"``). The legacy
+        ``SG_VERBOSE`` spelling is preserved for the SG default by
+        falling back when prefix is exactly ``"SG_BUILD_"``.
     """
     entry = get_arch_entry(spec.arch)
     prefix = spec.macro_prefix or "SG_BUILD_"
+    # 2b — re-prefix the arch macro when the project picked a non-SG prefix.
+    arch_macro = entry.macro
+    if arch_macro.startswith("SG_BUILD_") and prefix != "SG_BUILD_":
+        arch_macro = prefix + arch_macro[len("SG_BUILD_"):]
+    # 2c — project-prefixed verbosity flag. For the default SG prefix we
+    # keep the historical ``SG_VERBOSE`` spelling (no ``BUILD_`` infix)
+    # byte-for-byte so existing kernels that ``#ifdef SG_VERBOSE`` keep
+    # building. For any other prefix we emit ``<PREFIX>VERBOSE=1``.
+    if prefix == "SG_BUILD_":
+        verbose_macro = "SG_VERBOSE"
+    else:
+        verbose_macro = f"{prefix}VERBOSE"
     macros = [
         f"-D{prefix}OPTIMIZER_{spec.optimizer.upper()}=1",
         f"-D{prefix}MODEL_{spec.model.upper()}=1",
-        f"-D{entry.macro}=1",
-        # Historical name kept exactly as-is — this is a global "any
-        # supergrok build" verbosity flag, not an optimizer / model gate,
-        # so it does NOT take the project prefix.
-        "-DSG_VERBOSE=1",
+        f"-D{arch_macro}=1",
+        f"-D{verbose_macro}=1",
     ]
     return macros + list(spec.extra_macros)
 
@@ -9708,6 +9785,8 @@ def build(
     prune_max_age_days: int = 30,
     prune_keep_top_n: int = 100,
     strict_numerics: bool = False,
+    enable_synth_codegen: bool = False,
+    enable_polyhedral: bool = False,
 ) -> Optional[Path]:
     """In-process orchestrator. ``main`` handles subprocess split.
 
@@ -9815,6 +9894,8 @@ def build(
         prune_max_age_days=prune_max_age_days,
         prune_keep_top_n=prune_keep_top_n,
         strict_numerics=strict_numerics,
+        enable_synth_codegen=enable_synth_codegen,
+        enable_polyhedral=enable_polyhedral,
     )
 
     # Stream 11: optionally load project config and apply to spec. Strictly
@@ -10036,17 +10117,46 @@ def main(argv: Optional[List[str]] = None) -> int:
         out_dir.mkdir(parents=True, exist_ok=True)
         return _e2e_smoke(out_dir, max_seconds=max_seconds)
 
+    # Early intercept: --list-archs is purely informational and doesn't
+    # need --optimizer/-M/-A. Dump the ARCH_TABLE and exit before the
+    # main parser requires those flags.
+    if "--list-archs" in _argv:
+        _seen: Dict[int, str] = {}
+        for _k, _v in ARCH_TABLE.items():
+            _seen.setdefault(id(_v), _k)
+        for _arch in sorted(_seen.values()):
+            _entry = ARCH_TABLE[_arch]
+            _features = ",".join(sorted(_entry.features)) or "-"
+            _min_tc = ".".join(str(x) for x in _entry.min_toolchain_version)
+            sys.stdout.write(
+                f"{_arch:<12s} vendor={_entry.vendor:<7s} "
+                f"min_toolchain={_min_tc:<8s} features={_features}\n")
+        return 0
+
     # Early intercept: --dry-run-all-archs doesn't need --optimizer/-M/-A
     # (those are required=True in the main parser). We parse just --out
-    # here so the sweep can write to the user-requested directory.
+    # and --config / --project-config here so the sweep writes to the
+    # user-requested directory AND so a downstream project's TOML
+    # (macro_prefix, source_roots, …) flows through into each manifest.
     if "--dry-run-all-archs" in _argv:
         dry_parser = argparse.ArgumentParser(add_help=False)
         dry_parser.add_argument("--dry-run-all-archs", action="store_true")
         dry_parser.add_argument("--out", type=Path, default=None)
+        dry_parser.add_argument("--config", default=None)
+        dry_parser.add_argument("--project-config", default=None,
+                                dest="project_config")
         dry_args, _ = dry_parser.parse_known_args(_argv)
         out_dir = Path(dry_args.out or REPO_ROOT / "build" / "compiled").resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
-        manifests = _dry_run_all_archs(out_dir)
+        _dry_cfg_path = dry_args.project_config or dry_args.config
+        try:
+            _dry_cfg = load_config(
+                Path(_dry_cfg_path) if _dry_cfg_path else None)
+        except FileNotFoundError:
+            raise
+        except Exception:
+            _dry_cfg = {}
+        manifests = _dry_run_all_archs(out_dir, config=_dry_cfg)
         sys.stdout.write(
             f"[dry-run-all-archs] wrote {len(manifests)} manifests to {out_dir}\n")
         for arch in sorted(manifests):
@@ -10291,7 +10401,78 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "Writes one JSON manifest per arch under "
                              "<out>/dry_run_<arch>.json. Useful for CI verification "
                              "on hosts without nvcc/hipcc.")
+    # Category 3a — surface existing BuildSpec capabilities through the CLI.
+    parser.add_argument("--enable-synth-codegen", action="store_true",
+                        help="Enable Stream D OpGraph-based generative codegen "
+                             "alongside the Jinja2 template variant. The synth "
+                             "source is emitted to <out>/synth_sources/ and "
+                             "stashed on spec._emitted_sources['<ckey>:synth'] "
+                             "so the autotuner can pick the winner against the "
+                             "template-rendered variant. Off by default.")
+    parser.add_argument("--enable-polyhedral", action="store_true",
+                        help="Enable Stream B polyhedral / loop-transform "
+                             "scheduling search on top of every emitted variant. "
+                             "Incurs libclang + islpy as soft dependencies and "
+                             "roughly multiplies the autotune fan-out by "
+                             "polyhedral.max_schedules_per_template.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Single-arch dry run: produce one preflight + "
+                             "source-resolution + flag-emission manifest for the "
+                             "specified --arch (mirror of --dry-run-all-archs "
+                             "scoped to a single target). Writes "
+                             "<out>/dry_run_<arch>.json and exits 0.")
+    parser.add_argument("--list-archs", action="store_true",
+                        help="Dump ARCH_TABLE (one line per canonical arch: "
+                             "name, vendor, features, min_toolchain) and exit. "
+                             "Useful for CI to discover what targets the wrapper "
+                             "advertises without launching a build.")
     args = parser.parse_args(argv)
+
+    # Category 3a — --list-archs: dump every canonical ArchEntry and exit.
+    if getattr(args, "list_archs", False):
+        _seen: Dict[int, str] = {}
+        for _k, _v in ARCH_TABLE.items():
+            _seen.setdefault(id(_v), _k)
+        for _arch in sorted(_seen.values()):
+            _entry = ARCH_TABLE[_arch]
+            _features = ",".join(sorted(_entry.features)) or "-"
+            _min_tc = ".".join(str(x) for x in _entry.min_toolchain_version)
+            sys.stdout.write(
+                f"{_arch:<12s} vendor={_entry.vendor:<7s} "
+                f"min_toolchain={_min_tc:<8s} features={_features}\n")
+        return 0
+
+    # Category 3a — --dry-run: single-arch manifest. Requires --arch
+    # (auto-detect filled in args.arch above if user omitted it).
+    if getattr(args, "dry_run", False):
+        out_dir = Path(args.out or REPO_ROOT / "build" / "compiled").resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        target_arch = args.arch
+        if target_arch is None or target_arch not in ARCH_TABLE:
+            sys.stderr.write(
+                f"[dry-run] --arch must be set to one of the known archs; "
+                f"got {target_arch!r}\n")
+            return 2
+        # Reuse _dry_run_all_archs's per-arch loop by temporarily slicing
+        # ARCH_TABLE to the single requested arch. We restore the table
+        # in a finally block so the in-process module state isn't
+        # mutated for any subsequent caller.
+        saved_table = dict(ARCH_TABLE)
+        try:
+            ARCH_TABLE.clear()
+            ARCH_TABLE[target_arch] = saved_table[target_arch]
+            manifests = _dry_run_all_archs(out_dir, config=_early_cfg)
+        finally:
+            ARCH_TABLE.clear()
+            ARCH_TABLE.update(saved_table)
+        m = manifests.get(target_arch, {})
+        sys.stdout.write(
+            f"[dry-run] wrote 1 manifest for {target_arch} to {out_dir}\n"
+            f"  {target_arch:<10s} vendor={m.get('vendor','?'):<7s} "
+            f"sources={len(m.get('sources',[])):>3d} "
+            f"device_cflags={len(m.get('device_cflags',[])):>3d} "
+            f"judgment={m.get('preflight_judgment','?')}\n")
+        return 0
 
     # Stream β.1 — auto-detect --arch when omitted on the CLI. We must do
     # this BEFORE any branch that reads args.arch (dry-run-all-archs is
@@ -10304,7 +10485,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.dry_run_all_archs:
         out_dir = Path(args.out or REPO_ROOT / "build" / "compiled").resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
-        manifests = _dry_run_all_archs(out_dir)
+        manifests = _dry_run_all_archs(out_dir, config=_early_cfg)
         sys.stdout.write(
             f"[dry-run-all-archs] wrote {len(manifests)} manifests to {out_dir}\n")
         for arch in sorted(manifests):
@@ -10436,6 +10617,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         prune_max_age_days=args.prune_max_age_days,
         prune_keep_top_n=args.prune_keep_top_n,
         strict_numerics=args.strict_numerics,
+        enable_synth_codegen=args.enable_synth_codegen,
+        enable_polyhedral=args.enable_polyhedral,
     )
 
     report = args.report or (
@@ -11352,6 +11535,40 @@ def _self_test_bayesian(run) -> None:
             shutil.rmtree(td)
     run("bias_trial_queue_wired_into_run_bayesian",
          test_bias_trial_queue_wired_into_run_bayesian)
+
+    def test_run_bayesian_optuna_4plus_pruned_fail_no_value():
+        """Regression: Optuna ≥ 4.0 raises ValueError when ``study.tell``
+        is given a numeric value together with ``state=PRUNED`` or
+        ``state=FAIL``. ``run_bayesian`` must therefore call
+        ``study.tell(trial, state=...)`` with NO value arg on every
+        failure / prune path.
+
+        We exercise the FAIL path by driving a timer that raises on every
+        call. If ``run_bayesian`` ever regresses to passing ``math.inf``
+        alongside ``state=FAIL`` this test will surface the ValueError
+        (run_bayesian doesn't catch it, so the call to ``run_bayesian``
+        would re-raise). We also assert every recorded trial carries
+        ``status="fail"`` so the sidecar reflects the FAIL state.
+        """
+        def _always_raises(cfg):
+            raise RuntimeError("synthetic timer failure")
+
+        td = Path(tempfile.mkdtemp())
+        try:
+            trials, _stop = run_bayesian(
+                "sm_90", _tiny_space(), n_trials=5, seed=0,
+                storage=td / "study.db", timer=_always_raises)
+            assert len(trials) == 5, f"expected 5 trials, got {len(trials)}"
+            for t in trials:
+                assert t.get("status") == "fail", (
+                    f"expected status='fail' for every trial, "
+                    f"got {t.get('status')!r}")
+                assert "synthetic timer failure" in (t.get("error") or "")
+        finally:
+            shutil.rmtree(td)
+
+    run("run_bayesian_optuna_4plus_pruned_fail_no_value",
+         test_run_bayesian_optuna_4plus_pruned_fail_no_value)
 
 
 def _self_test_early_stopping(run) -> None:
@@ -12598,6 +12815,118 @@ def _self_test_portability(run) -> None:
                 os.chdir(saved_cwd)
 
     run("portability_custom_project", test_portability_custom_project)
+
+    def test_project_agnostic_dry_run_no_sg_leakage():
+        """Category 2e — when ``_dry_run_all_archs`` is invoked with a
+        synthetic project config (``macro_prefix="MYPROJ_"``,
+        ``project.name="myproj"``, ``archs.default="sm_86"``), every
+        emitted ``-D<MACRO>`` in the per-arch manifest must start with
+        the project's prefix (no ``SG_BUILD_`` leakage). The verbosity
+        flag must be ``MYPROJ_VERBOSE=1`` (not ``SG_VERBOSE``), the arch
+        macro must be ``MYPROJ_ARCH_SM_86=1``, and ``get_registry``'s
+        derived cache dir must mention ``myproj`` instead of
+        ``supergrok`` when called with the same config.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tdp = Path(td)
+            out_dir = tdp / "manifests"
+            cfg = {
+                "project": {
+                    "name": "myproj",
+                    "macro_prefix": "MYPROJ_",
+                    "fused_op_template":
+                        "torch.ops.myproj.fused_{opt_lower}_step",
+                    "python_package": "myproj",
+                    "namespace": "",
+                },
+                "archs": {"default": "sm_86", "allowed": []},
+                "sources": {},
+                "codegen": {"enable_emitter": False,
+                            "template_overrides": {}},
+                "synth_codegen": {"enable": False},
+                "runtime_specialization": {"enable": False},
+                "device_pgo": {"enable": False},
+                "numerics": {"strict": False},
+                "polyhedral": {"enable": False},
+                "cost_model": {"enable": False},
+                "cache": {"auto_prune_after_jit": True,
+                          "max_age_days": 30, "keep_top_n": 100},
+                "optimizers": {"enabled": []},
+                "models": {"enabled": []},
+            }
+            manifests = _dry_run_all_archs(out_dir, config=cfg)
+            assert "sm_86" in manifests, sorted(manifests.keys())
+            sm86 = manifests["sm_86"]
+            # Pool of every -D macro across host + device cflags.
+            joined = list(sm86["host_cflags"]) + list(sm86["device_cflags"])
+            macros = [tok for tok in joined if tok.startswith("-D")]
+            assert macros, (
+                f"sm_86 emitted no -D macros at all: host={sm86['host_cflags']!r}"
+                f" device={sm86['device_cflags']!r}")
+            # Filter to the macros that gate optimizer/model/arch/verbosity.
+            # Strip "-D" and any "=..." suffix for prefix-check.
+            def _macro_name(tok: str) -> str:
+                s = tok[2:]
+                return s.split("=", 1)[0]
+            gate_prefixes = ("OPTIMIZER_", "MODEL_", "ARCH_", "VERBOSE")
+            project_macros = [
+                _macro_name(m) for m in macros
+                if any(_macro_name(m).startswith(f"{p}")
+                       or f"_{p}" in _macro_name(m)
+                       for p in gate_prefixes)
+                or _macro_name(m).endswith("VERBOSE")
+            ]
+            # Among the project-gating macros every one must start with
+            # MYPROJ_; SG_ / SG_BUILD_ must not appear at all in the
+            # gating set (compiler --define-macro / vendor flags like
+            # -DWITH_CUDA / -DCUTLASS_ARCH_MMA_SM* are allowed
+            # because they're not project-gates).
+            for name in project_macros:
+                assert name.startswith("MYPROJ_"), (
+                    f"non-project-prefixed gate macro leaked: -D{name}")
+            for name in project_macros:
+                assert not name.startswith("SG_"), (
+                    f"SG_ prefix leaked into project-gate macro: -D{name}")
+            # Required positive assertions. The arch macro name is
+            # whatever ``ArchEntry.macro`` declares (e.g. "SG_BUILD_ARCH_SM86")
+            # with the leading ``SG_BUILD_`` swapped for the project prefix.
+            macro_names = {_macro_name(m) for m in macros}
+            expected_arch_macro = (
+                "MYPROJ_" + ARCH_TABLE["sm_86"].macro[len("SG_BUILD_"):])
+            assert expected_arch_macro in macro_names, (
+                f"expected {expected_arch_macro!r} in macros, "
+                f"got {sorted(macro_names)}")
+            assert "MYPROJ_VERBOSE" in macro_names, sorted(macro_names)
+            assert "SG_VERBOSE" not in macro_names, sorted(macro_names)
+            # Sidecar JSON read-back.
+            sidecar = out_dir / "dry_run_sm_86.json"
+            assert sidecar.exists(), sidecar
+            payload = json.loads(sidecar.read_text())
+            payload_macros = [
+                _macro_name(tok)
+                for tok in (list(payload["host_cflags"])
+                            + list(payload["device_cflags"]))
+                if tok.startswith("-D")]
+            assert expected_arch_macro in payload_macros, payload_macros
+            assert "MYPROJ_VERBOSE" in payload_macros, payload_macros
+
+            # ---- get_registry cache dir mentions the project name -----
+            # Wipe the module-level registry cache so we exercise the
+            # config-derived cache_dir code path (the registry is
+            # memoized per-arch, so re-using sm_86 would short-circuit).
+            global _REGISTRY
+            saved = dict(_REGISTRY)
+            _REGISTRY.clear()
+            try:
+                reg = get_registry("sm_86", config=cfg)
+                assert "myproj" in str(reg.cache_dir), reg.cache_dir
+                assert "supergrok" not in str(reg.cache_dir), reg.cache_dir
+            finally:
+                _REGISTRY.clear()
+                _REGISTRY.update(saved)
+
+    run("project_agnostic_dry_run_no_sg_leakage",
+         test_project_agnostic_dry_run_no_sg_leakage)
 
     # ─────────────────────────────────────────────────────────────────
     # Stream 6 — codegen / Jinja2 kernel emitter
@@ -18079,14 +18408,45 @@ _REGISTRY_LOCK = threading.Lock()
 
 
 def get_registry(arch: str,
-                 cache_dir: Optional[Path] = None) -> KernelRegistry:
+                 cache_dir: Optional[Path] = None,
+                 config: Optional[Dict[str, Any]] = None) -> KernelRegistry:
+    """Return (and lazily create) the per-arch ``KernelRegistry``.
+
+    Project-agnosticism (Category 2d): when ``cache_dir`` is not given
+    explicitly, the default NVRTC cache directory is derived from the
+    project name found in ``config["project"]["name"]`` (falling back to
+    ``_DEFAULT_PROJECT_CONFIG["project"]["name"]`` which today is
+    ``"supergrok"``). A downstream project that loads its own TOML and
+    passes it through here gets ``~/.cache/<their_project>/nvrtc``
+    instead of leaking the SuperGrok name. With no override the path
+    is byte-identical to today (``~/.cache/supergrok/nvrtc``).
+    """
     with _REGISTRY_LOCK:
         existing = _REGISTRY.get(arch)
         if existing is not None:
             return existing
-        cd = cache_dir or (
-            Path(os.environ.get("HOME", "/tmp"))
-            / ".cache" / "supergrok" / "nvrtc")
+        if cache_dir is not None:
+            cd = cache_dir
+        else:
+            # Derive the project-name slug from the active config (when
+            # supplied) or the module-level default. Both layers fall
+            # back to ``supergrok`` if the key is missing.
+            project_name = "supergrok"
+            try:
+                if isinstance(config, dict):
+                    proj_cfg = config.get("project") or {}
+                    project_name = str(
+                        proj_cfg.get("name") or project_name)
+                else:
+                    proj_cfg = _DEFAULT_PROJECT_CONFIG.get("project") or {}
+                    project_name = str(
+                        proj_cfg.get("name") or project_name)
+            except Exception:
+                # Defensive: any failure to read the config falls back
+                # to the historical ``supergrok`` slug.
+                project_name = "supergrok"
+            cd = (Path(os.environ.get("HOME", "/tmp"))
+                  / ".cache" / project_name / "nvrtc")
         reg = KernelRegistry(arch, cd)
         _REGISTRY[arch] = reg
         return reg
