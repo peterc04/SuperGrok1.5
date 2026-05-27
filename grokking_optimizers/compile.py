@@ -7784,6 +7784,44 @@ def _ldflags(spec: BuildSpec,
     return flags
 
 
+def _device_ldflags(spec: BuildSpec) -> List[str]:
+    """Return the device-link flag list (nvcc -dlink step).
+
+    ``--device-link-options=-dlto`` is a LINK-only flag — nvcc -c rejects
+    it during the per-TU compile step with ``Unknown option`` (the exact
+    Colab CUDA 12.0 failure mode this audit fixes). It must NOT be in
+    ``_device_cflags(spec)``; it has its dedicated home here.
+
+    Important caveat about consumption: ``torch.utils.cpp_extension.load()``
+    (the wrapper's primary build driver) does NOT expose a separate
+    ``nvcc -dlink`` step — ninja invokes ``nvcc -c`` per source, then the
+    host linker (g++) directly. So this function's output is currently
+    consumed by:
+      - the ``--dry-run-all-archs`` manifest (so any downstream consumer
+        can see the canonical link-only flag set);
+      - regression tests in ``_self_test_flags`` that assert
+        ``--device-link-options=-dlto`` IS in this list AND IS NOT in
+        ``_device_cflags(spec)``;
+      - any future wrapper that invokes ``nvcc -dlink`` directly.
+
+    LTO across translation units requires BOTH ``-dlto`` at compile time
+    (in ``_device_cflags(spec)``, paired with ``-rdc=true``) AND
+    ``--device-link-options=-dlto`` at the device-link step — but the
+    latter only fires when the torch.cpp_extension pipeline grows a
+    device-link pathway.
+    """
+    entry = get_arch_entry(spec.arch)
+    if entry.vendor != "cuda":
+        return []
+    cflags = _device_cflags(spec)
+    has_dlto = "-dlto" in cflags
+    has_rdc = any(f == "-rdc=true" or f == "--relocatable-device-code=true"
+                  for f in cflags)
+    if has_dlto and has_rdc:
+        return ["--device-link-options=-dlto"]
+    return []
+
+
 # ---- XLA / Pallas worker env (Stream 3) ----------------------------------
 # When the build target is a Pallas / XLA arch (tpu_*) we don't emit C++
 # flags — there is no host compiler. Instead, the perf knobs live in the
@@ -8837,14 +8875,17 @@ def _newer_compiler_flags(arch: str, report=None) -> Tuple[List[str], List[str]]
         if ver:
             if report:
                 report.write(f"  [toolchain] nvcc {ver[0]}.{ver[1]}\n")
-            # CUDA 12.0+: --register-usage-level=10 enables PTXAS to use
+            # CUDA 12.3+: --register-usage-level=10 enables PTXAS to use
             # the full register budget (default 5 leaves slots on the table).
-            if ver >= (12, 0):
+            # Per CUDA Toolkit Release Notes, this flag was added in 12.3 —
+            # CUDA 12.0–12.2 ptxas rejects it with "Unknown option". (Fixed
+            # from an earlier (12,0) gate that bit a Colab CUDA 12.0 user.)
+            if ver >= (12, 3):
                 extra_device += ["-Xptxas", "--register-usage-level=10"]
                 if report:
                     report.write("  [toolchain] enabling "
                                  "-Xptxas --register-usage-level=10 "
-                                 "(CUDA ≥12.0)\n")
+                                 "(CUDA ≥12.3)\n")
             # CUDA 11.4+: explicit device-link-options=-dlto belt-and-suspenders.
             # (NVCC_DEVICE_BASE already passes it on the main line; this is a
             # second copy with an explicit option-name spelling for the rare
