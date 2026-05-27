@@ -5710,76 +5710,72 @@ def _bootstrap_cuda_via_apt(stream) -> bool:
     return rc == 0 and _ensure_nvcc_on_path() is not None
 
 
+def _bootstrap_via_pkg_manager(
+        name: str,
+        install_cmd: List[str],
+        packages: List[str],
+        stream,
+        verb: str = "install",
+        ) -> bool:
+    """Generic Linux-package-manager CUDA bootstrap.
+
+    Resolves ``name`` on PATH, then for each ``pkg`` in ``packages`` runs
+    ``[sudo, name, *install_cmd, pkg]`` and returns True on the first
+    invocation whose exit code is 0 and that lands nvcc on PATH. Returns
+    False if the manager isn't installed or every package failed.
+
+    Used by every distro's stock CUDA install path that follows the
+    ``<pkg-mgr> [args...] install <pkg>`` shape — currently dnf, yum,
+    zypper, pacman, apk. Kept distinct from
+    ``_bootstrap_cuda_via_conda`` / ``_bootstrap_cuda_via_nvidia_apt_repo``
+    / ``_bootstrap_cuda_via_pypi_wheels`` because those add extra steps
+    (env activation, repo file install, wheel layout patching) that don't
+    fit this shape.
+    """
+    mgr = shutil.which(name)
+    if not mgr:
+        return False
+    sudo = _sudo_prefix()
+    for pkg in packages:
+        stream.write(f"[bootstrap] trying {name} {verb} {pkg}\n")
+        stream.flush()
+        rc = subprocess.call(sudo + [mgr] + install_cmd + [pkg])
+        if rc == 0 and _ensure_nvcc_on_path():
+            return True
+    return False
+
+
 def _bootstrap_cuda_via_dnf(stream) -> bool:
     """Fedora / RHEL 8+ / Rocky / Alma. Tries `cuda` first
     (works once NVIDIA repo is added), then `nvidia-cuda-toolkit`
     (RPMFusion)."""
-    dnf = shutil.which("dnf")
-    if not dnf:
-        return False
-    sudo = _sudo_prefix()
-    for pkg in ("cuda", "nvidia-cuda-toolkit"):
-        stream.write(f"[bootstrap] trying dnf install {pkg}\n")
-        stream.flush()
-        rc = subprocess.call(sudo + [dnf, "install", "-y", pkg])
-        if rc == 0 and _ensure_nvcc_on_path():
-            return True
-    return False
+    return _bootstrap_via_pkg_manager(
+        "dnf", ["install", "-y"], ["cuda", "nvidia-cuda-toolkit"], stream)
 
 
 def _bootstrap_cuda_via_yum(stream) -> bool:
     """RHEL 7 / CentOS 7."""
-    yum = shutil.which("yum")
-    if not yum:
-        return False
-    sudo = _sudo_prefix()
-    for pkg in ("cuda", "nvidia-cuda-toolkit"):
-        stream.write(f"[bootstrap] trying yum install {pkg}\n")
-        stream.flush()
-        rc = subprocess.call(sudo + [yum, "install", "-y", pkg])
-        if rc == 0 and _ensure_nvcc_on_path():
-            return True
-    return False
+    return _bootstrap_via_pkg_manager(
+        "yum", ["install", "-y"], ["cuda", "nvidia-cuda-toolkit"], stream)
 
 
 def _bootstrap_cuda_via_zypper(stream) -> bool:
     """openSUSE / SLES."""
-    zypper = shutil.which("zypper")
-    if not zypper:
-        return False
-    sudo = _sudo_prefix()
-    for pkg in ("cuda", "nvidia-cuda-toolkit"):
-        stream.write(f"[bootstrap] trying zypper install {pkg}\n")
-        stream.flush()
-        rc = subprocess.call(sudo + [zypper, "--non-interactive", "install",
-                                     "-y", pkg])
-        if rc == 0 and _ensure_nvcc_on_path():
-            return True
-    return False
+    return _bootstrap_via_pkg_manager(
+        "zypper", ["--non-interactive", "install", "-y"],
+        ["cuda", "nvidia-cuda-toolkit"], stream)
 
 
 def _bootstrap_cuda_via_pacman(stream) -> bool:
     """Arch / Manjaro / EndeavourOS — `cuda` is in extra repo."""
-    pac = shutil.which("pacman")
-    if not pac:
-        return False
-    stream.write("[bootstrap] trying pacman -S cuda\n")
-    stream.flush()
-    sudo = _sudo_prefix()
-    rc = subprocess.call(sudo + [pac, "-S", "--noconfirm", "cuda"])
-    return rc == 0 and _ensure_nvcc_on_path() is not None
+    return _bootstrap_via_pkg_manager(
+        "pacman", ["-S", "--noconfirm"], ["cuda"], stream, verb="-S")
 
 
 def _bootstrap_cuda_via_apk(stream) -> bool:
     """Alpine Linux — `cuda` is in the testing repo."""
-    apk = shutil.which("apk")
-    if not apk:
-        return False
-    stream.write("[bootstrap] trying apk add cuda\n")
-    stream.flush()
-    sudo = _sudo_prefix()
-    rc = subprocess.call(sudo + [apk, "add", "--no-cache", "cuda"])
-    return rc == 0 and _ensure_nvcc_on_path() is not None
+    return _bootstrap_via_pkg_manager(
+        "apk", ["add", "--no-cache"], ["cuda"], stream, verb="add")
 
 
 def _bootstrap_cuda_via_brew(stream) -> bool:
@@ -6644,7 +6640,7 @@ def _resolve_sources(spec: BuildSpec) -> List[Path]:
     entry = get_arch_entry(spec.arch)
     if entry.vendor == "pallas":
         return []
-    roots = getattr(spec, "source_roots", {}) or {}
+    roots = spec.source_roots or {}
     # ── backend (launcher + models) ──────────────────────────────────
     vendor_root_raw = roots.get(entry.vendor)
     if vendor_root_raw:
@@ -6687,7 +6683,7 @@ def _build_macros(spec: BuildSpec) -> List[str]:
     config is byte-identical to today.
     """
     entry = get_arch_entry(spec.arch)
-    prefix = getattr(spec, "macro_prefix", "SG_BUILD_") or "SG_BUILD_"
+    prefix = spec.macro_prefix or "SG_BUILD_"
     macros = [
         f"-D{prefix}OPTIMIZER_{spec.optimizer.upper()}=1",
         f"-D{prefix}MODEL_{spec.model.upper()}=1",
@@ -7071,7 +7067,7 @@ def _include_paths(spec: Optional["BuildSpec"] = None) -> List[str]:
     """
     paths: List[str] = []
     if spec is not None:
-        roots = getattr(spec, "source_roots", {}) or {}
+        roots = spec.source_roots or {}
         bindings_raw = roots.get("bindings")
         if bindings_raw:
             paths.append(str(_resolve_path(spec, bindings_raw)))
@@ -8079,8 +8075,8 @@ def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
     """
     # Stream 3 — if arch wasn't passed explicitly, lift it off spec.
     if arch is None and spec is not None:
-        arch = getattr(spec, "arch", None)
-    if spec is not None and getattr(spec, "enable_emitter", False) \
+        arch = spec.arch
+    if spec is not None and spec.enable_emitter \
             and target == "device":
         try:
             from grokking_optimizers.codegen import (
@@ -8089,7 +8085,7 @@ def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
             # so a user-supplied TOML can redirect (opt, arch) pairs at
             # custom .j2 files. Falls back to None when the spec has no
             # config attached → historical probe order.
-            spec_cfg = getattr(spec, "config", {}) or {}
+            spec_cfg = spec.config or {}
             overrides = (spec_cfg.get("codegen", {}) or {}).get(
                 "template_overrides") or None
             emitted_path, residual = emit_variant_source(
@@ -8180,8 +8176,8 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
 
     # Stream 10 — numerical validation context.
     arch_entry = get_arch_entry(spec.arch)
-    aot_so = getattr(spec, "aot_so_path", None)
-    strict = bool(getattr(spec, "strict_numerics", False))
+    aot_so = spec.aot_so_path
+    strict = bool(spec.strict_numerics)
     # Pallas has no per-variant .so; skip numerical validation entirely.
     numerics_enabled = (arch_entry.vendor != "pallas"
                         and aot_so is not None
@@ -8206,7 +8202,7 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
             p = _capture_reference_output(
                 Path(aot_so), OPT_CLASS[spec.optimizer],
                 ref_state["size"], ref_state["dtype"], spec.out_dir,
-                fused_op_template=getattr(spec, "fused_op_template", None))
+                fused_op_template=spec.fused_op_template)
             ref_state["path"] = p
             return p
         except Exception as exc:
@@ -8222,7 +8218,7 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         # always measures so the first retrain has signal). The cap on
         # rejection fraction guards against an over-confident model
         # excluding the real optimum.
-        if (getattr(spec, "enable_cost_model", False)
+        if (spec.enable_cost_model
                 and cost_model_state is not None):
             reg = cost_model_state.get("model")
             if reg is not None and reg.is_warm():
@@ -8237,8 +8233,7 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                 best = cost_model_state.get("best_so_far",
                                             float("inf")) or float("inf")
                 threshold_x = float(
-                    getattr(spec, "cost_model_rejection_threshold_x",
-                            3.0) or 3.0)
+                    spec.cost_model_rejection_threshold_x or 3.0)
                 threshold = threshold_x * best if math.isfinite(best) else \
                     float("inf")
                 # High confidence = sigma small relative to mean.
@@ -8248,8 +8243,7 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                     n_total = int(cost_model_state.get("n_total", 0)) + 1
                     n_rejected = int(cost_model_state.get("n_rejected", 0))
                     cap = float(
-                        getattr(spec, "cost_model_rejection_max_pct",
-                                0.8) or 0.8)
+                        spec.cost_model_rejection_max_pct or 0.8)
                     # Cap check: only reject when doing so keeps us under
                     # the cap. Else fall through and measure normally.
                     if (n_rejected + 1) / max(1, n_total) <= cap:
@@ -8276,11 +8270,10 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         # Failures here MUST NOT break the un-polyhedral flow — both
         # libclang and islpy are optional.
         try:
-            poly_cfg = (getattr(spec, "config", {}) or {}).get(
+            poly_cfg = (spec.config or {}).get(
                 "polyhedral", {}) or {}
             if poly_cfg.get("enable"):
-                emitted_source = (getattr(spec, "_emitted_sources", {})
-                                  or {}).get(ckey)
+                emitted_source = (spec._emitted_sources or {}).get(ckey)
                 if emitted_source is not None and Path(emitted_source).exists():
                     _polyhedral_expand_variant(
                         spec, Path(emitted_source), report)
@@ -8304,7 +8297,7 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         # without modifying the timer's return shape. With the flag
         # OFF (the default), this branch is a no-op.
         variant_sources = list(sources)
-        if getattr(spec, "enable_synth_codegen", False):
+        if spec.enable_synth_codegen:
             try:
                 synth_path = _try_synth_codegen(spec, config, dims)
             except Exception as exc:
@@ -8314,9 +8307,7 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                 synth_path = None
             if synth_path is not None:
                 spec._emitted_sources[f"{ckey}:synth"] = synth_path
-                if getattr(spec,
-                           "synth_codegen_prefer_synth_over_template",
-                           False):
+                if spec.synth_codegen_prefer_synth_over_template:
                     # Synth-only: replace template-driven sources with
                     # the synthesised file. The existing _torch_load
                     # call below picks this list up unchanged.
@@ -8375,7 +8366,7 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
             if result is None:
                 result = _time_variant_oneshot(
                     variant_so, OPT_CLASS[spec.optimizer], report=report,
-                    python_package=getattr(spec, "python_package", None))
+                    python_package=spec.python_package)
         finally:
             if prior_dump is None:
                 os.environ.pop("SG_DUMP_OUTPUT", None)
@@ -8657,7 +8648,7 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
                      f"({','.join(visible)}); spawning MultiGPUTimingPool.\n")
         pool = MultiGPUTimingPool(
             OPT_CLASS[spec.optimizer], vendor=vendor,
-            python_package=getattr(spec, "python_package", None))
+            python_package=spec.python_package)
         if pool.start():
             worker = pool
             report.write(f"  [worker] multi-GPU pool up with "
@@ -8668,7 +8659,7 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
     if worker is None:
         single = TimingWorker(
             opt_class=OPT_CLASS[spec.optimizer],
-            python_package=getattr(spec, "python_package", None))
+            python_package=spec.python_package)
         if not single.start():
             report.write("  [worker] start FAILED; falling back to "
                          "one-shot per variant.\n")
@@ -8714,7 +8705,7 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
     # Auto-prune the variant cache so a long-running autotune campaign
     # doesn't accumulate gigabytes of stale .so files. Only runs on a
     # successful sweep; opt out with spec.prune_after_autotune=False.
-    if winning is not None and getattr(spec, "prune_after_autotune", True):
+    if winning is not None and spec.prune_after_autotune:
         try:
             summary = cache.prune(
                 max_age_days=spec.prune_max_age_days,
@@ -8822,11 +8813,10 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
     # ``cost_model_retrain_every`` completed trials and feed it back
     # into the state dict so the next batch of TPE suggestions can be
     # rejected by the freshly-fit predictor.
-    cm_enabled = bool(getattr(spec, "enable_cost_model", False)
+    cm_enabled = bool(spec.enable_cost_model
                       and cost_model_state is not None)
-    cm_retrain_every = int(getattr(spec, "cost_model_retrain_every", 20) or 20)
-    cm_uncertainty = str(getattr(spec, "cost_model_uncertainty_method",
-                                 "bootstrap"))
+    cm_retrain_every = int(spec.cost_model_retrain_every or 20)
+    cm_uncertainty = str(spec.cost_model_uncertainty_method or "bootstrap")
     cm_arch_entry = (cost_model_state.get("arch_entry")
                      if cost_model_state else None)
     cm_cache_dir = (cache.path.parent if cache.path is not None
@@ -8851,8 +8841,8 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
         # current trials and feed them as extra (X, y) rows to the next
         # retrain. (No-op when transfer_learning is OFF.)
         cost_model_state["_sibling_model"] = None
-        if getattr(spec, "transfer_learning", False):
-            for sib_opt in (allowed_optimizers(getattr(spec, "config", {}))
+        if spec.transfer_learning:
+            for sib_opt in (allowed_optimizers(spec.config)
                             or []):
                 if sib_opt == spec.optimizer:
                     continue
@@ -9014,7 +9004,7 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
     # Only consulted when ``spec.enable_device_pgo`` is True so the
     # default flow is byte-identical to today.
     stall_info_for_bias: Optional[Dict[str, Any]] = None
-    if getattr(spec, "enable_device_pgo", False):
+    if spec.enable_device_pgo:
         if cost_model_state is not None:
             stall_info_for_bias = cost_model_state.get("stall_info")
         if stall_info_for_bias is None:
@@ -9313,7 +9303,7 @@ def _write_tuned_configs_header(combo: Dict[str, Any], optimizer: str,
     ``csrc/algorithms/tuned_configs.h``). When ``spec`` is None the legacy
     REPO_ROOT-relative path is used so older callers keep working.
     """
-    raw = (getattr(spec, "tuned_header_path", None)
+    raw = (spec.tuned_header_path
            if spec is not None else None) or "csrc/algorithms/tuned_configs.h"
     tuned_h = Path(raw)
     if not tuned_h.is_absolute():
@@ -9519,7 +9509,7 @@ def _build_aot_pgo(spec: BuildSpec, cache: CompileCache, sources: List[Path],
     # specific stall sampling whose output (a JSON sidecar) the Bayesian
     # autotuner can use to enqueue biased trials. The hook is a no-op
     # unless ``spec.enable_device_pgo`` is True.
-    if getattr(spec, "enable_device_pgo", False):
+    if spec.enable_device_pgo:
         try:
             from grokking_optimizers.device_profiling import (
                 run_device_pgo_round,
@@ -9850,7 +9840,7 @@ def build(
     # Stream A: make sure spec.config carries the full loaded config even
     # if apply_to_buildspec couldn't (e.g. read-only spec / older signature).
     try:
-        if not getattr(spec, "config", None) and isinstance(project_cfg, dict):
+        if not spec.config and isinstance(project_cfg, dict):
             spec.config = dict(project_cfg)
     except Exception:
         pass
@@ -10634,24 +10624,25 @@ def _e2e_smoke(out_dir: Path, *, max_seconds: float = 120.0) -> int:
     return 0 if all_ok else 1
 
 
-def _self_test() -> int:
-    """Run inline self-checks. Returns 0 on success, 1 on failure."""
+# ----------------------------------------------------------------------
+# _self_test orchestrator + per-section helpers
+# ----------------------------------------------------------------------
+#
+# δ.1: ``_self_test`` is split into a thin orchestrator that calls one
+# helper per ``[self-test] <name>`` banner. The historical behavior is
+# byte-identical: each helper prints its own banner, defines its nested
+# test functions, and dispatches them through the ``run(name, fn)``
+# callable that the orchestrator supplies. The orchestrator owns the
+# global PASS/FAIL counters + the final summary line.
+#
+# To add a new section: append a ``_self_test_<name>(run)`` helper here,
+# then add one ``_self_test_<name>(_run)`` call in ``_self_test`` below.
+# Each helper must be project-agnostic — it should rely only on this
+# module's exported symbols, not on local state from sibling helpers.
+def _self_test_search_space(run) -> None:
+    """`[self-test] search_space` section."""
     import shutil
     import tempfile
-
-    failures = 0
-    passed = 0
-
-    def _run(name, fn):
-        nonlocal failures, passed
-        try:
-            fn()
-            sys.stdout.write(f"  PASS: {name}\n")
-            passed += 1
-        except Exception as exc:
-            sys.stdout.write(f"  FAIL: {name}: {exc}\n")
-            failures += 1
-
     sys.stdout.write("[self-test] search_space\n")
 
     def test_load_yaml_validates_shape():
@@ -10770,16 +10761,21 @@ def _self_test() -> int:
             assert space[alias] is space[canonical], (
                 f"alias {alias} doesn't share dict with {canonical}")
 
-    _run("load_yaml_validates_shape", test_load_yaml_validates_shape)
-    _run("load_yaml_rejects_duplicate_dim", test_load_yaml_rejects_duplicate_dim)
-    _run("embedded_yaml_loads", test_real_yaml_loads)
-    _run("cartesian_counts", test_cartesian_counts)
-    _run("prefilter_eliminates", test_prefilter_eliminates)
-    _run("config_key_deterministic", test_config_key_deterministic)
-    _run("hash_space_stable", test_hash_space_stable)
-    _run("per_arch_search_space", test_per_arch_search_space)
-    _run("alias_search_space_consistency", test_alias_search_space_consistency)
+    run("load_yaml_validates_shape", test_load_yaml_validates_shape)
+    run("load_yaml_rejects_duplicate_dim", test_load_yaml_rejects_duplicate_dim)
+    run("embedded_yaml_loads", test_real_yaml_loads)
+    run("cartesian_counts", test_cartesian_counts)
+    run("prefilter_eliminates", test_prefilter_eliminates)
+    run("config_key_deterministic", test_config_key_deterministic)
+    run("hash_space_stable", test_hash_space_stable)
+    run("per_arch_search_space", test_per_arch_search_space)
+    run("alias_search_space_consistency", test_alias_search_space_consistency)
 
+
+def _self_test_pgo(run) -> None:
+    """`[self-test] pgo` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] pgo\n")
 
     def test_hash_workload_deterministic():
@@ -10822,11 +10818,16 @@ def _self_test() -> int:
         finally:
             shutil.rmtree(td)
 
-    _run("hash_workload_deterministic", test_hash_workload_deterministic)
-    _run("hash_workload_changes", test_hash_workload_changes)
-    _run("instrument_flags_cuda", test_instrument_flags_cuda)
-    _run("use_flags_round_trip", test_use_flags_round_trip)
+    run("hash_workload_deterministic", test_hash_workload_deterministic)
+    run("hash_workload_changes", test_hash_workload_changes)
+    run("instrument_flags_cuda", test_instrument_flags_cuda)
+    run("use_flags_round_trip", test_use_flags_round_trip)
 
+
+def _self_test_device_profiling(run) -> None:
+    """`[self-test] device_profiling` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] device_profiling\n")
 
     def test_device_profiling_import():
@@ -10943,16 +10944,21 @@ def _self_test() -> int:
             out_dir=Path("/tmp"), enable_device_pgo=True)
         assert spec2.enable_device_pgo is True
 
-    _run("device_profiling_import", test_device_profiling_import)
-    _run("stall_to_bias_mapping", test_stall_to_bias_mapping)
-    _run("stall_to_bias_empty_input", test_stall_to_bias_empty_input)
-    _run("bias_trial_queue_enqueues", test_bias_trial_queue_enqueues)
-    _run("bias_trial_queue_empty", test_bias_trial_queue_empty)
-    _run("run_device_pgo_round_disabled", test_run_device_pgo_round_disabled)
-    _run("stall_sidecar_round_trip", test_stall_sidecar_round_trip)
-    _run("buildspec_has_device_pgo_field", test_buildspec_has_device_pgo_field)
+    run("device_profiling_import", test_device_profiling_import)
+    run("stall_to_bias_mapping", test_stall_to_bias_mapping)
+    run("stall_to_bias_empty_input", test_stall_to_bias_empty_input)
+    run("bias_trial_queue_enqueues", test_bias_trial_queue_enqueues)
+    run("bias_trial_queue_empty", test_bias_trial_queue_empty)
+    run("run_device_pgo_round_disabled", test_run_device_pgo_round_disabled)
+    run("stall_sidecar_round_trip", test_stall_sidecar_round_trip)
+    run("buildspec_has_device_pgo_field", test_buildspec_has_device_pgo_field)
 
     # ---- Stream 3: per-arch native flag emission ----
+
+def _self_test_flags(run) -> None:
+    """`[self-test] flags` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] flags\n")
 
     def _spec(arch: str) -> "BuildSpec":
@@ -11222,15 +11228,20 @@ def _self_test() -> int:
         finally:
             shutil.rmtree(td)
 
-    _run("per_arch_native_flags", test_per_arch_native_flags)
-    _run("flag_base_superset_regression", test_flag_base_superset_regression)
-    _run("nvcc_no_duplicate_ptxas_o3", test_nvcc_no_duplicate_ptxas_o3)
-    _run("resolve_extra_feature_macros", test_resolve_extra_feature_macros)
-    _run("xla_env", test_xla_env)
-    _run("stream_alpha_nvcc_flags", test_stream_alpha_nvcc_flags)
-    _run("stream_alpha_hipcc_flags", test_stream_alpha_hipcc_flags)
-    _run("stream_alpha_xla_flags", test_stream_alpha_xla_flags)
+    run("per_arch_native_flags", test_per_arch_native_flags)
+    run("flag_base_superset_regression", test_flag_base_superset_regression)
+    run("nvcc_no_duplicate_ptxas_o3", test_nvcc_no_duplicate_ptxas_o3)
+    run("resolve_extra_feature_macros", test_resolve_extra_feature_macros)
+    run("xla_env", test_xla_env)
+    run("stream_alpha_nvcc_flags", test_stream_alpha_nvcc_flags)
+    run("stream_alpha_hipcc_flags", test_stream_alpha_hipcc_flags)
+    run("stream_alpha_xla_flags", test_stream_alpha_xla_flags)
 
+
+def _self_test_bayesian(run) -> None:
+    """`[self-test] bayesian` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] bayesian\n")
 
     def _tiny_space():
@@ -11275,8 +11286,8 @@ def _self_test() -> int:
         finally:
             shutil.rmtree(td)
 
-    _run("bayesian_finds_winner", test_bayesian_finds_winner)
-    _run("topk_refine_generates_neighbours", test_topk_refine_generates_neighbours)
+    run("bayesian_finds_winner", test_bayesian_finds_winner)
+    run("topk_refine_generates_neighbours", test_topk_refine_generates_neighbours)
 
     def test_bias_trial_queue_wired_into_run_bayesian():
         """Stream γ.4 — when ``stall_info`` is threaded through
@@ -11339,9 +11350,14 @@ def _self_test() -> int:
             assert 128 in [c.get("swizzle") for c in head25]
         finally:
             shutil.rmtree(td)
-    _run("bias_trial_queue_wired_into_run_bayesian",
+    run("bias_trial_queue_wired_into_run_bayesian",
          test_bias_trial_queue_wired_into_run_bayesian)
 
+
+def _self_test_early_stopping(run) -> None:
+    """`[self-test] early_stopping` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] early_stopping\n")
 
     import random
@@ -11455,12 +11471,17 @@ def _self_test() -> int:
         sys.stdout.write(f"    (stopper triggered after {len(records)} trials, "
                          f"reason={reason})\n")
 
-    _run("early_stopper_triggers", test_early_stopper_triggers)
-    _run("early_stopper_wall_clock", test_early_stopper_wall_clock)
-    _run("topk_elbow_detection", test_topk_elbow_detection)
-    _run("stopper_to_dict_serializable", test_stopper_to_dict_serializable)
-    _run("ei_exhaustion_triggers", test_ei_exhaustion_triggers)
+    run("early_stopper_triggers", test_early_stopper_triggers)
+    run("early_stopper_wall_clock", test_early_stopper_wall_clock)
+    run("topk_elbow_detection", test_topk_elbow_detection)
+    run("stopper_to_dict_serializable", test_stopper_to_dict_serializable)
+    run("ei_exhaustion_triggers", test_ei_exhaustion_triggers)
 
+
+def _self_test_cost_model(run) -> None:
+    """`[self-test] cost_model` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] cost_model\n")
 
     def test_cost_model_helpers_importable():
@@ -11470,7 +11491,7 @@ def _self_test() -> int:
         assert CostModel is not None
         assert callable(featurize_config)
         assert FEATURE_DIM > 0
-    _run("cost_model_helpers_importable",
+    run("cost_model_helpers_importable",
          test_cost_model_helpers_importable)
 
     def test_cost_model_featurize_deterministic():
@@ -11493,7 +11514,7 @@ def _self_test() -> int:
         f3 = featurize_config(c3, dims, arch)
         assert np.array_equal(f1, f2), "same config → same features"
         assert not np.array_equal(f1, f3), "different config → different features"
-    _run("cost_model_featurize_deterministic",
+    run("cost_model_featurize_deterministic",
          test_cost_model_featurize_deterministic)
 
     def test_cost_model_fit_and_predict_synthetic():
@@ -11520,7 +11541,7 @@ def _self_test() -> int:
             # (Loose bound — graceful for the linear fallback.)
             assert reg._mae_val < 0.5, \
                 f"val MAE {reg._mae_val} too high"
-    _run("cost_model_fit_and_predict_synthetic",
+    run("cost_model_fit_and_predict_synthetic",
          test_cost_model_fit_and_predict_synthetic)
 
     def test_cost_model_rejection_cap():
@@ -11537,7 +11558,7 @@ def _self_test() -> int:
                 n_rejected += 1
         # 80% cap means we reject ~80 out of 100.
         assert n_rejected <= int(rejection_max_pct * n_total) + 1, n_rejected
-    _run("cost_model_rejection_cap", test_cost_model_rejection_cap)
+    run("cost_model_rejection_cap", test_cost_model_rejection_cap)
 
     def test_cost_model_save_load_round_trip():
         """Train → save → load → predict produces same answer."""
@@ -11556,9 +11577,14 @@ def _self_test() -> int:
             assert reg2.load()
             ms_after, _ = reg2.predict(X[0])
             assert abs(ms_before - ms_after) < 1e-6, (ms_before, ms_after)
-    _run("cost_model_save_load_round_trip",
+    run("cost_model_save_load_round_trip",
          test_cost_model_save_load_round_trip)
 
+
+def _self_test_cache(run) -> None:
+    """`[self-test] cache` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] cache\n")
 
     def test_v2_to_v3_migration():
@@ -11602,8 +11628,8 @@ def _self_test() -> int:
         finally:
             shutil.rmtree(td)
 
-    _run("v2_to_v3_migration", test_v2_to_v3_migration)
-    _run("cache_round_trips", test_cache_round_trips)
+    run("v2_to_v3_migration", test_v2_to_v3_migration)
+    run("cache_round_trips", test_cache_round_trips)
 
     def test_v3_to_v4_migration():
         """Synthetic v3 cache with bayesian_trials migrates cleanly to v4."""
@@ -11671,8 +11697,8 @@ def _self_test() -> int:
             sidecar = Path(td) / e["trial_log_path"]
             assert sidecar.exists()
 
-    _run("v3_to_v4_migration", test_v3_to_v4_migration)
-    _run("v2_to_v4_chain_migration", test_v2_to_v4_chain_migration)
+    run("v3_to_v4_migration", test_v3_to_v4_migration)
+    run("v2_to_v4_chain_migration", test_v2_to_v4_chain_migration)
 
     def test_cache_prune():
         """Populate 5 variants, prune to top-2 by timing, verify 3 dropped
@@ -11753,9 +11779,14 @@ def _self_test() -> int:
         finally:
             shutil.rmtree(td)
 
-    _run("cache_prune", test_cache_prune)
-    _run("cache_prune_dry_run", test_cache_prune_dry_run)
+    run("cache_prune", test_cache_prune)
+    run("cache_prune_dry_run", test_cache_prune_dry_run)
 
+
+def _self_test_multi_gpu_pool(run) -> None:
+    """`[self-test] multi_gpu_pool` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] multi_gpu_pool\n")
 
     def test_visible_devices_default():
@@ -11820,10 +11851,10 @@ def _self_test() -> int:
             else:
                 os.environ["CUDA_VISIBLE_DEVICES"] = saved
 
-    _run("visible_devices_default", test_visible_devices_default)
-    _run("visible_devices_multi", test_visible_devices_multi)
-    _run("visible_devices_hip", test_visible_devices_hip)
-    _run("pool_constructs_per_device_workers", test_pool_constructs_per_device_workers)
+    run("visible_devices_default", test_visible_devices_default)
+    run("visible_devices_multi", test_visible_devices_multi)
+    run("visible_devices_hip", test_visible_devices_hip)
+    run("pool_constructs_per_device_workers", test_pool_constructs_per_device_workers)
 
     def test_work_stealing_fast_worker_dominates():
         """Build a 2-worker pool with mock workers of different latencies.
@@ -11889,8 +11920,13 @@ def _self_test() -> int:
         sys.stdout.write(
             f"    (fast={fast_calls} slow={slow_calls} wall={wall:.3f}s)\n")
 
-    _run("multigpu_work_stealing", test_work_stealing_fast_worker_dominates)
+    run("multigpu_work_stealing", test_work_stealing_fast_worker_dominates)
 
+
+def _self_test_kernel_headers(run) -> None:
+    """`[self-test] kernel_headers` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] kernel_headers\n")
 
     def _read_kernel(p: Path) -> str:
@@ -11956,10 +11992,15 @@ def _self_test() -> int:
         assert (gfx942_dir / "common_gfx942.hip.hpp").is_file()
         assert (tpu_dir / "common_tpu.py").is_file()
 
-    _run("elementwise_headers", test_elementwise_headers)
-    _run("model_headers", test_model_headers)
-    _run("optimizer_model_cross", test_optimizer_model_cross)
+    run("elementwise_headers", test_elementwise_headers)
+    run("model_headers", test_model_headers)
+    run("optimizer_model_cross", test_optimizer_model_cross)
 
+
+def _self_test_arch_table(run) -> None:
+    """`[self-test] arch_table` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] arch_table\n")
 
     def test_arch_table_completeness():
@@ -12075,9 +12116,14 @@ def _self_test() -> int:
             assert ",code=compute_" in ptx, \
                 f"{arch}: PTX fallback malformed: {ptx}"
 
-    _run("arch_table_completeness", test_arch_table_completeness)
-    _run("arch_table_gencode_format", test_arch_table_gencode_format)
+    run("arch_table_completeness", test_arch_table_completeness)
+    run("arch_table_gencode_format", test_arch_table_gencode_format)
 
+
+def _self_test_kernel_registry(run) -> None:
+    """`[self-test] kernel_registry` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] kernel_registry\n")
 
     def test_kernel_registry_importable():
@@ -12221,19 +12267,24 @@ def _self_test() -> int:
         finally:
             shutil.rmtree(td)
 
-    _run("kernel_registry_importable", test_kernel_registry_importable)
-    _run("kernel_registry_shape_buckets", test_shape_class_buckets)
-    _run("kernel_registry_construct_cuda", test_kernel_registry_construct_cuda)
-    _run("kernel_registry_rejects_pallas", test_kernel_registry_rejects_pallas)
-    _run("kernel_registry_rejects_unknown_arch",
+    run("kernel_registry_importable", test_kernel_registry_importable)
+    run("kernel_registry_shape_buckets", test_shape_class_buckets)
+    run("kernel_registry_construct_cuda", test_kernel_registry_construct_cuda)
+    run("kernel_registry_rejects_pallas", test_kernel_registry_rejects_pallas)
+    run("kernel_registry_rejects_unknown_arch",
          test_kernel_registry_rejects_unknown_arch)
-    _run("kernel_registry_nvrtc_compile_or_skip",
+    run("kernel_registry_nvrtc_compile_or_skip",
          test_kernel_registry_nvrtc_compile_or_skip)
-    _run("kernel_registry_initialize_disabled",
+    run("kernel_registry_initialize_disabled",
          test_initialize_registry_disabled_by_default)
-    _run("loaded_kernel_call_or_skip", test_loaded_kernel_call_or_skip)
+    run("loaded_kernel_call_or_skip", test_loaded_kernel_call_or_skip)
 
     # ----- Stream 11: compile_config -----
+
+def _self_test_compile_config(run) -> None:
+    """`[self-test] compile_config` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] compile_config\n")
 
     def test_compile_config_default_loads():
@@ -12282,10 +12333,106 @@ def _self_test() -> int:
         assert ms.enable_device_pgo is False
         assert ms.strict_numerics is False
 
-    _run("compile_config_default_loads", test_compile_config_default_loads)
-    _run("compile_config_cwd_override", test_compile_config_cwd_override)
-    _run("compile_config_apply_noop_on_empty",
+    run("compile_config_default_loads", test_compile_config_default_loads)
+    run("compile_config_cwd_override", test_compile_config_cwd_override)
+    run("compile_config_apply_noop_on_empty",
          test_compile_config_apply_noop_on_empty)
+
+    def test_buildspec_advertises_all_fields_read_by_production_code():
+        """Every ``spec.X`` and ``getattr(spec, "X", ...)`` reference in
+        production code (everything except this self-test) where the
+        enclosing function declares ``spec: BuildSpec`` (or
+        ``Optional[BuildSpec]``) must name a declared BuildSpec dataclass
+        field, so the dataclass stays in sync with the code that consumes
+        it.
+
+        This is the structural guardrail that lets us drop the historical
+        ``getattr(spec, ...)`` fallbacks in favour of plain ``spec.X``
+        attribute access: a future rename of a BuildSpec field will now
+        hard-fail at this check rather than silently regressing to the
+        ``getattr`` default.
+
+        Functions that take a ``spec`` parameter with a different (or no)
+        annotation are skipped — they may be duck-typed callers (e.g.
+        ``apply_to_buildspec``) that intentionally use ``getattr`` for
+        graceful absent-field handling.
+        """
+        import ast as _ast
+        from dataclasses import fields as _fields
+        with open(__file__, "r", encoding="utf-8") as _f:
+            tree = _ast.parse(_f.read())
+        # Locate the self-test function so we can exclude it.
+        self_test_start = self_test_end = None
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.FunctionDef) and node.name == "_self_test":
+                self_test_start = node.lineno
+                self_test_end = node.end_lineno
+                break
+        assert self_test_start is not None, "could not locate _self_test"
+
+        # Collect (start_line, end_line) ranges of every function whose
+        # `spec` parameter is annotated as BuildSpec / Optional[BuildSpec].
+        def _annotation_names_buildspec(ann) -> bool:
+            if ann is None:
+                return False
+            s = _ast.unparse(ann)
+            # Strip Optional[...] wrappers.
+            for prefix in ('Optional[', 'Union['):
+                if s.startswith(prefix) and s.endswith(']'):
+                    s = s[len(prefix):-1]
+            # Strip quoted forward refs.
+            s = s.strip("'\"")
+            return s.endswith("BuildSpec")
+
+        ranges: List[Tuple[int, int]] = []
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                all_args = list(node.args.args) + list(node.args.kwonlyargs)
+                for arg in all_args:
+                    if arg.arg == "spec" and _annotation_names_buildspec(
+                            arg.annotation):
+                        ranges.append((node.lineno, node.end_lineno))
+                        break
+
+        def _in_buildspec_fn(lineno: int) -> bool:
+            return any(s <= lineno <= e for s, e in ranges)
+
+        declared = {f.name for f in _fields(BuildSpec)}
+        names_read: Dict[str, List[int]] = {}
+        for node in _ast.walk(tree):
+            lineno = getattr(node, "lineno", -1)
+            if lineno < 0:
+                continue
+            if self_test_start <= lineno <= self_test_end:
+                continue
+            if not _in_buildspec_fn(lineno):
+                continue
+            # spec.X attribute access
+            if (isinstance(node, _ast.Attribute)
+                    and isinstance(node.value, _ast.Name)
+                    and node.value.id == "spec"):
+                names_read.setdefault(node.attr, []).append(lineno)
+            # getattr(spec, "X", ...) call
+            elif (isinstance(node, _ast.Call)
+                    and isinstance(node.func, _ast.Name)
+                    and node.func.id == "getattr"
+                    and len(node.args) >= 2
+                    and isinstance(node.args[0], _ast.Name)
+                    and node.args[0].id == "spec"
+                    and isinstance(node.args[1], _ast.Constant)
+                    and isinstance(node.args[1].value, str)):
+                names_read.setdefault(node.args[1].value, []).append(lineno)
+        undeclared = {
+            name: lines for name, lines in names_read.items()
+            if name not in declared and not name.startswith("__")
+        }
+        assert not undeclared, (
+            f"{len(undeclared)} attribute name(s) read off `spec` in "
+            f"production code (in functions where spec: BuildSpec) but NOT "
+            f"declared on the BuildSpec dataclass: {undeclared}")
+
+    run("buildspec_advertises_all_fields_read_by_production_code",
+         test_buildspec_advertises_all_fields_read_by_production_code)
 
     # ─────────────────────────────────────────────────────────────────
     # Stream A — portability: TOML config flows through the 12 historical
@@ -12295,6 +12442,11 @@ def _self_test() -> int:
     # nvcc; we exercise the config-resolution + flag-emission + template
     # selection paths and assert they reflect a fully-custom project.
     # ─────────────────────────────────────────────────────────────────
+
+def _self_test_portability(run) -> None:
+    """`[self-test] portability` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] portability\n")
 
     def test_portability_custom_project():
@@ -12445,11 +12597,16 @@ def _self_test() -> int:
             finally:
                 os.chdir(saved_cwd)
 
-    _run("portability_custom_project", test_portability_custom_project)
+    run("portability_custom_project", test_portability_custom_project)
 
     # ─────────────────────────────────────────────────────────────────
     # Stream 6 — codegen / Jinja2 kernel emitter
     # ─────────────────────────────────────────────────────────────────
+
+def _self_test_codegen(run) -> None:
+    """`[self-test] codegen` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] codegen\n")
 
     def test_codegen_import():
@@ -12668,17 +12825,17 @@ def _self_test() -> int:
         finally:
             shutil.rmtree(td)
 
-    _run("codegen_import", test_codegen_import)
-    _run("codegen_templates_dir", test_codegen_templates_dir)
-    _run("codegen_template_count", test_codegen_template_count)
-    _run("codegen_jinja2_probe", test_codegen_jinja2_or_skip)
-    _run("codegen_adamw_sm90_renders", test_codegen_adamw_sm90_renders)
-    _run("codegen_emit_returns_path", test_codegen_emit_returns_path)
-    _run("codegen_nvcc_dryrun_graceful", test_codegen_nvcc_dryrun_graceful)
-    _run("codegen_find_template_fallback", test_codegen_find_template_fallback)
-    _run("codegen_unknown_template_raises", test_codegen_unknown_template_raises)
-    _run("codegen_variant_macros_hook", test_codegen_variant_macros_hook)
-    _run("cutlass_gemm_emitter_or_skip", test_cutlass_gemm_emitter_or_skip)
+    run("codegen_import", test_codegen_import)
+    run("codegen_templates_dir", test_codegen_templates_dir)
+    run("codegen_template_count", test_codegen_template_count)
+    run("codegen_jinja2_probe", test_codegen_jinja2_or_skip)
+    run("codegen_adamw_sm90_renders", test_codegen_adamw_sm90_renders)
+    run("codegen_emit_returns_path", test_codegen_emit_returns_path)
+    run("codegen_nvcc_dryrun_graceful", test_codegen_nvcc_dryrun_graceful)
+    run("codegen_find_template_fallback", test_codegen_find_template_fallback)
+    run("codegen_unknown_template_raises", test_codegen_unknown_template_raises)
+    run("codegen_variant_macros_hook", test_codegen_variant_macros_hook)
+    run("cutlass_gemm_emitter_or_skip", test_cutlass_gemm_emitter_or_skip)
 
     def test_codegen_all_optimizers_emit():
         """Every optimizer × {sm_90a, generic CUDA, gfx942, pallas} must render."""
@@ -12703,9 +12860,14 @@ def _self_test() -> int:
             f"{len(failures)} (optimizer, arch) pairs failed to render:\n  "
             + "\n  ".join(failures))
 
-    _run("codegen_all_optimizers_emit", test_codegen_all_optimizers_emit)
+    run("codegen_all_optimizers_emit", test_codegen_all_optimizers_emit)
 
     # ── Stream 12: toolchain bootstrap ──────────────────────────────
+
+def _self_test_toolchain_bootstrap(run) -> None:
+    """`[self-test] toolchain_bootstrap` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] toolchain_bootstrap\n")
 
     def test_bootstrap_helpers_importable():
@@ -12884,20 +13046,25 @@ def _self_test() -> int:
             f"(full preflight: {lines})"
         )
 
-    _run("resolve_default_arch_torch_cuda",
+    run("resolve_default_arch_torch_cuda",
          test_resolve_default_arch_torch_cuda)
-    _run("resolve_default_arch_from_config",
+    run("resolve_default_arch_from_config",
          test_resolve_default_arch_from_config)
-    _run("preflight_suggestion_on_cuda_version_fail",
+    run("preflight_suggestion_on_cuda_version_fail",
          test_preflight_suggestion_on_cuda_version_fail)
-    _run("bootstrap_helpers_importable", test_bootstrap_helpers_importable)
-    _run("target_version_lookup", test_target_version_lookup)
-    _run("cuda_target_respects_arch_min", test_cuda_target_respects_arch_min)
-    _run("preflight_emits_judgment_per_arch",
+    run("bootstrap_helpers_importable", test_bootstrap_helpers_importable)
+    run("target_version_lookup", test_target_version_lookup)
+    run("cuda_target_respects_arch_min", test_cuda_target_respects_arch_min)
+    run("preflight_emits_judgment_per_arch",
          test_preflight_emits_judgment_per_arch)
-    _run("bootstrap_toolchain_dispatch_no_crash",
+    run("bootstrap_toolchain_dispatch_no_crash",
          test_bootstrap_toolchain_dispatch_no_crash)
 
+
+def _self_test_dry_run_all_archs(run) -> None:
+    """`[self-test] dry_run_all_archs` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] dry_run_all_archs\n")
 
     def test_dry_run_all_archs():
@@ -12936,8 +13103,13 @@ def _self_test() -> int:
                 payload = json.loads(sidecar.read_text())
                 assert payload["arch"] == arch
 
-    _run("dry_run_all_archs", test_dry_run_all_archs)
+    run("dry_run_all_archs", test_dry_run_all_archs)
 
+
+def _self_test_pallas(run) -> None:
+    """`[self-test] pallas` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] pallas\n")
 
     def test_pallas_timer_importable_without_jax():
@@ -13002,11 +13174,16 @@ def _self_test() -> int:
                                         _DummyReport())
             assert str(out) == "pallas-noop"
 
-    _run("pallas_timer_importable", test_pallas_timer_importable_without_jax)
-    _run("pallas_build_aot_noop", test_pallas_build_aot_noop)
-    _run("pallas_publish_handles_sentinel", test_pallas_publish_handles_sentinel)
+    run("pallas_timer_importable", test_pallas_timer_importable_without_jax)
+    run("pallas_build_aot_noop", test_pallas_build_aot_noop)
+    run("pallas_publish_handles_sentinel", test_pallas_publish_handles_sentinel)
 
     # ── Stream 10 — numerical / differential validation ──────────────
+
+def _self_test_numerical_validation(run) -> None:
+    """`[self-test] numerical_validation` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] numerical_validation\n")
 
     def test_compare_outputs_tolerant():
@@ -13122,19 +13299,24 @@ def _self_test() -> int:
         finally:
             _LAST_NUMERICAL_STATUS.pop(ck, None)
 
-    _run("tolerances_table_shape", test_tolerances_table_shape)
-    _run("compare_outputs_tolerant", test_compare_outputs_tolerant)
-    _run("compare_outputs_numerical_fail", test_compare_outputs_fail)
-    _run("compare_outputs_deterministic", test_compare_outputs_deterministic)
-    _run("compare_outputs_shape_mismatch", test_compare_outputs_shape_mismatch)
-    _run("pick_winner_excludes_numerical_fail",
+    run("tolerances_table_shape", test_tolerances_table_shape)
+    run("compare_outputs_tolerant", test_compare_outputs_tolerant)
+    run("compare_outputs_numerical_fail", test_compare_outputs_fail)
+    run("compare_outputs_deterministic", test_compare_outputs_deterministic)
+    run("compare_outputs_shape_mismatch", test_compare_outputs_shape_mismatch)
+    run("pick_winner_excludes_numerical_fail",
          test_pick_winner_filters_numerical_fail)
-    _run("pick_winner_strict_requires_deterministic",
+    run("pick_winner_strict_requires_deterministic",
          test_pick_winner_strict_returns_none_when_no_deterministic)
-    _run("make_trial_record_propagates_numerical_status",
+    run("make_trial_record_propagates_numerical_status",
          test_make_trial_record_pulls_numerical_status)
 
     # ── Stream B — polyhedral / loop-transform layer ────────────────
+
+def _self_test_polyhedral(run) -> None:
+    """`[self-test] polyhedral` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] polyhedral\n")
 
     def test_polyhedral_helpers_importable():
@@ -13146,7 +13328,7 @@ def _self_test() -> int:
         )
         assert LoopNest is not None and Schedule is not None
         assert PolyhedralError is not None
-    _run("polyhedral_helpers_importable", test_polyhedral_helpers_importable)
+    run("polyhedral_helpers_importable", test_polyhedral_helpers_importable)
 
     def test_polyhedral_schedule_enumeration_2d_loop():
         """Synthetic 2D loop nest with no dependences: enumerator yields
@@ -13174,7 +13356,7 @@ def _self_test() -> int:
                 assert ax in ln.parallel_axes, \
                     f"sched {s} parallelizes non-parallel axis {ax}"
 
-    _run("polyhedral_schedule_enumeration_2d_loop",
+    run("polyhedral_schedule_enumeration_2d_loop",
          test_polyhedral_schedule_enumeration_2d_loop)
 
     def test_polyhedral_skips_when_libclang_absent():
@@ -13191,7 +13373,7 @@ def _self_test() -> int:
             assert result is None or isinstance(result, LoopNest), result
         finally:
             p.unlink()
-    _run("polyhedral_skips_when_libclang_absent",
+    run("polyhedral_skips_when_libclang_absent",
          test_polyhedral_skips_when_libclang_absent)
 
     def test_polyhedral_apply_schedule_simple():
@@ -13224,7 +13406,7 @@ def _self_test() -> int:
         # (inner+outer index combination) somewhere in the emitted code.
         # This was the placeholder-detection strengthening from γ.5.
         assert "+" in src, "expected '+' operator in tiled schedule body"
-    _run("polyhedral_apply_schedule_simple",
+    run("polyhedral_apply_schedule_simple",
          test_polyhedral_apply_schedule_simple)
 
     def test_polyhedral_apply_schedule_honest_libclang_fallback():
@@ -13252,13 +13434,18 @@ def _self_test() -> int:
             in src, f"missing libclang-absent comment in:\n{src}"
         # Identity-copy fallback still produced so the source compiles.
         assert "out[_idx]" in src and "in[_idx]" in src, src
-    _run("polyhedral_apply_schedule_honest_libclang_fallback",
+    run("polyhedral_apply_schedule_honest_libclang_fallback",
          test_polyhedral_apply_schedule_honest_libclang_fallback)
 
     # Stream D — generative / structural codegen. Five tests covering
     # OpGraph construction + topo sort, elementwise lowering on CUDA,
     # adamw_update pattern across (cuda, hip, pallas), and the CK
     # GEMM emitter's import-lazy skip path.
+
+def _self_test_synth_codegen(run) -> None:
+    """`[self-test] synth_codegen` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] synth_codegen\n")
 
     def test_synth_codegen_helpers_importable():
@@ -13277,7 +13464,7 @@ def _self_test() -> int:
         assert hasattr(_cg, "synthesize_kernel")
         assert callable(pattern_adamw_update)
         assert callable(pattern_reduce_broadcast)
-    _run("synth_codegen_helpers_importable",
+    run("synth_codegen_helpers_importable",
          test_synth_codegen_helpers_importable)
 
     def test_synth_opgraph_construction_and_topo():
@@ -13297,7 +13484,7 @@ def _self_test() -> int:
         topo = g.topological_order()
         names = [n.name for n in topo]
         assert names == ["add", "sum"], names
-    _run("synth_opgraph_construction_and_topo",
+    run("synth_opgraph_construction_and_topo",
          test_synth_opgraph_construction_and_topo)
 
     def test_synth_elementwise_lowers_to_cuda():
@@ -13336,7 +13523,7 @@ def _self_test() -> int:
         src2 = synthesize_kernel(g2, "sm_90a", "fp32", (1024,))
         assert "a * b + c" in src2, \
             f"expected `a * b + c` verbatim in emitted source:\n{src2}"
-    _run("synth_elementwise_lowers_to_cuda",
+    run("synth_elementwise_lowers_to_cuda",
          test_synth_elementwise_lowers_to_cuda)
 
     def test_synth_adamw_pattern_lowers_per_vendor():
@@ -13383,7 +13570,7 @@ def _self_test() -> int:
             assert mnemonic in src, (
                 f"{arch}: expected MMA opcode {mnemonic!r} "
                 f"in emitted source; got first 400 chars:\n{src[:400]}")
-    _run("synth_adamw_pattern_lowers_per_vendor",
+    run("synth_adamw_pattern_lowers_per_vendor",
          test_synth_adamw_pattern_lowers_per_vendor)
 
     def test_synth_ck_emitter_skip_path():
@@ -13413,10 +13600,15 @@ def _self_test() -> int:
                         "expected SynthCodegenError when CK is absent")
                 except SynthCodegenError as exc:
                     assert "composable_kernel" in str(exc).lower()
-    _run("synth_ck_emitter_skip_path", test_synth_ck_emitter_skip_path)
+    run("synth_ck_emitter_skip_path", test_synth_ck_emitter_skip_path)
 
     # Stream H — final wrapper: only runs the e2e smoke when a GPU is
     # visible; SKIPs cleanly (and counts as PASS) otherwise.
+
+def _self_test_e2e_smoke(run) -> None:
+    """`[self-test] e2e_smoke` section."""
+    import shutil
+    import tempfile
     sys.stdout.write("[self-test] e2e_smoke (gated on GPU availability)\n")
 
     def test_e2e_smoke_gated():
@@ -13434,10 +13626,56 @@ def _self_test() -> int:
             rc = _e2e_smoke(Path(td), max_seconds=60)
             assert rc == 0, f"_e2e_smoke returned {rc}"
 
-    _run("e2e_smoke_gated", test_e2e_smoke_gated)
+    run("e2e_smoke_gated", test_e2e_smoke_gated)
+
+
+def _self_test() -> int:
+    """Run inline self-checks. Returns 0 on success, 1 on failure.
+
+    δ.1: thin orchestrator — every ``[self-test] <section>`` is owned by
+    its own ``_self_test_<section>`` helper above. This function owns
+    only the PASS/FAIL counters, the ``run`` closure that wraps each
+    test, and the final summary line.
+    """
+    failures = 0
+    passed = 0
+
+    def _run(name, fn):
+        nonlocal failures, passed
+        try:
+            fn()
+            sys.stdout.write(f"  PASS: {name}\n")
+            passed += 1
+        except Exception as exc:
+            sys.stdout.write(f"  FAIL: {name}: {exc}\n")
+            failures += 1
+
+    _self_test_search_space(_run)
+    _self_test_pgo(_run)
+    _self_test_device_profiling(_run)
+    _self_test_flags(_run)
+    _self_test_bayesian(_run)
+    _self_test_early_stopping(_run)
+    _self_test_cost_model(_run)
+    _self_test_cache(_run)
+    _self_test_multi_gpu_pool(_run)
+    _self_test_kernel_headers(_run)
+    _self_test_arch_table(_run)
+    _self_test_kernel_registry(_run)
+    _self_test_compile_config(_run)
+    _self_test_portability(_run)
+    _self_test_codegen(_run)
+    _self_test_toolchain_bootstrap(_run)
+    _self_test_dry_run_all_archs(_run)
+    _self_test_pallas(_run)
+    _self_test_numerical_validation(_run)
+    _self_test_polyhedral(_run)
+    _self_test_synth_codegen(_run)
+    _self_test_e2e_smoke(_run)
 
     sys.stdout.write(f"\n[self-test] {passed} passed, {failures} failed\n")
-    return 1 if failures else 0
+    return 0 if failures == 0 else 1
+
 
 
 # ==============================================================================
@@ -13457,9 +13695,13 @@ import re as _re_consolidated  # used by toml fallback parser + nsys stall parse
 # Bundled Jinja2 templates (formerly grokking_optimizers/templates/*.j2)
 # ------------------------------------------------------------------------------
 
-_BUNDLED_TEMPLATES: Dict[str, str] = {
-    "adamw_sm_90a.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   AdamW
+# Base templates — Jinja2 source with `__OPT_*__` placeholders filled in
+# at module load time by ``_build_bundled_templates``. The Jinja2 syntax
+# (``{{ ... }}``, ``{% ... %}``) is untouched by the placeholder
+# substitution and is interpreted by Jinja2 at codegen time.
+
+_TEMPLATE_BASE_SM_90A = r'''// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
+// Optimizer:   __OPT_DISPLAY__
 // Arch:        {{ arch }} ({{ display_name }})
 // Vendor:      {{ vendor }}
 // Generated config (baked in at template-render time):
@@ -13494,24 +13736,16 @@ _BUNDLED_TEMPLATES: Dict[str, str] = {
 #define SG_ASYNC_DEPTH  {{ async_depth }}
 {% endif %}
 
-// The actual per-element AdamW math + grid-stride loop primitives live
+// The actual per-element __OPT_DISPLAY__ math + grid-stride loop primitives live
 // in the project headers below; the emitted source only injects the
 // tuned constants so the compiler can specialise the kernel body.
-#include "csrc/algorithms/adamw.h"
+#include "__OPT_HEADER__"
 
 namespace sg::sm90 {
 
-// Tuned launch bounds — the compiler uses this to pick a register
-// budget that fits SG_BLOCK_SIZE warps without spilling.
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
+__OPT_SM90_EXTRA_COMMENT__template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
 __global__ __launch_bounds__(BlockSize)
-void adamw_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ g,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
+__OPT_KERNEL_SIG__
     constexpr int kVec = VecWidth;
     const int gid = blockIdx.x * BlockSize + threadIdx.x;
     const int stride = BlockSize * gridDim.x;
@@ -13521,30 +13755,25 @@ void adamw_step_kernel(float* __restrict__ p,
         for (int k = 0; k < kVec; ++k) {
             const int idx = i + k;
             if (idx >= n) break;
-            adamw_step_elem(p + idx, m + idx, v + idx, g[idx],
-                            lr, beta1, beta2, eps, wd, bc1, bc2);
+            __OPT_ELEM_CALL__
         }
     }
 }
 
-extern "C" void launch_adamw_step(float* p, float* m, float* v,
-                                  const float* g, float lr, float beta1,
-                                  float beta2, float eps, float wd,
-                                  float bc1, float bc2, int n,
+extern "C" void launch___OPT_NAME___step(__OPT_LAUNCH_SIG__
                                   cudaStream_t stream) {
     const int threads = SG_BLOCK_SIZE;
     const int items_per_block = threads * SG_VEC_WIDTH;
     const int blocks = (n + items_per_block - 1) / items_per_block;
-    adamw_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>
-        <<<blocks, threads, 0, stream>>>(p, m, v, g, lr, beta1, beta2,
-                                         eps, wd, bc1, bc2, n);
+    __OPT_NAME___step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>
+        <<<blocks, threads, 0, stream>>>(__OPT_SM90_ARGS__);
 }
 
 } // namespace sg::sm90
-""",
+'''
 
-    "adamw_generic.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   AdamW (generic CUDA fallback)
+_TEMPLATE_BASE_GENERIC = r'''// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
+// Optimizer:   __OPT_DISPLAY__ (generic CUDA fallback)
 // Arch:        {{ arch }} ({{ display_name }})
 // Vendor:      {{ vendor }}
 //
@@ -13562,18 +13791,12 @@ extern "C" void launch_adamw_step(float* p, float* m, float* v,
 #define SG_VEC_WIDTH   {{ vec | default(4) }}
 #define SG_UNROLL      {{ unroll | default(4) }}
 
-#include "csrc/algorithms/adamw.h"
+#include "__OPT_HEADER__"
 
 namespace sg::generic {
 
 __global__ __launch_bounds__(SG_BLOCK_SIZE)
-void adamw_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ g,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
+__OPT_KERNEL_SIG__
     const int gid = blockIdx.x * SG_BLOCK_SIZE + threadIdx.x;
     const int stride = SG_BLOCK_SIZE * gridDim.x;
     #pragma unroll SG_UNROLL
@@ -13582,29 +13805,24 @@ void adamw_step_kernel(float* __restrict__ p,
         for (int k = 0; k < SG_VEC_WIDTH; ++k) {
             const int idx = i + k;
             if (idx >= n) break;
-            adamw_step_elem(p + idx, m + idx, v + idx, g[idx],
-                            lr, beta1, beta2, eps, wd, bc1, bc2);
+            __OPT_ELEM_CALL__
         }
     }
 }
 
-extern "C" void launch_adamw_step(float* p, float* m, float* v,
-                                  const float* g, float lr, float beta1,
-                                  float beta2, float eps, float wd,
-                                  float bc1, float bc2, int n,
+extern "C" void launch___OPT_NAME___step(__OPT_LAUNCH_SIG__
                                   cudaStream_t stream) {
     const int threads = SG_BLOCK_SIZE;
     const int items_per_block = threads * SG_VEC_WIDTH;
     const int blocks = (n + items_per_block - 1) / items_per_block;
-    adamw_step_kernel<<<blocks, threads, 0, stream>>>(
-        p, m, v, g, lr, beta1, beta2, eps, wd, bc1, bc2, n);
+    __OPT_NAME___step_kernel<<<blocks, threads, 0, stream>>>(__OPT_GENERIC_ARGS__);
 }
 
 } // namespace sg::generic
-""",
+'''
 
-    "adamw_gfx942.hip.cpp.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   AdamW
+_TEMPLATE_BASE_GFX942 = r'''// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
+// Optimizer:   __OPT_DISPLAY__
 // Arch:        {{ arch }} ({{ display_name }})
 // Vendor:      {{ vendor }}
 // Wavefront:   {{ warp_size }} lanes (CDNA3)
@@ -13639,19 +13857,13 @@ extern "C" void launch_adamw_step(float* p, float* m, float* v,
 {% endif %}
 
 #include <hip/hip_runtime.h>
-#include "csrc/algorithms/adamw.h"
+#include "__OPT_HEADER__"
 
 namespace sg::gfx942 {
 
 template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
 __global__ __launch_bounds__(BlockSize)
-void adamw_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ g,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
+__OPT_KERNEL_SIG__
     const int gid = blockIdx.x * BlockSize + threadIdx.x;
     const int stride = BlockSize * gridDim.x;
     #pragma unroll SG_UNROLL
@@ -13660,31 +13872,27 @@ void adamw_step_kernel(float* __restrict__ p,
         for (int k = 0; k < VecWidth; ++k) {
             const int idx = i + k;
             if (idx >= n) break;
-            adamw_step_elem(p + idx, m + idx, v + idx, g[idx],
-                            lr, beta1, beta2, eps, wd, bc1, bc2);
+            __OPT_ELEM_CALL__
         }
     }
 }
 
-extern "C" void launch_adamw_step(float* p, float* m, float* v,
-                                  const float* g, float lr, float beta1,
-                                  float beta2, float eps, float wd,
-                                  float bc1, float bc2, int n,
+extern "C" void launch___OPT_NAME___step(__OPT_LAUNCH_SIG__
                                   hipStream_t stream) {
     const int threads = SG_BLOCK_SIZE;
     const int items_per_block = threads * SG_VEC_WIDTH;
     const int blocks = (n + items_per_block - 1) / items_per_block;
     hipLaunchKernelGGL(
-        (adamw_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>),
+        (__OPT_NAME___step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>),
         dim3(blocks), dim3(threads), 0, stream,
-        p, m, v, g, lr, beta1, beta2, eps, wd, bc1, bc2, n);
+        __OPT_GFX942_ARGS__);
 }
 
 } // namespace sg::gfx942
-""",
+'''
 
-    "adamw_pallas.py.j2": r'''# AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-# Optimizer:   AdamW
+_TEMPLATE_BASE_PALLAS = r'''# AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
+# Optimizer:   __OPT_DISPLAY__
 # Arch:        {{ arch }} ({{ display_name }})
 # Vendor:      {{ vendor }} (JAX/Pallas — TPU target)
 #
@@ -13706,11 +13914,65 @@ SG_VEC_WIDTH = {{ vec | default(4) }}
 SG_UNROLL = {{ unroll | default(4) }}
 
 
-def _adamw_step_pallas_kernel(p_ref, m_ref, g_ref, lr, beta1, beta2,
-                              eps, wd, bc1, bc2,
-                              p_out_ref, m_out_ref, v_out_ref):
+def ___OPT_NAME___step_pallas_kernel(__OPT_PALLAS_KERNEL_PARAMS__):
     """Per-block Pallas kernel — runs on one TPU core's HBM slice."""
-    p = p_ref[...]
+__OPT_PALLAS_MATH__
+
+
+def launch___OPT_NAME___step(__OPT_PALLAS_LAUNCH_PARAMS__):
+    """JIT-compiled __OPT_DISPLAY__ step. Block size = {{ block | default(128) }}."""
+    grid = (max(1, p.size // SG_BLOCK_SIZE),)
+    fn = pl.pallas_call(
+        lambda *a: ___OPT_NAME___step_pallas_kernel(*a, __OPT_PALLAS_LAMBDA_TAIL__),
+        out_shape=[
+__OPT_PALLAS_OUT_SHAPES__
+        ],
+        grid=grid,
+    )
+    return fn(__OPT_PALLAS_FN_ARGS__)
+'''
+
+_ADAMW_SM90_EXTRA_COMMENT = (
+    "// Tuned launch bounds — the compiler uses this to pick a register\n"
+    "// budget that fits SG_BLOCK_SIZE warps without spilling.\n"
+)
+
+# Per-optimizer template specs. ORDER MATTERS — it sets the insertion
+# order of the final ``_BUNDLED_TEMPLATES`` dict. Each spec carries the
+# optimizer-specific slot fillers; the 4 base templates above + the wrap
+# helpers below assemble the final 44-entry dict.
+_OPTIMIZER_TEMPLATE_SPECS = [
+    dict(
+        name='adamw',
+        display='AdamW',
+        header='csrc/algorithms/adamw.h',
+        sm90_extra_comment=_ADAMW_SM90_EXTRA_COMMENT,
+        kernel_param_lines=[
+            'float* __restrict__ p,',
+            'float* __restrict__ m,',
+            'float* __restrict__ v,',
+            'const float* __restrict__ g,',
+            'float lr, float beta1, float beta2,',
+            'float eps, float wd, float bc1, float bc2,',
+        ],
+        elem_call=r'''adamw_step_elem(p + idx, m + idx, v + idx, g[idx],
+                            lr, beta1, beta2, eps, wd, bc1, bc2);''',
+        launch_indent=34,
+        launch_param_lines=[
+            'float* p, float* m, float* v,',
+            'const float* g, float lr, float beta1,',
+            'float beta2, float eps, float wd,',
+            'float bc1, float bc2, int n,',
+        ],
+        sm90_args=r'''p, m, v, g, lr, beta1, beta2,
+                                         eps, wd, bc1, bc2, n''',
+        generic_args=r'''
+        p, m, v, g, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        gfx942_args=r'''p, m, v, g, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        pallas_kernel_params=r'''p_ref, m_ref, g_ref, lr, beta1, beta2,
+                              eps, wd, bc1, bc2,
+                              p_out_ref, m_out_ref, v_out_ref''',
+        pallas_math=r'''    p = p_ref[...]
     m = m_ref[...]
     g = g_ref[...]
     new_m = beta1 * m + (1.0 - beta1) * g
@@ -13720,260 +13982,40 @@ def _adamw_step_pallas_kernel(p_ref, m_ref, g_ref, lr, beta1, beta2,
     new_p = p - lr * (m_hat / (jnp.sqrt(v_hat) + eps) + wd * p)
     p_out_ref[...] = new_p
     m_out_ref[...] = new_m
-    v_out_ref[...] = new_v
-
-
-def launch_adamw_step(p, m, v, g, lr, beta1, beta2, eps, wd, bc1, bc2):
-    """JIT-compiled AdamW step. Block size = {{ block | default(128) }}."""
-    grid = (max(1, p.size // SG_BLOCK_SIZE),)
-    fn = pl.pallas_call(
-        lambda *a: _adamw_step_pallas_kernel(*a, lr, beta1, beta2,
-                                              eps, wd, bc1, bc2),
-        out_shape=[
-            jax.ShapeDtypeStruct(p.shape, p.dtype),
+    v_out_ref[...] = new_v''',
+        pallas_launch_params=r'''p, m, v, g, lr, beta1, beta2, eps, wd, bc1, bc2''',
+        pallas_lambda_tail=r'''lr, beta1, beta2,
+                                              eps, wd, bc1, bc2''',
+        pallas_out_shapes=r'''            jax.ShapeDtypeStruct(p.shape, p.dtype),
             jax.ShapeDtypeStruct(m.shape, m.dtype),
-            jax.ShapeDtypeStruct(v.shape, v.dtype),
+            jax.ShapeDtypeStruct(v.shape, v.dtype),''',
+        pallas_fn_args=r'''p, m, g''',
+    ),
+    dict(
+        name='lion',
+        display='Lion',
+        header='csrc/algorithms/lion.h',
+        sm90_extra_comment="",
+        kernel_param_lines=[
+            'float* __restrict__ p,',
+            'float* __restrict__ m,',
+            'const float* __restrict__ g,',
+            'float lr, float beta1, float beta2,',
+            'float wd,',
         ],
-        grid=grid,
-    )
-    return fn(p, m, g)
-''',
-    "lion_sm_90a.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   Lion
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Generated config (baked in at template-render time):
-//   block        = {{ block }}
-//   vec          = {{ vec }}
-//   unroll       = {{ unroll }}
-//   num_stages   = {{ num_stages | default(2) }}
-{% if 'cluster_shape' in config %}
-//   cluster_shape = {{ cluster_shape }}
-{% endif %}
-{% if 'swizzle' in config %}
-//   swizzle      = {{ swizzle }}
-{% endif %}
-//
-// Hopper-specific knobs auto-emitted from the arch features
-// ({{ features | join(', ') }})
-{% if 'wgmma' in features %}
-#define SG_USE_WGMMA 1
-{% endif %}
-{% if 'tma' in features %}
-#define SG_USE_TMA 1
-{% endif %}
-{% if 'cluster' in features %}
-#define SG_USE_CLUSTER 1
-{% endif %}
-
-#define SG_BLOCK_SIZE   {{ block }}
-#define SG_VEC_WIDTH    {{ vec }}
-#define SG_UNROLL       {{ unroll }}
-#define SG_NUM_STAGES   {{ num_stages | default(2) }}
-{% if 'async_depth' in config %}
-#define SG_ASYNC_DEPTH  {{ async_depth }}
-{% endif %}
-
-// The actual per-element Lion math + grid-stride loop primitives live
-// in the project headers below; the emitted source only injects the
-// tuned constants so the compiler can specialise the kernel body.
-#include "csrc/algorithms/lion.h"
-
-namespace sg::sm90 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void lion_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       const float* __restrict__ g,
-                       float lr, float beta1, float beta2,
-                       float wd,
-                       int n) {
-    constexpr int kVec = VecWidth;
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * kVec; i < n; i += stride * kVec) {
-        #pragma unroll
-        for (int k = 0; k < kVec; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            lion_step_elem(p + idx, m + idx, g[idx], lr, beta1, beta2, wd);
-        }
-    }
-}
-
-extern "C" void launch_lion_step(float* p, float* m, const float* g,
-                                 float lr, float beta1, float beta2,
-                                 float wd, int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    lion_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>
-        <<<blocks, threads, 0, stream>>>(p, m, g, lr, beta1, beta2, wd, n);
-}
-
-} // namespace sg::sm90
-""",
-    "lion_generic.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   Lion (generic CUDA fallback)
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-//
-// This template targets pre-Hopper CUDA (sm_75 / sm_80 / sm_86 / sm_89).
-// No TMA, wgmma, or cluster launch — just a clean block-strided loop
-// with the autotuned block / vec / unroll constants baked in.
-//
-// Tuned config:
-//   block      = {{ block | default(256) }}
-//   vec        = {{ vec | default(4) }}
-//   unroll     = {{ unroll | default(4) }}
-//   num_stages = {{ num_stages | default(2) }}
-
-#define SG_BLOCK_SIZE  {{ block | default(256) }}
-#define SG_VEC_WIDTH   {{ vec | default(4) }}
-#define SG_UNROLL      {{ unroll | default(4) }}
-
-#include "csrc/algorithms/lion.h"
-
-namespace sg::generic {
-
-__global__ __launch_bounds__(SG_BLOCK_SIZE)
-void lion_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       const float* __restrict__ g,
-                       float lr, float beta1, float beta2,
-                       float wd,
-                       int n) {
-    const int gid = blockIdx.x * SG_BLOCK_SIZE + threadIdx.x;
-    const int stride = SG_BLOCK_SIZE * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * SG_VEC_WIDTH; i < n; i += stride * SG_VEC_WIDTH) {
-        #pragma unroll
-        for (int k = 0; k < SG_VEC_WIDTH; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            lion_step_elem(p + idx, m + idx, g[idx], lr, beta1, beta2, wd);
-        }
-    }
-}
-
-extern "C" void launch_lion_step(float* p, float* m, const float* g,
-                                 float lr, float beta1, float beta2,
-                                 float wd, int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    lion_step_kernel<<<blocks, threads, 0, stream>>>(p, m, g, lr, beta1, beta2, wd, n);
-}
-
-} // namespace sg::generic
-""",
-    "lion_gfx942.hip.cpp.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   Lion
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Wavefront:   {{ warp_size }} lanes (CDNA3)
-//
-// Tuned config:
-//   block          = {{ block }}
-//   vec            = {{ vec }}
-//   unroll         = {{ unroll }}
-//   num_stages     = {{ num_stages | default(2) }}
-{% if 'waves_per_eu' in config %}
-//   waves_per_eu   = {{ waves_per_eu }}
-{% endif %}
-{% if 'lds_padding' in config %}
-//   lds_padding    = {{ lds_padding }}
-{% endif %}
-{% if 'mfma_shape' in config %}
-//   mfma_shape     = {{ mfma_shape }}
-{% endif %}
-{% if 'scheduler_hint' in config %}
-//   scheduler_hint = {{ scheduler_hint }}
-{% endif %}
-
-#define SG_BLOCK_SIZE  {{ block }}
-#define SG_VEC_WIDTH   {{ vec }}
-#define SG_UNROLL      {{ unroll }}
-#define SG_NUM_STAGES  {{ num_stages | default(2) }}
-{% if 'mfma' in features %}
-#define SG_USE_MFMA 1
-{% endif %}
-{% if 'fp8_mfma' in features %}
-#define SG_USE_FP8_MFMA 1
-{% endif %}
-
-#include <hip/hip_runtime.h>
-#include "csrc/algorithms/lion.h"
-
-namespace sg::gfx942 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void lion_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       const float* __restrict__ g,
-                       float lr, float beta1, float beta2,
-                       float wd,
-                       int n) {
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * VecWidth; i < n; i += stride * VecWidth) {
-        #pragma unroll
-        for (int k = 0; k < VecWidth; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            lion_step_elem(p + idx, m + idx, g[idx], lr, beta1, beta2, wd);
-        }
-    }
-}
-
-extern "C" void launch_lion_step(float* p, float* m, const float* g,
-                                 float lr, float beta1, float beta2,
-                                 float wd, int n,
-                                  hipStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    hipLaunchKernelGGL(
-        (lion_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>),
-        dim3(blocks), dim3(threads), 0, stream,
-        p, m, g, lr, beta1, beta2, wd, n);
-}
-
-} // namespace sg::gfx942
-""",
-    "lion_pallas.py.j2": r'''# AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-# Optimizer:   Lion
-# Arch:        {{ arch }} ({{ display_name }})
-# Vendor:      {{ vendor }} (JAX/Pallas — TPU target)
-#
-# Tuned config baked into the Pallas kernel call:
-#   block      = {{ block | default(128) }}
-#   vec        = {{ vec | default(4) }}
-#   unroll     = {{ unroll | default(4) }}
-{% if 'num_stages' in config %}
-#   num_stages = {{ num_stages }}
-{% endif %}
-
-import jax
-import jax.numpy as jnp
-from jax.experimental import pallas as pl
-
-
-SG_BLOCK_SIZE = {{ block | default(128) }}
-SG_VEC_WIDTH = {{ vec | default(4) }}
-SG_UNROLL = {{ unroll | default(4) }}
-
-
-def _lion_step_pallas_kernel(p_ref, m_ref, g_ref, lr, beta1, beta2, wd,
-                              p_out_ref, m_out_ref):
-    """Per-block Pallas kernel — runs on one TPU core's HBM slice."""
-    p = p_ref[...]
+        elem_call=r'''lion_step_elem(p + idx, m + idx, g[idx], lr, beta1, beta2, wd);''',
+        launch_indent=33,
+        launch_param_lines=[
+            'float* p, float* m, const float* g,',
+            'float lr, float beta1, float beta2,',
+            'float wd, int n,',
+        ],
+        sm90_args=r'''p, m, g, lr, beta1, beta2, wd, n''',
+        generic_args=r'''p, m, g, lr, beta1, beta2, wd, n''',
+        gfx942_args=r'''p, m, g, lr, beta1, beta2, wd, n''',
+        pallas_kernel_params=r'''p_ref, m_ref, g_ref, lr, beta1, beta2, wd,
+                              p_out_ref, m_out_ref''',
+        pallas_math=r'''    p = p_ref[...]
     m = m_ref[...]
     g = g_ref[...]
     interp = beta1 * m + (1.0 - beta1) * g
@@ -13981,531 +14023,81 @@ def _lion_step_pallas_kernel(p_ref, m_ref, g_ref, lr, beta1, beta2, wd,
     new_p = p - lr * (s + wd * p)
     new_m = beta2 * m + (1.0 - beta2) * g
     p_out_ref[...] = new_p
-    m_out_ref[...] = new_m
-
-
-def launch_lion_step(p, m, g, lr, beta1, beta2, wd):
-    """JIT-compiled Lion step. Block size = {{ block | default(128) }}."""
-    grid = (max(1, p.size // SG_BLOCK_SIZE),)
-    fn = pl.pallas_call(
-        lambda *a: _lion_step_pallas_kernel(*a, lr, beta1, beta2, wd),
-        out_shape=[
-            jax.ShapeDtypeStruct(p.shape, p.dtype),
-            jax.ShapeDtypeStruct(m.shape, m.dtype),
+    m_out_ref[...] = new_m''',
+        pallas_launch_params=r'''p, m, g, lr, beta1, beta2, wd''',
+        pallas_lambda_tail=r'''lr, beta1, beta2, wd''',
+        pallas_out_shapes=r'''            jax.ShapeDtypeStruct(p.shape, p.dtype),
+            jax.ShapeDtypeStruct(m.shape, m.dtype),''',
+        pallas_fn_args=r'''p, m, g''',
+    ),
+    dict(
+        name='muon',
+        display='Muon',
+        header='csrc/algorithms/muon.h',
+        sm90_extra_comment="",
+        kernel_param_lines=[
+            'float* __restrict__ p,',
+            'float* __restrict__ m,',
+            'const float* __restrict__ g,',
+            'float lr, float momentum,',
+            'float wd, float inv_norm,',
         ],
-        grid=grid,
-    )
-    return fn(p, m, g)
-''',
-    "muon_sm_90a.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   Muon
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Generated config (baked in at template-render time):
-//   block        = {{ block }}
-//   vec          = {{ vec }}
-//   unroll       = {{ unroll }}
-//   num_stages   = {{ num_stages | default(2) }}
-{% if 'cluster_shape' in config %}
-//   cluster_shape = {{ cluster_shape }}
-{% endif %}
-{% if 'swizzle' in config %}
-//   swizzle      = {{ swizzle }}
-{% endif %}
-//
-// Hopper-specific knobs auto-emitted from the arch features
-// ({{ features | join(', ') }})
-{% if 'wgmma' in features %}
-#define SG_USE_WGMMA 1
-{% endif %}
-{% if 'tma' in features %}
-#define SG_USE_TMA 1
-{% endif %}
-{% if 'cluster' in features %}
-#define SG_USE_CLUSTER 1
-{% endif %}
-
-#define SG_BLOCK_SIZE   {{ block }}
-#define SG_VEC_WIDTH    {{ vec }}
-#define SG_UNROLL       {{ unroll }}
-#define SG_NUM_STAGES   {{ num_stages | default(2) }}
-{% if 'async_depth' in config %}
-#define SG_ASYNC_DEPTH  {{ async_depth }}
-{% endif %}
-
-// The actual per-element Muon math + grid-stride loop primitives live
-// in the project headers below; the emitted source only injects the
-// tuned constants so the compiler can specialise the kernel body.
-#include "csrc/algorithms/muon.h"
-
-namespace sg::sm90 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void muon_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       const float* __restrict__ g,
-                       float lr, float momentum,
-                       float wd, float inv_norm,
-                       int n) {
-    constexpr int kVec = VecWidth;
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * kVec; i < n; i += stride * kVec) {
-        #pragma unroll
-        for (int k = 0; k < kVec; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            muon_step_elem(p + idx, m + idx, g[idx], lr, momentum, wd, inv_norm);
-        }
-    }
-}
-
-extern "C" void launch_muon_step(float* p, float* m, const float* g,
-                                 float lr, float momentum,
-                                 float wd, float inv_norm, int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    muon_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>
-        <<<blocks, threads, 0, stream>>>(p, m, g, lr, momentum, wd, inv_norm, n);
-}
-
-} // namespace sg::sm90
-""",
-    "muon_generic.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   Muon (generic CUDA fallback)
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-//
-// This template targets pre-Hopper CUDA (sm_75 / sm_80 / sm_86 / sm_89).
-// No TMA, wgmma, or cluster launch — just a clean block-strided loop
-// with the autotuned block / vec / unroll constants baked in.
-//
-// Tuned config:
-//   block      = {{ block | default(256) }}
-//   vec        = {{ vec | default(4) }}
-//   unroll     = {{ unroll | default(4) }}
-//   num_stages = {{ num_stages | default(2) }}
-
-#define SG_BLOCK_SIZE  {{ block | default(256) }}
-#define SG_VEC_WIDTH   {{ vec | default(4) }}
-#define SG_UNROLL      {{ unroll | default(4) }}
-
-#include "csrc/algorithms/muon.h"
-
-namespace sg::generic {
-
-__global__ __launch_bounds__(SG_BLOCK_SIZE)
-void muon_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       const float* __restrict__ g,
-                       float lr, float momentum,
-                       float wd, float inv_norm,
-                       int n) {
-    const int gid = blockIdx.x * SG_BLOCK_SIZE + threadIdx.x;
-    const int stride = SG_BLOCK_SIZE * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * SG_VEC_WIDTH; i < n; i += stride * SG_VEC_WIDTH) {
-        #pragma unroll
-        for (int k = 0; k < SG_VEC_WIDTH; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            muon_step_elem(p + idx, m + idx, g[idx], lr, momentum, wd, inv_norm);
-        }
-    }
-}
-
-extern "C" void launch_muon_step(float* p, float* m, const float* g,
-                                 float lr, float momentum,
-                                 float wd, float inv_norm, int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    muon_step_kernel<<<blocks, threads, 0, stream>>>(p, m, g, lr, momentum, wd, inv_norm, n);
-}
-
-} // namespace sg::generic
-""",
-    "muon_gfx942.hip.cpp.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   Muon
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Wavefront:   {{ warp_size }} lanes (CDNA3)
-//
-// Tuned config:
-//   block          = {{ block }}
-//   vec            = {{ vec }}
-//   unroll         = {{ unroll }}
-//   num_stages     = {{ num_stages | default(2) }}
-{% if 'waves_per_eu' in config %}
-//   waves_per_eu   = {{ waves_per_eu }}
-{% endif %}
-{% if 'lds_padding' in config %}
-//   lds_padding    = {{ lds_padding }}
-{% endif %}
-{% if 'mfma_shape' in config %}
-//   mfma_shape     = {{ mfma_shape }}
-{% endif %}
-{% if 'scheduler_hint' in config %}
-//   scheduler_hint = {{ scheduler_hint }}
-{% endif %}
-
-#define SG_BLOCK_SIZE  {{ block }}
-#define SG_VEC_WIDTH   {{ vec }}
-#define SG_UNROLL      {{ unroll }}
-#define SG_NUM_STAGES  {{ num_stages | default(2) }}
-{% if 'mfma' in features %}
-#define SG_USE_MFMA 1
-{% endif %}
-{% if 'fp8_mfma' in features %}
-#define SG_USE_FP8_MFMA 1
-{% endif %}
-
-#include <hip/hip_runtime.h>
-#include "csrc/algorithms/muon.h"
-
-namespace sg::gfx942 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void muon_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       const float* __restrict__ g,
-                       float lr, float momentum,
-                       float wd, float inv_norm,
-                       int n) {
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * VecWidth; i < n; i += stride * VecWidth) {
-        #pragma unroll
-        for (int k = 0; k < VecWidth; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            muon_step_elem(p + idx, m + idx, g[idx], lr, momentum, wd, inv_norm);
-        }
-    }
-}
-
-extern "C" void launch_muon_step(float* p, float* m, const float* g,
-                                 float lr, float momentum,
-                                 float wd, float inv_norm, int n,
-                                  hipStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    hipLaunchKernelGGL(
-        (muon_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>),
-        dim3(blocks), dim3(threads), 0, stream,
-        p, m, g, lr, momentum, wd, inv_norm, n);
-}
-
-} // namespace sg::gfx942
-""",
-    "muon_pallas.py.j2": r'''# AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-# Optimizer:   Muon
-# Arch:        {{ arch }} ({{ display_name }})
-# Vendor:      {{ vendor }} (JAX/Pallas — TPU target)
-#
-# Tuned config baked into the Pallas kernel call:
-#   block      = {{ block | default(128) }}
-#   vec        = {{ vec | default(4) }}
-#   unroll     = {{ unroll | default(4) }}
-{% if 'num_stages' in config %}
-#   num_stages = {{ num_stages }}
-{% endif %}
-
-import jax
-import jax.numpy as jnp
-from jax.experimental import pallas as pl
-
-
-SG_BLOCK_SIZE = {{ block | default(128) }}
-SG_VEC_WIDTH = {{ vec | default(4) }}
-SG_UNROLL = {{ unroll | default(4) }}
-
-
-def _muon_step_pallas_kernel(p_ref, m_ref, g_ref, lr, momentum, wd, inv_norm,
-                              p_out_ref, m_out_ref):
-    """Per-block Pallas kernel — runs on one TPU core's HBM slice."""
-    p = p_ref[...]
+        elem_call=r'''muon_step_elem(p + idx, m + idx, g[idx], lr, momentum, wd, inv_norm);''',
+        launch_indent=33,
+        launch_param_lines=[
+            'float* p, float* m, const float* g,',
+            'float lr, float momentum,',
+            'float wd, float inv_norm, int n,',
+        ],
+        sm90_args=r'''p, m, g, lr, momentum, wd, inv_norm, n''',
+        generic_args=r'''p, m, g, lr, momentum, wd, inv_norm, n''',
+        gfx942_args=r'''p, m, g, lr, momentum, wd, inv_norm, n''',
+        pallas_kernel_params=r'''p_ref, m_ref, g_ref, lr, momentum, wd, inv_norm,
+                              p_out_ref, m_out_ref''',
+        pallas_math=r'''    p = p_ref[...]
     m = m_ref[...]
     g = g_ref[...]
     new_m = momentum * m + g
     update = new_m * inv_norm
     new_p = p - lr * (update + wd * p)
     p_out_ref[...] = new_p
-    m_out_ref[...] = new_m
-
-
-def launch_muon_step(p, m, g, lr, momentum, wd, inv_norm):
-    """JIT-compiled Muon step. Block size = {{ block | default(128) }}."""
-    grid = (max(1, p.size // SG_BLOCK_SIZE),)
-    fn = pl.pallas_call(
-        lambda *a: _muon_step_pallas_kernel(*a, lr, momentum, wd, inv_norm),
-        out_shape=[
-            jax.ShapeDtypeStruct(p.shape, p.dtype),
-            jax.ShapeDtypeStruct(m.shape, m.dtype),
+    m_out_ref[...] = new_m''',
+        pallas_launch_params=r'''p, m, g, lr, momentum, wd, inv_norm''',
+        pallas_lambda_tail=r'''lr, momentum, wd, inv_norm''',
+        pallas_out_shapes=r'''            jax.ShapeDtypeStruct(p.shape, p.dtype),
+            jax.ShapeDtypeStruct(m.shape, m.dtype),''',
+        pallas_fn_args=r'''p, m, g''',
+    ),
+    dict(
+        name='prodigy',
+        display='Prodigy',
+        header='csrc/algorithms/prodigy.h',
+        sm90_extra_comment="",
+        kernel_param_lines=[
+            'float* __restrict__ p,',
+            'float* __restrict__ m,',
+            'float* __restrict__ v,',
+            'const float* __restrict__ p0,',
+            'const float* __restrict__ g,',
+            'float lr, float beta1, float beta2,',
+            'float eps, float wd, float d, float d_denom,',
         ],
-        grid=grid,
-    )
-    return fn(p, m, g)
-''',
-    "prodigy_sm_90a.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   Prodigy
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Generated config (baked in at template-render time):
-//   block        = {{ block }}
-//   vec          = {{ vec }}
-//   unroll       = {{ unroll }}
-//   num_stages   = {{ num_stages | default(2) }}
-{% if 'cluster_shape' in config %}
-//   cluster_shape = {{ cluster_shape }}
-{% endif %}
-{% if 'swizzle' in config %}
-//   swizzle      = {{ swizzle }}
-{% endif %}
-//
-// Hopper-specific knobs auto-emitted from the arch features
-// ({{ features | join(', ') }})
-{% if 'wgmma' in features %}
-#define SG_USE_WGMMA 1
-{% endif %}
-{% if 'tma' in features %}
-#define SG_USE_TMA 1
-{% endif %}
-{% if 'cluster' in features %}
-#define SG_USE_CLUSTER 1
-{% endif %}
-
-#define SG_BLOCK_SIZE   {{ block }}
-#define SG_VEC_WIDTH    {{ vec }}
-#define SG_UNROLL       {{ unroll }}
-#define SG_NUM_STAGES   {{ num_stages | default(2) }}
-{% if 'async_depth' in config %}
-#define SG_ASYNC_DEPTH  {{ async_depth }}
-{% endif %}
-
-// The actual per-element Prodigy math + grid-stride loop primitives live
-// in the project headers below; the emitted source only injects the
-// tuned constants so the compiler can specialise the kernel body.
-#include "csrc/algorithms/prodigy.h"
-
-namespace sg::sm90 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void prodigy_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ p0,
-                       const float* __restrict__ g,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float d, float d_denom,
-                       int n) {
-    constexpr int kVec = VecWidth;
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * kVec; i < n; i += stride * kVec) {
-        #pragma unroll
-        for (int k = 0; k < kVec; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            prodigy_step_elem(p + idx, m + idx, v + idx, p0[idx], g[idx],
-                              lr, beta1, beta2, eps, wd, d, d_denom);
-        }
-    }
-}
-
-extern "C" void launch_prodigy_step(float* p, float* m, float* v,
-                                 const float* p0, const float* g,
-                                 float lr, float beta1, float beta2,
-                                 float eps, float wd, float d,
-                                 float d_denom, int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    prodigy_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>
-        <<<blocks, threads, 0, stream>>>(p, m, v, p0, g, lr, beta1, beta2, eps, wd, d, d_denom, n);
-}
-
-} // namespace sg::sm90
-""",
-    "prodigy_generic.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   Prodigy (generic CUDA fallback)
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-//
-// This template targets pre-Hopper CUDA (sm_75 / sm_80 / sm_86 / sm_89).
-// No TMA, wgmma, or cluster launch — just a clean block-strided loop
-// with the autotuned block / vec / unroll constants baked in.
-//
-// Tuned config:
-//   block      = {{ block | default(256) }}
-//   vec        = {{ vec | default(4) }}
-//   unroll     = {{ unroll | default(4) }}
-//   num_stages = {{ num_stages | default(2) }}
-
-#define SG_BLOCK_SIZE  {{ block | default(256) }}
-#define SG_VEC_WIDTH   {{ vec | default(4) }}
-#define SG_UNROLL      {{ unroll | default(4) }}
-
-#include "csrc/algorithms/prodigy.h"
-
-namespace sg::generic {
-
-__global__ __launch_bounds__(SG_BLOCK_SIZE)
-void prodigy_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ p0,
-                       const float* __restrict__ g,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float d, float d_denom,
-                       int n) {
-    const int gid = blockIdx.x * SG_BLOCK_SIZE + threadIdx.x;
-    const int stride = SG_BLOCK_SIZE * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * SG_VEC_WIDTH; i < n; i += stride * SG_VEC_WIDTH) {
-        #pragma unroll
-        for (int k = 0; k < SG_VEC_WIDTH; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            prodigy_step_elem(p + idx, m + idx, v + idx, p0[idx], g[idx],
-                              lr, beta1, beta2, eps, wd, d, d_denom);
-        }
-    }
-}
-
-extern "C" void launch_prodigy_step(float* p, float* m, float* v,
-                                 const float* p0, const float* g,
-                                 float lr, float beta1, float beta2,
-                                 float eps, float wd, float d,
-                                 float d_denom, int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    prodigy_step_kernel<<<blocks, threads, 0, stream>>>(p, m, v, p0, g, lr, beta1, beta2, eps, wd, d, d_denom, n);
-}
-
-} // namespace sg::generic
-""",
-    "prodigy_gfx942.hip.cpp.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   Prodigy
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Wavefront:   {{ warp_size }} lanes (CDNA3)
-//
-// Tuned config:
-//   block          = {{ block }}
-//   vec            = {{ vec }}
-//   unroll         = {{ unroll }}
-//   num_stages     = {{ num_stages | default(2) }}
-{% if 'waves_per_eu' in config %}
-//   waves_per_eu   = {{ waves_per_eu }}
-{% endif %}
-{% if 'lds_padding' in config %}
-//   lds_padding    = {{ lds_padding }}
-{% endif %}
-{% if 'mfma_shape' in config %}
-//   mfma_shape     = {{ mfma_shape }}
-{% endif %}
-{% if 'scheduler_hint' in config %}
-//   scheduler_hint = {{ scheduler_hint }}
-{% endif %}
-
-#define SG_BLOCK_SIZE  {{ block }}
-#define SG_VEC_WIDTH   {{ vec }}
-#define SG_UNROLL      {{ unroll }}
-#define SG_NUM_STAGES  {{ num_stages | default(2) }}
-{% if 'mfma' in features %}
-#define SG_USE_MFMA 1
-{% endif %}
-{% if 'fp8_mfma' in features %}
-#define SG_USE_FP8_MFMA 1
-{% endif %}
-
-#include <hip/hip_runtime.h>
-#include "csrc/algorithms/prodigy.h"
-
-namespace sg::gfx942 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void prodigy_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ p0,
-                       const float* __restrict__ g,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float d, float d_denom,
-                       int n) {
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * VecWidth; i < n; i += stride * VecWidth) {
-        #pragma unroll
-        for (int k = 0; k < VecWidth; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            prodigy_step_elem(p + idx, m + idx, v + idx, p0[idx], g[idx],
-                              lr, beta1, beta2, eps, wd, d, d_denom);
-        }
-    }
-}
-
-extern "C" void launch_prodigy_step(float* p, float* m, float* v,
-                                 const float* p0, const float* g,
-                                 float lr, float beta1, float beta2,
-                                 float eps, float wd, float d,
-                                 float d_denom, int n,
-                                  hipStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    hipLaunchKernelGGL(
-        (prodigy_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>),
-        dim3(blocks), dim3(threads), 0, stream,
-        p, m, v, p0, g, lr, beta1, beta2, eps, wd, d, d_denom, n);
-}
-
-} // namespace sg::gfx942
-""",
-    "prodigy_pallas.py.j2": r'''# AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-# Optimizer:   Prodigy
-# Arch:        {{ arch }} ({{ display_name }})
-# Vendor:      {{ vendor }} (JAX/Pallas — TPU target)
-#
-# Tuned config baked into the Pallas kernel call:
-#   block      = {{ block | default(128) }}
-#   vec        = {{ vec | default(4) }}
-#   unroll     = {{ unroll | default(4) }}
-{% if 'num_stages' in config %}
-#   num_stages = {{ num_stages }}
-{% endif %}
-
-import jax
-import jax.numpy as jnp
-from jax.experimental import pallas as pl
-
-
-SG_BLOCK_SIZE = {{ block | default(128) }}
-SG_VEC_WIDTH = {{ vec | default(4) }}
-SG_UNROLL = {{ unroll | default(4) }}
-
-
-def _prodigy_step_pallas_kernel(p_ref, m_ref, v_ref, g_ref, p0_ref, lr, beta1, beta2, eps, wd, d, d_denom,
-                              p_out_ref, m_out_ref, v_out_ref):
-    """Per-block Pallas kernel — runs on one TPU core's HBM slice."""
-    p = p_ref[...]
+        elem_call=r'''prodigy_step_elem(p + idx, m + idx, v + idx, p0[idx], g[idx],
+                              lr, beta1, beta2, eps, wd, d, d_denom);''',
+        launch_indent=33,
+        launch_param_lines=[
+            'float* p, float* m, float* v,',
+            'const float* p0, const float* g,',
+            'float lr, float beta1, float beta2,',
+            'float eps, float wd, float d,',
+            'float d_denom, int n,',
+        ],
+        sm90_args=r'''p, m, v, p0, g, lr, beta1, beta2, eps, wd, d, d_denom, n''',
+        generic_args=r'''p, m, v, p0, g, lr, beta1, beta2, eps, wd, d, d_denom, n''',
+        gfx942_args=r'''p, m, v, p0, g, lr, beta1, beta2, eps, wd, d, d_denom, n''',
+        pallas_kernel_params=r'''p_ref, m_ref, v_ref, g_ref, p0_ref, lr, beta1, beta2, eps, wd, d, d_denom,
+                              p_out_ref, m_out_ref, v_out_ref''',
+        pallas_math=r'''    p = p_ref[...]
     m = m_ref[...]
     v = v_ref[...]
     g = g_ref[...]
@@ -14515,280 +14107,46 @@ def _prodigy_step_pallas_kernel(p_ref, m_ref, v_ref, g_ref, p0_ref, lr, beta1, b
     new_p = p - lr * d * (update + wd * p)
     p_out_ref[...] = new_p
     m_out_ref[...] = new_m
-    v_out_ref[...] = new_v
-
-
-def launch_prodigy_step(p, m, v, g, p0, lr, beta1, beta2, eps, wd, d, d_denom):
-    """JIT-compiled Prodigy step. Block size = {{ block | default(128) }}."""
-    grid = (max(1, p.size // SG_BLOCK_SIZE),)
-    fn = pl.pallas_call(
-        lambda *a: _prodigy_step_pallas_kernel(*a, lr, beta1, beta2, eps, wd, d, d_denom),
-        out_shape=[
-            jax.ShapeDtypeStruct(p.shape, p.dtype),
+    v_out_ref[...] = new_v''',
+        pallas_launch_params=r'''p, m, v, g, p0, lr, beta1, beta2, eps, wd, d, d_denom''',
+        pallas_lambda_tail=r'''lr, beta1, beta2, eps, wd, d, d_denom''',
+        pallas_out_shapes=r'''            jax.ShapeDtypeStruct(p.shape, p.dtype),
             jax.ShapeDtypeStruct(m.shape, m.dtype),
-            jax.ShapeDtypeStruct(v.shape, v.dtype),
+            jax.ShapeDtypeStruct(v.shape, v.dtype),''',
+        pallas_fn_args=r'''p, m, v, g, p0''',
+    ),
+    dict(
+        name='grokadamw',
+        display='GrokAdamW',
+        header='csrc/algorithms/grokadamw.h',
+        sm90_extra_comment="",
+        kernel_param_lines=[
+            'float* __restrict__ p,',
+            'float* __restrict__ m,',
+            'float* __restrict__ v,',
+            'float* __restrict__ ema,',
+            'const float* __restrict__ g,',
+            'float alpha, float lamb,',
+            'float lr, float beta1, float beta2,',
+            'float eps, float wd, float bc1, float bc2,',
         ],
-        grid=grid,
-    )
-    return fn(p, m, v, g, p0)
-''',
-    "grokadamw_sm_90a.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   GrokAdamW
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Generated config (baked in at template-render time):
-//   block        = {{ block }}
-//   vec          = {{ vec }}
-//   unroll       = {{ unroll }}
-//   num_stages   = {{ num_stages | default(2) }}
-{% if 'cluster_shape' in config %}
-//   cluster_shape = {{ cluster_shape }}
-{% endif %}
-{% if 'swizzle' in config %}
-//   swizzle      = {{ swizzle }}
-{% endif %}
-//
-// Hopper-specific knobs auto-emitted from the arch features
-// ({{ features | join(', ') }})
-{% if 'wgmma' in features %}
-#define SG_USE_WGMMA 1
-{% endif %}
-{% if 'tma' in features %}
-#define SG_USE_TMA 1
-{% endif %}
-{% if 'cluster' in features %}
-#define SG_USE_CLUSTER 1
-{% endif %}
-
-#define SG_BLOCK_SIZE   {{ block }}
-#define SG_VEC_WIDTH    {{ vec }}
-#define SG_UNROLL       {{ unroll }}
-#define SG_NUM_STAGES   {{ num_stages | default(2) }}
-{% if 'async_depth' in config %}
-#define SG_ASYNC_DEPTH  {{ async_depth }}
-{% endif %}
-
-// The actual per-element GrokAdamW math + grid-stride loop primitives live
-// in the project headers below; the emitted source only injects the
-// tuned constants so the compiler can specialise the kernel body.
-#include "csrc/algorithms/grokadamw.h"
-
-namespace sg::sm90 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void grokadamw_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       float* __restrict__ ema,
-                       const float* __restrict__ g,
-                       float alpha, float lamb,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
-    constexpr int kVec = VecWidth;
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * kVec; i < n; i += stride * kVec) {
-        #pragma unroll
-        for (int k = 0; k < kVec; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            grokadamw_step_elem(p + idx, m + idx, v + idx, ema + idx, g[idx],
+        elem_call=r'''grokadamw_step_elem(p + idx, m + idx, v + idx, ema + idx, g[idx],
                                 alpha, lamb, lr, beta1, beta2,
-                                eps, wd, bc1, bc2);
-        }
-    }
-}
-
-extern "C" void launch_grokadamw_step(float* p, float* m, float* v, float* ema,
-                                     const float* g, float alpha, float lamb,
-                                     float lr, float beta1, float beta2,
-                                     float eps, float wd, float bc1, float bc2,
-                                     int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    grokadamw_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>
-        <<<blocks, threads, 0, stream>>>(p, m, v, ema, g, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2, n);
-}
-
-} // namespace sg::sm90
-""",
-    "grokadamw_generic.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   GrokAdamW (generic CUDA fallback)
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-//
-// This template targets pre-Hopper CUDA (sm_75 / sm_80 / sm_86 / sm_89).
-// No TMA, wgmma, or cluster launch — just a clean block-strided loop
-// with the autotuned block / vec / unroll constants baked in.
-//
-// Tuned config:
-//   block      = {{ block | default(256) }}
-//   vec        = {{ vec | default(4) }}
-//   unroll     = {{ unroll | default(4) }}
-//   num_stages = {{ num_stages | default(2) }}
-
-#define SG_BLOCK_SIZE  {{ block | default(256) }}
-#define SG_VEC_WIDTH   {{ vec | default(4) }}
-#define SG_UNROLL      {{ unroll | default(4) }}
-
-#include "csrc/algorithms/grokadamw.h"
-
-namespace sg::generic {
-
-__global__ __launch_bounds__(SG_BLOCK_SIZE)
-void grokadamw_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       float* __restrict__ ema,
-                       const float* __restrict__ g,
-                       float alpha, float lamb,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
-    const int gid = blockIdx.x * SG_BLOCK_SIZE + threadIdx.x;
-    const int stride = SG_BLOCK_SIZE * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * SG_VEC_WIDTH; i < n; i += stride * SG_VEC_WIDTH) {
-        #pragma unroll
-        for (int k = 0; k < SG_VEC_WIDTH; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            grokadamw_step_elem(p + idx, m + idx, v + idx, ema + idx, g[idx],
-                                alpha, lamb, lr, beta1, beta2,
-                                eps, wd, bc1, bc2);
-        }
-    }
-}
-
-extern "C" void launch_grokadamw_step(float* p, float* m, float* v, float* ema,
-                                     const float* g, float alpha, float lamb,
-                                     float lr, float beta1, float beta2,
-                                     float eps, float wd, float bc1, float bc2,
-                                     int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    grokadamw_step_kernel<<<blocks, threads, 0, stream>>>(p, m, v, ema, g, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2, n);
-}
-
-} // namespace sg::generic
-""",
-    "grokadamw_gfx942.hip.cpp.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   GrokAdamW
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Wavefront:   {{ warp_size }} lanes (CDNA3)
-//
-// Tuned config:
-//   block          = {{ block }}
-//   vec            = {{ vec }}
-//   unroll         = {{ unroll }}
-//   num_stages     = {{ num_stages | default(2) }}
-{% if 'waves_per_eu' in config %}
-//   waves_per_eu   = {{ waves_per_eu }}
-{% endif %}
-{% if 'lds_padding' in config %}
-//   lds_padding    = {{ lds_padding }}
-{% endif %}
-{% if 'mfma_shape' in config %}
-//   mfma_shape     = {{ mfma_shape }}
-{% endif %}
-{% if 'scheduler_hint' in config %}
-//   scheduler_hint = {{ scheduler_hint }}
-{% endif %}
-
-#define SG_BLOCK_SIZE  {{ block }}
-#define SG_VEC_WIDTH   {{ vec }}
-#define SG_UNROLL      {{ unroll }}
-#define SG_NUM_STAGES  {{ num_stages | default(2) }}
-{% if 'mfma' in features %}
-#define SG_USE_MFMA 1
-{% endif %}
-{% if 'fp8_mfma' in features %}
-#define SG_USE_FP8_MFMA 1
-{% endif %}
-
-#include <hip/hip_runtime.h>
-#include "csrc/algorithms/grokadamw.h"
-
-namespace sg::gfx942 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void grokadamw_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       float* __restrict__ ema,
-                       const float* __restrict__ g,
-                       float alpha, float lamb,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * VecWidth; i < n; i += stride * VecWidth) {
-        #pragma unroll
-        for (int k = 0; k < VecWidth; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            grokadamw_step_elem(p + idx, m + idx, v + idx, ema + idx, g[idx],
-                                alpha, lamb, lr, beta1, beta2,
-                                eps, wd, bc1, bc2);
-        }
-    }
-}
-
-extern "C" void launch_grokadamw_step(float* p, float* m, float* v, float* ema,
-                                     const float* g, float alpha, float lamb,
-                                     float lr, float beta1, float beta2,
-                                     float eps, float wd, float bc1, float bc2,
-                                     int n,
-                                  hipStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    hipLaunchKernelGGL(
-        (grokadamw_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>),
-        dim3(blocks), dim3(threads), 0, stream,
-        p, m, v, ema, g, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2, n);
-}
-
-} // namespace sg::gfx942
-""",
-    "grokadamw_pallas.py.j2": r'''# AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-# Optimizer:   GrokAdamW
-# Arch:        {{ arch }} ({{ display_name }})
-# Vendor:      {{ vendor }} (JAX/Pallas — TPU target)
-#
-# Tuned config baked into the Pallas kernel call:
-#   block      = {{ block | default(128) }}
-#   vec        = {{ vec | default(4) }}
-#   unroll     = {{ unroll | default(4) }}
-{% if 'num_stages' in config %}
-#   num_stages = {{ num_stages }}
-{% endif %}
-
-import jax
-import jax.numpy as jnp
-from jax.experimental import pallas as pl
-
-
-SG_BLOCK_SIZE = {{ block | default(128) }}
-SG_VEC_WIDTH = {{ vec | default(4) }}
-SG_UNROLL = {{ unroll | default(4) }}
-
-
-def _grokadamw_step_pallas_kernel(p_ref, m_ref, v_ref, ema_ref, g_ref, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2,
-                              p_out_ref, m_out_ref, v_out_ref, ema_out_ref):
-    """Per-block Pallas kernel — runs on one TPU core's HBM slice."""
-    p = p_ref[...]
+                                eps, wd, bc1, bc2);''',
+        launch_indent=37,
+        launch_param_lines=[
+            'float* p, float* m, float* v, float* ema,',
+            'const float* g, float alpha, float lamb,',
+            'float lr, float beta1, float beta2,',
+            'float eps, float wd, float bc1, float bc2,',
+            'int n,',
+        ],
+        sm90_args=r'''p, m, v, ema, g, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        generic_args=r'''p, m, v, ema, g, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        gfx942_args=r'''p, m, v, ema, g, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        pallas_kernel_params=r'''p_ref, m_ref, v_ref, ema_ref, g_ref, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2,
+                              p_out_ref, m_out_ref, v_out_ref, ema_out_ref''',
+        pallas_math=r'''    p = p_ref[...]
     m = m_ref[...]
     v = v_ref[...]
     ema = ema_ref[...]
@@ -14803,281 +14161,47 @@ def _grokadamw_step_pallas_kernel(p_ref, m_ref, v_ref, ema_ref, g_ref, alpha, la
     p_out_ref[...] = new_p
     m_out_ref[...] = new_m
     v_out_ref[...] = new_v
-    ema_out_ref[...] = new_ema
-
-
-def launch_grokadamw_step(p, m, v, ema, g, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2):
-    """JIT-compiled GrokAdamW step. Block size = {{ block | default(128) }}."""
-    grid = (max(1, p.size // SG_BLOCK_SIZE),)
-    fn = pl.pallas_call(
-        lambda *a: _grokadamw_step_pallas_kernel(*a, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2),
-        out_shape=[
-            jax.ShapeDtypeStruct(p.shape, p.dtype),
+    ema_out_ref[...] = new_ema''',
+        pallas_launch_params=r'''p, m, v, ema, g, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2''',
+        pallas_lambda_tail=r'''alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2''',
+        pallas_out_shapes=r'''            jax.ShapeDtypeStruct(p.shape, p.dtype),
             jax.ShapeDtypeStruct(m.shape, m.dtype),
             jax.ShapeDtypeStruct(v.shape, v.dtype),
-            jax.ShapeDtypeStruct(ema.shape, ema.dtype),
+            jax.ShapeDtypeStruct(ema.shape, ema.dtype),''',
+        pallas_fn_args=r'''p, m, v, ema, g''',
+    ),
+    dict(
+        name='grokfast',
+        display='Grokfast',
+        header='csrc/algorithms/grokfast.h',
+        sm90_extra_comment="",
+        kernel_param_lines=[
+            'float* __restrict__ p,',
+            'float* __restrict__ m,',
+            'float* __restrict__ v,',
+            'float* __restrict__ ema,',
+            'const float* __restrict__ g,',
+            'float alpha, float lamb,',
+            'float lr, float beta1, float beta2,',
+            'float eps, float wd, float bc1, float bc2,',
         ],
-        grid=grid,
-    )
-    return fn(p, m, v, ema, g)
-''',
-    "grokfast_sm_90a.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   Grokfast
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Generated config (baked in at template-render time):
-//   block        = {{ block }}
-//   vec          = {{ vec }}
-//   unroll       = {{ unroll }}
-//   num_stages   = {{ num_stages | default(2) }}
-{% if 'cluster_shape' in config %}
-//   cluster_shape = {{ cluster_shape }}
-{% endif %}
-{% if 'swizzle' in config %}
-//   swizzle      = {{ swizzle }}
-{% endif %}
-//
-// Hopper-specific knobs auto-emitted from the arch features
-// ({{ features | join(', ') }})
-{% if 'wgmma' in features %}
-#define SG_USE_WGMMA 1
-{% endif %}
-{% if 'tma' in features %}
-#define SG_USE_TMA 1
-{% endif %}
-{% if 'cluster' in features %}
-#define SG_USE_CLUSTER 1
-{% endif %}
-
-#define SG_BLOCK_SIZE   {{ block }}
-#define SG_VEC_WIDTH    {{ vec }}
-#define SG_UNROLL       {{ unroll }}
-#define SG_NUM_STAGES   {{ num_stages | default(2) }}
-{% if 'async_depth' in config %}
-#define SG_ASYNC_DEPTH  {{ async_depth }}
-{% endif %}
-
-// The actual per-element Grokfast math + grid-stride loop primitives live
-// in the project headers below; the emitted source only injects the
-// tuned constants so the compiler can specialise the kernel body.
-#include "csrc/algorithms/grokfast.h"
-
-namespace sg::sm90 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void grokfast_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       float* __restrict__ ema,
-                       const float* __restrict__ g,
-                       float alpha, float lamb,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
-    constexpr int kVec = VecWidth;
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * kVec; i < n; i += stride * kVec) {
-        #pragma unroll
-        for (int k = 0; k < kVec; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            grokfast_step_elem(p + idx, m + idx, v + idx, ema + idx, g[idx],
+        elem_call=r'''grokfast_step_elem(p + idx, m + idx, v + idx, ema + idx, g[idx],
                                alpha, lamb, lr, beta1, beta2,
-                               eps, wd, bc1, bc2);
-        }
-    }
-}
-
-extern "C" void launch_grokfast_step(float* p, float* m, float* v, float* ema,
-                                    const float* g, float alpha, float lamb,
-                                    float lr, float beta1, float beta2,
-                                    float eps, float wd, float bc1, float bc2,
-                                    int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    grokfast_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>
-        <<<blocks, threads, 0, stream>>>(p, m, v, ema, g, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2, n);
-}
-
-} // namespace sg::sm90
-""",
-    "grokfast_generic.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   Grokfast (generic CUDA fallback)
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-//
-// This template targets pre-Hopper CUDA (sm_75 / sm_80 / sm_86 / sm_89).
-// No TMA, wgmma, or cluster launch — just a clean block-strided loop
-// with the autotuned block / vec / unroll constants baked in.
-//
-// Tuned config:
-//   block      = {{ block | default(256) }}
-//   vec        = {{ vec | default(4) }}
-//   unroll     = {{ unroll | default(4) }}
-//   num_stages = {{ num_stages | default(2) }}
-
-#define SG_BLOCK_SIZE  {{ block | default(256) }}
-#define SG_VEC_WIDTH   {{ vec | default(4) }}
-#define SG_UNROLL      {{ unroll | default(4) }}
-
-#include "csrc/algorithms/grokfast.h"
-
-namespace sg::generic {
-
-__global__ __launch_bounds__(SG_BLOCK_SIZE)
-void grokfast_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       float* __restrict__ ema,
-                       const float* __restrict__ g,
-                       float alpha, float lamb,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
-    const int gid = blockIdx.x * SG_BLOCK_SIZE + threadIdx.x;
-    const int stride = SG_BLOCK_SIZE * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * SG_VEC_WIDTH; i < n; i += stride * SG_VEC_WIDTH) {
-        #pragma unroll
-        for (int k = 0; k < SG_VEC_WIDTH; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            grokfast_step_elem(p + idx, m + idx, v + idx, ema + idx, g[idx],
-                               alpha, lamb, lr, beta1, beta2,
-                               eps, wd, bc1, bc2);
-        }
-    }
-}
-
-extern "C" void launch_grokfast_step(float* p, float* m, float* v, float* ema,
-                                    const float* g, float alpha, float lamb,
-                                    float lr, float beta1, float beta2,
-                                    float eps, float wd, float bc1, float bc2,
-                                    int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    grokfast_step_kernel<<<blocks, threads, 0, stream>>>(p, m, v, ema, g, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2, n);
-}
-
-} // namespace sg::generic
-""",
-    "grokfast_gfx942.hip.cpp.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   Grokfast
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Wavefront:   {{ warp_size }} lanes (CDNA3)
-//
-// Tuned config:
-//   block          = {{ block }}
-//   vec            = {{ vec }}
-//   unroll         = {{ unroll }}
-//   num_stages     = {{ num_stages | default(2) }}
-{% if 'waves_per_eu' in config %}
-//   waves_per_eu   = {{ waves_per_eu }}
-{% endif %}
-{% if 'lds_padding' in config %}
-//   lds_padding    = {{ lds_padding }}
-{% endif %}
-{% if 'mfma_shape' in config %}
-//   mfma_shape     = {{ mfma_shape }}
-{% endif %}
-{% if 'scheduler_hint' in config %}
-//   scheduler_hint = {{ scheduler_hint }}
-{% endif %}
-
-#define SG_BLOCK_SIZE  {{ block }}
-#define SG_VEC_WIDTH   {{ vec }}
-#define SG_UNROLL      {{ unroll }}
-#define SG_NUM_STAGES  {{ num_stages | default(2) }}
-{% if 'mfma' in features %}
-#define SG_USE_MFMA 1
-{% endif %}
-{% if 'fp8_mfma' in features %}
-#define SG_USE_FP8_MFMA 1
-{% endif %}
-
-#include <hip/hip_runtime.h>
-#include "csrc/algorithms/grokfast.h"
-
-namespace sg::gfx942 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void grokfast_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       float* __restrict__ ema,
-                       const float* __restrict__ g,
-                       float alpha, float lamb,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * VecWidth; i < n; i += stride * VecWidth) {
-        #pragma unroll
-        for (int k = 0; k < VecWidth; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            grokfast_step_elem(p + idx, m + idx, v + idx, ema + idx, g[idx],
-                               alpha, lamb, lr, beta1, beta2,
-                               eps, wd, bc1, bc2);
-        }
-    }
-}
-
-extern "C" void launch_grokfast_step(float* p, float* m, float* v, float* ema,
-                                    const float* g, float alpha, float lamb,
-                                    float lr, float beta1, float beta2,
-                                    float eps, float wd, float bc1, float bc2,
-                                    int n,
-                                  hipStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    hipLaunchKernelGGL(
-        (grokfast_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>),
-        dim3(blocks), dim3(threads), 0, stream,
-        p, m, v, ema, g, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2, n);
-}
-
-} // namespace sg::gfx942
-""",
-    "grokfast_pallas.py.j2": r'''# AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-# Optimizer:   Grokfast
-# Arch:        {{ arch }} ({{ display_name }})
-# Vendor:      {{ vendor }} (JAX/Pallas — TPU target)
-#
-# Tuned config baked into the Pallas kernel call:
-#   block      = {{ block | default(128) }}
-#   vec        = {{ vec | default(4) }}
-#   unroll     = {{ unroll | default(4) }}
-{% if 'num_stages' in config %}
-#   num_stages = {{ num_stages }}
-{% endif %}
-
-import jax
-import jax.numpy as jnp
-from jax.experimental import pallas as pl
-
-
-SG_BLOCK_SIZE = {{ block | default(128) }}
-SG_VEC_WIDTH = {{ vec | default(4) }}
-SG_UNROLL = {{ unroll | default(4) }}
-
-
-def _grokfast_step_pallas_kernel(p_ref, m_ref, v_ref, ema_ref, g_ref, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2,
-                              p_out_ref, m_out_ref, v_out_ref, ema_out_ref):
-    """Per-block Pallas kernel — runs on one TPU core's HBM slice."""
-    p = p_ref[...]
+                               eps, wd, bc1, bc2);''',
+        launch_indent=36,
+        launch_param_lines=[
+            'float* p, float* m, float* v, float* ema,',
+            'const float* g, float alpha, float lamb,',
+            'float lr, float beta1, float beta2,',
+            'float eps, float wd, float bc1, float bc2,',
+            'int n,',
+        ],
+        sm90_args=r'''p, m, v, ema, g, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        generic_args=r'''p, m, v, ema, g, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        gfx942_args=r'''p, m, v, ema, g, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        pallas_kernel_params=r'''p_ref, m_ref, v_ref, ema_ref, g_ref, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2,
+                              p_out_ref, m_out_ref, v_out_ref, ema_out_ref''',
+        pallas_math=r'''    p = p_ref[...]
     m = m_ref[...]
     v = v_ref[...]
     ema = ema_ref[...]
@@ -15092,281 +14216,47 @@ def _grokfast_step_pallas_kernel(p_ref, m_ref, v_ref, ema_ref, g_ref, alpha, lam
     p_out_ref[...] = new_p
     m_out_ref[...] = new_m
     v_out_ref[...] = new_v
-    ema_out_ref[...] = new_ema
-
-
-def launch_grokfast_step(p, m, v, ema, g, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2):
-    """JIT-compiled Grokfast step. Block size = {{ block | default(128) }}."""
-    grid = (max(1, p.size // SG_BLOCK_SIZE),)
-    fn = pl.pallas_call(
-        lambda *a: _grokfast_step_pallas_kernel(*a, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2),
-        out_shape=[
-            jax.ShapeDtypeStruct(p.shape, p.dtype),
+    ema_out_ref[...] = new_ema''',
+        pallas_launch_params=r'''p, m, v, ema, g, alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2''',
+        pallas_lambda_tail=r'''alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2''',
+        pallas_out_shapes=r'''            jax.ShapeDtypeStruct(p.shape, p.dtype),
             jax.ShapeDtypeStruct(m.shape, m.dtype),
             jax.ShapeDtypeStruct(v.shape, v.dtype),
-            jax.ShapeDtypeStruct(ema.shape, ema.dtype),
+            jax.ShapeDtypeStruct(ema.shape, ema.dtype),''',
+        pallas_fn_args=r'''p, m, v, ema, g''',
+    ),
+    dict(
+        name='looksam',
+        display='LookSAM',
+        header='csrc/algorithms/looksam.h',
+        sm90_extra_comment="",
+        kernel_param_lines=[
+            'float* __restrict__ p,',
+            'float* __restrict__ m,',
+            'float* __restrict__ v,',
+            'const float* __restrict__ g,',
+            'const float* __restrict__ g_sam,',
+            'float lr, float beta1, float beta2,',
+            'float eps, float wd, float bc1, float bc2,',
+            'float alpha_sam,',
         ],
-        grid=grid,
-    )
-    return fn(p, m, v, ema, g)
-''',
-    "looksam_sm_90a.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   LookSAM
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Generated config (baked in at template-render time):
-//   block        = {{ block }}
-//   vec          = {{ vec }}
-//   unroll       = {{ unroll }}
-//   num_stages   = {{ num_stages | default(2) }}
-{% if 'cluster_shape' in config %}
-//   cluster_shape = {{ cluster_shape }}
-{% endif %}
-{% if 'swizzle' in config %}
-//   swizzle      = {{ swizzle }}
-{% endif %}
-//
-// Hopper-specific knobs auto-emitted from the arch features
-// ({{ features | join(', ') }})
-{% if 'wgmma' in features %}
-#define SG_USE_WGMMA 1
-{% endif %}
-{% if 'tma' in features %}
-#define SG_USE_TMA 1
-{% endif %}
-{% if 'cluster' in features %}
-#define SG_USE_CLUSTER 1
-{% endif %}
-
-#define SG_BLOCK_SIZE   {{ block }}
-#define SG_VEC_WIDTH    {{ vec }}
-#define SG_UNROLL       {{ unroll }}
-#define SG_NUM_STAGES   {{ num_stages | default(2) }}
-{% if 'async_depth' in config %}
-#define SG_ASYNC_DEPTH  {{ async_depth }}
-{% endif %}
-
-// The actual per-element LookSAM math + grid-stride loop primitives live
-// in the project headers below; the emitted source only injects the
-// tuned constants so the compiler can specialise the kernel body.
-#include "csrc/algorithms/looksam.h"
-
-namespace sg::sm90 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void looksam_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ g,
-                       const float* __restrict__ g_sam,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       float alpha_sam,
-                       int n) {
-    constexpr int kVec = VecWidth;
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * kVec; i < n; i += stride * kVec) {
-        #pragma unroll
-        for (int k = 0; k < kVec; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            looksam_step_elem(p + idx, m + idx, v + idx, g[idx], g_sam[idx],
+        elem_call=r'''looksam_step_elem(p + idx, m + idx, v + idx, g[idx], g_sam[idx],
                               lr, beta1, beta2, eps, wd,
-                              bc1, bc2, alpha_sam);
-        }
-    }
-}
-
-extern "C" void launch_looksam_step(float* p, float* m, float* v,
-                                  const float* g, const float* g_sam,
-                                  float lr, float beta1, float beta2,
-                                  float eps, float wd, float bc1, float bc2,
-                                  float alpha_sam, int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    looksam_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>
-        <<<blocks, threads, 0, stream>>>(p, m, v, g, g_sam, lr, beta1, beta2, eps, wd, bc1, bc2, alpha_sam, n);
-}
-
-} // namespace sg::sm90
-""",
-    "looksam_generic.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   LookSAM (generic CUDA fallback)
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-//
-// This template targets pre-Hopper CUDA (sm_75 / sm_80 / sm_86 / sm_89).
-// No TMA, wgmma, or cluster launch — just a clean block-strided loop
-// with the autotuned block / vec / unroll constants baked in.
-//
-// Tuned config:
-//   block      = {{ block | default(256) }}
-//   vec        = {{ vec | default(4) }}
-//   unroll     = {{ unroll | default(4) }}
-//   num_stages = {{ num_stages | default(2) }}
-
-#define SG_BLOCK_SIZE  {{ block | default(256) }}
-#define SG_VEC_WIDTH   {{ vec | default(4) }}
-#define SG_UNROLL      {{ unroll | default(4) }}
-
-#include "csrc/algorithms/looksam.h"
-
-namespace sg::generic {
-
-__global__ __launch_bounds__(SG_BLOCK_SIZE)
-void looksam_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ g,
-                       const float* __restrict__ g_sam,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       float alpha_sam,
-                       int n) {
-    const int gid = blockIdx.x * SG_BLOCK_SIZE + threadIdx.x;
-    const int stride = SG_BLOCK_SIZE * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * SG_VEC_WIDTH; i < n; i += stride * SG_VEC_WIDTH) {
-        #pragma unroll
-        for (int k = 0; k < SG_VEC_WIDTH; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            looksam_step_elem(p + idx, m + idx, v + idx, g[idx], g_sam[idx],
-                              lr, beta1, beta2, eps, wd,
-                              bc1, bc2, alpha_sam);
-        }
-    }
-}
-
-extern "C" void launch_looksam_step(float* p, float* m, float* v,
-                                  const float* g, const float* g_sam,
-                                  float lr, float beta1, float beta2,
-                                  float eps, float wd, float bc1, float bc2,
-                                  float alpha_sam, int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    looksam_step_kernel<<<blocks, threads, 0, stream>>>(p, m, v, g, g_sam, lr, beta1, beta2, eps, wd, bc1, bc2, alpha_sam, n);
-}
-
-} // namespace sg::generic
-""",
-    "looksam_gfx942.hip.cpp.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   LookSAM
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Wavefront:   {{ warp_size }} lanes (CDNA3)
-//
-// Tuned config:
-//   block          = {{ block }}
-//   vec            = {{ vec }}
-//   unroll         = {{ unroll }}
-//   num_stages     = {{ num_stages | default(2) }}
-{% if 'waves_per_eu' in config %}
-//   waves_per_eu   = {{ waves_per_eu }}
-{% endif %}
-{% if 'lds_padding' in config %}
-//   lds_padding    = {{ lds_padding }}
-{% endif %}
-{% if 'mfma_shape' in config %}
-//   mfma_shape     = {{ mfma_shape }}
-{% endif %}
-{% if 'scheduler_hint' in config %}
-//   scheduler_hint = {{ scheduler_hint }}
-{% endif %}
-
-#define SG_BLOCK_SIZE  {{ block }}
-#define SG_VEC_WIDTH   {{ vec }}
-#define SG_UNROLL      {{ unroll }}
-#define SG_NUM_STAGES  {{ num_stages | default(2) }}
-{% if 'mfma' in features %}
-#define SG_USE_MFMA 1
-{% endif %}
-{% if 'fp8_mfma' in features %}
-#define SG_USE_FP8_MFMA 1
-{% endif %}
-
-#include <hip/hip_runtime.h>
-#include "csrc/algorithms/looksam.h"
-
-namespace sg::gfx942 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void looksam_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ g,
-                       const float* __restrict__ g_sam,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       float alpha_sam,
-                       int n) {
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * VecWidth; i < n; i += stride * VecWidth) {
-        #pragma unroll
-        for (int k = 0; k < VecWidth; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            looksam_step_elem(p + idx, m + idx, v + idx, g[idx], g_sam[idx],
-                              lr, beta1, beta2, eps, wd,
-                              bc1, bc2, alpha_sam);
-        }
-    }
-}
-
-extern "C" void launch_looksam_step(float* p, float* m, float* v,
-                                  const float* g, const float* g_sam,
-                                  float lr, float beta1, float beta2,
-                                  float eps, float wd, float bc1, float bc2,
-                                  float alpha_sam, int n,
-                                  hipStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    hipLaunchKernelGGL(
-        (looksam_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>),
-        dim3(blocks), dim3(threads), 0, stream,
-        p, m, v, g, g_sam, lr, beta1, beta2, eps, wd, bc1, bc2, alpha_sam, n);
-}
-
-} // namespace sg::gfx942
-""",
-    "looksam_pallas.py.j2": r'''# AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-# Optimizer:   LookSAM
-# Arch:        {{ arch }} ({{ display_name }})
-# Vendor:      {{ vendor }} (JAX/Pallas — TPU target)
-#
-# Tuned config baked into the Pallas kernel call:
-#   block      = {{ block | default(128) }}
-#   vec        = {{ vec | default(4) }}
-#   unroll     = {{ unroll | default(4) }}
-{% if 'num_stages' in config %}
-#   num_stages = {{ num_stages }}
-{% endif %}
-
-import jax
-import jax.numpy as jnp
-from jax.experimental import pallas as pl
-
-
-SG_BLOCK_SIZE = {{ block | default(128) }}
-SG_VEC_WIDTH = {{ vec | default(4) }}
-SG_UNROLL = {{ unroll | default(4) }}
-
-
-def _looksam_step_pallas_kernel(p_ref, m_ref, v_ref, g_ref, g_sam_ref, lr, beta1, beta2, eps, wd, bc1, bc2, alpha_sam,
-                              p_out_ref, m_out_ref, v_out_ref):
-    """Per-block Pallas kernel — runs on one TPU core's HBM slice."""
-    p = p_ref[...]
+                              bc1, bc2, alpha_sam);''',
+        launch_indent=34,
+        launch_param_lines=[
+            'float* p, float* m, float* v,',
+            'const float* g, const float* g_sam,',
+            'float lr, float beta1, float beta2,',
+            'float eps, float wd, float bc1, float bc2,',
+            'float alpha_sam, int n,',
+        ],
+        sm90_args=r'''p, m, v, g, g_sam, lr, beta1, beta2, eps, wd, bc1, bc2, alpha_sam, n''',
+        generic_args=r'''p, m, v, g, g_sam, lr, beta1, beta2, eps, wd, bc1, bc2, alpha_sam, n''',
+        gfx942_args=r'''p, m, v, g, g_sam, lr, beta1, beta2, eps, wd, bc1, bc2, alpha_sam, n''',
+        pallas_kernel_params=r'''p_ref, m_ref, v_ref, g_ref, g_sam_ref, lr, beta1, beta2, eps, wd, bc1, bc2, alpha_sam,
+                              p_out_ref, m_out_ref, v_out_ref''',
+        pallas_math=r'''    p = p_ref[...]
     m = m_ref[...]
     v = v_ref[...]
     g = g_ref[...]
@@ -15379,283 +14269,47 @@ def _looksam_step_pallas_kernel(p_ref, m_ref, v_ref, g_ref, g_sam_ref, lr, beta1
     new_p = p - lr * (m_hat / (jnp.sqrt(v_hat) + eps) + wd * p)
     p_out_ref[...] = new_p
     m_out_ref[...] = new_m
-    v_out_ref[...] = new_v
-
-
-def launch_looksam_step(p, m, v, g, g_sam, lr, beta1, beta2, eps, wd, bc1, bc2, alpha_sam):
-    """JIT-compiled LookSAM step. Block size = {{ block | default(128) }}."""
-    grid = (max(1, p.size // SG_BLOCK_SIZE),)
-    fn = pl.pallas_call(
-        lambda *a: _looksam_step_pallas_kernel(*a, lr, beta1, beta2, eps, wd, bc1, bc2, alpha_sam),
-        out_shape=[
-            jax.ShapeDtypeStruct(p.shape, p.dtype),
+    v_out_ref[...] = new_v''',
+        pallas_launch_params=r'''p, m, v, g, g_sam, lr, beta1, beta2, eps, wd, bc1, bc2, alpha_sam''',
+        pallas_lambda_tail=r'''lr, beta1, beta2, eps, wd, bc1, bc2, alpha_sam''',
+        pallas_out_shapes=r'''            jax.ShapeDtypeStruct(p.shape, p.dtype),
             jax.ShapeDtypeStruct(m.shape, m.dtype),
-            jax.ShapeDtypeStruct(v.shape, v.dtype),
+            jax.ShapeDtypeStruct(v.shape, v.dtype),''',
+        pallas_fn_args=r'''p, m, v, g, g_sam''',
+    ),
+    dict(
+        name='neuralgrok',
+        display='NeuralGrok',
+        header='csrc/algorithms/neuralgrok.h',
+        sm90_extra_comment="",
+        kernel_param_lines=[
+            'float* __restrict__ p,',
+            'float* __restrict__ m,',
+            'float* __restrict__ v,',
+            'const float* __restrict__ g,',
+            'float psi_scale, float alpha, float beta,',
+            'float lr, float beta1, float beta2,',
+            'float eps, float wd, float bc1, float bc2,',
         ],
-        grid=grid,
-    )
-    return fn(p, m, v, g, g_sam)
-''',
-    "neuralgrok_sm_90a.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   NeuralGrok
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Generated config (baked in at template-render time):
-//   block        = {{ block }}
-//   vec          = {{ vec }}
-//   unroll       = {{ unroll }}
-//   num_stages   = {{ num_stages | default(2) }}
-{% if 'cluster_shape' in config %}
-//   cluster_shape = {{ cluster_shape }}
-{% endif %}
-{% if 'swizzle' in config %}
-//   swizzle      = {{ swizzle }}
-{% endif %}
-//
-// Hopper-specific knobs auto-emitted from the arch features
-// ({{ features | join(', ') }})
-{% if 'wgmma' in features %}
-#define SG_USE_WGMMA 1
-{% endif %}
-{% if 'tma' in features %}
-#define SG_USE_TMA 1
-{% endif %}
-{% if 'cluster' in features %}
-#define SG_USE_CLUSTER 1
-{% endif %}
-
-#define SG_BLOCK_SIZE   {{ block }}
-#define SG_VEC_WIDTH    {{ vec }}
-#define SG_UNROLL       {{ unroll }}
-#define SG_NUM_STAGES   {{ num_stages | default(2) }}
-{% if 'async_depth' in config %}
-#define SG_ASYNC_DEPTH  {{ async_depth }}
-{% endif %}
-
-// The actual per-element NeuralGrok math + grid-stride loop primitives live
-// in the project headers below; the emitted source only injects the
-// tuned constants so the compiler can specialise the kernel body.
-#include "csrc/algorithms/neuralgrok.h"
-
-namespace sg::sm90 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void neuralgrok_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ g,
-                       float psi_scale, float alpha, float beta,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
-    constexpr int kVec = VecWidth;
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * kVec; i < n; i += stride * kVec) {
-        #pragma unroll
-        for (int k = 0; k < kVec; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            neuralgrok_step_elem(p + idx, m + idx, v + idx, g[idx],
+        elem_call=r'''neuralgrok_step_elem(p + idx, m + idx, v + idx, g[idx],
                                  psi_scale, alpha, beta,
                                  lr, beta1, beta2, eps, wd,
-                                 bc1, bc2);
-        }
-    }
-}
-
-extern "C" void launch_neuralgrok_step(float* p, float* m, float* v,
-                                     const float* g,
-                                     float psi_scale, float alpha, float beta,
-                                     float lr, float beta1, float beta2,
-                                     float eps, float wd, float bc1, float bc2,
-                                     int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    neuralgrok_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>
-        <<<blocks, threads, 0, stream>>>(p, m, v, g, psi_scale, alpha, beta, lr, beta1, beta2, eps, wd, bc1, bc2, n);
-}
-
-} // namespace sg::sm90
-""",
-    "neuralgrok_generic.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   NeuralGrok (generic CUDA fallback)
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-//
-// This template targets pre-Hopper CUDA (sm_75 / sm_80 / sm_86 / sm_89).
-// No TMA, wgmma, or cluster launch — just a clean block-strided loop
-// with the autotuned block / vec / unroll constants baked in.
-//
-// Tuned config:
-//   block      = {{ block | default(256) }}
-//   vec        = {{ vec | default(4) }}
-//   unroll     = {{ unroll | default(4) }}
-//   num_stages = {{ num_stages | default(2) }}
-
-#define SG_BLOCK_SIZE  {{ block | default(256) }}
-#define SG_VEC_WIDTH   {{ vec | default(4) }}
-#define SG_UNROLL      {{ unroll | default(4) }}
-
-#include "csrc/algorithms/neuralgrok.h"
-
-namespace sg::generic {
-
-__global__ __launch_bounds__(SG_BLOCK_SIZE)
-void neuralgrok_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ g,
-                       float psi_scale, float alpha, float beta,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
-    const int gid = blockIdx.x * SG_BLOCK_SIZE + threadIdx.x;
-    const int stride = SG_BLOCK_SIZE * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * SG_VEC_WIDTH; i < n; i += stride * SG_VEC_WIDTH) {
-        #pragma unroll
-        for (int k = 0; k < SG_VEC_WIDTH; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            neuralgrok_step_elem(p + idx, m + idx, v + idx, g[idx],
-                                 psi_scale, alpha, beta,
-                                 lr, beta1, beta2, eps, wd,
-                                 bc1, bc2);
-        }
-    }
-}
-
-extern "C" void launch_neuralgrok_step(float* p, float* m, float* v,
-                                     const float* g,
-                                     float psi_scale, float alpha, float beta,
-                                     float lr, float beta1, float beta2,
-                                     float eps, float wd, float bc1, float bc2,
-                                     int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    neuralgrok_step_kernel<<<blocks, threads, 0, stream>>>(p, m, v, g, psi_scale, alpha, beta, lr, beta1, beta2, eps, wd, bc1, bc2, n);
-}
-
-} // namespace sg::generic
-""",
-    "neuralgrok_gfx942.hip.cpp.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   NeuralGrok
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Wavefront:   {{ warp_size }} lanes (CDNA3)
-//
-// Tuned config:
-//   block          = {{ block }}
-//   vec            = {{ vec }}
-//   unroll         = {{ unroll }}
-//   num_stages     = {{ num_stages | default(2) }}
-{% if 'waves_per_eu' in config %}
-//   waves_per_eu   = {{ waves_per_eu }}
-{% endif %}
-{% if 'lds_padding' in config %}
-//   lds_padding    = {{ lds_padding }}
-{% endif %}
-{% if 'mfma_shape' in config %}
-//   mfma_shape     = {{ mfma_shape }}
-{% endif %}
-{% if 'scheduler_hint' in config %}
-//   scheduler_hint = {{ scheduler_hint }}
-{% endif %}
-
-#define SG_BLOCK_SIZE  {{ block }}
-#define SG_VEC_WIDTH   {{ vec }}
-#define SG_UNROLL      {{ unroll }}
-#define SG_NUM_STAGES  {{ num_stages | default(2) }}
-{% if 'mfma' in features %}
-#define SG_USE_MFMA 1
-{% endif %}
-{% if 'fp8_mfma' in features %}
-#define SG_USE_FP8_MFMA 1
-{% endif %}
-
-#include <hip/hip_runtime.h>
-#include "csrc/algorithms/neuralgrok.h"
-
-namespace sg::gfx942 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void neuralgrok_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ g,
-                       float psi_scale, float alpha, float beta,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * VecWidth; i < n; i += stride * VecWidth) {
-        #pragma unroll
-        for (int k = 0; k < VecWidth; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            neuralgrok_step_elem(p + idx, m + idx, v + idx, g[idx],
-                                 psi_scale, alpha, beta,
-                                 lr, beta1, beta2, eps, wd,
-                                 bc1, bc2);
-        }
-    }
-}
-
-extern "C" void launch_neuralgrok_step(float* p, float* m, float* v,
-                                     const float* g,
-                                     float psi_scale, float alpha, float beta,
-                                     float lr, float beta1, float beta2,
-                                     float eps, float wd, float bc1, float bc2,
-                                     int n,
-                                  hipStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    hipLaunchKernelGGL(
-        (neuralgrok_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>),
-        dim3(blocks), dim3(threads), 0, stream,
-        p, m, v, g, psi_scale, alpha, beta, lr, beta1, beta2, eps, wd, bc1, bc2, n);
-}
-
-} // namespace sg::gfx942
-""",
-    "neuralgrok_pallas.py.j2": r'''# AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-# Optimizer:   NeuralGrok
-# Arch:        {{ arch }} ({{ display_name }})
-# Vendor:      {{ vendor }} (JAX/Pallas — TPU target)
-#
-# Tuned config baked into the Pallas kernel call:
-#   block      = {{ block | default(128) }}
-#   vec        = {{ vec | default(4) }}
-#   unroll     = {{ unroll | default(4) }}
-{% if 'num_stages' in config %}
-#   num_stages = {{ num_stages }}
-{% endif %}
-
-import jax
-import jax.numpy as jnp
-from jax.experimental import pallas as pl
-
-
-SG_BLOCK_SIZE = {{ block | default(128) }}
-SG_VEC_WIDTH = {{ vec | default(4) }}
-SG_UNROLL = {{ unroll | default(4) }}
-
-
-def _neuralgrok_step_pallas_kernel(p_ref, m_ref, v_ref, g_ref, psi_scale, alpha, beta, lr, beta1, beta2, eps, wd, bc1, bc2,
-                              p_out_ref, m_out_ref, v_out_ref):
-    """Per-block Pallas kernel — runs on one TPU core's HBM slice."""
-    p = p_ref[...]
+                                 bc1, bc2);''',
+        launch_indent=37,
+        launch_param_lines=[
+            'float* p, float* m, float* v,',
+            'const float* g,',
+            'float psi_scale, float alpha, float beta,',
+            'float lr, float beta1, float beta2,',
+            'float eps, float wd, float bc1, float bc2,',
+            'int n,',
+        ],
+        sm90_args=r'''p, m, v, g, psi_scale, alpha, beta, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        generic_args=r'''p, m, v, g, psi_scale, alpha, beta, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        gfx942_args=r'''p, m, v, g, psi_scale, alpha, beta, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        pallas_kernel_params=r'''p_ref, m_ref, v_ref, g_ref, psi_scale, alpha, beta, lr, beta1, beta2, eps, wd, bc1, bc2,
+                              p_out_ref, m_out_ref, v_out_ref''',
+        pallas_math=r'''    p = p_ref[...]
     m = m_ref[...]
     v = v_ref[...]
     g = g_ref[...]
@@ -15667,283 +14321,47 @@ def _neuralgrok_step_pallas_kernel(p_ref, m_ref, v_ref, g_ref, psi_scale, alpha,
     new_p = p - lr * (m_hat / (jnp.sqrt(v_hat) + eps) + wd * p)
     p_out_ref[...] = new_p
     m_out_ref[...] = new_m
-    v_out_ref[...] = new_v
-
-
-def launch_neuralgrok_step(p, m, v, g, psi_scale, alpha, beta, lr, beta1, beta2, eps, wd, bc1, bc2):
-    """JIT-compiled NeuralGrok step. Block size = {{ block | default(128) }}."""
-    grid = (max(1, p.size // SG_BLOCK_SIZE),)
-    fn = pl.pallas_call(
-        lambda *a: _neuralgrok_step_pallas_kernel(*a, psi_scale, alpha, beta, lr, beta1, beta2, eps, wd, bc1, bc2),
-        out_shape=[
-            jax.ShapeDtypeStruct(p.shape, p.dtype),
+    v_out_ref[...] = new_v''',
+        pallas_launch_params=r'''p, m, v, g, psi_scale, alpha, beta, lr, beta1, beta2, eps, wd, bc1, bc2''',
+        pallas_lambda_tail=r'''psi_scale, alpha, beta, lr, beta1, beta2, eps, wd, bc1, bc2''',
+        pallas_out_shapes=r'''            jax.ShapeDtypeStruct(p.shape, p.dtype),
             jax.ShapeDtypeStruct(m.shape, m.dtype),
-            jax.ShapeDtypeStruct(v.shape, v.dtype),
+            jax.ShapeDtypeStruct(v.shape, v.dtype),''',
+        pallas_fn_args=r'''p, m, v, g''',
+    ),
+    dict(
+        name='supergrok11',
+        display='SuperGrok 1.1',
+        header='csrc/algorithms/supergrok11.h',
+        sm90_extra_comment="",
+        kernel_param_lines=[
+            'float* __restrict__ p,',
+            'float* __restrict__ m,',
+            'float* __restrict__ v,',
+            'const float* __restrict__ g,',
+            'float gate, float smart_grad_scale,',
+            'float lr, float beta1, float beta2,',
+            'float eps, float wd, float bc1, float bc2,',
         ],
-        grid=grid,
-    )
-    return fn(p, m, v, g)
-''',
-    "supergrok11_sm_90a.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   SuperGrok 1.1
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Generated config (baked in at template-render time):
-//   block        = {{ block }}
-//   vec          = {{ vec }}
-//   unroll       = {{ unroll }}
-//   num_stages   = {{ num_stages | default(2) }}
-{% if 'cluster_shape' in config %}
-//   cluster_shape = {{ cluster_shape }}
-{% endif %}
-{% if 'swizzle' in config %}
-//   swizzle      = {{ swizzle }}
-{% endif %}
-//
-// Hopper-specific knobs auto-emitted from the arch features
-// ({{ features | join(', ') }})
-{% if 'wgmma' in features %}
-#define SG_USE_WGMMA 1
-{% endif %}
-{% if 'tma' in features %}
-#define SG_USE_TMA 1
-{% endif %}
-{% if 'cluster' in features %}
-#define SG_USE_CLUSTER 1
-{% endif %}
-
-#define SG_BLOCK_SIZE   {{ block }}
-#define SG_VEC_WIDTH    {{ vec }}
-#define SG_UNROLL       {{ unroll }}
-#define SG_NUM_STAGES   {{ num_stages | default(2) }}
-{% if 'async_depth' in config %}
-#define SG_ASYNC_DEPTH  {{ async_depth }}
-{% endif %}
-
-// The actual per-element SuperGrok 1.1 math + grid-stride loop primitives live
-// in the project headers below; the emitted source only injects the
-// tuned constants so the compiler can specialise the kernel body.
-#include "csrc/algorithms/supergrok11.h"
-
-namespace sg::sm90 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void supergrok11_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ g,
-                       float gate, float smart_grad_scale,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
-    constexpr int kVec = VecWidth;
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * kVec; i < n; i += stride * kVec) {
-        #pragma unroll
-        for (int k = 0; k < kVec; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            supergrok11_step_elem(p + idx, m + idx, v + idx, g[idx],
+        elem_call=r'''supergrok11_step_elem(p + idx, m + idx, v + idx, g[idx],
                                   gate, smart_grad_scale,
                                   lr, beta1, beta2, eps, wd,
-                                  bc1, bc2);
-        }
-    }
-}
-
-extern "C" void launch_supergrok11_step(float* p, float* m, float* v,
-                                      const float* g,
-                                      float gate, float smart_grad_scale,
-                                      float lr, float beta1, float beta2,
-                                      float eps, float wd, float bc1, float bc2,
-                                      int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    supergrok11_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>
-        <<<blocks, threads, 0, stream>>>(p, m, v, g, gate, smart_grad_scale, lr, beta1, beta2, eps, wd, bc1, bc2, n);
-}
-
-} // namespace sg::sm90
-""",
-    "supergrok11_generic.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   SuperGrok 1.1 (generic CUDA fallback)
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-//
-// This template targets pre-Hopper CUDA (sm_75 / sm_80 / sm_86 / sm_89).
-// No TMA, wgmma, or cluster launch — just a clean block-strided loop
-// with the autotuned block / vec / unroll constants baked in.
-//
-// Tuned config:
-//   block      = {{ block | default(256) }}
-//   vec        = {{ vec | default(4) }}
-//   unroll     = {{ unroll | default(4) }}
-//   num_stages = {{ num_stages | default(2) }}
-
-#define SG_BLOCK_SIZE  {{ block | default(256) }}
-#define SG_VEC_WIDTH   {{ vec | default(4) }}
-#define SG_UNROLL      {{ unroll | default(4) }}
-
-#include "csrc/algorithms/supergrok11.h"
-
-namespace sg::generic {
-
-__global__ __launch_bounds__(SG_BLOCK_SIZE)
-void supergrok11_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ g,
-                       float gate, float smart_grad_scale,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
-    const int gid = blockIdx.x * SG_BLOCK_SIZE + threadIdx.x;
-    const int stride = SG_BLOCK_SIZE * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * SG_VEC_WIDTH; i < n; i += stride * SG_VEC_WIDTH) {
-        #pragma unroll
-        for (int k = 0; k < SG_VEC_WIDTH; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            supergrok11_step_elem(p + idx, m + idx, v + idx, g[idx],
-                                  gate, smart_grad_scale,
-                                  lr, beta1, beta2, eps, wd,
-                                  bc1, bc2);
-        }
-    }
-}
-
-extern "C" void launch_supergrok11_step(float* p, float* m, float* v,
-                                      const float* g,
-                                      float gate, float smart_grad_scale,
-                                      float lr, float beta1, float beta2,
-                                      float eps, float wd, float bc1, float bc2,
-                                      int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    supergrok11_step_kernel<<<blocks, threads, 0, stream>>>(p, m, v, g, gate, smart_grad_scale, lr, beta1, beta2, eps, wd, bc1, bc2, n);
-}
-
-} // namespace sg::generic
-""",
-    "supergrok11_gfx942.hip.cpp.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   SuperGrok 1.1
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Wavefront:   {{ warp_size }} lanes (CDNA3)
-//
-// Tuned config:
-//   block          = {{ block }}
-//   vec            = {{ vec }}
-//   unroll         = {{ unroll }}
-//   num_stages     = {{ num_stages | default(2) }}
-{% if 'waves_per_eu' in config %}
-//   waves_per_eu   = {{ waves_per_eu }}
-{% endif %}
-{% if 'lds_padding' in config %}
-//   lds_padding    = {{ lds_padding }}
-{% endif %}
-{% if 'mfma_shape' in config %}
-//   mfma_shape     = {{ mfma_shape }}
-{% endif %}
-{% if 'scheduler_hint' in config %}
-//   scheduler_hint = {{ scheduler_hint }}
-{% endif %}
-
-#define SG_BLOCK_SIZE  {{ block }}
-#define SG_VEC_WIDTH   {{ vec }}
-#define SG_UNROLL      {{ unroll }}
-#define SG_NUM_STAGES  {{ num_stages | default(2) }}
-{% if 'mfma' in features %}
-#define SG_USE_MFMA 1
-{% endif %}
-{% if 'fp8_mfma' in features %}
-#define SG_USE_FP8_MFMA 1
-{% endif %}
-
-#include <hip/hip_runtime.h>
-#include "csrc/algorithms/supergrok11.h"
-
-namespace sg::gfx942 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void supergrok11_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ g,
-                       float gate, float smart_grad_scale,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * VecWidth; i < n; i += stride * VecWidth) {
-        #pragma unroll
-        for (int k = 0; k < VecWidth; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            supergrok11_step_elem(p + idx, m + idx, v + idx, g[idx],
-                                  gate, smart_grad_scale,
-                                  lr, beta1, beta2, eps, wd,
-                                  bc1, bc2);
-        }
-    }
-}
-
-extern "C" void launch_supergrok11_step(float* p, float* m, float* v,
-                                      const float* g,
-                                      float gate, float smart_grad_scale,
-                                      float lr, float beta1, float beta2,
-                                      float eps, float wd, float bc1, float bc2,
-                                      int n,
-                                  hipStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    hipLaunchKernelGGL(
-        (supergrok11_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>),
-        dim3(blocks), dim3(threads), 0, stream,
-        p, m, v, g, gate, smart_grad_scale, lr, beta1, beta2, eps, wd, bc1, bc2, n);
-}
-
-} // namespace sg::gfx942
-""",
-    "supergrok11_pallas.py.j2": r'''# AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-# Optimizer:   SuperGrok 1.1
-# Arch:        {{ arch }} ({{ display_name }})
-# Vendor:      {{ vendor }} (JAX/Pallas — TPU target)
-#
-# Tuned config baked into the Pallas kernel call:
-#   block      = {{ block | default(128) }}
-#   vec        = {{ vec | default(4) }}
-#   unroll     = {{ unroll | default(4) }}
-{% if 'num_stages' in config %}
-#   num_stages = {{ num_stages }}
-{% endif %}
-
-import jax
-import jax.numpy as jnp
-from jax.experimental import pallas as pl
-
-
-SG_BLOCK_SIZE = {{ block | default(128) }}
-SG_VEC_WIDTH = {{ vec | default(4) }}
-SG_UNROLL = {{ unroll | default(4) }}
-
-
-def _supergrok11_step_pallas_kernel(p_ref, m_ref, v_ref, g_ref, gate, smart_grad_scale, lr, beta1, beta2, eps, wd, bc1, bc2,
-                              p_out_ref, m_out_ref, v_out_ref):
-    """Per-block Pallas kernel — runs on one TPU core's HBM slice."""
-    p = p_ref[...]
+                                  bc1, bc2);''',
+        launch_indent=38,
+        launch_param_lines=[
+            'float* p, float* m, float* v,',
+            'const float* g,',
+            'float gate, float smart_grad_scale,',
+            'float lr, float beta1, float beta2,',
+            'float eps, float wd, float bc1, float bc2,',
+            'int n,',
+        ],
+        sm90_args=r'''p, m, v, g, gate, smart_grad_scale, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        generic_args=r'''p, m, v, g, gate, smart_grad_scale, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        gfx942_args=r'''p, m, v, g, gate, smart_grad_scale, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        pallas_kernel_params=r'''p_ref, m_ref, v_ref, g_ref, gate, smart_grad_scale, lr, beta1, beta2, eps, wd, bc1, bc2,
+                              p_out_ref, m_out_ref, v_out_ref''',
+        pallas_math=r'''    p = p_ref[...]
     m = m_ref[...]
     v = v_ref[...]
     g = g_ref[...]
@@ -15955,286 +14373,48 @@ def _supergrok11_step_pallas_kernel(p_ref, m_ref, v_ref, g_ref, gate, smart_grad
     new_p = p - lr * (m_hat / (jnp.sqrt(v_hat) + eps) + wd * p)
     p_out_ref[...] = new_p
     m_out_ref[...] = new_m
-    v_out_ref[...] = new_v
-
-
-def launch_supergrok11_step(p, m, v, g, gate, smart_grad_scale, lr, beta1, beta2, eps, wd, bc1, bc2):
-    """JIT-compiled SuperGrok 1.1 step. Block size = {{ block | default(128) }}."""
-    grid = (max(1, p.size // SG_BLOCK_SIZE),)
-    fn = pl.pallas_call(
-        lambda *a: _supergrok11_step_pallas_kernel(*a, gate, smart_grad_scale, lr, beta1, beta2, eps, wd, bc1, bc2),
-        out_shape=[
-            jax.ShapeDtypeStruct(p.shape, p.dtype),
+    v_out_ref[...] = new_v''',
+        pallas_launch_params=r'''p, m, v, g, gate, smart_grad_scale, lr, beta1, beta2, eps, wd, bc1, bc2''',
+        pallas_lambda_tail=r'''gate, smart_grad_scale, lr, beta1, beta2, eps, wd, bc1, bc2''',
+        pallas_out_shapes=r'''            jax.ShapeDtypeStruct(p.shape, p.dtype),
             jax.ShapeDtypeStruct(m.shape, m.dtype),
-            jax.ShapeDtypeStruct(v.shape, v.dtype),
+            jax.ShapeDtypeStruct(v.shape, v.dtype),''',
+        pallas_fn_args=r'''p, m, v, g''',
+    ),
+    dict(
+        name='supergrok15',
+        display='SuperGrok 1.5',
+        header='csrc/algorithms/supergrok15.h',
+        sm90_extra_comment="",
+        kernel_param_lines=[
+            'float* __restrict__ p,',
+            'float* __restrict__ m,',
+            'float* __restrict__ v,',
+            'const float* __restrict__ g,',
+            'const float* __restrict__ mu,',
+            'float alpha_base, float alpha_max,',
+            'float lr, float beta1, float beta2,',
+            'float eps, float wd, float bc1, float bc2,',
         ],
-        grid=grid,
-    )
-    return fn(p, m, v, g)
-''',
-    "supergrok15_sm_90a.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   SuperGrok 1.5
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Generated config (baked in at template-render time):
-//   block        = {{ block }}
-//   vec          = {{ vec }}
-//   unroll       = {{ unroll }}
-//   num_stages   = {{ num_stages | default(2) }}
-{% if 'cluster_shape' in config %}
-//   cluster_shape = {{ cluster_shape }}
-{% endif %}
-{% if 'swizzle' in config %}
-//   swizzle      = {{ swizzle }}
-{% endif %}
-//
-// Hopper-specific knobs auto-emitted from the arch features
-// ({{ features | join(', ') }})
-{% if 'wgmma' in features %}
-#define SG_USE_WGMMA 1
-{% endif %}
-{% if 'tma' in features %}
-#define SG_USE_TMA 1
-{% endif %}
-{% if 'cluster' in features %}
-#define SG_USE_CLUSTER 1
-{% endif %}
-
-#define SG_BLOCK_SIZE   {{ block }}
-#define SG_VEC_WIDTH    {{ vec }}
-#define SG_UNROLL       {{ unroll }}
-#define SG_NUM_STAGES   {{ num_stages | default(2) }}
-{% if 'async_depth' in config %}
-#define SG_ASYNC_DEPTH  {{ async_depth }}
-{% endif %}
-
-// The actual per-element SuperGrok 1.5 math + grid-stride loop primitives live
-// in the project headers below; the emitted source only injects the
-// tuned constants so the compiler can specialise the kernel body.
-#include "csrc/algorithms/supergrok15.h"
-
-namespace sg::sm90 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void supergrok15_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ g,
-                       const float* __restrict__ mu,
-                       float alpha_base, float alpha_max,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
-    constexpr int kVec = VecWidth;
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * kVec; i < n; i += stride * kVec) {
-        #pragma unroll
-        for (int k = 0; k < kVec; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            supergrok15_step_elem(p + idx, m + idx, v + idx, g[idx], mu[idx],
+        elem_call=r'''supergrok15_step_elem(p + idx, m + idx, v + idx, g[idx], mu[idx],
                                   alpha_base, alpha_max,
                                   lr, beta1, beta2, eps, wd,
-                                  bc1, bc2);
-        }
-    }
-}
-
-extern "C" void launch_supergrok15_step(float* p, float* m, float* v,
-                                      const float* g, const float* mu,
-                                      float alpha_base, float alpha_max,
-                                      float lr, float beta1, float beta2,
-                                      float eps, float wd, float bc1, float bc2,
-                                      int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    supergrok15_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>
-        <<<blocks, threads, 0, stream>>>(p, m, v, g, mu, alpha_base, alpha_max, lr, beta1, beta2, eps, wd, bc1, bc2, n);
-}
-
-} // namespace sg::sm90
-""",
-    "supergrok15_generic.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   SuperGrok 1.5 (generic CUDA fallback)
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-//
-// This template targets pre-Hopper CUDA (sm_75 / sm_80 / sm_86 / sm_89).
-// No TMA, wgmma, or cluster launch — just a clean block-strided loop
-// with the autotuned block / vec / unroll constants baked in.
-//
-// Tuned config:
-//   block      = {{ block | default(256) }}
-//   vec        = {{ vec | default(4) }}
-//   unroll     = {{ unroll | default(4) }}
-//   num_stages = {{ num_stages | default(2) }}
-
-#define SG_BLOCK_SIZE  {{ block | default(256) }}
-#define SG_VEC_WIDTH   {{ vec | default(4) }}
-#define SG_UNROLL      {{ unroll | default(4) }}
-
-#include "csrc/algorithms/supergrok15.h"
-
-namespace sg::generic {
-
-__global__ __launch_bounds__(SG_BLOCK_SIZE)
-void supergrok15_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ g,
-                       const float* __restrict__ mu,
-                       float alpha_base, float alpha_max,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
-    const int gid = blockIdx.x * SG_BLOCK_SIZE + threadIdx.x;
-    const int stride = SG_BLOCK_SIZE * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * SG_VEC_WIDTH; i < n; i += stride * SG_VEC_WIDTH) {
-        #pragma unroll
-        for (int k = 0; k < SG_VEC_WIDTH; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            supergrok15_step_elem(p + idx, m + idx, v + idx, g[idx], mu[idx],
-                                  alpha_base, alpha_max,
-                                  lr, beta1, beta2, eps, wd,
-                                  bc1, bc2);
-        }
-    }
-}
-
-extern "C" void launch_supergrok15_step(float* p, float* m, float* v,
-                                      const float* g, const float* mu,
-                                      float alpha_base, float alpha_max,
-                                      float lr, float beta1, float beta2,
-                                      float eps, float wd, float bc1, float bc2,
-                                      int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    supergrok15_step_kernel<<<blocks, threads, 0, stream>>>(p, m, v, g, mu, alpha_base, alpha_max, lr, beta1, beta2, eps, wd, bc1, bc2, n);
-}
-
-} // namespace sg::generic
-""",
-    "supergrok15_gfx942.hip.cpp.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   SuperGrok 1.5
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Wavefront:   {{ warp_size }} lanes (CDNA3)
-//
-// Tuned config:
-//   block          = {{ block }}
-//   vec            = {{ vec }}
-//   unroll         = {{ unroll }}
-//   num_stages     = {{ num_stages | default(2) }}
-{% if 'waves_per_eu' in config %}
-//   waves_per_eu   = {{ waves_per_eu }}
-{% endif %}
-{% if 'lds_padding' in config %}
-//   lds_padding    = {{ lds_padding }}
-{% endif %}
-{% if 'mfma_shape' in config %}
-//   mfma_shape     = {{ mfma_shape }}
-{% endif %}
-{% if 'scheduler_hint' in config %}
-//   scheduler_hint = {{ scheduler_hint }}
-{% endif %}
-
-#define SG_BLOCK_SIZE  {{ block }}
-#define SG_VEC_WIDTH   {{ vec }}
-#define SG_UNROLL      {{ unroll }}
-#define SG_NUM_STAGES  {{ num_stages | default(2) }}
-{% if 'mfma' in features %}
-#define SG_USE_MFMA 1
-{% endif %}
-{% if 'fp8_mfma' in features %}
-#define SG_USE_FP8_MFMA 1
-{% endif %}
-
-#include <hip/hip_runtime.h>
-#include "csrc/algorithms/supergrok15.h"
-
-namespace sg::gfx942 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void supergrok15_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ g,
-                       const float* __restrict__ mu,
-                       float alpha_base, float alpha_max,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * VecWidth; i < n; i += stride * VecWidth) {
-        #pragma unroll
-        for (int k = 0; k < VecWidth; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            supergrok15_step_elem(p + idx, m + idx, v + idx, g[idx], mu[idx],
-                                  alpha_base, alpha_max,
-                                  lr, beta1, beta2, eps, wd,
-                                  bc1, bc2);
-        }
-    }
-}
-
-extern "C" void launch_supergrok15_step(float* p, float* m, float* v,
-                                      const float* g, const float* mu,
-                                      float alpha_base, float alpha_max,
-                                      float lr, float beta1, float beta2,
-                                      float eps, float wd, float bc1, float bc2,
-                                      int n,
-                                  hipStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    hipLaunchKernelGGL(
-        (supergrok15_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>),
-        dim3(blocks), dim3(threads), 0, stream,
-        p, m, v, g, mu, alpha_base, alpha_max, lr, beta1, beta2, eps, wd, bc1, bc2, n);
-}
-
-} // namespace sg::gfx942
-""",
-    "supergrok15_pallas.py.j2": r'''# AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-# Optimizer:   SuperGrok 1.5
-# Arch:        {{ arch }} ({{ display_name }})
-# Vendor:      {{ vendor }} (JAX/Pallas — TPU target)
-#
-# Tuned config baked into the Pallas kernel call:
-#   block      = {{ block | default(128) }}
-#   vec        = {{ vec | default(4) }}
-#   unroll     = {{ unroll | default(4) }}
-{% if 'num_stages' in config %}
-#   num_stages = {{ num_stages }}
-{% endif %}
-
-import jax
-import jax.numpy as jnp
-from jax.experimental import pallas as pl
-
-
-SG_BLOCK_SIZE = {{ block | default(128) }}
-SG_VEC_WIDTH = {{ vec | default(4) }}
-SG_UNROLL = {{ unroll | default(4) }}
-
-
-def _supergrok15_step_pallas_kernel(p_ref, m_ref, v_ref, g_ref, mu_ref, alpha_base, alpha_max, lr, beta1, beta2, eps, wd, bc1, bc2,
-                              p_out_ref, m_out_ref, v_out_ref):
-    """Per-block Pallas kernel — runs on one TPU core's HBM slice."""
-    p = p_ref[...]
+                                  bc1, bc2);''',
+        launch_indent=38,
+        launch_param_lines=[
+            'float* p, float* m, float* v,',
+            'const float* g, const float* mu,',
+            'float alpha_base, float alpha_max,',
+            'float lr, float beta1, float beta2,',
+            'float eps, float wd, float bc1, float bc2,',
+            'int n,',
+        ],
+        sm90_args=r'''p, m, v, g, mu, alpha_base, alpha_max, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        generic_args=r'''p, m, v, g, mu, alpha_base, alpha_max, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        gfx942_args=r'''p, m, v, g, mu, alpha_base, alpha_max, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        pallas_kernel_params=r'''p_ref, m_ref, v_ref, g_ref, mu_ref, alpha_base, alpha_max, lr, beta1, beta2, eps, wd, bc1, bc2,
+                              p_out_ref, m_out_ref, v_out_ref''',
+        pallas_math=r'''    p = p_ref[...]
     m = m_ref[...]
     v = v_ref[...]
     g = g_ref[...]
@@ -16248,277 +14428,45 @@ def _supergrok15_step_pallas_kernel(p_ref, m_ref, v_ref, g_ref, mu_ref, alpha_ba
     new_p = p - lr * (m_hat / (jnp.sqrt(v_hat) + eps) + wd * p)
     p_out_ref[...] = new_p
     m_out_ref[...] = new_m
-    v_out_ref[...] = new_v
-
-
-def launch_supergrok15_step(p, m, v, g, mu, alpha_base, alpha_max, lr, beta1, beta2, eps, wd, bc1, bc2):
-    """JIT-compiled SuperGrok 1.5 step. Block size = {{ block | default(128) }}."""
-    grid = (max(1, p.size // SG_BLOCK_SIZE),)
-    fn = pl.pallas_call(
-        lambda *a: _supergrok15_step_pallas_kernel(*a, alpha_base, alpha_max, lr, beta1, beta2, eps, wd, bc1, bc2),
-        out_shape=[
-            jax.ShapeDtypeStruct(p.shape, p.dtype),
+    v_out_ref[...] = new_v''',
+        pallas_launch_params=r'''p, m, v, g, mu, alpha_base, alpha_max, lr, beta1, beta2, eps, wd, bc1, bc2''',
+        pallas_lambda_tail=r'''alpha_base, alpha_max, lr, beta1, beta2, eps, wd, bc1, bc2''',
+        pallas_out_shapes=r'''            jax.ShapeDtypeStruct(p.shape, p.dtype),
             jax.ShapeDtypeStruct(m.shape, m.dtype),
-            jax.ShapeDtypeStruct(v.shape, v.dtype),
+            jax.ShapeDtypeStruct(v.shape, v.dtype),''',
+        pallas_fn_args=r'''p, m, v, g, mu''',
+    ),
+    dict(
+        name='supergrok2',
+        display='SuperGrok 2',
+        header='csrc/algorithms/supergrok2.h',
+        sm90_extra_comment="",
+        kernel_param_lines=[
+            'float* __restrict__ p,',
+            'float* __restrict__ m,',
+            'float* __restrict__ v,',
+            'const float* __restrict__ g,',
+            'const float* __restrict__ routed,',
+            'float lr, float beta1, float beta2,',
+            'float eps, float wd, float bc1, float bc2,',
         ],
-        grid=grid,
-    )
-    return fn(p, m, v, g, mu)
-''',
-    "supergrok2_sm_90a.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   SuperGrok 2
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Generated config (baked in at template-render time):
-//   block        = {{ block }}
-//   vec          = {{ vec }}
-//   unroll       = {{ unroll }}
-//   num_stages   = {{ num_stages | default(2) }}
-{% if 'cluster_shape' in config %}
-//   cluster_shape = {{ cluster_shape }}
-{% endif %}
-{% if 'swizzle' in config %}
-//   swizzle      = {{ swizzle }}
-{% endif %}
-//
-// Hopper-specific knobs auto-emitted from the arch features
-// ({{ features | join(', ') }})
-{% if 'wgmma' in features %}
-#define SG_USE_WGMMA 1
-{% endif %}
-{% if 'tma' in features %}
-#define SG_USE_TMA 1
-{% endif %}
-{% if 'cluster' in features %}
-#define SG_USE_CLUSTER 1
-{% endif %}
-
-#define SG_BLOCK_SIZE   {{ block }}
-#define SG_VEC_WIDTH    {{ vec }}
-#define SG_UNROLL       {{ unroll }}
-#define SG_NUM_STAGES   {{ num_stages | default(2) }}
-{% if 'async_depth' in config %}
-#define SG_ASYNC_DEPTH  {{ async_depth }}
-{% endif %}
-
-// The actual per-element SuperGrok 2 math + grid-stride loop primitives live
-// in the project headers below; the emitted source only injects the
-// tuned constants so the compiler can specialise the kernel body.
-#include "csrc/algorithms/supergrok2.h"
-
-namespace sg::sm90 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void supergrok2_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ g,
-                       const float* __restrict__ routed,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
-    constexpr int kVec = VecWidth;
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * kVec; i < n; i += stride * kVec) {
-        #pragma unroll
-        for (int k = 0; k < kVec; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            supergrok2_step_elem(p + idx, m + idx, v + idx, g[idx], routed[idx],
+        elem_call=r'''supergrok2_step_elem(p + idx, m + idx, v + idx, g[idx], routed[idx],
                                  lr, beta1, beta2, eps, wd,
-                                 bc1, bc2);
-        }
-    }
-}
-
-extern "C" void launch_supergrok2_step(float* p, float* m, float* v,
-                                     const float* g, const float* routed,
-                                     float lr, float beta1, float beta2,
-                                     float eps, float wd, float bc1, float bc2,
-                                     int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    supergrok2_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>
-        <<<blocks, threads, 0, stream>>>(p, m, v, g, routed, lr, beta1, beta2, eps, wd, bc1, bc2, n);
-}
-
-} // namespace sg::sm90
-""",
-    "supergrok2_generic.cu.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   SuperGrok 2 (generic CUDA fallback)
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-//
-// This template targets pre-Hopper CUDA (sm_75 / sm_80 / sm_86 / sm_89).
-// No TMA, wgmma, or cluster launch — just a clean block-strided loop
-// with the autotuned block / vec / unroll constants baked in.
-//
-// Tuned config:
-//   block      = {{ block | default(256) }}
-//   vec        = {{ vec | default(4) }}
-//   unroll     = {{ unroll | default(4) }}
-//   num_stages = {{ num_stages | default(2) }}
-
-#define SG_BLOCK_SIZE  {{ block | default(256) }}
-#define SG_VEC_WIDTH   {{ vec | default(4) }}
-#define SG_UNROLL      {{ unroll | default(4) }}
-
-#include "csrc/algorithms/supergrok2.h"
-
-namespace sg::generic {
-
-__global__ __launch_bounds__(SG_BLOCK_SIZE)
-void supergrok2_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ g,
-                       const float* __restrict__ routed,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
-    const int gid = blockIdx.x * SG_BLOCK_SIZE + threadIdx.x;
-    const int stride = SG_BLOCK_SIZE * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * SG_VEC_WIDTH; i < n; i += stride * SG_VEC_WIDTH) {
-        #pragma unroll
-        for (int k = 0; k < SG_VEC_WIDTH; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            supergrok2_step_elem(p + idx, m + idx, v + idx, g[idx], routed[idx],
-                                 lr, beta1, beta2, eps, wd,
-                                 bc1, bc2);
-        }
-    }
-}
-
-extern "C" void launch_supergrok2_step(float* p, float* m, float* v,
-                                     const float* g, const float* routed,
-                                     float lr, float beta1, float beta2,
-                                     float eps, float wd, float bc1, float bc2,
-                                     int n,
-                                  cudaStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    supergrok2_step_kernel<<<blocks, threads, 0, stream>>>(p, m, v, g, routed, lr, beta1, beta2, eps, wd, bc1, bc2, n);
-}
-
-} // namespace sg::generic
-""",
-    "supergrok2_gfx942.hip.cpp.j2": r"""// AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-// Optimizer:   SuperGrok 2
-// Arch:        {{ arch }} ({{ display_name }})
-// Vendor:      {{ vendor }}
-// Wavefront:   {{ warp_size }} lanes (CDNA3)
-//
-// Tuned config:
-//   block          = {{ block }}
-//   vec            = {{ vec }}
-//   unroll         = {{ unroll }}
-//   num_stages     = {{ num_stages | default(2) }}
-{% if 'waves_per_eu' in config %}
-//   waves_per_eu   = {{ waves_per_eu }}
-{% endif %}
-{% if 'lds_padding' in config %}
-//   lds_padding    = {{ lds_padding }}
-{% endif %}
-{% if 'mfma_shape' in config %}
-//   mfma_shape     = {{ mfma_shape }}
-{% endif %}
-{% if 'scheduler_hint' in config %}
-//   scheduler_hint = {{ scheduler_hint }}
-{% endif %}
-
-#define SG_BLOCK_SIZE  {{ block }}
-#define SG_VEC_WIDTH   {{ vec }}
-#define SG_UNROLL      {{ unroll }}
-#define SG_NUM_STAGES  {{ num_stages | default(2) }}
-{% if 'mfma' in features %}
-#define SG_USE_MFMA 1
-{% endif %}
-{% if 'fp8_mfma' in features %}
-#define SG_USE_FP8_MFMA 1
-{% endif %}
-
-#include <hip/hip_runtime.h>
-#include "csrc/algorithms/supergrok2.h"
-
-namespace sg::gfx942 {
-
-template <int BlockSize = SG_BLOCK_SIZE, int VecWidth = SG_VEC_WIDTH>
-__global__ __launch_bounds__(BlockSize)
-void supergrok2_step_kernel(float* __restrict__ p,
-                       float* __restrict__ m,
-                       float* __restrict__ v,
-                       const float* __restrict__ g,
-                       const float* __restrict__ routed,
-                       float lr, float beta1, float beta2,
-                       float eps, float wd, float bc1, float bc2,
-                       int n) {
-    const int gid = blockIdx.x * BlockSize + threadIdx.x;
-    const int stride = BlockSize * gridDim.x;
-    #pragma unroll SG_UNROLL
-    for (int i = gid * VecWidth; i < n; i += stride * VecWidth) {
-        #pragma unroll
-        for (int k = 0; k < VecWidth; ++k) {
-            const int idx = i + k;
-            if (idx >= n) break;
-            supergrok2_step_elem(p + idx, m + idx, v + idx, g[idx], routed[idx],
-                                 lr, beta1, beta2, eps, wd,
-                                 bc1, bc2);
-        }
-    }
-}
-
-extern "C" void launch_supergrok2_step(float* p, float* m, float* v,
-                                     const float* g, const float* routed,
-                                     float lr, float beta1, float beta2,
-                                     float eps, float wd, float bc1, float bc2,
-                                     int n,
-                                  hipStream_t stream) {
-    const int threads = SG_BLOCK_SIZE;
-    const int items_per_block = threads * SG_VEC_WIDTH;
-    const int blocks = (n + items_per_block - 1) / items_per_block;
-    hipLaunchKernelGGL(
-        (supergrok2_step_kernel<SG_BLOCK_SIZE, SG_VEC_WIDTH>),
-        dim3(blocks), dim3(threads), 0, stream,
-        p, m, v, g, routed, lr, beta1, beta2, eps, wd, bc1, bc2, n);
-}
-
-} // namespace sg::gfx942
-""",
-    "supergrok2_pallas.py.j2": r'''# AUTO-GENERATED by grokking_optimizers.codegen — DO NOT EDIT
-# Optimizer:   SuperGrok 2
-# Arch:        {{ arch }} ({{ display_name }})
-# Vendor:      {{ vendor }} (JAX/Pallas — TPU target)
-#
-# Tuned config baked into the Pallas kernel call:
-#   block      = {{ block | default(128) }}
-#   vec        = {{ vec | default(4) }}
-#   unroll     = {{ unroll | default(4) }}
-{% if 'num_stages' in config %}
-#   num_stages = {{ num_stages }}
-{% endif %}
-
-import jax
-import jax.numpy as jnp
-from jax.experimental import pallas as pl
-
-
-SG_BLOCK_SIZE = {{ block | default(128) }}
-SG_VEC_WIDTH = {{ vec | default(4) }}
-SG_UNROLL = {{ unroll | default(4) }}
-
-
-def _supergrok2_step_pallas_kernel(p_ref, m_ref, v_ref, g_ref, routed_ref, lr, beta1, beta2, eps, wd, bc1, bc2,
-                              p_out_ref, m_out_ref, v_out_ref):
-    """Per-block Pallas kernel — runs on one TPU core's HBM slice."""
-    p = p_ref[...]
+                                 bc1, bc2);''',
+        launch_indent=37,
+        launch_param_lines=[
+            'float* p, float* m, float* v,',
+            'const float* g, const float* routed,',
+            'float lr, float beta1, float beta2,',
+            'float eps, float wd, float bc1, float bc2,',
+            'int n,',
+        ],
+        sm90_args=r'''p, m, v, g, routed, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        generic_args=r'''p, m, v, g, routed, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        gfx942_args=r'''p, m, v, g, routed, lr, beta1, beta2, eps, wd, bc1, bc2, n''',
+        pallas_kernel_params=r'''p_ref, m_ref, v_ref, g_ref, routed_ref, lr, beta1, beta2, eps, wd, bc1, bc2,
+                              p_out_ref, m_out_ref, v_out_ref''',
+        pallas_math=r'''    p = p_ref[...]
     m = m_ref[...]
     v = v_ref[...]
     g = g_ref[...]
@@ -16531,24 +14479,91 @@ def _supergrok2_step_pallas_kernel(p_ref, m_ref, v_ref, g_ref, routed_ref, lr, b
     new_p = p - lr * (m_hat / (jnp.sqrt(v_hat) + eps) + wd * p)
     p_out_ref[...] = new_p
     m_out_ref[...] = new_m
-    v_out_ref[...] = new_v
-
-
-def launch_supergrok2_step(p, m, v, g, routed, lr, beta1, beta2, eps, wd, bc1, bc2):
-    """JIT-compiled SuperGrok 2 step. Block size = {{ block | default(128) }}."""
-    grid = (max(1, p.size // SG_BLOCK_SIZE),)
-    fn = pl.pallas_call(
-        lambda *a: _supergrok2_step_pallas_kernel(*a, lr, beta1, beta2, eps, wd, bc1, bc2),
-        out_shape=[
-            jax.ShapeDtypeStruct(p.shape, p.dtype),
+    v_out_ref[...] = new_v''',
+        pallas_launch_params=r'''p, m, v, g, routed, lr, beta1, beta2, eps, wd, bc1, bc2''',
+        pallas_lambda_tail=r'''lr, beta1, beta2, eps, wd, bc1, bc2''',
+        pallas_out_shapes=r'''            jax.ShapeDtypeStruct(p.shape, p.dtype),
             jax.ShapeDtypeStruct(m.shape, m.dtype),
-            jax.ShapeDtypeStruct(v.shape, v.dtype),
-        ],
-        grid=grid,
-    )
-    return fn(p, m, v, g, routed)
-''',
-}
+            jax.ShapeDtypeStruct(v.shape, v.dtype),''',
+        pallas_fn_args=r'''p, m, v, g, routed''',
+    ),
+]
+
+def _wrap_kernel_sig(name: str, param_lines: List[str]) -> str:
+    """Render ``void <name>_step_kernel(<param_lines...>, int n) {`` with
+    historical 23-space alignment (column matches the legacy hand-formatted
+    source for every optimizer)."""
+    indent = " " * 23
+    parts = [f"void {name}_step_kernel({param_lines[0]}"]
+    for p in param_lines[1:]:
+        parts.append(indent + p)
+    parts.append(indent + "int n) {")
+    return "\n".join(parts)
+
+
+def _wrap_launch_sig(indent_width: int, param_lines: List[str]) -> str:
+    """Render the parameter body of ``extern "C" void launch_<name>_step(...)``
+    using per-optimizer ``indent_width`` (preserved from the hand-formatted
+    legacy source). ``param_lines`` already includes the trailing ``int n,``
+    entry; the surrounding base template supplies the ``cudaStream_t`` /
+    ``hipStream_t`` close line."""
+    indent = " " * indent_width
+    parts = [param_lines[0]]
+    for p in param_lines[1:]:
+        parts.append(indent + p)
+    return "\n".join(parts)
+
+
+def _render_bundled_template(base: str, spec: Dict[str, Any]) -> str:
+    """Substitute one spec into one base template via str.replace.
+
+    The base templates contain Jinja2 syntax (``{{ ... }}``, ``{% ... %}``)
+    which passes through unchanged — only the ``__OPT_*__`` placeholders are
+    filled in here.
+    """
+    kernel_sig = _wrap_kernel_sig(spec["name"], spec["kernel_param_lines"])
+    launch_sig = _wrap_launch_sig(spec["launch_indent"],
+                                  spec["launch_param_lines"])
+    return (base
+            .replace("__OPT_NAME__", spec["name"])
+            .replace("__OPT_DISPLAY__", spec["display"])
+            .replace("__OPT_HEADER__", spec["header"])
+            .replace("__OPT_SM90_EXTRA_COMMENT__", spec["sm90_extra_comment"])
+            .replace("__OPT_KERNEL_SIG__", kernel_sig)
+            .replace("__OPT_ELEM_CALL__", spec["elem_call"])
+            .replace("__OPT_LAUNCH_SIG__", launch_sig)
+            .replace("__OPT_SM90_ARGS__", spec["sm90_args"])
+            .replace("__OPT_GENERIC_ARGS__", spec["generic_args"])
+            .replace("__OPT_GFX942_ARGS__", spec["gfx942_args"])
+            .replace("__OPT_PALLAS_KERNEL_PARAMS__",
+                     spec["pallas_kernel_params"])
+            .replace("__OPT_PALLAS_MATH__", spec["pallas_math"])
+            .replace("__OPT_PALLAS_LAUNCH_PARAMS__",
+                     spec["pallas_launch_params"])
+            .replace("__OPT_PALLAS_LAMBDA_TAIL__", spec["pallas_lambda_tail"])
+            .replace("__OPT_PALLAS_OUT_SHAPES__", spec["pallas_out_shapes"])
+            .replace("__OPT_PALLAS_FN_ARGS__", spec["pallas_fn_args"]))
+
+
+def _build_bundled_templates() -> Dict[str, str]:
+    """Assemble the 44-entry _BUNDLED_TEMPLATES dict from the 4 base
+    templates + the 11 per-optimizer specs."""
+    out: Dict[str, str] = {}
+    for spec in _OPTIMIZER_TEMPLATE_SPECS:
+        n = spec["name"]
+        out[f"{n}_sm_90a.cu.j2"] = _render_bundled_template(
+            _TEMPLATE_BASE_SM_90A, spec)
+        out[f"{n}_generic.cu.j2"] = _render_bundled_template(
+            _TEMPLATE_BASE_GENERIC, spec)
+        out[f"{n}_gfx942.hip.cpp.j2"] = _render_bundled_template(
+            _TEMPLATE_BASE_GFX942, spec)
+        out[f"{n}_pallas.py.j2"] = _render_bundled_template(
+            _TEMPLATE_BASE_PALLAS, spec)
+    return out
+
+
+_BUNDLED_TEMPLATES: Dict[str, str] = _build_bundled_templates()
+
 
 # TEMPLATE_ROOT — kept as the legacy filesystem location for any caller that
 # wants to write out emitted sources nearby. Templates themselves are NOT
@@ -17988,7 +16003,7 @@ def _polyhedral_expand_variant(spec, emitted_source: Path,
     logged — this path is opt-in and must NEVER break the unmodified
     autotune flow.
     """
-    poly_cfg = (getattr(spec, "config", {}) or {}).get("polyhedral", {}) or {}
+    poly_cfg = (spec.config or {}).get("polyhedral", {}) or {}
     if not poly_cfg.get("enable"):
         return []
     try:
@@ -19251,7 +17266,7 @@ def _try_synth_codegen(spec: "BuildSpec",
     ``synth_source`` annotation on ``spec._emitted_sources``; the
     function returns ``None`` so the caller can stay on the Jinja path.
     """
-    spec_cfg = getattr(spec, "config", {}) or {}
+    spec_cfg = spec.config or {}
     sc = (spec_cfg.get("synth_codegen") or {})
     allowed = set(sc.get("allowed_patterns") or _SYNTH_KNOWN_PATTERNS)
     # Pattern-selection heuristic: today we map every optimizer to the
@@ -19292,7 +17307,7 @@ def _try_synth_codegen(spec: "BuildSpec",
     except Exception:
         return None
 
-    out_dir = Path(getattr(spec, "out_dir", Path(tempfile.gettempdir())))
+    out_dir = Path(spec.out_dir)
     synth_dir = out_dir / "synth_sources"
     synth_dir.mkdir(parents=True, exist_ok=True)
 
@@ -20079,7 +18094,7 @@ def get_registry(arch: str,
 
 def initialize_registry(spec, report=None) -> Optional[KernelRegistry]:
     """Pre-warm the registry from build() when enable_runtime_specialization=True."""
-    if not getattr(spec, "enable_runtime_specialization", False):
+    if not spec.enable_runtime_specialization:
         return None
     try:
         cache_dir = Path(spec.out_dir) / "nvrtc_cache"
@@ -20088,7 +18103,7 @@ def initialize_registry(spec, report=None) -> Optional[KernelRegistry]:
         if report is not None:
             report.write(f"[nvrtc] disabled: {exc}\n")
         return None
-    op = getattr(spec, "optimizer", "kernel")
+    op = spec.optimizer
     for dtype in ("fp32", "fp64"):
         try:
             reg.dispatch(op, dtype, (1024,))
@@ -20384,7 +18399,7 @@ def bias_trial_queue(study, stall_info: Optional[Dict[str, Any]],
 
 def run_device_pgo_round(spec, workload_cmd: List[str],
                          out_dir: Path, report=None) -> Optional[Path]:
-    if not getattr(spec, "enable_device_pgo", False):
+    if not spec.enable_device_pgo:
         return None
     try:
         stall_info = collect_device_stalls(spec.arch, workload_cmd, out_dir)
