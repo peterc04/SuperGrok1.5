@@ -6311,16 +6311,21 @@ def _preflight_toolchain(arch: str) -> List[str]:
         lines.append(f"[preflight] arch {arch} not in ARCH_TABLE — FAIL")
         return lines
     need = entry.min_toolchain_version
+    # Track (have, vendor, kind) on FAIL so we can append an actionable
+    # ``[preflight] suggestion: ...`` line at the end — Stream β.2.
+    fail_info: Optional[Tuple[str, str, Optional[Tuple[int, ...]]]] = None
     if entry.vendor == "cuda":
         have = _probe_nvcc_version()
         if have is None:
             lines.append(
                 f"[preflight] arch={arch} need CUDA>={need[0]}.{need[1]}: "
                 "nvcc not found — FAIL")
+            fail_info = ("cuda", "missing", None)
         elif have < (need[0], need[1]):
             lines.append(
                 f"[preflight] arch={arch} need CUDA>={need[0]}.{need[1]} "
                 f"have {have[0]}.{have[1]} — FAIL")
+            fail_info = ("cuda", "too_old", tuple(have))
         else:
             lines.append(
                 f"[preflight] arch={arch} need CUDA>={need[0]}.{need[1]} "
@@ -6331,10 +6336,12 @@ def _preflight_toolchain(arch: str) -> List[str]:
             lines.append(
                 f"[preflight] arch={arch} need ROCm>={need[0]}.{need[1]}: "
                 "hipcc not found — FAIL")
+            fail_info = ("hip", "missing", None)
         elif have < (need[0], need[1]):
             lines.append(
                 f"[preflight] arch={arch} need ROCm>={need[0]}.{need[1]} "
                 f"have {have[0]}.{have[1]} — FAIL")
+            fail_info = ("hip", "too_old", tuple(have))
         else:
             lines.append(
                 f"[preflight] arch={arch} need ROCm>={need[0]}.{need[1]} "
@@ -6357,8 +6364,61 @@ def _preflight_toolchain(arch: str) -> List[str]:
                 lines.append(
                     f"[preflight] arch={arch} JAX {jax.__version__} "
                     f"< {need_str} — FAIL")
+                fail_info = ("pallas", "too_old", tuple(jv))
         except ImportError:
             lines.append(f"[preflight] arch={arch} JAX not installed — FAIL")
+            fail_info = ("pallas", "missing", None)
+
+    # ── Stream β.2 — version-mismatch suggestions ────────────────────
+    # When the per-arch min-version judgment FAILed, emit an actionable
+    # one-liner naming (a) how to install/upgrade and (b) the
+    # highest-capability arch the user's current toolchain CAN target.
+    # Wrapped in try/except so a malformed ARCH_TABLE entry never makes
+    # preflight itself crash — the suggestion is advisory.
+    if fail_info is not None:
+        try:
+            vendor_key, kind, have = fail_info
+            need_str = f"{need[0]}.{need[1]}"
+            if vendor_key == "cuda":
+                fix_clause = (
+                    f"install CUDA {need_str}+ via --bootstrap-cuda"
+                    if kind == "missing"
+                    else f"install CUDA {need_str}+ via --bootstrap-cuda"
+                )
+                have_str = (f"your CUDA {have[0]}.{have[1]}"
+                            if have else "your current CUDA")
+            elif vendor_key == "hip":
+                fix_clause = (
+                    f"install ROCm {need_str}+ via --bootstrap-rocm"
+                    if kind == "missing"
+                    else f"install ROCm {need_str}+ via --bootstrap-rocm"
+                )
+                have_str = (f"your ROCm {have[0]}.{have[1]}"
+                            if have else "your current ROCm")
+            else:  # pallas
+                fix_clause = (
+                    f"install jax[tpu]>={need_str} via --bootstrap-jax"
+                )
+                have_str = (
+                    f"your JAX {'.'.join(str(x) for x in have)}"
+                    if have else "your current JAX"
+                )
+            alt = _highest_compatible_arch_for_version(
+                vendor_key, have or (0,))
+            if alt and alt != arch and have is not None:
+                lines.append(
+                    f"[preflight] suggestion: {fix_clause}, OR retry with "
+                    f"--arch {alt} (highest compatible with {have_str})"
+                )
+            else:
+                lines.append(
+                    f"[preflight] suggestion: {fix_clause} — no alternate "
+                    f"arch in ARCH_TABLE is compatible with {have_str}"
+                )
+        except Exception:
+            # Suggestion is advisory — never let it block the preflight
+            # output that callers actually need.
+            pass
     return lines
 
 
@@ -6974,6 +7034,273 @@ def _probe_hipcc_version() -> Optional[Tuple[int, int]]:
     if not m:
         return None
     return int(m.group(1)), int(m.group(2))
+
+
+# ---------------------------------------------------------------------------
+# Stream β — zero-config smart routing: auto-detect --arch when omitted
+# ---------------------------------------------------------------------------
+#
+# Probe order (project-agnostic — no SuperGrok-specific assumptions):
+#   1. torch.cuda.is_available() + torch.cuda.get_device_capability(0)
+#   2. rocm-smi --showproductname   (parse card name → gfx arch)
+#   3. jax.devices() — any TPU → tpu_v{N} from device_kind
+#   4. TOML config ["archs"]["default"]                  (Stream A)
+#   5. Hardcoded final fallback: "sm_90a"
+#
+# Each probe is wrapped in broad exception handling so a hostile environment
+# (missing libraries, broken drivers, mis-parsed output) NEVER crashes
+# auto-detection — we always fall through to the next source. The first
+# probe that returns a valid arch wins; we emit one ``[arch] auto-detected
+# <arch> from <source>`` line so the user can see what happened.
+
+# AMD card-name → gfx arch lookup. Used by the rocm-smi probe to translate
+# the "Card series"/"Card SKU" string into a canonical gfxNNNN entry in
+# ARCH_TABLE. The map is intentionally tolerant — substrings of the rocm-smi
+# output (case-insensitive) are matched, so e.g. "AMD Instinct MI300X" hits
+# "mi300" and routes to gfx942. Add more entries as new SKUs ship; missing
+# entries simply make the probe return None and the next source is tried.
+_ROCM_CARD_TO_GFX: List[Tuple[str, str]] = [
+    # CDNA (data-center)
+    ("mi355", "gfx950"),
+    ("mi350", "gfx950"),
+    ("mi325", "gfx942"),
+    ("mi300", "gfx942"),
+    ("mi250", "gfx90a"),
+    ("mi210", "gfx90a"),
+    ("mi200", "gfx90a"),
+    ("mi100", "gfx908"),
+    ("mi50",  "gfx906"),
+    ("mi60",  "gfx906"),
+    # RDNA4
+    ("rx 9070", "gfx1201"),
+    ("rx 9000", "gfx1200"),
+    ("navi 48", "gfx1201"),
+    ("navi 44", "gfx1200"),
+    # RDNA3.5 (Strix Halo APU)
+    ("strix halo", "gfx1151"),
+    ("ryzen ai max", "gfx1151"),
+    # RDNA3
+    ("rx 7900", "gfx1100"),
+    ("rx 7800", "gfx1101"),
+    ("rx 7700", "gfx1101"),
+    ("rx 7600", "gfx1102"),
+    ("navi 31", "gfx1100"),
+    ("navi 32", "gfx1101"),
+    ("navi 33", "gfx1102"),
+    # RDNA2
+    ("rx 6900", "gfx1030"),
+    ("rx 6800", "gfx1030"),
+    ("rx 6700", "gfx1030"),
+    ("navi 21", "gfx1030"),
+]
+
+
+def _probe_torch_cuda_arch() -> Optional[str]:
+    """Probe torch.cuda for a (major, minor) compute capability and map it
+    to a canonical arch key in ARCH_TABLE. Prefer the ``sm_XYa`` variant
+    (Hopper+: TMA/wgmma require the "a" suffix) before falling back to
+    ``sm_XY``. Returns None on any failure (CPU host, broken driver,
+    library missing) — callers must treat None as "try the next source"."""
+    try:
+        import torch  # noqa: F401
+    except Exception:
+        return None
+    try:
+        if not torch.cuda.is_available():
+            return None
+        major, minor = torch.cuda.get_device_capability(0)
+    except Exception:
+        return None
+    suffixed = f"sm_{major}{minor}a"
+    plain = f"sm_{major}{minor}"
+    if suffixed in ARCH_TABLE:
+        return suffixed
+    if plain in ARCH_TABLE:
+        return plain
+    return None
+
+
+def _probe_rocm_smi_arch() -> Optional[str]:
+    """Run ``rocm-smi --showproductname`` and map the card name to a
+    canonical gfxNNNN entry via ``_ROCM_CARD_TO_GFX``. Returns None on
+    any failure (rocm-smi missing, non-zero exit, unknown card)."""
+    rocm_smi = shutil.which("rocm-smi")
+    if not rocm_smi:
+        return None
+    try:
+        out = subprocess.run(
+            [rocm_smi, "--showproductname"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except Exception:
+        return None
+    if not out:
+        return None
+    haystack = out.lower()
+    for needle, gfx in _ROCM_CARD_TO_GFX:
+        if needle in haystack:
+            if gfx in ARCH_TABLE:
+                return gfx
+    return None
+
+
+def _probe_jax_tpu_arch() -> Optional[str]:
+    """Detect a TPU via ``jax.devices()``; map ``device_kind`` (e.g.
+    ``"TPU v4"``, ``"TPU v5 lite"``, ``"TPU v6 lite"``) to a canonical
+    ``tpu_vN[e|p]`` entry in ARCH_TABLE. Returns None on any failure."""
+    try:
+        import jax  # noqa: F401
+    except Exception:
+        return None
+    try:
+        devs = jax.devices()
+    except Exception:
+        return None
+    for d in devs:
+        if getattr(d, "platform", "") != "tpu":
+            continue
+        kind = (getattr(d, "device_kind", "")
+                or getattr(d, "kind", "")
+                or "").lower()
+        # device_kind strings observed in the wild:
+        #   "TPU v4"  → tpu_v4
+        #   "TPU v5 lite" / "TPU v5e" → tpu_v5e
+        #   "TPU v5p" / "TPU v5"      → tpu_v5p
+        #   "TPU v6 lite" / "TPU v6e" → tpu_v6e
+        #   "TPU v7"  / "Ironwood"    → tpu_v7
+        if "v7" in kind or "ironwood" in kind:
+            cand = "tpu_v7"
+        elif "v6" in kind:
+            cand = "tpu_v6e"
+        elif "v5" in kind and ("lite" in kind or "5e" in kind):
+            cand = "tpu_v5e"
+        elif "v5" in kind:
+            cand = "tpu_v5p"
+        elif "v4" in kind:
+            cand = "tpu_v4"
+        else:
+            continue
+        if cand in ARCH_TABLE:
+            return cand
+    return None
+
+
+def _resolve_default_arch(
+        config: Optional[Dict[str, Any]] = None,
+        *,
+        stream=None) -> str:
+    """Auto-detect the target arch when --arch is omitted on the CLI.
+
+    Probe order — every probe wrapped in broad exception handling so an
+    auto-detect call NEVER crashes; we always fall through to the next
+    source and finally to the hardcoded ``sm_90a`` default:
+
+      1. torch.cuda  → sm_XYa | sm_XY  (compute capability → ARCH_TABLE)
+      2. rocm-smi    → gfxNNNN          (card name → ARCH_TABLE)
+      3. jax.devices → tpu_vN[e|p]      (TPU device_kind → ARCH_TABLE)
+      4. ``config["archs"]["default"]`` if a TOML config supplied one
+      5. Final fallback: ``"sm_90a"``
+
+    Prints one ``[arch] auto-detected <arch> from <source>`` line on
+    ``stream`` (defaults to ``sys.stdout``) so users see what happened.
+    Returns the resolved arch string — guaranteed to be a key in
+    ARCH_TABLE for sources (1)-(3) and (5); for source (4) the value is
+    whatever the TOML supplied (validated against ARCH_TABLE by the
+    caller's ``choices=`` argparse check or downstream ``get_arch_entry``).
+    """
+    if stream is None:
+        stream = sys.stdout
+    # 1. torch.cuda
+    try:
+        arch = _probe_torch_cuda_arch()
+    except Exception:
+        arch = None
+    if arch:
+        stream.write(f"[arch] auto-detected {arch} from "
+                     f"torch.cuda.get_device_capability()\n")
+        return arch
+    # 2. rocm-smi
+    try:
+        arch = _probe_rocm_smi_arch()
+    except Exception:
+        arch = None
+    if arch:
+        stream.write(f"[arch] auto-detected {arch} from "
+                     f"rocm-smi --showproductname\n")
+        return arch
+    # 3. jax.devices (TPU)
+    try:
+        arch = _probe_jax_tpu_arch()
+    except Exception:
+        arch = None
+    if arch:
+        stream.write(f"[arch] auto-detected {arch} from "
+                     f"jax.devices()\n")
+        return arch
+    # 4. TOML config archs.default
+    if isinstance(config, dict):
+        try:
+            cfg_arch = config.get("archs", {}).get("default") or None
+        except Exception:
+            cfg_arch = None
+        if cfg_arch:
+            stream.write(f"[arch] auto-detected {cfg_arch} from config "
+                         f"[archs].default\n")
+            return cfg_arch
+    # 5. Final hardcoded fallback.
+    fallback = "sm_90a"
+    stream.write(f"[arch] auto-detected {fallback} from built-in default "
+                 f"(no GPU/TPU probe matched)\n")
+    return fallback
+
+
+def _highest_compatible_arch_for_version(
+        vendor: str,
+        have: Tuple[int, ...]) -> Optional[str]:
+    """Return the highest-capability canonical arch in ARCH_TABLE whose
+    ``min_toolchain_version`` is <= ``have`` for the given vendor, or
+    None if no arch qualifies.
+
+    "Highest-capability" is approximated by the cutlass_arch / numeric
+    suffix of the arch name (sm_90 > sm_89 > sm_86 > sm_80 ...; gfx950 >
+    gfx942 > gfx90a ...; tpu_v7 > tpu_v6e > tpu_v5p ...). Aliases (sm_90
+    pointing at sm_90a) are deduped so we never suggest "sm_90" when
+    the canonical key is "sm_90a"."""
+    if not have:
+        return None
+
+    def _rank(arch: str, entry: ArchEntry) -> int:
+        # Prefer cutlass_arch when present (CUDA), else extract the leading
+        # numeric run from the arch suffix. Higher = newer/more capable.
+        if entry.cutlass_arch is not None:
+            return entry.cutlass_arch
+        digits = "".join(ch for ch in arch if ch.isdigit())
+        try:
+            return int(digits) if digits else 0
+        except ValueError:
+            return 0
+
+    seen_ids: set = set()
+    best_arch: Optional[str] = None
+    best_rank: int = -1
+    for arch, entry in ARCH_TABLE.items():
+        if entry.vendor != vendor:
+            continue
+        if id(entry) in seen_ids:
+            continue
+        seen_ids.add(id(entry))
+        need = entry.min_toolchain_version
+        # Compare as tuples of identical length (pad with zeros).
+        n = max(len(need), len(have))
+        need_p = tuple(list(need) + [0] * (n - len(need)))
+        have_p = tuple(list(have) + [0] * (n - len(have)))
+        if have_p < need_p:
+            continue
+        r = _rank(arch, entry)
+        if r > best_rank:
+            best_rank = r
+            best_arch = arch
+    return best_arch
 
 
 def _newer_compiler_flags(arch: str, report=None) -> Tuple[List[str], List[str]]:
@@ -9415,9 +9742,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--model", "-M", required=True,
                         choices=_choice_models,
                         help="Model name (csrc/backends/*/models/<name>.*)")
-    parser.add_argument("--arch", "-A", required=True,
+    # Stream β.1 — --arch is optional; when omitted we auto-detect via
+    # ``_resolve_default_arch()`` (torch.cuda → rocm-smi → jax.devices →
+    # TOML config → sm_90a). Passing --arch explicitly preserves today's
+    # behaviour exactly. ``choices=`` is enforced only when a value is
+    # actually supplied, so default=None coexists with the restricted set.
+    parser.add_argument("--arch", "-A", default=None,
                         choices=_choice_archs,
-                        help="Target arch")
+                        help="Target arch (auto-detected when omitted via "
+                             "torch.cuda / rocm-smi / jax.devices / TOML "
+                             "[archs].default)")
     parser.add_argument("--out", type=Path,
                         default=REPO_ROOT / "build" / "compiled",
                         help="Build artifact directory (default: build/compiled)")
@@ -9607,6 +9941,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "<out>/dry_run_<arch>.json. Useful for CI verification "
                              "on hosts without nvcc/hipcc.")
     args = parser.parse_args(argv)
+
+    # Stream β.1 — auto-detect --arch when omitted on the CLI. We must do
+    # this BEFORE any branch that reads args.arch (dry-run-all-archs is
+    # arch-agnostic; the runtime split + build path below all need a
+    # resolved arch). Identical to passing --arch explicitly when the
+    # user does supply one.
+    if getattr(args, "arch", None) is None:
+        args.arch = _resolve_default_arch(_early_cfg)
 
     if args.dry_run_all_archs:
         out_dir = Path(args.out or REPO_ROOT / "build" / "compiled").resolve()
@@ -11899,6 +12241,98 @@ def _self_test() -> int:
         # And: unknown arch returns False, doesn't crash.
         assert bootstrap_toolchain("not_a_real_arch", buf) is False
 
+    # ── Stream β.1 — zero-config arch auto-detection ─────────────────
+    def test_resolve_default_arch_torch_cuda():
+        """When torch.cuda is available and reports compute capability
+        (9, 0), ``_resolve_default_arch()`` must pick ``sm_90a`` and emit
+        a source-attribution line that names ``torch.cuda``."""
+        import io
+        import types
+        # Build a minimal fake torch.cuda module the helper can probe.
+        fake_torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(
+                is_available=lambda: True,
+                get_device_capability=lambda i=0: (9, 0),
+            ),
+        )
+        saved = sys.modules.get("torch")
+        sys.modules["torch"] = fake_torch
+        buf = io.StringIO()
+        try:
+            arch = _resolve_default_arch(config=None, stream=buf)
+        finally:
+            if saved is not None:
+                sys.modules["torch"] = saved
+            else:
+                sys.modules.pop("torch", None)
+        assert arch == "sm_90a", f"expected sm_90a, got {arch!r}"
+        out = buf.getvalue()
+        assert "torch.cuda" in out, f"missing source attribution: {out!r}"
+        assert "sm_90a" in out, f"resolved arch not in output: {out!r}"
+
+    def test_resolve_default_arch_from_config():
+        """When every live probe returns unavailable, the TOML config's
+        ``[archs].default`` must be honoured. We force the probe helpers
+        to return None via monkeypatch and supply a config dict with
+        ``archs.default = "sm_86"``; the helper should pick sm_86 AND
+        emit "from config" in the attribution line."""
+        import io
+        # Save & monkeypatch the three probe helpers (module-level
+        # functions; the helper resolves them by name each call).
+        g = globals()
+        saved_t = g.get("_probe_torch_cuda_arch")
+        saved_r = g.get("_probe_rocm_smi_arch")
+        saved_j = g.get("_probe_jax_tpu_arch")
+        g["_probe_torch_cuda_arch"] = lambda: None
+        g["_probe_rocm_smi_arch"] = lambda: None
+        g["_probe_jax_tpu_arch"] = lambda: None
+        try:
+            cfg = {"archs": {"default": "sm_86"}}
+            buf = io.StringIO()
+            arch = _resolve_default_arch(config=cfg, stream=buf)
+        finally:
+            g["_probe_torch_cuda_arch"] = saved_t
+            g["_probe_rocm_smi_arch"] = saved_r
+            g["_probe_jax_tpu_arch"] = saved_j
+        assert arch == "sm_86", f"expected sm_86 from config, got {arch!r}"
+        out = buf.getvalue()
+        assert "from config" in out, \
+            f"missing 'from config' attribution: {out!r}"
+        assert "sm_86" in out, f"resolved arch not in output: {out!r}"
+
+    def test_preflight_suggestion_on_cuda_version_fail():
+        """Synthesise nvcc 11.5 detected + sm_90a preflight: the FAIL
+        line must be followed by a ``[preflight] suggestion:`` line
+        that names an sm_8x arch (the highest compatible with CUDA
+        11.5 — sm_89 in ARCH_TABLE)."""
+        g = globals()
+        saved = g.get("_probe_nvcc_version")
+        g["_probe_nvcc_version"] = lambda: (11, 5)
+        try:
+            lines = _preflight_toolchain("sm_90a")
+        finally:
+            g["_probe_nvcc_version"] = saved
+        # FAIL line must be present.
+        fail_lines = [ln for ln in lines
+                      if "arch=sm_90a" in ln and "FAIL" in ln]
+        assert fail_lines, \
+            f"no FAIL line for sm_90a vs CUDA 11.5: {lines}"
+        # Suggestion must follow and name a sm_8x arch (highest is sm_89).
+        sugg_lines = [ln for ln in lines if "suggestion:" in ln]
+        assert sugg_lines, \
+            f"no suggestion line on FAIL: {lines}"
+        sugg = sugg_lines[-1]
+        assert "sm_8" in sugg, (
+            f"suggestion doesn't name a sm_8x arch: {sugg!r} "
+            f"(full preflight: {lines})"
+        )
+
+    _run("resolve_default_arch_torch_cuda",
+         test_resolve_default_arch_torch_cuda)
+    _run("resolve_default_arch_from_config",
+         test_resolve_default_arch_from_config)
+    _run("preflight_suggestion_on_cuda_version_fail",
+         test_preflight_suggestion_on_cuda_version_fail)
     _run("bootstrap_helpers_importable", test_bootstrap_helpers_importable)
     _run("target_version_lookup", test_target_version_lookup)
     _run("cuda_target_respects_arch_min", test_cuda_target_respects_arch_min)
@@ -16632,6 +17066,125 @@ def enumerate_schedules(loopnest: LoopNest, arch: str,
 # Source emission
 # ---------------------------------------------------------------------------
 
+def _apply_schedule_lift_body(loopnest: "LoopNest",
+                              schedule: "Schedule",
+                              iter_vars: List[str],
+                              body_indent: str
+                              ) -> Optional[List[str]]:
+    """Lift the original loop body from ``loopnest.body_ast`` (a libclang
+    Cursor captured by ``extract_loopnest_from_template``) and rewrite
+    its identifier references so they match the transformed loop's
+    induction variables (tiled outer/inner pair instead of the original
+    flat axis variable).
+
+    Returns ``None`` when:
+      * ``loopnest.body_ast`` is None (synthetic LoopNest, libclang
+        was absent at extraction time, etc.)
+      * libclang cannot be reloaded at body-lift time
+      * the captured cursor doesn't contain an extractable body
+      * any unexpected exception is raised (defensive — the lift is
+        opt-in and must NEVER block the surrounding schedule emission)
+
+    Otherwise returns a list of emitted source lines, properly
+    indented by ``body_indent``, that the caller can splice into the
+    transformed kernel body.
+
+    Project-agnostic: operates on whatever identifiers / index
+    expressions appear in the captured body. The rewrite is
+    schedule-driven (tile_sizes -> ``ivar_outer + ivar_inner``) and
+    never bakes in any assumption about what the kernel computes.
+    """
+    if loopnest.body_ast is None:
+        return None
+    cindex = _try_import_libclang()
+    if cindex is None:
+        return None
+    import re as _re
+    try:
+        cursor = loopnest.body_ast
+        # Find the innermost for-statement body (or just the function
+        # body if no inner for) — that's where the actual compute
+        # lives. Walk the cursor preorder collecting every FOR_STMT and
+        # take the deepest one's body.
+        CursorKind = cindex.CursorKind
+        fors: List[Any] = []
+        try:
+            for c in cursor.walk_preorder():
+                if c.kind == CursorKind.FOR_STMT:
+                    fors.append(c)
+        except Exception:
+            return None
+        body_cursor = None
+        if fors:
+            # Deepest for-stmt = the one with the most for-ancestors;
+            # libclang doesn't expose ancestor counts directly, so we
+            # use the last entry in pre-order traversal as a proxy
+            # (deepest cursor of the same kind always appears latest).
+            inner_for = fors[-1]
+            try:
+                children = list(inner_for.get_children())
+            except Exception:
+                return None
+            # For-stmt children: init, cond, inc, body (some kinds
+            # may collapse the init). The body is the last
+            # COMPOUND_STMT or expression-statement child.
+            for ch in reversed(children):
+                if ch.kind in (CursorKind.COMPOUND_STMT,
+                               CursorKind.IF_STMT,
+                               CursorKind.BINARY_OPERATOR,
+                               CursorKind.COMPOUND_ASSIGNMENT_OPERATOR,
+                               CursorKind.CALL_EXPR):
+                    body_cursor = ch
+                    break
+            if body_cursor is None and children:
+                body_cursor = children[-1]
+        if body_cursor is None:
+            return None
+        # Lift the textual extent of the body via libclang's token API.
+        try:
+            tokens = list(body_cursor.get_tokens())
+        except Exception:
+            return None
+        if not tokens:
+            return None
+        # Re-assemble token text. libclang gives us each token's
+        # spelling separately — we glue them with single-space joins
+        # which is C-portable (whitespace is insignificant outside of
+        # string literals, and any string literals appear as single
+        # tokens already).
+        raw = " ".join(t.spelling for t in tokens).strip()
+        # Strip outer braces if the cursor was a COMPOUND_STMT — we'll
+        # rewrap.
+        if raw.startswith("{") and raw.endswith("}"):
+            raw = raw[1:-1].strip()
+        if not raw:
+            return None
+        # Apply identifier rewrites for tiled axes: every reference
+        # to ``ivar`` becomes ``(ivar_outer + ivar_inner)`` so the
+        # transformed loop body sees the correct index. Use a
+        # whole-word regex so we don't rewrite identifiers that
+        # merely contain the axis name as a substring.
+        tile_map = dict(schedule.tile_sizes)
+        for ax, ts in tile_map.items():
+            if ts and ts > 1 and ax < len(iter_vars):
+                ivar = iter_vars[ax]
+                pattern = _re.compile(
+                    r"\b" + _re.escape(ivar) + r"\b")
+                raw = pattern.sub(f"({ivar}_outer + {ivar}_inner)", raw)
+        # Split on ';' but preserve braces / pragma directives. The
+        # libclang token reassembly above flattens whitespace, so we
+        # produce one C statement per emitted line.
+        stmts = [s.strip() for s in raw.split(";") if s.strip()]
+        out_lines: List[str] = []
+        for s in stmts:
+            out_lines.append(f"{body_indent}{s};")
+        if not out_lines:
+            return None
+        return out_lines
+    except Exception:
+        return None
+
+
 def apply_schedule(loopnest: LoopNest, schedule: Schedule,
                     arch: str) -> str:
     """Emit transformed C++ / CUDA / HIP source from ``loopnest`` + ``schedule``.
@@ -16723,16 +17276,26 @@ def apply_schedule(loopnest: LoopNest, schedule: Schedule,
                 f"{indent * (depth + 1)}for (int {ivar} = {lo}; "
                 f"{ivar} < {hi}; {ivar} += {step}) {{")
             depth += 1
-    # Body — placeholder identity copy so the source is at least syntactically
-    # complete. The real body lift from libclang is intentionally left for
-    # a follow-up; today we only need the harness to compile + time
-    # transformed *structure*, not preserve a hand-written kernel body.
+    # Body — when a libclang AST cursor is available on the LoopNest,
+    # lift the original loop body verbatim (with identifier rewrites for
+    # any tiled / vectorized axes). When body_ast is None (libclang
+    # absent at extraction time, or the LoopNest was synthesised in
+    # tests / external callers), fall back to an identity copy and
+    # advertise the limitation in a comment so the path is honest.
     body_indent = indent * (depth + 1)
     first_ivar = iter_vars[0]
-    lines.append(f"{body_indent}int _idx = {first_ivar};")
-    lines.append(f"{body_indent}if (_idx < n_elems) {{")
-    lines.append(f"{body_indent}    out[_idx] = in[_idx];")
-    lines.append(f"{body_indent}}}")
+    body_lines = _apply_schedule_lift_body(
+        loopnest, schedule, iter_vars, body_indent)
+    if body_lines is None:
+        lines.append(
+            f"{body_indent}// schedule shape only; libclang absent "
+            f"— body unchanged")
+        lines.append(f"{body_indent}int _idx = {first_ivar};")
+        lines.append(f"{body_indent}if (_idx < n_elems) {{")
+        lines.append(f"{body_indent}    out[_idx] = in[_idx];")
+        lines.append(f"{body_indent}}}")
+    else:
+        lines.extend(body_lines)
     # Close braces.
     for _ in range(depth):
         depth -= 1
