@@ -129,6 +129,7 @@ import collections
 import concurrent.futures
 import datetime
 import hashlib
+import importlib
 import json
 import os
 import platform
@@ -7293,35 +7294,68 @@ def _device_cflags(spec: BuildSpec,
         cutlass_arch_token = (
             f"{entry.cutlass_arch}{entry.arch_suffix}"
             if entry.cutlass_arch is not None else "")
-        if (REPO_ROOT / "third_party/cutlass/include").exists():
+        cutlass_hdrs = (REPO_ROOT / "third_party/cutlass/include").exists()
+        if cutlass_hdrs:
             base += ["-DWITH_CUTLASS",
                      f"-DCUTLASS_NVCC_ARCHS={cutlass_arch_token}"]
+            _trace_add_many(trace, ["-DWITH_CUTLASS",
+                                    f"-DCUTLASS_NVCC_ARCHS={cutlass_arch_token}"],
+                            "third_party/cutlass/include is vendored")
+        else:
+            _trace_add(trace, "-DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=…",
+                       "skipped",
+                       "third_party/cutlass/include not vendored")
         if cutlass_arch_token:
             # Independent of whether CUTLASS headers are vendored — the
             # supported-arch macro is consumed by host code that probes
             # availability at compile time.
             base += [f"-DCUTLASS_NVCC_ARCHS_SUPPORTED={cutlass_arch_token}"]
+            _trace_add(trace,
+                       f"-DCUTLASS_NVCC_ARCHS_SUPPORTED={cutlass_arch_token}",
+                       "kept",
+                       f"ARCH_TABLE[{spec.arch!r}] has cutlass_arch="
+                       f"{entry.cutlass_arch}{entry.arch_suffix!r}")
 
         # Feature-gated capability macros consumed by template specialisations.
-        if "tma" in feats:
-            base += ["-DCUDA_TMA_ENABLED=1"]
-        if "wgmma" in feats:
-            base += ["-DCUDA_WGMMA_ENABLED=1"]
-        if "cluster" in feats:
-            base += ["-DCUDA_CLUSTER_ENABLED=1"]
-        if "fp8" in feats:
-            base += ["-DCUDA_FP8_ENABLED=1"]
-        if "fp4" in feats:
-            base += ["-DCUDA_FP4_ENABLED=1"]
-        if "tcgen05" in feats:
-            base += ["-DCUDA_TCGEN05_ENABLED=1"]
-        if "dyn_parallelism" in feats:
-            base += ["-DCUDA_FORCE_CDP1_IF_SUPPORTED"]
+        for feat, macro in (("tma",            "-DCUDA_TMA_ENABLED=1"),
+                            ("wgmma",          "-DCUDA_WGMMA_ENABLED=1"),
+                            ("cluster",        "-DCUDA_CLUSTER_ENABLED=1"),
+                            ("fp8",            "-DCUDA_FP8_ENABLED=1"),
+                            ("fp4",            "-DCUDA_FP4_ENABLED=1"),
+                            ("tcgen05",        "-DCUDA_TCGEN05_ENABLED=1"),
+                            ("dyn_parallelism", "-DCUDA_FORCE_CDP1_IF_SUPPORTED")):
+            if feat in feats:
+                base += [macro]
+                _trace_add(trace, macro, "kept",
+                           f"feature {feat!r} ∈ ARCH_TABLE[{spec.arch!r}]"
+                           ".features")
+            else:
+                _trace_add(trace, macro, "skipped",
+                           f"feature {feat!r} ∉ ARCH_TABLE[{spec.arch!r}]"
+                           ".features")
 
-        return base + _build_macros(spec)
+        # Optional inline version-gated probe (for --flag-audit, which wants
+        # every decision in one block). The regular build path lets
+        # _torch_load append these later — keeping include_version_gated=False
+        # there means no version-gate decisions appear in the trace yet.
+        if include_version_gated:
+            _eh, ed = _newer_compiler_flags(spec.arch, report=None,
+                                            trace=trace)
+            base += ed
+
+        macros = _build_macros(spec)
+        if macros:
+            _trace_add_many(trace, macros,
+                            f"-D macros derived from BuildSpec "
+                            f"(macro_prefix={spec.macro_prefix!r})")
+        if own_trace and trace is not None:
+            _emit_flag_trace_block("device_cflags", trace)
+        return base + macros
 
     if entry.vendor == "hip":
         base = list(HIPCC_DEVICE_BASE)
+        _trace_add_many(trace, list(HIPCC_DEVICE_BASE),
+                        "base hipcc flag (HIPCC_DEVICE_BASE, no version gate)")
         # Per-arch --offload-arch from ARCH_TABLE. Stream α: gfx950 (CDNA4)
         # benefits from explicit SRAM-ECC + XNACK suffixes — the bitcode
         # library picker uses those bits to choose the right variant. Other
@@ -7330,53 +7364,115 @@ def _device_cflags(spec: BuildSpec,
         if entry.hipcc_offload_arch:
             offload = entry.hipcc_offload_arch
             if offload == "gfx950":
-                base += [f"--offload-arch={offload}:sramecc+:xnack-"]
+                tok = f"--offload-arch={offload}:sramecc+:xnack-"
+                base += [tok]
+                _trace_add(trace, tok, "kept",
+                           "gfx950 (CDNA4) → explicit SRAM-ECC + XNACK suffix")
             else:
-                base += [f"--offload-arch={offload}"]
+                tok = f"--offload-arch={offload}"
+                base += [tok]
+                _trace_add(trace, tok, "kept",
+                           f"ARCH_TABLE[{spec.arch!r}]"
+                           f".hipcc_offload_arch={offload!r}")
+        else:
+            _trace_add(trace, "--offload-arch=…", "skipped",
+                       f"ARCH_TABLE[{spec.arch!r}].hipcc_offload_arch empty")
 
         # CDNA (gfx9xx, wave64) gets -mcumode for compute-unit mode (vs the
         # default WGP mode that pairs CUs in RDNA). RDNA (gfx10xx+, wave32)
         # instead gets the wave32 enable + tgsplit toggle.
         if entry.warp_size == 64:
             base += ["-mcumode"]
+            _trace_add(trace, "-mcumode", "kept",
+                       f"warp_size=64 (CDNA) → CU mode (not WGP)")
+            _trace_add(trace, "-mtgsplit -mwavefrontsize32", "skipped",
+                       "warp_size=64 (CDNA, not RDNA)")
         elif entry.warp_size == 32:
             base += ["-mtgsplit", "-mwavefrontsize32"]
+            _trace_add_many(trace, ["-mtgsplit", "-mwavefrontsize32"],
+                            "warp_size=32 (RDNA) → wave32 + tgsplit")
+            _trace_add(trace, "-mcumode", "skipped",
+                       "warp_size=32 (RDNA, not CDNA)")
 
         # Feature-gated AMDGPU capability macros (consumed by header specs).
-        if "mfma" in feats:
-            base += ["-DAMDGPU_MFMA_ENABLED=1"]
-        if "wmma" in feats:
-            base += ["-DAMDGPU_WMMA_ENABLED=1"]
-        if "bf16_mfma" in feats:
-            base += ["-DAMDGPU_BF16_MFMA=1"]
-        if "fp8_mfma" in feats:
-            base += ["-DAMDGPU_FP8_MFMA=1"]
-        if "fp4_mfma" in feats:
-            base += ["-DAMDGPU_FP4_MFMA=1"]
-        if "tgsplit" in feats:
-            base += ["-DAMDGPU_TGSPLIT=1"]
-        if "dpp" in feats:
-            base += ["-DAMDGPU_DPP=1"]
-        if "fp8" in feats:
-            base += ["-DAMDGPU_FP8_ENABLED=1"]
+        for feat, macro in (("mfma",       "-DAMDGPU_MFMA_ENABLED=1"),
+                            ("wmma",       "-DAMDGPU_WMMA_ENABLED=1"),
+                            ("bf16_mfma",  "-DAMDGPU_BF16_MFMA=1"),
+                            ("fp8_mfma",   "-DAMDGPU_FP8_MFMA=1"),
+                            ("fp4_mfma",   "-DAMDGPU_FP4_MFMA=1"),
+                            ("tgsplit",    "-DAMDGPU_TGSPLIT=1"),
+                            ("dpp",        "-DAMDGPU_DPP=1"),
+                            ("fp8",        "-DAMDGPU_FP8_ENABLED=1")):
+            if feat in feats:
+                base += [macro]
+                _trace_add(trace, macro, "kept",
+                           f"feature {feat!r} ∈ ARCH_TABLE[{spec.arch!r}]"
+                           ".features")
+            else:
+                _trace_add(trace, macro, "skipped",
+                           f"feature {feat!r} ∉ ARCH_TABLE[{spec.arch!r}]"
+                           ".features")
 
         # Debug-only: -fgpu-sanitize is opt-in (it adds nontrivial overhead).
         if spec.debug_symbols:
-            base += ["-fgpu-sanitize"]
-            # Stream α: --save-temps=cwd preserves the device IR / object
-            # artefacts in the build CWD for post-mortem disassembly. Only
-            # enabled in debug mode (it inflates build-dir size noticeably).
-            base += ["--save-temps=cwd"]
+            base += ["-fgpu-sanitize", "--save-temps=cwd"]
+            _trace_add_many(trace, ["-fgpu-sanitize", "--save-temps=cwd"],
+                            "spec.debug_symbols=True → device sanitizer "
+                            "+ preserve intermediates")
+        else:
+            _trace_add(trace, "-fgpu-sanitize --save-temps=cwd", "skipped",
+                       "spec.debug_symbols=False")
         if spec.debug_symbols or spec.profile:
             base += ["-ggdb"]
-        return base + _build_macros(spec)
+            _trace_add(trace, "-ggdb", "kept",
+                       f"spec.debug_symbols={spec.debug_symbols} "
+                       f"spec.profile={spec.profile} → DWARF debug info")
+        else:
+            _trace_add(trace, "-ggdb", "skipped",
+                       "spec.debug_symbols=False spec.profile=False")
+
+        if include_version_gated:
+            _eh, ed = _newer_compiler_flags(spec.arch, report=None,
+                                            trace=trace)
+            base += ed
+
+        macros = _build_macros(spec)
+        if macros:
+            _trace_add_many(trace, macros,
+                            f"-D macros derived from BuildSpec "
+                            f"(macro_prefix={spec.macro_prefix!r})")
+        if own_trace and trace is not None:
+            _emit_flag_trace_block("device_cflags", trace)
+        return base + macros
+    # Pallas / unknown vendor → no device cflags. Still emit one note so
+    # the trace block isn't completely empty in --flag-audit.
+    _trace_add(trace, "(no device cflags)", "kept",
+               f"vendor={entry.vendor}: no nvcc/hipcc — see [xla_env]")
+    if own_trace and trace is not None:
+        _emit_flag_trace_block("device_cflags", trace)
     return []
 
 
-def _ldflags(spec: BuildSpec) -> List[str]:
-    if get_arch_entry(spec.arch).vendor == "pallas":
+def _ldflags(spec: BuildSpec,
+             trace: Optional[_FlagTrace] = None) -> List[str]:
+    """Return the linker flag list. Pallas archs use an empty list (no host
+    linker invocation)."""
+    own_trace = trace is None and _trace_enabled(spec)
+    if own_trace:
+        trace = []
+    entry = get_arch_entry(spec.arch)
+    if entry.vendor == "pallas":
+        _trace_add(trace, "(no ldflags)", "kept",
+                   "vendor=pallas: no host linker invocation")
+        if own_trace and trace is not None:
+            _emit_flag_trace_block("ldflags", trace)
         return []
-    return list(LDFLAGS_BASE)
+    flags = list(LDFLAGS_BASE)
+    _trace_add_many(trace, list(LDFLAGS_BASE),
+                    "base ldflag (LDFLAGS_BASE, no version gate)")
+    if own_trace and trace is not None:
+        _emit_flag_trace_block("ldflags", trace)
+    return flags
 
 
 # ---- XLA / Pallas worker env (Stream 3) ----------------------------------
