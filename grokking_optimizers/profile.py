@@ -87,7 +87,7 @@ MODELS: Tuple[str, ...] = ("mamba", "decoder", "vit")
 # compile.py imports several names from this module at load time.
 ARCHES: Tuple[str, ...] = (
     # NVIDIA / CUDA
-    "sm_75", "sm_80", "sm_86", "sm_89",
+    "sm_70", "sm_75", "sm_80", "sm_86", "sm_89",
     "sm_90", "sm_90a",
     "sm_100", "sm_100a",
     "sm_103", "sm_103a",
@@ -496,29 +496,30 @@ def profile_hip(optimizer: str, model: str, arch: str, report,
 def profile_pallas(optimizer: str, model: str, arch: str, report,
                    timeout: int = 900) -> int:
     body = smoke_script(optimizer, model, arch)
-    wrapper = textwrap.dedent(f"""\
-        import sys, os, tempfile, traceback
+    try:
+        import jax.profiler  # noqa: F401
+    except ImportError:
+        report.write("[profile-pallas] jax.profiler not available — skip\n")
+        return 0
+    import tempfile
+    tdir = tempfile.mkdtemp(prefix="grok_profile_pallas_")
+    try:
+        jax.profiler.start_trace(tdir)
         try:
-            import jax.profiler
-        except ImportError:
-            print('[skip] jax.profiler not available', file=sys.stderr)
-            sys.exit(0)
-        with tempfile.TemporaryDirectory() as tdir:
-            jax.profiler.start_trace(tdir)
-            try:
-                exec(compile({body!r}, '<smoke>', 'exec'))
-            except Exception:
-                traceback.print_exc()
-            finally:
-                jax.profiler.stop_trace()
-            print('--- jax.profiler trace contents ---')
-            for root, _, files in os.walk(tdir):
-                for f in files:
-                    fp = os.path.join(root, f)
-                    print(f'{{f}}: {{os.path.getsize(fp)}} bytes')
-    """)
-    return run_capture([sys.executable, "-c", wrapper], report,
-                       timeout=timeout)
+            exec(compile(body, "<smoke>", "exec"))  # noqa: S102
+        except Exception:
+            import traceback
+            report.write(traceback.format_exc())
+        finally:
+            jax.profiler.stop_trace()
+        report.write("--- jax.profiler trace contents ---\n")
+        for root, _, files in os.walk(tdir):
+            for f in files:
+                fp = os.path.join(root, f)
+                report.write(f"  {f}: {os.path.getsize(fp)} bytes\n")
+    except Exception as exc:
+        report.write(f"[profile-pallas] in-process trace failed: {exc}\n")
+    return 0
 
 
 def _dispatch_profile(optimizer: str, model: str, arch: str, report,
@@ -528,7 +529,9 @@ def _dispatch_profile(optimizer: str, model: str, arch: str, report,
         return profile_cuda(optimizer, model, arch, report, timeout=timeout)
     if vendor == "hip":
         return profile_hip(optimizer, model, arch, report, timeout=timeout)
-    return profile_pallas(optimizer, model, arch, report, timeout=timeout)
+    if vendor == "pallas":
+        return profile_pallas(optimizer, model, arch, report, timeout=timeout)
+    raise ValueError(f"unknown vendor {vendor!r} for arch {arch!r}")
 
 
 # ---------------------------------------------------------------------------
