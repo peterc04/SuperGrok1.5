@@ -7864,7 +7864,8 @@ _XLA_FLAGS_BASE: Tuple[str, ...] = (
 )
 
 
-def _xla_env(arch: str, out_dir: Path) -> Dict[str, str]:
+def _xla_env(arch: str, out_dir: Path,
+             trace=None) -> Dict[str, str]:
     """Return env-var dict for the XLA / Pallas worker subprocess.
 
     Empty dict for non-Pallas archs (so callers can unconditionally
@@ -8854,7 +8855,8 @@ def _highest_compatible_arch_for_version(
     return best_arch
 
 
-def _newer_compiler_flags(arch: str, report=None) -> Tuple[List[str], List[str]]:
+def _newer_compiler_flags(arch: str, report=None,
+                          trace=None) -> Tuple[List[str], List[str]]:
     """Return (extra_host, extra_device) flags that are safe additions
     when the detected toolchain is new enough. §12 C1 — pure autodetect,
     no-op on older toolchains. Dispatch is by ARCH_TABLE vendor so every
@@ -8949,6 +8951,85 @@ def _newer_compiler_flags(arch: str, report=None) -> Tuple[List[str], List[str]]
 # Build driver — torch.utils.cpp_extension.load with ninja
 # ---------------------------------------------------------------------------
 
+def _summarize_build_failure(exc, collected_text, module_name, elapsed, arch):
+    """Build a list of human-readable summary lines for a failed build.
+
+    Scans ``collected_text`` for the first nvcc/hipcc error line AND for
+    any ``nvcc fatal: Unknown option '<flag>'`` patterns. Returns the
+    lines to write at the TOP of the failure block.
+    """
+    import re as _re
+    lines = []
+    error_lines = []
+    fatal_unknown_flags = []
+    nvcc_error_count = 0
+    for ln in collected_text.splitlines():
+        low = ln.lower()
+        if ("nvcc fatal" in low or "nvcc error" in low
+                or "hipcc fatal" in low
+                or low.startswith("error:") or " error:" in low):
+            nvcc_error_count += 1
+            if len(error_lines) < 1:
+                error_lines.append(ln.strip())
+        m = _re.search(
+            r"""(?:nvcc|hipcc|ptxas)\s+(?:fatal|error)\s*:\s*Unknown option\s*"""
+            r"""['"]?([^'"
+]+?)['"]?(?:$|\s*\(|\s+at )""",
+            ln, _re.IGNORECASE)
+        if m:
+            fatal_unknown_flags.append(m.group(1).strip())
+    first_error = (error_lines[0] if error_lines
+                   else f"{type(exc).__name__}: {exc}")
+    lines.append("")
+    lines.append("=" * 72)
+    lines.append(
+        f"[build FAILURE summary] module={module_name} in {elapsed:.1f}s")
+    lines.append(f"  First compiler error: {first_error}")
+    lines.append(f"  Total compile errors detected: {nvcc_error_count}")
+    lines.append("=" * 72)
+    nvcc_ver = _probe_nvcc_version()
+    nvcc_ver_str = (f"{nvcc_ver[0]}.{nvcc_ver[1]}"
+                    if nvcc_ver else "<unknown>")
+    seen_sugg = set()
+    for fl in fatal_unknown_flags:
+        if fl in seen_sugg:
+            continue
+        seen_sugg.add(fl)
+        lines.append(
+            f"[suggestion] flag {fl!r} may be too new for nvcc "
+            f"{nvcc_ver_str}. Add --no-validate-flags to bypass, or "
+            f"upgrade CUDA.")
+    lines.append("")
+    lines.append("[common causes]")
+    lines.append(
+        f"  - Mismatched CUDA + nvcc versions. Detected: nvcc "
+        f"{nvcc_ver_str}. Try `--bootstrap-cuda` to install a fresher "
+        f"toolchain.")
+    cuda_home = os.environ.get("CUDA_HOME", "")
+    if cuda_home:
+        lines.append(
+            f"  - Stale `CUDA_HOME` env var. Detected: {cuda_home}. "
+            f"Run `_reconcile_cuda_home()` (see compile.py) or unset "
+            f"CUDA_HOME and re-run.")
+    else:
+        lines.append(
+            "  - CUDA_HOME is not set in the env. If the build expected "
+            "a specific install, `export CUDA_HOME=/usr/local/cuda` and "
+            "re-run.")
+    detected_gpu = "<not probed>"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            detected_gpu = torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    lines.append(
+        f"  - Wrong arch for this GPU. Detected GPU: {detected_gpu}. "
+        f"Try `--arch auto` or specify `--arch <correct>` (target was "
+        f"{arch!r}).")
+    return lines
+
+
 def _torch_load(spec: BuildSpec, sources: List[Path],
                 host_cflags: List[str], device_cflags: List[str],
                 ldflags: List[str], report,
@@ -9012,6 +9093,27 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
             )
         except Exception as exc:
             elapsed = time.monotonic() - t0
+            # Stream — debug-flags: collect ALL ninja / log content so the
+            # failure-summary builder can scan for the first nvcc error.
+            _collected = [str(exc)]
+            for _log_name in ("build.ninja", ".ninja_log", "build.log",
+                              "compile_commands.json", "ninja_build.log"):
+                _lp = build_dir / _log_name
+                if _lp.is_file():
+                    try:
+                        _collected.append(_lp.read_text(errors="replace"))
+                    except Exception:
+                        pass
+            try:
+                _sum_lines = _summarize_build_failure(
+                    exc, "\n".join(_collected),
+                    module_name=module_name, elapsed=elapsed,
+                    arch=spec.arch)
+                for _ln in _sum_lines:
+                    report.write(_ln + "\n")
+            except Exception as _sum_exc:
+                report.write(f"\n[failure summary builder errored: "
+                             f"{_sum_exc}]\n")
             report.write(f"\n[build FAILED after {elapsed:.1f}s]\n{exc}\n")
             # Surface the actual compiler/linker error that torch's
             # cpp_extension swallowed. Look in the build directory for
@@ -13014,6 +13116,103 @@ def _self_test_flags(run) -> None:
     run("stream_alpha_nvcc_flags", test_stream_alpha_nvcc_flags)
     run("stream_alpha_hipcc_flags", test_stream_alpha_hipcc_flags)
     run("stream_alpha_xla_flags", test_stream_alpha_xla_flags)
+
+    # ---- Stream — debug-flags / flag-audit ------------------------------
+
+    def test_flag_trace_recorded_per_decision():
+        """_device_cflags(spec, trace=...) populates the trace list with
+        one entry per decision; the version-gated probe adds PASS/SKIP
+        labels for every gate."""
+        spec = _spec("sm_90a")
+        trace = []
+        _device_cflags(spec, trace=trace, include_version_gated=True)
+        assert trace, "trace must contain at least one entry"
+        kept = sum(1 for _f, st, _r in trace if st == "kept")
+        assert kept > 0, "trace should record some kept flags"
+        reasons = {r for _f, _st, r in trace}
+        assert any("base nvcc" in r for r in reasons), \
+            "trace missing 'base nvcc' reason"
+        assert any("ARCH_TABLE" in r for r in reasons), \
+            "trace missing ARCH_TABLE-driven reason"
+        ver_reasons = [r for _f, _st, r in trace
+                       if "gated CUDA>=" in r or "nvcc not on PATH" in r]
+        assert ver_reasons, "trace missing version-gated probe decisions"
+
+    def test_flag_audit_mode_writes_file():
+        """Invoking the CLI in --flag-audit mode writes
+        <out>/flag_audit.txt and contains every canonical arch."""
+        td = Path(tempfile.mkdtemp())
+        try:
+            rc = main(["--flag-audit", "--out", str(td)])
+            assert rc == 0, f"--flag-audit returned {rc}, expected 0"
+            audit_path = td / "flag_audit.txt"
+            assert audit_path.is_file(), \
+                f"audit file not written: {audit_path}"
+            text = audit_path.read_text()
+            for arch in ("sm_90a", "sm_75", "gfx942", "gfx1100"):
+                assert arch in text, f"audit missing arch {arch!r}"
+            for label in ("[host_cflags]", "[device_cflags]", "[ldflags]"):
+                assert label in text, f"audit missing label {label!r}"
+            assert "FINAL:" in text, "audit missing FINAL summary line"
+        finally:
+            shutil.rmtree(td)
+
+    def test_debug_banner_includes_toolchain_versions():
+        """The debug banner block (in build()) calls the version-string
+        probes for nvcc / hipcc / jax and includes them in the banner."""
+        nv = _probe_nvcc_version_string()
+        hi = _probe_hipcc_version_string()
+        jx = _probe_jax_version_string()
+        for s_ in (nv, hi, jx):
+            assert s_ is None or isinstance(s_, str)
+        import inspect as _inspect
+        try:
+            src = _inspect.getsource(build)
+        except OSError:
+            return
+        assert "_probe_nvcc_version_string" in src, \
+            "build() must call _probe_nvcc_version_string for the banner"
+        assert "_probe_hipcc_version_string" in src, \
+            "build() must call _probe_hipcc_version_string for the banner"
+        assert "_probe_jax_version_string" in src, \
+            "build() must call _probe_jax_version_string for the banner"
+        assert "arch-eligibility" in src, \
+            "build() banner must include arch-eligibility verdict"
+        assert "disk:" in src, \
+            "build() banner must report free disk space"
+
+    def test_build_failure_summary_lists_first_nvcc_error():
+        """_summarize_build_failure extracts the first nvcc error,
+        emits a per-flag suggestion for any 'Unknown option' line, and
+        appends a common-causes footer."""
+        sample = (
+            "nvcc fatal   : Unknown option '--device-link-options=-dlto'\n"
+            "ninja: build stopped: subcommand failed.\n"
+        )
+        lines = _summarize_build_failure(
+            RuntimeError("Error building extension 'foo'"),
+            sample, module_name="grokking_compiled_x", elapsed=12.3,
+            arch="sm_90a")
+        joined = "\n".join(lines)
+        assert "[build FAILURE summary]" in joined
+        assert "First compiler error:" in joined
+        assert "--device-link-options=-dlto" in joined
+        assert "[suggestion]" in joined, \
+            "missing per-flag suggestion for Unknown option"
+        assert "[common causes]" in joined, "missing common-causes footer"
+        assert "Mismatched CUDA + nvcc" in joined
+        assert "Wrong arch for this GPU" in joined
+        assert "Total compile errors detected:" in joined
+        assert "grokking_compiled_x" in joined
+        assert "12.3s" in joined
+
+    run("flag_trace_recorded_per_decision",
+        test_flag_trace_recorded_per_decision)
+    run("flag_audit_mode_writes_file", test_flag_audit_mode_writes_file)
+    run("debug_banner_includes_toolchain_versions",
+        test_debug_banner_includes_toolchain_versions)
+    run("build_failure_summary_lists_first_nvcc_error",
+        test_build_failure_summary_lists_first_nvcc_error)
 
 
 def _self_test_bayesian(run) -> None:
