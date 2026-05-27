@@ -27,7 +27,7 @@ you confirm the wrapper is healthy on the current host without
 installing anything but Python and the package itself:
 
 ```bash
-# 1. Run the inline self-test suite (116 checks, no GPU needed)
+# 1. Run the inline self-test suite (122 checks, no GPU needed)
 python3 -m grokking_optimizers.compile --self-test
 
 # 2. List every supported arch with its vendor / min toolchain / features
@@ -59,26 +59,33 @@ re-prefixes for your project. Example:
 ```toml
 # myproject.toml
 [project]
-name          = "myproject"      # → ~/.cache/myproject/nvrtc, NVRTC cache namespace
-namespace     = "myproject"      # → C++ namespace in emitted code
-python_package = "myproject"      # → import path the registry uses
+name              = "myproject"      # → ~/.cache/myproject/nvrtc, NVRTC cache namespace
+namespace         = "myproject"      # → C++ namespace in emitted code
+python_package    = "myproject"      # → import path the registry uses
+macro_prefix      = "MYPROJ_"        # → -DMYPROJ_OPTIMIZER_*, -DMYPROJ_ARCH_*, -DMYPROJ_VERBOSE
+fused_op_template = "fused_{name}_step.cpp.j2"
+# (macro_prefix and fused_op_template can ALSO be placed under [sources] if
+#  that reads more naturally; both locations are accepted, [project] wins.)
 
 [sources]
-source_layout = "src/myproject/{name}"        # where your .cu / .hip.cpp / .py live
-macro_prefix  = "MYPROJ_"                     # → -DMYPROJ_OPTIMIZER_*, -DMYPROJ_ARCH_*, -DMYPROJ_VERBOSE
-fused_op_template = "fused_{name}_step.cpp.j2"
+source_layout    = "src/myproject/{name}"      # where your .cu / .hip.cpp / .py live
 
 [archs]
-default = "sm_86"                # used when --arch is omitted and no GPU probe succeeds
+default = "sm_86"                              # used when --arch is omitted and no GPU probe succeeds
 
 [optimizers]
 enabled = ["adamw", "lion", "my_custom_opt"]  # any optimizer name; not restricted to the SuperGrok 11
 ```
 
 Then drive `compile.py` exactly as below but with `--config myproject.toml`
-or `build(..., config="myproject.toml")`. Verified end-to-end: emits
-`-DMYPROJ_OPTIMIZER_ADAMW`, `-DMYPROJ_ARCH_SM_86`, `-DMYPROJ_VERBOSE`
-with **zero `SG_BUILD_` leakage** across all 25 archs.
+or `build(..., config="myproject.toml")`. Verified end-to-end via the
+self-test `project_agnostic_dry_run_no_sg_leakage`: with the above
+config the wrapper emits `-DMYPROJ_OPTIMIZER_ADAMW=1`,
+`-DMYPROJ_ARCH_SM86=1` (note: arch macro uses the literal arch label
+from `ARCH_TABLE` — `SM86`, not `SM_86`), and `-DMYPROJ_VERBOSE=1`
+with **zero `SG_BUILD_` leakage** across all 25 archs. The new
+`enabled_features` field in every dry-run manifest also surfaces which
+opt-in toggles were enabled.
 
 ### Step 1 — Clone the repo
 
@@ -397,10 +404,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path.cwd()))   # assumes you're in SuperGrok1.5/
 
 from grokking_optimizers.compile import main as compile_main
-assert compile_main(["--self-test"]) == 0  # prints "[self-test] 116 passed, 0 failed"
+assert compile_main(["--self-test"]) == 0  # prints "[self-test] 122 passed, 0 failed"
 ```
 
-The 116-test self-test covers: ARCH_TABLE completeness for all 25 archs,
+The 122-test self-test covers: ARCH_TABLE completeness for all 25 archs,
 per-arch search-space cardinalities (billions per CUDA/HIP arch, ~3.4T for
 sm_100a), the new Stream α native flag emission (`--warn-on-spills`,
 `--default-stream per-thread`, `-rdc=true`, `--source-in-ptx` on NVIDIA;
@@ -421,11 +428,15 @@ Stream β auto-arch resolver (torch.cuda → rocm-smi → jax.devices → TOML �
 fallback), the preflight version-mismatch suggestion lines, the per-arch
 dry-run manifest sweep, the e2e smoke gate, Pallas backend sentinels with
 the `block_spec` search-space dim, numerical-validation tolerances, the
-TOML config loader (with project-agnostic macro-prefix override), the
-Optuna 4.0+ `study.tell(state=PRUNED)` regression test, the
-buildspec-field AST guardrail (catches field renames at test time), and
-toolchain-bootstrap dispatch — no GPU, nvcc, hipcc, or jax[tpu] required
-to pass it.
+TOML config loader (with project-agnostic macro-prefix override and
+`[project]` / `[sources]` dual-location acceptance), the Optuna 4.0+
+`study.tell(state=PRUNED)` regression test (all 4 paths: infeasible,
+exception, cost-model, non-finite), the v4 cache fresh-write sidecar
+plumbing (the `record_trial` path now writes `.jsonl` sidecars directly,
+not just on migration), the dry-run `enabled_features` feature-toggle
+manifest field, the buildspec-field AST guardrail (catches field renames
+at test time), and toolchain-bootstrap dispatch — no GPU, nvcc, hipcc,
+or jax[tpu] required to pass it.
 
 ### Troubleshooting
 
@@ -691,6 +702,54 @@ them:
   archs (previously invisible). `[autotune] early stop: <reason>`
   printed to stdout (previously only in returned dict).
 
+### Round-2 verification fixes (`bc4aaa3`)
+
+A second round of ten parallel verification agents (re-exercising every
+layer after the first fix-up) caught three more bugs that the new
+self-tests missed plus three hardening opportunities:
+
+- **`--enable-synth-codegen` / `--enable-polyhedral` silently ignored in
+  `--dry-run` path**: argparse accepted the flags, BuildSpec was wired
+  for the real build path, but `--dry-run` short-circuited into
+  `_dry_run_all_archs` which constructed a fresh BuildSpec per arch
+  with hardcoded defaults. Manifests were byte-identical with or without
+  the flags. **Fix**: `_dry_run_all_archs` now accepts the toggle
+  kwargs, threads them onto each per-arch BuildSpec, and surfaces them
+  as an `enabled_features` dict in every emitted manifest. The dict
+  exposes all opt-in toggles (`enable_synth_codegen`,
+  `enable_polyhedral`, `enable_runtime_specialization`,
+  `enable_device_pgo`, `enable_cost_model`, `enable_emitter`,
+  `strict_numerics`).
+- **`CompileCache.record_trial` wrote to in-memory list, not v4 `.jsonl`
+  sidecar**: only v3→v4 migrations created sidecars; freshly-recorded
+  trials on a v4 cache stayed in the main JSON as `bayesian_trials` /
+  `sweep_history` lists. The promised v4 layout was hybrid. **Fix**:
+  `record_trial` now writes each trial directly to
+  `<cache_dir>/trials_<opt>_<model>_<arch>.jsonl` (append + `fsync`),
+  updates `trial_log_path` and `trial_log_summary`, and falls back to
+  in-memory-only with a `[cache] WARN` line if the sidecar write fails
+  (disk full, permission denied). On `save()`, the in-memory lists are
+  emptied to `[]` placeholders before writing the main JSON.
+- **`macro_prefix` / `fused_op_template` only accepted under `[project]`**:
+  user TOMLs placing these under `[sources]` (intuitive given their
+  semantic relation to source layout) silently lost the value. **Fix**:
+  `apply_to_buildspec` now accepts either location, with `[project]`
+  canonical (wins on collision); `[sources]` is recognized as a
+  fallback.
+
+Plus three opportunistic hardening additions:
+
+- Extended Optuna 4.0 regression test from 1 path (FAIL via exception)
+  to all 4 paths (infeasible-prefilter PRUNED, exception FAIL,
+  cost-model PRUNED, non-finite FAIL).
+- Added `inst_fetch` (CUPTI instruction-fetch stall reason) to
+  `STALL_DIM_HINTS` — `_parse_nsys_stall_section` was silently dropping
+  it. Now biases `maxrregcount` and `block` dims. Count bumped 13 → 14.
+- Documented `get_registry`'s per-arch singleton behavior in its
+  docstring: first call wins; subsequent calls with a different
+  `config=` for the same arch return the existing registry. Clear
+  `_REGISTRY[arch]` to force a re-build.
+
 ### Bayesian auto early-stopping
 
 `--bayesian-trials` defaults to `None` (auto). The autotune loop runs
@@ -927,9 +986,12 @@ order:
 3. Packaged defaults — now inlined inside compile.py as the
    `_DEFAULT_PROJECT_CONFIG` dict (no external TOML file needed)
 
-12 sections: `[project]`, `[sources]`, `[optimizers]`, `[models]`,
+15 sections: `[project]`, `[sources]`, `[optimizers]`, `[models]`,
 `[archs]`, `[pgo]`, `[autotune]`, `[codegen]`, `[runtime_specialization]`,
-`[device_pgo]`, `[cache]`, `[numerics]`. Strictly additive — without a
+`[device_pgo]`, `[cache]`, `[numerics]`, plus `[synth_codegen]`,
+`[polyhedral]`, `[cost_model]` (the last three added by Streams B / C /
+D for the OpGraph synth codegen, polyhedral schedule search, and
+learned cost-model layers respectively). Strictly additive — without a
 config file, behavior is identical to today.
 
 ### Verification harnesses
@@ -939,7 +1001,7 @@ needing a target GPU:
 
 | Flag | Behaviour |
 |------|-----------|
-| `--self-test` | 116-test inline suite covering every layer of the wrapper (ARCH_TABLE, search spaces, codegen, autotune, cache v4, polyhedral, synth codegen, Stream α/β/γ regression tests). Runs in ~30s on a CPU-only host. |
+| `--self-test` | 122-test inline suite covering every layer of the wrapper (ARCH_TABLE, search spaces, codegen, autotune, cache v4, polyhedral, synth codegen, Stream α/β/γ regression tests). Runs in ~30s on a CPU-only host. |
 | `--list-archs` | Dumps every entry in ARCH_TABLE — one line per arch with vendor, min toolchain version, and feature set (wgmma / tcgen05 / mfma / wmma / sparsecore / etc.). Exits 0; no `--optimizer` / `--model` required. |
 | `--dry-run --arch <arch>` | Single-arch dry-run: runs preflight + `_resolve_sources` + `_host_cflags` + `_device_cflags` + `_ldflags` for the named arch without invoking `torch.cpp_extension`. Writes `<out>/dry_run_<arch>.json`. Pair with `--enable-synth-codegen --enable-polyhedral` to also exercise the synth/polyhedral layers. |
 | `--dry-run-all-archs` | Same as above but sweeps every canonical arch in ARCH_TABLE. Writes one JSON manifest per arch under `<out>/dry_run_<arch>.json`. Sweeps all 25 archs on a CPU-only host in ~3 seconds. For Pallas archs the manifest now includes the resolved `xla_env` dict (previously empty). |
@@ -1087,7 +1149,7 @@ via arch-specific common headers.
 | Grokfast  | 🟡 | 🟡 | 3 (ema, m, v) | 12 |
 | GrokAdamW | 🟡 | 🟡 | 3 (ema, m, v) | 12 |
 
-Legend: 🟡 = written, structurally validated (116 inline self-tests pass via
+Legend: 🟡 = written, structurally validated (122 inline self-tests pass via
 `python -m grokking_optimizers.compile --self-test`), not compiled on device
 (no CUDA/HIP toolchain in this environment).
 
@@ -1215,7 +1277,7 @@ python -m grokking_optimizers.compile \
   [--prune] [--prune-max-age-days 30] [--prune-keep-top-n 100]
   [--no-auto-prune]                     # cache GC
   [--debug-symbols] [--seed N] [-D MACRO[=VALUE]] [-v] [--debug]
-  [--self-test]                         # 116-test in-process suite
+  [--self-test]                         # 122-test in-process suite
   [--dry-run-all-archs]                 # write JSON manifests for all 25 archs
   [--e2e-smoke] [--e2e-max-seconds 120] # end-to-end build smoke (GPU-gated)
 ```
@@ -2910,7 +2972,7 @@ and eliminate cross-module coupling:
 | `INTERFACES.md` | `README.md` — compile cache schema, CLI surface |
 | `docs/autotune.md` | `README.md` — autotune guide, YAML schema, PGO |
 | `docs/optimization_matrix.md` | `README.md` — optimization candidate matrix |
-| `tests/` (all files) | `compile.py --self-test` — 116 inline checks |
+| `tests/` (all files) | `compile.py --self-test` — 122 inline checks |
 
 ---
 
