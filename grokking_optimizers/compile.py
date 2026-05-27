@@ -11086,6 +11086,7 @@ def build(
     strict_numerics: bool = False,
     enable_synth_codegen: bool = False,
     enable_polyhedral: bool = False,
+    auto_install_optional_deps: bool = True,
 ) -> Optional[Path]:
     """In-process orchestrator. ``main`` handles subprocess split.
 
@@ -11095,7 +11096,19 @@ def build(
 
     ``debug=True`` mirrors every line of the build report to stderr in
     real time, prints every spawned subprocess and ninja invocation
-    (via verbose=True), and emits per-phase banners with timestamps."""
+    (via verbose=True), and emits per-phase banners with timestamps.
+
+    ``auto_install_optional_deps=True`` (default) lets every opt-in
+    feature (NVRTC, Jinja2 emitter, learned cost model, polyhedral
+    layer) ``pip install`` its missing Python dep once before falling
+    back to the graceful-skip path. Pass False (or use ``--no-auto-
+    install`` on the CLI) for CI / offline / air-gapped builds."""
+    # Set the process-wide auto-install switch EARLY — every feature
+    # site (Jinja2, NVRTC, cost model, libclang) consults the module
+    # global via _auto_install_enabled() at first-use time. This must
+    # happen before BuildSpec() construction so a config-supplied
+    # override in apply_to_buildspec() can still flip it back if needed.
+    _set_auto_install(bool(auto_install_optional_deps))
     if aot_only:
         runtime = "aot"
     if jit_only:
@@ -19977,10 +19990,35 @@ class KernelRegistry:
         except ImportError:
             try:
                 from cuda import nvrtc  # type: ignore
-            except ImportError as exc:
-                raise RegistryError(
-                    "NVRTC requires cuda-python (pip install cuda-python)"
-                ) from exc
+            except ImportError:
+                # Try auto-install via the central helper before giving
+                # up. ``_ensure_optional_dep`` consults the process-wide
+                # auto-install switch (BuildSpec.auto_install_optional_deps),
+                # logs an actionable skip line on miss, and caches the
+                # result so repeat probes are cheap.
+                ok = _ensure_optional_dep(
+                    "cuda", "nvrtc",
+                    install=_auto_install_enabled(),
+                    pip_name="cuda-python")
+                if not ok:
+                    raise RegistryError(
+                        "[nvrtc] SKIPPED — cuda-python not installed. "
+                        "To enable: pip install cuda-python. "
+                        "Or pass --no-runtime-specialization to silence "
+                        "this message. Or pass --auto-install (default "
+                        "ON in build()) to install it automatically."
+                    )
+                # Retry the import paths now that the package is in.
+                try:
+                    from cuda.bindings import nvrtc  # type: ignore
+                except ImportError:
+                    try:
+                        from cuda import nvrtc  # type: ignore
+                    except ImportError as exc:
+                        raise RegistryError(
+                            "NVRTC requires cuda-python "
+                            "(pip install cuda-python)"
+                        ) from exc
         entry = ARCH_TABLE[self.arch]
         compute = f"compute_{entry.cutlass_arch}{entry.arch_suffix}"
         create_res = nvrtc.nvrtcCreateProgram(
@@ -20356,9 +20394,30 @@ def get_registry(arch: str,
 
 
 def initialize_registry(spec, report=None) -> Optional[KernelRegistry]:
-    """Pre-warm the registry from build() when enable_runtime_specialization=True."""
+    """Pre-warm the registry from build() when enable_runtime_specialization=True.
+
+    Honors ``spec.auto_install_optional_deps`` by propagating it to the
+    process-wide auto-install switch before any NVRTC import. When the
+    user opts into runtime specialization on a fresh host without
+    cuda-python, the helper will (by default) install it for them; if
+    install fails — or the toggle is off — every dtype-prewarm path
+    writes an *actionable* skip block (exact pip command + suppression
+    flag) instead of the old terse "skipped: <exc>" line.
+    """
     if not spec.enable_runtime_specialization:
         return None
+    # Honor the spec-level toggle. _ensure_optional_dep reads the module
+    # global; setting it here means every NVRTC site (this prewarm loop
+    # plus any later live dispatch) sees the same switch.
+    _set_auto_install(bool(getattr(spec, "auto_install_optional_deps", True)))
+    # Probe up front so the actionable skip block lands ONCE (instead of
+    # once per dtype below) when cuda-python is missing and auto-install
+    # is off or fails. The cache inside _ensure_optional_dep dedupes the
+    # later per-dtype calls into a single dict lookup.
+    cuda_python_ok = _ensure_optional_dep(
+        "cuda", "nvrtc",
+        install=_auto_install_enabled(),
+        pip_name="cuda-python")
     try:
         cache_dir = Path(spec.out_dir) / "nvrtc_cache"
         reg = get_registry(spec.arch, cache_dir=cache_dir)
@@ -20368,11 +20427,25 @@ def initialize_registry(spec, report=None) -> Optional[KernelRegistry]:
         return None
     op = spec.optimizer
     for dtype in ("fp32", "fp64"):
+        if not cuda_python_ok:
+            if report is not None:
+                report.write(
+                    f"[nvrtc] {dtype} prewarm SKIPPED — cuda-python "
+                    f"not installed. To enable:\n"
+                    f"[nvrtc]   pip install cuda-python\n"
+                    f"[nvrtc] Or pass --no-runtime-specialization to "
+                    f"silence this message.\n"
+                    f"[nvrtc] Or pass --auto-install (default ON in "
+                    f"build()) to install it automatically.\n")
+            continue
         try:
             reg.dispatch(op, dtype, (1024,))
         except RegistryError as exc:
             if report is not None:
-                report.write(f"[nvrtc] {dtype} prewarm skipped: {exc}\n")
+                report.write(
+                    f"[nvrtc] {dtype} prewarm skipped: {exc}\n"
+                    f"[nvrtc]   pip install cuda-python   "
+                    f"# (or pass --no-runtime-specialization)\n")
     if report is not None:
         report.write(f"[nvrtc] registry initialized for {spec.arch} "
                      f"(cache={reg.cache_dir})\n")
