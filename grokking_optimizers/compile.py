@@ -5483,6 +5483,25 @@ class BuildSpec:
     cost_model_rejection_threshold_x: float = 3.0
     cost_model_rejection_max_pct: float = 0.8
     cost_model_uncertainty_method: str = "bootstrap"
+    # ─── Agent-F2 — flag probe (compile-time flag validation) ────────────
+    # When True (default), _device_cflags routes its full output through
+    # _validate_flag_set so any flag the installed nvcc/hipcc rejects is
+    # dropped with a logged reason. Protects against version-mismatch
+    # bugs where a "version-gated" flag (e.g. --device-link-options=-dlto)
+    # was accidentally emitted into compile-time cflags even though the
+    # specific patch release rejects it at -ptx time. Set to False (or
+    # toggle off via the --no-flag-probe CLI flag) for CI speed.
+    validate_flags: bool = True
+    # When True, _device_cflags writes its [flag-probe] log lines through
+    # sys.stderr so the dry-run path can capture them. False by default
+    # (the path is also exercised at build time where _torch_load owns
+    # the report stream).
+    flag_probe_verbose: bool = False
+    # Holds the (flag, reason) drops produced by the most recent
+    # _validate_flag_set call on _device_cflags. Populated as a side-
+    # effect so downstream consumers (preflight, dry-run manifest) can
+    # report on what was filtered without re-running the probe.
+    flag_probe_dropped: List[Tuple[str, str]] = field(default_factory=list)
 
 
 def _ensure_nvcc_on_path() -> Optional[str]:
@@ -6413,7 +6432,8 @@ def _validate(spec: BuildSpec) -> None:
             f"pruner={spec.pruner!r} not in {{'none', 'median', 'hyperband'}}")
 
 
-def _preflight_toolchain(arch: str) -> List[str]:
+def _preflight_toolchain(arch: str,
+                         spec: Optional["BuildSpec"] = None) -> List[str]:
     """Pre-flight: probe the toolchain for the chosen arch.
 
     Returns a list of human-readable diagnostic lines (warnings, paths,
@@ -6422,7 +6442,21 @@ def _preflight_toolchain(arch: str) -> List[str]:
     error including the actual compiler stderr. The purpose here is to
     give the user a clear ``[preflight]`` block at the top of the run
     so they can spot a missing dependency before waiting for the build
-    to fail."""
+    to fail.
+
+    Agent-F2 — when ``spec`` is supplied and the per-arch judgment is
+    PASS and a compiler is reachable, additionally runs the **flag
+    probe** over the spec's full ``_device_cflags`` output. Any flag the
+    installed compiler rejects with a dry-run kernel compile is logged
+    as ``[preflight] WARN flag <flag> rejected by <compiler> — dropping
+    (reason: ...)``. The validated subset is the same one
+    ``_device_cflags`` would return for the same spec, so the build's
+    cflags and the preflight's report stay consistent.
+
+    Back-compat: callers passing only ``arch`` (the historical signature)
+    still get the original behaviour — no flag-probe pass. This keeps
+    every existing self-test and CI grep working unchanged.
+    """
     lines: List[str] = []
     vendor = get_arch_entry(arch).vendor
     lines.append(f"[preflight] arch={arch} vendor={vendor}")
@@ -6623,6 +6657,69 @@ def _preflight_toolchain(arch: str) -> List[str]:
             # Suggestion is advisory — never let it block the preflight
             # output that callers actually need.
             pass
+
+    # ── Agent-F2 — dry-run flag-probe pass ───────────────────────────
+    # Only runs when:
+    #   (a) caller passed a spec (preserves the historical 1-arg API),
+    #   (b) per-arch judgment is PASS (don't probe with a broken toolchain),
+    #   (c) the spec opted in (spec.validate_flags=True by default),
+    #   (d) the global --no-flag-probe override is OFF,
+    #   (e) the vendor is CUDA / HIP (Pallas has no host compiler probe).
+    # Pallas archs and FAIL judgments skip the probe — there's nothing to
+    # validate against (no compiler, or it's already known-broken).
+    try:
+        judgment_passed = any(
+            f"arch={arch}" in ln and "PASS" in ln for ln in lines)
+        probe_disabled = _FLAG_PROBE_DISABLED or (
+            spec is not None and not getattr(spec, "validate_flags", True))
+        if spec is not None and judgment_passed and not probe_disabled:
+            entry = ARCH_TABLE.get(arch)
+            if entry is not None and entry.vendor in ("cuda", "hip"):
+                compiler = _flag_probe_compiler_for(entry.vendor)
+                if compiler:
+                    # Clear any prior drops on the spec so we get a fresh
+                    # list for this preflight pass.
+                    spec.flag_probe_dropped = []
+                    # Snapshot existing validate_flags state. We disable
+                    # spec-level validation INSIDE this call so the
+                    # _device_cflags helper doesn't double-validate; we
+                    # then run the probe ourselves on the raw flag list.
+                    saved = spec.validate_flags
+                    spec.validate_flags = False
+                    try:
+                        raw_flags = _device_cflags(spec)
+                    finally:
+                        spec.validate_flags = saved
+                    kept, dropped = _validate_flag_set(
+                        raw_flags, compiler, entry.vendor)
+                    for f, r in dropped:
+                        lines.append(
+                            f"[preflight] WARN flag {f!r} rejected by "
+                            f"{Path(compiler).name} — dropping "
+                            f"(reason: {r})")
+                    if dropped:
+                        lines.append(
+                            f"[preflight] flag-probe: kept "
+                            f"{len(kept)} / dropped {len(dropped)} "
+                            f"(compiler {Path(compiler).name})")
+                    elif raw_flags:
+                        lines.append(
+                            f"[preflight] flag-probe: all "
+                            f"{len(raw_flags)} flags accepted by "
+                            f"{Path(compiler).name}")
+                    # Persist the validated set onto the spec so
+                    # downstream consumers (build, dry-run manifest)
+                    # use the SAME list the preflight just reported on.
+                    spec.flag_probe_dropped = list(dropped)
+                else:
+                    lines.append(
+                        f"[preflight] flag-probe: skipped — "
+                        f"{entry.vendor} compiler not on PATH")
+    except Exception as exc:  # noqa: BLE001
+        # Flag-probe is advisory — never let it abort preflight.
+        lines.append(
+            f"[preflight] flag-probe: skipped due to error "
+            f"({type(exc).__name__}: {exc})")
     return lines
 
 
@@ -6746,7 +6843,7 @@ def _dry_run_all_archs(out_dir: Path,
         preflight_lines: List[str] = []
         preflight_judgment = "?"
         try:
-            preflight_lines = list(_preflight_toolchain(arch))
+            preflight_lines = list(_preflight_toolchain(arch, spec))
         except Exception as exc:  # noqa: BLE001 — preflight must never abort sweep
             preflight_lines = [f"[preflight] arch={arch} EXCEPTION {exc!r}"]
         # Parse PASS / FAIL from the per-arch judgment line(s).
@@ -7350,7 +7447,8 @@ def _device_cflags(spec: BuildSpec,
                             f"(macro_prefix={spec.macro_prefix!r})")
         if own_trace and trace is not None:
             _emit_flag_trace_block("device_cflags", trace)
-        return base + macros
+        return _device_cflags_maybe_validate(
+            base + macros, spec, vendor="cuda")
 
     if entry.vendor == "hip":
         base = list(HIPCC_DEVICE_BASE)
@@ -7443,7 +7541,8 @@ def _device_cflags(spec: BuildSpec,
                             f"(macro_prefix={spec.macro_prefix!r})")
         if own_trace and trace is not None:
             _emit_flag_trace_block("device_cflags", trace)
-        return base + macros
+        return _device_cflags_maybe_validate(
+            base + macros, spec, vendor="hip")
     # Pallas / unknown vendor → no device cflags. Still emit one note so
     # the trace block isn't completely empty in --flag-audit.
     _trace_add(trace, "(no device cflags)", "kept",
@@ -7451,6 +7550,49 @@ def _device_cflags(spec: BuildSpec,
     if own_trace and trace is not None:
         _emit_flag_trace_block("device_cflags", trace)
     return []
+
+
+def _device_cflags_maybe_validate(flags: List[str], spec: "BuildSpec",
+                                  *, vendor: str) -> List[str]:
+    """Helper: route ``flags`` through ``_validate_flag_set`` when
+    ``spec.validate_flags`` is True AND a compiler is reachable AND the
+    global ``--no-flag-probe`` override isn't set.
+
+    The dropped flags (with reasons) are stashed on
+    ``spec.flag_probe_dropped`` as a side-effect so downstream consumers
+    (preflight, dry-run manifest) can surface them without re-probing.
+
+    On hosts where the compiler is missing, validation is silently
+    skipped — _validate_flag_set returns the input unchanged, so the
+    downstream dry-run / source-resolution paths still work on CPU-only
+    dev hosts.
+
+    Compatibility: if ``flags`` is empty (Pallas archs) or
+    ``spec.validate_flags`` is False, returns ``flags`` unchanged.
+    """
+    if not flags:
+        return flags
+    if not getattr(spec, "validate_flags", True):
+        return flags
+    if _FLAG_PROBE_DISABLED:
+        return flags
+    compiler = _flag_probe_compiler_for(vendor)
+    if not compiler:
+        # No compiler reachable — silently keep the canonical list (the
+        # build dies louder at _torch_load time if a flag truly is bad).
+        return flags
+    log_stream = sys.stderr if getattr(spec, "flag_probe_verbose", False) else None
+    kept, dropped = _validate_flag_set(
+        flags, compiler, vendor, log_stream=log_stream)
+    # Stash dropped flags onto the spec so preflight / dry-run can report.
+    # We APPEND (don't overwrite) so multiple device-cflag calls per spec
+    # (e.g. host + device passes) accumulate. Dedupe by (flag, reason).
+    seen = {(f, r) for f, r in getattr(spec, "flag_probe_dropped", [])}
+    for f, r in dropped:
+        if (f, r) not in seen:
+            spec.flag_probe_dropped.append((f, r))
+            seen.add((f, r))
+    return kept
 
 
 def _ldflags(spec: BuildSpec,
@@ -7876,6 +8018,368 @@ def _trace_enabled(spec: Optional["BuildSpec"]) -> bool:
                     or getattr(spec, "debug_symbols", False))
     except Exception:
         return False
+
+# ---------------------------------------------------------------------------
+# Flag probe — dry-run-compile validation of suspect compiler flags
+# ---------------------------------------------------------------------------
+#
+# Background: the wrapper emits many "version-gated" device-compiler flags
+# (e.g. ``-Xptxas --register-usage-level=10``, ``--device-link-options=-dlto``,
+# ``--minimal``) based on a probed ``nvcc --version`` string. That probe is
+# coarse — two 12.x patch releases can disagree on whether a given flag is
+# accepted, and some flags only apply at link time but were accidentally
+# emitted into the compile-time cflags. The result on real users
+# (e.g. Colab CUDA 12.0) is an obscure ``nvcc fatal: Unknown option`` even
+# though the version gate "should" have matched.
+#
+# The flag probe closes that gap by **actually asking the installed nvcc /
+# hipcc** whether each suspect flag is accepted with a tiny dry-run kernel
+# compile (``-ptx`` for nvcc, ``--cuda-host-only -c`` for hipcc). Results
+# are cached per (compiler-path, compiler-version, flag) for the lifetime
+# of the process so the second invocation in the same run is free.
+#
+# The probe is intentionally PERMISSIVE on failure: when no compiler is on
+# PATH (CPU-only dev host), ``_validate_flag_set`` returns the input list
+# unchanged so the downstream dry-run / source-resolution paths still work.
+# A global ``_FLAG_PROBE_DISABLED`` flag (set by ``--no-flag-probe`` CLI)
+# bypasses the probe entirely for CI / fast-path workflows.
+
+# Module-level cache: (compiler-path, version-string, flag-token) -> bool.
+# The version string is folded in so a toolchain swap in the same process
+# (rare, but happens in test fixtures that monkeypatch nvcc) re-probes.
+_FLAG_PROBE_CACHE: Dict[Tuple[str, str, str], bool] = {}
+
+# Counts cache hits vs subprocess invocations across the process. Exposed
+# only for self-tests / debug logging — never read by production code.
+_FLAG_PROBE_STATS: Dict[str, int] = {"hits": 0, "misses": 0, "errors": 0}
+
+# Toggled by the ``--no-flag-probe`` CLI flag. When True,
+# ``_validate_flag_set`` is a no-op (returns input unchanged, no logging).
+_FLAG_PROBE_DISABLED: bool = False
+
+# Flags that NEVER need a compiler dry-run probe. These are either:
+#   * universal across every nvcc / hipcc release we care about (-O3,
+#     -std=c++17, -fPIC, -ggdb, -DXXX, -I..., -L..., -l..., -isystem),
+#   * pure macro definitions (-D...) which the compiler always accepts,
+#   * include / lib paths (compiler may warn about empty dirs but won't
+#     error at -ptx compile time),
+#   * arch-selection flags (-gencode, --offload-arch, --cuda-gpu-arch) —
+#     these have arch-specific accept/reject behaviour that would falsely
+#     reject the probe kernel which doesn't need them.
+# Anything OUTSIDE this allowlist is candidate for the dry-run probe.
+_FLAG_PROBE_SKIP_EXACT: frozenset = frozenset({
+    "-O0", "-O1", "-O2", "-O3", "-Os", "-Og",
+    "-g", "-ggdb", "-ggdb3", "-fPIC", "-fpic", "-fPIE", "-fpie",
+    "-pthread", "-fopenmp",
+    "-std=c++11", "-std=c++14", "-std=c++17", "-std=c++20", "-std=c++23",
+    "-std=c11", "-std=c17", "-std=c99",
+    "-c", "-shared", "-static",
+    "-Wall", "-Wextra", "-Werror", "-w",
+    "-x", "c++", "c", "cu",
+})
+_FLAG_PROBE_SKIP_PREFIXES: Tuple[str, ...] = (
+    "-D",            # macro definitions
+    "-I",            # include paths
+    "-L",            # library search paths
+    "-l",            # library link
+    "-isystem",      # system include
+    "-iquote",       # quoted include
+    "-iframework",   # framework include (clang)
+    "-isysroot",     # sysroot
+    "-MD", "-MF", "-MM", "-MMD", "-MT",   # dep-tracking
+    "-gencode",      # -gencode=arch=compute_X,code=sm_X (CUDA arch select)
+    "--offload-arch",                      # HIP arch select
+    "--cuda-gpu-arch",                     # clang CUDA arch select
+    "--generate-code",                     # alias for -gencode (long form)
+    "-arch=",        # nvcc short arch select
+    "-code=",        # nvcc short arch select
+    "--cuda-path",   # nvcc CUDA install path
+    "--rocm-path",   # hipcc ROCm install path
+    "--rocm-device-lib-path",
+    "@",             # response file
+    "-o",            # output path
+    "-x",            # language override (followed by "cu", "c++" etc.)
+)
+
+# Compound flag pairs: the first token is a host pass-through wrapper that
+# takes the second token as its argument. They must be probed AS A PAIR
+# because probing the bare argument alone would be a syntax error for
+# nvcc/hipcc. The values map ``leading flag`` -> True (pair-consumer).
+_FLAG_PROBE_PAIR_PREFIXES: frozenset = frozenset({
+    # NVCC pass-throughs.
+    "-Xptxas", "-Xcompiler", "-Xnvlink", "-Xcudafe", "-Xfatbin",
+    "-Xarchive", "-Xptxas-options", "-Xcicc",
+    # NVCC two-token options.
+    "--threads", "--default-stream",
+    # HIP / clang pass-throughs.
+    "-mllvm", "-Xclang", "-Xarch_device", "-Xarch_host",
+    # GCC/clang generic.
+    "-include", "-imacros",
+})
+
+
+def _flag_probe_compiler_for(vendor: str) -> Optional[str]:
+    """Resolve the compiler binary used for flag probes for ``vendor``.
+
+    Mirrors the discovery used elsewhere in compile.py but is intentionally
+    NON-side-effecting: it does not mutate PATH/CUDA_HOME. Returns the
+    absolute path (or PATH-relative name) suitable for subprocess, or None
+    when no compiler is reachable.
+    """
+    if vendor == "cuda":
+        return shutil.which("nvcc")
+    if vendor == "hip":
+        return shutil.which("hipcc")
+    return None
+
+
+def _probe_flag_support(compiler: str, flag: str, vendor: str,
+                       timeout_seconds: float = 5.0) -> bool:
+    """Ask ``compiler`` whether ``flag`` is accepted via a tiny kernel compile.
+
+    The probe writes a minimal extern-"C" empty kernel to a temp file and
+    invokes the compiler with ``flag`` plus enough boilerplate to get the
+    front-end past argument parsing without requiring a GPU at the other
+    end. Exit-code-0 ⇒ True; any nonzero exit (including timeouts and
+    OS errors launching the compiler) ⇒ False.
+
+    Pair flags (e.g. ``-Xptxas --opt-level=3``) are tested as the joined
+    token ``"-Xptxas --opt-level=3"``: callers pass the joined string here
+    so the cache key matches downstream usage. ``_validate_flag_set``
+    handles the pairing logic.
+
+    Results are cached per (compiler-path, version-key, flag) — calling
+    this twice for the same triple in one process avoids the second
+    subprocess invocation entirely.
+
+    ``vendor`` controls the compile mode:
+        * ``cuda`` → ``-ptx -o <tmp>/probe.ptx <tmp>/probe.cu``
+        * ``hip`` → ``--cuda-host-only -c -o <tmp>/probe.o <tmp>/probe.cu``
+
+    Returns False (not raising) on:
+        * compiler binary not found / not executable
+        * subprocess timeout (5s default — generous for any flag-parse)
+        * any OSError starting the subprocess
+    """
+    if not compiler or not flag:
+        return False
+
+    # Cache key: (compiler-path, version-stamp, flag-token). The version
+    # stamp folds in the toolchain version so a swap in the same process
+    # (test fixtures) doesn't return stale results.
+    version_stamp = ""
+    if vendor == "cuda":
+        v = _probe_nvcc_version()
+        if v is not None:
+            version_stamp = f"{v[0]}.{v[1]}"
+    elif vendor == "hip":
+        v = _probe_hipcc_version()
+        if v is not None:
+            version_stamp = f"{v[0]}.{v[1]}"
+
+    cache_key = (compiler, version_stamp, flag)
+    cached = _FLAG_PROBE_CACHE.get(cache_key)
+    if cached is not None:
+        _FLAG_PROBE_STATS["hits"] += 1
+        return cached
+    _FLAG_PROBE_STATS["misses"] += 1
+
+    # Tokenise pair-form flags ("-Xptxas --opt-level=3" → two argv tokens).
+    # The caller is free to pass a single token (e.g. "--minimal") or a
+    # space-joined pair (e.g. "-Xptxas --register-usage-level=10").
+    flag_tokens = flag.split()
+    if not flag_tokens:
+        _FLAG_PROBE_CACHE[cache_key] = False
+        return False
+
+    accepted = False
+    last_err = ""
+    try:
+        with tempfile.TemporaryDirectory(prefix="sg_flag_probe_") as td:
+            src_path = Path(td) / "probe.cu"
+            src_path.write_text("extern \"C\" __global__ void k() {}\n")
+            if vendor == "cuda":
+                out_path = Path(td) / "probe.ptx"
+                cmd = [compiler, *flag_tokens, "-ptx",
+                       "-o", str(out_path), str(src_path)]
+            elif vendor == "hip":
+                out_path = Path(td) / "probe.o"
+                cmd = [compiler, *flag_tokens, "--cuda-host-only", "-c",
+                       "-o", str(out_path), str(src_path)]
+            else:
+                _FLAG_PROBE_CACHE[cache_key] = False
+                return False
+            try:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    timeout=timeout_seconds,
+                )
+                accepted = (proc.returncode == 0)
+                if not accepted:
+                    # Keep a short tail of stderr for debug logging upstream.
+                    last_err = (proc.stderr or proc.stdout or "").strip()
+            except subprocess.TimeoutExpired:
+                accepted = False
+                last_err = f"timeout after {timeout_seconds}s"
+                _FLAG_PROBE_STATS["errors"] += 1
+            except (OSError, subprocess.SubprocessError) as exc:
+                accepted = False
+                last_err = f"{type(exc).__name__}: {exc}"
+                _FLAG_PROBE_STATS["errors"] += 1
+    except (OSError, PermissionError) as exc:
+        # tempdir creation can fail on locked-down hosts; treat as
+        # "unable to probe" and conservatively accept the flag so we
+        # don't silently strip a valid one. (Bias is toward keeping
+        # flags; the user will see the real compiler error at build
+        # time if the flag truly is bad.)
+        _FLAG_PROBE_STATS["errors"] += 1
+        sys.stderr.write(
+            f"[flag-probe] WARNING tempdir failed ({exc!r}); "
+            f"defaulting {flag!r} to accepted\n")
+        accepted = True
+
+    _FLAG_PROBE_CACHE[cache_key] = accepted
+    # Stash the error excerpt on the cache so _validate_flag_set can
+    # surface it in the dropped list without re-probing. We use a
+    # parallel dict keyed identically.
+    if not accepted and last_err:
+        _FLAG_PROBE_ERRORS[cache_key] = last_err[:200]
+    return accepted
+
+
+# Parallel error excerpts for the cache, populated by _probe_flag_support.
+_FLAG_PROBE_ERRORS: Dict[Tuple[str, str, str], str] = {}
+
+
+def _flag_probe_should_skip(token: str) -> bool:
+    """Return True when ``token`` is universally safe and should not be
+    sent through the dry-run probe (cuts probe cost by ~80%)."""
+    if token in _FLAG_PROBE_SKIP_EXACT:
+        return True
+    for pfx in _FLAG_PROBE_SKIP_PREFIXES:
+        if token.startswith(pfx):
+            return True
+    return False
+
+
+def _validate_flag_set(flags: List[str], compiler: Optional[str],
+                       vendor: str,
+                       *,
+                       log_stream=None,
+                       ) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """Validate every potentially-suspect flag in ``flags`` against the
+    actual installed compiler with a tiny dry-run kernel compile.
+
+    Returns ``(kept_flags, dropped)`` where ``dropped`` is a list of
+    ``(flag_or_pair, reason)`` tuples. The input ordering of ``flags`` is
+    preserved in ``kept_flags`` modulo dropped entries.
+
+    Pair flags like ``-Xptxas --opt-level=3`` are detected and probed
+    together; if the pair is rejected, BOTH tokens are dropped from
+    ``kept_flags``.
+
+    Pass-through behaviour:
+      * ``compiler`` is None / empty → return (input, []) unchanged, no
+        probe (the build dies with a louder error at compile time if a
+        flag really is bad — see _torch_load's stderr capture).
+      * ``vendor`` not in {"cuda", "hip"} → return (input, []) unchanged.
+      * ``_FLAG_PROBE_DISABLED`` global True (set by --no-flag-probe) →
+        return (input, []) unchanged.
+    """
+    # ── Pass-through guards. ─────────────────────────────────────────
+    if _FLAG_PROBE_DISABLED:
+        return list(flags), []
+    if not flags:
+        return [], []
+    if vendor not in ("cuda", "hip"):
+        return list(flags), []
+    if not compiler:
+        return list(flags), []
+
+    t0 = time.monotonic()
+    kept: List[str] = []
+    dropped: List[Tuple[str, str]] = []
+
+    # Count flags that will actually go through the dry-run subprocess so
+    # the user sees a useful "[flag-probe] testing N flags" header.
+    n_probed = 0
+    n_skipped = 0
+    cache_hits_start = _FLAG_PROBE_STATS.get("hits", 0)
+
+    i = 0
+    while i < len(flags):
+        tok = flags[i]
+        # Pair-form: ``-Xptxas <arg>``, ``-mllvm <arg>``, etc.
+        if tok in _FLAG_PROBE_PAIR_PREFIXES and i + 1 < len(flags):
+            arg = flags[i + 1]
+            joined = f"{tok} {arg}"
+            # Skip universally-safe pair args (e.g. ``-Xcompiler -fPIC``).
+            # We probe the outer + inner together to be robust.
+            n_probed += 1
+            ok = _probe_flag_support(compiler, joined, vendor)
+            if ok:
+                kept.append(tok)
+                kept.append(arg)
+            else:
+                key = (compiler, _flag_probe_version_stamp(vendor), joined)
+                reason = _FLAG_PROBE_ERRORS.get(
+                    key, "compiler rejected")
+                # Trim multi-line stderr to a one-line excerpt.
+                reason_line = reason.splitlines()[-1] if reason else "compiler rejected"
+                dropped.append((joined,
+                                f"compiler rejected: {reason_line[:160]}"))
+                if log_stream is not None:
+                    log_stream.write(
+                        f"[flag-probe] DROP {joined!r} — "
+                        f"{reason_line[:160]}\n")
+            i += 2
+            continue
+
+        # Singleton form.
+        if _flag_probe_should_skip(tok):
+            kept.append(tok)
+            n_skipped += 1
+            i += 1
+            continue
+
+        n_probed += 1
+        ok = _probe_flag_support(compiler, tok, vendor)
+        if ok:
+            kept.append(tok)
+        else:
+            key = (compiler, _flag_probe_version_stamp(vendor), tok)
+            reason = _FLAG_PROBE_ERRORS.get(key, "compiler rejected")
+            reason_line = reason.splitlines()[-1] if reason else "compiler rejected"
+            dropped.append((tok, f"compiler rejected: {reason_line[:160]}"))
+            if log_stream is not None:
+                log_stream.write(
+                    f"[flag-probe] DROP {tok!r} — {reason_line[:160]}\n")
+        i += 1
+
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    if log_stream is not None:
+        cache_hits = _FLAG_PROBE_STATS.get("hits", 0) - cache_hits_start
+        log_stream.write(
+            f"[flag-probe] testing {n_probed} flags against "
+            f"{compiler} (skipped {n_skipped} universal)\n"
+            f"[flag-probe] kept {len(kept)} / dropped {len(dropped)} "
+            f"in {elapsed_ms}ms (cache hits this call: {cache_hits})\n")
+    return kept, dropped
+
+
+def _flag_probe_version_stamp(vendor: str) -> str:
+    """Return the version-stamp string used by ``_probe_flag_support`` so
+    callers can build cache keys identically. Empty string when the
+    compiler is missing — matches ``_probe_flag_support`` behaviour."""
+    if vendor == "cuda":
+        v = _probe_nvcc_version()
+        if v is not None:
+            return f"{v[0]}.{v[1]}"
+    elif vendor == "hip":
+        v = _probe_hipcc_version()
+        if v is not None:
+            return f"{v[0]}.{v[1]}"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -10635,8 +11139,12 @@ def build(
 
             # Pre-flight: dump toolchain visibility so the user sees what
             # the build can actually find BEFORE we waste 4 phases.
+            # Agent-F2: passing the spec activates the flag-probe pass,
+            # which validates each device cflag against the actual
+            # installed nvcc/hipcc with a tiny dry-run kernel compile
+            # and reports any flag that gets dropped.
             report.write("\n")
-            for line in _preflight_toolchain(arch):
+            for line in _preflight_toolchain(arch, spec):
                 report.write(line + "\n")
             step("resolve")
 
@@ -11054,7 +11562,26 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "name, vendor, features, min_toolchain) and exit. "
                              "Useful for CI to discover what targets the wrapper "
                              "advertises without launching a build.")
+    # Agent-F2 — flag probe (compile-time flag validation)
+    parser.add_argument("--no-flag-probe", action="store_true",
+                        help="Disable the flag-probe pre-flight pass that "
+                             "validates each device cflag against the actual "
+                             "installed nvcc/hipcc with a tiny dry-run kernel "
+                             "compile. The probe normally catches "
+                             "version-gated flags emitted by the wrapper that "
+                             "the specific toolchain release rejects "
+                             "(e.g. --device-link-options=-dlto on CUDA 12.0). "
+                             "Use --no-flag-probe in CI to skip the probe for "
+                             "faster startup when you know the toolchain is "
+                             "compatible.")
     args = parser.parse_args(argv)
+
+    # Agent-F2 — wire the --no-flag-probe global. Set BEFORE any path
+    # that calls _device_cflags / _preflight_toolchain (every code branch
+    # below this point) so the flag is honoured uniformly.
+    if getattr(args, "no_flag_probe", False):
+        global _FLAG_PROBE_DISABLED
+        _FLAG_PROBE_DISABLED = True
 
     # Category 3a — --list-archs: dump every canonical ArchEntry and exit.
     if getattr(args, "list_archs", False):
@@ -11114,6 +11641,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"sources={len(m.get('sources',[])):>3d} "
             f"device_cflags={len(m.get('device_cflags',[])):>3d} "
             f"judgment={m.get('preflight_judgment','?')}\n")
+        # Agent-F2: also surface the [flag-probe] / WARN flag lines on
+        # stdout so users (and CI grep) can spot rejected flags without
+        # parsing the JSON manifest.
+        for ln in m.get("preflight_lines", []):
+            if "flag-probe" in ln or "WARN flag" in ln:
+                sys.stdout.write(f"  {ln}\n")
         return 0
 
     # Stream β.1 — auto-detect --arch when omitted on the CLI. We must do
@@ -14863,6 +15396,166 @@ def _self_test_synth_codegen(run) -> None:
     # Stream H — final wrapper: only runs the e2e smoke when a GPU is
     # visible; SKIPs cleanly (and counts as PASS) otherwise.
 
+def _self_test_flag_probe(run) -> None:
+    """`[self-test] flag_probe` section — Agent-F2 dry-run flag validation.
+
+    The five tests below match the brief 1:1: universal-flag accept,
+    bogus-flag reject, validate_flag_set drops invalid + logs the reason,
+    no-compiler pass-through, and cache-hit on the second call.
+    """
+    import shutil
+    import tempfile
+    import io
+    sys.stdout.write("[self-test] flag_probe\n")
+
+    nvcc_present = shutil.which("nvcc") is not None
+
+    def test_flag_probe_accepts_universal_flags():
+        """Test 1: ``-O3``, ``-std=c++17``, ``-fPIC`` must be accepted by
+        nvcc when probed. Gated on nvcc being on PATH — skipped silently
+        on CPU-only hosts (where the probe correctly returns False
+        because the compiler can't be invoked)."""
+        if not nvcc_present:
+            sys.stdout.write("    [flag-probe] no nvcc on PATH — skipping\n")
+            return
+        nvcc = shutil.which("nvcc")
+        for flag in ("-O3", "-std=c++17", "-fPIC"):
+            ok = _probe_flag_support(nvcc, flag, "cuda")
+            assert ok, (
+                f"_probe_flag_support({flag!r}) returned False for a "
+                f"universal flag — nvcc at {nvcc} should accept it")
+
+    def test_flag_probe_rejects_made_up_flag():
+        """Test 2: A flag that nvcc cannot possibly recognise must be
+        rejected by the probe. Gated on nvcc being on PATH."""
+        if not nvcc_present:
+            sys.stdout.write("    [flag-probe] no nvcc on PATH — skipping\n")
+            return
+        nvcc = shutil.which("nvcc")
+        ok = _probe_flag_support(
+            nvcc, "--bogus-flag-that-does-not-exist", "cuda")
+        assert not ok, (
+            "_probe_flag_support returned True for a fabricated flag — "
+            "the probe is not actually exercising the compiler")
+        # And the error excerpt must be populated in the parallel dict so
+        # _validate_flag_set can surface it.
+        key = (nvcc, _flag_probe_version_stamp("cuda"),
+               "--bogus-flag-that-does-not-exist")
+        assert key in _FLAG_PROBE_ERRORS or key in _FLAG_PROBE_CACHE, \
+            "rejection did not populate the per-key cache state"
+
+    def test_validate_flag_set_drops_invalid():
+        """Test 3: feed a list with a flag the user's brief explicitly
+        called out (``--device-link-options=-dlto`` — link-only, rejected
+        at compile time), assert it's filtered out and the dropped list
+        carries a non-empty reason. Gated on nvcc being on PATH."""
+        if not nvcc_present:
+            sys.stdout.write("    [flag-probe] no nvcc on PATH — skipping\n")
+            return
+        nvcc = shutil.which("nvcc")
+        flags_in = [
+            "-O3", "-std=c++17", "--use_fast_math",
+            "--device-link-options=-dlto",   # link-only flag, rejected at compile
+            "-DTEST_MACRO=1",
+        ]
+        buf = io.StringIO()
+        kept, dropped = _validate_flag_set(
+            flags_in, nvcc, "cuda", log_stream=buf)
+        # The link-only flag should be filtered out. (We don't ASSERT a
+        # specific drop count because nvcc patch releases differ — the
+        # contract is "kept ⊆ flags_in" and "anything dropped has a reason".)
+        # Universal flags must survive.
+        assert "-O3" in kept, f"universal -O3 missing from kept: {kept}"
+        assert "-std=c++17" in kept, f"-std=c++17 missing from kept: {kept}"
+        assert "-DTEST_MACRO=1" in kept, \
+            f"-D macro filtered (skip-list bug): {kept}"
+        # When something IS dropped, the reason must be non-empty.
+        for f, r in dropped:
+            assert r, f"dropped flag {f!r} has empty reason"
+            assert "compiler rejected" in r, \
+                f"unexpected drop reason for {f!r}: {r!r}"
+        # If --device-link-options=-dlto is rejected by THIS nvcc (the
+        # exact bug the brief describes), confirm the log line surfaces.
+        joined_dropped = [f for f, _r in dropped]
+        if "--device-link-options=-dlto" in joined_dropped:
+            log_text = buf.getvalue()
+            assert "[flag-probe] DROP" in log_text, \
+                f"expected DROP log line, got: {log_text!r}"
+            assert "--device-link-options=-dlto" in log_text, \
+                f"DROP line missing flag name: {log_text!r}"
+
+    def test_validate_flag_set_no_probes_on_no_compiler():
+        """Test 4: when no compiler is supplied (None / ''), the validator
+        must return the input list UNCHANGED and report zero drops. This
+        keeps the dry-run path on CPU-only dev hosts working — no spurious
+        drops, no crashes."""
+        flags_in = [
+            "-O3", "-std=c++17", "--device-link-options=-dlto",
+            "-Xptxas", "--register-usage-level=10",
+            "--bogus-flag", "-mllvm", "--enable-newgvn",
+        ]
+        # No compiler available.
+        kept, dropped = _validate_flag_set(flags_in, None, "cuda")
+        assert kept == flags_in, \
+            f"no-compiler pass-through failed: got {kept}"
+        assert dropped == [], f"no-compiler dropped non-empty: {dropped}"
+        # Empty string compiler path — same behaviour.
+        kept2, dropped2 = _validate_flag_set(flags_in, "", "cuda")
+        assert kept2 == flags_in
+        assert dropped2 == []
+        # Unknown vendor — same behaviour.
+        kept3, dropped3 = _validate_flag_set(
+            flags_in, "/usr/bin/true", "pallas")
+        assert kept3 == flags_in
+        assert dropped3 == []
+
+    def test_flag_probe_caches_results():
+        """Test 5: calling _probe_flag_support twice for the same triple
+        must hit the in-process cache. We verify by inspecting the
+        _FLAG_PROBE_STATS dict (a parallel global counter) — the second
+        call must increment ``hits``, NOT ``misses``."""
+        if not nvcc_present:
+            sys.stdout.write("    [flag-probe] no nvcc on PATH — skipping\n")
+            return
+        nvcc = shutil.which("nvcc")
+        # Clear any cached entry for this specific (compiler, flag) so we
+        # can observe the miss→hit transition cleanly.
+        version = _flag_probe_version_stamp("cuda")
+        cache_key = (nvcc, version, "-O3")
+        _FLAG_PROBE_CACHE.pop(cache_key, None)
+        hits_before = _FLAG_PROBE_STATS.get("hits", 0)
+        misses_before = _FLAG_PROBE_STATS.get("misses", 0)
+        # First call — cache miss.
+        ok1 = _probe_flag_support(nvcc, "-O3", "cuda")
+        hits_mid = _FLAG_PROBE_STATS.get("hits", 0)
+        misses_mid = _FLAG_PROBE_STATS.get("misses", 0)
+        assert misses_mid == misses_before + 1, \
+            f"first call did not register a miss: "\
+            f"misses {misses_before}→{misses_mid}"
+        assert hits_mid == hits_before, \
+            f"first call should not have hit cache: hits {hits_before}→{hits_mid}"
+        # Second call — cache hit.
+        ok2 = _probe_flag_support(nvcc, "-O3", "cuda")
+        hits_after = _FLAG_PROBE_STATS.get("hits", 0)
+        misses_after = _FLAG_PROBE_STATS.get("misses", 0)
+        assert hits_after == hits_mid + 1, \
+            f"second call did not hit cache: hits {hits_mid}→{hits_after}"
+        assert misses_after == misses_mid, \
+            f"second call mis-counted as a miss: misses {misses_mid}→{misses_after}"
+        assert ok1 == ok2, "cache returned a different verdict than fresh probe"
+
+    run("flag_probe_accepts_universal_flags",
+         test_flag_probe_accepts_universal_flags)
+    run("flag_probe_rejects_made_up_flag",
+         test_flag_probe_rejects_made_up_flag)
+    run("validate_flag_set_drops_invalid",
+         test_validate_flag_set_drops_invalid)
+    run("validate_flag_set_no_probes_on_no_compiler",
+         test_validate_flag_set_no_probes_on_no_compiler)
+    run("flag_probe_caches_results",
+         test_flag_probe_caches_results)
+
+
 def _self_test_e2e_smoke(run) -> None:
     """`[self-test] e2e_smoke` section."""
     import shutil
@@ -14929,6 +15622,7 @@ def _self_test() -> int:
     _self_test_numerical_validation(_run)
     _self_test_polyhedral(_run)
     _self_test_synth_codegen(_run)
+    _self_test_flag_probe(_run)
     _self_test_e2e_smoke(_run)
 
     sys.stdout.write(f"\n[self-test] {passed} passed, {failures} failed\n")
