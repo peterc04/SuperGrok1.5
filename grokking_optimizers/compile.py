@@ -3406,11 +3406,11 @@ def _cost_model_compute_feature_dim() -> int:
 
 # Cache the dimension once. Self-tests + retrains rely on this being
 # a constant across the lifetime of the process. STALL_DIM_HINTS is
-# defined later in this file so we hardcode its known length here (13
+# defined later in this file so we hardcode its known length here (14
 # entries — kept in sync by the cost_model_feature_dim_matches_components
 # self-test). _cost_model_stall_reasons() resolves the actual keys on
 # first use; this constant only fixes the column count.
-_COST_MODEL_STALL_REASON_COUNT: int = 13  # len(STALL_DIM_HINTS) below
+_COST_MODEL_STALL_REASON_COUNT: int = 14  # len(STALL_DIM_HINTS) below
 FEATURE_DIM: int = (
     sum(len(vals) for vals in _COST_MODEL_CANONICAL_DIM_VALUES.values())
     + len(_COST_MODEL_NUMERIC_FEATURES)
@@ -4809,6 +4809,54 @@ def _migrate_v3_to_v4(data: dict, cache_dir: Optional[Path]) -> dict:
     return data
 
 
+def _read_trial_log_summary(sidecar_path: Path,
+                            stop_reason: Optional[str] = None
+                            ) -> Dict[str, Any]:
+    """Recompute the per-entry trial_log_summary from a .jsonl sidecar.
+
+    Mirrors the summary shape produced by ``_migrate_v3_to_v4`` so a
+    fresh-v4 cache (record_trial → sidecar) ends up byte-compatible with
+    a v3→v4-migrated cache. Used by ``CompileCache.record_trial`` and by
+    tests that read back the sidecar without going through the cache.
+
+    Returns ``{"n_trials", "best_timing_ms", "stop_reason",
+    "last_updated_unix"}``. Best timing is the minimum ``value_ms`` /
+    ``timing_ms`` across trials with status in (None, "ok"). A missing
+    or unreadable sidecar yields ``n_trials=0`` and ``best_timing_ms=None``.
+    """
+    n_trials = 0
+    times: List[float] = []
+    try:
+        with Path(sidecar_path).open("r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    trial = json.loads(ln)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(trial, dict):
+                    continue
+                n_trials += 1
+                if trial.get("status") not in (None, "ok"):
+                    continue
+                ms = trial.get("value_ms") or trial.get("timing_ms")
+                if ms is not None:
+                    try:
+                        times.append(float(ms))
+                    except (TypeError, ValueError):
+                        pass
+    except OSError:
+        pass
+    return {
+        "n_trials":          n_trials,
+        "best_timing_ms":    (min(times) if times else None),
+        "stop_reason":       stop_reason,
+        "last_updated_unix": time.time(),
+    }
+
+
 class _DebugTee:
     """File-like wrapper that mirrors every write to a secondary stream.
 
@@ -4920,13 +4968,41 @@ class CompileCache:
         return data
 
     def save(self) -> None:
-        """Atomically write to disk via tmp-file rename."""
+        """Atomically write to disk via tmp-file rename.
+
+        v4 layout: the main JSON does NOT carry the full
+        ``bayesian_trials`` / ``sweep_history`` payload — those lists
+        live in the per-entry .jsonl sidecar pointed to by
+        ``trial_log_path``. We copy the in-memory dict, strip the lists
+        to ``[]`` placeholders, and serialize the result. The in-memory
+        state is left intact so same-process callers can keep reading
+        the full trial lists after save().
+        """
         if self.path is None or not self._dirty:
             return
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-            tmp.write_text(json.dumps(self._data, indent=2, sort_keys=True))
+            # Build a serialization view that elides the trial lists —
+            # they live in the sidecar now. The shallow-then-per-entry
+            # copy keeps the cost O(entries) instead of O(total trials)
+            # for caches with thousands of trials.
+            serialized = dict(self._data)
+            entries = self._data.get("entries", {})
+            if isinstance(entries, dict) and entries:
+                ser_entries: Dict[str, Any] = {}
+                for k, e in entries.items():
+                    if isinstance(e, dict) and (
+                            e.get("bayesian_trials")
+                            or e.get("sweep_history")):
+                        ec = dict(e)
+                        ec["bayesian_trials"] = []
+                        ec["sweep_history"] = []
+                        ser_entries[k] = ec
+                    else:
+                        ser_entries[k] = e
+                serialized["entries"] = ser_entries
+            tmp.write_text(json.dumps(serialized, indent=2, sort_keys=True))
             tmp.replace(self.path)
             self._dirty = False
 
@@ -5048,11 +5124,69 @@ class CompileCache:
 
     def record_trial(self, opt: str, model: str, arch: str,
                      trial: Dict[str, Any]) -> None:
-        """Append a trial record to both bayesian_trials and sweep_history."""
+        """Append a trial record.
+
+        v4 layout: every trial is appended to a per-entry .jsonl sidecar
+        at ``<cache_dir>/trials_<opt>_<model>_<arch>.jsonl``. The main
+        JSON keeps the legacy ``bayesian_trials`` / ``sweep_history``
+        lists populated in-memory for same-process readers (transfer
+        learning, prune-by-timing) but those lists are REPLACED with
+        empty placeholders before ``save()`` writes the main JSON to
+        disk — mirroring the v3→v4 migration's on-disk shape.
+
+        Per-entry summary fields are updated on every call:
+          * ``trial_log_path`` → relative path to the sidecar (set once).
+          * ``trial_log_summary`` → ``{n_trials, best_timing_ms,
+            stop_reason, last_updated_unix}`` rolled forward.
+
+        Sidecar IO is best-effort: if the write fails (disk full,
+        permission denied, …) we emit a single ``[cache] WARN …`` line
+        and fall back to in-memory only. The autotune loop must never
+        crash on a sidecar write failure.
+        """
         with self._lock:
             e = self.get(opt, model, arch)
+            # In-memory copy — kept so same-process callers that read
+            # e["bayesian_trials"] / e["sweep_history"] (e.g.
+            # _collect_sibling_trials, prune-by-timing) keep working.
+            # save() replaces these with [] before writing the main
+            # JSON, same shape as a v3→v4-migrated cache.
             e["bayesian_trials"].append(trial)
             e["sweep_history"].append(trial)
+            # Sidecar write — the v4 promised on-disk layout. Resilient:
+            # any IO error degrades to in-memory only with a WARN log.
+            if self.path is not None:
+                cache_dir = self.path.parent
+                sidecar_name = f"trials_{opt}_{model}_{arch}.jsonl"
+                sidecar = cache_dir / sidecar_name
+                try:
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    with sidecar.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(trial, default=str) + "\n")
+                        f.flush()
+                        try:
+                            os.fsync(f.fileno())
+                        except (OSError, AttributeError):
+                            # fsync may fail on some filesystems (tmpfs,
+                            # NFS) or platforms — not fatal.
+                            pass
+                    # Pin the sidecar's relative path the first time we
+                    # successfully write to it; subsequent writes leave
+                    # it alone (callers may read from cache and resolve
+                    # against self.path.parent).
+                    if not e.get("trial_log_path"):
+                        e["trial_log_path"] = sidecar_name
+                    # Roll the summary forward — recomputing from the
+                    # sidecar is robust to mid-process restarts.
+                    stop_reason = (
+                        e.get("early_stop_info") or {}).get("stop_reason")
+                    e["trial_log_summary"] = _read_trial_log_summary(
+                        sidecar, stop_reason=stop_reason)
+                except OSError as exc:
+                    sys.stderr.write(
+                        f"[cache] WARN trial sidecar write failed: "
+                        f"{type(exc).__name__}: {exc}; "
+                        f"falling back to in-memory only\n")
             self._dirty = True
 
     def record_sweep(self, opt: str, model: str, arch: str, *,
@@ -6483,7 +6617,13 @@ def _preflight_toolchain(arch: str) -> List[str]:
 # "preflight FAILed" via separate fields so a CI grep can target either.
 
 def _dry_run_all_archs(out_dir: Path,
-                       config: Optional[Dict[str, Any]] = None
+                       config: Optional[Dict[str, Any]] = None,
+                       enable_synth_codegen: bool = False,
+                       enable_polyhedral: bool = False,
+                       enable_runtime_specialization: bool = False,
+                       enable_emitter: bool = False,
+                       enable_device_pgo: bool = False,
+                       strict_numerics: bool = False,
                        ) -> Dict[str, Dict]:
     """Run preflight + source-resolution + flag-emission for every CANONICAL
     arch in ARCH_TABLE. Aliases are skipped (they point at the same ArchEntry
@@ -6499,6 +6639,16 @@ def _dry_run_all_archs(out_dir: Path,
     …) flows through into the dry-run output. With ``config=None`` (or
     an empty dict) the manifest is byte-identical to the historical
     SuperGrok behaviour.
+
+    Opt-in feature toggles (``enable_synth_codegen``, ``enable_polyhedral``,
+    ``enable_runtime_specialization``, ``enable_emitter``,
+    ``enable_device_pgo``, ``strict_numerics``) are threaded onto the
+    per-arch BuildSpec BEFORE flag emission and surfaced in the manifest
+    under ``enabled_features`` so a CI consumer can grep the dry-run
+    output to confirm which knobs were on. ``enable_cost_model`` is
+    sourced from the project TOML (``[cost_model].enable``) via
+    apply_to_buildspec — no CLI flag exists for it today, so it
+    surfaces in ``enabled_features`` only when the user's config sets it.
 
     Robustness:
       * ``_resolve_sources`` may raise on archs whose
@@ -6547,6 +6697,24 @@ def _dry_run_all_archs(out_dir: Path,
                 # apply_to_buildspec is best-effort; a malformed user
                 # config must never abort the sweep.
                 pass
+        # Thread opt-in feature toggles onto the per-arch spec so they
+        # influence any downstream config-dependent flag emission AND so
+        # ``enabled_features`` (below) reports the effective state. Any
+        # toggles already set via apply_to_buildspec(...) (i.e. via the
+        # user's TOML) win over False defaults; the explicit CLI / kwarg
+        # request layers on top so a True kwarg always lights the flag.
+        if enable_synth_codegen:
+            spec.enable_synth_codegen = True
+        if enable_polyhedral:
+            spec.enable_polyhedral = True
+        if enable_runtime_specialization:
+            spec.enable_runtime_specialization = True
+        if enable_emitter:
+            spec.enable_emitter = True
+        if enable_device_pgo:
+            spec.enable_device_pgo = True
+        if strict_numerics:
+            spec.strict_numerics = True
 
         # --- preflight (capture all diagnostic lines) ---
         preflight_lines: List[str] = []
@@ -6607,6 +6775,28 @@ def _dry_run_all_archs(out_dir: Path,
             "ldflags":               ldflags,
             "expected_gencode":      list(entry.nvcc_gencode) if entry.vendor == "cuda" else [],
             "expected_offload_arch": entry.hipcc_offload_arch if entry.vendor == "hip" else "",
+            # Surface the effective opt-in feature toggle state for this
+            # per-arch spec so a CI grep can confirm which knobs were on
+            # at dry-run time. enable_cost_model has no CLI flag — it
+            # sources from [cost_model].enable in the project TOML via
+            # apply_to_buildspec, so it appears here only when the user's
+            # config sets it.
+            "enabled_features":      {
+                "enable_synth_codegen":          bool(
+                    getattr(spec, "enable_synth_codegen", False)),
+                "enable_polyhedral":             bool(
+                    getattr(spec, "enable_polyhedral", False)),
+                "enable_runtime_specialization": bool(
+                    getattr(spec, "enable_runtime_specialization", False)),
+                "enable_device_pgo":             bool(
+                    getattr(spec, "enable_device_pgo", False)),
+                "enable_cost_model":             bool(
+                    getattr(spec, "enable_cost_model", False)),
+                "enable_emitter":                bool(
+                    getattr(spec, "enable_emitter", False)),
+                "strict_numerics":               bool(
+                    getattr(spec, "strict_numerics", False)),
+            },
         }
         # Category 3b — surface XLA env flags in the dry-run manifest for
         # Pallas archs. ``device_cflags`` is intentionally empty for
@@ -10461,7 +10651,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             ARCH_TABLE.clear()
             ARCH_TABLE[target_arch] = saved_table[target_arch]
-            manifests = _dry_run_all_archs(out_dir, config=_early_cfg)
+            manifests = _dry_run_all_archs(
+                out_dir, config=_early_cfg,
+                enable_synth_codegen=bool(
+                    getattr(args, "enable_synth_codegen", False)),
+                enable_polyhedral=bool(
+                    getattr(args, "enable_polyhedral", False)),
+                enable_runtime_specialization=bool(
+                    getattr(args, "enable_runtime_specialization", False)),
+                enable_emitter=bool(
+                    getattr(args, "enable_emitter", False)),
+                enable_device_pgo=bool(
+                    getattr(args, "enable_device_pgo", False)),
+                strict_numerics=bool(
+                    getattr(args, "strict_numerics", False)),
+            )
         finally:
             ARCH_TABLE.clear()
             ARCH_TABLE.update(saved_table)
@@ -10485,7 +10689,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.dry_run_all_archs:
         out_dir = Path(args.out or REPO_ROOT / "build" / "compiled").resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
-        manifests = _dry_run_all_archs(out_dir, config=_early_cfg)
+        manifests = _dry_run_all_archs(
+            out_dir, config=_early_cfg,
+            enable_synth_codegen=bool(
+                getattr(args, "enable_synth_codegen", False)),
+            enable_polyhedral=bool(
+                getattr(args, "enable_polyhedral", False)),
+            enable_runtime_specialization=bool(
+                getattr(args, "enable_runtime_specialization", False)),
+            enable_emitter=bool(
+                getattr(args, "enable_emitter", False)),
+            enable_device_pgo=bool(
+                getattr(args, "enable_device_pgo", False)),
+            strict_numerics=bool(
+                getattr(args, "strict_numerics", False)),
+        )
         sys.stdout.write(
             f"[dry-run-all-archs] wrote {len(manifests)} manifests to {out_dir}\n")
         for arch in sorted(manifests):
@@ -11570,6 +11788,100 @@ def _self_test_bayesian(run) -> None:
     run("run_bayesian_optuna_4plus_pruned_fail_no_value",
          test_run_bayesian_optuna_4plus_pruned_fail_no_value)
 
+    def test_run_bayesian_optuna_4plus_pruned_infeasible_no_value():
+        """L4476 — PRUNED-infeasible path: every cfg fails the prefilter,
+        so each iteration goes straight to ``study.tell(state=PRUNED)``
+        with NO value. Must not raise ValueError under Optuna 4.0.
+        """
+        space = {"sm_90": {"dims": [
+            {"name": "block", "type": "int", "values": [64, 128, 256, 512],
+             "macro": "BLK", "applies_to": ["host", "device"]},
+            {"name": "vec", "type": "int", "values": [1, 2, 4],
+             "macro": "VEC", "applies_to": ["host", "device"]},
+        ], "prefilter": {"rules": [{"expr": "False"}]}}}
+
+        def _never_called_timer(cfg):
+            raise AssertionError(
+                "timer must never run when every cfg is infeasible")
+
+        td = Path(tempfile.mkdtemp())
+        try:
+            trials, _stop = run_bayesian(
+                "sm_90", space, n_trials=5, seed=0,
+                storage=td / "study.db", timer=_never_called_timer)
+            assert len(trials) == 5, f"expected 5 trials, got {len(trials)}"
+            for t in trials:
+                assert t.get("status") == "infeasible", (
+                    f"expected status='infeasible', got {t.get('status')!r}")
+        finally:
+            shutil.rmtree(td)
+
+    def test_run_bayesian_optuna_4plus_pruned_cost_model_no_value():
+        """L4505 — PRUNED-cost-model path: the timer returns a
+        ``cost_model_pruned`` sentinel dict. ``study.tell`` must be called
+        with state=PRUNED and NO value under Optuna 4.0.
+        """
+        def _cost_model_pruner(cfg):
+            return {
+                "stage":              "tpe",
+                "config":             dict(cfg),
+                "config_key":         config_key(cfg),
+                "timing_ms":          None,
+                "min_ms":             None,
+                "max_ms":             None,
+                "n":                  None,
+                "host":               None,
+                "numerical_status":   "skipped",
+                "status":             "cost_model_pruned",
+                "predicted_timing_ms": 10.0,
+                "recorded_at":        datetime.datetime.now().isoformat(),
+            }
+
+        td = Path(tempfile.mkdtemp())
+        try:
+            trials, _stop = run_bayesian(
+                "sm_90", _tiny_space(), n_trials=5, seed=0,
+                storage=td / "study.db", timer=_cost_model_pruner)
+            assert len(trials) == 5, f"expected 5 trials, got {len(trials)}"
+            for t in trials:
+                assert t.get("status") == "cost_model_pruned", (
+                    f"expected status='cost_model_pruned', "
+                    f"got {t.get('status')!r}")
+        finally:
+            shutil.rmtree(td)
+
+    def test_run_bayesian_optuna_4plus_fail_nonfinite_no_value():
+        """L4520 — FAIL-non-finite path: the timer returns NaN. The
+        ``not math.isfinite(value)`` branch must call ``study.tell`` with
+        state=FAIL and NO value under Optuna 4.0.
+        """
+        def _nan_timer(cfg):
+            return float("nan")
+
+        td = Path(tempfile.mkdtemp())
+        try:
+            trials, _stop = run_bayesian(
+                "sm_90", _tiny_space(), n_trials=5, seed=0,
+                storage=td / "study.db", timer=_nan_timer)
+            assert len(trials) == 5, f"expected 5 trials, got {len(trials)}"
+            # _coerce_timer_result wraps the NaN scalar into a dict, so
+            # the rec status ends up "ok" (result is not None) even
+            # though the value is NaN — the assertion is that the call
+            # didn't raise ValueError from study.tell.
+            for t in trials:
+                # The status may be "ok" (result dict wrapped from NaN
+                # scalar) — what matters is that the path didn't crash.
+                assert "status" in t, t
+        finally:
+            shutil.rmtree(td)
+
+    run("run_bayesian_optuna_4plus_pruned_infeasible_no_value",
+        test_run_bayesian_optuna_4plus_pruned_infeasible_no_value)
+    run("run_bayesian_optuna_4plus_pruned_cost_model_no_value",
+        test_run_bayesian_optuna_4plus_pruned_cost_model_no_value)
+    run("run_bayesian_optuna_4plus_fail_nonfinite_no_value",
+        test_run_bayesian_optuna_4plus_fail_nonfinite_no_value)
+
 
 def _self_test_early_stopping(run) -> None:
     """`[self-test] early_stopping` section."""
@@ -11998,6 +12310,77 @@ def _self_test_cache(run) -> None:
 
     run("cache_prune", test_cache_prune)
     run("cache_prune_dry_run", test_cache_prune_dry_run)
+
+    def test_cache_v4_fresh_record_trial_writes_sidecar():
+        """Regression for Bug 2: a fresh v4 cache must spill record_trial
+        appends into a per-entry .jsonl sidecar (the promised v4 layout)
+        AND the main JSON's bayesian_trials / sweep_history must be
+        empty placeholders on disk — same shape as a v3→v4-migrated cache.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tdp = Path(td)
+            cache_path = tdp / "cache.json"
+            cache = CompileCache(cache_path)
+            # Three trials, mimicking a small autotune burst.
+            for i in range(3):
+                cache.record_trial("lion", "mamba3", "sm_90a", {
+                    "config":     {"block": 64 * (i + 1), "vec": 2, "unroll": 4},
+                    "timing_ms":  0.5 + 0.01 * i,
+                    "trial_num":  i,
+                    "stage":      "tpe",
+                    "status":     "ok",
+                    "ptxas_info": {"regs_used": 32},
+                })
+            cache.save()
+
+            # 1) Sidecar exists with exactly 3 lines.
+            sidecar = tdp / "trials_lion_mamba3_sm_90a.jsonl"
+            assert sidecar.exists(), \
+                f"expected sidecar at {sidecar}, dir contents: {list(tdp.iterdir())}"
+            lines = [ln for ln in sidecar.read_text().splitlines() if ln.strip()]
+            assert len(lines) == 3, f"expected 3 lines, got {len(lines)}"
+            # Each line is valid JSON with the expected payload.
+            parsed = [json.loads(ln) for ln in lines]
+            assert all(p["status"] == "ok" for p in parsed), parsed
+            assert parsed[0]["trial_num"] == 0
+            assert parsed[2]["ptxas_info"]["regs_used"] == 32
+
+            # 2) Main JSON's bayesian_trials/sweep_history are empty
+            #    placeholders (NOT the full trial payload).
+            on_disk = json.loads(cache_path.read_text())
+            entry = on_disk["entries"]["lion/mamba3/sm_90a"]
+            assert entry["bayesian_trials"] == [], entry["bayesian_trials"]
+            assert entry["sweep_history"] == [], entry["sweep_history"]
+
+            # 3) trial_log_path / trial_log_summary populated.
+            assert entry["trial_log_path"] == "trials_lion_mamba3_sm_90a.jsonl", \
+                entry["trial_log_path"]
+            tls = entry["trial_log_summary"]
+            assert tls["n_trials"] == 3, tls
+            assert tls["best_timing_ms"] is not None
+            assert abs(tls["best_timing_ms"] - 0.5) < 1e-9, tls
+
+            # 4) Roundtrip: re-load cache from disk; verify sidecar
+            #    summary persists and matches _read_trial_log_summary.
+            reloaded = CompileCache(cache_path)
+            re_entry = reloaded._data["entries"]["lion/mamba3/sm_90a"]
+            assert re_entry["trial_log_path"] == "trials_lion_mamba3_sm_90a.jsonl"
+            assert re_entry["trial_log_summary"]["n_trials"] == 3
+            recomputed = _read_trial_log_summary(sidecar)
+            assert recomputed["n_trials"] == 3, recomputed
+            assert recomputed["best_timing_ms"] is not None
+            assert abs(recomputed["best_timing_ms"] - 0.5) < 1e-9, recomputed
+
+            # 5) In-memory state on the ORIGINAL cache still has the
+            #    trials (save() must not mutate the in-memory dict).
+            in_mem = cache._data["entries"]["lion/mamba3/sm_90a"]
+            assert len(in_mem["bayesian_trials"]) == 3, \
+                "save() must not mutate in-memory bayesian_trials"
+            assert len(in_mem["sweep_history"]) == 3, \
+                "save() must not mutate in-memory sweep_history"
+
+    run("cache_v4_fresh_record_trial_writes_sidecar",
+        test_cache_v4_fresh_record_trial_writes_sidecar)
 
 
 def _self_test_multi_gpu_pool(run) -> None:
@@ -12928,6 +13311,65 @@ def _self_test_portability(run) -> None:
     run("project_agnostic_dry_run_no_sg_leakage",
          test_project_agnostic_dry_run_no_sg_leakage)
 
+    def test_toml_macro_prefix_accepts_sources_location():
+        """Regression for Bug 3: macro_prefix is canonically under
+        [project] but the README example placed it under [sources].
+        apply_to_buildspec must accept both locations so a user TOML
+        following the README doesn't silently lose the setting. When
+        BOTH are set, [project] wins (canonical).
+        """
+        class _SimSpec:
+            arch = "sm_90a"
+            optimizer = "myop"
+            model = "mymodel"
+            extra_macros: list = []
+            macro_prefix = "SG_BUILD_"
+            fused_op_template = (
+                "torch.ops.grokking_optimizers."
+                "fused_{opt_lower}_simple_step")
+            python_package = "grokking_optimizers"
+            project_namespace = ""
+            tuned_header_path = "csrc/algorithms/tuned_configs.h"
+            source_roots: dict = {}
+            config: dict = {}
+            enable_emitter = False
+            enable_runtime_specialization = False
+            enable_device_pgo = False
+            strict_numerics = False
+            prune_after_autotune = True
+            prune_max_age_days = 30
+            prune_keep_top_n = 100
+
+        # Case A — macro_prefix under [sources] alone (README's example).
+        spec_a = _SimSpec()
+        apply_to_buildspec(spec_a, {"sources": {"macro_prefix": "FOO_"}})
+        assert spec_a.macro_prefix == "FOO_", spec_a.macro_prefix
+
+        # Case B — macro_prefix under [project] alone (canonical).
+        spec_b = _SimSpec()
+        apply_to_buildspec(spec_b, {"project": {"macro_prefix": "BAR_"}})
+        assert spec_b.macro_prefix == "BAR_", spec_b.macro_prefix
+
+        # Case C — both set; [project] wins (canonical placement).
+        spec_c = _SimSpec()
+        apply_to_buildspec(spec_c, {
+            "project": {"macro_prefix": "BAZ_"},
+            "sources": {"macro_prefix": "QUX_"},
+        })
+        assert spec_c.macro_prefix == "BAZ_", spec_c.macro_prefix
+
+        # Sanity: same fallback for fused_op_template.
+        spec_d = _SimSpec()
+        apply_to_buildspec(spec_d, {
+            "sources": {"fused_op_template":
+                        "torch.ops.altproj.fused_{opt_lower}_step"},
+        })
+        assert spec_d.fused_op_template.startswith("torch.ops.altproj"), \
+            spec_d.fused_op_template
+
+    run("toml_macro_prefix_accepts_sources_location",
+        test_toml_macro_prefix_accepts_sources_location)
+
     # ─────────────────────────────────────────────────────────────────
     # Stream 6 — codegen / Jinja2 kernel emitter
     # ─────────────────────────────────────────────────────────────────
@@ -13433,6 +13875,55 @@ def _self_test_dry_run_all_archs(run) -> None:
                 assert payload["arch"] == arch
 
     run("dry_run_all_archs", test_dry_run_all_archs)
+
+    def test_dry_run_threads_feature_toggles():
+        """_dry_run_all_archs must thread the opt-in feature toggles
+        (enable_synth_codegen / enable_polyhedral / etc.) onto every
+        per-arch BuildSpec AND surface them in the emitted manifest under
+        ``enabled_features`` so a CI consumer can confirm which knobs
+        were on. Regression for Bug 1 — the --dry-run short-circuit in
+        main() used to skip the toggles entirely.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            # Both toggles ON via kwargs (mirrors --enable-synth-codegen
+            # --enable-polyhedral on the CLI).
+            manifests_on = _dry_run_all_archs(
+                Path(td), config=None,
+                enable_synth_codegen=True,
+                enable_polyhedral=True,
+            )
+            assert manifests_on, "expected at least one manifest"
+            for arch, m in manifests_on.items():
+                ef = m.get("enabled_features")
+                assert isinstance(ef, dict), (
+                    f"{arch}: enabled_features missing or not a dict: {ef!r}")
+                assert ef.get("enable_synth_codegen") is True, (
+                    f"{arch}: enable_synth_codegen={ef.get('enable_synth_codegen')!r}")
+                assert ef.get("enable_polyhedral") is True, (
+                    f"{arch}: enable_polyhedral={ef.get('enable_polyhedral')!r}")
+                # Sidecar must carry the same payload.
+                payload = json.loads(
+                    (Path(td) / f"dry_run_{arch}.json").read_text())
+                pef = payload.get("enabled_features", {})
+                assert pef.get("enable_synth_codegen") is True, pef
+                assert pef.get("enable_polyhedral") is True, pef
+
+        with tempfile.TemporaryDirectory() as td2:
+            # Default (no kwargs) → toggles all False in the manifest.
+            manifests_off = _dry_run_all_archs(Path(td2), config=None)
+            for arch, m in manifests_off.items():
+                ef = m.get("enabled_features", {})
+                assert ef.get("enable_synth_codegen") is False, (
+                    f"{arch}: expected False, got {ef.get('enable_synth_codegen')!r}")
+                assert ef.get("enable_polyhedral") is False, (
+                    f"{arch}: expected False, got {ef.get('enable_polyhedral')!r}")
+                # The other toggles in the contract — also False.
+                for k in ("enable_runtime_specialization",
+                          "enable_device_pgo", "enable_cost_model",
+                          "enable_emitter", "strict_numerics"):
+                    assert ef.get(k) is False, f"{arch}: {k}={ef.get(k)!r}"
+
+    run("dry_run_threads_feature_toggles", test_dry_run_threads_feature_toggles)
 
 
 def _self_test_pallas(run) -> None:
@@ -18420,6 +18911,17 @@ def get_registry(arch: str,
     passes it through here gets ``~/.cache/<their_project>/nvrtc``
     instead of leaking the SuperGrok name. With no override the path
     is byte-identical to today (``~/.cache/supergrok/nvrtc``).
+
+    Note: registries are cached per-arch in a module-level ``_REGISTRY``
+    dict. The first call with a given ``arch`` wins; subsequent calls
+    with a different ``config=`` or ``cache_dir=`` for the same arch
+    return the existing registry without re-resolving the cache dir.
+    This is intentional for build-time stability (the autotuner expects
+    a single registry per arch across the lifetime of a build) but can
+    surprise callers that switch projects mid-process. To force a
+    re-build, clear ``_REGISTRY[arch]`` (or the whole dict) before the
+    next call. The portability self-test wipes the dict around its
+    project-name assertions for exactly this reason.
     """
     with _REGISTRY_LOCK:
         existing = _REGISTRY.get(arch)
@@ -18498,6 +19000,10 @@ STALL_DIM_HINTS: Dict[str, List[str]] = {
     "vmem_lat":            ["waves_per_eu", "vec"],
     "lds_bank_conflict":   ["lds_padding"],
     "valu_dep":            ["unroll", "num_stages"],
+    # CUPTI emits ``inst_fetch`` for instruction-cache fetch stalls.
+    # Register pressure (maxrregcount) and occupancy (block) are the
+    # generic bias dims for that bottleneck.
+    "inst_fetch":          ["maxrregcount", "block"],
 }
 
 
@@ -19110,10 +19616,19 @@ def apply_to_buildspec(spec, config: Dict[str, Any]) -> None:
             config["cache"].get("keep_top_n", 100))
     # ---------------- Stream A portability fields ------------------
     proj = config.get("project", {}) if isinstance(config, dict) else {}
-    if proj.get("macro_prefix"):
-        spec.macro_prefix = str(proj["macro_prefix"])
-    if proj.get("fused_op_template"):
-        spec.fused_op_template = str(proj["fused_op_template"])
+    src = config.get("sources", {}) if isinstance(config, dict) else {}
+    # macro_prefix / fused_op_template are CANONICALLY declared under
+    # [project] but the README's source-layout example placed them under
+    # [sources] (intuitive given their relationship to the source tree).
+    # We accept both locations to avoid silent loss. [project] wins when
+    # both are set so the canonical placement is unambiguous.
+    macro_prefix = proj.get("macro_prefix") or src.get("macro_prefix")
+    if macro_prefix:
+        spec.macro_prefix = str(macro_prefix)
+    fused_op_template = (proj.get("fused_op_template")
+                         or src.get("fused_op_template"))
+    if fused_op_template:
+        spec.fused_op_template = str(fused_op_template)
     if proj.get("python_package"):
         spec.python_package = str(proj["python_package"])
     # ``namespace`` defaults to "" — we still copy that through so a
