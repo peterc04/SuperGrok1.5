@@ -27,26 +27,41 @@ you confirm the wrapper is healthy on the current host without
 installing anything but Python and the package itself:
 
 ```bash
-# 1. Run the inline self-test suite (127 checks, no GPU needed)
+# 1. Run the inline self-test suite (131 checks; many gate on dep
+#    presence and SKIP cleanly on a CPU-only host — see the gating
+#    note in "What gets exercised on a CPU-only host" below)
 python3 -m grokking_optimizers.compile --self-test
 
 # 2. List every supported arch with its vendor / min toolchain / features
 python3 -m grokking_optimizers.compile --list-archs
 
-# 3. Sweep all 26 archs into per-arch JSON manifests (no compile, no GPU)
+# 3. Sweep all 25 canonical archs into per-arch JSON manifests (no
+#    compile, no GPU). Each JSON includes host_cflags, device_cflags,
+#    device_ldflags, version_gated_device_cflags (per-host toolchain
+#    probe), preflight judgment, and enabled_features (with the pgo
+#    toggle surfaced alongside the others).
 python3 -m grokking_optimizers.compile --dry-run-all-archs --out /tmp/manifests
 ```
 
 Auto-arch detection: every CLI invocation now treats `--arch` as
-**optional**. When omitted, the wrapper probes `torch.cuda` → `rocm-smi` →
-`jax.devices()` → your TOML config's `[archs].default` → built-in
-fallback (`sm_90a`), prints a `[arch] auto-detected <arch> from <source>
-(<gpu_name>)` line (with the actual GPU name from
-`torch.cuda.get_device_name(0)`), and proceeds. Pass `--arch sm_90a`
-(or any other) to override. The probe priority is strict: if a real
-GPU is detected via `torch.cuda`, the built-in `sm_90a` fallback is
-NEVER consulted — that's the fix for Colab/Kaggle hosts that were
-previously cross-compiling sm_90a binaries onto T4/A100/V100 GPUs.
+**optional**. When **omitted entirely** (no `--arch` token on the
+command line), the wrapper probes in priority order:
+
+1. `torch.cuda.get_device_capability(0)` (real NVIDIA GPU on the host)
+2. `rocm-smi --showproductname` (real AMD GPU)
+3. `jax.devices()` (real TPU)
+4. The TOML config's `[archs].default` (when a `--config <file>` is
+   supplied AND it sets that key)
+5. Built-in fallback `sm_90a`
+
+The first probe that succeeds wins; subsequent probes are skipped.
+A `[arch] auto-detected <arch> from <source> (<gpu_name>)` line is
+printed so you can see which one fired. Pass `--arch sm_90a` (or any
+other concrete arch) to override.
+
+Note: `--arch auto` is **not** a recognized value. Only *omitting*
+`--arch` triggers auto-detect; passing the literal string `auto` is
+rejected by argparse with an `invalid choice` error.
 
 Single-arch dry-run: `python3 -m grokking_optimizers.compile -O adamw -M
 mamba3 --arch sm_90a --dry-run --out /tmp/probe --enable-synth-codegen
@@ -64,7 +79,8 @@ re-prefixes for your project. Example:
 ```toml
 # myproject.toml
 [project]
-name              = "myproject"      # → ~/.cache/myproject/nvrtc, NVRTC cache namespace
+name              = "myproject"      # used by the debug header for the disk-free probe; the
+                                     # actual NVRTC cubin cache lives under <out>/nvrtc_cache
 namespace         = "myproject"      # → C++ namespace in emitted code
 python_package    = "myproject"      # → import path the registry uses
 macro_prefix      = "MYPROJ_"        # → -DMYPROJ_OPTIMIZER_*, -DMYPROJ_ARCH_*, -DMYPROJ_VERBOSE
@@ -88,9 +104,10 @@ self-test `project_agnostic_dry_run_no_sg_leakage`: with the above
 config the wrapper emits `-DMYPROJ_OPTIMIZER_ADAMW=1`,
 `-DMYPROJ_ARCH_SM86=1` (note: arch macro uses the literal arch label
 from `ARCH_TABLE` — `SM86`, not `SM_86`), and `-DMYPROJ_VERBOSE=1`
-with **zero `SG_BUILD_` leakage** across all 26 archs. The new
-`enabled_features` field in every dry-run manifest also surfaces which
-opt-in toggles were enabled.
+with **zero `SG_BUILD_` leakage** across all 25 canonical archs. The
+`enabled_features` field in every dry-run manifest surfaces which
+opt-in toggles were enabled (including `pgo`, surfaced alongside the
+other `enable_*` keys).
 
 ### Step 1 — Clone the repo
 
@@ -125,7 +142,7 @@ subprocess.run(["git", "submodule", "update", "--init", "--recursive",
 ### Step 3 — Compile (one Python block, every MAXIMAL feature available)
 
 > **Before you start**: `compile.py` auto-detects your GPU. On Colab
-> (T4 / L4 / A100 / V100) you don't need to set `ARCH` — leave it as
+> (T4 / L4 / A100) you don't need to set `ARCH` — leave it as
 > `None` and the resolver runs the same probe chain as the CLI
 > (`torch.cuda` → `rocm-smi` → `jax.devices` → TOML → built-in
 > fallback). The quickstart works on **any GPU vendor / arch** out of
@@ -164,16 +181,32 @@ sys.path.insert(0, str(REPO_ROOT))
 OPTIMIZER = "adamw"            # adamw | lion | grokfast | grokadamw | looksam |
                                # muon | neuralgrok | prodigy | supergrok11 |
                                # supergrok15 | supergrok2
-MODEL     = "decoder"          # mamba | decoder | vit
+MODEL     = "vit"              # mamba | decoder | vit  (per
+                               # grokking_optimizers.profile.MODELS)
+                               # NOTE: the CLI parser's --model choices come
+                               # from [models].enabled in the active TOML
+                               # config (default _DEFAULT_PROJECT_CONFIG
+                               # advertises ["mamba3", "transformer_decoder",
+                               # "vit"]); ``_validate(spec)`` enforces the
+                               # profile-module triple ("mamba", "decoder",
+                               # "vit"). ``vit`` is the only value that
+                               # passes BOTH layers with no extra TOML
+                               # override. To use ``mamba`` or ``decoder``
+                               # from the CLI, supply ``--config`` with a
+                               # TOML that sets [models].enabled = ["mamba",
+                               # "decoder", "vit"].
 ARCH      = None               # None  ⇒ auto-detect via build()'s probe chain
                                # (torch.cuda → rocm-smi → jax → TOML →
-                               # built-in fallback). Override ONLY if
-                               # cross-compiling for a different arch than
-                               # the GPU this process is on. Common Colab
-                               # GPUs map to: V100=sm_70, T4=sm_75,
-                               # A100=sm_80, L4=sm_89, H100=sm_90a.
+                               # built-in fallback `sm_90a`). Override ONLY
+                               # if cross-compiling for a different arch
+                               # than the GPU this process is on. Common
+                               # Colab GPUs map to: T4=sm_75, A100=sm_80,
+                               # L4=sm_89, H100=sm_90a. (V100 / sm_70 is
+                               # NOT in ARCH_TABLE today — V100 hosts
+                               # cannot run this wrapper without a custom
+                               # arch entry; see "Common pitfalls" below.)
                                # See "Hardware support — ARCH_TABLE" for
-                               # the full list of 26 canonical archs.
+                               # the full list of 25 canonical archs.
 
 # ─── AUTOTUNE BUDGET — every value below is a CEILING / KNOB, not a target.
 #     The autotuner picks the actual kernel parameters from a per-arch
@@ -228,7 +261,12 @@ ENABLE_COST_MODEL         = True   # Learned cost model + rejection budget
                                    # (Stream C) — predicted-bad configs
                                    # are skipped without timing them, so
                                    # the autotuner spends its budget on
-                                   # promising candidates.
+                                   # promising candidates. NOTE: not wired
+                                   # through build() as a kwarg — opt in
+                                   # via TOML ([cost_model].enable=true).
+                                   # The variable is referenced below only
+                                   # to keep the comment block in sync
+                                   # with the TOML key.
 STRICT_NUMERICS           = False  # KEEP OFF for first run — opt in only
                                    # after a healthy baseline. Requires
                                    # bit-identical determinism for the
@@ -313,7 +351,11 @@ so_path = build(
     enable_runtime_specialization=ENABLE_RUNTIME_SPEC,  # NVRTC / hipRTC
     enable_synth_codegen=ENABLE_SYNTH_CODEGEN,   # OpGraph synthesis codegen
     enable_polyhedral=ENABLE_POLYHEDRAL,         # polyhedral schedule search
-    enable_cost_model=ENABLE_COST_MODEL,         # learned cost-model gate
+    # NOTE: ``enable_cost_model`` is NOT a build() kwarg today — it is
+    # opt-in via the TOML config only ([cost_model].enable = true). Pass
+    # ``config={"cost_model": {"enable": True}}`` to build(), or set the
+    # key in your compile_config.toml. The pure build() signature is
+    # checked by py_compile if you uncomment any nonexistent kwarg.
     # ── Numerical validation ──
     strict_numerics=STRICT_NUMERICS,
     # ── Cache GC ──
@@ -463,39 +505,50 @@ from pathlib import Path
 sys.path.insert(0, str(Path.cwd()))   # assumes you're in SuperGrok1.5/
 
 from grokking_optimizers.compile import main as compile_main
-assert compile_main(["--self-test"]) == 0  # prints "[self-test] 127 passed, 0 failed"
+assert compile_main(["--self-test"]) == 0  # prints "[self-test] N passed, M failed";
+                                            # N is ~131 today (count fluctuates as
+                                            # tests are added). M=0 is the success
+                                            # condition. On a CPU-only host, several
+                                            # tests SKIP cleanly (counted as PASS)
+                                            # when their dep is absent — see the
+                                            # "What gets exercised" note below.
 ```
 
-The 127-test self-test covers: ARCH_TABLE completeness for all 26 archs,
-per-arch search-space cardinalities (billions per CUDA/HIP arch, ~3.4T for
-sm_100a), the new Stream α native flag emission (`--warn-on-spills`,
-`--default-stream per-thread`, `-rdc=true`, `--source-in-ptx` on NVIDIA;
-`-fgpu-rdc`, `-mllvm --enable-newgvn`, `--inline-threshold=275` on AMD;
-`--xla_gpu_enable_priority_fusion`, pipelined collectives,
-`autotune_max_solutions=128` on JAX), the ptxas-v stderr parser, the five
-Bayesian early-stopping criteria (plateau, EI-exhaustion, coverage
-saturation, wall-clock, hard ceiling), all 44 bundled Jinja2 templates
-(11 optimizers × 4 arch families), the polyhedral `apply_schedule` body
-lift (real libclang Cursor walk + honest fallback comment when libclang
-absent), the arch-native MMA emission in synth GEMM (`wgmma.mma_async`,
-`tcgen05.mma`, `mfma_f32_16x16x16`, `wmma_f32_16x16x16`), the CUTLASS/CK
-fallback `source=` tagging, the bias_trial_queue device-PGO wiring into
-`run_bayesian`, NVRTC compile + live `cuLaunchKernel` dispatch (gated on
-cuda-python + GPU), the work-stealing multi-GPU pool, cache schema
-migrations (v2 → v3 → v4), the v4 `.jsonl` trial sidecar plumbing, the
-Stream β auto-arch resolver (torch.cuda → rocm-smi → jax.devices → TOML →
-fallback), the preflight version-mismatch suggestion lines, the per-arch
-dry-run manifest sweep, the e2e smoke gate, Pallas backend sentinels with
-the `block_spec` search-space dim, numerical-validation tolerances, the
-TOML config loader (with project-agnostic macro-prefix override and
-`[project]` / `[sources]` dual-location acceptance), the Optuna 4.0+
-`study.tell(state=PRUNED)` regression test (all 4 paths: infeasible,
-exception, cost-model, non-finite), the v4 cache fresh-write sidecar
-plumbing (the `record_trial` path now writes `.jsonl` sidecars directly,
-not just on migration), the dry-run `enabled_features` feature-toggle
-manifest field, the buildspec-field AST guardrail (catches field renames
-at test time), and toolchain-bootstrap dispatch — no GPU, nvcc, hipcc,
-or jax[tpu] required to pass it.
+The self-test (~131 checks today) covers a broad surface area:
+
+- **Always exercised** (no opt deps needed): ARCH_TABLE completeness for
+  all 25 canonical archs; per-arch search-space cardinalities; the
+  Stream α native flag emission for NVIDIA / AMD / JAX; ptxas-v stderr
+  parser; the five Bayesian early-stopping criteria (plateau,
+  EI-exhaustion, coverage saturation, wall-clock, hard ceiling); cache
+  schema migrations (v2 → v3 → v4) and the v4 `.jsonl` trial sidecar
+  plumbing; the Stream β auto-arch resolver
+  (`torch.cuda` → `rocm-smi` → `jax.devices` → TOML → fallback);
+  preflight version-mismatch suggestion lines; per-arch dry-run
+  manifest sweep; Pallas backend sentinels with the `block_spec`
+  search-space dim; numerical-validation tolerances; TOML config
+  loader (project-agnostic macro-prefix override; `[project]` /
+  `[sources]` dual-location acceptance; macro-prefix validation); the
+  Optuna 4.0+ `study.tell(state=PRUNED)` regression test; the dry-run
+  `enabled_features` feature-toggle manifest field (including the
+  `pgo` key surfaced alongside `enable_*`); the buildspec-field AST
+  guardrail; and toolchain-bootstrap *dispatch* (the actual
+  installation path is not exercised — only the per-vendor selector).
+- **Dep-gated (SKIP cleanly when dep absent)**: bundled Jinja2 template
+  rendering (needs `jinja2`); polyhedral `apply_schedule` body lift
+  (needs `libclang`); arch-native MMA emission in synth GEMM and the
+  CUTLASS / CK fallback `source=` tagging (needs the third-party
+  submodules); NVRTC compile + live `cuLaunchKernel` dispatch (needs
+  `cuda-python` + a visible CUDA device); work-stealing multi-GPU pool
+  (needs ≥1 visible GPU); the `e2e_smoke` end-to-end build (needs
+  toolchain + GPU); device-PGO `bias_trial_queue` wiring into
+  `run_bayesian` (needs `nsys` / `rocprof` to produce a real sidecar).
+
+In other words: the *build-correctness* portion of the suite (flag
+emission, search space, cache schema, BuildSpec semantics, config
+loader) runs on any host. The *integration* portion (live NVRTC,
+GPU-bound autotune, Jinja2-rendered templates) needs the
+corresponding optional dep to actually fire.
 
 ### Troubleshooting
 
@@ -518,9 +571,74 @@ or jax[tpu] required to pass it.
 | Compile silently hangs at "jit-autotune" | First-time Optuna study creation needs SQLite write access to `<out>/optuna_<O>_<M>_<A>.db`. With `debug=True` the SQLite error would have streamed; check `out_dir=` permissions. |
 | `[build FAILED after 0.0s]` and you missed the error | Re-run with `debug=True` — the actual compiler error streams to your terminal and is also persisted in `build/compiled/compile_<O>_<M>_<A>.txt`. |
 
+### Common pitfalls
+
+A short list of footguns the wrapper does not (and cannot) auto-fix:
+
+- **GPU vs ARCH mismatch (cross-compile foot-gun).** Setting
+  `ARCH=sm_90a` on a host whose GPU is a T4 / A100 / V100 produces a
+  perfectly valid Hopper artefact — but it will not load on the local
+  GPU at runtime. If you want to *run* what you build, either omit
+  `--arch` (auto-detect picks the local arch) or set it to match.
+  `--arch sm_90a` on a non-Hopper host is only useful when you intend
+  to *publish* the `.so` to a Hopper machine via `--aot-artifact-dir`.
+
+- **V100 / sm_70 is NOT in ARCH_TABLE today.** The table contains
+  `sm_75` (T4) and up. V100 hosts cannot use this wrapper without a
+  custom `ArchEntry` for `sm_70` (Volta) — the auto-detect probe will
+  fall through to the `sm_90a` default, which is wrong for the host.
+  The README's "Hardware support" table previously included an
+  `sm_70` row out of optimism; that row is informational at best
+  until an entry is added.
+
+- **CUDA-version mismatch on the host.** When `nvcc --version` reports
+  CUDA 11.x but your target arch needs 12.x (e.g. sm_90, sm_100,
+  sm_120), pass `--bootstrap-cuda` so the wrapper installs the
+  matching toolchain version from NVIDIA's official apt repo. Without
+  this, the per-arch preflight emits `[preflight] arch=sm_X need
+  CUDA>=N have M — FAIL` and the build is unlikely to succeed.
+
+- **LTO compatibility.** The `HOST_CFLAGS_BASE` includes `-flto=full`,
+  which older GCC releases (and clang ≤ ~13) reject — they only
+  accept `-flto` / `-flto=auto` / `-flto=thin`. If your host compiler
+  fails with `unrecognized argument to -flto= option: 'full'`, the
+  preflight flag-probe will detect and drop the flag automatically
+  (`[preflight] WARN flag '-Xcompiler -flto=full' rejected by nvcc —
+  dropping`). The build proceeds without LTO in that case.
+
+- **`--arch auto` is not valid.** Auto-detect only triggers when
+  `--arch` is *omitted entirely* — passing the literal string `auto`
+  is rejected by argparse.
+
+### What gets exercised on a CPU-only host
+
+The self-test runs ~131 checks today, but many are dep-gated: when
+the required Python package or hardware isn't available, the check
+SKIPs cleanly (still counted as PASS — the gate fires before the
+check's body). Concretely, on a fresh CPU-only host without optional
+deps, the following families SKIP:
+
+- `e2e_smoke` family — gates on a visible CUDA / ROCm / TPU device.
+- `flag_probe_*` family — partially gated on a working nvcc / hipcc
+  on PATH; the cache + dispatch tests still run.
+- `polyhedral_apply_schedule_*` — gates on `libclang` (soft dep).
+- `synth_codegen_*` (CK / CUTLASS variants) — gates on the
+  third-party-submodule presence.
+- `bundled_templates_*` — gates on `jinja2`.
+- `nvrtc_*` — gates on `cuda-python`.
+
+The remaining ~110 checks (ARCH_TABLE completeness, search-space
+hashing, flag-emission per arch, cache-v4 consistency, BuildSpec
+schema, autotune stopper math, dry-run manifest schema, TOML config
+loader, macro-prefix validation, project-agnostic dry-run) run on
+**any** host with Python 3.11+ and torch. The "131 checks" number
+is therefore the upper bound; the floor on a stripped CPU-only host
+is what the user actually sees and that floor is still informative
+(it's the build-correctness portion of the suite).
+
 ---
 
-## Hardware support — ARCH_TABLE (26 canonical archs)
+## Hardware support — ARCH_TABLE (25 canonical archs)
 
 `grokking_optimizers.compile.ARCH_TABLE` is the single source of truth.
 Every flag, feature gate, search-space dim, and toolchain requirement
@@ -529,7 +647,7 @@ branches anywhere in the file.
 
 | Arch | Family | Cards | Backend | Min toolchain | Self-test | AOT dry-run |
 |------|--------|-------|---------|---------------|-----------|-------------|
-| `sm_70` | Volta | V100 | CUDA | 10.0 | ✅ | ✅ |
+| `sm_70` | Volta | V100 | CUDA | 10.0 | ❌ (not in ARCH_TABLE today) | ❌ |
 | `sm_75` | Turing | T4 | CUDA | 10.0 | ✅ | ✅ |
 | `sm_80` | Ampere | A100, A30, A10 | CUDA | 11.0 | ✅ | ✅ |
 | `sm_86` | Ampere | A10, RTX 30xx | CUDA | 11.1 | ✅ | ✅ |
@@ -754,9 +872,11 @@ them:
 - **`-DSG_VERBOSE=1` hardcoded**: now emits as
   `-D<spec.macro_prefix>VERBOSE=1`, with backward-compat byte-identity
   preserved when the prefix is the default `SG_BUILD_`.
-- **NVRTC cache dir hardcoded to `~/.cache/supergrok/nvrtc`**: now
-  derives from `config["project"]["name"]` (or default `supergrok` for
-  back-compat).
+- **NVRTC cache dir clarification**: the actual cubin cache lives at
+  `<out>/nvrtc_cache` (driven by `spec.out_dir`, not the project name).
+  The debug banner additionally probes `~/.cache/<project_name>/nvrtc`
+  for a disk-free reading; that path is informational only and is not
+  used for cubin storage.
 - Plus CLI completeness: `--enable-synth-codegen`, `--enable-polyhedral`,
   `--dry-run` (single-arch, requires `--arch`), `--list-archs` added to
   argparse. `xla_env` dict surfaced in dry-run manifests for Pallas
@@ -1062,10 +1182,10 @@ needing a target GPU:
 
 | Flag | Behaviour |
 |------|-----------|
-| `--self-test` | 127-test inline suite covering every layer of the wrapper (ARCH_TABLE, search spaces, codegen, autotune, cache v4, polyhedral, synth codegen, Stream α/β/γ regression tests, plus the Colab-arch-detection regression suite). Runs in ~30s on a CPU-only host. |
+| `--self-test` | Inline suite (~131 checks today) covering ARCH_TABLE, search spaces, codegen, autotune, cache v4, polyhedral, synth codegen, Stream α/β/γ regression tests, plus the Colab-arch-detection regression suite. Runs in ~30s on a CPU-only host. Several checks gate on optional deps (`jinja2`, `cuda-python`, `libclang`, GPU presence); those that don't have their dep available SKIP cleanly (still counted as PASS — see the "What gets exercised on a CPU-only host" note above). |
 | `--list-archs` | Dumps every entry in ARCH_TABLE — one line per arch with vendor, min toolchain version, and feature set (wgmma / tcgen05 / mfma / wmma / sparsecore / etc.). Exits 0; no `--optimizer` / `--model` required. |
 | `--dry-run --arch <arch>` | Single-arch dry-run: runs preflight + `_resolve_sources` + `_host_cflags` + `_device_cflags` + `_ldflags` for the named arch without invoking `torch.cpp_extension`. Writes `<out>/dry_run_<arch>.json`. Pair with `--enable-synth-codegen --enable-polyhedral` to also exercise the synth/polyhedral layers. |
-| `--dry-run-all-archs` | Same as above but sweeps every canonical arch in ARCH_TABLE. Writes one JSON manifest per arch under `<out>/dry_run_<arch>.json`. Sweeps all 26 archs on a CPU-only host in ~3 seconds. For Pallas archs the manifest now includes the resolved `xla_env` dict (previously empty). |
+| `--dry-run-all-archs` | Same as above but sweeps every canonical arch in ARCH_TABLE. Writes one JSON manifest per arch under `<out>/dry_run_<arch>.json`. Sweeps all 25 canonical archs on a CPU-only host in ~3 seconds. For Pallas archs the manifest includes the resolved `xla_env` dict. Each manifest now also surfaces `device_ldflags` (nvcc -dlink step) and `version_gated_device_cflags` (flags `_newer_compiler_flags` would add when the installed toolchain is new enough; empty on CPU-only hosts). Mutually exclusive with `--dry-run`. |
 | `--e2e-smoke` | End-to-end smoke: detects the local GPU via `torch.cuda.get_device_capability()`, maps to ARCH_TABLE, runs `build(adamw, mamba3, <detected>, autotune=bayesian, max_tune_seconds=120)`, and asserts `tuned_config` is written, `early_stop_info` is recorded, `tuned_configs.h` is regenerated, and the final `.so` loads. Skips cleanly with `[e2e-smoke] no CUDA device — skipping` on CPU-only hosts. `--e2e-max-seconds N` adjusts the autotune wall-clock cap. |
 
 All modes are wired into `_self_test` so they exercise automatically
@@ -1093,7 +1213,7 @@ the *Using this wrapper for a different project* block at the top of
 the quickstart).
 
 What carries over verbatim to any project:
-- All 26 archs (9 NVIDIA + 12 AMD + 5 TPU), their feature gates, and
+- All 25 canonical archs (8 NVIDIA + 12 AMD + 5 TPU), their feature gates, and
   the per-arch search spaces (~3.7B candidates on sm_90a, ~3.4T on
   sm_100a) — these come from the hardware spec, not from SuperGrok.
 - Every flag the wrapper emits for nvcc / hipcc / JAX (Stream α native
@@ -1113,7 +1233,9 @@ What carries over verbatim to any project:
   vendoring the wrapper into another project is one file copy.
 
 What you supply per-project via TOML:
-- `[project] name` → cache namespace (`~/.cache/<name>/nvrtc`)
+- `[project] name` → reported by the debug header (the actual NVRTC
+  cubin cache lives at `<out>/nvrtc_cache`, not under `~/.cache/<name>`;
+  only the disk-free probe in the debug banner inspects `~/.cache/<name>/nvrtc`)
 - `[sources] macro_prefix` → emitted macros (`-D<PREFIX>VERBOSE`,
   `-D<PREFIX>OPTIMIZER_*`, `-D<PREFIX>ARCH_*`)
 - `[sources] source_layout` → where your kernels live
@@ -1210,7 +1332,7 @@ via arch-specific common headers.
 | Grokfast  | 🟡 | 🟡 | 3 (ema, m, v) | 12 |
 | GrokAdamW | 🟡 | 🟡 | 3 (ema, m, v) | 12 |
 
-Legend: 🟡 = written, structurally validated (122 inline self-tests pass via
+Legend: 🟡 = written, structurally validated (~131 inline self-tests pass via
 `python -m grokking_optimizers.compile --self-test`), not compiled on device
 (no CUDA/HIP toolchain in this environment).
 
@@ -1338,8 +1460,8 @@ python -m grokking_optimizers.compile \
   [--prune] [--prune-max-age-days 30] [--prune-keep-top-n 100]
   [--no-auto-prune]                     # cache GC
   [--debug-symbols] [--seed N] [-D MACRO[=VALUE]] [-v] [--debug]
-  [--self-test]                         # 127-test in-process suite
-  [--dry-run-all-archs]                 # write JSON manifests for all 26 archs
+  [--self-test]                         # in-process suite (~131 checks today)
+  [--dry-run-all-archs]                 # write JSON manifests for all 25 canonical archs
   [--e2e-smoke] [--e2e-max-seconds 120] # end-to-end build smoke (GPU-gated)
 ```
 
@@ -3033,7 +3155,7 @@ and eliminate cross-module coupling:
 | `INTERFACES.md` | `README.md` — compile cache schema, CLI surface |
 | `docs/autotune.md` | `README.md` — autotune guide, YAML schema, PGO |
 | `docs/optimization_matrix.md` | `README.md` — optimization candidate matrix |
-| `tests/` (all files) | `compile.py --self-test` — 122 inline checks |
+| `tests/` (all files) | `compile.py --self-test` — ~131 inline checks today |
 
 ---
 
