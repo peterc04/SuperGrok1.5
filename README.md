@@ -27,21 +27,26 @@ you confirm the wrapper is healthy on the current host without
 installing anything but Python and the package itself:
 
 ```bash
-# 1. Run the inline self-test suite (122 checks, no GPU needed)
+# 1. Run the inline self-test suite (127 checks, no GPU needed)
 python3 -m grokking_optimizers.compile --self-test
 
 # 2. List every supported arch with its vendor / min toolchain / features
 python3 -m grokking_optimizers.compile --list-archs
 
-# 3. Sweep all 25 archs into per-arch JSON manifests (no compile, no GPU)
+# 3. Sweep all 26 archs into per-arch JSON manifests (no compile, no GPU)
 python3 -m grokking_optimizers.compile --dry-run-all-archs --out /tmp/manifests
 ```
 
 Auto-arch detection: every CLI invocation now treats `--arch` as
 **optional**. When omitted, the wrapper probes `torch.cuda` → `rocm-smi` →
 `jax.devices()` → your TOML config's `[archs].default` → built-in
-fallback (`sm_90a`), prints a `[arch] auto-detected <arch> from <source>`
-line, and proceeds. Pass `--arch sm_90a` (or any other) to override.
+fallback (`sm_90a`), prints a `[arch] auto-detected <arch> from <source>
+(<gpu_name>)` line (with the actual GPU name from
+`torch.cuda.get_device_name(0)`), and proceeds. Pass `--arch sm_90a`
+(or any other) to override. The probe priority is strict: if a real
+GPU is detected via `torch.cuda`, the built-in `sm_90a` fallback is
+NEVER consulted — that's the fix for Colab/Kaggle hosts that were
+previously cross-compiling sm_90a binaries onto T4/A100/V100 GPUs.
 
 Single-arch dry-run: `python3 -m grokking_optimizers.compile -O adamw -M
 mamba3 --arch sm_90a --dry-run --out /tmp/probe --enable-synth-codegen
@@ -83,7 +88,7 @@ self-test `project_agnostic_dry_run_no_sg_leakage`: with the above
 config the wrapper emits `-DMYPROJ_OPTIMIZER_ADAMW=1`,
 `-DMYPROJ_ARCH_SM86=1` (note: arch macro uses the literal arch label
 from `ARCH_TABLE` — `SM86`, not `SM_86`), and `-DMYPROJ_VERBOSE=1`
-with **zero `SG_BUILD_` leakage** across all 25 archs. The new
+with **zero `SG_BUILD_` leakage** across all 26 archs. The new
 `enabled_features` field in every dry-run manifest also surfaces which
 opt-in toggles were enabled.
 
@@ -119,13 +124,23 @@ subprocess.run(["git", "submodule", "update", "--init", "--recursive",
 
 ### Step 3 — Compile (one Python block, every MAXIMAL feature available)
 
-Pick your `(optimizer, model, arch)` triple, flip the feature toggles you
-want, and call `build(...)` with `debug=True`. The single block below
-does AOT compile, Bayesian autotune with **auto early-stop**, 3-pass
-PGO (plus optional CUPTI/rocprof device-PGO sidecar), final rebuild with
-the winning macros, and the profile pass — all streamed to your
-terminal so you can see every compiler invocation, every autotune trial,
-every cache hit/miss, and the full env state.
+> **Before you start**: `compile.py` auto-detects your GPU. On Colab
+> (T4 / L4 / A100 / V100) you don't need to set `ARCH` — leave it as
+> `None` and the resolver runs the same probe chain as the CLI
+> (`torch.cuda` → `rocm-smi` → `jax.devices` → TOML → built-in
+> fallback). The quickstart works on **any GPU vendor / arch** out of
+> the box. Set `ARCH` to a specific value only if you want to
+> cross-compile for a different GPU than the one this process is
+> running on.
+
+Pick your `(optimizer, model)` pair (leave `ARCH = None` for
+auto-detect, or override it), flip the feature toggles you want, and
+call `build(...)` with `debug=True`. The single block below does AOT
+compile, Bayesian autotune with **auto early-stop**, 3-pass PGO (plus
+optional CUPTI/rocprof device-PGO sidecar), final rebuild with the
+winning macros, and the profile pass — all streamed to your terminal
+so you can see every compiler invocation, every autotune trial, every
+cache hit/miss, and the full env state.
 
 **Important:** run Python from the repo root (the directory `cd`'d into
 in Step 1). The block below adds the repo root to `sys.path` so the
@@ -150,10 +165,15 @@ OPTIMIZER = "adamw"            # adamw | lion | grokfast | grokadamw | looksam |
                                # muon | neuralgrok | prodigy | supergrok11 |
                                # supergrok15 | supergrok2
 MODEL     = "decoder"          # mamba | decoder | vit
-ARCH      = "sm_90a"           # See README "Hardware support — ARCH_TABLE" for
-                               # all 25 canonical archs. The "a" suffix is the
-                               # canonical Hopper/Blackwell form; bare "sm_90"
-                               # still works as an alias.
+ARCH      = None               # None  ⇒ auto-detect via build()'s probe chain
+                               # (torch.cuda → rocm-smi → jax → TOML →
+                               # built-in fallback). Override ONLY if
+                               # cross-compiling for a different arch than
+                               # the GPU this process is on. Common Colab
+                               # GPUs map to: V100=sm_70, T4=sm_75,
+                               # A100=sm_80, L4=sm_89, H100=sm_90a.
+                               # See "Hardware support — ARCH_TABLE" for
+                               # the full list of 26 canonical archs.
 
 # ─── AUTOTUNE BUDGET — every value below is a CEILING / KNOB, not a target.
 #     The autotuner picks the actual kernel parameters from a per-arch
@@ -162,7 +182,10 @@ ARCH      = "sm_90a"           # See README "Hardware support — ARCH_TABLE" fo
 BAYESIAN_TRIALS = None         # None  ⇒ auto early-stop on plateau / EI
                                # exhaustion / coverage saturation /
                                # MAX_TUNE_SECONDS. Set to an int to pin a
-                               # fixed trial count.
+                               # fixed trial count. TIP: for first-run
+                               # sanity-checking, try BAYESIAN_TRIALS = 25
+                               # (quick mode) before letting it run to
+                               # full convergence.
 TOP_K           = None         # None  ⇒ elbow-of-timing-curve detection.
                                # Set to an int to pin top-K refinement size.
 MAX_TUNE_SECONDS = None        # None  ⇒ no wall-clock cap. Set e.g. 900
@@ -174,21 +197,42 @@ PRUNER           = "hyperband" # "none" | "median" | "hyperband"
 TRANSFER         = True        # seed TPE from sibling-optimizer trials
 SEED             = 0           # Optuna sampler seed
 
-# ─── BUILD-TIME FEATURE TOGGLES (all default OFF; flip what you want) ────
-PGO                       = True   # host-side LLVM PGO 3-pass loop
+# ─── BUILD-TIME FEATURE TOGGLES — defaulted ON for max performance. ──────
+#     Every toggle below has a graceful no-op skip path when its
+#     dependency is missing (e.g. ENABLE_POLYHEDRAL silently skips if
+#     libclang isn't installed). Leaving them ON gives users maximum
+#     performance out of the box without breakage.
+PGO                       = True   # host-side LLVM PGO 3-pass loop —
+                                   # always a win, no external dep
 PGO_STEPS                 = 1000   # # of opt.step() calls during PGO collect
-ENABLE_DEVICE_PGO         = False  # CUPTI (NVIDIA) / rocprof (AMD) / XLA
+ENABLE_DEVICE_PGO         = True   # CUPTI (NVIDIA) / rocprof (AMD) / XLA
                                    # HLO (Pallas) stall-info sidecar — biases
                                    # the autotuner toward stall-relieving
-                                   # configs. Needs nsys / rocprof on PATH.
-ENABLE_EMITTER            = False  # Render per-variant kernels from the
+                                   # configs. Gated on nsys / rocprof
+                                   # availability — graceful skip otherwise.
+ENABLE_EMITTER            = True   # Render per-variant kernels from the
                                    # bundled Jinja2 templates instead of -D
-                                   # macros. Needs jinja2.
-ENABLE_RUNTIME_SPEC       = False  # NVRTC / hipRTC runtime kernel
-                                   # specialization (KernelRegistry). Needs
-                                   # cuda-python or hip-python.
-STRICT_NUMERICS           = False  # Require bit-identical determinism for
-                                   # the winning variant (excludes
+                                   # macros. Gated on jinja2 availability.
+ENABLE_RUNTIME_SPEC       = True   # NVRTC / hipRTC runtime kernel
+                                   # specialization (KernelRegistry). Gated
+                                   # on cuda-python / hip-python.
+ENABLE_SYNTH_CODEGEN      = True   # OpGraph-based synthesis codegen
+                                   # (Stream γ) — emit fully fused kernel
+                                   # sources from a pattern library.
+                                   # No external dep; always safe.
+ENABLE_POLYHEDRAL         = True   # Polyhedral schedule search — extra
+                                   # loop-restructuring candidates fed to
+                                   # the autotuner. Gated on libclang
+                                   # availability — graceful skip otherwise.
+ENABLE_COST_MODEL         = True   # Learned cost model + rejection budget
+                                   # (Stream C) — predicted-bad configs
+                                   # are skipped without timing them, so
+                                   # the autotuner spends its budget on
+                                   # promising candidates.
+STRICT_NUMERICS           = False  # KEEP OFF for first run — opt in only
+                                   # after a healthy baseline. Requires
+                                   # bit-identical determinism for the
+                                   # winning variant (excludes
                                    # numerical_fail; demands deterministic
                                    # status on a 3x re-run).
 
@@ -219,9 +263,15 @@ CONFIG_TOML    = None          # Path to your own compile_config.toml that
                                # compile.py. None ⇒ use inlined defaults.
 
 # ─── TOOLCHAIN ENV — set BEFORE the grokking_optimizers import so torch's
-#     cpp_extension picks up CUDA_HOME / ROCM_HOME at its first import. ──
-from grokking_optimizers.compile import get_arch_entry
-_vendor = get_arch_entry(ARCH).vendor
+#     cpp_extension picks up CUDA_HOME / ROCM_HOME at its first import.
+#     When ARCH is None (auto-detect), resolve it here so the env-setup
+#     below knows which toolchain to wire in. The same probe chain runs
+#     again inside build() — both calls are idempotent and cheap. ─────
+from grokking_optimizers.compile import (
+    get_arch_entry, _resolve_default_arch,
+)
+_resolved_arch = ARCH if ARCH not in (None, "auto") else _resolve_default_arch()
+_vendor = get_arch_entry(_resolved_arch).vendor
 if _vendor == "cuda":
     os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")  # adjust to your install
     os.environ["PATH"] = f"{os.environ['CUDA_HOME']}/bin:{os.environ['PATH']}"
@@ -238,7 +288,9 @@ cache = CompileCache(Path("build/.compile_cache.json"))
 so_path = build(
     optimizer=OPTIMIZER,
     model=MODEL,
-    arch=ARCH,
+    arch=ARCH,                                   # None ⇒ build() auto-detects
+                                                 # via the same probe chain
+                                                 # used by the CLI.
     cache=cache,
     debug=True,                                  # stream the full report
     autotune=True,
@@ -259,6 +311,9 @@ so_path = build(
     # ── Codegen + runtime specialization ──
     enable_emitter=ENABLE_EMITTER,               # Jinja2 per-variant emitter
     enable_runtime_specialization=ENABLE_RUNTIME_SPEC,  # NVRTC / hipRTC
+    enable_synth_codegen=ENABLE_SYNTH_CODEGEN,   # OpGraph synthesis codegen
+    enable_polyhedral=ENABLE_POLYHEDRAL,         # polyhedral schedule search
+    enable_cost_model=ENABLE_COST_MODEL,         # learned cost-model gate
     # ── Numerical validation ──
     strict_numerics=STRICT_NUMERICS,
     # ── Cache GC ──
@@ -281,19 +336,23 @@ so_path = build(
 print("built:", so_path)
 ```
 
-Why most of these are `None` / `False` by default: **the autotune is
-exactly what searches over the actual kernel parameters** (block size,
-vector width, unroll factor, num_stages, cluster shape, swizzle,
-warp-specialization, TMA, async-copy depth on sm_90a; LDS padding,
-waves-per-EU, MFMA shape, scheduler hint on gfx942 — see
-`build_full_search_space()` in `compile.py` for the complete
-programmatic grid: **billions of candidates per arch** before prefilter,
-sampled directly via Optuna's `suggest_categorical` rather than
-materialized). The values above are the **budget** for that search (when
-to stop, which pruner, what to bootstrap, what extra layers to enable);
-the autotuner picks the kernel parameters from the search space. The
-winning config gets baked into `csrc/algorithms/tuned_configs.h` and the
-primary `.so` is rebuilt with those macros.
+Why the autotune budget values default to `None` and the feature
+toggles default to `True`: **the autotune is exactly what searches
+over the actual kernel parameters** (block size, vector width, unroll
+factor, num_stages, cluster shape, swizzle, warp-specialization, TMA,
+async-copy depth on sm_90a; LDS padding, waves-per-EU, MFMA shape,
+scheduler hint on gfx942 — see `build_full_search_space()` in
+`compile.py` for the complete programmatic grid: **billions of
+candidates per arch** before prefilter, sampled directly via Optuna's
+`suggest_categorical` rather than materialized). The `None` budget
+values above let the **5-criterion early-stop** (plateau / EI floor /
+coverage saturation / time-cap / patience) decide when to halt — that
+beats a hardcoded trial count on every workload we've measured. The
+`True` feature toggles enable every layer that has a graceful skip
+path when its dependency is missing, so users get max performance on
+whatever toolchain they have without breakage. The winning config
+gets baked into `csrc/algorithms/tuned_configs.h` and the primary
+`.so` is rebuilt with those macros.
 
 What you will see streaming to your terminal with `debug=True`:
 
@@ -404,10 +463,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path.cwd()))   # assumes you're in SuperGrok1.5/
 
 from grokking_optimizers.compile import main as compile_main
-assert compile_main(["--self-test"]) == 0  # prints "[self-test] 122 passed, 0 failed"
+assert compile_main(["--self-test"]) == 0  # prints "[self-test] 127 passed, 0 failed"
 ```
 
-The 122-test self-test covers: ARCH_TABLE completeness for all 25 archs,
+The 127-test self-test covers: ARCH_TABLE completeness for all 26 archs,
 per-arch search-space cardinalities (billions per CUDA/HIP arch, ~3.4T for
 sm_100a), the new Stream α native flag emission (`--warn-on-spills`,
 `--default-stream per-thread`, `-rdc=true`, `--source-in-ptx` on NVIDIA;
@@ -461,7 +520,7 @@ or jax[tpu] required to pass it.
 
 ---
 
-## Hardware support — ARCH_TABLE (25 canonical archs)
+## Hardware support — ARCH_TABLE (26 canonical archs)
 
 `grokking_optimizers.compile.ARCH_TABLE` is the single source of truth.
 Every flag, feature gate, search-space dim, and toolchain requirement
@@ -470,6 +529,7 @@ branches anywhere in the file.
 
 | Arch | Family | Cards | Backend | Min toolchain | Self-test | AOT dry-run |
 |------|--------|-------|---------|---------------|-----------|-------------|
+| `sm_70` | Volta | V100 | CUDA | 10.0 | ✅ | ✅ |
 | `sm_75` | Turing | T4 | CUDA | 10.0 | ✅ | ✅ |
 | `sm_80` | Ampere | A100, A30, A10 | CUDA | 11.0 | ✅ | ✅ |
 | `sm_86` | Ampere | A10, RTX 30xx | CUDA | 11.1 | ✅ | ✅ |
@@ -516,6 +576,7 @@ per-dim value lists; the product is never materialized.
 
 | Arch | Cardinality |
 |------|-------------|
+| `sm_70` | 1,003,520 |
 | `sm_75` | 1,003,520 |
 | `sm_80` / `sm_86` | 2,867,200 |
 | `sm_89` | 8,601,600 |
@@ -1001,10 +1062,10 @@ needing a target GPU:
 
 | Flag | Behaviour |
 |------|-----------|
-| `--self-test` | 122-test inline suite covering every layer of the wrapper (ARCH_TABLE, search spaces, codegen, autotune, cache v4, polyhedral, synth codegen, Stream α/β/γ regression tests). Runs in ~30s on a CPU-only host. |
+| `--self-test` | 127-test inline suite covering every layer of the wrapper (ARCH_TABLE, search spaces, codegen, autotune, cache v4, polyhedral, synth codegen, Stream α/β/γ regression tests, plus the Colab-arch-detection regression suite). Runs in ~30s on a CPU-only host. |
 | `--list-archs` | Dumps every entry in ARCH_TABLE — one line per arch with vendor, min toolchain version, and feature set (wgmma / tcgen05 / mfma / wmma / sparsecore / etc.). Exits 0; no `--optimizer` / `--model` required. |
 | `--dry-run --arch <arch>` | Single-arch dry-run: runs preflight + `_resolve_sources` + `_host_cflags` + `_device_cflags` + `_ldflags` for the named arch without invoking `torch.cpp_extension`. Writes `<out>/dry_run_<arch>.json`. Pair with `--enable-synth-codegen --enable-polyhedral` to also exercise the synth/polyhedral layers. |
-| `--dry-run-all-archs` | Same as above but sweeps every canonical arch in ARCH_TABLE. Writes one JSON manifest per arch under `<out>/dry_run_<arch>.json`. Sweeps all 25 archs on a CPU-only host in ~3 seconds. For Pallas archs the manifest now includes the resolved `xla_env` dict (previously empty). |
+| `--dry-run-all-archs` | Same as above but sweeps every canonical arch in ARCH_TABLE. Writes one JSON manifest per arch under `<out>/dry_run_<arch>.json`. Sweeps all 26 archs on a CPU-only host in ~3 seconds. For Pallas archs the manifest now includes the resolved `xla_env` dict (previously empty). |
 | `--e2e-smoke` | End-to-end smoke: detects the local GPU via `torch.cuda.get_device_capability()`, maps to ARCH_TABLE, runs `build(adamw, mamba3, <detected>, autotune=bayesian, max_tune_seconds=120)`, and asserts `tuned_config` is written, `early_stop_info` is recorded, `tuned_configs.h` is regenerated, and the final `.so` loads. Skips cleanly with `[e2e-smoke] no CUDA device — skipping` on CPU-only hosts. `--e2e-max-seconds N` adjusts the autotune wall-clock cap. |
 
 All modes are wired into `_self_test` so they exercise automatically
@@ -1032,7 +1093,7 @@ the *Using this wrapper for a different project* block at the top of
 the quickstart).
 
 What carries over verbatim to any project:
-- All 25 archs (8 NVIDIA + 12 AMD + 5 TPU), their feature gates, and
+- All 26 archs (9 NVIDIA + 12 AMD + 5 TPU), their feature gates, and
   the per-arch search spaces (~3.7B candidates on sm_90a, ~3.4T on
   sm_100a) — these come from the hardware spec, not from SuperGrok.
 - Every flag the wrapper emits for nvcc / hipcc / JAX (Stream α native
@@ -1277,8 +1338,8 @@ python -m grokking_optimizers.compile \
   [--prune] [--prune-max-age-days 30] [--prune-keep-top-n 100]
   [--no-auto-prune]                     # cache GC
   [--debug-symbols] [--seed N] [-D MACRO[=VALUE]] [-v] [--debug]
-  [--self-test]                         # 122-test in-process suite
-  [--dry-run-all-archs]                 # write JSON manifests for all 25 archs
+  [--self-test]                         # 127-test in-process suite
+  [--dry-run-all-archs]                 # write JSON manifests for all 26 archs
   [--e2e-smoke] [--e2e-max-seconds 120] # end-to-end build smoke (GPU-gated)
 ```
 
