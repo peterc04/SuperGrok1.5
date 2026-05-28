@@ -8,7 +8,7 @@ namespace gfx942 {
 
 // Forward-declare metanet_forward from supergrok11 header; if compiling
 // standalone, include supergrok11_gfx942.hip.hpp before this header or
-// define the function below.
+// the fallback definition below will be used.
 #ifndef GROKKING_SUPERGROK11_GFX942_HIP_HPP_
 __forceinline__ __device__
 float metanet_forward(
@@ -41,6 +41,19 @@ float metanet_forward(
 }
 #endif  // !GROKKING_SUPERGROK11_GFX942_HIP_HPP_
 
+// ============================================================================
+// SuperGrok v1.5 — Sigmoid gating (host-precomputed gate_signal)
+//
+// State tensors (4): exp_avg, exp_avg_sq, mu, sharpness
+// Per-element pipeline:
+//   1. Clip gradient
+//   2. EMA:  mu = layer_alpha * mu + (1 - layer_alpha) * g
+//   3. MetaNet forward -> correction;  smart_g = g + correction
+//   4. gate_signal is a scalar passed from host (not computed per-element)
+//   5. effective_g = g + ramp * lamb * gate_signal * (smart_g - g)
+//   6. AdamW step with per-layer beta1 and effective weight decay
+// ============================================================================
+
 struct SuperGrok15State {
     float* __restrict__ exp_avg;
     float* __restrict__ exp_avg_sq;
@@ -52,13 +65,7 @@ struct SuperGrok15State {
 };
 
 // --------------------------------------------------------------------------
-// SuperGrok v1.5 per-element update
-//   1. Clip gradient
-//   2. EMA update:  mu = layer_alpha * mu + (1-layer_alpha) * g
-//   3. MetaNet forward -> correction;  smart_g = g + correction
-//   4. gate_signal is a scalar passed from host (sigmoid-gated, precomputed)
-//   5. effective_g = g + ramp * lamb * gate_signal * (smart_g - g)
-//   6. AdamW step using effective_g with per-layer beta1 and effective wd
+// Scalar per-element update
 // --------------------------------------------------------------------------
 template <typename ParamT, NanPolicy NAN_POLICY = NanPolicy::kNone, bool ENABLE_CLIP = false>
 __forceinline__ __device__
@@ -91,7 +98,7 @@ void supergrok15_update(
     int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
 
     for (int64_t i = idx; i < n; i += stride) {
-        // Streaming non-temporal grad read.
+        // Streaming non-temporal grad read
         ParamT g_raw = __builtin_nontemporal_load(grads + i);
         float g = to_float(g_raw);
         g = apply_nan_policy<NAN_POLICY>(g);
@@ -238,7 +245,7 @@ void supergrok15_update_vec4(
         sh4[i] = make_float4(shs[0], shs[1], shs[2], shs[3]);
     }
 
-    // Handle tail elements.
+    // Handle tail elements
     int64_t tail_start = n4 * 4;
     for (int64_t i = tail_start + idx; i < n; i += stride) {
         float g_raw = __builtin_nontemporal_load(grads + i);
