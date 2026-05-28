@@ -8,7 +8,6 @@
 // MFMA APPLICABILITY: none. Elementwise.
 
 #include <torch/extension.h>
-#include "csrc/tuning.h"
 #include <vector>
 
 // ── inlined from former csrc/backends/hip/gfx942/primitives.hpp ──
@@ -139,6 +138,28 @@ void launch_grokfast_step(
         prim::ema_sq_update_inplace(v, g_amp, beta2);
         prim::adam_apply_inplace(p, m, v, lr, bc1, bc2, eps, wd);
     }
+}
+
+
+void launch_fused_grokfast_ema(
+    torch::Tensor grad, torch::Tensor ema, float alpha, float lamb
+) {
+    throw std::runtime_error(
+        "launch_fused_grokfast_ema: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_fused_grokfast_adam(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor ema, torch::Tensor grad, float alpha, float lamb, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2
+) {
+    throw std::runtime_error(
+        "launch_fused_grokfast_adam: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_multi_tensor_grokfast_ema(
+    std::vector<torch::Tensor>& grads, std::vector<torch::Tensor>& ema_bufs, float alpha, float lamb
+) {
+    throw std::runtime_error(
+        "launch_multi_tensor_grokfast_ema: HIP gfx942 kernel not yet implemented.");
 }
 
 }} // namespace sg::gfx942

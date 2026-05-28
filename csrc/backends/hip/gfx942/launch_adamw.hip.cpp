@@ -18,7 +18,6 @@
 // elementwise kernels. Bandwidth is the bound either way.
 
 #include <torch/extension.h>
-#include "csrc/tuning.h"
 #include <vector>
 
 // ── inlined from former csrc/backends/hip/gfx942/primitives.hpp ──

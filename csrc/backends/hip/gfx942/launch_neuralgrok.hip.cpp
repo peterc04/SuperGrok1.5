@@ -24,7 +24,6 @@
 // 1 kernel launch (≈ 3 µs).
 
 #include <torch/extension.h>
-#include "csrc/tuning.h"
 #include <vector>
 
 // ── inlined from former csrc/backends/hip/gfx942/primitives.hpp ──
@@ -161,6 +160,28 @@ void launch_neuralgrok_step(
         prim::ema_sq_update_inplace(v, g_amp, beta2);
         prim::adam_apply_inplace(p, m, v, lr, bc1, bc2, eps, wd);
     }
+}
+
+
+void launch_fused_neuralgrok_amplifier(
+    torch::Tensor grad, torch::Tensor amplified, torch::Tensor amplifier_w1, torch::Tensor amplifier_b1, torch::Tensor amplifier_w2, torch::Tensor amplifier_b2, int hidden_dim, float alpha, float beta
+) {
+    throw std::runtime_error(
+        "launch_fused_neuralgrok_amplifier: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_fused_neuralgrok_adam(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor amplified_grad, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2
+) {
+    throw std::runtime_error(
+        "launch_fused_neuralgrok_adam: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_fused_neuralgrok_full_step(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor grad, torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2, float alpha_amp, float beta_amp, int hidden_dim, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2
+) {
+    throw std::runtime_error(
+        "launch_fused_neuralgrok_full_step: HIP gfx942 kernel not yet implemented.");
 }
 
 }} // namespace sg::gfx942

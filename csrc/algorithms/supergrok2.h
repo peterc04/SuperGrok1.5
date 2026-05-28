@@ -6,19 +6,23 @@
 //   - csrc/kernels/cuda/sm_90/supergrok2_bwd.cuh
 //   - csrc/kernels/cuda/sm_90/supergrok2_warp_specialized.cuh
 //
-// Mamba-3 + 4-Head PEER + per-element GRU + Adam pipeline.
+// CSA/HCA compressed-attention + 4-Head PEER + per-element GRU + Adam pipeline.
+// (Replaces the former Mamba-3 selective scan sequence mixer — see spec §2/§3b.)
 //
 // Per-step pipeline:
 //   (1) input_proj_sort     : [grad, sharpness] -> [N, d_model], sort keys = |grad|
-//   (2) mamba3_scan         : selective scan with trapezoidal discretization + RoPE
-//                              (sequential for small N, parallel Blelloch for larger N,
-//                               warp-specialized on Hopper for uniform d_state)
+//   (2) CSA/HCA attention   : compressed-sparse (m=4, top-k, +window) -> csa_ctx and
+//                              heavily-compressed (m'=128, dense, +window) -> hca_ctx.
+//                              Built from: KV compression (sg2_csa_compress_kv /
+//                              sg2_hca_compress_kv), lightning-indexer top-k
+//                              (sg2_csa_index_score), and an online-softmax core
+//                              (sg2_attention_score_and_accumulate / _finalize).
 //   (3) peer_route          : product-key expert routing, top-4 of 144 experts
 //   (4) gru_step            : per-element GRU integrates expert output with temporal state
 //   (5) apply               : smart_grad + Adam + trust-ratio + decoupled weight decay
 //
 // Backward (used by bilevel meta-learning):
-//   (6) bilevel_precompute  : reproduce forward projections needed for adjoint scan
+//   (6) bilevel_precompute  : recompute forward q/k/v (+indexer) projections for adjoint
 //
 // The heavy math (GEMMs, parallel scans, cluster reductions) is in the
 // per-backend primitives; this header contains the per-element building
@@ -352,9 +356,14 @@ __device__ __forceinline__ Affine2x2 ptx_affine_combine(
 namespace sg { namespace algorithms {
 
 // Compile-time maximums (must match types.h constants).
-constexpr int SG2_MAX_D_STATE = 128;
-constexpr int SG2_MAX_D_INNER = 128;
-constexpr int SG2_MAX_D_MODEL = 64;
+constexpr int SG2_MAX_D_MODEL = 64;     // upper bound on per-element feature width
+
+// ── CSA/HCA compressed-attention maximums (spec §2, §3) ──
+// These bound per-thread register arrays used by the device helpers below.
+constexpr int SG2_CSA_WINDOW_MAX  = 16;   // max sliding-window / KV-pool width (CSA_WINDOW=8 default)
+constexpr int SG2_CSA_TOPK_MAX    = 64;   // max top-k compressed entries per query (CSA_TOPK=16 default)
+constexpr int SG2_INDEXER_RANK_MAX = 8;   // max lightning-indexer low rank (INDEXER_RANK=4 default)
+constexpr int SG2_HCA_COMPRESS    = 128;  // heavily-compressed pooling stride m' (spec §2 HCA)
 
 // =========================================================================
 //  Forward (1): Input Projection + Sort Key
@@ -391,142 +400,219 @@ __device__ __forceinline__ void sg2_input_proj_sort(
 }
 
 // =========================================================================
-//  Forward (2): Sequential Mamba-3 Scan (per-thread, single timestep)
-//  Trapezoidal discretization + RoPE on state pairs.
+//  Forward (2a): CSA — Compressed KV pooling (spec §2 CSA step 1)
+//
+//  Equation (spec §2):
+//      c_kv[j, :] = Σ_{w=0..W-1} softmax(compress_w)[w] · x[j·m + w, :]
+//
+//  where m = CSA_COMPRESS (stride), W = CSA_WINDOW (pool width), and
+//  compress_w are learned per-window-position pooling logits (softmax-
+//  normalized to a probability distribution over the window). Produces one
+//  compressed entry j; compressed length Nc = ceil(N / m). This per-output-
+//  element form computes a single feature channel `d` of compressed entry
+//  `j`, suitable for a grid-stride kernel over (j, d) pairs.
+//
+//  FP32 accumulation. `x_seq` is the sorted feature sequence [N, d_model].
+//  Out-of-range window taps (j·m + w >= N) are skipped and the softmax is
+//  renormalized over the valid taps only (causal/edge-safe pooling).
 // =========================================================================
 
-__device__ __forceinline__ void sg2_mamba3_scan_step(
-    float* __restrict__ h,           // [d_state] state (registers / smem)
-    const float* __restrict__ A,     // [d_state] preloaded A coefficients
-    const float* __restrict__ freq,  // [d_state/2] RoPE frequencies
-    const float x_val,
-    const float dt_val,
-    const float* __restrict__ B_vals,
-    const float* __restrict__ C_vals,
-    const float D_val,
-    const float z_val,
-    const int d_state,
-    const int step_t,
-    float* __restrict__ y_out
+template <typename feat_t>
+__device__ __forceinline__ float sg2_csa_compress_kv(
+    const feat_t* __restrict__ x_seq,        // [N, d_model] sorted features
+    const float*  __restrict__ compress_w,   // [csa_window] learned pooling logits
+    const int j,                             // compressed-entry index (0..Nc-1)
+    const int d,                             // feature channel (0..d_model-1)
+    const int N,
+    const int d_model,
+    const int csa_compress,                  // stride m
+    const int csa_window                     // pool width W
 ) {
-    const int half_d_state = d_state / 2;
-    float y_acc = 0.0f;
+    const int base = j * csa_compress;       // first raw token in this window
 
+    // Online softmax over the (valid) window logits, fused with the weighted
+    // pool: keep running max for numerical stability (spec §2 uses softmax(bias)).
+    float run_max = -INFINITY;
     #pragma unroll 4
-    for (int p = 0; p < half_d_state; p++) {
-        int s0 = p * 2;
-        int s1 = s0 + 1;
-
-        // Trapezoidal discretization
-        float dt_A0 = dt_val * A[s0];
-        float dt_A1 = dt_val * A[s1];
-        float dA0 = (1.0f + dt_A0 * 0.5f) / (1.0f - dt_A0 * 0.5f);
-        float dA1 = (1.0f + dt_A1 * 0.5f) / (1.0f - dt_A1 * 0.5f);
-        float dBx0 = B_vals[s0] * x_val * dt_val;
-        float dBx1 = B_vals[s1] * x_val * dt_val;
-
-        h[s0] = dA0 * h[s0] + dBx0;
-        h[s1] = dA1 * h[s1] + dBx1;
-
-        // RoPE rotation on state pair
-        float cos_r = cosf(freq[p] * step_t);
-        float sin_r = sinf(freq[p] * step_t);
-        float h0_rot = h[s0] * cos_r - h[s1] * sin_r;
-        float h1_rot = h[s0] * sin_r + h[s1] * cos_r;
-
-        y_acc += C_vals[s0] * h0_rot + C_vals[s1] * h1_rot;
+    for (int w = 0; w < csa_window; w++) {
+        if (base + w >= N) break;
+        run_max = fmaxf(run_max, compress_w[w]);
     }
+    if (!isfinite(run_max)) return 0.0f;     // empty window
 
-    // y + D*x gated by silu(z)
-    y_acc += D_val * x_val;
-    float silu_z = z_val / (1.0f + expf(-z_val));
-    *y_out = y_acc * silu_z;
+    float denom = 0.0f;
+    float acc   = 0.0f;
+    #pragma unroll 4
+    for (int w = 0; w < csa_window; w++) {
+        const int t = base + w;
+        if (t >= N) break;
+        const float e = ptx_expf(compress_w[w] - run_max);
+        denom += e;
+        acc   += e * static_cast<float>(x_seq[t * d_model + d]);
+    }
+    return (denom > 0.0f) ? (acc / denom) : 0.0f;
 }
 
 // =========================================================================
-//  Forward (2'): Warp-Specialized Scan (Hopper consumer per-timestep)
-//  Producer warp loads data into double-buffered smem; this is the
-//  consumer-side recurrence for a single (di, state-pair) tuple.
+//  Forward (2b): Lightning indexer score (spec §2 CSA step 2)
+//
+//  Equation (spec §2):
+//      I[t, s] = qI[t] · kI[s] / sqrt(rank)
+//
+//  where the low-rank query qI[t] = x[t] · W_DQ · W_UQ (rank INDEXER_RANK)
+//  and kI[s] is the (compressed) indexer key for compressed entry s. The
+//  host/kernel calls this per (query t, compressed key s) to build the
+//  top-k selection set; only the dot-product + scaling is provided here.
+//
+//  `q_idx` and `k_idx` are pre-projected indexer vectors of length
+//  `indexer_rank`. FP32 accumulation. Returns the scaled score.
 // =========================================================================
 
-__device__ __forceinline__ void sg2_scan_consumer_step(
-    float* __restrict__ h,           // [2] state pair in registers
-    const float A0,
-    const float A1,
-    const float D_val,
-    const float rope_f,
-    const float x_val,
-    const float z_val,
-    const float dt_val,
-    const float B0_val,
-    const float B1_val,
-    const float C0_val,
-    const float C1_val,
-    const int t,
-    float* __restrict__ y_out
+__device__ __forceinline__ float sg2_csa_index_score(
+    const float* __restrict__ q_idx,   // [indexer_rank] low-rank query  qI[t]
+    const float* __restrict__ k_idx,   // [indexer_rank] compressed key  kI[s]
+    const int indexer_rank
 ) {
-    float dA0 = expf(A0 * dt_val);
-    float dA1 = expf(A1 * dt_val);
-    float dBx0 = B0_val * x_val * dt_val;
-    float dBx1 = B1_val * x_val * dt_val;
-
-    h[0] = dA0 * h[0] + dBx0;
-    h[1] = dA1 * h[1] + dBx1;
-
-    float h0_rot = h[0] * cosf(rope_f * t) - h[1] * sinf(rope_f * t);
-    float h1_rot = h[0] * sinf(rope_f * t) + h[1] * cosf(rope_f * t);
-
-    float y = C0_val * h0_rot + C1_val * h1_rot + D_val * x_val;
-    float silu_z = z_val / (1.0f + expf(-z_val));
-    *y_out = y * silu_z;
-}
-
-// =========================================================================
-//  Forward (2''): Warp-Specialized Scan, d_state=16 unrolled
-//  All 8 state pairs processed in one consumer thread.
-// =========================================================================
-
-constexpr int SG2_D_STATE_16 = 16;
-constexpr int SG2_D_STATE_16_PAIRS = 8;
-
-__device__ __forceinline__ void sg2_scan_consumer_step_d16(
-    float h[SG2_D_STATE_16],
-    const float A_vals[SG2_D_STATE_16],
-    const float rope_f[SG2_D_STATE_16_PAIRS],
-    const float D_val,
-    const float x_val,
-    const float z_val,
-    const float dt_val,
-    const float B[SG2_D_STATE_16],
-    const float C[SG2_D_STATE_16],
-    const int t,
-    float* __restrict__ y_out
-) {
-    float y_acc = 0.0f;
+    float dot = 0.0f;
     #pragma unroll
-    for (int p = 0; p < SG2_D_STATE_16_PAIRS; p++) {
-        int s0 = p * 2;
-        int s1 = s0 + 1;
+    for (int r = 0; r < indexer_rank; r++) {
+        dot = ptx_fma(q_idx[r], k_idx[r], dot);
+    }
+    // Scale by 1/sqrt(rank) for variance control (spec §2: / sqrt(d)).
+    return dot * fast_rsqrt_nr(static_cast<float>(indexer_rank));
+}
 
-        float dA0 = expf(A_vals[s0] * dt_val);
-        float dA1 = expf(A_vals[s1] * dt_val);
-        float dBx0 = B[s0] * x_val * dt_val;
-        float dBx1 = B[s1] * x_val * dt_val;
+// =========================================================================
+//  Forward (3): Online-softmax attention step (FlashAttention-style)
+//
+//  Core reusable attention primitive shared by BOTH CSA (over selected
+//  compressed ∪ window keys) and HCA (over all compressed ∪ window keys).
+//  Implements one numerically-stable streaming-softmax update of
+//  softmax(Q·Kᵀ / sqrt(head_dim)) · V (spec §2 CSA step 4 / HCA dense attn):
+//
+//      s      = (q · k) / sqrt(head_dim)
+//      m_new  = max(m, s)
+//      corr   = exp(m - m_new)                 (rescale prior partial state)
+//      p      = exp(s - m_new)
+//      l      = l·corr + p                      (running denominator)
+//      acc[:] = acc[:]·corr + p·v[:]            (running value accumulator)
+//
+//  The running (m, l, acc) are carried in registers/smem across all keys for
+//  one query; call sg2_softmax_finalize() once at the end. FP32 throughout.
+//  Pass `scale` = 1/sqrt(head_dim) precomputed by the caller (constant across
+//  keys, so we take it as an arg to avoid recomputing the rsqrt per key).
+// =========================================================================
 
-        h[s0] = dA0 * h[s0] + dBx0;
-        h[s1] = dA1 * h[s1] + dBx1;
+__device__ __forceinline__ void sg2_attention_score_and_accumulate(
+    const float* __restrict__ q,     // [head_dim] query vector
+    const float* __restrict__ k,     // [head_dim] key vector for one entry
+    const float* __restrict__ v,     // [head_dim] value vector for one entry
+    float* __restrict__ run_max,     // running max m  (in/out)
+    float* __restrict__ run_denom,   // running denom l (in/out)
+    float* __restrict__ acc,         // [head_dim] running accumulator (in/out)
+    const float scale,               // = 1 / sqrt(head_dim)
+    const int head_dim
+) {
+    // Logit s = (q·k) * scale.
+    float dot = 0.0f;
+    #pragma unroll
+    for (int e = 0; e < head_dim; e++) {
+        dot = ptx_fma(q[e], k[e], dot);
+    }
+    const float s = dot * scale;
 
-        float cos_r = cosf(rope_f[p] * t);
-        float sin_r = sinf(rope_f[p] * t);
-        float h0_rot = h[s0] * cos_r - h[s1] * sin_r;
-        float h1_rot = h[s0] * sin_r + h[s1] * cos_r;
+    const float m_old = *run_max;
+    const float m_new = fmaxf(m_old, s);
+    // exp(m_old - m_new): 1.0 on the very first key (m_old = -INF -> corr = 0,
+    // but acc/denom are 0 there too, so the math is consistent).
+    const float corr  = ptx_expf(m_old - m_new);
+    const float p     = ptx_expf(s - m_new);
 
-        y_acc += C[s0] * h0_rot + C[s1] * h1_rot;
+    *run_denom = (*run_denom) * corr + p;
+    #pragma unroll
+    for (int e = 0; e < head_dim; e++) {
+        acc[e] = acc[e] * corr + p * v[e];
+    }
+    *run_max = m_new;
+}
+
+// =========================================================================
+//  Forward (3'): Softmax finalize — divide accumulator by denominator.
+//
+//  Completes the online softmax: out[:] = acc[:] / l  (spec §2). Call once
+//  per query after all sg2_attention_score_and_accumulate() updates. Guards
+//  against l == 0 (a query that saw no keys) by emitting zeros.
+// =========================================================================
+
+__device__ __forceinline__ void sg2_softmax_finalize(
+    float* __restrict__ acc,         // [head_dim] running accumulator (in/out)
+    const float run_denom,
+    const int head_dim
+) {
+    const float inv = (run_denom > 0.0f) ? (1.0f / run_denom) : 0.0f;
+    #pragma unroll
+    for (int e = 0; e < head_dim; e++) {
+        acc[e] *= inv;
+    }
+}
+
+// =========================================================================
+//  Forward (4): HCA — Heavily-compressed KV pooling (spec §2 HCA step 1)
+//
+//  Equation (spec §2):
+//      c_kv[j, :] = (1/M) Σ_{w=0..M-1} x[j·M + w, :]                (mean pool)
+//   or, if optional learned weights are supplied:
+//      c_kv[j, :] = Σ_w softmax(hca_w)[w] · x[j·M + w, :]
+//
+//  with M = HCA_COMPRESS (=128, stride==window), single stream, NO indexer
+//  (HCA attends densely to every compressed entry). Compressed length
+//  Nh = ceil(N / M). Per-output-element form: feature channel `d` of
+//  compressed entry `j`. Pass `hca_w = nullptr` for plain mean pooling.
+//  Edge-safe: taps beyond N are skipped and the pool renormalized.
+// =========================================================================
+
+template <typename feat_t>
+__device__ __forceinline__ float sg2_hca_compress_kv(
+    const feat_t* __restrict__ x_seq,    // [N, d_model] sorted features
+    const float*  __restrict__ hca_w,    // [hca_compress] weights, or nullptr (mean)
+    const int j,                         // compressed-entry index (0..Nh-1)
+    const int d,                         // feature channel (0..d_model-1)
+    const int N,
+    const int d_model,
+    const int hca_compress               // pooling stride/window M
+) {
+    const int base = j * hca_compress;
+
+    if (hca_w == nullptr) {
+        // Plain mean pool over valid taps.
+        float acc = 0.0f;
+        int   cnt = 0;
+        for (int w = 0; w < hca_compress; w++) {
+            const int t = base + w;
+            if (t >= N) break;
+            acc += static_cast<float>(x_seq[t * d_model + d]);
+            cnt++;
+        }
+        return (cnt > 0) ? (acc / static_cast<float>(cnt)) : 0.0f;
     }
 
-    y_acc += D_val * x_val;
-    float silu_z = z_val / (1.0f + expf(-z_val));
-    *y_out = y_acc * silu_z;
+    // Learned weighted pool via numerically-stable softmax over valid taps.
+    float run_max = -INFINITY;
+    for (int w = 0; w < hca_compress; w++) {
+        if (base + w >= N) break;
+        run_max = fmaxf(run_max, hca_w[w]);
+    }
+    if (!isfinite(run_max)) return 0.0f;
+
+    float denom = 0.0f, acc = 0.0f;
+    for (int w = 0; w < hca_compress; w++) {
+        const int t = base + w;
+        if (t >= N) break;
+        const float e = ptx_expf(hca_w[w] - run_max);
+        denom += e;
+        acc   += e * static_cast<float>(x_seq[t * d_model + d]);
+    }
+    return (denom > 0.0f) ? (acc / denom) : 0.0f;
 }
 
 // =========================================================================
@@ -577,64 +663,77 @@ __device__ __forceinline__ void sg2_apply_step(
 }
 
 // =========================================================================
-//  Backward (6): Bilevel precompute per-timestep
-//  Reproduces the forward projections needed for the adjoint scan.
+//  Backward (6): Bilevel precompute per-timestep (CSA/HCA adjoint inputs)
+//
+//  Reproduces the forward attention projections needed for the adjoint
+//  (spec §3b / §7: the bilevel backward saves softmax denominators +
+//  selected-index sets, and recomputes the q/k/v projections rather than the
+//  Mamba in_proj/dt/B/C). For one feature row x[t, :] (length d_model) this
+//  computes the per-head query/key/value projections used by both CSA and
+//  HCA attention:
+//
+//      q[t, :] = x[t, :] · q_W      (q_W : [d_model, d_model])
+//      k[t, :] = x[t, :] · k_W      (k_W : [d_model, d_model])
+//      v[t, :] = x[t, :] · v_W      (v_W : [d_model, d_model])
+//      qI[t,:] = (x[t, :] · idx_DQ) · idx_UQ   (low-rank indexer query, CSA;
+//                pass idx_DQ/idx_UQ = nullptr for HCA which has no indexer)
+//
+//  Row-major weights, projected vectors written to pre_q/k/v_t [d_model] and
+//  the indexer query to pre_qidx_t [indexer_rank] (skipped if idx_* null).
+//  FP32 accumulation. Replaces the former Mamba in_proj/dt/B/C recompute.
 // =========================================================================
 
 __device__ __forceinline__ void sg2_bilevel_precompute_timestep(
-    const float* __restrict__ x_sorted_t,
-    const float* __restrict__ in_proj_W,
-    const float* __restrict__ dt_proj_W,
-    const float* __restrict__ dt_proj_b,
-    const float* __restrict__ B_proj_W,
-    const float* __restrict__ C_proj_W,
-    float* __restrict__ pre_x_val_t,
-    float* __restrict__ pre_z_val_t,
-    float* __restrict__ pre_dt_val_t,
-    float* __restrict__ pre_B_val_t,
-    float* __restrict__ pre_C_val_t,
+    const float* __restrict__ x_row,      // [d_model] one sorted feature row x[t]
+    const float* __restrict__ q_W,        // [d_model, d_model] query proj
+    const float* __restrict__ k_W,        // [d_model, d_model] key proj
+    const float* __restrict__ v_W,        // [d_model, d_model] value proj
+    const float* __restrict__ idx_DQ,     // [d_model, indexer_rank] or nullptr (HCA)
+    const float* __restrict__ idx_UQ,     // [indexer_rank, d_model] or nullptr (HCA)
+    float* __restrict__ pre_q_t,          // [d_model] out
+    float* __restrict__ pre_k_t,          // [d_model] out
+    float* __restrict__ pre_v_t,          // [d_model] out
+    float* __restrict__ pre_qidx_t,       // [indexer_rank] out, or nullptr (HCA)
     const int d_model,
-    const int d_inner,
-    const int d_state
+    const int indexer_rank
 ) {
-    float x_branch[SG2_MAX_D_INNER];
-
-    // Input projection: x_branch and z
+    // q/k/v projections: out[o] = Σ_d x[d] · W[d, o]  (row-major [d_model,d_model]).
     #pragma unroll 4
-    for (int j = 0; j < d_inner; j++) {
-        float x_val = 0.0f, z_val = 0.0f;
+    for (int o = 0; o < d_model; o++) {
+        float q_val = 0.0f, k_val = 0.0f, v_val = 0.0f;
         #pragma unroll 4
         for (int d = 0; d < d_model; d++) {
-            x_val += in_proj_W[j * d_model + d] * x_sorted_t[d];
-            z_val += in_proj_W[(j + d_inner) * d_model + d] * x_sorted_t[d];
+            const float xd = x_row[d];
+            const int   wi = d * d_model + o;
+            q_val = ptx_fma(q_W[wi], xd, q_val);
+            k_val = ptx_fma(k_W[wi], xd, k_val);
+            v_val = ptx_fma(v_W[wi], xd, v_val);
         }
-        x_branch[j]      = x_val;
-        pre_x_val_t[j]   = x_val;
-        pre_z_val_t[j]   = z_val;
+        pre_q_t[o] = q_val;
+        pre_k_t[o] = k_val;
+        pre_v_t[o] = v_val;
     }
 
-    // dt projection + softplus
-    #pragma unroll 4
-    for (int j = 0; j < d_inner; j++) {
-        float dt_raw = dt_proj_b[j];
-        #pragma unroll 4
-        for (int k = 0; k < d_inner; k++) {
-            dt_raw += dt_proj_W[j * d_inner + k] * x_branch[k];
+    // Low-rank lightning-indexer query qI = (x · idx_DQ) · idx_UQ  (CSA only).
+    if (idx_DQ != nullptr && idx_UQ != nullptr && pre_qidx_t != nullptr) {
+        float lr[SG2_INDEXER_RANK_MAX];
+        #pragma unroll
+        for (int r = 0; r < indexer_rank; r++) {
+            float acc = 0.0f;
+            #pragma unroll 4
+            for (int d = 0; d < d_model; d++) {
+                acc = ptx_fma(idx_DQ[d * indexer_rank + r], x_row[d], acc);
+            }
+            lr[r] = acc;
         }
-        pre_dt_val_t[j] = logf(1.0f + expf(dt_raw));
-    }
-
-    // B and C projections
-    #pragma unroll 4
-    for (int s = 0; s < d_state; s++) {
-        float b_val = 0.0f, c_val = 0.0f;
-        #pragma unroll 4
-        for (int j = 0; j < d_inner; j++) {
-            b_val += B_proj_W[s * d_inner + j] * x_branch[j];
-            c_val += C_proj_W[s * d_inner + j] * x_branch[j];
+        // qI is rank-INDEXER_RANK; spec §2 keeps qI in the low-rank space for
+        // scoring against compressed indexer keys, so emit the rank-dim vector.
+        #pragma unroll
+        for (int r = 0; r < indexer_rank; r++) {
+            pre_qidx_t[r] = lr[r];
         }
-        pre_B_val_t[s] = b_val;
-        pre_C_val_t[s] = c_val;
+        (void)idx_UQ;  // UQ lift-back is applied where qI meets full-dim keys;
+                       // the indexer score path uses the low-rank form directly.
     }
 }
 

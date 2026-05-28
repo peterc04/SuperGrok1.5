@@ -16,7 +16,6 @@
 // practice ATen + rocBLAS already does this via the rocBLAS dispatch.
 
 #include <torch/extension.h>
-#include "csrc/tuning.h"
 #include <vector>
 
 // ── inlined from former csrc/backends/hip/gfx942/primitives.hpp ──
@@ -169,6 +168,43 @@ void launch_supergrok11_step(
         prim::ema_sq_update_inplace(v, smart, beta2);
         prim::adam_apply_inplace(p, m, v, lr, bc1, bc2, eps, wd);
     }
+}
+
+
+void launch_sg11_mu_metanet(
+    torch::Tensor mu, torch::Tensor grad, torch::Tensor sharpness, torch::Tensor smart_grad, float alpha, torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2, float rescale, int hidden_dim
+) {
+    throw std::runtime_error(
+        "launch_sg11_mu_metanet: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_sg11_adam_decay(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor smart_grad, torch::Tensor mu, float lamb_eff, float beta1, float beta2, float lr, float wd_eff, float eps, float bc1, float bc2
+) {
+    throw std::runtime_error(
+        "launch_sg11_adam_decay: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_sg11_sam_perturb(
+    torch::Tensor param, torch::Tensor grad, float rho_over_norm
+) {
+    throw std::runtime_error(
+        "launch_sg11_sam_perturb: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_sg11_sharpness_restore(
+    torch::Tensor param, torch::Tensor sharpness, torch::Tensor backup, torch::Tensor sam_grad, torch::Tensor normal_grad
+) {
+    throw std::runtime_error(
+        "launch_sg11_sharpness_restore: HIP gfx942 kernel not yet implemented.");
+}
+
+float compute_cosine_gate_fused(
+    torch::Tensor smart_grad, torch::Tensor mu, float gate_temp
+) {
+    throw std::runtime_error(
+        "compute_cosine_gate_fused: HIP gfx942 kernel not yet implemented.");
+    return 0.0f;
 }
 
 }} // namespace sg::gfx942

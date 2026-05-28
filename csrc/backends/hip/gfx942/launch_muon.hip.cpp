@@ -29,7 +29,6 @@
 // rocBLAS launcher's overhead. Not worth the maintenance burden.
 
 #include <torch/extension.h>
-#include "csrc/tuning.h"
 #include <vector>
 
 // ── inlined from former csrc/backends/hip/gfx942/primitives.hpp ──
@@ -173,6 +172,35 @@ void launch_muon_step(
             p.add_(buf.to(p.scalar_type()), -lr);
         }
     }
+}
+
+
+void launch_muon_ns_combine_update_fused(
+    torch::Tensor param, torch::Tensor X, torch::Tensor AX, torch::Tensor AAX, float a, float b, float c, float neg_lr_scale, float decay_factor
+) {
+    throw std::runtime_error(
+        "launch_muon_ns_combine_update_fused: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_muon_momentum_normalize(
+    torch::Tensor buf, torch::Tensor X, torch::Tensor grad, float momentum, float inv_norm
+) {
+    throw std::runtime_error(
+        "launch_muon_momentum_normalize: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_muon_ns_combine(
+    torch::Tensor X_out, torch::Tensor X, torch::Tensor AX, torch::Tensor AAX, float a, float b, float c
+) {
+    throw std::runtime_error(
+        "launch_muon_ns_combine: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_muon_update(
+    torch::Tensor param, torch::Tensor orth, float neg_lr_scale, float decay_factor
+) {
+    throw std::runtime_error(
+        "launch_muon_update: HIP gfx942 kernel not yet implemented.");
 }
 
 }} // namespace sg::gfx942

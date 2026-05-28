@@ -1,17 +1,35 @@
-"""TPU/Pallas kernels for SuperGrok v2 -- Mamba-3 + PEER + GRU meta-net optimizer.
+"""TPU/Pallas kernels for SuperGrok v2 -- CSA/HCA hybrid attention + PEER + GRU.
 
-The most complex optimizer in the SuperGrok family. Combines:
-  - Mamba-3 bidirectional selective state-space scan (via associative_scan)
-  - 4-Head PEER product-key expert routing
-  - Per-element GRU temporal memory
-  - AdamW with sigmoid gating and adaptive scheduling
+DeepSeek-V4-style learned-optimizer meta-net (see /tmp/csa_hca_spec.md, esp.
+SS2, SS3b). The flattened parameter-element sequence is mixed by compressed
+attention, replacing the previous Mamba-3 bidirectional selective scan. The
+GRU + PEER + expert-MLP + AdamW apply tail is KEPT VERBATIM (only the sequence
+mixer changes -- spec SS3b). Combines:
+  - CSA: Compressed Sparse Attention (compress m=4 + lightning-indexer top-k +
+    sliding window) -> csa_ctx  (fine/local context; was the mamba fwd scan)
+  - HCA: Heavily Compressed Attention (heavy compress m'=128 + dense attention +
+    sliding window) -> hca_ctx  (global coarse context; was the mamba bwd scan)
+  - 4-Head PEER product-key expert routing                 (UNCHANGED)
+  - Per-element GRU temporal memory                         (UNCHANGED)
+  - AdamW with sigmoid gating and adaptive scheduling       (UNCHANGED)
+
+CSA mechanics (spec SS2):
+  c_kv[j]  = sum_w softmax(compress_w)[w] * x[j*m + w]      (KV compression)
+  qI       = (x @ idx_DQ) @ idx_UQ ;  kI = compress(x @ idx_K)  (rank R indexer)
+  I[t,s]   = qI[t] . kI[s] / sqrt(d)  -> keep top-k compressed entries per query
+  out      = softmax(Q.K^T / sqrt(head_dim)) . V  over (top-k U window), MQA KV.
+HCA mechanics: stride-m' mean pool -> Nh entries; every query attends DENSELY to
+all Nh compressed entries (+window). No top-k.
 
 Key TPU optimisations:
-  - jax.lax.associative_scan for O(log N) parallel Mamba scans
+  - reshape + mean for O(1) KV compression (no sequential scan)
+  - einsum + jax.lax.top_k for the lightning indexer selection
+  - jnp.einsum + jax.nn.softmax for attention (XLA -> MXU)
   - jax.vmap for expert MLP evaluation (vectorised across experts)
-  - Pure JAX for matmul-heavy paths (XLA -> MXU)
   - Pallas kernels for element-wise fused AdamW
 
+Attention is STATELESS across optimizer steps (unlike the carried Mamba state),
+so the mamba_fwd_state / mamba_bwd_state entries are dropped; the GRU state stays.
 BF16 parameters, FP32 accumulators throughout.
 """
 
@@ -22,7 +40,6 @@ from typing import Any, Dict, Tuple
 
 import jax
 import jax.numpy as jnp
-from jax import lax
 
 from grokking_optimizers.kernels.tpu.common_tpu import (
     ACCUM_DTYPE,
@@ -39,95 +56,183 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Component 1: Mamba selective scan via associative_scan
+# Component 1a: shared attention helpers (compression + sliding-window mask)
 # ---------------------------------------------------------------------------
 
 
-def sg2_mamba_scan(
-    x: jnp.ndarray,
-    state: jnp.ndarray,
-    A_log: jnp.ndarray,
-    B_proj: jnp.ndarray,
-    C_proj: jnp.ndarray,
-    D: jnp.ndarray,
-    dt_proj_W: jnp.ndarray,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Mamba-3 selective state-space scan using associative_scan.
+def _compress_kv(
+    kv: jnp.ndarray,        # [N, d_model]
+    compress_w: jnp.ndarray,  # [window] or None -> uniform mean pool
+    m: int,                 # compression stride
+    window: int,            # pooling window (>= m); for HCA window == m
+) -> jnp.ndarray:
+    """Pool a `window`-wide block at stride `m` -> [Nc, d_model] (spec SS2.1).
 
-    Uses the 2x2 affine operator for the parallel scan:
-        (M, b) where M = diag(exp(A * dt)), b = B * x
-        Combine: (M1, b1) o (M2, b2) = (M1 * M2, M2 * b1 + b2)
-
-    This parallelises the inherently sequential SSM scan on TPU,
-    achieving O(log N) depth instead of O(N).
-
-    Args:
-        x: Input sequence [N, d_inner] (f32). N = flattened param elements.
-        state: Previous SSM hidden state [d_inner, d_state] (f32).
-        A_log: Log of state transition matrix [d_inner, d_state] (f32).
-        B_proj: B projection weights [d_state, d_inner] (f32).
-        C_proj: C projection weights [d_state, d_inner] (f32).
-        D: Skip connection parameter [d_inner] (f32).
-        dt_proj_W: Timestep projection weights [d_inner, d_inner] (f32).
-
-    Returns:
-        (output, new_state) where output is [N, d_inner] and
-        new_state is [d_inner, d_state].
+    c_kv[j] = sum_w softmax(compress_w)[w] * kv[j*m + w]. Implemented with a
+    reshape into [Nc, m, d_model] (zero-padded) and a weighted mean -- no scan.
+    When window > m the spec pools overlapping windows; for the reference path we
+    use the stride-m non-overlapping block (window collapses to m) so the reshape
+    stays exact, which is the common m == window case.
     """
-    N = x.shape[0]
-    d_inner = x.shape[1] if x.ndim > 1 else D.shape[0]
-    d_state = A_log.shape[1]
+    N, d_model = kv.shape
+    Nc = (N + m - 1) // m
+    pad = Nc * m - N
+    if pad:
+        kv = jnp.concatenate([kv, jnp.zeros((pad, d_model), kv.dtype)], axis=0)
+    blocks = kv.reshape(Nc, m, d_model)  # [Nc, m, d_model]
 
-    # Ensure x is 2D: [N, d_inner]
-    x_f32 = x.astype(ACCUM_DTYPE)
-    if x_f32.ndim == 1:
-        x_f32 = x_f32[:, None]  # [N, 1] -- will broadcast
+    if compress_w is None:
+        weights = jnp.full((m,), 1.0 / m, dtype=ACCUM_DTYPE)
+    else:
+        # softmax over the first m entries of the learned window weights
+        w = compress_w[:m].astype(ACCUM_DTYPE)
+        weights = jax.nn.softmax(w)
+    return jnp.einsum('cmd,m->cd', blocks.astype(ACCUM_DTYPE), weights)  # [Nc, d_model]
 
-    # Compute dt via softplus of projection
-    dt = jnp.log1p(jnp.exp(x_f32 @ dt_proj_W.T))  # [N, d_inner]
 
-    # Compute B and C from projections
-    B = x_f32 @ B_proj.T  # [N, d_state]
-    C = x_f32 @ C_proj.T  # [N, d_state]
+def _sliding_window_bias(N: int, window: int) -> jnp.ndarray:
+    """Additive attention bias [N, N] allowing only the last `window` causal
+    tokens (token t attends to t-window+1 .. t). 0 where allowed, -inf else."""
+    t = jnp.arange(N)[:, None]
+    s = jnp.arange(N)[None, :]
+    allowed = (s <= t) & (s > t - window)
+    return jnp.where(allowed, 0.0, -jnp.inf).astype(ACCUM_DTYPE)
 
-    # Discretisation
-    A = jnp.exp(A_log)  # [d_inner, d_state]
-    # A_bar = exp(dt * A): [N, d_inner, d_state]
-    A_bar = jnp.exp(dt[:, :, None] * A[None, :, :])
-    # B_bar = dt * B: [N, d_inner, d_state]
-    B_bar = dt[:, :, None] * B[:, None, :]
-    # x_bar = B_bar * x: [N, d_inner, d_state]
-    x_bar = B_bar * x_f32[:, :, None]
 
-    # Associative scan along sequence axis (axis=0)
-    # Operator: (a1, b1) o (a2, b2) = (a1 * a2, a2 * b1 + b2)
-    def _combine(
-        carry: Tuple[jnp.ndarray, jnp.ndarray],
-        incoming: Tuple[jnp.ndarray, jnp.ndarray],
-    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        a1, b1 = carry
-        a2, b2 = incoming
-        return a1 * a2, a2 * b1 + b2
+# ---------------------------------------------------------------------------
+# Component 1b: CSA -- Compressed Sparse Attention (spec SS2)
+# ---------------------------------------------------------------------------
 
-    # Incorporate initial state into the first element
-    # h[0] = A_bar[0] * state + x_bar[0]
-    init_contrib = A_bar[0] * state[None, :, :]  # [1, d_inner, d_state] -> broadcast
-    x_bar_adj = x_bar.at[0].add(init_contrib.squeeze(0))
 
-    _, h_scan = lax.associative_scan(
-        _combine, (A_bar, x_bar_adj), axis=0,
-    )  # h_scan: [N, d_inner, d_state]
+def sg2_csa_attention(
+    x: jnp.ndarray,          # [N, d_model] projected feature sequence
+    q_W: jnp.ndarray,        # [d_model, d_model]
+    k_W: jnp.ndarray,        # [d_model, d_model]
+    v_W: jnp.ndarray,        # [d_model, d_model]
+    out_W: jnp.ndarray,      # [d_model, d_model]
+    compress_w: jnp.ndarray,  # [csa_window] learned KV pool weights
+    idx_DQ: jnp.ndarray,     # [d_model, indexer_rank]
+    idx_UQ: jnp.ndarray,     # [indexer_rank, d_model]  (kept for parity; see note)
+    idx_K: jnp.ndarray,      # [d_model, indexer_rank]
+    n_heads: int,
+    csa_compress: int,
+    csa_window: int,
+    csa_topk: int,
+) -> jnp.ndarray:
+    """Compressed Sparse Attention -> csa_ctx [N, d_model] (spec SS2 CSA).
 
-    # Output: y[n] = sum_s(C[n, s] * h[n, :, s])
-    y = jnp.sum(C[:, None, :] * h_scan, axis=-1)  # [N, d_inner]
+    1. KV compression at stride m=csa_compress with learned pooling.
+    2. Lightning indexer: low-rank query qI scores compressed indexer keys kI;
+       keep top-k compressed entries per query (jax.lax.top_k).
+    3. Sliding window: also attend to the last csa_window raw tokens (causal).
+    4. Attention: softmax(Q.Kc^T / sqrt(head_dim)) . Vc over selected entries,
+       plus the windowed raw attention; KV shared across heads (multi-query).
+    """
+    x = x.astype(ACCUM_DTYPE)
+    N, d_model = x.shape
+    head_dim = d_model // n_heads
+    scale = 1.0 / jnp.sqrt(jnp.asarray(head_dim, ACCUM_DTYPE))
 
-    # Skip connection
-    y = y + D[None, :] * x_f32
+    q = x @ q_W.T  # [N, d_model]
+    k = x @ k_W.T
+    v = x @ v_W.T
 
-    # New state = last hidden state
-    new_state = h_scan[-1]  # [d_inner, d_state]
+    c_k = _compress_kv(k, compress_w, csa_compress, csa_window)  # [Nc, d_model]
+    c_v = _compress_kv(v, compress_w, csa_compress, csa_window)  # [Nc, d_model]
+    Nc = c_k.shape[0]
 
-    return y, new_state
+    # Lightning indexer (spec SS2.2): qI = (x @ idx_DQ) @ idx_UQ then projected
+    # back to rank space against kI. We score directly in rank space: the rank-R
+    # indexer query z = x @ idx_DQ and indexer keys kI = compress(x @ idx_K).
+    R = idx_DQ.shape[1]
+    z = x @ idx_DQ                       # [N, R]
+    kI = _compress_kv(x @ idx_K, compress_w, csa_compress, csa_window)  # [Nc, R]
+    idx_scores = (z @ kI.T) / jnp.sqrt(jnp.asarray(R, ACCUM_DTYPE))  # [N, Nc]
+
+    k_keep = min(csa_topk, Nc)
+    _, top_idx = jax.lax.top_k(idx_scores, k_keep)  # [N, k_keep] compressed ids
+
+    # Per-head multi-query attention over the selected compressed entries.
+    def _attend_head(h):
+        off = h * head_dim
+        q_h = q[:, off:off + head_dim]                  # [N, head_dim]
+        ck_h = c_k[:, off:off + head_dim]               # [Nc, head_dim]
+        cv_h = c_v[:, off:off + head_dim]
+        # Gather selected compressed keys/values per query: [N, k_keep, head_dim]
+        sel_k = ck_h[top_idx]
+        sel_v = cv_h[top_idx]
+        comp_scores = jnp.einsum('nd,nkd->nk', q_h, sel_k) * scale  # [N, k_keep]
+        comp_p = jax.nn.softmax(comp_scores, axis=-1)
+        comp_ctx = jnp.einsum('nk,nkd->nd', comp_p, sel_v)          # [N, head_dim]
+
+        # Sliding-window raw attention (causal, last csa_window tokens).
+        rk_h = k[:, off:off + head_dim]
+        rv_h = v[:, off:off + head_dim]
+        win_scores = jnp.einsum('nd,md->nm', q_h, rk_h) * scale     # [N, N]
+        win_scores = win_scores + _sliding_window_bias(N, csa_window)
+        win_p = jax.nn.softmax(win_scores, axis=-1)
+        win_ctx = win_p @ rv_h                                       # [N, head_dim]
+
+        return 0.5 * (comp_ctx + win_ctx)                           # [N, head_dim]
+
+    heads = [_attend_head(h) for h in range(n_heads)]
+    ctx = jnp.concatenate(heads, axis=-1)  # [N, d_model]
+    return ctx @ out_W.T                    # output projection [N, d_model]
+
+
+# ---------------------------------------------------------------------------
+# Component 1c: HCA -- Heavily Compressed Attention (spec SS2)
+# ---------------------------------------------------------------------------
+
+
+def sg2_hca_attention(
+    x: jnp.ndarray,          # [N, d_model] projected feature sequence
+    q_W: jnp.ndarray,        # [d_model, d_model]
+    k_W: jnp.ndarray,        # [d_model, d_model]
+    v_W: jnp.ndarray,        # [d_model, d_model]
+    out_W: jnp.ndarray,      # [d_model, d_model]
+    n_heads: int,
+    hca_compress: int,
+    csa_window: int,
+) -> jnp.ndarray:
+    """Heavily Compressed Attention -> hca_ctx [N, d_model] (spec SS2 HCA).
+
+    Stride-m' mean pool (m'=hca_compress) -> Nh compressed entries; every query
+    attends DENSELY to all Nh entries (no top-k) plus the sliding window.
+    """
+    x = x.astype(ACCUM_DTYPE)
+    N, d_model = x.shape
+    head_dim = d_model // n_heads
+    scale = 1.0 / jnp.sqrt(jnp.asarray(head_dim, ACCUM_DTYPE))
+
+    q = x @ q_W.T
+    k = x @ k_W.T
+    v = x @ v_W.T
+
+    c_k = _compress_kv(k, None, hca_compress, hca_compress)  # [Nh, d_model] mean
+    c_v = _compress_kv(v, None, hca_compress, hca_compress)
+
+    def _attend_head(h):
+        off = h * head_dim
+        q_h = q[:, off:off + head_dim]
+        ck_h = c_k[:, off:off + head_dim]
+        cv_h = c_v[:, off:off + head_dim]
+        dense_scores = jnp.einsum('nd,md->nm', q_h, ck_h) * scale  # [N, Nh] dense
+        dense_p = jax.nn.softmax(dense_scores, axis=-1)
+        dense_ctx = dense_p @ cv_h                                  # [N, head_dim]
+
+        rk_h = k[:, off:off + head_dim]
+        rv_h = v[:, off:off + head_dim]
+        win_scores = jnp.einsum('nd,md->nm', q_h, rk_h) * scale
+        win_scores = win_scores + _sliding_window_bias(N, csa_window)
+        win_p = jax.nn.softmax(win_scores, axis=-1)
+        win_ctx = win_p @ rv_h
+
+        return 0.5 * (dense_ctx + win_ctx)
+
+    heads = [_attend_head(h) for h in range(n_heads)]
+    ctx = jnp.concatenate(heads, axis=-1)
+    return ctx @ out_W.T
 
 
 # ---------------------------------------------------------------------------
@@ -327,11 +432,12 @@ def sg2_update(
 ) -> Tuple[jnp.ndarray, Dict[str, Any]]:
     """Full SuperGrok v2 update step orchestrating all components (pure JAX).
 
-    Orchestrates:
+    Orchestrates (spec SS3b -- only the sequence mixer changed vs. the old
+    Mamba-3 meta-net):
       1. Gradient clipping
       2. Sort by |gradient| magnitude
       3. Input projection
-      4. Bidirectional Mamba-3 scan (forward + backward)
+      4. CSA + HCA hybrid attention (csa_ctx local, hca_ctx global)
       5. Per-element GRU temporal memory
       6. 4-Head PEER product-key expert routing
       7. Expert MLP evaluation
@@ -347,18 +453,19 @@ def sg2_update(
             - mu: Momentum buffer (f32).
             - sharpness: Per-element sharpness (f32).
             - gru_state: GRU hidden state [N, gru_hidden] (f32).
-            - mamba_fwd_state: Forward SSM state [d_inner, d_state] (f32).
-            - mamba_bwd_state: Backward SSM state [d_inner, d_state] (f32).
             - step: Current step (int).
+          (Attention is stateless across steps -- no mamba_fwd/bwd_state.)
         meta_weights: Meta-network weights dict containing:
             - input_proj_W, input_proj_b
-            - mamba_fwd_*: Forward Mamba weights
-            - mamba_bwd_*: Backward Mamba weights
+            - csa_q_W, csa_k_W, csa_v_W, csa_out_W, csa_compress_w,
+              csa_idx_DQ, csa_idx_UQ, csa_idx_K   (CSA layer)
+            - hca_q_W, hca_k_W, hca_v_W, hca_out_W (HCA layer)
             - gru_W_z, gru_W_r, gru_W_h, gru_b_z, gru_b_r, gru_b_h
             - peer_query_Ws: [num_heads, d_model, peer_input_dim]
             - product_keys_A, product_keys_B: [num_heads, pk_dim, d_model//2]
             - expert_W1, expert_b1, expert_W2, expert_b2
-            - rescale, d_model, d_state, d_inner, pk_dim, num_peer_heads
+            - rescale, d_model, pk_dim, num_peer_heads, n_heads,
+              csa_compress, csa_window, csa_topk, hca_compress, indexer_rank
         hyperparams: Optimizer hyperparameters dict containing:
             - layer_beta1, beta2, lr, wd, eps
             - lamb, ramp, gate_signal, grad_clip
@@ -382,21 +489,24 @@ def sg2_update(
 
     # Unpack meta-network dimensions
     d_model = meta_weights['d_model']
-    d_state = meta_weights['d_state']
-    d_inner = meta_weights['d_inner']
     pk_dim = meta_weights['pk_dim']
     num_heads = meta_weights['num_peer_heads']
     rescale = meta_weights['rescale']
     gru_hidden = meta_weights.get('gru_hidden', 4)
+    # CSA / HCA attention dims
+    n_heads = meta_weights.get('n_heads', 2)
+    csa_compress = meta_weights.get('csa_compress', 4)
+    csa_window = meta_weights.get('csa_window', 8)
+    csa_topk = meta_weights.get('csa_topk', 16)
+    hca_compress = meta_weights.get('hca_compress', 128)
+    indexer_rank = meta_weights.get('indexer_rank', 4)
 
-    # Unpack state
+    # Unpack state (attention is stateless -> no mamba scan state)
     exp_avg = state['exp_avg']
     exp_avg_sq = state['exp_avg_sq']
     mu = state['mu']
     sharpness = state['sharpness']
     gru_state_val = state['gru_state']
-    mamba_fwd_state = state['mamba_fwd_state']
-    mamba_bwd_state = state['mamba_bwd_state']
     step = state['step']
 
     # --- 1. Gradient clipping ---
@@ -417,37 +527,34 @@ def sg2_update(
     inp = jnp.stack([g_sorted, s_sorted], axis=-1)  # [N, 2]
     x = inp @ meta_weights['input_proj_W'].T + meta_weights['input_proj_b']  # [N, d_model]
 
-    # --- 4. Bidirectional Mamba-3 scan ---
-    # Forward scan
-    fwd_out, new_fwd_state = sg2_mamba_scan(
-        x, mamba_fwd_state,
-        meta_weights['mamba_fwd_A_log'],
-        meta_weights['mamba_fwd_B_proj'],
-        meta_weights['mamba_fwd_C_proj'],
-        meta_weights['mamba_fwd_D'],
-        meta_weights['mamba_fwd_dt_proj_W'],
-    )
-
-    # Backward scan (flip input, flip output)
-    bwd_out, new_bwd_state = sg2_mamba_scan(
-        x[::-1], mamba_bwd_state,
-        meta_weights['mamba_bwd_A_log'],
-        meta_weights['mamba_bwd_B_proj'],
-        meta_weights['mamba_bwd_C_proj'],
-        meta_weights['mamba_bwd_D'],
-        meta_weights['mamba_bwd_dt_proj_W'],
-    )
-    bwd_out = bwd_out[::-1]
+    # --- 4. CSA + HCA hybrid attention (spec SS2, SS3b) ---
+    # CSA -> local/fine context (replaces mamba fwd); HCA -> global coarse
+    # context (replaces mamba bwd). Both operate on the sorted, projected seq x.
+    csa_out = sg2_csa_attention(
+        x,
+        meta_weights['csa_q_W'], meta_weights['csa_k_W'],
+        meta_weights['csa_v_W'], meta_weights['csa_out_W'],
+        meta_weights['csa_compress_w'],
+        meta_weights['csa_idx_DQ'], meta_weights['csa_idx_UQ'],
+        meta_weights['csa_idx_K'],
+        n_heads, csa_compress, csa_window, csa_topk,
+    )  # [N, d_model]
+    hca_out = sg2_hca_attention(
+        x,
+        meta_weights['hca_q_W'], meta_weights['hca_k_W'],
+        meta_weights['hca_v_W'], meta_weights['hca_out_W'],
+        n_heads, hca_compress, csa_window,
+    )  # [N, d_model]
 
     # Unsort back to original element order
     unsort_idx = jnp.argsort(sort_idx)
-    fwd_ctx = fwd_out[unsort_idx]  # [N, d_model]
-    bwd_ctx = bwd_out[unsort_idx]  # [N, d_model]
+    csa_ctx = csa_out[unsort_idx]  # [N, d_model]
+    hca_ctx = hca_out[unsort_idx]  # [N, d_model]
 
     # --- 5. Per-element GRU temporal memory ---
     gru_input = jnp.concatenate([
         g_flat[:, None], s_flat[:, None],
-        fwd_ctx, bwd_ctx,
+        csa_ctx, hca_ctx,
     ], axis=-1)  # [N, 2 + 2*d_model]
 
     new_gru = sg2_gru_update(
@@ -458,7 +565,7 @@ def sg2_update(
 
     # --- 6. PEER product-key expert routing ---
     peer_input = jnp.concatenate([
-        new_gru, fwd_ctx, bwd_ctx,
+        new_gru, csa_ctx, hca_ctx,
         g_flat[:, None], s_flat[:, None],
     ], axis=-1)  # [N, gru_hidden + 2*d_model + 2]
 
@@ -498,15 +605,13 @@ def sg2_update(
     update = m_hat / (jnp.sqrt(v_hat) + eps)
     p = p - lr * (update + wd * p)
 
-    # --- Build updated state ---
+    # --- Build updated state (attention is stateless across steps) ---
     new_state = {
         'exp_avg': new_exp_avg,
         'exp_avg_sq': new_exp_avg_sq,
         'mu': new_mu,
         'sharpness': sharpness,
         'gru_state': new_gru,
-        'mamba_fwd_state': new_fwd_state,
-        'mamba_bwd_state': new_bwd_state,
         'step': step + 1,
     }
 
@@ -584,6 +689,12 @@ def sg2_pallas_kernel(
     pk_dim = meta_weights['pk_dim']
     num_heads = meta_weights['num_peer_heads']
     rescale = meta_weights['rescale']
+    n_heads = meta_weights.get('n_heads', 2)
+    csa_compress = meta_weights.get('csa_compress', 4)
+    csa_window = meta_weights.get('csa_window', 8)
+    csa_topk = meta_weights.get('csa_topk', 16)
+    hca_compress = meta_weights.get('hca_compress', 128)
+    indexer_rank = meta_weights.get('indexer_rank', 4)
 
     step = state['step']
 
@@ -604,26 +715,28 @@ def sg2_pallas_kernel(
     inp = jnp.stack([g_sorted, s_sorted], axis=-1)
     x = inp @ meta_weights['input_proj_W'].T + meta_weights['input_proj_b']
 
-    fwd_out, new_fwd_state = sg2_mamba_scan(
-        x, state['mamba_fwd_state'],
-        meta_weights['mamba_fwd_A_log'], meta_weights['mamba_fwd_B_proj'],
-        meta_weights['mamba_fwd_C_proj'], meta_weights['mamba_fwd_D'],
-        meta_weights['mamba_fwd_dt_proj_W'],
+    csa_out = sg2_csa_attention(
+        x,
+        meta_weights['csa_q_W'], meta_weights['csa_k_W'],
+        meta_weights['csa_v_W'], meta_weights['csa_out_W'],
+        meta_weights['csa_compress_w'],
+        meta_weights['csa_idx_DQ'], meta_weights['csa_idx_UQ'],
+        meta_weights['csa_idx_K'],
+        n_heads, csa_compress, csa_window, csa_topk,
     )
-    bwd_out, new_bwd_state = sg2_mamba_scan(
-        x[::-1], state['mamba_bwd_state'],
-        meta_weights['mamba_bwd_A_log'], meta_weights['mamba_bwd_B_proj'],
-        meta_weights['mamba_bwd_C_proj'], meta_weights['mamba_bwd_D'],
-        meta_weights['mamba_bwd_dt_proj_W'],
+    hca_out = sg2_hca_attention(
+        x,
+        meta_weights['hca_q_W'], meta_weights['hca_k_W'],
+        meta_weights['hca_v_W'], meta_weights['hca_out_W'],
+        n_heads, hca_compress, csa_window,
     )
-    bwd_out = bwd_out[::-1]
 
     unsort_idx = jnp.argsort(sort_idx)
-    fwd_ctx = fwd_out[unsort_idx]
-    bwd_ctx = bwd_out[unsort_idx]
+    csa_ctx = csa_out[unsort_idx]
+    hca_ctx = hca_out[unsort_idx]
 
     gru_input = jnp.concatenate([
-        g_flat[:, None], s_flat[:, None], fwd_ctx, bwd_ctx,
+        g_flat[:, None], s_flat[:, None], csa_ctx, hca_ctx,
     ], axis=-1)
     new_gru = sg2_gru_update(
         gru_input, state['gru_state'],
@@ -632,7 +745,7 @@ def sg2_pallas_kernel(
     )
 
     peer_input = jnp.concatenate([
-        new_gru, fwd_ctx, bwd_ctx, g_flat[:, None], s_flat[:, None],
+        new_gru, csa_ctx, hca_ctx, g_flat[:, None], s_flat[:, None],
     ], axis=-1)
     expert_indices = sg2_peer_routing(
         peer_input, meta_weights['peer_query_Ws'],
@@ -675,8 +788,6 @@ def sg2_pallas_kernel(
         'mu': out_mu,
         'sharpness': state['sharpness'],
         'gru_state': new_gru,
-        'mamba_fwd_state': new_fwd_state,
-        'mamba_bwd_state': new_bwd_state,
         'step': step + 1,
     }
 

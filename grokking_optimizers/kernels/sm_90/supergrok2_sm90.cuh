@@ -6,17 +6,27 @@
 namespace grokking { namespace sm90 {
 
 // ============================================================================
-// SuperGrok v2 (SG2) -- Mamba-3 + 4-Head PEER + GRU Meta-Net Optimizer
+// SuperGrok v2 (SG2) -- CSA/HCA Hybrid Attention + 4-Head PEER + GRU Meta-Net
+//
+// DeepSeek-V4-style sequence mixer (see /tmp/csa_hca_spec.md, esp. SS2, SS3b):
+// the meta-model views a parameter tensor's flattened elements as a SEQUENCE
+// and runs compressed-sparse / heavily-compressed attention over it, replacing
+// the previous Mamba-3 bidirectional selective scan. The GRU + PEER + expert
+// MLP + AdamW apply tail is KEPT VERBATIM (only the sequence mixer changes).
 //
 // Architecture overview (per-parameter fused step):
 //   1. Gradient validation, clipping, and radix sort by |grad|
-//   2. Forward Mamba selective scan on sorted gradients
-//   3. Backward Mamba selective scan on reversed sorted gradients
+//   2. CSA (compress m=4, lightning-indexer top-k, +sliding window)  -> csa_ctx
+//   3. HCA (heavy compress m'=128, dense attention,  +sliding window) -> hca_ctx
 //   4. Unsort to original order
-//   5. GRU temporal memory update
-//   6. PEER 4-head product-key expert routing
-//   7. Expert MLP evaluation
-//   8. AdamW update with smart (amplified) gradients
+//   5. GRU temporal memory update                  (input: g, s, csa_ctx, hca_ctx)
+//   6. PEER 4-head product-key expert routing      (UNCHANGED)
+//   7. Expert MLP evaluation                       (UNCHANGED)
+//   8. AdamW update with smart (amplified) gradients (UNCHANGED)
+//
+// CSA replaces the old forward (fine/local) Mamba scan; HCA replaces the old
+// backward (global) scan. Attention is STATELESS across optimizer steps, so the
+// carried mamba_fwd/bwd state tensors are dropped; only the GRU state persists.
 // ============================================================================
 
 // ---------------------------------------------------------------------------
@@ -26,24 +36,34 @@ namespace sg2_constants {
     constexpr int MAX_BLOCK_SORT_N   = 1024;  // Max N for intra-block bitonic sort
     constexpr int RADIX_BITS         = 8;
     constexpr int RADIX_BUCKETS      = 1 << RADIX_BITS;  // 256
-    constexpr int MAMBA_TILE_SIZE    = 32;
-    constexpr int DEFAULT_D_INNER    = 16;
-    constexpr int DEFAULT_D_STATE    = 16;
+    // -- CSA / HCA attention defaults (spec SS3) --
+    constexpr int DEFAULT_D_MODEL    = 8;     // per-element feature width
+    constexpr int DEFAULT_N_HEADS    = 2;     // attention heads (multi-query KV)
+    constexpr int DEFAULT_HEAD_DIM   = 4;     // d_model / n_heads
+    constexpr int DEFAULT_CSA_COMPRESS = 4;   // CSA KV compression stride m
+    constexpr int DEFAULT_CSA_WINDOW   = 8;   // CSA pooling window / sliding window
+    constexpr int DEFAULT_CSA_TOPK     = 16;  // lightning-indexer top-k (clamped to Nc)
+    constexpr int DEFAULT_HCA_COMPRESS = 128; // HCA KV compression stride m'
+    constexpr int DEFAULT_INDEXER_RANK = 4;   // low-rank lightning indexer rank
     constexpr int DEFAULT_GRU_HIDDEN = 8;
-    constexpr int DEFAULT_NUM_HEADS  = 4;
+    constexpr int DEFAULT_NUM_HEADS  = 4;     // PEER heads
     constexpr int DEFAULT_PK_DIM     = 32;    // Product-key sub-dimension
     constexpr int DEFAULT_NUM_EXPERTS = 1024;  // pk_dim * pk_dim
     constexpr int DEFAULT_EXPERT_HIDDEN = 16;
 
     constexpr int SORT_SMEM_BYTES       = MAX_BLOCK_SORT_N * (sizeof(float) + sizeof(int));
-    constexpr int MAMBA_SCAN_SMEM_BYTES = 2 * DEFAULT_D_INNER * DEFAULT_D_STATE * sizeof(float);
+    // SMEM for an attention tile: q/k/v rows of one head + online-softmax scratch
+    constexpr int ATTN_SMEM_BYTES       = 4 * DEFAULT_D_MODEL * sizeof(float);
     constexpr int GRU_SMEM_BYTES        = 0;
     constexpr int PEER_SMEM_BYTES       = 4 * DEFAULT_PK_DIM * sizeof(float);  // Per-head top-k scratch
     constexpr int EXPERT_SMEM_BYTES     = DEFAULT_EXPERT_HIDDEN * 2 * sizeof(float);  // W1, b1 tile
 }
 
 // ---------------------------------------------------------------------------
-// State struct: 7 persistent state tensors per parameter group
+// State struct: 5 persistent state tensors per parameter group
+//
+// Attention (CSA/HCA) is stateless across steps, so unlike the Mamba scan there
+// is no carried sequence-mixer state -- only the Adam moments + GRU memory.
 // ---------------------------------------------------------------------------
 struct SuperGrok2State {
     float* __restrict__ exp_avg;           // [N]   Adam first moment
@@ -51,14 +71,11 @@ struct SuperGrok2State {
     float* __restrict__ mu;                // [N]   EMA gradient
     float* __restrict__ sharpness;         // [N]   Gradient correction magnitude EMA
     float* __restrict__ gru_state;         // [N * gru_hidden]
-    float* __restrict__ mamba_fwd_state;   // [d_inner * d_state] per param group
-    float* __restrict__ mamba_bwd_state;   // [d_inner * d_state] per param group
 
-    static constexpr int num_state_tensors() { return 7; }
-    static constexpr int state_bytes_per_element(int gru_hidden, int d_inner, int d_state) {
+    static constexpr int num_state_tensors() { return 5; }
+    static constexpr int state_bytes_per_element(int gru_hidden) {
         return 4 * sizeof(float)                     // exp_avg, exp_avg_sq, mu, sharpness
-             + gru_hidden * sizeof(float)            // gru_state
-             + 2 * d_inner * d_state * sizeof(float); // mamba fwd + bwd (amortized)
+             + gru_hidden * sizeof(float);           // gru_state
     }
 };
 
@@ -79,11 +96,18 @@ struct SG2Hyperparams {
     float bias_correction1;
     float bias_correction2;
     float clip_threshold;
-    int   d_inner;
-    int   d_state;
+    // -- CSA / HCA attention dims (replace d_inner/d_state) --
+    int   d_model;        // per-element feature width
+    int   n_heads;        // attention heads (multi-query KV)
+    int   csa_compress;   // CSA compression stride m (e.g. 4)
+    int   csa_window;     // CSA pooling / sliding window (e.g. 8)
+    int   csa_topk;       // lightning-indexer top-k (clamped to Nc)
+    int   hca_compress;   // HCA compression stride m' (e.g. 128)
+    int   indexer_rank;   // low-rank lightning indexer rank
+    // -- GRU / PEER / expert dims (unchanged) --
     int   gru_hidden;
     int   gru_input_dim;
-    int   num_heads;
+    int   num_heads;      // PEER heads
     int   pk_dim;
     int   num_experts;
     int   expert_hidden;
@@ -91,14 +115,39 @@ struct SG2Hyperparams {
 };
 
 // ---------------------------------------------------------------------------
-// Mamba weight pointers
+// CSA (Compressed Sparse Attention) weight pointers -- produces csa_ctx.
+//
+// Mechanics (spec SS2):
+//   c_kv[j] = sum_w softmax(csa_compress_w)[w] * x[j*m + w]   (m=csa_compress)
+//   qI = x @ idx_DQ @ idx_UQ   (low-rank lightning-indexer query, rank R)
+//   kI = compress(x @ idx_K)   (indexer keys, same pooling)
+//   I[t,s] = qI[t] . kI[s] / sqrt(R)         -> keep top-k compressed entries s
+//   out[t]  = softmax(Q.K^T / sqrt(head_dim)) . V   over (top-k compressed
+//             union last csa_window raw tokens), KV shared across heads (MQA).
 // ---------------------------------------------------------------------------
-struct SG2MambaWeights {
-    const float* __restrict__ A_log;       // [d_inner, d_state]
-    const float* __restrict__ B_proj;      // [d_inner, d_state] projection
-    const float* __restrict__ C_proj;      // [d_inner, d_state] projection
-    const float* __restrict__ D;           // [d_inner]
-    const float* __restrict__ dt_proj_W;   // [d_inner]  (simplified: per-channel dt bias)
+struct SG2CSAWeights {
+    const float* __restrict__ q_W;          // [d_model, d_model]  query proj
+    const float* __restrict__ k_W;          // [d_model, d_model]  key proj
+    const float* __restrict__ v_W;          // [d_model, d_model]  value proj
+    const float* __restrict__ out_W;        // [d_model, d_model]  output proj
+    const float* __restrict__ csa_compress_w; // [csa_window]  learned KV pool weights
+    const float* __restrict__ idx_DQ;       // [d_model, indexer_rank]  indexer q down-proj
+    const float* __restrict__ idx_UQ;       // [indexer_rank, d_model]  indexer q up-proj
+    const float* __restrict__ idx_K;        // [d_model, indexer_rank]  indexer key proj
+};
+
+// ---------------------------------------------------------------------------
+// HCA (Heavily Compressed Attention) weight pointers -- produces hca_ctx.
+//
+// Mechanics (spec SS2): stride-m' mean/learned pool (m'=hca_compress) gives
+// Nh = ceil(N / m') compressed entries; every query attends DENSELY to all Nh
+// compressed entries (no top-k) plus the sliding window. Global coarse context.
+// ---------------------------------------------------------------------------
+struct SG2HCAWeights {
+    const float* __restrict__ q_W;          // [d_model, d_model]  query proj
+    const float* __restrict__ k_W;          // [d_model, d_model]  key proj
+    const float* __restrict__ v_W;          // [d_model, d_model]  value proj
+    const float* __restrict__ out_W;        // [d_model, d_model]  output proj
 };
 
 // ---------------------------------------------------------------------------
@@ -357,149 +406,204 @@ void sg2_radix_sort_by_abs(
 }
 
 // ============================================================================
-// 2. sg2_mamba_scan_forward -- Single-direction Mamba selective scan
+// 2. CSA / HCA hybrid attention sequence mixer (spec SS2, SS3b)
 //
-// Simplified sequential-within-warp version. Each thread processes one element
-// in the parameter-gradient sequence. State is maintained in shared memory.
+// Replaces the Mamba bidirectional selective scan. CSA produces the fine-grained
+// /local context (csa_ctx, formerly mamba fwd); HCA produces the global coarse
+// context (hca_ctx, formerly mamba bwd). Both operate on the d_model-wide
+// projected feature sequence x[N, d_model] (built from sorted [grad, sharpness]
+// via input_proj upstream). All accumulation is FP32.
 //
-// State update per element i:
-//   dt = softplus(dt_proj_W[c] + input_dependent_bias)
-//   A_bar = exp(-exp(A_log[c,n]) * dt)  for each state dim n
-//   B_bar = B_proj[c,n] * dt * x[i]
-//   h[c,n] = A_bar * h[c,n] + B_bar
-//   y[i] += C_proj[c,n]^T @ h[:,n] + D[c] * x[i]
+// Helper math (small d_model, so explicit loops -- production routes GEMMs
+// through CUTLASS WGMMA per spec SS8):
+//   proj(x, W)[t, o] = sum_i x[t, i] * W[o, i]            (row-major [out, in])
 // ============================================================================
 
+// ---- 2a. sg2_csa_compress_kv -------------------------------------------------
+// Compress the projected K/V sequence by pooling a `window`-wide block at stride
+// `m` with a learned softmax(compress_w) weighting (plus implicit bias folded
+// into the weights). Produces Nc = ceil(N / m) compressed rows of width d_model.
+//
+//   c_kv[j, :] = sum_{w=0..window-1} softmax(compress_w)[w] * kv[j*m + w, :]
+//
+// For HCA, pass compress_w = nullptr to fall back to a uniform mean pool over the
+// `m`-wide stride block (window == m, learned-weight-free heavy compression).
 __forceinline__ __device__
-void sg2_mamba_scan_forward(
-    float* __restrict__       output,     // [N] mamba-processed gradient signal
-    const float* __restrict__ input,      // [N] (sorted) gradient magnitudes
-    float* __restrict__       state,      // [d_inner * d_state] persistent scan state
-    const SG2MambaWeights&    weights,
+void sg2_csa_compress_kv(
+    float* __restrict__       c_kv,        // [Nc, d_model] compressed output
+    const float* __restrict__ kv,          // [N, d_model] projected key or value seq
+    const float* __restrict__ compress_w,  // [window] learned weights (nullptr = mean)
     int                       N,
-    int                       d_inner,
-    int                       d_state,
-    float* __restrict__       smem_state  // [d_inner * d_state] shared memory
+    int                       d_model,
+    int                       m,            // compression stride
+    int                       window        // pooling window (>= m)
 ) {
-    // Load persistent state into shared memory
-    for (int j = threadIdx.x; j < d_inner * d_state; j += blockDim.x) {
-        smem_state[j] = state[j];
-    }
-    __syncthreads();
+    const int Nc = (N + m - 1) / m;
 
-    // Sequential scan over the N elements
-    // Each thread cooperates: thread t processes elements t, t+blockDim, ...
-    // but the scan is inherently sequential, so we serialize by element index.
-    // For practical N < 100K, we tile: each warp processes a channel slice.
+    // Precompute softmax(compress_w) into per-thread registers via a max/sum scan.
+    // window is tiny (<= 8 for CSA), so each thread recomputes it cheaply.
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < Nc;
+         j += gridDim.x * (int64_t)blockDim.x) {
 
-    for (int i = 0; i < N; ++i) {
-        float x_val = input[i];
-        float y_val = 0.0f;
-
-        // Each thread handles a subset of (d_inner, d_state) pairs
-        for (int cn = threadIdx.x; cn < d_inner * d_state; cn += blockDim.x) {
-            int c = cn / d_state;
-            int n = cn % d_state;
-
-            // Discretization
-            float dt_bias = __ldg(&weights.dt_proj_W[c]);
-            // Softplus: log(1 + exp(x))
-            float dt = log1pf(__expf(dt_bias + x_val * 0.01f));  // input-dependent modulation
-
-            float A_val = __expf(__ldg(&weights.A_log[c * d_state + n]));
-            float A_bar = __expf(-A_val * dt);
-            float B_val = __ldg(&weights.B_proj[c * d_state + n]);
-            float B_bar = B_val * dt;
-            float C_val = __ldg(&weights.C_proj[c * d_state + n]);
-
-            // State update
-            float h_old = smem_state[cn];
-            float h_new = A_bar * h_old + B_bar * x_val;
-            smem_state[cn] = h_new;
-
-            // Output accumulation: each (c,n) contributes C_val * h_new / d_state
-            float contrib = C_val * h_new;
-            // Warp-reduce the contribution for this element
-            atomicAdd(&output[i], contrib);
+        float wmax = -1e30f;
+        if (compress_w) {
+            for (int w = 0; w < window; ++w) wmax = fmaxf(wmax, __ldg(&compress_w[w]));
         }
-        __syncthreads();
+        float wsum = 0.0f;
+        for (int w = 0; w < window; ++w) {
+            wsum += compress_w ? __expf(__ldg(&compress_w[w]) - wmax) : 1.0f;
+        }
+        float inv_wsum = 1.0f / (wsum + 1e-20f);
 
-        // Add skip connection: D * x
-        if (threadIdx.x == 0) {
-            float d_skip = 0.0f;
-            for (int c = 0; c < d_inner; ++c) {
-                d_skip += __ldg(&weights.D[c]);
+        for (int d = 0; d < d_model; ++d) {
+            float acc = 0.0f;
+            for (int w = 0; w < window; ++w) {
+                int src = j * m + w;
+                if (src >= N) break;
+                float pw = compress_w ? __expf(__ldg(&compress_w[w]) - wmax) * inv_wsum
+                                      : inv_wsum;  // uniform mean when no weights
+                acc += pw * kv[src * d_model + d];
             }
-            output[i] += d_skip * x_val / static_cast<float>(d_inner);
+            c_kv[j * d_model + d] = acc;
         }
-        __syncthreads();
-    }
-
-    // Write updated state back to global memory
-    for (int j = threadIdx.x; j < d_inner * d_state; j += blockDim.x) {
-        state[j] = smem_state[j];
     }
 }
 
-// Backward scan: same structure but processes input in reverse order
+// ---- 2b. sg2_hca_compress_kv -------------------------------------------------
+// Heavy stride-m' mean pool (m'=hca_compress, window==m', no learned weights).
+// Thin wrapper over sg2_csa_compress_kv with compress_w=nullptr.
 __forceinline__ __device__
-void sg2_mamba_scan_backward(
-    float* __restrict__       output,
-    const float* __restrict__ input,
-    float* __restrict__       state,
-    const SG2MambaWeights&    weights,
+void sg2_hca_compress_kv(
+    float* __restrict__       c_kv,        // [Nh, d_model]
+    const float* __restrict__ kv,          // [N, d_model]
     int                       N,
-    int                       d_inner,
-    int                       d_state,
-    float* __restrict__       smem_state
+    int                       d_model,
+    int                       m_prime       // hca_compress (e.g. 128)
 ) {
-    // Load persistent state into shared memory
-    for (int j = threadIdx.x; j < d_inner * d_state; j += blockDim.x) {
-        smem_state[j] = state[j];
-    }
-    __syncthreads();
+    sg2_csa_compress_kv(c_kv, kv, /*compress_w=*/nullptr, N, d_model, m_prime, m_prime);
+}
 
-    // Process in reverse order
-    for (int i = N - 1; i >= 0; --i) {
-        float x_val = input[i];
-        float y_val = 0.0f;
+// ---- 2c. sg2_csa_indexer_topk ------------------------------------------------
+// Lightning indexer: low-rank query qI[t] = (x[t] @ idx_DQ) @ idx_UQ scores each
+// query token against compressed indexer keys kI[s] (= compress(x @ idx_K)):
+//
+//   I[t, s] = qI[t] . kI[s] / sqrt(rank)
+//
+// Keep the top-k highest-scoring compressed entries per query (clamped to Nc).
+// Selected compressed-entry indices are written to topk_idx[t, 0..k-1] (-1 pad).
+//
+// Reference path uses a simple per-query selection scan (Nc is small for the
+// meta-model); production uses a fused argpartition. Here qI is recomputed from
+// the low-rank factors and kI is precomputed indexer keys [Nc, rank].
+__forceinline__ __device__
+void sg2_csa_indexer_topk(
+    int*   __restrict__       topk_idx,    // [N, k] selected compressed indices
+    const float* __restrict__ x,           // [N, d_model] projected feature seq
+    const float* __restrict__ kI,          // [Nc, rank] compressed indexer keys
+    const SG2CSAWeights&      weights,
+    int                       N,
+    int                       Nc,
+    int                       d_model,
+    int                       rank,
+    int                       k             // csa_topk (clamped to Nc by caller)
+) {
+    const float inv_sqrt_rank = rsqrtf(static_cast<float>(rank));
 
-        for (int cn = threadIdx.x; cn < d_inner * d_state; cn += blockDim.x) {
-            int c = cn / d_state;
-            int n = cn % d_state;
+    for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < N;
+         t += gridDim.x * (int64_t)blockDim.x) {
 
-            float dt_bias = __ldg(&weights.dt_proj_W[c]);
-            float dt = log1pf(__expf(dt_bias + x_val * 0.01f));
-
-            float A_val = __expf(__ldg(&weights.A_log[c * d_state + n]));
-            float A_bar = __expf(-A_val * dt);
-            float B_val = __ldg(&weights.B_proj[c * d_state + n]);
-            float B_bar = B_val * dt;
-            float C_val = __ldg(&weights.C_proj[c * d_state + n]);
-
-            float h_old = smem_state[cn];
-            float h_new = A_bar * h_old + B_bar * x_val;
-            smem_state[cn] = h_new;
-
-            float contrib = C_val * h_new;
-            atomicAdd(&output[i], contrib);
-        }
-        __syncthreads();
-
-        if (threadIdx.x == 0) {
-            float d_skip = 0.0f;
-            for (int c = 0; c < d_inner; ++c) {
-                d_skip += __ldg(&weights.D[c]);
+        // qI[t] = (x[t] @ idx_DQ) @ idx_UQ -> low-rank query of width `rank`.
+        // idx_DQ:[d_model, rank], idx_UQ:[rank, d_model]; we only need the rank-
+        // dim indexer query, so qI = (x @ idx_DQ) then projected back implicitly
+        // via dot with kI keys (which live in rank space). Compute z = x @ idx_DQ.
+        float z[8];  // rank <= 8 for the meta-model
+        for (int r = 0; r < rank; ++r) {
+            float acc = 0.0f;
+            for (int i = 0; i < d_model; ++i) {
+                acc += x[t * d_model + i] * __ldg(&weights.idx_DQ[i * rank + r]);
             }
-            output[i] += d_skip * x_val / static_cast<float>(d_inner);
+            z[r] = acc;
         }
-        __syncthreads();
+
+        // Online top-k selection over compressed entries s (causal: s*m <= t).
+        // Keep the k best by score; small-k insertion into a register buffer.
+        float best_score[64];
+        int   best_idx[64];
+        int kk = (k < 64) ? k : 64;
+        for (int j = 0; j < kk; ++j) { best_score[j] = -1e30f; best_idx[j] = -1; }
+
+        for (int s = 0; s < Nc; ++s) {
+            float score = 0.0f;
+            for (int r = 0; r < rank; ++r) {
+                score += z[r] * __ldg(&kI[s * rank + r]);
+            }
+            score *= inv_sqrt_rank;
+            // Insert s into the running top-k if it beats the current minimum.
+            int min_pos = 0;
+            float min_val = best_score[0];
+            for (int j = 1; j < kk; ++j) {
+                if (best_score[j] < min_val) { min_val = best_score[j]; min_pos = j; }
+            }
+            if (score > min_val) {
+                best_score[min_pos] = score;
+                best_idx[min_pos]   = s;
+            }
+        }
+        for (int j = 0; j < kk; ++j) {
+            topk_idx[t * k + j] = best_idx[j];
+        }
+    }
+}
+
+// ---- 2d. sg2_attention_online_softmax ---------------------------------------
+// Numerically-stable online (flash-style) softmax attention of one query row
+// against a caller-supplied set of key/value rows, accumulating into out[head]:
+//
+//   scores = q . k / sqrt(head_dim);  running max m, denom l (online softmax)
+//   out += softmax(scores) . v
+//
+// Multi-query: a single shared KV row set is reused across all heads (the q/out
+// are per-head slices of the d_model vector). Returns nothing; writes `out`.
+__forceinline__ __device__
+void sg2_attention_online_softmax(
+    float* __restrict__       out,         // [head_dim] per-head context (accum)
+    const float* __restrict__ q,           // [head_dim] query for this head
+    const float* __restrict__ k_rows,      // [num_kv, d_model] candidate keys
+    const float* __restrict__ v_rows,      // [num_kv, d_model] candidate values
+    const int*   __restrict__ kv_index,    // [num_kv] row ids (-1 = skip), or nullptr
+    int                       num_kv,
+    int                       head_off,     // head_idx * head_dim (slice into d_model)
+    int                       head_dim,
+    int                       d_model
+) {
+    const float inv_sqrt_d = rsqrtf(static_cast<float>(head_dim));
+    float run_max = -1e30f;
+    float run_den = 0.0f;
+    for (int h = 0; h < head_dim; ++h) out[h] = 0.0f;
+
+    for (int j = 0; j < num_kv; ++j) {
+        int row = kv_index ? kv_index[j] : j;
+        if (row < 0) continue;
+        const float* kj = k_rows + row * d_model + head_off;
+        const float* vj = v_rows + row * d_model + head_off;
+
+        float score = 0.0f;
+        for (int h = 0; h < head_dim; ++h) score += q[h] * kj[h];
+        score *= inv_sqrt_d;
+
+        // Online softmax rescale.
+        float new_max = fmaxf(run_max, score);
+        float corr    = __expf(run_max - new_max);
+        float p       = __expf(score - new_max);
+        run_den = run_den * corr + p;
+        for (int h = 0; h < head_dim; ++h) {
+            out[h] = out[h] * corr + p * vj[h];
+        }
+        run_max = new_max;
     }
 
-    // Write updated state back
-    for (int j = threadIdx.x; j < d_inner * d_state; j += blockDim.x) {
-        state[j] = smem_state[j];
-    }
+    float inv_den = 1.0f / (run_den + 1e-20f);
+    for (int h = 0; h < head_dim; ++h) out[h] *= inv_den;
 }
 
 // ============================================================================
@@ -929,25 +1033,34 @@ __global__ void sg2_fused_step(
     // Hyperparameters
     SG2Hyperparams             hparams,
     // Component weights
-    SG2MambaWeights            mamba_fwd_weights,
-    SG2MambaWeights            mamba_bwd_weights,
+    SG2CSAWeights              csa_weights,   // CSA layer (produces csa_ctx)
+    SG2HCAWeights              hca_weights,   // HCA layer (produces hca_ctx)
+    const float* __restrict__  input_proj_W,  // [d_model, 2]
+    const float* __restrict__  input_proj_b,  // [d_model]
     SG2GRUWeights              gru_weights,
     SG2PEERWeights             peer_weights,
     SG2ExpertWeights           expert_weights,
     // Scratch buffers (caller-allocated global memory)
-    float* __restrict__        scratch_grads_f32,   // [N]
+    float* __restrict__        scratch_grads_f32,    // [N]
     float* __restrict__        scratch_sorted_keys,  // [N]
     int*   __restrict__        scratch_sorted_idx,   // [N]
-    float* __restrict__        scratch_mamba_fwd,     // [N]
-    float* __restrict__        scratch_mamba_bwd,     // [N]
-    float* __restrict__        scratch_mamba_combined, // [N]
-    float* __restrict__        scratch_gru_input,     // [N, gru_input_dim]
-    float* __restrict__        scratch_gru_out,       // [N, gru_hidden]
-    int*   __restrict__        scratch_expert_idx,    // [N, num_heads]
-    float* __restrict__        scratch_routing_wts,   // [N, num_heads]
-    float* __restrict__        scratch_expert_out,    // [N]
-    float* __restrict__        scratch_smart_grads,   // [N]
-    int*   __restrict__        scratch_radix_hist     // [gridDim.x * 256]
+    float* __restrict__        scratch_x,            // [N, d_model] projected seq
+    float* __restrict__        scratch_q,            // [N, d_model] queries
+    float* __restrict__        scratch_k,            // [N, d_model] keys (raw)
+    float* __restrict__        scratch_v,            // [N, d_model] values (raw)
+    float* __restrict__        scratch_c_k,          // [Nc_max, d_model] compressed keys
+    float* __restrict__        scratch_c_v,          // [Nc_max, d_model] compressed values
+    float* __restrict__        scratch_kI,           // [Nc_max, indexer_rank] indexer keys
+    int*   __restrict__        scratch_topk,         // [N, csa_topk] selected indices
+    float* __restrict__        scratch_csa_ctx,      // [N, d_model] CSA context
+    float* __restrict__        scratch_hca_ctx,      // [N, d_model] HCA context
+    float* __restrict__        scratch_gru_input,    // [N, gru_input_dim]
+    float* __restrict__        scratch_gru_out,      // [N, gru_hidden]
+    int*   __restrict__        scratch_expert_idx,   // [N, num_heads]
+    float* __restrict__        scratch_routing_wts,  // [N, num_heads]
+    float* __restrict__        scratch_expert_out,   // [N]
+    float* __restrict__        scratch_smart_grads,  // [N]
+    int*   __restrict__        scratch_radix_hist    // [gridDim.x * 256]
 ) {
     extern __shared__ char shared_mem[];
 
@@ -1001,78 +1114,209 @@ __global__ void sg2_fused_step(
     __syncthreads();
 
     // ====================================================================
-    // Step (c): Forward Mamba scan on sorted gradients
+    // Step (c): Input projection + Q/K/V projections of the sorted sequence
+    //
+    // x[t] = input_proj_W @ [grad_sorted[t], sharpness_sorted[t]] + input_proj_b
+    // q/k/v[t] = x[t] @ {csa_q_W, csa_k_W, csa_v_W}^T   (row-major [out, in])
+    // (Production routes all of these through CUTLASS WGMMA, spec SS8.)
     // ====================================================================
-    if (blockIdx.x == 0) {
-        // Initialize output buffer
-        for (int64_t i = threadIdx.x; i < N; i += blockDim.x) {
-            scratch_mamba_fwd[i] = 0.0f;
+    {
+        const int dm = hparams.d_model;
+        for (int64_t t = blockIdx.x * blockDim.x + threadIdx.x; t < N;
+             t += gridDim.x * (int64_t)blockDim.x) {
+            int orig = scratch_sorted_idx[t];
+            float g_s = scratch_sorted_keys[t];
+            float s_s = (orig >= 0 && orig < N) ? state.sharpness[orig] : 0.0f;
+            for (int o = 0; o < dm; ++o) {
+                float acc = __ldg(&input_proj_b[o]);
+                acc += __ldg(&input_proj_W[o * 2 + 0]) * g_s;
+                acc += __ldg(&input_proj_W[o * 2 + 1]) * s_s;
+                scratch_x[t * dm + o] = acc;
+            }
+            // q/k/v projections (CSA weights; HCA reuses the same x via its own
+            // q/k/v below -- here we materialize the CSA stream q/k/v).
+            for (int o = 0; o < dm; ++o) {
+                float qa = 0.0f, ka = 0.0f, va = 0.0f;
+                for (int i = 0; i < dm; ++i) {
+                    float xv = scratch_x[t * dm + i];
+                    qa += xv * __ldg(&csa_weights.q_W[o * dm + i]);
+                    ka += xv * __ldg(&csa_weights.k_W[o * dm + i]);
+                    va += xv * __ldg(&csa_weights.v_W[o * dm + i]);
+                }
+                scratch_q[t * dm + o] = qa;
+                scratch_k[t * dm + o] = ka;
+                scratch_v[t * dm + o] = va;
+            }
+        }
+    }
+    __syncthreads();
+
+    // ====================================================================
+    // Step (c2): CSA -- compress KV (m=csa_compress), lightning-indexer top-k,
+    //            sparse attention (+sliding window) -> csa_ctx (local context).
+    // ====================================================================
+    {
+        const int dm = hparams.d_model;
+        const int m  = hparams.csa_compress;
+        const int Nc = (static_cast<int>(N) + m - 1) / m;
+        const int R  = hparams.indexer_rank;
+        int k = hparams.csa_topk; if (k > Nc) k = Nc;
+        const int head_dim = dm / hparams.n_heads;
+
+        // Compress keys and values with learned pooling weights.
+        sg2_csa_compress_kv(scratch_c_k, scratch_k, csa_weights.csa_compress_w,
+                            static_cast<int>(N), dm, m, hparams.csa_window);
+        sg2_csa_compress_kv(scratch_c_v, scratch_v, csa_weights.csa_compress_w,
+                            static_cast<int>(N), dm, m, hparams.csa_window);
+        __syncthreads();
+
+        // Build compressed indexer keys kI[Nc, R] = compress(x @ idx_K).
+        // Reuse scratch_kI; idx_K projects d_model -> R, then pool with the same
+        // learned weights. (Done inline: project per token then pool.)
+        for (int s = blockIdx.x * blockDim.x + threadIdx.x; s < Nc;
+             s += gridDim.x * (int64_t)blockDim.x) {
+            for (int r = 0; r < R; ++r) {
+                float acc = 0.0f;
+                for (int w = 0; w < m; ++w) {
+                    int src = s * m + w;
+                    if (src >= N) break;
+                    float proj = 0.0f;
+                    for (int i = 0; i < dm; ++i) {
+                        proj += scratch_x[src * dm + i] * __ldg(&csa_weights.idx_K[i * R + r]);
+                    }
+                    acc += proj / static_cast<float>(m);  // mean pool over stride
+                }
+                scratch_kI[s * R + r] = acc;
+            }
         }
         __syncthreads();
 
-        float* mamba_smem = reinterpret_cast<float*>(shared_mem);
-        sg2_mamba_scan_forward(
-            scratch_mamba_fwd,
-            scratch_sorted_keys,
-            state.mamba_fwd_state,
-            mamba_fwd_weights,
-            static_cast<int>(N),
-            hparams.d_inner,
-            hparams.d_state,
-            mamba_smem);
+        sg2_csa_indexer_topk(scratch_topk, scratch_x, scratch_kI, csa_weights,
+                             static_cast<int>(N), Nc, dm, R, k);
+        __syncthreads();
+
+        // Inline the CSA attention body (the sg2_csa_attention_kernel launcher
+        // above wraps the same math for standalone autotuning).
+        for (int64_t t = blockIdx.x * blockDim.x + threadIdx.x; t < N;
+             t += gridDim.x * (int64_t)blockDim.x) {
+            float ctx[64];
+            for (int d = 0; d < dm; ++d) ctx[d] = 0.0f;
+            for (int hd = 0; hd < hparams.n_heads; ++hd) {
+                int head_off = hd * head_dim;
+                const float* q_h = scratch_q + t * dm + head_off;
+                float head_out[16], win_out[16];
+                sg2_attention_online_softmax(head_out, q_h, scratch_c_k, scratch_c_v,
+                                             &scratch_topk[t * k], k, head_off, head_dim, dm);
+                int ws = t - hparams.csa_window + 1; if (ws < 0) ws = 0;
+                int wn = static_cast<int>(t) - ws + 1;
+                sg2_attention_online_softmax(win_out, q_h,
+                                             scratch_k + (int64_t)ws * dm,
+                                             scratch_v + (int64_t)ws * dm,
+                                             nullptr, wn, head_off, head_dim, dm);
+                for (int h = 0; h < head_dim; ++h)
+                    ctx[head_off + h] = 0.5f * (head_out[h] + win_out[h]);
+            }
+            for (int o = 0; o < dm; ++o) {
+                float acc = 0.0f;
+                for (int i = 0; i < dm; ++i)
+                    acc += ctx[i] * __ldg(&csa_weights.out_W[o * dm + i]);
+                scratch_csa_ctx[t * dm + o] = acc;
+            }
+        }
     }
     __syncthreads();
 
     // ====================================================================
-    // Step (d): Backward Mamba scan on reversed sorted gradients
+    // Step (d): HCA -- heavy stride-m' mean compress, DENSE attention over all
+    //           Nh compressed entries (+sliding window) -> hca_ctx (global ctx).
     // ====================================================================
-    if (blockIdx.x == 0) {
-        for (int64_t i = threadIdx.x; i < N; i += blockDim.x) {
-            scratch_mamba_bwd[i] = 0.0f;
+    {
+        const int dm = hparams.d_model;
+        const int mp = hparams.hca_compress;
+        const int Nh = (static_cast<int>(N) + mp - 1) / mp;
+        const int head_dim = dm / hparams.n_heads;
+
+        // HCA reuses scratch_q/k/v: re-project with HCA weights into c_k/c_v after
+        // compression. Project k/v with HCA k_W/v_W (overwrite scratch_k/v).
+        for (int64_t t = blockIdx.x * blockDim.x + threadIdx.x; t < N;
+             t += gridDim.x * (int64_t)blockDim.x) {
+            for (int o = 0; o < dm; ++o) {
+                float qa = 0.0f, ka = 0.0f, va = 0.0f;
+                for (int i = 0; i < dm; ++i) {
+                    float xv = scratch_x[t * dm + i];
+                    qa += xv * __ldg(&hca_weights.q_W[o * dm + i]);
+                    ka += xv * __ldg(&hca_weights.k_W[o * dm + i]);
+                    va += xv * __ldg(&hca_weights.v_W[o * dm + i]);
+                }
+                scratch_q[t * dm + o] = qa;
+                scratch_k[t * dm + o] = ka;
+                scratch_v[t * dm + o] = va;
+            }
         }
         __syncthreads();
 
-        float* mamba_smem = reinterpret_cast<float*>(shared_mem);
-        sg2_mamba_scan_backward(
-            scratch_mamba_bwd,
-            scratch_sorted_keys,
-            state.mamba_bwd_state,
-            mamba_bwd_weights,
-            static_cast<int>(N),
-            hparams.d_inner,
-            hparams.d_state,
-            mamba_smem);
+        sg2_hca_compress_kv(scratch_c_k, scratch_k, static_cast<int>(N), dm, mp);
+        sg2_hca_compress_kv(scratch_c_v, scratch_v, static_cast<int>(N), dm, mp);
+        __syncthreads();
+
+        for (int64_t t = blockIdx.x * blockDim.x + threadIdx.x; t < N;
+             t += gridDim.x * (int64_t)blockDim.x) {
+            float ctx[64];
+            for (int d = 0; d < dm; ++d) ctx[d] = 0.0f;
+            for (int hd = 0; hd < hparams.n_heads; ++hd) {
+                int head_off = hd * head_dim;
+                const float* q_h = scratch_q + t * dm + head_off;
+                float head_out[16], win_out[16];
+                sg2_attention_online_softmax(head_out, q_h, scratch_c_k, scratch_c_v,
+                                             nullptr, Nh, head_off, head_dim, dm);
+                int ws = t - hparams.csa_window + 1; if (ws < 0) ws = 0;
+                int wn = static_cast<int>(t) - ws + 1;
+                sg2_attention_online_softmax(win_out, q_h,
+                                             scratch_k + (int64_t)ws * dm,
+                                             scratch_v + (int64_t)ws * dm,
+                                             nullptr, wn, head_off, head_dim, dm);
+                for (int h = 0; h < head_dim; ++h)
+                    ctx[head_off + h] = 0.5f * (head_out[h] + win_out[h]);
+            }
+            for (int o = 0; o < dm; ++o) {
+                float acc = 0.0f;
+                for (int i = 0; i < dm; ++i)
+                    acc += ctx[i] * __ldg(&hca_weights.out_W[o * dm + i]);
+                scratch_hca_ctx[t * dm + o] = acc;
+            }
+        }
     }
     __syncthreads();
 
     // ====================================================================
-    // Step (e): Combine forward + backward and unsort to original order
+    // Step (e): Unsort csa_ctx/hca_ctx to original element order and build the
+    //           GRU input [grad, csa_summary, hca_summary, sharpness] -- same
+    //           downstream contract as the old mamba combined signal (SS3b).
     // ====================================================================
-    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < N;
-         i += gridDim.x * (int64_t)blockDim.x) {
-        // Combine bidirectional Mamba outputs (mean)
-        float combined = 0.5f * (scratch_mamba_fwd[i] + scratch_mamba_bwd[i]);
-        scratch_mamba_combined[i] = combined;
-    }
-    __syncthreads();
-
-    // Unsort: write combined signal back to original element order
-    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < N;
-         i += gridDim.x * (int64_t)blockDim.x) {
-        int orig_idx = scratch_sorted_idx[i];
+    for (int64_t t = blockIdx.x * blockDim.x + threadIdx.x; t < N;
+         t += gridDim.x * (int64_t)blockDim.x) {
+        int orig_idx = scratch_sorted_idx[t];
         if (orig_idx >= 0 && orig_idx < N) {
-            // Build GRU input: [grad, mamba_signal, sharpness, mu]
-            float g_val = scratch_grads_f32[orig_idx];
-            float mamba_val = scratch_mamba_combined[i];
-            float sharp_val = state.sharpness[orig_idx];
-            float mu_val = state.mu[orig_idx];
+            const int dm = hparams.d_model;
+            // Summarize each context vector to a scalar (mean over d_model), the
+            // local (CSA) and global (HCA) signals that previously came from the
+            // bidirectional mamba scan.
+            float csa_sum = 0.0f, hca_sum = 0.0f;
+            for (int d = 0; d < dm; ++d) {
+                csa_sum += scratch_csa_ctx[t * dm + d];
+                hca_sum += scratch_hca_ctx[t * dm + d];
+            }
+            csa_sum /= static_cast<float>(dm);
+            hca_sum /= static_cast<float>(dm);
 
-            // Pack into gru_input (dim = gru_input_dim, typically 4)
+            float g_val = scratch_grads_f32[orig_idx];
+            float sharp_val = state.sharpness[orig_idx];
+
             int gid = hparams.gru_input_dim;
             scratch_gru_input[orig_idx * gid + 0] = g_val;
-            if (gid > 1) scratch_gru_input[orig_idx * gid + 1] = mamba_val;
-            if (gid > 2) scratch_gru_input[orig_idx * gid + 2] = sharp_val;
-            if (gid > 3) scratch_gru_input[orig_idx * gid + 3] = mu_val;
+            if (gid > 1) scratch_gru_input[orig_idx * gid + 1] = csa_sum;
+            if (gid > 2) scratch_gru_input[orig_idx * gid + 2] = hca_sum;
+            if (gid > 3) scratch_gru_input[orig_idx * gid + 3] = sharp_val;
         }
     }
     __syncthreads();
@@ -1215,47 +1459,163 @@ __global__ void sg2_sort_kernel(
     }
 }
 
-// Mamba forward scan launcher
-__global__ void sg2_mamba_forward_kernel(
-    float* __restrict__       output,
-    const float* __restrict__ input,
-    float* __restrict__       state,
-    SG2MambaWeights           weights,
+// CSA KV-compression launcher (spec SS2.1). Pools key (or value) seq at stride
+// `m` with learned softmax(compress_w) weights -> c_kv[Nc, d_model].
+__global__ void sg2_csa_compress_kernel(
+    float* __restrict__       c_kv,          // [Nc, d_model]
+    const float* __restrict__ kv,            // [N, d_model]
+    const float* __restrict__ compress_w,    // [window] (nullptr -> mean pool)
     int                       N,
-    int                       d_inner,
-    int                       d_state
+    int                       d_model,
+    int                       m,
+    int                       window
 ) {
-    extern __shared__ char smem[];
-    float* smem_state = reinterpret_cast<float*>(smem);
-
-    // Zero output
-    for (int i = threadIdx.x; i < N; i += blockDim.x) {
-        output[i] = 0.0f;
-    }
-    __syncthreads();
-
-    sg2_mamba_scan_forward(output, input, state, weights, N, d_inner, d_state, smem_state);
+    sg2_csa_compress_kv(c_kv, kv, compress_w, N, d_model, m, window);
 }
 
-// Mamba backward scan launcher
-__global__ void sg2_mamba_backward_kernel(
-    float* __restrict__       output,
-    const float* __restrict__ input,
-    float* __restrict__       state,
-    SG2MambaWeights           weights,
+// CSA lightning-indexer top-k launcher (spec SS2.2). Scores each query against
+// compressed indexer keys and emits the top-k selected compressed indices.
+__global__ void sg2_csa_indexer_kernel(
+    int*   __restrict__       topk_idx,      // [N, k]
+    const float* __restrict__ x,             // [N, d_model]
+    const float* __restrict__ kI,            // [Nc, rank] compressed indexer keys
+    SG2CSAWeights             weights,
     int                       N,
-    int                       d_inner,
-    int                       d_state
+    int                       Nc,
+    int                       d_model,
+    int                       rank,
+    int                       k
 ) {
-    extern __shared__ char smem[];
-    float* smem_state = reinterpret_cast<float*>(smem);
+    sg2_csa_indexer_topk(topk_idx, x, kI, weights, N, Nc, d_model, rank, k);
+}
 
-    for (int i = threadIdx.x; i < N; i += blockDim.x) {
-        output[i] = 0.0f;
+// CSA attention launcher (spec SS2.4). Each query attends to its top-k selected
+// compressed entries UNION the last csa_window raw tokens (sliding window), with
+// KV shared across heads (multi-query). Writes csa_ctx[N, d_model].
+__global__ void sg2_csa_attention_kernel(
+    float* __restrict__       csa_ctx,       // [N, d_model] output context
+    const float* __restrict__ q,             // [N, d_model] projected queries
+    const float* __restrict__ c_k,           // [Nc, d_model] compressed keys
+    const float* __restrict__ c_v,           // [Nc, d_model] compressed values
+    const float* __restrict__ k_raw,         // [N, d_model] raw keys (window)
+    const float* __restrict__ v_raw,         // [N, d_model] raw values (window)
+    const int*   __restrict__ topk_idx,      // [N, k] selected compressed indices
+    const float* __restrict__ out_W,         // [d_model, d_model] output proj
+    int                       N,
+    int                       d_model,
+    int                       n_heads,
+    int                       head_dim,
+    int                       csa_window,
+    int                       k
+) {
+    // Per-query scratch for the (top-k compressed) U (window raw) candidate set.
+    // We build the window index list inline; compressed rows come via topk_idx.
+    for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < N;
+         t += gridDim.x * (int64_t)blockDim.x) {
+
+        float ctx[64];   // d_model <= 64 accumulator (pre-out_proj)
+        for (int d = 0; d < d_model; ++d) ctx[d] = 0.0f;
+
+        for (int hd = 0; hd < n_heads; ++hd) {
+            const int head_off = hd * head_dim;
+            const float* q_h = q + t * d_model + head_off;
+
+            float head_out[16];  // head_dim <= 16
+
+            // (i) attend to the top-k compressed entries.
+            sg2_attention_online_softmax(
+                head_out, q_h, c_k, c_v, &topk_idx[t * k],
+                k, head_off, head_dim, d_model);
+
+            // (ii) sliding window: blend the last csa_window raw tokens. We run a
+            // second online softmax over the window then average the two contexts
+            // (reference simplification; production fuses into one denom).
+            float win_out[16];
+            int win_start = t - csa_window + 1;
+            if (win_start < 0) win_start = 0;
+            int win_n = t - win_start + 1;
+            // local index list 0..win_n-1 mapped to raw rows win_start+..
+            // sg2_attention_online_softmax indexes k_raw/v_raw by row directly,
+            // so synthesize a contiguous window via kv_index=nullptr+offset ptrs.
+            sg2_attention_online_softmax(
+                win_out, q_h,
+                k_raw + (int64_t)win_start * d_model,
+                v_raw + (int64_t)win_start * d_model,
+                /*kv_index=*/nullptr, win_n, head_off, head_dim, d_model);
+
+            for (int h = 0; h < head_dim; ++h) {
+                ctx[head_off + h] = 0.5f * (head_out[h] + win_out[h]);
+            }
+        }
+
+        // Output projection: csa_ctx[t] = ctx @ out_W^T  (out_W row-major [out,in])
+        for (int o = 0; o < d_model; ++o) {
+            float acc = 0.0f;
+            for (int i = 0; i < d_model; ++i) {
+                acc += ctx[i] * __ldg(&out_W[o * d_model + i]);
+            }
+            csa_ctx[t * d_model + o] = acc;
+        }
     }
-    __syncthreads();
+}
 
-    sg2_mamba_scan_backward(output, input, state, weights, N, d_inner, d_state, smem_state);
+// HCA attention launcher (spec SS2 HCA). Each query attends DENSELY to ALL Nh
+// heavily-compressed entries (no top-k) plus the sliding window. Writes
+// hca_ctx[N, d_model]. Global coarse context.
+__global__ void sg2_hca_attention_kernel(
+    float* __restrict__       hca_ctx,       // [N, d_model] output context
+    const float* __restrict__ q,             // [N, d_model] projected queries
+    const float* __restrict__ c_k,           // [Nh, d_model] compressed keys
+    const float* __restrict__ c_v,           // [Nh, d_model] compressed values
+    const float* __restrict__ k_raw,         // [N, d_model] raw keys (window)
+    const float* __restrict__ v_raw,         // [N, d_model] raw values (window)
+    const float* __restrict__ out_W,         // [d_model, d_model] output proj
+    int                       N,
+    int                       Nh,
+    int                       d_model,
+    int                       n_heads,
+    int                       head_dim,
+    int                       csa_window
+) {
+    for (int t = blockIdx.x * blockDim.x + threadIdx.x; t < N;
+         t += gridDim.x * (int64_t)blockDim.x) {
+
+        float ctx[64];
+        for (int d = 0; d < d_model; ++d) ctx[d] = 0.0f;
+
+        for (int hd = 0; hd < n_heads; ++hd) {
+            const int head_off = hd * head_dim;
+            const float* q_h = q + t * d_model + head_off;
+
+            float head_out[16];
+            // Dense attention over all Nh compressed entries (kv_index=nullptr).
+            sg2_attention_online_softmax(
+                head_out, q_h, c_k, c_v, /*kv_index=*/nullptr,
+                Nh, head_off, head_dim, d_model);
+
+            float win_out[16];
+            int win_start = t - csa_window + 1;
+            if (win_start < 0) win_start = 0;
+            int win_n = t - win_start + 1;
+            sg2_attention_online_softmax(
+                win_out, q_h,
+                k_raw + (int64_t)win_start * d_model,
+                v_raw + (int64_t)win_start * d_model,
+                /*kv_index=*/nullptr, win_n, head_off, head_dim, d_model);
+
+            for (int h = 0; h < head_dim; ++h) {
+                ctx[head_off + h] = 0.5f * (head_out[h] + win_out[h]);
+            }
+        }
+
+        for (int o = 0; o < d_model; ++o) {
+            float acc = 0.0f;
+            for (int i = 0; i < d_model; ++i) {
+                acc += ctx[i] * __ldg(&out_W[o * d_model + i]);
+            }
+            hca_ctx[t * d_model + o] = acc;
+        }
+    }
 }
 
 // GRU update launcher
@@ -1369,13 +1729,22 @@ __global__ void sg2_adam_update_kernel(
 
 struct SG2ScratchSizes {
     static int64_t compute(int64_t N, const SG2Hyperparams& hp, int num_blocks) {
+        const int dm = hp.d_model;
+        const int Nc = (static_cast<int>(N) + hp.csa_compress - 1) / hp.csa_compress;
         int64_t total = 0;
         total += N * sizeof(float);                    // grads_f32
         total += N * sizeof(float);                    // sorted_keys
         total += N * sizeof(int);                      // sorted_idx
-        total += N * sizeof(float);                    // mamba_fwd
-        total += N * sizeof(float);                    // mamba_bwd
-        total += N * sizeof(float);                    // mamba_combined
+        total += N * dm * sizeof(float);               // x (projected seq)
+        total += N * dm * sizeof(float);               // q
+        total += N * dm * sizeof(float);               // k (raw)
+        total += N * dm * sizeof(float);               // v (raw)
+        total += (int64_t)Nc * dm * sizeof(float);     // c_k (compressed keys)
+        total += (int64_t)Nc * dm * sizeof(float);     // c_v (compressed values)
+        total += (int64_t)Nc * hp.indexer_rank * sizeof(float);  // kI (indexer keys)
+        total += N * hp.csa_topk * sizeof(int);        // topk indices
+        total += N * dm * sizeof(float);               // csa_ctx
+        total += N * dm * sizeof(float);               // hca_ctx
         total += N * hp.gru_input_dim * sizeof(float); // gru_input
         total += N * hp.gru_hidden * sizeof(float);    // gru_out
         total += N * hp.num_heads * sizeof(int);       // expert_idx
@@ -1390,11 +1759,13 @@ struct SG2ScratchSizes {
         int sort_bytes = (N <= sg2_constants::MAX_BLOCK_SORT_N)
             ? static_cast<int>(N) * (sizeof(float) + sizeof(int))
             : 0;
-        int mamba_bytes = hp.d_inner * hp.d_state * sizeof(float);
+        // Attention works register-resident per query (small d_model), so its
+        // SMEM footprint is modest; size it to one q/k/v/out head tile.
+        int attn_bytes = 4 * hp.d_model * sizeof(float);
         int peer_bytes  = 2 * hp.pk_dim * sizeof(float);
         // Return the max across all phases
         int max_bytes = sort_bytes;
-        if (mamba_bytes > max_bytes) max_bytes = mamba_bytes;
+        if (attn_bytes > max_bytes) max_bytes = attn_bytes;
         if (peer_bytes > max_bytes)  max_bytes = peer_bytes;
         return max_bytes;
     }

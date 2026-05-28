@@ -73,7 +73,35 @@ Every optimizer header follows this pattern:
 | SuperGrok 1.1 | ✓ | ✓ | ✓ | New |
 | SuperGrok 1.5 | ✓ | ✓ | ✓ | New |
 | Muon | ✓ | ✓ | ✓ | New (Newton-Schulz) |
-| SuperGrok v2 | ✓ | ✓ | ✓ | New (Mamba-3+PEER) |
+| SuperGrok v2 | ✓ | ✓ | ✓ | CSA/HCA hybrid attention + PEER + GRU |
+
+### SuperGrok v2 meta-model (CSA/HCA)
+
+SuperGrok v2 is a learned optimizer: it views a parameter tensor's flattened
+elements as a **sequence** and runs a small meta-net over it to produce a smart
+gradient, then applies an Adam-style update. The sequence mixer is a
+**DeepSeek-V4-style CSA/HCA hybrid attention** stack (replacing the previous
+Mamba-3 bidirectional selective scan). Per spec SS3b, only the mixer changed --
+the GRU + PEER routing + expert MLP + AdamW apply tail is kept verbatim.
+
+| Stage | What it does |
+|---|---|
+| input proj | `[grad, sharpness] -> d_model` per element |
+| **CSA** | Compressed Sparse Attention: KV compress `m=4` (learned pool) + lightning-indexer **top-k** selection (low-rank rank=4) + sliding window. Produces `csa_ctx` (fine/local context; was the mamba fwd scan). |
+| **HCA** | Heavily Compressed Attention: heavy KV compress `m'=128` (mean pool) + **dense** attention over all compressed entries + sliding window. Produces `hca_ctx` (global coarse context; was the mamba bwd scan). |
+| GRU | per-element temporal memory (input: `g, s, csa_ctx, hca_ctx`) — unchanged |
+| PEER | 4-head product-key expert routing — unchanged |
+| expert MLP | top-routed per-element expert (FP32 / INT8 / INT4 tiers) — unchanged |
+| AdamW apply | smart-gradient blended AdamW step — unchanged |
+
+Multi-query KV is shared across attention heads; all accumulation is FP32.
+Attention is **stateless across optimizer steps**, so (unlike the carried Mamba
+fwd/bwd state) only the GRU state persists — the reference `*State` structs drop
+the two mamba-state tensors (`num_state_tensors()` 7 -> 5). Per-arch reference
+files: `sm_90/supergrok2_sm90.cuh` (CSA/HCA via WGMMA-routed GEMMs in
+production), `gfx942/supergrok2_gfx942.hip.hpp` (rocBLAS/ATen GEMMs, 64-wide
+wavefront), `tpu/supergrok2_tpu.py` (reshape/mean compression, `jax.lax.top_k`
+indexer, `jnp.einsum` + `jax.nn.softmax` attention).
 
 ## Model Coverage
 

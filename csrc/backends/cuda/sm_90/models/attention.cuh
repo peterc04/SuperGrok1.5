@@ -703,6 +703,25 @@ __device__ __forceinline__ Affine2x2 ptx_affine_combine(
 #endif // GROK_CUDA || GROK_HIP
 // ── end inlined csrc/common/utils.cuh ──
 
+#ifdef WITH_CUTLASS
+// ── Sm90 (Hopper) warp-group collective GEMM headers ──────────────────────
+// Used by cutlass_fmha_forward below. The fused-MHA is realised as two Sm90
+// GemmUniversal calls (S = Q·Kᵀ, then O = P·V) with a softmax kernel between,
+// all FP32-accumulate. This emits real WGMMA/TMA instructions; the previous
+// FMHA path relied on the default the default device::Gemm (no arch tag) which has
+// no arch tag and silently compiled the Sm70 SIMT kernel (no tensor cores).
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
+#include <cute/tensor.hpp>
+#include <cutlass/gemm/device/gemm_universal_adapter.h>
+#include <cutlass/gemm/collective/collective_builder.hpp>
+#include <cutlass/gemm/kernel/gemm_universal.hpp>
+#include <cutlass/epilogue/collective/collective_builder.hpp>
+#endif // WITH_CUTLASS
+
 namespace sg { namespace sm90 { namespace models { namespace attention {
 
 // ── Launch configuration descriptor ────────────────────────────────────
@@ -802,6 +821,261 @@ smem_attention_fwd_kernel(
         out[base + idx] = static_cast<ActT>(acc);
     }
 }
+
+#ifdef WITH_CUTLASS
+// ─────────────────────────────────────────────────────────────────────────
+//  Sm90 collective FMHA forward (TMA + WGMMA, FP32 accumulate)
+//
+//  Implemented as two Sm90 GemmUniversal calls per (batch, head):
+//      S = Q · Kᵀ          (M=N=seq_len, K=head_dim)   -> FP32 scores
+//      softmax(S * scale)  (causal mask if kCausal)     -> FP32 probs P
+//      O = P · V           (M=seq_len, N=head_dim, K=seq_len)
+//  All matmuls accumulate in FP32 and emit Hopper WGMMA/TMA instructions via
+//  CollectiveBuilder<arch::Sm90, OpClassTensorOp, ...>. This replaces the old
+//  the default device::Gemm (no arch tag) default which compiled the Sm70 SIMT path.
+//
+//  A full single-kernel Sm90 fused-MHA collective is intentionally not inlined
+//  here (too large); the two-GEMM + softmax decomposition is clearly correct
+//  and shares the same WGMMA/TMA mainloop. The tiny-seq_len SMEM fallback
+//  kernel (non-CUTLASS path) is left untouched.
+// ─────────────────────────────────────────────────────────────────────────
+
+// Element trait: map activation type -> CUTLASS input element.
+template <typename ActT> struct cutlass_elem;
+template <> struct cutlass_elem<__half>        { using type = cutlass::half_t; };
+template <> struct cutlass_elem<__nv_bfloat16> { using type = cutlass::bfloat16_t; };
+
+// Per-thread CUTLASS workspace (lazily grown). Reused across calls.
+inline void* fmha_get_workspace(size_t bytes) {
+    static thread_local void*  ws_ptr   = nullptr;
+    static thread_local size_t ws_bytes = 0;
+    if (bytes > ws_bytes) {
+        if (ws_ptr) cudaFree(ws_ptr);
+        if (cudaMalloc(&ws_ptr, bytes) != cudaSuccess) {
+            ws_ptr = nullptr; ws_bytes = 0; return nullptr;
+        }
+        ws_bytes = bytes;
+    }
+    return ws_ptr;
+}
+
+// Generic Sm90 GEMM: C[MxN] = A[MxK] * B[KxN], FP32 out, FP32 accumulate.
+// A is RowMajor [M,K]. B layout is a template parameter:
+//   - ColumnMajor B + physical [N,K] row-major data  => computes A·Bᵀ (QKᵀ)
+//   - RowMajor    B + physical [K,N] row-major data  => computes A·B  (P·V)
+// strideB_dims = logical {N, K, 1} so the packed stride matches the physical
+// row-major [N,K] (QKᵀ) / [K,N] (PV) buffer respectively.
+template <typename ElementInput, typename LayoutBT>
+inline cudaError_t fmha_sm90_gemm(
+    int M, int N, int K,
+    const void* A, const void* B, float* C,
+    cudaStream_t stream)
+{
+    using ElementA   = ElementInput;
+    using ElementB   = ElementInput;
+    using ElementC   = float;
+    using ElementAcc = float;
+    using LayoutA    = cutlass::layout::RowMajor;
+    using LayoutB    = LayoutBT;
+    using LayoutC    = cutlass::layout::RowMajor;
+
+    constexpr int AlignA = 128 / cutlass::sizeof_bits<ElementA>::value;
+    constexpr int AlignB = 128 / cutlass::sizeof_bits<ElementB>::value;
+    constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementC>::value;
+
+    using TileShape    = cute::Shape<cute::_128, cute::_128, cute::_64>;
+    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+
+    using CollectiveEpilogue =
+        typename cutlass::epilogue::collective::CollectiveBuilder<
+            cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+            TileShape, ClusterShape,
+            cutlass::epilogue::collective::EpilogueTileAuto,
+            ElementAcc, ElementAcc,
+            ElementC, LayoutC, AlignC,
+            ElementC, LayoutC, AlignC,
+            cutlass::epilogue::collective::EpilogueScheduleAuto
+        >::CollectiveOp;
+
+    using CollectiveMainloop =
+        typename cutlass::gemm::collective::CollectiveBuilder<
+            cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+            ElementA, LayoutA, AlignA,
+            ElementB, LayoutB, AlignB,
+            ElementAcc,
+            TileShape, ClusterShape,
+            cutlass::gemm::collective::StageCountAutoCarveout<
+                static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+            cutlass::gemm::collective::KernelScheduleAuto
+        >::CollectiveOp;
+
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        cute::Shape<int, int, int, int>,
+        CollectiveMainloop, CollectiveEpilogue>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+
+    StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+    StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    StrideC stride_c = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
+
+    typename Gemm::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {M, N, K, 1},
+        { reinterpret_cast<const ElementA*>(A), stride_a,
+          reinterpret_cast<const ElementB*>(B), stride_b },
+        { {ElementAcc(1.0f), ElementAcc(0.0f)},
+          C, stride_c, C, stride_c }
+    };
+
+    Gemm op;
+    if (op.can_implement(args) != cutlass::Status::kSuccess)
+        return cudaErrorNotSupported;
+    size_t ws_size = Gemm::get_workspace_size(args);
+    void*  ws = (ws_size > 0) ? fmha_get_workspace(ws_size) : nullptr;
+    if (ws_size > 0 && ws == nullptr) return cudaErrorMemoryAllocation;
+    if (op.initialize(args, ws, stream) != cutlass::Status::kSuccess)
+        return cudaErrorUnknown;
+    return (op.run(stream) == cutlass::Status::kSuccess)
+               ? cudaSuccess : cudaErrorUnknown;
+}
+
+// In-place row-wise softmax of an [N x N] FP32 score matrix, scaled, with
+// optional causal mask. Casts the result into ActT probs buffer P.
+template <typename ActT, bool kCausal>
+__global__ void fmha_softmax_kernel(
+    const float* __restrict__ S,   // [N, N] raw scores (Q·Kᵀ)
+    ActT* __restrict__ P,          // [N, N] softmax probabilities (ActT)
+    float* __restrict__ lse,       // [N] log-sum-exp or nullptr
+    int N, float scale)
+{
+    int i = blockIdx.x;            // query row
+    if (i >= N) return;
+    extern __shared__ float sh[];  // N floats
+    int tid = threadIdx.x;
+
+    // load + mask + find max
+    float m = -1e30f;
+    for (int j = tid; j < N; j += blockDim.x) {
+        float v = S[i * N + j] * scale;
+        if (kCausal && j > i) v = -1e30f;
+        sh[j] = v;
+        m = fmaxf(m, v);
+    }
+    __syncthreads();
+    // block-wide max reduction (simple shared-mem tree over warps)
+    __shared__ float red[32];
+    for (int o = WARP_SIZE / 2; o > 0; o >>= 1)
+        m = fmaxf(m, SHFL_DOWN_SYNC(FULL_WARP_MASK, m, o));
+    if ((tid & (WARP_SIZE - 1)) == 0) red[tid / WARP_SIZE] = m;
+    __syncthreads();
+    if (tid == 0) {
+        float mm = -1e30f;
+        int nwarp = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
+        for (int w = 0; w < nwarp; w++) mm = fmaxf(mm, red[w]);
+        red[0] = mm;
+    }
+    __syncthreads();
+    float row_max = red[0];
+
+    // exp + sum
+    float s = 0.0f;
+    for (int j = tid; j < N; j += blockDim.x) {
+        float e = ptx_expf(sh[j] - row_max);
+        sh[j] = e;
+        s += e;
+    }
+    for (int o = WARP_SIZE / 2; o > 0; o >>= 1)
+        s += SHFL_DOWN_SYNC(FULL_WARP_MASK, s, o);
+    if ((tid & (WARP_SIZE - 1)) == 0) red[tid / WARP_SIZE] = s;
+    __syncthreads();
+    if (tid == 0) {
+        float ss = 0.0f;
+        int nwarp = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
+        for (int w = 0; w < nwarp; w++) ss += red[w];
+        red[0] = ss;
+    }
+    __syncthreads();
+    float row_sum = red[0];
+    float inv = 1.0f / fmaxf(row_sum, 1e-12f);
+
+    for (int j = tid; j < N; j += blockDim.x)
+        P[i * N + j] = static_cast<ActT>(sh[j] * inv);
+    if (lse != nullptr && tid == 0)
+        lse[i] = row_max + logf(fmaxf(row_sum, 1e-12f));
+}
+
+// Cast FP32 O accumulator -> ActT output.
+template <typename ActT>
+__global__ void fmha_cast_kernel(const float* __restrict__ src,
+                                 ActT* __restrict__ dst, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = static_cast<ActT>(src[idx]);
+}
+
+template <typename ActT, int kHeadDim, bool kCausal>
+cudaError_t cutlass_fmha_forward(
+    const ActT* q, const ActT* k, const ActT* v, ActT* out, ActT* softmax_lse,
+    int batch, int n_heads, int seq_len, float scale, cudaStream_t stream)
+{
+    using Elem = typename cutlass_elem<ActT>::type;
+    const int N  = seq_len;
+    const int D  = kHeadDim;
+    const int BH = batch * n_heads;
+    float* lse = reinterpret_cast<float*>(softmax_lse);
+
+    // Scratch: FP32 scores [N*N], ActT probs [N*N], FP32 O [N*D].
+    float* S = nullptr;  ActT* P = nullptr;  float* O = nullptr;
+    if (cudaMalloc(&S, sizeof(float) * (size_t)N * N) != cudaSuccess)
+        return cudaErrorMemoryAllocation;
+    if (cudaMalloc(&P, sizeof(ActT) * (size_t)N * N) != cudaSuccess) {
+        cudaFree(S); return cudaErrorMemoryAllocation;
+    }
+    if (cudaMalloc(&O, sizeof(float) * (size_t)N * D) != cudaSuccess) {
+        cudaFree(S); cudaFree(P); return cudaErrorMemoryAllocation;
+    }
+
+    cudaError_t err = cudaSuccess;
+    for (int bh = 0; bh < BH && err == cudaSuccess; ++bh) {
+        const ActT* qh = q + (size_t)bh * N * D;
+        const ActT* kh = k + (size_t)bh * N * D;
+        const ActT* vh = v + (size_t)bh * N * D;
+        ActT*       oh = out + (size_t)bh * N * D;
+
+        // S[N,N] = Q[N,D] · Kᵀ[D,N]. K is physically row-major [N,D]. Declaring
+        // the B operand ColumnMajor over logical {N(=GEMM-N), D(=GEMM-K)} makes
+        // CUTLASS read that same buffer as Kᵀ, so we get S[i,j]=Σ_d Q[i,d]K[j,d].
+        err = fmha_sm90_gemm<Elem, cutlass::layout::ColumnMajor>(
+            N, N, D, qh, kh, S, stream);
+        if (err != cudaSuccess) break;
+
+        // softmax over rows (scaled, optional causal mask) -> P (ActT)
+        int sm_block = 128;
+        size_t sm_smem = sizeof(float) * (size_t)N;
+        fmha_softmax_kernel<ActT, kCausal>
+            <<<N, sm_block, sm_smem, stream>>>(
+                S, P, lse ? lse + (size_t)bh * N : nullptr, N, scale);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) break;
+
+        // O[N,D] = P[N,N] · V[N,D]. V is row-major [N,D] = logical [K=N, N=D],
+        // so the B operand is RowMajor and read directly.
+        err = fmha_sm90_gemm<Elem, cutlass::layout::RowMajor>(
+            N, D, N, P, vh, O, stream);
+        if (err != cudaSuccess) break;
+
+        int total = N * D, cb = 256, cg = (total + cb - 1) / cb;
+        fmha_cast_kernel<ActT><<<cg, cb, 0, stream>>>(O, oh, total);
+        err = cudaGetLastError();
+    }
+
+    cudaFree(S); cudaFree(P); cudaFree(O);
+    return err;
+}
+#endif // WITH_CUTLASS
 
 // ── Forward dispatch ───────────────────────────────────────────────────
 template <typename ActT, int kHeadDim, bool kCausal>

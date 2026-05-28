@@ -11,7 +11,19 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include "csrc/algorithms/prodigy.h"
-#include "csrc/tuning.h"
+// ── Autotuner-consumable launch parameters (inlined; see compile.py) ──
+#ifndef SG_TUNED_BLOCK_SIZE
+#define SG_TUNED_BLOCK_SIZE 256
+#endif
+#ifndef SG_TUNED_VEC_WIDTH
+#define SG_TUNED_VEC_WIDTH 4
+#endif
+#ifndef SG_TUNED_UNROLL
+#define SG_TUNED_UNROLL 1
+#endif
+#ifndef SG_TUNED_ASYNC_DEPTH
+#define SG_TUNED_ASYNC_DEPTH 2
+#endif
 // ── inlined from former csrc/backends/cuda/sm_90/primitives.cuh ──
 // CUDA sm_90 (Hopper) primitives — shared across all 11 launch_*.cu files.
 //
@@ -1160,6 +1172,28 @@ void launch_prodigy_step(
                 d_t.data_ptr<float>(),
                 beta1, beta2, eps, wd, bc1, bc2, N);
         });
+}
+
+
+void launch_fused_prodigy_step(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor s, torch::Tensor param_init, torch::Tensor grad, float lr, float d_lr, float beta1, float beta2, float weight_decay, float eps, float bc1, float bc2
+) {
+    throw std::runtime_error(
+        "launch_fused_prodigy_step: CUDA sm_90 kernel not yet implemented.");
+}
+
+void launch_prodigy_dlr_reduce(
+    torch::Tensor grad, torch::Tensor param, torch::Tensor param_init, torch::Tensor s, torch::Tensor numerator, torch::Tensor denominator, float eps
+) {
+    throw std::runtime_error(
+        "launch_prodigy_dlr_reduce: CUDA sm_90 kernel not yet implemented.");
+}
+
+void launch_multi_tensor_prodigy_fused_reduce_step(
+    std::vector<torch::Tensor>& params, std::vector<torch::Tensor>& grads, std::vector<torch::Tensor>& param_inits, std::vector<torch::Tensor>& exp_avgs, std::vector<torch::Tensor>& exp_avg_sqs, std::vector<torch::Tensor>& s_bufs, std::vector<float>& bc1s, std::vector<float>& bc2s, torch::Tensor d_lr_buf, float beta1, float beta2, float lr, float wd, float eps
+) {
+    throw std::runtime_error(
+        "launch_multi_tensor_prodigy_fused_reduce_step: CUDA sm_90 kernel not yet implemented.");
 }
 
 }} // namespace sg::sm90
