@@ -17,6 +17,7 @@ struct ProdigyState {
 
 // ---------------------------------------------------------------------------
 // Wavefront-level reduction helper (sum) -- 64-wide wavefront on gfx942
+// Uses __shfl_xor for butterfly reduction across all 64 lanes.
 // ---------------------------------------------------------------------------
 __forceinline__ __device__
 float prodigy_wavefront_reduce_sum(float val) {
@@ -84,8 +85,8 @@ void prodigy_reduce(
 
     for (int64_t i = idx; i < n; i += stride) {
         // gfx942: non-temporal load for streaming grad reads
-        ParamT g_raw = __builtin_nontemporal_load(grads + i);
-        float g = to_float(g_raw);
+        ParamT g_raw = __builtin_nontemporal_load(&grads[i]);
+        float g = to_float<ParamT>(g_raw);
 
         if constexpr (NAN_POLICY == NanPolicy::kZero) {
             if (isnan(g)) g = 0.0f;
@@ -97,8 +98,8 @@ void prodigy_reduce(
             g = fminf(fmaxf(g, -clip_threshold), clip_threshold);
         }
 
-        ParamT p_raw = __builtin_nontemporal_load(params + i);
-        float p_f = to_float(p_raw);
+        ParamT p_raw = __builtin_nontemporal_load(&params[i]);
+        float p_f = to_float<ParamT>(p_raw);
         float p_init = state.param_init[i];
         float s_old = state.s[i];
 
@@ -157,8 +158,8 @@ void prodigy_update(
 
     for (int64_t i = idx; i < n; i += stride) {
         // gfx942: non-temporal load for streaming grad reads
-        ParamT g_raw = __builtin_nontemporal_load(grads + i);
-        float g = to_float(g_raw);
+        ParamT g_raw = __builtin_nontemporal_load(&grads[i]);
+        float g = to_float<ParamT>(g_raw);
 
         if constexpr (NAN_POLICY == NanPolicy::kZero) {
             if (isnan(g)) g = 0.0f;
@@ -170,7 +171,7 @@ void prodigy_update(
             g = fminf(fmaxf(g, -clip_threshold), clip_threshold);
         }
 
-        float p_f = to_float(params[i]);
+        float p_f = to_float<ParamT>(params[i]);
         float m_old = state.exp_avg[i];
         float v_old = state.exp_avg_sq[i];
 
@@ -227,7 +228,7 @@ void prodigy_update_vec4(
     for (int64_t i = idx; i < n4; i += stride) {
         float4 p_vec = p4[i];
         // Non-temporal load for streaming grad access on gfx942
-        float4 g_vec = __builtin_nontemporal_load(g4 + i);
+        float4 g_vec = __builtin_nontemporal_load(&g4[i]);
         float4 m_vec = m4[i];
         float4 v_vec = v4[i];
 

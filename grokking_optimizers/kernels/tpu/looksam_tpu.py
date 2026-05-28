@@ -1,4 +1,4 @@
-"""TPU/Pallas kernels for LookSAM — AdamW with sharpness-aware direction adjustment.
+"""TPU/Pallas kernels for LookSAM -- AdamW with sharpness-aware direction adjustment.
 
 Provides pure-JAX update functions and Pallas-accelerated TPU kernels for:
   - Standard AdamW parameter update
