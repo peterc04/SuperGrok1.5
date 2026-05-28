@@ -29,6 +29,7 @@
 // rocBLAS launcher's overhead. Not worth the maintenance burden.
 
 #include <torch/extension.h>
+#include "csrc/tuning.h"
 #include <vector>
 
 // ── inlined from former csrc/backends/hip/gfx942/primitives.hpp ──

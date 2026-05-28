@@ -17,6 +17,7 @@
 // bandwidth bound stays the same.
 
 #include <torch/extension.h>
+#include "csrc/tuning.h"
 #include <vector>
 
 // ── inlined from former csrc/backends/hip/gfx942/primitives.hpp ──

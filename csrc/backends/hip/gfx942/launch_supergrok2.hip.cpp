@@ -45,6 +45,7 @@
 // elementwise allclose validation against the sm_90 path on an MI300X.
 
 #include <torch/extension.h>
+#include "csrc/tuning.h"
 #include <ATen/ATen.h>
 #include <vector>
 #include <stdexcept>

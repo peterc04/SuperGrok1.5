@@ -11,6 +11,7 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include "csrc/algorithms/adamw.h"
+#include "csrc/tuning.h"
 // ── inlined from former csrc/backends/cuda/sm_90/primitives.cuh ──
 // CUDA sm_90 (Hopper) primitives — shared across all 11 launch_*.cu files.
 //
@@ -1110,8 +1111,8 @@ void launch_adamw_step(
     if (N == 0) return;
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    const int block = 256;
-    const int grid = std::min<int>(8192, (N + block - 1) / block);
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
 
     const bool all_fp32 = param.scalar_type() == torch::kFloat32 &&
                           grad.scalar_type() == torch::kFloat32;
@@ -1119,7 +1120,7 @@ void launch_adamw_step(
     if (all_fp32 && prim::is_vec4_alignable(param.data_ptr(), N) &&
         prim::is_vec4_alignable(grad.data_ptr(), N)) {
         const int N4 = N / 4;
-        const int grid4 = std::min<int>(8192, (N4 + block - 1) / block);
+        const int grid4 = std::min<int>(65535, (N4 + block - 1) / block);
         adamw_kernel_vec4_fp32<<<grid4, block, 0, stream>>>(
             reinterpret_cast<float4*>(param.data_ptr<float>()),
             reinterpret_cast<float4*>(exp_avg.data_ptr<float>()),
