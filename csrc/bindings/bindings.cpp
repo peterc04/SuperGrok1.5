@@ -203,7 +203,12 @@ void grokadamw_fused_step(
  std::vector<float> bc1_vec, bc2_vec;
  for (size_t i = 0; i < n_params; i++) {
  if (!grads[i].defined() || grads[i].numel() == 0) continue;
- steps[i] += 1;
+ // NOTE: the Python optimizer owns the step counter (state["step"] += 1
+ // before this call), matching fused_adamw_simple_step and
+ // grokfast_fused_ema_adam_step. Do NOT increment here — `steps` is a
+ // pybind-copied vector so an increment would not persist back to Python
+ // anyway, and incrementing made bias correction permanently off-by-one
+ // (bc computed with step+1).
  float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
  float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
  vp.push_back(params[i]); vg.push_back(grads[i]);

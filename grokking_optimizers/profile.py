@@ -521,12 +521,20 @@ def profile_pallas(optimizer: str, model: str, arch: str, report,
     except ImportError:
         report.write("[profile-pallas] jax.profiler not available — skip\n")
         return 0
+    import shutil
     import tempfile
     tdir = tempfile.mkdtemp(prefix="grok_profile_pallas_")
     try:
         jax.profiler.start_trace(tdir)
         try:
-            exec(compile(body, "<smoke>", "exec"))  # noqa: S102
+            # Run the generated smoke in its own namespace. The smoke script
+            # ends its failure path with sys.exit(1), which raises SystemExit
+            # — NOT a subclass of Exception — so it must be caught explicitly
+            # or it would abort the whole profile run past stop_trace().
+            exec(compile(body, "<smoke>", "exec"),  # noqa: S102
+                 {"__name__": "__grok_smoke__"})
+        except SystemExit:
+            report.write("[profile-pallas] smoke script exited non-zero\n")
         except Exception:
             import traceback
             report.write(traceback.format_exc())
@@ -539,6 +547,8 @@ def profile_pallas(optimizer: str, model: str, arch: str, report,
                 report.write(f"  {f}: {os.path.getsize(fp)} bytes\n")
     except Exception as exc:
         report.write(f"[profile-pallas] in-process trace failed: {exc}\n")
+    finally:
+        shutil.rmtree(tdir, ignore_errors=True)
     return 0
 
 
