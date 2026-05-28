@@ -27,7 +27,7 @@ you confirm the wrapper is healthy on the current host without
 installing anything but Python and the package itself:
 
 ```bash
-# 1. Run the inline self-test suite (131 checks; many gate on dep
+# 1. Run the inline self-test suite (138 checks; many gate on dep
 #    presence and SKIP cleanly on a CPU-only host — see the gating
 #    note in "What gets exercised on a CPU-only host" below)
 python3 -m grokking_optimizers.compile --self-test
@@ -316,7 +316,7 @@ sys.path.insert(0, str(Path.cwd()))   # assumes you're in SuperGrok1.5/
 
 from grokking_optimizers.compile import main as compile_main
 assert compile_main(["--self-test"]) == 0  # prints "[self-test] N passed, M failed";
-                                            # N is ~131 today (count fluctuates as
+                                            # N is ~138 today (count fluctuates as
                                             # tests are added). M=0 is the success
                                             # condition. On a CPU-only host, several
                                             # tests SKIP cleanly (counted as PASS)
@@ -324,7 +324,7 @@ assert compile_main(["--self-test"]) == 0  # prints "[self-test] N passed, M fai
                                             # "What gets exercised" note below.
 ```
 
-The self-test (~131 checks today) covers a broad surface area:
+The self-test (~138 checks today) covers a broad surface area:
 
 - **Always exercised** (no opt deps needed): ARCH_TABLE completeness for
   all 26 canonical archs; per-arch search-space cardinalities; the
@@ -419,7 +419,7 @@ A short list of footguns the wrapper does not (and cannot) auto-fix:
 
 ### What gets exercised on a CPU-only host
 
-The self-test runs ~131 checks today, but many are dep-gated: when
+The self-test runs ~138 checks today, but many are dep-gated: when
 the required Python package or hardware isn't available, the check
 SKIPs cleanly (still counted as PASS — the gate fires before the
 check's body). Concretely, on a fresh CPU-only host without optional
@@ -438,7 +438,7 @@ The remaining ~110 checks (ARCH_TABLE completeness, search-space
 hashing, flag-emission per arch, cache-v4 consistency, BuildSpec
 schema, autotune stopper math, dry-run manifest schema, TOML config
 loader, macro-prefix validation, project-agnostic dry-run) run on
-**any** host with Python 3.11+ and torch. The "131 checks" number
+**any** host with Python 3.11+ and torch. The "138 checks" number
 is therefore the upper bound; the floor on a stripped CPU-only host
 is what the user actually sees and that floor is still informative
 (it's the build-correctness portion of the suite).
@@ -480,7 +480,7 @@ branches anywhere in the file.
 
 **Status legend**:
 - ✅ Self-test: arch is registered in ARCH_TABLE with non-empty search
-  space, feature flags, and toolchain version — verified by the 90-test
+  space, feature flags, and toolchain version — verified by the 138-test
   in-process suite.
 - ✅ AOT dry-run: `--arch <X> --runtime aot --no-autotune --no-profile`
   produces either a build.ninja or a clear per-arch toolchain
@@ -493,6 +493,17 @@ branches anywhere in the file.
 `sm_103 → sm_103a`, `sm_120 → sm_120a`. Both keys resolve to the same
 `ArchEntry` object via `is`-identity.
 
+> **Registered ≠ hand-tuned.** Every arch above is registered, search-
+> space-complete, and dry-runnable, and the flag/gencode emission is
+> arch-correct for all 26. But hand-written per-arch kernel **sources**
+> currently exist only for **`sm_90` (CUDA)** and **`gfx942` (HIP)** under
+> `csrc/backends/`, plus the **Pallas** Python kernels for TPU. The other
+> CUDA/HIP arches resolve through the shared bindings + algorithm headers
+> and the generic codegen template — they compile and are numerically
+> correct, but they do not yet have arch-specialized kernel bodies
+> (e.g. Blackwell tcgen05, Ampere async-copy). See the Build-status
+> matrices below, which list only the arches with real kernel sources.
+
 ### Per-arch search space cardinalities
 
 The complete programmatic Cartesian per arch (no YAML curation). Bayesian
@@ -501,25 +512,24 @@ per-dim value lists; the product is never materialized.
 
 | Arch | Cardinality |
 |------|-------------|
-| `sm_70` | 1,003,520 |
-| `sm_75` | 1,003,520 |
-| `sm_80` / `sm_86` | 2,867,200 |
-| `sm_89` | 8,601,600 |
+| `sm_70` / `sm_75` | 1,039,360 |
+| `sm_80` / `sm_86` | 2,969,600 |
+| `sm_89` | 8,908,800 |
 | `sm_90a` | 3,735,552,000 |
-| `sm_100a` / `sm_103a` | 3,369,074,688,000 |
-| `sm_120a` | 17,203,200 |
-| `gfx906` | 12,042,240 |
-| `gfx908` | 57,344,000 |
-| `gfx90a` | 80,281,600 |
-| `gfx942` | 700,416,000 |
-| `gfx950` | 1,651,507,200 |
-| `gfx1030` | 3,010,560 |
-| `gfx1100/1101/1102/1151` | 91,750,400 |
-| `gfx1200/1201` | 481,689,600 |
-| `tpu_v4` / `tpu_v5e` | 240 |
-| `tpu_v5p` | 720 |
-| `tpu_v6e` | 480 |
-| `tpu_v7` | 384 |
+| `sm_100a` / `sm_103a` | 3,489,398,784,000 |
+| `sm_120a` | 17,817,600 |
+| `gfx906` | 4,157,440 |
+| `gfx908` | 59,392,000 |
+| `gfx90a` | 83,148,800 |
+| `gfx942` | 688,128,000 |
+| `gfx950` | 1,710,489,600 |
+| `gfx1030` | 3,118,080 |
+| `gfx1100/1101/1102/1151` | 95,027,200 |
+| `gfx1200/1201` | 498,892,800 |
+| `tpu_v4` / `tpu_v5e` | 1,200 |
+| `tpu_v5p` | 3,600 |
+| `tpu_v6e` | 2,400 |
+| `tpu_v7` | 1,920 |
 
 ---
 
@@ -563,15 +573,17 @@ they don't support.
 - `-Wno-pass-failed=transform-warning` — suppress RDNA wavefront noise
 - Per-arch: `gfx950 → --offload-arch=gfx950:sramecc+:xnack-`
 
-**JAX / XLA** (Pallas archs):
-- `--xla_gpu_enable_persistent_temp_buffers=true`
-- `--xla_gpu_enable_priority_fusion=true`
-- `--xla_gpu_enable_pipelined_all_reduce=true` / `all_gather` / `reduce_scatter`
-- `--xla_gpu_redzone_padding_bytes=8388608` — 8 MiB redzone for memcheck
-- `--xla_gpu_enable_command_buffer=FUSION,CUSTOM_CALL,CUBLAS,CUBLASLT,CUDNN,COLLECTIVES`
-- `--xla_gpu_graph_min_graph_size=1` — always graph
-- `--xla_gpu_autotune_max_solutions=128`
-- Env: `JAX_PLATFORMS=tpu` when arch starts with `tpu_`; `LIBTPU_INIT_ARGS` pass-through
+**JAX / XLA** (Pallas archs — all of which are TPUs, so the emitted
+`XLA_FLAGS` are TPU-specific `xla_tpu_*` flags, not the `xla_gpu_*`
+family):
+- `--xla_tpu_enable_async_collective_fusion=true` (+ `_multiple_steps=true`)
+- `--xla_enable_async_all_gather=true`
+- `--xla_tpu_enable_latency_hiding_scheduler=true`
+- `--xla_tpu_megacore_fusion_allow_ags=false`
+- `--xla_tpu_spmd_rng_bit_generator_unsafe=true`
+- `--xla_dump_hlo_as_text=true`
+- Env: `JAX_PLATFORMS=tpu`, plus a `JAX_COMPILATION_CACHE_DIR` +
+  `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS` persistent-cache pair
 
 ### Zero-config arch routing (Stream β)
 
@@ -989,7 +1001,7 @@ needing a target GPU:
 
 | Flag | Behaviour |
 |------|-----------|
-| `--self-test` | Inline suite (~131 checks today) covering ARCH_TABLE, search spaces, codegen, autotune, cache v4, polyhedral, synth codegen, Stream α/β/γ regression tests, plus the Colab-arch-detection regression suite. Runs in ~30s on a CPU-only host. Several checks gate on optional deps (`jinja2`, `cuda-python`, `libclang`, GPU presence); those that don't have their dep available SKIP cleanly (still counted as PASS — see the "What gets exercised on a CPU-only host" note above). |
+| `--self-test` | Inline suite (~138 checks today) covering ARCH_TABLE, search spaces, codegen, autotune, cache v4, polyhedral, synth codegen, Stream α/β/γ regression tests, plus the Colab-arch-detection regression suite. Runs in ~30s on a CPU-only host. Several checks gate on optional deps (`jinja2`, `cuda-python`, `libclang`, GPU presence); those that don't have their dep available SKIP cleanly (still counted as PASS — see the "What gets exercised on a CPU-only host" note above). |
 | `--list-archs` | Dumps every entry in ARCH_TABLE — one line per arch with vendor, min toolchain version, and feature set (wgmma / tcgen05 / mfma / wmma / sparsecore / etc.). Exits 0; no `--optimizer` / `--model` required. |
 | `--dry-run --arch <arch>` | Single-arch dry-run: runs preflight + `_resolve_sources` + `_host_cflags` + `_device_cflags` + `_ldflags` for the named arch without invoking `torch.cpp_extension`. Writes `<out>/dry_run_<arch>.json`. Pair with `--enable-synth-codegen --enable-polyhedral` to also exercise the synth/polyhedral layers. |
 | `--dry-run-all-archs` | Same as above but sweeps every canonical arch in ARCH_TABLE. Writes one JSON manifest per arch under `<out>/dry_run_<arch>.json`. Sweeps all 26 canonical archs on a CPU-only host in ~3 seconds. For Pallas archs the manifest includes the resolved `xla_env` dict. Each manifest now also surfaces `device_ldflags` (nvcc -dlink step) and `version_gated_device_cflags` (flags `_newer_compiler_flags` would add when the installed toolchain is new enough; empty on CPU-only hosts). Mutually exclusive with `--dry-run`. |
@@ -1120,9 +1132,10 @@ functional. Promotion to ✅ requires elementwise allclose validation against
 the sm_90 path on an MI300X.
 
 Everything marked 🟡 is implemented end-to-end in the refactored tree but has
-not been run on real hardware in this environment. Phase 12 of the refactor
-(see `REFACTOR_NOTES.md`) documents the smoke tests that must run on a real
-H100, MI300X, or TPU v5p before any cell can be promoted to ✅.
+not been run on real hardware in this environment. The "Action items for
+hardware validation" section near the end of this README documents the smoke
+tests that must run on a real H100, MI300X, or TPU v5p before any cell can be
+promoted to ✅.
 
 ### Kernel header status
 
@@ -1139,7 +1152,7 @@ via arch-specific common headers.
 | Grokfast  | 🟡 | 🟡 | 3 (ema, m, v) | 12 |
 | GrokAdamW | 🟡 | 🟡 | 3 (ema, m, v) | 12 |
 
-Legend: 🟡 = written, structurally validated (~131 inline self-tests pass via
+Legend: 🟡 = written, structurally validated (~138 inline self-tests pass via
 `python -m grokking_optimizers.compile --self-test`), not compiled on device
 (no CUDA/HIP toolchain in this environment).
 
@@ -1147,10 +1160,26 @@ Legend: 🟡 = written, structurally validated (~131 inline self-tests pass via
 
 Per-model kernel headers in `grokking_optimizers/kernels/`. Each header
 provides templated per-layer `__device__` forward and backward functions,
-a state struct with raw pointers, constexpr size helpers, and
-arch-specific instructions (wgmma/CUTLASS on sm_90, MFMA on gfx942,
-Pallas/JAX on TPU). All headers share NanPolicy and type-cast helpers
-via arch-specific common headers.
+a state struct with raw pointers, constexpr size helpers, and shares
+NanPolicy and type-cast helpers via arch-specific common headers.
+
+Honest note on the matmul path per arch (the GEMM-heavy layers —
+attention QK^T/PV, in/out projections — are what differ):
+
+- **gfx942 (`mamba3_gfx942.hip.hpp`)** emits **real MFMA intrinsics**
+  (`__builtin_amdgcn_mfma_f32_32x32x8bf16_1k` /
+  `..._16x16x16bf16_1k`). The CDNA matmul path is genuine.
+- **sm_90 (`*_sm90.cuh`)** currently carries **scalar / grid-stride
+  bodies** with comments that describe the intended wgmma / CUTLASS 3.x
+  dispatch (e.g. `wgmma_matmul` in `transformer_decoder_sm90.cuh` is a
+  shape-only placeholder; `in_proj_forward` in `mamba3_sm90.cuh` is a
+  scalar inner-product loop). These compile and are numerically correct
+  but do **not** yet emit `wgmma` / TMA. The CUTLASS GEMM that *is* wired
+  lives in `csrc/backends/cuda/sm_90/launch_supergrok2.cu`
+  (`cutlass::gemm::device::Gemm`), and even there the Sm90 collective
+  (warp-group MMA) ArchTag is not yet selected.
+- **TPU (`*_tpu.py`)** uses `pl.pallas_call` with `BlockSpec` tiling in
+  `_pallas_kernels.py`.
 
 | Model | sm_90 `.cuh` | gfx942 `.hip.hpp` | TPU `.py` | Layers (fwd+bwd) |
 |-------|:---:|:---:|:---:|:---:|
@@ -1158,9 +1187,10 @@ via arch-specific common headers.
 | Mamba-3 (SSM)       | 🟡 | 🟡 | 🟡 | 8+7 |
 | ViT                 | 🟡 | 🟡 | 🟡 | 10+8 |
 
-Legend: 🟡 = written, structurally validated (18 inline self-tests pass via
-`python -m grokking_optimizers.compile --self-test`), not compiled on device
-(no CUDA/HIP/TPU toolchain in this environment).
+Legend: 🟡 = written and structurally validated by the inline self-test
+suite (`python -m grokking_optimizers.compile --self-test`), not compiled
+on device (no CUDA/HIP/TPU toolchain in this environment). The Hopper
+wgmma/TMA path is the main outstanding kernel-perf work item.
 
 ### Cross-validation: optimizer × model × arch
 
@@ -1267,7 +1297,7 @@ python -m grokking_optimizers.compile \
   [--prune] [--prune-max-age-days 30] [--prune-keep-top-n 100]
   [--no-auto-prune]                     # cache GC
   [--debug-symbols] [--seed N] [-D MACRO[=VALUE]] [-v] [--debug]
-  [--self-test]                         # in-process suite (~131 checks today)
+  [--self-test]                         # in-process suite (~138 checks today)
   [--dry-run-all-archs]                 # write JSON manifests for all 26 canonical archs
   [--e2e-smoke] [--e2e-max-seconds 120] # end-to-end build smoke (GPU-gated)
 ```
@@ -1327,7 +1357,7 @@ LDFLAGS_BASE = ["-flto=full", "-Wl,--as-needed", "-Wl,--gc-sections", "-Wl,-O3",
 #### TL;DR workflows
 
 ```bash
-# End-to-end (Bayesian, 500 trials, top-K=20)
+# End-to-end (Bayesian, auto early-stop + elbow top-K — the defaults)
 python -m grokking_optimizers.compile -O supergrok2 -M mamba -A sm_90 \
     --cache build/.compile_cache.json
 
@@ -1614,7 +1644,7 @@ iterating on a specific combo; use `setup.py` (the default
 consumed by the race driver.
 
 ```bash
-# End-to-end (default: bayesian, 500 trials, top-K=20, both runtimes)
+# End-to-end (default: bayesian, auto early-stop, elbow-detected top-K, both runtimes)
 python -m grokking_optimizers.compile \
     --optimizer supergrok2 --model mamba --arch sm_90 \
     --cache build/.compile_cache.json
@@ -1684,10 +1714,13 @@ What runs, in order:
    space, apply static **pre-filter** rules (alignment, occupancy
    ceilings, TMA/warp-spec block thresholds; logged as
    `[prefilter] N candidates → M survivors (K eliminated)`), then sweep:
-   - **`--mode bayesian`** (default): Optuna TPE multivariate sampler
-     for `--bayesian-trials` iterations (default 500), then ±2-step
-     neighbour refinement on the top-K (default 20). The study persists
-     to `<out>/optuna_<opt>_<model>_<arch>.db` for cross-run resume.
+   - **`--mode bayesian`** (default): Optuna TPE multivariate sampler.
+     `--bayesian-trials` defaults to `None` → the 5-criterion auto
+     early-stop decides when to halt (pass an int to pin a hard cap),
+     then ±2-step neighbour refinement on the top-K, which defaults to
+     `None` → elbow-of-the-timing-curve detection (pass an int to pin
+     it). The study persists to `<out>/optuna_<opt>_<model>_<arch>.db`
+     for cross-run resume.
    - **`--mode exhaustive`**: every surviving config is built and timed.
      Cache flushes every 5 trials so a Ctrl-C is recoverable.
    Each variant is timed by a **persistent subprocess worker** that
@@ -1841,7 +1874,7 @@ the elimination count is logged at sweep start.
 
 | Mode | What runs |
 |---|---|
-| `--mode bayesian` (default) | Optuna TPE for `--bayesian-trials` (default 500) + ±2-step neighbour refinement on top-K (default 20). Optuna study persisted for cross-run resume. |
+| `--mode bayesian` (default) | Optuna TPE for `--bayesian-trials` (default `None` → 5-criterion auto early-stop) + ±2-step neighbour refinement on top-K (default `None` → elbow detection). Optuna study persisted for cross-run resume. |
 | `--mode exhaustive` | Every config that survives the pre-filter is built and timed. Cache flush every 5 trials. |
 | `--quick` | Debug shortcut: bayesian mode, 25 trials. |
 
@@ -2962,7 +2995,7 @@ and eliminate cross-module coupling:
 | `INTERFACES.md` | `README.md` — compile cache schema, CLI surface |
 | `docs/autotune.md` | `README.md` — autotune guide, YAML schema, PGO |
 | `docs/optimization_matrix.md` | `README.md` — optimization candidate matrix |
-| `tests/` (all files) | `compile.py --self-test` — ~131 inline checks today |
+| `tests/` (all files) | `compile.py --self-test` — ~138 inline checks today |
 
 ---
 
