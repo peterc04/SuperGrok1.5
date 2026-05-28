@@ -3,16 +3,25 @@
 Algorithm: csrc/algorithms/supergrok2.h
 Self-contained — collapses the entire functional JAX rewrite that
 previously lived in supergrok2_jax_tpu/ (supergrok2_jax.py,
-mamba3_peer_metanet_jax.py, scan.py, gru.py, peer.py, bilevel.py,
+csa_hca_peer_metanet_jax.py, gru.py, peer.py, bilevel.py,
 quantization_jax.py) into one file. Matches the policy that each
 optimizer launch is fully self-contained, even if the resulting file
 is large.
 
+The sequence mixer is a DeepSeek-V4-style CSA/HCA hybrid attention stack
+(see grokking_optimizers/kernels/tpu/supergrok2_tpu.py, spec SS2/SS3b),
+which REPLACES the previous Mamba-3 bidirectional selective scan. Per spec
+SS3b only the mixer changed; the GRU + PEER + expert-MLP + AdamW tail is
+KEPT VERBATIM. Attention is stateless across optimizer steps, so (unlike
+the carried Mamba fwd/bwd state) only the GRU state persists — the
+per-parameter state drops from 7 to 5 tensors.
+
 Architectural map (all in this file):
-  1. Mamba-3 scan primitives        (parallel associative scan)
+  1. CSA/HCA hybrid attention mixer (compress + lightning-indexer top-k +
+     window CSA; heavy-compress dense HCA)
   2. Per-element GRU cell           (temporal memory)
   3. Multi-head PEER routing         (soft and hard variants)
-  4. Composed meta-net forward pass (sort, scan, GRU, route, skip)
+  4. Composed meta-net forward pass (sort, attend, GRU, route, skip)
   5. SuperGrok v2 per-parameter step
   6. Bilevel meta-net optimization step
   7. INT8/INT4 quantization helpers
@@ -25,140 +34,197 @@ from __future__ import annotations
 import math
 import jax
 import jax.numpy as jnp
-from jax import lax
 from typing import Any, Callable, NamedTuple, Optional, Tuple
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Section 1 — Mamba-3 scan
+#  Section 1 — CSA/HCA hybrid attention sequence mixer (spec SS2, SS3b)
 # ════════════════════════════════════════════════════════════════════════════
+#
+# DeepSeek-V4-style compressed attention. Replaces the former Mamba-3
+# bidirectional selective scan (only the sequence mixer changed -- spec SS3b):
+#   - CSA (Compressed Sparse Attention): compress KV at stride m=csa_compress
+#     with a learned pool, score compressed positions with a low-rank
+#     "lightning indexer" (rank=indexer_rank) and keep top-k (jax.lax.top_k),
+#     plus a causal sliding window -> csa_ctx (fine/local; was the mamba fwd).
+#   - HCA (Heavily Compressed Attention): compress KV at stride m'=hca_compress
+#     with mean pooling, then DENSE attention over all compressed entries +
+#     window -> hca_ctx (global/coarse; was the mamba bwd).
+# Attention is STATELESS across optimizer steps; KV is shared across heads (MQA)
+# and all accumulation is FP32. Mirrors grokking_optimizers/kernels/tpu/
+# supergrok2_tpu.py exactly.
 
 
-class MambaScanWeights(NamedTuple):
-    """Weights for one direction of the Mamba-3 scan."""
-    in_proj_W: jnp.ndarray      # [2*d_inner, d_model]
-    dt_proj_W: jnp.ndarray      # [d_inner, d_inner]
-    dt_proj_b: jnp.ndarray      # [d_inner]
-    B_proj_W: jnp.ndarray       # [d_state, d_inner]
-    C_proj_W: jnp.ndarray       # [d_state, d_inner]
-    A_log: jnp.ndarray          # [d_inner, d_state]
-    D: jnp.ndarray              # [d_inner]
-    rope_freq: jnp.ndarray      # [d_inner, d_state//2]
-    out_proj_W: jnp.ndarray     # [d_model, d_inner]
+class CSAWeights(NamedTuple):
+    """Weights for the Compressed Sparse Attention layer."""
+    q_W: jnp.ndarray          # [d_model, d_model]
+    k_W: jnp.ndarray          # [d_model, d_model]
+    v_W: jnp.ndarray          # [d_model, d_model]
+    out_W: jnp.ndarray        # [d_model, d_model]
+    compress_w: jnp.ndarray   # [csa_window] learned KV pool weights
+    idx_DQ: jnp.ndarray       # [d_model, indexer_rank]  indexer q down-proj
+    idx_UQ: jnp.ndarray       # [indexer_rank, d_model]  indexer q up-proj (parity)
+    idx_K: jnp.ndarray        # [d_model, indexer_rank]  indexer key proj
 
 
-def _build_affine_transforms(
-    dt: jnp.ndarray,
-    x_branch: jnp.ndarray,
-    B: jnp.ndarray,
-    A_log: jnp.ndarray,
-    rope_freq: jnp.ndarray,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Build per-timestep affine transforms for the associative scan.
+class HCAWeights(NamedTuple):
+    """Weights for the Heavily Compressed Attention layer."""
+    q_W: jnp.ndarray          # [d_model, d_model]
+    k_W: jnp.ndarray          # [d_model, d_model]
+    v_W: jnp.ndarray          # [d_model, d_model]
+    out_W: jnp.ndarray        # [d_model, d_model]
 
-    For each timestep t, state pair p, and inner dimension j, the recurrence
-    h_pair[t] = M[t] @ h_pair[t-1] + b[t] is encoded as (M[t], b[t]).
+
+def _compress_kv(
+    kv: jnp.ndarray,            # [N, d_model]
+    compress_w: Optional[jnp.ndarray],  # [window] or None -> uniform mean pool
+    m: int,                     # compression stride
+    window: int,                # pooling window (>= m); for HCA window == m
+) -> jnp.ndarray:
+    """Pool a `window`-wide block at stride `m` -> [Nc, d_model] (spec SS2.1).
+
+    c_kv[j] = sum_w softmax(compress_w)[w] * kv[j*m + w]. Implemented with a
+    reshape into [Nc, m, d_model] (zero-padded) and a weighted mean -- no scan.
     """
-    A = -jnp.exp(A_log)
-    half_dtA = dt[:, :, None] * A[None, :, :] / 2.0
-    A_bar = (1.0 + half_dtA) / (1.0 - half_dtA + 1e-8)
-    B_bar = dt[:, :, None] * B[:, None, :]
+    N, d_model = kv.shape
+    Nc = (N + m - 1) // m
+    pad = Nc * m - N
+    if pad:
+        kv = jnp.concatenate([kv, jnp.zeros((pad, d_model), kv.dtype)], axis=0)
+    blocks = kv.reshape(Nc, m, d_model)  # [Nc, m, d_model]
 
-    phase = dt[:, :, None] * rope_freq[None, :, :]
-    cos_p = jnp.cos(phase)
-    sin_p = jnp.sin(phase)
-
-    A_bar_e = A_bar[:, :, 0::2]
-    A_bar_o = A_bar[:, :, 1::2]
-
-    M_00 = A_bar_e * cos_p
-    M_01 = -A_bar_e * sin_p
-    M_10 = A_bar_o * sin_p
-    M_11 = A_bar_o * cos_p
-    Ms = jnp.stack([
-        jnp.stack([M_00, M_01], axis=-1),
-        jnp.stack([M_10, M_11], axis=-1),
-    ], axis=-2)
-
-    B_bar_e = B_bar[:, :, 0::2]
-    B_bar_o = B_bar[:, :, 1::2]
-    bs = jnp.stack([
-        B_bar_e * x_branch[:, :, None],
-        B_bar_o * x_branch[:, :, None],
-    ], axis=-1)
-    return Ms, bs
-
-
-def _associative_combine(left, right):
-    """Compose two affine transforms: (M_r @ M_l, M_r @ b_l + b_r)."""
-    M_l, b_l = left
-    M_r, b_r = right
-    M_out = jnp.einsum('...ij,...jk->...ik', M_r, M_l)
-    b_out = jnp.einsum('...ij,...j->...i', M_r, b_l) + b_r
-    return M_out, b_out
-
-
-def mamba3_scan(
-    x_sorted: jnp.ndarray,
-    weights: MambaScanWeights,
-    initial_state: Optional[jnp.ndarray] = None,
-    reverse: bool = False,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Bidirectional Mamba-3 scan using JAX associative_scan.
-
-    Mathematical equivalence to the CUDA Blelloch scan:
-      h[t] = A_bar[t] * RoPE(h[t-1]) + B_bar[t] * x[t]
-      y[t] = sum_s(h[t,:,s] * C[t,s]) * silu(z[t]) + D * x_branch[t]
-      output[t] = y[t] @ out_proj.T
-    """
-    N, d_model = x_sorted.shape
-    d_inner = weights.in_proj_W.shape[0] // 2
-    d_state = weights.A_log.shape[1]
-    half_d_state = d_state // 2
-
-    if reverse:
-        x_sorted = x_sorted[::-1]
-
-    xz = x_sorted @ weights.in_proj_W.T
-    x_branch = xz[:, :d_inner]
-    z_branch = xz[:, d_inner:]
-
-    dt_raw = x_branch @ weights.dt_proj_W.T + weights.dt_proj_b
-    dt = jax.nn.softplus(dt_raw)
-    B = x_branch @ weights.B_proj_W.T
-    C = x_branch @ weights.C_proj_W.T
-
-    Ms, bs = _build_affine_transforms(dt, x_branch, B, weights.A_log, weights.rope_freq)
-
-    cumulative_M, cumulative_b = lax.associative_scan(
-        _associative_combine, (Ms, bs), axis=0)
-
-    if initial_state is not None:
-        h_init_pairs = initial_state.reshape(d_inner, half_d_state, 2)
+    if compress_w is None:
+        weights = jnp.full((m,), 1.0 / m, dtype=jnp.float32)
     else:
-        h_init_pairs = jnp.zeros((d_inner, half_d_state, 2))
+        w = compress_w[:m].astype(jnp.float32)
+        weights = jax.nn.softmax(w)
+    return jnp.einsum('cmd,m->cd', blocks.astype(jnp.float32), weights)  # [Nc, d_model]
 
-    h_pairs = (
-        jnp.einsum('...ij,...j->...i', cumulative_M, h_init_pairs[None, :, :, :])
-        + cumulative_b
-    )
 
-    h_even = h_pairs[..., 0]
-    h_odd = h_pairs[..., 1]
-    h = jnp.zeros((N, d_inner, d_state))
-    h = h.at[:, :, 0::2].set(h_even)
-    h = h.at[:, :, 1::2].set(h_odd)
+def _sliding_window_bias(N: int, window: int) -> jnp.ndarray:
+    """Additive attention bias [N, N] allowing only the last `window` causal
+    tokens (token t attends to t-window+1 .. t). 0 where allowed, -inf else."""
+    t = jnp.arange(N)[:, None]
+    s = jnp.arange(N)[None, :]
+    allowed = (s <= t) & (s > t - window)
+    return jnp.where(allowed, 0.0, -jnp.inf).astype(jnp.float32)
 
-    y = jnp.sum(h * C[:, None, :], axis=-1)
-    y = y * jax.nn.silu(z_branch) + weights.D[None, :] * x_branch
-    output = y @ weights.out_proj_W.T
 
-    final_state = h[-1]
+def csa_attention(
+    x: jnp.ndarray,            # [N, d_model] projected feature sequence
+    weights: CSAWeights,
+    n_heads: int,
+    csa_compress: int,
+    csa_window: int,
+    csa_topk: int,
+) -> jnp.ndarray:
+    """Compressed Sparse Attention -> csa_ctx [N, d_model] (spec SS2 CSA).
 
-    if reverse:
-        output = output[::-1]
+    1. KV compression at stride m=csa_compress with learned pooling.
+    2. Lightning indexer: low-rank query scores compressed indexer keys; keep
+       top-k compressed entries per query (jax.lax.top_k).
+    3. Sliding window: also attend to the last csa_window raw tokens (causal).
+    4. Attention: softmax(Q.Kc^T / sqrt(head_dim)) . Vc over selected entries
+       blended with the windowed raw attention; KV shared across heads (MQA).
+    """
+    x = x.astype(jnp.float32)
+    N, d_model = x.shape
+    head_dim = d_model // n_heads
+    scale = 1.0 / jnp.sqrt(jnp.asarray(head_dim, jnp.float32))
 
-    return output, final_state
+    q = x @ weights.q_W.T  # [N, d_model]
+    k = x @ weights.k_W.T
+    v = x @ weights.v_W.T
+
+    c_k = _compress_kv(k, weights.compress_w, csa_compress, csa_window)  # [Nc, d_model]
+    c_v = _compress_kv(v, weights.compress_w, csa_compress, csa_window)
+    Nc = c_k.shape[0]
+
+    # Lightning indexer (spec SS2.2): rank-R indexer query z = x @ idx_DQ and
+    # indexer keys kI = compress(x @ idx_K), scored in rank space.
+    R = weights.idx_DQ.shape[1]
+    z = x @ weights.idx_DQ                       # [N, R]
+    kI = _compress_kv(x @ weights.idx_K, weights.compress_w,
+                      csa_compress, csa_window)  # [Nc, R]
+    idx_scores = (z @ kI.T) / jnp.sqrt(jnp.asarray(R, jnp.float32))  # [N, Nc]
+
+    k_keep = min(csa_topk, Nc)
+    _, top_idx = jax.lax.top_k(idx_scores, k_keep)  # [N, k_keep] compressed ids
+
+    win_bias = _sliding_window_bias(N, csa_window)
+
+    def _attend_head(h):
+        off = h * head_dim
+        q_h = q[:, off:off + head_dim]                  # [N, head_dim]
+        ck_h = c_k[:, off:off + head_dim]               # [Nc, head_dim]
+        cv_h = c_v[:, off:off + head_dim]
+        sel_k = ck_h[top_idx]                            # [N, k_keep, head_dim]
+        sel_v = cv_h[top_idx]
+        comp_scores = jnp.einsum('nd,nkd->nk', q_h, sel_k) * scale  # [N, k_keep]
+        comp_p = jax.nn.softmax(comp_scores, axis=-1)
+        comp_ctx = jnp.einsum('nk,nkd->nd', comp_p, sel_v)          # [N, head_dim]
+
+        rk_h = k[:, off:off + head_dim]
+        rv_h = v[:, off:off + head_dim]
+        win_scores = jnp.einsum('nd,md->nm', q_h, rk_h) * scale     # [N, N]
+        win_scores = win_scores + win_bias
+        win_p = jax.nn.softmax(win_scores, axis=-1)
+        win_ctx = win_p @ rv_h                                       # [N, head_dim]
+
+        return 0.5 * (comp_ctx + win_ctx)                           # [N, head_dim]
+
+    heads = [_attend_head(h) for h in range(n_heads)]
+    ctx = jnp.concatenate(heads, axis=-1)  # [N, d_model]
+    return ctx @ weights.out_W.T            # output projection [N, d_model]
+
+
+def hca_attention(
+    x: jnp.ndarray,            # [N, d_model] projected feature sequence
+    weights: HCAWeights,
+    n_heads: int,
+    hca_compress: int,
+    csa_window: int,
+) -> jnp.ndarray:
+    """Heavily Compressed Attention -> hca_ctx [N, d_model] (spec SS2 HCA).
+
+    Stride-m' mean pool (m'=hca_compress) -> Nh compressed entries; every query
+    attends DENSELY to all Nh entries (no top-k) plus the sliding window.
+    """
+    x = x.astype(jnp.float32)
+    N, d_model = x.shape
+    head_dim = d_model // n_heads
+    scale = 1.0 / jnp.sqrt(jnp.asarray(head_dim, jnp.float32))
+
+    q = x @ weights.q_W.T
+    k = x @ weights.k_W.T
+    v = x @ weights.v_W.T
+
+    c_k = _compress_kv(k, None, hca_compress, hca_compress)  # [Nh, d_model] mean
+    c_v = _compress_kv(v, None, hca_compress, hca_compress)
+
+    win_bias = _sliding_window_bias(N, csa_window)
+
+    def _attend_head(h):
+        off = h * head_dim
+        q_h = q[:, off:off + head_dim]
+        ck_h = c_k[:, off:off + head_dim]
+        cv_h = c_v[:, off:off + head_dim]
+        dense_scores = jnp.einsum('nd,md->nm', q_h, ck_h) * scale  # [N, Nh] dense
+        dense_p = jax.nn.softmax(dense_scores, axis=-1)
+        dense_ctx = dense_p @ cv_h                                  # [N, head_dim]
+
+        rk_h = k[:, off:off + head_dim]
+        rv_h = v[:, off:off + head_dim]
+        win_scores = jnp.einsum('nd,md->nm', q_h, rk_h) * scale
+        win_scores = win_scores + win_bias
+        win_p = jax.nn.softmax(win_scores, axis=-1)
+        win_ctx = win_p @ rv_h
+
+        return 0.5 * (dense_ctx + win_ctx)
+
+    heads = [_attend_head(h) for h in range(n_heads)]
+    ctx = jnp.concatenate(heads, axis=-1)
+    return ctx @ weights.out_W.T
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -319,8 +385,8 @@ class MetaNetWeights(NamedTuple):
     """All weights for the SuperGrok v2 meta-net."""
     input_proj_W: jnp.ndarray   # [d_model, 2]
     input_proj_b: jnp.ndarray   # [d_model]
-    mamba_fwd: MambaScanWeights
-    mamba_bwd: MambaScanWeights
+    csa: CSAWeights             # Compressed Sparse Attention (was mamba_fwd)
+    hca: HCAWeights             # Heavily Compressed Attention (was mamba_bwd)
     gru: GRUWeights
     peer_query_Ws: jnp.ndarray
     prod_keys_A: jnp.ndarray
@@ -334,10 +400,19 @@ class MetaNetWeights(NamedTuple):
 
 
 class MetaNetConfig(NamedTuple):
-    """Configuration for the meta-net (static, not traced by JAX)."""
+    """Configuration for the meta-net (static, not traced by JAX).
+
+    The sequence-mixer dims are now CSA/HCA attention dims (spec SS2/SS3b);
+    the former Mamba d_state / d_inner are gone. Matches the CUDA/HIP backend
+    defaults (small d_model=8 reference scale, NOT production DeepSeek sizes).
+    """
     d_model: int = 8
-    d_state: int = 16
-    d_inner: int = 16
+    n_heads: int = 2          # attention heads (multi-query KV)
+    csa_compress: int = 4     # CSA compression stride m
+    csa_window: int = 8       # CSA pooling / sliding window
+    csa_topk: int = 16        # lightning-indexer top-k (clamped to Nc)
+    hca_compress: int = 128   # HCA compression stride m'
+    indexer_rank: int = 4     # low-rank lightning indexer rank
     num_peer_heads: int = 4
     num_experts: int = 144
     expert_hidden: int = 16
@@ -352,8 +427,8 @@ def init_meta_weights(
 ) -> MetaNetWeights:
     """Initialize meta-net weights with the same scheme as PyTorch."""
     d_model = config.d_model
-    d_state = config.d_state
-    d_inner = config.d_inner
+    indexer_rank = config.indexer_rank
+    csa_window = config.csa_window
     num_heads = config.num_peer_heads
     num_experts = config.num_experts
     expert_hidden = config.expert_hidden
@@ -377,28 +452,24 @@ def init_meta_weights(
     input_proj_W = _linear(_k(), d_model, 2)
     input_proj_b = _bias(_k(), d_model, 2)
 
-    mamba_fwd = MambaScanWeights(
-        in_proj_W=_linear(_k(), 2 * d_inner, d_model),
-        dt_proj_W=_linear(_k(), d_inner, d_inner),
-        dt_proj_b=_bias(_k(), d_inner, d_inner),
-        B_proj_W=_linear(_k(), d_state, d_inner),
-        C_proj_W=_linear(_k(), d_state, d_inner),
-        A_log=jnp.log(jnp.linspace(1, d_state, d_state))[None, :].repeat(d_inner, axis=0),
-        D=jnp.ones(d_inner),
-        rope_freq=jax.random.normal(_k(), (d_inner, d_state // 2)) * 0.01,
-        out_proj_W=_linear(_k(), d_model, d_inner),
+    # CSA (Compressed Sparse Attention) -> csa_ctx (fine/local; was mamba_fwd).
+    csa = CSAWeights(
+        q_W=_linear(_k(), d_model, d_model),
+        k_W=_linear(_k(), d_model, d_model),
+        v_W=_linear(_k(), d_model, d_model),
+        out_W=_linear(_k(), d_model, d_model),
+        compress_w=jnp.zeros(csa_window),  # softmax(0) == uniform pool init
+        idx_DQ=jax.random.normal(_k(), (d_model, indexer_rank)) * 0.02,
+        idx_UQ=jax.random.normal(_k(), (indexer_rank, d_model)) * 0.02,
+        idx_K=jax.random.normal(_k(), (d_model, indexer_rank)) * 0.02,
     )
 
-    mamba_bwd = MambaScanWeights(
-        in_proj_W=_linear(_k(), 2 * d_inner, d_model),
-        dt_proj_W=_linear(_k(), d_inner, d_inner),
-        dt_proj_b=_bias(_k(), d_inner, d_inner),
-        B_proj_W=_linear(_k(), d_state, d_inner),
-        C_proj_W=_linear(_k(), d_state, d_inner),
-        A_log=jnp.log(jnp.linspace(1, d_state, d_state))[None, :].repeat(d_inner, axis=0),
-        D=jnp.ones(d_inner),
-        rope_freq=jax.random.normal(_k(), (d_inner, d_state // 2)) * 0.01,
-        out_proj_W=_linear(_k(), d_model, d_inner),
+    # HCA (Heavily Compressed Attention) -> hca_ctx (global/coarse; was mamba_bwd).
+    hca = HCAWeights(
+        q_W=_linear(_k(), d_model, d_model),
+        k_W=_linear(_k(), d_model, d_model),
+        v_W=_linear(_k(), d_model, d_model),
+        out_W=_linear(_k(), d_model, d_model),
     )
 
     gru_input_dim = 2 + 2 * d_model
@@ -428,8 +499,8 @@ def init_meta_weights(
     return MetaNetWeights(
         input_proj_W=input_proj_W,
         input_proj_b=input_proj_b,
-        mamba_fwd=mamba_fwd,
-        mamba_bwd=mamba_bwd,
+        csa=csa,
+        hca=hca,
         gru=gru,
         peer_query_Ws=peer_query_Ws,
         prod_keys_A=prod_keys_A,
@@ -447,16 +518,18 @@ def meta_net_forward(
     grad: jnp.ndarray,
     sharpness: jnp.ndarray,
     gru_state: jnp.ndarray,
-    mamba_fwd_state: Optional[jnp.ndarray],
-    mamba_bwd_state: Optional[jnp.ndarray],
     meta_weights: MetaNetWeights,
     config: MetaNetConfig,
     use_soft_routing: bool = False,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Full SuperGrok v2 meta-net forward pass.
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Full SuperGrok v2 meta-net forward pass (CSA/HCA mixer, spec SS3b).
 
-    Equivalent to PyTorch Mamba3PEERMetaNet.forward (hard) or
-    forward_for_bilevel (soft).
+    The sequence mixer is now a DeepSeek-V4-style CSA/HCA hybrid attention
+    stack (replaces the former Mamba-3 bidirectional selective scan); only the
+    mixer changed, the GRU + PEER + expert tail is verbatim. Attention is
+    stateless across steps, so no mixer state is carried -- only the GRU state.
+
+    Returns (smart_grad, new_gru, expert_counts).
     """
     N = grad.shape[0]
     g = grad.reshape(-1).astype(jnp.float32)
@@ -469,20 +542,28 @@ def meta_net_forward(
     inp = jnp.stack([g_sorted, s_sorted], axis=-1)
     x = inp @ meta_weights.input_proj_W.T + meta_weights.input_proj_b
 
-    fwd_out, new_fwd = mamba3_scan(x, meta_weights.mamba_fwd, mamba_fwd_state, reverse=False)
-    bwd_out, new_bwd = mamba3_scan(x, meta_weights.mamba_bwd, mamba_bwd_state, reverse=True)
+    # CSA -> local/fine context (was the mamba fwd scan); HCA -> global coarse
+    # context (was the mamba bwd scan). Both run on the sorted, projected seq x.
+    csa_out = csa_attention(
+        x, meta_weights.csa,
+        config.n_heads, config.csa_compress, config.csa_window, config.csa_topk,
+    )
+    hca_out = hca_attention(
+        x, meta_weights.hca,
+        config.n_heads, config.hca_compress, config.csa_window,
+    )
 
     unsort_idx = jnp.argsort(sort_idx)
-    fwd_ctx = fwd_out[unsort_idx]
-    bwd_ctx = bwd_out[unsort_idx]
+    csa_ctx = csa_out[unsort_idx]
+    hca_ctx = hca_out[unsort_idx]
 
     gru_input = jnp.concatenate([
-        g[:, None], s[:, None], fwd_ctx, bwd_ctx
+        g[:, None], s[:, None], csa_ctx, hca_ctx
     ], axis=-1)
     new_gru = mini_gru(gru_input, gru_state.astype(jnp.float32), meta_weights.gru)
 
     peer_input = jnp.concatenate([
-        new_gru, fwd_ctx, bwd_ctx, g[:, None], s[:, None]
+        new_gru, csa_ctx, hca_ctx, g[:, None], s[:, None]
     ], axis=-1)
 
     if use_soft_routing:
@@ -505,7 +586,7 @@ def meta_net_forward(
         )
 
     smart_grad = g + meta_weights.rescale * expert_out
-    return smart_grad.reshape(grad.shape), new_gru, new_fwd, new_bwd, expert_counts
+    return smart_grad.reshape(grad.shape), new_gru, expert_counts
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -514,14 +595,18 @@ def meta_net_forward(
 
 
 class PerParamState(NamedTuple):
-    """Per-parameter optimizer state. JAX-compatible pytree."""
+    """Per-parameter optimizer state. JAX-compatible pytree.
+
+    CSA/HCA attention is stateless across optimizer steps (unlike the carried
+    Mamba fwd/bwd state), so only the GRU hidden state persists. The persistent
+    state-tensor count drops from 7 to 5: exp_avg, exp_avg_sq, mu, sharpness,
+    gru_state (step_count is a scalar step counter, not a per-element tensor).
+    """
     exp_avg: jnp.ndarray
     exp_avg_sq: jnp.ndarray
     mu: jnp.ndarray
     sharpness: jnp.ndarray
     gru_state: jnp.ndarray
-    mamba_fwd_state: jnp.ndarray
-    mamba_bwd_state: jnp.ndarray
     step_count: jnp.ndarray
 
 
@@ -566,10 +651,6 @@ def init_per_param_state(
         mu=jnp.zeros(N, dtype=jnp.float32),
         sharpness=jnp.zeros(N, dtype=jnp.float32),
         gru_state=jnp.zeros((N, meta_config.gru_hidden), dtype=jnp.float32),
-        mamba_fwd_state=jnp.zeros(
-            (meta_config.d_inner, meta_config.d_state), dtype=jnp.float32),
-        mamba_bwd_state=jnp.zeros(
-            (meta_config.d_inner, meta_config.d_state), dtype=jnp.float32),
         step_count=jnp.array(0, dtype=jnp.int32),
     )
 
@@ -646,9 +727,8 @@ def _update_single_param(
     )
     g = jnp.where(jnp.isfinite(g), g, 0.0)
 
-    smart_grad, new_gru, new_fwd, new_bwd, _ = meta_net_forward(
+    smart_grad, new_gru, _ = meta_net_forward(
         g, ps.sharpness, ps.gru_state,
-        ps.mamba_fwd_state, ps.mamba_bwd_state,
         meta_weights, meta_config,
         use_soft_routing=False,
     )
@@ -673,8 +753,6 @@ def _update_single_param(
         mu=new_mu,
         sharpness=ps.sharpness,
         gru_state=new_gru,
-        mamba_fwd_state=new_fwd,
-        mamba_bwd_state=new_bwd,
         step_count=step,
     )
     return new_param.reshape(param.shape), new_ps
@@ -753,8 +831,9 @@ def bilevel_step(
 ) -> Tuple[MetaNetWeights, float]:
     """Bilevel meta-net training step using jax.grad.
 
-    Differentiates through the meta-net forward (including lax.associative_scan)
-    to update meta_weights. No custom backward kernel needed.
+    Differentiates through the meta-net forward (including the CSA/HCA
+    compressed-attention mixer) to update meta_weights. No custom backward
+    kernel needed.
     """
     params_flat, _ = jax.tree.flatten(params)
     grads_flat, _ = jax.tree.flatten(train_grads)
@@ -768,9 +847,8 @@ def bilevel_step(
         for i, (g, vg) in enumerate(zip(grads_flat, val_grads_flat)):
             ps = opt_state.param_states[i]
 
-            smart_grad, _, _, _, _ = meta_net_forward(
-                g.reshape(-1), ps.sharpness,
-                ps.gru_state, ps.mamba_fwd_state, ps.mamba_bwd_state,
+            smart_grad, _, _ = meta_net_forward(
+                g.reshape(-1), ps.sharpness, ps.gru_state,
                 mw, meta_config, use_soft_routing=True,
             )
 

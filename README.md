@@ -4,8 +4,8 @@ SuperGrok2 is a C++/CUDA/HIP/Pallas optimizer suite for grokking-aware
 training of large neural networks. It ships twelve optimizers — a plain
 AdamW baseline plus eleven grokking-aware variants spanning sign-momentum,
 sharpness-aware minimization, Newton-Schulz orthogonalization, and a
-Mamba-3 + PEER + GRU meta-network optimizer (SuperGrok v2 — the project's
-namesake). The grokking race driver (`grokking_race_v2.py`) compares all
+CSA/HCA hybrid-attention + PEER + GRU meta-network optimizer (SuperGrok v2 —
+the project's namesake). The grokking race driver (`grokking_race_v2.py`) compares all
 twelve head-to-head on three algorithmic learning tasks under controlled
 conditions.
 
@@ -1121,14 +1121,15 @@ Per-arch coverage of the 12 optimizers and 3 models. Honest legend:
 
 **SuperGrok v2 on gfx942 is 🟡 (functional, perf not verified).** The launcher
 (`csrc/backends/hip/gfx942/launch_supergrok2.hip.cpp`) implements the full
-Mamba + GRU + PEER pipeline via ATen tensor ops. Projection GEMMs go through
-rocBLAS (which dispatches to MFMA `v_mfma_f32_16x16x16_bf16` internally for
-BF16/FP16 at sizes ≥ 16), so the dense-linear-algebra portion does exercise
-the MFMA pipeline. The scan recurrence runs as a host-side sequential loop —
-slower than the Hopper warp-specialized parallel scan but mathematically
-equivalent. The bilevel backward path is not yet implemented on gfx942 and
-will raise; only the forward `supergrok2_prepare_and_batched_step` path is
-functional. Promotion to ✅ requires elementwise allclose validation against
+CSA/HCA attention + GRU + PEER pipeline via ATen tensor ops. Projection /
+QKV / compression GEMMs go through rocBLAS (which dispatches to MFMA
+`v_mfma_f32_16x16x16_bf16` internally for BF16/FP16 at sizes ≥ 16), so the
+dense-linear-algebra portion does exercise the MFMA pipeline. The CSA
+top-k selection (`unfold` + weighted pool + `topk` + softmax) and HCA dense
+attention (mean pool + softmax) run as ATen ops — correct but not warp-fused
+like the Hopper path. The bilevel backward path is not yet implemented on
+gfx942 and will raise; only the forward `supergrok2_prepare_and_batched_step`
+path is functional. Promotion to ✅ requires elementwise allclose validation against
 the sm_90 path on an MI300X.
 
 Everything marked 🟡 is implemented end-to-end in the refactored tree but has
@@ -1174,10 +1175,13 @@ attention QK^T/PV, in/out projections — are what differ):
   dispatch (e.g. `wgmma_matmul` in `transformer_decoder_sm90.cuh` is a
   shape-only placeholder; `in_proj_forward` in `mamba3_sm90.cuh` is a
   scalar inner-product loop). These compile and are numerically correct
-  but do **not** yet emit `wgmma` / TMA. The CUTLASS GEMM that *is* wired
-  lives in `csrc/backends/cuda/sm_90/launch_supergrok2.cu`
-  (`cutlass::gemm::device::Gemm`), and even there the Sm90 collective
-  (warp-group MMA) ArchTag is not yet selected.
+  but do **not** yet emit `wgmma` / TMA. The production CUTLASS GEMM that *is*
+  wired lives in `csrc/backends/cuda/sm_90/launch_supergrok2.cu` and the model
+  GEMM helpers (`models/mamba.cuh`, `models/attention.cuh`); these were
+  upgraded from the SIMT-defaulting `cutlass::gemm::device::Gemm<>` to the
+  **Sm90 `GemmUniversalAdapter`** built via `CollectiveBuilder<arch::Sm90,
+  OpClassTensorOp, …>` (TMA + WGMMA warp-group collective). The reference
+  headers under `kernels/sm_90/` remain scalar placeholders.
 - **TPU (`*_tpu.py`)** uses `pl.pallas_call` with `BlockSpec` tiling in
   `_pallas_kernels.py`.
 
@@ -1617,11 +1621,28 @@ bash build.sh
 Requires `git submodule update --init --recursive third_party/cutlass`.
 Adds `-DCUTLASS_NVCC_ARCHS=90a` and CUTLASS include directories.
 
-CUTLASS is used only by Muon (Newton-Schulz GEMMs) and SuperGrok v2 (dt_proj
-fused softplus). **Without `WITH_CUTLASS=1`**, Muon falls back to cuBLAS via
-`torch::mm` and SuperGrok v2 uses cuBLAS + a separate softplus kernel —
-slightly slower but fully functional. The fall-back path is the default for
-local development; CUTLASS is the production-deployment knob.
+CUTLASS is used by Muon (Newton-Schulz GEMMs) and SuperGrok v2 (the CSA/HCA
+QKV / compression / out-projection GEMMs), upgraded to the **Sm90
+`GemmUniversalAdapter` collective** (TMA + WGMMA via `CollectiveBuilder<arch::Sm90,
+OpClassTensorOp, …>`) rather than the old SIMT-defaulting `Gemm<>`. **Without
+`WITH_CUTLASS=1`**, Muon falls back to cuBLAS via `torch::mm` and SuperGrok v2
+uses cuBLAS / a SMEM fallback — slightly slower but fully functional. The
+fall-back path is the default for local development; CUTLASS is the
+production-deployment knob.
+
+#### Gradient checkpointing (on by default)
+
+Activation/gradient checkpointing is enabled for **all** trainable parts: the
+three race models (`Transformer`, `ViT`, `MambaModel` in `grokking_race_v2.py`,
+checkpointed per transformer/SSM block) and every learned-optimizer meta-net
+(`CSAHCAMetaNet`'s CSA / HCA / GRU / PEER-MLP sub-blocks, plus the
+`SharpnessMetaNet` MLPs in SG v1.1/v1.5 and the NeuralGrok amplifier). It trades
+a backward recompute for a large activation-memory saving and is **numerically
+transparent** (bit-identical outputs and gradients in CPU parity tests). It is
+gated on `module.training and torch.is_grad_enabled()`, so eval / inference and
+the CUDA fused-step paths are unaffected. Toggle per model via the
+`grad_checkpoint` config key (or the `grad_checkpoint=` constructor kwarg on a
+model / meta-net); default is `True`.
 
 ### Targeted build: `grokking_optimizers.compile`
 
@@ -1837,7 +1858,8 @@ Common requirements (all arches):
 - Optional: **`third_party/cutlass`** checked out (
   `git submodule update --init --recursive third_party/cutlass`) — when
   present, the sm_90 build auto-adds `-DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a`
-  so Muon Newton-Schulz and SuperGrok v2 dt_proj route through CUTLASS GEMMs.
+  so Muon Newton-Schulz and SuperGrok v2 CSA/HCA projection GEMMs route
+  through the Sm90 CUTLASS `GemmUniversalAdapter` collective.
 
 #### Autotune search space (programmatic, not YAML)
 
@@ -2043,21 +2065,41 @@ generalization beyond memorization.
 The flagship optimizer. SuperGrok v2 wraps a standard Adam optimizer with a
 sophisticated meta-network that learns how to transform gradients before they
 are applied. At every training step, the raw gradient for each parameter is
-fed through a bidirectional Mamba-3 selective state space scan that captures
-relationships between gradient elements across the parameter vector. The scan
-runs forward and backward through the gradient, building a compressed
-representation of the gradient's spatial structure.
+fed through a **DeepSeek-V4-style CSA/HCA hybrid attention** stack that captures
+relationships between gradient elements across the parameter vector. (This
+replaced the earlier bidirectional Mamba-3 selective scan; only the sequence
+mixer changed — the GRU + PEER routing + expert MLP + AdamW apply tail below is
+unchanged.) The optimizer treats a parameter tensor's flattened elements
+(sorted by |g|) as a *sequence* and runs two complementary attention layers
+over it, at the same small scale as the old Mamba-3 meta-net (d_model ≈ 8):
 
-After the scan, each gradient element is routed through a Product-Key Expert
+- **CSA — Compressed Sparse Attention.** Keys/values are compressed at stride
+  `m = 4` with a *learned* pooling weight, a low-rank "lightning indexer"
+  (rank 4) scores compressed positions and selects the **top-k**, and a sliding
+  window adds local context. CSA produces `csa_ctx`, the fine/local view of the
+  gradient sequence (it plays the role the forward Mamba scan used to).
+- **HCA — Heavily Compressed Attention.** Keys/values are compressed much more
+  aggressively at stride `m' = 128` with mean pooling, then **dense** attention
+  runs over *all* compressed entries (plus a window). HCA produces `hca_ctx`,
+  the global/coarse view (it plays the role the backward Mamba scan used to).
+
+Multi-query KV is shared across attention heads, and all accumulation is FP32.
+Crucially the attention is **stateless across optimizer steps** — unlike the
+carried Mamba fwd/bwd scan state, nothing about CSA/HCA persists between steps,
+so only the GRU hidden state is carried forward.
+
+After attention, each gradient element is routed through a Product-Key Expert
 Routing system (PEER) with 144 learned experts. The routing works by splitting
 each element's representation into two halves, matching each half against a
 bank of learned keys, and picking the top experts from the outer product of
 the two key matches. This gives each element access to four specialized expert
 networks simultaneously, without the cost of evaluating all 144.
 
-A per-element GRU then integrates the current expert-modified gradient with a
-temporal memory of previous steps. The GRU decides how much of the old memory
-to keep and how much new information to incorporate.
+A per-element GRU then integrates the current expert-modified gradient (and
+the `csa_ctx` / `hca_ctx` attention contexts) with a temporal memory of
+previous steps. The GRU decides how much of the old memory to keep and how
+much new information to incorporate; its hidden state is the only meta-net
+state carried across optimizer steps.
 
 The transformed gradient is used in standard Adam momentum and variance
 tracking, with decoupled weight decay. On top of this, SuperGrok v2
@@ -2078,51 +2120,55 @@ cloning the weights of the best-performing expert. Weight decay increases
 sigmoidally with accuracy.
 
 Per-parameter state: gradient momentum, squared gradient average, update
-buffer, sharpness estimate, GRU hidden states, forward Mamba scan state,
-backward Mamba scan state (seven tensors total).
+buffer, sharpness estimate, GRU hidden state (five tensors total). The two
+Mamba scan-state tensors are gone — CSA/HCA attention is stateless across
+steps, so the reference `*State` structs dropped from seven to five tensors.
 
 **Compute pattern.** Mixed — the most varied of the optimizers. Per parameter
 (length N): argsort by |g| (O(N log N) sort), input projection ([N, 2] @ [2, d_model]
-= [N, d_model] GEMM), bidirectional Mamba-3 scan (N sequential timesteps,
-each timestep is a per-element FMA + RoPE rotation across d_inner × d_state
-state pairs), out_proj GEMM ([N, d_inner] @ [d_inner, d_model]), unsort
-(O(N) gather), PEER routing (num_heads × topk² candidate evaluations, each
-a small expert MLP), per-element GRU step, AdamW. Bilevel backward is
-saved-activations + adjoint scan + meta-net backward through autograd.
+= [N, d_model] GEMM), **CSA** (compress KV at stride m=4 → N/4 entries, low-rank
+lightning-indexer top-k scoring + sliding-window attention), **HCA** (compress
+KV at stride m'=128 → N/128 entries, dense attention over all compressed
+entries + window), out_proj GEMM, unsort (O(N) gather), PEER routing
+(num_heads × topk² candidate evaluations, each a small expert MLP), per-element
+GRU step, AdamW. Bilevel backward is autograd through the differentiable
+CSA/HCA forward (saved attention denominators / selected-index sets / probs),
+not a hand-written scan adjoint.
 
-**Dependency chain.** The scan is the serial bottleneck: each timestep
-depends on the previous (no parallelism across t without Blelloch). PEER
-routing and the GRU step are fully parallel across N once the scan finishes.
-The bidirectional scans (forward + backward over t) are independent of
-each other — they can run on different streams in principle. AdamW
-trails everything; depends on the smart_grad output of PEER+GRU.
+**Dependency chain.** Attention replaces the serial scan with two parallel
+reductions: CSA and HCA are independent of each other (different streams in
+principle), and within each, the compress → score/select → weighted-sum stages
+are batched across the whole sequence rather than stepped t-by-t. PEER routing
+and the GRU step are fully parallel across N once attention finishes. AdamW
+trails everything; it depends on the smart_grad output of PEER+GRU.
 
 **State.** Per-element: param, grad, sharpness, exp_avg, exp_avg_sq, mu,
-gru_state (size gru_hidden ≈ 8). Per-tensor: mamba_fwd_state and
-mamba_bwd_state (one [d_inner, d_state] matrix per param). Per-step:
-bc1, bc2, alpha_mu, lamb_eff, ramp, gate_signal (scalars). Meta-net
-weights (in_proj, dt_proj, B/C_proj, A_log, D, rope_freq, out_proj, GRU
-linears, expert MLPs, product keys) are shared across all params for the
-whole training run.
+gru_state (size gru_hidden ≈ 8). No per-tensor scan state — attention is
+recomputed from the (sorted) gradient each step. Per-step: bc1, bc2, alpha_mu,
+lamb_eff, ramp, gate_signal (scalars). Meta-net weights (input_proj, the CSA
+block `csa_q/k/v/out_W`, `csa_compress_w`, `csa_idx_DQ/UQ/K`, the HCA block
+`hca_q/k/v/out_W`, GRU linears, expert MLPs, product keys) are shared across
+all params for the whole training run.
 
-**Precision.** FP32 accumulators throughout (scan state h, GRU state,
-Adam moments). Projection GEMMs accept BF16 input with FP32 accumulate
-(MFMA-friendly on CDNA3, WGMMA-friendly on Hopper). The sort, RoPE
-rotation, and PEER softmax stay in FP32 — quantizing them risks losing
-the top-k selection. INT8/INT4 quantization is supported for the expert
-MLP weights and param storage (with stochastic rounding on the
+**Precision.** FP32 accumulators throughout (attention softmax denominators,
+GRU state, Adam moments). The QKV / compression / out projections accept BF16
+input with FP32 accumulate (MFMA-friendly on CDNA3, WGMMA-friendly on Hopper —
+routed through the Sm90 CUTLASS `GemmUniversalAdapter` collective on Hopper).
+The sort, indexer scoring, and PEER/attention softmax stay in FP32 — quantizing
+them risks losing the top-k selection. INT8/INT4 quantization is supported for
+the expert MLP weights and param storage (with stochastic rounding on the
 quantization step).
 
 ### SuperGrok v1.5
 
-A simplified version of SuperGrok v2 that replaces the Mamba scan, PEER
-routing, and GRU with a small two-layer feedforward network (MLP). At each
-step, the MLP takes two inputs for each parameter element: the raw gradient
-and the current sharpness estimate. It outputs a correction term that is added
-to the gradient before the Adam update.
+A simplified version of SuperGrok v2 that replaces the CSA/HCA hybrid
+attention, PEER routing, and GRU with a small two-layer feedforward network
+(MLP). At each step, the MLP takes two inputs for each parameter element: the
+raw gradient and the current sharpness estimate. It outputs a correction term
+that is added to the gradient before the Adam update.
 
 The key simplification is that gradient transformation happens independently
-per element through the MLP, rather than through the spatially-aware scan and
+per element through the MLP, rather than through the spatially-aware attention and
 routing of v2. This makes the optimizer much cheaper to run while retaining
 the core idea of learned gradient modification.
 
@@ -2611,15 +2657,16 @@ self-contained:
 Model symbols are exposed through `sg::sm90::models::*` and
 `sg::gfx942::models::*` to match the bindings' DISPATCH macros.
 
-### Launch glue (10 files per backend)
+### Launch glue (11 files per backend)
 
-For each backend, one launch file per optimizer (MoEAwareSuperGrok2 is
-folded into SuperGrok v2):
+For each backend, one launch file per optimizer (the MoE-model compaction
+stubs, quantization stubs, and distributed-scan helpers are folded into
+SuperGrok v2's launcher):
 
 ```
-csrc/backends/cuda/sm_90/launch_<opt>.cu       (10 files; SG2 absorbed MoE)
-csrc/backends/hip/gfx942/launch_<opt>.hip.cpp  (10 files; SG2 raises std::runtime_error)
-csrc/backends/pallas/launch_<opt>.py           (10 files)
+csrc/backends/cuda/sm_90/launch_<opt>.cu       (11 files; SG2 absorbs the folded stubs)
+csrc/backends/hip/gfx942/launch_<opt>.hip.cpp  (11 files; SG2 bilevel-backward raises std::runtime_error)
+csrc/backends/pallas/launch_<opt>.py           (11 files)
 ```
 
 Each launch file is **fully self-contained**:
@@ -2628,16 +2675,17 @@ Each launch file is **fully self-contained**:
    reductions, PTX intrinsics, quantization, BatchedScanCtx, …).
 2. Inlines the per-backend primitives it needs (grid-stride loop,
    vec4 alignment, ATen tensor-op helpers, JAX scan kernels).
-3. For Muon and SG2 (CUDA): inlines `mma.cuh` (CUTLASS wrappers + fused
-   softplus epilogue) directly.
-4. For SG2 (all backends): inlines `affine2x2.h` + the scan adapter.
+3. For Muon and SG2 (CUDA): inlines the CUTLASS Sm90 `GemmUniversalAdapter`
+   wrappers (TMA+WGMMA collective) directly.
+4. For SG2 (all backends): inlines the CSA/HCA attention kernels (KV
+   compression, lightning-indexer top-k, compressed/window attention).
 5. Defines `__global__` kernels (CUDA only) that wrap the per-element step
    in a grid-stride loop.
 6. Provides the host-side launcher function called from bindings.
 
 ### Bindings (`csrc/bindings/`)
 
-Pybind11 entry points that connect Python to the C++ launchers. Five
+Pybind11 entry points that connect Python to the C++ launchers. Three
 files:
 
 - **bindings.cpp** — all per-optimizer dispatchers (forward declarations
@@ -2647,10 +2695,12 @@ files:
   so the diff against the pre-consolidation layout stays legible.
 - **dispatch.cpp** — `int sg::detect_arch()` (CUDA/HIP probes + FORCE_ARCH
   env var) and the `fused_step` placeholder.
-- **distributed_scan.cpp** — the three-phase multi-GPU Mamba-3 scan dispatch.
-- **quantization.cpp** — FP8 / INT8 / INT4 quantize launchers.
 - **helpers.h** — `SG_DISPATCH` macro, the `sg::detect_arch()` forward decl,
   and the device-side gradient norm helpers.
+
+(The former `distributed_scan.cpp` (Mamba-3 multi-GPU scan) and
+`quantization.cpp` (FP8/INT8/INT4 quantize) dispatchers were never-implemented
+placeholders and were removed in the CSA/HCA audit.)
 
 Each dispatcher inside `bindings.cpp` filters undefined gradients, packs
 tensors into vectors, and calls `SG_DISPATCH(launcher, ...)` which picks
@@ -2748,13 +2798,14 @@ The TPU functional rewrite that previously lived under `supergrok2_jax_tpu/`
 was folded into the Pallas backend itself. Each
 `csrc/backends/pallas/launch_<optimizer>.py` is now fully self-contained:
 
-- All 10 launch files carry their own `State` / `Config` namedtuples and
+- All 11 launch files carry their own `State` / `Config` namedtuples and
   the canonical per-parameter step function (Lion, Muon, Prodigy, …),
   plus inlined copies of TPU detection + Pallas-kernel re-exports
   (formerly in `primitives.py`).
 - `launch_supergrok2.py` absorbs the full SG2 functional rewrite:
-  bidirectional Mamba-3 scan, per-element GRU, multi-head PEER routing
-  (soft + hard), meta-net composition, the SG2 optimizer step, the
+  CSA/HCA hybrid attention (the DeepSeek-V4-style sequence mixer that
+  replaced the bidirectional Mamba-3 scan), per-element GRU, multi-head PEER
+  routing (soft + hard), meta-net composition, the SG2 optimizer step, the
   bilevel meta-update, INT8/INT4 quantization helpers, and the folded-in
   MoE multi-tensor launcher (`launch_moe_adam_step`).
 - The former `primitives.py` is deleted — TPU detection and Pallas-kernel

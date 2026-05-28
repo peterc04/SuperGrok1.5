@@ -39,7 +39,33 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.optim import Optimizer
+from torch.utils.checkpoint import checkpoint as _grad_checkpoint
 from typing import Optional, Dict, List, Tuple
+
+
+# Activation/gradient checkpointing helper (mirrors grokking_race_v2.py).
+# Only checkpoints when training AND grad is being tracked — under
+# torch.no_grad()/eval there is nothing to recompute, so we call directly,
+# avoiding checkpoint's overhead and its "no input requires grad" warning.
+# This keeps the eval/inference and CUDA fused-step paths completely unaffected.
+def _maybe_checkpoint(module, x, enabled):
+    """Run ``module(x)`` (single-tensor input), optionally checkpointed."""
+    if enabled and module.training and torch.is_grad_enabled():
+        return _grad_checkpoint(module, x, use_reentrant=False)
+    return module(x)
+
+
+def _maybe_checkpoint_fn(fn, enabled, training, *args):
+    """Run ``fn(*args)`` for an arbitrary self-contained sub-computation,
+    optionally under activation checkpointing.
+
+    Used for the in-forward sub-blocks that are not standalone nn.Modules
+    (per-stage attention closures, PEER expert MLP). ``training`` is the
+    owning module's ``self.training`` flag so eval bypasses recomputation.
+    """
+    if enabled and training and torch.is_grad_enabled():
+        return _grad_checkpoint(fn, *args, use_reentrant=False)
+    return fn(*args)
 
 from grokking_optimizers.dispatch import get_ops
 from grokking_optimizers.dispatch import (
@@ -346,9 +372,11 @@ class HybridCompressedAttention(nn.Module):
         csa_topk: int = 16,
         hca_compress: int = 128,
         indexer_rank: int = 4,
+        grad_checkpoint: bool = True,
     ):
         super().__init__()
         assert mode in ('csa', 'hca'), f"mode must be 'csa' or 'hca', got {mode}"
+        self.grad_checkpoint = grad_checkpoint
         assert d_model % num_heads == 0, \
             f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
         self.d_model = d_model
@@ -400,7 +428,11 @@ class HybridCompressedAttention(nn.Module):
         k_tok = self.k_W(x)                   # [N, d]
         v_tok = self.v_W(x)                   # [N, d]
 
-        if self.mode == 'csa':
+        # The heavy attention body (compression + indexer + scores + softmax)
+        # is wrapped as a self-contained closure so it can be recomputed in the
+        # backward pass instead of being held in memory. Output is the
+        # pre-out_W context [N, d].
+        def _csa_body(x, q, k_tok, v_tok):
             stride = self.csa_compress
             win = self.csa_window
             # ── Strided weighted pooling of K/V into compressed entries ──
@@ -456,9 +488,9 @@ class HybridCompressedAttention(nn.Module):
             ctx_h = (torch.einsum('nhk,nkhd->nhd', attn_c, sel_vh)
                      + torch.einsum('nhw,nwhd->nhd', attn_w, win_v))  # [N, H, hd]
             ctx = ctx_h.reshape(N, d)
-            return self.out_W(ctx)
+            return ctx
 
-        else:
+        def _hca_body(x, q, k_tok, v_tok):
             # ── HCA: stride-128 mean pool, dense attention over all entries ──
             stride = self.hca_compress
             nh = (N + stride - 1) // stride
@@ -498,27 +530,38 @@ class HybridCompressedAttention(nn.Module):
             ctx_h = (torch.einsum('hnm,hmd->hnd', attn_c, c_vh)
                      + torch.einsum('hnw,hnwd->hnd', attn_w, win_vh))  # [H, N, hd]
             ctx = ctx_h.permute(1, 0, 2).reshape(N, d)
-            return self.out_W(ctx)
+            return ctx
+
+        body = _csa_body if self.mode == 'csa' else _hca_body
+        ctx = _maybe_checkpoint_fn(
+            body, self.grad_checkpoint, self.training, x, q, k_tok, v_tok)
+        return self.out_W(ctx)
 
 
 class MiniGRU(nn.Module):
     """Tiny per-element GRU for temporal memory across optimizer steps."""
 
-    def __init__(self, input_dim: int, hidden_dim: int = 4):
+    def __init__(self, input_dim: int, hidden_dim: int = 4,
+                 grad_checkpoint: bool = True):
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.grad_checkpoint = grad_checkpoint
         self.W_z = nn.Linear(input_dim + hidden_dim, hidden_dim)
         self.W_r = nn.Linear(input_dim + hidden_dim, hidden_dim)
         self.W_h = nn.Linear(input_dim + hidden_dim, hidden_dim)
 
     def forward(self, x: torch.Tensor, h: torch.Tensor):
-        xh = torch.cat([x, h], dim=-1)
-        z = torch.sigmoid(self.W_z(xh))
-        r = torch.sigmoid(self.W_r(xh))
-        xrh = torch.cat([x, r * h], dim=-1)
-        h_tilde = torch.tanh(self.W_h(xrh))
-        h_new = (1 - z) * h + z * h_tilde
-        return h_new
+        def _gru_body(x, h):
+            xh = torch.cat([x, h], dim=-1)
+            z = torch.sigmoid(self.W_z(xh))
+            r = torch.sigmoid(self.W_r(xh))
+            xrh = torch.cat([x, r * h], dim=-1)
+            h_tilde = torch.tanh(self.W_h(xrh))
+            h_new = (1 - z) * h + z * h_tilde
+            return h_new
+
+        return _maybe_checkpoint_fn(
+            _gru_body, self.grad_checkpoint, self.training, x, h)
 
 
 class CSAHCAMetaNet(nn.Module):
@@ -548,8 +591,10 @@ class CSAHCAMetaNet(nn.Module):
         csa_topk: int = 16,
         hca_compress: int = 128,
         indexer_rank: int = 4,
+        grad_checkpoint: bool = True,
     ):
         super().__init__()
+        self.grad_checkpoint = grad_checkpoint
         self.d_model = d_model
         self.d_state = d_state
         self.num_peer_heads = num_peer_heads
@@ -578,15 +623,18 @@ class CSAHCAMetaNet(nn.Module):
             d_model, mode='csa', num_heads=n_heads,
             csa_compress=csa_compress, csa_window=csa_window, csa_topk=csa_topk,
             hca_compress=hca_compress, indexer_rank=indexer_rank,
+            grad_checkpoint=grad_checkpoint,
         )
         self.hca_layer = HybridCompressedAttention(
             d_model, mode='hca', num_heads=n_heads,
             csa_compress=csa_compress, csa_window=csa_window, csa_topk=csa_topk,
             hca_compress=hca_compress, indexer_rank=indexer_rank,
+            grad_checkpoint=grad_checkpoint,
         )
 
         gru_input_dim = 2 + 2 * d_model
-        self.gru = MiniGRU(gru_input_dim, gru_hidden)
+        self.gru = MiniGRU(gru_input_dim, gru_hidden,
+                           grad_checkpoint=grad_checkpoint)
 
         peer_input_dim = gru_hidden + 2 * d_model + 2
         self.peer_queries = nn.ModuleList([
@@ -738,10 +786,19 @@ class CSAHCAMetaNet(nn.Module):
             b2 = self.expert_b2[expert_indices]
 
             num_active = topk * topk
-            g_exp = g.unsqueeze(1).unsqueeze(-1).unsqueeze(-1).expand(-1, num_active, -1, -1)
-            z = torch.relu(torch.matmul(W1, g_exp).squeeze(-1) + b1)
-            out = torch.matmul(W2, z.unsqueeze(-1)).squeeze(-1).squeeze(-1) + b2.squeeze(-1)
-            head_out = (routing_weights * out).sum(dim=1, keepdim=True)
+
+            # Per-head expert MLP (the two batched matmuls + relu) is the
+            # largest self-contained sub-block here; checkpoint it so the
+            # [N, num_active, ...] activations are recomputed in backward.
+            def _expert_mlp(g, W1, b1, W2, b2, routing_weights):
+                g_exp = g.unsqueeze(1).unsqueeze(-1).unsqueeze(-1).expand(-1, num_active, -1, -1)
+                z = torch.relu(torch.matmul(W1, g_exp).squeeze(-1) + b1)
+                out = torch.matmul(W2, z.unsqueeze(-1)).squeeze(-1).squeeze(-1) + b2.squeeze(-1)
+                return (routing_weights * out).sum(dim=1, keepdim=True)
+
+            head_out = _maybe_checkpoint_fn(
+                _expert_mlp, self.grad_checkpoint, self.training,
+                g, W1, b1, W2, b2, routing_weights)
             total_expert_out = total_expert_out + head_out
 
         total_expert_out = total_expert_out / self.num_peer_heads
@@ -2150,7 +2207,22 @@ class MoEAwareSuperGrok2(SuperGrok2):
     def _moe_step(self, active_expert_indices, gate_logits=None,
                   param_to_expert=None, expert_active=None,
                   threshold=0.0, closure=None, **kwargs):
-        """MoE-aware step: compact -> scan -> scatter."""
+        """MoE-aware step: compact -> attention meta-net -> scatter.
+
+        NOTE: the device-side MoE-model compaction kernels (``moe_filter_active_params``,
+        ``moe_scatter_results``, ``moe_count_expert_activations``, ...) are
+        not yet implemented — they are registered as throwing placeholders.
+        This path therefore raises a clear error rather than failing deep
+        inside a kernel call. Use the standard dense ``SuperGrok2.step()``
+        (call ``step()`` without ``active_expert_indices``), which transparently
+        falls back to the dense path. The meta-model's own PEER product-key
+        expert routing is unaffected and always active on the dense path.
+        """
+        raise NotImplementedError(
+            "MoEAwareSuperGrok2 device-side expert compaction is not implemented "
+            "(the moe_* kernels are throwing placeholders). Run the dense path by "
+            "calling step() without active_expert_indices; the meta-model's PEER "
+            "expert routing still runs there.")
         loss = None
         if closure is not None:
             with torch.enable_grad():

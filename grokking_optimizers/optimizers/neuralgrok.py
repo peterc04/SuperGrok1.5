@@ -15,10 +15,23 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.optim.optimizer import Optimizer
+from torch.utils.checkpoint import checkpoint as _grad_checkpoint
 
 from grokking_optimizers.dispatch import get_ops
 
 _ops = get_ops()  # Fails loudly if C++ extension not built
+
+
+# Activation/gradient checkpointing helper (mirrors grokking_race_v2.py).
+# Only checkpoints when training AND grad is being tracked — under
+# torch.no_grad()/eval there is nothing to recompute, so we call directly,
+# avoiding checkpoint's overhead and its "no input requires grad" warning.
+# This keeps the eval/inference and CUDA fused-step paths completely unaffected.
+def _maybe_checkpoint(module, x, enabled):
+    """Run ``module(x)`` (single-tensor input), optionally checkpointed."""
+    if enabled and module.training and torch.is_grad_enabled():
+        return _grad_checkpoint(module, x, use_reentrant=False)
+    return module(x)
 
 
 class _Amplifier(nn.Module):
@@ -32,12 +45,14 @@ class _Amplifier(nn.Module):
         hidden_dim: Width of hidden layers (default: 128).
     """
 
-    def __init__(self, num_layers: int = 3, hidden_dim: int = 128) -> None:
+    def __init__(self, num_layers: int = 3, hidden_dim: int = 128,
+                 grad_checkpoint: bool = True) -> None:
         super().__init__()
         if num_layers < 2:
             raise ValueError("num_layers must be >= 2 (input + output layer)")
 
         self.hidden_dim = hidden_dim
+        self.grad_checkpoint = grad_checkpoint
         layers: List[nn.Module] = []
         layers.append(nn.Linear(1, hidden_dim))
         layers.append(nn.ReLU())
@@ -48,9 +63,30 @@ class _Amplifier(nn.Module):
 
         self.net = nn.Sequential(*layers)
 
+        # Group the flat Sequential into natural sub-blocks for checkpointing:
+        # each (Linear, ReLU) pair is one block, plus the trailing output Linear.
+        # Activations are recomputed in the backward pass per-block rather than
+        # held in memory, which is the point of gradient checkpointing.
+        self._blocks = nn.ModuleList()
+        i = 0
+        net_layers = list(self.net)
+        while i < len(net_layers):
+            if i + 1 < len(net_layers) and isinstance(net_layers[i + 1], nn.ReLU):
+                self._blocks.append(nn.Sequential(net_layers[i], net_layers[i + 1]))
+                i += 2
+            else:
+                self._blocks.append(nn.Sequential(net_layers[i]))
+                i += 1
+
     def forward(self, x: Tensor) -> Tensor:
-        """Forward pass: gradient magnitude -> scale factor."""
-        return self.net(x)
+        """Forward pass: gradient magnitude -> scale factor.
+
+        Each (Linear, ReLU) sub-block is independently checkpointed in
+        train mode so its activations are recomputed during backward.
+        """
+        for block in self._blocks:
+            x = _maybe_checkpoint(block, x, self.grad_checkpoint)
+        return x
 
     def get_weights(self) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """Return first- and last-layer weights for the C++ kernel.
@@ -110,6 +146,7 @@ class NeuralGrok(Optimizer):
         inner_steps: int = 1,
         grad_clip: float = 1.0,
         use_grad_hooks: bool = False,
+        grad_checkpoint: bool = True,
     ) -> None:
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -133,7 +170,8 @@ class NeuralGrok(Optimizer):
 
         # The amplifier is constructed before super().__init__ so that it
         # lives on the correct device once parameters are registered.
-        self.amplifier = _Amplifier(num_layers=num_layers, hidden_dim=hidden_dim)
+        self.amplifier = _Amplifier(num_layers=num_layers, hidden_dim=hidden_dim,
+                                    grad_checkpoint=grad_checkpoint)
 
         super().__init__(params, defaults)
 

@@ -1,21 +1,22 @@
 // CUDA sm_90 launch glue for SuperGrok v2.
 // Algorithm: csrc/algorithms/supergrok2.h
 //
-// Consolidates Phase 6's three-way SG2 split (fwd + bwd + warp-specialized)
-// into one launch file per the prompt's target architecture. The
-// warp-specialized path is a runtime branch (activated when uniform d_state
-// is detected), not a separate compilation unit.
+// Consolidates Phase 6's SG2 split (fwd + bwd) into one launch file per the
+// target architecture.
 //
-// This launcher orchestrates the full SG2 pipeline:
+// This launcher orchestrates the full SG2 pipeline. The sequence mixer is a
+// DeepSeek-V4-style CSA/HCA hybrid attention stack (replacing the previous
+// Mamba-3 bidirectional scan); only the mixer changed — the GRU + PEER + Adam
+// tail is unchanged:
 //   (1) input_proj_sort         — kernel
-//   (2) mamba3_scan             — kernel (sequential | parallel | warp-spec)
+//   (2) CSA + HCA attention     — kernels (compressed-sparse + heavily-compressed)
 //   (3) peer_route + gru_step   — kernel
 //   (4) apply tail              — kernel
 //   (5) bilevel_precompute      — kernel (backward / meta-net training)
 //
-// The heavy GEMMs (projections, dt_proj with fused softplus) route through
-// CUTLASS (csrc/backends/cuda/sm_90/mma.cuh) when -DWITH_CUTLASS is set,
-// or cuBLAS via torch::mm otherwise.
+// The heavy GEMMs (QKV / compression / out projections) route through the
+// Sm90 CUTLASS GemmUniversalAdapter collective (TMA+WGMMA) when -DWITH_CUTLASS
+// is set, or cuBLAS via torch::mm otherwise.
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -3673,56 +3674,6 @@ void moe_apply_frequency_scaling(
     int num_experts, int total_activations,
     float min_scale, float max_scale, float smoothing) {
     throw std::runtime_error("moe_apply_frequency_scaling: sm_90 kernel not yet implemented.");
-}
-
-// ═════════════════════════════════════════════════════════════════════════
-//  Quantization (folded from former launch_quantization.cu) — throwing stubs.
-// ═════════════════════════════════════════════════════════════════════════
-
-void launch_fp8_e4m3_quantize(
-    torch::Tensor input, torch::Tensor q_out, torch::Tensor scale) {
-    throw std::runtime_error(
-        "fp8_e4m3_quantize: sm_90 kernel not yet implemented. See roadmap Tier 5.");
-}
-
-void launch_int8_symmetric_quantize(
-    torch::Tensor input, torch::Tensor q_out, torch::Tensor scale) {
-    throw std::runtime_error(
-        "int8_symmetric_quantize: sm_90 kernel not yet implemented. See roadmap Tier 5.");
-}
-
-void launch_int4_gptq_quantize(
-    torch::Tensor input, torch::Tensor packed,
-    torch::Tensor scales, torch::Tensor zeros, int group_size) {
-    throw std::runtime_error(
-        "int4_gptq_quantize: sm_90 kernel not yet implemented. See roadmap Tier 5.");
-}
-
-// ═════════════════════════════════════════════════════════════════════════
-//  Distributed scan (folded from former launch_distributed_scan.cu) — stubs.
-// ═════════════════════════════════════════════════════════════════════════
-
-void distributed_scan_local_with_summary(
-    torch::Tensor x_sorted, torch::Tensor scan_out,
-    torch::Tensor summary_out,
-    torch::Tensor in_proj_W, torch::Tensor dt_proj_W,
-    torch::Tensor B_proj_W, torch::Tensor C_proj_W,
-    torch::Tensor A_log, torch::Tensor D_param,
-    torch::Tensor rope_freq) {
-    throw std::runtime_error(
-        "distributed_scan_local_with_summary: sm_90 kernel not yet implemented.");
-}
-
-void distributed_scan_summary_prefix(
-    torch::Tensor summaries, torch::Tensor prefixes) {
-    throw std::runtime_error(
-        "distributed_scan_summary_prefix: sm_90 kernel not yet implemented.");
-}
-
-void distributed_scan_apply_prefix(
-    torch::Tensor scan_out, torch::Tensor prefix) {
-    throw std::runtime_error(
-        "distributed_scan_apply_prefix: sm_90 kernel not yet implemented.");
 }
 
 }} // namespace sg::sm90

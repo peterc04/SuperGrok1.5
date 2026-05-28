@@ -209,6 +209,24 @@ def _start_ntfy_listener():
 import math, copy, random
 from typing import Dict, Optional
 import torch, torch.nn as nn, torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _grad_checkpoint
+
+# Gradient checkpointing (activation recomputation) is enabled for all models
+# by default — it trades a recompute in backward for a large activation-memory
+# saving, which matters for the deep/long-context grokking runs. It is applied
+# per transformer/SSM block and is automatically bypassed in eval (no grad) so
+# validation/inference cost is unchanged. Override per-run via the "grad_checkpoint"
+# config key.
+def _maybe_checkpoint(module, x, enabled):
+    """Run `module(x)`, optionally under activation checkpointing.
+
+    Only checkpoints when training AND grad is being tracked — under
+    torch.no_grad()/eval there is nothing to recompute so we call directly,
+    avoiding checkpoint's overhead and its "no input requires grad" warning.
+    """
+    if enabled and module.training and torch.is_grad_enabled():
+        return _grad_checkpoint(module, x, use_reentrant=False)
+    return module(x)
 
 MODEL_SCALES = {
     "small":  {"dim_model": 128, "num_heads": 4, "num_layers": 2},   # ~420K params
@@ -328,15 +346,16 @@ class DecoderBlock(nn.Module):
         x = self.n1(x + a); return self.n2(x + self.ff(x))
 
 class Transformer(nn.Module):
-    def __init__(self, nl=2, d=128, h=4, ntok=99, seq=4):
+    def __init__(self, nl=2, d=128, h=4, ntok=99, seq=4, grad_checkpoint=True):
         super().__init__()
         self.tok = nn.Embedding(ntok, d); self.pos = nn.Embedding(seq, d)
         self.layers = nn.ModuleList([DecoderBlock(d, h, seq_len=seq) for _ in range(nl)])
         self.norm = nn.LayerNorm(d); self.out = nn.Linear(d, ntok)
         self.register_buffer('pos_ids', torch.arange(seq).unsqueeze(0))
+        self.grad_checkpoint = grad_checkpoint
     def forward(self, x):
         h = self.tok(x) + self.pos(self.pos_ids)
-        for l in self.layers: h = l(h)
+        for l in self.layers: h = _maybe_checkpoint(l, h, self.grad_checkpoint)
         return self.out(self.norm(h)[:, -1, :])
 
 # ── Model 2: ViT ─────────────────────────────────────────────────────
@@ -351,7 +370,7 @@ class EncoderBlock(nn.Module):
         x = self.n1(x + a); return self.n2(x + self.ff(x))
 
 class ViT(nn.Module):
-    def __init__(self, p=97, patch_dim=49, num_patches=16, d=128, h=4, nl=2):
+    def __init__(self, p=97, patch_dim=49, num_patches=16, d=128, h=4, nl=2, grad_checkpoint=True):
         super().__init__()
         self.patch_proj = nn.Linear(patch_dim, d)
         self.cls_token = nn.Parameter(torch.randn(1, 1, d) * 0.02)
@@ -359,11 +378,12 @@ class ViT(nn.Module):
         self.layers = nn.ModuleList([EncoderBlock(d, h) for _ in range(nl)])
         self.norm = nn.LayerNorm(d); self.out = nn.Linear(d, p)
         self.register_buffer('pos_ids', torch.arange(num_patches + 1).unsqueeze(0))
+        self.grad_checkpoint = grad_checkpoint
     def forward(self, x):
         B = x.size(0); h = self.patch_proj(x)
         h = torch.cat([self.cls_token.expand(B, -1, -1), h], dim=1)
         h = h + self.pos(self.pos_ids)
-        for l in self.layers: h = l(h)
+        for l in self.layers: h = _maybe_checkpoint(l, h, self.grad_checkpoint)
         return self.out(self.norm(h[:, 0, :]))
 
 # ── Model 3: Mamba SSM ───────────────────────────────────────────────
@@ -412,15 +432,16 @@ class SelectiveSSMLayer(nn.Module):
         return self.norm(y + residual)
 
 class MambaModel(nn.Module):
-    def __init__(self, p=97, ntok=99, seq_len=8, d=128, nl=2):
+    def __init__(self, p=97, ntok=99, seq_len=8, d=128, nl=2, grad_checkpoint=True):
         super().__init__()
         self.tok = nn.Embedding(ntok, d); self.pos = nn.Embedding(seq_len, d)
         self.layers = nn.ModuleList([SelectiveSSMLayer(d) for _ in range(nl)])
         self.norm = nn.LayerNorm(d); self.out = nn.Linear(d, p)
         self.register_buffer('pos_ids', torch.arange(seq_len).unsqueeze(0))
+        self.grad_checkpoint = grad_checkpoint
     def forward(self, x):
         h = self.tok(x) + self.pos(self.pos_ids)
-        for l in self.layers: h = l(h)
+        for l in self.layers: h = _maybe_checkpoint(l, h, self.grad_checkpoint)
         return self.out(self.norm(h[:, -1, :]))
 
 # ── Model Factory ─────────────────────────────────────────────────────
@@ -433,9 +454,10 @@ TASK_LABELS = {"decoder": "(a ÷ b) mod 97", "vit": "MNIST (a + b) mod 97", "mam
 
 def _raw_model(c, device):
     mt, p, d, h, nl = c.get("model_type","decoder"), c["p"], c["dim_model"], c["num_heads"], c["num_layers"]
-    if mt == "decoder": return Transformer(nl, d, h, c["num_tokens"], 4).to(device)
-    elif mt == "vit":   return ViT(p=p, patch_dim=c.get("patch_dim",49), num_patches=c.get("num_patches",16), d=d, h=h, nl=nl).to(device)
-    elif mt == "mamba": return MambaModel(p=p, ntok=c["num_tokens"], seq_len=c.get("seq_len",8), d=d, nl=nl).to(device)
+    gc = c.get("grad_checkpoint", True)
+    if mt == "decoder": return Transformer(nl, d, h, c["num_tokens"], 4, grad_checkpoint=gc).to(device)
+    elif mt == "vit":   return ViT(p=p, patch_dim=c.get("patch_dim",49), num_patches=c.get("num_patches",16), d=d, h=h, nl=nl, grad_checkpoint=gc).to(device)
+    elif mt == "mamba": return MambaModel(p=p, ntok=c["num_tokens"], seq_len=c.get("seq_len",8), d=d, nl=nl, grad_checkpoint=gc).to(device)
     else: raise ValueError(f"Unknown: {mt}")
 
 def build_model(c, device, do_compile=False):
