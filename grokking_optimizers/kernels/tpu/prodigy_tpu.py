@@ -1,4 +1,4 @@
-"""TPU/Pallas kernels for Prodigy — distance-aware self-tuning Adam.
+"""TPU/Pallas kernels for Prodigy -- distance-aware self-tuning Adam.
 
 Prodigy automatically estimates the optimal learning rate by tracking the
 distance between current parameters and their initial values.  Two-phase
@@ -55,9 +55,9 @@ def prodigy_update(
     """Prodigy distance-aware Adam update (pure JAX).
 
     Two-phase algorithm:
-      Phase 1 — Compute d_numerator = sum(grad * (param - param_init))
+      Phase 1 -- Compute d_numerator = sum(grad * (param - param_init))
                 and d_denominator = sum(|s|) to update d_lr.
-      Phase 2 — Apply AdamW with effective_lr = d_lr * lr.
+      Phase 2 -- Apply AdamW with effective_lr = d_lr * lr.
 
     Args:
         params: Current parameters (bf16).
@@ -189,7 +189,7 @@ def prodigy_pallas_kernel(
             step, d_lr, beta1, beta2, lr, wd, eps,
         )
 
-    # Phase 1: Global reductions for d_lr (pure JAX — XLA handles these well)
+    # Phase 1: Global reductions for d_lr (pure JAX -- XLA handles these well)
     g_f32 = grads.astype(ACCUM_DTYPE)
     p_f32 = params.astype(ACCUM_DTYPE)
     p0_f32 = param_init.astype(ACCUM_DTYPE)
