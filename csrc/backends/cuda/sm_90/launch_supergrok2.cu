@@ -21,6 +21,7 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include "csrc/algorithms/supergrok2.h"
+#include "csrc/tuning.h"
 // ── inlined from former csrc/backends/cuda/sm_90/primitives.cuh ──
 // CUDA sm_90 (Hopper) primitives — shared across all 11 launch_*.cu files.
 //
@@ -2485,7 +2486,7 @@ void launch_supergrok2_input_proj_sort(
     const int N = grad.numel();
     const int d_model = proj_W.size(0);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    const int block = 256;
+    const int block = SG_TUNED_BLOCK_SIZE;
     const int grid = (N + block - 1) / block;
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -2514,8 +2515,8 @@ void launch_supergrok2_apply(
     const int64_t N = param.numel();
     if (N == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    const int block = 256;
-    const int grid = std::min<int>(8192, (N + block - 1) / block);
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
@@ -2570,8 +2571,8 @@ void launch_moe_adam_step(
     if (N == 0) return;
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    const int block = 256;
-    const int grid = std::min<int>(8192, (N + block - 1) / block);
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,

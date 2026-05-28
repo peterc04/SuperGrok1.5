@@ -25,6 +25,7 @@
 // (~2×) that is hardware-verified or not at all.
 
 #include <torch/extension.h>
+#include "csrc/tuning.h"
 #include <vector>
 
 // ── inlined from former csrc/backends/hip/gfx942/primitives.hpp ──

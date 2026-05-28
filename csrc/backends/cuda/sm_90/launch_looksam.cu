@@ -8,6 +8,7 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include "csrc/algorithms/looksam.h"
+#include "csrc/tuning.h"
 // ── inlined from former csrc/backends/cuda/sm_90/primitives.cuh ──
 // CUDA sm_90 (Hopper) primitives — shared across all 11 launch_*.cu files.
 //
@@ -1109,8 +1110,8 @@ void launch_looksam_perturb(
     const int64_t N = param.numel();
     if (N == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    const int block = 256;
-    const int grid = std::min<int>(8192, (N + block - 1) / block);
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
@@ -1129,8 +1130,8 @@ void launch_looksam_restore(
     const int64_t N = param.numel();
     if (N == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    const int block = 256;
-    const int grid = std::min<int>(8192, (N + block - 1) / block);
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
@@ -1149,8 +1150,8 @@ void launch_looksam_set_direction(
     const int64_t N = sam_dir.numel();
     if (N == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    const int block = 256;
-    const int grid = std::min<int>(8192, (N + block - 1) / block);
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
@@ -1174,8 +1175,8 @@ void launch_looksam_apply(
     const int64_t N = param.numel();
     if (N == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    const int block = 256;
-    const int grid = std::min<int>(8192, (N + block - 1) / block);
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,

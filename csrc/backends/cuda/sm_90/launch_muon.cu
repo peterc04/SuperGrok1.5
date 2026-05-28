@@ -12,6 +12,7 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include "csrc/algorithms/muon.h"
+#include "csrc/tuning.h"
 // ── inlined from former csrc/backends/cuda/sm_90/primitives.cuh ──
 // CUDA sm_90 (Hopper) primitives — shared across all 11 launch_*.cu files.
 //
@@ -1100,8 +1101,8 @@ void launch_muon_momentum_normalize(
     const int64_t N = buf.numel();
     if (N == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    const int block = 256;
-    const int grid = std::min<int>(8192, (N + block - 1) / block);
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
@@ -1121,8 +1122,8 @@ void launch_muon_ns_combine(
     const int64_t N = Y.numel();
     if (N == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    const int block = 256;
-    const int grid = std::min<int>(8192, (N + block - 1) / block);
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
     muon_ns_combine_kernel<<<grid, block, 0, stream>>>(
         Y.data_ptr<float>(), X.data_ptr<float>(),
         AX.data_ptr<float>(), AAX.data_ptr<float>(),
@@ -1136,8 +1137,8 @@ void launch_muon_update(
     const int64_t N = param.numel();
     if (N == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    const int block = 256;
-    const int grid = std::min<int>(8192, (N + block - 1) / block);
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,

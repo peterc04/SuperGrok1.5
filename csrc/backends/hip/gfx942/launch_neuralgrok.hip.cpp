@@ -24,6 +24,7 @@
 // 1 kernel launch (≈ 3 µs).
 
 #include <torch/extension.h>
+#include "csrc/tuning.h"
 #include <vector>
 
 // ── inlined from former csrc/backends/hip/gfx942/primitives.hpp ──

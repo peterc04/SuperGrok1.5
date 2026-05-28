@@ -18,6 +18,7 @@
 // gain is ≈ 1.7× and needs hardware verification.
 
 #include <torch/extension.h>
+#include "csrc/tuning.h"
 #include <vector>
 
 // ── inlined from former csrc/backends/hip/gfx942/primitives.hpp ──
