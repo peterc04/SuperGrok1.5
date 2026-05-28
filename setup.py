@@ -104,8 +104,6 @@ def _collect(globs):
 COMMON_BINDINGS = [
     "csrc/bindings/bindings.cpp",
     "csrc/bindings/dispatch.cpp",
-    "csrc/bindings/distributed_scan.cpp",
-    "csrc/bindings/quantization.cpp",
 ]
 
 if _has_gpu and _is_hip:

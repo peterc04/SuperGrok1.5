@@ -17,12 +17,25 @@ import math
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
+from torch.utils.checkpoint import checkpoint as _grad_checkpoint
 from typing import Optional, Callable, Dict, Any, Tuple
 
 from grokking_optimizers.dispatch import get_ops
 
 _ops = get_ops()  # Fails loudly if C++ extension not built
 _ops_cpu = _ops  # CPU ops are part of the same extension
+
+
+# Activation/gradient checkpointing helper (mirrors grokking_race_v2.py).
+# Only checkpoints when training AND grad is being tracked — under
+# torch.no_grad()/eval there is nothing to recompute, so we call directly,
+# avoiding checkpoint's overhead and its "no input requires grad" warning.
+# This keeps the eval/inference and CUDA fused-step paths completely unaffected.
+def _maybe_checkpoint(module, x, enabled):
+    """Run ``module(x)`` (single-tensor input), optionally checkpointed."""
+    if enabled and module.training and torch.is_grad_enabled():
+        return _grad_checkpoint(module, x, use_reentrant=False)
+    return module(x)
 
 
 class SharpnessMetaNet(nn.Module):
@@ -32,9 +45,10 @@ class SharpnessMetaNet(nn.Module):
     MLP: Linear(2, H) -> GELU -> Linear(H, 1)
     """
 
-    def __init__(self, hidden_dim: int = 32):
+    def __init__(self, hidden_dim: int = 32, grad_checkpoint: bool = True):
         super().__init__()
         self.hidden_dim = hidden_dim
+        self.grad_checkpoint = grad_checkpoint
         self.net = nn.Sequential(
             nn.Linear(2, hidden_dim),
             nn.GELU(),
@@ -54,7 +68,11 @@ class SharpnessMetaNet(nn.Module):
         flat_g = grad.reshape(-1, 1)
         flat_s = sharpness.reshape(-1, 1)
         inp = torch.cat([flat_g, flat_s], dim=1)
-        correction = self.rescale * self.net(inp)
+        # The MLP (Linear -> GELU -> Linear) is the only non-trivial
+        # self-contained sub-computation here, so it is checkpointed as a
+        # single block; the surrounding cat/rescale/reshape ops are negligible.
+        correction = self.rescale * _maybe_checkpoint(
+            self.net, inp, self.grad_checkpoint)
         return (flat_g + correction).reshape(shape)
 
     def get_weights(self):
@@ -110,6 +128,7 @@ class SuperGrok15(Optimizer):
         wd_thresh: float = 0.9,
         sam_enable_threshold: float = 0.0,
         use_grad_hooks: bool = False,
+        grad_checkpoint: bool = True,
     ):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
@@ -144,7 +163,8 @@ class SuperGrok15(Optimizer):
         self.wd_thresh = wd_thresh
 
         if meta_net is None:
-            self.meta_net = SharpnessMetaNet(meta_hidden_dim)
+            self.meta_net = SharpnessMetaNet(meta_hidden_dim,
+                                             grad_checkpoint=grad_checkpoint)
         else:
             self.meta_net = meta_net
 

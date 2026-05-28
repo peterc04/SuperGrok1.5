@@ -3258,16 +3258,6 @@ PYBIND11_MODULE(_ops, m) {
  m.def("moe_compute_load_balance_loss", &sg::moe_compute_load_balance_loss);
  m.def("moe_apply_frequency_scaling", &sg::moe_apply_frequency_scaling);
 
- // Distributed scan
- m.def("distributed_scan_phase1", &sg::distributed_scan_phase1);
- m.def("distributed_scan_phase2", &sg::distributed_scan_phase2);
- m.def("distributed_scan_phase3", &sg::distributed_scan_phase3);
-
- // Quantization
- m.def("fp8_e4m3_quantize", &sg::fp8_e4m3_quantize);
- m.def("int8_symmetric_quantize", &sg::int8_symmetric_quantize);
- m.def("int4_gptq_quantize", &sg::int4_gptq_quantize);
-
  // SuperGrok v2 — CSA/HCA hybrid-attention meta-net entries.
  // Wrappers in csrc/bindings/supergrok2.cpp dispatch to the per-arch
  // launchers launch_csa_hca_* in csrc/kernels/{cuda/<sm>,hip/<gfx>}/.
