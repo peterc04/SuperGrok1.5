@@ -29,6 +29,26 @@ from grokking_optimizers.dispatch import get_ops
 _ops = get_ops()  # Fails loudly on first attribute access if extension not built
 
 
+def _validate_grad(p):
+    """Validate a gradient before handing its data_ptr to the fused kernel.
+
+    The fused kernels index raw contiguous memory and dispatch on the
+    parameter's dtype (treating the grad buffer as the same scalar type),
+    so a sparse, dtype-mismatched, or non-contiguous gradient would
+    silently corrupt the parameter and optimizer state. There is no Python
+    fallback, so reject the unsupported cases loudly and densify the rest.
+    """
+    g = p.grad
+    if g.is_sparse:
+        raise RuntimeError(
+            "fused optimizer kernel does not support sparse gradients")
+    if g.dtype != p.dtype:
+        raise RuntimeError(
+            f"grad dtype {g.dtype} != param dtype {p.dtype}; cast gradients "
+            "to the parameter dtype before step()")
+    return g if g.is_contiguous() else g.contiguous()
+
+
 class AdamW(Optimizer):
     """Adam with decoupled weight decay (multi-tensor fused step).
 
@@ -56,6 +76,8 @@ class AdamW(Optimizer):
     ) -> None:
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
+        if not isinstance(betas, (tuple, list)) or len(betas) != 2:
+            raise ValueError(f"Invalid betas (expected a 2-tuple): {betas}")
         if not 0.0 <= betas[0] < 1.0:
             raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
         if not 0.0 <= betas[1] < 1.0:
@@ -92,6 +114,7 @@ class AdamW(Optimizer):
             for p in group["params"]:
                 if p.grad is None:
                     continue
+                grad = _validate_grad(p)
 
                 state = self.state[p]
                 if len(state) == 0:
@@ -101,7 +124,7 @@ class AdamW(Optimizer):
 
                 state["step"] += 1
                 params_list.append(p)
-                grads_list.append(p.grad)
+                grads_list.append(grad)
                 exp_avg_list.append(state["exp_avg"])
                 exp_avg_sq_list.append(state["exp_avg_sq"])
                 steps_list.append(int(state["step"]))
@@ -128,6 +151,7 @@ class AdamW(Optimizer):
         """Per-parameter step for the ``use_grad_hooks=True`` path."""
         if param.grad is None:
             return
+        grad = _validate_grad(param)
         if len(state) == 0:
             state["step"] = 0
             state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
@@ -135,7 +159,7 @@ class AdamW(Optimizer):
         state["step"] += 1
         _ops.fused_adamw_simple_step(
             [param],
-            [param.grad],
+            [grad],
             [state["exp_avg"]],
             [state["exp_avg_sq"]],
             [int(state["step"])],

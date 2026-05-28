@@ -660,7 +660,10 @@ _ARCH_TABLE_PRIMARY: Dict[str, ArchEntry] = {
         warp_size=64,
         max_regs_per_thread=255,
         max_threads_per_block=1024,
-        features=frozenset({"mfma"}),
+        # Vega20 has NO MFMA units — MFMA debuted on CDNA1 (gfx908). Tagging
+        # mfma here emitted -DAMDGPU_MFMA_ENABLED=1 and an mfma_shape search
+        # dim for hardware that can't run MFMA intrinsics.
+        features=frozenset(),
     ),
 
     "gfx908": ArchEntry(
@@ -1124,10 +1127,7 @@ def _maxrregcount_values(arch_key: str) -> List[int]:
     entry = ARCH_TABLE[arch_key]
     cap = entry.max_regs_per_thread or 255
     # Per spec: [24, 28, 32, ..., 248] in 4-step increments, capped per arch.
-    floor_n = max(24, (cap // 8) * 4 // 4 * 4)  # at least max_regs/8 *4 step
-    floor_n = max(24, (cap // 8))
-    # Snap floor to a multiple of 4.
-    floor_n = max(24, (floor_n + 3) // 4 * 4)
+    floor_n = 24
     vals = list(range(floor_n, min(249, cap + 1), 4))
     if cap >= 255 and 255 not in vals:
         vals.append(255)
@@ -1597,7 +1597,7 @@ def _gfx942_full_space() -> Dict[str, Any]:
                  "SG_TUNED_UNROLL", ["host", "device"]),
             _dim("num_stages", "int", list(range(1, 9)),
                  "SG_TUNED_NUM_STAGES", ["device"]),
-            _dim("maxrregcount", "int", list(range(32, 257, 4)),
+            _dim("maxrregcount", "int", list(range(32, 256, 4)),
                  None, ["device"]),
             _dim("waves_per_eu", "int", list(range(1, 11)),
                  "SG_TUNED_WAVES_PER_EU", ["device"]),
@@ -1614,7 +1614,8 @@ def _gfx942_full_space() -> Dict[str, Any]:
                  "SG_TUNED_SCHEDULER_HINT", ["device"]),
         ],
         "prefilter": {
-            "register_pressure_max": 256,
+            # AMDGPU per-thread VGPR ceiling is 255, not 256.
+            "register_pressure_max": 255,
             "waves_per_eu_max": 10,
             "smem_budget_bytes": entry.max_smem_per_block or 65536,
             "rules": [
@@ -2335,22 +2336,26 @@ def use_flags(
     """Append profile-use flags."""
     profile_dir = Path(profile_dir).resolve()
 
-    h = list(host_cflags) + [
-        f"-fprofile-use={profile_dir}",
-        "-fprofile-correction",
-    ]
-    d: List[str] = list(device_cflags)
     entry = get_arch_entry(arch) if arch in ARCH_TABLE else None
+    is_hip = entry is not None and entry.vendor == "hip"
+    # ``-fprofile-correction`` is a GCC-only flag (handles atomic-update
+    # races in the gcov counters). clang — which hipcc drives — rejects it,
+    # so only emit it for the gcc host-compiler (CUDA/CPU) path. NOTE: clang
+    # PGO additionally needs the raw .profraw files merged with
+    # ``llvm-profdata merge`` before ``-fprofile-use`` can consume them; on
+    # HIP hosts the pass-3 build will fall back to a non-PGO build when the
+    # merged profile is absent (functionally correct, just un-profiled).
+    h = list(host_cflags) + [f"-fprofile-use={profile_dir}"]
+    if not is_hip:
+        h.append("-fprofile-correction")
+    d: List[str] = list(device_cflags)
     if entry is not None and entry.vendor == "cuda":
         d += [
             "-Xcompiler", f"-fprofile-use={profile_dir}",
             "-Xcompiler", "-fprofile-correction",
         ]
-    elif entry is not None and entry.vendor == "hip":
-        d += [
-            f"-fprofile-use={profile_dir}",
-            "-fprofile-correction",
-        ]
+    elif is_hip:
+        d += [f"-fprofile-use={profile_dir}"]
     l = list(ldflags) + [f"-fprofile-use={profile_dir}"]
     return h, d, l
 
@@ -4505,14 +4510,14 @@ def _detect_topk_elbow(records: List[Dict[str, Any]]) -> int:
     # Second discrete differences: t[i-1] - 2*t[i] + t[i+1]
     d2 = [times[i - 1] - 2.0 * times[i] + times[i + 1]
           for i in range(1, len(times) - 1)]
-    # Peak negative curvature would be a max of |d2|; we want the first
-    # index where d2 spikes substantially. Take argmax of -d2 (since
-    # the knee is where the second derivative becomes large and negative
-    # in a convex-then-flat curve).
+    # times is sorted ascending, so the curve is flat ("good" configs)
+    # then turns sharply upward (long-tail slow configs). The knee is the
+    # point of maximum *positive* curvature (largest second difference) —
+    # i.e. where the convex up-turn is steepest. argmax(d2) finds it.
     if not d2 or all(abs(x) < 1e-12 for x in d2):
         return min(50, max(1, len(times) // 4))
     # The knee index in the original 'times' array is d2_idx + 1
-    knee = max(range(len(d2)), key=lambda i: -d2[i]) + 1
+    knee = max(range(len(d2)), key=lambda i: d2[i]) + 1
     # Ensure at least a few seeds even if curvature is shallow
     knee = max(knee, min(3, len(times)))
     return min(50, knee)
@@ -5167,6 +5172,32 @@ def _read_trial_log_summary(sidecar_path: Path,
     }
 
 
+def _read_trial_log_records(sidecar_path: Path) -> List[Dict[str, Any]]:
+    """Read every trial record from a ``.jsonl`` sidecar. Returns [] on a
+    missing/unreadable file. Companion to ``_read_trial_log_summary`` for
+    callers that need the full records (transfer learning, cache prune)
+    after a fresh-process load — the v4 cache strips the in-memory
+    ``bayesian_trials`` / ``sweep_history`` lists before writing the main
+    JSON, so they must be re-read from the sidecar.
+    """
+    out: List[Dict[str, Any]] = []
+    try:
+        with Path(sidecar_path).open("r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    rec = json.loads(ln)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(rec, dict):
+                    out.append(rec)
+    except OSError:
+        pass
+    return out
+
+
 class _DebugTee:
     """File-like wrapper that mirrors every write to a secondary stream.
 
@@ -5789,17 +5820,27 @@ class CompileCache:
                 # buckets so a v2-style cache (sweep_history only) still
                 # gets ranked correctly.
                 best_ms: Dict[str, float] = {}
-                for src in ("sweep_history", "bayesian_trials"):
-                    for t in entry.get(src) or []:
-                        if not isinstance(t, dict):
-                            continue
-                        ck = t.get("config_key")
-                        tms = t.get("timing_ms")
-                        if ck is None or tms is None:
-                            continue
-                        prior = best_ms.get(ck, math.inf)
-                        if tms < prior:
-                            best_ms[ck] = tms
+                trial_iter = list(entry.get("sweep_history") or []) \
+                    + list(entry.get("bayesian_trials") or [])
+                if not trial_iter:
+                    # v4 caches strip the in-memory trial lists before
+                    # writing; reload from the .jsonl sidecar so prune ranks
+                    # variants by REAL timing rather than tying every ckey at
+                    # inf and keeping an arbitrary dict-order top-N.
+                    tlp = entry.get("trial_log_path")
+                    if tlp and self.path is not None:
+                        trial_iter = _read_trial_log_records(
+                            self.path.parent / tlp)
+                for t in trial_iter:
+                    if not isinstance(t, dict):
+                        continue
+                    ck = t.get("config_key")
+                    tms = t.get("timing_ms")
+                    if ck is None or tms is None:
+                        continue
+                    prior = best_ms.get(ck, math.inf)
+                    if tms < prior:
+                        best_ms[ck] = tms
 
                 # Always preserve the tuned winner's ckey if present.
                 tuned = entry.get("tuned_config") or {}
@@ -6702,8 +6743,24 @@ def _bootstrap_rocm_via_amd_apt_repo(stream, arch: str) -> bool:
             return False
         subprocess.run(sudo + ["apt-key", "add", key_path],
                        check=True, timeout=30, env=env)
-        # Add repo
-        sources_line = f"deb [arch=amd64] {rocm_repo_url} ubuntu main"
+        # Add repo. AMD's ROCm apt layout is keyed by the distro CODENAME
+        # (jammy/focal/noble for Ubuntu, bookworm/bullseye for Debian), NOT
+        # the literal string "ubuntu" — using "ubuntu" makes `apt-get update`
+        # fail to find the release file on every host.
+        codename = ""
+        try:
+            with open("/etc/os-release") as _f:
+                for _line in _f:
+                    if _line.startswith("VERSION_CODENAME="):
+                        codename = _line.strip().split("=", 1)[1].strip('"')
+                        break
+        except Exception:
+            codename = ""
+        if not codename:
+            stream.write("[bootstrap_rocm:apt] could not determine distro "
+                         "codename from /etc/os-release\n")
+            return False
+        sources_line = f"deb [arch=amd64] {rocm_repo_url} {codename} main"
         list_path = "/etc/apt/sources.list.d/rocm.list"
         subprocess.run(
             sudo + ["bash", "-c", f"echo '{sources_line}' > {list_path}"],
@@ -7524,7 +7581,16 @@ def _collect_sibling_trials(cache: CompileCache, opt: str, model: str,
             continue
         if key.startswith(f"{opt}/"):
             continue  # don't reseed from the same optimizer
-        for t in entry.get("bayesian_trials", []):
+        trials = entry.get("bayesian_trials") or []
+        if not trials:
+            # v4 caches strip the in-memory trial lists before writing the
+            # main JSON; reload from the .jsonl sidecar so transfer learning
+            # actually works across process boundaries (otherwise every run
+            # silently cold-started).
+            tlp = entry.get("trial_log_path")
+            if tlp and cache.path is not None:
+                trials = _read_trial_log_records(cache.path.parent / tlp)
+        for t in trials:
             if t.get("timing_ms") is not None and "config" in t:
                 sibling_trials.append(t)
     return sibling_trials
@@ -11609,8 +11675,20 @@ def _build_aot_pgo(spec: BuildSpec, cache: CompileCache, sources: List[Path],
     report.write("\n  [pgo 1/3] building instrumented .so\n")
     inst_host, inst_device, inst_ld = instrument_flags(
         spec.arch, profile_dir, host_cflags, device_cflags, ldflags)
-    inst_spec = BuildSpec(**{**spec.__dict__})
-    inst_spec.extra_macros = list(spec.extra_macros) + ["-DSG_PGO_INSTRUMENT=1"]
+    # Clone the spec for the instrumented build with FRESH copies of every
+    # mutable field — a plain BuildSpec(**spec.__dict__) shares the same
+    # dict/list objects (_emitted_sources, flag_probe_dropped, config,
+    # source_roots) by reference, so a mutation through inst_spec would leak
+    # back into the caller's spec.
+    import dataclasses as _dc
+    inst_spec = _dc.replace(
+        spec,
+        extra_macros=list(spec.extra_macros) + ["-DSG_PGO_INSTRUMENT=1"],
+        _emitted_sources=dict(spec._emitted_sources),
+        flag_probe_dropped=list(spec.flag_probe_dropped),
+        config=dict(spec.config),
+        source_roots=dict(spec.source_roots),
+    )
     inst_so = _torch_load(inst_spec, sources, inst_host, inst_device,
                           inst_ld, report, module_suffix="_pgo_instrument")
     if inst_so is None:
@@ -13248,7 +13326,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.runtime = "jit"
     if args.quick:
         args.mode = "bayesian"
-        args.bayesian_trials = QUICK_BAYESIAN_TRIALS
+        # Only impose the quick trial cap when the user didn't pin an explicit
+        # count — otherwise `--quick --bayesian-trials N` silently dropped N.
+        if args.bayesian_trials is None:
+            args.bayesian_trials = QUICK_BAYESIAN_TRIALS
 
     # ── --prune mode: GC the variant cache and exit, no build ──────
     if args.prune:
@@ -19906,14 +19987,27 @@ def apply_schedule(loopnest: LoopNest, schedule: Schedule,
     # tests / external callers), fall back to an identity copy and
     # advertise the limitation in a comment so the path is honest.
     body_indent = indent * (depth + 1)
-    first_ivar = iter_vars[0]
+    # Build a valid index expression from the INNERMOST emitted loop variable
+    # so the identity-copy fallback compiles regardless of tiling. A tiled
+    # axis only declares ``<ivar>_outer`` / ``<ivar>_inner`` (no bare
+    # ``<ivar>``), so referencing iter_vars[0] directly produced an undefined
+    # identifier for any tiled schedule.
+    if perm:
+        inner_ax = perm[-1]
+        inner_ivar = iter_vars[inner_ax]
+        if tile_map.get(inner_ax, 0) and tile_map[inner_ax] > 1:
+            idx_expr = f"{inner_ivar}_outer + {inner_ivar}_inner"
+        else:
+            idx_expr = inner_ivar
+    else:
+        idx_expr = "0"
     body_lines = _apply_schedule_lift_body(
         loopnest, schedule, iter_vars, body_indent)
     if body_lines is None:
         lines.append(
             f"{body_indent}// schedule shape only; libclang absent "
             f"— body unchanged")
-        lines.append(f"{body_indent}int _idx = {first_ivar};")
+        lines.append(f"{body_indent}int _idx = {idx_expr};")
         lines.append(f"{body_indent}if (_idx < n_elems) {{")
         lines.append(f"{body_indent}    out[_idx] = in[_idx];")
         lines.append(f"{body_indent}}}")
@@ -20128,7 +20222,17 @@ class OpGraph:
         consumers: Dict[str, List[str]] = {n.name: [] for n in self.nodes}
         for n in self.nodes:
             for inp in n.inputs:
-                prod = producers.get(inp)
+                if inp not in producers:
+                    # Neither a declared graph input nor produced by any
+                    # node — a dangling/misspelled reference. Without this
+                    # check it silently added no edge, so len(order) still
+                    # matched len(nodes) and no error fired (contradicting
+                    # the docstring), and the emitters would later declare a
+                    # parameter for a tensor that is never bound.
+                    raise SynthCodegenError(
+                        f"node {n.name!r} references unknown tensor {inp!r} "
+                        "(not a graph input and not produced by any node)")
+                prod = producers[inp]
                 if prod is None:
                     # Graph input — no edge to add.
                     continue
@@ -20502,6 +20606,41 @@ def _emit_reduce_cuda(node: OpNode,
     # The shuffle primitive is the same name on CUDA + HIP.
     use_warp_fast = (n_elems <= _REDUCE_WARP_FAST_THRESHOLD)
     inp = node.inputs[0] if node.inputs else "x"
+    # Cross-block combine for the large-tensor path. atomicAdd is only
+    # correct for sum; max/prod need an op-matching atomic or they would
+    # return the SUM of per-block maxima/products. Emit CAS-based helpers
+    # for max/prod (typed to accum_t). The output buffer must be
+    # pre-initialised to the op identity by the caller (the standard
+    # contract for atomic reductions; true for atomicAdd's zero too).
+    _is_double = (accum_t == "double")
+    if op == "max":
+        _atomic_call = f"_synth_atomic_max_{accum_t}({node.output}_ptr, acc)"
+    elif op == "prod":
+        _atomic_call = f"_synth_atomic_mul_{accum_t}({node.output}_ptr, acc)"
+    else:
+        _atomic_call = f"atomicAdd({node.output}_ptr, ({scalar_t})acc)"
+    if op in ("max", "prod") and use_warp_fast is False:
+        _bits_t = "unsigned long long int" if _is_double else "int"
+        _as_bits = "__double_as_longlong" if _is_double else "__float_as_int"
+        _from_bits = "__longlong_as_double" if _is_double else "__int_as_float"
+        _fmax = "fmax" if _is_double else "fmaxf"
+        _op_expr = (f"{_fmax}(cur, val)" if op == "max" else "cur * val")
+        _helper_name = (f"_synth_atomic_max_{accum_t}" if op == "max"
+                        else f"_synth_atomic_mul_{accum_t}")
+        _atomic_helper = f"""
+__device__ {accum_t} {_helper_name}({accum_t}* addr, {accum_t} val) {{
+    {_bits_t}* a = ({_bits_t}*)addr;
+    {_bits_t} old = *a, assumed;
+    do {{
+        assumed = old;
+        {accum_t} cur = {_from_bits}(assumed);
+        old = atomicCAS(a, assumed, {_as_bits}({_op_expr}));
+    }} while (assumed != old);
+    return {_from_bits}(old);
+}}
+"""
+    else:
+        _atomic_helper = ""
     if use_warp_fast:
         body = f"""
     // small tensor — single warp shuffle reduce
@@ -20543,12 +20682,12 @@ def _emit_reduce_cuda(node: OpNode,
             {accum_t} v = __shfl_down_sync(0xffffffffu, acc, off);
             acc = {combine};
         }}
-        if (lane == 0) {{ atomicAdd({node.output}_ptr, ({scalar_t})acc); }}
+        if (lane == 0) {{ {_atomic_call}; }}
     }}
 """.rstrip("\n")
     return f"""
 // node: {node.name} (reduce, op={op}, fast_warp={use_warp_fast})
-__global__ void {fn_name}(
+{_atomic_helper}__global__ void {fn_name}(
         const {scalar_t}* __restrict__ {inp}_ptr,
         {scalar_t}* __restrict__ {node.output}_ptr,
         int n) {{
@@ -21124,7 +21263,14 @@ def synthesize_kernel(opgraph: OpGraph,
         n_elems = 1
         for s in problem_shape:
             n_elems *= int(s)
-        if first_node is None:
+        # The top-level smoke launcher hard-codes the elementwise kernel
+        # symbol + (inputs.., output, n) signature, so it is only valid when
+        # the first node is elementwise. For gemm/reduce/scan/scatter first
+        # nodes the emitted __global__ has a different name AND signature, so
+        # emitting this launcher would reference an undefined symbol and fail
+        # to compile. Real callers wire each node via its per-node launcher
+        # recorded in the cache index; skip the smoke launcher in that case.
+        if first_node is None or first_node.op_kind != "elementwise":
             launcher = ""
         else:
             first_inputs = ", ".join(
@@ -21440,10 +21586,12 @@ def emit_ck_gemm_variants(arch: str,
     one-line ``[codegen] WARN ...`` notice is written to ``report``
     whenever the curated sweep is used.
 
-    Scope: gfx942 / gfx950 (CDNA3/4) and gfx1100+ (RDNA3+). On
-    unsupported archs (e.g. gfx906 / gfx1030) the function raises
-    SynthCodegenError so the caller can fall back to the portable
-    triple-loop kernel emitted by ``_emit_gemm_cuda``.
+    Scope: gfx942 / gfx950 (CDNA3/4) only. The emitted device op is CK's
+    ``DeviceGemmXdl`` — the XDL/MFMA mainline that exists only on CDNA.
+    RDNA3+ (gfx11xx/gfx12xx) uses WMMA, not XDL, so this template would not
+    compile against CK there; those archs (and gfx906/gfx1030) raise
+    SynthCodegenError so the caller falls back to the portable triple-loop
+    kernel emitted by ``_emit_gemm_cuda``.
     """
     try:
         import composable_kernel  # type: ignore  # noqa: F401
@@ -21454,11 +21602,13 @@ def emit_ck_gemm_variants(arch: str,
             "build from https://github.com/ROCm/composable_kernel"
         ) from exc
 
-    supported_archs = {"gfx942", "gfx950", "gfx1100", "gfx1151", "gfx1200"}
+    # XDL/MFMA is CDNA-only. Admitting RDNA archs here emitted a
+    # DeviceGemmXdl template that cannot compile on gfx11xx/gfx12xx.
+    supported_archs = {"gfx942", "gfx950"}
     if arch not in supported_archs:
         raise SynthCodegenError(
-            f"CK GEMM emitter supports {sorted(supported_archs)} only; "
-            f"got arch={arch!r}")
+            f"CK GEMM (DeviceGemmXdl) emitter supports {sorted(supported_archs)} "
+            f"(CDNA) only; got arch={arch!r}")
 
     if arch in ARCH_TABLE and get_arch_entry(arch).vendor != "hip":
         raise SynthCodegenError(
@@ -21651,15 +21801,19 @@ class KernelRegistry:
         self._template_provider = (template_provider
                                    or _default_template_provider)
 
-    def _key(self, op: str, dtype: str, shape_cls: str) -> str:
+    def _key(self, op: str, dtype: str, shape_cls: str, ndim: int) -> str:
+        # ndim is part of the key because _compile bakes SHAPE_DIMS=len(shape)
+        # into the generated source; two dispatches in the same shape class
+        # but different rank (e.g. (1024,) vs (32,32)) must not collide on a
+        # cubin compiled for the other rank.
         return hashlib.sha256(
-            f"{self.arch}|{op}|{dtype}|{shape_cls}".encode()
+            f"{self.arch}|{op}|{dtype}|{shape_cls}|{ndim}".encode()
         ).hexdigest()[:24]
 
     def dispatch(self, op: str, dtype: str, shape: Tuple[int, ...]):
         """Return a callable kernel handle. Sub-µs on cache hit."""
         shape_cls = _shape_class(tuple(shape))
-        key = self._key(op, dtype, shape_cls)
+        key = self._key(op, dtype, shape_cls, len(tuple(shape)))
         with self._lock:
             cached = self._handle_cache.get(key)
             if cached is not None:
@@ -21738,33 +21892,43 @@ class KernelRegistry:
         prog = _first_payload(create_res)
         if prog is None:
             raise RegistryError(f"nvrtcCreateProgram failed: {create_res!r}")
-        opts = [f"-arch={compute}".encode(),
-                b"-default-device",
-                b"--std=c++17"]
-        compile_res = nvrtc.nvrtcCompileProgram(prog, len(opts), opts)
-        if _err_value(compile_res) != 0:
-            log = ""
+        try:
+            opts = [f"-arch={compute}".encode(),
+                    b"-default-device",
+                    b"--std=c++17"]
+            compile_res = nvrtc.nvrtcCompileProgram(prog, len(opts), opts)
+            if _err_value(compile_res) != 0:
+                log = ""
+                try:
+                    log_sz = _first_payload(nvrtc.nvrtcGetProgramLogSize(prog)) or 0
+                    if log_sz:
+                        buf = bytearray(log_sz)
+                        nvrtc.nvrtcGetProgramLog(prog, buf)
+                        log = buf.decode("utf-8", "replace")
+                except Exception:
+                    pass
+                raise RegistryError(
+                    f"NVRTC compile failed: {compile_res!r}\n{log}")
+            cubin_ok = (hasattr(nvrtc, "nvrtcGetCUBINSize")
+                        and hasattr(nvrtc, "nvrtcGetCUBIN"))
+            if cubin_ok:
+                size = _first_payload(nvrtc.nvrtcGetCUBINSize(prog)) or 0
+                if size > 0:
+                    buf = bytearray(size)
+                    nvrtc.nvrtcGetCUBIN(prog, buf)
+                    return bytes(buf)
+            size = _first_payload(nvrtc.nvrtcGetPTXSize(prog)) or 0
+            buf = bytearray(size)
+            nvrtc.nvrtcGetPTX(prog, buf)
+            return bytes(buf)
+        finally:
+            # Always release the NVRTC program handle — leaking it on every
+            # cache-miss compile accumulates driver-side memory over a long
+            # autotune session.
             try:
-                log_sz = _first_payload(nvrtc.nvrtcGetProgramLogSize(prog)) or 0
-                if log_sz:
-                    buf = bytearray(log_sz)
-                    nvrtc.nvrtcGetProgramLog(prog, buf)
-                    log = buf.decode("utf-8", "replace")
+                nvrtc.nvrtcDestroyProgram(prog)
             except Exception:
                 pass
-            raise RegistryError(f"NVRTC compile failed: {compile_res!r}\n{log}")
-        cubin_ok = (hasattr(nvrtc, "nvrtcGetCUBINSize")
-                    and hasattr(nvrtc, "nvrtcGetCUBIN"))
-        if cubin_ok:
-            size = _first_payload(nvrtc.nvrtcGetCUBINSize(prog)) or 0
-            if size > 0:
-                buf = bytearray(size)
-                nvrtc.nvrtcGetCUBIN(prog, buf)
-                return bytes(buf)
-        size = _first_payload(nvrtc.nvrtcGetPTXSize(prog)) or 0
-        buf = bytearray(size)
-        nvrtc.nvrtcGetPTX(prog, buf)
-        return bytes(buf)
 
     def _hiprtc_compile(self, src: str) -> bytes:
         try:
@@ -21778,14 +21942,21 @@ class KernelRegistry:
             hiprtc.hiprtcCreateProgram(src.encode(), b"kernel.hip", 0, [], []))
         if prog is None:
             raise RegistryError("hiprtcCreateProgram failed")
-        opts = [f"--offload-arch={offload}".encode()]
-        compile_res = hiprtc.hiprtcCompileProgram(prog, len(opts), opts)
-        if _err_value(compile_res) != 0:
-            raise RegistryError(f"hipRTC compile failed: {compile_res!r}")
-        size = _first_payload(hiprtc.hiprtcGetCodeSize(prog)) or 0
-        buf = bytearray(size)
-        hiprtc.hiprtcGetCode(prog, buf)
-        return bytes(buf)
+        try:
+            opts = [f"--offload-arch={offload}".encode()]
+            compile_res = hiprtc.hiprtcCompileProgram(prog, len(opts), opts)
+            if _err_value(compile_res) != 0:
+                raise RegistryError(f"hipRTC compile failed: {compile_res!r}")
+            size = _first_payload(hiprtc.hiprtcGetCodeSize(prog)) or 0
+            buf = bytearray(size)
+            hiprtc.hiprtcGetCode(prog, buf)
+            return bytes(buf)
+        finally:
+            # Always release the hipRTC program handle (see _nvrtc_compile).
+            try:
+                hiprtc.hiprtcDestroyProgram(prog)
+            except Exception:
+                pass
 
     def _load_cubin(self, cubin_path: Path, op: str):
         return _LoadedKernel(cubin_path, op, vendor=self.vendor)

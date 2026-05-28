@@ -19,6 +19,26 @@ from grokking_optimizers.dispatch import get_ops
 _ops = get_ops()  # Fails loudly if C++ extension not built
 
 
+def _validate_grad(p):
+    """Validate a gradient before handing its data_ptr to the fused kernel.
+
+    The fused kernel indexes raw contiguous memory and dispatches on the
+    parameter's dtype, so a sparse, dtype-mismatched, or non-contiguous
+    gradient would silently corrupt the parameter, EMA, and Adam state.
+    There is no Python fallback, so reject the unsupported cases loudly
+    and densify the rest.
+    """
+    g = p.grad
+    if g.is_sparse:
+        raise RuntimeError(
+            "fused optimizer kernel does not support sparse gradients")
+    if g.dtype != p.dtype:
+        raise RuntimeError(
+            f"grad dtype {g.dtype} != param dtype {p.dtype}; cast gradients "
+            "to the parameter dtype before step()")
+    return g if g.is_contiguous() else g.contiguous()
+
+
 @torch.no_grad()
 def _adamw_step_reference(params, grads, exp_avgs, exp_avg_sqs, steps,
                           lr, beta1, beta2, eps, wd):
@@ -77,12 +97,18 @@ class GrokAdamW(Optimizer):
             raise ValueError(f"Invalid learning rate: {lr}")
         if eps < 0.0:
             raise ValueError(f"Invalid epsilon value: {eps}")
+        if not isinstance(betas, (tuple, list)) or len(betas) != 2:
+            raise ValueError(f"Invalid betas (expected a 2-tuple): {betas}")
         if not 0.0 <= betas[0] < 1.0:
             raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
         if not 0.0 <= betas[1] < 1.0:
             raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
         if not 0.0 <= alpha < 1.0:
             raise ValueError(f"Invalid alpha parameter: {alpha}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Invalid weight_decay: {weight_decay}")
+        if grad_clip <= 0.0:
+            raise ValueError(f"Invalid grad_clip (must be > 0): {grad_clip}")
 
         defaults = dict(
             lr=lr,
@@ -131,6 +157,7 @@ class GrokAdamW(Optimizer):
             for p in group["params"]:
                 if p.grad is None:
                     continue
+                grad = _validate_grad(p)
 
                 # Lazy state initialisation
                 state = self.state[p]
@@ -138,12 +165,16 @@ class GrokAdamW(Optimizer):
                     state["step"] = 0
                     state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
                     state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
-                    state["ema"] = torch.zeros_like(p, dtype=torch.float32)
+                    # Seed the gradient EMA with the first gradient (not
+                    # zeros) — see Grokfast; a zero seed under-amplifies the
+                    # early grokking phase and the kernel applies no EMA bias
+                    # correction.
+                    state["ema"] = grad.detach().to(torch.float32).clone()
 
                 state["step"] += 1
 
                 params_list.append(p)
-                grads_list.append(p.grad)
+                grads_list.append(grad)
                 exp_avg_list.append(state["exp_avg"])
                 exp_avg_sq_list.append(state["exp_avg_sq"])
                 ema_list.append(state["ema"])
@@ -175,14 +206,15 @@ class GrokAdamW(Optimizer):
         """Per-parameter step used by the `use_grad_hooks=True` path."""
         if param.grad is None:
             return
+        grad = _validate_grad(param)
         if len(state) == 0:
             state["step"] = 0
             state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
             state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
-            state["ema"] = torch.zeros_like(param, dtype=torch.float32)
+            state["ema"] = grad.detach().to(torch.float32).clone()
         state["step"] += 1
         _ops.grokadamw_fused_step(
-            [param], [param.grad], [state["exp_avg"]], [state["exp_avg_sq"]],
+            [param], [grad], [state["exp_avg"]], [state["exp_avg_sq"]],
             [state["ema"]], [state["step"]],
             group["alpha"], group["lamb"],
             group["betas"][0], group["betas"][1], group["lr"],

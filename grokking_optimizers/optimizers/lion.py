@@ -20,6 +20,26 @@ from grokking_optimizers.dispatch import get_ops
 _ops = get_ops()  # Fails loudly if C++ extension not built
 
 
+def _validate_grad(p):
+    """Validate a gradient before handing its data_ptr to the fused kernel.
+
+    The fused kernel indexes raw contiguous memory and dispatches on the
+    parameter's dtype, so a sparse, dtype-mismatched, or non-contiguous
+    gradient would silently corrupt the parameter and momentum state.
+    There is no Python fallback, so reject the unsupported cases loudly
+    and densify the rest.
+    """
+    g = p.grad
+    if g.is_sparse:
+        raise RuntimeError(
+            "fused optimizer kernel does not support sparse gradients")
+    if g.dtype != p.dtype:
+        raise RuntimeError(
+            f"grad dtype {g.dtype} != param dtype {p.dtype}; cast gradients "
+            "to the parameter dtype before step()")
+    return g if g.is_contiguous() else g.contiguous()
+
+
 class Lion(Optimizer):
     """Sign-based optimiser with interpolated momentum (Lion).
 
@@ -42,6 +62,8 @@ class Lion(Optimizer):
     ) -> None:
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
+        if not isinstance(betas, (tuple, list)) or len(betas) != 2:
+            raise ValueError(f"Invalid betas (expected a 2-tuple): {betas}")
         if not 0.0 <= betas[0] < 1.0:
             raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
         if not 0.0 <= betas[1] < 1.0:
@@ -85,6 +107,7 @@ class Lion(Optimizer):
             for p in group["params"]:
                 if p.grad is None:
                     continue
+                grad = _validate_grad(p)
 
                 # Lazy state initialisation
                 state = self.state[p]
@@ -92,7 +115,7 @@ class Lion(Optimizer):
                     state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
 
                 params_list.append(p)
-                grads_list.append(p.grad)
+                grads_list.append(grad)
                 exp_avg_list.append(state["exp_avg"])
 
             if len(params_list) == 0:
@@ -114,10 +137,11 @@ class Lion(Optimizer):
         """Per-parameter step used by the `use_grad_hooks=True` path."""
         if param.grad is None:
             return
+        grad = _validate_grad(param)
         if len(state) == 0:
             state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
         _ops.lion_fused_step(
-            [param], [param.grad], [state["exp_avg"]],
+            [param], [grad], [state["exp_avg"]],
             group["lr"], group["betas"][0], group["betas"][1],
             group["weight_decay"],
         )
