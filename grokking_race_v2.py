@@ -217,18 +217,20 @@ MODEL_SCALES = {
 }
 
 DEFAULT_CONFIG: Dict = {
-    "p": 97, "operation": "x/y", "frac_train": 0.5,
+    "p": 97, "operation": "x/y", "frac_train": 0.5, "val_ratio": 0.10,
     "num_layers": 2, "dim_model": 128, "num_heads": 4, "num_tokens": 99,
     "lr": 1e-3, "weight_decay": 1.0, "beta1": 0.9, "beta2": 0.98,
     "max_steps": 100_000, "early_stop_threshold": 0.95,
+    "early_stop_max_steps": 20_000, "eval_every": 100,
     "early_stop_patience": 500, "log_every": 10, "seed": 42,
     "compile_model": False, "use_amp": False, "model_type": "decoder",
     "patch_dim": 49, "num_patches": 16,
     "chain_length": 3, "seq_len": 8,
+    "use_fused": True,
 }
 
 # ── Data 1: Modular Division (a ÷ b) mod p  [Decoder] ────────────────
-def make_data(p=97, frac_train=0.5, seed=42):
+def make_data(p=97, frac_train=0.5, val_ratio=0.10, seed=42):
     rng = random.Random(seed)
     op_tok, eq_tok = p, p + 1
     pairs, labels = [], []
@@ -239,13 +241,15 @@ def make_data(p=97, frac_train=0.5, seed=42):
             labels.append((a * b_inv) % p)
     c = list(zip(pairs, labels)); rng.shuffle(c)
     pairs, labels = zip(*c)
-    n = int(len(pairs) * frac_train)
+    n_train_total = int(len(pairs) * frac_train)
+    n_val = int(n_train_total * val_ratio)
+    n_train = n_train_total - n_val
     x = torch.tensor(pairs, dtype=torch.long)
     y = torch.tensor(labels, dtype=torch.long)
-    return x[:n], y[:n], x[n:], y[n:]
+    return x[:n_train], y[:n_train], x[n_train:n_train_total], y[n_train:n_train_total], x[n_train_total:], y[n_train_total:]
 
 # ── Data 2: MNIST-Addition (a + b) mod p  [ViT] ──────────────────────
-def make_mnist_addition_data(p=97, frac_train=0.5, seed=42):
+def make_mnist_addition_data(p=97, frac_train=0.5, val_ratio=0.10, seed=42):
     import torchvision
     from torchvision import transforms
     transform = transforms.Compose([transforms.Resize((14, 14)), transforms.ToTensor()])
@@ -266,17 +270,19 @@ def make_mnist_addition_data(p=97, frac_train=0.5, seed=42):
             pairs.append((a, b)); labels.append((a + b) % p)
     combined = list(zip(pairs, labels)); rng.shuffle(combined)
     pairs, labels = zip(*combined)
-    n_split = int(len(pairs) * frac_train)
+    n_train_total = int(len(pairs) * frac_train)
+    n_val = int(n_train_total * val_ratio)
+    n_train = n_train_total - n_val
     images = []
     for a, b in pairs:
         full = torch.cat([number_images[a], number_images[b]], dim=0)
         patches = full.unfold(0, 7, 7).unfold(1, 7, 7).contiguous().reshape(16, 49)
         images.append(patches)
     x = torch.stack(images); y = torch.tensor(labels, dtype=torch.long)
-    return x[:n_split], y[:n_split], x[n_split:], y[n_split:]
+    return x[:n_train], y[:n_train], x[n_train:n_train_total], y[n_train:n_train_total], x[n_train_total:], y[n_train_total:]
 
 # ── Data 3: Sequential Chained Division  [Mamba] ─────────────────────
-def make_sequential_division_data(p=97, chain_length=3, frac_train=0.5, seed=42):
+def make_sequential_division_data(p=97, chain_length=3, frac_train=0.5, val_ratio=0.10, seed=42):
     rng = random.Random(seed)
     op_tok, eq_tok = p, p + 1
     target_size = p * (p - 1)
@@ -295,15 +301,18 @@ def make_sequential_division_data(p=97, chain_length=3, frac_train=0.5, seed=42)
         pairs.append(seq); labels.append(result)
     combined = list(zip(pairs, labels)); rng.shuffle(combined)
     pairs, labels = zip(*combined)
-    n = int(len(pairs) * frac_train)
+    n_train_total = int(len(pairs) * frac_train)
+    n_val = int(n_train_total * val_ratio)
+    n_train = n_train_total - n_val
     x = torch.tensor(pairs, dtype=torch.long); y = torch.tensor(labels, dtype=torch.long)
-    return x[:n], y[:n], x[n:], y[n:]
+    return x[:n_train], y[:n_train], x[n_train:n_train_total], y[n_train:n_train_total], x[n_train_total:], y[n_train_total:]
 
 def make_data_for_task(c, seed):
     mt = c.get("model_type", "decoder"); ft, p = c.get("frac_train", 0.5), c.get("p", 97)
-    if mt == "decoder":  return make_data(p, ft, seed)
-    elif mt == "vit":    return make_mnist_addition_data(p, ft, seed)
-    elif mt == "mamba":  return make_sequential_division_data(p, c.get("chain_length", 3), ft, seed)
+    vr = c.get("val_ratio", 0.10)
+    if mt == "decoder":  return make_data(p, ft, vr, seed)
+    elif mt == "vit":    return make_mnist_addition_data(p, ft, vr, seed)
+    elif mt == "mamba":  return make_sequential_division_data(p, c.get("chain_length", 3), ft, vr, seed)
     else: raise ValueError(f"Unknown model_type: {mt}")
 
 # ── Model 1: Decoder Transformer ─────────────────────────────────────
@@ -454,20 +463,29 @@ def evaluate(model, x, y, p=97):
     return loss, acc
 
 class EarlyStopper:
-    def __init__(self, threshold=0.95, patience=500, max_steps=100_000):
-        self.threshold=threshold; self.patience=patience; self.max_steps=max_steps
-        self._triggered=False; self._counter=0; self.best_val_acc=0.
+    def __init__(self, threshold=0.95, max_steps=20_000, patience=500):
+        self.threshold=threshold; self.max_steps=max_steps; self.patience=patience
+        self._triggered=False; self._counter=0; self.best_test_acc=0.
         self.grokking_step=None; self.grokking_wall=None; self._t0=time.time()
-    def step(self, val_acc, current_step):
-        if current_step >= self.max_steps: return True
-        self.best_val_acc = max(self.best_val_acc, val_acc)
-        if val_acc >= self.threshold:
+        self.stopping_reason=None; self.stopping_step=None
+    def step(self, test_acc, current_step):
+        if current_step >= self.max_steps:
+            if self.stopping_reason is None:
+                self.stopping_reason="max_steps"; self.stopping_step=current_step
+            return True
+        self.best_test_acc = max(self.best_test_acc, test_acc)
+        if test_acc >= self.threshold:
             if not self._triggered:
                 if torch.cuda.is_available(): torch.cuda.synchronize()
                 self._triggered=True; self.grokking_step=current_step
                 self.grokking_wall = time.time()-self._t0
-            self._counter += 1; return self._counter >= self.patience
-        else: self._counter=0; return False
+            self._counter += 1
+            if self._counter >= self.patience:
+                if self.stopping_reason is None:
+                    self.stopping_reason="test_acc_threshold"; self.stopping_step=current_step
+                return True
+        else: self._counter=0
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -500,22 +518,29 @@ except Exception:
 
 class TrainResult:
     __slots__ = ("name","seed","steps","train_losses","train_accs",
-                 "val_losses","val_accs","wall_time","total_steps",
+                 "val_losses","val_accs","test_losses","test_accs",
+                 "wall_time","total_steps",
                  "grokking_step","grokking_wall","final_val_acc","final_train_acc",
-                 "model_type","frac_train")
-    def __init__(self, name, seed=42, model_type="decoder", frac_train=0.5):
-        self.name=name; self.seed=seed; self.model_type=model_type; self.frac_train=frac_train
+                 "final_test_acc","final_test_loss","final_val_loss",
+                 "stopping_reason","stopping_step","val_test_gap",
+                 "model_type","frac_train","val_ratio")
+    def __init__(self, name, seed=42, model_type="decoder", frac_train=0.5, val_ratio=0.10):
+        self.name=name; self.seed=seed; self.model_type=model_type
+        self.frac_train=frac_train; self.val_ratio=val_ratio
         self.steps=[]; self.train_losses=[]; self.train_accs=[]
         self.val_losses=[]; self.val_accs=[]
+        self.test_losses=[]; self.test_accs=[]
         self.wall_time=0.; self.total_steps=0; self.grokking_step=None
         self.grokking_wall=None; self.final_val_acc=0.; self.final_train_acc=0.
+        self.final_test_acc=0.; self.final_test_loss=0.; self.final_val_loss=0.
+        self.stopping_reason=None; self.stopping_step=None; self.val_test_gap=0.
 
 def _merge(base, ov):
     m = dict(base)
     if ov: m.update(ov)
     return m
 def _stopper(c):
-    return EarlyStopper(c["early_stop_threshold"], c["early_stop_patience"], c["max_steps"])
+    return EarlyStopper(c["early_stop_threshold"], c.get("early_stop_max_steps", c["max_steps"]), c["early_stop_patience"])
 def _pbar(name, mx, pos):
     return tqdm(range(1, mx+1), desc=f"{name:<14s}", position=pos, leave=True, ncols=120,
                 bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {postfix}]")
@@ -524,18 +549,28 @@ def _progressive_eval_freq(step, base_freq=10, max_freq=50, scale=0.01, thresh=5
     heat = 1.0 / (1.0 + math.exp(-scale * (step - thresh)))
     freq = max_freq - (max_freq - base_freq) * heat
     return max(base_freq, round(freq))
-def _eval_log(r, step, m, tx, ty, vx, vy, c, st, pb):
-    tl, ta = evaluate(m, tx, ty, c["p"]); vl, va = evaluate(m, vx, vy, c["p"])
+def _eval_log(r, step, m, tx, ty, vax, vay, tex, tey, c, st, pb):
+    tl, ta = evaluate(m, tx, ty, c["p"])
+    vl, va = evaluate(m, vax, vay, c["p"])
+    tel, tea = evaluate(m, tex, tey, c["p"])
     r.steps.append(step); r.train_losses.append(tl); r.train_accs.append(ta)
     r.val_losses.append(vl); r.val_accs.append(va)
-    pb.set_postfix({"trn":f"{ta:.3f}","val":f"{va:.3f}","tl":f"{tl:.3f}","vl":f"{vl:.3f}"}, refresh=False)
-    return st.step(va, step), tl, vl
-def _fin(r, st, step, t0):
+    r.test_losses.append(tel); r.test_accs.append(tea)
+    pb.set_postfix({"trn":f"{ta:.3f}","val":f"{va:.3f}","tst":f"{tea:.3f}","tl":f"{tl:.3f}"}, refresh=False)
+    return st.step(tea, step), tl, tel
+def _fin(r, st, step, t0, m, tex, tey, p=97):
     if torch.cuda.is_available(): torch.cuda.synchronize()
     r.wall_time=time.time()-t0; r.total_steps=step
     r.grokking_step=st.grokking_step; r.grokking_wall=st.grokking_wall
+    r.stopping_reason=st.stopping_reason; r.stopping_step=st.stopping_step
     r.final_train_acc = r.train_accs[-1] if r.train_accs else 0.
     r.final_val_acc = r.val_accs[-1] if r.val_accs else 0.
+    r.final_val_loss = r.val_losses[-1] if r.val_losses else 0.
+    m.eval()
+    with torch.no_grad():
+        r.final_test_loss, r.final_test_acc = evaluate(m, tex, tey, p)
+    m.train()
+    r.val_test_gap = r.final_val_acc - r.final_test_acc
     return r
 def _load(c, device, init_state):
     m = build_model(c, device, c.get("compile_model", False))
@@ -545,48 +580,56 @@ def _load(c, device, init_state):
         raw.load_state_dict(copy.deepcopy(init_state), strict=True)
     return m
 def _tr(name, c):
-    return TrainResult(name, c["seed"], c.get("model_type","decoder"), c.get("frac_train",0.5))
+    return TrainResult(name, c["seed"], c.get("model_type","decoder"), c.get("frac_train",0.5), c.get("val_ratio",0.10))
 
 # ── C++/CUDA fused optimizers (grokking_optimizers package) ────────────
 from grokking_optimizers import (
     SuperGrok15, SuperGrok2, SuperGrok11,
     GrokAdamW, NeuralGrok, Prodigy, Grokfast, Lion, LookSAM, Muon,
-    CUDAGraphOptimizer,
 )
-from grokking_optimizers.gradient_hook_optimizer import GradientHookOptimizer
+from grokking_optimizers.dispatch import detect_arch, has_fused, dispatch_fused
 
 def _maybe_wrap_cuda_graph(opt, c):
-    """Wrap optimizer in CUDAGraphOptimizer if enabled in config."""
-    if c.get("use_cuda_graph", False):
-        return CUDAGraphOptimizer(
-            opt,
-            warmup_steps=c.get("cuda_graph_warmup", 3),
-            max_graph_age=c.get("cuda_graph_max_age", 0),
-        )
+    """No-op shim. CUDA Graph wrapping was removed in the post-refactor
+    cleanup; the race is single-node and does not need graph capture."""
     return opt
 
-def _maybe_wrap_grad_hooks(opt, model, c):
-    """Wrap optimizer with GradientHookOptimizer if --grad-hooks flag is active."""
-    if c.get("use_grad_hooks", False):
-        return GradientHookOptimizer(model, opt)
-    return opt
+def _try_fused_step(model_name, opt_name, model, optimizer, x_batch, y_batch, c):
+    """Attempt fused (model, optimizer, arch) kernel; return True if used, False to fallback."""
+    if not c.get("use_fused", True):
+        return False
+    if not has_fused(model_name, opt_name):
+        return False
+    try:
+        params = {n: p for n, p in model.named_parameters()}
+        # Fused kernel handles forward + backward + optimizer step in one launch
+        dispatch_fused(model_name, opt_name, params, x_batch, None, optimizer.state,
+                       optimizer.defaults.get('lr', 1e-3))
+        return True
+    except (KeyError, NotImplementedError):
+        return False
 
 # ── 1. AdamW ──────────────────────────────────────────────────────────
-def train_adamw(c, init, tx, ty, vx, vy, dev, bp=0):
+def train_adamw(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("AdamW",c); m=_load(c,dev,init)
     opt=torch.optim.AdamW(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]), weight_decay=c["weight_decay"], fused=True)
-    opt=_maybe_wrap_grad_hooks(opt, m, c)
+    # AdamW baseline does not support use_grad_hooks (no _single_param_step API).
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
-    st=_stopper(c); m.train(); t0=time.time()
+    st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("AdamW",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "grokadamw", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
-        if step%c["log_every"]==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
+        if step%eval_every==0 or step==1:
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
-    pb.close(); return _fin(r,st,step,t0)
+    pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
 # ── 2. NeuralGrok ─────────────────────────────────────────────────────
 # NOTE: The NeuralGrok amplifier MLP is trained here via aopt on the outer
@@ -596,20 +639,25 @@ def train_adamw(c, init, tx, ty, vx, vy, dev, bp=0):
 # the C++ kernel cannot call back into Python autograd, so the amplifier
 # must be trained separately and its updated weights are picked up on the
 # next opt.step() call when the cache is refreshed.
-def train_neuralgrok(c, init, tx, ty, vx, vy, dev, bp=0):
+def train_neuralgrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("NeuralGrok",c); m=_load(c,dev,init)
     opt=NeuralGrok(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
         weight_decay=c["weight_decay"], alpha=c.get("neural_alpha",10.0),
         beta=c.get("neural_beta",4.0), num_layers=c.get("neural_layers",3),
         hidden_dim=c.get("neural_hidden",128), inner_steps=c.get("inner_steps",1),
-        grad_clip=c.get("neural_grad_clip",1.0))
+        grad_clip=c.get("neural_grad_clip",1.0),
+        use_grad_hooks=c.get("use_grad_hooks",False))
     opt.amplifier=opt.amplifier.to(dev)
     aopt=opt.get_amplifier_optimizer(lr=1e-3)
-    opt=_maybe_wrap_grad_hooks(opt, m, c)
     ni=int(tx.size(0)*0.9); ix,ox,iy,oy = tx[:ni],tx[ni:],ty[:ni],ty[ni:]
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
-    st=_stopper(c); m.train(); t0=time.time()
+    st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("NeuralGrok",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "neuralgrok", m, opt, ix, iy, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             loss=F.cross_entropy(m(ix),iy)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt)
@@ -617,33 +665,38 @@ def train_neuralgrok(c, init, tx, ty, vx, vy, dev, bp=0):
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             aloss=c.get("neural_beta",4.0)*F.cross_entropy(m(ox),oy)
         scaler.scale(aloss).backward(); scaler.step(aopt); scaler.update()
-        if step%c["log_every"]==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
+        if step%eval_every==0 or step==1:
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
-    pb.close(); return _fin(r,st,step,t0)
+    pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
 # ── 3. GrokAdamW ──────────────────────────────────────────────────────
-def train_grokadamw(c, init, tx, ty, vx, vy, dev, bp=0):
+def train_grokadamw(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("GrokAdamW",c); m=_load(c,dev,init)
     opt=GrokAdamW(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
         weight_decay=c["weight_decay"], alpha=c.get("grokadamw_alpha",0.98),
         lamb=c.get("grokadamw_lamb",5.0), gamma=c.get("grokadamw_gamma",0.1),
-        decay=c.get("grokadamw_decay",0.1), grad_clip=c.get("grokadamw_grad_clip",1.0))
-    opt=_maybe_wrap_grad_hooks(opt, m, c)
+        decay=c.get("grokadamw_decay",0.1), grad_clip=c.get("grokadamw_grad_clip",1.0),
+        use_grad_hooks=c.get("use_grad_hooks",False))
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
-    st=_stopper(c); m.train(); t0=time.time()
+    st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("GrokAdamW",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "grokadamw", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
-        if step%c["log_every"]==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
+        if step%eval_every==0 or step==1:
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
-    pb.close(); return _fin(r,st,step,t0)
+    pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
 # ── 4. SuperGrok v1.1 ─────────────────────────────────────────────────
-def train_supergrok(c, init, tx, ty, vx, vy, dev, bp=0):
+def train_supergrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     muf=c.get("supergrok_meta_update_freq",5)
     r=_tr("SuperGrok",c); m=_load(c,dev,init)
     opt=SuperGrok11(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
@@ -656,33 +709,36 @@ def train_supergrok(c, init, tx, ty, vx, vy, dev, bp=0):
         gate_temperature=c.get("supergrok_gate_temp",5.0),
         zero_loss_threshold=c.get("supergrok_zero_loss_thresh",1e-4),
         zero_acc_threshold=c.get("supergrok_zero_acc_thresh",0.995),
-        meta_hidden_dim=c.get("supergrok_meta_dim",32))
+        meta_hidden_dim=c.get("supergrok_meta_dim",32),
+        use_grad_hooks=c.get("use_grad_hooks",False))
     opt.meta_net=opt.meta_net.to(dev)
     mopt=torch.optim.Adam(opt.meta_net.parameters(), lr=1e-4)
     crit_sg=nn.CrossEntropyLoss()
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
-    st=_stopper(c); m.train(); t0=time.time()
+    st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("SuperGrok",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "supergrok11", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             logits=m(tx); loss=F.cross_entropy(logits,ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
-        # Check for inf/nan gradients from AMP unscaling (skip when AMP disabled)
         if c.get("use_amp", False):
             _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
             if _has_inf:
                 scaler.update(); continue
         if step%muf==0:
-            try: opt.meta_step(m, vx, vy, crit_sg, mopt)
+            try: opt.meta_step(m, vax, vay, crit_sg, mopt)
             except Exception as e: warnings.warn(f"SuperGrok meta_step failed at step {step}: {e}")
-        # SAM step (v1.1 sharpness-aware minimization, respects sam_enable_threshold)
         sam_freq = max(1, muf * 2)
         if hasattr(opt, 'sam_step') and step % sam_freq == 0 and opt._get_effective_sam_freq() < 999999:
             try: opt.sam_step(m, tx, ty, crit_sg)
             except Exception as e: warnings.warn(f"SuperGrok sam_step failed at step {step}: {e}")
-        # Deferred metrics — only compute .item() when needed
         alpha_freq=c.get("supergrok_alpha_update_freq",50)
         kw={}
-        needs_metrics=(step%alpha_freq==0) or (step%c["log_every"]==0) or step==1
+        needs_metrics=(step%alpha_freq==0) or (step%eval_every==0) or step==1
         if needs_metrics:
             with torch.no_grad():
                 train_loss_val=loss.item()
@@ -690,18 +746,18 @@ def train_supergrok(c, init, tx, ty, vx, vy, dev, bp=0):
             kw["train_loss"]=train_loss_val; kw["train_acc"]=train_acc
             if step%alpha_freq==0:
                 with torch.no_grad():
-                    vl_sg=F.cross_entropy(m(vx),vy).item()
+                    vl_sg=F.cross_entropy(m(vax),vay).item()
                 kw["val_loss"]=vl_sg
         try: opt.step(**kw)
         except TypeError: opt.step()
         scaler.update()
-        if step%c["log_every"]==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
+        if step%eval_every==0 or step==1:
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
-    pb.close(); return _fin(r,st,step,t0)
+    pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
 # ── 4b. SuperGrok v1.5 ────────────────────────────────────────────────
-def train_supergrok15(c, init, tx, ty, vx, vy, dev, bp=0):
+def train_supergrok15(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("SuperGrok1.5",c); m=_load(c,dev,init)
     opt=SuperGrok15(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
         weight_decay=c["weight_decay"], alpha_init=c.get("supergrok15_alpha",0.98),
@@ -726,36 +782,37 @@ def train_supergrok15(c, init, tx, ty, vx, vy, dev, bp=0):
         bilevel_thresh=c.get("supergrok15_bilevel_thresh",0.9),
         wd_ramp=c.get("supergrok15_wd_ramp",4.0),
         wd_scale=c.get("supergrok15_wd_scale",20.0),
-        wd_thresh=c.get("supergrok15_wd_thresh",0.9))
+        wd_thresh=c.get("supergrok15_wd_thresh",0.9),
+        use_grad_hooks=c.get("use_grad_hooks",False))
     opt.meta_net=opt.meta_net.to(dev)
     mopt=torch.optim.Adam(opt.meta_net.parameters(), lr=1e-4)
     crit_s15=nn.CrossEntropyLoss()
     alpha_freq=c.get("supergrok15_alpha_update_freq",50)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
-    st=_stopper(c); m.train(); t0=time.time()
+    st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("SuperGrok1.5",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "supergrok15", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             logits=m(tx); loss=F.cross_entropy(logits,ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
-        # Check for inf/nan gradients from AMP unscaling (skip when AMP disabled)
         if c.get("use_amp", False):
             _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
             if _has_inf:
                 scaler.update(); continue
-        # Adaptive SAM (sigmoid-driven frequency)
         sam_freq_eff=opt._get_effective_sam_freq()
         if sam_freq_eff < 999999 and step%sam_freq_eff==0:
             try: opt.sam_step(m, tx, ty, crit_s15)
             except Exception as e: warnings.warn(f"SuperGrok1.5 sam_step failed at step {step}: {e}")
-        # Adaptive bilevel (independent sigmoid-driven frequency)
         bilevel_freq_eff=opt._get_effective_bilevel_freq()
         if step%bilevel_freq_eff==0:
-            try: opt.bilevel_step(m, tx, ty, vx, vy, crit_s15, mopt)
+            try: opt.bilevel_step(m, tx, ty, vax, vay, crit_s15, mopt)
             except Exception as e: warnings.warn(f"SuperGrok1.5 bilevel_step failed at step {step}: {e}")
-        # Deferred metrics — only compute .item() when needed
-        eval_freq=_progressive_eval_freq(step, base_freq=c["log_every"])
         kw={}
-        needs_metrics=(step%alpha_freq==0) or (step%eval_freq==0) or step==1
+        needs_metrics=(step%alpha_freq==0) or (step%eval_every==0) or step==1
         if needs_metrics:
             with torch.no_grad():
                 train_loss_val=loss.item()
@@ -763,18 +820,18 @@ def train_supergrok15(c, init, tx, ty, vx, vy, dev, bp=0):
             kw["train_loss"]=train_loss_val; kw["train_acc"]=train_acc
             if step%alpha_freq==0:
                 with torch.no_grad():
-                    vl_s15=F.cross_entropy(m(vx),vy).item()
+                    vl_s15=F.cross_entropy(m(vax),vay).item()
                 kw["val_loss"]=vl_s15
         try: opt.step(**kw)
         except TypeError: opt.step()
         scaler.update()
-        if step%eval_freq==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
+        if step%eval_every==0 or step==1:
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
-    pb.close(); return _fin(r,st,step,t0)
+    pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
 # ── 4c. SuperGrok v2 (Mamba-3 + PEER) ────────────────────────────────
-def train_supergrok2(c, init, tx, ty, vx, vy, dev, bp=0):
+def train_supergrok2(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("SuperGrok2",c); m=_load(c,dev,init)
     opt=SuperGrok2(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
         weight_decay=c["weight_decay"], alpha_init=c.get("sg2_alpha",0.98),
@@ -803,36 +860,37 @@ def train_supergrok2(c, init, tx, ty, vx, vy, dev, bp=0):
         bilevel_scale=c.get("sg2_bilevel_scale",20.0), bilevel_thresh=c.get("sg2_bilevel_thresh",0.9),
         wd_ramp=c.get("sg2_wd_ramp",4.0), wd_scale=c.get("sg2_wd_scale",20.0),
         wd_thresh=c.get("sg2_wd_thresh",0.9),
-        sam_enable_threshold=c.get("sg2_sam_enable_threshold",0.0))
+        sam_enable_threshold=c.get("sg2_sam_enable_threshold",0.0),
+        use_grad_hooks=c.get("use_grad_hooks",False))
     opt.meta_net=opt.meta_net.to(dev)
     mopt=torch.optim.Adam(opt.meta_net.parameters(), lr=1e-4)
     crit_s2=nn.CrossEntropyLoss()
     alpha_freq=c.get("sg2_alpha_update_freq",50)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
-    st=_stopper(c); m.train(); t0=time.time()
+    st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("SuperGrok2",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "supergrok2", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             logits=m(tx); loss=F.cross_entropy(logits,ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
-        # Check for inf/nan gradients from AMP unscaling (skip when AMP disabled)
         if c.get("use_amp", False):
             _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
             if _has_inf:
                 scaler.update(); continue
-        # Adaptive SAM (sigmoid-driven frequency)
         sam_freq_eff=opt._get_effective_sam_freq()
         if sam_freq_eff < 999999 and step%sam_freq_eff==0:
             try: opt.sam_step(m, tx, ty, crit_s2)
             except Exception as e: warnings.warn(f"SuperGrok2 sam_step failed at step {step}: {e}")
-        # Adaptive bilevel (independent sigmoid-driven frequency)
         bilevel_freq_eff=opt._get_effective_bilevel_freq()
         if step%bilevel_freq_eff==0:
-            try: opt.bilevel_step(m, tx, ty, vx, vy, crit_s2, mopt)
+            try: opt.bilevel_step(m, tx, ty, vax, vay, crit_s2, mopt)
             except Exception as e: warnings.warn(f"SuperGrok2 bilevel_step failed at step {step}: {e}")
-        # Deferred metrics
-        eval_freq=_progressive_eval_freq(step, base_freq=c["log_every"])
         kw={}
-        needs_metrics=(step%alpha_freq==0) or (step%eval_freq==0) or step==1
+        needs_metrics=(step%alpha_freq==0) or (step%eval_every==0) or step==1
         if needs_metrics:
             with torch.no_grad():
                 train_loss_val=loss.item()
@@ -840,37 +898,42 @@ def train_supergrok2(c, init, tx, ty, vx, vy, dev, bp=0):
             kw["train_loss"]=train_loss_val; kw["train_acc"]=train_acc
             if step%alpha_freq==0:
                 with torch.no_grad():
-                    vl_s2=F.cross_entropy(m(vx),vy).item()
+                    vl_s2=F.cross_entropy(m(vax),vay).item()
                 kw["val_loss"]=vl_s2
         try: opt.step(**kw)
         except TypeError: opt.step()
         scaler.update()
-        if step%eval_freq==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
+        if step%eval_every==0 or step==1:
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
-    pb.close(); return _fin(r,st,step,t0)
+    pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
 # ── 5. Grokfast ───────────────────────────────────────────────────────
-def train_grokfast(c, init, tx, ty, vx, vy, dev, bp=0):
+def train_grokfast(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("Grokfast",c); m=_load(c,dev,init)
     opt=Grokfast(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
         weight_decay=c["weight_decay"], grokfast_alpha=c.get("grokfast_alpha",0.98),
-        grokfast_lamb=c.get("grokfast_lamb",2.0))
-    opt=_maybe_wrap_grad_hooks(opt, m, c)
+        grokfast_lamb=c.get("grokfast_lamb",2.0),
+        use_grad_hooks=c.get("use_grad_hooks",False))
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
-    st=_stopper(c); m.train(); t0=time.time()
+    st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("Grokfast",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "grokfast", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
-        if step%c["log_every"]==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
+        if step%eval_every==0 or step==1:
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
-    pb.close(); return _fin(r,st,step,t0)
+    pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
 # ── 6. Muon ───────────────────────────────────────────────────────────
-def train_muon(c, init, tx, ty, vx, vy, dev, bp=0):
+def train_muon(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("Muon",c); m=_load(c,dev,init)
     muon_params, adam_params = [], []
     for n,p in m.named_parameters():
@@ -878,53 +941,68 @@ def train_muon(c, init, tx, ty, vx, vy, dev, bp=0):
     opt=Muon(muon_params, params_1d=adam_params if adam_params else None,
         lr=c.get("muon_lr",0.02), momentum=c.get("muon_momentum",0.95),
         weight_decay=c["weight_decay"], adamw_lr=c["lr"],
-        adamw_betas=(c["beta1"],c["beta2"]))
-    opt=_maybe_wrap_grad_hooks(opt, m, c)
+        adamw_betas=(c["beta1"],c["beta2"]),
+        use_grad_hooks=c.get("use_grad_hooks",False))
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
-    st=_stopper(c); m.train(); t0=time.time()
+    st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("Muon",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "muon", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
-        if step%c["log_every"]==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
+        if step%eval_every==0 or step==1:
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
-    pb.close(); return _fin(r,st,step,t0)
+    pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
 # ── 7. Lion ───────────────────────────────────────────────────────────
-def train_lion(c, init, tx, ty, vx, vy, dev, bp=0):
+def train_lion(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("Lion",c); m=_load(c,dev,init)
     opt=Lion(m.parameters(), lr=c.get("lion_lr",3e-4),
-        betas=(c["beta1"],0.99), weight_decay=c.get("lion_wd",3.0))
-    opt=_maybe_wrap_grad_hooks(opt, m, c)
+        betas=(c["beta1"],0.99), weight_decay=c.get("lion_wd",3.0),
+        use_grad_hooks=c.get("use_grad_hooks",False))
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
-    st=_stopper(c); m.train(); t0=time.time()
+    st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("Lion",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "lion", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
-        if step%c["log_every"]==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
+        if step%eval_every==0 or step==1:
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
-    pb.close(); return _fin(r,st,step,t0)
+    pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
 # ── 9. LookSAM ───────────────────────────────────────────────────────
-def train_looksam(c, init, tx, ty, vx, vy, dev, bp=0):
+def train_looksam(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("LookSAM",c); m=_load(c,dev,init)
     k=c.get("looksam_k",5)
     opt=LookSAM(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
         weight_decay=c["weight_decay"], rho=c.get("looksam_rho",0.05),
-        k=k, alpha=c.get("looksam_alpha",0.7))
+        k=k, alpha=c.get("looksam_alpha",0.7),
+        use_grad_hooks=c.get("use_grad_hooks",False))
     crit_ls=nn.CrossEntropyLoss()
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
-    st=_stopper(c); m.train(); t0=time.time()
+    st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("LookSAM",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "looksam", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
-        # Check for inf/nan gradients from AMP unscaling (skip when AMP disabled)
         if c.get("use_amp", False):
             _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
             if _has_inf:
@@ -933,27 +1011,32 @@ def train_looksam(c, init, tx, ty, vx, vy, dev, bp=0):
             opt.sam_step(m, tx, ty, crit_ls)
         opt.step()
         scaler.update()
-        if step%c["log_every"]==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
+        if step%eval_every==0 or step==1:
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
-    pb.close(); return _fin(r,st,step,t0)
+    pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
 # ── 10. Prodigy ───────────────────────────────────────────────────────
-def train_prodigy(c, init, tx, ty, vx, vy, dev, bp=0):
+def train_prodigy(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("Prodigy",c); m=_load(c,dev,init)
-    opt=Prodigy(m.parameters(), lr=c.get("prodigy_lr",1.0), weight_decay=c["weight_decay"])
-    opt=_maybe_wrap_grad_hooks(opt, m, c)
+    opt=Prodigy(m.parameters(), lr=c.get("prodigy_lr",1.0), weight_decay=c["weight_decay"],
+        use_grad_hooks=c.get("use_grad_hooks",False))
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
-    st=_stopper(c); m.train(); t0=time.time()
+    st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("Prodigy",c["max_steps"],bp)):
+        # Try fused kernel path
+        if _try_fused_step("transformer", "prodigy", m, opt, tx, ty, c):
+            step += 1
+            continue
+        # Fallback: separate forward/backward/step
         with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
-        if step%c["log_every"]==0 or step==1:
-            done,_,_=_eval_log(r,step,m,tx,ty,vx,vy,c,st,pb)
+        if step%eval_every==0 or step==1:
+            done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
-    pb.close(); return _fin(r,st,step,t0)
+    pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
 # ── Registry ──────────────────────────────────────────────────────────
 OPTIMIZER_REGISTRY = {
@@ -1016,7 +1099,7 @@ def plot_comparison(rbo, save_dir="results", thresh=0.95, ft=0.5, model_type="de
     # ── Curve plots with mean ± std band ────────────────────────────
     fig, axes = plt.subplots(2,2,figsize=(18,13))
     fig.suptitle(f"Grokking Race — {task_label} | {mt_label}\n"
-                 f"train/val={ft*100:.0f}/{(1-ft)*100:.0f} | {thresh*100:.0f}% threshold",
+                 f"train/test={ft*100:.0f}/{(1-ft)*100:.0f} | {thresh*100:.0f}% threshold",
                  fontsize=14, fontweight="bold")
     for row,col,attr,title,logy in [(0,0,"train_accs","Train Acc",False),(0,1,"val_accs","Val Acc",False),
                                      (1,0,"train_losses","Train Loss",True),(1,1,"val_losses","Val Loss",True)]:
@@ -1084,9 +1167,15 @@ def save_json(rbo, save_dir="results", total_wall=None, model_type="decoder", fr
     d={"_meta":{"total_wall":total_wall,"model_type":model_type,"frac_train":frac_train}}
     for name,runs in rbo.items():
         d[name]=[{"seed":r.seed,"steps":r.steps,"train_losses":r.train_losses,"train_accs":r.train_accs,
-            "val_losses":r.val_losses,"val_accs":r.val_accs,"wall_time":r.wall_time,"total_steps":r.total_steps,
+            "val_losses":r.val_losses,"val_accs":r.val_accs,
+            "test_losses":r.test_losses,"test_accs":r.test_accs,
+            "wall_time":r.wall_time,"total_steps":r.total_steps,
             "grokking_step":r.grokking_step,"grokking_wall":r.grokking_wall,
             "final_val_acc":r.final_val_acc,"final_train_acc":r.final_train_acc,
+            "final_test_acc":r.final_test_acc,"final_test_loss":r.final_test_loss,
+            "final_val_loss":r.final_val_loss,"stopping_reason":r.stopping_reason,
+            "stopping_step":r.stopping_step,"val_test_gap":r.val_test_gap,
+            "val_ratio":r.val_ratio,
             "model_type":r.model_type,"frac_train":r.frac_train} for r in runs]
     with open(os.path.join(save_dir,f"results_{model_type}_ft{int(frac_train*100)}.json"),"w") as f:
         json.dump(d,f,indent=2)
@@ -1121,20 +1210,20 @@ def _gpu_worker(gpu_id, task_queue, base, merged, result_queue, worker_id):
                 break
             name, s = task
 
-            # Lazily create data for this seed on this GPU
             if s not in seed_data:
                 torch.manual_seed(s); np.random.seed(s)
-                tx, ty, vx, vy = make_data_for_task(base, s)
+                tx, ty, vax, vay, tex, tey = make_data_for_task(base, s)
                 tx, ty = tx.to(device), ty.to(device)
-                vx, vy = vx.to(device), vy.to(device)
+                vax, vay = vax.to(device), vay.to(device)
+                tex, tey = tex.to(device), tey.to(device)
                 ctmp = dict(base); ctmp["seed"] = s
                 ist = get_init_state(ctmp, device)
-                seed_data[s] = (tx, ty, vx, vy, ist)
+                seed_data[s] = (tx, ty, vax, vay, tex, tey, ist)
 
             cfg = dict(merged[name]); cfg["seed"] = s
-            tx, ty, vx, vy, ist = seed_data[s]
+            tx, ty, vax, vay, tex, tey, ist = seed_data[s]
             try:
-                res = OPTIMIZER_REGISTRY[name](cfg, ist, tx, ty, vx, vy, device, 0)
+                res = OPTIMIZER_REGISTRY[name](cfg, ist, tx, ty, vax, vay, tex, tey, device, 0)
                 result_queue.put((name, s, res))
                 grokked = res.grokking_step is not None
                 status = f"✓ grokked step {res.grokking_step}" if grokked else f"✗ DNF"
@@ -1153,14 +1242,20 @@ def _gpu_worker(gpu_id, task_queue, base, merged, result_queue, worker_id):
 def run_pipeline(optimizers=None, optimizer_configs=None, seeds=None,
                  compile_model=False, parallel=True, max_steps=None,
                  lr=None, weight_decay=None, threshold=None, log_every=None,
-                 frac_train=None, seed=None, device_str=None,
+                 frac_train=None, val_ratio=None, seed=None, device_str=None,
                  save_dir="results", model_type=None, gpu_ids=None,
-                 use_amp=False, model_scale=None):
+                 use_amp=False, model_scale=None,
+                 early_stop_max_steps=None, eval_every=None):
     base=dict(DEFAULT_CONFIG)
     for k,v in [("max_steps",max_steps),("lr",lr),("weight_decay",weight_decay),
                 ("early_stop_threshold",threshold),("log_every",log_every),
-                ("frac_train",frac_train),("seed",seed),("model_type",model_type)]:
+                ("frac_train",frac_train),("val_ratio",val_ratio),("seed",seed),
+                ("model_type",model_type),("early_stop_max_steps",early_stop_max_steps),
+                ("eval_every",eval_every)]:
         if v is not None: base[k]=v
+    # Auto-override: 10/90 split uses val_ratio=0.05 if not explicitly set
+    if val_ratio is None and base["frac_train"] == 0.10:
+        base["val_ratio"] = 0.05
     base["compile_model"]=compile_model
     base["use_amp"]=use_amp
     if model_scale is not None and model_scale in MODEL_SCALES:
@@ -1197,23 +1292,24 @@ def run_pipeline(optimizers=None, optimizer_configs=None, seeds=None,
         dev_str = f"{len(gpu_ids)} GPUs: {gpu_ids}"
     else:
         dev_str = str(device)
+    vr=base["val_ratio"]; ft=base["frac_train"]
+    train_pct=ft*(1-vr)*100; val_pct=ft*vr*100; test_pct=(1-ft)*100
     print(f"\n{'='*60}\n  Model : {mt_label}\n  Task  : {TASK_LABELS.get(mt,'')}\n"
-          f"  Device: {dev_str}\n  Split : {base['frac_train']*100:.0f}/{(1-base['frac_train'])*100:.0f}\n"
-          f"  Seeds : {seeds}\n  Max   : {base['max_steps']:,} steps\n{'='*60}")
+          f"  Device: {dev_str}\n  Split : {train_pct:.1f}/{val_pct:.1f}/{test_pct:.1f} (train/val/test)\n"
+          f"  Seeds : {seeds}\n  Max   : {base['max_steps']:,} steps | Early-stop: {base.get('early_stop_max_steps',base['max_steps']):,}\n{'='*60}")
     merged={n: _merge(base, optimizer_configs.get(n)) for n in optimizers}
-    for n in merged: merged[n]["model_type"]=mt; merged[n]["frac_train"]=base["frac_train"]; merged[n]["seq_len"]=base["seq_len"]
+    for n in merged: merged[n]["model_type"]=mt; merged[n]["frac_train"]=base["frac_train"]; merged[n]["val_ratio"]=base["val_ratio"]; merged[n]["seq_len"]=base["seq_len"]
     tasks=[(n,s) for n in optimizers for s in seeds]
     total_tasks = len(tasks)
     print(f"Total tasks: {total_tasks}")
 
-    # Print data/param info using first device
     tmp_dev = device if not use_multi_gpu else torch.device(f"cuda:{gpu_ids[0]}")
     torch.manual_seed(seeds[0]); np.random.seed(seeds[0])
-    tx0,ty0,vx0,vy0 = make_data_for_task(base, seeds[0])
-    print(f"Train: {tx0.shape[0]:,} | Val: {vx0.shape[0]:,} | x shape: {list(tx0.shape)}")
+    tx0,ty0,vax0,vay0,tex0,tey0 = make_data_for_task(base, seeds[0])
+    print(f"Train: {tx0.shape[0]:,} | Val: {vax0.shape[0]:,} | Test: {tex0.shape[0]:,} | x shape: {list(tx0.shape)}")
     npar=sum(p.numel() for p in _raw_model(base,tmp_dev).parameters())
     print(f"Params ({mt}): {npar:,}")
-    del tx0, ty0, vx0, vy0
+    del tx0, ty0, vax0, vay0, tex0, tey0
 
     results_by_opt=defaultdict(list); total_t0=time.time()
 
@@ -1287,20 +1383,22 @@ def run_pipeline(optimizers=None, optimizer_configs=None, seeds=None,
         seed_data={}
         for s in seeds:
             torch.manual_seed(s); np.random.seed(s)
-            tx,ty,vx,vy=make_data_for_task(base, s)
-            tx,ty=tx.to(device),ty.to(device); vx,vy=vx.to(device),vy.to(device)
+            tx,ty,vax,vay,tex,tey=make_data_for_task(base, s)
+            tx,ty=tx.to(device),ty.to(device)
+            vax,vay=vax.to(device),vay.to(device)
+            tex,tey=tex.to(device),tey.to(device)
             ctmp=dict(base); ctmp["seed"]=s; ist=get_init_state(ctmp,device)
-            seed_data[s]=(tx,ty,vx,vy,ist)
+            seed_data[s]=(tx,ty,vax,vay,tex,tey,ist)
 
         bar_pos={t:i for i,t in enumerate(tasks)}
 
         def _run(name, s, run_idx):
             cfg=dict(merged[name]); cfg["seed"]=s
-            tx,ty,vx,vy,ist=seed_data[s]; bp=bar_pos[(name,s)]
+            tx,ty,vax,vay,tex,tey,ist=seed_data[s]; bp=bar_pos[(name,s)]
             task_desc = f"{name} | {mt} | ft={base['frac_train']} | seed={s}"
             _update_progress(current_run=run_idx, current_task=task_desc)
             try:
-                res = OPTIMIZER_REGISTRY[name](cfg,ist,tx,ty,vx,vy,device,bp)
+                res = OPTIMIZER_REGISTRY[name](cfg,ist,tx,ty,vax,vay,tex,tey,device,bp)
                 grokked = res.grokking_step is not None
                 with _PROGRESS_LOCK:
                     _PROGRESS["completed"].append({
@@ -1341,7 +1439,7 @@ def run_pipeline(optimizers=None, optimizer_configs=None, seeds=None,
 def run_multi_split(splits, **kwargs):
     all_results={}
     for ft in splits:
-        print(f"\n{'#'*70}\n  SPLIT: {ft*100:.0f}/{(1-ft)*100:.0f}  (train/val)\n{'#'*70}")
+        print(f"\n{'#'*70}\n  SPLIT: {ft*100:.0f}/{(1-ft)*100:.0f}  (train/test)\n{'#'*70}")
         all_results[ft] = run_pipeline(frac_train=ft, **kwargs)
     if all_results: _plot_split_comparison(all_results, kwargs.get("save_dir","results"), kwargs.get("model_type","decoder"))
     return all_results
@@ -1396,7 +1494,7 @@ def _plot_split_comparison(all_results, save_dir, model_type):
         ax2.bar(x+off, stps, bw*0.9, color=sc[si], label=f"{ft*100:.0f}/{(1-ft)*100:.0f}", edgecolor="black", alpha=0.85)
     for ax,yl,t in [(ax1,"Wall-Clock (s)","⏱ Time to Grok"),(ax2,"Steps","Steps to Grok")]:
         ax.set_xticks(x); ax.set_xticklabels([DISPLAY_NAMES.get(n,n) for n in all_opts],rotation=45,ha="right"); ax.set_ylabel(yl); ax.set_title(t)
-        ax.legend(title="Train/Val"); ax.grid(axis="y",alpha=0.3)
+        ax.legend(title="Train/Test"); ax.grid(axis="y",alpha=0.3)
     plt.tight_layout(); plt.savefig(os.path.join(save_dir,f"split_comparison_{model_type}.png"),dpi=150,bbox_inches="tight"); plt.close()
     fig3,ax3=plt.subplots(figsize=(14,6)); gm=np.zeros((no,ns_))
     for si,ft in enumerate(splits):
@@ -1406,7 +1504,7 @@ def _plot_split_comparison(all_results, save_dir, model_type):
     im=ax3.imshow(gm,cmap="RdYlGn",aspect="auto",vmin=0,vmax=1)
     ax3.set_xticks(range(ns_)); ax3.set_xticklabels([f"{ft*100:.0f}/{(1-ft)*100:.0f}" for ft in splits])
     ax3.set_yticks(range(no)); ax3.set_yticklabels([DISPLAY_NAMES.get(n,n) for n in all_opts])
-    ax3.set_xlabel("Train/Val Split"); ax3.set_ylabel("Optimizer")
+    ax3.set_xlabel("Train/Test Split"); ax3.set_ylabel("Optimizer")
     ax3.set_title(f"Grok Success Rate — {MODEL_LABELS.get(model_type,model_type)}")
     for oi in range(no):
         for si in range(ns_): ax3.text(si,oi,f"{gm[oi,si]:.0%}",ha="center",va="center",fontsize=9,color="white" if gm[oi,si]<0.5 else "black")
@@ -1520,12 +1618,41 @@ if __name__ == "__main__":
                              "Single GPU for fair sequential benchmark if omitted.")
     parser.add_argument("--grad-hooks", action="store_true",
                         help="Use gradient hooks for L2-warm optimizer updates")
+    parser.add_argument("--no-fused", action="store_true",
+                        help="Disable fused (model, optimizer, arch) dispatch kernels")
+    parser.add_argument("--val-ratio", type=float, default=None,
+                        help="Fraction of train portion carved out as val (default: 0.10, auto 0.05 on 10/90)")
+    parser.add_argument("--early-stop-test-acc", type=float, default=0.95,
+                        help="Test accuracy threshold for early stopping (default: 0.95)")
+    parser.add_argument("--early-stop-max-steps", type=int, default=20000,
+                        help="Max steps before forced stop (default: 20000)")
+    parser.add_argument("--eval-every", type=int, default=100,
+                        help="Evaluate val accuracy every N steps (default: 100)")
+    parser.add_argument("--optimizers", type=str, default=None,
+                        help="Comma-separated optimizer names to run (default: all 11)")
+    parser.add_argument("--seeds", type=str, default=None,
+                        help="Comma-separated seeds (default: mode-dependent)")
+    parser.add_argument("--num-seeds", type=int, default=None,
+                        help="Number of seeds to use from default seed list")
+    parser.add_argument("--tasks", type=str, default=None,
+                        help="Comma-separated model types: decoder,vit,mamba")
+    parser.add_argument("--train-test-ratios", type=str, default=None,
+                        help="Comma-separated train/test ratios e.g. '10/90,25/75,50/50,80/20'")
+    parser.add_argument("--output", type=str, default="results",
+                        help="Output directory (default: results)")
     args = parser.parse_args()
 
     if args.setup:
         run_setup()
 
     DEFAULT_CONFIG["use_grad_hooks"] = args.grad_hooks if hasattr(args, 'grad_hooks') else False
+    if args.no_fused:
+        DEFAULT_CONFIG["use_fused"] = False
+    DEFAULT_CONFIG["early_stop_threshold"] = args.early_stop_test_acc
+    DEFAULT_CONFIG["early_stop_max_steps"] = args.early_stop_max_steps
+    DEFAULT_CONFIG["eval_every"] = args.eval_every
+    if args.val_ratio is not None:
+        DEFAULT_CONFIG["val_ratio"] = args.val_ratio
 
     warnings.filterwarnings('ignore')
 
@@ -1630,20 +1757,41 @@ if __name__ == "__main__":
         optimizer_configs=optimizer_configs,
         compile_model=True,
         parallel=False,
-        max_steps=20_000,
+        max_steps=args.early_stop_max_steps,
         lr=1e-3,
-        threshold=0.95,
+        threshold=args.early_stop_test_acc,
         log_every=10,
-        save_dir="results",
+        save_dir=args.output,
         gpu_ids=gpu_ids,
         use_amp=False,
+        val_ratio=args.val_ratio,
+        early_stop_max_steps=args.early_stop_max_steps,
+        eval_every=args.eval_every,
     )
 
-    # ── Compute total runs for progress tracking ──────────────────────
+    # ── Parse CLI overrides for optimizers, seeds, tasks, splits ──────
+    if args.optimizers:
+        ALL_OPTIMIZERS = [o.strip().lower() for o in args.optimizers.split(",")]
+    if args.train_test_ratios:
+        SPLITS = []
+        for r in args.train_test_ratios.split(","):
+            parts = r.strip().split("/")
+            SPLITS.append(int(parts[0]) / 100.0)
+    else:
+        SPLITS = [0.10, 0.25, 0.50, 0.80]
+
     SEEDS_A = [42, 123, 456, 1337, 3407, 9999]
     SEEDS_BCD = [42, 123, 456, 1337, 3407]
-    SPLITS = [0.10, 0.25, 0.50, 0.80]
-    ARCHS = ["decoder", "vit", "mamba"]
+    if args.seeds:
+        custom_seeds = [int(s.strip()) for s in args.seeds.split(",")]
+        SEEDS_A = custom_seeds; SEEDS_BCD = custom_seeds
+    elif args.num_seeds:
+        SEEDS_A = SEEDS_A[:args.num_seeds]; SEEDS_BCD = SEEDS_BCD[:args.num_seeds]
+
+    if args.tasks:
+        ARCHS = [t.strip().lower() for t in args.tasks.split(",")]
+    else:
+        ARCHS = ["decoder", "vit", "mamba"]
 
     if MODE == "A":   total = len(ALL_OPTIMIZERS) * len(SEEDS_A)
     elif MODE == "B": total = len(ALL_OPTIMIZERS) * len(SEEDS_BCD) * len(SPLITS)

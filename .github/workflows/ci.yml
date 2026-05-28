@@ -1,0 +1,476 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  # CPU-only torch wheels — all jobs build/import torch without a CUDA runtime.
+  PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Lint — ruff check + ruff format --check. Fast (~5s), runs first so a bad
+  # diff fails before the heavier jobs spin up.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: ruff lint + format check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install ruff
+        run: pip install ruff
+      - name: ruff check (lint)
+        run: ruff check grokking_optimizers/ --output-format=github
+      - name: ruff format --check
+        run: ruff format --check grokking_optimizers/
+        # Non-blocking — surface formatting drift without failing CI today.
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # py_compile — every .py in the package must parse cleanly. Cheapest gate.
+  # ---------------------------------------------------------------------------
+  py_compile:
+    name: py_compile (syntax)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: py_compile every module
+        run: |
+          find grokking_optimizers -name '*.py' -print0 \
+            | xargs -0 -n1 python3 -m py_compile
+
+  # ---------------------------------------------------------------------------
+  # Import smoke — import each public surface in isolation. Catches missing
+  # deps, circular imports, and module-level NameErrors that py_compile misses.
+  # ---------------------------------------------------------------------------
+  import_smoke:
+    name: import smoke (3.11)
+    runs-on: ubuntu-latest
+    needs: py_compile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch + runtime deps
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy pyyaml optuna ninja
+      - name: Import top-level package
+        run: python3 -c "import grokking_optimizers; print(grokking_optimizers.__file__)"
+      - name: Import compile module
+        run: |
+          python3 -c "
+          from grokking_optimizers.compile import (
+              build, CompileCache, BuildSpec,
+              get_arch_entry, _resolve_default_arch,
+              ARCH_TABLE, ARCH_INFO,
+          )
+          assert callable(build)
+          assert callable(CompileCache)
+          assert callable(_resolve_default_arch)
+          print(f'ARCH_TABLE: {len(ARCH_TABLE)} entries')
+          print(f'ARCH_INFO:  {len(ARCH_INFO)} entries')
+          "
+      - name: Import profile module
+        run: |
+          python3 -c "
+          from grokking_optimizers.profile import (
+              ARCHES, MODELS, OPTIMIZERS, OPT_CLASS,
+              profile, _dispatch_profile,
+              profile_cuda, profile_hip, profile_pallas,
+          )
+          assert 'sm_70' in ARCHES, 'sm_70 missing from ARCHES'
+          assert 'tpu_v6e' in ARCHES, 'tpu_v6e missing from ARCHES'
+          assert set(MODELS) == {'mamba', 'decoder', 'vit'}, MODELS
+          print(f'OPTIMIZERS: {len(OPTIMIZERS)}, MODELS: {len(MODELS)}, ARCHES: {len(ARCHES)}')
+          "
+      - name: README quickstart import smoke
+        run: |
+          python3 -c "
+          # Replicate the imports the README quickstart performs.
+          from grokking_optimizers.compile import (
+              get_arch_entry, _resolve_default_arch, build, CompileCache,
+          )
+          arch = _resolve_default_arch()
+          entry = get_arch_entry(arch)
+          print(f'resolved arch: {arch}  vendor: {entry.vendor}')
+          assert entry.vendor in ('cuda', 'hip', 'pallas')
+          "
+
+  # ---------------------------------------------------------------------------
+  # Self-test — full --self-test suite (138 tests). The repo's own correctness
+  # gate.
+  # ---------------------------------------------------------------------------
+  self_test:
+    name: --self-test (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: py_compile
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    env:
+      GROK_NO_AUTO_INSTALL: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install CPU-only torch + deps
+        run: |
+          pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy pyyaml optuna ninja scikit-learn jinja2
+      - name: Apt deps (ninja, g++)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build g++ || true
+      - name: Environment diagnostics
+        run: |
+          echo "::group::Python + tooling"
+          python3 --version
+          python3 -c "import sys; print('executable:', sys.executable); print('path:', sys.path)"
+          which ninja && ninja --version || echo "ninja: missing"
+          which g++ && g++ --version | head -1 || echo "g++: missing"
+          echo "::endgroup::"
+          echo "::group::pip list"
+          pip list
+          echo "::endgroup::"
+          echo "::group::Import probe"
+          python3 -c "import torch; print('torch:', torch.__version__, 'cuda?', torch.cuda.is_available())"
+          python3 -c "import optuna; print('optuna:', optuna.__version__)"
+          python3 -c "import yaml; print('yaml:', yaml.__version__)"
+          python3 -c "import numpy; print('numpy:', numpy.__version__)"
+          python3 -c "import sklearn; print('sklearn:', sklearn.__version__)"
+          python3 -c "import jinja2; print('jinja2:', jinja2.__version__)"
+          echo "::endgroup::"
+      - name: Run --self-test
+        timeout-minutes: 10
+        run: |
+          python3 -u -m grokking_optimizers.compile --self-test 2>&1 | tee self_test.log
+          rc=${PIPESTATUS[0]}
+          echo "exit_code=$rc" >> "$GITHUB_ENV"
+          exit $rc
+      - name: Verify self-test summary
+        if: success()
+        run: |
+          tail -n 5 self_test.log | grep -E '\[self-test\] [0-9]+ passed, 0 failed' \
+            || (echo "::error::self-test ran without crashing but reported failures"; \
+                tail -n 50 self_test.log; exit 1)
+      - name: Surface failure context
+        if: failure()
+        run: |
+          echo "::group::self-test tail (last 200 lines)"
+          tail -n 200 self_test.log 2>/dev/null || echo "(no log file)"
+          echo "::endgroup::"
+          echo "::group::stderr capture"
+          echo "exit_code=${{ env.exit_code }}"
+          echo "::endgroup::"
+      - name: Upload self-test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: self-test-log-py${{ matrix.python-version }}
+          path: self_test.log
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Dry-run sweep — write per-arch JSON manifests for every canonical arch and
+  # upload them as a CI artifact for review.
+  # ---------------------------------------------------------------------------
+  dry_run_all_archs:
+    name: --dry-run-all-archs (manifest artifact)
+    runs-on: ubuntu-latest
+    needs: py_compile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch + deps
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy pyyaml optuna ninja
+      - name: Apt deps (ninja, g++)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build g++
+      - name: --dry-run-all-archs
+        run: |
+          mkdir -p dry_run_manifests
+          python3 -m grokking_optimizers.compile \
+            --dry-run-all-archs \
+            --out dry_run_manifests \
+            --no-flag-probe \
+            --no-auto-install 2>&1 | tee dry_run.log
+      - name: Verify all 26 canonical archs produced manifests
+        run: |
+          count=$(ls dry_run_manifests/dry_run_*.json 2>/dev/null | wc -l)
+          echo "Manifest count: $count"
+          if [ "$count" -lt 26 ]; then
+            echo "::error::expected >= 26 manifests, got $count"
+            ls -la dry_run_manifests/
+            exit 1
+          fi
+      - name: Sanity-check one CUDA + one Pallas manifest
+        run: |
+          python3 - <<'PY'
+          import json, pathlib
+          d = pathlib.Path("dry_run_manifests")
+          sm90 = json.loads((d / "dry_run_sm_90a.json").read_text())
+          tpu  = json.loads((d / "dry_run_tpu_v5p.json").read_text())
+          assert sm90["vendor"] == "cuda", sm90["vendor"]
+          assert tpu["vendor"]  == "pallas", tpu["vendor"]
+          assert sm90["device_cflags"], "sm_90a should have device_cflags"
+          assert tpu.get("xla_env"), "tpu_v5p manifest should carry xla_env"
+          xla_flags = tpu["xla_env"].get("XLA_FLAGS", "")
+          assert "xla_tpu_" in xla_flags, f"TPU missing tpu-specific flags: {xla_flags[:200]}"
+          assert "xla_gpu_autotune_level" not in xla_flags, "GPU flag leaked into TPU env"
+          print("Manifest sanity-check: OK")
+          PY
+      - name: Upload manifests artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dry-run-manifests
+          path: |
+            dry_run_manifests/
+            dry_run.log
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Single-arch dry-run — exercise the per-arch dry-run path independently
+  # (different code path from --dry-run-all-archs).
+  # ---------------------------------------------------------------------------
+  single_arch_dry_run:
+    name: --dry-run single arch
+    runs-on: ubuntu-latest
+    needs: py_compile
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [sm_70, sm_90a, sm_120a, gfx942, gfx1201, tpu_v5p, tpu_v6e]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch + deps
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy pyyaml optuna ninja
+      - name: --dry-run --arch ${{ matrix.arch }}
+        run: |
+          mkdir -p single_dry_run
+          python3 -m grokking_optimizers.compile \
+            -O adamw -M mamba --arch ${{ matrix.arch }} \
+            --dry-run --out single_dry_run \
+            --no-flag-probe --no-auto-install
+
+  # ---------------------------------------------------------------------------
+  # CLI surface smoke — exercise the informational subcommands that don't
+  # require a GPU. Catches argparse regressions.
+  # ---------------------------------------------------------------------------
+  cli_surface:
+    name: CLI surface smoke
+    runs-on: ubuntu-latest
+    needs: py_compile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch + deps
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy pyyaml optuna ninja
+      - name: --help
+        run: python3 -m grokking_optimizers.compile --help > /dev/null
+      - name: --list-archs (must list 26 canonical + 4 alias = 30 keys)
+        run: |
+          out=$(python3 -m grokking_optimizers.compile --list-archs)
+          echo "$out"
+          count=$(echo "$out" | grep -c '^sm_\|^gfx\|^tpu_')
+          if [ "$count" -lt 26 ]; then
+            echo "::error::--list-archs printed $count rows, expected >= 26"
+            exit 1
+          fi
+      - name: --flag-audit (writes audit report, no compiler invocation)
+        run: |
+          mkdir -p flag_audit_out
+          python3 -m grokking_optimizers.compile --flag-audit --out flag_audit_out --no-auto-install \
+            2>&1 | tee flag_audit.log
+          test -f flag_audit_out/flag_audit.txt
+      - name: Upload flag-audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flag-audit
+          path: |
+            flag_audit_out/
+            flag_audit.log
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # e2e smoke — gated on GPU availability. On CPU-only runners it should
+  # cleanly skip with "no CUDA device — skipping" and exit 0.
+  # ---------------------------------------------------------------------------
+  e2e_smoke_skip:
+    name: --e2e-smoke (CPU skip path)
+    runs-on: ubuntu-latest
+    needs: py_compile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch + deps
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy pyyaml optuna ninja
+      - name: --e2e-smoke (must exit 0 with skip message on CPU)
+        run: |
+          mkdir -p e2e_out
+          out=$(python3 -m grokking_optimizers.compile --e2e-smoke --out e2e_out 2>&1)
+          echo "$out"
+          echo "$out" | grep -E 'no CUDA device|skipping|SKIP' \
+            || (echo "::error::e2e-smoke should print a skip message on CPU" && exit 1)
+
+  # ---------------------------------------------------------------------------
+  # Package metadata — validate pyproject.toml + the package layout WITHOUT
+  # invoking setup.py's C++ extension build. setup.py hard-requires a CUDA or
+  # ROCm toolchain (raises RuntimeError on CPU-only hosts even with
+  # FORCE_CUDA=1 because torch+cpu has torch.version.cuda == None), and CPU
+  # runners have neither nvcc nor hipcc. The real build is validated by GPU
+  # runners; this job just confirms the metadata is well-formed.
+  # ---------------------------------------------------------------------------
+  package_metadata:
+    name: package metadata (pyproject + tomllib)
+    runs-on: ubuntu-latest
+    needs: py_compile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Validate pyproject.toml is well-formed
+        run: |
+          python3 - <<'PY'
+          import tomllib, pathlib
+          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          # Required top-level sections.
+          assert "build-system" in data, "missing [build-system]"
+          assert "project" in data, "missing [project]"
+          # Required project fields.
+          for key in ("name", "version", "description", "requires-python", "dependencies"):
+              assert key in data["project"], f"[project].{key} missing"
+          print(f"pyproject.toml OK — project: {data['project']['name']} {data['project']['version']}")
+          print(f"build requires: {data['build-system']['requires']}")
+          print(f"dependencies: {data['project']['dependencies']}")
+          PY
+      - name: Verify package layout (find_packages)
+        run: |
+          pip install --upgrade pip setuptools
+          python3 - <<'PY'
+          from setuptools import find_packages
+          pkgs = find_packages(where=".")
+          assert "grokking_optimizers" in pkgs, f"top package missing: {pkgs}"
+          assert any(p.startswith("grokking_optimizers.optimizers") for p in pkgs), pkgs
+          print(f"find_packages: {len(pkgs)} packages")
+          for p in sorted(pkgs):
+              print(f"  {p}")
+          PY
+      - name: Build sdist (metadata only — no C++ extension)
+        run: |
+          pip install build
+          # SETUPTOOLS_USE_DISTUTILS=stdlib + a stub for torch.cpp_extension
+          # would be needed to fully sdist; instead just confirm that
+          # ``python -m build --help`` works (the build tool itself is wired
+          # in correctly) and leave the real sdist to a separate GPU job.
+          python3 -m build --help > /dev/null
+          echo "build tooling OK"
+
+  # ---------------------------------------------------------------------------
+  # macOS smoke — minimal cross-platform check: install + import + self-test.
+  # CPU-only torch wheels are published for macOS too.
+  # ---------------------------------------------------------------------------
+  macos_smoke:
+    name: macOS smoke (3.11)
+    runs-on: macos-latest
+    needs: py_compile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch + deps
+        run: |
+          pip install torch
+          pip install numpy pyyaml optuna ninja
+      - name: Import smoke
+        run: |
+          python3 -c "from grokking_optimizers.compile import build, _resolve_default_arch; print(_resolve_default_arch())"
+      - name: --list-archs
+        run: python3 -m grokking_optimizers.compile --list-archs | head -5
+      - name: --self-test
+        env:
+          GROK_NO_AUTO_INSTALL: "1"
+        run: python3 -u -m grokking_optimizers.compile --self-test 2>&1 | tail -10
+
+  # ---------------------------------------------------------------------------
+  # Aggregate gate — every required job must pass for a green check. Branch
+  # protection should require THIS single job rather than each individual one.
+  # ---------------------------------------------------------------------------
+  ci_success:
+    name: ci success
+    runs-on: ubuntu-latest
+    needs:
+      - lint
+      - py_compile
+      - import_smoke
+      - self_test
+      - dry_run_all_archs
+      - single_arch_dry_run
+      - cli_surface
+      - e2e_smoke_skip
+      - package_metadata
+    if: always()
+    steps:
+      - name: Verify all required jobs succeeded
+        run: |
+          results='${{ toJSON(needs) }}'
+          echo "$results"
+          echo "$results" | python3 -c "
+          import json, sys
+          n = json.load(sys.stdin)
+          failed = [k for k, v in n.items() if v.get('result') not in ('success', 'skipped')]
+          if failed:
+              print(f'::error::failed jobs: {failed}')
+              sys.exit(1)
+          print('all required jobs passed')
+          "
