@@ -9,45 +9,62 @@ namespace gfx942 {
 // ============================================================================
 //  SuperGrok v2 -- gfx942 (MI300X, CDNA3) fused optimizer kernel
 //
+//  DeepSeek-V4-style CSA/HCA hybrid attention sequence mixer (see
+//  /tmp/csa_hca_spec.md, esp. SS2, SS3b). The flattened parameter-element
+//  sequence is mixed by compressed-sparse / heavily-compressed attention,
+//  replacing the previous Mamba-3 bidirectional selective scan. The GRU + PEER
+//  + expert MLP + AdamW apply tail is KEPT VERBATIM (only the mixer changes).
+//
 //  Pipeline per step:
 //    (1) sg2_bitonic_sort_abs     : sort elements by |grad| (bitonic in LDS)
-//    (2) sg2_mamba_scan_forward   : bidirectional selective scan (Mamba-3)
+//    (2) CSA (compress m=4, lightning-indexer top-k, +window) -> csa_ctx
+//        HCA (heavy compress m'=128, dense attention, +window) -> hca_ctx
 //    (3) sg2_gru_update           : per-element GRU temporal memory
 //    (4) sg2_peer_routing         : 4-head product-key expert routing
 //    (5) sg2_expert_mlp           : expert MLP with LDS weight caching
 //    (6) sg2_adam_update          : AdamW with amplified gradient
 //    (7) sg2_fused_step           : __global__ kernel chaining all stages
 //
+//  CSA replaces the old forward (fine/local) scan; HCA replaces the old backward
+//  (global) scan. Attention is STATELESS across steps, so the carried mamba
+//  fwd/bwd states are dropped; only the GRU state persists.
+//
 //  gfx942-specific:
 //    - 64-wide wavefront (CDNA3), NOT 32-wide warp
 //    - __builtin_nontemporal_load for streaming grad reads (no __ldg)
 //    - __builtin_isnan (not __isnanf)
 //    - LDS (Local Data Share) = shared memory, 64 KB per CU
-//    - FP32 accumulators throughout scan and reduction paths
+//    - FP32 accumulators throughout attention and reduction paths
+//    - hip_bfloat16 param storage tier
 // ============================================================================
 
 // ---------------------------------------------------------------------------
 //  Constants
 // ---------------------------------------------------------------------------
 static constexpr int kSG2WavefrontSize = 64;
-static constexpr int kSG2MaxDState     = 128;
-static constexpr int kSG2MaxDInner     = 128;
+static constexpr int kSG2MaxDModel     = 64;   // attention feature width cap
+static constexpr int kSG2MaxHeadDim    = 16;   // per-head dim cap
+static constexpr int kSG2MaxTopK       = 64;   // CSA top-k register-buffer cap
+static constexpr int kSG2MaxIndexRank  = 8;    // lightning-indexer rank cap
 static constexpr int kSG2MaxGruHidden  = 8;
 static constexpr int kSG2MaxExpertHid  = 16;
-static constexpr int kSG2NumHeads      = 4;
+static constexpr int kSG2NumHeads      = 4;    // PEER heads
 static constexpr int kSG2BlockSize     = 256;  // 4 wavefronts per workgroup
 
 // LDS budget (must not exceed 64 KB)
 static constexpr int kSG2SortLdsBytes   = 4096;   // bitonic sort scratch
-static constexpr int kSG2ScanLdsBytes   = 16384;  // mamba scan state
+static constexpr int kSG2AttnLdsBytes   = 16384;  // attention KV/compress tile
 static constexpr int kSG2ExpertLdsBytes = 8192;   // expert weight cache
 static constexpr int kSG2TotalLdsBytes  = kSG2SortLdsBytes
-                                        + kSG2ScanLdsBytes
+                                        + kSG2AttnLdsBytes
                                         + kSG2ExpertLdsBytes;
 static_assert(kSG2TotalLdsBytes <= 65536, "LDS budget exceeds gfx942 64 KB limit");
 
 // ---------------------------------------------------------------------------
 //  State struct
+//
+//  CSA/HCA attention is stateless across steps, so (unlike the Mamba scan) there
+//  is no carried sequence-mixer state -- only the Adam moments + GRU memory.
 // ---------------------------------------------------------------------------
 struct SuperGrok2State {
     float* __restrict__ exp_avg;
@@ -55,9 +72,40 @@ struct SuperGrok2State {
     float* __restrict__ mu;
     float* __restrict__ sharpness;
     float* __restrict__ gru_state;       // [N * gru_hidden]
-    float* __restrict__ mamba_fwd_state; // [d_inner * d_state]
-    float* __restrict__ mamba_bwd_state; // [d_inner * d_state]
-    static constexpr int num_state_tensors() { return 7; }
+    static constexpr int num_state_tensors() { return 5; }
+};
+
+// ---------------------------------------------------------------------------
+//  CSA (Compressed Sparse Attention) weight pointers -- produces csa_ctx.
+//
+//  Mechanics (spec SS2):
+//    c_kv[j] = sum_w softmax(csa_compress_w)[w] * kv[j*m + w]   (m=csa_compress)
+//    qI = (x @ idx_DQ) @ idx_UQ;  kI = compress(x @ idx_K)   (rank R)
+//    I[t,s] = qI[t] . kI[s] / sqrt(R)        -> keep top-k compressed entries
+//    out[t] = softmax(Q.K^T / sqrt(head_dim)) . V   over (top-k U window), MQA.
+// ---------------------------------------------------------------------------
+struct SG2CSAWeights {
+    const float* __restrict__ q_W;            // [d_model, d_model]
+    const float* __restrict__ k_W;            // [d_model, d_model]
+    const float* __restrict__ v_W;            // [d_model, d_model]
+    const float* __restrict__ out_W;          // [d_model, d_model]
+    const float* __restrict__ csa_compress_w; // [csa_window] learned pool weights
+    const float* __restrict__ idx_DQ;         // [d_model, indexer_rank]
+    const float* __restrict__ idx_UQ;         // [indexer_rank, d_model]
+    const float* __restrict__ idx_K;          // [d_model, indexer_rank]
+};
+
+// ---------------------------------------------------------------------------
+//  HCA (Heavily Compressed Attention) weight pointers -- produces hca_ctx.
+//
+//  Mechanics (spec SS2): stride-m' mean pool (m'=hca_compress) -> Nh entries;
+//  every query attends DENSELY to all Nh compressed entries (+sliding window).
+// ---------------------------------------------------------------------------
+struct SG2HCAWeights {
+    const float* __restrict__ q_W;            // [d_model, d_model]
+    const float* __restrict__ k_W;            // [d_model, d_model]
+    const float* __restrict__ v_W;            // [d_model, d_model]
+    const float* __restrict__ out_W;          // [d_model, d_model]
 };
 
 // ---------------------------------------------------------------------------
@@ -244,106 +292,172 @@ void sg2_bitonic_sort_abs(
 }
 
 // ============================================================================
-//  (2) sg2_mamba_scan_forward -- Selective scan (Mamba-3)
+//  (2) CSA / HCA hybrid attention sequence mixer (spec SS2, SS3b)
 //
-//  State update per inner dimension j, state index s:
-//    dt  = softplus(dt_proj @ x_branch)
-//    B   = B_proj @ x_branch
-//    C   = C_proj @ x_branch
-//    h[j,s] = exp(A[j,s] * dt[j]) * h[j,s] + B[s] * x[j] * dt[j]
-//    y[j]   = sum_s( C[s] * h[j,s] ) + D[j] * x[j]
+//  Replaces the Mamba bidirectional selective scan. CSA -> csa_ctx (fine/local,
+//  formerly mamba fwd); HCA -> hca_ctx (global coarse, formerly mamba bwd). Both
+//  operate on the d_model-wide projected feature sequence x[N, d_model]. FP32
+//  accumulators throughout. Production routes the GEMMs through rocBLAS/ATen
+//  (spec SS8); the reference uses explicit loops with nontemporal loads.
 //
-//  FP32-only for scan state. Sequential along sequence dimension.
-//  LDS is used for the state matrix tile.
+//  proj(x, W)[t, o] = sum_i x[t, i] * W[o, i]            (row-major [out, in])
 // ============================================================================
+
+// ---- 2a. sg2_csa_compress_kv ------------------------------------------------
+//  Pool a `window`-wide block at stride `m` with learned softmax(compress_w):
+//    c_kv[j, :] = sum_w softmax(compress_w)[w] * kv[j*m + w, :]
+//  compress_w == nullptr -> uniform mean pool (used by HCA heavy compression).
+//  Produces Nc = ceil(N / m) compressed rows of width d_model.
 __forceinline__ __device__
-void sg2_mamba_scan_forward(
-    float*       __restrict__ h_state,     // [d_inner * d_state] persistent state
-    const float* __restrict__ x_sorted,    // [seq_len, d_inner]  sorted input
-    const float* __restrict__ A_log,       // [d_inner, d_state]  log(A)
-    const float* __restrict__ D_param,     // [d_inner]
-    const float* __restrict__ dt_proj_W,   // [d_inner, d_inner]  dt projection weight
-    const float* __restrict__ dt_proj_b,   // [d_inner]           dt projection bias
-    const float* __restrict__ B_proj_W,    // [d_state, d_inner]
-    const float* __restrict__ C_proj_W,    // [d_state, d_inner]
-    float*       __restrict__ y_out,       // [seq_len, d_inner]  output
-    int                       seq_len,
-    int                       d_inner,
-    int                       d_state)
+void sg2_csa_compress_kv(
+    float*       __restrict__ c_kv,        // [Nc, d_model] compressed output
+    const float* __restrict__ kv,          // [N, d_model] projected key/value seq
+    const float* __restrict__ compress_w,  // [window] learned weights (nullptr=mean)
+    int                       N,
+    int                       d_model,
+    int                       m,            // compression stride
+    int                       window)       // pooling window (>= m)
 {
-    // LDS tile for state matrix: up to kSG2MaxDInner * kSG2MaxDState floats
-    // In practice d_inner * d_state should fit in kSG2ScanLdsBytes.
-    __shared__ float lds_h[kSG2ScanLdsBytes / sizeof(float)];
+    const int Nc = (N + m - 1) / m;
+    int64_t idx    = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
 
-    const int tid = threadIdx.x;
-    const int bsz = blockDim.x;
-
-    // Load persistent state into LDS
-    const int state_size = d_inner * d_state;
-    for (int i = tid; i < state_size; i += bsz) {
-        lds_h[i] = h_state[i];
-    }
-    __syncthreads();
-
-    // Process each timestep sequentially (scan is inherently serial along seq)
-    for (int t = 0; t < seq_len; ++t) {
-        const float* x_t = x_sorted + t * d_inner;
-
-        // Each thread handles a slice of d_inner
-        for (int j = tid; j < d_inner; j += bsz) {
-            // Compute dt = softplus(dt_proj @ x_branch + bias)
-            float dt_raw = __builtin_nontemporal_load(&dt_proj_b[j]);
-            for (int k = 0; k < d_inner; ++k) {
-                dt_raw += __builtin_nontemporal_load(&dt_proj_W[j * d_inner + k])
-                        * __builtin_nontemporal_load(&x_t[k]);
-            }
-            float dt = sg2_softplus(dt_raw);
-
-            // Compute B and C projections for each state dimension
-            float y_acc = 0.0f;
-            float x_j = __builtin_nontemporal_load(&x_t[j]);
-
-            for (int s = 0; s < d_state; ++s) {
-                // B[s] = B_proj_W[s,:] @ x_t
-                float B_s = 0.0f;
-                for (int k = 0; k < d_inner; ++k) {
-                    B_s += __builtin_nontemporal_load(&B_proj_W[s * d_inner + k])
-                         * __builtin_nontemporal_load(&x_t[k]);
-                }
-
-                // C[s] = C_proj_W[s,:] @ x_t
-                float C_s = 0.0f;
-                for (int k = 0; k < d_inner; ++k) {
-                    C_s += __builtin_nontemporal_load(&C_proj_W[s * d_inner + k])
-                         * __builtin_nontemporal_load(&x_t[k]);
-                }
-
-                // State update: h = exp(A * dt) * h + B * x * dt
-                float A_val = __builtin_nontemporal_load(&A_log[j * d_state + s]);
-                float decay = expf(A_val * dt);
-                int   h_idx = j * d_state + s;
-                float h_old = lds_h[h_idx];
-                float h_new = decay * h_old + B_s * x_j * dt;
-                lds_h[h_idx] = h_new;
-
-                // Accumulate output: y += C * h
-                y_acc += C_s * h_new;
-            }
-
-            // Add skip connection: y += D * x
-            float D_j = __builtin_nontemporal_load(&D_param[j]);
-            y_acc += D_j * x_j;
-
-            y_out[t * d_inner + j] = y_acc;
+    for (int64_t j = idx; j < Nc; j += stride) {
+        // softmax(compress_w) normalizer (window tiny; recompute per row).
+        float wmax = -1e30f;
+        if (compress_w) {
+            for (int w = 0; w < window; ++w)
+                wmax = fmaxf(wmax, __builtin_nontemporal_load(&compress_w[w]));
         }
-        __syncthreads();  // All threads must finish timestep before next
+        float wsum = 0.0f;
+        for (int w = 0; w < window; ++w)
+            wsum += compress_w ? expf(__builtin_nontemporal_load(&compress_w[w]) - wmax) : 1.0f;
+        float inv_wsum = 1.0f / (wsum + 1e-20f);
+
+        for (int d = 0; d < d_model; ++d) {
+            float acc = 0.0f;
+            for (int w = 0; w < window; ++w) {
+                int src = static_cast<int>(j) * m + w;
+                if (src >= N) break;
+                float pw = compress_w
+                    ? expf(__builtin_nontemporal_load(&compress_w[w]) - wmax) * inv_wsum
+                    : inv_wsum;
+                acc += pw * kv[src * d_model + d];
+            }
+            c_kv[j * d_model + d] = acc;
+        }
+    }
+}
+
+// ---- 2b. sg2_hca_compress_kv ------------------------------------------------
+//  Heavy stride-m' mean pool (m'=hca_compress, window==m', no learned weights).
+__forceinline__ __device__
+void sg2_hca_compress_kv(
+    float*       __restrict__ c_kv,        // [Nh, d_model]
+    const float* __restrict__ kv,          // [N, d_model]
+    int                       N,
+    int                       d_model,
+    int                       m_prime)      // hca_compress (e.g. 128)
+{
+    sg2_csa_compress_kv(c_kv, kv, /*compress_w=*/nullptr, N, d_model, m_prime, m_prime);
+}
+
+// ---- 2c. sg2_csa_indexer_topk -----------------------------------------------
+//  Lightning indexer: low-rank query z[t] = x[t] @ idx_DQ scored against
+//  compressed indexer keys kI[s] (rank R). Keep the top-k compressed entries:
+//    I[t,s] = (z[t] . kI[s]) / sqrt(R)
+//  Selected compressed indices written to topk_idx[t, 0..k-1] (-1 pad).
+__forceinline__ __device__
+void sg2_csa_indexer_topk(
+    int*         __restrict__ topk_idx,    // [N, k] selected compressed indices
+    const float* __restrict__ x,           // [N, d_model] projected feature seq
+    const float* __restrict__ kI,          // [Nc, rank] compressed indexer keys
+    const SG2CSAWeights&      weights,
+    int                       N,
+    int                       Nc,
+    int                       d_model,
+    int                       rank,
+    int                       k)            // csa_topk (clamped to Nc by caller)
+{
+    const float inv_sqrt_rank = 1.0f / sqrtf(static_cast<float>(rank));
+    int64_t idx    = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+
+    for (int64_t t = idx; t < N; t += stride) {
+        float z[kSG2MaxIndexRank];
+        for (int r = 0; r < rank; ++r) {
+            float acc = 0.0f;
+            for (int i = 0; i < d_model; ++i) {
+                acc += x[t * d_model + i] * __builtin_nontemporal_load(&weights.idx_DQ[i * rank + r]);
+            }
+            z[r] = acc;
+        }
+
+        float best_score[kSG2MaxTopK];
+        int   best_idx[kSG2MaxTopK];
+        int kk = (k < kSG2MaxTopK) ? k : kSG2MaxTopK;
+        for (int j = 0; j < kk; ++j) { best_score[j] = -1e30f; best_idx[j] = -1; }
+
+        for (int s = 0; s < Nc; ++s) {
+            float score = 0.0f;
+            for (int r = 0; r < rank; ++r) {
+                score += z[r] * __builtin_nontemporal_load(&kI[s * rank + r]);
+            }
+            score *= inv_sqrt_rank;
+            int min_pos = 0;
+            float min_val = best_score[0];
+            for (int j = 1; j < kk; ++j) {
+                if (best_score[j] < min_val) { min_val = best_score[j]; min_pos = j; }
+            }
+            if (score > min_val) { best_score[min_pos] = score; best_idx[min_pos] = s; }
+        }
+        for (int j = 0; j < kk; ++j) topk_idx[t * k + j] = best_idx[j];
+    }
+}
+
+// ---- 2d. sg2_attention_online_softmax ---------------------------------------
+//  Flash-style numerically-stable online softmax attention of one query row
+//  against a caller-supplied KV row set, accumulating per-head context:
+//    scores = q . k / sqrt(head_dim);  running max m, denom l (online softmax)
+//    out += softmax(scores) . v
+//  Multi-query: one KV row set is shared across heads (q/out are per-head slices).
+__forceinline__ __device__
+void sg2_attention_online_softmax(
+    float*       __restrict__ out,         // [head_dim] per-head context (output)
+    const float* __restrict__ q,           // [head_dim] query for this head
+    const float* __restrict__ k_rows,      // [num_kv, d_model] candidate keys
+    const float* __restrict__ v_rows,      // [num_kv, d_model] candidate values
+    const int*   __restrict__ kv_index,    // [num_kv] row ids (-1 skip) or nullptr
+    int                       num_kv,
+    int                       head_off,     // head_idx * head_dim
+    int                       head_dim,
+    int                       d_model)
+{
+    const float inv_sqrt_d = 1.0f / sqrtf(static_cast<float>(head_dim));
+    float run_max = -1e30f;
+    float run_den = 0.0f;
+    for (int h = 0; h < head_dim; ++h) out[h] = 0.0f;
+
+    for (int j = 0; j < num_kv; ++j) {
+        int row = kv_index ? kv_index[j] : j;
+        if (row < 0) continue;
+        const float* kj = k_rows + row * d_model + head_off;
+        const float* vj = v_rows + row * d_model + head_off;
+
+        float score = 0.0f;
+        for (int h = 0; h < head_dim; ++h) score += q[h] * kj[h];
+        score *= inv_sqrt_d;
+
+        float new_max = fmaxf(run_max, score);
+        float corr    = expf(run_max - new_max);
+        float p       = expf(score - new_max);
+        run_den = run_den * corr + p;
+        for (int h = 0; h < head_dim; ++h) out[h] = out[h] * corr + p * vj[h];
+        run_max = new_max;
     }
 
-    // Persist state back to global memory
-    for (int i = tid; i < state_size; i += bsz) {
-        h_state[i] = lds_h[i];
-    }
-    __syncthreads();
+    float inv_den = 1.0f / (run_den + 1e-20f);
+    for (int h = 0; h < head_dim; ++h) out[h] *= inv_den;
 }
 
 // ============================================================================
@@ -841,12 +955,13 @@ void sg2_adam_update_vec4(
 //
 //  Pipeline:
 //    1. Bitonic sort by |grad|
-//    2. Mamba-3 forward selective scan
-//    3. Mamba-3 backward selective scan
-//    4. GRU update (fuses fwd + bwd scan outputs)
-//    5. PEER product-key expert routing
-//    6. Expert MLP evaluation
-//    7. AdamW parameter update with amplified gradient
+//    2. Input + Q/K/V projection of the sorted sequence
+//    3. CSA (compress m=4, lightning-indexer top-k, +window)  -> csa_ctx
+//    4. HCA (heavy compress m'=128, dense attention, +window) -> hca_ctx
+//    5. GRU update (fuses csa_ctx + hca_ctx summaries)
+//    6. PEER product-key expert routing
+//    7. Expert MLP evaluation
+//    8. AdamW parameter update with amplified gradient
 //
 //  Template params:
 //    ParamT      -- parameter storage type (float, __half, hip_bfloat16)
@@ -867,15 +982,20 @@ __global__ void sg2_fused_step(
     // Optimizer state
     SuperGrok2State            state,
 
-    // Mamba scan weights
-    const float* __restrict__ A_log,
-    const float* __restrict__ D_param,
-    const float* __restrict__ dt_proj_W,
-    const float* __restrict__ dt_proj_b,
-    const float* __restrict__ B_proj_W,
-    const float* __restrict__ C_proj_W,
-    int                       d_inner,
-    int                       d_state,
+    // Shared input projection (2 -> d_model)
+    const float* __restrict__ input_proj_W, // [d_model, 2]
+    const float* __restrict__ input_proj_b, // [d_model]
+
+    // CSA / HCA attention weights + dims
+    SG2CSAWeights             csa_weights,  // produces csa_ctx
+    SG2HCAWeights             hca_weights,  // produces hca_ctx
+    int                       d_model,
+    int                       n_heads,
+    int                       csa_compress,
+    int                       csa_window,
+    int                       csa_topk,
+    int                       hca_compress,
+    int                       indexer_rank,
 
     // GRU weights
     const float* __restrict__ gru_W_z,
@@ -922,10 +1042,17 @@ __global__ void sg2_fused_step(
     // Scratch buffers (caller-allocated)
     float* __restrict__ sort_keys_buf,      // [N]
     int*   __restrict__ sort_indices_buf,   // [N]
-    float* __restrict__ scan_input_buf,     // [N, d_inner]
-    float* __restrict__ scan_fwd_out_buf,   // [N, d_inner]
-    float* __restrict__ scan_bwd_out_buf,   // [N, d_inner]
-    float* __restrict__ gru_input_buf,      // [N]
+    float* __restrict__ x_buf,              // [N, d_model] projected seq
+    float* __restrict__ q_buf,              // [N, d_model] queries
+    float* __restrict__ k_buf,              // [N, d_model] raw keys
+    float* __restrict__ v_buf,              // [N, d_model] raw values
+    float* __restrict__ c_k_buf,            // [Nc_max, d_model] compressed keys
+    float* __restrict__ c_v_buf,            // [Nc_max, d_model] compressed values
+    float* __restrict__ kI_buf,             // [Nc_max, indexer_rank] indexer keys
+    int*   __restrict__ topk_buf,           // [N, csa_topk] selected indices
+    float* __restrict__ csa_ctx_buf,        // [N, d_model] CSA context
+    float* __restrict__ hca_ctx_buf,        // [N, d_model] HCA context
+    float* __restrict__ gru_input_buf,      // [N, gru_input_dim]
     int*   __restrict__ expert_idx_buf,     // [N, num_heads]
     float* __restrict__ expert_score_buf,   // [N, num_heads]
     float* __restrict__ smart_grad_buf,     // [N]
@@ -943,102 +1070,189 @@ __global__ void sg2_fused_step(
     __syncthreads();
 
     // -----------------------------------------------------------------------
-    // Stage 2: Build scan input from sorted gradients + sharpness
-    // Project [grad, sharpness] -> d_inner dimensional space
+    // Stage 2: Input projection + CSA Q/K/V projection of the sorted sequence
+    //   x[t]     = input_proj_W @ [grad_sorted[t], sharpness_sorted[t]] + b
+    //   q/k/v[t] = x[t] @ {csa_q_W, csa_k_W, csa_v_W}^T   (row-major [out, in])
+    // (Production routes these GEMMs through rocBLAS/ATen, spec SS8.)
     // -----------------------------------------------------------------------
     {
         const int tid = threadIdx.x;
         const int bsz = blockDim.x;
-        for (int64_t elem = tid; elem < N; elem += bsz) {
-            int orig_idx = sort_indices_buf[elem];
-            if (orig_idx >= 0 && orig_idx < static_cast<int>(N)) {
-                // Simple projection: replicate grad into d_inner channels
-                // (full projection handled by host-side GEMM for large N)
-                float g = to_float(__builtin_nontemporal_load(grads + orig_idx));
-                g = apply_nan_policy<NAN_POLICY>(g);
-                for (int j = 0; j < d_inner; ++j) {
-                    scan_input_buf[elem * d_inner + j] = g;
+        for (int64_t t = tid; t < N; t += bsz) {
+            int orig = sort_indices_buf[t];
+            float g_s = sort_keys_buf[t];
+            float s_s = (orig >= 0 && orig < static_cast<int>(N)) ? state.sharpness[orig] : 0.0f;
+            for (int o = 0; o < d_model; ++o) {
+                float acc = __builtin_nontemporal_load(&input_proj_b[o]);
+                acc += __builtin_nontemporal_load(&input_proj_W[o * 2 + 0]) * g_s;
+                acc += __builtin_nontemporal_load(&input_proj_W[o * 2 + 1]) * s_s;
+                x_buf[t * d_model + o] = acc;
+            }
+            for (int o = 0; o < d_model; ++o) {
+                float qa = 0.0f, ka = 0.0f, va = 0.0f;
+                for (int i = 0; i < d_model; ++i) {
+                    float xv = x_buf[t * d_model + i];
+                    qa += xv * __builtin_nontemporal_load(&csa_weights.q_W[o * d_model + i]);
+                    ka += xv * __builtin_nontemporal_load(&csa_weights.k_W[o * d_model + i]);
+                    va += xv * __builtin_nontemporal_load(&csa_weights.v_W[o * d_model + i]);
                 }
+                q_buf[t * d_model + o] = qa;
+                k_buf[t * d_model + o] = ka;
+                v_buf[t * d_model + o] = va;
             }
         }
     }
     __syncthreads();
 
     // -----------------------------------------------------------------------
-    // Stage 3: Mamba forward scan
+    // Stage 3: CSA -- compress KV (m=csa_compress), lightning-indexer top-k,
+    //          sparse attention (+sliding window) -> csa_ctx (local context).
     // -----------------------------------------------------------------------
-    sg2_mamba_scan_forward(
-        state.mamba_fwd_state,
-        scan_input_buf,
-        A_log, D_param,
-        dt_proj_W, dt_proj_b,
-        B_proj_W, C_proj_W,
-        scan_fwd_out_buf,
-        static_cast<int>(N), d_inner, d_state);
+    {
+        const int m  = csa_compress;
+        const int Nc = (static_cast<int>(N) + m - 1) / m;
+        const int R  = indexer_rank;
+        int k = csa_topk; if (k > Nc) k = Nc;
+        const int head_dim = d_model / n_heads;
+
+        sg2_csa_compress_kv(c_k_buf, k_buf, csa_weights.csa_compress_w,
+                            static_cast<int>(N), d_model, m, csa_window);
+        sg2_csa_compress_kv(c_v_buf, v_buf, csa_weights.csa_compress_w,
+                            static_cast<int>(N), d_model, m, csa_window);
+        __syncthreads();
+
+        // Compressed indexer keys kI[Nc, R] = mean-pool(x @ idx_K) over stride.
+        for (int64_t s = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             s < Nc; s += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+            for (int r = 0; r < R; ++r) {
+                float acc = 0.0f;
+                for (int w = 0; w < m; ++w) {
+                    int src = static_cast<int>(s) * m + w;
+                    if (src >= N) break;
+                    float proj = 0.0f;
+                    for (int i = 0; i < d_model; ++i) {
+                        proj += x_buf[src * d_model + i]
+                              * __builtin_nontemporal_load(&csa_weights.idx_K[i * R + r]);
+                    }
+                    acc += proj / static_cast<float>(m);
+                }
+                kI_buf[s * R + r] = acc;
+            }
+        }
+        __syncthreads();
+
+        sg2_csa_indexer_topk(topk_buf, x_buf, kI_buf, csa_weights,
+                             static_cast<int>(N), Nc, d_model, R, k);
+        __syncthreads();
+
+        for (int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             t < N; t += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+            float ctx[kSG2MaxDModel];
+            for (int d = 0; d < d_model; ++d) ctx[d] = 0.0f;
+            for (int hd = 0; hd < n_heads; ++hd) {
+                int head_off = hd * head_dim;
+                const float* q_h = q_buf + t * d_model + head_off;
+                float head_out[kSG2MaxHeadDim], win_out[kSG2MaxHeadDim];
+                sg2_attention_online_softmax(head_out, q_h, c_k_buf, c_v_buf,
+                                             &topk_buf[t * k], k, head_off, head_dim, d_model);
+                int ws = static_cast<int>(t) - csa_window + 1; if (ws < 0) ws = 0;
+                int wn = static_cast<int>(t) - ws + 1;
+                sg2_attention_online_softmax(win_out, q_h,
+                                             k_buf + (int64_t)ws * d_model,
+                                             v_buf + (int64_t)ws * d_model,
+                                             nullptr, wn, head_off, head_dim, d_model);
+                for (int h = 0; h < head_dim; ++h)
+                    ctx[head_off + h] = 0.5f * (head_out[h] + win_out[h]);
+            }
+            for (int o = 0; o < d_model; ++o) {
+                float acc = 0.0f;
+                for (int i = 0; i < d_model; ++i)
+                    acc += ctx[i] * __builtin_nontemporal_load(&csa_weights.out_W[o * d_model + i]);
+                csa_ctx_buf[t * d_model + o] = acc;
+            }
+        }
+    }
     __syncthreads();
 
     // -----------------------------------------------------------------------
-    // Stage 4: Mamba backward scan (reverse order)
-    // Reuse the same scan function on reversed input
+    // Stage 4: HCA -- heavy stride-m' mean compress, DENSE attention over all
+    //          Nh compressed entries (+sliding window) -> hca_ctx (global ctx).
     // -----------------------------------------------------------------------
     {
-        // Reverse scan_input_buf into a temporary reordering via index math
-        // The backward scan reads from the end of the sorted sequence
-        const int tid = threadIdx.x;
-        const int bsz = blockDim.x;
+        const int mp = hca_compress;
+        const int Nh = (static_cast<int>(N) + mp - 1) / mp;
+        const int head_dim = d_model / n_heads;
 
-        // Build reversed input in scan_bwd_out_buf temporarily
-        for (int64_t elem = tid; elem < N; elem += bsz) {
-            int rev = static_cast<int>(N) - 1 - static_cast<int>(elem);
-            for (int j = 0; j < d_inner; ++j) {
-                scan_bwd_out_buf[elem * d_inner + j] =
-                    scan_input_buf[rev * d_inner + j];
+        // Re-project Q/K/V with HCA weights (overwrite q/k/v scratch).
+        for (int64_t t = threadIdx.x; t < N; t += blockDim.x) {
+            for (int o = 0; o < d_model; ++o) {
+                float qa = 0.0f, ka = 0.0f, va = 0.0f;
+                for (int i = 0; i < d_model; ++i) {
+                    float xv = x_buf[t * d_model + i];
+                    qa += xv * __builtin_nontemporal_load(&hca_weights.q_W[o * d_model + i]);
+                    ka += xv * __builtin_nontemporal_load(&hca_weights.k_W[o * d_model + i]);
+                    va += xv * __builtin_nontemporal_load(&hca_weights.v_W[o * d_model + i]);
+                }
+                q_buf[t * d_model + o] = qa;
+                k_buf[t * d_model + o] = ka;
+                v_buf[t * d_model + o] = va;
             }
         }
         __syncthreads();
 
-        // Run backward scan using reversed input
-        // Use a temporary LDS-resident state; overwrite scan_bwd_out_buf in-place
-        sg2_mamba_scan_forward(
-            state.mamba_bwd_state,
-            scan_bwd_out_buf,   // reversed input
-            A_log, D_param,
-            dt_proj_W, dt_proj_b,
-            B_proj_W, C_proj_W,
-            scan_bwd_out_buf,   // overwrite with output
-            static_cast<int>(N), d_inner, d_state);
+        sg2_hca_compress_kv(c_k_buf, k_buf, static_cast<int>(N), d_model, mp);
+        sg2_hca_compress_kv(c_v_buf, v_buf, static_cast<int>(N), d_model, mp);
         __syncthreads();
 
-        // Reverse the backward output back to original order
-        // We use smart_grad_buf as temp for one d_inner column at a time
-        for (int j = 0; j < d_inner; ++j) {
-            for (int64_t elem = tid; elem < N / 2; elem += bsz) {
-                int rev = static_cast<int>(N) - 1 - static_cast<int>(elem);
-                float tmp = scan_bwd_out_buf[elem * d_inner + j];
-                scan_bwd_out_buf[elem * d_inner + j] =
-                    scan_bwd_out_buf[rev * d_inner + j];
-                scan_bwd_out_buf[rev * d_inner + j] = tmp;
+        for (int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             t < N; t += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+            float ctx[kSG2MaxDModel];
+            for (int d = 0; d < d_model; ++d) ctx[d] = 0.0f;
+            for (int hd = 0; hd < n_heads; ++hd) {
+                int head_off = hd * head_dim;
+                const float* q_h = q_buf + t * d_model + head_off;
+                float head_out[kSG2MaxHeadDim], win_out[kSG2MaxHeadDim];
+                sg2_attention_online_softmax(head_out, q_h, c_k_buf, c_v_buf,
+                                             nullptr, Nh, head_off, head_dim, d_model);
+                int ws = static_cast<int>(t) - csa_window + 1; if (ws < 0) ws = 0;
+                int wn = static_cast<int>(t) - ws + 1;
+                sg2_attention_online_softmax(win_out, q_h,
+                                             k_buf + (int64_t)ws * d_model,
+                                             v_buf + (int64_t)ws * d_model,
+                                             nullptr, wn, head_off, head_dim, d_model);
+                for (int h = 0; h < head_dim; ++h)
+                    ctx[head_off + h] = 0.5f * (head_out[h] + win_out[h]);
             }
-            __syncthreads();
+            for (int o = 0; o < d_model; ++o) {
+                float acc = 0.0f;
+                for (int i = 0; i < d_model; ++i)
+                    acc += ctx[i] * __builtin_nontemporal_load(&hca_weights.out_W[o * d_model + i]);
+                hca_ctx_buf[t * d_model + o] = acc;
+            }
         }
     }
+    __syncthreads();
 
     // -----------------------------------------------------------------------
-    // Stage 5: Merge fwd + bwd scan outputs -> per-element GRU input
-    // Average across d_inner channels and unsort back to original order
+    // Stage 5: Unsort csa_ctx/hca_ctx and build per-element GRU input. The GRU
+    //   here consumes a single combined local+global context scalar (matching
+    //   the prior mamba-merged contract, spec SS3b: csa_ctx replaces fwd, hca_ctx
+    //   replaces bwd).
     // -----------------------------------------------------------------------
     {
         const int tid = threadIdx.x;
         const int bsz = blockDim.x;
-        for (int64_t elem = tid; elem < N; elem += bsz) {
-            int orig_idx = sort_indices_buf[elem];
+        for (int64_t t = tid; t < N; t += bsz) {
+            int orig_idx = sort_indices_buf[t];
             if (orig_idx >= 0 && orig_idx < static_cast<int>(N)) {
-                float sum = 0.0f;
-                for (int j = 0; j < d_inner; ++j) {
-                    sum += scan_fwd_out_buf[elem * d_inner + j]
-                         + scan_bwd_out_buf[elem * d_inner + j];
+                float csa_sum = 0.0f, hca_sum = 0.0f;
+                for (int d = 0; d < d_model; ++d) {
+                    csa_sum += csa_ctx_buf[t * d_model + d];
+                    hca_sum += hca_ctx_buf[t * d_model + d];
                 }
-                gru_input_buf[orig_idx] = sum / static_cast<float>(2 * d_inner);
+                csa_sum /= static_cast<float>(d_model);
+                hca_sum /= static_cast<float>(d_model);
+                gru_input_buf[orig_idx] = 0.5f * (csa_sum + hca_sum);
             }
         }
     }

@@ -29,7 +29,6 @@
 //   3. Implement `__global__ void lion_kernel(...)` + `hipLaunchKernelGGL(...)`.
 
 #include <torch/extension.h>
-#include "csrc/tuning.h"
 #include <vector>
 
 // ── inlined from former csrc/backends/hip/gfx942/primitives.hpp ──
@@ -156,6 +155,21 @@ void launch_lion_step(
         // Momentum refresh
         ea.mul_(beta2).add_(g.to(ea.scalar_type()), 1.0f - beta2);
     }
+}
+
+
+void launch_fused_lion_step(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor grad, float lr, float beta1, float beta2, float weight_decay
+) {
+    throw std::runtime_error(
+        "launch_fused_lion_step: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_multi_tensor_lion(
+    std::vector<torch::Tensor>& params, std::vector<torch::Tensor>& exp_avgs, std::vector<torch::Tensor>& grads, float lr, float beta1, float beta2, float wd
+) {
+    throw std::runtime_error(
+        "launch_multi_tensor_lion: HIP gfx942 kernel not yet implemented.");
 }
 
 }} // namespace sg::gfx942

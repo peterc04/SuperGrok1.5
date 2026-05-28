@@ -10,7 +10,19 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include "csrc/algorithms/neuralgrok.h"
-#include "csrc/tuning.h"
+// ── Autotuner-consumable launch parameters (inlined; see compile.py) ──
+#ifndef SG_TUNED_BLOCK_SIZE
+#define SG_TUNED_BLOCK_SIZE 256
+#endif
+#ifndef SG_TUNED_VEC_WIDTH
+#define SG_TUNED_VEC_WIDTH 4
+#endif
+#ifndef SG_TUNED_UNROLL
+#define SG_TUNED_UNROLL 1
+#endif
+#ifndef SG_TUNED_ASYNC_DEPTH
+#define SG_TUNED_ASYNC_DEPTH 2
+#endif
 // ── inlined from former csrc/backends/cuda/sm_90/primitives.cuh ──
 // CUDA sm_90 (Hopper) primitives — shared across all 11 launch_*.cu files.
 //
@@ -1115,6 +1127,28 @@ void launch_neuralgrok_step(
                 psi_b2,
                 alpha, beta, lr, beta1_a, beta2_a, eps, wd, bc1, bc2, N);
         });
+}
+
+
+void launch_fused_neuralgrok_amplifier(
+    torch::Tensor grad, torch::Tensor amplified, torch::Tensor amplifier_w1, torch::Tensor amplifier_b1, torch::Tensor amplifier_w2, torch::Tensor amplifier_b2, int hidden_dim, float alpha, float beta
+) {
+    throw std::runtime_error(
+        "launch_fused_neuralgrok_amplifier: CUDA sm_90 kernel not yet implemented.");
+}
+
+void launch_fused_neuralgrok_adam(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor amplified_grad, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2
+) {
+    throw std::runtime_error(
+        "launch_fused_neuralgrok_adam: CUDA sm_90 kernel not yet implemented.");
+}
+
+void launch_fused_neuralgrok_full_step(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor grad, torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2, float alpha_amp, float beta_amp, int hidden_dim, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2
+) {
+    throw std::runtime_error(
+        "launch_fused_neuralgrok_full_step: CUDA sm_90 kernel not yet implemented.");
 }
 
 }} // namespace sg::sm90

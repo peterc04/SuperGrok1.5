@@ -1431,34 +1431,45 @@ void supergrok15_sharpness_restore_all(
 // ─── csrc/bindings/supergrok2.cpp ──────────────────────────────────
 // bindings/supergrok2.cpp — runtime dispatch to per-arch SG v2 launchers.
 //
-// SG v2 has the largest dispatcher surface in the codebase. The Python
-// optimizer (grokking_optimizers/supergrok2.py) invokes six entry points
-// that all dispatch to per-arch launchers in
-// csrc/kernels/{cuda/<sm>,hip/<gfx>}/supergrok2_{fwd,bwd}_<arch>.{cu,hip.cpp}.
+// SG v2 is a learned optimizer whose meta-model is a DeepSeek-V4-style
+// CSA/HCA hybrid attention stack (replacing the old Mamba-3 + PEER scan).
+// For each parameter tensor it views the flattened gradient elements as a
+// sequence, runs:
+// input_proj -> CSA (compressed sparse attention, m=4, lightning-indexer
+// top-k + sliding window) -> HCA (heavily compressed
+// attention, m'=128, dense) -> MiniGRU -> PEER product-key
+// routing -> per-element expert MLP -> out_proj
+// producing a smart gradient, then applies the unchanged Adam-style update.
 //
-// Per-arch launcher names (signatures must match exactly across all 8
-// arches — the wrap-baseline pass preserved bit-identical signatures):
+// The CSA/HCA attention is STATELESS across optimizer steps (unlike Mamba's
+// carried fwd/bwd scan state), so the launchers DROP mamba_fwd_state /
+// mamba_bwd_state. The GRU state IS still carried across steps (gru_state).
 //
-// sg::<arch>::launch_mamba3_peer_step (forward step)
-// sg::<arch>::launch_mamba3_peer_batched_step (batched fwd step)
-// sg::<arch>::launch_mamba3_peer_bilevel_fwd_save (bilevel fwd-save)
-// sg::<arch>::launch_mamba3_peer_bilevel_fwd_save_batched(batched fwd-save)
-// sg::<arch>::launch_mamba3_peer_backward (bilevel bwd)
-// sg::<arch>::launch_mamba3_peer_backward_batched (batched bwd)
+// Per-arch launcher names (sg::sm90 / sg::gfx942). Signatures must match
+// exactly across arches and with the CUDA / HIP launcher agents — the
+// single-tensor step list is the locked spec §7 contract:
 //
-// Public Python entry points (registered via _ops.<name> in module.cpp):
-// supergrok2_mamba_peer_step
-// supergrok2_mamba_peer_batched_step
+// sg::<arch>::launch_csa_hca_step (forward step)
+// sg::<arch>::launch_csa_hca_batched_step (batched fwd step)
+// sg::<arch>::launch_csa_hca_bilevel_fwd_save (bilevel fwd-save)
+// sg::<arch>::launch_csa_hca_bilevel_fwd_save_batched(batched fwd-save)
+// sg::<arch>::launch_csa_hca_backward (bilevel bwd)
+// sg::<arch>::launch_csa_hca_backward_batched (batched bwd)
+//
+// Public Python entry points (registered via _ops.<name> in module.cpp).
+// New names plus old "mamba_peer" aliases kept for back-compat:
+// supergrok2_step (alias: supergrok2_mamba_peer_step)
+// supergrok2_batched_step (alias: supergrok2_mamba_peer_batched_step)
 // supergrok2_bilevel_fwd_save
 // supergrok2_bilevel_fwd_save_batched
 // supergrok2_bilevel_backward
 // supergrok2_bilevel_backward_batched
+// supergrok2_prepare_and_batched_step
 //
-// Reference: pre-refactor csrc/common/ops.cpp@682eab4^ (lines 908-1199 for
-// forward/peer-step entries, lines 1499-1611 for bilevel registrations).
-// The launcher signatures here are taken verbatim from the canonical sm_80
-// translation units (supergrok2_fwd_sm80.cu / supergrok2_bwd_sm80.cu) —
-// they are the linker contract.
+// The CSA/HCA meta-model weight set (per spec §4/§7) replaces the Mamba
+// weight block: csa_{q,k,v,out}_W, csa_compress_w, csa_idx_{DQ,UQ,K},
+// hca_{q,k,v,out}_W. The GRU, PEER (peer_query_Ws, prod_keys_A/B),
+// expert MLP, and Adam-apply tail are unchanged.
 
 
 #include <vector>
@@ -1467,42 +1478,45 @@ namespace sg {
 
 // ---------------------------------------------------------------------
 // Per-arch launcher forward declarations.
-// Signatures verbatim from csrc/kernels/cuda/sm_80/supergrok2_{fwd,bwd}_sm80.cu.
+// The launch_csa_hca_step parameter list is the AUTHORITATIVE spec §7
+// contract, shared byte-for-byte with the CUDA / HIP launcher agents.
 // ---------------------------------------------------------------------
 
 #define DECLARE_SG2(NS) \
  namespace NS { \
- void launch_mamba3_peer_step( \
+ void launch_csa_hca_step( \
  torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness, \
  torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor mu,\
  torch::Tensor gru_state, \
- torch::Tensor mamba_fwd_state, torch::Tensor mamba_bwd_state, \
+ /* --- shared input projection --- */ \
  torch::Tensor input_proj_W, torch::Tensor input_proj_b, \
- torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W, \
- torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj, \
- torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log, \
- torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope, \
- torch::Tensor mamba_fwd_out_proj, \
- torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W, \
- torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj, \
- torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log, \
- torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope, \
- torch::Tensor mamba_bwd_out_proj, \
- torch::Tensor gru_Wz, torch::Tensor gru_bz, \
- torch::Tensor gru_Wr, torch::Tensor gru_br, \
- torch::Tensor gru_Wh, torch::Tensor gru_bh, \
+ /* --- CSA layer (produces csa_ctx) --- */ \
+ torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W, \
+ torch::Tensor csa_compress_w, \
+ torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_UQ, \
+ torch::Tensor csa_idx_K, \
+ torch::Tensor csa_out_W, \
+ /* --- HCA layer (produces hca_ctx) --- */ \
+ torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W, \
+ torch::Tensor hca_out_W, \
+ /* --- GRU (carried across steps) --- */ \
+ torch::Tensor gru_Wz, torch::Tensor gru_bz, torch::Tensor gru_Wr, \
+ torch::Tensor gru_br, torch::Tensor gru_Wh, torch::Tensor gru_bh, \
+ /* --- PEER routing + experts --- */ \
  torch::Tensor peer_query_Ws, \
  torch::Tensor prod_keys_A, torch::Tensor prod_keys_B, \
  torch::Tensor expert_W1, torch::Tensor expert_b1, \
  torch::Tensor expert_W2, torch::Tensor expert_b2, \
+ /* --- scalars --- */ \
  float rescale, float alpha_mu, float lamb_eff, \
  float beta1, float beta2, float lr, float wd_eff, float eps, \
  float bc1, float bc2, \
- int d_model, int d_state, int d_inner, \
- int gru_hidden, int num_heads, int pk_dim, \
+ int d_model, int gru_hidden, int num_heads, int pk_dim, \
  int expert_hidden, int num_experts, \
+ int csa_compress, int csa_window, int csa_topk, \
+ int hca_compress, int indexer_rank, \
  torch::Tensor expert_counts); \
- void launch_mamba3_peer_batched_step( \
+ void launch_csa_hca_batched_step( \
  std::vector<torch::Tensor> params, \
  std::vector<torch::Tensor> grads, \
  std::vector<torch::Tensor> sharpness_list, \
@@ -1510,101 +1524,92 @@ namespace sg {
  std::vector<torch::Tensor> exp_avg_sqs, \
  std::vector<torch::Tensor> mus, \
  std::vector<torch::Tensor> gru_states, \
- std::vector<torch::Tensor> mamba_fwd_states, \
- std::vector<torch::Tensor> mamba_bwd_states, \
+ /* --- shared input projection --- */ \
  torch::Tensor input_proj_W, torch::Tensor input_proj_b, \
- torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W, \
- torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj, \
- torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log, \
- torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope, \
- torch::Tensor mamba_fwd_out_proj, \
- torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W, \
- torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj, \
- torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log, \
- torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope, \
- torch::Tensor mamba_bwd_out_proj, \
- torch::Tensor gru_Wz, torch::Tensor gru_bz, \
- torch::Tensor gru_Wr, torch::Tensor gru_br, \
- torch::Tensor gru_Wh, torch::Tensor gru_bh, \
+ /* --- CSA layer --- */ \
+ torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W, \
+ torch::Tensor csa_compress_w, \
+ torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_UQ, \
+ torch::Tensor csa_idx_K, \
+ torch::Tensor csa_out_W, \
+ /* --- HCA layer --- */ \
+ torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W, \
+ torch::Tensor hca_out_W, \
+ /* --- GRU --- */ \
+ torch::Tensor gru_Wz, torch::Tensor gru_bz, torch::Tensor gru_Wr, \
+ torch::Tensor gru_br, torch::Tensor gru_Wh, torch::Tensor gru_bh, \
+ /* --- PEER routing + experts --- */ \
  torch::Tensor peer_query_Ws, \
  torch::Tensor prod_keys_A, torch::Tensor prod_keys_B, \
  torch::Tensor expert_W1, torch::Tensor expert_b1, \
  torch::Tensor expert_W2, torch::Tensor expert_b2, \
+ /* --- per-tensor scalars --- */ \
  std::vector<float> alpha_mus, std::vector<float> lamb_effs, \
  std::vector<float> beta1s, \
  std::vector<float> bc1s, std::vector<float> bc2s, \
+ /* --- shared scalars --- */ \
  float rescale, float beta2, float lr, float wd_eff, float eps, \
- int d_model, int d_state, int d_inner, \
- int gru_hidden, int num_heads, int pk_dim, \
+ int d_model, int gru_hidden, int num_heads, int pk_dim, \
  int expert_hidden, int num_experts, \
+ int csa_compress, int csa_window, int csa_topk, \
+ int hca_compress, int indexer_rank, \
  torch::Tensor expert_counts); \
- void launch_mamba3_peer_bilevel_fwd_save( \
+ void launch_csa_hca_bilevel_fwd_save( \
  torch::Tensor grad, torch::Tensor sharpness, \
  torch::Tensor input_proj_W, torch::Tensor input_proj_b, \
- torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W, \
- torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj, \
- torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log, \
- torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope, \
- torch::Tensor mamba_fwd_out_proj, \
- torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W, \
- torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj, \
- torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log, \
- torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope, \
- torch::Tensor mamba_bwd_out_proj, \
- int d_model, int d_state, int d_inner, \
- torch::Tensor fwd_scan_out, torch::Tensor bwd_scan_out, \
- torch::Tensor fwd_final_state, torch::Tensor bwd_final_state, \
- torch::Tensor fwd_saved_states, \
- torch::Tensor fwd_saved_x_branch, \
- torch::Tensor fwd_saved_z, torch::Tensor fwd_saved_dt, \
- torch::Tensor bwd_saved_states, \
- torch::Tensor bwd_saved_x_branch, \
- torch::Tensor bwd_saved_z, torch::Tensor bwd_saved_dt, \
+ torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W, \
+ torch::Tensor csa_compress_w, \
+ torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_UQ, \
+ torch::Tensor csa_idx_K, \
+ torch::Tensor csa_out_W, \
+ torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W, \
+ torch::Tensor hca_out_W, \
+ int d_model, int num_heads, \
+ int csa_compress, int csa_window, int csa_topk, \
+ int hca_compress, int indexer_rank, \
+ torch::Tensor csa_ctx_out, torch::Tensor hca_ctx_out, \
  torch::Tensor x_sorted, torch::Tensor sort_indices, \
- torch::Tensor fwd_initial_state, \
- torch::Tensor bwd_initial_state, \
+ /* attention adjoint saved state */ \
+ torch::Tensor csa_saved_denom, \
+ torch::Tensor csa_saved_sel_idx, \
+ torch::Tensor csa_saved_probs, \
+ torch::Tensor hca_saved_denom, \
+ torch::Tensor hca_saved_probs, \
  int checkpoint_interval); \
- void launch_mamba3_peer_bilevel_fwd_save_batched( \
+ void launch_csa_hca_bilevel_fwd_save_batched( \
  std::vector<torch::Tensor> grads, \
  std::vector<torch::Tensor> sharpness_list, \
  torch::Tensor input_proj_W, torch::Tensor input_proj_b, \
- torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W, \
- torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj, \
- torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log, \
- torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope, \
- torch::Tensor mamba_fwd_out_proj, \
- torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W, \
- torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj, \
- torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log, \
- torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope, \
- torch::Tensor mamba_bwd_out_proj, \
- int d_model, int d_state, int d_inner, \
- torch::Tensor fwd_scan_out_packed, \
- torch::Tensor bwd_scan_out_packed, \
- torch::Tensor fwd_saved_states_packed, \
- torch::Tensor fwd_saved_xb_packed, \
- torch::Tensor fwd_saved_z_packed, \
- torch::Tensor fwd_saved_dt_packed, \
- torch::Tensor bwd_saved_states_packed, \
- torch::Tensor bwd_saved_xb_packed, \
- torch::Tensor bwd_saved_z_packed, \
- torch::Tensor bwd_saved_dt_packed, \
+ torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W, \
+ torch::Tensor csa_compress_w, \
+ torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_UQ, \
+ torch::Tensor csa_idx_K, \
+ torch::Tensor csa_out_W, \
+ torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W, \
+ torch::Tensor hca_out_W, \
+ int d_model, int num_heads, \
+ int csa_compress, int csa_window, int csa_topk, \
+ int hca_compress, int indexer_rank, \
+ torch::Tensor csa_ctx_out_packed, \
+ torch::Tensor hca_ctx_out_packed, \
  torch::Tensor x_sorted_packed, torch::Tensor offsets_t, \
  torch::Tensor sort_indices_packed, \
- torch::Tensor fwd_initial_states, \
- torch::Tensor bwd_initial_states, \
+ torch::Tensor csa_saved_denom_packed, \
+ torch::Tensor csa_saved_sel_idx_packed, \
+ torch::Tensor csa_saved_probs_packed, \
+ torch::Tensor hca_saved_denom_packed, \
+ torch::Tensor hca_saved_probs_packed, \
  int checkpoint_interval); \
- void launch_mamba3_peer_backward( \
+ void launch_csa_hca_backward( \
  torch::Tensor d_smart_grad, \
  torch::Tensor grad, torch::Tensor sharpness, float rescale, \
  torch::Tensor sort_indices, torch::Tensor x_sorted, \
- torch::Tensor fwd_scan_out, torch::Tensor bwd_scan_out, \
- torch::Tensor fwd_saved_states, \
- torch::Tensor fwd_saved_x_branch, \
- torch::Tensor fwd_saved_z, torch::Tensor fwd_saved_dt, \
- torch::Tensor bwd_saved_states, \
- torch::Tensor bwd_saved_x_branch, \
- torch::Tensor bwd_saved_z, torch::Tensor bwd_saved_dt, \
+ torch::Tensor csa_ctx, torch::Tensor hca_ctx, \
+ torch::Tensor csa_saved_denom, \
+ torch::Tensor csa_saved_sel_idx, \
+ torch::Tensor csa_saved_probs, \
+ torch::Tensor hca_saved_denom, \
+ torch::Tensor hca_saved_probs, \
  torch::Tensor gru_input, torch::Tensor gru_h_old, \
  torch::Tensor gru_z_gate, torch::Tensor gru_r_gate, \
  torch::Tensor gru_h_tilde, \
@@ -1613,42 +1618,25 @@ namespace sg {
  torch::Tensor saved_scores_a, torch::Tensor saved_scores_b, \
  torch::Tensor saved_top_a_idx, torch::Tensor saved_top_b_idx, \
  torch::Tensor saved_soft_a, torch::Tensor saved_soft_b, \
- torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W, \
- torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj, \
- torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log, \
- torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope, \
- torch::Tensor mamba_fwd_out_proj, \
- torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W, \
- torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj, \
- torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log, \
- torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope, \
- torch::Tensor mamba_bwd_out_proj, \
+ torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W, \
+ torch::Tensor csa_compress_w, \
+ torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_UQ, \
+ torch::Tensor csa_idx_K, \
+ torch::Tensor csa_out_W, \
+ torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W, \
+ torch::Tensor hca_out_W, \
  torch::Tensor gru_Wz, torch::Tensor gru_Wr, torch::Tensor gru_Wh, \
  torch::Tensor peer_query_Ws, \
  torch::Tensor prod_keys_A, torch::Tensor prod_keys_B, \
  torch::Tensor expert_W1, torch::Tensor expert_W2, \
  torch::Tensor expert_b1_in, torch::Tensor expert_b2_in, \
  torch::Tensor input_proj_W, \
- torch::Tensor mamba_fwd_init_state, \
- torch::Tensor mamba_bwd_init_state, \
- torch::Tensor d_mamba_fwd_in_proj, \
- torch::Tensor d_mamba_fwd_dt_W, \
- torch::Tensor d_mamba_fwd_dt_b, \
- torch::Tensor d_mamba_fwd_B_proj, \
- torch::Tensor d_mamba_fwd_C_proj, \
- torch::Tensor d_mamba_fwd_A_log, \
- torch::Tensor d_mamba_fwd_D, \
- torch::Tensor d_mamba_fwd_rope, \
- torch::Tensor d_mamba_fwd_out_proj, \
- torch::Tensor d_mamba_bwd_in_proj, \
- torch::Tensor d_mamba_bwd_dt_W, \
- torch::Tensor d_mamba_bwd_dt_b, \
- torch::Tensor d_mamba_bwd_B_proj, \
- torch::Tensor d_mamba_bwd_C_proj, \
- torch::Tensor d_mamba_bwd_A_log, \
- torch::Tensor d_mamba_bwd_D, \
- torch::Tensor d_mamba_bwd_rope, \
- torch::Tensor d_mamba_bwd_out_proj, \
+ torch::Tensor d_csa_q_W, torch::Tensor d_csa_k_W, \
+ torch::Tensor d_csa_v_W, torch::Tensor d_csa_compress_w, \
+ torch::Tensor d_csa_idx_DQ, torch::Tensor d_csa_idx_UQ, \
+ torch::Tensor d_csa_idx_K, torch::Tensor d_csa_out_W, \
+ torch::Tensor d_hca_q_W, torch::Tensor d_hca_k_W, \
+ torch::Tensor d_hca_v_W, torch::Tensor d_hca_out_W, \
  torch::Tensor d_gru_Wz, torch::Tensor d_gru_bz, \
  torch::Tensor d_gru_Wr, torch::Tensor d_gru_br, \
  torch::Tensor d_gru_Wh, torch::Tensor d_gru_bh, \
@@ -1657,48 +1645,39 @@ namespace sg {
  torch::Tensor d_expert_W1, torch::Tensor d_expert_b1, \
  torch::Tensor d_expert_W2, torch::Tensor d_expert_b2, \
  torch::Tensor d_input_proj_W, torch::Tensor d_input_proj_b, \
- int d_model, int d_state, int d_inner, \
- int gru_hidden, int gru_input_dim, \
+ int d_model, int gru_hidden, int gru_input_dim, \
  int num_heads, int topk, int pk_dim, \
  int expert_hidden, int peer_input_dim, int num_experts, \
+ int csa_compress, int csa_window, int csa_topk, \
+ int hca_compress, int indexer_rank, \
  int checkpoint_interval); \
- void launch_mamba3_peer_backward_batched( \
- torch::Tensor d_fwd_scan_out_packed, \
- torch::Tensor d_bwd_scan_out_packed, \
+ void launch_csa_hca_backward_batched( \
+ torch::Tensor d_csa_ctx_packed, \
+ torch::Tensor d_hca_ctx_packed, \
  torch::Tensor x_sorted_packed, \
- torch::Tensor fwd_saved_states_packed, \
- torch::Tensor fwd_saved_xb_packed, \
- torch::Tensor fwd_saved_z_packed, \
- torch::Tensor fwd_saved_dt_packed, \
- torch::Tensor bwd_saved_states_packed, \
- torch::Tensor bwd_saved_xb_packed, \
- torch::Tensor bwd_saved_z_packed, \
- torch::Tensor bwd_saved_dt_packed, \
+ torch::Tensor csa_saved_denom_packed, \
+ torch::Tensor csa_saved_sel_idx_packed, \
+ torch::Tensor csa_saved_probs_packed, \
+ torch::Tensor hca_saved_denom_packed, \
+ torch::Tensor hca_saved_probs_packed, \
  torch::Tensor offsets_t, \
- torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W, \
- torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj, \
- torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log, \
- torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope, \
- torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W, \
- torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj, \
- torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log, \
- torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope, \
- torch::Tensor d_mamba_fwd_in_proj, \
- torch::Tensor d_mamba_fwd_dt_W, torch::Tensor d_mamba_fwd_dt_b, \
- torch::Tensor d_mamba_fwd_B_proj, \
- torch::Tensor d_mamba_fwd_C_proj, \
- torch::Tensor d_mamba_fwd_A_log, \
- torch::Tensor d_mamba_fwd_D, torch::Tensor d_mamba_fwd_rope, \
- torch::Tensor d_mamba_bwd_in_proj, \
- torch::Tensor d_mamba_bwd_dt_W, torch::Tensor d_mamba_bwd_dt_b, \
- torch::Tensor d_mamba_bwd_B_proj, \
- torch::Tensor d_mamba_bwd_C_proj, \
- torch::Tensor d_mamba_bwd_A_log, \
- torch::Tensor d_mamba_bwd_D, torch::Tensor d_mamba_bwd_rope, \
+ torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W, \
+ torch::Tensor csa_compress_w, \
+ torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_UQ, \
+ torch::Tensor csa_idx_K, \
+ torch::Tensor csa_out_W, \
+ torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W, \
+ torch::Tensor hca_out_W, \
+ torch::Tensor d_csa_q_W, torch::Tensor d_csa_k_W, \
+ torch::Tensor d_csa_v_W, torch::Tensor d_csa_compress_w, \
+ torch::Tensor d_csa_idx_DQ, torch::Tensor d_csa_idx_UQ, \
+ torch::Tensor d_csa_idx_K, torch::Tensor d_csa_out_W, \
+ torch::Tensor d_hca_q_W, torch::Tensor d_hca_k_W, \
+ torch::Tensor d_hca_v_W, torch::Tensor d_hca_out_W, \
  torch::Tensor d_x_sorted_packed, \
- torch::Tensor fwd_initial_states, \
- torch::Tensor bwd_initial_states, \
- int d_model, int d_state, int d_inner, int num_params, \
+ int d_model, int num_heads, int num_params, \
+ int csa_compress, int csa_window, int csa_topk, \
+ int hca_compress, int indexer_rank, \
  int checkpoint_interval); \
  }
 
@@ -1715,23 +1694,20 @@ DECLARE_SG2(gfx942)
 // forward/peer-step entries, lines 1499-1611 for the bilevel entries.
 // ---------------------------------------------------------------------
 
-// Pre-refactor csrc/common/ops.cpp::supergrok2_mamba_peer_step.
-void supergrok2_mamba_peer_step(
+// SG2 single-tensor CSA/HCA step. (Renamed from supergrok2_mamba_peer_step;
+// old name kept as a pybind alias.) Parameter list is spec §7.
+void supergrok2_step(
  torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness,
  torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor mu,
  torch::Tensor gru_state,
- torch::Tensor mamba_fwd_state, torch::Tensor mamba_bwd_state,
  torch::Tensor input_proj_W, torch::Tensor input_proj_b,
- torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
- torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
- torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
- torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
- torch::Tensor mamba_fwd_out_proj,
- torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
- torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
- torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
- torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
- torch::Tensor mamba_bwd_out_proj,
+ torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W,
+ torch::Tensor csa_compress_w,
+ torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_UQ,
+ torch::Tensor csa_idx_K,
+ torch::Tensor csa_out_W,
+ torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W,
+ torch::Tensor hca_out_W,
  torch::Tensor gru_Wz, torch::Tensor gru_bz,
  torch::Tensor gru_Wr, torch::Tensor gru_br,
  torch::Tensor gru_Wh, torch::Tensor gru_bh,
@@ -1742,34 +1718,35 @@ void supergrok2_mamba_peer_step(
  float rescale, float alpha_mu, float lamb_eff,
  float beta1, float beta2, float lr, float wd_eff, float eps,
  float bc1, float bc2,
- int d_model, int d_state, int d_inner,
- int gru_hidden, int num_heads, int pk_dim,
+ int d_model, int gru_hidden, int num_heads, int pk_dim,
  int expert_hidden, int num_experts,
+ int csa_compress, int csa_window, int csa_topk,
+ int hca_compress, int indexer_rank,
  torch::Tensor expert_counts
 ) {
  if (grad.numel() == 0) return;
- SG_DISPATCH(launch_mamba3_peer_step,
+ SG_DISPATCH(launch_csa_hca_step,
  param, grad, sharpness, exp_avg, exp_avg_sq, mu,
- gru_state, mamba_fwd_state, mamba_bwd_state,
+ gru_state,
  input_proj_W, input_proj_b,
- mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
- mamba_fwd_B_proj, mamba_fwd_C_proj, mamba_fwd_A_log,
- mamba_fwd_D, mamba_fwd_rope, mamba_fwd_out_proj,
- mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
- mamba_bwd_B_proj, mamba_bwd_C_proj, mamba_bwd_A_log,
- mamba_bwd_D, mamba_bwd_rope, mamba_bwd_out_proj,
+ csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
+ csa_idx_DQ, csa_idx_UQ, csa_idx_K, csa_out_W,
+ hca_q_W, hca_k_W, hca_v_W, hca_out_W,
  gru_Wz, gru_bz, gru_Wr, gru_br, gru_Wh, gru_bh,
  peer_query_Ws, prod_keys_A, prod_keys_B,
  expert_W1, expert_b1, expert_W2, expert_b2,
  rescale, alpha_mu, lamb_eff,
  beta1, beta2, lr, wd_eff, eps, bc1, bc2,
- d_model, d_state, d_inner,
- gru_hidden, num_heads, pk_dim,
- expert_hidden, num_experts, expert_counts);
+ d_model, gru_hidden, num_heads, pk_dim,
+ expert_hidden, num_experts,
+ csa_compress, csa_window, csa_topk,
+ hca_compress, indexer_rank, expert_counts);
 }
 
-// Pre-refactor csrc/common/ops.cpp::supergrok2_mamba_peer_batched_step.
-void supergrok2_mamba_peer_batched_step(
+// SG2 batched CSA/HCA step. (Renamed from supergrok2_mamba_peer_batched_step;
+// old name kept as a pybind alias.) Vectors per tensor; shared meta weights
+// passed once; mamba states dropped (attention is stateless across steps).
+void supergrok2_batched_step(
  std::vector<torch::Tensor> params,
  std::vector<torch::Tensor> grads,
  std::vector<torch::Tensor> sharpness_list,
@@ -1777,19 +1754,14 @@ void supergrok2_mamba_peer_batched_step(
  std::vector<torch::Tensor> exp_avg_sqs,
  std::vector<torch::Tensor> mus,
  std::vector<torch::Tensor> gru_states,
- std::vector<torch::Tensor> mamba_fwd_states,
- std::vector<torch::Tensor> mamba_bwd_states,
  torch::Tensor input_proj_W, torch::Tensor input_proj_b,
- torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
- torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
- torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
- torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
- torch::Tensor mamba_fwd_out_proj,
- torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
- torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
- torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
- torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
- torch::Tensor mamba_bwd_out_proj,
+ torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W,
+ torch::Tensor csa_compress_w,
+ torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_UQ,
+ torch::Tensor csa_idx_K,
+ torch::Tensor csa_out_W,
+ torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W,
+ torch::Tensor hca_out_W,
  torch::Tensor gru_Wz, torch::Tensor gru_bz,
  torch::Tensor gru_Wr, torch::Tensor gru_br,
  torch::Tensor gru_Wh, torch::Tensor gru_bh,
@@ -1801,147 +1773,130 @@ void supergrok2_mamba_peer_batched_step(
  std::vector<float> beta1s,
  std::vector<float> bc1s, std::vector<float> bc2s,
  float rescale, float beta2, float lr, float wd_eff, float eps,
- int d_model, int d_state, int d_inner,
- int gru_hidden, int num_heads, int pk_dim,
+ int d_model, int gru_hidden, int num_heads, int pk_dim,
  int expert_hidden, int num_experts,
+ int csa_compress, int csa_window, int csa_topk,
+ int hca_compress, int indexer_rank,
  torch::Tensor expert_counts
 ) {
  if (params.empty()) return;
- SG_DISPATCH(launch_mamba3_peer_batched_step,
+ SG_DISPATCH(launch_csa_hca_batched_step,
  params, grads, sharpness_list, exp_avgs, exp_avg_sqs, mus,
- gru_states, mamba_fwd_states, mamba_bwd_states,
+ gru_states,
  input_proj_W, input_proj_b,
- mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
- mamba_fwd_B_proj, mamba_fwd_C_proj, mamba_fwd_A_log,
- mamba_fwd_D, mamba_fwd_rope, mamba_fwd_out_proj,
- mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
- mamba_bwd_B_proj, mamba_bwd_C_proj, mamba_bwd_A_log,
- mamba_bwd_D, mamba_bwd_rope, mamba_bwd_out_proj,
+ csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
+ csa_idx_DQ, csa_idx_UQ, csa_idx_K, csa_out_W,
+ hca_q_W, hca_k_W, hca_v_W, hca_out_W,
  gru_Wz, gru_bz, gru_Wr, gru_br, gru_Wh, gru_bh,
  peer_query_Ws, prod_keys_A, prod_keys_B,
  expert_W1, expert_b1, expert_W2, expert_b2,
  alpha_mus, lamb_effs, beta1s, bc1s, bc2s,
  rescale, beta2, lr, wd_eff, eps,
- d_model, d_state, d_inner,
- gru_hidden, num_heads, pk_dim,
- expert_hidden, num_experts, expert_counts);
+ d_model, gru_hidden, num_heads, pk_dim,
+ expert_hidden, num_experts,
+ csa_compress, csa_window, csa_topk,
+ hca_compress, indexer_rank, expert_counts);
 }
 
-// Pre-refactor csrc/common/ops.cpp::supergrok2_bilevel_fwd_save.
-// Forward scan with state-saving for the meta-net's bilevel backward.
+// SG2 bilevel forward-save: runs the CSA/HCA attention forward and saves the
+// adjoint state (softmax denominators, selected-index sets, attention probs)
+// needed by the bilevel backward. Mamba scan saved-state tensors dropped.
 void supergrok2_bilevel_fwd_save(
  torch::Tensor grad, torch::Tensor sharpness,
  torch::Tensor input_proj_W, torch::Tensor input_proj_b,
- torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
- torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
- torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
- torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
- torch::Tensor mamba_fwd_out_proj,
- torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
- torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
- torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
- torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
- torch::Tensor mamba_bwd_out_proj,
- int d_model, int d_state, int d_inner,
- torch::Tensor fwd_scan_out, torch::Tensor bwd_scan_out,
- torch::Tensor fwd_final_state, torch::Tensor bwd_final_state,
- torch::Tensor fwd_saved_states,
- torch::Tensor fwd_saved_x_branch,
- torch::Tensor fwd_saved_z, torch::Tensor fwd_saved_dt,
- torch::Tensor bwd_saved_states,
- torch::Tensor bwd_saved_x_branch,
- torch::Tensor bwd_saved_z, torch::Tensor bwd_saved_dt,
+ torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W,
+ torch::Tensor csa_compress_w,
+ torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_UQ,
+ torch::Tensor csa_idx_K,
+ torch::Tensor csa_out_W,
+ torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W,
+ torch::Tensor hca_out_W,
+ int d_model, int num_heads,
+ int csa_compress, int csa_window, int csa_topk,
+ int hca_compress, int indexer_rank,
+ torch::Tensor csa_ctx_out, torch::Tensor hca_ctx_out,
  torch::Tensor x_sorted, torch::Tensor sort_indices,
- torch::Tensor fwd_initial_state,
- torch::Tensor bwd_initial_state,
+ torch::Tensor csa_saved_denom,
+ torch::Tensor csa_saved_sel_idx,
+ torch::Tensor csa_saved_probs,
+ torch::Tensor hca_saved_denom,
+ torch::Tensor hca_saved_probs,
  int checkpoint_interval
 ) {
  if (grad.numel() == 0) return;
- SG_DISPATCH(launch_mamba3_peer_bilevel_fwd_save,
+ SG_DISPATCH(launch_csa_hca_bilevel_fwd_save,
  grad, sharpness,
  input_proj_W, input_proj_b,
- mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
- mamba_fwd_B_proj, mamba_fwd_C_proj, mamba_fwd_A_log,
- mamba_fwd_D, mamba_fwd_rope, mamba_fwd_out_proj,
- mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
- mamba_bwd_B_proj, mamba_bwd_C_proj, mamba_bwd_A_log,
- mamba_bwd_D, mamba_bwd_rope, mamba_bwd_out_proj,
- d_model, d_state, d_inner,
- fwd_scan_out, bwd_scan_out,
- fwd_final_state, bwd_final_state,
- fwd_saved_states, fwd_saved_x_branch, fwd_saved_z, fwd_saved_dt,
- bwd_saved_states, bwd_saved_x_branch, bwd_saved_z, bwd_saved_dt,
+ csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
+ csa_idx_DQ, csa_idx_UQ, csa_idx_K, csa_out_W,
+ hca_q_W, hca_k_W, hca_v_W, hca_out_W,
+ d_model, num_heads,
+ csa_compress, csa_window, csa_topk,
+ hca_compress, indexer_rank,
+ csa_ctx_out, hca_ctx_out,
  x_sorted, sort_indices,
- fwd_initial_state, bwd_initial_state,
+ csa_saved_denom, csa_saved_sel_idx, csa_saved_probs,
+ hca_saved_denom, hca_saved_probs,
  checkpoint_interval);
 }
 
-// Pre-refactor csrc/common/ops.cpp::supergrok2_bilevel_fwd_save_batched.
+// SG2 batched bilevel forward-save (packed across params).
 void supergrok2_bilevel_fwd_save_batched(
  std::vector<torch::Tensor> grads,
  std::vector<torch::Tensor> sharpness_list,
  torch::Tensor input_proj_W, torch::Tensor input_proj_b,
- torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
- torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
- torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
- torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
- torch::Tensor mamba_fwd_out_proj,
- torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
- torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
- torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
- torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
- torch::Tensor mamba_bwd_out_proj,
- int d_model, int d_state, int d_inner,
- torch::Tensor fwd_scan_out_packed,
- torch::Tensor bwd_scan_out_packed,
- torch::Tensor fwd_saved_states_packed,
- torch::Tensor fwd_saved_xb_packed,
- torch::Tensor fwd_saved_z_packed,
- torch::Tensor fwd_saved_dt_packed,
- torch::Tensor bwd_saved_states_packed,
- torch::Tensor bwd_saved_xb_packed,
- torch::Tensor bwd_saved_z_packed,
- torch::Tensor bwd_saved_dt_packed,
+ torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W,
+ torch::Tensor csa_compress_w,
+ torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_UQ,
+ torch::Tensor csa_idx_K,
+ torch::Tensor csa_out_W,
+ torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W,
+ torch::Tensor hca_out_W,
+ int d_model, int num_heads,
+ int csa_compress, int csa_window, int csa_topk,
+ int hca_compress, int indexer_rank,
+ torch::Tensor csa_ctx_out_packed,
+ torch::Tensor hca_ctx_out_packed,
  torch::Tensor x_sorted_packed, torch::Tensor offsets_t,
  torch::Tensor sort_indices_packed,
- torch::Tensor fwd_initial_states,
- torch::Tensor bwd_initial_states,
+ torch::Tensor csa_saved_denom_packed,
+ torch::Tensor csa_saved_sel_idx_packed,
+ torch::Tensor csa_saved_probs_packed,
+ torch::Tensor hca_saved_denom_packed,
+ torch::Tensor hca_saved_probs_packed,
  int checkpoint_interval
 ) {
  if (grads.empty()) return;
- SG_DISPATCH(launch_mamba3_peer_bilevel_fwd_save_batched,
+ SG_DISPATCH(launch_csa_hca_bilevel_fwd_save_batched,
  grads, sharpness_list,
  input_proj_W, input_proj_b,
- mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
- mamba_fwd_B_proj, mamba_fwd_C_proj, mamba_fwd_A_log,
- mamba_fwd_D, mamba_fwd_rope, mamba_fwd_out_proj,
- mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
- mamba_bwd_B_proj, mamba_bwd_C_proj, mamba_bwd_A_log,
- mamba_bwd_D, mamba_bwd_rope, mamba_bwd_out_proj,
- d_model, d_state, d_inner,
- fwd_scan_out_packed, bwd_scan_out_packed,
- fwd_saved_states_packed, fwd_saved_xb_packed,
- fwd_saved_z_packed, fwd_saved_dt_packed,
- bwd_saved_states_packed, bwd_saved_xb_packed,
- bwd_saved_z_packed, bwd_saved_dt_packed,
+ csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
+ csa_idx_DQ, csa_idx_UQ, csa_idx_K, csa_out_W,
+ hca_q_W, hca_k_W, hca_v_W, hca_out_W,
+ d_model, num_heads,
+ csa_compress, csa_window, csa_topk,
+ hca_compress, indexer_rank,
+ csa_ctx_out_packed, hca_ctx_out_packed,
  x_sorted_packed, offsets_t, sort_indices_packed,
- fwd_initial_states, bwd_initial_states,
+ csa_saved_denom_packed, csa_saved_sel_idx_packed,
+ csa_saved_probs_packed,
+ hca_saved_denom_packed, hca_saved_probs_packed,
  checkpoint_interval);
 }
 
-// Pre-refactor csrc/common/ops.cpp::supergrok2_bilevel_backward.
-// Full backward through the meta-net, single-tensor entry.
+// SG2 bilevel backward through the CSA/HCA meta-net, single-tensor entry.
+// Mamba weight/state block swapped for the CSA/HCA weight + attention adjoint
+// saved-state block. On gfx942 the backward may still throw (forward only).
 void supergrok2_bilevel_backward(
  torch::Tensor d_smart_grad,
  torch::Tensor grad, torch::Tensor sharpness, float rescale,
  torch::Tensor sort_indices, torch::Tensor x_sorted,
- torch::Tensor fwd_scan_out, torch::Tensor bwd_scan_out,
- torch::Tensor fwd_saved_states,
- torch::Tensor fwd_saved_x_branch,
- torch::Tensor fwd_saved_z, torch::Tensor fwd_saved_dt,
- torch::Tensor bwd_saved_states,
- torch::Tensor bwd_saved_x_branch,
- torch::Tensor bwd_saved_z, torch::Tensor bwd_saved_dt,
+ torch::Tensor csa_ctx, torch::Tensor hca_ctx,
+ torch::Tensor csa_saved_denom,
+ torch::Tensor csa_saved_sel_idx,
+ torch::Tensor csa_saved_probs,
+ torch::Tensor hca_saved_denom,
+ torch::Tensor hca_saved_probs,
  torch::Tensor gru_input, torch::Tensor gru_h_old,
  torch::Tensor gru_z_gate, torch::Tensor gru_r_gate,
  torch::Tensor gru_h_tilde,
@@ -1950,42 +1905,25 @@ void supergrok2_bilevel_backward(
  torch::Tensor saved_scores_a, torch::Tensor saved_scores_b,
  torch::Tensor saved_top_a_idx, torch::Tensor saved_top_b_idx,
  torch::Tensor saved_soft_a, torch::Tensor saved_soft_b,
- torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
- torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
- torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
- torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
- torch::Tensor mamba_fwd_out_proj,
- torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
- torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
- torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
- torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
- torch::Tensor mamba_bwd_out_proj,
+ torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W,
+ torch::Tensor csa_compress_w,
+ torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_UQ,
+ torch::Tensor csa_idx_K,
+ torch::Tensor csa_out_W,
+ torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W,
+ torch::Tensor hca_out_W,
  torch::Tensor gru_Wz, torch::Tensor gru_Wr, torch::Tensor gru_Wh,
  torch::Tensor peer_query_Ws,
  torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
  torch::Tensor expert_W1, torch::Tensor expert_W2,
  torch::Tensor expert_b1_in, torch::Tensor expert_b2_in,
  torch::Tensor input_proj_W,
- torch::Tensor mamba_fwd_init_state,
- torch::Tensor mamba_bwd_init_state,
- torch::Tensor d_mamba_fwd_in_proj,
- torch::Tensor d_mamba_fwd_dt_W,
- torch::Tensor d_mamba_fwd_dt_b,
- torch::Tensor d_mamba_fwd_B_proj,
- torch::Tensor d_mamba_fwd_C_proj,
- torch::Tensor d_mamba_fwd_A_log,
- torch::Tensor d_mamba_fwd_D,
- torch::Tensor d_mamba_fwd_rope,
- torch::Tensor d_mamba_fwd_out_proj,
- torch::Tensor d_mamba_bwd_in_proj,
- torch::Tensor d_mamba_bwd_dt_W,
- torch::Tensor d_mamba_bwd_dt_b,
- torch::Tensor d_mamba_bwd_B_proj,
- torch::Tensor d_mamba_bwd_C_proj,
- torch::Tensor d_mamba_bwd_A_log,
- torch::Tensor d_mamba_bwd_D,
- torch::Tensor d_mamba_bwd_rope,
- torch::Tensor d_mamba_bwd_out_proj,
+ torch::Tensor d_csa_q_W, torch::Tensor d_csa_k_W,
+ torch::Tensor d_csa_v_W, torch::Tensor d_csa_compress_w,
+ torch::Tensor d_csa_idx_DQ, torch::Tensor d_csa_idx_UQ,
+ torch::Tensor d_csa_idx_K, torch::Tensor d_csa_out_W,
+ torch::Tensor d_hca_q_W, torch::Tensor d_hca_k_W,
+ torch::Tensor d_hca_v_W, torch::Tensor d_hca_out_W,
  torch::Tensor d_gru_Wz, torch::Tensor d_gru_bz,
  torch::Tensor d_gru_Wr, torch::Tensor d_gru_br,
  torch::Tensor d_gru_Wh, torch::Tensor d_gru_bh,
@@ -1994,129 +1932,106 @@ void supergrok2_bilevel_backward(
  torch::Tensor d_expert_W1, torch::Tensor d_expert_b1,
  torch::Tensor d_expert_W2, torch::Tensor d_expert_b2,
  torch::Tensor d_input_proj_W, torch::Tensor d_input_proj_b,
- int d_model, int d_state, int d_inner,
- int gru_hidden, int gru_input_dim,
+ int d_model, int gru_hidden, int gru_input_dim,
  int num_heads, int topk, int pk_dim,
  int expert_hidden, int peer_input_dim, int num_experts,
+ int csa_compress, int csa_window, int csa_topk,
+ int hca_compress, int indexer_rank,
  int checkpoint_interval
 ) {
  if (d_smart_grad.numel() == 0) return;
- SG_DISPATCH(launch_mamba3_peer_backward,
+ SG_DISPATCH(launch_csa_hca_backward,
  d_smart_grad, grad, sharpness, rescale,
  sort_indices, x_sorted,
- fwd_scan_out, bwd_scan_out,
- fwd_saved_states, fwd_saved_x_branch, fwd_saved_z, fwd_saved_dt,
- bwd_saved_states, bwd_saved_x_branch, bwd_saved_z, bwd_saved_dt,
+ csa_ctx, hca_ctx,
+ csa_saved_denom, csa_saved_sel_idx, csa_saved_probs,
+ hca_saved_denom, hca_saved_probs,
  gru_input, gru_h_old, gru_z_gate, gru_r_gate, gru_h_tilde,
  peer_input, expert_indices, routing_weights, saved_z_hidden,
  saved_scores_a, saved_scores_b,
  saved_top_a_idx, saved_top_b_idx, saved_soft_a, saved_soft_b,
- mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
- mamba_fwd_B_proj, mamba_fwd_C_proj, mamba_fwd_A_log,
- mamba_fwd_D, mamba_fwd_rope, mamba_fwd_out_proj,
- mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
- mamba_bwd_B_proj, mamba_bwd_C_proj, mamba_bwd_A_log,
- mamba_bwd_D, mamba_bwd_rope, mamba_bwd_out_proj,
+ csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
+ csa_idx_DQ, csa_idx_UQ, csa_idx_K, csa_out_W,
+ hca_q_W, hca_k_W, hca_v_W, hca_out_W,
  gru_Wz, gru_Wr, gru_Wh,
  peer_query_Ws, prod_keys_A, prod_keys_B,
  expert_W1, expert_W2, expert_b1_in, expert_b2_in, input_proj_W,
- mamba_fwd_init_state, mamba_bwd_init_state,
- d_mamba_fwd_in_proj, d_mamba_fwd_dt_W, d_mamba_fwd_dt_b,
- d_mamba_fwd_B_proj, d_mamba_fwd_C_proj, d_mamba_fwd_A_log,
- d_mamba_fwd_D, d_mamba_fwd_rope, d_mamba_fwd_out_proj,
- d_mamba_bwd_in_proj, d_mamba_bwd_dt_W, d_mamba_bwd_dt_b,
- d_mamba_bwd_B_proj, d_mamba_bwd_C_proj, d_mamba_bwd_A_log,
- d_mamba_bwd_D, d_mamba_bwd_rope, d_mamba_bwd_out_proj,
+ d_csa_q_W, d_csa_k_W, d_csa_v_W, d_csa_compress_w,
+ d_csa_idx_DQ, d_csa_idx_UQ, d_csa_idx_K, d_csa_out_W,
+ d_hca_q_W, d_hca_k_W, d_hca_v_W, d_hca_out_W,
  d_gru_Wz, d_gru_bz, d_gru_Wr, d_gru_br, d_gru_Wh, d_gru_bh,
  d_peer_query_Ws, d_prod_keys_A, d_prod_keys_B,
  d_expert_W1, d_expert_b1, d_expert_W2, d_expert_b2,
  d_input_proj_W, d_input_proj_b,
- d_model, d_state, d_inner,
- gru_hidden, gru_input_dim,
+ d_model, gru_hidden, gru_input_dim,
  num_heads, topk, pk_dim,
  expert_hidden, peer_input_dim, num_experts,
+ csa_compress, csa_window, csa_topk,
+ hca_compress, indexer_rank,
  checkpoint_interval);
 }
 
-// Pre-refactor csrc/common/ops.cpp::supergrok2_bilevel_backward_batched.
+// SG2 batched bilevel backward (packed across params). CSA/HCA weight block
+// + attention adjoint saved-state block replace the Mamba scan block.
 void supergrok2_bilevel_backward_batched(
- torch::Tensor d_fwd_scan_out_packed,
- torch::Tensor d_bwd_scan_out_packed,
+ torch::Tensor d_csa_ctx_packed,
+ torch::Tensor d_hca_ctx_packed,
  torch::Tensor x_sorted_packed,
- torch::Tensor fwd_saved_states_packed,
- torch::Tensor fwd_saved_xb_packed,
- torch::Tensor fwd_saved_z_packed,
- torch::Tensor fwd_saved_dt_packed,
- torch::Tensor bwd_saved_states_packed,
- torch::Tensor bwd_saved_xb_packed,
- torch::Tensor bwd_saved_z_packed,
- torch::Tensor bwd_saved_dt_packed,
+ torch::Tensor csa_saved_denom_packed,
+ torch::Tensor csa_saved_sel_idx_packed,
+ torch::Tensor csa_saved_probs_packed,
+ torch::Tensor hca_saved_denom_packed,
+ torch::Tensor hca_saved_probs_packed,
  torch::Tensor offsets_t,
- torch::Tensor mamba_fwd_in_proj, torch::Tensor mamba_fwd_dt_W,
- torch::Tensor mamba_fwd_dt_b, torch::Tensor mamba_fwd_B_proj,
- torch::Tensor mamba_fwd_C_proj, torch::Tensor mamba_fwd_A_log,
- torch::Tensor mamba_fwd_D, torch::Tensor mamba_fwd_rope,
- torch::Tensor mamba_bwd_in_proj, torch::Tensor mamba_bwd_dt_W,
- torch::Tensor mamba_bwd_dt_b, torch::Tensor mamba_bwd_B_proj,
- torch::Tensor mamba_bwd_C_proj, torch::Tensor mamba_bwd_A_log,
- torch::Tensor mamba_bwd_D, torch::Tensor mamba_bwd_rope,
- torch::Tensor d_mamba_fwd_in_proj,
- torch::Tensor d_mamba_fwd_dt_W, torch::Tensor d_mamba_fwd_dt_b,
- torch::Tensor d_mamba_fwd_B_proj,
- torch::Tensor d_mamba_fwd_C_proj,
- torch::Tensor d_mamba_fwd_A_log,
- torch::Tensor d_mamba_fwd_D, torch::Tensor d_mamba_fwd_rope,
- torch::Tensor d_mamba_bwd_in_proj,
- torch::Tensor d_mamba_bwd_dt_W, torch::Tensor d_mamba_bwd_dt_b,
- torch::Tensor d_mamba_bwd_B_proj,
- torch::Tensor d_mamba_bwd_C_proj,
- torch::Tensor d_mamba_bwd_A_log,
- torch::Tensor d_mamba_bwd_D, torch::Tensor d_mamba_bwd_rope,
+ torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W,
+ torch::Tensor csa_compress_w,
+ torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_UQ,
+ torch::Tensor csa_idx_K,
+ torch::Tensor csa_out_W,
+ torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W,
+ torch::Tensor hca_out_W,
+ torch::Tensor d_csa_q_W, torch::Tensor d_csa_k_W,
+ torch::Tensor d_csa_v_W, torch::Tensor d_csa_compress_w,
+ torch::Tensor d_csa_idx_DQ, torch::Tensor d_csa_idx_UQ,
+ torch::Tensor d_csa_idx_K, torch::Tensor d_csa_out_W,
+ torch::Tensor d_hca_q_W, torch::Tensor d_hca_k_W,
+ torch::Tensor d_hca_v_W, torch::Tensor d_hca_out_W,
  torch::Tensor d_x_sorted_packed,
- torch::Tensor fwd_initial_states,
- torch::Tensor bwd_initial_states,
- int d_model, int d_state, int d_inner, int num_params,
+ int d_model, int num_heads, int num_params,
+ int csa_compress, int csa_window, int csa_topk,
+ int hca_compress, int indexer_rank,
  int checkpoint_interval
 ) {
  if (num_params == 0) return;
- SG_DISPATCH(launch_mamba3_peer_backward_batched,
- d_fwd_scan_out_packed, d_bwd_scan_out_packed,
+ SG_DISPATCH(launch_csa_hca_backward_batched,
+ d_csa_ctx_packed, d_hca_ctx_packed,
  x_sorted_packed,
- fwd_saved_states_packed, fwd_saved_xb_packed,
- fwd_saved_z_packed, fwd_saved_dt_packed,
- bwd_saved_states_packed, bwd_saved_xb_packed,
- bwd_saved_z_packed, bwd_saved_dt_packed,
+ csa_saved_denom_packed, csa_saved_sel_idx_packed,
+ csa_saved_probs_packed,
+ hca_saved_denom_packed, hca_saved_probs_packed,
  offsets_t,
- mamba_fwd_in_proj, mamba_fwd_dt_W, mamba_fwd_dt_b,
- mamba_fwd_B_proj, mamba_fwd_C_proj, mamba_fwd_A_log,
- mamba_fwd_D, mamba_fwd_rope,
- mamba_bwd_in_proj, mamba_bwd_dt_W, mamba_bwd_dt_b,
- mamba_bwd_B_proj, mamba_bwd_C_proj, mamba_bwd_A_log,
- mamba_bwd_D, mamba_bwd_rope,
- d_mamba_fwd_in_proj, d_mamba_fwd_dt_W, d_mamba_fwd_dt_b,
- d_mamba_fwd_B_proj, d_mamba_fwd_C_proj, d_mamba_fwd_A_log,
- d_mamba_fwd_D, d_mamba_fwd_rope,
- d_mamba_bwd_in_proj, d_mamba_bwd_dt_W, d_mamba_bwd_dt_b,
- d_mamba_bwd_B_proj, d_mamba_bwd_C_proj, d_mamba_bwd_A_log,
- d_mamba_bwd_D, d_mamba_bwd_rope,
+ csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
+ csa_idx_DQ, csa_idx_UQ, csa_idx_K, csa_out_W,
+ hca_q_W, hca_k_W, hca_v_W, hca_out_W,
+ d_csa_q_W, d_csa_k_W, d_csa_v_W, d_csa_compress_w,
+ d_csa_idx_DQ, d_csa_idx_UQ, d_csa_idx_K, d_csa_out_W,
+ d_hca_q_W, d_hca_k_W, d_hca_v_W, d_hca_out_W,
  d_x_sorted_packed,
- fwd_initial_states, bwd_initial_states,
- d_model, d_state, d_inner, num_params,
+ d_model, num_heads, num_params,
+ csa_compress, csa_window, csa_topk,
+ hca_compress, indexer_rank,
  checkpoint_interval);
 }
 
-// Pre-refactor csrc/common/ops.cpp::supergrok2_prepare_and_batched_step.
-// Lives in csrc/kernels/{cuda,hip}/<arch>/multi_tensor_prepare_<arch>.{cu,hip.cpp}
-// (not a launch_X — the per-arch host wrapper for the multi_tensor prepare
-// kernel + batched-step pipeline). Each arch translates this to one
-// ::sg::<arch>::supergrok2_prepare_and_batched_step.
+// SG2 fused multi-tensor grad prepare (clip, finite, bias corrections) +
+// batched CSA/HCA step. Keeps its name (spec §7); the per-arch impl swaps the
+// Mamba weight bundle for the CSA/HCA weight set. Lives in
+// csrc/kernels/{cuda,hip}/<arch>/multi_tensor_prepare_<arch>.{cu,hip.cpp}.
 void supergrok2_prepare_and_batched_step(
  std::vector<torch::Tensor> params,
  std::vector<torch::Tensor> grads,
  std::vector<torch::Tensor> exp_avgs,
  std::vector<torch::Tensor> exp_avg_sqs,
- std::vector<torch::Tensor> mamba_fwd_states,
- std::vector<torch::Tensor> mamba_bwd_states,
  std::vector<torch::Tensor> gru_states,
  std::vector<torch::Tensor> mus,
  std::vector<torch::Tensor> sharpnesses,
@@ -2126,31 +2041,73 @@ void supergrok2_prepare_and_batched_step(
  double base_alpha, double gradient_clipping,
  double beta2, double lr, double eps, double wd,
  double lamb, double ramp, double gate_signal,
- torch::Tensor mamba_fwd_A, torch::Tensor mamba_fwd_B,
- torch::Tensor mamba_fwd_C, torch::Tensor mamba_fwd_D,
- torch::Tensor mamba_fwd_dt,
- torch::Tensor mamba_bwd_A, torch::Tensor mamba_bwd_B,
- torch::Tensor mamba_bwd_C, torch::Tensor mamba_bwd_D,
- torch::Tensor mamba_bwd_dt,
+ torch::Tensor input_proj_W, torch::Tensor input_proj_b,
+ torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W,
+ torch::Tensor csa_compress_w,
+ torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_UQ,
+ torch::Tensor csa_idx_K,
+ torch::Tensor csa_out_W,
+ torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W,
+ torch::Tensor hca_out_W,
  torch::Tensor gru_Wz, torch::Tensor gru_Wr, torch::Tensor gru_Wh,
  torch::Tensor gru_bz, torch::Tensor gru_br, torch::Tensor gru_bh,
  torch::Tensor peer_query_Ws,
  torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
- torch::Tensor value_proj_W,
- int64_t d_inner, int64_t d_state, int64_t n_experts, int64_t topk
+ torch::Tensor expert_W1, torch::Tensor expert_b1,
+ torch::Tensor expert_W2, torch::Tensor expert_b2,
+ int64_t d_model, int64_t gru_hidden, int64_t num_heads, int64_t pk_dim,
+ int64_t expert_hidden, int64_t num_experts,
+ int64_t csa_compress, int64_t csa_window, int64_t csa_topk,
+ int64_t hca_compress, int64_t indexer_rank,
+ torch::Tensor expert_counts
 ) {
- if (params.empty()) return;
- SG_DISPATCH(supergrok2_prepare_and_batched_step,
- params, grads, exp_avgs, exp_avg_sqs,
- mamba_fwd_states, mamba_bwd_states, gru_states, mus, sharpnesses,
- steps, layer_alphas, layer_beta1s,
- base_alpha, gradient_clipping, beta2, lr, eps, wd,
- lamb, ramp, gate_signal,
- mamba_fwd_A, mamba_fwd_B, mamba_fwd_C, mamba_fwd_D, mamba_fwd_dt,
- mamba_bwd_A, mamba_bwd_B, mamba_bwd_C, mamba_bwd_D, mamba_bwd_dt,
- gru_Wz, gru_Wr, gru_Wh, gru_bz, gru_br, gru_bh,
- peer_query_Ws, prod_keys_A, prod_keys_B, value_proj_W,
- d_inner, d_state, n_experts, topk);
+ const size_t n = params.size();
+ if (n == 0) return;
+
+ // Host-side global-norm gradient clipping (arch-independent prep).
+ clip_grad_norms_device_side(grads, n, static_cast<float>(gradient_clipping));
+
+ // Per-param scalars: clamped blend alpha, gated lambda, bias corrections.
+ std::vector<torch::Tensor> sharp_list(n);
+ std::vector<float> alpha_mus(n), lamb_effs(n), beta1s(n), bc1s(n), bc2s(n);
+ const float lamb_eff = static_cast<float>(lamb * ramp * gate_signal);
+ const float wd_eff = static_cast<float>(wd);
+ for (size_t i = 0; i < n; ++i) {
+ const float la = static_cast<float>(layer_alphas[i]);
+ alpha_mus[i] = std::max(0.0f, std::min(1.0f,
+ static_cast<float>(base_alpha) * la));
+ lamb_effs[i] = lamb_eff;
+ beta1s[i] = static_cast<float>(layer_beta1s[i]);
+ bc1s[i] = 1.0f - std::pow(beta1s[i], static_cast<float>(steps[i]));
+ bc2s[i] = 1.0f - std::pow(static_cast<float>(beta2),
+ static_cast<float>(steps[i]));
+ sharp_list[i] =
+ (sharpnesses[i].defined() && sharpnesses[i].numel() == grads[i].numel())
+ ? sharpnesses[i].to(grads[i].dtype())
+ : torch::zeros_like(grads[i]);
+ }
+
+ // Smart-grad blend strength (rescale); matches the prior raw-lambda blend.
+ const float rescale = static_cast<float>(lamb);
+
+ SG_DISPATCH(launch_csa_hca_batched_step,
+ params, grads, sharp_list, exp_avgs, exp_avg_sqs, mus, gru_states,
+ input_proj_W, input_proj_b,
+ csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
+ csa_idx_DQ, csa_idx_UQ, csa_idx_K, csa_out_W,
+ hca_q_W, hca_k_W, hca_v_W, hca_out_W,
+ gru_Wz, gru_bz, gru_Wr, gru_br, gru_Wh, gru_bh,
+ peer_query_Ws, prod_keys_A, prod_keys_B,
+ expert_W1, expert_b1, expert_W2, expert_b2,
+ alpha_mus, lamb_effs, beta1s, bc1s, bc2s,
+ rescale, static_cast<float>(beta2),
+ static_cast<float>(lr), wd_eff, static_cast<float>(eps),
+ static_cast<int>(d_model), static_cast<int>(gru_hidden),
+ static_cast<int>(num_heads), static_cast<int>(pk_dim),
+ static_cast<int>(expert_hidden), static_cast<int>(num_experts),
+ static_cast<int>(csa_compress), static_cast<int>(csa_window),
+ static_cast<int>(csa_topk), static_cast<int>(hca_compress),
+ static_cast<int>(indexer_rank), expert_counts);
 }
 
 } // namespace sg
@@ -3311,24 +3268,30 @@ PYBIND11_MODULE(_ops, m) {
  m.def("int8_symmetric_quantize", &sg::int8_symmetric_quantize);
  m.def("int4_gptq_quantize", &sg::int4_gptq_quantize);
 
- // SuperGrok v2 — Mamba-3+PEER meta-net entries.
+ // SuperGrok v2 — CSA/HCA hybrid-attention meta-net entries.
  // Wrappers in csrc/bindings/supergrok2.cpp dispatch to the per-arch
- // launchers in csrc/kernels/{cuda/<sm>,hip/<gfx>}/supergrok2_{fwd,bwd}_<arch>.
- m.def("supergrok2_mamba_peer_step", &sg::supergrok2_mamba_peer_step,
- "SuperGrok2: per-param Mamba-3+PEER meta-net + mu + Adam + WD");
- m.def("supergrok2_mamba_peer_batched_step", &sg::supergrok2_mamba_peer_batched_step,
- "SuperGrok2: batched Mamba-3+PEER step for all params at once");
+ // launchers launch_csa_hca_* in csrc/kernels/{cuda/<sm>,hip/<gfx>}/.
+ // Both the new names and the old "mamba_peer" names are registered (the
+ // old ones alias the same C++ fn) so existing callers/tests keep working.
+ m.def("supergrok2_step", &sg::supergrok2_step,
+ "SuperGrok2: per-param CSA/HCA meta-net + mu + Adam + WD");
+ m.def("supergrok2_mamba_peer_step", &sg::supergrok2_step,
+ "Alias of supergrok2_step (back-compat)");
+ m.def("supergrok2_batched_step", &sg::supergrok2_batched_step,
+ "SuperGrok2: batched CSA/HCA step for all params at once");
+ m.def("supergrok2_mamba_peer_batched_step", &sg::supergrok2_batched_step,
+ "Alias of supergrok2_batched_step (back-compat)");
  m.def("supergrok2_bilevel_fwd_save", &sg::supergrok2_bilevel_fwd_save,
- "SuperGrok2 bilevel: forward scan with state saving for backward");
+ "SuperGrok2 bilevel: CSA/HCA forward with adjoint state saving");
  m.def("supergrok2_bilevel_fwd_save_batched", &sg::supergrok2_bilevel_fwd_save_batched,
- "SuperGrok2 bilevel: batched forward scan with state saving");
+ "SuperGrok2 bilevel: batched CSA/HCA forward with state saving");
  m.def("supergrok2_bilevel_backward", &sg::supergrok2_bilevel_backward,
- "SuperGrok2 bilevel: full backward through meta-net");
+ "SuperGrok2 bilevel: full backward through CSA/HCA meta-net");
  m.def("supergrok2_bilevel_backward_batched", &sg::supergrok2_bilevel_backward_batched,
- "SuperGrok2 bilevel: batched full backward through meta-net");
+ "SuperGrok2 bilevel: batched full backward through CSA/HCA meta-net");
  m.def("supergrok2_prepare_and_batched_step", &sg::supergrok2_prepare_and_batched_step,
  "Fused multi-tensor grad prepare (clip, finite, bias corrections) "
- "+ batched mamba-3+PEER step. Replaces N per-parameter Python "
+ "+ batched CSA/HCA step. Replaces N per-parameter Python "
  "iterations with one kernel launch.");
 
  // Model bindings (decoder, vit, mamba) — registered as _ops.models.*

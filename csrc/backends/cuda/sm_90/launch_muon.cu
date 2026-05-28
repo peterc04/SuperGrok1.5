@@ -12,7 +12,19 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include "csrc/algorithms/muon.h"
-#include "csrc/tuning.h"
+// ── Autotuner-consumable launch parameters (inlined; see compile.py) ──
+#ifndef SG_TUNED_BLOCK_SIZE
+#define SG_TUNED_BLOCK_SIZE 256
+#endif
+#ifndef SG_TUNED_VEC_WIDTH
+#define SG_TUNED_VEC_WIDTH 4
+#endif
+#ifndef SG_TUNED_UNROLL
+#define SG_TUNED_UNROLL 1
+#endif
+#ifndef SG_TUNED_ASYNC_DEPTH
+#define SG_TUNED_ASYNC_DEPTH 2
+#endif
 // ── inlined from former csrc/backends/cuda/sm_90/primitives.cuh ──
 // CUDA sm_90 (Hopper) primitives — shared across all 11 launch_*.cu files.
 //
@@ -1148,6 +1160,14 @@ void launch_muon_update(
                 orth.data_ptr<float>(),
                 neg_lr_scale, decay_factor, N);
         });
+}
+
+
+void launch_muon_ns_combine_update_fused(
+    torch::Tensor param, torch::Tensor X, torch::Tensor AX, torch::Tensor AAX, float a, float b, float c, float neg_lr_scale, float decay_factor
+) {
+    throw std::runtime_error(
+        "launch_muon_ns_combine_update_fused: CUDA sm_90 kernel not yet implemented.");
 }
 
 }} // namespace sg::sm90

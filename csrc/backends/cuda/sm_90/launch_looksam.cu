@@ -8,7 +8,19 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include "csrc/algorithms/looksam.h"
-#include "csrc/tuning.h"
+// ── Autotuner-consumable launch parameters (inlined; see compile.py) ──
+#ifndef SG_TUNED_BLOCK_SIZE
+#define SG_TUNED_BLOCK_SIZE 256
+#endif
+#ifndef SG_TUNED_VEC_WIDTH
+#define SG_TUNED_VEC_WIDTH 4
+#endif
+#ifndef SG_TUNED_UNROLL
+#define SG_TUNED_UNROLL 1
+#endif
+#ifndef SG_TUNED_ASYNC_DEPTH
+#define SG_TUNED_ASYNC_DEPTH 2
+#endif
 // ── inlined from former csrc/backends/cuda/sm_90/primitives.cuh ──
 // CUDA sm_90 (Hopper) primitives — shared across all 11 launch_*.cu files.
 //
@@ -1189,6 +1201,21 @@ void launch_looksam_apply(
                 grad.data_ptr<scalar_t>(),
                 alpha, lr, beta1, beta2, eps, wd, bc1, bc2, N);
         });
+}
+
+
+void launch_looksam_direction_adjust_fused(
+    torch::Tensor grad, torch::Tensor sam_grad, torch::Tensor v_dir, float inv_norm, float lambda, float grad_norm
+) {
+    throw std::runtime_error(
+        "launch_looksam_direction_adjust_fused: CUDA sm_90 kernel not yet implemented.");
+}
+
+void launch_looksam_norm_reduce(
+    torch::Tensor grad, torch::Tensor sam_grad, torch::Tensor results /* [diff_norm, grad_norm] */
+) {
+    throw std::runtime_error(
+        "launch_looksam_norm_reduce: CUDA sm_90 kernel not yet implemented.");
 }
 
 }} // namespace sg::sm90

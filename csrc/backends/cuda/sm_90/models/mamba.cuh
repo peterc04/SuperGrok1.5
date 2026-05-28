@@ -1938,76 +1938,173 @@ cudaError_t selective_scan_backward(
 
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
-#include <cutlass/gemm/device/gemm.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/epilogue/thread/linear_combination_generic.h>
 
+// ── Sm90 (Hopper) warp-group collective GEMM headers ──────────────────────
+// The previous code used the default device::Gemm (no arch tag) which, with no arch
+// tag, silently defaults to the SIMT/Sm70 path — i.e. NO tensor cores, NO
+// WGMMA, NO TMA. To actually emit Hopper WGMMA/TMA instructions we build a
+// GemmUniversalAdapter from the Sm90 CollectiveBuilder mainloop + collective
+// epilogue. FP32 accumulate throughout (matches cuBLAS CUBLAS_COMPUTE_32F).
+#include <cute/tensor.hpp>
+#include <cutlass/gemm/device/gemm_universal_adapter.h>
+#include <cutlass/gemm/collective/collective_builder.hpp>
+#include <cutlass/gemm/kernel/gemm_universal.hpp>
+#include <cutlass/epilogue/collective/collective_builder.hpp>
+
 namespace sg { namespace sm90 { namespace mma {
 
+// ─────────────────────────────────────────────────────────────────────────
+//  Sm90 collective GEMM (TMA + WGMMA, FP32 accumulate)
+//
+//  Generic builder parameterised on the input element type. Row-major A,
+//  row-major B, row-major C with FP32 output. C = alpha*A*B + beta*C.
+//
+//  Why this exists: the old the default device::Gemm (no arch tag) instantiation
+//  carried no arch tag and therefore compiled the SIMT (Sm70) kernel — no
+//  tensor cores at all. GemmUniversalAdapter<GemmUniversal<...>> built from
+//  CollectiveBuilder<arch::Sm90, OpClassTensorOp, ...> guarantees the Hopper
+//  warp-group MMA + TMA path is emitted.
+//
+//  GemmUniversalAdapter requires a workspace; we query get_workspace_size()
+//  and serve it from a per-thread cached device buffer (grown on demand).
+// ─────────────────────────────────────────────────────────────────────────
+
+// Per-thread, lazily grown CUTLASS workspace. Avoids a cudaMalloc per call.
+// Lifetime = process lifetime (intentional: the buffer is reused). Sized to
+// the largest workspace any GEMM in this thread has requested so far.
+inline void* sm90_get_workspace(size_t bytes) {
+    static thread_local void*  ws_ptr   = nullptr;
+    static thread_local size_t ws_bytes = 0;
+    if (bytes > ws_bytes) {
+        if (ws_ptr) cudaFree(ws_ptr);
+        if (cudaMalloc(&ws_ptr, bytes) != cudaSuccess) {
+            ws_ptr = nullptr;
+            ws_bytes = 0;
+            return nullptr;
+        }
+        ws_bytes = bytes;
+    }
+    return ws_ptr;
+}
+
+template <typename ElementInput>
+struct Sm90Gemm {
+    using ElementA   = ElementInput;
+    using ElementB   = ElementInput;
+    using ElementC   = float;          // FP32 output (matches cuBLAS path)
+    using ElementAcc = float;          // FP32 accumulate
+    using LayoutA    = cutlass::layout::RowMajor;
+    using LayoutB    = cutlass::layout::RowMajor;
+    using LayoutC    = cutlass::layout::RowMajor;
+
+    // 128-bit aligned access (16 bytes / sizeof(element)).
+    static constexpr int AlignA = 128 / cutlass::sizeof_bits<ElementA>::value;
+    static constexpr int AlignB = 128 / cutlass::sizeof_bits<ElementB>::value;
+    static constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementC>::value;
+
+    using TileShape    = cute::Shape<cute::_128, cute::_128, cute::_64>;
+    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+
+    // Collective epilogue: linear combination (alpha/beta), FP32 accumulate.
+    using CollectiveEpilogue =
+        typename cutlass::epilogue::collective::CollectiveBuilder<
+            cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+            TileShape, ClusterShape,
+            cutlass::epilogue::collective::EpilogueTileAuto,
+            ElementAcc, ElementAcc,
+            ElementC, LayoutC, AlignC,
+            ElementC, LayoutC, AlignC,
+            cutlass::epilogue::collective::EpilogueScheduleAuto
+        >::CollectiveOp;
+
+    // Collective mainloop: Sm90 TMA + WGMMA, auto stage count / schedule.
+    using CollectiveMainloop =
+        typename cutlass::gemm::collective::CollectiveBuilder<
+            cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+            ElementA, LayoutA, AlignA,
+            ElementB, LayoutB, AlignB,
+            ElementAcc,
+            TileShape, ClusterShape,
+            cutlass::gemm::collective::StageCountAutoCarveout<
+                static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+            cutlass::gemm::collective::KernelScheduleAuto
+        >::CollectiveOp;
+
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        cute::Shape<int, int, int, int>,   // (M, N, K, L) problem shape
+        CollectiveMainloop,
+        CollectiveEpilogue>;
+
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
+
+// Run a single row-major C = A*B with FP32 accumulate on the Sm90 collective.
+template <typename ElementInput>
+inline cudaError_t sm90_run_gemm(
+    int M, int N, int K,
+    const void* A, const void* B, float* C,
+    cudaStream_t stream)
+{
+    using G          = Sm90Gemm<ElementInput>;
+    using Gemm       = typename G::Gemm;
+    using ElementA   = typename G::ElementA;
+    using ElementB   = typename G::ElementB;
+    using ElementAcc = typename G::ElementAcc;
+    using StrideA    = typename Gemm::GemmKernel::StrideA;
+    using StrideB    = typename Gemm::GemmKernel::StrideB;
+    using StrideC    = typename Gemm::GemmKernel::StrideC;
+
+    // Row-major strides via CUTLASS helpers (L=1 batch).
+    StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+    StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    StrideC stride_c = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
+
+    typename Gemm::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {M, N, K, 1},
+        { reinterpret_cast<const ElementA*>(A), stride_a,
+          reinterpret_cast<const ElementB*>(B), stride_b },
+        { {ElementAcc(1.0f), ElementAcc(0.0f)},
+          C, stride_c, C, stride_c }
+    };
+
+    Gemm op;
+    cutlass::Status st = op.can_implement(args);
+    if (st != cutlass::Status::kSuccess) return cudaErrorNotSupported;
+
+    size_t ws_size = Gemm::get_workspace_size(args);
+    void*  ws = (ws_size > 0) ? sm90_get_workspace(ws_size) : nullptr;
+    if (ws_size > 0 && ws == nullptr) return cudaErrorMemoryAllocation;
+
+    st = op.initialize(args, ws, stream);
+    if (st != cutlass::Status::kSuccess) return cudaErrorUnknown;
+
+    st = op.run(stream);
+    return (st == cutlass::Status::kSuccess) ? cudaSuccess : cudaErrorUnknown;
+}
+
 // FP16 in / FP32 acc / FP32 out, row-major A * row-major B, row-major C.
+// Sm90 collective (TMA+WGMMA), FP32 accumulate — replaces the old Gemm<>
+// that silently defaulted to Sm70 SIMT (no tensor cores).
 inline cudaError_t gemm_fp16(
     int M, int N, int K,
     const __half* A, const __half* B, float* C,
     cudaStream_t stream)
 {
-    using ElementA = cutlass::half_t;
-    using ElementB = cutlass::half_t;
-    using ElementC = float;
-    using ElementAcc = float;
-    using LayoutA = cutlass::layout::RowMajor;
-    using LayoutB = cutlass::layout::RowMajor;
-    using LayoutC = cutlass::layout::RowMajor;
-
-    using Gemm = cutlass::gemm::device::Gemm<
-        ElementA, LayoutA,
-        ElementB, LayoutB,
-        ElementC, LayoutC,
-        ElementAcc>;
-
-    typename Gemm::Arguments args(
-        {M, N, K},
-        {reinterpret_cast<const ElementA*>(A), K},
-        {reinterpret_cast<const ElementB*>(B), N},
-        {C, N},
-        {C, N},
-        {ElementAcc(1.0f), ElementAcc(0.0f)});
-
-    Gemm op;
-    cutlass::Status st = op(args, nullptr, stream);
-    return (st == cutlass::Status::kSuccess) ? cudaSuccess : cudaErrorUnknown;
+    return sm90_run_gemm<cutlass::half_t>(M, N, K, A, B, C, stream);
 }
 
 // BF16 in / FP32 acc / FP32 out variant.
+// Sm90 collective (TMA+WGMMA), FP32 accumulate — replaces the old Gemm<>
+// that silently defaulted to Sm70 SIMT (no tensor cores).
 inline cudaError_t gemm_bf16(
     int M, int N, int K,
     const __nv_bfloat16* A, const __nv_bfloat16* B, float* C,
     cudaStream_t stream)
 {
-    using ElementA = cutlass::bfloat16_t;
-    using ElementB = cutlass::bfloat16_t;
-    using ElementC = float;
-    using ElementAcc = float;
-    using LayoutA = cutlass::layout::RowMajor;
-    using LayoutB = cutlass::layout::RowMajor;
-    using LayoutC = cutlass::layout::RowMajor;
-
-    using Gemm = cutlass::gemm::device::Gemm<
-        ElementA, LayoutA,
-        ElementB, LayoutB,
-        ElementC, LayoutC,
-        ElementAcc>;
-
-    typename Gemm::Arguments args(
-        {M, N, K},
-        {reinterpret_cast<const ElementA*>(A), K},
-        {reinterpret_cast<const ElementB*>(B), N},
-        {C, N},
-        {C, N},
-        {ElementAcc(1.0f), ElementAcc(0.0f)});
-
-    Gemm op;
-    cutlass::Status st = op(args, nullptr, stream);
-    return (st == cutlass::Status::kSuccess) ? cudaSuccess : cudaErrorUnknown;
+    return sm90_run_gemm<cutlass::bfloat16_t>(M, N, K, A, B, C, stream);
 }
 
 // Softplus+bias post-pass (used by SG2 dt_proj fused path).

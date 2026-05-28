@@ -25,7 +25,6 @@
 // (~2×) that is hardware-verified or not at all.
 
 #include <torch/extension.h>
-#include "csrc/tuning.h"
 #include <vector>
 
 // ── inlined from former csrc/backends/hip/gfx942/primitives.hpp ──
@@ -179,6 +178,28 @@ void launch_prodigy_step(
         st.add_(g.to(torch::kFloat32), d_val);
         prim::adam_apply_inplace(p, m, v, d_val, bc1, bc2, eps, wd);
     }
+}
+
+
+void launch_fused_prodigy_step(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor s, torch::Tensor param_init, torch::Tensor grad, float lr, float d_lr, float beta1, float beta2, float weight_decay, float eps, float bc1, float bc2
+) {
+    throw std::runtime_error(
+        "launch_fused_prodigy_step: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_prodigy_dlr_reduce(
+    torch::Tensor grad, torch::Tensor param, torch::Tensor param_init, torch::Tensor s, torch::Tensor numerator, torch::Tensor denominator, float eps
+) {
+    throw std::runtime_error(
+        "launch_prodigy_dlr_reduce: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_multi_tensor_prodigy_fused_reduce_step(
+    std::vector<torch::Tensor>& params, std::vector<torch::Tensor>& grads, std::vector<torch::Tensor>& param_inits, std::vector<torch::Tensor>& exp_avgs, std::vector<torch::Tensor>& exp_avg_sqs, std::vector<torch::Tensor>& s_bufs, std::vector<float>& bc1s, std::vector<float>& bc2s, torch::Tensor d_lr_buf, float beta1, float beta2, float lr, float wd, float eps
+) {
+    throw std::runtime_error(
+        "launch_multi_tensor_prodigy_fused_reduce_step: HIP gfx942 kernel not yet implemented.");
 }
 
 }} // namespace sg::gfx942

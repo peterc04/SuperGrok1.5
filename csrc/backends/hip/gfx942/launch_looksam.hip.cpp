@@ -18,7 +18,6 @@
 // gain is ≈ 1.7× and needs hardware verification.
 
 #include <torch/extension.h>
-#include "csrc/tuning.h"
 #include <vector>
 
 // ── inlined from former csrc/backends/hip/gfx942/primitives.hpp ──
@@ -179,6 +178,21 @@ void launch_looksam_apply(
         prim::ema_sq_update_inplace(v, g_adj, beta2);
         prim::adam_apply_inplace(p, m, v, lr, bc1, bc2, eps, wd);
     }
+}
+
+
+void launch_looksam_direction_adjust_fused(
+    torch::Tensor grad, torch::Tensor sam_grad, torch::Tensor v_dir, float inv_norm, float lambda, float grad_norm
+) {
+    throw std::runtime_error(
+        "launch_looksam_direction_adjust_fused: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_looksam_norm_reduce(
+    torch::Tensor grad, torch::Tensor sam_grad, torch::Tensor results /* [diff_norm, grad_norm] */
+) {
+    throw std::runtime_error(
+        "launch_looksam_norm_reduce: HIP gfx942 kernel not yet implemented.");
 }
 
 }} // namespace sg::gfx942

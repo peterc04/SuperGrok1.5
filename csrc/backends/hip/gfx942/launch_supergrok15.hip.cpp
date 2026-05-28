@@ -14,7 +14,6 @@
 // for the MLP.
 
 #include <torch/extension.h>
-#include "csrc/tuning.h"
 #include <vector>
 
 // ── inlined from former csrc/backends/hip/gfx942/primitives.hpp ──
@@ -160,6 +159,28 @@ void launch_supergrok15_step(
         prim::ema_sq_update_inplace(v, smart, beta2);
         prim::adam_apply_inplace(p, m, v, lr, bc1, bc2, eps, wd);
     }
+}
+
+
+void launch_fused_supergrok15_full_step(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor mu, torch::Tensor grad, torch::Tensor sharpness, float alpha, torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2, float rescale, float lamb_eff, float beta1, float beta2, float lr, float wd_eff, float eps, float bc1, float bc2, int hidden_dim
+) {
+    throw std::runtime_error(
+        "launch_fused_supergrok15_full_step: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_sam_perturb(
+    torch::Tensor param, torch::Tensor grad, float rho_over_norm
+) {
+    throw std::runtime_error(
+        "launch_sam_perturb: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_sharpness_restore(
+    torch::Tensor param, torch::Tensor sharpness, torch::Tensor backup, torch::Tensor sam_grad, torch::Tensor normal_grad
+) {
+    throw std::runtime_error(
+        "launch_sharpness_restore: HIP gfx942 kernel not yet implemented.");
 }
 
 }} // namespace sg::gfx942

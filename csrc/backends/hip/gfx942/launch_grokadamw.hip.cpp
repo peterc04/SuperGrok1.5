@@ -17,7 +17,6 @@
 // bandwidth bound stays the same.
 
 #include <torch/extension.h>
-#include "csrc/tuning.h"
 #include <vector>
 
 // ── inlined from former csrc/backends/hip/gfx942/primitives.hpp ──
@@ -151,6 +150,42 @@ void launch_grokadamw_step(
         prim::ema_sq_update_inplace(v, g_amp, beta2);
         prim::adam_apply_inplace(p, m, v, lr, bc1, bc2, eps, wd);
     }
+}
+
+
+void launch_fused_grokadamw_step(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor ema, torch::Tensor grad, float alpha, float lamb, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2
+) {
+    throw std::runtime_error(
+        "launch_fused_grokadamw_step: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_fused_grokadamw_clip_step(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor ema, torch::Tensor grad, float alpha, float lamb, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2, float clip_threshold
+) {
+    throw std::runtime_error(
+        "launch_fused_grokadamw_clip_step: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_fused_grokadamw_step_q3(
+    torch::Tensor param, torch::Tensor exp_avg_int8, torch::Tensor exp_avg_scales, torch::Tensor exp_avg_sq_bf16, torch::Tensor ema_bf16, torch::Tensor grad, float alpha, float lamb, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2, unsigned global_step
+) {
+    throw std::runtime_error(
+        "launch_fused_grokadamw_step_q3: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_multi_tensor_grokadamw(
+    std::vector<torch::Tensor>& params, std::vector<torch::Tensor>& exp_avgs, std::vector<torch::Tensor>& exp_avg_sqs, std::vector<torch::Tensor>& emas, std::vector<torch::Tensor>& grads, std::vector<float>& bc1s, std::vector<float>& bc2s, float alpha, float lamb, float beta1, float beta2, float lr, float wd, float eps
+) {
+    throw std::runtime_error(
+        "launch_multi_tensor_grokadamw: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_fused_adamw_simple(
+    std::vector<torch::Tensor>& params, std::vector<torch::Tensor>& exp_avgs, std::vector<torch::Tensor>& exp_avg_sqs, std::vector<torch::Tensor>& grads, std::vector<int64_t>& steps, float beta1, float beta2, float lr, float wd, float eps
+) {
+    throw std::runtime_error(
+        "launch_fused_adamw_simple: HIP gfx942 kernel not yet implemented.");
 }
 
 }} // namespace sg::gfx942

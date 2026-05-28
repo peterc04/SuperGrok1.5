@@ -11,7 +11,19 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include "csrc/algorithms/supergrok11.h"
-#include "csrc/tuning.h"
+// ── Autotuner-consumable launch parameters (inlined; see compile.py) ──
+#ifndef SG_TUNED_BLOCK_SIZE
+#define SG_TUNED_BLOCK_SIZE 256
+#endif
+#ifndef SG_TUNED_VEC_WIDTH
+#define SG_TUNED_VEC_WIDTH 4
+#endif
+#ifndef SG_TUNED_UNROLL
+#define SG_TUNED_UNROLL 1
+#endif
+#ifndef SG_TUNED_ASYNC_DEPTH
+#define SG_TUNED_ASYNC_DEPTH 2
+#endif
 // ── inlined from former csrc/backends/cuda/sm_90/primitives.cuh ──
 // CUDA sm_90 (Hopper) primitives — shared across all 11 launch_*.cu files.
 //
@@ -1167,6 +1179,43 @@ void launch_supergrok11_step(
                 mu_buf.data_ptr<float>(),
                 gate, alpha, lr, beta1, beta2, eps, wd, bc1, bc2, N);
         });
+}
+
+
+void launch_sg11_mu_metanet(
+    torch::Tensor mu, torch::Tensor grad, torch::Tensor sharpness, torch::Tensor smart_grad, float alpha, torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2, float rescale, int hidden_dim
+) {
+    throw std::runtime_error(
+        "launch_sg11_mu_metanet: CUDA sm_90 kernel not yet implemented.");
+}
+
+void launch_sg11_adam_decay(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor smart_grad, torch::Tensor mu, float lamb_eff, float beta1, float beta2, float lr, float wd_eff, float eps, float bc1, float bc2
+) {
+    throw std::runtime_error(
+        "launch_sg11_adam_decay: CUDA sm_90 kernel not yet implemented.");
+}
+
+void launch_sg11_sam_perturb(
+    torch::Tensor param, torch::Tensor grad, float rho_over_norm
+) {
+    throw std::runtime_error(
+        "launch_sg11_sam_perturb: CUDA sm_90 kernel not yet implemented.");
+}
+
+void launch_sg11_sharpness_restore(
+    torch::Tensor param, torch::Tensor sharpness, torch::Tensor backup, torch::Tensor sam_grad, torch::Tensor normal_grad
+) {
+    throw std::runtime_error(
+        "launch_sg11_sharpness_restore: CUDA sm_90 kernel not yet implemented.");
+}
+
+float compute_cosine_gate_fused(
+    torch::Tensor smart_grad, torch::Tensor mu, float gate_temp
+) {
+    throw std::runtime_error(
+        "compute_cosine_gate_fused: CUDA sm_90 kernel not yet implemented.");
+    return 0.0f;
 }
 
 }} // namespace sg::sm90
