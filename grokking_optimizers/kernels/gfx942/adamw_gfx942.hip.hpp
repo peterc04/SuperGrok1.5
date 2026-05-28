@@ -144,6 +144,102 @@ __global__ void adamw_kernel(
         params, grads, state, n, lr, beta1, beta2, eps, wd, bc1, bc2, clip_threshold);
 }
 
+// ---------------------------------------------------------------------------
+// Prefetch-pipelined scalar AdamW update for gfx942: software-pipelined with
+// 2 register sets.  Uses __builtin_nontemporal_load for prefetch reads to
+// bypass L2 on streaming gradient data.
+// ---------------------------------------------------------------------------
+
+template <typename ParamT, NanPolicy NAN_POLICY = NanPolicy::kNone, bool ENABLE_CLIP = false>
+__forceinline__ __device__
+void adamw_update_prefetch(
+    ParamT* __restrict__ params,
+    const ParamT* __restrict__ grads,
+    AdamWState state,
+    int64_t n,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps,
+    float weight_decay,
+    float bias_correction1,
+    float bias_correction2,
+    float clip_threshold = 0.0f
+) {
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+
+    if (i >= n) return;
+
+    // Load first element (current)
+    float g_cur = to_float<ParamT>(__builtin_nontemporal_load(&grads[i]));
+    float p_cur = to_float<ParamT>(params[i]);
+    float m_cur = state.exp_avg[i];
+    float v_cur = state.exp_avg_sq[i];
+
+    for (; i < n; i += stride) {
+        // Prefetch next iteration's data
+        int64_t next = i + stride;
+        float g_next, p_next, m_next, v_next;
+        bool has_next = next < n;
+        if (has_next) {
+            g_next = to_float<ParamT>(__builtin_nontemporal_load(&grads[next]));
+            p_next = to_float<ParamT>(params[next]);
+            m_next = state.exp_avg[next];
+            v_next = state.exp_avg_sq[next];
+        }
+
+        // ---- Process current element ----
+        float g = g_cur;
+
+        if constexpr (NAN_POLICY == NanPolicy::kZero) {
+            if (isnan(g)) g = 0.0f;
+        } else if constexpr (NAN_POLICY == NanPolicy::kPropagate) {
+            if (isnan(g)) {
+                if (has_next) { g_cur = g_next; p_cur = p_next; m_cur = m_next; v_cur = v_next; }
+                continue;
+            }
+        }
+
+        if constexpr (ENABLE_CLIP) {
+            g = fminf(fmaxf(g, -clip_threshold), clip_threshold);
+        }
+
+        float m = beta1 * m_cur + (1.0f - beta1) * g;
+        float v = beta2 * v_cur + (1.0f - beta2) * g * g;
+
+        float m_hat = m * bias_correction1;
+        float v_hat = v * bias_correction2;
+
+        float denom = sqrtf(v_hat) + eps;
+        float update = m_hat / denom + weight_decay * p_cur;
+        float p_f = p_cur - lr * update;
+
+        // Write current results
+        state.exp_avg[i] = m;
+        state.exp_avg_sq[i] = v;
+        params[i] = from_float<ParamT>(p_f);
+
+        // Swap prefetched data into current registers
+        if (has_next) {
+            g_cur = g_next;
+            p_cur = p_next;
+            m_cur = m_next;
+            v_cur = v_next;
+        }
+    }
+}
+
+template <typename ParamT, NanPolicy NAN_POLICY, bool ENABLE_CLIP>
+__global__ void adamw_kernel_prefetch(
+    ParamT* params, const ParamT* grads, AdamWState state, int64_t n,
+    float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2, float clip_threshold
+) {
+    adamw_update_prefetch<ParamT, NAN_POLICY, ENABLE_CLIP>(
+        params, grads, state, n, lr, beta1, beta2, eps, wd, bc1, bc2, clip_threshold);
+}
+
 }} // namespace grokking::gfx942
 
 #endif // GROKKING_ADAMW_GFX942_HIP_HPP_
