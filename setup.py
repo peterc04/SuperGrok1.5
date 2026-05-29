@@ -238,7 +238,7 @@ if _has_gpu and _is_hip:
         # inlined into every backend file. Only csrc/bindings/ (the one
         # surviving cross-file boundary) and csrc/ (for algorithm-header
         # absolute-path includes from launch files) remain.
-        include_dirs=["csrc/bindings", "csrc"],
+        include_dirs=[".", "csrc/bindings", "csrc"],
         define_macros=[("WITH_HIP", None)],
         extra_compile_args={"cxx": hip_cxx, "nvcc": hip_nvcc},
     )
@@ -293,7 +293,7 @@ elif _has_gpu:
     # csrc/common/ and csrc/scan/ were deleted; their content is inlined
     # into every backend file. Only csrc/bindings/ (the one surviving
     # cross-file boundary) and csrc/ remain.
-    cuda_include_dirs = ["csrc/bindings", "csrc"]
+    cuda_include_dirs = [".", "csrc/bindings", "csrc"]
     cuda_define_macros = [("WITH_CUDA", None)]
     if _with_cutlass:
         cutlass_archs = []

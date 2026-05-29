@@ -1,805 +1,1857 @@
-#ifndef GROKKING_TRANSFORMER_DECODER_SM90_CUH_
-#define GROKKING_TRANSFORMER_DECODER_SM90_CUH_
+#ifndef GROKKING_KERNELS_SM90_TRANSFORMER_DECODER_SM90_CUH_
+#define GROKKING_KERNELS_SM90_TRANSFORMER_DECODER_SM90_CUH_
+// ============================================================================
+// transformer_decoder_sm90.cuh — CANONICAL SuperGrok sm_90 device kernels for the 'decoder'
+// model. Single source of truth: templated per-layer __device__ forward/backward,
+// __global__ launchers, inline-PTX blocks VERBATIM, and the CUTLASS Sm90
+// tensor-core GEMM wrappers (attention). Composition primitive for the future
+// fused megakernel.
+//
+// The production location csrc/backends/cuda/sm_90/models/decoder.cuh is now a thin
+// shim that #include's this header, so every existing includer (bindings.cpp,
+// the decoder.cu instantiation TU, the HIP tree's references) keeps working
+// unchanged. Migrated byte-for-byte; verified compile-neutral via the
+// preprocessor-equivalence gate (nvcc -E, modulo __FILE__/__LINE__).
+// ============================================================================
+// csrc/backends/cuda/sm_90/models/decoder.cuh
+// Autoregressive Decoder Transformer for sm_90 (Hopper).
+//
+// Reference (grokking_race_v2.py lines 318-340):
+//   class DecoderBlock:
+//     attn = MultiheadAttention(d, h)
+//     n1 = LayerNorm(d); n2 = LayerNorm(d)
+//     ff = Linear(d, 4d) -> GELU -> Linear(4d, d)
+//     forward(x):
+//       a, _ = attn(x, x, x, attn_mask=causal)
+//       x = n1(x + a)
+//       return n2(x + ff(x))
+//   class Transformer:
+//     tok = Embedding(ntok, d); pos = Embedding(seq, d)
+//     forward(x):
+//       h = tok(x) + pos(pos_ids)
+//       for l in layers: h = l(h)
+//       return out(norm(h)[:, -1, :])
+//
+// Post-norm style; output is the LAST token only.
+//
+// ─── Weight buffer layout (contiguous packed) ────────────────────────
+//   tok_embed     [vocab, d]
+//   pos_embed     [seq,   d]
+//   per layer ℓ:
+//     n1_g [d], n1_b [d]
+//     qkv_W [3d, d], qkv_b [3d]
+//     out_W [d, d],  out_b [d]
+//     n2_g [d], n2_b [d]
+//     ff1_W [4d, d], ff1_b [4d]
+//     ff2_W [d, 4d], ff2_b [d]
+//   final_g [d], final_b [d]
+//   vocab_W [vocab, d], vocab_b [vocab]
+//
+// ─── Activation scratch layout (per call) ────────────────────────────
+//   input_ids_saved    [B, S]                 (forward stashes input here)
+//   embed_out          [B, S, d]
+//   per layer ℓ:
+//     qkv_in           [B, S, d]      (input to QKV proj == prev layer output)
+//     qkv_out          [B, S, 3d]
+//     attn_in_qkv      [B, S, 3d]     (q,k,v in [B,H,S,d_h] layout, packed)
+//     attn_out_perhead [B, S, d]      (attention output [B,H,S,d_h])
+//     attn_out         [B, S, d]      (reshaped [B,S,D])
+//     attn_proj        [B, S, d]      (after out_W + bias)
+//     n1_in            [B, S, d]      (qkv_in + attn_proj — layernorm input)
+//     layer1_out       [B, S, d]      (LN(n1_in) — input to FFN block)
+//     ffn_pre          [B, S, 4d]     (pre-GELU)
+//     ffn_post         [B, S, 4d]     (post-GELU)
+//     ffn_out          [B, S, d]      (after ff2)
+//     n2_in            [B, S, d]      (layer1_out + ffn_out)
+//     layer_out        [B, S, d]      (LN(n2_in) — block output)
+//     softmax_lse      [B, H, S]      (FP32 bit-aliased)
+//   final_norm_out     [B, S, d]
+//   logits_full        [B, S, vocab]
+//
+// Total scratch (in T elements):
+//   B*S + B*S*D + n_layers * per_layer_total + B*S*D + B*S*V
+//
+// All multi-token GEMMs go through cuBLAS; LayerNorm + residual is fused
+// in a single warp-reduction kernel; GELU is a separate elementwise kernel.
 
-#include "common_sm90.cuh"
+#pragma once
+// ── inlined from former csrc/common/platform.h ──
+/*
+ * SuperGrok v2 — Platform Abstraction Layer
+ *
+ * Provides a unified API across NVIDIA CUDA and AMD HIP (ROCm).
+ * Include this header instead of raw <cuda.h> / <hip/hip_runtime.h>.
+ *
+ * Key differences handled:
+ *   - Warp size: CUDA = 32, HIP/RDNA = 32, HIP/CDNA = 64
+ *   - __sincosf: CUDA intrinsic, HIP uses sincosf (no double-underscore)
+ *   - __ldg: CUDA L1 cache hint, no-op on HIP (compiler handles caching)
+ *   - Thrust → rocThrust, CUB → hipCUB (header-compatible wrappers)
+ *   - cuBLAS → rocBLAS (ATen abstracts this via at::cuda::getCurrentCUDABlasHandle)
+ */
 
-namespace grokking { namespace sm90 {
 
-// ---------------------------------------------------------------------------
-// Resource declarations for the dispatch generator
-// ---------------------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════════
+//  Backend detection
+// ═══════════════════════════════════════════════════════════════════════
 
-namespace decoder_resources {
-    constexpr int EMBED_SMEM_BYTES       = 0;
-    constexpr int RMSNORM_SMEM_BYTES     = 512;    // warp reduction scratch
-    constexpr int QKV_PROJ_SMEM_BYTES    = 0;      // matmul via wgmma
-    constexpr int ATTENTION_SMEM_BYTES   = 32768;  // FA3 working set
-    constexpr int O_PROJ_SMEM_BYTES      = 0;
-    constexpr int MLP_SMEM_BYTES         = 0;
-    constexpr int LM_HEAD_SMEM_BYTES     = 0;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+#define GROK_HIP 1
+#define GROK_CUDA 0
+#else
+#define GROK_HIP 0
+#define GROK_CUDA 1
+#endif
 
-    constexpr int EMBED_REG_HINT         = 32;
-    constexpr int RMSNORM_REG_HINT       = 40;
-    constexpr int QKV_PROJ_REG_HINT      = 64;
-    constexpr int ATTENTION_REG_HINT     = 128;
-    constexpr int O_PROJ_REG_HINT        = 64;
-    constexpr int MLP_REG_HINT           = 64;
-    constexpr int LM_HEAD_REG_HINT       = 64;
+// ═══════════════════════════════════════════════════════════════════════
+//  Runtime includes
+// ═══════════════════════════════════════════════════════════════════════
 
-    constexpr bool EMBED_REQUIRES_GRID_SYNC                = false;
-    constexpr bool RMSNORM_REQUIRES_GRID_SYNC              = true;
-    constexpr bool QKV_PROJ_REQUIRES_GRID_SYNC             = false;
-    constexpr bool ATTENTION_REQUIRES_GRID_SYNC            = false;
-    constexpr bool ATTENTION_REQUIRES_INTERNAL_SYNC        = true;
-    constexpr bool MLP_REQUIRES_GRID_SYNC                  = false;
-    constexpr bool LM_HEAD_REQUIRES_GRID_SYNC              = false;
-} // namespace decoder_resources
+#if GROK_HIP
+#include <hip/hip_runtime.h>
+// rocThrust and hipCUB provide thrust/cub API compatibility
+#include <thrust/device_ptr.h>
+#include <thrust/sort.h>
+#include <hipcub/hipcub.hpp>
+#else
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <thrust/device_ptr.h>
+#include <thrust/sort.h>
+#include <cub/cub.cuh>
+#endif
 
-// ---------------------------------------------------------------------------
-// Constexpr size helpers
-// ---------------------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════════
+//  Stream type alias
+// ═══════════════════════════════════════════════════════════════════════
 
-template <typename ParamT, int D_MODEL, int N_HEADS, int N_LAYERS, int VOCAB, int SEQ_LEN, int BATCH>
-struct DecoderSizes {
-    static_assert(D_MODEL % N_HEADS == 0, "d_model must be divisible by n_heads");
-    static_assert(SEQ_LEN > 0 && BATCH > 0, "sequence and batch must be positive");
+#if GROK_HIP
+using GpuStream_t = hipStream_t;
+#else
+using GpuStream_t = cudaStream_t;
+#endif
 
-    static constexpr int D_HEAD     = D_MODEL / N_HEADS;
-    static constexpr int FFN_HIDDEN = 4 * D_MODEL;
+// ═══════════════════════════════════════════════════════════════════════
+//  Warp / wavefront size
+//
+//  CDNA (MI200, MI300): wavefront = 64
+//  RDNA (RX 7900):      wavefront = 32
+//  NVIDIA:               warp     = 32
+//
+//  We default to the compile-time warp size. On HIP, __AMDGCN_WAVEFRONT_SIZE__
+//  is set by the compiler for the target architecture.
+// ═══════════════════════════════════════════════════════════════════════
 
-    // Per-layer weights: norm1_g[D] + W_qkv[3*D, D] + W_o[D, D]
-    //                  + norm2_g[D] + W_gate[FFN, D] + W_up[FFN, D] + W_down[D, FFN]
-    static constexpr size_t params_per_layer() {
-        return static_cast<size_t>(D_MODEL)                                // norm1 gamma
-             + static_cast<size_t>(3) * D_MODEL * D_MODEL                  // W_qkv
-             + static_cast<size_t>(D_MODEL) * D_MODEL                      // W_o
-             + static_cast<size_t>(D_MODEL)                                // norm2 gamma
-             + static_cast<size_t>(FFN_HIDDEN) * D_MODEL                   // W_gate
-             + static_cast<size_t>(FFN_HIDDEN) * D_MODEL                   // W_up
-             + static_cast<size_t>(D_MODEL) * FFN_HIDDEN;                  // W_down
-    }
+#if GROK_HIP
+  #ifdef __AMDGCN_WAVEFRONT_SIZE__
+    #define WARP_SIZE __AMDGCN_WAVEFRONT_SIZE__
+  #else
+    #define WARP_SIZE 64  // conservative default for CDNA
+  #endif
+#else
+  #define WARP_SIZE 32
+#endif
 
-    static constexpr size_t param_bytes_per_layer() {
-        return params_per_layer() * sizeof(ParamT);
-    }
+// ═══════════════════════════════════════════════════════════════════════
+//  Warp shuffle
+//
+//  CUDA: __shfl_down_sync(mask, val, offset)
+//  HIP:  __shfl_down(val, offset)  — no mask parameter on CDNA
+//        (On wavefront-64, all lanes are always synchronized)
+//
+//  We wrap both into SHFL_DOWN(val, offset) and SHFL_DOWN_SYNC(mask, val, offset).
+// ═══════════════════════════════════════════════════════════════════════
 
-    static constexpr size_t param_bytes() {
-        return static_cast<size_t>(VOCAB) * D_MODEL * sizeof(ParamT)       // tok_embed
-             + static_cast<size_t>(N_LAYERS) * param_bytes_per_layer()     // layers
-             + static_cast<size_t>(D_MODEL) * sizeof(ParamT)              // final_norm gamma
-             + static_cast<size_t>(D_MODEL) * sizeof(ParamT)              // final_norm beta
-             + static_cast<size_t>(VOCAB) * D_MODEL * sizeof(ParamT)      // lm_head_w
-             + static_cast<size_t>(VOCAB) * sizeof(ParamT);               // lm_head_b
-    }
+#if GROK_HIP
+  #define SHFL_DOWN(val, offset) __shfl_down((val), (offset))
+  #define SHFL_DOWN_SYNC(mask, val, offset) __shfl_down((val), (offset))
+#else
+  #define SHFL_DOWN(val, offset) __shfl_down_sync(0xFFFFFFFF, (val), (offset))
+  #define SHFL_DOWN_SYNC(mask, val, offset) __shfl_down_sync((mask), (val), (offset))
+#endif
 
-    // Number of distinct weight tensors across the full model
-    static constexpr size_t num_param_tensors() {
-        // embed(1) + per-layer(7 each) + final_norm_g(1) + final_norm_b(1) + lm_head_w(1) + lm_head_b(1)
-        return 1 + static_cast<size_t>(N_LAYERS) * 7 + 4;
-    }
+// ═══════════════════════════════════════════════════════════════════════
+//  Fast sincos
+//
+//  CUDA: __sincosf (device intrinsic, single instruction on SM)
+//  HIP:  sincosf   (no double-underscore variant)
+// ═══════════════════════════════════════════════════════════════════════
 
-    // Activation scratch per layer: input[B,S,D] + post_norm[B,S,D] + qkv[B,S,3D]
-    //   + attn_out[B,S,D] + o_proj[B,S,D] + gate[B,S,FFN] + up[B,S,FFN] + mlp_down[B,S,D]
-    static constexpr size_t activation_bytes_per_layer() {
-        constexpr size_t tokens = static_cast<size_t>(BATCH) * SEQ_LEN;
-        return (tokens * D_MODEL          // saved input for backward
-              + tokens * D_MODEL          // post-norm
-              + tokens * 3 * D_MODEL      // qkv
-              + tokens * D_MODEL          // attention output
-              + tokens * D_MODEL          // o_proj output
-              + tokens * FFN_HIDDEN       // gate pre-activation (saved for SiLU backward)
-              + tokens * FFN_HIDDEN       // up projection
-              + tokens * D_MODEL          // mlp_down output
-             ) * sizeof(float);           // activations always fp32
-    }
+#if GROK_HIP
+  #define FAST_SINCOSF(x, sptr, cptr) sincosf((x), (sptr), (cptr))
+#else
+  #define FAST_SINCOSF(x, sptr, cptr) __sincosf((x), (sptr), (cptr))
+#endif
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Read-only cache load hint
+//
+//  CUDA: __ldg(ptr) — hints L1 cache for read-only data
+//  HIP:  direct dereference (compiler manages caching on GCN/CDNA)
+// ═══════════════════════════════════════════════════════════════════════
+
+#if GROK_HIP
+  #define LDG(ptr) (*(ptr))
+#else
+  #define LDG(ptr) __ldg(ptr)
+#endif
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Error checking
+// ═══════════════════════════════════════════════════════════════════════
+
+#if GROK_HIP
+  #define GPU_SUCCESS hipSuccess
+  #define gpuGetLastError hipGetLastError
+  #define gpuGetErrorString hipGetErrorString
+  #define gpuDeviceSynchronize hipDeviceSynchronize
+  #define gpuGetDeviceProperties hipGetDeviceProperties
+  #define gpuDeviceProp_t hipDeviceProp_t
+#else
+  #define GPU_SUCCESS cudaSuccess
+  #define gpuGetLastError cudaGetLastError
+  #define gpuGetErrorString cudaGetErrorString
+  #define gpuDeviceSynchronize cudaDeviceSynchronize
+  #define gpuGetDeviceProperties cudaGetDeviceProperties
+  #define gpuDeviceProp_t cudaDeviceProp
+#endif
+
+// ═══════════════════════════════════════════════════════════════════════
+//  CUB / hipCUB namespace alias
+//
+//  hipCUB wraps rocPRIM with a CUB-compatible API.
+//  We alias so kernel code can use `cub::DeviceSegmentedRadixSort` uniformly.
+// ═══════════════════════════════════════════════════════════════════════
+
+#if GROK_HIP
+  namespace cub = hipcub;
+#endif
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Full-mask constant for warp-wide operations
+//
+//  CUDA uses explicit masks (0xFFFFFFFF for 32 lanes).
+//  HIP/CDNA doesn't use masks — all 64 lanes in a wavefront are lockstep.
+// ═══════════════════════════════════════════════════════════════════════
+
+#if GROK_HIP
+  #define FULL_WARP_MASK 0  // unused, but defined for code that passes it around
+#else
+  #define FULL_WARP_MASK 0xFFFFFFFF
+#endif
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Async memset
+// ═══════════════════════════════════════════════════════════════════════
+
+#if GROK_HIP
+  #define gpuMemsetAsync hipMemsetAsync
+#else
+  #define gpuMemsetAsync cudaMemsetAsync
+#endif
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Stream management
+// ═══════════════════════════════════════════════════════════════════════
+
+#if GROK_HIP
+  #define gpuStreamCreate hipStreamCreate
+  #define gpuStreamSynchronize hipStreamSynchronize
+  #define gpuStreamDestroy hipStreamDestroy
+#else
+  #define gpuStreamCreate cudaStreamCreate
+  #define gpuStreamSynchronize cudaStreamSynchronize
+  #define gpuStreamDestroy cudaStreamDestroy
+#endif
+
+// ═══════════════════════════════════════════════════════════════════════
+//  GCN/CDNA scheduler hints (AMD-only occupancy control)
+//
+//  __attribute__((amdgpu_waves_per_eu(min, max))) controls occupancy
+//  on AMD GCN/CDNA by limiting waves per execution unit. On NVIDIA,
+//  __launch_bounds__ serves this purpose (already applied separately).
+//
+//  GROK_WAVES_PER_EU(min, max) — applies attribute on HIP, no-op on CUDA.
+//  GROK_FLAT_WORK_GROUP_SIZE(min, max) — hints block size range for AMD.
+// ═══════════════════════════════════════════════════════════════════════
+
+#if GROK_HIP
+  #define GROK_WAVES_PER_EU(min_waves, max_waves) \
+      __attribute__((amdgpu_waves_per_eu(min_waves, max_waves)))
+  #define GROK_FLAT_WORK_GROUP_SIZE(min_size, max_size) \
+      __attribute__((amdgpu_flat_work_group_size(min_size, max_size)))
+#else
+  #define GROK_WAVES_PER_EU(min_waves, max_waves)
+  #define GROK_FLAT_WORK_GROUP_SIZE(min_size, max_size)
+#endif
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Kernel launch attribute (for configuring smem size)
+// ═══════════════════════════════════════════════════════════════════════
+
+#if GROK_HIP
+  #define gpuFuncSetAttribute hipFuncSetAttribute
+  #define gpuFuncAttributeMaxDynamicSharedMemorySize \
+          hipFuncAttributeMaxDynamicSharedMemorySize
+#else
+  #define gpuFuncSetAttribute cudaFuncSetAttribute
+  #define gpuFuncAttributeMaxDynamicSharedMemorySize \
+          cudaFuncAttributeMaxDynamicSharedMemorySize
+#endif
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Non-temporal (streaming) memory access
+//
+//  Used for optimizer state access to avoid L2 cache pollution.
+//  Model weights stay warm in L2 for the next forward pass.
+// ═══════════════════════════════════════════════════════════════════════
+
+#if GROK_CUDA
+  // Streaming load: reads bypass L2 (or use L2 read-only path)
+  __device__ __forceinline__ float stream_load(const float* ptr) {
+      float val;
+      asm volatile("ld.global.nc.f32 %0, [%1];" : "=f"(val) : "l"(ptr));
+      return val;
+  }
+
+  // Streaming store: writes bypass L2 allocation
+  // Available on sm_80+ (Ampere). On older, falls back to normal store.
+  __device__ __forceinline__ void stream_store(float* ptr, float val) {
+  #if __CUDA_ARCH__ >= 800
+      asm volatile("st.global.wt.f32 [%0], %1;" :: "l"(ptr), "f"(val));
+  #else
+      *ptr = val;
+  #endif
+  }
+
+  // float4 streaming variants
+  __device__ __forceinline__ float4 stream_load4(const float4* ptr) {
+      float4 val;
+      asm volatile(
+          "ld.global.nc.v4.f32 {%0,%1,%2,%3}, [%4];"
+          : "=f"(val.x), "=f"(val.y), "=f"(val.z), "=f"(val.w)
+          : "l"(ptr));
+      return val;
+  }
+
+  __device__ __forceinline__ void stream_store4(float4* ptr, float4 val) {
+  #if __CUDA_ARCH__ >= 800
+      asm volatile(
+          "st.global.wt.v4.f32 [%0], {%1,%2,%3,%4};"
+          :: "l"(ptr), "f"(val.x), "f"(val.y), "f"(val.z), "f"(val.w));
+  #else
+      *ptr = val;
+  #endif
+  }
+
+#elif GROK_HIP
+  // HIP: use __builtin_nontemporal_load/store
+  __device__ __forceinline__ float stream_load(const float* ptr) {
+      return __builtin_nontemporal_load(ptr);
+  }
+  __device__ __forceinline__ void stream_store(float* ptr, float val) {
+      __builtin_nontemporal_store(val, ptr);
+  }
+  // float4 variants: decompose into 4 scalar non-temporal ops
+  __device__ __forceinline__ float4 stream_load4(const float4* ptr) {
+      const float* fp = reinterpret_cast<const float*>(ptr);
+      return make_float4(
+          __builtin_nontemporal_load(fp),
+          __builtin_nontemporal_load(fp+1),
+          __builtin_nontemporal_load(fp+2),
+          __builtin_nontemporal_load(fp+3));
+  }
+  __device__ __forceinline__ void stream_store4(float4* ptr, float4 val) {
+      float* fp = reinterpret_cast<float*>(ptr);
+      __builtin_nontemporal_store(val.x, fp);
+      __builtin_nontemporal_store(val.y, fp+1);
+      __builtin_nontemporal_store(val.z, fp+2);
+      __builtin_nontemporal_store(val.w, fp+3);
+  }
+#else
+  // CPU: no non-temporal hint needed (OS manages caching)
+  static inline float stream_load(const float* ptr) { return *ptr; }
+  static inline void stream_store(float* ptr, float val) { *ptr = val; }
+#endif
+// ── end inlined csrc/common/platform.h ──
+// ── inlined from former csrc/common/types.h ──
+/*
+ * SuperGrok v2 — Shared Types and Constants
+ *
+ * Common struct definitions and compile-time constants used by both
+ * forward and backward CUDA kernels.
+ */
+
+
+
+#include <vector>
+#include <torch/extension.h>
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Compile-time constants
+// ═══════════════════════════════════════════════════════════════════════
+
+constexpr int MAX_D_STATE = 128;
+constexpr int MAX_D_INNER = 128;
+constexpr int MAX_D_MODEL = 64;
+constexpr int MAX_GRU_HIDDEN = 8;
+constexpr int MAX_EXPERT_HIDDEN = 16;
+constexpr int MAX_TOPK = 4;
+constexpr int MAX_CKPT_INTERVAL = 32;   // max checkpoint interval for bilevel gradient checkpointing
+
+constexpr int SG2M_BLOCK = 256;         // forward kernel block size
+constexpr int SG2B_BLOCK = 256;         // backward kernel block size
+constexpr int PSCAN_BLOCK = 512;        // threads per parallel scan block (must be power of 2)
+constexpr int PSCAN_THRESHOLD = 256;    // fall back to sequential scan if N < this
+constexpr int GEMM_PRECOMPUTE_THRESHOLD = 1024;  // use GEMM when N >= this
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Parallel Prefix Scan Infrastructure
+//
+//  Affine2x2 and affine_combine moved to csrc/scan/affine2x2.h.
+//  Included here so existing callers that #include "csrc/common/types.h"
+//  continue to compile without modification.
+// ═══════════════════════════════════════════════════════════════════════
+
+// ── inlined from former csrc/scan/affine2x2.h ──
+// Affine2x2 — shared scan primitive.
+//
+// Extracted from csrc/common/types.h. The associative operator used by the
+// Mamba parallel prefix scan and by SuperGrok v2's selective scan.
+//
+// Encoding: each scan element is a 2x2 affine transform
+//   (h_new) = (m00 m01) (h) + (b0)
+//   (h_new')  (m10 m11) (h')  (b1)
+//
+// composition: (B ∘ A)(h) = B(A(h))
+//   M_out = M_B * M_A
+//   b_out = M_B * b_A + b_B
+//
+// Used by:
+//   csrc/scan/mamba_scan_adapter.cuh  — Mamba model selective scan
+//   csrc/algorithms/supergrok2.h      — SG2 optimizer scan recurrence
+//   csrc/backends/cuda/sm_90/launch_supergrok2.cu — Blelloch parallel scan
+
+#ifdef __CUDACC__
+
+struct Affine2x2 {
+    float m00, m01, m10, m11;  // 2x2 matrix
+    float b0, b1;               // 2-vector bias
 };
 
-// ---------------------------------------------------------------------------
-// Model state
-// ---------------------------------------------------------------------------
+__device__ __forceinline__ Affine2x2 affine_identity() {
+    return {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+}
 
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-struct TransformerDecoderState {
-    // Embedding table [VOCAB, D]
-    const ParamT* __restrict__ tok_embed;
+__device__ __forceinline__ Affine2x2 affine_combine(Affine2x2 left, Affine2x2 right) {
+    // Computes right ∘ left: apply left first, then right.
+    // M_out = M_right * M_left
+    // b_out = M_right * b_left + b_right
+    Affine2x2 out;
+#if defined(GROK_CUDA) && GROK_CUDA
+    // Inline PTX: 12-FMA composition arranged for ILP across pipelines.
+    asm volatile(
+        "fma.rn.f32 %0, %6, %12, 0f00000000;\n\t"
+        "fma.rn.f32 %1, %6, %13, 0f00000000;\n\t"
+        "fma.rn.f32 %2, %8, %12, 0f00000000;\n\t"
+        "fma.rn.f32 %3, %8, %13, 0f00000000;\n\t"
+        "fma.rn.f32 %0, %7, %14, %0;\n\t"
+        "fma.rn.f32 %1, %7, %15, %1;\n\t"
+        "fma.rn.f32 %2, %9, %14, %2;\n\t"
+        "fma.rn.f32 %3, %9, %15, %3;\n\t"
+        "fma.rn.f32 %4, %6, %16, %10;\n\t"
+        "fma.rn.f32 %5, %8, %16, %11;\n\t"
+        "fma.rn.f32 %4, %7, %17, %4;\n\t"
+        "fma.rn.f32 %5, %9, %17, %5;\n\t"
+        : "=f"(out.m00), "=f"(out.m01), "=f"(out.m10), "=f"(out.m11),
+          "=f"(out.b0), "=f"(out.b1)
+        : "f"(right.m00), "f"(right.m01), "f"(right.m10), "f"(right.m11),
+          "f"(right.b0), "f"(right.b1),
+          "f"(left.m00), "f"(left.m01), "f"(left.m10), "f"(left.m11),
+          "f"(left.b0), "f"(left.b1)
+    );
+#else
+    // HIP/CPU fallback: C++ implementation (HIP has different inline asm syntax)
+    out.m00 = right.m00 * left.m00 + right.m01 * left.m10;
+    out.m01 = right.m00 * left.m01 + right.m01 * left.m11;
+    out.m10 = right.m10 * left.m00 + right.m11 * left.m10;
+    out.m11 = right.m10 * left.m01 + right.m11 * left.m11;
+    out.b0  = right.m00 * left.b0  + right.m01 * left.b1 + right.b0;
+    out.b1  = right.m10 * left.b0  + right.m11 * left.b1 + right.b1;
+#endif
+    return out;
+}
 
-    // Architecture dims
-    int n_layers;
-    int d_model;
-    int n_heads;
+#endif // __CUDACC__
+// ── end inlined csrc/scan/affine2x2.h ──
 
-    // All per-layer weights packed contiguously; stride = DecoderSizes::param_bytes_per_layer()
-    const ParamT* __restrict__ layer_weights;
+#ifdef __CUDACC__
 
-    // Final layernorm parameters [D]
-    const ParamT* __restrict__ final_norm_g;
-    const ParamT* __restrict__ final_norm_b;
+// ═══════════════════════════════════════════════════════════════════════
+//  Branchless Stochastic Rounding (Config4 / INT8 quantized kernels)
+//
+//  Converts float to int8 with stochastic rounding. The ternary compiles
+//  to a PTX selp instruction at -O2, avoiding warp divergence.
+// ═══════════════════════════════════════════════════════════════════════
 
-    // Output projection [VOCAB, D] — nullptr when TIED_EMBEDDINGS
-    const ParamT* __restrict__ lm_head_w;
-    const ParamT* __restrict__ lm_head_b;   // [VOCAB]
+__device__ __forceinline__ int8_t float_to_int8_stochastic_branchless(
+    float val, float scale, unsigned rand_bits
+) {
+    float scaled = val / fmaxf(scale, 1e-12f);
+    float trunc_val = truncf(scaled);
+    float frac = fabsf(scaled - trunc_val);
+    float threshold = (float)(rand_bits & 0xFFFF) * (1.0f / 65536.0f);
+    // Branchless: ternary compiles to selp on nvcc -O2
+    float round_up = (frac > threshold) ? copysignf(1.0f, scaled) : 0.0f;
+    float result = trunc_val + round_up;
+    return (int8_t)fmaxf(-127.0f, fminf(127.0f, result));
+}
 
-    // Accessor: base pointer for layer l within packed weights
-    __device__ __forceinline__ const ParamT* layer_base(int l) const {
-        // Caller must supply stride matching DecoderSizes::params_per_layer()
-        const size_t stride = params_per_layer_runtime();
-        return layer_weights + static_cast<size_t>(l) * stride;
+#endif  // __CUDACC__
+// ── end inlined csrc/common/types.h ──
+// ── inlined from former csrc/common/utils.cuh ──
+/*
+ * SuperGrok v2 — Shared Device Helpers
+ *
+ * Device utility functions used by multiple kernel files.
+ * Uses platform.h macros for CUDA/HIP portability.
+ */
+
+
+#if GROK_CUDA
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+#endif
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Warp-level reduction helper
+//
+//  Sum a float across d_inner threads (all in one warp, d_inner ≤ WARP_SIZE).
+//  Uses platform-abstracted shuffle; works for any d_inner ≤ WARP_SIZE
+//  (including non-power-of-2).
+// ═══════════════════════════════════════════════════════════════════════
+
+__device__ __forceinline__ float warp_reduce_sum(float val, int d_inner, int tid) {
+    unsigned mask = (d_inner < WARP_SIZE) ? ((1u << d_inner) - 1) : FULL_WARP_MASK;
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        float other = SHFL_DOWN_SYNC(mask, val, offset);
+        if (tid + offset < d_inner)
+            val += other;
     }
+    return val;  // only lane 0 has the correct sum
+}
 
-    // Runtime params-per-layer (mirrors DecoderSizes but uses runtime d_model)
-    __device__ __forceinline__ size_t params_per_layer_runtime() const {
-        const int D = d_model;
-        const int FFN = 4 * D;
-        return static_cast<size_t>(D)
-             + static_cast<size_t>(3) * D * D
-             + static_cast<size_t>(D) * D
-             + static_cast<size_t>(D)
-             + static_cast<size_t>(FFN) * D
-             + static_cast<size_t>(FFN) * D
-             + static_cast<size_t>(D) * FFN;
+// ═══════════════════════════════════════════════════════════════════════
+//  Stochastic Rounding for Quantized Optimizer States (Config 3)
+//
+//  Hash-based PRNG: deterministic per (step, element) pair, no state needed.
+//  Faster than cuRAND, no separate state tensor required.
+// ═══════════════════════════════════════════════════════════════════════
+
+// Hash-based PRNG (Philox-like): deterministic, no state
+__device__ __forceinline__ unsigned hash_prng(unsigned step, unsigned idx) {
+    unsigned h = (step * 2654435761u) ^ (idx * 2246822519u);
+    h ^= h >> 16;
+    h *= 0x45d9f3bu;
+    h ^= h >> 16;
+    return h;
+}
+
+#if GROK_CUDA || GROK_HIP
+
+// BF16 stochastic rounding: unbiased quantization
+__device__ __forceinline__ __nv_bfloat16 float_to_bf16_stochastic(float val, unsigned rand_bits) {
+    unsigned bits = __float_as_uint(val);
+    unsigned truncated = bits & 0xFFFF;     // bits that BF16 drops
+    unsigned threshold = rand_bits & 0xFFFF; // random 16-bit threshold
+    if (truncated > threshold) {
+        bits += 0x10000;  // round up
     }
+    bits &= 0xFFFF0000;  // truncate to BF16
+    return __float2bfloat16(__uint_as_float(bits));
+}
 
-    // Per-layer weight offsets within a single layer's slice
-    __device__ __forceinline__ const ParamT* norm1_g(int l)   const { return layer_base(l); }
-    __device__ __forceinline__ const ParamT* w_qkv(int l)     const { return norm1_g(l) + d_model; }
-    __device__ __forceinline__ const ParamT* w_o(int l)       const { return w_qkv(l) + 3 * d_model * d_model; }
-    __device__ __forceinline__ const ParamT* norm2_g(int l)   const { return w_o(l) + d_model * d_model; }
-    __device__ __forceinline__ const ParamT* w_gate(int l)    const { return norm2_g(l) + d_model; }
-    __device__ __forceinline__ const ParamT* w_up(int l)      const { return w_gate(l) + 4 * d_model * d_model; }
-    __device__ __forceinline__ const ParamT* w_down(int l)    const { return w_up(l) + 4 * d_model * d_model; }
-
-    // Output head weight — reuses embedding table when tied
-    __device__ __forceinline__ const ParamT* output_weight() const {
-        if constexpr (TIED_EMBEDDINGS) return tok_embed;
-        return lm_head_w;
+// INT8 per-block quantization with stochastic rounding
+// block_size elements share one FP32 scale factor
+__device__ __forceinline__ int8_t float_to_int8_stochastic(
+    float val, float scale, unsigned rand_bits
+) {
+    float scaled = val / scale;
+    float truncated = truncf(scaled);
+    float frac = fabsf(scaled - truncated);
+    float threshold = (float)(rand_bits & 0xFFFF) / 65536.0f;
+    if (frac > threshold) {
+        truncated += (scaled > 0) ? 1.0f : -1.0f;
     }
-};
+    return (int8_t)fmaxf(-127.0f, fminf(127.0f, truncated));
+}
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════════
+//  Phase 3: Inline PTX for Hot Inner Loops
+//
+//  Hand-tuned PTX for critical paths in the SG2 fused_elem pipeline.
+//  These replace compiler-generated code in the highest-frequency loops.
+// ═══════════════════════════════════════════════════════════════════════
 
-namespace detail {
+#if GROK_CUDA
 
-// Warp-level reduction (sum) for RMSNorm — uses warp shuffle
-__device__ __forceinline__ float warp_reduce_sum(float val) {
+// Fast reciprocal sqrt via PTX rsqrt.approx.f32 + Newton-Raphson refinement.
+// 2-3x faster than sqrtf(x) + fdividef for Adam denominator.
+__device__ __forceinline__ float fast_rsqrt_nr(float x) {
+    float r;
+    asm("rsqrt.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+    // One Newton-Raphson iteration: r = r * (1.5 - 0.5 * x * r * r)
+    r = r * (1.5f - 0.5f * x * r * r);
+    return r;
+}
+
+// Fused multiply-add via PTX fma.rn.f32 — ensures single FMA instruction.
+// Critical for affine_combine inner loop (8 FMAs per composition).
+__device__ __forceinline__ float ptx_fma(float a, float b, float c) {
+    float r;
+    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c));
+    return r;
+}
+
+// Fast exp2 approximation via PTX ex2.approx.f32.
+// Used in Mamba scan: exp(A * dt) = exp2(A * dt / ln2).
+__device__ __forceinline__ float ptx_exp2(float x) {
+    float r;
+    asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+
+// Fast log2 via PTX lg2.approx.f32.
+__device__ __forceinline__ float ptx_log2(float x) {
+    float r;
+    asm("lg2.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+
+// Fast exp via exp2: exp(x) = exp2(x * log2(e))
+__device__ __forceinline__ float ptx_expf(float x) {
+    return ptx_exp2(x * 1.4426950408889634f);  // log2(e)
+}
+
+// Fast tanh approximation via exp2: tanh(x) = (e^2x - 1) / (e^2x + 1)
+// Used in GRU h_tilde computation.
+__device__ __forceinline__ float ptx_tanhf(float x) {
+    float e2x = ptx_exp2(2.0f * x * 1.4426950408889634f);
+    return (e2x - 1.0f) / (e2x + 1.0f);
+}
+
+// Fast sigmoid via exp2: sigmoid(x) = 1 / (1 + exp(-x))
+// Used in GRU z_gate and r_gate.
+__device__ __forceinline__ float ptx_sigmoidf(float x) {
+    float en = ptx_exp2(-x * 1.4426950408889634f);
+    return 1.0f / (1.0f + en);
+}
+
+// Blelloch affine_combine using pure PTX FMA instructions.
+// Composes two Affine2x2 transforms: result = left ∘ right
+// M_out = M_left * M_right, b_out = M_left * b_right + b_left
+// This is the inner loop of the parallel prefix scan (called O(log N) times).
+__device__ __forceinline__ Affine2x2 ptx_affine_combine(
+    const Affine2x2& left, const Affine2x2& right
+) {
+    Affine2x2 out;
+    // M_out = M_left * M_right (2x2 matrix multiply via 8 FMAs)
+    out.m00 = ptx_fma(left.m00, right.m00, left.m01 * right.m10);
+    out.m01 = ptx_fma(left.m00, right.m01, left.m01 * right.m11);
+    out.m10 = ptx_fma(left.m10, right.m00, left.m11 * right.m10);
+    out.m11 = ptx_fma(left.m10, right.m01, left.m11 * right.m11);
+    // b_out = M_left * b_right + b_left
+    out.b0 = ptx_fma(left.m00, right.b0, ptx_fma(left.m01, right.b1, left.b0));
+    out.b1 = ptx_fma(left.m10, right.b0, ptx_fma(left.m11, right.b1, left.b1));
+    return out;
+}
+
+// Expert MLP forward pass — single expert, ReLU activation.
+// Inlined PTX FMA for the inner products.
+// expert_hidden is typically 8-16, so fully unrollable at compile time.
+template <int EXPERT_HIDDEN>
+__device__ __forceinline__ float ptx_expert_mlp_forward(
+    const float* __restrict__ W1,   // [expert_hidden]
+    const float* __restrict__ b1,   // [expert_hidden]
+    const float* __restrict__ W2,   // [expert_hidden]
+    float b2,
+    float input
+) {
+    float result = b2;
     #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_xor_sync(0xffffffff, val, offset);
+    for (int h = 0; h < EXPERT_HIDDEN; h++) {
+        float hidden = ptx_fma(W1[h], input, b1[h]);
+        hidden = fmaxf(hidden, 0.0f);  // ReLU
+        result = ptx_fma(W2[h], hidden, result);
+    }
+    return result;
+}
+
+// Stochastic rounding with PTX prmt (permute bytes) for fast bit extraction.
+// Replaces the hash_prng shift+multiply chain with a single PTX instruction
+// for extracting the random threshold from the hash output.
+__device__ __forceinline__ int8_t ptx_int8_stochastic_round(
+    float val, float scale, unsigned rand_bits
+) {
+    float scaled = val / fmaxf(scale, 1e-12f);
+    float tr = truncf(scaled);
+    float frac = fabsf(scaled - tr);
+    // Extract lower 16 bits as threshold using prmt
+    unsigned lo16;
+    asm("prmt.b32 %0, %1, 0, 0x4140;" : "=r"(lo16) : "r"(rand_bits));
+    float threshold = (float)lo16 / 65536.0f;
+    if (frac > threshold) tr += (scaled > 0) ? 1.0f : -1.0f;
+    return (int8_t)fmaxf(-127.0f, fminf(127.0f, tr));
+}
+
+// §25.7 DSMEM cluster reduce (sm_90+ Hopper distributed shared memory).
+// Block-local warp reduce first, then cluster-wide reduce via cooperative
+// groups. Falls back to warp reduce on pre-Hopper.
+__device__ __forceinline__ float cluster_dsmem_reduce_sum(float val) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    namespace cg = cooperative_groups;
+    val = warp_reduce_sum(val, WARP_SIZE, threadIdx.x & (WARP_SIZE - 1));
+    auto cluster = cg::this_cluster();
+    val = cg::reduce(cluster, val, cg::plus<float>());
     return val;
+#else
+    return warp_reduce_sum(val, WARP_SIZE, threadIdx.x & (WARP_SIZE - 1));
+#endif
 }
 
-// Dispatches to wgmma via CUTLASS 3.x CollectiveMainloopSm90TmaGmmaRF.
-// Template arguments select tile shape m64n128k16 for BF16/FP16.
-// A and B must be in global memory; result is accumulated in registers.
-template <typename ParamT>
-__device__ __forceinline__ void wgmma_matmul(
-    const ParamT* __restrict__ A, int M, int K,
-    const ParamT* __restrict__ B, int K2, int N,
-    float* __restrict__ C
+#endif // GROK_CUDA
+
+// HIP fallbacks — use standard math functions
+#if GROK_HIP
+__device__ __forceinline__ float fast_rsqrt_nr(float x) { return rsqrtf(x); }
+__device__ __forceinline__ float ptx_fma(float a, float b, float c) { return fmaf(a, b, c); }
+__device__ __forceinline__ float ptx_expf(float x) { return expf(x); }
+__device__ __forceinline__ float ptx_tanhf(float x) { return tanhf(x); }
+__device__ __forceinline__ float ptx_sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
+
+__device__ __forceinline__ Affine2x2 ptx_affine_combine(
+    const Affine2x2& left, const Affine2x2& right
 ) {
-    // Placeholder: actual implementation generated by CUTLASS 3.x codegen.
-    // The dispatch generator emits a call to:
-    //   cutlass::gemm::collective::CollectiveMainloopSm90TmaGmmaRF<
-    //       cutlass::gemm::GemmShape<64, 128, 16>,
-    //       ParamT, cutlass::layout::RowMajor,
-    //       ParamT, cutlass::layout::ColumnMajor,
-    //       float,  cutlass::layout::RowMajor>
-    // This uses wgmma.mma_async for Hopper warp-group matrix multiply-accumulate.
-    (void)A; (void)M; (void)K; (void)B; (void)K2; (void)N; (void)C;
+    return affine_combine(left, right);  // Use types.h version
+}
+#endif // GROK_HIP
+
+#endif // GROK_CUDA || GROK_HIP
+// ── end inlined csrc/common/utils.cuh ──
+#include "csrc/backends/cuda/sm_90/models/attention.cuh"
+
+#include <cublas_v2.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+namespace sg { namespace sm90 { namespace models { namespace decoder {
+
+// ─── cuBLAS dtype traits ─────────────────────────────────────────────
+template <typename T> struct CublasTraits;
+template <> struct CublasTraits<float> {
+    static constexpr cudaDataType_t data_type = CUDA_R_32F;
+    static constexpr cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F;
+};
+template <> struct CublasTraits<__nv_bfloat16> {
+    static constexpr cudaDataType_t data_type = CUDA_R_16BF;
+    static constexpr cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F;
+};
+template <> struct CublasTraits<__half> {
+    static constexpr cudaDataType_t data_type = CUDA_R_16F;
+    static constexpr cublasComputeType_t compute_type = CUBLAS_COMPUTE_32F;
+};
+
+// ─── Cast helpers ────────────────────────────────────────────────────
+template <typename T>
+__host__ __device__ __forceinline__ float to_float(T x) { return static_cast<float>(x); }
+template <>
+__host__ __device__ __forceinline__ float to_float<__nv_bfloat16>(__nv_bfloat16 x) {
+#ifdef __CUDA_ARCH__
+    return __bfloat162float(x);
+#else
+    return static_cast<float>(x);
+#endif
+}
+template <>
+__host__ __device__ __forceinline__ float to_float<__half>(__half x) {
+#ifdef __CUDA_ARCH__
+    return __half2float(x);
+#else
+    return static_cast<float>(x);
+#endif
+}
+template <typename T>
+__device__ __forceinline__ T from_float(float x) { return static_cast<T>(x); }
+template <>
+__device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(float x) { return __float2bfloat16(x); }
+template <>
+__device__ __forceinline__ __half from_float<__half>(float x) { return __float2half(x); }
+
+// ─── Atomic-add-on-W helpers ─────────────────────────────────────────
+// FP32: builtin atomicAdd. BF16/FP16: simulate via CAS on uint16 packed
+// pairs (slow path; only used for embedding/bias gradients which are
+// small). Acceptable for grokking-scale (vocab=99, d=128).
+__device__ __forceinline__ void atomic_add_w(float* p, float v) { atomicAdd(p, v); }
+__device__ __forceinline__ void atomic_add_w(__nv_bfloat16* p, float v) {
+    // Atomic on aligned uint32 holding two BF16s
+    auto* p_align = reinterpret_cast<unsigned int*>(
+        reinterpret_cast<size_t>(p) & ~(size_t)0x3);
+    bool is_high = (reinterpret_cast<size_t>(p) & 0x3) != 0;
+    unsigned int old = *p_align, expected;
+    do {
+        expected = old;
+        unsigned int half = is_high ? (expected >> 16) : (expected & 0xFFFF);
+        __nv_bfloat16 cur = __ushort_as_bfloat16((unsigned short)half);
+        float new_val = __bfloat162float(cur) + v;
+        unsigned short new_bits = __bfloat16_as_ushort(__float2bfloat16(new_val));
+        unsigned int packed = is_high
+            ? ((expected & 0xFFFFu) | ((unsigned int)new_bits << 16))
+            : ((expected & 0xFFFF0000u) | (unsigned int)new_bits);
+        old = atomicCAS(p_align, expected, packed);
+    } while (old != expected);
+}
+__device__ __forceinline__ void atomic_add_w(__half* p, float v) {
+    auto* p_align = reinterpret_cast<unsigned int*>(
+        reinterpret_cast<size_t>(p) & ~(size_t)0x3);
+    bool is_high = (reinterpret_cast<size_t>(p) & 0x3) != 0;
+    unsigned int old = *p_align, expected;
+    do {
+        expected = old;
+        unsigned int half = is_high ? (expected >> 16) : (expected & 0xFFFF);
+        __half cur = __ushort_as_half((unsigned short)half);
+        float new_val = __half2float(cur) + v;
+        unsigned short new_bits = __half_as_ushort(__float2half(new_val));
+        unsigned int packed = is_high
+            ? ((expected & 0xFFFFu) | ((unsigned int)new_bits << 16))
+            : ((expected & 0xFFFF0000u) | (unsigned int)new_bits);
+        old = atomicCAS(p_align, expected, packed);
+    } while (old != expected);
 }
 
-// SiLU activation: x / (1 + exp(-x))
-__device__ __forceinline__ float silu(float x) {
-    float e = __expf(-x);
-    return x / (1.0f + e);
+// ─── Activation layout helpers ───────────────────────────────────────
+template <typename T>
+struct ActLayout {
+    size_t input_ids_saved;  // [B*S]
+    size_t qkv_in, qkv_out, attn_in_qkv, attn_out_perhead, attn_out;
+    size_t attn_proj, n1_in, layer1_out;
+    size_t ffn_pre, ffn_post, ffn_out, n2_in, layer_out, softmax_lse_T;
+    size_t per_layer_total;
+    size_t embed_out, final_norm_out, logits_full;
+};
+
+template <typename T>
+inline ActLayout<T> compute_layout(int B, int S, int D, int H, int V, int ffn_exp) {
+    const size_t bsd = (size_t)B * S * D;
+    const size_t bs3d = (size_t)B * S * 3 * D;
+    const size_t bshd = (size_t)B * S * (size_t)ffn_exp * D;
+    const size_t bhs = (size_t)B * H * S;
+    const size_t bsv = (size_t)B * S * V;
+    const size_t lse_T = (bhs * sizeof(float) + sizeof(T) - 1) / sizeof(T);
+    ActLayout<T> L;
+    L.input_ids_saved = (size_t)B * S;
+    L.qkv_in = bsd;
+    L.qkv_out = bs3d;
+    L.attn_in_qkv = bs3d;       // packed q,k,v in [B,H,S,d] each = bsd*3
+    L.attn_out_perhead = bsd;
+    L.attn_out = bsd;
+    L.attn_proj = bsd;
+    L.n1_in = bsd;
+    L.layer1_out = bsd;
+    L.ffn_pre = bshd;
+    L.ffn_post = bshd;
+    L.ffn_out = bsd;
+    L.n2_in = bsd;
+    L.layer_out = bsd;
+    L.softmax_lse_T = lse_T;
+    L.per_layer_total =
+        L.qkv_in + L.qkv_out + L.attn_in_qkv + L.attn_out_perhead +
+        L.attn_out + L.attn_proj + L.n1_in + L.layer1_out +
+        L.ffn_pre + L.ffn_post + L.ffn_out + L.n2_in + L.layer_out +
+        L.softmax_lse_T;
+    L.embed_out = bsd;
+    L.final_norm_out = bsd;
+    L.logits_full = bsv;
+    return L;
 }
 
-// SiLU backward: silu(x) + x * sigmoid(x) * (1 - sigmoid(x))
-//              = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
-__device__ __forceinline__ float silu_backward(float x) {
-    float sig = 1.0f / (1.0f + __expf(-x));
-    return sig * (1.0f + x * (1.0f - sig));
+template <typename T>
+struct LayerScratch {
+    T* qkv_in;
+    T* qkv_out;
+    T* attn_in_qkv;       // [3 * B*S*D] — q,k,v concatenated
+    T* attn_out_perhead;  // [B*S*D] in [B,H,S,d] layout
+    T* attn_out;
+    T* attn_proj;
+    T* n1_in;
+    T* layer1_out;
+    T* ffn_pre;
+    T* ffn_post;
+    T* ffn_out;
+    T* n2_in;
+    T* layer_out;
+    T* softmax_lse;
+};
+
+template <typename T>
+inline LayerScratch<T> slice_layer(T* base, const ActLayout<T>& L, int layer_idx) {
+    T* p = base + L.input_ids_saved + L.embed_out + (size_t)layer_idx * L.per_layer_total;
+    LayerScratch<T> s;
+    s.qkv_in = p;            p += L.qkv_in;
+    s.qkv_out = p;           p += L.qkv_out;
+    s.attn_in_qkv = p;       p += L.attn_in_qkv;
+    s.attn_out_perhead = p;  p += L.attn_out_perhead;
+    s.attn_out = p;          p += L.attn_out;
+    s.attn_proj = p;         p += L.attn_proj;
+    s.n1_in = p;             p += L.n1_in;
+    s.layer1_out = p;        p += L.layer1_out;
+    s.ffn_pre = p;           p += L.ffn_pre;
+    s.ffn_post = p;          p += L.ffn_post;
+    s.ffn_out = p;           p += L.ffn_out;
+    s.n2_in = p;             p += L.n2_in;
+    s.layer_out = p;         p += L.layer_out;
+    s.softmax_lse = p;       p += L.softmax_lse_T;
+    return s;
 }
 
-// NaN sanitization for a gradient value
-template <NanPolicy NAN_POLICY>
-__device__ __forceinline__ float sanitize_grad(float g) {
-    if constexpr (NAN_POLICY == NanPolicy::kZero) {
-        return __isnanf(g) ? 0.0f : g;
-    } else if constexpr (NAN_POLICY == NanPolicy::kPropagate) {
-        return g; // caller skips if NaN
+// ─── Weight pointer slicing ──────────────────────────────────────────
+inline size_t per_layer_weight_count(int d, int ffn_h) {
+    return (size_t)d + d
+         + (size_t)3*d*d + 3*d
+         + (size_t)d*d + d
+         + d + d
+         + (size_t)ffn_h*d + ffn_h
+         + (size_t)d*ffn_h + d;
+}
+
+template <typename W>
+struct LayerWeights {
+    const W* n1_g;  const W* n1_b;
+    const W* qkv_W; const W* qkv_b;
+    const W* out_W; const W* out_b;
+    const W* n2_g;  const W* n2_b;
+    const W* ff1_W; const W* ff1_b;
+    const W* ff2_W; const W* ff2_b;
+};
+
+template <typename W>
+inline LayerWeights<W> slice_layer_weights(const W* base, int d, int ffn_h) {
+    LayerWeights<W> w;
+    const W* p = base;
+    w.n1_g = p; p += d;
+    w.n1_b = p; p += d;
+    w.qkv_W = p; p += (size_t)3*d*d;
+    w.qkv_b = p; p += 3*d;
+    w.out_W = p; p += (size_t)d*d;
+    w.out_b = p; p += d;
+    w.n2_g = p; p += d;
+    w.n2_b = p; p += d;
+    w.ff1_W = p; p += (size_t)ffn_h*d;
+    w.ff1_b = p; p += ffn_h;
+    w.ff2_W = p; p += (size_t)d*ffn_h;
+    w.ff2_b = p; p += d;
+    return w;
+}
+
+// Same struct for grad (non-const)
+template <typename W>
+struct LayerGrads {
+    W* n1_g;  W* n1_b;
+    W* qkv_W; W* qkv_b;
+    W* out_W; W* out_b;
+    W* n2_g;  W* n2_b;
+    W* ff1_W; W* ff1_b;
+    W* ff2_W; W* ff2_b;
+};
+template <typename W>
+inline LayerGrads<W> slice_layer_grads(W* base, int d, int ffn_h) {
+    LayerGrads<W> w;
+    W* p = base;
+    w.n1_g = p; p += d;
+    w.n1_b = p; p += d;
+    w.qkv_W = p; p += (size_t)3*d*d;
+    w.qkv_b = p; p += 3*d;
+    w.out_W = p; p += (size_t)d*d;
+    w.out_b = p; p += d;
+    w.n2_g = p; p += d;
+    w.n2_b = p; p += d;
+    w.ff1_W = p; p += (size_t)ffn_h*d;
+    w.ff1_b = p; p += ffn_h;
+    w.ff2_W = p; p += (size_t)d*ffn_h;
+    w.ff2_b = p; p += d;
+    return w;
+}
+
+// ─── Embedding kernel ────────────────────────────────────────────────
+template <typename T, typename W>
+__global__ void __launch_bounds__(128, 4)
+embedding_kernel(
+    const T* __restrict__ input_ids,
+    const W* __restrict__ tok_embed,
+    const W* __restrict__ pos_embed,
+    T* __restrict__ out,
+    int B, int S, int D, int V
+) {
+    const int bs = blockIdx.x;
+    if (bs >= B * S) return;
+    const int s = bs % S;
+    const int tid = threadIdx.x;
+    int tok_id = static_cast<int>(to_float<T>(input_ids[bs]));
+    if (tok_id < 0) tok_id = 0;
+    if (tok_id >= V) tok_id = V - 1;
+    for (int d = tid; d < D; d += blockDim.x) {
+        float t = to_float<W>(tok_embed[(size_t)tok_id * D + d]);
+        float p = to_float<W>(pos_embed[(size_t)s * D + d]);
+        out[(size_t)bs * D + d] = from_float<T>(t + p);
     }
-    return g;
 }
 
-} // namespace detail
-
-// ---------------------------------------------------------------------------
-// Forward pass — per-layer device functions
-// ---------------------------------------------------------------------------
-
-// Embedding lookup: tok_embed[token_ids[i]] → out[i, :]
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-__device__ __forceinline__ void embed_forward(
-    const ParamT* __restrict__ tok_embed,   // [VOCAB, D]
-    const int*    __restrict__ token_ids,    // [B, S]
-    float*        __restrict__ out,          // [B, S, D]
-    int d_model
+template <typename T, typename W>
+__global__ void __launch_bounds__(128, 4)
+embedding_bwd_kernel(
+    const T* __restrict__ input_ids,
+    const T* __restrict__ grad_embed,
+    W* __restrict__ grad_tok_embed,
+    W* __restrict__ grad_pos_embed,
+    int B, int S, int D, int V
 ) {
-    const int total_tokens = BATCH * SEQ_LEN;
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
-         idx < total_tokens * d_model;
-         idx += gridDim.x * blockDim.x) {
-        const int tok_flat = idx / d_model;
-        const int d        = idx % d_model;
-        const int tok_id   = token_ids[tok_flat];
-        out[idx] = to_float<ParamT>(__ldg(&tok_embed[tok_id * d_model + d]));
+    const int bs = blockIdx.x;
+    if (bs >= B * S) return;
+    const int s = bs % S;
+    int tok_id = static_cast<int>(to_float<T>(input_ids[bs]));
+    if (tok_id < 0) tok_id = 0;
+    if (tok_id >= V) tok_id = V - 1;
+    const int tid = threadIdx.x;
+    for (int d = tid; d < D; d += blockDim.x) {
+        float g = to_float<T>(grad_embed[(size_t)bs * D + d]);
+        atomic_add_w(&grad_pos_embed[(size_t)s * D + d], g);
+        atomic_add_w(&grad_tok_embed[(size_t)tok_id * D + d], g);
     }
 }
 
-// RMSNorm: y = x / rms(x) * gamma, where rms(x) = sqrt(mean(x^2) + eps)
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-__device__ __forceinline__ void rmsnorm_forward(
-    const float*  __restrict__ x,       // [B, S, D]
-    const ParamT* __restrict__ gamma,   // [D]
-    float*        __restrict__ out,     // [B, S, D]
-    float*        __restrict__ rms_buf, // [B, S] — saved for backward
-    int d_model,
-    float eps = 1e-6f
+// ─── Fused residual + LayerNorm ──────────────────────────────────────
+template <typename T, typename W>
+__global__ void __launch_bounds__(128, 4)
+residual_layernorm_kernel(
+    const T* __restrict__ x, const T* __restrict__ residual,
+    const W* __restrict__ gain, const W* __restrict__ bias,
+    T* __restrict__ sum_out, T* __restrict__ out,
+    int N, int D, float eps
 ) {
-    // Each warp processes one token position
-    const int warp_id    = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    const int lane       = threadIdx.x % 32;
-    const int total_toks = BATCH * SEQ_LEN;
-    if (warp_id >= total_toks) return;
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const int tid = threadIdx.x;
+    const int row_off = row * D;
 
-    const float* x_row   = x + static_cast<size_t>(warp_id) * d_model;
-    float*       out_row = out + static_cast<size_t>(warp_id) * d_model;
+    extern __shared__ float smem[];
+    float* sum_buf = smem;
 
-    // Compute sum of squares via warp reduction
-    float ss = 0.0f;
-    for (int d = lane; d < d_model; d += 32) {
-        float v = x_row[d];
-        ss += v * v;
+    float local_sum = 0.0f;
+    for (int d = tid; d < D; d += blockDim.x) {
+        float v = to_float<T>(x[row_off + d]) + to_float<T>(residual[row_off + d]);
+        sum_buf[d] = v;
+        sum_out[row_off + d] = from_float<T>(v);
+        local_sum += v;
     }
-    ss = detail::warp_reduce_sum(ss);
-    float rms_inv = rsqrtf(ss / static_cast<float>(d_model) + eps);
+    __shared__ float reduce_buf[32];
+    int lane = tid & (WARP_SIZE - 1);
+    int warp = tid / WARP_SIZE;
+    local_sum = warp_reduce_sum(local_sum, WARP_SIZE, lane);
+    if (lane == 0) reduce_buf[warp] = local_sum;
+    __syncthreads();
+    int n_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
+    float total_sum = (tid < n_warps) ? reduce_buf[tid] : 0.0f;
+    total_sum = warp_reduce_sum(total_sum, n_warps, tid);
+    if (tid == 0) reduce_buf[0] = total_sum;
+    __syncthreads();
+    float mean = reduce_buf[0] / (float)D;
 
-    if (lane == 0) rms_buf[warp_id] = rms_inv;
+    float local_var = 0.0f;
+    for (int d = tid; d < D; d += blockDim.x) {
+        float v = sum_buf[d] - mean;
+        local_var += v * v;
+    }
+    local_var = warp_reduce_sum(local_var, WARP_SIZE, lane);
+    if (lane == 0) reduce_buf[warp] = local_var;
+    __syncthreads();
+    float total_var = (tid < n_warps) ? reduce_buf[tid] : 0.0f;
+    total_var = warp_reduce_sum(total_var, n_warps, tid);
+    if (tid == 0) reduce_buf[0] = total_var;
+    __syncthreads();
+    float inv_std = fast_rsqrt_nr(reduce_buf[0] / (float)D + eps);
 
-    for (int d = lane; d < d_model; d += 32) {
-        float g = to_float<ParamT>(__ldg(&gamma[d]));
-        out_row[d] = x_row[d] * rms_inv * g;
+    for (int d = tid; d < D; d += blockDim.x) {
+        float g = to_float<W>(gain[d]);
+        float b = to_float<W>(bias[d]);
+        float v = (sum_buf[d] - mean) * inv_std;
+        out[row_off + d] = from_float<T>(v * g + b);
     }
 }
 
-// QKV projection: x[B,S,D] @ W_qkv[3D, D]^T → qkv[B,S,3D]
-// Dispatches to wgmma m64n128k16 BF16 via CUTLASS 3.x
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-__device__ __forceinline__ void qkv_proj_forward(
-    const float*  __restrict__ x,      // [B, S, D]
-    const ParamT* __restrict__ w_qkv,  // [3*D, D]
-    float*        __restrict__ out,    // [B, S, 3*D]
-    int d_model
+template <typename T, typename W>
+__global__ void __launch_bounds__(128, 4)
+layernorm_kernel(
+    const T* __restrict__ x,
+    const W* __restrict__ gain, const W* __restrict__ bias,
+    T* __restrict__ out,
+    int N, int D, float eps
 ) {
-    const int M = BATCH * SEQ_LEN;
-    const int N = 3 * d_model;
-    const int K = d_model;
-    detail::wgmma_matmul<ParamT>(
-        reinterpret_cast<const ParamT*>(nullptr), M, K,  // A matrix (x cast)
-        w_qkv, K, N,
-        out
-    );
-    // Actual implementation: the dispatch generator replaces this with a
-    // CUTLASS 3.x CollectiveMainloopSm90TmaGmmaRF epilogue-fused call.
-    (void)x;
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const int tid = threadIdx.x;
+    const int row_off = row * D;
+    extern __shared__ float smem[];
+    float* buf = smem;
+
+    float local_sum = 0.0f;
+    for (int d = tid; d < D; d += blockDim.x) {
+        float v = to_float<T>(x[row_off + d]);
+        buf[d] = v;
+        local_sum += v;
+    }
+    __shared__ float reduce_buf[32];
+    int lane = tid & (WARP_SIZE - 1);
+    int warp = tid / WARP_SIZE;
+    local_sum = warp_reduce_sum(local_sum, WARP_SIZE, lane);
+    if (lane == 0) reduce_buf[warp] = local_sum;
+    __syncthreads();
+    int n_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
+    float total_sum = (tid < n_warps) ? reduce_buf[tid] : 0.0f;
+    total_sum = warp_reduce_sum(total_sum, n_warps, tid);
+    if (tid == 0) reduce_buf[0] = total_sum;
+    __syncthreads();
+    float mean = reduce_buf[0] / (float)D;
+
+    float local_var = 0.0f;
+    for (int d = tid; d < D; d += blockDim.x) {
+        float v = buf[d] - mean;
+        local_var += v * v;
+    }
+    local_var = warp_reduce_sum(local_var, WARP_SIZE, lane);
+    if (lane == 0) reduce_buf[warp] = local_var;
+    __syncthreads();
+    float total_var = (tid < n_warps) ? reduce_buf[tid] : 0.0f;
+    total_var = warp_reduce_sum(total_var, n_warps, tid);
+    if (tid == 0) reduce_buf[0] = total_var;
+    __syncthreads();
+    float inv_std = fast_rsqrt_nr(reduce_buf[0] / (float)D + eps);
+
+    for (int d = tid; d < D; d += blockDim.x) {
+        float g = to_float<W>(gain[d]);
+        float b = to_float<W>(bias[d]);
+        float v = (buf[d] - mean) * inv_std;
+        out[row_off + d] = from_float<T>(v * g + b);
+    }
 }
 
-// RoPE: apply rotary position embedding in-place on Q and K within qkv buffer.
-// Interleaved pairs: (q[2i], q[2i+1]) rotated by (cos(theta), sin(theta)).
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-__device__ __forceinline__ void rope_apply(
-    float* __restrict__ qkv,   // [B, S, 3*D]  — Q and K modified in-place, V untouched
-    int d_model,
-    int n_heads,
-    float rope_base = 10000.0f
+// LayerNorm backward
+template <typename T, typename W>
+__global__ void __launch_bounds__(128, 4)
+layernorm_bwd_kernel(
+    const T* __restrict__ x, const T* __restrict__ grad_out,
+    const W* __restrict__ gain,
+    T* __restrict__ grad_in, W* __restrict__ grad_gain, W* __restrict__ grad_bias,
+    int N, int D, float eps
 ) {
-    const int d_head    = d_model / n_heads;
-    const int half_dh   = d_head / 2;
-    const int total     = BATCH * SEQ_LEN;
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const int tid = threadIdx.x;
+    const int row_off = row * D;
+    extern __shared__ float smem[];
+    float* x_hat = smem;
 
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
-         idx < total * n_heads * half_dh;
-         idx += gridDim.x * blockDim.x) {
+    float local_sum = 0.0f;
+    for (int d = tid; d < D; d += blockDim.x)
+        local_sum += to_float<T>(x[row_off + d]);
+    __shared__ float reduce_buf[32];
+    int lane = tid & (WARP_SIZE - 1);
+    int warp = tid / WARP_SIZE;
+    int n_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
+    local_sum = warp_reduce_sum(local_sum, WARP_SIZE, lane);
+    if (lane == 0) reduce_buf[warp] = local_sum;
+    __syncthreads();
+    float total_sum = (tid < n_warps) ? reduce_buf[tid] : 0.0f;
+    total_sum = warp_reduce_sum(total_sum, n_warps, tid);
+    if (tid == 0) reduce_buf[0] = total_sum;
+    __syncthreads();
+    float mean = reduce_buf[0] / (float)D;
 
-        const int tok  = idx / (n_heads * half_dh);
-        const int rem  = idx % (n_heads * half_dh);
-        const int h    = rem / half_dh;
-        const int pair = rem % half_dh;
+    float local_var = 0.0f;
+    for (int d = tid; d < D; d += blockDim.x) {
+        float v = to_float<T>(x[row_off + d]) - mean;
+        local_var += v * v;
+    }
+    local_var = warp_reduce_sum(local_var, WARP_SIZE, lane);
+    if (lane == 0) reduce_buf[warp] = local_var;
+    __syncthreads();
+    float total_var = (tid < n_warps) ? reduce_buf[tid] : 0.0f;
+    total_var = warp_reduce_sum(total_var, n_warps, tid);
+    if (tid == 0) reduce_buf[0] = total_var;
+    __syncthreads();
+    float inv_std = fast_rsqrt_nr(reduce_buf[0] / (float)D + eps);
 
-        const int pos  = tok % SEQ_LEN; // position within sequence
-        const float freq = 1.0f / __powf(rope_base, static_cast<float>(2 * pair) / static_cast<float>(d_head));
-        const float angle = static_cast<float>(pos) * freq;
+    float sum_gy = 0.0f, sum_gy_xhat = 0.0f;
+    for (int d = tid; d < D; d += blockDim.x) {
+        float xv = to_float<T>(x[row_off + d]);
+        float xh = (xv - mean) * inv_std;
+        x_hat[d] = xh;
+        float g = to_float<W>(gain[d]);
+        float gy = to_float<T>(grad_out[row_off + d]) * g;
+        sum_gy += gy;
+        sum_gy_xhat += gy * xh;
+    }
+    sum_gy = warp_reduce_sum(sum_gy, WARP_SIZE, lane);
+    if (lane == 0) reduce_buf[warp] = sum_gy;
+    __syncthreads();
+    float total_gy = (tid < n_warps) ? reduce_buf[tid] : 0.0f;
+    total_gy = warp_reduce_sum(total_gy, n_warps, tid);
+    if (tid == 0) reduce_buf[0] = total_gy;
+    __syncthreads();
+    total_gy = reduce_buf[0];
 
-        float cos_a, sin_a;
-        __sincosf(angle, &sin_a, &cos_a);
+    sum_gy_xhat = warp_reduce_sum(sum_gy_xhat, WARP_SIZE, lane);
+    if (lane == 0) reduce_buf[warp] = sum_gy_xhat;
+    __syncthreads();
+    float total_gy_xhat = (tid < n_warps) ? reduce_buf[tid] : 0.0f;
+    total_gy_xhat = warp_reduce_sum(total_gy_xhat, n_warps, tid);
+    if (tid == 0) reduce_buf[0] = total_gy_xhat;
+    __syncthreads();
+    total_gy_xhat = reduce_buf[0];
 
-        // Apply to Q (offset 0) and K (offset d_model) within the 3D-wide qkv row
-        #pragma unroll
-        for (int qk = 0; qk < 2; ++qk) {
-            const size_t base = static_cast<size_t>(tok) * 3 * d_model
-                              + static_cast<size_t>(qk) * d_model
-                              + static_cast<size_t>(h) * d_head
-                              + 2 * pair;
+    float invD = 1.0f / (float)D;
+    for (int d = tid; d < D; d += blockDim.x) {
+        float g = to_float<W>(gain[d]);
+        float gy = to_float<T>(grad_out[row_off + d]) * g;
+        float xh = x_hat[d];
+        float dx = inv_std * (gy - invD * total_gy - xh * invD * total_gy_xhat);
+        grad_in[row_off + d] = from_float<T>(dx);
+        float go = to_float<T>(grad_out[row_off + d]);
+        atomic_add_w(&grad_gain[d], go * xh);
+        atomic_add_w(&grad_bias[d], go);
+    }
+}
 
-            float v0 = qkv[base];
-            float v1 = qkv[base + 1];
-            qkv[base]     = v0 * cos_a - v1 * sin_a;
-            qkv[base + 1] = v0 * sin_a + v1 * cos_a;
+// ─── GELU (tanh approximation) ───────────────────────────────────────
+__device__ __forceinline__ float gelu_tanh(float x) {
+    const float k0 = 0.7978845608028654f;
+    const float k1 = 0.044715f;
+    float t = k0 * (x + k1 * x * x * x);
+    return 0.5f * x * (1.0f + ptx_tanhf(t));
+}
+__device__ __forceinline__ float gelu_tanh_grad(float x) {
+    const float k0 = 0.7978845608028654f;
+    const float k1 = 0.044715f;
+    float x2 = x * x;
+    float t = k0 * (x + k1 * x * x2);
+    float th = ptx_tanhf(t);
+    float sech2 = 1.0f - th * th;
+    float dt = k0 * (1.0f + 3.0f * k1 * x2);
+    return 0.5f * (1.0f + th) + 0.5f * x * sech2 * dt;
+}
+
+template <typename T>
+__global__ void __launch_bounds__(256, 4)
+gelu_fwd_kernel(const T* __restrict__ pre, T* __restrict__ post, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    post[i] = from_float<T>(gelu_tanh(to_float<T>(pre[i])));
+}
+template <typename T>
+__global__ void __launch_bounds__(256, 4)
+gelu_bwd_kernel(const T* __restrict__ pre, const T* __restrict__ grad_post,
+                T* __restrict__ grad_pre, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float gp = to_float<T>(grad_post[i]);
+    float dx = gp * gelu_tanh_grad(to_float<T>(pre[i]));
+    grad_pre[i] = from_float<T>(dx);
+}
+
+// ─── Bias add + bias bwd ─────────────────────────────────────────────
+template <typename T, typename W>
+__global__ void __launch_bounds__(256, 4)
+bias_add_kernel(T* __restrict__ x, const W* __restrict__ bias, int M, int N) {
+    int row = blockIdx.x;
+    if (row >= M) return;
+    int tid = threadIdx.x;
+    for (int n = tid; n < N; n += blockDim.x)
+        x[(size_t)row * N + n] = from_float<T>(
+            to_float<T>(x[(size_t)row * N + n]) + to_float<W>(bias[n]));
+}
+template <typename T, typename W>
+__global__ void __launch_bounds__(256, 4)
+bias_bwd_kernel(const T* __restrict__ grad_out, W* __restrict__ grad_bias,
+                int M, int N) {
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    float acc = 0.0f;
+    for (int m = 0; m < M; m++) acc += to_float<T>(grad_out[(size_t)m * N + n]);
+    atomic_add_w(&grad_bias[n], acc);
+}
+
+// Elementwise add: dst += src
+template <typename T>
+__global__ void __launch_bounds__(256, 4)
+add_inplace_kernel(T* __restrict__ dst, const T* __restrict__ src, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = from_float<T>(to_float<T>(dst[i]) + to_float<T>(src[i]));
+}
+
+// ─── QKV split: [B, S, 3, H, d] -> q/k/v in [B, H, S, d] ─────────────
+template <typename T>
+__global__ void __launch_bounds__(128, 4)
+qkv_split_kernel(
+    const T* __restrict__ qkv,
+    T* __restrict__ q, T* __restrict__ k, T* __restrict__ v,
+    int B, int S, int H, int d
+) {
+    int bs = blockIdx.x;
+    if (bs >= B * S) return;
+    int b = bs / S, s = bs % S;
+    int tid = threadIdx.x;
+    int total = 3 * H * d;
+    for (int idx = tid; idx < total; idx += blockDim.x) {
+        int qkv_idx = idx / (H * d);
+        int rem = idx % (H * d);
+        int h = rem / d, dd = rem % d;
+        T val = qkv[((size_t)bs * 3 + qkv_idx) * H * d + h * d + dd];
+        size_t out_off = ((size_t)b * H + h) * S * d + (size_t)s * d + dd;
+        if (qkv_idx == 0) q[out_off] = val;
+        else if (qkv_idx == 1) k[out_off] = val;
+        else v[out_off] = val;
+    }
+}
+
+template <typename T>
+__global__ void __launch_bounds__(128, 4)
+qkv_merge_kernel(
+    const T* __restrict__ q, const T* __restrict__ k, const T* __restrict__ v,
+    T* __restrict__ qkv,
+    int B, int S, int H, int d
+) {
+    int bs = blockIdx.x;
+    if (bs >= B * S) return;
+    int b = bs / S, s = bs % S;
+    int tid = threadIdx.x;
+    int total = 3 * H * d;
+    for (int idx = tid; idx < total; idx += blockDim.x) {
+        int qkv_idx = idx / (H * d);
+        int rem = idx % (H * d);
+        int h = rem / d, dd = rem % d;
+        size_t in_off = ((size_t)b * H + h) * S * d + (size_t)s * d + dd;
+        T val = (qkv_idx == 0) ? q[in_off]
+              : (qkv_idx == 1) ? k[in_off]
+                                : v[in_off];
+        qkv[((size_t)bs * 3 + qkv_idx) * H * d + h * d + dd] = val;
+    }
+}
+
+// [B, H, S, d] -> [B, S, H*d]
+template <typename T>
+__global__ void __launch_bounds__(128, 4)
+attn_out_reshape_kernel(const T* __restrict__ in, T* __restrict__ out,
+                        int B, int S, int H, int d) {
+    int bs = blockIdx.x;
+    if (bs >= B * S) return;
+    int b = bs / S, s = bs % S;
+    int tid = threadIdx.x;
+    int D = H * d;
+    for (int dd = tid; dd < D; dd += blockDim.x) {
+        int h = dd / d, ddi = dd % d;
+        size_t in_off = ((size_t)b * H + h) * S * d + (size_t)s * d + ddi;
+        out[(size_t)bs * D + dd] = in[in_off];
+    }
+}
+template <typename T>
+__global__ void __launch_bounds__(128, 4)
+attn_out_inverse_reshape_kernel(const T* __restrict__ in, T* __restrict__ out,
+                                int B, int S, int H, int d) {
+    int bs = blockIdx.x;
+    if (bs >= B * S) return;
+    int b = bs / S, s = bs % S;
+    int tid = threadIdx.x;
+    int D = H * d;
+    for (int dd = tid; dd < D; dd += blockDim.x) {
+        int h = dd / d, ddi = dd % d;
+        size_t out_off = ((size_t)b * H + h) * S * d + (size_t)s * d + ddi;
+        out[out_off] = in[(size_t)bs * D + dd];
+    }
+}
+
+// ─── Last-token extract / scatter ────────────────────────────────────
+template <typename T>
+__global__ void __launch_bounds__(128, 4)
+last_token_kernel(const T* __restrict__ full, T* __restrict__ out,
+                  int B, int S, int V) {
+    int b = blockIdx.x;
+    if (b >= B) return;
+    int tid = threadIdx.x;
+    for (int v = tid; v < V; v += blockDim.x)
+        out[(size_t)b * V + v] = full[((size_t)b * S + (S - 1)) * V + v];
+}
+template <typename T>
+__global__ void __launch_bounds__(128, 4)
+last_token_scatter_kernel(const T* __restrict__ grad_last, T* __restrict__ grad_full,
+                          int B, int S, int V) {
+    int bs = blockIdx.x;
+    if (bs >= B * S) return;
+    int b = bs / S, s = bs % S;
+    int tid = threadIdx.x;
+    bool is_last = (s == S - 1);
+    for (int v = tid; v < V; v += blockDim.x) {
+        T val = is_last ? grad_last[(size_t)b * V + v] : from_float<T>(0.0f);
+        grad_full[(size_t)bs * V + v] = val;
+    }
+}
+
+// ─── cuBLAS GEMM (row-major wrapper) ─────────────────────────────────
+// Computes row-major: C[M,N] = alpha * op(A) * op(B) + beta * C.
+// Implemented by computing C^T in column-major:
+//   cublas: opB',opA' on (N, M, K) with B as first matrix, A as second.
+template <typename T>
+inline cublasStatus_t cublas_gemm_rm(
+    cublasHandle_t handle,
+    cublasOperation_t opA, cublasOperation_t opB,
+    int M, int N, int K,
+    float alpha, float beta,
+    const T* A, int lda,
+    const T* B, int ldb,
+    T* C, int ldc,
+    cudaStream_t stream
+) {
+    cublasSetStream(handle, stream);
+    return cublasGemmEx(handle,
+        opB, opA,
+        N, M, K,
+        &alpha,
+        B, CublasTraits<T>::data_type, ldb,
+        A, CublasTraits<T>::data_type, lda,
+        &beta,
+        C, CublasTraits<T>::data_type, ldc,
+        CublasTraits<T>::compute_type,
+        CUBLAS_GEMM_DEFAULT);
+}
+
+// ─── Forward orchestration ───────────────────────────────────────────
+template <typename ActT, typename WeightT>
+cudaError_t forward(
+    const ActT* input,
+    const WeightT* weights,
+    ActT* output,
+    ActT* activations,
+    int batch, int seq_len, int d_model, int n_heads, int d_head,
+    int n_layers, int vocab_size, int ffn_expansion,
+    cudaStream_t stream
+) {
+    const int B = batch, S = seq_len, D = d_model, H = n_heads, V = vocab_size;
+    const int FH = ffn_expansion * D;
+    const float scale = 1.0f / sqrtf((float)d_head);
+    const float eps = 1e-5f;
+    const size_t per_layer_w = per_layer_weight_count(D, FH);
+    auto L = compute_layout<ActT>(B, S, D, H, V, ffn_expansion);
+
+    const WeightT* wp = weights;
+    const WeightT* tok_embed = wp; wp += (size_t)V * D;
+    const WeightT* pos_embed = wp; wp += (size_t)S * D;
+    const WeightT* layers_w = wp; wp += (size_t)n_layers * per_layer_w;
+    const WeightT* final_g = wp; wp += D;
+    const WeightT* final_b = wp; wp += D;
+    const WeightT* vocab_W = wp; wp += (size_t)V * D;
+    const WeightT* vocab_b = wp; wp += V;
+
+    cublasHandle_t cublas;
+    cublasCreate(&cublas);
+    cublasSetStream(cublas, stream);
+
+    // Stash input ids for backward
+    ActT* input_ids_saved = activations;
+    cudaMemcpyAsync(input_ids_saved, input, (size_t)B*S*sizeof(ActT),
+                    cudaMemcpyDeviceToDevice, stream);
+
+    // Embedding lookup
+    ActT* embed_out = activations + L.input_ids_saved;
+    embedding_kernel<ActT, WeightT><<<B*S, 128, 0, stream>>>(
+        input, tok_embed, pos_embed, embed_out, B, S, D, V);
+
+    ActT* layer_input = embed_out;
+
+    // Layer stack
+    for (int li = 0; li < n_layers; li++) {
+        auto sl = slice_layer<ActT>(activations, L, li);
+        auto lw = slice_layer_weights<WeightT>(layers_w + (size_t)li * per_layer_w, D, FH);
+
+        // Save input to QKV (== prev layer output)
+        cudaMemcpyAsync(sl.qkv_in, layer_input, (size_t)B*S*D*sizeof(ActT),
+                        cudaMemcpyDeviceToDevice, stream);
+
+        // QKV projection: [B*S, D] * [D, 3D]^T -> [B*S, 3D]
+        cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+            B*S, 3*D, D, 1.0f, 0.0f,
+            (const WeightT*)sl.qkv_in, D, lw.qkv_W, D,
+            (WeightT*)sl.qkv_out, 3*D, stream);
+        bias_add_kernel<ActT, WeightT><<<B*S, 256, 0, stream>>>(
+            sl.qkv_out, lw.qkv_b, B*S, 3*D);
+
+        // Split into Q/K/V in [B, H, S, d_h] layout (3 contiguous slabs)
+        ActT* q_buf = sl.attn_in_qkv;
+        ActT* k_buf = sl.attn_in_qkv + (size_t)B*S*D;
+        ActT* v_buf = sl.attn_in_qkv + (size_t)2*B*S*D;
+        qkv_split_kernel<ActT><<<B*S, 128, 0, stream>>>(
+            sl.qkv_out, q_buf, k_buf, v_buf, B, S, H, d_head);
+
+        // Attention forward
+        attention::attention_forward<ActT, 32, /*kCausal=*/true>(
+            q_buf, k_buf, v_buf,
+            sl.attn_out_perhead, sl.softmax_lse,
+            B, H, S, scale, stream);
+
+        // Reshape attention output [B, H, S, d] -> [B, S, D]
+        attn_out_reshape_kernel<ActT><<<B*S, 128, 0, stream>>>(
+            sl.attn_out_perhead, sl.attn_out, B, S, H, d_head);
+
+        // Output projection
+        cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+            B*S, D, D, 1.0f, 0.0f,
+            (const WeightT*)sl.attn_out, D, lw.out_W, D,
+            (WeightT*)sl.attn_proj, D, stream);
+        bias_add_kernel<ActT, WeightT><<<B*S, 128, 0, stream>>>(
+            sl.attn_proj, lw.out_b, B*S, D);
+
+        // n1: x = LN(qkv_in + attn_proj) [post-norm]
+        residual_layernorm_kernel<ActT, WeightT>
+            <<<B*S, 128, D*sizeof(float), stream>>>(
+                sl.qkv_in, sl.attn_proj, lw.n1_g, lw.n1_b,
+                sl.n1_in, sl.layer1_out, B*S, D, eps);
+
+        // FFN up
+        cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+            B*S, FH, D, 1.0f, 0.0f,
+            (const WeightT*)sl.layer1_out, D, lw.ff1_W, D,
+            (WeightT*)sl.ffn_pre, FH, stream);
+        bias_add_kernel<ActT, WeightT><<<B*S, 256, 0, stream>>>(
+            sl.ffn_pre, lw.ff1_b, B*S, FH);
+
+        // GELU
+        {
+            size_t n = (size_t)B*S*FH;
+            int block = 256, grid = (int)((n + block - 1) / block);
+            gelu_fwd_kernel<ActT><<<grid, block, 0, stream>>>(
+                sl.ffn_pre, sl.ffn_post, n);
         }
+
+        // FFN down
+        cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+            B*S, D, FH, 1.0f, 0.0f,
+            (const WeightT*)sl.ffn_post, FH, lw.ff2_W, FH,
+            (WeightT*)sl.ffn_out, D, stream);
+        bias_add_kernel<ActT, WeightT><<<B*S, 128, 0, stream>>>(
+            sl.ffn_out, lw.ff2_b, B*S, D);
+
+        // n2: layer_out = LN(layer1_out + ffn_out) [post-norm]
+        residual_layernorm_kernel<ActT, WeightT>
+            <<<B*S, 128, D*sizeof(float), stream>>>(
+                sl.layer1_out, sl.ffn_out, lw.n2_g, lw.n2_b,
+                sl.n2_in, sl.layer_out, B*S, D, eps);
+
+        layer_input = sl.layer_out;
     }
+
+    // Final LayerNorm
+    ActT* final_norm_out = activations + L.input_ids_saved + L.embed_out + (size_t)n_layers * L.per_layer_total;
+    layernorm_kernel<ActT, WeightT>
+        <<<B*S, 128, D*sizeof(float), stream>>>(
+            layer_input, final_g, final_b, final_norm_out, B*S, D, eps);
+
+    // Vocab head (full): logits[B*S, V] = norm * vocab_W^T + b
+    ActT* logits_full = final_norm_out + L.final_norm_out;
+    cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+        B*S, V, D, 1.0f, 0.0f,
+        (const WeightT*)final_norm_out, D, vocab_W, D,
+        (WeightT*)logits_full, V, stream);
+    bias_add_kernel<ActT, WeightT><<<B*S, 128, 0, stream>>>(
+        logits_full, vocab_b, B*S, V);
+
+    // Last-token output [B, V]
+    last_token_kernel<ActT><<<B, 128, 0, stream>>>(
+        logits_full, output, B, S, V);
+
+    cublasDestroy(cublas);
+    return cudaGetLastError();
 }
 
-// FlashAttention-3 style causal attention.
-// Design: wgmma-based MMA, online softmax with running max, async TMA copies.
-// Q,K,V are sliced from the qkv buffer. Output goes to attn_out.
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-__device__ __launch_bounds__(256, 2) __forceinline__ void attention_forward(
-    const float* __restrict__ qkv,       // [B, S, 3*D] — Q, K, V packed
-    float*       __restrict__ attn_out,  // [B, S, D]
-    float*       __restrict__ lse_buf,   // [B, H, S] — log-sum-exp for backward
-    int d_model,
-    int n_heads
+// ─── Backward orchestration ──────────────────────────────────────────
+//
+// Implementation strategy: every weight-grad GEMM is computed BEFORE the
+// activation that it consumes is overwritten. Where we need to overwrite
+// a saved activation (to run a backward GEMM into it), we issue the
+// weight-grad GEMM first.
+//
+// We use the activation buffer as scratch by reusing slots that are no
+// longer needed. Specifically:
+//   * grad_layer_out (input grad of n2): held in workspace W1
+//   * grad_ffn_out  (= grad_n2_in): held in W1 (it's the output of LN bwd)
+//   * grad_ffn_post: held in W2 (activation grad of GEMM2)
+//   * grad_ffn_pre:  W2 (after GELU bwd)
+//   * grad_layer1_out (residual + GEMM1.A grad): W1 (after add)
+//   * grad_n1_in:    W1 (output of LN bwd)
+//   * grad_attn_proj: W1
+//   * grad_attn_out: W2
+//   * grad_attn_perhead: W3 (we need a third buffer for QKV layout)
+//   * grad_q/grad_k/grad_v: W1, W2, W3 (overwriting attn_in_qkv slabs)
+//   * grad_qkv_out: W4 (or reuse qkv_out — we overwrite it last)
+//   * grad_qkv_in: W1 (final output for layer)
+//
+// We allocate W1/W2/W3 by overwriting saved layer activations in the
+// reverse order they're consumed. The key invariants:
+//   - sl.qkv_in must be preserved until grad_qkv_W is computed.
+//   - sl.layer1_out must be preserved until grad_ff1_W is computed.
+//   - sl.ffn_post must be preserved until grad_ff2_W is computed.
+//   - sl.attn_out must be preserved until grad_out_W is computed.
+//   - sl.attn_in_qkv (q,k,v) must be preserved until attention_backward.
+//   - sl.qkv_out is no longer needed once Q,K,V are split (we rebuild for
+//     forward consistency, but for backward we overwrite as grad_qkv_out).
+//
+template <typename ActT, typename WeightT>
+cudaError_t backward(
+    const ActT* grad_output,
+    const ActT* activations_saved,
+    const WeightT* weights,
+    ActT* grad_input,
+    WeightT* grad_weights,
+    int batch, int seq_len, int d_model, int n_heads, int d_head,
+    int n_layers, int vocab_size, int ffn_expansion,
+    cudaStream_t stream
 ) {
-    // FA3 implementation outline:
-    // 1. Tile Q in registers (m64 tile), K/V loaded via TMA into shared memory.
-    // 2. Compute S = Q @ K^T / sqrt(d_head) via wgmma m64n128k16.
-    // 3. Apply causal mask: S[i,j] = -inf where j > i.
-    // 4. Online softmax: track running max and sum per row.
-    // 5. Accumulate O = softmax(S) @ V via wgmma.
-    // 6. Rescale O by final softmax normalizer.
-    // 7. Store log-sum-exp for backward pass.
-    //
-    // Actual inner loops dispatched via CUTLASS 3.x wgmma codegen.
+    const int B = batch, S = seq_len, D = d_model, H = n_heads, V = vocab_size;
+    const int FH = ffn_expansion * D;
+    const float scale = 1.0f / sqrtf((float)d_head);
+    const float eps = 1e-5f;
+    const size_t per_layer_w = per_layer_weight_count(D, FH);
+    auto L = compute_layout<ActT>(B, S, D, H, V, ffn_expansion);
 
-    const int d_head     = d_model / n_heads;
-    const float scale    = rsqrtf(static_cast<float>(d_head));
-    const int total_toks = BATCH * SEQ_LEN;
+    const WeightT* wp = weights;
+    const WeightT* tok_embed = wp; wp += (size_t)V * D;
+    const WeightT* pos_embed = wp; wp += (size_t)S * D;
+    const WeightT* layers_w = wp; wp += (size_t)n_layers * per_layer_w;
+    const WeightT* final_g = wp; wp += D;
+    /* final_b */ wp += D;
+    const WeightT* vocab_W = wp; wp += (size_t)V * D;
+    /* vocab_b */ wp += V;
+    (void)tok_embed; (void)pos_embed;
 
-    // Per-head, per-batch-element processing
-    const int head_batch_idx = blockIdx.x;
-    if (head_batch_idx >= BATCH * n_heads) return;
+    WeightT* gwp = grad_weights;
+    WeightT* g_tok_embed = gwp; gwp += (size_t)V * D;
+    WeightT* g_pos_embed = gwp; gwp += (size_t)S * D;
+    WeightT* g_layers = gwp; gwp += (size_t)n_layers * per_layer_w;
+    WeightT* g_final_g = gwp; gwp += D;
+    WeightT* g_final_b = gwp; gwp += D;
+    WeightT* g_vocab_W = gwp; gwp += (size_t)V * D;
+    WeightT* g_vocab_b = gwp; gwp += V;
 
-    const int b = head_batch_idx / n_heads;
-    const int h = head_batch_idx % n_heads;
+    cublasHandle_t cublas;
+    cublasCreate(&cublas);
+    cublasSetStream(cublas, stream);
 
-    // Pointers into qkv for this head
-    const float* Q = qkv + static_cast<size_t>(b) * SEQ_LEN * 3 * d_model
-                         + static_cast<size_t>(h) * d_head;
-    const float* K = Q + d_model;     // K starts at offset D within the 3D slice
-    const float* V = Q + 2 * d_model; // V starts at offset 2D
+    ActT* act_base = const_cast<ActT*>(activations_saved);
+    const ActT* input_ids_saved = act_base;
+    ActT* final_norm_out = act_base + L.input_ids_saved + L.embed_out + (size_t)n_layers * L.per_layer_total;
+    ActT* logits_full = final_norm_out + L.final_norm_out;
 
-    float* O = attn_out + static_cast<size_t>(b) * SEQ_LEN * d_model
-                        + static_cast<size_t>(h) * d_head;
+    // 1. Scatter grad_output into grad_logits_full (overwrites logits_full)
+    last_token_scatter_kernel<ActT><<<B*S, 128, 0, stream>>>(
+        grad_output, logits_full, B, S, V);
 
-    // Online softmax with running max — each thread group handles a tile of rows
-    // Placeholder: dispatches to wgmma via CUTLASS 3.x for S=Q@K^T and O=P@V
-    (void)Q; (void)K; (void)V; (void)O; (void)scale;
-    (void)lse_buf; (void)total_toks;
-}
+    // 2. Vocab head bwd. Compute weight grad FIRST (needs saved final_norm_out).
+    // grad_vocab_W [V, D] += grad_logits^T [V, B*S] * final_norm_out [B*S, D]
+    cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+        V, D, B*S, 1.0f, 1.0f,
+        (const WeightT*)logits_full, V,
+        (const WeightT*)final_norm_out, D,
+        g_vocab_W, D, stream);
+    // grad_vocab_b
+    bias_bwd_kernel<ActT, WeightT><<<(V+255)/256, 256, 0, stream>>>(
+        logits_full, g_vocab_b, B*S, V);
+    // grad_norm_out (= grad of input to vocab head) = grad_logits * vocab_W
+    // Overwrite final_norm_out — no longer needed.
+    cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+        B*S, D, V, 1.0f, 0.0f,
+        (const WeightT*)logits_full, V, vocab_W, D,
+        (WeightT*)final_norm_out, D, stream);
 
-// Output projection: attn_out[B,S,D] @ W_o[D, D]^T → out[B,S,D]
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-__device__ __forceinline__ void o_proj_forward(
-    const float*  __restrict__ attn_out, // [B, S, D]
-    const ParamT* __restrict__ w_o,      // [D, D]
-    float*        __restrict__ out,      // [B, S, D]
-    int d_model
-) {
-    detail::wgmma_matmul<ParamT>(
-        reinterpret_cast<const ParamT*>(nullptr), BATCH * SEQ_LEN, d_model,
-        w_o, d_model, d_model,
-        out
-    );
-    (void)attn_out;
-}
+    // 3. Final LayerNorm bwd. Input was last layer's layer_out.
+    auto sl_last = slice_layer<ActT>(act_base, L, n_layers - 1);
+    ActT* grad_stack_out = logits_full;  // reuse — sized [B*S*V] which is >> [B*S*D]
+    layernorm_bwd_kernel<ActT, WeightT>
+        <<<B*S, 128, D*sizeof(float), stream>>>(
+            sl_last.layer_out, final_norm_out, final_g,
+            grad_stack_out, g_final_g, g_final_b, B*S, D, eps);
 
-// Elementwise residual addition: out = x + residual
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-__device__ __forceinline__ void residual_add(
-    const float* __restrict__ x,        // [B, S, D]
-    const float* __restrict__ residual, // [B, S, D]
-    float*       __restrict__ out,      // [B, S, D]
-    int d_model
-) {
-    const int n = BATCH * SEQ_LEN * d_model;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        float v = x[i] + residual[i];
-        if constexpr (NAN_POLICY == NanPolicy::kZero) {
-            v = __isnanf(v) ? 0.0f : v;
+    ActT* grad_y = grad_stack_out;  // grad w.r.t. last layer's output
+
+    // 4. Per-layer backward (reverse order)
+    for (int li = n_layers - 1; li >= 0; li--) {
+        auto sl = slice_layer<ActT>(act_base, L, li);
+        auto lw = slice_layer_weights<WeightT>(layers_w + (size_t)li * per_layer_w, D, FH);
+        auto gw = slice_layer_grads<WeightT>(g_layers + (size_t)li * per_layer_w, D, FH);
+
+        // ── n2 backward
+        // input was n2_in = layer1_out + ffn_out. Grad branches both.
+        // Write grad_n2_in into ffn_out (no longer needed).
+        layernorm_bwd_kernel<ActT, WeightT>
+            <<<B*S, 128, D*sizeof(float), stream>>>(
+                sl.n2_in, grad_y, lw.n2_g,
+                sl.ffn_out, gw.n2_g, gw.n2_b, B*S, D, eps);
+        ActT* grad_n2_in = sl.ffn_out;     // alias (grad for both branches)
+
+        // ── FFN-down bwd: y = ffn_post * ff2_W^T + ff2_b
+        // First: weight grad uses saved ffn_post.
+        // grad_ff2_W [D, FH] += grad_y^T * ffn_post
+        cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+            D, FH, B*S, 1.0f, 1.0f,
+            (const WeightT*)grad_n2_in, D,
+            (const WeightT*)sl.ffn_post, FH,
+            gw.ff2_W, FH, stream);
+        bias_bwd_kernel<ActT, WeightT><<<(D+255)/256, 256, 0, stream>>>(
+            grad_n2_in, gw.ff2_b, B*S, D);
+        // Then: activation grad. Overwrite ffn_post (no longer needed).
+        // grad_ffn_post = grad_n2_in * ff2_W
+        cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+            B*S, FH, D, 1.0f, 0.0f,
+            (const WeightT*)grad_n2_in, D, lw.ff2_W, FH,
+            (WeightT*)sl.ffn_post, FH, stream);
+        ActT* grad_ffn_post = sl.ffn_post;
+
+        // ── GELU bwd: in-place into ffn_pre (no longer needed after this)
+        {
+            size_t n = (size_t)B*S*FH;
+            int block = 256, grid = (int)((n + block - 1) / block);
+            gelu_bwd_kernel<ActT><<<grid, block, 0, stream>>>(
+                sl.ffn_pre, grad_ffn_post, sl.ffn_pre, n);
         }
-        out[i] = v;
-    }
-}
+        ActT* grad_ffn_pre = sl.ffn_pre;
 
-// Fused gate+up MLP projection with SiLU activation:
-//   gate = x @ W_gate^T,  up = x @ W_up^T,  out = silu(gate) * up
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-__device__ __forceinline__ void mlp_gate_up_forward(
-    const float*  __restrict__ x,           // [B, S, D]
-    const ParamT* __restrict__ w_gate,      // [4D, D]
-    const ParamT* __restrict__ w_up,        // [4D, D]
-    float*        __restrict__ gate_pre,    // [B, S, 4D] — saved pre-activation for backward
-    float*        __restrict__ up_buf,      // [B, S, 4D] — saved for backward
-    float*        __restrict__ out,         // [B, S, 4D]
-    int d_model
-) {
-    const int ffn_hidden = 4 * d_model;
-    const int M = BATCH * SEQ_LEN;
+        // ── FFN-up bwd: y = layer1_out * ff1_W^T + ff1_b
+        // Weight grad uses saved layer1_out.
+        cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+            FH, D, B*S, 1.0f, 1.0f,
+            (const WeightT*)grad_ffn_pre, FH,
+            (const WeightT*)sl.layer1_out, D,
+            gw.ff1_W, D, stream);
+        bias_bwd_kernel<ActT, WeightT><<<(FH+255)/256, 256, 0, stream>>>(
+            grad_ffn_pre, gw.ff1_b, B*S, FH);
+        // Activation grad: grad_layer1_ff = grad_ffn_pre * ff1_W
+        // Overwrite layer1_out (no longer needed after weight grad).
+        cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+            B*S, D, FH, 1.0f, 0.0f,
+            (const WeightT*)grad_ffn_pre, FH, lw.ff1_W, D,
+            (WeightT*)sl.layer1_out, D, stream);
+        ActT* grad_layer1_ff = sl.layer1_out;
 
-    // gate = x @ W_gate^T
-    detail::wgmma_matmul<ParamT>(
-        reinterpret_cast<const ParamT*>(nullptr), M, d_model,
-        w_gate, d_model, ffn_hidden,
-        gate_pre
-    );
-    // up = x @ W_up^T
-    detail::wgmma_matmul<ParamT>(
-        reinterpret_cast<const ParamT*>(nullptr), M, d_model,
-        w_up, d_model, ffn_hidden,
-        up_buf
-    );
-
-    // Fused SiLU(gate) * up
-    const int n = M * ffn_hidden;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        float g = gate_pre[i];
-        float u = up_buf[i];
-        out[i] = detail::silu(g) * u;
-    }
-    (void)x;
-}
-
-// Down projection: mlp_act[B,S,4D] @ W_down[D, 4D]^T → out[B,S,D]
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-__device__ __forceinline__ void mlp_down_forward(
-    const float*  __restrict__ mlp_act, // [B, S, 4D]
-    const ParamT* __restrict__ w_down,  // [D, 4D]
-    float*        __restrict__ out,     // [B, S, D]
-    int d_model
-) {
-    const int ffn_hidden = 4 * d_model;
-    detail::wgmma_matmul<ParamT>(
-        reinterpret_cast<const ParamT*>(nullptr), BATCH * SEQ_LEN, ffn_hidden,
-        w_down, ffn_hidden, d_model,
-        out
-    );
-    (void)mlp_act;
-}
-
-// Final output head: x[B,S,D] @ W[VOCAB,D]^T + b → logits[B,S,VOCAB]
-// When TIED_EMBEDDINGS, W = tok_embed.
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-__device__ __forceinline__ void lm_head_forward(
-    const float*  __restrict__ x,      // [B, S, D]
-    const ParamT* __restrict__ weight, // [VOCAB, D] (tok_embed when tied)
-    const ParamT* __restrict__ bias,   // [VOCAB] (may be nullptr)
-    float*        __restrict__ logits, // [B, S, VOCAB]
-    int d_model
-) {
-    // Matmul: [B*S, D] @ [VOCAB, D]^T → [B*S, VOCAB]
-    detail::wgmma_matmul<ParamT>(
-        reinterpret_cast<const ParamT*>(nullptr), BATCH * SEQ_LEN, d_model,
-        weight, d_model, VOCAB,
-        logits
-    );
-
-    // Add bias if present
-    if (bias != nullptr) {
-        const int n = BATCH * SEQ_LEN * VOCAB;
-        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-            const int v = i % VOCAB;
-            logits[i] += to_float<ParamT>(__ldg(&bias[v]));
+        // grad_layer1_out total = grad_n2_in (residual branch) + grad_layer1_ff
+        {
+            size_t n = (size_t)B*S*D;
+            int block = 256, grid = (int)((n + block - 1) / block);
+            add_inplace_kernel<ActT><<<grid, block, 0, stream>>>(
+                grad_layer1_ff, grad_n2_in, n);
         }
-    }
-    (void)x;
-}
+        ActT* grad_layer1_out = grad_layer1_ff;
 
-// ---------------------------------------------------------------------------
-// Backward pass — per-layer device functions
-// ---------------------------------------------------------------------------
+        // ── n1 bwd. Input was n1_in = qkv_in + attn_proj. Grad branches both.
+        // Write grad_n1_in into attn_proj (no longer needed).
+        layernorm_bwd_kernel<ActT, WeightT>
+            <<<B*S, 128, D*sizeof(float), stream>>>(
+                sl.n1_in, grad_layer1_out, lw.n1_g,
+                sl.attn_proj, gw.n1_g, gw.n1_b, B*S, D, eps);
+        ActT* grad_n1_in = sl.attn_proj;
 
-// LM head backward: dL/dx = dL/dlogits @ W,  dL/dW = dL/dlogits^T @ x
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-__device__ __forceinline__ void lm_head_backward(
-    const float*  __restrict__ d_logits,  // [B, S, VOCAB]
-    const float*  __restrict__ x,         // [B, S, D] — saved from forward
-    const ParamT* __restrict__ weight,    // [VOCAB, D]
-    float*        __restrict__ d_x,       // [B, S, D]
-    ParamT*       __restrict__ d_weight,  // [VOCAB, D]
-    ParamT*       __restrict__ d_bias,    // [VOCAB]
-    int d_model
-) {
-    // d_x = d_logits @ weight — dispatches to wgmma
-    detail::wgmma_matmul<ParamT>(
-        reinterpret_cast<const ParamT*>(nullptr), BATCH * SEQ_LEN, VOCAB,
-        weight, VOCAB, d_model,  // effectively weight^T
-        d_x
-    );
-    // d_weight, d_bias accumulated by the dispatch generator's reduction epilogue
-    (void)d_logits; (void)x; (void)d_weight; (void)d_bias;
-}
+        // ── out projection bwd: y = attn_out * out_W^T + out_b
+        // Weight grad uses saved attn_out.
+        cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+            D, D, B*S, 1.0f, 1.0f,
+            (const WeightT*)grad_n1_in, D,
+            (const WeightT*)sl.attn_out, D,
+            gw.out_W, D, stream);
+        bias_bwd_kernel<ActT, WeightT><<<(D+255)/256, 256, 0, stream>>>(
+            grad_n1_in, gw.out_b, B*S, D);
+        // Activation grad. Overwrite attn_out.
+        cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+            B*S, D, D, 1.0f, 0.0f,
+            (const WeightT*)grad_n1_in, D, lw.out_W, D,
+            (WeightT*)sl.attn_out, D, stream);
+        ActT* grad_attn_out = sl.attn_out;
 
-// MLP down projection backward
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-__device__ __forceinline__ void mlp_down_backward(
-    const float*  __restrict__ d_out,    // [B, S, D]
-    const float*  __restrict__ mlp_act,  // [B, S, 4D] — saved from forward
-    const ParamT* __restrict__ w_down,   // [D, 4D]
-    float*        __restrict__ d_act,    // [B, S, 4D]
-    ParamT*       __restrict__ d_w_down, // [D, 4D]
-    int d_model
-) {
-    const int ffn_hidden = 4 * d_model;
-    // d_act = d_out @ w_down (un-transposed) — dispatches to wgmma
-    detail::wgmma_matmul<ParamT>(
-        reinterpret_cast<const ParamT*>(nullptr), BATCH * SEQ_LEN, d_model,
-        w_down, d_model, ffn_hidden,
-        d_act
-    );
-    (void)d_out; (void)mlp_act; (void)d_w_down;
-}
+        // Reshape [B, S, D] -> [B, H, S, d] for attention_backward
+        attn_out_inverse_reshape_kernel<ActT><<<B*S, 128, 0, stream>>>(
+            grad_attn_out, sl.attn_out_perhead, B, S, H, d_head);
+        // After this, attn_out_perhead holds grad in [B,H,S,d] layout.
 
-// Fused gate+up backward: propagate through silu(gate)*up
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-__device__ __forceinline__ void mlp_gate_up_backward(
-    const float*  __restrict__ d_fused,    // [B, S, 4D] — gradient from mlp_down_backward
-    const float*  __restrict__ gate_pre,   // [B, S, 4D] — saved pre-activation
-    const float*  __restrict__ up_buf,     // [B, S, 4D] — saved from forward
-    const float*  __restrict__ x,          // [B, S, D]  — input saved from forward
-    const ParamT* __restrict__ w_gate,     // [4D, D]
-    const ParamT* __restrict__ w_up,       // [4D, D]
-    float*        __restrict__ d_x,        // [B, S, D]
-    ParamT*       __restrict__ d_w_gate,   // [4D, D]
-    ParamT*       __restrict__ d_w_up,     // [4D, D]
-    int d_model
-) {
-    const int ffn_hidden = 4 * d_model;
-    const int n = BATCH * SEQ_LEN * ffn_hidden;
+        // ── Attention bwd
+        // q/k/v are stored in attn_in_qkv slabs. We allocate separate
+        // grad buffers (NOT aliased with q/k/v — the bwd kernel reads
+        // v multiple times).
+        ActT* q_buf = sl.attn_in_qkv;
+        ActT* k_buf = sl.attn_in_qkv + (size_t)B*S*D;
+        ActT* v_buf = sl.attn_in_qkv + (size_t)2*B*S*D;
+        // grad_q/k/v borrow ffn_pre/ffn_post (each [B,S,4D] >> [B,S,D]).
+        ActT* grad_q_buf = sl.ffn_pre;
+        ActT* grad_k_buf = sl.ffn_pre + (size_t)B*S*D;
+        ActT* grad_v_buf = sl.ffn_post;
+        // attention_backward consumes q,k,v + softmax_lse and produces grad_q/k/v.
+        // The 'out' arg is unused by the SMEM kernel — pass nullptr-equivalent
+        // (we pass q_buf for type-correctness; it's only touched by FA3 path).
+        attention::attention_backward<ActT, 32, /*kCausal=*/true>(
+            sl.attn_out_perhead,
+            q_buf, k_buf, v_buf,
+            q_buf,            // 'out' placeholder (unused by SMEM bwd)
+            sl.softmax_lse,
+            grad_q_buf, grad_k_buf, grad_v_buf,
+            B, H, S, scale, stream);
 
-    // d_gate = d_fused * up * silu'(gate),  d_up = d_fused * silu(gate)
-    // Temporaries written in-place to avoid extra allocation (reuse d_fused buffer)
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        float df = d_fused[i];
-        float g  = gate_pre[i];
-        float u  = up_buf[i];
-        float d_gate_i = df * u * detail::silu_backward(g);
-        float d_up_i   = df * detail::silu(g);
-        // These are consumed by the matmul below; written to shared scratch
-        (void)d_gate_i; (void)d_up_i;
-    }
+        // Merge grad_q/k/v back into a packed [B, S, 3, H, d] buffer.
+        // Reuse qkv_out as the merged grad buffer.
+        qkv_merge_kernel<ActT><<<B*S, 128, 0, stream>>>(
+            grad_q_buf, grad_k_buf, grad_v_buf, sl.qkv_out, B, S, H, d_head);
+        ActT* grad_qkv_out = sl.qkv_out;
 
-    // d_x = d_gate @ w_gate + d_up @ w_up — two wgmma calls, accumulated
-    detail::wgmma_matmul<ParamT>(
-        reinterpret_cast<const ParamT*>(nullptr), BATCH * SEQ_LEN, ffn_hidden,
-        w_gate, ffn_hidden, d_model,
-        d_x
-    );
-    // Second contribution added in-place by the dispatch generator
-    (void)x; (void)w_up; (void)d_w_gate; (void)d_w_up;
-}
+        // ── QKV projection bwd: y = qkv_in * qkv_W^T + qkv_b
+        // Weight grad uses saved qkv_in.
+        cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+            3*D, D, B*S, 1.0f, 1.0f,
+            (const WeightT*)grad_qkv_out, 3*D,
+            (const WeightT*)sl.qkv_in, D,
+            gw.qkv_W, D, stream);
+        bias_bwd_kernel<ActT, WeightT><<<(3*D+255)/256, 256, 0, stream>>>(
+            grad_qkv_out, gw.qkv_b, B*S, 3*D);
+        // Activation grad: grad_qkv_in = grad_qkv_out * qkv_W
+        // Write into qkv_in (no longer needed).
+        cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+            B*S, D, 3*D, 1.0f, 0.0f,
+            (const WeightT*)grad_qkv_out, 3*D, lw.qkv_W, D,
+            (WeightT*)sl.qkv_in, D, stream);
+        ActT* grad_qkv_in = sl.qkv_in;
 
-// Output projection backward
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-__device__ __forceinline__ void o_proj_backward(
-    const float*  __restrict__ d_out,     // [B, S, D]
-    const float*  __restrict__ attn_out,  // [B, S, D] — saved from forward
-    const ParamT* __restrict__ w_o,       // [D, D]
-    float*        __restrict__ d_attn,    // [B, S, D]
-    ParamT*       __restrict__ d_w_o,     // [D, D]
-    int d_model
-) {
-    detail::wgmma_matmul<ParamT>(
-        reinterpret_cast<const ParamT*>(nullptr), BATCH * SEQ_LEN, d_model,
-        w_o, d_model, d_model,
-        d_attn
-    );
-    (void)d_out; (void)attn_out; (void)d_w_o;
-}
-
-// Attention backward (FA3-style reverse pass)
-// Recomputes S = Q@K^T from saved Q,K,V and lse; computes dQ, dK, dV.
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-__device__ __launch_bounds__(256, 2) __forceinline__ void attention_backward(
-    const float* __restrict__ d_attn_out, // [B, S, D]
-    const float* __restrict__ qkv,        // [B, S, 3*D] — saved from forward
-    const float* __restrict__ lse_buf,    // [B, H, S]   — saved log-sum-exp
-    float*       __restrict__ d_qkv,      // [B, S, 3*D]
-    int d_model,
-    int n_heads
-) {
-    // FA3 backward outline:
-    // 1. Reload Q, K, V tiles from saved qkv buffer.
-    // 2. Recompute P = softmax(Q@K^T / sqrt(d_h)) using saved lse for numerical stability.
-    // 3. dV = P^T @ dO via wgmma.
-    // 4. dP = dO @ V^T via wgmma.
-    // 5. dS = P * (dP - rowsum(dP * P)) — softmax backward.
-    // 6. dQ = dS @ K, dK = dS^T @ Q via wgmma.
-    // 7. Apply causal mask gradient (zero where j > i).
-    //
-    // Dispatches to wgmma via CUTLASS 3.x for all matmul tiles.
-
-    const int d_head = d_model / n_heads;
-    const float scale = rsqrtf(static_cast<float>(d_head));
-    (void)d_attn_out; (void)qkv; (void)lse_buf; (void)d_qkv; (void)scale;
-}
-
-// QKV projection backward (includes RoPE backward fused in)
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-__device__ __forceinline__ void qkv_proj_backward(
-    const float*  __restrict__ d_qkv,     // [B, S, 3*D] — includes RoPE backward
-    const float*  __restrict__ x,         // [B, S, D]   — saved from forward
-    const ParamT* __restrict__ w_qkv,     // [3*D, D]
-    float*        __restrict__ d_x,       // [B, S, D]
-    ParamT*       __restrict__ d_w_qkv,   // [3*D, D]
-    int d_model,
-    int n_heads,
-    float rope_base = 10000.0f
-) {
-    // Undo RoPE on dQ and dK before weight gradient computation.
-    // RoPE is orthogonal so its backward is just rotation by -angle.
-    const int d_head  = d_model / n_heads;
-    const int half_dh = d_head / 2;
-    const int total   = BATCH * SEQ_LEN;
-
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
-         idx < total * n_heads * half_dh;
-         idx += gridDim.x * blockDim.x) {
-
-        const int tok  = idx / (n_heads * half_dh);
-        const int rem  = idx % (n_heads * half_dh);
-        const int h    = rem / half_dh;
-        const int pair = rem % half_dh;
-
-        const int pos = tok % SEQ_LEN;
-        const float freq = 1.0f / __powf(rope_base, static_cast<float>(2 * pair) / static_cast<float>(d_head));
-        const float angle = static_cast<float>(pos) * freq;
-
-        float cos_a, sin_a;
-        __sincosf(angle, &sin_a, &cos_a);
-
-        // Inverse rotation: rotate by -angle (cos_a, -sin_a)
-        #pragma unroll
-        for (int qk = 0; qk < 2; ++qk) {
-            const size_t base = static_cast<size_t>(tok) * 3 * d_model
-                              + static_cast<size_t>(qk) * d_model
-                              + static_cast<size_t>(h) * d_head
-                              + 2 * pair;
-            // d_qkv is read-write here; we un-rotate in place before matmul backward
-            (void)base; (void)cos_a; (void)sin_a;
+        // grad_layer_input = grad_n1_in (residual) + grad_qkv_in
+        {
+            size_t n = (size_t)B*S*D;
+            int block = 256, grid = (int)((n + block - 1) / block);
+            add_inplace_kernel<ActT><<<grid, block, 0, stream>>>(
+                grad_qkv_in, grad_n1_in, n);
         }
+        grad_y = grad_qkv_in;
     }
 
-    // d_x = d_qkv_unrotated @ w_qkv — dispatches to wgmma
-    detail::wgmma_matmul<ParamT>(
-        reinterpret_cast<const ParamT*>(nullptr), BATCH * SEQ_LEN, 3 * d_model,
-        w_qkv, 3 * d_model, d_model,
-        d_x
-    );
-    (void)d_qkv; (void)x; (void)d_w_qkv;
+    // 5. Embedding bwd: grad_y is grad of embed_out. The forward pass
+    //    stashed the input ids at activations_saved[0..B*S).
+    embedding_bwd_kernel<ActT, WeightT><<<B*S, 128, 0, stream>>>(
+        input_ids_saved, grad_y, g_tok_embed, g_pos_embed, B, S, D, V);
+
+    // grad_input is grad w.r.t. token IDs — undefined for integer inputs.
+    cudaMemsetAsync(grad_input, 0, (size_t)B*S*sizeof(ActT), stream);
+
+    cublasDestroy(cublas);
+    return cudaGetLastError();
 }
 
-// RMSNorm backward
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-__device__ __forceinline__ void rmsnorm_backward(
-    const float*  __restrict__ d_out,     // [B, S, D]
-    const float*  __restrict__ x,         // [B, S, D] — saved from forward
-    const float*  __restrict__ rms_buf,   // [B, S]    — saved rms_inv
-    const ParamT* __restrict__ gamma,     // [D]
-    float*        __restrict__ d_x,       // [B, S, D]
-    ParamT*       __restrict__ d_gamma,   // [D]
-    int d_model
-) {
-    // Each warp handles one token
-    const int warp_id    = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    const int lane       = threadIdx.x % 32;
-    const int total_toks = BATCH * SEQ_LEN;
-    if (warp_id >= total_toks) return;
+}}}}  // namespace sg::sm90::models::decoder
 
-    const float rms_inv     = rms_buf[warp_id];
-    const float* x_row      = x + static_cast<size_t>(warp_id) * d_model;
-    const float* d_out_row  = d_out + static_cast<size_t>(warp_id) * d_model;
-    float*       d_x_row    = d_x + static_cast<size_t>(warp_id) * d_model;
-
-    // sum_i(d_out_i * x_i * gamma_i) for the correction term
-    float dot = 0.0f;
-    for (int d = lane; d < d_model; d += 32) {
-        float g  = to_float<ParamT>(__ldg(&gamma[d]));
-        float dy = d_out_row[d];
-        dot += dy * x_row[d] * g;
-    }
-    dot = detail::warp_reduce_sum(dot);
-
-    float coeff = rms_inv * rms_inv * rms_inv / static_cast<float>(d_model);
-
-    for (int d = lane; d < d_model; d += 32) {
-        float g   = to_float<ParamT>(__ldg(&gamma[d]));
-        float dy  = d_out_row[d];
-        float xi  = x_row[d];
-        d_x_row[d] = rms_inv * g * dy - coeff * xi * dot;
-        // d_gamma accumulated via atomicAdd by the dispatch generator
-    }
-    (void)d_gamma;
-}
-
-// Residual connection backward: just pass-through
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-__device__ __forceinline__ void residual_add_backward(
-    const float* __restrict__ d_out, // [B, S, D]
-    float*       __restrict__ d_x,   // [B, S, D] — gradient to the residual branch
-    float*       __restrict__ d_res, // [B, S, D] — gradient to the skip connection
-    int d_model
-) {
-    // Residual add is y = x + r, so dy/dx = 1, dy/dr = 1
-    const int n = BATCH * SEQ_LEN * d_model;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-        float g = d_out[i];
-        if constexpr (NAN_POLICY == NanPolicy::kZero) {
-            g = detail::sanitize_grad<NAN_POLICY>(g);
-        }
-        d_x[i]   = g;
-        d_res[i] = g;
-    }
-}
-
-// Embedding backward: scatter-add gradients to d_tok_embed
-template <typename ParamT, int SEQ_LEN, int BATCH, int VOCAB, bool TIED_EMBEDDINGS,
-          NanPolicy NAN_POLICY = NanPolicy::kZero>
-__device__ __forceinline__ void embed_backward(
-    const float* __restrict__ d_out,       // [B, S, D]
-    const int*   __restrict__ token_ids,   // [B, S]
-    ParamT*      __restrict__ d_tok_embed, // [VOCAB, D]
-    int d_model
-) {
-    const int total_tokens = BATCH * SEQ_LEN;
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
-         idx < total_tokens * d_model;
-         idx += gridDim.x * blockDim.x) {
-        const int tok_flat = idx / d_model;
-        const int d        = idx % d_model;
-        const int tok_id   = token_ids[tok_flat];
-        float g = d_out[idx];
-        if constexpr (NAN_POLICY == NanPolicy::kZero) {
-            g = detail::sanitize_grad<NAN_POLICY>(g);
-        }
-        // Scatter-add; dispatch generator may replace with deterministic reduction
-        atomicAdd(
-            reinterpret_cast<float*>(&d_tok_embed[tok_id * d_model + d]),
-            g
-        );
-    }
-}
-
-}} // namespace grokking::sm90
-
-#endif // GROKKING_TRANSFORMER_DECODER_SM90_CUH_
+#endif  // GROKKING_KERNELS_SM90_TRANSFORMER_DECODER_SM90_CUH_
