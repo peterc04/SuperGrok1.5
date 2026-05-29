@@ -1,65 +1,29 @@
-#ifndef GROKKING_KERNELS_SM90_ADAMW_SM90_CUH_
-#define GROKKING_KERNELS_SM90_ADAMW_SM90_CUH_
+#ifndef GROKKING_KERNELS_SM90_ATTENTION_SM90_CUH_
+#define GROKKING_KERNELS_SM90_ATTENTION_SM90_CUH_
 // ============================================================================
-// adamw_sm90.cuh — CANONICAL SuperGrok sm_90 device kernels for 'adamw'.
+// attention_sm90.cuh — CANONICAL SuperGrok sm_90 device kernels for the 'attention'
+// model. Single source of truth: templated per-layer __device__ forward/backward,
+// __global__ launchers, inline-PTX blocks VERBATIM, and the CUTLASS Sm90
+// tensor-core GEMM wrappers (attention). Composition primitive for the future
+// fused megakernel.
 //
-// This header is the SINGLE source of truth for the sm_90 device logic:
-// templated __forceinline__ __device__ update/_vec4 functions, the __global__
-// launcher kernels, every inline-PTX (asm-volatile) block VERBATIM, and (for
-// muon/supergrok2) the CUTLASS Sm90 tensor-core collectives. It is a
-// composition primitive for the future fused megakernel.
-//
-// The production TU csrc/backends/cuda/sm_90/launch_adamw.cu now #include's
-// this header and keeps only the host launcher(s) the pybind layer calls.
-// Migrated byte-for-byte from that .cu; verified compile-neutral via the
-// preprocessor-equivalence gate (nvcc -E, modulo __FILE__).
+// The production location csrc/backends/cuda/sm_90/models/attention.cuh is now a thin
+// shim that #include's this header, so every existing includer (bindings.cpp,
+// the attention.cu instantiation TU, the HIP tree's references) keeps working
+// unchanged. Migrated byte-for-byte; verified compile-neutral via the
+// preprocessor-equivalence gate (nvcc -E, modulo __FILE__/__LINE__).
 // ============================================================================
-// CUDA sm_90 launch glue for AdamW.
+// csrc/kernels/cuda/sm_90/models/attention.cuh
+// Shared attention kernel for sm_90 (Hopper). Serves both Decoder (causal,
+// seq_len=4) and ViT (non-causal, seq_len=17) via the kCausal template flag.
 //
-// Includes:
-//   csrc/algorithms/adamw.h           — per-element math
-//   csrc/backends/cuda/sm_90/primitives.cuh — grid-stride, vec4, reductions
+// At these tiny sequence lengths FlashAttention's block-wise tiling adds
+// overhead with no benefit. Instead we compute the full QK^T score matrix
+// in SMEM/registers, run softmax in-place, then multiply by V.
 //
-// Exposes:
-//   sg::sm90::launch_adamw_step(...)   — multi-tensor launcher
+// BF16 activations, FP32 accumulation for matmuls.
 
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-
-#include "csrc/algorithms/adamw.h"
-// ── Autotuner-consumable launch parameters (inlined; see compile.py) ──
-#ifndef SG_TUNED_BLOCK_SIZE
-#define SG_TUNED_BLOCK_SIZE 256
-#endif
-#ifndef SG_TUNED_VEC_WIDTH
-#define SG_TUNED_VEC_WIDTH 4
-#endif
-#ifndef SG_TUNED_UNROLL
-#define SG_TUNED_UNROLL 1
-#endif
-#ifndef SG_TUNED_ASYNC_DEPTH
-#define SG_TUNED_ASYNC_DEPTH 2
-#endif
-// ── inlined from former csrc/backends/cuda/sm_90/primitives.cuh ──
-// CUDA sm_90 (Hopper) primitives — shared across all 11 launch_*.cu files.
-//
-// This header consolidates vendor-specific intrinsics that the optimizer
-// launch files use repeatedly: warp/block/cluster reductions, vec4 helpers,
-// non-temporal load/store, stochastic rounding, RoPE pair rotation, fused
-// element ingestion, and grid-stride loop helpers.
-//
-// Algorithm-neutral. Per-element optimizer math lives in csrc/algorithms/.
-// Per-backend launch glue (kernel definitions + host launchers) lives in
-// the 11 csrc/backends/cuda/sm_90/launch_<optimizer>.cu files which include
-// both this header and the relevant algorithm header.
-
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
-#include <cuda_pipeline.h>
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
-
+#pragma once
 // ── inlined from former csrc/common/platform.h ──
 /*
  * SuperGrok v2 — Platform Abstraction Layer
@@ -723,423 +687,533 @@ __device__ __forceinline__ Affine2x2 ptx_affine_combine(
 
 #endif // GROK_CUDA || GROK_HIP
 // ── end inlined csrc/common/utils.cuh ──
-// ── inlined from former csrc/common/ptx_intrinsics.cuh ──
-/*
- * PTX Intrinsics for SuperGrok v2
- *
- * Hot-path intrinsics that replace multi-cycle standard library calls with
- * single-cycle PTX instructions:
- *
- *   affine_combine_ptx  — 12-FMA parallel prefix scan composition
- *   softplus_ptx        — log(1+exp(x)) via ex2.approx + lg2.approx (2 cycles vs ~16)
- *   fast_exp_ptx        — exp(x) via ex2.approx (1 cycle vs ~8)
- *   stochastic_round_ptx— branchless stochastic rounding for Config4 quantization
- *   gru_gates_ptx       — interleaved sigmoid pair for GRU z/r gates
- *
- * On HIP (AMD), all intrinsics fall back to standard math functions.
- */
 
+#ifdef WITH_CUTLASS
+// ── Sm90 (Hopper) warp-group collective GEMM headers ──────────────────────
+// Used by cutlass_fmha_forward below. The fused-MHA is realised as two Sm90
+// GemmUniversal calls (S = Q·Kᵀ, then O = P·V) with a softmax kernel between,
+// all FP32-accumulate. This emits real WGMMA/TMA instructions; the previous
+// FMHA path relied on the default the default device::Gemm (no arch tag) which has
+// no arch tag and silently compiled the Sm70 SIMT kernel (no tensor cores).
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
+#include <cutlass/cutlass.h>
+#include <cutlass/numeric_types.h>
+#include <cute/tensor.hpp>
+#include <cutlass/gemm/device/gemm_universal_adapter.h>
+#include <cutlass/gemm/collective/collective_builder.hpp>
+#include <cutlass/gemm/kernel/gemm_universal.hpp>
+#include <cutlass/epilogue/collective/collective_builder.hpp>
+#endif // WITH_CUTLASS
 
-#if defined(__CUDACC__) || defined(GROK_CUDA)
+namespace sg { namespace sm90 { namespace models { namespace attention {
 
-__device__ __forceinline__ Affine2x2 affine_combine_ptx(
-    const Affine2x2& left, const Affine2x2& right
-) {
-    Affine2x2 out;
-    // 12-FMA inline PTX for composing two Affine2x2 transforms.
-    // Computes: M_out = M_right * M_left, b_out = M_right * b_left + b_right
-    //
-    // Wave 0 (cycle 0): 4 independent partial products for M_out
-    // Wave 1 (cycle 4): 4 dependent accumulations for M_out + 2 bias starts
-    // Wave 2 (cycle 8): 2 final bias accumulations
-    asm volatile(
-        // Wave 0: 4 independent partial products
-        "fma.rn.f32 %0, %6, %12, 0f00000000;\n\t"   // m00  = r.m00 * l.m00
-        "fma.rn.f32 %1, %6, %13, 0f00000000;\n\t"   // m01  = r.m00 * l.m01
-        "fma.rn.f32 %2, %8, %12, 0f00000000;\n\t"   // m10  = r.m10 * l.m00
-        "fma.rn.f32 %3, %8, %13, 0f00000000;\n\t"   // m11  = r.m10 * l.m01
-        // Wave 1: accumulate cross-terms + begin bias
-        "fma.rn.f32 %0, %7, %14, %0;\n\t"            // m00 += r.m01 * l.m10
-        "fma.rn.f32 %1, %7, %15, %1;\n\t"            // m01 += r.m01 * l.m11
-        "fma.rn.f32 %2, %9, %14, %2;\n\t"            // m10 += r.m11 * l.m10
-        "fma.rn.f32 %3, %9, %15, %3;\n\t"            // m11 += r.m11 * l.m11
-        "fma.rn.f32 %4, %6, %16, %10;\n\t"           // b0   = r.m00 * l.b0 + r.b0
-        "fma.rn.f32 %5, %8, %16, %11;\n\t"           // b1   = r.m10 * l.b0 + r.b1
-        // Wave 2: final bias accumulations
-        "fma.rn.f32 %4, %7, %17, %4;\n\t"            // b0  += r.m01 * l.b1
-        "fma.rn.f32 %5, %9, %17, %5;\n\t"            // b1  += r.m11 * l.b1
-        : "=f"(out.m00), "=f"(out.m01), "=f"(out.m10), "=f"(out.m11),
-          "=f"(out.b0), "=f"(out.b1)
-        : "f"(right.m00), "f"(right.m01), "f"(right.m10), "f"(right.m11),
-          "f"(right.b0), "f"(right.b1),
-          "f"(left.m00), "f"(left.m01), "f"(left.m10), "f"(left.m11),
-          "f"(left.b0), "f"(left.b1)
-    );
-    return out;
-}
+// ── Launch configuration descriptor ────────────────────────────────────
+template <typename ActT, int kHeadDim, bool kCausal>
+struct AttentionLaunchConfig {
+    int block;
+    int cluster_size;
+    int smem_bytes;
+    bool use_fa3;
+    bool use_cutlass_fmha;
+};
 
-// ═══════════════════════════════════════════════════════════════════════
-//  softplus_ptx: log(1 + exp(x)) in ~2 cycles
-//
-//  Replaces logf(1.0f + expf(x)) (~16 cycles) with ex2.approx + lg2.approx.
-//  Branchless saturation at x > 20 via selp.
-// ═══════════════════════════════════════════════════════════════════════
-__device__ __forceinline__ float softplus_ptx(float x) {
-    float result;
-    asm volatile(
-        "{\n\t"
-        ".reg .f32 t, ex, ep1, lg;\n\t"
-        ".reg .pred p;\n\t"
-        "mul.f32 t, %1, 0f3FB8AA3B;\n\t"      // x * log2(e)
-        "ex2.approx.f32 ex, t;\n\t"             // exp(x)
-        "add.f32 ep1, ex, 0f3F800000;\n\t"      // 1 + exp(x)
-        "lg2.approx.f32 lg, ep1;\n\t"           // log2(1+exp(x))
-        "mul.f32 lg, lg, 0f3F317218;\n\t"       // * ln(2)
-        "setp.gt.f32 p, %1, 0f41A00000;\n\t"    // x > 20.0?
-        "selp.f32 %0, %1, lg, p;\n\t"           // branchless select
-        "}\n\t"
-        : "=f"(result) : "f"(x)
-    );
-    return result;
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-//  fast_exp_ptx: exp(x) in 1 cycle via ex2.approx
-//
-//  Replaces __expf(A * dt) in scan. A_bar is always in (0,1).
-// ═══════════════════════════════════════════════════════════════════════
-__device__ __forceinline__ float fast_exp_ptx(float x) {
-    float result;
-    asm volatile(
-        "{\n\t"
-        ".reg .f32 t;\n\t"
-        "mul.f32 t, %1, 0f3FB8AA3B;\n\t"   // x * log2(e)
-        "ex2.approx.f32 %0, t;\n\t"         // 2^t = exp(x)
-        "}\n\t"
-        : "=f"(result) : "f"(x)
-    );
-    return result;
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-//  stochastic_round_ptx: branchless stochastic rounding for Config4
-//
-//  Replaces floor + branch + comparison with cvt.rmi + selp.
-// ═══════════════════════════════════════════════════════════════════════
-__device__ __forceinline__ int stochastic_round_ptx(float x, unsigned rand_bits) {
-    int result;
-    asm volatile(
-        "{\n\t"
-        ".reg .f32 fl, frac, r;\n\t"
-        ".reg .s32 ifl, up;\n\t"
-        ".reg .pred p;\n\t"
-        "cvt.rmi.f32.f32 fl, %1;\n\t"
-        "sub.f32 frac, %1, fl;\n\t"
-        "cvt.rn.f32.u32 r, %2;\n\t"
-        "mul.f32 r, r, 0f2F800000;\n\t"
-        "setp.lt.f32 p, r, frac;\n\t"
-        "cvt.rzi.s32.f32 ifl, fl;\n\t"
-        "selp.s32 up, 1, 0, p;\n\t"
-        "add.s32 %0, ifl, up;\n\t"
-        "}\n\t"
-        : "=r"(result) : "f"(x), "r"(rand_bits)
-    );
-    return result;
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-//  gru_gates_ptx: interleaved sigmoid pair for GRU z/r gates
-//
-//  Two independent sigmoid(wx + b) computations fill both FMA pipelines.
-//  Uses rcp.approx for 1/(1+exp(-x)) instead of fdividef.
-// ═══════════════════════════════════════════════════════════════════════
-__device__ __forceinline__ void gru_gates_ptx(
-    float wx_z, float bz, float wx_r, float br,
-    float& z_out, float& r_out
-) {
-    asm volatile(
-        "{\n\t"
-        ".reg .f32 nz, nr, tz, tr, ez, er, dz, dr;\n\t"
-        "add.f32 nz, %2, %3;\n\t"
-        "add.f32 nr, %4, %5;\n\t"
-        "neg.f32 nz, nz;\n\t"
-        "neg.f32 nr, nr;\n\t"
-        "mul.f32 tz, nz, 0f3FB8AA3B;\n\t"
-        "mul.f32 tr, nr, 0f3FB8AA3B;\n\t"
-        "ex2.approx.f32 ez, tz;\n\t"
-        "ex2.approx.f32 er, tr;\n\t"
-        "add.f32 dz, ez, 0f3F800000;\n\t"
-        "add.f32 dr, er, 0f3F800000;\n\t"
-        "rcp.approx.f32 %0, dz;\n\t"
-        "rcp.approx.f32 %1, dr;\n\t"
-        "}\n\t"
-        : "=f"(z_out), "=f"(r_out)
-        : "f"(wx_z), "f"(bz), "f"(wx_r), "f"(br)
-    );
-}
-
-#elif defined(__HIP_DEVICE_COMPILE__) || defined(GROK_HIP)
-
-__device__ __forceinline__ Affine2x2 affine_combine_ptx(
-    const Affine2x2& left, const Affine2x2& right
-) {
-    return affine_combine(left, right);
-}
-
-__device__ __forceinline__ float softplus_ptx(float x) {
-    return (x > 20.0f) ? x : logf(1.0f + expf(x));
-}
-
-__device__ __forceinline__ float fast_exp_ptx(float x) {
-    return expf(x);
-}
-
-__device__ __forceinline__ int stochastic_round_ptx(float x, unsigned rand_bits) {
-    float fl = floorf(x);
-    float frac = x - fl;
-    float r = (float)rand_bits * (1.0f / 4294967296.0f);
-    return (int)fl + (r < frac ? 1 : 0);
-}
-
-__device__ __forceinline__ void gru_gates_ptx(
-    float wx_z, float bz, float wx_r, float br,
-    float& z_out, float& r_out
-) {
-    z_out = 1.0f / (1.0f + expf(-(wx_z + bz)));
-    r_out = 1.0f / (1.0f + expf(-(wx_r + br)));
-}
-
+// ── Forward declaration for external backends ──────────────────────────
+#ifdef WITH_FLASH_ATTN_3
+template <typename ActT, int kHeadDim, bool kCausal>
+cudaError_t flash_attn3_forward(
+    const ActT* q, const ActT* k, const ActT* v, ActT* out, ActT* softmax_lse,
+    int batch, int n_heads, int seq_len, float scale, cudaStream_t stream);
 #endif
-// ── end inlined csrc/common/ptx_intrinsics.cuh ──
 
-namespace sg { namespace sm90 { namespace primitives {
+#ifdef WITH_CUTLASS
+template <typename ActT, int kHeadDim, bool kCausal>
+cudaError_t cutlass_fmha_forward(
+    const ActT* q, const ActT* k, const ActT* v, ActT* out, ActT* softmax_lse,
+    int batch, int n_heads, int seq_len, float scale, cudaStream_t stream);
+#endif
 
-namespace cg = cooperative_groups;
+// ── SMEM-based attention kernel (default for tiny seq_len) ─────────────
+// One block per (batch, head). Each thread cooperates on the matmul.
+// Max seq_len supported: 32 (17x17 scores = 289 floats in SMEM).
 
-// =========================================================================
-//  Grid-stride loop helper
-// =========================================================================
-
-__device__ __forceinline__ int grid_stride_index() {
-    return blockIdx.x * blockDim.x + threadIdx.x;
-}
-
-__device__ __forceinline__ int grid_stride() {
-    return gridDim.x * blockDim.x;
-}
-
-// =========================================================================
-//  Vec4 alignment check (host-side)
-// =========================================================================
-
-__host__ __forceinline__ bool is_vec4_alignable(
-    const void* p, int64_t numel
+template <typename ActT, int kHeadDim, bool kCausal>
+__global__ void __launch_bounds__(128, 4)
+smem_attention_fwd_kernel(
+    const ActT* __restrict__ q,     // [B, H, N, D]
+    const ActT* __restrict__ k,
+    const ActT* __restrict__ v,
+    ActT* __restrict__ out,
+    float* __restrict__ softmax_lse, // [B, H, N] or nullptr
+    int seq_len, float scale
 ) {
-    return ((reinterpret_cast<uintptr_t>(p) & 0xF) == 0) && (numel % 4 == 0);
-}
-
-// =========================================================================
-//  Warp-level sum reduction (butterfly via __shfl_down_sync)
-// =========================================================================
-
-__device__ __forceinline__ float warp_reduce_sum_f32(float v) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(0xffffffff, v, offset);
-    }
-    return v;
-}
-
-// =========================================================================
-//  Block-level sum reduction: warp reduce + shared-memory tree + warp reduce.
-//  Uses up to 32 floats of smem (one per warp).
-// =========================================================================
-
-__device__ __forceinline__ float block_reduce_sum_f32(float v) {
-    __shared__ float smem[32];
+    const int bh = blockIdx.x;              // flattened (batch, head) index
     const int tid = threadIdx.x;
-    const int warp = tid / 32;
-    const int lane = tid & 31;
+    const int N = seq_len;
+    const int D = kHeadDim;
+    const int base = bh * N * D;
 
-    float w = warp_reduce_sum_f32(v);
-    if (lane == 0) smem[warp] = w;
-    __syncthreads();
+    // Shared memory: scores[N][N] + row_max[N] + row_sum[N]
+    extern __shared__ float smem[];
+    float* scores  = smem;                  // N * N
+    float* row_max = scores + N * N;        // N
+    float* row_sum = row_max + N;           // N
 
-    int n_warps = (blockDim.x + 31) / 32;
-    if (warp == 0) {
-        float x = (lane < n_warps) ? smem[lane] : 0.0f;
-        x = warp_reduce_sum_f32(x);
-        if (lane == 0) smem[0] = x;
+    // Step 1: Compute S = Q K^T * scale, with optional causal mask
+    for (int idx = tid; idx < N * N; idx += blockDim.x) {
+        int i = idx / N;  // query row
+        int j = idx % N;  // key column
+        if constexpr (kCausal) {
+            if (j > i) { scores[idx] = -1e9f; continue; }
+        }
+        float dot = 0.0f;
+        for (int d = 0; d < D; d++) {
+            dot += static_cast<float>(q[base + i * D + d])
+                 * static_cast<float>(k[base + j * D + d]);
+        }
+        scores[idx] = dot * scale;
     }
     __syncthreads();
-    return smem[0];
-}
 
-// =========================================================================
-//  Cluster (DSMEM) reduction on Hopper sm_90+ with sm_80 fallback.
-//  Wraps the utility in common/utils.cuh.
-// =========================================================================
-
-__device__ __forceinline__ float cluster_reduce_sum_f32(float v) {
-    return sg::cluster_dsmem_reduce_sum(v);
-}
-
-// =========================================================================
-//  Non-temporal load / store (bypass L2 for read-once optimizer state).
-//  Implemented in common/platform.h; wrapped here for legibility.
-// =========================================================================
-
-__device__ __forceinline__ float ldg_f32(const float* ptr) {
-    return __ldg(ptr);
-}
-
-__device__ __forceinline__ void stream_store_f32(float* ptr, float v) {
-    __stwt(ptr, v);
-}
-
-// =========================================================================
-//  Stochastic rounding to BF16 (branchless via PTX hash_prng).
-// =========================================================================
-
-__device__ __forceinline__ __nv_bfloat16 round_bf16_stochastic(
-    float v, uint32_t prng_key
-) {
-    return sg::float_to_bf16_stochastic_branchless(v, prng_key);
-}
-
-// =========================================================================
-//  RoPE pair rotation (used by SG2 scan kernels).
-//  Input: (h0, h1, cos, sin)  ->  (h0*c - h1*s, h0*s + h1*c)
-// =========================================================================
-
-__device__ __forceinline__ void rope_rotate_pair(
-    float& h0, float& h1, float cos_v, float sin_v
-) {
-    float h0_new = h0 * cos_v - h1 * sin_v;
-    float h1_new = h0 * sin_v + h1 * cos_v;
-    h0 = h0_new;
-    h1 = h1_new;
-}
-
-// =========================================================================
-//  Last-block-finished pattern for cooperative reductions without grid sync.
-//  Returns true on exactly one block; caller uses that block to publish
-//  the final reduced value.
-// =========================================================================
-
-__device__ __forceinline__ bool last_block_finished(
-    unsigned int* __restrict__ counter,
-    int total_blocks
-) {
-    __shared__ bool is_last;
-    if (threadIdx.x == 0) {
-        unsigned int v = atomicInc(counter, total_blocks);
-        is_last = (v == static_cast<unsigned int>(total_blocks - 1));
+    // Step 2: Row-wise softmax (online stable via max subtraction)
+    for (int i = tid; i < N; i += blockDim.x) {
+        float m = -1e9f;
+        for (int j = 0; j < N; j++) m = fmaxf(m, scores[i * N + j]);
+        row_max[i] = m;
+        float s = 0.0f;
+        for (int j = 0; j < N; j++) {
+            float e = ptx_expf(scores[i * N + j] - m);
+            scores[i * N + j] = e;
+            s += e;
+        }
+        float inv_s = 1.0f / fmaxf(s, 1e-12f);
+        for (int j = 0; j < N; j++) scores[i * N + j] *= inv_s;
+        row_sum[i] = s;  // keep for lse
+        if (softmax_lse != nullptr)
+            softmax_lse[bh * N + i] = m + logf(fmaxf(s, 1e-12f));
     }
     __syncthreads();
-    return is_last;
-}
 
-// =========================================================================
-//  Compute Adam denom with fast rsqrt + Newton-Raphson refinement.
-//  Slightly faster than 1.0f / (sqrtf(v) + eps) when v >= eps^2.
-// =========================================================================
-
-__device__ __forceinline__ float adam_denom_fast(float v, float eps) {
-    return sqrtf(v) + eps;
-}
-
-}}} // namespace sg::sm90::primitives
-// ── end inlined csrc/backends/cuda/sm_90/primitives.cuh ──
-
-namespace sg { namespace sm90 {
-
-namespace prim = ::sg::sm90::primitives;
-using ::sg::algorithms::adamw_step;
-using ::sg::algorithms::adamw_step_vec4;
-
-// =========================================================================
-//  Scalar grid-stride kernel
-// =========================================================================
-
-template <typename ParamT, typename GradT>
-__global__ void adamw_kernel(
-    ParamT* param, float* exp_avg, float* exp_avg_sq,
-    const GradT* grad,
-    float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int N
-) {
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
-        adamw_step(param, exp_avg, exp_avg_sq, grad,
-                   lr, beta1, beta2, eps, wd, bc1, bc2, i);
+    // Step 3: Out = Softmax(S) * V
+    for (int idx = tid; idx < N * D; idx += blockDim.x) {
+        int i = idx / D;
+        int d = idx % D;
+        float acc = 0.0f;
+        for (int j = 0; j < N; j++) {
+            acc += scores[i * N + j] * static_cast<float>(v[base + j * D + d]);
+        }
+        out[base + idx] = static_cast<ActT>(acc);
     }
 }
 
-// =========================================================================
-//  FP32 vec4 fast path (when param, grad, both states are FP32 and 16B-aligned)
-// =========================================================================
+#ifdef WITH_CUTLASS
+// ─────────────────────────────────────────────────────────────────────────
+//  Sm90 collective FMHA forward (TMA + WGMMA, FP32 accumulate)
+//
+//  Implemented as two Sm90 GemmUniversal calls per (batch, head):
+//      S = Q · Kᵀ          (M=N=seq_len, K=head_dim)   -> FP32 scores
+//      softmax(S * scale)  (causal mask if kCausal)     -> FP32 probs P
+//      O = P · V           (M=seq_len, N=head_dim, K=seq_len)
+//  All matmuls accumulate in FP32 and emit Hopper WGMMA/TMA instructions via
+//  CollectiveBuilder<arch::Sm90, OpClassTensorOp, ...>. This replaces the old
+//  the default device::Gemm (no arch tag) default which compiled the Sm70 SIMT path.
+//
+//  A full single-kernel Sm90 fused-MHA collective is intentionally not inlined
+//  here (too large); the two-GEMM + softmax decomposition is clearly correct
+//  and shares the same WGMMA/TMA mainloop. The tiny-seq_len SMEM fallback
+//  kernel (non-CUTLASS path) is left untouched.
+// ─────────────────────────────────────────────────────────────────────────
 
-__global__ void adamw_kernel_vec4_fp32(
-    float4* param4, float4* exp_avg4, float4* exp_avg_sq4,
-    const float4* grad4,
-    float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int N4
+// Element trait: map activation type -> CUTLASS input element.
+template <typename ActT> struct cutlass_elem;
+template <> struct cutlass_elem<__half>        { using type = cutlass::half_t; };
+template <> struct cutlass_elem<__nv_bfloat16> { using type = cutlass::bfloat16_t; };
+
+// Per-thread CUTLASS workspace (lazily grown). Reused across calls.
+inline void* fmha_get_workspace(size_t bytes) {
+    static thread_local void*  ws_ptr   = nullptr;
+    static thread_local size_t ws_bytes = 0;
+    if (bytes > ws_bytes) {
+        if (ws_ptr) cudaFree(ws_ptr);
+        if (cudaMalloc(&ws_ptr, bytes) != cudaSuccess) {
+            ws_ptr = nullptr; ws_bytes = 0; return nullptr;
+        }
+        ws_bytes = bytes;
+    }
+    return ws_ptr;
+}
+
+// Generic Sm90 GEMM: C[MxN] = A[MxK] * B[KxN], FP32 out, FP32 accumulate.
+// A is RowMajor [M,K]. B layout is a template parameter:
+//   - ColumnMajor B + physical [N,K] row-major data  => computes A·Bᵀ (QKᵀ)
+//   - RowMajor    B + physical [K,N] row-major data  => computes A·B  (P·V)
+// strideB_dims = logical {N, K, 1} so the packed stride matches the physical
+// row-major [N,K] (QKᵀ) / [K,N] (PV) buffer respectively.
+template <typename ElementInput, typename LayoutBT>
+inline cudaError_t fmha_sm90_gemm(
+    int M, int N, int K,
+    const void* A, const void* B, float* C,
+    cudaStream_t stream)
+{
+    using ElementA   = ElementInput;
+    using ElementB   = ElementInput;
+    using ElementC   = float;
+    using ElementAcc = float;
+    using LayoutA    = cutlass::layout::RowMajor;
+    using LayoutB    = LayoutBT;
+    using LayoutC    = cutlass::layout::RowMajor;
+
+    constexpr int AlignA = 128 / cutlass::sizeof_bits<ElementA>::value;
+    constexpr int AlignB = 128 / cutlass::sizeof_bits<ElementB>::value;
+    constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementC>::value;
+
+    using TileShape    = cute::Shape<cute::_128, cute::_128, cute::_64>;
+    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+
+    using CollectiveEpilogue =
+        typename cutlass::epilogue::collective::CollectiveBuilder<
+            cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+            TileShape, ClusterShape,
+            cutlass::epilogue::collective::EpilogueTileAuto,
+            ElementAcc, ElementAcc,
+            ElementC, LayoutC, AlignC,
+            ElementC, LayoutC, AlignC,
+            cutlass::epilogue::collective::EpilogueScheduleAuto
+        >::CollectiveOp;
+
+    using CollectiveMainloop =
+        typename cutlass::gemm::collective::CollectiveBuilder<
+            cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+            ElementA, LayoutA, AlignA,
+            ElementB, LayoutB, AlignB,
+            ElementAcc,
+            TileShape, ClusterShape,
+            cutlass::gemm::collective::StageCountAutoCarveout<
+                static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+            cutlass::gemm::collective::KernelScheduleAuto
+        >::CollectiveOp;
+
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        cute::Shape<int, int, int, int>,
+        CollectiveMainloop, CollectiveEpilogue>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+
+    StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+    StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    StrideC stride_c = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
+
+    typename Gemm::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {M, N, K, 1},
+        { reinterpret_cast<const ElementA*>(A), stride_a,
+          reinterpret_cast<const ElementB*>(B), stride_b },
+        { {ElementAcc(1.0f), ElementAcc(0.0f)},
+          C, stride_c, C, stride_c }
+    };
+
+    Gemm op;
+    if (op.can_implement(args) != cutlass::Status::kSuccess)
+        return cudaErrorNotSupported;
+    size_t ws_size = Gemm::get_workspace_size(args);
+    void*  ws = (ws_size > 0) ? fmha_get_workspace(ws_size) : nullptr;
+    if (ws_size > 0 && ws == nullptr) return cudaErrorMemoryAllocation;
+    if (op.initialize(args, ws, stream) != cutlass::Status::kSuccess)
+        return cudaErrorUnknown;
+    return (op.run(stream) == cutlass::Status::kSuccess)
+               ? cudaSuccess : cudaErrorUnknown;
+}
+
+// In-place row-wise softmax of an [N x N] FP32 score matrix, scaled, with
+// optional causal mask. Casts the result into ActT probs buffer P.
+template <typename ActT, bool kCausal>
+__global__ void fmha_softmax_kernel(
+    const float* __restrict__ S,   // [N, N] raw scores (Q·Kᵀ)
+    ActT* __restrict__ P,          // [N, N] softmax probabilities (ActT)
+    float* __restrict__ lse,       // [N] log-sum-exp or nullptr
+    int N, float scale)
+{
+    int i = blockIdx.x;            // query row
+    if (i >= N) return;
+    extern __shared__ float sh[];  // N floats
+    int tid = threadIdx.x;
+
+    // load + mask + find max
+    float m = -1e30f;
+    for (int j = tid; j < N; j += blockDim.x) {
+        float v = S[i * N + j] * scale;
+        if (kCausal && j > i) v = -1e30f;
+        sh[j] = v;
+        m = fmaxf(m, v);
+    }
+    __syncthreads();
+    // block-wide max reduction (simple shared-mem tree over warps)
+    __shared__ float red[32];
+    for (int o = WARP_SIZE / 2; o > 0; o >>= 1)
+        m = fmaxf(m, SHFL_DOWN_SYNC(FULL_WARP_MASK, m, o));
+    if ((tid & (WARP_SIZE - 1)) == 0) red[tid / WARP_SIZE] = m;
+    __syncthreads();
+    if (tid == 0) {
+        float mm = -1e30f;
+        int nwarp = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
+        for (int w = 0; w < nwarp; w++) mm = fmaxf(mm, red[w]);
+        red[0] = mm;
+    }
+    __syncthreads();
+    float row_max = red[0];
+
+    // exp + sum
+    float s = 0.0f;
+    for (int j = tid; j < N; j += blockDim.x) {
+        float e = ptx_expf(sh[j] - row_max);
+        sh[j] = e;
+        s += e;
+    }
+    for (int o = WARP_SIZE / 2; o > 0; o >>= 1)
+        s += SHFL_DOWN_SYNC(FULL_WARP_MASK, s, o);
+    if ((tid & (WARP_SIZE - 1)) == 0) red[tid / WARP_SIZE] = s;
+    __syncthreads();
+    if (tid == 0) {
+        float ss = 0.0f;
+        int nwarp = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
+        for (int w = 0; w < nwarp; w++) ss += red[w];
+        red[0] = ss;
+    }
+    __syncthreads();
+    float row_sum = red[0];
+    float inv = 1.0f / fmaxf(row_sum, 1e-12f);
+
+    for (int j = tid; j < N; j += blockDim.x)
+        P[i * N + j] = static_cast<ActT>(sh[j] * inv);
+    if (lse != nullptr && tid == 0)
+        lse[i] = row_max + logf(fmaxf(row_sum, 1e-12f));
+}
+
+// Cast FP32 O accumulator -> ActT output.
+template <typename ActT>
+__global__ void fmha_cast_kernel(const float* __restrict__ src,
+                                 ActT* __restrict__ dst, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = static_cast<ActT>(src[idx]);
+}
+
+template <typename ActT, int kHeadDim, bool kCausal>
+cudaError_t cutlass_fmha_forward(
+    const ActT* q, const ActT* k, const ActT* v, ActT* out, ActT* softmax_lse,
+    int batch, int n_heads, int seq_len, float scale, cudaStream_t stream)
+{
+    using Elem = typename cutlass_elem<ActT>::type;
+    const int N  = seq_len;
+    const int D  = kHeadDim;
+    const int BH = batch * n_heads;
+    float* lse = reinterpret_cast<float*>(softmax_lse);
+
+    // Scratch: FP32 scores [N*N], ActT probs [N*N], FP32 O [N*D].
+    float* S = nullptr;  ActT* P = nullptr;  float* O = nullptr;
+    if (cudaMalloc(&S, sizeof(float) * (size_t)N * N) != cudaSuccess)
+        return cudaErrorMemoryAllocation;
+    if (cudaMalloc(&P, sizeof(ActT) * (size_t)N * N) != cudaSuccess) {
+        cudaFree(S); return cudaErrorMemoryAllocation;
+    }
+    if (cudaMalloc(&O, sizeof(float) * (size_t)N * D) != cudaSuccess) {
+        cudaFree(S); cudaFree(P); return cudaErrorMemoryAllocation;
+    }
+
+    cudaError_t err = cudaSuccess;
+    for (int bh = 0; bh < BH && err == cudaSuccess; ++bh) {
+        const ActT* qh = q + (size_t)bh * N * D;
+        const ActT* kh = k + (size_t)bh * N * D;
+        const ActT* vh = v + (size_t)bh * N * D;
+        ActT*       oh = out + (size_t)bh * N * D;
+
+        // S[N,N] = Q[N,D] · Kᵀ[D,N]. K is physically row-major [N,D]. Declaring
+        // the B operand ColumnMajor over logical {N(=GEMM-N), D(=GEMM-K)} makes
+        // CUTLASS read that same buffer as Kᵀ, so we get S[i,j]=Σ_d Q[i,d]K[j,d].
+        err = fmha_sm90_gemm<Elem, cutlass::layout::ColumnMajor>(
+            N, N, D, qh, kh, S, stream);
+        if (err != cudaSuccess) break;
+
+        // softmax over rows (scaled, optional causal mask) -> P (ActT)
+        int sm_block = 128;
+        size_t sm_smem = sizeof(float) * (size_t)N;
+        fmha_softmax_kernel<ActT, kCausal>
+            <<<N, sm_block, sm_smem, stream>>>(
+                S, P, lse ? lse + (size_t)bh * N : nullptr, N, scale);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) break;
+
+        // O[N,D] = P[N,N] · V[N,D]. V is row-major [N,D] = logical [K=N, N=D],
+        // so the B operand is RowMajor and read directly.
+        err = fmha_sm90_gemm<Elem, cutlass::layout::RowMajor>(
+            N, D, N, P, vh, O, stream);
+        if (err != cudaSuccess) break;
+
+        int total = N * D, cb = 256, cg = (total + cb - 1) / cb;
+        fmha_cast_kernel<ActT><<<cg, cb, 0, stream>>>(O, oh, total);
+        err = cudaGetLastError();
+    }
+
+    cudaFree(S); cudaFree(P); cudaFree(O);
+    return err;
+}
+#endif // WITH_CUTLASS
+
+// ── Forward dispatch ───────────────────────────────────────────────────
+template <typename ActT, int kHeadDim, bool kCausal>
+cudaError_t attention_forward(
+    const ActT* q, const ActT* k, const ActT* v,
+    ActT* out,
+    ActT* softmax_lse_act,  // only used to locate the float buffer
+    int batch, int n_heads, int seq_len,
+    float scale,
+    cudaStream_t stream
 ) {
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N4; i += stride) {
-        adamw_step_vec4(param4, exp_avg4, exp_avg_sq4, grad4,
-                        lr, beta1, beta2, eps, wd, bc1, bc2, i);
+    // softmax_lse is always FP32 regardless of ActT
+    float* softmax_lse = reinterpret_cast<float*>(softmax_lse_act);
+
+#ifdef WITH_FLASH_ATTN_3
+    return flash_attn3_forward<ActT, kHeadDim, kCausal>(
+        q, k, v, out, reinterpret_cast<ActT*>(softmax_lse),
+        batch, n_heads, seq_len, scale, stream);
+#elif defined(WITH_CUTLASS)
+    return cutlass_fmha_forward<ActT, kHeadDim, kCausal>(
+        q, k, v, out, reinterpret_cast<ActT*>(softmax_lse),
+        batch, n_heads, seq_len, scale, stream);
+#else
+    int grid = batch * n_heads;
+    int block = 128;
+    int N = seq_len;
+    int smem_bytes = (N * N + 2 * N) * sizeof(float);
+    smem_attention_fwd_kernel<ActT, kHeadDim, kCausal>
+        <<<grid, block, smem_bytes, stream>>>(
+            q, k, v, out, softmax_lse, seq_len, scale);
+    return cudaGetLastError();
+#endif
+}
+
+// ── Backward kernel ────────────────────────────────────────────────────
+// Recomputes attention weights from softmax_lse (log-sum-exp saved in fwd).
+// dV = A^T dO, dA = dO V^T, backprop through softmax, dQ = dA' K * scale,
+// dK = dA'^T Q * scale. All in SMEM for these tiny sequence lengths.
+
+template <typename ActT, int kHeadDim, bool kCausal>
+__global__ void __launch_bounds__(128, 4)
+smem_attention_bwd_kernel(
+    const ActT* __restrict__ grad_out,   // [B, H, N, D]
+    const ActT* __restrict__ q,
+    const ActT* __restrict__ k,
+    const ActT* __restrict__ v,
+    const ActT* __restrict__ attn_out,   // saved forward output
+    const float* __restrict__ softmax_lse, // [B, H, N]
+    ActT* __restrict__ grad_q,
+    ActT* __restrict__ grad_k,
+    ActT* __restrict__ grad_v,
+    int seq_len, float scale
+) {
+    const int bh = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int N = seq_len;
+    const int D = kHeadDim;
+    const int base = bh * N * D;
+
+    extern __shared__ float smem[];
+    float* scores = smem;               // N * N  (attention weights)
+    float* dA     = scores + N * N;     // N * N  (grad through attn weights)
+
+    // Recompute attention weights from softmax_lse
+    for (int idx = tid; idx < N * N; idx += blockDim.x) {
+        int i = idx / N, j = idx % N;
+        if constexpr (kCausal) {
+            if (j > i) { scores[idx] = 0.0f; continue; }
+        }
+        float dot = 0.0f;
+        for (int d = 0; d < D; d++)
+            dot += static_cast<float>(q[base + i * D + d])
+                 * static_cast<float>(k[base + j * D + d]);
+        float lse = softmax_lse[bh * N + i];
+        scores[idx] = ptx_expf(dot * scale - lse);
+    }
+    __syncthreads();
+
+    // dV = A^T dO  (accumulated directly to global)
+    for (int idx = tid; idx < N * D; idx += blockDim.x) {
+        int j = idx / D, d = idx % D;
+        float acc = 0.0f;
+        for (int i = 0; i < N; i++) acc += scores[i * N + j]
+            * static_cast<float>(grad_out[base + i * D + d]);
+        grad_v[base + idx] = static_cast<ActT>(acc);
+    }
+    __syncthreads();
+
+    // dA = dO V^T
+    for (int idx = tid; idx < N * N; idx += blockDim.x) {
+        int i = idx / N, j = idx % N;
+        float acc = 0.0f;
+        for (int d = 0; d < D; d++)
+            acc += static_cast<float>(grad_out[base + i * D + d])
+                 * static_cast<float>(v[base + j * D + d]);
+        dA[idx] = acc;
+    }
+    __syncthreads();
+
+    // Backprop through softmax: dS_ij = A_ij * (dA_ij - sum_k(A_ik * dA_ik))
+    for (int i = tid; i < N; i += blockDim.x) {
+        float dot_sum = 0.0f;
+        for (int j = 0; j < N; j++) dot_sum += scores[i * N + j] * dA[i * N + j];
+        for (int j = 0; j < N; j++) {
+            float ds = scores[i * N + j] * (dA[i * N + j] - dot_sum) * scale;
+            if constexpr (kCausal) { if (j > i) ds = 0.0f; }
+            dA[i * N + j] = ds;   // reuse dA storage for dS
+        }
+    }
+    __syncthreads();
+
+    // dQ = dS K
+    for (int idx = tid; idx < N * D; idx += blockDim.x) {
+        int i = idx / D, d = idx % D;
+        float acc = 0.0f;
+        for (int j = 0; j < N; j++)
+            acc += dA[i * N + j] * static_cast<float>(k[base + j * D + d]);
+        grad_q[base + idx] = static_cast<ActT>(acc);
+    }
+
+    // dK = dS^T Q
+    for (int idx = tid; idx < N * D; idx += blockDim.x) {
+        int j = idx / D, d = idx % D;
+        float acc = 0.0f;
+        for (int i = 0; i < N; i++)
+            acc += dA[i * N + j] * static_cast<float>(q[base + i * D + d]);
+        grad_k[base + idx] = static_cast<ActT>(acc);
     }
 }
 
-// =========================================================================
-//  Host-side launcher (per-tensor)
-// =========================================================================
-
-void launch_adamw_step(
-    torch::Tensor& param,
-    torch::Tensor& exp_avg,
-    torch::Tensor& exp_avg_sq,
-    const torch::Tensor& grad,
-    float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2
+// ── Backward dispatch ──────────────────────────────────────────────────
+template <typename ActT, int kHeadDim, bool kCausal>
+cudaError_t attention_backward(
+    const ActT* grad_out,
+    const ActT* q, const ActT* k, const ActT* v,
+    const ActT* out, const ActT* softmax_lse_act,
+    ActT* grad_q, ActT* grad_k, ActT* grad_v,
+    int batch, int n_heads, int seq_len,
+    float scale,
+    cudaStream_t stream
 ) {
-    const int64_t N = param.numel();
-    if (N == 0) return;
-
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    const int block = SG_TUNED_BLOCK_SIZE;
-    const int grid = std::min<int>(65535, (N + block - 1) / block);
-
-    const bool all_fp32 = param.scalar_type() == torch::kFloat32 &&
-                          grad.scalar_type() == torch::kFloat32;
-
-    if (all_fp32 && prim::is_vec4_alignable(param.data_ptr(), N) &&
-        prim::is_vec4_alignable(grad.data_ptr(), N)) {
-        const int N4 = N / 4;
-        const int grid4 = std::min<int>(65535, (N4 + block - 1) / block);
-        adamw_kernel_vec4_fp32<<<grid4, block, 0, stream>>>(
-            reinterpret_cast<float4*>(param.data_ptr<float>()),
-            reinterpret_cast<float4*>(exp_avg.data_ptr<float>()),
-            reinterpret_cast<float4*>(exp_avg_sq.data_ptr<float>()),
-            reinterpret_cast<const float4*>(grad.data_ptr<float>()),
-            lr, beta1, beta2, eps, wd, bc1, bc2, N4);
-        return;
-    }
-
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
-        param.scalar_type(), "adamw_step", [&] {
-            adamw_kernel<scalar_t, scalar_t><<<grid, block, 0, stream>>>(
-                param.data_ptr<scalar_t>(),
-                exp_avg.data_ptr<float>(),
-                exp_avg_sq.data_ptr<float>(),
-                grad.data_ptr<scalar_t>(),
-                lr, beta1, beta2, eps, wd, bc1, bc2, N);
-        });
+    const float* softmax_lse = reinterpret_cast<const float*>(softmax_lse_act);
+    int grid = batch * n_heads;
+    int block = 128;
+    int N = seq_len;
+    int smem_bytes = 2 * N * N * sizeof(float);  // scores + dA
+    smem_attention_bwd_kernel<ActT, kHeadDim, kCausal>
+        <<<grid, block, smem_bytes, stream>>>(
+            grad_out, q, k, v, out, softmax_lse,
+            grad_q, grad_k, grad_v, seq_len, scale);
+    return cudaGetLastError();
 }
 
-}} // namespace sg::sm90
+}}}}  // namespace sg::sm90::models::attention
 
-#endif  // GROKKING_KERNELS_SM90_ADAMW_SM90_CUH_
+#endif  // GROKKING_KERNELS_SM90_ATTENTION_SM90_CUH_

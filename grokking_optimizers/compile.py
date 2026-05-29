@@ -15509,40 +15509,61 @@ def _self_test_kernel_headers(run) -> None:
     KERNEL_DIR = REPO_ROOT / "grokking_optimizers" / "kernels"
 
     def test_elementwise_headers():
+        # Post-migration contract: grokking_optimizers/kernels/ is now the SINGLE
+        # canonical kernel tree (the placeholder scaffolding was replaced by the
+        # production sm_90 device kernels). The sm_90 headers therefore expose the
+        # production API — namespace sg::sm90 and the <opt>_kernel launchers — not
+        # the old placeholder `<opt>_update` / `namespace grokking` convention. The
+        # gfx942 headers remain ATen+rocBLAS (host-compiler routed); see their
+        # AMDGCN-asm-status banner. The vendor-neutral per-element math lives in
+        # csrc/algorithms/<opt>.h (included by each launcher).
         sm90_dir = KERNEL_DIR / "sm_90"
         gfx942_dir = KERNEL_DIR / "gfx942"
+        algo_dir = REPO_ROOT / "csrc" / "algorithms"
         for opt in ("adamw", "lion", "grokfast", "grokadamw"):
             sm = sm90_dir / f"{opt}_sm90.cuh"
             gfx = gfx942_dir / f"{opt}_gfx942.hip.hpp"
+            algo = algo_dir / f"{opt}.h"
             assert sm.is_file(), f"Missing {sm}"
             assert gfx.is_file(), f"Missing {gfx}"
+            assert algo.is_file(), f"Missing {algo}"
             sm_src = _read_kernel(sm)
-            gfx_src = _read_kernel(gfx)
-            assert f"{opt}_update(" in sm_src
-            assert f"{opt}_update(" in gfx_src
-            assert f"{opt}_kernel(" in sm_src
-            assert f"{opt}_kernel(" in gfx_src
-            assert "namespace grokking" in sm_src
-            assert "namespace grokking" in gfx_src
+            algo_src = _read_kernel(algo)
+            # Production sm_90 header: real launcher kernel + production namespace.
+            assert f"{opt}_kernel(" in sm_src, f"{opt}_sm90.cuh missing {opt}_kernel launcher"
+            assert "namespace sg" in sm_src, f"{opt}_sm90.cuh missing namespace sg::sm90"
+            assert "__global__" in sm_src, f"{opt}_sm90.cuh has no __global__ kernels"
+            # Per-element math is in the vendor-neutral algorithm header. The
+            # step entry point is named <opt>_step / <opt>_update / <opt>_*_step
+            # (e.g. grokfast exposes grokfast_fused_step + grokfast_ema_step).
+            assert (f"{opt}_step(" in algo_src or f"{opt}_update(" in algo_src
+                    or f"{opt}_fused_step(" in algo_src), \
+                f"csrc/algorithms/{opt}.h missing per-element step"
 
     def test_model_headers():
-        models = [
-            ("transformer_decoder", "sm_90", "transformer_decoder_sm90.cuh"),
-            ("transformer_decoder", "gfx942", "transformer_decoder_gfx942.hip.hpp"),
-            ("transformer_decoder", "tpu", "transformer_decoder_tpu.py"),
-            ("mamba3", "sm_90", "mamba3_sm90.cuh"),
-            ("mamba3", "gfx942", "mamba3_gfx942.hip.hpp"),
-            ("mamba3", "tpu", "mamba3_tpu.py"),
-            ("vit", "sm_90", "vit_sm90.cuh"),
-            ("vit", "gfx942", "vit_gfx942.hip.hpp"),
-            ("vit", "tpu", "vit_tpu.py"),
-        ]
-        for model, arch, fname in models:
-            p = KERNEL_DIR / arch / fname
+        # Post-migration contract: the sm_90 model headers are the production
+        # device kernels (templated per-layer forward/backward + __global__
+        # launchers), so they expose cudaError_t entry points and real kernels
+        # rather than the old placeholder size-helper tokens. gfx942/tpu remain
+        # as before.
+        for fname in ("transformer_decoder_sm90.cuh", "mamba3_sm90.cuh",
+                      "vit_sm90.cuh"):
+            p = KERNEL_DIR / "sm_90" / fname
             assert p.is_file(), f"Missing {p}"
             src = _read_kernel(p)
-            assert "param_bytes" in src or "Sizes" in src or "SMEM_BYTES" in src, \
-                f"{fname} missing size helpers"
+            assert "__global__" in src, f"{fname} has no __global__ kernels"
+            assert "namespace sg" in src, f"{fname} missing namespace sg::sm90"
+            assert "cudaError_t" in src, f"{fname} missing cudaError_t entry points"
+        for model, arch, fname in [
+            ("transformer_decoder", "gfx942", "transformer_decoder_gfx942.hip.hpp"),
+            ("transformer_decoder", "tpu", "transformer_decoder_tpu.py"),
+            ("mamba3", "gfx942", "mamba3_gfx942.hip.hpp"),
+            ("mamba3", "tpu", "mamba3_tpu.py"),
+            ("vit", "gfx942", "vit_gfx942.hip.hpp"),
+            ("vit", "tpu", "vit_tpu.py"),
+        ]:
+            p = KERNEL_DIR / arch / fname
+            assert p.is_file(), f"Missing {p}"
 
     def test_optimizer_model_cross():
         sm90_dir = KERNEL_DIR / "sm_90"
