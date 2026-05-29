@@ -196,7 +196,7 @@ jobs:
           echo "::endgroup::"
       - name: Upload self-test log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: self-test-log-py${{ matrix.python-version }}
           path: self_test.log
@@ -257,7 +257,7 @@ jobs:
           PY
       - name: Upload manifests artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dry-run-manifests
           path: |
@@ -332,7 +332,7 @@ jobs:
           test -f flag_audit_out/flag_audit.txt
       - name: Upload flag-audit report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: flag-audit
           path: |
@@ -991,7 +991,7 @@ jobs:
         continue-on-error: true
       - name: Upload coverage
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: coverage.txt
