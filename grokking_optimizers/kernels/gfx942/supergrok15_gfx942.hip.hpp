@@ -1,310 +1,205 @@
-#ifndef GROKKING_SUPERGROK15_GFX942_HIP_HPP_
-#define GROKKING_SUPERGROK15_GFX942_HIP_HPP_
-
-#include "common_gfx942.hip.hpp"
-
-namespace grokking {
-namespace gfx942 {
-
-// Forward-declare metanet_forward from supergrok11 header; if compiling
-// standalone, include supergrok11_gfx942.hip.hpp before this header or
-// the fallback definition below will be used.
-#ifndef GROKKING_SUPERGROK11_GFX942_HIP_HPP_
-__forceinline__ __device__
-float metanet_forward(
-    float g,
-    float sharp,
-    const float* __restrict__ W1,
-    const float* __restrict__ b1,
-    const float* __restrict__ W2,
-    const float* __restrict__ b2,
-    float rescale,
-    int hidden_dim
-) {
-    float out = __builtin_nontemporal_load(b2);
-
-    for (int j = 0; j < hidden_dim; ++j) {
-        float z = __builtin_nontemporal_load(&W1[j * 2 + 0]) * g
-                + __builtin_nontemporal_load(&W1[j * 2 + 1]) * sharp
-                + __builtin_nontemporal_load(&b1[j]);
-
-        constexpr float kSqrt2OverPi = 0.7978845608f;
-        constexpr float kCoeff = 0.044715f;
-        float z3 = z * z * z;
-        float inner = kSqrt2OverPi * (z + kCoeff * z3);
-        float h = 0.5f * z * (1.0f + tanhf(inner));
-
-        out += __builtin_nontemporal_load(&W2[j]) * h;
-    }
-
-    return rescale * out;
-}
-#endif  // !GROKKING_SUPERGROK11_GFX942_HIP_HPP_
-
+#ifndef GROKKING_KERNELS_GFX942_SUPERGROK15_GFX942_HIP_HPP_
+#define GROKKING_KERNELS_GFX942_SUPERGROK15_GFX942_HIP_HPP_
 // ============================================================================
-// SuperGrok v1.5 — Sigmoid gating (host-precomputed gate_signal)
+// supergrok15_gfx942.hip.hpp — CANONICAL SuperGrok gfx942 step logic for 'supergrok15'.
 //
-// State tensors (4): exp_avg, exp_avg_sq, mu, sharpness
-// Per-element pipeline:
-//   1. Clip gradient
-//   2. EMA:  mu = layer_alpha * mu + (1 - layer_alpha) * g
-//   3. MetaNet forward -> correction;  smart_g = g + correction
-//   4. gate_signal is a scalar passed from host (not computed per-element)
-//   5. effective_g = g + ramp * lamb * gate_signal * (smart_g - g)
-//   6. AdamW step with per-layer beta1 and effective weight decay
+// AMDGCN-asm status: NOT PRESENT. This path is ATen + rocBLAS
+// (rocBLAS dispatches MFMA v_mfma_f32_16x16x16_bf16 internally for
+// BF16/FP16 GEMMs >= 16). Native __global__ + inline AMDGCN asm
+// requires migrating this file from .hip.cpp to .hip (hipcc-routed);
+// tracked as roadmap item 2. These .hip.cpp TUs route through the host
+// compiler (g++/clang++), which is why they hold host ATen orchestration
+// rather than device kernels.
+//
+// The production TU csrc/backends/hip/gfx942/launch_supergrok15.hip.cpp now
+// #include's this header and keeps only the host launcher(s) the pybind
+// layer calls. Migrated byte-for-byte from that TU.
 // ============================================================================
+// HIP gfx942 launch glue for SuperGrok v1.5.
+// Algorithm: csrc/algorithms/supergrok15.h
+//
+// COMPUTE PATTERN
+// Mixed: meta-MLP + per-coord alpha gate + sharpness backward + AdamW.
+//   Per element:
+//     mu = phi_mlp(grad, sharpness)        — 2-input × H × 1 MLP
+//     alpha = clamp(alpha_base * (1 + mu), 0, alpha_max)
+//     smart_grad = g + gate_signal * alpha * mu
+//     AdamW(smart_grad)
+//   Plus: sharpness EMA update (separate kernel).
+//
+// MFMA APPLICABILITY: same as NeuralGrok / SG11 — partial via rocBLAS dispatch
+// for the MLP.
 
-struct SuperGrok15State {
-    float* __restrict__ exp_avg;
-    float* __restrict__ exp_avg_sq;
-    float* __restrict__ mu;
-    float* __restrict__ sharpness;
+#include <torch/extension.h>
+#include <vector>
 
-    static constexpr int num_state_tensors() { return 4; }
-    static constexpr int state_bytes_per_element() { return 4 * sizeof(float); }
+// ── inlined from former csrc/backends/hip/gfx942/primitives.hpp ──
+// HIP gfx942 (CDNA3 / MI300X) primitives — shared across all 11 launch files.
+//
+// Note: PyTorch routes `.hip.cpp` through the host compiler (g++/clang++),
+// not through hipcc. This means primitives here cannot contain `__global__`
+// kernels or `<<<...>>>` launch syntax. Instead, primitives here are
+// host-side helpers (ATen tensor ops, dtype/device checks, gradient
+// filtering) that the launch_*.hip.cpp files call.
+//
+// The actual GPU work is done by ATen / rocBLAS / hipBLAS via the
+// PyTorch C++ API on the active HIP stream.
+
+#include <torch/extension.h>
+#include <vector>
+#include <cstdint>
+
+namespace sg { namespace gfx942 { namespace primitives {
+
+// =========================================================================
+//  Validate that a tensor is on the active HIP/CUDA device.
+// =========================================================================
+
+inline void check_device(const torch::Tensor& t, const char* name) {
+    TORCH_CHECK(t.is_cuda(), name, " must be on a HIP/CUDA device");
+}
+
+// =========================================================================
+//  Filter (param, grad, state...) tuples to skip params with undefined
+//  or zero-size gradients. Returns parallel vectors of valid entries.
+// =========================================================================
+
+template <typename... Tensors>
+inline bool keep_tensor(const torch::Tensor& grad) {
+    return grad.defined() && grad.numel() > 0;
+}
+
+// =========================================================================
+//  ATen-driven element-wise update helpers.
+//  These build the optimizer math out of broadcasted tensor ops.
+//  PyTorch dispatches them to hipBLAS / hipDNN / pure HIP kernels.
+// =========================================================================
+
+// In-place: m = beta1 * m + (1 - beta1) * g
+inline void ema_update_inplace(
+    torch::Tensor& m, const torch::Tensor& g, float beta1
+) {
+    m.mul_(beta1).add_(g, 1.0f - beta1);
+}
+
+// In-place: v = beta2 * v + (1 - beta2) * g^2
+inline void ema_sq_update_inplace(
+    torch::Tensor& v, const torch::Tensor& g, float beta2
+) {
+    v.mul_(beta2).addcmul_(g, g, 1.0f - beta2);
+}
+
+// In-place: p = p - lr * (m_hat / (sqrt(v_hat) + eps) + wd * p)
+inline void adam_apply_inplace(
+    torch::Tensor& p, const torch::Tensor& m, const torch::Tensor& v,
+    float lr, float bc1, float bc2, float eps, float wd
+) {
+    auto m_hat = m / bc1;  // bc1 = 1 - beta1^t (un-inverted)
+    auto v_hat = v / bc2;  // bc2 = 1 - beta2^t (un-inverted)
+    auto denom = v_hat.sqrt().add_(eps);
+    auto update = m_hat.div_(denom).add_(p, wd);
+    p.add_(update, -lr);
+}
+
+// =========================================================================
+//  Tensor-pack helper for multi-tensor optimizer paths.
+//  Collects valid (param, grad, ...) pairs into a contiguous std::vector.
+// =========================================================================
+
+struct TensorPack {
+    std::vector<torch::Tensor> params;
+    std::vector<torch::Tensor> grads;
+    std::vector<torch::Tensor> state_a;
+    std::vector<torch::Tensor> state_b;
 };
 
-// --------------------------------------------------------------------------
-// Scalar per-element update
-// --------------------------------------------------------------------------
-template <typename ParamT, NanPolicy NAN_POLICY = NanPolicy::kNone, bool ENABLE_CLIP = false>
-__forceinline__ __device__
-void supergrok15_update(
-    ParamT* __restrict__       params,
-    const ParamT* __restrict__ grads,
-    SuperGrok15State           state,
-    int64_t                    n,
-    float lr,
-    float layer_beta1,
-    float beta2,
-    float eps,
-    float weight_decay,
-    float layer_alpha,
-    float lamb,
-    float ramp,
-    float gate_signal,
-    float grad_clip,
-    const float* __restrict__ W1,
-    const float* __restrict__ b1,
-    const float* __restrict__ W2,
-    const float* __restrict__ b2,
-    float rescale,
-    int   hidden_dim,
-    float bias_correction1,
-    float bias_correction2,
-    float clip_threshold = 0.0f
+inline TensorPack pack_valid(
+    const std::vector<torch::Tensor>& params,
+    const std::vector<torch::Tensor>& grads,
+    const std::vector<torch::Tensor>& state_a = {},
+    const std::vector<torch::Tensor>& state_b = {}
 ) {
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    TensorPack out;
+    for (size_t i = 0; i < params.size(); i++) {
+        if (!grads[i].defined() || grads[i].numel() == 0) continue;
+        out.params.push_back(params[i]);
+        out.grads.push_back(grads[i]);
+        if (!state_a.empty()) out.state_a.push_back(state_a[i]);
+        if (!state_b.empty()) out.state_b.push_back(state_b[i]);
+    }
+    return out;
+}
 
-    for (int64_t i = idx; i < n; i += stride) {
-        // Streaming non-temporal grad read
-        ParamT g_raw = __builtin_nontemporal_load(grads + i);
-        float g = to_float(g_raw);
-        g = apply_nan_policy<NAN_POLICY>(g);
-        g = apply_clip<ENABLE_CLIP>(g, clip_threshold);
+}}} // namespace sg::gfx942::primitives
+// ── end inlined csrc/backends/hip/gfx942/primitives.hpp ──
 
-        // Step 1: always-on per-element gradient clip
-        g = fminf(fmaxf(g, -grad_clip), grad_clip);
+namespace sg { namespace gfx942 {
 
-        // Step 2: EMA gradient update
-        float mu_old = state.mu[i];
-        float mu_val = layer_alpha * mu_old + (1.0f - layer_alpha) * g;
+namespace prim = ::sg::gfx942::primitives;
 
-        // Read current sharpness
-        float sharp = state.sharpness[i];
+void launch_supergrok15_step(
+    std::vector<torch::Tensor>& params,
+    std::vector<torch::Tensor>& exp_avgs,
+    std::vector<torch::Tensor>& exp_avg_sqs,
+    std::vector<torch::Tensor>& mu_bufs,
+    std::vector<torch::Tensor>& grads,
+    std::vector<torch::Tensor>& sharpnesses,
+    const torch::Tensor& phi_W1,
+    const torch::Tensor& phi_b1,
+    const torch::Tensor& phi_W2,
+    float phi_b2,
+    float gate_global,
+    float alpha_base, float alpha_max,
+    float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2
+) {
+    for (size_t i = 0; i < params.size(); i++) {
+        if (!grads[i].defined() || grads[i].numel() == 0) continue;
+        auto& p = params[i];
+        auto& g = grads[i];
+        auto& m = exp_avgs[i];
+        auto& v = exp_avg_sqs[i];
+        auto& mu = mu_bufs[i];
 
-        // Step 3: MetaNet forward
-        float correction = metanet_forward(g, sharp, W1, b1, W2, b2, rescale, hidden_dim);
-        float smart_g = g + correction;
+        // Sweep A: meta-net forward
+        auto x = torch::stack({g.to(torch::kFloat32).view({-1}),
+                               sharpnesses[i].view({-1})}, /*dim=*/1);
+        auto h = torch::tanh(torch::matmul(x, phi_W1.t()) + phi_b1);
+        auto mu_flat = (torch::matmul(h, phi_W2.unsqueeze(1)) + phi_b2).view_as(g);
+        mu.copy_(mu_flat);
 
-        // Step 4-5: gate_signal is host-precomputed (sigmoid); apply directly
-        float effective_g = g + ramp * lamb * gate_signal * (smart_g - g);
+        // Per-coord alpha, then smart_grad
+        auto a_per_coord = torch::clamp(alpha_base * (1.0f + mu), 0.0f, alpha_max);
+        auto smart = g.to(torch::kFloat32) + gate_global * a_per_coord * mu;
 
-        // Step 6: AdamW step using effective_g
-        float p_f   = to_float(params[i]);
-        float m_old = state.exp_avg[i];
-        float v_old = state.exp_avg_sq[i];
-
-        float m = layer_beta1 * m_old + (1.0f - layer_beta1) * effective_g;
-        float v = beta2 * v_old + (1.0f - beta2) * effective_g * effective_g;
-
-        float m_hat = m * bias_correction1;
-        float v_hat = v * bias_correction2;
-
-        float denom  = sqrtf(v_hat) + eps;
-        float update = m_hat / denom + weight_decay * p_f;
-
-        p_f -= lr * update;
-
-        // Update sharpness (magnitude of gradient correction as a running signal)
-        float new_sharp = layer_alpha * sharp + (1.0f - layer_alpha) * fabsf(correction);
-
-        // Writeback
-        state.exp_avg[i]    = m;
-        state.exp_avg_sq[i] = v;
-        state.mu[i]         = mu_val;
-        state.sharpness[i]  = new_sharp;
-        params[i]           = from_float<ParamT>(p_f);
+        prim::ema_update_inplace(m, smart, beta1);
+        prim::ema_sq_update_inplace(v, smart, beta2);
+        prim::adam_apply_inplace(p, m, v, lr, bc1, bc2, eps, wd);
     }
 }
 
-// --------------------------------------------------------------------------
-// Vectorized path for float params, 4 elements per thread via float4.
-// --------------------------------------------------------------------------
-template <NanPolicy NAN_POLICY = NanPolicy::kNone, bool ENABLE_CLIP = false>
-__forceinline__ __device__
-void supergrok15_update_vec4(
-    float* __restrict__       params,
-    const float* __restrict__ grads,
-    SuperGrok15State          state,
-    int64_t                   n,
-    float lr,
-    float layer_beta1,
-    float beta2,
-    float eps,
-    float weight_decay,
-    float layer_alpha,
-    float lamb,
-    float ramp,
-    float gate_signal,
-    float grad_clip,
-    const float* __restrict__ W1,
-    const float* __restrict__ b1,
-    const float* __restrict__ W2,
-    const float* __restrict__ b2,
-    float rescale,
-    int   hidden_dim,
-    float bias_correction1,
-    float bias_correction2,
-    float clip_threshold = 0.0f
+
+void launch_fused_supergrok15_full_step(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor mu, torch::Tensor grad, torch::Tensor sharpness, float alpha, torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2, float rescale, float lamb_eff, float beta1, float beta2, float lr, float wd_eff, float eps, float bc1, float bc2, int hidden_dim
 ) {
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
-
-    const int64_t n4 = n / 4;
-
-    float4* __restrict__       p4  = reinterpret_cast<float4*>(params);
-    const float4* __restrict__ g4  = reinterpret_cast<const float4*>(grads);
-    float4* __restrict__       m4  = reinterpret_cast<float4*>(state.exp_avg);
-    float4* __restrict__       v4  = reinterpret_cast<float4*>(state.exp_avg_sq);
-    float4* __restrict__       mu4 = reinterpret_cast<float4*>(state.mu);
-    float4* __restrict__       sh4 = reinterpret_cast<float4*>(state.sharpness);
-
-    for (int64_t i = idx; i < n4; i += stride) {
-        float4 p_vec  = p4[i];
-        float4 g_vec  = __builtin_nontemporal_load(g4 + i);
-        float4 m_vec  = m4[i];
-        float4 v_vec  = v4[i];
-        float4 mu_vec = mu4[i];
-        float4 sh_vec = sh4[i];
-
-        float gs[4]  = {g_vec.x,  g_vec.y,  g_vec.z,  g_vec.w};
-        float ps[4]  = {p_vec.x,  p_vec.y,  p_vec.z,  p_vec.w};
-        float ms[4]  = {m_vec.x,  m_vec.y,  m_vec.z,  m_vec.w};
-        float vs[4]  = {v_vec.x,  v_vec.y,  v_vec.z,  v_vec.w};
-        float mus[4] = {mu_vec.x, mu_vec.y, mu_vec.z, mu_vec.w};
-        float shs[4] = {sh_vec.x, sh_vec.y, sh_vec.z, sh_vec.w};
-
-        #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            float g = apply_nan_policy<NAN_POLICY>(gs[k]);
-            g = apply_clip<ENABLE_CLIP>(g, clip_threshold);
-
-            // Always-on gradient clip
-            g = fminf(fmaxf(g, -grad_clip), grad_clip);
-
-            // EMA
-            float mu_val = layer_alpha * mus[k] + (1.0f - layer_alpha) * g;
-
-            // MetaNet
-            float correction = metanet_forward(g, shs[k], W1, b1, W2, b2, rescale, hidden_dim);
-            float smart_g = g + correction;
-
-            // Host-precomputed sigmoid gate
-            float effective_g = g + ramp * lamb * gate_signal * (smart_g - g);
-
-            // AdamW
-            float m = layer_beta1 * ms[k] + (1.0f - layer_beta1) * effective_g;
-            float v = beta2 * vs[k] + (1.0f - beta2) * effective_g * effective_g;
-
-            float m_hat = m * bias_correction1;
-            float v_hat = v * bias_correction2;
-
-            ps[k] -= lr * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * ps[k]);
-            ms[k]  = m;
-            vs[k]  = v;
-            mus[k] = mu_val;
-            shs[k] = layer_alpha * shs[k] + (1.0f - layer_alpha) * fabsf(correction);
-        }
-
-        p4[i]  = make_float4(ps[0],  ps[1],  ps[2],  ps[3]);
-        m4[i]  = make_float4(ms[0],  ms[1],  ms[2],  ms[3]);
-        v4[i]  = make_float4(vs[0],  vs[1],  vs[2],  vs[3]);
-        mu4[i] = make_float4(mus[0], mus[1], mus[2], mus[3]);
-        sh4[i] = make_float4(shs[0], shs[1], shs[2], shs[3]);
-    }
-
-    // Handle tail elements
-    int64_t tail_start = n4 * 4;
-    for (int64_t i = tail_start + idx; i < n; i += stride) {
-        float g_raw = __builtin_nontemporal_load(grads + i);
-        float g = apply_nan_policy<NAN_POLICY>(g_raw);
-        g = apply_clip<ENABLE_CLIP>(g, clip_threshold);
-        g = fminf(fmaxf(g, -grad_clip), grad_clip);
-
-        float mu_old = state.mu[i];
-        float mu_val = layer_alpha * mu_old + (1.0f - layer_alpha) * g;
-        float sharp = state.sharpness[i];
-
-        float correction = metanet_forward(g, sharp, W1, b1, W2, b2, rescale, hidden_dim);
-        float smart_g = g + correction;
-
-        float effective_g = g + ramp * lamb * gate_signal * (smart_g - g);
-
-        float p_f   = params[i];
-        float m_old = state.exp_avg[i];
-        float v_old = state.exp_avg_sq[i];
-
-        float m = layer_beta1 * m_old + (1.0f - layer_beta1) * effective_g;
-        float v = beta2 * v_old + (1.0f - beta2) * effective_g * effective_g;
-
-        float m_hat = m * bias_correction1;
-        float v_hat = v * bias_correction2;
-
-        p_f -= lr * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * p_f);
-
-        float new_sharp = layer_alpha * sharp + (1.0f - layer_alpha) * fabsf(correction);
-
-        state.exp_avg[i]    = m;
-        state.exp_avg_sq[i] = v;
-        state.mu[i]         = mu_val;
-        state.sharpness[i]  = new_sharp;
-        params[i]           = p_f;
-    }
+    throw std::runtime_error(
+        "launch_fused_supergrok15_full_step: HIP gfx942 kernel not yet implemented.");
 }
 
-// --------------------------------------------------------------------------
-// Global launcher kernel
-// --------------------------------------------------------------------------
-template <typename ParamT, NanPolicy NAN_POLICY, bool ENABLE_CLIP>
-__global__ void supergrok15_kernel(
-    ParamT* params, const ParamT* grads, SuperGrok15State state, int64_t n,
-    float lr, float layer_beta1, float beta2, float eps, float wd,
-    float layer_alpha, float lamb, float ramp, float gate_signal, float grad_clip,
-    const float* W1, const float* b1, const float* W2, const float* b2,
-    float rescale, int hidden_dim,
-    float bc1, float bc2, float clip_threshold
+void launch_sam_perturb(
+    torch::Tensor param, torch::Tensor grad, float rho_over_norm
 ) {
-    supergrok15_update<ParamT, NAN_POLICY, ENABLE_CLIP>(
-        params, grads, state, n,
-        lr, layer_beta1, beta2, eps, wd,
-        layer_alpha, lamb, ramp, gate_signal, grad_clip,
-        W1, b1, W2, b2, rescale, hidden_dim,
-        bc1, bc2, clip_threshold);
+    throw std::runtime_error(
+        "launch_sam_perturb: HIP gfx942 kernel not yet implemented.");
 }
 
-}  // namespace gfx942
-}  // namespace grokking
+void launch_sharpness_restore(
+    torch::Tensor param, torch::Tensor sharpness, torch::Tensor backup, torch::Tensor sam_grad, torch::Tensor normal_grad
+) {
+    throw std::runtime_error(
+        "launch_sharpness_restore: HIP gfx942 kernel not yet implemented.");
+}
 
-#endif  // GROKKING_SUPERGROK15_GFX942_HIP_HPP_
+}} // namespace sg::gfx942
+
+#endif  // GROKKING_KERNELS_GFX942_SUPERGROK15_GFX942_HIP_HPP_
