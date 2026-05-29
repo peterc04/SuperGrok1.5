@@ -1389,7 +1389,7 @@ class SuperGrok2(Optimizer):
                 for k, i in enumerate(active_indices)
             ]
             # supergrok2_prepare_and_batched_step keeps its name (spec §5).
-            prepare_step = getattr(_ops, 'supergrok2_prepare_and_batched_step')
+            prepare_step = _ops.supergrok2_prepare_and_batched_step
             prepare_step(
                 [self._flat_params[i].data for i in active_indices],
                 active_grads,

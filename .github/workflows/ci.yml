@@ -42,20 +42,26 @@ jobs:
         continue-on-error: true
 
   # ---------------------------------------------------------------------------
-  # py_compile — every .py in the package must parse cleanly. Cheapest gate.
+  # py_compile — every .py in the WHOLE repo (package + root scripts) must parse
+  # cleanly. Cheapest gate.
   # ---------------------------------------------------------------------------
   py_compile:
-    name: py_compile (syntax)
+    name: py_compile (syntax, whole repo)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: py_compile every module
+      - name: py_compile every module (package + root scripts)
         run: |
-          find grokking_optimizers -name '*.py' -print0 \
-            | xargs -0 -n1 python3 -m py_compile
+          # Package modules + top-level scripts (grokking_race_v2.py,
+          # bench_backends.py, setup.py). Excludes third_party/ and build/.
+          { find grokking_optimizers -name '*.py' \
+              -not -path '*/third_party/*' -not -path '*/build/*'; \
+            find . -maxdepth 1 -name '*.py'; } \
+            | sort -u | xargs -n1 python3 -m py_compile
+          echo "py_compile: all modules + root scripts parse cleanly"
 
   # ---------------------------------------------------------------------------
   # Import smoke — import each public surface in isolation. Catches missing
@@ -443,6 +449,171 @@ jobs:
         run: python3 -u -m grokking_optimizers.compile --self-test 2>&1 | tail -10
 
   # ---------------------------------------------------------------------------
+  # Whole-repo lint — runs ruff across the ENTIRE repo (package + root scripts).
+  # NON-BLOCKING: the root race driver/bench scripts use a terse one-liner style
+  # with ~370 baseline style hits, so this surfaces drift (and feeds CI auto-fix)
+  # without gating merges. The blocking `lint` job above guards the package.
+  # ---------------------------------------------------------------------------
+  lint_full:
+    name: ruff lint (whole repo, non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install ruff
+        run: pip install ruff
+      - name: ruff check (whole repo)
+        run: ruff check . --output-format=github
+        continue-on-error: true
+      - name: ruff format --check (whole repo)
+        run: ruff format --check .
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # C++/CUDA/HIP structural sanity — no toolchain needed. Catches the classes
+  # of breakage that have actually bitten this repo: unbalanced braces from
+  # block edits, merge-conflict markers, stale includes of deleted headers,
+  # references to removed symbols, and drift in the per-arch launch-file count.
+  # ---------------------------------------------------------------------------
+  cpp_structural:
+    name: C++ structural sanity (no toolchain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Structural checks over csrc/
+        run: |
+          python3 - <<'PY'
+          import glob, re, sys
+          EXT = ('.cu', '.cuh', '.cpp', '.h', '.hpp')
+          fails = []
+          files = [f for f in glob.glob('csrc/**/*', recursive=True)
+                   if f.endswith(EXT)]
+          for f in files:
+              s = open(f, errors='ignore').read()
+              if re.search(r'^(<{7}|={7}|>{7})', s, re.M):
+                  fails.append(f'merge-conflict marker: {f}')
+              if s.count('{') != s.count('}'):
+                  fails.append(f'brace imbalance: {f} '
+                               f'({s.count("{")} open / {s.count("}")} close)')
+              if '#include "csrc/tuning.h"' in s:
+                  fails.append(f'stale include of deleted csrc/tuning.h: {f}')
+              # Symbols removed in the CSA/HCA audit must not reappear (except
+              # the SG2 launcher, which keeps the moe_* stubs intentionally).
+              for sym in ('distributed_scan', 'fp8_e4m3_quantize',
+                          'int8_symmetric_quantize', 'int4_gptq_quantize',
+                          'BatchedScanCtx'):
+                  if sym in s and 'launch_supergrok2' not in f:
+                      fails.append(f'removed symbol {sym!r} reappeared in {f}')
+          # Per-arch launch-file count contract: exactly 11 per arch.
+          cu  = len(glob.glob('csrc/backends/cuda/sm_90/launch_*.cu'))
+          hip = len(glob.glob('csrc/backends/hip/gfx942/launch_*.hip.cpp'))
+          if cu != 11:
+              fails.append(f'cuda sm_90 launch files: {cu} (expected 11)')
+          if hip != 11:
+              fails.append(f'hip gfx942 launch files: {hip} (expected 11)')
+          # Bindings: exactly the 3 surviving files.
+          import os
+          binds = sorted(os.path.basename(p) for p in glob.glob('csrc/bindings/*'))
+          expected = ['bindings.cpp', 'dispatch.cpp', 'helpers.h']
+          if binds != expected:
+              fails.append(f'csrc/bindings/ = {binds} (expected {expected})')
+          print(f'scanned {len(files)} C/C++/CUDA/HIP files')
+          if fails:
+              for m in fails:
+                  print(f'::error::{m}')
+              sys.exit(1)
+          print('C++ structural sanity: OK')
+          PY
+
+  # ---------------------------------------------------------------------------
+  # Functional smoke — real torch forward/backward on CPU. Verifies the three
+  # race models and the learned-optimizer meta-nets construct, and that
+  # gradient checkpointing is numerically transparent (bit-identical grads
+  # with it on vs off). This is the correctness gate that the GPU-gated
+  # self-test cannot cover on a CPU runner.
+  # ---------------------------------------------------------------------------
+  functional_smoke:
+    name: functional smoke (torch CPU + grad checkpointing)
+    runs-on: ubuntu-latest
+    needs: py_compile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch + race deps
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy matplotlib tqdm
+      - name: Model + meta-net + checkpointing parity
+        env:
+          FORCE_ARCH: "90"   # let optimizers construct on a CPU runner
+        run: |
+          python3 - <<'PY'
+          import torch, torch.nn.functional as F
+          import grokking_race_v2 as g
+
+          def parity(make, x):
+              res = {}
+              for gc in (False, True):
+                  torch.manual_seed(7)
+                  m = make(gc); m.train()
+                  out = m(x)
+                  loss = out.float().pow(2).mean()
+                  loss.backward()
+                  grads = torch.cat([p.grad.flatten()
+                                     for p in m.parameters() if p.grad is not None])
+                  res[gc] = (out.detach(), grads)
+              od = (res[False][0] - res[True][0]).abs().max().item()
+              gd = (res[False][1] - res[True][1]).abs().max().item()
+              return od, gd
+
+          checks = []
+          xt = torch.randint(0, 99, (8, 4))
+          checks.append(('Transformer',
+              parity(lambda gc: g.Transformer(nl=2, d=32, h=4, ntok=99, seq=4,
+                                              grad_checkpoint=gc), xt)))
+          xv = torch.randn(6, 16, 49)
+          checks.append(('ViT',
+              parity(lambda gc: g.ViT(p=97, patch_dim=49, num_patches=16, d=32,
+                                      h=4, nl=2, grad_checkpoint=gc), xv)))
+          xm = torch.randint(0, 99, (8, 8))
+          checks.append(('Mamba',
+              parity(lambda gc: g.MambaModel(p=97, ntok=99, seq_len=8, d=32,
+                                             nl=2, grad_checkpoint=gc), xm)))
+
+          bad = []
+          for name, (od, gd) in checks:
+              print(f'{name:12s} out_diff={od:.2e} grad_diff={gd:.2e}')
+              if od > 1e-4 or gd > 1e-4:
+                  bad.append(name)
+          if bad:
+              print(f'::error::gradient-checkpointing parity failed: {bad}')
+              raise SystemExit(1)
+
+          # eval/no-grad bypass must not error
+          m = g.Transformer(nl=2, d=32, grad_checkpoint=True); m.eval()
+          with torch.no_grad():
+              _ = m(xt)
+
+          # Meta-nets construct (pure PyTorch, CPU).
+          import grokking_optimizers.optimizers.supergrok2 as sg2
+          net = sg2.CSAHCAMetaNet(d_model=8)
+          assert net.grad_checkpoint is True
+          w = net.get_weights()
+          for k in ('csa_q_W', 'hca_q_W', 'csa_compress_w', 'expert_W1'):
+              assert k in w, f'meta-net weight {k} missing'
+          print('functional smoke: OK')
+          PY
+
+  # ---------------------------------------------------------------------------
   # Aggregate gate — every required job must pass for a green check. Branch
   # protection should require THIS single job rather than each individual one.
   # ---------------------------------------------------------------------------
@@ -459,6 +630,8 @@ jobs:
       - cli_surface
       - e2e_smoke_skip
       - package_metadata
+      - cpp_structural
+      - functional_smoke
     if: always()
     steps:
       - name: Verify all required jobs succeeded
