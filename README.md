@@ -493,16 +493,24 @@ branches anywhere in the file.
 `sm_103 → sm_103a`, `sm_120 → sm_120a`. Both keys resolve to the same
 `ArchEntry` object via `is`-identity.
 
-> **Registered ≠ hand-tuned.** Every arch above is registered, search-
-> space-complete, and dry-runnable, and the flag/gencode emission is
-> arch-correct for all 26. But hand-written per-arch kernel **sources**
-> currently exist only for **`sm_90` (CUDA)** and **`gfx942` (HIP)** under
-> `csrc/backends/`, plus the **Pallas** Python kernels for TPU. The other
-> CUDA/HIP arches resolve through the shared bindings + algorithm headers
-> and the generic codegen template — they compile and are numerically
-> correct, but they do not yet have arch-specialized kernel bodies
-> (e.g. Blackwell tcgen05, Ampere async-copy). See the Build-status
-> matrices below, which list only the arches with real kernel sources.
+> **Multi-arch build, one source per vendor.** Every arch above is registered,
+> search-space-complete, and dry-runnable, and the flag/gencode emission is
+> arch-correct for all 26. The kernel **source** is single-per-vendor: one CUDA
+> tree (`csrc/backends/cuda/sm_90/`, namespace `sg::sm90`) and one HIP tree
+> (`csrc/backends/hip/gfx942/`, `sg::gfx942`), plus the Pallas Python kernels for
+> TPU. That source is portable — the arch-specialized paths (CUTLASS Sm90,
+> `wgmma`, MFMA) are `#ifdef`/`__CUDA_ARCH__`-gated and the default path is
+> ATen/cuBLAS/rocBLAS — so `setup.py` **gencode/offload-compiles it for every
+> NVIDIA CC / AMD gfx the installed toolchain accepts** (a fat binary; the
+> candidate set is probe-filtered, falling back to `sm_90`/`gfx942`). Runtime
+> dispatch (`csrc/bindings/dispatch.cpp` + `dispatch.py`) **vendor-routes**: any
+> NVIDIA device → the `sm90` impl, any AMD device → the `gfx942` impl, with the
+> driver selecting the matching per-SM/-gfx code from the fat binary. So the
+> "mega kernels" run across the full arch picture, not just `sm_90`/`gfx942`.
+> What is *not* yet present is **arch-specialized kernel bodies** (e.g. Blackwell
+> `tcgen05`, Ampere async-copy variants) — those archs run the portable shared
+> source rather than hand-tuned-per-arch code. Override the default target set
+> with `TORCH_CUDA_ARCH_LIST`.
 
 ### Per-arch search space cardinalities
 
