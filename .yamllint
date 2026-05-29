@@ -1,0 +1,17 @@
+# Relaxed yamllint config — focuses on real errors (syntax, duplicate keys,
+# tabs) rather than cosmetic line-length/indentation, so GitHub Actions
+# workflows (which legitimately use long `run:` lines) lint cleanly.
+extends: relaxed
+
+rules:
+  line-length: disable
+  document-start: disable
+  comments:
+    min-spaces-from-content: 1
+  truthy:
+    # GitHub Actions uses `on:` as a key — don't flag it as a boolean.
+    allowed-values: ["true", "false", "on", "off"]
+    check-keys: false
+  indentation:
+    spaces: consistent
+    indent-sequences: whatever

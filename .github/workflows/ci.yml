@@ -135,7 +135,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     env:
       GROK_NO_AUTO_INSTALL: "1"
     steps:
@@ -612,6 +612,205 @@ jobs:
               assert k in w, f'meta-net weight {k} missing'
           print('functional smoke: OK')
           PY
+
+  # ===========================================================================
+  # NON-BLOCKING QUALITY / SECURITY CHECKS
+  # ---------------------------------------------------------------------------
+  # The jobs below all run `continue-on-error: true` (and are NOT in the
+  # ci_success gate). They exist to maximise check coverage and feed CI
+  # auto-fix mode with actionable annotations, WITHOUT spuriously blocking
+  # merges on a baseline that is not yet clean. Promote any one of them into
+  # the gate by removing continue-on-error and adding it to ci_success.needs.
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Type checking — mypy over the package (non-blocking; the scientific code
+  # is largely untyped, so this surfaces gradual-typing opportunities).
+  # ---------------------------------------------------------------------------
+  typecheck:
+    name: mypy (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install mypy + stubs
+        run: pip install mypy types-PyYAML
+      - name: mypy
+        run: mypy grokking_optimizers --ignore-missing-imports --no-error-summary
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # Security lint — bandit scans Python for common security footguns.
+  # ---------------------------------------------------------------------------
+  security_bandit:
+    name: bandit security scan (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install bandit
+        run: pip install "bandit[toml]"
+      - name: bandit
+        run: bandit -r grokking_optimizers -ll -x '*/third_party/*' --format screen
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # Dependency vulnerability audit — pip-audit against the declared deps.
+  # ---------------------------------------------------------------------------
+  deps_audit:
+    name: pip-audit (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install pip-audit
+        run: pip install pip-audit
+      - name: Audit declared dependencies
+        run: |
+          python3 - <<'PY' > requirements-audit.txt
+          import tomllib, pathlib
+          d = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          print("\n".join(d["project"].get("dependencies", [])))
+          PY
+          cat requirements-audit.txt
+          pip-audit -r requirements-audit.txt || true
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # Spell check — codespell over source + docs (skips vendored/binary dirs).
+  # ---------------------------------------------------------------------------
+  codespell:
+    name: codespell (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install codespell
+        run: pip install codespell
+      - name: codespell
+        run: codespell --config .codespellrc
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # YAML lint — validate every workflow / config YAML against .yamllint.
+  # ---------------------------------------------------------------------------
+  yamllint:
+    name: yamllint (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install yamllint
+        run: pip install yamllint
+      - name: yamllint
+        run: yamllint -c .yamllint .github/
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # actionlint — static check of the GitHub Actions workflows themselves.
+  # ---------------------------------------------------------------------------
+  actionlint:
+    name: actionlint (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run actionlint
+        uses: raven-actions/actionlint@v2
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # shellcheck — lint build.sh and any other shell scripts.
+  # ---------------------------------------------------------------------------
+  shellcheck:
+    name: shellcheck (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
+      - name: shellcheck *.sh
+        run: |
+          shopt -s nullglob globstar
+          files=( **/*.sh )
+          if [ ${#files[@]} -eq 0 ]; then echo "no shell scripts"; exit 0; fi
+          shellcheck "${files[@]}"
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # Markdown link check — verify links in README + docs resolve.
+  # ---------------------------------------------------------------------------
+  markdown_links:
+    name: markdown link check (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: lychee link checker
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: "--no-progress --max-concurrency 4 './**/*.md'"
+          fail: false
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # TODO / FIXME audit — informational census of debt markers in source.
+  # ---------------------------------------------------------------------------
+  todo_audit:
+    name: TODO/FIXME census (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Count debt markers
+        run: |
+          echo "::group::TODO / FIXME / XXX / HACK markers"
+          grep -rnE 'TODO|FIXME|XXX|HACK' \
+            --include='*.py' --include='*.cu' --include='*.cuh' \
+            --include='*.cpp' --include='*.h' --include='*.hpp' \
+            grokking_optimizers csrc 2>/dev/null | tee debt.txt | tail -200 || true
+          echo "::endgroup::"
+          echo "marker count: $(wc -l < debt.txt 2>/dev/null || echo 0)"
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # Windows smoke — cross-platform import + self-test on a Windows runner.
+  # Kept out of the required gate (Windows runners are slower / occasionally
+  # flaky); still surfaces as its own check.
+  # ---------------------------------------------------------------------------
+  windows_smoke:
+    name: Windows smoke (3.11, non-gating)
+    runs-on: windows-latest
+    needs: py_compile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch + deps
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy pyyaml optuna ninja
+      - name: Import + list-archs
+        run: |
+          python -c "from grokking_optimizers.compile import _resolve_default_arch; print(_resolve_default_arch())"
+          python -m grokking_optimizers.compile --list-archs
+      - name: --self-test
+        env:
+          GROK_NO_AUTO_INSTALL: "1"
+        run: python -u -m grokking_optimizers.compile --self-test
+        continue-on-error: true
 
   # ---------------------------------------------------------------------------
   # Aggregate gate — every required job must pass for a green check. Branch
