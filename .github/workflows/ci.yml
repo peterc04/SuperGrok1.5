@@ -997,6 +997,68 @@ jobs:
           path: coverage.txt
           retention-days: 14
 
+  # ---------------------------------------------------------------------------
+  # Arch dispatch normalization — every arch in ARCH_TABLE must FORCE_ARCH-
+  # normalize to the correct vendor impl selector (NVIDIA -> 90, AMD -> 942,
+  # TPU -> tpu_v5p). Locks in the multi-arch "mega kernel" routing so the fat
+  # binary is reachable from every supported device, not just sm_90/gfx942.
+  # ---------------------------------------------------------------------------
+  arch_dispatch:
+    name: vendor-routing across all archs
+    runs-on: ubuntu-latest
+    needs: py_compile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch + deps
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy pyyaml optuna ninja
+      - name: FORCE_ARCH normalization for every ARCH_TABLE entry
+        run: |
+          python3 - <<'PY'
+          import os, subprocess, sys
+          from grokking_optimizers.compile import ARCH_TABLE
+          bad = []
+          for arch in ARCH_TABLE:
+              if arch.startswith("tpu"):
+                  expected = "tpu_v5p"
+              elif arch.startswith("gfx"):
+                  expected = "942"
+              elif arch.startswith("sm_"):
+                  expected = "90"
+              else:
+                  continue
+              # Fresh process so the lru_cache picks up this FORCE_ARCH.
+              code = ("from grokking_optimizers.dispatch import detect_arch;"
+                      "print(detect_arch())")
+              env = dict(os.environ, FORCE_ARCH=arch)
+              out = subprocess.run([sys.executable, "-c", code],
+                                   capture_output=True, text=True, env=env)
+              got = out.stdout.strip()
+              status = "ok" if got == expected else "MISMATCH"
+              print(f"{status:8s} {arch:10s} -> {got} (expected {expected})")
+              if got != expected:
+                  bad.append((arch, got, expected))
+          # Also verify setup.py's probe helpers degrade safely with no toolchain.
+          ns = {}
+          head = open("setup.py").read().split("# Backend detection.")[0]
+          exec(compile(head, "setup.py", "exec"), ns)
+          gc = ns["_supported_gencode"]()
+          off = ns["_supported_offload"]()
+          assert any("sm_90" in f for f in gc), gc
+          assert any("gfx942" in f for f in off), off
+          print(f"setup probe fallback OK: gencode={gc}, offload={off}")
+          if bad:
+              for b in bad:
+                  print(f"::error::arch routing mismatch: {b}")
+              raise SystemExit(1)
+          print(f"all {len(ARCH_TABLE)} ARCH_TABLE entries route correctly")
+          PY
+
   # ===========================================================================
   # NON-BLOCKING QUALITY / SECURITY CHECKS
   # ---------------------------------------------------------------------------
@@ -1222,6 +1284,7 @@ jobs:
       - functional_metanets
       - determinism
       - docs_consistency
+      - arch_dispatch
     if: always()
     steps:
       - name: Verify all required jobs succeeded

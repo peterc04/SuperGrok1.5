@@ -23,6 +23,8 @@ To build for a specific arch subset:
 import glob
 import os
 import shutil
+import subprocess
+import tempfile
 
 import torch
 from setuptools import find_packages, setup
@@ -39,8 +41,12 @@ from torch.utils.cpp_extension import BuildExtension
 #                       Muon Newton-Schulz) through CUTLASS instead of
 #                       cuBLAS. Requires third_party/cutlass cloned via
 #                       `git submodule update --init`. Only emits CUTLASS
-#                       arch flags for sm_90; gfx942 stays on rocBLAS
-#                       unconditionally.
+#                       arch flags for sm_90 and restricts the multi-arch
+#                       gencode set to Hopper+ (the Sm90 collective will not
+#                       build for older targets); gfx942 stays on rocBLAS.
+#   TORCH_CUDA_ARCH_LIST -> override the default multi-arch build. Unset, the
+#                       build targets every NVIDIA CC / AMD gfx the installed
+#                       toolchain accepts (probe-filtered fat binary).
 # ----------------------------------------------------------------------
 
 _cuda_debug = os.environ.get("CUDA_DEBUG", "0") == "1"
@@ -75,6 +81,86 @@ if _launcher_path:
     # ccache/sccache install style) and let torch invoke nvcc normally.
 else:
     print("  Compiler launcher: none (ccache/sccache not found)")
+
+
+# ----------------------------------------------------------------------
+# Multi-arch targets. The kernel source is single-per-vendor (one CUDA
+# tree, one HIP tree) and portable: the arch-specific paths (CUTLASS Sm90,
+# wgmma, MFMA) are #ifdef / __CUDA_ARCH__-gated, and the default path is
+# ATen/cuBLAS/rocBLAS. So we compile that one source for EVERY arch the
+# installed toolchain accepts — a fat binary covering the full picture —
+# rather than only sm_90 / gfx942. Runtime dispatch (csrc/bindings/dispatch.cpp)
+# vendor-routes any NVIDIA device to the sm90 impl and any AMD device to the
+# gfx942 impl. The candidate lists mirror grokking_optimizers/compile.py's
+# ARCH_TABLE; each candidate is probe-compiled and silently dropped if the
+# toolchain rejects it, so adding new (or very old) arches never hard-fails
+# the build — it degrades to whatever nvcc/hipcc supports (min: sm_90 / gfx942).
+# ----------------------------------------------------------------------
+
+_NVIDIA_CCS = ["70", "75", "80", "86", "89", "90", "100", "103", "120"]
+_AMD_GFXS = [
+    "gfx906", "gfx908", "gfx90a", "gfx942", "gfx950",
+    "gfx1030", "gfx1100", "gfx1101", "gfx1102",
+    "gfx1151", "gfx1200", "gfx1201",
+]
+
+
+def _toolchain_accepts(compiler, probe_flags, suffix):
+    """True if ``<compiler> <probe_flags> -c <trivial-kernel>`` succeeds.
+
+    Used to filter arch targets down to what the installed toolchain actually
+    supports. Missing compiler or any failure -> False (target dropped).
+    """
+    exe = shutil.which(compiler)
+    if not exe:
+        return False
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "probe" + suffix)
+            with open(src, "w") as fh:
+                fh.write("__global__ void _probe_kernel() {}\n")
+            obj = os.path.join(d, "probe.o")
+            res = subprocess.run(
+                [exe, *probe_flags, "-c", src, "-o", obj],
+                capture_output=True, timeout=120,
+            )
+            return res.returncode == 0
+    except Exception:
+        return False
+
+
+def _supported_gencode(min_cc=0):
+    """`-gencode` flags for every NVIDIA CC the installed nvcc accepts (+PTX).
+
+    ``min_cc`` lets the CUTLASS path restrict to Hopper+ (the Sm90 collective
+    will not compile for older device targets). Falls back to sm_90-only.
+    """
+    candidates = [cc for cc in _NVIDIA_CCS if int(cc) >= min_cc]
+    accepted = [
+        cc for cc in candidates
+        if _toolchain_accepts(
+            "nvcc", [f"-gencode=arch=compute_{cc},code=sm_{cc}"], ".cu")
+    ]
+    if not accepted:
+        accepted = ["90"]  # safe fallback: Hopper only
+    flags = [f"-gencode=arch=compute_{cc},code=sm_{cc}" for cc in accepted]
+    # Embed PTX of the newest accepted CC for driver-JIT forward-compat.
+    newest = max(accepted, key=int)
+    flags.append(f"-gencode=arch=compute_{newest},code=compute_{newest}")
+    print(f"  CUDA gencode archs (toolchain-probed): {accepted} (+PTX {newest})")
+    return flags
+
+
+def _supported_offload():
+    """``--offload-arch`` for every AMD gfx the installed hipcc accepts."""
+    accepted = [
+        g for g in _AMD_GFXS
+        if _toolchain_accepts("hipcc", [f"--offload-arch={g}"], ".hip")
+    ]
+    if not accepted:
+        accepted = ["gfx942"]  # safe fallback: MI300X/MI300A only
+    print(f"  ROCm offload archs (toolchain-probed): {accepted}")
+    return [f"--offload-arch={g}" for g in accepted]
 
 
 # ----------------------------------------------------------------------
@@ -134,9 +220,8 @@ if _has_gpu and _is_hip:
                 offload.append(f"--offload-arch={a}")
         print(f"  ROCm archs (from TORCH_CUDA_ARCH_LIST): {rocm_archs}")
     else:
-        offload = [
-            "--offload-arch=gfx942",   # MI300X / MI300A
-        ]
+        # Default: every AMD gfx the installed hipcc accepts (probe-filtered).
+        offload = _supported_offload()
 
     hip_cxx = ["-O3", "-std=c++17", "-DWITH_HIP", "-ffast-math", "-funroll-loops", "-fPIC"]
     hip_nvcc = ["-O3", "-std=c++17", "-DWITH_HIP", "-ffast-math", "-fPIC"] + offload
@@ -180,13 +265,11 @@ elif _has_gpu:
             gencode.append(f"-gencode=arch=compute_{a},code=sm_{a}")
         print(f"  CUDA archs (from TORCH_CUDA_ARCH_LIST): {nvcc_archs_env}")
     else:
-        # Supported set: sm_90 only.
-        # AOT-only model: no NVRTC, no runtime compilation. Driver JIT
-        # provides forward-compat from the embedded PTX.
-        gencode = [
-            "-gencode=arch=compute_90,code=sm_90",         # H100, H200 (Hopper)
-            "-gencode=arch=compute_90,code=compute_90",    # PTX for forward-compat
-        ]
+        # Default: every NVIDIA CC the installed nvcc accepts (probe-filtered),
+        # plus PTX of the newest for driver-JIT forward-compat. When CUTLASS is
+        # on, restrict to Hopper+ (the Sm90 collective will not build for older
+        # device targets); the portable cuBLAS path covers the rest.
+        gencode = _supported_gencode(min_cc=90 if _with_cutlass else 0)
 
     cuda_cxx = ["-O3", "-std=c++17", "-DWITH_CUDA", "-ffast-math", "-funroll-loops", "-fPIC"]
     cuda_nvcc = [
