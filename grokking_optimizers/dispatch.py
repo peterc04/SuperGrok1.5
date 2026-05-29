@@ -1,15 +1,17 @@
-"""Runtime hardware detection for the 3-arch fused kernel architecture.
+"""Runtime hardware detection for the fused kernel architecture.
 
-Supported arches (3-arch active set):
-    NVIDIA: sm_90 (Hopper — H100, H200)
-    AMD:    gfx942 (CDNA3 — MI300X, MI300A)
-    TPU:    v5p (handled via JAX backend)
+The kernels are single-source-per-vendor and the C++ extension is built as a
+multi-arch fat binary (every NVIDIA CC / AMD gfx the toolchain accepts; see
+setup.py). Detection therefore normalises to a VENDOR impl selector:
 
-Anything else raises ``UnsupportedArchError``. There is no tier fallback chain
-and no generic-kernel path. ``FORCE_ARCH`` env var continues to work for
-testing on hosts that have multiple bindings compiled in.
+    NVIDIA (any sm_70..sm_120) -> 90  (the sg::sm90 impl)
+    AMD    (any gfx906..gfx1201) -> 942 (the sg::gfx942 impl)
+    TPU                          -> "tpu_v5p" (handled via JAX backend)
 
-See REFACTOR_PLAN.md (esp. §10) and csrc/kernels/README.md for policy.
+The driver loads the matching per-SM/-gfx code from the fat binary; the host
+only needs to pick the vendor impl. Feature predicates (``supports_fp8`` etc.)
+are keyed to the REAL compute capability via ``get_device_sm()``, not the
+normalised selector. ``FORCE_ARCH`` accepts any of the above forms.
 """
 
 from __future__ import annotations
@@ -64,60 +66,70 @@ def get_warp_size() -> int:
 # Arch detection
 # ----------------------------------------------------------------------
 
+def _normalize_force_arch(force: str):
+    """Map a FORCE_ARCH string to the vendor impl selector, or None for TPU.
+
+    Returns 90 (NVIDIA), 942 (AMD), or "tpu_v5p". Raises on unrecognised input.
+    """
+    if force.startswith('tpu'):
+        return "tpu_v5p"
+    # AMD: any gfx target (and the bare 942 form).
+    if force == '942' or force.startswith('gfx'):
+        return 942
+    # NVIDIA: sm_* / smXX, or a bare numeric compute capability.
+    if force.startswith('sm'):
+        return 90
+    if force.isdigit():
+        return 90
+    raise UnsupportedArchError(
+        f"FORCE_ARCH={force!r} not recognized. Use an NVIDIA arch "
+        f"(sm_70..sm_120 or a numeric CC), an AMD arch (gfx906..gfx1201), "
+        f"or tpu_v5p.")
+
+
 @functools.lru_cache(maxsize=1)
 def get_gpu_arch() -> int:
-    """Detected GPU arch as one of {90, 942}.
+    """Detected GPU vendor impl selector: 90 (NVIDIA) or 942 (AMD).
 
-    For NVIDIA: only sm_90 (Hopper) is supported. Everything else raises.
+    Any NVIDIA device (sm_70..sm_120) normalises to 90; any AMD gfx device
+    normalises to 942. The fat binary carries the matching per-arch code.
 
-    For AMD: only gfx942 is supported. Everything else raises.
-
-    Honors FORCE_ARCH env var.
-
-    Raises ``UnsupportedArchError`` if the detected arch is not supported.
+    Honors FORCE_ARCH. Raises ``UnsupportedArchError`` if no GPU is available
+    or the vendor is unknown.
     """
     force = os.environ.get('FORCE_ARCH')
     if force:
-        # Allow "tpu_v5p" to pass through for detect_arch(), but not here
-        if force == "tpu_v5p":
+        sel = _normalize_force_arch(force)
+        if sel == "tpu_v5p":
             raise UnsupportedArchError(
                 "FORCE_ARCH=tpu_v5p is not a GPU arch; use detect_arch() instead")
-        try:
-            arch = int(force)
-        except ValueError:
-            raise UnsupportedArchError(
-                f"FORCE_ARCH={force!r} is not a valid arch identifier")
-        if arch not in (90, 942):
-            raise UnsupportedArchError(
-                f"FORCE_ARCH={arch} not in supported GPU set {{90, 942}}. "
-                f"3-arch active set is: sm_90, gfx942, tpu_v5p.")
-        return arch
+        return sel
 
     if not torch.cuda.is_available():
         raise UnsupportedArchError(
-            "No CUDA/HIP device available. SuperGrok kernels require sm_90 "
-            "(Hopper) or gfx942 (MI300X/MI300A). Set FORCE_ARCH=<90|942> "
-            "for cross-arch testing.")
+            "No CUDA/HIP device available. Set FORCE_ARCH (e.g. 90 for any "
+            "NVIDIA, 942 for any AMD) for cross-arch testing.")
 
     vendor = get_gpu_vendor()
     if vendor == 'nvidia':
-        major, minor = torch.cuda.get_device_capability()
-        sm = major * 10 + minor
-        if sm == 90:
-            return 90     # Hopper (H100, H200)
-        raise UnsupportedArchError(
-            f"Detected sm_{sm}; only sm_90 (Hopper) is in the active set.")
-
+        return 90     # any sm_70..sm_120 -> the sm90 impl
     if vendor == 'amd':
-        prop = torch.cuda.get_device_properties(0)
-        arch_name = (prop.gcnArchName or '').split(':')[0]
-        if arch_name == 'gfx942':
-            return 942
-        raise UnsupportedArchError(
-            f"Detected {arch_name!r}; only gfx942 (MI300X/MI300A) is "
-            "in the active set.")
-
+        return 942    # any gfx906..gfx1201 -> the gfx942 impl
     raise UnsupportedArchError(f"Unknown GPU vendor {vendor!r}")
+
+
+@functools.lru_cache(maxsize=1)
+def get_device_sm():
+    """Real NVIDIA compute capability (e.g. 70, 80, 90, 120), or None.
+
+    None when there is no NVIDIA device (CPU host or AMD). Used by the feature
+    predicates, which need the true capability rather than the normalised
+    vendor selector returned by ``get_gpu_arch()``.
+    """
+    if get_gpu_vendor() != 'nvidia':
+        return None
+    major, minor = torch.cuda.get_device_capability()
+    return major * 10 + minor
 
 
 @functools.lru_cache(maxsize=1)
@@ -133,17 +145,7 @@ def detect_arch() -> Union[int, str]:
     """
     force = os.environ.get('FORCE_ARCH')
     if force:
-        if force == "tpu_v5p":
-            return "tpu_v5p"
-        try:
-            arch = int(force)
-        except ValueError:
-            raise UnsupportedArchError(
-                f"FORCE_ARCH={force!r} not in supported set {{90, 942, tpu_v5p}}")
-        if arch not in (90, 942):
-            raise UnsupportedArchError(
-                f"FORCE_ARCH={arch} not in supported set {{90, 942, tpu_v5p}}")
-        return arch
+        return _normalize_force_arch(force)
 
     # Try TPU detection first (check if JAX is available and running on TPU)
     try:
@@ -174,23 +176,23 @@ def supports_tf32() -> bool:
 
 
 def supports_fp8() -> bool:
-    """FP8 E4M3 tensor cores (Hopper sm_90+)."""
-    return get_gpu_vendor() == 'nvidia' and get_gpu_arch() >= 90
+    """FP8 E4M3 tensor cores (Hopper sm_90+). Keyed to the real device CC."""
+    return (get_device_sm() or 0) >= 90
 
 
 def supports_async_copy() -> bool:
-    """cp.async (NVIDIA only)."""
-    return get_gpu_vendor() == 'nvidia'
+    """cp.async (NVIDIA Ampere sm_80+)."""
+    return (get_device_sm() or 0) >= 80
 
 
 def supports_tma() -> bool:
-    """TMA bulk copy (Hopper sm_90)."""
-    return get_gpu_vendor() == 'nvidia' and get_gpu_arch() >= 90
+    """TMA bulk copy (Hopper sm_90+). Keyed to the real device CC."""
+    return (get_device_sm() or 0) >= 90
 
 
 def supports_block_clusters() -> bool:
-    """Thread block clusters (Hopper sm_90)."""
-    return get_gpu_vendor() == 'nvidia' and get_gpu_arch() >= 90
+    """Thread block clusters (Hopper sm_90+). Keyed to the real device CC."""
+    return (get_device_sm() or 0) >= 90
 
 
 def supports_matrix_cores() -> bool:

@@ -1,0 +1,8 @@
+[codespell]
+# Skip vendored / generated / binary trees and lockfiles.
+skip = .git,build,third_party,*.lock,*.json,*.svg,*.png,*.so,*.o
+# Domain words that look like typos but are intentional (numerics / hardware /
+# library identifiers). Extend as needed; keep lowercase.
+ignore-words-list = nin,arange,tace,nd,te,hsa,inout,dout,coo,iput,dur,mma,wgmma,fo,ot,ans,bu
+quiet-level = 3
+check-hidden = true

@@ -135,7 +135,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     env:
       GROK_NO_AUTO_INSTALL: "1"
     steps:
@@ -613,6 +613,651 @@ jobs:
           print('functional smoke: OK')
           PY
 
+  # ===========================================================================
+  # EXHAUSTIVE CONFIGURATION COVERAGE (blocking)
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Codegen matrix — THE exhaustive gate. For every one of the 30 arches in
+  # ARCH_TABLE, dry-run codegen for ALL 11 optimizers x 3 models (33 combos).
+  # 30 x 33 = 990 (optimizer x model x arch) configurations validated. Catches
+  # codegen / flag-emission / manifest bugs in ANY configuration. No toolchain
+  # needed (dry-run emits manifests without compiling).
+  # ---------------------------------------------------------------------------
+  codegen_matrix:
+    name: codegen ${{ matrix.arch }} (11 opts x 3 models)
+    runs-on: ubuntu-latest
+    needs: py_compile
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - sm_70
+          - sm_75
+          - sm_80
+          - sm_86
+          - sm_89
+          - sm_90a
+          - sm_100a
+          - sm_103a
+          - sm_120a
+          - gfx906
+          - gfx908
+          - gfx90a
+          - gfx942
+          - gfx950
+          - gfx1030
+          - gfx1100
+          - gfx1101
+          - gfx1102
+          - gfx1151
+          - gfx1200
+          - gfx1201
+          - tpu_v4
+          - tpu_v5e
+          - tpu_v5p
+          - tpu_v6e
+          - tpu_v7
+          - sm_90
+          - sm_100
+          - sm_103
+          - sm_120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch + deps
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy pyyaml optuna ninja
+      - name: Dry-run every (optimizer x model) for ${{ matrix.arch }}
+        run: |
+          set -u
+          mkdir -p cg_out
+          fails=0; total=0
+          for opt in adamw lion grokfast grokadamw looksam prodigy \
+                     neuralgrok supergrok11 supergrok15 muon supergrok2; do
+            for model in mamba decoder vit; do
+              total=$((total+1))
+              log="cg_out/${opt}_${model}.log"
+              if python3 -m grokking_optimizers.compile \
+                   -O "$opt" -M "$model" --arch "${{ matrix.arch }}" \
+                   --dry-run --out cg_out --no-flag-probe --no-auto-install \
+                   > "$log" 2>&1; then
+                echo "ok   $opt x $model x ${{ matrix.arch }}"
+              else
+                echo "::error::codegen FAILED: $opt x $model x ${{ matrix.arch }}"
+                tail -n 25 "$log"
+                fails=$((fails+1))
+              fi
+            done
+          done
+          echo "::notice::${{ matrix.arch }}: $((total-fails))/$total combos OK"
+          test "$fails" -eq 0
+
+  # ---------------------------------------------------------------------------
+  # Exhaustive-mode dry-run — exercises the --mode exhaustive enumeration path
+  # (distinct from the default bayesian dry-run) for a CUDA + a TPU combo.
+  # ---------------------------------------------------------------------------
+  exhaustive_mode:
+    name: --mode exhaustive dry-run
+    runs-on: ubuntu-latest
+    needs: py_compile
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { opt: supergrok2, model: vit,   arch: sm_90a }
+          - { opt: muon,       model: mamba, arch: gfx942 }
+          - { opt: adamw,      model: vit,   arch: tpu_v6e }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install deps
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy pyyaml optuna ninja
+      - name: --mode exhaustive --dry-run (${{ matrix.opt }}/${{ matrix.model }}/${{ matrix.arch }})
+        run: |
+          python3 -m grokking_optimizers.compile \
+            -O ${{ matrix.opt }} -M ${{ matrix.model }} --arch ${{ matrix.arch }} \
+            --mode exhaustive --dry-run --out exh_out \
+            --no-flag-probe --no-auto-install
+
+  # ---------------------------------------------------------------------------
+  # Import matrix — import the package + every importable submodule on each
+  # supported Python. Catches per-version import bugs the 3.11-only smoke misses.
+  # ---------------------------------------------------------------------------
+  import_matrix:
+    name: import all submodules (py ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: py_compile
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    env:
+      FORCE_ARCH: "90"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install CPU-only torch + deps
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy pyyaml optuna ninja
+      - name: Import package + all optimizer submodules
+        run: |
+          python3 - <<'PY'
+          import importlib, pkgutil, sys
+          import grokking_optimizers
+          import grokking_optimizers.optimizers as O
+          mods = ["grokking_optimizers", "grokking_optimizers.compile",
+                  "grokking_optimizers.profile", "grokking_optimizers.dispatch"]
+          mods += [m.name for m in pkgutil.iter_modules(
+                       O.__path__, "grokking_optimizers.optimizers.")]
+          bad = []
+          for name in mods:
+              try:
+                  importlib.import_module(name)
+                  print(f"ok  {name}")
+              except Exception as e:
+                  print(f"::error::import {name}: {type(e).__name__}: {e}")
+                  bad.append(name)
+          if bad:
+              sys.exit(f"failed imports: {bad}")
+          print(f"all {len(mods)} modules import on py{sys.version_info.major}.{sys.version_info.minor}")
+          PY
+
+  # ---------------------------------------------------------------------------
+  # Optimizer construction — every optimizer must construct under BOTH the
+  # CUDA (90) and HIP (942) arch codes (exercises both dispatch __init__ paths).
+  # ---------------------------------------------------------------------------
+  optimizer_construct:
+    name: construct all optimizers (FORCE_ARCH=${{ matrix.force_arch }})
+    runs-on: ubuntu-latest
+    needs: py_compile
+    strategy:
+      fail-fast: false
+      matrix:
+        force_arch: ["90", "942"]
+    env:
+      FORCE_ARCH: ${{ matrix.force_arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch + deps
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy
+      - name: Construct every optimizer
+        run: |
+          python3 - <<'PY'
+          import torch, grokking_optimizers as go
+          from grokking_optimizers.profile import OPT_CLASS
+          bad = []
+          for name, clsname in OPT_CLASS.items():
+              cls = getattr(go, clsname, None)
+              if cls is None:
+                  bad.append((name, "not exported")); continue
+              try:
+                  cls([torch.nn.Parameter(torch.randn(8, 4))], lr=1e-3)
+                  print(f"ok  {name} ({clsname})")
+              except Exception as e:
+                  print(f"::error::construct {name}: {type(e).__name__}: {e}")
+                  bad.append((name, repr(e)))
+          if bad:
+              raise SystemExit(f"failed: {bad}")
+          print(f"all {len(OPT_CLASS)} optimizers constructed")
+          PY
+
+  # ---------------------------------------------------------------------------
+  # Meta-net checkpointing parity — every learned-optimizer meta-net must be
+  # numerically transparent under gradient checkpointing (bit-identical grads
+  # on vs off), across all 4 meta-net families.
+  # ---------------------------------------------------------------------------
+  functional_metanets:
+    name: meta-net grad-checkpoint parity (4 families)
+    runs-on: ubuntu-latest
+    needs: py_compile
+    env:
+      FORCE_ARCH: "90"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch + deps
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy
+      - name: Parity across all meta-nets
+        run: |
+          python3 - <<'PY'
+          import torch
+          import grokking_optimizers.optimizers.supergrok11 as s11
+          import grokking_optimizers.optimizers.supergrok15 as s15
+          import grokking_optimizers.optimizers.neuralgrok as ng
+          import grokking_optimizers.optimizers.supergrok2 as s2
+          N = 64
+
+          def parity(make, callfn):
+              r = {}
+              for gc in (False, True):
+                  torch.manual_seed(3)
+                  m = make(gc); m.train()
+                  out = callfn(m)
+                  out = out[0] if isinstance(out, tuple) else out
+                  loss = out.float().pow(2).mean()
+                  m.zero_grad(); loss.backward()
+                  g = torch.cat([p.grad.flatten()
+                                 for p in m.parameters() if p.grad is not None])
+                  r[gc] = (out.detach(), g)
+              return ((r[False][0] - r[True][0]).abs().max().item(),
+                      (r[False][1] - r[True][1]).abs().max().item())
+
+          g = torch.randn(N); s = torch.randn(N)
+          checks = {
+              "sg11.SharpnessMetaNet": parity(
+                  lambda gc: s11.SharpnessMetaNet(hidden_dim=16, grad_checkpoint=gc),
+                  lambda m: m(g, s)),
+              "sg15.SharpnessMetaNet": parity(
+                  lambda gc: s15.SharpnessMetaNet(hidden_dim=16, grad_checkpoint=gc),
+                  lambda m: m(g, s)),
+              "neuralgrok._Amplifier": parity(
+                  lambda gc: ng._Amplifier(num_layers=3, hidden_dim=16, grad_checkpoint=gc),
+                  lambda m: m(torch.randn(N, 1))),
+              "sg2.CSAHCAMetaNet": parity(
+                  lambda gc: s2.CSAHCAMetaNet(d_model=8, grad_checkpoint=gc),
+                  lambda m: m(g, s, torch.zeros(N, m.gru_hidden))),
+          }
+          bad = []
+          for k, (od, gd) in checks.items():
+              print(f"{k:28s} out_diff={od:.2e} grad_diff={gd:.2e}")
+              if od > 1e-4 or gd > 1e-4:
+                  bad.append(k)
+          if bad:
+              raise SystemExit(f"::error::meta-net checkpoint parity failed: {bad}")
+          print("all meta-net checkpoint parity: OK")
+          PY
+
+  # ---------------------------------------------------------------------------
+  # Determinism — the self-test must pass twice in a row (catches order- or
+  # state-dependent flakiness that a single run would miss).
+  # ---------------------------------------------------------------------------
+  determinism:
+    name: self-test determinism (2x)
+    runs-on: ubuntu-latest
+    needs: py_compile
+    env:
+      GROK_NO_AUTO_INSTALL: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install deps
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy pyyaml optuna ninja scikit-learn jinja2
+      - name: Run self-test twice
+        run: |
+          for run in 1 2; do
+            echo "::group::self-test run $run"
+            python3 -u -m grokking_optimizers.compile --self-test \
+              | tee "st_$run.log"
+            tail -n 3 "st_$run.log" | grep -E '[0-9]+ passed, 0 failed' \
+              || (echo "::error::self-test run $run did not report all-passed"; exit 1)
+            echo "::endgroup::"
+          done
+
+  # ---------------------------------------------------------------------------
+  # Docs consistency — the README's hard claims about repo structure must match
+  # the tree (catches doc drift, which has bitten this repo before).
+  # ---------------------------------------------------------------------------
+  docs_consistency:
+    name: README ↔ tree consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify structural claims
+        run: |
+          python3 - <<'PY'
+          import glob, re, pathlib, sys
+          readme = pathlib.Path("README.md").read_text()
+          fails = []
+          cu  = len(glob.glob("csrc/backends/cuda/sm_90/launch_*.cu"))
+          hip = len(glob.glob("csrc/backends/hip/gfx942/launch_*.hip.cpp"))
+          pal = len(glob.glob("csrc/backends/pallas/launch_*.py"))
+          binds = sorted(p.split("/")[-1] for p in glob.glob("csrc/bindings/*"))
+          # README claims "11 files per backend" / "11 launch_*"
+          if cu != 11 or hip != 11 or pal != 11:
+              fails.append(f"launch files cu={cu} hip={hip} pal={pal} (expect 11 each)")
+          if "11 launch" not in readme and "11 files per backend" not in readme:
+              fails.append("README no longer states the 11-launch-files contract")
+          if binds != ["bindings.cpp", "dispatch.cpp", "helpers.h"]:
+              fails.append(f"bindings dir = {binds}")
+          # ARCH_TABLE size sanity vs README "26 canonical archs" wording
+          from importlib import import_module
+          sys.path.insert(0, ".")
+          n_arch = len(import_module("grokking_optimizers.compile").ARCH_TABLE)
+          if n_arch < 26:
+              fails.append(f"ARCH_TABLE has {n_arch} (<26)")
+          if fails:
+              for f in fails:
+                  print(f"::error::{f}")
+              raise SystemExit(1)
+          print(f"docs consistency OK (launch={cu}/{hip}/{pal}, archs={n_arch})")
+          PY
+
+  # ---------------------------------------------------------------------------
+  # Coverage — measure self-test line coverage (non-blocking; informational).
+  # ---------------------------------------------------------------------------
+  coverage:
+    name: self-test coverage (non-blocking)
+    runs-on: ubuntu-latest
+    needs: py_compile
+    env:
+      GROK_NO_AUTO_INSTALL: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install deps + coverage
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy pyyaml optuna ninja scikit-learn jinja2 coverage
+      - name: Run self-test under coverage
+        run: |
+          coverage run -m grokking_optimizers.compile --self-test || true
+          coverage report -m | tail -40 | tee coverage.txt
+        continue-on-error: true
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.txt
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Arch dispatch normalization — every arch in ARCH_TABLE must FORCE_ARCH-
+  # normalize to the correct vendor impl selector (NVIDIA -> 90, AMD -> 942,
+  # TPU -> tpu_v5p). Locks in the multi-arch "mega kernel" routing so the fat
+  # binary is reachable from every supported device, not just sm_90/gfx942.
+  # ---------------------------------------------------------------------------
+  arch_dispatch:
+    name: vendor-routing across all archs
+    runs-on: ubuntu-latest
+    needs: py_compile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch + deps
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy pyyaml optuna ninja
+      - name: FORCE_ARCH normalization for every ARCH_TABLE entry
+        run: |
+          python3 - <<'PY'
+          import os, subprocess, sys
+          from grokking_optimizers.compile import ARCH_TABLE
+          bad = []
+          for arch in ARCH_TABLE:
+              if arch.startswith("tpu"):
+                  expected = "tpu_v5p"
+              elif arch.startswith("gfx"):
+                  expected = "942"
+              elif arch.startswith("sm_"):
+                  expected = "90"
+              else:
+                  continue
+              # Fresh process so the lru_cache picks up this FORCE_ARCH.
+              code = ("from grokking_optimizers.dispatch import detect_arch;"
+                      "print(detect_arch())")
+              env = dict(os.environ, FORCE_ARCH=arch)
+              out = subprocess.run([sys.executable, "-c", code],
+                                   capture_output=True, text=True, env=env)
+              got = out.stdout.strip()
+              status = "ok" if got == expected else "MISMATCH"
+              print(f"{status:8s} {arch:10s} -> {got} (expected {expected})")
+              if got != expected:
+                  bad.append((arch, got, expected))
+          # Also verify setup.py's probe helpers degrade safely with no toolchain.
+          ns = {}
+          head = open("setup.py").read().split("# Backend detection.")[0]
+          exec(compile(head, "setup.py", "exec"), ns)
+          gc = ns["_supported_gencode"]()
+          off = ns["_supported_offload"]()
+          assert any("sm_90" in f for f in gc), gc
+          assert any("gfx942" in f for f in off), off
+          print(f"setup probe fallback OK: gencode={gc}, offload={off}")
+          if bad:
+              for b in bad:
+                  print(f"::error::arch routing mismatch: {b}")
+              raise SystemExit(1)
+          print(f"all {len(ARCH_TABLE)} ARCH_TABLE entries route correctly")
+          PY
+
+  # ===========================================================================
+  # NON-BLOCKING QUALITY / SECURITY CHECKS
+  # ---------------------------------------------------------------------------
+  # The jobs below all run `continue-on-error: true` (and are NOT in the
+  # ci_success gate). They exist to maximise check coverage and feed CI
+  # auto-fix mode with actionable annotations, WITHOUT spuriously blocking
+  # merges on a baseline that is not yet clean. Promote any one of them into
+  # the gate by removing continue-on-error and adding it to ci_success.needs.
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Type checking — mypy over the package (non-blocking; the scientific code
+  # is largely untyped, so this surfaces gradual-typing opportunities).
+  # ---------------------------------------------------------------------------
+  typecheck:
+    name: mypy (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install mypy + stubs
+        run: pip install mypy types-PyYAML
+      - name: mypy
+        run: mypy grokking_optimizers --ignore-missing-imports --no-error-summary
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # Security lint — bandit scans Python for common security footguns.
+  # ---------------------------------------------------------------------------
+  security_bandit:
+    name: bandit security scan (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install bandit
+        run: pip install "bandit[toml]"
+      - name: bandit
+        run: bandit -r grokking_optimizers -ll -x '*/third_party/*' --format screen
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # Dependency vulnerability audit — pip-audit against the declared deps.
+  # ---------------------------------------------------------------------------
+  deps_audit:
+    name: pip-audit (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install pip-audit
+        run: pip install pip-audit
+      - name: Audit declared dependencies
+        run: |
+          python3 - <<'PY' > requirements-audit.txt
+          import tomllib, pathlib
+          d = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          print("\n".join(d["project"].get("dependencies", [])))
+          PY
+          cat requirements-audit.txt
+          pip-audit -r requirements-audit.txt || true
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # Spell check — codespell over source + docs (skips vendored/binary dirs).
+  # ---------------------------------------------------------------------------
+  codespell:
+    name: codespell (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install codespell
+        run: pip install codespell
+      - name: codespell
+        run: codespell --config .codespellrc
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # YAML lint — validate every workflow / config YAML against .yamllint.
+  # ---------------------------------------------------------------------------
+  yamllint:
+    name: yamllint (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install yamllint
+        run: pip install yamllint
+      - name: yamllint
+        run: yamllint -c .yamllint .github/
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # actionlint — static check of the GitHub Actions workflows themselves.
+  # ---------------------------------------------------------------------------
+  actionlint:
+    name: actionlint (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run actionlint
+        uses: raven-actions/actionlint@v2
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # shellcheck — lint build.sh and any other shell scripts.
+  # ---------------------------------------------------------------------------
+  shellcheck:
+    name: shellcheck (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
+      - name: shellcheck *.sh
+        run: |
+          shopt -s nullglob globstar
+          files=( **/*.sh )
+          if [ ${#files[@]} -eq 0 ]; then echo "no shell scripts"; exit 0; fi
+          shellcheck "${files[@]}"
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # Markdown link check — verify links in README + docs resolve.
+  # ---------------------------------------------------------------------------
+  markdown_links:
+    name: markdown link check (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: lychee link checker
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: "--no-progress --max-concurrency 4 './**/*.md'"
+          fail: false
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # TODO / FIXME audit — informational census of debt markers in source.
+  # ---------------------------------------------------------------------------
+  todo_audit:
+    name: TODO/FIXME census (non-blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Count debt markers
+        run: |
+          echo "::group::TODO / FIXME / XXX / HACK markers"
+          grep -rnE 'TODO|FIXME|XXX|HACK' \
+            --include='*.py' --include='*.cu' --include='*.cuh' \
+            --include='*.cpp' --include='*.h' --include='*.hpp' \
+            grokking_optimizers csrc 2>/dev/null | tee debt.txt | tail -200 || true
+          echo "::endgroup::"
+          echo "marker count: $(wc -l < debt.txt 2>/dev/null || echo 0)"
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # Windows smoke — cross-platform import + self-test on a Windows runner.
+  # Kept out of the required gate (Windows runners are slower / occasionally
+  # flaky); still surfaces as its own check.
+  # ---------------------------------------------------------------------------
+  windows_smoke:
+    name: Windows smoke (3.11, non-gating)
+    runs-on: windows-latest
+    needs: py_compile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch + deps
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy pyyaml optuna ninja
+      - name: Import + list-archs
+        run: |
+          python -c "from grokking_optimizers.compile import _resolve_default_arch; print(_resolve_default_arch())"
+          python -m grokking_optimizers.compile --list-archs
+      - name: --self-test
+        env:
+          GROK_NO_AUTO_INSTALL: "1"
+        run: python -u -m grokking_optimizers.compile --self-test
+        continue-on-error: true
+
   # ---------------------------------------------------------------------------
   # Aggregate gate — every required job must pass for a green check. Branch
   # protection should require THIS single job rather than each individual one.
@@ -632,6 +1277,14 @@ jobs:
       - package_metadata
       - cpp_structural
       - functional_smoke
+      - codegen_matrix
+      - exhaustive_mode
+      - import_matrix
+      - optimizer_construct
+      - functional_metanets
+      - determinism
+      - docs_consistency
+      - arch_dispatch
     if: always()
     steps:
       - name: Verify all required jobs succeeded

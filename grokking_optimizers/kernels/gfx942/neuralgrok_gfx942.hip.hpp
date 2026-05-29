@@ -1,242 +1,206 @@
-#ifndef GROKKING_NEURALGROK_GFX942_HIP_HPP_
-#define GROKKING_NEURALGROK_GFX942_HIP_HPP_
+#ifndef GROKKING_KERNELS_GFX942_NEURALGROK_GFX942_HIP_HPP_
+#define GROKKING_KERNELS_GFX942_NEURALGROK_GFX942_HIP_HPP_
+// ============================================================================
+// neuralgrok_gfx942.hip.hpp — CANONICAL SuperGrok gfx942 step logic for 'neuralgrok'.
+//
+// AMDGCN-asm status: NOT PRESENT. This path is ATen + rocBLAS
+// (rocBLAS dispatches MFMA v_mfma_f32_16x16x16_bf16 internally for
+// BF16/FP16 GEMMs >= 16). Native __global__ + inline AMDGCN asm
+// requires migrating this file from .hip.cpp to .hip (hipcc-routed);
+// tracked as roadmap item 2. These .hip.cpp TUs route through the host
+// compiler (g++/clang++), which is why they hold host ATen orchestration
+// rather than device kernels.
+//
+// The production TU csrc/backends/hip/gfx942/launch_neuralgrok.hip.cpp now
+// #include's this header and keeps only the host launcher(s) the pybind
+// layer calls. Migrated byte-for-byte from that TU.
+// ============================================================================
+// HIP gfx942 launch glue for NeuralGrok.
+// Algorithm: csrc/algorithms/neuralgrok.h
+//
+// COMPUTE PATTERN
+// Mixed: per-element psi-net MLP + AdamW.
+//   Per element:
+//     h = W1 * |g| + b1     — 1×1 × 1×H → 1×H GEMM (per element)
+//     h = relu(h)
+//     s = W2 * h + b2       — 1×H × H×1 → 1×1 GEMM (per element)
+//     g_amp = (s * alpha + beta) * g
+//     AdamW(g_amp)
+//
+// MFMA APPLICABILITY: partial.
+// The per-element MLP is structurally GEMM-shaped but the contraction
+// dimension is too small (H typically 16-32) for MFMA's 16×16×16 tile to
+// give a clean win on the FIRST layer (input is 1-D scalar). The SECOND
+// layer (N × H × 1) is a true matrix-vector op: if we batch across N,
+// MFMA can run at full pipe.
+//
+// WHY ATEN HERE
+// ATen + rocBLAS handles the batched layer-2 GEMM via MFMA already. The
+// layer-1 (input is per-element scalar) doesn't benefit from MFMA; ATen
+// emits a broadcast elementwise kernel. Hand-written fusion would save
+// 1 kernel launch (≈ 3 µs).
 
-#include "common_gfx942.hip.hpp"
+#include <torch/extension.h>
+#include <vector>
 
-namespace grokking { namespace gfx942 {
+// ── inlined from former csrc/backends/hip/gfx942/primitives.hpp ──
+// HIP gfx942 (CDNA3 / MI300X) primitives — shared across all 11 launch files.
+//
+// Note: PyTorch routes `.hip.cpp` through the host compiler (g++/clang++),
+// not through hipcc. This means primitives here cannot contain `__global__`
+// kernels or `<<<...>>>` launch syntax. Instead, primitives here are
+// host-side helpers (ATen tensor ops, dtype/device checks, gradient
+// filtering) that the launch_*.hip.cpp files call.
+//
+// The actual GPU work is done by ATen / rocBLAS / hipBLAS via the
+// PyTorch C++ API on the active HIP stream.
 
-struct NeuralGrokState {
-    float* __restrict__ exp_avg;
-    float* __restrict__ exp_avg_sq;
+#include <torch/extension.h>
+#include <vector>
+#include <cstdint>
 
-    static constexpr int num_state_tensors() { return 2; }
-    static constexpr int state_bytes_per_element() { return 2 * sizeof(float); }
+namespace sg { namespace gfx942 { namespace primitives {
+
+// =========================================================================
+//  Validate that a tensor is on the active HIP/CUDA device.
+// =========================================================================
+
+inline void check_device(const torch::Tensor& t, const char* name) {
+    TORCH_CHECK(t.is_cuda(), name, " must be on a HIP/CUDA device");
+}
+
+// =========================================================================
+//  Filter (param, grad, state...) tuples to skip params with undefined
+//  or zero-size gradients. Returns parallel vectors of valid entries.
+// =========================================================================
+
+template <typename... Tensors>
+inline bool keep_tensor(const torch::Tensor& grad) {
+    return grad.defined() && grad.numel() > 0;
+}
+
+// =========================================================================
+//  ATen-driven element-wise update helpers.
+//  These build the optimizer math out of broadcasted tensor ops.
+//  PyTorch dispatches them to hipBLAS / hipDNN / pure HIP kernels.
+// =========================================================================
+
+// In-place: m = beta1 * m + (1 - beta1) * g
+inline void ema_update_inplace(
+    torch::Tensor& m, const torch::Tensor& g, float beta1
+) {
+    m.mul_(beta1).add_(g, 1.0f - beta1);
+}
+
+// In-place: v = beta2 * v + (1 - beta2) * g^2
+inline void ema_sq_update_inplace(
+    torch::Tensor& v, const torch::Tensor& g, float beta2
+) {
+    v.mul_(beta2).addcmul_(g, g, 1.0f - beta2);
+}
+
+// In-place: p = p - lr * (m_hat / (sqrt(v_hat) + eps) + wd * p)
+inline void adam_apply_inplace(
+    torch::Tensor& p, const torch::Tensor& m, const torch::Tensor& v,
+    float lr, float bc1, float bc2, float eps, float wd
+) {
+    auto m_hat = m / bc1;  // bc1 = 1 - beta1^t (un-inverted)
+    auto v_hat = v / bc2;  // bc2 = 1 - beta2^t (un-inverted)
+    auto denom = v_hat.sqrt().add_(eps);
+    auto update = m_hat.div_(denom).add_(p, wd);
+    p.add_(update, -lr);
+}
+
+// =========================================================================
+//  Tensor-pack helper for multi-tensor optimizer paths.
+//  Collects valid (param, grad, ...) pairs into a contiguous std::vector.
+// =========================================================================
+
+struct TensorPack {
+    std::vector<torch::Tensor> params;
+    std::vector<torch::Tensor> grads;
+    std::vector<torch::Tensor> state_a;
+    std::vector<torch::Tensor> state_b;
 };
 
-// ---------------------------------------------------------------------------
-// 2-layer MLP forward for a single element (psi-net).
-//
-// Input:  |grad|  (scalar)
-// Hidden: h_j = relu(W1[j] * |grad| + b1[j])   for j in [0, hidden_dim)
-// Output: scale = W_last @ h + b_last
-//
-// MLP weights are passed as raw float pointers (the caller controls where
-// they live -- __constant__, global, etc.).
-// ---------------------------------------------------------------------------
-__forceinline__ __device__
-float neuralgrok_mlp_forward(
-    float abs_grad,
-    const float* __restrict__ W1,       // [hidden_dim]
-    const float* __restrict__ b1,       // [hidden_dim]
-    const float* __restrict__ W_last,   // [hidden_dim]
-    float b_last,
-    int hidden_dim
+inline TensorPack pack_valid(
+    const std::vector<torch::Tensor>& params,
+    const std::vector<torch::Tensor>& grads,
+    const std::vector<torch::Tensor>& state_a = {},
+    const std::vector<torch::Tensor>& state_b = {}
 ) {
-    float acc = b_last;
-    for (int j = 0; j < hidden_dim; ++j) {
-        float h = W1[j] * abs_grad + b1[j];
-        h = fmaxf(h, 0.0f);  // ReLU
-        acc += W_last[j] * h;
+    TensorPack out;
+    for (size_t i = 0; i < params.size(); i++) {
+        if (!grads[i].defined() || grads[i].numel() == 0) continue;
+        out.params.push_back(params[i]);
+        out.grads.push_back(grads[i]);
+        if (!state_a.empty()) out.state_a.push_back(state_a[i]);
+        if (!state_b.empty()) out.state_b.push_back(state_b[i]);
     }
-    return acc;
+    return out;
 }
 
-// ---------------------------------------------------------------------------
-// Per-element NeuralGrok update (scalar path)
-//
-// Steps:
-//   1. Clip gradient:  g = clamp(g, -grad_clip, grad_clip)
-//   2. MLP forward:    h = relu(W1 * |g| + b1), scale = W_last @ h + b_last
-//   3. Amplify:        g_amp = g + alpha * scale * g + beta_amp * scale * sign(g)
-//   4. Standard AdamW step using g_amp
-// ---------------------------------------------------------------------------
-template <typename ParamT, NanPolicy NAN_POLICY = NanPolicy::kNone, bool ENABLE_CLIP = false>
-__forceinline__ __device__
-void neuralgrok_update(
-    ParamT* __restrict__ params,
-    const ParamT* __restrict__ grads,
-    NeuralGrokState state,
-    int64_t n,
-    float lr,
-    float beta1,
-    float beta2,
-    float eps,
-    float weight_decay,
-    float bias_correction1,
-    float bias_correction2,
-    const float* __restrict__ W1,
-    const float* __restrict__ b1,
-    const float* __restrict__ W_last,
-    float b_last,
-    float alpha,
-    float beta_amp,
-    int hidden_dim,
-    float grad_clip,
-    float clip_threshold = 0.0f
-) {
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+}}} // namespace sg::gfx942::primitives
+// ── end inlined csrc/backends/hip/gfx942/primitives.hpp ──
 
-    for (int64_t i = idx; i < n; i += stride) {
-        // gfx942 has no __ldg; non-temporal load bypasses L2 for streaming grad data
-        ParamT g_raw = __builtin_nontemporal_load(&grads[i]);
-        float g = to_float<ParamT>(g_raw);
+namespace sg { namespace gfx942 {
 
-        // NaN handling
-        if constexpr (NAN_POLICY == NanPolicy::kZero) {
-            if (isnan(g)) g = 0.0f;
-        } else if constexpr (NAN_POLICY == NanPolicy::kPropagate) {
-            if (isnan(g)) continue;
-        }
+namespace prim = ::sg::gfx942::primitives;
 
-        if constexpr (ENABLE_CLIP) {
-            g = fminf(fmaxf(g, -clip_threshold), clip_threshold);
-        }
-
-        // Step 1: Clip gradient for MLP stability
-        g = fminf(fmaxf(g, -grad_clip), grad_clip);
-
-        // Step 2: MLP forward -- compute per-element amplification scale
-        float abs_g = fabsf(g);
-        float scale = neuralgrok_mlp_forward(abs_g, W1, b1, W_last, b_last, hidden_dim);
-
-        // Step 3: Amplified gradient
-        float sign_g = copysignf(1.0f, g);
-        float g_amp = g + alpha * scale * g + beta_amp * scale * sign_g;
-
-        // Step 4: AdamW step on g_amp
-        float p_f = to_float<ParamT>(params[i]);
-        float m_old = state.exp_avg[i];
-        float v_old = state.exp_avg_sq[i];
-
-        float m = beta1 * m_old + (1.0f - beta1) * g_amp;
-        float v = beta2 * v_old + (1.0f - beta2) * g_amp * g_amp;
-
-        float m_hat = m * bias_correction1;
-        float v_hat = v * bias_correction2;
-
-        float denom = sqrtf(v_hat) + eps;
-        float update = m_hat / denom + weight_decay * p_f;
-
-        p_f -= lr * update;
-
-        state.exp_avg[i] = m;
-        state.exp_avg_sq[i] = v;
-        params[i] = from_float<ParamT>(p_f);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Vectorized path for float params -- 4 elements per thread via float4
-// loads/stores.  Caller must guarantee n % 4 == 0 and 16-byte alignment.
-// ---------------------------------------------------------------------------
-template <NanPolicy NAN_POLICY = NanPolicy::kNone, bool ENABLE_CLIP = false>
-__forceinline__ __device__
-void neuralgrok_update_vec4(
-    float* __restrict__ params,
-    const float* __restrict__ grads,
-    NeuralGrokState state,
-    int64_t n,
-    float lr,
-    float beta1,
-    float beta2,
-    float eps,
-    float weight_decay,
-    float bias_correction1,
-    float bias_correction2,
-    const float* __restrict__ W1,
-    const float* __restrict__ b1,
-    const float* __restrict__ W_last,
-    float b_last,
-    float alpha,
-    float beta_amp,
-    int hidden_dim,
-    float grad_clip,
-    float clip_threshold = 0.0f
-) {
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
-
-    const int64_t n4 = n / 4;
-    float4* __restrict__ p4 = reinterpret_cast<float4*>(params);
-    const float4* __restrict__ g4 = reinterpret_cast<const float4*>(grads);
-    float4* __restrict__ m4 = reinterpret_cast<float4*>(state.exp_avg);
-    float4* __restrict__ v4 = reinterpret_cast<float4*>(state.exp_avg_sq);
-
-    for (int64_t i = idx; i < n4; i += stride) {
-        float4 p_vec = p4[i];
-        // Non-temporal load for streaming grad access on gfx942
-        float4 g_vec = __builtin_nontemporal_load(&g4[i]);
-        float4 m_vec = m4[i];
-        float4 v_vec = v4[i];
-
-        float gs[4] = {g_vec.x, g_vec.y, g_vec.z, g_vec.w};
-        float ps[4] = {p_vec.x, p_vec.y, p_vec.z, p_vec.w};
-        float ms[4] = {m_vec.x, m_vec.y, m_vec.z, m_vec.w};
-        float vs[4] = {v_vec.x, v_vec.y, v_vec.z, v_vec.w};
-
-        #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            float g = gs[k];
-
-            if constexpr (NAN_POLICY == NanPolicy::kZero) {
-                if (isnan(g)) g = 0.0f;
-            } else if constexpr (NAN_POLICY == NanPolicy::kPropagate) {
-                if (isnan(g)) { continue; }
-            }
-
-            if constexpr (ENABLE_CLIP) {
-                g = fminf(fmaxf(g, -clip_threshold), clip_threshold);
-            }
-
-            // Step 1: Clip gradient for MLP stability
-            g = fminf(fmaxf(g, -grad_clip), grad_clip);
-
-            // Step 2: MLP forward
-            float abs_g = fabsf(g);
-            float scale = neuralgrok_mlp_forward(abs_g, W1, b1, W_last, b_last, hidden_dim);
-
-            // Step 3: Amplified gradient
-            float sign_g = copysignf(1.0f, g);
-            float g_amp = g + alpha * scale * g + beta_amp * scale * sign_g;
-
-            // Step 4: AdamW step
-            float m = beta1 * ms[k] + (1.0f - beta1) * g_amp;
-            float v = beta2 * vs[k] + (1.0f - beta2) * g_amp * g_amp;
-
-            float m_hat = m * bias_correction1;
-            float v_hat = v * bias_correction2;
-
-            float denom = sqrtf(v_hat) + eps;
-            ps[k] -= lr * (m_hat / denom + weight_decay * ps[k]);
-            ms[k] = m;
-            vs[k] = v;
-        }
-
-        p4[i] = make_float4(ps[0], ps[1], ps[2], ps[3]);
-        m4[i] = make_float4(ms[0], ms[1], ms[2], ms[3]);
-        v4[i] = make_float4(vs[0], vs[1], vs[2], vs[3]);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Launcher kernel
-// ---------------------------------------------------------------------------
-template <typename ParamT, NanPolicy NAN_POLICY, bool ENABLE_CLIP>
-__global__ void neuralgrok_kernel(
-    ParamT* params, const ParamT* grads, NeuralGrokState state, int64_t n,
+void launch_neuralgrok_step(
+    std::vector<torch::Tensor>& params,
+    std::vector<torch::Tensor>& exp_avgs,
+    std::vector<torch::Tensor>& exp_avg_sqs,
+    std::vector<torch::Tensor>& grads,
+    const torch::Tensor& psi_W1,
+    const torch::Tensor& psi_b1,
+    const torch::Tensor& psi_W2,
+    float psi_b2,
+    float alpha, float beta,
     float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2,
-    const float* W1, const float* b1, const float* W_last, float b_last,
-    float alpha, float beta_amp, int hidden_dim, float grad_clip,
-    float clip_threshold
+    float bc1, float bc2
 ) {
-    neuralgrok_update<ParamT, NAN_POLICY, ENABLE_CLIP>(
-        params, grads, state, n, lr, beta1, beta2, eps, wd, bc1, bc2,
-        W1, b1, W_last, b_last, alpha, beta_amp, hidden_dim, grad_clip,
-        clip_threshold);
+    for (size_t i = 0; i < params.size(); i++) {
+        if (!grads[i].defined() || grads[i].numel() == 0) continue;
+        auto& p = params[i];
+        auto& g = grads[i];
+        auto& m = exp_avgs[i];
+        auto& v = exp_avg_sqs[i];
+
+        // psi forward: input is |grad| flattened
+        auto ag = g.abs().to(torch::kFloat32).view({-1, 1});
+        auto h = torch::relu(torch::matmul(ag, psi_W1.unsqueeze(0)) + psi_b1);
+        auto s = (torch::matmul(h, psi_W2.unsqueeze(1)) + psi_b2).view_as(g);
+
+        auto g_amp = (s * alpha + beta) * g.to(torch::kFloat32);
+        prim::ema_update_inplace(m, g_amp, beta1);
+        prim::ema_sq_update_inplace(v, g_amp, beta2);
+        prim::adam_apply_inplace(p, m, v, lr, bc1, bc2, eps, wd);
+    }
 }
 
-}} // namespace grokking::gfx942
 
-#endif // GROKKING_NEURALGROK_GFX942_HIP_HPP_
+void launch_fused_neuralgrok_amplifier(
+    torch::Tensor grad, torch::Tensor amplified, torch::Tensor amplifier_w1, torch::Tensor amplifier_b1, torch::Tensor amplifier_w2, torch::Tensor amplifier_b2, int hidden_dim, float alpha, float beta
+) {
+    throw std::runtime_error(
+        "launch_fused_neuralgrok_amplifier: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_fused_neuralgrok_adam(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor amplified_grad, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2
+) {
+    throw std::runtime_error(
+        "launch_fused_neuralgrok_adam: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_fused_neuralgrok_full_step(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor grad, torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2, float alpha_amp, float beta_amp, int hidden_dim, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2
+) {
+    throw std::runtime_error(
+        "launch_fused_neuralgrok_full_step: HIP gfx942 kernel not yet implemented.");
+}
+
+}} // namespace sg::gfx942
+
+#endif  // GROKKING_KERNELS_GFX942_NEURALGROK_GFX942_HIP_HPP_
