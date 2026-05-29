@@ -1,99 +1,112 @@
-"""
-Grokking Optimizers — C++/CUDA/HIP/CPU Accelerated Optimizer Suite
+"""Grokking Optimizers — vendor-neutral algorithm + per-vendor backend.
 
-All optimizers use custom GPU kernels for maximum performance.
-Supports NVIDIA CUDA, AMD ROCm/HIP, and CPU-only (for debugging/testing).
-Supports FP32, FP16, and BF16 parameter tensors.
+Package layout:
+
+  grokking_optimizers/
+    optimizers/         11 torch.optim.Optimizer subclasses (the race optimizers)
+    dispatch.py         arch detection + fused kernel routing + get_ops()
+
+Each optimizer file is fully self-contained — the Mamba3+PEER metanet and
+PrecisionConfig live inside supergrok2.py; SharpnessMetaNet is duplicated
+between supergrok15.py and supergrok11.py. Those implementation-detail
+classes are reachable via
+`from grokking_optimizers.optimizers.supergrok2 import X` when needed.
+
+The C++ kernel is the only execution path — if the extension isn't built or
+a kernel raises, the exception propagates. There is no Python reference
+fallback.
 
 Usage:
-    from grokking_optimizers import SuperGrok15, SuperGrok2, GrokAdamW, ...
+    from grokking_optimizers import SuperGrok2, Lion, GrokAdamW, ...
 """
 
-__version__ = "2.1.0"
+__version__ = "3.0.0"
 
-# ── Backend capability flags ─────────────────────────────────────────
-# No fallbacks. If the C++ extension is not built, get_ops() fails loudly.
-# _HAS_OPS is always True in production. Tests mock this.
-from grokking_optimizers._ops_loader import get_ops
+import torch  # noqa: F401 — load libc10.so first
 
-import torch  # noqa: F401 — must import torch first to load libc10.so
+# --------------------------------------------------------------------------
+# C++ extension capability probes
+# --------------------------------------------------------------------------
 
-_HAS_OPS = True  # Always True in production. Tests mock this.
+from grokking_optimizers.dispatch import get_ops, detect_arch, UnsupportedArchError
+
+
+_ops = get_ops()
+_HAS_OPS = bool(_ops)
+_HAS_CUDA = hasattr(_ops, "supergrok2_mamba_peer_batched_step") or \
+            hasattr(_ops, "sg15_fused_step")
+_HAS_CPU_OPS = hasattr(_ops, "supergrok2_cpu_step")
+
 
 def _get_ops():
     return get_ops()
 
-try:
-    _ops = get_ops()
-    _HAS_CUDA = hasattr(_ops, 'supergrok2_mamba_peer_batched_step')
-    _HAS_CPU_OPS = hasattr(_ops, 'supergrok2_cpu_step')
-except RuntimeError:
-    # Extension not built — flags remain for import-time checks,
-    # but any actual use of _ops will fail loudly via get_ops()
-    _HAS_CUDA = False
-    _HAS_CPU_OPS = False
 
-from .supergrok15 import SuperGrok15, SharpnessMetaNet
-from .supergrok2 import SuperGrok2, CompiledSuperGrok2
-from .mamba3_peer_metanet import Mamba3PEERMetaNet, Mamba3ScanBlock, MiniGRU
-from .supergrok11 import SuperGrok11
-from .grokadamw import GrokAdamW
-from .neuralgrok import NeuralGrok
-from .prodigy import Prodigy
-from .grokfast import Grokfast
-from .lion import Lion
-from .looksam import LookSAM
-from .muon import Muon
-from .cuda_graph_optimizer import CUDAGraphOptimizer
-from .dispatch import (
+# --------------------------------------------------------------------------
+# Core optimizers (11)
+# --------------------------------------------------------------------------
+
+from grokking_optimizers.optimizers.supergrok2 import (
+    SuperGrok2, CompiledSuperGrok2, MoEAwareSuperGrok2,
+)
+from grokking_optimizers.optimizers.supergrok15 import SuperGrok15
+from grokking_optimizers.optimizers.supergrok11 import SuperGrok11
+from grokking_optimizers.optimizers.adamw import AdamW
+from grokking_optimizers.optimizers.grokadamw import GrokAdamW
+from grokking_optimizers.optimizers.grokfast import Grokfast
+from grokking_optimizers.optimizers.lion import Lion
+from grokking_optimizers.optimizers.looksam import LookSAM
+from grokking_optimizers.optimizers.muon import Muon
+from grokking_optimizers.optimizers.neuralgrok import NeuralGrok
+from grokking_optimizers.optimizers.prodigy import Prodigy
+
+
+# --------------------------------------------------------------------------
+# Dispatch / arch helpers
+# --------------------------------------------------------------------------
+
+from grokking_optimizers.dispatch import (
     get_gpu_arch, get_gpu_vendor, get_backend, get_arch_label,
     get_warp_size, supports_bf16, supports_fp8, supports_tf32,
-    supports_matrix_cores, supports_nvfp4,
-    get_amd_tier, get_amd_label,
+    supports_matrix_cores,
+    SUPPORTED_ARCHES, assert_supported_arch,
 )
-from .quantization import PrecisionConfig
-from .distributed import (
-    setup_distributed, cleanup_distributed,
-    get_rank, get_world_size, is_main_process,
-    broadcast_optimizer_state, wrap_model_ddp,
+
+
+# Single source of truth for every supported GPU/TPU architecture. See
+# grokking_optimizers/compile.py for the ArchEntry dataclass and the table
+# itself. ARCH_INFO is a derived 6-key dict kept for backward compatibility
+# with older call sites that read e.g. ARCH_INFO[arch]["vendor"].
+from grokking_optimizers.compile import (
+    ARCH_TABLE, ARCH_INFO, ArchEntry, get_arch_entry,
 )
-from .moe_deep import MoEAwareSuperGrok2
-from .overlap_distributed import OverlappedOptimizer
-from .gradient_compression import INT8GradientCompressor, PowerSGDCompressor
-from .partial_graph import PartialGraphOptimizer
-from .sparse_gradients import SparseGradientHandler
-from .pipelined_optimizer import PipelinedOptimizer
-from .gradient_hook_optimizer import GradientHookOptimizer
-from .async_supergrok2 import AsyncSuperGrok2
+
 
 __all__ = [
-    "SuperGrok15", "SharpnessMetaNet",
+    # 12 core optimizers (11 grokking + AdamW baseline)
+    "AdamW",
     "SuperGrok2", "CompiledSuperGrok2",
-    "Mamba3PEERMetaNet", "Mamba3ScanBlock", "MiniGRU",
+    "SuperGrok15",
     "SuperGrok11",
     "GrokAdamW",
-    "NeuralGrok",
-    "Prodigy",
     "Grokfast",
     "Lion",
     "LookSAM",
     "Muon",
-    "CUDAGraphOptimizer",
+    "NeuralGrok",
+    "Prodigy",
+    "MoEAwareSuperGrok2",
+
+    # Dispatch helpers
     "get_gpu_arch", "get_gpu_vendor", "get_backend", "get_arch_label",
     "get_warp_size", "supports_bf16", "supports_fp8", "supports_tf32",
-    "supports_matrix_cores", "supports_nvfp4",
-    "get_amd_tier", "get_amd_label",
-    "PrecisionConfig",
-    "CompiledSuperGrok2",
-    "setup_distributed", "cleanup_distributed",
-    "get_rank", "get_world_size", "is_main_process",
-    "broadcast_optimizer_state", "wrap_model_ddp",
+    "supports_matrix_cores",
+    "SUPPORTED_ARCHES", "UnsupportedArchError", "assert_supported_arch",
+    "detect_arch",
+
+    # ARCH_TABLE — single source of truth for every supported arch
+    "ARCH_TABLE", "ARCH_INFO", "ArchEntry", "get_arch_entry",
+
+    # Capability flags
     "_HAS_OPS", "_HAS_CUDA", "_HAS_CPU_OPS",
-    "PartialGraphOptimizer",
-    "SparseGradientHandler",
-    "PipelinedOptimizer",
-    "GradientHookOptimizer",
-    "AsyncSuperGrok2",
-    "MoEAwareSuperGrok2",
-    "OverlappedOptimizer",
 ]

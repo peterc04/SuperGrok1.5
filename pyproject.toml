@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=45", "wheel", "torch>=2.0.0"]
+requires = ["setuptools>=45", "wheel", "torch>=2.0.0", "ninja"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "grokking-optimizers"
-version = "2.1.0"
+version = "3.0.0"
 description = "C++/CUDA/HIP/JAX optimizer suite with SuperGrok v2 (Mamba-3 + PEER + GRU meta-net)"
 requires-python = ">=3.8"
 license = {text = "MIT"}
