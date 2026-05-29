@@ -1,267 +1,210 @@
-#ifndef GROKKING_GROKADAMW_GFX942_HIP_HPP_
-#define GROKKING_GROKADAMW_GFX942_HIP_HPP_
+#ifndef GROKKING_KERNELS_GFX942_GROKADAMW_GFX942_HIP_HPP_
+#define GROKKING_KERNELS_GFX942_GROKADAMW_GFX942_HIP_HPP_
+// ============================================================================
+// grokadamw_gfx942.hip.hpp — CANONICAL SuperGrok gfx942 step logic for 'grokadamw'.
+//
+// AMDGCN-asm status: NOT PRESENT. This path is ATen + rocBLAS
+// (rocBLAS dispatches MFMA v_mfma_f32_16x16x16_bf16 internally for
+// BF16/FP16 GEMMs >= 16). Native __global__ + inline AMDGCN asm
+// requires migrating this file from .hip.cpp to .hip (hipcc-routed);
+// tracked as roadmap item 2. These .hip.cpp TUs route through the host
+// compiler (g++/clang++), which is why they hold host ATen orchestration
+// rather than device kernels.
+//
+// The production TU csrc/backends/hip/gfx942/launch_grokadamw.hip.cpp now
+// #include's this header and keeps only the host launcher(s) the pybind
+// layer calls. Migrated byte-for-byte from that TU.
+// ============================================================================
+// HIP gfx942 launch glue for GrokAdamW.
+// Algorithm: csrc/algorithms/grokadamw.h
+//
+// COMPUTE PATTERN
+// Elementwise EMA-amplified Adam. Per element:
+//   ema = alpha * ema + (1-alpha) * g
+//   g_amp = g + lamb * ema
+//   then AdamW(g_amp) per launch_adamw.
+// 4 state tensors (p, m, v, ema) + grad → 5 mem reads + 4 writes per element.
+//
+// MFMA APPLICABILITY: none. Pure elementwise.
+//
+// WHY ATEN HERE
+// Same as launch_adamw. The ema update fuses with the Adam apply only if
+// we hand-write a `__global__` kernel — the ATen path generates 2 kernel
+// launches (one for ema, one for adam). The fusion gain is ~1.5×; the
+// bandwidth bound stays the same.
 
-#include "common_gfx942.hip.hpp"
+#include <torch/extension.h>
+#include <vector>
 
-namespace grokking {
-namespace gfx942 {
+// ── inlined from former csrc/backends/hip/gfx942/primitives.hpp ──
+// HIP gfx942 (CDNA3 / MI300X) primitives — shared across all 11 launch files.
+//
+// Note: PyTorch routes `.hip.cpp` through the host compiler (g++/clang++),
+// not through hipcc. This means primitives here cannot contain `__global__`
+// kernels or `<<<...>>>` launch syntax. Instead, primitives here are
+// host-side helpers (ATen tensor ops, dtype/device checks, gradient
+// filtering) that the launch_*.hip.cpp files call.
+//
+// The actual GPU work is done by ATen / rocBLAS / hipBLAS via the
+// PyTorch C++ API on the active HIP stream.
 
-struct GrokAdamWState {
-    float* __restrict__ ema;
-    float* __restrict__ exp_avg;
-    float* __restrict__ exp_avg_sq;
-    static constexpr int num_state_tensors() { return 3; }
-    static constexpr int state_bytes_per_element() { return 3 * sizeof(float); }
+#include <torch/extension.h>
+#include <vector>
+#include <cstdint>
+
+namespace sg { namespace gfx942 { namespace primitives {
+
+// =========================================================================
+//  Validate that a tensor is on the active HIP/CUDA device.
+// =========================================================================
+
+inline void check_device(const torch::Tensor& t, const char* name) {
+    TORCH_CHECK(t.is_cuda(), name, " must be on a HIP/CUDA device");
+}
+
+// =========================================================================
+//  Filter (param, grad, state...) tuples to skip params with undefined
+//  or zero-size gradients. Returns parallel vectors of valid entries.
+// =========================================================================
+
+template <typename... Tensors>
+inline bool keep_tensor(const torch::Tensor& grad) {
+    return grad.defined() && grad.numel() > 0;
+}
+
+// =========================================================================
+//  ATen-driven element-wise update helpers.
+//  These build the optimizer math out of broadcasted tensor ops.
+//  PyTorch dispatches them to hipBLAS / hipDNN / pure HIP kernels.
+// =========================================================================
+
+// In-place: m = beta1 * m + (1 - beta1) * g
+inline void ema_update_inplace(
+    torch::Tensor& m, const torch::Tensor& g, float beta1
+) {
+    m.mul_(beta1).add_(g, 1.0f - beta1);
+}
+
+// In-place: v = beta2 * v + (1 - beta2) * g^2
+inline void ema_sq_update_inplace(
+    torch::Tensor& v, const torch::Tensor& g, float beta2
+) {
+    v.mul_(beta2).addcmul_(g, g, 1.0f - beta2);
+}
+
+// In-place: p = p - lr * (m_hat / (sqrt(v_hat) + eps) + wd * p)
+inline void adam_apply_inplace(
+    torch::Tensor& p, const torch::Tensor& m, const torch::Tensor& v,
+    float lr, float bc1, float bc2, float eps, float wd
+) {
+    auto m_hat = m / bc1;  // bc1 = 1 - beta1^t (un-inverted)
+    auto v_hat = v / bc2;  // bc2 = 1 - beta2^t (un-inverted)
+    auto denom = v_hat.sqrt().add_(eps);
+    auto update = m_hat.div_(denom).add_(p, wd);
+    p.add_(update, -lr);
+}
+
+// =========================================================================
+//  Tensor-pack helper for multi-tensor optimizer paths.
+//  Collects valid (param, grad, ...) pairs into a contiguous std::vector.
+// =========================================================================
+
+struct TensorPack {
+    std::vector<torch::Tensor> params;
+    std::vector<torch::Tensor> grads;
+    std::vector<torch::Tensor> state_a;
+    std::vector<torch::Tensor> state_b;
 };
 
-// -- Scalar GrokAdamW update --
-
-template <typename ParamT, NanPolicy NAN_POLICY = NanPolicy::kNone, bool ENABLE_CLIP = false>
-__forceinline__ __device__
-void grokadamw_update(
-    ParamT* __restrict__ params,
-    const ParamT* __restrict__ grads,
-    GrokAdamWState state,
-    int64_t n,
-    float lr, float beta1, float beta2, float eps, float weight_decay,
-    float alpha, float lamb, float grad_clip,
-    float bias_correction1, float bias_correction2,
-    float clip_threshold = 0.0f
+inline TensorPack pack_valid(
+    const std::vector<torch::Tensor>& params,
+    const std::vector<torch::Tensor>& grads,
+    const std::vector<torch::Tensor>& state_a = {},
+    const std::vector<torch::Tensor>& state_b = {}
 ) {
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
-
-    for (int64_t i = idx; i < n; i += stride) {
-        ParamT g_raw = __builtin_nontemporal_load(grads + i);
-        float g = to_float(g_raw);
-        g = apply_nan_policy<NAN_POLICY>(g);
-        g = apply_clip<ENABLE_CLIP>(g, clip_threshold);
-
-        float p_f = to_float(params[i]);
-        float ema_old = state.ema[i];
-        float m_old = state.exp_avg[i];
-        float v_old = state.exp_avg_sq[i];
-
-        // Phase 1: EMA filter + amplification.
-        float ema_val = alpha * ema_old + (1.0f - alpha) * g;
-        float g_amp = g + lamb * ema_val;
-
-        // Phase 2: Always-on per-element clipping.
-        g_amp = fminf(fmaxf(g_amp, -grad_clip), grad_clip);
-
-        // Phase 3: AdamW on clipped gradient.
-        float m_new = beta1 * m_old + (1.0f - beta1) * g_amp;
-        float v_new = beta2 * v_old + (1.0f - beta2) * g_amp * g_amp;
-        float m_hat = m_new * bias_correction1;
-        float v_hat = v_new * bias_correction2;
-        p_f -= lr * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * p_f);
-
-        state.ema[i] = ema_val;
-        state.exp_avg[i] = m_new;
-        state.exp_avg_sq[i] = v_new;
-        params[i] = from_float<ParamT>(p_f);
+    TensorPack out;
+    for (size_t i = 0; i < params.size(); i++) {
+        if (!grads[i].defined() || grads[i].numel() == 0) continue;
+        out.params.push_back(params[i]);
+        out.grads.push_back(grads[i]);
+        if (!state_a.empty()) out.state_a.push_back(state_a[i]);
+        if (!state_b.empty()) out.state_b.push_back(state_b[i]);
     }
+    return out;
 }
 
-// -- Vectorized float4 GrokAdamW update (float params only) --
+}}} // namespace sg::gfx942::primitives
+// ── end inlined csrc/backends/hip/gfx942/primitives.hpp ──
 
-template <NanPolicy NAN_POLICY = NanPolicy::kNone, bool ENABLE_CLIP = false>
-__forceinline__ __device__
-void grokadamw_update_vec4(
-    float* __restrict__ params,
-    const float* __restrict__ grads,
-    GrokAdamWState state,
-    int64_t n,
-    float lr, float beta1, float beta2, float eps, float weight_decay,
-    float alpha, float lamb, float grad_clip,
-    float bias_correction1, float bias_correction2,
-    float clip_threshold = 0.0f
-) {
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+namespace sg { namespace gfx942 {
 
-    int64_t n4 = n / 4;
+namespace prim = ::sg::gfx942::primitives;
 
-    float4* params4 = reinterpret_cast<float4*>(params);
-    const float4* grads4 = reinterpret_cast<const float4*>(grads);
-    float4* ema4 = reinterpret_cast<float4*>(state.ema);
-    float4* m4 = reinterpret_cast<float4*>(state.exp_avg);
-    float4* v4 = reinterpret_cast<float4*>(state.exp_avg_sq);
-
-    for (int64_t i = idx; i < n4; i += stride) {
-        float4 g4 = __builtin_nontemporal_load(grads4 + i);
-        float4 p4 = params4[i];
-        float4 eo4 = ema4[i];
-        float4 mo4 = m4[i];
-        float4 vo4 = v4[i];
-
-        float g_arr[4] = {g4.x, g4.y, g4.z, g4.w};
-        float p_arr[4] = {p4.x, p4.y, p4.z, p4.w};
-        float e_arr[4] = {eo4.x, eo4.y, eo4.z, eo4.w};
-        float m_arr[4] = {mo4.x, mo4.y, mo4.z, mo4.w};
-        float v_arr[4] = {vo4.x, vo4.y, vo4.z, vo4.w};
-
-        #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            float g = apply_nan_policy<NAN_POLICY>(g_arr[k]);
-            g = apply_clip<ENABLE_CLIP>(g, clip_threshold);
-
-            float ema_val = alpha * e_arr[k] + (1.0f - alpha) * g;
-            float g_amp = g + lamb * ema_val;
-            g_amp = fminf(fmaxf(g_amp, -grad_clip), grad_clip);
-
-            float m_new = beta1 * m_arr[k] + (1.0f - beta1) * g_amp;
-            float v_new = beta2 * v_arr[k] + (1.0f - beta2) * g_amp * g_amp;
-            float m_hat = m_new * bias_correction1;
-            float v_hat = v_new * bias_correction2;
-
-            p_arr[k] -= lr * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * p_arr[k]);
-            e_arr[k] = ema_val;
-            m_arr[k] = m_new;
-            v_arr[k] = v_new;
-        }
-
-        params4[i] = make_float4(p_arr[0], p_arr[1], p_arr[2], p_arr[3]);
-        ema4[i] = make_float4(e_arr[0], e_arr[1], e_arr[2], e_arr[3]);
-        m4[i] = make_float4(m_arr[0], m_arr[1], m_arr[2], m_arr[3]);
-        v4[i] = make_float4(v_arr[0], v_arr[1], v_arr[2], v_arr[3]);
-    }
-
-    // Handle tail elements.
-    int64_t tail_start = n4 * 4;
-    for (int64_t i = tail_start + idx; i < n; i += stride) {
-        float g_raw = __builtin_nontemporal_load(grads + i);
-        float g = apply_nan_policy<NAN_POLICY>(g_raw);
-        g = apply_clip<ENABLE_CLIP>(g, clip_threshold);
-
-        float p_f = params[i];
-        float ema_old = state.ema[i];
-        float m_old = state.exp_avg[i];
-        float v_old = state.exp_avg_sq[i];
-
-        float ema_val = alpha * ema_old + (1.0f - alpha) * g;
-        float g_amp = g + lamb * ema_val;
-        g_amp = fminf(fmaxf(g_amp, -grad_clip), grad_clip);
-
-        float m_new = beta1 * m_old + (1.0f - beta1) * g_amp;
-        float v_new = beta2 * v_old + (1.0f - beta2) * g_amp * g_amp;
-        float m_hat = m_new * bias_correction1;
-        float v_hat = v_new * bias_correction2;
-
-        p_f -= lr * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * p_f);
-
-        params[i] = p_f;
-        state.ema[i] = ema_val;
-        state.exp_avg[i] = m_new;
-        state.exp_avg_sq[i] = v_new;
-    }
-}
-
-// -- Launcher kernel --
-
-template <typename ParamT, NanPolicy NAN_POLICY, bool ENABLE_CLIP>
-__global__ void grokadamw_kernel(
-    ParamT* params, const ParamT* grads, GrokAdamWState state, int64_t n,
+void launch_grokadamw_step(
+    std::vector<torch::Tensor>& params,
+    std::vector<torch::Tensor>& exp_avgs,
+    std::vector<torch::Tensor>& exp_avg_sqs,
+    std::vector<torch::Tensor>& emas,
+    std::vector<torch::Tensor>& grads,
+    float alpha, float lamb,
     float lr, float beta1, float beta2, float eps, float wd,
-    float alpha, float lamb, float grad_clip,
-    float bc1, float bc2, float clip_threshold
+    float bc1, float bc2
 ) {
-    grokadamw_update<ParamT, NAN_POLICY, ENABLE_CLIP>(
-        params, grads, state, n, lr, beta1, beta2, eps, wd,
-        alpha, lamb, grad_clip, bc1, bc2, clip_threshold);
-}
+    for (size_t i = 0; i < params.size(); i++) {
+        if (!grads[i].defined() || grads[i].numel() == 0) continue;
+        auto& p = params[i];
+        auto& g = grads[i];
+        auto& m = exp_avgs[i];
+        auto& v = exp_avg_sqs[i];
+        auto& ema = emas[i];
 
-// ---------------------------------------------------------------------------
-// Prefetch-pipelined scalar GrokAdamW update for gfx942: software-pipelined
-// with 2 register sets.  Uses __builtin_nontemporal_load for prefetch reads.
-// ---------------------------------------------------------------------------
-
-template <typename ParamT, NanPolicy NAN_POLICY = NanPolicy::kNone, bool ENABLE_CLIP = false>
-__forceinline__ __device__
-void grokadamw_update_prefetch(
-    ParamT* __restrict__ params,
-    const ParamT* __restrict__ grads,
-    GrokAdamWState state,
-    int64_t n,
-    float lr, float beta1, float beta2, float eps, float weight_decay,
-    float alpha, float lamb, float grad_clip,
-    float bias_correction1, float bias_correction2,
-    float clip_threshold = 0.0f
-) {
-    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
-    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-
-    if (i >= n) return;
-
-    // Load first element (current)
-    float g_cur = to_float(__builtin_nontemporal_load(grads + i));
-    float p_cur = to_float(params[i]);
-    float ema_cur = state.ema[i];
-    float m_cur = state.exp_avg[i];
-    float v_cur = state.exp_avg_sq[i];
-
-    for (; i < n; i += stride) {
-        // Prefetch next iteration's data
-        int64_t next = i + stride;
-        float g_next, p_next, ema_next, m_next, v_next;
-        bool has_next = next < n;
-        if (has_next) {
-            g_next = to_float(__builtin_nontemporal_load(grads + next));
-            p_next = to_float(params[next]);
-            ema_next = state.ema[next];
-            m_next = state.exp_avg[next];
-            v_next = state.exp_avg_sq[next];
-        }
-
-        // ---- Process current element ----
-        float g = g_cur;
-        g = apply_nan_policy<NAN_POLICY>(g);
-        g = apply_clip<ENABLE_CLIP>(g, clip_threshold);
-
-        // Phase 1: EMA filter + amplification
-        float ema_val = alpha * ema_cur + (1.0f - alpha) * g;
-        float g_amp = g + lamb * ema_val;
-
-        // Phase 2: Always-on per-element clipping
-        g_amp = fminf(fmaxf(g_amp, -grad_clip), grad_clip);
-
-        // Phase 3: AdamW on clipped gradient
-        float m_new = beta1 * m_cur + (1.0f - beta1) * g_amp;
-        float v_new = beta2 * v_cur + (1.0f - beta2) * g_amp * g_amp;
-        float m_hat = m_new * bias_correction1;
-        float v_hat = v_new * bias_correction2;
-        float p_f = p_cur - lr * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * p_cur);
-
-        // Write back state and param
-        state.ema[i] = ema_val;
-        state.exp_avg[i] = m_new;
-        state.exp_avg_sq[i] = v_new;
-        params[i] = from_float<ParamT>(p_f);
-
-        // Swap prefetched data into current registers
-        if (has_next) {
-            g_cur = g_next;
-            p_cur = p_next;
-            ema_cur = ema_next;
-            m_cur = m_next;
-            v_cur = v_next;
-        }
+        // EMA filter
+        prim::ema_update_inplace(ema, g, alpha);
+        // Amplified gradient
+        auto g_amp = g.to(torch::kFloat32) + lamb * ema;
+        // Adam moments on g_amp
+        prim::ema_update_inplace(m, g_amp, beta1);
+        prim::ema_sq_update_inplace(v, g_amp, beta2);
+        prim::adam_apply_inplace(p, m, v, lr, bc1, bc2, eps, wd);
     }
 }
 
-template <typename ParamT, NanPolicy NAN_POLICY, bool ENABLE_CLIP>
-__global__ void grokadamw_kernel_prefetch(
-    ParamT* params, const ParamT* grads, GrokAdamWState state, int64_t n,
-    float lr, float beta1, float beta2, float eps, float wd,
-    float alpha, float lamb, float grad_clip,
-    float bc1, float bc2, float clip_threshold
+
+void launch_fused_grokadamw_step(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor ema, torch::Tensor grad, float alpha, float lamb, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2
 ) {
-    grokadamw_update_prefetch<ParamT, NAN_POLICY, ENABLE_CLIP>(
-        params, grads, state, n, lr, beta1, beta2, eps, wd,
-        alpha, lamb, grad_clip, bc1, bc2, clip_threshold);
+    throw std::runtime_error(
+        "launch_fused_grokadamw_step: HIP gfx942 kernel not yet implemented.");
 }
 
-}  // namespace gfx942
-}  // namespace grokking
+void launch_fused_grokadamw_clip_step(
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor ema, torch::Tensor grad, float alpha, float lamb, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2, float clip_threshold
+) {
+    throw std::runtime_error(
+        "launch_fused_grokadamw_clip_step: HIP gfx942 kernel not yet implemented.");
+}
 
-#endif  // GROKKING_GROKADAMW_GFX942_HIP_HPP_
+void launch_fused_grokadamw_step_q3(
+    torch::Tensor param, torch::Tensor exp_avg_int8, torch::Tensor exp_avg_scales, torch::Tensor exp_avg_sq_bf16, torch::Tensor ema_bf16, torch::Tensor grad, float alpha, float lamb, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2, unsigned global_step
+) {
+    throw std::runtime_error(
+        "launch_fused_grokadamw_step_q3: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_multi_tensor_grokadamw(
+    std::vector<torch::Tensor>& params, std::vector<torch::Tensor>& exp_avgs, std::vector<torch::Tensor>& exp_avg_sqs, std::vector<torch::Tensor>& emas, std::vector<torch::Tensor>& grads, std::vector<float>& bc1s, std::vector<float>& bc2s, float alpha, float lamb, float beta1, float beta2, float lr, float wd, float eps
+) {
+    throw std::runtime_error(
+        "launch_multi_tensor_grokadamw: HIP gfx942 kernel not yet implemented.");
+}
+
+void launch_fused_adamw_simple(
+    std::vector<torch::Tensor>& params, std::vector<torch::Tensor>& exp_avgs, std::vector<torch::Tensor>& exp_avg_sqs, std::vector<torch::Tensor>& grads, std::vector<int64_t>& steps, float beta1, float beta2, float lr, float wd, float eps
+) {
+    throw std::runtime_error(
+        "launch_fused_adamw_simple: HIP gfx942 kernel not yet implemented.");
+}
+
+}} // namespace sg::gfx942
+
+#endif  // GROKKING_KERNELS_GFX942_GROKADAMW_GFX942_HIP_HPP_

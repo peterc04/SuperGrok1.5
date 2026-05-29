@@ -1,30 +1,32 @@
-#ifndef GROKKING_KERNELS_GFX942_VIT_GFX942_HIP_HPP_
-#define GROKKING_KERNELS_GFX942_VIT_GFX942_HIP_HPP_
+#ifndef GROKKING_KERNELS_GFX942_ATTENTION_GFX942_HIP_HPP_
+#define GROKKING_KERNELS_GFX942_ATTENTION_GFX942_HIP_HPP_
 // ============================================================================
-// vit_gfx942.hip.hpp — CANONICAL SuperGrok gfx942 'vit' model logic.
+// attention_gfx942.hip.hpp — CANONICAL SuperGrok gfx942 'attention' model logic.
 //
 // AMDGCN-asm status: NOT PRESENT in the production path. This path is ATen +
 // rocBLAS (rocBLAS dispatches MFMA v_mfma_f32_16x16x16_bf16 internally for
 // BF16/FP16 GEMMs >= 16). Native __global__ + inline AMDGCN asm requires
 // migrating the model TU from .hip.cpp to .hip (hipcc-routed); roadmap item 2.
 //
-// The production location csrc/backends/hip/gfx942/models/vit.hip.h is now a
-// thin shim #include'ing this header, so its vit.hip.cpp TU resolves unchanged.
+// The production location csrc/backends/hip/gfx942/models/attention.hip.h is now a
+// thin shim #include'ing this header, so its attention.hip.cpp TU resolves unchanged.
 // Migrated byte-for-byte from that header.
 // ============================================================================
-// csrc/backends/hip/gfx942/models/vit.hip.h
-// Vision Transformer model header for gfx942 (CDNA3 / MI300X).
+// csrc/kernels/hip/gfx942/models/attention.hip.h
+// Shared attention kernel for gfx942 (CDNA3 / MI300X). Serves both Decoder
+// (causal, seq_len=4) and ViT (non-causal, seq_len=17) via kCausal template.
 //
-// Strategy: this is a thin wrapper around the sm_90 implementation.
-// vit.cuh is platform-portable — it uses cuBLAS (hipify-remapped to
-// rocBLAS), at::cuda::* helpers, and standard runtime calls. There are
-// no sm_90-only intrinsics in vit.cuh proper.
+// Key differences from sm_90:
+//   - Wave size 64: reductions use __shfl_xor with strides {32,16,8,4,2,1}
+//   - No WGMMA/TMA: BF16 MFMA via __builtin_amdgcn_mfma_f32_16x16x16bf16
+//   - 64 KB LDS per CU (not 228 KB SMEM)
+//   - FULL_WARP_MASK is 0 on HIP (all 64 lanes lockstep)
+//   - CK FMHA gated behind WITH_CK; fallback to hand-written MFMA path
+//   - Occupancy via GROK_WAVES_PER_EU / GROK_FLAT_WORK_GROUP_SIZE
+//   - warp_reduce_sum from utils.cuh (already wave-64 aware)
 //
-// The bindings (csrc/bindings/models_vit.cpp) call
-// `sg::gfx942::models::vit::forward<ActT,ActT>` directly when
-// `detect_arch() == 942`. The wrappers below provide those symbols and
-// delegate to the sm_90 implementation.
-
+// For grokking shapes (d_head=32, seq_len=4/17), QK^T fits in regs/LDS.
+// One workgroup per (batch, head) pair.
 #pragma once
 // ── inlined from former csrc/common/platform.h ──
 /*
@@ -460,86 +462,496 @@ __device__ __forceinline__ int8_t float_to_int8_stochastic_branchless(
 
 #endif  // __CUDACC__
 // ── end inlined csrc/common/types.h ──
-// Bring in the full sm_90 ViT template implementation. On HIP the cuBLAS
-// includes are hipified to rocBLAS by PyTorch's CUDAExtension.
-#include "csrc/backends/cuda/sm_90/models/vit.cuh"
+// ── inlined from former csrc/common/utils.cuh ──
+/*
+ * SuperGrok v2 — Shared Device Helpers
+ *
+ * Device utility functions used by multiple kernel files.
+ * Uses platform.h macros for CUDA/HIP portability.
+ */
 
-namespace sg { namespace gfx942 { namespace models { namespace vit {
 
-// -- Model configuration ------------------------------------------------------
-struct ModelConfig {
-    int d_model;
-    int n_heads;
-    int head_dim;
-    int n_layers;
-    int seq_len;        // num_patches + 1 (CLS token)
-    int patch_size;
-    int image_size;
-    int num_classes;
-    int batch;
-    float attn_scale;   // typically 1/sqrt(head_dim)
-    int lds_bytes;      // LDS allocation budget
-    int waves_per_eu;   // occupancy hint for CDNA3
+#if GROK_CUDA
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+#endif
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Warp-level reduction helper
+//
+//  Sum a float across d_inner threads (all in one warp, d_inner ≤ WARP_SIZE).
+//  Uses platform-abstracted shuffle; works for any d_inner ≤ WARP_SIZE
+//  (including non-power-of-2).
+// ═══════════════════════════════════════════════════════════════════════
+
+__device__ __forceinline__ float warp_reduce_sum(float val, int d_inner, int tid) {
+    unsigned mask = (d_inner < WARP_SIZE) ? ((1u << d_inner) - 1) : FULL_WARP_MASK;
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        float other = SHFL_DOWN_SYNC(mask, val, offset);
+        if (tid + offset < d_inner)
+            val += other;
+    }
+    return val;  // only lane 0 has the correct sum
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Stochastic Rounding for Quantized Optimizer States (Config 3)
+//
+//  Hash-based PRNG: deterministic per (step, element) pair, no state needed.
+//  Faster than cuRAND, no separate state tensor required.
+// ═══════════════════════════════════════════════════════════════════════
+
+// Hash-based PRNG (Philox-like): deterministic, no state
+__device__ __forceinline__ unsigned hash_prng(unsigned step, unsigned idx) {
+    unsigned h = (step * 2654435761u) ^ (idx * 2246822519u);
+    h ^= h >> 16;
+    h *= 0x45d9f3bu;
+    h ^= h >> 16;
+    return h;
+}
+
+#if GROK_CUDA || GROK_HIP
+
+// BF16 stochastic rounding: unbiased quantization
+__device__ __forceinline__ __nv_bfloat16 float_to_bf16_stochastic(float val, unsigned rand_bits) {
+    unsigned bits = __float_as_uint(val);
+    unsigned truncated = bits & 0xFFFF;     // bits that BF16 drops
+    unsigned threshold = rand_bits & 0xFFFF; // random 16-bit threshold
+    if (truncated > threshold) {
+        bits += 0x10000;  // round up
+    }
+    bits &= 0xFFFF0000;  // truncate to BF16
+    return __float2bfloat16(__uint_as_float(bits));
+}
+
+// INT8 per-block quantization with stochastic rounding
+// block_size elements share one FP32 scale factor
+__device__ __forceinline__ int8_t float_to_int8_stochastic(
+    float val, float scale, unsigned rand_bits
+) {
+    float scaled = val / scale;
+    float truncated = truncf(scaled);
+    float frac = fabsf(scaled - truncated);
+    float threshold = (float)(rand_bits & 0xFFFF) / 65536.0f;
+    if (frac > threshold) {
+        truncated += (scaled > 0) ? 1.0f : -1.0f;
+    }
+    return (int8_t)fmaxf(-127.0f, fminf(127.0f, truncated));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Phase 3: Inline PTX for Hot Inner Loops
+//
+//  Hand-tuned PTX for critical paths in the SG2 fused_elem pipeline.
+//  These replace compiler-generated code in the highest-frequency loops.
+// ═══════════════════════════════════════════════════════════════════════
+
+#if GROK_CUDA
+
+// Fast reciprocal sqrt via PTX rsqrt.approx.f32 + Newton-Raphson refinement.
+// 2-3x faster than sqrtf(x) + fdividef for Adam denominator.
+__device__ __forceinline__ float fast_rsqrt_nr(float x) {
+    float r;
+    asm("rsqrt.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+    // One Newton-Raphson iteration: r = r * (1.5 - 0.5 * x * r * r)
+    r = r * (1.5f - 0.5f * x * r * r);
+    return r;
+}
+
+// Fused multiply-add via PTX fma.rn.f32 — ensures single FMA instruction.
+// Critical for affine_combine inner loop (8 FMAs per composition).
+__device__ __forceinline__ float ptx_fma(float a, float b, float c) {
+    float r;
+    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c));
+    return r;
+}
+
+// Fast exp2 approximation via PTX ex2.approx.f32.
+// Used in Mamba scan: exp(A * dt) = exp2(A * dt / ln2).
+__device__ __forceinline__ float ptx_exp2(float x) {
+    float r;
+    asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+
+// Fast log2 via PTX lg2.approx.f32.
+__device__ __forceinline__ float ptx_log2(float x) {
+    float r;
+    asm("lg2.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+
+// Fast exp via exp2: exp(x) = exp2(x * log2(e))
+__device__ __forceinline__ float ptx_expf(float x) {
+    return ptx_exp2(x * 1.4426950408889634f);  // log2(e)
+}
+
+// Fast tanh approximation via exp2: tanh(x) = (e^2x - 1) / (e^2x + 1)
+// Used in GRU h_tilde computation.
+__device__ __forceinline__ float ptx_tanhf(float x) {
+    float e2x = ptx_exp2(2.0f * x * 1.4426950408889634f);
+    return (e2x - 1.0f) / (e2x + 1.0f);
+}
+
+// Fast sigmoid via exp2: sigmoid(x) = 1 / (1 + exp(-x))
+// Used in GRU z_gate and r_gate.
+__device__ __forceinline__ float ptx_sigmoidf(float x) {
+    float en = ptx_exp2(-x * 1.4426950408889634f);
+    return 1.0f / (1.0f + en);
+}
+
+// Blelloch affine_combine using pure PTX FMA instructions.
+// Composes two Affine2x2 transforms: result = left ∘ right
+// M_out = M_left * M_right, b_out = M_left * b_right + b_left
+// This is the inner loop of the parallel prefix scan (called O(log N) times).
+__device__ __forceinline__ Affine2x2 ptx_affine_combine(
+    const Affine2x2& left, const Affine2x2& right
+) {
+    Affine2x2 out;
+    // M_out = M_left * M_right (2x2 matrix multiply via 8 FMAs)
+    out.m00 = ptx_fma(left.m00, right.m00, left.m01 * right.m10);
+    out.m01 = ptx_fma(left.m00, right.m01, left.m01 * right.m11);
+    out.m10 = ptx_fma(left.m10, right.m00, left.m11 * right.m10);
+    out.m11 = ptx_fma(left.m10, right.m01, left.m11 * right.m11);
+    // b_out = M_left * b_right + b_left
+    out.b0 = ptx_fma(left.m00, right.b0, ptx_fma(left.m01, right.b1, left.b0));
+    out.b1 = ptx_fma(left.m10, right.b0, ptx_fma(left.m11, right.b1, left.b1));
+    return out;
+}
+
+// Expert MLP forward pass — single expert, ReLU activation.
+// Inlined PTX FMA for the inner products.
+// expert_hidden is typically 8-16, so fully unrollable at compile time.
+template <int EXPERT_HIDDEN>
+__device__ __forceinline__ float ptx_expert_mlp_forward(
+    const float* __restrict__ W1,   // [expert_hidden]
+    const float* __restrict__ b1,   // [expert_hidden]
+    const float* __restrict__ W2,   // [expert_hidden]
+    float b2,
+    float input
+) {
+    float result = b2;
+    #pragma unroll
+    for (int h = 0; h < EXPERT_HIDDEN; h++) {
+        float hidden = ptx_fma(W1[h], input, b1[h]);
+        hidden = fmaxf(hidden, 0.0f);  // ReLU
+        result = ptx_fma(W2[h], hidden, result);
+    }
+    return result;
+}
+
+// Stochastic rounding with PTX prmt (permute bytes) for fast bit extraction.
+// Replaces the hash_prng shift+multiply chain with a single PTX instruction
+// for extracting the random threshold from the hash output.
+__device__ __forceinline__ int8_t ptx_int8_stochastic_round(
+    float val, float scale, unsigned rand_bits
+) {
+    float scaled = val / fmaxf(scale, 1e-12f);
+    float tr = truncf(scaled);
+    float frac = fabsf(scaled - tr);
+    // Extract lower 16 bits as threshold using prmt
+    unsigned lo16;
+    asm("prmt.b32 %0, %1, 0, 0x4140;" : "=r"(lo16) : "r"(rand_bits));
+    float threshold = (float)lo16 / 65536.0f;
+    if (frac > threshold) tr += (scaled > 0) ? 1.0f : -1.0f;
+    return (int8_t)fmaxf(-127.0f, fminf(127.0f, tr));
+}
+
+// §25.7 DSMEM cluster reduce (sm_90+ Hopper distributed shared memory).
+// Block-local warp reduce first, then cluster-wide reduce via cooperative
+// groups. Falls back to warp reduce on pre-Hopper.
+__device__ __forceinline__ float cluster_dsmem_reduce_sum(float val) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    namespace cg = cooperative_groups;
+    val = warp_reduce_sum(val, WARP_SIZE, threadIdx.x & (WARP_SIZE - 1));
+    auto cluster = cg::this_cluster();
+    val = cg::reduce(cluster, val, cg::plus<float>());
+    return val;
+#else
+    return warp_reduce_sum(val, WARP_SIZE, threadIdx.x & (WARP_SIZE - 1));
+#endif
+}
+
+#endif // GROK_CUDA
+
+// HIP fallbacks — use standard math functions
+#if GROK_HIP
+__device__ __forceinline__ float fast_rsqrt_nr(float x) { return rsqrtf(x); }
+__device__ __forceinline__ float ptx_fma(float a, float b, float c) { return fmaf(a, b, c); }
+__device__ __forceinline__ float ptx_expf(float x) { return expf(x); }
+__device__ __forceinline__ float ptx_tanhf(float x) { return tanhf(x); }
+__device__ __forceinline__ float ptx_sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
+
+__device__ __forceinline__ Affine2x2 ptx_affine_combine(
+    const Affine2x2& left, const Affine2x2& right
+) {
+    return affine_combine(left, right);  // Use types.h version
+}
+#endif // GROK_HIP
+
+#endif // GROK_CUDA || GROK_HIP
+// ── end inlined csrc/common/utils.cuh ──
+#ifdef WITH_CK
+#include <ck_tile/ops/fmha.hpp>
+#endif
+
+namespace sg { namespace gfx942 { namespace models { namespace attention {
+
+constexpr int kMaxLdsBytes = 65536;  // 64 KB LDS per CU on gfx942
+
+template <typename ActT, int kHeadDim, bool kCausal>
+struct AttentionLaunchConfig {
+    int block;
+    int lds_bytes;
+    int waves_per_eu;       // occupancy hint for CDNA3 scheduler
+    bool use_ck_fmha;
+    bool use_aiter;
 };
 
-// -- Forward pass -------------------------------------------------------------
-template <typename ActT, typename WeightT>
-inline cudaError_t forward(
-    const ActT* input,
-    const WeightT* weights,
-    ActT* output,
-    ActT* activations,
-    int batch, int channels, int height, int width,
-    int patch_size, int d_model, int n_heads, int d_head,
-    int n_layers, int n_classes, int ffn_expansion,
-    cudaStream_t stream
-) {
-    return sg::sm90::models::vit::forward<ActT, WeightT>(
-        input, weights, output, activations,
-        batch, channels, height, width,
-        patch_size, d_model, n_heads, d_head,
-        n_layers, n_classes, ffn_expansion, stream);
+// -- Wave-64 XOR butterfly reductions ----------------------------------------
+__device__ __forceinline__ float wave64_reduce_sum(float val) {
+    val += __shfl_xor(val, 32);
+    val += __shfl_xor(val, 16);
+    val += __shfl_xor(val, 8);
+    val += __shfl_xor(val, 4);
+    val += __shfl_xor(val, 2);
+    val += __shfl_xor(val, 1);
+    return val;
 }
 
-// -- Backward pass ------------------------------------------------------------
-template <typename ActT, typename WeightT>
-inline cudaError_t backward(
-    const ActT* grad_output,
-    const ActT* activations_saved,
-    const WeightT* weights,
-    ActT* grad_input,
-    WeightT* grad_weights,
-    int batch, int channels, int height, int width,
-    int patch_size, int d_model, int n_heads, int d_head,
-    int n_layers, int n_classes, int ffn_expansion,
-    cudaStream_t stream
-) {
-    return sg::sm90::models::vit::backward<ActT, WeightT>(
-        grad_output, activations_saved, weights,
-        grad_input, grad_weights,
-        batch, channels, height, width,
-        patch_size, d_model, n_heads, d_head,
-        n_layers, n_classes, ffn_expansion, stream);
+__device__ __forceinline__ float wave64_reduce_max(float val) {
+    val = fmaxf(val, __shfl_xor(val, 32));
+    val = fmaxf(val, __shfl_xor(val, 16));
+    val = fmaxf(val, __shfl_xor(val, 8));
+    val = fmaxf(val, __shfl_xor(val, 4));
+    val = fmaxf(val, __shfl_xor(val, 2));
+    val = fmaxf(val, __shfl_xor(val, 1));
+    return val;
 }
 
-// -- Patch projection (component-level) ---------------------------------------
-// Provided for parity with sm_90::vit::patch_project. The current binding
-// explicitly errors for arch != 90, so this wrapper is unused at runtime
-// but instantiated for symbol completeness.
-template <typename ActT, typename WeightT>
-inline cudaError_t patch_project(
-    const ActT* input,
-    const WeightT* weight,
-    const WeightT* bias,
-    ActT* output,
-    int batch, int num_patches, int patch_dim, int d_model,
-    cudaStream_t stream
+// -- External backend forward declarations ------------------------------------
+#ifdef WITH_CK
+template <typename ActT, int kHeadDim, bool kCausal>
+hipError_t ck_fmha_forward(
+    const ActT* q, const ActT* k, const ActT* v, ActT* out, ActT* softmax_lse,
+    int batch, int n_heads, int seq_len, float scale, hipStream_t stream);
+#endif
+#ifdef WITH_AITER
+template <typename ActT, int kHeadDim, bool kCausal>
+hipError_t aiter_fmha_forward(
+    const ActT* q, const ActT* k, const ActT* v, ActT* out, ActT* softmax_lse,
+    int batch, int n_heads, int seq_len, float scale, hipStream_t stream);
+#endif
+
+// -- LDS-based attention kernel (default for tiny seq_len) ---------------------
+// One block per (batch, head). Wave-64 cooperative matmul. Max seq_len: 32.
+template <typename ActT, int kHeadDim, bool kCausal>
+__global__ void
+GROK_FLAT_WORK_GROUP_SIZE(64, 256)
+GROK_WAVES_PER_EU(1, 4)
+lds_attention_fwd_kernel(
+    const ActT* __restrict__ q,      // [B, H, N, D]
+    const ActT* __restrict__ k,
+    const ActT* __restrict__ v,
+    ActT* __restrict__ out,
+    float* __restrict__ softmax_lse,  // [B, H, N] or nullptr
+    int seq_len, float scale
 ) {
-    return sg::sm90::models::vit::patch_project<ActT, WeightT>(
-        input, weight, bias, output,
-        batch, num_patches, patch_dim, d_model, stream);
+    const int bh = blockIdx.x, tid = threadIdx.x;
+    const int N = seq_len, D = kHeadDim, base = bh * N * D;
+    extern __shared__ float lds[];
+    float* scores  = lds;
+    float* row_max = scores + N * N;
+    float* row_sum = row_max + N;
+    // S = Q K^T * scale, optional causal mask
+    for (int idx = tid; idx < N * N; idx += blockDim.x) {
+        int i = idx / N, j = idx % N;
+        if constexpr (kCausal) {
+            if (j > i) { scores[idx] = -1e9f; continue; }
+        }
+        float dot = 0.0f;
+        for (int d = 0; d < D; d++)
+            dot += static_cast<float>(q[base + i * D + d])
+                 * static_cast<float>(k[base + j * D + d]);
+        scores[idx] = dot * scale;
+    }
+    __syncthreads();
+    // Row-wise stable softmax
+    for (int i = tid; i < N; i += blockDim.x) {
+        float m = -1e9f;
+        for (int j = 0; j < N; j++) m = fmaxf(m, scores[i * N + j]);
+        row_max[i] = m;
+        float s = 0.0f;
+        for (int j = 0; j < N; j++) {
+            float e = expf(scores[i * N + j] - m);
+            scores[i * N + j] = e;
+            s += e;
+        }
+        float inv_s = 1.0f / fmaxf(s, 1e-12f);
+        for (int j = 0; j < N; j++) scores[i * N + j] *= inv_s;
+        row_sum[i] = s;
+        if (softmax_lse != nullptr)
+            softmax_lse[bh * N + i] = m + logf(fmaxf(s, 1e-12f));
+    }
+    __syncthreads();
+    // Out = Softmax(S) * V
+    for (int idx = tid; idx < N * D; idx += blockDim.x) {
+        int i = idx / D, d = idx % D;
+        float acc = 0.0f;
+        for (int j = 0; j < N; j++)
+            acc += scores[i * N + j] * static_cast<float>(v[base + j * D + d]);
+        out[base + idx] = static_cast<ActT>(acc);
+    }
 }
 
-}}}}  // namespace sg::gfx942::models::vit
+// -- Forward dispatch ----------------------------------------------------------
+template <typename ActT, int kHeadDim, bool kCausal>
+hipError_t attention_forward(
+    const ActT* q, const ActT* k, const ActT* v,
+    ActT* out, ActT* softmax_lse_act,
+    int batch, int n_heads, int seq_len, float scale,
+    hipStream_t stream
+) {
+    float* softmax_lse = reinterpret_cast<float*>(softmax_lse_act);
+#ifdef WITH_CK
+    return ck_fmha_forward<ActT, kHeadDim, kCausal>(
+        q, k, v, out, reinterpret_cast<ActT*>(softmax_lse),
+        batch, n_heads, seq_len, scale, stream);
+#elif defined(WITH_AITER)
+    return aiter_fmha_forward<ActT, kHeadDim, kCausal>(
+        q, k, v, out, reinterpret_cast<ActT*>(softmax_lse),
+        batch, n_heads, seq_len, scale, stream);
+#else
+    int grid = batch * n_heads;
+    int block = WARP_SIZE * 2;  // 128 threads = 2 waves on CDNA3
+    int N = seq_len;
+    int lds_bytes = (N * N + 2 * N) * sizeof(float);
+    lds_attention_fwd_kernel<ActT, kHeadDim, kCausal>
+        <<<grid, block, lds_bytes, stream>>>(
+            q, k, v, out, softmax_lse, seq_len, scale);
+    return hipGetLastError();
+#endif
+}
 
-#endif  // GROKKING_KERNELS_GFX942_VIT_GFX942_HIP_HPP_
+// -- Backward kernel ----------------------------------------------------------
+// Recomputes attention weights from softmax_lse (log-sum-exp saved in fwd).
+// dV = A^T dO, dA = dO V^T, backprop through softmax, dQ = dA' K * scale,
+// dK = dA'^T Q * scale. All in LDS for these tiny sequence lengths.
+
+template <typename ActT, int kHeadDim, bool kCausal>
+__global__
+GROK_FLAT_WORK_GROUP_SIZE(64, 256)
+GROK_WAVES_PER_EU(1, 4)
+void lds_attention_bwd_kernel(
+    const ActT* __restrict__ grad_out,   // [B, H, N, D]
+    const ActT* __restrict__ q,
+    const ActT* __restrict__ k,
+    const ActT* __restrict__ v,
+    const ActT* __restrict__ attn_out,   // saved forward output
+    const float* __restrict__ softmax_lse, // [B, H, N]
+    ActT* __restrict__ grad_q,
+    ActT* __restrict__ grad_k,
+    ActT* __restrict__ grad_v,
+    int seq_len, float scale
+) {
+    const int bh = blockIdx.x, tid = threadIdx.x;
+    const int N = seq_len, D = kHeadDim, base = bh * N * D;
+
+    extern __shared__ float lds[];
+    float* scores = lds;             // N * N (attention weights)
+    float* dA     = scores + N * N;  // N * N (grad through attn weights)
+
+    // Recompute attention weights from softmax_lse
+    for (int idx = tid; idx < N * N; idx += blockDim.x) {
+        int i = idx / N, j = idx % N;
+        if constexpr (kCausal) {
+            if (j > i) { scores[idx] = 0.0f; continue; }
+        }
+        float dot = 0.0f;
+        for (int d = 0; d < D; d++)
+            dot += static_cast<float>(q[base + i * D + d])
+                 * static_cast<float>(k[base + j * D + d]);
+        float lse = softmax_lse[bh * N + i];
+        scores[idx] = ptx_expf(dot * scale - lse);
+    }
+    __syncthreads();
+
+    // dV = A^T dO
+    for (int idx = tid; idx < N * D; idx += blockDim.x) {
+        int j = idx / D, d = idx % D;
+        float acc = 0.0f;
+        for (int i = 0; i < N; i++)
+            acc += scores[i * N + j]
+                 * static_cast<float>(grad_out[base + i * D + d]);
+        grad_v[base + idx] = static_cast<ActT>(acc);
+    }
+    __syncthreads();
+
+    // dA = dO V^T
+    for (int idx = tid; idx < N * N; idx += blockDim.x) {
+        int i = idx / N, j = idx % N;
+        float acc = 0.0f;
+        for (int d = 0; d < D; d++)
+            acc += static_cast<float>(grad_out[base + i * D + d])
+                 * static_cast<float>(v[base + j * D + d]);
+        dA[idx] = acc;
+    }
+    __syncthreads();
+
+    // Backprop through softmax: dS_ij = A_ij * (dA_ij - sum_k(A_ik * dA_ik))
+    for (int i = tid; i < N; i += blockDim.x) {
+        float dot_sum = 0.0f;
+        for (int j = 0; j < N; j++)
+            dot_sum += scores[i * N + j] * dA[i * N + j];
+        for (int j = 0; j < N; j++) {
+            float ds = scores[i * N + j] * (dA[i * N + j] - dot_sum) * scale;
+            if constexpr (kCausal) { if (j > i) ds = 0.0f; }
+            dA[i * N + j] = ds;  // reuse dA for dS
+        }
+    }
+    __syncthreads();
+
+    // dQ = dS K
+    for (int idx = tid; idx < N * D; idx += blockDim.x) {
+        int i = idx / D, d = idx % D;
+        float acc = 0.0f;
+        for (int j = 0; j < N; j++)
+            acc += dA[i * N + j] * static_cast<float>(k[base + j * D + d]);
+        grad_q[base + idx] = static_cast<ActT>(acc);
+    }
+
+    // dK = dS^T Q
+    for (int idx = tid; idx < N * D; idx += blockDim.x) {
+        int j = idx / D, d = idx % D;
+        float acc = 0.0f;
+        for (int i = 0; i < N; i++)
+            acc += dA[i * N + j] * static_cast<float>(q[base + i * D + d]);
+        grad_k[base + idx] = static_cast<ActT>(acc);
+    }
+}
+
+// -- Backward dispatch --------------------------------------------------------
+template <typename ActT, int kHeadDim, bool kCausal>
+hipError_t attention_backward(
+    const ActT* grad_out,
+    const ActT* q, const ActT* k, const ActT* v,
+    const ActT* out, const ActT* softmax_lse_act,
+    ActT* grad_q, ActT* grad_k, ActT* grad_v,
+    int batch, int n_heads, int seq_len,
+    float scale, hipStream_t stream
+) {
+    const float* softmax_lse = reinterpret_cast<const float*>(softmax_lse_act);
+    int grid = batch * n_heads;
+    int block = WARP_SIZE * 2;  // 128 threads = 2 waves on CDNA3
+    int N = seq_len;
+    int lds_bytes = 2 * N * N * sizeof(float);  // scores + dA
+    lds_attention_bwd_kernel<ActT, kHeadDim, kCausal>
+        <<<grid, block, lds_bytes, stream>>>(
+            grad_out, q, k, v, out, softmax_lse,
+            grad_q, grad_k, grad_v, seq_len, scale);
+    return hipGetLastError();
+}
+
+}}}}  // namespace sg::gfx942::models::attention
+
+#endif  // GROKKING_KERNELS_GFX942_ATTENTION_GFX942_HIP_HPP_
