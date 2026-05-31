@@ -77,70 +77,7 @@
 #define SG_TUNED_ASYNC_DEPTH 2
 #endif
 
-// ── inlined from former csrc/backends/hip/gfx942/primitives.hpp ──
-// HIP gfx942 (CDNA3 / MI300X) primitives — host-side ATen helpers shared
-// across every HIP launch file.
-
-namespace sg { namespace gfx942 { namespace primitives {
-
-inline void check_device(const torch::Tensor& t, const char* name) {
-    TORCH_CHECK(t.is_cuda(), name, " must be on a HIP/CUDA device");
-}
-
-template <typename... Tensors>
-inline bool keep_tensor(const torch::Tensor& grad) {
-    return grad.defined() && grad.numel() > 0;
-}
-
-inline void ema_update_inplace(
-    torch::Tensor& m, const torch::Tensor& g, float beta1
-) {
-    m.mul_(beta1).add_(g, 1.0f - beta1);
-}
-
-inline void ema_sq_update_inplace(
-    torch::Tensor& v, const torch::Tensor& g, float beta2
-) {
-    v.mul_(beta2).addcmul_(g, g, 1.0f - beta2);
-}
-
-inline void adam_apply_inplace(
-    torch::Tensor& p, const torch::Tensor& m, const torch::Tensor& v,
-    float lr, float bc1, float bc2, float eps, float wd
-) {
-    auto m_hat = m / bc1;  // bc1 = 1 - beta1^t (un-inverted)
-    auto v_hat = v / bc2;  // bc2 = 1 - beta2^t (un-inverted)
-    auto denom = v_hat.sqrt().add_(eps);
-    auto update = m_hat.div_(denom).add_(p, wd);
-    p.add_(update, -lr);
-}
-
-struct TensorPack {
-    std::vector<torch::Tensor> params;
-    std::vector<torch::Tensor> grads;
-    std::vector<torch::Tensor> state_a;
-    std::vector<torch::Tensor> state_b;
-};
-
-inline TensorPack pack_valid(
-    const std::vector<torch::Tensor>& params,
-    const std::vector<torch::Tensor>& grads,
-    const std::vector<torch::Tensor>& state_a = {},
-    const std::vector<torch::Tensor>& state_b = {}
-) {
-    TensorPack out;
-    for (size_t i = 0; i < params.size(); i++) {
-        if (!grads[i].defined() || grads[i].numel() == 0) continue;
-        out.params.push_back(params[i]);
-        out.grads.push_back(grads[i]);
-        if (!state_a.empty()) out.state_a.push_back(state_a[i]);
-        if (!state_b.empty()) out.state_b.push_back(state_b[i]);
-    }
-    return out;
-}
-
-}}} // namespace sg::gfx942::primitives
-// ── end inlined csrc/backends/hip/gfx942/primitives.hpp ──
+#include "csrc/backends/hip/gfx942/primitives.hpp"
 
 namespace sg { namespace gfx942 {
 
