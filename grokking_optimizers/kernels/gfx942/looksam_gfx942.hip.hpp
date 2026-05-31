@@ -201,15 +201,18 @@ void launch_looksam_apply(
 void launch_looksam_direction_adjust_fused(
     torch::Tensor grad, torch::Tensor sam_grad, torch::Tensor v_dir, float inv_norm, float lambda, float grad_norm
 ) {
-    throw std::runtime_error(
-        "launch_looksam_direction_adjust_fused: HIP gfx942 kernel not yet implemented.");
+    // grad = (1 - lambda) * grad + lambda * grad_norm * (v_dir * inv_norm)
+    auto scaled_dir = v_dir * (inv_norm * grad_norm);
+    grad.mul_(1.0f - lambda).add_(scaled_dir, lambda);
 }
 
 void launch_looksam_norm_reduce(
     torch::Tensor grad, torch::Tensor sam_grad, torch::Tensor results /* [diff_norm, grad_norm] */
 ) {
-    throw std::runtime_error(
-        "launch_looksam_norm_reduce: HIP gfx942 kernel not yet implemented.");
+    // results[0] = ||sam_grad - grad||, results[1] = ||grad||
+    auto diff = sam_grad.to(torch::kFloat32) - grad.to(torch::kFloat32);
+    results[0] = diff.norm();
+    results[1] = grad.to(torch::kFloat32).norm();
 }
 
 }} // namespace sg::gfx942

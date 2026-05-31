@@ -191,37 +191,56 @@ void launch_supergrok11_step(
 void launch_sg11_mu_metanet(
     torch::Tensor mu, torch::Tensor grad, torch::Tensor sharpness, torch::Tensor smart_grad, float alpha, torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2, float rescale, int hidden_dim
 ) {
-    throw std::runtime_error(
-        "launch_sg11_mu_metanet: HIP gfx942 kernel not yet implemented.");
+    // phi network forward: 2-input MLP with tanh activation
+    auto gf = grad.to(torch::kFloat32).view({-1});
+    auto sf = sharpness.view({-1});
+    auto x = torch::stack({gf, sf}, /*dim=*/1);  // [N, 2]
+    auto h = torch::tanh(torch::matmul(x, W1.t()) + b1);
+    float b2_val = b2.item<float>();
+    auto mu_flat = (torch::matmul(h, W2.unsqueeze(1)) + b2_val).view_as(grad) * rescale;
+    mu.copy_(mu_flat);
+    // smart_grad = grad + alpha * mu
+    smart_grad.copy_(gf.view_as(grad) + alpha * mu_flat);
 }
 
 void launch_sg11_adam_decay(
     torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor smart_grad, torch::Tensor mu, float lamb_eff, float beta1, float beta2, float lr, float wd_eff, float eps, float bc1, float bc2
 ) {
-    throw std::runtime_error(
-        "launch_sg11_adam_decay: HIP gfx942 kernel not yet implemented.");
+    // g = smart_grad + lamb_eff * mu, then Adam update
+    auto g = smart_grad + lamb_eff * mu;
+    prim::ema_update_inplace(exp_avg, g, beta1);
+    prim::ema_sq_update_inplace(exp_avg_sq, g, beta2);
+    prim::adam_apply_inplace(param, exp_avg, exp_avg_sq, lr, bc1, bc2, eps, wd_eff);
 }
 
 void launch_sg11_sam_perturb(
     torch::Tensor param, torch::Tensor grad, float rho_over_norm
 ) {
-    throw std::runtime_error(
-        "launch_sg11_sam_perturb: HIP gfx942 kernel not yet implemented.");
+    // param += rho_over_norm * grad
+    param.add_(grad.to(param.scalar_type()), rho_over_norm);
 }
 
 void launch_sg11_sharpness_restore(
     torch::Tensor param, torch::Tensor sharpness, torch::Tensor backup, torch::Tensor sam_grad, torch::Tensor normal_grad
 ) {
-    throw std::runtime_error(
-        "launch_sg11_sharpness_restore: HIP gfx942 kernel not yet implemented.");
+    // param = backup, sharpness = (sam_grad - normal_grad)^2
+    param.copy_(backup);
+    auto diff = sam_grad.to(torch::kFloat32) - normal_grad.to(torch::kFloat32);
+    sharpness.copy_(diff * diff);
 }
 
 float compute_cosine_gate_fused(
     torch::Tensor smart_grad, torch::Tensor mu, float gate_temp
 ) {
-    throw std::runtime_error(
-        "compute_cosine_gate_fused: HIP gfx942 kernel not yet implemented.");
-    return 0.0f;
+    // cos_sim(smart_grad, mu) clamped to [0, 1]
+    auto sg_f = smart_grad.to(torch::kFloat32).flatten();
+    auto mu_f = mu.to(torch::kFloat32).flatten();
+    float num = (sg_f * mu_f).sum().item<float>();
+    float den_g = (sg_f * sg_f).sum().item<float>();
+    float den_m = (mu_f * mu_f).sum().item<float>();
+    float denom = sqrtf(den_g * den_m + 1e-12f);
+    float gate = (denom > 0.0f) ? (num / denom) : 0.0f;
+    return std::min(std::max(gate, 0.0f), 1.0f);
 }
 
 }} // namespace sg::gfx942

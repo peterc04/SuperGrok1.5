@@ -171,38 +171,96 @@ void launch_grokadamw_step(
 
 
 void launch_fused_grokadamw_step(
-    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor ema, torch::Tensor grad, float alpha, float lamb, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor ema, torch::Tensor grad,
+    float alpha, float lamb, float beta1, float beta2,
+    float lr, float weight_decay, float eps, float bc1, float bc2
 ) {
-    throw std::runtime_error(
-        "launch_fused_grokadamw_step: HIP gfx942 kernel not yet implemented.");
+    std::vector<torch::Tensor> vp{param}, vea{exp_avg}, veas{exp_avg_sq},
+                               vema{ema}, vg{grad};
+    launch_grokadamw_step(vp, vea, veas, vema, vg,
+                          alpha, lamb, lr, beta1, beta2, eps, weight_decay,
+                          bc1, bc2);
 }
 
 void launch_fused_grokadamw_clip_step(
-    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor ema, torch::Tensor grad, float alpha, float lamb, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2, float clip_threshold
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor ema, torch::Tensor grad,
+    float alpha, float lamb, float beta1, float beta2,
+    float lr, float weight_decay, float eps,
+    float bc1, float bc2, float clip_threshold
 ) {
-    throw std::runtime_error(
-        "launch_fused_grokadamw_clip_step: HIP gfx942 kernel not yet implemented.");
+    if (clip_threshold > 0.0f) {
+        auto gn = grad.norm().item<float>();
+        if (gn > clip_threshold) grad = grad.mul(clip_threshold / gn);
+    }
+    launch_fused_grokadamw_step(param, exp_avg, exp_avg_sq, ema, grad,
+                                alpha, lamb, beta1, beta2, lr, weight_decay,
+                                eps, bc1, bc2);
 }
 
 void launch_fused_grokadamw_step_q3(
-    torch::Tensor param, torch::Tensor exp_avg_int8, torch::Tensor exp_avg_scales, torch::Tensor exp_avg_sq_bf16, torch::Tensor ema_bf16, torch::Tensor grad, float alpha, float lamb, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2, unsigned global_step
+    torch::Tensor param, torch::Tensor exp_avg_int8,
+    torch::Tensor exp_avg_scales, torch::Tensor exp_avg_sq_bf16,
+    torch::Tensor ema_bf16, torch::Tensor grad,
+    float alpha, float lamb, float beta1, float beta2,
+    float lr, float weight_decay, float eps,
+    float bc1, float bc2, unsigned global_step
 ) {
-    throw std::runtime_error(
-        "launch_fused_grokadamw_step_q3: HIP gfx942 kernel not yet implemented.");
+    auto ea = exp_avg_int8.to(torch::kFloat32) * exp_avg_scales.repeat_interleave(
+        exp_avg_int8.numel() / exp_avg_scales.numel());
+    auto eas = exp_avg_sq_bf16.to(torch::kFloat32);
+    auto ema_f = ema_bf16.to(torch::kFloat32);
+    std::vector<torch::Tensor> vp{param}, vea{ea}, veas{eas},
+                               vema{ema_f}, vg{grad};
+    launch_grokadamw_step(vp, vea, veas, vema, vg,
+                          alpha, lamb, lr, beta1, beta2, eps, weight_decay,
+                          bc1, bc2);
+    auto scale = ea.abs().max();
+    if (scale.item<float>() < 1e-12f) scale = torch::ones({1}, ea.options());
+    exp_avg_scales.fill_(scale.item<float>() / 127.0f);
+    exp_avg_int8.copy_((ea / (scale / 127.0f)).clamp(-127, 127).to(torch::kInt8));
+    exp_avg_sq_bf16.copy_(eas.to(torch::kBFloat16));
+    ema_bf16.copy_(ema_f.to(torch::kBFloat16));
 }
 
 void launch_multi_tensor_grokadamw(
-    std::vector<torch::Tensor>& params, std::vector<torch::Tensor>& exp_avgs, std::vector<torch::Tensor>& exp_avg_sqs, std::vector<torch::Tensor>& emas, std::vector<torch::Tensor>& grads, std::vector<float>& bc1s, std::vector<float>& bc2s, float alpha, float lamb, float beta1, float beta2, float lr, float wd, float eps
+    std::vector<torch::Tensor>& params,
+    std::vector<torch::Tensor>& exp_avgs,
+    std::vector<torch::Tensor>& exp_avg_sqs,
+    std::vector<torch::Tensor>& emas,
+    std::vector<torch::Tensor>& grads,
+    std::vector<float>& bc1s, std::vector<float>& bc2s,
+    float alpha, float lamb, float beta1, float beta2,
+    float lr, float wd, float eps
 ) {
-    throw std::runtime_error(
-        "launch_multi_tensor_grokadamw: HIP gfx942 kernel not yet implemented.");
+    for (size_t i = 0; i < params.size(); i++) {
+        std::vector<torch::Tensor> vp{params[i]}, vea{exp_avgs[i]},
+            veas{exp_avg_sqs[i]}, vema{emas[i]}, vg{grads[i]};
+        launch_grokadamw_step(vp, vea, veas, vema, vg,
+                              alpha, lamb, lr, beta1, beta2, eps, wd,
+                              bc1s[i], bc2s[i]);
+    }
 }
 
 void launch_fused_adamw_simple(
-    std::vector<torch::Tensor>& params, std::vector<torch::Tensor>& exp_avgs, std::vector<torch::Tensor>& exp_avg_sqs, std::vector<torch::Tensor>& grads, std::vector<int64_t>& steps, float beta1, float beta2, float lr, float wd, float eps
+    std::vector<torch::Tensor>& params,
+    std::vector<torch::Tensor>& exp_avgs,
+    std::vector<torch::Tensor>& exp_avg_sqs,
+    std::vector<torch::Tensor>& grads,
+    std::vector<int64_t>& steps,
+    float beta1, float beta2, float lr, float wd, float eps
 ) {
-    throw std::runtime_error(
-        "launch_fused_adamw_simple: HIP gfx942 kernel not yet implemented.");
+    for (size_t t = 0; t < params.size(); t++) {
+        if (!grads[t].defined() || grads[t].numel() == 0) continue;
+        float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[t]));
+        float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[t]));
+        auto& p = params[t]; auto& g = grads[t];
+        auto& m = exp_avgs[t]; auto& v = exp_avg_sqs[t];
+        prim::ema_update_inplace(m, g, beta1);
+        prim::ema_sq_update_inplace(v, g, beta2);
+        prim::adam_apply_inplace(p, m, v, lr, bc1, bc2, eps, wd);
+    }
 }
 
 }} // namespace sg::gfx942

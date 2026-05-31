@@ -1149,11 +1149,39 @@ void launch_muon_update(
 }
 
 
-void launch_muon_ns_combine_update_fused(
-    torch::Tensor param, torch::Tensor X, torch::Tensor AX, torch::Tensor AAX, float a, float b, float c, float neg_lr_scale, float decay_factor
+// Fused Newton-Schulz combine + parameter update in a single pass.
+// Y = a*X + b*AX + c*AAX (NS combine), then param -= lr_scale*Y + decay*param.
+template <typename ParamT>
+__global__ void muon_ns_combine_update_kernel(
+    ParamT* param, const float* X, const float* AX, const float* AAX,
+    float a, float b, float c, float neg_lr_scale, float decay_factor, int N
 ) {
-    throw std::runtime_error(
-        "launch_muon_ns_combine_update_fused: CUDA sm_90 kernel not yet implemented.");
+    const int stride = prim::grid_stride();
+    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+        float y = a * X[i] + b * AX[i] + c * AAX[i];
+        float p = static_cast<float>(param[i]);
+        param[i] = static_cast<ParamT>(p + neg_lr_scale * y - decay_factor * p);
+    }
+}
+
+void launch_muon_ns_combine_update_fused(
+    torch::Tensor param, torch::Tensor X, torch::Tensor AX, torch::Tensor AAX,
+    float a, float b, float c, float neg_lr_scale, float decay_factor
+) {
+    const int64_t N = param.numel();
+    if (N == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        param.scalar_type(), "muon_ns_combine_update", [&] {
+            muon_ns_combine_update_kernel<scalar_t><<<grid, block, 0, stream>>>(
+                param.data_ptr<scalar_t>(),
+                X.data_ptr<float>(), AX.data_ptr<float>(), AAX.data_ptr<float>(),
+                a, b, c, neg_lr_scale, decay_factor, N);
+        });
 }
 
 }} // namespace sg::sm90

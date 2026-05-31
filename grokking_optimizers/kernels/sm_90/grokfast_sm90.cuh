@@ -1098,25 +1098,52 @@ void launch_grokfast_step(
 }
 
 
+// EMA-only update: ema = alpha * ema + (1 - alpha) * grad.
+// No Adam step; used as a sub-operation by the fused path.
+__global__ void grokfast_ema_kernel(
+    float* grad, float* ema, float alpha, float lamb, int N
+) {
+    const int stride = prim::grid_stride();
+    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+        float g = grad[i];
+        float e = alpha * ema[i] + (1.0f - alpha) * g;
+        ema[i] = e;
+        grad[i] = g + lamb * e;
+    }
+}
+
 void launch_fused_grokfast_ema(
     torch::Tensor grad, torch::Tensor ema, float alpha, float lamb
 ) {
-    throw std::runtime_error(
-        "launch_fused_grokfast_ema: CUDA sm_90 kernel not yet implemented.");
+    const int64_t N = grad.numel();
+    if (N == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    grokfast_ema_kernel<<<grid, block, 0, stream>>>(
+        grad.data_ptr<float>(), ema.data_ptr<float>(), alpha, lamb, N);
 }
 
 void launch_fused_grokfast_adam(
-    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor ema, torch::Tensor grad, float alpha, float lamb, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor ema, torch::Tensor grad,
+    float alpha, float lamb,
+    float beta1, float beta2,
+    float lr, float weight_decay, float eps,
+    float bc1, float bc2
 ) {
-    throw std::runtime_error(
-        "launch_fused_grokfast_adam: CUDA sm_90 kernel not yet implemented.");
+    launch_grokfast_step(param, exp_avg, exp_avg_sq, ema, grad,
+                         alpha, lamb, lr, beta1, beta2, eps, weight_decay,
+                         bc1, bc2);
 }
 
 void launch_multi_tensor_grokfast_ema(
-    std::vector<torch::Tensor>& grads, std::vector<torch::Tensor>& ema_bufs, float alpha, float lamb
+    std::vector<torch::Tensor>& grads, std::vector<torch::Tensor>& ema_bufs,
+    float alpha, float lamb
 ) {
-    throw std::runtime_error(
-        "launch_multi_tensor_grokfast_ema: CUDA sm_90 kernel not yet implemented.");
+    for (size_t i = 0; i < grads.size(); i++) {
+        launch_fused_grokfast_ema(grads[i], ema_bufs[i], alpha, lamb);
+    }
 }
 
 }} // namespace sg::sm90

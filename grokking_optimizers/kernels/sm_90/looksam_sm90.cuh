@@ -1190,18 +1190,43 @@ void launch_looksam_apply(
 }
 
 
-void launch_looksam_direction_adjust_fused(
-    torch::Tensor grad, torch::Tensor sam_grad, torch::Tensor v_dir, float inv_norm, float lambda, float grad_norm
+// Fused direction-adjust: grad = (1 - lambda) * grad + lambda * grad_norm * (v_dir * inv_norm)
+__global__ void looksam_direction_adjust_kernel(
+    float* grad, const float* v_dir,
+    float inv_norm, float lambda, float grad_norm, int N
 ) {
-    throw std::runtime_error(
-        "launch_looksam_direction_adjust_fused: CUDA sm_90 kernel not yet implemented.");
+    const int stride = prim::grid_stride();
+    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+        float g = grad[i];
+        float d = v_dir[i] * inv_norm;
+        grad[i] = (1.0f - lambda) * g + lambda * grad_norm * d;
+    }
 }
 
-void launch_looksam_norm_reduce(
-    torch::Tensor grad, torch::Tensor sam_grad, torch::Tensor results /* [diff_norm, grad_norm] */
+void launch_looksam_direction_adjust_fused(
+    torch::Tensor grad, torch::Tensor sam_grad, torch::Tensor v_dir,
+    float inv_norm, float lambda, float grad_norm
 ) {
-    throw std::runtime_error(
-        "launch_looksam_norm_reduce: CUDA sm_90 kernel not yet implemented.");
+    const int64_t N = grad.numel();
+    if (N == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    looksam_direction_adjust_kernel<<<grid, block, 0, stream>>>(
+        grad.data_ptr<float>(), v_dir.data_ptr<float>(),
+        inv_norm, lambda, grad_norm, N);
+}
+
+// Reduce: results[0] = ||sam_grad - grad||, results[1] = ||grad||.
+void launch_looksam_norm_reduce(
+    torch::Tensor grad, torch::Tensor sam_grad,
+    torch::Tensor results
+) {
+    auto diff = (sam_grad - grad).to(torch::kFloat32);
+    auto dn = diff.norm();
+    auto gn = grad.to(torch::kFloat32).norm();
+    results[0] = dn;
+    results[1] = gn;
 }
 
 }} // namespace sg::sm90

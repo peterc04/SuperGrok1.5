@@ -195,29 +195,35 @@ void launch_muon_step(
 void launch_muon_ns_combine_update_fused(
     torch::Tensor param, torch::Tensor X, torch::Tensor AX, torch::Tensor AAX, float a, float b, float c, float neg_lr_scale, float decay_factor
 ) {
-    throw std::runtime_error(
-        "launch_muon_ns_combine_update_fused: HIP gfx942 kernel not yet implemented.");
+    // Y = a*X + b*AX + c*AAX
+    auto Y = a * X + b * AX + c * AAX;
+    // param = param + neg_lr_scale*Y - decay_factor*param
+    //       = (1 - decay_factor)*param + neg_lr_scale*Y
+    param.mul_(1.0f - decay_factor).add_(Y.to(param.scalar_type()), neg_lr_scale);
 }
 
 void launch_muon_momentum_normalize(
     torch::Tensor buf, torch::Tensor X, torch::Tensor grad, float momentum, float inv_norm
 ) {
-    throw std::runtime_error(
-        "launch_muon_momentum_normalize: HIP gfx942 kernel not yet implemented.");
+    // buf = momentum*buf + inv_norm*grad.float()
+    buf.mul_(momentum).add_(grad.to(torch::kFloat32), inv_norm);
+    // X = buf (copy)
+    X.copy_(buf);
 }
 
 void launch_muon_ns_combine(
     torch::Tensor X_out, torch::Tensor X, torch::Tensor AX, torch::Tensor AAX, float a, float b, float c
 ) {
-    throw std::runtime_error(
-        "launch_muon_ns_combine: HIP gfx942 kernel not yet implemented.");
+    // X_out = a*X + b*AX + c*AAX
+    X_out.copy_(a * X + b * AX + c * AAX);
 }
 
 void launch_muon_update(
     torch::Tensor param, torch::Tensor orth, float neg_lr_scale, float decay_factor
 ) {
-    throw std::runtime_error(
-        "launch_muon_update: HIP gfx942 kernel not yet implemented.");
+    // param = param + neg_lr_scale*orth - decay_factor*param
+    //       = (1 - decay_factor)*param + neg_lr_scale*orth
+    param.mul_(1.0f - decay_factor).add_(orth.to(param.scalar_type()), neg_lr_scale);
 }
 
 }} // namespace sg::gfx942

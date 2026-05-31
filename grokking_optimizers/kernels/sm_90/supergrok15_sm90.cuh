@@ -1148,25 +1148,93 @@ void launch_supergrok15_step(
 }
 
 
+// Full fused SG15 step: meta-net forward (sweep_a) + Adam update (sweep_b).
 void launch_fused_supergrok15_full_step(
-    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor mu, torch::Tensor grad, torch::Tensor sharpness, float alpha, torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2, float rescale, float lamb_eff, float beta1, float beta2, float lr, float wd_eff, float eps, float bc1, float bc2, int hidden_dim
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor mu, torch::Tensor grad, torch::Tensor sharpness,
+    float alpha,
+    torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2,
+    float rescale, float lamb_eff,
+    float beta1, float beta2, float lr, float wd_eff, float eps,
+    float bc1, float bc2, int hidden_dim
 ) {
-    throw std::runtime_error(
-        "launch_fused_supergrok15_full_step: CUDA sm_90 kernel not yet implemented.");
+    float b2_val = b2.item<float>();
+    auto sharp_partial = torch::zeros({1},
+        torch::TensorOptions().device(param.device()).dtype(torch::kFloat32));
+    float gate_global = lamb_eff;
+    float alpha_base = alpha;
+    float alpha_max = alpha;
+    launch_supergrok15_step(param, exp_avg, exp_avg_sq, mu, grad, sharpness,
+                            W1, b1, W2, b2_val, sharp_partial,
+                            gate_global, alpha_base, alpha_max,
+                            lr, beta1, beta2, eps, wd_eff, bc1, bc2);
+}
+
+// SAM perturbation: param += rho_over_norm * grad
+template <typename ParamT>
+__global__ void sg15_sam_perturb_kernel(
+    ParamT* param, const ParamT* grad, float rho_over_norm, int N
+) {
+    const int stride = prim::grid_stride();
+    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+        float p = static_cast<float>(param[i]);
+        float g = static_cast<float>(grad[i]);
+        param[i] = static_cast<ParamT>(p + rho_over_norm * g);
+    }
 }
 
 void launch_sam_perturb(
     torch::Tensor param, torch::Tensor grad, float rho_over_norm
 ) {
-    throw std::runtime_error(
-        "launch_sam_perturb: CUDA sm_90 kernel not yet implemented.");
+    const int64_t N = param.numel();
+    if (N == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        param.scalar_type(), "sg15_sam_perturb", [&] {
+            sg15_sam_perturb_kernel<scalar_t><<<grid, block, 0, stream>>>(
+                param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+                rho_over_norm, N);
+        });
+}
+
+// Sharpness restore: param = backup, sharpness = (sam_grad - normal_grad)^2
+template <typename ParamT>
+__global__ void sg15_sharpness_restore_kernel(
+    ParamT* param, float* sharpness, const ParamT* backup,
+    const ParamT* sam_grad, const ParamT* normal_grad, int N
+) {
+    const int stride = prim::grid_stride();
+    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+        param[i] = backup[i];
+        float diff = static_cast<float>(sam_grad[i]) -
+                     static_cast<float>(normal_grad[i]);
+        sharpness[i] = diff * diff;
+    }
 }
 
 void launch_sharpness_restore(
-    torch::Tensor param, torch::Tensor sharpness, torch::Tensor backup, torch::Tensor sam_grad, torch::Tensor normal_grad
+    torch::Tensor param, torch::Tensor sharpness, torch::Tensor backup,
+    torch::Tensor sam_grad, torch::Tensor normal_grad
 ) {
-    throw std::runtime_error(
-        "launch_sharpness_restore: CUDA sm_90 kernel not yet implemented.");
+    const int64_t N = param.numel();
+    if (N == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        param.scalar_type(), "sg15_sharpness_restore", [&] {
+            sg15_sharpness_restore_kernel<scalar_t>
+                <<<grid, block, 0, stream>>>(
+                param.data_ptr<scalar_t>(),
+                sharpness.data_ptr<float>(),
+                backup.data_ptr<scalar_t>(),
+                sam_grad.data_ptr<scalar_t>(),
+                normal_grad.data_ptr<scalar_t>(), N);
+        });
 }
 
 }} // namespace sg::sm90

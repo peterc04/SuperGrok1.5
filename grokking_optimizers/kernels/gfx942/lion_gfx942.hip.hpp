@@ -178,15 +178,16 @@ void launch_lion_step(
 void launch_fused_lion_step(
     torch::Tensor param, torch::Tensor exp_avg, torch::Tensor grad, float lr, float beta1, float beta2, float weight_decay
 ) {
-    throw std::runtime_error(
-        "launch_fused_lion_step: HIP gfx942 kernel not yet implemented.");
+    std::vector<torch::Tensor> vp{param};
+    std::vector<torch::Tensor> ve{exp_avg};
+    std::vector<torch::Tensor> vg{grad};
+    launch_lion_step(vp, ve, vg, lr, beta1, beta2, weight_decay);
 }
 
 void launch_multi_tensor_lion(
     std::vector<torch::Tensor>& params, std::vector<torch::Tensor>& exp_avgs, std::vector<torch::Tensor>& grads, float lr, float beta1, float beta2, float wd
 ) {
-    throw std::runtime_error(
-        "launch_multi_tensor_lion: HIP gfx942 kernel not yet implemented.");
+    launch_lion_step(params, exp_avgs, grads, lr, beta1, beta2, wd);
 }
 
 }} // namespace sg::gfx942

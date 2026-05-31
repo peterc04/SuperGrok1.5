@@ -1098,38 +1098,149 @@ void launch_grokadamw_step(
 
 
 void launch_fused_grokadamw_step(
-    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor ema, torch::Tensor grad, float alpha, float lamb, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor ema, torch::Tensor grad,
+    float alpha, float lamb,
+    float beta1, float beta2,
+    float lr, float weight_decay, float eps,
+    float bc1, float bc2
 ) {
-    throw std::runtime_error(
-        "launch_fused_grokadamw_step: CUDA sm_90 kernel not yet implemented.");
+    launch_grokadamw_step(param, exp_avg, exp_avg_sq, ema, grad,
+                          alpha, lamb, lr, beta1, beta2, eps, weight_decay,
+                          bc1, bc2);
 }
 
 void launch_fused_grokadamw_clip_step(
-    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor ema, torch::Tensor grad, float alpha, float lamb, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2, float clip_threshold
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor ema, torch::Tensor grad,
+    float alpha, float lamb,
+    float beta1, float beta2,
+    float lr, float weight_decay, float eps,
+    float bc1, float bc2, float clip_threshold
 ) {
-    throw std::runtime_error(
-        "launch_fused_grokadamw_clip_step: CUDA sm_90 kernel not yet implemented.");
+    if (clip_threshold > 0.0f) {
+        auto gn = grad.norm().item<float>();
+        if (gn > clip_threshold) {
+            grad = grad.mul(clip_threshold / gn);
+        }
+    }
+    launch_grokadamw_step(param, exp_avg, exp_avg_sq, ema, grad,
+                          alpha, lamb, lr, beta1, beta2, eps, weight_decay,
+                          bc1, bc2);
+}
+
+// Quantized Config-3: INT8 exp_avg, BF16 exp_avg_sq & ema.
+// Dequantize → update in FP32 → re-quantize with stochastic rounding.
+template <typename ParamT, typename GradT>
+__global__ void grokadamw_q3_kernel(
+    ParamT* param,
+    int8_t* ea_int8, float* ea_scales,
+    __nv_bfloat16* eas_bf16, __nv_bfloat16* ema_bf16,
+    const GradT* grad,
+    float alpha, float lamb,
+    float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2, unsigned step, int N, int block_size
+) {
+    const int stride = prim::grid_stride();
+    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+        int scale_idx = i / block_size;
+        float scale = ea_scales[scale_idx];
+        float ea_val = static_cast<float>(ea_int8[i]) * scale;
+        float eas_val = __bfloat162float(eas_bf16[i]);
+        float ema_val = __bfloat162float(ema_bf16[i]);
+
+        float g = static_cast<float>(grad[i]);
+        float p = static_cast<float>(param[i]);
+
+        float ema_new = alpha * ema_val + (1.0f - alpha) * g;
+        float g_amp = g + lamb * ema_new;
+        float m = beta1 * ea_val + (1.0f - beta1) * g_amp;
+        float v = beta2 * eas_val + (1.0f - beta2) * g_amp * g_amp;
+
+        float update = (m / bc1) / (sqrtf(v / bc2) + eps);
+        param[i] = static_cast<ParamT>(p - lr * (update + wd * p));
+
+        unsigned rng = hash_prng(step, static_cast<unsigned>(i));
+        ea_int8[i] = ptx_int8_stochastic_round(m, scale, rng);
+        eas_bf16[i] = float_to_bf16_stochastic(v, rng >> 16);
+        ema_bf16[i] = float_to_bf16_stochastic(ema_new, rng ^ 0xDEADBEEFu);
+    }
 }
 
 void launch_fused_grokadamw_step_q3(
-    torch::Tensor param, torch::Tensor exp_avg_int8, torch::Tensor exp_avg_scales, torch::Tensor exp_avg_sq_bf16, torch::Tensor ema_bf16, torch::Tensor grad, float alpha, float lamb, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2, unsigned global_step
+    torch::Tensor param,
+    torch::Tensor exp_avg_int8, torch::Tensor exp_avg_scales,
+    torch::Tensor exp_avg_sq_bf16, torch::Tensor ema_bf16,
+    torch::Tensor grad,
+    float alpha, float lamb,
+    float beta1, float beta2,
+    float lr, float weight_decay, float eps,
+    float bc1, float bc2, unsigned global_step
 ) {
-    throw std::runtime_error(
-        "launch_fused_grokadamw_step_q3: CUDA sm_90 kernel not yet implemented.");
+    const int64_t N = param.numel();
+    if (N == 0) return;
+
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    const int q_block_size = std::max<int>(1,
+        static_cast<int>(N / exp_avg_scales.numel()));
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        param.scalar_type(), "grokadamw_q3", [&] {
+            grokadamw_q3_kernel<scalar_t, scalar_t><<<grid, block, 0, stream>>>(
+                param.data_ptr<scalar_t>(),
+                exp_avg_int8.data_ptr<int8_t>(),
+                exp_avg_scales.data_ptr<float>(),
+                reinterpret_cast<__nv_bfloat16*>(exp_avg_sq_bf16.data_ptr()),
+                reinterpret_cast<__nv_bfloat16*>(ema_bf16.data_ptr()),
+                grad.data_ptr<scalar_t>(),
+                alpha, lamb, lr, beta1, beta2, eps, weight_decay,
+                bc1, bc2, global_step, N, q_block_size);
+        });
 }
 
 void launch_multi_tensor_grokadamw(
-    std::vector<torch::Tensor>& params, std::vector<torch::Tensor>& exp_avgs, std::vector<torch::Tensor>& exp_avg_sqs, std::vector<torch::Tensor>& emas, std::vector<torch::Tensor>& grads, std::vector<float>& bc1s, std::vector<float>& bc2s, float alpha, float lamb, float beta1, float beta2, float lr, float wd, float eps
+    std::vector<torch::Tensor>& params,
+    std::vector<torch::Tensor>& exp_avgs,
+    std::vector<torch::Tensor>& exp_avg_sqs,
+    std::vector<torch::Tensor>& emas,
+    std::vector<torch::Tensor>& grads,
+    std::vector<float>& bc1s, std::vector<float>& bc2s,
+    float alpha, float lamb,
+    float beta1, float beta2,
+    float lr, float wd, float eps
 ) {
-    throw std::runtime_error(
-        "launch_multi_tensor_grokadamw: CUDA sm_90 kernel not yet implemented.");
+    for (size_t i = 0; i < params.size(); i++) {
+        launch_grokadamw_step(params[i], exp_avgs[i], exp_avg_sqs[i],
+                              emas[i], grads[i],
+                              alpha, lamb, lr, beta1, beta2, eps, wd,
+                              bc1s[i], bc2s[i]);
+    }
 }
 
+// AdamW is GrokAdamW with lamb=0 (EMA amplification disabled).
+// The ema buffer is not needed; allocate a dummy per-tensor.
 void launch_fused_adamw_simple(
-    std::vector<torch::Tensor>& params, std::vector<torch::Tensor>& exp_avgs, std::vector<torch::Tensor>& exp_avg_sqs, std::vector<torch::Tensor>& grads, std::vector<int64_t>& steps, float beta1, float beta2, float lr, float wd, float eps
+    std::vector<torch::Tensor>& params,
+    std::vector<torch::Tensor>& exp_avgs,
+    std::vector<torch::Tensor>& exp_avg_sqs,
+    std::vector<torch::Tensor>& grads,
+    std::vector<int64_t>& steps,
+    float beta1, float beta2, float lr, float wd, float eps
 ) {
-    throw std::runtime_error(
-        "launch_fused_adamw_simple: CUDA sm_90 kernel not yet implemented.");
+    for (size_t t = 0; t < params.size(); t++) {
+        const int64_t N = params[t].numel();
+        if (N == 0 || !grads[t].defined()) continue;
+        float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[t]));
+        float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[t]));
+        auto ema_dummy = torch::zeros_like(exp_avgs[t]);
+        launch_grokadamw_step(params[t], exp_avgs[t], exp_avg_sqs[t],
+                              ema_dummy, grads[t],
+                              0.0f, 0.0f, lr, beta1, beta2, eps, wd,
+                              bc1, bc2);
+    }
 }
 
 }} // namespace sg::sm90

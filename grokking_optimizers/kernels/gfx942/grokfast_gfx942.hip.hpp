@@ -161,22 +161,30 @@ void launch_grokfast_step(
 void launch_fused_grokfast_ema(
     torch::Tensor grad, torch::Tensor ema, float alpha, float lamb
 ) {
-    throw std::runtime_error(
-        "launch_fused_grokfast_ema: HIP gfx942 kernel not yet implemented.");
+    prim::ema_update_inplace(ema, grad, alpha);
+    grad.add_(ema, lamb);
 }
 
 void launch_fused_grokfast_adam(
-    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor ema, torch::Tensor grad, float alpha, float lamb, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor ema, torch::Tensor grad,
+    float alpha, float lamb, float beta1, float beta2,
+    float lr, float weight_decay, float eps, float bc1, float bc2
 ) {
-    throw std::runtime_error(
-        "launch_fused_grokfast_adam: HIP gfx942 kernel not yet implemented.");
+    std::vector<torch::Tensor> vp{param}, vea{exp_avg}, veas{exp_avg_sq},
+                               vema{ema}, vg{grad};
+    launch_grokfast_step(vp, vea, veas, vema, vg,
+                         alpha, lamb, lr, beta1, beta2, eps, weight_decay,
+                         bc1, bc2);
 }
 
 void launch_multi_tensor_grokfast_ema(
-    std::vector<torch::Tensor>& grads, std::vector<torch::Tensor>& ema_bufs, float alpha, float lamb
+    std::vector<torch::Tensor>& grads, std::vector<torch::Tensor>& ema_bufs,
+    float alpha, float lamb
 ) {
-    throw std::runtime_error(
-        "launch_multi_tensor_grokfast_ema: HIP gfx942 kernel not yet implemented.");
+    for (size_t i = 0; i < grads.size(); i++) {
+        launch_fused_grokfast_ema(grads[i], ema_bufs[i], alpha, lamb);
+    }
 }
 
 }} // namespace sg::gfx942

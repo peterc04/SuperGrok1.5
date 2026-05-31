@@ -183,22 +183,36 @@ void launch_neuralgrok_step(
 void launch_fused_neuralgrok_amplifier(
     torch::Tensor grad, torch::Tensor amplified, torch::Tensor amplifier_w1, torch::Tensor amplifier_b1, torch::Tensor amplifier_w2, torch::Tensor amplifier_b2, int hidden_dim, float alpha, float beta
 ) {
-    throw std::runtime_error(
-        "launch_fused_neuralgrok_amplifier: HIP gfx942 kernel not yet implemented.");
+    // psi forward: input is |grad| per-element
+    auto ag = grad.abs().to(torch::kFloat32).view({-1, 1});
+    auto h = torch::relu(torch::matmul(ag, amplifier_w1.unsqueeze(0)) + amplifier_b1);
+    float b2_val = amplifier_b2.item<float>();
+    auto s = (torch::matmul(h, amplifier_w2.unsqueeze(1)) + b2_val).view_as(grad);
+    // amplified = alpha * psi * grad + beta * grad
+    amplified.copy_((s * alpha + beta) * grad.to(torch::kFloat32));
 }
 
 void launch_fused_neuralgrok_adam(
     torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor amplified_grad, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2
 ) {
-    throw std::runtime_error(
-        "launch_fused_neuralgrok_adam: HIP gfx942 kernel not yet implemented.");
+    prim::ema_update_inplace(exp_avg, amplified_grad, beta1);
+    prim::ema_sq_update_inplace(exp_avg_sq, amplified_grad, beta2);
+    prim::adam_apply_inplace(param, exp_avg, exp_avg_sq, lr, bc1, bc2, eps, weight_decay);
 }
 
 void launch_fused_neuralgrok_full_step(
     torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor grad, torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2, float alpha_amp, float beta_amp, int hidden_dim, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2
 ) {
-    throw std::runtime_error(
-        "launch_fused_neuralgrok_full_step: HIP gfx942 kernel not yet implemented.");
+    float b2_val = b2.item<float>();
+    std::vector<torch::Tensor> vp{param};
+    std::vector<torch::Tensor> vm{exp_avg};
+    std::vector<torch::Tensor> vv{exp_avg_sq};
+    std::vector<torch::Tensor> vg{grad};
+    launch_neuralgrok_step(vp, vm, vv, vg,
+                           W1, b1, W2, b2_val,
+                           alpha_amp, beta_amp,
+                           lr, beta1, beta2, eps, weight_decay,
+                           bc1, bc2);
 }
 
 }} // namespace sg::gfx942

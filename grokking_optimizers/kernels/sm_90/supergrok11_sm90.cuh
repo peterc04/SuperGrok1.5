@@ -1168,40 +1168,168 @@ void launch_supergrok11_step(
 }
 
 
-void launch_sg11_mu_metanet(
-    torch::Tensor mu, torch::Tensor grad, torch::Tensor sharpness, torch::Tensor smart_grad, float alpha, torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2, float rescale, int hidden_dim
+// Meta-net forward: mu[i] = phi(grad[i], sharpness[i]); smart_grad = grad + alpha*mu
+template <typename GradT>
+__global__ void sg11_mu_metanet_kernel(
+    float* mu, const GradT* grad, const float* sharpness,
+    float* smart_grad, float alpha,
+    const float* W1, const float* b1, const float* W2, float b2_scalar,
+    float rescale, int N
 ) {
-    throw std::runtime_error(
-        "launch_sg11_mu_metanet: CUDA sm_90 kernel not yet implemented.");
+    const int stride = prim::grid_stride();
+    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+        float g = static_cast<float>(grad[i]);
+        float s = sharpness[i];
+        float phi = sg11_phi_forward(g, s, W1, b1, W2, b2_scalar) * rescale;
+        mu[i] = phi;
+        smart_grad[i] = g + alpha * phi;
+    }
+}
+
+void launch_sg11_mu_metanet(
+    torch::Tensor mu, torch::Tensor grad, torch::Tensor sharpness,
+    torch::Tensor smart_grad, float alpha,
+    torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2,
+    float rescale, int hidden_dim
+) {
+    const int64_t N = mu.numel();
+    if (N == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    float b2_val = b2.item<float>();
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        grad.scalar_type(), "sg11_mu_metanet", [&] {
+            sg11_mu_metanet_kernel<scalar_t><<<grid, block, 0, stream>>>(
+                mu.data_ptr<float>(),
+                grad.data_ptr<scalar_t>(),
+                sharpness.data_ptr<float>(),
+                smart_grad.data_ptr<float>(), alpha,
+                W1.data_ptr<float>(), b1.data_ptr<float>(),
+                W2.data_ptr<float>(), b2_val, rescale, N);
+        });
+}
+
+// Adam + decoupled WD on smart_grad, with optional lamb-scaled mu blending.
+__global__ void sg11_adam_decay_kernel(
+    float* param, float* exp_avg, float* exp_avg_sq,
+    const float* smart_grad, const float* mu,
+    float lamb_eff, float beta1, float beta2, float lr,
+    float wd_eff, float eps, float bc1, float bc2, int N
+) {
+    const int stride = prim::grid_stride();
+    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+        float g = smart_grad[i] + lamb_eff * mu[i];
+        float p = param[i];
+        float m = beta1 * exp_avg[i] + (1.0f - beta1) * g;
+        float v = beta2 * exp_avg_sq[i] + (1.0f - beta2) * g * g;
+        exp_avg[i] = m;
+        exp_avg_sq[i] = v;
+        float update = (m / bc1) / (sqrtf(v / bc2) + eps);
+        param[i] = p - lr * (update + wd_eff * p);
+    }
 }
 
 void launch_sg11_adam_decay(
-    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor smart_grad, torch::Tensor mu, float lamb_eff, float beta1, float beta2, float lr, float wd_eff, float eps, float bc1, float bc2
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor smart_grad, torch::Tensor mu,
+    float lamb_eff, float beta1, float beta2, float lr,
+    float wd_eff, float eps, float bc1, float bc2
 ) {
-    throw std::runtime_error(
-        "launch_sg11_adam_decay: CUDA sm_90 kernel not yet implemented.");
+    const int64_t N = param.numel();
+    if (N == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    sg11_adam_decay_kernel<<<grid, block, 0, stream>>>(
+        param.data_ptr<float>(), exp_avg.data_ptr<float>(),
+        exp_avg_sq.data_ptr<float>(),
+        smart_grad.data_ptr<float>(), mu.data_ptr<float>(),
+        lamb_eff, beta1, beta2, lr, wd_eff, eps, bc1, bc2, N);
+}
+
+// SAM perturbation: param += rho_over_norm * grad
+template <typename ParamT>
+__global__ void sg11_sam_perturb_kernel(
+    ParamT* param, const ParamT* grad, float rho_over_norm, int N
+) {
+    const int stride = prim::grid_stride();
+    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+        float p = static_cast<float>(param[i]);
+        float g = static_cast<float>(grad[i]);
+        param[i] = static_cast<ParamT>(p + rho_over_norm * g);
+    }
 }
 
 void launch_sg11_sam_perturb(
     torch::Tensor param, torch::Tensor grad, float rho_over_norm
 ) {
-    throw std::runtime_error(
-        "launch_sg11_sam_perturb: CUDA sm_90 kernel not yet implemented.");
+    const int64_t N = param.numel();
+    if (N == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        param.scalar_type(), "sg11_sam_perturb", [&] {
+            sg11_sam_perturb_kernel<scalar_t><<<grid, block, 0, stream>>>(
+                param.data_ptr<scalar_t>(), grad.data_ptr<scalar_t>(),
+                rho_over_norm, N);
+        });
+}
+
+// Sharpness restore: param = backup, sharpness = ||sam_grad - normal_grad||
+template <typename ParamT>
+__global__ void sg11_sharpness_restore_kernel(
+    ParamT* param, float* sharpness, const ParamT* backup,
+    const ParamT* sam_grad, const ParamT* normal_grad, int N
+) {
+    const int stride = prim::grid_stride();
+    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+        param[i] = backup[i];
+        float sg = static_cast<float>(sam_grad[i]);
+        float ng = static_cast<float>(normal_grad[i]);
+        float diff = sg - ng;
+        sharpness[i] = diff * diff;
+    }
 }
 
 void launch_sg11_sharpness_restore(
-    torch::Tensor param, torch::Tensor sharpness, torch::Tensor backup, torch::Tensor sam_grad, torch::Tensor normal_grad
+    torch::Tensor param, torch::Tensor sharpness, torch::Tensor backup,
+    torch::Tensor sam_grad, torch::Tensor normal_grad
 ) {
-    throw std::runtime_error(
-        "launch_sg11_sharpness_restore: CUDA sm_90 kernel not yet implemented.");
+    const int64_t N = param.numel();
+    if (N == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16,
+        param.scalar_type(), "sg11_sharpness_restore", [&] {
+            sg11_sharpness_restore_kernel<scalar_t>
+                <<<grid, block, 0, stream>>>(
+                param.data_ptr<scalar_t>(),
+                sharpness.data_ptr<float>(),
+                backup.data_ptr<scalar_t>(),
+                sam_grad.data_ptr<scalar_t>(),
+                normal_grad.data_ptr<scalar_t>(), N);
+        });
 }
 
+// Cosine gate: cos_sim(smart_grad, mu) clamped to [0,1].
 float compute_cosine_gate_fused(
     torch::Tensor smart_grad, torch::Tensor mu, float gate_temp
 ) {
-    throw std::runtime_error(
-        "compute_cosine_gate_fused: CUDA sm_90 kernel not yet implemented.");
-    return 0.0f;
+    auto sg_f = smart_grad.to(torch::kFloat32).flatten();
+    auto mu_f = mu.to(torch::kFloat32).flatten();
+    float num = (sg_f * mu_f).sum().item<float>();
+    float den_g = (sg_f * sg_f).sum().item<float>();
+    float den_m = (mu_f * mu_f).sum().item<float>();
+    float denom = sqrtf(den_g * den_m + 1e-12f);
+    float gate = (denom > 0.0f) ? (num / denom) : 0.0f;
+    return fminf(fmaxf(gate, 0.0f), 1.0f);
 }
 
 }} // namespace sg::sm90

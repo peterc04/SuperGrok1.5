@@ -182,22 +182,37 @@ void launch_supergrok15_step(
 void launch_fused_supergrok15_full_step(
     torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor mu, torch::Tensor grad, torch::Tensor sharpness, float alpha, torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2, float rescale, float lamb_eff, float beta1, float beta2, float lr, float wd_eff, float eps, float bc1, float bc2, int hidden_dim
 ) {
-    throw std::runtime_error(
-        "launch_fused_supergrok15_full_step: HIP gfx942 kernel not yet implemented.");
+    // Delegate to the working launch_supergrok15_step, wrapping single tensors in vectors
+    float b2_val = b2.item<float>();
+    std::vector<torch::Tensor> vp{param};
+    std::vector<torch::Tensor> vm{exp_avg};
+    std::vector<torch::Tensor> vv{exp_avg_sq};
+    std::vector<torch::Tensor> vmu{mu};
+    std::vector<torch::Tensor> vg{grad};
+    std::vector<torch::Tensor> vs{sharpness};
+    float gate_global = lamb_eff;
+    float alpha_base = alpha;
+    float alpha_max = alpha;
+    launch_supergrok15_step(vp, vm, vv, vmu, vg, vs,
+                            W1, b1, W2, b2_val,
+                            gate_global, alpha_base, alpha_max,
+                            lr, beta1, beta2, eps, wd_eff, bc1, bc2);
 }
 
 void launch_sam_perturb(
     torch::Tensor param, torch::Tensor grad, float rho_over_norm
 ) {
-    throw std::runtime_error(
-        "launch_sam_perturb: HIP gfx942 kernel not yet implemented.");
+    // param += rho_over_norm * grad
+    param.add_(grad.to(param.scalar_type()), rho_over_norm);
 }
 
 void launch_sharpness_restore(
     torch::Tensor param, torch::Tensor sharpness, torch::Tensor backup, torch::Tensor sam_grad, torch::Tensor normal_grad
 ) {
-    throw std::runtime_error(
-        "launch_sharpness_restore: HIP gfx942 kernel not yet implemented.");
+    // param = backup, sharpness = (sam_grad - normal_grad)^2
+    param.copy_(backup);
+    auto diff = sam_grad.to(torch::kFloat32) - normal_grad.to(torch::kFloat32);
+    sharpness.copy_(diff * diff);
 }
 
 }} // namespace sg::gfx942

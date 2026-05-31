@@ -1115,17 +1115,22 @@ void launch_lion_step(
 
 
 void launch_fused_lion_step(
-    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor grad, float lr, float beta1, float beta2, float weight_decay
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor grad,
+    float lr, float beta1, float beta2, float weight_decay
 ) {
-    throw std::runtime_error(
-        "launch_fused_lion_step: CUDA sm_90 kernel not yet implemented.");
+    launch_lion_step(param, exp_avg, grad, lr, beta1, beta2, weight_decay);
 }
 
 void launch_multi_tensor_lion(
-    std::vector<torch::Tensor>& params, std::vector<torch::Tensor>& exp_avgs, std::vector<torch::Tensor>& grads, float lr, float beta1, float beta2, float wd
+    std::vector<torch::Tensor>& params,
+    std::vector<torch::Tensor>& exp_avgs,
+    std::vector<torch::Tensor>& grads,
+    float lr, float beta1, float beta2, float wd
 ) {
-    throw std::runtime_error(
-        "launch_multi_tensor_lion: CUDA sm_90 kernel not yet implemented.");
+    for (size_t i = 0; i < params.size(); i++) {
+        launch_lion_step(params[i], exp_avgs[i], grads[i],
+                         lr, beta1, beta2, wd);
+    }
 }
 
 }} // namespace sg::sm90

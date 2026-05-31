@@ -201,22 +201,63 @@ void launch_prodigy_step(
 void launch_fused_prodigy_step(
     torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor s, torch::Tensor param_init, torch::Tensor grad, float lr, float d_lr, float beta1, float beta2, float weight_decay, float eps, float bc1, float bc2
 ) {
-    throw std::runtime_error(
-        "launch_fused_prodigy_step: HIP gfx942 kernel not yet implemented.");
+    auto d_t = torch::tensor({d_lr},
+        torch::TensorOptions().device(param.device()).dtype(torch::kFloat32));
+    std::vector<torch::Tensor> vp{param};
+    std::vector<torch::Tensor> vm{exp_avg};
+    std::vector<torch::Tensor> vv{exp_avg_sq};
+    std::vector<torch::Tensor> vs{s};
+    std::vector<torch::Tensor> vpi{param_init};
+    std::vector<torch::Tensor> vg{grad};
+    launch_prodigy_step(vp, vm, vv, vs, vpi, vg,
+                        d_t, d_lr,
+                        beta1, beta2, eps, weight_decay, bc1, bc2);
 }
 
 void launch_prodigy_dlr_reduce(
     torch::Tensor grad, torch::Tensor param, torch::Tensor param_init, torch::Tensor s, torch::Tensor numerator, torch::Tensor denominator, float eps
 ) {
-    throw std::runtime_error(
-        "launch_prodigy_dlr_reduce: HIP gfx942 kernel not yet implemented.");
+    // numerator += sum(grad * (param - param_init))
+    auto gf = grad.to(torch::kFloat32);
+    auto delta = (param - param_init).to(torch::kFloat32);
+    numerator.add_((gf * delta).sum());
+    // denominator += sum(|s|)
+    denominator.add_(s.to(torch::kFloat32).abs().sum());
 }
 
 void launch_multi_tensor_prodigy_fused_reduce_step(
     std::vector<torch::Tensor>& params, std::vector<torch::Tensor>& grads, std::vector<torch::Tensor>& param_inits, std::vector<torch::Tensor>& exp_avgs, std::vector<torch::Tensor>& exp_avg_sqs, std::vector<torch::Tensor>& s_bufs, std::vector<float>& bc1s, std::vector<float>& bc2s, torch::Tensor d_lr_buf, float beta1, float beta2, float lr, float wd, float eps
 ) {
-    throw std::runtime_error(
-        "launch_multi_tensor_prodigy_fused_reduce_step: HIP gfx942 kernel not yet implemented.");
+    if (params.empty()) return;
+    auto dev = params[0].device();
+    float d_prev = d_lr_buf.item<float>();
+
+    // Phase 1: accumulate r and s across all tensors
+    auto r_sum = torch::zeros({}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
+    auto s_sum = torch::zeros({}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
+    for (size_t i = 0; i < params.size(); i++) {
+        if (!grads[i].defined() || grads[i].numel() == 0) continue;
+        auto gf = grads[i].to(torch::kFloat32);
+        auto delta = (param_inits[i] - params[i]).to(torch::kFloat32);
+        r_sum += (gf * delta).sum() * d_prev;
+        s_sum += gf.abs().sum() * (d_prev * d_prev);
+    }
+
+    // Phase 2: update d
+    auto candidate = r_sum / (s_sum.abs() + 1e-12f);
+    d_lr_buf.copy_(torch::maximum(d_lr_buf.new_full({}, d_prev), candidate));
+    float d_val = d_lr_buf.item<float>();
+
+    // Phase 3: apply Adam with d as effective lr
+    for (size_t i = 0; i < params.size(); i++) {
+        if (!grads[i].defined() || grads[i].numel() == 0) continue;
+        auto gf = d_val * grads[i].to(torch::kFloat32);
+        prim::ema_update_inplace(exp_avgs[i], gf, beta1);
+        prim::ema_sq_update_inplace(exp_avg_sqs[i], gf, beta2);
+        s_bufs[i].add_(grads[i].to(torch::kFloat32), d_val);
+        prim::adam_apply_inplace(params[i], exp_avgs[i], exp_avg_sqs[i],
+                                 d_val, bc1s[i], bc2s[i], eps, wd);
+    }
 }
 
 }} // namespace sg::gfx942

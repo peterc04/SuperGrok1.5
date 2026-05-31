@@ -1116,25 +1116,93 @@ void launch_neuralgrok_step(
 }
 
 
-void launch_fused_neuralgrok_amplifier(
-    torch::Tensor grad, torch::Tensor amplified, torch::Tensor amplifier_w1, torch::Tensor amplifier_b1, torch::Tensor amplifier_w2, torch::Tensor amplifier_b2, int hidden_dim, float alpha, float beta
+// Amplifier-only: amplified[i] = psi(|grad[i]|) * grad[i], where
+// psi is the 1-hidden-layer network (W1,b1,W2,b2) with ReLU.
+// alpha, beta scale the amplified gradient: out = alpha * psi(|g|) * g + beta * g
+__global__ void neuralgrok_amplifier_kernel(
+    const float* grad, float* amplified,
+    const float* W1, const float* b1, const float* W2, float b2_scalar,
+    float alpha, float beta, int N
 ) {
-    throw std::runtime_error(
-        "launch_fused_neuralgrok_amplifier: CUDA sm_90 kernel not yet implemented.");
+    const int stride = prim::grid_stride();
+    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+        float g = grad[i];
+        float ag = fabsf(g);
+        float s = neuralgrok_psi_forward<NG_H>(ag, W1, b1, W2, b2_scalar);
+        amplified[i] = alpha * s * g + beta * g;
+    }
+}
+
+void launch_fused_neuralgrok_amplifier(
+    torch::Tensor grad, torch::Tensor amplified,
+    torch::Tensor amplifier_w1, torch::Tensor amplifier_b1,
+    torch::Tensor amplifier_w2, torch::Tensor amplifier_b2,
+    int hidden_dim, float alpha, float beta
+) {
+    const int64_t N = grad.numel();
+    if (N == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    float b2_val = amplifier_b2.item<float>();
+    neuralgrok_amplifier_kernel<<<grid, block, 0, stream>>>(
+        grad.data_ptr<float>(), amplified.data_ptr<float>(),
+        amplifier_w1.data_ptr<float>(), amplifier_b1.data_ptr<float>(),
+        amplifier_w2.data_ptr<float>(), b2_val,
+        alpha, beta, N);
+}
+
+// Adam-only on pre-amplified gradient (no psi network evaluation).
+__global__ void neuralgrok_adam_only_kernel(
+    float* param, float* exp_avg, float* exp_avg_sq,
+    const float* amplified_grad,
+    float beta1, float beta2, float lr, float wd, float eps,
+    float bc1, float bc2, int N
+) {
+    const int stride = prim::grid_stride();
+    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+        float g = amplified_grad[i];
+        float p = param[i];
+        float m = beta1 * exp_avg[i] + (1.0f - beta1) * g;
+        float v = beta2 * exp_avg_sq[i] + (1.0f - beta2) * g * g;
+        exp_avg[i] = m;
+        exp_avg_sq[i] = v;
+        float update = (m / bc1) / (sqrtf(v / bc2) + eps);
+        param[i] = p - lr * (update + wd * p);
+    }
 }
 
 void launch_fused_neuralgrok_adam(
-    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor amplified_grad, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor amplified_grad,
+    float beta1, float beta2, float lr, float weight_decay, float eps,
+    float bc1, float bc2
 ) {
-    throw std::runtime_error(
-        "launch_fused_neuralgrok_adam: CUDA sm_90 kernel not yet implemented.");
+    const int64_t N = param.numel();
+    if (N == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    neuralgrok_adam_only_kernel<<<grid, block, 0, stream>>>(
+        param.data_ptr<float>(), exp_avg.data_ptr<float>(),
+        exp_avg_sq.data_ptr<float>(), amplified_grad.data_ptr<float>(),
+        beta1, beta2, lr, weight_decay, eps, bc1, bc2, N);
 }
 
+// Full fused step: psi amplification + Adam update in a single kernel launch.
 void launch_fused_neuralgrok_full_step(
-    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor grad, torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2, float alpha_amp, float beta_amp, int hidden_dim, float beta1, float beta2, float lr, float weight_decay, float eps, float bc1, float bc2
+    torch::Tensor param, torch::Tensor exp_avg, torch::Tensor exp_avg_sq,
+    torch::Tensor grad,
+    torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2,
+    float alpha_amp, float beta_amp, int hidden_dim,
+    float beta1, float beta2, float lr, float weight_decay, float eps,
+    float bc1, float bc2
 ) {
-    throw std::runtime_error(
-        "launch_fused_neuralgrok_full_step: CUDA sm_90 kernel not yet implemented.");
+    float b2_val = b2.item<float>();
+    launch_neuralgrok_step(param, exp_avg, exp_avg_sq, grad,
+                           W1, b1, W2, b2_val,
+                           alpha_amp, beta_amp,
+                           lr, beta1, beta2, eps, weight_decay, bc1, bc2);
 }
 
 }} // namespace sg::sm90
