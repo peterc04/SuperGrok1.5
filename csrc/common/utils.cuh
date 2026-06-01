@@ -160,14 +160,24 @@ __device__ __forceinline__ int8_t ptx_int8_stochastic_round(
     return (int8_t)fmaxf(-127.0f, fminf(127.0f, tr));
 }
 
-// §25.7 DSMEM cluster reduce (sm_90+ Hopper distributed shared memory).
-// Block-local warp reduce first, then cluster-wide reduce via cooperative
-// groups. Falls back to warp reduce on pre-Hopper.
+// §25.7 / §3.2 DSMEM cluster reduce — SAFE FALLBACK shim.
+//
+// The REAL Hopper thread-block-cluster DSMEM cross-CTA reduction now lives in
+// csrc/backends/cuda/sm_90/primitives.cuh as
+//   sg::sm90::primitives::cluster_reduce_sum_f32_dsmem(val, cluster_smem_slot)
+// which does the full thread->warp->block->cluster tree via map_shared_rank +
+// cl.sync(). That helper needs (a) a cluster launch and (b) a per-block shared
+// scratch slot, so new cluster-aware call sites route to it directly.
+//
+// This utils.cuh entry is intentionally LEFT as the arch-portable warp-reduce
+// fallback: it has no shared-scratch argument and no cluster handle, so it is
+// the right default for the (many) non-cluster call sites and for pre-Hopper
+// builds. We do NOT change its signature (other sites depend on it). It is the
+// "DSMEM off" behavior — equivalent to ENABLE_DSMEM_REDUCE==0.
 __device__ __forceinline__ float cluster_dsmem_reduce_sum(float val) {
-    // cg::reduce() requires a thread_block_tile; a raw cluster_group is not a
-    // valid argument on current CCCL (static_assert "does not exclusively
-    // represent a tile"). Use the warp-level reduction, which is the supported
-    // and previously-active fallback on every arch.
+    // No cluster handle / shared slot here by design; the supported, arch-
+    // portable behavior is the warp-level reduction. Cluster-aware sites that
+    // want the real DSMEM tree call primitives::cluster_reduce_sum_f32_dsmem.
     return warp_reduce_sum(val, WARP_SIZE, threadIdx.x & (WARP_SIZE - 1));
 }
 

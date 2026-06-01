@@ -572,3 +572,208 @@ values produce different code (verified below).
 | 3.2 | fmha_softmax / csa+hca attn | cp.async LDGSTS + load/compute overlap | §Stage 3.2 ncu |
 | 3.2 | fmha_softmax / csa+hca attn | output bit-parity vs sync-load path | §Stage 3.2 parity |
 | 3.2 | all §4.2 kernels | invariant output across ASYNC_DEPTH 1–4 | §Stage 3.2 depth sweep |
+
+## Stage 4.1 — TMA descriptor / operator reuse (NVIDIA memory §3.1)
+
+**What changed (host-side, `csrc/backends/cuda/sm_90/mma.cuh`):** the generic
+Sm90 collective GEMM launchers `sm90_run_gemm<>` and
+`sm90_run_gemm_bt<,LayoutBT>` used to rebuild the CUTLASS `Gemm::Arguments`
+(which materialises the Hopper TMA tensor-map descriptors via
+`make_tma_copy_A/B_sm90` inside `to_underlying_arguments`), re-query the
+workspace, and call `op.initialize()` on **every** invocation — even though
+every optimizer step issues the **same** matmul shapes against the **same**
+persistent buffers. They now route through a new shape-keyed host cache
+`sm90_run_gemm_cached<Gemm,…>` that reuses the already-initialised operator.
+
+**Exactly what is cached / reused:**
+- The **initialised `GemmUniversalAdapter` operator** (its `params_` member,
+  which holds the baked TMA descriptors for A, B and the C epilogue map), plus
+  the workspace pointer it was initialised with. On a hit we skip
+  `make_cute_packed_stride` ×3, `Gemm::Arguments` construction,
+  `can_implement`, `get_workspace_size`, and `initialize` (the call that runs
+  the `cuTensorMapEncode`s) and re-launch via the supported
+  `op.run(stream)` overload — CUTLASS documents this overload as
+  "re-launch the same kernel without updating internal params"
+  (`gemm_universal_adapter.h:545`).
+- **Not** reused / not reached into: CUTLASS's internal TMA mainloop. There is
+  no public "swap the descriptor's base pointer" API in 3.6, so we do not
+  fabricate one. The real, measurable win is skipping the per-step
+  Arguments+initialize (the cuTensorMapEncode path), which is what this does.
+
+**Cache key + eviction:**
+- Key = `GemmCacheKey{ int M,N,K; const void* A; const void* B; void* C; }`.
+  The key is **per-template-instantiation** (one static `Sm90GemmCache<Gemm>`
+  each), so an FP16 vs BF16 GEMM, and a RowMajor-B vs ColumnMajor-B (Bᵀ) GEMM,
+  never share a slot even at identical `(M,N,K,ptrs)`.
+- Eviction: fixed-size **direct-mapped** table, `kSlots = 16`, slot =
+  `FNV-1a(key) & (kSlots-1)`. A colliding signature evicts the resident entry
+  and **`cudaFree`s its owned workspace** first → bounded memory, no leak. Only
+  a handful of distinct signatures recur per run, so collisions are rare.
+- Thread-safety: one `std::mutex` per `Sm90GemmCache<Gemm>`; the launcher is
+  single-threaded per stream here but the lock makes concurrent host launchers
+  safe and is off the hot path (host-side µs, dwarfed by the kernel).
+
+**Descriptor address-stability analysis (the load-bearing correctness
+invariant):** a Hopper TMA tensor map encodes the tensor's **global base
+address** (CUTLASS feeds `make_tensor(ptr_A, layout)` into
+`make_tma_copy_A_sm90`, `sm90_mma_tma_gmma_ss_warpspecialized.hpp:212-226`),
+plus its box/shape and strides. Strides here are a pure function of `(M,N,K)`
+(row-major packed). Therefore a cached operator is **bit-for-bit equivalent**
+to a freshly rebuilt one **iff** `(M,N,K)` and the A/B/C base pointers match —
+which is precisely the cache key. The buffers served (optimizer param/m/v
+state, model weights, and the grow-once FP32 output scratch) are allocated
+**once** and keep the same address every step ⇒ stable key ⇒ hit. If any buffer
+is reallocated to a new address, the key changes ⇒ **miss ⇒ full rebuild**, so a
+stale descriptor can never be launched against a moved buffer (that would be
+wrong results / an illegal access). Workspace: for this builder (1×1×1 cluster,
+`kGemm`, no split-K) `get_workspace_size()==0` and the adapter only adds a
+barrier workspace when `cute::size(ClusterShape)>1`, so served GEMMs use
+`ws==nullptr`; even so each entry **owns** its workspace allocation so a cached
+operator's params can never dangle into the shared grow-only
+`sm90_get_workspace` buffer.
+
+**elect/mbarrier boundary note (honest):** §3.4's `elect_one_sync()` /
+`Mbarrier` (`warp_specialize.cuh`, namespace `sg::sm90::wgs`) compose a
+**hand-written** producer/consumer TMA staging loop. The CUTLASS GEMM is a
+self-contained kernel that **owns** its TMA mainloop — there is no hand-written
+TMA staging in `mma.cuh` into which a leader/barrier could be injected.
+Pairing elect/mbarrier with TMA therefore belongs to the **Stage-6 megakernel's**
+hand-written TMA path, **not** here. Stage 4.1 is the host-side
+operator/descriptor cache only.
+
+**Verification gate (this host, run today):**
+- `compile_to_object.sh launch_supergrok2.cu -DWITH_CUTLASS` → `COMPILE_OK`
+- `compile_to_object.sh launch_muon.cu -DWITH_CUTLASS`        → `COMPILE_OK`
+- `compile_to_object.sh models/mamba.cu -DWITH_CUTLASS`       → `COMPILE_OK`
+- `compile_to_object.sh models/decoder.cu -DWITH_CUTLASS`     → `COMPILE_OK`
+- `python grokking_optimizers/compile.py --self-test` → `137 passed, 1 failed`
+- `ruff check grokking_optimizers/` → `All checks passed!`
+
+**Hardware checks (deferred — 🟡, no CUDA device in this env):**
+- Fewer descriptor encodes / lower launch overhead per step:
+  `ncu --metrics gpu__time_duration.sum --target-processes all` on a multi-step
+  optimizer/model run, plus an API trace
+  (`nsys profile --trace=cuda,nvtx`) — expect the per-step host-side
+  `cuTensorMapEncodeTiled` calls (3 per GEMM: A, B, C) to drop to **zero after
+  the first occurrence of each distinct shape** (only misses encode), and lower
+  CPU launch overhead per step vs the rebuild-every-time build.
+- Numeric parity: cached-operator GEMM output must be **bit-identical**
+  (rtol=0, every element) to a `rebuild-every-step` build (revert
+  `sm90_run_gemm*` to the inline initialize path, or force the cache to miss by
+  perturbing the key). Same `args` ⇒ same `params_` ⇒ same descriptors ⇒ same
+  launch, so equality is exact, not approximate. Drive identical inputs through
+  the SG2 dt_proj GEMM, the decoder/ViT linear GEMMs, and the Muon
+  Newton-Schulz GEMMs and diff the output tensors.
+- Moved-buffer safety: re-run after forcing a buffer reallocation between steps
+  (new base address) — the key must change and the rebuild must produce correct
+  output (no illegal access from a stale TMA descriptor).
+
+| stage | cell | deferred check | command ref |
+|-------|------|----------------|-------------|
+| 4.1 | sm90_run_gemm{,_bt} | cuTensorMapEncode count → 0 after warm-up; lower per-step launch overhead | §Stage 4.1 ncu/nsys |
+| 4.1 | sm90_run_gemm{,_bt} | cached-op output bit-identical to rebuild-every-step | §Stage 4.1 parity |
+| 4.1 | Sm90GemmCache | moved-buffer → key change → rebuild, correct output | §Stage 4.1 moved-buffer |
+
+---
+
+## Stage 4.2 — DSMEM cross-CTA reductions (NVIDIA memory features §3.2)
+
+**What landed.** Replaced the `cluster_dsmem_reduce_sum` STUB (a bare warp
+reduce that a comment admitted was a `cg::reduce` fallback) with a **real
+Hopper thread-block-cluster DSMEM cross-CTA reduction**:
+`sg::sm90::primitives::cluster_reduce_sum_f32_dsmem(val, cluster_smem_slot)` in
+`csrc/backends/cuda/sm_90/primitives.cuh` (added as a NEW section after the
+just-landed Stage 3.1 redux.sync and Stage 3.2 cp.async sections — neither was
+touched). It is a **full multi-level tree** (§3.4) thread → warp → block(shared
+tree) → cluster(DSMEM): each block publishes its block-reduced partial to its
+OWN shared slot, then **every** block reads ALL peers' slots via
+`cl.map_shared_rank` + `cl.sync()` and sums them (a full cluster-wide tree, not
+a single-rank gather). Ordering is the critical part: **write own slot →
+`cl.sync()` → read all peers → `cl.sync()`** (the second barrier prevents a
+later reduction from clobbering the scratch mid-read). `cluster_size == 1` (the
+common, no-cluster launch) short-circuits to the block reduce and **never
+deadlocks** on a singleton-cluster barrier; pre-Hopper (`__CUDA_ARCH__ < 900`)
+compiles to `block_reduce_sum_f32` with no cluster API referenced. The old
+`cluster_dsmem_reduce_sum` in `csrc/common/utils.cuh` is **kept** as the
+arch-portable warp-reduce fallback (signature unchanged — other sites depend on
+it); cluster-aware sites route to the new helper.
+
+**Toggle (§3.5).** `ENABLE_DSMEM_REDUCE` (default **0**). OFF ⇒ call sites use
+the existing global-atomic reduction (today's behavior) and the DSMEM kernel is
+never compiled-in at the call site — **zero overhead** at small scale. ON ⇒ the
+host launcher selects the cluster kernel **only when the whole reduction grid
+fits in one cluster** (`grid ≤ cluster_volume`), else it falls back to the
+atomic kernel. Default OFF until the on-silicon checks below pass.
+
+**Cluster-size knob (§3.3).** The launch cluster dimension is autotuner-pickable
+via `SG_TUNED_CLUSTER_SHAPE` (already emitted by `compile.py`, volume capped
+`m·n·p ≤ 8`). A latent bug was fixed: `-DSG_TUNED_CLUSTER_SHAPE=2,1,1` is
+**rejected by nvcc** ("macro names must be identifiers" — the driver splits the
+`-D` value on commas). `resolve_macros` now emits tuple dims as nvcc-safe scalar
+macros `SG_TUNED_CLUSTER_SHAPE_{0,1,2}` + `SG_TUNED_CLUSTER_SHAPE_VOLUME`; the
+C++ side reassembles them for `__cluster_dims__(…)`. **Megakernel caveat:** cap
+the cluster at **≤ 2** inside any persistent megakernel context — large clusters
+reduce the count of concurrently-resident cluster slots and can starve a
+long-lived persistent grid.
+
+**Sites wired vs deferred.**
+- ✅ **Prodigy r/s sums** (`prodigy_reduce_kernel`): added
+  `prodigy_reduce_dsmem_kernel` (`__cluster_dims__`), replacing the cross-block
+  `atomicAdd(r_partial/s_partial)` with the DSMEM cluster tree; block 0 writes
+  the final sum without an atomic. Wired into `launch_prodigy_step`.
+- 🟡 **LookSAM ‖g‖** — `launch_looksam_norm_reduce` uses **ATen** `.norm()`
+  (no custom CUDA reduction kernel), so there is no cross-CTA atomic to
+  replace. Helper ready; no launch site to wire.
+- 🟡 **Muon Frobenius norm** — `inv_norm` is computed **host-side** and passed
+  into `muon_momentum_normalize_kernel` as a scalar; no device reduction kernel
+  here. Helper ready; no launch site to wire.
+- 🟡 **Attention softmax denom** (`fmha_softmax_kernel`) — **single-block per
+  row** (`blockIdx.x == query row`); the row-sum is reduced entirely within one
+  block, so there is no cross-CTA atomic. DSMEM not applicable as-is.
+- 🟡 **Layernorm mean/var** (`transformer_decoder_sm90.cuh` /
+  `vit_sm90.cuh`) — **single-block per row**; mean/variance are block-local
+  warp+shared trees, no cross-CTA atomic. DSMEM not applicable as-is.
+  Rationale: DSMEM only pays off where a reduction is **multi-block with an
+  atomic accumulator that fits one cluster** — Prodigy is the only such site;
+  the rest are single-block or host/ATen reductions. Correctness over coverage.
+
+**Verification gate (this host, run today):**
+- `compile_to_object.sh launch_prodigy.cu`  → `COMPILE_OK` (toggle off, and
+  also verified `-DENABLE_DSMEM_REDUCE=1` and `…_1 -DSG_TUNED_CLUSTER_SHAPE_0=2`)
+- `compile_to_object.sh launch_looksam.cu`  → `COMPILE_OK`
+- `compile_to_object.sh launch_muon.cu`     → `COMPILE_OK`
+- `compile_to_object.sh models/decoder.cu -DWITH_CUTLASS` → `COMPILE_OK`
+- `compile_to_object.sh models/vit.cu -DWITH_CUTLASS`     → `COMPILE_OK`
+- `compile_to_object.sh launch_adamw.cu`    → `COMPILE_OK` (header clean —
+  primitives.cuh new section adds nothing to a non-cluster TU)
+- standalone `__cluster_dims__(2,1,1)` TU calling
+  `cluster_reduce_sum_f32_dsmem` → builds (`sm_90a`, nvcc 12.0)
+- `python grokking_optimizers/compile.py --self-test` → `137 passed, 1 failed`
+- `ruff check grokking_optimizers/` → `All checks passed!`
+
+**Hardware checks (deferred — 🟡, no CUDA device in this env):**
+- **DSMEM/cluster metrics:** with `ENABLE_DSMEM_REDUCE=1` and a Prodigy reduce
+  whose grid fits one cluster, `ncu --metrics \
+  sm__ctas_launched.sum,l1tex__data_pipe_lsu_wavefronts_mem_shared.sum,\
+  smsp__inst_executed_op_shared_ld.sum,launch__cluster_size` — expect the
+  cross-block `atomicAdd` traffic to L2 (`lts__t_sectors_op_atom*`) to **drop
+  to zero** and the cluster size metric to read the launched shape; the partial
+  exchange shows up as shared (DSMEM) loads, not global atomics.
+- **Bit-parity-vs-atomic (tolerance, NOT bit-exact):** drive identical
+  `(param, param_init, grad, d_prev)` through both the atomic kernel and the
+  DSMEM kernel and compare `r_sum`/`s_sum`. The DSMEM gather sums block partials
+  in **rank order** in fp32 while the atomic path completes in nondeterministic
+  order, so results match to **~1 ulp** (same reorder class as the existing
+  warp/block shuffle trees), NOT bit-identically. Gate: relative error
+  ≤ a few ulps; downstream `d` update unchanged within optimizer tolerance.
+- **≤2-cluster-in-megakernel caveat:** when this helper is later composed into
+  the Stage-6 persistent megakernel, verify occupancy with `ncu
+  --metrics sm__maximum_active_clusters` and cap `SG_TUNED_CLUSTER_SHAPE` volume
+  at ≤2 there — confirm the persistent grid does not lose resident blocks /
+  stall on cluster-slot starvation at larger cluster volumes.
+
+| stage | cell | deferred check | command ref |
+|-------|------|----------------|-------------|
+| 4.2 | prodigy_reduce_dsmem_kernel | DSMEM shared exchange replaces L2 atomics; cluster size metric | §Stage 4.2 ncu DSMEM |
+| 4.2 | cluster_reduce_sum_f32_dsmem | DSMEM sum vs atomic sum within ~1 ulp (tolerance, not bit-exact) | §Stage 4.2 bit-parity |
+| 4.2 | SG_TUNED_CLUSTER_SHAPE | ≤2-cluster cap inside persistent megakernel (slot starvation) | §Stage 4.2 megakernel caveat |

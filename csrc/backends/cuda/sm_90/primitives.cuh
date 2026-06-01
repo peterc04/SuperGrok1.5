@@ -407,4 +407,134 @@ __device__ __forceinline__ void cp_async_wait_all() {
     cp_async_wait_group<0>();
 }
 
+// =========================================================================
+//  §3.2 DSMEM cross-CTA reductions (NVIDIA memory features — Hopper sm_90+).
+//
+//  Hopper thread-block clusters give every CTA in the cluster a window into
+//  every peer CTA's shared memory ("distributed shared memory", DSMEM). A
+//  block-reduced partial sum that lives in one CTA's shared memory can be read
+//  by any other CTA in the same cluster via `cl.map_shared_rank(ptr, rank)`,
+//  with a cluster barrier (`cl.sync()`) ordering the publish vs the read. This
+//  replaces a cross-block global atomicAdd (round-trip through L2/DRAM) with an
+//  on-chip SM-to-SM shared-memory exchange when the producing blocks all fit in
+//  one cluster.
+//
+//  FULL MULTI-LEVEL TREE (§3.4):   thread -> warp -> block(shared) -> cluster.
+//    1. warp_reduce_sum_f32   (butterfly shuffle)            — thread -> warp
+//    2. shared-mem tree        (block_reduce_sum_f32 body)    — warp  -> block
+//    3. publish block partial to OWN cluster_smem slot; cl.sync()
+//    4. every block reads ALL peers' slots via map_shared_rank and sums them
+//       (a full cluster-wide tree, not a single-rank gather); cl.sync()
+//  Every block returns the SAME cluster-wide sum, so any block may publish the
+//  final result (mirrors the old "block 0 atomicAdds" contract — but without
+//  the atomic).
+//
+//  CORRECTNESS / ORDERING (CRITICAL):  write own slot -> cl.sync() -> read all
+//  peers -> cl.sync(). The first barrier guarantees every peer's partial is
+//  visible before any block reads it; the second guarantees no block reuses /
+//  overwrites the scratch (e.g. a subsequent reduction with the same buffer)
+//  until all reads have completed. A missing barrier == data race == garbage.
+//
+//  cluster_size == 1 (kernel launched WITHOUT a cluster dim — the common case)
+//  degrades to exactly block_reduce_sum_f32: num_blocks()==1, the loop reads
+//  only the local slot, and cl.sync() on a singleton cluster is a no-op that
+//  CANNOT deadlock. Pre-Hopper (__CUDA_ARCH__ < 900) compiles to the plain
+//  block reduce with no cluster API referenced at all.
+//
+//  NUMERICS:  the cluster gather sums block partials in rank order in fp32.
+//  This is a tree reduction whose summation ORDER differs from the global-
+//  atomic path (atomic completion order is nondeterministic anyway), so fp32
+//  results may differ in the last ~1 ulp — the SAME class of reorder as the
+//  existing warp/block shuffle trees, and within optimizer tolerance. It is
+//  NOT bit-identical to the serial/atomic path; the on-silicon check in
+//  HARDWARE_VALIDATION.md is a tolerance (relative-error) check, not bit-parity.
+//
+//  CLUSTER-SIZE CAP:  supports cluster volumes up to 8 (Hopper hw max is 8 for
+//  portable launch; 16 is opt-in datacenter-only). The autotuner picks the
+//  launch cluster shape via SG_TUNED_CLUSTER_SHAPE (compile.py, capped m*n*p<=8)
+//  — see launch glue. Inside a PERSISTENT MEGAKERNEL, cap the cluster at <=2:
+//  large clusters reduce the number of concurrently-resident cluster slots and
+//  can starve a long-lived persistent grid (documented caveat, §3.3).
+//
+//  ENGINEER TOGGLE (§3.5):  ENABLE_DSMEM_REDUCE gates whether call sites take
+//  the cluster path at all. When 0 (default), call sites keep the existing
+//  global-atomic reduction and this helper is never invoked — ZERO overhead at
+//  small scale. When 1, the launch glue issues a cluster launch (cudaLaunch-
+//  KernelEx with a cluster dim, or a __cluster_dims__ kernel) and calls this
+//  helper instead of the atomic. Default OFF because (a) it requires a cluster
+//  launch + scratch wiring and (b) the atomic path is already correct and
+//  bit-stable; flip to 1 once on-silicon ncu DSMEM metrics are validated.
+// =========================================================================
+
+#ifndef ENABLE_DSMEM_REDUCE
+#define ENABLE_DSMEM_REDUCE 0
+#endif
+
+// Largest cluster volume this helper will gather over. Hopper hw max is 8 for
+// the portable (compute_90a) launch path; the gather loop is bounded by the
+// runtime num_blocks() so smaller clusters (incl. size 1) are handled too.
+#ifndef SG_DSMEM_MAX_CLUSTER
+#define SG_DSMEM_MAX_CLUSTER 8
+#endif
+
+// Full multi-level tree reduction: thread -> warp -> block -> cluster (DSMEM).
+//
+//   val                 : this thread's contribution.
+//   cluster_smem_scratch : pointer to ONE float in THIS block's shared memory,
+//                          used as this block's published partial slot. Must be
+//                          a real __shared__ float (so map_shared_rank can
+//                          remap it across ranks). Caller allocates it.
+//
+// Returns the cluster-wide sum on every thread of every block. cluster_size==1
+// returns the block reduce. Pre-Hopper falls back to block_reduce_sum_f32.
+__device__ __forceinline__ float cluster_reduce_sum_f32_dsmem(
+    float val, float* cluster_smem_scratch
+) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    // ── Levels 1+2: thread -> warp -> block, into THIS block's slot. ──────
+    float block_partial = block_reduce_sum_f32(val);
+    if (threadIdx.x == 0) {
+        *cluster_smem_scratch = block_partial;
+    }
+
+    // ── Level 3: cluster handle + publish barrier. ───────────────────────
+    cg::cluster_group cluster = cg::this_cluster();
+    const unsigned cluster_size = cluster.num_blocks();
+
+    // Singleton cluster (no cluster launch, the common case): the block
+    // partial IS the answer. cl.sync() on a size-1 cluster is a safe no-op,
+    // but short-circuit to avoid even touching the gather loop.
+    if (cluster_size <= 1) {
+        // block_reduce_sum_f32 already __syncthreads()'d; broadcast the slot.
+        return block_partial;
+    }
+
+    // Publish: every block has now written its slot. Barrier so all peers'
+    // partials are visible before any read.
+    cluster.sync();
+
+    // ── Level 4: gather ALL peers' slots via DSMEM (map_shared_rank). ─────
+    // Full cluster-wide tree across ranks (bounded by SG_DSMEM_MAX_CLUSTER so
+    // the loop is statically unrollable; runtime num_blocks() guards the tail).
+    float total = 0.0f;
+    #pragma unroll
+    for (unsigned r = 0; r < SG_DSMEM_MAX_CLUSTER; ++r) {
+        if (r >= cluster_size) break;
+        // Remap THIS block's scratch address into peer rank r's shared window.
+        const float* peer = cluster.map_shared_rank(cluster_smem_scratch, r);
+        total += *peer;
+    }
+
+    // Second barrier: no block may overwrite the scratch (e.g. on a subsequent
+    // reduction reusing the same buffer) until every block finished reading.
+    cluster.sync();
+    return total;
+#else
+    // Pre-Hopper: no cluster hardware. The scratch is unused; the block reduce
+    // is the full answer for a single-block-per-reduction launch.
+    (void)cluster_smem_scratch;
+    return block_reduce_sum_f32(val);
+#endif
+}
+
 }}} // namespace sg::sm90::primitives

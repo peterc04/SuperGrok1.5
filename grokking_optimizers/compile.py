@@ -2170,7 +2170,23 @@ def resolve_macros(config: Dict[str, Any], dim_specs: List[Dict[str, Any]],
         name = spec["name"]
         if name not in config:
             continue
-        out.append(f"-D{macro}={_format_value(config[name])}")
+        value = config[name]
+        # §3.3 nvcc-safe tuple emission. A `-DFOO=a,b,c` flag is rejected by
+        # nvcc/clang ("macro names must be identifiers") because the driver's
+        # -D lexer splits the value on commas. So for tuple-valued dims (e.g.
+        # cluster_shape) emit per-component scalar macros FOO_0/_1/_2 — the
+        # C++ side reassembles the triplet for __cluster_dims__. We also emit
+        # FOO_VOLUME (product) for the host-side fits-in-one-cluster check.
+        if isinstance(value, (tuple, list)):
+            comps = list(value)
+            for i, comp in enumerate(comps):
+                out.append(f"-D{macro}_{i}={_format_value(comp)}")
+            vol = 1
+            for comp in comps:
+                vol *= int(comp)
+            out.append(f"-D{macro}_VOLUME={vol}")
+        else:
+            out.append(f"-D{macro}={_format_value(value)}")
     return out
 
 

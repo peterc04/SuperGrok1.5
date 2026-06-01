@@ -24,6 +24,9 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cstdint>
+#include <mutex>
+
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
@@ -76,6 +79,221 @@ inline void* sm90_get_workspace(size_t bytes) {
         ws_bytes = bytes;
     }
     return ws_ptr;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  §3.1 — TMA-descriptor / operator reuse (shape-keyed host cache)
+//
+//  WHAT IS REUSED (and WHY this is the correct CUTLASS-3.6 reuse):
+//  ----------------------------------------------------------------
+//  CUTLASS 3.6 builds the Hopper TMA tensor-map descriptors *inside*
+//  `op.initialize(args, ws, stream)` → `GemmKernel::to_underlying_arguments`
+//  → `CollectiveMainloop::to_underlying_arguments`, which calls
+//  `make_tma_copy_A/B_sm90(...)` (sm90_mma_tma_gmma_ss_warpspecialized.hpp
+//  lines 215-226). Those descriptors (one cuTensorMapEncode each for A and B,
+//  plus the epilogue's C map) are baked into the operator's `params_` member.
+//  GemmUniversalAdapter exposes `run(stream)` precisely "to re-launch the same
+//  kernel without updating internal params" (gemm_universal_adapter.h:545) —
+//  i.e. reusing the already-built descriptors.
+//
+//  So the supported, internals-respecting reuse is NOT to reach into CUTLASS's
+//  TMA path, but to CACHE THE INITIALIZED OPERATOR keyed by everything its
+//  descriptors encode, and on a recurring shape skip
+//  make_cute_packed_stride + Arguments construction + get_workspace_size +
+//  initialize (which is where the cuTensorMapEncode calls live) and just call
+//  the cached `op.run(stream)`.
+//
+//  DESCRIPTOR ADDRESS-STABILITY (correctness invariant):
+//  ----------------------------------------------------------------
+//  A Hopper TMA tensor map encodes the *global base address* of the tensor
+//  (make_tma_copy is fed `make_tensor(ptr_A, ...)`), the box/shape and the
+//  strides. Therefore a cached operator is bit-for-bit equivalent to a freshly
+//  rebuilt one IFF (M,N,K), the A/B/C base pointers, AND the strides all match.
+//  Strides here are a pure function of (M,N,K) (row-major packed), so the key
+//  is {M,N,K, A, B, C}. The optimizer/model buffers this serves (param/m/v
+//  state, weights, and the grown-once FP32 scratch) are allocated ONCE and keep
+//  the same address every step → stable key → cache hit. If any buffer is
+//  reallocated to a new address, the key changes → MISS → rebuild, so a stale
+//  descriptor can never be launched against a moved buffer (that would be wrong
+//  results / an illegal access). This is the load-bearing safety property.
+//
+//  WORKSPACE LIFETIME:
+//  ----------------------------------------------------------------
+//  For this builder (1x1x1 cluster, kGemm, no split-K) the kernel reports
+//  get_workspace_size()==0 and the adapter adds a barrier workspace only when
+//  cute::size(ClusterShape)>1 — so the served GEMMs need no workspace and
+//  `initialize` is called with ws==nullptr. We still query the size and, if a
+//  future tile/cluster change makes it non-zero, each cache entry OWNS its own
+//  workspace allocation (freed on eviction) so a cached operator's params can
+//  never dangle into the shared grow-only `sm90_get_workspace` buffer.
+//
+//  EVICTION: fixed-size, direct-mapped (hash → slot). On collision the resident
+//  entry is evicted (its owned workspace freed) and replaced — bounded memory,
+//  no leak. Only a handful of distinct (shape,ptr) signatures recur per run, so
+//  collisions are rare.
+//
+//  THREAD-SAFETY: one static cache per template instantiation, guarded by a
+//  std::mutex. The launcher is single-threaded per stream in this codebase, but
+//  the mutex makes concurrent host launchers safe and is off the hot path
+//  (host-side, microseconds, dwarfed by the kernel it replaces rebuilding).
+//
+//  ELECT/MBARRIER BOUNDARY (honest note):
+//  ----------------------------------------------------------------
+//  §3.4's elect_one_sync()/Mbarrier (warp_specialize.cuh) compose a
+//  HAND-WRITTEN producer/consumer TMA staging loop. The CUTLASS GEMM is a
+//  self-contained kernel that OWNS its TMA mainloop — there is no hand-written
+//  TMA staging in mma.cuh to inject a leader/barrier into. Pairing the elect/
+//  mbarrier primitives with TMA therefore belongs to the Stage-6 megakernel's
+//  hand-written TMA path, NOT here. Stage 4.1 is the host-side operator/
+//  descriptor cache only.
+// ─────────────────────────────────────────────────────────────────────────
+
+// Problem signature the cached descriptors depend on. Pointers are part of the
+// key because a TMA tensor map encodes the global base address (see above).
+struct GemmCacheKey {
+    int         M, N, K;
+    const void* A;
+    const void* B;
+    void*       C;
+
+    bool operator==(const GemmCacheKey& o) const {
+        return M == o.M && N == o.N && K == o.K &&
+               A == o.A && B == o.B && C == o.C;
+    }
+};
+
+inline uint64_t sm90_gemm_key_hash(const GemmCacheKey& k) {
+    // FNV-1a over the raw key bytes — cheap, decent spread for the small set
+    // of distinct signatures that recur.
+    auto mix = [](uint64_t h, uint64_t v) {
+        h ^= v; h *= 0x100000001b3ull; return h;
+    };
+    uint64_t h = 0xcbf29ce484222325ull;
+    h = mix(h, (uint64_t)(uint32_t)k.M);
+    h = mix(h, (uint64_t)(uint32_t)k.N);
+    h = mix(h, (uint64_t)(uint32_t)k.K);
+    h = mix(h, (uint64_t)k.A);
+    h = mix(h, (uint64_t)k.B);
+    h = mix(h, (uint64_t)k.C);
+    return h;
+}
+
+// Per-Gemm-instantiation, fixed-size, direct-mapped cache of INITIALIZED
+// operators. Holds the operator (with its baked-in TMA descriptors / params_)
+// and the workspace it was initialized with. The operator is stored by value;
+// GemmUniversalAdapter is just a `Params params_` holder (copy/move-able) and
+// is re-launched via op.run(stream), which reuses params_ unchanged.
+template <typename Gemm>
+struct Sm90GemmCache {
+    static constexpr int kSlots = 16;   // bounded; covers the recurring shapes
+
+    struct Entry {
+        bool         valid = false;
+        GemmCacheKey key{};
+        Gemm         op{};
+        void*        ws       = nullptr;   // OWNED by this entry (may be null)
+        size_t       ws_bytes = 0;
+    };
+
+    Entry      slots[kSlots];
+    std::mutex mu;
+
+    static Sm90GemmCache& instance() {
+        static Sm90GemmCache c;
+        return c;
+    }
+};
+
+template <typename Gemm>
+inline int sm90_gemm_slot(const GemmCacheKey& k) {
+    return (int)(sm90_gemm_key_hash(k) & (uint64_t)(Sm90GemmCache<Gemm>::kSlots - 1));
+}
+
+// Build a row-major-packed Arguments for (M,N,K) with the given A/B/C and run
+// it, caching the initialized operator so a recurring (shape,ptr) signature
+// skips make_stride + Arguments + initialize (and thus the cuTensorMapEncode
+// calls) and re-launches the cached op directly.
+template <typename Gemm, typename ElementA, typename ElementB, typename ElementAcc>
+inline cudaError_t sm90_run_gemm_cached(
+    int M, int N, int K,
+    const void* A, const void* B, float* C,
+    cudaStream_t stream)
+{
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+
+    GemmCacheKey key{M, N, K, A, B, C};
+    auto& cache = Sm90GemmCache<Gemm>::instance();
+    int   slot  = sm90_gemm_slot<Gemm>(key);
+
+    std::lock_guard<std::mutex> guard(cache.mu);
+    auto& e = cache.slots[slot];
+
+    // HIT: identical (shape,ptr) signature → cached descriptors are valid.
+    if (e.valid && e.key == key) {
+        cutlass::Status st = e.op.run(stream);
+        return (st == cutlass::Status::kSuccess) ? cudaSuccess : cudaErrorUnknown;
+    }
+
+    // MISS (empty or colliding signature): build + initialize a fresh operator.
+    StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+    StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    StrideC stride_c = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
+
+    typename Gemm::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {M, N, K, 1},
+        { reinterpret_cast<const ElementA*>(A), stride_a,
+          reinterpret_cast<const ElementB*>(B), stride_b },
+        { {ElementAcc(1.0f), ElementAcc(0.0f)},
+          C, stride_c, C, stride_c }
+    };
+
+    Gemm op;
+    cutlass::Status st = op.can_implement(args);
+    if (st != cutlass::Status::kSuccess) return cudaErrorNotSupported;
+
+    size_t ws_size = Gemm::get_workspace_size(args);
+
+    // Evict the resident colliding entry (free its OWNED workspace) before reuse.
+    if (e.valid && e.ws) {
+        cudaFree(e.ws);
+        e.ws = nullptr;
+        e.ws_bytes = 0;
+    }
+
+    void* ws = nullptr;
+    if (ws_size > 0) {
+        // Entry owns its workspace so the cached operator's params can never
+        // dangle into the shared grow-only buffer.
+        if (cudaMalloc(&ws, ws_size) != cudaSuccess) {
+            e.valid = false;
+            return cudaErrorMemoryAllocation;
+        }
+    }
+
+    st = op.initialize(args, ws, stream);
+    if (st != cutlass::Status::kSuccess) {
+        if (ws) cudaFree(ws);
+        e.valid = false;
+        return cudaErrorUnknown;
+    }
+
+    st = op.run(stream);
+    if (st != cutlass::Status::kSuccess) {
+        if (ws) cudaFree(ws);
+        e.valid = false;
+        return cudaErrorUnknown;
+    }
+
+    // Install into the cache for subsequent recurring invocations.
+    e.op       = op;          // copies params_ (baked TMA descriptors)
+    e.key      = key;
+    e.ws       = ws;
+    e.ws_bytes = ws_size;
+    e.valid    = true;
+    return cudaSuccess;
 }
 
 template <typename ElementInput>
@@ -141,37 +359,14 @@ inline cudaError_t sm90_run_gemm(
     using ElementA   = typename G::ElementA;
     using ElementB   = typename G::ElementB;
     using ElementAcc = typename G::ElementAcc;
-    using StrideA    = typename Gemm::GemmKernel::StrideA;
-    using StrideB    = typename Gemm::GemmKernel::StrideB;
-    using StrideC    = typename Gemm::GemmKernel::StrideC;
 
-    // Row-major strides via CUTLASS helpers (L=1 batch).
-    StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
-    StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
-    StrideC stride_c = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
-
-    typename Gemm::Arguments args{
-        cutlass::gemm::GemmUniversalMode::kGemm,
-        {M, N, K, 1},
-        { reinterpret_cast<const ElementA*>(A), stride_a,
-          reinterpret_cast<const ElementB*>(B), stride_b },
-        { {ElementAcc(1.0f), ElementAcc(0.0f)},
-          C, stride_c, C, stride_c }
-    };
-
-    Gemm op;
-    cutlass::Status st = op.can_implement(args);
-    if (st != cutlass::Status::kSuccess) return cudaErrorNotSupported;
-
-    size_t ws_size = Gemm::get_workspace_size(args);
-    void*  ws = (ws_size > 0) ? sm90_get_workspace(ws_size) : nullptr;
-    if (ws_size > 0 && ws == nullptr) return cudaErrorMemoryAllocation;
-
-    st = op.initialize(args, ws, stream);
-    if (st != cutlass::Status::kSuccess) return cudaErrorUnknown;
-
-    st = op.run(stream);
-    return (st == cutlass::Status::kSuccess) ? cudaSuccess : cudaErrorUnknown;
+    // §3.1: serve from the shape-keyed operator cache. A recurring
+    // (M,N,K, A,B,C) signature reuses the already-built TMA descriptors and
+    // skips make_stride + Arguments + initialize (the cuTensorMapEncode path);
+    // a miss builds + initializes + installs. Numerically identical to the
+    // rebuild-every-time path (same args → same params_).
+    return sm90_run_gemm_cached<Gemm, ElementA, ElementB, ElementAcc>(
+        M, N, K, A, B, C, stream);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -251,36 +446,13 @@ inline cudaError_t sm90_run_gemm_bt(
     using ElementA   = typename G::ElementA;
     using ElementB   = typename G::ElementB;
     using ElementAcc = typename G::ElementAcc;
-    using StrideA    = typename Gemm::GemmKernel::StrideA;
-    using StrideB    = typename Gemm::GemmKernel::StrideB;
-    using StrideC    = typename Gemm::GemmKernel::StrideC;
 
-    StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
-    StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
-    StrideC stride_c = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
-
-    typename Gemm::Arguments args{
-        cutlass::gemm::GemmUniversalMode::kGemm,
-        {M, N, K, 1},
-        { reinterpret_cast<const ElementA*>(A), stride_a,
-          reinterpret_cast<const ElementB*>(B), stride_b },
-        { {ElementAcc(1.0f), ElementAcc(0.0f)},
-          C, stride_c, C, stride_c }
-    };
-
-    Gemm op;
-    cutlass::Status st = op.can_implement(args);
-    if (st != cutlass::Status::kSuccess) return cudaErrorNotSupported;
-
-    size_t ws_size = Gemm::get_workspace_size(args);
-    void*  ws = (ws_size > 0) ? sm90_get_workspace(ws_size) : nullptr;
-    if (ws_size > 0 && ws == nullptr) return cudaErrorMemoryAllocation;
-
-    st = op.initialize(args, ws, stream);
-    if (st != cutlass::Status::kSuccess) return cudaErrorUnknown;
-
-    st = op.run(stream);
-    return (st == cutlass::Status::kSuccess) ? cudaSuccess : cudaErrorUnknown;
+    // §3.1: same shape-keyed operator cache as sm90_run_gemm. The cache is
+    // per-Gemm-instantiation, so each (ElementInput, LayoutBT) flavour gets its
+    // own slot table — a RowMajor-B descriptor is never confused with a
+    // ColumnMajor-B (Bᵀ) one even at identical (M,N,K,ptrs).
+    return sm90_run_gemm_cached<Gemm, ElementA, ElementB, ElementAcc>(
+        M, N, K, A, B, C, stream);
 }
 
 // FP16 in / FP32 acc / FP32 out, row-major A * row-major B, row-major C.
