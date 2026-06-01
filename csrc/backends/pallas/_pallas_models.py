@@ -126,6 +126,16 @@ def _hand_tiled_attention_forward(q, k, v, *, causal: bool, tile_size=128):
 def attention_forward(q, k, v, *, causal: bool, tile_size=128):
     """Multi-head attention forward — splash_attention first, hand-tiled fallback.
 
+    Path selection (LIVE / FALLBACK, both intentional):
+      1. If the TPU splash_attention kernel is importable AND callable, use it
+         (the fast v5p MXU path). It returns the attention output; we recompute
+         the log-sum-exp cheaply for the backward contract.
+      2. Otherwise — splash not present, not callable, or it raised/returned
+         None at trace time — fall through to the hand-tiled Pallas attention
+         (:func:`_hand_tiled_attention_forward`), which is a complete,
+         numerically-stable dense path (NOT a stub). This is the default on any
+         platform without the experimental splash kernel.
+
     Args:
         q, k, v: [batch, n_heads, seq_len, d_head]
         causal: whether to apply a causal mask
@@ -134,12 +144,13 @@ def attention_forward(q, k, v, *, causal: bool, tile_size=128):
     Returns:
         (out, softmax_lse)
     """
-    if _HAS_SPLASH:
+    if _HAS_SPLASH and callable(_splash_fn):
         try:
-            out = _splash_fn(q, k, v, is_causal=causal) if callable(_splash_fn) else None
-            if out is None:
-                raise RuntimeError("splash fallback")
-            # Compute softmax_lse for backward compatibility
+            out = _splash_fn(q, k, v, is_causal=causal)
+        except Exception:
+            out = None  # splash unavailable/incompatible at trace → dense path
+        if out is not None:
+            # Recompute softmax_lse for the backward contract (cheap vs attn).
             scale = q.shape[-1] ** -0.5
             attn_weights = jnp.einsum('bhid,bhjd->bhij', q, k) * scale
             if causal:
@@ -152,8 +163,6 @@ def attention_forward(q, k, v, *, causal: bool, tile_size=128):
                 axis=-1,
             )
             return out, softmax_lse
-        except Exception:
-            pass
     return _hand_tiled_attention_forward(q, k, v, causal=causal, tile_size=tile_size)
 
 
