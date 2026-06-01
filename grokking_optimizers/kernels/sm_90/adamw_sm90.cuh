@@ -102,6 +102,11 @@ void launch_adamw_step(
     const int block = SG_TUNED_BLOCK_SIZE;
     const int grid = std::min<int>(65535, (N + block - 1) / block);
 
+    // §6.1: keep the Adam moments (m, v) L2-resident across the step.
+    prim::L2PersistScope l2(stream,
+        exp_avg.data_ptr(), exp_avg.nbytes(),
+        exp_avg_sq.data_ptr(), exp_avg_sq.nbytes());
+
     const bool all_fp32 = param.scalar_type() == torch::kFloat32 &&
                           grad.scalar_type() == torch::kFloat32;
 

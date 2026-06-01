@@ -164,4 +164,114 @@ __device__ __forceinline__ float adam_denom_fast(float v, float eps) {
     return sqrtf(v) + eps;
 }
 
+// =========================================================================
+//  §6.1 L2 persistence for per-step optimizer state (Hopper sm_90+).
+//
+//  Optimizer state (m, v, EMA, mu, …) is read+written every step and is the
+//  hottest reuse in the whole pipeline. We hint the L2 cache to keep it
+//  resident across the step via the SAFE RUNTIME API
+//  (cudaStreamSetAttribute + cudaAccessPolicyWindow) — NOT hand-written
+//  `createpolicy` PTX, which trips the known CUDA-13.1 ptxas lowering bug.
+//
+//  Use as an RAII scope around the kernel launch(es) in a host launcher:
+//      { L2PersistScope l2(stream, exp_avg.data_ptr(), exp_avg.nbytes(),
+//                          exp_avg_sq.data_ptr(), exp_avg_sq.nbytes());
+//        kernel<<<...,stream>>>(...); }
+//  On construction it carves a persisting window over the (contiguous-ish)
+//  span covering the given buffers; on destruction it resets the policy and
+//  releases the carve-out so the next op sees a clean L2.
+//
+//  Gated by ENABLE_L2_PERSIST and a runtime check: if the requested span is
+//  larger than the device's reservable persisting-L2 (cudaDevAttrMax-
+//  PersistingL2CacheSize, ~50 MB on H100) — or the device predates Hopper —
+//  the scope is a no-op (and logs nothing on the hot path).
+// =========================================================================
+
+#ifndef ENABLE_L2_PERSIST
+#define ENABLE_L2_PERSIST 1
+#endif
+
+class L2PersistScope {
+public:
+    // Up to two state buffers (the common Adam m/v case). Pass {ptr,bytes}.
+    L2PersistScope(cudaStream_t stream,
+                   void* p0, size_t n0,
+                   void* p1 = nullptr, size_t n1 = 0)
+        : stream_(stream), active_(false) {
+#if ENABLE_L2_PERSIST
+        if (p0 == nullptr || n0 == 0) return;
+
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return;
+
+        int cc_major = 0;
+        cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev);
+        if (cc_major < 9) return;  // L2 residency control: Ampere+ has the API,
+                                   // but we scope the win to Hopper sm_90 here.
+
+        int max_persist = 0;
+        cudaDeviceGetAttribute(&max_persist,
+                               cudaDevAttrMaxPersistingL2CacheSize, dev);
+        if (max_persist <= 0) return;
+
+        // Build the smallest byte span covering the (assumed nearby) buffers.
+        char* lo = static_cast<char*>(p0);
+        char* hi = lo + n0;
+        if (p1 != nullptr && n1 > 0) {
+            char* lo1 = static_cast<char*>(p1);
+            char* hi1 = lo1 + n1;
+            if (lo1 < lo) lo = lo1;
+            if (hi1 > hi) hi = hi1;
+        }
+        size_t span = static_cast<size_t>(hi - lo);
+        // Only worthwhile (and reservable) if the span fits the persisting L2.
+        if (span == 0 || span > static_cast<size_t>(max_persist)) return;
+
+        // Reserve the carve-out for persisting accesses on this stream.
+        cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, span);
+
+        cudaStreamAttrValue attr = {};
+        attr.accessPolicyWindow.base_ptr  = static_cast<void*>(lo);
+        attr.accessPolicyWindow.num_bytes = span;
+        attr.accessPolicyWindow.hitRatio  = 1.0f;
+        attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+        attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+        if (cudaStreamSetAttribute(
+                stream_, cudaStreamAttributeAccessPolicyWindow, &attr)
+            == cudaSuccess) {
+            active_ = true;
+        }
+#else
+        (void)stream; (void)p0; (void)n0; (void)p1; (void)n1;
+#endif
+    }
+
+    ~L2PersistScope() {
+#if ENABLE_L2_PERSIST
+        if (!active_) return;
+        // Reset the window (num_bytes=0 disables it) and release the carve-out
+        // so subsequent ops on this stream see a clean, fully-normal L2.
+        cudaStreamAttrValue attr = {};
+        attr.accessPolicyWindow.base_ptr  = nullptr;
+        attr.accessPolicyWindow.num_bytes = 0;
+        attr.accessPolicyWindow.hitRatio  = 0.0f;
+        attr.accessPolicyWindow.hitProp   = cudaAccessPropertyNormal;
+        attr.accessPolicyWindow.missProp  = cudaAccessPropertyNormal;
+        cudaStreamSetAttribute(
+            stream_, cudaStreamAttributeAccessPolicyWindow, &attr);
+        cudaCtxResetPersistingL2Cache();
+        cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0);
+#endif
+    }
+
+    L2PersistScope(const L2PersistScope&) = delete;
+    L2PersistScope& operator=(const L2PersistScope&) = delete;
+
+    bool active() const { return active_; }
+
+private:
+    cudaStream_t stream_;
+    bool active_;
+};
+
 }}} // namespace sg::sm90::primitives

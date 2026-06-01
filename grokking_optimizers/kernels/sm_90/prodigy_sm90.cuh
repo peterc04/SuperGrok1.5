@@ -111,6 +111,12 @@ void launch_prodigy_step(
     if (N == 0) return;
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+    // §6.1: keep the Adam moments (m, v) L2-resident across the step.
+    prim::L2PersistScope l2(stream,
+        exp_avg.data_ptr(), exp_avg.nbytes(),
+        exp_avg_sq.data_ptr(), exp_avg_sq.nbytes());
+
     const int block = SG_TUNED_BLOCK_SIZE;
     const int grid = std::min<int>(65535, (N + block - 1) / block);
 

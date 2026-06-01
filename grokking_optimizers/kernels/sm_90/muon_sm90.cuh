@@ -89,6 +89,10 @@ void launch_muon_momentum_normalize(
     const int64_t N = buf.numel();
     if (N == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+    // §6.1: keep the Muon momentum buffer L2-resident across the step.
+    prim::L2PersistScope l2(stream, buf.data_ptr(), buf.nbytes());
+
     const int block = SG_TUNED_BLOCK_SIZE;
     const int grid = std::min<int>(65535, (N + block - 1) / block);
 

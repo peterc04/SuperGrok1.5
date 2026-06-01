@@ -364,3 +364,35 @@ Each stage appends one line per deferred check: `STAGE | cell | what to verify |
 | 1B | supergrok2/moe | moe_dynamic_expert_bwd VJP gradcheck | §2 Stage 1B #8 |
 | 1B | supergrok2/moe | moe_scan_compacted (vestigial) SSM recurrence | §2 Stage 1B #9 |
 | 1B | supergrok2/moe | sm_90 atomic-add SASS emission | §2 Stage 1B SASS |
+
+## Stage 2 — L2 persistence (§6.1)
+
+Per-step optimizer state (m, v, EMA, μ, momentum, tracking) is hinted L2-resident
+across the step via `prim::L2PersistScope` (RAII; `cudaStreamSetAttribute` +
+`cudaAccessPolicyWindow` — the safe runtime API, NOT `createpolicy` PTX). Gated
+by `ENABLE_L2_PERSIST` + a runtime size check against
+`cudaDevAttrMaxPersistingL2CacheSize` (no-op on pre-Hopper or when the state span
+exceeds the reservable persisting-L2, ~50 MB on H100).
+
+Wired into the primary step launcher of all 11 optimizers (state buffers persisted):
+adamw, grokfast, grokadamw, neuralgrok, prodigy, supergrok11, supergrok15,
+supergrok2 (exp_avg + exp_avg_sq); lion (exp_avg); muon (momentum buf);
+looksam (exp_avg + exp_avg_sq in the apply step).
+
+**Hardware checks (deferred — all 🟡):**
+- L2 hit-rate uplift on the state buffers:
+  `ncu --metrics lts__t_sector_hit_rate.pct,lts__t_sectors_aperture_device_op_read.sum -k "regex:adamw|supergrok2" python -m tests.hw.run_one_step ...`
+  Expect a measurable rise in `lts__t_sector_hit_rate.pct` for the m/v reads vs an
+  `ENABLE_L2_PERSIST=0` rebuild.
+- Correctness must be a NO-OP on numerics: persisting L2 is a cache hint only;
+  bit-level optimizer-state parity vs the ENABLE_L2_PERSIST=0 build must be exact
+  (rtol=0). Run the Stage-1/§1 per-cell oracle under both builds and diff.
+- Confirm the carve-out is released: after a step, `cudaCtxResetPersistingL2Cache`
+  + `cudaDeviceSetLimit(...,0)` leave a clean L2 for the next op (check no
+  residual persisting window via `ncu` on a following unrelated kernel).
+
+| stage | cell | deferred check | command ref |
+|-------|------|----------------|-------------|
+| 2 | all opt | L2 hit-rate uplift on m/v | §Stage 2 ncu |
+| 2 | all opt | numerics no-op vs ENABLE_L2_PERSIST=0 | §Stage 2 parity |
+| 2 | all opt | carve-out released after step | §Stage 2 reset |

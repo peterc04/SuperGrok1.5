@@ -1382,6 +1382,12 @@ void launch_csa_hca_step(
 {
     if (grad.numel() == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+    // §6.1: keep the Adam moments (m, v) L2-resident across the CSA/HCA step.
+    prim::L2PersistScope l2(stream,
+        exp_avg.data_ptr(), exp_avg.nbytes(),
+        exp_avg_sq.data_ptr(), exp_avg_sq.nbytes());
+
     (void)gru_Wz; (void)gru_bz; (void)gru_Wr; (void)gru_br;
     (void)gru_Wh; (void)gru_bh; (void)lamb_eff; (void)pk_dim; (void)gru_hidden;
     // The carried GRU decay is folded into alpha_mu's elementwise blend; use a
