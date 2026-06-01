@@ -203,6 +203,32 @@ top-k-index path, so the adjoint correctly accumulates zero into those three
 buffers. Marked 🟡 only to flag for explicit on-device confirmation that the
 oracle indeed yields zero (rather than a surrogate) for those parameters.
 
+**Stage-1A correctness re-review (Opus 4.8, 2026-06-01) — `scripts/REVIEW_1A.md`.**
+The hand-written adjoint was re-verified by a line-by-line Python transcription
+of `supergrok2_bilevel_adjoint.h` compared against `torch.autograd.grad` through
+the real `forward_for_bilevel` (CPU fp32). **All 24 weight-grad buffers match
+autograd to fp32 precision** across 4 configs (incl. production defaults
+csa_compress=4/window=8/topk=16/hca_compress=128, and small-N=5 edge), each run
+with zero AND nonzero `gru_state` to exercise the reset-gate path. No VJP / sign
+/ dropped-gradient bug found; **nothing changed in the adjoint**. Two residual
+🟡 items surfaced for on-silicon follow-up:
+
+- 🟡 **GRU-gate recompute fallback drops biases.** If a caller passes *empty*
+  `gru_z_gate/gru_r_gate/gru_h_tilde` to `launch_csa_hca_backward`, both backends
+  recompute the gates **without** `gru_{bz,br,bh}` (sm90:1684/1687/1691,
+  gfx942:875/878/882). The oracle gates include the biases, so the fallback is
+  inexact. The documented save-set provides the gates (canonical path is exact,
+  and is what the parity test validates), but the backward ABI cannot recompute
+  them bias-correctly. **On-device check:** assert the fwd_save→backward harness
+  threads the saved gru gates (non-empty), OR extend the backward ABI to accept
+  `gru_{bz,br,bh}` and recompute with biases. Until then the no-bias fallback
+  must never be hit.
+- 🟡 **Output-buffer zero-init is a caller contract with no guard.** The driver
+  accumulates (`add_`/`index_add_`) into the 24 `d_*` buffers; the bindings do
+  NOT zero them. **On-device check:** the numerics harness must `zero_()` all 24
+  `d_*` buffers before each `supergrok2_bilevel_backward` call (or add a guard in
+  the binding), else grads accumulate across calls.
+
 ### Stage 1B — MoE compaction (`MoEAwareSuperGrok2._moe_step`)
 
 Nine MoE-compaction kernels implemented: sm_90 as real `__global__` CUDA
