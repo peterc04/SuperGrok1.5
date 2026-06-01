@@ -84,7 +84,86 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#ifdef WITH_CUTLASS
+// Sm90 (Hopper) warp-group collective GEMM helpers (TMA + WGMMA, FP32
+// accumulate). Reuses the canonical, layout-parameterised builder from
+// mma.cuh so the decoder's heavy matmuls (QKV/out projections, FFN up/down,
+// vocab head) emit real Hopper WGMMA/TMA instructions instead of the cuBLAS
+// fallback. All CUTLASS #includes stay at GLOBAL scope (mma.cuh requirement).
+#include "csrc/backends/cuda/sm_90/mma.cuh"
+#endif  // WITH_CUTLASS
+
 namespace sg { namespace sm90 { namespace models { namespace decoder {
+
+#ifdef WITH_CUTLASS
+// The Sm90 collective GEMM path only supports the CUTLASS half/bf16 element
+// types. FP32 activations/weights (T=float) keep the cuBLAS path. Resolved at
+// compile time so the FP32 instantiation never tries to build a float CUTLASS
+// GEMM (no cutlass element mapping for float).
+template <typename T> struct cutlass_gemm_elem;            // primary: unsupported
+template <> struct cutlass_gemm_elem<__half>        { using type = cutlass::half_t; };
+template <> struct cutlass_gemm_elem<__nv_bfloat16> { using type = cutlass::bfloat16_t; };
+template <typename T> struct cutlass_gemm_supported          { static constexpr bool value = false; };
+template <> struct cutlass_gemm_supported<__half>           { static constexpr bool value = true; };
+template <> struct cutlass_gemm_supported<__nv_bfloat16>    { static constexpr bool value = true; };
+
+// Forward declaration: the FP32->T cast helper is fully defined (with its
+// __nv_bfloat16/__half specializations) further down. Declared here so the
+// cast kernel below — which is the first user — resolves it.
+template <typename T> __device__ __forceinline__ T from_float(float x);
+
+// Cast an FP32 collective-GEMM output buffer back into the weight/act dtype.
+template <typename T>
+__global__ void __launch_bounds__(256, 4)
+gemm_cast_f32_kernel(const float* __restrict__ src, T* __restrict__ dst, size_t n) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = from_float<T>(src[i]);
+}
+
+// Per-call FP32 scratch for the collective GEMM (lazily grown, reused).
+inline float* decoder_gemm_fp32_scratch(size_t elems) {
+    static thread_local float* ptr   = nullptr;
+    static thread_local size_t cap_n = 0;
+    if (elems > cap_n) {
+        if (ptr) cudaFree(ptr);
+        if (cudaMalloc(&ptr, elems * sizeof(float)) != cudaSuccess) {
+            ptr = nullptr; cap_n = 0; return nullptr;
+        }
+        cap_n = elems;
+    }
+    return ptr;
+}
+
+// ─── Linear-layer GEMM via the Sm90 collective (TMA + WGMMA) ──────────
+// Computes  C[M,N] = A[M,K] · op(B)  with FP32 accumulate, then casts the
+// FP32 result back into the activation dtype T. Reuses the canonical
+// layout-parameterised builder mma::sm90_run_gemm_bt from mma.cuh (modeled
+// byte-for-byte on fmha_sm90_gemm) — no local CollectiveBuilder.
+//
+//   LayoutBT = ColumnMajor  + physical row-major B[N,K]  => C = A · Bᵀ
+//              (a Linear weight W[out,in] read as Wᵀ — the x@Wᵀ projections:
+//               QKV, out-proj, FFN up/down, vocab head).
+//   LayoutBT = RowMajor     + physical row-major B[K,N]  => C = A · B.
+//
+// Returns cudaErrorNotSupported if CUTLASS cannot implement the shape; the
+// caller falls back to cuBLAS. T must be a CUTLASS-supported half/bf16 type.
+template <typename T, typename LayoutBT>
+inline cudaError_t decoder_linear_gemm(
+    int M, int N, int K,
+    const T* A, const T* B, T* C, cudaStream_t stream)
+{
+    using Elem = typename cutlass_gemm_elem<T>::type;
+    float* c_fp32 = decoder_gemm_fp32_scratch((size_t)M * N);
+    if (c_fp32 == nullptr) return cudaErrorMemoryAllocation;
+    cudaError_t err = mma::sm90_run_gemm_bt<Elem, LayoutBT>(
+        M, N, K, A, B, c_fp32, stream);
+    if (err != cudaSuccess) return err;
+    size_t n = (size_t)M * N;
+    int block = 256, grid = (int)((n + block - 1) / block);
+    gemm_cast_f32_kernel<T><<<grid, block, 0, stream>>>(c_fp32, C, n);
+    return cudaGetLastError();
+}
+#endif  // WITH_CUTLASS
 
 // ─── cuBLAS dtype traits ─────────────────────────────────────────────
 template <typename T> struct CublasTraits;
@@ -825,6 +904,17 @@ cudaError_t forward(
                         cudaMemcpyDeviceToDevice, stream);
 
         // QKV projection: [B*S, D] * [D, 3D]^T -> [B*S, 3D]
+        // qkv_out = qkv_in @ qkv_W^T  (qkv_W is [3D, D] row-major => Bᵀ).
+#ifdef WITH_CUTLASS
+        bool qkv_done = false;
+        if constexpr (cutlass_gemm_supported<WeightT>::value) {
+            qkv_done = (decoder_linear_gemm<WeightT, cutlass::layout::ColumnMajor>(
+                B*S, 3*D, D,
+                (const WeightT*)sl.qkv_in, lw.qkv_W,
+                (WeightT*)sl.qkv_out, stream) == cudaSuccess);
+        }
+        if (!qkv_done)
+#endif
         cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
             B*S, 3*D, D, 1.0f, 0.0f,
             (const WeightT*)sl.qkv_in, D, lw.qkv_W, D,
@@ -849,7 +939,17 @@ cudaError_t forward(
         attn_out_reshape_kernel<ActT><<<B*S, 128, 0, stream>>>(
             sl.attn_out_perhead, sl.attn_out, B, S, H, d_head);
 
-        // Output projection
+        // Output projection: attn_proj = attn_out @ out_W^T  (out_W [D,D]).
+#ifdef WITH_CUTLASS
+        bool outp_done = false;
+        if constexpr (cutlass_gemm_supported<WeightT>::value) {
+            outp_done = (decoder_linear_gemm<WeightT, cutlass::layout::ColumnMajor>(
+                B*S, D, D,
+                (const WeightT*)sl.attn_out, lw.out_W,
+                (WeightT*)sl.attn_proj, stream) == cudaSuccess);
+        }
+        if (!outp_done)
+#endif
         cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
             B*S, D, D, 1.0f, 0.0f,
             (const WeightT*)sl.attn_out, D, lw.out_W, D,
@@ -863,7 +963,17 @@ cudaError_t forward(
                 sl.qkv_in, sl.attn_proj, lw.n1_g, lw.n1_b,
                 sl.n1_in, sl.layer1_out, B*S, D, eps);
 
-        // FFN up
+        // FFN up: ffn_pre = layer1_out @ ff1_W^T  (ff1_W [FH,D]).
+#ifdef WITH_CUTLASS
+        bool ff1_done = false;
+        if constexpr (cutlass_gemm_supported<WeightT>::value) {
+            ff1_done = (decoder_linear_gemm<WeightT, cutlass::layout::ColumnMajor>(
+                B*S, FH, D,
+                (const WeightT*)sl.layer1_out, lw.ff1_W,
+                (WeightT*)sl.ffn_pre, stream) == cudaSuccess);
+        }
+        if (!ff1_done)
+#endif
         cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
             B*S, FH, D, 1.0f, 0.0f,
             (const WeightT*)sl.layer1_out, D, lw.ff1_W, D,
@@ -879,7 +989,17 @@ cudaError_t forward(
                 sl.ffn_pre, sl.ffn_post, n);
         }
 
-        // FFN down
+        // FFN down: ffn_out = ffn_post @ ff2_W^T  (ff2_W [D,FH]).
+#ifdef WITH_CUTLASS
+        bool ff2_done = false;
+        if constexpr (cutlass_gemm_supported<WeightT>::value) {
+            ff2_done = (decoder_linear_gemm<WeightT, cutlass::layout::ColumnMajor>(
+                B*S, D, FH,
+                (const WeightT*)sl.ffn_post, lw.ff2_W,
+                (WeightT*)sl.ffn_out, stream) == cudaSuccess);
+        }
+        if (!ff2_done)
+#endif
         cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
             B*S, D, FH, 1.0f, 0.0f,
             (const WeightT*)sl.ffn_post, FH, lw.ff2_W, FH,
@@ -902,8 +1022,18 @@ cudaError_t forward(
         <<<B*S, 128, D*sizeof(float), stream>>>(
             layer_input, final_g, final_b, final_norm_out, B*S, D, eps);
 
-    // Vocab head (full): logits[B*S, V] = norm * vocab_W^T + b
+    // Vocab head (full): logits[B*S, V] = norm @ vocab_W^T + b  (vocab_W [V,D]).
     ActT* logits_full = final_norm_out + L.final_norm_out;
+#ifdef WITH_CUTLASS
+    bool vocab_done = false;
+    if constexpr (cutlass_gemm_supported<WeightT>::value) {
+        vocab_done = (decoder_linear_gemm<WeightT, cutlass::layout::ColumnMajor>(
+            B*S, V, D,
+            (const WeightT*)final_norm_out, vocab_W,
+            (WeightT*)logits_full, stream) == cudaSuccess);
+    }
+    if (!vocab_done)
+#endif
     cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_T,
         B*S, V, D, 1.0f, 0.0f,
         (const WeightT*)final_norm_out, D, vocab_W, D,

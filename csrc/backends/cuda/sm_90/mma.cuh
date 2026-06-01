@@ -174,6 +174,115 @@ inline cudaError_t sm90_run_gemm(
     return (st == cutlass::Status::kSuccess) ? cudaSuccess : cudaErrorUnknown;
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+//  LayoutB-parameterised Sm90 collective GEMM (TMA + WGMMA, FP32 accumulate)
+//
+//  Identical builder to Sm90Gemm above, but the B operand layout is a
+//  template parameter. This lets callers express both flavours of the
+//  transformer/ViT matmuls with the SAME proven CollectiveBuilder path used
+//  by the FMHA wrappers in attention_sm90.cuh:
+//    - LayoutBT = cutlass::layout::RowMajor    => C = A · B   (physical [K,N])
+//    - LayoutBT = cutlass::layout::ColumnMajor => C = A · Bᵀ  (physical [N,K]
+//                                                 row-major, e.g. a Linear
+//                                                 weight W[out,in] read as Wᵀ)
+//  A is always RowMajor [M,K]; C is RowMajor [M,N]; FP32 accumulate + FP32
+//  output (matches the cuBLAS CUBLAS_COMPUTE_32F numerics). strideB packs the
+//  logical {N, K, 1} extents so it matches the physical row-major [N,K] (Bᵀ)
+//  / [K,N] (B) buffer respectively — same convention as fmha_sm90_gemm.
+// ─────────────────────────────────────────────────────────────────────────
+template <typename ElementInput, typename LayoutBT>
+struct Sm90GemmBT {
+    using ElementA   = ElementInput;
+    using ElementB   = ElementInput;
+    using ElementC   = float;          // FP32 output (matches cuBLAS path)
+    using ElementAcc = float;          // FP32 accumulate
+    using LayoutA    = cutlass::layout::RowMajor;
+    using LayoutB    = LayoutBT;
+    using LayoutC    = cutlass::layout::RowMajor;
+
+    static constexpr int AlignA = 128 / cutlass::sizeof_bits<ElementA>::value;
+    static constexpr int AlignB = 128 / cutlass::sizeof_bits<ElementB>::value;
+    static constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementC>::value;
+
+    using TileShape    = cute::Shape<cute::_128, cute::_128, cute::_64>;
+    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+
+    using CollectiveEpilogue =
+        typename cutlass::epilogue::collective::CollectiveBuilder<
+            cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+            TileShape, ClusterShape,
+            cutlass::epilogue::collective::EpilogueTileAuto,
+            ElementAcc, ElementAcc,
+            ElementC, LayoutC, AlignC,
+            ElementC, LayoutC, AlignC,
+            cutlass::epilogue::collective::EpilogueScheduleAuto
+        >::CollectiveOp;
+
+    using CollectiveMainloop =
+        typename cutlass::gemm::collective::CollectiveBuilder<
+            cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+            ElementA, LayoutA, AlignA,
+            ElementB, LayoutB, AlignB,
+            ElementAcc,
+            TileShape, ClusterShape,
+            cutlass::gemm::collective::StageCountAutoCarveout<
+                static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+            cutlass::gemm::collective::KernelScheduleAuto
+        >::CollectiveOp;
+
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        cute::Shape<int, int, int, int>,
+        CollectiveMainloop,
+        CollectiveEpilogue>;
+
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
+
+// Run a single C[MxN] = A[MxK] · op(B) with FP32 accumulate on the Sm90
+// collective. op(B) is B (LayoutBT=RowMajor) or Bᵀ (LayoutBT=ColumnMajor).
+template <typename ElementInput, typename LayoutBT>
+inline cudaError_t sm90_run_gemm_bt(
+    int M, int N, int K,
+    const void* A, const void* B, float* C,
+    cudaStream_t stream)
+{
+    using G          = Sm90GemmBT<ElementInput, LayoutBT>;
+    using Gemm       = typename G::Gemm;
+    using ElementA   = typename G::ElementA;
+    using ElementB   = typename G::ElementB;
+    using ElementAcc = typename G::ElementAcc;
+    using StrideA    = typename Gemm::GemmKernel::StrideA;
+    using StrideB    = typename Gemm::GemmKernel::StrideB;
+    using StrideC    = typename Gemm::GemmKernel::StrideC;
+
+    StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+    StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    StrideC stride_c = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
+
+    typename Gemm::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {M, N, K, 1},
+        { reinterpret_cast<const ElementA*>(A), stride_a,
+          reinterpret_cast<const ElementB*>(B), stride_b },
+        { {ElementAcc(1.0f), ElementAcc(0.0f)},
+          C, stride_c, C, stride_c }
+    };
+
+    Gemm op;
+    cutlass::Status st = op.can_implement(args);
+    if (st != cutlass::Status::kSuccess) return cudaErrorNotSupported;
+
+    size_t ws_size = Gemm::get_workspace_size(args);
+    void*  ws = (ws_size > 0) ? sm90_get_workspace(ws_size) : nullptr;
+    if (ws_size > 0 && ws == nullptr) return cudaErrorMemoryAllocation;
+
+    st = op.initialize(args, ws, stream);
+    if (st != cutlass::Status::kSuccess) return cudaErrorUnknown;
+
+    st = op.run(stream);
+    return (st == cutlass::Status::kSuccess) ? cudaSuccess : cudaErrorUnknown;
+}
+
 // FP16 in / FP32 acc / FP32 out, row-major A * row-major B, row-major C.
 // Sm90 collective (TMA+WGMMA), FP32 accumulate — replaces the old Gemm<>
 // that silently defaulted to Sm70 SIMT (no tensor cores).

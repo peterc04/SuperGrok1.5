@@ -1569,38 +1569,146 @@ void launch_csa_hca_backward_batched(
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-//  MoE systems (folded from former launch_moe.cu). Throwing stubs that keep
-//  compiling; SG2's real expert math lives in the CSA/HCA forward above.
+//  MoE systems (folded from former launch_moe.cu). REAL sm_90 CUDA kernels for
+//  the MoE-compaction tail of MoEAwareSuperGrok2 (Stage 1B). The Python driver
+//  (optimizers/supergrok2.py::_moe_step) gathers the active-expert parameter
+//  slice into a dense buffer, runs the Adam update on it, and scatters back;
+//  these kernels are the gather/scatter/histogram/load-balance primitives.
+//
+//  Reachability (verified): _moe_step calls moe_count_expert_activations,
+//  moe_compute_load_balance_loss, moe_apply_frequency_scaling,
+//  moe_filter_active_params, moe_scatter_results. The dynamic_expert_{load,
+//  fwd,bwd} and scan_compacted entries are exported (bindings.cpp) but not
+//  currently called; they are implemented as correct real kernels for ABI /
+//  completeness. moe_scan_compacted is VESTIGIAL (Mamba-era selective scan;
+//  SG2's mixer is now CSA/HCA) — kept linkable and numerically sound.
+//
+//  All compaction tensors are FP32 1-D; index tensors are int32. Grid-stride
+//  loops + atomics, matching moe_adam_kernel / the prim:: helpers above.
 // ═════════════════════════════════════════════════════════════════════════
 
-void moe_dynamic_expert_load(
-    torch::Tensor expert_w1, torch::Tensor expert_b1,
-    torch::Tensor expert_w2, torch::Tensor expert_b2,
-    torch::Tensor active_mask,
-    torch::Tensor smem_w1, torch::Tensor smem_b1,
-    torch::Tensor smem_w2, torch::Tensor smem_b2) {
-    throw std::runtime_error("moe_dynamic_expert_load: sm_90 kernel not yet implemented.");
+// ── (1) Expert-activation histogram ───────────────────────────────────────
+//  gate_logits [N, num_experts] (row-major). For each (row, e) with
+//  gate_logits[row,e] > threshold, atomicAdd expert_counts[e]. One thread per
+//  (row, e) cell via a flattened grid-stride loop over N*num_experts.
+__global__ void moe_count_expert_activations_kernel(
+    const float* __restrict__ gate_logits,
+    int* __restrict__ expert_counts,
+    float threshold, int N, int num_experts
+) {
+    const long total = static_cast<long>(N) * num_experts;
+    const int stride = prim::grid_stride();
+    for (long idx = prim::grid_stride_index(); idx < total; idx += stride) {
+        const int e = static_cast<int>(idx % num_experts);
+        if (gate_logits[idx] > threshold) {
+            atomicAdd(&expert_counts[e], 1);
+        }
+    }
 }
 
-torch::Tensor moe_dynamic_expert_fwd(
-    torch::Tensor input, torch::Tensor expert_indices,
-    torch::Tensor routing_weights,
-    torch::Tensor expert_w1, torch::Tensor expert_b1,
-    torch::Tensor expert_w2, torch::Tensor expert_b2,
-    torch::Tensor output) {
-    throw std::runtime_error("moe_dynamic_expert_fwd: sm_90 kernel not yet implemented.");
-    return torch::Tensor{};
+void moe_count_expert_activations(
+    torch::Tensor gate_logits, torch::Tensor expert_counts,
+    float threshold, int N, int num_experts) {
+    if (N == 0 || num_experts == 0) return;
+    auto gl = gate_logits.contiguous();
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const long total = static_cast<long>(N) * num_experts;
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (total + block - 1) / block);
+    moe_count_expert_activations_kernel<<<grid, block, 0, stream>>>(
+        gl.data_ptr<float>(), expert_counts.data_ptr<int>(),
+        threshold, N, num_experts);
 }
 
-void moe_dynamic_expert_bwd(
-    torch::Tensor d_output, torch::Tensor input,
-    torch::Tensor expert_indices, torch::Tensor routing_weights,
-    torch::Tensor expert_w1, torch::Tensor expert_b1,
-    torch::Tensor expert_w2, torch::Tensor expert_b2,
-    torch::Tensor d_input, torch::Tensor d_expert_w1,
-    torch::Tensor d_expert_b1, torch::Tensor d_expert_w2,
-    torch::Tensor d_expert_b2) {
-    throw std::runtime_error("moe_dynamic_expert_bwd: sm_90 kernel not yet implemented.");
+// ── (2) Switch-Transformer load-balance auxiliary loss ─────────────────────
+//  f_e = expert_counts[e]/N  (fraction of tokens routed to expert e)
+//  P_e = mean_t softmax(gate_logits[t,:])[e]
+//  loss = num_experts * Σ_e f_e * P_e
+//  Implemented with ATen reductions (softmax + mean) for numerical stability;
+//  returns a scalar tensor on the gate_logits device.
+torch::Tensor moe_compute_load_balance_loss(
+    torch::Tensor expert_counts, torch::Tensor gate_logits,
+    int N, int num_experts) {
+    auto opts = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(gate_logits.device());
+    if (N == 0 || num_experts == 0) return torch::zeros({}, opts);
+    auto gl = gate_logits.to(torch::kFloat32);
+    // P_e: mean over tokens of softmax probability for expert e -> [num_experts]
+    auto P = torch::softmax(gl, /*dim=*/1).mean(/*dim=*/0);          // [E]
+    // f_e: token fraction routed to expert e
+    auto f = expert_counts.to(torch::kFloat32) / static_cast<double>(N);  // [E]
+    auto loss = static_cast<double>(num_experts) * (f * P).sum();
+    return loss;
+}
+
+// ── (3) Frequency-inverse per-expert LR scaling ────────────────────────────
+//  freq_e  = (counts[e] + smoothing) / (total + smoothing*num_experts)
+//  scale_e = clamp( (1/num_experts) / freq_e, min_scale, max_scale )
+__global__ void moe_apply_frequency_scaling_kernel(
+    const int* __restrict__ expert_counts,
+    float* __restrict__ lr_scale,
+    int num_experts, int total_activations,
+    float min_scale, float max_scale, float smoothing
+) {
+    const int stride = prim::grid_stride();
+    const float denom = static_cast<float>(total_activations)
+                      + smoothing * static_cast<float>(num_experts);
+    const float uniform = 1.0f / static_cast<float>(num_experts);
+    for (int e = prim::grid_stride_index(); e < num_experts; e += stride) {
+        const float freq = (static_cast<float>(expert_counts[e]) + smoothing)
+                         / denom;
+        float scale = (freq > 0.0f) ? (uniform / freq) : max_scale;
+        scale = fminf(fmaxf(scale, min_scale), max_scale);
+        lr_scale[e] = scale;
+    }
+}
+
+void moe_apply_frequency_scaling(
+    torch::Tensor expert_counts, torch::Tensor lr_scale,
+    int num_experts, int total_activations,
+    float min_scale, float max_scale, float smoothing) {
+    if (num_experts == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (num_experts + block - 1) / block);
+    moe_apply_frequency_scaling_kernel<<<grid, block, 0, stream>>>(
+        expert_counts.data_ptr<int>(), lr_scale.data_ptr<float>(),
+        num_experts, total_activations, min_scale, max_scale, smoothing);
+}
+
+// ── (4) Stream-compaction of active-expert parameters ──────────────────────
+//  For each i in [0,total_params): if expert_active[param_to_expert[i]] != 0,
+//  append params/grads/state_m/state_v[i] to the compact_* arrays and record
+//  scatter_indices[out]=i. compact_count[0] = number kept.
+//
+//  Output position is claimed via a single global atomicAdd counter
+//  (compact_count). A prefix-sum compaction would yield deterministic ordering
+//  and slightly better coalescing, but the optimizer only needs the (out -> i)
+//  scatter map to be self-consistent — ordering among kept elements is
+//  irrelevant because moe_scatter_results writes back by stored index. The
+//  atomic compaction is correct and is the documented choice here.
+__global__ void moe_filter_active_params_kernel(
+    const float* __restrict__ params, const float* __restrict__ grads,
+    const float* __restrict__ state_m, const float* __restrict__ state_v,
+    const int* __restrict__ param_to_expert,
+    const int* __restrict__ expert_active,
+    float* __restrict__ compact_params, float* __restrict__ compact_grads,
+    float* __restrict__ compact_state_m, float* __restrict__ compact_state_v,
+    int* __restrict__ scatter_indices, int* __restrict__ compact_count,
+    int total_params
+) {
+    const int stride = prim::grid_stride();
+    for (int i = prim::grid_stride_index(); i < total_params; i += stride) {
+        const int e = param_to_expert[i];
+        if (expert_active[e] != 0) {
+            const int out = atomicAdd(&compact_count[0], 1);
+            compact_params[out]  = params[i];
+            compact_grads[out]   = grads[i];
+            compact_state_m[out] = state_m[i];
+            compact_state_v[out] = state_v[i];
+            scatter_indices[out] = i;
+        }
+    }
 }
 
 void moe_filter_active_params(
@@ -1611,7 +1719,347 @@ void moe_filter_active_params(
     torch::Tensor compact_state_m, torch::Tensor compact_state_v,
     torch::Tensor scatter_indices, torch::Tensor compact_count,
     int total_params) {
-    throw std::runtime_error("moe_filter_active_params: sm_90 kernel not yet implemented.");
+    if (total_params == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (total_params + block - 1) / block);
+    moe_filter_active_params_kernel<<<grid, block, 0, stream>>>(
+        params.data_ptr<float>(), grads.data_ptr<float>(),
+        state_m.data_ptr<float>(), state_v.data_ptr<float>(),
+        param_to_expert.data_ptr<int>(), expert_active.data_ptr<int>(),
+        compact_params.data_ptr<float>(), compact_grads.data_ptr<float>(),
+        compact_state_m.data_ptr<float>(), compact_state_v.data_ptr<float>(),
+        scatter_indices.data_ptr<int>(), compact_count.data_ptr<int>(),
+        total_params);
+}
+
+// ── (5) Scatter compacted results back to dense storage ────────────────────
+//  Inverse of (4): for j in [0,compact_N): i=scatter_indices[j];
+//  params[i]=compact_params[j]; state_m[i]=compact_state_m[j]; etc.
+__global__ void moe_scatter_results_kernel(
+    const float* __restrict__ compact_params,
+    const float* __restrict__ compact_state_m,
+    const float* __restrict__ compact_state_v,
+    const int* __restrict__ scatter_indices,
+    float* __restrict__ params,
+    float* __restrict__ state_m, float* __restrict__ state_v,
+    int compact_N
+) {
+    const int stride = prim::grid_stride();
+    for (int j = prim::grid_stride_index(); j < compact_N; j += stride) {
+        const int i = scatter_indices[j];
+        params[i]  = compact_params[j];
+        state_m[i] = compact_state_m[j];
+        state_v[i] = compact_state_v[j];
+    }
+}
+
+void moe_scatter_results(
+    torch::Tensor compact_params,
+    torch::Tensor compact_state_m, torch::Tensor compact_state_v,
+    torch::Tensor scatter_indices,
+    torch::Tensor params,
+    torch::Tensor state_m, torch::Tensor state_v,
+    int compact_N) {
+    if (compact_N == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (compact_N + block - 1) / block);
+    moe_scatter_results_kernel<<<grid, block, 0, stream>>>(
+        compact_params.data_ptr<float>(),
+        compact_state_m.data_ptr<float>(), compact_state_v.data_ptr<float>(),
+        scatter_indices.data_ptr<int>(),
+        params.data_ptr<float>(),
+        state_m.data_ptr<float>(), state_v.data_ptr<float>(),
+        compact_N);
+}
+
+// ── (6) Masked gather of active expert weights ─────────────────────────────
+//  expert_w1 [E, hidden, d_in], expert_b1 [E, hidden],
+//  expert_w2 [E, d_out, hidden], expert_b2 [E, d_out]. active_mask [E].
+//  Copies the e-th slice into a compact buffer for every active expert e,
+//  packed densely in expert order (compact slot = #active experts before e).
+//  Implemented as a per-active-expert prefix index built on the host (ATen)
+//  followed by an index_copy; the gather itself is a simple memcpy-style copy.
+void moe_dynamic_expert_load(
+    torch::Tensor expert_w1, torch::Tensor expert_b1,
+    torch::Tensor expert_w2, torch::Tensor expert_b2,
+    torch::Tensor active_mask,
+    torch::Tensor smem_w1, torch::Tensor smem_b1,
+    torch::Tensor smem_w2, torch::Tensor smem_b2) {
+    // active expert indices, in ascending order -> dense packing positions.
+    auto idx = torch::nonzero(active_mask.reshape(-1) != 0).reshape(-1);  // [A]
+    const int64_t A = idx.numel();
+    if (A == 0) return;
+    auto src1 = expert_w1.index_select(0, idx);
+    auto src2 = expert_w2.index_select(0, idx);
+    auto sb1  = expert_b1.index_select(0, idx);
+    auto sb2  = expert_b2.index_select(0, idx);
+    smem_w1.narrow(0, 0, A).copy_(src1);
+    smem_w2.narrow(0, 0, A).copy_(src2);
+    smem_b1.narrow(0, 0, A).copy_(sb1);
+    smem_b2.narrow(0, 0, A).copy_(sb2);
+}
+
+// ── (7) Per-token expert MLP forward ───────────────────────────────────────
+//  Shapes (from the binding contract / spec):
+//    input          [N, d_in]
+//    expert_indices [N]            (int, per-token expert id)
+//    routing_weights[N]            (float, per-token scalar gate weight)
+//    expert_w1      [E, hidden, d_in]   expert_b1 [E, hidden]
+//    expert_w2      [E, d_out,  hidden] expert_b2 [E, d_out]
+//    output         [N, d_out]    (written)
+//  output[t] = routing_weights[t] * (W2_e @ relu(W1_e @ input[t] + b1_e) + b2_e)
+//  One warp per token; each lane strides over the output dimension. The hidden
+//  activation is recomputed per output element (hidden is small for SG2's
+//  PEER-style experts); correctness-first, the dynamic_expert_* path is not on
+//  the hot reachable list.
+__global__ void moe_dynamic_expert_fwd_kernel(
+    const float* __restrict__ input,
+    const int* __restrict__ expert_indices,
+    const float* __restrict__ routing_weights,
+    const float* __restrict__ expert_w1, const float* __restrict__ expert_b1,
+    const float* __restrict__ expert_w2, const float* __restrict__ expert_b2,
+    float* __restrict__ output,
+    int N, int d_in, int hidden, int d_out
+) {
+    const int t = blockIdx.x;                 // one block per token
+    if (t >= N) return;
+    const int lane = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int e = expert_indices[t];
+    const float rw = routing_weights[t];
+
+    const float* x   = input + static_cast<long>(t) * d_in;
+    const float* W1  = expert_w1 + static_cast<long>(e) * hidden * d_in;
+    const float* b1  = expert_b1 + static_cast<long>(e) * hidden;
+    const float* W2  = expert_w2 + static_cast<long>(e) * d_out * hidden;
+    const float* b2  = expert_b2 + static_cast<long>(e) * d_out;
+
+    // Shared hidden activation h = relu(W1 x + b1), [hidden].
+    extern __shared__ float h[];
+    for (int j = lane; j < hidden; j += nthreads) {
+        float acc = b1[j];
+        const float* w1row = W1 + static_cast<long>(j) * d_in;
+        for (int k = 0; k < d_in; ++k) acc += w1row[k] * x[k];
+        h[j] = acc > 0.0f ? acc : 0.0f;
+    }
+    __syncthreads();
+
+    float* y = output + static_cast<long>(t) * d_out;
+    for (int o = lane; o < d_out; o += nthreads) {
+        float acc = b2[o];
+        const float* w2row = W2 + static_cast<long>(o) * hidden;
+        for (int j = 0; j < hidden; ++j) acc += w2row[j] * h[j];
+        y[o] = rw * acc;
+    }
+}
+
+torch::Tensor moe_dynamic_expert_fwd(
+    torch::Tensor input, torch::Tensor expert_indices,
+    torch::Tensor routing_weights,
+    torch::Tensor expert_w1, torch::Tensor expert_b1,
+    torch::Tensor expert_w2, torch::Tensor expert_b2,
+    torch::Tensor output) {
+    const int N = static_cast<int>(input.size(0));
+    if (N == 0) return output;
+    const int d_in   = static_cast<int>(input.size(1));
+    const int hidden = static_cast<int>(expert_w1.size(1));
+    const int d_out  = static_cast<int>(expert_w2.size(1));
+    auto inp = input.to(torch::kFloat32).contiguous();
+    auto w1  = expert_w1.to(torch::kFloat32).contiguous();
+    auto b1  = expert_b1.to(torch::kFloat32).contiguous();
+    auto w2  = expert_w2.to(torch::kFloat32).contiguous();
+    auto b2  = expert_b2.to(torch::kFloat32).contiguous();
+    auto rw  = routing_weights.to(torch::kFloat32).contiguous();
+    auto ei  = expert_indices.to(torch::kInt32).contiguous();
+
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = std::min<int>(256, std::max<int>(d_out, hidden));
+    const int grid = N;
+    const size_t smem = static_cast<size_t>(hidden) * sizeof(float);
+    moe_dynamic_expert_fwd_kernel<<<grid, block, smem, stream>>>(
+        inp.data_ptr<float>(), ei.data_ptr<int>(), rw.data_ptr<float>(),
+        w1.data_ptr<float>(), b1.data_ptr<float>(),
+        w2.data_ptr<float>(), b2.data_ptr<float>(),
+        output.data_ptr<float>(), N, d_in, hidden, d_out);
+    return output;
+}
+
+// ── (8) Per-token expert MLP backward (full VJP, no autograd) ──────────────
+//  Forward:  h = relu(z1), z1 = W1 x + b1 ; y = rw * (W2 h + b2)
+//  Given d_output (= dL/dy), accumulate:
+//    d(W2 b2): dy = rw * d_output ; dW2_e += dy ⊗ h ; db2_e += dy
+//    dh = W2ᵀ dy ; dz1 = dh ⊙ [z1>0]
+//    dW1_e += dz1 ⊗ x ; db1_e += dz1 ; d_input[t] = W1ᵀ dz1
+//  Expert-weight grads are accumulated with atomics (many tokens share e).
+//  One block per token; hidden activation + dz1 recomputed in shared memory.
+__global__ void moe_dynamic_expert_bwd_kernel(
+    const float* __restrict__ d_output,
+    const float* __restrict__ input,
+    const int* __restrict__ expert_indices,
+    const float* __restrict__ routing_weights,
+    const float* __restrict__ expert_w1, const float* __restrict__ expert_b1,
+    const float* __restrict__ expert_w2, const float* __restrict__ expert_b2,
+    float* __restrict__ d_input, float* __restrict__ d_expert_w1,
+    float* __restrict__ d_expert_b1, float* __restrict__ d_expert_w2,
+    float* __restrict__ d_expert_b2,
+    int N, int d_in, int hidden, int d_out
+) {
+    const int t = blockIdx.x;
+    if (t >= N) return;
+    const int lane = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int e = expert_indices[t];
+    const float rw = routing_weights[t];
+
+    const float* x   = input + static_cast<long>(t) * d_in;
+    const float* W1  = expert_w1 + static_cast<long>(e) * hidden * d_in;
+    const float* b1  = expert_b1 + static_cast<long>(e) * hidden;
+    const float* W2  = expert_w2 + static_cast<long>(e) * d_out * hidden;
+    const float* dy_row = d_output + static_cast<long>(t) * d_out;
+
+    float* dW1 = d_expert_w1 + static_cast<long>(e) * hidden * d_in;
+    float* db1 = d_expert_b1 + static_cast<long>(e) * hidden;
+    float* dW2 = d_expert_w2 + static_cast<long>(e) * d_out * hidden;
+    float* db2 = d_expert_b2 + static_cast<long>(e) * d_out;
+
+    // h[j] = relu(W1 x + b1)[j], hmask[j] = [z1>0]   (recompute forward act).
+    extern __shared__ float smem[];
+    float* h    = smem;             // [hidden]
+    float* dz1  = smem + hidden;    // [hidden]
+    for (int j = lane; j < hidden; j += nthreads) {
+        float acc = b1[j];
+        const float* w1row = W1 + static_cast<long>(j) * d_in;
+        for (int k = 0; k < d_in; ++k) acc += w1row[k] * x[k];
+        h[j] = acc > 0.0f ? acc : 0.0f;
+        dz1[j] = 0.0f;
+    }
+    __syncthreads();
+
+    // dy = rw * d_output ; db2 += dy ; dW2 += dy ⊗ h ; accumulate dh into dz1.
+    for (int o = lane; o < d_out; o += nthreads) {
+        const float dy = rw * dy_row[o];
+        atomicAdd(&db2[o], dy);
+        const float* w2row = W2 + static_cast<long>(o) * hidden;
+        float* dw2row = dW2 + static_cast<long>(o) * hidden;
+        for (int j = 0; j < hidden; ++j) {
+            atomicAdd(&dw2row[j], dy * h[j]);
+            // dh_j = Σ_o W2[o,j] dy ; gate by relu mask (h[j]>0).
+            if (h[j] > 0.0f) atomicAdd(&dz1[j], w2row[j] * dy);
+        }
+    }
+    __syncthreads();
+
+    // dW1 += dz1 ⊗ x ; db1 += dz1 ; d_input[t] = W1ᵀ dz1.
+    for (int j = lane; j < hidden; j += nthreads) {
+        const float g = dz1[j];
+        atomicAdd(&db1[j], g);
+        const float* w1row = W1 + static_cast<long>(j) * d_in;
+        float* dw1row = dW1 + static_cast<long>(j) * d_in;
+        for (int k = 0; k < d_in; ++k) atomicAdd(&dw1row[k], g * x[k]);
+    }
+    __syncthreads();
+    float* dx = d_input + static_cast<long>(t) * d_in;
+    for (int k = lane; k < d_in; k += nthreads) {
+        float acc = 0.0f;
+        for (int j = 0; j < hidden; ++j) {
+            acc += W1[static_cast<long>(j) * d_in + k] * dz1[j];
+        }
+        dx[k] = acc;
+    }
+}
+
+void moe_dynamic_expert_bwd(
+    torch::Tensor d_output, torch::Tensor input,
+    torch::Tensor expert_indices, torch::Tensor routing_weights,
+    torch::Tensor expert_w1, torch::Tensor expert_b1,
+    torch::Tensor expert_w2, torch::Tensor expert_b2,
+    torch::Tensor d_input, torch::Tensor d_expert_w1,
+    torch::Tensor d_expert_b1, torch::Tensor d_expert_w2,
+    torch::Tensor d_expert_b2) {
+    const int N = static_cast<int>(input.size(0));
+    if (N == 0) return;
+    const int d_in   = static_cast<int>(input.size(1));
+    const int hidden = static_cast<int>(expert_w1.size(1));
+    const int d_out  = static_cast<int>(expert_w2.size(1));
+    auto inp = input.to(torch::kFloat32).contiguous();
+    auto dout = d_output.to(torch::kFloat32).contiguous();
+    auto w1  = expert_w1.to(torch::kFloat32).contiguous();
+    auto b1  = expert_b1.to(torch::kFloat32).contiguous();
+    auto w2  = expert_w2.to(torch::kFloat32).contiguous();
+    auto b2  = expert_b2.to(torch::kFloat32).contiguous();
+    auto rw  = routing_weights.to(torch::kFloat32).contiguous();
+    auto ei  = expert_indices.to(torch::kInt32).contiguous();
+
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = std::min<int>(256, std::max<int>(d_out, hidden));
+    const int grid = N;
+    const size_t smem = static_cast<size_t>(2 * hidden) * sizeof(float);
+    moe_dynamic_expert_bwd_kernel<<<grid, block, smem, stream>>>(
+        dout.data_ptr<float>(), inp.data_ptr<float>(),
+        ei.data_ptr<int>(), rw.data_ptr<float>(),
+        w1.data_ptr<float>(), b1.data_ptr<float>(),
+        w2.data_ptr<float>(), b2.data_ptr<float>(),
+        d_input.data_ptr<float>(), d_expert_w1.data_ptr<float>(),
+        d_expert_b1.data_ptr<float>(), d_expert_w2.data_ptr<float>(),
+        d_expert_b2.data_ptr<float>(), N, d_in, hidden, d_out);
+}
+
+// ── (9) Compacted selective scan — VESTIGIAL ───────────────────────────────
+//  This signature references a Mamba-style discretized SSM recurrence
+//  (A_log/dt/B/C/D). SG2's sequence mixer is now CSA/HCA, NOT Mamba, and the
+//  reachability audit confirms Python NEVER calls moe_scan_compacted. It is
+//  kept here purely for ABI stability (the symbol is exported by bindings.cpp).
+//
+//  We implement the standard discretized SSM recurrence so the entry is
+//  numerically sound if ever invoked:
+//    A_bar = exp(dt_t * A) where A = -exp(A_log)   (per (channel, state))
+//    h_t   = A_bar ⊙ h_{t-1} + (dt_t * B_t) * x_t
+//    y_t   = Σ_s C_t[s] * h_t[d,s] + D[d] * x_t[d]
+//  Layout (compacted, single sequence of length compact_N):
+//    compact_x  [compact_N, d_inner]      compact_dt [compact_N, d_inner]
+//    compact_B  [compact_N, d_state]      compact_C  [compact_N, d_state]
+//    A_log      [d_inner, d_state]        D_param    [d_inner]
+//    initial_state/final_state [d_inner, d_state]
+//    scan_output[compact_N, d_inner]
+//  rope_freq is accepted but unused (vestigial positional arg). One thread per
+//  inner channel d; the scan is sequential along time, parallel across d.
+__global__ void moe_scan_compacted_kernel(
+    const float* __restrict__ compact_x, const float* __restrict__ compact_dt,
+    const float* __restrict__ compact_B, const float* __restrict__ compact_C,
+    const float* __restrict__ A_log, const float* __restrict__ D_param,
+    float* __restrict__ scan_output, float* __restrict__ final_state,
+    const float* __restrict__ initial_state,
+    int compact_N, int d_inner, int d_state
+) {
+    const int stride = prim::grid_stride();
+    for (int d = prim::grid_stride_index(); d < d_inner; d += stride) {
+        // per-channel state register row h[s], bounded by SG2's MAX d_state.
+        float h[256];
+        for (int s = 0; s < d_state; ++s) {
+            h[s] = (initial_state != nullptr)
+                 ? initial_state[d * d_state + s] : 0.0f;
+        }
+        const float Dd = (D_param != nullptr) ? D_param[d] : 0.0f;
+        for (int t = 0; t < compact_N; ++t) {
+            const float xt = compact_x[t * d_inner + d];
+            const float dt = compact_dt[t * d_inner + d];
+            float y = Dd * xt;
+            for (int s = 0; s < d_state; ++s) {
+                const float A = -expf(A_log[d * d_state + s]);  // negative real
+                const float A_bar = expf(dt * A);
+                const float Bx = (dt * compact_B[t * d_state + s]) * xt;
+                h[s] = A_bar * h[s] + Bx;
+                y += compact_C[t * d_state + s] * h[s];
+            }
+            scan_output[t * d_inner + d] = y;
+        }
+        if (final_state != nullptr) {
+            for (int s = 0; s < d_state; ++s)
+                final_state[d * d_state + s] = h[s];
+        }
+    }
 }
 
 void moe_scan_compacted(
@@ -1622,37 +2070,32 @@ void moe_scan_compacted(
     torch::Tensor scan_output, torch::Tensor final_state,
     torch::Tensor initial_state,
     int compact_N, int d_inner, int d_state) {
-    throw std::runtime_error("moe_scan_compacted: sm_90 kernel not yet implemented.");
-}
-
-void moe_scatter_results(
-    torch::Tensor compact_params,
-    torch::Tensor compact_state_m, torch::Tensor compact_state_v,
-    torch::Tensor scatter_indices,
-    torch::Tensor params,
-    torch::Tensor state_m, torch::Tensor state_v,
-    int compact_N) {
-    throw std::runtime_error("moe_scatter_results: sm_90 kernel not yet implemented.");
-}
-
-void moe_count_expert_activations(
-    torch::Tensor gate_logits, torch::Tensor expert_counts,
-    float threshold, int N, int num_experts) {
-    throw std::runtime_error("moe_count_expert_activations: sm_90 kernel not yet implemented.");
-}
-
-torch::Tensor moe_compute_load_balance_loss(
-    torch::Tensor expert_counts, torch::Tensor gate_logits,
-    int N, int num_experts) {
-    throw std::runtime_error("moe_compute_load_balance_loss: sm_90 kernel not yet implemented.");
-    return torch::Tensor{};
-}
-
-void moe_apply_frequency_scaling(
-    torch::Tensor expert_counts, torch::Tensor lr_scale,
-    int num_experts, int total_activations,
-    float min_scale, float max_scale, float smoothing) {
-    throw std::runtime_error("moe_apply_frequency_scaling: sm_90 kernel not yet implemented.");
+    (void)rope_freq;  // vestigial positional arg (Mamba-era), intentionally unused.
+    if (compact_N == 0 || d_inner == 0) return;
+    TORCH_CHECK(d_state <= 256,
+        "moe_scan_compacted: vestigial scan supports d_state <= 256");
+    auto cx = compact_x.to(torch::kFloat32).contiguous();
+    auto cdt = compact_dt.to(torch::kFloat32).contiguous();
+    auto cB = compact_B.to(torch::kFloat32).contiguous();
+    auto cC = compact_C.to(torch::kFloat32).contiguous();
+    auto al = A_log.to(torch::kFloat32).contiguous();
+    auto dp = D_param.defined() ? D_param.to(torch::kFloat32).contiguous()
+                                : torch::Tensor{};
+    auto init = initial_state.defined()
+              ? initial_state.to(torch::kFloat32).contiguous()
+              : torch::Tensor{};
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (d_inner + block - 1) / block);
+    moe_scan_compacted_kernel<<<grid, block, 0, stream>>>(
+        cx.data_ptr<float>(), cdt.data_ptr<float>(),
+        cB.data_ptr<float>(), cC.data_ptr<float>(),
+        al.data_ptr<float>(),
+        dp.defined() ? dp.data_ptr<float>() : nullptr,
+        scan_output.data_ptr<float>(),
+        final_state.defined() ? final_state.data_ptr<float>() : nullptr,
+        init.defined() ? init.data_ptr<float>() : nullptr,
+        compact_N, d_inner, d_state);
 }
 
 }} // namespace sg::sm90

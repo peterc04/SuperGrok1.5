@@ -71,7 +71,30 @@
 #include <cstdint>
 #include <type_traits>
 
+#ifdef WITH_CUTLASS
+// Sm90 (Hopper) warp-group collective GEMM helpers (TMA + WGMMA, FP32
+// accumulate). Reuses the canonical, layout-parameterised builder from
+// mma.cuh so the ViT's heavy matmuls (patch embedding, QKV/out projections,
+// MLP up/down, classification head) emit real Hopper WGMMA/TMA instructions
+// instead of the scalar gemm_bias_kernel fallback. All CUTLASS #includes
+// stay at GLOBAL scope (mma.cuh requirement).
+#include "csrc/backends/cuda/sm_90/mma.cuh"
+#endif  // WITH_CUTLASS
+
 namespace sg { namespace sm90 { namespace models { namespace vit {
+
+#ifdef WITH_CUTLASS
+// The Sm90 collective GEMM path only supports the CUTLASS half/bf16 element
+// types. FP32 activations/weights (T=float) keep the scalar gemm_bias_kernel
+// path. Resolved at compile time so the FP32 instantiation never tries to
+// build a float CUTLASS GEMM (no cutlass element mapping for float).
+template <typename T> struct cutlass_gemm_elem;            // primary: unsupported
+template <> struct cutlass_gemm_elem<__half>        { using type = cutlass::half_t; };
+template <> struct cutlass_gemm_elem<__nv_bfloat16> { using type = cutlass::bfloat16_t; };
+template <typename T> struct cutlass_gemm_supported       { static constexpr bool value = false; };
+template <> struct cutlass_gemm_supported<__half>        { static constexpr bool value = true; };
+template <> struct cutlass_gemm_supported<__nv_bfloat16> { static constexpr bool value = true; };
+#endif  // WITH_CUTLASS
 
 // ─── dtype helpers ─────────────────────────────────────────────────────
 template <typename T>
@@ -324,6 +347,77 @@ inline cudaError_t launch_gemm_bias(
     gemm_bias_kernel<ActT, WeightT><<<M, block, 0, stream>>>(in, W, b, out, M, N, K);
     return cudaGetLastError();
 }
+
+#ifdef WITH_CUTLASS
+// Cast an FP32 collective-GEMM output buffer back into the activation dtype,
+// optionally adding a per-column bias b[N] in the same pass.
+template <typename ActT, typename WeightT>
+__global__ void __launch_bounds__(256, 4)
+gemm_cast_bias_kernel(const float* __restrict__ src, const WeightT* __restrict__ b,
+                      ActT* __restrict__ dst, int M, int N) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)M * N) return;
+    float v = src[i];
+    if (b != nullptr) v += to_f32(b[(int)(i % (size_t)N)]);
+    dst[i] = from_f32<ActT>(v);
+}
+
+// Per-call FP32 scratch for the collective GEMM (lazily grown, reused).
+inline float* vit_gemm_fp32_scratch(size_t elems) {
+    static thread_local float* ptr   = nullptr;
+    static thread_local size_t cap_n = 0;
+    if (elems > cap_n) {
+        if (ptr) cudaFree(ptr);
+        if (cudaMalloc(&ptr, elems * sizeof(float)) != cudaSuccess) {
+            ptr = nullptr; cap_n = 0; return nullptr;
+        }
+        cap_n = elems;
+    }
+    return ptr;
+}
+
+// ─── Linear-layer GEMM via the Sm90 collective (TMA + WGMMA) ──────────
+// Computes  out[M,N] = in[M,K] @ W^T + b   (W is a Linear weight [N,K]
+// row-major, read as Wᵀ via LayoutBT=ColumnMajor — exactly the convention
+// of the scalar gemm_bias_kernel it replaces). FP32 accumulate, then a
+// cast(+bias) pass back into the activation dtype. Reuses the canonical
+// mma::sm90_run_gemm_bt builder from mma.cuh (modeled byte-for-byte on
+// fmha_sm90_gemm) — no local CollectiveBuilder. T must be CUTLASS half/bf16.
+// Returns cudaErrorNotSupported if CUTLASS cannot implement the shape; the
+// caller falls back to the scalar gemm_bias_kernel.
+template <typename T>
+inline cudaError_t vit_linear_gemm_bias(
+    const T* in, const T* W, const T* b, T* out,
+    int M, int N, int K, cudaStream_t stream)
+{
+    using Elem = typename cutlass_gemm_elem<T>::type;
+    float* c_fp32 = vit_gemm_fp32_scratch((size_t)M * N);
+    if (c_fp32 == nullptr) return cudaErrorMemoryAllocation;
+    cudaError_t err = mma::sm90_run_gemm_bt<Elem, cutlass::layout::ColumnMajor>(
+        M, N, K, in, W, c_fp32, stream);
+    if (err != cudaSuccess) return err;
+    size_t n = (size_t)M * N;
+    int block = 256, grid = (int)((n + block - 1) / block);
+    gemm_cast_bias_kernel<T, T><<<grid, block, 0, stream>>>(c_fp32, b, out, M, N);
+    return cudaGetLastError();
+}
+
+// Dispatch wrapper: CUTLASS Sm90 path for half/bf16, scalar fallback for
+// FP32 (or whenever CUTLASS cannot implement the shape).
+template <typename ActT, typename WeightT>
+inline cudaError_t launch_linear_bias(
+    const ActT* in, const WeightT* W, const WeightT* b, ActT* out,
+    int M, int N, int K, cudaStream_t stream)
+{
+    if constexpr (cutlass_gemm_supported<ActT>::value &&
+                  std::is_same<ActT, WeightT>::value) {
+        cudaError_t err = vit_linear_gemm_bias<ActT>(in, W, b, out, M, N, K, stream);
+        if (err == cudaSuccess) return cudaSuccess;
+        // fall through to the scalar path on cudaErrorNotSupported
+    }
+    return launch_gemm_bias<ActT, WeightT>(in, W, b, out, M, N, K, stream);
+}
+#endif  // WITH_CUTLASS
 
 // dX = dY · W   where Y[m,n] = sum_k W[n,k] X[m,k]; dX[m,k] = sum_n dY[m,n] W[n,k]
 template <typename ActT, typename WeightT>
@@ -848,9 +942,15 @@ cudaError_t forward(
     // region by routing through a temporary ActT scratch (layer-0 attn_out).
     auto L0 = A.layer(0);
     ActT* patches_proj = L0.proj_out;  // reuse: temporary scratch (overwritten before use)
+#ifdef WITH_CUTLASS
+    err = launch_linear_bias<ActT, WeightT>(
+        input, w.patch_W(), w.patch_b(), patches_proj,
+        /*M=*/batch * num_patches, /*N=*/d_model, /*K=*/patch_dim, stream);
+#else
     err = launch_gemm_bias<ActT, WeightT>(
         input, w.patch_W(), w.patch_b(), patches_proj,
         /*M=*/batch * num_patches, /*N=*/d_model, /*K=*/patch_dim, stream);
+#endif
     if (err != cudaSuccess) return err;
 
     // Step 2: prepend CLS + add pos embed -> tokens (= layer-0 pre_attn_in)
@@ -869,9 +969,15 @@ cudaError_t forward(
         auto P = A.layer(L);
 
         // QKV projection: [M, D] -> [M, 3*HD]
+#ifdef WITH_CUTLASS
+        err = launch_linear_bias<ActT, WeightT>(
+            P.pre_attn_in, w.qkv_W(L), w.qkv_b(L), P.qkv,
+            M, 3 * HD, d_model, stream);
+#else
         err = launch_gemm_bias<ActT, WeightT>(
             P.pre_attn_in, w.qkv_W(L), w.qkv_b(L), P.qkv,
             M, 3 * HD, d_model, stream);
+#endif
         if (err != cudaSuccess) return err;
 
         // Split into Q/K/V [B, H, S, Dh] each via temporary scratch.
@@ -914,9 +1020,15 @@ cudaError_t forward(
         err = cudaGetLastError(); if (err != cudaSuccess) return err;
 
         // Output projection: attn_out [M, HD] -> proj_out [M, D]
+#ifdef WITH_CUTLASS
+        err = launch_linear_bias<ActT, WeightT>(
+            P.attn_out, w.out_W(L), w.out_b(L), P.proj_out,
+            M, d_model, HD, stream);
+#else
         err = launch_gemm_bias<ActT, WeightT>(
             P.attn_out, w.out_W(L), w.out_b(L), P.proj_out,
             M, d_model, HD, stream);
+#endif
         if (err != cudaSuccess) return err;
 
         // Residual: ln1_in = pre_attn_in + proj_out
@@ -931,9 +1043,15 @@ cudaError_t forward(
         if (err != cudaSuccess) return err;
 
         // FFN up: ffn_h_pre = ff1_W @ ln1_out + ff1_b
+#ifdef WITH_CUTLASS
+        err = launch_linear_bias<ActT, WeightT>(
+            P.ln1_out, w.ff1_W(L), w.ff1_b(L), P.ffn_h_pre,
+            M, ffn_hidden, d_model, stream);
+#else
         err = launch_gemm_bias<ActT, WeightT>(
             P.ln1_out, w.ff1_W(L), w.ff1_b(L), P.ffn_h_pre,
             M, ffn_hidden, d_model, stream);
+#endif
         if (err != cudaSuccess) return err;
 
         // GELU
@@ -941,9 +1059,15 @@ cudaError_t forward(
         if (err != cudaSuccess) return err;
 
         // FFN down: ffn_out = ff2_W @ ffn_h + ff2_b
+#ifdef WITH_CUTLASS
+        err = launch_linear_bias<ActT, WeightT>(
+            P.ffn_h, w.ff2_W(L), w.ff2_b(L), P.ffn_out,
+            M, d_model, ffn_hidden, stream);
+#else
         err = launch_gemm_bias<ActT, WeightT>(
             P.ffn_h, w.ff2_W(L), w.ff2_b(L), P.ffn_out,
             M, d_model, ffn_hidden, stream);
+#endif
         if (err != cudaSuccess) return err;
 
         // Residual: ln2_in = ln1_out + ffn_out
@@ -984,9 +1108,15 @@ cudaError_t forward(
     if (err != cudaSuccess) return err;
 
     // Step 6: classification head: output = head_W @ final_out + head_b
+#ifdef WITH_CUTLASS
+    err = launch_linear_bias<ActT, WeightT>(
+        F.final_out, w.head_W(), w.head_b(), output,
+        batch, n_classes, d_model, stream);
+#else
     err = launch_gemm_bias<ActT, WeightT>(
         F.final_out, w.head_W(), w.head_b(), output,
         batch, n_classes, d_model, stream);
+#endif
     return err;
 }
 

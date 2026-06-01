@@ -745,45 +745,64 @@ void launch_moe_adam_step(
 // ═══════════════════════════════════════════════════════════════════════
 //  MoE (Mixture of Experts) — folded in from former launch_moe.hip.cpp.
 //
-//  Placeholder kernels that throw at runtime. Real gfx942 MFMA-fused expert
-//  MLP kernels are the obvious follow-up (spec §9: "MoE for SG2 should be REAL
-//  where feasible"); the host-compiled ATen TU keeps them as stubs for now so
-//  the binding symbols resolve.
+//  REAL gfx942 implementations of the MoE-compaction tail of
+//  MoEAwareSuperGrok2 (Stage 1B). Because `.hip.cpp` TUs route through the
+//  HOST compiler we cannot author __global__ kernels here; all work is ATen
+//  tensor ops (which reach rocBLAS / rocPRIM internally), semantically mirroring
+//  the sm_90 CUDA path in supergrok2_sm90.cuh.
+//
+//  Reachability (verified): Python's _moe_step calls count_expert_activations,
+//  compute_load_balance_loss, apply_frequency_scaling, filter_active_params,
+//  scatter_results. dynamic_expert_{load,fwd,bwd} and scan_compacted are
+//  exported for ABI but not currently called; still implemented correctly.
+//  moe_scan_compacted is VESTIGIAL (Mamba-era; SG2's mixer is now CSA/HCA).
 // ═══════════════════════════════════════════════════════════════════════
 
-void moe_dynamic_expert_load(
-    torch::Tensor expert_w1, torch::Tensor expert_b1,
-    torch::Tensor expert_w2, torch::Tensor expert_b2,
-    torch::Tensor active_mask,
-    torch::Tensor smem_w1, torch::Tensor smem_b1,
-    torch::Tensor smem_w2, torch::Tensor smem_b2) {
-    throw std::runtime_error(
-        "moe_dynamic_expert_load: gfx942 kernel not yet implemented.");
+// ── (1) Expert-activation histogram ──
+//  expert_counts[e] += #rows with gate_logits[:,e] > threshold (int32).
+void moe_count_expert_activations(
+    torch::Tensor gate_logits, torch::Tensor expert_counts,
+    float threshold, int N, int num_experts) {
+    if (N == 0 || num_experts == 0) return;
+    auto gl = gate_logits.to(torch::kFloat32);
+    auto counts = (gl > threshold).sum(/*dim=*/0).to(torch::kInt32);  // [E]
+    expert_counts.copy_(counts);
 }
 
-torch::Tensor moe_dynamic_expert_fwd(
-    torch::Tensor input, torch::Tensor expert_indices,
-    torch::Tensor routing_weights,
-    torch::Tensor expert_w1, torch::Tensor expert_b1,
-    torch::Tensor expert_w2, torch::Tensor expert_b2,
-    torch::Tensor output) {
-    throw std::runtime_error(
-        "moe_dynamic_expert_fwd: gfx942 kernel not yet implemented.");
-    return torch::Tensor{};
+// ── (2) Switch-Transformer load-balance auxiliary loss ──
+//  loss = E * Σ_e f_e * P_e ; f_e = counts[e]/N ; P_e = mean_t softmax(gl)[t,e].
+torch::Tensor moe_compute_load_balance_loss(
+    torch::Tensor expert_counts, torch::Tensor gate_logits,
+    int N, int num_experts) {
+    auto opts = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(gate_logits.device());
+    if (N == 0 || num_experts == 0) return torch::zeros({}, opts);
+    auto gl = gate_logits.to(torch::kFloat32);
+    auto P = torch::softmax(gl, /*dim=*/1).mean(/*dim=*/0);              // [E]
+    auto f = expert_counts.to(torch::kFloat32) / static_cast<double>(N); // [E]
+    return static_cast<double>(num_experts) * (f * P).sum();
 }
 
-void moe_dynamic_expert_bwd(
-    torch::Tensor d_output, torch::Tensor input,
-    torch::Tensor expert_indices, torch::Tensor routing_weights,
-    torch::Tensor expert_w1, torch::Tensor expert_b1,
-    torch::Tensor expert_w2, torch::Tensor expert_b2,
-    torch::Tensor d_input, torch::Tensor d_expert_w1,
-    torch::Tensor d_expert_b1, torch::Tensor d_expert_w2,
-    torch::Tensor d_expert_b2) {
-    throw std::runtime_error(
-        "moe_dynamic_expert_bwd: gfx942 kernel not yet implemented.");
+// ── (3) Frequency-inverse per-expert LR scaling ──
+//  freq_e = (counts[e]+s)/(total+s*E) ; scale_e = clamp((1/E)/freq_e, lo, hi).
+void moe_apply_frequency_scaling(
+    torch::Tensor expert_counts, torch::Tensor lr_scale,
+    int num_experts, int total_activations,
+    float min_scale, float max_scale, float smoothing) {
+    if (num_experts == 0) return;
+    const double denom = static_cast<double>(total_activations)
+                       + static_cast<double>(smoothing) * num_experts;
+    const double uniform = 1.0 / static_cast<double>(num_experts);
+    auto freq = (expert_counts.to(torch::kFloat32) + smoothing) / denom;  // [E]
+    auto scale = torch::clamp(uniform / freq, min_scale, max_scale);      // [E]
+    lr_scale.copy_(scale.to(torch::kFloat32));
 }
 
+// ── (4) Stream-compaction of active-expert parameters ──
+//  Keep index i iff expert_active[param_to_expert[i]] != 0. We build a boolean
+//  mask and use it to gather the kept elements (deterministic ascending order,
+//  unlike the sm_90 atomic compaction — both satisfy the (out->i) scatter
+//  contract). compact_count[0] = #kept; outputs filled in [0, kept).
 void moe_filter_active_params(
     torch::Tensor params, torch::Tensor grads,
     torch::Tensor state_m, torch::Tensor state_v,
@@ -792,10 +811,138 @@ void moe_filter_active_params(
     torch::Tensor compact_state_m, torch::Tensor compact_state_v,
     torch::Tensor scatter_indices, torch::Tensor compact_count,
     int total_params) {
-    throw std::runtime_error(
-        "moe_filter_active_params: gfx942 kernel not yet implemented.");
+    if (total_params == 0) {
+        compact_count.zero_();
+        return;
+    }
+    auto p2e = param_to_expert.to(torch::kLong);                  // [P]
+    auto active = expert_active.to(torch::kBool);                 // [E]
+    auto keep = active.index_select(0, p2e);                      // [P] bool
+    auto idx = torch::nonzero(keep).reshape(-1);                  // [K] long
+    const int64_t K = idx.numel();
+    compact_count.fill_(static_cast<int>(K));
+    if (K == 0) return;
+    compact_params.narrow(0, 0, K).copy_(params.index_select(0, idx));
+    compact_grads.narrow(0, 0, K).copy_(grads.index_select(0, idx));
+    compact_state_m.narrow(0, 0, K).copy_(state_m.index_select(0, idx));
+    compact_state_v.narrow(0, 0, K).copy_(state_v.index_select(0, idx));
+    scatter_indices.narrow(0, 0, K).copy_(idx.to(torch::kInt32));
 }
 
+// ── (5) Scatter compacted results back to dense storage ──
+//  params[scatter_indices[j]] = compact_params[j], etc. (inverse of (4)).
+void moe_scatter_results(
+    torch::Tensor compact_params,
+    torch::Tensor compact_state_m, torch::Tensor compact_state_v,
+    torch::Tensor scatter_indices,
+    torch::Tensor params,
+    torch::Tensor state_m, torch::Tensor state_v,
+    int compact_N) {
+    if (compact_N == 0) return;
+    auto idx = scatter_indices.narrow(0, 0, compact_N).to(torch::kLong);
+    params.index_copy_(0, idx, compact_params.narrow(0, 0, compact_N));
+    state_m.index_copy_(0, idx, compact_state_m.narrow(0, 0, compact_N));
+    state_v.index_copy_(0, idx, compact_state_v.narrow(0, 0, compact_N));
+}
+
+// ── (6) Masked gather of active expert weights ──
+//  Pack the slices of expert_{w1,b1,w2,b2} where active_mask[e]!=0, in
+//  ascending expert order, into the smem_* buffers.
+void moe_dynamic_expert_load(
+    torch::Tensor expert_w1, torch::Tensor expert_b1,
+    torch::Tensor expert_w2, torch::Tensor expert_b2,
+    torch::Tensor active_mask,
+    torch::Tensor smem_w1, torch::Tensor smem_b1,
+    torch::Tensor smem_w2, torch::Tensor smem_b2) {
+    auto idx = torch::nonzero(active_mask.reshape(-1) != 0).reshape(-1);  // [A]
+    const int64_t A = idx.numel();
+    if (A == 0) return;
+    smem_w1.narrow(0, 0, A).copy_(expert_w1.index_select(0, idx));
+    smem_w2.narrow(0, 0, A).copy_(expert_w2.index_select(0, idx));
+    smem_b1.narrow(0, 0, A).copy_(expert_b1.index_select(0, idx));
+    smem_b2.narrow(0, 0, A).copy_(expert_b2.index_select(0, idx));
+}
+
+// ── (7) Per-token expert MLP forward ──
+//  output[t] = rw[t] * (W2_e @ relu(W1_e @ input[t] + b1_e) + b2_e).
+//  Shapes: input [N,d_in]; expert_w1 [E,hidden,d_in]; expert_w2 [E,d_out,hidden].
+//  Vectorized with batched bmm over per-token gathered expert weights.
+torch::Tensor moe_dynamic_expert_fwd(
+    torch::Tensor input, torch::Tensor expert_indices,
+    torch::Tensor routing_weights,
+    torch::Tensor expert_w1, torch::Tensor expert_b1,
+    torch::Tensor expert_w2, torch::Tensor expert_b2,
+    torch::Tensor output) {
+    const int64_t N = input.size(0);
+    if (N == 0) return output;
+    auto x   = input.to(torch::kFloat32);                       // [N,d_in]
+    auto idx = expert_indices.to(torch::kLong);                 // [N]
+    auto rw  = routing_weights.to(torch::kFloat32).reshape({N, 1});
+    auto W1  = expert_w1.to(torch::kFloat32).index_select(0, idx);  // [N,H,d_in]
+    auto b1  = expert_b1.to(torch::kFloat32).index_select(0, idx);  // [N,H]
+    auto W2  = expert_w2.to(torch::kFloat32).index_select(0, idx);  // [N,d_out,H]
+    auto b2  = expert_b2.to(torch::kFloat32).index_select(0, idx);  // [N,d_out]
+    // h = relu(W1 @ x + b1)  -> [N,H]
+    auto h = torch::relu(
+        torch::bmm(W1, x.unsqueeze(2)).squeeze(2) + b1);           // [N,H]
+    auto y = torch::bmm(W2, h.unsqueeze(2)).squeeze(2) + b2;       // [N,d_out]
+    output.copy_(rw * y);
+    return output;
+}
+
+// ── (8) Per-token expert MLP backward (full VJP) ──
+//  dy = rw * d_output ; db2_e += dy ; dW2_e += dy⊗h ; dh = W2ᵀdy ;
+//  dz1 = dh ⊙ [z1>0] ; dW1_e += dz1⊗x ; db1_e += dz1 ; d_input = W1ᵀ dz1.
+//  Expert-weight grads accumulated via index_add_ (multiple tokens per expert).
+void moe_dynamic_expert_bwd(
+    torch::Tensor d_output, torch::Tensor input,
+    torch::Tensor expert_indices, torch::Tensor routing_weights,
+    torch::Tensor expert_w1, torch::Tensor expert_b1,
+    torch::Tensor expert_w2, torch::Tensor expert_b2,
+    torch::Tensor d_input, torch::Tensor d_expert_w1,
+    torch::Tensor d_expert_b1, torch::Tensor d_expert_w2,
+    torch::Tensor d_expert_b2) {
+    const int64_t N = input.size(0);
+    if (N == 0) return;
+    auto x   = input.to(torch::kFloat32);                          // [N,d_in]
+    auto dout = d_output.to(torch::kFloat32);                      // [N,d_out]
+    auto idx = expert_indices.to(torch::kLong);                    // [N]
+    auto rw  = routing_weights.to(torch::kFloat32).reshape({N, 1});
+    auto W1g = expert_w1.to(torch::kFloat32).index_select(0, idx); // [N,H,d_in]
+    auto b1g = expert_b1.to(torch::kFloat32).index_select(0, idx); // [N,H]
+    auto W2g = expert_w2.to(torch::kFloat32).index_select(0, idx); // [N,d_out,H]
+
+    // Recompute forward activations.
+    auto z1 = torch::bmm(W1g, x.unsqueeze(2)).squeeze(2) + b1g;    // [N,H]
+    auto relu_mask = (z1 > 0).to(torch::kFloat32);                 // [N,H]
+    auto h = z1 * relu_mask;                                       // [N,H]
+
+    auto dy = rw * dout;                                           // [N,d_out]
+    // dW2 = dy ⊗ h : [N,d_out,H] ; db2 = dy ; dh = W2ᵀ dy.
+    auto dW2 = torch::bmm(dy.unsqueeze(2), h.unsqueeze(1));        // [N,d_out,H]
+    auto db2 = dy;                                                 // [N,d_out]
+    auto dh = torch::bmm(W2g.transpose(1, 2), dy.unsqueeze(2)).squeeze(2); // [N,H]
+    auto dz1 = dh * relu_mask;                                     // [N,H]
+    auto dW1 = torch::bmm(dz1.unsqueeze(2), x.unsqueeze(1));       // [N,H,d_in]
+    auto db1 = dz1;                                                // [N,H]
+    auto dx = torch::bmm(W1g.transpose(1, 2), dz1.unsqueeze(2)).squeeze(2); // [N,d_in]
+    d_input.copy_(dx);
+
+    // Scatter-accumulate per-expert grads.
+    d_expert_w1.index_add_(0, idx, dW1);
+    d_expert_b1.index_add_(0, idx, db1);
+    d_expert_w2.index_add_(0, idx, dW2);
+    d_expert_b2.index_add_(0, idx, db2);
+}
+
+// ── (9) Compacted selective scan — VESTIGIAL ──
+//  Mamba-era discretized SSM recurrence; SG2's mixer is now CSA/HCA and Python
+//  NEVER calls this. Kept linkable + numerically sound for ABI stability.
+//    A = -exp(A_log) ; A_bar = exp(dt*A) ; h_t = A_bar*h_{t-1} + (dt*B_t)*x_t ;
+//    y_t = Σ_s C_t[s]*h_t[d,s] + D[d]*x_t[d].
+//  Layout: compact_x/dt [Nc,d_inner]; compact_B/C [Nc,d_state];
+//          A_log [d_inner,d_state]; D_param [d_inner];
+//          initial/final_state [d_inner,d_state]; scan_output [Nc,d_inner].
 void moe_scan_compacted(
     torch::Tensor compact_x, torch::Tensor compact_dt,
     torch::Tensor compact_B, torch::Tensor compact_C,
@@ -804,42 +951,33 @@ void moe_scan_compacted(
     torch::Tensor scan_output, torch::Tensor final_state,
     torch::Tensor initial_state,
     int compact_N, int d_inner, int d_state) {
-    throw std::runtime_error(
-        "moe_scan_compacted: gfx942 kernel not yet implemented.");
-}
-
-void moe_scatter_results(
-    torch::Tensor compact_params,
-    torch::Tensor compact_state_m, torch::Tensor compact_state_v,
-    torch::Tensor scatter_indices,
-    torch::Tensor params,
-    torch::Tensor state_m, torch::Tensor state_v,
-    int compact_N) {
-    throw std::runtime_error(
-        "moe_scatter_results: gfx942 kernel not yet implemented.");
-}
-
-void moe_count_expert_activations(
-    torch::Tensor gate_logits, torch::Tensor expert_counts,
-    float threshold, int N, int num_experts) {
-    throw std::runtime_error(
-        "moe_count_expert_activations: gfx942 kernel not yet implemented.");
-}
-
-torch::Tensor moe_compute_load_balance_loss(
-    torch::Tensor expert_counts, torch::Tensor gate_logits,
-    int N, int num_experts) {
-    throw std::runtime_error(
-        "moe_compute_load_balance_loss: gfx942 kernel not yet implemented.");
-    return torch::Tensor{};
-}
-
-void moe_apply_frequency_scaling(
-    torch::Tensor expert_counts, torch::Tensor lr_scale,
-    int num_experts, int total_activations,
-    float min_scale, float max_scale, float smoothing) {
-    throw std::runtime_error(
-        "moe_apply_frequency_scaling: gfx942 kernel not yet implemented.");
+    (void)rope_freq;  // vestigial positional arg (Mamba-era), intentionally unused.
+    if (compact_N == 0 || d_inner == 0) return;
+    auto x  = compact_x.to(torch::kFloat32);     // [Nc,d_inner]
+    auto dt = compact_dt.to(torch::kFloat32);    // [Nc,d_inner]
+    auto B  = compact_B.to(torch::kFloat32);     // [Nc,d_state]
+    auto C  = compact_C.to(torch::kFloat32);     // [Nc,d_state]
+    auto A  = -torch::exp(A_log.to(torch::kFloat32));  // [d_inner,d_state]
+    auto opts = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(x.device());
+    auto h = (initial_state.defined() && initial_state.numel() > 0)
+           ? initial_state.to(torch::kFloat32).clone()
+           : torch::zeros({d_inner, d_state}, opts);     // [d_inner,d_state]
+    auto Dvec = (D_param.defined() && D_param.numel() > 0)
+              ? D_param.to(torch::kFloat32)
+              : torch::zeros({d_inner}, opts);            // [d_inner]
+    for (int t = 0; t < compact_N; ++t) {
+        auto xt = x[t].reshape({d_inner, 1});             // [d_inner,1]
+        auto dtt = dt[t].reshape({d_inner, 1});           // [d_inner,1]
+        auto Bt = B[t].reshape({1, d_state});             // [1,d_state]
+        auto Ct = C[t].reshape({1, d_state});             // [1,d_state]
+        auto A_bar = torch::exp(dtt * A);                 // [d_inner,d_state]
+        h = A_bar * h + (dtt * Bt) * xt;                  // [d_inner,d_state]
+        auto y = (h * Ct).sum(/*dim=*/1) + Dvec * x[t];   // [d_inner]
+        scan_output[t].copy_(y);
+    }
+    if (final_state.defined() && final_state.numel() > 0)
+        final_state.copy_(h);
 }
 
 }} // namespace sg::gfx942
