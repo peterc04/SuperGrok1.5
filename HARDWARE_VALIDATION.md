@@ -1488,3 +1488,158 @@ the AMD run on the NVIDIA bar.
 - `ruff check grokking_optimizers/ tests/` → `All checks passed!`
 - `tests/hw/test_3d_parallel.py` run with no launch → `[stage7] SKIP: no
   distributed launch` (and the CPU-safe sizing/efficiency/partition tests pass).
+
+---
+
+## Stage 6 — 99 megakernels + solver
+
+Stage 6 builds the **L3 persistent-megakernel scaffolding + the dispatch
+wiring**: one uniform scheduler/barrier substrate per arch, one parameterized
+L3 megakernel that composes *(forward → backward → fused optimizer step)* in a
+single persistent launch, a Python code generator that instantiates that
+template per solver-chosen cell, and the `fused_step` dispatch that prefers a
+fused TU when present (§1.12). The Python feasibility solver
+(`grokking_optimizers/megakernel.py`) is the tier authority; the C++ generator
+mirrors its L3/L2/L1 model.
+
+### Scheduler / barrier design (§1.1–§1.4, §1.13, §1.14)
+
+Shared substrate — `csrc/fused/megakernel_common.cuh` (sm_90) and
+`csrc/fused/megakernel_common_hip.hip.hpp` (gfx942):
+
+- **§1.1 task-queue scheduler** — one global atomic `int` (`g_next_task`,
+  host-zeroed). Each persistent CTA/workgroup pulls parameter-tensor indices via
+  `atomicAdd(g_next_task, 1)` (the ThunderKittens-interpreter pattern). The
+  leader thread pulls per-CTA and broadcasts through shared/LDS (`next_block`).
+- **§1.2 work-stealing** — there is NO static partition: an idle core just keeps
+  calling `next()`, so a CTA that drains its tensor early grabs the next index.
+  The `atomicAdd` IS the steal.
+- **§1.3 SM/CU pinning** — `sm_id()` reads `%smid` (`mov.u32 %0, %%smid;`) on
+  sm_90; `cu_id()` reads `HW_ID` via `__builtin_amdgcn_s_getreg` on gfx942. The
+  host launches one persistent CTA per SM (gridDim.x = #SMs) / one workgroup per
+  CU, so that SM's/CU's optimizer-state slice stays L2-warm across the step.
+- **§1.4 hand-built grid barrier** — `GridBarrier` from two global atomics
+  (`arrived`, `generation`) + a **sense-reversing generation** counter, NO
+  cooperative launch (scales past the cooperative-grid CTA cap). Each CTA
+  samples the generation, RELEASE-fences its phase writes, joins the arrival
+  count; the **last arriver** resets `arrived=0` and advances the generation;
+  everyone else spins on the generation; all then ACQUIRE-fence. The
+  sense-reversal is what makes it **reusable** without the classic
+  reset-vs-lap race (a fast CTA cannot lap a slow one because the consumer side
+  never touches `arrived` for reset — it waits on the generation advancing).
+- **§1.13 AMD scheduling note** — the gfx942 megakernel is **NOT**
+  warp-specialized (no TMA/WGMMA/setmaxnreg analog on CDNA3). It uses
+  **ping-pong / 4-wave-interleave** scheduling (4 wavefronts/SIMD take turns,
+  `sched_group_barrier` hints pin the MFMA-vs-VMEM interleave); latency is hidden
+  by occupancy, not a dedicated producer warp-group. The sm_90 megakernel uses
+  the §3.4 `wgs` warp-spec primitives (elect / mbarrier / setmaxnreg) for the
+  producer/consumer load→compute split.
+- **§1.14 fences** — explicit + minimal: exactly one release fence before the
+  arrival publish and one acquire fence after the generation advances at the
+  barrier; exactly one `fence.proxy.async` paired with the sm_90 mbarrier
+  hand-off. No loose fences.
+
+### Demo megakernel structure (§1.5–§1.8)
+
+`csrc/fused/sm_90/megakernel_demo.cu` and
+`csrc/fused/gfx942/megakernel_demo.hip.hpp` are ONE templated L3 megakernel
+`l3_megakernel<Model, Optimizer>` that composes three stages in a single
+persistent launch:
+
+```
+forward_stage<M>  ─GridBarrier─▶ (reset queue) ─GridBarrier─▶
+backward_stage<M> ─GridBarrier─▶ (reset queue) ─GridBarrier─▶ optimizer_stage<Opt>
+```
+
+The forward/backward stages are lightweight **representative** bodies
+(grid-stride compute over the param tensor with the correct barrier/hand-off
+structure); the optimizer stage is the fused L3 tail (`opt_update<Opt>`,
+specialized per optimizer). The sm_90 forward stage exercises the §3.4
+producer/consumer split: warp 0 is the producer (`elect_one_sync`,
+`arrive_expect_tx`, `warpgroup_reg_dealloc<32>`, one `fence_async_proxy`), warps
+1–3 are the consumer (`warpgroup_reg_alloc<240>`, `mbarrier.wait`). The task
+queue counter is reset **inside** the kernel at the grid barrier (last arriver),
+where all CTAs are quiesced — race-free. **§1.7**: SG2's SAM/bilevel outer loop
+stays OUTSIDE this per-step megakernel (a separate host launch); the demo
+instantiates the elementwise-tail optimizers and the generator emits the SG2
+meta-net tail as its own cell.
+
+A generated cell `.cu` defines `SG_MEGAKERNEL_DEMO_TEMPLATE_ONLY` before
+including the demo, so it pulls in JUST the template machinery (comdat-folded)
+and adds its own unique launcher — no duplicate-symbol clash.
+
+### Cells instantiated + wired into `fused_step`
+
+Three representative **L3-fitting** (model, optimizer) cells are instantiated in
+the sm_90 demo TU and routed by `csrc/bindings/dispatch.cpp::fused_step`
+(§1.12), with the gfx942 twins instantiated in the header (gate-verified):
+
+| cell | tier (solver) | wired in dispatch | launcher |
+|------|---------------|-------------------|----------|
+| (mamba3, adamw) | L3_FWD_BWD_OPT | yes (sm_90) | `mega_mamba3_adamw` |
+| (transformer_decoder, lion) | L3_FWD_BWD_OPT | yes (sm_90) | `mega_decoder_lion` |
+| (vit, supergrok15) | L1_OPT_ONLY* | yes (sm_90) | `mega_vit_supergrok15` |
+
+`fused_step` detects the arch, looks up `wired_fused_cell(model, optimizer,
+arch)`, and dispatches to the demo launcher for these cells; **every other cell
+throws a descriptive "no fused TU; use per-op path"** so the caller falls
+through to the (untouched) per-op dispatch — additive, no silent slow path. The
+gfx942 megakernel is a gate-verified `.hip.hpp` header pending a hipcc `.hip` TU
+on MI300X, so its cells are emittable but not yet routed (🟡).
+
+(*the demo instantiates `vit + supergrok15` at L3 to exercise the meta-gated
+tail structurally; the solver's tighter sm_90 register estimate falls that cell
+to L1 — the megakernel shape is identical, the difference is which stages
+co-reside, which the on-silicon `ptxas -v` report will confirm.)
+
+### Generator manifest (`grokking_optimizers/megakernel_codegen.py`)
+
+`--emit-all` reports the full 99-cell manifest (3 models × 11 optimizers × 3
+archs) with the solver tier per cell:
+
+```
+tier coverage: L1_OPT_ONLY=46, L3_FWD_BWD_OPT=53
+wired into fused_step: 3 cell(s) (real fused TU + dispatch route)
+```
+
+(matches `megakernel.coverage_summary()`: 53 L3 / 46 L1). `--emit <model>
+<optimizer> <arch>` emits one cell's source string by instantiating the demo
+template at the solver-chosen tier (raises on an infeasible cell, §1.11).
+`setup.py` globs `csrc/fused/sm_90/*.cu` and `csrc/fused/gfx942/*.hip` (guarded —
+the build works if the dirs are sparse).
+
+### Verification (this env)
+
+- `bash scripts/compile_to_object.sh csrc/fused/sm_90/megakernel_demo.cu` →
+  `COMPILE_OK` (nvcc sm_90a). A generated cell (`vit, adamw` via the
+  template-only guard) also `COMPILE_OK`.
+- `bash scripts/amdgcn_check.sh --header csrc/fused/megakernel_common_hip.hip.hpp`
+  → `AMDGCN_OK`; `--header csrc/fused/gfx942/megakernel_demo.hip.hpp` →
+  `AMDGCN_OK` (clang free-standing amdgcn; a generated gfx942 cell also
+  `AMDGCN_OK`).
+- `dispatch.cpp` host-compiles clean under WITH_CUDA, WITH_HIP, and the CPU
+  (no-backend) configs (`-fsyntax-only`).
+- `PYTHONPATH=. python grokking_optimizers/compile.py --self-test` →
+  `137 passed, 1 failed` (the 1 failure is the pre-existing sm_90 flag-baseline
+  regression test, untouched by this change — no new failure).
+- `ruff check grokking_optimizers/` → `All checks passed!`
+
+### Hardware checks (deferred — 🟡, no sm_90/MI300X silicon, no hipcc here)
+
+- **L3-vs-unfused latency:** the single persistent megakernel (fwd+bwd+opt) vs
+  the unfused per-op path for a wired cell — expect the L3 fusion to remove the
+  inter-kernel launch + global-memory round-trips between stages.
+- **Persistent-kernel occupancy / SM-pin verification:** confirm one resident
+  CTA per SM (Nsight `sm__warps_active` / `launch__occupancy_limit`), that
+  `%smid` pins the optimizer-state slice L2-warm, and that the hand-built grid
+  barrier neither deadlocks nor races at full grid (the sense-reversing
+  generation is the audited correctness point).
+- **Register report:** `ptxas -v` / `rocm-llvm` per-cell register counts confirm
+  the solver's L3/L2/L1 tier selection (the calibrated estimates in
+  `megakernel.py` are 🟡 until this report).
+
+| stage | cell | deferred check | command ref |
+|-------|------|----------------|-------------|
+| 6 | l3:mamba3+adamw:sm_90 | L3 fwd+bwd+opt single-launch latency vs unfused per-op | §Stage 6 fused_step |
+| 6 | persistent_megakernel_occupancy | 1 CTA/SM resident, %smid L2-warm pin, grid-barrier no-deadlock | §Stage 6 GridBarrier |
+| 6 | solver_tier_register_report | ptxas -v / rocm-llvm reg counts confirm L3/L2/L1 selection | §Stage 6 megakernel.py |
