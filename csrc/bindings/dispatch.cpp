@@ -139,17 +139,13 @@ struct PersistentContext {
  int n_tasks;
  unsigned n_ctas;
 };
-// Host launchers exported by megakernel_demo.cu for the wired cells.
-cudaError_t mega_mamba3_adamw(
- PersistentContext, float*, const float*, float*, float*, float*, float*,
- const int*, const int*, float, int, cudaStream_t);
-cudaError_t mega_decoder_lion(
- PersistentContext, float*, const float*, float*, float*, float*, float*,
- const int*, const int*, float, int, cudaStream_t);
-cudaError_t mega_vit_supergrok15(
- PersistentContext, float*, const float*, float*, float*, float*, float*,
- const int*, const int*, float, int, cudaStream_t);
 }} // namespace fused::sm90
+// Phase 3 Stage 5: all 33 sm_90 cells are real component compositions
+// (csrc/fused/sm_90/mega_<model>_<opt>.cu → fused_megakernel.cuh →
+// opt_components.cuh/model_stages.cuh). This generated table declares every
+// cell launcher and routes (model, optimizer) → the real symbol. It replaces
+// the 3 hard-coded demo routes (the toy megakernel_demo.cu was deleted).
+#include "csrc/fused/sm_90/fused_dispatch_table.inc"
 #endif
 
 namespace {
@@ -307,25 +303,22 @@ void fused_step(const std::string& model, const std::string& optimizer,
  reinterpret_cast<unsigned*>(g_generation.data_ptr<int>()),
  n, 0u};
 
- cudaError_t err = cudaSuccess;
- if (model == "mamba3" && optimizer == "adamw")
- err = fused::sm90::mega_mamba3_adamw(
- ctx, p, in, acts.data_ptr<float>(), gr, m, v,
- sizes.data_ptr<int>(), offsets.data_ptr<int>(), lr, /*step=*/1, 0);
- else if (model == "transformer_decoder" && optimizer == "lion")
- err = fused::sm90::mega_decoder_lion(
- ctx, p, in, acts.data_ptr<float>(), gr, m, v,
- sizes.data_ptr<int>(), offsets.data_ptr<int>(), lr, 1, 0);
- else if (model == "vit" && optimizer == "supergrok15")
- err = fused::sm90::mega_vit_supergrok15(
- ctx, p, in, acts.data_ptr<float>(), gr, m, v,
- sizes.data_ptr<int>(), offsets.data_ptr<int>(), lr, 1, 0);
+ // Route to the real composed cell launcher (all 33 sm_90 cells). `found`
+ // is set false only if no cell matches (then we fall through to the honest
+ // not-compiled signal below).
+ bool found = false;
+ cudaError_t err = fused::sm90::dispatch_sm90_cell(
+ model, optimizer, ctx, p, in, acts.data_ptr<float>(), gr, m, v,
+ sizes.data_ptr<int>(), offsets.data_ptr<int>(), lr, /*step=*/1,
+ /*stream=*/0, &found);
 
+ if (found) {
  if (err != cudaSuccess)
  throw std::runtime_error(
  std::string("fused megakernel launch failed for ") + cell + ": " +
  cudaGetErrorString(err));
  return;
+ }
  }
 #endif
 
