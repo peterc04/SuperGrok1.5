@@ -37,8 +37,18 @@ namespace wgs = ::sg::sm90::wgs;
 enum class FuseTier : int { L1 = 1, L3 = 3 };
 
 // Per-warp-group register targets for the producer/consumer split (§3.4).
+// On Hopper setmaxnreg is warp-group granular (128 threads / 4 warps). The
+// fused kernel launches 256 threads = TWO warp-groups so the split is well
+// formed: warp-group 0 is the PRODUCER (staging / queue / row-context loads,
+// few registers) and warp-group 1 is the CONSUMER (the heavy WGMMA-class
+// compute + optimizer tail). Partitioning lets the consumer claim a large
+// register file WITHOUT the producer's allocation counting against the L3
+// footprint, so no single warp-group needs the full fused register budget.
 static constexpr int kProducerRegsF = 32;
 static constexpr int kConsumerRegsF = 200;
+// Warp-group size on Hopper (threads). 256-thread block => 2 warp-groups.
+static constexpr int kWarpGroupThreads = 128;
+static constexpr int kFusedBlockThreads = 256;
 
 // =========================================================================
 //  Optimizer stage — the fused tail. Pulls tensors from the queue and applies
@@ -76,11 +86,20 @@ __device__ void fused_optimizer_stage(const PersistentContext& ctx,
 //  The L3/L1 persistent megakernel. ONE launch composes the real model stages
 //  (L3 only) and the real optimizer tail, separated by the hand-built grid
 //  barrier (§1.4) whose last arriver resets the task-queue counter race-free.
-//  Launch config (host): gridDim.x = #SMs, blockDim.x = 128 (warp 0 producer,
-//  1–3 consumer) so the §3.4 warp-group split is well-formed.
+//  Launch config (host): gridDim.x = #SMs, blockDim.x = 256 = TWO Hopper
+//  warp-groups (§3.4). Warp-group 0 (threads 0..127) is the producer and
+//  deallocs its register file down to kProducerRegsF; warp-group 1 (threads
+//  128..255) is the consumer and allocs up to kConsumerRegsF. setmaxnreg is
+//  warp-group-uniform, so the call is issued by all 128 lanes of each group.
+//
+//  Behavior-preserving: setmaxnreg only repartitions the SM register file
+//  between the two warp-groups; it does NOT change any computed value. All 256
+//  threads still execute the same grid-stride element-local stages (whose
+//  shared reduction / staging buffers are sized for 256), so __syncthreads is
+//  well-formed and the results are identical to the single-warp-group launch.
 // =========================================================================
 template <ModelId M, OptId Opt, FuseTier Tier>
-__global__ void __launch_bounds__(128)
+__global__ void __launch_bounds__(kFusedBlockThreads)
 fused_megakernel(PersistentContext ctx,
                  float* __restrict__ params,
                  const float* __restrict__ input,
@@ -90,6 +109,15 @@ fused_megakernel(PersistentContext ctx,
                  const int* __restrict__ offsets,
                  float lr, int step, FusedOptState st) {
     GridBarrier bar = ctx.barrier();
+
+    // §3.4 warp-group register repartition: producer WG (0) gives registers
+    // back; consumer WG (1) claims the large file. Uniform within each WG.
+    const int warp_group = threadIdx.x / kWarpGroupThreads;
+    if (warp_group == 0) {
+        wgs::warpgroup_reg_dealloc<kProducerRegsF>();
+    } else {
+        wgs::warpgroup_reg_alloc<kConsumerRegsF>();
+    }
 
     if constexpr (Tier == FuseTier::L3) {
         // ── Phase 1: real model forward ──────────────────────────────────
@@ -109,7 +137,7 @@ fused_megakernel(PersistentContext ctx,
 }
 
 // =========================================================================
-//  Host launcher — one persistent CTA per SM, 128 threads/CTA.
+//  Host launcher — one persistent CTA per SM, 256 threads/CTA (2 warp-groups).
 // =========================================================================
 template <ModelId M, OptId Opt, FuseTier Tier>
 cudaError_t launch_fused_megakernel(
@@ -124,7 +152,9 @@ cudaError_t launch_fused_megakernel(
     err = cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, dev);
     if (err != cudaSuccess) return err;
     ctx.n_ctas = (unsigned)n_sms;
-    dim3 grid((unsigned)n_sms), block(128);
+    // 256 threads = two Hopper warp-groups for the §3.4 producer/consumer
+    // register split (kProducerRegsF / kConsumerRegsF).
+    dim3 grid((unsigned)n_sms), block(kFusedBlockThreads);
     fused_megakernel<M, Opt, Tier><<<grid, block, 0, stream>>>(
         ctx, params, input, acts, grad, sizes, offsets, lr, step, st);
     return cudaGetLastError();

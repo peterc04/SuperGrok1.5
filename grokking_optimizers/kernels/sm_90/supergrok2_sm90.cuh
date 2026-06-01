@@ -309,11 +309,22 @@ __global__ void csa_indexer_topk_kernel(
     int N, int Nc, int rank, int topk
 ) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // SMEM-staged top-k scratch: the best_score[CSA_MAX_TOPK] /
+    // best_idx[CSA_MAX_TOPK] buffers were a 128-slot per-thread register array
+    // (the dominant register cost of this kernel and a guaranteed local-memory
+    // spill on real ptxas). Relocating them into this thread's private slice of
+    // dynamic shared is BIT-IDENTICAL: the insertion-sort reads/writes and the
+    // final sel_idx stores are unchanged in value and order. Layout:
+    // [blockDim.x * CSA_MAX_TOPK] floats then [blockDim.x * CSA_MAX_TOPK] ints.
+    extern __shared__ float topk_smem[];
+    float* best_score = topk_smem + threadIdx.x * CSA_MAX_TOPK;
+    int*   best_idx   = reinterpret_cast<int*>(
+                            topk_smem + blockDim.x * CSA_MAX_TOPK)
+                        + threadIdx.x * CSA_MAX_TOPK;
     if (t >= N) return;
 
     const int K = min(topk, CSA_MAX_TOPK);
-    float best_score[CSA_MAX_TOPK];
-    int   best_idx[CSA_MAX_TOPK];
     #pragma unroll
     for (int i = 0; i < CSA_MAX_TOPK; i++) { best_score[i] = -INFINITY; best_idx[i] = -1; }
 
@@ -395,7 +406,13 @@ __global__ void csa_attention_kernel(
 ) {
     const int gid = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = N * num_heads;
-    // §4.2 cp.async query staging buffer: [blockDim.x * head_dim] floats.
+    // §4.2 cp.async query staging buffer + SMEM-staged online-softmax
+    // accumulator. Layout: [blockDim.x * head_dim] query slots, then
+    // [blockDim.x * head_dim] accumulator slots. The accumulator was a
+    // CSA_MAX_D_MODEL (=64) per-thread register array that pinned register
+    // pressure (and spilled to local on real ptxas); moving it into this
+    // thread's private shared slot is BIT-IDENTICAL — the same float adds in
+    // the same order, only the storage class changes (register/local -> smem).
     extern __shared__ float csa_qsh[];
     if (gid >= total) return;
     const int t = gid / num_heads;
@@ -404,7 +421,7 @@ __global__ void csa_attention_kernel(
 
     const float scale = rsqrtf(static_cast<float>(head_dim));
 
-    float acc[CSA_MAX_D_MODEL];
+    float* acc = csa_qsh + (blockDim.x + threadIdx.x) * head_dim;  // private slot
     #pragma unroll
     for (int e = 0; e < head_dim; e++) acc[e] = 0.0f;
     float run_max = -INFINITY, run_denom = 0.0f;
@@ -477,7 +494,10 @@ __global__ void hca_attention_kernel(
 ) {
     const int gid = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = N * num_heads;
-    // §4.2 cp.async query staging buffer: [blockDim.x * head_dim] floats.
+    // §4.2 query staging buffer + SMEM-staged online-softmax accumulator (same
+    // layout/argument as csa_attention_kernel; bit-identical relocation of the
+    // CSA_MAX_D_MODEL per-thread acc[] register array into this thread's private
+    // shared slot).
     extern __shared__ float hca_qsh[];
     if (gid >= total) return;
     const int t = gid / num_heads;
@@ -486,7 +506,7 @@ __global__ void hca_attention_kernel(
 
     const float scale = rsqrtf(static_cast<float>(head_dim));
 
-    float acc[CSA_MAX_D_MODEL];
+    float* acc = hca_qsh + (blockDim.x + threadIdx.x) * head_dim;  // private slot
     #pragma unroll
     for (int e = 0; e < head_dim; e++) acc[e] = 0.0f;
     float run_max = -INFINITY, run_denom = 0.0f;
@@ -1204,7 +1224,15 @@ static torch::Tensor csa_context(
         torch::TensorOptions().dtype(torch::kInt32).device(x_sorted.device()));
     {
         const int grid = std::min<int>(65535, (N + block - 1) / block);
-        csa_hca::csa_indexer_topk_kernel<<<grid, block, 0, stream>>>(
+        // SMEM-staged top-k scratch: block * CSA_MAX_TOPK floats (best_score) +
+        // block * CSA_MAX_TOPK ints (best_idx). Opt into >48KB if needed.
+        const size_t topk_smem_bytes =
+            (size_t)block * (size_t)csa_hca::CSA_MAX_TOPK
+            * (sizeof(float) + sizeof(int));
+        csa_hca::set_attn_dyn_smem(
+            reinterpret_cast<const void*>(
+                &csa_hca::csa_indexer_topk_kernel), topk_smem_bytes);
+        csa_hca::csa_indexer_topk_kernel<<<grid, block, topk_smem_bytes, stream>>>(
             qI.data_ptr<float>(), kI.data_ptr<float>(), sel.data_ptr<int>(),
             N, Nc, indexer_rank, std::max(topk, 1));
     }
@@ -1213,9 +1241,11 @@ static torch::Tensor csa_context(
     {
         const int total = N * num_heads;
         const int grid = std::min<int>(65535, (total + block - 1) / block);
-        // §4.2 dynamic shared for cp.async query staging: block * head_dim.
+        // §4.2 dynamic shared: cp.async query staging (block * head_dim) +
+        // SMEM-staged online-softmax accumulator (block * head_dim). Doubled
+        // so the per-thread acc[] no longer occupies the register file.
         const size_t qsh_bytes =
-            sizeof(float) * (size_t)block * (size_t)head_dim;
+            2u * sizeof(float) * (size_t)block * (size_t)head_dim;
         csa_hca::set_attn_dyn_smem(
             reinterpret_cast<const void*>(
                 &csa_hca::csa_attention_kernel), qsh_bytes);
@@ -1258,9 +1288,10 @@ static torch::Tensor hca_context(
     {
         const int total = N * num_heads;
         const int grid = std::min<int>(65535, (total + block - 1) / block);
-        // §4.2 dynamic shared for cp.async query staging: block * head_dim.
+        // §4.2 dynamic shared: cp.async query staging (block * head_dim) +
+        // SMEM-staged online-softmax accumulator (block * head_dim).
         const size_t qsh_bytes =
-            sizeof(float) * (size_t)block * (size_t)head_dim;
+            2u * sizeof(float) * (size_t)block * (size_t)head_dim;
         csa_hca::set_attn_dyn_smem(
             reinterpret_cast<const void*>(
                 &csa_hca::hca_attention_kernel), qsh_bytes);

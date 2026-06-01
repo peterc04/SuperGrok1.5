@@ -16,6 +16,16 @@ Hardware-deferred: the *measured* register counts come from `ptxas
 -v`/`rocm-llvm` on real silicon; here the solver uses calibrated per-component
 estimates (recorded in HARDWARE_VALIDATION.md), so the tier selection is
 🟡 until the on-device register report confirms it.
+
+🟡 WORKSTREAM-1 CAVEAT (register-pressure reduction): the component costs below
+were LOWERED to reflect behavior-preserving SMEM-staging / rematerialization /
+live-range-shortening in the kernels (model_stages.cuh, supergrok2_sm90.cuh)
+and the Hopper setmaxnreg producer/consumer warp-group split
+(fused_megakernel.cuh). The resulting L1→L3/L2 tier promotions are ESTIMATES.
+ptxas register allocation does NOT match this additive model — it may keep a
+staged value live anyway, or free a slot we assumed live. The compile.py
+per-cell `maxrregcount` sweep (knob #1) plus on-silicon `ptxas -v` are the
+real arbiters; treat every tier change here as 🟡 until silicon confirms it.
 """
 
 from __future__ import annotations
@@ -73,9 +83,15 @@ _MODEL_FWD: Dict[str, ComponentCost] = {
 }
 _MODEL_BWD: Dict[str, ComponentCost] = {
     # Backward roughly tracks forward + the saved-activation adjoints.
-    "transformer_decoder": ComponentCost("decoder_bwd", regs=200, smem=65536),
-    "vit":                 ComponentCost("vit_bwd",     regs=200, smem=65536),
-    "mamba3":              ComponentCost("mamba3_bwd",  regs=208, smem=49152),
+    # WORKSTREAM 1 (#2/#3/#4): model_backward_stage now STAGES the upstream
+    # adjoint slab into shared memory (up_stage[256], +1KB smem) and
+    # rematerializes x at point-of-use, and model_activation_grad was
+    # live-range-shortened so u/t/du no longer co-reside. That pulls the
+    # per-thread live-register working set down from the saved-adjoint estimate.
+    # 🟡 estimate — ptxas refines on silicon.
+    "transformer_decoder": ComponentCost("decoder_bwd", regs=168, smem=66560),
+    "vit":                 ComponentCost("vit_bwd",     regs=168, smem=66560),
+    "mamba3":              ComponentCost("mamba3_bwd",  regs=176, smem=50176),
 }
 # Optimizer-step register/ smem cost (the fused tail). Elementwise optimizers
 # are cheap; the meta-net optimizers (sg11/15/2) carry a small MLP / attention.
@@ -91,7 +107,14 @@ _OPT_COST: Dict[str, ComponentCost] = {
     "supergrok11": ComponentCost("sg11_opt",        regs=88, smem=4096),
     "supergrok15": ComponentCost("sg15_opt",        regs=88, smem=4096),
     # SG2's CSA/HCA + PEER meta-net is the heaviest optimizer tail by far.
-    "supergrok2":  ComponentCost("sg2_opt",         regs=168, smem=32768),
+    # WORKSTREAM 1 (#2): the CSA/HCA online-softmax accumulator acc[64] and the
+    # indexer top-k scratch best_score[64]+best_idx[64] (the dominant per-thread
+    # register arrays, which spilled to local on real ptxas) are now staged into
+    # the attention kernels' dynamic shared buffer + a top-k smem scratch. That
+    # removes ~128 register slots of array state from the hot path; the smem
+    # rises (acc staging doubles the query buffer, top-k adds block*64*8 B), but
+    # smem is the near-empty resource. 🟡 estimate.
+    "supergrok2":  ComponentCost("sg2_opt",         regs=96, smem=49152),
 }
 
 
@@ -141,17 +164,37 @@ class FusionPlan:
         return self.tier > FusionTier.L0_UNFUSED
 
 
+# Hopper setmaxnreg producer-warp-group floor (kProducerRegsF in
+# fused_megakernel.cuh). The producer WG that runs the light staging + the
+# optimizer tail is bounded at this allocation; the heavy model stages run on
+# the consumer WG. See _tier_cost for how the §3.4 split changes the L3 peak.
+_PRODUCER_WG_REGS = 32
+
+
 def _tier_cost(model: str, optimizer: str,
                tier: FusionTier) -> Tuple[int, int]:
-    """Peak (regs, smem) for a given fusion tier. Fused stages share one
-    kernel, so register pressure is the MAX of the co-resident stages (they
-    don't all peak simultaneously, but we bound by the max + the optimizer
-    tail which is always live), and smem is the MAX tile resident at once."""
+    """Peak (regs, smem) for a given fusion tier.
+
+    WORKSTREAM 1 (#6): the L3 fused kernel now runs as TWO Hopper warp-groups
+    (setmaxnreg split, fused_megakernel.cuh). The heavy model forward/backward
+    stages run on the CONSUMER warp-group; the light producer staging + the
+    optimizer tail run on the PRODUCER warp-group. The SM register *ceiling* a
+    single warp-group must satisfy is therefore the MAX of the two warp-groups'
+    footprints, NOT the old sum (max(fwd,bwd) + opt). We bound the consumer WG
+    by max(fwd,bwd) and the producer WG by the optimizer tail (which subsumes
+    the producer floor), and take the max. smem is the MAX tile resident at
+    once (the staged adjoint / attention buffers are summed into the component
+    smem figures). 🟡 these are MODEL estimates — ptxas register allocation
+    differs; the per-cell maxrregcount sweep (compile.py knob #1) + on-silicon
+    `ptxas -v` are the source of truth.
+    """
     fwd = _MODEL_FWD[model]
     bwd = _MODEL_BWD[model]
     opt = _OPT_COST[optimizer]
     if tier == FusionTier.L3_FWD_BWD_OPT:
-        regs = max(fwd.regs, bwd.regs) + opt.regs
+        consumer_wg = max(fwd.regs, bwd.regs)          # heavy model stages
+        producer_wg = max(opt.regs, _PRODUCER_WG_REGS)  # tail + staging
+        regs = max(consumer_wg, producer_wg)            # §3.4 split: max, not sum
         smem = max(fwd.smem, bwd.smem, opt.smem)
     elif tier == FusionTier.L2_BWD_OPT:
         regs = bwd.regs + opt.regs
