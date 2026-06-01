@@ -6,7 +6,10 @@
 #include "csrc/common/types.h"
 #include "csrc/scan/affine2x2.h"
 #include "csrc/common/utils.cuh"
-#include "csrc/common/ptx_intrinsics.cuh"
+// §3.0: csrc/common/ptx_intrinsics.cuh removed — all 5 of its hand-PTX
+// transcendentals (affine_combine_ptx / softplus_ptx / fast_exp_ptx /
+// stochastic_round_ptx / gru_gates_ptx) were dead (0 call sites) and merely
+// re-derived what --use_fast_math already emits. See scripts/STAGE3_PTX_AUDIT.md.
 
 // CUDA sm_90 (Hopper) primitives — shared across all 11 launch_*.cu files.
 //

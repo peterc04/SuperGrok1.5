@@ -117,12 +117,8 @@ __device__ __forceinline__ float ptx_exp2(float x) {
     return r;
 }
 
-// Fast log2 via PTX lg2.approx.f32.
-__device__ __forceinline__ float ptx_log2(float x) {
-    float r;
-    asm("lg2.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
-    return r;
-}
+// §3.0: ptx_log2 removed (dead, 0 call sites; --use_fast_math lowers logf to
+// lg2.approx). See scripts/STAGE3_PTX_AUDIT.md.
 
 // Fast exp via exp2: exp(x) = exp2(x * log2(e))
 __device__ __forceinline__ float ptx_expf(float x) {
@@ -143,45 +139,9 @@ __device__ __forceinline__ float ptx_sigmoidf(float x) {
     return 1.0f / (1.0f + en);
 }
 
-// Blelloch affine_combine using pure PTX FMA instructions.
-// Composes two Affine2x2 transforms: result = left ∘ right
-// M_out = M_left * M_right, b_out = M_left * b_right + b_left
-// This is the inner loop of the parallel prefix scan (called O(log N) times).
-__device__ __forceinline__ Affine2x2 ptx_affine_combine(
-    const Affine2x2& left, const Affine2x2& right
-) {
-    Affine2x2 out;
-    // M_out = M_left * M_right (2x2 matrix multiply via 8 FMAs)
-    out.m00 = ptx_fma(left.m00, right.m00, left.m01 * right.m10);
-    out.m01 = ptx_fma(left.m00, right.m01, left.m01 * right.m11);
-    out.m10 = ptx_fma(left.m10, right.m00, left.m11 * right.m10);
-    out.m11 = ptx_fma(left.m10, right.m01, left.m11 * right.m11);
-    // b_out = M_left * b_right + b_left
-    out.b0 = ptx_fma(left.m00, right.b0, ptx_fma(left.m01, right.b1, left.b0));
-    out.b1 = ptx_fma(left.m10, right.b0, ptx_fma(left.m11, right.b1, left.b1));
-    return out;
-}
-
-// Expert MLP forward pass — single expert, ReLU activation.
-// Inlined PTX FMA for the inner products.
-// expert_hidden is typically 8-16, so fully unrollable at compile time.
-template <int EXPERT_HIDDEN>
-__device__ __forceinline__ float ptx_expert_mlp_forward(
-    const float* __restrict__ W1,   // [expert_hidden]
-    const float* __restrict__ b1,   // [expert_hidden]
-    const float* __restrict__ W2,   // [expert_hidden]
-    float b2,
-    float input
-) {
-    float result = b2;
-    #pragma unroll
-    for (int h = 0; h < EXPERT_HIDDEN; h++) {
-        float hidden = ptx_fma(W1[h], input, b1[h]);
-        hidden = fmaxf(hidden, 0.0f);  // ReLU
-        result = ptx_fma(W2[h], hidden, result);
-    }
-    return result;
-}
+// §3.0: ptx_affine_combine and ptx_expert_mlp_forward removed (dead, 0 call
+// sites). The live scan-compose primitive is affine_combine() in
+// csrc/scan/affine2x2.h (12-FMA ILP block, kept). See STAGE3_PTX_AUDIT.md.
 
 // Stochastic rounding with PTX prmt (permute bytes) for fast bit extraction.
 // Replaces the hash_prng shift+multiply chain with a single PTX instruction
@@ -220,12 +180,7 @@ __device__ __forceinline__ float ptx_fma(float a, float b, float c) { return fma
 __device__ __forceinline__ float ptx_expf(float x) { return expf(x); }
 __device__ __forceinline__ float ptx_tanhf(float x) { return tanhf(x); }
 __device__ __forceinline__ float ptx_sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
-
-__device__ __forceinline__ Affine2x2 ptx_affine_combine(
-    const Affine2x2& left, const Affine2x2& right
-) {
-    return affine_combine(left, right);  // Use types.h version
-}
+// §3.0: ptx_affine_combine HIP fallback removed with its CUDA twin (dead).
 #endif // GROK_HIP
 
 #endif // GROK_CUDA || GROK_HIP
