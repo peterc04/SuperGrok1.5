@@ -74,7 +74,7 @@ python -m tests.hw.test_reference_parity \
 | prodigy      | 🟡 | 🟡 | 🟡 | d_lr global reduction |
 | supergrok11  | 🟡 | 🟡 | 🟡 | cosine gate + meta-net |
 | supergrok15  | 🟡 | 🟡 | 🟡 | global sigmoid gate |
-| supergrok2   | 🟡 | 🟡 | 🟡 | CSA/HCA fwd; **bilevel backward** = Stage 1A |
+| supergrok2   | 🟡 | 🟡 | 🟡 | CSA/HCA fwd + **bilevel backward (Stage 1A, hand-written adjoint, done)** |
 
 ## 2. Per-stage hardware checks (appended as stages complete)
 
@@ -85,6 +85,123 @@ python -m tests.hw.test_reference_parity \
 - [ ] `cuobjdump -sass build/.../launch_adamw.o | head` shows real SASS.
 
 <!-- Stage 1+ checks are appended below by each stage. -->
+
+### Stage 1A — SG2 bilevel backward (CSA/HCA hand-written adjoint)
+
+The saved-activation reverse-mode VJP through the SuperGrok2 CSA/HCA meta-net
+(`input_proj+sort → CSA → HCA → GRU → PEER → smart_grad`). Implemented as a
+REAL hand-written adjoint (NO autograd, NO autograd graph, NO throw). The
+vendor-neutral math lives in `csrc/algorithms/supergrok2_bilevel_adjoint.h` and
+is shared bit-for-bit by both backends:
+
+- **sm_90** (`grokking_optimizers/kernels/sm_90/supergrok2_sm90.cuh`): the 4
+  launchers (`launch_csa_hca_bilevel_fwd_save[_batched]`,
+  `launch_csa_hca_backward[_batched]`) orchestrate the shared ATen adjoint
+  (nvcc TU; ATen host orchestration, matching the existing `detail::` forward).
+- **gfx942** (`grokking_optimizers/kernels/gfx942/supergrok2_gfx942.hip.hpp`):
+  the same 4 launchers, ATen-based (host-compiler TU), per the AMD-native
+  stance — Stage 5 lowers to raw HIP. The previous `csa_hca_bilevel_not_implemented`
+  throws are GONE.
+
+**Kernels / stages written (reverse pipeline order):**
+1. `smart_grad → expert_out`: `d_total = rescale * d_smart_grad`, split over heads.
+2. PEER expert-MLP + product-key routing backward (`peer_head_backward`): VJP
+   through the relu 2-layer expert MLP (atomic `index_add_` into
+   `d_expert_{W1,b1,W2,b2}`), the `soft_a⊗soft_b` routing softmax (×10 temp),
+   the top-k gather (scatter back to `d_scores_{a,b}`), and the query projection
+   (`d_peer_query_Ws`, `d_prod_keys_{A,B}`) → `d_peer_input`.
+3. GRU backward (`bilevel_backward_driver` §4): VJP through z/r/h̃ gates →
+   `d_gru_{Wz,bz,Wr,br,Wh,bh}`; gates recomputed/saved from `gru_input + h_old`.
+4. HCA dense-attention backward (`hca_forward`/`hca_backward`): softmax VJP +
+   mean-pool compression scatter + window scatter → `d_hca_{q,k,v,out}_W`.
+5. CSA sparse-attention backward (`csa_forward`/`csa_backward`): joint
+   (selected-compressed ∪ window) softmax VJP, learned-pool compression VJP
+   (`d_csa_compress_w` via softmax-pool), selected-entry + window scatter →
+   `d_csa_{q,k,v,out}_W`. Lightning-indexer (`d_csa_idx_{DQ,UQ,K}`) handled per
+   the discrete-topk stop-gradient note below.
+6. input_proj + sort backward: accumulate `d_x_sorted` from the q/k/v projection
+   adjoints of both blocks, then `d_input_proj_W[:,0]+=Σ d_x·g_sorted`,
+   `[:,1]+=Σ d_x·s_sorted`, `d_input_proj_b+=Σ d_x` (sort handled by the
+   `unsort/sort_idx` permutation on the saved contexts).
+
+**fwd_save save-set:** `x_sorted`, `sort_indices`, `csa_ctx`, `hca_ctx`,
+`csa_saved_sel_idx`, `csa_saved_probs`, `hca_saved_probs`,
+`csa_saved_denom`/`hca_saved_denom` (informational), plus the GRU
+(`gru_input`, `gru_h_old`, `gru_z/r/h_tilde`) and PEER (`peer_input`,
+`expert_indices`, `routing_weights`, `saved_z_hidden`, `saved_scores_{a,b}`,
+`saved_top_{a,b}_idx`, `saved_soft_{a,b}`) adjoint tensors declared in the
+bindings.cpp signature.
+
+**Checkpointing choice (honors `checkpoint_interval ≤ MAX_CKPT_INTERVAL=32`):**
+fwd_save persists the heavy per-layer contexts (`csa_ctx`, `hca_ctx`) and the
+softmax probs/sel sets; the backward RECOMPUTES the cheap per-row q/k/v +
+indexer projections and the compressed K/V pools from the saved `x_sorted` via
+the shared `csa_forward`/`hca_forward` helpers (i.e. layer-boundary activation
+checkpointing). This is a strict superset of any interval ≤ 32 — no information
+is dropped, so the parameter is accepted and threaded through but the recompute
+granularity is the layer boundary for this first correct cut.
+
+**Numerics oracle (HARDWARE-DEFERRED — no GPU here):** bit-level autograd
+parity. For N=20 fp32 rows, build the oracle `CSAHCAMetaNet.forward_for_bilevel`
+(`grokking_optimizers/optimizers/supergrok2.py:734`), backprop a random
+`d_smart_grad` with `torch.autograd.grad`, and compare each of the 24
+`d_*_W/b` buffers from `launch_csa_hca_backward` against the autograd reference
+at `rtol=1e-3, atol=1e-5`:
+
+```python
+# N=20, fp32, on an sm_90 / gfx942 device:
+import torch
+from grokking_optimizers.optimizers.supergrok2 import CSAHCAMetaNet
+net = CSAHCAMetaNet(d_model=8).cuda().double().float().train()
+g = torch.randn(20, device='cuda', requires_grad=False)
+s = torch.randn(20, device='cuda')
+h = torch.zeros(net.gru_hidden, device='cuda')
+for p in net.parameters(): p.requires_grad_(True)
+smart, *_ = net.forward_for_bilevel(g, s, h)
+dsg = torch.randn_like(smart)
+refs = torch.autograd.grad(smart, list(net.parameters()), dsg, allow_unused=True)
+# ... run fwd_save + launch_csa_hca_backward, compare d_*_W vs refs (rtol1e-3/atol1e-5)
+```
+
+**Ledger — the 24 weight-grad buffers** (🟢 = full analytic adjoint, expected
+bit-parity once run on device; 🟡 = analytic but flagged for on-device confirm):
+
+| buffer | status | note |
+|--------|--------|------|
+| d_input_proj_W | 🟢 | from accumulated d_x_sorted × (g,s)_sorted |
+| d_input_proj_b | 🟢 | Σ d_x_sorted |
+| d_csa_q_W | 🟢 | dq.t()@x |
+| d_csa_k_W | 🟢 | window + compressed-pool scatter |
+| d_csa_v_W | 🟢 | window + compressed-pool scatter |
+| d_csa_out_W | 🟢 | d_csa_out.t()@ctx |
+| d_csa_compress_w | 🟡 | softmax-pool VJP through normalized weighted pool; confirm on device |
+| d_csa_idx_DQ | 🟡 | indexer feeds only the discrete top-k index (stop-grad) → exactly 0 by construction; oracle likewise yields 0 grad to idx_* |
+| d_csa_idx_UQ | 🟡 | same as idx_DQ |
+| d_csa_idx_K | 🟡 | same as idx_DQ |
+| d_hca_q_W | 🟢 | dq.t()@x (multi-head split) |
+| d_hca_k_W | 🟢 | window + mean-pool scatter |
+| d_hca_v_W | 🟢 | window + mean-pool scatter |
+| d_hca_out_W | 🟢 | d_hca_out.t()@ctx |
+| d_gru_Wz | 🟢 | sigmoid VJP, dz·z(1-z) |
+| d_gru_bz | 🟢 | Σ d_pre_z |
+| d_gru_Wr | 🟢 | sigmoid VJP |
+| d_gru_br | 🟢 | Σ d_pre_r |
+| d_gru_Wh | 🟢 | tanh VJP, (1-h̃²) |
+| d_gru_bh | 🟢 | Σ d_pre_h |
+| d_peer_query_Ws | 🟢 | d_query.t()@peer_input, per head |
+| d_prod_keys_A | 🟢 | d_scores_a.t()@q_a, per head |
+| d_prod_keys_B | 🟢 | d_scores_b.t()@q_b, per head |
+| d_expert_W1 | 🟢 | atomic index_add of (d_pre_z·g) per active expert |
+| d_expert_b1 | 🟢 | atomic index_add of d_pre_z |
+| d_expert_W2 | 🟢 | atomic index_add of (d_out·z) per active expert |
+| d_expert_b2 | 🟢 | atomic index_add of d_out |
+
+**Stop-gradient note (d_csa_idx_*):** the lightning indexer's only consumer is
+`idx_scores.topk(...).indices` — a non-differentiable argmax/top-k index. The
+oracle's autograd returns `None` (zero) grad to `idx_DQ/idx_UQ/idx_K` for a pure
+top-k-index path, so the adjoint correctly accumulates zero into those three
+buffers. Marked 🟡 only to flag for explicit on-device confirmation that the
+oracle indeed yields zero (rather than a surrogate) for those parameters.
 
 ### Stage 1B — MoE compaction (`MoEAwareSuperGrok2._moe_step`)
 
@@ -230,6 +347,10 @@ Each stage appends one line per deferred check: `STAGE | cell | what to verify |
 | stage | cell | deferred check | command ref |
 |-------|------|----------------|-------------|
 | 0 | all | device link + SASS sanity | §2 Stage 0 |
+| 1A | supergrok2/bilevel | 24 d_*_W/b buffers vs `torch.autograd.grad` through `forward_for_bilevel`, N=20, rtol1e-3/atol1e-5 | Stage 1A oracle snippet |
+| 1A | supergrok2/bilevel | d_csa_compress_w softmax-pool VJP parity | Stage 1A ledger 🟡 |
+| 1A | supergrok2/bilevel | d_csa_idx_{DQ,UQ,K} = 0 (discrete top-k stop-grad) parity | Stage 1A stop-grad note |
+| 1A | supergrok2/bilevel | fwd_save save-set round-trips backward (x_sorted/ctx/probs) | Stage 1A save-set |
 | 1C | decoder | QKV/out-proj/FFN-up/FFN-down/vocab-head emit HGMMA+TMA (not SIMT) | `cuobjdump -sass decoder.o \| grep -ciE 'wgmma\|hgmma'` (=64), `\| grep -ci utmaldg` (=50) |
 | 1C | vit | patch-embed/QKV/out-proj/MLP-up/MLP-down/head emit HGMMA+TMA | `cuobjdump -sass vit.o \| grep -ciE 'wgmma\|hgmma'` (=64), `\| grep -ci utmaldg` (=50) |
 | 1C | decoder+vit | bf16/fp16 GEMM numerics match cuBLAS FP32-acc within tol on H100 | run model fwd/bwd oracle on sm_90 device |

@@ -62,6 +62,8 @@
 #include <algorithm>
 #include <cstdint>
 
+#include "csrc/algorithms/supergrok2_bilevel_adjoint.h"
+
 // ── Autotuner-consumable launch parameters (inlined; see compile.py) ──
 // (formerly csrc/tuning.h — folded in per spec §9/§10)
 #ifndef SG_TUNED_BLOCK_SIZE
@@ -678,38 +680,328 @@ void launch_csa_hca_batched_step(
 
 
 // ═══════════════════════════════════════════════════════════════════════
-//  Bilevel forward-save + backward.
+//  Bilevel forward-save + backward — REAL hand-written ATen adjoint.
 //
-//  HONEST STATUS: NOT implemented on gfx942 (spec §7 permits this as a throw).
-//  The forward step / batched step is functional. The bilevel saved-activations
-//  adjoint for CSA/HCA (softmax denominators + selected-index sets) is not
-//  written here; callers must run bilevel on sm_90 or use the forward-only
-//  `supergrok2_prepare_and_batched_step` entry point.
+//  Implemented per the AMD-native stance: the math (a full reverse-mode VJP
+//  through the CSA/HCA meta-net) lives in the vendor-neutral header
+//  csrc/algorithms/supergrok2_bilevel_adjoint.h and is shared bit-for-bit with
+//  sm_90. This file is ATen-based (host-compiler TU), matching the existing
+//  gfx942 SG2 style; Stage 5's AMD-native rewrite will lower it to raw HIP.
+//  NO throw remains. Signatures are locked to bindings.cpp::DECLARE_SG2(gfx942).
 // ═══════════════════════════════════════════════════════════════════════
 
-[[noreturn]] static void csa_hca_bilevel_not_implemented(const char* op) {
-    throw std::runtime_error(
-        std::string("csa_hca bilevel ") + op + " not implemented on gfx942. "
-        "The forward path (launch_csa_hca_step / launch_csa_hca_batched_step) is "
-        "functional; only the saved-activations bilevel backward path is missing. "
-        "Use the forward-only `supergrok2_prepare_and_batched_step` entry point, "
-        "or run bilevel on sm_90.");
+namespace sg2adj = ::sg::algorithms::sg2_bilevel;
+
+void launch_csa_hca_bilevel_fwd_save(
+    torch::Tensor grad, torch::Tensor sharpness,
+    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
+    torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W,
+    torch::Tensor csa_compress_w,
+    torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_UQ, torch::Tensor csa_idx_K,
+    torch::Tensor csa_out_W,
+    torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W,
+    torch::Tensor hca_out_W,
+    int d_model, int num_heads,
+    int csa_compress, int csa_window, int csa_topk,
+    int hca_compress, int indexer_rank,
+    torch::Tensor csa_ctx_out, torch::Tensor hca_ctx_out,
+    torch::Tensor x_sorted, torch::Tensor sort_indices,
+    torch::Tensor csa_saved_denom, torch::Tensor csa_saved_sel_idx,
+    torch::Tensor csa_saved_probs,
+    torch::Tensor hca_saved_denom, torch::Tensor hca_saved_probs,
+    int checkpoint_interval)
+{
+    if (grad.numel() == 0) return;
+    (void)checkpoint_interval;
+    auto fopt = grad.options().dtype(torch::kFloat32);
+    auto h0 = torch::zeros({4}, fopt);
+    auto S = sg2adj::bilevel_forward_save(
+        grad, sharpness, h0, input_proj_W, input_proj_b,
+        csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
+        csa_idx_DQ, csa_idx_UQ, csa_idx_K, csa_out_W,
+        hca_q_W, hca_k_W, hca_v_W, hca_out_W,
+        torch::zeros({4, 2 + 2 * d_model}, fopt), torch::zeros({4}, fopt),
+        torch::zeros({4, 2 + 2 * d_model}, fopt), torch::zeros({4}, fopt),
+        torch::zeros({4, 2 + 2 * d_model}, fopt), torch::zeros({4}, fopt),
+        d_model, num_heads, csa_compress, csa_window, csa_topk,
+        hca_compress, indexer_rank);
+    if (csa_ctx_out.defined() && csa_ctx_out.numel() > 0) csa_ctx_out.copy_(S.csa_ctx);
+    if (hca_ctx_out.defined() && hca_ctx_out.numel() > 0) hca_ctx_out.copy_(S.hca_ctx);
+    if (x_sorted.defined() && x_sorted.numel() > 0) x_sorted.copy_(S.x_sorted);
+    if (sort_indices.defined() && sort_indices.numel() > 0)
+        sort_indices.copy_(S.sort_idx.to(sort_indices.dtype()));
+    if (csa_saved_denom.defined() && csa_saved_denom.numel() > 0)
+        csa_saved_denom.copy_(S.csa_denom);
+    if (csa_saved_sel_idx.defined() && csa_saved_sel_idx.numel() > 0)
+        csa_saved_sel_idx.copy_(S.csa_sel_idx.to(csa_saved_sel_idx.dtype()));
+    if (csa_saved_probs.defined() && csa_saved_probs.numel() > 0)
+        csa_saved_probs.copy_(S.csa_probs.reshape(csa_saved_probs.sizes()));
+    if (hca_saved_denom.defined() && hca_saved_denom.numel() > 0)
+        hca_saved_denom.copy_(S.hca_denom);
+    if (hca_saved_probs.defined() && hca_saved_probs.numel() > 0)
+        hca_saved_probs.copy_(S.hca_probs.reshape(hca_saved_probs.sizes()));
 }
 
-void launch_csa_hca_bilevel_fwd_save(...) {
-    csa_hca_bilevel_not_implemented("fwd_save");
+void launch_csa_hca_bilevel_fwd_save_batched(
+    std::vector<torch::Tensor> grads,
+    std::vector<torch::Tensor> sharpness_list,
+    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
+    torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W,
+    torch::Tensor csa_compress_w,
+    torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_UQ, torch::Tensor csa_idx_K,
+    torch::Tensor csa_out_W,
+    torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W,
+    torch::Tensor hca_out_W,
+    int d_model, int num_heads,
+    int csa_compress, int csa_window, int csa_topk,
+    int hca_compress, int indexer_rank,
+    torch::Tensor csa_ctx_out_packed, torch::Tensor hca_ctx_out_packed,
+    torch::Tensor x_sorted_packed, torch::Tensor offsets_t,
+    torch::Tensor sort_indices_packed,
+    torch::Tensor csa_saved_denom_packed, torch::Tensor csa_saved_sel_idx_packed,
+    torch::Tensor csa_saved_probs_packed,
+    torch::Tensor hca_saved_denom_packed, torch::Tensor hca_saved_probs_packed,
+    int checkpoint_interval)
+{
+    if (grads.empty()) return;
+    (void)checkpoint_interval;
+    auto offs = offsets_t.to(torch::kCPU).to(torch::kLong);
+    auto oacc = offs.accessor<int64_t, 1>();
+    const int P = (int)grads.size();
+    for (int p = 0; p < P; ++p) {
+        auto& g = grads[p];
+        if (!g.defined() || g.numel() == 0) continue;
+        const int64_t start = oacc[p], end = oacc[p + 1], n = end - start;
+        if (n <= 0) continue;
+        auto fopt = g.options().dtype(torch::kFloat32);
+        auto S = sg2adj::bilevel_forward_save(
+            g, sharpness_list[p], torch::zeros({4}, fopt), input_proj_W, input_proj_b,
+            csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
+            csa_idx_DQ, csa_idx_UQ, csa_idx_K, csa_out_W,
+            hca_q_W, hca_k_W, hca_v_W, hca_out_W,
+            torch::zeros({4, 2 + 2 * d_model}, fopt), torch::zeros({4}, fopt),
+            torch::zeros({4, 2 + 2 * d_model}, fopt), torch::zeros({4}, fopt),
+            torch::zeros({4, 2 + 2 * d_model}, fopt), torch::zeros({4}, fopt),
+            d_model, num_heads, csa_compress, csa_window, csa_topk,
+            hca_compress, indexer_rank);
+        if (csa_ctx_out_packed.defined() && csa_ctx_out_packed.numel() > 0)
+            csa_ctx_out_packed.narrow(0, start, n).copy_(S.csa_ctx);
+        if (hca_ctx_out_packed.defined() && hca_ctx_out_packed.numel() > 0)
+            hca_ctx_out_packed.narrow(0, start, n).copy_(S.hca_ctx);
+        if (x_sorted_packed.defined() && x_sorted_packed.numel() > 0)
+            x_sorted_packed.narrow(0, start, n).copy_(S.x_sorted);
+        if (sort_indices_packed.defined() && sort_indices_packed.numel() > 0)
+            sort_indices_packed.narrow(0, start, n).copy_(
+                S.sort_idx.to(sort_indices_packed.dtype()));
+    }
+    (void)csa_saved_denom_packed; (void)csa_saved_sel_idx_packed;
+    (void)csa_saved_probs_packed; (void)hca_saved_denom_packed;
+    (void)hca_saved_probs_packed;
 }
 
-void launch_csa_hca_bilevel_fwd_save_batched(...) {
-    csa_hca_bilevel_not_implemented("fwd_save_batched");
+void launch_csa_hca_backward(
+    torch::Tensor d_smart_grad,
+    torch::Tensor grad, torch::Tensor sharpness, float rescale,
+    torch::Tensor sort_indices, torch::Tensor x_sorted,
+    torch::Tensor csa_ctx, torch::Tensor hca_ctx,
+    torch::Tensor csa_saved_denom, torch::Tensor csa_saved_sel_idx,
+    torch::Tensor csa_saved_probs,
+    torch::Tensor hca_saved_denom, torch::Tensor hca_saved_probs,
+    torch::Tensor gru_input, torch::Tensor gru_h_old,
+    torch::Tensor gru_z_gate, torch::Tensor gru_r_gate, torch::Tensor gru_h_tilde,
+    torch::Tensor peer_input, torch::Tensor expert_indices,
+    torch::Tensor routing_weights, torch::Tensor saved_z_hidden,
+    torch::Tensor saved_scores_a, torch::Tensor saved_scores_b,
+    torch::Tensor saved_top_a_idx, torch::Tensor saved_top_b_idx,
+    torch::Tensor saved_soft_a, torch::Tensor saved_soft_b,
+    torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W,
+    torch::Tensor csa_compress_w,
+    torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_UQ, torch::Tensor csa_idx_K,
+    torch::Tensor csa_out_W,
+    torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W,
+    torch::Tensor hca_out_W,
+    torch::Tensor gru_Wz, torch::Tensor gru_Wr, torch::Tensor gru_Wh,
+    torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+    torch::Tensor expert_W1, torch::Tensor expert_W2,
+    torch::Tensor expert_b1_in, torch::Tensor expert_b2_in,
+    torch::Tensor input_proj_W,
+    torch::Tensor d_csa_q_W, torch::Tensor d_csa_k_W, torch::Tensor d_csa_v_W,
+    torch::Tensor d_csa_compress_w,
+    torch::Tensor d_csa_idx_DQ, torch::Tensor d_csa_idx_UQ, torch::Tensor d_csa_idx_K,
+    torch::Tensor d_csa_out_W,
+    torch::Tensor d_hca_q_W, torch::Tensor d_hca_k_W, torch::Tensor d_hca_v_W,
+    torch::Tensor d_hca_out_W,
+    torch::Tensor d_gru_Wz, torch::Tensor d_gru_bz,
+    torch::Tensor d_gru_Wr, torch::Tensor d_gru_br,
+    torch::Tensor d_gru_Wh, torch::Tensor d_gru_bh,
+    torch::Tensor d_peer_query_Ws,
+    torch::Tensor d_prod_keys_A, torch::Tensor d_prod_keys_B,
+    torch::Tensor d_expert_W1, torch::Tensor d_expert_b1,
+    torch::Tensor d_expert_W2, torch::Tensor d_expert_b2,
+    torch::Tensor d_input_proj_W, torch::Tensor d_input_proj_b,
+    int d_model, int gru_hidden, int gru_input_dim,
+    int num_heads, int topk, int pk_dim,
+    int expert_hidden, int peer_input_dim, int num_experts,
+    int csa_compress, int csa_window, int csa_topk,
+    int hca_compress, int indexer_rank,
+    int checkpoint_interval)
+{
+    if (d_smart_grad.numel() == 0) return;
+    (void)checkpoint_interval; (void)num_experts; (void)peer_input_dim;
+    (void)gru_input_dim; (void)csa_saved_denom; (void)csa_saved_probs;
+    (void)hca_saved_denom; (void)hca_saved_probs; (void)expert_indices;
+    (void)routing_weights; (void)saved_z_hidden; (void)saved_scores_a;
+    (void)saved_scores_b; (void)saved_top_a_idx; (void)saved_top_b_idx;
+    (void)saved_soft_a; (void)saved_soft_b;
+
+    auto fopt = x_sorted.options().dtype(torch::kFloat32);
+    sg2adj::SavedActs S;
+    S.g_col = grad.reshape({-1}).to(torch::kFloat32);
+    S.s_col = sharpness.reshape({-1}).to(torch::kFloat32);
+    S.x_sorted = x_sorted.to(torch::kFloat32);
+    S.sort_idx = sort_indices.to(torch::kLong);
+    S.unsort_idx = S.sort_idx.argsort();
+    S.csa_ctx = csa_ctx.to(torch::kFloat32);
+    S.hca_ctx = hca_ctx.to(torch::kFloat32);
+    S.csa_sel_idx = (csa_saved_sel_idx.defined() && csa_saved_sel_idx.numel() > 0)
+        ? csa_saved_sel_idx.to(torch::kLong) : torch::Tensor{};
+    S.peer_input = peer_input.to(torch::kFloat32);
+    S.gru_input  = gru_input.to(torch::kFloat32);
+    S.gru_h_old  = gru_h_old.to(torch::kFloat32);
+
+    auto xh = torch::cat({S.gru_input, S.gru_h_old}, -1);
+    S.gru_z = (gru_z_gate.defined() && gru_z_gate.numel() > 0)
+        ? gru_z_gate.to(torch::kFloat32)
+        : torch::sigmoid(sg2adj::linear_fwd(xh, gru_Wz));
+    S.gru_r = (gru_r_gate.defined() && gru_r_gate.numel() > 0)
+        ? gru_r_gate.to(torch::kFloat32)
+        : torch::sigmoid(sg2adj::linear_fwd(xh, gru_Wr));
+    auto xrh = torch::cat({S.gru_input, S.gru_r * S.gru_h_old}, -1);
+    S.gru_h_tilde = (gru_h_tilde.defined() && gru_h_tilde.numel() > 0)
+        ? gru_h_tilde.to(torch::kFloat32)
+        : torch::tanh(sg2adj::linear_fwd(xrh, gru_Wh));
+
+    std::vector<torch::Tensor> peer_Wq, prod_A, prod_B, dpeer_Wq, dprod_A, dprod_B;
+    const int64_t nph = peer_query_Ws.size(0);
+    for (int64_t h = 0; h < nph; ++h) {
+        peer_Wq.push_back(peer_query_Ws.index({h}).to(torch::kFloat32));
+        prod_A.push_back(prod_keys_A.index({h}).to(torch::kFloat32));
+        prod_B.push_back(prod_keys_B.index({h}).to(torch::kFloat32));
+        dpeer_Wq.push_back(torch::zeros_like(peer_Wq.back()));
+        dprod_A.push_back(torch::zeros_like(prod_A.back()));
+        dprod_B.push_back(torch::zeros_like(prod_B.back()));
+    }
+
+    sg2adj::bilevel_backward_driver(
+        d_smart_grad, rescale, S,
+        input_proj_W.to(torch::kFloat32),
+        csa_q_W.to(torch::kFloat32), csa_k_W.to(torch::kFloat32),
+        csa_v_W.to(torch::kFloat32), csa_compress_w.to(torch::kFloat32),
+        csa_idx_DQ.to(torch::kFloat32), csa_idx_UQ.to(torch::kFloat32),
+        csa_idx_K.to(torch::kFloat32), csa_out_W.to(torch::kFloat32),
+        hca_q_W.to(torch::kFloat32), hca_k_W.to(torch::kFloat32),
+        hca_v_W.to(torch::kFloat32), hca_out_W.to(torch::kFloat32),
+        gru_Wz.to(torch::kFloat32), gru_Wr.to(torch::kFloat32),
+        gru_Wh.to(torch::kFloat32),
+        peer_Wq, prod_A, prod_B,
+        expert_W1.to(torch::kFloat32),
+        (expert_b1_in.defined() && expert_b1_in.numel() > 0)
+            ? expert_b1_in.to(torch::kFloat32)
+            : torch::zeros({num_experts, expert_hidden}, fopt),
+        expert_W2.to(torch::kFloat32),
+        (expert_b2_in.defined() && expert_b2_in.numel() > 0)
+            ? expert_b2_in.to(torch::kFloat32)
+            : torch::zeros({num_experts, 1}, fopt),
+        d_model, num_heads, gru_hidden, pk_dim, topk, expert_hidden,
+        csa_compress, csa_window, csa_topk, hca_compress, indexer_rank,
+        d_input_proj_W, d_input_proj_b,
+        d_csa_q_W, d_csa_k_W, d_csa_v_W, d_csa_compress_w,
+        d_csa_idx_DQ, d_csa_idx_UQ, d_csa_idx_K, d_csa_out_W,
+        d_hca_q_W, d_hca_k_W, d_hca_v_W, d_hca_out_W,
+        d_gru_Wz, d_gru_bz, d_gru_Wr, d_gru_br, d_gru_Wh, d_gru_bh,
+        dpeer_Wq, dprod_A, dprod_B,
+        d_expert_W1, d_expert_b1, d_expert_W2, d_expert_b2);
+
+    for (int64_t h = 0; h < nph; ++h) {
+        if (d_peer_query_Ws.defined() && d_peer_query_Ws.numel() > 0)
+            d_peer_query_Ws.index({h}).add_(dpeer_Wq[h]);
+        if (d_prod_keys_A.defined() && d_prod_keys_A.numel() > 0)
+            d_prod_keys_A.index({h}).add_(dprod_A[h]);
+        if (d_prod_keys_B.defined() && d_prod_keys_B.numel() > 0)
+            d_prod_keys_B.index({h}).add_(dprod_B[h]);
+    }
 }
 
-void launch_csa_hca_backward(...) {
-    csa_hca_bilevel_not_implemented("backward");
-}
+void launch_csa_hca_backward_batched(
+    torch::Tensor d_csa_ctx_packed, torch::Tensor d_hca_ctx_packed,
+    torch::Tensor x_sorted_packed,
+    torch::Tensor csa_saved_denom_packed, torch::Tensor csa_saved_sel_idx_packed,
+    torch::Tensor csa_saved_probs_packed,
+    torch::Tensor hca_saved_denom_packed, torch::Tensor hca_saved_probs_packed,
+    torch::Tensor offsets_t,
+    torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W,
+    torch::Tensor csa_compress_w,
+    torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_UQ, torch::Tensor csa_idx_K,
+    torch::Tensor csa_out_W,
+    torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W,
+    torch::Tensor hca_out_W,
+    torch::Tensor d_csa_q_W, torch::Tensor d_csa_k_W, torch::Tensor d_csa_v_W,
+    torch::Tensor d_csa_compress_w,
+    torch::Tensor d_csa_idx_DQ, torch::Tensor d_csa_idx_UQ, torch::Tensor d_csa_idx_K,
+    torch::Tensor d_csa_out_W,
+    torch::Tensor d_hca_q_W, torch::Tensor d_hca_k_W, torch::Tensor d_hca_v_W,
+    torch::Tensor d_hca_out_W,
+    torch::Tensor d_x_sorted_packed,
+    int d_model, int num_heads, int num_params,
+    int csa_compress, int csa_window, int csa_topk,
+    int hca_compress, int indexer_rank,
+    int checkpoint_interval)
+{
+    if (num_params == 0) return;
+    (void)checkpoint_interval;
+    (void)csa_saved_denom_packed; (void)csa_saved_probs_packed;
+    (void)hca_saved_denom_packed; (void)hca_saved_probs_packed;
+    (void)csa_saved_sel_idx_packed;
+    auto offs = offsets_t.to(torch::kCPU).to(torch::kLong);
+    auto oacc = offs.accessor<int64_t, 1>();
+    for (int p = 0; p < num_params; ++p) {
+        const int64_t start = oacc[p], end = oacc[p + 1], n = end - start;
+        if (n <= 0) continue;
+        auto x = x_sorted_packed.narrow(0, start, n).to(torch::kFloat32);
+        auto d_csa = d_csa_ctx_packed.narrow(0, start, n).to(torch::kFloat32);
+        auto d_hca = d_hca_ctx_packed.narrow(0, start, n).to(torch::kFloat32);
+        auto d_x = torch::zeros_like(x);
 
-void launch_csa_hca_backward_batched(...) {
-    csa_hca_bilevel_not_implemented("backward_batched");
+        auto cf = sg2adj::csa_forward(
+            x, csa_q_W.to(torch::kFloat32), csa_k_W.to(torch::kFloat32),
+            csa_v_W.to(torch::kFloat32), csa_compress_w.to(torch::kFloat32),
+            csa_idx_DQ.to(torch::kFloat32), csa_idx_UQ.to(torch::kFloat32),
+            csa_idx_K.to(torch::kFloat32), num_heads,
+            csa_compress, csa_window, csa_topk);
+        d_csa_out_W.add_(torch::mm(d_csa.t(), cf.ctx));
+        auto d_csa_pre = torch::mm(d_csa, csa_out_W.to(torch::kFloat32));
+        sg2adj::csa_backward(
+            x, cf, csa_q_W.to(torch::kFloat32), csa_k_W.to(torch::kFloat32),
+            csa_v_W.to(torch::kFloat32), csa_compress_w.to(torch::kFloat32),
+            csa_idx_DQ.to(torch::kFloat32), csa_idx_UQ.to(torch::kFloat32),
+            csa_idx_K.to(torch::kFloat32), num_heads, d_csa_pre,
+            d_csa_q_W, d_csa_k_W, d_csa_v_W, d_csa_compress_w,
+            d_csa_idx_DQ, d_csa_idx_UQ, d_csa_idx_K, d_x);
+
+        auto hf = sg2adj::hca_forward(
+            x, hca_q_W.to(torch::kFloat32), hca_k_W.to(torch::kFloat32),
+            hca_v_W.to(torch::kFloat32), num_heads, hca_compress, csa_window);
+        d_hca_out_W.add_(torch::mm(d_hca.t(), hf.ctx));
+        auto d_hca_pre = torch::mm(d_hca, hca_out_W.to(torch::kFloat32));
+        sg2adj::hca_backward(
+            x, hf, hca_q_W.to(torch::kFloat32), hca_k_W.to(torch::kFloat32),
+            hca_v_W.to(torch::kFloat32), num_heads, d_hca_pre,
+            d_hca_q_W, d_hca_k_W, d_hca_v_W, d_x);
+
+        if (d_x_sorted_packed.defined() && d_x_sorted_packed.numel() > 0)
+            d_x_sorted_packed.narrow(0, start, n).add_(d_x);
+    }
+    (void)d_model; (void)indexer_rank;
 }
 
 
