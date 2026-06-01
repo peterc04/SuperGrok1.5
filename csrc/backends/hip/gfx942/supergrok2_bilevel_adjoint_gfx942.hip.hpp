@@ -188,9 +188,21 @@ static inline void bilevel_backward_aten_fallback(
 //       st, q_bf16, cK_bf16, cV_bf16, attn_probs, d_ctx_bf16,
 //       /*out*/ d_q, d_cK, d_cV, N, Lc, scale);
 //
-// 🟡 DEFERRED: the live launch + hipcc link is MI300X-gated (no hipcc / no
-// device here). Until then SG2_ADJOINT_GFX942_LIVE==0 and the host launchers
-// delegate to bilevel_backward_aten_fallback() above (the proven oracle).
+// LIVE WIRING (done): the SG2 optimizer header
+// grokking_optimizers/kernels/gfx942/supergrok2_gfx942.hip.hpp now DISPATCHES
+// these §A kernels under `#if defined(__HIPCC__)` in launch_csa_hca_backward /
+// _batched — they are the live hipcc backward path (GRU-gate bwd → d_gru_W*/b*;
+// PEER bwd → d_expert_W1/W2 + d_prod_keys_A/B; attention-ctx bwd → d_q/d_cK/d_cV
+// tiles). The ATen oracle (bilevel_backward_aten_fallback / the driver) is the
+// CPU `#else` fallback AND supplies the documented host tail (scatter-to-token
+// grads + projection-weight reductions) on the device path.
+//
+// 🟡 HARDWARE-GATED: the hipLaunchKernelGGL glue is compiled only by hipcc
+// (absent here) and MI300X numeric parity vs the oracle is NOT yet validated;
+// the device kernels themselves are gfx942-compile-verified (amdgcn_check.sh).
+// SG2_ADJOINT_GFX942_LIVE remains a greppable selector for the adjoint header's
+// own host-pass documentation; the actual dispatch lives in the SG2 optimizer
+// header's __HIPCC__ blocks.
 
 }}} // namespace sg::gfx942::bilevel_adjoint
 #endif  // !defined(__AMDGCN__)  — end host pass (A)

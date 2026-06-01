@@ -67,8 +67,9 @@
 // ════════════════════════════════════════════════════════════════════════════
 // (A) HOST orchestration — ATen public entry points. Compiled by the HOST pass
 // only (torch/extension.h pulls in <cuda.h>/ATen, invisible to the bare device
-// gate). On a real hipcc build the host pass launches the §5 kernel via
-// hipLaunchKernelGGL (see §5.LAUNCH).
+// gate). Under hipcc (`#if __HIPCC__`) the host launcher now DISPATCHES the §5
+// kernel via hipLaunchKernelGGL (see §5.LAUNCH); the `#else` branch keeps the
+// ATen path as the CPU-host fallback.
 // ════════════════════════════════════════════════════════════════════════════
 #if !defined(__AMDGCN__)
 #include <torch/extension.h>
@@ -92,6 +93,18 @@ void launch_lion_step(
         auto& g = grads[i];
         auto& ea = exp_avgs[i];
 
+#if defined(__HIPCC__)
+        // LIVE device path: dispatch the §5 AMDGCN kernel per tensor (fuses the
+        // sign-momentum interp + decoupled-WD apply + momentum refresh into ONE
+        // launch vs the ATen broadcast chain). 🟡 hipcc-only — none in this env.
+        const int n = static_cast<int>(p.numel());
+        dim3 grid(min(1024, (n + 255) / 256)), block(256);  // 4 wavefronts/block
+        hipLaunchKernelGGL((native::lion_gfx942_kernel<float, float>), grid,
+                           block, 0, 0,
+                           p.data_ptr<float>(), ea.data_ptr<float>(),
+                           g.data_ptr<float>(),
+                           lr, beta1, beta2, wd, n);
+#else
         // Interpolation, sign, update
         auto interp = beta1 * ea + (1.0f - beta1) * g.to(ea.scalar_type());
         auto upd = interp.sign();
@@ -99,6 +112,7 @@ void launch_lion_step(
 
         // Momentum refresh
         ea.mul_(beta2).add_(g.to(ea.scalar_type()), 1.0f - beta2);
+#endif
     }
 }
 
@@ -120,17 +134,18 @@ void launch_multi_tensor_lion(
 
 }} // namespace sg::gfx942
 
-// ── §5.LAUNCH (host-side wiring note) ────────────────────────────────────────
-// On a real `.hip` (hipcc) build, launch_lion_step() launches the §5 kernel per
-// tensor instead of the chain of ATen broadcast ops (interp + sign + apply +
-// momentum refresh):
+// ── §5.LAUNCH (host-side wiring — NOW LIVE under hipcc) ──────────────────────
+// Under `#if defined(__HIPCC__)`, launch_lion_step() DISPATCHES the §5 kernel
+// per tensor (above) instead of the chain of ATen broadcast ops (interp + sign
+// + apply + momentum refresh):
 //   dim3 grid(min(1024,(n+255)/256)), block(256);   // 4 wavefronts/block
 //   hipLaunchKernelGGL((native::lion_gfx942_kernel<float,float>), grid, block,
-//                      0, stream, p_ptr, ea_ptr, g_ptr,
+//                      0, 0, p_ptr, ea_ptr, g_ptr,
 //                      lr, beta1, beta2, wd, n);
-// 🟡 DEFERRED: the live launch + hipcc link is MI300X-gated. This host TU keeps
-// the ATen path (numerics-correct); the §5 kernel is COMPILER-VERIFIED for
-// gfx942 via scripts/amdgcn_check.sh and ready to wire in on hardware.
+// The `#else` branch is the ATen CPU-host fallback (numerics-correct).
+// 🟡 The hipcc host-launch compiles ONLY under hipcc (no hipcc in this env, so
+// the hipLaunchKernelGGL glue is unverified here). The §5 device kernel itself
+// is COMPILER-VERIFIED for gfx942 via scripts/amdgcn_check.sh (AMDGCN_OK).
 #endif  // !defined(__AMDGCN__)  — end host orchestration (A)
 
 // ════════════════════════════════════════════════════════════════════════════
