@@ -1643,3 +1643,33 @@ the build works if the dirs are sparse).
 | 6 | l3:mamba3+adamw:sm_90 | L3 fwd+bwd+opt single-launch latency vs unfused per-op | §Stage 6 fused_step |
 | 6 | persistent_megakernel_occupancy | 1 CTA/SM resident, %smid L2-warm pin, grid-barrier no-deadlock | §Stage 6 GridBarrier |
 | 6 | solver_tier_register_report | ptxas -v / rocm-llvm reg counts confirm L3/L2/L1 selection | §Stage 6 megakernel.py |
+
+## Phase 2 additions (post-consolidation)
+
+### Stage P2-1: SG2 bilevel adjoint wired live
+- **What**: `bilevel_step()` now dispatches to the C++ hand-written VJP
+  (`supergrok2_bilevel_backward`) when the extension is built with bilevel
+  support. `forward_for_bilevel_cuda()` runs under `torch.no_grad()` saving
+  GRU gates (z/r/h\_tilde), peer\_input, x\_sorted, csa/hca\_ctx.
+- **Deferred**: Numerical parity of C++ VJP vs autograd on real hardware
+  (the Phase 1 Opus reviewer matched to fp32 precision in a transcribed-to-
+  Python oracle; the live wiring needs on-device validation).
+
+### Stage P2-2: 99 megakernel cells emitted
+- **What**: `megakernel_codegen.py --write-all` materializes 33 sm\_90 .cu +
+  33 gfx942 .hip + 33 tpu\_v5p .py stubs. `dispatch.cpp::wired_fused_cell`
+  expanded to route all 99. Solver: 53 L3 / 46 L1 / 0 infeasible.
+- **Deferred**: Compile-gate all 33 sm\_90 .cu via nvcc on H100, all 33
+  gfx942 .hip via hipcc on MI300X. Profile L3 latency vs unfused per-op.
+
+### Stage P2-4: TPU parity — pallas\_expert\_gather implemented
+- **What**: Real Pallas-tiled gather kernel replaces pure-JAX stub. All TPU
+  optimizer/model kernels now have JAX/Pallas implementations.
+- **Deferred**: Profile pallas\_expert\_gather on v5p, confirm gather < 5%
+  of step time (the implementation threshold from the original comment).
+
+| stage | cell | deferred check | command ref |
+|-------|------|----------------|-------------|
+| P2-1 | bilevel\_cuda\_vs\_autograd | C++ VJP matches autograd to rtol=1e-5 on H100/MI300X | §P2-1 bilevel\_step |
+| P2-2 | 99\_cell\_compile\_gate | nvcc/hipcc compile all 66 GPU cells | §P2-2 megakernel\_codegen |
+| P2-4 | pallas\_expert\_gather\_perf | gather < 5% of step on v5p | §P2-4 \_pallas\_kernels.py |
