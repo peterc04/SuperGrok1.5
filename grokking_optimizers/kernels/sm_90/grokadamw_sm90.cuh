@@ -36,6 +36,29 @@
 #endif
 #include "csrc/backends/cuda/sm_90/primitives.cuh"
 
+// ── inlined from former csrc/common/utils.cuh (Phase3 S0) ──
+#if GROK_CUDA
+#ifndef SG_INLINE_PTX_PTX_INT8_STOCHASTIC_ROUND
+#define SG_INLINE_PTX_PTX_INT8_STOCHASTIC_ROUND
+// Stochastic rounding with PTX prmt (permute bytes) for fast bit extraction.
+// Replaces the hash_prng shift+multiply chain with a single PTX instruction
+// for extracting the random threshold from the hash output.
+__device__ __forceinline__ int8_t ptx_int8_stochastic_round(
+    float val, float scale, unsigned rand_bits
+) {
+    float scaled = val / fmaxf(scale, 1e-12f);
+    float tr = truncf(scaled);
+    float frac = fabsf(scaled - tr);
+    // Extract lower 16 bits as threshold using prmt
+    unsigned lo16;
+    asm("prmt.b32 %0, %1, 0, 0x4140;" : "=r"(lo16) : "r"(rand_bits));
+    float threshold = (float)lo16 / 65536.0f;
+    if (frac > threshold) tr += (scaled > 0) ? 1.0f : -1.0f;
+    return (int8_t)fmaxf(-127.0f, fminf(127.0f, tr));
+}
+#endif  // SG_INLINE_PTX_PTX_INT8_STOCHASTIC_ROUND
+#endif  // GROK_CUDA
+
 namespace sg { namespace sm90 {
 
 namespace prim = ::sg::sm90::primitives;

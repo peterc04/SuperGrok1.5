@@ -82,83 +82,9 @@ __device__ __forceinline__ int8_t float_to_int8_stochastic(
     return (int8_t)fmaxf(-127.0f, fminf(127.0f, truncated));
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-//  Phase 3: Inline PTX for Hot Inner Loops
-//
-//  Hand-tuned PTX for critical paths in the SG2 fused_elem pipeline.
-//  These replace compiler-generated code in the highest-frequency loops.
-// ═══════════════════════════════════════════════════════════════════════
+// §Phase3-S0: PTX helpers (fast_rsqrt_nr/ptx_fma/ptx_exp2/ptx_expf/ptx_tanhf/ptx_sigmoidf/ptx_int8_stochastic_round) inlined into their owning component headers; drained here.
 
 #if GROK_CUDA
-
-// Fast reciprocal sqrt via PTX rsqrt.approx.f32 + Newton-Raphson refinement.
-// 2-3x faster than sqrtf(x) + fdividef for Adam denominator.
-__device__ __forceinline__ float fast_rsqrt_nr(float x) {
-    float r;
-    asm("rsqrt.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
-    // One Newton-Raphson iteration: r = r * (1.5 - 0.5 * x * r * r)
-    r = r * (1.5f - 0.5f * x * r * r);
-    return r;
-}
-
-// Fused multiply-add via PTX fma.rn.f32 — ensures single FMA instruction.
-// Critical for affine_combine inner loop (8 FMAs per composition).
-__device__ __forceinline__ float ptx_fma(float a, float b, float c) {
-    float r;
-    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c));
-    return r;
-}
-
-// Fast exp2 approximation via PTX ex2.approx.f32.
-// Used in Mamba scan: exp(A * dt) = exp2(A * dt / ln2).
-__device__ __forceinline__ float ptx_exp2(float x) {
-    float r;
-    asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
-    return r;
-}
-
-// §3.0: ptx_log2 removed (dead, 0 call sites; --use_fast_math lowers logf to
-// lg2.approx). See scripts/STAGE3_PTX_AUDIT.md.
-
-// Fast exp via exp2: exp(x) = exp2(x * log2(e))
-__device__ __forceinline__ float ptx_expf(float x) {
-    return ptx_exp2(x * 1.4426950408889634f);  // log2(e)
-}
-
-// Fast tanh approximation via exp2: tanh(x) = (e^2x - 1) / (e^2x + 1)
-// Used in GRU h_tilde computation.
-__device__ __forceinline__ float ptx_tanhf(float x) {
-    float e2x = ptx_exp2(2.0f * x * 1.4426950408889634f);
-    return (e2x - 1.0f) / (e2x + 1.0f);
-}
-
-// Fast sigmoid via exp2: sigmoid(x) = 1 / (1 + exp(-x))
-// Used in GRU z_gate and r_gate.
-__device__ __forceinline__ float ptx_sigmoidf(float x) {
-    float en = ptx_exp2(-x * 1.4426950408889634f);
-    return 1.0f / (1.0f + en);
-}
-
-// §3.0: ptx_affine_combine and ptx_expert_mlp_forward removed (dead, 0 call
-// sites). The live scan-compose primitive is affine_combine() in
-// csrc/scan/affine2x2.h (12-FMA ILP block, kept). See STAGE3_PTX_AUDIT.md.
-
-// Stochastic rounding with PTX prmt (permute bytes) for fast bit extraction.
-// Replaces the hash_prng shift+multiply chain with a single PTX instruction
-// for extracting the random threshold from the hash output.
-__device__ __forceinline__ int8_t ptx_int8_stochastic_round(
-    float val, float scale, unsigned rand_bits
-) {
-    float scaled = val / fmaxf(scale, 1e-12f);
-    float tr = truncf(scaled);
-    float frac = fabsf(scaled - tr);
-    // Extract lower 16 bits as threshold using prmt
-    unsigned lo16;
-    asm("prmt.b32 %0, %1, 0, 0x4140;" : "=r"(lo16) : "r"(rand_bits));
-    float threshold = (float)lo16 / 65536.0f;
-    if (frac > threshold) tr += (scaled > 0) ? 1.0f : -1.0f;
-    return (int8_t)fmaxf(-127.0f, fminf(127.0f, tr));
-}
 
 // §25.7 / §3.2 DSMEM cluster reduce — SAFE FALLBACK shim.
 //
@@ -182,15 +108,5 @@ __device__ __forceinline__ float cluster_dsmem_reduce_sum(float val) {
 }
 
 #endif // GROK_CUDA
-
-// HIP fallbacks — use standard math functions
-#if GROK_HIP
-__device__ __forceinline__ float fast_rsqrt_nr(float x) { return rsqrtf(x); }
-__device__ __forceinline__ float ptx_fma(float a, float b, float c) { return fmaf(a, b, c); }
-__device__ __forceinline__ float ptx_expf(float x) { return expf(x); }
-__device__ __forceinline__ float ptx_tanhf(float x) { return tanhf(x); }
-__device__ __forceinline__ float ptx_sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
-// §3.0: ptx_affine_combine HIP fallback removed with its CUDA twin (dead).
-#endif // GROK_HIP
 
 #endif // GROK_CUDA || GROK_HIP

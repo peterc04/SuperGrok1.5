@@ -73,6 +73,66 @@
 #include "csrc/backends/cuda/sm_90/mma.cuh"
 #endif
 
+// ── inlined from former csrc/common/utils.cuh (Phase3 S0) ──
+#if GROK_CUDA
+#ifndef SG_INLINE_PTX_FAST_RSQRT_NR
+#define SG_INLINE_PTX_FAST_RSQRT_NR
+// Fast reciprocal sqrt via PTX rsqrt.approx.f32 + Newton-Raphson refinement.
+// 2-3x faster than sqrtf(x) + fdividef for Adam denominator.
+__device__ __forceinline__ float fast_rsqrt_nr(float x) {
+    float r;
+    asm("rsqrt.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+    // One Newton-Raphson iteration: r = r * (1.5 - 0.5 * x * r * r)
+    r = r * (1.5f - 0.5f * x * r * r);
+    return r;
+}
+#endif  // SG_INLINE_PTX_FAST_RSQRT_NR
+
+#ifndef SG_INLINE_PTX_PTX_EXP2
+#define SG_INLINE_PTX_PTX_EXP2
+// Fast exp2 approximation via PTX ex2.approx.f32.
+// Used in Mamba scan: exp(A * dt) = exp2(A * dt / ln2).
+__device__ __forceinline__ float ptx_exp2(float x) {
+    float r;
+    asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+#endif  // SG_INLINE_PTX_PTX_EXP2
+
+#ifndef SG_INLINE_PTX_PTX_EXPF
+#define SG_INLINE_PTX_PTX_EXPF
+// Fast exp via exp2: exp(x) = exp2(x * log2(e))
+__device__ __forceinline__ float ptx_expf(float x) {
+    return ptx_exp2(x * 1.4426950408889634f);  // log2(e)
+}
+#endif  // SG_INLINE_PTX_PTX_EXPF
+
+#ifndef SG_INLINE_PTX_PTX_SIGMOIDF
+#define SG_INLINE_PTX_PTX_SIGMOIDF
+// Fast sigmoid via exp2: sigmoid(x) = 1 / (1 + exp(-x))
+// Used in GRU z_gate and r_gate.
+__device__ __forceinline__ float ptx_sigmoidf(float x) {
+    float en = ptx_exp2(-x * 1.4426950408889634f);
+    return 1.0f / (1.0f + en);
+}
+#endif  // SG_INLINE_PTX_PTX_SIGMOIDF
+#endif  // GROK_CUDA
+
+#if GROK_HIP
+#ifndef SG_INLINE_PTX_FAST_RSQRT_NR
+#define SG_INLINE_PTX_FAST_RSQRT_NR
+__device__ __forceinline__ float fast_rsqrt_nr(float x) { return rsqrtf(x); }
+#endif  // SG_INLINE_PTX_FAST_RSQRT_NR
+#ifndef SG_INLINE_PTX_PTX_EXPF
+#define SG_INLINE_PTX_PTX_EXPF
+__device__ __forceinline__ float ptx_expf(float x) { return expf(x); }
+#endif  // SG_INLINE_PTX_PTX_EXPF
+#ifndef SG_INLINE_PTX_PTX_SIGMOIDF
+#define SG_INLINE_PTX_PTX_SIGMOIDF
+__device__ __forceinline__ float ptx_sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
+#endif  // SG_INLINE_PTX_PTX_SIGMOIDF
+#endif  // GROK_HIP
+
 namespace sg { namespace sm90 { namespace models { namespace mamba {
 
 // ─────────────────────────────────────────────────────────────────────

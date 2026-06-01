@@ -2,26 +2,32 @@
 // Cell: (transformer_decoder, prodigy, sm_90)  tier=L1_OPT_ONLY
 //   regs=56/255  smem=2048/233472
 //   fell back to L1_OPT_ONLY; L3_FWD_BWD_OPT(regs 256>255); L2_BWD_OPT(regs 256>255)
-// NOTE: optimizer 'prodigy' has no dedicated demo tail; instantiated with the 'adamw' elementwise tail as a structural placeholder (production generator emits the exact tail).
-// This cell is ALREADY wired in the canonical demo TU (megakernel_demo.cu);
-// the generator would normally SKIP emitting it to disk. Shown here for
-// completeness — the launcher below is named distinctly to avoid a clash.
 //
-// Instantiates the ONE templated L3 persistent megakernel for this (model,
-// optimizer). SG_MEGAKERNEL_DEMO_TEMPLATE_ONLY pulls in JUST the template
-// machinery (scheduler/barrier substrate, SM-pinning, fused-optimizer tail —
-// all comdat-folded across TUs); this TU adds only its own unique launcher.
-#define SG_MEGAKERNEL_DEMO_TEMPLATE_ONLY
-#include "csrc/fused/sm_90/megakernel_demo.cu"
+// REAL component composition (Phase 3 Stage 5): composes the real optimizer
+// device-function component (csrc/algorithms/prodigy.h via
+// opt_components.cuh::apply_optimizer<OptId::Prodigy>) with the real model
+// stage component (model_stages.cuh::model_*_stage<ModelId::TransformerDecoder>) over the
+// shared persistent-megakernel substrate. Fuse tier L1 chosen by the solver.
+#include "csrc/fused/sm_90/fused_megakernel.cuh"
 
 namespace sg { namespace fused { namespace sm90 {
 
+// Uniform host entry (the symbol fused_step dispatches to). Builds the
+// FusedOptState from the Adam-family moment slices (m, v); optimizers needing
+// extra state (ema / sam_dir / s_track / mu / orth / smart_grad) have those
+// buffers supplied by the host orchestration layer (🟡 runtime-deferred — see
+// HARDWARE_VALIDATION.md). The composition + the apply math are real + compiled.
 cudaError_t mega_transformer_decoder_prodigy(
         PersistentContext ctx, float* params, const float* input, float* acts,
         float* grad, float* m, float* v, const int* sizes, const int* offsets,
         float lr, int step, cudaStream_t stream) {
-    return launch_l3_megakernel<Model::TransformerDecoder, Optimizer::AdamW>(
-        ctx, params, input, acts, grad, m, v, sizes, offsets, lr, step, stream);
+    FusedOptState st;
+    st.exp_avg = m;
+    st.exp_avg_sq = v;
+    st.lr = lr;
+    return launch_fused_megakernel<ModelId::TransformerDecoder, OptId::Prodigy,
+                                   FuseTier::L1>(
+        ctx, params, input, acts, grad, sizes, offsets, lr, step, st, stream);
 }
 
 }}}  // namespace sg::fused::sm90

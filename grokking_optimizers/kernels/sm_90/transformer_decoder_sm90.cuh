@@ -93,6 +93,54 @@
 #include "csrc/backends/cuda/sm_90/mma.cuh"
 #endif  // WITH_CUTLASS
 
+// ── inlined from former csrc/common/utils.cuh (Phase3 S0) ──
+#if GROK_CUDA
+#ifndef SG_INLINE_PTX_FAST_RSQRT_NR
+#define SG_INLINE_PTX_FAST_RSQRT_NR
+// Fast reciprocal sqrt via PTX rsqrt.approx.f32 + Newton-Raphson refinement.
+// 2-3x faster than sqrtf(x) + fdividef for Adam denominator.
+__device__ __forceinline__ float fast_rsqrt_nr(float x) {
+    float r;
+    asm("rsqrt.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+    // One Newton-Raphson iteration: r = r * (1.5 - 0.5 * x * r * r)
+    r = r * (1.5f - 0.5f * x * r * r);
+    return r;
+}
+#endif  // SG_INLINE_PTX_FAST_RSQRT_NR
+
+#ifndef SG_INLINE_PTX_PTX_EXP2
+#define SG_INLINE_PTX_PTX_EXP2
+// Fast exp2 approximation via PTX ex2.approx.f32.
+// Used in Mamba scan: exp(A * dt) = exp2(A * dt / ln2).
+__device__ __forceinline__ float ptx_exp2(float x) {
+    float r;
+    asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+#endif  // SG_INLINE_PTX_PTX_EXP2
+
+#ifndef SG_INLINE_PTX_PTX_TANHF
+#define SG_INLINE_PTX_PTX_TANHF
+// Fast tanh approximation via exp2: tanh(x) = (e^2x - 1) / (e^2x + 1)
+// Used in GRU h_tilde computation.
+__device__ __forceinline__ float ptx_tanhf(float x) {
+    float e2x = ptx_exp2(2.0f * x * 1.4426950408889634f);
+    return (e2x - 1.0f) / (e2x + 1.0f);
+}
+#endif  // SG_INLINE_PTX_PTX_TANHF
+#endif  // GROK_CUDA
+
+#if GROK_HIP
+#ifndef SG_INLINE_PTX_FAST_RSQRT_NR
+#define SG_INLINE_PTX_FAST_RSQRT_NR
+__device__ __forceinline__ float fast_rsqrt_nr(float x) { return rsqrtf(x); }
+#endif  // SG_INLINE_PTX_FAST_RSQRT_NR
+#ifndef SG_INLINE_PTX_PTX_TANHF
+#define SG_INLINE_PTX_PTX_TANHF
+__device__ __forceinline__ float ptx_tanhf(float x) { return tanhf(x); }
+#endif  // SG_INLINE_PTX_PTX_TANHF
+#endif  // GROK_HIP
+
 namespace sg { namespace sm90 { namespace models { namespace decoder {
 
 #ifdef WITH_CUTLASS
