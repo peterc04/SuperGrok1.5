@@ -8877,9 +8877,30 @@ def _probe_flag_support(compiler: str, flag: str, vendor: str,
             src_path = Path(td) / "probe.cu"
             src_path.write_text("extern \"C\" __global__ void k() {}\n")
             if vendor == "cuda":
-                out_path = Path(td) / "probe.ptx"
-                cmd = [compiler, *flag_tokens, "-ptx",
-                       "-o", str(out_path), str(src_path)]
+                # Default probe mode is ``-ptx`` (fast, no GPU). But a few
+                # legitimate COMPILE flags are incompatible with ``-ptx``
+                # output and must be probed in ``-c`` mode, or the probe
+                # yields a FALSE negative and silently strips a valid flag:
+                #   -dlto / -rdc=true → device-LTO emits LTO-IR, not PTX;
+                #     ``nvcc -ptx -dlto`` fatals "not compatible with -ptx",
+                #     yet ``nvcc -c -dlto -rdc=true`` is accepted and is the
+                #     real usage. (This was the flag_base_superset_regression.)
+                _ptx_incompatible = {"-dlto", "-rdc=true",
+                                     "--relocatable-device-code=true"}
+                if any(t in _ptx_incompatible for t in flag_tokens):
+                    out_path = Path(td) / "probe.o"
+                    # -dlto requires -rdc=true; pair them for the probe so a
+                    # lone -dlto token still probes in a valid configuration.
+                    extra = []
+                    if "-dlto" in flag_tokens and \
+                       "-rdc=true" not in flag_tokens:
+                        extra = ["-rdc=true"]
+                    cmd = [compiler, *flag_tokens, *extra, "-c",
+                           "-o", str(out_path), str(src_path)]
+                else:
+                    out_path = Path(td) / "probe.ptx"
+                    cmd = [compiler, *flag_tokens, "-ptx",
+                           "-o", str(out_path), str(src_path)]
             elif vendor == "hip":
                 out_path = Path(td) / "probe.o"
                 cmd = [compiler, *flag_tokens, "--cuda-host-only", "-c",
@@ -9388,12 +9409,6 @@ def _newer_compiler_flags(arch: str, report=None,
             _gate("-Xptxas --register-usage-level=10",
                   "12.3", fired,
                   f"gated CUDA>=12.3, have {ver_str}")
-            # NOTE: ``--device-link-options=-dlto`` is NOT emitted here. It
-            # is a *link-only* flag — nvcc -c rejects it during the per-TU
-            # compile step with "Unknown option" (exactly the Colab CUDA 12.0
-            # failure mode this audit fixes). It now lives in
-            # ``_device_ldflags(spec)`` for any downstream consumer that
-            # invokes ``nvcc -dlink`` directly.
             # CUDA 12.5+: --maxrregcount-list accepts a comma-separated set
             # of register caps and lets ptxas pick the best per-kernel,
             # finer-grained than the single-value --maxrregcount. The list
