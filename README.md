@@ -11,6 +11,62 @@ conditions.
 
 ---
 
+## Performance build status (Stages 0–7)
+
+The maximal-performance build is **complete** across Stages 0–7. The full
+per-stage record — scope, exact verification gate per item, PTX/CUTLASS
+parity, feasibility-solver coverage, and the complete deferred-to-hardware
+ledger — lives in **[`BUILD_REPORT.md`](BUILD_REPORT.md)**. The 🟡 → ✅
+promotion runbook (per-stage on-silicon checks) lives in
+**[`HARDWARE_VALIDATION.md`](HARDWARE_VALIDATION.md)**. This README
+**summarizes** those; read them for the authoritative detail.
+
+### Status legend (read this first)
+
+- 🟡 = **implemented + structurally / compile verified** on this CPU host
+  — `nvcc -c` to object (sm_90a cross-compile, no GPU), clang AMDGPU
+  device-compile (gfx942, no hipcc), or the Python `--self-test`. **NOT yet
+  hardware-validated.**
+- ✅ = **bit-level reference-checked + profiled** on real H100 / MI300X /
+  TPU v5p via `HARDWARE_VALIDATION.md`.
+
+> **Every performance cell in this repo is 🟡.** There is **no silicon in
+> this environment**, so nothing is ✅ yet. The architecture is built and
+> compile/structure-verified; runtime performance and on-device numerics are
+> deferred to `HARDWARE_VALIDATION.md`. The one item with stronger-than-compile
+> evidence is the **SG2 bilevel adjoint**, which was numerically validated in
+> Python against `torch.autograd.grad` (all 24 weight-grad buffers match to
+> fp32, max abs ≤ 6e-9) — still 🟡 pending the on-device rerun.
+
+### Stage × status table
+
+| Stage | Scope | Verified how (this host) | Status | Hardware-deferred |
+|-------|-------|--------------------------|:------:|-------------------|
+| **0** | Real-nvcc prereq: de-inline shared blocks into `#pragma once` headers; hoist CUTLASS includes (−22,365 / +2,267 LOC, pure de-dup) | `verify_stage0.sh` → 14/14 COMPILE_OK; Opus byte/semantic-identity review | 🟡 | `pip install -e .` device link + `cuobjdump -sass` sanity |
+| **1** | Close the **24 kernel stubs**: 1A SG2 CSA/HCA bilevel backward, 1B MoE compaction (9×2), 1C decoder/ViT tensor-core GEMMs (11) | `nvcc -c` + AMDGCN gate; **1A adjoint numerically validated vs autograd to fp32**; Opus-reviewed | 🟡 | 24-buffer adjoint bit-parity rerun; MoE numerics; wgmma/HMMA emission + GEMM parity |
+| **2** | **L2 persistence** for per-step optimizer state (`L2PersistScope` RAII, safe runtime API, all 11 launchers) | COMPILE_OK; numerics-invariant (pure cache hint); Opus-reviewed | 🟡 | `ncu` L2 hit-rate uplift |
+| **3** | **PTX maximization**: `redux.sync` int reductions, `cp.async` background loads, Hopper warp-spec primitives (`elect.sync`/`mbarrier`/`setmaxnreg`/`fence`), dead-PTX removal | COMPILE_OK; PTX-emission grep-confirmed; SASS-confirmed REDUX | 🟡 | `cuobjdump` REDUX + histogram parity; `ncu` async overlap; warp-spec occupancy |
+| **4** | **TMA descriptor/operator reuse** (shape+ptr-keyed host cache) + **DSMEM** cross-CTA cluster reductions (`mapa`/`barrier.cluster`) | COMPILE_OK; PTX-emission confirmed; Opus design-review | 🟡 | fewer `cuTensorMapEncode`/step; cluster/DSMEM metrics + reduction parity |
+| **5** | **Real AMD kernels**: all 11 optimizers + 3 models + SG2 AMD-native AMDGCN (MFMA / DPP / FP8-FNUZ / AGENT-atomics) | `amdgcn_check.sh` → **17/17 AMDGCN_OK** (caught the bf16x4 MFMA-operand bug) | 🟡 | MFMA/DPP numerics + `rocprof` utilization; live `hipLaunchKernelGGL` link |
+| **6** | **99 megakernels + feasibility solver**: per (model×opt×arch) tier pick (L3/L2/L1); task-queue scheduler, hand-built global barrier, SM-pinning; `fused_step` dispatch | COMPILE_OK + AMDGCN_OK on demo cells; solver run → coverage below | 🟡 | L3-vs-unfused latency; persistent-kernel SM-pin occupancy |
+| **7** | **Distributed**: 3D parallelism (DP×TP×PP) + ZeRO-3 + fused-kernel-as-optimizer adapter (DeepSpeed/Megatron) | import-safe; 1-rank no-op self-test; no launch needed | 🟡 | 3D+ZeRO-3 weak-scaling efficiency ≥70% to 32 GPUs |
+
+**Solver tier coverage (all 99 pipelines):** **53 L3** (fwd→bwd→opt fused) /
+**46 L1** (opt-only; register-pressure bound at L3/L2 on heavy meta-net / SAM
+optimizers) / **0 infeasible** (the §1.11 error path never triggers).
+
+### Headline gates (final)
+
+- **sm_90: 14/14 COMPILE_OK** (`scripts/verify_stage0.sh`, `nvcc -c` to object)
+- **gfx942: 17/17 AMDGCN_OK** (`scripts/amdgcn_check.sh`, clang AMDGPU device-compile)
+- **self-test: 138 passed / 0 failed** (was 137/1 — the last failure was a
+  flag-probe false-negative on `-dlto`, now fixed)
+- **ruff: clean repo-wide**
+- **Zero `not_implemented` / throwing stubs tree-wide** — all 24 Stage-1 stubs
+  are real implementations.
+
+---
+
 ## Quickstart: clone → install → compile → profile
 
 Four Python steps from a fresh machine to a profiled artifact. Everything
@@ -324,9 +380,9 @@ assert compile_main(["--self-test"]) == 0  # prints "[self-test] N passed, M fai
                                             # "What gets exercised" note below.
 ```
 
-The self-test (~138 checks today; currently 137 pass + 1 known pre-existing
-failure, `flag_base_superset_regression`, in the CUDA `-dlto` flag-gating path —
-unrelated to the kernel tree) covers a broad surface area:
+The self-test (138 checks today; **138 pass / 0 fail** — the former lone
+failure was a flag-probe false-negative in the CUDA `-dlto` flag-gating path,
+now fixed) covers a broad surface area:
 
 - **Always exercised** (no opt deps needed): ARCH_TABLE completeness for
   all 26 canonical archs; per-arch search-space cardinalities; the
@@ -509,10 +565,13 @@ branches anywhere in the file.
 > NVIDIA device → the `sm90` impl, any AMD device → the `gfx942` impl, with the
 > driver selecting the matching per-SM/-gfx code from the fat binary. So the
 > "mega kernels" run across the full arch picture, not just `sm_90`/`gfx942`.
-> What is *not* yet present is **arch-specialized kernel bodies** (e.g. Blackwell
-> `tcgen05`, Ampere async-copy variants) — those archs run the portable shared
-> source rather than hand-tuned-per-arch code. Override the default target set
-> with `TORCH_CUDA_ARCH_LIST`.
+> The two **canonical** targets now have **hand-written arch-specialized
+> kernel bodies**: sm_90 (real inline PTX + CUTLASS Sm90 TMA/WGMMA, warp-spec,
+> L2-persist, TMA-reuse, DSMEM) and gfx942 (AMD-native AMDGCN: MFMA / DPP /
+> FP8-FNUZ / AGENT-atomics, 17/17 AMDGCN_OK). What is *not* specialized is the
+> **other** NVIDIA CC / AMD gfx in the fat binary (e.g. Blackwell `tcgen05`,
+> Ampere async-copy variants) — those run the portable shared source. Override
+> the default target set with `TORCH_CUDA_ARCH_LIST`.
 
 ### Per-arch search space cardinalities
 
@@ -1112,10 +1171,12 @@ device code:
      collectives (TMA+WGMMA) for SG2/attention/mamba GEMMs. Composable: device
      functions stay `__forceinline__ __device__` so a future megakernel can call
      them directly.
-   - `gfx942/<name>_gfx942.hip.hpp` — the AMD path (ATen + rocBLAS; MFMA via
-     rocBLAS internally). Each carries an honest `AMDGCN-asm status: NOT PRESENT`
-     banner; a reference `__builtin_amdgcn_mfma_*` block is preserved
-     `#if 0`-guarded in `mamba3_gfx942.hip.hpp`.
+   - `gfx942/<name>_gfx942.hip.hpp` — the **AMD-native AMDGCN** path (Stage 5):
+     real MFMA (`__builtin_amdgcn_mfma_*`, 16×16×16 bf16), DPP wave reductions,
+     FP8-FNUZ, `buffer_load` streaming, and AGENT-scope atomics, two-pass per
+     header (`#if !__AMDGCN__` host ATen / `#if __AMDGCN__||__HIPCC__` device).
+     **17/17 pass `scripts/amdgcn_check.sh`** (clang AMDGPU device-compile).
+     See the [Stage × status table](#stage--status-table) and `BUILD_REPORT.md`.
    - `tpu/<name>_tpu.py` — the Pallas/JAX arch-reference spec.
 
 3. **Backends — `csrc/backends/<vendor>/<arch>/`** (thin glue). After the
@@ -1132,21 +1193,35 @@ device code:
 The boundary that makes this safe: the move from backend TU to header was
 verified **byte-for-byte** via a preprocessor-equivalence gate (`nvcc -E`,
 modulo `__FILE__`/`__LINE__`) — the migrated translation units preprocess
-identically to their originals. This layering is also what sets up (but does
-**not** yet implement) the future persistent fused megakernel: it would compose
-the `__forceinline__ __device__` functions from layer 2 + the math from layer 1
-into one resident kernel with an on-device scheduler (roadmap item 1).
+identically to their originals. This layering is what the **Stage 6 persistent
+fused megakernel** builds on: it composes the `__forceinline__ __device__`
+functions from layer 2 + the math from layer 1 into one resident kernel with an
+on-device task-queue scheduler, hand-built global barrier, and SM-pinning. See
+[Stage 6](#stage--status-table) — the feasibility solver picks an L3/L2/L1
+fusion tier per (model×opt×arch) across all 99 pipelines (coverage **53 L3 / 46
+L1 / 0 infeasible**); `csrc/fused/{sm_90,gfx942}/` holds the megakernel infra
+and three demo L3 cells (COMPILE_OK + AMDGCN_OK), and `fused_step` dispatch
+routes to a fused TU when present.
 
 ## Build status
 
-Per-arch coverage of the 12 optimizers and 3 models. Honest legend:
+Per-arch coverage of the 12 optimizers and 3 models. This summarizes the
+[Stage × status table](#stage--status-table) at a per-cell granularity; see
+`BUILD_REPORT.md` for the authoritative per-stage record. Honest legend (same
+as the top of this README):
 
-- ✅ **done & validated on hardware** — implemented, build-checked, parity
-  confirmed against a reference path
-- 🟡 **done, unvalidated on hardware** — implemented and import-checked, but
-  not yet validated on real hardware (no GPU available in this environment)
-- ⛔ **stub / raises NotImplementedError** — explicitly unimplemented; the
-  launcher raises a runtime error with a descriptive message
+- 🟡 **implemented + compile/structure-verified on this CPU host** — `nvcc -c`
+  to object (sm_90, 14/14 COMPILE_OK), clang AMDGPU device-compile (gfx942,
+  17/17 AMDGCN_OK), or the Python `--self-test` (138/0). **NOT yet
+  hardware-validated** (no silicon in this environment).
+- ✅ **bit-level reference-checked + profiled** on real H100 / MI300X / TPU v5p
+  via `HARDWARE_VALIDATION.md`. **Nothing is ✅ yet.**
+
+Every cell below is **🟡**. There are **zero `not_implemented` / throwing
+stubs tree-wide** — all 24 Stage-1 stubs are real implementations, including the
+SG2 CSA/HCA bilevel backward (which was additionally numerically validated in
+Python vs `torch.autograd.grad`, all 24 weight-grad buffers to fp32, max abs
+≤ 6e-9).
 
 ### Optimizer × arch matrix
 
@@ -1173,24 +1248,19 @@ Per-arch coverage of the 12 optimizers and 3 models. Honest legend:
 | ViT      | 🟡 | 🟡 | 🟡 |
 | Mamba    | 🟡 | 🟡 | 🟡 |
 
-**SuperGrok v2 on gfx942 is 🟡 (functional, perf not verified).** The launcher
-(`csrc/backends/hip/gfx942/launch_supergrok2.hip.cpp`) implements the full
-CSA/HCA attention + GRU + PEER pipeline via ATen tensor ops. Projection /
-QKV / compression GEMMs go through rocBLAS (which dispatches to MFMA
-`v_mfma_f32_16x16x16_bf16` internally for BF16/FP16 at sizes ≥ 16), so the
-dense-linear-algebra portion does exercise the MFMA pipeline. The CSA
-top-k selection (`unfold` + weighted pool + `topk` + softmax) and HCA dense
-attention (mean pool + softmax) run as ATen ops — correct but not warp-fused
-like the Hopper path. The bilevel backward path is not yet implemented on
-gfx942 and will raise; only the forward `supergrok2_prepare_and_batched_step`
-path is functional. Promotion to ✅ requires elementwise allclose validation against
-the sm_90 path on an MI300X.
+**SuperGrok v2 on gfx942 is 🟡 (AMD-native, structurally verified).** As of
+Stage 5 the SG2 gfx942 path is **AMD-native AMDGCN**: the CSA/HCA mixer runs on
+real 16×16×16 bf16 MFMA + DPP softmax, with PEER on-device; only the bilevel
+adjoint and MoE compaction stay ATen (the same split as on the Hopper side for
+those two pieces). The SG2 header is part of the **17/17 AMDGCN_OK** clang
+device-compile gate. The bilevel backward is **implemented and live** on both
+sm_90 and gfx942 — it no longer raises. Promotion to ✅ requires MFMA/DPP
+numerics + `rocprof` utilization on an MI300X (see `HARDWARE_VALIDATION.md`).
 
-Everything marked 🟡 is implemented end-to-end in the refactored tree but has
-not been run on real hardware in this environment. The "Action items for
-hardware validation" section near the end of this README documents the smoke
-tests that must run on a real H100, MI300X, or TPU v5p before any cell can be
-promoted to ✅.
+Everything marked 🟡 is implemented end-to-end and compile/structure-verified on
+this host but has not been *run* on real hardware in this environment. The
+per-stage on-silicon checks that promote any cell 🟡 → ✅ live in
+**`HARDWARE_VALIDATION.md`**.
 
 ### Kernel header status (single tree)
 
@@ -1203,7 +1273,7 @@ the vendor-neutral `csrc/algorithms/<opt>.h` that each header includes. The
 `csrc/backends/cuda/sm_90/launch_<opt>.cu` files are now **thin TUs** (a single
 `#include` of the header) that exist only so the build glob has a compilation
 unit; the gfx942 `.hip.cpp` files are likewise thin and `#include` their
-`<opt>_gfx942.hip.hpp` headers (ATen + rocBLAS — see the per-arch asm note below).
+`<opt>_gfx942.hip.hpp` headers (AMD-native AMDGCN — see the per-arch asm note below).
 
 | Optimizer | sm_90 `.cuh` | gfx942 `.hip.hpp` | sm_90 PTX blocks | State tensors |
 |-----------|:---:|:---:|:---:|:---:|
@@ -1227,15 +1297,16 @@ unit; the gfx942 `.hip.cpp` files are likewise thin and `#include` their
   `CollectiveBuilder<arch::Sm90, OpClassTensorOp, …>` when `-DWITH_CUTLASS` is
   set (6 collectives in SG2, 4 in `attention_sm90.cuh`, 7 in `mamba3_sm90.cuh`);
   without it they fall back to cuBLAS via `torch::mm`.
-- **gfx942 (`*_gfx942.hip.hpp`)** — **ATen + rocBLAS**. rocBLAS dispatches MFMA
-  (`v_mfma_f32_16x16x16_bf16`) internally for BF16/FP16 GEMMs ≥ 16, so the dense
-  linear algebra does hit the matrix cores, but there is **no hand-written
-  `__global__` or inline AMDGCN asm** on this path — these `.hip.cpp` TUs route
-  through the host compiler (g++/clang++), not hipcc. Native AMDGCN asm requires
-  migrating `.hip.cpp` → `.hip` (hipcc-routed); **roadmap item 2**. A reference
-  MFMA implementation (`__builtin_amdgcn_mfma_*`) is preserved `#if 0`-guarded in
-  `mamba3_gfx942.hip.hpp` as the template for that migration. Each header carries
-  an `AMDGCN-asm status: NOT PRESENT` banner so this is never overstated.
+- **gfx942 (`*_gfx942.hip.hpp`)** — **AMD-native AMDGCN** (Stage 5). All 11
+  optimizers + 3 models + SG2 carry real device kernels: `__builtin_amdgcn_mfma_*`
+  (16×16×16 bf16), DPP wave→block→AGENT-atomic reductions, FP8-FNUZ, `buffer_load`
+  streaming loads, and `sched_group_barrier`. Each header is two-pass
+  (`#if !__AMDGCN__` host ATen for portability / `#if __AMDGCN__||__HIPCC__`
+  device), activating on a real hipcc build with no rename. The whole tree passes
+  `scripts/amdgcn_check.sh` (clang 18 AMDGPU backend, no hipcc/ROCm needed) at
+  **17/17 AMDGCN_OK** — a gate that caught real bugs (notably bf16x4, not u32x4,
+  MFMA operands). Live `hipLaunchKernelGGL` link + numerics are deferred to
+  MI300X (`HARDWARE_VALIDATION.md`).
 - **tpu_v5p (`*_tpu.py`)** — **Pallas / XLA**, `BlockSpec`-tiled; no inline-asm
   concept. These files are the arch-reference spec; the executed Pallas path is
   `csrc/backends/pallas/launch_<opt>.py` (+ `_pallas_kernels.py`).
@@ -1248,14 +1319,16 @@ unit; the gfx942 `.hip.cpp` files are likewise thin and `#include` their
 | (shared `attention`)| 🟡 | 🟡 | — | 5 | 4 |
 
 **Status legend (crisp boundary):**
-- 🟡 = implemented **including real PTX / CUTLASS collectives**, and
-  build-structure self-tested (the inline `--self-test` suite passes), but
-  **NOT yet validated on real silicon**. The self-test validates flag emission,
-  the search space, the cache schema, and tree structure — **not** kernel
-  numerics or that the kernels emit the intended SASS.
-- ✅ = bit-level reference-checked on real H100 / MI300X / TPU v5p. **Nothing is
-  ✅ yet** — hardware validation is roadmap item 6 and is the gate to any ✅.
-- ⛔ = not present / throws (e.g. SG2 bilevel backward on gfx942).
+- 🟡 = implemented **including real PTX / CUTLASS collectives (sm_90) and
+  AMD-native MFMA/DPP (gfx942)**, and compile/structure-verified (sm_90 `nvcc -c`
+  14/14 COMPILE_OK, gfx942 clang device-compile 17/17 AMDGCN_OK, `--self-test`
+  138/0), but **NOT yet validated on real silicon**. These gates prove the code
+  compiles to object/device and the build structure is sound — **not** kernel
+  numerics or the emitted SASS/ISA.
+- ✅ = bit-level reference-checked + profiled on real H100 / MI300X / TPU v5p.
+  **Nothing is ✅ yet** — `HARDWARE_VALIDATION.md` is the gate to any ✅.
+- ⛔ = not present / throws. **No ⛔ cells remain** — zero `not_implemented`
+  tree-wide; the SG2 bilevel backward is now live on both sm_90 and gfx942.
 
 Mamba-3 here is the **model** (one of three race models), distinct from the old
 SG2 *mixer*: SG2's sequence mixer is now CSA/HCA hybrid attention; the
@@ -1663,6 +1736,33 @@ bash build.sh
 | `./build.sh --profile` | Release build + `ncu --set full` profile capture. |
 | `./build.sh --package` | Build + stage redistributable `dist/` tree. |
 | `./build.sh --package-tarball` | `--package` + `supergrok2-3.0.0-<sha>.tar.gz`. |
+
+### Per-vendor builds
+
+```bash
+# NVIDIA sm_90 (Hopper). FORCE_CUDA lets a CPU host with no visible GPU still
+# gencode-compile a Hopper artifact; WITH_CUTLASS turns on the Sm90 TMA/WGMMA path.
+WITH_CUTLASS=1 FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST=9.0 pip install -e .
+
+# AMD gfx942 (CDNA3, MI300X). FORCE_HIP routes the gfx942 tree through hipcc,
+# activating the Stage-5 AMD-native AMDGCN kernels.
+FORCE_HIP=1 PYTORCH_ROCM_ARCH=gfx942 pip install -e .
+
+# TPU (Pallas/XLA) — no C++ extension; the Pallas backend runs under JAX.
+pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+```
+
+### Compile/structure gates (no GPU needed)
+
+These are the gates the Stages 0–7 build is verified against on a CPU host —
+run them to reproduce the headline results:
+
+```bash
+bash scripts/compile_to_object.sh <tu.cu>   # nvcc -c to object, sm_90a cross-compile
+bash scripts/verify_stage0.sh               # the 14 canonical sm_90 TUs → 14/14 COMPILE_OK
+bash scripts/amdgcn_check.sh --header <h>    # clang AMDGPU device-compile, gfx942 → AMDGCN_OK
+PYTHONPATH=. python grokking_optimizers/compile.py --self-test   # 138 passed / 0 failed
+```
 
 ### Compiler flags
 
@@ -2669,9 +2769,10 @@ Algorithm headers are vendor-neutral: they declare `__device__ __forceinline__`
 template functions that compile under both nvcc and hipcc, plus pure-JAX
 mirrors inside each `csrc/backends/pallas/launch_<opt>.py`. Backend launch
 files are non-templated glue that calls into the algorithm functions inside
-grid-stride loops. If fused megakernels (one TU per model × optimizer × arch)
-ever land, they'll live under `csrc/fused/<arch>/` — there are no placeholder
-stubs in the meantime.
+grid-stride loops. The Stage-6 fused megakernels live under `csrc/fused/<arch>/`
+(`megakernel_common.{cuh,hip.hpp}` infra + `megakernel_demo` L3 cells +
+generated per-cell sources); the feasibility solver in
+`grokking_optimizers/megakernel.py` picks the fusion tier per pipeline.
 
 ### Algorithm headers (`csrc/algorithms/`)
 
@@ -2717,12 +2818,12 @@ Model symbols are exposed through `sg::sm90::models::*` and
 ### Launch glue (11 files per backend)
 
 For each backend, one launch file per optimizer (the MoE-model compaction
-stubs, quantization stubs, and distributed-scan helpers are folded into
-SuperGrok v2's launcher):
+kernels, quantization helpers, and distributed-scan helpers are folded into
+SuperGrok v2's launcher — all implemented, Stage 1B):
 
 ```
-csrc/backends/cuda/sm_90/launch_<opt>.cu       (11 files; SG2 absorbs the folded stubs)
-csrc/backends/hip/gfx942/launch_<opt>.hip.cpp  (11 files; SG2 bilevel-backward raises std::runtime_error)
+csrc/backends/cuda/sm_90/launch_<opt>.cu       (11 files; SG2 absorbs the folded MoE/scan helpers)
+csrc/backends/hip/gfx942/launch_<opt>.hip.cpp  (11 files; SG2 bilevel-backward live, AMD-native)
 csrc/backends/pallas/launch_<opt>.py           (11 files)
 ```
 
@@ -2751,7 +2852,8 @@ files:
   per-file boundaries with `// ─── csrc/bindings/<filename>.cpp ───` markers
   so the diff against the pre-consolidation layout stays legible.
 - **dispatch.cpp** — `int sg::detect_arch()` (CUDA/HIP probes + FORCE_ARCH
-  env var) and the `fused_step` placeholder.
+  env var) and the `fused_step` dispatch (§1.12): routes to a fused megakernel
+  TU when one is present for the (model×opt×arch) cell, else the per-op path.
 - **helpers.h** — `SG_DISPATCH` macro, the `sg::detect_arch()` forward decl,
   and the device-side gradient norm helpers.
 
@@ -2763,46 +2865,34 @@ Each dispatcher inside `bindings.cpp` filters undefined gradients, packs
 tensors into vectors, and calls `SG_DISPATCH(launcher, ...)` which picks
 the right backend at runtime.
 
-### HIP backend: ATen + rocBLAS-MFMA design
+### HIP backend: AMD-native AMDGCN (Stage 5)
 
-The HIP gfx942 launchers (`csrc/backends/hip/gfx942/launch_*.hip.cpp`) use
-ATen tensor ops + rocBLAS rather than hand-written `__global__` HIP kernels.
-This is a deliberate constraint of PyTorch's `cpp_extension`:
+The gfx942 kernel tree (`grokking_optimizers/kernels/gfx942/*.hip.hpp` +
+`csrc/backends/hip/gfx942/amdgcn_primitives.hip.hpp`) is **AMD-native** — real
+device kernels, not an ATen/rocBLAS shim. The build enabler was
+`scripts/amdgcn_check.sh`: a real device-compile gate via **clang 18's AMDGPU
+backend** that needs no hipcc/ROCm, so the whole tree is structurally verified
+on this CPU host (**17/17 AMDGCN_OK**). It caught real bugs the in-repo MFMA
+reference had — the operand layout had to be **bf16x4 (not u32x4)**, and several
+DPP/FP8/swizzle/sched builtins require constant args.
 
-- `_is_cuda_file()` only matches `.cu`, `.cuh`, and `.hip` extensions for
-  hipcc routing. Files with the `.hip.cpp` suffix go through the host
-  compiler (g++/clang++), which cannot compile `__global__` decorations or
-  `<<<grid, block>>>` launch syntax.
+Primitive set (`amdgcn_primitives.hip.hpp`): MFMA (16×16×16 bf16), DPP wave
+reductions, FP8-FNUZ, `buffer_load` streaming, `sched_group_barrier`, and
+AGENT-scope atomics.
 
-- ATen tensor ops on a HIP tensor dispatch to **rocBLAS** for GEMMs and
-  **rocPRIM** (rocPRIM-thrust) for elementwise / reduction patterns.
-  rocBLAS internally uses `v_mfma_f32_16x16x16_bf16` MFMA instructions on
-  CDNA3 for BF16/FP16 inputs at sizes ≥ 16, so the dense-linear-algebra
-  portion of every HIP launcher already exercises the MFMA pipeline —
-  it just isn't visible in our source code.
+| Kernel group | AMD-native technique |
+|--------------|----------------------|
+| 4 models (mamba3 / attn / decoder / vit) | real 16×16×16 bf16 MFMA + DPP softmax |
+| 5 reduction optimizers (looksam / muon / prodigy / sg11 / sg15) | DPP wave→block→AGENT-atomic reductions |
+| 5 elementwise optimizers (adamw / lion / grokfast / grokadamw / neuralgrok) | grid-stride streaming-load kernels |
+| SuperGrok v2 | CSA/HCA MFMA + DPP softmax + PEER (bilevel adjoint + MoE stay ATen) |
 
-Per-optimizer MFMA applicability (analysis in each launcher's file header):
-
-| Optimizer       | Pattern              | MFMA via rocBLAS | Hand-written kernel win |
-|-----------------|----------------------|------------------|-------------------------|
-| Lion            | elementwise          | n/a — no GEMM    | ~1.3× (kernel fusion)   |
-| AdamW           | elementwise          | n/a — no GEMM    | ~1.3× (kernel fusion)   |
-| GrokAdamW       | elementwise          | n/a — no GEMM    | ~1.5× (fuse EMA+Adam)   |
-| Grokfast        | elementwise          | n/a — no GEMM    | ~1.5× (fuse EMA+Adam)   |
-| LookSAM         | elementwise + reduce | n/a              | ~1.7× (fuse 3 kernels)  |
-| Prodigy         | elementwise + reduce | n/a              | ~2× (fuse reduce+apply) |
-| Muon            | elementwise + GEMM   | ✓ (5 NS GEMMs)   | ~1.2× (skip rocBLAS overhead) |
-| NeuralGrok      | per-element MLP      | ✓ (layer 2)      | ~1.5× (fuse MLP+Adam)   |
-| SuperGrok v1.1  | per-param MLP + Adam | ✓ (MLP forward)  | ~1.5× (fuse)            |
-| SuperGrok v1.5  | per-param MLP + Adam | ✓ (MLP forward)  | ~1.5× (fuse)            |
-| SuperGrok v2    | scan + GEMM + GRU    | ✓ (projections)  | substantial (LDS scan)  |
-
-Each launcher's file header contains a four-block analysis: COMPUTE PATTERN,
-MFMA APPLICABILITY, WHY ATEN HERE, and the three-step migration recipe to
-a hand-written kernel. The setup.py source glob picks up both `*.hip.cpp`
-(host-compiler-routed, ATen+rocBLAS) and `*.hip` (hipcc-routed, real
-`__global__` kernels via `hipLaunchKernelGGL`); migrating a launcher to
-native is the same three-step recipe in the file header.
+Each header is two-pass: `#if !__AMDGCN__` selects the host ATen path (for
+portability and the non-canonical gfx targets in the fat binary), and
+`#if __AMDGCN__ || __HIPCC__` selects the device path — so a real hipcc build
+activates the native kernels with no rename. `setup.py`'s source glob already
+picks these up. Live `hipLaunchKernelGGL` link + MFMA/DPP numerics + `rocprof`
+utilization are deferred to MI300X (`HARDWARE_VALIDATION.md`).
 
 ---
 
@@ -2950,9 +3040,9 @@ git history.
 
 | Cell | Before | After | Reason |
 |------|--------|-------|--------|
-| SuperGrok2 / gfx942 | ⛔ → 🟡 | 🟡 | Functional port via ATen + rocBLAS (MFMA for projection GEMMs). Scan recurrence is sequential ATen loop, slower than Hopper Blelloch + 4-warp specialization. Bilevel backward path raises (forward path is functional). Promotion to ✅ requires hardware validation. |
-| All other optimizer × arch cells | done | 🟡 | Implemented end-to-end in the refactored tree, but not run on real hardware in this environment. Promotion to ✅ gated on the action items below. |
-| All model × arch cells | done | 🟡 | Same — implementation exists, hardware validation pending. |
+| SuperGrok2 / gfx942 | ⛔ → 🟡 | 🟡 | Now AMD-native AMDGCN (Stage 5): CSA/HCA on MFMA + DPP, PEER on-device, bilevel backward **live** (no longer raises). Part of the 17/17 AMDGCN_OK gate. Promotion to ✅ requires MFMA/DPP numerics on MI300X. |
+| All other optimizer × arch cells | done | 🟡 | Implemented end-to-end and compile/structure-verified (sm_90 14/14, gfx942 17/17, self-test 138/0), but not run on real hardware here. Promotion to ✅ via `HARDWARE_VALIDATION.md`. |
+| All model × arch cells | done | 🟡 | Same — implementation + compile gates pass, hardware validation pending. |
 
 ### Post-refactor cleanup pass
 
@@ -3006,78 +3096,64 @@ each launch file is self-contained at the Python level too.
 
 ---
 
-## Roadmap to the vision
+## Performance build — completed stages (was the roadmap)
 
-In priority order. Each item is one honest sentence of current status.
+The Stages 0–7 maximal-performance build delivered everything that used to be on
+this roadmap. Each item below is **🟡 implemented + compile/structure-verified**;
+the on-silicon promotion check is in `HARDWARE_VALIDATION.md`. See `BUILD_REPORT.md`
+for the per-stage detail and the [Stage × status table](#stage--status-table)
+above for the gate results.
 
-1. **Persistent fused megakernel + on-device scheduler** (task queue,
-   work-stealing, DAG dependencies, SM-pinning) — greenfield; `csrc/fused/` does
-   not exist yet; it would compose the `__forceinline__ __device__` functions in
-   the new kernel headers + the `csrc/algorithms/` math into one resident kernel,
-   and needs a design pass before any code.
-2. **AMDGCN inline asm on gfx942** — currently NOT present (the path is
-   ATen + rocBLAS); blocked on migrating the `.hip.cpp` TUs to `.hip`
-   (hipcc-routed) so `__global__` + `__builtin_amdgcn_mfma`/inline asm can live
-   there; the reference MFMA block is already preserved `#if 0` in
-   `mamba3_gfx942.hip.hpp`. CUDA-side PTX is already present.
-3. **SG2 bilevel backward on gfx942** — currently throws
-   (`csa_hca_bilevel_not_implemented`); the forward + Adam-apply path runs, and
-   the full bilevel path runs on sm_90.
-4. **TMA-descriptor reuse across steps + DSMEM cross-CTA norm reductions**
-   (LookSAM / Prodigy) on sm_90 — not started; the SG2/Muon GEMMs already use
-   the Sm90 TMA+WGMMA collective, but descriptors are rebuilt per call and the
-   norm reductions are not yet DSMEM-based.
-5. **L2 persistence hints for per-step optimizer state**
-   (`cudaAccessPolicyWindow` on m/v and friends) — NOT landed in this pass:
-   adding it would alter the translation unit and break the byte-for-byte
-   migration guarantee, and it cannot be validated without a GPU, so it is
-   deferred to a dedicated pass with hardware verification.
-6. **Hardware validation** — the gate to any ✅. Nothing is silicon-validated
-   yet: the `--self-test` suite checks flag emission, search space, cache schema,
-   and tree structure, **not** kernel numerics or emitted SASS. Bit-level
-   reference checks on real H100 / MI300X / TPU v5p are required before any
-   kernel moves from 🟡 to ✅.
+1. **Persistent fused megakernel + on-device scheduler** — **built (Stage 6).**
+   `csrc/fused/{sm_90,gfx942}/` holds `megakernel_common.{cuh,hip.hpp}`
+   (task-queue scheduler §1.1, work-stealing §1.2, SM/CU-pinning via `%smid`/`HW_ID`
+   §1.3, hand-built sense-reversing global barrier §1.4) plus a templated L3
+   `megakernel_demo` (fwd→barrier→bwd→barrier→opt). A feasibility solver
+   (`megakernel.py`) picks L3/L2/L1 per (model×opt×arch) across all 99 pipelines
+   (**53 L3 / 46 L1 / 0 infeasible**); `megakernel_codegen.py` emits per-cell
+   sources; `fused_step` dispatch is wired.
+2. **AMDGCN-native gfx942** — **built (Stage 5).** All 11 optimizers + 3 models +
+   SG2 are AMD-native (MFMA / DPP / FP8-FNUZ / AGENT-atomics), **17/17 AMDGCN_OK**
+   via `scripts/amdgcn_check.sh`.
+3. **SG2 bilevel backward on gfx942** — **built (Stage 1A).** Hand-written
+   reverse-mode adjoint, no autograd, live on both sm_90 and gfx942; the Python
+   transcription was numerically validated vs `torch.autograd.grad` (24/24
+   buffers to fp32, max abs ≤ 6e-9).
+4. **TMA-descriptor reuse + DSMEM cross-CTA reductions** — **built (Stage 4).**
+   Shape+ptr-keyed host cache of the CUTLASS operator (skips per-step
+   `cuTensorMapEncode`); real cluster-tree DSMEM reduction (`mapa` +
+   `barrier.cluster`) wired into Prodigy.
+5. **L2 persistence for per-step optimizer state** — **built (Stage 2).**
+   `prim::L2PersistScope` RAII over the safe runtime API
+   (`cudaStreamSetAttribute` + `cudaAccessPolicyWindow`, not hand-PTX), wired into
+   all 11 optimizer launchers; numerics-invariant (pure cache hint).
+6. **Hardware validation** — the gate to any ✅, and the **only** thing not done
+   in this environment (no silicon). Bit-level reference checks + profiling on
+   real H100 / MI300X / TPU v5p are required before any cell moves 🟡 → ✅. The
+   complete per-stage runbook is `HARDWARE_VALIDATION.md`.
 
-## Action items for hardware validation
+## Hardware validation — the 🟡 → ✅ gate
 
-When this branch lands on a machine with a real sm_90 GPU and an MI300X:
+Nothing in this environment runs on a GPU/TPU, so every performance cell is 🟡.
+The full promotion runbook — exact per-stage on-silicon commands and the
+bit-parity / profiling thresholds — lives in **`HARDWARE_VALIDATION.md`**. The
+complete deferred-to-hardware ledger (which check, which target accelerator) is
+in **`BUILD_REPORT.md`**. In summary, on a machine with a real H100 + MI300X
+(+ TPU v5p):
 
-**Build smoke test**
-- [ ] `./build.sh` succeeds on sm_90 (H100/H200)
-- [ ] `./build.sh` succeeds on gfx942 (MI300X) after `export USE_HIP=1`
-- [ ] `pip install -e .` produces an importable `_ops` extension
-
-**Import smoke test**
-- [ ] `python -c "from grokking_optimizers import SuperGrok2, Lion"` works
-- [ ] All 12 optimizers in `grokking_optimizers/optimizers/` instantiate
-      without error
-- [ ] `grokking_race_v2.py --help` runs cleanly
-
-**Functional smoke test (sm_90)**
-- [ ] 20-step training loop on the decoder modular-division task with Lion
-      converges (loss decreases)
-- [ ] 20-step training loop with SuperGrok v2 converges
-- [ ] (Optional) Compare against a hand-written PyTorch reference outside
-      the package to validate math; the package itself no longer ships a
-      Python reference implementation.
-
-**Honest stub test (gfx942)**
-- [ ] On MI300X: `SuperGrok2(...).step()` completes without error (forward
-      path) — bilevel meta-update will raise until the saved-activations
-      backward kernel is implemented.
-
-**Matrix promotion**
-- [ ] After each above test passes, promote the corresponding cell in the
-      build matrix from 🟡 → ✅
-- [ ] If anything fails, add a follow-up commit with the fix and re-test
-
-**Out-of-scope items (deferred)**
-- Fused megakernels (`csrc/fused/<arch>/`) — directory currently absent;
-  any future fusion work will recreate it with real content.
-- Warp-specialized SG2 scan as a runtime-detected branch
-- CUDA Graph capture for the SG2 pipeline
-- DSMEM cross-CTA reductions wired into LookSAM / Prodigy norm kernels
-- CI matrix (tests are inline via `--self-test`; no external test suite)
+- **Build/link**: `pip install -e .` on sm_90 (H100/H200) and gfx942 (MI300X,
+  `FORCE_HIP=1`) produces an importable `_ops`; `cuobjdump -sass` / `rocprof`
+  confirm the intended ISA.
+- **Numerics**: per-stage bit-parity reruns — the SG2 24-buffer adjoint
+  (CPU-proven 🟢, device rerun), MoE compaction, wgmma/HMMA GEMM parity, REDUX +
+  histogram, MFMA/DPP outputs.
+- **Profiling**: `ncu` L2 hit-rate uplift (Stage 2), async-copy overlap
+  (Stage 3.2), cluster/DSMEM metrics (Stage 4.2), `rocprof` MFMA utilization
+  (Stage 5), L3-vs-unfused latency + SM-pin occupancy (Stage 6), 3D+ZeRO-3
+  weak-scaling ≥ 70% to 32 GPUs (Stage 7).
+- **Promotion**: as each check passes on silicon, flip the matching cell
+  🟡 → ✅ in the [Stage × status table](#stage--status-table) and the per-cell
+  matrices above.
 
 ---
 
@@ -3109,12 +3185,23 @@ Run the inline self-test suite:
 python -m grokking_optimizers.compile --self-test
 ```
 
-This runs 18 checks covering: YAML search space loading/validation/hashing,
-PGO workload hashing and flag plumbing, Bayesian TPE optimization and
-top-K refinement, compile cache v2→v3 migration and round-trip,
-elementwise kernel header structure (4 optimizers × 2 GPU arches), model
-kernel header existence (3 models × 3 arches), and optimizer × model
-cross-validation (file existence + size helpers for all combinations).
+This runs **138 checks, 138 pass / 0 fail** (the former lone failure was a
+flag-probe false-negative on the CUDA `-dlto` flag-gating path, now fixed)
+covering: programmatic search-space cardinalities + hashing, PGO workload
+hashing and flag plumbing, Bayesian TPE + top-K refinement and the five
+early-stop criteria, compile cache v2→v3→v4 migration and the `.jsonl` trial
+sidecar, ARCH_TABLE completeness for all 26 archs, per-arch flag/gencode
+emission, the auto-arch resolver, the TOML project-agnostic config loader,
+BuildSpec field guardrails, and kernel-tree structure. See "Verifying the
+install" above for the full breakdown of what runs on a CPU-only host vs. what
+SKIPs cleanly on a missing dep. Companion compile gates:
+
+```bash
+bash scripts/verify_stage0.sh                       # 14/14 sm_90 COMPILE_OK
+for h in grokking_optimizers/kernels/gfx942/*.hip.hpp \
+         csrc/backends/hip/gfx942/amdgcn_primitives.hip.hpp; do
+  bash scripts/amdgcn_check.sh --header "$h"; done   # 17/17 AMDGCN_OK
+```
 
 ---
 
