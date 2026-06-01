@@ -1673,3 +1673,18 @@ the build works if the dirs are sparse).
 | P2-1 | bilevel\_cuda\_vs\_autograd | C++ VJP matches autograd to rtol=1e-5 on H100/MI300X | §P2-1 bilevel\_step |
 | P2-2 | 99\_cell\_compile\_gate | nvcc/hipcc compile all 66 GPU cells | §P2-2 megakernel\_codegen |
 | P2-4 | pallas\_expert\_gather\_perf | gather < 5% of step on v5p | §P2-4 \_pallas\_kernels.py |
+
+## Phase 3 additions (real component compositions — sm_90)
+
+See PHASE3_REPORT.md for the full honest 44-component / 99-pipeline status.
+Phase 3 made the sm_90 fused cells REAL compositions (all 11 optimizers' real
+`csrc/algorithms/<opt>.h` math, no AdamW fallback) and inlined the PTX into the
+owning component headers. The following stay 🟡 (no GPU this session):
+
+| stage | item | deferred check |
+|-------|------|----------------|
+| P3-S5 | sm_90 fused tails | on-silicon numeric parity of `apply_optimizer<OptId>` vs the per-op path for all 11 (H100) |
+| P3-S5 | sm_90 extra-state opts | host-plumb ema/sam_dir/s_track/mu through `dispatch.cpp::fused_step`, then runtime-verify on H100 |
+| P3-S5 | remaining 21 sm_90 cells | individually nvcc -c compile-gate (mechanism proven on the 12-cell cover) |
+| P3 | gfx942 / tpu real compositions | NOT-DONE this phase — fused cells remain wrappers/stubs; build the real `.hip.hpp` / Pallas compositions |
+| P3 | gfx942 SG2 adjoint + MoE | still ATen — port to AMDGCN |
