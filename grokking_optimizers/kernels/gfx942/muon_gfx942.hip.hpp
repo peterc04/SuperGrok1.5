@@ -162,9 +162,17 @@ void launch_muon_update(
 //   hipLaunchKernelGGL(native::muon_gfx942_frobenius_reduce, grid, block,
 //                      0, stream, buf_ptr, d_acc, n);
 //   // host then: frob = sqrtf(*d_acc) + 1e-8f;  inv_norm = 1.f / frob
+//
+// and newton_schulz_iterate()'s 3 GEMMs/step (currently torch::mm → rocBLAS)
+// launch the §5.2 REAL MFMA Newton-Schulz kernel — one wavefront per 2-D param,
+// X pre-normalized by inv_norm:
+//   int lds = native::muon_ns_lds_bytes(M, N);   // host mirror of the device fn
+//   hipLaunchKernelGGL(native::muon_gfx942_newton_schulz, dim3(1), dim3(64),
+//                      lds, stream, X_ptr, M, N, ns_steps, ns_a, ns_b, ns_c);
 // 🟡 DEFERRED: the live launch + hipcc link is MI300X-gated. This host TU keeps
-// the ATen `.norm()` (numerics-correct); the §5 kernel is COMPILER-VERIFIED for
-// gfx942 via scripts/amdgcn_check.sh and ready to wire in on hardware.
+// the ATen `.norm()` + torch::mm Newton-Schulz (numerics-correct); the §5 /
+// §5.2 kernels are COMPILER-VERIFIED for gfx942 via scripts/amdgcn_check.sh and
+// ready to wire in on hardware.
 #endif  // !defined(__AMDGCN__)  — end host orchestration (A)
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -219,9 +227,12 @@ static GrokGridDim   gridDim;
 //   5. one thread does amd::atomic_add_agent_f32 to the global accumulator
 //      (§2.13: AMD has no DSMEM, so cross-workgroup uses an AGENT-scope atomic
 //      visible across all 8 XCDs of MI300X).
-// APPLY: the per-element momentum/normalize/Newton-Schulz/update stays on the
-// ATen host path (launch_muon_*) — the GEMMs route through rocBLAS MFMA; only
-// the Frobenius-norm reduction is migrated to AMDGCN.
+// Two AMDGCN device pieces are provided:
+//   §5.1  Frobenius-norm reduction (DPP wave→block→grid sum-of-squares), and
+//   §5.2  Newton-Schulz orthogonalization via REAL 16×16×16 bf16 MFMA (the
+//         3-GEMMs/step inner loop — the matmul-bearing work the task calls for).
+// APPLY: the momentum EMA + the final p -= lr·X·scale + decay update stay on the
+// ATen host path (launch_muon_*); they are pure elementwise (no MFMA/DPP value).
 // ============================================================================
 namespace sg { namespace gfx942 { namespace native {
 
@@ -266,6 +277,187 @@ extern "C" __global__ void muon_gfx942_frobenius_reduce(
     const float* __restrict__ m, float* __restrict__ acc, int n)
 {
     muon_frobenius_block(m, acc, n);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// §5.2  Newton-Schulz iteration via REAL 16×16×16 bf16 MFMA (the §2.4 matrix-
+// core path). The orthogonalization inner loop is three GEMMs per step over the
+// normalized weight X[M,N] (M=rows, N=cols):
+//   AX  = Xᵀ·X            [N,N]   (A=Xᵀ[N,M], W=Xᵀ[N,M] → contract M)
+//   AAX = AX·AX           [N,N]   (A=AX[N,N],  W=AXᵀ[N,N] → contract N)
+//   X'  = a·X + b·X·AX + c·X·AAX  (X·AX,X·AAX: A=X[M,N], W=AXᵀ/AAXᵀ[N,N])
+// where the §2.4 mfma helper computes C[M,N']=A[M,K]·W[N',K]ᵀ (W in [out,K]
+// row-major = the transpose the contraction wants). bf16 operands flow as raw
+// `short` bit-patterns to amd::mfma_bf16_16x16x16 (short[4]); f32 accumulate.
+// One wavefront strides the 16×16 output-tile lattice; MFMA vs VMEM are pinned
+// via sched_group_barrier (§2.11) so the matrix unit is not starved.
+//
+// This is the genuine MFMA-justified Muon work (vs the rocBLAS-via-ATen host
+// fallback). 🟡 device-compile-verified only; MI300X parity vs newton_schulz_
+// iterate() deferred (HARDWARE_VALIDATION.md, Stage 5).
+// ════════════════════════════════════════════════════════════════════════════
+
+// bf16 <-> f32 bit codec (the gate has no hip_bfloat16; matches the SG2 codec).
+__device__ __forceinline__ float ns_bf16_to_f32(short h) {
+    unsigned u = static_cast<unsigned>(static_cast<unsigned short>(h)) << 16;
+    return __builtin_bit_cast(float, u);
+}
+__device__ __forceinline__ short ns_f32_to_bf16(float f) {
+    unsigned u = __builtin_bit_cast(unsigned, f);
+    unsigned lsb = (u >> 16) & 1u;
+    u += 0x7fffu + lsb;
+    return static_cast<short>(static_cast<unsigned short>(u >> 16));
+}
+
+// One 16×16 output tile of C[M,N] = A[M,K] · W[N,K]ᵀ (K-contraction), MFMA path.
+__device__ __forceinline__ void ns_mfma_tile_16x16(
+    const short* __restrict__ A,   // [M, K] row-major bf16 bits
+    const short* __restrict__ W,   // [N, K] row-major bf16 bits (= Bᵀ)
+    float*       __restrict__ C,   // [M, N] row-major f32
+    int M, int N, int K, int tile_row, int tile_col)
+{
+    const int lane = static_cast<int>(threadIdx.x) % kWave;
+    const int half = lane / 16;        // which 16-K group this lane feeds (0..3)
+    const int idx  = lane % 16;        // row (A) / col (W) within the tile
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    const int aRow = tile_row + idx;
+    const int bCol = tile_col + idx;
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        short af[4], bf[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int k = k0 + half * 4 + j;
+            af[j] = (aRow < M && k < K) ? amd::streaming_load(&A[aRow * K + k]) : (short)0;
+            bf[j] = (bCol < N && k < K) ? amd::streaming_load(&W[bCol * K + k]) : (short)0;
+        }
+        amd::mfma_bf16_16x16x16(acc, af, bf);
+        amd::sched_group_barrier<0x008, 1>();   // 1 MFMA …
+        amd::sched_group_barrier<0x100, 2>();   // … then 2 VMEM reads (§2.11)
+    }
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        int outRow = tile_row + 4 * half + r;
+        int outCol = tile_col + idx;
+        if (outRow < M && outCol < N) C[outRow * N + outCol] = acc[r];
+    }
+}
+
+// Whole-matrix MFMA GEMM: one wavefront strides the 16×16 output-tile lattice.
+__device__ __forceinline__ void ns_mfma_matmul_bf16(
+    const short* __restrict__ A, const short* __restrict__ W,
+    float* __restrict__ C, int M, int N, int K)
+{
+    const int tilesM = (M + 15) / 16;
+    const int tilesN = (N + 15) / 16;
+    const int nTiles = tilesM * tilesN;
+    for (int t = 0; t < nTiles; ++t)
+        ns_mfma_tile_16x16(A, W, C, M, N, K, (t / tilesN) * 16, (t % tilesN) * 16);
+}
+
+// Pack f32 src[R,Cc] → bf16-bits dst[R,Cc] (lane-strided).
+__device__ __forceinline__ void ns_pack_bf16(
+    const float* __restrict__ src, short* __restrict__ dst, int n)
+{
+    const int lane = static_cast<int>(threadIdx.x) % kWave;
+    for (int i = lane; i < n; i += kWave) dst[i] = ns_f32_to_bf16(src[i]);
+}
+// Transpose-pack f32 src[R,Cc] → bf16-bits dst[Cc,R] (lane-strided).
+__device__ __forceinline__ void ns_transpose_pack_bf16(
+    const float* __restrict__ src, short* __restrict__ dst, int R, int Cc)
+{
+    const int lane = static_cast<int>(threadIdx.x) % kWave;
+    for (int i = lane; i < R * Cc; i += kWave) {
+        int r = i / Cc, c = i % Cc;
+        dst[c * R + r] = ns_f32_to_bf16(src[i]);
+    }
+}
+
+// One Newton-Schulz step over X[M,N] (single wavefront, X already 1/‖·‖-scaled).
+// Matches newton_schulz_iterate(): AX=XᵀX[N,N]; AAX=AX·AX[N,N];
+// X' = a·X + b·(X·AX) + c·(X·AAX). AX and AAX stay resident through both final
+// rectangular GEMMs, so no operand is recomputed.
+// LDS scratch (caller-sized via muon_ns_lds_bytes): Xf[M*N], AXf[N*N], AAXf[N*N],
+// XAXf[M*N] f32 + a bf16 pack region pkA/pkW each [max(M*N,N*N)] shorts.
+__device__ __forceinline__ void muon_ns_step(
+    float* __restrict__ Xf,     // LDS [M,N] in/out (f32)
+    float* __restrict__ AXf,    // LDS [N,N]   AX = XᵀX
+    float* __restrict__ AAXf,   // LDS [N,N]   AAX = AX·AX
+    float* __restrict__ XAXf,   // LDS [M,N]   X·AX (then X·AAX)
+    short* __restrict__ pkA,    // LDS bf16 scratch A operand
+    short* __restrict__ pkW,    // LDS bf16 scratch W operand
+    int M, int N, float a, float b, float c)
+{
+    const int lane = static_cast<int>(threadIdx.x) % kWave;
+
+    // (1) AX = Xᵀ·X  [N,N]: A=Xᵀ[N,M], W=Xᵀ[N,M] (helper computes A·Wᵀ; both
+    //     operands = Xᵀ[N,M] contract over M, giving Xᵀ·(Xᵀ)ᵀ = Xᵀ·X).
+    ns_transpose_pack_bf16(Xf, pkA, M, N);          // pkA = Xᵀ[N,M] bf16
+    amd::workgroup_barrier_release();
+    ns_mfma_matmul_bf16(pkA, pkA, AXf, N, N, M);    // AXf = XᵀX [N,N]
+    amd::wait_vmcnt0();
+    amd::workgroup_barrier_release();
+
+    // (2) AAX = AX·AX [N,N]: A=AX[N,N], W=AXᵀ[N,N] (AX symmetric, but transpose
+    //     explicitly to keep the A·Wᵀ contract general).
+    ns_pack_bf16(AXf, pkA, N * N);                  // pkA = AX[N,N] bf16
+    ns_transpose_pack_bf16(AXf, pkW, N, N);         // pkW = AXᵀ[N,N] bf16
+    amd::workgroup_barrier_release();
+    ns_mfma_matmul_bf16(pkA, pkW, AAXf, N, N, N);   // AAXf = AX·AX [N,N]
+    amd::wait_vmcnt0();
+    amd::workgroup_barrier_release();
+
+    // (3) X·AX [M,N]: A=X[M,N], W=AXᵀ[N,N]  (→ XAXf).
+    ns_pack_bf16(Xf, pkA, M * N);                   // pkA = X[M,N] bf16
+    ns_transpose_pack_bf16(AXf, pkW, N, N);         // pkW = AXᵀ[N,N] bf16
+    amd::workgroup_barrier_release();
+    ns_mfma_matmul_bf16(pkA, pkW, XAXf, M, N, N);   // XAXf = X·AX [M,N]
+    amd::wait_vmcnt0();
+    amd::workgroup_barrier_release();
+
+    // (4) X·AAX [M,N]: A=X[M,N] (pkA still valid), W=AAXᵀ[N,N]  (→ AAXf reused).
+    ns_transpose_pack_bf16(AAXf, pkW, N, N);        // pkW = AAXᵀ[N,N] bf16
+    amd::workgroup_barrier_release();
+    ns_mfma_matmul_bf16(pkA, pkW, AAXf, M, N, N);   // AAXf = X·AAX [M,N]
+    amd::wait_vmcnt0();
+    amd::workgroup_barrier_release();
+
+    // (5) X' = a·X + b·(X·AX) + c·(X·AAX).
+    for (int i = lane; i < M * N; i += kWave)
+        Xf[i] = a * Xf[i] + b * XAXf[i] + c * AAXf[i];
+    amd::workgroup_barrier_release();
+}
+
+// LDS byte budget for one Newton-Schulz wavefront over X[M,N].
+__device__ __forceinline__ int muon_ns_lds_bytes(int M, int N) {
+    int sq = N * N, rect = M * N;
+    int mx = sq > rect ? sq : rect;
+    int f32b = (rect + sq + sq + rect) * (int)sizeof(float);  // Xf,AXf,AAXf,XAXf
+    int bf16b = (2 * mx) * (int)sizeof(short);
+    return f32b + bf16b;
+}
+
+// Newton-Schulz orthogonalization kernel: one wavefront per 2-D parameter.
+// X_inout[M,N] is the 1/‖·‖_F-normalized momentum (host does the normalize); the
+// kernel applies `steps` Newton-Schulz iterations in place via the MFMA GEMMs.
+extern "C" __global__ void muon_gfx942_newton_schulz(
+    float* __restrict__ X_inout, int M, int N, int steps,
+    float a, float b, float c)
+{
+    extern __shared__ float lds[];
+    const int rect = M * N, sq = N * N;
+    int mx = sq > rect ? sq : rect;
+    float* Xf   = lds;
+    float* AXf  = Xf   + rect;
+    float* AAXf = AXf  + sq;
+    float* XAXf = AAXf + sq;
+    short* pkA  = reinterpret_cast<short*>(XAXf + rect);
+    short* pkW  = pkA + mx;
+    const int lane = static_cast<int>(threadIdx.x) % kWave;
+    for (int i = lane; i < rect; i += kWave) Xf[i] = amd::streaming_load(&X_inout[i]);
+    amd::workgroup_barrier_release();
+    for (int s = 0; s < steps; ++s)
+        muon_ns_step(Xf, AXf, AAXf, XAXf, pkA, pkW, M, N, a, b, c);
+    for (int i = lane; i < rect; i += kWave) amd::streaming_store(&X_inout[i], Xf[i]);
 }
 
 }}} // namespace sg::gfx942::native

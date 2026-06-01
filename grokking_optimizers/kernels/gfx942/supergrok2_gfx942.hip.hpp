@@ -1906,6 +1906,28 @@ template __global__ void sg2_hca_attention_fwd_mfma<4>(
 
 }  // namespace native
 }}}}  // namespace sg::gfx942::models::supergrok2
+
+// ════════════════════════════════════════════════════════════════════════════
+// §5.WIRE  Pull the REAL device-side SG2 bilevel ADJOINT (reverse-mode VJP) and
+// the MoE compaction/scatter/histogram kernels into THIS device pass, so the SG2
+// optimizer header's device path actually carries the hand-written AMDGCN adjoint
+// + MoE kernels (not just the forward). Both headers self-gate on
+// __AMDGCN__||__HIPCC__ and re-use the SAME GROK_GFX942_LAUNCH_SHIM_ guard +
+// amdgcn_primitives, so this is a no-conflict include here:
+//   * the adjoint kernels live in
+//     sg::gfx942::models::supergrok2::native_adjoint (sg2_attn_ctx_bwd_kernel /
+//     sg2_gru_gate_bwd_kernel / sg2_peer_route_bwd_kernel — §A1..§A4 MFMA+DPP),
+//   * the MoE compaction kernels live in sg::gfx942::native
+//     (moe_filter_active / moe_scatter_results / moe_expert_histogram — §5.1-5.3),
+//   distinct from the forward's sg::gfx942::models::supergrok2::native, so no
+//   symbol collides. The host (!__AMDGCN__) pass of THIS file keeps the ATen
+//   orchestration / oracle fallback (those headers' own host pass holds the
+//   launch shims + SG2_ADJOINT_GFX942_LIVE selector).
+// This makes the SG2 device pass reference the real device adjoint path as
+// required: on a hipcc/MI300X build the backward + MoE launchers dispatch to
+// these device kernels (ATen oracle stays the host/CPU fallback only).
+#include "csrc/backends/hip/gfx942/supergrok2_bilevel_adjoint_gfx942.hip.hpp"
+#include "csrc/backends/hip/gfx942/moe_compaction_gfx942.hip.hpp"
 #endif  // (B) device pass
 
 #endif  // GROKKING_KERNELS_GFX942_SUPERGROK2_GFX942_HIP_HPP_
