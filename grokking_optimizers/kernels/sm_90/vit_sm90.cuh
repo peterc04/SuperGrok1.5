@@ -81,6 +81,29 @@
 #include "csrc/backends/cuda/sm_90/mma.cuh"
 #endif  // WITH_CUTLASS
 
+// ── inlined from former csrc/common/utils.cuh (Phase3 S0) ──
+#if GROK_CUDA
+#ifndef SG_INLINE_PTX_FAST_RSQRT_NR
+#define SG_INLINE_PTX_FAST_RSQRT_NR
+// Fast reciprocal sqrt via PTX rsqrt.approx.f32 + Newton-Raphson refinement.
+// 2-3x faster than sqrtf(x) + fdividef for Adam denominator.
+__device__ __forceinline__ float fast_rsqrt_nr(float x) {
+    float r;
+    asm("rsqrt.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+    // One Newton-Raphson iteration: r = r * (1.5 - 0.5 * x * r * r)
+    r = r * (1.5f - 0.5f * x * r * r);
+    return r;
+}
+#endif  // SG_INLINE_PTX_FAST_RSQRT_NR
+#endif  // GROK_CUDA
+
+#if GROK_HIP
+#ifndef SG_INLINE_PTX_FAST_RSQRT_NR
+#define SG_INLINE_PTX_FAST_RSQRT_NR
+__device__ __forceinline__ float fast_rsqrt_nr(float x) { return rsqrtf(x); }
+#endif  // SG_INLINE_PTX_FAST_RSQRT_NR
+#endif  // GROK_HIP
+
 namespace sg { namespace sm90 { namespace models { namespace vit {
 
 #ifdef WITH_CUTLASS

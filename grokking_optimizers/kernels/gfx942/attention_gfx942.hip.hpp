@@ -63,6 +63,14 @@
 #include <ck_tile/ops/fmha.hpp>
 #endif
 
+// ── inlined from former csrc/common/utils.cuh (Phase3 S0) ──
+#if GROK_HIP
+#ifndef SG_INLINE_PTX_PTX_EXPF
+#define SG_INLINE_PTX_PTX_EXPF
+__device__ __forceinline__ float ptx_expf(float x) { return expf(x); }
+#endif  // SG_INLINE_PTX_PTX_EXPF
+#endif  // GROK_HIP
+
 namespace sg { namespace gfx942 { namespace models { namespace attention {
 
 constexpr int kMaxLdsBytes = 65536;  // 64 KB LDS per CU on gfx942

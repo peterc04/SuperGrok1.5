@@ -60,6 +60,35 @@
 #include <cutlass/util/packed_stride.hpp>
 #endif // WITH_CUTLASS
 
+// ── inlined from former csrc/common/utils.cuh (Phase3 S0) ──
+#if GROK_CUDA
+#ifndef SG_INLINE_PTX_PTX_EXP2
+#define SG_INLINE_PTX_PTX_EXP2
+// Fast exp2 approximation via PTX ex2.approx.f32.
+// Used in Mamba scan: exp(A * dt) = exp2(A * dt / ln2).
+__device__ __forceinline__ float ptx_exp2(float x) {
+    float r;
+    asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+#endif  // SG_INLINE_PTX_PTX_EXP2
+
+#ifndef SG_INLINE_PTX_PTX_EXPF
+#define SG_INLINE_PTX_PTX_EXPF
+// Fast exp via exp2: exp(x) = exp2(x * log2(e))
+__device__ __forceinline__ float ptx_expf(float x) {
+    return ptx_exp2(x * 1.4426950408889634f);  // log2(e)
+}
+#endif  // SG_INLINE_PTX_PTX_EXPF
+#endif  // GROK_CUDA
+
+#if GROK_HIP
+#ifndef SG_INLINE_PTX_PTX_EXPF
+#define SG_INLINE_PTX_PTX_EXPF
+__device__ __forceinline__ float ptx_expf(float x) { return expf(x); }
+#endif  // SG_INLINE_PTX_PTX_EXPF
+#endif  // GROK_HIP
+
 namespace sg { namespace sm90 { namespace models { namespace attention {
 
 // ── Launch configuration descriptor ────────────────────────────────────

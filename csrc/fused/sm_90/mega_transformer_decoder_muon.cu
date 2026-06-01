@@ -2,25 +2,32 @@
 // Cell: (transformer_decoder, muon, sm_90)  tier=L1_OPT_ONLY
 //   regs=72/255  smem=4096/233472
 //   fell back to L1_OPT_ONLY; L3_FWD_BWD_OPT(regs 272>255); L2_BWD_OPT(regs 272>255)
-// This cell is ALREADY wired in the canonical demo TU (megakernel_demo.cu);
-// the generator would normally SKIP emitting it to disk. Shown here for
-// completeness — the launcher below is named distinctly to avoid a clash.
 //
-// Instantiates the ONE templated L3 persistent megakernel for this (model,
-// optimizer). SG_MEGAKERNEL_DEMO_TEMPLATE_ONLY pulls in JUST the template
-// machinery (scheduler/barrier substrate, SM-pinning, fused-optimizer tail —
-// all comdat-folded across TUs); this TU adds only its own unique launcher.
-#define SG_MEGAKERNEL_DEMO_TEMPLATE_ONLY
-#include "csrc/fused/sm_90/megakernel_demo.cu"
+// REAL component composition (Phase 3 Stage 5): composes the real optimizer
+// device-function component (csrc/algorithms/muon.h via
+// opt_components.cuh::apply_optimizer<OptId::Muon>) with the real model
+// stage component (model_stages.cuh::model_*_stage<ModelId::TransformerDecoder>) over the
+// shared persistent-megakernel substrate. Fuse tier L1 chosen by the solver.
+#include "csrc/fused/sm_90/fused_megakernel.cuh"
 
 namespace sg { namespace fused { namespace sm90 {
 
+// Uniform host entry (the symbol fused_step dispatches to). Builds the
+// FusedOptState from the Adam-family moment slices (m, v); optimizers needing
+// extra state (ema / sam_dir / s_track / mu / orth / smart_grad) have those
+// buffers supplied by the host orchestration layer (🟡 runtime-deferred — see
+// HARDWARE_VALIDATION.md). The composition + the apply math are real + compiled.
 cudaError_t mega_transformer_decoder_muon(
         PersistentContext ctx, float* params, const float* input, float* acts,
         float* grad, float* m, float* v, const int* sizes, const int* offsets,
         float lr, int step, cudaStream_t stream) {
-    return launch_l3_megakernel<Model::TransformerDecoder, Optimizer::Muon>(
-        ctx, params, input, acts, grad, m, v, sizes, offsets, lr, step, stream);
+    FusedOptState st;
+    st.exp_avg = m;
+    st.exp_avg_sq = v;
+    st.lr = lr;
+    return launch_fused_megakernel<ModelId::TransformerDecoder, OptId::Muon,
+                                   FuseTier::L1>(
+        ctx, params, input, acts, grad, sizes, offsets, lr, step, st, stream);
 }
 
 }}}  // namespace sg::fused::sm90

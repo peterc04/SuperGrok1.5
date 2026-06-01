@@ -32,6 +32,67 @@
 #include "csrc/common/utils.cuh"
 #include "csrc/algorithms/adamw.h"  // pulled in for the merged moe_adam_step
 
+// ── inlined from former csrc/common/utils.cuh (Phase3 S0) ──
+#if GROK_CUDA
+#ifndef SG_INLINE_PTX_FAST_RSQRT_NR
+#define SG_INLINE_PTX_FAST_RSQRT_NR
+// Fast reciprocal sqrt via PTX rsqrt.approx.f32 + Newton-Raphson refinement.
+// 2-3x faster than sqrtf(x) + fdividef for Adam denominator.
+__device__ __forceinline__ float fast_rsqrt_nr(float x) {
+    float r;
+    asm("rsqrt.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+    // One Newton-Raphson iteration: r = r * (1.5 - 0.5 * x * r * r)
+    r = r * (1.5f - 0.5f * x * r * r);
+    return r;
+}
+#endif  // SG_INLINE_PTX_FAST_RSQRT_NR
+
+#ifndef SG_INLINE_PTX_PTX_FMA
+#define SG_INLINE_PTX_PTX_FMA
+// Fused multiply-add via PTX fma.rn.f32 — ensures single FMA instruction.
+// Critical for affine_combine inner loop (8 FMAs per composition).
+__device__ __forceinline__ float ptx_fma(float a, float b, float c) {
+    float r;
+    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c));
+    return r;
+}
+#endif  // SG_INLINE_PTX_PTX_FMA
+
+#ifndef SG_INLINE_PTX_PTX_EXP2
+#define SG_INLINE_PTX_PTX_EXP2
+// Fast exp2 approximation via PTX ex2.approx.f32.
+// Used in Mamba scan: exp(A * dt) = exp2(A * dt / ln2).
+__device__ __forceinline__ float ptx_exp2(float x) {
+    float r;
+    asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+#endif  // SG_INLINE_PTX_PTX_EXP2
+
+#ifndef SG_INLINE_PTX_PTX_EXPF
+#define SG_INLINE_PTX_PTX_EXPF
+// Fast exp via exp2: exp(x) = exp2(x * log2(e))
+__device__ __forceinline__ float ptx_expf(float x) {
+    return ptx_exp2(x * 1.4426950408889634f);  // log2(e)
+}
+#endif  // SG_INLINE_PTX_PTX_EXPF
+#endif  // GROK_CUDA
+
+#if GROK_HIP
+#ifndef SG_INLINE_PTX_FAST_RSQRT_NR
+#define SG_INLINE_PTX_FAST_RSQRT_NR
+__device__ __forceinline__ float fast_rsqrt_nr(float x) { return rsqrtf(x); }
+#endif  // SG_INLINE_PTX_FAST_RSQRT_NR
+#ifndef SG_INLINE_PTX_PTX_FMA
+#define SG_INLINE_PTX_PTX_FMA
+__device__ __forceinline__ float ptx_fma(float a, float b, float c) { return fmaf(a, b, c); }
+#endif  // SG_INLINE_PTX_PTX_FMA
+#ifndef SG_INLINE_PTX_PTX_EXPF
+#define SG_INLINE_PTX_PTX_EXPF
+__device__ __forceinline__ float ptx_expf(float x) { return expf(x); }
+#endif  // SG_INLINE_PTX_PTX_EXPF
+#endif  // GROK_HIP
+
 namespace sg { namespace algorithms {
 
 // Compile-time maximums (must match types.h constants).
