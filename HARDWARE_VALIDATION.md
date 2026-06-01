@@ -76,6 +76,52 @@ python -m tests.hw.test_reference_parity \
 | supergrok15  | 🟡 | 🟡 | 🟡 | global sigmoid gate |
 | supergrok2   | 🟡 | 🟡 | 🟡 | CSA/HCA fwd + **bilevel backward (Stage 1A, hand-written adjoint, done)** |
 
+### Full per-cell × per-arch status matrix (99 cells; all 🟡 until silicon)
+
+Generated from the live solver (`megakernel.solve_all`). Fuse tier is the
+solver's current assignment (🟡 estimate until `ptxas -v`). The on-silicon
+numeric-oracle for every cell is `tests.hw.test_reference_parity --optimizer
+<opt> --model <model> --arch <arch> --steps 20`. Status 🟡 = compile/clang/
+trace-verified in-repo; runtime+numerics pending hardware.
+
+| model | optimizer | sm_90 | gfx942 | tpu_v5p | numeric-oracle reference |
+|-------|-----------|:-----:|:------:|:-------:|--------------------------|
+| transformer | adamw | L3 🟡 | L1 🟡 | L3 🟡 | m/v EMA + bias-corrected decoupled-WD apply |
+| transformer | lion | L3 🟡 | L1 🟡 | L3 🟡 | sign-momentum update; ema refresh |
+| transformer | grokfast | L3 🟡 | L1 🟡 | L3 🟡 | slow-grad EMA amplify → AdamW apply |
+| transformer | grokadamw | L3 🟡 | L1 🟡 | L3 🟡 | EMA amplify (+Q3 quant path) → AdamW apply |
+| transformer | looksam | L3 🟡 | L1 🟡 | L3 🟡 | SAM ascent ‖g‖ (DPP reduce) → perturb/restore → apply |
+| transformer | prodigy | L3 🟡 | L1 🟡 | L3 🟡 | r/s partials (DPP reduce) → d update → apply |
+| transformer | neuralgrok | L3 🟡 | L1 🟡 | L3 🟡 | psi-net |g| amplifier → AdamW apply |
+| transformer | muon | L3 🟡 | L1 🟡 | L3 🟡 | Frobenius ‖M‖_F (DPP) → Newton-Schulz (MFMA) → apply |
+| transformer | supergrok11 | L3 🟡 | L1 🟡 | L3 🟡 | cosine gate (DPP num/den) → smart-grad Adam |
+| transformer | supergrok15 | L3 🟡 | L1 🟡 | L3 🟡 | sharpness gate (DPP) → per-coord alpha → smart-grad Adam |
+| transformer | supergrok2 | L3 🟡 | L1 🟡 | L3 🟡 | CSA/HCA fwd (MFMA) + GRU+PEER + bilevel backward adjoint |
+| vit | adamw | L3 🟡 | L1 🟡 | L3 🟡 | m/v EMA + bias-corrected decoupled-WD apply |
+| vit | lion | L3 🟡 | L1 🟡 | L3 🟡 | sign-momentum update; ema refresh |
+| vit | grokfast | L3 🟡 | L1 🟡 | L3 🟡 | slow-grad EMA amplify → AdamW apply |
+| vit | grokadamw | L3 🟡 | L1 🟡 | L3 🟡 | EMA amplify (+Q3 quant path) → AdamW apply |
+| vit | looksam | L3 🟡 | L1 🟡 | L3 🟡 | SAM ascent ‖g‖ (DPP reduce) → perturb/restore → apply |
+| vit | prodigy | L3 🟡 | L1 🟡 | L3 🟡 | r/s partials (DPP reduce) → d update → apply |
+| vit | neuralgrok | L3 🟡 | L1 🟡 | L3 🟡 | psi-net |g| amplifier → AdamW apply |
+| vit | muon | L3 🟡 | L1 🟡 | L3 🟡 | Frobenius ‖M‖_F (DPP) → Newton-Schulz (MFMA) → apply |
+| vit | supergrok11 | L3 🟡 | L1 🟡 | L3 🟡 | cosine gate (DPP num/den) → smart-grad Adam |
+| vit | supergrok15 | L3 🟡 | L1 🟡 | L3 🟡 | sharpness gate (DPP) → per-coord alpha → smart-grad Adam |
+| vit | supergrok2 | L3 🟡 | L1 🟡 | L3 🟡 | CSA/HCA fwd (MFMA) + GRU+PEER + bilevel backward adjoint |
+| mamba | adamw | L3 🟡 | L3 🟡 | L3 🟡 | m/v EMA + bias-corrected decoupled-WD apply |
+| mamba | lion | L3 🟡 | L3 🟡 | L3 🟡 | sign-momentum update; ema refresh |
+| mamba | grokfast | L3 🟡 | L3 🟡 | L3 🟡 | slow-grad EMA amplify → AdamW apply |
+| mamba | grokadamw | L3 🟡 | L3 🟡 | L3 🟡 | EMA amplify (+Q3 quant path) → AdamW apply |
+| mamba | looksam | L3 🟡 | L3 🟡 | L3 🟡 | SAM ascent ‖g‖ (DPP reduce) → perturb/restore → apply |
+| mamba | prodigy | L3 🟡 | L3 🟡 | L3 🟡 | r/s partials (DPP reduce) → d update → apply |
+| mamba | neuralgrok | L3 🟡 | L3 🟡 | L3 🟡 | psi-net |g| amplifier → AdamW apply |
+| mamba | muon | L3 🟡 | L3 🟡 | L3 🟡 | Frobenius ‖M‖_F (DPP) → Newton-Schulz (MFMA) → apply |
+| mamba | supergrok11 | L3 🟡 | L3 🟡 | L3 🟡 | cosine gate (DPP num/den) → smart-grad Adam |
+| mamba | supergrok15 | L3 🟡 | L3 🟡 | L3 🟡 | sharpness gate (DPP) → per-coord alpha → smart-grad Adam |
+| mamba | supergrok2 | L3 🟡 | L3 🟡 | L3 🟡 | CSA/HCA fwd (MFMA) + GRU+PEER + bilevel backward adjoint |
+
+Rows: 33 (model×optimizer) × 3 archs = 99 cells. Tier legend: L3=fwd+bwd+opt fused, L1=optimizer-only fused (model fwd/bwd separate). SG2 gfx942 backward: ATen vendor-neutral adjoint LIVE (CPU) + AMDGCN device adjoint LIVE on hipcc (host-launch 🟡).
+
 ## 2. Per-stage hardware checks (appended as stages complete)
 
 ### Stage 0 — compile correctness
