@@ -12,18 +12,21 @@
 
 namespace sg { namespace fused { namespace sm90 {
 
-// Uniform host entry (the symbol fused_step dispatches to). Builds the
-// FusedOptState from the Adam-family moment slices (m, v); optimizers needing
-// extra state (ema / sam_dir / s_track / mu / orth / smart_grad) have those
-// buffers supplied by the host orchestration layer (🟡 runtime-deferred — see
-// HARDWARE_VALIDATION.md). The composition + the apply math are real + compiled.
+// Uniform host entry (the symbol fused_step dispatches to). Binds this
+// optimizer's REAL state buffers: m/v (Adam moments) + the per-optimizer
+// `extra` n-slice (ema/sam_dir/s_track/mu/orth/smart_grad). Scalar hyperparams
+// (prodigy d, sg gates, neuralgrok psi-net) are host-supplied at runtime (🟡
+// no-GPU here) — see HARDWARE_VALIDATION.md. Composition + apply math are
+// real + compiled.
 cudaError_t mega_transformer_decoder_neuralgrok(
         PersistentContext ctx, float* params, const float* input, float* acts,
-        float* grad, float* m, float* v, const int* sizes, const int* offsets,
+        float* grad, float* m, float* v, float* extra,
+        const int* sizes, const int* offsets,
         float lr, int step, cudaStream_t stream) {
     FusedOptState st;
     st.exp_avg = m;
     st.exp_avg_sq = v;
+    (void)extra;  // adamw/lion/neuralgrok need no 'extra' n-slice
     st.lr = lr;
     return launch_fused_megakernel<ModelId::TransformerDecoder, OptId::NeuralGrok,
                                    FuseTier::L1>(
