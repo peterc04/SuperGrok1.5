@@ -1129,3 +1129,100 @@ reductions + register accumulators, 0 LDS bytes). Longer sequences stream K/V in
 | 5 | vit_gfx942_matmul_bias | patch/QKV/out/FFN/head MFMA-core instr counts non-zero; matrix unit fed | §Stage 5 vit MFMA |
 | 5 | vit_gfx942_attention | DPP-max + online-softmax vs ATen within a few ulps | §Stage 5 vit softmax |
 | 5 | vit layernorm DPP | two-DPP mean/var vs ATen LayerNorm within ~1 ulp | §Stage 5 vit DPP |
+
+---
+
+## Stage 5 — reduction-bearing optimizers AMD-native (looksam/muon/prodigy/sg11/sg15) 🟡
+
+Five reduction-bearing gfx942 optimizer kernels now carry a REAL hand-written
+AMDGCN reduction (section (B), `#if defined(__AMDGCN__) || defined(__HIPCC__)`)
+alongside the UNCHANGED ATen host orchestration (section (A),
+`#if !defined(__AMDGCN__)`). Each follows the proven mamba3/attention two-pass
+single-header pattern: the host launchers + public entry points resolve
+byte-for-byte for the thin `.hip.cpp` TUs, and the device pass compiles the
+hand-written reductions built on
+`csrc/backends/hip/gfx942/amdgcn_primitives.hip.hpp` (`namespace amd`). The
+gate-only workitem/launch shim (`threadIdx/blockIdx/__global__/__shared__` via
+the AMDGCN ISA builtins under `#if defined(__AMDGCN__) && !defined(__HIPCC__)`)
+is copied verbatim from the exemplar.
+
+Every reduction is the canonical 2-level **wave → block → grid** tree from the
+task spec: each thread grid-strides its partials → `amd::wave_reduce_add_dpp`
+(DPP wavefront sum, replacing `__shfl`/`__shfl_xor` butterflies) → lane 0 of
+each wavefront writes to an LDS slot → `workgroup_barrier_release` → the first
+wavefront reduces the slots with a second DPP reduce → one thread does
+`amd::atomic_add_agent_f32` to the global accumulator (§2.13 AGENT scope — AMD
+has no DSMEM, so cross-workgroup accumulation uses an XCD-visible global atomic).
+
+**Per-file reduction kernels (the high-value AMDGCN piece; APPLY stays ATen):**
+- **looksam** — `looksam_gfx942_sumsq_reduce`: the SAM gradient L2 norm
+  ‖g‖ = sqrt(Σ gᵢ²) as a global sum-of-squares; host does the final
+  sqrt/rsqrt for the 1/‖g‖ perturbation scale. 1 AGENT atomic. (Reference
+  exemplar — already in place; re-verified.)
+- **muon** — `muon_gfx942_frobenius_reduce`: the momentum-buffer Frobenius norm
+  ‖M‖_F = sqrt(Σ_ij M_ij²) that normalizes the Newton-Schulz iterate (flat sum
+  over numel); host does sqrt + 1/‖M‖_F. 1 AGENT atomic. Newton-Schulz GEMMs
+  stay on rocBLAS MFMA.
+- **prodigy** — `prodigy_gfx942_rs_reduce`: the r-sum and s-sum global
+  reductions TOGETHER in one pass (mirrors the sm_90 `prodigy_reduce_kernel`):
+  r = Σ gᵢ·(p_initᵢ − pᵢ)·d_prev, s = Σ d_prev²·|gᵢ|; two DPP reduces, two LDS
+  trees, **2 AGENT atomics**. Host forms d_new = max(d_prev, r/(|s|+1e-12)).
+- **supergrok11** — `supergrok11_gfx942_cosine_reduce`: the cosine-gate
+  3-quantity reduction in one pass: num = Σ g·m, den_g = Σ g², den_m = Σ m²;
+  three DPP reduces, three LDS trees, **3 AGENT atomics**. Host forms
+  gate = clamp(num / sqrt(den_g·den_m + 1e-12), 0, 1).
+- **supergrok15** — `supergrok15_gfx942_sharpness_reduce`: the sharpness
+  reduction Σ_i sharpnessᵢ (global gate signal) as a global sum. 1 AGENT atomic.
+  Host forms the sharpness-driven gate scale (e.g. mean = Σ/n).
+
+**APPLY decision:** for ALL five, the per-element optimizer update (the
+Adam/Lion/SAM/Newton-Schulz apply after the reduction) stays on the proven ATen
+host path; only the reduction — the high-value AMDGCN piece — is migrated.
+
+**Gate-caught fixes during bring-up:**
+- The bare gate has no `<cmath>`, so `fabsf` is unavailable in the device pass;
+  prodigy's |gᵢ| uses `__builtin_fabsf` (valid under hipcc too). Verified via the
+  gate before wiring it in.
+- The host-pass guard `#if !defined(__AMDGCN__)` around the ATen/torch block is
+  mandatory — `torch/extension.h` pulls in `<cuda.h>`/ATen, which the
+  free-standing amdgcn target cannot resolve (matches the looksam exemplar).
+- DPP-ctrl/sched-mask are compile-time-constant templates (inherited from
+  `amd::wave_reduce_add_dpp`); the multi-quantity reductions reuse the verified
+  primitive rather than open-coding a second butterfly.
+- All AGENT atomics route through `amd::atomic_add_agent_f32` (the gate maps
+  `__hip_atomic_fetch_add` + `__HIP_MEMORY_SCOPE_AGENT` to the host `__atomic_*`
+  stub for the free-standing compile).
+
+**Verification (this env):**
+- `bash scripts/amdgcn_check.sh --header grokking_optimizers/kernels/gfx942/looksam_gfx942.hip.hpp`
+  → `AMDGCN_OK`
+- `bash scripts/amdgcn_check.sh --header grokking_optimizers/kernels/gfx942/muon_gfx942.hip.hpp`
+  → `AMDGCN_OK`
+- `bash scripts/amdgcn_check.sh --header grokking_optimizers/kernels/gfx942/prodigy_gfx942.hip.hpp`
+  → `AMDGCN_OK`
+- `bash scripts/amdgcn_check.sh --header grokking_optimizers/kernels/gfx942/supergrok11_gfx942.hip.hpp`
+  → `AMDGCN_OK`
+- `bash scripts/amdgcn_check.sh --header grokking_optimizers/kernels/gfx942/supergrok15_gfx942.hip.hpp`
+  → `AMDGCN_OK`
+- `PYTHONPATH=. python grokking_optimizers/compile.py --self-test` →
+  `137 passed, 1 failed` (the 1 failure is the pre-existing sm_90 flag-baseline
+  regression test, untouched by this change)
+- `ruff check grokking_optimizers/` → `All checks passed!`
+- sm_90 CUDA build UNAFFECTED — only the five gfx942 optimizer headers changed.
+
+**Hardware checks (deferred — 🟡, no MI300X / no hipcc in this env):**
+- **MI300X numerics:** each reduction (‖g‖, ‖M‖_F, r/s, num/den_g/den_m,
+  Σ sharpness) vs the ATen reference within a few ulps end-to-end.
+- **wave→block→AGENT bit-parity:** the DPP wave reduce → LDS block tree →
+  AGENT-atomic grid sum reproduces the rocPRIM segmented-reduction result
+  bit-for-bit (modulo the non-associative-atomic ordering tolerance).
+- **Launch wiring:** the §5.LAUNCH `hipLaunchKernelGGL` sequence becomes live
+  once each optimizer TU migrates `.hip.cpp → .hip`.
+
+| stage | cell | deferred check | command ref |
+|-------|------|----------------|-------------|
+| 5 | looksam_gfx942_sumsq_reduce | ‖g‖ sum-of-squares vs ATen `.norm()` within a few ulps | §Stage 5 reduction optimizers |
+| 5 | muon_gfx942_frobenius_reduce | ‖M‖_F vs ATen `.norm()` within a few ulps | §Stage 5 reduction optimizers |
+| 5 | prodigy_gfx942_rs_reduce | r/s dual sum vs sm_90 prodigy_reduce_kernel bit-parity | §Stage 5 reduction optimizers |
+| 5 | supergrok11_gfx942_cosine_reduce | num/den_g/den_m triple sum vs ATen within a few ulps | §Stage 5 reduction optimizers |
+| 5 | supergrok15_gfx942_sharpness_reduce | Σ sharpness vs ATen `.sum()` within a few ulps | §Stage 5 reduction optimizers |
