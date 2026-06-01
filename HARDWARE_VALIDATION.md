@@ -1415,3 +1415,76 @@ Device kernels force-instantiated at the grokking shapes (`d_model=8`,
 | 5 | sg2_hca_attention_fwd_mfma | HCA mean-pool compress + dense MFMA attn + DPP softmax vs ATen hca path | §Stage 5 supergrok2 |
 | 5 | sg2_peer_route_kernel | product-key top-k + candidate softmax + inline expert MLP vs ATen peer_route | §Stage 5 supergrok2 |
 | 5 | sg2_gru_gate_kernel | z/r/h̃ gates + convex update vs ATen gru_step within a few ulps | §Stage 5 supergrok2 |
+| 7 | 3d_parallel_weak_scaling | weak-scaling efficiency ≥70% to 32 GPUs (IB/NVLink) | §Stage 7 launch |
+| 7 | zero3_state_shard | per-rank optimizer-state memory ≈ 1/DP of replicated (SG2 ~5–6× state) | §Stage 7 ZeRO-3 |
+| 7 | fused_adapter_no_double_apply | L3 step is a no-op on the math (update already applied in fused launch); no double update | §Stage 7 adapter |
+| 7 | amd_multinode_allgather | AMD cross-node ZeRO-3 all-gather trails NVIDIA (§2.13) — record the gap, not a pass/fail | §Stage 7 §8.6 |
+
+---
+
+## Stage 7 — distributed (3D + ZeRO-3 + fused-kernel adapter)
+
+Python-level orchestration on top of the existing optimizers + the Stage-6
+fused megakernel. **No kernel changes**, **no optimizer `.step()` math touched**
+— this is purely the multi-GPU / multinode comms + framework-integration layer
+(§8). Everything is **import-safe** and degrades to a single-process world with
+no GPU / no launched job / no DeepSpeed (the self-test path), so the runtime
+multi-GPU checks below are hardware-deferred 🟡.
+
+**New modules**
+
+- `grokking_optimizers/distributed.py`
+  - `ParallelConfig` — DP×TP×PP sizes, `zero_stage` (0/1/2/3),
+    `backend` (`nccl`/`rccl`/`gloo`), `use_megakernel`. No sequence/4th dim
+    (short-sequence models, §8.1).
+  - `DistributedContext` — lazily builds the DP/TP/PP process groups from the
+    standard Megatron rank-mesh (TP fastest-varying so TP all-reduces land on
+    the tightest fabric, §8.6). Every `torch.distributed` call is guarded; with
+    no launch it is a 1-rank, all-dims-=1 no-op context.
+  - `ZeRO3Sharder` (§8.3) — **DeepSpeed-or-native**: uses DeepSpeed's ZeRO-3
+    engine when importable (`build_ds_config` emits the matching stage-3 config),
+    else a native `torch.distributed` shim (`partition_optimizer_state` →
+    contiguous 1/DP slice per rank; `reduce_scatter_grads`; `all_gather_params`
+    on-step). The all-gather is the §2.13 cross-node-sensitive collective.
+- `grokking_optimizers/megakernel_engine.py` (§8.4 — the tricky bit)
+  - `MegakernelOptimizer(torch.optim.Optimizer)` — presents the fused L3 step as
+    a standard `.step()` (DeepSpeed `client_optimizer` shape); for L2/L3 the
+    update already happened in the fused launch so `.step()` is a **no-op on the
+    math** (re-running would double-apply); for L1/L0 it delegates to the inner
+    optimizer's real `.step()`.
+  - `FusedBackwardHook` — `intercept_backward()` returns True for L2/L3 and
+    **suppresses the framework's autograd backward** (and runs the fused launch
+    instead); returns False for L0/L1 so the framework runs its own backward.
+    `as_tensor_hook()` neutralizes an accidental `loss.backward()` for fused
+    cells. The tier comes from `megakernel.solve(model, optimizer, arch)`.
+- `tests/hw/test_3d_parallel.py` — torchrun harness that sizes a ~7B decoder,
+  shards it TP×PP with ZeRO-3 over DP, runs a few fused steps, reports
+  steps/s. Import-clean; the hardware test **skips** unless `WORLD_SIZE>1` and a
+  CUDA/ROCm device is visible. The CPU-safe sizing / efficiency / partition
+  tests run unconditionally.
+
+**Launch (hardware-deferred 🟡):**
+
+```bash
+# 3D-parallel 5–10B-param harness; record steps/s per launch, then compare
+# across world sizes for weak-scaling efficiency.
+torchrun --nnodes=$N --nproc_per_node=8 \
+  tests/hw/test_3d_parallel.py --params 7e9 --dp 8 --tp 4 --pp 2 --zero 3
+```
+
+**Pass criterion (deferred):** **≥ 70 % weak-scaling efficiency to 32 GPUs** on
+an InfiniBand / NVLink-class fabric, where efficiency = `scaled_throughput /
+(base_throughput × scale_factor)` (8→16→32 GPUs at fixed per-GPU batch). On AMD
+(RCCL) the cross-node ZeRO-3 all-gather (§2.13) is expected to pull efficiency
+below the NVIDIA number at the same scale — record the gap rather than failing
+the AMD run on the NVIDIA bar.
+
+**Verification (this env — no GPU / no launch / no DeepSpeed):**
+- `python -c "import grokking_optimizers.distributed, grokking_optimizers.megakernel_engine"`
+  → `IMPORT_OK`
+- `PYTHONPATH=. python grokking_optimizers/compile.py --self-test` →
+  `137 passed, 1 failed` (the 1 failure is the pre-existing sm_90 flag-baseline
+  regression; no new failures from Stage 7)
+- `ruff check grokking_optimizers/ tests/` → `All checks passed!`
+- `tests/hw/test_3d_parallel.py` run with no launch → `[stage7] SKIP: no
+  distributed launch` (and the CPU-safe sizing/efficiency/partition tests pass).
