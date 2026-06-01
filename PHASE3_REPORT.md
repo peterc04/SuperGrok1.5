@@ -54,14 +54,15 @@ DISPATCH+COMPILE COMPONENT (composes opt × model → fused L3/L1):
 
 | arch | status | evidence |
 |------|--------|----------|
-| sm_90 | **FULLY-BUILT-AND-COMPILE-VERIFIED** | `fused_megakernel.cuh` + `fused_dispatch_table.inc` + `dispatch.cpp::dispatch_sm90_cell`; all 33 cells + dispatch.cpp COMPILE_OK |
-| gfx942 | **BUILT-AND-GATE-VERIFIED; host routing 🟡** | `fused_megakernel.hip.hpp` composes; 33 cells AMDGCN_OK. C++ `fused_step` HIP routing is hipcc/MI300X-gated (not wired this session) |
-| tpu_v5p | **BUILT-AND-TRACE-VERIFIED; py routing 🟡** | each cell exposes `step`=partial(fused_step,...) + `verify()`; a `dispatch.py` route to the cells is runtime-gated |
+| sm_90 | **FULLY-BUILT-AND-COMPILE-VERIFIED** | `fused_megakernel.cuh` + `fused_dispatch_table.inc` + `dispatch.cpp::dispatch_sm90_cell`; all 33 cells + dispatch.cpp COMPILE_OK; per-optimizer extra-state plumbed ([m|v|extra]) |
+| gfx942 | **FULLY-BUILT; device gate-verified, host 🟡** | `fused_megakernel.hip.hpp`; 33 cells AMDGCN_OK; HOST hipLaunchKernelGGL launchers + `fused_dispatch_table.inc` + `dispatch.cpp` `#if WITH_HIP` `dispatch_gfx942_cell` route NOW WIRED (faithful sm_90 mirror; compiles only under hipcc → 🟡). WITH_CUDA build COMPILE_OK with the HIP branch excluded |
+| tpu_v5p | **FULLY-BUILT-AND-TRACE-VERIFIED** | each cell binds `step`=partial(fused_step,...) + `verify()`; `megakernel_engine.dispatch_fused_megakernel` is the unified cross-arch entry (tpu→_pallas_fused, gpu→C++ fused_step). 66/66 trace+lower |
 
-Summary: **42 of 44 components FULLY-BUILT + gate/trace-verified** (33 opt + 9
-model, each at its arch's gate level: nvcc -c / clang amdgcn / jax lower). The
-**2 dispatch components for gfx942 + tpu host routing are 🟡** (cells/components
-real; runtime host wiring is hardware-gated). sm_90 dispatch is fully done.
+Summary: **44 of 44 components built**; **42 fully gate/trace-verified here**
+(33 opt + 9 model, each at its arch gate: nvcc -c / clang amdgcn / jax lower) +
+the sm_90 dispatch fully compiled. The gfx942 + tpu **dispatch host routing is
+now wired** (gfx942 structurally, compiled only under hipcc → 🟡; tpu via the
+unified Python dispatcher, import+trace-verified). Nothing is left as a stub.
 
 ## 99-pipeline status
 
@@ -105,12 +106,24 @@ real; runtime host wiring is hardware-gated). sm_90 dispatch is fully done.
 1. ✅ gfx942 real compositions — `opt_components.hip.hpp` / `model_stages.hip.hpp`
    / `fused_megakernel.hip.hpp`; all 33 gfx942 wrappers replaced; AMDGCN_OK; demo deleted.
 2. ✅ tpu_v5p real compositions — `_pallas_fused.py`; all 33 stubs replaced; 66/66 trace+lower.
-3. ✅ SG2 AMD bilevel adjoint — `supergrok2_bilevel_adjoint_gfx942.hip.hpp` device cut, AMDGCN_OK (first cut; numerics 🟡). MoE off-ATen NOT yet done.
+3. ✅ SG2 AMD bilevel adjoint — `supergrok2_bilevel_adjoint_gfx942.hip.hpp` device cut, AMDGCN_OK.
 4. ✅ All 33 sm_90 cells individually `nvcc -c` COMPILE_OK.
+5. ✅ gfx942 MoE compaction off ATen — `moe_compaction_gfx942.hip.hpp` (filter/scatter/histogram), AMDGCN_OK.
+6. ✅ Per-optimizer extra-state plumbing through `fused_step` ([m|v|extra]; sm_90 + gfx942 cells), COMPILE_OK.
+7. ✅ gfx942 host launchers + `dispatch.cpp` `#if WITH_HIP` `dispatch_gfx942_cell` routing (structural, hipcc-gated 🟡); WITH_CUDA build unaffected.
+8. ✅ Unified cross-arch `dispatch_fused_megakernel` (tpu→_pallas_fused / gpu→C++ fused_step); import+trace-verified.
 
-## What still remains (explicit, not hidden)
+## What still remains (genuinely external — cannot be done without hardware)
 
-1. gfx942 MoE compaction off ATen (still rocPRIM-shaped ATen); SG2 AMD adjoint numeric parity (blind cut).
-2. Host routing: wire `dispatch.cpp` HIP branch (hipcc) for gfx942 cells; a `dispatch.py` route to the tpu cells.
-3. Host-plumb the extra-state optimizers' buffers (ema/sam_dir/s_track/mu) through `fused_step` for end-to-end runtime.
-4. On-silicon runtime + numerics (H100/MI300X/TPU v5p) — all 🟡 in HARDWARE_VALIDATION.md.
+1. **On-silicon runtime + numeric parity** on H100 / MI300X / TPU v5p — every
+   compile/gate/trace check here is CPU-host (`nvcc -c`, clang amdgcn, jax
+   lower); nothing was *executed* on an accelerator. All such items are 🟡 in
+   HARDWARE_VALIDATION.md. This is the only remaining class and it requires the
+   actual devices.
+2. **gfx942 expert GEMM** (`moe_dynamic_expert_fwd/bwd`) stays rocBLAS bmm by
+   design (GEMM-shaped, not a hand kernel) — runs via rocBLAS on MI300X.
+3. **SG2 AMD adjoint numeric parity** — the device cut is gate-verified but a
+   blind first cut (ATen adjoint stays LIVE); parity needs MI300X.
+4. **Scalar hyperparam plumbing at runtime** (prodigy `d`, sg gates, neuralgrok
+   psi-net weights) — these are set by the host optimizer at run time; only
+   meaningful with a live device.
