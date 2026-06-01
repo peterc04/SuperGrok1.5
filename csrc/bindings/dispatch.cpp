@@ -291,11 +291,15 @@ void fused_step(const std::string& model, const std::string& optimizer,
  auto p = params.data_ptr<float>();
  auto in = input.numel() ? input.data_ptr<float>() : p;
  auto gr = grad.numel() ? grad.data_ptr<float>() : acts.data_ptr<float>();
- // state holds [m | v]; split it (fallback to zeros if undersized).
+ // state holds [m | v | extra]; split it. `extra` is the per-optimizer third
+ // per-element buffer (ema/sam_dir/s_track/mu/orth/smart_grad); each cell binds
+ // it to its FusedOptState field (adamw/lion/neuralgrok ignore it). Sized 3n;
+ // reallocated to zeros if the caller passed an undersized state tensor.
  torch::Tensor mv = state;
- if (mv.numel() < 2 * n) mv = torch::zeros({2 * n}, params.options());
+ if (mv.numel() < 3 * n) mv = torch::zeros({3 * n}, params.options());
  float* m = mv.data_ptr<float>();
  float* v = m + n;
+ float* extra = m + 2 * n;
 
  fused::sm90::PersistentContext ctx{
  g_next.data_ptr<int>(),
@@ -308,7 +312,7 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // not-compiled signal below).
  bool found = false;
  cudaError_t err = fused::sm90::dispatch_sm90_cell(
- model, optimizer, ctx, p, in, acts.data_ptr<float>(), gr, m, v,
+ model, optimizer, ctx, p, in, acts.data_ptr<float>(), gr, m, v, extra,
  sizes.data_ptr<int>(), offsets.data_ptr<int>(), lr, /*step=*/1,
  /*stream=*/0, &found);
 
