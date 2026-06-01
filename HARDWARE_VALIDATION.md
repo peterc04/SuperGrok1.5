@@ -493,3 +493,82 @@ softmax, gradient atomics) are untouched — float `redux` is Blackwell-only
 | 3.1 | moe count | expert_counts bit-parity vs per-lane atomics | §Stage 3.1 parity |
 | 3.1 | moe filter | compact_count + content parity | §Stage 3.1 parity |
 | 3.1 | moe count | global-atomic traffic drop | §Stage 3.1 ncu |
+
+---
+
+## Stage 3.2 — cp.async background loads (NVIDIA PTX maximization §4.2)
+
+Hand-issued `cp.async.{cg,ca}.shared.global` + commit/wait pipelines for the
+memory-bound global→shared staging loads in the model attention path and the
+SG2 CSA/HCA attention path, with the loads-in-flight (pipeline) depth exposed
+as the autotuner dimension `SG_TUNED_ASYNC_DEPTH`.
+
+**Helpers added** (`csrc/backends/cuda/sm_90/primitives.cuh`, namespace
+`sg::sm90::primitives`, new §4.2 section appended at end — the Stage 3.1
+reduction section was NOT touched):
+- `cp_async_cg_16(smem, gmem)` — 16B (float4) `cp.async.cg.shared.global`.
+- `cp_async_ca_4(smem, gmem)`  — 4B (scalar float) `cp.async.ca.shared.global`.
+- `cp_async_commit()`          — `cp.async.commit_group`.
+- `cp_async_wait_group<N>()`   — `cp.async.wait_group N` (N a PTX immediate).
+- `cp_async_wait_all()`        — `wait_group 0` (drain all).
+All four are guarded `#if __CUDA_ARCH__ >= 800` with a **synchronous-copy
+fallback** (plain `float4`/`float` store; commit/wait become no-ops) so the
+pre-Ampere codegen matrix still compiles and is numerically identical.
+
+**Kernels converted:**
+- Model attention — `grokking_optimizers/kernels/sm_90/attention_sm90.cuh`,
+  `fmha_softmax_kernel`: the raw score row `S[i*N + 0..N)` is staged into a new
+  `sraw[N]` shared buffer via a depth-pipelined `cp.async.ca` loop (one strided
+  tile of `blockDim.x` 4B copies per group, up to ASYNC_DEPTH groups in flight),
+  then scale+mask+max read it from shared. Shared alloc grew `N → 2*N` floats
+  (`sh[N]` working + `sraw[N]` staging). The fwd/bwd `smem_attention_*_kernel`
+  compute QKᵀ directly into shared with no reused global→shared staging loop, so
+  they were intentionally left as-is (no clean memory-bound staging target).
+- SG2 CSA/HCA — `grokking_optimizers/kernels/sm_90/supergrok2_sm90.cuh`,
+  `csa_attention_kernel` + `hca_attention_kernel`: the per-thread query vector
+  `qv[0..head_dim)` is REUSED across every top-k entry and every window token —
+  the reused global→shared load. New `csa_stage_query_async()` helper stages
+  each thread's `head_dim`-float query slice into a private dynamic-shared slot
+  (`block*head_dim` floats) via `cp.async.ca` split into `kCsaAsyncDepth`
+  committed groups, then `wait_all`. Launches now pass the dynamic smem and call
+  `set_attn_dyn_smem()` to opt into >48KB dynamic shared when needed. Streaming
+  K/V stay direct (read once, no reuse → no staging benefit).
+
+**How `SG_TUNED_ASYNC_DEPTH` is consumed:** it is the number of in-flight
+cp.async groups / staging slots. In `fmha_softmax_kernel` it is the number of
+row-tile groups primed and kept in flight (`cp_async_wait_group<depth-1>` per
+consumed tile); in the CSA/HCA path it is the number of committed query-chunk
+groups (`kCsaAsyncDepth`). Clamped to `[1,4]` at every use site. Two distinct
+values produce different code (verified below).
+
+**PTX / codegen survival (verified on this host, nvcc 12.0, `-arch=sm_90a`):**
+- Tiny TU calling `cp_async_cg_16` / `cp_async_ca_4` / commit / wait emits, in
+  the PTX: `cp.async.cg.shared.global [...], [...], 16;` (×1),
+  `cp.async.ca.shared.global [...], [...], 4;` (×1), `cp.async.commit_group;`
+  (×2), and `cp.async.wait_group 0;` / `cp.async.wait_group 1;`. None optimized
+  away.
+- Depth knob is live: compiling the staging-prime pattern with
+  `-DSG_TUNED_ASYNC_DEPTH={1,2,4}` emits {1,2,4} `cp.async.commit_group`
+  instructions and `cp.async.wait_group {0,1,3}` respectively — distinct SASS
+  per depth, confirming the autotuner dimension is actually consumed.
+
+**Hardware checks (deferred — all 🟡, no CUDA device in this env):**
+- Async-copy + overlap confirmation:
+  `ncu --metrics smsp__inst_executed_pipe_lsu,l1tex__data_pipe_lsu_wavefronts_mem_shared`
+  on `fmha_softmax_kernel` and `csa/hca_attention_kernel` — expect cp.async
+  (LDGSTS) issue on the LSU pipe and improved load/compute overlap (lower load
+  stall) vs the pre-change synchronous-load build.
+- Numeric parity: attention output (`P`/`csa_ctx`/`hca_ctx`) must be
+  **bit-identical** (rtol=0, every element) to the pre-change synchronous-load
+  path — a correctly waited cp.async lands byte-identical shared data. Run the
+  same inputs through the Stage-3.2 build and a `-DSG_FORCE_SYNC_STAGING` (or
+  pre-Ampere fallback) build and diff the output tensors.
+- Depth sweep: build with `SG_TUNED_ASYNC_DEPTH ∈ {1,2,3,4}`; all must produce
+  the identical output tensor (depth changes scheduling only, never numerics)
+  while ncu LSU-overlap metrics shift — the autotuner picks the fastest depth.
+
+| stage | cell | deferred check | command ref |
+|-------|------|----------------|-------------|
+| 3.2 | fmha_softmax / csa+hca attn | cp.async LDGSTS + load/compute overlap | §Stage 3.2 ncu |
+| 3.2 | fmha_softmax / csa+hca attn | output bit-parity vs sync-load path | §Stage 3.2 parity |
+| 3.2 | all §4.2 kernels | invariant output across ASYNC_DEPTH 1–4 | §Stage 3.2 depth sweep |
