@@ -477,6 +477,74 @@ inline cudaError_t gemm_bf16(
     return sm90_run_gemm<cutlass::bfloat16_t>(M, N, K, A, B, C, stream);
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+//  TF32 (tfloat32_t) tensor-core GEMM — the FP32 tensor-core path (LIVE).
+//
+//  FP32 inputs (plain `float` buffers) are fed to the Sm90 WGMMA mainloop with
+//  ElementA/B = cutlass::tfloat32_t. tfloat32_t is a 4-byte type that occupies
+//  the SAME storage as `float`; the WGMMA hardware rounds each operand's
+//  mantissa to TF32's 10 explicit bits at MMA-issue time, accumulating in FP32.
+//  So a `const float*` is reinterpret_cast to `const tfloat32_t*` (standard
+//  CUTLASS idiom — no separate conversion buffer needed) and the result lands
+//  in an FP32 C buffer, matching the FP32 output of the cuBLAS/scalar path.
+//
+//  PRECISION NOTE (🟡 numeric parity vs scalar FP32): TF32 carries a 10-bit
+//  mantissa vs FP32's 23. This is the accepted, expected tensor-core "FP32"
+//  mode (same precision class as cuBLAS CUBLAS_TF32_TENSOR_OP_MATH and
+//  PyTorch's allow_tf32), NOT bit-identical to a scalar FP32 triple-loop. It is
+//  an accuracy/precision tradeoff, not a bug. Callers demanding exact FP32 must
+//  force the scalar path (the models gate this via SG_FORCE_SCALAR_FP32).
+//
+//  ALIGNMENT: tfloat32_t is 32-bit, so 128-bit vector access = 4 elements
+//  (AlignA/B = 128/32). The Sm90 TF32 MMA atom (SM90_MMA_TF32) is selected
+//  automatically by CollectiveBuilder<arch::Sm90, OpClassTensorOp, tfloat32_t,
+//  ...>. Tile/cluster shapes are the same proven 128x128x64 / 1x1x1 used by the
+//  half/bf16 builders above.
+// ─────────────────────────────────────────────────────────────────────────
+
+// Run a single row-major C = A*B with FP32 (TF32 MMA) accumulate. A/B/C are
+// plain float buffers; A and B are reinterpreted as tfloat32_t for the WGMMA.
+inline cudaError_t sm90_run_gemm_tf32(
+    int M, int N, int K,
+    const float* A, const float* B, float* C,
+    cudaStream_t stream)
+{
+    using G          = Sm90Gemm<cutlass::tfloat32_t>;
+    using Gemm       = typename G::Gemm;
+    using ElementAcc = typename G::ElementAcc;
+    return sm90_run_gemm_cached<Gemm, cutlass::tfloat32_t, cutlass::tfloat32_t,
+                                ElementAcc>(
+        M, N, K, reinterpret_cast<const void*>(A),
+        reinterpret_cast<const void*>(B), C, stream);
+}
+
+// LayoutB-parameterised TF32 variant: C[MxN] = A[MxK] · op(B), op(B) is B
+// (LayoutBT=RowMajor) or Bᵀ (LayoutBT=ColumnMajor). FP32 buffers in/out, TF32
+// MMA. Mirrors sm90_run_gemm_bt but with the tfloat32_t element type.
+template <typename LayoutBT>
+inline cudaError_t sm90_run_gemm_tf32_bt(
+    int M, int N, int K,
+    const float* A, const float* B, float* C,
+    cudaStream_t stream)
+{
+    using G          = Sm90GemmBT<cutlass::tfloat32_t, LayoutBT>;
+    using Gemm       = typename G::Gemm;
+    using ElementAcc = typename G::ElementAcc;
+    return sm90_run_gemm_cached<Gemm, cutlass::tfloat32_t, cutlass::tfloat32_t,
+                                ElementAcc>(
+        M, N, K, reinterpret_cast<const void*>(A),
+        reinterpret_cast<const void*>(B), C, stream);
+}
+
+// FP32 in / FP32 acc / FP32 out via the TF32 tensor-core mainloop (row-major).
+inline cudaError_t gemm_tf32(
+    int M, int N, int K,
+    const float* A, const float* B, float* C,
+    cudaStream_t stream)
+{
+    return sm90_run_gemm_tf32(M, N, K, A, B, C, stream);
+}
+
 // Softplus+bias post-pass (used by SG2 dt_proj fused path).
 static __global__ void softplus_bias_kernel(
     float* __restrict__ C, const float* __restrict__ bias,

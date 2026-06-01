@@ -207,20 +207,27 @@ smem_attention_fwd_kernel(
 //  kernel (non-CUTLASS path) is left untouched.
 // ─────────────────────────────────────────────────────────────────────────
 
-// Element trait: map activation type -> CUTLASS input element.
+// Element trait: map activation type -> CUTLASS input element. FP32 maps to
+// cutlass::tfloat32_t — the LIVE FP32 tensor-core FMHA path: the QKᵀ and P·V
+// WGMMA mainloops read the float buffers as TF32 (10-bit mantissa, FP32
+// accumulate). The intermediate scores S and probs P stay FP32.
 template <typename ActT> struct cutlass_elem;
 template <> struct cutlass_elem<__half>        { using type = cutlass::half_t; };
 template <> struct cutlass_elem<__nv_bfloat16> { using type = cutlass::bfloat16_t; };
+template <> struct cutlass_elem<float>         { using type = cutlass::tfloat32_t; };
 
-// The Sm90 collective FMHA path only supports the CUTLASS half/bf16 element
-// types (above). FP32 activations (ActT=float, used by the decoder/ViT
-// instantiation TUs) fall back to the SMEM attention kernel — see the dispatch
-// in attention_forward. This trait lets that dispatch be resolved at compile
-// time without instantiating cutlass_fmha_forward<float> (which would require a
-// non-existent cutlass_elem<float> and an FP32-input CUTLASS GEMM).
+// The Sm90 collective FMHA path supports half/bf16 directly and FP32 via the
+// TF32 tensor-core MMA (cutlass_elem<float>=tfloat32_t). FP32 attention uses
+// the TF32 collective by DEFAULT. Define SG_FORCE_SCALAR_FP32 to force the
+// exact-FP32 SMEM attention kernel instead. 🟡 numeric parity: TF32 (10-bit
+// mantissa) is NOT bit-identical to the scalar SMEM FP32 (23-bit) path — the
+// accepted FP32 tensor-core precision tradeoff, not a bug.
 template <typename ActT> struct cutlass_fmha_supported { static constexpr bool value = false; };
 template <> struct cutlass_fmha_supported<__half>        { static constexpr bool value = true; };
 template <> struct cutlass_fmha_supported<__nv_bfloat16> { static constexpr bool value = true; };
+#ifndef SG_FORCE_SCALAR_FP32
+template <> struct cutlass_fmha_supported<float>         { static constexpr bool value = true; };
+#endif
 
 // Per-thread CUTLASS workspace (lazily grown). Reused across calls.
 inline void* fmha_get_workspace(size_t bytes) {

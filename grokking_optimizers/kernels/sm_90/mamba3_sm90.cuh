@@ -68,6 +68,7 @@
 #include <cuda_bf16.h>
 #include <cmath>
 #include <algorithm>
+#include <type_traits>
 
 #ifdef WITH_CUTLASS
 #include "csrc/backends/cuda/sm_90/mma.cuh"
@@ -191,6 +192,24 @@ inline cudaError_t gemm_rowmajor_NT(
     const T* A, const T* B, T* C,
     cudaStream_t stream)
 {
+#if defined(WITH_CUTLASS) && !defined(SG_FORCE_SCALAR_FP32)
+    // FP32 tensor-core (TF32) fast-path (LIVE). A[M,K] · Bᵀ (B is [N,K]
+    // row-major) → C[M,N], all FP32 buffers. The Sm90 WGMMA mainloop reads A/B
+    // as cutlass::tfloat32_t (B[N,K] read as Bᵀ via LayoutBT=ColumnMajor) and
+    // accumulates in FP32 — matching this GEMM's float output. 🟡 TF32's 10-bit
+    // mantissa is NOT bit-identical to FP32's 23 — the accepted FP32
+    // tensor-core precision tradeoff, not a bug. On a shape CUTLASS cannot tile
+    // (cudaErrorNotSupported) we fall through to the cuBLAS path below.
+    // (Define SG_FORCE_SCALAR_FP32 to force the exact-FP32 cuBLAS path.)
+    if constexpr (std::is_same<T, float>::value) {
+        cudaError_t tc = mma::sm90_run_gemm_tf32_bt<cutlass::layout::ColumnMajor>(
+            M, N, K,
+            reinterpret_cast<const float*>(A), reinterpret_cast<const float*>(B),
+            reinterpret_cast<float*>(C), stream);
+        if (tc == cudaSuccess) return cudaSuccess;
+        // else: untileable shape → genuine last-resort cuBLAS fallback below.
+    }
+#endif
     cublasSetStream(handle, stream);
     const float alpha = 1.0f, beta = 0.0f;
     cudaDataType_t dt = cublas_traits<T>::dt;
