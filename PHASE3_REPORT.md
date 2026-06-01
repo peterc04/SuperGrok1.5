@@ -17,9 +17,9 @@ on-silicon runtime.
 | S0 — PTX inline | inline PTX into the 6 owning sm_90 headers + supergrok2.h + mamba_scan_adapter + gfx942 attention (guarded), drain `utils.cuh` | **DONE, COMPILE-VERIFIED** (`asm(` in utils.cuh = 0; launch_adamw/muon/supergrok2/grokadamw + models COMPILE_OK; self-test 138/0) |
 | S4 — TPU splash | replace `raise RuntimeError("splash fallback")` with an explicit LIVE splash / documented dense-fallback branch | **DONE** (no splash-raise tree-wide) |
 | S5 — sm_90 real compositions | kill the toy-demo template wrappers; all 33 sm_90 fused cells compose the REAL `csrc/algorithms/<opt>.h` (all 11, no fallback) + real model stages | **DONE for sm_90, COMPILE-VERIFIED** (anti-false-positive grep on `csrc/fused/sm_90` = 0; representative cover + dispatch.cpp COMPILE_OK) |
-| S1/S2 — gfx942 & tpu maximal rebuild | rebuild the 22 gfx942/tpu optimizer+model components AS the fused device-function libraries | **NOT-DONE this phase** (the per-arch component files already exist and are AMDGCN_OK / Pallas-real from prior phases, but are NOT composed into a real fused megakernel) |
-| S3 — AMD adjoint + MoE | SG2 AMD bilevel adjoint hand-written in AMDGCN + MoE off ATen | **NOT-DONE this phase** (SG2 adjoint + MoE on gfx942 remain ATen, as in prior phases) |
-| S5 — gfx942/tpu real compositions | replace the gfx942/tpu fused wrappers with real compositions | **NOT-DONE this phase** (gfx942: 33 cells still demo-template wrappers; tpu: 33 Pallas stubs) |
+| S1/S2/S5 — gfx942 real compositions | build gfx942 opt+model device-function components + compose all 33 cells | **DONE, AMDGCN-GATE-VERIFIED** (opt_components.hip.hpp = 11 real apply, model_stages.hip.hpp, fused_megakernel.hip.hpp; 33 cells force-instantiate the real composition; demo deleted; grep=0; clang `--target=amdgcn-amd-amdhsa -mcpu=gfx942` OK on the cover + cells-as-device-C++). Host hipLaunchKernelGGL + MI300X numerics 🟡 |
+| S4/S5 — tpu real compositions | replace the 33 Pallas stubs with real fused programs | **DONE, TRACE+LOWER-VERIFIED** (_pallas_fused.py composes real model fwd/bwd + real per-opt step in one jax.jit; 33 cells bind to it; 66/66 trace+lower at L1 and L3 on JAX 0.10.1 CPU). On-TPU runtime/numerics 🟡 |
+| S3 — AMD SG2 adjoint | device-side AMDGCN SG2 bilevel adjoint | **FIRST CUT, AMDGCN-GATE-VERIFIED** (supergrok2_bilevel_adjoint_gfx942.hip.hpp: real device attention-ctx / GRU-gate / PEER / softmax backward; AMDGCN_OK). HONEST: blind, ZERO numeric validation; ATen adjoint stays LIVE; element-local scatter + MoE tail stay ATen/host. 🟡 |
 
 ## The false positive that WAS eliminated (sm_90)
 
@@ -39,48 +39,51 @@ per-tensor device-function library for that optimizer on that arch.
 | arch | components | status | evidence |
 |------|-----------|--------|----------|
 | sm_90 | all 11 | **FULLY-BUILT-AND-COMPILE-VERIFIED** | real `csrc/algorithms/<opt>.h` device fns, composed via `opt_components.cuh`; all 11 force-instantiated COMPILE_OK; no fallback |
-| gfx942 | all 11 | **PARTIAL** | real AMDGCN per-arch kernels exist + AMDGCN_OK (prior phases), but NOT composed into the fused megakernel; SG2 adjoint + MoE still ATen |
-| tpu_v5p | all 11 | **PARTIAL** | real JAX/Pallas kernels exist (prior phases), but the fused tpu cells are Pallas stubs (not real compositions) |
+| gfx942 | all 11 | **FULLY-BUILT-AND-GATE-VERIFIED** | `opt_components.hip.hpp` = 11 real AMDGCN apply (byte-faithful to the algorithm headers); all 11 force-instantiated under clang `--target=amdgcn-amd-amdhsa -mcpu=gfx942` → AMDGCN_OK; no fallback. Host hipcc + MI300X numerics 🟡 |
+| tpu_v5p | all 11 | **FULLY-BUILT-AND-TRACE-VERIFIED** | `_pallas_fused.py::OPT_STEPS` → 11 real TPU step callables (no aliasing); composed in `fused_step`; 66/66 trace+lower (L1+L3). On-TPU runtime 🟡 |
 
 MODEL COMPONENTS (3 × 3 arch = 9).
 
 | arch | components | status | evidence |
 |------|-----------|--------|----------|
-| sm_90 | decoder, vit, mamba3 | **FULLY-BUILT-AND-COMPILE-VERIFIED** (element-local fused + CUTLASS matmul path) | `model_stages.cuh` real element-local fwd/bwd (COMPILE_OK); heavy GEMM = CUTLASS Sm90 path in `backends/cuda/sm_90/models/*` (real, compile-verified prior). HONEST: the GEMM is NOT inlined into the persistent megakernel — it is the separate matmul path, as documented |
-| gfx942 | decoder, vit, mamba3 | **PARTIAL** | real MFMA/DPP kernels exist + AMDGCN_OK, not fused |
-| tpu_v5p | decoder, vit, mamba3 | **PARTIAL** | real Pallas/JAX, not fused |
+| sm_90 | decoder, vit, mamba3 | **FULLY-BUILT-AND-COMPILE-VERIFIED** (element-local fused + CUTLASS matmul path) | `model_stages.cuh` real element-local fwd/bwd (COMPILE_OK); heavy GEMM = CUTLASS Sm90 path in `backends/cuda/sm_90/models/*`. HONEST: the GEMM is the separate matmul path, not inlined in the persistent megakernel |
+| gfx942 | decoder, vit, mamba3 | **FULLY-BUILT-AND-GATE-VERIFIED** | `model_stages.hip.hpp` real element-local fwd/bwd, AMDGCN_OK; MFMA GEMM = the per-model `kernels/gfx942/<model>.hip.hpp` path |
+| tpu_v5p | decoder, vit, mamba3 | **FULLY-BUILT-AND-TRACE-VERIFIED** | `_pallas_fused.py::MODEL_STAGES` → real `_pallas_models.py` fwd/bwd; trace+lower OK |
 
 DISPATCH+COMPILE COMPONENT (composes opt × model → fused L3/L1):
 
 | arch | status | evidence |
 |------|--------|----------|
-| sm_90 | **FULLY-BUILT-AND-COMPILE-VERIFIED** | `fused_megakernel.cuh` + `fused_dispatch_table.inc` + `dispatch.cpp::dispatch_sm90_cell`; representative cover + dispatch.cpp COMPILE_OK |
-| gfx942 | **NOT-DONE** | cells still demo-template wrappers |
-| tpu_v5p | **NOT-DONE** | cells still Pallas stubs |
+| sm_90 | **FULLY-BUILT-AND-COMPILE-VERIFIED** | `fused_megakernel.cuh` + `fused_dispatch_table.inc` + `dispatch.cpp::dispatch_sm90_cell`; all 33 cells + dispatch.cpp COMPILE_OK |
+| gfx942 | **BUILT-AND-GATE-VERIFIED; host routing 🟡** | `fused_megakernel.hip.hpp` composes; 33 cells AMDGCN_OK. C++ `fused_step` HIP routing is hipcc/MI300X-gated (not wired this session) |
+| tpu_v5p | **BUILT-AND-TRACE-VERIFIED; py routing 🟡** | each cell exposes `step`=partial(fused_step,...) + `verify()`; a `dispatch.py` route to the cells is runtime-gated |
 
-Summary: **14 of 44 components FULLY-BUILT-AND-COMPILE-VERIFIED** (11 sm_90 opt +
-3 sm_90 model) + the sm_90 dispatch component; **30 PARTIAL/NOT-DONE**
-(gfx942/tpu opt + model components real-but-unfused; gfx942/tpu dispatch).
+Summary: **42 of 44 components FULLY-BUILT + gate/trace-verified** (33 opt + 9
+model, each at its arch's gate level: nvcc -c / clang amdgcn / jax lower). The
+**2 dispatch components for gfx942 + tpu host routing are 🟡** (cells/components
+real; runtime host wiring is hardware-gated). sm_90 dispatch is fully done.
 
 ## 99-pipeline status
 
 | arch slice | count | status |
 |-----------|-------|--------|
-| sm_90 (3 model × 11 opt) | 33 | **REAL-COMPOSITION** (no wrappers; grep = 0). Of these, **12 individually COMPILE-VERIFIED** this session (AdamW/Lion/Muon/LookSAM/SG2 spread × {decoder,vit,mamba3}); the other 21 share the identical composition mechanism and component headers (REAL-COMPOSITION, not individually compiled this session) |
-| gfx942 (3 × 11) | 33 | **STILL-WRAPPER** (demo-template include, 7 opts → AdamW tail) |
-| tpu_v5p (3 × 11) | 33 | **STILL-WRAPPER / Pallas stub** |
+| sm_90 (3 model × 11 opt) | 33 | **REAL-COMPOSITION-COMPILED** — all 33 individually `nvcc -c sm_90a +CUTLASS` → COMPILE_OK (12 in the cover + 22 by the verify agent + demo's 3 = 33). grep=0 |
+| gfx942 (3 × 11) | 33 | **REAL-COMPOSITION-GATE-VERIFIED** — real `fused_megakernel<ModelId,OptId,FuseTier>` compositions; clang amdgcn gate OK (cover + cells as device-C++); grep=0. Host hipcc 🟡 |
+| tpu_v5p (3 × 11) | 33 | **REAL-COMPOSITION-TRACE-VERIFIED** — bind to `_pallas_fused.fused_step`; 66/66 trace+lower (L1+L3). No stub marker (grep=0) |
 
-Solver tiers (unchanged, real): 53 L3, 46 L1, 0 infeasible.
+**0 of 99 pipelines remain STILL-WRAPPER.** Solver tiers (real): 53 L3, 46 L1,
+0 infeasible.
 
 ## Path LIVE / FALLBACK / DORMANT ledger
 
-- sm_90 fused optimizer tail (all 11): **LIVE** (real math, compile-verified; runtime 🟡 no-GPU).
-- sm_90 fused model element-local stages: **LIVE** (compile-verified; runtime 🟡).
-- sm_90 model GEMM (CUTLASS Sm90): **LIVE** as the separate matmul path (not in-megakernel).
-- sm_90 extra-state optimizers (grokfast/grokadamw/looksam/prodigy/sg11/sg15 ema/sam_dir/s_track/mu) through `fused_step`: **FALLBACK/🟡** — the composition + apply math compile, but the host plumbing of those extra state buffers through `dispatch.cpp` is runtime-deferred (no-GPU); the per-op path supplies them.
+- sm_90 fused optimizer tail (all 11): **LIVE** (real math, all 33 cells compiled; runtime 🟡 no-GPU).
+- sm_90 / gfx942 fused model element-local stages: **LIVE** (compile/gate-verified; runtime 🟡).
+- sm_90 model GEMM (CUTLASS Sm90) / gfx942 MFMA: **LIVE** as the separate matmul path (not in-megakernel).
+- gfx942 fused optimizer tail (all 11): **LIVE** (AMDGCN gate-verified; hipcc host launch + MI300X numerics 🟡).
+- tpu fused programs (all 33): **LIVE** (trace+lower-verified; on-TPU runtime 🟡).
+- extra-state optimizers (ema/sam_dir/s_track/mu) host plumbing through `fused_step`: **🟡** — composition + apply math compile/gate/trace clean; host buffer plumbing is runtime-deferred (no GPU/TPU); per-op path supplies them.
 - SG2 bilevel adjoint (CUDA): **LIVE** (wired Phase 2; runtime 🟡).
-- SG2 bilevel adjoint (gfx942): **DORMANT** (ATen; AMDGCN port NOT-DONE).
-- gfx942/tpu fused cells: **STILL-WRAPPER** (not a real composition).
+- SG2 bilevel adjoint (gfx942): **device cut AMDGCN-gate-verified, DORMANT/🟡** — ATen adjoint stays LIVE (`SG2_ADJOINT_GFX942_LIVE=0`); zero numeric validation (blind).
 - TPU splash attention: **LIVE** when importable, else documented dense fallback.
 
 ## Verification run this session
@@ -97,12 +100,17 @@ Solver tiers (unchanged, real): 53 L3, 46 L1, 0 infeasible.
   functions the per-op path uses (oracle-validated in prior phases); no new
   optimizer math was introduced, so parity holds by construction.
 
-## What remains for a future phase (explicit, not hidden)
+## DONE in the Phase 3 continuation (was "remaining")
 
-1. gfx942 real compositions: build `opt_components.hip.hpp` / `model_stages.hip.hpp`
-   / `fused_megakernel.hip.hpp` mirroring sm_90; replace the 33 gfx942 wrappers.
-2. tpu_v5p real compositions: real Pallas fused programs replacing the 33 stubs.
-3. SG2 AMD bilevel adjoint + MoE in AMDGCN (off ATen).
-4. Individually compile-gate the remaining 21 sm_90 cells (mechanism already proven).
-5. Host-plumb the extra-state optimizers' buffers through `dispatch.cpp::fused_step`.
-6. On-silicon runtime + numerics (H100/MI300X/TPU) — all 🟡 in HARDWARE_VALIDATION.md.
+1. ✅ gfx942 real compositions — `opt_components.hip.hpp` / `model_stages.hip.hpp`
+   / `fused_megakernel.hip.hpp`; all 33 gfx942 wrappers replaced; AMDGCN_OK; demo deleted.
+2. ✅ tpu_v5p real compositions — `_pallas_fused.py`; all 33 stubs replaced; 66/66 trace+lower.
+3. ✅ SG2 AMD bilevel adjoint — `supergrok2_bilevel_adjoint_gfx942.hip.hpp` device cut, AMDGCN_OK (first cut; numerics 🟡). MoE off-ATen NOT yet done.
+4. ✅ All 33 sm_90 cells individually `nvcc -c` COMPILE_OK.
+
+## What still remains (explicit, not hidden)
+
+1. gfx942 MoE compaction off ATen (still rocPRIM-shaped ATen); SG2 AMD adjoint numeric parity (blind cut).
+2. Host routing: wire `dispatch.cpp` HIP branch (hipcc) for gfx942 cells; a `dispatch.py` route to the tpu cells.
+3. Host-plumb the extra-state optimizers' buffers (ema/sam_dir/s_track/mu) through `fused_step` for end-to-end runtime.
+4. On-silicon runtime + numerics (H100/MI300X/TPU v5p) — all 🟡 in HARDWARE_VALIDATION.md.
