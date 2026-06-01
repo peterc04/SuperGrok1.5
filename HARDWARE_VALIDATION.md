@@ -777,3 +777,100 @@ long-lived persistent grid.
 | 4.2 | prodigy_reduce_dsmem_kernel | DSMEM shared exchange replaces L2 atomics; cluster size metric | §Stage 4.2 ncu DSMEM |
 | 4.2 | cluster_reduce_sum_f32_dsmem | DSMEM sum vs atomic sum within ~1 ulp (tolerance, not bit-exact) | §Stage 4.2 bit-parity |
 | 4.2 | SG_TUNED_CLUSTER_SHAPE | ≤2-cluster cap inside persistent megakernel (slot starvation) | §Stage 4.2 megakernel caveat |
+
+---
+
+## Stage 5 — mamba3 AMD-native
+
+AMD-native hand-written AMDGCN forward+backward for the gfx942 (CDNA3 / MI300X)
+Mamba-3 model kernel, replacing the scalar-labeled-as-MFMA reference with REAL
+MFMA + DPP + LDS-handoff scan built on the shared, compiler-verified primitives
+`csrc/backends/hip/gfx942/amdgcn_primitives.hip.hpp` (`namespace amd =
+sg::gfx942::amdgcn`).
+
+**File touched (only one):** `grokking_optimizers/kernels/gfx942/mamba3_gfx942.hip.hpp`
+
+**What was rewritten (§5 device section, `__AMDGCN__ || __HIPCC__`):**
+- **§5.1 in_proj / x_proj / out_proj — REAL MFMA matmul.** The reference's
+  "scalar dot-product loop labeled MFMA" is now a true tiled bf16 matmul:
+  `mfma_tile_16x16` / `mfma_matmul_bf16` issue `amd::mfma_bf16_16x16x16`
+  (bf16x4 = `short[4]` operands, f32[4] accumulate) over 16×16 output tiles,
+  one wavefront per tile, K contracted in 16-wide steps, with
+  `amd::sched_group_barrier<MFMA,1>()`/`<VMEM,2>()` interleave (§2.11).
+- **§5.2 / §5.6 RMSNorm fwd+bwd — DPP reductions.** The `__shfl_xor` butterfly
+  is replaced by `amd::wave_reduce_add_dpp` (§2.6); `dweight` accumulates via
+  `amd::atomic_add_agent_f32` (AGENT scope, §2.13).
+- **§5.3 conv1d** depthwise k=3 + SiLU, **§5.5 gate multiply** — ported scalar.
+- **§5.4 / §5.7 SSM selective scan fwd+bwd — workgroup-barrier LDS handoff.**
+  Per-lane sequential segment + work-efficient Blelloch monoid scan across 64
+  lanes; the reference's raw `__builtin_amdgcn_fence + s_barrier` is routed
+  through `amd::workgroup_barrier_release/acquire` (§2.13). Paired-RoPE on
+  B/C state dims retained.
+- Read-once global loads use `amd::streaming_load` (§2.7); bf16 tensors flow as
+  raw `short` bit-patterns through a self-contained bf16↔f32 codec (the
+  free-standing gate has no `hip_bfloat16`).
+- `__global__` entry kernels (`mamba3_gfx942_{in_proj_mfma,rmsnorm_fwd,
+  conv1d_fwd,ssm_fwd<S>,gate_mul,rmsnorm_bwd,ssm_bwd<S>}`) with SEQ_LEN ∈
+  {4,17,128} instantiated for the grokking shapes.
+
+**Gate-caught issues fixed (this is what compiler verification bought):**
+- **MFMA operand register type.** Reused `amd::mfma_bf16_16x16x16`, which takes
+  `const short[4]` (bf16x4), NOT the reference's `uint32_t[4]` — the gate
+  rejects u32x4 for the `_1k` builtins. Operand fragments packed as `short[4]`.
+- **Compile-time-constant intrinsic args.** DPP-ctrl, sched-group mask/size and
+  fp8 byte-index are routed through the templated primitives
+  (`dpp_mov<CTRL>`, `sched_group_barrier<MASK,SIZE>`), never runtime values —
+  the gate rejects runtime args.
+- **Math builtins under the bare gate.** `rsqrtf`/`sincosf` are absent on the
+  free-standing AMDGPU target; replaced with `__builtin_amdgcn_rsqf` and
+  `__builtin_sinf`/`__builtin_cosf` (valid under hipcc too).
+- **Launch builtins absent on the gate.** The free-standing target lacks
+  `threadIdx/blockIdx/blockDim/gridDim`, `__global__`, `__shared__` (HIP
+  runtime is stubbed). Added a gate-only shim (`__AMDGCN__ && !__HIPCC__`)
+  modeling them with the AMDGCN workitem/workgroup ISA builtins so the device
+  bodies type-check; on a real hipcc build the runtime supplies them and the
+  shim is off.
+- **Host/device split.** The ATen path's `#include "csrc/common/platform.h"`
+  (→ `<cuda.h>`) cannot resolve on the AMDGPU target, so the ATen orchestration
+  (A) is guarded `#if !defined(__AMDGCN__)` and the device kernels (B) under
+  `#if defined(__AMDGCN__) || defined(__HIPCC__)` — one header, two passes.
+
+**Launch wiring:** documented (§5.LAUNCH note in-file). The public entry points
+`sg::gfx942::models::mamba::{forward,backward,selective_scan_fwd,
+selective_scan_bwd}<T>` are UNCHANGED and still route to the proven ATen +
+rocBLAS path (numerics-correct, MFMA via rocBLAS), so the bindings and the host
+`mamba.hip.cpp` TU resolve byte-for-byte as before. Live `hipLaunchKernelGGL`
+of the §5 kernels + hipcc link is **🟡 DEFERRED** (MI300X-gated: no hipcc / no
+device in this env); the device kernels are compiler-verified and ready to wire
+once the model TU migrates `.hip.cpp -> .hip` on hardware.
+
+**Verification gate (this host, run today):**
+- `bash scripts/amdgcn_check.sh --header grokking_optimizers/kernels/gfx942/mamba3_gfx942.hip.hpp`
+  → `AMDGCN_OK` (device code compiles for gfx942)
+- `bash scripts/amdgcn_check.sh --header csrc/backends/hip/gfx942/amdgcn_primitives.hip.hpp`
+  → `AMDGCN_OK` (unchanged)
+- `python grokking_optimizers/compile.py --self-test` → `137 passed, 1 failed`
+  (the 1 failure is the pre-existing `flag_base_superset_regression` sm_90
+  flag-baseline test, untouched by this change)
+- `ruff check grokking_optimizers/` → `All checks passed!`
+- sm_90 CUDA build UNAFFECTED — only the one gfx942 header changed.
+
+**Hardware checks (deferred — 🟡, no MI300X / no hipcc in this env):**
+- **MFMA utilization:** `rocprof --stats` / `rocprofv2` on the §5 kernels —
+  expect `SQ_INSTS_VALU_MFMA*` (matrix-core instruction counts) non-zero for
+  `mamba3_gfx942_in_proj_mfma` and the projection GEMMs, and the matrix unit
+  busy fraction (`GRBM_GUI_ACTIVE` vs MFMA-issue) to confirm the 16×16×16 tiles
+  keep the V_MFMA pipe fed (not VALU-bound); compare vs the rocBLAS path.
+- **DPP / scan correctness:** drive identical (x, w, A, B, C, dt) through the
+  §5 device kernels and the ATen path; compare RMSNorm, scan-fwd y_out, and the
+  bwd grads to tolerance (DPP/atomic reduction reorder → ~1 ulp class, NOT
+  bit-exact). Gate: relative error ≤ a few ulps end-to-end.
+- **LDS handoff:** confirm the `workgroup_barrier_release/acquire` scan produces
+  the same prefixes as the serial recurrence across SEQ_LEN ∈ {4,17,128}; check
+  no LDS bank-conflict stalls (`SQ_LDS_BANK_CONFLICT`) in the Blelloch sweeps.
+
+| stage | cell | deferred check | command ref |
+|-------|------|----------------|-------------|
+| 5 | mamba3_gfx942_in_proj_mfma | MFMA-core instr counts non-zero; matrix unit busy fraction | §Stage 5 rocprof MFMA |
+| 5 | ssm_fwd/ssm_bwd LDS handoff | Blelloch prefixes == serial recurrence; bank-conflict-free | §Stage 5 LDS handoff |
+| 5 | rmsnorm_fwd/bwd DPP | DPP-reduced norm/grads vs ATen within ~1 ulp (tolerance) | §Stage 5 DPP correctness |

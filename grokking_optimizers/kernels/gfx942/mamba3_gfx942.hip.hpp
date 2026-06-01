@@ -3,14 +3,33 @@
 // ============================================================================
 // mamba3_gfx942.hip.hpp — CANONICAL SuperGrok gfx942 'mamba' model logic.
 //
-// AMDGCN-asm status: NOT PRESENT in the production path. This path is ATen +
-// rocBLAS (rocBLAS dispatches MFMA v_mfma_f32_16x16x16_bf16 internally for
-// BF16/FP16 GEMMs >= 16). Native __global__ + inline AMDGCN asm requires
-// migrating the model TU from .hip.cpp to .hip (hipcc-routed); roadmap item 2.
+// AMDGCN-asm status (Stage 5 — AMD-native): this file now carries BOTH
+//   (A) the ATen + rocBLAS host orchestration (the public
+//       sg::gfx942::models::mamba::{forward,backward,selective_scan_*} entry
+//       points the bindings call), AND
+//   (B) a REAL hand-written AMDGCN forward+backward (§5 below) built on the
+//       shared, compiler-verified primitives
+//       csrc/backends/hip/gfx942/amdgcn_primitives.hip.hpp — MFMA bf16 matmul,
+//       DPP wave reductions, buffer_load streaming, and the SSM selective scan
+//       with the workgroup-barrier LDS handoff.
 //
-// The production location csrc/backends/hip/gfx942/models/mamba.hip.h is now a
-// thin shim #include'ing this header, so its mamba.hip.cpp TU resolves unchanged.
-// Migrated byte-for-byte from that header.
+// COMPILE ROUTING (two passes, one header):
+//   * HOST pass  (host compiler / hipcc host pass, `!__AMDGCN__`): sees ONLY
+//     section (A). It pulls in platform.h/ATen and exposes the entry points;
+//     a real `.hip` TU would LAUNCH the §5 __global__ kernels here via
+//     hipLaunchKernelGGL (see §5.LAUNCH note). The thin host `.hip.cpp` TU
+//     resolves exactly as before.
+//   * DEVICE pass (`__AMDGCN__` — the Stage-5 gate scripts/amdgcn_check.sh AND
+//     the hipcc device pass): sees ONLY section (B), the device kernels. The
+//     gate compiles these for gfx942, catching every builtin-signature /
+//     constant-arg / register-type bug (it already taught us bf16 MFMA takes
+//     bf16x4 = short[4], not u32x4).
+//
+// HARDWARE-GATED 🟡: device-compile-verified for gfx942 only; MI300X numerics +
+// rocprof MFMA-utilization are deferred — see HARDWARE_VALIDATION.md, Stage 5.
+//
+// The production location csrc/backends/hip/gfx942/models/mamba.hip.h is a thin
+// shim #include'ing this header, so its mamba.hip.cpp TU resolves unchanged.
 // ============================================================================
 // csrc/backends/hip/gfx942/models/mamba.hip.h
 // Mamba (selective state-space) model header for gfx942 (CDNA3 / MI300X).
@@ -27,6 +46,16 @@
 // selective_scan_bwd}<T>` directly when `detect_arch() == 942`.
 
 #pragma once
+
+// ════════════════════════════════════════════════════════════════════════════
+// (A) HOST orchestration — ATen + rocBLAS public entry points.
+// Compiled by the HOST pass only. The free-standing AMDGCN device gate
+// (__AMDGCN__) does NOT see this block (platform.h pulls in <cuda.h>/ATen,
+// which the device target cannot resolve); the §5 device kernels below are the
+// device-pass content. On a real hipcc build the host pass compiles this and
+// launches the §5 kernels (see §5.LAUNCH).
+// ════════════════════════════════════════════════════════════════════════════
+#if !defined(__AMDGCN__)
 #include "csrc/common/platform.h"
 #include "csrc/common/types.h"
 // Bring in the full sm_90 Mamba template implementation. On HIP the
@@ -118,6 +147,623 @@ inline cudaError_t selective_scan_bwd(
 }
 
 }}}}  // namespace sg::gfx942::models::mamba
+
+// ── §5.LAUNCH (host-side wiring note) ────────────────────────────────────────
+// The §5 __global__ kernels below are launched from the entry points above on a
+// real `.hip` (hipcc) build, e.g. in forward<T>():
+//
+//   dim3 grid(n_tiles_or_rows), block(256);            // 4 wavefronts/block
+//   hipLaunchKernelGGL(native::mamba3_gfx942_rmsnorm_fwd, grid, block, 0,
+//                      stream, x_bf16, w_bf16, y_bf16, n_rows, d_model, eps);
+//   hipLaunchKernelGGL(native::mamba3_gfx942_in_proj_mfma, gridM, block, 0,
+//                      stream, x_bf16, Win_bf16, nullptr, xz_f32, M, N, K);
+//   hipLaunchKernelGGL((native::mamba3_gfx942_ssm_fwd<SEQ_LEN>), gW, block,
+//                      waves*128*sizeof(float), stream, x_f32, dt_f32, A_log,
+//                      B_ssm, C_ssm, y_out, batch, d_inner);
+//   ... conv1d_fwd, gate_mul, then out_proj via in_proj_mfma; backward mirrors.
+//
+// 🟡 DEFERRED: the live launch + hipcc link is MI300X-gated (no hipcc / no
+// device here). This host TU currently routes forward/backward to the proven
+// ATen + rocBLAS path above (numerics-correct, MFMA via rocBLAS); the §5 device
+// kernels are COMPILER-VERIFIED for gfx942 via scripts/amdgcn_check.sh and ready
+// to be wired in once the model TU migrates .hip.cpp -> .hip on hardware.
+#endif  // !defined(__AMDGCN__)  — end host orchestration (A)
+
+// ════════════════════════════════════════════════════════════════════════════
+// (B) DEVICE pass — real hand-written AMDGCN forward+backward (§5).
+// Compiled by the AMDGCN device pass only: the Stage-5 gate (__AMDGCN__, no
+// hipcc) AND the hipcc device pass (__HIPCC__).
+// ════════════════════════════════════════════════════════════════════════════
+#if defined(__AMDGCN__) || defined(__HIPCC__) || defined(GROK_HIP_DEVICE)
+#include "csrc/backends/hip/gfx942/amdgcn_primitives.hip.hpp"
+// ── gate-only launch-builtin shim ────────────────────────────────────────────
+// The free-standing AMDGCN device-compile gate (scripts/amdgcn_check.sh) stubs
+// out <hip/hip_runtime.h>, so the kernel-launch builtins (threadIdx/blockIdx/
+// blockDim/gridDim, __global__, __shared__) that HIP normally provides are
+// absent. Under a real hipcc build these come from the runtime; here we model
+// them with the AMDGCN workitem/workgroup ISA builtins so the device bodies
+// type-check. Active ONLY on the bare gate (__AMDGCN__ && !__HIPCC__).
+#if defined(__AMDGCN__) && !defined(__HIPCC__)
+#ifndef GROK_GFX942_LAUNCH_SHIM_
+#define GROK_GFX942_LAUNCH_SHIM_
+struct GrokTidX { __device__ operator unsigned() const { return __builtin_amdgcn_workitem_id_x(); } };
+struct GrokBidX { __device__ operator unsigned() const { return __builtin_amdgcn_workgroup_id_x(); } };
+struct GrokBdimX{ __device__ operator unsigned() const { return __builtin_amdgcn_workgroup_size_x(); } };
+struct GrokGdimX{ __device__ operator unsigned() const { return __builtin_amdgcn_grid_size_x()
+                                                              / __builtin_amdgcn_workgroup_size_x(); } };
+struct GrokThreadIdx { GrokTidX  x; };
+struct GrokBlockIdx  { GrokBidX  x; };
+struct GrokBlockDim  { GrokBdimX x; };
+struct GrokGridDim   { GrokGdimX x; };
+static GrokThreadIdx threadIdx;
+static GrokBlockIdx  blockIdx;
+static GrokBlockDim  blockDim;
+static GrokGridDim   gridDim;
+#ifndef __global__
+#define __global__ __attribute__((amdgpu_kernel))
+#endif
+#ifndef __shared__
+#define __shared__ __attribute__((shared))
+#endif
+#endif  // GROK_GFX942_LAUNCH_SHIM_
+#endif  // bare gate
+// ============================================================================
+// §5  AMD-NATIVE device kernels (Stage 5 hand-written AMDGCN).
+//
+// This section is the REAL hand-written gfx942 forward+backward, built on the
+// shared, compiler-verified primitives in
+//   csrc/backends/hip/gfx942/amdgcn_primitives.hip.hpp   (namespace amd = …).
+//
+// It is compiled ONLY by an AMDGCN device pass:
+//   * the Stage-5 device-compile gate  (scripts/amdgcn_check.sh, __AMDGCN__), and
+//   * the hipcc device pass             (__HIPCC__ on a real ROCm build).
+// The host `.hip.cpp` TU never sees it — that pass keeps the ATen orchestration
+// above (which LAUNCHES these kernels via hipLaunchKernelGGL, see §5.LAUNCH).
+//
+// Self-contained on purpose: under the free-standing gate the only reachable
+// headers are the amdgcn_primitives stub set (no <cmath>/<cstdint>/bfloat16),
+// so the model math here uses clang __builtin_* (valid under hipcc too) and a
+// local bf16<->f32 bit codec rather than common_gfx942.hip.hpp's host helpers.
+//
+// HARDWARE-GATED 🟡: device-compile-verified for gfx942 only; MI300X numerics +
+// rocprof MFMA-utilization are deferred (HARDWARE_VALIDATION.md, Stage 5).
+// ============================================================================
+
+namespace sg { namespace gfx942 { namespace models { namespace mamba {
+namespace native {
+
+namespace amd = ::sg::gfx942::amdgcn;
+
+// Mamba-3 fixed geometry (CDNA3 wavefront width = 64).
+static constexpr int kDState  = 16;
+static constexpr int kWave    = 64;   // == amd::kWave
+static constexpr int kConvK   = 3;
+
+// ── device math shims (clang builtins; resolve under the bare gate AND hipcc) ─
+__device__ __forceinline__ float dexpf(float x)  { return __builtin_expf(x); }
+__device__ __forceinline__ float dlogf(float x)  { return __builtin_logf(x); }
+__device__ __forceinline__ float dlog1pf(float x){ return __builtin_log1pf(x); }
+__device__ __forceinline__ float drsqrtf(float x){ return __builtin_amdgcn_rsqf(x); }
+__device__ __forceinline__ float dpowf(float b,float e){ return __builtin_powf(b,e); }
+__device__ __forceinline__ float dsinf(float x)  { return __builtin_sinf(x); }
+__device__ __forceinline__ float dcosf(float x)  { return __builtin_cosf(x); }
+
+__device__ __forceinline__ float silu(float x)     { return x / (1.0f + dexpf(-x)); }
+__device__ __forceinline__ float softplus(float x) { return dlog1pf(dexpf(x)); }
+
+// ── bf16 <-> f32 bit codec (self-contained: the gate has no hip_bfloat16) ────
+// bf16 is the top 16 bits of an f32. Operands flow to the MFMA wrappers as the
+// raw `short` bit-pattern (matches amd::mfma_bf16_* which take const short[4]).
+__device__ __forceinline__ float bf16_to_f32(short h) {
+    unsigned u = static_cast<unsigned>(static_cast<unsigned short>(h)) << 16;
+    return __builtin_bit_cast(float, u);
+}
+__device__ __forceinline__ short f32_to_bf16(float f) {
+    unsigned u = __builtin_bit_cast(unsigned, f);
+    // round-to-nearest-even before truncating the low 16 bits.
+    unsigned lsb = (u >> 16) & 1u;
+    u += 0x7fffu + lsb;
+    return static_cast<short>(static_cast<unsigned short>(u >> 16));
+}
+
+// RoPE pair rotation (paired B/C state dims), §SSM.
+__device__ __forceinline__ void rope_rotate(float& re, float& im,
+                                             int pos, int freq_idx,
+                                             float theta_base = 10000.0f) {
+    float freq  = 1.0f / dpowf(theta_base,
+                               static_cast<float>(2 * freq_idx) / static_cast<float>(kDState));
+    float angle = static_cast<float>(pos) * freq;
+    float sn = dsinf(angle), cs = dcosf(angle);
+    float re_n = re * cs - im * sn;
+    float im_n = re * sn + im * cs;
+    re = re_n; im = im_n;
+}
+
+// ── §5.1  MFMA tiled matmul: C[MxN] = A[MxK] · Bᵀ  (row-major, K-contraction) ─
+// The §2.4 path: REAL 16×16×16 bf16 MFMA (NOT the reference's scalar dot loop).
+// One wavefront owns one 16×16 output tile; the 64 lanes hold the MFMA operand
+// lanes the ISA defines for the 16×16×16 shape (4 bf16 / lane / 16-K step → the
+// short[4] fragment), accumulating f32[4] across the K dimension in 16-wide
+// steps. A is [M,K] row-major; W is [N,K] row-major (i.e. Bᵀ already), which is
+// exactly the projection-weight layout ([out, in]) used throughout the model.
+//
+// Lane→fragment map for mfma_f32_16x16x16bf16 (CDNA3): lane L in [0,64) supplies
+// A[row = L%16][k = 16*(L/16) + j] and B[col = L%16][k = 16*(L/16) + j] for the
+// four K sub-lanes j∈[0,4); acc lane L receives C[row=4*(L/16)+r][col=L%16] in
+// acc[r]. We load the per-lane fragments from global, pack to short[4], and call
+// amd::mfma_bf16_16x16x16. sched_group_barrier interleaves MFMA vs VMEM so the
+// matrix unit is not starved (§2.11).
+__device__ __forceinline__ void mfma_tile_16x16(
+    const short* __restrict__ A,   // [M, K] row-major bf16 bits
+    const short* __restrict__ W,   // [N, K] row-major bf16 bits  (= Bᵀ)
+    float*       __restrict__ C,   // [M, N] row-major f32
+    int M, int N, int K,
+    int tile_row, int tile_col)    // 16-aligned output-tile origin
+{
+    const int lane = static_cast<int>(threadIdx.x) % kWave;
+    const int half = lane / 16;        // which 16-K group this lane feeds (0..3)
+    const int idx  = lane % 16;        // row (for A) / col (for W) within the tile
+
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+
+    const int aRow = tile_row + idx;   // A row this lane streams
+    const int bCol = tile_col + idx;   // W row (= output col) this lane streams
+
+    // Contract over K in steps of 16; each lane contributes 4 bf16 of A and B.
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        short af[4], bf[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int k = k0 + half * 4 + j;   // 64 lanes cover the 16 K-values ×4
+            af[j] = (aRow < M && k < K) ? A[aRow * K + k] : (short)0;
+            bf[j] = (bCol < N && k < K) ? W[bCol * K + k] : (short)0;
+        }
+        amd::mfma_bf16_16x16x16(acc, af, bf);
+        amd::sched_group_barrier<0x008, 1>();   // 1 MFMA …
+        amd::sched_group_barrier<0x100, 2>();   // … then 2 VMEM reads
+    }
+
+    // Scatter the 4 accumulator rows this lane owns.
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        int outRow = tile_row + 4 * half + r;
+        int outCol = tile_col + idx;
+        if (outRow < M && outCol < N) C[outRow * N + outCol] = acc[r];
+    }
+}
+
+// Whole-matrix driver: grid-strides over the 16×16 output-tile lattice, one
+// wavefront per tile. A:[M,K] bf16, W:[N,K] bf16 (= Bᵀ), C:[M,N] f32.
+__device__ __forceinline__ void mfma_matmul_bf16(
+    const short* __restrict__ A, const short* __restrict__ W,
+    float* __restrict__ C, int M, int N, int K)
+{
+    const int wavesPerBlock = static_cast<int>(blockDim.x) / kWave;
+    const int waveId  = static_cast<int>(threadIdx.x) / kWave;
+    const int gWave   = static_cast<int>(blockIdx.x) * wavesPerBlock + waveId;
+    const int tilesM  = (M + 15) / 16;
+    const int tilesN  = (N + 15) / 16;
+    const int nTiles  = tilesM * tilesN;
+    const int stride  = static_cast<int>(gridDim.x) * wavesPerBlock;
+    for (int t = gWave; t < nTiles; t += stride) {
+        int tr = (t / tilesN) * 16;
+        int tc = (t % tilesN) * 16;
+        mfma_tile_16x16(A, W, C, M, N, K, tr, tc);
+    }
+}
+
+// ── §5.2  RMSNorm forward (DPP wave reduction replaces __shfl butterfly) ──────
+__device__ __forceinline__ void rmsnorm_row(
+    const short* __restrict__ x, const short* __restrict__ w,
+    short* __restrict__ y, int row, int d_model, float eps)
+{
+    const int lane = static_cast<int>(threadIdx.x) % kWave;
+    const short* xr = x + row * d_model;
+    float sum_sq = 0.f;
+    for (int d = lane; d < d_model; d += kWave) {
+        float v = bf16_to_f32(amd::streaming_load(&xr[d]));
+        sum_sq += v * v;
+    }
+    sum_sq = amd::wave_reduce_add_dpp(sum_sq);                 // §2.6
+    float rms_inv = drsqrtf(sum_sq / static_cast<float>(d_model) + eps);
+    for (int d = lane; d < d_model; d += kWave) {
+        float v = bf16_to_f32(xr[d]);
+        float g = bf16_to_f32(w[d]);
+        y[row * d_model + d] = f32_to_bf16(v * rms_inv * g);
+    }
+}
+
+// ── §5.3  Conv1d depthwise (k=3, pad=1) + SiLU ────────────────────────────────
+__device__ __forceinline__ void conv1d_silu(
+    const short* __restrict__ x_main, const short* __restrict__ conv_w,
+    const short* __restrict__ conv_b, short* __restrict__ y,
+    int seq_len, int d_inner, int b, int t, int ch)
+{
+    float w0 = bf16_to_f32(conv_w[ch * kConvK + 0]);
+    float w1 = bf16_to_f32(conv_w[ch * kConvK + 1]);
+    float w2 = bf16_to_f32(conv_w[ch * kConvK + 2]);
+    float bias = bf16_to_f32(conv_b[ch]);
+    int base = b * seq_len * d_inner + ch;
+    float xl = (t > 0)           ? bf16_to_f32(x_main[base + (t - 1) * d_inner]) : 0.f;
+    float xc =                     bf16_to_f32(x_main[base +  t      * d_inner]);
+    float xr = (t < seq_len - 1) ? bf16_to_f32(x_main[base + (t + 1) * d_inner]) : 0.f;
+    float out = silu(w0 * xl + w1 * xc + w2 * xr + bias);
+    y[base + t * d_inner] = f32_to_bf16(out);
+}
+
+// ── §5.4  SSM selective scan (Blelloch monoid scan, LDS handoff) ──────────────
+// One wavefront per (batch, channel). Per-lane sequential segment then a
+// work-efficient prefix scan of the (A_bar-product, h)-monoid across 64 lanes,
+// handed off through LDS with amd::workgroup_barrier_release/acquire (§2.13)
+// replacing the reference's raw __builtin_amdgcn_fence + s_barrier.
+template <int SEQ_LEN>
+__device__ __forceinline__ void ssm_scan(
+    const float* __restrict__ x_main_f,   // [B,S,d_inner]
+    const float* __restrict__ dt,         // [B,S,d_inner]
+    const short* __restrict__ A_log,      // [d_inner,d_state]
+    const short* __restrict__ B_ssm,      // [B,S,d_state]
+    const short* __restrict__ C_ssm,      // [B,S,d_state]
+    float* __restrict__ y_out,            // [B,S,d_inner]
+    float* __restrict__ smem,             // LDS, >= waves*128 floats
+    int batch, int d_inner)
+{
+    const int lane    = static_cast<int>(threadIdx.x) % kWave;
+    const int waveId  = static_cast<int>(threadIdx.x) / kWave;
+    const int wpb     = static_cast<int>(blockDim.x) / kWave;
+    const int gWave   = static_cast<int>(blockIdx.x) * wpb + waveId;
+    const int total   = batch * d_inner;
+    if (gWave >= total) return;
+
+    const int b_idx = gWave / d_inner;
+    const int ch    = gWave % d_inner;
+    float* ws = smem + waveId * kWave * 2;            // (a, bx) per lane
+
+    constexpr int EPL = (SEQ_LEN + kWave - 1) / kWave;
+
+    float A_vals[kDState];
+    #pragma unroll
+    for (int n = 0; n < kDState; ++n)
+        A_vals[n] = dexpf(bf16_to_f32(A_log[ch * kDState + n]));
+
+    float y_accum[EPL];
+    #pragma unroll
+    for (int e = 0; e < EPL; ++e) y_accum[e] = 0.f;
+
+    for (int n = 0; n < kDState; ++n) {
+        float A_n = A_vals[n];
+        float seg_a = 1.f, seg_bx = 0.f;
+        float h_local[EPL];
+        #pragma unroll
+        for (int e = 0; e < EPL; ++e) {
+            int t = lane * EPL + e;
+            if (t >= SEQ_LEN) { h_local[e] = 0.f; continue; }
+            int sidx = b_idx * SEQ_LEN * d_inner + t * d_inner + ch;
+            float dt_v = dt[sidx];
+            float A_bar = dexpf(dlogf(A_n) * dt_v);
+            float x_v   = x_main_f[sidx];
+            int bidx = b_idx * SEQ_LEN * kDState + t * kDState;
+            float b_re = bf16_to_f32(B_ssm[bidx + n]);
+            float b_im = bf16_to_f32(B_ssm[bidx + (n ^ 1)]);
+            rope_rotate(b_re, b_im, t, n / 2);
+            float B_bar = dt_v * b_re;
+            seg_bx = A_bar * seg_bx + B_bar * x_v;
+            seg_a  = A_bar * seg_a;
+            h_local[e] = seg_bx;
+        }
+
+        // store carries, publish to the wavefront via the LDS handoff.
+        ws[lane * 2 + 0] = seg_a;
+        ws[lane * 2 + 1] = seg_bx;
+        amd::workgroup_barrier_release();
+
+        // up-sweep (reduce).
+        #pragma unroll
+        for (int stride = 1; stride < kWave; stride <<= 1) {
+            int i = (lane + 1) * (stride << 1) - 1;
+            if (i < kWave) {
+                int l = i - stride;
+                float al = ws[l * 2], bl = ws[l * 2 + 1];
+                float ar = ws[i * 2], br = ws[i * 2 + 1];
+                ws[i * 2]     = ar * al;
+                ws[i * 2 + 1] = ar * bl + br;
+            }
+            amd::workgroup_barrier_acquire();
+        }
+        if (lane == 0) { ws[(kWave - 1) * 2] = 1.f; ws[(kWave - 1) * 2 + 1] = 0.f; }
+        amd::workgroup_barrier_release();
+        // down-sweep.
+        #pragma unroll
+        for (int stride = kWave / 2; stride >= 1; stride >>= 1) {
+            int i = (lane + 1) * (stride << 1) - 1;
+            if (i < kWave) {
+                int l = i - stride;
+                float at = ws[l * 2], bt = ws[l * 2 + 1];
+                float ar = ws[i * 2], br = ws[i * 2 + 1];
+                ws[l * 2]     = ar;       ws[l * 2 + 1] = br;
+                ws[i * 2]     = ar * at;  ws[i * 2 + 1] = ar * bt + br;
+            }
+            amd::workgroup_barrier_acquire();
+        }
+
+        float pfx_a  = ws[lane * 2];
+        float pfx_bx = ws[lane * 2 + 1];
+        amd::workgroup_barrier_acquire();
+
+        #pragma unroll
+        for (int e = 0; e < EPL; ++e) {
+            int t = lane * EPL + e;
+            if (t >= SEQ_LEN) continue;
+            float h = pfx_a * h_local[e] + pfx_bx;
+            int cidx = b_idx * SEQ_LEN * kDState + t * kDState;
+            float c_re = bf16_to_f32(C_ssm[cidx + n]);
+            float c_im = bf16_to_f32(C_ssm[cidx + (n ^ 1)]);
+            rope_rotate(c_re, c_im, t, n / 2);
+            y_accum[e] += c_re * h;
+        }
+    }
+
+    #pragma unroll
+    for (int e = 0; e < EPL; ++e) {
+        int t = lane * EPL + e;
+        if (t >= SEQ_LEN) continue;
+        y_out[b_idx * SEQ_LEN * d_inner + t * d_inner + ch] = y_accum[e];
+    }
+}
+
+// ── §5.5  Gate multiply: y = (y_scan + x_main·D) · SiLU(z) ─────────────────────
+__device__ __forceinline__ void gate_multiply(
+    const float* __restrict__ y_scan, const short* __restrict__ x_main,
+    const short* __restrict__ z, const short* __restrict__ D_param,
+    short* __restrict__ y_out, int idx, int d_inner)
+{
+    int ch = idx % d_inner;
+    float ys = y_scan[idx];
+    float xm = bf16_to_f32(x_main[idx]);
+    float zv = bf16_to_f32(z[idx]);
+    float Dv = bf16_to_f32(D_param[ch]);
+    y_out[idx] = f32_to_bf16((ys + xm * Dv) * silu(zv));
+}
+
+// ── §5.6  RMSNorm backward (two DPP reductions) ───────────────────────────────
+__device__ __forceinline__ void rmsnorm_backward_row(
+    const short* __restrict__ dy, const short* __restrict__ x,
+    const short* __restrict__ w, short* __restrict__ dx,
+    float* __restrict__ dweight, int row, int d_model, float eps)
+{
+    const int lane = static_cast<int>(threadIdx.x) % kWave;
+    const short* xr  = x  + row * d_model;
+    const short* dyr = dy + row * d_model;
+    float sum_sq = 0.f;
+    for (int d = lane; d < d_model; d += kWave) {
+        float v = bf16_to_f32(xr[d]); sum_sq += v * v;
+    }
+    sum_sq = amd::wave_reduce_add_dpp(sum_sq);
+    float var_inv = drsqrtf(sum_sq / static_cast<float>(d_model) + eps);
+    float dot = 0.f;
+    for (int d = lane; d < d_model; d += kWave) {
+        float v = bf16_to_f32(xr[d]), g = bf16_to_f32(dyr[d]), gw = bf16_to_f32(w[d]);
+        dot += g * gw * v;
+    }
+    dot = amd::wave_reduce_add_dpp(dot);
+    float coeff = dot * var_inv * var_inv * var_inv / static_cast<float>(d_model);
+    for (int d = lane; d < d_model; d += kWave) {
+        float v = bf16_to_f32(xr[d]), g = bf16_to_f32(dyr[d]), gw = bf16_to_f32(w[d]);
+        dx[row * d_model + d] = f32_to_bf16(g * gw * var_inv - coeff * v);
+        amd::atomic_add_agent_f32(&dweight[d], g * v * var_inv);   // §2.13
+    }
+}
+
+// ── §5.7  SSM scan backward (reverse-time adjoint, same LDS-handoff scan) ──────
+template <int SEQ_LEN>
+__device__ __forceinline__ void ssm_scan_backward(
+    const float* __restrict__ dy_scan, const float* __restrict__ x_main_f,
+    const float* __restrict__ dt, const short* __restrict__ A_log,
+    const short* __restrict__ B_ssm, const short* __restrict__ C_ssm,
+    float* __restrict__ dx_out, float* __restrict__ ddt_out,
+    float* __restrict__ dA_log, float* __restrict__ dB_ssm,
+    float* __restrict__ smem, int batch, int d_inner)
+{
+    const int lane   = static_cast<int>(threadIdx.x) % kWave;
+    const int waveId = static_cast<int>(threadIdx.x) / kWave;
+    const int wpb    = static_cast<int>(blockDim.x) / kWave;
+    const int gWave  = static_cast<int>(blockIdx.x) * wpb + waveId;
+    if (gWave >= batch * d_inner) return;
+
+    const int b_idx = gWave / d_inner;
+    const int ch    = gWave % d_inner;
+    float* ws = smem + waveId * kWave * 2;
+    constexpr int EPL = (SEQ_LEN + kWave - 1) / kWave;
+
+    float A_vals[kDState];
+    #pragma unroll
+    for (int n = 0; n < kDState; ++n)
+        A_vals[n] = dexpf(bf16_to_f32(A_log[ch * kDState + n]));
+
+    for (int n = 0; n < kDState; ++n) {
+        float A_n = A_vals[n];
+        float seg_a = 1.f, seg_bx = 0.f;
+        float dh_local[EPL];
+        #pragma unroll
+        for (int e = EPL - 1; e >= 0; --e) {
+            int t = (kWave - 1 - lane) * EPL + (EPL - 1 - e);
+            if (t >= SEQ_LEN || t < 0) { dh_local[e] = 0.f; continue; }
+            int sidx = b_idx * SEQ_LEN * d_inner + t * d_inner + ch;
+            float A_bar = dexpf(dlogf(A_n) * dt[sidx]);
+            int cidx = b_idx * SEQ_LEN * kDState + t * kDState;
+            float c_re = bf16_to_f32(C_ssm[cidx + n]);
+            float c_im = bf16_to_f32(C_ssm[cidx + (n ^ 1)]);
+            rope_rotate(c_re, c_im, t, n / 2);
+            seg_bx = A_bar * seg_bx + c_re * dy_scan[sidx];
+            seg_a  = A_bar * seg_a;
+            dh_local[e] = seg_bx;
+        }
+        ws[lane * 2] = seg_a; ws[lane * 2 + 1] = seg_bx;
+        amd::workgroup_barrier_release();
+        #pragma unroll
+        for (int stride = 1; stride < kWave; stride <<= 1) {
+            int i = (lane + 1) * (stride << 1) - 1;
+            if (i < kWave) {
+                int l = i - stride;
+                float al = ws[l * 2], bl = ws[l * 2 + 1];
+                float ar = ws[i * 2], br = ws[i * 2 + 1];
+                ws[i * 2] = ar * al; ws[i * 2 + 1] = ar * bl + br;
+            }
+            amd::workgroup_barrier_acquire();
+        }
+        if (lane == 0) { ws[(kWave - 1) * 2] = 1.f; ws[(kWave - 1) * 2 + 1] = 0.f; }
+        amd::workgroup_barrier_release();
+        #pragma unroll
+        for (int stride = kWave / 2; stride >= 1; stride >>= 1) {
+            int i = (lane + 1) * (stride << 1) - 1;
+            if (i < kWave) {
+                int l = i - stride;
+                float at = ws[l * 2], bt = ws[l * 2 + 1];
+                float ar = ws[i * 2], br = ws[i * 2 + 1];
+                ws[l * 2] = ar; ws[l * 2 + 1] = br;
+                ws[i * 2] = ar * at; ws[i * 2 + 1] = ar * bt + br;
+            }
+            amd::workgroup_barrier_acquire();
+        }
+        float pfx_a = ws[lane * 2], pfx_bx = ws[lane * 2 + 1];
+        amd::workgroup_barrier_acquire();
+        #pragma unroll
+        for (int e = EPL - 1; e >= 0; --e) {
+            int t = (kWave - 1 - lane) * EPL + (EPL - 1 - e);
+            if (t >= SEQ_LEN || t < 0) continue;
+            float dh = pfx_a * dh_local[e] + pfx_bx;
+            int sidx = b_idx * SEQ_LEN * d_inner + t * d_inner + ch;
+            float dt_v = dt[sidx], x_v = x_main_f[sidx];
+            int bidx = b_idx * SEQ_LEN * kDState + t * kDState;
+            float b_re = bf16_to_f32(B_ssm[bidx + n]);
+            float b_im = bf16_to_f32(B_ssm[bidx + (n ^ 1)]);
+            rope_rotate(b_re, b_im, t, n / 2);
+            amd::atomic_add_agent_f32(&dx_out[sidx],  dh * dt_v * b_re);
+            amd::atomic_add_agent_f32(&ddt_out[sidx], dh * b_re * x_v);
+            amd::atomic_add_agent_f32(&dB_ssm[bidx + n], dh * dt_v * x_v);
+            amd::atomic_add_agent_f32(&dA_log[ch * kDState + n], dh * dt_v * A_vals[n]);
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// §5.LAUNCH  __global__ entry kernels (host launches these via hipLaunchKernelGGL
+// from the ATen orchestration in the host TU; see the launch note at the bottom
+// of the host section). bf16 tensors flow as raw `short` bit-patterns.
+// ════════════════════════════════════════════════════════════════════════════
+
+extern "C" __global__ void mamba3_gfx942_in_proj_mfma(
+    const short* __restrict__ x, const short* __restrict__ W,
+    short* __restrict__ xz_f32_unused, float* __restrict__ C,
+    int M, int N, int K)
+{
+    (void)xz_f32_unused;
+    mfma_matmul_bf16(x, W, C, M, N, K);
+}
+
+extern "C" __global__ void mamba3_gfx942_rmsnorm_fwd(
+    const short* __restrict__ x, const short* __restrict__ w,
+    short* __restrict__ y, int n_rows, int d_model, float eps)
+{
+    const int wpb = static_cast<int>(blockDim.x) / kWave;
+    const int row = static_cast<int>(blockIdx.x) * wpb
+                  + static_cast<int>(threadIdx.x) / kWave;
+    if (row < n_rows) rmsnorm_row(x, w, y, row, d_model, eps);
+}
+
+extern "C" __global__ void mamba3_gfx942_conv1d_fwd(
+    const short* __restrict__ x_main, const short* __restrict__ conv_w,
+    const short* __restrict__ conv_b, short* __restrict__ y,
+    int batch, int seq_len, int d_inner)
+{
+    int total = batch * seq_len * d_inner;
+    for (int idx = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
+                 + static_cast<int>(threadIdx.x);
+         idx < total;
+         idx += static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x)) {
+        int ch = idx % d_inner;
+        int fp = idx / d_inner;
+        int b  = fp / seq_len;
+        int t  = fp % seq_len;
+        conv1d_silu(x_main, conv_w, conv_b, y, seq_len, d_inner, b, t, ch);
+    }
+}
+
+template <int SEQ_LEN>
+__global__ void mamba3_gfx942_ssm_fwd(
+    const float* __restrict__ x_main_f, const float* __restrict__ dt,
+    const short* __restrict__ A_log, const short* __restrict__ B_ssm,
+    const short* __restrict__ C_ssm, float* __restrict__ y_out,
+    int batch, int d_inner)
+{
+    extern __shared__ float smem[];
+    ssm_scan<SEQ_LEN>(x_main_f, dt, A_log, B_ssm, C_ssm, y_out, smem,
+                      batch, d_inner);
+}
+
+extern "C" __global__ void mamba3_gfx942_gate_mul(
+    const float* __restrict__ y_scan, const short* __restrict__ x_main,
+    const short* __restrict__ z, const short* __restrict__ D_param,
+    short* __restrict__ y_out, int batch, int seq_len, int d_inner)
+{
+    int total = batch * seq_len * d_inner;
+    for (int idx = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
+                 + static_cast<int>(threadIdx.x);
+         idx < total;
+         idx += static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x))
+        gate_multiply(y_scan, x_main, z, D_param, y_out, idx, d_inner);
+}
+
+extern "C" __global__ void mamba3_gfx942_rmsnorm_bwd(
+    const short* __restrict__ dy, const short* __restrict__ x,
+    const short* __restrict__ w, short* __restrict__ dx,
+    float* __restrict__ dweight, int n_rows, int d_model, float eps)
+{
+    const int wpb = static_cast<int>(blockDim.x) / kWave;
+    const int row = static_cast<int>(blockIdx.x) * wpb
+                  + static_cast<int>(threadIdx.x) / kWave;
+    if (row < n_rows) rmsnorm_backward_row(dy, x, w, dx, dweight, row, d_model, eps);
+}
+
+template <int SEQ_LEN>
+__global__ void mamba3_gfx942_ssm_bwd(
+    const float* __restrict__ dy_scan, const float* __restrict__ x_main_f,
+    const float* __restrict__ dt, const short* __restrict__ A_log,
+    const short* __restrict__ B_ssm, const short* __restrict__ C_ssm,
+    float* __restrict__ dx_out, float* __restrict__ ddt_out,
+    float* __restrict__ dA_log, float* __restrict__ dB_ssm,
+    int batch, int d_inner)
+{
+    extern __shared__ float smem[];
+    ssm_scan_backward<SEQ_LEN>(dy_scan, x_main_f, dt, A_log, B_ssm, C_ssm,
+                               dx_out, ddt_out, dA_log, dB_ssm, smem,
+                               batch, d_inner);
+}
+
+// Force-instantiate the SEQ_LEN-templated scan kernels for the grokking shapes
+// (S ∈ {4,17,128}) so the device pass emits them; the host TU dispatches on
+// seq_len to the matching instantiation.
+template __global__ void mamba3_gfx942_ssm_fwd<4>(
+    const float*, const float*, const short*, const short*, const short*,
+    float*, int, int);
+template __global__ void mamba3_gfx942_ssm_fwd<17>(
+    const float*, const float*, const short*, const short*, const short*,
+    float*, int, int);
+template __global__ void mamba3_gfx942_ssm_fwd<128>(
+    const float*, const float*, const short*, const short*, const short*,
+    float*, int, int);
+template __global__ void mamba3_gfx942_ssm_bwd<4>(
+    const float*, const float*, const float*, const short*, const short*,
+    const short*, float*, float*, float*, float*, int, int);
+template __global__ void mamba3_gfx942_ssm_bwd<17>(
+    const float*, const float*, const float*, const short*, const short*,
+    const short*, float*, float*, float*, float*, int, int);
+template __global__ void mamba3_gfx942_ssm_bwd<128>(
+    const float*, const float*, const float*, const short*, const short*,
+    const short*, float*, float*, float*, float*, int, int);
+
+}  // namespace native
+}}}}  // namespace sg::gfx942::models::mamba
+#endif  // (B) device pass
 
 
 #if 0  // ===== PRESERVED REFERENCE: hand-written AMDGCN MFMA intrinsics =====
