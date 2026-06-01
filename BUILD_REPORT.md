@@ -172,3 +172,24 @@ ruff check .                                         # clean
 PYTHONPATH=. python -m grokking_optimizers.megakernel            # solver coverage
 PYTHONPATH=. python -m grokking_optimizers.megakernel_codegen --emit-all  # 99-cell manifest
 ```
+
+---
+
+## Phase 4 — 44-component status table (gap #6, now produced)
+
+Full detail + the 99-pipeline table + before→after fuse-tiers are in
+`PHASE4_REPORT.md`. Summary (44/44 components built; verified at each arch's
+gate level; on-silicon execution/numerics 🟡):
+
+| component group | sm_90 | gfx942 | tpu_v5p | verification level |
+|-----------------|-------|--------|---------|--------------------|
+| 11 optimizers   | ✅ built | ✅ built | ✅ built | nvcc-object / clang-amdgcn / jax-lower |
+| 3 models        | ✅ built | ✅ built | ✅ built | nvcc-object / clang-amdgcn / jax-lower |
+| dispatch        | ✅ nvcc | 🟡 hipcc-structural | ✅ unified-py | per arch |
+| compile/codegen | ✅ self-test (138/0) + per-cell register-cap autotuner sweep | | | |
+
+- 33 optimizer + 9 model + 2 (dispatch, compile/codegen) = **44/44 built**.
+- 99 pipelines: **0 STILL-WRAPPER** (anti-false-positive grep = 0). Post-WS1
+  fuse tiers (🟡 estimates): 77 L3 / 22 L1 (was 53 / 46).
+- gfx942: DPP 13 files, MFMA 9 files, ATen 11 (host-orchestration only).
+- All perf/tier/numeric cells are 🟡 pending HARDWARE_VALIDATION.md.

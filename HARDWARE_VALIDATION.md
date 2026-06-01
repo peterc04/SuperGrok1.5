@@ -1700,3 +1700,17 @@ host. The ONLY remaining class is execution on real accelerators:
 | MI300X gfx942 | hipcc-build the 33 `.hip` cells + the `#if WITH_HIP` dispatch branch; run; numeric parity of the AMDGCN apply tails, the SG2 device adjoint, and the MoE filter/scatter/histogram vs their ATen references |
 | TPU v5p | execute the 33 `_pallas_fused` programs; numeric parity vs the JAX reference; confirm XLA fuses fwd→bwd→opt |
 | all | scalar-hyperparam runtime plumbing (prodigy d, sg gates, neuralgrok psi-net) end-to-end |
+
+## Phase 4 — single consolidated verification (Stage V) deferrals
+
+Everything CPU/clang-verifiable PASSED in Stage V (self-test 138/0; ruff check
+clean; nvcc -c on models/{decoder,vit,mamba}.cu + WS1 fused cells; AMDGCN_OK on
+all touched gfx942 files; anti-false-positive grep = 0; WS4 guard exit 0). The
+remaining checks need real accelerators:
+
+| WS | on-silicon check (🟡) |
+|----|----------------------|
+| WS1 | `ptxas -v` register counts confirm the 53→77 L3 re-tier; numeric parity of the SMEM-staged / warp-split fused kernels is bit-identical to pre-WS1 (the change is storage-class/schedule only — confirm on H100) |
+| WS2 | MI300X: numeric parity of the 11 gfx942 device apply kernels + Muon NS MFMA + SG2 adjoint + MoE vs their ATen references; confirm DPP/MFMA issue |
+| WS3 | H100: TF32 tensor-core FP32 path numerics (accepted ~10-bit-mantissa TC precision; `-DSG_FORCE_SCALAR_FP32` for exact); confirm WGMMA engages |
+| WS5 | TPU v5p: the 4 base `kernels/tpu` shims resolve to the same executed `launch_<opt>` math |
