@@ -1226,3 +1226,93 @@ host path; only the reduction — the high-value AMDGCN piece — is migrated.
 | 5 | prodigy_gfx942_rs_reduce | r/s dual sum vs sm_90 prodigy_reduce_kernel bit-parity | §Stage 5 reduction optimizers |
 | 5 | supergrok11_gfx942_cosine_reduce | num/den_g/den_m triple sum vs ATen within a few ulps | §Stage 5 reduction optimizers |
 | 5 | supergrok15_gfx942_sharpness_reduce | Σ sharpness vs ATen `.sum()` within a few ulps | §Stage 5 reduction optimizers |
+
+---
+
+## Stage 5 — elementwise optimizers AMD-native (adamw/lion/grokfast/grokadamw/neuralgrok)
+
+🟡 **HARDWARE-GATED.** The five pure-elementwise optimizer headers now carry a
+real hand-written AMDGCN grid-stride update kernel (§5, section B) alongside the
+unchanged ATen host orchestration (section A). Each is a per-parameter update
+(read grad + state, compute new param + state, write back) — **no reductions, no
+cross-lane MFMA** — so the AMD-native deliverable is a streaming (read-once)
+grid-stride `__global__` kernel built on
+`csrc/backends/hip/gfx942/amdgcn_primitives.hip.hpp` (namespace `amd`):
+
+- **Grid-stride** over `numel`, one stride of elements per workitem (§2.1).
+- **Streaming loads** (§2.7): the grad is read once via `amd::streaming_load`
+  (nontemporal `__builtin_nontemporal_load` — bypasses L2 for one-touch data);
+  the param write-back uses `amd::streaming_store`.
+- **Lean recompute** (§2.9): trivial here — the whole step lives in registers,
+  state EMAs are read/written exactly once, no recompute needed.
+
+**Per-element MATH — inlined (option a).** The vendor-neutral device step
+functions in `csrc/algorithms/<opt>.h` (`adamw_step`, `lion_step`,
+`grokfast_fused_step`, `grokadamw_step`, `neuralgrok_psi_forward` +
+`neuralgrok_apply_step`) include `csrc/common/{types.h,utils.cuh}`, which pull
+torch/cuda and cannot resolve under the bare amdgcn gate. So the tiny per-element
+arithmetic is copied **verbatim** into each device kernel (numerically identical
+to the algorithm header), keeping the bindings + `.hip.cpp` TUs resolving
+unchanged via section A. libm calls are mapped to clang builtins under the gate:
+`sqrtf→__builtin_sqrtf`, `copysignf→__builtin_copysignf`, `fabsf→__builtin_fabsf`.
+
+**Kernels written (all `sg::gfx942::native`, fp32 param + fp32 grad instantiated):**
+- `adamw_gfx942_kernel<ParamT,GradT>` — m/v EMAs + bias-corrected decoupled-WD
+  apply, fused (vs 3 ATen launches).
+- `lion_gfx942_kernel<ParamT,GradT>` — sign-momentum interp + decoupled-WD apply
+  + momentum refresh, fused (sign via `__builtin_copysignf`, zero-interp → 0).
+- `grokfast_gfx942_kernel<ParamT,GradT>` — slow-gradient EMA filter +
+  amplification (`g_amp = g + lamb·ema`) + Adam apply, fused.
+- `grokadamw_gfx942_kernel<ParamT,GradT>` — EMA filter + amplification + Adam
+  apply, fused.
+- `neuralgrok_gfx942_kernel<ParamT,GradT,H>` — per-element psi-net amplifier MLP
+  (`relu(W1·|g|+b1)·W2 + b2`, H-wide, unrolled; layer-1 input is a per-element
+  scalar so it is pure SIMD — no MFMA tile applies) → `g_amp = (s·alpha+beta)·g`
+  → Adam apply, fused. Instantiated at `H ∈ {16,32}` (`neuralgrok_psi<H>` helper).
+
+**Compile routing (two passes, one header):** the HOST `#if !defined(__AMDGCN__)`
+guard keeps the existing ATen path + public launcher signatures byte-for-byte
+(torch pulls `<cuda.h>`, invisible to the bare gate); the DEVICE
+`#if defined(__AMDGCN__) || defined(__HIPCC__)` block carries section B with the
+gate-only workitem/launch shim copied verbatim from the looksam/mamba3 exemplar.
+Each §5.LAUNCH note documents the deferred `hipLaunchKernelGGL` wiring.
+
+**Gate-caught fixes:** the lion/grokfast/grokadamw/neuralgrok headers had no host
+guard (the bare `#include <torch/extension.h>` + namespace were unguarded) — wrapped
+the entire ATen block in `#if !defined(__AMDGCN__)` so torch is invisible to the
+device pass; libm `sqrtf`/`copysignf`/`fabsf` swapped to the `__builtin_*` forms the
+bare gate resolves. No DPP/sched constant-arg issues (no reductions here). adamw was
+already in the pattern and re-verified.
+
+**Verification (this env):**
+- `bash scripts/amdgcn_check.sh --header grokking_optimizers/kernels/gfx942/adamw_gfx942.hip.hpp`
+  → `AMDGCN_OK`
+- `bash scripts/amdgcn_check.sh --header grokking_optimizers/kernels/gfx942/lion_gfx942.hip.hpp`
+  → `AMDGCN_OK`
+- `bash scripts/amdgcn_check.sh --header grokking_optimizers/kernels/gfx942/grokfast_gfx942.hip.hpp`
+  → `AMDGCN_OK`
+- `bash scripts/amdgcn_check.sh --header grokking_optimizers/kernels/gfx942/grokadamw_gfx942.hip.hpp`
+  → `AMDGCN_OK`
+- `bash scripts/amdgcn_check.sh --header grokking_optimizers/kernels/gfx942/neuralgrok_gfx942.hip.hpp`
+  → `AMDGCN_OK`
+- `PYTHONPATH=. python grokking_optimizers/compile.py --self-test` →
+  `137 passed, 1 failed` (the 1 failure is the pre-existing sm_90 flag-baseline
+  regression test, untouched by this change)
+- `ruff check grokking_optimizers/` → `All checks passed!`
+- sm_90 CUDA build UNAFFECTED — only the five gfx942 elementwise optimizer
+  headers changed; the section-A public launchers are byte-for-byte unchanged.
+
+**Hardware checks (deferred — 🟡, no MI300X / no hipcc in this env):**
+- **MI300X numeric parity:** each fused kernel (adamw/lion/grokfast/grokadamw/
+  neuralgrok) vs its `csrc/algorithms/<opt>.h` device-step reference within a few
+  ulps end-to-end (bit-identical math, modulo fp contraction/FMA ordering).
+- **Launch wiring:** the §5.LAUNCH `hipLaunchKernelGGL` sequence becomes live once
+  each optimizer TU migrates `.hip.cpp → .hip`.
+
+| stage | cell | deferred check | command ref |
+|-------|------|----------------|-------------|
+| 5 | adamw_gfx942_kernel | fused m/v + apply vs `adamw_step` reference within a few ulps | §Stage 5 elementwise optimizers |
+| 5 | lion_gfx942_kernel | sign-momentum step vs `lion_step` reference within a few ulps | §Stage 5 elementwise optimizers |
+| 5 | grokfast_gfx942_kernel | EMA-amplified Adam vs `grokfast_fused_step` reference | §Stage 5 elementwise optimizers |
+| 5 | grokadamw_gfx942_kernel | EMA-amplified Adam vs `grokadamw_step` reference | §Stage 5 elementwise optimizers |
+| 5 | neuralgrok_gfx942_kernel | psi-MLP amplifier + Adam vs `neuralgrok_{psi_forward,apply_step}` | §Stage 5 elementwise optimizers |
