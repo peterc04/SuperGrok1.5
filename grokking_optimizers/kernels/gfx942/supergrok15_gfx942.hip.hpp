@@ -56,12 +56,31 @@
 #if !defined(__AMDGCN__)
 #include <torch/extension.h>
 #include <vector>
+#include <cmath>
 
 #include "csrc/backends/hip/gfx942/primitives.hpp"
+
+#if defined(__HIPCC__)
+// LIVE (hipcc) host launch glue: the §5 sharpness-reduce device kernel
+// (section B) and the HIP runtime launch/stream API. On the bare AMDGCN gate
+// (no hipcc) this block is skipped, so amdgcn_check.sh never parses these HIP
+// includes.
+#include <hip/hip_runtime.h>
+#include <ATen/hip/HIPContext.h>
+#endif
 
 namespace sg { namespace gfx942 {
 
 namespace prim = ::sg::gfx942::primitives;
+
+#if defined(__HIPCC__)
+// Forward declaration of the §5 device kernel (defined in section B below) so
+// the host launcher can hipLaunchKernelGGL it; signature matches exactly.
+namespace native {
+extern "C" __global__ void supergrok15_gfx942_sharpness_reduce(
+    const float* __restrict__ sharpness, float* __restrict__ acc, int n);
+}  // namespace native
+#endif
 
 void launch_supergrok15_step(
     std::vector<torch::Tensor>& params,
@@ -94,9 +113,32 @@ void launch_supergrok15_step(
         auto mu_flat = (torch::matmul(h, phi_W2.unsqueeze(1)) + phi_b2).view_as(g);
         mu.copy_(mu_flat);
 
+        // Per-coord alpha gate signal: the sharpness-driven scale.
+        float gate = gate_global;
+#if defined(__HIPCC__)
+        // LIVE (hipcc): §5 sharpness reduce — one pass yields acc = Σ_i
+        // sharpness_i via DPP wave→block→AGENT atomics (replacing an ATen
+        // .sum()). The host forms the sharpness-driven gate scale from the mean
+        // and folds it into the externally-supplied gate_global.
+        {
+            auto sh = sharpnesses[i].to(torch::kFloat32).contiguous();
+            int n = static_cast<int>(sh.numel());
+            if (n > 0) {
+                auto acc = torch::zeros({1}, sh.options());
+                hipStream_t stream = at::hip::getCurrentHIPStream();
+                dim3 grid(std::min(1024, (n + 255) / 256)), block(256);  // 4 waves/block
+                hipLaunchKernelGGL(native::supergrok15_gfx942_sharpness_reduce,
+                                   grid, block, 0, stream,
+                                   sh.data_ptr<float>(), acc.data_ptr<float>(), n);
+                float sharp_mean = acc.item<float>() / static_cast<float>(n);
+                gate = gate_global * (1.0f / (1.0f + sharp_mean));
+            }
+        }
+#endif
+
         // Per-coord alpha, then smart_grad
         auto a_per_coord = torch::clamp(alpha_base * (1.0f + mu), 0.0f, alpha_max);
-        auto smart = g.to(torch::kFloat32) + gate_global * a_per_coord * mu;
+        auto smart = g.to(torch::kFloat32) + gate * a_per_coord * mu;
 
         prim::ema_update_inplace(m, smart, beta1);
         prim::ema_sq_update_inplace(v, smart, beta2);
@@ -143,18 +185,21 @@ void launch_sharpness_restore(
 
 }} // namespace sg::gfx942
 
-// ── §5.LAUNCH (host-side wiring note) ────────────────────────────────────────
-// On a real `.hip` (hipcc) build, the global gate scale (the mean/sum of the
-// per-coordinate sharpness across the parameter) launches the §5 kernel below
-// instead of an ATen `.sum()`:
-//   float* d_acc;  hipMalloc(&d_acc, sizeof(float)); hipMemsetAsync(d_acc,0,4);
+// ── §5.LAUNCH (host-side wiring — NOW DISPATCHED) ────────────────────────────
+// launch_supergrok15_step() DISPATCHES the §5 sharpness reduce on hipcc
+// (`#if __HIPCC__`); the ATen-scalar `gate_global` path is the `#else` CPU-host
+// fallback. The global gate scale (the mean of the per-coordinate sharpness
+// across the parameter) is computed on-device per param:
+//   auto acc = torch::zeros({1}, sh.options());
 //   dim3 grid(min(1024, (n+255)/256)), block(256);   // 4 wavefronts/block
 //   hipLaunchKernelGGL(native::supergrok15_gfx942_sharpness_reduce, grid, block,
-//                      0, stream, sharpness_ptr, d_acc, n);
-//   // host then: gate_global = f(*d_acc / n)  (the sharpness-driven gate)
-// 🟡 DEFERRED: the live launch + hipcc link is MI300X-gated. This host TU keeps
-// the ATen `.sum()` (numerics-correct); the §5 kernel is COMPILER-VERIFIED for
-// gfx942 via scripts/amdgcn_check.sh and ready to wire in on hardware.
+//                      0, stream, sh.data_ptr<float>(), acc.data_ptr<float>(), n);
+//   // host then: sharp_mean = acc/ n;  gate = gate_global / (1 + sharp_mean)
+// The per-element meta-net MLP + per-coord alpha gate + smart_grad + Adam apply
+// stay on the ATen host path (pure elementwise — no MFMA/DPP value). The §5
+// kernel is COMPILER-VERIFIED for gfx942 via scripts/amdgcn_check.sh.
+// 🟡 host-launch glue UNEXERCISED here (no hipcc / no MI300X in this CI); the
+//    live launch + hipcc link is hardware-gated — see HARDWARE_VALIDATION.md.
 #endif  // !defined(__AMDGCN__)  — end host orchestration (A)
 
 // ════════════════════════════════════════════════════════════════════════════

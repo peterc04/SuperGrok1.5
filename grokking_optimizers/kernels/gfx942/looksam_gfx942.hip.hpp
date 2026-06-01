@@ -58,8 +58,22 @@
 #if !defined(__AMDGCN__)
 #include <torch/extension.h>
 #include <vector>
+#include <algorithm>
 
 #include "csrc/backends/hip/gfx942/primitives.hpp"
+
+#if defined(__HIPCC__)
+// LIVE host-launch path: pull in the HIP runtime (hipLaunchKernelGGL, dim3) and
+// the ATen↔HIP stream accessor, and forward-declare the §5 device kernel so the
+// host launcher below can dispatch it. The kernel body is in section (B), which
+// the hipcc DEVICE pass compiles from this same header (__HIPCC__ gate).
+#include <hip/hip_runtime.h>
+#include <ATen/hip/HIPContext.h>
+namespace sg { namespace gfx942 { namespace native {
+extern "C" __global__ void looksam_gfx942_sumsq_reduce(
+    const float* __restrict__ g, float* __restrict__ acc, int n);
+}}}
+#endif
 
 namespace sg { namespace gfx942 {
 
@@ -134,24 +148,56 @@ void launch_looksam_norm_reduce(
     torch::Tensor grad, torch::Tensor sam_grad, torch::Tensor results /* [diff_norm, grad_norm] */
 ) {
     // results[0] = ||sam_grad - grad||, results[1] = ||grad||
+#if defined(__HIPCC__)
+    // LIVE (hipcc): dispatch the §5 DPP sum-of-squares reduction kernel for each
+    // norm, matching the ATen body's two .norm() stages. ‖x‖ = sqrt(Σ x²): one
+    // reduce per quantity into a single-float AGENT accumulator, host does sqrt.
+    //   STAGE 1: ‖sam_grad − grad‖ — reduce the diff buffer; STAGE 2: ‖grad‖.
+    // §5.LAUNCH grid/block: block(256) = 4 wavefronts, grid = min(1024,(n+255)/256).
+    auto diff = (sam_grad.to(torch::kFloat32) - grad.to(torch::kFloat32)).contiguous();
+    auto gf   = grad.to(torch::kFloat32).contiguous();
+    const int n_diff = static_cast<int>(diff.numel());
+    const int n_grad = static_cast<int>(gf.numel());
+
+    auto acc_opts = torch::TensorOptions().device(grad.device()).dtype(torch::kFloat32);
+    auto acc = torch::zeros({2}, acc_opts);  // [Σ diff², Σ grad²]
+    auto stream = at::hip::getCurrentHIPStream();
+
+    if (n_diff > 0) {
+        dim3 block(256), grid(std::min(1024, (n_diff + 255) / 256));
+        hipLaunchKernelGGL(native::looksam_gfx942_sumsq_reduce, grid, block, 0, stream,
+                           diff.data_ptr<float>(), acc.data_ptr<float>(), n_diff);
+    }
+    if (n_grad > 0) {
+        dim3 block(256), grid(std::min(1024, (n_grad + 255) / 256));
+        hipLaunchKernelGGL(native::looksam_gfx942_sumsq_reduce, grid, block, 0, stream,
+                           gf.data_ptr<float>(), acc.data_ptr<float>() + 1, n_grad);
+    }
+    auto norms = acc.sqrt();  // [‖diff‖, ‖grad‖]
+    results[0] = norms[0];
+    results[1] = norms[1];
+#else
     auto diff = sam_grad.to(torch::kFloat32) - grad.to(torch::kFloat32);
     results[0] = diff.norm();
     results[1] = grad.to(torch::kFloat32).norm();
+#endif
 }
 
 }} // namespace sg::gfx942
 
-// ── §5.LAUNCH (host-side wiring note) ────────────────────────────────────────
-// On a real `.hip` (hipcc) build, launch_looksam_norm_reduce() launches the §5
-// kernel below instead of calling ATen `.norm()`:
-//   float* d_acc;  hipMalloc(&d_acc, sizeof(float)); hipMemsetAsync(d_acc,0,4);
-//   dim3 grid(min(1024, (n+255)/256)), block(256);   // 4 wavefronts/block
+// ── §5.LAUNCH (host-side wiring — NOW LIVE on hipcc) ─────────────────────────
+// launch_looksam_norm_reduce() above DISPATCHES the §5 kernel under
+// `#if defined(__HIPCC__)` instead of calling ATen `.norm()`; ATen `.norm()` is
+// the `#else` CPU-host fallback. The dispatch (one reduce per norm into a
+// 2-float AGENT accumulator, host sqrt) follows §5.LAUNCH grid/block:
+//   dim3 block(256), grid(min(1024, (n+255)/256));   // 4 wavefronts/block
 //   hipLaunchKernelGGL(native::looksam_gfx942_sumsq_reduce, grid, block,
-//                      0, stream, g_ptr, d_acc, n);
-//   // host then: grad_norm = sqrtf(*d_acc)   (rsqrt for the 1/‖g‖ scale)
-// 🟡 DEFERRED: the live launch + hipcc link is MI300X-gated. This host TU keeps
-// the ATen `.norm()` (numerics-correct); the §5 kernel is COMPILER-VERIFIED for
-// gfx942 via scripts/amdgcn_check.sh and ready to wire in on hardware.
+//                      0, stream, x_ptr, acc_ptr, n);
+//   // host then: ‖x‖ = sqrtf(*acc)   (rsqrt for the 1/‖g‖ perturb scale)
+// 🟡 host-launch DEFERRED: the live hipLaunchKernelGGL glue is COMPILED only on
+// a real hipcc/ROCm toolchain (no hipcc here) and the MI300X numeric bit-parity
+// check is still gated. The §5 device kernel is COMPILER-VERIFIED for gfx942 via
+// scripts/amdgcn_check.sh; the host glue links on hardware.
 #endif  // !defined(__AMDGCN__)  — end host orchestration (A)
 
 // ════════════════════════════════════════════════════════════════════════════

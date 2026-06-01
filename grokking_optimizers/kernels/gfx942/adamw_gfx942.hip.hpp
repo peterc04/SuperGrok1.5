@@ -54,8 +54,9 @@
 // only. The free-standing AMDGCN device gate (__AMDGCN__) does NOT see this
 // block (torch/extension.h pulls in <cuda.h>/ATen, which the free-standing
 // device target cannot resolve); the §5 device kernel below is the device-pass
-// content. On a real hipcc build the host pass compiles this and launches the
-// §5 kernel via hipLaunchKernelGGL (see §5.LAUNCH).
+// content. Under hipcc (`#if __HIPCC__`) the host launcher now DISPATCHES the
+// §5 kernel via hipLaunchKernelGGL (see §5.LAUNCH); the `#else` branch keeps
+// the ATen path as the CPU-host fallback.
 // ════════════════════════════════════════════════════════════════════════════
 #if !defined(__AMDGCN__)
 #include <torch/extension.h>
@@ -82,24 +83,39 @@ void launch_adamw_step(
         auto& m = pack.state_a[i];
         auto& v = pack.state_b[i];
 
+#if defined(__HIPCC__)
+        // LIVE device path: dispatch the §5 AMDGCN kernel per tensor (fuses the
+        // m/v EMAs + bias-corrected decoupled-weight-decay apply into ONE launch
+        // vs the 3 ATen elementwise ops). 🟡 hipcc-only — no hipcc in this env.
+        const int n = static_cast<int>(p.numel());
+        if (n == 0) continue;
+        dim3 grid(min(1024, (n + 255) / 256)), block(256);  // 4 wavefronts/block
+        hipLaunchKernelGGL((native::adamw_gfx942_kernel<float, float>), grid,
+                           block, 0, 0,
+                           p.data_ptr<float>(), m.data_ptr<float>(),
+                           v.data_ptr<float>(), g.data_ptr<float>(),
+                           lr, beta1, beta2, eps, wd, bc1, bc2, n);
+#else
         prim::ema_update_inplace(m, g, beta1);
         prim::ema_sq_update_inplace(v, g, beta2);
         prim::adam_apply_inplace(p, m, v, lr, bc1, bc2, eps, wd);
+#endif
     }
 }
 
 }} // namespace sg::gfx942
 
-// ── §5.LAUNCH (host-side wiring note) ────────────────────────────────────────
-// On a real `.hip` (hipcc) build, launch_adamw_step() launches the §5 kernel
-// per tensor instead of the 3 ATen elementwise ops:
+// ── §5.LAUNCH (host-side wiring — NOW LIVE under hipcc) ──────────────────────
+// Under `#if defined(__HIPCC__)`, launch_adamw_step() DISPATCHES the §5 kernel
+// per tensor (above) instead of the 3 ATen elementwise ops:
 //   dim3 grid(min(1024,(n+255)/256)), block(256);   // 4 wavefronts/block
 //   hipLaunchKernelGGL((native::adamw_gfx942_kernel<float,float>), grid, block,
-//                      0, stream, p_ptr, m_ptr, v_ptr, g_ptr,
+//                      0, 0, p_ptr, m_ptr, v_ptr, g_ptr,
 //                      lr, beta1, beta2, eps, wd, bc1, bc2, n);
-// 🟡 DEFERRED: the live launch + hipcc link is MI300X-gated. This host TU keeps
-// the ATen path (numerics-correct); the §5 kernel is COMPILER-VERIFIED for
-// gfx942 via scripts/amdgcn_check.sh and ready to wire in on hardware.
+// The `#else` branch is the ATen CPU-host fallback (numerics-correct).
+// 🟡 The hipcc host-launch compiles ONLY under hipcc (no hipcc in this env, so
+// the hipLaunchKernelGGL glue is unverified here). The §5 device kernel itself
+// is COMPILER-VERIFIED for gfx942 via scripts/amdgcn_check.sh (AMDGCN_OK).
 #endif  // !defined(__AMDGCN__)  — end host orchestration (A)
 
 // ════════════════════════════════════════════════════════════════════════════

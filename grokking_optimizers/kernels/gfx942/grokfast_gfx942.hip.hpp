@@ -46,8 +46,9 @@
 // ════════════════════════════════════════════════════════════════════════════
 // (A) HOST orchestration — ATen public entry points. Compiled by the HOST pass
 // only (torch/extension.h pulls in <cuda.h>/ATen, invisible to the bare device
-// gate). On a real hipcc build the host pass launches the §5 kernel via
-// hipLaunchKernelGGL (see §5.LAUNCH).
+// gate). Under hipcc (`#if __HIPCC__`) the host launcher now DISPATCHES the §5
+// kernel via hipLaunchKernelGGL (see §5.LAUNCH); the `#else` branch keeps the
+// ATen path as the CPU-host fallback.
 // ════════════════════════════════════════════════════════════════════════════
 #if !defined(__AMDGCN__)
 #include <torch/extension.h>
@@ -77,11 +78,26 @@ void launch_grokfast_step(
         auto& v = exp_avg_sqs[i];
         auto& ema = emas[i];
 
+#if defined(__HIPCC__)
+        // LIVE device path: dispatch the §5 AMDGCN kernel per tensor (fuses the
+        // EMA filter + amplification + m/v Adam EMAs + bias-corrected decoupled-
+        // WD apply into ONE launch). 🟡 hipcc-only — none in this env.
+        const int n = static_cast<int>(p.numel());
+        dim3 grid(min(1024, (n + 255) / 256)), block(256);  // 4 wavefronts/block
+        hipLaunchKernelGGL((native::grokfast_gfx942_kernel<float, float>), grid,
+                           block, 0, 0,
+                           p.data_ptr<float>(), m.data_ptr<float>(),
+                           v.data_ptr<float>(), ema.data_ptr<float>(),
+                           g.data_ptr<float>(),
+                           gf_alpha, gf_lamb, lr, beta1, beta2, eps, wd,
+                           bc1, bc2, n);
+#else
         prim::ema_update_inplace(ema, g, gf_alpha);
         auto g_amp = g.to(torch::kFloat32) + gf_lamb * ema;
         prim::ema_update_inplace(m, g_amp, beta1);
         prim::ema_sq_update_inplace(v, g_amp, beta2);
         prim::adam_apply_inplace(p, m, v, lr, bc1, bc2, eps, wd);
+#endif
     }
 }
 
@@ -117,16 +133,17 @@ void launch_multi_tensor_grokfast_ema(
 
 }} // namespace sg::gfx942
 
-// ── §5.LAUNCH (host-side wiring note) ────────────────────────────────────────
-// On a real `.hip` (hipcc) build, launch_grokfast_step() launches the §5 kernel
-// per tensor instead of the chain of ATen ema + amplify + adam ops:
+// ── §5.LAUNCH (host-side wiring — NOW LIVE under hipcc) ──────────────────────
+// Under `#if defined(__HIPCC__)`, launch_grokfast_step() DISPATCHES the §5
+// kernel per tensor (above) instead of the chain of ATen ema + amplify + adam:
 //   dim3 grid(min(1024,(n+255)/256)), block(256);   // 4 wavefronts/block
 //   hipLaunchKernelGGL((native::grokfast_gfx942_kernel<float,float>), grid,
-//                      block, 0, stream, p_ptr, m_ptr, v_ptr, ema_ptr, g_ptr,
+//                      block, 0, 0, p_ptr, m_ptr, v_ptr, ema_ptr, g_ptr,
 //                      gf_alpha, gf_lamb, lr, beta1, beta2, eps, wd, bc1, bc2, n);
-// 🟡 DEFERRED: the live launch + hipcc link is MI300X-gated. This host TU keeps
-// the ATen path (numerics-correct); the §5 kernel is COMPILER-VERIFIED for
-// gfx942 via scripts/amdgcn_check.sh and ready to wire in on hardware.
+// The `#else` branch is the ATen CPU-host fallback (numerics-correct).
+// 🟡 The hipcc host-launch compiles ONLY under hipcc (no hipcc in this env, so
+// the hipLaunchKernelGGL glue is unverified here). The §5 device kernel itself
+// is COMPILER-VERIFIED for gfx942 via scripts/amdgcn_check.sh (AMDGCN_OK).
 #endif  // !defined(__AMDGCN__)  — end host orchestration (A)
 
 // ════════════════════════════════════════════════════════════════════════════

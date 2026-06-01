@@ -60,12 +60,33 @@
 #if !defined(__AMDGCN__)
 #include <torch/extension.h>
 #include <vector>
+#include <algorithm>
+#include <cmath>
 
 #include "csrc/backends/hip/gfx942/primitives.hpp"
+
+#if defined(__HIPCC__)
+// LIVE (hipcc) host launch glue: the §5 cosine-gate device kernel (section B)
+// and the HIP runtime launch/stream API. On the bare AMDGCN gate (no hipcc)
+// this block is skipped, so amdgcn_check.sh never parses these HIP includes.
+#include <hip/hip_runtime.h>
+#include <ATen/hip/HIPContext.h>
+#endif
 
 namespace sg { namespace gfx942 {
 
 namespace prim = ::sg::gfx942::primitives;
+
+#if defined(__HIPCC__)
+// Forward declaration of the §5 device kernel (defined in section B below) so
+// the host launchers can hipLaunchKernelGGL it; signature matches exactly.
+namespace native {
+extern "C" __global__ void supergrok11_gfx942_cosine_reduce(
+    const float* __restrict__ g, const float* __restrict__ m,
+    float* __restrict__ num_acc, float* __restrict__ den_g_acc,
+    float* __restrict__ den_m_acc, int n);
+}  // namespace native
+#endif
 
 void launch_supergrok11_step(
     std::vector<torch::Tensor>& params,
@@ -101,11 +122,37 @@ void launch_supergrok11_step(
         // Cosine gate
         auto gf = g.to(torch::kFloat32);
         auto mom = momenta[i];
+#if defined(__HIPCC__)
+        // LIVE (hipcc): §5 cosine-gate reduce — one pass yields num=Σg·m,
+        // den_g=Σg², den_m=Σm² via DPP wave→block→AGENT atomics (replacing the
+        // ATen .sum()/.norm() triple). gate = clamp(num / sqrt(den_g·den_m),0,1).
+        float gate;
+        {
+            auto gfc  = gf.contiguous();
+            auto momc = mom.to(torch::kFloat32).contiguous();
+            int n = static_cast<int>(gfc.numel());
+            auto acc = torch::zeros({3}, gfc.options());
+            hipStream_t stream = at::hip::getCurrentHIPStream();
+            dim3 grid(std::min(1024, (n + 255) / 256)), block(256);  // 4 wavefronts/block
+            hipLaunchKernelGGL(native::supergrok11_gfx942_cosine_reduce, grid, block,
+                               0, stream, gfc.data_ptr<float>(), momc.data_ptr<float>(),
+                               acc.data_ptr<float>(), acc.data_ptr<float>() + 1,
+                               acc.data_ptr<float>() + 2, n);
+            auto h_acc = acc.cpu();
+            float num   = h_acc[0].item<float>();
+            float den_g = h_acc[1].item<float>();
+            float den_m = h_acc[2].item<float>();
+            float denom = sqrtf(den_g * den_m);
+            gate = (denom > 1e-12f) ? (num / denom) : 0.0f;
+            gate = std::min(std::max(gate, 0.0f), 1.0f);
+        }
+#else
         float dot = (gf * mom).sum().item<float>();
         float ng = gf.norm().item<float>();
         float nm = mom.norm().item<float>();
         float gate = (ng * nm > 1e-12f) ? (dot / (ng * nm)) : 0.0f;
         gate = std::min(std::max(gate, 0.0f), 1.0f);
+#endif
 
         // Sweep B: smart_grad + Adam
         auto smart = gf + (1.0f - gate) * alpha * mu;
@@ -161,32 +208,52 @@ float compute_cosine_gate_fused(
     torch::Tensor smart_grad, torch::Tensor mu, float gate_temp
 ) {
     // cos_sim(smart_grad, mu) clamped to [0, 1]
-    auto sg_f = smart_grad.to(torch::kFloat32).flatten();
-    auto mu_f = mu.to(torch::kFloat32).flatten();
+    auto sg_f = smart_grad.to(torch::kFloat32).flatten().contiguous();
+    auto mu_f = mu.to(torch::kFloat32).flatten().contiguous();
+#if defined(__HIPCC__)
+    // LIVE (hipcc): §5 cosine-gate reduce (num=Σsg·mu, den_g=Σsg², den_m=Σmu²)
+    // via DPP wave→block→AGENT atomics; ATen .sum() triple is the #else fallback.
+    int n = static_cast<int>(sg_f.numel());
+    auto acc = torch::zeros({3}, sg_f.options());
+    hipStream_t stream = at::hip::getCurrentHIPStream();
+    dim3 grid(std::min(1024, (n + 255) / 256)), block(256);  // 4 wavefronts/block
+    hipLaunchKernelGGL(native::supergrok11_gfx942_cosine_reduce, grid, block,
+                       0, stream, sg_f.data_ptr<float>(), mu_f.data_ptr<float>(),
+                       acc.data_ptr<float>(), acc.data_ptr<float>() + 1,
+                       acc.data_ptr<float>() + 2, n);
+    auto h_acc = acc.cpu();
+    float num = h_acc[0].item<float>(), den_g = h_acc[1].item<float>(), den_m = h_acc[2].item<float>();
+    float denom = sqrtf(den_g * den_m + 1e-12f);
+    float gate = (denom > 0.0f) ? (num / denom) : 0.0f;
+    return std::min(std::max(gate, 0.0f), 1.0f);
+#else
     float num = (sg_f * mu_f).sum().item<float>();
     float den_g = (sg_f * sg_f).sum().item<float>();
     float den_m = (mu_f * mu_f).sum().item<float>();
     float denom = sqrtf(den_g * den_m + 1e-12f);
     float gate = (denom > 0.0f) ? (num / denom) : 0.0f;
     return std::min(std::max(gate, 0.0f), 1.0f);
+#endif
 }
 
 }} // namespace sg::gfx942
 
-// ── §5.LAUNCH (host-side wiring note) ────────────────────────────────────────
-// On a real `.hip` (hipcc) build, launch_supergrok11_step()/compute_cosine_gate_
-// fused() launch the §5 kernel below instead of the ATen `.sum()`/`.norm()`
-// triple:
-//   float* d_acc;  hipMalloc(&d_acc, 3*sizeof(float)); hipMemsetAsync(d_acc,0,12);
+// ── §5.LAUNCH (host-side wiring — NOW DISPATCHED) ────────────────────────────
+// launch_supergrok11_step() / compute_cosine_gate_fused() DISPATCH the §5
+// cosine-gate kernel on hipcc (`#if __HIPCC__`); the ATen `.sum()`/`.norm()`
+// triple is the `#else` CPU-host fallback. Live (hipcc) stage:
+//   auto acc = torch::zeros({3}, gfc.options());
 //   dim3 grid(min(1024, (n+255)/256)), block(256);   // 4 wavefronts/block
 //   hipLaunchKernelGGL(native::supergrok11_gfx942_cosine_reduce, grid, block, 0,
-//                      stream, g_ptr, m_ptr, d_acc, d_acc+1, d_acc+2, n);
-//   // host then: num=d_acc[0]; den_g=d_acc[1]; den_m=d_acc[2];
+//                      stream, g_ptr, m_ptr, acc, acc+1, acc+2, n);
+//   // host then: num=acc[0]; den_g=acc[1]; den_m=acc[2];
 //   //            denom = sqrtf(den_g*den_m + 1e-12f);
 //   //            gate  = clamp(num / denom, 0, 1);
-// 🟡 DEFERRED: the live launch + hipcc link is MI300X-gated. This host TU keeps
-// the ATen reductions (numerics-correct); the §5 kernel is COMPILER-VERIFIED for
-// gfx942 via scripts/amdgcn_check.sh and ready to wire in on hardware.
+// The per-element meta-net MLP + smart_grad + Adam apply stay on the ATen host
+// path (pure elementwise — no MFMA/DPP value). The §5 kernel is
+// COMPILER-VERIFIED for gfx942 via scripts/amdgcn_check.sh.
+// 🟡 host-launch glue UNEXERCISED here (no hipcc / no MI300X in this CI); the
+//    live launch + hipcc link is hardware-gated — see HARDWARE_VALIDATION.md.
 #endif  // !defined(__AMDGCN__)  — end host orchestration (A)
 
 // ════════════════════════════════════════════════════════════════════════════

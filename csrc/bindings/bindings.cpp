@@ -1886,7 +1886,12 @@ void supergrok2_bilevel_fwd_save_batched(
 
 // SG2 bilevel backward through the CSA/HCA meta-net, single-tensor entry.
 // Mamba weight/state block swapped for the CSA/HCA weight + attention adjoint
-// saved-state block. On gfx942 the backward may still throw (forward only).
+// saved-state block. FUNCTIONAL on BOTH arches (no throw): sm_90 and gfx942 run
+// the real reverse-mode VJP via launch_csa_hca_backward →
+// sg2adj::bilevel_backward_driver (vendor-neutral ATen adjoint, the LIVE CPU
+// path). On a hipcc build the gfx942 device AMDGCN adjoint
+// (supergrok2_bilevel_adjoint_gfx942.hip.hpp) is the live device path; numeric
+// parity is 🟡 (MI300X). The earlier "forward only / throws" note was stale.
 void supergrok2_bilevel_backward(
  torch::Tensor d_smart_grad,
  torch::Tensor grad, torch::Tensor sharpness, float rescale,

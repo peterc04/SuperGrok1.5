@@ -70,12 +70,35 @@
 #if !defined(__AMDGCN__)
 #include <torch/extension.h>
 #include <vector>
+#include <algorithm>
+#include <cmath>
 
 #include "csrc/backends/hip/gfx942/primitives.hpp"
+
+#if defined(__HIPCC__)
+// LIVE (hipcc) host launch glue: the §5 device kernels (section B) and the HIP
+// runtime launch/stream API. On the bare AMDGCN gate (no hipcc) this whole host
+// block is skipped, so amdgcn_check.sh never parses these HIP-runtime includes.
+#include <hip/hip_runtime.h>
+#include <ATen/hip/HIPContext.h>
+#endif
 
 namespace sg { namespace gfx942 {
 
 namespace prim = ::sg::gfx942::primitives;
+
+#if defined(__HIPCC__)
+// Forward declarations of the §5 / §5.2 device kernels (defined in section B
+// below) so the host launchers can hipLaunchKernelGGL them. Signatures match
+// the extern "C" __global__ definitions exactly.
+namespace native {
+extern "C" __global__ void muon_gfx942_frobenius_reduce(
+    const float* __restrict__ m, float* __restrict__ acc, int n);
+extern "C" __global__ void muon_gfx942_newton_schulz(
+    float* __restrict__ X_inout, int M, int N, int steps,
+    float a, float b, float c);
+}  // namespace native
+#endif
 
 static inline torch::Tensor newton_schulz_iterate(
     torch::Tensor X, int ns_steps, float a, float b, float c
@@ -95,6 +118,60 @@ void launch_muon_step(
     float lr, float momentum, float wd, int ns_steps,
     float ns_a, float ns_b, float ns_c
 ) {
+#if defined(__HIPCC__)
+    // LIVE (hipcc): dispatch the §5 device kernels per stage; §5 / §5.2 are the
+    // live AMD-native path on real hardware. Stage order mirrors the COMPUTE
+    // PATTERN above:
+    //   (1) momentum EMA + (5) p-update stay elementwise on the ATen host path;
+    //   (2) Frobenius ‖buf‖_F  → §5  muon_gfx942_frobenius_reduce  (DPP reduce);
+    //   (3) normalize X = buf / ‖buf‖_F                            (host scalar);
+    //   (4) Newton-Schulz × ns_steps → §5.2 muon_gfx942_newton_schulz (bf16 MFMA).
+    // 1D params have no 2-D orthogonalization → AdamW-like device fallthrough.
+    hipStream_t stream = at::hip::getCurrentHIPStream();
+    for (size_t i = 0; i < params.size(); i++) {
+        if (!grads[i].defined() || grads[i].numel() == 0) continue;
+        auto& p = params[i];
+        auto& buf = bufs[i];
+        auto& g = grads[i];
+
+        // (1) momentum EMA (elementwise — no MFMA/DPP value).
+        buf.mul_(momentum).add_(g.to(buf.scalar_type()), 1.0f - momentum);
+
+        if (p.dim() >= 2) {
+            auto buf_f = buf.to(torch::kFloat32).contiguous();
+            int n = static_cast<int>(buf_f.numel());
+
+            // (2) Frobenius ‖buf‖_F = sqrt(Σ buf²): §5 DPP wave→block→AGENT reduce.
+            auto acc = torch::zeros({1}, buf_f.options());
+            dim3 fgrid(std::min(1024, (n + 255) / 256)), fblock(256);
+            hipLaunchKernelGGL(native::muon_gfx942_frobenius_reduce, fgrid, fblock,
+                               0, stream, buf_f.data_ptr<float>(),
+                               acc.data_ptr<float>(), n);
+            float frob = sqrtf(acc.item<float>()) + 1e-8f;
+
+            // (3) normalize the iterate in place: X = buf / ‖buf‖_F.
+            int M = static_cast<int>(p.size(-2));
+            int N = static_cast<int>(p.size(-1));
+            auto X = (buf_f / frob).contiguous();
+
+            // (4) Newton-Schulz × ns_steps: §5.2 one wavefront per 2-D param,
+            //     16×16×16 bf16 MFMA orthogonalization (device matrix-core path).
+            int sq = N * N, rect = M * N, mx = sq > rect ? sq : rect;
+            int lds = (rect + sq + sq + rect) * (int)sizeof(float)
+                      + (2 * mx) * (int)sizeof(short);   // host mirror of muon_ns_lds_bytes
+            hipLaunchKernelGGL(native::muon_gfx942_newton_schulz, dim3(1), dim3(64),
+                               lds, stream, X.data_ptr<float>(), M, N, ns_steps,
+                               ns_a, ns_b, ns_c);
+
+            // (5) p -= lr·X·scale + p·decay (elementwise — host path).
+            float neg_lr_scale = -lr * 0.2f * sqrtf((float)std::max<int64_t>(p.size(-1), p.size(-2)));
+            p.mul_(1.0f - lr * wd).add_(X.to(p.scalar_type()), neg_lr_scale);
+        } else {
+            // 1D fall back: Adam-like (no 2-D orthogonalization).
+            p.add_(buf.to(p.scalar_type()), -lr);
+        }
+    }
+#else
     for (size_t i = 0; i < params.size(); i++) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
         auto& p = params[i];
@@ -114,6 +191,7 @@ void launch_muon_step(
             p.add_(buf.to(p.scalar_type()), -lr);
         }
     }
+#endif
 }
 
 
@@ -153,26 +231,23 @@ void launch_muon_update(
 
 }} // namespace sg::gfx942
 
-// ── §5.LAUNCH (host-side wiring note) ────────────────────────────────────────
-// On a real `.hip` (hipcc) build, launch_muon_step()/launch_muon_momentum_
-// normalize() launch the §5 kernel below instead of calling ATen `.norm()` for
-// the Frobenius norm ‖buf‖_F:
-//   float* d_acc;  hipMalloc(&d_acc, sizeof(float)); hipMemsetAsync(d_acc,0,4);
+// ── §5.LAUNCH (host-side wiring — NOW DISPATCHED) ────────────────────────────
+// launch_muon_step() DISPATCHES the §5 device kernels on hipcc (`#if __HIPCC__`);
+// ATen `.norm()` + torch::mm Newton-Schulz is the `#else` CPU-host fallback.
+// Live (hipcc) stage order for each 2-D param (see launch_muon_step):
 //   dim3 grid(min(1024, (n+255)/256)), block(256);   // 4 wavefronts/block
 //   hipLaunchKernelGGL(native::muon_gfx942_frobenius_reduce, grid, block,
-//                      0, stream, buf_ptr, d_acc, n);
-//   // host then: frob = sqrtf(*d_acc) + 1e-8f;  inv_norm = 1.f / frob
-//
-// and newton_schulz_iterate()'s 3 GEMMs/step (currently torch::mm → rocBLAS)
-// launch the §5.2 REAL MFMA Newton-Schulz kernel — one wavefront per 2-D param,
-// X pre-normalized by inv_norm:
-//   int lds = native::muon_ns_lds_bytes(M, N);   // host mirror of the device fn
+//                      0, stream, buf_ptr, d_acc, n);   // §5 DPP reduce
+//   // host then: frob = sqrtf(*d_acc) + 1e-8f;  X = buf / frob
+//   int lds = (M*N + N*N + N*N + M*N)*sizeof(float)
+//             + 2*max(M*N,N*N)*sizeof(short);          // host mirror of muon_ns_lds_bytes
 //   hipLaunchKernelGGL(native::muon_gfx942_newton_schulz, dim3(1), dim3(64),
 //                      lds, stream, X_ptr, M, N, ns_steps, ns_a, ns_b, ns_c);
-// 🟡 DEFERRED: the live launch + hipcc link is MI300X-gated. This host TU keeps
-// the ATen `.norm()` + torch::mm Newton-Schulz (numerics-correct); the §5 /
-// §5.2 kernels are COMPILER-VERIFIED for gfx942 via scripts/amdgcn_check.sh and
-// ready to wire in on hardware.
+// The §5.2 path is the device 16×16×16 bf16 MFMA Newton-Schulz; rocBLAS/torch::mm
+// is ONLY the `#else` CPU fallback. The §5 / §5.2 kernels are COMPILER-VERIFIED
+// for gfx942 via scripts/amdgcn_check.sh.
+// 🟡 host-launch glue UNEXERCISED here (no hipcc / no MI300X in this CI); the
+//    live launch + hipcc link is hardware-gated — see HARDWARE_VALIDATION.md.
 #endif  // !defined(__AMDGCN__)  — end host orchestration (A)
 
 // ════════════════════════════════════════════════════════════════════════════
