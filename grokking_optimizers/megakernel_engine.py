@@ -96,6 +96,49 @@ from torch.optim import Optimizer
 from grokking_optimizers.megakernel import FusionPlan, FusionTier, solve
 
 
+# ─────────────────────── unified cross-arch fused dispatch ───────────────────
+
+def dispatch_fused_megakernel(model: str, optimizer: str, *, params=None,
+                              grads=None, opt_state=None, inputs=None,
+                              lr: float = 1e-3, state=None):
+    """Route a fused L3/L1 megakernel step to the backend for the detected arch.
+
+    The single cross-arch entry that unifies the three real composition paths
+    (Phase 3):
+      * tpu_v5p → csrc.backends.pallas._pallas_fused.fused_step (jax.jit fused
+        program; the 33 tpu cells bind to it).
+      * sm_90 / gfx942 → the C++ `fused_step` pybind (dispatch.cpp routes to the
+        real composed `mega_<model>_<opt>` launcher; gfx942 host launch is 🟡).
+
+    Returns the backend's result (TPU: (new_params, new_state)). Raises a clear
+    error if the cell/binding is unavailable on this build (no silent no-op).
+    """
+    from grokking_optimizers.dispatch import detect_arch
+    arch = detect_arch()
+    tier = "L3" if solve(model, optimizer,
+                         arch if isinstance(arch, str) else
+                         ("sm_90" if arch == 90 else "gfx942")
+                         ).tier == FusionTier.L3_FWD_BWD_OPT else "L1"
+    if arch == "tpu_v5p":
+        from csrc.backends.pallas._pallas_fused import fused_step as tpu_fused
+        return tpu_fused(model, optimizer, params=params, grads=grads,
+                         opt_state=opt_state, inputs=inputs, lr=lr, tier=tier)
+    # NVIDIA / AMD: the C++ megakernel dispatch (real composition per dispatch.cpp).
+    from grokking_optimizers.dispatch import get_ops
+    ops = get_ops()
+    if not hasattr(ops, "fused_step"):
+        raise RuntimeError(
+            "C++ fused_step binding unavailable; build the extension "
+            "(WITH_CUDA/WITH_HIP) to use the GPU fused megakernel path.")
+    if params is None or state is None:
+        raise ValueError("GPU fused_step needs params, grads, and a state tensor "
+                         "([m|v|extra] per param-tensor).")
+    ops.fused_step(model, optimizer, params,
+                   inputs if inputs is not None else params,
+                   grads if grads is not None else params, state, float(lr))
+    return params
+
+
 # ─────────────────────────── fused-ownership query ───────────────────────────
 
 
@@ -454,4 +497,5 @@ __all__ = [
     "build_client_optimizer",
     "fused_training_step",
     "all_reduce_optimizer_hooks",
+    "dispatch_fused_megakernel",
 ]
