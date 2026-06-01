@@ -1685,6 +1685,18 @@ owning component headers. The following stay 🟡 (no GPU this session):
 |-------|------|----------------|
 | P3-S5 | sm_90 fused tails | on-silicon numeric parity of `apply_optimizer<OptId>` vs the per-op path for all 11 (H100) |
 | P3-S5 | sm_90 extra-state opts | host-plumb ema/sam_dir/s_track/mu through `dispatch.cpp::fused_step`, then runtime-verify on H100 |
-| P3-S5 | remaining 21 sm_90 cells | individually nvcc -c compile-gate (mechanism proven on the 12-cell cover) |
-| P3 | gfx942 / tpu real compositions | NOT-DONE this phase — fused cells remain wrappers/stubs; build the real `.hip.hpp` / Pallas compositions |
-| P3 | gfx942 SG2 adjoint + MoE | still ATen — port to AMDGCN |
+| P3-S5 | remaining 21 sm_90 cells | ✅ DONE — all 33 sm_90 cells individually nvcc -c COMPILE_OK |
+| P3 | gfx942 / tpu real compositions | ✅ DONE — gfx942 AMDGCN_OK, tpu 66/66 trace+lower (see PHASE3_REPORT.md) |
+| P3 | gfx942 SG2 adjoint + MoE | ✅ device cuts AMDGCN_OK (adjoint + MoE filter/scatter/histogram); numeric parity 🟡 |
+
+## Phase 3 continuation — remaining checks are all on-silicon (no device here)
+
+Everything structurally/compile/trace-checkable is DONE and verified on the CPU
+host. The ONLY remaining class is execution on real accelerators:
+
+| arch | on-silicon check (🟡) |
+|------|----------------------|
+| H100 sm_90 | run the 33 composed megakernels; numeric parity of all 11 `apply_optimizer<OptId>` tails vs the per-op path; persistent-kernel occupancy / grid-barrier no-deadlock |
+| MI300X gfx942 | hipcc-build the 33 `.hip` cells + the `#if WITH_HIP` dispatch branch; run; numeric parity of the AMDGCN apply tails, the SG2 device adjoint, and the MoE filter/scatter/histogram vs their ATen references |
+| TPU v5p | execute the 33 `_pallas_fused` programs; numeric parity vs the JAX reference; confirm XLA fuses fwd→bwd→opt |
+| all | scalar-hyperparam runtime plumbing (prodigy d, sg gates, neuralgrok psi-net) end-to-end |
