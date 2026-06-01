@@ -186,16 +186,73 @@ def mamba3_scan_with_pallas(x_sorted, weights, initial_state, reverse=False):
     return scan_module.mamba3_scan(x_sorted, weights, initial_state, reverse)
 
 
-def pallas_expert_gather(expert_weights, expert_indices, top_k):
-    """Gather top-k expert weights for each element.
-
-    XLA version: expert_weights[expert_indices] — generates gather ops
-    Pallas version: manual indexing in VMEM — avoids gather overhead
-
-    Currently a stub — implement if profiling shows gather > 20% of step time.
-    """
-    # Pure JAX gather — correct baseline
+def _expert_gather_jax(expert_weights, expert_indices, top_k):
+    """Pure JAX expert gather fallback — always correct."""
     return expert_weights[expert_indices]
+
+
+if _HAS_PALLAS:
+    def pallas_expert_gather(expert_weights, expert_indices, top_k):
+        """Gather top-k expert weights for each element.
+
+        XLA version: expert_weights[expert_indices] — generates gather ops
+        Pallas version: manual indexing in VMEM — avoids gather overhead
+
+        Args:
+            expert_weights: [num_experts, D] expert parameter buffer.
+            expert_indices: [batch, top_k] selected expert indices per token.
+            top_k: number of experts per token.
+
+        Returns:
+            gathered: [batch, top_k, D] gathered expert weights.
+        """
+        batch_size = expert_indices.shape[0]
+        num_experts = expert_weights.shape[0]
+        D = expert_weights.shape[1] if expert_weights.ndim >= 2 else 1
+        flat_weights = expert_weights.reshape(num_experts, -1) if expert_weights.ndim >= 2 else expert_weights[:, None]
+        D = flat_weights.shape[1]
+
+        TILE = min(64, batch_size)
+        if batch_size < TILE or batch_size % TILE != 0:
+            return _expert_gather_jax(expert_weights, expert_indices, top_k)
+
+        num_blocks = batch_size // TILE
+        out_shape_tuple = expert_weights.shape[1:] if expert_weights.ndim >= 2 else ()
+
+        def gather_kernel(weights_ref, indices_ref, out_ref):
+            tile_idx = indices_ref[...]  # [TILE, top_k]
+            for elem in range(TILE):
+                for k in range(top_k):
+                    eidx = tile_idx[elem, k]
+                    out_ref[elem, k] = weights_ref[eidx]
+
+        try:
+            gathered = pl.pallas_call(
+                gather_kernel,
+                out_shape=[
+                    jax.ShapeDtypeStruct(
+                        (batch_size, top_k, D), flat_weights.dtype),
+                ],
+                grid=(num_blocks,),
+                in_specs=[
+                    pl.BlockSpec(flat_weights.shape, lambda i: (0, 0)),
+                    pl.BlockSpec((TILE, top_k), lambda i: (i * TILE, 0)),
+                ],
+                out_specs=[
+                    pl.BlockSpec((TILE, top_k, D), lambda i: (i * TILE, 0, 0)),
+                ],
+            )(flat_weights, expert_indices)
+
+            result_shape = (batch_size, top_k) + out_shape_tuple
+            return gathered.reshape(result_shape)
+
+        except Exception:
+            return _expert_gather_jax(expert_weights, expert_indices, top_k)
+
+else:
+    def pallas_expert_gather(expert_weights, expert_indices, top_k):
+        """Gather top-k expert weights (pure JAX — Pallas unavailable)."""
+        return _expert_gather_jax(expert_weights, expert_indices, top_k)
 
 
 # ═══════════════════════════════════════════════════════════════════════
