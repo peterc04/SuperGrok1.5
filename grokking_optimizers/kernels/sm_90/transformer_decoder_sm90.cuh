@@ -83,6 +83,7 @@
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <type_traits>
 
 #ifdef WITH_CUTLASS
 // Sm90 (Hopper) warp-group collective GEMM helpers (TMA + WGMMA, FP32
@@ -144,16 +145,36 @@ __device__ __forceinline__ float ptx_tanhf(float x) { return tanhf(x); }
 namespace sg { namespace sm90 { namespace models { namespace decoder {
 
 #ifdef WITH_CUTLASS
-// The Sm90 collective GEMM path only supports the CUTLASS half/bf16 element
-// types. FP32 activations/weights (T=float) keep the cuBLAS path. Resolved at
-// compile time so the FP32 instantiation never tries to build a float CUTLASS
-// GEMM (no cutlass element mapping for float).
+// ── Tensor-core element mapping ──────────────────────────────────────
+// half/bf16 map directly to their CUTLASS element types. FP32 (T=float) maps
+// to cutlass::tfloat32_t: the LIVE FP32 tensor-core path — the WGMMA mainloop
+// reads the float buffers as TF32 (10-bit mantissa) and accumulates in FP32.
+// See the precision note below before the float decoder_linear_gemm overload.
 template <typename T> struct cutlass_gemm_elem;            // primary: unsupported
 template <> struct cutlass_gemm_elem<__half>        { using type = cutlass::half_t; };
 template <> struct cutlass_gemm_elem<__nv_bfloat16> { using type = cutlass::bfloat16_t; };
+template <> struct cutlass_gemm_elem<float>         { using type = cutlass::tfloat32_t; };
+// half/bf16 are always tensor-core supported.
 template <typename T> struct cutlass_gemm_supported          { static constexpr bool value = false; };
 template <> struct cutlass_gemm_supported<__half>           { static constexpr bool value = true; };
 template <> struct cutlass_gemm_supported<__nv_bfloat16>    { static constexpr bool value = true; };
+
+// ── FP32 tensor-core (TF32) gate ─────────────────────────────────────
+// FP32 uses the TF32 tensor-core path by DEFAULT (the accepted FP32 MMA mode).
+// Define SG_FORCE_SCALAR_FP32 at build time to force the exact-FP32 cuBLAS
+// (CUBLAS_COMPUTE_32F) path instead — for a caller demanding bit-exact FP32.
+// 🟡 numeric parity: TF32 (10-bit mantissa) is NOT bit-identical to scalar
+// FP32 (23-bit) — an accuracy/precision tradeoff, not a bug.
+template <typename T> struct cutlass_gemm_tf32          { static constexpr bool value = false; };
+#ifndef SG_FORCE_SCALAR_FP32
+template <> struct cutlass_gemm_tf32<float>             { static constexpr bool value = true; };
+#endif
+// "Any tensor-core GEMM available for T" — half/bf16 (real CUTLASS element) or
+// float (TF32). Used to gate the try-tensor-core-then-fallback dispatch.
+template <typename T> struct cutlass_gemm_any_tc {
+    static constexpr bool value =
+        cutlass_gemm_supported<T>::value || cutlass_gemm_tf32<T>::value;
+};
 
 // Forward declaration: the FP32->T cast helper is fully defined (with its
 // __nv_bfloat16/__half specializations) further down. Declared here so the
@@ -210,6 +231,36 @@ inline cudaError_t decoder_linear_gemm(
     int block = 256, grid = (int)((n + block - 1) / block);
     gemm_cast_f32_kernel<T><<<grid, block, 0, stream>>>(c_fp32, C, n);
     return cudaGetLastError();
+}
+
+// FP32 (TF32 tensor-core) overload — LIVE FP32 tensor-core path.
+// C is already FP32, so the WGMMA result lands directly in C (no cast pass and
+// no scratch). A/B are float buffers read as tfloat32_t by mma::*_tf32_bt.
+// 🟡 TF32's 10-bit mantissa is NOT bit-identical to scalar FP32 (23-bit) — the
+// accepted FP32 tensor-core precision tradeoff. Returns cudaErrorNotSupported
+// if CUTLASS cannot tile the shape; the caller falls back to cuBLAS.
+template <typename LayoutBT>
+inline cudaError_t decoder_linear_gemm_f32(
+    int M, int N, int K,
+    const float* A, const float* B, float* C, cudaStream_t stream)
+{
+    return mma::sm90_run_gemm_tf32_bt<LayoutBT>(M, N, K, A, B, C, stream);
+}
+
+// Unified dispatcher used by the forward/backward call sites: routes half/bf16
+// to the CUTLASS half/bf16 collective and float to the TF32 tensor-core path,
+// with a single uniform call signature. Both return cudaErrorNotSupported on a
+// shape CUTLASS cannot tile, so the caller's cuBLAS fallback still fires.
+template <typename T, typename LayoutBT>
+inline cudaError_t decoder_linear_gemm_tc(
+    int M, int N, int K,
+    const T* A, const T* B, T* C, cudaStream_t stream)
+{
+    if constexpr (std::is_same<T, float>::value) {
+        return decoder_linear_gemm_f32<LayoutBT>(M, N, K, A, B, C, stream);
+    } else {
+        return decoder_linear_gemm<T, LayoutBT>(M, N, K, A, B, C, stream);
+    }
 }
 #endif  // WITH_CUTLASS
 
@@ -955,8 +1006,8 @@ cudaError_t forward(
         // qkv_out = qkv_in @ qkv_W^T  (qkv_W is [3D, D] row-major => Bᵀ).
 #ifdef WITH_CUTLASS
         bool qkv_done = false;
-        if constexpr (cutlass_gemm_supported<WeightT>::value) {
-            qkv_done = (decoder_linear_gemm<WeightT, cutlass::layout::ColumnMajor>(
+        if constexpr (cutlass_gemm_any_tc<WeightT>::value) {
+            qkv_done = (decoder_linear_gemm_tc<WeightT, cutlass::layout::ColumnMajor>(
                 B*S, 3*D, D,
                 (const WeightT*)sl.qkv_in, lw.qkv_W,
                 (WeightT*)sl.qkv_out, stream) == cudaSuccess);
@@ -990,8 +1041,8 @@ cudaError_t forward(
         // Output projection: attn_proj = attn_out @ out_W^T  (out_W [D,D]).
 #ifdef WITH_CUTLASS
         bool outp_done = false;
-        if constexpr (cutlass_gemm_supported<WeightT>::value) {
-            outp_done = (decoder_linear_gemm<WeightT, cutlass::layout::ColumnMajor>(
+        if constexpr (cutlass_gemm_any_tc<WeightT>::value) {
+            outp_done = (decoder_linear_gemm_tc<WeightT, cutlass::layout::ColumnMajor>(
                 B*S, D, D,
                 (const WeightT*)sl.attn_out, lw.out_W,
                 (WeightT*)sl.attn_proj, stream) == cudaSuccess);
@@ -1014,8 +1065,8 @@ cudaError_t forward(
         // FFN up: ffn_pre = layer1_out @ ff1_W^T  (ff1_W [FH,D]).
 #ifdef WITH_CUTLASS
         bool ff1_done = false;
-        if constexpr (cutlass_gemm_supported<WeightT>::value) {
-            ff1_done = (decoder_linear_gemm<WeightT, cutlass::layout::ColumnMajor>(
+        if constexpr (cutlass_gemm_any_tc<WeightT>::value) {
+            ff1_done = (decoder_linear_gemm_tc<WeightT, cutlass::layout::ColumnMajor>(
                 B*S, FH, D,
                 (const WeightT*)sl.layer1_out, lw.ff1_W,
                 (WeightT*)sl.ffn_pre, stream) == cudaSuccess);
@@ -1040,8 +1091,8 @@ cudaError_t forward(
         // FFN down: ffn_out = ffn_post @ ff2_W^T  (ff2_W [D,FH]).
 #ifdef WITH_CUTLASS
         bool ff2_done = false;
-        if constexpr (cutlass_gemm_supported<WeightT>::value) {
-            ff2_done = (decoder_linear_gemm<WeightT, cutlass::layout::ColumnMajor>(
+        if constexpr (cutlass_gemm_any_tc<WeightT>::value) {
+            ff2_done = (decoder_linear_gemm_tc<WeightT, cutlass::layout::ColumnMajor>(
                 B*S, D, FH,
                 (const WeightT*)sl.ffn_post, lw.ff2_W,
                 (WeightT*)sl.ffn_out, stream) == cudaSuccess);
@@ -1074,8 +1125,8 @@ cudaError_t forward(
     ActT* logits_full = final_norm_out + L.final_norm_out;
 #ifdef WITH_CUTLASS
     bool vocab_done = false;
-    if constexpr (cutlass_gemm_supported<WeightT>::value) {
-        vocab_done = (decoder_linear_gemm<WeightT, cutlass::layout::ColumnMajor>(
+    if constexpr (cutlass_gemm_any_tc<WeightT>::value) {
+        vocab_done = (decoder_linear_gemm_tc<WeightT, cutlass::layout::ColumnMajor>(
             B*S, V, D,
             (const WeightT*)final_norm_out, vocab_W,
             (WeightT*)logits_full, stream) == cudaSuccess);

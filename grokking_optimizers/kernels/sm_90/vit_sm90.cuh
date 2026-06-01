@@ -107,16 +107,31 @@ __device__ __forceinline__ float fast_rsqrt_nr(float x) { return rsqrtf(x); }
 namespace sg { namespace sm90 { namespace models { namespace vit {
 
 #ifdef WITH_CUTLASS
-// The Sm90 collective GEMM path only supports the CUTLASS half/bf16 element
-// types. FP32 activations/weights (T=float) keep the scalar gemm_bias_kernel
-// path. Resolved at compile time so the FP32 instantiation never tries to
-// build a float CUTLASS GEMM (no cutlass element mapping for float).
+// ── Tensor-core element mapping ──────────────────────────────────────
+// half/bf16 map to their CUTLASS element types. FP32 (T=float) maps to
+// cutlass::tfloat32_t — the LIVE FP32 tensor-core path: the WGMMA mainloop
+// reads the float buffers as TF32 (10-bit mantissa), accumulating in FP32.
 template <typename T> struct cutlass_gemm_elem;            // primary: unsupported
 template <> struct cutlass_gemm_elem<__half>        { using type = cutlass::half_t; };
 template <> struct cutlass_gemm_elem<__nv_bfloat16> { using type = cutlass::bfloat16_t; };
+template <> struct cutlass_gemm_elem<float>         { using type = cutlass::tfloat32_t; };
 template <typename T> struct cutlass_gemm_supported       { static constexpr bool value = false; };
 template <> struct cutlass_gemm_supported<__half>        { static constexpr bool value = true; };
 template <> struct cutlass_gemm_supported<__nv_bfloat16> { static constexpr bool value = true; };
+
+// ── FP32 tensor-core (TF32) gate ─────────────────────────────────────
+// FP32 uses the TF32 tensor-core path by DEFAULT (the accepted FP32 MMA mode).
+// Define SG_FORCE_SCALAR_FP32 to force the exact-FP32 scalar gemm_bias_kernel.
+// 🟡 numeric parity: TF32 (10-bit mantissa) is NOT bit-identical to scalar
+// FP32 (23-bit) — an accuracy/precision tradeoff, not a bug.
+template <typename T> struct cutlass_gemm_tf32          { static constexpr bool value = false; };
+#ifndef SG_FORCE_SCALAR_FP32
+template <> struct cutlass_gemm_tf32<float>             { static constexpr bool value = true; };
+#endif
+template <typename T> struct cutlass_gemm_any_tc {
+    static constexpr bool value =
+        cutlass_gemm_supported<T>::value || cutlass_gemm_tf32<T>::value;
+};
 #endif  // WITH_CUTLASS
 
 // ─── dtype helpers ─────────────────────────────────────────────────────
@@ -405,7 +420,11 @@ inline float* vit_gemm_fp32_scratch(size_t elems) {
 // of the scalar gemm_bias_kernel it replaces). FP32 accumulate, then a
 // cast(+bias) pass back into the activation dtype. Reuses the canonical
 // mma::sm90_run_gemm_bt builder from mma.cuh (modeled byte-for-byte on
-// fmha_sm90_gemm) — no local CollectiveBuilder. T must be CUTLASS half/bf16.
+// fmha_sm90_gemm) — no local CollectiveBuilder. T = half/bf16 (real CUTLASS
+// element) OR float: for float, cutlass_gemm_elem<float>=tfloat32_t selects the
+// LIVE TF32 tensor-core mainloop (the float in/W buffers are read as tfloat32_t
+// — 10-bit mantissa, FP32 accumulate). 🟡 TF32 is NOT bit-identical to scalar
+// FP32 (23-bit) — accepted FP32 tensor-core precision tradeoff, not a bug.
 // Returns cudaErrorNotSupported if CUTLASS cannot implement the shape; the
 // caller falls back to the scalar gemm_bias_kernel.
 template <typename T>
@@ -425,18 +444,23 @@ inline cudaError_t vit_linear_gemm_bias(
     return cudaGetLastError();
 }
 
-// Dispatch wrapper: CUTLASS Sm90 path for half/bf16, scalar fallback for
-// FP32 (or whenever CUTLASS cannot implement the shape).
+// Dispatch wrapper: tensor-core Sm90 path for half/bf16 AND fp32 (TF32 MMA),
+// scalar gemm_bias_kernel as the genuine last-resort fallback (a shape CUTLASS
+// truly cannot tile → cudaErrorNotSupported). For ActT=float the collective is
+// the LIVE TF32 path; the in/W float buffers are read as tfloat32_t for the
+// WGMMA (10-bit mantissa, FP32 accumulate). 🟡 TF32 is NOT bit-identical to the
+// scalar FP32 triple-loop — the accepted FP32 tensor-core precision tradeoff;
+// define SG_FORCE_SCALAR_FP32 to force exact scalar FP32.
 template <typename ActT, typename WeightT>
 inline cudaError_t launch_linear_bias(
     const ActT* in, const WeightT* W, const WeightT* b, ActT* out,
     int M, int N, int K, cudaStream_t stream)
 {
-    if constexpr (cutlass_gemm_supported<ActT>::value &&
+    if constexpr (cutlass_gemm_any_tc<ActT>::value &&
                   std::is_same<ActT, WeightT>::value) {
         cudaError_t err = vit_linear_gemm_bias<ActT>(in, W, b, out, M, N, K, stream);
         if (err == cudaSuccess) return cudaSuccess;
-        // fall through to the scalar path on cudaErrorNotSupported
+        // genuine last-resort fallback on cudaErrorNotSupported (untileable shape)
     }
     return launch_gemm_bias<ActT, WeightT>(in, W, b, out, M, N, K, stream);
 }
