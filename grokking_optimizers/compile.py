@@ -1833,6 +1833,82 @@ def _populate_search_space_builders() -> None:
 _populate_search_space_builders()
 
 
+# ===========================================================================
+# Per-cell megakernel register-cap sweep (WORKSTREAM 1, knob #1)
+# ===========================================================================
+#
+# The per-arch search space already carries a ``maxrregcount`` tuning dim (it
+# is emitted as a bare ``--maxrregcount=N`` / ``-amdgpu-max-num-vgprs=N`` flag,
+# see ``_render_*_flags``). A hardcoded register cap is a footgun — forcing a
+# cap below what ptxas wants spills to local memory, which is only a net win
+# when the spilled values are cold. So the cap MUST be tuned per cell, not
+# fixed. Rather than invent a parallel tuning path, we EXTEND the existing
+# ``maxrregcount`` dim: for a megakernel cell we replace that dim's value list
+# with a per-cell sweep seeded from the solver's footprint estimate for that
+# exact (model, optimizer, arch). The autotuner then times each cap and the
+# winner is whatever ptxas+silicon actually prefers for that cell.
+def _megakernel_maxrregcount_values(arch_key: str,
+                                    model: str,
+                                    optimizer: str) -> List[int]:
+    """Per-CELL register-cap sweep for a fused megakernel (model×optimizer).
+
+    Seeds the sweep around the megakernel solver's estimated L3 register
+    footprint for this cell: we sample the uncapped point (let ptxas choose),
+    the arch ceiling, and a spread of caps from the estimate down toward the
+    producer-warp-group floor. The autotuner times each and keeps the fastest;
+    a cap only wins if its spill is cold (§ knob #1).
+    """
+    entry = ARCH_TABLE[arch_key]
+    cap = entry.max_regs_per_thread or 255
+    # Lazy import to avoid a heavy import at module load (mirrors megakernel.py).
+    try:
+        from grokking_optimizers import megakernel as _mk
+        plan = _mk.solve(model, optimizer, arch_key if arch_key in
+                         _mk.MEGAKERNEL_ARCHS else _mk.MEGAKERNEL_ARCHS[0])
+        est = max(32, min(cap, int(plan.regs)))
+    except Exception:
+        est = cap  # solver unavailable → fall back to the full arch range
+    # Candidate caps: estimate, a few steps above/below (to bracket the real
+    # ptxas number), the arch ceiling, and a low cap that trades occupancy for
+    # registers. De-duplicate + sort; always include 0 == "no cap" (ptxas free)
+    # which is encoded as the arch ceiling here so the bare flag stays valid.
+    cands = set()
+    for c in (est - 16, est - 8, est, est + 8, est + 16,
+              (est + cap) // 2, cap):
+        if 24 <= c <= cap:
+            cands.add(c - (c % 4))  # 4-step aligned, matches _maxrregcount_values
+    cands.add(cap)
+    if cap >= 255:
+        cands.add(255)
+    return sorted(v for v in cands if v >= 24) or [cap]
+
+
+def megakernel_cell_search_space(arch_key: str,
+                                 model: str,
+                                 optimizer: str) -> Dict[str, Any]:
+    """Return the arch's full search space with the ``maxrregcount`` dim
+    re-bound to this CELL's per-cell register-cap sweep (knob #1).
+
+    This is the single seam the megakernel autotune path calls: it does NOT
+    create a new search space, it takes the existing per-arch space and swaps
+    only the register-cap dim's value list for the cell-seeded one, so the cap
+    is tuned per (model, optimizer, arch) inside the SAME sweep machinery.
+    """
+    entry = ARCH_TABLE.get(arch_key)
+    if entry is None or entry.search_space_builder is None:
+        raise KeyError(f"no search-space builder for arch '{arch_key}'")
+    space = entry.search_space_builder()
+    cell_caps = _megakernel_maxrregcount_values(arch_key, model, optimizer)
+    for d in space.get("dims", []):
+        if d.get("name") == "maxrregcount":
+            d["values"] = cell_caps
+            break
+    else:
+        # Arch had no maxrregcount dim (e.g. Pallas) — nothing to tune.
+        pass
+    return space
+
+
 def _canonical_arches() -> List[str]:
     """Distinct canonical arch keys (skips aliases that share an entry)."""
     seen_ids: set = set()
