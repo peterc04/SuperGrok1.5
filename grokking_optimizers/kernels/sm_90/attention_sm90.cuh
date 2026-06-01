@@ -28,6 +28,18 @@
 #include "csrc/common/types.h"
 #include "csrc/common/utils.cuh"
 
+// ── Autotuner-consumable launch parameters (inlined; see compile.py) ──
+// The autotuner emits -DSG_TUNED_ASYNC_DEPTH=N; the §4.2 cp.async staging
+// loads below consume it as the number of in-flight cp.async groups / buffer
+// slots. Clamped to a sane max at the use site.
+#ifndef SG_TUNED_ASYNC_DEPTH
+#define SG_TUNED_ASYNC_DEPTH 2
+#endif
+
+// §4.2 cp.async background-load helpers (cp_async_cg_16 / cp_async_ca_4 /
+// cp_async_commit / cp_async_wait_group / cp_async_wait_all).
+#include "csrc/backends/cuda/sm_90/primitives.cuh"
+
 #ifdef WITH_CUTLASS
 // ── Sm90 (Hopper) warp-group collective GEMM headers ──────────────────────
 // Used by cutlass_fmha_forward below. The fused-MHA is realised as two Sm90
@@ -288,19 +300,65 @@ __global__ void fmha_softmax_kernel(
     float* __restrict__ lse,       // [N] log-sum-exp or nullptr
     int N, float scale)
 {
+    namespace prim = ::sg::sm90::primitives;
     int i = blockIdx.x;            // query row
     if (i >= N) return;
-    extern __shared__ float sh[];  // N floats
+    // Shared layout: sh[N] (working/scaled buffer) followed by sraw[N], the
+    // cp.async raw-S staging buffer. Caller allocates 2*N floats (see launch).
+    extern __shared__ float sh[];  // sh[0..N) | sraw[0..N)
+    float* sraw = sh + N;
     int tid = threadIdx.x;
 
-    // load + mask + find max
-    float m = -1e30f;
-    for (int j = tid; j < N; j += blockDim.x) {
-        float v = S[i * N + j] * scale;
-        if (kCausal && j > i) v = -1e30f;
-        sh[j] = v;
-        m = fmaxf(m, v);
+    // ── §4.2 cp.async background staging of the raw S row into `sraw` ──────
+    // The raw row S[i*N + 0..N) is the memory-bound global->shared load that
+    // precedes the (latency-bound) softmax. We hand-issue cp.async.ca (4B,
+    // scalar float) copies tile-by-tile, keeping SG_TUNED_ASYNC_DEPTH groups
+    // in flight so the global-load latency overlaps the address math / issue
+    // of later tiles. Each "tile" is one strided pass of blockDim.x elements.
+    // Clamp the pipeline depth to a sane maximum.
+    constexpr int kAsyncDepth =
+        (SG_TUNED_ASYNC_DEPTH < 1) ? 1
+      : (SG_TUNED_ASYNC_DEPTH > 4) ? 4 : SG_TUNED_ASYNC_DEPTH;
+    const int bdx    = blockDim.x;
+    const int nTiles = (N + bdx - 1) / bdx;          // tiles along the row
+    const float* Srow = S + (size_t)i * N;
+
+    auto issue_tile = [&](int t) {
+        const int j = t * bdx + tid;
+        if (j < N) {
+            // 4-byte (.ca) async copy S[i*N+j] -> sraw[j]; committed as a group.
+            prim::cp_async_ca_4(&sraw[j], &Srow[j]);
+        }
+        prim::cp_async_commit();
+    };
+
+    // Prime the pipeline with up to kAsyncDepth groups.
+    int issued = 0;
+    #pragma unroll
+    for (int d = 0; d < kAsyncDepth; ++d) {
+        if (issued < nTiles) { issue_tile(issued); ++issued; }
     }
+
+    // load + mask + find max, consuming the staged tiles as they land.
+    float m = -1e30f;
+    for (int t = 0; t < nTiles; ++t) {
+        // Wait until at most (kAsyncDepth-1) groups remain in flight, i.e. the
+        // group feeding tile `t` has landed in `sraw`. Then issue one more to
+        // keep the pipe full.
+        prim::cp_async_wait_group<kAsyncDepth - 1>();
+        __syncthreads();                  // sraw[tile t] visible to all threads
+        const int j = t * bdx + tid;
+        if (j < N) {
+            float v = sraw[j] * scale;    // byte-identical to S[i*N+j]*scale
+            if (kCausal && j > i) v = -1e30f;
+            sh[j] = v;
+            m = fmaxf(m, v);
+        }
+        if (issued < nTiles) { issue_tile(issued); ++issued; }
+        // No second sync needed: tiles write disjoint sraw[] regions (full-row
+        // buffer, no slot reuse), so the next tile's wait+sync is sufficient.
+    }
+    prim::cp_async_wait_all();           // drain any tail groups still in flight
     __syncthreads();
     // block-wide max reduction (simple shared-mem tree over warps)
     __shared__ float red[32];
@@ -390,7 +448,8 @@ cudaError_t cutlass_fmha_forward(
 
         // softmax over rows (scaled, optional causal mask) -> P (ActT)
         int sm_block = 128;
-        size_t sm_smem = sizeof(float) * (size_t)N;
+        // 2*N floats: sh[N] working buffer + sraw[N] cp.async S staging buffer.
+        size_t sm_smem = sizeof(float) * (size_t)N * 2;
         fmha_softmax_kernel<ActT, kCausal>
             <<<N, sm_block, sm_smem, stream>>>(
                 S, P, lse ? lse + (size_t)bh * N : nullptr, N, scale);

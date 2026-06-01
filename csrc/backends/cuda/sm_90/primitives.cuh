@@ -94,6 +94,57 @@ __device__ __forceinline__ float block_reduce_sum_f32(float v) {
 }
 
 // =========================================================================
+//  Warp-level u32 sum reduction (§4.1 PTX maximization).
+//  Integer reductions use the single-instruction `redux.sync.add.u32`
+//  warp collective on Ampere/Hopper (sm_80+), which replaces the 5-step
+//  shuffle-xor butterfly with one instruction. Every lane in the (fully
+//  active) warp receives the full-warp sum. A shuffle-tree fallback keeps
+//  the helper compiling/working on pre-Ampere arches in the codegen matrix.
+//
+//  NOTE: integer-only. FLOAT redux (`redux.sync.{add,min,max}.f32`) is
+//  Blackwell-only (sm_100+) and out of scope — float reductions stay on the
+//  shuffle tree (warp_reduce_sum_f32 above).
+// =========================================================================
+
+__device__ __forceinline__ unsigned warp_reduce_add_u32(unsigned v) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    unsigned r;
+    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(r) : "r"(v));
+    return r;  // every lane gets the full-warp sum
+#else
+    // shuffle-tree fallback (pre-Ampere)
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+    return v;
+#endif
+}
+
+// =========================================================================
+//  Block-level u32 sum reduction: warp reduce + shared-memory tree + warp
+//  reduce. Mirrors block_reduce_sum_f32 exactly (32 u32 of smem, one per
+//  warp; same __syncthreads placement) but uses the redux.sync warp reducer.
+// =========================================================================
+
+__device__ __forceinline__ unsigned block_reduce_add_u32(unsigned v) {
+    __shared__ unsigned smem[32];
+    const int tid = threadIdx.x;
+    const int warp = tid / 32;
+    const int lane = tid & 31;
+
+    unsigned w = warp_reduce_add_u32(v);
+    if (lane == 0) smem[warp] = w;
+    __syncthreads();
+
+    int n_warps = (blockDim.x + 31) / 32;
+    if (warp == 0) {
+        unsigned x = (lane < n_warps) ? smem[lane] : 0u;
+        x = warp_reduce_add_u32(x);
+        if (lane == 0) smem[0] = x;
+    }
+    __syncthreads();
+    return smem[0];
+}
+
+// =========================================================================
 //  Cluster (DSMEM) reduction on Hopper sm_90+ with sm_80 fallback.
 //  Wraps the utility in common/utils.cuh.
 // =========================================================================
@@ -276,5 +327,84 @@ private:
     cudaStream_t stream_;
     bool active_;
 };
+
+// =========================================================================
+//  §4.2 cp.async background loads (NVIDIA PTX maximization).
+//
+//  Hand-issued `cp.async.{cg,ca}.shared.global` + commit/wait pipelines for
+//  memory-bound global->shared staging loads. The async copy lets the SM
+//  issue the load and continue executing (address math, the previous tile's
+//  compute) while the bytes arrive — overlapping the global-load latency
+//  instead of stalling at a synchronous load.
+//
+//  Contract / correctness (CRITICAL):
+//    issue (cp_async_cg_16 / cp_async_ca_4)  ->  cp_async_commit()  ->
+//    cp_async_wait_group<N>()  ->  __syncthreads()  ->  read shared.
+//  A correctly WAITED cp.async produces byte-identical shared data to a plain
+//  synchronous load. A missing/misplaced wait = reading bytes still in flight
+//  = garbage. Every issued group MUST be committed and the consume MUST be
+//  preceded by a wait that drains the group(s) feeding it.
+//
+//  Arch guard: cp.async is sm_80+ (Ampere). On pre-Ampere arches in the
+//  codegen matrix the helpers fall back to a plain synchronous copy (commit /
+//  wait become no-ops), so call sites are portable and numerically identical.
+//
+//  Alignment/size: cp.async sources must be 4/8/16-byte aligned and the size
+//  must be exactly 4/8/16. Use cp_async_cg_16 for 16B (float4, .cg cache-
+//  global) and cp_async_ca_4 for 4B (single float, .ca cache-all).
+// =========================================================================
+
+// 16-byte (float4) async global->shared copy, .cg (cache-global) hint.
+__device__ __forceinline__ void cp_async_cg_16(
+    void* smem_ptr, const void* gmem_ptr
+) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    unsigned s = __cvta_generic_to_shared(smem_ptr);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                 :: "r"(s), "l"(gmem_ptr));
+#else
+    *reinterpret_cast<float4*>(smem_ptr) =
+        *reinterpret_cast<const float4*>(gmem_ptr);
+#endif
+}
+
+// 4-byte async global->shared copy, .ca (cache-all) hint. For scalar (float)
+// staging loops that are not float4-alignable.
+__device__ __forceinline__ void cp_async_ca_4(
+    void* smem_ptr, const void* gmem_ptr
+) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    unsigned s = __cvta_generic_to_shared(smem_ptr);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                 :: "r"(s), "l"(gmem_ptr));
+#else
+    *reinterpret_cast<float*>(smem_ptr) =
+        *reinterpret_cast<const float*>(gmem_ptr);
+#endif
+}
+
+// Commit all cp.async copies issued since the last commit into one group.
+__device__ __forceinline__ void cp_async_commit() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("cp.async.commit_group;\n");
+#endif
+    // pre-Ampere: synchronous fallback already completed the copy; no-op.
+}
+
+// Wait until at most N committed groups remain in flight (the rest have
+// landed in shared). cp_async_wait_group<0>() drains ALL outstanding groups.
+// N is a compile-time immediate as required by the PTX wait_group operand.
+template <int N>
+__device__ __forceinline__ void cp_async_wait_group() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#endif
+    // pre-Ampere: synchronous fallback already completed the copy; no-op.
+}
+
+// Drain every outstanding cp.async group (wait_group 0).
+__device__ __forceinline__ void cp_async_wait_all() {
+    cp_async_wait_group<0>();
+}
 
 }}} // namespace sg::sm90::primitives

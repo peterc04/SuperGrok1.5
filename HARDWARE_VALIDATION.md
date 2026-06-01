@@ -422,3 +422,74 @@ looksam (exp_avg + exp_avg_sq in the apply step).
 | 2 | all opt | L2 hit-rate uplift on m/v | §Stage 2 ncu |
 | 2 | all opt | numerics no-op vs ENABLE_L2_PERSIST=0 | §Stage 2 parity |
 | 2 | all opt | carve-out released after step | §Stage 2 reset |
+
+## Stage 3.1 — redux.sync integer reductions
+
+§4.1 (NVIDIA PTX maximization). INTEGER warp/block reductions now use the
+single-instruction Ampere/Hopper warp collective `redux.sync.add.u32` instead of
+the 5-step `__shfl_xor` butterfly, and the two per-lane INTEGER-atomic histogram
+sites in the MoE path are converted to warp-aggregated atomics
+(`__ballot_sync` / `__match_any_sync` + `__popc`). FLOAT reductions (norms,
+softmax, gradient atomics) are untouched — float `redux` is Blackwell-only
+(sm_100+) and out of scope.
+
+**Helpers added** (`csrc/backends/cuda/sm_90/primitives.cuh`,
+`sg::sm90::primitives`, next to the float reducers):
+- `warp_reduce_add_u32(unsigned)` — `redux.sync.add.u32` under
+  `__CUDA_ARCH__ >= 800`, shuffle-xor tree fallback otherwise (pre-Ampere
+  codegen matrix still compiles + works). Every lane receives the full-warp sum.
+- `block_reduce_add_u32(unsigned)` — warp-reduce → `smem[warp]` → first-warp
+  reduce. Structure (32-u32 smem, `__syncthreads` placement) mirrors
+  `block_reduce_sum_f32` exactly.
+
+**Sites converted** (`grokking_optimizers/kernels/sm_90/supergrok2_sm90.cuh`):
+- `moe_count_expert_activations_kernel` (~L1862): per-element expert histogram.
+  Was `atomicAdd(&expert_counts[e], 1)` per active lane. Now lanes ballot the
+  hit predicate, `__match_any_sync` groups same-`e` lanes, the group leader
+  (lowest set lane) issues one `atomicAdd(&expert_counts[e], __popc(mask))`.
+  Trip count rounded up to a whole number of strides so every lane reaches the
+  warp ballot each iteration; the `in_range && hit` predicate excludes tail
+  lanes. Counts are BIT-IDENTICAL — `popc(mask)` = number of lanes adding 1.
+- `moe_filter_active_params_kernel` (~L1983): stream-compaction slot allocation.
+  Was `atomicAdd(&compact_count[0], 1)` per kept lane. Now the warp leader
+  reserves a contiguous block of `popc(mask)` slots with one atomic; each kept
+  lane writes to `base + intra-warp-rank`. Total count identical; ordering among
+  kept elements was already irrelevant (scatter map written by stored index).
+
+**Sites left as-is (with reason):**
+- `last_block_finished` `atomicInc` (primitives.cuh): one-thread-per-block
+  (`threadIdx.x==0` only) — no intra-warp aggregation possible.
+- All remaining `atomicAdd` in the sm_90 tree are FLOAT (gradient accumulation
+  in supergrok2 backward `db1/db2/dw1/dw2/dz1`, grad_A_log; prodigy
+  numerator/denominator; supergrok11 gate num/den; supergrok15 sharpness) —
+  out of scope (float redux is Blackwell-only).
+
+**PTX / SASS survival (verified on this host, nvcc 12.x):**
+- `nvcc -ptx -arch=sm_90a` on a tiny TU calling the helper emits
+  `redux.sync.add.u32 %r1, %r2, 0xffffffff;` (PTX line 33). Instruction is NOT
+  optimized away.
+- `nvcc -cubin -arch=sm_90a` + `cuobjdump -sass` shows it lowers to
+  `REDUX.SUM UR6, R2` in SASS.
+
+**Hardware checks (deferred — all 🟡):**
+- On-silicon SASS confirmation in the actual built kernels: after a real
+  `-arch=sm_90a` build of `launch_supergrok2`, run
+  `cuobjdump -sass <obj> | grep -i REDUX` and confirm `REDUX.SUM` appears in the
+  MoE / any u32-reduce kernel (the standalone probe above already shows the
+  helper lowers to REDUX; this confirms it in the linked TU).
+- Expert-count histogram bit-parity: run the MoE count path under the
+  warp-aggregated build and a per-lane-atomic reference build over the same
+  `gate_logits`/`threshold`; `expert_counts` must match exactly (rtol=0, every
+  element). Likewise `compact_count[0]` and the multiset of compacted rows from
+  `moe_filter_active_params` must be identical (order may differ; content/count
+  must not).
+- Throughput: `ncu --metrics l1tex__t_sectors_pipe_lsu_mem_global_op_atom.sum`
+  on the MoE count kernel should show a drop in global-atomic traffic vs the
+  pre-change per-lane build, with no change in result.
+
+| stage | cell | deferred check | command ref |
+|-------|------|----------------|-------------|
+| 3.1 | moe count | REDUX.SUM in built SASS | §Stage 3.1 cuobjdump |
+| 3.1 | moe count | expert_counts bit-parity vs per-lane atomics | §Stage 3.1 parity |
+| 3.1 | moe filter | compact_count + content parity | §Stage 3.1 parity |
+| 3.1 | moe count | global-atomic traffic drop | §Stage 3.1 ncu |

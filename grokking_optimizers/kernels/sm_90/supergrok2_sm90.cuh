@@ -104,6 +104,26 @@
 namespace sg { namespace sm90 { namespace csa_hca {
 
 namespace alg = ::sg::algorithms;
+namespace prim = ::sg::sm90::primitives;  // §4.2 cp.async background loads
+
+// §4.2 pipeline depth (in-flight cp.async groups / query staging slots),
+// consumed by the CSA/HCA attention kernels below. SG_TUNED_ASYNC_DEPTH is the
+// autotuner knob (default 2); clamp to [1,4]. Two distinct ASYNC_DEPTH values
+// produce different code (different number of primed cp.async groups).
+constexpr int kCsaAsyncDepth =
+    (SG_TUNED_ASYNC_DEPTH < 1) ? 1
+  : (SG_TUNED_ASYNC_DEPTH > 4) ? 4 : SG_TUNED_ASYNC_DEPTH;
+
+// Host helper: opt the attention kernels into >48KB dynamic shared memory when
+// the cp.async query-staging buffer (block * head_dim floats) exceeds the
+// default static cap. No-op (and harmless) for smaller requests.
+inline void set_attn_dyn_smem(const void* kernel, size_t smem_bytes) {
+    if (smem_bytes > (48u * 1024u)) {
+        cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(smem_bytes));
+    }
+}
 
 // Per-query register-array bounds (mirror algorithm-header maxima).
 constexpr int CSA_MAX_D_MODEL = ::sg::algorithms::SG2_MAX_D_MODEL;     // 64
@@ -285,6 +305,43 @@ __global__ void csa_indexer_topk_kernel(
     for (int i = 0; i < K; i++) sel_idx[t * topk + i] = best_idx[i];
 }
 
+// §4.2 cp.async query staging helper (shared by CSA + HCA attention).
+//
+//  Both attention kernels read the per-thread query vector qv[0..head_dim)
+//  REPEATEDLY (once per top-k entry and once per window token). That makes the
+//  query the reused global->shared staging load — the prime cp.async target.
+//  Each thread stages its own head_dim-float query slice into its private slot
+//  qsh[threadIdx.x*head_dim .. +head_dim) with hand-issued cp.async.ca (4B)
+//  copies, split into `kCsaAsyncDepth` groups kept in flight so the query-load
+//  latency overlaps the first key's address math. After cp_async_wait_all the
+//  staged slice is BYTE-IDENTICAL to a synchronous load of qv (no numeric
+//  change). The streaming K/V reads stay direct (read once, no reuse benefit).
+//
+//  NOTE: these kernels are 1-thread-per-(query,head) with no __syncthreads, so
+//  each thread waits only on ITS OWN cp.async groups — no block-wide barrier
+//  is needed (and none exists) to make the private slot visible to the owner.
+__device__ __forceinline__ const float* csa_stage_query_async(
+    float* qsh,              // dynamic shared: [blockDim.x * head_dim]
+    const float* __restrict__ qv_global,  // [head_dim] this thread's query
+    int head_dim
+) {
+    float* qslot = qsh + threadIdx.x * head_dim;
+    // Split head_dim into kCsaAsyncDepth roughly-equal chunks; commit each as
+    // its own group so up to kCsaAsyncDepth copies are in flight at once.
+    const int chunk = (head_dim + kCsaAsyncDepth - 1) / kCsaAsyncDepth;
+    #pragma unroll
+    for (int g = 0; g < kCsaAsyncDepth; ++g) {
+        const int e0 = g * chunk;
+        const int e1 = (e0 + chunk < head_dim) ? (e0 + chunk) : head_dim;
+        for (int e = e0; e < e1; ++e) {
+            prim::cp_async_ca_4(&qslot[e], &qv_global[e]);
+        }
+        prim::cp_async_commit();
+    }
+    prim::cp_async_wait_all();  // drain all groups: qslot now == qv (byte-exact)
+    return qslot;
+}
+
 // ── (3) CSA attention ────────────────────────────────────────────────────
 //  Per query t and head h: online-softmax attention over the selected
 //  top-k compressed entries ∪ the causal sliding window (last csa_window raw
@@ -308,6 +365,8 @@ __global__ void csa_attention_kernel(
 ) {
     const int gid = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = N * num_heads;
+    // §4.2 cp.async query staging buffer: [blockDim.x * head_dim] floats.
+    extern __shared__ float csa_qsh[];
     if (gid >= total) return;
     const int t = gid / num_heads;
     const int h = gid % num_heads;
@@ -320,7 +379,9 @@ __global__ void csa_attention_kernel(
     for (int e = 0; e < head_dim; e++) acc[e] = 0.0f;
     float run_max = -INFINITY, run_denom = 0.0f;
 
-    const float* qv = q + t * d_model + hoff;
+    // Background-load this thread's reused query slice into shared via cp.async.
+    const float* qv = csa_stage_query_async(
+        csa_qsh, q + t * d_model + hoff, head_dim);
 
     // Selected compressed entries.
     for (int i = 0; i < topk; i++) {
@@ -386,6 +447,8 @@ __global__ void hca_attention_kernel(
 ) {
     const int gid = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = N * num_heads;
+    // §4.2 cp.async query staging buffer: [blockDim.x * head_dim] floats.
+    extern __shared__ float hca_qsh[];
     if (gid >= total) return;
     const int t = gid / num_heads;
     const int h = gid % num_heads;
@@ -398,7 +461,9 @@ __global__ void hca_attention_kernel(
     for (int e = 0; e < head_dim; e++) acc[e] = 0.0f;
     float run_max = -INFINITY, run_denom = 0.0f;
 
-    const float* qv = q + t * d_model + hoff;
+    // Background-load this thread's reused query slice into shared via cp.async.
+    const float* qv = csa_stage_query_async(
+        hca_qsh, q + t * d_model + hoff, head_dim);
 
     for (int s = 0; s < Nh; s++) {
         alg::sg2_attention_score_and_accumulate(
@@ -1118,7 +1183,13 @@ static torch::Tensor csa_context(
     {
         const int total = N * num_heads;
         const int grid = std::min<int>(65535, (total + block - 1) / block);
-        csa_hca::csa_attention_kernel<<<grid, block, 0, stream>>>(
+        // §4.2 dynamic shared for cp.async query staging: block * head_dim.
+        const size_t qsh_bytes =
+            sizeof(float) * (size_t)block * (size_t)head_dim;
+        csa_hca::set_attn_dyn_smem(
+            reinterpret_cast<const void*>(
+                &csa_hca::csa_attention_kernel), qsh_bytes);
+        csa_hca::csa_attention_kernel<<<grid, block, qsh_bytes, stream>>>(
             q.data_ptr<float>(), c_k.data_ptr<float>(), c_v.data_ptr<float>(),
             win_k.data_ptr<float>(), win_v.data_ptr<float>(),
             sel.data_ptr<int>(), out_W.data_ptr<float>(),
@@ -1157,7 +1228,13 @@ static torch::Tensor hca_context(
     {
         const int total = N * num_heads;
         const int grid = std::min<int>(65535, (total + block - 1) / block);
-        csa_hca::hca_attention_kernel<<<grid, block, 0, stream>>>(
+        // §4.2 dynamic shared for cp.async query staging: block * head_dim.
+        const size_t qsh_bytes =
+            sizeof(float) * (size_t)block * (size_t)head_dim;
+        csa_hca::set_attn_dyn_smem(
+            reinterpret_cast<const void*>(
+                &csa_hca::hca_attention_kernel), qsh_bytes);
+        csa_hca::hca_attention_kernel<<<grid, block, qsh_bytes, stream>>>(
             q.data_ptr<float>(), c_k.data_ptr<float>(), c_v.data_ptr<float>(),
             win_k.data_ptr<float>(), win_v.data_ptr<float>(),
             concat.data_ptr<float>(), N, Nh, d_model, num_heads, head_dim,
@@ -1842,8 +1919,19 @@ void launch_csa_hca_backward_batched(
 
 // ── (1) Expert-activation histogram ───────────────────────────────────────
 //  gate_logits [N, num_experts] (row-major). For each (row, e) with
-//  gate_logits[row,e] > threshold, atomicAdd expert_counts[e]. One thread per
+//  gate_logits[row,e] > threshold, increment expert_counts[e]. One thread per
 //  (row, e) cell via a flattened grid-stride loop over N*num_experts.
+//
+//  §4.1 (redux.sync / warp-aggregated atomics): rather than every active lane
+//  issuing an independent global atomicAdd(&expert_counts[e], 1), lanes in a
+//  warp that target the SAME expert e coalesce their +1's. __match_any_sync
+//  partitions the (predicate-passing) lanes of the warp into groups by e; the
+//  lowest lane of each group issues a single atomicAdd(&counts[e], popc(mask)).
+//  Numerically IDENTICAL to per-lane atomics — popc(mask) is exactly the count
+//  of lanes adding 1 for that e — but issues at most one atomic per (warp, e)
+//  instead of one per active lane. __match_any_sync needs sm_70+ (always true
+//  here: this TU is sm_90a); the participating mask is the predicate ballot, so
+//  divergent/tail lanes are excluded correctly.
 __global__ void moe_count_expert_activations_kernel(
     const float* __restrict__ gate_logits,
     int* __restrict__ expert_counts,
@@ -1851,10 +1939,31 @@ __global__ void moe_count_expert_activations_kernel(
 ) {
     const long total = static_cast<long>(N) * num_experts;
     const int stride = prim::grid_stride();
-    for (long idx = prim::grid_stride_index(); idx < total; idx += stride) {
-        const int e = static_cast<int>(idx % num_experts);
-        if (gate_logits[idx] > threshold) {
-            atomicAdd(&expert_counts[e], 1);
+    const unsigned lane = threadIdx.x & 31u;
+    // Uniform (warp-convergent) trip count: round `total` up to a whole number
+    // of strides so every lane reaches the warp ballot each iteration. The
+    // per-element predicate (in_range && hit) excludes the tail lanes, so the
+    // ballot mask is full (0xffffffff) and well-defined for all 32 lanes.
+    const long start = prim::grid_stride_index();
+    const long rounded = ((total + stride - 1) / stride) * stride;
+    for (long idx = start; idx < rounded; idx += stride) {
+        const bool in_range = idx < total;
+        int e = -1;
+        bool hit = false;
+        if (in_range) {
+            e = static_cast<int>(idx % num_experts);
+            hit = gate_logits[idx] > threshold;
+        }
+        // Ballot the lanes that will add 1 (full participating mask).
+        const unsigned active = __ballot_sync(0xffffffffu, hit);
+        if (hit) {
+            // Group the contributing lanes by their target expert e.
+            const unsigned same = __match_any_sync(active, e);
+            // Lowest lane in this e-group is the leader; it adds the group size.
+            const unsigned leader = __ffs(static_cast<int>(same)) - 1u;
+            if (lane == leader) {
+                atomicAdd(&expert_counts[e], __popc(same));
+            }
         }
     }
 }
@@ -1951,10 +2060,40 @@ __global__ void moe_filter_active_params_kernel(
     int total_params
 ) {
     const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < total_params; i += stride) {
-        const int e = param_to_expert[i];
-        if (expert_active[e] != 0) {
-            const int out = atomicAdd(&compact_count[0], 1);
+    const unsigned lane = threadIdx.x & 31u;
+    // Uniform (warp-convergent) trip count so every lane reaches the ballot
+    // each iteration; the `in_range && active` predicate masks the tail lanes.
+    const int start = prim::grid_stride_index();
+    const long rounded =
+        ((static_cast<long>(total_params) + stride - 1) / stride) * stride;
+    for (long ii = start; ii < rounded; ii += stride) {
+        const int i = static_cast<int>(ii);
+        bool keep = false;
+        if (ii < total_params) {
+            const int e = param_to_expert[i];
+            keep = expert_active[e] != 0;
+        }
+        // §4.1 warp-aggregated atomic ALLOCATION: the leader reserves one
+        // contiguous block of `popc(mask)` output slots with a single global
+        // atomicAdd; each kept lane then writes to base + its in-warp rank.
+        // Ordering among kept elements is irrelevant (moe_scatter_results
+        // writes back by stored scatter index), and the total count is
+        // identical to the per-lane atomic — popc(mask) kept lanes claim
+        // exactly popc(mask) slots.
+        const unsigned mask = __ballot_sync(0xffffffffu, keep);
+        if (keep) {
+            const unsigned leader = __ffs(static_cast<int>(mask)) - 1u;
+            int base = 0;
+            if (lane == leader) {
+                base = atomicAdd(&compact_count[0], __popc(mask));
+            }
+            // Broadcast the reserved base from the leader to the whole group.
+            base = __shfl_sync(mask, base, static_cast<int>(leader));
+            // Rank of this lane within the kept group = popcount of kept lanes
+            // below it.
+            const unsigned rank =
+                __popc(mask & ((1u << lane) - 1u));
+            const int out = base + static_cast<int>(rank);
             compact_params[out]  = params[i];
             compact_grads[out]   = grads[i];
             compact_state_m[out] = state_m[i];
