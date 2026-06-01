@@ -96,12 +96,22 @@ requirements on DPP/FP8/swizzle/sched builtins.
   work-stealing (§1.2) + SM/CU pinning via `%smid`/`HW_ID` (§1.3) + hand-built
   sense-reversing global-counter barrier (§1.4) + AMD ping-pong note (§1.13) +
   audited minimal fences (§1.14).
-- `csrc/fused/{sm_90,gfx942}/megakernel_demo` — one templated L3 megakernel
-  (fwd→barrier→bwd→barrier→opt), sm_90 using the warp-spec producer/consumer
-  split; SG2 SAM/bilevel kept outside (§1.7). Gate: COMPILE_OK + AMDGCN_OK.
-- `megakernel_codegen.py` — emits per-cell source at the solver tier; 99-cell
-  manifest; `setup.py` globs `csrc/fused/`. `fused_step` dispatch wired (§1.12):
-  routes to a fused TU when present (3 demo cells), else the per-op path.
+- `csrc/fused/{sm_90,gfx942}/` — **99 distinct REAL component compositions**
+  (Phase 3 Stage 5): each `mega_<model>_<opt>` cell composes the real optimizer
+  device-function component (`opt_components.{cuh,hip.hpp}` → `csrc/algorithms/
+  <opt>.h`) with the real model-stage component (`model_stages.{cuh,hip.hpp}`)
+  over the shared substrate (fwd→barrier→bwd→barrier→opt). sm_90 uses the
+  warp-spec producer/consumer split. The toy `megakernel_demo.{cu,hip.hpp}` was
+  DELETED — there is NO templated demo and NO TEMPLATE_ONLY / demo-include in any
+  cell (anti-false-positive grep = 0). Gate: COMPILE_OK (nvcc -c) + AMDGCN_OK.
+- `megakernel_codegen.py` — emits each cell's REAL composition at the live solver
+  tier (`_emit_*` explicitly writes "NO demo include, NO TEMPLATE_ONLY"); cell
+  header comments are generator-emitted from the live solver (regenerated each
+  build so tier/reg/smem can't drift). `setup.py` globs `csrc/fused/`.
+  `fused_step` dispatch routes **all 99** cells: `dispatch_sm90_cell` (nvcc,
+  COMPILE_OK) for sm_90, the `#if WITH_HIP` `dispatch_gfx942_cell` for gfx942
+  (hipcc-gated 🟡), and `dispatch_fused_megakernel` (unified, tpu via
+  `_pallas_fused`). No "3 demo cells" path remains.
 
 ### Stage 7 — distributed (§8)
 - `distributed.py` — `ParallelConfig` + `DistributedContext` (Megatron DP×TP×PP
