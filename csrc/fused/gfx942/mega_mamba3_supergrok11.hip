@@ -22,3 +22,36 @@ fused_megakernel<ModelId::Mamba3, OptId::SuperGrok11, FuseTier::L1>(
 
 }}}  // namespace sg::fused::gfx942_mega
 #endif
+
+// ── HOST launcher (hipcc host pass only; 🟡 MI300X — not the bare amdgcn gate,
+//    not the WITH_CUDA build). Faithful mirror of the verified sm_90 launcher:
+//    one persistent workgroup per CU, 256 threads (4 wavefronts). __HIPCC__ is
+//    defined for the hipcc host pass, so FusedOptState/fused_megakernel (guarded
+//    on __HIPCC__) are visible here. ───────────────────────────────────────────
+#if defined(__HIPCC__) && !defined(__AMDGCN__)
+#include <hip/hip_runtime.h>
+namespace sg { namespace fused { namespace gfx942_mega {
+hipError_t mega_mamba3_supergrok11(
+        PersistentContext ctx, float* params, const float* input, float* acts,
+        float* grad, float* m, float* v, float* extra,
+        const int* sizes, const int* offsets, float lr, int step,
+        hipStream_t stream) {
+    int dev = 0; hipError_t err = hipGetDevice(&dev);
+    if (err != hipSuccess) return err;
+    int n_cus = 0;
+    err = hipDeviceGetAttribute(&n_cus, hipDeviceAttributeMultiprocessorCount, dev);
+    if (err != hipSuccess) return err;
+    ctx.n_ctas = (unsigned)n_cus;
+    FusedOptState st;
+    st.exp_avg = m; st.exp_avg_sq = v;
+    st.mu = extra;
+    st.lr = lr;
+    dim3 grid((unsigned)n_cus), block(256);
+    hipLaunchKernelGGL(
+        (fused_megakernel<ModelId::Mamba3, OptId::SuperGrok11, FuseTier::L1>),
+        grid, block, 0, stream,
+        ctx, params, input, acts, grad, sizes, offsets, lr, step, st);
+    return hipGetLastError();
+}
+}}}  // namespace sg::fused::gfx942_mega
+#endif
