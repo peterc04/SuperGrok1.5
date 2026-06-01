@@ -32,12 +32,50 @@ typedef unsigned int uint32_t;
 #define __forceinline__ inline __attribute__((always_inline))
 #endif
 EOF
-: > "$STUB/hip_bf16.h"; : > "$STUB/hip_fp16.h"
 printf '#pragma once\n' > "$STUB/hip_bf16.h"
 printf '#pragma once\n' > "$STUB/hip_fp16.h"
+# Minimal hip_fp16/bf16 type + cstdint/cmath shims so the pre-existing
+# common_gfx942.hip.hpp (which uses real ROCm __half/__hip_bfloat16 types) can
+# also be parsed by the free-standing gate. Under real hipcc these come from
+# ROCm; here we provide just enough surface for the device code to type-check.
+cat >> "$STUB/hip_fp16.h" <<'EOF'
+struct __half { unsigned short x; __half()=default; __device__ __half(float f){ x=(unsigned short)(__builtin_bit_cast(unsigned,f)>>16); } __device__ operator float() const { return __builtin_bit_cast(float, (unsigned)x << 16); } };
+static inline __attribute__((always_inline)) float __half2float(__half h){ return __builtin_bit_cast(float, (unsigned)h.x << 16); }
+static inline __attribute__((always_inline)) __half __float2half(float f){ __half h; h.x = (unsigned short)(__builtin_bit_cast(unsigned, f) >> 16); return h; }
+static inline __attribute__((always_inline)) __half __float2half_rn(float f){ return __float2half(f); }
+EOF
+cat >> "$STUB/hip_bf16.h" <<'EOF'
+struct __hip_bfloat16 { unsigned short x; __hip_bfloat16()=default; __device__ __hip_bfloat16(float f){ x=(unsigned short)(__builtin_bit_cast(unsigned,f)>>16); } __device__ operator float() const { return __builtin_bit_cast(float, (unsigned)x << 16); } };
+typedef __hip_bfloat16 hip_bfloat16;  // older ROCm spelling used by some headers
+static inline __attribute__((always_inline)) float __bfloat162float(__hip_bfloat16 h){ return __builtin_bit_cast(float, (unsigned)h.x << 16); }
+static inline __attribute__((always_inline)) __hip_bfloat16 __float2bfloat16(float f){ __hip_bfloat16 h; h.x = (unsigned short)(__builtin_bit_cast(unsigned, f) >> 16); return h; }
+EOF
+# common_gfx942.hip.hpp includes the longer spelling <hip/hip_bfloat16.h>.
+cp "$STUB/hip_bf16.h" "$STUB/hip_bfloat16.h"
+# cstdint/cmath are absent on the free-standing target; provide a tiny subset.
+mkdir -p "$(dirname "$STUB")/_cxx"
+cat > "$(dirname "$STUB")/_cxx/cstdint" <<'EOF'
+#pragma once
+typedef unsigned char uint8_t; typedef signed char int8_t;
+typedef unsigned short uint16_t; typedef short int16_t;
+typedef unsigned int uint32_t; typedef int int32_t;
+typedef unsigned long long uint64_t; typedef long long int64_t;
+EOF
+cat > "$(dirname "$STUB")/_cxx/cmath" <<'EOF'
+#pragma once
+static inline float sqrtf(float x){ return __builtin_sqrtf(x); }
+static inline float expf(float x){ return __builtin_expf(x); }
+static inline float fabsf(float x){ return __builtin_fabsf(x); }
+static inline float fmaxf(float a,float b){ return __builtin_fmaxf(a,b); }
+static inline float fminf(float a,float b){ return __builtin_fminf(a,b); }
+static inline float tanhf(float x){ return __builtin_tanhf(x); }
+static inline float copysignf(float a,float b){ return __builtin_copysignf(a,b); }
+static inline float truncf(float x){ return __builtin_truncf(x); }
+static inline float floorf(float x){ return __builtin_floorf(x); }
+EOF
 
 FLAGS=(--target=amdgcn-amd-amdhsa -mcpu=gfx942 -nogpulib -std=c++17
-       -Wno-unused-function -I"$(dirname "$STUB")" -I.
+       -Wno-unused-function -I"$(dirname "$STUB")" -I"$(dirname "$STUB")/_cxx" -I.
        "-D__hip_atomic_fetch_add(a,b,c,d)=__atomic_fetch_add(a,b,c)"
        "-D__hip_atomic_load(a,b,c)=__atomic_load_n(a,b)"
        -D__HIP_MEMORY_SCOPE_AGENT=0 -D__HIP_MEMORY_SCOPE_WORKGROUP=0)
