@@ -874,3 +874,258 @@ once the model TU migrates `.hip.cpp -> .hip` on hardware.
 | 5 | mamba3_gfx942_in_proj_mfma | MFMA-core instr counts non-zero; matrix unit busy fraction | §Stage 5 rocprof MFMA |
 | 5 | ssm_fwd/ssm_bwd LDS handoff | Blelloch prefixes == serial recurrence; bank-conflict-free | §Stage 5 LDS handoff |
 | 5 | rmsnorm_fwd/bwd DPP | DPP-reduced norm/grads vs ATen within ~1 ulp (tolerance) | §Stage 5 DPP correctness |
+
+## Stage 5 — attention AMD-native
+
+`grokking_optimizers/kernels/gfx942/attention_gfx942.hip.hpp` was rewritten to
+the same TWO-pass / ONE-header structure proven on `mamba3_gfx942.hip.hpp`:
+
+- **HOST pass** (`#if !defined(__AMDGCN__)`): the unchanged ATen + wave-64 LDS
+  attention path, exposing the public
+  `sg::gfx942::models::attention::{attention_forward,attention_backward}<ActT,
+  kHeadDim,kCausal>` entry points the bindings call. The thin
+  `csrc/backends/hip/gfx942/models/attention.hip.{h,cpp}` shim resolves unchanged.
+- **DEVICE pass** (`#if defined(__AMDGCN__) || defined(__HIPCC__)`): a REAL
+  hand-written AMDGCN forward + backward built on
+  `csrc/backends/hip/gfx942/amdgcn_primitives.hip.hpp` (namespace `amd`). Carries
+  the gate-only workitem/launch shim (`threadIdx/blockIdx/__global__/__shared__`
+  via ISA builtins) under `#if defined(__AMDGCN__) && !defined(__HIPCC__)`, off
+  under real hipcc — copied verbatim from the mamba3 exemplar.
+
+**§5 device kernels (matrix-core attention):**
+- `mfma_tile_16x16` / `mfma_matmul_bf16` — `S = Q·Kᵀ` and `O = P·V` as REAL
+  16×16×16 bf16 MFMA (`amd::mfma_bf16_16x16x16`), one wavefront per 16×16 output
+  tile, K-contraction in 16-wide bf16 steps, `amd::streaming_load` read-once VMEM,
+  MFMA/VMEM interleave via `amd::sched_group_barrier<0x008,1>` / `<0x100,2>`.
+- `attention_gfx942_fwd_mfma<32,kCausal>` — QKᵀ MFMA, scale + causal mask, row
+  softmax (DPP), then PV MFMA (P and Vᵀ packed to bf16 in LDS).
+- `attention_gfx942_bwd_mfma<32,kCausal>` — recompute A from saved `softmax_lse`,
+  then `dV = Aᵀ·dO`, `dA = dO·Vᵀ`, the softmax jacobian, `dQ = dS·K`,
+  `dK = dSᵀ·Q` — all five contractions through the MFMA tile path.
+- Force-instantiated for the grokking configs `<32,true>` (decoder, causal,
+  seq_len=4) and `<32,false>` (ViT, non-causal, seq_len=17).
+
+**Softmax-max DPP approach:** the primitives header only ships
+`wave_reduce_add_dpp` (SUM). The softmax row-MAX is implemented as
+`wave_reduce_max_dpp` — the IDENTICAL row-shift + row-broadcast butterfly shape
+with `fmaxf` substituted for `+`, using the same compile-time literal DPP
+controls via `amd::dpp_mov<CTRL>` (`0x111/0x112/0x114/0x118` row_shr,
+`0x142/0x143` row_bcast), broadcasting the top-lane result with `readlane`. The
+row-sum then uses `amd::wave_reduce_add_dpp`.
+
+**§2.10 LDS tile sizing (64 KB CDNA3 budget):** the sm_90 FMHA reference stages
+whole K/V head tiles in 228 KB SMEM, which overflows the 64 KB CDNA3 LDS. The
+tiling here is sized to the grokking shapes (D=32, N∈{4,17}, one wavefront per
+(batch,head)): forward `scores[N×N] f32` (≤ 32·32·4 = 4096 B) + bf16 pack scratch
+`Pbf[N×N] + Vtb[D×N]` (≤ (1024+1024)·2 = 4096 B) ⇒ ≤ ~8 KB; backward
+`scores[N×N] + dA[N×N] f32` + bf16 pack ⇒ ≤ ~12 KB — all ≪ 64 KB, no K/V
+re-tiling needed. A flash-style streaming tile (score buffer capped at N×Bc with
+Bc=64 ⇒ 8 KB) is documented for the larger-N regime the grokking shapes don't reach.
+
+**Gate-caught fixes (the device-compile gate did its job):**
+1. `fmaxf` is undeclared under the free-standing gate (no `<cmath>`) → added a
+   `dfmaxf` shim over `__builtin_fmaxf` and used it throughout the device section.
+2. `__host__` is undefined under the bare gate → dropped it from the
+   `attention_lds_bytes_fwd` launch-sizing helper (`__device__ __forceinline__`).
+The two residual `'shared' attribute ignored` warnings are benign and identical
+to the mamba3 exemplar (the gate's `__shared__` shim).
+
+**Verification (this env):**
+- `bash scripts/amdgcn_check.sh --header grokking_optimizers/kernels/gfx942/attention_gfx942.hip.hpp`
+  → `AMDGCN_OK`
+- `python grokking_optimizers/compile.py --self-test` → `137 passed, 1 failed`
+  (the 1 failure is the pre-existing `flag_base_superset_regression` sm_90
+  flag-baseline test, untouched by this change)
+- `ruff check grokking_optimizers/` → `All checks passed!`
+- sm_90 CUDA build UNAFFECTED — only the one gfx942 attention header changed.
+
+**Hardware checks (deferred — 🟡, no MI300X / no hipcc in this env):**
+- **MFMA utilization:** `rocprof --stats` on `attention_gfx942_fwd_mfma` /
+  `_bwd_mfma` — expect non-zero `SQ_INSTS_VALU_MFMA*` for the QKᵀ / PV / dV / dA /
+  dQ / dK tiles and the matrix unit kept fed (16×16×16 MFMA not VALU-bound);
+  compare vs the rocBLAS / scalar-LDS path.
+- **DPP softmax correctness:** drive identical (Q,K,V) through the §5 kernels and
+  the ATen LDS path; confirm `wave_reduce_max_dpp` row-max + `wave_reduce_add_dpp`
+  row-sum reproduce the stable softmax to ~1 ulp (reduction reorder, NOT
+  bit-exact) for both causal (N=4) and non-causal (N=17).
+- **Numerics:** fwd `out` and bwd `grad_{q,k,v}` vs the ATen reference within a
+  few ulps end-to-end; bf16 pack/unpack round-trip error within bf16 tolerance.
+
+| stage | cell | deferred check | command ref |
+|-------|------|----------------|-------------|
+| 5 | attention_gfx942_fwd_mfma | QKᵀ/PV MFMA-core instr counts non-zero; matrix unit fed | §Stage 5 attention MFMA |
+| 5 | attention softmax DPP | DPP max+sum softmax vs ATen within ~1 ulp (causal + non-causal) | §Stage 5 attention DPP |
+| 5 | attention_gfx942_bwd_mfma | dV/dA/dS/dQ/dK MFMA tiles + jacobian grads vs ATen | §Stage 5 attention numerics |
+
+---
+
+## Stage 5 — transformer_decoder AMD-native
+
+`grokking_optimizers/kernels/gfx942/transformer_decoder_gfx942.hip.hpp` rewritten
+from the ~102-line thin ATen wrapper into the proven two-pass, one-header form
+(exact mamba3 scaffolding): HOST pass (`!__AMDGCN__`) keeps the unchanged ATen +
+rocBLAS orchestration and the public `sg::gfx942::models::decoder::{forward,
+backward}` entry points (decoder.hip.h shim + decoder.hip.cpp + bindings resolve
+unchanged); DEVICE pass (`__AMDGCN__ || __HIPCC__`) is REAL hand-written AMDGCN
+on `csrc/backends/hip/gfx942/amdgcn_primitives.hip.hpp`, with the gate-only
+workitem/launch shim under `__AMDGCN__ && !__HIPCC__`.
+
+**Device kernels (§5):**
+- `decoder_gfx942_mfma_gemm` — the one 16×16×16 bf16 MFMA driver
+  (`mfma_matmul_bf16` → `mfma_tile_16x16`) used for ALL heavy matmuls: QKV
+  projection, attention output projection, and the FFN up (D→4D) / down (4D→D)
+  matmuls. C[M,N]=A[M,K]·Wᵀ[N,K] (the [out,in] projection-weight layout), 64
+  lanes feed the ISA fragment (4 bf16/lane/16-K step = short[4]), f32[4] acc,
+  MFMA/VMEM `sched_group_barrier` interleave (§2.11), read-once `streaming_load`.
+- `decoder_gfx942_attention` — fused per-(batch,head) S=QKᵀ·scale → softmax →
+  O=PV with the S×S score tile staged in LDS (dynamic `extern __shared__`).
+- `decoder_gfx942_layernorm_fwd` — LayerNorm mean & var.
+- `decoder_gfx942_gelu` — tanh-approx GELU elementwise.
+- `decoder_gfx942_residual_add` — f32-accum residual + bf16 store.
+
+**GELU approach:** tanh approximation `0.5·x·(1 + tanh(k0·(x + k1·x³)))` with
+`k0 = 0.7978845608028654` (√(2/π)), `k1 = 0.044715` — the SAME constants as the
+sm_90 decoder's `gelu_tanh`, so HIP numerics track the reference. The bare gate
+has no libm `tanhf`, so the tanh is clang's `__builtin_tanhf` (also valid under
+hipcc; verified it compiles under the gate before committing to it).
+
+**LayerNorm approach:** the two-pass clean form needs BOTH Σx and Σx², so it does
+TWO `amd::wave_reduce_add_dpp` reductions per row (one over the running sum, one
+over the running sum-of-squares) — the §2.6 row-shift + row-broadcast DPP
+butterfly replacing a `__shfl` tree. `var = Σx²/n − (Σx/n)²`, then
+`(x−mean)·rsqrt(var+eps)·γ + β` with `__builtin_amdgcn_rsqf`.
+
+**LDS tile sizing (§2.10, 64 KB CDNA3 cap):** only the attention softmax uses
+LDS — one S×S FP32 score tile, passed as a dynamic `extern __shared__` allocation
+of `S*S*sizeof(float)`. At the grokking S_max=128 this is 128·128·4 = 65536 B =
+exactly the 64 KB budget (`static_assert` guards it); for the common grokking S
+(4, 17) it is far smaller. The MFMA-GEMM, LayerNorm, and GELU kernels keep their
+accumulators in VGPRs (the 16×16 MFMA acc spread / DPP) and use NO LDS, so they
+never contend for the budget.
+
+**Gate-caught / structural fixes during bring-up:**
+- The baseline (host-only) header FAILED the gate (`cuda.h` →
+  `bits/libc-header-start.h not found`) under the free-standing amdgcn target —
+  confirming the `#if !defined(__AMDGCN__)` host-include guard is mandatory; the
+  two-pass split fixes it (`AMDGCN_OK`).
+- bf16 MFMA operands are `short[4]` (bf16x4), NOT u32x4 — used `amd::
+  mfma_bf16_16x16x16(float acc[4], const short[4], const short[4])` directly.
+- `sched_group_barrier` mask/size, `dpp` ctrl args are compile-time constants —
+  satisfied via the templated `amd::sched_group_barrier<MASK,SIZE>()` /
+  `wave_reduce_add_dpp`.
+- Pre-verified `__builtin_tanhf` / `__builtin_expf` / `__builtin_amdgcn_rsqf` /
+  `__builtin_fmaxf` compile under the gate before wiring them into GELU/softmax.
+
+**Verification (this env):**
+- `bash scripts/amdgcn_check.sh --header grokking_optimizers/kernels/gfx942/transformer_decoder_gfx942.hip.hpp`
+  → `AMDGCN_OK`
+- `PYTHONPATH=. python grokking_optimizers/compile.py --self-test` →
+  `137 passed, 1 failed` (the 1 failure is the pre-existing sm_90 flag-baseline
+  regression test, untouched by this change)
+- `ruff check grokking_optimizers/` → `All checks passed!`
+- sm_90 CUDA build UNAFFECTED — only the one gfx942 decoder header changed.
+
+**Hardware checks (deferred — 🟡, no MI300X / no hipcc in this env):**
+- **MFMA utilization:** `rocprof --stats` on `decoder_gfx942_mfma_gemm` — expect
+  non-zero `SQ_INSTS_VALU_MFMA*` across the QKV / out-proj / FFN-up / FFN-down
+  tiles and the matrix unit kept fed (16×16×16 MFMA, not VALU-bound); compare vs
+  the rocBLAS path.
+- **DPP LayerNorm correctness:** the two-DPP mean/var vs the ATen LayerNorm to
+  ~1 ulp (reduction reorder, not bit-exact) across the grokking D.
+- **GELU + softmax numerics:** the tanh-approx GELU and the attention softmax vs
+  the ATen reference within a few ulps end-to-end; bf16 round-trip within bf16
+  tolerance.
+- **Launch wiring:** the §5.LAUNCH `hipLaunchKernelGGL` sequence (one pre-LN
+  layer) becomes live once the model TU migrates `.hip.cpp → .hip` on hardware.
+
+| stage | cell | deferred check | command ref |
+|-------|------|----------------|-------------|
+| 5 | decoder_gfx942_mfma_gemm | QKV/out/FFN MFMA-core instr counts non-zero; matrix unit fed | §Stage 5 decoder MFMA |
+| 5 | decoder layernorm DPP | two-DPP mean/var vs ATen LayerNorm within ~1 ulp | §Stage 5 decoder DPP |
+| 5 | decoder GELU + attention | tanh-GELU + softmax vs ATen within a few ulps | §Stage 5 decoder numerics |
+
+---
+
+## Stage 5 — vit AMD-native
+
+**File:** `grokking_optimizers/kernels/gfx942/vit_gfx942.hip.hpp` (rewritten
+~113-line thin-ATen header → two-pass HOST/DEVICE, ~560 lines). Same canonical
+two-pass scaffolding proven on `mamba3_gfx942` / `transformer_decoder_gfx942`:
+- **HOST pass** (`#if !defined(__AMDGCN__)`): unchanged ATen + rocBLAS path. The
+  public `sg::gfx942::models::vit::{forward,backward,patch_project}` entry points
+  are byte-for-byte intact, so `models/vit.hip.{h,cpp}` and the `bindings.cpp`
+  `vit_forward`/`vit_backward` dispatch resolve unchanged.
+- **DEVICE pass** (`#if defined(__AMDGCN__) || defined(__HIPCC__) ||
+  GROK_HIP_DEVICE`): real hand-written AMDGCN ViT forward on
+  `amdgcn_primitives.hip.hpp` (`namespace amd = sg::gfx942::amdgcn`), with the
+  gate-only workitem/launch shim copied exactly under
+  `#if defined(__AMDGCN__) && !defined(__HIPCC__)`.
+
+**What the §5 device kernels implement (all matmuls via 16×16×16 bf16 MFMA):**
+- `vit_gfx942_matmul_bias` — the single MFMA GEMM (`C[M,N]=A[M,K]·Wᵀ[N,K]+bias`)
+  that the patch-embedding projection, QKV, attention out-proj, MLP up/down, and
+  the classification head all route through. 16-wide bf16 K-steps, f32[4] acc,
+  `amd::sched_group_barrier<0x008,1>` (MFMA) interleaved with `<0x100,2>` (VMEM).
+- `vit_gfx942_attention` — per-(batch,head) scaled dot-product attention. S=QKᵀ
+  per-lane partial dot reduced with `amd::wave_reduce_add_dpp`; numerically
+  stable **online softmax** (running max/sum with exp-rescale); O=PV accumulated
+  per lane. K/V staged once in LDS.
+- `vit_gfx942_layernorm_fwd` — pre-norm LayerNorm (mean AND var), both via
+  `amd::wave_reduce_add_dpp` (two reductions), `__builtin_amdgcn_rsqf` for invstd.
+- `vit_gfx942_gelu` — element-wise tanh-approx GELU.
+
+**Softmax row-MAX approach:** built a DPP **max butterfly** with the SAME shape
+as `amd::wave_reduce_add_dpp` but `__builtin_fmaxf` instead of `+`
+(`wave_reduce_max_dpp`): `dpp_mov<0x111/0x112/0x114/0x118>` (row_shr 1/2/4/8)
+then `dpp_mov<0x142/0x143>` (row_bcast 15/31), folded with fmaxf, then
+`readlane(63)` broadcasts the wavefront max. The attention kernel uses the
+online-softmax variant (per-key running max via `fmaxf` + exp-rescale of the
+running sum and the O accumulator), which is the same max algebra applied
+incrementally; the standalone `wave_reduce_max_dpp` is provided for the
+batched/two-pass path.
+
+**GELU approach:** tanh approximation matching PyTorch `nn.GELU` default and the
+sm_90 ViT: `0.5·x·(1+tanh(√(2/π)·(x+0.044715·x³)))` via `__builtin_tanhf`
+(gate-verified), with `√(2/π)` folded as a literal.
+
+**LDS tile sizing (§2.10, CDNA3 64 KB):** only the attention kernel uses LDS —
+it stages this head's K and V strips plus is bounded by `kAttnMaxS=240`,
+`kAttnMaxHeadDim=64`: `2·240·64·2 B + 240·4 B = 62 400 B < 65 536 B`, enforced by
+a `static_assert`. The matmul / LayerNorm / GELU kernels are LDS-free (DPP
+reductions + register accumulators, 0 LDS bytes). Longer sequences stream K/V in
+≤240-row strips.
+
+**Gate-caught fixes during bring-up:**
+- My first LDS budget (`kAttnMaxS=256`) FAILED the `static_assert`
+  (`66560 <= 65536`) — the gate evaluated the constexpr and rejected it; dropped
+  to `kAttnMaxS=240` (62 400 B) to fit the 64 KB CDNA3 LDS.
+- `size_t` is unavailable under the free-standing amdgcn gate (no `<cstddef>`) —
+  the GELU element index now uses `unsigned long` instead.
+- Pre-verified `__builtin_tanhf` / `__builtin_expf` / `__builtin_amdgcn_rsqf` /
+  `__builtin_fmaxf` and the bf16x4 `short[4]` MFMA operand type via the gate
+  before wiring them in.
+
+**Verification (this env):**
+- `bash scripts/amdgcn_check.sh --header grokking_optimizers/kernels/gfx942/vit_gfx942.hip.hpp`
+  → `AMDGCN_OK`
+- `PYTHONPATH=. python grokking_optimizers/compile.py --self-test` →
+  `137 passed, 1 failed` (the 1 failure is the pre-existing sm_90 flag-baseline
+  regression test, untouched by this change)
+- `ruff check grokking_optimizers/` → `All checks passed!`
+- sm_90 CUDA build UNAFFECTED — only the one gfx942 vit header changed.
+
+**Hardware checks (deferred — 🟡, no MI300X / no hipcc in this env):**
+- **MFMA utilization:** `rocprof --stats` on `vit_gfx942_matmul_bias` — expect
+  non-zero `SQ_INSTS_VALU_MFMA*` across patch-embed / QKV / out-proj / FFN /
+  head tiles and the matrix unit kept fed (16×16×16 MFMA, not VALU-bound).
+- **Attention softmax numerics:** the DPP-max + online-softmax vs the ATen
+  reference within a few ulps end-to-end; bf16 round-trip within bf16 tolerance.
+- **DPP LayerNorm correctness:** the two-DPP mean/var vs ATen LayerNorm to ~1 ulp.
+- **Launch wiring:** the §5.LAUNCH `hipLaunchKernelGGL` sequence (one pre-LN
+  encoder layer) becomes live once the model TU migrates `.hip.cpp → .hip`.
+
+| stage | cell | deferred check | command ref |
+|-------|------|----------------|-------------|
+| 5 | vit_gfx942_matmul_bias | patch/QKV/out/FFN/head MFMA-core instr counts non-zero; matrix unit fed | §Stage 5 vit MFMA |
+| 5 | vit_gfx942_attention | DPP-max + online-softmax vs ATen within a few ulps | §Stage 5 vit softmax |
+| 5 | vit layernorm DPP | two-DPP mean/var vs ATen LayerNorm within ~1 ulp | §Stage 5 vit DPP |
