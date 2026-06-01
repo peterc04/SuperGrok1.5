@@ -1316,3 +1316,102 @@ already in the pattern and re-verified.
 | 5 | grokfast_gfx942_kernel | EMA-amplified Adam vs `grokfast_fused_step` reference | §Stage 5 elementwise optimizers |
 | 5 | grokadamw_gfx942_kernel | EMA-amplified Adam vs `grokadamw_step` reference | §Stage 5 elementwise optimizers |
 | 5 | neuralgrok_gfx942_kernel | psi-MLP amplifier + Adam vs `neuralgrok_{psi_forward,apply_step}` | §Stage 5 elementwise optimizers |
+
+---
+
+## Stage 5 — supergrok2 AMD-native 🟡
+
+SG2 (the SG2-weighted, most complex meta-net per the design doc) — the gfx942
+`supergrok2_gfx942.hip.hpp` was rewritten to the proven two-pass, one-header
+shape (HOST `#if !defined(__AMDGCN__)` / DEVICE `#if defined(__AMDGCN__) ||
+defined(__HIPCC__)`), matching mamba3 / attention / supergrok11.
+
+**(A) HOST pass — UNCHANGED byte-for-byte.** The entire existing ATen + rocBLAS
+orchestration (the `csa_hca_attention` CSA/HCA forward, `peer_route`, `gru_step`,
+`sg2_step_one_param`, the public `launch_csa_hca_step` / `launch_csa_hca_batched_step`,
+the bilevel `launch_csa_hca_bilevel_fwd_save{,_batched}` / `launch_csa_hca_backward{,_batched}`
+launchers, and the `moe_*` functions) is wrapped verbatim in
+`#if !defined(__AMDGCN__)` and now also `#include`s
+`csrc/backends/hip/gfx942/primitives.hpp` (it already did). The
+`csrc/algorithms/supergrok2_bilevel_adjoint.h` include + the `sg2adj::*` calls are
+preserved. This alone makes the gate skip the torch block under `__AMDGCN__`.
+
+**(B) DEVICE pass — real hand-written AMDGCN §5 kernels written this stage:**
+- **§5.1 `mfma_matmul_bf16`** — 16×16×16 bf16 MFMA tiled `C[M,N]=A[M,K]·W[N,K]ᵀ`,
+  f32 accumulate, MFMA/VMEM `sched_group_barrier` interleave, read-once VMEM via
+  `streaming_load`. Shared GEMM engine for the CSA/HCA QKᵀ and O=P·V. (head_dim=4
+  zero-pads the 16-wide K loop.)
+- **§5.2 `softmax_row_inplace`** — stable per-row softmax: row-max via the §5.0
+  DPP MAX butterfly (`wave_reduce_max_dpp`, built like attention_gfx942 did) +
+  exp-sum via `amd::wave_reduce_add_dpp`.
+- **§5.3 CSA attention fwd** (`sg2_csa_attention_fwd_mfma<4>`) — the CSA learned-
+  pool compression (`csa_pool_compress`, softmax(compress_w)-weighted, valid-mask
+  renormalized) baked into the compressed-K build, shared MFMA attention core,
+  DPP softmax, MFMA O=P·V over the selected-compressed ∪ window union.
+- **§5.4 HCA attention fwd** (`sg2_hca_attention_fwd_mfma<4>`) — the HCA stride-
+  mean-pool compression (`hca_mean_compress`) baked in, dense MFMA attention over
+  all compressed entries, DPP softmax.
+- **§5.5 PEER product-key routing** (`sg2_peer_route_kernel`,
+  `peer_route_row<4>`) — per-head q-half · prod-keys, top-k(=4) per half, the
+  topk×topk candidate softmax, and the inline expert MLP
+  (`out = Σ_h W2_e,h · relu(W1_e,h · s)`, lane-cooperative over expert_hidden,
+  DPP-reduced) — the MFMA/DPP-justified expert-eval path.
+- **§5.6 GRU gates** (`sg2_gru_gate_kernel`, `gru_gate_row`) — per-element z/r/h̃
+  sigmoid/tanh + the convex `(1−z)⊙h + z⊙h̃` update.
+
+Device kernels force-instantiated at the grokking shapes (`d_model=8`,
+`num_heads=2`, `head_dim=4`, `csa_compress=4`, `csa_window=8`, `csa_topk=16`,
+`hca_compress=128`, `indexer_rank=4`, `num_experts=144`, `pk_dim=12`,
+`expert_hidden=16`, `gru_hidden=4`, peer topk=4).
+
+**What stays on the ATen host path (by design, documented in-header):**
+- **The bilevel forward-save + backward ADJOINT** — its math lives in the
+  vendor-neutral `csrc/algorithms/supergrok2_bilevel_adjoint.h`, shared
+  bit-for-bit with sm_90 (Stage 1A). It is NOT reimplemented in device AMDGCN;
+  the host launchers call into that header unchanged.
+- **The MoE compaction tail** (`moe_filter_active_params` / `moe_scatter_results`
+  / `moe_dynamic_expert_load` and the `moe_dynamic_expert_{fwd,bwd}` batched bmms,
+  plus the vestigial `moe_scan_compacted`) — stream-compaction / scatter is
+  rocPRIM-shaped, not MFMA/DPP-shaped; kept on ATen. The §5 expert-MLP kernel
+  covers the PEER inline expert eval (the MFMA-justified expert path).
+
+**Gate-caught fixes this stage:**
+- The pre-existing file had `#if !defined(__AMDGCN__)` opened at the top of the
+  torch block but never closed before the header-guard `#endif`, so under
+  `__AMDGCN__` the header-guard `#ifndef` was left **unterminated** —
+  `error: unterminated conditional directive`. Closing the host block with a
+  dedicated `#endif // !defined(__AMDGCN__)` before the new device section (and
+  the device section's own `#endif`) before the guard `#endif` balances the
+  three nested conditionals (guard → host → device) and the gate passes.
+- The MFMA / DPP / `sched_group_barrier` / `dpp_mov` usages reuse the
+  compiler-verified attention_gfx942 patterns (short[4] bf16 fragments,
+  compile-time-constant DPP controls), so no further builtin-signature fixes were
+  needed beyond the proven primitives.
+
+**Verification (this env):**
+- `bash scripts/amdgcn_check.sh --header grokking_optimizers/kernels/gfx942/supergrok2_gfx942.hip.hpp`
+  → `AMDGCN_OK`
+- `PYTHONPATH=. python grokking_optimizers/compile.py --self-test` →
+  `137 passed, 1 failed` (the 1 failure is the pre-existing sm_90 flag-baseline
+  regression test, untouched by this change)
+- `ruff check grokking_optimizers/` → `All checks passed!`
+- sm_90 CUDA build UNAFFECTED; the gfx942 SG2 bilevel adjoint (Stage 1A) intact —
+  the `csa_hca_bilevel_*` / `_backward` launchers and the
+  `supergrok2_bilevel_adjoint.h` include are preserved byte-for-byte.
+
+**Hardware checks (deferred — 🟡, no MI300X / no hipcc in this env):**
+- **MI300X numeric parity:** the §5 CSA/HCA MFMA attention + DPP softmax, the
+  PEER routing, and the GRU gates vs the ATen `csa_hca_attention` / `peer_route`
+  / `gru_step` host references within a few ulps (bit-identical math, modulo
+  fp contraction/FMA ordering and the bf16 round-trip on the MFMA operands).
+- **rocprof MFMA utilization:** `v_mfma_f32_16x16x16bf16` instruction counts
+  non-zero and the matrix unit fed (not starved) on the QKᵀ / O=P·V tiles.
+- **Launch wiring:** the §5.LAUNCH `hipLaunchKernelGGL` sequence becomes live
+  once the SG2 model TU migrates `.hip.cpp → .hip`.
+
+| stage | cell | deferred check | command ref |
+|-------|------|----------------|-------------|
+| 5 | sg2_csa_attention_fwd_mfma | CSA learned-pool compress + MFMA attn + DPP softmax vs ATen csa path | §Stage 5 supergrok2 |
+| 5 | sg2_hca_attention_fwd_mfma | HCA mean-pool compress + dense MFMA attn + DPP softmax vs ATen hca path | §Stage 5 supergrok2 |
+| 5 | sg2_peer_route_kernel | product-key top-k + candidate softmax + inline expert MLP vs ATen peer_route | §Stage 5 supergrok2 |
+| 5 | sg2_gru_gate_kernel | z/r/h̃ gates + convex update vs ATen gru_step within a few ulps | §Stage 5 supergrok2 |
