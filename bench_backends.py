@@ -260,7 +260,7 @@ def profile_hip(script: str, report, opt_name: str) -> None:
             or shutil.which("rocprof"))
     smoke_script = write_temp_script(script)
     if tool is None:
-        report.write(f"  [skip] no rocprof tool in PATH; running smoke only\n")
+        report.write("  [skip] no rocprof tool in PATH; running smoke only\n")
         try:
             run_capture([sys.executable, smoke_script], report)
         finally:
