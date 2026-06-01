@@ -148,6 +148,26 @@ struct PersistentContext {
 #include "csrc/fused/sm_90/fused_dispatch_table.inc"
 #endif
 
+// gfx942 twin (🟡 hipcc/MI300X only). Faithful mirror of the sm_90 block: the
+// 33 gfx942 cells are real component compositions
+// (csrc/fused/gfx942/mega_<m>_<o>.hip → fused_megakernel.hip.hpp →
+// opt_components.hip.hpp/model_stages.hip.hpp), AMDGCN-gate-verified; their host
+// hipLaunchKernelGGL launchers + this routing compile only under hipcc. The
+// WITH_CUDA build #if-excludes this entire block.
+#if defined(WITH_HIP)
+#include <hip/hip_runtime.h>
+namespace fused { namespace gfx942_mega {
+struct PersistentContext {   // mirror of megakernel_common_hip.hip.hpp
+ int* g_next_task;
+ unsigned* g_arrived;
+ unsigned* g_generation;
+ int n_tasks;
+ unsigned n_ctas;
+};
+}} // namespace fused::gfx942_mega
+#include "csrc/fused/gfx942/fused_dispatch_table.inc"
+#endif
+
 namespace {
 
 // Canonical name of the wired fused cell, or empty if none. This is the single
@@ -326,13 +346,48 @@ void fused_step(const std::string& model, const std::string& optimizer,
  }
 #endif
 
+#if defined(WITH_HIP)
+ if (arch == 942) {
+ // gfx942 real composition route (hipcc/MI300X). Mirror of the sm_90 path.
+ auto opts_i = torch::TensorOptions().device(params.device()).dtype(torch::kInt32);
+ torch::Tensor g_next = torch::zeros({1}, opts_i);
+ torch::Tensor g_arrived = torch::zeros({1}, opts_i);
+ torch::Tensor g_generation = torch::zeros({1}, opts_i);
+ const int n = static_cast<int>(params.numel());
+ torch::Tensor sizes = torch::full({1}, n, opts_i);
+ torch::Tensor offsets = torch::zeros({1}, opts_i);
+ torch::Tensor acts = torch::zeros_like(params);
+ auto p = params.data_ptr<float>();
+ auto in = input.numel() ? input.data_ptr<float>() : p;
+ auto gr = grad.numel() ? grad.data_ptr<float>() : acts.data_ptr<float>();
+ torch::Tensor mv = state;
+ if (mv.numel() < 3 * n) mv = torch::zeros({3 * n}, params.options());
+ float* m = mv.data_ptr<float>();
+ float* v = m + n; float* extra = m + 2 * n;
+ fused::gfx942_mega::PersistentContext ctx{
+ g_next.data_ptr<int>(),
+ reinterpret_cast<unsigned*>(g_arrived.data_ptr<int>()),
+ reinterpret_cast<unsigned*>(g_generation.data_ptr<int>()),
+ n, 0u};
+ bool found = false;
+ hipError_t herr = fused::gfx942_mega::dispatch_gfx942_cell(
+ model, optimizer, ctx, p, in, acts.data_ptr<float>(), gr, m, v, extra,
+ sizes.data_ptr<int>(), offsets.data_ptr<int>(), lr, 1, 0, &found);
+ if (found) {
+ if (herr != hipSuccess)
+ throw std::runtime_error(
+ std::string("gfx942 fused megakernel launch failed for ") + cell +
+ ": " + hipGetErrorString(herr));
+ return;
+ }
+ }
+#endif
+
  // The cell is "wired" in the manifest but its TU is not compiled into THIS
- // build (e.g. the gfx942 megakernel is a header pending a hipcc .hip TU, or
- // a CPU/host build). Surface it honestly rather than silently no-op.
+ // build (CPU/host build has no fused TU). Surface it honestly.
  throw std::runtime_error(
  "fused TU for " + cell + " is manifest-registered but not compiled into "
- "this build (gfx942 megakernel is hardware-gated 🟡; CPU build has no "
- "fused TU). Use the per-op path.");
+ "this build (CPU build has no fused TU). Use the per-op path.");
 }
 
 } // namespace sg
