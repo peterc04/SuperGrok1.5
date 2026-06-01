@@ -2209,20 +2209,20 @@ class MoEAwareSuperGrok2(SuperGrok2):
                   threshold=0.0, closure=None, **kwargs):
         """MoE-aware step: compact -> attention meta-net -> scatter.
 
-        NOTE: the device-side MoE-model compaction kernels (``moe_filter_active_params``,
-        ``moe_scatter_results``, ``moe_count_expert_activations``, ...) are
-        not yet implemented — they are registered as throwing placeholders.
-        This path therefore raises a clear error rather than failing deep
-        inside a kernel call. Use the standard dense ``SuperGrok2.step()``
-        (call ``step()`` without ``active_expert_indices``), which transparently
-        falls back to the dense path. The meta-model's own PEER product-key
-        expert routing is unaffected and always active on the dense path.
+        The device-side MoE-model compaction kernels — ``moe_count_expert_
+        activations``, ``moe_compute_load_balance_loss``, ``moe_apply_frequency_
+        scaling``, ``moe_filter_active_params``, ``moe_scatter_results`` — are
+        implemented for both sm_90 (real CUDA) and gfx942 (ATen) and were
+        numerically reviewed (Stage 1B). This path is reached only when the C++
+        extension is built and exposes them (guarded at the call site by
+        ``_HAS_CUDA and hasattr(_ops, 'moe_filter_active_params')``); otherwise
+        the caller transparently uses the dense ``SuperGrok2.step()``.
+
+        NOTE (🟡): the kernels are compile-verified but their on-device numerics
+        are hardware-deferred (see HARDWARE_VALIDATION.md Stage 1B). The dense
+        path remains the default; pass ``active_expert_indices`` to opt in to the
+        compacted expert path on real hardware.
         """
-        raise NotImplementedError(
-            "MoEAwareSuperGrok2 device-side expert compaction is not implemented "
-            "(the moe_* kernels are throwing placeholders). Run the dense path by "
-            "calling step() without active_expert_indices; the meta-model's PEER "
-            "expert routing still runs there.")
         loss = None
         if closure is not None:
             with torch.enable_grad():
