@@ -17736,6 +17736,56 @@ def _self_test_e2e_smoke(run) -> None:
     run("e2e_smoke_gated", test_e2e_smoke_gated)
 
 
+def _self_test_math_drift_guard(run) -> None:
+    """`[self-test] math_drift_guard` — WS2 ENFORCED optimizer-math single-source.
+
+    Runs scripts/check_math_single_source.py's logic (structural single-source +
+    content-hash manifest drift detection) and PROVES the guard triggers on
+    divergent math (so it is a real enforced check, not a comment).
+    """
+    import importlib.util
+
+    sys.stdout.write("[self-test] math_drift_guard\n")
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _path = os.path.join(_root, "scripts", "check_math_single_source.py")
+
+    def _load():
+        spec = importlib.util.spec_from_file_location("sg_math_guard", _path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def guard_passes_on_real_tree():
+        mod = _load()
+        fails = mod.check()
+        assert not fails, "drift guard reports failures on the real tree: " + \
+            "; ".join(fails)
+
+    def guard_triggers_on_divergence():
+        # Perturb the canonical-math hash for one optimizer in-memory and confirm
+        # the guard FLAGS it (proves the enforcement is live, no files touched).
+        mod = _load()
+        real = mod.normalized_math_hash
+        mod.normalized_math_hash = (
+            lambda opt: "deadbeef" if opt == "adamw" else real(opt))
+        try:
+            fails = mod.check()
+        finally:
+            mod.normalized_math_hash = real
+        assert any("DRIFT" in f and "adamw" in f for f in fails), (
+            "drift guard did NOT trigger on perturbed canonical math — "
+            "the check is not enforcing")
+
+    def structural_single_source_holds():
+        mod = _load()
+        fails = mod.check(structural_only=True)
+        assert not fails, "structural single-source broken: " + "; ".join(fails)
+
+    run("math_drift_guard_passes_clean", guard_passes_on_real_tree)
+    run("math_drift_guard_triggers_on_divergence", guard_triggers_on_divergence)
+    run("math_structural_single_source", structural_single_source_holds)
+
+
 def _self_test() -> int:
     """Run inline self-checks. Returns 0 on success, 1 on failure.
 
@@ -17779,6 +17829,7 @@ def _self_test() -> int:
     _self_test_polyhedral(_run)
     _self_test_synth_codegen(_run)
     _self_test_flag_probe(_run)
+    _self_test_math_drift_guard(_run)
     _self_test_e2e_smoke(_run)
 
     sys.stdout.write(f"\n[self-test] {passed} passed, {failures} failed\n")
