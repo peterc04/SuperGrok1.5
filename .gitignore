@@ -7,5 +7,6 @@ dist/
 *.so
 .eggs/
 .claude/
-third_party/
+third_party/*
+!third_party/cutlass
 *.ptx
