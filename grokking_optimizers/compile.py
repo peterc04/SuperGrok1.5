@@ -15614,6 +15614,11 @@ def _self_test_kernel_headers(run) -> None:
         return p.read_text(encoding="utf-8")
 
     KERNEL_DIR = REPO_ROOT / "grokking_optimizers" / "kernels"
+    # Phase 7 WS1: the dead grokking_optimizers/kernels/tpu/ duplicate was
+    # deleted; the canonical TPU path is csrc/backends/pallas/ (per-opt launchers
+    # + the shared _pallas_models / _pallas_kernels). TPU assertions below point
+    # at that single source.
+    PALLAS_DIR = REPO_ROOT / "csrc" / "backends" / "pallas"
 
     def test_elementwise_headers():
         # Post-migration contract: grokking_optimizers/kernels/ is now the SINGLE
@@ -15663,36 +15668,42 @@ def _self_test_kernel_headers(run) -> None:
             assert "cudaError_t" in src, f"{fname} missing cudaError_t entry points"
         for model, arch, fname in [
             ("transformer_decoder", "gfx942", "transformer_decoder_gfx942.hip.hpp"),
-            ("transformer_decoder", "tpu", "transformer_decoder_tpu.py"),
             ("mamba3", "gfx942", "mamba3_gfx942.hip.hpp"),
-            ("mamba3", "tpu", "mamba3_tpu.py"),
             ("vit", "gfx942", "vit_gfx942.hip.hpp"),
-            ("vit", "tpu", "vit_tpu.py"),
         ]:
             p = KERNEL_DIR / arch / fname
             assert p.is_file(), f"Missing {p}"
+        # TPU models: the canonical path is the shared pallas _pallas_models.py
+        # (one program file covering decoder/vit/mamba fwd+bwd), NOT the deleted
+        # kernels/tpu/<model>_tpu.py duplicate (Phase 7 WS1).
+        pm = PALLAS_DIR / "_pallas_models.py"
+        assert pm.is_file(), f"Missing {pm}"
+        pm_src = _read_kernel(pm)
+        for tok in ("decoder", "vit", "mamba"):
+            assert tok in pm_src.lower(), f"_pallas_models.py missing {tok}"
 
     def test_optimizer_model_cross():
         sm90_dir = KERNEL_DIR / "sm_90"
         gfx942_dir = KERNEL_DIR / "gfx942"
-        tpu_dir = KERNEL_DIR / "tpu"
         opts = ("adamw", "lion", "grokfast", "grokadamw")
         models_sm90 = ("transformer_decoder_sm90.cuh", "mamba3_sm90.cuh", "vit_sm90.cuh")
         models_gfx = ("transformer_decoder_gfx942.hip.hpp", "mamba3_gfx942.hip.hpp",
                       "vit_gfx942.hip.hpp")
-        models_tpu = ("transformer_decoder_tpu.py", "mamba3_tpu.py", "vit_tpu.py")
         for opt in opts:
             assert (sm90_dir / f"{opt}_sm90.cuh").is_file()
             assert (gfx942_dir / f"{opt}_gfx942.hip.hpp").is_file()
+            # TPU: canonical per-opt launcher in pallas (the kernels/tpu/<opt>_tpu
+            # duplicate was deleted in Phase 7 WS1).
+            assert (PALLAS_DIR / f"launch_{opt}.py").is_file()
         for m in models_sm90:
             assert (sm90_dir / m).is_file()
         for m in models_gfx:
             assert (gfx942_dir / m).is_file()
-        for m in models_tpu:
-            assert (tpu_dir / m).is_file()
+        # TPU models + shared kernels: the canonical pallas single source.
+        assert (PALLAS_DIR / "_pallas_models.py").is_file()
+        assert (PALLAS_DIR / "_pallas_kernels.py").is_file()
         assert (sm90_dir / "common_sm90.cuh").is_file()
         assert (gfx942_dir / "common_gfx942.hip.hpp").is_file()
-        assert (tpu_dir / "common_tpu.py").is_file()
 
     run("elementwise_headers", test_elementwise_headers)
     run("model_headers", test_model_headers)
