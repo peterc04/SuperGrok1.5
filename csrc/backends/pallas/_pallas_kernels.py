@@ -105,12 +105,15 @@ if _HAS_PALLAS:
                 ],
                 grid=(N // TILE,),
                 in_specs=[
-                    pl.BlockSpec((TILE, 2, 2), lambda i: (i * TILE, 0, 0)),
-                    pl.BlockSpec((TILE, 2), lambda i: (i * TILE, 0)),
+                    # BlockSpec index_map returns BLOCK indices (block i covers
+                    # rows [i*TILE:(i+1)*TILE]), so the map must be ``i`` — not
+                    # the element offset ``i*TILE`` which over-runs the grid.
+                    pl.BlockSpec((TILE, 2, 2), lambda i: (i, 0, 0)),
+                    pl.BlockSpec((TILE, 2), lambda i: (i, 0)),
                 ],
                 out_specs=[
-                    pl.BlockSpec((TILE, 2, 2), lambda i: (i * TILE, 0, 0)),
-                    pl.BlockSpec((TILE, 2), lambda i: (i * TILE, 0)),
+                    pl.BlockSpec((TILE, 2, 2), lambda i: (i, 0, 0)),
+                    pl.BlockSpec((TILE, 2), lambda i: (i, 0)),
                 ],
             )(Ms, bs)
 
@@ -628,12 +631,18 @@ def _make_pallas_scan_kernel(tile_size: int):
                 ],
                 grid=(num_tiles,),
                 in_specs=[
-                    pl.BlockSpec((TILE, 2, 2), lambda i: (i * TILE, 0, 0)),
-                    pl.BlockSpec((TILE, 2), lambda i: (i * TILE, 0)),
+                    # BlockSpec index_map returns BLOCK indices, not element
+                    # offsets: block i covers rows [i*TILE : (i+1)*TILE]. Using
+                    # ``i * TILE`` here pointed past the array for grid step
+                    # i>=1 (only block 0 landed), leaving tiles 2..K reading/
+                    # writing out-of-bounds blocks — silently wrong (NaN in
+                    # interpret mode) for N > 2*TILE. Must be ``i``.
+                    pl.BlockSpec((TILE, 2, 2), lambda i: (i, 0, 0)),
+                    pl.BlockSpec((TILE, 2), lambda i: (i, 0)),
                 ],
                 out_specs=[
-                    pl.BlockSpec((TILE, 2, 2), lambda i: (i * TILE, 0, 0)),
-                    pl.BlockSpec((TILE, 2), lambda i: (i * TILE, 0)),
+                    pl.BlockSpec((TILE, 2, 2), lambda i: (i, 0, 0)),
+                    pl.BlockSpec((TILE, 2), lambda i: (i, 0)),
                 ],
             )(Ms, bs)
         except Exception:
@@ -1068,14 +1077,15 @@ def _make_pallas_persistent_scan_fused_elem(tile_size: int):
                 ],
                 grid=(num_tiles,),
                 in_specs=[
-                    pl.BlockSpec((TILE, 2, 2), lambda i: (i * TILE, 0, 0)),
-                    pl.BlockSpec((TILE, 2), lambda i: (i * TILE, 0)),
-                    pl.BlockSpec((TILE, 2), lambda i: (i * TILE, 0)),
-                    pl.BlockSpec((TILE,), lambda i: (i * TILE,)),
-                    pl.BlockSpec((TILE,), lambda i: (i * TILE,)),
+                    # index_map returns BLOCK indices, so ``i`` (not ``i*TILE``).
+                    pl.BlockSpec((TILE, 2, 2), lambda i: (i, 0, 0)),
+                    pl.BlockSpec((TILE, 2), lambda i: (i, 0)),
+                    pl.BlockSpec((TILE, 2), lambda i: (i, 0)),
+                    pl.BlockSpec((TILE,), lambda i: (i,)),
+                    pl.BlockSpec((TILE,), lambda i: (i,)),
                 ],
                 out_specs=[
-                    pl.BlockSpec((TILE,), lambda i: (i * TILE,)),
+                    pl.BlockSpec((TILE,), lambda i: (i,)),
                     pl.BlockSpec((1, 2, 2), lambda i: (i, 0, 0)),
                     pl.BlockSpec((1, 2), lambda i: (i, 0)),
                 ],

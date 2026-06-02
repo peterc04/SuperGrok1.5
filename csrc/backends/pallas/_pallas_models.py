@@ -494,8 +494,14 @@ def _jax_selective_scan_fallback(x, B_mat, C_mat, dt, A_log):
 
     final_Ms, final_bs = lax.associative_scan(_combine, (Ms, bs), axis=1)
     # final_bs is the state at each timestep: [B, S, d_inner, d_state]
-    # Output: y_t = C_t . state_t  (dot over d_state)
-    y = jnp.einsum('bsdn,bsn->bsd', final_bs, C_mat)
+    # Output: y_t = C_t . state_t  (dot over d_state).
+    # fp32-accumulate the output contraction so a bf16-default activation path
+    # keeps the C·state reduction on the fp32 MXU fast path (consistent with the
+    # attention QK^T/PV einsums). The scan recurrence itself stays in the input
+    # dtype: it is element-wise (no MXU matmul) and numerically sensitive to the
+    # long product of dA, so bf16 accumulation there would hurt, not help.
+    y = jnp.einsum('bsdn,bsn->bsd', final_bs, C_mat,
+                   preferred_element_type=jnp.float32)
     return y
 
 
