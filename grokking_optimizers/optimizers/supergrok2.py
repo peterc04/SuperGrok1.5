@@ -1708,6 +1708,8 @@ class SuperGrok2(Optimizer):
                 self.meta_net.csa_topk, self.meta_net.hca_compress,
                 self.meta_net.indexer_rank,
                 self.meta_net.expert_counts,
+                # ── configurable PEER top-k (Phase 8; trailing arg, default 4) ──
+                self.meta_net.peer_topk,
             )
             # Expert recycling: increment step counter and periodically recycle
             self._step_counter += 1
@@ -2274,6 +2276,8 @@ class SuperGrok2(Optimizer):
             self.meta_net.csa_topk, self.meta_net.hca_compress,
             self.meta_net.indexer_rank,
             self.meta_net.expert_counts,
+            # ── configurable PEER top-k (Phase 8; trailing arg, default 4) ──
+            self.meta_net.peer_topk,
         )
 
         self._step_counter += 1
