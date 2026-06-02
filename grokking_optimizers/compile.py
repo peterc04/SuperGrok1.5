@@ -8485,6 +8485,54 @@ def _device_cflags_maybe_validate(flags: List[str], spec: "BuildSpec",
     return kept
 
 
+def install_nvcc_flags(arch: str,
+                       *,
+                       include_version_gated: bool = True,
+                       validate_flags: bool = False) -> List[str]:
+    """Public, GPU-less flag source (Stage 2 unify).
+
+    Return the canonical per-arch device-compiler flag list — the SAME
+    flags the autotuner tunes against — for a given ``arch`` WITHOUT
+    requiring a GPU, a CUDA-enabled torch, or even nvcc/hipcc on PATH.
+    ``setup.py`` (and any external install driver) can call this to build
+    the shipped extension with flags identical to what ``_device_cflags``
+    produces during autotuning, so the installed kernel matches what was
+    tuned.
+
+    The name says ``nvcc`` for the common (CUDA) caller, but the helper is
+    vendor-agnostic: HIP archs get the hipcc device flags and Pallas archs
+    get ``[]``. It is a thin wrapper over the existing ``_device_cflags`` /
+    ``_newer_compiler_flags`` machinery — additive, no behavior change to
+    either of those.
+
+    Parameters
+    ----------
+    arch:
+        An ARCH_TABLE key (e.g. ``"sm_90a"``, ``"gfx942"``, ``"tpu_v5p"``).
+    include_version_gated:
+        When True (default) the version-gated additions from
+        ``_newer_compiler_flags`` are folded in inline, matching the
+        ``--flag-audit`` view and what the build line ultimately receives.
+        On a host with no nvcc/hipcc those additions are simply empty
+        (the probe degrades gracefully) — the base list is still returned.
+    validate_flags:
+        Default False — the install host may lack the device compiler, and
+        we do NOT want a missing-compiler probe to silently drop canonical
+        flags. Set True only when the install host's nvcc/hipcc is known to
+        match the deployment toolchain.
+    """
+    spec = BuildSpec(
+        optimizer="adamw",          # any registered optimizer; irrelevant to
+        model="generic",            # device cflags (they depend only on arch)
+        arch=arch,
+        out_dir=Path(tempfile.gettempdir()),
+        autotune=False,
+        profile=False,
+        validate_flags=validate_flags,
+    )
+    return list(_device_cflags(spec, include_version_gated=include_version_gated))
+
+
 def _ldflags(spec: BuildSpec,
              trace: Optional[_FlagTrace] = None) -> List[str]:
     """Return the linker flag list. Pallas archs use an empty list (no host
@@ -14858,6 +14906,36 @@ def _self_test_flags(run) -> None:
         assert "Wrong arch for this GPU" not in joined, \
             "arch hint fired on a linker-only failure (regression)"
 
+    def test_install_nvcc_flags_gpuless_source():
+        """Stage 2 — install_nvcc_flags is a public, GPU-less flag source
+        usable by setup.py: it returns the SAME canonical device cflags
+        the autotuner tunes against, without a GPU / CUDA-torch / nvcc.
+        It must be importable, callable per-arch, and agree with the
+        _device_cflags path it wraps."""
+        from grokking_optimizers.compile import (
+            install_nvcc_flags, _device_cflags, BuildSpec)
+        # CUDA arch: non-empty, includes the canonical base + a -gencode.
+        cuda_flags = install_nvcc_flags("sm_90a")
+        assert isinstance(cuda_flags, list) and cuda_flags
+        assert "-O3" in cuda_flags
+        assert any(f.startswith("-gencode") for f in cuda_flags), cuda_flags
+        # HIP arch: non-empty, carries an --offload-arch token.
+        hip_flags = install_nvcc_flags("gfx942")
+        assert hip_flags and any("--offload-arch" in f for f in hip_flags)
+        # Pallas arch: no device cflags.
+        assert install_nvcc_flags("tpu_v5p") == []
+        # Agreement with the path it wraps (same flags the autotuner uses).
+        # Mirror the helper's release-install spec exactly (autotune off,
+        # profile off) so the comparison is apples-to-apples.
+        spec = BuildSpec(optimizer="adamw", model="generic", arch="sm_90a",
+                         out_dir=Path(tempfile.gettempdir()),
+                         autotune=False, profile=False,
+                         validate_flags=False)
+        assert (install_nvcc_flags("sm_90a", include_version_gated=True)
+                == list(_device_cflags(spec, include_version_gated=True)))
+    run("install_nvcc_flags_gpuless_source",
+        test_install_nvcc_flags_gpuless_source)
+
     run("flag_trace_recorded_per_decision",
         test_flag_trace_recorded_per_decision)
     run("flag_audit_mode_writes_file", test_flag_audit_mode_writes_file)
@@ -17885,6 +17963,51 @@ def _self_test_synth_codegen(run) -> None:
                     assert "composable_kernel" in str(exc).lower()
     run("synth_ck_emitter_skip_path", test_synth_ck_emitter_skip_path)
 
+    def test_synth_dispatcher_per_optimizer():
+        """Stage 5 — the per-(spec.optimizer) dispatcher must route
+        GEMM-heavy optimizers (muon / supergrok2 Newton–Schulz) to the
+        tensor-core GEMM pattern and elementwise optimizers to
+        adamw_update — NOT a single hardcoded pattern. Also verifies the
+        muon synth path emits a real tensor-core opcode (no GPU needed:
+        we inspect the emitted source string)."""
+        from grokking_optimizers.compile import (
+            _synth_pattern_for_optimizer, _try_synth_codegen, BuildSpec,
+            pattern_newton_schulz, synthesize_kernel)
+        # Dispatch mapping is real, not a single constant.
+        assert _synth_pattern_for_optimizer("muon") == "newton_schulz"
+        assert _synth_pattern_for_optimizer("supergrok2") == "newton_schulz"
+        assert _synth_pattern_for_optimizer("grokfast") == "fused_adam_grad_norm"
+        assert _synth_pattern_for_optimizer("adamw") == "adamw_update"
+        assert _synth_pattern_for_optimizer("lion") == "adamw_update"
+        # Unknown optimizer falls back to adamw_update (additive).
+        assert _synth_pattern_for_optimizer("brand_new_opt") == "adamw_update"
+        # The Newton–Schulz pattern lowers to real tensor-core opcodes.
+        g = pattern_newton_schulz(M=256, N=256, dtype="fp16")
+        for arch, mnemonic in (("sm_90a", "wgmma"),
+                               ("gfx942", "v_mfma")):
+            src = synthesize_kernel(g, arch, "fp16", (256, 256),
+                                    pattern_name="newton_schulz")
+            assert mnemonic in src, (
+                f"{arch}: expected {mnemonic!r} in Newton–Schulz source")
+        # End-to-end: muon routes through the dispatcher to a GEMM-bearing
+        # synth file; adamw stays on the elementwise pattern. Distinct
+        # pattern_name in the emitted filename proves the hardcode is gone.
+        with tempfile.TemporaryDirectory() as td:
+            dims = [{"name": "block"}]
+            spec_m = BuildSpec(optimizer="muon", model="mamba",
+                               arch="sm_90a", out_dir=Path(td),
+                               enable_synth_codegen=True)
+            p_m = _try_synth_codegen(spec_m, {"block": 256}, dims)
+            assert p_m is not None and "newton_schulz" in str(p_m), p_m
+            spec_a = BuildSpec(optimizer="adamw", model="mamba",
+                               arch="sm_90a", out_dir=Path(td),
+                               enable_synth_codegen=True)
+            p_a = _try_synth_codegen(spec_a, {"block": 256}, dims)
+            assert p_a is not None and "adamw_update" in str(p_a), p_a
+            assert str(p_m) != str(p_a)
+    run("synth_dispatcher_per_optimizer",
+         test_synth_dispatcher_per_optimizer)
+
     # Stream H — final wrapper: only runs the e2e smoke when a GPU is
     # visible; SKIPs cleanly (and counts as PASS) otherwise.
 
@@ -18129,6 +18252,21 @@ def _self_test_math_drift_guard(run) -> None:
     run("math_structural_single_source", structural_single_source_holds)
 
 
+# ─── Self-test count authority (Stage 3) ──────────────────────────────────
+# The TOTAL number of individual self-test cases (PASS + FAIL lines) that a
+# full ``--self-test`` run executes. This is the SINGLE authoritative place
+# the count lives — the ``count_guard`` section below COUNTS the cases that
+# actually ran and asserts they equal this constant, so the number can never
+# silently drift from docs/CI again. When you add or remove a ``run(...)``
+# case, update this constant in the same commit; the guard will fail loudly
+# (with the observed vs expected count) until you do.
+#
+# The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
+# any other), so the value is the grand total reported on the final
+# ``[self-test] N passed, M failed`` line.
+_SELF_TEST_EXPECTED_COUNT: int = 147
+
+
 def _self_test() -> int:
     """Run inline self-checks. Returns 0 on success, 1 on failure.
 
@@ -18136,6 +18274,10 @@ def _self_test() -> int:
     its own ``_self_test_<section>`` helper above. This function owns
     only the PASS/FAIL counters, the ``run`` closure that wraps each
     test, and the final summary line.
+
+    Stage 3: a final ``count_guard`` section counts the cases that ran and
+    asserts the total equals ``_SELF_TEST_EXPECTED_COUNT`` so the documented
+    count can never silently drift from the real count again.
     """
     failures = 0
     passed = 0
@@ -18174,6 +18316,22 @@ def _self_test() -> int:
     _self_test_flag_probe(_run)
     _self_test_math_drift_guard(_run)
     _self_test_e2e_smoke(_run)
+
+    # Stage 3 — count-consistency guard. Runs LAST so it can observe the
+    # number of cases every prior section executed. ``passed + failures`` is
+    # the count of all PRIOR cases; the guard case itself is the ``+ 1`` that
+    # brings the total to the grand total reported on the summary line.
+    def _count_guard() -> None:
+        observed_prior = passed + failures
+        observed_total = observed_prior + 1  # this guard case is counted too
+        assert observed_total == _SELF_TEST_EXPECTED_COUNT, (
+            f"self-test count drift: ran {observed_total} cases but "
+            f"_SELF_TEST_EXPECTED_COUNT={_SELF_TEST_EXPECTED_COUNT}. "
+            f"Update _SELF_TEST_EXPECTED_COUNT to {observed_total} in the "
+            f"same commit that changed the case count (this is the single "
+            f"authoritative place the number lives).")
+    sys.stdout.write("[self-test] count_guard\n")
+    _run("self_test_count_is_authoritative", _count_guard)
 
     sys.stdout.write(f"\n[self-test] {passed} passed, {failures} failed\n")
     return 0 if failures == 0 else 1
@@ -20639,8 +20797,42 @@ class SynthCodegenError(RuntimeError):
 # in sync with the ``allowed_patterns`` list in _DEFAULT_PROJECT_CONFIG.
 _SYNTH_KNOWN_PATTERNS: Tuple[str, ...] = (
     "adamw_update", "fused_adam_grad_norm", "softmax_matmul",
-    "reduce_broadcast", "parallel_scan", "bilevel_fusion",
+    "newton_schulz", "reduce_broadcast", "parallel_scan", "bilevel_fusion",
 )
+
+
+# Per-(spec.optimizer) → synth pattern dispatch (Stage 5). Replaces the old
+# hardcoded ``pattern_name = "adamw_update"`` in ``_try_synth_codegen``.
+# Optimizers whose device math is a GEMM-shaped subgraph (muon's Newton–Schulz
+# orthogonalisation) route to a tensor-core GEMM pattern; clip-bearing
+# optimizers route to the fused Adam + grad-norm pattern; the remaining
+# elementwise optimizers stay on ``adamw_update``. An optimizer absent from
+# this table falls back to ``adamw_update`` (historical behaviour), so adding
+# a new optimizer never silently breaks the synth path.
+_OPTIMIZER_SYNTH_PATTERN: Dict[str, str] = {
+    # GEMM-heavy: Newton–Schulz iteration is dominated by tensor-core GEMMs.
+    "muon":         "newton_schulz",
+    "supergrok2":   "newton_schulz",   # SuperGrok2 carries a muon-style NS leg
+    # Grad-norm-clipped Adam variants → fused reduce(g·g) + clipped update.
+    "grokfast":     "fused_adam_grad_norm",
+    "grokadamw":    "fused_adam_grad_norm",
+    "neuralgrok":   "fused_adam_grad_norm",
+    # Elementwise optimizers — single fused elementwise pass.
+    "adamw":        "adamw_update",
+    "lion":         "adamw_update",
+    "prodigy":      "adamw_update",
+    "looksam":      "adamw_update",
+    "supergrok11":  "adamw_update",
+    "supergrok15":  "adamw_update",
+}
+
+
+def _synth_pattern_for_optimizer(optimizer: str) -> str:
+    """Map ``spec.optimizer`` → the OpGraph pattern name the synthesiser
+    should emit (Stage 5 dispatcher). Unknown optimizers fall back to the
+    elementwise ``adamw_update`` pattern — the historical default — so the
+    dispatcher is purely additive."""
+    return _OPTIMIZER_SYNTH_PATTERN.get(optimizer.lower(), "adamw_update")
 
 
 # Per-arch lowering helpers consult this table to pick a vendor (cuda /
@@ -20953,6 +21145,81 @@ def pattern_softmax_matmul(M: int, N: int, K: int,
         },
         nodes=[qkt, smax, av],
         output="O",
+    )
+
+
+def pattern_newton_schulz(M: int, N: int,
+                          dtype: str,
+                          *, coeff: Tuple[float, float, float] =
+                          (3.4445, -4.7750, 2.0315)) -> OpGraph:
+    """Muon's Newton–Schulz orthogonalisation step as a GEMM-bearing graph.
+
+    Muon orthogonalises the momentum matrix ``G`` (shape ``M×N``) by
+    iterating the quintic Newton–Schulz polynomial
+
+        X ← a·X + b·(X Xᵀ) X + c·(X Xᵀ)² X
+
+    The arithmetic is dominated by tensor-core GEMMs — ``A = X Xᵀ``
+    (``M×N · N×M → M×M``) and the two right-multiplies ``A X`` /
+    ``A² X`` — which is exactly why muon, unlike the elementwise
+    optimizers, must lower to the CUTLASS / CK GEMM emitter rather than
+    the ``adamw_update`` elementwise pass. The GEMM nodes carry
+    ``requires_features={"wgmma"}`` so sm_90a/sm_100a dispatch to the
+    tensor-core path; AMD (gfx9xx mfma / gfx10xx wmma) is reached through
+    the ``emit_ck_gemm_variants`` branch in ``synthesize_kernel``.
+
+    One iteration is emitted (the autotuner / runtime loops it the
+    configured number of steps); the polynomial combine is a single
+    elementwise node fusing the three terms.
+    """
+    a, b, c = coeff
+    xxt = OpNode(
+        op_kind="gemm",
+        name="ns_xxt",
+        inputs=["X", "X"],
+        output="A",
+        attrs={"M": M, "N": M, "K": N, "transA": False, "transB": True,
+               "tile_M": 64, "tile_N": 128, "tile_K": 16},
+        requires_features=frozenset({"wgmma"}),
+    )
+    a2 = OpNode(
+        op_kind="gemm",
+        name="ns_a2",
+        inputs=["A", "A"],
+        output="A2",
+        attrs={"M": M, "N": M, "K": M, "transA": False, "transB": False,
+               "tile_M": 64, "tile_N": 128, "tile_K": 16},
+        requires_features=frozenset({"wgmma"}),
+    )
+    ax = OpNode(
+        op_kind="gemm",
+        name="ns_ax",
+        inputs=["A", "X"],
+        output="AX",
+        attrs={"M": M, "N": N, "K": M, "transA": False, "transB": False,
+               "tile_M": 64, "tile_N": 128, "tile_K": 16},
+        requires_features=frozenset({"wgmma"}),
+    )
+    a2x = OpNode(
+        op_kind="gemm",
+        name="ns_a2x",
+        inputs=["A2", "X"],
+        output="A2X",
+        attrs={"M": M, "N": N, "K": M, "transA": False, "transB": False,
+               "tile_M": 64, "tile_N": 128, "tile_K": 16},
+        requires_features=frozenset({"wgmma"}),
+    )
+    combine = OpNode(
+        op_kind="elementwise",
+        name="ns_combine",
+        inputs=["X", "AX", "A2X"],
+        output="Xn",
+        attrs={"expr": f"{a}f * X + {b}f * AX + {c}f * A2X"},
+    )
+    return OpGraph(
+        inputs={"X": (dtype, (M, N))},
+        nodes=[xxt, a2, ax, a2x, combine],
+        output="Xn",
     )
 
 
@@ -21877,53 +22144,77 @@ def _try_synth_codegen(spec: "BuildSpec",
     spec_cfg = spec.config or {}
     sc = (spec_cfg.get("synth_codegen") or {})
     allowed = set(sc.get("allowed_patterns") or _SYNTH_KNOWN_PATTERNS)
-    # Pattern-selection heuristic: today we map every optimizer to the
-    # adamw_update pattern (the only one that covers a full optimizer
-    # step in a single elementwise pass). Streams beyond D can extend
-    # this dispatcher to pick e.g. fused_adam_grad_norm for clipped
-    # variants. The selection lives here (not in synthesize_kernel) so
-    # the synth library remains optimizer-agnostic.
+    # Stage 5 — per-(spec.optimizer) pattern dispatcher. Replaces the prior
+    # hardcoded ``pattern_name = "adamw_update"``: GEMM-heavy optimizers
+    # (muon / supergrok2 Newton–Schulz) now route to the tensor-core GEMM
+    # pattern so the CUTLASS/CK GEMM emitter is actually exercised instead of
+    # every optimizer collapsing to the adamw_update elementwise pass; clipped
+    # Adam variants route to fused_adam_grad_norm; the remaining elementwise
+    # optimizers stay on adamw_update. The selection lives here (not inside
+    # synthesize_kernel) so the synth library stays optimizer-agnostic.
     #
-    # TODO(codegen, higher-risk follow-up): replace this single hardcoded
-    # ``adamw_update`` selection with a real per-(spec.optimizer) dispatcher
-    # (e.g. lion/adafactor/sgd → their own OpGraph patterns, clipped variants
-    # → fused_adam_grad_norm). Today every optimizer lowers through the
-    # adamw_update graph, so the synth path only produces a faithful kernel
-    # for AdamW; other optimizers silently fall back to the Jinja template.
-    # This is intentionally left as a separate workstream — wiring the real
-    # tensor-core GEMM emitter / per-optimizer graphs into prod is out of
-    # scope for the autotuner-budget cleanup. Do NOT half-implement here.
-    pattern_name = "adamw_update"
+    # 🟡 device-numeric validation: the emitted OpGraph + per-arch source
+    # (real wgmma/tcgen05/mfma/wmma opcodes via synthesize_kernel) are wired
+    # and exercised by the self-tests on a CPU host, but bit-exact numeric
+    # parity of the synthesised Newton–Schulz kernel against the committed
+    # muon kernel requires a GPU and is NOT asserted here — it is gated behind
+    # the e2e_smoke GPU path. What is wired: the dispatch (pattern selection
+    # per optimizer) + the real OpGraph emit. What is deferred: on-device
+    # numeric equivalence of the GEMM-pattern kernels.
+    pattern_name = _synth_pattern_for_optimizer(spec.optimizer)
     if pattern_name not in allowed:
-        return None
+        # The dispatched pattern was disabled via allowed_patterns; fall back
+        # to adamw_update if IT is allowed (historical behaviour), else skip.
+        if "adamw_update" in allowed:
+            pattern_name = "adamw_update"
+        else:
+            return None
 
-    # Problem shape: take the largest contiguous dim from the config if
-    # present, else fall back to 4096 (a reasonable smoke-test default
-    # that matches the existing template path's hashing).
-    shape: Tuple[int, ...] = (4096,)
-    for d in dims:
-        if d.get("name") == "block":
-            try:
-                shape = (int(config.get("block", 4096)) * 16,)
-            except (TypeError, ValueError):
-                shape = (4096,)
-            break
     dtype = "fp32"  # default; future streams can pass dtype through dims
 
-    factory = {
-        "adamw_update":         pattern_adamw_update,
-        "fused_adam_grad_norm": pattern_fused_adam_grad_norm,
-        "reduce_broadcast":     pattern_reduce_broadcast,
-        "parallel_scan":        pattern_parallel_scan,
-    }.get(pattern_name)
-    if factory is None:
-        return None
+    # GEMM-shaped patterns take (M, N[, K]) dims and emit tensor-core GEMMs;
+    # the elementwise / reduce / scan patterns take a flat ``shape`` tuple.
+    # Derive a problem size from the config's ``block`` dim when present.
+    block = 4096
+    has_block = any(d.get("name") == "block" for d in dims)
+    if has_block:
+        try:
+            block = int(config.get("block", 4096))
+        except (TypeError, ValueError):
+            block = 4096
+    flat_shape: Tuple[int, ...] = (block * 16,) if has_block else (4096,)
+
+    _GEMM_PATTERNS = {"newton_schulz", "softmax_matmul"}
+    graph: Optional[OpGraph]
     try:
-        graph = factory(shape=shape, dtype=dtype)
+        if pattern_name == "newton_schulz":
+            # Square-ish matrix sized from the block dim; clamped to a sane
+            # tensor-core multiple so the GEMM tiles divide evenly.
+            mn = max(64, (block // 64) * 64) if has_block else 256
+            graph = pattern_newton_schulz(M=mn, N=mn, dtype=dtype)
+            gemm_shape: Tuple[int, ...] = (mn, mn)
+        elif pattern_name == "softmax_matmul":
+            mn = max(64, (block // 64) * 64) if has_block else 256
+            graph = pattern_softmax_matmul(M=mn, N=mn, K=mn, dtype=dtype)
+            gemm_shape = (mn, mn)
+        else:
+            factory = {
+                "adamw_update":         pattern_adamw_update,
+                "fused_adam_grad_norm": pattern_fused_adam_grad_norm,
+                "reduce_broadcast":     pattern_reduce_broadcast,
+                "parallel_scan":        pattern_parallel_scan,
+            }.get(pattern_name)
+            if factory is None:
+                return None
+            graph = factory(shape=flat_shape, dtype=dtype)
+            gemm_shape = flat_shape
     except SynthCodegenError:
         return None
     except Exception:
         return None
+    if graph is None:
+        return None
+    shape = gemm_shape if pattern_name in _GEMM_PATTERNS else flat_shape
 
     out_dir = Path(spec.out_dir)
     synth_dir = out_dir / "synth_sources"
@@ -21932,6 +22223,7 @@ def _try_synth_codegen(spec: "BuildSpec",
     attrs_for_hash: Dict[str, Any] = {
         "shape": list(shape),
         "dtype": dtype,
+        "optimizer": spec.optimizer,
         "config_block": config.get("block"),
     }
     key = _synth_cache_key(pattern_name, spec.arch, dtype, attrs_for_hash)
