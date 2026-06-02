@@ -63,6 +63,55 @@ def _configure_logging_from_env() -> None:
 _configure_logging_from_env()
 
 
+# ----------------------------------------------------------------------
+# Model name normalization — single point of truth for short → canonical.
+#
+# Short names ("mamba", "decoder", "vit") are the user-facing API exposed
+# by profile.MODELS and the CLI. Canonical names ("mamba3",
+# "transformer_decoder", "vit") are the identifiers used by the
+# megakernel engine, fused cells, and C++ dispatch. canonicalize_model()
+# is the ONLY place this mapping is defined.
+# ----------------------------------------------------------------------
+
+_MODEL_CANONICAL = {
+    "mamba": "mamba3",
+    "decoder": "transformer_decoder",
+    "vit": "vit",
+    # Canonical names map to themselves (idempotent).
+    "mamba3": "mamba3",
+    "transformer_decoder": "transformer_decoder",
+}
+
+_MODEL_SHORT = {v: k for k, v in {
+    "mamba": "mamba3",
+    "decoder": "transformer_decoder",
+    "vit": "vit",
+}.items()}
+
+
+def canonicalize_model(name: str) -> str:
+    """Map a user-facing model name to the canonical internal name.
+
+    Short names ("mamba", "decoder", "vit") are the user API (profile.MODELS);
+    canonical names ("mamba3", "transformer_decoder", "vit") are the megakernel/
+    fused-cell identifiers. This function accepts either form and returns the
+    canonical form. Raises ValueError for unknown names.
+    """
+    canon = _MODEL_CANONICAL.get(name)
+    if canon is None:
+        raise ValueError(
+            f"Unknown model name {name!r}. "
+            f"Accepted: {sorted(_MODEL_CANONICAL.keys())}"
+        )
+    return canon
+
+
+def short_model_name(canonical: str) -> str:
+    """Reverse of canonicalize_model: canonical → short user-facing name."""
+    short = _MODEL_SHORT.get(canonical, canonical)
+    return short
+
+
 # Every real arch the package recognises (matches the canonical keys in
 # compile.ARCH_TABLE). Reporting is honest against this set; the fat-binary
 # impl selector (90/942) is a separate, normalised value (see normalize_arch).
@@ -563,6 +612,7 @@ def has_fused(model, optimizer, arch=None):
     """
     if arch is None:
         arch = detect_arch()
+    model = canonicalize_model(model)
     return (model, optimizer, arch) in _FUSED_REGISTRY
 
 
@@ -573,6 +623,7 @@ def dispatch_fused(model, optimizer, params, inputs, grads, state, lr, arch=None
     """
     if arch is None:
         arch = detect_arch()
+    model = canonicalize_model(model)
     key = (model, optimizer, arch)
     if key not in _FUSED_REGISTRY:
         raise KeyError(

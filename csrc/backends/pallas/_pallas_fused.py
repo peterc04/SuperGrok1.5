@@ -48,6 +48,8 @@ from __future__ import annotations
 import functools
 from typing import Any, Callable, Dict, Tuple
 
+from grokking_optimizers.dispatch import canonicalize_model
+
 # ---------------------------------------------------------------------------
 # JAX / Pallas availability guard (mirrors the other pallas backend files).
 # ---------------------------------------------------------------------------
@@ -741,6 +743,7 @@ def fused_step(
     not traced). Returns ``(new_params, new_opt_state_dynamic)`` -- a single XLA
     program for L3, NOT a stub.
     """
+    model = canonicalize_model(model)
     _require_ready(model, optimizer)
     dyn_state, static = _split_static(opt_state)
 
@@ -979,6 +982,7 @@ def trace_check(model: str, optimizer: str, tier: str = "L3") -> str:
 
     Returns ``"ok"`` on success; raises on any failure.
     """
+    model = canonicalize_model(model)
     _require_ready(model, optimizer)
     batch, weights, cfg = _TINY_MODELS[model]()
     opt_state = _build_dummy_opt_state(optimizer, weights)

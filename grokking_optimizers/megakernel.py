@@ -34,6 +34,8 @@ import dataclasses
 import enum
 from typing import Dict, List, Optional, Tuple
 
+from grokking_optimizers.dispatch import canonicalize_model
+
 # The ARCH_TABLE (single source of truth for per-arch smem/reg/warp budgets)
 # lives in compile.py. Import lazily to avoid a heavy import at module load.
 
@@ -212,7 +214,11 @@ def solve(model: str, optimizer: str, arch: str) -> FusionPlan:
 
     Falls DOWN tiers when L3 doesn't fit; raises (§1.11 — no silent slow path)
     when even L1 (optimizer-only fusion) doesn't fit the arch budget.
+
+    Accepts both short names ("mamba", "decoder", "vit") and canonical names
+    ("mamba3", "transformer_decoder", "vit") via canonicalize_model().
     """
+    model = canonicalize_model(model)
     if model not in _MODEL_FWD:
         raise KeyError(f"unknown model '{model}'")
     if optimizer not in _OPT_COST:

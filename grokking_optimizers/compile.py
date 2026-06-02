@@ -178,6 +178,7 @@ from grokking_optimizers.profile import (
     env_overlay,
     make_progress,
 )
+from grokking_optimizers.dispatch import canonicalize_model
 # ARCH_INFO / ARCH_TABLE are defined later in this file (single source of
 # truth); profile.py imports them lazily to avoid a circular import.
 
@@ -7636,10 +7637,12 @@ def _dry_run_all_archs(out_dir: Path,
     manifests: Dict[str, Dict] = {}
     for arch in canonical_archs:
         entry = ARCH_TABLE[arch]
-        # BLOCKER 7 — use the canonical short model name ("mamba") so
-        # the dry-run manifests carry macros that match the runtime
-        # dispatch (profile.MODELS). The legacy "mamba3" string was not
-        # in MODELS and never round-tripped through _validate.
+        # BLOCKER 7 RESOLVED via canonicalize_model — the short model name
+        # ("mamba") is the user-API value from profile.MODELS; canonicalize_model()
+        # maps it to "mamba3" internally wherever canonical names are required.
+        # The dry-run manifest macros match the runtime dispatch (profile.MODELS)
+        # because _validate() accepts short names and canonicalization happens
+        # at the internal dispatch boundary.
         spec = BuildSpec(
             optimizer="adamw",
             model="mamba",
@@ -13006,12 +13009,11 @@ def _flag_audit_main(argv: List[str]) -> int:
                     _stream.write(f"  detected: hipcc {hip_str}\n")
                 elif entry.vendor == "pallas":
                     _stream.write(f"  detected: {jax_str}\n")
-            # BLOCKER 7 — use the canonical short model name ("mamba")
-            # so the emitted -D macros match what profile.MODELS dispatches
-            # on. The prior "mamba3" literal was an alias that no longer
-            # appears anywhere in profile.MODELS / _DEFAULT_PROJECT_CONFIG;
-            # downstream consumers parsing the audit log were confused by
-            # the dangling -DSG_BUILD_MODEL_MAMBA3=1 line.
+            # BLOCKER 7 RESOLVED via canonicalize_model — "mamba" is the
+            # short user-API name (profile.MODELS); canonicalize_model() maps
+            # it to "mamba3" at the internal dispatch boundary. The emitted
+            # -D macros match what profile.MODELS dispatches on; the prior
+            # "mamba3" literal is no longer used at this call site.
             spec = BuildSpec(
                 optimizer="adamw", model="mamba", arch=arch,
                 out_dir=out_dir, runtime="aot",
@@ -13939,38 +13941,24 @@ def _e2e_smoke(out_dir: Path, *, max_seconds: float = 120.0) -> int:
     cache = CompileCache(cache_path)
     tuned_h = REPO_ROOT / "csrc/algorithms/tuned_configs.h"
 
-    chosen_model: Optional[str] = None
-    so: Optional[Path] = None
-    last_exc: Optional[BaseException] = None
-    for candidate_model in ("mamba", "mamba3"):
-        try:
-            so = build(
-                optimizer="adamw",
-                model=candidate_model,
-                arch=detected_arch,
-                out_dir=out_dir,
-                cache=cache,
-                autotune=True,
-                autotune_mode="bayesian",
-                bayesian_trials=None,         # auto early-stop
-                max_tune_seconds=max_seconds, # cap wall-clock
-                profile=False,
-                pgo=False,
-                debug=True,
-            )
-            chosen_model = candidate_model
-            break
-        except ValueError as exc:
-            last_exc = exc
-            sys.stdout.write(
-                f"[e2e-smoke] model={candidate_model!r} rejected "
-                f"({exc}); trying fallback...\n")
-            continue
-    if chosen_model is None:
-        sys.stdout.write(
-            f"[e2e-smoke] FAIL: neither 'mamba3' nor 'mamba' is a valid "
-            f"model (last error: {last_exc})\n")
-        return 1
+    # RESOLVED via canonicalize_model: use the short name "mamba" (profile.MODELS)
+    # directly — no try/except fallback needed. canonicalize_model() maps "mamba"
+    # → "mamba3" internally wherever canonical names are required.
+    chosen_model = "mamba"
+    so = build(
+        optimizer="adamw",
+        model=chosen_model,
+        arch=detected_arch,
+        out_dir=out_dir,
+        cache=cache,
+        autotune=True,
+        autotune_mode="bayesian",
+        bayesian_trials=None,         # auto early-stop
+        max_tune_seconds=max_seconds, # cap wall-clock
+        profile=False,
+        pgo=False,
+        debug=True,
+    )
 
     # ── 4. Assertions ──────────────────────────────────────────────────
     entry_key = cache.key("adamw", chosen_model, detected_arch)
@@ -23550,13 +23538,13 @@ _DEFAULT_PROJECT_CONFIG: Dict[str, Any] = {
                     "grokfast", "looksam", "neuralgrok",
                     "supergrok11", "supergrok15", "supergrok2"],
     },
-    # BLOCKER 7 — model names MUST match grokking_optimizers.profile.MODELS
-    # because ``_validate(spec)`` rejects any model not in that tuple. The
-    # short names ("mamba" / "decoder" / "vit") are the canonical strings
-    # used by every runtime dispatch site; the longer aliases that used
-    # to live here ("mamba3" / "transformer_decoder") never passed
-    # _validate, so this dict + the choices= gate on the CLI parser were
-    # silently incompatible with each other.
+    # BLOCKER 7 RESOLVED via canonicalize_model — model names here are the
+    # short user-API names from profile.MODELS ("mamba" / "decoder" / "vit").
+    # canonicalize_model() in dispatch.py is the single point of truth that
+    # maps them to canonical internal names ("mamba3" / "transformer_decoder"
+    # / "vit") at every internal dispatch boundary. The prior "mamba3" /
+    # "transformer_decoder" aliases are no longer used at call sites; they
+    # failed _validate() and were silently incompatible with the CLI parser.
     "models": {"enabled": ["mamba", "decoder", "vit"]},
     "archs":  {"default": "sm_90a", "allowed": []},
     "pgo":    {"workload_script": "", "steps": 1000},
