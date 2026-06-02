@@ -368,8 +368,10 @@ __device__ __forceinline__ void supergrok11_cosine_block(
 
     float num = 0.f, den_g = 0.f, den_m = 0.f;
     for (int i = gtid; i < n; i += stride) {
+        // g is the read-once grad (nontemporal/streaming is correct); m is the
+        // recurring momentum STATE, reused next step → CACHED (keep L2-resident).
         float gi = amd::streaming_load(&g[i]);
-        float mi = amd::streaming_load(&m[i]);
+        float mi = amd::cached_load(&m[i]);
         num   += gi * mi;
         den_g += gi * gi;
         den_m += mi * mi;
@@ -405,7 +407,9 @@ __device__ __forceinline__ void supergrok11_cosine_block(
     }
 }
 
-extern "C" __global__ void supergrok11_gfx942_cosine_reduce(
+// Bandwidth-bound reduction → request high occupancy (256-thread block = 4
+// wavefronts; 8 waves/EU) to hide global-memory latency. (WS5 occupancy wire.)
+extern "C" SG_KERNEL_BOUNDS(256, 8) void supergrok11_gfx942_cosine_reduce(
     const float* __restrict__ g, const float* __restrict__ m,
     float* __restrict__ num_acc, float* __restrict__ den_g_acc,
     float* __restrict__ den_m_acc, int n)
@@ -447,7 +451,7 @@ __device__ __forceinline__ float sg11_apply_elem(
 }
 
 template <typename ParamT, typename GradT>
-__global__ void supergrok11_gfx942_apply(
+SG_KERNEL_BOUNDS(256, 8) void supergrok11_gfx942_apply(
     ParamT* __restrict__ param, float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq, const float* __restrict__ mu,
     const GradT* __restrict__ grad, float gate, float alpha,
@@ -460,10 +464,14 @@ __global__ void supergrok11_gfx942_apply(
     const int n4     = N & ~3;   // largest multiple of 4 <= N
 
     // Vectorized body: 4 contiguous floats / iter via f32x4 (128-bit access).
+    // NONTEMPORAL POLICY (matches adamw_gfx942): grad + mu are read-once this
+    // step → streaming (nontemporal, L2-bypass); exp_avg / exp_avg_sq are
+    // recurring STATE (read+written every step, reused next step) → CACHED;
+    // param is read once then written once → cached load + streaming store.
     for (int base = gtid * 4; base < n4; base += stride * 4) {
-        f32x4 pv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(param + base));
-        f32x4 mv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(exp_avg + base));
-        f32x4 vv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(exp_avg_sq + base));
+        f32x4 pv4 = amd::cached_load(reinterpret_cast<const f32x4*>(param + base));
+        f32x4 mv4 = amd::cached_load(reinterpret_cast<const f32x4*>(exp_avg + base));
+        f32x4 vv4 = amd::cached_load(reinterpret_cast<const f32x4*>(exp_avg_sq + base));
         f32x4 uv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(mu + base));
         f32x4 gv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(grad + base));
         f32x4 ov4;
@@ -475,8 +483,8 @@ __global__ void supergrok11_gfx942_apply(
             mv4[j] = mj;
             vv4[j] = vj;
         }
-        amd::streaming_store(reinterpret_cast<f32x4*>(exp_avg + base), mv4);
-        amd::streaming_store(reinterpret_cast<f32x4*>(exp_avg_sq + base), vv4);
+        amd::cached_store(reinterpret_cast<f32x4*>(exp_avg + base), mv4);
+        amd::cached_store(reinterpret_cast<f32x4*>(exp_avg_sq + base), vv4);
         amd::streaming_store(reinterpret_cast<f32x4*>(param + base), ov4);
     }
 

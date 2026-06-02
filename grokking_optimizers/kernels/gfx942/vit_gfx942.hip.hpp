@@ -534,7 +534,8 @@ extern "C" __global__ void vit_gfx942_attention(
                    ksm, vsm, S, d_head, scale);
 }
 
-extern "C" __global__ void vit_gfx942_gelu(
+// Elementwise GELU (grid-stride, bandwidth-bound) → high occupancy. (WS5)
+extern "C" SG_KERNEL_BOUNDS(256, 8) void vit_gfx942_gelu(
     const short* __restrict__ in, short* __restrict__ out, unsigned long long n)
 {
     for (unsigned long long i =

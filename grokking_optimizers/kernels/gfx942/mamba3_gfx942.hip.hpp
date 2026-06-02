@@ -700,7 +700,8 @@ __global__ void mamba3_gfx942_ssm_fwd(
                       batch, d_inner);
 }
 
-extern "C" __global__ void mamba3_gfx942_gate_mul(
+// Elementwise gated multiply (grid-stride, bandwidth-bound) → high occupancy. (WS5)
+extern "C" SG_KERNEL_BOUNDS(256, 8) void mamba3_gfx942_gate_mul(
     const float* __restrict__ y_scan, const short* __restrict__ x_main,
     const short* __restrict__ z, const short* __restrict__ D_param,
     short* __restrict__ y_out, int batch, int seq_len, int d_inner)

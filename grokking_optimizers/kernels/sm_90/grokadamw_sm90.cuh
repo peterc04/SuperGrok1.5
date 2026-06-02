@@ -65,18 +65,62 @@ namespace prim = ::sg::sm90::primitives;
 using ::sg::algorithms::grokadamw_step;
 using ::sg::algorithms::grokadamw_adam_tail;
 
-template <typename ParamT, typename GradT>
-__global__ void grokadamw_kernel(
+#ifndef SG_GROKADAMW_MIN_BLOCKS
+#define SG_GROKADAMW_MIN_BLOCKS 4
+#endif
+
+// SG_TUNED_UNROLL-parameterized scalar grid-stride kernel; calls the canonical
+// per-element grokadamw_step (math single-sourced in algorithms/grokadamw.h).
+template <typename ParamT, typename GradT, int UNROLL>
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_GROKADAMW_MIN_BLOCKS)
+grokadamw_kernel(
     ParamT* param, float* exp_avg, float* exp_avg_sq, float* ema,
     const GradT* grad,
     float alpha, float lamb,
     float lr, float beta1, float beta2, float eps, float wd,
     float bc1, float bc2, int N
 ) {
+    const int stride = prim::grid_stride() * UNROLL;
+    const int base0 = prim::grid_stride_index() * UNROLL;
+    for (int base = base0; base < N; base += stride) {
+        #pragma unroll
+        for (int u = 0; u < UNROLL; ++u) {
+            const int i = base + u;
+            if (i < N) {
+                grokadamw_step(param, exp_avg, exp_avg_sq, ema, grad,
+                               alpha, lamb, lr, beta1, beta2, eps, wd,
+                               bc1, bc2, i);
+            }
+        }
+    }
+}
+
+// FP32 vec4 fast path: float4 global traffic, canonical step CALLED 4×.
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_GROKADAMW_MIN_BLOCKS)
+grokadamw_kernel_vec4_fp32(
+    float4* param4, float4* exp_avg4, float4* exp_avg_sq4, float4* ema4,
+    const float4* grad4,
+    float alpha, float lamb,
+    float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2, int N4
+) {
     const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
-        grokadamw_step(param, exp_avg, exp_avg_sq, ema, grad,
-                       alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2, i);
+    for (int i = prim::grid_stride_index(); i < N4; i += stride) {
+        float4 p = prim::ld_f32v4(param4 + i);
+        float4 m = prim::ld_f32v4(exp_avg4 + i);
+        float4 v = prim::ld_f32v4(exp_avg_sq4 + i);
+        float4 e = prim::ld_f32v4(ema4 + i);
+        float4 g = prim::ldg_f32v4(grad4 + i);
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            grokadamw_step(&p.x, &m.x, &v.x, &e.x, &g.x,
+                           alpha, lamb, lr, beta1, beta2, eps, wd,
+                           bc1, bc2, u);
+        }
+        prim::st_f32v4(param4 + i, p);
+        prim::st_f32v4(exp_avg4 + i, m);
+        prim::st_f32v4(exp_avg_sq4 + i, v);
+        prim::st_f32v4(ema4 + i, e);
     }
 }
 
@@ -103,10 +147,32 @@ void launch_grokadamw_step(
     const int block = SG_TUNED_BLOCK_SIZE;
     const int grid = std::min<int>(65535, (N + block - 1) / block);
 
+    const bool all_fp32 = param.scalar_type() == torch::kFloat32 &&
+                          grad.scalar_type() == torch::kFloat32;
+
+    if (SG_TUNED_VEC_WIDTH == 4 && all_fp32 &&
+        prim::is_vec4_alignable(param.data_ptr(), N) &&
+        prim::is_vec4_alignable(exp_avg.data_ptr(), N) &&
+        prim::is_vec4_alignable(exp_avg_sq.data_ptr(), N) &&
+        prim::is_vec4_alignable(ema.data_ptr(), N) &&
+        prim::is_vec4_alignable(grad.data_ptr(), N)) {
+        const int N4 = N / 4;
+        const int grid4 = std::min<int>(65535, (N4 + block - 1) / block);
+        grokadamw_kernel_vec4_fp32<<<grid4, block, 0, stream>>>(
+            reinterpret_cast<float4*>(param.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg_sq.data_ptr<float>()),
+            reinterpret_cast<float4*>(ema.data_ptr<float>()),
+            reinterpret_cast<const float4*>(grad.data_ptr<float>()),
+            alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2, N4);
+        return;
+    }
+
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         param.scalar_type(), "grokadamw_step", [&] {
-            grokadamw_kernel<scalar_t, scalar_t><<<grid, block, 0, stream>>>(
+            grokadamw_kernel<scalar_t, scalar_t, SG_TUNED_UNROLL>
+                <<<grid, block, 0, stream>>>(
                 param.data_ptr<scalar_t>(),
                 exp_avg.data_ptr<float>(),
                 exp_avg_sq.data_ptr<float>(),

@@ -10,6 +10,7 @@ that previously lived in supergrok2_jax_tpu/simple_optimizers_jax.py.
 
 from __future__ import annotations
 
+import functools
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -42,9 +43,17 @@ def _newton_schulz_ortho(X: jnp.ndarray, ns_steps: int) -> jnp.ndarray:
     """
     a, b, c = 3.4445, -4.7750, 2.0315
 
+    # fp32 accumulate on the MXU fast path at HIGHEST precision: keeps the
+    # Newton-Schulz matmuls bit-stable vs the prior default-fp32 ``@``.
+    _mm = functools.partial(
+        jnp.matmul,
+        precision=lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    )
+
     def ns_body(_, X):
-        A = X @ X.T
-        return X * a + (A @ X) * b + (X @ (X.T @ X)) * c
+        A = _mm(X, X.T)
+        return X * a + _mm(A, X) * b + _mm(X, _mm(X.T, X)) * c
 
     return lax.fori_loop(0, ns_steps, ns_body, X)
 
@@ -76,10 +85,15 @@ def newton_schulz_iterate(
     X: jnp.ndarray, ns_steps: int, a: float, b: float, c: float
 ) -> jnp.ndarray:
     """Unrolled Newton-Schulz variant used by the fused-TU launcher."""
+    _mm = functools.partial(
+        jnp.matmul,
+        precision=lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    )
     for _ in range(ns_steps):
-        AX = X.T @ X
-        AAX = AX @ AX
-        X = a * X + b * (X @ AX) + c * (X @ AAX)
+        AX = _mm(X.T, X)
+        AAX = _mm(AX, AX)
+        X = a * X + b * _mm(X, AX) + c * _mm(X, AAX)
     return X
 
 

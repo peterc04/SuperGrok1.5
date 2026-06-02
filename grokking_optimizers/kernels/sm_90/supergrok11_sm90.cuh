@@ -52,19 +52,49 @@ using ::sg::algorithms::sg11_adam_tail;
 
 constexpr int SG11_H = 64;
 
+// Minimum resident blocks/SM for the element-wise sweeps. Caps registers so
+// occupancy stays high on the (memory-bound) Adam apply.
+#ifndef SG_SUPERGROK11_MIN_BLOCKS
+#define SG_SUPERGROK11_MIN_BLOCKS 4
+#endif
+
+// Cooperatively stage the per-element meta-net phi weights into shared memory
+// ONCE per block, then hand the shared pointers to the canonical
+// sg11_phi_forward<H>. W1 is [H,2] (row-major, 2 inputs/hidden unit), b1/W2 are
+// [H]. The same weights are read by every element this block processes; staging
+// removes the per-element re-read from GLOBAL inside the H-wide forward loop. NO
+// math/signature change — the fn still takes const float* (single-sourced in
+// algorithms/supergrok11.h).
+template <int H>
+__device__ __forceinline__ void sg11_stage_phi_weights(
+    const float* __restrict__ W1, const float* __restrict__ b1,
+    const float* __restrict__ W2,
+    float* sW1, float* sb1, float* sW2
+) {
+    for (int j = threadIdx.x; j < H * 2; j += blockDim.x) sW1[j] = W1[j];
+    for (int j = threadIdx.x; j < H;     j += blockDim.x) { sb1[j] = b1[j]; sW2[j] = W2[j]; }
+    __syncthreads();
+}
+
 template <typename GradT>
-__global__ void sg11_sweep_a_kernel(
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_SUPERGROK11_MIN_BLOCKS)
+sg11_sweep_a_kernel(
     float* mu_out, const GradT* grad, const float* sharpness, const float* momentum,
     const float* W1, const float* b1, const float* W2, float b2,
     float* gate_num_p, float* gate_den_g_p, float* gate_den_m_p,
     int N
 ) {
+    __shared__ float sW1[SG11_H * 2];
+    __shared__ float sb1[SG11_H];
+    __shared__ float sW2[SG11_H];
+    sg11_stage_phi_weights<SG11_H>(W1, b1, W2, sW1, sb1, sW2);
+
     float gn = 0.0f, gdg = 0.0f, gdm = 0.0f;
     const int stride = prim::grid_stride();
     for (int i = prim::grid_stride_index(); i < N; i += stride) {
         const float g = static_cast<float>(grad[i]);
         const float s = sharpness[i];
-        const float mu_val = sg11_phi_forward<SG11_H>(g, s, W1, b1, W2, b2);
+        const float mu_val = sg11_phi_forward<SG11_H>(g, s, sW1, sb1, sW2, b2);
         sg11_sweep_a_step(mu_out, grad, sharpness, momentum, mu_val, i,
                           gn, gdg, gdm);
     }
@@ -78,17 +108,52 @@ __global__ void sg11_sweep_a_kernel(
     }
 }
 
-template <typename ParamT, typename GradT>
-__global__ void sg11_sweep_b_kernel(
+template <typename ParamT, typename GradT, int UNROLL>
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_SUPERGROK11_MIN_BLOCKS)
+sg11_sweep_b_kernel(
     ParamT* param, float* exp_avg, float* exp_avg_sq,
     const GradT* grad, const float* mu, float gate,
     float alpha, float lr, float beta1, float beta2, float eps, float wd,
     float bc1, float bc2, int N
 ) {
+    const int stride = prim::grid_stride() * UNROLL;
+    const int base0 = prim::grid_stride_index() * UNROLL;
+    for (int base = base0; base < N; base += stride) {
+        #pragma unroll
+        for (int u = 0; u < UNROLL; ++u) {
+            const int i = base + u;
+            if (i < N) {
+                sg11_sweep_b_step(param, exp_avg, exp_avg_sq, grad, mu, gate,
+                                  alpha, lr, beta1, beta2, eps, wd, bc1, bc2, i);
+            }
+        }
+    }
+}
+
+// FP32 vec4 sweep B: float4 traffic on param/state/grad/mu, canonical
+// sg11_sweep_b_step CALLED 4× on the register lanes. Math is NOT re-typed here.
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_SUPERGROK11_MIN_BLOCKS)
+sg11_sweep_b_kernel_vec4_fp32(
+    float4* param4, float4* exp_avg4, float4* exp_avg_sq4,
+    const float4* grad4, const float4* mu4, float gate,
+    float alpha, float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2, int N4
+) {
     const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
-        sg11_sweep_b_step(param, exp_avg, exp_avg_sq, grad, mu, gate,
-                          alpha, lr, beta1, beta2, eps, wd, bc1, bc2, i);
+    for (int i = prim::grid_stride_index(); i < N4; i += stride) {
+        float4 p  = prim::ld_f32v4(param4 + i);
+        float4 m  = prim::ld_f32v4(exp_avg4 + i);
+        float4 v  = prim::ld_f32v4(exp_avg_sq4 + i);
+        float4 g  = prim::ldg_f32v4(grad4 + i);
+        float4 mu = prim::ldg_f32v4(mu4 + i);
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            sg11_sweep_b_step(&p.x, &m.x, &v.x, &g.x, &mu.x, gate,
+                              alpha, lr, beta1, beta2, eps, wd, bc1, bc2, u);
+        }
+        prim::st_f32v4(param4 + i, p);
+        prim::st_f32v4(exp_avg4 + i, m);
+        prim::st_f32v4(exp_avg_sq4 + i, v);
     }
 }
 
@@ -151,10 +216,31 @@ void launch_supergrok11_step(
     float gate = (denom > 0.0f) ? (gn / denom) : 0.0f;
     gate = fminf(fmaxf(gate, 0.0f), 1.0f);
 
+    const bool all_fp32 = param.scalar_type() == torch::kFloat32 &&
+                          grad.scalar_type() == torch::kFloat32;
+    if (SG_TUNED_VEC_WIDTH == 4 && all_fp32 &&
+        prim::is_vec4_alignable(param.data_ptr(), N) &&
+        prim::is_vec4_alignable(exp_avg.data_ptr(), N) &&
+        prim::is_vec4_alignable(exp_avg_sq.data_ptr(), N) &&
+        prim::is_vec4_alignable(grad.data_ptr(), N) &&
+        prim::is_vec4_alignable(mu_buf.data_ptr(), N)) {
+        const int N4 = N / 4;
+        const int grid4 = std::min<int>(65535, (N4 + block - 1) / block);
+        sg11_sweep_b_kernel_vec4_fp32<<<grid4, block, 0, stream>>>(
+            reinterpret_cast<float4*>(param.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg_sq.data_ptr<float>()),
+            reinterpret_cast<const float4*>(grad.data_ptr<float>()),
+            reinterpret_cast<const float4*>(mu_buf.data_ptr<float>()),
+            gate, alpha, lr, beta1, beta2, eps, wd, bc1, bc2, N4);
+        return;
+    }
+
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         param.scalar_type(), "sg11_sweep_b", [&] {
-            sg11_sweep_b_kernel<scalar_t, scalar_t><<<grid, block, 0, stream>>>(
+            sg11_sweep_b_kernel<scalar_t, scalar_t, SG_TUNED_UNROLL>
+                <<<grid, block, 0, stream>>>(
                 param.data_ptr<scalar_t>(),
                 exp_avg.data_ptr<float>(),
                 exp_avg_sq.data_ptr<float>(),
@@ -167,17 +253,23 @@ void launch_supergrok11_step(
 
 // Meta-net forward: mu[i] = phi(grad[i], sharpness[i]); smart_grad = grad + alpha*mu
 template <typename GradT>
-__global__ void sg11_mu_metanet_kernel(
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_SUPERGROK11_MIN_BLOCKS)
+sg11_mu_metanet_kernel(
     float* mu, const GradT* grad, const float* sharpness,
     float* smart_grad, float alpha,
     const float* W1, const float* b1, const float* W2, float b2_scalar,
     float rescale, int N
 ) {
+    __shared__ float sW1[SG11_H * 2];
+    __shared__ float sb1[SG11_H];
+    __shared__ float sW2[SG11_H];
+    sg11_stage_phi_weights<SG11_H>(W1, b1, W2, sW1, sb1, sW2);
+
     const int stride = prim::grid_stride();
     for (int i = prim::grid_stride_index(); i < N; i += stride) {
         float g = static_cast<float>(grad[i]);
         float s = sharpness[i];
-        float phi = sg11_phi_forward<SG11_H>(g, s, W1, b1, W2, b2_scalar) * rescale;
+        float phi = sg11_phi_forward<SG11_H>(g, s, sW1, sb1, sW2, b2_scalar) * rescale;
         mu[i] = phi;
         smart_grad[i] = g + alpha * phi;
     }

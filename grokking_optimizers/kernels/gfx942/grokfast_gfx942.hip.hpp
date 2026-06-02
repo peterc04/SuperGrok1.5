@@ -238,7 +238,7 @@ __device__ __forceinline__ void grokfast_apply_elem(
 }
 
 template <typename ParamT, typename GradT>
-__global__ void grokfast_gfx942_kernel(
+SG_KERNEL_BOUNDS(256, 8) void grokfast_gfx942_kernel(
     ParamT* __restrict__ param, float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq, float* __restrict__ ema,
     const GradT* __restrict__ grad,

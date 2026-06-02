@@ -42,19 +42,37 @@ namespace prim = ::sg::sm90::primitives;
 using ::sg::algorithms::lion_step;
 using ::sg::algorithms::lion_step_vec4;
 
-template <typename ParamT, typename GradT>
-__global__ void lion_kernel(
+// Minimum resident blocks/SM for the bandwidth-bound element-wise applies.
+// Caps registers so occupancy stays high on the memory-bound path.
+#ifndef SG_LION_MIN_BLOCKS
+#define SG_LION_MIN_BLOCKS 4
+#endif
+
+// SG_TUNED_UNROLL elements per iteration; the canonical lion_step is CALLED
+// (math single-sourced) — the unroll only changes the loop structure the
+// autotuner generates, not the math.
+template <typename ParamT, typename GradT, int UNROLL>
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_LION_MIN_BLOCKS)
+lion_kernel(
     ParamT* param, float* exp_avg,
     const GradT* grad,
     float lr, float beta1, float beta2, float wd, int N
 ) {
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
-        lion_step(param, exp_avg, grad, lr, beta1, beta2, wd, i);
+    const int stride = prim::grid_stride() * UNROLL;
+    const int base0 = prim::grid_stride_index() * UNROLL;
+    for (int base = base0; base < N; base += stride) {
+        #pragma unroll
+        for (int u = 0; u < UNROLL; ++u) {
+            const int i = base + u;
+            if (i < N) {
+                lion_step(param, exp_avg, grad, lr, beta1, beta2, wd, i);
+            }
+        }
     }
 }
 
-__global__ void lion_kernel_vec4_fp32(
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_LION_MIN_BLOCKS)
+lion_kernel_vec4_fp32(
     float4* param4, float4* exp_avg4, const float4* grad4,
     float lr, float beta1, float beta2, float wd, int N4
 ) {
@@ -84,7 +102,8 @@ void launch_lion_step(
     const bool all_fp32 = param.scalar_type() == torch::kFloat32 &&
                           grad.scalar_type() == torch::kFloat32;
 
-    if (all_fp32 && prim::is_vec4_alignable(param.data_ptr(), N) &&
+    if (SG_TUNED_VEC_WIDTH == 4 && all_fp32 &&
+        prim::is_vec4_alignable(param.data_ptr(), N) &&
         prim::is_vec4_alignable(grad.data_ptr(), N)) {
         const int N4 = N / 4;
         const int grid4 = std::min<int>(65535, (N4 + block - 1) / block);
@@ -99,7 +118,8 @@ void launch_lion_step(
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         param.scalar_type(), "lion_step", [&] {
-            lion_kernel<scalar_t, scalar_t><<<grid, block, 0, stream>>>(
+            lion_kernel<scalar_t, scalar_t, SG_TUNED_UNROLL>
+                <<<grid, block, 0, stream>>>(
                 param.data_ptr<scalar_t>(),
                 exp_avg.data_ptr<float>(),
                 grad.data_ptr<scalar_t>(),

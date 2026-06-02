@@ -38,6 +38,17 @@ enum class OptId : int {
 
 static constexpr int kPsiHidden = 16;   // neuralgrok psi-net hidden width
 
+// #5 — NeuralGrok psi-net weight packing in the cell's `extra` buffer (mirror of
+// the sm_90 layout in opt_components.cuh): W1[kPsiHidden] | b1[kPsiHidden] |
+// W2[kPsiHidden] | b2(scalar). The cell binds st.psi_W1/b1/W2 from these
+// offsets so the device read of the psi weights is a bound pointer, not a null
+// deref. psi_b2 stays at its 0.0f default (device scalar; host can't deref).
+static constexpr int kPsiW1Off = 0;
+static constexpr int kPsiB1Off = kPsiHidden;
+static constexpr int kPsiW2Off = 2 * kPsiHidden;
+static constexpr int kPsiB2Off = 3 * kPsiHidden;
+static constexpr int kPsiPackFloats = 3 * kPsiHidden + 1;
+
 // All optimizer state any of the 11 tails may read (mirror of the sm_90 struct).
 // A cell zero-fills the pointers its optimizer does not use; each branch touches
 // ONLY its own optimizer's real buffers.

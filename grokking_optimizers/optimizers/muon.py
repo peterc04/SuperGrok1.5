@@ -105,9 +105,21 @@ class Muon(Optimizer):
         )
         super().__init__(param_groups, defaults)
 
+        # Per-group cache of static tensor lists (params + state buffers keep a
+        # fixed identity across steps); only grads_list and step counters are
+        # refreshed per step. Invalidated by add_param_group.
+        self._static_cache: dict = {}
+        # Lazily-bound fused kernel callables (resolved once at first use).
+        self._muon_fused_step = None
+        self._adamw_fused_step = None
+
         self._use_grad_hooks = use_grad_hooks
         if use_grad_hooks:
             _register_grad_hooks(self)
+
+    def add_param_group(self, param_group) -> None:
+        self._static_cache = {}
+        super().add_param_group(param_group)
 
     @torch.no_grad()
     def step(self, closure=None) -> Optional[float]:
@@ -138,31 +150,68 @@ class Muon(Optimizer):
 
         return loss
 
-    def _step_muon(self, group: dict) -> None:
-        """Apply Muon (momentum + Newton-Schulz orthogonalisation) to 2D params."""
+    def _muon_cache(self, group: dict):
+        """Cached (params, momentum_buffers) for a Muon group, keyed on the
+        grad-bearing param ids."""
+        key = tuple(id(p) for p in group["params"] if p.grad is not None)
+        cached = self._static_cache.get(id(group))
+        if cached is not None and cached[0] == key:
+            return cached[1]
         params_list = []
-        grads_list = []
         momentum_buf_list = []
-
         for p in group["params"]:
             if p.grad is None:
                 continue
-
-            # Lazy state initialisation
             state = self.state[p]
             if len(state) == 0:
                 state["momentum_buffer"] = torch.zeros_like(
-                    p, dtype=torch.float32
-                )
-
+                    p, dtype=torch.float32)
             params_list.append(p)
-            grads_list.append(p.grad)
             momentum_buf_list.append(state["momentum_buffer"])
+        entry = (params_list, momentum_buf_list)
+        self._static_cache[id(group)] = (key, entry)
+        return entry
+
+    def _adamw_cache(self, group: dict):
+        """Cached (params, exp_avg, exp_avg_sq, states) for an AdamW group,
+        keyed on the grad-bearing param ids."""
+        key = tuple(id(p) for p in group["params"] if p.grad is not None)
+        cached = self._static_cache.get(id(group))
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        params_list = []
+        exp_avg_list = []
+        exp_avg_sq_list = []
+        states = []
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            state = self.state[p]
+            if len(state) == 0:
+                state["step"] = 0
+                state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+                state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+            params_list.append(p)
+            exp_avg_list.append(state["exp_avg"])
+            exp_avg_sq_list.append(state["exp_avg_sq"])
+            states.append(state)
+        entry = (params_list, exp_avg_list, exp_avg_sq_list, states)
+        self._static_cache[id(group)] = (key, entry)
+        return entry
+
+    def _step_muon(self, group: dict) -> None:
+        """Apply Muon (momentum + Newton-Schulz orthogonalisation) to 2D params."""
+        params_list, momentum_buf_list = self._muon_cache(group)
 
         if len(params_list) == 0:
             return
 
-        _ops.muon_fused_step(
+        grads_list = [p.grad for p in params_list]
+
+        fused_step = self._muon_fused_step
+        if fused_step is None:
+            fused_step = self._muon_fused_step = _ops.bind("muon_fused_step")
+        fused_step(
             params_list,
             grads_list,
             momentum_buf_list,
@@ -174,38 +223,26 @@ class Muon(Optimizer):
 
     def _step_adamw(self, group: dict) -> None:
         """Apply standard AdamW to non-2D params."""
-        params_list = []
-        grads_list = []
-        exp_avg_list = []
-        exp_avg_sq_list = []
-        step_list = []
-
-        for p in group["params"]:
-            if p.grad is None:
-                continue
-
-            # Lazy state initialisation
-            state = self.state[p]
-            if len(state) == 0:
-                state["step"] = 0
-                state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
-                state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
-
-            state["step"] += 1
-
-            params_list.append(p)
-            grads_list.append(p.grad)
-            exp_avg_list.append(state["exp_avg"])
-            exp_avg_sq_list.append(state["exp_avg_sq"])
-            step_list.append(state["step"])
+        params_list, exp_avg_list, exp_avg_sq_list, states = \
+            self._adamw_cache(group)
 
         if len(params_list) == 0:
             return
 
+        grads_list = [p.grad for p in params_list]
+        step_list = []
+        for state in states:
+            state["step"] += 1
+            step_list.append(state["step"])
+
         betas = group.get("betas", (0.9, 0.98))
         eps = group.get("eps", 1e-8)
 
-        _ops.fused_adamw_simple_step(
+        fused_step = self._adamw_fused_step
+        if fused_step is None:
+            fused_step = self._adamw_fused_step = _ops.bind(
+                "fused_adamw_simple_step")
+        fused_step(
             params_list,
             grads_list,
             exp_avg_list,

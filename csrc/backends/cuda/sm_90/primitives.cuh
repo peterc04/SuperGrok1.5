@@ -94,6 +94,41 @@ __device__ __forceinline__ float block_reduce_sum_f32(float v) {
 }
 
 // =========================================================================
+//  Block-level sum reduction of TWO floats in one pass (shared warp-tree).
+//  Reduces a and b together: one shared-memory tile (2 floats/warp) and a
+//  single pair of __syncthreads, instead of two back-to-back
+//  block_reduce_sum_f32 calls (which serialize on the same static smem).
+//  Used by the prodigy (r, s) reduce. Every thread returns the block sums.
+// =========================================================================
+
+__device__ __forceinline__ void block_reduce_sum2_f32(
+    float a, float b, float& a_out, float& b_out
+) {
+    __shared__ float smem_a[32];
+    __shared__ float smem_b[32];
+    const int tid = threadIdx.x;
+    const int warp = tid / 32;
+    const int lane = tid & 31;
+
+    a = warp_reduce_sum_f32(a);
+    b = warp_reduce_sum_f32(b);
+    if (lane == 0) { smem_a[warp] = a; smem_b[warp] = b; }
+    __syncthreads();
+
+    const int n_warps = (blockDim.x + 31) / 32;
+    if (warp == 0) {
+        float xa = (lane < n_warps) ? smem_a[lane] : 0.0f;
+        float xb = (lane < n_warps) ? smem_b[lane] : 0.0f;
+        xa = warp_reduce_sum_f32(xa);
+        xb = warp_reduce_sum_f32(xb);
+        if (lane == 0) { smem_a[0] = xa; smem_b[0] = xb; }
+    }
+    __syncthreads();
+    a_out = smem_a[0];
+    b_out = smem_b[0];
+}
+
+// =========================================================================
 //  Warp-level u32 sum reduction (§4.1 PTX maximization).
 //  Integer reductions use the single-instruction `redux.sync.add.u32`
 //  warp collective on Ampere/Hopper (sm_80+), which replaces the 5-step
@@ -166,6 +201,39 @@ __device__ __forceinline__ void stream_store_f32(float* ptr, float v) {
     __stwt(ptr, v);
 }
 
+// -------------------------------------------------------------------------
+//  float4 (16B) vectorized load/store helpers for the optimizer vec4 fast
+//  paths. The element-wise optimizer math itself stays in the canonical
+//  csrc/algorithms/<opt>.h step functions — these helpers ONLY widen the
+//  global memory traffic (one 128-bit transaction per 4 FP32 elements
+//  instead of four 32-bit ones), they perform no math.
+//
+//  ld_f32v4 / st_f32v4 are plain (cached) vector access. ldg_f32v4 takes the
+//  read-only/__ldg path for inputs that are not written this step (e.g. the
+//  gradient). The pointers must be 16B-aligned (guaranteed by the host-side
+//  is_vec4_alignable() gate before the vec4 kernel is selected).
+// -------------------------------------------------------------------------
+
+__device__ __forceinline__ float4 ld_f32v4(const float4* ptr) {
+    return *ptr;
+}
+
+__device__ __forceinline__ float4 ldg_f32v4(const float4* ptr) {
+    return __ldg(ptr);
+}
+
+__device__ __forceinline__ void st_f32v4(float4* ptr, float4 v) {
+    *ptr = v;
+}
+
+// Non-temporal (streaming) 16B store — bypasses L2 for write-once output.
+__device__ __forceinline__ void stream_store_f32v4(float4* ptr, float4 v) {
+    __stwt(reinterpret_cast<float*>(ptr) + 0, v.x);
+    __stwt(reinterpret_cast<float*>(ptr) + 1, v.y);
+    __stwt(reinterpret_cast<float*>(ptr) + 2, v.z);
+    __stwt(reinterpret_cast<float*>(ptr) + 3, v.w);
+}
+
 // =========================================================================
 //  Stochastic rounding to BF16 (branchless via PTX hash_prng).
 // =========================================================================
@@ -210,12 +278,34 @@ __device__ __forceinline__ bool last_block_finished(
 }
 
 // =========================================================================
-//  Compute Adam denom with fast rsqrt + Newton-Raphson refinement.
-//  Slightly faster than 1.0f / (sqrtf(v) + eps) when v >= eps^2.
+//  Adam denominator helpers.
+//
+//  adam_denom_add(v, eps) is the additive denominator sqrtf(v)+eps that you
+//  DIVIDE by (m_hat / denom). It matches the canonical algorithms/<opt>.h
+//  math exactly. (Previously this file shipped a single `adam_denom_fast`
+//  whose comment claimed "fast rsqrt + Newton-Raphson" but whose body was
+//  plain `sqrtf(v)+eps` — the comment was wrong; it is corrected and renamed
+//  here. There are no in-tree callers of either name, so nothing breaks.)
+//
+//  adam_recip_denom_fast(v, eps) is the genuine fast path: the RECIPROCAL of
+//  the denominator, 1/(sqrt(v)+eps), computed via the hardware approximate
+//  reciprocal-sqrt (__frsqrt_rn) so the apply becomes a MULTIPLY (m_hat *
+//  recip) instead of a divide. It returns the reciprocal, so callers must
+//  multiply, not divide. Equivalent to 1.0f/(sqrtf(v)+eps) to within the
+//  rsqrt approximation; do NOT use it on the bit-stability path — it is for
+//  the perf-tolerant fast denom only.
 // =========================================================================
 
-__device__ __forceinline__ float adam_denom_fast(float v, float eps) {
+__device__ __forceinline__ float adam_denom_add(float v, float eps) {
     return sqrtf(v) + eps;
+}
+
+__device__ __forceinline__ float adam_recip_denom_fast(float v, float eps) {
+    // sqrt(v) = v * rsqrt(v); guard v==0 so rsqrt(0)=+inf does not poison the
+    // result (then denom = eps, recip = 1/eps).
+    const float rs = __frsqrt_rn(v);
+    const float sqrt_v = (v > 0.0f) ? (v * rs) : 0.0f;
+    return 1.0f / (sqrt_v + eps);
 }
 
 // =========================================================================

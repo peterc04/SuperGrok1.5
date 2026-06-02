@@ -67,6 +67,10 @@ using ::sg::algorithms::prodigy_partials_step;
 using ::sg::algorithms::prodigy_update_d;
 using ::sg::algorithms::prodigy_apply_step;
 
+#ifndef SG_PRODIGY_MIN_BLOCKS
+#define SG_PRODIGY_MIN_BLOCKS 4
+#endif
+
 // Compile-time cluster volume from the tuned shape, capped at the Hopper
 // portable max (8). Used both for the host-side fits-in-one-cluster decision
 // and to bound the DSMEM gather. (The __cluster_dims__ attribute below takes
@@ -78,7 +82,8 @@ constexpr int kClusterVolume =
 }  // namespace prodigy_detail
 
 template <typename ParamT, typename GradT>
-__global__ void prodigy_reduce_kernel(
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_PRODIGY_MIN_BLOCKS)
+prodigy_reduce_kernel(
     const ParamT* param, const ParamT* param_init, const GradT* grad,
     float d_prev,
     float* r_partial, float* s_partial,
@@ -90,11 +95,50 @@ __global__ void prodigy_reduce_kernel(
         prodigy_partials_step(param, param_init, grad, d_prev, i,
                               r_local, s_local);
     }
-    float r_block = prim::block_reduce_sum_f32(r_local);
-    float s_block = prim::block_reduce_sum_f32(s_local);
+    // Single fused two-value block reduction (one shared tile + one barrier
+    // pair) → ONE atomicAdd per partial per block, instead of two separate
+    // block reductions.
+    float r_block, s_block;
+    prim::block_reduce_sum2_f32(r_local, s_local, r_block, s_block);
     if (threadIdx.x == 0) {
         atomicAdd(r_partial, r_block);
         atomicAdd(s_partial, s_block);
+    }
+}
+
+// Fused reduce + d-update for the SINGLE-tensor path: the LAST block to finish
+// (last_block_finished + the gridDim counter) reads the fully-accumulated
+// (r, s) partials and writes d_t directly — folding away the separate
+// <<<1,1>>> prodigy_update_d_kernel launch. block_done_counter must be a
+// device scalar zeroed before launch. The multi-tensor path keeps the separate
+// d-update kernel (it accumulates across many launches before the update).
+template <typename ParamT, typename GradT>
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_PRODIGY_MIN_BLOCKS)
+prodigy_reduce_and_update_d_kernel(
+    const ParamT* param, const ParamT* param_init, const GradT* grad,
+    float d_prev,
+    float* r_partial, float* s_partial, float* d_t,
+    unsigned* block_done_counter,
+    int N, int total_blocks
+) {
+    float r_local = 0.0f, s_local = 0.0f;
+    const int stride = prim::grid_stride();
+    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+        prodigy_partials_step(param, param_init, grad, d_prev, i,
+                              r_local, s_local);
+    }
+    float r_block, s_block;
+    prim::block_reduce_sum2_f32(r_local, s_local, r_block, s_block);
+    if (threadIdx.x == 0) {
+        atomicAdd(r_partial, r_block);
+        atomicAdd(s_partial, s_block);
+    }
+    // __threadfence so the last block sees the completed atomic results.
+    __threadfence();
+    if (prim::last_block_finished(block_done_counter, total_blocks)) {
+        if (threadIdx.x == 0) {
+            *d_t = prodigy_update_d(d_prev, *r_partial, *s_partial);
+        }
     }
 }
 
@@ -148,18 +192,54 @@ __global__ void prodigy_update_d_kernel(
     }
 }
 
-template <typename ParamT, typename GradT>
-__global__ void prodigy_apply_kernel(
+template <typename ParamT, typename GradT, int UNROLL>
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_PRODIGY_MIN_BLOCKS)
+prodigy_apply_kernel(
     ParamT* param, float* exp_avg, float* exp_avg_sq, float* s_track,
     const GradT* grad, const float* d_ptr,
     float beta1, float beta2, float eps, float wd,
     float bc1, float bc2, int N
 ) {
     const float d = *d_ptr;
+    const int stride = prim::grid_stride() * UNROLL;
+    const int base0 = prim::grid_stride_index() * UNROLL;
+    for (int base = base0; base < N; base += stride) {
+        #pragma unroll
+        for (int u = 0; u < UNROLL; ++u) {
+            const int i = base + u;
+            if (i < N) {
+                prodigy_apply_step(param, exp_avg, exp_avg_sq, s_track, grad,
+                                   d, beta1, beta2, eps, wd, bc1, bc2, i);
+            }
+        }
+    }
+}
+
+// FP32 vec4 apply: float4 traffic, canonical prodigy_apply_step CALLED 4×.
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_PRODIGY_MIN_BLOCKS)
+prodigy_apply_kernel_vec4_fp32(
+    float4* param4, float4* exp_avg4, float4* exp_avg_sq4, float4* s_track4,
+    const float4* grad4, const float* d_ptr,
+    float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2, int N4
+) {
+    const float d = *d_ptr;
     const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
-        prodigy_apply_step(param, exp_avg, exp_avg_sq, s_track, grad,
-                           d, beta1, beta2, eps, wd, bc1, bc2, i);
+    for (int i = prim::grid_stride_index(); i < N4; i += stride) {
+        float4 p  = prim::ld_f32v4(param4 + i);
+        float4 m  = prim::ld_f32v4(exp_avg4 + i);
+        float4 v  = prim::ld_f32v4(exp_avg_sq4 + i);
+        float4 st = prim::ld_f32v4(s_track4 + i);
+        float4 g  = prim::ldg_f32v4(grad4 + i);
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            prodigy_apply_step(&p.x, &m.x, &v.x, &st.x, &g.x,
+                               d, beta1, beta2, eps, wd, bc1, bc2, u);
+        }
+        prim::st_f32v4(param4 + i, p);
+        prim::st_f32v4(exp_avg4 + i, m);
+        prim::st_f32v4(exp_avg_sq4 + i, v);
+        prim::st_f32v4(s_track4 + i, st);
     }
 }
 
@@ -217,31 +297,63 @@ void launch_prodigy_step(
                     s_partial.data_ptr<float>(),
                     N);
             });
+        // DSMEM path wrote the final (r, s) directly; do the d-update on one
+        // thread (the cluster kernel cannot use the last-block fold).
+        prodigy_update_d_kernel<<<1, 1, 0, stream>>>(
+            d_t.data_ptr<float>(),
+            r_partial.data_ptr<float>(),
+            s_partial.data_ptr<float>(),
+            d_prev);
     } else
 #endif  // ENABLE_DSMEM_REDUCE
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
-        param.scalar_type(), "prodigy_reduce", [&] {
-            prodigy_reduce_kernel<scalar_t, scalar_t><<<grid, block, 0, stream>>>(
-                param.data_ptr<scalar_t>(),
-                param_init.data_ptr<scalar_t>(),
-                grad.data_ptr<scalar_t>(),
-                d_prev,
-                r_partial.data_ptr<float>(),
-                s_partial.data_ptr<float>(),
-                N);
-        });
+    {
+        // Atomic reduce + last-block d-update fold: the reduce kernel itself
+        // writes d_t from the completed (r, s) partials — no separate <<<1,1>>>.
+        auto counter = torch::zeros({1},
+            torch::TensorOptions().device(param.device()).dtype(torch::kInt32));
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::ScalarType::Half, at::ScalarType::BFloat16,
+            param.scalar_type(), "prodigy_reduce_update_d", [&] {
+                prodigy_reduce_and_update_d_kernel<scalar_t, scalar_t>
+                    <<<grid, block, 0, stream>>>(
+                    param.data_ptr<scalar_t>(),
+                    param_init.data_ptr<scalar_t>(),
+                    grad.data_ptr<scalar_t>(),
+                    d_prev,
+                    r_partial.data_ptr<float>(),
+                    s_partial.data_ptr<float>(),
+                    d_t.data_ptr<float>(),
+                    reinterpret_cast<unsigned*>(counter.data_ptr<int>()),
+                    N, grid);
+            });
+    }
 
-    prodigy_update_d_kernel<<<1, 1, 0, stream>>>(
-        d_t.data_ptr<float>(),
-        r_partial.data_ptr<float>(),
-        s_partial.data_ptr<float>(),
-        d_prev);
+    const bool apply_fp32 = param.scalar_type() == torch::kFloat32 &&
+                            grad.scalar_type() == torch::kFloat32;
+    if (SG_TUNED_VEC_WIDTH == 4 && apply_fp32 &&
+        prim::is_vec4_alignable(param.data_ptr(), N) &&
+        prim::is_vec4_alignable(exp_avg.data_ptr(), N) &&
+        prim::is_vec4_alignable(exp_avg_sq.data_ptr(), N) &&
+        prim::is_vec4_alignable(s_track.data_ptr(), N) &&
+        prim::is_vec4_alignable(grad.data_ptr(), N)) {
+        const int N4 = N / 4;
+        const int grid4 = std::min<int>(65535, (N4 + block - 1) / block);
+        prodigy_apply_kernel_vec4_fp32<<<grid4, block, 0, stream>>>(
+            reinterpret_cast<float4*>(param.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg_sq.data_ptr<float>()),
+            reinterpret_cast<float4*>(s_track.data_ptr<float>()),
+            reinterpret_cast<const float4*>(grad.data_ptr<float>()),
+            d_t.data_ptr<float>(),
+            beta1, beta2, eps, wd, bc1, bc2, N4);
+        return;
+    }
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         param.scalar_type(), "prodigy_apply", [&] {
-            prodigy_apply_kernel<scalar_t, scalar_t><<<grid, block, 0, stream>>>(
+            prodigy_apply_kernel<scalar_t, scalar_t, SG_TUNED_UNROLL>
+                <<<grid, block, 0, stream>>>(
                 param.data_ptr<scalar_t>(),
                 exp_avg.data_ptr<float>(),
                 exp_avg_sq.data_ptr<float>(),
@@ -273,19 +385,26 @@ void launch_fused_prodigy_step(
 
 // DLR reduction: numerator += <grad, param - param_init>,
 // denominator += ||s|| * d + eps.
-__global__ void prodigy_dlr_reduce_kernel(
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_PRODIGY_MIN_BLOCKS)
+prodigy_dlr_reduce_kernel(
     const float* grad, const float* param, const float* param_init,
     const float* s, float* numerator, float* denominator,
     float eps, int N
 ) {
     float num_acc = 0.0f, den_acc = 0.0f;
-    const int stride = blockDim.x * gridDim.x;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < N; i += stride) {
+    const int stride = prim::grid_stride();
+    for (int i = prim::grid_stride_index(); i < N; i += stride) {
         num_acc += grad[i] * (param[i] - param_init[i]);
         den_acc += fabsf(s[i]);
     }
-    atomicAdd(numerator, num_acc);
-    atomicAdd(denominator, den_acc);
+    // Fused two-value block reduction → ONE atomicAdd per partial per block
+    // (was a per-THREAD atomicAdd, i.e. blockDim.x * gridDim.x atomics).
+    float num_block, den_block;
+    prim::block_reduce_sum2_f32(num_acc, den_acc, num_block, den_block);
+    if (threadIdx.x == 0) {
+        atomicAdd(numerator, num_block);
+        atomicAdd(denominator, den_block);
+    }
 }
 
 void launch_prodigy_dlr_reduce(
@@ -359,7 +478,7 @@ void launch_multi_tensor_prodigy_fused_reduce_step(
         AT_DISPATCH_FLOATING_TYPES_AND2(
             at::ScalarType::Half, at::ScalarType::BFloat16,
             params[i].scalar_type(), "prodigy_mt_apply", [&] {
-                prodigy_apply_kernel<scalar_t, scalar_t>
+                prodigy_apply_kernel<scalar_t, scalar_t, SG_TUNED_UNROLL>
                     <<<grid, block, 0, stream>>>(
                     params[i].data_ptr<scalar_t>(),
                     exp_avgs[i].data_ptr<float>(),
