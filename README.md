@@ -172,19 +172,43 @@ fused cells).
 ## 6. Verification (this environment — no accelerator)
 
 ```bash
-python -m grokking_optimizers.compile --self-test     # 147 passed, 0 failed
+python -m grokking_optimizers.compile --self-test     # 156 passed, 0 failed
 ruff check grokking_optimizers/ && ruff format --check grokking_optimizers/
 python scripts/check_math_single_source.py            # drift guard (exit 0)
 scripts/amdgcn_check.sh --header <gfx942 header>       # clang AMDGPU device gate
 scripts/compile_to_object.sh <tu>.cu -DWITH_CUTLASS    # nvcc -c sm_90a
 ```
 
-System-verified (Phase 5/6): self-test **147/0**; ruff clean; **15/15** gfx942
+System-verified (Phase 5/6): self-test **156/0**; ruff clean; **15/15** gfx942
 headers AMDGCN_OK (11 optimizer + 4 model/attention); **99/99** cells emit real
 compositions and are 5-way
 consistent (canonical file ↔ solver tier ↔ cell comment ↔ dispatch route ↔
 status table); anti-false-positive sweep = **0**; the math-drift guard passes
 and **provably triggers** on injected divergence.
+
+### Observability — device utilization across all 33 pipelines per arch
+
+`grokking_optimizers/utilization.py` is a **live device-utilization sweep**: for
+a given arch it runs each of the **33 fused pipelines** (11 optimizers × 3
+models) under a sustained load while a low-overhead background poller samples the
+device, then emits one structured record per pipeline (mean/peak compute % +
+memory %, peak device MB) as a table + JSON.
+
+```bash
+python -m grokking_optimizers.utilization --arch tpu_v6e            # sweep all 33
+python -m grokking_optimizers.utilization --arch sm_90a -O supergrok2  # one optimizer ×3
+python -m grokking_optimizers.utilization --arch gfx942 --list      # enumerate, no device
+```
+
+Per-arch sampler backend: NVIDIA → `pynvml` `nvmlDeviceGetUtilizationRates`
+(SM% + mem%, `nvidia-smi` fallback); AMD → `amdsmi` / `rocm-smi --showuse`
+(GPU use% + VRAM%); TPU → JAX `device.memory_stats()` for live HBM utilization
+(MXU compute duty-cycle is xprof-only — see `grokking_optimizers.profile`). It
+complements `grokking_optimizers.profile` (one-shot ncu/rocprof/jax.profiler
+dump) and `bench_backends` (wall-clock). On a host with no accelerator the full
+33-cell structure + JSON schema are still produced with `status` flags and null
+metrics (CPU-tested in `--self-test`); only the **numbers** are 🟡 (need the
+target accelerator).
 
 ---
 
