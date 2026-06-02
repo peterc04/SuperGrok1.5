@@ -935,9 +935,9 @@ __global__ void sg2_input_proj_sort_kernel(
     const scalar_t* grad, const scalar_t* sharpness,
     float* x_out, float* sort_keys, int* sort_indices,
     const float* proj_W, const float* proj_b,
-    int N, int d_model
+    int64_t N, int d_model
 ) {
-    const int idx = prim::grid_stride_index();
+    const int64_t idx = prim::grid_stride_index();
     ::sg::algorithms::sg2_input_proj_sort(
         grad, sharpness, x_out, sort_keys, sort_indices,
         proj_W, proj_b, idx, N, d_model);
@@ -962,10 +962,10 @@ __global__ void sg2_apply_kernel(
     const GradT* grad, const float* expert_out,
     float alpha, float gru_decay,
     float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int N
+    float bc1, float bc2, int64_t N
 ) {
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N; i += stride) {
         ::sg::algorithms::sg2_apply_step(
             param, exp_avg, exp_avg_sq, mu_state, grad, expert_out[i],
             alpha, gru_decay, lr, beta1, beta2, eps, wd, bc1, bc2, i);
@@ -981,11 +981,13 @@ void launch_supergrok2_input_proj_sort(
     torch::Tensor& x_out, torch::Tensor& sort_keys, torch::Tensor& sort_indices,
     const torch::Tensor& proj_W, const torch::Tensor& proj_b
 ) {
-    const int N = grad.numel();
+    const int64_t N = grad.numel();
     const int d_model = proj_W.size(0);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int block = SG_TUNED_BLOCK_SIZE;
-    const int grid = (N + block - 1) / block;
+    // One element per thread (no grid-stride loop in this kernel): grid must
+    // cover all N. Form the division in int64 then cast the (in-range) grid dim.
+    const int grid = static_cast<int>((N + block - 1) / block);
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
@@ -1050,10 +1052,10 @@ __global__ void moe_adam_kernel(
     ParamT* param, float* exp_avg, float* exp_avg_sq,
     const GradT* grad,
     float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int N
+    float bc1, float bc2, int64_t N
 ) {
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N; i += stride) {
         moe_adam_step(param, exp_avg, exp_avg_sq, grad,
                       lr, beta1, beta2, eps, wd, bc1, bc2, i);
     }
@@ -1469,6 +1471,7 @@ static void csa_hca_step_one(
     int csa_compress, int csa_window, int csa_topk,
     int hca_compress, int indexer_rank,
     torch::Tensor& expert_counts,
+    int peer_topk,
     cudaStream_t stream)
 {
     const int N = static_cast<int>(grad.numel());
@@ -1521,7 +1524,8 @@ static void csa_hca_step_one(
         feat, peer_query_Ws, prod_keys_A, prod_keys_B,
         expert_W1, expert_b1, expert_W2, expert_b2,
         N, d_model, num_experts, expert_hidden, expert_counts,
-        /*peer_topk=*/4);  // [N] sorted — real product-key top-4 combination
+        /*peer_topk=*/peer_topk);  // [N] sorted — real product-key top-k combination
+                                   // (configurable; default 4 preserves PEER top-4)
 
     // (4) Unsort expert output back to original element order, scale.
     auto expert_out = torch::empty({N}, fopt);
@@ -1574,7 +1578,8 @@ void launch_csa_hca_step(
     int expert_hidden, int num_experts,
     int csa_compress, int csa_window, int csa_topk,
     int hca_compress, int indexer_rank,
-    torch::Tensor expert_counts)
+    torch::Tensor expert_counts,
+    int peer_topk = 4)
 {
     if (grad.numel() == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -1600,7 +1605,7 @@ void launch_csa_hca_step(
         rescale, alpha_mu, gru_decay, beta1, beta2, lr, wd_eff, eps, bc1, bc2,
         d_model, num_heads, expert_hidden, num_experts,
         csa_compress, csa_window, csa_topk, hca_compress, indexer_rank,
-        expert_counts, stream);
+        expert_counts, peer_topk, stream);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1636,7 +1641,8 @@ void launch_csa_hca_batched_step(
     int expert_hidden, int num_experts,
     int csa_compress, int csa_window, int csa_topk,
     int hca_compress, int indexer_rank,
-    torch::Tensor expert_counts)
+    torch::Tensor expert_counts,
+    int peer_topk = 4)
 {
     const size_t n = params.size();
     if (n == 0) return;
@@ -1659,7 +1665,7 @@ void launch_csa_hca_batched_step(
             bc1s[i], bc2s[i],
             d_model, num_heads, expert_hidden, num_experts,
             csa_compress, csa_window, csa_topk, hca_compress, indexer_rank,
-            expert_counts, stream);
+            expert_counts, peer_topk, stream);
         (void)lamb_effs;
     }
 }

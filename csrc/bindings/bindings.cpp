@@ -1580,7 +1580,8 @@ namespace sg {
  int expert_hidden, int num_experts, \
  int csa_compress, int csa_window, int csa_topk, \
  int hca_compress, int indexer_rank, \
- torch::Tensor expert_counts); \
+ torch::Tensor expert_counts, \
+ int peer_topk); \
  void launch_csa_hca_batched_step( \
  std::vector<torch::Tensor> params, \
  std::vector<torch::Tensor> grads, \
@@ -1618,7 +1619,8 @@ namespace sg {
  int expert_hidden, int num_experts, \
  int csa_compress, int csa_window, int csa_topk, \
  int hca_compress, int indexer_rank, \
- torch::Tensor expert_counts); \
+ torch::Tensor expert_counts, \
+ int peer_topk); \
  void launch_csa_hca_bilevel_fwd_save( \
  torch::Tensor grad, torch::Tensor sharpness, \
  torch::Tensor input_proj_W, torch::Tensor input_proj_b, \
@@ -1787,7 +1789,8 @@ void supergrok2_step(
  int expert_hidden, int num_experts,
  int csa_compress, int csa_window, int csa_topk,
  int hca_compress, int indexer_rank,
- torch::Tensor expert_counts
+ torch::Tensor expert_counts,
+ int peer_topk = 4
 ) {
  if (grad.numel() == 0) return;
  check_param_grad(param, grad, "supergrok2_step");
@@ -1806,7 +1809,7 @@ void supergrok2_step(
  d_model, gru_hidden, num_heads, pk_dim,
  expert_hidden, num_experts,
  csa_compress, csa_window, csa_topk,
- hca_compress, indexer_rank, expert_counts);
+ hca_compress, indexer_rank, expert_counts, peer_topk);
 }
 
 // SG2 batched CSA/HCA step. (Renamed from supergrok2_mamba_peer_batched_step;
@@ -1843,7 +1846,8 @@ void supergrok2_batched_step(
  int expert_hidden, int num_experts,
  int csa_compress, int csa_window, int csa_topk,
  int hca_compress, int indexer_rank,
- torch::Tensor expert_counts
+ torch::Tensor expert_counts,
+ int peer_topk = 4
 ) {
  if (params.empty()) return;
  check_params_grads(params, grads, "supergrok2_batched_step");
@@ -1862,7 +1866,7 @@ void supergrok2_batched_step(
  d_model, gru_hidden, num_heads, pk_dim,
  expert_hidden, num_experts,
  csa_compress, csa_window, csa_topk,
- hca_compress, indexer_rank, expert_counts);
+ hca_compress, indexer_rank, expert_counts, peer_topk);
 }
 
 // SG2 bilevel forward-save: runs the CSA/HCA attention forward and saves the
@@ -2131,7 +2135,8 @@ void supergrok2_prepare_and_batched_step(
  int64_t expert_hidden, int64_t num_experts,
  int64_t csa_compress, int64_t csa_window, int64_t csa_topk,
  int64_t hca_compress, int64_t indexer_rank,
- torch::Tensor expert_counts
+ torch::Tensor expert_counts,
+ int64_t peer_topk = 4
 ) {
  const size_t n = params.size();
  if (n == 0) return;
@@ -2179,7 +2184,8 @@ void supergrok2_prepare_and_batched_step(
  static_cast<int>(expert_hidden), static_cast<int>(num_experts),
  static_cast<int>(csa_compress), static_cast<int>(csa_window),
  static_cast<int>(csa_topk), static_cast<int>(hca_compress),
- static_cast<int>(indexer_rank), expert_counts);
+ static_cast<int>(indexer_rank), expert_counts,
+ static_cast<int>(peer_topk));
 }
 
 } // namespace sg
