@@ -293,7 +293,9 @@ __device__ __forceinline__ void looksam_sumsq_block(
     }
 }
 
-extern "C" __global__ void looksam_gfx942_sumsq_reduce(
+// Bandwidth-bound reduction → high occupancy (256-thread block = 4 wavefronts;
+// 8 waves/EU) to hide global-memory latency. (WS5 occupancy wire.)
+extern "C" SG_KERNEL_BOUNDS(256, 8) void looksam_gfx942_sumsq_reduce(
     const float* __restrict__ g, float* __restrict__ acc, int n)
 {
     looksam_sumsq_block(g, acc, n);
@@ -344,7 +346,7 @@ __device__ __forceinline__ void looksam_apply_elem(
 }
 
 template <typename ParamT, typename GradT>
-__global__ void looksam_gfx942_apply_kernel(
+SG_KERNEL_BOUNDS(256, 8) void looksam_gfx942_apply_kernel(
     ParamT* __restrict__ param, float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq, const float* __restrict__ sam_dir,
     const GradT* __restrict__ grad, float alpha,

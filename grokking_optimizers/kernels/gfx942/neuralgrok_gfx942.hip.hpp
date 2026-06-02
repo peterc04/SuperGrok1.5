@@ -334,7 +334,7 @@ __device__ __forceinline__ void neuralgrok_apply_elem(
 }
 
 template <typename ParamT, typename GradT, int H>
-__global__ void neuralgrok_gfx942_kernel(
+SG_KERNEL_BOUNDS(256, 8) void neuralgrok_gfx942_kernel(
     ParamT* __restrict__ param, float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq, const GradT* __restrict__ grad,
     const float* __restrict__ psi_W1, const float* __restrict__ psi_b1,
