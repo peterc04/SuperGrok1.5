@@ -331,9 +331,17 @@ void grokfast_fused_step(
  float alpha, float lamb
 ) {
  if (grads.empty()) return;
+ TORCH_CHECK(grads.size() == ema_bufs.size(), "grokfast_fused_step",
+             ": grads.size() (", grads.size(), ") != ema_bufs.size() (",
+             ema_bufs.size(), ")");
  std::vector<torch::Tensor> vg, ve;
  for (size_t i = 0; i < grads.size(); i++) {
  if (!grads[i].defined() || grads[i].numel() == 0) continue;
+ // EMA-only entrypoint: the launcher indexes ema_bufs[i] and grads[i] as
+ // flat data_ptr buffers, so they must match device/dtype/shape/contig.
+ // check_param_grad validates the EMA buffer as the "param" and the grad
+ // against it — the same boundary contract every other *_fused_step uses.
+ check_param_grad(ema_bufs[i], grads[i], "grokfast_fused_step");
  vg.push_back(grads[i]); ve.push_back(ema_bufs[i]);
  }
  if (vg.empty()) return;

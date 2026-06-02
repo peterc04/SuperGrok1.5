@@ -38,6 +38,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <stdexcept>
 #include <cmath>
+#include <climits>
 #include <algorithm>
 #include <string>
 
@@ -1536,6 +1537,15 @@ static void csa_hca_step_one(
     int peer_topk,
     cudaStream_t stream)
 {
+    // SG2 runs sequence-attention over the N "tokens" (materializes [N,d_model]
+    // + N*N attention), so it OOMs far below INT_MAX elements — the int domain
+    // here is safe in practice. Guard the truncation loudly anyway so a >2^31
+    // element param ERRORS instead of silently wrapping `N` into corruption.
+    TORCH_CHECK(grad.numel() <= static_cast<int64_t>(INT_MAX),
+                "supergrok2: param numel ", grad.numel(),
+                " exceeds INT_MAX; the SG2 attention path uses 32-bit token "
+                "indexing (it materializes an N*N attention map and cannot "
+                "reach this size in practice).");
     const int N = static_cast<int>(grad.numel());
     if (N == 0) return;
     const int head_dim = d_model / std::max(num_heads, 1);

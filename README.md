@@ -179,8 +179,9 @@ scripts/amdgcn_check.sh --header <gfx942 header>       # clang AMDGPU device gat
 scripts/compile_to_object.sh <tu>.cu -DWITH_CUTLASS    # nvcc -c sm_90a
 ```
 
-System-verified (Phase 5/6): self-test **147/0**; ruff clean; **19/19** gfx942
-headers AMDGCN_OK; **99/99** cells emit real compositions and are 5-way
+System-verified (Phase 5/6): self-test **147/0**; ruff clean; **15/15** gfx942
+headers AMDGCN_OK (11 optimizer + 4 model/attention); **99/99** cells emit real
+compositions and are 5-way
 consistent (canonical file ↔ solver tier ↔ cell comment ↔ dispatch route ↔
 status table); anti-false-positive sweep = **0**; the math-drift guard passes
 and **provably triggers** on injected divergence.
