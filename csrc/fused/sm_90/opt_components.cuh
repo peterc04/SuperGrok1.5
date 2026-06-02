@@ -60,6 +60,24 @@ enum class OptId : int {
 // per-op neuralgrok kernel's default instantiation.
 static constexpr int kPsiHidden = 16;
 
+// #5 — NeuralGrok psi-net weight packing in the cell's `extra` buffer.
+// neuralgrok has no per-element `extra` n-slice (its psi-net is a small
+// per-TENSOR weight set), so the cell repurposes the otherwise-unused `extra`
+// pointer to carry the packed psi-net weights in this fixed layout:
+//   extra[0                  .. kPsiHidden)        = psi_W1  [kPsiHidden]
+//   extra[kPsiHidden         .. 2*kPsiHidden)      = psi_b1  [kPsiHidden]
+//   extra[2*kPsiHidden       .. 3*kPsiHidden)      = psi_W2  [kPsiHidden]
+//   extra[3*kPsiHidden]                            = psi_b2  (scalar)
+// A neuralgrok cell binds st.psi_W1/b1/W2 from these offsets so the device read
+// of the psi weights is a real, bound pointer instead of a null-deref. psi_b2
+// is a device scalar; the cell leaves st.psi_b2 at its 0.0f default (a host
+// scalar cannot dereference a device pointer) — see the #5 stop in the report.
+static constexpr int kPsiW1Off = 0;
+static constexpr int kPsiB1Off = kPsiHidden;
+static constexpr int kPsiW2Off = 2 * kPsiHidden;
+static constexpr int kPsiB2Off = 3 * kPsiHidden;   // scalar slot (device-side)
+static constexpr int kPsiPackFloats = 3 * kPsiHidden + 1;
+
 // All optimizer state any of the 11 tails may read. A given cell zero-fills the
 // pointers its optimizer does not use; each apply_optimizer<> branch touches
 // ONLY its own optimizer's real buffers (so unused ones are never dereferenced).

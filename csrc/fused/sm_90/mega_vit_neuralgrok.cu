@@ -26,7 +26,16 @@ cudaError_t mega_vit_neuralgrok(
     FusedOptState st;
     st.exp_avg = m;
     st.exp_avg_sq = v;
-    (void)extra;  // adamw/lion/neuralgrok need no 'extra' n-slice
+    // #5: bind the psi-net weights from the packed `extra` buffer (layout in
+    // opt_components.cuh: W1|b1|W2|b2). Without this the psi pointers stay null
+    // and neuralgrok_psi_forward null-derefs on this real path.
+    if (extra) {
+        st.psi_W1 = extra + kPsiW1Off;
+        st.psi_b1 = extra + kPsiB1Off;
+        st.psi_W2 = extra + kPsiW2Off;
+        // st.psi_b2 stays 0.0f (device scalar at extra[kPsiB2Off]; a host scalar
+        // cannot dereference a device pointer — codegen stop, see report).
+    }
     st.lr = lr;
     return launch_fused_megakernel<ModelId::ViT, OptId::NeuralGrok,
                                    FuseTier::L3>(

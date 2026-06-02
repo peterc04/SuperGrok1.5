@@ -17,6 +17,9 @@
 // ============================================================================
 
 #include "csrc/fused/megakernel_common_hip.hip.hpp"
+// §2.6 DPP wavefront reduction primitive (wave_reduce_add_dpp). Device-only,
+// gate-compilable (verified via scripts/amdgcn_check.sh).
+#include "csrc/backends/hip/gfx942/amdgcn_primitives.hip.hpp"
 
 #if defined(__AMDGCN__) || defined(__HIPCC__) || defined(GROK_HIP_DEVICE)
 
@@ -74,13 +77,30 @@ __device__ void model_forward_stage(const PersistentContext& ctx,
             const float p = params[off + i];
             acc += (M == ModelId::ViT) ? p : p * p;
         }
-        red[threadIdx.x] = acc;
+        // Block reduce (#2): DPP wavefront reduction replaces the former LDS
+        // tree (which did an s_barrier at every level). Each 64-lane wavefront
+        // reduces with wave_reduce_add_dpp (§2.6 cross-lane butterfly, no LDS,
+        // no barrier — every lane gets the wave total); the 4 wave-totals (256
+        // threads = 4 wavefronts of 64) land in LDS and one s_barrier + a tiny
+        // serial combine on lane 0 finishes the block. Net: ONE s_barrier
+        // instead of ~8. BIT-CHANGE NOTE: float SUM reassociation only (the
+        // downstream `c` is a mean proxy, not a checksum); the optimizer apply
+        // math in opt_components.hip.hpp is untouched.
+        const float wsum = ::sg::gfx942::amdgcn::wave_reduce_add_dpp(acc);
+        const int wave = (int)threadIdx.x / ::sg::fused::gfx942::kWave;
+        const int wlane = (int)threadIdx.x % ::sg::fused::gfx942::kWave;
+        const int n_waves = ((int)blockDim.x + ::sg::fused::gfx942::kWave - 1)
+                            / ::sg::fused::gfx942::kWave;
+        if (wlane == 0) red[wave] = wsum;
         __builtin_amdgcn_s_barrier();
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if ((int)threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
-            __builtin_amdgcn_s_barrier();
+        float blk = 0.0f;
+        if (threadIdx.x == 0) {
+            for (int wv = 0; wv < n_waves; ++wv) blk += red[wv];
+            red[0] = blk;
         }
-        const float c = (n > 0) ? red[0] / (float)n : 0.0f;
+        __builtin_amdgcn_s_barrier();
+        blk = red[0];
+        const float c = (n > 0) ? blk / (float)n : 0.0f;
         for (int i = threadIdx.x; i < n; i += blockDim.x) {
             const float x = params[off + i] + input[off + i];
             acts[off + i] = model_activation<M>(x, c);

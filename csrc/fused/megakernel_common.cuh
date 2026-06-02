@@ -169,10 +169,21 @@ struct GridBarrier {
                 atomicAdd(g_generation, 1u);
             } else {
                 // Not last: spin until the generation advances past our sample.
+                // §1.14b BACKOFF: a tight volatile-read spin hammers the L2 /
+                // memory subsystem with the generation poll and steals issue
+                // slots from arriving CTAs. __nanosleep parks the spinning warp
+                // for an exponentially-growing nap (capped) so the poll rate
+                // drops and the memory subsystem is left to the laggard CTAs.
+                // Behavior-preserving: still exits the instant the generation
+                // advances; only the *poll cadence* changes (sm_70+; on older
+                // arches the asm is a no-op fallback).
+                unsigned backoff = 32u;
                 while (*reinterpret_cast<volatile unsigned*>(g_generation)
                        == my_gen) {
-                    // busy-wait; volatile read defeats the spin from being
-                    // hoisted. No fence inside the loop (§1.14 — minimal).
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+                    __nanosleep(backoff);
+                    backoff = (backoff < 1024u) ? (backoff << 1) : 1024u;
+#endif
                 }
             }
 
@@ -182,6 +193,50 @@ struct GridBarrier {
         }
 
         // Release the rest of the block once the leader has crossed.
+        __syncthreads();
+    }
+
+    // #4 — barrier with a FUSED task-counter reset. The L3 phase loop used to do
+    //   fwd → sync → reset_counter → sync → bwd → sync → reset_counter → sync
+    // (4 grid barriers + 2 standalone in-kernel counter resets). The reset is
+    // folded into THIS barrier's last-arriver critical section: the last CTA
+    // zeroes `*reset_counter` BEFORE the release-store that advances the
+    // generation, so any CTA that later observes the new generation (and thus
+    // crosses) is guaranteed to see the counter == 0 for the next phase. That
+    // removes the two standalone resets AND their two barriers — 4 → 2 grid
+    // barriers per L3 step — with identical phase ordering/visibility. Pass the
+    // task-queue counter (ctx.g_next_task) as `reset_counter`.
+    __device__ __forceinline__ void sync_reset(int* reset_counter) const {
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            unsigned my_gen =
+                *reinterpret_cast<volatile unsigned*>(g_generation);
+            __threadfence();   // §1.14 RELEASE: publish phase writes before arrival.
+            unsigned prev = atomicAdd(g_arrived, 1u);
+            if (prev + 1u == n_ctas) {
+                // Last arriver: clear arrival count AND reset the task counter
+                // for the next phase, then a release-store of the advanced
+                // generation. Ordering: both resets, then __threadfence(), then
+                // the generation bump — so observers of the new gen see both
+                // arrived==0 and reset_counter==0.
+                atomicExch(g_arrived, 0u);
+                atomicExch(reinterpret_cast<unsigned*>(reset_counter), 0u);
+                __threadfence();
+                atomicAdd(g_generation, 1u);
+            } else {
+                unsigned backoff = 32u;
+                while (*reinterpret_cast<volatile unsigned*>(g_generation)
+                       == my_gen) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
+                    __nanosleep(backoff);
+                    backoff = (backoff < 1024u) ? (backoff << 1) : 1024u;
+#endif
+                }
+            }
+            __threadfence();   // §1.14 ACQUIRE.
+        }
+
         __syncthreads();
     }
 };
