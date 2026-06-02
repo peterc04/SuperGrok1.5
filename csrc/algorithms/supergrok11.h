@@ -59,7 +59,7 @@ __device__ __forceinline__ void sg11_sweep_a_step(
     const float* __restrict__ sharpness,
     const float* __restrict__ momentum,
     const float mu_val,
-    const int idx,
+    const int64_t idx,
     float& gate_num_local,
     float& gate_den_g_local,
     float& gate_den_m_local
@@ -89,7 +89,7 @@ __device__ __forceinline__ void sg11_sweep_b_step(
     const float wd,
     const float bc1,
     const float bc2,
-    const int idx
+    const int64_t idx
 ) {
     const float g  = static_cast<float>(grad[idx]);
     const float p  = static_cast<float>(param[idx]);
@@ -132,7 +132,7 @@ __device__ __forceinline__ void sg11_adam_tail(
     const float wd,
     const float bc1,
     const float bc2,
-    const int idx
+    const int64_t idx
 ) {
     const float p = static_cast<float>(param[idx]);
     const float m = beta1 * exp_avg[idx]    + (1.0f - beta1) * g_eff;

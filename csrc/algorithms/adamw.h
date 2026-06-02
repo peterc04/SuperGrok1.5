@@ -39,7 +39,7 @@ __device__ __forceinline__ void adamw_step(
     const float wd,
     const float bc1,   // 1 - beta1^t (un-inverted; header divides by it)
     const float bc2,   // 1 - beta2^t (un-inverted; header divides by it)
-    const int idx
+    const int64_t idx
 ) {
     const float g  = static_cast<float>(grad[idx]);
     const float p  = static_cast<float>(param[idx]);
@@ -74,7 +74,7 @@ __device__ __forceinline__ void adamw_step_vec4(
     const float wd,
     const float bc1,
     const float bc2,
-    const int i
+    const int64_t i
 ) {
     float4 p  = param4[i];
     float4 m0 = exp_avg4[i];

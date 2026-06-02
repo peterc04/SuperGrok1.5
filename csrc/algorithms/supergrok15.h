@@ -55,7 +55,7 @@ __device__ __forceinline__ void sg15_sweep_a_step(
     float* __restrict__ mu_out,
     const GradT* __restrict__ grad,
     const float mu_val,
-    const int idx,
+    const int64_t idx,
     float& sharp_local
 ) {
     mu_out[idx] = mu_val;
@@ -90,7 +90,7 @@ __device__ __forceinline__ void sg15_sweep_b_step(
     const float wd,
     const float bc1,
     const float bc2,
-    const int idx
+    const int64_t idx
 ) {
     const float g = static_cast<float>(grad[idx]);
     const float p = static_cast<float>(param[idx]);

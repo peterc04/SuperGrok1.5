@@ -39,7 +39,7 @@ __device__ __forceinline__ void grokadamw_step(
     const float wd,
     const float bc1,
     const float bc2,
-    const int idx
+    const int64_t idx
 ) {
     const float g = static_cast<float>(grad[idx]);
     const float p = static_cast<float>(param[idx]);

@@ -120,8 +120,8 @@ __device__ __forceinline__ void sg2_input_proj_sort(
     int* __restrict__ sort_indices,
     const float* __restrict__ proj_W,
     const float* __restrict__ proj_b,
-    const int idx,
-    const int N,
+    const int64_t idx,
+    const int64_t N,
     const int d_model
 ) {
     if (idx >= N) return;
@@ -163,7 +163,7 @@ __device__ __forceinline__ float sg2_csa_compress_kv(
     const float*  __restrict__ compress_w,   // [csa_window] learned pooling logits
     const int j,                             // compressed-entry index (0..Nc-1)
     const int d,                             // feature channel (0..d_model-1)
-    const int N,
+    const int64_t N,
     const int d_model,
     const int csa_compress,                  // stride m
     const int csa_window                     // pool width W
@@ -317,7 +317,7 @@ __device__ __forceinline__ float sg2_hca_compress_kv(
     const float*  __restrict__ hca_w,    // [hca_compress] weights, or nullptr (mean)
     const int j,                         // compressed-entry index (0..Nh-1)
     const int d,                         // feature channel (0..d_model-1)
-    const int N,
+    const int64_t N,
     const int d_model,
     const int hca_compress               // pooling stride/window M
 ) {
@@ -379,7 +379,7 @@ __device__ __forceinline__ void sg2_apply_step(
     const float wd,
     const float bc1,
     const float bc2,
-    const int idx
+    const int64_t idx
 ) {
     const float g = static_cast<float>(grad[idx]);
     const float p = static_cast<float>(param[idx]);
@@ -503,7 +503,7 @@ __device__ __forceinline__ void moe_adam_step(
     const float wd,
     const float bc1,
     const float bc2,
-    const int idx
+    const int64_t idx
 ) {
     adamw_step(param, exp_avg, exp_avg_sq, grad,
                lr, beta1, beta2, eps, wd, bc1, bc2, idx);

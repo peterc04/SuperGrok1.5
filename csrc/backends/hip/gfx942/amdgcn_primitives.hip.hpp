@@ -46,6 +46,31 @@ namespace sg { namespace gfx942 { namespace amdgcn {
 static constexpr int kWave = 64;
 
 // ─────────────────────────────────────────────────────────────────────────
+//  64-bit grid-stride helpers (mirror of the sm_90 primitives.cuh contract).
+//
+//  The canonical per-element step functions in csrc/algorithms/<opt>.h take
+//  `const int64_t idx`; the gfx942 device kernels that adopt the contract drive
+//  them with these. blockIdx.x * blockDim.x is formed in 64-bit (cast BEFORE the
+//  multiply) so a launch covering >2^31 elements cannot overflow the 32-bit
+//  product. Wavefront width on CDNA3 is 64 (kWave), but the flat 1-D global
+//  index is identical to the CUDA form.
+//
+//  Guarded on __HIPCC__: the built-in launch dims (blockIdx/blockDim/gridDim)
+//  exist under real hipcc. The free-standing amdgcn compile gate
+//  (scripts/amdgcn_check.sh) does NOT model those built-ins, so the helpers are
+//  omitted there (it only type-checks the intrinsic wrappers, not launch glue).
+// ─────────────────────────────────────────────────────────────────────────
+#if defined(__HIPCC__)
+__device__ __forceinline__ int64_t grid_stride_index() {
+    return static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+}
+
+__device__ __forceinline__ int64_t grid_stride() {
+    return static_cast<int64_t>(gridDim.x) * blockDim.x;
+}
+#endif
+
+// ─────────────────────────────────────────────────────────────────────────
 // Occupancy attributes (WS5 — wire the dead `waves_per_eu` metadata into a
 // REAL codegen attribute). `amdgpu_flat_work_group_size(lo,hi)` bounds the
 // flat (1-D) block size the compiler must support, and `amdgpu_waves_per_eu(N)`

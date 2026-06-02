@@ -31,7 +31,7 @@ __device__ __forceinline__ void prodigy_partials_step(
     const ParamT* __restrict__ param_init,
     const GradT* __restrict__ grad,
     const float d_prev,
-    const int idx,
+    const int64_t idx,
     float& r_local,
     float& s_local
 ) {
@@ -70,7 +70,7 @@ __device__ __forceinline__ void prodigy_apply_step(
     const float wd,
     const float bc1,
     const float bc2,
-    const int idx
+    const int64_t idx
 ) {
     const float g = static_cast<float>(grad[idx]);
     const float p = static_cast<float>(param[idx]);

@@ -30,7 +30,7 @@ __device__ __forceinline__ void looksam_perturb_step(
     ParamT* __restrict__ backup,
     const GradT* __restrict__ grad,
     const float scale,        // rho / (||g|| + eps), precomputed
-    const int idx
+    const int64_t idx
 ) {
     const ParamT p = param[idx];
     backup[idx] = p;
@@ -42,7 +42,7 @@ template <typename ParamT>
 __device__ __forceinline__ void looksam_restore_step(
     ParamT* __restrict__ param,
     const ParamT* __restrict__ backup,
-    const int idx
+    const int64_t idx
 ) {
     param[idx] = backup[idx];
 }
@@ -53,7 +53,7 @@ __device__ __forceinline__ void looksam_set_direction(
     float* __restrict__ sam_dir,
     const GradT* __restrict__ grad_sam,
     const GradT* __restrict__ grad_orig,
-    const int idx
+    const int64_t idx
 ) {
     sam_dir[idx] = static_cast<float>(grad_sam[idx]) - static_cast<float>(grad_orig[idx]);
 }
@@ -74,7 +74,7 @@ __device__ __forceinline__ void looksam_apply_step(
     const float wd,
     const float bc1,
     const float bc2,
-    const int idx
+    const int64_t idx
 ) {
     const float g = static_cast<float>(grad[idx]);
     const float p = static_cast<float>(param[idx]);

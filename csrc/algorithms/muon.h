@@ -35,7 +35,7 @@ __device__ __forceinline__ void muon_momentum_normalize_step(
     const GradT* __restrict__ grad,
     const float momentum,
     const float inv_norm,
-    const int idx
+    const int64_t idx
 ) {
     const float g = static_cast<float>(grad[idx]);
     const float b = momentum * buf[idx] + g;
@@ -52,7 +52,7 @@ __device__ __forceinline__ void muon_ns_combine_step(
     const float a,
     const float b,
     const float c,
-    const int idx
+    const int64_t idx
 ) {
     Y[idx] = a * X[idx] + b * AX[idx] + c * AAX[idx];
 }
@@ -64,7 +64,7 @@ __device__ __forceinline__ void muon_update_step(
     const float* __restrict__ orth,
     const float neg_lr_scale,
     const float decay_factor,
-    const int idx
+    const int64_t idx
 ) {
     const float p = static_cast<float>(param[idx]);
     param[idx] = static_cast<ParamT>(p * decay_factor + neg_lr_scale * orth[idx]);

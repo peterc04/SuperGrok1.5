@@ -62,7 +62,7 @@ __device__ __forceinline__ void neuralgrok_apply_step(
     const float wd,
     const float bc1,
     const float bc2,
-    const int idx
+    const int64_t idx
 ) {
     const float g = static_cast<float>(grad[idx]);
     const float p = static_cast<float>(param[idx]);
@@ -104,7 +104,7 @@ __device__ __forceinline__ void neuralgrok_adam_tail(
     const float wd,
     const float bc1,
     const float bc2,
-    const int idx
+    const int64_t idx
 ) {
     const float p = static_cast<float>(param[idx]);
     const float m = beta1 * exp_avg[idx]    + (1.0f - beta1) * g_eff;

@@ -29,7 +29,7 @@ __device__ __forceinline__ void grokfast_ema_step(
     const GradT* __restrict__ grad_in,
     const float alpha,
     const float lamb,
-    const int idx
+    const int64_t idx
 ) {
     const float g = static_cast<float>(grad_in[idx]);
     const float e = alpha * ema[idx] + (1.0f - alpha) * g;
@@ -55,7 +55,7 @@ __device__ __forceinline__ void grokfast_fused_step(
     const float wd,
     const float bc1,
     const float bc2,
-    const int idx
+    const int64_t idx
 ) {
     const float g = static_cast<float>(grad[idx]);
     const float p = static_cast<float>(param[idx]);
