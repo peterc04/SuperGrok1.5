@@ -118,9 +118,7 @@ DECLARE_MT_GROKADAMW(gfx942)
  do { \
  const int a = sg::detect_arch(); \
  switch (a) { \
-
  case 90: return sg::sm90::METHOD(__VA_ARGS__); \
-
  case 942: return sg::gfx942::METHOD(__VA_ARGS__); \
  default: \
  throw std::runtime_error( \
@@ -199,16 +197,39 @@ void grokadamw_fused_step(
  clip_grad_norms_device_side(grads, n_params, grad_clip_norm);
  if (n_params == 0) return;
 
- std::vector<torch::Tensor> vp, vg, vea, veas, vema;
- std::vector<float> bc1_vec, bc2_vec;
- for (size_t i = 0; i < n_params; i++) {
- if (!grads[i].defined() || grads[i].numel() == 0) continue;
  // NOTE: the Python optimizer owns the step counter (state["step"] += 1
  // before this call), matching fused_adamw_simple_step and
  // grokfast_fused_ema_adam_step. Do NOT increment here — `steps` is a
  // pybind-copied vector so an increment would not persist back to Python
  // anyway, and incrementing made bias correction permanently off-by-one
  // (bc computed with step+1).
+
+ // Common case: every param has a grad. Then the per-tensor lists are just
+ // the inputs verbatim, so we skip rebuilding the 5 parallel filtered tensor
+ // vectors (vp/vg/vea/veas/vema) and pass the originals straight through. The
+ // bias-correction scalars are intrinsically per-param and still computed.
+ bool all_present = true;
+ for (size_t i = 0; i < n_params; i++) {
+ if (!grads[i].defined() || grads[i].numel() == 0) { all_present = false; break; }
+ }
+
+ if (all_present) {
+ std::vector<float> bc1_vec, bc2_vec;
+ bc1_vec.reserve(n_params); bc2_vec.reserve(n_params);
+ for (size_t i = 0; i < n_params; i++) {
+ bc1_vec.push_back(1.0f - std::pow(beta1, static_cast<float>(steps[i])));
+ bc2_vec.push_back(1.0f - std::pow(beta2, static_cast<float>(steps[i])));
+ }
+ DISPATCH_GROKADAMW(launch_multi_tensor_grokadamw,
+ params, exp_avgs, exp_avg_sqs, emas, grads, bc1_vec, bc2_vec,
+ alpha, lamb_grok, beta1, beta2, lr, wd, eps);
+ }
+
+ // Sparse-grad fallback: build the filtered parallel vectors.
+ std::vector<torch::Tensor> vp, vg, vea, veas, vema;
+ std::vector<float> bc1_vec, bc2_vec;
+ for (size_t i = 0; i < n_params; i++) {
+ if (!grads[i].defined() || grads[i].numel() == 0) continue;
  float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
  float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
  vp.push_back(params[i]); vg.push_back(grads[i]);
@@ -470,8 +491,16 @@ std::vector<torch::Tensor> looksam_perturb_all(
  std::vector<torch::Tensor> backups;
  backups.reserve(params.size());
  for (size_t i = 0; i < params.size(); i++) {
+ // Params without a grad are never perturbed below, so cloning them is
+ // wasted work. Skip the clone and store the param itself as the backup:
+ // since the param is left untouched, the later restore (copy backup→param)
+ // is a value-preserving self-copy no-op — behavior is identical, minus the
+ // clone/alloc. Backups stays index-aligned with params for restore.
+ if (!grads[i].defined() || grads[i].numel() == 0) {
+ backups.push_back(params[i]);
+ continue;
+ }
  backups.push_back(params[i].clone());
- if (!grads[i].defined() || grads[i].numel() == 0) continue;
  SG_DISPATCH_CALL(launch_looksam_perturb,
  params[i], backups[i], grads[i], rho_over_norm);
  }
@@ -754,11 +783,6 @@ namespace sg {
  float beta1, float beta2, \
  float lr, float weight_decay, \
  float eps, float bc1, float bc2); \
- void launch_multi_tensor_lion( \
- std::vector<torch::Tensor> params, \
- std::vector<torch::Tensor> exp_avgs, \
- std::vector<torch::Tensor> grads, \
- float lr, float beta1, float beta2, float weight_decay); \
  }
 
  DECLARE_MT(sm90) DECLARE_MT(gfx942)
@@ -914,15 +938,23 @@ void muon_fused_step(
  float neg_lr_scale = -lr * scale_factor;
  float decay_factor = 1.0f - lr * wd;
 
+ // Double-buffer the NS combine output: allocate one scratch of X's shape
+ // up front and ping-pong into it across iterations, instead of a fresh
+ // torch::empty_like(X) every intermediate step. The combine launcher reads
+ // X and writes a distinct buffer, so two buffers suffice; we swap handles
+ // (no copies). Math is unchanged.
+ torch::Tensor scratch; // lazily allocated on first combine step
  for (int step = 0; step < ns_steps; step++) {
  auto A = torch::mm(X, X.t());
  auto AX = torch::mm(A, X);
  auto AAX = torch::mm(A, AX);
  if (step < ns_steps - 1) {
- auto X_new = torch::empty_like(X);
+ if (!scratch.defined()) scratch = torch::empty_like(X);
  SG_DISPATCH_CALL(launch_muon_ns_combine,
- X_new, X, AX, AAX, NS_A, NS_B, NS_C);
- X = X_new;
+ scratch, X, AX, AAX, NS_A, NS_B, NS_C);
+ // Ping-pong: the just-read X becomes the next iteration's scratch,
+ // the freshly-written buffer becomes X.
+ std::swap(X, scratch);
  } else {
  SG_DISPATCH_CALL(launch_muon_ns_combine_update_fused,
  p, X, AX, AAX, NS_A, NS_B, NS_C,
@@ -1270,8 +1302,14 @@ std::vector<torch::Tensor> supergrok11_sam_perturb_all(
  std::vector<torch::Tensor> backups;
  backups.reserve(params.size());
  for (size_t i = 0; i < params.size(); i++) {
+ // Grad-less params are not perturbed; skip the clone and alias the param
+ // as its own backup. The restore for these entries (params[i].copy_(
+ // backups[i])) is then a self-copy no-op — identical behavior, no clone.
+ if (!grads[i].defined() || grads[i].numel() == 0) {
+ backups.push_back(params[i]);
+ continue;
+ }
  backups.push_back(params[i].clone());
- if (!grads[i].defined() || grads[i].numel() == 0) continue;
  SG_DISPATCH_CALL(launch_sg11_sam_perturb,
  params[i], grads[i], rho_over_norm);
  }
@@ -1397,8 +1435,14 @@ std::vector<torch::Tensor> supergrok15_sam_perturb_all(
  std::vector<torch::Tensor> backups;
  backups.reserve(params.size());
  for (size_t i = 0; i < params.size(); i++) {
+ // Grad-less params are not perturbed; skip the clone and alias the param
+ // as its own backup. The restore for these entries (params[i].copy_(
+ // backups[i])) is then a self-copy no-op — identical behavior, no clone.
+ if (!grads[i].defined() || grads[i].numel() == 0) {
+ backups.push_back(params[i]);
+ continue;
+ }
  backups.push_back(params[i].clone());
- if (!grads[i].defined() || grads[i].numel() == 0) continue;
  SG_DISPATCH_CALL(launch_sam_perturb, params[i], grads[i], rho_over_norm);
  }
  return backups;
