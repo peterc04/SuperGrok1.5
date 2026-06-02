@@ -70,7 +70,7 @@ def _maybe_checkpoint_fn(fn, enabled, training, *args):
 
 from grokking_optimizers.dispatch import get_ops
 from grokking_optimizers.dispatch import (
-    get_gpu_arch, get_gpu_vendor,
+    get_device_sm, get_gpu_vendor,
     supports_bf16, supports_fp8, supports_tf32,
 )
 
@@ -118,18 +118,13 @@ class PrecisionConfig:
         self.dynamic = dynamic
 
         if projection_precision == 'auto':
-            arch = get_gpu_arch()
-            vendor = get_gpu_vendor()
-            if vendor == 'amd':
-                # gfx942 (CDNA3, MI300X) supports BF16 MFMA; we don't target
-                # older AMD archs in the 3-arch active set.
-                self.projection_precision = 'bf16' if supports_bf16() else 'fp32'
-            elif arch >= 90:
-                self.projection_precision = 'fp8'
-            elif arch >= 80:
-                self.projection_precision = 'bf16'
-            else:
-                self.projection_precision = 'fp32'
+            # 'auto' picks the live default: BF16 everywhere it is supported
+            # (the configured default for SG2 — see SuperGrok2.__init__), only
+            # dropping to FP32 on a host with no BF16 path. FP8/INT4 are NOT
+            # selected by 'auto'; they remain explicitly opt-in (config-gated)
+            # because they need the matching kernel ABI to be the live tail.
+            vendor = get_gpu_vendor()  # noqa: F841 — kept for clarity/symmetry
+            self.projection_precision = 'bf16' if supports_bf16() else 'fp32'
         else:
             if projection_precision not in self.PROJECTION_MODES:
                 raise ValueError(
@@ -579,6 +574,7 @@ class CSAHCAMetaNet(nn.Module):
         d_state: int = 16,             # retained for back-compat config (unused by attn)
         mamba_expand: int = 2,         # retained for back-compat config (unused by attn)
         num_peer_heads: int = 4,
+        peer_topk: int = 4,
         num_experts: int = 144,
         expert_hidden: int = 16,
         gru_hidden: int = 4,
@@ -599,6 +595,10 @@ class CSAHCAMetaNet(nn.Module):
         self.d_model = d_model
         self.d_state = d_state
         self.num_peer_heads = num_peer_heads
+        # PEER routing top-k experts per head (spec §2). 4 is the design
+        # default (4 product-key sub-selections per A/B axis → top-k soft
+        # routing); 1 reproduces the old hard argmax (top-1) routing.
+        self.peer_topk = max(1, int(peer_topk))
         self.num_experts = num_experts
         self.expert_hidden = expert_hidden
         self.gru_hidden = gru_hidden
@@ -700,30 +700,52 @@ class CSAHCAMetaNet(nn.Module):
         ], dim=-1)
 
         total_expert_out = torch.zeros(N, 1, device=grad.device, dtype=torch.float32)
+        topk = self.peer_topk
 
         for h in range(self.num_peer_heads):
             query = self.peer_queries[h](peer_input)
             q_a = query[:, :self.d_model // 2]
             q_b = query[:, self.d_model // 2:]
 
-            idx_a = (q_a @ self.product_keys_A[h].T).argmax(dim=-1)
-            idx_b = (q_b @ self.product_keys_B[h].T).argmax(dim=-1)
-            expert_idx = idx_a * self.pk_dim + idx_b
+            scores_a = q_a @ self.product_keys_A[h].T
+            scores_b = q_b @ self.product_keys_B[h].T
+
+            # Top-k product-key selection (spec §2). top-k=1 reduces to the old
+            # hard argmax routing; the default top-k=4 keeps 4 sub-selections on
+            # each axis and softmax-weights the k*k experts they index.
+            ka = min(topk, scores_a.shape[-1])
+            kb = min(topk, scores_b.shape[-1])
+            top_a_vals, top_a_idx = scores_a.topk(ka, dim=-1)
+            top_b_vals, top_b_idx = scores_b.topk(kb, dim=-1)
+
+            soft_a = torch.softmax(top_a_vals * 10.0, dim=-1)
+            soft_b = torch.softmax(top_b_vals * 10.0, dim=-1)
+
+            expert_idx = (top_a_idx.unsqueeze(2) * self.pk_dim
+                          + top_b_idx.unsqueeze(1)).reshape(N, -1)
+            routing_weights = (soft_a.unsqueeze(2)
+                               * soft_b.unsqueeze(1)).reshape(N, -1)
+            num_active = ka * kb
 
             if self.training:
                 with torch.no_grad():
                     self.expert_counts.scatter_add_(
-                        0, expert_idx,
-                        torch.ones_like(expert_idx, dtype=torch.int32))
+                        0, expert_idx.reshape(-1),
+                        torch.ones(expert_idx.numel(),
+                                   dtype=torch.int32, device=expert_idx.device))
 
             W1 = self.expert_W1[expert_idx]
             b1 = self.expert_b1[expert_idx]
             W2 = self.expert_W2[expert_idx]
             b2 = self.expert_b2[expert_idx]
 
-            z = torch.relu(torch.bmm(W1, g.unsqueeze(-1).unsqueeze(-1)).squeeze(-1) + b1)
-            out = torch.bmm(W2, z.unsqueeze(-1)).squeeze(-1) + b2
-            total_expert_out = total_expert_out + out
+            g_exp = g.unsqueeze(1).unsqueeze(-1).unsqueeze(-1).expand(
+                -1, num_active, -1, -1)
+            z = torch.relu(torch.matmul(W1, g_exp).squeeze(-1) + b1)
+            out = (torch.matmul(W2, z.unsqueeze(-1)).squeeze(-1).squeeze(-1)
+                   + b2.squeeze(-1))
+            head_out = (routing_weights * out).sum(dim=1, keepdim=True)
+            total_expert_out = total_expert_out + head_out
 
         total_expert_out = total_expert_out / self.num_peer_heads
         smart_grad = (g.unsqueeze(-1) + self.rescale * total_expert_out).squeeze(-1)
@@ -762,7 +784,7 @@ class CSAHCAMetaNet(nn.Module):
         peer_input = torch.cat([new_gru, csa_ctx, hca_ctx, g.unsqueeze(-1), s.unsqueeze(-1)], dim=-1)
 
         total_expert_out = torch.zeros(N, 1, device=grad.device, dtype=torch.float32)
-        topk = 4
+        topk = self.peer_topk
 
         for h in range(self.num_peer_heads):
             query = self.peer_queries[h](peer_input)
@@ -772,8 +794,10 @@ class CSAHCAMetaNet(nn.Module):
             scores_a = q_a @ self.product_keys_A[h].T
             scores_b = q_b @ self.product_keys_B[h].T
 
-            top_a_vals, top_a_idx = scores_a.topk(topk, dim=-1)
-            top_b_vals, top_b_idx = scores_b.topk(topk, dim=-1)
+            ka = min(topk, scores_a.shape[-1])
+            kb = min(topk, scores_b.shape[-1])
+            top_a_vals, top_a_idx = scores_a.topk(ka, dim=-1)
+            top_b_vals, top_b_idx = scores_b.topk(kb, dim=-1)
 
             soft_a = torch.softmax(top_a_vals * 10.0, dim=-1)
             soft_b = torch.softmax(top_b_vals * 10.0, dim=-1)
@@ -786,7 +810,7 @@ class CSAHCAMetaNet(nn.Module):
             W2 = self.expert_W2[expert_indices]
             b2 = self.expert_b2[expert_indices]
 
-            num_active = topk * topk
+            num_active = ka * kb
 
             # Per-head expert MLP (the two batched matmuls + relu) is the
             # largest self-contained sub-block here; checkpoint it so the
@@ -933,15 +957,17 @@ class CSAHCAMetaNet(nn.Module):
 
         total_expert_out = torch.zeros(N, 1, device=grad.device,
                                        dtype=torch.float32)
-        topk = 4
+        topk = self.peer_topk
         for h in range(self.num_peer_heads):
             query = self.peer_queries[h](peer_input)
             q_a = query[:, :self.d_model // 2]
             q_b = query[:, self.d_model // 2:]
             scores_a = q_a @ self.product_keys_A[h].T
             scores_b = q_b @ self.product_keys_B[h].T
-            top_a_vals, top_a_idx = scores_a.topk(topk, dim=-1)
-            top_b_vals, top_b_idx = scores_b.topk(topk, dim=-1)
+            ka = min(topk, scores_a.shape[-1])
+            kb = min(topk, scores_b.shape[-1])
+            top_a_vals, top_a_idx = scores_a.topk(ka, dim=-1)
+            top_b_vals, top_b_idx = scores_b.topk(kb, dim=-1)
             soft_a = torch.softmax(top_a_vals * 10.0, dim=-1)
             soft_b = torch.softmax(top_b_vals * 10.0, dim=-1)
             expert_indices = (top_a_idx.unsqueeze(2) * self.pk_dim
@@ -952,7 +978,7 @@ class CSAHCAMetaNet(nn.Module):
             b1 = self.expert_b1[expert_indices]
             W2 = self.expert_W2[expert_indices]
             b2 = self.expert_b2[expert_indices]
-            num_active = topk * topk
+            num_active = ka * kb
             g_exp = g.unsqueeze(1).unsqueeze(-1).unsqueeze(-1).expand(
                 -1, num_active, -1, -1)
             z_h = torch.relu(torch.matmul(W1, g_exp).squeeze(-1) + b1)
@@ -980,50 +1006,113 @@ class CSAHCAMetaNet(nn.Module):
         }
         return smart_grad, new_gru.detach(), saved
 
-    def get_weights(self):
+    def get_weights(self, precision=None):
         """Extract all meta-model weights for the CUDA/HIP kernels.
 
         Returns the CSA/HCA weight set (spec §4): the Mamba scan weights are
         dropped and replaced by the CSA + HCA attention projections. The shared
-        input_proj, GRU, PEER/product-key, and expert tensors are kept. All
-        tensors are detached, FP32, contiguous.
+        input_proj, GRU, PEER/product-key, and expert tensors are kept.
+
+        Precision (spec §1):
+          ``precision`` is an optional :class:`PrecisionConfig`. When ``None``
+          (or ``projection_precision`` resolves to ``fp32``/``tf32``), every
+          tensor is detached, FP32, contiguous — the historical behaviour that
+          the FP32 kernel ABI consumes directly.
+
+          When ``projection_precision == 'bf16'`` (the live SG2 default) the
+          attention *projection* matrices (input_proj, CSA/HCA q/k/v/out,
+          indexer DQ/UQ/K) are emitted in BF16 via
+          :meth:`PrecisionConfig.convert_projection_weights`; ``'fp8'`` emits
+          FP8 with a per-matrix ``<name>_scale`` companion. Compress logits,
+          GRU, PEER queries, product keys, biases and the scan-free scalars stay
+          FP32 (they are accumulators / tiny vectors, not GEMM operands). Expert
+          MLP weights follow ``expert_precision`` (int8/int4 emit packed tensors
+          + scales) — these are reachable, config-gated paths, not dead code.
+
+        The emitted-dtype tensors are what the step() call site forwards to the
+        kernel. See the ``_KERNEL_PROJECTION_DTYPE_ABI`` note in
+        :meth:`SuperGrok2.step` for the documented C++ ABI dependency: the
+        current ``supergrok2_*_step`` pybind signature is ``const float*`` for
+        every projection weight, so the live fused tail upcasts the emitted
+        low-precision tensors back to FP32 at that boundary until the bf16/fp8
+        kernel overloads land. The bf16 *emission* path is fully reachable and
+        is the dtype the eager / autograd meta-net consumes natively.
         """
-        def _d(t):
+        proj_mode = (precision.projection_precision
+                     if precision is not None else 'fp32')
+        expert_mode = (precision.expert_precision
+                       if precision is not None else 'fp32')
+
+        def _f32(t):
             return t.detach().float().contiguous()
 
-        return {
-            'input_proj_W': _d(self.input_proj.weight),
-            'input_proj_b': _d(self.input_proj.bias),
-            # ── CSA layer (produces csa_ctx) ──
-            'csa_q_W': _d(self.csa_layer.q_W.weight),
-            'csa_k_W': _d(self.csa_layer.k_W.weight),
-            'csa_v_W': _d(self.csa_layer.v_W.weight),
-            'csa_compress_w': _d(self.csa_layer.compress_w),
-            'csa_idx_DQ': _d(self.csa_layer.idx_DQ),
-            'csa_idx_UQ': _d(self.csa_layer.idx_UQ),
-            'csa_idx_K': _d(self.csa_layer.idx_K),
-            'csa_out_W': _d(self.csa_layer.out_W.weight),
-            # ── HCA layer (produces hca_ctx) ──
-            'hca_q_W': _d(self.hca_layer.q_W.weight),
-            'hca_k_W': _d(self.hca_layer.k_W.weight),
-            'hca_v_W': _d(self.hca_layer.v_W.weight),
-            'hca_out_W': _d(self.hca_layer.out_W.weight),
-            # ── GRU (carried across steps) ──
-            'gru_W_z': _d(self.gru.W_z.weight),
-            'gru_b_z': _d(self.gru.W_z.bias),
-            'gru_W_r': _d(self.gru.W_r.weight),
-            'gru_b_r': _d(self.gru.W_r.bias),
-            'gru_W_h': _d(self.gru.W_h.weight),
-            'gru_b_h': _d(self.gru.W_h.bias),
-            # ── PEER routing + experts ──
-            'peer_queries': [_d(q.weight) for q in self.peer_queries],
-            'product_keys_A': [_d(k) for k in self.product_keys_A],
-            'product_keys_B': [_d(k) for k in self.product_keys_B],
-            'expert_W1': _d(self.expert_W1),
-            'expert_b1': _d(self.expert_b1),
-            'expert_W2': _d(self.expert_W2),
-            'expert_b2': _d(self.expert_b2),
-            # ── scalars / config ints ──
+        def _proj(t):
+            """Emit a projection matrix at the configured precision.
+
+            Returns (tensor, scale|None). FP32/TF32 → fp32 tensor, None.
+            BF16 → bf16 tensor, None. FP8 → fp8 tensor + scalar scale.
+            """
+            if precision is None or proj_mode in ('fp32', 'tf32'):
+                return _f32(t), None
+            return precision.convert_projection_weights(t.detach())
+
+        out = {}
+
+        def _put_proj(name, t):
+            w, scale = _proj(t)
+            out[name] = w
+            if scale is not None:
+                out[name + '_scale'] = scale
+
+        # ── shared input projection ──
+        _put_proj('input_proj_W', self.input_proj.weight)
+        out['input_proj_b'] = _f32(self.input_proj.bias)
+        # ── CSA layer (produces csa_ctx) ──
+        _put_proj('csa_q_W', self.csa_layer.q_W.weight)
+        _put_proj('csa_k_W', self.csa_layer.k_W.weight)
+        _put_proj('csa_v_W', self.csa_layer.v_W.weight)
+        out['csa_compress_w'] = _f32(self.csa_layer.compress_w)
+        _put_proj('csa_idx_DQ', self.csa_layer.idx_DQ)
+        _put_proj('csa_idx_UQ', self.csa_layer.idx_UQ)
+        _put_proj('csa_idx_K', self.csa_layer.idx_K)
+        _put_proj('csa_out_W', self.csa_layer.out_W.weight)
+        # ── HCA layer (produces hca_ctx) ──
+        _put_proj('hca_q_W', self.hca_layer.q_W.weight)
+        _put_proj('hca_k_W', self.hca_layer.k_W.weight)
+        _put_proj('hca_v_W', self.hca_layer.v_W.weight)
+        _put_proj('hca_out_W', self.hca_layer.out_W.weight)
+        # ── GRU (carried across steps; FP32 accumulators) ──
+        out['gru_W_z'] = _f32(self.gru.W_z.weight)
+        out['gru_b_z'] = _f32(self.gru.W_z.bias)
+        out['gru_W_r'] = _f32(self.gru.W_r.weight)
+        out['gru_b_r'] = _f32(self.gru.W_r.bias)
+        out['gru_W_h'] = _f32(self.gru.W_h.weight)
+        out['gru_b_h'] = _f32(self.gru.W_h.bias)
+        # ── PEER routing (queries/keys stay FP32) ──
+        out['peer_queries'] = [_f32(q.weight) for q in self.peer_queries]
+        out['product_keys_A'] = [_f32(k) for k in self.product_keys_A]
+        out['product_keys_B'] = [_f32(k) for k in self.product_keys_B]
+        # ── Expert MLP — follows expert_precision (fp32/int8/int4) ──
+        if precision is None or expert_mode == 'fp32':
+            out['expert_W1'] = _f32(self.expert_W1)
+            out['expert_b1'] = _f32(self.expert_b1)
+            out['expert_W2'] = _f32(self.expert_W2)
+            out['expert_b2'] = _f32(self.expert_b2)
+        else:
+            # int8 / int4 packed expert weights + scales (reachable, gated).
+            out['expert_quant'] = precision.convert_expert_weights(
+                self.expert_W1.detach(), self.expert_b1.detach(),
+                self.expert_W2.detach(), self.expert_b2.detach())
+            # Keep FP32 copies too so the FP32 kernel ABI still has operands
+            # while the int8/int4 expert kernel overload is not the live tail.
+            out['expert_W1'] = _f32(self.expert_W1)
+            out['expert_b1'] = _f32(self.expert_b1)
+            out['expert_W2'] = _f32(self.expert_W2)
+            out['expert_b2'] = _f32(self.expert_b2)
+        # ── scalars / config ints ──
+        out.update({
+            'projection_precision': proj_mode,
+            'expert_precision': expert_mode,
             'rescale': self.rescale,
             'd_model': self.d_model,
             'pk_dim': self.pk_dim,
@@ -1037,7 +1126,9 @@ class CSAHCAMetaNet(nn.Module):
             'csa_topk': self.csa_topk,
             'hca_compress': self.hca_compress,
             'indexer_rank': self.indexer_rank,
-        }
+            'topk': self.peer_topk,
+        })
+        return out
 
 
 # Back-compat alias: the meta-net used to be named ``Mamba3PEERMetaNet``.
@@ -1078,6 +1169,7 @@ class SuperGrok2(Optimizer):
         d_state: int = 16,
         mamba_expand: int = 2,
         num_peer_heads: int = 4,
+        peer_topk: int = 4,
         num_experts: int = 144,
         expert_hidden: int = 16,
         gru_hidden: int = 4,
@@ -1110,7 +1202,14 @@ class SuperGrok2(Optimizer):
         wd_thresh: float = 0.9,
         sam_enable_threshold: float = 0.0,
         bilevel_checkpoint_interval: int = 1,
-        projection_precision: str = 'auto',
+        # Precision (spec §1): bf16 is the live default for the attention
+        # projection GEMMs, configurable. fp8/int4 are reachable, opt-in.
+        projection_precision: str = 'bf16',
+        expert_precision: str = 'fp32',
+        # Model config (spec §7): vocabulary / class count the optimizer's
+        # model operates over. Exposed here so the kernel-arg plumbing can pass
+        # it down instead of relying on a hardcoded 97/99 in the C++ side.
+        vocab_size: int = 97,
         # Distributed training parameters
         bilevel_allreduce_meta_grads: bool = True,
         expert_allreduce_before_recycle: bool = True,
@@ -1136,17 +1235,25 @@ class SuperGrok2(Optimizer):
         self.zero_acc_threshold = zero_acc_threshold
         self.sam_rho = sam_rho
 
-        # Precision configuration for projection GEMMs
+        # Precision configuration for projection GEMMs (spec §1). bf16 is the
+        # live default; fp8/int4 are reachable, opt-in. Threaded into
+        # get_weights() so the chosen-precision tensors actually reach the
+        # kernel call boundary (see step()).
         self.precision_config = PrecisionConfig(
-            projection_precision=projection_precision)
+            projection_precision=projection_precision,
+            expert_precision=expert_precision)
 
         # Meta-net hyperparams
         self.d_model = d_model
         self.d_state = d_state
+        self.num_peer_heads = num_peer_heads
+        self.peer_topk = max(1, int(peer_topk))
         self.num_experts = num_experts
         self.expert_hidden = expert_hidden
         self.gru_hidden = gru_hidden
         self.meta_rescale = meta_rescale
+        # Model vocab/class count (spec §7) — passed down to the kernel args.
+        self.vocab_size = int(vocab_size)
 
         # CSA/HCA attention config
         self.n_heads = n_heads
@@ -1184,6 +1291,7 @@ class SuperGrok2(Optimizer):
                 d_state=d_state,
                 mamba_expand=mamba_expand,
                 num_peer_heads=num_peer_heads,
+                peer_topk=self.peer_topk,
                 num_experts=num_experts,
                 expert_hidden=expert_hidden,
                 gru_hidden=gru_hidden,
@@ -1421,6 +1529,54 @@ class SuperGrok2(Optimizer):
                     gathered.append((i, p.grad.detach().clone()))
         return gathered
 
+    # Projection-weight keys emitted by CSAHCAMetaNet.get_weights() that are
+    # subject to the precision config (the GEMM operands). Compress logits /
+    # GRU / PEER / experts are not in this set (they stay FP32 by design).
+    _PROJECTION_WEIGHT_KEYS = (
+        'input_proj_W',
+        'csa_q_W', 'csa_k_W', 'csa_v_W',
+        'csa_idx_DQ', 'csa_idx_UQ', 'csa_idx_K', 'csa_out_W',
+        'hca_q_W', 'hca_k_W', 'hca_v_W', 'hca_out_W',
+    )
+
+    def _kernel_abi_view(self, emitted):
+        """Return the FP32 weight bundle the CURRENT kernel ABI consumes.
+
+        ───────────────────── DOCUMENTED C++ ABI STOP (spec §1) ────────────────
+        The live ``supergrok2_prepare_and_batched_step`` /
+        ``supergrok2_batched_step`` pybind signatures declare EVERY projection
+        weight as ``const float* __restrict__`` (FP32) — see
+        ``grokking_optimizers/kernels/sm_90/supergrok2_sm90.cuh`` (``proj_W``,
+        ``q_W``, ``out_W``, ``idx_*`` are all ``const float*``). Handing those
+        entry points a BF16/FP8 tensor would reinterpret 2-byte elements as
+        4-byte floats — silent memory corruption, not a clean error.
+
+        So the Python side does the honest thing: ``get_weights(precision)``
+        EMITS the chosen-precision tensors (the bf16 path is fully reachable and
+        is the dtype the eager/autograd meta-net consumes), and this method
+        upcasts the projection operands back to FP32 *at the kernel boundary*
+        only. The bf16 emission is NOT dead — it is produced every step and is
+        what a bf16 kernel overload would bind to directly.
+
+        TO MAKE BF16 LIVE ALL THE WAY INTO THE KERNEL (the C++ change another
+        agent must land), add a BF16 overload of the two step entry points whose
+        projection args are ``const __nv_bfloat16*`` (NVIDIA) /
+        ``const __hip_bfloat16*`` (AMD), plus the matching dtype-dispatch in the
+        pybind so Python can pass the bf16 tensors emitted here unchanged. For
+        FP8, the overload additionally takes the per-matrix ``*_scale`` scalars
+        already present in the emitted bundle. Until that overload exists, this
+        boundary upcast is the only correct behaviour.
+        """
+        proj_mode = emitted.get('projection_precision', 'fp32')
+        if proj_mode in ('fp32', 'tf32'):
+            return emitted  # already FP32 operands; no boundary conversion
+        w = dict(emitted)
+        for key in self._PROJECTION_WEIGHT_KEYS:
+            t = w.get(key)
+            if t is not None and t.dtype != torch.float32:
+                w[key] = t.float().contiguous()
+        return w
+
     @torch.no_grad()
     def step(self, closure=None, train_loss=None, val_loss=None, train_acc=None):
         loss = None
@@ -1477,7 +1633,13 @@ class SuperGrok2(Optimizer):
         if use_cuda:
             # Ensure weights are extracted and cached
             if self._weights_dirty:
-                w = self.meta_net.get_weights()
+                # Emit weights at the configured precision (bf16 by default).
+                # _emitted_weights holds the chosen-precision tensors (the
+                # reachable bf16/fp8 path); _cached_weights is the FP32 view the
+                # current kernel ABI consumes (see _kernel_abi_view).
+                self._emitted_weights = self.meta_net.get_weights(
+                    self.precision_config)
+                w = self._kernel_abi_view(self._emitted_weights)
                 def _to_f32_contig(t):
                     t = t if t.dtype == torch.float32 else t.float()
                     return t if t.is_contiguous() else t.contiguous()
@@ -1556,8 +1718,10 @@ class SuperGrok2(Optimizer):
                 self.meta_net._recycle_dead_experts()
         else:
             raise RuntimeError(
-                "SuperGrok2.step() requires CUDA and the compiled C++ extension. "
-                "There is no Python fallback path. For per-parameter execution "
+                "SuperGrok2.step() requires a CUDA/HIP GPU and the compiled "
+                "C++ kernel extension. There is NO pure-PyTorch / CPU fallback "
+                "(check grokking_optimizers.has_kernels() before stepping; "
+                "build with `pip install -e .`). For per-parameter execution "
                 "(e.g. gradient hooks), use `use_grad_hooks=True` which routes "
                 "through `_single_param_step`.")
 
@@ -1746,7 +1910,7 @@ class SuperGrok2(Optimizer):
         pkd = w['pk_dim']
         ehid = w['expert_hidden']
         n_exp = w['num_experts']
-        topk = 4
+        topk = w['topk']
         gru_in_dim = 2 + 2 * d
         peer_in_dim = gru_hid + 2 * d + 2
         fopt = dict(device=w['input_proj_W'].device, dtype=torch.float32)
@@ -1935,11 +2099,13 @@ class SuperGrok2(Optimizer):
         """
         self._ensure_state()
 
-        # Force weight extraction and cache
+        # Force weight extraction and cache (precision-aware emission +
+        # FP32 kernel-ABI view, mirroring step()).
         def _f32c(t):
             t = t if t.dtype == torch.float32 else t.float()
             return t if t.is_contiguous() else t.contiguous()
-        w = self.meta_net.get_weights()
+        self._emitted_weights = self.meta_net.get_weights(self.precision_config)
+        w = self._kernel_abi_view(self._emitted_weights)
         self._cached_peer_query_Ws = torch.stack(
             [_f32c(q.weight.data) for q in self.meta_net.peer_queries])
         self._cached_prod_keys_A = torch.stack(

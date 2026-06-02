@@ -15,6 +15,16 @@ The set of cells that already have a REAL, wired fused TU (the three the demo
 instantiates + dispatch.cpp routes to) is :data:`WIRED_CELLS`; every other cell
 is generator-emittable but not yet compiled into the extension (the manifest
 flags which is which, mirroring dispatch.cpp's honesty contract, §1.12).
+
+BUILD-TIME GENERATOR — NOT a runtime module. It is invoked from the build
+(``setup.py`` materializes the per-cell sources it emits) and as a CLI::
+
+    python -m grokking_optimizers.megakernel_codegen --emit-all
+    python -m grokking_optimizers.megakernel_codegen --emit mamba3 supergrok2 sm_90
+    python -m grokking_optimizers.megakernel_codegen --write-all
+
+It has NO runtime call sites in the optimizer hot path by design; see
+:func:`main` / the ``__main__`` entry below.
 """
 
 from __future__ import annotations

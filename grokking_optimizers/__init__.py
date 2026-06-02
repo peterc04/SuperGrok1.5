@@ -12,9 +12,18 @@ between supergrok15.py and supergrok11.py. Those implementation-detail
 classes are reachable via
 `from grokking_optimizers.optimizers.supergrok2 import X` when needed.
 
-The C++ kernel is the only execution path — if the extension isn't built or
-a kernel raises, the exception propagates. There is no Python reference
-fallback.
+GPU + COMPILED KERNELS REQUIRED. The compiled C++/CUDA/HIP extension is the
+ONLY execution path for ``optimizer.step()`` — there is NO pure-PyTorch /
+CPU fallback for the 11 optimizers. ``import grokking_optimizers`` still
+succeeds without a build (so tooling/introspection works), but calling
+``.step()`` on a CPU-only or unbuilt install raises a descriptive error.
+
+Check capability before relying on the kernels::
+
+    import grokking_optimizers as go
+    if not go.has_kernels():
+        raise SystemExit("grokking_optimizers needs a GPU build "
+                         "(pip install -e .) — there is no CPU fallback.")
 
 Usage:
     from grokking_optimizers import SuperGrok2, Lion, GrokAdamW, ...
@@ -28,13 +37,16 @@ import torch  # noqa: F401 — load libc10.so first
 # C++ extension capability probes
 # --------------------------------------------------------------------------
 
-from grokking_optimizers.dispatch import get_ops, detect_arch, UnsupportedArchError
+from grokking_optimizers.dispatch import (
+    get_ops, detect_arch, has_kernels, UnsupportedArchError,
+)
 
 
 _ops = get_ops()
 _HAS_OPS = bool(_ops)
-_HAS_CUDA = hasattr(_ops, "supergrok2_mamba_peer_batched_step") or \
-            hasattr(_ops, "sg15_fused_step")
+# Honest GPU-build capability flag (spec §6a). `_HAS_CUDA` is retained for
+# back-compat; `has_kernels()` is the public, documented probe.
+_HAS_CUDA = has_kernels()
 _HAS_CPU_OPS = hasattr(_ops, "supergrok2_cpu_step")
 
 
@@ -69,7 +81,7 @@ from grokking_optimizers.dispatch import (
     get_gpu_arch, get_gpu_vendor, get_backend, get_arch_label,
     get_warp_size, supports_bf16, supports_fp8, supports_tf32,
     supports_matrix_cores,
-    SUPPORTED_ARCHES, assert_supported_arch,
+    SUPPORTED_ARCHES, assert_supported_arch, normalize_arch,
 )
 
 
@@ -121,7 +133,7 @@ __all__ = [
     "get_warp_size", "supports_bf16", "supports_fp8", "supports_tf32",
     "supports_matrix_cores",
     "SUPPORTED_ARCHES", "UnsupportedArchError", "assert_supported_arch",
-    "detect_arch",
+    "detect_arch", "normalize_arch", "has_kernels",
 
     # ARCH_TABLE — single source of truth for every supported arch
     "ARCH_TABLE", "ARCH_INFO", "ArchEntry", "get_arch_entry",

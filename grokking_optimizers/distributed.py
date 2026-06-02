@@ -61,6 +61,16 @@ class ParallelConfig:
     data_parallel, tensor_parallel, pipeline_parallel:
         Sizes of the three parallel dims. ``1`` disables that dim. There is no
         sequence-parallel dim by design (short-sequence models, §8.1).
+    expert_parallel:
+        Size of the expert-parallel (EP) dim — the MoE experts are sharded
+        across this many ranks (the PEER/MoE optimizers, e.g.
+        ``MoEAwareSuperGrok2``, route tokens to expert shards). ``1`` (the
+        default) disables EP, so the common dense case is unaffected. EP shares
+        ranks with the DP group (experts are replicated/sharded over the same
+        data-parallel ranks), so it does NOT enlarge ``world_size``; instead it
+        sub-divides the DP dim (``data_parallel`` must be a multiple of
+        ``expert_parallel``). The EP group is the set of DP peers that together
+        hold one full expert set.
     zero_stage:
         ZeRO optimizer-state sharding stage, 0/1/2/3. Stage 3 shards optimizer
         state **and** gradients **and** parameters across the DP group (§8.3).
@@ -86,13 +96,15 @@ class ParallelConfig:
     data_parallel: int = 1
     tensor_parallel: int = 1
     pipeline_parallel: int = 1
+    expert_parallel: int = 1
     zero_stage: int = 0
     backend: str = "nccl"
     use_megakernel: bool = True
     reduce_bucket_size: int = 25_000_000
 
     def __post_init__(self) -> None:
-        for name in ("data_parallel", "tensor_parallel", "pipeline_parallel"):
+        for name in ("data_parallel", "tensor_parallel", "pipeline_parallel",
+                     "expert_parallel"):
             v = getattr(self, name)
             if not isinstance(v, int) or v < 1:
                 raise ValueError(f"{name} must be a positive int, got {v!r}")
@@ -102,6 +114,18 @@ class ParallelConfig:
             raise ValueError(
                 f"reduce_bucket_size must be a positive int, "
                 f"got {self.reduce_bucket_size!r}")
+        # EP sub-divides the DP dim (experts are sharded over DP peers), so it
+        # must evenly divide it and never exceeds it.
+        if self.data_parallel % self.expert_parallel != 0:
+            raise ValueError(
+                f"expert_parallel ({self.expert_parallel}) must evenly divide "
+                f"data_parallel ({self.data_parallel}) — EP shards experts "
+                f"across a subset of the DP ranks.")
+
+    @property
+    def ep(self) -> int:
+        """Alias for ``expert_parallel`` (the short spelling used in configs)."""
+        return self.expert_parallel
 
     @property
     def model_parallel_size(self) -> int:
@@ -201,9 +225,11 @@ class _RankMesh:
     dp: int
     tp: int
     pp: int
+    ep: int
     dp_ranks: Tuple[int, ...]
     tp_ranks: Tuple[int, ...]
     pp_ranks: Tuple[int, ...]
+    ep_ranks: Tuple[int, ...]
 
 
 def _coords_from_rank(rank: int, dp: int, tp: int, pp: int) -> Tuple[int, int, int]:
@@ -227,6 +253,7 @@ def _build_mesh(rank: int, cfg: ParallelConfig) -> _RankMesh:
     unit-testable on a single process.
     """
     dp, tp, pp = cfg.data_parallel, cfg.tensor_parallel, cfg.pipeline_parallel
+    ep = cfg.expert_parallel
     dp_i, tp_i, pp_i = _coords_from_rank(rank, dp, tp, pp)
 
     # DP peers: vary dp_i, hold (tp_i, pp_i) — this is the ZeRO-3 shard group.
@@ -241,15 +268,27 @@ def _build_mesh(rank: int, cfg: ParallelConfig) -> _RankMesh:
     pp_ranks = tuple(
         _rank_from_coords(dp_i, tp_i, p, dp, tp, pp) for p in range(pp)
     )
+    # EP peers: the ``ep`` consecutive DP ranks that together hold one full
+    # (sharded) expert set. DP is partitioned into dp/ep expert-replica blocks;
+    # this rank's EP group is the block its dp_i falls in. EP coordinate is the
+    # offset within that block. EP size 1 ⇒ a singleton group (no-op).
+    ep_block_start = (dp_i // ep) * ep
+    ep_dp_coords = range(ep_block_start, ep_block_start + ep)
+    ep_ranks = tuple(
+        _rank_from_coords(d, tp_i, pp_i, dp, tp, pp) for d in ep_dp_coords
+    )
+    ep_i = dp_i % ep
     return _RankMesh(
         global_rank=rank,
         world_size=cfg.world_size,
         dp=dp_i,
         tp=tp_i,
         pp=pp_i,
+        ep=ep_i,
         dp_ranks=dp_ranks,
         tp_ranks=tp_ranks,
         pp_ranks=pp_ranks,
+        ep_ranks=ep_ranks,
     )
 
 
@@ -272,6 +311,7 @@ class DistributedContext:
         self._dp_group = None
         self._tp_group = None
         self._pp_group = None
+        self._ep_group = None
         # Async DDP grad-hook bookkeeping (populated by register_dp_grad_hooks).
         self._dp_grad_hook_handles: list = []
         self._pending_dp_works: list = []
@@ -348,6 +388,7 @@ class DistributedContext:
         assert dist is not None and self._mesh is not None
         cfg = self.config
         dp, tp, pp = cfg.data_parallel, cfg.tensor_parallel, cfg.pipeline_parallel
+        ep = cfg.expert_parallel
         mesh = self._mesh
 
         # Build every DP group (one per (tp_i, pp_i) slice).
@@ -359,6 +400,22 @@ class DistributedContext:
                 g = dist.new_group(ranks)
                 if mesh.global_rank in ranks:
                     self._dp_group = g
+        # Build every EP group (one per (tp_i, pp_i, dp-block) slice): the ``ep``
+        # consecutive DP ranks that hold one full expert set. Only meaningful
+        # when ep > 1; with ep == 1 each group is a singleton (still entered by
+        # every rank — new_group is collective). Skipped entirely for ep == 1 to
+        # avoid issuing dp*tp*pp singleton-group collectives.
+        if ep > 1:
+            for tp_i in range(tp):
+                for pp_i in range(pp):
+                    for block_start in range(0, dp, ep):
+                        ranks = [
+                            _rank_from_coords(d, tp_i, pp_i, dp, tp, pp)
+                            for d in range(block_start, block_start + ep)
+                        ]
+                        g = dist.new_group(ranks)
+                        if mesh.global_rank in ranks:
+                            self._ep_group = g
         # Build every TP group (one per (dp_i, pp_i) slice).
         for dp_i in range(dp):
             for pp_i in range(pp):
@@ -391,6 +448,7 @@ class DistributedContext:
                 pass
         self._initialized = False
         self._dp_group = self._tp_group = self._pp_group = None
+        self._ep_group = None
 
     # ── rank / coordinate accessors (always safe) ────────────────────────────
 
@@ -430,6 +488,10 @@ class DistributedContext:
         return self.mesh.pp
 
     @property
+    def ep_rank(self) -> int:
+        return self.mesh.ep
+
+    @property
     def dp_world_size(self) -> int:
         return self.config.data_parallel
 
@@ -442,6 +504,10 @@ class DistributedContext:
         return self.config.pipeline_parallel
 
     @property
+    def ep_world_size(self) -> int:
+        return self.config.expert_parallel
+
+    @property
     def dp_group(self):
         return self._dp_group
 
@@ -452,6 +518,10 @@ class DistributedContext:
     @property
     def pp_group(self):
         return self._pp_group
+
+    @property
+    def ep_group(self):
+        return self._ep_group
 
     @property
     def is_pipeline_first_stage(self) -> bool:
@@ -471,6 +541,17 @@ class DistributedContext:
         """
         if self.tp_world_size > 1 and is_dist_available_and_initialized():
             _dist().all_reduce(tensor, group=self._tp_group)
+        return tensor
+
+    def all_reduce_ep(self, tensor: "torch.Tensor") -> "torch.Tensor":
+        """Sum-reduce a tensor across the expert-parallel group (in place).
+
+        Used to combine partial expert outputs / expert-gradient stats across
+        the EP shards that hold one full expert set. No-op when EP size is 1 or
+        no job is launched.
+        """
+        if self.ep_world_size > 1 and is_dist_available_and_initialized():
+            _dist().all_reduce(tensor, group=self._ep_group)
         return tensor
 
     def all_reduce_dp_grads(self, params: Iterable["torch.Tensor"]) -> None:
@@ -723,14 +804,17 @@ class ZeRO3Sharder:
         Pure data — does not import or call DeepSpeed, so it is import-safe even
         when DeepSpeed is absent (useful for serializing the launch config).
         """
+        # Cross-node all-gather/reduce-scatter bucket sizes. These are the knobs
+        # §8.6/§2.13 cares about: on AMD multinode the cross-node all-gather is
+        # the bottleneck, so larger buckets amortize launch latency. Honor the
+        # context's configured ``reduce_bucket_size`` (no longer hardcoded 5M),
+        # so the native DDP path and the DeepSpeed path use ONE source of truth.
+        # The prefetch/persistence knobs scale off it so they stay proportional.
+        bucket = self.ctx.config.reduce_bucket_size
         zero: Dict = {
             "stage": self.ctx.config.zero_stage,
-            # Cross-node all-gather/reduce-scatter bucket sizes. These are the
-            # knobs §8.6/§2.13 cares about: on AMD multinode the cross-node
-            # all-gather is the bottleneck, so larger buckets amortize launch
-            # latency. Conservative defaults; the harness tunes per fabric.
-            "reduce_bucket_size": 5_000_000,
-            "stage3_prefetch_bucket_size": 5_000_000,
+            "reduce_bucket_size": bucket,
+            "stage3_prefetch_bucket_size": bucket,
             "stage3_param_persistence_threshold": 1_000_000,
             "stage3_max_live_parameters": 1_000_000_000,
             "stage3_gather_16bit_weights_on_model_save": True,

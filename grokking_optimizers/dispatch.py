@@ -1,29 +1,87 @@
 """Runtime hardware detection for the fused kernel architecture.
 
-The kernels are single-source-per-vendor and the C++ extension is built as a
-multi-arch fat binary (every NVIDIA CC / AMD gfx the toolchain accepts; see
-setup.py). Detection therefore normalises to a VENDOR impl selector:
+Detection is **arch-honest**: ``detect_arch()`` / ``get_gpu_arch()`` report the
+REAL device architecture, not a collapsed vendor selector. An A100 reports
+``sm_80``, an L40S ``sm_89``, an H100 ``sm_90a`` — they are NOT all flattened to
+``90``. AMD reports its real ``gfx<...>`` target; TPU reports ``tpu_v5p``.
 
-    NVIDIA (any sm_70..sm_120) -> 90  (the sg::sm90 impl)
-    AMD    (any gfx906..gfx1201) -> 942 (the sg::gfx942 impl)
-    TPU                          -> "tpu_v5p" (handled via JAX backend)
+    NVIDIA: sm_70 / sm_75 / sm_80 / sm_86 / sm_89 / sm_90a / sm_100a / ...
+    AMD:    gfx906 / gfx908 / gfx90a / gfx942 / gfx950 / gfx110x / ...
+    TPU:    tpu_v5p
 
-The driver loads the matching per-SM/-gfx code from the fat binary; the host
-only needs to pick the vendor impl. Feature predicates (``supports_fp8`` etc.)
-are keyed to the REAL compute capability via ``get_device_sm()``, not the
-normalised selector. ``FORCE_ARCH`` accepts any of the above forms.
+The C++ extension is still built as a multi-arch fat binary (one impl per
+vendor family; see setup.py), so the *fat-binary impl selector* is a separate
+concern from the reported arch. ``normalize_arch()`` maps a real arch to its
+impl-family selector (NVIDIA → 90, AMD → 942, TPU → "tpu_v5p") for the code
+paths that load the matching per-SM/-gfx code from the fat binary. Reporting
+stays honest; only the binary loader normalises.
+
+Feature predicates (``supports_fp8`` etc.) are keyed to the REAL compute
+capability via ``get_device_sm()``. ``FORCE_ARCH`` accepts any real arch form
+(``sm_80``, ``gfx942``, ``tpu_v5p``, or a bare numeric CC like ``80``/``90``).
 """
 
 from __future__ import annotations
 
 import functools
+import logging
 import os
 from typing import Union
 
 import torch
 
 
-SUPPORTED_ARCHES = (90, 942, "tpu_v5p")
+# ----------------------------------------------------------------------
+# Structured logging (spec §6b). A single module logger, env-controlled
+# level via GROK_LOG_LEVEL (e.g. DEBUG/INFO/WARNING; default WARNING).
+# Replaces ad-hoc print()s and is the channel for arch-detection / ops-
+# resolution diagnostics. We attach a NullHandler so importing the package
+# never configures the root logger (library-friendly); the level is only
+# applied when the env var is set, so default behaviour is quiet.
+# ----------------------------------------------------------------------
+logger = logging.getLogger("grokking_optimizers.dispatch")
+logger.addHandler(logging.NullHandler())
+
+
+def _configure_logging_from_env() -> None:
+    level_name = os.environ.get("GROK_LOG_LEVEL")
+    if not level_name:
+        return
+    level = getattr(logging, level_name.upper(), None)
+    if isinstance(level, int):
+        logger.setLevel(level)
+        # Only add a stream handler if the user opted in via the env var and
+        # no real handler exists yet (don't duplicate on re-import).
+        if not any(not isinstance(h, logging.NullHandler)
+                   for h in logger.handlers):
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter(
+                "[%(name)s %(levelname)s] %(message)s"))
+            logger.addHandler(handler)
+
+
+_configure_logging_from_env()
+
+
+# Every real arch the package recognises (matches the canonical keys in
+# compile.ARCH_TABLE). Reporting is honest against this set; the fat-binary
+# impl selector (90/942) is a separate, normalised value (see normalize_arch).
+SUPPORTED_ARCHES = (
+    # NVIDIA — real compute capabilities (the ``a`` suffix is the canonical
+    # spelling for the arch-conditional variants, matching compile.ARCH_TABLE).
+    "sm_70", "sm_75", "sm_80", "sm_86", "sm_89",
+    "sm_90a", "sm_100a", "sm_103a", "sm_120a",
+    # AMD — real gfx targets.
+    "gfx906", "gfx908", "gfx90a", "gfx942", "gfx950",
+    "gfx1030", "gfx1100", "gfx1101", "gfx1102",
+    "gfx1151", "gfx1200", "gfx1201",
+    # TPU.
+    "tpu_v5p",
+)
+
+# The two GPU fat-binary impl families the extension actually ships. Real
+# arches normalise onto one of these (plus "tpu_v5p") via normalize_arch().
+IMPL_FAMILIES = (90, 942, "tpu_v5p")
 
 
 class UnsupportedArchError(RuntimeError):
@@ -66,33 +124,102 @@ def get_warp_size() -> int:
 # Arch detection
 # ----------------------------------------------------------------------
 
-def _normalize_force_arch(force: str):
-    """Map a FORCE_ARCH string to the vendor impl selector, or None for TPU.
+# Real NVIDIA compute capabilities the package recognises, in ascending
+# order, mapped to their canonical arch-label spelling. A device CC is
+# resolved to the highest label it is >= to (so a future sm_91 still resolves
+# to the sm_90a kernel family, never silently dropping to fp32).
+_NVIDIA_CC_LABELS = (
+    (70, "sm_70"), (75, "sm_75"), (80, "sm_80"), (86, "sm_86"),
+    (89, "sm_89"), (90, "sm_90a"), (100, "sm_100a"), (103, "sm_103a"),
+    (120, "sm_120a"),
+)
 
-    Returns 90 (NVIDIA), 942 (AMD), or "tpu_v5p". Raises on unrecognised input.
+
+def _sm_to_arch_label(cc: int) -> str:
+    """Map a real NVIDIA compute capability int to its canonical arch label.
+
+    Honest: an A100 (CC 80) → ``sm_80``, an L40S (CC 89) → ``sm_89``, an H100
+    (CC 90) → ``sm_90a``. A CC above the highest known entry resolves to that
+    highest label (forward-compatible), a CC below the lowest raises.
+    """
+    label = None
+    for threshold, name in _NVIDIA_CC_LABELS:
+        if cc >= threshold:
+            label = name
+    if label is None:
+        raise UnsupportedArchError(
+            f"NVIDIA compute capability {cc} is below the minimum supported "
+            f"(sm_70).")
+    return label
+
+
+def _normalize_force_arch(force: str) -> Union[int, str]:
+    """Map a FORCE_ARCH string to the REAL arch it names (honest).
+
+    Returns a real arch label (``sm_80``/``gfx942``/...) or ``tpu_v5p``. A bare
+    numeric value is treated as an NVIDIA compute capability and resolved to its
+    real label. Raises on unrecognised input. Use :func:`normalize_arch` on the
+    result when an impl-family selector (90/942) is needed.
     """
     if force.startswith('tpu'):
         return "tpu_v5p"
-    # AMD: any gfx target (and the bare 942 form).
-    if force == '942' or force.startswith('gfx'):
-        return 942
-    # NVIDIA: sm_* / smXX, or a bare numeric compute capability.
+    # AMD: any gfx target. Honor the exact gfx label; the bare ``942`` form maps
+    # to gfx942 for back-compat.
+    if force.startswith('gfx'):
+        return force
+    if force == '942':
+        return "gfx942"
+    # NVIDIA: sm_* label (normalise the bare ``sm_90`` alias to ``sm_90a`` etc.)
+    if force.startswith('sm_'):
+        try:
+            cc = int(force[3:].rstrip('a'))
+        except ValueError:
+            raise UnsupportedArchError(
+                f"FORCE_ARCH={force!r} not recognized.") from None
+        return _sm_to_arch_label(cc)
     if force.startswith('sm'):
-        return 90
+        try:
+            cc = int(force[2:].rstrip('a'))
+        except ValueError:
+            raise UnsupportedArchError(
+                f"FORCE_ARCH={force!r} not recognized.") from None
+        return _sm_to_arch_label(cc)
+    # Bare numeric compute capability (e.g. ``80`` for A100, ``90`` for H100).
     if force.isdigit():
-        return 90
+        return _sm_to_arch_label(int(force))
     raise UnsupportedArchError(
         f"FORCE_ARCH={force!r} not recognized. Use an NVIDIA arch "
-        f"(sm_70..sm_120 or a numeric CC), an AMD arch (gfx906..gfx1201), "
+        f"(sm_70..sm_120a or a numeric CC), an AMD arch (gfx906..gfx1201), "
         f"or tpu_v5p.")
 
 
-@functools.lru_cache(maxsize=1)
-def get_gpu_arch() -> int:
-    """Detected GPU vendor impl selector: 90 (NVIDIA) or 942 (AMD).
+def normalize_arch(arch: Union[int, str]) -> Union[int, str]:
+    """Map a real arch to its fat-binary impl-family selector.
 
-    Any NVIDIA device (sm_70..sm_120) normalises to 90; any AMD gfx device
-    normalises to 942. The fat binary carries the matching per-arch code.
+    NVIDIA labels (``sm_*``) and bare CC ints → ``90``; AMD ``gfx*`` (and the
+    bare ``942``) → ``942``; ``tpu_v5p`` → ``"tpu_v5p"``. This is the ONLY place
+    the NVIDIA→90 / AMD→942 collapse happens, and it is used solely by the code
+    that loads the matching per-arch code from the multi-arch fat binary — never
+    for *reporting* the device's real arch.
+    """
+    if arch == "tpu_v5p":
+        return "tpu_v5p"
+    if isinstance(arch, int):
+        return 942 if arch == 942 else 90
+    if arch.startswith('gfx'):
+        return 942
+    if arch.startswith('sm'):
+        return 90
+    raise UnsupportedArchError(f"Cannot normalize unknown arch {arch!r}")
+
+
+@functools.lru_cache(maxsize=1)
+def get_gpu_arch() -> Union[int, str]:
+    """Detected REAL GPU arch label: ``sm_80`` / ``sm_90a`` / ``gfx942`` / ...
+
+    Reports the device's actual compute capability (NVIDIA) or gfx target (AMD)
+    — NOT a collapsed vendor selector. Use :func:`normalize_arch` on the result
+    when the fat-binary impl-family int (90/942) is needed.
 
     Honors FORCE_ARCH. Raises ``UnsupportedArchError`` if no GPU is available
     or the vendor is unknown.
@@ -107,15 +234,35 @@ def get_gpu_arch() -> int:
 
     if not torch.cuda.is_available():
         raise UnsupportedArchError(
-            "No CUDA/HIP device available. Set FORCE_ARCH (e.g. 90 for any "
-            "NVIDIA, 942 for any AMD) for cross-arch testing.")
+            "No CUDA/HIP device available. Set FORCE_ARCH (e.g. sm_80 for an "
+            "A100, sm_90a for an H100, gfx942 for MI300X) for cross-arch "
+            "testing.")
 
     vendor = get_gpu_vendor()
     if vendor == 'nvidia':
-        return 90     # any sm_70..sm_120 -> the sm90 impl
+        return _sm_to_arch_label(get_device_sm())  # real CC -> real label
     if vendor == 'amd':
-        return 942    # any gfx906..gfx1201 -> the gfx942 impl
+        return _amd_gfx_label()                     # real gfx target
     raise UnsupportedArchError(f"Unknown GPU vendor {vendor!r}")
+
+
+@functools.lru_cache(maxsize=1)
+def _amd_gfx_label() -> str:
+    """Real AMD gfx target string (e.g. ``gfx942``), or ``gfx942`` if unknown.
+
+    Reads the device's gcnArchName via torch and strips any ``:xnack`` feature
+    suffix. Falls back to ``gfx942`` (the shipped CDNA3 impl) only when the
+    runtime exposes no arch name.
+    """
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        name = getattr(props, "gcnArchName", None) or ""
+    except Exception:
+        name = ""
+    name = name.split(":", 1)[0].strip()
+    if name.startswith("gfx"):
+        return name
+    return "gfx942"
 
 
 @functools.lru_cache(maxsize=1)
@@ -123,8 +270,8 @@ def get_device_sm():
     """Real NVIDIA compute capability (e.g. 70, 80, 90, 120), or None.
 
     None when there is no NVIDIA device (CPU host or AMD). Used by the feature
-    predicates, which need the true capability rather than the normalised
-    vendor selector returned by ``get_gpu_arch()``.
+    predicates that want the raw integer CC; ``get_gpu_arch()`` returns the
+    same capability as a canonical arch *label*.
     """
     if get_gpu_vendor() != 'nvidia':
         return None
@@ -134,14 +281,17 @@ def get_device_sm():
 
 @functools.lru_cache(maxsize=1)
 def detect_arch() -> Union[int, str]:
-    """Detect active arch: returns 90, 942, or "tpu_v5p".
+    """Detect the active REAL arch: a label like ``sm_80`` / ``sm_90a`` /
+    ``gfx942``, or ``"tpu_v5p"``.
 
     Detection order:
-      1. FORCE_ARCH env var (accepts 90, 942, or "tpu_v5p")
+      1. FORCE_ARCH env var (accepts sm_*, gfx*, a numeric CC, or tpu_v5p)
       2. TPU detection via JAX
       3. GPU detection via get_gpu_arch()
 
-    Raises ``UnsupportedArchError`` if no supported arch is found.
+    The result is the device's honest arch — an A100 reports ``sm_80``, never a
+    collapsed ``90``. Apply :func:`normalize_arch` for the fat-binary impl
+    selector. Raises ``UnsupportedArchError`` if no supported arch is found.
     """
     force = os.environ.get('FORCE_ARCH')
     if force:
@@ -158,7 +308,10 @@ def detect_arch() -> Union[int, str]:
         pass
 
     # Fall back to GPU detection
-    return get_gpu_arch()
+    arch = get_gpu_arch()
+    logger.debug("detect_arch resolved real arch=%r (impl-family=%r)",
+                 arch, normalize_arch(arch))
+    return arch
 
 
 # ----------------------------------------------------------------------
@@ -204,17 +357,34 @@ def supports_matrix_cores() -> bool:
 # Human-readable labels
 # ----------------------------------------------------------------------
 
+_ARCH_LABELS = {
+    "sm_70":   "Volta (sm_70) — V100",
+    "sm_75":   "Turing (sm_75) — T4 / RTX 20xx",
+    "sm_80":   "Ampere (sm_80) — A100",
+    "sm_86":   "Ampere (sm_86) — A10 / RTX 30xx",
+    "sm_89":   "Ada (sm_89) — L40S / RTX 40xx",
+    "sm_90a":  "Hopper (sm_90a) — H100, H200",
+    "sm_100a": "Blackwell (sm_100a) — B100 / B200",
+    "sm_103a": "Blackwell (sm_103a)",
+    "sm_120a": "Blackwell (sm_120a) — RTX 50xx",
+    "gfx942":  "CDNA3 (gfx942) — MI300X / MI300A",
+    "gfx950":  "CDNA3.5 (gfx950) — MI325X",
+    "tpu_v5p": "TPU v5p",
+}
+
+
 def get_arch_label() -> str:
-    """Human-readable label for the detected arch."""
+    """Human-readable label for the detected (real) arch."""
     try:
         arch = detect_arch()
     except UnsupportedArchError as exc:
         return f"unsupported ({exc})"
-    return {
-        90:       "Hopper (sm_90) — H100, H200",
-        942:      "CDNA3 (gfx942) — MI300X / MI300A",
-        "tpu_v5p": "TPU v5p",
-    }[arch]
+    label = _ARCH_LABELS.get(arch)
+    if label is not None:
+        return label
+    # Any recognised-but-unlabelled real arch (e.g. an older gfx) still gets an
+    # honest string rather than a KeyError.
+    return str(arch)
 
 
 # ----------------------------------------------------------------------
@@ -267,6 +437,8 @@ class _LazyOps:
             return real
         except ImportError as e:
             object.__setattr__(self, "_error", e)
+            logger.debug("grokking_optimizers._ops not importable "
+                         "(extension unbuilt?): %s", e)
             return None
 
     def __getattr__(self, name):
@@ -314,6 +486,33 @@ def get_ops():
     return _cached_ops
 
 
+# Kernel entry points whose presence indicates a usable GPU build. We probe a
+# representative spread (the two SG2 fused steps + the SG15 step) rather than
+# one name, so a partial/renamed build is still reported honestly.
+_KERNEL_PROBE_NAMES = (
+    "supergrok2_prepare_and_batched_step",
+    "supergrok2_batched_step",
+    "supergrok2_mamba_peer_batched_step",
+    "sg15_fused_step",
+)
+
+
+def has_kernels() -> bool:
+    """True iff the compiled C++/CUDA/HIP kernel extension is importable AND
+    exposes the fused optimizer kernels.
+
+    This is the honest capability flag (spec §6a): the optimizers have NO
+    pure-PyTorch fallback for ``.step()`` — they hard-require this extension and
+    a GPU. Gate any GPU-only code on ``grokking_optimizers.has_kernels()``
+    instead of assuming a fallback exists. Returns False on a CPU-only / unbuilt
+    install (import still succeeds for introspection/tooling).
+    """
+    ops = _cached_ops
+    if not ops:
+        return False
+    return any(hasattr(ops, name) for name in _KERNEL_PROBE_NAMES)
+
+
 # ----------------------------------------------------------------------
 # Fused (model, optimizer, arch) kernel registry.
 #
@@ -333,7 +532,14 @@ def get_ops():
 # ----------------------------------------------------------------------
 
 MODELS = ("transformer_decoder", "vit", "mamba3")
-OPTIMIZERS = ("grokadamw", "grokfast", "lion", "looksam", "moe_adam", "muon",
+# Canonical optimizer identifiers. MUST match the real optimizer set used by
+# the megakernel solver/codegen (``megakernel.OPTIMIZERS``), the profiler
+# (``profile.OPTIMIZERS``) and the engine name-inference: the baseline is
+# ``adamw`` (a real fused cell + a shipped ``AdamW`` optimizer), NOT
+# ``moe_adam`` (which is not a megakernel cell — ``MoEAwareSuperGrok2`` routes
+# through the ``supergrok2`` cell). The prior list had ``moe_adam`` and was
+# missing ``adamw``; reconciled here.
+OPTIMIZERS = ("adamw", "grokadamw", "grokfast", "lion", "looksam", "muon",
               "neuralgrok", "prodigy", "supergrok2", "supergrok15", "supergrok11")
 
 _FUSED_REGISTRY = {}
