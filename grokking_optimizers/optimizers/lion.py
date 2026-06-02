@@ -76,9 +76,42 @@ class Lion(Optimizer):
         )
         super().__init__(params, defaults)
 
+        # Per-group cache of static tensor lists (params + exp_avg buffers keep
+        # a fixed identity across steps); only grads_list is rebuilt per step.
+        # Invalidated by add_param_group.
+        self._static_cache: dict = {}
+        # Lazily-bound fused kernel callable (resolved once at first step()).
+        self._fused_step = None
+
         self._use_grad_hooks = use_grad_hooks
         if use_grad_hooks:
             _register_grad_hooks(self)
+
+    def add_param_group(self, param_group) -> None:
+        self._static_cache = {}
+        super().add_param_group(param_group)
+
+    def _group_cache(self, group):
+        """Return cached (params, exp_avg) for *group*, keyed on the set of
+        grad-bearing param ids so semantics match the per-step scan."""
+        key = tuple(id(p) for p in group["params"] if p.grad is not None)
+        cached = self._static_cache.get(id(group))
+        if cached is not None and cached[0] == key:
+            return cached[1]
+
+        params_list = []
+        exp_avg_list = []
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            state = self.state[p]
+            if len(state) == 0:
+                state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+            params_list.append(p)
+            exp_avg_list.append(state["exp_avg"])
+        entry = (params_list, exp_avg_list)
+        self._static_cache[id(group)] = (key, entry)
+        return entry
 
     @torch.no_grad()
     def step(self, closure=None) -> Optional[float]:
@@ -99,29 +132,19 @@ class Lion(Optimizer):
         if self._use_grad_hooks:
             return loss
 
+        fused_step = self._fused_step
+        if fused_step is None:
+            fused_step = self._fused_step = _ops.bind("lion_fused_step")
+
         for group in self.param_groups:
-            params_list = []
-            grads_list = []
-            exp_avg_list = []
-
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                grad = _validate_grad(p)
-
-                # Lazy state initialisation
-                state = self.state[p]
-                if len(state) == 0:
-                    state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
-
-                params_list.append(p)
-                grads_list.append(grad)
-                exp_avg_list.append(state["exp_avg"])
+            params_list, exp_avg_list = self._group_cache(group)
 
             if len(params_list) == 0:
                 continue
 
-            _ops.lion_fused_step(
+            grads_list = [_validate_grad(p) for p in params_list]
+
+            fused_step(
                 params_list,
                 grads_list,
                 exp_avg_list,

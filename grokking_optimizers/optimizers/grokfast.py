@@ -98,9 +98,60 @@ class Grokfast(Optimizer):
         )
         super().__init__(params, defaults)
 
+        # Per-group cache of static tensor lists (params + ema/exp_avg/exp_avg_sq
+        # buffers keep a fixed identity across steps); only grads_list and step
+        # counters are refreshed per step. Invalidated by add_param_group.
+        self._static_cache: dict = {}
+        # Lazily-bound fused kernel callable (resolved once at first step()).
+        self._fused_step = None
+
         self._use_grad_hooks = use_grad_hooks
         if use_grad_hooks:
             _register_grad_hooks(self)
+
+    def add_param_group(self, param_group) -> None:
+        self._static_cache = {}
+        super().add_param_group(param_group)
+
+    def _group_cache(self, group, grads_by_id):
+        """Return cached (params, grads, ema, exp_avg, exp_avg_sq, states).
+
+        Keyed on the grad-bearing param ids. ``grads_by_id`` maps id(p) -> the
+        validated grad, used to seed the EMA on first init (matching the
+        canonical Grokfast first-gradient seed)."""
+        key = tuple(id(p) for p in group["params"] if p.grad is not None)
+        cached = self._static_cache.get(id(group))
+        if cached is not None and cached[0] == key:
+            return cached[1]
+
+        params_list = []
+        ema_list = []
+        exp_avg_list = []
+        exp_avg_sq_list = []
+        states = []
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            state = self.state[p]
+            if len(state) == 0:
+                state["step"] = 0
+                # Seed the gradient EMA with the first gradient (not zeros) to
+                # match the canonical Grokfast filter. A zero seed heavily damps
+                # the amplification term for the first ~1/(1-alpha) steps —
+                # exactly the early phase Grokfast exists to accelerate — and
+                # there is no EMA bias correction in the kernel to compensate.
+                state["ema"] = grads_by_id[id(p)].detach().to(
+                    torch.float32).clone()
+                state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+                state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+            params_list.append(p)
+            ema_list.append(state["ema"])
+            exp_avg_list.append(state["exp_avg"])
+            exp_avg_sq_list.append(state["exp_avg_sq"])
+            states.append(state)
+        entry = (params_list, ema_list, exp_avg_list, exp_avg_sq_list, states)
+        self._static_cache[id(group)] = (key, entry)
+        return entry
 
     @torch.no_grad()
     def step(self, closure=None) -> Optional[float]:
@@ -121,47 +172,32 @@ class Grokfast(Optimizer):
         if self._use_grad_hooks:
             return loss
 
+        fused_step = self._fused_step
+        if fused_step is None:
+            fused_step = self._fused_step = _ops.bind(
+                "grokfast_fused_ema_adam_step")
+
         for group in self.param_groups:
-            params_list = []
-            grads_list = []
-            ema_list = []
-            exp_avg_list = []
-            exp_avg_sq_list = []
-            step_list = []
-
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                grad = _validate_grad(p)
-
-                # Lazy state initialisation
-                state = self.state[p]
-                if len(state) == 0:
-                    state["step"] = 0
-                    # Seed the gradient EMA with the first gradient (not
-                    # zeros) to match the canonical Grokfast filter. A zero
-                    # seed heavily damps the amplification term for the first
-                    # ~1/(1-alpha) steps — exactly the early phase Grokfast
-                    # exists to accelerate — and there is no EMA bias
-                    # correction in the kernel to compensate.
-                    state["ema"] = grad.detach().to(torch.float32).clone()
-                    state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
-                    state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
-
-                state["step"] += 1
-
-                params_list.append(p)
-                grads_list.append(grad)
-                ema_list.append(state["ema"])
-                exp_avg_list.append(state["exp_avg"])
-                exp_avg_sq_list.append(state["exp_avg_sq"])
-                step_list.append(state["step"])
+            # Validate grads up front; this also provides the first-gradient
+            # seed for any params whose EMA state is initialised on this step.
+            grads_by_id = {
+                id(p): _validate_grad(p)
+                for p in group["params"] if p.grad is not None
+            }
+            params_list, ema_list, exp_avg_list, exp_avg_sq_list, states = \
+                self._group_cache(group, grads_by_id)
 
             if len(params_list) == 0:
                 continue
 
+            grads_list = [grads_by_id[id(p)] for p in params_list]
+            step_list = []
+            for state in states:
+                state["step"] += 1
+                step_list.append(state["step"])
+
             # Fused EMA + amplification + Adam in a single CUDA pass
-            _ops.grokfast_fused_ema_adam_step(
+            fused_step(
                 params_list, grads_list, ema_list,
                 exp_avg_list, exp_avg_sq_list, step_list,
                 group["grokfast_alpha"], group["grokfast_lamb"],
