@@ -79,4 +79,40 @@ __device__ __forceinline__ void neuralgrok_apply_step(
     param[idx] = static_cast<ParamT>(p - lr * (update + wd * p));
 }
 
+// Canonical bias-corrected Adam tail on a caller-supplied effective gradient
+// g_eff. SINGLE source of the moment-update + decoupled-WD apply math, factored
+// out of neuralgrok_apply_step so the "Adam-only on a pre-amplified gradient"
+// kernel can reuse the exact same float ops without re-inlining them. Writes
+// the new moments into exp_avg[idx]/exp_avg_sq[idx] and the new parameter into
+// param[idx].
+//
+// Bit-identical to the tail of neuralgrok_apply_step:
+//   m = beta1 * exp_avg[idx]    + (1 - beta1) * g_eff;
+//   v = beta2 * exp_avg_sq[idx] + (1 - beta2) * g_eff * g_eff;
+//   update = (m / bc1) / (sqrtf(v / bc2) + eps);
+//   param[idx] = p - lr * (update + wd * p);
+template <typename ParamT>
+__device__ __forceinline__ void neuralgrok_adam_tail(
+    ParamT* __restrict__ param,
+    float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq,
+    const float g_eff,
+    const float lr,
+    const float beta1,
+    const float beta2,
+    const float eps,
+    const float wd,
+    const float bc1,
+    const float bc2,
+    const int idx
+) {
+    const float p = static_cast<float>(param[idx]);
+    const float m = beta1 * exp_avg[idx]    + (1.0f - beta1) * g_eff;
+    const float v = beta2 * exp_avg_sq[idx] + (1.0f - beta2) * g_eff * g_eff;
+    exp_avg[idx]    = m;
+    exp_avg_sq[idx] = v;
+    const float update = (m / bc1) / (sqrtf(v / bc2) + eps);
+    param[idx] = static_cast<ParamT>(p - lr * (update + wd * p));
+}
+
 }} // namespace sg::algorithms
