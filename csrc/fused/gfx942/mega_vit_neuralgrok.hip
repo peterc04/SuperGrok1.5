@@ -44,7 +44,14 @@ hipError_t mega_vit_neuralgrok(
     ctx.n_ctas = (unsigned)n_cus;
     FusedOptState st;
     st.exp_avg = m; st.exp_avg_sq = v;
-    (void)extra;
+    // #5: bind psi-net weights from the packed `extra` buffer (W1|b1|W2|b2,
+    // layout in opt_components.hip.hpp) — without this the psi pointers are null
+    // and sg_psi_forward null-derefs. psi_b2 stays 0.0f (device-scalar stop).
+    if (extra) {
+        st.psi_W1 = extra + kPsiW1Off;
+        st.psi_b1 = extra + kPsiB1Off;
+        st.psi_W2 = extra + kPsiW2Off;
+    }
     st.lr = lr;
     dim3 grid((unsigned)n_cus), block(256);
     hipLaunchKernelGGL(
