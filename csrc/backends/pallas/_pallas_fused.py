@@ -45,6 +45,7 @@ failing at import time, so codegen can import this module unconditionally.
 
 from __future__ import annotations
 
+import functools
 from typing import Any, Callable, Dict, Tuple
 
 # ---------------------------------------------------------------------------
@@ -615,6 +616,105 @@ def _split_static(opt_state: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, 
     return dynamic, static
 
 
+# ---------------------------------------------------------------------------
+# Hoisted jit construction.
+#
+# The fused/optimizer step closes over compile-time constants (``model``,
+# ``optimizer``, ``cfg``, the ``static`` hyperparameter dict, ``lr``) and traces
+# only the runtime arrays (weights, optimizer-state pytrees, batch, cotangent).
+# Rebuilding ``jax.jit`` per call would re-trace + recompile every step because
+# each fresh closure is a distinct callable object. We therefore build the
+# jitted callable ONCE per distinct ``(model, optimizer, tier, static-config)``
+# key and reuse it across steps -- the single biggest TPU win.
+#
+# ``cfg`` / ``static`` / ``lr`` are not hashable (frozen dataclass with array
+# fields would be, but ``static`` is a nested dict and ``lr`` a python float),
+# so we wrap them in an identity-hashable holder and key an ``lru_cache`` on it.
+# Callers that reuse the same static-config object across steps (the steady
+# state) get a cache hit and skip recompilation entirely.
+# ---------------------------------------------------------------------------
+class _Static:
+    """Identity-hashable holder for non-hashable compile-time constants.
+
+    Two holders are equal iff they wrap the *same* python object, so reusing the
+    same ``cfg`` / ``static`` / ``lr`` objects across steps yields a cache hit
+    (and thus no recompilation). Distinct config objects key distinct programs.
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+    def __hash__(self) -> int:
+        return id(self.value)
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, _Static) and self.value is other.value
+
+
+@functools.lru_cache(maxsize=None)
+def _build_l1_step(
+    optimizer: str, static_h: "_Static", lr_h: "_Static"
+) -> Callable[..., Any]:
+    """Build (once) the jitted L1 optimizer-only step.
+
+    Traced args: ``(params, grads, dyn_state)``. ``static`` / ``lr`` are closed
+    over as compile-time constants. Donates both ``params`` (0) and the
+    optimizer-state pytree (2) so XLA can reuse their buffers in place.
+    """
+    static = static_h.value
+    lr = lr_h.value
+
+    @functools.partial(jax.jit, donate_argnums=(0, 2))
+    def _step(p, g, st):
+        return _optimizer_step(optimizer, p, g, st, static, lr)
+
+    return _step
+
+
+@functools.lru_cache(maxsize=None)
+def _build_l3_step(
+    model: str,
+    optimizer: str,
+    cfg_h: "_Static",
+    static_h: "_Static",
+    lr_h: "_Static",
+) -> Callable[..., Any]:
+    """Build (once) the jitted L3 fused fwd->bwd->opt step.
+
+    Traced args: ``(weights, dyn_state, batch, grad_logits)``. ``cfg`` /
+    ``static`` / ``lr`` are closed over as compile-time constants. ``forward``
+    and ``backward`` are resolved once at build time.
+
+    The forward + parameter grads are computed in a SINGLE
+    ``jax.value_and_grad`` pass (the cotangent on ``logits`` is ``grad_logits``,
+    matching the former forward-then-grad-rerunning-forward path exactly), so
+    the forward is no longer evaluated twice. Donates both ``weights`` (0) and
+    the optimizer-state pytree (1).
+    """
+    cfg = cfg_h.value
+    static = static_h.value
+    lr = lr_h.value
+    forward = _forward_fn(model)
+
+    @functools.partial(jax.jit, donate_argnums=(0, 1))
+    def _step(weights, st, batch, grad_logits):
+        # One pass: value (logits) + grads of sum(logits * grad_logits) w.r.t.
+        # weights. ``jax.grad`` of that inner product yields exactly the same
+        # ``param_grads`` the former separate backward produced, but reuses the
+        # forward trace instead of re-running it.
+        def _loss(w):
+            logits = forward(batch, w, cfg)
+            gl = grad_logits if grad_logits is not None else jnp.ones_like(logits)
+            return jnp.sum(logits * gl)
+
+        param_grads = jax.grad(_loss)(weights)
+        return _optimizer_step(optimizer, weights, param_grads, st, static, lr)
+
+    return _step
+
+
 def fused_step(
     model: str,
     optimizer: str,
@@ -646,35 +746,26 @@ def fused_step(
 
     if tier == "L1":
         # Optimizer-only fused step across the parameter tree (one jit program).
-        # ``static`` is closed over (compile-time constant); only arrays traced.
-        opt_fn = jax.jit(
-            lambda p, g, st: _optimizer_step(optimizer, p, g, st, static, lr),
-            donate_argnums=(0,),
-        )
+        # The jitted callable is built ONCE per (optimizer, static, lr) and
+        # cached, so steady-state steps hit the cache and skip recompilation.
+        opt_fn = _build_l1_step(optimizer, _Static(static), _Static(lr))
         return opt_fn(params, grads, dyn_state)
 
     if tier != "L3":
         raise ValueError(f"unsupported tier {tier!r}; expected 'L1' or 'L3'")
 
-    # L3: one jitted program: model forward -> backward -> optimizer.
-    # ``cfg`` and ``static`` are closed over as compile-time constants so the
-    # whole fwd/bwd/opt chain lowers to a single XLA program (XLA fuses it).
+    # L3: one jitted program: model forward -> (value_and_grad) -> optimizer.
+    # ``cfg`` / ``static`` / ``lr`` are closed over as compile-time constants so
+    # the whole fwd/bwd/opt chain lowers to a single XLA program. The jitted
+    # callable is built ONCE per (model, optimizer, cfg, static, lr) and cached,
+    # so steady-state steps reuse the same compiled program (no recompile).
     batch = inputs["batch"]
     cfg = inputs["cfg"]
     grad_logits = inputs.get("grad_logits")
-    forward = _forward_fn(model)
-    backward = _backward_fn(model)
-
-    def _fused(weights, st):
-        logits = forward(batch, weights, cfg)
-        gl = grad_logits if grad_logits is not None else jnp.ones_like(logits)
-        # Real backward: grads w.r.t. the SAME weights pytree (params).
-        param_grads = backward(gl, batch, weights, cfg)
-        # Optimizer consumes the freshly-computed grads -> updated weights.
-        return _optimizer_step(optimizer, weights, param_grads, st, static, lr)
-
-    fused_fn = jax.jit(_fused, donate_argnums=(0,))
-    return fused_fn(params, dyn_state)
+    fused_fn = _build_l3_step(
+        model, optimizer, _Static(cfg), _Static(static), _Static(lr)
+    )
+    return fused_fn(params, dyn_state, batch, grad_logits)
 
 
 # ---------------------------------------------------------------------------

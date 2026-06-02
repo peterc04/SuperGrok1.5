@@ -160,13 +160,28 @@ def csa_attention(
         cv_h = c_v[:, off:off + head_dim]
         sel_k = ck_h[top_idx]                            # [N, k_keep, head_dim]
         sel_v = cv_h[top_idx]
-        comp_scores = jnp.einsum('nd,nkd->nk', q_h, sel_k) * scale  # [N, k_keep]
+        # fp32 accumulate on the MXU fast path (preferred_element_type) at
+        # HIGHEST precision so the dot products stay bit-stable vs the prior
+        # default-fp32 einsums.
+        comp_scores = jnp.einsum(
+            'nd,nkd->nk', q_h, sel_k,
+            preferred_element_type=jnp.float32,
+            precision=jax.lax.Precision.HIGHEST,
+        ) * scale  # [N, k_keep]
         comp_p = jax.nn.softmax(comp_scores, axis=-1)
-        comp_ctx = jnp.einsum('nk,nkd->nd', comp_p, sel_v)          # [N, head_dim]
+        comp_ctx = jnp.einsum(
+            'nk,nkd->nd', comp_p, sel_v,
+            preferred_element_type=jnp.float32,
+            precision=jax.lax.Precision.HIGHEST,
+        )          # [N, head_dim]
 
         rk_h = k[:, off:off + head_dim]
         rv_h = v[:, off:off + head_dim]
-        win_scores = jnp.einsum('nd,md->nm', q_h, rk_h) * scale     # [N, N]
+        win_scores = jnp.einsum(
+            'nd,md->nm', q_h, rk_h,
+            preferred_element_type=jnp.float32,
+            precision=jax.lax.Precision.HIGHEST,
+        ) * scale     # [N, N]
         win_scores = win_scores + win_bias
         win_p = jax.nn.softmax(win_scores, axis=-1)
         win_ctx = win_p @ rv_h                                       # [N, head_dim]
@@ -209,13 +224,21 @@ def hca_attention(
         q_h = q[:, off:off + head_dim]
         ck_h = c_k[:, off:off + head_dim]
         cv_h = c_v[:, off:off + head_dim]
-        dense_scores = jnp.einsum('nd,md->nm', q_h, ck_h) * scale  # [N, Nh] dense
+        dense_scores = jnp.einsum(
+            'nd,md->nm', q_h, ck_h,
+            preferred_element_type=jnp.float32,
+            precision=jax.lax.Precision.HIGHEST,
+        ) * scale  # [N, Nh] dense
         dense_p = jax.nn.softmax(dense_scores, axis=-1)
         dense_ctx = dense_p @ cv_h                                  # [N, head_dim]
 
         rk_h = k[:, off:off + head_dim]
         rv_h = v[:, off:off + head_dim]
-        win_scores = jnp.einsum('nd,md->nm', q_h, rk_h) * scale
+        win_scores = jnp.einsum(
+            'nd,md->nm', q_h, rk_h,
+            preferred_element_type=jnp.float32,
+            precision=jax.lax.Precision.HIGHEST,
+        ) * scale
         win_scores = win_scores + win_bias
         win_p = jax.nn.softmax(win_scores, axis=-1)
         win_ctx = win_p @ rv_h

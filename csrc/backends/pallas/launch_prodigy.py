@@ -63,8 +63,9 @@ def prodigy_step(
     num = jnp.sum(g * (p_flat - state.param_init))
     den = jnp.sum(state.s_buf * jnp.abs(g))
 
+    # Keep d_lr as a device scalar — never force a host sync via float(...),
+    # which would block the device queue and serialise the step.
     new_d_lr = jnp.where(den > 0, jnp.maximum(d_lr, num / den), d_lr)
-    new_d_lr_float = float(new_d_lr)
 
     new_s = config.beta2 * state.s_buf + (1.0 - config.beta2) * jnp.abs(g) * d_lr
     effective = g * d_lr
@@ -83,7 +84,7 @@ def prodigy_step(
     new_state = ProdigyState(
         exp_avg=new_ea, exp_avg_sq=new_easq, s_buf=new_s,
         param_init=state.param_init, step=step)
-    return new_p.reshape(param.shape), new_state, new_d_lr_float
+    return new_p.reshape(param.shape), new_state, new_d_lr
 
 
 def launch_prodigy_step(

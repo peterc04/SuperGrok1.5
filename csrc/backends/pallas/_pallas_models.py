@@ -104,7 +104,13 @@ def _hand_tiled_attention_forward(q, k, v, *, causal: bool, tile_size=128):
     v = v.astype(jnp.bfloat16)
 
     scale = q.shape[-1] ** -0.5
-    attn_weights = jnp.einsum('bhid,bhjd->bhij', q, k) * scale
+    # bf16 inputs, fp32 accumulate: keep the QK^T / PV matmuls on the
+    # fp32-accumulate MXU fast path (preferred_element_type) at HIGHEST
+    # precision so numerics match the prior default-precision fp32 path.
+    attn_weights = jnp.einsum(
+        'bhid,bhjd->bhij', q, k,
+        preferred_element_type=jnp.float32, precision=jax.lax.Precision.HIGHEST,
+    ) * scale
 
     if causal:
         seq_len = q.shape[2]
@@ -119,7 +125,10 @@ def _hand_tiled_attention_forward(q, k, v, *, causal: bool, tile_size=128):
     softmax_lse = jnp.squeeze(max_score + jnp.log(sum_exp), axis=-1)
     attn_probs = exp_shifted / sum_exp
 
-    out = jnp.einsum('bhij,bhjd->bhid', attn_probs, v)
+    out = jnp.einsum(
+        'bhij,bhjd->bhid', attn_probs.astype(jnp.bfloat16), v,
+        preferred_element_type=jnp.float32, precision=jax.lax.Precision.HIGHEST,
+    )
     return out, softmax_lse
 
 
@@ -150,19 +159,13 @@ def attention_forward(q, k, v, *, causal: bool, tile_size=128):
         except Exception:
             out = None  # splash unavailable/incompatible at trace → dense path
         if out is not None:
-            # Recompute softmax_lse for the backward contract (cheap vs attn).
-            scale = q.shape[-1] ** -0.5
-            attn_weights = jnp.einsum('bhid,bhjd->bhij', q, k) * scale
-            if causal:
-                seq_len = q.shape[2]
-                cmask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
-                attn_weights = jnp.where(cmask[None, None], attn_weights, -1e9)
-            max_score = jnp.max(attn_weights, axis=-1, keepdims=True)
-            softmax_lse = jnp.squeeze(
-                max_score + jnp.log(jnp.sum(jnp.exp(attn_weights - max_score), axis=-1, keepdims=True)),
-                axis=-1,
-            )
-            return out, softmax_lse
+            # softmax_lse is NOT consumed by any caller: every call site does
+            # ``attn_out, _ = attention_forward(...)`` and ``attention_backward``
+            # recomputes its own forward (its ``softmax_lse`` arg is unused). The
+            # former full dense [B,h,S,S] scores+mask+logsumexp recompute here was
+            # pure dead work on top of splash; return ``None`` for the lse slot to
+            # preserve the (out, lse) tuple contract without recomputing.
+            return out, None
     return _hand_tiled_attention_forward(q, k, v, causal=causal, tile_size=tile_size)
 
 
@@ -497,7 +500,16 @@ def _jax_selective_scan_fallback(x, B_mat, C_mat, dt, A_log):
 
 
 def mamba_selective_scan(x, B_mat, C_mat, dt, A_log):
-    """Selective scan -- tries Pallas pallas_affine_scan, falls back to JAX.
+    """Diagonal-SSM selective scan via element-wise ``lax.associative_scan``.
+
+    The diagonal SSM recurrence ``state_t = dA_t * state_{t-1} + dB_x_t`` is an
+    *element-wise* affine combine on each (d_inner, d_state) channel -- there is
+    no 2x2 matrix coupling. The former code routed this through
+    ``pallas_affine_scan`` (which expects [N, 2, 2] / [N, 2] affine pairs) after
+    reshaping to ``[B, N, d_inner*d_state]``: the shapes never matched, so the
+    Pallas call ALWAYS raised and silently fell back to the JAX path below --
+    dead, broken code. We call the vectorised element-wise associative scan
+    directly (same math, no throwaway Pallas attempt, fully parallel prefix).
 
     Args:
         x: [batch, seq_len, d_inner]
@@ -509,24 +521,7 @@ def mamba_selective_scan(x, B_mat, C_mat, dt, A_log):
     Returns:
         y: [batch, seq_len, d_inner]
     """
-    try:
-        from ._pallas_kernels import pallas_affine_scan
-        A = -jnp.exp(A_log)
-        dt_exp = dt[..., None]
-        dA = jnp.exp(dt_exp * A[None, None, :, :])
-        dB_x = dt_exp * B_mat[:, :, None, :] * x[..., None]
-        N = dA.shape[1]
-        d_inner = dA.shape[2]
-        B_dim = dA.shape[0]
-        d_state = dA.shape[3]
-        Ms = dA.reshape(B_dim, N, d_inner * d_state)
-        bs = dB_x.reshape(B_dim, N, d_inner * d_state)
-        out_Ms, out_bs = pallas_affine_scan(Ms, bs, N, d_inner * d_state)
-        states = out_bs.reshape(B_dim, N, d_inner, d_state)
-        y = jnp.einsum('bsdn,bsn->bsd', states, C_mat)
-        return y
-    except Exception:
-        return _jax_selective_scan_fallback(x, B_mat, C_mat, dt, A_log)
+    return _jax_selective_scan_fallback(x, B_mat, C_mat, dt, A_log)
 
 
 # -- Mamba layer -----------------------------------------------------------
