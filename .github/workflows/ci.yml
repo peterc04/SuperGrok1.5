@@ -124,8 +124,10 @@ jobs:
           "
 
   # ---------------------------------------------------------------------------
-  # Self-test — full --self-test suite (138 tests). The repo's own correctness
-  # gate.
+  # Self-test — full --self-test suite (144 tests as of Phase 8). The repo's
+  # own correctness gate. The authoritative count is enforced inside
+  # grokking_optimizers/compile.py (the self-test count guard); the summary
+  # check below asserts "<N> passed, 0 failed" rather than hard-coding N here.
   # ---------------------------------------------------------------------------
   self_test:
     name: --self-test (python ${{ matrix.python-version }})
@@ -1059,6 +1061,122 @@ jobs:
           print(f"all {len(ARCH_TABLE)} ARCH_TABLE entries route correctly")
           PY
 
+  # ---------------------------------------------------------------------------
+  # CUDA object compile — nvcc -c (NO GPU) over the sm_90 launch + model TUs.
+  # Installs the CUDA toolkit via apt and device-compiles each translation unit
+  # to an object (-o /dev/null). This catches real nvcc / PTX / template errors
+  # that the CPU-only structural check cannot. No device is needed for `-c`.
+  # ---------------------------------------------------------------------------
+  compile_to_object:
+    name: nvcc -c sm_90 launch + model TUs (no GPU)
+    runs-on: ubuntu-latest
+    needs: py_compile
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive          # third_party/cutlass for the sm_90 TUs
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch (for headers)
+        run: pip install --index-url https://download.pytorch.org/whl/cpu torch
+      - name: Install CUDA toolkit (nvcc)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends nvidia-cuda-toolkit
+          nvcc --version
+      - name: nvcc -c over sm_90 launch + fused-model TUs
+        run: |
+          set -uo pipefail
+          fails=0
+          # Per-op launch TUs (11) + the fused mega-model TUs (vit/decoder/mamba3).
+          tus=$(ls csrc/backends/cuda/sm_90/launch_*.cu \
+                   csrc/fused/sm_90/mega_*.cu 2>/dev/null)
+          n=$(echo "$tus" | wc -w)
+          echo "compiling $n sm_90 translation units to objects (no GPU)"
+          for tu in $tus; do
+            if bash scripts/compile_to_object.sh "$tu"; then :; else
+              echo "::error::nvcc -c failed: $tu"; fails=$((fails+1)); fi
+          done
+          if [ "$fails" -ne 0 ]; then
+            echo "::error::$fails sm_90 TU(s) failed to compile"; exit 1; fi
+          echo "all $n sm_90 TUs compiled to objects OK"
+
+  # ---------------------------------------------------------------------------
+  # AMDGCN device-code gate — clang's AMDGPU backend free-standing-compiles the
+  # gfx942 per-op device headers (no hipcc / no ROCm device-libs). Catches real
+  # builtin-signature / DPP-control / MFMA register-type bugs. See
+  # scripts/amdgcn_check.sh for what it does and does not cover.
+  # ---------------------------------------------------------------------------
+  amdgcn_check:
+    name: clang AMDGPU gate over gfx942 headers (no GPU)
+    runs-on: ubuntu-latest
+    needs: py_compile
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang (AMDGPU target)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang
+          clang --version
+      - name: amdgcn_check over the 11 gfx942 per-op device headers
+        run: |
+          set -uo pipefail
+          fails=0
+          for h in grokking_optimizers/kernels/gfx942/*_gfx942.hip.hpp; do
+            case "$h" in
+              *common_gfx942.hip.hpp) continue ;;   # included indirectly
+            esac
+            if bash scripts/amdgcn_check.sh --header "$h"; then :; else
+              echo "::error::AMDGCN compile failed: $h"; fails=$((fails+1)); fi
+          done
+          if [ "$fails" -ne 0 ]; then
+            echo "::error::$fails gfx942 header(s) failed the AMDGCN gate"; exit 1; fi
+          echo "all gfx942 per-op device headers passed the AMDGCN gate"
+
+  # ---------------------------------------------------------------------------
+  # Optimizer-math drift guard — the single-source structural invariant: every
+  # per-op CUDA kernel #includes its canonical csrc/algorithms/<opt>.h, and the
+  # canonical math has not drifted from the recorded manifest. See
+  # csrc/algorithms/SOURCE_OF_TRUTH.md.
+  # ---------------------------------------------------------------------------
+  drift_guard:
+    name: optimizer-math single-source drift guard
+    runs-on: ubuntu-latest
+    needs: py_compile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: check_math_single_source.py
+        run: python3 scripts/check_math_single_source.py
+
+  # ---------------------------------------------------------------------------
+  # pytest (CPU) — the pure-PyTorch reference-parity + import-safe test suite,
+  # excluding hardware-gated tests (-m "not hw"). The fp64 optimizer reference
+  # implementations and their self-consistency checks are the CPU half of the
+  # Stage-3 ✅-gate (tests/hw/test_reference_parity.py); the GPU kernel-vs-
+  # reference half runs from HARDWARE_VALIDATION.md.
+  # ---------------------------------------------------------------------------
+  pytest_cpu:
+    name: pytest tests/ (CPU, not hw)
+    runs-on: ubuntu-latest
+    needs: py_compile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch + pytest
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install pytest numpy
+      - name: pytest -m "not hw"
+        run: PYTHONPATH=. python3 -m pytest tests/ -m "not hw" -q
+
   # ===========================================================================
   # NON-BLOCKING QUALITY / SECURITY CHECKS
   # ---------------------------------------------------------------------------
@@ -1285,6 +1403,10 @@ jobs:
       - determinism
       - docs_consistency
       - arch_dispatch
+      - compile_to_object
+      - amdgcn_check
+      - drift_guard
+      - pytest_cpu
     if: always()
     steps:
       - name: Verify all required jobs succeeded
