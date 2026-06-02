@@ -1,0 +1,9 @@
+[submodule "third_party/cutlass"]
+	path = third_party/cutlass
+	url = https://github.com/NVIDIA/cutlass.git
+	# v3.6.0 == commit bf9da7b76c766d7ee7d536afc77880a4ef1f1156 (SHA pin is
+	# reproducible; `submodule update --init` also needs the gitlink committed to
+	# HEAD — see README "Build"). Re-pin: git -C third_party/cutlass checkout
+	# bf9da7b76c766d7ee7d536afc77880a4ef1f1156 && git add third_party/cutlass
+	branch = v3.6.0
+	shallow = true

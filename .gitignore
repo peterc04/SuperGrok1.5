@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+*.so
+.eggs/
+.claude/
+third_party/*
+!third_party/cutlass
+*.ptx
