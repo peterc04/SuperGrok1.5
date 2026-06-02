@@ -50,14 +50,16 @@ grokking_optimizers/kernels/
   sm_90/<opt>_sm90.cuh             ← per-op LAUNCH wrapper (#includes the
                                       canonical header; zero math duplication)
   sm_90/<model>_sm90.cuh           ← CANONICAL CUDA model (CUTLASS Sm90 TMA/WGMMA)
-  gfx942/<opt|model>_gfx942.hip.hpp← CANONICAL AMDGCN device kernels (MFMA/DPP)
-  tpu/<opt|model>_tpu.py           ← CANONICAL TPU/JAX math (7 opts + 3 models)
+  gfx942/<opt|model>_gfx942.hip.hpp← CANONICAL AMDGCN device kernels (MFMA/DPP +
+                                      f32x4-vectorized apply-steps)
+  (there is NO kernels/tpu/ tree — the canonical TPU path is pallas, below)
 
 csrc/backends/
   cuda/sm_90/*.cu                  ← pure entry-point shims (~5 LOC, #include only)
   hip/gfx942/*.hip.cpp             ← entry points + amdgcn_primitives + SG2
                                       device adjoint + MoE compaction
-  pallas/launch_<opt>.py           ← CANONICAL TPU math for the 4 base optimizers
+  pallas/launch_<opt>.py           ← CANONICAL TPU/JAX math for ALL 11 optimizers
+  pallas/_pallas_models.py         ← CANONICAL TPU model fwd/bwd (decoder/vit/mamba)
   pallas/_pallas_fused.py          ← composes the 33 TPU fused cells
 
 csrc/fused/
@@ -69,14 +71,19 @@ csrc/fused/
   megakernel_common*.{cuh,hip.hpp} ← task queue, %smid/HW_ID pin, GridBarrier
 ```
 
-**Single-source guarantee.** The CUDA per-op path and the fused path both
-`#include` `csrc/algorithms/<opt>.h` — they cannot drift. The enforced guard
-`scripts/check_math_single_source.py` (wired into `--self-test` as
-`math_drift_guard`, with a content-hash manifest) *fails the build* if any
-consumer reimplements the math or the canonical math changes without a
-deliberate `--update-manifest`. The gfx942 device transcription and the TPU JAX
-path are documented, cross-referenced re-expressions (necessary: thrust/JAX
-toolchain constraints).
+**Single-source guarantee (enforced).** The CUDA per-op path and the fused path
+both `#include` `csrc/algorithms/<opt>.h` and CALL its step function — they
+cannot drift. The enforced guard `scripts/check_math_single_source.py` (wired
+into `--self-test` as `math_drift_guard`) *fails the build* on three triggers:
+(1) a consumer stops `#include`-ing the canonical header; (2) a consumer keeps
+the include but **re-inlines** the Adam moment-update/apply locally (Phase-7
+re-inline detection — catches the subtle case where math is re-typed in the
+`.cuh`); (3) the canonical math changes without a deliberate `--update-manifest`
+(content-hash manifest). The gfx942 device transcription and the TPU JAX path
+are documented, cross-referenced re-expressions (necessary: thrust/JAX toolchain
+constraints), covered by the manifest. The C++ fused dispatch table is
+generator-emitted (`csrc/fused/fused_wired_cells.inc`) from the same solver
+enumeration that emits the 99 cells, so it cannot hand-sync-drift.
 
 ---
 
@@ -205,6 +212,12 @@ controlled conditions — the project's namesake driver.
 ## 9. Deeper docs
 - [`HARDWARE_VALIDATION.md`](HARDWARE_VALIDATION.md) — the 99-cell on-silicon checklist + per-stage bring-up.
 - [`BUILD_REPORT.md`](BUILD_REPORT.md) — per-stage scope, gates, the 44-component table.
-- [`RESTRUCTURE_PLAN.md`](RESTRUCTURE_PLAN.md) — Phase-6 inventory proving the single-source-per-component architecture.
-- `PHASE{2,3,4,5}_REPORT.md` — the incremental build history (real compositions, register pass, AMD device live-wiring, drift guard).
+- [`RESTRUCTURE_PLAN.md`](RESTRUCTURE_PLAN.md) — Phase-6 inventory of the (already clean-layered) architecture. NOTE: the codebase was already clean layering, NOT parallel math trees; Phase 7 then closed the residual real gaps — deleted the dead `kernels/tpu/` duplicate, de-inlined 3 optimizers' Adam math to `algorithms/`, hardened the drift guard to catch re-inlining, made the C++ dispatch table generator-driven, and vectorized the 11 gfx942 apply-steps.
+- `PHASE{2,3,4,5,7}_REPORT.md` — the incremental build history (real compositions, register pass, AMD device live-wiring + vectorization, enforced drift guard, dead-tree removal).
 - `csrc/algorithms/SOURCE_OF_TRUTH.md` — the optimizer-math canonical contract.
+
+> **Implementation-maximal.** Across sm_90 / gfx942 / tpu the implementation is
+> complete: single canonical math source per component (enforced), no dead
+> duplicate trees, generator-driven dispatch, vectorized AMD apply-steps. The
+> ONLY remaining work class is on-silicon validation (gap #7) — the
+> `HARDWARE_VALIDATION.md` runbook on real H100 / MI300X / TPU v5p — to move 🟡 → ✅.
