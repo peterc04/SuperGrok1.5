@@ -303,6 +303,36 @@ __device__ __forceinline__ float neuralgrok_psi(
     return h_acc + b2;
 }
 
+// Per-element NeuralGrok apply — the canonical scalar body, shared by the scalar
+// tail and (replicated lane-by-lane) the f32x4 fast-path so both are bit-identical.
+// The psi-net amplifier scalar is computed PER ELEMENT from |g| (the tiny H-wide
+// ReLU MLP), then the Adam apply runs on the amplified gradient.
+template <typename ParamT, typename GradT, int H>
+__device__ __forceinline__ void neuralgrok_apply_elem(
+    ParamT* __restrict__ param, float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq, const GradT* __restrict__ grad, int i,
+    const float* __restrict__ psi_W1, const float* __restrict__ psi_b1,
+    const float* __restrict__ psi_W2, float psi_b2,
+    float alpha, float beta,
+    float lr, float beta1, float beta2, float eps, float wd, float bc1, float bc2)
+{
+    const float g = static_cast<float>(amd::streaming_load(&grad[i]));
+    const float p = static_cast<float>(param[i]);
+
+    const float s = neuralgrok_psi<H>(__builtin_fabsf(g),
+                                      psi_W1, psi_b1, psi_W2, psi_b2);
+    const float g_amp = (s * alpha + beta) * g;
+
+    const float m = beta1 * exp_avg[i]    + (1.0f - beta1) * g_amp;
+    const float v = beta2 * exp_avg_sq[i] + (1.0f - beta2) * g_amp * g_amp;
+    exp_avg[i]    = m;
+    exp_avg_sq[i] = v;
+
+    const float update = (m / bc1) / (__builtin_sqrtf(v / bc2) + eps);
+    amd::streaming_store(&param[i],
+                         static_cast<ParamT>(p - lr * (update + wd * p)));
+}
+
 template <typename ParamT, typename GradT, int H>
 __global__ void neuralgrok_gfx942_kernel(
     ParamT* __restrict__ param, float* __restrict__ exp_avg,
@@ -314,24 +344,52 @@ __global__ void neuralgrok_gfx942_kernel(
     float bc1, float bc2, int N)
 {
     const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
-    for (int i = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
-                 + static_cast<int>(threadIdx.x);
-         i < N; i += stride) {
-        const float g = static_cast<float>(amd::streaming_load(&grad[i]));
-        const float p = static_cast<float>(param[i]);
+    const int tid    = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
+                       + static_cast<int>(threadIdx.x);
 
-        const float s = neuralgrok_psi<H>(__builtin_fabsf(g),
-                                          psi_W1, psi_b1, psi_W2, psi_b2);
-        const float g_amp = (s * alpha + beta) * g;
+    // VECTORIZED fast-path: 128-bit (dwordx4) memory access, only for plain fp32
+    // param/grad. The psi MLP is evaluated PER LANE (it is a per-element scalar
+    // map of |g|, no cross-lane contraction), then the Adam apply is vectorized.
+    constexpr bool kVecOk =
+        sizeof(ParamT) == sizeof(float) && sizeof(GradT) == sizeof(float);
+    const int n4 = kVecOk ? (N >> 2) : 0;   // number of full float4 groups
 
-        const float m = beta1 * exp_avg[i]    + (1.0f - beta1) * g_amp;
-        const float v = beta2 * exp_avg_sq[i] + (1.0f - beta2) * g_amp * g_amp;
-        exp_avg[i]    = m;
-        exp_avg_sq[i] = v;
+    using f32x4 = amd::f32x4;
+    auto* p4 = reinterpret_cast<f32x4*>(param);
+    auto* m4 = reinterpret_cast<f32x4*>(exp_avg);
+    auto* v4 = reinterpret_cast<f32x4*>(exp_avg_sq);
+    const auto* g4 = reinterpret_cast<const f32x4*>(grad);
 
-        const float update = (m / bc1) / (__builtin_sqrtf(v / bc2) + eps);
-        amd::streaming_store(&param[i],
-                             static_cast<ParamT>(p - lr * (update + wd * p)));
+    for (int q = tid; q < n4; q += stride) {
+        const f32x4 g = amd::streaming_load(&g4[q]);   // 128-bit dwordx4 load
+        const f32x4 p = p4[q];
+        const f32x4 ea = m4[q];
+        const f32x4 ev = v4[q];
+        f32x4 mo, vo, po;
+        // 4 lanes, each evaluating the IDENTICAL per-element psi + Adam math.
+        for (int l = 0; l < 4; ++l) {
+            const float s = neuralgrok_psi<H>(__builtin_fabsf(g[l]),
+                                              psi_W1, psi_b1, psi_W2, psi_b2);
+            const float g_amp = (s * alpha + beta) * g[l];
+            const float m = beta1 * ea[l] + (1.0f - beta1) * g_amp;
+            const float v = beta2 * ev[l] + (1.0f - beta2) * g_amp * g_amp;
+            mo[l] = m;
+            vo[l] = v;
+            const float update = (m / bc1) / (__builtin_sqrtf(v / bc2) + eps);
+            po[l] = p[l] - lr * (update + wd * p[l]);
+        }
+        m4[q] = mo;
+        v4[q] = vo;
+        amd::streaming_store(&p4[q], po);              // 128-bit dwordx4 store
+    }
+
+    // SCALAR TAIL: the final N%4 elements (and the whole array when kVecOk is
+    // false / N<4). Grid-strided over the remaining indices.
+    for (int i = (n4 << 2) + tid; i < N; i += stride) {
+        neuralgrok_apply_elem<ParamT, GradT, H>(
+            param, exp_avg, exp_avg_sq, grad, i,
+            psi_W1, psi_b1, psi_W2, psi_b2, alpha, beta,
+            lr, beta1, beta2, eps, wd, bc1, bc2);
     }
 }
 

@@ -535,6 +535,80 @@ extern "C" __global__ void muon_gfx942_newton_schulz(
     for (int i = lane; i < rect; i += kWave) amd::streaming_store(&X_inout[i], Xf[i]);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// §5.3  Muon APPLY — per-element param update (elementwise, vectorized only; NO
+// DPP — the cross-lane ‖buf‖_F reduction is §5.1 and the orthogonalization is the
+// §5.2 MFMA Newton-Schulz; both stay as-is).
+//
+// Once the orthogonalized iterate `orth` (= X, post-Newton-Schulz) and the two
+// host scalars are known, the apply is the decoupled-weight-decay step from
+// launch_muon_update() / launch_muon_step() stage (5):
+//   param = param·decay + neg_lr_scale·orth
+// where decay = 1 - lr·wd and neg_lr_scale = -lr·0.2·sqrt(max(rows,cols)) are
+// uniform host scalars. Math is verbatim from the ATen body
+// (param.mul_(1 - decay_factor).add_(orth, neg_lr_scale), here folded as
+// param·decay + neg_lr_scale·orth with decay = 1 - decay_factor).
+//
+// VECTORIZATION (WS5/B — scalar→f32x4): the fp32 path is bandwidth-bound, so the
+// bulk loop is widened to 128-bit (dwordx4) memory access. orth is vector-loaded
+// via amd::streaming_load<f32x4> (read-once); param is vector-loaded and the
+// write-once result goes through amd::streaming_store<f32x4>. The 4 lanes each
+// evaluate the IDENTICAL scalar expression (uniform decay/neg_lr_scale on all
+// lanes), so the result is BIT-IDENTICAL to the scalar path — only the access
+// width changes. A scalar TAIL handles the final N%4 (and the whole array on the
+// fp32-only fallback).
+// ════════════════════════════════════════════════════════════════════════════
+
+// Per-element Muon apply — canonical scalar body, shared by the scalar tail and
+// (replicated lane-by-lane) the f32x4 fast-path so both are bit-identical.
+template <typename ParamT, typename OrthT>
+__device__ __forceinline__ void muon_apply_elem(
+    ParamT* __restrict__ param, const OrthT* __restrict__ orth, int i,
+    float decay, float neg_lr_scale)
+{
+    const float p = static_cast<float>(param[i]);
+    const float x = static_cast<float>(amd::streaming_load(&orth[i]));
+    amd::streaming_store(&param[i],
+                         static_cast<ParamT>(p * decay + neg_lr_scale * x));
+}
+
+template <typename ParamT, typename OrthT>
+__global__ void muon_gfx942_apply_kernel(
+    ParamT* __restrict__ param, const OrthT* __restrict__ orth,
+    float decay, float neg_lr_scale, int N)
+{
+    const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    const int tid    = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
+                       + static_cast<int>(threadIdx.x);
+
+    constexpr bool kVecOk =
+        sizeof(ParamT) == sizeof(float) && sizeof(OrthT) == sizeof(float);
+    const int n4 = kVecOk ? (N >> 2) : 0;   // number of full float4 groups
+
+    using f32x4 = amd::f32x4;
+    auto* p4 = reinterpret_cast<f32x4*>(param);
+    const auto* x4 = reinterpret_cast<const f32x4*>(orth);
+
+    for (int q = tid; q < n4; q += stride) {
+        const f32x4 p = p4[q];
+        const f32x4 x = amd::streaming_load(&x4[q]);   // 128-bit dwordx4 load (orth)
+        f32x4 po;
+        for (int l = 0; l < 4; ++l) {
+            po[l] = p[l] * decay + neg_lr_scale * x[l];
+        }
+        amd::streaming_store(&p4[q], po);              // 128-bit dwordx4 store
+    }
+
+    // SCALAR TAIL: the final N%4 elements (and the whole array on fp32 fallback).
+    for (int i = (n4 << 2) + tid; i < N; i += stride) {
+        muon_apply_elem(param, orth, i, decay, neg_lr_scale);
+    }
+}
+
+// Force-instantiate the grokking dtype combo (fp32 param + fp32 orth iterate).
+template __global__ void muon_gfx942_apply_kernel<float, float>(
+    float*, const float*, float, float, int);
+
 }}} // namespace sg::gfx942::native
 #endif  // (B) device pass
 

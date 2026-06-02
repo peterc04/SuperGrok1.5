@@ -208,6 +208,16 @@ extern "C" __global__ void moe_scatter_results_kernel(
     const float*, const int*, float*, int, int, int);
 extern "C" __global__ void moe_expert_histogram_kernel(
     const float*, unsigned*, float, int, int);
+// Per-element AdamW apply (§5.ADAM; defined in section B below) — the standalone
+// elementwise apply tail of the MoE/Adam multi-tensor path (launch_moe_adam_step).
+// m/v EMA + bias-corrected decoupled-WD apply. Vectorized to 128-bit (f32x4)
+// memory access with a scalar tail.
+template <typename ParamT, typename GradT>
+__global__ void sg2_gfx942_adam_apply(
+    ParamT* __restrict__ param, float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq, const GradT* __restrict__ grad,
+    float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2, int N);
 }  // namespace native
 #endif  // __HIPCC__
 
@@ -1533,6 +1543,24 @@ void launch_moe_adam_step(
         auto& m = exp_avgs[i];
         auto& v = exp_avg_sqs[i];
 
+#if defined(__HIPCC__)
+        // LIVE device path: the §5.ADAM f32x4-vectorized AdamW apply fuses the m/v
+        // EMAs and the bias-corrected decoupled-WD apply into ONE launch (128-bit
+        // dwordx4 access). float param/grad only; other dtypes fall back to ATen.
+        if (p.scalar_type() == torch::kFloat32 && g.scalar_type() == torch::kFloat32 &&
+            p.is_contiguous() && g.is_contiguous() &&
+            m.is_contiguous() && v.is_contiguous()) {
+            int n = static_cast<int>(p.numel());
+            hipStream_t stream = at::hip::getCurrentHIPStream();
+            dim3 grid(std::min(1024, (n + 255) / 256)), block(256);
+            hipLaunchKernelGGL((native::sg2_gfx942_adam_apply<float, float>),
+                               grid, block, 0, stream,
+                               p.data_ptr<float>(), m.data_ptr<float>(),
+                               v.data_ptr<float>(), g.data_ptr<float>(),
+                               lr, beta1, beta2, eps, wd, bc1, bc2, n);
+            continue;
+        }
+#endif
         prim::ema_update_inplace(m, g, beta1);
         prim::ema_sq_update_inplace(v, g, beta2);
         prim::adam_apply_inplace(p, m, v, lr, bc1, bc2, eps, wd);
@@ -2468,6 +2496,99 @@ template __global__ void sg2_hca_attention_fwd_mfma<4>(
 // these device kernels (ATen oracle stays the host/CPU fallback only).
 #include "csrc/backends/hip/gfx942/supergrok2_bilevel_adjoint_gfx942.hip.hpp"
 #include "csrc/backends/hip/gfx942/moe_compaction_gfx942.hip.hpp"
+
+// ── §5.ADAM  per-element AdamW apply (128-bit / f32x4 vectorized) ─────────────
+// The standalone elementwise apply tail of the MoE/Adam multi-tensor path
+// (launch_moe_adam_step). Lives in sg::gfx942::native (matching the MoE
+// compaction kernels + the host forward-decl). BIT-IDENTICAL to the ATen host
+// path (primitives.hpp ema_update_inplace / ema_sq_update_inplace /
+// adam_apply_inplace):
+//   m   = beta1*m + (1-beta1)*g
+//   v   = beta2*v + (1-beta2)*g*g
+//   m_hat = m/bc1 ; v_hat = v/bc2 ; denom = sqrt(v_hat)+eps
+//   p  -= lr*(m_hat/denom + wd*p)
+// Memory access widens to 128-bit dwordx4 (f32x4 streaming_load/streaming_store
+// on param/exp_avg/exp_avg_sq/grad); the scalar tail runs the identical math on
+// the n%4 remainder. Per-lane math, order, constants and __builtin_sqrtf are
+// unchanged from the scalar form — only the access width changes.
+//
+// SCOPE: this is the ONLY cleanly-vectorizable elementwise apply in SG2. The
+// CSA/HCA single-param apply tail (sg2_step_one_param, §(8)-(10)) is FUSED into
+// the per-parameter attention/GRU/PEER pipeline (its smart_grad depends on the
+// per-row GRU output gru_new[:,0] and uses the coupled-WD form p*=(1-lr*wd)) —
+// it is matmul/structured-fused, NOT a standalone elementwise kernel, so it
+// stays on the ATen host path. The attention MFMA, PEER, GRU and softmax-DPP
+// device kernels are matmul/reduction-shaped and are left untouched.
+namespace sg { namespace gfx942 { namespace native {
+namespace amd_apply = ::sg::gfx942::amdgcn;
+using f32x4 = ::sg::gfx942::amdgcn::f32x4;
+
+// Identical per-element apply (used by both the f32x4 lanes and the scalar tail).
+__device__ __forceinline__ float sg2_adam_apply_elem(
+    float* __restrict__ pp, float* __restrict__ pm, float* __restrict__ pv,
+    float g_i, float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2)
+{
+    float m = beta1 * (*pm) + (1.0f - beta1) * g_i;
+    float v = beta2 * (*pv) + (1.0f - beta2) * g_i * g_i;
+    *pm = m;
+    *pv = v;
+    float m_hat = m / bc1;
+    float v_hat = v / bc2;
+    float denom = __builtin_sqrtf(v_hat) + eps;
+    float update = m_hat / denom + wd * (*pp);
+    return (*pp) - lr * update;
+}
+
+template <typename ParamT, typename GradT>
+__global__ void sg2_gfx942_adam_apply(
+    ParamT* __restrict__ param, float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq, const GradT* __restrict__ grad,
+    float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2, int N)
+{
+    const int gtid   = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
+                       + static_cast<int>(threadIdx.x);
+    const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    const int n4     = N & ~3;   // largest multiple of 4 <= N
+
+    // Vectorized body: 4 contiguous floats / iter via f32x4 (128-bit access).
+    for (int base = gtid * 4; base < n4; base += stride * 4) {
+        f32x4 pv4 = amd_apply::streaming_load(reinterpret_cast<const f32x4*>(param + base));
+        f32x4 mv4 = amd_apply::streaming_load(reinterpret_cast<const f32x4*>(exp_avg + base));
+        f32x4 vv4 = amd_apply::streaming_load(reinterpret_cast<const f32x4*>(exp_avg_sq + base));
+        f32x4 gv4 = amd_apply::streaming_load(reinterpret_cast<const f32x4*>(grad + base));
+        f32x4 ov4;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float pj = pv4[j], mj = mv4[j], vj = vv4[j];
+            ov4[j] = sg2_adam_apply_elem(&pj, &mj, &vj, gv4[j],
+                                         lr, beta1, beta2, eps, wd, bc1, bc2);
+            mv4[j] = mj;
+            vv4[j] = vj;
+        }
+        amd_apply::streaming_store(reinterpret_cast<f32x4*>(exp_avg + base), mv4);
+        amd_apply::streaming_store(reinterpret_cast<f32x4*>(exp_avg_sq + base), vv4);
+        amd_apply::streaming_store(reinterpret_cast<f32x4*>(param + base), ov4);
+    }
+
+    // Scalar tail: the n%4 remainder, identical per-element function.
+    for (int i = n4 + gtid; i < N; i += stride) {
+        float pi = param[i], mi = exp_avg[i], vi = exp_avg_sq[i];
+        float out = sg2_adam_apply_elem(&pi, &mi, &vi, grad[i],
+                                        lr, beta1, beta2, eps, wd, bc1, bc2);
+        exp_avg[i]    = mi;
+        exp_avg_sq[i] = vi;
+        param[i]      = out;
+    }
+}
+
+// Force-instantiate the <float,float> apply the host launcher dispatches.
+template __global__ void sg2_gfx942_adam_apply<float, float>(
+    float*, float*, float*, const float*,
+    float, float, float, float, float, float, float, int);
+
+}}}  // namespace sg::gfx942::native
 #endif  // (B) device pass
 
 #endif  // GROKKING_KERNELS_GFX942_SUPERGROK2_GFX942_HIP_HPP_
