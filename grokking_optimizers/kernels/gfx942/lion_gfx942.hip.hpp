@@ -230,7 +230,7 @@ __device__ __forceinline__ void lion_apply_elem(
 }
 
 template <typename ParamT, typename GradT>
-__global__ void lion_gfx942_kernel(
+SG_KERNEL_BOUNDS(256, 8) void lion_gfx942_kernel(
     ParamT* __restrict__ param, float* __restrict__ exp_avg,
     const GradT* __restrict__ grad,
     float lr, float beta1, float beta2, float wd, int N)

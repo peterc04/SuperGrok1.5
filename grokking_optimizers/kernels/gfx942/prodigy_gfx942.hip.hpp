@@ -349,10 +349,36 @@ __device__ __forceinline__ void prodigy_rs_block(
     const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
     const float d2   = d_prev * d_prev;
 
+    // VECTORIZED reduction body (WS5/item 6): widen the 3-buffer read to 128-bit
+    // (f32x4 / dwordx4) memory access — was three scalar loads/iter. The 4 lanes
+    // accumulate the IDENTICAL scalar partials (r_i = g_i·(p_init_i−p_i)·d_prev,
+    // s_i = d²·|g_i|), so the per-thread partials are bit-identical to the scalar
+    // form — only the access width changes. A scalar TAIL covers the n%4 remainder.
+    // NONTEMPORAL POLICY: g is the read-once grad → streaming (nontemporal); p is
+    // the current param (read here, written by the apply → recurring) and p_init
+    // is re-read every step → both CACHED (keep L2-resident).
+    using f32x4 = amd::f32x4;
+    const int n4v   = n & ~3;            // largest multiple of 4 <= n
+    const auto* g4  = reinterpret_cast<const f32x4*>(g);
+    const auto* p4  = reinterpret_cast<const f32x4*>(p);
+    const auto* pi4 = reinterpret_cast<const f32x4*>(p_init);
+
     float r_local = 0.f, s_local = 0.f;
-    for (int i = gtid; i < n; i += stride) {
+    for (int q = gtid; q < (n4v >> 2); q += stride) {
+        const f32x4 gv  = amd::streaming_load(&g4[q]);   // read-once grad
+        const f32x4 pv  = amd::cached_load(&p4[q]);      // recurring param (cached)
+        const f32x4 piv = amd::cached_load(&pi4[q]);     // p_init re-read (cached)
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            float delta = piv[l] - pv[l];
+            r_local += gv[l] * delta * d_prev;
+            s_local += d2 * dabsf(gv[l]);
+        }
+    }
+    // SCALAR TAIL: the final n%4 elements, identical per-element partials.
+    for (int i = n4v + gtid; i < n; i += stride) {
         float gi = amd::streaming_load(&g[i]);
-        float delta = amd::streaming_load(&p_init[i]) - amd::streaming_load(&p[i]);
+        float delta = amd::cached_load(&p_init[i]) - amd::cached_load(&p[i]);
         r_local += gi * delta * d_prev;
         s_local += d2 * dabsf(gi);
     }
@@ -378,7 +404,9 @@ __device__ __forceinline__ void prodigy_rs_block(
     }
 }
 
-extern "C" __global__ void prodigy_gfx942_rs_reduce(
+// Bandwidth-bound reduction → high occupancy (256-thread block = 4 wavefronts;
+// 8 waves/EU) to hide global-memory latency. (WS5 occupancy wire.)
+extern "C" SG_KERNEL_BOUNDS(256, 8) void prodigy_gfx942_rs_reduce(
     const float* __restrict__ g, const float* __restrict__ p,
     const float* __restrict__ p_init, float* __restrict__ r_acc,
     float* __restrict__ s_acc, float d_prev, int n)
@@ -435,7 +463,7 @@ __device__ __forceinline__ void prodigy_apply_elem(
 }
 
 template <typename ParamT, typename GradT>
-__global__ void prodigy_gfx942_apply_kernel(
+SG_KERNEL_BOUNDS(256, 8) void prodigy_gfx942_apply_kernel(
     ParamT* __restrict__ param, float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq, float* __restrict__ s_track,
     const GradT* __restrict__ grad, float d_val,

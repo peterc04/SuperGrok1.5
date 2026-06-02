@@ -36,7 +36,9 @@
 // (causal, seq_len=4) and ViT (non-causal, seq_len=17) via kCausal template.
 //
 // Key differences from sm_90:
-//   - Wave size 64: reductions use __shfl_xor / DPP with strides {32..1}
+//   - Wave size 64: reductions use the explicit __builtin_amdgcn_mov_dpp
+//     row-shift + row-broadcast butterfly (NOT __shfl_xor, which can lower to a
+//     ds_bpermute LDS round-trip) — see §5.0 / amd::wave_reduce_add_dpp
 //   - No WGMMA/TMA: BF16 MFMA via __builtin_amdgcn_mfma_f32_16x16x16bf16
 //   - 64 KB LDS per CU (not 228 KB SMEM)
 //   - FULL_WARP_MASK is 0 on HIP (all 64 lanes lockstep)
@@ -84,26 +86,16 @@ struct AttentionLaunchConfig {
     bool use_aiter;
 };
 
-// -- Wave-64 XOR butterfly reductions ----------------------------------------
-__device__ __forceinline__ float wave64_reduce_sum(float val) {
-    val += __shfl_xor(val, 32);
-    val += __shfl_xor(val, 16);
-    val += __shfl_xor(val, 8);
-    val += __shfl_xor(val, 4);
-    val += __shfl_xor(val, 2);
-    val += __shfl_xor(val, 1);
-    return val;
-}
-
-__device__ __forceinline__ float wave64_reduce_max(float val) {
-    val = fmaxf(val, __shfl_xor(val, 32));
-    val = fmaxf(val, __shfl_xor(val, 16));
-    val = fmaxf(val, __shfl_xor(val, 8));
-    val = fmaxf(val, __shfl_xor(val, 4));
-    val = fmaxf(val, __shfl_xor(val, 2));
-    val = fmaxf(val, __shfl_xor(val, 1));
-    return val;
-}
+// -- Wave-64 reductions: see the DEVICE pass (§5.0) ---------------------------
+// NOTE (WS5/item 3 — DPP butterfly, not __shfl_xor): the live softmax wavefront
+// reductions are in the DEVICE pass below — amd::wave_reduce_add_dpp (SUM, the
+// primitives header §2.6) and native::wave_reduce_max_dpp (MAX, §5.0). Both are
+// the explicit __builtin_amdgcn_mov_dpp row-shift + row-broadcast butterfly (one
+// instruction per step, no LDS round-trip). The earlier __shfl_xor host-block
+// helpers here were DEAD (never referenced) and were removed: on CDNA3 __shfl_xor
+// can lower to ds_bpermute (an LDS round-trip), which is exactly the slow path
+// the explicit DPP butterfly avoids — keeping them invited a future copy-paste
+// of the wrong primitive into a device kernel.
 
 // -- External backend forward declarations ------------------------------------
 #ifdef WITH_CK
@@ -738,8 +730,14 @@ __device__ __forceinline__ int attention_lds_bytes_fwd(int N, int D) {
     return score_bytes + pack_bytes;
 }
 
+// MFMA + heavy-LDS kernel: launched single-wavefront (block=64). The forward
+// tile can consume up to the full 64 KB LDS, which caps CU occupancy to ~1
+// wavefront regardless; so request waves_per_eu(1) — that lets the register
+// allocator use the full VGPR file for the MFMA f32 accumulators instead of
+// reserving for unattainable extra waves. (WS5 occupancy wire — the previously
+// dead `waves_per_eu` config field is now a real codegen attribute.)
 template <int kHeadDimT, bool kCausal>
-__global__ void attention_gfx942_fwd_mfma(
+SG_KERNEL_BOUNDS(64, 1) void attention_gfx942_fwd_mfma(
     const short* __restrict__ q, const short* __restrict__ k,
     const short* __restrict__ v, short* __restrict__ out,
     float* __restrict__ softmax_lse, int seq_len, float scale)
@@ -754,7 +752,7 @@ __global__ void attention_gfx942_fwd_mfma(
 }
 
 template <int kHeadDimT, bool kCausal>
-__global__ void attention_gfx942_bwd_mfma(
+SG_KERNEL_BOUNDS(64, 1) void attention_gfx942_bwd_mfma(
     const short* __restrict__ grad_out, const short* __restrict__ q,
     const short* __restrict__ k, const short* __restrict__ v,
     const float* __restrict__ softmax_lse,
