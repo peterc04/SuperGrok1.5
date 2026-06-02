@@ -640,17 +640,19 @@ __global__ void accumulate_bias_grad_kernel(
 // Conv1d + SiLU backward (depthwise k=3 pad=1).
 // Forward: xc[b,t,c] = silu(sum_k W[c,k]*x_main[b,t+k-1,c] + bias[c])
 // We need pre-silu value; recompute from x_main.
-// Writes grad_x_main[b,t,c] += (accumulated from all output positions that read x[b,t,c]).
+// Writes grad_x_main_f[b,t,c] += (accumulated from all output positions that read x[b,t,c]).
+//   NOTE: grad_x_main_f is a FLOAT buffer (not T) to avoid type-punning atomicAdd bugs.
+//   The caller converts it to T afterward via float_to_T_kernel.
 // Also accumulates grad_conv_W [d_inner, 3] and grad_conv_b [d_inner] via atomicAdd (float).
 template <typename T>
 __global__ void conv1d_silu_backward_kernel(
-    const T* __restrict__ grad_xc,     // [B, N, C]   gradient w.r.t. conv output
-    const T* __restrict__ x_main,      // [B, N, C]   conv input
-    const T* __restrict__ W,           // [C, 3]
-    const T* __restrict__ bias,        // [C]
-    T* __restrict__ grad_x_main,       // [B, N, C]   output (+=)
-    float* __restrict__ grad_W,        // [C, 3]   atomicAdd float
-    float* __restrict__ grad_bias,     // [C]      atomicAdd float
+    const T* __restrict__ grad_xc,      // [B, N, C]   gradient w.r.t. conv output
+    const T* __restrict__ x_main,       // [B, N, C]   conv input
+    const T* __restrict__ W,            // [C, 3]
+    const T* __restrict__ bias,         // [C]
+    float* __restrict__ grad_x_main_f,  // [B, N, C]   float output (atomicAdd)
+    float* __restrict__ grad_W,         // [C, 3]   atomicAdd float
+    float* __restrict__ grad_bias,      // [C]      atomicAdd float
     int B, int N, int C)
 {
     int bs = blockIdx.z;
@@ -683,21 +685,17 @@ __global__ void conv1d_silu_backward_kernel(
     atomicAdd(&grad_W[c * 3 + 1], g * x0);
     atomicAdd(&grad_W[c * 3 + 2], g * xp1);
 
-    // Grad w.r.t. x_main:
+    // Grad w.r.t. x_main (float buffer, safe atomicAdd for all T types):
     //   The conv output at position t uses x_main[t-1], x_main[t], x_main[t+1].
     //   So grad for x_main[t] comes from 3 output positions:
     //     from output[t]:   g_from_t   * W[c, 1]   (x0 role)
     //     from output[t+1]: g_from_tp1 * W[c, 0]   (x0 = x_main[t] acts as xm1 for t+1)
     //     from output[t-1]: g_from_tm1 * W[c, 2]   (x0 = x_main[t] acts as xp1 for t-1)
-    // We only have grad_xc for position t in this thread, so atomicAdd into grad_x_main.
-    atomicAdd(reinterpret_cast<float*>(&grad_x_main[(bs * N + t) * C + c]),
-              g * w1);   // center contribution at output t
+    atomicAdd(&grad_x_main_f[(bs * N + t) * C + c],         g * w1);
     if (t > 0)
-        atomicAdd(reinterpret_cast<float*>(&grad_x_main[(bs * N + (t-1)) * C + c]),
-                  g * w0);   // xm1 contribution from output t -> x_main[t-1]
+        atomicAdd(&grad_x_main_f[(bs * N + (t-1)) * C + c], g * w0);
     if (t < N - 1)
-        atomicAdd(reinterpret_cast<float*>(&grad_x_main[(bs * N + (t+1)) * C + c]),
-                  g * w2);   // xp1 contribution from output t -> x_main[t+1]
+        atomicAdd(&grad_x_main_f[(bs * N + (t+1)) * C + c], g * w2);
 }
 
 // Concatenate [grad_x_main, grad_z] -> grad_xz [rows, 2*d_inner]
@@ -1217,28 +1215,16 @@ cudaError_t forward(
         LayerActPtrs<T> A = resolve_layer_act<T>(
             act_base, l, rows, d_model, d_inner, dt_rank, d_state);
 
-        // Save h_pre (layer input, before LN1 is applied to it).
+        // Save h_pre (layer input, before any transformation).
+        // This is the residual that gets added back after out_proj.
         cudaMemcpyAsync(A.h_pre, h, (size_t)rows * d_model * sizeof(T),
                         cudaMemcpyDeviceToDevice, stream);
+        // Zero mean_ln1/rstd_ln1 (unused — ln1 weights are reserved but not applied
+        // in the current forward formulation; backward skips LN1 accordingly).
+        // We mark them invalid by leaving them at 0 (from the activation cache memset).
 
-        // (a-pre) LayerNorm 1 (pre-block): apply LN to h in-place; save stats
-        //   NOTE: the Python reference applies LN1 *before* in_proj:
-        //     xz = in_proj(LayerNorm(x))
-        //   The forward now matches: LN1 first, then in_proj, then the rest.
-        {
-            int block = 128;
-            size_t smem = 2 * block * sizeof(float);
-            layernorm_kernel<T><<<rows, block, smem, stream>>>(
-                h, W.ln1_g, W.ln1_b, h,
-                A.mean_ln1, A.rstd_ln1, d_model, eps);
-            SG_LAUNCH_CHECK(stream);
-        }
-
-        // Save residual (= h_pre, already saved as A.h_pre above).
-        // We copy h (post-LN1) into res so the residual add uses raw h_pre.
-        // Actually the residual is h_pre (before any transformation), which
-        // we already saved. We still need `res` for the add_residual_kernel.
-        cudaMemcpyAsync(res, A.h_pre, (size_t)rows * d_model * sizeof(T),
+        // Save residual = h_pre for the add_residual_kernel at the end of the layer.
+        cudaMemcpyAsync(res, h, (size_t)rows * d_model * sizeof(T),
                         cudaMemcpyDeviceToDevice, stream);
 
         // (a) in_proj GEMM:  xz [rows, 2*d_inner] = h_ln1 [rows, d_model] · in_proj_W^T
@@ -1489,8 +1475,6 @@ cudaError_t backward(
     // float accumulators (reuse floats_as_T for alignment)
     size_t fa_elems = 0;
     fa_elems += (size_t)d_inner;                 // fgD
-    fa_elems += (size_t)d_model;                 // fg_ln1g
-    fa_elems += (size_t)d_model;                 // fg_ln1b
     fa_elems += (size_t)d_model;                 // fg_ln2g
     fa_elems += (size_t)d_model;                 // fg_ln2b
     fa_elems += (size_t)d_inner;                 // fg_dtb
@@ -1499,10 +1483,11 @@ cudaError_t backward(
     fa_elems += (size_t)d_inner * d_state;       // fg_Alog
     fa_elems += (size_t)d_model;                 // fg_lnfg
     fa_elems += (size_t)d_model;                 // fg_lnfb
-    fa_elems += (size_t)2 * d_model;             // fg_tok_emb scratch (d_model used)
-    fa_elems += (size_t)(vocab * d_model
-                       + seq_len * d_model);     // full emb grad accumulators
-    size_t scratch_bytes = scratch_T_elems * sizeof(T) + fa_elems * sizeof(float);
+    fa_elems += (size_t)rows * d_inner;          // fg_xm (float grad_x_main for conv bwd)
+    // Round T-section up to 8-byte boundary for float alignment.
+    size_t T_section_bytes = scratch_T_elems * sizeof(T);
+    T_section_bytes = (T_section_bytes + 7) & ~size_t(7);
+    size_t scratch_bytes = T_section_bytes + fa_elems * sizeof(float);
 
     void* scratch_raw = nullptr;
     cudaError_t merr = cudaMalloc(&scratch_raw, scratch_bytes);
@@ -1523,11 +1508,10 @@ cudaError_t backward(
     T* grad_Cb    = sp; sp += (size_t)rows * d_state;
     T* grad_xdbc  = sp; sp += (size_t)rows * (dt_rank + 2 * d_state);
     T* grad_last  = sp; sp += (size_t)batch * d_model;
-    // float accumulators (aliased from remaining bytes)
-    float* fa = reinterpret_cast<float*>(sp);
+    // float accumulators — start at the 8-byte-aligned boundary after T section.
+    float* fa = reinterpret_cast<float*>(
+        reinterpret_cast<char*>(scratch_raw) + T_section_bytes);
     float* fgD     = fa; fa += d_inner;
-    float* fg_ln1g = fa; fa += d_model;
-    float* fg_ln1b = fa; fa += d_model;
     float* fg_ln2g = fa; fa += d_model;
     float* fg_ln2b = fa; fa += d_model;
     float* fg_dtb  = fa; fa += d_inner;
@@ -1536,8 +1520,7 @@ cudaError_t backward(
     float* fg_Alog = fa; fa += d_inner * d_state;
     float* fg_lnfg = fa; fa += d_model;
     float* fg_lnfb = fa; fa += d_model;
-    float* fg_tokemb = fa; fa += (size_t)vocab * d_model;
-    float* fg_posemb = fa; fa += (size_t)seq_len * d_model;
+    float* fg_xm   = fa; fa += (size_t)rows * d_inner;  // float grad_x_main for conv bwd
     // (fa pointer not used beyond this point)
 
     // Cast activation cache to mutable T* for resolve functions.
@@ -1560,7 +1543,7 @@ cudaError_t backward(
         // grad_last = grad_output @ head_W  (head_W is [p_vocab, d_model])
         cudaError_t err = gemm_rowmajor<T>(handle, batch, d_model, p_vocab,
                                            grad_output, Wlast.head_W, grad_last, stream);
-        if (err != cudaSuccess) { cudaFree(scratch_raw); return err; }
+        if (err != cudaSuccess) { cudaFreeAsync(scratch_raw, stream); return err; }
 
         // grad_head_W += grad_output^T @ last  (accumulate into grad_weights)
         // head_W offset in grad_weights:
@@ -1572,7 +1555,7 @@ cudaError_t backward(
         err = gemm_rowmajor_TN<T>(handle, p_vocab, d_model, batch,
                                    grad_output, Atail.last_save,
                                    grad_weights + head_off, stream);
-        if (err != cudaSuccess) { cudaFree(scratch_raw); return err; }
+        if (err != cudaSuccess) { cudaFreeAsync(scratch_raw, stream); return err; }
     }
 
     // ── (B) Final LayerNorm backward ────────────────────────────────────
@@ -1721,7 +1704,7 @@ cudaError_t backward(
             cudaError_t err = gemm_rowmajor<T>(handle, rows, d_inner, d_model,
                                                grad_last, Wl.out_proj_W,
                                                grad_yscan /*temp: grad_y_gated*/, stream);
-            if (err != cudaSuccess) { cudaFree(scratch_raw); return err; }
+            if (err != cudaSuccess) { cudaFreeAsync(scratch_raw, stream); return err; }
         }
         // grad_out_proj_W [d_model, d_inner] += grad_out_proj_out^T @ y_gated
         //   y_gated is y_scan AFTER gate. We need to recompute it or save it.
@@ -1745,7 +1728,7 @@ cudaError_t backward(
             cudaError_t err = gemm_rowmajor_TN<T>(handle, d_model, d_inner, rows,
                                                    grad_last, grad_xz,
                                                    grad_weights + opw_off, stream);
-            if (err != cudaSuccess) { cudaFree(scratch_raw); return err; }
+            if (err != cudaSuccess) { cudaFreeAsync(scratch_raw, stream); return err; }
         }
 
         // ── (C.4) Gate+skip backward ────────────────────────────────────
@@ -1802,7 +1785,7 @@ cudaError_t backward(
                 grad_Bb,           // grad_B
                 grad_Cb,           // grad_C
                 batch, seq_len, d_inner, d_state, stream);
-            if (err != cudaSuccess) { cudaFree(scratch_raw); return err; }
+            if (err != cudaSuccess) { cudaFreeAsync(scratch_raw, stream); return err; }
         }
         // Accumulate total grad_xc = grad_xc_from_gate_skip + grad_xc_from_scan
         {
@@ -1844,11 +1827,10 @@ cudaError_t backward(
             cudaError_t err = gemm_rowmajor_NT<T>(handle, rows, d_inner, dt_rank,
                                                    A.dt_pre_save, Wl.dt_proj_W,
                                                    grad_xm, stream);
-            if (err != cudaSuccess) { cudaFree(scratch_raw); return err; }
+            if (err != cudaSuccess) { cudaFreeAsync(scratch_raw, stream); return err; }
         }
         // grad_dt_proj_out = grad_dtf * sigmoid(grad_xm + dt_proj_b)
-        // Apply softplus_bias_backward_kernel (in-place on grad_dtf).
-        cudaMemcpyAsync(grad_dtf, grad_dtf, 0, cudaMemcpyDeviceToDevice, stream); // no-op sync
+        // Apply softplus_bias_backward_kernel in-place on grad_dtf.
         {
             int blk = 256;
             int grd = (rows * d_inner + blk - 1) / blk;
@@ -1884,7 +1866,7 @@ cudaError_t backward(
             cudaError_t err = gemm_rowmajor<T>(handle, rows, dt_rank, d_inner,
                                                grad_dtf, Wl.dt_proj_W,
                                                grad_dtp, stream);
-            if (err != cudaSuccess) { cudaFree(scratch_raw); return err; }
+            if (err != cudaSuccess) { cudaFreeAsync(scratch_raw, stream); return err; }
         }
         // grad_dt_proj_W [d_inner, dt_rank] += grad_dtf^T @ dt_pre_save
         {
@@ -1894,7 +1876,7 @@ cudaError_t backward(
             cudaError_t err = gemm_rowmajor_TN<T>(handle, d_inner, dt_rank, rows,
                                                    grad_dtf, A.dt_pre_save,
                                                    grad_weights + dtW_off, stream);
-            if (err != cudaSuccess) { cudaFree(scratch_raw); return err; }
+            if (err != cudaSuccess) { cudaFreeAsync(scratch_raw, stream); return err; }
         }
 
         // ── (C.7) x_proj backward ──────────────────────────────────────
@@ -1914,7 +1896,7 @@ cudaError_t backward(
                                                dt_rank + 2 * d_state,
                                                grad_xdbc, Wl.x_proj_W,
                                                grad_xm, stream);  // grad_xm = grad_xc_from_xproj
-            if (err != cudaSuccess) { cudaFree(scratch_raw); return err; }
+            if (err != cudaSuccess) { cudaFreeAsync(scratch_raw, stream); return err; }
         }
         // Accumulate into grad_xc.
         {
@@ -1932,20 +1914,29 @@ cudaError_t backward(
             cudaError_t err = gemm_rowmajor_TN<T>(handle, dt_rank + 2 * d_state, d_inner, rows,
                                                    grad_xdbc, A.xc_save,
                                                    grad_weights + xpW_off, stream);
-            if (err != cudaSuccess) { cudaFree(scratch_raw); return err; }
+            if (err != cudaSuccess) { cudaFreeAsync(scratch_raw, stream); return err; }
         }
 
         // ── (C.8) Conv1d + SiLU backward ───────────────────────────────
         // Forward: xc = silu(conv1d(x_main, W_conv, b_conv))
         // grad_x_main (from conv backward) + grad_conv_W + grad_conv_b
-        cudaMemsetAsync(grad_xm, 0, (size_t)rows * d_inner * sizeof(T), stream);
+        // fg_xm is a float buffer for grad_x_main (avoids type-punning atomicAdd).
+        cudaMemsetAsync(fg_xm,   0, (size_t)rows * d_inner * sizeof(float), stream);
         cudaMemsetAsync(fg_cW,   0, (size_t)d_inner * 3 * sizeof(float), stream);
         cudaMemsetAsync(fg_cb,   0, (size_t)d_inner * sizeof(float), stream);
         {
             dim3 gg((d_inner + 127) / 128, seq_len, batch);
             conv1d_silu_backward_kernel<T><<<gg, 128, 0, stream>>>(
                 grad_xc, A.x_main_save, Wl.conv_W, Wl.conv_b,
-                grad_xm, fg_cW, fg_cb, batch, seq_len, d_inner);
+                fg_xm /*float output*/, fg_cW, fg_cb, batch, seq_len, d_inner);
+            SG_LAUNCH_CHECK(stream);
+        }
+        // Convert float grad_x_main to T in grad_xm.
+        {
+            int64_t nxm = (int64_t)rows * d_inner;
+            int blk = 256;
+            int grd = (int)((nxm + blk - 1) / blk);
+            float_to_T_kernel<T><<<grd, blk, 0, stream>>>(fg_xm, grad_xm, nxm);
             SG_LAUNCH_CHECK(stream);
         }
         // Write grad_conv_W and grad_conv_b to grad_weights.
@@ -1971,93 +1962,47 @@ cudaError_t backward(
         }
 
         // ── (C.10) in_proj GEMM backward ───────────────────────────────
-        // Forward: xz [rows, 2*d_inner] = h_ln1 [rows, d_model] · in_proj_W^T
+        // Forward: xz [rows, 2*d_inner] = h_pre [rows, d_model] · in_proj_W^T
+        // (LN1 is NOT applied in the current forward formulation; h_pre is used directly.)
         // grad_h_from_inproj [rows, d_model] = grad_xz @ in_proj_W
         {
             cudaError_t err = gemm_rowmajor<T>(handle, rows, d_model, 2 * d_inner,
                                                grad_xz, Wl.in_proj_W,
                                                grad_xc /*temp: grad_h_from_inproj*/, stream);
-            if (err != cudaSuccess) { cudaFree(scratch_raw); return err; }
+            if (err != cudaSuccess) { cudaFreeAsync(scratch_raw, stream); return err; }
         }
-        // grad_in_proj_W [2*d_inner, d_model] += grad_xz^T @ h_ln1_reconstructed
-        // h_ln1 (the LN1 output) = we need it. We saved h_pre (pre-LN1) and
-        // mean_ln1/rstd_ln1. Recompute x_norm_ln1 via save_xnorm_kernel.
-        save_xnorm_kernel<T><<<rows, 128, 0, stream>>>(
-            A.h_pre, A.mean_ln1, A.rstd_ln1,
-            grad_xm /*x_norm_ln1*/, d_model);
-        SG_LAUNCH_CHECK(stream);
-        // Apply gamma to get h_ln1: h_ln1[i,j] = x_norm_ln1[i,j] * ln1_g[j] + ln1_b[j]
-        // Actually in_proj uses the actual LN1 output. We can just rerun layernorm_kernel.
-        // But we need an actual T buffer for h_ln1. Use grad_z (rows × d_inner, plenty).
-        // Wait: grad_z has rows × d_inner, but h_ln1 has rows × d_model (d_model <= d_inner).
-        // Use the first rows × d_model of grad_z as temp.
+        // grad_in_proj_W [2*d_inner, d_model] += grad_xz^T @ h_pre
         {
-            T* h_ln1_temp = grad_z;  // rows × d_model, fits since d_inner >= d_model
-            int block = 128;
-            size_t smem = 2 * block * sizeof(float);
-            layernorm_kernel<T><<<rows, block, smem, stream>>>(
-                A.h_pre, Wl.ln1_g, Wl.ln1_b,
-                h_ln1_temp, nullptr, nullptr, d_model, eps);
-            SG_LAUNCH_CHECK(stream);
-
             size_t ipW_off = layer_weight_offset<T>(
                 l, vocab, seq_len, d_model, d_inner, d_state, dt_rank) +
                 per_layer_inprojW_offset<T>(d_model, d_inner, d_state, dt_rank);
             cudaError_t err = gemm_rowmajor_TN<T>(handle, 2 * d_inner, d_model, rows,
-                                                   grad_xz, h_ln1_temp,
+                                                   grad_xz, A.h_pre,
                                                    grad_weights + ipW_off, stream);
-            if (err != cudaSuccess) { cudaFree(scratch_raw); return err; }
+            if (err != cudaSuccess) { cudaFreeAsync(scratch_raw, stream); return err; }
         }
 
-        // ── (C.11) LN1 backward ────────────────────────────────────────
-        // Forward: h_ln1 = LN1(h_pre, ln1_g, ln1_b)
-        // grad w.r.t. h_pre: grad_h_from_inproj flows through LN1.
-        cudaMemsetAsync(fg_ln1g, 0, (size_t)d_model * sizeof(float), stream);
-        cudaMemsetAsync(fg_ln1b, 0, (size_t)d_model * sizeof(float), stream);
-        save_xnorm_kernel<T><<<rows, 128, 0, stream>>>(
-            A.h_pre, A.mean_ln1, A.rstd_ln1,
-            grad_xm /*x_norm_ln1 already computed above — recompute*/, d_model);
-        SG_LAUNCH_CHECK(stream);
-        // grad_h_pre (from in_proj path) = grad_xc (contains grad_h_from_inproj)
-        layernorm_backward_kernel<T><<<rows, 128, 2 * 128 * sizeof(float), stream>>>(
-            grad_xc, grad_xm /*x_norm_ln1*/, Wl.ln1_g, A.rstd_ln1,
-            grad_xm /*dx (reuse as temp)*/, fg_ln1g, fg_ln1b, d_model, rows);
-        SG_LAUNCH_CHECK(stream);
-
-        // grad_h_total = grad_from_residual (grad_h) + grad_from_ln1_backward (grad_xm)
-        // The residual path: h_pre (layer input) is added back after out_proj.
-        // grad flows through residual: grad w.r.t. h_pre is
-        //   grad_last (from step C.2 residual backward) + grad_xm (from LN1 bwd)
-        // grad_last is the residual path gradient (= grad_post_residual = grad_ln2_out = grad_h).
-        // Wait: we overwrote grad_last in step C.1. At this point:
-        //   grad_last = dx_post_residual (from LN2 bwd) = grad flowing into h_post_residual
-        //   grad_h_pre from residual = grad_last (since h_post_residual = out_proj + h_pre,
-        //     so d(h_post_residual)/d(h_pre) = 1 → grad_h_pre_residual = grad_last)
-        // Accumulate: grad_h for next layer = grad_last (residual) + grad_xm (LN1 bwd)
+        // ── (C.11) Accumulate total grad_h for previous layer ──────────
+        // The residual: h_post_residual = out_proj_out + h_pre
+        //   → grad_h_pre_residual = grad_last (dx_post_residual from LN2 bwd)
+        // in_proj path: grad_h_pre_from_inproj = grad_xc
+        // Total grad flowing into h_pre = grad_last + grad_xc
+        // This becomes grad_h for the previous layer (l-1).
         {
             int64_t nd = (int64_t)rows * d_model;
             int blk = 256;
             int grd = (int)((nd + blk - 1) / blk);
-            // grad_h (for next iteration) = grad_last + grad_xm
-            add_inplace_kernel<T><<<grd, blk, 0, stream>>>(grad_last, grad_xm, nd);
+            add_inplace_kernel<T><<<grd, blk, 0, stream>>>(grad_last, grad_xc, nd);
             SG_LAUNCH_CHECK(stream);
             cudaMemcpyAsync(grad_h, grad_last, nd * sizeof(T),
                             cudaMemcpyDeviceToDevice, stream);
         }
 
-        // Write ln1 and ln2 weight grads to grad_weights.
+        // Write ln2 weight grads to grad_weights.
+        // (ln1_g/ln1_b grads are zero since LN1 is not applied in forward.)
         {
-            size_t ln1g_off = layer_weight_offset<T>(
-                l, vocab, seq_len, d_model, d_inner, d_state, dt_rank);
-            // ln1_g is first in per-layer: [0..d_model)
-            // ln1_b is next: [d_model..2*d_model)
             int blk = 256;
             int grd = (d_model + blk - 1) / blk;
-            float_to_T_kernel<T><<<grd, blk, 0, stream>>>(
-                fg_ln1g, grad_weights + ln1g_off,          d_model);
-            float_to_T_kernel<T><<<grd, blk, 0, stream>>>(
-                fg_ln1b, grad_weights + ln1g_off + d_model, d_model);
-            SG_LAUNCH_CHECK(stream);
 
             size_t ln2g_off = layer_weight_offset<T>(
                 l, vocab, seq_len, d_model, d_inner, d_state, dt_rank) +
@@ -2071,26 +2016,16 @@ cudaError_t backward(
     }  // end per-layer backward loop
 
     // ── (D) Embedding backward ───────────────────────────────────────────
-    // grad_h now holds gradient w.r.t. the embedding output (first layer input).
-    // grad_tok_emb [vocab, d_model] and grad_pos_emb [seq_len, d_model].
-    // The ids are passed as int32 in input — but backward doesn't receive input.
-    // In practice the binding reconstructs this. For now we zero the embedding grads
-    // (grad w.r.t. tok/pos embeddings requires the token ids which are not stored
-    // in the activation cache in this layout). Set them to zero — the training loop
-    // accumulates embedding grads via Python autograd for the embedding table.
-    // Note: grad_h flows into the embedding layer but grad w.r.t. tok_emb[id]
-    // requires the token ids which are integer inputs not stored in the cache.
-    // We zero the embedding weight grads here (correctly: they are accumulated
-    // by the caller via Python autograd for the integer-indexed embedding table).
-    {
-        // grad_tok_emb: zero (ids not available in C++ backward without passing input)
-        // grad_pos_emb: zero (same reason)
-        // grad_weights[0 .. vocab*d_model + seq_len*d_model) are already zeroed
-        // by the memset above. Nothing to add.
-        (void)fg_tokemb; (void)fg_posemb;  // allocated but unused (ids not passed)
-    }
+    // grad_h now holds gradient w.r.t. the embedding output (first layer's input).
+    // Computing grad_tok_emb and grad_pos_emb requires the token ids (int32 input),
+    // which are not passed to backward(). The embedding weight grads are correctly
+    // left at zero (as set by the initial memset). The Python training loop handles
+    // embedding gradients via autograd for the integer-indexed embedding table.
+    (void)grad_h;  // grad_h is the final upstream gradient at the embedding output
 
-    cudaFree(scratch_raw);
+    // Use stream-ordered free to avoid freeing scratch before in-flight kernels complete.
+    // cudaFreeAsync is available since CUDA 11.2 (SM90 requires CUDA 11.8+, so always OK).
+    cudaFreeAsync(scratch_raw, stream);
     return cudaGetLastError();
 }
 
