@@ -83,6 +83,6 @@ fix.
 Nothing was executed on an accelerator (none in this env). All of: the
 hipLaunchKernelGGL host-launch glue (needs hipcc), gfx942/SG2-adjoint/MoE numeric
 parity (MI300X), the WS1-Phase-4 L3 re-tier confirmation (`ptxas -v`, H100), and
-TPU runtime (v5p) — are 🟡 in HARDWARE_VALIDATION.md (now a complete 99-cell
+TPU runtime (v6e) — are 🟡 in HARDWARE_VALIDATION.md (now a complete 99-cell
 checklist). Everything else is closed at "implemented + system-verified
 (CPU/clang/nvcc)".

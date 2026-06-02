@@ -194,7 +194,7 @@ and **provably triggers** on injected divergence.
 |------|--------|
 | sm_90 fused L3/L1 + TF32 model GEMM | **LIVE**, nvcc-object-verified; tiers + runtime 🟡 (ptxas/H100) |
 | gfx942 device kernels (11 opt + SG2 fwd/bwd/MoE) | **LIVE on hipcc** (`#if __HIPCC__`); ATen = **FALLBACK** (CPU). clang-gate-verified; host-launch + numerics 🟡 (MI300X) |
-| TPU Pallas fused (33 cells) | **LIVE**, trace+lower-verified; on-TPU runtime 🟡 (v5p) |
+| TPU Pallas fused (33 cells) | **LIVE**, trace+lower-verified; on-TPU runtime 🟡 (v6e) |
 | SG2 bilevel adjoint | **LIVE** (ATen vendor-neutral on CPU; AMDGCN device adjoint on hipcc); numerics 🟡 |
 | math-drift guard | **LIVE + enforced** in `--self-test` |
 

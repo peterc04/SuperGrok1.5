@@ -36,7 +36,7 @@ FORCE_HIP=1 PYTORCH_ROCM_ARCH=gfx942 \
 python -c "import grokking_optimizers._C as c; print('ext loaded', c)"
 ```
 
-### TPU (v5p)
+### TPU (v6e)
 ```bash
 python -c "import jax; print(jax.devices())"   # expect TPU v6e chips
 # Pallas path is pure-Python; no extension build required.
@@ -1703,7 +1703,7 @@ the build works if the dirs are sparse).
 
 ### Stage P2-2: 99 megakernel cells emitted
 - **What**: `megakernel_codegen.py --write-all` materializes 33 sm\_90 .cu +
-  33 gfx942 .hip + 33 tpu\_v5p .py stubs. `dispatch.cpp::wired_fused_cell`
+  33 gfx942 .hip + 33 tpu\_v6e .py stubs. `dispatch.cpp::wired_fused_cell`
   expanded to route all 99. Solver: 53 L3 / 46 L1 / 0 infeasible.
 - **Deferred**: Compile-gate all 33 sm\_90 .cu via nvcc on H100, all 33
   gfx942 .hip via hipcc on MI300X. Profile L3 latency vs unfused per-op.
@@ -1711,14 +1711,14 @@ the build works if the dirs are sparse).
 ### Stage P2-4: TPU parity — pallas\_expert\_gather implemented
 - **What**: Real Pallas-tiled gather kernel replaces pure-JAX stub. All TPU
   optimizer/model kernels now have JAX/Pallas implementations.
-- **Deferred**: Profile pallas\_expert\_gather on v5p, confirm gather < 5%
+- **Deferred**: Profile pallas\_expert\_gather on v6e, confirm gather < 5%
   of step time (the implementation threshold from the original comment).
 
 | stage | cell | deferred check | command ref |
 |-------|------|----------------|-------------|
 | P2-1 | bilevel\_cuda\_vs\_autograd | C++ VJP matches autograd to rtol=1e-5 on H100/MI300X | §P2-1 bilevel\_step |
 | P2-2 | 99\_cell\_compile\_gate | nvcc/hipcc compile all 66 GPU cells | §P2-2 megakernel\_codegen |
-| P2-4 | pallas\_expert\_gather\_perf | gather < 5% of step on v5p | §P2-4 \_pallas\_kernels.py |
+| P2-4 | pallas\_expert\_gather\_perf | gather < 5% of step on v6e | §P2-4 \_pallas\_kernels.py |
 
 ## Phase 3 additions (real component compositions — sm_90)
 

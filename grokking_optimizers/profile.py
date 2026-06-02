@@ -97,7 +97,7 @@ ARCHES: Tuple[str, ...] = (
     "gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1151",
     "gfx1200", "gfx1201",
     # Google / Pallas
-    "tpu_v4", "tpu_v5e", "tpu_v6e", "tpu_v6e", "tpu_v7",
+    "tpu_v4", "tpu_v5e", "tpu_v5p", "tpu_v6e", "tpu_v7",
 )
 
 OPT_CLASS = {

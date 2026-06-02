@@ -4,7 +4,7 @@ Grokking Optimizers — All-Specialized Per-Arch Kernel Build
 Supported arches (3-arch active set):
   - NVIDIA: sm_90 (Hopper: H100/H200)
   - AMD:    gfx942 (CDNA3: MI300X, MI300A)
-  - TPU:    v5p (Pallas via JAX)
+  - TPU:    v6e (Pallas via JAX)
 
 Build fails on unsupported arches. There is no generic-kernel fallback
 and no tier fallback chain. See README.md (Architecture section)

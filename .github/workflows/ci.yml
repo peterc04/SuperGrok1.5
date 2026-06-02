@@ -229,6 +229,7 @@ jobs:
           mkdir -p dry_run_manifests
           python3 -m grokking_optimizers.compile \
             --dry-run-all-archs \
+            --include-bodyless \
             --out dry_run_manifests \
             --no-flag-probe \
             --no-auto-install 2>&1 | tee dry_run.log
