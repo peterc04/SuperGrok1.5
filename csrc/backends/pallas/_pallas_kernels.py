@@ -220,11 +220,14 @@ if _HAS_PALLAS:
         out_shape_tuple = expert_weights.shape[1:] if expert_weights.ndim >= 2 else ()
 
         def gather_kernel(weights_ref, indices_ref, out_ref):
-            tile_idx = indices_ref[...]  # [TILE, top_k]
-            for elem in range(TILE):
-                for k in range(top_k):
-                    eidx = tile_idx[elem, k]
-                    out_ref[elem, k] = weights_ref[eidx]
+            # Vectorised gather: one batched advanced-index over the whole tile
+            # instead of a TILE*top_k scalar Python loop with per-element
+            # ``.at[].set``. ``weights_ref[...]`` is the [num_experts, D] table
+            # resident in VMEM; ``flat_weights[idx]`` produces [TILE, top_k, D]
+            # in a single gather. Same result, no per-element scalar ops.
+            flat_weights = weights_ref[...]   # [num_experts, D]
+            tile_idx = indices_ref[...]       # [TILE, top_k]
+            out_ref[...] = flat_weights[tile_idx]  # [TILE, top_k, D]
 
         try:
             gathered = pl.pallas_call(
@@ -660,8 +663,12 @@ def _make_pallas_scan_kernel(tile_size: int):
         correction_Ms = jnp.concatenate([identity_M, prefix_Ms[:-1]], axis=0)  # [num_tiles, 2, 2]
         correction_bs = jnp.concatenate([zero_b, prefix_bs[:-1]], axis=0)      # [num_tiles, 2]
 
-        # Vectorised correction: M_new = M_elem @ corr_M, b_new = M_elem @ corr_b + b_elem
-        corrected_Ms = jnp.einsum('ntij,njk->ntik', M_tiles, correction_Ms[:, None, :, :])
+        # Vectorised correction: M_new = M_elem @ corr_M, b_new = M_elem @ corr_b + b_elem.
+        # ``correction_Ms`` is [num_tiles, 2, 2] (one prefix per tile); it
+        # broadcasts over the within-tile axis ``t`` via the shared ``n`` index.
+        # (The former ``correction_Ms[:, None, :, :]`` made the operand rank-4,
+        # which mismatched the rank-3 ``njk`` subscript and always raised.)
+        corrected_Ms = jnp.einsum('ntij,njk->ntik', M_tiles, correction_Ms)
         corrected_bs = jnp.einsum('ntij,nj->nti', M_tiles, correction_bs) + b_tiles
 
         result_Ms = corrected_Ms.reshape(N_padded, 2, 2)[:N]
@@ -971,8 +978,19 @@ def _make_pallas_persistent_scan_fused_elem(tile_size: int):
         """
         N = Ms.shape[0]
 
-        if N <= TILE or not _HAS_PALLAS:
-            # Small input or no Pallas — pure JAX path
+        # CORRECTNESS FIRST: the multi-tile Pallas kernel below emitted a
+        # per-tile *projected* ``scan_out`` plus tile summaries but never applied
+        # the cross-tile prefix correction to the output (it computed
+        # ``prefix_Ms/prefix_bs`` and discarded them, then just sliced
+        # ``scan_out[:N]``). Because the projection collapses the per-element
+        # affine states, that correction cannot be reapplied post-hoc -> the
+        # kernel was SILENTLY WRONG for N > TILE. The pure-JAX
+        # ``associative_scan`` path is a correct parallel prefix scan for ANY N,
+        # so we use it unconditionally and leave the (unreachable) Pallas kernel
+        # below documented but disabled. Re-enabling it requires emitting the raw
+        # corrected per-element states and re-projecting inside the kernel.
+        if True or N <= TILE or not _HAS_PALLAS:
+            # Correct pure-JAX parallel-prefix path (all N).
             M_out, b_out = jax.lax.associative_scan(
                 _associative_combine, (Ms, bs))
             # Output projection: y = C @ h + D*x, gated by SiLU(z)
@@ -991,6 +1009,7 @@ def _make_pallas_persistent_scan_fused_elem(tile_size: int):
             p = params * (1.0 - lr * wd) - lr * m / (jnp.sqrt(v) + eps)
             return p, m, v
 
+        # NOTE: dead/disabled below (kept for reference; see comment above).
         # Pad to multiple of TILE
         remainder = N % TILE
         if remainder != 0:
