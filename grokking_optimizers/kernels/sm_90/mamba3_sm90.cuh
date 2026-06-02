@@ -61,6 +61,10 @@
 #include "csrc/common/types.h"
 #include "csrc/common/utils.cuh"
 #include "csrc/scan/mamba_scan_adapter.cuh"
+// SG_LAUNCH_CHECK(stream): surfaces a kernel launch failure (bad config, OOM
+// SMEM, invalid args) as an immediate TORCH_CHECK at the launch site instead of
+// a silent deferred async error. (Foundation: csrc/.../primitives.cuh.)
+#include "csrc/backends/cuda/sm_90/primitives.cuh"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cublas_v2.h>
@@ -256,10 +260,11 @@ __global__ void embed_kernel(
     int t  = blockIdx.x;
     int j  = threadIdx.x;
     if (bs >= B || t >= N || j >= D) return;
-    int id = ids[bs * N + t];
+    int id = ids[static_cast<int64_t>(bs) * N + t];
     if (id < 0 || id >= vocab) id = 0;
-    float v = to_float<T>(tok_emb[id * D + j]) + to_float<T>(pos_emb[t * D + j]);
-    out[(bs * N + t) * D + j] = from_float<T>(v);
+    float v = to_float<T>(tok_emb[static_cast<int64_t>(id) * D + j])
+            + to_float<T>(pos_emb[static_cast<int64_t>(t) * D + j]);
+    out[(static_cast<int64_t>(bs) * N + t) * D + j] = from_float<T>(v);
 }
 
 // LayerNorm forward: per-row, in-place safe.  out[i,:] = (x - mean)/std * g + b
@@ -377,9 +382,9 @@ __global__ void softplus_bias_kernel(
     T* __restrict__ inout, const T* __restrict__ bias,
     int rows, int cols)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= rows * cols) return;
-    int j = idx % cols;
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= static_cast<int64_t>(rows) * cols) return;
+    int j = static_cast<int>(idx % cols);
     float v = to_float<T>(inout[idx]) + to_float<T>(bias[j]);
     float sp = (v > 20.0f) ? v : logf(1.0f + ptx_expf(v));
     inout[idx] = from_float<T>(sp);
@@ -407,9 +412,9 @@ __global__ void gate_dskip_kernel(
 
 // Add residual (out += residual) elementwise
 template <typename T>
-__global__ void add_residual_kernel(T* __restrict__ y, const T* __restrict__ r, int n)
+__global__ void add_residual_kernel(T* __restrict__ y, const T* __restrict__ r, int64_t n)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     y[idx] = from_float<T>(to_float<T>(y[idx]) + to_float<T>(r[idx]));
 }
@@ -578,6 +583,7 @@ cudaError_t forward(
         embed_kernel<T><<<grid, block, 0, stream>>>(
             ids, weights /*tok_emb*/, weights + (size_t)vocab * d_model /*pos_emb*/,
             h, batch, seq_len, d_model, vocab);
+        SG_LAUNCH_CHECK(stream);
     }
 
     // 2. Per-layer
@@ -599,6 +605,7 @@ cudaError_t forward(
         {
             dim3 grid(rows, (d_inner + 127) / 128);
             split_chunk2_kernel<T><<<grid, 128, 0, stream>>>(xz, x_main, z_buf, rows, d_inner);
+            SG_LAUNCH_CHECK(stream);
         }
 
         // (c) conv1d depthwise k=3 pad=1 + SiLU
@@ -607,6 +614,7 @@ cudaError_t forward(
             conv1d_silu_kernel<T><<<grid, 128, 0, stream>>>(
                 x_main, W.conv_W, W.conv_b, xc,
                 batch, seq_len, d_inner);
+            SG_LAUNCH_CHECK(stream);
         }
 
         // (d) x_proj GEMM: x_dbc [rows, dt_rank+2*d_state] = xc · x_proj_W^T
@@ -619,6 +627,7 @@ cudaError_t forward(
             dim3 grid(rows, (dt_rank + 2 * d_state + 127) / 128);
             split_dbc_kernel<T><<<grid, 128, 0, stream>>>(
                 x_dbc, dt_pre, B_buf, C_buf, rows, dt_rank, d_state);
+            SG_LAUNCH_CHECK(stream);
         }
 
         // (f) dt_proj GEMM + softplus(+ bias).  dt_full = dt_pre · dt_proj_W^T
@@ -629,6 +638,7 @@ cudaError_t forward(
             int block = 256;
             int grid  = (rows * d_inner + block - 1) / block;
             softplus_bias_kernel<T><<<grid, block, 0, stream>>>(dt_full, W.dt_proj_b, rows, d_inner);
+            SG_LAUNCH_CHECK(stream);
         }
 
         // (g) selective scan via adapter
@@ -644,6 +654,7 @@ cudaError_t forward(
             dim3 grid(rows, (d_inner + 127) / 128);
             gate_dskip_kernel<T><<<grid, 128, 0, stream>>>(
                 y_scan, xc, W.D, z_buf, rows, d_inner);
+            SG_LAUNCH_CHECK(stream);
         }
 
         // (i) out_proj GEMM:  h_new = y_scan · out_proj_W^T  [rows, d_model]
@@ -653,10 +664,11 @@ cudaError_t forward(
 
         // (j) Add residual
         {
-            int n = rows * d_model;
+            int64_t n = static_cast<int64_t>(rows) * d_model;
             int block = 256;
-            int grid  = (n + block - 1) / block;
+            int grid  = static_cast<int>((n + block - 1) / block);
             add_residual_kernel<T><<<grid, block, 0, stream>>>(h, res, n);
+            SG_LAUNCH_CHECK(stream);
         }
 
         // (k) LayerNorm (post-block)
@@ -665,6 +677,7 @@ cudaError_t forward(
             size_t smem = 2 * block * sizeof(float);
             layernorm_kernel<T><<<rows, block, smem, stream>>>(
                 h, W.ln2_g, W.ln2_b, h, nullptr, nullptr, d_model, eps);
+            SG_LAUNCH_CHECK(stream);
         }
     }
 
@@ -677,6 +690,7 @@ cudaError_t forward(
         size_t smem = 2 * block * sizeof(float);
         layernorm_kernel<T><<<rows, block, smem, stream>>>(
             h, Wlast.ln_final_g, Wlast.ln_final_b, h, nullptr, nullptr, d_model, eps);
+        SG_LAUNCH_CHECK(stream);
     }
 
     // Gather last token: last [B, d_model] = h[:, N-1, :]
@@ -684,6 +698,7 @@ cudaError_t forward(
     {
         dim3 grid(batch, (d_model + 127) / 128);
         gather_last_token_kernel<T><<<grid, 128, 0, stream>>>(h, last, batch, seq_len, d_model);
+        SG_LAUNCH_CHECK(stream);
     }
 
     // Head GEMM: output [B, p_vocab] = last [B, d_model] · head_W^T [p_vocab, d_model]
@@ -705,17 +720,42 @@ cudaError_t forward(
 }
 
 // ─────────────────────────────────────────────────────────────────────
-//  Backward pass — minimal viable implementation. Computes grad_input
-//  through the model. For weight grads (grad_weights) we only compute
-//  the head + final layernorm gradients fully; the full reverse pass
-//  through every layer is a substantial amount of code. The selective-
-//  scan portion uses mamba_adapter::selective_scan_backward.
+//  Backward pass — EXPLICIT autograd-delegation contract (NOT a fused
+//  reverse pass).
+//
+//  STATUS (Stage 8, definitive): the fused multi-layer C++ reverse pass is
+//  intentionally NOT implemented here. The Mamba forward() above reuses a
+//  single set of workspace buffers across all layers (see "subsequent layers
+//  reuse these buffers", §forward), so it does NOT persist the per-layer
+//  activations a correct reverse pass would require — only the last layer's
+//  transients survive in `activations_saved`. A mathematically-correct fused
+//  backward would therefore additionally require rewriting the forward's
+//  activation-save contract and the workspace sizing the Python harness
+//  allocates; that is out of scope for this kernel and would be wrong (silent
+//  cross-layer gradient drop) if bolted on without it.
+//
+//  The production training loop (MambaModel) computes gradients via Python-side
+//  autograd through the forward-kernel boundary; this C++ entry exists for
+//  benchmark/parity harnesses that do NOT consume the produced gradients.
+//
+//  CONTRACT (honest, not a zero-grad masquerade): we zero BOTH grad_input AND
+//  grad_weights to their FULL, correct extents and return success. The previous
+//  implementation left grad_weights *completely uninitialized* (an
+//  uninitialized-read bug for any caller that did read it) while only zeroing
+//  grad_input — and its comment implied real grads were produced. We do not
+//  pretend these zeros are the gradient: a caller that needs real weight grads
+//  must use the Python autograd path (or the component-level
+//  selective_scan_bwd / mamba_adapter::selective_scan_backward, which ARE real
+//  reverse passes for the scan sub-block).
+//
+//  grad_input is the gradient w.r.t. integer token ids — undefined/zero by
+//  construction (mirrors decoder::backward, which also memsets grad_input).
 // ─────────────────────────────────────────────────────────────────────
 
 template <typename T>
 cudaError_t backward(
     const T* grad_output,
-    const T* activations_saved,      // unused in this thin impl
+    const T* activations_saved,      // last-layer transients only (see contract)
     const T* weights,
     T* grad_input,
     T* grad_weights,
@@ -723,17 +763,30 @@ cudaError_t backward(
     int d_conv, int expand, int n_layers,
     cudaStream_t stream)
 {
-    (void)grad_output; (void)activations_saved; (void)weights;
-    (void)grad_input;  (void)grad_weights;
-    (void)batch; (void)seq_len; (void)d_model; (void)d_state;
-    (void)d_conv; (void)expand; (void)n_layers; (void)stream;
-    // The training loop in MambaModel uses Python-side autograd through the
-    // forward kernel boundary; this fused C++ backward is provided only for
-    // benchmark parity. Returning success with zeroed grads is acceptable
-    // when autograd handles the actual gradient computation. If the caller
-    // really needs a fused backward, route through the per-layer adapter.
-    if (grad_input)   cudaMemsetAsync(grad_input,   0,
-        (size_t)batch * seq_len * sizeof(T), stream);
+    (void)grad_output; (void)activations_saved; (void)weights; (void)d_conv;
+    // grad_input: gradient w.r.t. token ids is undefined → zero its full extent.
+    if (grad_input) {
+        cudaMemsetAsync(grad_input, 0,
+            (size_t)batch * seq_len * sizeof(T), stream);
+    }
+    // grad_weights: zero the FULL weight buffer (was previously left
+    // UNINITIALIZED). Size mirrors forward()'s flat layout exactly:
+    //   tok_emb[vocab,d] + pos_emb[seq,d]
+    //   + n_layers * per_layer_count + ln_final(2*d) + head_W[p_vocab,d]
+    if (grad_weights) {
+        const int   d_inner  = d_model * expand;
+        const int   dt_rank  = std::max(d_model / 16, 1);
+        const int   vocab    = 99;   // grokking embedding bound (forward §)
+        const int   p_vocab  = 97;   // grokking classifier dim (forward §)
+        size_t total = 0;
+        total += (size_t)vocab * d_model;                       // tok_emb
+        total += (size_t)seq_len * d_model;                     // pos_emb
+        total += (size_t)n_layers *
+                 per_layer_count<T>(d_model, d_inner, d_state, dt_rank);
+        total += (size_t)2 * d_model;                           // ln_final g,b
+        total += (size_t)p_vocab * d_model;                     // head_W
+        cudaMemsetAsync(grad_weights, 0, total * sizeof(T), stream);
+    }
     return cudaGetLastError();
 }
 

@@ -999,6 +999,7 @@ void launch_supergrok2_input_proj_sort(
                 proj_W.data_ptr<float>(),
                 proj_b.data_ptr<float>(),
                 N, d_model);
+            SG_LAUNCH_CHECK(stream);
         });
 }
 
@@ -1027,6 +1028,7 @@ void launch_supergrok2_apply(
                 grad.data_ptr<scalar_t>(),
                 expert_out.data_ptr<float>(),
                 alpha, gru_decay, lr, beta1, beta2, eps, wd, bc1, bc2, N);
+            SG_LAUNCH_CHECK(stream);
         });
 }
 
@@ -1081,6 +1083,7 @@ void launch_moe_adam_step(
                 exp_avg_sq.data_ptr<float>(),
                 grad.data_ptr<scalar_t>(),
                 lr, beta1, beta2, eps, wd, bc1, bc2, N);
+            SG_LAUNCH_CHECK(stream);
         });
 }
 
@@ -1145,6 +1148,7 @@ static torch::Tensor compress_csa(
         x_sorted_f32.data_ptr<float>(), proj_W.data_ptr<float>(),
         compress_logits.data_ptr<float>(), out.data_ptr<float>(),
         N, d_model, Nc, csa_compress, csa_window);
+    SG_LAUNCH_CHECK(stream);
     return out;
 }
 
@@ -1162,6 +1166,7 @@ static torch::Tensor compress_hca(
         x_sorted_f32.data_ptr<float>(), proj_W.data_ptr<float>(),
         /*hca_w=*/nullptr, out.data_ptr<float>(),
         N, d_model, Nh, hca_compress);
+    SG_LAUNCH_CHECK(stream);
     return out;
 }
 
@@ -1177,6 +1182,7 @@ static torch::Tensor project(
     csa_hca::project_q_kernel<float><<<grid, block, 0, stream>>>(
         x_f32.data_ptr<float>(), W.data_ptr<float>(), out.data_ptr<float>(),
         N, d_model);
+    SG_LAUNCH_CHECK(stream);
     return out;
 }
 
@@ -1210,6 +1216,7 @@ static torch::Tensor csa_context(
         csa_hca::indexer_q_kernel<float><<<grid, block, 0, stream>>>(
             x_sorted.data_ptr<float>(), idx_DQ.data_ptr<float>(),
             qI.data_ptr<float>(), N, d_model, indexer_rank);
+        SG_LAUNCH_CHECK(stream);
     }
     auto kI = torch::empty({Nc, indexer_rank}, fopt);
     {
@@ -1219,6 +1226,7 @@ static torch::Tensor csa_context(
             x_sorted.data_ptr<float>(), idx_K.data_ptr<float>(),
             compress_w.data_ptr<float>(), kI.data_ptr<float>(),
             N, d_model, Nc, indexer_rank, csa_compress, csa_window);
+        SG_LAUNCH_CHECK(stream);
     }
     auto sel = torch::empty({N, std::max(topk, 1)},
         torch::TensorOptions().dtype(torch::kInt32).device(x_sorted.device()));
@@ -1235,6 +1243,7 @@ static torch::Tensor csa_context(
         csa_hca::csa_indexer_topk_kernel<<<grid, block, topk_smem_bytes, stream>>>(
             qI.data_ptr<float>(), kI.data_ptr<float>(), sel.data_ptr<int>(),
             N, Nc, indexer_rank, std::max(topk, 1));
+        SG_LAUNCH_CHECK(stream);
     }
 
     auto concat = torch::empty({N, d_model}, fopt);
@@ -1255,6 +1264,7 @@ static torch::Tensor csa_context(
             sel.data_ptr<int>(), out_W.data_ptr<float>(),
             concat.data_ptr<float>(), N, Nc, d_model, num_heads, head_dim,
             std::max(topk, 1), csa_window);
+        SG_LAUNCH_CHECK(stream);
     }
     auto ctx = torch::empty({N, d_model}, fopt);
     {
@@ -1263,6 +1273,7 @@ static torch::Tensor csa_context(
         csa_hca::attn_out_proj_kernel<<<grid, block, 0, stream>>>(
             concat.data_ptr<float>(), out_W.data_ptr<float>(),
             ctx.data_ptr<float>(), N, d_model);
+        SG_LAUNCH_CHECK(stream);
     }
     return ctx;
 }
@@ -1300,6 +1311,7 @@ static torch::Tensor hca_context(
             win_k.data_ptr<float>(), win_v.data_ptr<float>(),
             concat.data_ptr<float>(), N, Nh, d_model, num_heads, head_dim,
             csa_window);
+        SG_LAUNCH_CHECK(stream);
     }
     auto ctx = torch::empty({N, d_model}, fopt);
     {
@@ -1308,13 +1320,25 @@ static torch::Tensor hca_context(
         csa_hca::attn_out_proj_kernel<<<grid, block, 0, stream>>>(
             concat.data_ptr<float>(), out_W.data_ptr<float>(),
             ctx.data_ptr<float>(), N, d_model);
+        SG_LAUNCH_CHECK(stream);
     }
     return ctx;
 }
 
 // PEER routing + per-element expert MLP. Reuses the existing expert tensors.
-// Routes each element to its top-1 product-key expert (host-side gather via
-// ATen), runs the per-expert MLP, returns expert_out [N] (sorted order).
+//
+// REAL product-key top-k routing (restored): the query projection is split into
+// halves q_a / q_b; we score against product-key sub-codebooks A and B, take the
+// top-k of EACH (k = peer_topk, default 4), form the k×k Cartesian product of
+// candidate experts (expert = a_idx * nb + b_idx), softmax-weight them by the
+// summed sub-scores, run the per-element expert MLP for each of the k² selected
+// experts and return the routing-weighted combination. This matches the bilevel
+// adjoint's PEER head (csrc/algorithms/supergrok2_bilevel_adjoint.h:
+// peer_head_backward) which uses scores_a.topk / scores_b.topk + softmax over
+// num_active = topk*topk. The previous code collapsed this to argmax (top-1) and
+// gathered a single expert — a routing-quality regression vs the trained
+// top-k product-key gate. When product keys are absent we fall back to a single
+// shared expert (index 0), unchanged.
 static torch::Tensor peer_expert_forward(
     const torch::Tensor& feat,              // [N, d_model] float (gru ⊕ ctx)
     const torch::Tensor& peer_query_Ws,     // [num_heads?, d_model] or [d_model]
@@ -1325,44 +1349,12 @@ static torch::Tensor peer_expert_forward(
     const torch::Tensor& expert_W2,
     const torch::Tensor& expert_b2,
     int N, int d_model, int num_experts, int expert_hidden,
-    torch::Tensor& expert_counts)
+    torch::Tensor& expert_counts,
+    int peer_topk = 4)
 {
-    // Product-key routing: score = feat · query; pick the expert whose
-    // product key (A_i ⊕ B_j) best matches. We implement a robust top-1
-    // gate over a learned query projection. When the product-key tensors are
-    // sentinels we fall back to a single shared expert (index 0).
-    auto fopt = torch::TensorOptions().dtype(torch::kFloat32).device(feat.device());
-    torch::Tensor gate_idx;
-    if (prod_keys_A.defined() && prod_keys_A.numel() > 0 &&
-        peer_query_Ws.defined() && peer_query_Ws.numel() >= d_model) {
-        auto qw = peer_query_Ws.reshape({-1, d_model}).to(torch::kFloat32);  // [Q, d_model]
-        auto query = feat.matmul(qw.transpose(0, 1));                        // [N, Q]
-        // Split query into two halves for product keys A, B.
-        const int Q = query.size(1);
-        const int half = Q / 2 > 0 ? Q / 2 : Q;
-        auto qa = query.narrow(1, 0, half);
-        auto A = prod_keys_A.reshape({-1, half}).to(torch::kFloat32);        // [na, half]
-        auto sa = qa.matmul(A.transpose(0, 1));                             // [N, na]
-        auto top_a = std::get<1>(sa.max(1));                                // [N]
-        int na = A.size(0);
-        torch::Tensor expert;
-        if (prod_keys_B.defined() && prod_keys_B.numel() > 0 && Q - half > 0) {
-            auto qb = query.narrow(1, half, Q - half);
-            auto B = prod_keys_B.reshape({-1, Q - half}).to(torch::kFloat32);
-            auto sb = qb.matmul(B.transpose(0, 1));
-            auto top_b = std::get<1>(sb.max(1));
-            int nb = B.size(0);
-            expert = (top_a * nb + top_b).clamp(0, num_experts - 1);
-        } else {
-            expert = top_a.clamp(0, num_experts - 1);
-        }
-        gate_idx = expert.to(torch::kLong);
-    } else {
-        gate_idx = torch::zeros({N}, torch::TensorOptions().dtype(torch::kLong).device(feat.device()));
-    }
+    auto lopt = torch::TensorOptions().dtype(torch::kLong).device(feat.device());
 
-    // Per-element expert MLP: input is a scalar projection of feat (mean over
-    // d_model), expanded through the selected expert's [expert_hidden] MLP.
+    // Per-element expert MLP weights (shared codebook, indexed per element).
     auto scalar_in = feat.mean(1);                                          // [N]
     auto W1 = expert_W1.reshape({num_experts, -1}).to(torch::kFloat32);     // [E, H]
     auto b1 = expert_b1.reshape({num_experts, -1}).to(torch::kFloat32);     // [E, H]
@@ -1370,19 +1362,82 @@ static torch::Tensor peer_expert_forward(
     auto b2 = expert_b2.reshape({num_experts, -1}).to(torch::kFloat32);     // [E, 1]
     const int H = W1.size(1);
 
-    auto g_W1 = W1.index_select(0, gate_idx);                              // [N, H]
-    auto g_b1 = b1.index_select(0, gate_idx);                              // [N, H]
-    auto g_W2 = W2.index_select(0, gate_idx);                              // [N, H]
-    auto g_b2 = b2.index_select(0, gate_idx).squeeze(-1);                  // [N]
+    // Apply the per-element MLP for a [N, A] block of expert indices, weighted
+    // by routing_w [N, A], reduced over A. scalar_in [N] is the (broadcast) MLP
+    // input. Returns [N].
+    auto run_experts = [&](const torch::Tensor& expert_idx,       // [N, A] long
+                           const torch::Tensor& routing_w) {      // [N, A] float
+        const int64_t A = expert_idx.size(1);
+        auto flat = expert_idx.reshape({-1});                     // [N*A]
+        auto g_W1 = W1.index_select(0, flat).reshape({N, A, H});  // [N,A,H]
+        auto g_b1 = b1.index_select(0, flat).reshape({N, A, H});
+        auto g_W2 = W2.index_select(0, flat).reshape({N, A, H});
+        auto g_b2 = b2.index_select(0, flat).reshape({N, A});     // [N,A]
+        auto si   = scalar_in.reshape({N, 1, 1});                 // [N,1,1]
+        auto hidden = (g_W1 * si + g_b1).clamp_min(0.0f);         // [N,A,H] ReLU
+        auto out    = (g_W2 * hidden).sum(2) + g_b2;              // [N,A]
+        return (out * routing_w).sum(1);                          // [N]
+    };
 
-    auto hidden = (g_W1 * scalar_in.unsqueeze(1) + g_b1).clamp_min(0.0f);  // [N, H] ReLU
-    auto out = (g_W2 * hidden).sum(1) + g_b2;                              // [N]
+    torch::Tensor out;
+    torch::Tensor count_idx;   // [N*A] long, for activation counting
+    if (prod_keys_A.defined() && prod_keys_A.numel() > 0 &&
+        peer_query_Ws.defined() && peer_query_Ws.numel() >= d_model) {
+        auto qw = peer_query_Ws.reshape({-1, d_model}).to(torch::kFloat32);  // [Q, d_model]
+        auto query = feat.matmul(qw.transpose(0, 1));                        // [N, Q]
+        const int Q = query.size(1);
+        const int half = Q / 2 > 0 ? Q / 2 : Q;
+        auto qa = query.narrow(1, 0, half);
+        auto A = prod_keys_A.reshape({-1, half}).to(torch::kFloat32);        // [na, half]
+        auto sa = qa.matmul(A.transpose(0, 1));                              // [N, na]
+        int na = A.size(0);
+        const double T = 10.0;   // gate temperature (matches adjoint PEER head)
 
-    // Update expert activation counts (best-effort; reused by recycling).
+        if (prod_keys_B.defined() && prod_keys_B.numel() > 0 && Q - half > 0) {
+            auto qb = query.narrow(1, half, Q - half);
+            auto B = prod_keys_B.reshape({-1, Q - half}).to(torch::kFloat32);
+            auto sb = qb.matmul(B.transpose(0, 1));                          // [N, nb]
+            int nb = B.size(0);
+            const int ka = std::min<int>(std::max(peer_topk, 1), na);
+            const int kb = std::min<int>(std::max(peer_topk, 1), nb);
+            auto ta = sa.topk(ka, -1);  // vals,idx  [N, ka]
+            auto tb = sb.topk(kb, -1);  // vals,idx  [N, kb]
+            auto top_a_vals = std::get<0>(ta), top_a_idx = std::get<1>(ta);
+            auto top_b_vals = std::get<0>(tb), top_b_idx = std::get<1>(tb);
+            auto soft_a = torch::softmax(top_a_vals * T, -1);                // [N, ka]
+            auto soft_b = torch::softmax(top_b_vals * T, -1);
+            // k_a × k_b Cartesian product of candidate experts + routing weights.
+            auto expert_idx = (top_a_idx.unsqueeze(2) * nb + top_b_idx.unsqueeze(1))
+                                  .reshape({N, ka * kb})
+                                  .clamp(0, num_experts - 1);               // [N, A]
+            auto routing_w = (soft_a.unsqueeze(2) * soft_b.unsqueeze(1))
+                                  .reshape({N, ka * kb});                   // [N, A]
+            out = run_experts(expert_idx, routing_w);
+            count_idx = expert_idx.reshape({-1});
+        } else {
+            // Single sub-codebook: top-k over A directly.
+            const int ka = std::min<int>(std::max(peer_topk, 1), na);
+            auto ta = sa.topk(ka, -1);
+            auto top_a_vals = std::get<0>(ta), top_a_idx = std::get<1>(ta);
+            auto soft_a = torch::softmax(top_a_vals * T, -1);               // [N, ka]
+            auto expert_idx = top_a_idx.clamp(0, num_experts - 1);          // [N, ka]
+            out = run_experts(expert_idx, soft_a);
+            count_idx = expert_idx.reshape({-1});
+        }
+    } else {
+        // No product keys → single shared expert (index 0), weight 1.
+        auto expert_idx = torch::zeros({N, 1}, lopt);
+        auto routing_w  = torch::ones({N, 1},
+            torch::TensorOptions().dtype(torch::kFloat32).device(feat.device()));
+        out = run_experts(expert_idx, routing_w);
+        count_idx = expert_idx.reshape({-1});
+    }
+
+    // Update expert activation counts (best-effort; reused by recycling). Now
+    // counts every selected expert in the top-k combination, not just one.
     if (expert_counts.defined() && expert_counts.numel() >= num_experts) {
-        auto counts = torch::zeros({num_experts},
-            torch::TensorOptions().dtype(torch::kLong).device(feat.device()));
-        counts.scatter_add_(0, gate_idx, torch::ones_like(gate_idx));
+        auto counts = torch::zeros({num_experts}, lopt);
+        counts.scatter_add_(0, count_idx, torch::ones_like(count_idx));
         expert_counts.add_(counts.to(expert_counts.dtype()));
     }
     (void)H; (void)expert_hidden;
@@ -1438,6 +1493,7 @@ static void csa_hca_step_one(
                     sort_idx.data_ptr<int>(),
                     input_proj_W.data_ptr<float>(), input_proj_b.data_ptr<float>(),
                     N, d_model);
+                SG_LAUNCH_CHECK(stream);
             });
     }
     // Sort the sequence by |grad| (descending) so attention sees a meaningful
@@ -1464,7 +1520,8 @@ static void csa_hca_step_one(
     auto expert_sorted = detail::peer_expert_forward(
         feat, peer_query_Ws, prod_keys_A, prod_keys_B,
         expert_W1, expert_b1, expert_W2, expert_b2,
-        N, d_model, num_experts, expert_hidden, expert_counts);  // [N] sorted
+        N, d_model, num_experts, expert_hidden, expert_counts,
+        /*peer_topk=*/4);  // [N] sorted — real product-key top-4 combination
 
     // (4) Unsort expert output back to original element order, scale.
     auto expert_out = torch::empty({N}, fopt);
@@ -1485,6 +1542,7 @@ static void csa_hca_step_one(
                     expert_out.data_ptr<float>(),
                     alpha_mu, gru_decay, lr, beta1, beta2, eps, wd_eff,
                     bc1, bc2, N);
+                SG_LAUNCH_CHECK(stream);
             });
     }
     (void)gru_state;  // carried state mirrored by mu_state in the elementwise tail
@@ -2041,6 +2099,7 @@ void moe_count_expert_activations(
     moe_count_expert_activations_kernel<<<grid, block, 0, stream>>>(
         gl.data_ptr<float>(), expert_counts.data_ptr<int>(),
         threshold, N, num_experts);
+    SG_LAUNCH_CHECK(stream);
 }
 
 // ── (2) Switch-Transformer load-balance auxiliary loss ─────────────────────
@@ -2097,6 +2156,7 @@ void moe_apply_frequency_scaling(
     moe_apply_frequency_scaling_kernel<<<grid, block, 0, stream>>>(
         expert_counts.data_ptr<int>(), lr_scale.data_ptr<float>(),
         num_experts, total_activations, min_scale, max_scale, smoothing);
+    SG_LAUNCH_CHECK(stream);
 }
 
 // ── (4) Stream-compaction of active-expert parameters ──────────────────────
@@ -2184,6 +2244,7 @@ void moe_filter_active_params(
         compact_state_m.data_ptr<float>(), compact_state_v.data_ptr<float>(),
         scatter_indices.data_ptr<int>(), compact_count.data_ptr<int>(),
         total_params);
+    SG_LAUNCH_CHECK(stream);
 }
 
 // ── (5) Scatter compacted results back to dense storage ────────────────────
@@ -2225,6 +2286,7 @@ void moe_scatter_results(
         params.data_ptr<float>(),
         state_m.data_ptr<float>(), state_v.data_ptr<float>(),
         compact_N);
+    SG_LAUNCH_CHECK(stream);
 }
 
 // ── (6) Masked gather of active expert weights ─────────────────────────────
@@ -2336,6 +2398,7 @@ torch::Tensor moe_dynamic_expert_fwd(
         w1.data_ptr<float>(), b1.data_ptr<float>(),
         w2.data_ptr<float>(), b2.data_ptr<float>(),
         output.data_ptr<float>(), N, d_in, hidden, d_out);
+    SG_LAUNCH_CHECK(stream);
     return output;
 }
 
@@ -2457,6 +2520,7 @@ void moe_dynamic_expert_bwd(
         d_input.data_ptr<float>(), d_expert_w1.data_ptr<float>(),
         d_expert_b1.data_ptr<float>(), d_expert_w2.data_ptr<float>(),
         d_expert_b2.data_ptr<float>(), N, d_in, hidden, d_out);
+    SG_LAUNCH_CHECK(stream);
 }
 
 // ── (9) Compacted selective scan — VESTIGIAL ───────────────────────────────
@@ -2549,6 +2613,7 @@ void moe_scan_compacted(
         final_state.defined() ? final_state.data_ptr<float>() : nullptr,
         init.defined() ? init.data_ptr<float>() : nullptr,
         compact_N, d_inner, d_state);
+    SG_LAUNCH_CHECK(stream);
 }
 
 }} // namespace sg::sm90
