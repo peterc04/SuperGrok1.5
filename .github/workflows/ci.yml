@@ -110,6 +110,20 @@ jobs:
           assert set(MODELS) == {'mamba', 'decoder', 'vit'}, MODELS
           print(f'OPTIMIZERS: {len(OPTIMIZERS)}, MODELS: {len(MODELS)}, ARCHES: {len(ARCHES)}')
           "
+      - name: Import utilization module (33-pipeline tracker)
+        run: |
+          python3 -c "
+          from grokking_optimizers.utilization import (
+              PIPELINES_PER_ARCH, enumerate_cells, make_sampler, track_all,
+          )
+          assert PIPELINES_PER_ARCH == 33, PIPELINES_PER_ARCH
+          assert len(enumerate_cells()) == 33
+          # vendor->backend selection works without a device present.
+          assert make_sampler('sm_90a').backend == 'nvml'
+          assert make_sampler('gfx942').backend == 'rocm-smi'
+          assert make_sampler('tpu_v6e').backend == 'jax-tpu'
+          print('utilization: 33 pipelines/arch, sampler backends OK')
+          "
       - name: README quickstart import smoke
         run: |
           python3 -c "
@@ -124,7 +138,7 @@ jobs:
           "
 
   # ---------------------------------------------------------------------------
-  # Self-test — full --self-test suite (147 tests as of Phase 8; authoritative count guarded in compile.py). The repo's
+  # Self-test — full --self-test suite (156 tests as of Phase 8; authoritative count guarded in compile.py). The repo's
   # own correctness gate. The authoritative count is enforced inside
   # grokking_optimizers/compile.py (the self-test count guard); the summary
   # check below asserts "<N> passed, 0 failed" rather than hard-coding N here.

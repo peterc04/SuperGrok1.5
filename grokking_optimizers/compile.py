@@ -14438,6 +14438,102 @@ def _self_test_device_profiling(run) -> None:
 
     # ---- Stream 3: per-arch native flag emission ----
 
+def _self_test_utilization(run) -> None:
+    """`[self-test] utilization` section — the 33-pipeline live device
+    utilization tracker. CPU-safe: every check exercises enumeration,
+    sampler selection, aggregation, graceful degradation, and the JSON/table
+    schema without touching an accelerator (numbers are HW-gated)."""
+    import tempfile
+    sys.stdout.write("[self-test] utilization\n")
+
+    def test_utilization_import():
+        from grokking_optimizers import utilization  # noqa: F401
+
+    def test_pipelines_per_arch_is_33():
+        from grokking_optimizers import utilization as u
+        # 11 optimizers × 3 models = 33 fused pipelines per arch.
+        assert u.PIPELINES_PER_ARCH == 33, u.PIPELINES_PER_ARCH
+        assert len(u.enumerate_cells()) == 33
+
+    def test_enumerate_cells_filtered():
+        from grokking_optimizers import utilization as u
+        cells = u.enumerate_cells(["adamw"], ["mamba", "vit"])
+        assert cells == [("adamw", "mamba"), ("adamw", "vit")], cells
+
+    def test_make_sampler_by_vendor():
+        from grokking_optimizers import utilization as u
+        assert u.make_sampler("sm_90a").backend == "nvml"
+        assert u.make_sampler("gfx942").backend == "rocm-smi"
+        assert u.make_sampler("tpu_v6e").backend == "jax-tpu"
+
+    def test_aggregate_math_and_warmup_drop():
+        from grokking_optimizers import utilization as u
+        # 5 samples; first (warmup) dropped → mean/peak over [20,30,40,50].
+        samples = [u.UtilSample(i * 0.1, c, c / 2.0, 100.0 * i)
+                   for i, c in enumerate([10.0, 20.0, 30.0, 40.0, 50.0])]
+        agg = u._aggregate(samples, drop_warmup=1)
+        assert abs(agg["compute_mean"] - 35.0) < 1e-9, agg
+        assert agg["compute_peak"] == 50.0, agg
+        assert agg["mem_used_peak_mb"] == 400.0, agg
+
+    def test_aggregate_handles_none_compute():
+        from grokking_optimizers import utilization as u
+        # TPU-style: compute None, mem present → compute stats stay None.
+        samples = [u.UtilSample(i * 0.1, None, 60.0 + i, None) for i in range(4)]
+        agg = u._aggregate(samples, drop_warmup=1)
+        assert agg["compute_mean"] is None and agg["compute_peak"] is None, agg
+        assert agg["mem_peak"] == 63.0, agg
+
+    def test_track_cell_degrades_gracefully():
+        from grokking_optimizers import utilization as u
+        # No accelerator here → must NOT raise; returns a complete record with
+        # a status flag and no metrics.
+        r = u.track_cell("adamw", "mamba", "sm_90a", iters=1, timeout=30)
+        assert r.status in ("no-device", "sampler-unavailable",
+                            "workload-failed", "no-samples"), r.status
+        assert r.arch == "sm_90a" and r.optimizer == "adamw"
+        assert r.compute_mean is None
+
+    def test_report_json_schema_roundtrip():
+        from grokking_optimizers import utilization as u
+        cells = [u.CellUtilization(
+            arch="sm_90a", optimizer="adamw", model="mamba",
+            status="ok", backend="nvml", n_samples=10, duration_s=1.0,
+            compute_mean=72.5, compute_peak=88.0, mem_mean=40.0,
+            mem_peak=55.0, mem_used_peak_mb=2048.0)]
+        with tempfile.TemporaryDirectory() as td:
+            p = u.write_report(cells, "sm_90a", Path(td) / "u.json")
+            data = json.loads(p.read_text())
+            assert data["pipelines_per_arch"] == 33
+            assert data["arch"] == "sm_90a" and data["n_cells"] == 1
+            c0 = data["cells"][0]
+            for k in ("arch", "optimizer", "model", "status", "backend",
+                      "compute_mean", "compute_peak", "mem_used_peak_mb"):
+                assert k in c0, k
+            assert c0["compute_mean"] == 72.5
+
+    def test_format_table_renders():
+        from grokking_optimizers import utilization as u
+        cells = [u.CellUtilization(
+            arch="gfx942", optimizer="muon", model="vit", status="ok",
+            backend="rocm-smi", n_samples=12, duration_s=2.0,
+            compute_mean=64.0, compute_peak=90.0, mem_mean=30.0,
+            mem_peak=44.0, mem_used_peak_mb=1024.0)]
+        txt = u.format_table(cells)
+        assert "gfx942" in txt and "muon" in txt and "vit" in txt
+        assert "compute%" in txt and "64.0" in txt
+
+    run("utilization_import", test_utilization_import)
+    run("pipelines_per_arch_is_33", test_pipelines_per_arch_is_33)
+    run("utilization_enumerate_cells_filtered", test_enumerate_cells_filtered)
+    run("utilization_make_sampler_by_vendor", test_make_sampler_by_vendor)
+    run("utilization_aggregate_math", test_aggregate_math_and_warmup_drop)
+    run("utilization_aggregate_none_compute", test_aggregate_handles_none_compute)
+    run("utilization_track_cell_degrades", test_track_cell_degrades_gracefully)
+    run("utilization_report_json_roundtrip", test_report_json_schema_roundtrip)
+    run("utilization_format_table", test_format_table_renders)
+
+
 def _self_test_flags(run) -> None:
     """`[self-test] flags` section."""
     import shutil
@@ -18274,7 +18370,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 147
+_SELF_TEST_EXPECTED_COUNT: int = 156
 
 
 def _self_test() -> int:
@@ -18305,6 +18401,7 @@ def _self_test() -> int:
     _self_test_search_space(_run)
     _self_test_pgo(_run)
     _self_test_device_profiling(_run)
+    _self_test_utilization(_run)
     _self_test_flags(_run)
     _self_test_bayesian(_run)
     _self_test_early_stopping(_run)
