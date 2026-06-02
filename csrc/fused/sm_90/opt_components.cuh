@@ -117,7 +117,7 @@ struct FusedOptState {
 template <OptId Opt>
 __device__ __forceinline__ void apply_optimizer(
         float* __restrict__ params, const float* __restrict__ grad,
-        int idx, int step, const FusedOptState& st) {
+        int64_t idx, int step, const FusedOptState& st) {
     (void)step;
     if constexpr (Opt == OptId::AdamW) {
         algo::adamw_step<float, float>(

@@ -77,7 +77,7 @@ struct FusedOptState {
 // Shared Adam tail: m,v EMAs on g_eff, bias-corrected decoupled-WD apply.
 // (bc1/bc2 un-inverted = 1-beta^t; divide — matches the algorithm headers.)
 __device__ __forceinline__ float sg_adam_tail(
-        float p, float g_eff, float* m_buf, float* v_buf, int i,
+        float p, float g_eff, float* m_buf, float* v_buf, long long i,
         float b1, float b2, float eps, float bc1, float bc2,
         float lr, float wd) {
     const float m = b1 * m_buf[i] + (1.0f - b1) * g_eff;
@@ -112,7 +112,7 @@ __device__ __forceinline__ float sg_sg15_alpha(float mu_val, float ab, float am)
 template <OptId Opt>
 __device__ __forceinline__ void apply_optimizer(
         float* __restrict__ params, const float* __restrict__ grad,
-        int i, int step, const FusedOptState& st) {
+        long long i, int step, const FusedOptState& st) {
     (void)step;
     const float g = grad[i];
     const float p = params[i];

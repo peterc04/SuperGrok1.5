@@ -26,6 +26,7 @@
 
 #include "csrc/fused/megakernel_common.cuh"
 #include <cuda_runtime.h>
+#include <cstdint>
 
 namespace sg { namespace fused { namespace sm90 {
 
@@ -88,10 +89,15 @@ __device__ void model_forward_stage(const PersistentContext& ctx,
     for (int t = q.next_block(&task_slot); t < ctx.n_tasks;
          t = q.next_block(&task_slot)) {
         const int n = sizes[t], off = offsets[t];
+        // int64 base (#2): off is an int element offset into the global param
+        // blob; off+i can exceed 2^31 once the blob crosses ~2 Gi elements, so
+        // the global index is computed in 64-bit. Behavior-preserving — same
+        // element addressed, only the index type widens (no value change).
+        const int64_t base64 = (int64_t)off;
         // Row context: mean-square (decoder/mamba) or mean (vit) over the slab.
         float acc = 0.0f;
         for (int i = threadIdx.x; i < n; i += blockDim.x) {
-            const float p = params[off + i];
+            const float p = params[base64 + i];
             acc += (M == ModelId::ViT) ? p : p * p;
         }
         // Block reduce (#2): WARP-SHUFFLE row reduction replaces the former
@@ -127,8 +133,9 @@ __device__ void model_forward_stage(const PersistentContext& ctx,
         blk = red[0];
         const float c = (n > 0) ? blk / (float)n : 0.0f;
         for (int i = threadIdx.x; i < n; i += blockDim.x) {
-            const float x = params[off + i] + input[off + i];
-            acts[off + i] = model_activation<M>(x, c);
+            const int64_t gi = base64 + i;
+            const float x = params[gi] + input[gi];
+            acts[gi] = model_activation<M>(x, c);
         }
         __syncthreads();
     }
@@ -153,9 +160,10 @@ __device__ void model_backward_stage(const PersistentContext& ctx,
     for (int t = q.next_block(&task_slot); t < ctx.n_tasks;
          t = q.next_block(&task_slot)) {
         const int n = sizes[t], off = offsets[t];
+        const int64_t base64 = (int64_t)off;   // #2 int64 global index base
         for (int i = threadIdx.x; i < n; i += blockDim.x) {
-            grad[off + i] = acts[off + i]
-                            * model_activation_grad<M>(params[off + i]);
+            const int64_t gi = base64 + i;
+            grad[gi] = acts[gi] * model_activation_grad<M>(params[gi]);
         }
     }
 }
