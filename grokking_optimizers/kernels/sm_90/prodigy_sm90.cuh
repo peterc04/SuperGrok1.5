@@ -59,6 +59,7 @@
     (SG_TUNED_CLUSTER_SHAPE_0 * SG_TUNED_CLUSTER_SHAPE_1 * SG_TUNED_CLUSTER_SHAPE_2)
 #endif
 #include "csrc/backends/cuda/sm_90/primitives.cuh"
+#include "grokking_optimizers/kernels/sm_90/common_sm90.cuh"
 
 namespace sg { namespace sm90 {
 
@@ -87,11 +88,12 @@ prodigy_reduce_kernel(
     const ParamT* param, const ParamT* param_init, const GradT* grad,
     float d_prev,
     float* r_partial, float* s_partial,
-    int N
+    int64_t N
 ) {
     float r_local = 0.0f, s_local = 0.0f;
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N; i += stride) {
+        SG_SANITIZE_GRAD_INPLACE(grad, i);
         prodigy_partials_step(param, param_init, grad, d_prev, i,
                               r_local, s_local);
     }
@@ -119,11 +121,12 @@ prodigy_reduce_and_update_d_kernel(
     float d_prev,
     float* r_partial, float* s_partial, float* d_t,
     unsigned* block_done_counter,
-    int N, int total_blocks
+    int64_t N, int total_blocks
 ) {
     float r_local = 0.0f, s_local = 0.0f;
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N; i += stride) {
+        SG_SANITIZE_GRAD_INPLACE(grad, i);
         prodigy_partials_step(param, param_init, grad, d_prev, i,
                               r_local, s_local);
     }
@@ -160,15 +163,16 @@ prodigy_reduce_dsmem_kernel(
     const ParamT* param, const ParamT* param_init, const GradT* grad,
     float d_prev,
     float* r_partial, float* s_partial,
-    int N
+    int64_t N
 ) {
     // One shared slot per reduced quantity for this block's published partial.
     __shared__ float r_slot;
     __shared__ float s_slot;
 
     float r_local = 0.0f, s_local = 0.0f;
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N; i += stride) {
+        SG_SANITIZE_GRAD_INPLACE(grad, i);
         prodigy_partials_step(param, param_init, grad, d_prev, i,
                               r_local, s_local);
     }
@@ -198,16 +202,17 @@ prodigy_apply_kernel(
     ParamT* param, float* exp_avg, float* exp_avg_sq, float* s_track,
     const GradT* grad, const float* d_ptr,
     float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int N
+    float bc1, float bc2, int64_t N
 ) {
     const float d = *d_ptr;
-    const int stride = prim::grid_stride() * UNROLL;
-    const int base0 = prim::grid_stride_index() * UNROLL;
-    for (int base = base0; base < N; base += stride) {
+    const int64_t stride = prim::grid_stride() * UNROLL;
+    const int64_t base0 = prim::grid_stride_index() * UNROLL;
+    for (int64_t base = base0; base < N; base += stride) {
         #pragma unroll
         for (int u = 0; u < UNROLL; ++u) {
-            const int i = base + u;
+            const int64_t i = base + u;
             if (i < N) {
+                SG_SANITIZE_GRAD_INPLACE(grad, i);
                 prodigy_apply_step(param, exp_avg, exp_avg_sq, s_track, grad,
                                    d, beta1, beta2, eps, wd, bc1, bc2, i);
             }
@@ -221,16 +226,17 @@ prodigy_apply_kernel_vec4_fp32(
     float4* param4, float4* exp_avg4, float4* exp_avg_sq4, float4* s_track4,
     const float4* grad4, const float* d_ptr,
     float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int N4
+    float bc1, float bc2, int64_t N4
 ) {
     const float d = *d_ptr;
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N4; i += stride) {
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N4; i += stride) {
         float4 p  = prim::ld_f32v4(param4 + i);
         float4 m  = prim::ld_f32v4(exp_avg4 + i);
         float4 v  = prim::ld_f32v4(exp_avg_sq4 + i);
         float4 st = prim::ld_f32v4(s_track4 + i);
         float4 g  = prim::ldg_f32v4(grad4 + i);
+        ::grokking::sm90::sg_sanitize_grad4(g);
         #pragma unroll
         for (int u = 0; u < 4; ++u) {
             prodigy_apply_step(&p.x, &m.x, &v.x, &st.x, &g.x,
@@ -268,7 +274,8 @@ void launch_prodigy_step(
         exp_avg_sq.data_ptr(), exp_avg_sq.nbytes());
 
     const int block = SG_TUNED_BLOCK_SIZE;
-    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    const int grid = static_cast<int>(
+        std::min<int64_t>(65535, (N + block - 1) / block));
 
     r_partial.zero_();
     s_partial.zero_();
@@ -296,6 +303,7 @@ void launch_prodigy_step(
                     r_partial.data_ptr<float>(),
                     s_partial.data_ptr<float>(),
                     N);
+                SG_LAUNCH_CHECK(stream);
             });
         // DSMEM path wrote the final (r, s) directly; do the d-update on one
         // thread (the cluster kernel cannot use the last-block fold).
@@ -304,6 +312,7 @@ void launch_prodigy_step(
             r_partial.data_ptr<float>(),
             s_partial.data_ptr<float>(),
             d_prev);
+        SG_LAUNCH_CHECK(stream);
     } else
 #endif  // ENABLE_DSMEM_REDUCE
     {
@@ -325,6 +334,7 @@ void launch_prodigy_step(
                     d_t.data_ptr<float>(),
                     reinterpret_cast<unsigned*>(counter.data_ptr<int>()),
                     N, grid);
+                SG_LAUNCH_CHECK(stream);
             });
     }
 
@@ -336,8 +346,9 @@ void launch_prodigy_step(
         prim::is_vec4_alignable(exp_avg_sq.data_ptr(), N) &&
         prim::is_vec4_alignable(s_track.data_ptr(), N) &&
         prim::is_vec4_alignable(grad.data_ptr(), N)) {
-        const int N4 = N / 4;
-        const int grid4 = std::min<int>(65535, (N4 + block - 1) / block);
+        const int64_t N4 = N / 4;
+        const int grid4 = static_cast<int>(
+            std::min<int64_t>(65535, (N4 + block - 1) / block));
         prodigy_apply_kernel_vec4_fp32<<<grid4, block, 0, stream>>>(
             reinterpret_cast<float4*>(param.data_ptr<float>()),
             reinterpret_cast<float4*>(exp_avg.data_ptr<float>()),
@@ -346,6 +357,7 @@ void launch_prodigy_step(
             reinterpret_cast<const float4*>(grad.data_ptr<float>()),
             d_t.data_ptr<float>(),
             beta1, beta2, eps, wd, bc1, bc2, N4);
+        SG_LAUNCH_CHECK(stream);
         return;
     }
 
@@ -361,6 +373,7 @@ void launch_prodigy_step(
                 grad.data_ptr<scalar_t>(),
                 d_t.data_ptr<float>(),
                 beta1, beta2, eps, wd, bc1, bc2, N);
+            SG_LAUNCH_CHECK(stream);
         });
 }
 
@@ -389,12 +402,13 @@ __global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_PRODIGY_MIN_BLOCKS)
 prodigy_dlr_reduce_kernel(
     const float* grad, const float* param, const float* param_init,
     const float* s, float* numerator, float* denominator,
-    float eps, int N
+    float eps, int64_t N
 ) {
     float num_acc = 0.0f, den_acc = 0.0f;
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
-        num_acc += grad[i] * (param[i] - param_init[i]);
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N; i += stride) {
+        num_acc += ::grokking::sm90::sg_sanitize_grad(grad[i]) *
+                   (param[i] - param_init[i]);
         den_acc += fabsf(s[i]);
     }
     // Fused two-value block reduction → ONE atomicAdd per partial per block
@@ -416,12 +430,14 @@ void launch_prodigy_dlr_reduce(
     if (N == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int block = SG_TUNED_BLOCK_SIZE;
-    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    const int grid = static_cast<int>(
+        std::min<int64_t>(65535, (N + block - 1) / block));
     prodigy_dlr_reduce_kernel<<<grid, block, 0, stream>>>(
         grad.data_ptr<float>(), param.data_ptr<float>(),
         param_init.data_ptr<float>(), s.data_ptr<float>(),
         numerator.data_ptr<float>(), denominator.data_ptr<float>(),
         eps, N);
+    SG_LAUNCH_CHECK(stream);
 }
 
 // Multi-tensor fused reduce + step: accumulate d_lr across all tensors,
@@ -451,7 +467,8 @@ void launch_multi_tensor_prodigy_fused_reduce_step(
     for (size_t i = 0; i < params.size(); i++) {
         const int64_t N = params[i].numel();
         if (N == 0) continue;
-        const int grid = std::min<int>(65535, (N + block - 1) / block);
+        const int grid = static_cast<int>(
+        std::min<int64_t>(65535, (N + block - 1) / block));
         AT_DISPATCH_FLOATING_TYPES_AND2(
             at::ScalarType::Half, at::ScalarType::BFloat16,
             params[i].scalar_type(), "prodigy_mt_reduce", [&] {
@@ -463,6 +480,7 @@ void launch_multi_tensor_prodigy_fused_reduce_step(
                     d_prev,
                     r_partial.data_ptr<float>(),
                     s_partial.data_ptr<float>(), N);
+                SG_LAUNCH_CHECK(stream);
             });
     }
 
@@ -470,11 +488,13 @@ void launch_multi_tensor_prodigy_fused_reduce_step(
         d_lr_buf.data_ptr<float>(),
         r_partial.data_ptr<float>(),
         s_partial.data_ptr<float>(), d_prev);
+    SG_LAUNCH_CHECK(stream);
 
     for (size_t i = 0; i < params.size(); i++) {
         const int64_t N = params[i].numel();
         if (N == 0) continue;
-        const int grid = std::min<int>(65535, (N + block - 1) / block);
+        const int grid = static_cast<int>(
+        std::min<int64_t>(65535, (N + block - 1) / block));
         AT_DISPATCH_FLOATING_TYPES_AND2(
             at::ScalarType::Half, at::ScalarType::BFloat16,
             params[i].scalar_type(), "prodigy_mt_apply", [&] {
@@ -487,6 +507,7 @@ void launch_multi_tensor_prodigy_fused_reduce_step(
                     grads[i].data_ptr<scalar_t>(),
                     d_lr_buf.data_ptr<float>(),
                     beta1, beta2, eps, wd, bc1s[i], bc2s[i], N);
+                SG_LAUNCH_CHECK(stream);
             });
     }
 }

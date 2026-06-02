@@ -35,6 +35,7 @@
 #define SG_TUNED_ASYNC_DEPTH 2
 #endif
 #include "csrc/backends/cuda/sm_90/primitives.cuh"
+#include "grokking_optimizers/kernels/sm_90/common_sm90.cuh"
 
 namespace sg { namespace sm90 {
 
@@ -58,15 +59,16 @@ grokfast_kernel(
     const GradT* grad,
     float gf_alpha, float gf_lamb,
     float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int N
+    float bc1, float bc2, int64_t N
 ) {
-    const int stride = prim::grid_stride() * UNROLL;
-    const int base0 = prim::grid_stride_index() * UNROLL;
-    for (int base = base0; base < N; base += stride) {
+    const int64_t stride = prim::grid_stride() * UNROLL;
+    const int64_t base0 = prim::grid_stride_index() * UNROLL;
+    for (int64_t base = base0; base < N; base += stride) {
         #pragma unroll
         for (int u = 0; u < UNROLL; ++u) {
-            const int i = base + u;
+            const int64_t i = base + u;
             if (i < N) {
+                SG_SANITIZE_GRAD_INPLACE(grad, i);
                 grokfast_fused_step(param, exp_avg, exp_avg_sq, ema, grad,
                                     gf_alpha, gf_lamb, lr, beta1, beta2, eps, wd,
                                     bc1, bc2, i);
@@ -85,15 +87,16 @@ grokfast_kernel_vec4_fp32(
     const float4* grad4,
     float gf_alpha, float gf_lamb,
     float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int N4
+    float bc1, float bc2, int64_t N4
 ) {
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N4; i += stride) {
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N4; i += stride) {
         float4 p  = prim::ld_f32v4(param4 + i);
         float4 m  = prim::ld_f32v4(exp_avg4 + i);
         float4 v  = prim::ld_f32v4(exp_avg_sq4 + i);
         float4 e  = prim::ld_f32v4(ema4 + i);
         float4 g  = prim::ldg_f32v4(grad4 + i);
+        ::grokking::sm90::sg_sanitize_grad4(g);
         // Call the canonical per-element step 4× on the register lanes.
         grokfast_fused_step(&p.x, &m.x, &v.x, &e.x, &g.x,
                             gf_alpha, gf_lamb, lr, beta1, beta2, eps, wd,
@@ -135,7 +138,8 @@ void launch_grokfast_step(
         exp_avg_sq.data_ptr(), exp_avg_sq.nbytes());
 
     const int block = SG_TUNED_BLOCK_SIZE;
-    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    const int grid = static_cast<int>(
+        std::min<int64_t>(65535, (N + block - 1) / block));
 
     const bool all_fp32 = param.scalar_type() == torch::kFloat32 &&
                           grad.scalar_type() == torch::kFloat32;
@@ -148,8 +152,9 @@ void launch_grokfast_step(
         prim::is_vec4_alignable(exp_avg_sq.data_ptr(), N) &&
         prim::is_vec4_alignable(ema.data_ptr(), N) &&
         prim::is_vec4_alignable(grad.data_ptr(), N)) {
-        const int N4 = N / 4;
-        const int grid4 = std::min<int>(65535, (N4 + block - 1) / block);
+        const int64_t N4 = N / 4;
+        const int grid4 = static_cast<int>(
+            std::min<int64_t>(65535, (N4 + block - 1) / block));
         grokfast_kernel_vec4_fp32<<<grid4, block, 0, stream>>>(
             reinterpret_cast<float4*>(param.data_ptr<float>()),
             reinterpret_cast<float4*>(exp_avg.data_ptr<float>()),
@@ -157,6 +162,7 @@ void launch_grokfast_step(
             reinterpret_cast<float4*>(ema.data_ptr<float>()),
             reinterpret_cast<const float4*>(grad.data_ptr<float>()),
             gf_alpha, gf_lamb, lr, beta1, beta2, eps, wd, bc1, bc2, N4);
+        SG_LAUNCH_CHECK(stream);
         return;
     }
 
@@ -171,6 +177,7 @@ void launch_grokfast_step(
                 ema.data_ptr<float>(),
                 grad.data_ptr<scalar_t>(),
                 gf_alpha, gf_lamb, lr, beta1, beta2, eps, wd, bc1, bc2, N);
+            SG_LAUNCH_CHECK(stream);
         });
 }
 
@@ -178,11 +185,11 @@ void launch_grokfast_step(
 // EMA-only update: ema = alpha * ema + (1 - alpha) * grad.
 // No Adam step; used as a sub-operation by the fused path.
 __global__ void grokfast_ema_kernel(
-    float* grad, float* ema, float alpha, float lamb, int N
+    float* grad, float* ema, float alpha, float lamb, int64_t N
 ) {
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
-        float g = grad[i];
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N; i += stride) {
+        float g = ::grokking::sm90::sg_sanitize_grad(grad[i]);
         float e = alpha * ema[i] + (1.0f - alpha) * g;
         ema[i] = e;
         grad[i] = g + lamb * e;
@@ -196,9 +203,11 @@ void launch_fused_grokfast_ema(
     if (N == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int block = SG_TUNED_BLOCK_SIZE;
-    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    const int grid = static_cast<int>(
+        std::min<int64_t>(65535, (N + block - 1) / block));
     grokfast_ema_kernel<<<grid, block, 0, stream>>>(
         grad.data_ptr<float>(), ema.data_ptr<float>(), alpha, lamb, N);
+    SG_LAUNCH_CHECK(stream);
 }
 
 void launch_fused_grokfast_adam(
