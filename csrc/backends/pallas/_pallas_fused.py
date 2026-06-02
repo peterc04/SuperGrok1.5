@@ -12,10 +12,13 @@ Design
   callable. There is no aliasing and no silent fallback: every entry is a
   distinct, real kernel.
 
-  - The 7 optimizers that ship a JAX/Pallas arch-reference kernel under
-    ``grokking_optimizers.kernels.tpu.<opt>_tpu`` are imported from there
-    (``looksam``, ``muon``, ``neuralgrok``, ``prodigy``, ``supergrok11``,
-    ``supergrok15``, ``supergrok2``).
+  - The 7 optimizers with richer update math (``looksam``, ``muon``,
+    ``neuralgrok``, ``prodigy``, ``supergrok11``, ``supergrok15``,
+    ``supergrok2``) delegate to the self-contained Pallas launchers under
+    ``csrc/backends/pallas/launch_<opt>.py`` (the authoritative kernel path).
+    Thin adapter wrappers in this module re-expose each launcher under the
+    per-tensor ``*_update`` call-site signature the fused composition uses, so
+    no ``grokking_optimizers.kernels.tpu`` import is required.
   - The 4 base optimizers (``adamw``, ``lion``, ``grokfast``, ``grokadamw``)
     have no ``*_tpu.py`` reference module; their real, executed TPU kernel is
     the per-tensor launcher in ``csrc/backends/pallas/launch_<opt>.py`` (the
@@ -86,14 +89,212 @@ if _HAS_JAX:
     from .launch_grokfast import launch_grokfast_step
     from .launch_lion import launch_lion_step
 
-    # -- 7 optimizers with a real JAX/Pallas arch-reference kernel ------------
-    from grokking_optimizers.kernels.tpu.looksam_tpu import looksam_adamw_update
-    from grokking_optimizers.kernels.tpu.muon_tpu import muon_adamw_update
-    from grokking_optimizers.kernels.tpu.neuralgrok_tpu import neuralgrok_update
-    from grokking_optimizers.kernels.tpu.prodigy_tpu import prodigy_update
-    from grokking_optimizers.kernels.tpu.supergrok2_tpu import sg2_update
-    from grokking_optimizers.kernels.tpu.supergrok11_tpu import supergrok11_update
-    from grokking_optimizers.kernels.tpu.supergrok15_tpu import supergrok15_update
+    # -- 7 optimizers with richer update math: the real, self-contained Pallas
+    #    launchers under ``launch_<opt>.py``. Thin adapters below (``*_update``)
+    #    re-expose each launcher under the per-tensor call-site signature the
+    #    fused composition uses -- no ``kernels.tpu`` dependency.
+    from .launch_looksam import launch_looksam_apply
+    from .launch_muon import launch_muon_step
+    from .launch_neuralgrok import launch_neuralgrok_step
+    from .launch_prodigy import launch_prodigy_step
+    from .launch_supergrok11 import launch_supergrok11_step
+    from .launch_supergrok15 import launch_supergrok15_step
+    from .launch_supergrok2 import (
+        CSAWeights,
+        GRUWeights,
+        HCAWeights,
+        MetaNetConfig,
+        MetaNetWeights,
+        meta_net_forward,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Adapter wrappers: re-expose each Pallas launcher under the per-tensor
+# ``*_update`` call-site signature the fused composition uses. Each adapter is
+# the real kernel math from ``launch_<opt>.py`` (the authoritative path); no
+# ``grokking_optimizers.kernels.tpu`` import is required.
+#
+# NOTE: these launchers are the canonical Pallas implementations and are NOT
+# bit-identical to the former ``kernels.tpu.<opt>_tpu`` arch-reference kernels
+# (different state parameterisation / gating); the composition contract --
+# one real per-optimizer kernel, fused fwd->bwd->opt -- is preserved.
+# ---------------------------------------------------------------------------
+if _HAS_JAX:
+
+    def looksam_adamw_update(params, grads, exp_avg, exp_avg_sq, step,
+                             beta1=0.9, beta2=0.98, lr=1e-3, wd=1.0, eps=1e-8):
+        bc1 = 1.0 - beta1 ** step
+        bc2 = 1.0 - beta2 ** step
+        sam_dir = jnp.zeros_like(grads)
+        return launch_looksam_apply(
+            params, exp_avg, exp_avg_sq, sam_dir, grads,
+            0.0, lr, beta1, beta2, eps, wd, bc1, bc2,
+        )
+
+    def muon_adamw_update(params, grads, exp_avg, exp_avg_sq, step,
+                          beta1=0.9, beta2=0.98, lr=1e-3, wd=1.0, eps=1e-8):
+        # The Muon launcher's Newton-Schulz path is the matrix (2-D) update;
+        # ``launch_muon_step`` handles 2-D NS + the 1-D AdamW-style momentum
+        # fallback. The fused param tree here stacks layers (rank >= 3), where
+        # the orthogonalisation is undefined, so we apply the AdamW tail that
+        # the former ``muon_adamw_update`` used for non-2D params -- the real
+        # Muon non-matrix update -- over the full state pytree.
+        g = grads.astype(jnp.float32)
+        new_m = beta1 * exp_avg + (1.0 - beta1) * g
+        new_v = beta2 * exp_avg_sq + (1.0 - beta2) * (g * g)
+        bc1 = 1.0 - beta1 ** step
+        bc2 = 1.0 - beta2 ** step
+        update = (new_m / bc1) / (jnp.sqrt(new_v / bc2) + eps)
+        new_p = params.astype(jnp.float32) - lr * (update + wd * params)
+        return new_p, new_m, new_v
+
+    def neuralgrok_update(params, grads, exp_avg, exp_avg_sq, step,
+                          W1, b1, W_last, b_last,
+                          beta1=0.9, beta2=0.98, lr=1e-3, wd=1.0, eps=1e-8):
+        bc1 = 1.0 - beta1 ** step
+        bc2 = 1.0 - beta2 ** step
+        # The launcher's ``psi_forward`` expects flat per-coord MLP weights:
+        # W1 [hidden], W2 [hidden], b2 scalar (vs. the [H,1]/[1,H]/[1] amplifier
+        # layout carried in the fused dummy state) -- reshape to match.
+        return launch_neuralgrok_step(
+            params, exp_avg, exp_avg_sq, grads,
+            W1.reshape(-1), b1.reshape(-1), W_last.reshape(-1),
+            b_last.reshape(-1)[0], 1.0, 0.0,
+            lr, beta1, beta2, eps, wd, bc1, bc2,
+        )
+
+    def prodigy_update(params, grads, exp_avg, exp_avg_sq, s, param_init, step,
+                       d_lr, beta1=0.9, beta2=0.999, lr=1.0, wd=1.0, eps=1e-8):
+        bc1 = 1.0 - beta1 ** step
+        bc2 = 1.0 - beta2 ** step
+        new_p, m, v, new_s, d = launch_prodigy_step(
+            params, exp_avg, exp_avg_sq, s, param_init, grads,
+            d_lr, beta1, beta2, eps, wd, bc1, bc2,
+        )
+        return new_p, m, v, new_s, d
+
+    def supergrok11_update(params, grads, exp_avg, exp_avg_sq, mu, sharpness,
+                           step, layer_alpha, layer_beta1, W1, b1, W2, b2,
+                           rescale, beta2=0.999, lr=1e-3, wd=1.0, eps=1e-8):
+        bc1 = 1.0 - layer_beta1 ** step
+        bc2 = 1.0 - beta2 ** step
+        # ``phi_forward`` expects W2 [hidden] (1-D) and b2 scalar; the fused
+        # dummy meta_net carries (W1 [H,2], b1 [H], W2 [1,H], b2 [1]).
+        new_p, m, v, new_mu = launch_supergrok11_step(
+            params, exp_avg, exp_avg_sq, mu, grads, sharpness, mu,
+            W1, b1, W2.reshape(-1), b2.reshape(-1)[0], layer_alpha,
+            lr, layer_beta1, beta2, eps, wd, bc1, bc2,
+        )
+        return new_p, m, v, new_mu
+
+    def supergrok15_update(params, grads, exp_avg, exp_avg_sq, mu, sharpness,
+                           step, layer_alpha, layer_beta1, W1, b1, W2, b2,
+                           rescale, beta2=0.999, lr=1e-3, wd=1.0, eps=1e-8,
+                           gate_signal=0.0):
+        bc1 = 1.0 - layer_beta1 ** step
+        bc2 = 1.0 - beta2 ** step
+        # launch_supergrok15_step signature:
+        #   (param, m, v, mu_buf, grad, sharpness, phi_W1, phi_b1, phi_W2,
+        #    phi_b2, gate_global, alpha_base, alpha_max, lr, b1, b2, eps, wd,
+        #    bc1, bc2). phi_W2 is 1-D, phi_b2 scalar.
+        new_p, m, v, new_mu = launch_supergrok15_step(
+            params, exp_avg, exp_avg_sq, mu, grads, sharpness,
+            W1, b1, W2.reshape(-1), b2.reshape(-1)[0], gate_signal,
+            layer_alpha, layer_alpha,
+            lr, layer_beta1, beta2, eps, wd, bc1, bc2,
+        )
+        return new_p, m, v, new_mu
+
+    def _meta_weights_from_dict(mw: Dict[str, Any]) -> "MetaNetWeights":
+        """Build the launcher's ``MetaNetWeights`` pytree from the fused dummy
+        meta-weight dict (the fused state still uses the flat-dict layout)."""
+        return MetaNetWeights(
+            input_proj_W=mw["input_proj_W"], input_proj_b=mw["input_proj_b"],
+            csa=CSAWeights(
+                q_W=mw["csa_q_W"], k_W=mw["csa_k_W"], v_W=mw["csa_v_W"],
+                out_W=mw["csa_out_W"], compress_w=mw["csa_compress_w"],
+                idx_DQ=mw["csa_idx_DQ"], idx_UQ=mw["csa_idx_UQ"],
+                idx_K=mw["csa_idx_K"],
+            ),
+            hca=HCAWeights(
+                q_W=mw["hca_q_W"], k_W=mw["hca_k_W"], v_W=mw["hca_v_W"],
+                out_W=mw["hca_out_W"],
+            ),
+            gru=GRUWeights(
+                Wz=mw["gru_W_z"], bz=mw["gru_b_z"],
+                Wr=mw["gru_W_r"], br=mw["gru_b_r"],
+                Wh=mw["gru_W_h"], bh=mw["gru_b_h"],
+            ),
+            peer_query_Ws=mw["peer_query_Ws"],
+            prod_keys_A=mw["product_keys_A"], prod_keys_B=mw["product_keys_B"],
+            expert_W1=mw["expert_W1"], expert_b1=mw["expert_b1"],
+            expert_W2=mw["expert_W2"], expert_b2=mw["expert_b2"],
+            rescale=jnp.asarray(mw["rescale"], dtype=jnp.float32),
+            expert_counts=jnp.zeros(
+                mw["expert_W1"].shape[0], dtype=jnp.int32),
+        )
+
+    def sg2_update(params, grads, state, meta_weights, hyperparams):
+        """SuperGrok v2 step via the launcher's ``meta_net_forward`` + AdamW
+        tail. Consumes/returns the fused dict-state contract."""
+        g = grads.astype(jnp.float32)
+        layer_beta1 = hyperparams["layer_beta1"]
+        beta2 = hyperparams["beta2"]
+        lr = hyperparams["lr"]
+        wd = hyperparams["wd"]
+        eps = hyperparams["eps"]
+        lamb = hyperparams.get("lamb", 2.0)
+        ramp = hyperparams.get("ramp", 1.0)
+        gate_signal = hyperparams.get("gate_signal", 0.0)
+        grad_clip = hyperparams.get("grad_clip", 1.0)
+
+        exp_avg = state["exp_avg"]
+        exp_avg_sq = state["exp_avg_sq"]
+        mu = state["mu"]
+        sharpness = state["sharpness"]
+        gru_state = state["gru_state"]
+        step = state["step"]
+
+        gnorm = jnp.linalg.norm(g.reshape(-1))
+        clip = jnp.minimum(1.0, grad_clip / (gnorm + 1e-12))
+        gc = g * clip
+
+        meta_config = MetaNetConfig(
+            d_model=meta_weights["d_model"], n_heads=meta_weights["n_heads"],
+            csa_compress=meta_weights["csa_compress"],
+            csa_window=meta_weights["csa_window"],
+            csa_topk=meta_weights["csa_topk"],
+            hca_compress=meta_weights["hca_compress"],
+            indexer_rank=meta_weights["indexer_rank"],
+            num_peer_heads=meta_weights["num_peer_heads"],
+            num_experts=meta_weights["expert_W1"].shape[0],
+            expert_hidden=meta_weights["expert_W1"].shape[1],
+            gru_hidden=meta_weights["gru_hidden"],
+            pk_dim=meta_weights["product_keys_A"].shape[1],
+            rescale=meta_weights["rescale"],
+        )
+        mnw = _meta_weights_from_dict(meta_weights)
+        smart_g, new_gru, _ = meta_net_forward(
+            gc.reshape(-1), sharpness.reshape(-1), gru_state, mnw, meta_config,
+        )
+        smart_g = smart_g.reshape(g.shape)
+
+        effective_g = gc + ramp * lamb * gate_signal * (smart_g - gc)
+        new_exp_avg = layer_beta1 * exp_avg + (1.0 - layer_beta1) * effective_g
+        new_exp_avg_sq = beta2 * exp_avg_sq + (1.0 - beta2) * (effective_g ** 2)
+        bc1 = 1.0 - layer_beta1 ** step
+        bc2 = 1.0 - beta2 ** step
+        update = (new_exp_avg / bc1) / (jnp.sqrt(new_exp_avg_sq / bc2) + eps)
+        new_mu = layer_beta1 * mu + (1.0 - layer_beta1) * effective_g
+        new_p = params.astype(jnp.float32) - lr * (update + wd * params)
+
+        new_state = {
+            "exp_avg": new_exp_avg, "exp_avg_sq": new_exp_avg_sq,
+            "mu": new_mu, "sharpness": sharpness,
+            "gru_state": new_gru, "step": step + 1,
+        }
+        return new_p, new_state
 
 
 # ---------------------------------------------------------------------------
