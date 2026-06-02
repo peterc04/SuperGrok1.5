@@ -124,7 +124,7 @@ jobs:
           "
 
   # ---------------------------------------------------------------------------
-  # Self-test — full --self-test suite (144 tests as of Phase 8). The repo's
+  # Self-test — full --self-test suite (147 tests as of Phase 8; authoritative count guarded in compile.py). The repo's
   # own correctness gate. The authoritative count is enforced inside
   # grokking_optimizers/compile.py (the self-test count guard); the summary
   # check below asserts "<N> passed, 0 failed" rather than hard-coding N here.

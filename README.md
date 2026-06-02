@@ -172,14 +172,14 @@ fused cells).
 ## 6. Verification (this environment — no accelerator)
 
 ```bash
-python -m grokking_optimizers.compile --self-test     # 141 passed, 0 failed
+python -m grokking_optimizers.compile --self-test     # 147 passed, 0 failed
 ruff check grokking_optimizers/ && ruff format --check grokking_optimizers/
 python scripts/check_math_single_source.py            # drift guard (exit 0)
 scripts/amdgcn_check.sh --header <gfx942 header>       # clang AMDGPU device gate
 scripts/compile_to_object.sh <tu>.cu -DWITH_CUTLASS    # nvcc -c sm_90a
 ```
 
-System-verified (Phase 5/6): self-test **141/0**; ruff clean; **19/19** gfx942
+System-verified (Phase 5/6): self-test **147/0**; ruff clean; **19/19** gfx942
 headers AMDGCN_OK; **99/99** cells emit real compositions and are 5-way
 consistent (canonical file ↔ solver tier ↔ cell comment ↔ dispatch route ↔
 status table); anti-false-positive sweep = **0**; the math-drift guard passes
