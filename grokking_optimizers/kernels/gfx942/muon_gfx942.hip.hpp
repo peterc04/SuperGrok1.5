@@ -67,7 +67,10 @@
 // content. On a real hipcc build the host pass compiles this and launches the
 // §5 kernel via hipLaunchKernelGGL (see §5.LAUNCH).
 // ════════════════════════════════════════════════════════════════════════════
-#if !defined(__AMDGCN__)
+// SG_GFX942_DEVICE_TU (Stage 7): set by the thin `.hip` device TU so this host
+// launcher is NOT re-emitted in that TU's host pass (it stays owned by the
+// `.hip.cpp` host TU) — avoids duplicate launch_muon_* symbols at link.
+#if !defined(__AMDGCN__) && !defined(SG_GFX942_DEVICE_TU)
 #include <torch/extension.h>
 #include <vector>
 #include <algorithm>
@@ -93,7 +96,7 @@ namespace prim = ::sg::gfx942::primitives;
 // the extern "C" __global__ definitions exactly.
 namespace native {
 extern "C" __global__ void muon_gfx942_frobenius_reduce(
-    const float* __restrict__ m, float* __restrict__ acc, int n);
+    const float* __restrict__ m, float* __restrict__ acc, int64_t n);
 extern "C" __global__ void muon_gfx942_newton_schulz(
     float* __restrict__ X_inout, int M, int N, int steps,
     float a, float b, float c);
@@ -139,14 +142,16 @@ void launch_muon_step(
 
         if (p.dim() >= 2) {
             auto buf_f = buf.to(torch::kFloat32).contiguous();
-            int n = static_cast<int>(buf_f.numel());
+            const int64_t n = static_cast<int64_t>(buf_f.numel());  // Stage 1: 64-bit
 
             // (2) Frobenius ‖buf‖_F = sqrt(Σ buf²): §5 DPP wave→block→AGENT reduce.
             auto acc = torch::zeros({1}, buf_f.options());
-            dim3 fgrid(std::min(1024, (n + 255) / 256)), fblock(256);
+            dim3 fgrid(static_cast<unsigned>(
+                std::min<int64_t>(1024, (n + 255) / 256))), fblock(256);
             hipLaunchKernelGGL(native::muon_gfx942_frobenius_reduce, fgrid, fblock,
                                0, stream, buf_f.data_ptr<float>(),
                                acc.data_ptr<float>(), n);
+            SG_HIP_LAUNCH_CHECK(stream);  // mirror sm_90 SG_LAUNCH_CHECK
             float frob = sqrtf(acc.item<float>()) + 1e-8f;
 
             // (3) normalize the iterate in place: X = buf / ‖buf‖_F.
@@ -162,6 +167,7 @@ void launch_muon_step(
             hipLaunchKernelGGL(native::muon_gfx942_newton_schulz, dim3(1), dim3(64),
                                lds, stream, X.data_ptr<float>(), M, N, ns_steps,
                                ns_a, ns_b, ns_c);
+            SG_HIP_LAUNCH_CHECK(stream);  // mirror sm_90 SG_LAUNCH_CHECK
 
             // (5) p -= lr·X·scale + p·decay (elementwise — host path).
             float neg_lr_scale = -lr * 0.2f * sqrtf((float)std::max<int64_t>(p.size(-1), p.size(-2)));
@@ -319,17 +325,20 @@ static constexpr int kWave = 64;   // == amd::kWave (CDNA3 wavefront width)
 // one float per wavefront (<= 64 floats). The momentum buffer is laid out
 // contiguously [rows*cols], so Σ_ij M_ij² is a flat sum over n = numel.
 __device__ __forceinline__ void muon_frobenius_block(
-    const float* __restrict__ m, float* __restrict__ acc, int n)
+    const float* __restrict__ m, float* __restrict__ acc, int64_t n)
 {
+    // LDS/lane bookkeeping is LOCAL to the block (<= 4096 threads) → int. The
+    // GLOBAL element index/stride is int64 so the Frobenius reduction over a
+    // >2^31-element momentum buffer cannot wrap (Stage 1).
     const int tid    = static_cast<int>(threadIdx.x);
     const int lane   = tid % kWave;
     const int waveId = tid / kWave;
     const int wpb    = static_cast<int>(blockDim.x) / kWave;
-    const int gtid   = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
-    const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    const int64_t gtid   = static_cast<int64_t>(blockIdx.x) * blockDim.x + tid;
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
 
     float local = 0.f;
-    for (int i = gtid; i < n; i += stride) {
+    for (int64_t i = gtid; i < n; i += stride) {
         float v = amd::streaming_load(&m[i]);
         local += v * v;
     }
@@ -351,7 +360,7 @@ __device__ __forceinline__ void muon_frobenius_block(
 // Bandwidth-bound reduction → high occupancy (256-thread block = 4 wavefronts;
 // 8 waves/EU) to hide global-memory latency. (WS5 occupancy wire.)
 extern "C" SG_KERNEL_BOUNDS(256, 8) void muon_gfx942_frobenius_reduce(
-    const float* __restrict__ m, float* __restrict__ acc, int n)
+    const float* __restrict__ m, float* __restrict__ acc, int64_t n)
 {
     muon_frobenius_block(m, acc, n);
 }
@@ -569,7 +578,7 @@ extern "C" SG_KERNEL_BOUNDS(64, 4) void muon_gfx942_newton_schulz(
 // (replicated lane-by-lane) the f32x4 fast-path so both are bit-identical.
 template <typename ParamT, typename OrthT>
 __device__ __forceinline__ void muon_apply_elem(
-    ParamT* __restrict__ param, const OrthT* __restrict__ orth, int i,
+    ParamT* __restrict__ param, const OrthT* __restrict__ orth, int64_t i,
     float decay, float neg_lr_scale)
 {
     const float p = static_cast<float>(param[i]);
@@ -581,21 +590,22 @@ __device__ __forceinline__ void muon_apply_elem(
 template <typename ParamT, typename OrthT>
 SG_KERNEL_BOUNDS(256, 8) void muon_gfx942_apply_kernel(
     ParamT* __restrict__ param, const OrthT* __restrict__ orth,
-    float decay, float neg_lr_scale, int N)
+    float decay, float neg_lr_scale, int64_t N)
 {
-    const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
-    const int tid    = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
-                       + static_cast<int>(threadIdx.x);
+    // 64-bit grid-stride indexing (Stage 1): cast BEFORE the multiply.
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    const int64_t tid    = static_cast<int64_t>(blockIdx.x) * blockDim.x
+                       + threadIdx.x;
 
     constexpr bool kVecOk =
         sizeof(ParamT) == sizeof(float) && sizeof(OrthT) == sizeof(float);
-    const int n4 = kVecOk ? (N >> 2) : 0;   // number of full float4 groups
+    const int64_t n4 = kVecOk ? (N >> 2) : 0;   // number of full float4 groups
 
     using f32x4 = amd::f32x4;
     auto* p4 = reinterpret_cast<f32x4*>(param);
     const auto* x4 = reinterpret_cast<const f32x4*>(orth);
 
-    for (int q = tid; q < n4; q += stride) {
+    for (int64_t q = tid; q < n4; q += stride) {
         const f32x4 p = p4[q];
         const f32x4 x = amd::streaming_load(&x4[q]);   // 128-bit dwordx4 load (orth)
         f32x4 po;
@@ -606,14 +616,14 @@ SG_KERNEL_BOUNDS(256, 8) void muon_gfx942_apply_kernel(
     }
 
     // SCALAR TAIL: the final N%4 elements (and the whole array on fp32 fallback).
-    for (int i = (n4 << 2) + tid; i < N; i += stride) {
+    for (int64_t i = (n4 << 2) + tid; i < N; i += stride) {
         muon_apply_elem(param, orth, i, decay, neg_lr_scale);
     }
 }
 
 // Force-instantiate the grokking dtype combo (fp32 param + fp32 orth iterate).
 template __global__ void muon_gfx942_apply_kernel<float, float>(
-    float*, const float*, float, float, int);
+    float*, const float*, float, float, int64_t);
 
 }}} // namespace sg::gfx942::native
 #endif  // (B) device pass

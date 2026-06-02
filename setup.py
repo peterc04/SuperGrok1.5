@@ -390,8 +390,19 @@ if _has_gpu and _is_hip:
         "csrc/backends/hip/gfx942/*.hip.cpp",
         "csrc/backends/hip/gfx942/models/*.hip.cpp",
         # `.hip` files go through hipcc (PyTorch routes the extension to its
-        # HIP/CUDA pipeline). Use this extension for hand-written
-        # `__global__` kernels with `hipLaunchKernelGGL` launch syntax.
+        # HIP/CUDA pipeline, running a DEVICE pass). Use this extension for
+        # hand-written `__global__` kernels with `hipLaunchKernelGGL` syntax.
+        #
+        # Stage 7 (hipcc device routing): the per-optimizer / per-model kernel
+        # headers (grokking_optimizers/kernels/gfx942/*_gfx942.hip.hpp) carry a
+        # DEVICE section gated `#if __AMDGCN__||__HIPCC__`, but their only
+        # includers were `.hip.cpp` HOST TUs — so hipcc's device pass never
+        # compiled the MFMA/DPP/FP8 kernels. The thin `device_*.hip` TUs here
+        # (one per optimizer/model) `#define SG_GFX942_DEVICE_TU` then #include
+        # the canonical header, forcing the device pass to emit the kernels
+        # (the header force-instantiates them) while the host orchestration
+        # stays owned by the `.hip.cpp` launchers (the guard suppresses a
+        # duplicate-symbol re-emit). This glob already matches them.
         "csrc/backends/hip/gfx942/*.hip",
         # Stage 6: generated L3 persistent megakernels (gfx942). The demo lives
         # as a gate-verified .hip.hpp header; the generator emits per-cell .hip

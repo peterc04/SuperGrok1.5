@@ -63,7 +63,10 @@
 // content. On a real hipcc build the host pass compiles this and launches the
 // §5 kernel via hipLaunchKernelGGL (see §5.LAUNCH).
 // ════════════════════════════════════════════════════════════════════════════
-#if !defined(__AMDGCN__)
+// SG_GFX942_DEVICE_TU (Stage 7): set by the thin `.hip` device TU so this host
+// launcher is NOT re-emitted in that TU's host pass (it stays owned by the
+// `.hip.cpp` host TU) — avoids duplicate launch_prodigy_* symbols at link.
+#if !defined(__AMDGCN__) && !defined(SG_GFX942_DEVICE_TU)
 #include <torch/extension.h>
 #include <vector>
 #include <algorithm>
@@ -81,7 +84,7 @@ namespace sg { namespace gfx942 { namespace native {
 extern "C" __global__ void prodigy_gfx942_rs_reduce(
     const float* __restrict__ g, const float* __restrict__ p,
     const float* __restrict__ p_init, float* __restrict__ r_acc,
-    float* __restrict__ s_acc, float d_prev, int n);
+    float* __restrict__ s_acc, float d_prev, int64_t n);
 }}}
 #endif
 
@@ -118,13 +121,16 @@ void launch_prodigy_step(
         auto gf = grads[i].to(torch::kFloat32).contiguous();
         auto pf = params[i].to(torch::kFloat32).contiguous();
         auto pif = param_inits[i].to(torch::kFloat32).contiguous();
-        const int n = static_cast<int>(gf.numel());
-        dim3 block(256), grid(std::min(1024, (n + 255) / 256));
+        // 64-bit safe element count + grid sizing (Stage 1).
+        const int64_t n = static_cast<int64_t>(gf.numel());
+        dim3 block(256), grid(static_cast<unsigned>(
+            std::min<int64_t>(1024, (n + 255) / 256)));
         hipLaunchKernelGGL(native::prodigy_gfx942_rs_reduce, grid, block, 0, stream,
                            gf.data_ptr<float>(), pf.data_ptr<float>(),
                            pif.data_ptr<float>(),
                            rs_acc.data_ptr<float>(), rs_acc.data_ptr<float>() + 1,
                            d_prev, n);
+        SG_HIP_LAUNCH_CHECK(stream);  // mirror sm_90 SG_LAUNCH_CHECK
     }
     r_sum += rs_acc[0];
     s_sum += rs_acc[1];
@@ -212,13 +218,16 @@ void launch_multi_tensor_prodigy_fused_reduce_step(
         auto gf = grads[i].to(torch::kFloat32).contiguous();
         auto pf = params[i].to(torch::kFloat32).contiguous();
         auto pif = param_inits[i].to(torch::kFloat32).contiguous();
-        const int n = static_cast<int>(gf.numel());
-        dim3 block(256), grid(std::min(1024, (n + 255) / 256));
+        // 64-bit safe element count + grid sizing (Stage 1).
+        const int64_t n = static_cast<int64_t>(gf.numel());
+        dim3 block(256), grid(static_cast<unsigned>(
+            std::min<int64_t>(1024, (n + 255) / 256)));
         hipLaunchKernelGGL(native::prodigy_gfx942_rs_reduce, grid, block, 0, stream,
                            gf.data_ptr<float>(), pf.data_ptr<float>(),
                            pif.data_ptr<float>(),
                            rs_acc.data_ptr<float>(), rs_acc.data_ptr<float>() + 1,
                            d_prev, n);
+        SG_HIP_LAUNCH_CHECK(stream);  // mirror sm_90 SG_LAUNCH_CHECK
     }
     r_sum += rs_acc[0];
     s_sum += rs_acc[1];
@@ -328,6 +337,20 @@ static GrokGridDim   gridDim;
 namespace sg { namespace gfx942 { namespace native {
 
 namespace amd = ::sg::gfx942::amdgcn;
+
+// Stage-1 NaN/Inf gradient sanitization (mirror of sm_90 sg_sanitize_grad).
+// Identity unless built with -DSG_SANITIZE_NONFINITE=1; default byte-identical.
+// Applied on the APPLY path's grad read only (the r/s reduction is unchanged).
+#ifndef SG_SANITIZE_NONFINITE
+#define SG_SANITIZE_NONFINITE 0
+#endif
+__device__ __forceinline__ float sg_sanitize_grad(float g) {
+#if SG_SANITIZE_NONFINITE
+    return __builtin_isfinite(g) ? g : 0.0f;
+#else
+    return g;
+#endif
+}
 static constexpr int kWave = 64;   // == amd::kWave (CDNA3 wavefront width)
 
 __device__ __forceinline__ float dabsf(float x) { return __builtin_fabsf(x); }
@@ -339,14 +362,16 @@ __device__ __forceinline__ float dabsf(float x) { return __builtin_fabsf(x); }
 __device__ __forceinline__ void prodigy_rs_block(
     const float* __restrict__ g, const float* __restrict__ p,
     const float* __restrict__ p_init, float* __restrict__ r_acc,
-    float* __restrict__ s_acc, float d_prev, int n)
+    float* __restrict__ s_acc, float d_prev, int64_t n)
 {
+    // LDS/lane bookkeeping is LOCAL to the block (<= 4096 threads) → int. The
+    // GLOBAL element index/stride is int64 so the reduction cannot wrap (Stage 1).
     const int tid    = static_cast<int>(threadIdx.x);
     const int lane   = tid % kWave;
     const int waveId = tid / kWave;
     const int wpb    = static_cast<int>(blockDim.x) / kWave;
-    const int gtid   = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
-    const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    const int64_t gtid   = static_cast<int64_t>(blockIdx.x) * blockDim.x + tid;
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
     const float d2   = d_prev * d_prev;
 
     // VECTORIZED reduction body (WS5/item 6): widen the 3-buffer read to 128-bit
@@ -358,13 +383,13 @@ __device__ __forceinline__ void prodigy_rs_block(
     // the current param (read here, written by the apply → recurring) and p_init
     // is re-read every step → both CACHED (keep L2-resident).
     using f32x4 = amd::f32x4;
-    const int n4v   = n & ~3;            // largest multiple of 4 <= n
+    const int64_t n4v = n & ~static_cast<int64_t>(3);   // largest mult of 4 <= n
     const auto* g4  = reinterpret_cast<const f32x4*>(g);
     const auto* p4  = reinterpret_cast<const f32x4*>(p);
     const auto* pi4 = reinterpret_cast<const f32x4*>(p_init);
 
     float r_local = 0.f, s_local = 0.f;
-    for (int q = gtid; q < (n4v >> 2); q += stride) {
+    for (int64_t q = gtid; q < (n4v >> 2); q += stride) {
         const f32x4 gv  = amd::streaming_load(&g4[q]);   // read-once grad
         const f32x4 pv  = amd::cached_load(&p4[q]);      // recurring param (cached)
         const f32x4 piv = amd::cached_load(&pi4[q]);     // p_init re-read (cached)
@@ -376,7 +401,7 @@ __device__ __forceinline__ void prodigy_rs_block(
         }
     }
     // SCALAR TAIL: the final n%4 elements, identical per-element partials.
-    for (int i = n4v + gtid; i < n; i += stride) {
+    for (int64_t i = n4v + gtid; i < n; i += stride) {
         float gi = amd::streaming_load(&g[i]);
         float delta = amd::cached_load(&p_init[i]) - amd::cached_load(&p[i]);
         r_local += gi * delta * d_prev;
@@ -409,7 +434,7 @@ __device__ __forceinline__ void prodigy_rs_block(
 extern "C" SG_KERNEL_BOUNDS(256, 8) void prodigy_gfx942_rs_reduce(
     const float* __restrict__ g, const float* __restrict__ p,
     const float* __restrict__ p_init, float* __restrict__ r_acc,
-    float* __restrict__ s_acc, float d_prev, int n)
+    float* __restrict__ s_acc, float d_prev, int64_t n)
 {
     prodigy_rs_block(g, p, p_init, r_acc, s_acc, d_prev, n);
 }
@@ -446,10 +471,10 @@ template <typename ParamT, typename GradT>
 __device__ __forceinline__ void prodigy_apply_elem(
     ParamT* __restrict__ param, float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq, float* __restrict__ s_track,
-    const GradT* __restrict__ grad, int i, float d_val,
+    const GradT* __restrict__ grad, int64_t i, float d_val,
     float beta1, float beta2, float eps, float wd, float bc1, float bc2)
 {
-    const float g   = static_cast<float>(amd::streaming_load(&grad[i]));
+    const float g   = sg_sanitize_grad(static_cast<float>(amd::streaming_load(&grad[i])));
     const float p   = static_cast<float>(param[i]);
     const float g_s = d_val * g;
     const float m   = beta1 * exp_avg[i]    + (1.0f - beta1) * g_s;
@@ -468,15 +493,16 @@ SG_KERNEL_BOUNDS(256, 8) void prodigy_gfx942_apply_kernel(
     float* __restrict__ exp_avg_sq, float* __restrict__ s_track,
     const GradT* __restrict__ grad, float d_val,
     float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int N)
+    float bc1, float bc2, int64_t N)
 {
-    const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
-    const int tid    = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
-                       + static_cast<int>(threadIdx.x);
+    // 64-bit grid-stride indexing (Stage 1): cast BEFORE the multiply.
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    const int64_t tid    = static_cast<int64_t>(blockIdx.x) * blockDim.x
+                       + threadIdx.x;
 
     constexpr bool kVecOk =
         sizeof(ParamT) == sizeof(float) && sizeof(GradT) == sizeof(float);
-    const int n4 = kVecOk ? (N >> 2) : 0;   // number of full float4 groups
+    const int64_t n4 = kVecOk ? (N >> 2) : 0;   // number of full float4 groups
 
     using f32x4 = amd::f32x4;
     auto* p4 = reinterpret_cast<f32x4*>(param);
@@ -485,7 +511,7 @@ SG_KERNEL_BOUNDS(256, 8) void prodigy_gfx942_apply_kernel(
     auto* s4 = reinterpret_cast<f32x4*>(s_track);
     const auto* g4 = reinterpret_cast<const f32x4*>(grad);
 
-    for (int q = tid; q < n4; q += stride) {
+    for (int64_t q = tid; q < n4; q += stride) {
         const f32x4 g  = amd::streaming_load(&g4[q]);   // 128-bit dwordx4 load
         const f32x4 p  = p4[q];
         const f32x4 ea = m4[q];
@@ -493,12 +519,13 @@ SG_KERNEL_BOUNDS(256, 8) void prodigy_gfx942_apply_kernel(
         const f32x4 st = s4[q];
         f32x4 mo, vo, so, po;
         for (int l = 0; l < 4; ++l) {
-            const float g_s = d_val * g[l];
+            const float gl = sg_sanitize_grad(g[l]);  // identity unless sanitize on
+            const float g_s = d_val * gl;
             const float m = beta1 * ea[l] + (1.0f - beta1) * g_s;
             const float v = beta2 * ev[l] + (1.0f - beta2) * g_s * g_s;
             mo[l] = m;
             vo[l] = v;
-            so[l] = st[l] + d_val * g[l];
+            so[l] = st[l] + d_val * gl;
             const float update = (m / bc1) / (__builtin_sqrtf(v / bc2) + eps);
             po[l] = p[l] - d_val * (update + wd * p[l]);
         }
@@ -509,7 +536,7 @@ SG_KERNEL_BOUNDS(256, 8) void prodigy_gfx942_apply_kernel(
     }
 
     // SCALAR TAIL: the final N%4 elements (and the whole array on fp32 fallback).
-    for (int i = (n4 << 2) + tid; i < N; i += stride) {
+    for (int64_t i = (n4 << 2) + tid; i < N; i += stride) {
         prodigy_apply_elem(param, exp_avg, exp_avg_sq, s_track, grad, i, d_val,
                            beta1, beta2, eps, wd, bc1, bc2);
     }
@@ -518,7 +545,7 @@ SG_KERNEL_BOUNDS(256, 8) void prodigy_gfx942_apply_kernel(
 // Force-instantiate the grokking dtype combo (fp32 param + fp32 grad).
 template __global__ void prodigy_gfx942_apply_kernel<float, float>(
     float*, float*, float*, float*, const float*, float,
-    float, float, float, float, float, float, int);
+    float, float, float, float, float, float, int64_t);
 
 }}} // namespace sg::gfx942::native
 #endif  // (B) device pass

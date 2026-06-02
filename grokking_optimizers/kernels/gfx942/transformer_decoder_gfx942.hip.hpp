@@ -44,7 +44,11 @@
 // exists); the §5 device kernels below are the device-pass content. On a real
 // hipcc build the host pass compiles this and launches the §5 kernels.
 // ════════════════════════════════════════════════════════════════════════════
-#if !defined(__AMDGCN__)
+// SG_GFX942_DEVICE_TU (Stage 7): set by the thin `.hip` device TU so the host
+// orchestration is NOT re-compiled in that TU's host pass — the model wrappers
+// stay owned by models/decoder.hip.cpp. The device TU only needs section (B)'s
+// force-instantiated __global__ kernels.
+#if !defined(__AMDGCN__) && !defined(SG_GFX942_DEVICE_TU)
 #include "csrc/common/platform.h"
 #include "csrc/common/types.h"
 // Bring in the full sm_90 decoder template implementation. On HIP the

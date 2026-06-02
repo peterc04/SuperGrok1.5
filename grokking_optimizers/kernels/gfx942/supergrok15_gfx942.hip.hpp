@@ -53,7 +53,10 @@
 // content. On a real hipcc build the host pass compiles this and launches the
 // §5 kernel via hipLaunchKernelGGL (see §5.LAUNCH).
 // ════════════════════════════════════════════════════════════════════════════
-#if !defined(__AMDGCN__)
+// SG_GFX942_DEVICE_TU (Stage 7): set by the thin `.hip` device TU so this host
+// launcher is NOT re-emitted in that TU's host pass (it stays owned by the
+// `.hip.cpp` host TU) — avoids duplicate launch_supergrok15_* symbols at link.
+#if !defined(__AMDGCN__) && !defined(SG_GFX942_DEVICE_TU)
 #include <torch/extension.h>
 #include <vector>
 #include <cmath>
@@ -78,7 +81,7 @@ namespace prim = ::sg::gfx942::primitives;
 // the host launcher can hipLaunchKernelGGL it; signature matches exactly.
 namespace native {
 extern "C" __global__ void supergrok15_gfx942_sharpness_reduce(
-    const float* __restrict__ sharpness, float* __restrict__ acc, int n);
+    const float* __restrict__ sharpness, float* __restrict__ acc, int64_t n);
 // Per-element smart_grad + Adam apply (§5.APPLY; defined in section B below).
 // smart = g + gate_global*clamp(alpha_base*(1+mu),0,alpha_max)*mu, then the m/v
 // EMA + bias-corrected decoupled-WD apply. Vectorized to 128-bit (f32x4) memory
@@ -89,7 +92,7 @@ __global__ void supergrok15_gfx942_apply(
     float* __restrict__ exp_avg_sq, const float* __restrict__ mu,
     const GradT* __restrict__ grad, float gate, float alpha_base, float alpha_max,
     float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int N);
+    float bc1, float bc2, int64_t N);
 }  // namespace native
 #endif
 
@@ -133,14 +136,16 @@ void launch_supergrok15_step(
         // and folds it into the externally-supplied gate_global.
         {
             auto sh = sharpnesses[i].to(torch::kFloat32).contiguous();
-            int n = static_cast<int>(sh.numel());
+            const int64_t n = static_cast<int64_t>(sh.numel());  // Stage 1: 64-bit
             if (n > 0) {
                 auto acc = torch::zeros({1}, sh.options());
                 hipStream_t stream = at::hip::getCurrentHIPStream();
-                dim3 grid(std::min(1024, (n + 255) / 256)), block(256);  // 4 waves/block
+                dim3 grid(static_cast<unsigned>(
+                    std::min<int64_t>(1024, (n + 255) / 256))), block(256);
                 hipLaunchKernelGGL(native::supergrok15_gfx942_sharpness_reduce,
                                    grid, block, 0, stream,
                                    sh.data_ptr<float>(), acc.data_ptr<float>(), n);
+                SG_HIP_LAUNCH_CHECK(stream);  // mirror sm_90 SG_LAUNCH_CHECK
                 float sharp_mean = acc.item<float>() / static_cast<float>(n);
                 gate = gate_global * (1.0f / (1.0f + sharp_mean));
             }
@@ -158,16 +163,18 @@ void launch_supergrok15_step(
         {
             auto gfc = g.to(torch::kFloat32).contiguous();
             auto muc = mu.to(torch::kFloat32).contiguous();
-            int n = static_cast<int>(gfc.numel());
+            const int64_t n = static_cast<int64_t>(gfc.numel());  // Stage 1: 64-bit
             if (n > 0) {
                 hipStream_t stream = at::hip::getCurrentHIPStream();
-                dim3 grid(std::min(1024, (n + 255) / 256)), block(256);  // 4 waves/block
+                dim3 grid(static_cast<unsigned>(
+                    std::min<int64_t>(1024, (n + 255) / 256))), block(256);
                 hipLaunchKernelGGL((native::supergrok15_gfx942_apply<float, float>),
                                    grid, block, 0, stream,
                                    p.data_ptr<float>(), m.data_ptr<float>(),
                                    v.data_ptr<float>(), muc.data_ptr<float>(),
                                    gfc.data_ptr<float>(), gate, alpha_base, alpha_max,
                                    lr, beta1, beta2, eps, wd, bc1, bc2, n);
+                SG_HIP_LAUNCH_CHECK(stream);  // mirror sm_90 SG_LAUNCH_CHECK
             }
         }
 #else
@@ -302,21 +309,37 @@ namespace sg { namespace gfx942 { namespace native {
 namespace amd = ::sg::gfx942::amdgcn;
 static constexpr int kWave = 64;   // == amd::kWave (CDNA3 wavefront width)
 
+// Stage-1 NaN/Inf gradient sanitization (mirror of sm_90 sg_sanitize_grad).
+// Identity unless built with -DSG_SANITIZE_NONFINITE=1; applied on the APPLY
+// path's grad read only (the sharpness reduce is unchanged). Default byte-identical.
+#ifndef SG_SANITIZE_NONFINITE
+#define SG_SANITIZE_NONFINITE 0
+#endif
+__device__ __forceinline__ float sg_sanitize_grad(float g) {
+#if SG_SANITIZE_NONFINITE
+    return __builtin_isfinite(g) ? g : 0.0f;
+#else
+    return g;
+#endif
+}
+
 // Block (workgroup) sum of `sharpness[0..n)`, atomically added to *acc.
 // blockDim.x must be a multiple of kWave and <= kWave*kWave (<= 4096); LDS holds
 // one float per wavefront (<= 64 floats).
 __device__ __forceinline__ void supergrok15_sharpness_block(
-    const float* __restrict__ sharpness, float* __restrict__ acc, int n)
+    const float* __restrict__ sharpness, float* __restrict__ acc, int64_t n)
 {
+    // LDS/lane bookkeeping is LOCAL to the block (<= 4096 threads) → int. The
+    // GLOBAL element index/stride is int64 so the reduction cannot wrap (Stage 1).
     const int tid    = static_cast<int>(threadIdx.x);
     const int lane   = tid % kWave;
     const int waveId = tid / kWave;
     const int wpb    = static_cast<int>(blockDim.x) / kWave;
-    const int gtid   = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
-    const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    const int64_t gtid   = static_cast<int64_t>(blockIdx.x) * blockDim.x + tid;
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
 
     float local = 0.f;
-    for (int i = gtid; i < n; i += stride) {
+    for (int64_t i = gtid; i < n; i += stride) {
         local += amd::streaming_load(&sharpness[i]);
     }
     // wavefront DPP reduce: every lane holds the wavefront sum.
@@ -337,7 +360,7 @@ __device__ __forceinline__ void supergrok15_sharpness_block(
 // Bandwidth-bound reduction → request high occupancy (256-thread block = 4
 // wavefronts; 8 waves/EU) to hide global-memory latency. (WS5 occupancy wire.)
 extern "C" SG_KERNEL_BOUNDS(256, 8) void supergrok15_gfx942_sharpness_reduce(
-    const float* __restrict__ sharpness, float* __restrict__ acc, int n)
+    const float* __restrict__ sharpness, float* __restrict__ acc, int64_t n)
 {
     supergrok15_sharpness_block(sharpness, acc, n);
 }
@@ -390,19 +413,20 @@ SG_KERNEL_BOUNDS(256, 8) void supergrok15_gfx942_apply(
     float* __restrict__ exp_avg_sq, const float* __restrict__ mu,
     const GradT* __restrict__ grad, float gate, float alpha_base, float alpha_max,
     float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int N)
+    float bc1, float bc2, int64_t N)
 {
-    const int gtid   = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
-                       + static_cast<int>(threadIdx.x);
-    const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
-    const int n4     = N & ~3;   // largest multiple of 4 <= N
+    // 64-bit grid-stride indexing (Stage 1): cast BEFORE the multiply.
+    const int64_t gtid   = static_cast<int64_t>(blockIdx.x) * blockDim.x
+                       + threadIdx.x;
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    const int64_t n4     = N & ~static_cast<int64_t>(3);   // largest mult of 4 <= N
 
     // Vectorized body: 4 contiguous floats / iter via f32x4 (128-bit access).
     // NONTEMPORAL POLICY (matches adamw_gfx942): grad + mu are read-once this
     // step → streaming (nontemporal, L2-bypass); exp_avg / exp_avg_sq are
     // recurring STATE (read+written every step, reused next step) → CACHED;
     // param is read once then written once → cached load + streaming store.
-    for (int base = gtid * 4; base < n4; base += stride * 4) {
+    for (int64_t base = gtid * 4; base < n4; base += stride * 4) {
         f32x4 pv4 = amd::cached_load(reinterpret_cast<const f32x4*>(param + base));
         f32x4 mv4 = amd::cached_load(reinterpret_cast<const f32x4*>(exp_avg + base));
         f32x4 vv4 = amd::cached_load(reinterpret_cast<const f32x4*>(exp_avg_sq + base));
@@ -412,7 +436,8 @@ SG_KERNEL_BOUNDS(256, 8) void supergrok15_gfx942_apply(
         #pragma unroll
         for (int j = 0; j < 4; ++j) {
             float pj = pv4[j], mj = mv4[j], vj = vv4[j];
-            ov4[j] = sg15_apply_elem(&pj, &mj, &vj, uv4[j], gv4[j], gate,
+            ov4[j] = sg15_apply_elem(&pj, &mj, &vj, uv4[j],
+                                     sg_sanitize_grad(gv4[j]), gate,
                                      alpha_base, alpha_max,
                                      lr, beta1, beta2, eps, wd, bc1, bc2);
             mv4[j] = mj;
@@ -424,9 +449,10 @@ SG_KERNEL_BOUNDS(256, 8) void supergrok15_gfx942_apply(
     }
 
     // Scalar tail: the n%4 remainder, identical per-element function.
-    for (int i = n4 + gtid; i < N; i += stride) {
+    for (int64_t i = n4 + gtid; i < N; i += stride) {
         float pi = param[i], mi = exp_avg[i], vi = exp_avg_sq[i];
-        float out = sg15_apply_elem(&pi, &mi, &vi, mu[i], grad[i], gate,
+        float out = sg15_apply_elem(&pi, &mi, &vi, mu[i],
+                                    sg_sanitize_grad(grad[i]), gate,
                                     alpha_base, alpha_max,
                                     lr, beta1, beta2, eps, wd, bc1, bc2);
         exp_avg[i]    = mi;
@@ -438,7 +464,7 @@ SG_KERNEL_BOUNDS(256, 8) void supergrok15_gfx942_apply(
 // Force-instantiate the <float,float> apply the host launcher dispatches.
 template __global__ void supergrok15_gfx942_apply<float, float>(
     float*, float*, float*, const float*, const float*, float, float, float,
-    float, float, float, float, float, float, float, int);
+    float, float, float, float, float, float, float, int64_t);
 
 }}} // namespace sg::gfx942::native
 #endif  // (B) device pass

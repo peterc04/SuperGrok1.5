@@ -55,7 +55,11 @@
 // device-pass content. On a real hipcc build the host pass compiles this and
 // launches the §5 kernels (see §5.LAUNCH).
 // ════════════════════════════════════════════════════════════════════════════
-#if !defined(__AMDGCN__)
+// SG_GFX942_DEVICE_TU (Stage 7): set by the thin `.hip` device TU so the host
+// orchestration (and its heavy sm_90 model includes) is NOT re-compiled in that
+// TU's host pass — the model wrappers stay owned by models/mamba.hip.cpp. The
+// device TU only needs section (B)'s force-instantiated __global__ kernels.
+#if !defined(__AMDGCN__) && !defined(SG_GFX942_DEVICE_TU)
 #include "csrc/common/platform.h"
 #include "csrc/common/types.h"
 // Bring in the full sm_90 Mamba template implementation. On HIP the
