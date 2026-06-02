@@ -246,11 +246,14 @@ class _LazyOps:
     no-fallback contract (kernels are unreachable without a build) while
     allowing import-time introspection.
     """
-    __slots__ = ("_real", "_error")
+    __slots__ = ("_real", "_error", "_attr_cache")
 
     def __init__(self):
         object.__setattr__(self, "_real", None)
         object.__setattr__(self, "_error", None)
+        # Memoize resolved kernel attributes so repeated `_ops.fn` access on
+        # the hot path skips the module getattr after the first lookup.
+        object.__setattr__(self, "_attr_cache", {})
 
     def _resolve(self):
         if self._real is not None:
@@ -269,6 +272,10 @@ class _LazyOps:
     def __getattr__(self, name):
         if name.startswith("_"):
             raise AttributeError(name)
+        cache = self._attr_cache
+        cached = cache.get(name)
+        if cached is not None:
+            return cached
         real = self._resolve()
         if real is None:
             raise AttributeError(
@@ -276,7 +283,18 @@ class _LazyOps:
                 f"Run `pip install -e .` (supported arches: {SUPPORTED_ARCHES}). "
                 f"Original ImportError: {self._error}"
             )
-        return getattr(real, name)
+        attr = getattr(real, name)
+        cache[name] = attr
+        return attr
+
+    def bind(self, name):
+        """Resolve ``name`` once and return the underlying kernel callable.
+
+        Callers (optimizers) cache the returned bound function on the instance
+        so subsequent steps skip the proxy ``__getattr__`` entirely. Raises the
+        same descriptive error as attribute access if the extension is unbuilt.
+        """
+        return self.__getattr__(name)
 
     def __bool__(self):
         return self._resolve() is not None
@@ -297,10 +315,24 @@ def get_ops():
 
 
 # ----------------------------------------------------------------------
-# Fused (model, optimizer, arch) kernel registry (from fused_dispatch.py).
+# Fused (model, optimizer, arch) kernel registry.
+#
+# This registry is intentionally EMPTY: the live fused execution path is the
+# megakernel engine (``grokking_optimizers.megakernel_engine``) keyed on the
+# canonical names in ``megakernel.MODELS`` / ``megakernel.OPTIMIZERS``. Nothing
+# in the package populates ``_FUSED_REGISTRY``.
+#
+# The registry + ``register_fused`` / ``has_fused`` / ``dispatch_fused`` are
+# retained only because ``grokking_race_v2.py`` imports ``has_fused`` /
+# ``dispatch_fused`` as an optional fast-path probe: ``has_fused(...)`` returns
+# False (empty registry) so the race always falls back to the eager path. They
+# are kept as a stable no-op shim rather than deleted to avoid breaking that
+# importer. ``MODELS`` / ``OPTIMIZERS`` here are validation lists of the
+# canonical model/optimizer identifiers; ``MODELS`` mirrors the canonical
+# ``megakernel.MODELS`` triple.
 # ----------------------------------------------------------------------
 
-MODELS = ("transformer", "vit", "mamba")
+MODELS = ("transformer_decoder", "vit", "mamba3")
 OPTIMIZERS = ("grokadamw", "grokfast", "lion", "looksam", "moe_adam", "muon",
               "neuralgrok", "prodigy", "supergrok2", "supergrok15", "supergrok11")
 
@@ -308,6 +340,9 @@ _FUSED_REGISTRY = {}
 
 
 def register_fused(model, optimizer, arch):
+    """Register a fused (model, optimizer, arch) kernel. Currently unused — the
+    live path is the megakernel engine; kept as a stable shim (see module note).
+    """
     def decorator(fn):
         _FUSED_REGISTRY[(model, optimizer, arch)] = fn
         return fn
@@ -315,12 +350,21 @@ def register_fused(model, optimizer, arch):
 
 
 def has_fused(model, optimizer, arch=None):
+    """Whether a fused kernel is registered for (model, optimizer, arch).
+
+    Always False with the (empty) built-in registry — callers fall back to the
+    eager path. See the module note above.
+    """
     if arch is None:
         arch = detect_arch()
     return (model, optimizer, arch) in _FUSED_REGISTRY
 
 
 def dispatch_fused(model, optimizer, params, inputs, grads, state, lr, arch=None):
+    """Dispatch to a registered fused kernel, or raise KeyError if none.
+
+    Unused by the package's live path (kept as a shim for grokking_race_v2.py).
+    """
     if arch is None:
         arch = detect_arch()
     key = (model, optimizer, arch)

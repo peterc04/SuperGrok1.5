@@ -73,6 +73,14 @@ class ParallelConfig:
         When True, the per-GPU local compute is the Stage-6 fused megakernel and
         the framework is driven through the
         :mod:`grokking_optimizers.megakernel_engine` adapter (§8.4/§8.5).
+    reduce_bucket_size:
+        Target size, in **elements**, of the flat gradient buckets the native
+        DDP all-reduce coalesces small per-param gradients into (§8.4). Larger
+        buckets amortize per-collective launch latency at the cost of delaying
+        the first reduce; ~25M elements (≈50 MB bf16 / 100 MB fp32) is a sane
+        default for the race's small models. Honored by
+        :meth:`DistributedContext.all_reduce_dp_grads` and the async-overlap
+        grad hooks.
     """
 
     data_parallel: int = 1
@@ -81,6 +89,7 @@ class ParallelConfig:
     zero_stage: int = 0
     backend: str = "nccl"
     use_megakernel: bool = True
+    reduce_bucket_size: int = 25_000_000
 
     def __post_init__(self) -> None:
         for name in ("data_parallel", "tensor_parallel", "pipeline_parallel"):
@@ -89,6 +98,10 @@ class ParallelConfig:
                 raise ValueError(f"{name} must be a positive int, got {v!r}")
         if self.zero_stage not in (0, 1, 2, 3):
             raise ValueError(f"zero_stage must be 0/1/2/3, got {self.zero_stage}")
+        if not isinstance(self.reduce_bucket_size, int) or self.reduce_bucket_size < 1:
+            raise ValueError(
+                f"reduce_bucket_size must be a positive int, "
+                f"got {self.reduce_bucket_size!r}")
 
     @property
     def model_parallel_size(self) -> int:
@@ -146,6 +159,27 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, default))
     except (TypeError, ValueError):
         return default
+
+
+def _bucketize(tensors, bucket_elems: int):
+    """Group ``tensors`` into contiguous buckets of ~``bucket_elems`` elements.
+
+    A single tensor larger than the target still forms its own (oversized)
+    bucket so nothing is dropped. Order is preserved so the flat-buffer
+    scatter-back in :meth:`DistributedContext.all_reduce_dp_grads` stays
+    aligned. Pure-Python list math (no collectives) — unit-testable offline.
+    """
+    bucket: list = []
+    cur = 0
+    for t in tensors:
+        n = t.numel()
+        if bucket and cur + n > bucket_elems:
+            yield bucket
+            bucket, cur = [], 0
+        bucket.append(t)
+        cur += n
+    if bucket:
+        yield bucket
 
 
 # ───────────────────────────── DistributedContext ────────────────────────────
@@ -238,6 +272,9 @@ class DistributedContext:
         self._dp_group = None
         self._tp_group = None
         self._pp_group = None
+        # Async DDP grad-hook bookkeeping (populated by register_dp_grad_hooks).
+        self._dp_grad_hook_handles: list = []
+        self._pending_dp_works: list = []
 
     # ── construction / teardown ──────────────────────────────────────────────
 
@@ -442,15 +479,106 @@ class DistributedContext:
         Used for ZeRO-0/1/2, where gradients are replicated then averaged. Under
         ZeRO-3 the gradient is reduce-scattered instead (see
         :class:`ZeRO3Sharder`). No-op single-process.
+
+        Gradients are coalesced into flat buckets of ~``reduce_bucket_size``
+        elements so a model with many small parameters issues a handful of large
+        all-reduces instead of one per parameter — the per-collective launch
+        latency is the dominant cost on the race's small models. Numerically
+        identical to the prior per-param all-reduce (sum then divide by the DP
+        world size); only the collective granularity changes.
         """
         if self.dp_world_size <= 1 or not is_dist_available_and_initialized():
             return
         dist = _dist()
         ws = self.dp_world_size
+        grads = [p.grad for p in params if getattr(p, "grad", None) is not None]
+        bucket_size = self.config.reduce_bucket_size
+        for bucket in _bucketize(grads, bucket_size):
+            if len(bucket) == 1:
+                g = bucket[0]
+                dist.all_reduce(g, group=self._dp_group)
+                g.div_(ws)
+                continue
+            flat = torch.cat([g.reshape(-1) for g in bucket])
+            dist.all_reduce(flat, group=self._dp_group)
+            flat.div_(ws)
+            # Scatter the reduced flat buffer back into each grad in place.
+            offset = 0
+            for g in bucket:
+                n = g.numel()
+                g.copy_(flat[offset:offset + n].view_as(g))
+                offset += n
+
+    # ── async comm/compute overlap (DDP grad hooks) ──────────────────────────
+
+    def register_dp_grad_hooks(
+        self, params: Iterable["torch.Tensor"]
+    ) -> int:
+        """Register backward hooks that issue **async** DP all-reduces.
+
+        Each parameter's ``register_post_accumulate_grad_hook`` fires the moment
+        that grad finishes accumulating in backward, so the reduce overlaps with
+        the remaining backward compute (comm/compute overlap, §8.4). The handles
+        are returned via the count and tracked on the context;
+        :meth:`wait_dp_grads` must be called before the optimizer step to drain
+        the in-flight collectives and apply the ``1/world`` averaging.
+
+        No-op (returns 0) single-process or when the grad-hook API is missing.
+        Returns the number of hooks registered.
+        """
+        if self.dp_world_size <= 1 or not is_dist_available_and_initialized():
+            return 0
+        self._pending_dp_works = getattr(self, "_pending_dp_works", [])
+        self._dp_grad_hook_handles = getattr(self, "_dp_grad_hook_handles", [])
+        ws = self.dp_world_size
+        group = self._dp_group
+        dist = _dist()
+        count = 0
         for p in params:
-            if getattr(p, "grad", None) is not None:
-                dist.all_reduce(p.grad, group=self._dp_group)
-                p.grad.div_(ws)
+            if not getattr(p, "requires_grad", False):
+                continue
+            if not hasattr(p, "register_post_accumulate_grad_hook"):
+                # PyTorch < 2.1 — caller should use all_reduce_dp_grads instead.
+                return count
+
+            def _hook(param, _ws=ws, _grp=group, _d=dist):
+                if param.grad is None:
+                    return
+                work = _d.all_reduce(
+                    param.grad, group=_grp, async_op=True)
+                # Defer the /ws division until wait() so it lands after the
+                # async reduce completes.
+                self._pending_dp_works.append((work, param.grad, _ws))
+
+            self._dp_grad_hook_handles.append(
+                p.register_post_accumulate_grad_hook(_hook))
+            count += 1
+        return count
+
+    def wait_dp_grads(self) -> None:
+        """Wait on all in-flight async DP all-reduces and finish the averaging.
+
+        Call once after ``loss.backward()`` and before ``optimizer.step()``.
+        Safe to call when no hooks were registered (no-op).
+        """
+        pending = getattr(self, "_pending_dp_works", None)
+        if not pending:
+            return
+        for work, grad, ws in pending:
+            if work is not None:
+                work.wait()
+            grad.div_(ws)
+        pending.clear()
+
+    def remove_dp_grad_hooks(self) -> None:
+        """Remove any registered DP grad hooks (best-effort)."""
+        for h in getattr(self, "_dp_grad_hook_handles", []):
+            try:
+                h.remove()
+            except Exception:
+                pass
+        self._dp_grad_hook_handles = []
+        self._pending_dp_works = []
 
 
 # Process-wide default context. It is single-process until something calls
@@ -548,6 +676,23 @@ class ZeRO3Sharder:
 
     Both backends are import-safe and degrade to a no-op single-process shim
     (every collective short-circuits when DP size is 1 / no job launched).
+
+    DOCUMENTED PARTIAL STOP (cross-param flat-bucket ZeRO-3): the native shim
+    now uses the fused per-parameter ``reduce_scatter_tensor`` /
+    ``all_gather_into_tensor`` primitives (half the traffic of the old
+    all-reduce-then-slice, and one collective call instead of a Python list
+    gather). It still issues **one collective per parameter**. A further win
+    would coalesce many small params into a single flat ~``reduce_bucket_size``
+    bucket per reduce-scatter/all-gather (as DeepSpeed's ``contiguous_gradients``
+    does). That is NOT implemented here: a correct cross-param bucketed
+    reduce-scatter must reproduce DeepSpeed's exact per-rank ownership of the
+    *concatenated* buffer (padding + alignment so each rank's owned slice maps
+    back to the right param sub-ranges), which is easy to get subtly wrong and
+    cannot be validated without a real multi-GPU job. The risk outweighs the
+    value for the race's small models, so it is deferred to the DeepSpeed path
+    (``build_ds_config`` already sets ``contiguous_gradients=True`` and the
+    bucket sizes). The DDP (ZeRO-0/1/2) path *is* bucketed — see
+    :meth:`DistributedContext.all_reduce_dp_grads`.
     """
 
     def __init__(self, ctx: DistributedContext) -> None:
@@ -642,23 +787,49 @@ class ZeRO3Sharder:
         step consumes. Falls back to a plain copy of the local grad slice when
         DP size is 1 / no job is launched (single-process correctness).
 
-        Implementation note: we use ``all_reduce`` over the DP group then take
-        the owned slice. That is bandwidth-equivalent in result to a true
-        ``reduce_scatter`` for correctness; the production DeepSpeed path uses
-        the native fused reduce-scatter (less traffic). The native shim favors
-        a single robust collective that works across torch versions without the
-        flat-bucket plumbing DeepSpeed already provides.
+        Implementation: a true fused ``reduce_scatter_tensor`` per parameter —
+        each rank sends the whole (per-rank-padded) flat grad and receives only
+        the reduced sum for its owned slice, which is half the traffic of the
+        former ``all_reduce``-then-slice. The padded reduce-scatter convention
+        matches :meth:`all_gather_params` / :meth:`_even_partition` (each rank
+        owns ``ceil(numel/world)`` elements). Falls back to the local slice when
+        DP size is 1 / no job is launched (single-process correctness).
         """
         out: Dict[str, "torch.Tensor"] = {}
         live = self.dp_world > 1 and is_dist_available_and_initialized()
-        dist = _dist() if live else None
         ws = self.dp_world
+        if not live:
+            for name, g in named_grads:
+                out[name] = self.owned_slice(name, g).clone()
+            return out
+
+        dist = _dist()
+        group = self.ctx.dp_group
+        rstensor = getattr(dist, "reduce_scatter_tensor", None)
         for name, g in named_grads:
-            if live:
-                g = g.contiguous()
-                dist.all_reduce(g, group=self.ctx.dp_group)
-                g.div_(ws)
-            out[name] = self.owned_slice(name, g).clone()
+            flat = g.reshape(-1).contiguous()
+            numel = flat.numel()
+            per = (numel + ws - 1) // ws
+            if rstensor is not None:
+                # Pad the input to world*per so the scatter is uniform.
+                padded = flat
+                if per * ws != numel:
+                    padded = flat.new_zeros(per * ws)
+                    padded[:numel] = flat
+                owned = flat.new_empty(per)
+                rstensor(owned, padded, group=group)
+                owned.div_(ws)
+                # Trim padding off this rank's owned slice.
+                shard = self._shards.get(name)
+                keep = (shard.shard_numel if shard is not None
+                        else max(0, min(per, numel - self.dp_rank * per)))
+                out[name] = owned[:keep].clone()
+            else:
+                # Older torch without reduce_scatter_tensor: equivalent result
+                # via all_reduce + owned slice.
+                dist.all_reduce(flat, group=group)
+                flat.div_(ws)
+                out[name] = self.owned_slice(name, flat).clone()
         return out
 
     def all_gather_params(
@@ -667,35 +838,48 @@ class ZeRO3Sharder:
         """ZeRO-3 all-gather-on-step: reconstitute full params from DP slices.
 
         After each DP rank updates its owned slice, every rank needs the full
-        parameter again for the next forward/backward. We all-gather the
-        owned slices and scatter them back into the param buffer in place.
-        No-op single-process. This is the §2.13 cross-node-sensitive collective
-        (the AMD multinode gap the harness records).
+        parameter again for the next forward/backward. We use a fused
+        ``all_gather_into_tensor`` (single contiguous output buffer) instead of
+        the list-based ``all_gather``, then stitch the per-rank slices back into
+        the param in place. No-op single-process. This is the §2.13
+        cross-node-sensitive collective (the AMD multinode gap the harness
+        records).
         """
         if self.dp_world <= 1 or not is_dist_available_and_initialized():
             return
         dist = _dist()
         world = self.dp_world
         group = self.ctx.dp_group
+        agtensor = getattr(dist, "all_gather_into_tensor", None)
         for name, p in named_params:
             shard = self._shards.get(name)
             if shard is None:
                 continue
             flat = p.reshape(-1)
             owned = flat[shard.start:shard.end].contiguous()
-            # Pad to the common per-rank shard length so all_gather is uniform.
+            # Pad to the common per-rank shard length so the gather is uniform.
             per = (shard.numel + world - 1) // world
             buf = owned.new_zeros(per)
             buf[: owned.numel()] = owned
-            gathered = [torch.empty_like(buf) for _ in range(world)]
-            dist.all_gather(gathered, buf, group=group)
-            # Stitch the gathered slices back into the full flat param.
-            for r in range(world):
-                start = min(r * per, shard.numel)
-                end = min(start + per, shard.numel)
-                n = end - start
-                if n > 0:
-                    flat[start:end].copy_(gathered[r][:n])
+            if agtensor is not None:
+                gathered = buf.new_empty(per * world)
+                agtensor(gathered, buf, group=group)
+                # Stitch the contiguous [r*per:(r+1)*per] slices back in place.
+                for r in range(world):
+                    start = min(r * per, shard.numel)
+                    end = min(start + per, shard.numel)
+                    n = end - start
+                    if n > 0:
+                        flat[start:end].copy_(gathered[r * per:r * per + n])
+            else:
+                gathered = [torch.empty_like(buf) for _ in range(world)]
+                dist.all_gather(gathered, buf, group=group)
+                for r in range(world):
+                    start = min(r * per, shard.numel)
+                    end = min(start + per, shard.numel)
+                    n = end - start
+                    if n > 0:
+                        flat[start:end].copy_(gathered[r][:n])
 
 
 __all__ = [

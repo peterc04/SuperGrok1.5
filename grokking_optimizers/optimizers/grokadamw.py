@@ -123,9 +123,57 @@ class GrokAdamW(Optimizer):
         )
         super().__init__(params, defaults)
 
+        # Per-group cache of static tensor lists (params + exp_avg/exp_avg_sq/ema
+        # buffers keep a fixed identity across steps); only grads_list and step
+        # counters are refreshed per step. Invalidated by add_param_group.
+        self._static_cache: dict = {}
+        # Lazily-bound fused kernel callable (resolved once at first step()).
+        self._fused_step = None
+
         self._use_grad_hooks = use_grad_hooks
         if use_grad_hooks:
             _register_grad_hooks(self)
+
+    def add_param_group(self, param_group) -> None:
+        self._static_cache = {}
+        super().add_param_group(param_group)
+
+    def _group_cache(self, group, grads_by_id):
+        """Return cached (params, exp_avg, exp_avg_sq, ema, states).
+
+        Keyed on the grad-bearing param ids. ``grads_by_id`` provides the
+        first-gradient EMA seed on first init."""
+        key = tuple(id(p) for p in group["params"] if p.grad is not None)
+        cached = self._static_cache.get(id(group))
+        if cached is not None and cached[0] == key:
+            return cached[1]
+
+        params_list = []
+        exp_avg_list = []
+        exp_avg_sq_list = []
+        ema_list = []
+        states = []
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            state = self.state[p]
+            if len(state) == 0:
+                state["step"] = 0
+                state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+                state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+                # Seed the gradient EMA with the first gradient (not zeros) —
+                # see Grokfast; a zero seed under-amplifies the early grokking
+                # phase and the kernel applies no EMA bias correction.
+                state["ema"] = grads_by_id[id(p)].detach().to(
+                    torch.float32).clone()
+            params_list.append(p)
+            exp_avg_list.append(state["exp_avg"])
+            exp_avg_sq_list.append(state["exp_avg_sq"])
+            ema_list.append(state["ema"])
+            states.append(state)
+        entry = (params_list, exp_avg_list, exp_avg_sq_list, ema_list, states)
+        self._static_cache[id(group)] = (key, entry)
+        return entry
 
     @torch.no_grad()
     def step(self, closure=None) -> Optional[float]:
@@ -146,44 +194,30 @@ class GrokAdamW(Optimizer):
         if self._use_grad_hooks:
             return loss
 
+        # Bind the resolved kernel callable once on the instance, then reuse it
+        # across steps instead of going through the _LazyOps proxy each step.
+        fused_step = self._fused_step
+        if fused_step is None:
+            fused_step = self._fused_step = _ops.bind("grokadamw_fused_step")
+
         for group in self.param_groups:
-            params_list = []
-            grads_list = []
-            exp_avg_list = []
-            exp_avg_sq_list = []
-            ema_list = []
-            step_list = []
-
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                grad = _validate_grad(p)
-
-                # Lazy state initialisation
-                state = self.state[p]
-                if len(state) == 0:
-                    state["step"] = 0
-                    state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
-                    state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
-                    # Seed the gradient EMA with the first gradient (not
-                    # zeros) — see Grokfast; a zero seed under-amplifies the
-                    # early grokking phase and the kernel applies no EMA bias
-                    # correction.
-                    state["ema"] = grad.detach().to(torch.float32).clone()
-
-                state["step"] += 1
-
-                params_list.append(p)
-                grads_list.append(grad)
-                exp_avg_list.append(state["exp_avg"])
-                exp_avg_sq_list.append(state["exp_avg_sq"])
-                ema_list.append(state["ema"])
-                step_list.append(state["step"])
+            grads_by_id = {
+                id(p): _validate_grad(p)
+                for p in group["params"] if p.grad is not None
+            }
+            params_list, exp_avg_list, exp_avg_sq_list, ema_list, states = \
+                self._group_cache(group, grads_by_id)
 
             if len(params_list) == 0:
                 continue
 
-            _ops.grokadamw_fused_step(
+            grads_list = [grads_by_id[id(p)] for p in params_list]
+            step_list = []
+            for state in states:
+                state["step"] += 1
+                step_list.append(state["step"])
+
+            fused_step(
                 params_list,
                 grads_list,
                 exp_avg_list,
