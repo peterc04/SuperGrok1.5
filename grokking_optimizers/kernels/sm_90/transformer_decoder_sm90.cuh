@@ -80,6 +80,7 @@
 #include "csrc/common/utils.cuh"
 #include "csrc/backends/cuda/sm_90/models/attention.cuh"
 
+#include <ATen/cuda/CUDAContext.h>   // at::cuda::getCurrentCUDABlasHandle (cached, per-stream)
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -938,6 +939,22 @@ inline cublasStatus_t cublas_gemm_rm(
     cudaStream_t stream
 ) {
     cublasSetStream(handle, stream);
+    // Compute type / algo selection so the cuBLAS *fallback* also hits Hopper
+    // tensor cores (it is only reached when the CUTLASS WGMMA path is disabled
+    // or reports an untileable shape):
+    //   • float : CUBLAS_COMPUTE_32F_FAST_TF32 + CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    //     → routes plain-FP32 buffers through the TF32 tensor cores, matching
+    //       the CUTLASS TF32 fast-path's precision class (allow_tf32 / PyTorch
+    //       default). FP32-accumulate is unchanged.
+    //   • bf16/half : kept AS-IS — CublasTraits<T>::compute_type (CUBLAS_COMPUTE_32F,
+    //     FP32-accumulate) with the default heuristic, which already selects a
+    //     tensor-core kernel for 16-bit inputs on sm_90.
+    cublasComputeType_t ctype = CublasTraits<T>::compute_type;
+    cublasGemmAlgo_t    algo  = CUBLAS_GEMM_DEFAULT;
+    if constexpr (std::is_same<T, float>::value) {
+        ctype = CUBLAS_COMPUTE_32F_FAST_TF32;
+        algo  = CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+    }
     return cublasGemmEx(handle,
         opB, opA,
         N, M, K,
@@ -946,8 +963,8 @@ inline cublasStatus_t cublas_gemm_rm(
         A, CublasTraits<T>::data_type, lda,
         &beta,
         C, CublasTraits<T>::data_type, ldc,
-        CublasTraits<T>::compute_type,
-        CUBLAS_GEMM_DEFAULT);
+        ctype,
+        algo);
 }
 
 // ─── Forward orchestration ───────────────────────────────────────────
@@ -977,8 +994,12 @@ cudaError_t forward(
     const WeightT* vocab_W = wp; wp += (size_t)V * D;
     const WeightT* vocab_b = wp; wp += V;
 
-    cublasHandle_t cublas;
-    cublasCreate(&cublas);
+    // Reuse the cached, per-stream cuBLAS handle instead of creating/destroying
+    // one per forward call. cublasCreate/Destroy each allocate+free a handle and
+    // associated workspace (a device sync point); the cached handle is created
+    // once by the CUDA caching context and shared across all calls on this
+    // thread/stream. (Same pattern mamba uses — mamba3_sm90.cuh:533.)
+    auto cublas = at::cuda::getCurrentCUDABlasHandle();
     cublasSetStream(cublas, stream);
 
     // Stash input ids for backward
@@ -1144,7 +1165,7 @@ cudaError_t forward(
     last_token_kernel<ActT><<<B, 128, 0, stream>>>(
         logits_full, output, B, S, V);
 
-    cublasDestroy(cublas);
+    // Handle is owned by the CUDA caching context — do NOT destroy it.
     return cudaGetLastError();
 }
 
@@ -1217,8 +1238,10 @@ cudaError_t backward(
     WeightT* g_vocab_W = gwp; gwp += (size_t)V * D;
     WeightT* g_vocab_b = gwp; gwp += V;
 
-    cublasHandle_t cublas;
-    cublasCreate(&cublas);
+    // Reuse the cached, per-stream cuBLAS handle (see forward()'s note); avoids
+    // a cublasCreate/Destroy (handle+workspace alloc/free, a sync point) on
+    // every backward call. (mamba3_sm90.cuh:533.)
+    auto cublas = at::cuda::getCurrentCUDABlasHandle();
     cublasSetStream(cublas, stream);
 
     ActT* act_base = const_cast<ActT*>(activations_saved);
@@ -1417,7 +1440,7 @@ cudaError_t backward(
     // grad_input is grad w.r.t. token IDs — undefined for integer inputs.
     cudaMemsetAsync(grad_input, 0, (size_t)B*S*sizeof(ActT), stream);
 
-    cublasDestroy(cublas);
+    // Handle is owned by the CUDA caching context — do NOT destroy it.
     return cudaGetLastError();
 }
 
