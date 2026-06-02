@@ -243,6 +243,25 @@ inline void* fmha_get_workspace(size_t bytes) {
     return ws_ptr;
 }
 
+// Per-thread FMHA scratch (S/P/O), lazily grown. Mirrors fmha_get_workspace:
+// one grow-only device buffer per slot, reused across forward calls so the
+// hot path no longer pays a cudaMalloc/cudaFree per call. Each slot has its
+// own static so the three buffers never alias. Lifetime = process lifetime
+// (intentional — the buffer is reused; sized to the largest request so far).
+template <int kSlot>
+inline void* fmha_get_scratch(size_t bytes) {
+    static thread_local void*  ptr   = nullptr;
+    static thread_local size_t cap   = 0;
+    if (bytes > cap) {
+        if (ptr) cudaFree(ptr);
+        if (cudaMalloc(&ptr, bytes) != cudaSuccess) {
+            ptr = nullptr; cap = 0; return nullptr;
+        }
+        cap = bytes;
+    }
+    return ptr;
+}
+
 // Generic Sm90 GEMM: C[MxN] = A[MxK] * B[KxN], FP32 out, FP32 accumulate.
 // A is RowMajor [M,K]. B layout is a template parameter:
 //   - ColumnMajor B + physical [N,K] row-major data  => computes A·Bᵀ (QKᵀ)
@@ -458,15 +477,15 @@ cudaError_t cutlass_fmha_forward(
     float* lse = reinterpret_cast<float*>(softmax_lse);
 
     // Scratch: FP32 scores [N*N], ActT probs [N*N], FP32 O [N*D].
-    float* S = nullptr;  ActT* P = nullptr;  float* O = nullptr;
-    if (cudaMalloc(&S, sizeof(float) * (size_t)N * N) != cudaSuccess)
+    // Served from per-thread lazily-grown buffers (one static slot each) so the
+    // forward no longer pays a cudaMalloc/cudaFree per call. Buffers are reused
+    // across calls and grown on demand; they are NOT freed here (process-lifetime
+    // reuse, same policy as fmha_get_workspace / sm90_get_workspace).
+    float* S = reinterpret_cast<float*>(fmha_get_scratch<0>(sizeof(float) * (size_t)N * N));
+    ActT*  P = reinterpret_cast<ActT*>(fmha_get_scratch<1>(sizeof(ActT) * (size_t)N * N));
+    float* O = reinterpret_cast<float*>(fmha_get_scratch<2>(sizeof(float) * (size_t)N * D));
+    if (S == nullptr || P == nullptr || O == nullptr)
         return cudaErrorMemoryAllocation;
-    if (cudaMalloc(&P, sizeof(ActT) * (size_t)N * N) != cudaSuccess) {
-        cudaFree(S); return cudaErrorMemoryAllocation;
-    }
-    if (cudaMalloc(&O, sizeof(float) * (size_t)N * D) != cudaSuccess) {
-        cudaFree(S); cudaFree(P); return cudaErrorMemoryAllocation;
-    }
 
     cudaError_t err = cudaSuccess;
     for (int bh = 0; bh < BH && err == cudaSuccess; ++bh) {
@@ -503,7 +522,8 @@ cudaError_t cutlass_fmha_forward(
         err = cudaGetLastError();
     }
 
-    cudaFree(S); cudaFree(P); cudaFree(O);
+    // S/P/O are reused across calls (process-lifetime per-thread scratch), so
+    // they are intentionally NOT freed here.
     return err;
 }
 #endif // WITH_CUTLASS

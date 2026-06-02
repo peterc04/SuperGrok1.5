@@ -172,6 +172,13 @@ inline cudaError_t gemm_rowmajor(
     cudaDataType_t dt = cublas_traits<T>::dt;
     // Row-major: C = A · B  ⇔  C^T = B^T · A^T  (col-major view)
     // In col-major: m=N, n=M, k=K, A_in=B (lda=N), B_in=A (ldb=K), C_out=C (ldc=N)
+    // For float inputs use CUBLAS_COMPUTE_32F_FAST_TF32 so plain-FP32 buffers are
+    // routed through the TF32 tensor cores (matching the CUTLASS TF32 path and
+    // gemm_rowmajor_NT's fast-path precision class); bf16/half keep
+    // CUBLAS_COMPUTE_32F (FP32-accumulate), which already selects tensor cores.
+    cublasComputeType_t ctype =
+        std::is_same<T, float>::value ? CUBLAS_COMPUTE_32F_FAST_TF32
+                                      : CUBLAS_COMPUTE_32F;
     cublasStatus_t st = cublasGemmEx(
         handle, CUBLAS_OP_N, CUBLAS_OP_N,
         N, M, K,
@@ -180,7 +187,7 @@ inline cudaError_t gemm_rowmajor(
         A, dt, K,
         &beta,
         C, dt, N,
-        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        ctype, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     return (st == CUBLAS_STATUS_SUCCESS) ? cudaSuccess : cudaErrorUnknown;
 }
 
