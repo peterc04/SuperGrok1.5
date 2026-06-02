@@ -24,14 +24,10 @@ enum class NanPolicy : int { kNone = 0, kZero = 1, kPropagate = 2 };
 //  read boundary only (the optimizer math stays single-sourced in
 //  csrc/algorithms/<opt>.h; nothing is re-typed here).
 //
-//  ENABLEMENT (compile-time): the canonical, behavior-preserving default is
-//  OFF — the host launchers' public signatures are fixed by the pybind bindings
-//  (csrc/bindings/bindings.cpp), so a runtime `bool sanitize_nonfinite` launcher
-//  param cannot be threaded through from here without editing the bindings
-//  (out of scope for this stage). Instead the guard is gated by the compile-time
-//  macro SG_SANITIZE_NONFINITE: build with -DSG_SANITIZE_NONFINITE=1 to turn it
-//  on for every sm_90 optimizer kernel. When 0 (default) sg_sanitize_grad() is
-//  the identity and the kernels are byte-for-byte the prior behavior.
+//  ENABLEMENT (compile-time): the default is ON — non-finite gradients are
+//  zeroed before the per-element step, preventing a single NaN/Inf from
+//  permanently poisoning exp_avg_sq or the parameter.  Build with
+//  -DSG_SANITIZE_NONFINITE=0 to revert to the legacy (pass-through) behavior.
 //
 //  The helpers operate on the FLOAT gradient value the kernel already
 //  materializes (after the static_cast<float> the canonical step would do), so
@@ -39,7 +35,7 @@ enum class NanPolicy : int { kNone = 0, kZero = 1, kPropagate = 2 };
 //  isfinite-select per element on the hot path.
 // =========================================================================
 #ifndef SG_SANITIZE_NONFINITE
-#define SG_SANITIZE_NONFINITE 0
+#define SG_SANITIZE_NONFINITE 1
 #endif
 
 // Scalar: returns g when finite, else 0. Identity when the guard is off.

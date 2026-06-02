@@ -419,7 +419,7 @@ __device__ __forceinline__ void attention_head(
 // ── §5.5  Residual add (FP32 accum + bf16 store): y = a + b ───────────────────
 __device__ __forceinline__ void residual_add(
     const float* __restrict__ a, const short* __restrict__ b,
-    short* __restrict__ y, int idx)
+    short* __restrict__ y, int64_t idx)
 {
     y[idx] = f32_to_bf16(a[idx] + bf16_to_f32(b[idx]));
 }
@@ -467,24 +467,22 @@ extern "C" __global__ void decoder_gfx942_attention(
 
 // Elementwise GELU (grid-stride, bandwidth-bound) → high occupancy. (WS5)
 extern "C" SG_KERNEL_BOUNDS(256, 8) void decoder_gfx942_gelu(
-    const short* __restrict__ x, short* __restrict__ y, int n)
+    const short* __restrict__ x, short* __restrict__ y, int64_t n)
 {
-    for (int idx = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
-                 + static_cast<int>(threadIdx.x);
+    for (int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
          idx < n;
-         idx += static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x))
+         idx += (int64_t)gridDim.x * blockDim.x)
         y[idx] = f32_to_bf16(gelu_tanh(bf16_to_f32(amd::streaming_load(&x[idx]))));
 }
 
 // Elementwise residual add (grid-stride, bandwidth-bound) → high occupancy. (WS5)
 extern "C" SG_KERNEL_BOUNDS(256, 8) void decoder_gfx942_residual_add(
     const float* __restrict__ a, const short* __restrict__ b,
-    short* __restrict__ y, int n)
+    short* __restrict__ y, int64_t n)
 {
-    for (int idx = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
-                 + static_cast<int>(threadIdx.x);
+    for (int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
          idx < n;
-         idx += static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x))
+         idx += (int64_t)gridDim.x * blockDim.x)
         residual_add(a, b, y, idx);
 }
 

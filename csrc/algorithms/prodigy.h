@@ -83,7 +83,7 @@ __device__ __forceinline__ void prodigy_apply_step(
     s_track[idx]   += d * g;
 
     // bc1, bc2 un-inverted (= 1 - beta^t): divide for bias correction.
-    const float update = (m / bc1) / (sqrtf(v / bc2) + eps);
+    const float update = (m / sg_safe_bc(bc1)) / (sqrtf(v / sg_safe_bc(bc2)) + eps);
     param[idx] = static_cast<ParamT>(p - d * (update + wd * p));
 }
 

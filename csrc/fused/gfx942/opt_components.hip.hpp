@@ -29,6 +29,12 @@
 
 namespace sg { namespace fused { namespace gfx942_mega {
 
+// Defensive bias-correction denominator guard (mirrors csrc/common/utils.cuh).
+__device__ __forceinline__ float sg_safe_bc(float bc) {
+    float abs_bc = bc < 0.0f ? -bc : bc;
+    return abs_bc > 1e-30f ? bc : 1e-30f;
+}
+
 // Compile-time optimizer selector — one value per real optimizer (no fallback).
 enum class OptId : int {
     AdamW = 0, Lion = 1, Grokfast = 2, GrokAdamW = 3, LookSAM = 4,
@@ -83,7 +89,7 @@ __device__ __forceinline__ float sg_adam_tail(
     const float m = b1 * m_buf[i] + (1.0f - b1) * g_eff;
     const float v = b2 * v_buf[i] + (1.0f - b2) * g_eff * g_eff;
     m_buf[i] = m; v_buf[i] = v;
-    const float update = (m / bc1) / (__builtin_sqrtf(v / bc2) + eps);
+    const float update = (m / sg_safe_bc(bc1)) / (__builtin_sqrtf(v / sg_safe_bc(bc2)) + eps);
     return p - lr * (update + wd * p);
 }
 
@@ -153,7 +159,7 @@ __device__ __forceinline__ void apply_optimizer(
                         + (1.0f - st.beta2) * g_scaled * g_scaled;
         st.exp_avg[i] = m; st.exp_avg_sq[i] = v;
         st.s_track[i] += d * g;
-        const float update = (m / st.bc1) / (__builtin_sqrtf(v / st.bc2) + st.eps);
+        const float update = (m / sg_safe_bc(st.bc1)) / (__builtin_sqrtf(v / sg_safe_bc(st.bc2)) + st.eps);
         params[i] = p - d * (update + st.wd * p);     // prodigy steps with d, not lr
     } else if constexpr (Opt == OptId::NeuralGrok) {
         // psi_b2 scalar is packed at extra[kPsiB2Off] == st.psi_W2[kPsiHidden];

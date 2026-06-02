@@ -35,11 +35,18 @@ def init_muon_state(param: jnp.ndarray) -> MuonState:
 
 
 def _newton_schulz_ortho(X: jnp.ndarray, ns_steps: int) -> jnp.ndarray:
-    """Newton-Schulz orthogonalization.
+    """Newton-Schulz orthogonalization (lax.fori_loop / scan-friendly form).
 
     Muon paper coefficients: a=3.4445, b=-4.7750, c=2.0315.
     Iterates: X <- a*X + b*(X @ X.T) @ X + c*X @ (X.T @ X)
     Converges to the nearest orthogonal matrix.
+
+    NOTE: this is the scan-form twin of ``newton_schulz_iterate`` below (the
+    unrolled form used by the fused-TU launcher). Both use the same Muon
+    coefficients and produce mathematically equivalent results; the two forms
+    coexist because lax.fori_loop (scan) is more XLA-efficient for the
+    standalone reference path while the unrolled loop better matches the
+    per-tensor fused-TU contract.
     """
     a, b, c = 3.4445, -4.7750, 2.0315
 
@@ -84,7 +91,12 @@ def muon_step(
 def newton_schulz_iterate(
     X: jnp.ndarray, ns_steps: int, a: float, b: float, c: float
 ) -> jnp.ndarray:
-    """Unrolled Newton-Schulz variant used by the fused-TU launcher."""
+    """Unrolled Newton-Schulz variant used by the fused-TU launcher.
+
+    This is the unrolled-form twin of ``_newton_schulz_ortho`` above (the
+    scan-friendly form). Both use the same Muon coefficients (a=3.4445,
+    b=-4.7750, c=2.0315) and produce mathematically equivalent results.
+    """
     _mm = functools.partial(
         jnp.matmul,
         precision=lax.Precision.HIGHEST,

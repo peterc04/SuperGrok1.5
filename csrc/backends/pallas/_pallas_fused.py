@@ -485,6 +485,7 @@ def _apply_kernel_optimizer(
     """
     meta = static.get("meta", {})
     step = static.get("step", 1)
+    _prodigy_d_leaves = False
 
     if optimizer == "supergrok2":
         # sg2_update(params, grads, state, meta_weights, hyperparams) per leaf.
@@ -543,7 +544,7 @@ def _apply_kernel_optimizer(
     elif optimizer == "prodigy":
         s_buf = opt_state["s"]
         p0 = opt_state["param_init"]
-        d_lr = meta.get("d_lr", 1e-6)
+        d_lr = opt_state.get("d_lr_scalar", meta.get("d_lr", 1e-6))
 
         def _leaf(p, g, m, v, s, pi):
             return step_fn(p, g, m, v, s, pi, step, d_lr,
@@ -552,6 +553,7 @@ def _apply_kernel_optimizer(
 
         out = jax.tree_util.tree_map(_leaf, params, grads, exp_avg, exp_avg_sq, s_buf, p0)
         new_keys = ("exp_avg", "exp_avg_sq", "s", "_d_lr")
+        _prodigy_d_leaves = True
 
     else:  # supergrok11 / supergrok15
         mu = opt_state["mu"]
@@ -584,6 +586,15 @@ def _apply_kernel_optimizer(
         new_state[k] = jax.tree_util.tree_unflatten(
             treedef, [t[i + 1] for t in leaves]
         )
+
+    if _prodigy_d_leaves:
+        d_idx = new_keys.index("_d_lr")
+        per_leaf_d = [t[d_idx + 1] for t in leaves]
+        d_reduced = per_leaf_d[0]
+        for d_val in per_leaf_d[1:]:
+            d_reduced = jnp.maximum(d_reduced, d_val)
+        new_state["d_lr_scalar"] = d_reduced
+
     return new_params, new_state
 
 

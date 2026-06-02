@@ -260,6 +260,17 @@ _DEP_CHECKED: Dict[Tuple[str, bool], bool] = {}
 _DEP_LOCK = threading.Lock()
 
 
+# Pinned versions for auto-installed optional dependencies (supply-chain
+# hygiene). Lower-bound ``>=`` keeps multi-arch/multi-Python builds flexible
+# while preventing arbitrary future versions from landing silently.
+_PINNED_VERSIONS: Dict[str, str] = {
+    "scikit-learn": "scikit-learn>=1.5,<2",
+    "jinja2": "jinja2>=3.1,<4",
+    "libclang": "libclang>=16,<19",
+    "cuda-python": "cuda-python>=12.2,<14",
+}
+
+
 def _ensure_optional_dep(pkg: str, feature: str,
                          *, install: bool = True,
                          pip_name: Optional[str] = None) -> bool:
@@ -274,15 +285,12 @@ def _ensure_optional_dep(pkg: str, feature: str,
         (defaults to ``pkg``) once with a 120 s timeout, then retry the
         import. Return True if the retry succeeds, False otherwise.
 
-    Every step is logged to stderr with the ``[deps]`` prefix and the
-    feature tag so a build log makes it obvious which knob asked for
-    which package. Successful auto-installs are cached per-process so a
-    second call for the same (pkg, install) tuple is free.
-
-    Designed to be safe to call from cold paths (the slow case is the
-    pip subprocess, gated by ``install`` and the cache) and from hot
-    paths (the cache turns subsequent hits into a dict lookup + a single
-    importlib call).
+    Auto-installs use pinned version ranges from ``_PINNED_VERSIONS`` to
+    prevent uncontrolled dependency drift. Every step is logged to stderr
+    with the ``[deps]`` prefix and the feature tag so a build log makes
+    it obvious which knob asked for which package. Successful auto-installs
+    are cached per-process so a second call for the same (pkg, install)
+    tuple is free.
     """
     cache_key = (pkg, bool(install))
     with _DEP_LOCK:
@@ -299,7 +307,8 @@ def _ensure_optional_dep(pkg: str, feature: str,
     except ImportError:
         pass
 
-    pip_target = pip_name or pkg
+    pip_target_bare = pip_name or pkg
+    pip_target = _PINNED_VERSIONS.get(pip_target_bare, pip_target_bare)
     if not install:
         sys.stderr.write(
             f"[deps] {feature}: {pkg} not installed — skipping. "

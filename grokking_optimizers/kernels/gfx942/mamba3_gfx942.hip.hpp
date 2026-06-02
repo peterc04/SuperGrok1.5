@@ -387,12 +387,12 @@ __device__ __forceinline__ void conv1d_silu(
     float w1 = bf16_to_f32(conv_w[ch * kConvK + 1]);
     float w2 = bf16_to_f32(conv_w[ch * kConvK + 2]);
     float bias = bf16_to_f32(conv_b[ch]);
-    int base = b * seq_len * d_inner + ch;
-    float xl = (t > 0)           ? bf16_to_f32(x_main[base + (t - 1) * d_inner]) : 0.f;
-    float xc =                     bf16_to_f32(x_main[base +  t      * d_inner]);
-    float xr = (t < seq_len - 1) ? bf16_to_f32(x_main[base + (t + 1) * d_inner]) : 0.f;
+    int64_t base = (int64_t)b * seq_len * d_inner + ch;
+    float xl = (t > 0)           ? bf16_to_f32(x_main[base + (int64_t)(t - 1) * d_inner]) : 0.f;
+    float xc =                     bf16_to_f32(x_main[base + (int64_t)t       * d_inner]);
+    float xr = (t < seq_len - 1) ? bf16_to_f32(x_main[base + (int64_t)(t + 1) * d_inner]) : 0.f;
     float out = silu(w0 * xl + w1 * xc + w2 * xr + bias);
-    y[base + t * d_inner] = f32_to_bf16(out);
+    y[base + (int64_t)t * d_inner] = f32_to_bf16(out);
 }
 
 // ── §5.4  SSM selective scan (Blelloch monoid scan, LDS handoff) ──────────────
@@ -414,12 +414,12 @@ __device__ __forceinline__ void ssm_scan(
     const int lane    = static_cast<int>(threadIdx.x) % kWave;
     const int waveId  = static_cast<int>(threadIdx.x) / kWave;
     const int wpb     = static_cast<int>(blockDim.x) / kWave;
-    const int gWave   = static_cast<int>(blockIdx.x) * wpb + waveId;
-    const int total   = batch * d_inner;
+    const int64_t gWave   = (int64_t)blockIdx.x * wpb + waveId;
+    const int64_t total   = (int64_t)batch * d_inner;
     if (gWave >= total) return;
 
-    const int b_idx = gWave / d_inner;
-    const int ch    = gWave % d_inner;
+    const int b_idx = static_cast<int>(gWave / d_inner);
+    const int ch    = static_cast<int>(gWave % d_inner);
     float* ws = smem + waveId * kWave * 2;            // (a, bx) per lane
 
     constexpr int EPL = (SEQ_LEN + kWave - 1) / kWave;
@@ -518,9 +518,9 @@ __device__ __forceinline__ void ssm_scan(
 __device__ __forceinline__ void gate_multiply(
     const float* __restrict__ y_scan, const short* __restrict__ x_main,
     const short* __restrict__ z, const short* __restrict__ D_param,
-    short* __restrict__ y_out, int idx, int d_inner)
+    short* __restrict__ y_out, int64_t idx, int d_inner)
 {
-    int ch = idx % d_inner;
+    int ch = static_cast<int>(idx % d_inner);
     float ys = y_scan[idx];
     float xm = bf16_to_f32(x_main[idx]);
     float zv = bf16_to_f32(z[idx]);
@@ -570,11 +570,11 @@ __device__ __forceinline__ void ssm_scan_backward(
     const int lane   = static_cast<int>(threadIdx.x) % kWave;
     const int waveId = static_cast<int>(threadIdx.x) / kWave;
     const int wpb    = static_cast<int>(blockDim.x) / kWave;
-    const int gWave  = static_cast<int>(blockIdx.x) * wpb + waveId;
-    if (gWave >= batch * d_inner) return;
+    const int64_t gWave  = (int64_t)blockIdx.x * wpb + waveId;
+    if (gWave >= (int64_t)batch * d_inner) return;
 
-    const int b_idx = gWave / d_inner;
-    const int ch    = gWave % d_inner;
+    const int b_idx = static_cast<int>(gWave / d_inner);
+    const int ch    = static_cast<int>(gWave % d_inner);
     float* ws = smem + waveId * kWave * 2;
     constexpr int EPL = (SEQ_LEN + kWave - 1) / kWave;
 
@@ -679,15 +679,14 @@ extern "C" __global__ void mamba3_gfx942_conv1d_fwd(
     const short* __restrict__ conv_b, short* __restrict__ y,
     int batch, int seq_len, int d_inner)
 {
-    int total = batch * seq_len * d_inner;
-    for (int idx = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
-                 + static_cast<int>(threadIdx.x);
+    int64_t total = (int64_t)batch * seq_len * d_inner;
+    for (int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
          idx < total;
-         idx += static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x)) {
-        int ch = idx % d_inner;
-        int fp = idx / d_inner;
-        int b  = fp / seq_len;
-        int t  = fp % seq_len;
+         idx += (int64_t)gridDim.x * blockDim.x) {
+        int ch = static_cast<int>(idx % d_inner);
+        int64_t fp = idx / d_inner;
+        int b  = static_cast<int>(fp / seq_len);
+        int t  = static_cast<int>(fp % seq_len);
         conv1d_silu(x_main, conv_w, conv_b, y, seq_len, d_inner, b, t, ch);
     }
 }
@@ -710,11 +709,10 @@ extern "C" SG_KERNEL_BOUNDS(256, 8) void mamba3_gfx942_gate_mul(
     const short* __restrict__ z, const short* __restrict__ D_param,
     short* __restrict__ y_out, int batch, int seq_len, int d_inner)
 {
-    int total = batch * seq_len * d_inner;
-    for (int idx = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
-                 + static_cast<int>(threadIdx.x);
+    int64_t total = (int64_t)batch * seq_len * d_inner;
+    for (int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
          idx < total;
-         idx += static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x))
+         idx += (int64_t)gridDim.x * blockDim.x)
         gate_multiply(y_scan, x_main, z, D_param, y_out, idx, d_inner);
 }
 

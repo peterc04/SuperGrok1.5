@@ -50,8 +50,8 @@ __device__ __forceinline__ void adamw_step(
     const float v = beta2 * v0 + (1.0f - beta2) * g * g;
 
     // Bias correction: m_hat = m / (1 - beta1^t), v_hat = v / (1 - beta2^t).
-    const float m_hat = m / bc1;
-    const float v_hat = v / bc2;
+    const float m_hat = m / sg_safe_bc(bc1);
+    const float v_hat = v / sg_safe_bc(bc2);
 
     const float denom = sqrtf(v_hat) + eps;
     const float update = m_hat / denom;
@@ -94,10 +94,10 @@ __device__ __forceinline__ void adamw_step_vec4(
     v.w = beta2 * v0.w + (1.0f - beta2) * g.w * g.w;
 
     // bc1, bc2 un-inverted: divide for bias correction.
-    p.x -= lr * ((m.x / bc1) / (sqrtf(v.x / bc2) + eps) + wd * p.x);
-    p.y -= lr * ((m.y / bc1) / (sqrtf(v.y / bc2) + eps) + wd * p.y);
-    p.z -= lr * ((m.z / bc1) / (sqrtf(v.z / bc2) + eps) + wd * p.z);
-    p.w -= lr * ((m.w / bc1) / (sqrtf(v.w / bc2) + eps) + wd * p.w);
+    p.x -= lr * ((m.x / sg_safe_bc(bc1)) / (sqrtf(v.x / sg_safe_bc(bc2)) + eps) + wd * p.x);
+    p.y -= lr * ((m.y / sg_safe_bc(bc1)) / (sqrtf(v.y / sg_safe_bc(bc2)) + eps) + wd * p.y);
+    p.z -= lr * ((m.z / sg_safe_bc(bc1)) / (sqrtf(v.z / sg_safe_bc(bc2)) + eps) + wd * p.z);
+    p.w -= lr * ((m.w / sg_safe_bc(bc1)) / (sqrtf(v.w / sg_safe_bc(bc2)) + eps) + wd * p.w);
 
     param4[i]      = p;
     exp_avg4[i]    = m;
