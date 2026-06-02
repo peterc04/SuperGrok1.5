@@ -2,14 +2,14 @@
   "_doc": "WS2 drift guard: normalized hashes of the canonical csrc/algorithms/<opt>.h math. Regenerate with `--update-manifest` ONLY when intentionally changing the canonical math (and after syncing the gfx942/TPU re-expressions).",
   "hashes": {
     "adamw": "1185714fe5feb1f0a7a8f83512fa237545d2e1cba7dfc9690e1ea23331902740",
-    "grokadamw": "9539c295ba52f99b5841a08a6c06d72b9398923b078ea86b5337d8ca6e3e724e",
+    "grokadamw": "7fedf139314417d7a0e4d881452b91e7da8af9d0465018206d2294089a8df294",
     "grokfast": "5f7485f43822462130a52ed49f615073f101378fb97da80e82675f0ea12477a2",
     "lion": "f170cae51e17a0269d185fb49723dc9b67a5bd99b6945b4d229178a37a5a3f1e",
     "looksam": "b179405d4d0ea4b885195bd195987805519ffd2b8421fdacbf5ad997dce4bb99",
     "muon": "d63a99810eca3cb89dd94e72ec0cc6690c636e3753cc2bb22db4ae85205949d0",
-    "neuralgrok": "de83d3a13588e8be4c2214c93a4dae373cc61d8ce7ff304de3ea1228f661f0d8",
+    "neuralgrok": "2560b4f0ff34df3c5b567e558609dd8b683ae2321cb7ffe1968019dbf3f37c5a",
     "prodigy": "eddd434763f55fac797354d6cf32ae95086320218ed0bd04a882ab432d64b693",
-    "supergrok11": "4b4b10869ba16ddb57aa7916661f7b05c7e6ce2cd0d044e5c77bcf58b789d708",
+    "supergrok11": "4046f237eef2b6faf437644f8d0cc40582fde66d9475a00fe671aa77f2de60f7",
     "supergrok15": "03cc973fe2b9cd6174433a67b8dec46963d242de4d420a509258673ec7cba014",
     "supergrok2": "e2b5e726a859c6d80b88e78a5c34038762e26fee57149241507c0037da88fb67"
   }

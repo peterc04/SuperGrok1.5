@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Phase 5 WS2 — ENFORCED optimizer-math single-source / drift guard.
 
-Two real teeth (a comment is NOT enough — this fails the build on drift):
+Three real teeth (a comment is NOT enough — this fails the build on drift):
 
 1. STRUCTURAL single-source (CUDA): the canonical per-element math lives once in
    csrc/algorithms/<opt>.h. BOTH CUDA consumers derive from it by #include:
@@ -10,6 +10,19 @@ Two real teeth (a comment is NOT enough — this fails the build on drift):
    If a consumer stops #including the canonical header (i.e. reimplements the
    math), this FAILS — reimplementation is the only way the two CUDA trees could
    drift, and it is now detected.
+
+1b. RE-INLINE detection (Phase 5 WS3): #include alone is not enough — a consumer
+   could keep the #include yet still LOCALLY RE-INLINE the Adam moment-update /
+   bias-corrected apply instead of CALLING the canonical step. That silently
+   re-introduces drift while passing the structural check. So each includable
+   CUDA consumer (kernels/sm_90/<opt>_sm90.cuh and the fused
+   csrc/fused/sm_90/opt_components.cuh) is scanned for the Adam moment-update +
+   apply expressions (`beta1 * exp_avg…`, `beta2 * exp_avg_sq…`, the
+   `(m / bc1) / (sqrtf(v / bc2) + eps)` apply). Any match in a consumer FAILS —
+   the math must come from a call into csrc/algorithms/<opt>.h, not be re-typed
+   in the .cuh. The canonical algorithms/*.h headers themselves are NOT scanned
+   (they are the single source and MUST contain the math); the gfx942/TPU
+   re-expressions are the sanctioned transcriptions guarded by check (2).
 
 2. CONTENT-HASH manifest (drift detection for the necessary RE-EXPRESSIONS that
    cannot #include the C header — gfx942 transcription, TPU JAX): a committed
@@ -63,6 +76,60 @@ def _strip_comments_ws(src: str) -> str:
     return src
 
 
+# ---------------------------------------------------------------------------
+# Phase 5 WS3 — re-inline detection.
+#
+# The Adam moment-update + bias-corrected decoupled-WD apply is the math that
+# MUST live once in csrc/algorithms/<opt>.h and reach every includable CUDA
+# consumer via a CALL (e.g. adamw_step / <opt>_adam_tail), never by being
+# re-typed locally. These regexes match the *moment-update / apply* expressions
+# specifically (not merely the names `beta1`/`exp_avg`, which legitimately
+# appear as function arguments passed INTO the canonical call).
+#
+# Patterns (whitespace-flexible):
+#   beta1 * exp_avg[...]        -> m  = b1*ea + (1-b1)*g   first moment update
+#   beta2 * exp_avg_sq[...]     -> v  = b2*eas + (1-b2)*g*g second moment update
+#   beta1 * ea... / beta2 * eas -> the quantized-state variant (ea_val/eas_val)
+#   (... / bc1) / (sqrtf(... / bc2) ... ) -> the bias-corrected apply
+_REINLINE_PATTERNS = [
+    re.compile(r"beta1\s*\*\s*exp_avg\b"),
+    re.compile(r"beta2\s*\*\s*exp_avg_sq\b"),
+    re.compile(r"beta1\s*\*\s*ea(?:_val)?\b"),
+    re.compile(r"beta2\s*\*\s*eas(?:_val)?\b"),
+    re.compile(r"/\s*bc1\s*\)\s*/\s*\(\s*sqrtf\s*\(.*?/\s*bc2"),
+]
+
+
+def _consumer_headers() -> list:
+    """Includable CUDA consumers that MUST obtain the Adam math by call, not by
+    re-inlining it. Excludes the canonical algorithms/*.h (which own the math)
+    and the gfx942/TPU re-expressions (sanctioned transcriptions, guarded by the
+    content-hash manifest)."""
+    consumers = [f"grokking_optimizers/kernels/sm_90/{opt}_sm90.cuh"
+                 for opt in OPTS]
+    consumers.append("csrc/fused/sm_90/opt_components.cuh")
+    return consumers
+
+
+def scan_reinlined_math(path: str) -> list:
+    """Return list of (lineno, pattern, line) for re-inlined Adam math in `path`.
+    Comments are stripped first so a commented-out reference line (e.g. the
+    bit-identity doc) is not flagged."""
+    body = _read(path)
+    if not body:
+        return []
+    hits = []
+    for lineno, raw in enumerate(body.splitlines(), 1):
+        # drop // comments (keep code before them); the doc comments that
+        # describe the canonical math are thereby ignored.
+        code = re.sub(r"//.*$", "", raw)
+        for pat in _REINLINE_PATTERNS:
+            if pat.search(code):
+                hits.append((lineno, pat.pattern, raw.strip()))
+                break
+    return hits
+
+
 def normalized_math_hash(opt: str) -> str:
     """SHA-256 of the comment/whitespace-stripped canonical header."""
     body = _read(_canonical_header(opt))
@@ -102,6 +169,16 @@ def check(structural_only: bool = False) -> list:
     if fused and "csrc/algorithms/adamw.h" not in fused:
         failures.append("[structural] opt_components.cuh lost its canonical "
                         "#includes.")
+
+    # (1b) re-inline detection: a consumer must CALL the canonical step, never
+    # re-type the Adam moment-update / apply locally.
+    for path in _consumer_headers():
+        for lineno, pat, line in scan_reinlined_math(path):
+            failures.append(
+                f"[re-inline] {path}:{lineno} re-inlines canonical Adam math "
+                f"(matched /{pat}/): `{line}`. This expression MUST come from a "
+                f"call into csrc/algorithms/<opt>.h (e.g. <opt>_step / "
+                f"<opt>_adam_tail), not be re-typed in the consumer.")
 
     if structural_only:
         return failures
