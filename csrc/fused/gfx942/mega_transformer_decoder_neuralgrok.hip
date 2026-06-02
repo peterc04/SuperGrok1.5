@@ -41,7 +41,7 @@ hipError_t mega_transformer_decoder_neuralgrok(
     int n_cus = 0;
     err = hipDeviceGetAttribute(&n_cus, hipDeviceAttributeMultiprocessorCount, dev);
     if (err != hipSuccess) return err;
-    ctx.n_ctas = (unsigned)n_cus;
+    ctx.n_groups = (unsigned)n_cus;
     FusedOptState st;
     st.exp_avg = m; st.exp_avg_sq = v;
     // #5: bind psi-net weights from the packed `extra` buffer (W1|b1|W2|b2,
