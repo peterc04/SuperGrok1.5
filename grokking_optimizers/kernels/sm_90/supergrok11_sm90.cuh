@@ -48,6 +48,7 @@ namespace prim = ::sg::sm90::primitives;
 using ::sg::algorithms::sg11_phi_forward;
 using ::sg::algorithms::sg11_sweep_a_step;
 using ::sg::algorithms::sg11_sweep_b_step;
+using ::sg::algorithms::sg11_adam_tail;
 
 constexpr int SG11_H = 64;
 
@@ -217,14 +218,11 @@ __global__ void sg11_adam_decay_kernel(
 ) {
     const int stride = prim::grid_stride();
     for (int i = prim::grid_stride_index(); i < N; i += stride) {
-        float g = smart_grad[i] + lamb_eff * mu[i];
-        float p = param[i];
-        float m = beta1 * exp_avg[i] + (1.0f - beta1) * g;
-        float v = beta2 * exp_avg_sq[i] + (1.0f - beta2) * g * g;
-        exp_avg[i] = m;
-        exp_avg_sq[i] = v;
-        float update = (m / bc1) / (sqrtf(v / bc2) + eps);
-        param[i] = p - lr * (update + wd_eff * p);
+        // g_eff = smart_grad + lamb_eff*mu blending; the bias-corrected Adam +
+        // decoupled-WD math lives once in algorithms/supergrok11.h.
+        const float g_eff = smart_grad[i] + lamb_eff * mu[i];
+        sg11_adam_tail(param, exp_avg, exp_avg_sq, g_eff,
+                       lr, beta1, beta2, eps, wd_eff, bc1, bc2, i);
     }
 }
 

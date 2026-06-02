@@ -63,6 +63,7 @@ namespace sg { namespace sm90 {
 
 namespace prim = ::sg::sm90::primitives;
 using ::sg::algorithms::grokadamw_step;
+using ::sg::algorithms::grokadamw_adam_tail;
 
 template <typename ParamT, typename GradT>
 __global__ void grokadamw_kernel(
@@ -173,11 +174,14 @@ __global__ void grokadamw_q3_kernel(
 
         float ema_new = alpha * ema_val + (1.0f - alpha) * g;
         float g_amp = g + lamb * ema_new;
-        float m = beta1 * ea_val + (1.0f - beta1) * g_amp;
-        float v = beta2 * eas_val + (1.0f - beta2) * g_amp * g_amp;
-
-        float update = (m / bc1) / (sqrtf(v / bc2) + eps);
-        param[i] = static_cast<ParamT>(p - lr * (update + wd * p));
+        // Canonical bias-corrected Adam tail (single-source: algorithms/grokadamw.h).
+        // g_eff = g_amp; moments come from the dequantized state, results are
+        // re-quantized below — the float math itself lives once in the header.
+        float m, v, p_new;
+        grokadamw_adam_tail(g_amp, p, ea_val, eas_val,
+                            lr, beta1, beta2, eps, wd, bc1, bc2,
+                            m, v, p_new);
+        param[i] = static_cast<ParamT>(p_new);
 
         unsigned rng = hash_prng(step, static_cast<unsigned>(i));
         ea_int8[i] = ptx_int8_stochastic_round(m, scale, rng);
