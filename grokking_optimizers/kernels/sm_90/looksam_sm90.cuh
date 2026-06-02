@@ -47,8 +47,13 @@ using ::sg::algorithms::looksam_restore_step;
 using ::sg::algorithms::looksam_set_direction;
 using ::sg::algorithms::looksam_apply_step;
 
+#ifndef SG_LOOKSAM_MIN_BLOCKS
+#define SG_LOOKSAM_MIN_BLOCKS 4
+#endif
+
 template <typename ParamT, typename GradT>
-__global__ void looksam_perturb_kernel(
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_LOOKSAM_MIN_BLOCKS)
+looksam_perturb_kernel(
     ParamT* param, ParamT* backup, const GradT* grad, float scale, int N
 ) {
     const int stride = prim::grid_stride();
@@ -58,7 +63,8 @@ __global__ void looksam_perturb_kernel(
 }
 
 template <typename ParamT>
-__global__ void looksam_restore_kernel(
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_LOOKSAM_MIN_BLOCKS)
+looksam_restore_kernel(
     ParamT* param, const ParamT* backup, int N
 ) {
     const int stride = prim::grid_stride();
@@ -68,7 +74,8 @@ __global__ void looksam_restore_kernel(
 }
 
 template <typename GradT>
-__global__ void looksam_set_direction_kernel(
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_LOOKSAM_MIN_BLOCKS)
+looksam_set_direction_kernel(
     float* sam_dir, const GradT* grad_sam, const GradT* grad_orig, int N
 ) {
     const int stride = prim::grid_stride();
@@ -77,17 +84,53 @@ __global__ void looksam_set_direction_kernel(
     }
 }
 
-template <typename ParamT, typename GradT>
-__global__ void looksam_apply_kernel(
+// SG_TUNED_UNROLL-parameterized scalar apply; calls canonical looksam_apply_step.
+template <typename ParamT, typename GradT, int UNROLL>
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_LOOKSAM_MIN_BLOCKS)
+looksam_apply_kernel(
     ParamT* param, float* exp_avg, float* exp_avg_sq,
     const float* sam_dir, const GradT* grad,
     float alpha, float lr, float beta1, float beta2, float eps, float wd,
     float bc1, float bc2, int N
 ) {
+    const int stride = prim::grid_stride() * UNROLL;
+    const int base0 = prim::grid_stride_index() * UNROLL;
+    for (int base = base0; base < N; base += stride) {
+        #pragma unroll
+        for (int u = 0; u < UNROLL; ++u) {
+            const int i = base + u;
+            if (i < N) {
+                looksam_apply_step(param, exp_avg, exp_avg_sq, sam_dir, grad,
+                                   alpha, lr, beta1, beta2, eps, wd,
+                                   bc1, bc2, i);
+            }
+        }
+    }
+}
+
+// FP32 vec4 fast path for the Adam apply: float4 traffic, canonical step 4×.
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_LOOKSAM_MIN_BLOCKS)
+looksam_apply_kernel_vec4_fp32(
+    float4* param4, float4* exp_avg4, float4* exp_avg_sq4,
+    const float4* sam_dir4, const float4* grad4,
+    float alpha, float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2, int N4
+) {
     const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
-        looksam_apply_step(param, exp_avg, exp_avg_sq, sam_dir, grad,
-                           alpha, lr, beta1, beta2, eps, wd, bc1, bc2, i);
+    for (int i = prim::grid_stride_index(); i < N4; i += stride) {
+        float4 p  = prim::ld_f32v4(param4 + i);
+        float4 m  = prim::ld_f32v4(exp_avg4 + i);
+        float4 v  = prim::ld_f32v4(exp_avg_sq4 + i);
+        float4 d  = prim::ldg_f32v4(sam_dir4 + i);
+        float4 g  = prim::ldg_f32v4(grad4 + i);
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            looksam_apply_step(&p.x, &m.x, &v.x, &d.x, &g.x,
+                               alpha, lr, beta1, beta2, eps, wd, bc1, bc2, u);
+        }
+        prim::st_f32v4(param4 + i, p);
+        prim::st_f32v4(exp_avg4 + i, m);
+        prim::st_f32v4(exp_avg_sq4 + i, v);
     }
 }
 
@@ -172,10 +215,32 @@ void launch_looksam_apply(
     const int block = SG_TUNED_BLOCK_SIZE;
     const int grid = std::min<int>(65535, (N + block - 1) / block);
 
+    const bool all_fp32 = param.scalar_type() == torch::kFloat32 &&
+                          grad.scalar_type() == torch::kFloat32;
+
+    if (SG_TUNED_VEC_WIDTH == 4 && all_fp32 &&
+        prim::is_vec4_alignable(param.data_ptr(), N) &&
+        prim::is_vec4_alignable(exp_avg.data_ptr(), N) &&
+        prim::is_vec4_alignable(exp_avg_sq.data_ptr(), N) &&
+        prim::is_vec4_alignable(sam_dir.data_ptr(), N) &&
+        prim::is_vec4_alignable(grad.data_ptr(), N)) {
+        const int N4 = N / 4;
+        const int grid4 = std::min<int>(65535, (N4 + block - 1) / block);
+        looksam_apply_kernel_vec4_fp32<<<grid4, block, 0, stream>>>(
+            reinterpret_cast<float4*>(param.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg_sq.data_ptr<float>()),
+            reinterpret_cast<const float4*>(sam_dir.data_ptr<float>()),
+            reinterpret_cast<const float4*>(grad.data_ptr<float>()),
+            alpha, lr, beta1, beta2, eps, wd, bc1, bc2, N4);
+        return;
+    }
+
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         param.scalar_type(), "looksam_apply", [&] {
-            looksam_apply_kernel<scalar_t, scalar_t><<<grid, block, 0, stream>>>(
+            looksam_apply_kernel<scalar_t, scalar_t, SG_TUNED_UNROLL>
+                <<<grid, block, 0, stream>>>(
                 param.data_ptr<scalar_t>(),
                 exp_avg.data_ptr<float>(),
                 exp_avg_sq.data_ptr<float>(),

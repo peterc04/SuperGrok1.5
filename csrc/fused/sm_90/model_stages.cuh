@@ -94,18 +94,38 @@ __device__ void model_forward_stage(const PersistentContext& ctx,
             const float p = params[off + i];
             acc += (M == ModelId::ViT) ? p : p * p;
         }
-        // Block reduce via shared (n is per-tensor; this is the row stat proxy).
-        // Sized to the max fused block (256 = two Hopper warp-groups for the
-        // §3.4 producer/consumer split). The power-of-two reduction below is
-        // unchanged for the 128-thread (single warp-group) launch.
-        __shared__ float red[256];
-        red[threadIdx.x] = acc;
+        // Block reduce (#2): WARP-SHUFFLE row reduction replaces the former
+        // 8-deep shared-memory tree (which did a __syncthreads() at every level
+        // — ~7 block barriers per tensor). Each warp first reduces its 32 lanes
+        // with __shfl_down_sync (zero smem, zero barriers); the 8 per-warp
+        // partials (256 threads = 8 warps) land in a tiny smem array, then warp
+        // 0 reduces those 8 with one more shuffle pass. Net: ONE __syncthreads()
+        // instead of ~8. BIT-CHANGE NOTE: this is a floating-point SUM reduction;
+        // the only thing that changes is the *summation order* (tree-by-stride
+        // vs warp-shuffle-then-combine). The downstream `c` is a mean proxy, not
+        // a checksum, so reassociation here is acceptable (and the algorithm
+        // math in csrc/algorithms is untouched — this is the model stage, not
+        // the optimizer apply).
+        const unsigned kFull = 0xffffffffu;
+        float w = acc;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) w += __shfl_down_sync(kFull, w, o);
+        __shared__ float red[32];   // one slot per warp (<=8 warps @256 threads)
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        if (lane == 0) red[warp] = w;
         __syncthreads();
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
-            __syncthreads();
+        const int n_warps = (blockDim.x + 31) >> 5;
+        float blk = 0.0f;
+        if (warp == 0) {
+            float p = (lane < n_warps) ? red[lane] : 0.0f;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) p += __shfl_down_sync(kFull, p, o);
+            if (lane == 0) red[0] = p;
         }
-        const float c = (n > 0) ? red[0] / (float)n : 0.0f;
+        __syncthreads();
+        blk = red[0];
+        const float c = (n > 0) ? blk / (float)n : 0.0f;
         for (int i = threadIdx.x; i < n; i += blockDim.x) {
             const float x = params[off + i] + input[off + i];
             acts[off + i] = model_activation<M>(x, c);
@@ -121,26 +141,20 @@ __device__ void model_backward_stage(const PersistentContext& ctx,
                                       const float* __restrict__ acts,
                                       float* __restrict__ grad,
                                       const int* sizes, const int* offsets) {
-    // SMEM staging (#2): the backward tail's per-tile working set (the upstream
-    // adjoint slab) is staged into the near-empty shared memory instead of being
-    // held in the register file across the grad write. The L3 megakernel cell
-    // uses ~1-65KB of the 233KB Hopper smem, so this is free capacity; pulling
-    // the adjoint out of registers lowers this stage's live-register footprint
-    // (it co-resides with the heavier forward stage in the L3 fusion). BIT-
-    // IDENTICAL: grad[i] = upstream(i) * model_activation_grad(x(i)) for the
-    // same i, same operand values, same multiply — only the storage class of
-    // `upstream` moves register -> shared.
+    // Backward tail (#3): direct register-local form. The former version staged
+    // the upstream adjoint into __shared__ up_stage[tid] and read it back in the
+    // very next statement of the SAME thread — a smem write+read that shares
+    // nothing across threads and only adds a store/load round-trip plus smem
+    // pressure. Removed; the adjoint stays in a register exactly as the gfx942
+    // twin (model_stages.hip.hpp) already does. BIT-IDENTICAL:
+    //   grad[off+i] = acts[off+i] * model_activation_grad<M>(params[off+i]).
     __shared__ int task_slot;
-    __shared__ float up_stage[256];   // one slot per thread (<=2 warp-groups).
     TaskQueue q = ctx.queue();
     for (int t = q.next_block(&task_slot); t < ctx.n_tasks;
          t = q.next_block(&task_slot)) {
         const int n = sizes[t], off = offsets[t];
         for (int i = threadIdx.x; i < n; i += blockDim.x) {
-            up_stage[threadIdx.x] = acts[off + i];   // staged adjoint (smem)
-            // x is rematerialized (#3) at point-of-use from params rather than
-            // cached alongside the staged adjoint.
-            grad[off + i] = up_stage[threadIdx.x]
+            grad[off + i] = acts[off + i]
                             * model_activation_grad<M>(params[off + i]);
         }
     }

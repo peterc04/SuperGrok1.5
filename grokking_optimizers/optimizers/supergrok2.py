@@ -35,6 +35,7 @@ Notes:
 """
 
 import math
+import warnings
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -821,38 +822,64 @@ class CSAHCAMetaNet(nn.Module):
             return
 
         counts_f = self.expert_counts.float()
-        top_expert = torch.multinomial(counts_f, 1).item()
+        # Keep the sampled donor expert as a 0-d device tensor (no .item()
+        # host sync); advanced indexing with it stays on device.
+        top_expert = torch.multinomial(counts_f, 1)[0]
         dead_indices = dead_mask.nonzero(as_tuple=True)[0]
 
-        for idx in dead_indices:
-            i = idx.item()
-            noise_scale = 0.01
-            self.expert_W1.data[i] = self.expert_W1.data[top_expert] + \
-                noise_scale * torch.randn_like(self.expert_W1.data[i])
-            self.expert_b1.data[i] = self.expert_b1.data[top_expert] + \
-                noise_scale * torch.randn_like(self.expert_b1.data[i])
-            self.expert_W2.data[i] = self.expert_W2.data[top_expert] + \
-                noise_scale * torch.randn_like(self.expert_W2.data[i])
-            self.expert_b2.data[i] = self.expert_b2.data[top_expert] + \
-                noise_scale * torch.randn_like(self.expert_b2.data[i])
+        noise_scale = 0.01
+        # Vectorized expert mutation: gather every dead row in one shot,
+        # generate all the perturbation noise with a single randn_like per
+        # tensor, and scatter back — replaces the per-index Python loop and
+        # its per-iteration .item()/randn_like calls.
+        for buf in (self.expert_W1, self.expert_b1,
+                    self.expert_W2, self.expert_b2):
+            donor = buf.data[top_expert].unsqueeze(0)  # [1, ...]
+            slice_ = buf.data[dead_indices]
+            buf.data[dead_indices] = donor + noise_scale * torch.randn_like(
+                slice_)
 
-            a_idx = i // self.pk_dim
-            b_idx = i % self.pk_dim
-
-            row_start = a_idx * self.pk_dim
-            row_end = row_start + self.pk_dim
-            if dead_mask[row_start:row_end].all():
+        # Product-key recycling: a query/key row is reset only when *all* of
+        # its experts are dead. Compute those conditions in a vectorized,
+        # on-device fashion (per (a_idx,b_idx) group) instead of inside the
+        # per-dead-expert Python loop. The boolean reductions below stay as
+        # device tensors and are only realised by the indexed assignment.
+        if self.num_experts % self.pk_dim == 0:
+            num_a = self.num_experts // self.pk_dim
+            # dead_mask reshaped to [num_a, pk_dim]: rows index a_idx, cols b_idx
+            dm2d = dead_mask[:num_a * self.pk_dim].reshape(num_a, self.pk_dim)
+            dead_rows = dm2d.all(dim=1).nonzero(as_tuple=True)[0]   # a_idx fully dead
+            dead_cols = dm2d.all(dim=0).nonzero(as_tuple=True)[0]   # b_idx fully dead
+            if dead_rows.numel() > 0:
                 for h in range(self.num_peer_heads):
-                    self.product_keys_A[h].data[a_idx] = torch.randn_like(
-                        self.product_keys_A[h].data[a_idx]) * 0.02
-
-            col_indices = torch.arange(0, self.num_experts, self.pk_dim,
-                                       device=dead_mask.device) + b_idx
-            col_indices = col_indices[col_indices < self.num_experts]
-            if dead_mask[col_indices].all():
+                    sel = self.product_keys_A[h].data[dead_rows]
+                    self.product_keys_A[h].data[dead_rows] = \
+                        torch.randn_like(sel) * 0.02
+            if dead_cols.numel() > 0:
                 for h in range(self.num_peer_heads):
-                    self.product_keys_B[h].data[b_idx] = torch.randn_like(
-                        self.product_keys_B[h].data[b_idx]) * 0.02
+                    sel = self.product_keys_B[h].data[dead_cols]
+                    self.product_keys_B[h].data[dead_cols] = \
+                        torch.randn_like(sel) * 0.02
+        else:
+            # Fallback (ragged num_experts): preserve the original per-dead
+            # logic exactly, including its row/col .all() semantics.
+            for idx in dead_indices:
+                i = int(idx)
+                a_idx = i // self.pk_dim
+                b_idx = i % self.pk_dim
+                row_start = a_idx * self.pk_dim
+                row_end = row_start + self.pk_dim
+                if dead_mask[row_start:row_end].all():
+                    for h in range(self.num_peer_heads):
+                        self.product_keys_A[h].data[a_idx] = torch.randn_like(
+                            self.product_keys_A[h].data[a_idx]) * 0.02
+                col_indices = torch.arange(0, self.num_experts, self.pk_dim,
+                                           device=dead_mask.device) + b_idx
+                col_indices = col_indices[col_indices < self.num_experts]
+                if dead_mask[col_indices].all():
+                    for h in range(self.num_peer_heads):
+                        self.product_keys_B[h].data[b_idx] = torch.randn_like(
+                            self.product_keys_B[h].data[b_idx]) * 0.02
 
         self.expert_counts.zero_()
 
@@ -1657,9 +1684,15 @@ class SuperGrok2(Optimizer):
         for (name, p, pidx, grad_flat, sharp_flat) in param_info:
             if p.grad is None:
                 continue
-            vg = p.grad.detach().reshape(-1).float()
-            if not torch.isfinite(vg).all():
-                continue
+            # Sanitize the val-grad on-device instead of an
+            # ``isfinite(vg).all()`` reduction-to-host skip: zero any NaN/Inf
+            # entries (no-op when already finite). nan_to_num maps a fully
+            # non-finite grad to all-zeros, whose norm is 0 -> the existing
+            # ``vg_norm > 1e-12`` branch then leaves vg_unit at zero, i.e. no
+            # contribution, matching the old skip semantics in that case.
+            vg = torch.nan_to_num(
+                p.grad.detach().reshape(-1).float(),
+                nan=0.0, posinf=0.0, neginf=0.0)
             vg_norm = vg.norm()
             vg_unit = vg / vg_norm if vg_norm > 1e-12 else vg
             sg = smart_grads[name].reshape(-1)
@@ -1758,9 +1791,15 @@ class SuperGrok2(Optimizer):
         for (name, p, pidx, grad_flat, sharp_flat) in param_info:
             if p.grad is None:
                 continue
-            vg = p.grad.detach().reshape(-1).float()
-            if not torch.isfinite(vg).all():
-                continue
+            # Sanitize on-device (see _allreduce_meta_grads): zero NaN/Inf
+            # entries rather than skipping the whole param via an
+            # ``isfinite(vg).all()`` host reduction. A fully non-finite grad
+            # becomes all-zeros -> vg_norm == 0 -> vg_unit stays zero, so the
+            # bilevel backward receives a zero d_smart (no contribution),
+            # matching the old skip in that case.
+            vg = torch.nan_to_num(
+                p.grad.detach().reshape(-1).float(),
+                nan=0.0, posinf=0.0, neginf=0.0)
             vg_norm = vg.norm()
             vg_unit = vg / vg_norm if vg_norm > 1e-12 else vg
             d_smart = -vg_unit
@@ -2100,12 +2139,21 @@ class SuperGrok2(Optimizer):
         wd_eff = self._get_effective_wd(group["weight_decay"])
 
         grad = param.grad.data
-        # Gradient clipping + NaN guard
+        # Gradient clipping + NaN guard, both done on-device without a host
+        # sync. The scale is 1.0 when ||g|| <= clip (matching the original
+        # ``if gn > clip`` branch exactly) and clip/(||g||+eps) otherwise,
+        # selected with a device-side ``where``. The non-finite guard then
+        # zeroes any NaN/Inf unconditionally (nan_to_num is a no-op on
+        # already-finite gradients), replacing the previous
+        # ``isfinite(grad).all()`` reduction-to-host on every step.
         gn = grad.norm()
-        if gn > self.gradient_clipping:
-            grad = grad * (self.gradient_clipping / (gn + 1e-12))
-        if not torch.isfinite(grad).all():
-            grad = torch.where(torch.isfinite(grad), grad, torch.zeros_like(grad))
+        scale = torch.where(
+            gn > self.gradient_clipping,
+            self.gradient_clipping / (gn + 1e-12),
+            torch.ones_like(gn),
+        )
+        grad = grad * scale
+        grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
 
         alpha_i = max(0.0, min(1.0, base_alpha * self._flat_layer_alphas[pidx]))
         beta1_i = self._flat_layer_beta1s[pidx]
@@ -2330,9 +2378,19 @@ class CompiledSuperGrok2:
             self._restore_grads(orig_grads)
             self._graph_valid = True
 
-        except Exception:
+        except Exception as exc:
             self._graph = None
             self._graph_valid = False
+            # Warn rather than silently degrade: CUDA-graph capture failed, so
+            # every subsequent step pays the eager-launch overhead this wrapper
+            # exists to eliminate. Surfacing the cause lets the caller fix it
+            # (e.g. dynamic shapes / sync ops in the captured region).
+            warnings.warn(
+                f"SuperGrok2 CUDA-graph capture failed; falling back to eager "
+                f"steps (launch overhead not amortized). Cause: {exc!r}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             # Fall back to eager
             self.optimizer.step()
 

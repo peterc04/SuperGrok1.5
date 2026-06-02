@@ -178,9 +178,47 @@ class NeuralGrok(Optimizer):
         self._meta_weights_dirty = True
         self._cached_meta_weights = None
 
+        # Per-group cache of static tensor lists (params + exp_avg/exp_avg_sq
+        # buffers keep a fixed identity across steps); only grads_list and step
+        # counters are refreshed per step. Invalidated by add_param_group.
+        self._static_cache: dict = {}
+        # Lazily-bound fused kernel callable (resolved once at first step()).
+        self._fused_step = None
+
         self._use_grad_hooks = use_grad_hooks
         if use_grad_hooks:
             _register_grad_hooks(self)
+
+    def add_param_group(self, param_group) -> None:
+        self._static_cache = {}
+        super().add_param_group(param_group)
+
+    def _group_cache(self, group):
+        """Cached (params, exp_avg, exp_avg_sq, states), keyed on the
+        grad-bearing param ids."""
+        key = tuple(id(p) for p in group["params"] if p.grad is not None)
+        cached = self._static_cache.get(id(group))
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        params_list = []
+        exp_avg_list = []
+        exp_avg_sq_list = []
+        states = []
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            state = self.state[p]
+            if len(state) == 0:
+                state["step"] = 0
+                state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+                state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+            params_list.append(p)
+            exp_avg_list.append(state["exp_avg"])
+            exp_avg_sq_list.append(state["exp_avg_sq"])
+            states.append(state)
+        entry = (params_list, exp_avg_list, exp_avg_sq_list, states)
+        self._static_cache[id(group)] = (key, entry)
+        return entry
 
     @torch.no_grad()
     def step(self, closure=None) -> Optional[float]:
@@ -201,6 +239,10 @@ class NeuralGrok(Optimizer):
         if self._use_grad_hooks:
             return loss
 
+        fused_step = self._fused_step
+        if fused_step is None:
+            fused_step = self._fused_step = _ops.bind("neuralgrok_fused_step")
+
         # Extract amplifier weights for the fused kernel (cached)
         if self._meta_weights_dirty or self._cached_meta_weights is None:
             self._cached_meta_weights = self.amplifier.get_weights()
@@ -208,33 +250,17 @@ class NeuralGrok(Optimizer):
         W1, b1, W_last, b_last = self._cached_meta_weights
 
         for group in self.param_groups:
-            params_list = []
-            grads_list = []
-            exp_avg_list = []
-            exp_avg_sq_list = []
-            step_list = []
-
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-
-                # Lazy state initialisation
-                state = self.state[p]
-                if len(state) == 0:
-                    state["step"] = 0
-                    state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
-                    state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
-
-                state["step"] += 1
-
-                params_list.append(p)
-                grads_list.append(p.grad)
-                exp_avg_list.append(state["exp_avg"])
-                exp_avg_sq_list.append(state["exp_avg_sq"])
-                step_list.append(state["step"])
+            params_list, exp_avg_list, exp_avg_sq_list, states = \
+                self._group_cache(group)
 
             if len(params_list) == 0:
                 continue
+
+            grads_list = [p.grad for p in params_list]
+            step_list = []
+            for state in states:
+                state["step"] += 1
+                step_list.append(state["step"])
 
             # Move amplifier weights to same device as params
             device = params_list[0].device
@@ -243,7 +269,7 @@ class NeuralGrok(Optimizer):
             W_last_d = W_last.to(device)
             b_last_d = b_last.to(device)
 
-            _ops.neuralgrok_fused_step(
+            fused_step(
                 params_list,
                 grads_list,
                 exp_avg_list,

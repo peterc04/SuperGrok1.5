@@ -200,7 +200,7 @@ __device__ __forceinline__ void adamw_apply_elem(
 }
 
 template <typename ParamT, typename GradT>
-__global__ void adamw_gfx942_kernel(
+SG_KERNEL_BOUNDS(256, 8) void adamw_gfx942_kernel(
     ParamT* __restrict__ param, float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq, const GradT* __restrict__ grad,
     float lr, float beta1, float beta2, float eps, float wd,

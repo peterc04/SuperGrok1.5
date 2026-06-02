@@ -77,9 +77,28 @@ from grokking_optimizers.dispatch import (
 # grokking_optimizers/compile.py for the ArchEntry dataclass and the table
 # itself. ARCH_INFO is a derived 6-key dict kept for backward compatibility
 # with older call sites that read e.g. ARCH_INFO[arch]["vendor"].
-from grokking_optimizers.compile import (
-    ARCH_TABLE, ARCH_INFO, ArchEntry, get_arch_entry,
-)
+#
+# These four symbols live in compile.py — a ~23k-LOC module whose parse cost
+# we do NOT want to pay on every ``import grokking_optimizers``. They are
+# resolved lazily via the module-level __getattr__ below (PEP 562), so the
+# import is deferred until ARCH_TABLE/ARCH_INFO/ArchEntry/get_arch_entry is
+# first accessed.
+_COMPILE_LAZY_EXPORTS = frozenset(
+    {"ARCH_TABLE", "ARCH_INFO", "ArchEntry", "get_arch_entry"})
+
+
+def __getattr__(name):
+    # PEP 562 module-level __getattr__: only invoked for names not found in the
+    # module's normal namespace, so it costs nothing until one of the lazy
+    # compile.py exports is actually accessed.
+    if name in _COMPILE_LAZY_EXPORTS:
+        import importlib
+        compile_mod = importlib.import_module("grokking_optimizers.compile")
+        value = getattr(compile_mod, name)
+        globals()[name] = value  # cache so __getattr__ isn't hit again
+        return value
+    raise AttributeError(
+        f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [

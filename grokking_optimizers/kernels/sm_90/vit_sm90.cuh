@@ -464,7 +464,131 @@ inline cudaError_t launch_linear_bias(
     }
     return launch_gemm_bias<ActT, WeightT>(in, W, b, out, M, N, K, stream);
 }
+
+// ─── backward GEMMs via the Sm90 collective (TMA + WGMMA) ───────────────
+// Two thin element-type dispatchers that pick the real-CUTLASS runner
+// (half/bf16) or the TF32 runner (float read as tfloat32_t) for the BT
+// (B-or-Bᵀ) and AT (Aᵀ·B) collective builders in mma.cuh. They keep the
+// dgrad/wgrad launchers below dtype-agnostic without re-deriving the element
+// mapping at every call. 🟡 float goes through TF32 (10-bit mantissa, FP32
+// accumulate) — the accepted FP32 tensor-core precision tradeoff, not a bug.
+template <typename T, typename LayoutBT>
+inline cudaError_t vit_run_gemm_bt(
+    int M, int N, int K, const T* A, const T* B, float* C, cudaStream_t stream)
+{
+    if constexpr (std::is_same<T, float>::value) {
+        return mma::sm90_run_gemm_tf32_bt<LayoutBT>(
+            M, N, K, reinterpret_cast<const float*>(A),
+            reinterpret_cast<const float*>(B), C, stream);
+    } else {
+        using Elem = typename cutlass_gemm_elem<T>::type;
+        return mma::sm90_run_gemm_bt<Elem, LayoutBT>(M, N, K, A, B, C, stream);
+    }
+}
+
+template <typename T>
+inline cudaError_t vit_run_gemm_atb(
+    int M, int N, int K, const T* A, const T* B, float* C, cudaStream_t stream)
+{
+    if constexpr (std::is_same<T, float>::value) {
+        // DOCUMENT-STOP: no TF32 A-transposed collective — CUTLASS fails a hard
+        // static_assert ("SmemLayoutB K must be 128bytes to be transposed") for
+        // ColumnMajor-A tfloat32_t (the RS warp-specialized transpose path; see
+        // mma.cuh). float wgrad therefore stays on the scalar fallback: signal
+        // not-supported so launch_gemm_grad_weight takes the scalar branch.
+        (void)M; (void)N; (void)K; (void)A; (void)B; (void)C; (void)stream;
+        return cudaErrorNotSupported;
+    } else {
+        using Elem = typename cutlass_gemm_elem<T>::type;
+        return mma::sm90_run_gemm_atb<Elem>(M, N, K, A, B, C, stream);
+    }
+}
+
+// dX[M,K] = dY[M,N] · W[N,K]  (dgrad). In GEMM terms this is C[M,K]=A·B with
+// A=dY[M,K_g=N] RowMajor and B=W physically [N,K] row-major = logical
+// [K_g=N, N_g=K] read RowMajor → sm90_run_gemm_bt<RowMajor>(M_g=M,N_g=K,K_g=N).
+// FP32 accumulate into scratch, then cast back into the ActT dX buffer.
+template <typename ActT>
+inline cudaError_t vit_dgrad_gemm(
+    const ActT* dY, const ActT* W, ActT* dX,
+    int M, int N, int K, cudaStream_t stream)
+{
+    float* c_fp32 = vit_gemm_fp32_scratch((size_t)M * K);
+    if (c_fp32 == nullptr) return cudaErrorMemoryAllocation;
+    cudaError_t err = vit_run_gemm_bt<ActT, cutlass::layout::RowMajor>(
+        M, K, N, dY, W, c_fp32, stream);
+    if (err != cudaSuccess) return err;
+    size_t n = (size_t)M * K;
+    int block = 256, grid = (int)((n + block - 1) / block);
+    gemm_cast_bias_kernel<ActT, ActT><<<grid, block, 0, stream>>>(
+        c_fp32, (const ActT*)nullptr, dX, M, K);
+    return cudaGetLastError();
+}
+
+// dW[N,K] = dYᵀ[N,M] · X[M,K]  (wgrad). In GEMM terms C[N,K]=Aᵀ·B with
+// A=dY physically [M,N] row-major read as Aᵀ of logical [M_g=N, K_g=M]
+// (ColumnMajor A) and B=X physically [M,K] row-major = logical [K_g=M, N_g=K]
+// RowMajor → sm90_run_gemm_atb(M_g=N, N_g=K, K_g=M). FP32 accumulate into
+// scratch, then cast back into the WeightT dW buffer. db is computed by the
+// parallel block-per-N reduction kernel (see launch_gemm_grad_weight).
+template <typename ActT>
+inline cudaError_t vit_wgrad_gemm(
+    const ActT* dY, const ActT* X, ActT* dW,
+    int M, int N, int K, cudaStream_t stream)
+{
+    float* c_fp32 = vit_gemm_fp32_scratch((size_t)N * K);
+    if (c_fp32 == nullptr) return cudaErrorMemoryAllocation;
+    cudaError_t err = vit_run_gemm_atb<ActT>(
+        N, K, M, dY, X, c_fp32, stream);
+    if (err != cudaSuccess) return err;
+    size_t n = (size_t)N * K;
+    int block = 256, grid = (int)((n + block - 1) / block);
+    gemm_cast_bias_kernel<ActT, ActT><<<grid, block, 0, stream>>>(
+        c_fp32, (const ActT*)nullptr, dW, N, K);
+    return cudaGetLastError();
+}
 #endif  // WITH_CUTLASS
+
+// Parallel bias-gradient reduction: db[n] = sum_m dY[m,n]. One block per N
+// column, block-stride loop over M with a shared-memory tree reduction.
+// Replaces the single-thread (k==0) db loop that previously serialized the
+// whole [M] reduction onto one thread per N.
+template <typename ActT, typename WeightT>
+__global__ void grad_bias_reduce_kernel(
+    const ActT* __restrict__ dY,   // [M, N]
+    WeightT* __restrict__ db,      // [N]
+    int M, int N
+) {
+    int n = blockIdx.x;
+    if (n >= N) return;
+    float acc = 0.0f;
+    for (int m = threadIdx.x; m < M; m += blockDim.x)
+        acc += to_f32(dY[(size_t)m * N + n]);
+    // block reduction (warp shuffle + shared tree)
+    for (int o = warpSize / 2; o > 0; o >>= 1)
+        acc += __shfl_down_sync(0xffffffffu, acc, o);
+    __shared__ float red[32];
+    int lane = threadIdx.x & (warpSize - 1);
+    int wid  = threadIdx.x / warpSize;
+    if (lane == 0) red[wid] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.0f;
+        int nwarp = (blockDim.x + warpSize - 1) / warpSize;
+        for (int w = 0; w < nwarp; w++) s += red[w];
+        db[n] = from_f32<WeightT>(s);
+    }
+}
+
+template <typename ActT, typename WeightT>
+inline cudaError_t launch_grad_bias_reduce(
+    const ActT* dY, WeightT* db, int M, int N, cudaStream_t stream)
+{
+    if (db == nullptr) return cudaSuccess;
+    int block = 256;
+    grad_bias_reduce_kernel<ActT, WeightT><<<N, block, 0, stream>>>(dY, db, M, N);
+    return cudaGetLastError();
+}
 
 // dX = dY · W   where Y[m,n] = sum_k W[n,k] X[m,k]; dX[m,k] = sum_n dY[m,n] W[n,k]
 template <typename ActT, typename WeightT>
@@ -490,6 +614,20 @@ inline cudaError_t launch_gemm_grad_input(
     const ActT* dY, const WeightT* W, ActT* dX,
     int M, int N, int K, cudaStream_t stream
 ) {
+#ifdef WITH_CUTLASS
+    // Sm90 collective dgrad (TMA + WGMMA) for half/bf16 AND fp32 (TF32 MMA),
+    // gated on ActT==WeightT (the collective uses a single element type). The
+    // scalar gemm_grad_input_kernel stays as the genuine last-resort fallback
+    // (a shape CUTLASS cannot tile → cudaErrorNotSupported). 🟡 float → TF32:
+    // not bit-identical to the scalar FP32 loop; the accepted FP32 tensor-core
+    // precision tradeoff (SG_FORCE_SCALAR_FP32 forces the scalar path).
+    if constexpr (cutlass_gemm_any_tc<ActT>::value &&
+                  std::is_same<ActT, WeightT>::value) {
+        cudaError_t err = vit_dgrad_gemm<ActT>(dY, W, dX, M, N, K, stream);
+        if (err == cudaSuccess) return cudaSuccess;
+        // else cudaErrorNotSupported → fall through to the scalar kernel.
+    }
+#endif
     int block = 128;
     if (K < 128) block = ((K + 31) / 32) * 32;
     if (block < 32) block = 32;
@@ -528,6 +666,25 @@ inline cudaError_t launch_gemm_grad_weight(
     const ActT* dY, const ActT* X, WeightT* dW, WeightT* db,
     int M, int N, int K, cudaStream_t stream
 ) {
+#ifdef WITH_CUTLASS
+    // Sm90 collective wgrad (Aᵀ·B, TMA + WGMMA) for half/bf16 AND fp32 (TF32),
+    // gated on ActT==WeightT. dW comes from the collective; db from the
+    // parallel block-per-N reduction (replacing the serialized k==0 loop). The
+    // scalar gemm_grad_weight_kernel (computes BOTH dW and db) stays as the
+    // genuine last-resort fallback on an untileable shape. 🟡 float → TF32:
+    // accepted FP32 tensor-core precision tradeoff (SG_FORCE_SCALAR_FP32 forces
+    // the scalar path).
+    if constexpr (cutlass_gemm_any_tc<ActT>::value &&
+                  std::is_same<ActT, WeightT>::value) {
+        cudaError_t err = vit_wgrad_gemm<ActT>(dY, X, dW, M, N, K, stream);
+        if (err == cudaSuccess) {
+            // db reduction runs in parallel with / after dW on the same stream.
+            return launch_grad_bias_reduce<ActT, WeightT>(dY, db, M, N, stream);
+        }
+        // else cudaErrorNotSupported → fall through to the scalar kernel below
+        // (which computes both dW and db, so db is handled there too).
+    }
+#endif
     int block = 128;
     int grid_x = (K + block - 1) / block;
     dim3 grid(grid_x, N);

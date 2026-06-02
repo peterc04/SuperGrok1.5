@@ -2541,7 +2541,7 @@ __device__ __forceinline__ float sg2_adam_apply_elem(
 }
 
 template <typename ParamT, typename GradT>
-__global__ void sg2_gfx942_adam_apply(
+SG_KERNEL_BOUNDS(256, 8) void sg2_gfx942_adam_apply(
     ParamT* __restrict__ param, float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq, const GradT* __restrict__ grad,
     float lr, float beta1, float beta2, float eps, float wd,
@@ -2553,10 +2553,14 @@ __global__ void sg2_gfx942_adam_apply(
     const int n4     = N & ~3;   // largest multiple of 4 <= N
 
     // Vectorized body: 4 contiguous floats / iter via f32x4 (128-bit access).
+    // NONTEMPORAL POLICY (matches adamw_gfx942): grad is read-once this step →
+    // streaming (nontemporal, L2-bypass); exp_avg / exp_avg_sq are recurring
+    // STATE (read+written every step, reused next step) → CACHED; param is read
+    // once then written once → cached load + streaming store.
     for (int base = gtid * 4; base < n4; base += stride * 4) {
-        f32x4 pv4 = amd_apply::streaming_load(reinterpret_cast<const f32x4*>(param + base));
-        f32x4 mv4 = amd_apply::streaming_load(reinterpret_cast<const f32x4*>(exp_avg + base));
-        f32x4 vv4 = amd_apply::streaming_load(reinterpret_cast<const f32x4*>(exp_avg_sq + base));
+        f32x4 pv4 = amd_apply::cached_load(reinterpret_cast<const f32x4*>(param + base));
+        f32x4 mv4 = amd_apply::cached_load(reinterpret_cast<const f32x4*>(exp_avg + base));
+        f32x4 vv4 = amd_apply::cached_load(reinterpret_cast<const f32x4*>(exp_avg_sq + base));
         f32x4 gv4 = amd_apply::streaming_load(reinterpret_cast<const f32x4*>(grad + base));
         f32x4 ov4;
         #pragma unroll
@@ -2567,8 +2571,8 @@ __global__ void sg2_gfx942_adam_apply(
             mv4[j] = mj;
             vv4[j] = vj;
         }
-        amd_apply::streaming_store(reinterpret_cast<f32x4*>(exp_avg + base), mv4);
-        amd_apply::streaming_store(reinterpret_cast<f32x4*>(exp_avg_sq + base), vv4);
+        amd_apply::cached_store(reinterpret_cast<f32x4*>(exp_avg + base), mv4);
+        amd_apply::cached_store(reinterpret_cast<f32x4*>(exp_avg_sq + base), vv4);
         amd_apply::streaming_store(reinterpret_cast<f32x4*>(param + base), ov4);
     }
 

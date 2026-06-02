@@ -23,6 +23,12 @@ int detect_arch();
 inline bool is_cuda_arch(int a) { return a == 90; }
 inline bool is_hip_arch(int a)  { return a == 942; }
 
+// ── Fused (model, optimizer, arch) megakernel dispatch (impl in
+//    dispatch.cpp). Declared here so bindings.cpp can bind &sg::fused_step.
+void fused_step(const std::string& model, const std::string& optimizer,
+                torch::Tensor params, torch::Tensor input,
+                torch::Tensor grad, torch::Tensor state, float lr);
+
 // ── Per-arch namespace handles ───────────────────────────────────────
 namespace sm90 {}
 namespace gfx942 {}
@@ -67,29 +73,48 @@ inline void clip_grad_norms_device_side(
 ) {
     if (grad_clip_norm <= 0.0f) return;
 
-    torch::Device dev(torch::kCPU);
+    // Collect the present grads once. Fused multi-tensor ops want a flat list.
+    std::vector<torch::Tensor> present;
+    present.reserve(n_params);
     for (size_t i = 0; i < n_params; i++) {
-        if (grads[i].defined() && grads[i].numel() > 0) {
-            dev = grads[i].device();
-            break;
-        }
+        if (grads[i].defined() && grads[i].numel() > 0)
+            present.push_back(grads[i]);
+    }
+    if (present.empty()) return;
+
+    // Per-tensor L2 norms via a single fused multi-tensor reduction
+    // (torch::_foreach_norm), replacing the per-tensor upcast + dot + add_
+    // (≈2N kernel launches) with one foreach launch. Numerics: the L2 norm of
+    // each tensor is accumulated into a fp32 sum-of-squares (squaring the
+    // per-tensor norm == that tensor's sum-of-squares), matching the original
+    // fp32 accumulation of the global sum-of-squares. To preserve the original
+    // precision when grads are NOT already fp32, upcast those (only) to fp32
+    // before the norm; fp32 grads skip the upcast entirely.
+    bool all_fp32 = true;
+    for (auto& g : present)
+        if (g.scalar_type() != torch::kFloat32) { all_fp32 = false; break; }
+
+    std::vector<torch::Tensor> norm_inputs;
+    if (all_fp32) {
+        norm_inputs = present;
+    } else {
+        norm_inputs.reserve(present.size());
+        for (auto& g : present)
+            norm_inputs.push_back(g.scalar_type() == torch::kFloat32
+                                      ? g
+                                      : g.to(torch::kFloat32));
     }
 
-    auto norm_sq = torch::zeros(
-        {1}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
-    for (size_t i = 0; i < n_params; i++) {
-        if (grads[i].defined() && grads[i].numel() > 0) {
-            auto g_flat = grads[i].to(torch::kFloat32).reshape(-1);
-            norm_sq.add_(g_flat.dot(g_flat));
-        }
-    }
-    float total_norm = std::sqrt(norm_sq.item<float>());
+    auto norms = torch::_foreach_norm(norm_inputs, /*p=*/2);
+    // norm_sq = sum_i (||g_i||_2)^2, accumulated in fp32 on-device, one sync.
+    auto stacked = torch::stack(norms).to(torch::kFloat32);
+    float total_norm =
+        std::sqrt(stacked.dot(stacked).item<float>());
+
     if (total_norm > grad_clip_norm) {
         float clip_coef = grad_clip_norm / (total_norm + 1e-6f);
-        for (size_t i = 0; i < n_params; i++) {
-            if (grads[i].defined() && grads[i].numel() > 0)
-                grads[i].mul_(clip_coef);
-        }
+        // Fused multi-tensor in-place scale of the present grads.
+        torch::_foreach_mul_(present, clip_coef);
     }
 }
 

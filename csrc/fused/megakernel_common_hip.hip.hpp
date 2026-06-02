@@ -213,11 +213,53 @@ struct GridBarrier {
                 atomic_add_agent_u32(g_generation, 1u);
             } else {
                 while (atomic_load_agent_u32(g_generation) == my_gen) {
-                    // busy-wait; AGENT-scope load each iter (no inner fence).
+                    // §1.14b BACKOFF: the AGENT-scope generation poll crosses
+                    // the Infinity-Fabric between XCDs every iteration; a tight
+                    // spin saturates the fabric and starves the laggard XCD's
+                    // arrival traffic. s_sleep parks the wavefront for a short
+                    // HW nap (the operand is a compile-time constant; CDNA3
+                    // sleeps ~64*N cycles) so the cross-XCD poll cadence drops.
+                    // Behavior-preserving: still exits the instant the
+                    // generation advances; only the poll rate changes.
+#if defined(__AMDGCN__) || defined(__HIP_DEVICE_COMPILE__)
+                    __builtin_amdgcn_s_sleep(2);
+#endif
                 }
             }
 
             // §1.14 ACQUIRE: see peers' released phase writes.
+            __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+        }
+
+        __builtin_amdgcn_s_barrier();
+    }
+
+    // #4 — barrier with a FUSED task-counter reset (AMD twin). The L3 phase loop
+    // used 4 grid barriers + 2 standalone counter resets; this folds the reset
+    // into the last-arriver critical section (cleared BEFORE the generation
+    // advance, so observers of the new gen see the counter == 0), cutting the L3
+    // step to 2 grid barriers with identical ordering/visibility. Pass
+    // ctx.g_next_task as `reset_counter`.
+    __device__ __forceinline__ void sync_reset(int* reset_counter) const {
+        __builtin_amdgcn_s_barrier();
+
+        if (threadIdx.x == 0) {
+            unsigned my_gen = atomic_load_agent_u32(g_generation);
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+            unsigned prev = atomic_add_agent_u32(g_arrived, 1u);
+            if (prev + 1u == n_groups) {
+                atomic_exch_agent_u32(g_arrived, 0u);
+                atomic_exch_agent_u32(
+                    reinterpret_cast<unsigned*>(reset_counter), 0u);
+                __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+                atomic_add_agent_u32(g_generation, 1u);
+            } else {
+                while (atomic_load_agent_u32(g_generation) == my_gen) {
+#if defined(__AMDGCN__) || defined(__HIP_DEVICE_COMPILE__)
+                    __builtin_amdgcn_s_sleep(2);
+#endif
+                }
+            }
             __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
         }
 

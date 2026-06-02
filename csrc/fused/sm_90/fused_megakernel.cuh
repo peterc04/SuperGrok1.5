@@ -55,29 +55,81 @@ static constexpr int kFusedBlockThreads = 256;
 //  the REAL apply_optimizer<Opt> elementwise over this SM's resident state
 //  slice (kept L2-warm via the %smid pin, §1.3).
 // =========================================================================
+// #6 — per-Opt pointer rebase via `if constexpr`. Rather than unconditionally
+// bumping all 8 optimizer-state pointers per task (8 predicated adds + the
+// chance the allocator keeps every field live), only the pointers the CHOSEN
+// optimizer actually dereferences are rebased to the tensor slice; the rest are
+// compiled out. `ts` starts as a copy of the const& `st` (the scalar
+// hyperparams must be present), but the dead-pointer rebases vanish, lowering
+// the local/register footprint of the tail.
+template <OptId Opt>
+__device__ __forceinline__ FusedOptState rebase_state(const FusedOptState& st,
+                                                       int off) {
+    FusedOptState ts = st;
+    if constexpr (Opt == OptId::AdamW || Opt == OptId::Lion ||
+                  Opt == OptId::Grokfast || Opt == OptId::GrokAdamW ||
+                  Opt == OptId::LookSAM || Opt == OptId::Prodigy ||
+                  Opt == OptId::NeuralGrok || Opt == OptId::SuperGrok11 ||
+                  Opt == OptId::SuperGrok15 || Opt == OptId::SuperGrok2) {
+        if (ts.exp_avg)    ts.exp_avg    += off;   // m (all Adam-family tails)
+    }
+    if constexpr (Opt != OptId::Lion && Opt != OptId::Muon) {
+        if (ts.exp_avg_sq) ts.exp_avg_sq += off;   // v (everyone but Lion/Muon)
+    }
+    if constexpr (Opt == OptId::Grokfast || Opt == OptId::GrokAdamW) {
+        if (ts.ema)        ts.ema        += off;
+    }
+    if constexpr (Opt == OptId::Prodigy) {
+        if (ts.s_track)    ts.s_track    += off;
+    }
+    if constexpr (Opt == OptId::SuperGrok11 || Opt == OptId::SuperGrok15) {
+        if (ts.mu)         ts.mu         += off;
+    }
+    if constexpr (Opt == OptId::LookSAM) {
+        if (ts.sam_dir)    ts.sam_dir    += off;
+    }
+    if constexpr (Opt == OptId::Muon) {
+        if (ts.orth)       ts.orth       += off;
+    }
+    if constexpr (Opt == OptId::SuperGrok2) {
+        if (ts.smart_grad) ts.smart_grad += off;
+    }
+    return ts;
+}
+
 template <OptId Opt>
 __device__ void fused_optimizer_stage(const PersistentContext& ctx,
                                        float* __restrict__ params,
                                        const float* __restrict__ grad,
                                        const int* sizes, const int* offsets,
-                                       int step, FusedOptState st) {
+                                       int step, const FusedOptState& st) {
     __shared__ int task_slot;
     TaskQueue q = ctx.queue();
     for (int t = q.next_block(&task_slot); t < ctx.n_tasks;
          t = q.next_block(&task_slot)) {
         const int n = sizes[t], off = offsets[t];
-        // Rebase this tensor's optimizer-state pointers to its slice.
-        FusedOptState ts = st;
-        if (ts.exp_avg)    ts.exp_avg    += off;
-        if (ts.exp_avg_sq) ts.exp_avg_sq += off;
-        if (ts.ema)        ts.ema        += off;
-        if (ts.s_track)    ts.s_track    += off;
-        if (ts.mu)         ts.mu         += off;
-        if (ts.sam_dir)    ts.sam_dir    += off;
-        if (ts.orth)       ts.orth       += off;
-        if (ts.smart_grad) ts.smart_grad += off;
-        for (int i = threadIdx.x; i < n; i += blockDim.x) {
-            apply_optimizer<Opt>(params + off, grad + off, i, step, ts);
+        // #6: rebase only the pointers Opt uses to this tensor's slice.
+        const FusedOptState ts = rebase_state<Opt>(st, off);
+        float* __restrict__ p = params + off;
+        const float* __restrict__ g = grad + off;
+        // #1 — float4 vectorization of the per-element tail. Each thread strides
+        // over groups of 4 CONSECUTIVE indices and calls the canonical per-
+        // element optimizer fn 4× on [4j .. 4j+3]; because the four indices are
+        // contiguous and the buffers are __restrict__, the loads/stores of
+        // params/grad/m/v coalesce into 128-bit float4 transactions. The
+        // canonical algorithm math (csrc/algorithms/<opt>.h via apply_optimizer)
+        // is CALLED, never re-inlined — only the loop's access pattern changes.
+        const int n4 = n >> 2;                  // # of full float4 groups
+        for (int j = threadIdx.x; j < n4; j += blockDim.x) {
+            const int base = j << 2;
+            apply_optimizer<Opt>(p, g, base + 0, step, ts);
+            apply_optimizer<Opt>(p, g, base + 1, step, ts);
+            apply_optimizer<Opt>(p, g, base + 2, step, ts);
+            apply_optimizer<Opt>(p, g, base + 3, step, ts);
+        }
+        // Scalar tail for the remainder (n not a multiple of 4).
+        for (int i = (n4 << 2) + (int)threadIdx.x; i < n; i += blockDim.x) {
+            apply_optimizer<Opt>(p, g, i, step, ts);
         }
     }
 }
@@ -121,15 +173,17 @@ fused_megakernel(PersistentContext ctx,
 
     if constexpr (Tier == FuseTier::L3) {
         // ── Phase 1: real model forward ──────────────────────────────────
+        // #4: the task-queue reset for the NEXT phase is folded into the grid
+        // barrier's last-arriver critical section (sync_reset), so the two
+        // standalone `*g_next_task = 0` resets and their two extra barriers are
+        // gone — 4 grid barriers → 2 per L3 step. The reset lands before the
+        // generation bump, so every CTA crossing into the backward phase sees a
+        // zeroed counter (same correctness as the old explicit reset).
         model_forward_stage<M>(ctx, params, input, acts, sizes, offsets);
-        bar.sync();
-        if (threadIdx.x == 0 && blockIdx.x == 0) *ctx.g_next_task = 0;
-        bar.sync();
+        bar.sync_reset(ctx.g_next_task);
         // ── Phase 2: real model backward ─────────────────────────────────
         model_backward_stage<M>(ctx, params, acts, grad, sizes, offsets);
-        bar.sync();
-        if (threadIdx.x == 0 && blockIdx.x == 0) *ctx.g_next_task = 0;
-        bar.sync();
+        bar.sync_reset(ctx.g_next_task);
     }
     // ── Phase 3 (L3) / sole phase (L1): real fused optimizer tail ─────────
     st.lr = lr;

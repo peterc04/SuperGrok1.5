@@ -348,7 +348,9 @@ __device__ __forceinline__ void muon_frobenius_block(
     }
 }
 
-extern "C" __global__ void muon_gfx942_frobenius_reduce(
+// Bandwidth-bound reduction → high occupancy (256-thread block = 4 wavefronts;
+// 8 waves/EU) to hide global-memory latency. (WS5 occupancy wire.)
+extern "C" SG_KERNEL_BOUNDS(256, 8) void muon_gfx942_frobenius_reduce(
     const float* __restrict__ m, float* __restrict__ acc, int n)
 {
     muon_frobenius_block(m, acc, n);
@@ -514,7 +516,11 @@ __device__ __forceinline__ int muon_ns_lds_bytes(int M, int N) {
 // Newton-Schulz orthogonalization kernel: one wavefront per 2-D parameter.
 // X_inout[M,N] is the 1/‖·‖_F-normalized momentum (host does the normalize); the
 // kernel applies `steps` Newton-Schulz iterations in place via the MFMA GEMMs.
-extern "C" __global__ void muon_gfx942_newton_schulz(
+// MFMA matrix-core kernel: launched single-wavefront (dim3(64)); the inner GEMM
+// loop is VGPR-heavy (f32 accumulators), so request a modest occupancy that does
+// NOT over-constrain the register allocator (flat WG = 64 = 1 wavefront, 4
+// waves/EU). (WS5 occupancy wire — replaces the bare __global__.)
+extern "C" SG_KERNEL_BOUNDS(64, 4) void muon_gfx942_newton_schulz(
     float* __restrict__ X_inout, int M, int N, int steps,
     float a, float b, float c)
 {
@@ -573,7 +579,7 @@ __device__ __forceinline__ void muon_apply_elem(
 }
 
 template <typename ParamT, typename OrthT>
-__global__ void muon_gfx942_apply_kernel(
+SG_KERNEL_BOUNDS(256, 8) void muon_gfx942_apply_kernel(
     ParamT* __restrict__ param, const OrthT* __restrict__ orth,
     float decay, float neg_lr_scale, int N)
 {

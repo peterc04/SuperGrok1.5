@@ -147,6 +147,30 @@ void launch_supergrok15_step(
         }
 #endif
 
+        // Sweep B: per-coord alpha gate + smart_grad + Adam apply.
+#if defined(__HIPCC__)
+        // LIVE device path: the §5.APPLY f32x4-vectorized kernel fuses
+        // a_per_coord=clamp(alpha_base*(1+mu),0,alpha_max), smart=g+gate*a*mu,
+        // the m/v EMAs, and the bias-corrected decoupled-WD apply into ONE launch
+        // (128-bit dwordx4 access). Dispatched exactly like sg11 (the apply was
+        // previously DEFINED but never launched — WS5/item 4). gate already folds
+        // the on-device sharpness mean (above). The `#else` keeps the ATen path.
+        {
+            auto gfc = g.to(torch::kFloat32).contiguous();
+            auto muc = mu.to(torch::kFloat32).contiguous();
+            int n = static_cast<int>(gfc.numel());
+            if (n > 0) {
+                hipStream_t stream = at::hip::getCurrentHIPStream();
+                dim3 grid(std::min(1024, (n + 255) / 256)), block(256);  // 4 waves/block
+                hipLaunchKernelGGL((native::supergrok15_gfx942_apply<float, float>),
+                                   grid, block, 0, stream,
+                                   p.data_ptr<float>(), m.data_ptr<float>(),
+                                   v.data_ptr<float>(), muc.data_ptr<float>(),
+                                   gfc.data_ptr<float>(), gate, alpha_base, alpha_max,
+                                   lr, beta1, beta2, eps, wd, bc1, bc2, n);
+            }
+        }
+#else
         // Per-coord alpha, then smart_grad
         auto a_per_coord = torch::clamp(alpha_base * (1.0f + mu), 0.0f, alpha_max);
         auto smart = g.to(torch::kFloat32) + gate * a_per_coord * mu;
@@ -154,6 +178,7 @@ void launch_supergrok15_step(
         prim::ema_update_inplace(m, smart, beta1);
         prim::ema_sq_update_inplace(v, smart, beta2);
         prim::adam_apply_inplace(p, m, v, lr, bc1, bc2, eps, wd);
+#endif
     }
 }
 
@@ -206,9 +231,11 @@ void launch_sharpness_restore(
 //   hipLaunchKernelGGL(native::supergrok15_gfx942_sharpness_reduce, grid, block,
 //                      0, stream, sh.data_ptr<float>(), acc.data_ptr<float>(), n);
 //   // host then: sharp_mean = acc/ n;  gate = gate_global / (1 + sharp_mean)
-// The per-element meta-net MLP + per-coord alpha gate + smart_grad + Adam apply
-// stay on the ATen host path (pure elementwise — no MFMA/DPP value). The §5
-// kernel is COMPILER-VERIFIED for gfx942 via scripts/amdgcn_check.sh.
+// The per-coord alpha gate + smart_grad + Adam apply is NOW DISPATCHED on hipcc
+// to the §5.APPLY f32x4 kernel (native::supergrok15_gfx942_apply<float,float>),
+// matching sg11 (WS5/item 4 — previously defined but never launched). The meta-
+// net MLP stays on the ATen host path (rocBLAS). The §5 kernels are
+// COMPILER-VERIFIED for gfx942 via scripts/amdgcn_check.sh.
 // 🟡 host-launch glue UNEXERCISED here (no hipcc / no MI300X in this CI); the
 //    live launch + hipcc link is hardware-gated — see HARDWARE_VALIDATION.md.
 #endif  // !defined(__AMDGCN__)  — end host orchestration (A)
@@ -307,7 +334,9 @@ __device__ __forceinline__ void supergrok15_sharpness_block(
     }
 }
 
-extern "C" __global__ void supergrok15_gfx942_sharpness_reduce(
+// Bandwidth-bound reduction → request high occupancy (256-thread block = 4
+// wavefronts; 8 waves/EU) to hide global-memory latency. (WS5 occupancy wire.)
+extern "C" SG_KERNEL_BOUNDS(256, 8) void supergrok15_gfx942_sharpness_reduce(
     const float* __restrict__ sharpness, float* __restrict__ acc, int n)
 {
     supergrok15_sharpness_block(sharpness, acc, n);
@@ -356,7 +385,7 @@ __device__ __forceinline__ float sg15_apply_elem(
 }
 
 template <typename ParamT, typename GradT>
-__global__ void supergrok15_gfx942_apply(
+SG_KERNEL_BOUNDS(256, 8) void supergrok15_gfx942_apply(
     ParamT* __restrict__ param, float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq, const float* __restrict__ mu,
     const GradT* __restrict__ grad, float gate, float alpha_base, float alpha_max,
@@ -369,10 +398,14 @@ __global__ void supergrok15_gfx942_apply(
     const int n4     = N & ~3;   // largest multiple of 4 <= N
 
     // Vectorized body: 4 contiguous floats / iter via f32x4 (128-bit access).
+    // NONTEMPORAL POLICY (matches adamw_gfx942): grad + mu are read-once this
+    // step → streaming (nontemporal, L2-bypass); exp_avg / exp_avg_sq are
+    // recurring STATE (read+written every step, reused next step) → CACHED;
+    // param is read once then written once → cached load + streaming store.
     for (int base = gtid * 4; base < n4; base += stride * 4) {
-        f32x4 pv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(param + base));
-        f32x4 mv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(exp_avg + base));
-        f32x4 vv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(exp_avg_sq + base));
+        f32x4 pv4 = amd::cached_load(reinterpret_cast<const f32x4*>(param + base));
+        f32x4 mv4 = amd::cached_load(reinterpret_cast<const f32x4*>(exp_avg + base));
+        f32x4 vv4 = amd::cached_load(reinterpret_cast<const f32x4*>(exp_avg_sq + base));
         f32x4 uv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(mu + base));
         f32x4 gv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(grad + base));
         f32x4 ov4;
@@ -385,8 +418,8 @@ __global__ void supergrok15_gfx942_apply(
             mv4[j] = mj;
             vv4[j] = vj;
         }
-        amd::streaming_store(reinterpret_cast<f32x4*>(exp_avg + base), mv4);
-        amd::streaming_store(reinterpret_cast<f32x4*>(exp_avg_sq + base), vv4);
+        amd::cached_store(reinterpret_cast<f32x4*>(exp_avg + base), mv4);
+        amd::cached_store(reinterpret_cast<f32x4*>(exp_avg_sq + base), vv4);
         amd::streaming_store(reinterpret_cast<f32x4*>(param + base), ov4);
     }
 

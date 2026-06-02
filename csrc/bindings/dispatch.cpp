@@ -17,11 +17,14 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 #if defined(WITH_CUDA) && !defined(WITH_HIP)
  #include <cuda_runtime.h>
+ #include <c10/cuda/CUDAStream.h>
 #elif defined(WITH_HIP)
  #include <hip/hip_runtime.h>
+ #include <c10/hip/HIPStream.h>
 #endif
 
 namespace sg {
@@ -60,14 +63,22 @@ int detect_arch_from_device() {
  throw std::runtime_error(
  std::string("cudaGetDevice failed: ") + cudaGetErrorString(err));
  }
- cudaDeviceProp prop;
- err = cudaGetDeviceProperties(&prop, dev);
+ // Query only the compute-capability attributes (cheap device-attribute
+ // reads) instead of the full cudaGetDeviceProperties struct copy.
+ int major = 0, minor = 0;
+ err = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
  if (err != cudaSuccess) {
  throw std::runtime_error(
- std::string("cudaGetDeviceProperties failed: ") +
+ std::string("cudaDeviceGetAttribute(ComputeCapabilityMajor) failed: ") +
  cudaGetErrorString(err));
  }
- int sm = prop.major * 10 + prop.minor;
+ err = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+ if (err != cudaSuccess) {
+ throw std::runtime_error(
+ std::string("cudaDeviceGetAttribute(ComputeCapabilityMinor) failed: ") +
+ cudaGetErrorString(err));
+ }
+ int sm = major * 10 + minor;
  // Any modern NVIDIA device routes to the sm90 impl; the driver loads the
  // matching per-SM SASS (or JITs from the embedded PTX) out of the fat binary.
  if (sm >= 70) return 90;
@@ -106,9 +117,16 @@ int detect_arch_from_device() {
 } // anonymous namespace
 
 int detect_arch() {
+ // The GPU arch (and FORCE_ARCH) cannot change mid-process, so resolve it
+ // exactly once. SG_DISPATCH invokes this up to n_params×ns_steps per step;
+ // memoizing turns the per-dispatch getenv + device query into a single
+ // C++11-guaranteed-thread-safe lazy init that subsequent calls read for free.
+ static const int cached_arch = [] {
  int env_arch = detect_arch_from_env();
  if (env_arch >= 0) return env_arch;
  return detect_arch_from_device();
+ }();
+ return cached_arch;
 }
 
 // =====================================================================
@@ -182,6 +200,54 @@ namespace {
 //     csrc/fused/fused_wired_cells.inc
 #include "csrc/fused/fused_wired_cells.inc"
 
+#if defined(WITH_CUDA) || defined(WITH_HIP)
+// Per-(device, n) reusable scratch for fused_step. The barrier counters and the
+// `acts` proxy were previously reallocated (and `acts` memset over the full
+// param size) on EVERY dispatch; sizes/offsets are constant for a given n.
+// We persist them keyed by (device_index, n) and only reset the mutable parts
+// (zero the 3 barrier counters + the acts buffer) per step. Behavior is
+// identical — same zero-initialized scratch handed to the launcher — but the
+// allocations/the full-size memset of sizes/offsets happen once per shape.
+struct FusedScratch {
+ torch::Tensor g_next;       // int32 [1]
+ torch::Tensor g_arrived;    // int32 [1] (reinterpreted as unsigned)
+ torch::Tensor g_generation; // int32 [1] (reinterpreted as unsigned)
+ torch::Tensor sizes;        // int32 [1] = n  (constant per n)
+ torch::Tensor offsets;      // int32 [1] = 0  (constant)
+ torch::Tensor acts;         // float [numel(params)] proxy buffer
+};
+
+// Keyed by (device_index, n). n disambiguates differing param shapes on the
+// same device; acts is sized to params.numel() (== n here, single flat tensor).
+inline FusedScratch& fused_scratch_for(const torch::Tensor& params, int n) {
+ static std::unordered_map<long long, FusedScratch> cache;
+ const long long dev_idx =
+ params.device().is_cuda() ? static_cast<long long>(params.device().index())
+ : -1LL;
+ const long long key = (dev_idx << 40) ^ static_cast<long long>(n);
+ auto it = cache.find(key);
+ if (it == cache.end()) {
+ auto opts_i =
+ torch::TensorOptions().device(params.device()).dtype(torch::kInt32);
+ FusedScratch s;
+ s.g_next = torch::zeros({1}, opts_i);
+ s.g_arrived = torch::zeros({1}, opts_i);
+ s.g_generation = torch::zeros({1}, opts_i);
+ s.sizes = torch::full({1}, n, opts_i); // constant for this n
+ s.offsets = torch::zeros({1}, opts_i); // constant
+ s.acts = torch::zeros_like(params);
+ it = cache.emplace(key, std::move(s)).first;
+ } else {
+ // Reset only the mutable scratch; sizes/offsets are invariant for this n.
+ it->second.g_next.zero_();
+ it->second.g_arrived.zero_();
+ it->second.g_generation.zero_();
+ it->second.acts.zero_();
+ }
+ return it->second;
+}
+#endif
+
 } // anonymous namespace
 
 void fused_step(const std::string& model, const std::string& optimizer,
@@ -209,45 +275,52 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // here; the host launcher pins one CTA per SM. `state` carries the
  // optimizer state slices (m, v) concatenated; sizes/offsets describe the
  // per-parameter-tensor layout (here the single flattened tensor).
- auto opts_i = torch::TensorOptions().device(params.device()).dtype(torch::kInt32);
- auto opts_u = torch::TensorOptions().device(params.device()).dtype(torch::kInt32);
- torch::Tensor g_next = torch::zeros({1}, opts_i);
- torch::Tensor g_arrived = torch::zeros({1}, opts_u);
- torch::Tensor g_generation = torch::zeros({1}, opts_u);
-
  const int n = static_cast<int>(params.numel());
- torch::Tensor sizes = torch::full({1}, n, opts_i);
- torch::Tensor offsets = torch::zeros({1}, opts_i);
+
+ // Reusable per-(device,n) scratch: counters/acts reset, sizes/offsets fixed.
+ FusedScratch& sc = fused_scratch_for(params, n);
 
  // acts proxy + the m/v halves of state.
- torch::Tensor acts = torch::zeros_like(params);
  auto p = params.data_ptr<float>();
  auto in = input.numel() ? input.data_ptr<float>() : p;
- auto gr = grad.numel() ? grad.data_ptr<float>() : acts.data_ptr<float>();
+ auto gr = grad.numel() ? grad.data_ptr<float>() : sc.acts.data_ptr<float>();
  // state holds [m | v | extra]; split it. `extra` is the per-optimizer third
  // per-element buffer (ema/sam_dir/s_track/mu/orth/smart_grad); each cell binds
- // it to its FusedOptState field (adamw/lion/neuralgrok ignore it). Sized 3n;
- // reallocated to zeros if the caller passed an undersized state tensor.
- torch::Tensor mv = state;
- if (mv.numel() < 3 * n) mv = torch::zeros({3 * n}, params.options());
- float* m = mv.data_ptr<float>();
+ // it to its FusedOptState field (adamw/lion/neuralgrok ignore it). Sized 3n.
+ // An undersized state tensor was previously silently replaced by a fresh
+ // zero buffer that was DISCARDED after the call (the optimizer state never
+ // persisted) and reallocated every step — a latent correctness bug plus a
+ // hot-path realloc. Surface it instead of silently corrupting state.
+ if (state.numel() < 3 * n) {
+ throw std::runtime_error(
+ "fused_step: state tensor for (" + model + ", " + optimizer +
+ ") has " + std::to_string(state.numel()) + " elements but needs at "
+ "least 3*n = " + std::to_string(3 * n) +
+ " (m|v|extra). Pass a persistent, correctly-sized state tensor.");
+ }
+ float* m = state.data_ptr<float>();
  float* v = m + n;
  float* extra = m + 2 * n;
 
  fused::sm90::PersistentContext ctx{
- g_next.data_ptr<int>(),
- reinterpret_cast<unsigned*>(g_arrived.data_ptr<int>()),
- reinterpret_cast<unsigned*>(g_generation.data_ptr<int>()),
+ sc.g_next.data_ptr<int>(),
+ reinterpret_cast<unsigned*>(sc.g_arrived.data_ptr<int>()),
+ reinterpret_cast<unsigned*>(sc.g_generation.data_ptr<int>()),
  n, 0u};
+
+ // Use the current CUDA stream so the megakernel orders against the rest of
+ // the model's work and is capturable in a CUDA graph (the legacy default
+ // stream 0 serialized against all work and blocked graph capture).
+ cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
 
  // Route to the real composed cell launcher (all 33 sm_90 cells). `found`
  // is set false only if no cell matches (then we fall through to the honest
  // not-compiled signal below).
  bool found = false;
  cudaError_t err = fused::sm90::dispatch_sm90_cell(
- model, optimizer, ctx, p, in, acts.data_ptr<float>(), gr, m, v, extra,
- sizes.data_ptr<int>(), offsets.data_ptr<int>(), lr, /*step=*/1,
- /*stream=*/0, &found);
+ model, optimizer, ctx, p, in, sc.acts.data_ptr<float>(), gr, m, v, extra,
+ sc.sizes.data_ptr<int>(), sc.offsets.data_ptr<int>(), lr, /*step=*/1,
+ stream, &found);
 
  if (found) {
  if (err != cudaSuccess)
@@ -262,30 +335,31 @@ void fused_step(const std::string& model, const std::string& optimizer,
 #if defined(WITH_HIP)
  if (arch == 942) {
  // gfx942 real composition route (hipcc/MI300X). Mirror of the sm_90 path.
- auto opts_i = torch::TensorOptions().device(params.device()).dtype(torch::kInt32);
- torch::Tensor g_next = torch::zeros({1}, opts_i);
- torch::Tensor g_arrived = torch::zeros({1}, opts_i);
- torch::Tensor g_generation = torch::zeros({1}, opts_i);
  const int n = static_cast<int>(params.numel());
- torch::Tensor sizes = torch::full({1}, n, opts_i);
- torch::Tensor offsets = torch::zeros({1}, opts_i);
- torch::Tensor acts = torch::zeros_like(params);
+ FusedScratch& sc = fused_scratch_for(params, n);
  auto p = params.data_ptr<float>();
  auto in = input.numel() ? input.data_ptr<float>() : p;
- auto gr = grad.numel() ? grad.data_ptr<float>() : acts.data_ptr<float>();
- torch::Tensor mv = state;
- if (mv.numel() < 3 * n) mv = torch::zeros({3 * n}, params.options());
- float* m = mv.data_ptr<float>();
+ auto gr = grad.numel() ? grad.data_ptr<float>() : sc.acts.data_ptr<float>();
+ if (state.numel() < 3 * n) {
+ throw std::runtime_error(
+ "fused_step: state tensor for (" + model + ", " + optimizer +
+ ") has " + std::to_string(state.numel()) + " elements but needs at "
+ "least 3*n = " + std::to_string(3 * n) +
+ " (m|v|extra). Pass a persistent, correctly-sized state tensor.");
+ }
+ float* m = state.data_ptr<float>();
  float* v = m + n; float* extra = m + 2 * n;
  fused::gfx942_mega::PersistentContext ctx{
- g_next.data_ptr<int>(),
- reinterpret_cast<unsigned*>(g_arrived.data_ptr<int>()),
- reinterpret_cast<unsigned*>(g_generation.data_ptr<int>()),
+ sc.g_next.data_ptr<int>(),
+ reinterpret_cast<unsigned*>(sc.g_arrived.data_ptr<int>()),
+ reinterpret_cast<unsigned*>(sc.g_generation.data_ptr<int>()),
  n, 0u};
+ // Current HIP stream for graph capture / proper ordering (was default 0).
+ hipStream_t stream = c10::hip::getCurrentHIPStream().stream();
  bool found = false;
  hipError_t herr = fused::gfx942_mega::dispatch_gfx942_cell(
- model, optimizer, ctx, p, in, acts.data_ptr<float>(), gr, m, v, extra,
- sizes.data_ptr<int>(), offsets.data_ptr<int>(), lr, 1, 0, &found);
+ model, optimizer, ctx, p, in, sc.acts.data_ptr<float>(), gr, m, v, extra,
+ sc.sizes.data_ptr<int>(), sc.offsets.data_ptr<int>(), lr, 1, stream, &found);
  if (found) {
  if (herr != hipSuccess)
  throw std::runtime_error(

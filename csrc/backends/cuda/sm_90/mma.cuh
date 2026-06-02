@@ -25,7 +25,6 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
-#include <mutex>
 
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
@@ -132,10 +131,16 @@ inline void* sm90_get_workspace(size_t bytes) {
 //  no leak. Only a handful of distinct (shape,ptr) signatures recur per run, so
 //  collisions are rare.
 //
-//  THREAD-SAFETY: one static cache per template instantiation, guarded by a
-//  std::mutex. The launcher is single-threaded per stream in this codebase, but
-//  the mutex makes concurrent host launchers safe and is off the hot path
-//  (host-side, microseconds, dwarfed by the kernel it replaces rebuilding).
+//  THREAD-SAFETY: the cache is `thread_local` (one instance per template
+//  instantiation PER HOST THREAD). The launcher is single-threaded per stream
+//  in this codebase, so each launching thread owns its own cache and no lock is
+//  needed — the former std::mutex has been dropped. A thread_local cache is also
+//  strictly correct for multi-thread launchers: each thread caches only the
+//  operators it itself built, so there is no cross-thread sharing to race on.
+//  (The cached device buffers / TMA descriptors are stream/context state, not
+//  thread state, but each thread re-builds+initializes its own operator on a
+//  miss, so correctness holds; the only cost of thread-local is that two threads
+//  launching the same shape each pay one build.)
 //
 //  ELECT/MBARRIER BOUNDARY (honest note):
 //  ----------------------------------------------------------------
@@ -195,11 +200,14 @@ struct Sm90GemmCache {
         size_t       ws_bytes = 0;
     };
 
-    Entry      slots[kSlots];
-    std::mutex mu;
+    Entry slots[kSlots];
 
     static Sm90GemmCache& instance() {
-        static Sm90GemmCache c;
+        // thread_local: each host thread owns its cache → no lock needed (the
+        // launcher is single-thread per stream). Keyed by {M,N,K,A,B,C} so a
+        // moved buffer changes the key → MISS → rebuild (no stale TMA descriptor
+        // ever launched against a relocated buffer — the load-bearing invariant).
+        static thread_local Sm90GemmCache c;
         return c;
     }
 };
@@ -227,7 +235,7 @@ inline cudaError_t sm90_run_gemm_cached(
     auto& cache = Sm90GemmCache<Gemm>::instance();
     int   slot  = sm90_gemm_slot<Gemm>(key);
 
-    std::lock_guard<std::mutex> guard(cache.mu);
+    // No lock: the cache is thread_local (single-thread per stream launcher).
     auto& e = cache.slots[slot];
 
     // HIT: identical (shape,ptr) signature → cached descriptors are valid.
@@ -296,6 +304,68 @@ inline cudaError_t sm90_run_gemm_cached(
     return cudaSuccess;
 }
 
+// Typed-output variant of sm90_run_gemm_cached: identical operator cache and
+// build/initialize/run logic, but the C operand is an ElementOut* buffer (the
+// collective's ElementC == ElementOut), so the result lands directly in the
+// activation dtype with NO FP32 scratch and NO separate cast kernel. Used by
+// the §5/§7 templated-output collectives. The cache is keyed identically
+// (the void* C in the key is the typed pointer reinterpret_cast to void*), and
+// each (Gemm, ElementOut) instantiation owns its own slot table, so a typed-
+// output operator is never confused with a float-output one.
+template <typename Gemm, typename ElementA, typename ElementB,
+          typename ElementAcc, typename ElementOut>
+inline cudaError_t sm90_run_gemm_cached_out(
+    int M, int N, int K,
+    const void* A, const void* B, ElementOut* C,
+    cudaStream_t stream)
+{
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+
+    GemmCacheKey key{M, N, K, A, B, reinterpret_cast<void*>(C)};
+    auto& cache = Sm90GemmCache<Gemm>::instance();
+    int   slot  = sm90_gemm_slot<Gemm>(key);
+    auto& e = cache.slots[slot];
+
+    if (e.valid && e.key == key) {
+        cutlass::Status st = e.op.run(stream);
+        return (st == cutlass::Status::kSuccess) ? cudaSuccess : cudaErrorUnknown;
+    }
+
+    StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+    StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    StrideC stride_c = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
+
+    typename Gemm::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {M, N, K, 1},
+        { reinterpret_cast<const ElementA*>(A), stride_a,
+          reinterpret_cast<const ElementB*>(B), stride_b },
+        { {ElementAcc(1.0f), ElementAcc(0.0f)},
+          C, stride_c, C, stride_c }
+    };
+
+    Gemm op;
+    cutlass::Status st = op.can_implement(args);
+    if (st != cutlass::Status::kSuccess) return cudaErrorNotSupported;
+
+    size_t ws_size = Gemm::get_workspace_size(args);
+    if (e.valid && e.ws) { cudaFree(e.ws); e.ws = nullptr; e.ws_bytes = 0; }
+
+    void* ws = nullptr;
+    if (ws_size > 0) {
+        if (cudaMalloc(&ws, ws_size) != cudaSuccess) { e.valid = false; return cudaErrorMemoryAllocation; }
+    }
+    st = op.initialize(args, ws, stream);
+    if (st != cutlass::Status::kSuccess) { if (ws) cudaFree(ws); e.valid = false; return cudaErrorUnknown; }
+    st = op.run(stream);
+    if (st != cutlass::Status::kSuccess) { if (ws) cudaFree(ws); e.valid = false; return cudaErrorUnknown; }
+
+    e.op = op; e.key = key; e.ws = ws; e.ws_bytes = ws_size; e.valid = true;
+    return cudaSuccess;
+}
+
 template <typename ElementInput>
 struct Sm90Gemm {
     using ElementA   = ElementInput;
@@ -311,6 +381,19 @@ struct Sm90Gemm {
     static constexpr int AlignB = 128 / cutlass::sizeof_bits<ElementB>::value;
     static constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementC>::value;
 
+    // §8 DOCUMENT-STOP — single 128x128x64 tile kept (no small-M variant):
+    //   A small-M tile (e.g. 64x128x64) was considered to better fit the small
+    //   M of several model GEMMs. It is NOT added because (a) the recurring
+    //   operator cache (sm90_run_gemm_cached) is keyed per-Gemm-INSTANTIATION,
+    //   so a second tile type would mean a second slot table + a runtime
+    //   M-threshold dispatch and a SECOND full kernel build per element type —
+    //   roughly doubling these already-heavy CUTLASS TUs' nvcc time/memory
+    //   (the build is near the documented OOM ceiling: heavy TUs must compile
+    //   serially), and (b) KernelScheduleAuto already picks a sensible
+    //   warp-specialized schedule for this tile across the M range in use, and
+    //   correctness is identical regardless of tile (FP32 accumulate). The
+    //   single proven 128x128x64 tile is therefore retained; revisit only with
+    //   measured per-shape occupancy data (no GPU here).
     using TileShape    = cute::Shape<cute::_128, cute::_128, cute::_64>;
     using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
 
@@ -327,6 +410,20 @@ struct Sm90Gemm {
         >::CollectiveOp;
 
     // Collective mainloop: Sm90 TMA + WGMMA, auto stage count / schedule.
+    //
+    // §7 DOCUMENT-STOP — KernelScheduleAuto kept (no KernelTmaWarpSpecialized-
+    //   Cooperative large-M path). The Cooperative schedule was attempted; it
+    //   composes correctly in isolation BUT delivering it as a large-M variant
+    //   requires: (1) a matching cooperative EPILOGUE schedule (TmaWarp-
+    //   SpecializedCooperative, not EpilogueScheduleAuto), (2) a 2-warpgroup-
+    //   friendly tile (the cooperative kernel splits the M tile across two
+    //   warpgroups — the proven 128x128x64 / 1x1x1 config is not its intended
+    //   shape), and (3) a SECOND full kernel instantiation per element type
+    //   behind a runtime M-threshold dispatch. That doubles the build cost on
+    //   TUs already compiled serially to dodge nvcc OOM, for an UNMEASURED
+    //   (no-GPU) win. KernelScheduleAuto already selects a warp-specialized
+    //   Hopper schedule and is correct (FP32 accumulate) across the M range.
+    //   Kept as the single, proven path; revisit with measured large-M data.
     using CollectiveMainloop =
         typename cutlass::gemm::collective::CollectiveBuilder<
             cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
@@ -454,6 +551,193 @@ inline cudaError_t sm90_run_gemm_bt(
     return sm90_run_gemm_cached<Gemm, ElementA, ElementB, ElementAcc>(
         M, N, K, A, B, C, stream);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+//  §5/§7 — Templated-OUTPUT Sm90 collective GEMM (TMA + WGMMA, FP32 accum)
+//
+//  Same builder as Sm90GemmBT but ElementC = ElementOut (the activation dtype:
+//  half/bf16, or float for the TF32 path). The collective epilogue casts the
+//  FP32 accumulator straight into the ElementOut C buffer, so a half/bf16 GEMM
+//  no longer needs an FP32 scratch buffer + a separate cast kernel — it writes
+//  the typed result directly. FP32 accumulate throughout (unchanged numerics
+//  vs the float-scratch-then-cast path; the cast happens in the epilogue
+//  instead of a follow-up kernel, with the same round-to-nearest).
+//
+//  This is an ADDITIVE capability: the existing float-output Sm90GemmBT /
+//  sm90_run_gemm_bt path is KEPT as the default so nothing breaks. Callers that
+//  want to skip the scratch+cast can opt into sm90_run_gemm_bt_out.
+//  Verified to compile for {half→half, bf16→bf16, tf32→float}.
+// ─────────────────────────────────────────────────────────────────────────
+template <typename ElementInput, typename ElementOut, typename LayoutBT>
+struct Sm90GemmBTOut {
+    using ElementA   = ElementInput;
+    using ElementB   = ElementInput;
+    using ElementC   = ElementOut;     // typed output (no FP32 scratch + cast)
+    using ElementAcc = float;          // FP32 accumulate
+    using LayoutA    = cutlass::layout::RowMajor;
+    using LayoutB    = LayoutBT;
+    using LayoutC    = cutlass::layout::RowMajor;
+
+    static constexpr int AlignA = 128 / cutlass::sizeof_bits<ElementA>::value;
+    static constexpr int AlignB = 128 / cutlass::sizeof_bits<ElementB>::value;
+    static constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementC>::value;
+
+    using TileShape    = cute::Shape<cute::_128, cute::_128, cute::_64>;
+    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+
+    using CollectiveEpilogue =
+        typename cutlass::epilogue::collective::CollectiveBuilder<
+            cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+            TileShape, ClusterShape,
+            cutlass::epilogue::collective::EpilogueTileAuto,
+            ElementAcc, ElementAcc,
+            ElementC, LayoutC, AlignC,
+            ElementC, LayoutC, AlignC,
+            cutlass::epilogue::collective::EpilogueScheduleAuto
+        >::CollectiveOp;
+
+    using CollectiveMainloop =
+        typename cutlass::gemm::collective::CollectiveBuilder<
+            cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+            ElementA, LayoutA, AlignA,
+            ElementB, LayoutB, AlignB,
+            ElementAcc,
+            TileShape, ClusterShape,
+            cutlass::gemm::collective::StageCountAutoCarveout<
+                static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+            cutlass::gemm::collective::KernelScheduleAuto
+        >::CollectiveOp;
+
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        cute::Shape<int, int, int, int>,
+        CollectiveMainloop,
+        CollectiveEpilogue>;
+
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
+
+// Run C[MxN] (ElementOut) = A[MxK] · op(B), FP32 accumulate, typed output.
+// op(B) is B (LayoutBT=RowMajor) or Bᵀ (LayoutBT=ColumnMajor). Writes directly
+// into the ElementOut buffer — no FP32 scratch, no separate cast kernel.
+template <typename ElementInput, typename ElementOut, typename LayoutBT>
+inline cudaError_t sm90_run_gemm_bt_out(
+    int M, int N, int K,
+    const void* A, const void* B, ElementOut* C,
+    cudaStream_t stream)
+{
+    using G          = Sm90GemmBTOut<ElementInput, ElementOut, LayoutBT>;
+    using Gemm       = typename G::Gemm;
+    using ElementA   = typename G::ElementA;
+    using ElementB   = typename G::ElementB;
+    using ElementAcc = typename G::ElementAcc;
+    return sm90_run_gemm_cached_out<Gemm, ElementA, ElementB, ElementAcc, ElementOut>(
+        M, N, K, A, B, C, stream);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  A-transposed Sm90 collective GEMM (TMA + WGMMA, FP32 accumulate)
+//
+//  C[MxN] = op(A) · B with op(A)=Aᵀ. The B operand is RowMajor [K,N]; the A
+//  operand is ColumnMajor over the logical (M,K) extents — i.e. it reads a
+//  physical row-major [K,M] buffer as Aᵀ (mirror of Sm90GemmBT's ColumnMajor-B
+//  Bᵀ trick, but applied to the A operand). C is RowMajor [M,N], FP32 acc/out.
+//
+//  Used by the ViT wgrad: dW[N,K] = Σ_m dY[m,n] X[m,k]. In GEMM terms
+//  (M_g=N, N_g=K, K_g=M): A=dY is physically [M,N] row-major and must be read
+//  as Aᵀ of logical [M_g=N, K_g=M] → ColumnMajor A; B=X is physically [M,K]
+//  row-major = logical [K_g=M, N_g=K] → RowMajor B. Sm90GemmBT can't express
+//  this (its A is fixed RowMajor), hence this dedicated A-transposed builder.
+//  The shape-keyed operator cache (sm90_run_gemm_cached) is fully generic over
+//  the layouts (StrideA/B/C are derived from the Gemm type), so it serves this
+//  builder unchanged — its per-instantiation slot table keeps the
+//  ColumnMajor-A descriptors separate from the RowMajor-A ones.
+// ─────────────────────────────────────────────────────────────────────────
+template <typename ElementInput>
+struct Sm90GemmAT {
+    using ElementA   = ElementInput;
+    using ElementB   = ElementInput;
+    using ElementC   = float;          // FP32 output (matches cuBLAS/scalar path)
+    using ElementAcc = float;          // FP32 accumulate
+    using LayoutA    = cutlass::layout::ColumnMajor;   // reads physical [K,M] as Aᵀ
+    using LayoutB    = cutlass::layout::RowMajor;
+    using LayoutC    = cutlass::layout::RowMajor;
+
+    static constexpr int AlignA = 128 / cutlass::sizeof_bits<ElementA>::value;
+    static constexpr int AlignB = 128 / cutlass::sizeof_bits<ElementB>::value;
+    static constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementC>::value;
+
+    using TileShape    = cute::Shape<cute::_128, cute::_128, cute::_64>;
+    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+
+    using CollectiveEpilogue =
+        typename cutlass::epilogue::collective::CollectiveBuilder<
+            cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+            TileShape, ClusterShape,
+            cutlass::epilogue::collective::EpilogueTileAuto,
+            ElementAcc, ElementAcc,
+            ElementC, LayoutC, AlignC,
+            ElementC, LayoutC, AlignC,
+            cutlass::epilogue::collective::EpilogueScheduleAuto
+        >::CollectiveOp;
+
+    using CollectiveMainloop =
+        typename cutlass::gemm::collective::CollectiveBuilder<
+            cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+            ElementA, LayoutA, AlignA,
+            ElementB, LayoutB, AlignB,
+            ElementAcc,
+            TileShape, ClusterShape,
+            cutlass::gemm::collective::StageCountAutoCarveout<
+                static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+            cutlass::gemm::collective::KernelScheduleAuto
+        >::CollectiveOp;
+
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        cute::Shape<int, int, int, int>,
+        CollectiveMainloop,
+        CollectiveEpilogue>;
+
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
+
+// Run a single C[MxN] = Aᵀ · B[KxN] with FP32 accumulate on the Sm90
+// collective. A is the physical row-major [K,M] buffer read as Aᵀ.
+template <typename ElementInput>
+inline cudaError_t sm90_run_gemm_atb(
+    int M, int N, int K,
+    const void* A, const void* B, float* C,
+    cudaStream_t stream)
+{
+    using G          = Sm90GemmAT<ElementInput>;
+    using Gemm       = typename G::Gemm;
+    using ElementA   = typename G::ElementA;
+    using ElementB   = typename G::ElementB;
+    using ElementAcc = typename G::ElementAcc;
+    return sm90_run_gemm_cached<Gemm, ElementA, ElementB, ElementAcc>(
+        M, N, K, A, B, C, stream);
+}
+
+// ── DOCUMENT-STOP: no TF32 (float) A-transposed collective ───────────────
+//  A `sm90_run_gemm_tf32_atb` (Sm90GemmAT<tfloat32_t>) was attempted and
+//  REVERTED because CUTLASS 3.x fails a HARD static_assert for it:
+//
+//    sm90_mma_tma_gmma_rs_warpspecialized.hpp(193):
+//      static assertion failed "SmemLayoutB K must be 128bytes to be transposed."
+//
+//  WHY: a ColumnMajor A operand routes Hopper through the RS (register-source)
+//  warp-specialized mainloop, whose transposed-operand SMEM layout requires the
+//  K tile to be 128 bytes wide. For tfloat32_t (4 B) with this 128x128x64 tile
+//  that constraint is not satisfied, and there is no Auto schedule that relaxes
+//  it for the TF32 RS path. (The half/bf16 AT path — Sm90GemmAT<half_t/
+//  bfloat16_t> — DOES satisfy it and compiles, so sm90_run_gemm_atb<> above is
+//  provided and live for those element types.)
+//
+//  CONSEQUENCE: the ViT wgrad (dW = dYᵀ·X, an inherently A-transposed GEMM —
+//  the contraction index m is the leading/row dim of both row-major operands,
+//  so one MUST be transposed and CUTLASS only supports the transposed operand
+//  on B for TF32) uses the CUTLASS AT collective for half/bf16 and KEEPS the
+//  scalar gemm_grad_weight_kernel fallback for float. `vit_run_gemm_atb<float>`
+//  (vit_sm90.cuh) therefore returns cudaErrorNotSupported → scalar path.
 
 // FP16 in / FP32 acc / FP32 out, row-major A * row-major B, row-major C.
 // Sm90 collective (TMA+WGMMA), FP32 accumulate — replaces the old Gemm<>

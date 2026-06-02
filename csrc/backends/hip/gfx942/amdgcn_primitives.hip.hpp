@@ -46,6 +46,43 @@ namespace sg { namespace gfx942 { namespace amdgcn {
 static constexpr int kWave = 64;
 
 // ─────────────────────────────────────────────────────────────────────────
+// Occupancy attributes (WS5 — wire the dead `waves_per_eu` metadata into a
+// REAL codegen attribute). `amdgpu_flat_work_group_size(lo,hi)` bounds the
+// flat (1-D) block size the compiler must support, and `amdgpu_waves_per_eu(N)`
+// asks the register allocator to leave room for N wavefronts per execution
+// unit. Bandwidth-bound elementwise applies/reduces want HIGH occupancy to
+// hide global-memory latency, so they request a generous waves_per_eu. CDNA3
+// has 4 SIMDs × up to 8 (architectural) waves/SIMD per CU; the per-EU figure
+// here is the per-SIMD slot count the allocator should target.
+//
+// These attributes must sit on the __global__ kernel DEFINITION. The bare gate
+// (scripts/amdgcn_check.sh) and real hipcc both honor them (clang AMDGPU
+// backend). Usage:
+//   __global__ SG_LAUNCH_BOUNDS(256, 8) void my_kernel(...) { ... }
+// 256 = our standard block (4 wavefronts), 8 waves/EU for bandwidth kernels.
+// ─────────────────────────────────────────────────────────────────────────
+// SG_KERNEL_BOUNDS(FLAT_WG, WAVES_PER_EU) is the kernel-declaration PREFIX
+// (replaces a bare `__global__`): it both marks the function as an AMDGPU
+// kernel AND attaches the occupancy bounds. Two lowerings:
+//   * real hipcc  → `__global__ __launch_bounds__(FLAT_WG, WAVES_PER_EU)`,
+//     the canonical HIP spelling (maxThreadsPerBlock, minWavesPerEU);
+//   * bare gate (plain-C++ amdgcn target, scripts/amdgcn_check.sh) → a single
+//     C++11 attribute list, because there the GNU `amdgpu_kernel` attribute is
+//     not elevated to kernel-function status early enough for the verifier to
+//     accept `amdgpu_flat_work_group_size` (clang-verified: the `[[...]]` form
+//     with `clang::amdgpu_kernel` IS accepted, the trailing/GNU forms are not).
+// Usage:  SG_KERNEL_BOUNDS(256, 8) void my_kernel(...) { ... }
+#if defined(__HIPCC__)
+#  define SG_KERNEL_BOUNDS(FLAT_WG, WAVES_PER_EU) \
+       __global__ __launch_bounds__((FLAT_WG), (WAVES_PER_EU))
+#else
+#  define SG_KERNEL_BOUNDS(FLAT_WG, WAVES_PER_EU) \
+       [[clang::amdgpu_kernel, \
+         gnu::amdgpu_flat_work_group_size(1, FLAT_WG), \
+         gnu::amdgpu_waves_per_eu(WAVES_PER_EU)]]
+#endif
+
+// ─────────────────────────────────────────────────────────────────────────
 // §2.4  MFMA matrix-core wrappers (bf16 inputs, f32 accumulate).
 //
 // The two CDNA3 bf16 matrix shapes used across the models / SG2 GEMMs. Source
@@ -170,6 +207,27 @@ template <typename T>
 __device__ __forceinline__ void streaming_store(T* __restrict__ p, T v) {
     __builtin_nontemporal_store(v, p);
 }
+
+// ── CACHED (temporal) load/store ────────────────────────────────────────────
+// NONTEMPORAL POLICY (WS5/§2.7). `streaming_load`/`streaming_store` are
+// nontemporal: they bypass / evict L2 (the CDNA `glc/slc` hint), which is
+// CORRECT for one-touch data — a grad read once per step, a param written once
+// per step. They are WRONG for recurring optimizer STATE (exp_avg, exp_avg_sq,
+// ema, s_track, mu, momentum): that data is read AND written every step and
+// re-read on the very next step, so it should stay resident in L2. Using the
+// nontemporal hint on state forces a cold reload every step (lost L2 locality).
+// `cached_load`/`cached_store` are plain temporal accesses — the compiler keeps
+// the normal L2 caching behavior. State buffers MUST use these; grad/param
+// (one-touch) keep the streaming_* variants. (adamw_gfx942 is the exemplar:
+// state via plain `[]` = cached, grad/param via streaming_*.)
+template <typename T>
+__device__ __forceinline__ T cached_load(const T* __restrict__ p) {
+    return *p;
+}
+template <typename T>
+__device__ __forceinline__ void cached_store(T* __restrict__ p, T v) {
+    *p = v;
+}
 // Wait for all outstanding vector-memory loads (vmcnt(0)).
 __device__ __forceinline__ void wait_vmcnt0() {
     __builtin_amdgcn_s_waitcnt(/*vmcnt=*/0);
@@ -220,6 +278,36 @@ __device__ __forceinline__ void atomic_add_agent_f32(float* addr, float v) {
 __device__ __forceinline__ void atomic_add_agent_u32(unsigned* addr, unsigned v) {
     __hip_atomic_fetch_add(addr, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
+
+// ── WORKGROUP / WAVEFRONT-scope atomics ─────────────────────────────────────
+// AGENT scope publishes across all 8 XCDs (device-wide coherence) — necessary
+// for cross-workgroup accumulators but the most expensive scope. When the
+// accumulation target is an LDS / workgroup-private slot (the standard
+// "DPP wave-reduce → ONE atomic per workgroup" pattern), a WORKGROUP-scope
+// atomic is sufficient and far cheaper (no cross-XCD probe traffic). A
+// WAVEFRONT-scope atomic narrows further to a single wavefront. The reduction
+// kernels should DPP-reduce within the wave first, then issue ONE workgroup
+// (or agent, when the accumulator is a global buffer shared across workgroups)
+// atomic — never one atomic per element/thread. (The MoE compaction filter
+// already follows this; matched here.)
+__device__ __forceinline__ void atomic_add_workgroup_f32(float* addr, float v) {
+    __hip_atomic_fetch_add(addr, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+}
+__device__ __forceinline__ void atomic_add_workgroup_u32(unsigned* addr, unsigned v) {
+    __hip_atomic_fetch_add(addr, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+}
+#if defined(__HIP_MEMORY_SCOPE_WAVEFRONT)
+__device__ __forceinline__ void atomic_add_wavefront_f32(float* addr, float v) {
+    __hip_atomic_fetch_add(addr, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WAVEFRONT);
+}
+#else
+// The free-standing gate (scripts/amdgcn_check.sh) only defines the AGENT /
+// WORKGROUP scope macros; fall back to workgroup scope there. Under real hipcc
+// __HIP_MEMORY_SCOPE_WAVEFRONT is defined and the narrower scope is used.
+__device__ __forceinline__ void atomic_add_wavefront_f32(float* addr, float v) {
+    __hip_atomic_fetch_add(addr, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+}
+#endif
 
 // Workgroup barrier + release/acquire fence (the LDS-handoff pattern used by
 // the mamba3 reference scan).

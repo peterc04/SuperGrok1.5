@@ -461,7 +461,8 @@ extern "C" __global__ void decoder_gfx942_attention(
     attention_head(Q + off, K + off, V + off, O + off, smem, S, d_head, scale);
 }
 
-extern "C" __global__ void decoder_gfx942_gelu(
+// Elementwise GELU (grid-stride, bandwidth-bound) → high occupancy. (WS5)
+extern "C" SG_KERNEL_BOUNDS(256, 8) void decoder_gfx942_gelu(
     const short* __restrict__ x, short* __restrict__ y, int n)
 {
     for (int idx = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
@@ -471,7 +472,8 @@ extern "C" __global__ void decoder_gfx942_gelu(
         y[idx] = f32_to_bf16(gelu_tanh(bf16_to_f32(amd::streaming_load(&x[idx]))));
 }
 
-extern "C" __global__ void decoder_gfx942_residual_add(
+// Elementwise residual add (grid-stride, bandwidth-bound) → high occupancy. (WS5)
+extern "C" SG_KERNEL_BOUNDS(256, 8) void decoder_gfx942_residual_add(
     const float* __restrict__ a, const short* __restrict__ b,
     short* __restrict__ y, int n)
 {
