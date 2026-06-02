@@ -242,10 +242,14 @@ if _HAS_PALLAS:
                 grid=(num_blocks,),
                 in_specs=[
                     pl.BlockSpec(flat_weights.shape, lambda i: (0, 0)),
-                    pl.BlockSpec((TILE, top_k), lambda i: (i * TILE, 0)),
+                    # BlockSpec index_map returns BLOCK indices (block i covers
+                    # rows [i*TILE:(i+1)*TILE]), so the map must be ``i`` — not
+                    # the element offset ``i*TILE`` which over-runs the grid
+                    # (tiles >=2 read out-of-bounds -> silently wrong / NaN).
+                    pl.BlockSpec((TILE, top_k), lambda i: (i, 0)),
                 ],
                 out_specs=[
-                    pl.BlockSpec((TILE, top_k, D), lambda i: (i * TILE, 0, 0)),
+                    pl.BlockSpec((TILE, top_k, D), lambda i: (i, 0, 0)),
                 ],
             )(flat_weights, expert_indices)
 
@@ -424,15 +428,19 @@ if _HAS_PALLAS:
                 ],
                 grid=(N // TILE,),
                 in_specs=[
-                    pl.BlockSpec((TILE,), lambda i: (i * TILE,)),
-                    pl.BlockSpec((TILE,), lambda i: (i * TILE,)),
-                    pl.BlockSpec((TILE, d_model), lambda i: (i * TILE, 0)),
-                    pl.BlockSpec((TILE, d_model), lambda i: (i * TILE, 0)),
-                    pl.BlockSpec((TILE, gru_hidden), lambda i: (i * TILE, 0)),
+                    # BlockSpec index_map returns BLOCK indices (block i covers
+                    # rows [i*TILE:(i+1)*TILE]), so the map must be ``i`` — not
+                    # the element offset ``i*TILE`` which over-runs the grid
+                    # (tiles >=2 read out-of-bounds -> silently wrong / NaN).
+                    pl.BlockSpec((TILE,), lambda i: (i,)),
+                    pl.BlockSpec((TILE,), lambda i: (i,)),
+                    pl.BlockSpec((TILE, d_model), lambda i: (i, 0)),
+                    pl.BlockSpec((TILE, d_model), lambda i: (i, 0)),
+                    pl.BlockSpec((TILE, gru_hidden), lambda i: (i, 0)),
                 ],
                 out_specs=[
-                    pl.BlockSpec((TILE,), lambda i: (i * TILE,)),
-                    pl.BlockSpec((TILE, gru_hidden), lambda i: (i * TILE, 0)),
+                    pl.BlockSpec((TILE,), lambda i: (i,)),
+                    pl.BlockSpec((TILE, gru_hidden), lambda i: (i, 0)),
                 ],
             )(grad, sharpness, fwd_ctx, bwd_ctx, gru_state)
 
@@ -804,8 +812,12 @@ def vmem_persistent_expert_mlp(
                 ],
                 grid=(num_blocks,),
                 in_specs=[
-                    pl.BlockSpec((TILE, d_model), lambda i: (i * TILE, 0)),
-                    pl.BlockSpec((TILE, top_k), lambda i: (i * TILE, 0)),
+                    # BlockSpec index_map returns BLOCK indices (block i covers
+                    # rows [i*TILE:(i+1)*TILE]), so the map must be ``i`` — not
+                    # the element offset ``i*TILE`` which over-runs the grid
+                    # (tiles >=2 read out-of-bounds -> silently wrong / NaN).
+                    pl.BlockSpec((TILE, d_model), lambda i: (i, 0)),
+                    pl.BlockSpec((TILE, top_k), lambda i: (i, 0)),
                     # Expert weight tables — full arrays, no tiling
                     pl.BlockSpec((num_experts, expert_hidden, d_model), lambda i: (0, 0, 0)),
                     pl.BlockSpec((num_experts, expert_hidden), lambda i: (0, 0)),
@@ -813,7 +825,7 @@ def vmem_persistent_expert_mlp(
                     pl.BlockSpec((num_experts, d_model), lambda i: (0, 0)),
                 ],
                 out_specs=[
-                    pl.BlockSpec((TILE, d_model), lambda i: (i * TILE, 0)),
+                    pl.BlockSpec((TILE, d_model), lambda i: (i, 0)),
                 ],
             )(x, expert_indices, expert_W1, expert_b1, expert_W2, expert_b2)
             return y
