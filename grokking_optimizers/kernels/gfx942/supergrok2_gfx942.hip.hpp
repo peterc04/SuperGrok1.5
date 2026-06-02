@@ -302,10 +302,19 @@ static torch::Tensor csa_hca_attention(
     const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
     const double sqrt_d = std::sqrt(static_cast<double>(d));
 
+    // Upcast weight matrices to float32 for ATen mm (rocBLAS handles bf16
+    // internally for the MFMA path; the device path packs via sg2_pack_bf16).
+    // This is the bandwidth-saving boundary: bf16 weights are loaded once and
+    // upcast here rather than storing a redundant fp32 copy.
+    auto q_Wf  = q_W.to(torch::kFloat32);
+    auto k_Wf  = k_W.to(torch::kFloat32);
+    auto v_Wf  = v_W.to(torch::kFloat32);
+    auto out_Wf = out_W.to(torch::kFloat32);
+
     // Per-token projections (nn.Linear: x @ W.t()).
-    auto q     = torch::mm(x, q_W.t());   // [N, d]
-    auto k_tok = torch::mm(x, k_W.t());   // [N, d]
-    auto v_tok = torch::mm(x, v_W.t());   // [N, d]
+    auto q     = torch::mm(x, q_Wf.t());   // [N, d]
+    auto k_tok = torch::mm(x, k_Wf.t());   // [N, d]
+    auto v_tok = torch::mm(x, v_Wf.t());   // [N, d]
 
     if (mode_csa) {
         const int64_t stride = csa_compress;
@@ -328,8 +337,9 @@ static torch::Tensor csa_hca_attention(
         auto c_v = (v_tok.index({gather_c}) * w_eff.unsqueeze(-1)).sum(/*dim=*/1);  // [Nc, d]
 
         // ── Lightning indexer top-k selection ──
-        auto qI     = torch::mm(torch::mm(x, idx_DQ), idx_UQ);        // [N, d]
-        auto kI_tok = torch::mm(torch::mm(x, idx_K), idx_UQ);         // [N, d]
+        // Upcast indexer matrices to float32 for ATen mm compatibility.
+        auto qI     = torch::mm(torch::mm(x, idx_DQ.to(torch::kFloat32)), idx_UQ.to(torch::kFloat32));  // [N, d]
+        auto kI_tok = torch::mm(torch::mm(x, idx_K.to(torch::kFloat32)), idx_UQ.to(torch::kFloat32));   // [N, d]
         auto c_kI   = (kI_tok.index({gather_c}) * w_eff.unsqueeze(-1)).sum(/*dim=*/1);  // [Nc, d]
         auto idx_scores = torch::mm(qI, c_kI.t()) / sqrt_d;           // [N, Nc]
         const int64_t topk = std::min<int64_t>(csa_topk, nc);
@@ -366,7 +376,7 @@ static torch::Tensor csa_hca_attention(
         auto ctx_h = torch::einsum("nhk,nkhd->nhd", {attn_c, sel_vh})
                    + torch::einsum("nhw,nwhd->nhd", {attn_w, win_v});            // [N,H,hd]
         auto ctx = ctx_h.reshape({N, d});
-        return torch::mm(ctx, out_W.t());                                        // [N, d]
+        return torch::mm(ctx, out_Wf.t());                                       // [N, d]
     } else {
         // ── HCA: stride-128 mean pool, dense attention over all entries ──
         const int64_t stride = hca_compress;
@@ -416,7 +426,7 @@ static torch::Tensor csa_hca_attention(
         auto ctx_h = torch::einsum("hnm,hmd->hnd", {attn_c, c_vh})
                    + torch::einsum("hnw,hnwd->hnd", {attn_w, win_vh});          // [H, N, hd]
         auto ctx = ctx_h.permute({1, 0, 2}).reshape({N, d});
-        return torch::mm(ctx, out_W.t());                                        // [N, d]
+        return torch::mm(ctx, out_Wf.t());                                       // [N, d]
     }
 }
 
@@ -451,11 +461,12 @@ static torch::Tensor csa_hca_attention_device(
     if (N == 0) return torch::zeros({0, d}, opts_f32);
     const auto head_dim = d / num_heads;
     const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
-    const double sqrt_d = std::sqrt(static_cast<double>(d));
 
-    auto q     = torch::mm(x, q_W.t());   // [N, d]
-    auto k_tok = torch::mm(x, k_W.t());
-    auto v_tok = torch::mm(x, v_W.t());
+    // Upcast projection weights to float32 for ATen mm; bf16 activations reach
+    // the MFMA kernels via sg2_pack_bf16 on the intermediate activation path.
+    auto q     = torch::mm(x, q_W.to(torch::kFloat32).t());   // [N, d]
+    auto k_tok = torch::mm(x, k_W.to(torch::kFloat32).t());
+    auto v_tok = torch::mm(x, v_W.to(torch::kFloat32).t());
 
     hipStream_t stream = at::hip::getCurrentHIPStream();
 
@@ -525,7 +536,7 @@ static torch::Tensor csa_hca_attention_device(
         }
     }
     auto ctx = ctx_heads.reshape({N, d});
-    return torch::mm(ctx, out_W.t());
+    return torch::mm(ctx, out_W.to(torch::kFloat32).t());
 }
 #endif  // __HIPCC__
 
@@ -729,8 +740,12 @@ static void sg2_step_one_param(
     auto s_sorted = s_flat.index_select(0, sort_idx);
 
     // (2) input projection: [g, s] (rescaled) → x_proj [N, d_model]
+    // Upcast projection weights to float32 for ATen addmm (bf16 pass-through
+    // on the MFMA device path happens via sg2_pack_bf16 in the launcher).
     auto inp = torch::stack({g_sorted * rescale, s_sorted * rescale}, /*dim=*/1);
-    auto x_proj = torch::addmm(input_proj_b.unsqueeze(0), inp, input_proj_W.t());
+    auto x_proj = torch::addmm(
+        input_proj_b.to(torch::kFloat32).unsqueeze(0),
+        inp, input_proj_W.to(torch::kFloat32).t());
 
     // (3) CSA attention → fine-grained / local context (was mamba_fwd).
     // (4) HCA attention → global coarse context (was mamba_bwd). The HCA layer

@@ -1540,36 +1540,17 @@ class SuperGrok2(Optimizer):
     )
 
     def _kernel_abi_view(self, emitted):
-        """Return the FP32 weight bundle the CURRENT kernel ABI consumes.
+        """Return the weight bundle the kernel ABI consumes.
 
-        ───────────────────── DOCUMENTED C++ ABI STOP (spec §1) ────────────────
-        The live ``supergrok2_prepare_and_batched_step`` /
-        ``supergrok2_batched_step`` pybind signatures declare EVERY projection
-        weight as ``const float* __restrict__`` (FP32) — see
-        ``grokking_optimizers/kernels/sm_90/supergrok2_sm90.cuh`` (``proj_W``,
-        ``q_W``, ``out_W``, ``idx_*`` are all ``const float*``). Handing those
-        entry points a BF16/FP8 tensor would reinterpret 2-byte elements as
-        4-byte floats — silent memory corruption, not a clean error.
-
-        So the Python side does the honest thing: ``get_weights(precision)``
-        EMITS the chosen-precision tensors (the bf16 path is fully reachable and
-        is the dtype the eager/autograd meta-net consumes), and this method
-        upcasts the projection operands back to FP32 *at the kernel boundary*
-        only. The bf16 emission is NOT dead — it is produced every step and is
-        what a bf16 kernel overload would bind to directly.
-
-        TO MAKE BF16 LIVE ALL THE WAY INTO THE KERNEL (the C++ change another
-        agent must land), add a BF16 overload of the two step entry points whose
-        projection args are ``const __nv_bfloat16*`` (NVIDIA) /
-        ``const __hip_bfloat16*`` (AMD), plus the matching dtype-dispatch in the
-        pybind so Python can pass the bf16 tensors emitted here unchanged. For
-        FP8, the overload additionally takes the per-matrix ``*_scale`` scalars
-        already present in the emitted bundle. Until that overload exists, this
-        boundary upcast is the only correct behaviour.
+        The C++ kernels now accept both FP32 and BF16 projection weights
+        (templated on weight type). BF16 tensors pass through unchanged,
+        saving the bandwidth of the FP32 upcast. FP8 still requires the
+        boundary upcast (no FP8 kernel overload yet).
         """
         proj_mode = emitted.get('projection_precision', 'fp32')
-        if proj_mode in ('fp32', 'tf32'):
-            return emitted  # already FP32 operands; no boundary conversion
+        if proj_mode in ('fp32', 'tf32', 'bf16'):
+            return emitted  # FP32 and BF16 pass through natively
+        # FP8 still needs the upcast until fp8 kernel overloads land
         w = dict(emitted)
         for key in self._PROJECTION_WEIGHT_KEYS:
             t = w.get(key)

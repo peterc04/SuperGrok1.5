@@ -111,15 +111,18 @@ constexpr int SG2_HCA_COMPRESS    = 128;  // heavily-compressed pooling stride m
 //  sort_key      = |grad|
 // =========================================================================
 
-template <typename scalar_t>
+// wt_t: projection weight type (float for the FP32 path, __nv_bfloat16 / at::BFloat16
+// for the bf16 bandwidth-saving path). Weights are static_cast<float>() on load so
+// all arithmetic stays in FP32.
+template <typename scalar_t, typename wt_t = float>
 __device__ __forceinline__ void sg2_input_proj_sort(
     const scalar_t* __restrict__ grad,
     const scalar_t* __restrict__ sharpness,
     float* __restrict__ x_out,
     float* __restrict__ sort_keys,
     int* __restrict__ sort_indices,
-    const float* __restrict__ proj_W,
-    const float* __restrict__ proj_b,
+    const wt_t* __restrict__ proj_W,
+    const wt_t* __restrict__ proj_b,
     const int64_t idx,
     const int64_t N,
     const int d_model
@@ -133,7 +136,10 @@ __device__ __forceinline__ void sg2_input_proj_sort(
 
     #pragma unroll 4
     for (int d = 0; d < d_model; d++) {
-        x_out[idx * d_model + d] = proj_W[d * 2] * g + proj_W[d * 2 + 1] * s + proj_b[d];
+        x_out[idx * d_model + d] =
+            static_cast<float>(proj_W[d * 2])     * g
+          + static_cast<float>(proj_W[d * 2 + 1]) * s
+          + static_cast<float>(proj_b[d]);
     }
     sort_keys[idx]    = fabsf(g);
     sort_indices[idx] = idx;
