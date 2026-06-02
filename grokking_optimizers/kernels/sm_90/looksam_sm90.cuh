@@ -38,6 +38,7 @@
 #define SG_TUNED_ASYNC_DEPTH 2
 #endif
 #include "csrc/backends/cuda/sm_90/primitives.cuh"
+#include "grokking_optimizers/kernels/sm_90/common_sm90.cuh"
 
 namespace sg { namespace sm90 {
 
@@ -54,10 +55,11 @@ using ::sg::algorithms::looksam_apply_step;
 template <typename ParamT, typename GradT>
 __global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_LOOKSAM_MIN_BLOCKS)
 looksam_perturb_kernel(
-    ParamT* param, ParamT* backup, const GradT* grad, float scale, int N
+    ParamT* param, ParamT* backup, const GradT* grad, float scale, int64_t N
 ) {
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N; i += stride) {
+        SG_SANITIZE_GRAD_INPLACE(grad, i);
         looksam_perturb_step(param, backup, grad, scale, i);
     }
 }
@@ -65,10 +67,10 @@ looksam_perturb_kernel(
 template <typename ParamT>
 __global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_LOOKSAM_MIN_BLOCKS)
 looksam_restore_kernel(
-    ParamT* param, const ParamT* backup, int N
+    ParamT* param, const ParamT* backup, int64_t N
 ) {
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N; i += stride) {
         looksam_restore_step(param, backup, i);
     }
 }
@@ -76,10 +78,10 @@ looksam_restore_kernel(
 template <typename GradT>
 __global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_LOOKSAM_MIN_BLOCKS)
 looksam_set_direction_kernel(
-    float* sam_dir, const GradT* grad_sam, const GradT* grad_orig, int N
+    float* sam_dir, const GradT* grad_sam, const GradT* grad_orig, int64_t N
 ) {
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N; i += stride) {
         looksam_set_direction(sam_dir, grad_sam, grad_orig, i);
     }
 }
@@ -91,15 +93,16 @@ looksam_apply_kernel(
     ParamT* param, float* exp_avg, float* exp_avg_sq,
     const float* sam_dir, const GradT* grad,
     float alpha, float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int N
+    float bc1, float bc2, int64_t N
 ) {
-    const int stride = prim::grid_stride() * UNROLL;
-    const int base0 = prim::grid_stride_index() * UNROLL;
-    for (int base = base0; base < N; base += stride) {
+    const int64_t stride = prim::grid_stride() * UNROLL;
+    const int64_t base0 = prim::grid_stride_index() * UNROLL;
+    for (int64_t base = base0; base < N; base += stride) {
         #pragma unroll
         for (int u = 0; u < UNROLL; ++u) {
-            const int i = base + u;
+            const int64_t i = base + u;
             if (i < N) {
+                SG_SANITIZE_GRAD_INPLACE(grad, i);
                 looksam_apply_step(param, exp_avg, exp_avg_sq, sam_dir, grad,
                                    alpha, lr, beta1, beta2, eps, wd,
                                    bc1, bc2, i);
@@ -114,10 +117,11 @@ looksam_apply_kernel_vec4_fp32(
     float4* param4, float4* exp_avg4, float4* exp_avg_sq4,
     const float4* sam_dir4, const float4* grad4,
     float alpha, float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int N4
+    float bc1, float bc2, int64_t N4
 ) {
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N4; i += stride) {
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N4; i += stride) {
+        SG_SANITIZE_GRAD4_INPLACE(grad4, i);
         float4 p  = prim::ld_f32v4(param4 + i);
         float4 m  = prim::ld_f32v4(exp_avg4 + i);
         float4 v  = prim::ld_f32v4(exp_avg_sq4 + i);
@@ -142,7 +146,10 @@ void launch_looksam_perturb(
     if (N == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int block = SG_TUNED_BLOCK_SIZE;
-    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    // Clamp the grid in int64 (N can exceed 2^31) then cast the grid dim to int
+    // (grid dims are int; the element index inside the kernel is int64_t).
+    const int grid = static_cast<int>(
+        std::min<int64_t>(65535, (N + block - 1) / block));
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
@@ -152,6 +159,7 @@ void launch_looksam_perturb(
                 backup.data_ptr<scalar_t>(),
                 grad.data_ptr<scalar_t>(),
                 scale, N);
+            SG_LAUNCH_CHECK(stream);
         });
 }
 
@@ -162,7 +170,10 @@ void launch_looksam_restore(
     if (N == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int block = SG_TUNED_BLOCK_SIZE;
-    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    // Clamp the grid in int64 (N can exceed 2^31) then cast the grid dim to int
+    // (grid dims are int; the element index inside the kernel is int64_t).
+    const int grid = static_cast<int>(
+        std::min<int64_t>(65535, (N + block - 1) / block));
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
@@ -170,6 +181,7 @@ void launch_looksam_restore(
             looksam_restore_kernel<scalar_t><<<grid, block, 0, stream>>>(
                 param.data_ptr<scalar_t>(),
                 backup.data_ptr<scalar_t>(), N);
+            SG_LAUNCH_CHECK(stream);
         });
 }
 
@@ -182,7 +194,10 @@ void launch_looksam_set_direction(
     if (N == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int block = SG_TUNED_BLOCK_SIZE;
-    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    // Clamp the grid in int64 (N can exceed 2^31) then cast the grid dim to int
+    // (grid dims are int; the element index inside the kernel is int64_t).
+    const int grid = static_cast<int>(
+        std::min<int64_t>(65535, (N + block - 1) / block));
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
@@ -191,6 +206,7 @@ void launch_looksam_set_direction(
                 sam_dir.data_ptr<float>(),
                 grad_sam.data_ptr<scalar_t>(),
                 grad_orig.data_ptr<scalar_t>(), N);
+            SG_LAUNCH_CHECK(stream);
         });
 }
 
@@ -213,7 +229,10 @@ void launch_looksam_apply(
         exp_avg_sq.data_ptr(), exp_avg_sq.nbytes());
 
     const int block = SG_TUNED_BLOCK_SIZE;
-    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    // Clamp the grid in int64 (N can exceed 2^31) then cast the grid dim to int
+    // (grid dims are int; the element index inside the kernel is int64_t).
+    const int grid = static_cast<int>(
+        std::min<int64_t>(65535, (N + block - 1) / block));
 
     const bool all_fp32 = param.scalar_type() == torch::kFloat32 &&
                           grad.scalar_type() == torch::kFloat32;
@@ -224,8 +243,9 @@ void launch_looksam_apply(
         prim::is_vec4_alignable(exp_avg_sq.data_ptr(), N) &&
         prim::is_vec4_alignable(sam_dir.data_ptr(), N) &&
         prim::is_vec4_alignable(grad.data_ptr(), N)) {
-        const int N4 = N / 4;
-        const int grid4 = std::min<int>(65535, (N4 + block - 1) / block);
+        const int64_t N4 = N / 4;
+        const int grid4 = static_cast<int>(
+            std::min<int64_t>(65535, (N4 + block - 1) / block));
         looksam_apply_kernel_vec4_fp32<<<grid4, block, 0, stream>>>(
             reinterpret_cast<float4*>(param.data_ptr<float>()),
             reinterpret_cast<float4*>(exp_avg.data_ptr<float>()),
@@ -233,6 +253,7 @@ void launch_looksam_apply(
             reinterpret_cast<const float4*>(sam_dir.data_ptr<float>()),
             reinterpret_cast<const float4*>(grad.data_ptr<float>()),
             alpha, lr, beta1, beta2, eps, wd, bc1, bc2, N4);
+        SG_LAUNCH_CHECK(stream);
         return;
     }
 
@@ -247,6 +268,7 @@ void launch_looksam_apply(
                 sam_dir.data_ptr<float>(),
                 grad.data_ptr<scalar_t>(),
                 alpha, lr, beta1, beta2, eps, wd, bc1, bc2, N);
+            SG_LAUNCH_CHECK(stream);
         });
 }
 
@@ -254,10 +276,10 @@ void launch_looksam_apply(
 // Fused direction-adjust: grad = (1 - lambda) * grad + lambda * grad_norm * (v_dir * inv_norm)
 __global__ void looksam_direction_adjust_kernel(
     float* grad, const float* v_dir,
-    float inv_norm, float lambda, float grad_norm, int N
+    float inv_norm, float lambda, float grad_norm, int64_t N
 ) {
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N; i += stride) {
         float g = grad[i];
         float d = v_dir[i] * inv_norm;
         grad[i] = (1.0f - lambda) * g + lambda * grad_norm * d;
@@ -272,10 +294,14 @@ void launch_looksam_direction_adjust_fused(
     if (N == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int block = SG_TUNED_BLOCK_SIZE;
-    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    // Clamp the grid in int64 (N can exceed 2^31) then cast the grid dim to int
+    // (grid dims are int; the element index inside the kernel is int64_t).
+    const int grid = static_cast<int>(
+        std::min<int64_t>(65535, (N + block - 1) / block));
     looksam_direction_adjust_kernel<<<grid, block, 0, stream>>>(
         grad.data_ptr<float>(), v_dir.data_ptr<float>(),
         inv_norm, lambda, grad_norm, N);
+    SG_LAUNCH_CHECK(stream);
 }
 
 // Reduce: results[0] = ||sam_grad - grad||, results[1] = ||grad||.
