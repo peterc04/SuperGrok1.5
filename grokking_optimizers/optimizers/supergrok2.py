@@ -865,9 +865,93 @@ class CSAHCAMetaNet(nn.Module):
         self, grad, sharpness, gru_state,
         mamba_fwd_state=None, mamba_bwd_state=None,
     ):
-        """Bilevel forward; falls back to forward_for_bilevel."""
-        return self.forward_for_bilevel(
-            grad, sharpness, gru_state, mamba_fwd_state, mamba_bwd_state)
+        """Bilevel forward with saved intermediates for the C++ backward.
+
+        Runs the full meta-net forward under torch.no_grad(), saving the
+        activation tensors the C++ bilevel_backward_driver needs. Returns
+        (smart_grad, new_gru_state, saved_dict).
+        """
+        N = grad.numel()
+        g = grad.reshape(-1).float()
+        s = sharpness.reshape(-1).float()
+
+        sort_idx = g.abs().argsort()
+        g_sorted = g[sort_idx]
+        s_sorted = s[sort_idx]
+
+        inp = torch.stack([g_sorted, s_sorted], dim=-1)
+        x = self.input_proj(inp)
+
+        csa_out = self.csa_layer(x)
+        hca_out = self.hca_layer(x)
+
+        unsort_idx = sort_idx.argsort()
+        csa_ctx = csa_out[unsort_idx]
+        hca_ctx = hca_out[unsort_idx]
+
+        gru_input = torch.cat([g.unsqueeze(-1), s.unsqueeze(-1),
+                               csa_ctx, hca_ctx], dim=-1)
+        h_old = gru_state.float()
+        if h_old.dim() == 1:
+            h_old = h_old.unsqueeze(0).expand(N, -1).contiguous()
+        xh = torch.cat([gru_input, h_old], dim=-1)
+        gru_z = torch.sigmoid(self.gru.W_z(xh))
+        gru_r = torch.sigmoid(self.gru.W_r(xh))
+        xrh = torch.cat([gru_input, gru_r * h_old], dim=-1)
+        gru_h_tilde = torch.tanh(self.gru.W_h(xrh))
+        new_gru = (1.0 - gru_z) * h_old + gru_z * gru_h_tilde
+
+        peer_input = torch.cat([new_gru, csa_ctx, hca_ctx,
+                                g.unsqueeze(-1), s.unsqueeze(-1)], dim=-1)
+
+        total_expert_out = torch.zeros(N, 1, device=grad.device,
+                                       dtype=torch.float32)
+        topk = 4
+        for h in range(self.num_peer_heads):
+            query = self.peer_queries[h](peer_input)
+            q_a = query[:, :self.d_model // 2]
+            q_b = query[:, self.d_model // 2:]
+            scores_a = q_a @ self.product_keys_A[h].T
+            scores_b = q_b @ self.product_keys_B[h].T
+            top_a_vals, top_a_idx = scores_a.topk(topk, dim=-1)
+            top_b_vals, top_b_idx = scores_b.topk(topk, dim=-1)
+            soft_a = torch.softmax(top_a_vals * 10.0, dim=-1)
+            soft_b = torch.softmax(top_b_vals * 10.0, dim=-1)
+            expert_indices = (top_a_idx.unsqueeze(2) * self.pk_dim
+                              + top_b_idx.unsqueeze(1)).reshape(N, -1)
+            routing_weights = (soft_a.unsqueeze(2)
+                               * soft_b.unsqueeze(1)).reshape(N, -1)
+            W1 = self.expert_W1[expert_indices]
+            b1 = self.expert_b1[expert_indices]
+            W2 = self.expert_W2[expert_indices]
+            b2 = self.expert_b2[expert_indices]
+            num_active = topk * topk
+            g_exp = g.unsqueeze(1).unsqueeze(-1).unsqueeze(-1).expand(
+                -1, num_active, -1, -1)
+            z_h = torch.relu(torch.matmul(W1, g_exp).squeeze(-1) + b1)
+            out = (torch.matmul(W2, z_h.unsqueeze(-1)).squeeze(-1).squeeze(-1)
+                   + b2.squeeze(-1))
+            head_out = (routing_weights * out).sum(dim=1, keepdim=True)
+            total_expert_out = total_expert_out + head_out
+
+        total_expert_out = total_expert_out / self.num_peer_heads
+        smart_grad = (g.unsqueeze(-1)
+                      + self.rescale * total_expert_out).squeeze(-1)
+        smart_grad = smart_grad.reshape(grad.shape).to(grad.dtype)
+
+        saved = {
+            'sort_indices': sort_idx.detach(),
+            'x_sorted': x.detach(),
+            'csa_ctx': csa_ctx.detach(),
+            'hca_ctx': hca_ctx.detach(),
+            'gru_input': gru_input.detach(),
+            'gru_h_old': h_old.detach(),
+            'gru_z': gru_z.detach(),
+            'gru_r': gru_r.detach(),
+            'gru_h_tilde': gru_h_tilde.detach(),
+            'peer_input': peer_input.detach(),
+        }
+        return smart_grad, new_gru.detach(), saved
 
     def get_weights(self):
         """Extract all meta-model weights for the CUDA/HIP kernels.
@@ -1495,27 +1579,20 @@ class SuperGrok2(Optimizer):
         return sam_loss_val
 
     def bilevel_step(self, model, train_x, train_y, val_x, val_y, criterion, meta_optimizer):
-        """Bilevel meta-net training (autograd through the CSA/HCA meta-net).
+        """Bilevel meta-net training with C++ backward (primary) or autograd (fallback).
 
-        The CSA/HCA hybrid attention meta-net is a standard differentiable
-        PyTorch module, so meta-gradients are computed exactly via autograd
-        through ``forward_for_bilevel`` (top-k sparse soft PEER routing). This
-        replaces the Mamba-specific hand-written scan adjoint kernels.
+        When the C++ bilevel backward is available (``mn.has_cuda_bilevel``),
+        runs the forward under ``no_grad`` saving intermediates, computes
+        validation gradients, then calls the hand-written C++ VJP
+        (``supergrok2_bilevel_backward``) to compute meta-net weight grads
+        without building an autograd graph — lower peak memory and faster.
 
-        The bilevel meta-objective is: perturb each parameter's gradient with the
-        meta-net's smart gradient, take validation gradients, and steer the
-        meta-net so its smart gradient aligns with the validation descent
-        direction (``d_smart = -val_grad_unit``).
-
-        Faster fused kernels may be wired in later via the renamed pybind entry
-        points (``supergrok2_bilevel_fwd_save_batched`` /
-        ``supergrok2_bilevel_backward_batched``); the saved-state contract for
-        the attention adjoint is owned jointly with the C++ launchers (spec §7).
+        Falls back to ``torch.autograd.backward`` when the C++ extension is
+        not available (CPU-only, or extension not built with bilevel support).
         """
         self._ensure_state()
         named_params = list(model.named_parameters())
 
-        # 1. Save training gradients (restored at the end).
         saved_grads = {}
         for name, p in named_params:
             if p.grad is not None:
@@ -1527,8 +1604,7 @@ class SuperGrok2(Optimizer):
 
         mn = self.meta_net
 
-        # ── Collect active parameters ──
-        param_info = []  # (name, p, pidx, grad_flat, sharp_flat)
+        param_info = []
         for name, p in named_params:
             if name not in saved_grads:
                 continue
@@ -1545,7 +1621,21 @@ class SuperGrok2(Optimizer):
             return torch.zeros((), device=saved_grads and
                                next(iter(saved_grads.values())).device or 'cpu')
 
-        # 2. Differentiable meta-net forward → smart grads (build autograd graph).
+        use_cuda_bwd = mn.has_cuda_bilevel
+
+        if use_cuda_bwd:
+            return self._bilevel_step_cuda(
+                model, val_x, val_y, criterion, meta_optimizer,
+                named_params, saved_grads, param_info, mn)
+        else:
+            return self._bilevel_step_autograd(
+                model, val_x, val_y, criterion, meta_optimizer,
+                named_params, saved_grads, param_info, mn)
+
+    def _bilevel_step_autograd(self, model, val_x, val_y, criterion,
+                               meta_optimizer, named_params, saved_grads,
+                               param_info, mn):
+        """Autograd fallback path for bilevel_step."""
         meta_optimizer.zero_grad()
         smart_grads = {}
         new_gru_states = {}
@@ -1557,14 +1647,11 @@ class SuperGrok2(Optimizer):
                 smart_grads[name] = smart_grad
                 new_gru_states[pidx] = new_gru.detach()
 
-        # 3. Compute validation gradients.
         model.zero_grad()
         with torch.enable_grad():
             val_loss = criterion(model(val_x), val_y)
             val_loss.backward()
 
-        # 4. Backprop the bilevel objective into the meta-net via autograd.
-        #    d_smart = -unit(val_grad); meta-loss = -<smart_grad, val_grad_unit>.
         grad_outputs = []
         outputs = []
         for (name, p, pidx, grad_flat, sharp_flat) in param_info:
@@ -1577,23 +1664,191 @@ class SuperGrok2(Optimizer):
             vg_unit = vg / vg_norm if vg_norm > 1e-12 else vg
             sg = smart_grads[name].reshape(-1)
             outputs.append(sg)
-            grad_outputs.append(-vg_unit)  # d(meta_loss)/d(smart_grad)
+            grad_outputs.append(-vg_unit)
 
         if outputs:
             torch.autograd.backward(outputs, grad_outputs)
 
-        # 5. Distributed: all-reduce meta-net gradients before stepping.
         if self.bilevel_allreduce_meta_grads:
             self._allreduce_meta_grads()
 
         meta_optimizer.step()
         self._weights_dirty = True
 
-        # 6. Persist carried GRU states.
         for pidx, ng in new_gru_states.items():
             self._flat_gru_states[pidx] = ng
 
-        # 7. Restore original training gradients.
+        for name, p in named_params:
+            p.grad = saved_grads.get(name)
+
+        return val_loss.detach()
+
+    def _bilevel_step_cuda(self, model, val_x, val_y, criterion,
+                           meta_optimizer, named_params, saved_grads,
+                           param_info, mn):
+        """C++ hand-written backward path — no autograd graph."""
+        meta_optimizer.zero_grad()
+        smart_grads = {}
+        new_gru_states = {}
+        per_param_saved = {}
+
+        with torch.no_grad():
+            for (name, p, pidx, grad_flat, sharp_flat) in param_info:
+                gru_state = self._flat_gru_states[pidx].float()
+                smart_grad, new_gru, saved = mn.forward_for_bilevel_cuda(
+                    grad_flat, sharp_flat, gru_state)
+                smart_grads[name] = smart_grad
+                new_gru_states[pidx] = new_gru
+                per_param_saved[name] = (grad_flat, sharp_flat, saved)
+
+        model.zero_grad()
+        with torch.enable_grad():
+            val_loss = criterion(model(val_x), val_y)
+            val_loss.backward()
+
+        w = mn.get_weights()
+        d = w['d_model']
+        gru_hid = w['gru_hidden']
+        nheads = w['num_heads']
+        pkd = w['pk_dim']
+        ehid = w['expert_hidden']
+        n_exp = w['num_experts']
+        topk = 4
+        gru_in_dim = 2 + 2 * d
+        peer_in_dim = gru_hid + 2 * d + 2
+        fopt = dict(device=w['input_proj_W'].device, dtype=torch.float32)
+
+        d_ip_W = torch.zeros_like(w['input_proj_W'])
+        d_ip_b = torch.zeros(d, **fopt)
+        d_csa_q = torch.zeros_like(w['csa_q_W'])
+        d_csa_k = torch.zeros_like(w['csa_k_W'])
+        d_csa_v = torch.zeros_like(w['csa_v_W'])
+        d_csa_cw = torch.zeros_like(w['csa_compress_w'])
+        d_csa_dq = torch.zeros_like(w['csa_idx_DQ'])
+        d_csa_uq = torch.zeros_like(w['csa_idx_UQ'])
+        d_csa_ik = torch.zeros_like(w['csa_idx_K'])
+        d_csa_out = torch.zeros_like(w['csa_out_W'])
+        d_hca_q = torch.zeros_like(w['hca_q_W'])
+        d_hca_k = torch.zeros_like(w['hca_k_W'])
+        d_hca_v = torch.zeros_like(w['hca_v_W'])
+        d_hca_out = torch.zeros_like(w['hca_out_W'])
+        d_gru_Wz = torch.zeros_like(w['gru_W_z'])
+        d_gru_bz = torch.zeros(gru_hid, **fopt)
+        d_gru_Wr = torch.zeros_like(w['gru_W_r'])
+        d_gru_br = torch.zeros(gru_hid, **fopt)
+        d_gru_Wh = torch.zeros_like(w['gru_W_h'])
+        d_gru_bh = torch.zeros(gru_hid, **fopt)
+        nph = w['num_peer_heads']
+        d_peer_Ws = torch.zeros(nph, d, peer_in_dim, **fopt)
+        d_pka = torch.zeros(nph, pkd, d // 2, **fopt)
+        d_pkb = torch.zeros(nph, pkd, d // 2, **fopt)
+        d_eW1 = torch.zeros_like(w['expert_W1'])
+        d_eb1 = torch.zeros_like(w['expert_b1'])
+        d_eW2 = torch.zeros_like(w['expert_W2'])
+        d_eb2 = torch.zeros_like(w['expert_b2'])
+
+        peer_Ws = torch.stack([q.detach().float().contiguous()
+                               for q in w['peer_queries']])
+        pka = torch.stack([k.detach().float().contiguous()
+                           for k in w['product_keys_A']])
+        pkb = torch.stack([k.detach().float().contiguous()
+                           for k in w['product_keys_B']])
+        empty_t = torch.empty(0, **fopt)
+
+        for (name, p, pidx, grad_flat, sharp_flat) in param_info:
+            if p.grad is None:
+                continue
+            vg = p.grad.detach().reshape(-1).float()
+            if not torch.isfinite(vg).all():
+                continue
+            vg_norm = vg.norm()
+            vg_unit = vg / vg_norm if vg_norm > 1e-12 else vg
+            d_smart = -vg_unit
+
+            g_f, s_f, sv = per_param_saved[name]
+            _ops.supergrok2_bilevel_backward(
+                d_smart, g_f, s_f, float(w['rescale']),
+                sv['sort_indices'], sv['x_sorted'],
+                sv['csa_ctx'], sv['hca_ctx'],
+                empty_t, empty_t, empty_t,
+                empty_t, empty_t,
+                sv['gru_input'], sv['gru_h_old'],
+                sv['gru_z'], sv['gru_r'], sv['gru_h_tilde'],
+                sv['peer_input'], empty_t, empty_t, empty_t,
+                empty_t, empty_t, empty_t, empty_t, empty_t, empty_t,
+                w['csa_q_W'], w['csa_k_W'], w['csa_v_W'],
+                w['csa_compress_w'],
+                w['csa_idx_DQ'], w['csa_idx_UQ'], w['csa_idx_K'],
+                w['csa_out_W'],
+                w['hca_q_W'], w['hca_k_W'], w['hca_v_W'],
+                w['hca_out_W'],
+                w['gru_W_z'], w['gru_W_r'], w['gru_W_h'],
+                peer_Ws, pka, pkb,
+                w['expert_W1'], w['expert_W2'],
+                w['expert_b1'], w['expert_b2'],
+                w['input_proj_W'],
+                d_csa_q, d_csa_k, d_csa_v, d_csa_cw,
+                d_csa_dq, d_csa_uq, d_csa_ik, d_csa_out,
+                d_hca_q, d_hca_k, d_hca_v, d_hca_out,
+                d_gru_Wz, d_gru_bz, d_gru_Wr, d_gru_br,
+                d_gru_Wh, d_gru_bh,
+                d_peer_Ws, d_pka, d_pkb,
+                d_eW1, d_eb1, d_eW2, d_eb2,
+                d_ip_W, d_ip_b,
+                d, gru_hid, gru_in_dim,
+                nheads, topk, pkd,
+                ehid, peer_in_dim, n_exp,
+                mn.csa_compress, mn.csa_window, mn.csa_topk,
+                mn.hca_compress, mn.indexer_rank,
+                32)
+
+        grad_map = {
+            'input_proj.weight': d_ip_W,
+            'input_proj.bias': d_ip_b,
+            'csa_layer.q_W.weight': d_csa_q,
+            'csa_layer.k_W.weight': d_csa_k,
+            'csa_layer.v_W.weight': d_csa_v,
+            'csa_layer.compress_w': d_csa_cw,
+            'csa_layer.idx_DQ': d_csa_dq,
+            'csa_layer.idx_UQ': d_csa_uq,
+            'csa_layer.idx_K': d_csa_ik,
+            'csa_layer.out_W.weight': d_csa_out,
+            'hca_layer.q_W.weight': d_hca_q,
+            'hca_layer.k_W.weight': d_hca_k,
+            'hca_layer.v_W.weight': d_hca_v,
+            'hca_layer.out_W.weight': d_hca_out,
+            'gru.W_z.weight': d_gru_Wz,
+            'gru.W_z.bias': d_gru_bz,
+            'gru.W_r.weight': d_gru_Wr,
+            'gru.W_r.bias': d_gru_br,
+            'gru.W_h.weight': d_gru_Wh,
+            'gru.W_h.bias': d_gru_bh,
+            'expert_W1': d_eW1,
+            'expert_b1': d_eb1,
+            'expert_W2': d_eW2,
+            'expert_b2': d_eb2,
+        }
+        for h in range(nph):
+            grad_map[f'peer_queries.{h}.weight'] = d_peer_Ws[h]
+            grad_map[f'product_keys_A.{h}'] = d_pka[h]
+            grad_map[f'product_keys_B.{h}'] = d_pkb[h]
+
+        for pname, param in mn.named_parameters():
+            if pname in grad_map:
+                g = grad_map[pname]
+                if g.shape != param.shape:
+                    g = g.reshape(param.shape)
+                param.grad = g.to(param.dtype)
+
+        if self.bilevel_allreduce_meta_grads:
+            self._allreduce_meta_grads()
+
+        meta_optimizer.step()
+        self._weights_dirty = True
+
+        for pidx, ng in new_gru_states.items():
+            self._flat_gru_states[pidx] = ng
+
         for name, p in named_params:
             p.grad = saved_grads.get(name)
 
@@ -2209,20 +2464,20 @@ class MoEAwareSuperGrok2(SuperGrok2):
                   threshold=0.0, closure=None, **kwargs):
         """MoE-aware step: compact -> attention meta-net -> scatter.
 
-        NOTE: the device-side MoE-model compaction kernels (``moe_filter_active_params``,
-        ``moe_scatter_results``, ``moe_count_expert_activations``, ...) are
-        not yet implemented — they are registered as throwing placeholders.
-        This path therefore raises a clear error rather than failing deep
-        inside a kernel call. Use the standard dense ``SuperGrok2.step()``
-        (call ``step()`` without ``active_expert_indices``), which transparently
-        falls back to the dense path. The meta-model's own PEER product-key
-        expert routing is unaffected and always active on the dense path.
+        The device-side MoE-model compaction kernels — ``moe_count_expert_
+        activations``, ``moe_compute_load_balance_loss``, ``moe_apply_frequency_
+        scaling``, ``moe_filter_active_params``, ``moe_scatter_results`` — are
+        implemented for both sm_90 (real CUDA) and gfx942 (ATen) and were
+        numerically reviewed (Stage 1B). This path is reached only when the C++
+        extension is built and exposes them (guarded at the call site by
+        ``_HAS_CUDA and hasattr(_ops, 'moe_filter_active_params')``); otherwise
+        the caller transparently uses the dense ``SuperGrok2.step()``.
+
+        NOTE (🟡): the kernels are compile-verified but their on-device numerics
+        are hardware-deferred (see HARDWARE_VALIDATION.md Stage 1B). The dense
+        path remains the default; pass ``active_expert_indices`` to opt in to the
+        compacted expert path on real hardware.
         """
-        raise NotImplementedError(
-            "MoEAwareSuperGrok2 device-side expert compaction is not implemented "
-            "(the moe_* kernels are throwing placeholders). Run the dense path by "
-            "calling step() without active_expert_indices; the meta-model's PEER "
-            "expert routing still runs there.")
         loss = None
         if closure is not None:
             with torch.enable_grad():

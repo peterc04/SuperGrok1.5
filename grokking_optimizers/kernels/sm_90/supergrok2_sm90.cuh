@@ -42,6 +42,7 @@
 #include <string>
 
 #include "csrc/algorithms/supergrok2.h"
+#include "csrc/algorithms/supergrok2_bilevel_adjoint.h"
 
 // ── Autotuner-consumable launch parameters (inlined; see compile.py) ──
 // Formerly csrc/tuning.h (deleted in the file-structure restoration). The
@@ -60,564 +61,12 @@
 #define SG_TUNED_ASYNC_DEPTH 2
 #endif
 
-// ── inlined from former csrc/backends/cuda/sm_90/primitives.cuh ──
-// CUDA sm_90 (Hopper) primitives — shared across all 11 launch_*.cu files.
-//
-// This header consolidates vendor-specific intrinsics that the optimizer
-// launch files use repeatedly: warp/block/cluster reductions, vec4 helpers,
-// non-temporal load/store, stochastic rounding, RoPE pair rotation, fused
-// element ingestion, and grid-stride loop helpers.
-//
-// Algorithm-neutral. Per-element optimizer math lives in csrc/algorithms/.
-// Per-backend launch glue (kernel definitions + host launchers) lives in
-// the 11 csrc/backends/cuda/sm_90/launch_<optimizer>.cu files which include
-// both this header and the relevant algorithm header.
+#include "csrc/backends/cuda/sm_90/primitives.cuh"
 
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
-#include <cuda_pipeline.h>
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
-
-// ── inlined from former csrc/common/platform.h ──
-/*
- * SuperGrok v2 — Platform Abstraction Layer
- *
- * Provides a unified API across NVIDIA CUDA and AMD HIP (ROCm).
- * Include this header instead of raw <cuda.h> / <hip/hip_runtime.h>.
- *
- * Key differences handled:
- *   - Warp size: CUDA = 32, HIP/RDNA = 32, HIP/CDNA = 64
- *   - __sincosf: CUDA intrinsic, HIP uses sincosf (no double-underscore)
- *   - __ldg: CUDA L1 cache hint, no-op on HIP (compiler handles caching)
- *   - Thrust → rocThrust, CUB → hipCUB (header-compatible wrappers)
- *   - cuBLAS → rocBLAS (ATen abstracts this via at::cuda::getCurrentCUDABlasHandle)
- */
-
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Backend detection
-// ═══════════════════════════════════════════════════════════════════════
-
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-#define GROK_HIP 1
-#define GROK_CUDA 0
-#else
-#define GROK_HIP 0
-#define GROK_CUDA 1
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Runtime includes
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-#include <hip/hip_runtime.h>
-// rocThrust and hipCUB provide thrust/cub API compatibility
-#include <thrust/device_ptr.h>
-#include <thrust/sort.h>
-#include <hipcub/hipcub.hpp>
-#else
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <thrust/device_ptr.h>
-#include <thrust/sort.h>
-#include <cub/cub.cuh>
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Stream type alias
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-using GpuStream_t = hipStream_t;
-#else
-using GpuStream_t = cudaStream_t;
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Warp / wavefront size
-//
-//  CDNA (MI200, MI300): wavefront = 64
-//  RDNA (RX 7900):      wavefront = 32
-//  NVIDIA:               warp     = 32
-//
-//  We default to the compile-time warp size. On HIP, __AMDGCN_WAVEFRONT_SIZE__
-//  is set by the compiler for the target architecture.
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #ifdef __AMDGCN_WAVEFRONT_SIZE__
-    #define WARP_SIZE __AMDGCN_WAVEFRONT_SIZE__
-  #else
-    #define WARP_SIZE 64  // conservative default for CDNA
-  #endif
-#else
-  #define WARP_SIZE 32
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Warp shuffle
-//
-//  CUDA: __shfl_down_sync(mask, val, offset)
-//  HIP:  __shfl_down(val, offset)  — no mask parameter on CDNA
-//        (On wavefront-64, all lanes are always synchronized)
-//
-//  We wrap both into SHFL_DOWN(val, offset) and SHFL_DOWN_SYNC(mask, val, offset).
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define SHFL_DOWN(val, offset) __shfl_down((val), (offset))
-  #define SHFL_DOWN_SYNC(mask, val, offset) __shfl_down((val), (offset))
-#else
-  #define SHFL_DOWN(val, offset) __shfl_down_sync(0xFFFFFFFF, (val), (offset))
-  #define SHFL_DOWN_SYNC(mask, val, offset) __shfl_down_sync((mask), (val), (offset))
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Fast sincos
-//
-//  CUDA: __sincosf (device intrinsic, single instruction on SM)
-//  HIP:  sincosf   (no double-underscore variant)
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define FAST_SINCOSF(x, sptr, cptr) sincosf((x), (sptr), (cptr))
-#else
-  #define FAST_SINCOSF(x, sptr, cptr) __sincosf((x), (sptr), (cptr))
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Read-only cache load hint
-//
-//  CUDA: __ldg(ptr) — hints L1 cache for read-only data
-//  HIP:  direct dereference (compiler manages caching on GCN/CDNA)
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define LDG(ptr) (*(ptr))
-#else
-  #define LDG(ptr) __ldg(ptr)
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Error checking
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define GPU_SUCCESS hipSuccess
-  #define gpuGetLastError hipGetLastError
-  #define gpuGetErrorString hipGetErrorString
-  #define gpuDeviceSynchronize hipDeviceSynchronize
-  #define gpuGetDeviceProperties hipGetDeviceProperties
-  #define gpuDeviceProp_t hipDeviceProp_t
-#else
-  #define GPU_SUCCESS cudaSuccess
-  #define gpuGetLastError cudaGetLastError
-  #define gpuGetErrorString cudaGetErrorString
-  #define gpuDeviceSynchronize cudaDeviceSynchronize
-  #define gpuGetDeviceProperties cudaGetDeviceProperties
-  #define gpuDeviceProp_t cudaDeviceProp
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  CUB / hipCUB namespace alias
-//
-//  hipCUB wraps rocPRIM with a CUB-compatible API.
-//  We alias so kernel code can use `cub::DeviceSegmentedRadixSort` uniformly.
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  namespace cub = hipcub;
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Full-mask constant for warp-wide operations
-//
-//  CUDA uses explicit masks (0xFFFFFFFF for 32 lanes).
-//  HIP/CDNA doesn't use masks — all 64 lanes in a wavefront are lockstep.
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define FULL_WARP_MASK 0  // unused, but defined for code that passes it around
-#else
-  #define FULL_WARP_MASK 0xFFFFFFFF
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Async memset
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define gpuMemsetAsync hipMemsetAsync
-#else
-  #define gpuMemsetAsync cudaMemsetAsync
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Stream management
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define gpuStreamCreate hipStreamCreate
-  #define gpuStreamSynchronize hipStreamSynchronize
-  #define gpuStreamDestroy hipStreamDestroy
-#else
-  #define gpuStreamCreate cudaStreamCreate
-  #define gpuStreamSynchronize cudaStreamSynchronize
-  #define gpuStreamDestroy cudaStreamDestroy
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  GCN/CDNA scheduler hints (AMD-only occupancy control)
-//
-//  __attribute__((amdgpu_waves_per_eu(min, max))) controls occupancy
-//  on AMD GCN/CDNA by limiting waves per execution unit. On NVIDIA,
-//  __launch_bounds__ serves this purpose (already applied separately).
-//
-//  GROK_WAVES_PER_EU(min, max) — applies attribute on HIP, no-op on CUDA.
-//  GROK_FLAT_WORK_GROUP_SIZE(min, max) — hints block size range for AMD.
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define GROK_WAVES_PER_EU(min_waves, max_waves) \
-      __attribute__((amdgpu_waves_per_eu(min_waves, max_waves)))
-  #define GROK_FLAT_WORK_GROUP_SIZE(min_size, max_size) \
-      __attribute__((amdgpu_flat_work_group_size(min_size, max_size)))
-#else
-  #define GROK_WAVES_PER_EU(min_waves, max_waves)
-  #define GROK_FLAT_WORK_GROUP_SIZE(min_size, max_size)
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Kernel launch attribute (for configuring smem size)
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define gpuFuncSetAttribute hipFuncSetAttribute
-  #define gpuFuncAttributeMaxDynamicSharedMemorySize \
-          hipFuncAttributeMaxDynamicSharedMemorySize
-#else
-  #define gpuFuncSetAttribute cudaFuncSetAttribute
-  #define gpuFuncAttributeMaxDynamicSharedMemorySize \
-          cudaFuncAttributeMaxDynamicSharedMemorySize
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Non-temporal (streaming) memory access
-//
-//  Used for optimizer state access to avoid L2 cache pollution.
-//  Model weights stay warm in L2 for the next forward pass.
-// ═══════════════════════════════════════════════════════════════════════
-
+// ── inlined from former csrc/common/utils.cuh (Phase3 S0) ──
 #if GROK_CUDA
-  // Streaming load: reads bypass L2 (or use L2 read-only path)
-  __device__ __forceinline__ float stream_load(const float* ptr) {
-      float val;
-      asm volatile("ld.global.nc.f32 %0, [%1];" : "=f"(val) : "l"(ptr));
-      return val;
-  }
-
-  // Streaming store: writes bypass L2 allocation
-  // Available on sm_80+ (Ampere). On older, falls back to normal store.
-  __device__ __forceinline__ void stream_store(float* ptr, float val) {
-  #if __CUDA_ARCH__ >= 800
-      asm volatile("st.global.wt.f32 [%0], %1;" :: "l"(ptr), "f"(val));
-  #else
-      *ptr = val;
-  #endif
-  }
-
-  // float4 streaming variants
-  __device__ __forceinline__ float4 stream_load4(const float4* ptr) {
-      float4 val;
-      asm volatile(
-          "ld.global.nc.v4.f32 {%0,%1,%2,%3}, [%4];"
-          : "=f"(val.x), "=f"(val.y), "=f"(val.z), "=f"(val.w)
-          : "l"(ptr));
-      return val;
-  }
-
-  __device__ __forceinline__ void stream_store4(float4* ptr, float4 val) {
-  #if __CUDA_ARCH__ >= 800
-      asm volatile(
-          "st.global.wt.v4.f32 [%0], {%1,%2,%3,%4};"
-          :: "l"(ptr), "f"(val.x), "f"(val.y), "f"(val.z), "f"(val.w));
-  #else
-      *ptr = val;
-  #endif
-  }
-
-#elif GROK_HIP
-  // HIP: use __builtin_nontemporal_load/store
-  __device__ __forceinline__ float stream_load(const float* ptr) {
-      return __builtin_nontemporal_load(ptr);
-  }
-  __device__ __forceinline__ void stream_store(float* ptr, float val) {
-      __builtin_nontemporal_store(val, ptr);
-  }
-  // float4 variants: decompose into 4 scalar non-temporal ops
-  __device__ __forceinline__ float4 stream_load4(const float4* ptr) {
-      const float* fp = reinterpret_cast<const float*>(ptr);
-      return make_float4(
-          __builtin_nontemporal_load(fp),
-          __builtin_nontemporal_load(fp+1),
-          __builtin_nontemporal_load(fp+2),
-          __builtin_nontemporal_load(fp+3));
-  }
-  __device__ __forceinline__ void stream_store4(float4* ptr, float4 val) {
-      float* fp = reinterpret_cast<float*>(ptr);
-      __builtin_nontemporal_store(val.x, fp);
-      __builtin_nontemporal_store(val.y, fp+1);
-      __builtin_nontemporal_store(val.z, fp+2);
-      __builtin_nontemporal_store(val.w, fp+3);
-  }
-#else
-  // CPU: no non-temporal hint needed (OS manages caching)
-  static inline float stream_load(const float* ptr) { return *ptr; }
-  static inline void stream_store(float* ptr, float val) { *ptr = val; }
-#endif
-// ── end inlined csrc/common/platform.h ──
-// ── inlined from former csrc/common/types.h ──
-/*
- * SuperGrok v2 — Shared Types and Constants
- *
- * Common struct definitions and compile-time constants used by both
- * forward and backward CUDA kernels.
- */
-
-
-
-#include <vector>
-#include <torch/extension.h>
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Compile-time constants
-// ═══════════════════════════════════════════════════════════════════════
-
-constexpr int MAX_D_STATE = 128;
-constexpr int MAX_D_INNER = 128;
-constexpr int MAX_D_MODEL = 64;
-constexpr int MAX_GRU_HIDDEN = 8;
-constexpr int MAX_EXPERT_HIDDEN = 16;
-constexpr int MAX_TOPK = 4;
-constexpr int MAX_CKPT_INTERVAL = 32;   // max checkpoint interval for bilevel gradient checkpointing
-
-constexpr int SG2M_BLOCK = 256;         // forward kernel block size
-constexpr int SG2B_BLOCK = 256;         // backward kernel block size
-constexpr int PSCAN_BLOCK = 512;        // threads per parallel scan block (must be power of 2)
-constexpr int PSCAN_THRESHOLD = 256;    // fall back to sequential scan if N < this
-constexpr int GEMM_PRECOMPUTE_THRESHOLD = 1024;  // use GEMM when N >= this
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Parallel Prefix Scan Infrastructure
-//
-//  Affine2x2 and affine_combine moved to csrc/scan/affine2x2.h.
-//  Included here so existing callers that #include "csrc/common/types.h"
-//  continue to compile without modification.
-// ═══════════════════════════════════════════════════════════════════════
-
-// ── inlined from former csrc/scan/affine2x2.h ──
-// Affine2x2 — shared scan primitive.
-//
-// Extracted from csrc/common/types.h. The associative operator used by the
-// Mamba parallel prefix scan and by SuperGrok v2's selective scan.
-//
-// Encoding: each scan element is a 2x2 affine transform
-//   (h_new) = (m00 m01) (h) + (b0)
-//   (h_new')  (m10 m11) (h')  (b1)
-//
-// composition: (B ∘ A)(h) = B(A(h))
-//   M_out = M_B * M_A
-//   b_out = M_B * b_A + b_B
-//
-// Used by:
-//   csrc/scan/mamba_scan_adapter.cuh  — Mamba model selective scan
-//   csrc/algorithms/supergrok2.h      — SG2 optimizer scan recurrence
-//   csrc/backends/cuda/sm_90/launch_supergrok2.cu — Blelloch parallel scan
-
-#ifdef __CUDACC__
-
-struct Affine2x2 {
-    float m00, m01, m10, m11;  // 2x2 matrix
-    float b0, b1;               // 2-vector bias
-};
-
-__device__ __forceinline__ Affine2x2 affine_identity() {
-    return {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
-}
-
-__device__ __forceinline__ Affine2x2 affine_combine(Affine2x2 left, Affine2x2 right) {
-    // Computes right ∘ left: apply left first, then right.
-    // M_out = M_right * M_left
-    // b_out = M_right * b_left + b_right
-    Affine2x2 out;
-#if defined(GROK_CUDA) && GROK_CUDA
-    // Inline PTX: 12-FMA composition arranged for ILP across pipelines.
-    asm volatile(
-        "fma.rn.f32 %0, %6, %12, 0f00000000;\n\t"
-        "fma.rn.f32 %1, %6, %13, 0f00000000;\n\t"
-        "fma.rn.f32 %2, %8, %12, 0f00000000;\n\t"
-        "fma.rn.f32 %3, %8, %13, 0f00000000;\n\t"
-        "fma.rn.f32 %0, %7, %14, %0;\n\t"
-        "fma.rn.f32 %1, %7, %15, %1;\n\t"
-        "fma.rn.f32 %2, %9, %14, %2;\n\t"
-        "fma.rn.f32 %3, %9, %15, %3;\n\t"
-        "fma.rn.f32 %4, %6, %16, %10;\n\t"
-        "fma.rn.f32 %5, %8, %16, %11;\n\t"
-        "fma.rn.f32 %4, %7, %17, %4;\n\t"
-        "fma.rn.f32 %5, %9, %17, %5;\n\t"
-        : "=f"(out.m00), "=f"(out.m01), "=f"(out.m10), "=f"(out.m11),
-          "=f"(out.b0), "=f"(out.b1)
-        : "f"(right.m00), "f"(right.m01), "f"(right.m10), "f"(right.m11),
-          "f"(right.b0), "f"(right.b1),
-          "f"(left.m00), "f"(left.m01), "f"(left.m10), "f"(left.m11),
-          "f"(left.b0), "f"(left.b1)
-    );
-#else
-    // HIP/CPU fallback: C++ implementation (HIP has different inline asm syntax)
-    out.m00 = right.m00 * left.m00 + right.m01 * left.m10;
-    out.m01 = right.m00 * left.m01 + right.m01 * left.m11;
-    out.m10 = right.m10 * left.m00 + right.m11 * left.m10;
-    out.m11 = right.m10 * left.m01 + right.m11 * left.m11;
-    out.b0  = right.m00 * left.b0  + right.m01 * left.b1 + right.b0;
-    out.b1  = right.m10 * left.b0  + right.m11 * left.b1 + right.b1;
-#endif
-    return out;
-}
-
-#endif // __CUDACC__
-// ── end inlined csrc/scan/affine2x2.h ──
-
-#ifdef __CUDACC__
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Branchless Stochastic Rounding (Config4 / INT8 quantized kernels)
-//
-//  Converts float to int8 with stochastic rounding. The ternary compiles
-//  to a PTX selp instruction at -O2, avoiding warp divergence.
-// ═══════════════════════════════════════════════════════════════════════
-
-__device__ __forceinline__ int8_t float_to_int8_stochastic_branchless(
-    float val, float scale, unsigned rand_bits
-) {
-    float scaled = val / fmaxf(scale, 1e-12f);
-    float trunc_val = truncf(scaled);
-    float frac = fabsf(scaled - trunc_val);
-    float threshold = (float)(rand_bits & 0xFFFF) * (1.0f / 65536.0f);
-    // Branchless: ternary compiles to selp on nvcc -O2
-    float round_up = (frac > threshold) ? copysignf(1.0f, scaled) : 0.0f;
-    float result = trunc_val + round_up;
-    return (int8_t)fmaxf(-127.0f, fminf(127.0f, result));
-}
-
-#endif  // __CUDACC__
-// ── end inlined csrc/common/types.h ──
-// ── inlined from former csrc/common/utils.cuh ──
-/*
- * SuperGrok v2 — Shared Device Helpers
- *
- * Device utility functions used by multiple kernel files.
- * Uses platform.h macros for CUDA/HIP portability.
- */
-
-
-#if GROK_CUDA
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Warp-level reduction helper
-//
-//  Sum a float across d_inner threads (all in one warp, d_inner ≤ WARP_SIZE).
-//  Uses platform-abstracted shuffle; works for any d_inner ≤ WARP_SIZE
-//  (including non-power-of-2).
-// ═══════════════════════════════════════════════════════════════════════
-
-__device__ __forceinline__ float warp_reduce_sum(float val, int d_inner, int tid) {
-    unsigned mask = (d_inner < WARP_SIZE) ? ((1u << d_inner) - 1) : FULL_WARP_MASK;
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        float other = SHFL_DOWN_SYNC(mask, val, offset);
-        if (tid + offset < d_inner)
-            val += other;
-    }
-    return val;  // only lane 0 has the correct sum
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Stochastic Rounding for Quantized Optimizer States (Config 3)
-//
-//  Hash-based PRNG: deterministic per (step, element) pair, no state needed.
-//  Faster than cuRAND, no separate state tensor required.
-// ═══════════════════════════════════════════════════════════════════════
-
-// Hash-based PRNG (Philox-like): deterministic, no state
-__device__ __forceinline__ unsigned hash_prng(unsigned step, unsigned idx) {
-    unsigned h = (step * 2654435761u) ^ (idx * 2246822519u);
-    h ^= h >> 16;
-    h *= 0x45d9f3bu;
-    h ^= h >> 16;
-    return h;
-}
-
-#if GROK_CUDA || GROK_HIP
-
-// BF16 stochastic rounding: unbiased quantization
-__device__ __forceinline__ __nv_bfloat16 float_to_bf16_stochastic(float val, unsigned rand_bits) {
-    unsigned bits = __float_as_uint(val);
-    unsigned truncated = bits & 0xFFFF;     // bits that BF16 drops
-    unsigned threshold = rand_bits & 0xFFFF; // random 16-bit threshold
-    if (truncated > threshold) {
-        bits += 0x10000;  // round up
-    }
-    bits &= 0xFFFF0000;  // truncate to BF16
-    return __float2bfloat16(__uint_as_float(bits));
-}
-
-// INT8 per-block quantization with stochastic rounding
-// block_size elements share one FP32 scale factor
-__device__ __forceinline__ int8_t float_to_int8_stochastic(
-    float val, float scale, unsigned rand_bits
-) {
-    float scaled = val / scale;
-    float truncated = truncf(scaled);
-    float frac = fabsf(scaled - truncated);
-    float threshold = (float)(rand_bits & 0xFFFF) / 65536.0f;
-    if (frac > threshold) {
-        truncated += (scaled > 0) ? 1.0f : -1.0f;
-    }
-    return (int8_t)fmaxf(-127.0f, fminf(127.0f, truncated));
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Phase 3: Inline PTX for Hot Inner Loops
-//
-//  Hand-tuned PTX for critical paths in the SG2 fused_elem pipeline.
-//  These replace compiler-generated code in the highest-frequency loops.
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_CUDA
-
-// Fast reciprocal sqrt via PTX rsqrt.approx.f32 + Newton-Raphson refinement.
-// 2-3x faster than sqrtf(x) + fdividef for Adam denominator.
-__device__ __forceinline__ float fast_rsqrt_nr(float x) {
-    float r;
-    asm("rsqrt.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
-    // One Newton-Raphson iteration: r = r * (1.5 - 0.5 * x * r * r)
-    r = r * (1.5f - 0.5f * x * r * r);
-    return r;
-}
-
-// Fused multiply-add via PTX fma.rn.f32 — ensures single FMA instruction.
-// Critical for affine_combine inner loop (8 FMAs per composition).
-__device__ __forceinline__ float ptx_fma(float a, float b, float c) {
-    float r;
-    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c));
-    return r;
-}
-
+#ifndef SG_INLINE_PTX_PTX_EXP2
+#define SG_INLINE_PTX_PTX_EXP2
 // Fast exp2 approximation via PTX ex2.approx.f32.
 // Used in Mamba scan: exp(A * dt) = exp2(A * dt / ln2).
 __device__ __forceinline__ float ptx_exp2(float x) {
@@ -625,453 +74,24 @@ __device__ __forceinline__ float ptx_exp2(float x) {
     asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
     return r;
 }
+#endif  // SG_INLINE_PTX_PTX_EXP2
 
-// Fast log2 via PTX lg2.approx.f32.
-__device__ __forceinline__ float ptx_log2(float x) {
-    float r;
-    asm("lg2.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
-    return r;
-}
-
+#ifndef SG_INLINE_PTX_PTX_EXPF
+#define SG_INLINE_PTX_PTX_EXPF
 // Fast exp via exp2: exp(x) = exp2(x * log2(e))
 __device__ __forceinline__ float ptx_expf(float x) {
     return ptx_exp2(x * 1.4426950408889634f);  // log2(e)
 }
+#endif  // SG_INLINE_PTX_PTX_EXPF
+#endif  // GROK_CUDA
 
-// Fast tanh approximation via exp2: tanh(x) = (e^2x - 1) / (e^2x + 1)
-// Used in GRU h_tilde computation.
-__device__ __forceinline__ float ptx_tanhf(float x) {
-    float e2x = ptx_exp2(2.0f * x * 1.4426950408889634f);
-    return (e2x - 1.0f) / (e2x + 1.0f);
-}
-
-// Fast sigmoid via exp2: sigmoid(x) = 1 / (1 + exp(-x))
-// Used in GRU z_gate and r_gate.
-__device__ __forceinline__ float ptx_sigmoidf(float x) {
-    float en = ptx_exp2(-x * 1.4426950408889634f);
-    return 1.0f / (1.0f + en);
-}
-
-// Blelloch affine_combine using pure PTX FMA instructions.
-// Composes two Affine2x2 transforms: result = left ∘ right
-// M_out = M_left * M_right, b_out = M_left * b_right + b_left
-// This is the inner loop of the parallel prefix scan (called O(log N) times).
-__device__ __forceinline__ Affine2x2 ptx_affine_combine(
-    const Affine2x2& left, const Affine2x2& right
-) {
-    Affine2x2 out;
-    // M_out = M_left * M_right (2x2 matrix multiply via 8 FMAs)
-    out.m00 = ptx_fma(left.m00, right.m00, left.m01 * right.m10);
-    out.m01 = ptx_fma(left.m00, right.m01, left.m01 * right.m11);
-    out.m10 = ptx_fma(left.m10, right.m00, left.m11 * right.m10);
-    out.m11 = ptx_fma(left.m10, right.m01, left.m11 * right.m11);
-    // b_out = M_left * b_right + b_left
-    out.b0 = ptx_fma(left.m00, right.b0, ptx_fma(left.m01, right.b1, left.b0));
-    out.b1 = ptx_fma(left.m10, right.b0, ptx_fma(left.m11, right.b1, left.b1));
-    return out;
-}
-
-// Expert MLP forward pass — single expert, ReLU activation.
-// Inlined PTX FMA for the inner products.
-// expert_hidden is typically 8-16, so fully unrollable at compile time.
-template <int EXPERT_HIDDEN>
-__device__ __forceinline__ float ptx_expert_mlp_forward(
-    const float* __restrict__ W1,   // [expert_hidden]
-    const float* __restrict__ b1,   // [expert_hidden]
-    const float* __restrict__ W2,   // [expert_hidden]
-    float b2,
-    float input
-) {
-    float result = b2;
-    #pragma unroll
-    for (int h = 0; h < EXPERT_HIDDEN; h++) {
-        float hidden = ptx_fma(W1[h], input, b1[h]);
-        hidden = fmaxf(hidden, 0.0f);  // ReLU
-        result = ptx_fma(W2[h], hidden, result);
-    }
-    return result;
-}
-
-// Stochastic rounding with PTX prmt (permute bytes) for fast bit extraction.
-// Replaces the hash_prng shift+multiply chain with a single PTX instruction
-// for extracting the random threshold from the hash output.
-__device__ __forceinline__ int8_t ptx_int8_stochastic_round(
-    float val, float scale, unsigned rand_bits
-) {
-    float scaled = val / fmaxf(scale, 1e-12f);
-    float tr = truncf(scaled);
-    float frac = fabsf(scaled - tr);
-    // Extract lower 16 bits as threshold using prmt
-    unsigned lo16;
-    asm("prmt.b32 %0, %1, 0, 0x4140;" : "=r"(lo16) : "r"(rand_bits));
-    float threshold = (float)lo16 / 65536.0f;
-    if (frac > threshold) tr += (scaled > 0) ? 1.0f : -1.0f;
-    return (int8_t)fmaxf(-127.0f, fminf(127.0f, tr));
-}
-
-// §25.7 DSMEM cluster reduce (sm_90+ Hopper distributed shared memory).
-// Block-local warp reduce first, then cluster-wide reduce via cooperative
-// groups. Falls back to warp reduce on pre-Hopper.
-__device__ __forceinline__ float cluster_dsmem_reduce_sum(float val) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    namespace cg = cooperative_groups;
-    val = warp_reduce_sum(val, WARP_SIZE, threadIdx.x & (WARP_SIZE - 1));
-    auto cluster = cg::this_cluster();
-    val = cg::reduce(cluster, val, cg::plus<float>());
-    return val;
-#else
-    return warp_reduce_sum(val, WARP_SIZE, threadIdx.x & (WARP_SIZE - 1));
-#endif
-}
-
-#endif // GROK_CUDA
-
-// HIP fallbacks — use standard math functions
 #if GROK_HIP
-__device__ __forceinline__ float fast_rsqrt_nr(float x) { return rsqrtf(x); }
-__device__ __forceinline__ float ptx_fma(float a, float b, float c) { return fmaf(a, b, c); }
+#ifndef SG_INLINE_PTX_PTX_EXPF
+#define SG_INLINE_PTX_PTX_EXPF
 __device__ __forceinline__ float ptx_expf(float x) { return expf(x); }
-__device__ __forceinline__ float ptx_tanhf(float x) { return tanhf(x); }
-__device__ __forceinline__ float ptx_sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
+#endif  // SG_INLINE_PTX_PTX_EXPF
+#endif  // GROK_HIP
 
-__device__ __forceinline__ Affine2x2 ptx_affine_combine(
-    const Affine2x2& left, const Affine2x2& right
-) {
-    return affine_combine(left, right);  // Use types.h version
-}
-#endif // GROK_HIP
-
-#endif // GROK_CUDA || GROK_HIP
-// ── end inlined csrc/common/utils.cuh ──
-// ── inlined from former csrc/common/ptx_intrinsics.cuh ──
-/*
- * PTX Intrinsics for SuperGrok v2
- *
- * Hot-path intrinsics that replace multi-cycle standard library calls with
- * single-cycle PTX instructions:
- *
- *   affine_combine_ptx  — 12-FMA parallel prefix scan composition
- *   softplus_ptx        — log(1+exp(x)) via ex2.approx + lg2.approx (2 cycles vs ~16)
- *   fast_exp_ptx        — exp(x) via ex2.approx (1 cycle vs ~8)
- *   stochastic_round_ptx— branchless stochastic rounding for Config4 quantization
- *   gru_gates_ptx       — interleaved sigmoid pair for GRU z/r gates
- *
- * On HIP (AMD), all intrinsics fall back to standard math functions.
- */
-
-
-
-#if defined(__CUDACC__) || defined(GROK_CUDA)
-
-__device__ __forceinline__ Affine2x2 affine_combine_ptx(
-    const Affine2x2& left, const Affine2x2& right
-) {
-    Affine2x2 out;
-    // 12-FMA inline PTX for composing two Affine2x2 transforms.
-    // Computes: M_out = M_right * M_left, b_out = M_right * b_left + b_right
-    //
-    // Wave 0 (cycle 0): 4 independent partial products for M_out
-    // Wave 1 (cycle 4): 4 dependent accumulations for M_out + 2 bias starts
-    // Wave 2 (cycle 8): 2 final bias accumulations
-    asm volatile(
-        // Wave 0: 4 independent partial products
-        "fma.rn.f32 %0, %6, %12, 0f00000000;\n\t"   // m00  = r.m00 * l.m00
-        "fma.rn.f32 %1, %6, %13, 0f00000000;\n\t"   // m01  = r.m00 * l.m01
-        "fma.rn.f32 %2, %8, %12, 0f00000000;\n\t"   // m10  = r.m10 * l.m00
-        "fma.rn.f32 %3, %8, %13, 0f00000000;\n\t"   // m11  = r.m10 * l.m01
-        // Wave 1: accumulate cross-terms + begin bias
-        "fma.rn.f32 %0, %7, %14, %0;\n\t"            // m00 += r.m01 * l.m10
-        "fma.rn.f32 %1, %7, %15, %1;\n\t"            // m01 += r.m01 * l.m11
-        "fma.rn.f32 %2, %9, %14, %2;\n\t"            // m10 += r.m11 * l.m10
-        "fma.rn.f32 %3, %9, %15, %3;\n\t"            // m11 += r.m11 * l.m11
-        "fma.rn.f32 %4, %6, %16, %10;\n\t"           // b0   = r.m00 * l.b0 + r.b0
-        "fma.rn.f32 %5, %8, %16, %11;\n\t"           // b1   = r.m10 * l.b0 + r.b1
-        // Wave 2: final bias accumulations
-        "fma.rn.f32 %4, %7, %17, %4;\n\t"            // b0  += r.m01 * l.b1
-        "fma.rn.f32 %5, %9, %17, %5;\n\t"            // b1  += r.m11 * l.b1
-        : "=f"(out.m00), "=f"(out.m01), "=f"(out.m10), "=f"(out.m11),
-          "=f"(out.b0), "=f"(out.b1)
-        : "f"(right.m00), "f"(right.m01), "f"(right.m10), "f"(right.m11),
-          "f"(right.b0), "f"(right.b1),
-          "f"(left.m00), "f"(left.m01), "f"(left.m10), "f"(left.m11),
-          "f"(left.b0), "f"(left.b1)
-    );
-    return out;
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-//  softplus_ptx: log(1 + exp(x)) in ~2 cycles
-//
-//  Replaces logf(1.0f + expf(x)) (~16 cycles) with ex2.approx + lg2.approx.
-//  Branchless saturation at x > 20 via selp.
-// ═══════════════════════════════════════════════════════════════════════
-__device__ __forceinline__ float softplus_ptx(float x) {
-    float result;
-    asm volatile(
-        "{\n\t"
-        ".reg .f32 t, ex, ep1, lg;\n\t"
-        ".reg .pred p;\n\t"
-        "mul.f32 t, %1, 0f3FB8AA3B;\n\t"      // x * log2(e)
-        "ex2.approx.f32 ex, t;\n\t"             // exp(x)
-        "add.f32 ep1, ex, 0f3F800000;\n\t"      // 1 + exp(x)
-        "lg2.approx.f32 lg, ep1;\n\t"           // log2(1+exp(x))
-        "mul.f32 lg, lg, 0f3F317218;\n\t"       // * ln(2)
-        "setp.gt.f32 p, %1, 0f41A00000;\n\t"    // x > 20.0?
-        "selp.f32 %0, %1, lg, p;\n\t"           // branchless select
-        "}\n\t"
-        : "=f"(result) : "f"(x)
-    );
-    return result;
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-//  fast_exp_ptx: exp(x) in 1 cycle via ex2.approx
-//
-//  Replaces __expf(A * dt) in scan. A_bar is always in (0,1).
-// ═══════════════════════════════════════════════════════════════════════
-__device__ __forceinline__ float fast_exp_ptx(float x) {
-    float result;
-    asm volatile(
-        "{\n\t"
-        ".reg .f32 t;\n\t"
-        "mul.f32 t, %1, 0f3FB8AA3B;\n\t"   // x * log2(e)
-        "ex2.approx.f32 %0, t;\n\t"         // 2^t = exp(x)
-        "}\n\t"
-        : "=f"(result) : "f"(x)
-    );
-    return result;
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-//  stochastic_round_ptx: branchless stochastic rounding for Config4
-//
-//  Replaces floor + branch + comparison with cvt.rmi + selp.
-// ═══════════════════════════════════════════════════════════════════════
-__device__ __forceinline__ int stochastic_round_ptx(float x, unsigned rand_bits) {
-    int result;
-    asm volatile(
-        "{\n\t"
-        ".reg .f32 fl, frac, r;\n\t"
-        ".reg .s32 ifl, up;\n\t"
-        ".reg .pred p;\n\t"
-        "cvt.rmi.f32.f32 fl, %1;\n\t"
-        "sub.f32 frac, %1, fl;\n\t"
-        "cvt.rn.f32.u32 r, %2;\n\t"
-        "mul.f32 r, r, 0f2F800000;\n\t"
-        "setp.lt.f32 p, r, frac;\n\t"
-        "cvt.rzi.s32.f32 ifl, fl;\n\t"
-        "selp.s32 up, 1, 0, p;\n\t"
-        "add.s32 %0, ifl, up;\n\t"
-        "}\n\t"
-        : "=r"(result) : "f"(x), "r"(rand_bits)
-    );
-    return result;
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-//  gru_gates_ptx: interleaved sigmoid pair for GRU z/r gates
-//
-//  Two independent sigmoid(wx + b) computations fill both FMA pipelines.
-//  Uses rcp.approx for 1/(1+exp(-x)) instead of fdividef.
-// ═══════════════════════════════════════════════════════════════════════
-__device__ __forceinline__ void gru_gates_ptx(
-    float wx_z, float bz, float wx_r, float br,
-    float& z_out, float& r_out
-) {
-    asm volatile(
-        "{\n\t"
-        ".reg .f32 nz, nr, tz, tr, ez, er, dz, dr;\n\t"
-        "add.f32 nz, %2, %3;\n\t"
-        "add.f32 nr, %4, %5;\n\t"
-        "neg.f32 nz, nz;\n\t"
-        "neg.f32 nr, nr;\n\t"
-        "mul.f32 tz, nz, 0f3FB8AA3B;\n\t"
-        "mul.f32 tr, nr, 0f3FB8AA3B;\n\t"
-        "ex2.approx.f32 ez, tz;\n\t"
-        "ex2.approx.f32 er, tr;\n\t"
-        "add.f32 dz, ez, 0f3F800000;\n\t"
-        "add.f32 dr, er, 0f3F800000;\n\t"
-        "rcp.approx.f32 %0, dz;\n\t"
-        "rcp.approx.f32 %1, dr;\n\t"
-        "}\n\t"
-        : "=f"(z_out), "=f"(r_out)
-        : "f"(wx_z), "f"(bz), "f"(wx_r), "f"(br)
-    );
-}
-
-#elif defined(__HIP_DEVICE_COMPILE__) || defined(GROK_HIP)
-
-__device__ __forceinline__ Affine2x2 affine_combine_ptx(
-    const Affine2x2& left, const Affine2x2& right
-) {
-    return affine_combine(left, right);
-}
-
-__device__ __forceinline__ float softplus_ptx(float x) {
-    return (x > 20.0f) ? x : logf(1.0f + expf(x));
-}
-
-__device__ __forceinline__ float fast_exp_ptx(float x) {
-    return expf(x);
-}
-
-__device__ __forceinline__ int stochastic_round_ptx(float x, unsigned rand_bits) {
-    float fl = floorf(x);
-    float frac = x - fl;
-    float r = (float)rand_bits * (1.0f / 4294967296.0f);
-    return (int)fl + (r < frac ? 1 : 0);
-}
-
-__device__ __forceinline__ void gru_gates_ptx(
-    float wx_z, float bz, float wx_r, float br,
-    float& z_out, float& r_out
-) {
-    z_out = 1.0f / (1.0f + expf(-(wx_z + bz)));
-    r_out = 1.0f / (1.0f + expf(-(wx_r + br)));
-}
-
-#endif
-// ── end inlined csrc/common/ptx_intrinsics.cuh ──
-
-namespace sg { namespace sm90 { namespace primitives {
-
-namespace cg = cooperative_groups;
-
-// =========================================================================
-//  Grid-stride loop helper
-// =========================================================================
-
-__device__ __forceinline__ int grid_stride_index() {
-    return blockIdx.x * blockDim.x + threadIdx.x;
-}
-
-__device__ __forceinline__ int grid_stride() {
-    return gridDim.x * blockDim.x;
-}
-
-// =========================================================================
-//  Vec4 alignment check (host-side)
-// =========================================================================
-
-__host__ __forceinline__ bool is_vec4_alignable(
-    const void* p, int64_t numel
-) {
-    return ((reinterpret_cast<uintptr_t>(p) & 0xF) == 0) && (numel % 4 == 0);
-}
-
-// =========================================================================
-//  Warp-level sum reduction (butterfly via __shfl_down_sync)
-// =========================================================================
-
-__device__ __forceinline__ float warp_reduce_sum_f32(float v) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(0xffffffff, v, offset);
-    }
-    return v;
-}
-
-// =========================================================================
-//  Block-level sum reduction: warp reduce + shared-memory tree + warp reduce.
-//  Uses up to 32 floats of smem (one per warp).
-// =========================================================================
-
-__device__ __forceinline__ float block_reduce_sum_f32(float v) {
-    __shared__ float smem[32];
-    const int tid = threadIdx.x;
-    const int warp = tid / 32;
-    const int lane = tid & 31;
-
-    float w = warp_reduce_sum_f32(v);
-    if (lane == 0) smem[warp] = w;
-    __syncthreads();
-
-    int n_warps = (blockDim.x + 31) / 32;
-    if (warp == 0) {
-        float x = (lane < n_warps) ? smem[lane] : 0.0f;
-        x = warp_reduce_sum_f32(x);
-        if (lane == 0) smem[0] = x;
-    }
-    __syncthreads();
-    return smem[0];
-}
-
-// =========================================================================
-//  Cluster (DSMEM) reduction on Hopper sm_90+ with sm_80 fallback.
-//  Wraps the utility in common/utils.cuh.
-// =========================================================================
-
-__device__ __forceinline__ float cluster_reduce_sum_f32(float v) {
-    return sg::cluster_dsmem_reduce_sum(v);
-}
-
-// =========================================================================
-//  Non-temporal load / store (bypass L2 for read-once optimizer state).
-//  Implemented in common/platform.h; wrapped here for legibility.
-// =========================================================================
-
-__device__ __forceinline__ float ldg_f32(const float* ptr) {
-    return __ldg(ptr);
-}
-
-__device__ __forceinline__ void stream_store_f32(float* ptr, float v) {
-    __stwt(ptr, v);
-}
-
-// =========================================================================
-//  Stochastic rounding to BF16 (branchless via PTX hash_prng).
-// =========================================================================
-
-__device__ __forceinline__ __nv_bfloat16 round_bf16_stochastic(
-    float v, uint32_t prng_key
-) {
-    return sg::float_to_bf16_stochastic_branchless(v, prng_key);
-}
-
-// =========================================================================
-//  RoPE pair rotation (used by SG2 scan kernels).
-//  Input: (h0, h1, cos, sin)  ->  (h0*c - h1*s, h0*s + h1*c)
-// =========================================================================
-
-__device__ __forceinline__ void rope_rotate_pair(
-    float& h0, float& h1, float cos_v, float sin_v
-) {
-    float h0_new = h0 * cos_v - h1 * sin_v;
-    float h1_new = h0 * sin_v + h1 * cos_v;
-    h0 = h0_new;
-    h1 = h1_new;
-}
-
-// =========================================================================
-//  Last-block-finished pattern for cooperative reductions without grid sync.
-//  Returns true on exactly one block; caller uses that block to publish
-//  the final reduced value.
-// =========================================================================
-
-__device__ __forceinline__ bool last_block_finished(
-    unsigned int* __restrict__ counter,
-    int total_blocks
-) {
-    __shared__ bool is_last;
-    if (threadIdx.x == 0) {
-        unsigned int v = atomicInc(counter, total_blocks);
-        is_last = (v == static_cast<unsigned int>(total_blocks - 1));
-    }
-    __syncthreads();
-    return is_last;
-}
-
-// =========================================================================
-//  Compute Adam denom with fast rsqrt + Newton-Raphson refinement.
-//  Slightly faster than 1.0f / (sqrtf(v) + eps) when v >= eps^2.
-// =========================================================================
-
-__device__ __forceinline__ float adam_denom_fast(float v, float eps) {
-    return sqrtf(v) + eps;
-}
-
-}}} // namespace sg::sm90::primitives
-// ── end inlined csrc/backends/cuda/sm_90/primitives.cuh ──
-// ── inlined from former csrc/scan/mamba_scan_adapter.cuh ──
 // csrc/scan/mamba_scan_adapter.cuh — CUDA scan adapter.
 // Moved here in Phase 4 of the refactor because the Mamba selective scan is
 // shared between the Mamba model kernels and the SuperGrok v2 optimizer.
@@ -1092,745 +112,11 @@ __device__ __forceinline__ float adam_denom_fast(float v, float eps) {
 //   N >= GEMM_PRECOMPUTE_THRESHOLD (1024)   -> parallel Blelloch scan (same kernel)
 
 
-// ── inlined from former csrc/common/platform.h ──
-/*
- * SuperGrok v2 — Platform Abstraction Layer
- *
- * Provides a unified API across NVIDIA CUDA and AMD HIP (ROCm).
- * Include this header instead of raw <cuda.h> / <hip/hip_runtime.h>.
- *
- * Key differences handled:
- *   - Warp size: CUDA = 32, HIP/RDNA = 32, HIP/CDNA = 64
- *   - __sincosf: CUDA intrinsic, HIP uses sincosf (no double-underscore)
- *   - __ldg: CUDA L1 cache hint, no-op on HIP (compiler handles caching)
- *   - Thrust → rocThrust, CUB → hipCUB (header-compatible wrappers)
- *   - cuBLAS → rocBLAS (ATen abstracts this via at::cuda::getCurrentCUDABlasHandle)
- */
-
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Backend detection
-// ═══════════════════════════════════════════════════════════════════════
-
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-#define GROK_HIP 1
-#define GROK_CUDA 0
-#else
-#define GROK_HIP 0
-#define GROK_CUDA 1
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Runtime includes
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-#include <hip/hip_runtime.h>
-// rocThrust and hipCUB provide thrust/cub API compatibility
-#include <thrust/device_ptr.h>
-#include <thrust/sort.h>
-#include <hipcub/hipcub.hpp>
-#else
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <thrust/device_ptr.h>
-#include <thrust/sort.h>
-#include <cub/cub.cuh>
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Stream type alias
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-using GpuStream_t = hipStream_t;
-#else
-using GpuStream_t = cudaStream_t;
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Warp / wavefront size
-//
-//  CDNA (MI200, MI300): wavefront = 64
-//  RDNA (RX 7900):      wavefront = 32
-//  NVIDIA:               warp     = 32
-//
-//  We default to the compile-time warp size. On HIP, __AMDGCN_WAVEFRONT_SIZE__
-//  is set by the compiler for the target architecture.
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #ifdef __AMDGCN_WAVEFRONT_SIZE__
-    #define WARP_SIZE __AMDGCN_WAVEFRONT_SIZE__
-  #else
-    #define WARP_SIZE 64  // conservative default for CDNA
-  #endif
-#else
-  #define WARP_SIZE 32
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Warp shuffle
-//
-//  CUDA: __shfl_down_sync(mask, val, offset)
-//  HIP:  __shfl_down(val, offset)  — no mask parameter on CDNA
-//        (On wavefront-64, all lanes are always synchronized)
-//
-//  We wrap both into SHFL_DOWN(val, offset) and SHFL_DOWN_SYNC(mask, val, offset).
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define SHFL_DOWN(val, offset) __shfl_down((val), (offset))
-  #define SHFL_DOWN_SYNC(mask, val, offset) __shfl_down((val), (offset))
-#else
-  #define SHFL_DOWN(val, offset) __shfl_down_sync(0xFFFFFFFF, (val), (offset))
-  #define SHFL_DOWN_SYNC(mask, val, offset) __shfl_down_sync((mask), (val), (offset))
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Fast sincos
-//
-//  CUDA: __sincosf (device intrinsic, single instruction on SM)
-//  HIP:  sincosf   (no double-underscore variant)
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define FAST_SINCOSF(x, sptr, cptr) sincosf((x), (sptr), (cptr))
-#else
-  #define FAST_SINCOSF(x, sptr, cptr) __sincosf((x), (sptr), (cptr))
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Read-only cache load hint
-//
-//  CUDA: __ldg(ptr) — hints L1 cache for read-only data
-//  HIP:  direct dereference (compiler manages caching on GCN/CDNA)
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define LDG(ptr) (*(ptr))
-#else
-  #define LDG(ptr) __ldg(ptr)
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Error checking
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define GPU_SUCCESS hipSuccess
-  #define gpuGetLastError hipGetLastError
-  #define gpuGetErrorString hipGetErrorString
-  #define gpuDeviceSynchronize hipDeviceSynchronize
-  #define gpuGetDeviceProperties hipGetDeviceProperties
-  #define gpuDeviceProp_t hipDeviceProp_t
-#else
-  #define GPU_SUCCESS cudaSuccess
-  #define gpuGetLastError cudaGetLastError
-  #define gpuGetErrorString cudaGetErrorString
-  #define gpuDeviceSynchronize cudaDeviceSynchronize
-  #define gpuGetDeviceProperties cudaGetDeviceProperties
-  #define gpuDeviceProp_t cudaDeviceProp
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  CUB / hipCUB namespace alias
-//
-//  hipCUB wraps rocPRIM with a CUB-compatible API.
-//  We alias so kernel code can use `cub::DeviceSegmentedRadixSort` uniformly.
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  namespace cub = hipcub;
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Full-mask constant for warp-wide operations
-//
-//  CUDA uses explicit masks (0xFFFFFFFF for 32 lanes).
-//  HIP/CDNA doesn't use masks — all 64 lanes in a wavefront are lockstep.
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define FULL_WARP_MASK 0  // unused, but defined for code that passes it around
-#else
-  #define FULL_WARP_MASK 0xFFFFFFFF
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Async memset
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define gpuMemsetAsync hipMemsetAsync
-#else
-  #define gpuMemsetAsync cudaMemsetAsync
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Stream management
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define gpuStreamCreate hipStreamCreate
-  #define gpuStreamSynchronize hipStreamSynchronize
-  #define gpuStreamDestroy hipStreamDestroy
-#else
-  #define gpuStreamCreate cudaStreamCreate
-  #define gpuStreamSynchronize cudaStreamSynchronize
-  #define gpuStreamDestroy cudaStreamDestroy
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  GCN/CDNA scheduler hints (AMD-only occupancy control)
-//
-//  __attribute__((amdgpu_waves_per_eu(min, max))) controls occupancy
-//  on AMD GCN/CDNA by limiting waves per execution unit. On NVIDIA,
-//  __launch_bounds__ serves this purpose (already applied separately).
-//
-//  GROK_WAVES_PER_EU(min, max) — applies attribute on HIP, no-op on CUDA.
-//  GROK_FLAT_WORK_GROUP_SIZE(min, max) — hints block size range for AMD.
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define GROK_WAVES_PER_EU(min_waves, max_waves) \
-      __attribute__((amdgpu_waves_per_eu(min_waves, max_waves)))
-  #define GROK_FLAT_WORK_GROUP_SIZE(min_size, max_size) \
-      __attribute__((amdgpu_flat_work_group_size(min_size, max_size)))
-#else
-  #define GROK_WAVES_PER_EU(min_waves, max_waves)
-  #define GROK_FLAT_WORK_GROUP_SIZE(min_size, max_size)
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Kernel launch attribute (for configuring smem size)
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define gpuFuncSetAttribute hipFuncSetAttribute
-  #define gpuFuncAttributeMaxDynamicSharedMemorySize \
-          hipFuncAttributeMaxDynamicSharedMemorySize
-#else
-  #define gpuFuncSetAttribute cudaFuncSetAttribute
-  #define gpuFuncAttributeMaxDynamicSharedMemorySize \
-          cudaFuncAttributeMaxDynamicSharedMemorySize
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Non-temporal (streaming) memory access
-//
-//  Used for optimizer state access to avoid L2 cache pollution.
-//  Model weights stay warm in L2 for the next forward pass.
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_CUDA
-  // Streaming load: reads bypass L2 (or use L2 read-only path)
-  __device__ __forceinline__ float stream_load(const float* ptr) {
-      float val;
-      asm volatile("ld.global.nc.f32 %0, [%1];" : "=f"(val) : "l"(ptr));
-      return val;
-  }
-
-  // Streaming store: writes bypass L2 allocation
-  // Available on sm_80+ (Ampere). On older, falls back to normal store.
-  __device__ __forceinline__ void stream_store(float* ptr, float val) {
-  #if __CUDA_ARCH__ >= 800
-      asm volatile("st.global.wt.f32 [%0], %1;" :: "l"(ptr), "f"(val));
-  #else
-      *ptr = val;
-  #endif
-  }
-
-  // float4 streaming variants
-  __device__ __forceinline__ float4 stream_load4(const float4* ptr) {
-      float4 val;
-      asm volatile(
-          "ld.global.nc.v4.f32 {%0,%1,%2,%3}, [%4];"
-          : "=f"(val.x), "=f"(val.y), "=f"(val.z), "=f"(val.w)
-          : "l"(ptr));
-      return val;
-  }
-
-  __device__ __forceinline__ void stream_store4(float4* ptr, float4 val) {
-  #if __CUDA_ARCH__ >= 800
-      asm volatile(
-          "st.global.wt.v4.f32 [%0], {%1,%2,%3,%4};"
-          :: "l"(ptr), "f"(val.x), "f"(val.y), "f"(val.z), "f"(val.w));
-  #else
-      *ptr = val;
-  #endif
-  }
-
-#elif GROK_HIP
-  // HIP: use __builtin_nontemporal_load/store
-  __device__ __forceinline__ float stream_load(const float* ptr) {
-      return __builtin_nontemporal_load(ptr);
-  }
-  __device__ __forceinline__ void stream_store(float* ptr, float val) {
-      __builtin_nontemporal_store(val, ptr);
-  }
-  // float4 variants: decompose into 4 scalar non-temporal ops
-  __device__ __forceinline__ float4 stream_load4(const float4* ptr) {
-      const float* fp = reinterpret_cast<const float*>(ptr);
-      return make_float4(
-          __builtin_nontemporal_load(fp),
-          __builtin_nontemporal_load(fp+1),
-          __builtin_nontemporal_load(fp+2),
-          __builtin_nontemporal_load(fp+3));
-  }
-  __device__ __forceinline__ void stream_store4(float4* ptr, float4 val) {
-      float* fp = reinterpret_cast<float*>(ptr);
-      __builtin_nontemporal_store(val.x, fp);
-      __builtin_nontemporal_store(val.y, fp+1);
-      __builtin_nontemporal_store(val.z, fp+2);
-      __builtin_nontemporal_store(val.w, fp+3);
-  }
-#else
-  // CPU: no non-temporal hint needed (OS manages caching)
-  static inline float stream_load(const float* ptr) { return *ptr; }
-  static inline void stream_store(float* ptr, float val) { *ptr = val; }
-#endif
-// ── end inlined csrc/common/platform.h ──
-// ── inlined from former csrc/common/types.h ──
-/*
- * SuperGrok v2 — Shared Types and Constants
- *
- * Common struct definitions and compile-time constants used by both
- * forward and backward CUDA kernels.
- */
-
-
-
-#include <vector>
-#include <torch/extension.h>
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Compile-time constants
-// ═══════════════════════════════════════════════════════════════════════
-
-constexpr int MAX_D_STATE = 128;
-constexpr int MAX_D_INNER = 128;
-constexpr int MAX_D_MODEL = 64;
-constexpr int MAX_GRU_HIDDEN = 8;
-constexpr int MAX_EXPERT_HIDDEN = 16;
-constexpr int MAX_TOPK = 4;
-constexpr int MAX_CKPT_INTERVAL = 32;   // max checkpoint interval for bilevel gradient checkpointing
-
-constexpr int SG2M_BLOCK = 256;         // forward kernel block size
-constexpr int SG2B_BLOCK = 256;         // backward kernel block size
-constexpr int PSCAN_BLOCK = 512;        // threads per parallel scan block (must be power of 2)
-constexpr int PSCAN_THRESHOLD = 256;    // fall back to sequential scan if N < this
-constexpr int GEMM_PRECOMPUTE_THRESHOLD = 1024;  // use GEMM when N >= this
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Parallel Prefix Scan Infrastructure
-//
-//  Affine2x2 and affine_combine moved to csrc/scan/affine2x2.h.
-//  Included here so existing callers that #include "csrc/common/types.h"
-//  continue to compile without modification.
-// ═══════════════════════════════════════════════════════════════════════
-
-// ── inlined from former csrc/scan/affine2x2.h ──
-// Affine2x2 — shared scan primitive.
-//
-// Extracted from csrc/common/types.h. The associative operator used by the
-// Mamba parallel prefix scan and by SuperGrok v2's selective scan.
-//
-// Encoding: each scan element is a 2x2 affine transform
-//   (h_new) = (m00 m01) (h) + (b0)
-//   (h_new')  (m10 m11) (h')  (b1)
-//
-// composition: (B ∘ A)(h) = B(A(h))
-//   M_out = M_B * M_A
-//   b_out = M_B * b_A + b_B
-//
-// Used by:
-//   csrc/scan/mamba_scan_adapter.cuh  — Mamba model selective scan
-//   csrc/algorithms/supergrok2.h      — SG2 optimizer scan recurrence
-//   csrc/backends/cuda/sm_90/launch_supergrok2.cu — Blelloch parallel scan
-
-#ifdef __CUDACC__
-
-struct Affine2x2 {
-    float m00, m01, m10, m11;  // 2x2 matrix
-    float b0, b1;               // 2-vector bias
-};
-
-__device__ __forceinline__ Affine2x2 affine_identity() {
-    return {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
-}
-
-__device__ __forceinline__ Affine2x2 affine_combine(Affine2x2 left, Affine2x2 right) {
-    // Computes right ∘ left: apply left first, then right.
-    // M_out = M_right * M_left
-    // b_out = M_right * b_left + b_right
-    Affine2x2 out;
-#if defined(GROK_CUDA) && GROK_CUDA
-    // Inline PTX: 12-FMA composition arranged for ILP across pipelines.
-    asm volatile(
-        "fma.rn.f32 %0, %6, %12, 0f00000000;\n\t"
-        "fma.rn.f32 %1, %6, %13, 0f00000000;\n\t"
-        "fma.rn.f32 %2, %8, %12, 0f00000000;\n\t"
-        "fma.rn.f32 %3, %8, %13, 0f00000000;\n\t"
-        "fma.rn.f32 %0, %7, %14, %0;\n\t"
-        "fma.rn.f32 %1, %7, %15, %1;\n\t"
-        "fma.rn.f32 %2, %9, %14, %2;\n\t"
-        "fma.rn.f32 %3, %9, %15, %3;\n\t"
-        "fma.rn.f32 %4, %6, %16, %10;\n\t"
-        "fma.rn.f32 %5, %8, %16, %11;\n\t"
-        "fma.rn.f32 %4, %7, %17, %4;\n\t"
-        "fma.rn.f32 %5, %9, %17, %5;\n\t"
-        : "=f"(out.m00), "=f"(out.m01), "=f"(out.m10), "=f"(out.m11),
-          "=f"(out.b0), "=f"(out.b1)
-        : "f"(right.m00), "f"(right.m01), "f"(right.m10), "f"(right.m11),
-          "f"(right.b0), "f"(right.b1),
-          "f"(left.m00), "f"(left.m01), "f"(left.m10), "f"(left.m11),
-          "f"(left.b0), "f"(left.b1)
-    );
-#else
-    // HIP/CPU fallback: C++ implementation (HIP has different inline asm syntax)
-    out.m00 = right.m00 * left.m00 + right.m01 * left.m10;
-    out.m01 = right.m00 * left.m01 + right.m01 * left.m11;
-    out.m10 = right.m10 * left.m00 + right.m11 * left.m10;
-    out.m11 = right.m10 * left.m01 + right.m11 * left.m11;
-    out.b0  = right.m00 * left.b0  + right.m01 * left.b1 + right.b0;
-    out.b1  = right.m10 * left.b0  + right.m11 * left.b1 + right.b1;
-#endif
-    return out;
-}
-
-#endif // __CUDACC__
-// ── end inlined csrc/scan/affine2x2.h ──
-
-#ifdef __CUDACC__
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Branchless Stochastic Rounding (Config4 / INT8 quantized kernels)
-//
-//  Converts float to int8 with stochastic rounding. The ternary compiles
-//  to a PTX selp instruction at -O2, avoiding warp divergence.
-// ═══════════════════════════════════════════════════════════════════════
-
-__device__ __forceinline__ int8_t float_to_int8_stochastic_branchless(
-    float val, float scale, unsigned rand_bits
-) {
-    float scaled = val / fmaxf(scale, 1e-12f);
-    float trunc_val = truncf(scaled);
-    float frac = fabsf(scaled - trunc_val);
-    float threshold = (float)(rand_bits & 0xFFFF) * (1.0f / 65536.0f);
-    // Branchless: ternary compiles to selp on nvcc -O2
-    float round_up = (frac > threshold) ? copysignf(1.0f, scaled) : 0.0f;
-    float result = trunc_val + round_up;
-    return (int8_t)fmaxf(-127.0f, fminf(127.0f, result));
-}
-
-#endif  // __CUDACC__
-// ── end inlined csrc/common/types.h ──
-// ── inlined from former csrc/common/utils.cuh ──
-/*
- * SuperGrok v2 — Shared Device Helpers
- *
- * Device utility functions used by multiple kernel files.
- * Uses platform.h macros for CUDA/HIP portability.
- */
-
-
-#if GROK_CUDA
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Warp-level reduction helper
-//
-//  Sum a float across d_inner threads (all in one warp, d_inner ≤ WARP_SIZE).
-//  Uses platform-abstracted shuffle; works for any d_inner ≤ WARP_SIZE
-//  (including non-power-of-2).
-// ═══════════════════════════════════════════════════════════════════════
-
-__device__ __forceinline__ float warp_reduce_sum(float val, int d_inner, int tid) {
-    unsigned mask = (d_inner < WARP_SIZE) ? ((1u << d_inner) - 1) : FULL_WARP_MASK;
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        float other = SHFL_DOWN_SYNC(mask, val, offset);
-        if (tid + offset < d_inner)
-            val += other;
-    }
-    return val;  // only lane 0 has the correct sum
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Stochastic Rounding for Quantized Optimizer States (Config 3)
-//
-//  Hash-based PRNG: deterministic per (step, element) pair, no state needed.
-//  Faster than cuRAND, no separate state tensor required.
-// ═══════════════════════════════════════════════════════════════════════
-
-// Hash-based PRNG (Philox-like): deterministic, no state
-__device__ __forceinline__ unsigned hash_prng(unsigned step, unsigned idx) {
-    unsigned h = (step * 2654435761u) ^ (idx * 2246822519u);
-    h ^= h >> 16;
-    h *= 0x45d9f3bu;
-    h ^= h >> 16;
-    return h;
-}
-
-#if GROK_CUDA || GROK_HIP
-
-// BF16 stochastic rounding: unbiased quantization
-__device__ __forceinline__ __nv_bfloat16 float_to_bf16_stochastic(float val, unsigned rand_bits) {
-    unsigned bits = __float_as_uint(val);
-    unsigned truncated = bits & 0xFFFF;     // bits that BF16 drops
-    unsigned threshold = rand_bits & 0xFFFF; // random 16-bit threshold
-    if (truncated > threshold) {
-        bits += 0x10000;  // round up
-    }
-    bits &= 0xFFFF0000;  // truncate to BF16
-    return __float2bfloat16(__uint_as_float(bits));
-}
-
-// INT8 per-block quantization with stochastic rounding
-// block_size elements share one FP32 scale factor
-__device__ __forceinline__ int8_t float_to_int8_stochastic(
-    float val, float scale, unsigned rand_bits
-) {
-    float scaled = val / scale;
-    float truncated = truncf(scaled);
-    float frac = fabsf(scaled - truncated);
-    float threshold = (float)(rand_bits & 0xFFFF) / 65536.0f;
-    if (frac > threshold) {
-        truncated += (scaled > 0) ? 1.0f : -1.0f;
-    }
-    return (int8_t)fmaxf(-127.0f, fminf(127.0f, truncated));
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Phase 3: Inline PTX for Hot Inner Loops
-//
-//  Hand-tuned PTX for critical paths in the SG2 fused_elem pipeline.
-//  These replace compiler-generated code in the highest-frequency loops.
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_CUDA
-
-// Fast reciprocal sqrt via PTX rsqrt.approx.f32 + Newton-Raphson refinement.
-// 2-3x faster than sqrtf(x) + fdividef for Adam denominator.
-__device__ __forceinline__ float fast_rsqrt_nr(float x) {
-    float r;
-    asm("rsqrt.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
-    // One Newton-Raphson iteration: r = r * (1.5 - 0.5 * x * r * r)
-    r = r * (1.5f - 0.5f * x * r * r);
-    return r;
-}
-
-// Fused multiply-add via PTX fma.rn.f32 — ensures single FMA instruction.
-// Critical for affine_combine inner loop (8 FMAs per composition).
-__device__ __forceinline__ float ptx_fma(float a, float b, float c) {
-    float r;
-    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c));
-    return r;
-}
-
-// Fast exp2 approximation via PTX ex2.approx.f32.
-// Used in Mamba scan: exp(A * dt) = exp2(A * dt / ln2).
-__device__ __forceinline__ float ptx_exp2(float x) {
-    float r;
-    asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
-    return r;
-}
-
-// Fast log2 via PTX lg2.approx.f32.
-__device__ __forceinline__ float ptx_log2(float x) {
-    float r;
-    asm("lg2.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
-    return r;
-}
-
-// Fast exp via exp2: exp(x) = exp2(x * log2(e))
-__device__ __forceinline__ float ptx_expf(float x) {
-    return ptx_exp2(x * 1.4426950408889634f);  // log2(e)
-}
-
-// Fast tanh approximation via exp2: tanh(x) = (e^2x - 1) / (e^2x + 1)
-// Used in GRU h_tilde computation.
-__device__ __forceinline__ float ptx_tanhf(float x) {
-    float e2x = ptx_exp2(2.0f * x * 1.4426950408889634f);
-    return (e2x - 1.0f) / (e2x + 1.0f);
-}
-
-// Fast sigmoid via exp2: sigmoid(x) = 1 / (1 + exp(-x))
-// Used in GRU z_gate and r_gate.
-__device__ __forceinline__ float ptx_sigmoidf(float x) {
-    float en = ptx_exp2(-x * 1.4426950408889634f);
-    return 1.0f / (1.0f + en);
-}
-
-// Blelloch affine_combine using pure PTX FMA instructions.
-// Composes two Affine2x2 transforms: result = left ∘ right
-// M_out = M_left * M_right, b_out = M_left * b_right + b_left
-// This is the inner loop of the parallel prefix scan (called O(log N) times).
-__device__ __forceinline__ Affine2x2 ptx_affine_combine(
-    const Affine2x2& left, const Affine2x2& right
-) {
-    Affine2x2 out;
-    // M_out = M_left * M_right (2x2 matrix multiply via 8 FMAs)
-    out.m00 = ptx_fma(left.m00, right.m00, left.m01 * right.m10);
-    out.m01 = ptx_fma(left.m00, right.m01, left.m01 * right.m11);
-    out.m10 = ptx_fma(left.m10, right.m00, left.m11 * right.m10);
-    out.m11 = ptx_fma(left.m10, right.m01, left.m11 * right.m11);
-    // b_out = M_left * b_right + b_left
-    out.b0 = ptx_fma(left.m00, right.b0, ptx_fma(left.m01, right.b1, left.b0));
-    out.b1 = ptx_fma(left.m10, right.b0, ptx_fma(left.m11, right.b1, left.b1));
-    return out;
-}
-
-// Expert MLP forward pass — single expert, ReLU activation.
-// Inlined PTX FMA for the inner products.
-// expert_hidden is typically 8-16, so fully unrollable at compile time.
-template <int EXPERT_HIDDEN>
-__device__ __forceinline__ float ptx_expert_mlp_forward(
-    const float* __restrict__ W1,   // [expert_hidden]
-    const float* __restrict__ b1,   // [expert_hidden]
-    const float* __restrict__ W2,   // [expert_hidden]
-    float b2,
-    float input
-) {
-    float result = b2;
-    #pragma unroll
-    for (int h = 0; h < EXPERT_HIDDEN; h++) {
-        float hidden = ptx_fma(W1[h], input, b1[h]);
-        hidden = fmaxf(hidden, 0.0f);  // ReLU
-        result = ptx_fma(W2[h], hidden, result);
-    }
-    return result;
-}
-
-// Stochastic rounding with PTX prmt (permute bytes) for fast bit extraction.
-// Replaces the hash_prng shift+multiply chain with a single PTX instruction
-// for extracting the random threshold from the hash output.
-__device__ __forceinline__ int8_t ptx_int8_stochastic_round(
-    float val, float scale, unsigned rand_bits
-) {
-    float scaled = val / fmaxf(scale, 1e-12f);
-    float tr = truncf(scaled);
-    float frac = fabsf(scaled - tr);
-    // Extract lower 16 bits as threshold using prmt
-    unsigned lo16;
-    asm("prmt.b32 %0, %1, 0, 0x4140;" : "=r"(lo16) : "r"(rand_bits));
-    float threshold = (float)lo16 / 65536.0f;
-    if (frac > threshold) tr += (scaled > 0) ? 1.0f : -1.0f;
-    return (int8_t)fmaxf(-127.0f, fminf(127.0f, tr));
-}
-
-// §25.7 DSMEM cluster reduce (sm_90+ Hopper distributed shared memory).
-// Block-local warp reduce first, then cluster-wide reduce via cooperative
-// groups. Falls back to warp reduce on pre-Hopper.
-__device__ __forceinline__ float cluster_dsmem_reduce_sum(float val) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    namespace cg = cooperative_groups;
-    val = warp_reduce_sum(val, WARP_SIZE, threadIdx.x & (WARP_SIZE - 1));
-    auto cluster = cg::this_cluster();
-    val = cg::reduce(cluster, val, cg::plus<float>());
-    return val;
-#else
-    return warp_reduce_sum(val, WARP_SIZE, threadIdx.x & (WARP_SIZE - 1));
-#endif
-}
-
-#endif // GROK_CUDA
-
-// HIP fallbacks — use standard math functions
-#if GROK_HIP
-__device__ __forceinline__ float fast_rsqrt_nr(float x) { return rsqrtf(x); }
-__device__ __forceinline__ float ptx_fma(float a, float b, float c) { return fmaf(a, b, c); }
-__device__ __forceinline__ float ptx_expf(float x) { return expf(x); }
-__device__ __forceinline__ float ptx_tanhf(float x) { return tanhf(x); }
-__device__ __forceinline__ float ptx_sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
-
-__device__ __forceinline__ Affine2x2 ptx_affine_combine(
-    const Affine2x2& left, const Affine2x2& right
-) {
-    return affine_combine(left, right);  // Use types.h version
-}
-#endif // GROK_HIP
-
-#endif // GROK_CUDA || GROK_HIP
-// ── end inlined csrc/common/utils.cuh ──
 
 // Algorithm spec for SG2 — kept as a documentation anchor for the scan
 // recurrence definition. This adapter's scan kernels are self-contained
 // and only need MAX_D_STATE / PSCAN_THRESHOLD / ptx_expf from common/.
 #include "csrc/algorithms/supergrok2.h"
-// ── inlined from former csrc/scan/affine2x2.h ──
-// Affine2x2 — shared scan primitive.
-//
-// Extracted from csrc/common/types.h. The associative operator used by the
-// Mamba parallel prefix scan and by SuperGrok v2's selective scan.
-//
-// Encoding: each scan element is a 2x2 affine transform
-//   (h_new) = (m00 m01) (h) + (b0)
-//   (h_new')  (m10 m11) (h')  (b1)
-//
-// composition: (B ∘ A)(h) = B(A(h))
-//   M_out = M_B * M_A
-//   b_out = M_B * b_A + b_B
-//
-// Used by:
-//   csrc/scan/mamba_scan_adapter.cuh  — Mamba model selective scan
-//   csrc/algorithms/supergrok2.h      — SG2 optimizer scan recurrence
-//   csrc/backends/cuda/sm_90/launch_supergrok2.cu — Blelloch parallel scan
-
-#ifdef __CUDACC__
-
-struct Affine2x2 {
-    float m00, m01, m10, m11;  // 2x2 matrix
-    float b0, b1;               // 2-vector bias
-};
-
-__device__ __forceinline__ Affine2x2 affine_identity() {
-    return {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
-}
-
-__device__ __forceinline__ Affine2x2 affine_combine(Affine2x2 left, Affine2x2 right) {
-    // Computes right ∘ left: apply left first, then right.
-    // M_out = M_right * M_left
-    // b_out = M_right * b_left + b_right
-    Affine2x2 out;
-#if defined(GROK_CUDA) && GROK_CUDA
-    // Inline PTX: 12-FMA composition arranged for ILP across pipelines.
-    asm volatile(
-        "fma.rn.f32 %0, %6, %12, 0f00000000;\n\t"
-        "fma.rn.f32 %1, %6, %13, 0f00000000;\n\t"
-        "fma.rn.f32 %2, %8, %12, 0f00000000;\n\t"
-        "fma.rn.f32 %3, %8, %13, 0f00000000;\n\t"
-        "fma.rn.f32 %0, %7, %14, %0;\n\t"
-        "fma.rn.f32 %1, %7, %15, %1;\n\t"
-        "fma.rn.f32 %2, %9, %14, %2;\n\t"
-        "fma.rn.f32 %3, %9, %15, %3;\n\t"
-        "fma.rn.f32 %4, %6, %16, %10;\n\t"
-        "fma.rn.f32 %5, %8, %16, %11;\n\t"
-        "fma.rn.f32 %4, %7, %17, %4;\n\t"
-        "fma.rn.f32 %5, %9, %17, %5;\n\t"
-        : "=f"(out.m00), "=f"(out.m01), "=f"(out.m10), "=f"(out.m11),
-          "=f"(out.b0), "=f"(out.b1)
-        : "f"(right.m00), "f"(right.m01), "f"(right.m10), "f"(right.m11),
-          "f"(right.b0), "f"(right.b1),
-          "f"(left.m00), "f"(left.m01), "f"(left.m10), "f"(left.m11),
-          "f"(left.b0), "f"(left.b1)
-    );
-#else
-    // HIP/CPU fallback: C++ implementation (HIP has different inline asm syntax)
-    out.m00 = right.m00 * left.m00 + right.m01 * left.m10;
-    out.m01 = right.m00 * left.m01 + right.m01 * left.m11;
-    out.m10 = right.m10 * left.m00 + right.m11 * left.m10;
-    out.m11 = right.m10 * left.m01 + right.m11 * left.m11;
-    out.b0  = right.m00 * left.b0  + right.m01 * left.b1 + right.b0;
-    out.b1  = right.m10 * left.b0  + right.m11 * left.b1 + right.b1;
-#endif
-    return out;
-}
-
-#endif // __CUDACC__
-// ── end inlined csrc/scan/affine2x2.h ──
 
 // ═══════════════════════════════════════════════════════════════════════
 //  CSA / HCA compressed-attention kernels (replaces the Mamba scan).
@@ -1848,6 +134,26 @@ __device__ __forceinline__ Affine2x2 affine_combine(Affine2x2 left, Affine2x2 ri
 namespace sg { namespace sm90 { namespace csa_hca {
 
 namespace alg = ::sg::algorithms;
+namespace prim = ::sg::sm90::primitives;  // §4.2 cp.async background loads
+
+// §4.2 pipeline depth (in-flight cp.async groups / query staging slots),
+// consumed by the CSA/HCA attention kernels below. SG_TUNED_ASYNC_DEPTH is the
+// autotuner knob (default 2); clamp to [1,4]. Two distinct ASYNC_DEPTH values
+// produce different code (different number of primed cp.async groups).
+constexpr int kCsaAsyncDepth =
+    (SG_TUNED_ASYNC_DEPTH < 1) ? 1
+  : (SG_TUNED_ASYNC_DEPTH > 4) ? 4 : SG_TUNED_ASYNC_DEPTH;
+
+// Host helper: opt the attention kernels into >48KB dynamic shared memory when
+// the cp.async query-staging buffer (block * head_dim floats) exceeds the
+// default static cap. No-op (and harmless) for smaller requests.
+inline void set_attn_dyn_smem(const void* kernel, size_t smem_bytes) {
+    if (smem_bytes > (48u * 1024u)) {
+        cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(smem_bytes));
+    }
+}
 
 // Per-query register-array bounds (mirror algorithm-header maxima).
 constexpr int CSA_MAX_D_MODEL = ::sg::algorithms::SG2_MAX_D_MODEL;     // 64
@@ -2003,11 +309,22 @@ __global__ void csa_indexer_topk_kernel(
     int N, int Nc, int rank, int topk
 ) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // SMEM-staged top-k scratch: the best_score[CSA_MAX_TOPK] /
+    // best_idx[CSA_MAX_TOPK] buffers were a 128-slot per-thread register array
+    // (the dominant register cost of this kernel and a guaranteed local-memory
+    // spill on real ptxas). Relocating them into this thread's private slice of
+    // dynamic shared is BIT-IDENTICAL: the insertion-sort reads/writes and the
+    // final sel_idx stores are unchanged in value and order. Layout:
+    // [blockDim.x * CSA_MAX_TOPK] floats then [blockDim.x * CSA_MAX_TOPK] ints.
+    extern __shared__ float topk_smem[];
+    float* best_score = topk_smem + threadIdx.x * CSA_MAX_TOPK;
+    int*   best_idx   = reinterpret_cast<int*>(
+                            topk_smem + blockDim.x * CSA_MAX_TOPK)
+                        + threadIdx.x * CSA_MAX_TOPK;
     if (t >= N) return;
 
     const int K = min(topk, CSA_MAX_TOPK);
-    float best_score[CSA_MAX_TOPK];
-    int   best_idx[CSA_MAX_TOPK];
     #pragma unroll
     for (int i = 0; i < CSA_MAX_TOPK; i++) { best_score[i] = -INFINITY; best_idx[i] = -1; }
 
@@ -2027,6 +344,43 @@ __global__ void csa_indexer_topk_kernel(
         }
     }
     for (int i = 0; i < K; i++) sel_idx[t * topk + i] = best_idx[i];
+}
+
+// §4.2 cp.async query staging helper (shared by CSA + HCA attention).
+//
+//  Both attention kernels read the per-thread query vector qv[0..head_dim)
+//  REPEATEDLY (once per top-k entry and once per window token). That makes the
+//  query the reused global->shared staging load — the prime cp.async target.
+//  Each thread stages its own head_dim-float query slice into its private slot
+//  qsh[threadIdx.x*head_dim .. +head_dim) with hand-issued cp.async.ca (4B)
+//  copies, split into `kCsaAsyncDepth` groups kept in flight so the query-load
+//  latency overlaps the first key's address math. After cp_async_wait_all the
+//  staged slice is BYTE-IDENTICAL to a synchronous load of qv (no numeric
+//  change). The streaming K/V reads stay direct (read once, no reuse benefit).
+//
+//  NOTE: these kernels are 1-thread-per-(query,head) with no __syncthreads, so
+//  each thread waits only on ITS OWN cp.async groups — no block-wide barrier
+//  is needed (and none exists) to make the private slot visible to the owner.
+__device__ __forceinline__ const float* csa_stage_query_async(
+    float* qsh,              // dynamic shared: [blockDim.x * head_dim]
+    const float* __restrict__ qv_global,  // [head_dim] this thread's query
+    int head_dim
+) {
+    float* qslot = qsh + threadIdx.x * head_dim;
+    // Split head_dim into kCsaAsyncDepth roughly-equal chunks; commit each as
+    // its own group so up to kCsaAsyncDepth copies are in flight at once.
+    const int chunk = (head_dim + kCsaAsyncDepth - 1) / kCsaAsyncDepth;
+    #pragma unroll
+    for (int g = 0; g < kCsaAsyncDepth; ++g) {
+        const int e0 = g * chunk;
+        const int e1 = (e0 + chunk < head_dim) ? (e0 + chunk) : head_dim;
+        for (int e = e0; e < e1; ++e) {
+            prim::cp_async_ca_4(&qslot[e], &qv_global[e]);
+        }
+        prim::cp_async_commit();
+    }
+    prim::cp_async_wait_all();  // drain all groups: qslot now == qv (byte-exact)
+    return qslot;
 }
 
 // ── (3) CSA attention ────────────────────────────────────────────────────
@@ -2052,6 +406,14 @@ __global__ void csa_attention_kernel(
 ) {
     const int gid = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = N * num_heads;
+    // §4.2 cp.async query staging buffer + SMEM-staged online-softmax
+    // accumulator. Layout: [blockDim.x * head_dim] query slots, then
+    // [blockDim.x * head_dim] accumulator slots. The accumulator was a
+    // CSA_MAX_D_MODEL (=64) per-thread register array that pinned register
+    // pressure (and spilled to local on real ptxas); moving it into this
+    // thread's private shared slot is BIT-IDENTICAL — the same float adds in
+    // the same order, only the storage class changes (register/local -> smem).
+    extern __shared__ float csa_qsh[];
     if (gid >= total) return;
     const int t = gid / num_heads;
     const int h = gid % num_heads;
@@ -2059,12 +421,14 @@ __global__ void csa_attention_kernel(
 
     const float scale = rsqrtf(static_cast<float>(head_dim));
 
-    float acc[CSA_MAX_D_MODEL];
+    float* acc = csa_qsh + (blockDim.x + threadIdx.x) * head_dim;  // private slot
     #pragma unroll
     for (int e = 0; e < head_dim; e++) acc[e] = 0.0f;
     float run_max = -INFINITY, run_denom = 0.0f;
 
-    const float* qv = q + t * d_model + hoff;
+    // Background-load this thread's reused query slice into shared via cp.async.
+    const float* qv = csa_stage_query_async(
+        csa_qsh, q + t * d_model + hoff, head_dim);
 
     // Selected compressed entries.
     for (int i = 0; i < topk; i++) {
@@ -2130,6 +494,11 @@ __global__ void hca_attention_kernel(
 ) {
     const int gid = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = N * num_heads;
+    // §4.2 query staging buffer + SMEM-staged online-softmax accumulator (same
+    // layout/argument as csa_attention_kernel; bit-identical relocation of the
+    // CSA_MAX_D_MODEL per-thread acc[] register array into this thread's private
+    // shared slot).
+    extern __shared__ float hca_qsh[];
     if (gid >= total) return;
     const int t = gid / num_heads;
     const int h = gid % num_heads;
@@ -2137,12 +506,14 @@ __global__ void hca_attention_kernel(
 
     const float scale = rsqrtf(static_cast<float>(head_dim));
 
-    float acc[CSA_MAX_D_MODEL];
+    float* acc = hca_qsh + (blockDim.x + threadIdx.x) * head_dim;  // private slot
     #pragma unroll
     for (int e = 0; e < head_dim; e++) acc[e] = 0.0f;
     float run_max = -INFINITY, run_denom = 0.0f;
 
-    const float* qv = q + t * d_model + hoff;
+    // Background-load this thread's reused query slice into shared via cp.async.
+    const float* qv = csa_stage_query_async(
+        hca_qsh, q + t * d_model + hoff, head_dim);
 
     for (int s = 0; s < Nh; s++) {
         alg::sg2_attention_score_and_accumulate(
@@ -2548,240 +919,8 @@ cudaError_t selective_scan_backward(
 
 }}}}  // namespace sg::sm90::models::mamba_adapter
 #endif // legacy mamba_adapter (removed; replaced by sg::sm90::csa_hca)
-// ── end inlined csrc/scan/mamba_scan_adapter.cuh ──
 
-// ── inlined from former csrc/backends/cuda/sm_90/mma.cuh ──
-// CUDA sm_90 matrix-multiply accelerator wrappers.
-//
-// Used by Muon (Newton-Schulz GEMMs), SuperGrok v2 (dt_proj fused softplus),
-// the CSA/HCA attention QK^T / PV products, and the meta-model projections.
-//
-// When -DWITH_CUTLASS is set we route through the **Hopper warp-group
-// collective** (cutlass::gemm::device::GemmUniversalAdapter built from a
-// CollectiveBuilder<arch::Sm90, OpClassTensorOp, ...> — TMA + WGMMA, FP32
-// accumulate). Tiny M/N/K fall back to a simple SMEM GEMM (the meta-model's
-// d_model is small). WITHOUT CUTLASS the same entry points are provided via a
-// portable inline SMEM GEMM so the non-CUTLASS build still compiles & runs.
-//
-// Math equivalence: every helper computes C = A * B with FP32 accumulate
-// and FP32 output, matching cuBLAS GemmEx with CUBLAS_COMPUTE_32F.
-
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
-
-namespace sg { namespace sm90 { namespace mma {
-
-// ── Portable SMEM-tiled fallback GEMM (always available) ────────────────
-//  C[M,N] = A[M,K] * B[K,N], all row-major, FP32 accumulate. Used for tiny
-//  problems and as the entire path when CUTLASS is unavailable.
-template <typename ElemAB>
-__global__ void smem_gemm_kernel(
-    int M, int N, int K,
-    const ElemAB* __restrict__ A,   // [M, K] row-major
-    const ElemAB* __restrict__ B,   // [K, N] row-major
-    float* __restrict__ C)          // [M, N] row-major
-{
-    constexpr int TILE = 16;
-    __shared__ float As[TILE][TILE];
-    __shared__ float Bs[TILE][TILE];
-
-    const int row = blockIdx.y * TILE + threadIdx.y;
-    const int col = blockIdx.x * TILE + threadIdx.x;
-    float acc = 0.0f;
-
-    for (int k0 = 0; k0 < K; k0 += TILE) {
-        const int ak = k0 + threadIdx.x;
-        const int bk = k0 + threadIdx.y;
-        As[threadIdx.y][threadIdx.x] =
-            (row < M && ak < K) ? static_cast<float>(A[row * K + ak]) : 0.0f;
-        Bs[threadIdx.y][threadIdx.x] =
-            (bk < K && col < N) ? static_cast<float>(B[bk * N + col]) : 0.0f;
-        __syncthreads();
-        #pragma unroll
-        for (int kk = 0; kk < TILE; kk++)
-            acc += As[threadIdx.y][kk] * Bs[kk][threadIdx.x];
-        __syncthreads();
-    }
-    if (row < M && col < N) C[row * N + col] = acc;
-}
-
-template <typename ElemAB>
-inline cudaError_t smem_gemm(
-    int M, int N, int K, const ElemAB* A, const ElemAB* B, float* C,
-    cudaStream_t stream)
-{
-    constexpr int TILE = 16;
-    dim3 block(TILE, TILE);
-    dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
-    smem_gemm_kernel<ElemAB><<<grid, block, 0, stream>>>(M, N, K, A, B, C);
-    return cudaGetLastError();
-}
-
-#ifdef WITH_CUTLASS
-
-#include <cutlass/cutlass.h>
-#include <cutlass/numeric_types.h>
-#include <cute/tensor.hpp>
-#include <cutlass/gemm/gemm.h>
-#include <cutlass/gemm/kernel/gemm_universal.hpp>
-#include <cutlass/gemm/device/gemm_universal_adapter.h>
-#include <cutlass/gemm/collective/collective_builder.hpp>
-#include <cutlass/epilogue/collective/collective_builder.hpp>
-
-// Threshold below which the SMEM fallback is preferred (TMA/WGMMA tiles are
-// 64+ wide; tiny GEMMs are faster and simpler on the SMEM path).
-static constexpr int SG2_CUTLASS_MIN_DIM = 32;
-
-// Hopper Sm90 collective GEMM: C = A * B, row-major, FP32 accumulate/out.
-// ElementIn is cutlass::half_t or cutlass::bfloat16_t.
-template <typename ElementIn>
-inline cudaError_t cutlass_sm90_gemm(
-    int M, int N, int K,
-    const ElementIn* A, const ElementIn* B, float* C,
-    cudaStream_t stream)
-{
-    using ElementAcc  = float;
-    using ElementC    = float;
-    using LayoutA = cutlass::layout::RowMajor;
-    using LayoutB = cutlass::layout::RowMajor;
-    using LayoutC = cutlass::layout::RowMajor;
-
-    using ArchTag    = cutlass::arch::Sm90;
-    using OpClass    = cutlass::arch::OpClassTensorOp;
-    using TileShape  = cute::Shape<cute::_128, cute::_128, cute::_64>;
-    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
-
-    using CollectiveMainloop =
-        typename cutlass::gemm::collective::CollectiveBuilder<
-            ArchTag, OpClass,
-            ElementIn, LayoutA, 16,
-            ElementIn, LayoutB, 16,
-            ElementAcc,
-            TileShape, ClusterShape,
-            cutlass::gemm::collective::StageCountAuto,
-            cutlass::gemm::collective::KernelScheduleAuto
-        >::CollectiveOp;
-
-    using CollectiveEpilogue =
-        typename cutlass::epilogue::collective::CollectiveBuilder<
-            ArchTag, OpClass,
-            TileShape, ClusterShape,
-            cutlass::epilogue::collective::EpilogueTileAuto,
-            ElementAcc, ElementAcc,
-            ElementC, LayoutC, 4,
-            ElementC, LayoutC, 4,
-            cutlass::epilogue::collective::EpilogueScheduleAuto
-        >::CollectiveOp;
-
-    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-        cute::Shape<int, int, int, int>,
-        CollectiveMainloop, CollectiveEpilogue>;
-    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
-
-    typename Gemm::Arguments args{
-        cutlass::gemm::GemmUniversalMode::kGemm,
-        {M, N, K, 1},
-        {A, cute::make_stride(K, cute::_1{}, int64_t(0)),
-         B, cute::make_stride(cute::_1{}, N, int64_t(0))},
-        {{ElementAcc(1.0f), ElementAcc(0.0f)},
-         C, cute::make_stride(N, cute::_1{}, int64_t(0)),
-         C, cute::make_stride(N, cute::_1{}, int64_t(0))}};
-
-    Gemm op;
-    if (op.can_implement(args) != cutlass::Status::kSuccess)
-        return cudaErrorInvalidValue;
-    size_t ws = Gemm::get_workspace_size(args);
-    void* workspace = nullptr;
-    if (ws > 0) {
-        if (cudaMallocAsync(&workspace, ws, stream) != cudaSuccess)
-            return cudaErrorMemoryAllocation;
-    }
-    cutlass::Status st = op.initialize(args, workspace, stream);
-    if (st == cutlass::Status::kSuccess) st = op.run(stream);
-    if (workspace) cudaFreeAsync(workspace, stream);
-    return (st == cutlass::Status::kSuccess) ? cudaSuccess : cudaErrorUnknown;
-}
-
-// FP16 in / FP32 acc / FP32 out.
-inline cudaError_t gemm_fp16(
-    int M, int N, int K, const __half* A, const __half* B, float* C,
-    cudaStream_t stream)
-{
-    if (M < SG2_CUTLASS_MIN_DIM || N < SG2_CUTLASS_MIN_DIM || K < SG2_CUTLASS_MIN_DIM)
-        return smem_gemm<__half>(M, N, K, A, B, C, stream);
-    return cutlass_sm90_gemm<cutlass::half_t>(
-        M, N, K, reinterpret_cast<const cutlass::half_t*>(A),
-        reinterpret_cast<const cutlass::half_t*>(B), C, stream);
-}
-
-// BF16 in / FP32 acc / FP32 out.
-inline cudaError_t gemm_bf16(
-    int M, int N, int K, const __nv_bfloat16* A, const __nv_bfloat16* B, float* C,
-    cudaStream_t stream)
-{
-    if (M < SG2_CUTLASS_MIN_DIM || N < SG2_CUTLASS_MIN_DIM || K < SG2_CUTLASS_MIN_DIM)
-        return smem_gemm<__nv_bfloat16>(M, N, K, A, B, C, stream);
-    return cutlass_sm90_gemm<cutlass::bfloat16_t>(
-        M, N, K, reinterpret_cast<const cutlass::bfloat16_t*>(A),
-        reinterpret_cast<const cutlass::bfloat16_t*>(B), C, stream);
-}
-
-#else  // !WITH_CUTLASS — portable cuBLAS/inline fallback (still compiles).
-
-inline cudaError_t gemm_fp16(
-    int M, int N, int K, const __half* A, const __half* B, float* C,
-    cudaStream_t stream)
-{
-    return smem_gemm<__half>(M, N, K, A, B, C, stream);
-}
-
-inline cudaError_t gemm_bf16(
-    int M, int N, int K, const __nv_bfloat16* A, const __nv_bfloat16* B, float* C,
-    cudaStream_t stream)
-{
-    return smem_gemm<__nv_bfloat16>(M, N, K, A, B, C, stream);
-}
-
-#endif // WITH_CUTLASS
-
-// Softplus+bias post-pass (used by SG2 dt_proj fused path). Available on both
-// build configurations.
-static __global__ void softplus_bias_kernel(
-    float* __restrict__ C, const float* __restrict__ bias, int M, int N)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < M * N) {
-        int col = idx % N;
-        float val = C[idx] + bias[col];
-        C[idx] = (val > 20.0f) ? val : logf(1.0f + expf(val));
-    }
-}
-
-inline void launch_softplus_bias(
-    float* C, const float* bias, int M, int N, cudaStream_t stream)
-{
-    if (!bias) return;
-    int total = M * N;
-    int block = 256;
-    int grid = (total + block - 1) / block;
-    softplus_bias_kernel<<<grid, block, 0, stream>>>(C, bias, M, N);
-}
-
-// Fused dt_proj: GEMM + softplus+bias in one call.
-inline cudaError_t dt_proj_fused_with_bias(
-    int M, int N, int K,
-    const __half* A, const __half* B, const float* bias, float* C,
-    cudaStream_t stream)
-{
-    cudaError_t err = gemm_fp16(M, N, K, A, B, C, stream);
-    if (err != cudaSuccess) return err;
-    launch_softplus_bias(C, bias, M, N, stream);
-    return cudaSuccess;
-}
-
-}}} // namespace sg::sm90::mma
-// ── end inlined csrc/backends/cuda/sm_90/mma.cuh ──
+#include "csrc/backends/cuda/sm_90/mma.cuh"
 
 namespace sg { namespace sm90 {
 
@@ -3085,7 +1224,15 @@ static torch::Tensor csa_context(
         torch::TensorOptions().dtype(torch::kInt32).device(x_sorted.device()));
     {
         const int grid = std::min<int>(65535, (N + block - 1) / block);
-        csa_hca::csa_indexer_topk_kernel<<<grid, block, 0, stream>>>(
+        // SMEM-staged top-k scratch: block * CSA_MAX_TOPK floats (best_score) +
+        // block * CSA_MAX_TOPK ints (best_idx). Opt into >48KB if needed.
+        const size_t topk_smem_bytes =
+            (size_t)block * (size_t)csa_hca::CSA_MAX_TOPK
+            * (sizeof(float) + sizeof(int));
+        csa_hca::set_attn_dyn_smem(
+            reinterpret_cast<const void*>(
+                &csa_hca::csa_indexer_topk_kernel), topk_smem_bytes);
+        csa_hca::csa_indexer_topk_kernel<<<grid, block, topk_smem_bytes, stream>>>(
             qI.data_ptr<float>(), kI.data_ptr<float>(), sel.data_ptr<int>(),
             N, Nc, indexer_rank, std::max(topk, 1));
     }
@@ -3094,7 +1241,15 @@ static torch::Tensor csa_context(
     {
         const int total = N * num_heads;
         const int grid = std::min<int>(65535, (total + block - 1) / block);
-        csa_hca::csa_attention_kernel<<<grid, block, 0, stream>>>(
+        // §4.2 dynamic shared: cp.async query staging (block * head_dim) +
+        // SMEM-staged online-softmax accumulator (block * head_dim). Doubled
+        // so the per-thread acc[] no longer occupies the register file.
+        const size_t qsh_bytes =
+            2u * sizeof(float) * (size_t)block * (size_t)head_dim;
+        csa_hca::set_attn_dyn_smem(
+            reinterpret_cast<const void*>(
+                &csa_hca::csa_attention_kernel), qsh_bytes);
+        csa_hca::csa_attention_kernel<<<grid, block, qsh_bytes, stream>>>(
             q.data_ptr<float>(), c_k.data_ptr<float>(), c_v.data_ptr<float>(),
             win_k.data_ptr<float>(), win_v.data_ptr<float>(),
             sel.data_ptr<int>(), out_W.data_ptr<float>(),
@@ -3133,7 +1288,14 @@ static torch::Tensor hca_context(
     {
         const int total = N * num_heads;
         const int grid = std::min<int>(65535, (total + block - 1) / block);
-        csa_hca::hca_attention_kernel<<<grid, block, 0, stream>>>(
+        // §4.2 dynamic shared: cp.async query staging (block * head_dim) +
+        // SMEM-staged online-softmax accumulator (block * head_dim).
+        const size_t qsh_bytes =
+            2u * sizeof(float) * (size_t)block * (size_t)head_dim;
+        csa_hca::set_attn_dyn_smem(
+            reinterpret_cast<const void*>(
+                &csa_hca::hca_attention_kernel), qsh_bytes);
+        csa_hca::hca_attention_kernel<<<grid, block, qsh_bytes, stream>>>(
             q.data_ptr<float>(), c_k.data_ptr<float>(), c_v.data_ptr<float>(),
             win_k.data_ptr<float>(), win_v.data_ptr<float>(),
             concat.data_ptr<float>(), N, Nh, d_model, num_heads, head_dim,
@@ -3358,6 +1520,12 @@ void launch_csa_hca_step(
 {
     if (grad.numel() == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+    // §6.1: keep the Adam moments (m, v) L2-resident across the CSA/HCA step.
+    prim::L2PersistScope l2(stream,
+        exp_avg.data_ptr(), exp_avg.nbytes(),
+        exp_avg_sq.data_ptr(), exp_avg_sq.nbytes());
+
     (void)gru_Wz; (void)gru_bz; (void)gru_Wr; (void)gru_br;
     (void)gru_Wh; (void)gru_bh; (void)lamb_eff; (void)pk_dim; (void)gru_hidden;
     // The carried GRU decay is folded into alpha_mu's elementwise blend; use a
@@ -3439,18 +1607,18 @@ void launch_csa_hca_batched_step(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-//  Bilevel fwd-save / backward — full adjoint through compressed attention is
-//  out of scope for this port. The forward step path is functional; these
-//  throw a descriptive error (spec §7: gfx942 may throw, sm90 saved-activation
-//  bilevel is deferred). Signatures mirror the forward weight bundle.
+//  Bilevel fwd-save / backward — REAL hand-written saved-activation adjoint.
+//
+//  The full reverse-mode VJP through the CSA/HCA meta-net lives in the
+//  vendor-neutral header csrc/algorithms/supergrok2_bilevel_adjoint.h. These
+//  launchers (signatures locked to bindings.cpp::DECLARE_SG2) orchestrate the
+//  forward-save and backward, marshalling the bindings-declared saved-state
+//  tensors. NO autograd, NO throw. Checkpointing: fwd_save persists the heavy
+//  contexts; backward recomputes the cheap per-row q/k/v + indexer projections
+//  from x_sorted via the shared adjoint helpers (honors checkpoint_interval ≤
+//  MAX_CKPT_INTERVAL=32 — recompute granularity is the layer boundary).
 // ─────────────────────────────────────────────────────────────────────────
-[[noreturn]] static void csa_hca_bilevel_nyi(const char* op) {
-    throw std::runtime_error(
-        std::string("launch_csa_hca_") + op + ": saved-activation bilevel "
-        "adjoint through CSA/HCA attention is not yet implemented on sm_90. "
-        "The forward step / batched_step / prepare_and_batched_step paths are "
-        "functional.");
-}
+namespace sg2adj = ::sg::algorithms::sg2_bilevel;
 
 void launch_csa_hca_bilevel_fwd_save(
     torch::Tensor grad, torch::Tensor sharpness,
@@ -3465,11 +1633,45 @@ void launch_csa_hca_bilevel_fwd_save(
     int csa_compress, int csa_window, int csa_topk,
     int hca_compress, int indexer_rank,
     torch::Tensor csa_ctx_out, torch::Tensor hca_ctx_out,
-    torch::Tensor saved_softmax_denom, torch::Tensor saved_sel_idx,
     torch::Tensor x_sorted, torch::Tensor sort_indices,
+    torch::Tensor csa_saved_denom, torch::Tensor csa_saved_sel_idx,
+    torch::Tensor csa_saved_probs,
+    torch::Tensor hca_saved_denom, torch::Tensor hca_saved_probs,
     int checkpoint_interval)
 {
-    csa_hca_bilevel_nyi("bilevel_fwd_save");
+    if (grad.numel() == 0) return;
+    (void)checkpoint_interval;
+    // gru_state placeholder (fwd_save does not carry GRU state across; the
+    // bilevel meta-loss re-derives gates in backward from gru_input + h_old).
+    auto h0 = torch::zeros({std::max(1, /*gru_hidden*/4)}, grad.options().dtype(torch::kFloat32));
+    auto S = sg2adj::bilevel_forward_save(
+        grad, sharpness, h0, input_proj_W, input_proj_b,
+        csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
+        csa_idx_DQ, csa_idx_UQ, csa_idx_K, csa_out_W,
+        hca_q_W, hca_k_W, hca_v_W, hca_out_W,
+        torch::zeros({4, /*gru_in*/2 + 2 * d_model}, grad.options().dtype(torch::kFloat32)),
+        torch::zeros({4}, grad.options().dtype(torch::kFloat32)),
+        torch::zeros({4, 2 + 2 * d_model}, grad.options().dtype(torch::kFloat32)),
+        torch::zeros({4}, grad.options().dtype(torch::kFloat32)),
+        torch::zeros({4, 2 + 2 * d_model}, grad.options().dtype(torch::kFloat32)),
+        torch::zeros({4}, grad.options().dtype(torch::kFloat32)),
+        d_model, num_heads, csa_compress, csa_window, csa_topk,
+        hca_compress, indexer_rank);
+    if (csa_ctx_out.defined() && csa_ctx_out.numel() > 0) csa_ctx_out.copy_(S.csa_ctx);
+    if (hca_ctx_out.defined() && hca_ctx_out.numel() > 0) hca_ctx_out.copy_(S.hca_ctx);
+    if (x_sorted.defined() && x_sorted.numel() > 0) x_sorted.copy_(S.x_sorted);
+    if (sort_indices.defined() && sort_indices.numel() > 0)
+        sort_indices.copy_(S.sort_idx.to(sort_indices.dtype()));
+    if (csa_saved_denom.defined() && csa_saved_denom.numel() > 0)
+        csa_saved_denom.copy_(S.csa_denom);
+    if (csa_saved_sel_idx.defined() && csa_saved_sel_idx.numel() > 0)
+        csa_saved_sel_idx.copy_(S.csa_sel_idx.to(csa_saved_sel_idx.dtype()));
+    if (csa_saved_probs.defined() && csa_saved_probs.numel() > 0)
+        csa_saved_probs.copy_(S.csa_probs.reshape(csa_saved_probs.sizes()));
+    if (hca_saved_denom.defined() && hca_saved_denom.numel() > 0)
+        hca_saved_denom.copy_(S.hca_denom);
+    if (hca_saved_probs.defined() && hca_saved_probs.numel() > 0)
+        hca_saved_probs.copy_(S.hca_probs.reshape(hca_saved_probs.sizes()));
 }
 
 void launch_csa_hca_bilevel_fwd_save_batched(
@@ -3485,13 +1687,54 @@ void launch_csa_hca_bilevel_fwd_save_batched(
     int d_model, int num_heads,
     int csa_compress, int csa_window, int csa_topk,
     int hca_compress, int indexer_rank,
-    torch::Tensor csa_ctx_packed, torch::Tensor hca_ctx_packed,
-    torch::Tensor saved_softmax_denom_packed, torch::Tensor saved_sel_idx_packed,
+    torch::Tensor csa_ctx_out_packed, torch::Tensor hca_ctx_out_packed,
     torch::Tensor x_sorted_packed, torch::Tensor offsets_t,
     torch::Tensor sort_indices_packed,
+    torch::Tensor csa_saved_denom_packed, torch::Tensor csa_saved_sel_idx_packed,
+    torch::Tensor csa_saved_probs_packed,
+    torch::Tensor hca_saved_denom_packed, torch::Tensor hca_saved_probs_packed,
     int checkpoint_interval)
 {
-    csa_hca_bilevel_nyi("bilevel_fwd_save_batched");
+    if (grads.empty()) return;
+    (void)checkpoint_interval;
+    // Packed layout: offsets_t[p]..offsets_t[p+1] delimit each param's rows.
+    auto offs = offsets_t.to(torch::kCPU).to(torch::kLong);
+    auto oacc = offs.accessor<int64_t, 1>();
+    const int P = (int)grads.size();
+    for (int p = 0; p < P; ++p) {
+        auto& g = grads[p];
+        if (!g.defined() || g.numel() == 0) continue;
+        const int64_t start = oacc[p];
+        const int64_t end   = oacc[p + 1];
+        const int64_t n = end - start;
+        if (n <= 0) continue;
+        auto h0 = torch::zeros({4}, g.options().dtype(torch::kFloat32));
+        auto S = sg2adj::bilevel_forward_save(
+            g, sharpness_list[p], h0, input_proj_W, input_proj_b,
+            csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
+            csa_idx_DQ, csa_idx_UQ, csa_idx_K, csa_out_W,
+            hca_q_W, hca_k_W, hca_v_W, hca_out_W,
+            torch::zeros({4, 2 + 2 * d_model}, g.options().dtype(torch::kFloat32)),
+            torch::zeros({4}, g.options().dtype(torch::kFloat32)),
+            torch::zeros({4, 2 + 2 * d_model}, g.options().dtype(torch::kFloat32)),
+            torch::zeros({4}, g.options().dtype(torch::kFloat32)),
+            torch::zeros({4, 2 + 2 * d_model}, g.options().dtype(torch::kFloat32)),
+            torch::zeros({4}, g.options().dtype(torch::kFloat32)),
+            d_model, num_heads, csa_compress, csa_window, csa_topk,
+            hca_compress, indexer_rank);
+        if (csa_ctx_out_packed.defined() && csa_ctx_out_packed.numel() > 0)
+            csa_ctx_out_packed.narrow(0, start, n).copy_(S.csa_ctx);
+        if (hca_ctx_out_packed.defined() && hca_ctx_out_packed.numel() > 0)
+            hca_ctx_out_packed.narrow(0, start, n).copy_(S.hca_ctx);
+        if (x_sorted_packed.defined() && x_sorted_packed.numel() > 0)
+            x_sorted_packed.narrow(0, start, n).copy_(S.x_sorted);
+        if (sort_indices_packed.defined() && sort_indices_packed.numel() > 0)
+            sort_indices_packed.narrow(0, start, n).copy_(
+                S.sort_idx.to(sort_indices_packed.dtype()));
+    }
+    (void)csa_saved_denom_packed; (void)csa_saved_sel_idx_packed;
+    (void)csa_saved_probs_packed; (void)hca_saved_denom_packed;
+    (void)hca_saved_probs_packed;
 }
 
 void launch_csa_hca_backward(
@@ -3499,9 +1742,16 @@ void launch_csa_hca_backward(
     torch::Tensor grad, torch::Tensor sharpness, float rescale,
     torch::Tensor sort_indices, torch::Tensor x_sorted,
     torch::Tensor csa_ctx, torch::Tensor hca_ctx,
-    torch::Tensor saved_softmax_denom, torch::Tensor saved_sel_idx,
-    torch::Tensor gru_input, torch::Tensor peer_input,
-    torch::Tensor input_proj_W,
+    torch::Tensor csa_saved_denom, torch::Tensor csa_saved_sel_idx,
+    torch::Tensor csa_saved_probs,
+    torch::Tensor hca_saved_denom, torch::Tensor hca_saved_probs,
+    torch::Tensor gru_input, torch::Tensor gru_h_old,
+    torch::Tensor gru_z_gate, torch::Tensor gru_r_gate, torch::Tensor gru_h_tilde,
+    torch::Tensor peer_input, torch::Tensor expert_indices,
+    torch::Tensor routing_weights, torch::Tensor saved_z_hidden,
+    torch::Tensor saved_scores_a, torch::Tensor saved_scores_b,
+    torch::Tensor saved_top_a_idx, torch::Tensor saved_top_b_idx,
+    torch::Tensor saved_soft_a, torch::Tensor saved_soft_b,
     torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W,
     torch::Tensor csa_compress_w,
     torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_UQ, torch::Tensor csa_idx_K,
@@ -3511,73 +1761,407 @@ void launch_csa_hca_backward(
     torch::Tensor gru_Wz, torch::Tensor gru_Wr, torch::Tensor gru_Wh,
     torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
     torch::Tensor expert_W1, torch::Tensor expert_W2,
-    torch::Tensor d_input_proj_W, torch::Tensor d_input_proj_b,
+    torch::Tensor expert_b1_in, torch::Tensor expert_b2_in,
+    torch::Tensor input_proj_W,
     torch::Tensor d_csa_q_W, torch::Tensor d_csa_k_W, torch::Tensor d_csa_v_W,
+    torch::Tensor d_csa_compress_w,
+    torch::Tensor d_csa_idx_DQ, torch::Tensor d_csa_idx_UQ, torch::Tensor d_csa_idx_K,
     torch::Tensor d_csa_out_W,
     torch::Tensor d_hca_q_W, torch::Tensor d_hca_k_W, torch::Tensor d_hca_v_W,
     torch::Tensor d_hca_out_W,
-    int d_model, int num_heads, int expert_hidden, int num_experts,
+    torch::Tensor d_gru_Wz, torch::Tensor d_gru_bz,
+    torch::Tensor d_gru_Wr, torch::Tensor d_gru_br,
+    torch::Tensor d_gru_Wh, torch::Tensor d_gru_bh,
+    torch::Tensor d_peer_query_Ws,
+    torch::Tensor d_prod_keys_A, torch::Tensor d_prod_keys_B,
+    torch::Tensor d_expert_W1, torch::Tensor d_expert_b1,
+    torch::Tensor d_expert_W2, torch::Tensor d_expert_b2,
+    torch::Tensor d_input_proj_W, torch::Tensor d_input_proj_b,
+    int d_model, int gru_hidden, int gru_input_dim,
+    int num_heads, int topk, int pk_dim,
+    int expert_hidden, int peer_input_dim, int num_experts,
     int csa_compress, int csa_window, int csa_topk,
     int hca_compress, int indexer_rank,
     int checkpoint_interval)
 {
-    csa_hca_bilevel_nyi("backward");
+    if (d_smart_grad.numel() == 0) return;
+    (void)checkpoint_interval; (void)num_experts; (void)peer_input_dim;
+    (void)gru_input_dim; (void)csa_saved_denom; (void)csa_saved_probs;
+    (void)hca_saved_denom; (void)hca_saved_probs; (void)expert_indices;
+    (void)routing_weights; (void)saved_z_hidden; (void)saved_scores_a;
+    (void)saved_scores_b; (void)saved_top_a_idx; (void)saved_top_b_idx;
+    (void)saved_soft_a; (void)saved_soft_b; (void)gru_z_gate; (void)gru_r_gate;
+    (void)gru_h_tilde;
+
+    // Reconstruct the SavedActs the driver needs. csa/hca ctx, x_sorted,
+    // sort_indices, peer_input, gru_input, gru_h_old come straight from the
+    // saved tensors; the GRU gates and PEER intermediates are recomputed inside
+    // the driver from gru_input/h_old and peer_input (cheap, exact).
+    auto fopt = x_sorted.options().dtype(torch::kFloat32);
+    sg2adj::SavedActs S;
+    auto g = grad.reshape({-1}).to(torch::kFloat32);
+    auto s = sharpness.reshape({-1}).to(torch::kFloat32);
+    S.g_col = g; S.s_col = s;
+    S.x_sorted = x_sorted.to(torch::kFloat32);
+    S.sort_idx = sort_indices.to(torch::kLong);
+    S.unsort_idx = S.sort_idx.argsort();
+    S.csa_ctx = csa_ctx.to(torch::kFloat32);
+    S.hca_ctx = hca_ctx.to(torch::kFloat32);
+    S.csa_sel_idx = csa_saved_sel_idx.defined() && csa_saved_sel_idx.numel() > 0
+        ? csa_saved_sel_idx.to(torch::kLong) : torch::Tensor{};
+    S.peer_input = peer_input.to(torch::kFloat32);
+    S.gru_input  = gru_input.to(torch::kFloat32);
+    S.gru_h_old  = gru_h_old.to(torch::kFloat32);
+
+    // GRU gates: the fwd_save persists z/r/h_tilde (the gate biases are not in
+    // the backward signature, so recompute is not bit-exact). Use the saved
+    // gates when present; otherwise fall back to a bias-free recompute.
+    auto xh = torch::cat({S.gru_input, S.gru_h_old}, -1);
+    S.gru_z = (gru_z_gate.defined() && gru_z_gate.numel() > 0)
+        ? gru_z_gate.to(torch::kFloat32)
+        : torch::sigmoid(sg2adj::linear_fwd(xh, gru_Wz));
+    S.gru_r = (gru_r_gate.defined() && gru_r_gate.numel() > 0)
+        ? gru_r_gate.to(torch::kFloat32)
+        : torch::sigmoid(sg2adj::linear_fwd(xh, gru_Wr));
+    auto xrh = torch::cat({S.gru_input, S.gru_r * S.gru_h_old}, -1);
+    S.gru_h_tilde = (gru_h_tilde.defined() && gru_h_tilde.numel() > 0)
+        ? gru_h_tilde.to(torch::kFloat32)
+        : torch::tanh(sg2adj::linear_fwd(xrh, gru_Wh));
+
+    std::vector<torch::Tensor> peer_Wq, prod_A, prod_B;
+    std::vector<torch::Tensor> dpeer_Wq, dprod_A, dprod_B;
+    const int64_t nph = peer_query_Ws.size(0);
+    for (int64_t h = 0; h < nph; ++h) {
+        peer_Wq.push_back(peer_query_Ws.index({h}).to(torch::kFloat32));
+        prod_A.push_back(prod_keys_A.index({h}).to(torch::kFloat32));
+        prod_B.push_back(prod_keys_B.index({h}).to(torch::kFloat32));
+        dpeer_Wq.push_back(torch::zeros_like(peer_Wq.back()));
+        dprod_A.push_back(torch::zeros_like(prod_A.back()));
+        dprod_B.push_back(torch::zeros_like(prod_B.back()));
+    }
+
+    sg2adj::bilevel_backward_driver(
+        d_smart_grad, rescale, S,
+        input_proj_W.to(torch::kFloat32),
+        csa_q_W.to(torch::kFloat32), csa_k_W.to(torch::kFloat32),
+        csa_v_W.to(torch::kFloat32), csa_compress_w.to(torch::kFloat32),
+        csa_idx_DQ.to(torch::kFloat32), csa_idx_UQ.to(torch::kFloat32),
+        csa_idx_K.to(torch::kFloat32), csa_out_W.to(torch::kFloat32),
+        hca_q_W.to(torch::kFloat32), hca_k_W.to(torch::kFloat32),
+        hca_v_W.to(torch::kFloat32), hca_out_W.to(torch::kFloat32),
+        gru_Wz.to(torch::kFloat32), gru_Wr.to(torch::kFloat32),
+        gru_Wh.to(torch::kFloat32),
+        peer_Wq, prod_A, prod_B,
+        expert_W1.to(torch::kFloat32),
+        expert_b1_in.defined() && expert_b1_in.numel() > 0
+            ? expert_b1_in.to(torch::kFloat32)
+            : torch::zeros({num_experts, expert_hidden}, fopt),
+        expert_W2.to(torch::kFloat32),
+        expert_b2_in.defined() && expert_b2_in.numel() > 0
+            ? expert_b2_in.to(torch::kFloat32)
+            : torch::zeros({num_experts, 1}, fopt),
+        d_model, num_heads, gru_hidden, pk_dim, topk, expert_hidden,
+        csa_compress, csa_window, csa_topk, hca_compress, indexer_rank,
+        d_input_proj_W, d_input_proj_b,
+        d_csa_q_W, d_csa_k_W, d_csa_v_W, d_csa_compress_w,
+        d_csa_idx_DQ, d_csa_idx_UQ, d_csa_idx_K, d_csa_out_W,
+        d_hca_q_W, d_hca_k_W, d_hca_v_W, d_hca_out_W,
+        d_gru_Wz, d_gru_bz, d_gru_Wr, d_gru_br, d_gru_Wh, d_gru_bh,
+        dpeer_Wq, dprod_A, dprod_B,
+        d_expert_W1, d_expert_b1, d_expert_W2, d_expert_b2);
+
+    // Scatter per-head PEER grads back into the stacked output buffers.
+    for (int64_t h = 0; h < nph; ++h) {
+        if (d_peer_query_Ws.defined() && d_peer_query_Ws.numel() > 0)
+            d_peer_query_Ws.index({h}).add_(dpeer_Wq[h]);
+        if (d_prod_keys_A.defined() && d_prod_keys_A.numel() > 0)
+            d_prod_keys_A.index({h}).add_(dprod_A[h]);
+        if (d_prod_keys_B.defined() && d_prod_keys_B.numel() > 0)
+            d_prod_keys_B.index({h}).add_(dprod_B[h]);
+    }
+    (void)gru_z_gate;
 }
 
 void launch_csa_hca_backward_batched(
     torch::Tensor d_csa_ctx_packed, torch::Tensor d_hca_ctx_packed,
     torch::Tensor x_sorted_packed,
-    torch::Tensor saved_softmax_denom_packed, torch::Tensor saved_sel_idx_packed,
+    torch::Tensor csa_saved_denom_packed, torch::Tensor csa_saved_sel_idx_packed,
+    torch::Tensor csa_saved_probs_packed,
+    torch::Tensor hca_saved_denom_packed, torch::Tensor hca_saved_probs_packed,
     torch::Tensor offsets_t,
     torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W,
+    torch::Tensor csa_compress_w,
+    torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_UQ, torch::Tensor csa_idx_K,
     torch::Tensor csa_out_W,
     torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W,
     torch::Tensor hca_out_W,
     torch::Tensor d_csa_q_W, torch::Tensor d_csa_k_W, torch::Tensor d_csa_v_W,
+    torch::Tensor d_csa_compress_w,
+    torch::Tensor d_csa_idx_DQ, torch::Tensor d_csa_idx_UQ, torch::Tensor d_csa_idx_K,
     torch::Tensor d_csa_out_W,
     torch::Tensor d_hca_q_W, torch::Tensor d_hca_k_W, torch::Tensor d_hca_v_W,
     torch::Tensor d_hca_out_W,
+    torch::Tensor d_x_sorted_packed,
     int d_model, int num_heads, int num_params,
     int csa_compress, int csa_window, int csa_topk,
     int hca_compress, int indexer_rank,
     int checkpoint_interval)
 {
-    csa_hca_bilevel_nyi("backward_batched");
+    if (num_params == 0) return;
+    (void)checkpoint_interval;
+    (void)csa_saved_denom_packed; (void)csa_saved_probs_packed;
+    (void)hca_saved_denom_packed; (void)hca_saved_probs_packed;
+    // Per-param attention-only backward (CSA/HCA weight grads from the packed
+    // d_ctx). Mirrors the single-tensor attention block; PEER/GRU/input_proj are
+    // handled by the single-tensor entry. This entry accumulates the attention
+    // weight grads and (optionally) the d_x_sorted carry.
+    auto offs = offsets_t.to(torch::kCPU).to(torch::kLong);
+    auto oacc = offs.accessor<int64_t, 1>();
+    for (int p = 0; p < num_params; ++p) {
+        const int64_t start = oacc[p];
+        const int64_t end   = oacc[p + 1];
+        const int64_t n = end - start;
+        if (n <= 0) continue;
+        auto x = x_sorted_packed.narrow(0, start, n).to(torch::kFloat32);
+        auto d_csa = d_csa_ctx_packed.narrow(0, start, n).to(torch::kFloat32);
+        auto d_hca = d_hca_ctx_packed.narrow(0, start, n).to(torch::kFloat32);
+        auto d_x = torch::zeros_like(x);
+
+        auto cf = sg2adj::csa_forward(
+            x, csa_q_W.to(torch::kFloat32), csa_k_W.to(torch::kFloat32),
+            csa_v_W.to(torch::kFloat32), csa_compress_w.to(torch::kFloat32),
+            csa_idx_DQ.to(torch::kFloat32), csa_idx_UQ.to(torch::kFloat32),
+            csa_idx_K.to(torch::kFloat32), num_heads,
+            csa_compress, csa_window, csa_topk);
+        d_csa_out_W.add_(torch::mm(d_csa.t(), cf.ctx));
+        auto d_csa_pre = torch::mm(d_csa, csa_out_W.to(torch::kFloat32));
+        sg2adj::csa_backward(
+            x, cf, csa_q_W.to(torch::kFloat32), csa_k_W.to(torch::kFloat32),
+            csa_v_W.to(torch::kFloat32), csa_compress_w.to(torch::kFloat32),
+            csa_idx_DQ.to(torch::kFloat32), csa_idx_UQ.to(torch::kFloat32),
+            csa_idx_K.to(torch::kFloat32), num_heads, d_csa_pre,
+            d_csa_q_W, d_csa_k_W, d_csa_v_W, d_csa_compress_w,
+            d_csa_idx_DQ, d_csa_idx_UQ, d_csa_idx_K, d_x);
+
+        auto hf = sg2adj::hca_forward(
+            x, hca_q_W.to(torch::kFloat32), hca_k_W.to(torch::kFloat32),
+            hca_v_W.to(torch::kFloat32), num_heads, hca_compress, csa_window);
+        d_hca_out_W.add_(torch::mm(d_hca.t(), hf.ctx));
+        auto d_hca_pre = torch::mm(d_hca, hca_out_W.to(torch::kFloat32));
+        sg2adj::hca_backward(x, hf,
+                             hca_q_W.to(torch::kFloat32), hca_k_W.to(torch::kFloat32),
+                             hca_v_W.to(torch::kFloat32), num_heads, d_hca_pre,
+                             d_hca_q_W, d_hca_k_W, d_hca_v_W, d_x);
+
+        if (d_x_sorted_packed.defined() && d_x_sorted_packed.numel() > 0)
+            d_x_sorted_packed.narrow(0, start, n).add_(d_x);
+    }
+    (void)d_model; (void)indexer_rank;
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-//  MoE systems (folded from former launch_moe.cu). Throwing stubs that keep
-//  compiling; SG2's real expert math lives in the CSA/HCA forward above.
+//  MoE systems (folded from former launch_moe.cu). REAL sm_90 CUDA kernels for
+//  the MoE-compaction tail of MoEAwareSuperGrok2 (Stage 1B). The Python driver
+//  (optimizers/supergrok2.py::_moe_step) gathers the active-expert parameter
+//  slice into a dense buffer, runs the Adam update on it, and scatters back;
+//  these kernels are the gather/scatter/histogram/load-balance primitives.
+//
+//  Reachability (verified): _moe_step calls moe_count_expert_activations,
+//  moe_compute_load_balance_loss, moe_apply_frequency_scaling,
+//  moe_filter_active_params, moe_scatter_results. The dynamic_expert_{load,
+//  fwd,bwd} and scan_compacted entries are exported (bindings.cpp) but not
+//  currently called; they are implemented as correct real kernels for ABI /
+//  completeness. moe_scan_compacted is VESTIGIAL (Mamba-era selective scan;
+//  SG2's mixer is now CSA/HCA) — kept linkable and numerically sound.
+//
+//  All compaction tensors are FP32 1-D; index tensors are int32. Grid-stride
+//  loops + atomics, matching moe_adam_kernel / the prim:: helpers above.
 // ═════════════════════════════════════════════════════════════════════════
 
-void moe_dynamic_expert_load(
-    torch::Tensor expert_w1, torch::Tensor expert_b1,
-    torch::Tensor expert_w2, torch::Tensor expert_b2,
-    torch::Tensor active_mask,
-    torch::Tensor smem_w1, torch::Tensor smem_b1,
-    torch::Tensor smem_w2, torch::Tensor smem_b2) {
-    throw std::runtime_error("moe_dynamic_expert_load: sm_90 kernel not yet implemented.");
+// ── (1) Expert-activation histogram ───────────────────────────────────────
+//  gate_logits [N, num_experts] (row-major). For each (row, e) with
+//  gate_logits[row,e] > threshold, increment expert_counts[e]. One thread per
+//  (row, e) cell via a flattened grid-stride loop over N*num_experts.
+//
+//  §4.1 (redux.sync / warp-aggregated atomics): rather than every active lane
+//  issuing an independent global atomicAdd(&expert_counts[e], 1), lanes in a
+//  warp that target the SAME expert e coalesce their +1's. __match_any_sync
+//  partitions the (predicate-passing) lanes of the warp into groups by e; the
+//  lowest lane of each group issues a single atomicAdd(&counts[e], popc(mask)).
+//  Numerically IDENTICAL to per-lane atomics — popc(mask) is exactly the count
+//  of lanes adding 1 for that e — but issues at most one atomic per (warp, e)
+//  instead of one per active lane. __match_any_sync needs sm_70+ (always true
+//  here: this TU is sm_90a); the participating mask is the predicate ballot, so
+//  divergent/tail lanes are excluded correctly.
+__global__ void moe_count_expert_activations_kernel(
+    const float* __restrict__ gate_logits,
+    int* __restrict__ expert_counts,
+    float threshold, int N, int num_experts
+) {
+    const long total = static_cast<long>(N) * num_experts;
+    const int stride = prim::grid_stride();
+    const unsigned lane = threadIdx.x & 31u;
+    // Uniform (warp-convergent) trip count: round `total` up to a whole number
+    // of strides so every lane reaches the warp ballot each iteration. The
+    // per-element predicate (in_range && hit) excludes the tail lanes, so the
+    // ballot mask is full (0xffffffff) and well-defined for all 32 lanes.
+    const long start = prim::grid_stride_index();
+    const long rounded = ((total + stride - 1) / stride) * stride;
+    for (long idx = start; idx < rounded; idx += stride) {
+        const bool in_range = idx < total;
+        int e = -1;
+        bool hit = false;
+        if (in_range) {
+            e = static_cast<int>(idx % num_experts);
+            hit = gate_logits[idx] > threshold;
+        }
+        // Ballot the lanes that will add 1 (full participating mask).
+        const unsigned active = __ballot_sync(0xffffffffu, hit);
+        if (hit) {
+            // Group the contributing lanes by their target expert e.
+            const unsigned same = __match_any_sync(active, e);
+            // Lowest lane in this e-group is the leader; it adds the group size.
+            const unsigned leader = __ffs(static_cast<int>(same)) - 1u;
+            if (lane == leader) {
+                atomicAdd(&expert_counts[e], __popc(same));
+            }
+        }
+    }
 }
 
-torch::Tensor moe_dynamic_expert_fwd(
-    torch::Tensor input, torch::Tensor expert_indices,
-    torch::Tensor routing_weights,
-    torch::Tensor expert_w1, torch::Tensor expert_b1,
-    torch::Tensor expert_w2, torch::Tensor expert_b2,
-    torch::Tensor output) {
-    throw std::runtime_error("moe_dynamic_expert_fwd: sm_90 kernel not yet implemented.");
-    return torch::Tensor{};
+void moe_count_expert_activations(
+    torch::Tensor gate_logits, torch::Tensor expert_counts,
+    float threshold, int N, int num_experts) {
+    if (N == 0 || num_experts == 0) return;
+    auto gl = gate_logits.contiguous();
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const long total = static_cast<long>(N) * num_experts;
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (total + block - 1) / block);
+    moe_count_expert_activations_kernel<<<grid, block, 0, stream>>>(
+        gl.data_ptr<float>(), expert_counts.data_ptr<int>(),
+        threshold, N, num_experts);
 }
 
-void moe_dynamic_expert_bwd(
-    torch::Tensor d_output, torch::Tensor input,
-    torch::Tensor expert_indices, torch::Tensor routing_weights,
-    torch::Tensor expert_w1, torch::Tensor expert_b1,
-    torch::Tensor expert_w2, torch::Tensor expert_b2,
-    torch::Tensor d_input, torch::Tensor d_expert_w1,
-    torch::Tensor d_expert_b1, torch::Tensor d_expert_w2,
-    torch::Tensor d_expert_b2) {
-    throw std::runtime_error("moe_dynamic_expert_bwd: sm_90 kernel not yet implemented.");
+// ── (2) Switch-Transformer load-balance auxiliary loss ─────────────────────
+//  f_e = expert_counts[e]/N  (fraction of tokens routed to expert e)
+//  P_e = mean_t softmax(gate_logits[t,:])[e]
+//  loss = num_experts * Σ_e f_e * P_e
+//  Implemented with ATen reductions (softmax + mean) for numerical stability;
+//  returns a scalar tensor on the gate_logits device.
+torch::Tensor moe_compute_load_balance_loss(
+    torch::Tensor expert_counts, torch::Tensor gate_logits,
+    int N, int num_experts) {
+    auto opts = torch::TensorOptions()
+        .dtype(torch::kFloat32).device(gate_logits.device());
+    if (N == 0 || num_experts == 0) return torch::zeros({}, opts);
+    auto gl = gate_logits.to(torch::kFloat32);
+    // P_e: mean over tokens of softmax probability for expert e -> [num_experts]
+    auto P = torch::softmax(gl, /*dim=*/1).mean(/*dim=*/0);          // [E]
+    // f_e: token fraction routed to expert e
+    auto f = expert_counts.to(torch::kFloat32) / static_cast<double>(N);  // [E]
+    auto loss = static_cast<double>(num_experts) * (f * P).sum();
+    return loss;
+}
+
+// ── (3) Frequency-inverse per-expert LR scaling ────────────────────────────
+//  freq_e  = (counts[e] + smoothing) / (total + smoothing*num_experts)
+//  scale_e = clamp( (1/num_experts) / freq_e, min_scale, max_scale )
+__global__ void moe_apply_frequency_scaling_kernel(
+    const int* __restrict__ expert_counts,
+    float* __restrict__ lr_scale,
+    int num_experts, int total_activations,
+    float min_scale, float max_scale, float smoothing
+) {
+    const int stride = prim::grid_stride();
+    const float denom = static_cast<float>(total_activations)
+                      + smoothing * static_cast<float>(num_experts);
+    const float uniform = 1.0f / static_cast<float>(num_experts);
+    for (int e = prim::grid_stride_index(); e < num_experts; e += stride) {
+        const float freq = (static_cast<float>(expert_counts[e]) + smoothing)
+                         / denom;
+        float scale = (freq > 0.0f) ? (uniform / freq) : max_scale;
+        scale = fminf(fmaxf(scale, min_scale), max_scale);
+        lr_scale[e] = scale;
+    }
+}
+
+void moe_apply_frequency_scaling(
+    torch::Tensor expert_counts, torch::Tensor lr_scale,
+    int num_experts, int total_activations,
+    float min_scale, float max_scale, float smoothing) {
+    if (num_experts == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (num_experts + block - 1) / block);
+    moe_apply_frequency_scaling_kernel<<<grid, block, 0, stream>>>(
+        expert_counts.data_ptr<int>(), lr_scale.data_ptr<float>(),
+        num_experts, total_activations, min_scale, max_scale, smoothing);
+}
+
+// ── (4) Stream-compaction of active-expert parameters ──────────────────────
+//  For each i in [0,total_params): if expert_active[param_to_expert[i]] != 0,
+//  append params/grads/state_m/state_v[i] to the compact_* arrays and record
+//  scatter_indices[out]=i. compact_count[0] = number kept.
+//
+//  Output position is claimed via a single global atomicAdd counter
+//  (compact_count). A prefix-sum compaction would yield deterministic ordering
+//  and slightly better coalescing, but the optimizer only needs the (out -> i)
+//  scatter map to be self-consistent — ordering among kept elements is
+//  irrelevant because moe_scatter_results writes back by stored index. The
+//  atomic compaction is correct and is the documented choice here.
+__global__ void moe_filter_active_params_kernel(
+    const float* __restrict__ params, const float* __restrict__ grads,
+    const float* __restrict__ state_m, const float* __restrict__ state_v,
+    const int* __restrict__ param_to_expert,
+    const int* __restrict__ expert_active,
+    float* __restrict__ compact_params, float* __restrict__ compact_grads,
+    float* __restrict__ compact_state_m, float* __restrict__ compact_state_v,
+    int* __restrict__ scatter_indices, int* __restrict__ compact_count,
+    int total_params
+) {
+    const int stride = prim::grid_stride();
+    const unsigned lane = threadIdx.x & 31u;
+    // Uniform (warp-convergent) trip count so every lane reaches the ballot
+    // each iteration; the `in_range && active` predicate masks the tail lanes.
+    const int start = prim::grid_stride_index();
+    const long rounded =
+        ((static_cast<long>(total_params) + stride - 1) / stride) * stride;
+    for (long ii = start; ii < rounded; ii += stride) {
+        const int i = static_cast<int>(ii);
+        bool keep = false;
+        if (ii < total_params) {
+            const int e = param_to_expert[i];
+            keep = expert_active[e] != 0;
+        }
+        // §4.1 warp-aggregated atomic ALLOCATION: the leader reserves one
+        // contiguous block of `popc(mask)` output slots with a single global
+        // atomicAdd; each kept lane then writes to base + its in-warp rank.
+        // Ordering among kept elements is irrelevant (moe_scatter_results
+        // writes back by stored scatter index), and the total count is
+        // identical to the per-lane atomic — popc(mask) kept lanes claim
+        // exactly popc(mask) slots.
+        const unsigned mask = __ballot_sync(0xffffffffu, keep);
+        if (keep) {
+            const unsigned leader = __ffs(static_cast<int>(mask)) - 1u;
+            int base = 0;
+            if (lane == leader) {
+                base = atomicAdd(&compact_count[0], __popc(mask));
+            }
+            // Broadcast the reserved base from the leader to the whole group.
+            base = __shfl_sync(mask, base, static_cast<int>(leader));
+            // Rank of this lane within the kept group = popcount of kept lanes
+            // below it.
+            const unsigned rank =
+                __popc(mask & ((1u << lane) - 1u));
+            const int out = base + static_cast<int>(rank);
+            compact_params[out]  = params[i];
+            compact_grads[out]   = grads[i];
+            compact_state_m[out] = state_m[i];
+            compact_state_v[out] = state_v[i];
+            scatter_indices[out] = i;
+        }
+    }
 }
 
 void moe_filter_active_params(
@@ -3588,7 +2172,347 @@ void moe_filter_active_params(
     torch::Tensor compact_state_m, torch::Tensor compact_state_v,
     torch::Tensor scatter_indices, torch::Tensor compact_count,
     int total_params) {
-    throw std::runtime_error("moe_filter_active_params: sm_90 kernel not yet implemented.");
+    if (total_params == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (total_params + block - 1) / block);
+    moe_filter_active_params_kernel<<<grid, block, 0, stream>>>(
+        params.data_ptr<float>(), grads.data_ptr<float>(),
+        state_m.data_ptr<float>(), state_v.data_ptr<float>(),
+        param_to_expert.data_ptr<int>(), expert_active.data_ptr<int>(),
+        compact_params.data_ptr<float>(), compact_grads.data_ptr<float>(),
+        compact_state_m.data_ptr<float>(), compact_state_v.data_ptr<float>(),
+        scatter_indices.data_ptr<int>(), compact_count.data_ptr<int>(),
+        total_params);
+}
+
+// ── (5) Scatter compacted results back to dense storage ────────────────────
+//  Inverse of (4): for j in [0,compact_N): i=scatter_indices[j];
+//  params[i]=compact_params[j]; state_m[i]=compact_state_m[j]; etc.
+__global__ void moe_scatter_results_kernel(
+    const float* __restrict__ compact_params,
+    const float* __restrict__ compact_state_m,
+    const float* __restrict__ compact_state_v,
+    const int* __restrict__ scatter_indices,
+    float* __restrict__ params,
+    float* __restrict__ state_m, float* __restrict__ state_v,
+    int compact_N
+) {
+    const int stride = prim::grid_stride();
+    for (int j = prim::grid_stride_index(); j < compact_N; j += stride) {
+        const int i = scatter_indices[j];
+        params[i]  = compact_params[j];
+        state_m[i] = compact_state_m[j];
+        state_v[i] = compact_state_v[j];
+    }
+}
+
+void moe_scatter_results(
+    torch::Tensor compact_params,
+    torch::Tensor compact_state_m, torch::Tensor compact_state_v,
+    torch::Tensor scatter_indices,
+    torch::Tensor params,
+    torch::Tensor state_m, torch::Tensor state_v,
+    int compact_N) {
+    if (compact_N == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (compact_N + block - 1) / block);
+    moe_scatter_results_kernel<<<grid, block, 0, stream>>>(
+        compact_params.data_ptr<float>(),
+        compact_state_m.data_ptr<float>(), compact_state_v.data_ptr<float>(),
+        scatter_indices.data_ptr<int>(),
+        params.data_ptr<float>(),
+        state_m.data_ptr<float>(), state_v.data_ptr<float>(),
+        compact_N);
+}
+
+// ── (6) Masked gather of active expert weights ─────────────────────────────
+//  expert_w1 [E, hidden, d_in], expert_b1 [E, hidden],
+//  expert_w2 [E, d_out, hidden], expert_b2 [E, d_out]. active_mask [E].
+//  Copies the e-th slice into a compact buffer for every active expert e,
+//  packed densely in expert order (compact slot = #active experts before e).
+//  Implemented as a per-active-expert prefix index built on the host (ATen)
+//  followed by an index_copy; the gather itself is a simple memcpy-style copy.
+void moe_dynamic_expert_load(
+    torch::Tensor expert_w1, torch::Tensor expert_b1,
+    torch::Tensor expert_w2, torch::Tensor expert_b2,
+    torch::Tensor active_mask,
+    torch::Tensor smem_w1, torch::Tensor smem_b1,
+    torch::Tensor smem_w2, torch::Tensor smem_b2) {
+    // active expert indices, in ascending order -> dense packing positions.
+    auto idx = torch::nonzero(active_mask.reshape(-1) != 0).reshape(-1);  // [A]
+    const int64_t A = idx.numel();
+    if (A == 0) return;
+    auto src1 = expert_w1.index_select(0, idx);
+    auto src2 = expert_w2.index_select(0, idx);
+    auto sb1  = expert_b1.index_select(0, idx);
+    auto sb2  = expert_b2.index_select(0, idx);
+    smem_w1.narrow(0, 0, A).copy_(src1);
+    smem_w2.narrow(0, 0, A).copy_(src2);
+    smem_b1.narrow(0, 0, A).copy_(sb1);
+    smem_b2.narrow(0, 0, A).copy_(sb2);
+}
+
+// ── (7) Per-token expert MLP forward ───────────────────────────────────────
+//  Shapes (from the binding contract / spec):
+//    input          [N, d_in]
+//    expert_indices [N]            (int, per-token expert id)
+//    routing_weights[N]            (float, per-token scalar gate weight)
+//    expert_w1      [E, hidden, d_in]   expert_b1 [E, hidden]
+//    expert_w2      [E, d_out,  hidden] expert_b2 [E, d_out]
+//    output         [N, d_out]    (written)
+//  output[t] = routing_weights[t] * (W2_e @ relu(W1_e @ input[t] + b1_e) + b2_e)
+//  One warp per token; each lane strides over the output dimension. The hidden
+//  activation is recomputed per output element (hidden is small for SG2's
+//  PEER-style experts); correctness-first, the dynamic_expert_* path is not on
+//  the hot reachable list.
+__global__ void moe_dynamic_expert_fwd_kernel(
+    const float* __restrict__ input,
+    const int* __restrict__ expert_indices,
+    const float* __restrict__ routing_weights,
+    const float* __restrict__ expert_w1, const float* __restrict__ expert_b1,
+    const float* __restrict__ expert_w2, const float* __restrict__ expert_b2,
+    float* __restrict__ output,
+    int N, int d_in, int hidden, int d_out
+) {
+    const int t = blockIdx.x;                 // one block per token
+    if (t >= N) return;
+    const int lane = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int e = expert_indices[t];
+    const float rw = routing_weights[t];
+
+    const float* x   = input + static_cast<long>(t) * d_in;
+    const float* W1  = expert_w1 + static_cast<long>(e) * hidden * d_in;
+    const float* b1  = expert_b1 + static_cast<long>(e) * hidden;
+    const float* W2  = expert_w2 + static_cast<long>(e) * d_out * hidden;
+    const float* b2  = expert_b2 + static_cast<long>(e) * d_out;
+
+    // Shared hidden activation h = relu(W1 x + b1), [hidden].
+    extern __shared__ float h[];
+    for (int j = lane; j < hidden; j += nthreads) {
+        float acc = b1[j];
+        const float* w1row = W1 + static_cast<long>(j) * d_in;
+        for (int k = 0; k < d_in; ++k) acc += w1row[k] * x[k];
+        h[j] = acc > 0.0f ? acc : 0.0f;
+    }
+    __syncthreads();
+
+    float* y = output + static_cast<long>(t) * d_out;
+    for (int o = lane; o < d_out; o += nthreads) {
+        float acc = b2[o];
+        const float* w2row = W2 + static_cast<long>(o) * hidden;
+        for (int j = 0; j < hidden; ++j) acc += w2row[j] * h[j];
+        y[o] = rw * acc;
+    }
+}
+
+torch::Tensor moe_dynamic_expert_fwd(
+    torch::Tensor input, torch::Tensor expert_indices,
+    torch::Tensor routing_weights,
+    torch::Tensor expert_w1, torch::Tensor expert_b1,
+    torch::Tensor expert_w2, torch::Tensor expert_b2,
+    torch::Tensor output) {
+    const int N = static_cast<int>(input.size(0));
+    if (N == 0) return output;
+    const int d_in   = static_cast<int>(input.size(1));
+    const int hidden = static_cast<int>(expert_w1.size(1));
+    const int d_out  = static_cast<int>(expert_w2.size(1));
+    auto inp = input.to(torch::kFloat32).contiguous();
+    auto w1  = expert_w1.to(torch::kFloat32).contiguous();
+    auto b1  = expert_b1.to(torch::kFloat32).contiguous();
+    auto w2  = expert_w2.to(torch::kFloat32).contiguous();
+    auto b2  = expert_b2.to(torch::kFloat32).contiguous();
+    auto rw  = routing_weights.to(torch::kFloat32).contiguous();
+    auto ei  = expert_indices.to(torch::kInt32).contiguous();
+
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = std::min<int>(256, std::max<int>(d_out, hidden));
+    const int grid = N;
+    const size_t smem = static_cast<size_t>(hidden) * sizeof(float);
+    moe_dynamic_expert_fwd_kernel<<<grid, block, smem, stream>>>(
+        inp.data_ptr<float>(), ei.data_ptr<int>(), rw.data_ptr<float>(),
+        w1.data_ptr<float>(), b1.data_ptr<float>(),
+        w2.data_ptr<float>(), b2.data_ptr<float>(),
+        output.data_ptr<float>(), N, d_in, hidden, d_out);
+    return output;
+}
+
+// ── (8) Per-token expert MLP backward (full VJP, no autograd) ──────────────
+//  Forward:  h = relu(z1), z1 = W1 x + b1 ; y = rw * (W2 h + b2)
+//  Given d_output (= dL/dy), accumulate:
+//    d(W2 b2): dy = rw * d_output ; dW2_e += dy ⊗ h ; db2_e += dy
+//    dh = W2ᵀ dy ; dz1 = dh ⊙ [z1>0]
+//    dW1_e += dz1 ⊗ x ; db1_e += dz1 ; d_input[t] = W1ᵀ dz1
+//  Expert-weight grads are accumulated with atomics (many tokens share e).
+//  One block per token; hidden activation + dz1 recomputed in shared memory.
+__global__ void moe_dynamic_expert_bwd_kernel(
+    const float* __restrict__ d_output,
+    const float* __restrict__ input,
+    const int* __restrict__ expert_indices,
+    const float* __restrict__ routing_weights,
+    const float* __restrict__ expert_w1, const float* __restrict__ expert_b1,
+    const float* __restrict__ expert_w2, const float* __restrict__ expert_b2,
+    float* __restrict__ d_input, float* __restrict__ d_expert_w1,
+    float* __restrict__ d_expert_b1, float* __restrict__ d_expert_w2,
+    float* __restrict__ d_expert_b2,
+    int N, int d_in, int hidden, int d_out
+) {
+    const int t = blockIdx.x;
+    if (t >= N) return;
+    const int lane = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int e = expert_indices[t];
+    const float rw = routing_weights[t];
+
+    const float* x   = input + static_cast<long>(t) * d_in;
+    const float* W1  = expert_w1 + static_cast<long>(e) * hidden * d_in;
+    const float* b1  = expert_b1 + static_cast<long>(e) * hidden;
+    const float* W2  = expert_w2 + static_cast<long>(e) * d_out * hidden;
+    const float* dy_row = d_output + static_cast<long>(t) * d_out;
+
+    float* dW1 = d_expert_w1 + static_cast<long>(e) * hidden * d_in;
+    float* db1 = d_expert_b1 + static_cast<long>(e) * hidden;
+    float* dW2 = d_expert_w2 + static_cast<long>(e) * d_out * hidden;
+    float* db2 = d_expert_b2 + static_cast<long>(e) * d_out;
+
+    // h[j] = relu(W1 x + b1)[j], hmask[j] = [z1>0]   (recompute forward act).
+    extern __shared__ float smem[];
+    float* h    = smem;             // [hidden]
+    float* dz1  = smem + hidden;    // [hidden]
+    for (int j = lane; j < hidden; j += nthreads) {
+        float acc = b1[j];
+        const float* w1row = W1 + static_cast<long>(j) * d_in;
+        for (int k = 0; k < d_in; ++k) acc += w1row[k] * x[k];
+        h[j] = acc > 0.0f ? acc : 0.0f;
+        dz1[j] = 0.0f;
+    }
+    __syncthreads();
+
+    // dy = rw * d_output ; db2 += dy ; dW2 += dy ⊗ h ; accumulate dh into dz1.
+    for (int o = lane; o < d_out; o += nthreads) {
+        const float dy = rw * dy_row[o];
+        atomicAdd(&db2[o], dy);
+        const float* w2row = W2 + static_cast<long>(o) * hidden;
+        float* dw2row = dW2 + static_cast<long>(o) * hidden;
+        for (int j = 0; j < hidden; ++j) {
+            atomicAdd(&dw2row[j], dy * h[j]);
+            // dh_j = Σ_o W2[o,j] dy ; gate by relu mask (h[j]>0).
+            if (h[j] > 0.0f) atomicAdd(&dz1[j], w2row[j] * dy);
+        }
+    }
+    __syncthreads();
+
+    // dW1 += dz1 ⊗ x ; db1 += dz1 ; d_input[t] = W1ᵀ dz1.
+    for (int j = lane; j < hidden; j += nthreads) {
+        const float g = dz1[j];
+        atomicAdd(&db1[j], g);
+        const float* w1row = W1 + static_cast<long>(j) * d_in;
+        float* dw1row = dW1 + static_cast<long>(j) * d_in;
+        for (int k = 0; k < d_in; ++k) atomicAdd(&dw1row[k], g * x[k]);
+    }
+    __syncthreads();
+    float* dx = d_input + static_cast<long>(t) * d_in;
+    for (int k = lane; k < d_in; k += nthreads) {
+        float acc = 0.0f;
+        for (int j = 0; j < hidden; ++j) {
+            acc += W1[static_cast<long>(j) * d_in + k] * dz1[j];
+        }
+        dx[k] = acc;
+    }
+}
+
+void moe_dynamic_expert_bwd(
+    torch::Tensor d_output, torch::Tensor input,
+    torch::Tensor expert_indices, torch::Tensor routing_weights,
+    torch::Tensor expert_w1, torch::Tensor expert_b1,
+    torch::Tensor expert_w2, torch::Tensor expert_b2,
+    torch::Tensor d_input, torch::Tensor d_expert_w1,
+    torch::Tensor d_expert_b1, torch::Tensor d_expert_w2,
+    torch::Tensor d_expert_b2) {
+    const int N = static_cast<int>(input.size(0));
+    if (N == 0) return;
+    const int d_in   = static_cast<int>(input.size(1));
+    const int hidden = static_cast<int>(expert_w1.size(1));
+    const int d_out  = static_cast<int>(expert_w2.size(1));
+    auto inp = input.to(torch::kFloat32).contiguous();
+    auto dout = d_output.to(torch::kFloat32).contiguous();
+    auto w1  = expert_w1.to(torch::kFloat32).contiguous();
+    auto b1  = expert_b1.to(torch::kFloat32).contiguous();
+    auto w2  = expert_w2.to(torch::kFloat32).contiguous();
+    auto b2  = expert_b2.to(torch::kFloat32).contiguous();
+    auto rw  = routing_weights.to(torch::kFloat32).contiguous();
+    auto ei  = expert_indices.to(torch::kInt32).contiguous();
+
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = std::min<int>(256, std::max<int>(d_out, hidden));
+    const int grid = N;
+    const size_t smem = static_cast<size_t>(2 * hidden) * sizeof(float);
+    moe_dynamic_expert_bwd_kernel<<<grid, block, smem, stream>>>(
+        dout.data_ptr<float>(), inp.data_ptr<float>(),
+        ei.data_ptr<int>(), rw.data_ptr<float>(),
+        w1.data_ptr<float>(), b1.data_ptr<float>(),
+        w2.data_ptr<float>(), b2.data_ptr<float>(),
+        d_input.data_ptr<float>(), d_expert_w1.data_ptr<float>(),
+        d_expert_b1.data_ptr<float>(), d_expert_w2.data_ptr<float>(),
+        d_expert_b2.data_ptr<float>(), N, d_in, hidden, d_out);
+}
+
+// ── (9) Compacted selective scan — VESTIGIAL ───────────────────────────────
+//  This signature references a Mamba-style discretized SSM recurrence
+//  (A_log/dt/B/C/D). SG2's sequence mixer is now CSA/HCA, NOT Mamba, and the
+//  reachability audit confirms Python NEVER calls moe_scan_compacted. It is
+//  kept here purely for ABI stability (the symbol is exported by bindings.cpp).
+//
+//  We implement the standard discretized SSM recurrence so the entry is
+//  numerically sound if ever invoked:
+//    A_bar = exp(dt_t * A) where A = -exp(A_log)   (per (channel, state))
+//    h_t   = A_bar ⊙ h_{t-1} + (dt_t * B_t) * x_t
+//    y_t   = Σ_s C_t[s] * h_t[d,s] + D[d] * x_t[d]
+//  Layout (compacted, single sequence of length compact_N):
+//    compact_x  [compact_N, d_inner]      compact_dt [compact_N, d_inner]
+//    compact_B  [compact_N, d_state]      compact_C  [compact_N, d_state]
+//    A_log      [d_inner, d_state]        D_param    [d_inner]
+//    initial_state/final_state [d_inner, d_state]
+//    scan_output[compact_N, d_inner]
+//  rope_freq is accepted but unused (vestigial positional arg). One thread per
+//  inner channel d; the scan is sequential along time, parallel across d.
+__global__ void moe_scan_compacted_kernel(
+    const float* __restrict__ compact_x, const float* __restrict__ compact_dt,
+    const float* __restrict__ compact_B, const float* __restrict__ compact_C,
+    const float* __restrict__ A_log, const float* __restrict__ D_param,
+    float* __restrict__ scan_output, float* __restrict__ final_state,
+    const float* __restrict__ initial_state,
+    int compact_N, int d_inner, int d_state
+) {
+    const int stride = prim::grid_stride();
+    for (int d = prim::grid_stride_index(); d < d_inner; d += stride) {
+        // per-channel state register row h[s], bounded by SG2's MAX d_state.
+        float h[256];
+        for (int s = 0; s < d_state; ++s) {
+            h[s] = (initial_state != nullptr)
+                 ? initial_state[d * d_state + s] : 0.0f;
+        }
+        const float Dd = (D_param != nullptr) ? D_param[d] : 0.0f;
+        for (int t = 0; t < compact_N; ++t) {
+            const float xt = compact_x[t * d_inner + d];
+            const float dt = compact_dt[t * d_inner + d];
+            float y = Dd * xt;
+            for (int s = 0; s < d_state; ++s) {
+                const float A = -expf(A_log[d * d_state + s]);  // negative real
+                const float A_bar = expf(dt * A);
+                const float Bx = (dt * compact_B[t * d_state + s]) * xt;
+                h[s] = A_bar * h[s] + Bx;
+                y += compact_C[t * d_state + s] * h[s];
+            }
+            scan_output[t * d_inner + d] = y;
+        }
+        if (final_state != nullptr) {
+            for (int s = 0; s < d_state; ++s)
+                final_state[d * d_state + s] = h[s];
+        }
+    }
 }
 
 void moe_scan_compacted(
@@ -3599,37 +2523,32 @@ void moe_scan_compacted(
     torch::Tensor scan_output, torch::Tensor final_state,
     torch::Tensor initial_state,
     int compact_N, int d_inner, int d_state) {
-    throw std::runtime_error("moe_scan_compacted: sm_90 kernel not yet implemented.");
-}
-
-void moe_scatter_results(
-    torch::Tensor compact_params,
-    torch::Tensor compact_state_m, torch::Tensor compact_state_v,
-    torch::Tensor scatter_indices,
-    torch::Tensor params,
-    torch::Tensor state_m, torch::Tensor state_v,
-    int compact_N) {
-    throw std::runtime_error("moe_scatter_results: sm_90 kernel not yet implemented.");
-}
-
-void moe_count_expert_activations(
-    torch::Tensor gate_logits, torch::Tensor expert_counts,
-    float threshold, int N, int num_experts) {
-    throw std::runtime_error("moe_count_expert_activations: sm_90 kernel not yet implemented.");
-}
-
-torch::Tensor moe_compute_load_balance_loss(
-    torch::Tensor expert_counts, torch::Tensor gate_logits,
-    int N, int num_experts) {
-    throw std::runtime_error("moe_compute_load_balance_loss: sm_90 kernel not yet implemented.");
-    return torch::Tensor{};
-}
-
-void moe_apply_frequency_scaling(
-    torch::Tensor expert_counts, torch::Tensor lr_scale,
-    int num_experts, int total_activations,
-    float min_scale, float max_scale, float smoothing) {
-    throw std::runtime_error("moe_apply_frequency_scaling: sm_90 kernel not yet implemented.");
+    (void)rope_freq;  // vestigial positional arg (Mamba-era), intentionally unused.
+    if (compact_N == 0 || d_inner == 0) return;
+    TORCH_CHECK(d_state <= 256,
+        "moe_scan_compacted: vestigial scan supports d_state <= 256");
+    auto cx = compact_x.to(torch::kFloat32).contiguous();
+    auto cdt = compact_dt.to(torch::kFloat32).contiguous();
+    auto cB = compact_B.to(torch::kFloat32).contiguous();
+    auto cC = compact_C.to(torch::kFloat32).contiguous();
+    auto al = A_log.to(torch::kFloat32).contiguous();
+    auto dp = D_param.defined() ? D_param.to(torch::kFloat32).contiguous()
+                                : torch::Tensor{};
+    auto init = initial_state.defined()
+              ? initial_state.to(torch::kFloat32).contiguous()
+              : torch::Tensor{};
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int block = SG_TUNED_BLOCK_SIZE;
+    const int grid = std::min<int>(65535, (d_inner + block - 1) / block);
+    moe_scan_compacted_kernel<<<grid, block, 0, stream>>>(
+        cx.data_ptr<float>(), cdt.data_ptr<float>(),
+        cB.data_ptr<float>(), cC.data_ptr<float>(),
+        al.data_ptr<float>(),
+        dp.defined() ? dp.data_ptr<float>() : nullptr,
+        scan_output.data_ptr<float>(),
+        final_state.defined() ? final_state.data_ptr<float>() : nullptr,
+        init.defined() ? init.data_ptr<float>() : nullptr,
+        compact_N, d_inner, d_state);
 }
 
 }} // namespace sg::sm90

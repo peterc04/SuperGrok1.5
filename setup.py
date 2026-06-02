@@ -209,6 +209,10 @@ if _has_gpu and _is_hip:
         # HIP/CUDA pipeline). Use this extension for hand-written
         # `__global__` kernels with `hipLaunchKernelGGL` launch syntax.
         "csrc/backends/hip/gfx942/*.hip",
+        # Stage 6: generated L3 persistent megakernels (gfx942). The demo lives
+        # as a gate-verified .hip.hpp header; the generator emits per-cell .hip
+        # TUs here. Glob is guarded — the build works if the dir is sparse.
+        "csrc/fused/gfx942/*.hip",
     ])
 
     rocm_archs = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()
@@ -252,6 +256,10 @@ elif _has_gpu:
     sources = COMMON_BINDINGS + _collect([
         "csrc/backends/cuda/sm_90/*.cu",
         "csrc/backends/cuda/sm_90/models/*.cu",
+        # Stage 6: generated L3 persistent megakernels (one .cu per solver-
+        # chosen cell, emitted by grokking_optimizers/megakernel_codegen.py).
+        # Glob is guarded — the build works if the dir is sparse / absent.
+        "csrc/fused/sm_90/*.cu",
     ])
 
     nvcc_archs_env = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()
