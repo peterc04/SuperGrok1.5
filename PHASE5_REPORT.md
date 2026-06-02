@@ -57,7 +57,7 @@ fix.
 
 ## 44-component status
 
-| group | sm_90 | gfx942 | tpu_v5p | verification |
+| group | sm_90 | gfx942 | tpu_v6e | verification |
 |-------|-------|--------|---------|--------------|
 | 11 optimizers | FULLY-BUILT (nvcc-object) | FULLY-BUILT, device LIVE-on-hipcc (clang-amdgcn-gate; host-launch 🟡) | FULLY-BUILT (jax-lower) | per arch |
 | 3 models | FULLY-BUILT (nvcc-object; TF32 path) | FULLY-BUILT (clang-amdgcn) | FULLY-BUILT (jax-lower) | per arch |
@@ -68,7 +68,7 @@ fix.
 ## 99-pipeline status (live-solver tiers, post-Phase-4 re-tier)
 - sm_90: 33 REAL-COMPOSITION-COMPILED (33 L3 🟡-estimate)
 - gfx942: 33 REAL-COMPOSITION-GATE-VERIFIED (11 L3 / 22 L1; device LIVE-on-hipcc 🟡)
-- tpu_v5p: 33 REAL-COMPOSITION-TRACE-VERIFIED (33 L3)
+- tpu_v6e: 33 REAL-COMPOSITION-TRACE-VERIFIED (33 L3)
 **0 STILL-WRAPPER.** 5-way consistent (V.4).
 
 ## LIVE / FALLBACK / DORMANT ledger

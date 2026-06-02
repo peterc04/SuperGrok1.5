@@ -45,7 +45,7 @@ OPTIMIZERS: Tuple[str, ...] = (
     "neuralgrok", "prodigy", "supergrok11", "supergrok15", "supergrok2",
 )
 # The three archs that have hand-written kernel bodies (the megakernel targets).
-MEGAKERNEL_ARCHS: Tuple[str, ...] = ("sm_90", "gfx942", "tpu_v5p")
+MEGAKERNEL_ARCHS: Tuple[str, ...] = ("sm_90", "gfx942", "tpu_v6e")
 
 
 class FusionTier(enum.IntEnum):

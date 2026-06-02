@@ -7,7 +7,7 @@ all 7 optimizers and 3 model architectures across the 3-arch active set:
 |---|---|---|---|
 | `sm_90/` | NVIDIA Hopper (H100/H200) | `.cuh` | 16 |
 | `gfx942/` | AMD CDNA3 (MI300X/MI300A) | `.hip.hpp` | 16 |
-| `tpu/` | Google TPU v5p (Pallas/JAX) | `.py` | 12 |
+| `tpu/` | Google TPU v6e (Pallas/JAX) | `.py` | 12 |
 
 ## Relationship to Production Kernels
 

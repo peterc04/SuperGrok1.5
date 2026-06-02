@@ -3,7 +3,7 @@
 A grokking-optimizer + model training stack built as **44 reusable components
 that compose into 99 fused training pipelines** across three accelerator
 families — **NVIDIA sm_90 (Hopper)**, **AMD gfx942 (CDNA3 / MI300X)**, and
-**Google TPU v5p** — with **one canonical source of truth per component**
+**Google TPU v6e** — with **one canonical source of truth per component**
 (no parallel math trees, no dead duplicates; enforced by a self-test drift
 guard).
 
@@ -11,7 +11,7 @@ guard).
 > this environment via CPU / clang-AMDGPU-gate / `nvcc -c` / JAX-lowering**.
 > No accelerator is present here, so all *runtime* and *numeric-parity* claims
 > are 🟡 and gated on the executable checklist in
-> [`HARDWARE_VALIDATION.md`](HARDWARE_VALIDATION.md) (H100 / MI300X / TPU v5p).
+> [`HARDWARE_VALIDATION.md`](HARDWARE_VALIDATION.md) (H100 / MI300X / TPU v6e).
 > Nothing in this README claims a hardware result.
 
 ---
@@ -29,7 +29,7 @@ guard).
 **11 optimizers:** AdamW, Lion, Grokfast, GrokAdamW, LookSAM, Prodigy,
 NeuralGrok, Muon, SuperGrok1.1, SuperGrok1.5, SuperGrok2.
 **3 models:** Transformer-Decoder, ViT, Mamba-3.
-**3 archs:** sm_90, gfx942, tpu_v5p.
+**3 archs:** sm_90, gfx942, tpu_v6e.
 
 The **dispatch/compile layer composes any optimizer component with any model
 component** into one fused L3/L1 persistent megakernel per (model, optimizer,
@@ -67,7 +67,7 @@ csrc/fused/
   sm_90/model_stages.cuh           ← element-local model fwd/bwd
   sm_90/fused_megakernel.cuh       ← the composition seam (L3/L1 persistent kernel)
   gfx942/{opt_components,model_stages,fused_megakernel}.hip.hpp
-  {sm_90,gfx942,tpu_v5p}/mega_<model>_<opt>.{cu,hip,py}  ← the 99 real cells
+  {sm_90,gfx942,tpu_v6e}/mega_<model>_<opt>.{cu,hip,py}  ← the 99 real cells
   megakernel_common*.{cuh,hip.hpp} ← task queue, %smid/HW_ID pin, GridBarrier
 ```
 
@@ -103,7 +103,7 @@ enumeration that emits the 99 cells, so it cannot hand-sync-drift.
   The device kernels are the **LIVE path on a hipcc build** (`#if __HIPCC__` →
   `hipLaunchKernelGGL`); ATen/rocBLAS is the `#else` **CPU fallback**. The SG2
   gfx942 bilevel adjoint + MoE compaction are real AMDGCN device code.
-- **tpu_v5p:** **Pallas** programs (`pl.pallas_call` + `BlockSpec`) composed by
+- **tpu_v6e:** **Pallas** programs (`pl.pallas_call` + `BlockSpec`) composed by
   `_pallas_fused.py` into one `jax.jit` fused program per cell (splash-attention
   where available, hand-tiled dense fallback otherwise; `lax.associative_scan`
   for Mamba).
@@ -156,7 +156,7 @@ FORCE_CUDA=1 WITH_CUTLASS=1 TORCH_CUDA_ARCH_LIST="9.0a" \
 # AMD (MI300X):
 WITH_HIP=1 pip install -e . --no-build-isolation     # requires ROCm/hipcc
 
-# TPU v5p:
+# TPU v6e:
 pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 
 # CPU-only (host build; device paths take their ATen/JAX fallbacks):
@@ -199,7 +199,7 @@ and **provably triggers** on injected divergence.
 | math-drift guard | **LIVE + enforced** in `--self-test` |
 
 **The only remaining work class is on-silicon execution + numeric parity** — no
-code is blocked on anything but real H100 / MI300X / TPU v5p hardware. Every such
+code is blocked on anything but real H100 / MI300X / TPU v6e hardware. Every such
 item is a concrete row in the 99-cell checklist in `HARDWARE_VALIDATION.md`.
 
 ---
@@ -221,4 +221,4 @@ controlled conditions — the project's namesake driver.
 > complete: single canonical math source per component (enforced), no dead
 > duplicate trees, generator-driven dispatch, vectorized AMD apply-steps. The
 > ONLY remaining work class is on-silicon validation (gap #7) — the
-> `HARDWARE_VALIDATION.md` runbook on real H100 / MI300X / TPU v5p — to move 🟡 → ✅.
+> `HARDWARE_VALIDATION.md` runbook on real H100 / MI300X / TPU v6e — to move 🟡 → ✅.

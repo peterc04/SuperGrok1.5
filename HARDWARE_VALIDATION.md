@@ -3,7 +3,7 @@
 This is the **gate to promote any cell 🟡 → ✅**. Every stage of the
 performance build appends its concrete on-silicon checks here. Nothing in this
 repo is `✅` until the relevant section below passes on real
-**H100 / MI300X / TPU v5p**.
+**H100 / MI300X / TPU v6e**.
 
 > **Status legend**
 > - 🟡 = implemented + structurally / compile verified (nvcc `-c` to object on a
@@ -38,7 +38,7 @@ python -c "import grokking_optimizers._C as c; print('ext loaded', c)"
 
 ### TPU (v5p)
 ```bash
-python -c "import jax; print(jax.devices())"   # expect TPU v5p chips
+python -c "import jax; print(jax.devices())"   # expect TPU v6e chips
 # Pallas path is pure-Python; no extension build required.
 ```
 
@@ -55,7 +55,7 @@ optimizer state match within `rtol=1e-3, atol=1e-5` (bf16 path) or `1e-5/1e-7`
 python -m tests.hw.test_reference_parity \
     --optimizer <adamw|lion|grokfast|grokadamw|looksam|muon|neuralgrok|prodigy|supergrok11|supergrok15|supergrok2> \
     --model <transformer|vit|mamba> \
-    --arch <sm_90|gfx942|tpu_v5p> \
+    --arch <sm_90|gfx942|tpu_v6e> \
     --steps 20 --dtype <bf16|fp32> \
     --rtol 1e-3 --atol 1e-5
 ```
@@ -84,7 +84,7 @@ numeric-oracle for every cell is `tests.hw.test_reference_parity --optimizer
 <opt> --model <model> --arch <arch> --steps 20`. Status 🟡 = compile/clang/
 trace-verified in-repo; runtime+numerics pending hardware.
 
-| model | optimizer | sm_90 | gfx942 | tpu_v5p | numeric-oracle reference |
+| model | optimizer | sm_90 | gfx942 | tpu_v6e | numeric-oracle reference |
 |-------|-----------|:-----:|:------:|:-------:|--------------------------|
 | transformer | adamw | L3 🟡 | L1 🟡 | L3 🟡 | m/v EMA + bias-corrected decoupled-WD apply |
 | transformer | lion | L3 🟡 | L1 🟡 | L3 🟡 | sign-momentum update; ema refresh |
@@ -1744,7 +1744,7 @@ host. The ONLY remaining class is execution on real accelerators:
 |------|----------------------|
 | H100 sm_90 | run the 33 composed megakernels; numeric parity of all 11 `apply_optimizer<OptId>` tails vs the per-op path; persistent-kernel occupancy / grid-barrier no-deadlock |
 | MI300X gfx942 | hipcc-build the 33 `.hip` cells + the `#if WITH_HIP` dispatch branch; run; numeric parity of the AMDGCN apply tails, the SG2 device adjoint, and the MoE filter/scatter/histogram vs their ATen references |
-| TPU v5p | execute the 33 `_pallas_fused` programs; numeric parity vs the JAX reference; confirm XLA fuses fwd→bwd→opt |
+| TPU v6e | execute the 33 `_pallas_fused` programs; numeric parity vs the JAX reference; confirm XLA fuses fwd→bwd→opt |
 | all | scalar-hyperparam runtime plumbing (prodigy d, sg gates, neuralgrok psi-net) end-to-end |
 
 ## Phase 4 — single consolidated verification (Stage V) deferrals
@@ -1759,4 +1759,4 @@ remaining checks need real accelerators:
 | WS1 | `ptxas -v` register counts confirm the 53→77 L3 re-tier; numeric parity of the SMEM-staged / warp-split fused kernels is bit-identical to pre-WS1 (the change is storage-class/schedule only — confirm on H100) |
 | WS2 | MI300X: numeric parity of the 11 gfx942 device apply kernels + Muon NS MFMA + SG2 adjoint + MoE vs their ATen references; confirm DPP/MFMA issue |
 | WS3 | H100: TF32 tensor-core FP32 path numerics (accepted ~10-bit-mantissa TC precision; `-DSG_FORCE_SCALAR_FP32` for exact); confirm WGMMA engages |
-| WS5 | TPU v5p: the 4 base `kernels/tpu` shims resolve to the same executed `launch_<opt>` math |
+| WS5 | TPU v6e: the 4 base `kernels/tpu` shims resolve to the same executed `launch_<opt>` math |

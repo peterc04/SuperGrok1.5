@@ -247,11 +247,11 @@ jobs:
           import json, pathlib
           d = pathlib.Path("dry_run_manifests")
           sm90 = json.loads((d / "dry_run_sm_90a.json").read_text())
-          tpu  = json.loads((d / "dry_run_tpu_v5p.json").read_text())
+          tpu  = json.loads((d / "dry_run_tpu_v6e.json").read_text())
           assert sm90["vendor"] == "cuda", sm90["vendor"]
           assert tpu["vendor"]  == "pallas", tpu["vendor"]
           assert sm90["device_cflags"], "sm_90a should have device_cflags"
-          assert tpu.get("xla_env"), "tpu_v5p manifest should carry xla_env"
+          assert tpu.get("xla_env"), "tpu_v6e manifest should carry xla_env"
           xla_flags = tpu["xla_env"].get("XLA_FLAGS", "")
           assert "xla_tpu_" in xla_flags, f"TPU missing tpu-specific flags: {xla_flags[:200]}"
           assert "xla_gpu_autotune_level" not in xla_flags, "GPU flag leaked into TPU env"
@@ -1002,7 +1002,7 @@ jobs:
   # ---------------------------------------------------------------------------
   # Arch dispatch normalization — every arch in ARCH_TABLE must FORCE_ARCH-
   # normalize to the correct vendor impl selector (NVIDIA -> 90, AMD -> 942,
-  # TPU -> tpu_v5p). Locks in the multi-arch "mega kernel" routing so the fat
+  # TPU -> tpu_v6e). Locks in the multi-arch "mega kernel" routing so the fat
   # binary is reachable from every supported device, not just sm_90/gfx942.
   # ---------------------------------------------------------------------------
   arch_dispatch:
@@ -1027,7 +1027,7 @@ jobs:
           bad = []
           for arch in ARCH_TABLE:
               if arch.startswith("tpu"):
-                  expected = "tpu_v5p"
+                  expected = "tpu_v6e"
               elif arch.startswith("gfx"):
                   expected = "942"
               elif arch.startswith("sm_"):

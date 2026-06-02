@@ -18,7 +18,7 @@ Profilers, auto-selected from the target arch:
                 --timestamp on``. CSV/JSON outputs are inlined into the
                 report.
 
-    tpu_v5p  -> ``jax.profiler.start_trace / stop_trace`` in-process; XLA
+    tpu_v6e  -> ``jax.profiler.start_trace / stop_trace`` in-process; XLA
                 HLO + op-level capture. The trace directory contents are
                 summarised in the report.
 
@@ -27,7 +27,7 @@ Path inference (when ``--path`` is given):
     csrc/backends/cuda/sm_90/launch_<opt>.cu          -> sm_90, <opt>
     csrc/backends/hip/gfx942/launch_<opt>.hip.cpp     -> gfx942, <opt>
     csrc/backends/hip/gfx942/launch_<opt>.hip         -> gfx942, <opt>
-    csrc/backends/pallas/launch_<opt>.py              -> tpu_v5p, <opt>
+    csrc/backends/pallas/launch_<opt>.py              -> tpu_v6e, <opt>
     build/compiled/grokking_compiled_<opt>_<model>_<arch>/*.so
                                                        -> arch, opt, model
     any other .py                                     -> need --arch
@@ -35,7 +35,7 @@ Path inference (when ``--path`` is given):
 The profiler runs the standard smoke (import the optimizer class, run one
 ``opt.step()``) — the path is the *identifier* of what to profile; the
 actual kernels exercised come from the installed ``grokking_optimizers._ops``
-(or, for tpu_v5p, the matching ``launch_*.py``).
+(or, for tpu_v6e, the matching ``launch_*.py``).
 
 Usage (CLI):
     python -m grokking_optimizers.profile \\
@@ -97,7 +97,7 @@ ARCHES: Tuple[str, ...] = (
     "gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1151",
     "gfx1200", "gfx1201",
     # Google / Pallas
-    "tpu_v4", "tpu_v5e", "tpu_v5p", "tpu_v6e", "tpu_v7",
+    "tpu_v4", "tpu_v5e", "tpu_v6e", "tpu_v6e", "tpu_v7",
 )
 
 OPT_CLASS = {
@@ -271,7 +271,7 @@ def smoke_script(optimizer: str, model: str, arch: str) -> str:
     grokking_optimizers._ops entirely (which only exists after
     ``pip install -e .``).
     """
-    if arch == "tpu_v5p" or _arch_info().get(arch, {}).get("vendor") == "pallas":
+    if arch == "tpu_v6e" or _arch_info().get(arch, {}).get("vendor") == "pallas":
         return _pallas_smoke_script(optimizer)
     cls = OPT_CLASS[optimizer]
     return textwrap.dedent(f"""\
@@ -419,7 +419,7 @@ def infer_from_path(path: Path) -> dict:
     elif "gfx942" in parts:
         arch = "gfx942"
     elif "pallas" in parts:
-        arch = "tpu_v5p"
+        arch = "tpu_v6e"
 
     name = path.name
 
