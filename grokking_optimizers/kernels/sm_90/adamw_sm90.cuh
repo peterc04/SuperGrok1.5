@@ -48,21 +48,37 @@ namespace prim = ::sg::sm90::primitives;
 using ::sg::algorithms::adamw_step;
 using ::sg::algorithms::adamw_step_vec4;
 
+// Minimum resident blocks/SM for the bandwidth-bound element-wise applies.
+// Caps registers so occupancy stays high on the memory-bound path.
+#ifndef SG_ADAMW_MIN_BLOCKS
+#define SG_ADAMW_MIN_BLOCKS 4
+#endif
+
 // =========================================================================
-//  Scalar grid-stride kernel
+//  Scalar grid-stride kernel. SG_TUNED_UNROLL elements per iteration; the
+//  canonical adamw_step is CALLED (math single-sourced) — the unroll only
+//  changes the loop structure the autotuner generates, not the math.
 // =========================================================================
 
-template <typename ParamT, typename GradT>
-__global__ void adamw_kernel(
+template <typename ParamT, typename GradT, int UNROLL>
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_ADAMW_MIN_BLOCKS)
+adamw_kernel(
     ParamT* param, float* exp_avg, float* exp_avg_sq,
     const GradT* grad,
     float lr, float beta1, float beta2, float eps, float wd,
     float bc1, float bc2, int N
 ) {
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
-        adamw_step(param, exp_avg, exp_avg_sq, grad,
-                   lr, beta1, beta2, eps, wd, bc1, bc2, i);
+    const int stride = prim::grid_stride() * UNROLL;
+    const int base0 = prim::grid_stride_index() * UNROLL;
+    for (int base = base0; base < N; base += stride) {
+        #pragma unroll
+        for (int u = 0; u < UNROLL; ++u) {
+            const int i = base + u;
+            if (i < N) {
+                adamw_step(param, exp_avg, exp_avg_sq, grad,
+                           lr, beta1, beta2, eps, wd, bc1, bc2, i);
+            }
+        }
     }
 }
 
@@ -70,7 +86,8 @@ __global__ void adamw_kernel(
 //  FP32 vec4 fast path (when param, grad, both states are FP32 and 16B-aligned)
 // =========================================================================
 
-__global__ void adamw_kernel_vec4_fp32(
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_ADAMW_MIN_BLOCKS)
+adamw_kernel_vec4_fp32(
     float4* param4, float4* exp_avg4, float4* exp_avg_sq4,
     const float4* grad4,
     float lr, float beta1, float beta2, float eps, float wd,
@@ -110,7 +127,8 @@ void launch_adamw_step(
     const bool all_fp32 = param.scalar_type() == torch::kFloat32 &&
                           grad.scalar_type() == torch::kFloat32;
 
-    if (all_fp32 && prim::is_vec4_alignable(param.data_ptr(), N) &&
+    if (SG_TUNED_VEC_WIDTH == 4 && all_fp32 &&
+        prim::is_vec4_alignable(param.data_ptr(), N) &&
         prim::is_vec4_alignable(grad.data_ptr(), N)) {
         const int N4 = N / 4;
         const int grid4 = std::min<int>(65535, (N4 + block - 1) / block);
@@ -126,7 +144,8 @@ void launch_adamw_step(
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         param.scalar_type(), "adamw_step", [&] {
-            adamw_kernel<scalar_t, scalar_t><<<grid, block, 0, stream>>>(
+            adamw_kernel<scalar_t, scalar_t, SG_TUNED_UNROLL>
+                <<<grid, block, 0, stream>>>(
                 param.data_ptr<scalar_t>(),
                 exp_avg.data_ptr<float>(),
                 exp_avg_sq.data_ptr<float>(),

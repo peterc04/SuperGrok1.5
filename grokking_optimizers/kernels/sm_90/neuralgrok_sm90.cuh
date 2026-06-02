@@ -51,8 +51,36 @@ using ::sg::algorithms::neuralgrok_adam_tail;
 // Compile-time hidden width specializations (H = 8, 16, 32, 64, 128).
 constexpr int NG_H = 64;
 
-template <typename ParamT, typename GradT>
-__global__ void neuralgrok_kernel(
+// Minimum resident blocks/SM. The psi-net forward is compute-heavy per element
+// but the bound is still memory traffic on the Adam state; cap registers so
+// occupancy stays high.
+#ifndef SG_NEURALGROK_MIN_BLOCKS
+#define SG_NEURALGROK_MIN_BLOCKS 4
+#endif
+
+// Cooperatively stage the per-element psi-net weights (W1[H], b1[H], W2[H]) into
+// shared memory ONCE per block, then hand the shared pointers to the canonical
+// neuralgrok_psi_forward<H>. The same weights are read by every element this
+// block processes; staging them removes the per-element re-read from GLOBAL
+// inside the H-wide forward loop. NO math/signature change — the fn still takes
+// const float* and is single-sourced in algorithms/neuralgrok.h.
+template <int H>
+__device__ __forceinline__ void ng_stage_psi_weights(
+    const float* __restrict__ W1, const float* __restrict__ b1,
+    const float* __restrict__ W2,
+    float* sW1, float* sb1, float* sW2
+) {
+    for (int j = threadIdx.x; j < H; j += blockDim.x) {
+        sW1[j] = W1[j];
+        sb1[j] = b1[j];
+        sW2[j] = W2[j];
+    }
+    __syncthreads();
+}
+
+template <typename ParamT, typename GradT, int UNROLL>
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_NEURALGROK_MIN_BLOCKS)
+neuralgrok_kernel(
     ParamT* param, float* exp_avg, float* exp_avg_sq,
     const GradT* grad,
     const float* W1, const float* b1, const float* W2, float b2,
@@ -60,13 +88,64 @@ __global__ void neuralgrok_kernel(
     float lr, float beta1_a, float beta2_a, float eps, float wd,
     float bc1, float bc2, int N
 ) {
+    __shared__ float sW1[NG_H];
+    __shared__ float sb1[NG_H];
+    __shared__ float sW2[NG_H];
+    ng_stage_psi_weights<NG_H>(W1, b1, W2, sW1, sb1, sW2);
+
+    const int stride = prim::grid_stride() * UNROLL;
+    const int base0 = prim::grid_stride_index() * UNROLL;
+    for (int base = base0; base < N; base += stride) {
+        #pragma unroll
+        for (int u = 0; u < UNROLL; ++u) {
+            const int i = base + u;
+            if (i < N) {
+                const float ag = fabsf(static_cast<float>(grad[i]));
+                const float s = neuralgrok_psi_forward<NG_H>(ag, sW1, sb1, sW2, b2);
+                neuralgrok_apply_step(param, exp_avg, exp_avg_sq, grad, s,
+                                      alpha, beta, lr, beta1_a, beta2_a, eps, wd,
+                                      bc1, bc2, i);
+            }
+        }
+    }
+}
+
+// FP32 vec4 fast path. Stages the psi weights into shared once, then loads
+// param/state/grad as float4 (one 128-bit transaction per 4 elements) and CALLS
+// the canonical neuralgrok_psi_forward<H> + neuralgrok_apply_step 4× on the
+// register lanes. The math is NOT re-typed here (single-source guard), only the
+// global traffic is widened and the weights are shared-staged.
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_NEURALGROK_MIN_BLOCKS)
+neuralgrok_kernel_vec4_fp32(
+    float4* param4, float4* exp_avg4, float4* exp_avg_sq4,
+    const float4* grad4,
+    const float* W1, const float* b1, const float* W2, float b2,
+    float alpha, float beta,
+    float lr, float beta1_a, float beta2_a, float eps, float wd,
+    float bc1, float bc2, int N4
+) {
+    __shared__ float sW1[NG_H];
+    __shared__ float sb1[NG_H];
+    __shared__ float sW2[NG_H];
+    ng_stage_psi_weights<NG_H>(W1, b1, W2, sW1, sb1, sW2);
+
     const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
-        const float ag = fabsf(static_cast<float>(grad[i]));
-        const float s = neuralgrok_psi_forward<NG_H>(ag, W1, b1, W2, b2);
-        neuralgrok_apply_step(param, exp_avg, exp_avg_sq, grad, s,
-                              alpha, beta, lr, beta1_a, beta2_a, eps, wd,
-                              bc1, bc2, i);
+    for (int i = prim::grid_stride_index(); i < N4; i += stride) {
+        float4 p = prim::ld_f32v4(param4 + i);
+        float4 m = prim::ld_f32v4(exp_avg4 + i);
+        float4 v = prim::ld_f32v4(exp_avg_sq4 + i);
+        float4 g = prim::ldg_f32v4(grad4 + i);
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const float ag = fabsf((&g.x)[u]);
+            const float s = neuralgrok_psi_forward<NG_H>(ag, sW1, sb1, sW2, b2);
+            neuralgrok_apply_step(&p.x, &m.x, &v.x, &g.x, s,
+                                  alpha, beta, lr, beta1_a, beta2_a, eps, wd,
+                                  bc1, bc2, u);
+        }
+        prim::st_f32v4(param4 + i, p);
+        prim::st_f32v4(exp_avg4 + i, m);
+        prim::st_f32v4(exp_avg_sq4 + i, v);
     }
 }
 
@@ -96,10 +175,37 @@ void launch_neuralgrok_step(
     const int block = SG_TUNED_BLOCK_SIZE;
     const int grid = std::min<int>(65535, (N + block - 1) / block);
 
+    const bool all_fp32 = param.scalar_type() == torch::kFloat32 &&
+                          grad.scalar_type() == torch::kFloat32;
+
+    // Autotuner picks the vector width: width 4 + 16B-aligned all-FP32 takes the
+    // float4 fast path; otherwise the SG_TUNED_UNROLL scalar path runs. Both
+    // stage the psi weights into shared once per block.
+    if (SG_TUNED_VEC_WIDTH == 4 && all_fp32 &&
+        prim::is_vec4_alignable(param.data_ptr(), N) &&
+        prim::is_vec4_alignable(exp_avg.data_ptr(), N) &&
+        prim::is_vec4_alignable(exp_avg_sq.data_ptr(), N) &&
+        prim::is_vec4_alignable(grad.data_ptr(), N)) {
+        const int N4 = N / 4;
+        const int grid4 = std::min<int>(65535, (N4 + block - 1) / block);
+        neuralgrok_kernel_vec4_fp32<<<grid4, block, 0, stream>>>(
+            reinterpret_cast<float4*>(param.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg.data_ptr<float>()),
+            reinterpret_cast<float4*>(exp_avg_sq.data_ptr<float>()),
+            reinterpret_cast<const float4*>(grad.data_ptr<float>()),
+            psi_W1.data_ptr<float>(),
+            psi_b1.data_ptr<float>(),
+            psi_W2.data_ptr<float>(),
+            psi_b2,
+            alpha, beta, lr, beta1_a, beta2_a, eps, wd, bc1, bc2, N4);
+        return;
+    }
+
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         param.scalar_type(), "neuralgrok_step", [&] {
-            neuralgrok_kernel<scalar_t, scalar_t><<<grid, block, 0, stream>>>(
+            neuralgrok_kernel<scalar_t, scalar_t, SG_TUNED_UNROLL>
+                <<<grid, block, 0, stream>>>(
                 param.data_ptr<scalar_t>(),
                 exp_avg.data_ptr<float>(),
                 exp_avg_sq.data_ptr<float>(),
@@ -116,16 +222,22 @@ void launch_neuralgrok_step(
 // Amplifier-only: amplified[i] = psi(|grad[i]|) * grad[i], where
 // psi is the 1-hidden-layer network (W1,b1,W2,b2) with ReLU.
 // alpha, beta scale the amplified gradient: out = alpha * psi(|g|) * g + beta * g
-__global__ void neuralgrok_amplifier_kernel(
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_NEURALGROK_MIN_BLOCKS)
+neuralgrok_amplifier_kernel(
     const float* grad, float* amplified,
     const float* W1, const float* b1, const float* W2, float b2_scalar,
     float alpha, float beta, int N
 ) {
+    __shared__ float sW1[NG_H];
+    __shared__ float sb1[NG_H];
+    __shared__ float sW2[NG_H];
+    ng_stage_psi_weights<NG_H>(W1, b1, W2, sW1, sb1, sW2);
+
     const int stride = prim::grid_stride();
     for (int i = prim::grid_stride_index(); i < N; i += stride) {
         float g = grad[i];
         float ag = fabsf(g);
-        float s = neuralgrok_psi_forward<NG_H>(ag, W1, b1, W2, b2_scalar);
+        float s = neuralgrok_psi_forward<NG_H>(ag, sW1, sb1, sW2, b2_scalar);
         amplified[i] = alpha * s * g + beta * g;
     }
 }
