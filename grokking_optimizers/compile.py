@@ -244,9 +244,10 @@ _FlagTrace = List[Tuple[str, str, str]]
 # falls back to a *clearly actionable* skip log block that names the
 # exact ``pip install`` command and the CLI flag to suppress the message.
 #
-# Auto-install is on by default (``BuildSpec.auto_install_optional_deps``)
-# because the only users hit by missing-dep skips are the ones who
-# explicitly enabled the feature in the first place. ``--no-auto-install``
+# Auto-install is OPT-IN (off by default; ``BuildSpec.auto_install_optional_deps``
+# defaults False, Phase 8 supply-chain hygiene) — it shells out to ``pip install``
+# only when the operator explicitly enables it (GROK_AUTO_INSTALL / --auto-install /
+# BuildSpec). A missing optional dep otherwise degrades gracefully. ``--no-auto-install``
 # on the CLI flips it off for CI / offline / air-gapped environments.
 #
 # A module-level ``_DEP_CHECKED`` cache deduplicates work: each

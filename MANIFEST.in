@@ -14,7 +14,9 @@ include setup.py
 include build.sh
 
 # Full C++/CUDA/HIP source tree (the extension is compiled from these).
-recursive-include csrc *.cpp *.cu *.cuh *.h *.hpp *.hip *.hip.cpp *.hip.hpp
+# *.inc is required: dispatch.cpp #includes the generated fused dispatch tables
+# (csrc/fused/**/fused_dispatch_table.inc, csrc/fused/fused_wired_cells.inc).
+recursive-include csrc *.cpp *.cu *.cuh *.h *.hpp *.hip *.hip.cpp *.hip.hpp *.inc
 
 # In-package per-arch kernel headers (also shipped via package_data).
 recursive-include grokking_optimizers *.cuh *.hip.hpp

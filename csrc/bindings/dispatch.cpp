@@ -1,13 +1,12 @@
 // =====================================================================
 // dispatch.cpp — single-source arch detection + fused_step dispatch
 //
-// VENDOR-level dispatch. The kernel source is single-per-vendor (one CUDA
-// tree compiled as sg::sm90, one HIP tree compiled as sg::gfx942) and is
-// gencode/offload-compiled by setup.py for the full arch picture (every
-// NVIDIA CC / AMD gfx the toolchain accepts). So detection normalises to a
-// vendor selector: ANY NVIDIA device -> 90 (the sm90 impl), ANY AMD device
-// -> 942 (the gfx942 impl). The right per-SM/-gfx SASS is selected by the
-// driver from the fat binary; the host only needs to pick the vendor impl.
+// Arch-honest LOUD-GATE dispatch (Phase 8). The kernel source has real bodies
+// only for sm_90/sm_90a (one CUDA tree, sg::sm90) and gfx942 (one HIP tree,
+// sg::gfx942). detect_arch_from_device() therefore returns 90 for NVIDIA
+// major==9 and 942 for gfx942, and THROWS for any other CC/gfx (e.g. an A100
+// sm_80, which has no TMA/WGMMA path) rather than silently running Hopper SASS
+// on the wrong architecture. FORCE_ARCH is the explicit operator override.
 // TPU arch is handled in Python via JAX.
 // =====================================================================
 
