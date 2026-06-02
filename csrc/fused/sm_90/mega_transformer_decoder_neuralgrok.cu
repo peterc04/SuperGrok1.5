@@ -33,8 +33,9 @@ cudaError_t mega_transformer_decoder_neuralgrok(
         st.psi_W1 = extra + kPsiW1Off;
         st.psi_b1 = extra + kPsiB1Off;
         st.psi_W2 = extra + kPsiW2Off;
-        // st.psi_b2 stays 0.0f (device scalar at extra[kPsiB2Off]; a host scalar
-        // cannot dereference a device pointer — codegen stop, see report).
+        // st.psi_b2 left at 0.0f host-side: the real psi_b2 scalar lives at
+        // extra[kPsiB2Off] and is read ON-DEVICE in apply_optimizer<NeuralGrok>
+        // (st.psi_W2[kPsiHidden]), where the device pointer is dereferenceable.
     }
     st.lr = lr;
     return launch_fused_megakernel<ModelId::TransformerDecoder, OptId::NeuralGrok,

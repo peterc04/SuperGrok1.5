@@ -138,7 +138,9 @@ lds_attention_fwd_kernel(
     for (int idx = tid; idx < N * N; idx += blockDim.x) {
         int i = idx / N, j = idx % N;
         if constexpr (kCausal) {
-            if (j > i) { scores[idx] = -1e9f; continue; }
+            // Unified mask sentinel (-1e30f), matching the sm_90 path and the
+            // other gfx942 attention kernel (was -1e9f — inconsistent).
+            if (j > i) { scores[idx] = -1e30f; continue; }
         }
         float dot = 0.0f;
         for (int d = 0; d < D; d++)
@@ -149,7 +151,7 @@ lds_attention_fwd_kernel(
     __syncthreads();
     // Row-wise stable softmax
     for (int i = tid; i < N; i += blockDim.x) {
-        float m = -1e9f;
+        float m = -1e30f;   // unified sentinel (matches sm_90 + CUTLASS softmax)
         for (int j = 0; j < N; j++) m = fmaxf(m, scores[i * N + j]);
         row_max[i] = m;
         float s = 0.0f;

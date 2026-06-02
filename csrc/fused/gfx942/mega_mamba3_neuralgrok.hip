@@ -46,7 +46,7 @@ hipError_t mega_mamba3_neuralgrok(
     st.exp_avg = m; st.exp_avg_sq = v;
     // #5: bind psi-net weights from the packed `extra` buffer (W1|b1|W2|b2,
     // layout in opt_components.hip.hpp) — without this the psi pointers are null
-    // and sg_psi_forward null-derefs. psi_b2 stays 0.0f (device-scalar stop).
+    // and sg_psi_forward null-derefs. psi_b2 is read on-device in apply_optimizer<NeuralGrok> (st.psi_W2[kPsiHidden]).
     if (extra) {
         st.psi_W1 = extra + kPsiW1Off;
         st.psi_b1 = extra + kPsiB1Off;
