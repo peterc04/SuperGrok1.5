@@ -1833,6 +1833,82 @@ def _populate_search_space_builders() -> None:
 _populate_search_space_builders()
 
 
+# ===========================================================================
+# Per-cell megakernel register-cap sweep (WORKSTREAM 1, knob #1)
+# ===========================================================================
+#
+# The per-arch search space already carries a ``maxrregcount`` tuning dim (it
+# is emitted as a bare ``--maxrregcount=N`` / ``-amdgpu-max-num-vgprs=N`` flag,
+# see ``_render_*_flags``). A hardcoded register cap is a footgun — forcing a
+# cap below what ptxas wants spills to local memory, which is only a net win
+# when the spilled values are cold. So the cap MUST be tuned per cell, not
+# fixed. Rather than invent a parallel tuning path, we EXTEND the existing
+# ``maxrregcount`` dim: for a megakernel cell we replace that dim's value list
+# with a per-cell sweep seeded from the solver's footprint estimate for that
+# exact (model, optimizer, arch). The autotuner then times each cap and the
+# winner is whatever ptxas+silicon actually prefers for that cell.
+def _megakernel_maxrregcount_values(arch_key: str,
+                                    model: str,
+                                    optimizer: str) -> List[int]:
+    """Per-CELL register-cap sweep for a fused megakernel (model×optimizer).
+
+    Seeds the sweep around the megakernel solver's estimated L3 register
+    footprint for this cell: we sample the uncapped point (let ptxas choose),
+    the arch ceiling, and a spread of caps from the estimate down toward the
+    producer-warp-group floor. The autotuner times each and keeps the fastest;
+    a cap only wins if its spill is cold (§ knob #1).
+    """
+    entry = ARCH_TABLE[arch_key]
+    cap = entry.max_regs_per_thread or 255
+    # Lazy import to avoid a heavy import at module load (mirrors megakernel.py).
+    try:
+        from grokking_optimizers import megakernel as _mk
+        plan = _mk.solve(model, optimizer, arch_key if arch_key in
+                         _mk.MEGAKERNEL_ARCHS else _mk.MEGAKERNEL_ARCHS[0])
+        est = max(32, min(cap, int(plan.regs)))
+    except Exception:
+        est = cap  # solver unavailable → fall back to the full arch range
+    # Candidate caps: estimate, a few steps above/below (to bracket the real
+    # ptxas number), the arch ceiling, and a low cap that trades occupancy for
+    # registers. De-duplicate + sort; always include 0 == "no cap" (ptxas free)
+    # which is encoded as the arch ceiling here so the bare flag stays valid.
+    cands = set()
+    for c in (est - 16, est - 8, est, est + 8, est + 16,
+              (est + cap) // 2, cap):
+        if 24 <= c <= cap:
+            cands.add(c - (c % 4))  # 4-step aligned, matches _maxrregcount_values
+    cands.add(cap)
+    if cap >= 255:
+        cands.add(255)
+    return sorted(v for v in cands if v >= 24) or [cap]
+
+
+def megakernel_cell_search_space(arch_key: str,
+                                 model: str,
+                                 optimizer: str) -> Dict[str, Any]:
+    """Return the arch's full search space with the ``maxrregcount`` dim
+    re-bound to this CELL's per-cell register-cap sweep (knob #1).
+
+    This is the single seam the megakernel autotune path calls: it does NOT
+    create a new search space, it takes the existing per-arch space and swaps
+    only the register-cap dim's value list for the cell-seeded one, so the cap
+    is tuned per (model, optimizer, arch) inside the SAME sweep machinery.
+    """
+    entry = ARCH_TABLE.get(arch_key)
+    if entry is None or entry.search_space_builder is None:
+        raise KeyError(f"no search-space builder for arch '{arch_key}'")
+    space = entry.search_space_builder()
+    cell_caps = _megakernel_maxrregcount_values(arch_key, model, optimizer)
+    for d in space.get("dims", []):
+        if d.get("name") == "maxrregcount":
+            d["values"] = cell_caps
+            break
+    else:
+        # Arch had no maxrregcount dim (e.g. Pallas) — nothing to tune.
+        pass
+    return space
+
+
 def _canonical_arches() -> List[str]:
     """Distinct canonical arch keys (skips aliases that share an entry)."""
     seen_ids: set = set()
@@ -2170,7 +2246,23 @@ def resolve_macros(config: Dict[str, Any], dim_specs: List[Dict[str, Any]],
         name = spec["name"]
         if name not in config:
             continue
-        out.append(f"-D{macro}={_format_value(config[name])}")
+        value = config[name]
+        # §3.3 nvcc-safe tuple emission. A `-DFOO=a,b,c` flag is rejected by
+        # nvcc/clang ("macro names must be identifiers") because the driver's
+        # -D lexer splits the value on commas. So for tuple-valued dims (e.g.
+        # cluster_shape) emit per-component scalar macros FOO_0/_1/_2 — the
+        # C++ side reassembles the triplet for __cluster_dims__. We also emit
+        # FOO_VOLUME (product) for the host-side fits-in-one-cluster check.
+        if isinstance(value, (tuple, list)):
+            comps = list(value)
+            for i, comp in enumerate(comps):
+                out.append(f"-D{macro}_{i}={_format_value(comp)}")
+            vol = 1
+            for comp in comps:
+                vol *= int(comp)
+            out.append(f"-D{macro}_VOLUME={vol}")
+        else:
+            out.append(f"-D{macro}={_format_value(value)}")
     return out
 
 
@@ -8861,9 +8953,30 @@ def _probe_flag_support(compiler: str, flag: str, vendor: str,
             src_path = Path(td) / "probe.cu"
             src_path.write_text("extern \"C\" __global__ void k() {}\n")
             if vendor == "cuda":
-                out_path = Path(td) / "probe.ptx"
-                cmd = [compiler, *flag_tokens, "-ptx",
-                       "-o", str(out_path), str(src_path)]
+                # Default probe mode is ``-ptx`` (fast, no GPU). But a few
+                # legitimate COMPILE flags are incompatible with ``-ptx``
+                # output and must be probed in ``-c`` mode, or the probe
+                # yields a FALSE negative and silently strips a valid flag:
+                #   -dlto / -rdc=true → device-LTO emits LTO-IR, not PTX;
+                #     ``nvcc -ptx -dlto`` fatals "not compatible with -ptx",
+                #     yet ``nvcc -c -dlto -rdc=true`` is accepted and is the
+                #     real usage. (This was the flag_base_superset_regression.)
+                _ptx_incompatible = {"-dlto", "-rdc=true",
+                                     "--relocatable-device-code=true"}
+                if any(t in _ptx_incompatible for t in flag_tokens):
+                    out_path = Path(td) / "probe.o"
+                    # -dlto requires -rdc=true; pair them for the probe so a
+                    # lone -dlto token still probes in a valid configuration.
+                    extra = []
+                    if "-dlto" in flag_tokens and \
+                       "-rdc=true" not in flag_tokens:
+                        extra = ["-rdc=true"]
+                    cmd = [compiler, *flag_tokens, *extra, "-c",
+                           "-o", str(out_path), str(src_path)]
+                else:
+                    out_path = Path(td) / "probe.ptx"
+                    cmd = [compiler, *flag_tokens, "-ptx",
+                           "-o", str(out_path), str(src_path)]
             elif vendor == "hip":
                 out_path = Path(td) / "probe.o"
                 cmd = [compiler, *flag_tokens, "--cuda-host-only", "-c",
@@ -9372,12 +9485,6 @@ def _newer_compiler_flags(arch: str, report=None,
             _gate("-Xptxas --register-usage-level=10",
                   "12.3", fired,
                   f"gated CUDA>=12.3, have {ver_str}")
-            # NOTE: ``--device-link-options=-dlto`` is NOT emitted here. It
-            # is a *link-only* flag — nvcc -c rejects it during the per-TU
-            # compile step with "Unknown option" (exactly the Colab CUDA 12.0
-            # failure mode this audit fixes). It now lives in
-            # ``_device_ldflags(spec)`` for any downstream consumer that
-            # invokes ``nvcc -dlink`` directly.
             # CUDA 12.5+: --maxrregcount-list accepts a comma-separated set
             # of register caps and lets ptxas pick the best per-kernel,
             # finer-grained than the single-value --maxrregcount. The list
@@ -15507,6 +15614,11 @@ def _self_test_kernel_headers(run) -> None:
         return p.read_text(encoding="utf-8")
 
     KERNEL_DIR = REPO_ROOT / "grokking_optimizers" / "kernels"
+    # Phase 7 WS1: the dead grokking_optimizers/kernels/tpu/ duplicate was
+    # deleted; the canonical TPU path is csrc/backends/pallas/ (per-opt launchers
+    # + the shared _pallas_models / _pallas_kernels). TPU assertions below point
+    # at that single source.
+    PALLAS_DIR = REPO_ROOT / "csrc" / "backends" / "pallas"
 
     def test_elementwise_headers():
         # Post-migration contract: grokking_optimizers/kernels/ is now the SINGLE
@@ -15556,36 +15668,42 @@ def _self_test_kernel_headers(run) -> None:
             assert "cudaError_t" in src, f"{fname} missing cudaError_t entry points"
         for model, arch, fname in [
             ("transformer_decoder", "gfx942", "transformer_decoder_gfx942.hip.hpp"),
-            ("transformer_decoder", "tpu", "transformer_decoder_tpu.py"),
             ("mamba3", "gfx942", "mamba3_gfx942.hip.hpp"),
-            ("mamba3", "tpu", "mamba3_tpu.py"),
             ("vit", "gfx942", "vit_gfx942.hip.hpp"),
-            ("vit", "tpu", "vit_tpu.py"),
         ]:
             p = KERNEL_DIR / arch / fname
             assert p.is_file(), f"Missing {p}"
+        # TPU models: the canonical path is the shared pallas _pallas_models.py
+        # (one program file covering decoder/vit/mamba fwd+bwd), NOT the deleted
+        # kernels/tpu/<model>_tpu.py duplicate (Phase 7 WS1).
+        pm = PALLAS_DIR / "_pallas_models.py"
+        assert pm.is_file(), f"Missing {pm}"
+        pm_src = _read_kernel(pm)
+        for tok in ("decoder", "vit", "mamba"):
+            assert tok in pm_src.lower(), f"_pallas_models.py missing {tok}"
 
     def test_optimizer_model_cross():
         sm90_dir = KERNEL_DIR / "sm_90"
         gfx942_dir = KERNEL_DIR / "gfx942"
-        tpu_dir = KERNEL_DIR / "tpu"
         opts = ("adamw", "lion", "grokfast", "grokadamw")
         models_sm90 = ("transformer_decoder_sm90.cuh", "mamba3_sm90.cuh", "vit_sm90.cuh")
         models_gfx = ("transformer_decoder_gfx942.hip.hpp", "mamba3_gfx942.hip.hpp",
                       "vit_gfx942.hip.hpp")
-        models_tpu = ("transformer_decoder_tpu.py", "mamba3_tpu.py", "vit_tpu.py")
         for opt in opts:
             assert (sm90_dir / f"{opt}_sm90.cuh").is_file()
             assert (gfx942_dir / f"{opt}_gfx942.hip.hpp").is_file()
+            # TPU: canonical per-opt launcher in pallas (the kernels/tpu/<opt>_tpu
+            # duplicate was deleted in Phase 7 WS1).
+            assert (PALLAS_DIR / f"launch_{opt}.py").is_file()
         for m in models_sm90:
             assert (sm90_dir / m).is_file()
         for m in models_gfx:
             assert (gfx942_dir / m).is_file()
-        for m in models_tpu:
-            assert (tpu_dir / m).is_file()
+        # TPU models + shared kernels: the canonical pallas single source.
+        assert (PALLAS_DIR / "_pallas_models.py").is_file()
+        assert (PALLAS_DIR / "_pallas_kernels.py").is_file()
         assert (sm90_dir / "common_sm90.cuh").is_file()
         assert (gfx942_dir / "common_gfx942.hip.hpp").is_file()
-        assert (tpu_dir / "common_tpu.py").is_file()
 
     run("elementwise_headers", test_elementwise_headers)
     run("model_headers", test_model_headers)
@@ -17629,6 +17747,56 @@ def _self_test_e2e_smoke(run) -> None:
     run("e2e_smoke_gated", test_e2e_smoke_gated)
 
 
+def _self_test_math_drift_guard(run) -> None:
+    """`[self-test] math_drift_guard` — WS2 ENFORCED optimizer-math single-source.
+
+    Runs scripts/check_math_single_source.py's logic (structural single-source +
+    content-hash manifest drift detection) and PROVES the guard triggers on
+    divergent math (so it is a real enforced check, not a comment).
+    """
+    import importlib.util
+
+    sys.stdout.write("[self-test] math_drift_guard\n")
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _path = os.path.join(_root, "scripts", "check_math_single_source.py")
+
+    def _load():
+        spec = importlib.util.spec_from_file_location("sg_math_guard", _path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def guard_passes_on_real_tree():
+        mod = _load()
+        fails = mod.check()
+        assert not fails, "drift guard reports failures on the real tree: " + \
+            "; ".join(fails)
+
+    def guard_triggers_on_divergence():
+        # Perturb the canonical-math hash for one optimizer in-memory and confirm
+        # the guard FLAGS it (proves the enforcement is live, no files touched).
+        mod = _load()
+        real = mod.normalized_math_hash
+        mod.normalized_math_hash = (
+            lambda opt: "deadbeef" if opt == "adamw" else real(opt))
+        try:
+            fails = mod.check()
+        finally:
+            mod.normalized_math_hash = real
+        assert any("DRIFT" in f and "adamw" in f for f in fails), (
+            "drift guard did NOT trigger on perturbed canonical math — "
+            "the check is not enforcing")
+
+    def structural_single_source_holds():
+        mod = _load()
+        fails = mod.check(structural_only=True)
+        assert not fails, "structural single-source broken: " + "; ".join(fails)
+
+    run("math_drift_guard_passes_clean", guard_passes_on_real_tree)
+    run("math_drift_guard_triggers_on_divergence", guard_triggers_on_divergence)
+    run("math_structural_single_source", structural_single_source_holds)
+
+
 def _self_test() -> int:
     """Run inline self-checks. Returns 0 on success, 1 on failure.
 
@@ -17672,6 +17840,7 @@ def _self_test() -> int:
     _self_test_polyhedral(_run)
     _self_test_synth_codegen(_run)
     _self_test_flag_probe(_run)
+    _self_test_math_drift_guard(_run)
     _self_test_e2e_smoke(_run)
 
     sys.stdout.write(f"\n[self-test] {passed} passed, {failures} failed\n")

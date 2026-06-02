@@ -61,526 +61,30 @@
 // invstds, softmax_lse) live in the same buffer reinterpreted as float.
 
 #pragma once
-// ── inlined from former csrc/common/platform.h ──
-/*
- * SuperGrok v2 — Platform Abstraction Layer
- *
- * Provides a unified API across NVIDIA CUDA and AMD HIP (ROCm).
- * Include this header instead of raw <cuda.h> / <hip/hip_runtime.h>.
- *
- * Key differences handled:
- *   - Warp size: CUDA = 32, HIP/RDNA = 32, HIP/CDNA = 64
- *   - __sincosf: CUDA intrinsic, HIP uses sincosf (no double-underscore)
- *   - __ldg: CUDA L1 cache hint, no-op on HIP (compiler handles caching)
- *   - Thrust → rocThrust, CUB → hipCUB (header-compatible wrappers)
- *   - cuBLAS → rocBLAS (ATen abstracts this via at::cuda::getCurrentCUDABlasHandle)
- */
+#include "csrc/common/platform.h"
+#include "csrc/common/types.h"
+#include "csrc/common/utils.cuh"
+#include "csrc/backends/cuda/sm_90/models/attention.cuh"
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cstdint>
+#include <type_traits>
 
-// ═══════════════════════════════════════════════════════════════════════
-//  Backend detection
-// ═══════════════════════════════════════════════════════════════════════
+#ifdef WITH_CUTLASS
+// Sm90 (Hopper) warp-group collective GEMM helpers (TMA + WGMMA, FP32
+// accumulate). Reuses the canonical, layout-parameterised builder from
+// mma.cuh so the ViT's heavy matmuls (patch embedding, QKV/out projections,
+// MLP up/down, classification head) emit real Hopper WGMMA/TMA instructions
+// instead of the scalar gemm_bias_kernel fallback. All CUTLASS #includes
+// stay at GLOBAL scope (mma.cuh requirement).
+#include "csrc/backends/cuda/sm_90/mma.cuh"
+#endif  // WITH_CUTLASS
 
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-#define GROK_HIP 1
-#define GROK_CUDA 0
-#else
-#define GROK_HIP 0
-#define GROK_CUDA 1
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Runtime includes
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-#include <hip/hip_runtime.h>
-// rocThrust and hipCUB provide thrust/cub API compatibility
-#include <thrust/device_ptr.h>
-#include <thrust/sort.h>
-#include <hipcub/hipcub.hpp>
-#else
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <thrust/device_ptr.h>
-#include <thrust/sort.h>
-#include <cub/cub.cuh>
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Stream type alias
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-using GpuStream_t = hipStream_t;
-#else
-using GpuStream_t = cudaStream_t;
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Warp / wavefront size
-//
-//  CDNA (MI200, MI300): wavefront = 64
-//  RDNA (RX 7900):      wavefront = 32
-//  NVIDIA:               warp     = 32
-//
-//  We default to the compile-time warp size. On HIP, __AMDGCN_WAVEFRONT_SIZE__
-//  is set by the compiler for the target architecture.
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #ifdef __AMDGCN_WAVEFRONT_SIZE__
-    #define WARP_SIZE __AMDGCN_WAVEFRONT_SIZE__
-  #else
-    #define WARP_SIZE 64  // conservative default for CDNA
-  #endif
-#else
-  #define WARP_SIZE 32
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Warp shuffle
-//
-//  CUDA: __shfl_down_sync(mask, val, offset)
-//  HIP:  __shfl_down(val, offset)  — no mask parameter on CDNA
-//        (On wavefront-64, all lanes are always synchronized)
-//
-//  We wrap both into SHFL_DOWN(val, offset) and SHFL_DOWN_SYNC(mask, val, offset).
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define SHFL_DOWN(val, offset) __shfl_down((val), (offset))
-  #define SHFL_DOWN_SYNC(mask, val, offset) __shfl_down((val), (offset))
-#else
-  #define SHFL_DOWN(val, offset) __shfl_down_sync(0xFFFFFFFF, (val), (offset))
-  #define SHFL_DOWN_SYNC(mask, val, offset) __shfl_down_sync((mask), (val), (offset))
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Fast sincos
-//
-//  CUDA: __sincosf (device intrinsic, single instruction on SM)
-//  HIP:  sincosf   (no double-underscore variant)
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define FAST_SINCOSF(x, sptr, cptr) sincosf((x), (sptr), (cptr))
-#else
-  #define FAST_SINCOSF(x, sptr, cptr) __sincosf((x), (sptr), (cptr))
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Read-only cache load hint
-//
-//  CUDA: __ldg(ptr) — hints L1 cache for read-only data
-//  HIP:  direct dereference (compiler manages caching on GCN/CDNA)
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define LDG(ptr) (*(ptr))
-#else
-  #define LDG(ptr) __ldg(ptr)
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Error checking
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define GPU_SUCCESS hipSuccess
-  #define gpuGetLastError hipGetLastError
-  #define gpuGetErrorString hipGetErrorString
-  #define gpuDeviceSynchronize hipDeviceSynchronize
-  #define gpuGetDeviceProperties hipGetDeviceProperties
-  #define gpuDeviceProp_t hipDeviceProp_t
-#else
-  #define GPU_SUCCESS cudaSuccess
-  #define gpuGetLastError cudaGetLastError
-  #define gpuGetErrorString cudaGetErrorString
-  #define gpuDeviceSynchronize cudaDeviceSynchronize
-  #define gpuGetDeviceProperties cudaGetDeviceProperties
-  #define gpuDeviceProp_t cudaDeviceProp
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  CUB / hipCUB namespace alias
-//
-//  hipCUB wraps rocPRIM with a CUB-compatible API.
-//  We alias so kernel code can use `cub::DeviceSegmentedRadixSort` uniformly.
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  namespace cub = hipcub;
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Full-mask constant for warp-wide operations
-//
-//  CUDA uses explicit masks (0xFFFFFFFF for 32 lanes).
-//  HIP/CDNA doesn't use masks — all 64 lanes in a wavefront are lockstep.
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define FULL_WARP_MASK 0  // unused, but defined for code that passes it around
-#else
-  #define FULL_WARP_MASK 0xFFFFFFFF
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Async memset
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define gpuMemsetAsync hipMemsetAsync
-#else
-  #define gpuMemsetAsync cudaMemsetAsync
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Stream management
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define gpuStreamCreate hipStreamCreate
-  #define gpuStreamSynchronize hipStreamSynchronize
-  #define gpuStreamDestroy hipStreamDestroy
-#else
-  #define gpuStreamCreate cudaStreamCreate
-  #define gpuStreamSynchronize cudaStreamSynchronize
-  #define gpuStreamDestroy cudaStreamDestroy
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  GCN/CDNA scheduler hints (AMD-only occupancy control)
-//
-//  __attribute__((amdgpu_waves_per_eu(min, max))) controls occupancy
-//  on AMD GCN/CDNA by limiting waves per execution unit. On NVIDIA,
-//  __launch_bounds__ serves this purpose (already applied separately).
-//
-//  GROK_WAVES_PER_EU(min, max) — applies attribute on HIP, no-op on CUDA.
-//  GROK_FLAT_WORK_GROUP_SIZE(min, max) — hints block size range for AMD.
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define GROK_WAVES_PER_EU(min_waves, max_waves) \
-      __attribute__((amdgpu_waves_per_eu(min_waves, max_waves)))
-  #define GROK_FLAT_WORK_GROUP_SIZE(min_size, max_size) \
-      __attribute__((amdgpu_flat_work_group_size(min_size, max_size)))
-#else
-  #define GROK_WAVES_PER_EU(min_waves, max_waves)
-  #define GROK_FLAT_WORK_GROUP_SIZE(min_size, max_size)
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Kernel launch attribute (for configuring smem size)
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_HIP
-  #define gpuFuncSetAttribute hipFuncSetAttribute
-  #define gpuFuncAttributeMaxDynamicSharedMemorySize \
-          hipFuncAttributeMaxDynamicSharedMemorySize
-#else
-  #define gpuFuncSetAttribute cudaFuncSetAttribute
-  #define gpuFuncAttributeMaxDynamicSharedMemorySize \
-          cudaFuncAttributeMaxDynamicSharedMemorySize
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Non-temporal (streaming) memory access
-//
-//  Used for optimizer state access to avoid L2 cache pollution.
-//  Model weights stay warm in L2 for the next forward pass.
-// ═══════════════════════════════════════════════════════════════════════
-
+// ── inlined from former csrc/common/utils.cuh (Phase3 S0) ──
 #if GROK_CUDA
-  // Streaming load: reads bypass L2 (or use L2 read-only path)
-  __device__ __forceinline__ float stream_load(const float* ptr) {
-      float val;
-      asm volatile("ld.global.nc.f32 %0, [%1];" : "=f"(val) : "l"(ptr));
-      return val;
-  }
-
-  // Streaming store: writes bypass L2 allocation
-  // Available on sm_80+ (Ampere). On older, falls back to normal store.
-  __device__ __forceinline__ void stream_store(float* ptr, float val) {
-  #if __CUDA_ARCH__ >= 800
-      asm volatile("st.global.wt.f32 [%0], %1;" :: "l"(ptr), "f"(val));
-  #else
-      *ptr = val;
-  #endif
-  }
-
-  // float4 streaming variants
-  __device__ __forceinline__ float4 stream_load4(const float4* ptr) {
-      float4 val;
-      asm volatile(
-          "ld.global.nc.v4.f32 {%0,%1,%2,%3}, [%4];"
-          : "=f"(val.x), "=f"(val.y), "=f"(val.z), "=f"(val.w)
-          : "l"(ptr));
-      return val;
-  }
-
-  __device__ __forceinline__ void stream_store4(float4* ptr, float4 val) {
-  #if __CUDA_ARCH__ >= 800
-      asm volatile(
-          "st.global.wt.v4.f32 [%0], {%1,%2,%3,%4};"
-          :: "l"(ptr), "f"(val.x), "f"(val.y), "f"(val.z), "f"(val.w));
-  #else
-      *ptr = val;
-  #endif
-  }
-
-#elif GROK_HIP
-  // HIP: use __builtin_nontemporal_load/store
-  __device__ __forceinline__ float stream_load(const float* ptr) {
-      return __builtin_nontemporal_load(ptr);
-  }
-  __device__ __forceinline__ void stream_store(float* ptr, float val) {
-      __builtin_nontemporal_store(val, ptr);
-  }
-  // float4 variants: decompose into 4 scalar non-temporal ops
-  __device__ __forceinline__ float4 stream_load4(const float4* ptr) {
-      const float* fp = reinterpret_cast<const float*>(ptr);
-      return make_float4(
-          __builtin_nontemporal_load(fp),
-          __builtin_nontemporal_load(fp+1),
-          __builtin_nontemporal_load(fp+2),
-          __builtin_nontemporal_load(fp+3));
-  }
-  __device__ __forceinline__ void stream_store4(float4* ptr, float4 val) {
-      float* fp = reinterpret_cast<float*>(ptr);
-      __builtin_nontemporal_store(val.x, fp);
-      __builtin_nontemporal_store(val.y, fp+1);
-      __builtin_nontemporal_store(val.z, fp+2);
-      __builtin_nontemporal_store(val.w, fp+3);
-  }
-#else
-  // CPU: no non-temporal hint needed (OS manages caching)
-  static inline float stream_load(const float* ptr) { return *ptr; }
-  static inline void stream_store(float* ptr, float val) { *ptr = val; }
-#endif
-// ── end inlined csrc/common/platform.h ──
-// ── inlined from former csrc/common/types.h ──
-/*
- * SuperGrok v2 — Shared Types and Constants
- *
- * Common struct definitions and compile-time constants used by both
- * forward and backward CUDA kernels.
- */
-
-
-
-#include <vector>
-#include <torch/extension.h>
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Compile-time constants
-// ═══════════════════════════════════════════════════════════════════════
-
-constexpr int MAX_D_STATE = 128;
-constexpr int MAX_D_INNER = 128;
-constexpr int MAX_D_MODEL = 64;
-constexpr int MAX_GRU_HIDDEN = 8;
-constexpr int MAX_EXPERT_HIDDEN = 16;
-constexpr int MAX_TOPK = 4;
-constexpr int MAX_CKPT_INTERVAL = 32;   // max checkpoint interval for bilevel gradient checkpointing
-
-constexpr int SG2M_BLOCK = 256;         // forward kernel block size
-constexpr int SG2B_BLOCK = 256;         // backward kernel block size
-constexpr int PSCAN_BLOCK = 512;        // threads per parallel scan block (must be power of 2)
-constexpr int PSCAN_THRESHOLD = 256;    // fall back to sequential scan if N < this
-constexpr int GEMM_PRECOMPUTE_THRESHOLD = 1024;  // use GEMM when N >= this
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Parallel Prefix Scan Infrastructure
-//
-//  Affine2x2 and affine_combine moved to csrc/scan/affine2x2.h.
-//  Included here so existing callers that #include "csrc/common/types.h"
-//  continue to compile without modification.
-// ═══════════════════════════════════════════════════════════════════════
-
-// ── inlined from former csrc/scan/affine2x2.h ──
-// Affine2x2 — shared scan primitive.
-//
-// Extracted from csrc/common/types.h. The associative operator used by the
-// Mamba parallel prefix scan and by SuperGrok v2's selective scan.
-//
-// Encoding: each scan element is a 2x2 affine transform
-//   (h_new) = (m00 m01) (h) + (b0)
-//   (h_new')  (m10 m11) (h')  (b1)
-//
-// composition: (B ∘ A)(h) = B(A(h))
-//   M_out = M_B * M_A
-//   b_out = M_B * b_A + b_B
-//
-// Used by:
-//   csrc/scan/mamba_scan_adapter.cuh  — Mamba model selective scan
-//   csrc/algorithms/supergrok2.h      — SG2 optimizer scan recurrence
-//   csrc/backends/cuda/sm_90/launch_supergrok2.cu — Blelloch parallel scan
-
-#ifdef __CUDACC__
-
-struct Affine2x2 {
-    float m00, m01, m10, m11;  // 2x2 matrix
-    float b0, b1;               // 2-vector bias
-};
-
-__device__ __forceinline__ Affine2x2 affine_identity() {
-    return {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
-}
-
-__device__ __forceinline__ Affine2x2 affine_combine(Affine2x2 left, Affine2x2 right) {
-    // Computes right ∘ left: apply left first, then right.
-    // M_out = M_right * M_left
-    // b_out = M_right * b_left + b_right
-    Affine2x2 out;
-#if defined(GROK_CUDA) && GROK_CUDA
-    // Inline PTX: 12-FMA composition arranged for ILP across pipelines.
-    asm volatile(
-        "fma.rn.f32 %0, %6, %12, 0f00000000;\n\t"
-        "fma.rn.f32 %1, %6, %13, 0f00000000;\n\t"
-        "fma.rn.f32 %2, %8, %12, 0f00000000;\n\t"
-        "fma.rn.f32 %3, %8, %13, 0f00000000;\n\t"
-        "fma.rn.f32 %0, %7, %14, %0;\n\t"
-        "fma.rn.f32 %1, %7, %15, %1;\n\t"
-        "fma.rn.f32 %2, %9, %14, %2;\n\t"
-        "fma.rn.f32 %3, %9, %15, %3;\n\t"
-        "fma.rn.f32 %4, %6, %16, %10;\n\t"
-        "fma.rn.f32 %5, %8, %16, %11;\n\t"
-        "fma.rn.f32 %4, %7, %17, %4;\n\t"
-        "fma.rn.f32 %5, %9, %17, %5;\n\t"
-        : "=f"(out.m00), "=f"(out.m01), "=f"(out.m10), "=f"(out.m11),
-          "=f"(out.b0), "=f"(out.b1)
-        : "f"(right.m00), "f"(right.m01), "f"(right.m10), "f"(right.m11),
-          "f"(right.b0), "f"(right.b1),
-          "f"(left.m00), "f"(left.m01), "f"(left.m10), "f"(left.m11),
-          "f"(left.b0), "f"(left.b1)
-    );
-#else
-    // HIP/CPU fallback: C++ implementation (HIP has different inline asm syntax)
-    out.m00 = right.m00 * left.m00 + right.m01 * left.m10;
-    out.m01 = right.m00 * left.m01 + right.m01 * left.m11;
-    out.m10 = right.m10 * left.m00 + right.m11 * left.m10;
-    out.m11 = right.m10 * left.m01 + right.m11 * left.m11;
-    out.b0  = right.m00 * left.b0  + right.m01 * left.b1 + right.b0;
-    out.b1  = right.m10 * left.b0  + right.m11 * left.b1 + right.b1;
-#endif
-    return out;
-}
-
-#endif // __CUDACC__
-// ── end inlined csrc/scan/affine2x2.h ──
-
-#ifdef __CUDACC__
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Branchless Stochastic Rounding (Config4 / INT8 quantized kernels)
-//
-//  Converts float to int8 with stochastic rounding. The ternary compiles
-//  to a PTX selp instruction at -O2, avoiding warp divergence.
-// ═══════════════════════════════════════════════════════════════════════
-
-__device__ __forceinline__ int8_t float_to_int8_stochastic_branchless(
-    float val, float scale, unsigned rand_bits
-) {
-    float scaled = val / fmaxf(scale, 1e-12f);
-    float trunc_val = truncf(scaled);
-    float frac = fabsf(scaled - trunc_val);
-    float threshold = (float)(rand_bits & 0xFFFF) * (1.0f / 65536.0f);
-    // Branchless: ternary compiles to selp on nvcc -O2
-    float round_up = (frac > threshold) ? copysignf(1.0f, scaled) : 0.0f;
-    float result = trunc_val + round_up;
-    return (int8_t)fmaxf(-127.0f, fminf(127.0f, result));
-}
-
-#endif  // __CUDACC__
-// ── end inlined csrc/common/types.h ──
-// ── inlined from former csrc/common/utils.cuh ──
-/*
- * SuperGrok v2 — Shared Device Helpers
- *
- * Device utility functions used by multiple kernel files.
- * Uses platform.h macros for CUDA/HIP portability.
- */
-
-
-#if GROK_CUDA
-#include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Warp-level reduction helper
-//
-//  Sum a float across d_inner threads (all in one warp, d_inner ≤ WARP_SIZE).
-//  Uses platform-abstracted shuffle; works for any d_inner ≤ WARP_SIZE
-//  (including non-power-of-2).
-// ═══════════════════════════════════════════════════════════════════════
-
-__device__ __forceinline__ float warp_reduce_sum(float val, int d_inner, int tid) {
-    unsigned mask = (d_inner < WARP_SIZE) ? ((1u << d_inner) - 1) : FULL_WARP_MASK;
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        float other = SHFL_DOWN_SYNC(mask, val, offset);
-        if (tid + offset < d_inner)
-            val += other;
-    }
-    return val;  // only lane 0 has the correct sum
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Stochastic Rounding for Quantized Optimizer States (Config 3)
-//
-//  Hash-based PRNG: deterministic per (step, element) pair, no state needed.
-//  Faster than cuRAND, no separate state tensor required.
-// ═══════════════════════════════════════════════════════════════════════
-
-// Hash-based PRNG (Philox-like): deterministic, no state
-__device__ __forceinline__ unsigned hash_prng(unsigned step, unsigned idx) {
-    unsigned h = (step * 2654435761u) ^ (idx * 2246822519u);
-    h ^= h >> 16;
-    h *= 0x45d9f3bu;
-    h ^= h >> 16;
-    return h;
-}
-
-#if GROK_CUDA || GROK_HIP
-
-// BF16 stochastic rounding: unbiased quantization
-__device__ __forceinline__ __nv_bfloat16 float_to_bf16_stochastic(float val, unsigned rand_bits) {
-    unsigned bits = __float_as_uint(val);
-    unsigned truncated = bits & 0xFFFF;     // bits that BF16 drops
-    unsigned threshold = rand_bits & 0xFFFF; // random 16-bit threshold
-    if (truncated > threshold) {
-        bits += 0x10000;  // round up
-    }
-    bits &= 0xFFFF0000;  // truncate to BF16
-    return __float2bfloat16(__uint_as_float(bits));
-}
-
-// INT8 per-block quantization with stochastic rounding
-// block_size elements share one FP32 scale factor
-__device__ __forceinline__ int8_t float_to_int8_stochastic(
-    float val, float scale, unsigned rand_bits
-) {
-    float scaled = val / scale;
-    float truncated = truncf(scaled);
-    float frac = fabsf(scaled - truncated);
-    float threshold = (float)(rand_bits & 0xFFFF) / 65536.0f;
-    if (frac > threshold) {
-        truncated += (scaled > 0) ? 1.0f : -1.0f;
-    }
-    return (int8_t)fmaxf(-127.0f, fminf(127.0f, truncated));
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-//  Phase 3: Inline PTX for Hot Inner Loops
-//
-//  Hand-tuned PTX for critical paths in the SG2 fused_elem pipeline.
-//  These replace compiler-generated code in the highest-frequency loops.
-// ═══════════════════════════════════════════════════════════════════════
-
-#if GROK_CUDA
-
+#ifndef SG_INLINE_PTX_FAST_RSQRT_NR
+#define SG_INLINE_PTX_FAST_RSQRT_NR
 // Fast reciprocal sqrt via PTX rsqrt.approx.f32 + Newton-Raphson refinement.
 // 2-3x faster than sqrtf(x) + fdividef for Adam denominator.
 __device__ __forceinline__ float fast_rsqrt_nr(float x) {
@@ -590,148 +94,45 @@ __device__ __forceinline__ float fast_rsqrt_nr(float x) {
     r = r * (1.5f - 0.5f * x * r * r);
     return r;
 }
+#endif  // SG_INLINE_PTX_FAST_RSQRT_NR
+#endif  // GROK_CUDA
 
-// Fused multiply-add via PTX fma.rn.f32 — ensures single FMA instruction.
-// Critical for affine_combine inner loop (8 FMAs per composition).
-__device__ __forceinline__ float ptx_fma(float a, float b, float c) {
-    float r;
-    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c));
-    return r;
-}
-
-// Fast exp2 approximation via PTX ex2.approx.f32.
-// Used in Mamba scan: exp(A * dt) = exp2(A * dt / ln2).
-__device__ __forceinline__ float ptx_exp2(float x) {
-    float r;
-    asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
-    return r;
-}
-
-// Fast log2 via PTX lg2.approx.f32.
-__device__ __forceinline__ float ptx_log2(float x) {
-    float r;
-    asm("lg2.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
-    return r;
-}
-
-// Fast exp via exp2: exp(x) = exp2(x * log2(e))
-__device__ __forceinline__ float ptx_expf(float x) {
-    return ptx_exp2(x * 1.4426950408889634f);  // log2(e)
-}
-
-// Fast tanh approximation via exp2: tanh(x) = (e^2x - 1) / (e^2x + 1)
-// Used in GRU h_tilde computation.
-__device__ __forceinline__ float ptx_tanhf(float x) {
-    float e2x = ptx_exp2(2.0f * x * 1.4426950408889634f);
-    return (e2x - 1.0f) / (e2x + 1.0f);
-}
-
-// Fast sigmoid via exp2: sigmoid(x) = 1 / (1 + exp(-x))
-// Used in GRU z_gate and r_gate.
-__device__ __forceinline__ float ptx_sigmoidf(float x) {
-    float en = ptx_exp2(-x * 1.4426950408889634f);
-    return 1.0f / (1.0f + en);
-}
-
-// Blelloch affine_combine using pure PTX FMA instructions.
-// Composes two Affine2x2 transforms: result = left ∘ right
-// M_out = M_left * M_right, b_out = M_left * b_right + b_left
-// This is the inner loop of the parallel prefix scan (called O(log N) times).
-__device__ __forceinline__ Affine2x2 ptx_affine_combine(
-    const Affine2x2& left, const Affine2x2& right
-) {
-    Affine2x2 out;
-    // M_out = M_left * M_right (2x2 matrix multiply via 8 FMAs)
-    out.m00 = ptx_fma(left.m00, right.m00, left.m01 * right.m10);
-    out.m01 = ptx_fma(left.m00, right.m01, left.m01 * right.m11);
-    out.m10 = ptx_fma(left.m10, right.m00, left.m11 * right.m10);
-    out.m11 = ptx_fma(left.m10, right.m01, left.m11 * right.m11);
-    // b_out = M_left * b_right + b_left
-    out.b0 = ptx_fma(left.m00, right.b0, ptx_fma(left.m01, right.b1, left.b0));
-    out.b1 = ptx_fma(left.m10, right.b0, ptx_fma(left.m11, right.b1, left.b1));
-    return out;
-}
-
-// Expert MLP forward pass — single expert, ReLU activation.
-// Inlined PTX FMA for the inner products.
-// expert_hidden is typically 8-16, so fully unrollable at compile time.
-template <int EXPERT_HIDDEN>
-__device__ __forceinline__ float ptx_expert_mlp_forward(
-    const float* __restrict__ W1,   // [expert_hidden]
-    const float* __restrict__ b1,   // [expert_hidden]
-    const float* __restrict__ W2,   // [expert_hidden]
-    float b2,
-    float input
-) {
-    float result = b2;
-    #pragma unroll
-    for (int h = 0; h < EXPERT_HIDDEN; h++) {
-        float hidden = ptx_fma(W1[h], input, b1[h]);
-        hidden = fmaxf(hidden, 0.0f);  // ReLU
-        result = ptx_fma(W2[h], hidden, result);
-    }
-    return result;
-}
-
-// Stochastic rounding with PTX prmt (permute bytes) for fast bit extraction.
-// Replaces the hash_prng shift+multiply chain with a single PTX instruction
-// for extracting the random threshold from the hash output.
-__device__ __forceinline__ int8_t ptx_int8_stochastic_round(
-    float val, float scale, unsigned rand_bits
-) {
-    float scaled = val / fmaxf(scale, 1e-12f);
-    float tr = truncf(scaled);
-    float frac = fabsf(scaled - tr);
-    // Extract lower 16 bits as threshold using prmt
-    unsigned lo16;
-    asm("prmt.b32 %0, %1, 0, 0x4140;" : "=r"(lo16) : "r"(rand_bits));
-    float threshold = (float)lo16 / 65536.0f;
-    if (frac > threshold) tr += (scaled > 0) ? 1.0f : -1.0f;
-    return (int8_t)fmaxf(-127.0f, fminf(127.0f, tr));
-}
-
-// §25.7 DSMEM cluster reduce (sm_90+ Hopper distributed shared memory).
-// Block-local warp reduce first, then cluster-wide reduce via cooperative
-// groups. Falls back to warp reduce on pre-Hopper.
-__device__ __forceinline__ float cluster_dsmem_reduce_sum(float val) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    namespace cg = cooperative_groups;
-    val = warp_reduce_sum(val, WARP_SIZE, threadIdx.x & (WARP_SIZE - 1));
-    auto cluster = cg::this_cluster();
-    val = cg::reduce(cluster, val, cg::plus<float>());
-    return val;
-#else
-    return warp_reduce_sum(val, WARP_SIZE, threadIdx.x & (WARP_SIZE - 1));
-#endif
-}
-
-#endif // GROK_CUDA
-
-// HIP fallbacks — use standard math functions
 #if GROK_HIP
+#ifndef SG_INLINE_PTX_FAST_RSQRT_NR
+#define SG_INLINE_PTX_FAST_RSQRT_NR
 __device__ __forceinline__ float fast_rsqrt_nr(float x) { return rsqrtf(x); }
-__device__ __forceinline__ float ptx_fma(float a, float b, float c) { return fmaf(a, b, c); }
-__device__ __forceinline__ float ptx_expf(float x) { return expf(x); }
-__device__ __forceinline__ float ptx_tanhf(float x) { return tanhf(x); }
-__device__ __forceinline__ float ptx_sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
-
-__device__ __forceinline__ Affine2x2 ptx_affine_combine(
-    const Affine2x2& left, const Affine2x2& right
-) {
-    return affine_combine(left, right);  // Use types.h version
-}
-#endif // GROK_HIP
-
-#endif // GROK_CUDA || GROK_HIP
-// ── end inlined csrc/common/utils.cuh ──
-#include "csrc/backends/cuda/sm_90/models/attention.cuh"
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cstdint>
-#include <type_traits>
+#endif  // SG_INLINE_PTX_FAST_RSQRT_NR
+#endif  // GROK_HIP
 
 namespace sg { namespace sm90 { namespace models { namespace vit {
+
+#ifdef WITH_CUTLASS
+// ── Tensor-core element mapping ──────────────────────────────────────
+// half/bf16 map to their CUTLASS element types. FP32 (T=float) maps to
+// cutlass::tfloat32_t — the LIVE FP32 tensor-core path: the WGMMA mainloop
+// reads the float buffers as TF32 (10-bit mantissa), accumulating in FP32.
+template <typename T> struct cutlass_gemm_elem;            // primary: unsupported
+template <> struct cutlass_gemm_elem<__half>        { using type = cutlass::half_t; };
+template <> struct cutlass_gemm_elem<__nv_bfloat16> { using type = cutlass::bfloat16_t; };
+template <> struct cutlass_gemm_elem<float>         { using type = cutlass::tfloat32_t; };
+template <typename T> struct cutlass_gemm_supported       { static constexpr bool value = false; };
+template <> struct cutlass_gemm_supported<__half>        { static constexpr bool value = true; };
+template <> struct cutlass_gemm_supported<__nv_bfloat16> { static constexpr bool value = true; };
+
+// ── FP32 tensor-core (TF32) gate ─────────────────────────────────────
+// FP32 uses the TF32 tensor-core path by DEFAULT (the accepted FP32 MMA mode).
+// Define SG_FORCE_SCALAR_FP32 to force the exact-FP32 scalar gemm_bias_kernel.
+// 🟡 numeric parity: TF32 (10-bit mantissa) is NOT bit-identical to scalar
+// FP32 (23-bit) — an accuracy/precision tradeoff, not a bug.
+template <typename T> struct cutlass_gemm_tf32          { static constexpr bool value = false; };
+#ifndef SG_FORCE_SCALAR_FP32
+template <> struct cutlass_gemm_tf32<float>             { static constexpr bool value = true; };
+#endif
+template <typename T> struct cutlass_gemm_any_tc {
+    static constexpr bool value =
+        cutlass_gemm_supported<T>::value || cutlass_gemm_tf32<T>::value;
+};
+#endif  // WITH_CUTLASS
 
 // ─── dtype helpers ─────────────────────────────────────────────────────
 template <typename T>
@@ -984,6 +385,86 @@ inline cudaError_t launch_gemm_bias(
     gemm_bias_kernel<ActT, WeightT><<<M, block, 0, stream>>>(in, W, b, out, M, N, K);
     return cudaGetLastError();
 }
+
+#ifdef WITH_CUTLASS
+// Cast an FP32 collective-GEMM output buffer back into the activation dtype,
+// optionally adding a per-column bias b[N] in the same pass.
+template <typename ActT, typename WeightT>
+__global__ void __launch_bounds__(256, 4)
+gemm_cast_bias_kernel(const float* __restrict__ src, const WeightT* __restrict__ b,
+                      ActT* __restrict__ dst, int M, int N) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)M * N) return;
+    float v = src[i];
+    if (b != nullptr) v += to_f32(b[(int)(i % (size_t)N)]);
+    dst[i] = from_f32<ActT>(v);
+}
+
+// Per-call FP32 scratch for the collective GEMM (lazily grown, reused).
+inline float* vit_gemm_fp32_scratch(size_t elems) {
+    static thread_local float* ptr   = nullptr;
+    static thread_local size_t cap_n = 0;
+    if (elems > cap_n) {
+        if (ptr) cudaFree(ptr);
+        if (cudaMalloc(&ptr, elems * sizeof(float)) != cudaSuccess) {
+            ptr = nullptr; cap_n = 0; return nullptr;
+        }
+        cap_n = elems;
+    }
+    return ptr;
+}
+
+// ─── Linear-layer GEMM via the Sm90 collective (TMA + WGMMA) ──────────
+// Computes  out[M,N] = in[M,K] @ W^T + b   (W is a Linear weight [N,K]
+// row-major, read as Wᵀ via LayoutBT=ColumnMajor — exactly the convention
+// of the scalar gemm_bias_kernel it replaces). FP32 accumulate, then a
+// cast(+bias) pass back into the activation dtype. Reuses the canonical
+// mma::sm90_run_gemm_bt builder from mma.cuh (modeled byte-for-byte on
+// fmha_sm90_gemm) — no local CollectiveBuilder. T = half/bf16 (real CUTLASS
+// element) OR float: for float, cutlass_gemm_elem<float>=tfloat32_t selects the
+// LIVE TF32 tensor-core mainloop (the float in/W buffers are read as tfloat32_t
+// — 10-bit mantissa, FP32 accumulate). 🟡 TF32 is NOT bit-identical to scalar
+// FP32 (23-bit) — accepted FP32 tensor-core precision tradeoff, not a bug.
+// Returns cudaErrorNotSupported if CUTLASS cannot implement the shape; the
+// caller falls back to the scalar gemm_bias_kernel.
+template <typename T>
+inline cudaError_t vit_linear_gemm_bias(
+    const T* in, const T* W, const T* b, T* out,
+    int M, int N, int K, cudaStream_t stream)
+{
+    using Elem = typename cutlass_gemm_elem<T>::type;
+    float* c_fp32 = vit_gemm_fp32_scratch((size_t)M * N);
+    if (c_fp32 == nullptr) return cudaErrorMemoryAllocation;
+    cudaError_t err = mma::sm90_run_gemm_bt<Elem, cutlass::layout::ColumnMajor>(
+        M, N, K, in, W, c_fp32, stream);
+    if (err != cudaSuccess) return err;
+    size_t n = (size_t)M * N;
+    int block = 256, grid = (int)((n + block - 1) / block);
+    gemm_cast_bias_kernel<T, T><<<grid, block, 0, stream>>>(c_fp32, b, out, M, N);
+    return cudaGetLastError();
+}
+
+// Dispatch wrapper: tensor-core Sm90 path for half/bf16 AND fp32 (TF32 MMA),
+// scalar gemm_bias_kernel as the genuine last-resort fallback (a shape CUTLASS
+// truly cannot tile → cudaErrorNotSupported). For ActT=float the collective is
+// the LIVE TF32 path; the in/W float buffers are read as tfloat32_t for the
+// WGMMA (10-bit mantissa, FP32 accumulate). 🟡 TF32 is NOT bit-identical to the
+// scalar FP32 triple-loop — the accepted FP32 tensor-core precision tradeoff;
+// define SG_FORCE_SCALAR_FP32 to force exact scalar FP32.
+template <typename ActT, typename WeightT>
+inline cudaError_t launch_linear_bias(
+    const ActT* in, const WeightT* W, const WeightT* b, ActT* out,
+    int M, int N, int K, cudaStream_t stream)
+{
+    if constexpr (cutlass_gemm_any_tc<ActT>::value &&
+                  std::is_same<ActT, WeightT>::value) {
+        cudaError_t err = vit_linear_gemm_bias<ActT>(in, W, b, out, M, N, K, stream);
+        if (err == cudaSuccess) return cudaSuccess;
+        // genuine last-resort fallback on cudaErrorNotSupported (untileable shape)
+    }
+    return launch_gemm_bias<ActT, WeightT>(in, W, b, out, M, N, K, stream);
+}
+#endif  // WITH_CUTLASS
 
 // dX = dY · W   where Y[m,n] = sum_k W[n,k] X[m,k]; dX[m,k] = sum_n dY[m,n] W[n,k]
 template <typename ActT, typename WeightT>
@@ -1508,9 +989,15 @@ cudaError_t forward(
     // region by routing through a temporary ActT scratch (layer-0 attn_out).
     auto L0 = A.layer(0);
     ActT* patches_proj = L0.proj_out;  // reuse: temporary scratch (overwritten before use)
+#ifdef WITH_CUTLASS
+    err = launch_linear_bias<ActT, WeightT>(
+        input, w.patch_W(), w.patch_b(), patches_proj,
+        /*M=*/batch * num_patches, /*N=*/d_model, /*K=*/patch_dim, stream);
+#else
     err = launch_gemm_bias<ActT, WeightT>(
         input, w.patch_W(), w.patch_b(), patches_proj,
         /*M=*/batch * num_patches, /*N=*/d_model, /*K=*/patch_dim, stream);
+#endif
     if (err != cudaSuccess) return err;
 
     // Step 2: prepend CLS + add pos embed -> tokens (= layer-0 pre_attn_in)
@@ -1529,9 +1016,15 @@ cudaError_t forward(
         auto P = A.layer(L);
 
         // QKV projection: [M, D] -> [M, 3*HD]
+#ifdef WITH_CUTLASS
+        err = launch_linear_bias<ActT, WeightT>(
+            P.pre_attn_in, w.qkv_W(L), w.qkv_b(L), P.qkv,
+            M, 3 * HD, d_model, stream);
+#else
         err = launch_gemm_bias<ActT, WeightT>(
             P.pre_attn_in, w.qkv_W(L), w.qkv_b(L), P.qkv,
             M, 3 * HD, d_model, stream);
+#endif
         if (err != cudaSuccess) return err;
 
         // Split into Q/K/V [B, H, S, Dh] each via temporary scratch.
@@ -1574,9 +1067,15 @@ cudaError_t forward(
         err = cudaGetLastError(); if (err != cudaSuccess) return err;
 
         // Output projection: attn_out [M, HD] -> proj_out [M, D]
+#ifdef WITH_CUTLASS
+        err = launch_linear_bias<ActT, WeightT>(
+            P.attn_out, w.out_W(L), w.out_b(L), P.proj_out,
+            M, d_model, HD, stream);
+#else
         err = launch_gemm_bias<ActT, WeightT>(
             P.attn_out, w.out_W(L), w.out_b(L), P.proj_out,
             M, d_model, HD, stream);
+#endif
         if (err != cudaSuccess) return err;
 
         // Residual: ln1_in = pre_attn_in + proj_out
@@ -1591,9 +1090,15 @@ cudaError_t forward(
         if (err != cudaSuccess) return err;
 
         // FFN up: ffn_h_pre = ff1_W @ ln1_out + ff1_b
+#ifdef WITH_CUTLASS
+        err = launch_linear_bias<ActT, WeightT>(
+            P.ln1_out, w.ff1_W(L), w.ff1_b(L), P.ffn_h_pre,
+            M, ffn_hidden, d_model, stream);
+#else
         err = launch_gemm_bias<ActT, WeightT>(
             P.ln1_out, w.ff1_W(L), w.ff1_b(L), P.ffn_h_pre,
             M, ffn_hidden, d_model, stream);
+#endif
         if (err != cudaSuccess) return err;
 
         // GELU
@@ -1601,9 +1106,15 @@ cudaError_t forward(
         if (err != cudaSuccess) return err;
 
         // FFN down: ffn_out = ff2_W @ ffn_h + ff2_b
+#ifdef WITH_CUTLASS
+        err = launch_linear_bias<ActT, WeightT>(
+            P.ffn_h, w.ff2_W(L), w.ff2_b(L), P.ffn_out,
+            M, d_model, ffn_hidden, stream);
+#else
         err = launch_gemm_bias<ActT, WeightT>(
             P.ffn_h, w.ff2_W(L), w.ff2_b(L), P.ffn_out,
             M, d_model, ffn_hidden, stream);
+#endif
         if (err != cudaSuccess) return err;
 
         // Residual: ln2_in = ln1_out + ffn_out
@@ -1644,9 +1155,15 @@ cudaError_t forward(
     if (err != cudaSuccess) return err;
 
     // Step 6: classification head: output = head_W @ final_out + head_b
+#ifdef WITH_CUTLASS
+    err = launch_linear_bias<ActT, WeightT>(
+        F.final_out, w.head_W(), w.head_b(), output,
+        batch, n_classes, d_model, stream);
+#else
     err = launch_gemm_bias<ActT, WeightT>(
         F.final_out, w.head_W(), w.head_b(), output,
         batch, n_classes, d_model, stream);
+#endif
     return err;
 }
 

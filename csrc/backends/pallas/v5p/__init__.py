@@ -1,6 +1,7 @@
 """TPU v4 / v5e / v5p Pallas kernels (128-wide MXU tiles).
 
-Re-exports the tile-128 variants from ``csrc/kernels/tpu/_pallas_kernels.py``.
+Re-exports the tile-128 variants from
+``csrc/backends/pallas/_pallas_kernels.py``.
 v5p additionally enables VMEM-persistent expert weights via the
 ``vmem_persistent_expert_mlp`` path; the version check inside that helper
 honors ``detect_tpu_version()`` so the residency policy fires correctly.
