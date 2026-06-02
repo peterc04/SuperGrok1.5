@@ -110,7 +110,7 @@ def supergrok15_step(
 
 # ---------------------------------------------------------------------------
 # Per-tensor fused-TU contract (different signature shape; consumed by
-# csrc/fused/tpu_v5p/fused_*_supergrok15_*.py stubs)
+# csrc/fused/tpu_v6e/fused_*_supergrok15_*.py stubs)
 # ---------------------------------------------------------------------------
 
 def phi_forward(

@@ -3,22 +3,22 @@
 Detection is **arch-honest**: ``detect_arch()`` / ``get_gpu_arch()`` report the
 REAL device architecture, not a collapsed vendor selector. An A100 reports
 ``sm_80``, an L40S ``sm_89``, an H100 ``sm_90a`` — they are NOT all flattened to
-``90``. AMD reports its real ``gfx<...>`` target; TPU reports ``tpu_v5p``.
+``90``. AMD reports its real ``gfx<...>`` target; TPU reports ``tpu_v6e``.
 
     NVIDIA: sm_70 / sm_75 / sm_80 / sm_86 / sm_89 / sm_90a / sm_100a / ...
     AMD:    gfx906 / gfx908 / gfx90a / gfx942 / gfx950 / gfx110x / ...
-    TPU:    tpu_v5p
+    TPU:    tpu_v6e
 
 The C++ extension is still built as a multi-arch fat binary (one impl per
 vendor family; see setup.py), so the *fat-binary impl selector* is a separate
 concern from the reported arch. ``normalize_arch()`` maps a real arch to its
-impl-family selector (NVIDIA → 90, AMD → 942, TPU → "tpu_v5p") for the code
+impl-family selector (NVIDIA → 90, AMD → 942, TPU → "tpu_v6e") for the code
 paths that load the matching per-SM/-gfx code from the fat binary. Reporting
 stays honest; only the binary loader normalises.
 
 Feature predicates (``supports_fp8`` etc.) are keyed to the REAL compute
 capability via ``get_device_sm()``. ``FORCE_ARCH`` accepts any real arch form
-(``sm_80``, ``gfx942``, ``tpu_v5p``, or a bare numeric CC like ``80``/``90``).
+(``sm_80``, ``gfx942``, ``tpu_v6e``, or a bare numeric CC like ``80``/``90``).
 """
 
 from __future__ import annotations
@@ -125,16 +125,16 @@ SUPPORTED_ARCHES = (
     "gfx1030", "gfx1100", "gfx1101", "gfx1102",
     "gfx1151", "gfx1200", "gfx1201",
     # TPU.
-    "tpu_v5p",
+    "tpu_v6e",
 )
 
 # The two GPU fat-binary impl families the extension actually ships. Real
-# arches normalise onto one of these (plus "tpu_v5p") via normalize_arch().
-IMPL_FAMILIES = (90, 942, "tpu_v5p")
+# arches normalise onto one of these (plus "tpu_v6e") via normalize_arch().
+IMPL_FAMILIES = (90, 942, "tpu_v6e")
 
 
 class UnsupportedArchError(RuntimeError):
-    """Raised when the detected arch is not one of {sm_90, gfx942, tpu_v5p}."""
+    """Raised when the detected arch is not one of {sm_90, gfx942, tpu_v6e}."""
 
 
 # ----------------------------------------------------------------------
@@ -205,13 +205,13 @@ def _sm_to_arch_label(cc: int) -> str:
 def _normalize_force_arch(force: str) -> Union[int, str]:
     """Map a FORCE_ARCH string to the REAL arch it names (honest).
 
-    Returns a real arch label (``sm_80``/``gfx942``/...) or ``tpu_v5p``. A bare
+    Returns a real arch label (``sm_80``/``gfx942``/...) or ``tpu_v6e``. A bare
     numeric value is treated as an NVIDIA compute capability and resolved to its
     real label. Raises on unrecognised input. Use :func:`normalize_arch` on the
     result when an impl-family selector (90/942) is needed.
     """
     if force.startswith('tpu'):
-        return "tpu_v5p"
+        return "tpu_v6e"
     # AMD: any gfx target. Honor the exact gfx label; the bare ``942`` form maps
     # to gfx942 for back-compat.
     if force.startswith('gfx'):
@@ -239,20 +239,20 @@ def _normalize_force_arch(force: str) -> Union[int, str]:
     raise UnsupportedArchError(
         f"FORCE_ARCH={force!r} not recognized. Use an NVIDIA arch "
         f"(sm_70..sm_120a or a numeric CC), an AMD arch (gfx906..gfx1201), "
-        f"or tpu_v5p.")
+        f"or tpu_v6e.")
 
 
 def normalize_arch(arch: Union[int, str]) -> Union[int, str]:
     """Map a real arch to its fat-binary impl-family selector.
 
     NVIDIA labels (``sm_*``) and bare CC ints → ``90``; AMD ``gfx*`` (and the
-    bare ``942``) → ``942``; ``tpu_v5p`` → ``"tpu_v5p"``. This is the ONLY place
+    bare ``942``) → ``942``; ``tpu_v6e`` → ``"tpu_v6e"``. This is the ONLY place
     the NVIDIA→90 / AMD→942 collapse happens, and it is used solely by the code
     that loads the matching per-arch code from the multi-arch fat binary — never
     for *reporting* the device's real arch.
     """
-    if arch == "tpu_v5p":
-        return "tpu_v5p"
+    if arch == "tpu_v6e":
+        return "tpu_v6e"
     if isinstance(arch, int):
         return 942 if arch == 942 else 90
     if arch.startswith('gfx'):
@@ -276,9 +276,9 @@ def get_gpu_arch() -> Union[int, str]:
     force = os.environ.get('FORCE_ARCH')
     if force:
         sel = _normalize_force_arch(force)
-        if sel == "tpu_v5p":
+        if sel == "tpu_v6e":
             raise UnsupportedArchError(
-                "FORCE_ARCH=tpu_v5p is not a GPU arch; use detect_arch() instead")
+                "FORCE_ARCH=tpu_v6e is not a GPU arch; use detect_arch() instead")
         return sel
 
     if not torch.cuda.is_available():
@@ -331,10 +331,10 @@ def get_device_sm():
 @functools.lru_cache(maxsize=1)
 def detect_arch() -> Union[int, str]:
     """Detect the active REAL arch: a label like ``sm_80`` / ``sm_90a`` /
-    ``gfx942``, or ``"tpu_v5p"``.
+    ``gfx942``, or ``"tpu_v6e"``.
 
     Detection order:
-      1. FORCE_ARCH env var (accepts sm_*, gfx*, a numeric CC, or tpu_v5p)
+      1. FORCE_ARCH env var (accepts sm_*, gfx*, a numeric CC, or tpu_v6e)
       2. TPU detection via JAX
       3. GPU detection via get_gpu_arch()
 
@@ -352,7 +352,7 @@ def detect_arch() -> Union[int, str]:
         import jax.devices
         devices = jax.devices()
         if devices and any(d.platform == 'tpu' for d in devices):
-            return "tpu_v5p"
+            return "tpu_v6e"
     except (ImportError, RuntimeError):
         pass
 
@@ -418,7 +418,7 @@ _ARCH_LABELS = {
     "sm_120a": "Blackwell (sm_120a) — RTX 50xx",
     "gfx942":  "CDNA3 (gfx942) — MI300X / MI300A",
     "gfx950":  "CDNA3.5 (gfx950) — MI325X",
-    "tpu_v5p": "TPU v5p",
+    "tpu_v6e": "TPU v6e",
 }
 
 

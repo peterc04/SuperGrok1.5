@@ -1,8 +1,8 @@
-"""TPU v5p model surface for Decoder Transformer, ViT, and Mamba.
+"""TPU v6e model surface for Decoder Transformer, ViT, and Mamba.
 
 Provides Pallas/JAX implementations of three models used by the grokking
 race driver.  Each model exposes forward and backward functions suitable
-for TPU v5p (128-wide MXU tiles).  All Pallas kernels are wrapped in
+for TPU v6e (256-wide MXU tiles).  All Pallas kernels are wrapped in
 try/except with pure-JAX fallbacks so the code remains functional when
 the Pallas API changes or is unavailable.
 
@@ -85,7 +85,7 @@ def _layer_norm(x, gamma, beta, eps=1e-5):
 #  Shared attention (used by Decoder and ViT)
 # ═══════════════════════════════════════════════════════════════════════
 
-def _hand_tiled_attention_forward(q, k, v, *, causal: bool, tile_size=128):
+def _hand_tiled_attention_forward(q, k, v, *, causal: bool, tile_size=256):
     """Hand-tiled QKV attention in BF16 with optional causal mask.
 
     Args:
@@ -132,12 +132,12 @@ def _hand_tiled_attention_forward(q, k, v, *, causal: bool, tile_size=128):
     return out, softmax_lse
 
 
-def attention_forward(q, k, v, *, causal: bool, tile_size=128):
+def attention_forward(q, k, v, *, causal: bool, tile_size=256):
     """Multi-head attention forward — splash_attention first, hand-tiled fallback.
 
     Path selection (LIVE / FALLBACK, both intentional):
       1. If the TPU splash_attention kernel is importable AND callable, use it
-         (the fast v5p MXU path). It returns the attention output; we recompute
+         (the fast v6e MXU path). It returns the attention output; we recompute
          the log-sum-exp cheaply for the backward contract.
       2. Otherwise — splash not present, not callable, or it raised/returned
          None at trace time — fall through to the hand-tiled Pallas attention
@@ -148,7 +148,7 @@ def attention_forward(q, k, v, *, causal: bool, tile_size=128):
     Args:
         q, k, v: [batch, n_heads, seq_len, d_head]
         causal: whether to apply a causal mask
-        tile_size: Pallas tile size (default 128 for v5p)
+        tile_size: Pallas tile size (default 256 for v6e)
 
     Returns:
         (out, softmax_lse)
@@ -169,7 +169,7 @@ def attention_forward(q, k, v, *, causal: bool, tile_size=128):
     return _hand_tiled_attention_forward(q, k, v, causal=causal, tile_size=tile_size)
 
 
-def attention_backward(grad_out, q, k, v, out, softmax_lse, *, causal: bool, tile_size=128):
+def attention_backward(grad_out, q, k, v, out, softmax_lse, *, causal: bool, tile_size=256):
     """Attention backward pass via JAX autodiff.
 
     Args:

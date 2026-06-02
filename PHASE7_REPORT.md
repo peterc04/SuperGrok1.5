@@ -59,5 +59,5 @@ compile/clang/trace/self-test verified.
 Implementation-maximal across sm_90 / gfx942 / tpu. Single canonical math source
 per component, **enforced** (incl. re-inline detection); no dead duplicate trees;
 generator-driven dispatch; vectorized AMD apply-steps. The ONLY remaining class
-is **gap #7 — on-silicon validation** (H100 / MI300X / TPU v5p) per
+is **gap #7 — on-silicon validation** (H100 / MI300X / TPU v6e) per
 `HARDWARE_VALIDATION.md`, to move 🟡 → ✅.

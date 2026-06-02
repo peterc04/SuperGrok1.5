@@ -26,7 +26,7 @@ inventories them.
 |------|------|-------------------------------------------|-----------------|
 | gfx942 device | `csrc/fused/gfx942/opt_components.hip.hpp` | `csrc/algorithms/*.h` → `platform.h` `GROK_HIP` branch pulls `<thrust/...>`, which the free-standing AMDGCN clang gate can't resolve | transcribed **byte-faithfully**; comment marks each as a transcription of `csrc/algorithms/<opt>.h`. A math edit must be mirrored here. |
 | gfx942 per-op | `grokking_optimizers/kernels/gfx942/<opt>_gfx942.hip.hpp` (device pass) | hand-written AMDGCN device kernels (DPP/MFMA/streaming) — a different kernel shape, not an elementwise re-include | mirror the *formula*, not the layout. |
-| tpu_v5p | `csrc/backends/pallas/launch_<opt>.py` (authoritative) + `grokking_optimizers/kernels/tpu/<opt>_tpu.py` (reference; the 4 base ones re-export, WS5) | JAX/XLA, a different runtime | the JAX path is the canonical TPU math; the 4 base `kernels/tpu` shims re-export `launch_<opt>.py` (single TPU source). |
+| tpu_v6e | `csrc/backends/pallas/launch_<opt>.py` (authoritative) + `grokking_optimizers/kernels/tpu/<opt>_tpu.py` (reference; the 4 base ones re-export, WS5) | JAX/XLA, a different runtime | the JAX path is the canonical TPU math; the 4 base `kernels/tpu` shims re-export `launch_<opt>.py` (single TPU source). |
 
 ## Edit protocol
 1. Change `csrc/algorithms/<opt>.h` — the CUDA per-op and fused paths update

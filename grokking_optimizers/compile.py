@@ -7161,7 +7161,7 @@ def bootstrap_rocm_toolkit(stream=None, arch: str = "gfx942") -> bool:
 # JAX/TPU bootstrap — Stream 12
 # ---------------------------------------------------------------------------
 
-def bootstrap_jax_tpu(stream=None, arch: str = "tpu_v5p") -> bool:
+def bootstrap_jax_tpu(stream=None, arch: str = "tpu_v6e") -> bool:
     """Detect TPU runtime via ``jax.devices()``; install ``jax[tpu]`` from
     the libtpu_releases bucket when missing. Returns True iff a TPU device
     is visible after.

@@ -631,7 +631,7 @@ setup(
     version="3.0.0",
     description=(
         "All-specialized per-arch optimizer kernels. "
-        "Supported: NVIDIA sm_90 (CUDA), AMD gfx942 (HIP), TPU v5p (Pallas via JAX)."
+        "Supported: NVIDIA sm_90 (CUDA), AMD gfx942 (HIP), TPU v6e (Pallas via JAX)."
     ),
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",

@@ -6,7 +6,7 @@ verified and how, and the complete list of checks deferred to real silicon.
 > **Status legend** — 🟡 = implemented + structurally / compile verified on the
 > CPU host (nvcc `-c` to object, clang amdgcn device-compile, or Python
 > self-test); **NOT** yet hardware-validated. ✅ = bit-level reference-checked +
-> profiled on real H100 / MI300X / TPU v5p via `HARDWARE_VALIDATION.md`.
+> profiled on real H100 / MI300X / TPU v6e via `HARDWARE_VALIDATION.md`.
 > Every performance cell below is 🟡 pending that runbook.
 
 ## Verification gates used
@@ -191,7 +191,7 @@ Full detail + the 99-pipeline table + before→after fuse-tiers are in
 `PHASE4_REPORT.md`. Summary (44/44 components built; verified at each arch's
 gate level; on-silicon execution/numerics 🟡):
 
-| component group | sm_90 | gfx942 | tpu_v5p | verification level |
+| component group | sm_90 | gfx942 | tpu_v6e | verification level |
 |-----------------|-------|--------|---------|--------------------|
 | 11 optimizers   | ✅ built | ✅ built | ✅ built | nvcc-object / clang-amdgcn / jax-lower |
 | 3 models        | ✅ built | ✅ built | ✅ built | nvcc-object / clang-amdgcn / jax-lower |

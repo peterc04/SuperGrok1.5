@@ -59,7 +59,7 @@ Total tracked source: **80,119 LOC**. Key trees:
 |------|----------------------|-------------------------------------|------------|
 | sm_90 | `csrc/algorithms/<opt>.h` (elementwise math) | `kernels/sm_90/<opt>_sm90.cuh` (`#include` + launch), `csrc/fused/sm_90/opt_components.cuh` (`#include` + `apply_optimizer`) | **NO** — `#include`, drift-guard-enforced |
 | gfx942 | `kernels/gfx942/<opt>_gfx942.hip.hpp` (device kernel) | `launch_<opt>.hip.cpp` (entry); `csrc/fused/gfx942/opt_components.hip.hpp` is a **documented byte-faithful transcription** of `csrc/algorithms` (thrust blocks `#include` on the bare AMDGCN gate — the one necessary re-expression, cross-referenced + drift-guard-noted) | **NO** (necessary re-expression, tracked) |
-| tpu_v5p | 7 opts: `kernels/tpu/<opt>_tpu.py`; 4 base: `pallas/launch_<opt>.py` | `_pallas_fused.py` imports each; the 4 `kernels/tpu/<base>_tpu.py` are pure re-export shims | **NO** — one math home per opt; shims carry zero math |
+| tpu_v6e | 7 opts: `kernels/tpu/<opt>_tpu.py`; 4 base: `pallas/launch_<opt>.py` | `_pallas_fused.py` imports each; the 4 `kernels/tpu/<base>_tpu.py` are pure re-export shims | **NO** — one math home per opt; shims carry zero math |
 
 **3 models (per arch):** sm_90 → `kernels/sm_90/<model>_sm90.cuh` (canonical CUTLASS), wrapped by `backends/cuda/sm_90/models/<model>.cuh`; gfx942 → `kernels/gfx942/<model>_gfx942.hip.hpp`; tpu → `_pallas_models.py`. **No duplicates.**
 

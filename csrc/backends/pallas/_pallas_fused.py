@@ -1,6 +1,6 @@
-"""Real TPU/Pallas fused composition for the tpu_v5p megakernel cells.
+"""Real TPU/Pallas fused composition for the tpu_v6e megakernel cells.
 
-This module turns the 33 ``csrc/fused/tpu_v5p/mega_<model>_<optimizer>.py``
+This module turns the 33 ``csrc/fused/tpu_v6e/mega_<model>_<optimizer>.py``
 structural stubs into a *real* fused program. It composes the real TPU
 optimizer kernels with the real TPU model kernels into a single jitted step
 function, so XLA fuses forward -> backward -> optimizer into one program

@@ -25,7 +25,7 @@ JAX lower — NOT on-silicon execution.
 |------|-----------|----------|-----------|----------|------|
 | sm_90 | 10 | **33** | 23 | **0** | all 33 cells now fit L3 under the staged-register model |
 | gfx942 | 10 | **11** | 23 | **22** | mamba3 ×11 promoted; decoder/vit stay L1 — their staged L3 smem (66560B) exceeds gfx942's 64KB LDS (an honest *smem* limit, not register) |
-| tpu_v5p | 33 | 33 | 0 | 0 | XLA-managed (unchanged) |
+| tpu_v6e | 33 | 33 | 0 | 0 | XLA-managed (unchanged) |
 | **total** | **53** | **77** | **46** | **22** | |
 
 🟡 These tiers are **estimates** from the solver's additive register model
@@ -42,7 +42,7 @@ OPTIMIZER COMPONENTS (11 × 3 = 33):
 |------|--------|----------|
 | sm_90 (×11) | FULLY-BUILT, **nvcc-object-verified** | canonical `csrc/algorithms/<opt>.h`; per-op + fused both `#include` it (WS4 guard); SG2-L3 fused cell COMPILE_OK |
 | gfx942 (×11) | FULLY-BUILT, **clang-amdgcn-gate-verified** | device passes filled; reducers use DPP; Muon NS + SG2 use MFMA; ATen only in `!__AMDGCN__` host fallback |
-| tpu_v5p (×11) | FULLY-BUILT, **jax-lower-verified** | all 11 in `kernels/tpu` (WS5) + `_pallas_fused` 66/66 trace+lower |
+| tpu_v6e (×11) | FULLY-BUILT, **jax-lower-verified** | all 11 in `kernels/tpu` (WS5) + `_pallas_fused` 66/66 trace+lower |
 
 MODEL COMPONENTS (3 × 3 = 9):
 
@@ -50,7 +50,7 @@ MODEL COMPONENTS (3 × 3 = 9):
 |------|--------|----------|
 | sm_90 (×3) | FULLY-BUILT, **nvcc-object-verified** | `models/{decoder,vit,mamba}.cu` COMPILE_OK; TF32 tensor-core path LIVE + scalar FALLBACK (WS3) |
 | gfx942 (×3) | FULLY-BUILT, **clang-amdgcn-gate-verified** | MFMA/DPP model kernels |
-| tpu_v5p (×3) | FULLY-BUILT, **jax-lower-verified** | `_pallas_models.py` fwd/bwd |
+| tpu_v6e (×3) | FULLY-BUILT, **jax-lower-verified** | `_pallas_models.py` fwd/bwd |
 
 DISPATCH + COMPILE (2):
 
@@ -68,7 +68,7 @@ object / clang amdgcn / jax lower). On-silicon execution + numerics are 🟡.
 |------|-------|--------|-------|
 | sm_90 | 33 | REAL-COMPOSITION-COMPILED (representative + WS1/WS3 TUs nvcc -c; 0 wrappers) | 33 L3 🟡 |
 | gfx942 | 33 | REAL-COMPOSITION-GATE-VERIFIED (clang amdgcn; 0 wrappers) | 11 L3 / 22 L1 🟡 |
-| tpu_v5p | 33 | REAL-COMPOSITION-TRACE-VERIFIED (66/66 lower) | 33 L3 |
+| tpu_v6e | 33 | REAL-COMPOSITION-TRACE-VERIFIED (66/66 lower) | 33 L3 |
 
 **0 / 99 STILL-WRAPPER** (anti-false-positive grep = 0 across `csrc/fused/`).
 
@@ -85,6 +85,6 @@ object / clang amdgcn / jax lower). On-silicon execution + numerics are 🟡.
 - WS4 CUDA single-source: **enforced** (guard script). gfx942/TPU re-expressions: cross-referenced manual-sync.
 
 ## What remains (genuinely external)
-1. **On-silicon execution + numeric parity** (H100 / MI300X / TPU v5p) — the only remaining class; nothing was executed on an accelerator. All 🟡 in HARDWARE_VALIDATION.md.
+1. **On-silicon execution + numeric parity** (H100 / MI300X / TPU v6e) — the only remaining class; nothing was executed on an accelerator. All 🟡 in HARDWARE_VALIDATION.md.
 2. **ptxas register confirmation** of the WS1 L3 tier promotions (the 53→77 is a modeled estimate).
 3. gfx942 decoder/vit L3 is smem-bound (66560B > 64KB LDS) — would need a smaller model tile (out of scope).
