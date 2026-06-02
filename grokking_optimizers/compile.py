@@ -410,6 +410,14 @@ class ArchEntry:
     max_threads_per_block: Optional[int]       # 1024 CUDA/HIP, None Pallas
     features: frozenset                        # capability flag strings (see docstring)
     search_space_builder: Optional[Callable[[], Dict[str, Any]]] = None
+    # True only for arches that ship a real committed kernel body (a *.cu /
+    # *.hip.cpp with arch-specific intrinsics). Today that is sm_90a + gfx942;
+    # every other arch falls back to a None/generic template, so enumerating
+    # and compiling tuning configs for them just burns budget producing
+    # identical generic binaries. Bodyless arches are skipped by the default
+    # dry-run / tuning sweep unless explicitly requested (see
+    # ``_arches_with_kernel_body`` / ``include_bodyless``).
+    has_kernel_body: bool = False
 
 
 # ---- NVCC gencode helper -------------------------------------------------
@@ -421,14 +429,37 @@ class ArchEntry:
 # The "a" suffix on Hopper+ tells NVCC to emit arch-specific instructions
 # (TMA, wgmma, tcgen05 etc.) that the non-"a" variant rejects.
 
-def _nvcc_gencode_pair(num: int, suffix: str = "") -> List[str]:
+# SASS-only gencode toggle. When True, _nvcc_gencode_pair emits ONLY the
+# ``code=sm_NN`` SASS gencode and DROPS the ``compute_NN`` PTX-fallback
+# gencode. For an arch that ships a real kernel body (sm_90 / gfx942 today)
+# this shrinks the fatbin and skips the JIT-from-PTX path entirely on the
+# exact target SM. It is OFF by default because dropping the PTX fallback
+# means the binary cannot JIT-forward onto a newer, not-yet-existing SM — so
+# it's only safe when you are certain of the deployment GPU. Set via
+# ``--sass-only`` on the CLI (wired in below) or by toggling this module flag.
+_SASS_ONLY_GENCODE: bool = False
+
+
+def _nvcc_gencode_pair(num: int, suffix: str = "",
+                       sass_only: Optional[bool] = None) -> List[str]:
+    """Return the -gencode flags for a CUDA arch.
+
+    By default emits the SASS gencode + a ``compute_NN`` PTX-fallback gencode
+    (so older drivers can JIT-forward onto newer hardware). When
+    ``sass_only`` (defaulting to the module-level ``_SASS_ONLY_GENCODE``) is
+    True, the PTX fallback is dropped — smaller fatbin / no JIT — which is
+    only safe for archs whose exact SM is the known deployment target.
+    """
+    if sass_only is None:
+        sass_only = _SASS_ONLY_GENCODE
     sm = f"sm_{num}{suffix}"
     compute = f"compute_{num}{suffix}"
     compute_fallback = f"compute_{num}"   # PTX fallback is always non-"a"
-    return [
-        f"-gencode=arch={compute},code={sm}",
-        f"-gencode=arch={compute_fallback},code={compute_fallback}",
-    ]
+    flags = [f"-gencode=arch={compute},code={sm}"]
+    if not sass_only:
+        flags.append(
+            f"-gencode=arch={compute_fallback},code={compute_fallback}")
+    return flags
 
 
 # ---- Feature-flag mnemonics (see ARCH_TABLE.features) --------------------
@@ -580,6 +611,7 @@ _ARCH_TABLE_PRIMARY: Dict[str, ArchEntry] = {
         max_regs_per_thread=255,
         max_threads_per_block=1024,
         features=frozenset(_F_HOPPER),
+        has_kernel_body=True,   # cuda/sm_90 ships real Hopper kernel bodies
     ),
 
     "sm_100a": ArchEntry(
@@ -724,6 +756,7 @@ _ARCH_TABLE_PRIMARY: Dict[str, ArchEntry] = {
         max_regs_per_thread=255,
         max_threads_per_block=1024,
         features=frozenset({"mfma", "bf16_mfma", "fp8_mfma", "mfma_xdl"}),
+        has_kernel_body=True,   # hip/gfx942 ships real CDNA3 kernel bodies
     ),
 
     "gfx950": ArchEntry(
@@ -1108,6 +1141,103 @@ def _dim(name: str, dtype: str, values: List[Any], macro: Optional[str],
             "macro": macro, "applies_to": applies_to, "kind": kind}
 
 
+# ---------------------------------------------------------------------------
+# Live vs. dead tuning dimensions
+# ---------------------------------------------------------------------------
+#
+# A producer→consumer audit of the emitted ``-DSG_TUNED_*`` macros against the
+# committed kernel bodies (grep of every *.cu / *.hip.cpp) showed that of the
+# ~22 macros the autotuner can emit, only FIVE are ever ``#ifdef``'d / read by
+# any kernel:
+#
+#   SG_TUNED_BLOCK_SIZE  (11 consumers)   — live
+#   SG_TUNED_VEC_WIDTH   (11 consumers)   — live
+#   SG_TUNED_UNROLL      (11 consumers)   — live
+#   SG_TUNED_ASYNC_DEPTH (12 consumers)   — live  (kernel clamps to [1,4])
+#   SG_TUNED_CLUSTER_SHAPE (2 consumers)  — live
+#
+# ``maxrregcount`` carries ``macro=None`` and is emitted as a real
+# ``--maxrregcount=N`` / ``-amdgpu-max-num-vgprs=N`` compiler flag, so it
+# genuinely changes the produced binary and is LIVE even though it is not an
+# SG_TUNED macro. All Pallas dims (kind == "pallas_kwarg") are real
+# ``pl.pallas_call`` arguments and are likewise LIVE.
+#
+# Every OTHER SG_TUNED_* / *_ENABLED macro (NUM_STAGES, SWIZZLE,
+# TMA_DESCRIPTORS, WGMMA_SHAPE, WARP_SPECIALIZATION, FP8/FP4_LAYOUT,
+# TCGEN05_VARIANT, LDS_PADDING, WAVES_PER_EU, MFMA_SHAPE, FP8/FP4_MFMA_LAYOUT,
+# SCHEDULER_HINT, WMMA_SHAPE, DPP_MODIFIER, TGSPLIT, the bare TMA bool) is
+# DEAD: no kernel reads it, so every distinct value produces a
+# binary-IDENTICAL artifact. Leaving these in the search space (a) inflates the
+# Cartesian product by ~10^4× on sm_90 / sm_100, wasting the sampler's trial
+# budget on binary-identical configs, and (b) poisons ``config_key`` so two
+# binary-identical configs hash to different keys → false cache misses → full
+# recompiles.
+#
+# We keep the macros *emittable* (the dims stay in the space, the
+# ``resolve_macros`` / ``resolve_extra_*_flags`` paths are untouched) so a dead
+# dim can be revived later by simply moving its name into ``_LIVE_TUNING_DIMS``.
+# But for now each dead dim is PINNED to a single default value (so it stops
+# expanding the search space) and DROPPED from ``config_key`` (so binary-
+# identical configs collapse to one cache entry).
+
+# Names of dims that change the emitted binary (live SG_TUNED macros + the
+# real --maxrregcount flag). Pallas kwargs are handled separately by kind.
+_LIVE_TUNING_DIMS: frozenset = frozenset({
+    "block", "vec", "unroll", "async_depth", "cluster_shape", "maxrregcount",
+})
+
+# Hard ceiling for the async-copy pipeline depth. The committed kernels clamp
+# SG_TUNED_ASYNC_DEPTH to [1, 4] (cp.async / async-pipeline stage count); the
+# search formerly offered [1, 16], so values 5..16 produced a kernel
+# byte-identical to the depth-4 build yet forced a fresh (wasted) compile.
+_ASYNC_DEPTH_MAX: int = 4
+
+
+def _is_dead_dim(spec: Dict[str, Any]) -> bool:
+    """True if ``spec`` is a tuning dim whose value never reaches the binary.
+
+    Pallas kwargs and live dims are never dead; everything else (the dead
+    SG_TUNED_* macros) is.
+    """
+    if spec.get("kind") == "pallas_kwarg":
+        return False
+    return spec.get("name") not in _LIVE_TUNING_DIMS
+
+
+# Dim names dropped from ``config_key`` so binary-identical configs collapse to
+# one cache entry. This is the union of dead-macro dim names across all
+# CUDA/HIP builders. ``num_stages`` is deliberately EXCLUDED here: it is a dead
+# device macro on CUDA/HIP (handled by pinning, below) but is ALSO a genuine,
+# live ``pl.pallas_call`` kwarg on Pallas archs — dropping it from the key
+# unconditionally would alias two distinct Pallas configs. Pinning the CUDA/HIP
+# num_stages dim already collapses those, so it need not appear here.
+_DEAD_KEY_DIMS: frozenset = frozenset({
+    "swizzle", "tma", "tma_descriptors", "wgmma_shape", "warp_specialization",
+    "fp8_layout", "fp4_layout", "tcgen05_variant", "lds_padding",
+    "waves_per_eu", "mfma_shape", "fp8_mfma_layout", "fp4_mfma_layout",
+    "scheduler_hint", "wmma_shape", "dpp_modifier", "tgsplit",
+})
+
+
+def _pin_dead_dims(dims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse every DEAD tuning dim to a single pinned default value.
+
+    The dim object is preserved (so the macro is still emitted and can be
+    revived) but its ``values`` list is truncated to its first entry, removing
+    it from the Cartesian product. Mutates and returns ``dims``. Live dims and
+    Pallas kwargs are untouched.
+    """
+    for d in dims:
+        if _is_dead_dim(d):
+            vals = d.get("values") or []
+            if len(vals) > 1:
+                d["values"] = vals[:1]
+            d["live"] = False
+        else:
+            d["live"] = True
+    return dims
+
+
 # ===========================================================================
 # Stream 2: per-arch search-space builders
 # ===========================================================================
@@ -1270,7 +1400,10 @@ def _build_cuda_space(arch_key: str,
     if "tma" in features:
         dims.append(_dim("tma_descriptors", "int", [0, 1, 2, 4, 8],
                          "SG_TUNED_TMA_DESCRIPTORS", ["device"]))
-        dims.append(_dim("async_depth", "int", list(range(1, 17)),
+        # async_depth capped at the kernel clamp [1, 4]; values 5..16 used to
+        # force byte-identical recompiles. See _ASYNC_DEPTH_MAX.
+        dims.append(_dim("async_depth", "int",
+                         list(range(1, _ASYNC_DEPTH_MAX + 1)),
                          "SG_TUNED_ASYNC_DEPTH", ["device"]))
         rules.append({"name": "async_depth_stages",
                       "expr": "async_depth >= num_stages - 1"})
@@ -1313,7 +1446,7 @@ def _build_cuda_space(arch_key: str,
                          "SG_TUNED_TCGEN05_VARIANT", ["device"]))
 
     return {
-        "dims": dims,
+        "dims": _pin_dead_dims(dims),
         "prefilter": {
             "register_pressure_max": entry.max_regs_per_thread or 255,
             "smem_budget_bytes": entry.max_smem_per_block or (48 * 1024),
@@ -1383,7 +1516,7 @@ def _build_cdna_space(arch_key: str,
                          "SG_TUNED_SCHEDULER_HINT", ["device"]))
 
     return {
-        "dims": dims,
+        "dims": _pin_dead_dims(dims),
         "prefilter": {
             "register_pressure_max": entry.max_regs_per_thread or 255,
             "waves_per_eu_max": 10,
@@ -1446,7 +1579,7 @@ def _build_rdna_space(arch_key: str,
                          "SG_TUNED_FP8_LAYOUT", ["device"]))
 
     return {
-        "dims": dims,
+        "dims": _pin_dead_dims(dims),
         "prefilter": {
             "register_pressure_max": entry.max_regs_per_thread or 255,
             "smem_budget_bytes": entry.max_smem_per_block or (64 * 1024),
@@ -1496,7 +1629,7 @@ def _sm90_full_space() -> Dict[str, Any]:
     arch_key = "sm_90a"
     entry = ARCH_TABLE[arch_key]
     return {
-        "dims": [
+        "dims": _pin_dead_dims([
             _dim("block", "int", list(range(32, 1025, 32)),
                  "SG_TUNED_BLOCK_SIZE", ["host", "device"]),
             _dim("vec", "int", [1, 2, 4, 8, 16],
@@ -1515,9 +1648,11 @@ def _sm90_full_space() -> Dict[str, Any]:
                  "SG_TUNED_WARP_SPECIALIZATION", ["device"]),
             _dim("tma", "bool", [False, True],
                  "SG_TUNED_TMA", ["device"]),
-            _dim("async_depth", "int", list(range(1, 17)),
+            # async_depth capped at the kernel clamp [1, 4]; see
+            # _ASYNC_DEPTH_MAX (was list(range(1, 17))).
+            _dim("async_depth", "int", list(range(1, _ASYNC_DEPTH_MAX + 1)),
                  "SG_TUNED_ASYNC_DEPTH", ["device"]),
-        ],
+        ]),
         "prefilter": {
             "register_pressure_max": 255,
             "smem_budget_bytes": entry.max_smem_per_block or 232448,
@@ -1588,7 +1723,7 @@ def _gfx942_full_space() -> Dict[str, Any]:
     arch_key = "gfx942"
     entry = ARCH_TABLE[arch_key]
     return {
-        "dims": [
+        "dims": _pin_dead_dims([
             _dim("block", "int", list(range(64, 1025, 64)),
                  "SG_TUNED_BLOCK_SIZE", ["host", "device"]),
             _dim("vec", "int", [1, 2, 4, 8],
@@ -1612,7 +1747,7 @@ def _gfx942_full_space() -> Dict[str, Any]:
                  ["default", "llvm", "iglp_max_throughput",
                   "iglp_max_throughput_v2", "iglp_gemm", "none"],
                  "SG_TUNED_SCHEDULER_HINT", ["device"]),
-        ],
+        ]),
         "prefilter": {
             # AMDGPU per-thread VGPR ceiling is 255, not 256.
             "register_pressure_max": 255,
@@ -1919,6 +2054,19 @@ def _canonical_arches() -> List[str]:
         seen_ids.add(id(entry))
         out.append(arch)
     return out
+
+
+def _arches_with_kernel_body() -> List[str]:
+    """Canonical arch keys whose ArchEntry ships a real kernel body.
+
+    Today this is exactly {sm_90a, gfx942}. Only these archs have committed
+    *.cu / *.hip.cpp bodies with arch-specific intrinsics; every other arch
+    falls back to a None/generic template, so its tuning configs all collapse
+    to the same generic binary and enumerating them just wastes the trial
+    budget. The default dry-run / tuning sweep restricts to this set; pass
+    ``include_bodyless=True`` (CLI: ``--include-bodyless``) to sweep the rest.
+    """
+    return [a for a in _canonical_arches() if ARCH_TABLE[a].has_kernel_body]
 
 
 def build_full_search_space() -> Dict[str, Any]:
@@ -2373,9 +2521,17 @@ def hash_space(space: Dict[str, Any], arch: str) -> str:
 
 
 def config_key(config: Dict[str, Any]) -> str:
-    """Compact, deterministic key — used as cache.variant_artifacts subkey."""
+    """Compact, deterministic key — used as cache.variant_artifacts subkey.
+
+    Dead tuning dims (``_DEAD_KEY_DIMS`` — macros no kernel consumes) are
+    EXCLUDED so two configs that differ only in a dead dim hash to the SAME
+    key and therefore collapse to one cache entry / one compile. This fixes
+    the false-cache-miss → full-recompile path the dead macros used to cause.
+    """
     parts = []
     for k in sorted(config.keys()):
+        if k in _DEAD_KEY_DIMS:
+            continue
         parts.append(f"{k}={_format_value(config[k])}")
     return "_".join(parts)
 
@@ -7403,10 +7559,17 @@ def _dry_run_all_archs(out_dir: Path,
                        enable_emitter: bool = False,
                        enable_device_pgo: bool = False,
                        strict_numerics: bool = False,
+                       include_bodyless: bool = False,
                        ) -> Dict[str, Dict]:
     """Run preflight + source-resolution + flag-emission for every CANONICAL
     arch in ARCH_TABLE. Aliases are skipped (they point at the same ArchEntry
     object as their canonical key — including both would duplicate work).
+
+    By default the sweep is restricted to arches that ship a real kernel body
+    (``ArchEntry.has_kernel_body`` — sm_90a + gfx942 today); bodyless arches
+    enumerate configs that all collapse to a None/generic template, so they
+    waste the sweep. Pass ``include_bodyless=True`` to sweep every canonical
+    arch (the previous behaviour).
 
     For each arch, writes ``<out_dir>/dry_run_<arch>.json`` AND returns a
     dict keyed by arch. The returned manifests carry the same payload as
@@ -7451,6 +7614,11 @@ def _dry_run_all_archs(out_dir: Path,
     for k, v in ARCH_TABLE.items():
         canonical_for.setdefault(id(v), k)
     canonical_archs = sorted(canonical_for.values())
+    # Gate out bodyless archs unless explicitly requested — they collapse to
+    # a generic template and only bloat the sweep.
+    if not include_bodyless:
+        with_body = set(_arches_with_kernel_body())
+        canonical_archs = [a for a in canonical_archs if a in with_body]
 
     manifests: Dict[str, Dict] = {}
     for arch in canonical_archs:
@@ -8032,7 +8200,20 @@ def _device_cflags(spec: BuildSpec,
         # fallback, splice it in here so older drivers can still JIT).
         gencodes = list(entry.nvcc_gencode)
         sm_num = entry.cutlass_arch
-        if (sm_num is not None
+        sass_only = _SASS_ONLY_GENCODE and entry.has_kernel_body
+        if sass_only:
+            # SASS-only mode (--sass-only) for a body-shipping arch: DROP every
+            # PTX-fallback gencode (code=compute_NN). The fatbin then carries
+            # only the target SASS — smaller, and no JIT-from-PTX on the exact
+            # SM. Safe only because this arch has a committed kernel body and
+            # the caller has asserted the deployment GPU. Skip the
+            # re-add-fallback block below.
+            dropped = [g for g in gencodes if ",code=compute_" in g]
+            gencodes = [g for g in gencodes if ",code=compute_" not in g]
+            for g in dropped:
+                _trace_add(trace, g, "skipped",
+                           "PTX fallback dropped (--sass-only)")
+        elif (sm_num is not None
                 and not any(",code=compute_" in g for g in gencodes)):
             extra_g = f"-gencode=arch=compute_{sm_num},code=compute_{sm_num}"
             gencodes.append(extra_g)
@@ -9610,11 +9791,56 @@ def _newer_compiler_flags(arch: str, report=None,
                              "skipping version-gated flags\n")
     elif entry.vendor == "hip":
         ver = _probe_hipcc_version()
-        if ver and report:
-            report.write(f"  [toolchain] HIP {ver[0]}.{ver[1]}\n")
-        elif report:
-            report.write("  [toolchain] hipcc not on PATH; "
-                         "skipping version-gated flags\n")
+        if ver:
+            if report:
+                report.write(f"  [toolchain] HIP {ver[0]}.{ver[1]}\n")
+            ver_str = f"{ver[0]}.{ver[1]}"
+            hipcc = shutil.which("hipcc")
+            # Stream 3: ROCm-version-gated AMDGPU LLVM knobs. These are the
+            # HIP analogue of the version-gated NVCC flags above — the base
+            # HIPCC_DEVICE_BASE list carries the always-safe -mllvm flags;
+            # these are gated on the detected ROCm version because older
+            # ROCm-LLVM rejects them. Each candidate is ALSO run through the
+            # ``_probe_flag_support`` front-end probe (when hipcc is on PATH)
+            # so a version gate that is too optimistic on a given install
+            # still can't inject a flag the local toolchain rejects — the
+            # no-ROCm path returns early above and is untouched.
+            #
+            # (flag-token, min ROCm (major, minor), human reason)
+            _hip_gated = [
+                # Scalarise provably-uniform global loads into SGPRs — frees
+                # VGPRs / boosts occupancy. Long-stable AMDGPU option;
+                # ROCm 5.0+ accepts the explicit ``=true`` spelling.
+                ("-mllvm --amdgpu-scalarize-global-loads=true", (5, 0),
+                 "uniform global loads → SGPR"),
+                # Aggressively re-materialise cheap defs near uses instead of
+                # spilling — measurable on register-heavy CDNA kernels.
+                # Present in ROCm 6.0+ LLVM.
+                ("-mllvm --amdgpu-enable-rematerialize=true", (6, 0),
+                 "remat cheap defs, fewer spills"),
+            ]
+            for flag_tok, min_ver, reason in _hip_gated:
+                fired = ver >= min_ver
+                if fired and hipcc:
+                    # Belt-and-suspenders: confirm the local hipcc actually
+                    # parses the flag before committing it to the build line.
+                    fired = _probe_flag_support(hipcc, flag_tok, "hip")
+                if fired:
+                    extra_device += flag_tok.split()
+                    if report:
+                        report.write(
+                            f"  [toolchain] enabling {flag_tok} "
+                            f"(ROCm ≥{min_ver[0]}.{min_ver[1]})\n")
+                _gate(flag_tok,
+                      f"{min_ver[0]}.{min_ver[1]}", fired,
+                      f"gated ROCm>={min_ver[0]}.{min_ver[1]}, have {ver_str}")
+        else:
+            if trace is not None:
+                trace.append(("version-gated hipcc flags", "skipped",
+                              "hipcc not on PATH"))
+            if report:
+                report.write("  [toolchain] hipcc not on PATH; "
+                             "skipping version-gated flags\n")
     return extra_host, extra_device
 
 
@@ -10414,6 +10640,17 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
             "stopper":     BayesianEarlyStopper | None,
         }
     """
+
+    # TODO(autotuner, higher-risk follow-up): the returned timer compiles each
+    # trial variant .so SERIALLY (one nvcc/hipcc invocation per config, inline
+    # in this closure). For Bayesian/Exhaustive sweeps the compile — not the
+    # timing — dominates wall-clock, so a build-pool that pre-compiles the next
+    # K candidate variants concurrently (ProcessPoolExecutor over the
+    # build-only step, then time the resulting .so files one-at-a-time on the
+    # single GPU) would be a large speedup. Left as a SEPARATE workstream: it
+    # touches cache-write concurrency, the TimingWorker handshake, and
+    # ninja-build-dir isolation, so it is intentionally NOT attempted as part
+    # of the search-budget cleanup. Do not half-wire a pool here.
 
     # ---- Pallas/TPU path: no .so, no worker — PallasTimer in-process. ----
     if get_arch_entry(spec.arch).vendor == "pallas":
@@ -12757,7 +12994,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # and the post-args-parse wiring). Python requires a single ``global``
     # declaration to precede every assignment in the function body, so
     # hoist it to the top.
-    global _FLAG_PROBE_DISABLED
+    global _FLAG_PROBE_DISABLED, _SASS_ONLY_GENCODE
     _argv = list(argv) if argv is not None else sys.argv[1:]
     if "--self-test" in _argv:
         if os.environ.get("GROK_NO_AUTO_INSTALL"):
@@ -12874,6 +13111,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         dry_parser.add_argument("--no-auto-install",
                                 dest="auto_install_optional_deps",
                                 action="store_false", default=True)
+        # Bodyless archs (everything but sm_90a + gfx942) are skipped by
+        # default; --include-bodyless restores the full-table sweep.
+        dry_parser.add_argument("--include-bodyless", action="store_true",
+                                dest="include_bodyless")
         dry_args, _ = dry_parser.parse_known_args(_argv)
         out_dir = Path(dry_args.out or REPO_ROOT / "build" / "compiled").resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -12889,7 +13130,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             raise
         except Exception:
             _dry_cfg = {}
-        manifests = _dry_run_all_archs(out_dir, config=_dry_cfg)
+        manifests = _dry_run_all_archs(
+            out_dir, config=_dry_cfg,
+            include_bodyless=bool(getattr(dry_args, "include_bodyless", False)))
         sys.stdout.write(
             f"[dry-run-all-archs] wrote {len(manifests)} manifests to {out_dir}\n")
         for arch in sorted(manifests):
@@ -12965,6 +13208,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="Cache file path (default: <out>/.compile_cache.json).")
     parser.add_argument("--report", type=Path, default=None,
                         help="Report file path (default: <out>/compile_<O>_<M>_<A>.txt)")
+    parser.add_argument("--sass-only", action="store_true", dest="sass_only",
+                        help="For archs that ship a kernel body (sm_90/gfx942) "
+                             "emit only code=sm_NN (drop the compute_NN PTX "
+                             "fallback) to shrink the fatbin and skip JIT. "
+                             "Unsafe for forward-compat onto newer GPUs; "
+                             "default keeps the PTX fallback.")
 
     # ── Runtime / phase ──────────────────────────────────────────────
     parser.add_argument("--runtime", choices=("aot", "jit", "both"),
@@ -13271,6 +13520,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     # exit branches bypass it; mirror the user's choice here so every CLI
     # entrypoint honours the flag uniformly.
     _set_auto_install(bool(getattr(args, "auto_install_optional_deps", True)))
+
+    # Wire the --sass-only toggle into the module global BEFORE any path
+    # that reaches _device_cflags (the gencode is recomputed there per build,
+    # so this takes effect for the actual compile line).
+    if getattr(args, "sass_only", False):
+        _SASS_ONLY_GENCODE = True
 
     # Agent-F2 — wire the --no-flag-probe global. Set BEFORE any path
     # that calls _device_cflags / _preflight_toolchain (every code branch
@@ -13796,15 +14051,19 @@ def _self_test_search_space(run) -> None:
             assert d["values"], f"dim {d['name']} has empty values list"
 
     def test_cartesian_counts():
-        """The COMPLETE space is huge — verify by counting product of value
-        list lengths, not by materializing the iterator (which would yield
-        billions of dicts)."""
+        """The space is large — verify by counting product of value list
+        lengths, not by materializing the iterator (which would yield millions
+        of dicts).
+
+        After the dead-dim pruning (only block/vec/unroll/maxrregcount +
+        async_depth/cluster_shape on Hopper expand the product; every dead
+        SG_TUNED macro is pinned to one value) the sm_90 live space is a few
+        million combos, not the ~3.7B of the old fully-dead-inflated space."""
         space = load_embedded_search_space()
         count = cartesian_count(space, "sm_90")
-        # Sanity bound — full sm_90 space should be at least 100 million combos
-        # and well under 10^12.
-        assert count > 100_000_000, f"sm_90 count too small: {count}"
-        assert count < 10**12, f"sm_90 count unreasonably large: {count}"
+        # Sanity bound — pruned sm_90 live space is in the low millions.
+        assert count > 1_000_000, f"sm_90 count too small: {count}"
+        assert count < 10**9, f"sm_90 count unreasonably large: {count}"
         # Iterator yields exactly that many items — verify on a tiny slice.
         it = cartesian(space, "sm_90")
         first_few = list(itertools.islice(it, 5))
@@ -13843,7 +14102,13 @@ def _self_test_search_space(run) -> None:
     def test_per_arch_search_space():
         """Stream 2: every canonical arch in ARCH_TABLE has a builder
         wired in, and its Cartesian product cardinality falls in the
-        arch-appropriate bounds (CUDA/HIP: 10^6..10^13; Pallas: 10..10^6)."""
+        arch-appropriate bounds.
+
+        Bounds reflect the dead-dim pruning: only the LIVE dims
+        (block/vec/unroll/maxrregcount, plus async_depth/cluster_shape on
+        Hopper+) expand the CUDA/HIP product now — the dead SG_TUNED macros
+        are each pinned to a single value — so the per-arch live space is
+        ~10^4..10^7, not the old ~10^6..10^13 dead-inflated range."""
         space = build_full_search_space()
         all_arches = _canonical_arches()
         assert len(all_arches) >= 20, f"only {len(all_arches)} canonical arches"
@@ -13852,7 +14117,7 @@ def _self_test_search_space(run) -> None:
             cnt = cartesian_count(space, arch)
             vendor = ARCH_TABLE[arch].vendor
             if vendor in ("cuda", "hip"):
-                assert 1_000_000 <= cnt <= 10**13, (
+                assert 10_000 <= cnt <= 10**8, (
                     f"{arch}: count {cnt} out of CUDA/HIP bounds")
             else:  # pallas
                 assert 10 <= cnt <= 10**6, (
@@ -13872,11 +14137,60 @@ def _self_test_search_space(run) -> None:
             assert space[alias] is space[canonical], (
                 f"alias {alias} doesn't share dict with {canonical}")
 
+    def test_dead_dims_pinned_and_collapsed():
+        """Dead tuning dims (SG_TUNED macros no kernel consumes) are pinned to
+        a single value in the search space AND excluded from config_key, so two
+        configs differing only in a dead dim collapse to one cache entry."""
+        space = build_full_search_space()
+        # Every dead dim in every CUDA/HIP arch is pinned to one value.
+        for arch in _canonical_arches():
+            if ARCH_TABLE[arch].vendor not in ("cuda", "hip"):
+                continue
+            for d in space[arch]["dims"]:
+                if _is_dead_dim(d):
+                    assert len(d["values"]) == 1, (
+                        f"{arch}/{d['name']}: dead dim not pinned "
+                        f"({len(d['values'])} values)")
+                    assert d.get("live") is False
+                else:
+                    assert d.get("live") is True, (
+                        f"{arch}/{d['name']}: live dim mismarked")
+        # config_key collapse demonstration: two configs that differ ONLY in a
+        # dead dim (swizzle) hash to the SAME key; differing in a LIVE dim
+        # (block) does not.
+        base = {"block": 128, "vec": 4, "unroll": 8, "swizzle": "none"}
+        only_dead_differs = {"block": 128, "vec": 4, "unroll": 8,
+                             "swizzle": "xor8"}
+        live_differs = {"block": 256, "vec": 4, "unroll": 8, "swizzle": "none"}
+        assert config_key(base) == config_key(only_dead_differs), (
+            "configs differing only in dead dim must collapse to one key")
+        assert config_key(base) != config_key(live_differs), (
+            "configs differing in a live dim must NOT collapse")
+        # The dead dim must not appear in the key at all.
+        assert "swizzle" not in config_key(base)
+        sys.stdout.write(
+            f"    [dead-dim] config_key(swizzle=none)  = {config_key(base)}\n"
+            f"    [dead-dim] config_key(swizzle=xor8)  = "
+            f"{config_key(only_dead_differs)}  (identical → collapses)\n")
+
+    def test_async_depth_capped_to_kernel_clamp():
+        """async_depth search dim is capped at the kernel clamp [1, 4]; values
+        5..16 used to force byte-identical recompiles."""
+        space = build_full_search_space()
+        for arch in ("sm_90a", "sm_100a"):
+            ad = next(d for d in space[arch]["dims"]
+                      if d["name"] == "async_depth")
+            assert max(ad["values"]) == _ASYNC_DEPTH_MAX == 4, (
+                f"{arch}: async_depth max {max(ad['values'])} != 4")
+
     run("load_yaml_validates_shape", test_load_yaml_validates_shape)
     run("load_yaml_rejects_duplicate_dim", test_load_yaml_rejects_duplicate_dim)
     run("embedded_yaml_loads", test_real_yaml_loads)
     run("cartesian_counts", test_cartesian_counts)
     run("prefilter_eliminates", test_prefilter_eliminates)
+    run("dead_dims_pinned_and_collapsed", test_dead_dims_pinned_and_collapsed)
+    run("async_depth_capped_to_kernel_clamp",
+        test_async_depth_capped_to_kernel_clamp)
     run("config_key_deterministic", test_config_key_deterministic)
     run("hash_space_stable", test_hash_space_stable)
     run("per_arch_search_space", test_per_arch_search_space)
@@ -16368,7 +16682,8 @@ def _self_test_portability(run) -> None:
                 "optimizers": {"enabled": []},
                 "models": {"enabled": []},
             }
-            manifests = _dry_run_all_archs(out_dir, config=cfg)
+            manifests = _dry_run_all_archs(out_dir, config=cfg,
+                                           include_bodyless=True)
             assert "sm_86" in manifests, sorted(manifests.keys())
             sm86 = manifests["sm_86"]
             # Pool of every -D macro across host + device cflags.
@@ -16971,9 +17286,13 @@ def _self_test_dry_run_all_archs(run) -> None:
 
     def test_dry_run_all_archs():
         """Every canonical arch produces a valid manifest with the right
-        -gencode / --offload-arch / preflight judgment."""
+        -gencode / --offload-arch / preflight judgment.
+
+        Uses ``include_bodyless=True`` so the sweep still covers every
+        canonical arch (the default sweep is gated to body-shipping arches —
+        see ``test_dry_run_default_gates_bodyless``)."""
         with tempfile.TemporaryDirectory() as td:
-            manifests = _dry_run_all_archs(Path(td))
+            manifests = _dry_run_all_archs(Path(td), include_bodyless=True)
             # Dedupe aliases — only canonical entries.
             seen = {}
             for k, v in ARCH_TABLE.items():
@@ -17006,6 +17325,19 @@ def _self_test_dry_run_all_archs(run) -> None:
                 assert payload["arch"] == arch
 
     run("dry_run_all_archs", test_dry_run_all_archs)
+
+    def test_dry_run_default_gates_bodyless():
+        """By default the sweep is restricted to arches that ship a real
+        kernel body (sm_90a + gfx942); bodyless arches are skipped unless
+        ``include_bodyless=True`` is passed."""
+        with tempfile.TemporaryDirectory() as td:
+            manifests = _dry_run_all_archs(Path(td))
+            got = set(manifests.keys())
+            assert got == {"sm_90a", "gfx942"}, (
+                f"default sweep should be body-shipping arches only, got {got}")
+            assert set(_arches_with_kernel_body()) == {"sm_90a", "gfx942"}
+
+    run("dry_run_default_gates_bodyless", test_dry_run_default_gates_bodyless)
 
     def test_dry_run_threads_feature_toggles():
         """_dry_run_all_archs must thread the opt-in feature toggles
@@ -21551,6 +21883,16 @@ def _try_synth_codegen(spec: "BuildSpec",
     # this dispatcher to pick e.g. fused_adam_grad_norm for clipped
     # variants. The selection lives here (not in synthesize_kernel) so
     # the synth library remains optimizer-agnostic.
+    #
+    # TODO(codegen, higher-risk follow-up): replace this single hardcoded
+    # ``adamw_update`` selection with a real per-(spec.optimizer) dispatcher
+    # (e.g. lion/adafactor/sgd → their own OpGraph patterns, clipped variants
+    # → fused_adam_grad_norm). Today every optimizer lowers through the
+    # adamw_update graph, so the synth path only produces a faithful kernel
+    # for AdamW; other optimizers silently fall back to the Jinja template.
+    # This is intentionally left as a separate workstream — wiring the real
+    # tensor-core GEMM emitter / per-optimizer graphs into prod is out of
+    # scope for the autotuner-budget cleanup. Do NOT half-implement here.
     pattern_name = "adamw_update"
     if pattern_name not in allowed:
         return None
