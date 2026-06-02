@@ -203,3 +203,19 @@ gate level; on-silicon execution/numerics 🟡):
   fuse tiers (🟡 estimates): 77 L3 / 22 L1 (was 53 / 46).
 - gfx942: DPP 13 files, MFMA 9 files, ATen 11 (host-orchestration only).
 - All perf/tier/numeric cells are 🟡 pending HARDWARE_VALIDATION.md.
+
+---
+
+## Phase 7 — final implementation-level cleanup (the codebase is now implementation-maximal)
+
+The architecture was already clean layering (`csrc/algorithms` = single optimizer-math source; `kernels/sm_90` = glue that `#include`s it; `csrc/fused` composes). Phase 7 closed the residual real gaps:
+
+| WS | change | verification |
+|----|--------|--------------|
+| W1 | deleted the dead `grokking_optimizers/kernels/tpu/` duplicate (16 files); redirected `_pallas_fused`'s 7 imports to the canonical pallas launchers | self-test 141/0; 0 remaining code imports of `kernels.tpu`. (pallas math ≠ bit-identical to the deleted dup for looksam/prodigy/muon/sg2 — dedup to the intended canonical path; TPU numerics 🟡) |
+| W2 | de-inlined grokadamw/neuralgrok/supergrok11 Adam math → new `<opt>_adam_tail` in `csrc/algorithms/` | bit-identical (expression-tree); 3 launch TUs nvcc -c COMPILE_OK |
+| W3 | hardened the drift guard with re-inline detection (not just missing-include) | passes clean; **triggers** on injected re-inline, then restores |
+| W4 | C++ `wired_fused_cell()` is now generator-emitted (`csrc/fused/fused_wired_cells.inc`) | dispatch.cpp COMPILE_OK; table = 99/99 cells, 0 drift |
+| W5 | vectorized all 11 gfx942 apply-steps to f32x4 (128-bit) + streaming stores | 14/14 gfx942 headers AMDGCN_OK; f32x4 apply in 11/11 |
+
+After Phase 7: implementation-maximal across all three arches; **only gap #7 (hardware validation) remains** for 🟡 → ✅.
