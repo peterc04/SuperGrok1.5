@@ -299,6 +299,106 @@ extern "C" __global__ void looksam_gfx942_sumsq_reduce(
     looksam_sumsq_block(g, acc, n);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// §5.2  LookSAM APPLY — per-element param/state update (elementwise, vectorized
+// only; NO DPP — the cross-lane ‖g‖/‖diff‖ reduction is §5 above and stays as-is).
+//
+// Once the reduction/scale is known, the apply forms the SAM-adjusted gradient
+//   g_adj = (1 - alpha)·g + alpha·sam_dir
+// then runs the AdamW EMAs + bias-corrected decoupled-weight-decay apply:
+//   m = beta1·m + (1-beta1)·g_adj ;  v = beta2·v + (1-beta2)·g_adj²
+//   update = (m/bc1)/(sqrt(v/bc2)+eps) ;  p = p - lr·(update + wd·p)
+// Math is verbatim from launch_looksam_apply()'s ATen body (bc1/bc2 un-inverted
+// → divide; sqrtf→__builtin_sqrtf).
+//
+// VECTORIZATION (WS5/B — scalar→f32x4): the fp32 path is bandwidth-bound, so the
+// bulk loop is widened to 128-bit (dwordx4) memory access. grad and sam_dir are
+// read-once via amd::streaming_load<f32x4>; exp_avg / exp_avg_sq are vector
+// load/stored; the param write-once goes through amd::streaming_store<f32x4>.
+// The 4 lanes each evaluate the IDENTICAL scalar expressions (uniform scalars
+// alpha/lr/beta1/beta2/bc1/bc2/eps/wd applied to all lanes), so the result is
+// BIT-IDENTICAL to the scalar path — only the access width changes. A scalar
+// TAIL handles the final N%4 (and the whole array on the fp32-only fallback).
+// ════════════════════════════════════════════════════════════════════════════
+
+// Per-element LookSAM apply — canonical scalar body, shared by the scalar tail
+// and (replicated lane-by-lane) the f32x4 fast-path so both are bit-identical.
+template <typename ParamT, typename GradT>
+__device__ __forceinline__ void looksam_apply_elem(
+    ParamT* __restrict__ param, float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq, const float* __restrict__ sam_dir,
+    const GradT* __restrict__ grad, int i, float alpha,
+    float lr, float beta1, float beta2, float eps, float wd, float bc1, float bc2)
+{
+    const float g     = static_cast<float>(amd::streaming_load(&grad[i]));
+    const float sd    = amd::streaming_load(&sam_dir[i]);
+    const float p     = static_cast<float>(param[i]);
+    const float g_adj = (1.0f - alpha) * g + alpha * sd;
+    const float m     = beta1 * exp_avg[i]    + (1.0f - beta1) * g_adj;
+    const float v     = beta2 * exp_avg_sq[i] + (1.0f - beta2) * g_adj * g_adj;
+    exp_avg[i]    = m;
+    exp_avg_sq[i] = v;
+    const float update = (m / bc1) / (__builtin_sqrtf(v / bc2) + eps);
+    amd::streaming_store(&param[i],
+                         static_cast<ParamT>(p - lr * (update + wd * p)));
+}
+
+template <typename ParamT, typename GradT>
+__global__ void looksam_gfx942_apply_kernel(
+    ParamT* __restrict__ param, float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq, const float* __restrict__ sam_dir,
+    const GradT* __restrict__ grad, float alpha,
+    float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2, int N)
+{
+    const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    const int tid    = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
+                       + static_cast<int>(threadIdx.x);
+
+    constexpr bool kVecOk =
+        sizeof(ParamT) == sizeof(float) && sizeof(GradT) == sizeof(float);
+    const int n4 = kVecOk ? (N >> 2) : 0;   // number of full float4 groups
+
+    using f32x4 = amd::f32x4;
+    auto* p4 = reinterpret_cast<f32x4*>(param);
+    auto* m4 = reinterpret_cast<f32x4*>(exp_avg);
+    auto* v4 = reinterpret_cast<f32x4*>(exp_avg_sq);
+    const auto* g4  = reinterpret_cast<const f32x4*>(grad);
+    const auto* sd4 = reinterpret_cast<const f32x4*>(sam_dir);
+
+    for (int q = tid; q < n4; q += stride) {
+        const f32x4 g  = amd::streaming_load(&g4[q]);   // 128-bit dwordx4 load
+        const f32x4 sd = amd::streaming_load(&sd4[q]);  // sam_dir vector-loaded
+        const f32x4 p  = p4[q];
+        const f32x4 ea = m4[q];
+        const f32x4 ev = v4[q];
+        f32x4 mo, vo, po;
+        for (int l = 0; l < 4; ++l) {
+            const float g_adj = (1.0f - alpha) * g[l] + alpha * sd[l];
+            const float m = beta1 * ea[l] + (1.0f - beta1) * g_adj;
+            const float v = beta2 * ev[l] + (1.0f - beta2) * g_adj * g_adj;
+            mo[l] = m;
+            vo[l] = v;
+            const float update = (m / bc1) / (__builtin_sqrtf(v / bc2) + eps);
+            po[l] = p[l] - lr * (update + wd * p[l]);
+        }
+        m4[q] = mo;
+        v4[q] = vo;
+        amd::streaming_store(&p4[q], po);               // 128-bit dwordx4 store
+    }
+
+    // SCALAR TAIL: the final N%4 elements (and the whole array on fp32 fallback).
+    for (int i = (n4 << 2) + tid; i < N; i += stride) {
+        looksam_apply_elem(param, exp_avg, exp_avg_sq, sam_dir, grad, i, alpha,
+                           lr, beta1, beta2, eps, wd, bc1, bc2);
+    }
+}
+
+// Force-instantiate the grokking dtype combo (fp32 param + fp32 grad).
+template __global__ void looksam_gfx942_apply_kernel<float, float>(
+    float*, float*, float*, const float*, const float*, float,
+    float, float, float, float, float, float, float, int);
+
 }}} // namespace sg::gfx942::native
 #endif  // (B) device pass
 

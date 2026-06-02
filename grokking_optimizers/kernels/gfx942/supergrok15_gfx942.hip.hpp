@@ -79,6 +79,17 @@ namespace prim = ::sg::gfx942::primitives;
 namespace native {
 extern "C" __global__ void supergrok15_gfx942_sharpness_reduce(
     const float* __restrict__ sharpness, float* __restrict__ acc, int n);
+// Per-element smart_grad + Adam apply (§5.APPLY; defined in section B below).
+// smart = g + gate_global*clamp(alpha_base*(1+mu),0,alpha_max)*mu, then the m/v
+// EMA + bias-corrected decoupled-WD apply. Vectorized to 128-bit (f32x4) memory
+// access with a scalar tail.
+template <typename ParamT, typename GradT>
+__global__ void supergrok15_gfx942_apply(
+    ParamT* __restrict__ param, float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq, const float* __restrict__ mu,
+    const GradT* __restrict__ grad, float gate, float alpha_base, float alpha_max,
+    float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2, int N);
 }  // namespace native
 #endif
 
@@ -301,6 +312,100 @@ extern "C" __global__ void supergrok15_gfx942_sharpness_reduce(
 {
     supergrok15_sharpness_block(sharpness, acc, n);
 }
+
+// ── §5.APPLY  per-element smart_grad + Adam apply (128-bit / f32x4 vectorized) ─
+// Per-coord alpha gate + smart_grad + Adam, BIT-IDENTICAL to the ATen host path
+// (launch_supergrok15_step + primitives.hpp):
+//   a_per_coord = clamp(alpha_base*(1+mu), 0, alpha_max)
+//   smart       = g + gate*a_per_coord*mu
+//   m   = beta1*m + (1-beta1)*smart
+//   v   = beta2*v + (1-beta2)*smart*smart
+//   m_hat = m/bc1 ; v_hat = v/bc2 ; denom = sqrt(v_hat)+eps
+//   p  -= lr*(m_hat/denom + wd*p)
+// `gate` (the sharpness-folded gate_global) is uniform; alpha_base/alpha_max are
+// scalars; the per-coordinate alpha is recomputed per element. Memory access
+// widens to 128-bit dwordx4 (f32x4 streaming_load/streaming_store on
+// param/exp_avg/exp_avg_sq/mu/grad); the scalar tail runs the identical math on
+// the n%4 remainder. Per-lane math, order, constants and __builtin_sqrtf are
+// unchanged from the scalar form — only the access width changes.
+using f32x4 = ::sg::gfx942::amdgcn::f32x4;
+
+__device__ __forceinline__ float sg15_clampf(float x, float lo, float hi) {
+    // Matches torch::clamp(x, lo, hi) element semantics.
+    return __builtin_fminf(__builtin_fmaxf(x, lo), hi);
+}
+
+// Identical per-element apply (used by both the f32x4 lanes and the scalar tail).
+__device__ __forceinline__ float sg15_apply_elem(
+    float* __restrict__ pp, float* __restrict__ pm, float* __restrict__ pv,
+    float mu_i, float g_i, float gate, float alpha_base, float alpha_max,
+    float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2)
+{
+    float a_per_coord = sg15_clampf(alpha_base * (1.0f + mu_i), 0.0f, alpha_max);
+    float smart = g_i + gate * a_per_coord * mu_i;
+    float m = beta1 * (*pm) + (1.0f - beta1) * smart;
+    float v = beta2 * (*pv) + (1.0f - beta2) * smart * smart;
+    *pm = m;
+    *pv = v;
+    float m_hat = m / bc1;
+    float v_hat = v / bc2;
+    float denom = __builtin_sqrtf(v_hat) + eps;
+    float update = m_hat / denom + wd * (*pp);
+    return (*pp) - lr * update;
+}
+
+template <typename ParamT, typename GradT>
+__global__ void supergrok15_gfx942_apply(
+    ParamT* __restrict__ param, float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq, const float* __restrict__ mu,
+    const GradT* __restrict__ grad, float gate, float alpha_base, float alpha_max,
+    float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2, int N)
+{
+    const int gtid   = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
+                       + static_cast<int>(threadIdx.x);
+    const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    const int n4     = N & ~3;   // largest multiple of 4 <= N
+
+    // Vectorized body: 4 contiguous floats / iter via f32x4 (128-bit access).
+    for (int base = gtid * 4; base < n4; base += stride * 4) {
+        f32x4 pv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(param + base));
+        f32x4 mv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(exp_avg + base));
+        f32x4 vv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(exp_avg_sq + base));
+        f32x4 uv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(mu + base));
+        f32x4 gv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(grad + base));
+        f32x4 ov4;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float pj = pv4[j], mj = mv4[j], vj = vv4[j];
+            ov4[j] = sg15_apply_elem(&pj, &mj, &vj, uv4[j], gv4[j], gate,
+                                     alpha_base, alpha_max,
+                                     lr, beta1, beta2, eps, wd, bc1, bc2);
+            mv4[j] = mj;
+            vv4[j] = vj;
+        }
+        amd::streaming_store(reinterpret_cast<f32x4*>(exp_avg + base), mv4);
+        amd::streaming_store(reinterpret_cast<f32x4*>(exp_avg_sq + base), vv4);
+        amd::streaming_store(reinterpret_cast<f32x4*>(param + base), ov4);
+    }
+
+    // Scalar tail: the n%4 remainder, identical per-element function.
+    for (int i = n4 + gtid; i < N; i += stride) {
+        float pi = param[i], mi = exp_avg[i], vi = exp_avg_sq[i];
+        float out = sg15_apply_elem(&pi, &mi, &vi, mu[i], grad[i], gate,
+                                    alpha_base, alpha_max,
+                                    lr, beta1, beta2, eps, wd, bc1, bc2);
+        exp_avg[i]    = mi;
+        exp_avg_sq[i] = vi;
+        param[i]      = out;
+    }
+}
+
+// Force-instantiate the <float,float> apply the host launcher dispatches.
+template __global__ void supergrok15_gfx942_apply<float, float>(
+    float*, float*, float*, const float*, const float*, float, float, float,
+    float, float, float, float, float, float, float, int);
 
 }}} // namespace sg::gfx942::native
 #endif  // (B) device pass

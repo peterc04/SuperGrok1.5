@@ -85,6 +85,16 @@ extern "C" __global__ void supergrok11_gfx942_cosine_reduce(
     const float* __restrict__ g, const float* __restrict__ m,
     float* __restrict__ num_acc, float* __restrict__ den_g_acc,
     float* __restrict__ den_m_acc, int n);
+// Per-element smart_grad + Adam apply (§5.APPLY; defined in section B below).
+// smart = g + (1-gate)*alpha*mu, then m/v EMA + bias-corrected decoupled-WD
+// apply. Vectorized to 128-bit (f32x4) memory access with a scalar tail.
+template <typename ParamT, typename GradT>
+__global__ void supergrok11_gfx942_apply(
+    ParamT* __restrict__ param, float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq, const float* __restrict__ mu,
+    const GradT* __restrict__ grad, float gate, float alpha,
+    float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2, int N);
 }  // namespace native
 #endif
 
@@ -155,10 +165,31 @@ void launch_supergrok11_step(
 #endif
 
         // Sweep B: smart_grad + Adam
+#if defined(__HIPCC__)
+        // LIVE device path: the §5.APPLY f32x4-vectorized smart_grad + Adam
+        // kernel fuses smart=g+(1-gate)*alpha*mu, the m/v EMAs, and the bias-
+        // corrected decoupled-WD apply into ONE launch (128-bit dwordx4 access).
+        {
+            auto gfc = gf.contiguous();
+            auto muc = mu.to(torch::kFloat32).contiguous();
+            int n = static_cast<int>(gfc.numel());
+            if (n > 0) {
+                hipStream_t stream = at::hip::getCurrentHIPStream();
+                dim3 grid(std::min(1024, (n + 255) / 256)), block(256);
+                hipLaunchKernelGGL((native::supergrok11_gfx942_apply<float, float>),
+                                   grid, block, 0, stream,
+                                   p.data_ptr<float>(), m.data_ptr<float>(),
+                                   v.data_ptr<float>(), muc.data_ptr<float>(),
+                                   gfc.data_ptr<float>(), gate, alpha,
+                                   lr, beta1, beta2, eps, wd, bc1, bc2, n);
+            }
+        }
+#else
         auto smart = gf + (1.0f - gate) * alpha * mu;
         prim::ema_update_inplace(m, smart, beta1);
         prim::ema_sq_update_inplace(v, smart, beta2);
         prim::adam_apply_inplace(p, m, v, lr, bc1, bc2, eps, wd);
+#endif
     }
 }
 
@@ -381,6 +412,89 @@ extern "C" __global__ void supergrok11_gfx942_cosine_reduce(
 {
     supergrok11_cosine_block(g, m, num_acc, den_g_acc, den_m_acc, n);
 }
+
+// ── §5.APPLY  per-element smart_grad + Adam apply (128-bit / f32x4 vectorized) ─
+// smart = g + (1-gate)*alpha*mu, then the m/v EMA + bias-corrected decoupled-WD
+// apply — BIT-IDENTICAL to the ATen host path (primitives.hpp):
+//   m   = beta1*m + (1-beta1)*smart
+//   v   = beta2*v + (1-beta2)*smart*smart
+//   m_hat = m/bc1 ; v_hat = v/bc2 ; denom = sqrt(v_hat)+eps
+//   p  -= lr*(m_hat/denom + wd*p)
+// The reduced `gate` is uniform (host-computed); alpha is a scalar. Memory access
+// widens to 128-bit dwordx4 (f32x4 streaming_load / streaming_store on
+// param/exp_avg/exp_avg_sq/mu/grad); the scalar tail runs the identical math on
+// the n%4 remainder. Per-lane math, order, constants and __builtin_sqrtf are
+// unchanged from the scalar form — only the access width changes.
+using f32x4 = ::sg::gfx942::amdgcn::f32x4;
+
+// Identical per-element apply (used by both the f32x4 lanes and the scalar tail).
+__device__ __forceinline__ float sg11_apply_elem(
+    float* __restrict__ pp, float* __restrict__ pm, float* __restrict__ pv,
+    float mu_i, float g_i, float gate, float alpha,
+    float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2)
+{
+    float smart = g_i + (1.0f - gate) * alpha * mu_i;
+    float m = beta1 * (*pm) + (1.0f - beta1) * smart;
+    float v = beta2 * (*pv) + (1.0f - beta2) * smart * smart;
+    *pm = m;
+    *pv = v;
+    float m_hat = m / bc1;
+    float v_hat = v / bc2;
+    float denom = __builtin_sqrtf(v_hat) + eps;
+    float update = m_hat / denom + wd * (*pp);
+    return (*pp) - lr * update;
+}
+
+template <typename ParamT, typename GradT>
+__global__ void supergrok11_gfx942_apply(
+    ParamT* __restrict__ param, float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq, const float* __restrict__ mu,
+    const GradT* __restrict__ grad, float gate, float alpha,
+    float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2, int N)
+{
+    const int gtid   = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
+                       + static_cast<int>(threadIdx.x);
+    const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    const int n4     = N & ~3;   // largest multiple of 4 <= N
+
+    // Vectorized body: 4 contiguous floats / iter via f32x4 (128-bit access).
+    for (int base = gtid * 4; base < n4; base += stride * 4) {
+        f32x4 pv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(param + base));
+        f32x4 mv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(exp_avg + base));
+        f32x4 vv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(exp_avg_sq + base));
+        f32x4 uv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(mu + base));
+        f32x4 gv4 = amd::streaming_load(reinterpret_cast<const f32x4*>(grad + base));
+        f32x4 ov4;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float pj = pv4[j], mj = mv4[j], vj = vv4[j];
+            ov4[j] = sg11_apply_elem(&pj, &mj, &vj, uv4[j], gv4[j], gate, alpha,
+                                     lr, beta1, beta2, eps, wd, bc1, bc2);
+            mv4[j] = mj;
+            vv4[j] = vj;
+        }
+        amd::streaming_store(reinterpret_cast<f32x4*>(exp_avg + base), mv4);
+        amd::streaming_store(reinterpret_cast<f32x4*>(exp_avg_sq + base), vv4);
+        amd::streaming_store(reinterpret_cast<f32x4*>(param + base), ov4);
+    }
+
+    // Scalar tail: the n%4 remainder, identical per-element function.
+    for (int i = n4 + gtid; i < N; i += stride) {
+        float pi = param[i], mi = exp_avg[i], vi = exp_avg_sq[i];
+        float out = sg11_apply_elem(&pi, &mi, &vi, mu[i], grad[i], gate, alpha,
+                                    lr, beta1, beta2, eps, wd, bc1, bc2);
+        exp_avg[i]    = mi;
+        exp_avg_sq[i] = vi;
+        param[i]      = out;
+    }
+}
+
+// Force-instantiate the <float,float> apply the host launcher dispatches.
+template __global__ void supergrok11_gfx942_apply<float, float>(
+    float*, float*, float*, const float*, const float*, float, float,
+    float, float, float, float, float, float, float, int);
 
 }}} // namespace sg::gfx942::native
 #endif  // (B) device pass

@@ -386,6 +386,112 @@ extern "C" __global__ void prodigy_gfx942_rs_reduce(
     prodigy_rs_block(g, p, p_init, r_acc, s_acc, d_prev, n);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// §5.2  Prodigy APPLY — per-element param/state update (elementwise, vectorized
+// only; NO DPP — the cross-lane r/s reduction is §5 above and stays as-is).
+//
+// Once the d-factor d_val = max(d_prev, r/(|s|+1e-12)) is known (host-reduced
+// from the §5 r/s sums), the apply scales the gradient by d_val and runs the
+// Adam EMAs + bias-corrected decoupled-weight-decay apply with d_val as the
+// effective lr, plus the s-track accumulator:
+//   g_s = d_val·g
+//   m   = beta1·m + (1-beta1)·g_s ;  v = beta2·v + (1-beta2)·g_s²
+//   st  = st + d_val·g
+//   update = (m/bc1)/(sqrt(v/bc2)+eps) ;  p = p - d_val·(update + wd·p)
+// Math is verbatim from launch_prodigy_step()'s ATen body (ema_update_inplace,
+// ema_sq_update_inplace, s_track add_, adam_apply_inplace with lr=d_val;
+// bc1/bc2 un-inverted → divide; sqrtf→__builtin_sqrtf).
+//
+// VECTORIZATION (WS5/B — scalar→f32x4): the fp32 path is bandwidth-bound, so the
+// bulk loop is widened to 128-bit (dwordx4) memory access. grad is read-once via
+// amd::streaming_load<f32x4>; exp_avg / exp_avg_sq / s_track are vector
+// load/stored; the param write-once goes through amd::streaming_store<f32x4>.
+// The 4 lanes each evaluate the IDENTICAL scalar expressions (uniform scalars
+// d_val/beta1/beta2/bc1/bc2/eps/wd applied to all lanes), so the result is
+// BIT-IDENTICAL to the scalar path — only the access width changes. A scalar
+// TAIL handles the final N%4 (and the whole array on the fp32-only fallback).
+// ════════════════════════════════════════════════════════════════════════════
+
+// Per-element Prodigy apply — canonical scalar body, shared by the scalar tail
+// and (replicated lane-by-lane) the f32x4 fast-path so both are bit-identical.
+template <typename ParamT, typename GradT>
+__device__ __forceinline__ void prodigy_apply_elem(
+    ParamT* __restrict__ param, float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq, float* __restrict__ s_track,
+    const GradT* __restrict__ grad, int i, float d_val,
+    float beta1, float beta2, float eps, float wd, float bc1, float bc2)
+{
+    const float g   = static_cast<float>(amd::streaming_load(&grad[i]));
+    const float p   = static_cast<float>(param[i]);
+    const float g_s = d_val * g;
+    const float m   = beta1 * exp_avg[i]    + (1.0f - beta1) * g_s;
+    const float v   = beta2 * exp_avg_sq[i] + (1.0f - beta2) * g_s * g_s;
+    exp_avg[i]    = m;
+    exp_avg_sq[i] = v;
+    s_track[i]    = s_track[i] + d_val * g;
+    const float update = (m / bc1) / (__builtin_sqrtf(v / bc2) + eps);
+    amd::streaming_store(&param[i],
+                         static_cast<ParamT>(p - d_val * (update + wd * p)));
+}
+
+template <typename ParamT, typename GradT>
+__global__ void prodigy_gfx942_apply_kernel(
+    ParamT* __restrict__ param, float* __restrict__ exp_avg,
+    float* __restrict__ exp_avg_sq, float* __restrict__ s_track,
+    const GradT* __restrict__ grad, float d_val,
+    float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2, int N)
+{
+    const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    const int tid    = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
+                       + static_cast<int>(threadIdx.x);
+
+    constexpr bool kVecOk =
+        sizeof(ParamT) == sizeof(float) && sizeof(GradT) == sizeof(float);
+    const int n4 = kVecOk ? (N >> 2) : 0;   // number of full float4 groups
+
+    using f32x4 = amd::f32x4;
+    auto* p4 = reinterpret_cast<f32x4*>(param);
+    auto* m4 = reinterpret_cast<f32x4*>(exp_avg);
+    auto* v4 = reinterpret_cast<f32x4*>(exp_avg_sq);
+    auto* s4 = reinterpret_cast<f32x4*>(s_track);
+    const auto* g4 = reinterpret_cast<const f32x4*>(grad);
+
+    for (int q = tid; q < n4; q += stride) {
+        const f32x4 g  = amd::streaming_load(&g4[q]);   // 128-bit dwordx4 load
+        const f32x4 p  = p4[q];
+        const f32x4 ea = m4[q];
+        const f32x4 ev = v4[q];
+        const f32x4 st = s4[q];
+        f32x4 mo, vo, so, po;
+        for (int l = 0; l < 4; ++l) {
+            const float g_s = d_val * g[l];
+            const float m = beta1 * ea[l] + (1.0f - beta1) * g_s;
+            const float v = beta2 * ev[l] + (1.0f - beta2) * g_s * g_s;
+            mo[l] = m;
+            vo[l] = v;
+            so[l] = st[l] + d_val * g[l];
+            const float update = (m / bc1) / (__builtin_sqrtf(v / bc2) + eps);
+            po[l] = p[l] - d_val * (update + wd * p[l]);
+        }
+        m4[q] = mo;
+        v4[q] = vo;
+        s4[q] = so;
+        amd::streaming_store(&p4[q], po);               // 128-bit dwordx4 store
+    }
+
+    // SCALAR TAIL: the final N%4 elements (and the whole array on fp32 fallback).
+    for (int i = (n4 << 2) + tid; i < N; i += stride) {
+        prodigy_apply_elem(param, exp_avg, exp_avg_sq, s_track, grad, i, d_val,
+                           beta1, beta2, eps, wd, bc1, bc2);
+    }
+}
+
+// Force-instantiate the grokking dtype combo (fp32 param + fp32 grad).
+template __global__ void prodigy_gfx942_apply_kernel<float, float>(
+    float*, float*, float*, float*, const float*, float,
+    float, float, float, float, float, float, int);
+
 }}} // namespace sg::gfx942::native
 #endif  // (B) device pass
 
