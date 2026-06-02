@@ -343,16 +343,25 @@ def _ensure_optional_dep(pkg: str, feature: str,
 
 
 # Module-level switch. Set by ``build()`` / CLI from the BuildSpec field
-# of the same name BEFORE any feature-gated import runs. Defaults to
-# True so the README quickstart works for a user who enables a feature
-# without pre-installing every soft dep. ``--no-auto-install`` (CLI) or
-# ``BuildSpec(auto_install_optional_deps=False)`` flips this off for CI
-# / offline / air-gapped builds.
-_AUTO_INSTALL_OPTIONAL_DEPS: bool = True
+# of the same name BEFORE any feature-gated import runs. Auto-install is
+# OPT-IN (Phase 8, supply-chain hygiene): it shells out to ``pip install``,
+# so it stays OFF unless the operator explicitly opts in. Enable via
+# ``GROK_AUTO_INSTALL=1`` (env), ``--auto-install`` (CLI), or
+# ``BuildSpec(auto_install_optional_deps=True)``. ``GROK_NO_AUTO_INSTALL=1``
+# is a hard override-off (wins over every opt-in).
+_AUTO_INSTALL_OPTIONAL_DEPS: bool = False
+
+_TRUTHY = ("1", "true", "TRUE", "True", "yes", "on")
 
 
 def _auto_install_enabled() -> bool:
-    """Read the process-wide auto-install switch."""
+    """Auto-install is opt-in. Env override order: NO_AUTO_INSTALL (hard off)
+    > AUTO_INSTALL (on) > the process-wide switch set by build()/CLI/BuildSpec."""
+    import os
+    if os.environ.get("GROK_NO_AUTO_INSTALL", "").strip() in _TRUTHY:
+        return False
+    if os.environ.get("GROK_AUTO_INSTALL", "").strip() in _TRUTHY:
+        return True
     return bool(_AUTO_INSTALL_OPTIONAL_DEPS)
 
 
@@ -6297,7 +6306,10 @@ class BuildSpec:
     # into _ensure_optional_dep via _set_auto_install() at the top of
     # ``build()`` so every feature site (NVRTC, jinja2 emitter,
     # learned cost model, polyhedral / libclang) sees the same switch.
-    auto_install_optional_deps: bool = True
+    # OPT-IN (Phase 8): defaults False so a build never shells out to
+    # ``pip install`` unless the operator asks (--auto-install / this field /
+    # GROK_AUTO_INSTALL=1).
+    auto_install_optional_deps: bool = False
 
 
 def _ensure_nvcc_on_path() -> Optional[str]:
@@ -12356,7 +12368,7 @@ def build(
     enable_synth_codegen: bool = True,
     enable_polyhedral: bool = True,
     enable_cost_model: bool = True,
-    auto_install_optional_deps: bool = True,
+    auto_install_optional_deps: bool = False,
 ) -> Optional[Path]:
     """In-process orchestrator. ``main`` handles subprocess split.
 
