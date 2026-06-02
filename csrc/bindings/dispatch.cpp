@@ -15,6 +15,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -79,12 +80,28 @@ int detect_arch_from_device() {
  cudaGetErrorString(err));
  }
  int sm = major * 10 + minor;
- // Any modern NVIDIA device routes to the sm90 impl; the driver loads the
- // matching per-SM SASS (or JITs from the embedded PTX) out of the fat binary.
- if (sm >= 70) return 90;
+ // ARCH-HONEST DISPATCH (Stage 4): route per the REAL compute capability,
+ // not "any NVIDIA -> 90". The shipped device code has ONE NVIDIA kernel
+ // BODY: the sm_90a Hopper impl (TMA / wgmma — instructions that do not
+ // exist on Ampere/Ada). setup.py emits SASS for every CC the toolchain
+ // accepts plus a PTX fallback, but that PTX is lowered from sm_90a-gated
+ // source, so it cannot JIT-forward to sm_80/sm_86/sm_89 — an A100 routed
+ // to the sm_90a path would hit an illegal-instruction fault (or worse,
+ // undefined behavior), not a clean error.
+ //
+ // POLICY: LOUD-GATE. We accept the Hopper family (sm_90 / sm_90a, i.e.
+ // major == 9) and route it to impl 90. Every other NVIDIA CC fails loudly
+ // here. This is the truthful option because only sm_90a has a real kernel
+ // body — there is no sm_80/sm_86/sm_89 impl to route to. If a per-CC body
+ // is ever added, give it its own selector value and a case here.
+ if (major == 9) return 90;  // Hopper (sm_90 / sm_90a)
  throw std::runtime_error(
  "Detected sm_" + std::to_string(sm) +
- " (compute capability < 7.0); below the minimum supported NVIDIA arch.");
+ ": no kernel body for this NVIDIA compute capability. The shipped "
+ "device code has only the sm_90a (Hopper) body, whose TMA/wgmma "
+ "instructions are not valid on this arch and cannot be JIT-forwarded "
+ "from the embedded PTX. Supported: sm_90a (NVIDIA), gfx942 (AMD). "
+ "Set FORCE_ARCH=sm_90 only on a real Hopper device.");
 #elif defined(WITH_HIP)
  int dev = 0;
  hipError_t err = hipGetDevice(&dev);
@@ -102,12 +119,19 @@ int detect_arch_from_device() {
  std::string arch_name = prop.gcnArchName; // e.g. "gfx942:sramecc+:xnack-"
  auto colon = arch_name.find(':');
  if (colon != std::string::npos) arch_name = arch_name.substr(0, colon);
- // Any AMD gfx device routes to the gfx942 impl; the offload-compiled fat
- // binary carries the matching per-gfx code object.
- if (arch_name.rfind("gfx", 0) == 0) return 942;
+ // ARCH-HONEST DISPATCH (Stage 4), AMD twin of the NVIDIA loud-gate above.
+ // The shipped AMD device code has ONE body: the gfx942 (CDNA3) impl. A
+ // gfx906/gfx908/gfx90a/gfx1100 device routed to the gfx942 code object
+ // would run an incompatible ISA. setup.py offload-compiles for every gfx
+ // the toolchain accepts, but the kernel BODY is gfx942-specific, so route
+ // only a real gfx942 to impl 942 and fail loudly otherwise.
+ // POLICY: LOUD-GATE (only gfx942 has a body).
+ if (arch_name == "gfx942") return 942;
  throw std::runtime_error(
  "Detected " + arch_name +
- "; not a recognized AMD gfx target.");
+ ": no kernel body for this AMD gfx target. The shipped device code "
+ "has only the gfx942 (CDNA3 / MI300X) body. Supported: sm_90a "
+ "(NVIDIA), gfx942 (AMD).");
 #else
  throw std::runtime_error(
  "No GPU backend compiled in. Build with WITH_CUDA or WITH_HIP.");
@@ -219,7 +243,7 @@ struct FusedScratch {
 
 // Keyed by (device_index, n). n disambiguates differing param shapes on the
 // same device; acts is sized to params.numel() (== n here, single flat tensor).
-inline FusedScratch& fused_scratch_for(const torch::Tensor& params, int n) {
+inline FusedScratch& fused_scratch_for(const torch::Tensor& params, int64_t n) {
  static std::unordered_map<long long, FusedScratch> cache;
  const long long dev_idx =
  params.device().is_cuda() ? static_cast<long long>(params.device().index())
@@ -275,7 +299,13 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // here; the host launcher pins one CTA per SM. `state` carries the
  // optimizer state slices (m, v) concatenated; sizes/offsets describe the
  // per-parameter-tensor layout (here the single flattened tensor).
- const int n = static_cast<int>(params.numel());
+ //
+ // Keep the element count in int64 at this boundary: a large flat param
+ // ( > 2^31-1 elements ) truncated to `int` would wrap negative, making
+ // the `3*n` state-size check pass spuriously and the `m + n` / `m + 2*n`
+ // pointer offsets index out of bounds (silent OOB corruption). The
+ // numel-derived state check and pointer math below all use this int64 n.
+ const int64_t n = params.numel();
 
  // Reusable per-(device,n) scratch: counters/acts reset, sizes/offsets fixed.
  FusedScratch& sc = fused_scratch_for(params, n);
@@ -302,11 +332,22 @@ void fused_step(const std::string& model, const std::string& optimizer,
  float* v = m + n;
  float* extra = m + 2 * n;
 
+ // The megakernel ABI (PersistentContext.n_tasks, the int32 sizes/offsets
+ // tensors) is 32-bit per the layout-identical mirror struct and the
+ // generated launchers. The fused indices are being widened by the fused
+ // agent; until the device-side N is int64, fail loudly rather than feed a
+ // truncated count into the kernel (which would silently process the wrong
+ // task range). This gate fires only for params with > 2^31-1 elements.
+ TORCH_CHECK(n <= static_cast<int64_t>(std::numeric_limits<int>::max()),
+ "fused_step: param has ", n, " elements, exceeding the int32 "
+ "megakernel ABI (PersistentContext.n_tasks / sizes / offsets). "
+ "Use the per-op path for params with > 2^31-1 elements.");
+
  fused::sm90::PersistentContext ctx{
  sc.g_next.data_ptr<int>(),
  reinterpret_cast<unsigned*>(sc.g_arrived.data_ptr<int>()),
  reinterpret_cast<unsigned*>(sc.g_generation.data_ptr<int>()),
- n, 0u};
+ static_cast<int>(n), 0u};
 
  // Use the current CUDA stream so the megakernel orders against the rest of
  // the model's work and is capturable in a CUDA graph (the legacy default
@@ -335,7 +376,10 @@ void fused_step(const std::string& model, const std::string& optimizer,
 #if defined(WITH_HIP)
  if (arch == 942) {
  // gfx942 real composition route (hipcc/MI300X). Mirror of the sm_90 path.
- const int n = static_cast<int>(params.numel());
+ // int64 element count at the boundary (see the sm_90 path for rationale):
+ // a truncated `int` numel would wrap negative and make the 3*n check and
+ // m+n/m+2*n pointer math index out of bounds.
+ const int64_t n = params.numel();
  FusedScratch& sc = fused_scratch_for(params, n);
  auto p = params.data_ptr<float>();
  auto in = input.numel() ? input.data_ptr<float>() : p;
@@ -349,11 +393,15 @@ void fused_step(const std::string& model, const std::string& optimizer,
  }
  float* m = state.data_ptr<float>();
  float* v = m + n; float* extra = m + 2 * n;
+ // int32 megakernel ABI gate (mirror of the sm_90 path).
+ TORCH_CHECK(n <= static_cast<int64_t>(std::numeric_limits<int>::max()),
+ "fused_step: param has ", n, " elements, exceeding the int32 "
+ "megakernel ABI. Use the per-op path for > 2^31-1 elements.");
  fused::gfx942_mega::PersistentContext ctx{
  sc.g_next.data_ptr<int>(),
  reinterpret_cast<unsigned*>(sc.g_arrived.data_ptr<int>()),
  reinterpret_cast<unsigned*>(sc.g_generation.data_ptr<int>()),
- n, 0u};
+ static_cast<int>(n), 0u};
  // Current HIP stream for graph capture / proper ordering (was default 0).
  hipStream_t stream = c10::hip::getCurrentHIPStream().stream();
  bool found = false;
