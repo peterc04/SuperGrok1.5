@@ -172,19 +172,38 @@ fused cells).
 ## 6. Verification (this environment — no accelerator)
 
 ```bash
+# The end-all-be-all: prove the modular composition compiles AND runs maximally.
+python -m grokking_optimizers.verify_all                # 152/152, all phases
+python -m grokking_optimizers.verify_all --phase 4      # just MAXIMALITY (fast)
+python -m grokking_optimizers.verify_all --quick        # skip the 99 compiles
+
+# The individual gates verify_all orchestrates:
 python -m grokking_optimizers.compile --self-test     # 156 passed, 0 failed
 ruff check grokking_optimizers/ && ruff format --check grokking_optimizers/
 python scripts/check_math_single_source.py            # drift guard (exit 0)
 scripts/amdgcn_check.sh --header <gfx942 header>       # clang AMDGPU device gate
+scripts/amdgcn_check.sh --cell <gfx942 mega_*.hip>     # full composed-cell gate
 scripts/compile_to_object.sh <tu>.cu -DWITH_CUTLASS    # nvcc -c sm_90a
 ```
 
-System-verified (Phase 5/6): self-test **156/0**; ruff clean; **15/15** gfx942
-headers AMDGCN_OK (11 optimizer + 4 model/attention); **99/99** cells emit real
-compositions and are 5-way
-consistent (canonical file ↔ solver tier ↔ cell comment ↔ dispatch route ↔
-status table); anti-false-positive sweep = **0**; the math-drift guard passes
-and **provably triggers** on injected divergence.
+**`verify_all` is the single authoritative gate.** It runs six phases: (0)
+toolchain probe, (1) structural inventory, (2) single-component compile gates,
+(3) **MODULAR COMPOSITION** — every optimizer compiles *together with* every
+model across all **99 fused cells** (33 sm_90 via `nvcc -c`, 33 gfx942 via the
+AMDGCN device gate, 33 tpu_v6e via `jax` trace+lower), (4) **MAXIMALITY** —
+every cell at its max feasible fusion tier, codegen idempotency (all 99 cells
+byte-identical to the generator), register+smem budget, math single-source
+drift, (5) cross-validation — dispatch tables match their generators, self-test,
+ruff, the utilization crash-hard contract. Anything needing absent hardware is
+reported `SKIP-silicon`, never a false green.
+
+System-verified: `verify_all` **152/152, 0 fail** — self-test **156/0**; ruff
+clean; **17/17** gfx942 headers + **33/33** gfx942 fused cells AMDGCN_OK;
+**33/33** sm_90 cells `nvcc -c` OK; **33/33** tpu_v6e cells trace+lower OK;
+**99/99** cells byte-idempotent vs the generator and 5-way consistent (canonical
+file ↔ solver tier ↔ cell comment ↔ dispatch route ↔ status table); fusion-tier
+map sm_90 **L3×33** / gfx942 **L3×11 + L1×22** / tpu_v6e **L3×33**; the
+math-drift guard passes and **provably triggers** on injected divergence.
 
 ### Observability — device utilization across all 33 pipelines per arch
 
