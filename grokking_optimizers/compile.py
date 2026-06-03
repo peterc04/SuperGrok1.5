@@ -1213,14 +1213,73 @@ _LIVE_TUNING_DIMS: frozenset = frozenset({
 _ASYNC_DEPTH_MAX: int = 4
 
 
+_KERNEL_MACRO_CACHE: Optional[frozenset] = None
+
+
+def _kernel_source_macros() -> frozenset:
+    """Auto-detect which ``SG_TUNED_*`` macros the committed kernel bodies
+    actually read. Scans the device-source trees (csrc/ + kernels/) once
+    (cached) and returns the set of macro tokens found. The search-space builder
+    uses this to decide which tuning dims are LIVE — so the space self-adjusts to
+    whatever the kernels honor, instead of relying on a hand-maintained
+    producer→consumer audit that drifts the moment a kernel gains or loses an
+    ``#ifdef``.
+
+    Returns an EMPTY set if no source tree is visible (e.g. an installed wheel
+    without csrc/); callers then fall back to the hardcoded floor.
+    """
+    global _KERNEL_MACRO_CACHE
+    if _KERNEL_MACRO_CACHE is not None:
+        return _KERNEL_MACRO_CACHE
+    import re as _re
+    roots = [REPO_ROOT / "csrc", REPO_ROOT / "grokking_optimizers" / "kernels"]
+    pat = _re.compile(r"SG_TUNED_[A-Z0-9_]+")
+    exts = {".cu", ".cuh", ".h", ".hpp", ".hip", ".cpp", ".cc", ".cxx"}
+    found: set = set()
+    for root in roots:
+        if not root.exists():
+            continue
+        for p in root.rglob("*"):
+            if p.suffix in exts:
+                try:
+                    found.update(pat.findall(p.read_text(errors="ignore")))
+                except OSError:
+                    continue
+    _KERNEL_MACRO_CACHE = frozenset(found)
+    return _KERNEL_MACRO_CACHE
+
+
 def _is_dead_dim(spec: Dict[str, Any]) -> bool:
     """True if ``spec`` is a tuning dim whose value never reaches the binary.
 
-    Pallas kwargs and live dims are never dead; everything else (the dead
-    SG_TUNED_* macros) is.
+    A dim is LIVE (not dead) when sweeping it actually changes the emitted
+    machine code; otherwise sweeping it just burns compiles on byte-identical
+    binaries. The determination is AUTO-DERIVED from the committed kernel
+    sources, so the search space tracks the kernels' real tuning surface no
+    matter what is being compiled (rather than a hand-maintained list that can
+    silently go stale when a kernel adds or drops an ``#ifdef SG_TUNED_*``):
+
+      * Pallas kwargs are arguments to ``pl.pallas_call`` — always live.
+      * A bare compiler flag (``macro is None``, e.g. ``maxrregcount`` →
+        ``--maxrregcount=N``) always changes ptxas codegen — always live.
+      * A ``-DSG_TUNED_*`` macro dim is live iff some committed kernel actually
+        reads that macro (see :func:`_kernel_source_macros`). The hardcoded
+        ``_LIVE_TUNING_DIMS`` is only a defensive floor for the (degenerate)
+        case where the source scan finds nothing — e.g. a bodyless registry.
     """
     if spec.get("kind") == "pallas_kwarg":
         return False
+    macro = spec.get("macro")
+    if macro is None:
+        return False  # real compiler flag (maxrregcount) — always affects code
+    detected = _kernel_source_macros()
+    if detected:
+        # Live iff the kernels read this macro (exact, or a derived variant
+        # like SG_TUNED_CLUSTER_SHAPE_VOLUME for SG_TUNED_CLUSTER_SHAPE).
+        live = macro in detected or any(t.startswith(macro + "_")
+                                        for t in detected)
+        return not live
+    # Source scan empty (no kernel tree visible) — fall back to the floor set.
     return spec.get("name") not in _LIVE_TUNING_DIMS
 
 
