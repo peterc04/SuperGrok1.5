@@ -92,6 +92,17 @@ elif [ "${1:-}" = "--cell" ]; then
   # the bare amdgcn target — __HIPCC__ is undefined here).
   CELL="${2:?usage: amdgcn_check.sh --cell <cell.hip>}"
   clang "${FLAGS[@]}" -x c++ -c "$CELL" -o /dev/null 2> "$LOG"
+elif [ "${1:-}" = "--emit-obj" ]; then
+  # Emit a REAL gfx942 ELF object (NOT a PCH) for emitted-ISA profiling:
+  # disassemble with llvm-objdump for v_mfma / DPP, read VGPR/SGPR/LDS from the
+  # kernel descriptor with llvm-readobj. -x c++ forces a translation unit so a
+  # .hip.hpp header emits its __global__ kernels as code, not a precompiled
+  # header. -O3 so the matrix builtins lower to real v_mfma.
+  SRC="${2:?usage: amdgcn_check.sh --emit-obj <src> <out.o>}"
+  OUT="${3:?usage: amdgcn_check.sh --emit-obj <src> <out.o>}"
+  clang "${FLAGS[@]}" -x c++ -O3 \
+    -Wno-pragma-once-outside-header -Wno-unknown-attributes \
+    -c "$SRC" -o "$OUT" 2> "$LOG"
 else
   SRC="${1:?usage: amdgcn_check.sh <snippet.cpp> | --header <h> | --cell <c.hip>}"
   clang "${FLAGS[@]}" -c "$SRC" -o /dev/null 2> "$LOG"
