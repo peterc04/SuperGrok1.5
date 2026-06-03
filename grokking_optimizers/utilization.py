@@ -22,11 +22,13 @@ Per-arch sampler backends (device-wide, single-tenant assumption):
     trace — see ``grokking_optimizers.profile``) and is documented as the
     hardware-gated piece.
 
-Honesty: on a host with no accelerator (or no sampler library), every cell
-record is still produced with ``status`` set and metrics ``None`` — so the
-33-cell structure, the JSON schema, and the aggregation are all CPU-testable;
-only the *numbers* require the accelerator (the same posture as the rest of the
-tree; see HARDWARE_VALIDATION.md).
+Failure policy: **crash hard, crash loud**.  If the sampler library is missing,
+the device is absent, the sampler can't read a counter, or the workload
+subprocess fails, the module raises immediately with a clear, attributable
+exception.  No graceful degradation, no null-metric fallback records, no
+swallowed exceptions.  This is deliberate: hard crashes surface real problems
+at the point of failure, making debugging unambiguous.  If you see a crash,
+fix the environment — don't paper over it.
 """
 
 from __future__ import annotations
@@ -78,8 +80,7 @@ class CellUtilization:
     arch: str
     optimizer: str
     model: str
-    status: str                       # "ok" | "no-device" | "sampler-unavailable"
-                                      # | "workload-failed" | "no-samples"
+    status: str                       # "ok" always — anything else is a crash
     backend: str                      # sampler backend name
     n_samples: int
     duration_s: float
@@ -116,19 +117,23 @@ class DeviceSampler:
         self._t0 = 0.0
 
     def available(self) -> bool:  # pragma: no cover - overridden
-        return False
+        raise RuntimeError(
+            f"DeviceSampler(backend={self.backend!r}): no device backend "
+            f"configured — this host has no recognized accelerator. "
+            f"Set --arch explicitly or install the sampler library "
+            f"(pynvml / amdsmi / jax).")
 
     def _read(self) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         """Return (compute_pct, mem_pct, mem_used_mb) for one sample."""
-        return (None, None, None)
+        raise RuntimeError(
+            f"DeviceSampler(backend={self.backend!r})._read(): no device "
+            f"backend — cannot sample. This is a bug; available() should "
+            f"have caught this.")
 
     # -- lifecycle ----------------------------------------------------------
     def _loop(self) -> None:
         while not self._stop.is_set():
-            try:
-                compute, mem, mem_mb = self._read()
-            except Exception:
-                compute, mem, mem_mb = (None, None, None)
+            compute, mem, mem_mb = self._read()
             self._samples.append(
                 UtilSample(time.monotonic() - self._t0, compute, mem, mem_mb))
             self._stop.wait(self.interval_s)
@@ -169,10 +174,15 @@ class _NvmlSampler(DeviceSampler):
             import pynvml  # noqa: F401
             self._pynvml = pynvml
             return True
-        except Exception:
+        except ImportError:
             pass
         self._smi = shutil.which("nvidia-smi")
-        return self._smi is not None
+        if self._smi is not None:
+            return True
+        raise RuntimeError(
+            "NvmlSampler: neither pynvml nor nvidia-smi found. "
+            "Install pynvml (`pip install pynvml`) or ensure nvidia-smi "
+            "is on PATH. Cannot sample NVIDIA device utilization.")
 
     def setup(self) -> None:
         if self._pynvml is not None:
@@ -182,10 +192,7 @@ class _NvmlSampler(DeviceSampler):
 
     def teardown(self) -> None:
         if self._pynvml is not None:
-            try:
-                self._pynvml.nvmlShutdown()
-            except Exception:
-                pass
+            self._pynvml.nvmlShutdown()
 
     def _read(self):
         if self._pynvml is not None and self._handle is not None:
@@ -194,14 +201,20 @@ class _NvmlSampler(DeviceSampler):
             return (float(rates.gpu), float(rates.memory),
                     float(mem.used) / (1024.0 * 1024.0))
         # nvidia-smi one-shot query fallback.
-        out = subprocess.run(
+        proc = subprocess.run(
             [self._smi, "--query-gpu=utilization.gpu,utilization.memory,"
              "memory.used", "--format=csv,noheader,nounits",
              f"--id={self.device_index}"],
             capture_output=True, text=True, timeout=5,
-        ).stdout.strip().splitlines()
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"nvidia-smi failed (exit {proc.returncode}): "
+                f"{(proc.stderr or proc.stdout or '').strip()}")
+        out = proc.stdout.strip().splitlines()
         if not out:
-            return (None, None, None)
+            raise RuntimeError(
+                f"nvidia-smi returned no output for device {self.device_index}")
         gpu, mem_pct, mem_mb = (x.strip() for x in out[0].split(","))
         return (float(gpu), float(mem_pct), float(mem_mb))
 
@@ -222,10 +235,15 @@ class _RocmSmiSampler(DeviceSampler):
             import amdsmi  # noqa: F401
             self._amdsmi = amdsmi
             return True
-        except Exception:
+        except ImportError:
             pass
         self._rocm_smi = shutil.which("rocm-smi")
-        return self._rocm_smi is not None
+        if self._rocm_smi is not None:
+            return True
+        raise RuntimeError(
+            "RocmSmiSampler: neither amdsmi nor rocm-smi found. "
+            "Install amdsmi or ensure rocm-smi is on PATH. "
+            "Cannot sample AMD device utilization.")
 
     def setup(self) -> None:
         if self._amdsmi is not None:
@@ -235,10 +253,7 @@ class _RocmSmiSampler(DeviceSampler):
 
     def teardown(self) -> None:
         if self._amdsmi is not None:
-            try:
-                self._amdsmi.amdsmi_shut_down()
-            except Exception:
-                pass
+            self._amdsmi.amdsmi_shut_down()
 
     def _read(self):
         if self._amdsmi is not None and self._handle is not None:
@@ -249,16 +264,28 @@ class _RocmSmiSampler(DeviceSampler):
             return (float(eng.get("gfx_activity", 0)),
                     100.0 * used_mb / total_mb, used_mb)
         # rocm-smi JSON fallback: GPU use% + VRAM%.
-        out = subprocess.run(
+        proc = subprocess.run(
             [self._rocm_smi, "--showuse", "--showmemuse", "--json"],
             capture_output=True, text=True, timeout=5,
-        ).stdout
-        data = json.loads(out)
-        card = data.get(f"card{self.device_index}", {})
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"rocm-smi failed (exit {proc.returncode}): "
+                f"{(proc.stderr or proc.stdout or '').strip()}")
+        data = json.loads(proc.stdout)
+        card_key = f"card{self.device_index}"
+        if card_key not in data:
+            raise RuntimeError(
+                f"rocm-smi JSON has no key {card_key!r}; "
+                f"available keys: {list(data.keys())}")
+        card = data[card_key]
         compute = card.get("GPU use (%)")
         mem_pct = card.get("GPU Memory Allocated (VRAM%)") or \
             card.get("GPU memory use (%)")
-        return (float(compute) if compute is not None else None,
+        if compute is None:
+            raise RuntimeError(
+                f"rocm-smi {card_key}: 'GPU use (%)' not found in {list(card.keys())}")
+        return (float(compute),
                 float(mem_pct) if mem_pct is not None else None, None)
 
 
@@ -279,20 +306,44 @@ class _TpuSampler(DeviceSampler):
     def available(self) -> bool:
         try:
             import jax
-            devs = [d for d in jax.devices() if d.platform == "tpu"]
-            if not devs:
-                return False
-            self._device = devs[self.device_index]
-            return hasattr(self._device, "memory_stats")
-        except Exception:
-            return False
+        except ImportError:
+            raise RuntimeError(
+                "TpuSampler: jax is not installed. "
+                "Install jax[tpu] to sample TPU utilization.") from None
+        devs = [d for d in jax.devices() if d.platform == "tpu"]
+        if not devs:
+            raise RuntimeError(
+                "TpuSampler: jax found but no TPU devices visible. "
+                f"jax.devices() returned: {jax.devices()}")
+        if self.device_index >= len(devs):
+            raise RuntimeError(
+                f"TpuSampler: device_index={self.device_index} but only "
+                f"{len(devs)} TPU device(s) visible.")
+        self._device = devs[self.device_index]
+        if not hasattr(self._device, "memory_stats"):
+            raise RuntimeError(
+                f"TpuSampler: TPU device {self._device} has no "
+                f"memory_stats() method — unsupported JAX/libtpu version.")
+        return True
 
     def _read(self):
-        stats = self._device.memory_stats() or {}
+        stats = self._device.memory_stats()
+        if not stats:
+            raise RuntimeError(
+                f"TpuSampler: device.memory_stats() returned {stats!r} — "
+                f"no HBM counters available.")
         used = stats.get("bytes_in_use")
         limit = stats.get("bytes_limit") or stats.get("bytes_reservable_limit")
-        used_mb = (float(used) / (1024.0 * 1024.0)) if used else None
-        mem_pct = (100.0 * float(used) / float(limit)) if used and limit else None
+        if used is None:
+            raise RuntimeError(
+                f"TpuSampler: 'bytes_in_use' not in memory_stats(); "
+                f"keys: {list(stats.keys())}")
+        if not limit:
+            raise RuntimeError(
+                f"TpuSampler: no 'bytes_limit'/'bytes_reservable_limit' "
+                f"in memory_stats(); keys: {list(stats.keys())}")
+        used_mb = float(used) / (1024.0 * 1024.0)
+        mem_pct = 100.0 * float(used) / float(limit)
         # compute_pct intentionally None — MXU duty-cycle is xprof-only.
         return (None, mem_pct, used_mb)
 
@@ -308,12 +359,20 @@ def make_sampler(arch: str, interval_s: float = 0.1,
                  device_index: int = 0) -> DeviceSampler:
     """Return the device sampler matching ``arch``'s vendor.
 
-    Always returns a sampler instance; call ``.available()`` to check whether
-    the backend can actually read the device on this host.
+    Raises if ``arch`` has no recognized vendor or no sampler backend.
     """
-    vendor = _arch_info().get(arch, {}).get("vendor")
-    cls = _SAMPLERS_BY_VENDOR.get(vendor, DeviceSampler)
-    return cls(interval_s=interval_s, device_index=device_index)
+    info = _arch_info().get(arch)
+    if info is None:
+        raise ValueError(
+            f"make_sampler: unknown arch {arch!r}; "
+            f"known arches: {list(_arch_info().keys())}")
+    vendor = info.get("vendor")
+    if vendor not in _SAMPLERS_BY_VENDOR:
+        raise ValueError(
+            f"make_sampler: arch {arch!r} has vendor={vendor!r} which has "
+            f"no sampler backend; known vendors: {list(_SAMPLERS_BY_VENDOR)}")
+    return _SAMPLERS_BY_VENDOR[vendor](
+        interval_s=interval_s, device_index=device_index)
 
 
 # ---------------------------------------------------------------------------
@@ -418,34 +477,21 @@ def track_cell(optimizer: str, model: str, arch: str, *,
     """Run one pipeline under a sustained load and measure device utilization.
 
     A device-wide sampler runs in this (parent) process while the workload runs
-    in a subprocess. Returns a :class:`CellUtilization`. Never raises for a
-    missing device / sampler / failed workload — the status field records it.
+    in a subprocess.  Returns a :class:`CellUtilization` on success.
+    **Raises on any failure** — missing device, sampler error, workload crash,
+    timeout, zero samples.  No graceful degradation.
     """
+    cell_id = f"{optimizer}/{model}/{arch}"
     own_sampler = sampler is None
     sampler = sampler or make_sampler(arch, interval_s=interval_s)
 
-    base = CellUtilization(
-        arch=arch, optimizer=optimizer, model=model, status="ok",
-        backend=sampler.backend, n_samples=0, duration_s=0.0,
-        compute_mean=None, compute_peak=None, mem_mean=None, mem_peak=None,
-        mem_used_peak_mb=None)
-
-    if not sampler.available():
-        base.status = "no-device" if sampler.backend == "none" \
-            else "sampler-unavailable"
-        base.note = (f"no {sampler.backend} device/library on this host; "
-                     f"run on the target accelerator for live numbers")
-        return base
+    # This raises if the device/library is missing — deliberately.
+    sampler.available()
 
     script = workload_script(optimizer, model, arch, iters)
     script_path = write_temp_script(script)
     if own_sampler:
-        try:
-            sampler.setup()
-        except Exception as exc:
-            base.status = "sampler-unavailable"
-            base.note = f"sampler.setup() failed: {exc}"
-            return base
+        sampler.setup()
 
     t0 = time.monotonic()
     try:
@@ -454,38 +500,42 @@ def track_cell(optimizer: str, model: str, arch: str, *,
             [sys.executable, script_path], cwd=REPO_ROOT, env=child_env(),
             capture_output=True, text=True, timeout=timeout)
         samples = sampler.stop()
-        base.duration_s = time.monotonic() - t0
-        base.n_samples = len(samples)
+        duration = time.monotonic() - t0
+
         if proc.returncode != 0:
-            base.status = "workload-failed"
-            tail = (proc.stderr or proc.stdout or "")[-300:]
-            base.note = f"workload exit {proc.returncode}: {tail.strip()}"
-            return base
+            tail = (proc.stderr or proc.stdout or "")[-500:]
+            raise RuntimeError(
+                f"[{cell_id}] workload subprocess failed "
+                f"(exit {proc.returncode}):\n{tail.strip()}")
+
         if not samples:
-            base.status = "no-samples"
-            base.note = "sampler produced no samples"
-            return base
+            raise RuntimeError(
+                f"[{cell_id}] sampler produced zero samples over "
+                f"{duration:.1f}s — device poller never fired.")
+
         agg = _aggregate(samples)
-        base.compute_mean = agg["compute_mean"]
-        base.compute_peak = agg["compute_peak"]
-        base.mem_mean = agg["mem_mean"]
-        base.mem_peak = agg["mem_peak"]
-        base.mem_used_peak_mb = agg["mem_used_peak_mb"]
-        if base.compute_mean is None and base.mem_mean is None:
-            base.note = (f"{sampler.backend}: no compute/mem counters exposed "
-                         f"(e.g. TPU MXU duty-cycle is xprof-only)")
+        return CellUtilization(
+            arch=arch, optimizer=optimizer, model=model, status="ok",
+            backend=sampler.backend, n_samples=len(samples),
+            duration_s=duration,
+            compute_mean=agg["compute_mean"],
+            compute_peak=agg["compute_peak"],
+            mem_mean=agg["mem_mean"],
+            mem_peak=agg["mem_peak"],
+            mem_used_peak_mb=agg["mem_used_peak_mb"],
+            note=(f"{sampler.backend}: MXU duty-cycle is xprof-only"
+                  if agg["compute_mean"] is None and agg["mem_mean"] is not None
+                  else ""))
     except subprocess.TimeoutExpired:
         sampler.stop()
-        base.status = "workload-failed"
-        base.note = f"workload timed out after {timeout}s"
+        raise RuntimeError(
+            f"[{cell_id}] workload timed out after {timeout}s — "
+            f"the pipeline is hung or takes too long for {iters} iterations."
+        ) from None
     finally:
         if own_sampler:
             sampler.teardown()
-        try:
-            Path(script_path).unlink()
-        except OSError:
-            pass
-    return base
+        Path(script_path).unlink(missing_ok=True)
 
 
 def enumerate_cells(optimizers: Optional[List[str]] = None,
@@ -503,17 +553,14 @@ def track_all(arch: str, *, optimizers: Optional[List[str]] = None,
               timeout: int = 300, progress: bool = True
               ) -> List[CellUtilization]:
     """Sweep all pipelines for ``arch`` (33 by default) and return one
-    :class:`CellUtilization` per cell. Shares one sampler across the sweep."""
+    :class:`CellUtilization` per cell.  Shares one sampler across the sweep.
+    Raises on any failure — no partial results, no fallback."""
     if arch not in ARCHES:
         raise ValueError(f"arch={arch!r} not in {list(ARCHES)}")
     cells = enumerate_cells(optimizers, models)
     sampler = make_sampler(arch, interval_s=interval_s)
-    have = sampler.available()
-    if have:
-        try:
-            sampler.setup()
-        except Exception:
-            have = False
+    sampler.available()
+    sampler.setup()
 
     step = close = None
     if progress:
@@ -523,12 +570,11 @@ def track_all(arch: str, *, optimizers: Optional[List[str]] = None,
         for opt, model in cells:
             results.append(track_cell(
                 opt, model, arch, iters=iters, interval_s=interval_s,
-                timeout=timeout, sampler=sampler if have else None))
+                timeout=timeout, sampler=sampler))
             if step:
                 step(f"{opt}/{model}")
     finally:
-        if have:
-            sampler.teardown()
+        sampler.teardown()
         if close:
             close()
     return results

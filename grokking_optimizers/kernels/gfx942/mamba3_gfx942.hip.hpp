@@ -1092,7 +1092,7 @@ void mamba3_conv1d_forward(
         float w2 = to_float(conv_w[ch * 3 + 2]);
         float bias = to_float(conv_b[ch]);
 
-        int base = b * SEQ_LEN * d_inner + ch;
+        int64_t base = static_cast<int64_t>(b) * SEQ_LEN * d_inner + ch;
 
         float x_left  = (t > 0)           ? to_float(x_main[base + (t - 1) * d_inner]) : 0.0f;
         float x_center =                    to_float(x_main[base + t       * d_inner]);
@@ -1802,7 +1802,7 @@ void mamba3_conv1d_backward(
         float w2 = to_float(conv_w[ch * 3 + 2]);
 
         // SiLU backward: d(SiLU(u))/du = sig(u) + u*sig(u)*(1-sig(u))
-        int base = b * SEQ_LEN * d_inner + ch;
+        int64_t base = static_cast<int64_t>(b) * SEQ_LEN * d_inner + ch;
         float x_left   = (t > 0)           ? to_float(x_in[base + (t-1)*d_inner]) : 0.0f;
         float x_center =                     to_float(x_in[base + t    *d_inner]);
         float x_right  = (t < SEQ_LEN - 1) ? to_float(x_in[base + (t+1)*d_inner]) : 0.0f;

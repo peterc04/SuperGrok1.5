@@ -278,7 +278,7 @@ void fused_step(const std::string& model, const std::string& optimizer,
  torch::Tensor grad, torch::Tensor state, float lr) {
  int arch = detect_arch();
  std::string arch_str = (arch == 90) ? "sm_90"
- : (arch == 942) ? "gfx942" : "tpu_v5p";
+ : (arch == 942) ? "gfx942" : "tpu_v6e";
 
  const std::string cell = wired_fused_cell(model, optimizer, arch);
  if (cell.empty()) {
