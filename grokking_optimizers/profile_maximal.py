@@ -137,7 +137,8 @@ class SassProfile:
 def _nvcc_profile(tu: Path, timeout: int = 900) -> SassProfile:
     """Compile a sm_90 TU with the maximal flags + ptxas -v, then SASS-audit."""
     obj = Path(tempfile.mktemp(suffix=".o"))
-    cmd = ["nvcc", *_MAX_NVCC, "-Xptxas", "-v", str(tu), "-o", str(obj)]
+    cmd = ["nvcc", *_MAX_NVCC, *_torch_incs(), "-Xptxas", "-v",
+           str(tu), "-o", str(obj)]
     proc = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True,
                           text=True, timeout=timeout)
     log = (proc.stdout or "") + (proc.stderr or "")
@@ -279,17 +280,22 @@ _GFX_KERNELS = [
 def tier_c_gfx942(rep: Report) -> None:
     sys.stdout.write("\n[TIER C] gfx942 instruction maximality "
                      "(MFMA matrix-cores + DPP cross-lane, source + AMDGCN)\n")
+    # CDNA3 matrix work reaches the MFMA cores either through the raw
+    # __builtin_amdgcn_mfma_* intrinsic or through the repo's mfma_* helper
+    # family (mfma_tile_16x16 / mfma_matmul_bf16 / mfma_gemm / mfma_bf16_*,
+    # which wrap the builtin in amdgcn_primitives). Count BOTH — the helper
+    # usage is the real signal in the model kernels.
+    mfma_re = (r"__builtin_amdgcn_mfma|mfma_tile|mfma_matmul|mfma_gemm"
+               r"|mfma_bf16")
     for path, label in _GFX_KERNELS:
         src = (REPO_ROOT / path).read_text()
-        mfma = len(re.findall(r"__builtin_amdgcn_mfma", src))
-        dpp = len(re.findall(r"__builtin_amdgcn_(mov_dpp|update_dpp|ds_bpermute"
-                             r"|ds_swizzle)", src))
-        # attention is the matrix-core path (must have MFMA); the SSM/element
-        # kernels legitimately may not use MFMA (recurrence/elementwise).
-        needs_mfma = "attention" in path or "decoder" in path
-        ok = (mfma > 0) if needs_mfma else True
-        detail = f"MFMA builtins={mfma}  DPP builtins={dpp}"
-        if needs_mfma and mfma == 0:
+        mfma = len(re.findall(mfma_re, src))
+        dpp = len(re.findall(r"dpp|ds_bpermute|ds_swizzle|wave_reduce", src))
+        # All three (attention, decoder, mamba3) are matrix-bearing and must
+        # reach the MFMA cores to be instruction-maximal on gfx942.
+        ok = mfma > 0
+        detail = f"MFMA matrix-core uses={mfma}  DPP/cross-lane uses={dpp}"
+        if mfma == 0:
             detail += "  ← expected matrix-core MFMA, found none"
         rep.add(Probe("C", label, PASS if ok else FAIL, detail))
         rep.table.append((f"gfx942 {label}", detail))
