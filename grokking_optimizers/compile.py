@@ -8582,6 +8582,15 @@ def _build_macros(spec: BuildSpec) -> List[str]:
 #     ``spec.cross_host_march``. In this mode the host_cflags_hash already
 #     varies with the chosen baseline, keeping the cache honest (#23 keys it
 #     on the target CPU).
+# Mandate #6 — ``-ffast-math`` is NOT in the base list. ``-ffast-math``
+# implies ``-ffinite-math-only`` (deletes NaN/Inf guards) and reorders FP
+# ops, changing numerics — so the DEFAULT build is strict-math. Fast-math
+# (and a safe subset) are offered as CANDIDATE VARIANTS (see
+# ``_FAST_MATH_VARIANTS`` / ``_fast_math_variant_flags``) that the autotuner
+# tries and the strict oracle (#9/#16) validates; a fast-math variant is kept
+# ONLY if it matches the strict reference. ``-fno-math-errno`` /
+# ``-fno-trapping-math`` stay in the base: they are safe (no value change,
+# no finite-only assumption) and standard for compute kernels.
 HOST_CFLAGS_BASE = [
     "-O3", "-std=c++17", "-fPIC",
     "-flto=auto",
@@ -8589,7 +8598,7 @@ HOST_CFLAGS_BASE = [
     "-fdata-sections", "-ffunction-sections",
     "-fno-math-errno", "-fno-trapping-math",
     "-fomit-frame-pointer",
-    "-ffast-math", "-funroll-loops",
+    "-funroll-loops",
 ]
 
 # Default portable ISA baseline for cross-host builds (x86-64-v3 ≈ Haswell+:
@@ -8639,17 +8648,20 @@ def _host_march_flags(spec: "BuildSpec") -> List[str]:
 # ``_device_ldflags(spec)``, NEVER in this list — nvcc -c rejects them
 # at the per-TU compile step ("Unknown option").
 NVCC_DEVICE_BASE = [
-    # -DNDEBUG is a MAXIMALITY flag, not just hygiene: it strips CUTLASS's
-    # device-side assert() calls, which otherwise emit an extern __assert_fail
-    # the Sm90 GEMM mainloop must call — and ptxas then SERIALIZES the
-    # wgmma.mma_async tensor-core pipeline around it (warning C7509). Profiled:
-    # decoder.cu drops from 6 C7509 serializations to 0 with -DNDEBUG, WGMMA
-    # (150) + TMA stay intact. Our own hang-safety guards are NDEBUG-immune
-    # (the megakernel occupancy check is a runtime `if (occ<1) return err`, not
-    # the assert; correctness is static_assert (compile-time) + TORCH_CHECK
-    # (always-on)). CUDA_DEBUG=1 strips -DNDEBUG (see setup.py) to restore
-    # asserts for debugging.
-    "-O3", "--use_fast_math", "-DNDEBUG", "-std=c++17", "-DWITH_CUDA",
+    # Mandate #6 — ``--use_fast_math`` is NOT in the base. It changes numerics
+    # (flushes denormals, reassociates, approximates div/sqrt) so the default
+    # build is strict-math; fast-math is a VALIDATED variant (see
+    # ``_FAST_MATH_VARIANTS``) kept only when it matches the strict oracle.
+    #
+    # Mandate (user directive) — ``-DNDEBUG`` is NOT in the base either. It is
+    # assert-stripping only and numerically neutral, BUT it is a PROJECT
+    # opinion, not a universal-tool default. The grokking project keeps it via
+    # its own ``[device_cflags].extra = ["-DNDEBUG"]`` in compile_config.toml
+    # (consumed by apply_to_buildspec → _device_cflags), preserving the WGMMA
+    # mainloop de-serialization win (C7509 6→0) exactly as before. Any other
+    # project builds without it unless its config opts in. The flag flows into
+    # device_cflags_hash so the de-serialization stays reproducible.
+    "-O3", "-std=c++17", "-DWITH_CUDA",
     "--expt-relaxed-constexpr",
     # NOTE: ``--threads N`` is a CUDA 11.2+ flag (parallel TU compilation).
     # Gated emission lives in ``_newer_compiler_flags``; the base list
@@ -8702,11 +8714,12 @@ NVCC_DEVICE_BASE = [
 # wave-size / cumode toggles (which are NOT arch-agnostic) live in
 # _device_cflags(spec) and are gated by ARCH_TABLE[arch].warp_size.
 HIPCC_DEVICE_BASE = [
-    # -DNDEBUG: release default (strips device assert()); the gfx942 megakernel
-    # hang-guard is a runtime `if (occ<1) return err`, NDEBUG-immune. Symmetric
-    # with NVCC_DEVICE_BASE. CUDA_DEBUG=1 strips it (setup.py).
-    "-O3", "-std=c++17", "-DWITH_HIP", "-DNDEBUG",
-    "-ffast-math", "-fPIC",
+    # Mandate #6 — ``-ffast-math`` is NOT in the base (changes numerics);
+    # it's a VALIDATED variant. Mandate (user directive) — ``-DNDEBUG`` is a
+    # PROJECT opinion, sourced from the project's compile_config.toml
+    # ``[device_cflags].extra`` (grokking keeps it), not a universal default.
+    "-O3", "-std=c++17", "-DWITH_HIP",
+    "-fPIC",
     "-mllvm", "-amdgpu-early-inline-all=true",
     "-mllvm", "-amdgpu-function-calls=false",
     "-mllvm", "-amdgpu-internalize-symbols",
@@ -8752,6 +8765,44 @@ LDFLAGS_BASE = [
     "-Wl,--gc-sections", "-Wl,-O3",
     "-Wl,--icf=all",
 ]
+
+
+# ── Mandate #6 — fast-math as a VETTED VARIANT, not a default ─────────────
+# These candidate flag sets are tried by the autotuner and validated against
+# the STRICT oracle (#9/#16); a variant is kept ONLY if its output matches
+# the strict reference within tolerance. Each maps a name → (host_flags,
+# nvcc_flags, hipcc_flags). The "safe_subset" deliberately omits
+# ``-ffinite-math-only`` (which would delete NaN/Inf guards) — it only
+# reassociates and drops errno/trapping, so it is the lowest-risk speedup.
+# "full_fast_math" is the aggressive option (the old always-on behavior),
+# now gated behind validation.
+_FAST_MATH_VARIANTS: Dict[str, Dict[str, List[str]]] = {
+    "safe_subset": {
+        "host":  ["-fassociative-math", "-freciprocal-math"],
+        "nvcc":  ["-Xcompiler", "-fassociative-math"],
+        "hipcc": ["-fassociative-math", "-freciprocal-math"],
+    },
+    "full_fast_math": {
+        "host":  ["-ffast-math"],
+        "nvcc":  ["--use_fast_math"],
+        "hipcc": ["-ffast-math"],
+    },
+}
+
+
+def _fast_math_variant_flags(variant: str, vendor: str) -> Tuple[List[str], List[str]]:
+    """Mandate #6 — return ``(host_flags, device_flags)`` for a named
+    fast-math variant on the given vendor. Unknown variant ⇒ no flags.
+    The caller tags the produced variant ``origin='fastmath'`` so pick_winner
+    (#16) requires a strict-oracle PASS before it can win."""
+    spec_v = _FAST_MATH_VARIANTS.get(variant)
+    if not spec_v:
+        return [], []
+    host = list(spec_v.get("host", []))
+    dev_key = "nvcc" if vendor == "cuda" else (
+        "hipcc" if vendor == "hip" else None)
+    device = list(spec_v.get(dev_key, [])) if dev_key else []
+    return host, device
 
 
 def _host_cflags(spec: BuildSpec,
@@ -8989,10 +9040,15 @@ def _device_cflags(spec: BuildSpec,
             _trace_add_many(trace, macros,
                             f"-D macros derived from BuildSpec "
                             f"(macro_prefix={spec.macro_prefix!r})")
+        proj_extra = _project_device_extra_flags(spec)
+        if proj_extra:
+            _trace_add_many(trace, proj_extra,
+                            "project config [device_cflags].extra "
+                            "(e.g. grokking -DNDEBUG)")
         if own_trace and trace is not None:
             _emit_flag_trace_block("device_cflags", trace)
         return _device_cflags_maybe_validate(
-            base + macros, spec, vendor="cuda")
+            base + macros + proj_extra, spec, vendor="cuda")
 
     if entry.vendor == "hip":
         base = list(HIPCC_DEVICE_BASE)
@@ -9081,10 +9137,15 @@ def _device_cflags(spec: BuildSpec,
             _trace_add_many(trace, macros,
                             f"-D macros derived from BuildSpec "
                             f"(macro_prefix={spec.macro_prefix!r})")
+        proj_extra = _project_device_extra_flags(spec)
+        if proj_extra:
+            _trace_add_many(trace, proj_extra,
+                            "project config [device_cflags].extra "
+                            "(e.g. grokking -DNDEBUG)")
         if own_trace and trace is not None:
             _emit_flag_trace_block("device_cflags", trace)
         return _device_cflags_maybe_validate(
-            base + macros, spec, vendor="hip")
+            base + macros + proj_extra, spec, vendor="hip")
     # Pallas / unknown vendor → no device cflags. Still emit one note so
     # the trace block isn't completely empty in --flag-audit.
     _trace_add(trace, "(no device cflags)", "kept",
@@ -9092,6 +9153,22 @@ def _device_cflags(spec: BuildSpec,
     if own_trace and trace is not None:
         _emit_flag_trace_block("device_cflags", trace)
     return []
+
+
+def _project_device_extra_flags(spec: "BuildSpec") -> List[str]:
+    """Mandate (NDEBUG migration) / #6 — project-supplied extra device flags
+    from ``compile_config.toml`` ``[device_cflags].extra``. This is how the
+    grokking project re-introduces ``-DNDEBUG`` (assert-stripping, WGMMA
+    de-serialization) WITHOUT compile.py carrying any project opinion in its
+    base lists. The flags flow into the build AND into device_cflags_hash so
+    the behavior stays reproducible + provenance-tracked. Empty for a
+    config-less generic build."""
+    cfg = getattr(spec, "config", None) or {}
+    dc = cfg.get("device_cflags") if isinstance(cfg, dict) else None
+    if not isinstance(dc, dict):
+        return []
+    extra = dc.get("extra") or []
+    return [str(f) for f in extra]
 
 
 def _device_cflags_maybe_validate(flags: List[str], spec: "BuildSpec",
@@ -15860,13 +15937,19 @@ def _self_test_flags(run) -> None:
         still expressed when nvcc is available.
         """
         sm90 = set(_device_cflags(_spec("sm_90a")))
+        # Mandate #6 — ``--use_fast_math`` is DELIBERATELY no longer in the
+        # base (it's a validated variant now); ``-DNDEBUG`` moved to project
+        # config. The remaining performance/correctness flags must persist.
         legacy_sm90 = {
-            "-O3", "--use_fast_math", "-std=c++17", "-DWITH_CUDA",
+            "-O3", "-std=c++17", "-DWITH_CUDA",
             "--expt-relaxed-constexpr", "--extra-device-vectorization",
             "--resource-usage",
         }
         missing = legacy_sm90 - sm90
         assert not missing, f"sm_90 lost legacy flags: {missing}"
+        # #6 — fast-math must NOT be a default base flag.
+        assert "--use_fast_math" not in sm90, \
+            "fast-math must be a validated variant, not a base default"
         # F-A — verify the device-LTO pair still appears under the
         # version-gated path when nvcc 11.4+ is available.
         if _probe_nvcc_version() and _probe_nvcc_version() >= (11, 4):
@@ -15878,13 +15961,16 @@ def _self_test_flags(run) -> None:
                 "sm_90 lost -rdc=true from the CUDA>=11.4 gated path"
 
         gfx942 = set(_device_cflags(_spec("gfx942")))
+        # #6 — -ffast-math removed from the gfx942 base too (validated variant).
         legacy_gfx942 = {
-            "-O3", "-std=c++17", "-DWITH_HIP", "-ffast-math", "-fPIC",
+            "-O3", "-std=c++17", "-DWITH_HIP", "-fPIC",
             "-fgpu-flush-denormals-to-zero", "-flto",
             "--offload-arch=gfx942",
         }
         missing_amd = legacy_gfx942 - gfx942
         assert not missing_amd, f"gfx942 lost legacy flags: {missing_amd}"
+        assert "-ffast-math" not in gfx942, \
+            "fast-math must be a validated variant, not a gfx942 base default"
 
     def test_nvcc_no_duplicate_ptxas_o3():
         """Exactly one PTXAS opt-level flag — duplicate -Xptxas -O3 must
@@ -17747,6 +17833,49 @@ def _self_test_discovery(run) -> None:
                            out_dir=Path("/tmp"), cross_host=False)
         assert "-march=native" in _host_march_flags(spec_n)
 
+    def test_fast_math_not_in_base_lists():
+        """#6 — fast-math is gone from every base flag list (it's a variant)."""
+        assert "--use_fast_math" not in NVCC_DEVICE_BASE
+        assert "-ffast-math" not in HOST_CFLAGS_BASE
+        assert "-ffast-math" not in HIPCC_DEVICE_BASE
+
+    def test_ndebug_not_in_base_lists():
+        """NDEBUG migration — compile.py base carries no project NDEBUG."""
+        assert "-DNDEBUG" not in NVCC_DEVICE_BASE
+        assert "-DNDEBUG" not in HIPCC_DEVICE_BASE
+
+    def test_ndebug_present_for_grokking_absent_for_generic():
+        """NDEBUG migration — grokking's config re-adds -DNDEBUG to device
+        flags; a config-less generic build has none."""
+        # Generic (no config) → no NDEBUG.
+        generic = _device_cflags(BuildSpec(
+            optimizer="adamw", model="decoder", arch="sm_90a",
+            out_dir=Path("/tmp")))
+        assert "-DNDEBUG" not in generic
+        # Grokking (default project config carries [device_cflags].extra).
+        grok = BuildSpec(optimizer="adamw", model="decoder", arch="sm_90a",
+                         out_dir=Path("/tmp"),
+                         config={"device_cflags": {"extra": ["-DNDEBUG"]}})
+        flags = _device_cflags(grok)
+        assert "-DNDEBUG" in flags, \
+            "grokking project config must re-introduce -DNDEBUG"
+
+    def test_fast_math_variant_flags():
+        """#6 — fast-math variants exist and map per-vendor; safe_subset
+        omits -ffinite-math-only (keeps NaN/Inf guards)."""
+        h, d = _fast_math_variant_flags("full_fast_math", "cuda")
+        assert "--use_fast_math" in d
+        h2, d2 = _fast_math_variant_flags("full_fast_math", "hip")
+        assert "-ffast-math" in d2
+        hs, ds = _fast_math_variant_flags("safe_subset", "cuda")
+        assert "-fassociative-math" in hs
+        # The safe subset must NEVER include the finite-only flag that deletes
+        # NaN/Inf handling.
+        all_safe = hs + ds
+        assert "-ffinite-math-only" not in all_safe
+        # Unknown variant → empty.
+        assert _fast_math_variant_flags("nope", "cuda") == ([], [])
+
     run("discovery_parse_adam_schema", test_parse_adam_style_schema)
     run("discovery_parse_mixed_signature", test_parse_mixed_signature)
     run("discovery_parse_strips_defaults", test_parse_strips_defaults_and_int)
@@ -17757,6 +17886,10 @@ def _self_test_discovery(run) -> None:
     run("discovery_probe_enumerates_torch_ops",
         test_discovery_probe_has_torch_ops_enumeration)
     run("discovery_stage_sets_cross_host", test_stage_selector_sets_cross_host)
+    run("fastmath_not_in_base_lists", test_fast_math_not_in_base_lists)
+    run("ndebug_not_in_base_lists", test_ndebug_not_in_base_lists)
+    run("ndebug_grokking_vs_generic", test_ndebug_present_for_grokking_absent_for_generic)
+    run("fast_math_variant_flags", test_fast_math_variant_flags)
 
 
 def _self_test_kernel_headers(run) -> None:
@@ -20202,7 +20335,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 201
+_SELF_TEST_EXPECTED_COUNT: int = 205
 
 
 def _self_test() -> int:
@@ -25594,6 +25727,16 @@ _DEFAULT_PROJECT_CONFIG: Dict[str, Any] = {
         # be absolute, or repo-root-relative when relative. Default
         # preserves the historical csrc/algorithms/tuned_configs.h.
         "tuned_header_path": "csrc/algorithms/tuned_configs.h",
+    },
+    # Mandate (NDEBUG migration) — compile.py's base device flags carry NO
+    # project opinion. The grokking project's ``-DNDEBUG`` (assert-stripping;
+    # de-serializes the WGMMA mainloop, C7509 6→0) lives HERE as an explicit,
+    # tracked project decision, appended to the device flags by
+    # ``_project_device_extra_flags`` and folded into device_cflags_hash. A
+    # config-less generic build gets no -DNDEBUG. CUDA_DEBUG strips it in
+    # setup.py to restore asserts for debugging.
+    "device_cflags": {
+        "extra": ["-DNDEBUG"],
     },
     "optimizers": {
         "enabled": ["adamw", "lion", "muon", "prodigy", "grokadamw",
