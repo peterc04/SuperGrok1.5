@@ -20,13 +20,25 @@ real compiled artifacts plus CPU execution of the fused programs:
     spill bytes for a sample of fused cells + the optimizer-step kernels,
     cross-checked against the megakernel solver's budget. Spills => not maximal.
 
-  TIER C — gfx942 instruction maximality (clang AMDGPU): the attention + model
-    device code must emit MFMA (CDNA3 matrix cores) and DPP cross-lane ops.
+  TIER C — gfx942 (MI300X) REAL emitted-ISA maximality (clang AMDGPU +
+    llvm-objdump + llvm-readobj): the attention/decoder/vit/mamba device code
+    must emit actual ``v_mfma`` CDNA3 matrix-core instructions (disassembled
+    from the object, not grepped from source) + DPP cross-lane ops, within the
+    VGPR budget read from the real AMDGPU kernel descriptor.
 
   TIER D — functional correctness (CPU execution): run the real fused
     (model, optimizer) program on CPU via the Pallas path and confirm the
     optimizer ACTUALLY reduces a loss and moves parameters finitely — the
     binaries do what we want, *period*.
+
+  TIER E — tpu_v6e (Trillium) HLO maximality (jax compile + run): each fused
+    cell's real program must compile to optimized HLO containing ``dot_general``
+    MXU matmuls + XLA fusion, execute on the host backend with finite output,
+    and the v6e binding must use the 256-wide MXU tile.
+
+All three target archs thus get the SAME emitted-code standard: sm_90 SASS
+(A/B), gfx942 ISA (C), tpu_v6e HLO (E). Live wall-clock / occupancy / real MXU
+emission are the silicon-only residual for every arch.
 
 Each tier prints PASS/FAIL/SKIP and the measured numbers; a final report gives
 the maximality verdict, the real-vs-estimate table, and what remains silicon-
@@ -264,7 +276,9 @@ def tier_b_resources(rep: Report) -> None:
 
 
 # ---------------------------------------------------------------------------
-# TIER C — gfx942 instruction maximality (MFMA + DPP)
+# TIER C — gfx942 (MI300X) instruction maximality: REAL emitted AMDGCN ISA
+# (the gfx942 analogue of the sm_90 SASS audit — actual v_mfma in the object,
+# real VGPR/SGPR/LDS from the kernel descriptor, not a source grep).
 # ---------------------------------------------------------------------------
 
 _GFX_KERNELS = [
@@ -273,35 +287,83 @@ _GFX_KERNELS = [
     ("grokking_optimizers/kernels/gfx942/mamba3_gfx942.hip.hpp",
      "mamba3 (scan + proj)"),
     ("grokking_optimizers/kernels/gfx942/transformer_decoder_gfx942.hip.hpp",
-     "decoder (attn + FFN)"),
+     "decoder (attn + FFN GEMMs)"),
+    ("grokking_optimizers/kernels/gfx942/vit_gfx942.hip.hpp",
+     "vit (patch + attn + FFN GEMMs)"),
 ]
 
 
+@dataclasses.dataclass
+class IsaProfile:
+    rc: int
+    v_mfma: int
+    dpp: int
+    lds_ops: int
+    vgpr_max: int
+    sgpr_max: int
+    lds_max: int
+    n_kernels: int
+    err: str = ""
+
+
+def _gfx942_isa(src: Path) -> IsaProfile:
+    """Emit a real gfx942 ELF object, disassemble for v_mfma/DPP, and read the
+    AMDGPU kernel descriptors for VGPR/SGPR/LDS — the MI300X SASS-equivalent."""
+    obj = Path(tempfile.mktemp(suffix=".o"))
+    proc = subprocess.run(
+        ["bash", "scripts/amdgcn_check.sh", "--emit-obj", str(src), str(obj)],
+        cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=180)
+    if proc.returncode != 0 or not obj.exists():
+        err = next((ln for ln in (proc.stdout + proc.stderr).splitlines()
+                    if "error" in ln.lower()), "emit-obj failed")
+        return IsaProfile(proc.returncode, 0, 0, 0, 0, 0, 0, 0, err[:180])
+    dis = subprocess.run(["llvm-objdump", "-d", str(obj)],
+                         capture_output=True, text=True).stdout
+    v_mfma = len(re.findall(r"\bv_mfma", dis))
+    dpp = len(re.findall(r"v_\w+_dpp|ds_bpermute|ds_swizzle|ds_permute", dis))
+    lds_ops = len(re.findall(r"\bds_(read|write)", dis))
+    notes = subprocess.run(["llvm-readobj", "--notes", str(obj)],
+                           capture_output=True, text=True).stdout
+    vgprs = [int(m) for m in re.findall(r"\.vgpr_count:\s*(\d+)", notes)]
+    sgprs = [int(m) for m in re.findall(r"\.sgpr_count:\s*(\d+)", notes)]
+    lds = [int(m) for m in
+           re.findall(r"\.group_segment_fixed_size:\s*(\d+)", notes)]
+    obj.unlink(missing_ok=True)
+    return IsaProfile(0, v_mfma, dpp, lds_ops,
+                      max(vgprs, default=0), max(sgprs, default=0),
+                      max(lds, default=0), len(vgprs))
+
+
 def tier_c_gfx942(rep: Report) -> None:
-    sys.stdout.write("\n[TIER C] gfx942 instruction maximality "
-                     "(MFMA matrix-cores + DPP cross-lane, source + AMDGCN)\n")
-    # CDNA3 matrix work reaches the MFMA cores either through the raw
-    # __builtin_amdgcn_mfma_* intrinsic or through the repo's mfma_* helper
-    # family (mfma_tile_16x16 / mfma_matmul_bf16 / mfma_gemm / mfma_bf16_*,
-    # which wrap the builtin in amdgcn_primitives). Count BOTH — the helper
-    # usage is the real signal in the model kernels.
-    mfma_re = (r"__builtin_amdgcn_mfma|mfma_tile|mfma_matmul|mfma_gemm"
-               r"|mfma_bf16")
+    sys.stdout.write("\n[TIER C] gfx942 (MI300X) REAL emitted-ISA maximality "
+                     "(v_mfma matrix-cores + DPP + VGPR/SGPR/LDS)\n")
+    if not shutil.which("clang") or not shutil.which("llvm-objdump"):
+        for _, label in _GFX_KERNELS:
+            rep.add(Probe("C", label, SKIP, "clang/llvm-objdump absent"))
+        rep.silicon.append("gfx942 emitted-ISA audit (needs clang + llvm)")
+        return
+    budget = mk._arch_budget("gfx942")
     for path, label in _GFX_KERNELS:
-        src = (REPO_ROOT / path).read_text()
-        mfma = len(re.findall(mfma_re, src))
-        dpp = len(re.findall(r"dpp|ds_bpermute|ds_swizzle|wave_reduce", src))
-        # All three (attention, decoder, mamba3) are matrix-bearing and must
-        # reach the MFMA cores to be instruction-maximal on gfx942.
-        ok = mfma > 0
-        detail = f"MFMA matrix-core uses={mfma}  DPP/cross-lane uses={dpp}"
-        if mfma == 0:
-            detail += "  ← expected matrix-core MFMA, found none"
-        rep.add(Probe("C", label, PASS if ok else FAIL, detail))
+        t0 = time.monotonic()
+        pr = _gfx942_isa(REPO_ROOT / path)
+        secs = time.monotonic() - t0
+        if pr.rc != 0:
+            rep.add(Probe("C", label, FAIL, pr.err, secs))
+            continue
+        # Maximal iff the matrix kernel actually emits v_mfma in the ISA and
+        # does not blow the VGPR budget (gfx942 = 256 VGPR/lane).
+        ok = pr.v_mfma > 0 and pr.vgpr_max <= budget.max_regs_per_thread
+        detail = (f"v_mfma={pr.v_mfma} DPP={pr.dpp} ds_rw={pr.lds_ops} | "
+                  f"{pr.n_kernels} kernels, VGPR≤{pr.vgpr_max} SGPR≤{pr.sgpr_max} "
+                  f"LDS≤{pr.lds_max}B (budget {budget.max_regs_per_thread} VGPR)")
+        if pr.v_mfma == 0:
+            detail += "  ← NO v_mfma in ISA (not maximal!)"
+        rep.add(Probe("C", label, PASS if ok else FAIL, detail, secs))
         rep.table.append((f"gfx942 {label}", detail))
-    rep.silicon.append("gfx942 real VGPR/LDS occupancy + L1→L3 promotion "
-                       "(needs rocprof on MI300X — free-standing clang omits "
-                       "HSA group_segment metadata)")
+    rep.silicon.append("gfx942 dynamic-LDS launch footprint + true occupancy "
+                       "for the L1→L3 promotion (needs rocprof on MI300X — the "
+                       "static descriptor LDS is exact, dynamic LDS is a launch "
+                       "parameter)")
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +444,68 @@ def tier_d_functional(rep: Report) -> None:
 
 
 # ---------------------------------------------------------------------------
+# TIER E — tpu_v6e (Trillium) instruction maximality: real OPTIMIZED HLO +
+# host execution (the TPU analogue of the SASS/ISA audit — the MXU is XLA-
+# compiler-mapped from dot_general, so optimized-HLO dot/fusion counts + a real
+# run are the instruction-level evidence; live MXU emission needs the TPU).
+# ---------------------------------------------------------------------------
+
+# A spread across all 3 models + light/heavy optimizers (the MXU dot count is a
+# property of the MODEL stages; the optimizer drives the fused tail).
+_TPU_CELLS = [
+    ("mamba3", "adamw"), ("transformer_decoder", "muon"),
+    ("vit", "supergrok2"), ("mamba3", "prodigy"),
+]
+
+
+def tier_e_tpu(rep: Report) -> None:
+    sys.stdout.write("\n[TIER E] tpu_v6e (Trillium) HLO maximality "
+                     "(dot_general MXU matmuls + XLA fusion, compiled + run)\n")
+    try:
+        import jax  # noqa: F401
+        from csrc.backends.pallas._pallas_fused import profile_cell
+    except Exception as exc:  # noqa: BLE001
+        for model, opt in _TPU_CELLS:
+            rep.add(Probe("E", f"tpu_v6e {model}/{opt}", SKIP,
+                          f"jax/pallas absent: {str(exc)[:60]}"))
+        rep.silicon.append("tpu_v6e HLO audit (needs jax)")
+        return
+    # Confirm the v6e binding uses the 256-wide MXU tile (vs v5p's 128).
+    try:
+        from csrc.backends.pallas.v6e import TILE_SIZE
+        ok = TILE_SIZE == 256
+        rep.add(Probe("E", "v6e MXU tile = 256", PASS if ok else FAIL,
+                      f"TILE_SIZE={TILE_SIZE} (v6e Trillium MXU is 256-wide)"))
+    except Exception as exc:  # noqa: BLE001
+        rep.add(Probe("E", "v6e MXU tile = 256", FAIL, str(exc)[:120]))
+
+    for model, opt in _TPU_CELLS:
+        t0 = time.monotonic()
+        try:
+            pr = profile_cell(model, opt, "L3")
+            secs = time.monotonic() - t0
+            # Maximal iff the compiled program actually contains MXU matmuls
+            # (dot ops) and XLA fused them, and the program runs finite.
+            ok = pr["n_dot"] > 0 and pr["n_fusion"] > 0 and pr["finite"]
+            detail = (f"dot(MXU)={pr['n_dot']} fusion={pr['n_fusion']} "
+                      f"convert={pr['n_convert']} executed={pr['executed']} "
+                      f"finite={pr['finite']} | HLO {pr['hlo_chars']}c")
+            if pr["n_dot"] == 0:
+                detail += "  ← NO dot/MXU ops (not maximal!)"
+            elif not pr["finite"]:
+                detail += "  ← non-finite output (not correct!)"
+            rep.add(Probe("E", f"tpu_v6e {model}/{opt}",
+                          PASS if ok else FAIL, detail, secs))
+            rep.table.append((f"tpu_v6e {model}/{opt}", detail))
+        except Exception as exc:  # noqa: BLE001
+            rep.add(Probe("E", f"tpu_v6e {model}/{opt}", FAIL,
+                          str(exc)[:160], time.monotonic() - t0))
+    rep.silicon.append("tpu_v6e real MXU instruction emission + wall-clock "
+                       "(needs a TPU v6e — CPU lowers the same HLO but maps "
+                       "dot_general to the host backend, not the MXU)")
+
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 
@@ -438,27 +562,33 @@ def main(argv: Optional[List[str]] = None) -> int:
         prog="python -m grokking_optimizers.profile_maximal",
         description="Profile the emitted binaries to prove they are maximal "
                     "(tensor cores, TMA, no spills) and correct (descend).")
-    ap.add_argument("--tier", choices=["A", "B", "C", "D"], default=None,
-                    help="Run only one tier (default: all).")
+    ap.add_argument("--tier", choices=["A", "B", "C", "D", "E"], default=None,
+                    help="Run only one tier (default: all). "
+                         "A/B=sm_90(H100), C=gfx942(MI300X), D=functional, "
+                         "E=tpu_v6e.")
     ap.add_argument("--quick", action="store_true",
-                    help="Functional correctness (tier D) only — no compiles.")
+                    help="Functional + per-arch fast tiers (C/D/E) — no nvcc.")
     args = ap.parse_args(argv)
 
     started = time.monotonic()
     sys.stdout.write("[profile-maximal] toolchain: "
                      f"nvcc={'yes' if shutil.which('nvcc') else 'NO'} "
                      f"clang={'yes' if shutil.which('clang') else 'NO'} "
-                     f"cuobjdump={'yes' if shutil.which('cuobjdump') else 'NO'}\n")
+                     f"cuobjdump={'yes' if shutil.which('cuobjdump') else 'NO'} "
+                     f"llvm-objdump="
+                     f"{'yes' if shutil.which('llvm-objdump') else 'NO'}\n")
     rep = Report()
     run_all = args.tier is None and not args.quick
     if run_all or args.tier == "A":
         tier_a_gemm(rep)
     if run_all or args.tier == "B":
         tier_b_resources(rep)
-    if run_all or args.tier == "C":
+    if run_all or args.quick or args.tier == "C":
         tier_c_gfx942(rep)
     if run_all or args.quick or args.tier == "D":
         tier_d_functional(rep)
+    if run_all or args.quick or args.tier == "E":
+        tier_e_tpu(rep)
     return report(rep, started)
 
 

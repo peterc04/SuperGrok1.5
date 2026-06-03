@@ -984,32 +984,20 @@ def _build_dummy_opt_state(optimizer: str, params: Any) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # trace_check: prove the composition traces + lowers without running on HW.
 # ---------------------------------------------------------------------------
-def trace_check(model: str, optimizer: str, tier: str = "L3") -> str:
-    """Trace + lower :func:`fused_step` for a cell on tiny dummy inputs.
-
-    Builds tiny model weights / inputs / optimizer state, then runs
-    :func:`jax.eval_shape` and ``jax.jit(...).lower(...)`` to confirm the real
-    fused program traces and lowers to HLO. NO hardware execution occurs.
-
-    Returns ``"ok"`` on success; raises on any failure.
-    """
+def _build_cell_call(model: str, optimizer: str, tier: str):
+    """Shared setup for trace_check / profile_cell: build the real fused
+    closure + its (weights, dyn_state) args on tiny dummy inputs. Returns
+    ``(call_fn, weights, dyn_state)``."""
     model = canonicalize_model(model)
     _require_ready(model, optimizer)
     batch, weights, cfg = _TINY_MODELS[model]()
     opt_state = _build_dummy_opt_state(optimizer, weights)
 
-    # Real forward (undecorated body) to size the upstream cotangent.
     forward = _forward_fn(model)
     logits_shape = jax.eval_shape(lambda w: forward(batch, w, cfg), weights)
     grad_logits = jnp.ones(logits_shape.shape, logits_shape.dtype)
     inputs = {"batch": batch, "cfg": cfg, "grad_logits": grad_logits}
-
-    # For L1 (optimizer-only) supply zero grads shaped like the params.
     dummy_grads = None if tier == "L3" else _zeros_like_tree(weights)
-
-    # Only the DYNAMIC state crosses the trace/lower boundary; the ``_static``
-    # config is re-attached as python constants inside the closure so it is
-    # never converted to a tracer (it drives kernel control flow + dims).
     dyn_state, static = _split_static(opt_state)
 
     def _call(w, st):
@@ -1020,12 +1008,56 @@ def trace_check(model: str, optimizer: str, tier: str = "L3") -> str:
             lr=1e-3, tier=tier,
         )
 
+    return _call, weights, dyn_state
+
+
+def trace_check(model: str, optimizer: str, tier: str = "L3") -> str:
+    """Trace + lower :func:`fused_step` for a cell on tiny dummy inputs.
+
+    Builds tiny model weights / inputs / optimizer state, then runs
+    :func:`jax.eval_shape` and ``jax.jit(...).lower(...)`` to confirm the real
+    fused program traces and lowers to HLO. NO hardware execution occurs.
+
+    Returns ``"ok"`` on success; raises on any failure.
+    """
+    _call, weights, dyn_state = _build_cell_call(model, optimizer, tier)
+
     # 1) Shape inference (cheap): proves the fused closure is traceable.
     jax.eval_shape(_call, weights, dyn_state)
 
     # 2) Full lowering of fused_step to HLO (no hardware execution).
     jax.jit(_call).lower(weights, dyn_state)
     return "ok"
+
+
+def profile_cell(model: str, optimizer: str, tier: str = "L3") -> Dict[str, Any]:
+    """Compile a cell's real fused program to optimized HLO + EXECUTE it on the
+    host (CPU) backend — the TPU-side analogue of the sm_90 SASS / gfx942 ISA
+    audit. The TPU MXU is XLA-compiler-mapped from ``dot_general`` ops, so the
+    optimized-HLO dot/fusion/convert counts are the instruction-level evidence;
+    real MXU emission + wall-clock are the silicon-only residual.
+
+    Returns a dict: n_dot (MXU matmuls), n_fusion (XLA fusions = the L3 fusion),
+    n_convert (bf16<->f32), executed (bool), finite (bool), hlo_chars.
+    """
+    import re as _re
+
+    _call, weights, dyn_state = _build_cell_call(model, optimizer, tier)
+    jitted = jax.jit(_call)
+    hlo = jitted.lower(weights, dyn_state).compile().as_text()
+    n_dot = len(_re.findall(r"\bdot\b|dot_general|custom-call.*gemm", hlo))
+    n_fusion = len(_re.findall(r"\bfusion\b|kLoop|kInput|kOutput", hlo))
+    n_convert = len(_re.findall(r"\bconvert\b", hlo))
+
+    # Execute on the host backend and confirm every output leaf is finite.
+    out = jitted(weights, dyn_state)
+    leaves = jax.tree_util.tree_leaves(out)
+    finite = all(bool(jnp.all(jnp.isfinite(x))) for x in leaves
+                 if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating))
+    return {
+        "n_dot": n_dot, "n_fusion": n_fusion, "n_convert": n_convert,
+        "executed": True, "finite": finite, "hlo_chars": len(hlo),
+    }
 
 
 __all__ = [
