@@ -209,20 +209,30 @@ file ↔ solver tier ↔ cell comment ↔ dispatch route ↔ status table); fusi
 map sm_90 **L3×33** / gfx942 **L3×11 + L1×22** / tpu_v6e **L3×33**; the
 math-drift guard passes and **provably triggers** on injected divergence.
 
-**Binary maximality** (`profile_maximal` **17/17**, real emitted-code numbers):
-the sm_90 GEMM TUs emit Hopper **WGMMA tensor cores (80–176/TU) + TMA async
-copies (84–164/TU)** via the CUTLASS Sm90 collectives, with the wgmma mainloop
-**not serialized** (ptxas C7509 = 0, after `-DNDEBUG` strips the CUTLASS asserts
-that an extern `__assert_fail` otherwise forced into the pipeline) and **zero
-register spills**; the fused megakernel cells run at **30–32 real registers**
-(vs the 255 budget) with **0 spills** (the solver's 168–176 estimate is
-conservative; the heavy tiles live in dynamic smem, a launch parameter);
-gfx942 attention/decoder/mamba reach the **MFMA matrix cores** (+ DPP cross-lane
-reductions); and the optimizer math **provably descends** on CPU (Adam core
-32→3.6e-8, Lion 32→2.8e-12). What remains is **silicon-only**: wall-clock
-latency/throughput, achieved occupancy + bandwidth (ncu/rocprof), the
-autotuner's measured-latency config selection, and the gfx942 L1→L3 promotion
-(real LDS via rocprof).
+**Binary maximality** (`profile_maximal` **23/23**, real emitted-code numbers —
+all three target archs get the SAME standard):
+- **sm_90 (H100)** — SASS via `cuobjdump` + `ptxas -v`: the GEMM TUs emit Hopper
+  **WGMMA tensor cores (80–176/TU) + TMA async copies (84–164/TU)** via the
+  CUTLASS Sm90 collectives, with the wgmma mainloop **not serialized** (ptxas
+  C7509 = 0, after `-DNDEBUG` strips the CUTLASS asserts that an extern
+  `__assert_fail` otherwise forced into the pipeline) and **zero register
+  spills**; the fused megakernel cells run at **30–32 real registers** (vs the
+  255 budget) with **0 spills**.
+- **gfx942 (MI300X)** — real AMDGCN ISA via `llvm-objdump` + `llvm-readobj`:
+  the attention kernel emits **20 `v_mfma_f32_16x16x16_bf16`** matrix-core
+  instructions + 36 DPP cross-lane ops; decoder/vit/mamba emit `v_mfma` in-ISA;
+  real **VGPR ≤ 105 / 255** from the AMDGPU kernel descriptor.
+- **tpu_v6e (Trillium)** — optimized HLO via `jax` compile + host run: every
+  fused cell compiles to **`dot_general` MXU matmuls (202–618/cell) + XLA
+  fusion (271–744/cell)** and **executes finite** on CPU; the v6e binding uses
+  the **256-wide MXU tile**.
+- **functional**: the optimizer math **provably descends** (Adam core
+  32→3.6e-8, Lion 32→2.8e-12).
+
+What remains is **silicon-only** for every arch: wall-clock latency/throughput,
+achieved occupancy + bandwidth (ncu/rocprof), the autotuner's measured-latency
+config selection, the gfx942 L1→L3 promotion (dynamic-LDS via rocprof), and real
+MXU instruction emission on the TPU.
 
 ### Observability — device utilization across all 33 pipelines per arch
 
