@@ -43,6 +43,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -135,12 +136,33 @@ def probe_toolchain() -> Toolchain:
 # Shell helpers
 # ---------------------------------------------------------------------------
 
+# A CUTLASS-heavy nvcc compile can OOM when several run concurrently (SIGKILL →
+# rc -9 / 137). That is memory contention, NOT a compile error — the TU builds
+# fine alone. When we see a kill we retry the unit ONCE while holding this lock,
+# so the retry runs with the machine to itself.
+_EXCLUSIVE = threading.Lock()
+
+
+def _is_oom_kill(rc: int, out: str) -> bool:
+    return rc in (-9, 137) or out.strip().endswith("Killed") or "Killed" in out
+
+
 def _run(cmd: List[str], timeout: int = 300) -> Tuple[int, str]:
     """Run a command in REPO_ROOT, return (rc, combined-tail)."""
     proc = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True,
                           text=True, timeout=timeout)
     out = (proc.stdout or "") + (proc.stderr or "")
     return proc.returncode, out.strip()
+
+
+def _run_resilient(cmd: List[str], timeout: int = 600) -> Tuple[int, str]:
+    """_run, but if the child is OOM-killed, retry once holding _EXCLUSIVE so
+    the heavy compile runs alone (full memory)."""
+    rc, out = _run(cmd, timeout)
+    if _is_oom_kill(rc, out):
+        with _EXCLUSIVE:
+            rc, out = _run(cmd, timeout)
+    return rc, out
 
 
 def _cell_path(model: str, optimizer: str, arch: str) -> Path:
@@ -278,10 +300,13 @@ def _nvcc_compile(tu: Path) -> Tuple[bool, str]:
     # CUTLASS WGMMA/TMA collectives for SG2 + the model GEMMs). supergrok2's
     # launcher and the model TUs hard-#error without it; the cuBLAS megakernel
     # cells are unaffected by it. Test what actually ships.
-    rc, out = _run(["bash", "scripts/compile_to_object.sh", str(tu),
-                    "-DWITH_CUTLASS"], timeout=600)
+    rc, out = _run_resilient(
+        ["bash", "scripts/compile_to_object.sh", str(tu), "-DWITH_CUTLASS"],
+        timeout=900)
     if rc == 0:
         return True, ""
+    if _is_oom_kill(rc, out):
+        return False, "OOM-killed even on exclusive retry (lower --jobs)"
     return False, _first_error(out)
 
 
