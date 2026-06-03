@@ -513,9 +513,19 @@ elif _has_gpu:
     # see the module-top TODO. We fall back to the historical hand-maintained
     # list if compile.py could not be imported.
     if _COMPILE_NVCC_BASE is not None:
-        cuda_nvcc = list(_COMPILE_NVCC_BASE) + ["-lineinfo"] + gencode
-        print("  NVCC base flags: sourced from compile.NVCC_DEVICE_BASE "
-              "(autotuner-shared)")
+        # compile.NVCC_DEVICE_BASE is now STRICT-MATH (mandate #6) and carries
+        # NO project opinion (NDEBUG migrated out). setup.py IS the grokking
+        # project, so it re-adds grokking's OWN flag decisions here — exactly
+        # the [device_cflags].extra = ["-DNDEBUG"] the autotuner sources from
+        # compile_config.toml, plus grokking's chosen --use_fast_math. This
+        # keeps the install build byte-aligned with the historical fast path
+        # (WGMMA de-serialization, fused-math) while the universal tool's base
+        # stays opinion-free. CUDA_DEBUG strips both below.
+        _grok_proj_nvcc = ["--use_fast_math", "-DNDEBUG"]
+        cuda_nvcc = (list(_COMPILE_NVCC_BASE) + _grok_proj_nvcc
+                     + ["-lineinfo"] + gencode)
+        print("  NVCC base flags: compile.NVCC_DEVICE_BASE (strict) "
+              "+ grokking project flags (--use_fast_math, -DNDEBUG)")
     else:
         cuda_nvcc = [
             "-O3", "--use_fast_math", "-std=c++17", "-DWITH_CUDA",
