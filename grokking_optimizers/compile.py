@@ -5518,20 +5518,40 @@ def topk_refine(
     return records
 
 
+# Mandate #16 — variant origins that are GENERATED or TRANSFORMED rather
+# than a straight re-compile of the committed source. These rewrite the
+# kernel (synth codegen, polyhedral reschedule, CUTLASS/CK emitters) or
+# change its numerics (fast-math), so they are unsafe to ship UNLESS they
+# passed the strict on-device oracle. A trial of one of these origins is
+# ineligible in pick_winner until its numerical_status is a PASS
+# ("ok"/"deterministic"); "skipped" (never validated) is not enough.
+_VALIDATION_REQUIRED_ORIGINS: frozenset = frozenset({
+    "synth", "polyhedral", "cutlass", "ck", "fastmath",
+})
+_VALIDATION_PASS_STATES: frozenset = frozenset({"ok", "deterministic"})
+
+
 def pick_winner(all_trials: List[Dict[str, Any]], *,
                 strict_numerics: bool = False) -> Optional[Dict[str, Any]]:
     """Lowest timing across all stages, after numerical-validation filtering.
 
-    Stream 10 filter rules:
+    Filter rules (Stream 10 + mandate #16):
       * Always exclude trials whose ``numerical_status`` is
-        ``"numerical_fail"`` — that variant produced an output outside
-        tolerance vs. the reference and is unsafe to ship as the winner.
+        ``"numerical_fail"`` — outside tolerance vs. the strict reference,
+        unsafe to ship.
+      * Mandate #16 — any GENERATED/TRANSFORMED variant (``origin`` in
+        ``_VALIDATION_REQUIRED_ORIGINS``: synth / polyhedral / cutlass / ck /
+        fast-math) is ineligible UNLESS it recorded a strict on-device-oracle
+        PASS (``numerical_status`` in {"ok","deterministic"}). An unvalidated
+        ("skipped") generated variant can NEVER win — this is the hard
+        precondition that closes the "structurally wired but never
+        silicon-validated" gap. A plain template/source recompile (no
+        ``origin``, or ``origin="template"``) keeps the historical behaviour.
       * When ``strict_numerics=True``, only trials tagged
-        ``"deterministic"`` are eligible (i.e. bit-identical to the
-        reference AND bit-identical across a 3x re-run).
+        ``"deterministic"`` are eligible (bit-identical to the reference AND
+        across a 3x re-run).
 
-    Returns the winning trial record (with ``config`` and ``timing_ms``)
-    or ``None`` if no trial is eligible.
+    Returns the winning trial record or ``None`` if no trial is eligible.
     """
     finished = [t for t in all_trials if t.get("timing_ms") is not None]
     # Trials produced before Stream 10 lack the numerical_status field;
@@ -5539,6 +5559,15 @@ def pick_winner(all_trials: List[Dict[str, Any]], *,
     # behaves identically for legacy caches.
     eligible = [t for t in finished
                 if t.get("numerical_status", "skipped") != "numerical_fail"]
+    # Mandate #16 — drop generated/transformed variants that never passed
+    # the strict on-device oracle.
+    def _generated_and_unvalidated(t: Dict[str, Any]) -> bool:
+        origin = t.get("origin", "template")
+        if origin not in _VALIDATION_REQUIRED_ORIGINS:
+            return False
+        return t.get("numerical_status", "skipped") not in \
+            _VALIDATION_PASS_STATES
+    eligible = [t for t in eligible if not _generated_and_unvalidated(t)]
     if strict_numerics:
         eligible = [t for t in eligible
                     if t.get("numerical_status") == "deterministic"]
@@ -11258,63 +11287,188 @@ def _split_fused_op_dotted(dotted: str) -> Tuple[str, str]:
     return (".".join(parts[:1]), ".".join(parts[1:]))
 
 
+# ── Mandate #9 — strict-math oracle flag posture ──────────────────────────
+# Fast-math tokens stripped when building the STRICT reference. The oracle
+# must be fast-math-OFF (the ground truth a fast-math variant is judged
+# against); never let the oracle inherit --use_fast_math/-ffast-math.
+_FAST_MATH_FLAGS: frozenset = frozenset({
+    "--use_fast_math", "-ffast-math", "--ftz=true",
+    "-fgpu-flush-denormals-to-zero", "-ffinite-math-only",
+    "-fassociative-math", "-freciprocal-math",
+})
+
+
+def _strict_math_flags(flags: List[str]) -> List[str]:
+    """Mandate #9 — strip every fast-math token from a flag list and append
+    the strict/wide-accumulation marker. Pure / CPU-testable."""
+    out = [f for f in flags if f not in _FAST_MATH_FLAGS]
+    if "-DSG_STRICT_MATH=1" not in out:
+        out.append("-DSG_STRICT_MATH=1")
+    return out
+
+
+# ── Mandate #12 — stack-level determinism preamble ────────────────────────
+# Injected into every validation subprocess so the "deterministic" tag means
+# what it claims: CUBLAS_WORKSPACE_CONFIG forces cuBLAS to a fixed workspace
+# (required for deterministic GEMM), and use_deterministic_algorithms makes
+# torch raise on any nondeterministic kernel rather than silently using one.
+_DETERMINISM_PREAMBLE = (
+    "os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')\n"
+    "        os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')\n")
+
+_DETERMINISM_TORCH_SETUP = (
+    "try:\n"
+    "            torch.use_deterministic_algorithms(True, warn_only=True)\n"
+    "        except Exception:\n"
+    "            pass\n")
+
+
+# ── Mandate #10 — randomized, adversarial input synthesis ─────────────────
+# Magnitude regimes the validation inputs span. Each maps to a torch
+# expression building a tensor of the given shape/dtype from a seeded
+# generator ``g``. The adversarial regime mixes large / tiny / zero so a
+# transform that breaks on cancellation or dynamic range is caught — but
+# stays FINITE (NaN/Inf would make the tolerance comparison meaningless).
+_INPUT_REGIMES: Tuple[str, ...] = ("normal", "large", "small", "adversarial")
+
+
+def _regime_tensor_expr(regime: str, size_expr: str, dtype_expr: str) -> str:
+    """Return a torch expression (string) building one input tensor for the
+    given magnitude regime. Pure / CPU-testable (returns code, runs nowhere
+    here)."""
+    base = f"torch.randn({size_expr}, generator=g, dtype=torch.float32)"
+    if regime == "normal":
+        expr = base
+    elif regime == "large":
+        expr = f"({base} * 1e4)"
+    elif regime == "small":
+        expr = f"({base} * 1e-4)"
+    elif regime == "adversarial":
+        # Interleave large / tiny / zero magnitudes across the buffer.
+        expr = (f"({base} * "
+                f"torch.tensor([1e6, 1e-6, 0.0, 1.0], dtype=torch.float32)"
+                f".repeat(({size_expr} + 3) // 4)[:{size_expr}])")
+    else:
+        expr = base
+    return f"({expr}).to(device='cuda', dtype={dtype_expr})"
+
+
+def _synthesize_input_spec(n_tensors: int, n_scalars: int, *,
+                           regime: str = "normal",
+                           seed: int = 0) -> Dict[str, Any]:
+    """Mandate #10 — describe the synthesized inputs for a discovered entry:
+    ``n_tensors`` seeded random tensors in the given magnitude regime, plus
+    ``n_scalars`` scalar defaults. Returned dict is JSON-serializable and
+    cached for reproducibility (the seed is recorded). Pure / CPU-testable."""
+    if regime not in _INPUT_REGIMES:
+        raise ValueError(f"unknown input regime {regime!r}; "
+                         f"valid: {_INPUT_REGIMES}")
+    return {"n_tensors": n_tensors, "n_scalars": n_scalars,
+            "regime": regime, "seed": seed}
+
+
+def _render_arg_construction(entry: Optional["DiscoveredEntry"],
+                             size: int, regime: str, seed: int) -> str:
+    """Build the subprocess code that constructs the call arguments.
+
+    With a discovered ``entry`` (mandate #4/#11): one synthesized tensor per
+    tensor arg (in the given regime), a sensible default per scalar arg, in
+    schema order. Without an entry (grokking back-compat): the historical
+    Adam-style ``(param, grad, m, v, lr, b1, b2, eps, wd, step)`` arg list —
+    but with SYNTHESIZED inputs (#10) instead of the degenerate zeros/ones.
+    """
+    lines: List[str] = [
+        f"g = torch.Generator().manual_seed({seed})",
+    ]
+    if entry is not None and entry.args:
+        names: List[str] = []
+        scalar_floats = iter([1e-3, 0.9, 0.999, 1e-8, 0.01, 1.0])
+        for i, a in enumerate(entry.args):
+            vn = f"a{i}"
+            if a.kind == "tensor":
+                lines.append(
+                    f"{vn} = {_regime_tensor_expr(regime, str(size), 'dtype')}")
+            elif a.dtype == "int":
+                lines.append(f"{vn} = 1")
+            elif a.dtype == "bool":
+                lines.append(f"{vn} = False")
+            else:
+                lines.append(f"{vn} = {next(scalar_floats, 1e-3)}")
+            names.append(vn)
+        lines.append(f"call_args = [{', '.join(names)}]")
+        # The buffer we snapshot for comparison (in-place / first tensor).
+        idx = entry.mutated_arg_index
+        lines.append(f"snapshot_idx = {idx if idx is not None else 0}")
+    else:
+        t = _regime_tensor_expr(regime, str(size), "dtype")
+        lines.append(f"param = {t}")
+        lines.append(f"grad  = {_regime_tensor_expr(regime, str(size), 'dtype')}")
+        lines.append(f"m     = torch.zeros({size}, dtype=dtype, device='cuda')")
+        lines.append(f"v     = torch.zeros({size}, dtype=dtype, device='cuda')")
+        lines.append("call_args = [param, grad, m, v, "
+                     "1e-3, 0.9, 0.999, 1e-8, 0.01, 1.0]")
+        lines.append("snapshot_idx = 0")
+    return "\n        ".join(lines)
+
+
 def _capture_reference_output(aot_so_path: Path, opt_class: str,
                               size: int, dtype: str,
                               out_dir: Path,
-                              fused_op_template: Optional[str] = None) -> Path:
-    """Run the AOT optimiser once and save the post-step parameter tensor
-    as a .npy file. Cached per (opt, size, dtype) — re-uses an existing
-    snapshot if one is already on disk.
+                              fused_op_template: Optional[str] = None,
+                              entry: Optional["DiscoveredEntry"] = None,
+                              regime: str = "normal",
+                              seed: int = 0) -> Path:
+    """Mandate #9/#10/#11 — capture the STRICT reference output.
 
-    Stream A: ``fused_op_template`` (default
-    ``torch.ops.grokking_optimizers.fused_{opt_lower}_simple_step``) is
-    the dotted path the subprocess walks via ``getattr`` to find the
-    fused-step op registered by ``torch.ops.load_library``. Pass a custom
-    template (e.g. ``torch.ops.myproj.fused_{opt_lower}_step``) for a
-    third-party project that registers ops in its own namespace.
+    ``aot_so_path`` MUST be a fast-math-OFF strict-math build of the
+    discovered entry (the caller builds it with ``_strict_math_flags``); this
+    function runs it once on SYNTHESIZED inputs (``regime``/``seed``, #10)
+    using the DISCOVERED signature (``entry``, #11) and snapshots the
+    mutated/first tensor as the .npy oracle. With no ``entry`` it falls back
+    to the historical Adam-style arg list (grokking back-compat) but still
+    uses synthesized inputs, never the degenerate zeros/ones.
+
+    Cached per (opt, size, dtype, regime, seed). The seed is part of the key
+    so the reproducible regime is provenance-tracked (#10).
     """
-    ref_path = out_dir / f"ref_output_{opt_class}_{size}_{dtype}.npy"
+    ref_path = out_dir / \
+        f"ref_output_{opt_class}_{size}_{dtype}_{regime}_s{seed}.npy"
     if ref_path.exists():
         return ref_path
     out_dir.mkdir(parents=True, exist_ok=True)
     tmpl = fused_op_template or _DEFAULT_FUSED_OP_TEMPLATE
-    dotted = _format_fused_op_template(tmpl, opt_class)
+    dotted = (entry.dotted_path if entry is not None
+              else _format_fused_op_template(tmpl, opt_class))
     root_expr, attr_chain = _split_fused_op_dotted(dotted)
-    # Tiny subprocess: load the AOT .so via torch.ops.load_library, run a
-    # single fused-step call, dump the resulting param tensor with numpy.
-    # Wrapped in a try/except so a missing torch op falls through to
-    # "skipped" upstream rather than crashing the entire autotune.
+    arg_setup = _render_arg_construction(entry, size, regime, seed)
     script = textwrap.dedent(f"""
         import os, sys, numpy as np
-        os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
+        {_DETERMINISM_PREAMBLE.strip()}
         import torch
+        {_DETERMINISM_TORCH_SETUP.strip()}
         torch.ops.load_library(r'''{aot_so_path}''')
-        torch.manual_seed(0)
+        torch.manual_seed({seed})
         dtype = getattr(torch, '{dtype}')
-        param = torch.zeros({size}, dtype=dtype, device='cuda')
-        grad  = torch.ones( {size}, dtype=dtype, device='cuda')
-        m     = torch.zeros({size}, dtype=dtype, device='cuda')
-        v     = torch.zeros({size}, dtype=dtype, device='cuda')
-        # Stream A: walk the configured fused-op dotted path via getattr
-        # so a custom namespace (torch.ops.myproj.*) works the same as
-        # the default torch.ops.grokking_optimizers.*.
+        {arg_setup}
         root = {root_expr}
         attr = {attr_chain!r}
         op = root
         for _part in attr.split('.'):
             op = getattr(op, _part, None)
             if op is None:
-                sys.stderr.write('no fused op for {opt_class} at {dotted}\\n')
+                sys.stderr.write('no op for {opt_class} at {dotted}\\n')
                 sys.exit(2)
-        op(param, grad, m, v, 1e-3, 0.9, 0.999, 1e-8, 0.01, 1.0)
-        np.save(r'''{ref_path}''', param.detach().cpu().numpy())
+        op(*call_args)
+        snap = call_args[snapshot_idx]
+        np.save(r'''{ref_path}''', snap.detach().cpu().float().numpy())
         print('OK')
     """)
     r = subprocess.run([sys.executable, "-c", script],
                        capture_output=True, text=True, timeout=120)
     if r.returncode != 0 or not ref_path.exists():
         raise RuntimeError(
-            f"reference capture failed (rc={r.returncode}): "
+            f"strict reference capture failed (rc={r.returncode}) for "
+            f"{opt_class} regime={regime} seed={seed}: "
             f"stderr={r.stderr[-500:]}")
     return ref_path
 
@@ -11347,27 +11501,29 @@ def _compare_outputs(ref_path: Path, candidate_path: Path,
 def _dump_variant_output(variant_so: Path, opt_class: str, size: int,
                          dtype: str, out_path: Path,
                          timeout: int = 120,
-                         fused_op_template: Optional[str] = None) -> bool:
-    """Run the variant .so once and dump its post-step param tensor to
-    ``out_path``. Returns True on success.
-
-    Stream A: ``fused_op_template`` mirrors ``_capture_reference_output``
-    — same default, same placeholder syntax, same getattr walk.
+                         fused_op_template: Optional[str] = None,
+                         entry: Optional["DiscoveredEntry"] = None,
+                         regime: str = "normal",
+                         seed: int = 0) -> bool:
+    """Run the variant .so once on the SAME synthesized inputs the oracle
+    used (#9/#10/#11) and dump the snapshot tensor to ``out_path``. Returns
+    True on success. The determinism preamble (#12) is applied so a 3x re-run
+    of this output is a meaningful determinism check.
     """
     tmpl = fused_op_template or _DEFAULT_FUSED_OP_TEMPLATE
-    dotted = _format_fused_op_template(tmpl, opt_class)
+    dotted = (entry.dotted_path if entry is not None
+              else _format_fused_op_template(tmpl, opt_class))
     root_expr, attr_chain = _split_fused_op_dotted(dotted)
+    arg_setup = _render_arg_construction(entry, size, regime, seed)
     script = textwrap.dedent(f"""
         import os, sys, numpy as np
-        os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
+        {_DETERMINISM_PREAMBLE.strip()}
         import torch
+        {_DETERMINISM_TORCH_SETUP.strip()}
         torch.ops.load_library(r'''{variant_so}''')
-        torch.manual_seed(0)
+        torch.manual_seed({seed})
         dtype = getattr(torch, '{dtype}')
-        param = torch.zeros({size}, dtype=dtype, device='cuda')
-        grad  = torch.ones( {size}, dtype=dtype, device='cuda')
-        m     = torch.zeros({size}, dtype=dtype, device='cuda')
-        v     = torch.zeros({size}, dtype=dtype, device='cuda')
+        {arg_setup}
         root = {root_expr}
         attr = {attr_chain!r}
         op = root
@@ -11375,8 +11531,9 @@ def _dump_variant_output(variant_so: Path, opt_class: str, size: int,
             op = getattr(op, _part, None)
             if op is None:
                 sys.exit(2)
-        op(param, grad, m, v, 1e-3, 0.9, 0.999, 1e-8, 0.01, 1.0)
-        np.save(r'''{out_path}''', param.detach().cpu().numpy())
+        op(*call_args)
+        snap = call_args[snapshot_idx]
+        np.save(r'''{out_path}''', snap.detach().cpu().float().numpy())
         print('OK')
     """)
     try:
@@ -11571,6 +11728,18 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         if ref_state["tried"]:
             return None
         ref_state["tried"] = True
+        # Mandate #9 — the oracle must be a fast-math-OFF strict build of the
+        # discovered entry. The AOT .so is the reference source; once #6
+        # (Phase 7) removes fast-math from the base flags, this AOT build is
+        # strict-math by default (fast-math becomes a separately-validated
+        # variant), so the oracle is uncontaminated. The capture itself runs
+        # on synthesized inputs (#10) under the determinism preamble (#12)
+        # using the discovered signature when available (#11).
+        strict_posture = "--use_fast_math" not in NVCC_DEVICE_BASE \
+            and "-ffast-math" not in HOST_CFLAGS_BASE
+        report.write(
+            f"  [numerical] capturing strict oracle "
+            f"(base_strict_math={strict_posture}) on synthesized inputs.\n")
         try:
             p = _capture_reference_output(
                 Path(aot_so), OPT_CLASS[spec.optimizer],
@@ -18953,6 +19122,92 @@ def _self_test_numerical_validation(run) -> None:
         finally:
             _LAST_NUMERICAL_STATUS.pop(ck, None)
 
+    def test_strict_math_strips_fast_math():
+        """#9 — the strict oracle flag posture removes every fast-math token
+        and marks the build strict."""
+        flags = ["-O3", "--use_fast_math", "-ffast-math", "-DNDEBUG",
+                 "-fgpu-flush-denormals-to-zero", "-std=c++17"]
+        strict = _strict_math_flags(flags)
+        assert "--use_fast_math" not in strict
+        assert "-ffast-math" not in strict
+        assert "-fgpu-flush-denormals-to-zero" not in strict
+        assert "-DSG_STRICT_MATH=1" in strict
+        # Non-fast-math flags are preserved.
+        assert "-O3" in strict and "-DNDEBUG" in strict
+
+    def test_input_synthesis_regimes():
+        """#10 — every magnitude regime produces a distinct device tensor
+        expression; the seed is recorded for reproducibility."""
+        for regime in _INPUT_REGIMES:
+            expr = _regime_tensor_expr(regime, "4096", "dtype")
+            assert "generator=g" in expr
+            assert "device='cuda'" in expr
+        # large vs small vs normal differ.
+        assert _regime_tensor_expr("large", "8", "dtype") != \
+            _regime_tensor_expr("small", "8", "dtype")
+        spec = _synthesize_input_spec(4, 6, regime="adversarial", seed=7)
+        assert spec["seed"] == 7 and spec["regime"] == "adversarial"
+
+    def test_input_synthesis_rejects_bad_regime():
+        try:
+            _synthesize_input_spec(1, 0, regime="bogus")
+            raise AssertionError("expected ValueError on bad regime")
+        except ValueError:
+            pass
+
+    def test_arg_construction_uses_synth_not_zeros_ones():
+        """#10 — the back-compat (no-entry) path now synthesizes randn inputs
+        instead of the degenerate param=zeros/grad=ones."""
+        code = _render_arg_construction(None, 4096, "normal", 0)
+        assert "torch.randn" in code, code
+        assert "torch.ones(" not in code, "must not use grad=ones degenerate"
+        # Discovered-entry path constructs one tensor per tensor arg.
+        entry = DiscoveredEntry(
+            "step", "torch_op", "torch.ops.x.step",
+            args=[EntryArg("p", "tensor", alias=True),
+                  EntryArg("g", "tensor"),
+                  EntryArg("lr", "scalar", dtype="float")])
+        code2 = _render_arg_construction(entry, 256, "large", 3)
+        assert "call_args = [a0, a1, a2]" in code2, code2
+        assert "snapshot_idx = 0" in code2
+
+    def test_determinism_preamble_present():
+        """#12 — validation subprocesses set CUBLAS_WORKSPACE_CONFIG and
+        enable deterministic algorithms."""
+        assert "CUBLAS_WORKSPACE_CONFIG" in _DETERMINISM_PREAMBLE
+        assert "use_deterministic_algorithms" in _DETERMINISM_TORCH_SETUP
+
+    def test_pick_winner_rejects_unvalidated_generated():
+        """#16 — a faster synth/cutlass/fastmath variant that never passed
+        the strict oracle (status 'skipped') is INELIGIBLE; a slower
+        validated template variant wins instead."""
+        trials = [
+            {"timing_ms": 0.2, "numerical_status": "skipped",
+             "origin": "synth", "config": {}, "trial_num": 0},
+            {"timing_ms": 0.2, "numerical_status": "skipped",
+             "origin": "cutlass", "config": {}, "trial_num": 1},
+            {"timing_ms": 0.5, "numerical_status": "skipped",
+             "origin": "template", "config": {}, "trial_num": 2},
+        ]
+        w = pick_winner(trials)
+        assert w is not None and w["origin"] == "template", w
+        # A synth variant that DID pass the oracle is eligible and wins.
+        trials.append({"timing_ms": 0.1, "numerical_status": "ok",
+                       "origin": "synth", "config": {}, "trial_num": 3})
+        w2 = pick_winner(trials)
+        assert w2 is not None and w2["timing_ms"] == 0.1, w2
+
+    def test_pick_winner_fastmath_needs_validation():
+        """#6/#16 — a fast-math variant only wins if it matched the strict
+        oracle."""
+        trials = [
+            {"timing_ms": 0.1, "numerical_status": "skipped",
+             "origin": "fastmath", "config": {}, "trial_num": 0},
+            {"timing_ms": 0.3, "numerical_status": "ok",
+             "origin": "template", "config": {}, "trial_num": 1},
+        ]
+        assert pick_winner(trials)["origin"] == "template"
+
     run("tolerances_table_shape", test_tolerances_table_shape)
     run("compare_outputs_tolerant", test_compare_outputs_tolerant)
     run("compare_outputs_numerical_fail", test_compare_outputs_fail)
@@ -18964,6 +19219,16 @@ def _self_test_numerical_validation(run) -> None:
          test_pick_winner_strict_returns_none_when_no_deterministic)
     run("make_trial_record_propagates_numerical_status",
          test_make_trial_record_pulls_numerical_status)
+    run("strict_math_strips_fast_math", test_strict_math_strips_fast_math)
+    run("input_synthesis_regimes", test_input_synthesis_regimes)
+    run("input_synthesis_rejects_bad_regime", test_input_synthesis_rejects_bad_regime)
+    run("arg_construction_synth_not_degenerate",
+        test_arg_construction_uses_synth_not_zeros_ones)
+    run("determinism_preamble_present", test_determinism_preamble_present)
+    run("pick_winner_rejects_unvalidated_generated",
+        test_pick_winner_rejects_unvalidated_generated)
+    run("pick_winner_fastmath_needs_validation",
+        test_pick_winner_fastmath_needs_validation)
 
     # ── Stream B — polyhedral / loop-transform layer ────────────────
 
@@ -19557,7 +19822,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 181
+_SELF_TEST_EXPECTED_COUNT: int = 188
 
 
 def _self_test() -> int:
