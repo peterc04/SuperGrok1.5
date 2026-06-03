@@ -5325,6 +5325,10 @@ def _make_trial_record(stage: str, trial_num: int, cfg: Dict[str, Any],
     # Empty dict (not None) when the variant never went through a compiler
     # invocation we parsed — keeps the sidecar schema stable.
     ptxas_info = dict(_LAST_PTXAS_INFO.get(ckey, {}))
+    # Mandate #16/#20/#21 — variant origin (template / synth / polyhedral /
+    # cutlass / ck / fastmath). pick_winner gates generated/transformed
+    # origins behind a strict-oracle PASS. Defaults to "template".
+    origin = _LAST_VARIANT_ORIGIN.get(ckey, "template")
     return {
         "trial_num":   trial_num,
         "stage":       stage,
@@ -5337,6 +5341,7 @@ def _make_trial_record(stage: str, trial_num: int, cfg: Dict[str, Any],
         "n":           result["n"]         if result else None,
         "host":        host,
         "numerical_status": num_status,
+        "origin":      origin,
         "ptxas_info":  ptxas_info,
         "recorded_at": datetime.datetime.now().isoformat(),
     }
@@ -10993,6 +10998,12 @@ TOLERANCES: Dict[str, Tuple[float, float]] = {
 # ``timer(cfg) -> result-dict`` signature stays unchanged.
 _LAST_NUMERICAL_STATUS: Dict[str, str] = {}
 
+# Mandate #16/#20/#21 — variant ORIGIN sidecar keyed by config_key(). The
+# codegen paths (synth / polyhedral / cutlass / ck / fastmath) stamp the
+# origin here so _make_trial_record can attach it and pick_winner can require
+# a strict-oracle PASS before a generated/transformed variant is eligible.
+_LAST_VARIANT_ORIGIN: Dict[str, str] = {}
+
 # Stream α — parsed ptxas-v info per-variant (regs_used, smem_bytes, etc.).
 # Populated by callers that have ptxas/hipcc stderr, read by
 # ``_make_trial_record`` so cost-model / autotune can consume the metrics.
@@ -11961,10 +11972,24 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
             poly_cfg = (spec.config or {}).get(
                 "polyhedral", {}) or {}
             if poly_cfg.get("enable"):
+                # Mandate #20 — surface missing optional deps loudly (the
+                # heuristic dependence test can emit an ILLEGAL reschedule, so
+                # the user must know when libclang/islpy — which would tighten
+                # legality — are absent).
+                if _try_import_libclang() is None or _try_import_islpy() is None:
+                    report.write(
+                        f"    [polyhedral] libclang/islpy not both present "
+                        f"for {ckey[:24]}: legality is heuristic; every "
+                        f"polyhedral variant is gated behind the strict "
+                        f"on-device oracle (#16/#20).\n")
                 emitted_source = (spec._emitted_sources or {}).get(ckey)
                 if emitted_source is not None and Path(emitted_source).exists():
                     _polyhedral_expand_variant(
                         spec, Path(emitted_source), report)
+                    # Mandate #20 — a polyhedral reschedule can be ILLEGAL;
+                    # tag origin so pick_winner refuses it unless it passes
+                    # the strict numeric oracle (#16).
+                    _LAST_VARIANT_ORIGIN[ckey] = "polyhedral"
         except Exception as exc:
             try:
                 report.write(
@@ -11987,7 +12012,8 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         variant_sources = list(sources)
         if spec.enable_synth_codegen:
             try:
-                synth_path = _try_synth_codegen(spec, config, dims)
+                synth_path = _try_synth_codegen(spec, config, dims,
+                                                report=report)
             except Exception as exc:
                 report.write(
                     f"    [synth_codegen] {ckey[:24]} skipped: "
@@ -12000,9 +12026,14 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                     # the synthesised file. The existing _torch_load
                     # call below picks this list up unchanged.
                     variant_sources = [synth_path]
+                    # Mandate #16 — this variant is GENERATED; tag its origin
+                    # so pick_winner requires a strict-oracle PASS before it
+                    # can win (never ships an unvalidated synth kernel).
+                    _LAST_VARIANT_ORIGIN[ckey] = "synth"
                     report.write(
                         f"    [synth_codegen] {ckey[:24]} "
-                        f"synth-only build: {synth_path.name}\n")
+                        f"synth-only build: {synth_path.name} "
+                        f"(origin=synth — needs oracle PASS to win)\n")
 
         variant_so = _torch_load(
             spec, variant_sources,
@@ -14044,7 +14075,7 @@ def build(
                     and not build_produced_nothing
                     and entry.vendor in ("cuda", "hip")):
                 from grokking_optimizers.kernel_registry import initialize_registry
-                initialize_registry(spec, report)
+                initialize_registry(spec, report, cache=cache)
 
             report.write(f"\n# Cache:    {cache.path}\n")
             if entry.vendor == "pallas":
@@ -19807,8 +19838,9 @@ def _self_test_synth_codegen(run) -> None:
         assert _synth_pattern_for_optimizer("grokfast") == "fused_adam_grad_norm"
         assert _synth_pattern_for_optimizer("adamw") == "adamw_update"
         assert _synth_pattern_for_optimizer("lion") == "adamw_update"
-        # Unknown optimizer falls back to adamw_update (additive).
-        assert _synth_pattern_for_optimizer("brand_new_opt") == "adamw_update"
+        # Mandate #17 — an unknown optimizer now returns None (NO silent
+        # adamw_update default); the caller compiles the existing source.
+        assert _synth_pattern_for_optimizer("brand_new_opt") is None
         # The Newton–Schulz pattern lowers to real tensor-core opcodes.
         g = pattern_newton_schulz(M=256, N=256, dtype="fp16")
         for arch, mnemonic in (("sm_90a", "wgmma"),
@@ -19835,6 +19867,84 @@ def _self_test_synth_codegen(run) -> None:
             assert str(p_m) != str(p_a)
     run("synth_dispatcher_per_optimizer",
          test_synth_dispatcher_per_optimizer)
+
+    def test_synth_pattern_failsafe_unknown_optimizer():
+        """#17 — an unknown optimizer has NO genuine pattern match → None
+        (not a silent adamw_update default)."""
+        assert _synth_pattern_for_optimizer("adamw") == "adamw_update"
+        assert _synth_pattern_for_optimizer("muon") == "newton_schulz"
+        # Unknown → None.
+        assert _synth_pattern_for_optimizer("totally_unknown_opt") is None
+
+    def test_synth_pattern_injectable():
+        """#17 — a project can inject its own optimizer→pattern map."""
+        inj = {"myopt": "softmax_matmul"}
+        assert _synth_pattern_for_optimizer("myopt", inj) == "softmax_matmul"
+        # Injected entry overrides the built-in table.
+        assert _synth_pattern_for_optimizer(
+            "adamw", {"adamw": "newton_schulz"}) == "newton_schulz"
+
+    def test_synth_unknown_optimizer_compiles_source_not_default():
+        """#17 — _try_synth_codegen returns None (compile existing source)
+        for an unknown optimizer instead of mis-synthesizing adamw_update."""
+        with tempfile.TemporaryDirectory() as td:
+            dims = [{"name": "block"}]
+            spec = BuildSpec(optimizer="some_third_party_opt", model="mamba",
+                             arch="sm_90a", out_dir=Path(td),
+                             enable_synth_codegen=True)
+            assert _try_synth_codegen(spec, {"block": 256}, dims) is None
+
+    def test_synth_dtype_from_config():
+        """#18 — dtype plumbed from the config's quant dim, not hardcoded."""
+        sc = {}
+        assert _synth_dtype_from_config({"quant": "bf16"}, [], sc) == "bf16"
+        assert _synth_dtype_from_config({"dtype": "fp16"}, [], sc) == "fp16"
+        # Explicit sc dtype wins.
+        assert _synth_dtype_from_config(
+            {}, [], {"dtype": "fp8"}) == "fp8"
+        # Unknown → fp32.
+        assert _synth_dtype_from_config({"quant": "weird"}, [], {}) == "fp32"
+
+    def test_synth_emits_configured_dtype():
+        """#18 — a non-fp32 config produces a non-fp32 synth kernel."""
+        with tempfile.TemporaryDirectory() as td:
+            dims = [{"name": "block"}]
+            spec = BuildSpec(optimizer="adamw", model="mamba", arch="sm_90a",
+                             out_dir=Path(td), enable_synth_codegen=True,
+                             config={"synth_codegen": {"dtype": "bf16"}})
+            p = _try_synth_codegen(spec, {"block": 256, "quant": "bf16"}, dims)
+            assert p is not None
+            text = p.read_text()
+            # bf16 maps to __nv_bfloat16 in the emitted CUDA source.
+            assert "bfloat16" in text or "__nv_bfloat16" in text, text[:200]
+
+    def test_registry_bakes_tuned_config():
+        """#15 — the registry's cubin cache key + template incorporate the
+        tuned block/vec/unroll, so a re-tuned config produces a new cubin
+        (the autotuner→runtime loop is closed)."""
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as td:
+            r0 = KernelRegistry("sm_90a", Path(td),
+                                tuned_config={"block": 128, "vec": 2, "unroll": 4})
+            r1 = KernelRegistry("sm_90a", Path(td),
+                                tuned_config={"block": 256, "vec": 4, "unroll": 8})
+            k0 = r0._key("adamw", "fp32", "small", 1)
+            k1 = r1._key("adamw", "fp32", "small", 1)
+            assert k0 != k1, "different tuned configs must not share a cubin key"
+            # The template bakes the tuned config into the source.
+            src = r0._template_provider("adamw", "sm_90a").format(
+                DTYPE="float", SHAPE_DIMS=1, SIZE_HINT=256,
+                BLOCK=128, VEC=2, UNROLL=4)
+            assert "kBlock  = 128" in src and "kVec    = 2" in src, src
+
+    run("synth_pattern_failsafe_unknown",
+        test_synth_pattern_failsafe_unknown_optimizer)
+    run("synth_pattern_injectable", test_synth_pattern_injectable)
+    run("synth_unknown_compiles_source",
+        test_synth_unknown_optimizer_compiles_source_not_default)
+    run("synth_dtype_from_config", test_synth_dtype_from_config)
+    run("synth_emits_configured_dtype", test_synth_emits_configured_dtype)
+    run("registry_bakes_tuned_config", test_registry_bakes_tuned_config)
 
     # Stream H — final wrapper: only runs the e2e smoke when a GPU is
     # visible; SKIPs cleanly (and counts as PASS) otherwise.
@@ -20092,7 +20202,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 195
+_SELF_TEST_EXPECTED_COUNT: int = 201
 
 
 def _self_test() -> int:
@@ -22661,12 +22771,45 @@ _OPTIMIZER_SYNTH_PATTERN: Dict[str, str] = {
 }
 
 
-def _synth_pattern_for_optimizer(optimizer: str) -> str:
+def _synth_pattern_for_optimizer(
+        optimizer: str,
+        injected: Optional[Dict[str, str]] = None) -> Optional[str]:
     """Map ``spec.optimizer`` → the OpGraph pattern name the synthesiser
-    should emit (Stage 5 dispatcher). Unknown optimizers fall back to the
-    elementwise ``adamw_update`` pattern — the historical default — so the
-    dispatcher is purely additive."""
-    return _OPTIMIZER_SYNTH_PATTERN.get(optimizer.lower(), "adamw_update")
+    should emit (Stage 5 dispatcher).
+
+    Mandate #17 — fail-safe + injectable:
+      * A project may INJECT its own optimizer→pattern map via
+        ``[synth_codegen].optimizer_patterns`` (``injected`` here); injected
+        entries override the built-in table.
+      * An optimizer with NO genuine match returns ``None`` (NOT a silent
+        ``adamw_update`` default). The caller then compiles the existing
+        source with a logged note instead of mis-synthesizing an arbitrary
+        kernel as an AdamW elementwise pass.
+    """
+    table = dict(_OPTIMIZER_SYNTH_PATTERN)
+    if injected:
+        table.update({str(k).lower(): str(v) for k, v in injected.items()})
+    return table.get(optimizer.lower())
+
+
+def _synth_dtype_from_config(config: Dict[str, Any],
+                             dims: List[Dict[str, Any]],
+                             sc: Dict[str, Any]) -> str:
+    """Mandate #18 — resolve the synth dtype from the config's quant dim
+    (or an explicit ``[synth_codegen].dtype``), instead of hardcoding fp32.
+
+    Order: explicit sc['dtype'] > a 'quant'/'dtype'/'precision' config dim >
+    fp32. Unknown tokens fall back to fp32 (the synth emitter validates the
+    final dtype against _SYNTH_DTYPE_MAP)."""
+    explicit = sc.get("dtype")
+    if explicit and str(explicit) in _SYNTH_DTYPE_MAP:
+        return str(explicit)
+    for key in ("quant", "dtype", "precision", "quant_dtype"):
+        if key in config:
+            val = str(config[key])
+            if val in _SYNTH_DTYPE_MAP:
+                return val
+    return "fp32"
 
 
 # Per-arch lowering helpers consult this table to pick a vendor (cuda /
@@ -23961,7 +24104,8 @@ def _synth_cache_key(pattern_name: str, arch: str, dtype: str,
 
 def _try_synth_codegen(spec: "BuildSpec",
                        config: Dict[str, Any],
-                       dims: List[Dict[str, Any]]) -> Optional[Path]:
+                       dims: List[Dict[str, Any]],
+                       report=None) -> Optional[Path]:
     """Attempt OpGraph synthesis for ``(spec.optimizer, spec.arch)``.
 
     Returns the emitted source ``Path`` on success, ``None`` when no
@@ -23995,20 +24139,42 @@ def _try_synth_codegen(spec: "BuildSpec",
     # the e2e_smoke GPU path. What is wired: the dispatch (pattern selection
     # per optimizer) + the real OpGraph emit. What is deferred: on-device
     # numeric equivalence of the GEMM-pattern kernels.
-    pattern_name = _synth_pattern_for_optimizer(spec.optimizer)
+    # Mandate #17 — injectable + fail-safe pattern dispatch. A project can
+    # inject its own optimizer→pattern map; an optimizer with NO genuine
+    # match returns None and we COMPILE THE EXISTING SOURCE (logged), rather
+    # than silently mis-synthesizing it as an AdamW elementwise pass.
+    injected = sc.get("optimizer_patterns") if isinstance(sc, dict) else None
+    pattern_name = _synth_pattern_for_optimizer(spec.optimizer, injected)
+    if pattern_name is None:
+        _codegen_report_log(
+            report,
+            f"synth: no pattern matches optimizer={spec.optimizer!r}; "
+            f"compiling existing source (no silent default).")
+        return None
     if pattern_name not in allowed:
-        # The dispatched pattern was disabled via allowed_patterns; fall back
-        # to adamw_update if IT is allowed (historical behaviour), else skip.
-        if "adamw_update" in allowed:
+        # The dispatched pattern was disabled via allowed_patterns. Only fall
+        # back to adamw_update when the optimizer GENUINELY maps to it; never
+        # coerce an unrelated (e.g. GEMM) optimizer into the elementwise pass.
+        if pattern_name == "adamw_update" or (
+                _synth_pattern_for_optimizer(spec.optimizer, injected)
+                == "adamw_update" and "adamw_update" in allowed):
             pattern_name = "adamw_update"
         else:
+            _codegen_report_log(
+                report,
+                f"synth: pattern {pattern_name!r} disabled via "
+                f"allowed_patterns; compiling existing source.")
             return None
 
-    dtype = "fp32"  # default; future streams can pass dtype through dims
+    # Mandate #18 — dtype from the config's quant dim (not hardcoded fp32).
+    dtype = _synth_dtype_from_config(config, dims, sc)
 
     # GEMM-shaped patterns take (M, N[, K]) dims and emit tensor-core GEMMs;
     # the elementwise / reduce / scan patterns take a flat ``shape`` tuple.
-    # Derive a problem size from the config's ``block`` dim when present.
+    # Mandate #19 — prefer a shape DERIVED FROM THE DISCOVERED WORKLOAD when
+    # one is supplied (spec.config['synth_codegen']['shape_hint'] / the
+    # discovered signature's representative shape), instead of guessing. Fall
+    # back to the config ``block`` dim, then the historical 4096 default.
     block = 4096
     has_block = any(d.get("name") == "block" for d in dims)
     if has_block:
@@ -24016,7 +24182,16 @@ def _try_synth_codegen(spec: "BuildSpec",
             block = int(config.get("block", 4096))
         except (TypeError, ValueError):
             block = 4096
-    flat_shape: Tuple[int, ...] = (block * 16,) if has_block else (4096,)
+    shape_hint = sc.get("shape_hint") if isinstance(sc, dict) else None
+    if shape_hint:
+        try:
+            flat_shape: Tuple[int, ...] = tuple(int(x) for x in shape_hint)
+            _codegen_report_log(
+                report, f"synth: using discovered shape_hint={flat_shape}")
+        except (TypeError, ValueError):
+            flat_shape = (block * 16,) if has_block else (4096,)
+    else:
+        flat_shape = (block * 16,) if has_block else (4096,)
 
     _GEMM_PATTERNS = {"newton_schulz", "softmax_matmul"}
     graph: Optional[OpGraph]
@@ -24427,13 +24602,25 @@ def _resolve_ctype(dtype: str) -> str:
 
 
 def _default_template_provider(op: str, arch: str) -> str:
+    # Mandate #15 — the template bakes the autotuned BLOCK / VEC / UNROLL as
+    # constexprs so a dispatched kernel for a shape bucket is compiled with
+    # that bucket's TUNED config (the cubin actually differs per tuned
+    # config, closing the autotuner→runtime loop). A bodyless registry's
+    # identity copy still works; a real per-bucket body can read these.
     return r"""
 extern "C" __global__ void specialized_{OP}_kernel({DTYPE}* out, const {DTYPE}* in, int n) {{
     constexpr int kSizeHint = {SIZE_HINT};
     constexpr int kShapeDims = {SHAPE_DIMS};
-    (void)kSizeHint; (void)kShapeDims;
+    constexpr int kBlock  = {BLOCK};
+    constexpr int kVec    = {VEC};
+    constexpr int kUnroll = {UNROLL};
+    (void)kSizeHint; (void)kShapeDims; (void)kBlock; (void)kVec; (void)kUnroll;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = in[i];
+    #pragma unroll {UNROLL}
+    for (int j = 0; j < kVec; ++j) {{
+        int idx = i * kVec + j;
+        if (idx < n) out[idx] = in[idx];
+    }}
 }}
 """.replace("{OP}", op)
 
@@ -24442,7 +24629,8 @@ class KernelRegistry:
     """Sub-µs runtime-specialized kernel lookup via NVRTC / hipRTC."""
 
     def __init__(self, arch: str, cache_dir: Path,
-                 template_provider: Optional[Callable[[str, str], str]] = None):
+                 template_provider: Optional[Callable[[str, str], str]] = None,
+                 tuned_config: Optional[Dict[str, Any]] = None):
         if arch not in ARCH_TABLE:
             raise RegistryError(f"unknown arch {arch!r}")
         entry = ARCH_TABLE[arch]
@@ -24458,14 +24646,25 @@ class KernelRegistry:
         self._handle_cache: Dict[str, Any] = {}
         self._template_provider = (template_provider
                                    or _default_template_provider)
+        # Mandate #15 — the autotuned config (block/vec/unroll), pulled from
+        # the compile cache by initialize_registry. Baked into every
+        # dispatched cubin so runtime specialization uses the tuned config
+        # instead of fixed defaults. None ⇒ neutral defaults (block=256,
+        # vec=1, unroll=1) — byte-identical to the pre-#15 stub.
+        self.tuned_config: Dict[str, Any] = dict(tuned_config or {})
 
     def _key(self, op: str, dtype: str, shape_cls: str, ndim: int) -> str:
         # ndim is part of the key because _compile bakes SHAPE_DIMS=len(shape)
         # into the generated source; two dispatches in the same shape class
         # but different rank (e.g. (1024,) vs (32,32)) must not collide on a
         # cubin compiled for the other rank.
+        # Mandate #15 — the tuned config (block/vec/unroll) is baked into the
+        # cubin, so it MUST be part of the cache key; otherwise a re-tuned
+        # config would silently reuse the old cubin.
+        tc = self.tuned_config or {}
+        tc_sig = f"{tc.get('block')}-{tc.get('vec')}-{tc.get('unroll')}"
         return hashlib.sha256(
-            f"{self.arch}|{op}|{dtype}|{shape_cls}|{ndim}".encode()
+            f"{self.arch}|{op}|{dtype}|{shape_cls}|{ndim}|{tc_sig}".encode()
         ).hexdigest()[:24]
 
     def dispatch(self, op: str, dtype: str, shape: Tuple[int, ...]):
@@ -24491,10 +24690,22 @@ class KernelRegistry:
 
     def _compile(self, op: str, dtype: str, shape_cls: str,
                  example_shape: Tuple[int, ...]) -> bytes:
+        # Mandate #15 — bake the autotuned config into the specialized
+        # kernel so the runtime cubin reflects the tuned block/vec/unroll
+        # for this (op, arch). Missing keys fall back to neutral defaults.
+        tc = self.tuned_config or {}
+        def _tc_int(name: str, default: int) -> int:
+            try:
+                return int(tc.get(name, default))
+            except (TypeError, ValueError):
+                return default
         src = self._template_provider(op, self.arch).format(
             DTYPE=_resolve_ctype(dtype),
             SHAPE_DIMS=len(example_shape),
             SIZE_HINT=_shape_class_size(shape_cls),
+            BLOCK=_tc_int("block", 256),
+            VEC=_tc_int("vec", 1),
+            UNROLL=_tc_int("unroll", 1),
         )
         if self.vendor == "cuda":
             return self._nvrtc_compile(src)
@@ -24880,7 +25091,8 @@ _REGISTRY_LOCK = threading.Lock()
 
 def get_registry(arch: str,
                  cache_dir: Optional[Path] = None,
-                 config: Optional[Dict[str, Any]] = None) -> KernelRegistry:
+                 config: Optional[Dict[str, Any]] = None,
+                 tuned_config: Optional[Dict[str, Any]] = None) -> KernelRegistry:
     """Return (and lazily create) the per-arch ``KernelRegistry``.
 
     Project-agnosticism (Category 2d): when ``cache_dir`` is not given
@@ -24929,12 +25141,12 @@ def get_registry(arch: str,
                 project_name = "supergrok"
             cd = (Path(os.environ.get("HOME", "/tmp"))
                   / ".cache" / project_name / "nvrtc")
-        reg = KernelRegistry(arch, cd)
+        reg = KernelRegistry(arch, cd, tuned_config=tuned_config)
         _REGISTRY[arch] = reg
         return reg
 
 
-def initialize_registry(spec, report=None) -> Optional[KernelRegistry]:
+def initialize_registry(spec, report=None, cache=None) -> Optional[KernelRegistry]:
     """Pre-warm the registry from build() when enable_runtime_specialization=True.
 
     Honors ``spec.auto_install_optional_deps`` by propagating it to the
@@ -24962,9 +25174,26 @@ def initialize_registry(spec, report=None) -> Optional[KernelRegistry]:
         "cuda", "nvrtc",
         install=_auto_install_enabled(),
         pip_name="cuda-python")
+    # Mandate #15 — pull the autotuned config for this (opt, model, arch)
+    # from the compile cache so the registry bakes it into every dispatched
+    # cubin (closes the autotuner→runtime loop). None when the sweep hasn't
+    # run yet → neutral defaults.
+    tuned_cfg: Optional[Dict[str, Any]] = None
+    if cache is not None:
+        try:
+            entry_c = cache.get(spec.optimizer, spec.model, spec.arch)
+            tuned_cfg = entry_c.get("tuned_config")
+            if tuned_cfg and report is not None:
+                report.write(
+                    f"[nvrtc] registry consuming tuned config "
+                    f"block={tuned_cfg.get('block')} vec={tuned_cfg.get('vec')}"
+                    f" unroll={tuned_cfg.get('unroll')} (#15 loop closed)\n")
+        except Exception:
+            tuned_cfg = None
     try:
         cache_dir = Path(spec.out_dir) / "nvrtc_cache"
-        reg = get_registry(spec.arch, cache_dir=cache_dir)
+        reg = get_registry(spec.arch, cache_dir=cache_dir,
+                           tuned_config=tuned_cfg)
     except RegistryError as exc:
         if report is not None:
             report.write(f"[nvrtc] disabled: {exc}\n")
