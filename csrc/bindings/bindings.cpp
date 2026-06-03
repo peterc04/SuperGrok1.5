@@ -3262,7 +3262,7 @@ PYBIND11_MODULE(_ops, m) {
 
  m.def("detect_arch", &sg::detect_arch,
  "Returns 90 or 942 for the detected GPU (3-arch active set: "
- "sm_90, gfx942, tpu_v5p). TPU handled in Python.");
+ "sm_90, gfx942, tpu_v6e). TPU handled in Python.");
 
  // Fused (model, optimizer, arch) dispatch
  m.def("fused_step", &sg::fused_step,

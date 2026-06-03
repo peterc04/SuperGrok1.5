@@ -37,7 +37,7 @@ compile/clang/trace/self-test verified.
 
 | check | command | result |
 |-------|---------|--------|
-| self-test | `compile --self-test` | **141 passed, 0 failed** |
+| self-test | `compile --self-test` | **156 passed, 0 failed** |
 | ruff | `ruff check grokking_optimizers/ scripts/ pallas/` | clean |
 | gfx942 gate | `amdgcn_check.sh --header` ×14 | **14/14 AMDGCN_OK** |
 | sm_90 compile | `compile_to_object.sh` launch_{grokadamw,neuralgrok,supergrok11}.cu + dispatch.cpp | COMPILE_OK |

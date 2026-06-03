@@ -205,10 +205,13 @@ Per-arch sampler backend: NVIDIA → `pynvml` `nvmlDeviceGetUtilizationRates`
 (GPU use% + VRAM%); TPU → JAX `device.memory_stats()` for live HBM utilization
 (MXU compute duty-cycle is xprof-only — see `grokking_optimizers.profile`). It
 complements `grokking_optimizers.profile` (one-shot ncu/rocprof/jax.profiler
-dump) and `bench_backends` (wall-clock). On a host with no accelerator the full
-33-cell structure + JSON schema are still produced with `status` flags and null
-metrics (CPU-tested in `--self-test`); only the **numbers** are 🟡 (need the
-target accelerator).
+dump) and `bench_backends` (wall-clock). **Failure policy: crash hard, crash
+loud.** If the sampler library is missing, the device is absent, the workload
+fails, or the poller can't read a counter, the module raises immediately with a
+clear, attributable exception — no graceful degradation, no null-metric
+fallback records. Fix the environment, don't paper over it. The enumeration,
+aggregation math, and JSON/table schema are CPU-tested in `--self-test`; the
+actual **numbers** are silicon-only.
 
 ---
 

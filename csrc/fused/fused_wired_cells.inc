@@ -138,70 +138,70 @@ std::string wired_fused_cell(const std::string& model,
  if (arch == 942 && model == "mamba3" && optimizer == "supergrok2")
   return "l3:mamba3+supergrok2:gfx942";
  if (arch == -1 && model == "transformer_decoder" && optimizer == "adamw")
-  return "l3:transformer_decoder+adamw:tpu_v5p";
+  return "l3:transformer_decoder+adamw:tpu_v6e";
  if (arch == -1 && model == "transformer_decoder" && optimizer == "lion")
-  return "l3:transformer_decoder+lion:tpu_v5p";
+  return "l3:transformer_decoder+lion:tpu_v6e";
  if (arch == -1 && model == "transformer_decoder" && optimizer == "grokfast")
-  return "l3:transformer_decoder+grokfast:tpu_v5p";
+  return "l3:transformer_decoder+grokfast:tpu_v6e";
  if (arch == -1 && model == "transformer_decoder" && optimizer == "grokadamw")
-  return "l3:transformer_decoder+grokadamw:tpu_v5p";
+  return "l3:transformer_decoder+grokadamw:tpu_v6e";
  if (arch == -1 && model == "transformer_decoder" && optimizer == "looksam")
-  return "l3:transformer_decoder+looksam:tpu_v5p";
+  return "l3:transformer_decoder+looksam:tpu_v6e";
  if (arch == -1 && model == "transformer_decoder" && optimizer == "muon")
-  return "l3:transformer_decoder+muon:tpu_v5p";
+  return "l3:transformer_decoder+muon:tpu_v6e";
  if (arch == -1 && model == "transformer_decoder" && optimizer == "neuralgrok")
-  return "l3:transformer_decoder+neuralgrok:tpu_v5p";
+  return "l3:transformer_decoder+neuralgrok:tpu_v6e";
  if (arch == -1 && model == "transformer_decoder" && optimizer == "prodigy")
-  return "l3:transformer_decoder+prodigy:tpu_v5p";
+  return "l3:transformer_decoder+prodigy:tpu_v6e";
  if (arch == -1 && model == "transformer_decoder" && optimizer == "supergrok11")
-  return "l3:transformer_decoder+supergrok11:tpu_v5p";
+  return "l3:transformer_decoder+supergrok11:tpu_v6e";
  if (arch == -1 && model == "transformer_decoder" && optimizer == "supergrok15")
-  return "l3:transformer_decoder+supergrok15:tpu_v5p";
+  return "l3:transformer_decoder+supergrok15:tpu_v6e";
  if (arch == -1 && model == "transformer_decoder" && optimizer == "supergrok2")
-  return "l3:transformer_decoder+supergrok2:tpu_v5p";
+  return "l3:transformer_decoder+supergrok2:tpu_v6e";
  if (arch == -1 && model == "vit" && optimizer == "adamw")
-  return "l3:vit+adamw:tpu_v5p";
+  return "l3:vit+adamw:tpu_v6e";
  if (arch == -1 && model == "vit" && optimizer == "lion")
-  return "l3:vit+lion:tpu_v5p";
+  return "l3:vit+lion:tpu_v6e";
  if (arch == -1 && model == "vit" && optimizer == "grokfast")
-  return "l3:vit+grokfast:tpu_v5p";
+  return "l3:vit+grokfast:tpu_v6e";
  if (arch == -1 && model == "vit" && optimizer == "grokadamw")
-  return "l3:vit+grokadamw:tpu_v5p";
+  return "l3:vit+grokadamw:tpu_v6e";
  if (arch == -1 && model == "vit" && optimizer == "looksam")
-  return "l3:vit+looksam:tpu_v5p";
+  return "l3:vit+looksam:tpu_v6e";
  if (arch == -1 && model == "vit" && optimizer == "muon")
-  return "l3:vit+muon:tpu_v5p";
+  return "l3:vit+muon:tpu_v6e";
  if (arch == -1 && model == "vit" && optimizer == "neuralgrok")
-  return "l3:vit+neuralgrok:tpu_v5p";
+  return "l3:vit+neuralgrok:tpu_v6e";
  if (arch == -1 && model == "vit" && optimizer == "prodigy")
-  return "l3:vit+prodigy:tpu_v5p";
+  return "l3:vit+prodigy:tpu_v6e";
  if (arch == -1 && model == "vit" && optimizer == "supergrok11")
-  return "l3:vit+supergrok11:tpu_v5p";
+  return "l3:vit+supergrok11:tpu_v6e";
  if (arch == -1 && model == "vit" && optimizer == "supergrok15")
-  return "l3:vit+supergrok15:tpu_v5p";
+  return "l3:vit+supergrok15:tpu_v6e";
  if (arch == -1 && model == "vit" && optimizer == "supergrok2")
-  return "l3:vit+supergrok2:tpu_v5p";
+  return "l3:vit+supergrok2:tpu_v6e";
  if (arch == -1 && model == "mamba3" && optimizer == "adamw")
-  return "l3:mamba3+adamw:tpu_v5p";
+  return "l3:mamba3+adamw:tpu_v6e";
  if (arch == -1 && model == "mamba3" && optimizer == "lion")
-  return "l3:mamba3+lion:tpu_v5p";
+  return "l3:mamba3+lion:tpu_v6e";
  if (arch == -1 && model == "mamba3" && optimizer == "grokfast")
-  return "l3:mamba3+grokfast:tpu_v5p";
+  return "l3:mamba3+grokfast:tpu_v6e";
  if (arch == -1 && model == "mamba3" && optimizer == "grokadamw")
-  return "l3:mamba3+grokadamw:tpu_v5p";
+  return "l3:mamba3+grokadamw:tpu_v6e";
  if (arch == -1 && model == "mamba3" && optimizer == "looksam")
-  return "l3:mamba3+looksam:tpu_v5p";
+  return "l3:mamba3+looksam:tpu_v6e";
  if (arch == -1 && model == "mamba3" && optimizer == "muon")
-  return "l3:mamba3+muon:tpu_v5p";
+  return "l3:mamba3+muon:tpu_v6e";
  if (arch == -1 && model == "mamba3" && optimizer == "neuralgrok")
-  return "l3:mamba3+neuralgrok:tpu_v5p";
+  return "l3:mamba3+neuralgrok:tpu_v6e";
  if (arch == -1 && model == "mamba3" && optimizer == "prodigy")
-  return "l3:mamba3+prodigy:tpu_v5p";
+  return "l3:mamba3+prodigy:tpu_v6e";
  if (arch == -1 && model == "mamba3" && optimizer == "supergrok11")
-  return "l3:mamba3+supergrok11:tpu_v5p";
+  return "l3:mamba3+supergrok11:tpu_v6e";
  if (arch == -1 && model == "mamba3" && optimizer == "supergrok15")
-  return "l3:mamba3+supergrok15:tpu_v5p";
+  return "l3:mamba3+supergrok15:tpu_v6e";
  if (arch == -1 && model == "mamba3" && optimizer == "supergrok2")
-  return "l3:mamba3+supergrok2:tpu_v5p";
+  return "l3:mamba3+supergrok2:tpu_v6e";
  return "";
 }

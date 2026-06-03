@@ -14441,8 +14441,8 @@ def _self_test_device_profiling(run) -> None:
 def _self_test_utilization(run) -> None:
     """`[self-test] utilization` section — the 33-pipeline live device
     utilization tracker. CPU-safe: every check exercises enumeration,
-    sampler selection, aggregation, graceful degradation, and the JSON/table
-    schema without touching an accelerator (numbers are HW-gated)."""
+    sampler selection, aggregation, crash-on-failure behavior, and the
+    JSON/table schema without touching an accelerator (numbers are HW-gated)."""
     import tempfile
     sys.stdout.write("[self-test] utilization\n")
 
@@ -14484,15 +14484,16 @@ def _self_test_utilization(run) -> None:
         assert agg["compute_mean"] is None and agg["compute_peak"] is None, agg
         assert agg["mem_peak"] == 63.0, agg
 
-    def test_track_cell_degrades_gracefully():
+    def test_track_cell_crashes_on_no_device():
         from grokking_optimizers import utilization as u
-        # No accelerator here → must NOT raise; returns a complete record with
-        # a status flag and no metrics.
-        r = u.track_cell("adamw", "mamba", "sm_90a", iters=1, timeout=30)
-        assert r.status in ("no-device", "sampler-unavailable",
-                            "workload-failed", "no-samples"), r.status
-        assert r.arch == "sm_90a" and r.optimizer == "adamw"
-        assert r.compute_mean is None
+        # No accelerator here → MUST raise RuntimeError, not return a status
+        # record.  Crash-hard policy: failures are never papered over.
+        raised = False
+        try:
+            u.track_cell("adamw", "mamba", "sm_90a", iters=1, timeout=30)
+        except RuntimeError:
+            raised = True
+        assert raised, "track_cell must raise RuntimeError when no device"
 
     def test_report_json_schema_roundtrip():
         from grokking_optimizers import utilization as u
@@ -14529,7 +14530,7 @@ def _self_test_utilization(run) -> None:
     run("utilization_make_sampler_by_vendor", test_make_sampler_by_vendor)
     run("utilization_aggregate_math", test_aggregate_math_and_warmup_drop)
     run("utilization_aggregate_none_compute", test_aggregate_handles_none_compute)
-    run("utilization_track_cell_degrades", test_track_cell_degrades_gracefully)
+    run("utilization_track_cell_crashes", test_track_cell_crashes_on_no_device)
     run("utilization_report_json_roundtrip", test_report_json_schema_roundtrip)
     run("utilization_format_table", test_format_table_renders)
 

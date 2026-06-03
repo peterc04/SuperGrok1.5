@@ -1749,7 +1749,7 @@ host. The ONLY remaining class is execution on real accelerators:
 
 ## Phase 4 — single consolidated verification (Stage V) deferrals
 
-Everything CPU/clang-verifiable PASSED in Stage V (self-test 138/0; ruff check
+Everything CPU/clang-verifiable PASSED in Stage V (self-test 156/0; ruff check
 clean; nvcc -c on models/{decoder,vit,mamba}.cu + WS1 fused cells; AMDGCN_OK on
 all touched gfx942 files; anti-false-positive grep = 0; WS4 guard exit 0). The
 remaining checks need real accelerators:

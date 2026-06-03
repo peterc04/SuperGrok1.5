@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Stage 0 verification gate: every sm_90 TU must compile to object, self-test
-# must stay 137/1 (or better), ruff clean. Prints one PASS/FAIL line per check.
+# must stay 156/0 (or better), ruff clean. Prints one PASS/FAIL line per check.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT"
 
