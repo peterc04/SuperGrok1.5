@@ -429,6 +429,13 @@ class ArchEntry:
     max_regs_per_thread: Optional[int]         # 255 CUDA/HIP, None Pallas
     max_threads_per_block: Optional[int]       # 1024 CUDA/HIP, None Pallas
     features: frozenset                        # capability flag strings (see docstring)
+    # Mandate #2 — last-level cache size in bytes. The autotune timer writes a
+    # buffer >= this between timed replays so iterations 2..N hit a COLD cache,
+    # matching real-loop behaviour instead of L2-warm bias. None on Pallas
+    # (XLA-managed) and on arches where we have no measured value; callers fall
+    # back to a conservative default via ``_arch_l2_bytes``. Values are nominal
+    # vendor specs (verify on silicon — GPU-deferred P2/P12).
+    l2_bytes: Optional[int] = None
     search_space_builder: Optional[Callable[[], Dict[str, Any]]] = None
     # True only for arches that ship a real committed kernel body (a *.cu /
     # *.hip.cpp with arch-specific intrinsics). Today that is sm_90a + gfx942;
@@ -571,6 +578,7 @@ _ARCH_TABLE_PRIMARY: Dict[str, ArchEntry] = {
         max_regs_per_thread=255,
         max_threads_per_block=1024,
         features=frozenset(_F_AMPERE),
+        l2_bytes=40 * 1024 * 1024,   # A100 L2 = 40 MB
     ),
 
     "sm_86": ArchEntry(
@@ -631,6 +639,7 @@ _ARCH_TABLE_PRIMARY: Dict[str, ArchEntry] = {
         max_regs_per_thread=255,
         max_threads_per_block=1024,
         features=frozenset(_F_HOPPER),
+        l2_bytes=50 * 1024 * 1024,   # H100 L2 = 50 MB
         has_kernel_body=True,   # cuda/sm_90 ships real Hopper kernel bodies
     ),
 
@@ -652,6 +661,7 @@ _ARCH_TABLE_PRIMARY: Dict[str, ArchEntry] = {
         max_regs_per_thread=255,
         max_threads_per_block=1024,
         features=frozenset(_F_BLACKWELL),
+        l2_bytes=50 * 1024 * 1024,   # B100/B200 L2 ≈ 50 MB
     ),
 
     "sm_103a": ArchEntry(
@@ -776,6 +786,9 @@ _ARCH_TABLE_PRIMARY: Dict[str, ArchEntry] = {
         max_regs_per_thread=255,
         max_threads_per_block=1024,
         features=frozenset({"mfma", "bf16_mfma", "fp8_mfma", "mfma_xdl"}),
+        # MI300X last-level cache = 256 MB Infinity Cache (MALL). Flush must
+        # exceed the LLC, not just the 4 MB/XCD L2, to evict between replays.
+        l2_bytes=256 * 1024 * 1024,
         has_kernel_body=True,   # hip/gfx942 ships real CDNA3 kernel bodies
     ),
 
@@ -1107,6 +1120,26 @@ def get_arch_entry(arch: str) -> ArchEntry:
         raise KeyError(
             f"arch={arch!r} not in ARCH_TABLE; "
             f"valid: {sorted(ARCH_TABLE.keys())}")
+
+
+# Mandate #2 — conservative fallback when an ArchEntry has no measured
+# ``l2_bytes``. 64 MiB over-estimates most current L2/LLCs (so the flush
+# buffer is guaranteed >= the real cache) without an absurd allocation.
+_DEFAULT_L2_FLUSH_BYTES: int = 64 * 1024 * 1024
+
+
+def _arch_l2_bytes(arch: str) -> int:
+    """Mandate #2 — last-level cache size for the L2-flush buffer, sourced
+    from ``ArchEntry.l2_bytes`` with a conservative 64 MiB fallback. Returns
+    0 for Pallas/TPU (XLA owns the device; no host-side flush is meaningful).
+    """
+    try:
+        entry = get_arch_entry(arch)
+    except KeyError:
+        return _DEFAULT_L2_FLUSH_BYTES
+    if entry.vendor == "pallas":
+        return 0
+    return entry.l2_bytes if entry.l2_bytes else _DEFAULT_L2_FLUSH_BYTES
 
 
 # How many trials Bayesian "quick" mode runs (vs the full 500 default).
@@ -3033,9 +3066,26 @@ def _build_param(opt_class_name: str, size: int) -> Any:
     return p, g
 
 
+def _make_l2_flush_buffer(l2_bytes: int):
+    """Mandate #2 — allocate a device buffer >= L2 size for cache flushing
+    between timed replays. Returns None when flushing is disabled (l2_bytes
+    <= 0). Allocated once and reused across all iterations of a timing run.
+    """
+    import torch
+    if not l2_bytes or l2_bytes <= 0:
+        return None
+    return torch.empty(int(l2_bytes), dtype=torch.uint8, device="cuda")
+
+
 def cuda_graph_median_ms(opt_class: str, *, size: int = 4096,
-                         warmup: int = 5, iters: int = 21) -> Dict[str, float]:
-    """Time ``opt.step()`` under a CUDA graph replay."""
+                         warmup: int = 5, iters: int = 21,
+                         l2_bytes: int = 0) -> Dict[str, float]:
+    """Time ``opt.step()`` under a CUDA graph replay.
+
+    Mandate #2: when ``l2_bytes > 0`` a buffer of that size is zeroed before
+    each timed replay so iterations 2..N hit a COLD last-level cache, removing
+    the L2-warm bias that favours configs that happen to fit in L2.
+    """
     import torch
     if not torch.cuda.is_available():
         raise RuntimeError("cuda_graph_median_ms requires torch.cuda.is_available()")
@@ -3065,8 +3115,11 @@ def cuda_graph_median_ms(opt_class: str, *, size: int = 4096,
         p.grad.copy_(g)
         opt.step()
 
+    flush = _make_l2_flush_buffer(l2_bytes)
     timings = []
     for _ in range(iters):
+        if flush is not None:
+            flush.zero_()   # evict L2 so this replay starts cold
         s = torch.cuda.Event(enable_timing=True)
         e = torch.cuda.Event(enable_timing=True)
         s.record()
@@ -3084,14 +3137,20 @@ def cuda_graph_median_ms(opt_class: str, *, size: int = 4096,
 
 
 def hip_graph_median_ms(opt_class: str, *, size: int = 4096,
-                        warmup: int = 5, iters: int = 21) -> Dict[str, float]:
+                        warmup: int = 5, iters: int = 21,
+                        l2_bytes: int = 0) -> Dict[str, float]:
     """HIP analogue — reuses cuda_graph_median_ms (ROCm uses same namespace)."""
-    return cuda_graph_median_ms(opt_class, size=size, warmup=warmup, iters=iters)
+    return cuda_graph_median_ms(opt_class, size=size, warmup=warmup,
+                                iters=iters, l2_bytes=l2_bytes)
 
 
 def event_median_ms(opt_class: str, *, size: int = 4096,
-                    warmup: int = 5, iters: int = 21) -> Dict[str, float]:
-    """Fallback timer for archs / backends that do not support graph capture."""
+                    warmup: int = 5, iters: int = 21,
+                    l2_bytes: int = 0) -> Dict[str, float]:
+    """Fallback timer for archs / backends that do not support graph capture.
+
+    Mandate #2: flushes a >= L2 buffer before each timed step when
+    ``l2_bytes > 0`` (cold-cache timing)."""
     import torch
     if not torch.cuda.is_available():
         raise RuntimeError("event_median_ms requires torch.cuda.is_available()")
@@ -3106,10 +3165,13 @@ def event_median_ms(opt_class: str, *, size: int = 4096,
         opt.step()
     torch.cuda.synchronize()
 
+    flush = _make_l2_flush_buffer(l2_bytes)
     timings = []
     for _ in range(iters):
         p.grad = g.clone()
         opt = OptCls([p], lr=1e-3)
+        if flush is not None:
+            flush.zero_()   # evict L2 so this step starts cold
         s = torch.cuda.Event(enable_timing=True)
         e = torch.cuda.Event(enable_timing=True)
         s.record()
@@ -3161,7 +3223,15 @@ def _bg_build_param(opt_class_name, size):
     return p, g
 
 
-def _bg_cuda_graph_median_ms(opt_class, *, size=4096, warmup=5, iters=21):
+def _bg_make_flush(l2_bytes):
+    # Mandate #2 — >= L2 buffer for cold-cache timing; None disables.
+    if not l2_bytes or l2_bytes <= 0:
+        return None
+    return torch.empty(int(l2_bytes), dtype=torch.uint8, device="cuda")
+
+
+def _bg_cuda_graph_median_ms(opt_class, *, size=4096, warmup=5, iters=21,
+                             l2_bytes=0):
     if not torch.cuda.is_available():
         raise RuntimeError("cuda_graph_median_ms requires torch.cuda.is_available()")
     from __PKG__ import _ops  # noqa: F401
@@ -3190,8 +3260,11 @@ def _bg_cuda_graph_median_ms(opt_class, *, size=4096, warmup=5, iters=21):
         p.grad.copy_(g)
         opt.step()
 
+    flush = _bg_make_flush(l2_bytes)
     timings = []
     for _ in range(iters):
+        if flush is not None:
+            flush.zero_()
         s = torch.cuda.Event(enable_timing=True)
         e = torch.cuda.Event(enable_timing=True)
         s.record()
@@ -3208,15 +3281,16 @@ def _bg_cuda_graph_median_ms(opt_class, *, size=4096, warmup=5, iters=21):
     }
 
 
-def _time_with_graph(opt_class, size, warmup, iters):
+def _time_with_graph(opt_class, size, warmup, iters, l2_bytes=0):
     try:
         return _bg_cuda_graph_median_ms(
-            opt_class, size=size, warmup=warmup, iters=iters)
+            opt_class, size=size, warmup=warmup, iters=iters,
+            l2_bytes=l2_bytes)
     except Exception:
         return None
 
 
-def _time_with_events(opt_class, size, warmup, iters):
+def _time_with_events(opt_class, size, warmup, iters, l2_bytes=0):
     from importlib import import_module
     grok = import_module("__PKG__")
     OptCls = getattr(grok, opt_class)
@@ -3229,10 +3303,13 @@ def _time_with_events(opt_class, size, warmup, iters):
         opt = OptCls([p], lr=1e-3)
         opt.step()
     torch.cuda.synchronize()
+    flush = _bg_make_flush(l2_bytes)
     times = []
     for _ in range(iters):
         p.grad = g.clone()
         opt = OptCls([p], lr=1e-3)
+        if flush is not None:
+            flush.zero_()
         s = torch.cuda.Event(enable_timing=True)
         e = torch.cuda.Event(enable_timing=True)
         s.record()
@@ -3291,12 +3368,15 @@ def main():
             size = int(req.get("size", 4096))
             warmup = int(req.get("warmup", 5))
             iters = int(req.get("iters", 21))
+            l2_bytes = int(req.get("l2_bytes", 0))
             _load_so(so_path)
             result = None
             if use_graph and req.get("use_cuda_graph", True):
-                result = _time_with_graph(opt_class, size, warmup, iters)
+                result = _time_with_graph(opt_class, size, warmup, iters,
+                                          l2_bytes)
             if result is None:
-                result = _time_with_events(opt_class, size, warmup, iters)
+                result = _time_with_events(opt_class, size, warmup, iters,
+                                           l2_bytes)
             sys.stdout.write(json.dumps(result) + "\n")
             sys.stdout.flush()
         except Exception as exc:
@@ -3542,7 +3622,8 @@ class TimingWorker:
                  watchdog_interval_s: float = 30.0,
                  watchdog_grace_s: float = 60.0,
                  enable_watchdog: bool = True,
-                 python_package: Optional[str] = None):
+                 python_package: Optional[str] = None,
+                 l2_bytes: int = 0):
         # Stream A: python_package threads through to the worker body so
         # the subprocess imports the correct package for OptCls lookup.
         # ``None`` preserves the historical "grokking_optimizers" name
@@ -3554,6 +3635,9 @@ class TimingWorker:
         self.warmup = warmup
         self.iters = iters
         self.use_cuda_graph = use_cuda_graph
+        # Mandate #2 — last-level cache flush size forwarded to the worker
+        # so each timed replay starts cold. 0 disables (preserves old timing).
+        self.l2_bytes = int(l2_bytes)
         self.timeout = timeout_per_variant
         # Merge env_overlay (per-GPU overrides) on top of the base env so
         # MultiGPUTimingPool can pin each worker to a single device via
@@ -3745,6 +3829,7 @@ class TimingWorker:
             "warmup":         self.warmup,
             "iters":          self.iters,
             "use_cuda_graph": self.use_cuda_graph,
+            "l2_bytes":       self.l2_bytes,
         }
         with self._io_lock:
             try:
@@ -11482,13 +11567,18 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
     # matches TimingWorker, so the timer closure below is unchanged.
     vendor = get_arch_entry(spec.arch).vendor
     visible = MultiGPUTimingPool.visible_devices(vendor)
+    # Mandate #2 — per-arch L2 flush size for cold-cache timing.
+    l2_flush = _arch_l2_bytes(spec.arch)
+    report.write(f"  [l2-flush] arch={spec.arch} flush_buffer="
+                 f"{l2_flush / (1024 * 1024):.0f} MiB "
+                 f"({'enabled' if l2_flush else 'disabled'})\n")
     worker: Optional[Any] = None
     if len(visible) > 1:
         report.write(f"  [worker] {len(visible)} GPUs visible "
                      f"({','.join(visible)}); spawning MultiGPUTimingPool.\n")
         pool = MultiGPUTimingPool(
             OPT_CLASS[spec.optimizer], vendor=vendor,
-            python_package=spec.python_package)
+            python_package=spec.python_package, l2_bytes=l2_flush)
         if pool.start():
             worker = pool
             report.write(f"  [worker] multi-GPU pool up with "
@@ -11499,7 +11589,7 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
     if worker is None:
         single = TimingWorker(
             opt_class=OPT_CLASS[spec.optimizer],
-            python_package=spec.python_package)
+            python_package=spec.python_package, l2_bytes=l2_flush)
         if not single.start():
             report.write("  [worker] start FAILED; falling back to "
                          "one-shot per variant.\n")
@@ -16480,6 +16570,61 @@ def _self_test_clock_lock(run) -> None:
     run("clock_lock_amd_perflevel_high", test_amd_perflevel_high)
 
 
+def _self_test_l2_flush(run) -> None:
+    """`[self-test] l2_flush` section (mandate #2)."""
+    sys.stdout.write("[self-test] l2_flush\n")
+
+    def test_l2_bytes_sourced_from_arch_entry():
+        """Per-arch L2 size comes from ArchEntry, not a hardcoded constant."""
+        assert get_arch_entry("sm_90a").l2_bytes == 50 * 1024 * 1024
+        assert get_arch_entry("sm_80").l2_bytes == 40 * 1024 * 1024
+        assert get_arch_entry("gfx942").l2_bytes == 256 * 1024 * 1024
+        assert _arch_l2_bytes("sm_90a") == 50 * 1024 * 1024
+        assert _arch_l2_bytes("gfx942") == 256 * 1024 * 1024
+
+    def test_l2_default_fallback_for_unspecified_arch():
+        """An arch without a measured l2_bytes falls back to 64 MiB, never 0
+        (a CUDA/HIP arch must always flush something)."""
+        # sm_70 has no l2_bytes set → fallback.
+        assert get_arch_entry("sm_70").l2_bytes is None
+        assert _arch_l2_bytes("sm_70") == _DEFAULT_L2_FLUSH_BYTES
+        assert _arch_l2_bytes("sm_70") > 0
+
+    def test_pallas_l2_flush_is_zero():
+        """Pallas/TPU has no host-side flush — _arch_l2_bytes returns 0 so the
+        timer skips buffer allocation entirely."""
+        assert _arch_l2_bytes("tpu_v6e") == 0
+
+    def test_timing_worker_forwards_l2_bytes():
+        """TimingWorker carries l2_bytes and would put it in the time request
+        (constructed without spawning a subprocess)."""
+        w = TimingWorker("Lion", l2_bytes=50 * 1024 * 1024,
+                         enable_watchdog=False)
+        assert w.l2_bytes == 50 * 1024 * 1024
+        # The pool forwards worker kwargs verbatim.
+        saved = os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        try:
+            pool = MultiGPUTimingPool("Lion", vendor="cuda",
+                                      l2_bytes=42, enable_watchdog=False)
+            assert all(wk.l2_bytes == 42 for wk in pool.workers)
+        finally:
+            if saved is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = saved
+
+    def test_worker_body_has_flush_logic():
+        """The rendered worker body must contain the flush primitive so the
+        subprocess actually performs the cold-cache eviction."""
+        body = _render_worker_body("grokking_optimizers")
+        assert "_bg_make_flush" in body
+        assert "flush.zero_()" in body
+
+    run("l2_bytes_sourced_from_arch_entry", test_l2_bytes_sourced_from_arch_entry)
+    run("l2_default_fallback", test_l2_default_fallback_for_unspecified_arch)
+    run("l2_pallas_is_zero", test_pallas_l2_flush_is_zero)
+    run("l2_timing_worker_forwards", test_timing_worker_forwards_l2_bytes)
+    run("l2_worker_body_has_flush", test_worker_body_has_flush_logic)
+
+
 def _self_test_kernel_headers(run) -> None:
     """`[self-test] kernel_headers` section."""
     import shutil
@@ -18748,7 +18893,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 160
+_SELF_TEST_EXPECTED_COUNT: int = 165
 
 
 def _self_test() -> int:
@@ -18787,6 +18932,7 @@ def _self_test() -> int:
     _self_test_cache(_run)
     _self_test_multi_gpu_pool(_run)
     _self_test_clock_lock(_run)
+    _self_test_l2_flush(_run)
     _self_test_kernel_headers(_run)
     _self_test_arch_table(_run)
     _self_test_kernel_registry(_run)
