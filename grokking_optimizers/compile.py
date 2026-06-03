@@ -6601,6 +6601,12 @@ class BuildSpec:
     # values, so a build with no config file produces byte-identical
     # output. apply_to_buildspec(spec, project_cfg) populates these from
     # _DEFAULT_PROJECT_CONFIG ⊕ user TOML when a config is supplied.
+    # Mandate #7 / #23 — march policy. Default False ⇒ on-target compile
+    # (-march=native correct). True ⇒ cross-host AOT ship: use a portable
+    # ISA baseline (cross_host_march) so the binary never assumes the build
+    # host's ISA. Set by the --stage cpu-then-target path (#23).
+    cross_host: bool = False
+    cross_host_march: Optional[str] = None
     macro_prefix: str = "SG_BUILD_"
     fused_op_template: str = (
         "torch.ops.grokking_optimizers.fused_{opt_lower}_simple_step")
@@ -8236,14 +8242,65 @@ def _resolve_path(spec: BuildSpec, raw: str) -> Path:
         else REPO_ROOT / p
 
 
+# Mandate Tier-1 — vendor → compilable source extensions for broad
+# auto-discovery. NVCC-parity: when no structured layout matches, glob the
+# whole project tree for anything the toolchain can compile, the way nvcc
+# accepts an arbitrary file list.
+_AUTO_DISCOVER_EXTS: Dict[str, Tuple[str, ...]] = {
+    "cuda": (".cu", ".cpp", ".cc", ".cxx"),
+    "hip":  (".hip", ".cpp", ".cc", ".cxx"),   # .hip.cpp matches .cpp too
+    "pallas": (".py",),
+}
+
+# Directories never swept by auto-discovery (build artifacts, VCS, vendored
+# deps, tests, caches). A project can still point source_roots at any of
+# these explicitly; this only bounds the zero-config glob.
+_AUTO_DISCOVER_PRUNE: frozenset = frozenset({
+    ".git", "build", "dist", "third_party", "__pycache__", ".cache",
+    "node_modules", ".venv", "venv", ".mypy_cache", ".ruff_cache",
+    ".pytest_cache", "tests", "test", "docs", ".github",
+})
+
+
+def _auto_discover_sources(root: Path, vendor: str,
+                           report=None) -> List[Path]:
+    """Mandate Tier-1 — glob ``root`` for every compilable source for
+    ``vendor`` (zero-config "find everything compilable"). Skips the
+    ``_AUTO_DISCOVER_PRUNE`` directories. Returns a sorted, de-duplicated
+    list. This is the NVCC-parity fallback when no structured layout matches
+    — it never requires a manifest.
+    """
+    exts = _AUTO_DISCOVER_EXTS.get(vendor, ())
+    if not exts or not root.exists():
+        return []
+    found: List[Path] = []
+    for p in root.rglob("*"):
+        # Prune unwanted directories cheaply by checking path parts.
+        if any(part in _AUTO_DISCOVER_PRUNE for part in p.parts):
+            continue
+        if p.is_file() and p.suffix in exts:
+            found.append(p)
+    found = sorted(set(found))
+    if report is not None:
+        report.write(f"  [auto-discover] vendor={vendor} root={root} "
+                     f"→ {len(found)} compilable source(s)\n")
+    return found
+
+
 def _resolve_sources(spec: BuildSpec) -> List[Path]:
     """Resolve the per-build source file list.
 
-    Stream A: every directory probed here now comes from
-    ``spec.source_roots`` (populated by ``apply_to_buildspec`` from the
-    TOML config). With no config file the dict is empty, so we fall back
-    to the historical ``csrc/backends/<entry.subdir>`` / ``csrc/bindings``
-    layout — behaviour is byte-identical to today.
+    Stream A: every directory probed here comes from ``spec.source_roots``
+    (populated by ``apply_to_buildspec`` from the TOML config). With no
+    config the dict is empty and we use the historical
+    ``csrc/backends/<entry.subdir>`` / ``csrc/bindings`` layout — byte-
+    identical to today for the grokking project.
+
+    Mandate Tier-1 (zero-config genericness): when the structured layout
+    finds NO sources (an arbitrary project that doesn't use the csrc/backends
+    convention), fall back to a broad auto-glob of the project tree so the
+    compiler "just works" with no manifest. The grokking project always
+    matches the structured layout, so its behaviour is unchanged.
     """
     entry = get_arch_entry(spec.arch)
     if entry.vendor == "pallas":
@@ -8278,7 +8335,17 @@ def _resolve_sources(spec: BuildSpec) -> List[Path]:
     if models_dir.exists():
         for g in entry.model_glob:
             models.extend(sorted(models_dir.glob(g)))
-    return bindings + launchers + models
+    structured = bindings + launchers + models
+    if structured:
+        return structured
+    # Mandate Tier-1 fallback — no structured layout matched. Auto-discover
+    # every compilable source under the project root (or a configured root)
+    # so the compiler works zero-config on an arbitrary project. A user can
+    # override by setting source_roots; this is only the no-config path.
+    disc_root_raw = roots.get(entry.vendor) or roots.get("root")
+    disc_root = _resolve_path(spec, disc_root_raw) if disc_root_raw \
+        else REPO_ROOT
+    return _auto_discover_sources(disc_root, entry.vendor)
 
 
 def _build_macros(spec: BuildSpec) -> List[str]:
@@ -8330,15 +8397,43 @@ def _build_macros(spec: BuildSpec) -> List[str]:
 
 # ---- Performance flag bases (see INTERFACES.md §9) ------------------------
 
+# Mandate #7 — ``-march``/``-mtune`` are NOT in the base list. They are
+# injected by ``_host_march_flags(spec)`` so the policy is explicit:
+#   * on-target compile (the default)  → ``-march=native -mtune=native``
+#     (correct: the build host IS the run host).
+#   * cross-host AOT-ship (spec.cross_host=True) → a portable ISA baseline
+#     (``-march=x86-64-v3``) so we never bake the build host's ISA into a
+#     binary that ships to a different CPU. The baseline is configurable via
+#     ``spec.cross_host_march``. In this mode the host_cflags_hash already
+#     varies with the chosen baseline, keeping the cache honest (#23 keys it
+#     on the target CPU).
 HOST_CFLAGS_BASE = [
     "-O3", "-std=c++17", "-fPIC",
-    "-flto=auto", "-march=native", "-mtune=native",
+    "-flto=auto",
     "-fno-semantic-interposition", "-fvisibility=hidden",
     "-fdata-sections", "-ffunction-sections",
     "-fno-math-errno", "-fno-trapping-math",
     "-fomit-frame-pointer",
     "-ffast-math", "-funroll-loops",
 ]
+
+# Default portable ISA baseline for cross-host builds (x86-64-v3 ≈ Haswell+:
+# AVX2/FMA/BMI — safe on essentially every datacenter CPU since ~2014).
+_DEFAULT_CROSS_HOST_MARCH: str = "x86-64-v3"
+
+
+def _host_march_flags(spec: "BuildSpec") -> List[str]:
+    """Mandate #7 — resolve the -march/-mtune policy for a build.
+
+    Default (on-target): ``-march=native -mtune=native``. Cross-host ship
+    (``spec.cross_host``): a portable ISA baseline so the shipped binary
+    never assumes the build host's instruction set.
+    """
+    if getattr(spec, "cross_host", False):
+        march = getattr(spec, "cross_host_march", None) \
+            or _DEFAULT_CROSS_HOST_MARCH
+        return [f"-march={march}"]
+    return ["-march=native", "-mtune=native"]
 
 # NVCC base flags — arch-specific -gencode is appended per-build from
 # ARCH_TABLE[arch].nvcc_gencode in _device_cflags(). Keeping the base
@@ -8511,6 +8606,14 @@ def _host_cflags(spec: BuildSpec,
     base = list(HOST_CFLAGS_BASE)
     _trace_add_many(trace, list(HOST_CFLAGS_BASE),
                     "base host-cflag (always on)")
+    # Mandate #7 — -march/-mtune by policy (native on-target, baseline cross-host)
+    march_flags = _host_march_flags(spec)
+    base += march_flags
+    _trace_add_many(
+        trace, march_flags,
+        "cross-host ISA baseline (spec.cross_host=True)"
+        if getattr(spec, "cross_host", False)
+        else "on-target native ISA (build host == run host)")
     host_def = f"-D{entry.host_define}"
     base.append(host_def)
     _trace_add(trace, host_def, "kept",
@@ -9120,6 +9223,74 @@ def _sccache_env() -> Dict[str, str]:
                 out[k] = os.environ[k]
 
     return out
+
+
+def _compiler_cache_present() -> Tuple[bool, List[str]]:
+    """Mandate #8 — which compiler caches are on PATH. Returns
+    ``(present, names)`` where names ⊆ {'ccache', 'sccache'}."""
+    names = [n for n in ("ccache", "sccache") if shutil.which(n)]
+    return (bool(names), names)
+
+
+def _warn_if_no_compiler_cache(report) -> None:
+    """Mandate #8 — a JIT sweep rebuilds a fresh .so per candidate. Without a
+    compiler cache the sweep is COMPILE-bound, not GPU-bound, wasting the
+    locked-clock GPU window on redundant recompiles. Warn loudly when neither
+    sccache nor ccache is available so the operator can install one."""
+    present, names = _compiler_cache_present()
+    if present:
+        report.write(f"  [ccache] compiler cache(s) on PATH: "
+                     f"{', '.join(names)} — sweep will reuse object cache.\n")
+    else:
+        report.write(
+            "  [ccache] WARNING: no sccache/ccache on PATH. The autotune "
+            "sweep recompiles every variant from scratch, so it is "
+            "COMPILE-bound rather than GPU-bound and wastes the locked-clock "
+            "window. Strongly recommended: `pip install sccache` or install "
+            "ccache, then re-run. Proceeding uncached.\n")
+
+
+def _compiler_cache_stats() -> Dict[str, Any]:
+    """Mandate #8 — query sccache/ccache hit-rate for the just-finished
+    sweep. Best-effort: returns a dict with raw stats text per tool and a
+    parsed ``hit_rate`` when derivable. Never raises (a stats failure must
+    not abort a build)."""
+    stats: Dict[str, Any] = {}
+    sccache = shutil.which("sccache")
+    if sccache:
+        rc, out, _ = _run_smi([sccache, "--show-stats"], timeout=10)
+        if rc == 0 and out:
+            stats["sccache"] = out
+            import re as _re
+            hits = _re.search(r"Cache hits\s+(\d+)", out)
+            misses = _re.search(r"Cache misses\s+(\d+)", out)
+            if hits and misses:
+                h, m = int(hits.group(1)), int(misses.group(1))
+                tot = h + m
+                if tot:
+                    stats["hit_rate"] = h / tot
+    ccache = shutil.which("ccache")
+    if ccache:
+        rc, out, _ = _run_smi([ccache, "-s"], timeout=10)
+        if rc == 0 and out:
+            stats["ccache"] = out
+    return stats
+
+
+def _report_compiler_cache_stats(report) -> None:
+    """Mandate #8 — emit the per-sweep compiler-cache hit-rate so cache
+    effectiveness is observable in the sweep log."""
+    try:
+        stats = _compiler_cache_stats()
+    except Exception as exc:  # never let a stats probe abort the build
+        report.write(f"  [ccache] stats probe failed: {exc}\n")
+        return
+    if "hit_rate" in stats:
+        report.write(f"  [ccache] sweep compiler-cache hit-rate: "
+                     f"{stats['hit_rate'] * 100:.1f}%\n")
+    elif "sccache" in stats or "ccache" in stats:
+        report.write("  [ccache] sweep compiler-cache stats recorded "
+                     "(hit-rate not parseable).\n")
 
 
 # ---------------------------------------------------------------------------
@@ -11572,6 +11743,9 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
     report.write(f"  [l2-flush] arch={spec.arch} flush_buffer="
                  f"{l2_flush / (1024 * 1024):.0f} MiB "
                  f"({'enabled' if l2_flush else 'disabled'})\n")
+    # Mandate #8 — a sweep without a compiler cache is compile-bound. Warn
+    # loudly so the operator installs sccache/ccache.
+    _warn_if_no_compiler_cache(report)
     worker: Optional[Any] = None
     if len(visible) > 1:
         report.write(f"  [worker] {len(visible)} GPUs visible "
@@ -11644,6 +11818,8 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
                                       clock_lock.record())
         except Exception as exc:
             report.write(f"  [clock-lock] cache annotate skipped: {exc}\n")
+    # Mandate #8 — report the sweep's compiler-cache hit-rate.
+    _report_compiler_cache_stats(report)
 
     # Auto-prune the variant cache so a long-running autotune campaign
     # doesn't accumulate gigabytes of stale .so files. Only runs on a
@@ -16625,6 +16801,93 @@ def _self_test_l2_flush(run) -> None:
     run("l2_worker_body_has_flush", test_worker_body_has_flush_logic)
 
 
+def _self_test_tier1_compile(run) -> None:
+    """`[self-test] tier1_compile` section (mandate Tier-1 source
+    auto-discovery + #7 march policy + #8 sccache requirement)."""
+    import tempfile
+    sys.stdout.write("[self-test] tier1_compile\n")
+
+    def test_auto_discover_globs_compilable_sources():
+        """A non-grokking project (no csrc/backends layout) → broad glob
+        finds every .cu/.cpp under the tree, skipping pruned dirs."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "kernels").mkdir()
+            (root / "build").mkdir()
+            (root / "tests").mkdir()
+            (root / "kernels" / "a.cu").write_text("// k\n")
+            (root / "kernels" / "b.cpp").write_text("// b\n")
+            (root / "build" / "stale.cu").write_text("// pruned\n")
+            (root / "tests" / "t.cu").write_text("// pruned\n")
+            found = _auto_discover_sources(root, "cuda")
+            names = sorted(p.name for p in found)
+            assert names == ["a.cu", "b.cpp"], names
+
+    def test_auto_discover_pallas_only_py():
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "k.py").write_text("# pallas\n")
+            (root / "k.cu").write_text("// not pallas\n")
+            found = _auto_discover_sources(root, "pallas")
+            assert [p.name for p in found] == ["k.py"], found
+
+    def test_march_native_by_default():
+        """On-target (default) → -march=native -mtune=native."""
+        flags = _host_march_flags(BuildSpec(
+            optimizer="adamw", model="decoder", arch="sm_90a",
+            out_dir=Path("/tmp")))
+        assert flags == ["-march=native", "-mtune=native"], flags
+
+    def test_march_baseline_cross_host():
+        """Cross-host → portable ISA baseline, never native."""
+        spec = BuildSpec(optimizer="adamw", model="decoder", arch="sm_90a",
+                         out_dir=Path("/tmp"), cross_host=True)
+        flags = _host_march_flags(spec)
+        assert flags == ["-march=x86-64-v3"], flags
+        assert "-march=native" not in flags
+        # Custom baseline honoured.
+        spec.cross_host_march = "x86-64-v4"
+        assert _host_march_flags(spec) == ["-march=x86-64-v4"]
+
+    def test_host_cflags_no_native_in_base():
+        """-march must not be baked into the shared base list (it's policy)."""
+        assert "-march=native" not in HOST_CFLAGS_BASE
+        assert "-mtune=native" not in HOST_CFLAGS_BASE
+
+    def test_host_cflags_hash_differs_native_vs_crosshost():
+        """Cross-host build must produce a different host flag set than the
+        native build (so host_cflags_hash diverges, keeping the cache honest)."""
+        base = dict(optimizer="adamw", model="decoder", arch="sm_90a",
+                    out_dir=Path("/tmp"))
+        native = _host_cflags(BuildSpec(**base))
+        cross = _host_cflags(BuildSpec(**base, cross_host=True))
+        assert native != cross
+        assert "-march=native" in native
+        assert "-march=x86-64-v3" in cross
+
+    def test_compiler_cache_warning_when_absent():
+        """When no compiler cache is on PATH, the sweep emits a loud warning
+        (not silent), so the operator knows the sweep is compile-bound."""
+        import io
+        saved = shutil.which
+        rep = io.StringIO()
+        try:
+            shutil.which = lambda name: None  # type: ignore
+            _warn_if_no_compiler_cache(rep)
+        finally:
+            shutil.which = saved
+        log = rep.getvalue()
+        assert "WARNING" in log and "no sccache/ccache" in log, log
+
+    run("tier1_auto_discover_globs", test_auto_discover_globs_compilable_sources)
+    run("tier1_auto_discover_pallas", test_auto_discover_pallas_only_py)
+    run("march_native_by_default", test_march_native_by_default)
+    run("march_baseline_cross_host", test_march_baseline_cross_host)
+    run("host_cflags_no_native_in_base", test_host_cflags_no_native_in_base)
+    run("host_cflags_hash_differs", test_host_cflags_hash_differs_native_vs_crosshost)
+    run("compiler_cache_warning_when_absent", test_compiler_cache_warning_when_absent)
+
+
 def _self_test_kernel_headers(run) -> None:
     """`[self-test] kernel_headers` section."""
     import shutil
@@ -18893,7 +19156,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 165
+_SELF_TEST_EXPECTED_COUNT: int = 172
 
 
 def _self_test() -> int:
@@ -18933,6 +19196,7 @@ def _self_test() -> int:
     _self_test_multi_gpu_pool(_run)
     _self_test_clock_lock(_run)
     _self_test_l2_flush(_run)
+    _self_test_tier1_compile(_run)
     _self_test_kernel_headers(_run)
     _self_test_arch_table(_run)
     _self_test_kernel_registry(_run)
