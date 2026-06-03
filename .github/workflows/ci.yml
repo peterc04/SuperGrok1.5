@@ -1227,6 +1227,42 @@ jobs:
             echo "::error::verify-all reported failures in $fails phase(s)"; exit 1; fi
 
   # ---------------------------------------------------------------------------
+  # profile-maximal (fast tiers) — binary/instruction maximality + functional
+  # correctness that no other job covers. Tier C: the gfx942 attention/decoder/
+  # mamba device kernels reach the MFMA matrix cores (+ DPP). Tier D: the
+  # optimizer math ACTUALLY descends a convex loss on CPU (Adam core, Lion) and
+  # a real fused (mamba3, adamw) Pallas program lowers. The compile-heavy SASS
+  # tiers (A: WGMMA/TMA emission, B: ptxas regs/smem/spills) need nvcc + ~25min
+  # and are run locally / nightly, not on every PR.
+  # ---------------------------------------------------------------------------
+  profile_maximal:
+    name: profile-maximal (MFMA + functional, no GPU)
+    runs-on: ubuntu-latest
+    needs: py_compile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch + deps
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy jax jaxlib
+      - name: profile-maximal tiers C + D
+        run: |
+          set -uo pipefail
+          fails=0
+          for tier in C D; do
+            echo "::group::profile-maximal tier $tier"
+            PYTHONPATH=. python3 -m grokking_optimizers.profile_maximal --tier "$tier" \
+              || fails=$((fails+1))
+            echo "::endgroup::"
+          done
+          if [ "$fails" -ne 0 ]; then
+            echo "::error::profile-maximal reported failures in $fails tier(s)"; exit 1; fi
+
+  # ---------------------------------------------------------------------------
   # pytest (CPU) — the pure-PyTorch reference-parity + import-safe test suite,
   # excluding hardware-gated tests (-m "not hw"). The fp64 optimizer reference
   # implementations and their self-consistency checks are the CPU half of the
@@ -1480,6 +1516,7 @@ jobs:
       - amdgcn_check
       - drift_guard
       - verify_all
+      - profile_maximal
       - pytest_cpu
     if: always()
     steps:
