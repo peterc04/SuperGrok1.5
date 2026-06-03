@@ -3353,6 +3353,35 @@ def main():
             sys.stdout.write(json.dumps({"ok": True}) + "\n")
             sys.stdout.flush()
             continue
+        if op == "calibrate":
+            # Mandate #5 — time a FIXED reference kernel (square matmul) on
+            # this pinned device so the pool can normalize per-GPU
+            # bin/throttle offsets before pooling timings across devices.
+            try:
+                n = int(req.get("ref_size", 2048))
+                iters = int(req.get("ref_iters", 11))
+                a = torch.randn(n, n, device="cuda", dtype=torch.float32)
+                b = torch.randn(n, n, device="cuda", dtype=torch.float32)
+                for _ in range(3):
+                    torch.mm(a, b)
+                torch.cuda.synchronize()
+                ts = []
+                for _ in range(iters):
+                    s = torch.cuda.Event(enable_timing=True)
+                    e = torch.cuda.Event(enable_timing=True)
+                    s.record()
+                    torch.mm(a, b)
+                    e.record()
+                    torch.cuda.synchronize()
+                    ts.append(s.elapsed_time(e))
+                ts.sort()
+                sys.stdout.write(json.dumps(
+                    {"ref_ms": float(ts[len(ts) // 2])}) + "\n")
+            except Exception as exc:
+                sys.stdout.write(json.dumps(
+                    {"error": "calibrate failed: " + str(exc)}) + "\n")
+            sys.stdout.flush()
+            continue
         if op == "shutdown":
             sys.stdout.write(json.dumps({"bye": True}) + "\n")
             sys.stdout.flush()
@@ -3870,6 +3899,25 @@ class TimingWorker:
             line = self._read_line(timeout=5)
         return bool(line and line.get("ok"))
 
+    def calibrate(self, *, ref_size: int = 2048,
+                  ref_iters: int = 11) -> Optional[float]:
+        """Mandate #5 — time the fixed reference matmul on this worker's
+        pinned device. Returns the median ms, or None on failure."""
+        if not self.alive():
+            return None
+        req = {"op": "calibrate", "ref_size": ref_size, "ref_iters": ref_iters}
+        with self._io_lock:
+            try:
+                assert self._proc and self._proc.stdin
+                self._proc.stdin.write(json.dumps(req) + "\n")
+                self._proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                return None
+            line = self._read_line(timeout=60)
+        if not line or "ref_ms" not in line:
+            return None
+        return float(line["ref_ms"])
+
     @property
     def error_log(self) -> list:
         return list(self._error_log)
@@ -3962,6 +4010,12 @@ class MultiGPUTimingPool:
         self._stopped = threading.Event()
         self._dispatch_threads: List[threading.Thread] = []
         self._started = False
+        # Mandate #5 — per-worker calibration factor (worker_ref_ms /
+        # fastest_ref_ms). A measured time on a slower-binned GPU is divided
+        # by its factor to normalize it into the fastest GPU's frame, so
+        # cross-GPU ranking matches single-GPU ranking. Default 1.0 (no
+        # normalization) until calibrate() runs.
+        self._calib_factors: List[float] = [1.0] * len(self.workers)
 
     # ---- lifecycle mirroring TimingWorker ----------------------------
 
@@ -3983,9 +4037,58 @@ class MultiGPUTimingPool:
                 live.append(w)
                 any_ok = True
         self.workers = live
+        # Mandate #5 — calibrate per-GPU offsets before pooling timings.
+        if any_ok and len(self.workers) > 1:
+            self.calibrate()
+        else:
+            self._calib_factors = [1.0] * len(self.workers)
         self._spawn_dispatchers()
         self._started = True
         return any_ok
+
+    def calibrate(self, report=None) -> List[float]:
+        """Mandate #5 — time a fixed reference kernel on every live worker
+        and compute per-worker normalization factors (worker_ref_ms /
+        fastest_ref_ms). A GPU that bins/throttles slower gets a factor > 1,
+        and its measured variant times are later divided by that factor so
+        ranking is consistent with a single-GPU sweep. Workers that fail to
+        calibrate keep factor 1.0 (no normalization)."""
+        refs: List[Optional[float]] = []
+        for w in self.workers:
+            try:
+                refs.append(w.calibrate())
+            except Exception:
+                refs.append(None)
+        valid = [r for r in refs if r and r > 0]
+        if not valid:
+            self._calib_factors = [1.0] * len(self.workers)
+            return self._calib_factors
+        fastest = min(valid)
+        self._calib_factors = [
+            (r / fastest) if (r and r > 0) else 1.0 for r in refs]
+        if report is not None:
+            for i, (r, f) in enumerate(zip(refs, self._calib_factors)):
+                dev = self.devices[i] if i < len(self.devices) else i
+                report.write(f"  [calibrate] gpu{dev}: ref_ms={r} "
+                             f"factor={f:.4f}\n")
+        return self._calib_factors
+
+    @staticmethod
+    def _normalize_result(result: Any, factor: float) -> Any:
+        """Mandate #5 — divide a worker's measured times by its calibration
+        factor so they live in the fastest GPU's frame. Records the raw value
+        + factor for provenance. No-op when factor==1.0 or result lacks
+        timing."""
+        if (factor == 1.0 or not isinstance(result, dict)
+                or result.get("timing_ms") is None):
+            return result
+        out = dict(result)
+        out["timing_ms_raw"] = result["timing_ms"]
+        out["calib_factor"] = factor
+        for k in ("timing_ms", "min_ms", "max_ms"):
+            if isinstance(out.get(k), (int, float)):
+                out[k] = float(out[k]) / factor
+        return out
 
     def _spawn_dispatchers(self) -> None:
         """Start one dispatcher thread per live worker (idempotent)."""
@@ -4089,6 +4192,11 @@ class MultiGPUTimingPool:
                     result = worker.time(variant_so)
                 else:
                     result = worker.time(variant_so, opt_class, **kwargs)
+                # Mandate #5 — normalize this GPU's measured time into the
+                # fastest GPU's frame so cross-GPU ranking is consistent.
+                factors = getattr(self, "_calib_factors", [])
+                factor = factors[idx] if idx < len(factors) else 1.0
+                result = self._normalize_result(result, factor)
                 fut.set_result(result)
             except Exception as exc:  # noqa: BLE001 — propagate to caller
                 try:
@@ -4425,6 +4533,16 @@ def featurize_config(config: Dict[str, Any],
 
 
 # ---- CostModel: backend-agnostic regressor wrapper -----------------------
+
+# Mandate #14 — cold-start floor. The cost model trains on in-run trial
+# timings; early on it is under-fit, and (worse pre-#1) it was trained on
+# UNLOCKED-clock noisy timings. So cost-model PRUNING (vetoing a candidate
+# before measuring it) is disabled until at least this many trials have been
+# MEASURED under locked clocks. Below the floor every candidate is measured,
+# guaranteeing the model can never early-stop the search from a cold/under-fit
+# state and the first fits see real (locked-clock) signal.
+_COST_MODEL_COLD_START_FLOOR: int = 100
+
 
 class CostModel:
     """XGBoost-backed (with sklearn / linear fallbacks) regressor of
@@ -4903,6 +5021,21 @@ def _hashable(v):
     return v
 
 
+# ── Mandate #13 — documented stopper defaults ─────────────────────────────
+# Broad coverage of a 10^6–10^13 search space is the BAYESIAN SAMPLER's job,
+# governed by CONVERGENCE DETECTORS, not by exhaustive enumeration. The
+# ``max_trials`` cap is a SAFETY RAIL only — it should essentially never be
+# the binding constraint; the plateau / EI-exhaustion / coverage-saturation
+# detectors below decide when the search has converged. These constants
+# centralize the "thorough-but-finite" effort posture (like a compiler's
+# fixed -O3 effort) so it is tuned in one place and exposed via one knob
+# (--min-improvement / --patience / --ei-floor / --max-tune-seconds).
+_DEFAULT_MIN_DELTA_REL: float = 0.005        # 0.5% improvement = meaningful
+_DEFAULT_EI_FLOOR: float = 1e-6              # rolling EI exhaustion floor
+_DEFAULT_COVERAGE_GROWTH_FLOOR: float = 0.001  # new-(dim,value) per trial
+_DEFAULT_STOPPER_SAFETY_CAP: int = 1_000_000   # safety rail, not primary
+
+
 class BayesianEarlyStopper:
     """Multi-criterion stopper for Optuna autotune.
 
@@ -4917,16 +5050,20 @@ class BayesianEarlyStopper:
       (c) Coverage saturation: new-(dim_name, value) tuples per trial
           < ``coverage_growth_floor``.
       (d) Wall-clock budget: ``time.time() - start_time > max_seconds``.
-      (e) Hard ceiling: ``trial_count >= max_trials`` (sanity, default 1M).
+      (e) Hard ceiling: ``trial_count >= max_trials`` — a SAFETY RAIL only
+          (default 1M). Mandate #13: this is NOT the primary stopping lever;
+          (a)/(b)/(c) govern convergence so the cap is essentially never the
+          binding constraint. Lifting it is unnecessary — broad coverage is
+          the sampler's job, not exhaustive enumeration.
     """
 
     def __init__(self, *,
-                 min_delta_rel: float = 0.005,
+                 min_delta_rel: float = _DEFAULT_MIN_DELTA_REL,
                  patience: Optional[int] = None,
-                 ei_floor: float = 1e-6,
-                 coverage_growth_floor: float = 0.001,
+                 ei_floor: float = _DEFAULT_EI_FLOOR,
+                 coverage_growth_floor: float = _DEFAULT_COVERAGE_GROWTH_FLOOR,
                  max_seconds: Optional[float] = None,
-                 max_trials: int = 1_000_000):
+                 max_trials: int = _DEFAULT_STOPPER_SAFETY_CAP):
         self.min_delta_rel = min_delta_rel
         self._patience_override = patience  # None → auto = max(50, 0.1*N)
         self.ei_floor = ei_floor
@@ -6584,6 +6721,10 @@ class BuildSpec:
     # improvement over the trailing ``patience`` trials drops below this
     # value. 0 disables (other stoppers still apply).
     ei_floor: float = 1e-6
+    # Mandate #13 — coverage-saturation floor (new-(dim,value) tuples/trial).
+    # Part of the convergence-detector trio that governs the sweep; the
+    # max_trials cap is only a safety rail.
+    coverage_growth_floor: float = 0.001
     seed: int = 0
     debug_symbols: bool = False
     debug: bool = False               # mirror report to stderr + print every subproc
@@ -11763,7 +11904,12 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         if (spec.enable_cost_model
                 and cost_model_state is not None):
             reg = cost_model_state.get("model")
-            if reg is not None and reg.is_warm():
+            # Mandate #14 — cold-start floor: never prune until >= N trials
+            # have been MEASURED (under locked clocks, #1). Below the floor the
+            # model is under-fit / clock-noisy, so we measure every candidate.
+            n_measured = int(cost_model_state.get("n_measured", 0))
+            cold = n_measured < _COST_MODEL_COLD_START_FLOOR
+            if reg is not None and reg.is_warm() and not cold:
                 try:
                     arch_entry_cm = cost_model_state.get("arch_entry")
                     stall_info_cm = cost_model_state.get("stall_info")
@@ -12374,12 +12520,20 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
     n_trials = spec.bayesian_trials  # may be None ⇒ auto stopper
     # Build a stopper from BuildSpec; honours --max-tune-seconds / --patience
     # / --min-improvement when provided, otherwise pure auto-mode.
+    # Mandate #13 — convergence detectors govern; the cap is a safety rail.
     stopper = BayesianEarlyStopper(
         min_delta_rel=spec.min_improvement,
         patience=spec.patience,
         ei_floor=spec.ei_floor,
+        coverage_growth_floor=getattr(
+            spec, "coverage_growth_floor", _DEFAULT_COVERAGE_GROWTH_FLOOR),
         max_seconds=spec.max_tune_seconds,
     )
+    report.write(
+        f"  [stopper] convergence-governed (plateau Δ<{stopper.min_delta_rel}, "
+        f"ei_floor={stopper.ei_floor}, coverage_floor="
+        f"{stopper.coverage_growth_floor}); max_trials={stopper.max_trials:,} "
+        f"is a SAFETY RAIL, not the primary lever.\n")
 
     # Stream C — learned cost-model bookkeeping. The state dict is the
     # same object the timer closure mutates (n_rejected / n_total) and
@@ -12505,6 +12659,26 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
                 if tms_f < float(cost_model_state.get("best_so_far",
                                                       float("inf"))):
                     cost_model_state["best_so_far"] = tms_f
+                # Mandate #14 — count MEASURED trials (the cold-start floor
+                # for pruning reads this) and log prediction error vs measured
+                # so model miscalibration is observable.
+                cost_model_state["n_measured"] = int(
+                    cost_model_state.get("n_measured", 0)) + 1
+                _reg = cost_model_state.get("model")
+                if _reg is not None and _reg.is_warm():
+                    try:
+                        _feat = featurize_config(cfg, dims, cm_arch_entry,
+                                                 cost_model_state.get("stall_info"))
+                        _pred, _ = _reg.predict(_feat)
+                        if math.isfinite(_pred) and tms_f > 0:
+                            _abs_err = abs(_pred - tms_f) / tms_f
+                            report.write(
+                                f"  [cost-model] pred={_pred:.4f}ms "
+                                f"measured={tms_f:.4f}ms "
+                                f"rel_err={_abs_err * 100:.1f}% "
+                                f"(n_measured={cost_model_state['n_measured']})\n")
+                    except Exception:
+                        pass
                 cm_trial_buffer.append({"config": cfg, "timing_ms": tms_f})
                 cm_state["since_last_train"] += 1
                 # Cold start: gather 2x retrain_every signals before the
@@ -17219,6 +17393,102 @@ def _self_test_clock_lock(run) -> None:
     run("clock_lock_amd_perflevel_high", test_amd_perflevel_high)
 
 
+def _self_test_autotune_brain(run) -> None:
+    """`[self-test] autotune_brain` section (mandate #13 stopper defaults,
+    #14 cost-model cold-start floor, #5 multi-GPU calibration)."""
+    sys.stdout.write("[self-test] autotune_brain\n")
+
+    def test_stopper_defaults_documented_constants():
+        """#13 — the stopper uses the centralized documented defaults; the
+        max_trials cap is a safety rail, far above any convergence count."""
+        s = BayesianEarlyStopper()
+        assert s.min_delta_rel == _DEFAULT_MIN_DELTA_REL
+        assert s.ei_floor == _DEFAULT_EI_FLOOR
+        assert s.coverage_growth_floor == _DEFAULT_COVERAGE_GROWTH_FLOOR
+        assert s.max_trials == _DEFAULT_STOPPER_SAFETY_CAP
+        assert s.max_trials >= 1_000_000, "safety rail must be very high"
+
+    def test_stopper_convergence_governs_not_cap():
+        """#13 — a converging timer stops on a convergence detector
+        (plateau/EI/coverage), NOT by hitting max_trials."""
+        def _converging(cfg):
+            return 0.1  # instant plateau
+        stopper = BayesianEarlyStopper(patience=20, max_trials=100000)
+        records, info = run_bayesian(
+            "sm_90", {"sm_90": {"dims": [
+                {"name": "block", "values": [64, 128, 256]},
+                {"name": "vec", "values": [1, 2, 4]}],
+                "prefilter": {"rules": []}}},
+            n_trials=None, seed=0, timer=_converging, stopper=stopper)
+        assert len(records) < 100000, "must converge, not hit the cap"
+        reason = info.get("stop_reason") or ""
+        assert "max_trials" not in reason, \
+            f"cap should not be the binding constraint, got {reason}"
+
+    def test_cost_model_cold_start_floor_constant():
+        """#14 — pruning floor is >= 100 measured trials."""
+        assert _COST_MODEL_COLD_START_FLOOR >= 100
+
+    def test_calibration_factors_default_unity():
+        """#5 — without calibration, factors are 1.0 (no normalization)."""
+        saved = os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        try:
+            pool = MultiGPUTimingPool("Lion", vendor="cuda",
+                                      enable_watchdog=False)
+            assert pool._calib_factors == [1.0]
+        finally:
+            if saved is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = saved
+
+    def test_calibration_normalizes_measured_time():
+        """#5 — a slower GPU's measured time is divided by its factor so it
+        lands in the fastest GPU's frame; raw value is preserved."""
+        # factor 1.0 → unchanged
+        r0 = MultiGPUTimingPool._normalize_result(
+            {"timing_ms": 1.0, "min_ms": 0.9, "max_ms": 1.1}, 1.0)
+        assert r0["timing_ms"] == 1.0 and "calib_factor" not in r0
+        # factor 1.25 (25% slower GPU) → divide.
+        r1 = MultiGPUTimingPool._normalize_result(
+            {"timing_ms": 1.25, "min_ms": 1.25, "max_ms": 1.25}, 1.25)
+        assert abs(r1["timing_ms"] - 1.0) < 1e-9, r1
+        assert r1["timing_ms_raw"] == 1.25 and r1["calib_factor"] == 1.25
+
+    def test_calibration_factor_from_refs():
+        """#5 — factors are worker_ref / fastest_ref; fastest gets 1.0."""
+        saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2"
+        try:
+            pool = MultiGPUTimingPool("Lion", vendor="cuda",
+                                      enable_watchdog=False)
+            # Splice mock workers returning fixed ref times.
+            class _MW:
+                def __init__(self, ms): self._ms = ms
+                def calibrate(self, **kw): return self._ms
+            pool.workers = [_MW(1.0), _MW(1.5), _MW(2.0)]
+            factors = pool.calibrate()
+            assert abs(factors[0] - 1.0) < 1e-9
+            assert abs(factors[1] - 1.5) < 1e-9
+            assert abs(factors[2] - 2.0) < 1e-9
+        finally:
+            if saved is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = saved
+
+    def test_worker_body_has_calibrate_op():
+        body = _render_worker_body("grokking_optimizers")
+        assert '"calibrate"' in body or "calibrate" in body
+        assert "ref_ms" in body
+
+    run("stopper_defaults_documented", test_stopper_defaults_documented_constants)
+    run("stopper_convergence_governs", test_stopper_convergence_governs_not_cap)
+    run("cost_model_cold_start_floor", test_cost_model_cold_start_floor_constant)
+    run("calibration_factors_default_unity", test_calibration_factors_default_unity)
+    run("calibration_normalizes_time", test_calibration_normalizes_measured_time)
+    run("calibration_factor_from_refs", test_calibration_factor_from_refs)
+    run("worker_body_has_calibrate_op", test_worker_body_has_calibrate_op)
+
+
 def _self_test_l2_flush(run) -> None:
     """`[self-test] l2_flush` section (mandate #2)."""
     sys.stdout.write("[self-test] l2_flush\n")
@@ -19822,7 +20092,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 188
+_SELF_TEST_EXPECTED_COUNT: int = 195
 
 
 def _self_test() -> int:
@@ -19861,6 +20131,7 @@ def _self_test() -> int:
     _self_test_cache(_run)
     _self_test_multi_gpu_pool(_run)
     _self_test_clock_lock(_run)
+    _self_test_autotune_brain(_run)
     _self_test_l2_flush(_run)
     _self_test_tier1_compile(_run)
     _self_test_discovery(_run)
