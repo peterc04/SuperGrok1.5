@@ -84,8 +84,16 @@ LOG="$(mktemp)"
 if [ "${1:-}" = "--header" ]; then
   HDR="${2:?usage: amdgcn_check.sh --header <header>}"
   clang "${FLAGS[@]}" -c "$HDR" -o /dev/null 2> "$LOG"
+elif [ "${1:-}" = "--cell" ]; then
+  # Full fused .hip cell: clang infers HIP language from the .hip extension and
+  # then errors ("unsupported architecture amdgcn for host compilation"). Force
+  # C++ language mode so the amdgcn device pass type-checks the forced template
+  # instantiation block (the host hipLaunchKernelGGL block is #if'd out under
+  # the bare amdgcn target — __HIPCC__ is undefined here).
+  CELL="${2:?usage: amdgcn_check.sh --cell <cell.hip>}"
+  clang "${FLAGS[@]}" -x c++ -c "$CELL" -o /dev/null 2> "$LOG"
 else
-  SRC="${1:?usage: amdgcn_check.sh <snippet.cpp> | --header <header>}"
+  SRC="${1:?usage: amdgcn_check.sh <snippet.cpp> | --header <h> | --cell <c.hip>}"
   clang "${FLAGS[@]}" -c "$SRC" -o /dev/null 2> "$LOG"
 fi
 RC=$?

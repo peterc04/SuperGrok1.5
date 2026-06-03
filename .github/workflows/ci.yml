@@ -1106,12 +1106,15 @@ jobs:
           set -uo pipefail
           fails=0
           # Per-op launch TUs (11) + the fused mega-model TUs (vit/decoder/mamba3).
+          # -DWITH_CUTLASS is the MAXIMAL sm_90 build config (the shipped fast
+          # path); launch_supergrok2.cu + the model TUs hard-#error without it,
+          # and the cuBLAS megakernel cells are unaffected — so test what ships.
           tus=$(ls csrc/backends/cuda/sm_90/launch_*.cu \
                    csrc/fused/sm_90/mega_*.cu 2>/dev/null)
           n=$(echo "$tus" | wc -w)
           echo "compiling $n sm_90 translation units to objects (no GPU)"
           for tu in $tus; do
-            if bash scripts/compile_to_object.sh "$tu"; then :; else
+            if bash scripts/compile_to_object.sh "$tu" -DWITH_CUTLASS; then :; else
               echo "::error::nvcc -c failed: $tu"; fails=$((fails+1)); fi
           done
           if [ "$fails" -ne 0 ]; then
@@ -1149,6 +1152,24 @@ jobs:
           if [ "$fails" -ne 0 ]; then
             echo "::error::$fails gfx942 header(s) failed the AMDGCN gate"; exit 1; fi
           echo "all gfx942 per-op device headers passed the AMDGCN gate"
+      - name: amdgcn_check --cell over the 33 gfx942 fused composition cells
+        run: |
+          set -uo pipefail
+          fails=0; n=0
+          # The fused mega_*.hip cells force the composed
+          # fused_megakernel<Model, Opt, Tier> instantiation under the bare
+          # amdgcn device target — this type-checks the FULL optimizer×model
+          # composition on device (the per-op headers above only cover the
+          # pieces in isolation). --cell forces -x c++ so clang treats the .hip
+          # as a C++ TU instead of erroring on host HIP compilation.
+          for c in csrc/fused/gfx942/mega_*.hip; do
+            n=$((n+1))
+            if bash scripts/amdgcn_check.sh --cell "$c"; then :; else
+              echo "::error::AMDGCN compose gate failed: $c"; fails=$((fails+1)); fi
+          done
+          if [ "$fails" -ne 0 ]; then
+            echo "::error::$fails gfx942 fused cell(s) failed the AMDGCN gate"; exit 1; fi
+          echo "all $n gfx942 fused composition cells passed the AMDGCN gate"
 
   # ---------------------------------------------------------------------------
   # Optimizer-math drift guard — the single-source structural invariant: every
@@ -1167,6 +1188,43 @@ jobs:
           python-version: "3.11"
       - name: check_math_single_source.py
         run: python3 scripts/check_math_single_source.py
+
+  # ---------------------------------------------------------------------------
+  # verify-all (maximality + cross-validation) — the end-all-be-all harness's
+  # fast phases (1 inventory, 4 maximality, 5 cross-validation). These run in
+  # seconds and catch what no other job does: codegen IDEMPOTENCY across all 99
+  # cells (no stale generated source), every cell at its MAX fusion tier, every
+  # cell within the register+smem budget, the dispatch tables matching their
+  # generators byte-for-byte, and the utilization crash-hard contract. The
+  # compile-heavy phases (2 components, 3 the 99-cell composition) are covered
+  # by the dedicated compile_to_object + amdgcn_check jobs above.
+  # ---------------------------------------------------------------------------
+  verify_all:
+    name: verify-all (maximality + cross-validation, no GPU)
+    runs-on: ubuntu-latest
+    needs: py_compile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU-only torch + deps
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy pyyaml jax jaxlib ruff
+      - name: verify-all phases 1 + 4 + 5
+        run: |
+          set -uo pipefail
+          fails=0
+          for ph in 1 4 5; do
+            echo "::group::verify-all phase $ph"
+            PYTHONPATH=. python3 -m grokking_optimizers.verify_all --phase "$ph" \
+              || fails=$((fails+1))
+            echo "::endgroup::"
+          done
+          if [ "$fails" -ne 0 ]; then
+            echo "::error::verify-all reported failures in $fails phase(s)"; exit 1; fi
 
   # ---------------------------------------------------------------------------
   # pytest (CPU) — the pure-PyTorch reference-parity + import-safe test suite,
@@ -1421,6 +1479,7 @@ jobs:
       - compile_to_object
       - amdgcn_check
       - drift_guard
+      - verify_all
       - pytest_cpu
     if: always()
     steps:
