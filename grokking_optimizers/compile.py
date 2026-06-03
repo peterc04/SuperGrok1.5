@@ -2841,6 +2841,184 @@ def _pgo_workload_main() -> int:
 
 
 # ===========================================================================
+# GPU clock locking — mandate #1
+# ===========================================================================
+#
+# Timing on free-boosting clocks corrupts the autotune signal: with
+# ``min_delta_rel = 0.005`` (0.5%), the 5-15% boost/thermal swing of an
+# unlocked GPU is 10-30x the improvement we are trying to resolve, so the
+# "winner" is partly noise and the early stopper fires on noise. NVCC-parity
+# does not need this (it never runs anything); empirical autotuning does.
+#
+# This context manager pins the graphics + memory clocks for the duration of a
+# whole sweep and restores them on exit (exception-safe). Inability to lock
+# (no permission on a shared cloud host, tool absent) is a VALID state per the
+# mandate's fail-fast contract: we emit a loud warning and mark results noisy,
+# rather than crashing or silently producing noisy data. Genuine command
+# failures (a tool present but erroring unexpectedly) are surfaced in the log.
+
+
+def _run_smi(cmd: List[str], timeout: float = 15.0
+             ) -> Tuple[int, str, str]:
+    """Run an nvidia-smi / rocm-smi command; return (rc, stdout, stderr).
+
+    Never raises for a non-zero rc (the caller decides) but DOES surface a
+    missing binary as rc=127 with the reason in stderr so the clock-lock layer
+    can distinguish "tool absent" (valid → noisy) from "tool errored".
+    """
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except FileNotFoundError as exc:
+        return 127, "", f"{cmd[0]} not found: {exc}"
+    except subprocess.TimeoutExpired as exc:
+        return 124, "", f"{cmd[0]} timed out after {timeout}s: {exc}"
+
+
+class _GpuClockLock:
+    """Lock GPU + memory clocks for a tuning sweep (mandate #1).
+
+    NVIDIA: persistence mode on (``nvidia-smi -pm 1``) + pin SM and memory
+    clocks to their max supported values (``-lgc <max>`` / ``-lmc <max>``).
+    Restores with ``-rgc`` / ``-rmc`` on exit.
+    AMD: deterministic max via ``rocm-smi --setperflevel high``; restores with
+    ``--setperflevel auto``.
+    TPU/Pallas: N/A — XLA owns the device and exposes no clock control;
+    records ``status="n/a"`` and proceeds (a valid state, not noisy).
+
+    Usage::
+
+        with _GpuClockLock(spec.arch, vendor, report=report) as lock:
+            ... run the sweep ...
+        # lock.record() -> dict to stash in the cache entry
+
+    Attributes:
+      locked       — True iff clocks were successfully pinned.
+      noisy        — True iff timing happened on unlocked clocks (warned).
+      status       — "locked" | "noisy" | "n/a".
+      locked_clocks— {"sm_mhz": int, "mem_mhz": int} when locked.
+    """
+
+    def __init__(self, arch: str, vendor: str, *, report=None,
+                 device_index: int = 0):
+        self.arch = arch
+        self.vendor = vendor
+        self.report = report
+        self.device_index = device_index
+        self.locked = False
+        self.noisy = False
+        self.status = "n/a"
+        self.locked_clocks: Dict[str, Any] = {}
+        self._restore_cmds: List[List[str]] = []
+
+    def _log(self, msg: str) -> None:
+        if self.report is not None:
+            self.report.write(msg)
+        if _COMPILE_LOG_LEVEL >= 1:
+            sys.stderr.write(msg)
+
+    def __enter__(self) -> "_GpuClockLock":
+        if self.vendor == "pallas":
+            self.status = "n/a"
+            self._log("  [clock-lock] TPU/Pallas — clock control N/A "
+                      "(XLA-managed); proceeding.\n")
+            return self
+        if self.vendor == "cuda":
+            self._lock_nvidia()
+        elif self.vendor == "hip":
+            self._lock_amd()
+        else:
+            self.status = "n/a"
+            self._log(f"  [clock-lock] vendor={self.vendor} — no clock "
+                      f"control; proceeding.\n")
+        return self
+
+    def _lock_nvidia(self) -> None:
+        idx = str(self.device_index)
+        # Persistence mode keeps the driver resident so clock pins survive.
+        _run_smi(["nvidia-smi", "-pm", "1", "-i", idx])
+        rc, out, err = _run_smi([
+            "nvidia-smi",
+            "--query-gpu=clocks.max.sm,clocks.max.mem",
+            "--format=csv,noheader,nounits", "-i", idx])
+        if rc != 0:
+            self._enter_noisy(
+                f"could not query max clocks (rc={rc}): {err.strip()}")
+            return
+        try:
+            sm_s, mem_s = (out.strip().splitlines()[0]).split(",")
+            sm_mhz, mem_mhz = int(sm_s.strip()), int(mem_s.strip())
+        except (ValueError, IndexError) as exc:
+            self._enter_noisy(f"unparseable max-clock output {out!r}: {exc}")
+            return
+        rc_g, _, err_g = _run_smi(
+            ["nvidia-smi", "-i", idx, "-lgc", f"{sm_mhz},{sm_mhz}"])
+        rc_m, _, err_m = _run_smi(
+            ["nvidia-smi", "-i", idx, "-lmc", f"{mem_mhz},{mem_mhz}"])
+        if rc_g == 0:
+            self._restore_cmds.append(["nvidia-smi", "-i", idx, "-rgc"])
+        if rc_m == 0:
+            self._restore_cmds.append(["nvidia-smi", "-i", idx, "-rmc"])
+        if rc_g == 0:
+            self.locked = True
+            self.status = "locked"
+            self.locked_clocks = {"sm_mhz": sm_mhz, "mem_mhz": mem_mhz,
+                                  "mem_locked": rc_m == 0}
+            self._log(f"  [clock-lock] NVIDIA gpu{idx}: SM={sm_mhz}MHz "
+                      f"MEM={mem_mhz}MHz (mem_locked={rc_m == 0}) — locked.\n")
+        else:
+            self._enter_noisy(
+                f"-lgc failed (rc={rc_g}): {err_g.strip() or err_m.strip()} "
+                f"(typically needs root / not permitted on shared hosts)")
+
+    def _lock_amd(self) -> None:
+        idx = str(self.device_index)
+        rc, _, err = _run_smi(["rocm-smi", "-d", idx, "--setperflevel", "high"])
+        if rc == 0:
+            self._restore_cmds.append(
+                ["rocm-smi", "-d", idx, "--setperflevel", "auto"])
+            self.locked = True
+            self.status = "locked"
+            self.locked_clocks = {"perflevel": "high"}
+            self._log(f"  [clock-lock] AMD gpu{idx}: perflevel=high — "
+                      f"locked (deterministic max).\n")
+        else:
+            self._enter_noisy(
+                f"--setperflevel high failed (rc={rc}): {err.strip()} "
+                f"(typically needs root / not permitted on shared hosts)")
+
+    def _enter_noisy(self, reason: str) -> None:
+        self.noisy = True
+        self.status = "noisy"
+        self._log("  [clock-lock] WARNING: clocks NOT locked — "
+                  f"{reason}.\n  [clock-lock] timing results will reflect "
+                  "boost/thermal NOISE; treat the winner as approximate. "
+                  "Re-run on a host where clocks can be pinned for a "
+                  "trustworthy sweep.\n")
+
+    def record(self) -> Dict[str, Any]:
+        """The clock state to stash in the cache entry for provenance."""
+        return {
+            "status": self.status,
+            "locked": self.locked,
+            "noisy": self.noisy,
+            "clocks": self.locked_clocks,
+        }
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        for cmd in self._restore_cmds:
+            rc, _, err = _run_smi(cmd)
+            if rc != 0:
+                self._log(f"  [clock-lock] WARNING: restore '{' '.join(cmd)}' "
+                          f"failed (rc={rc}): {err.strip()}\n")
+            else:
+                self._log(f"  [clock-lock] restored via "
+                          f"'{' '.join(cmd[-2:])}'.\n")
+        return False  # never suppress an exception from the sweep
+
+
+# ===========================================================================
 # bench_graph — CUDA / HIP graph-replay timing (absorbed from
 # grokking_optimizers/bench_graph.py)
 # ===========================================================================
@@ -6089,7 +6267,8 @@ class CompileCache:
     def set_tuned(self, opt: str, model: str, arch: str,
                   config: dict, *, mode: Optional[str] = None,
                   search_space_hash: Optional[str] = None,
-                  early_stop_info: Optional[Dict[str, Any]] = None) -> None:
+                  early_stop_info: Optional[Dict[str, Any]] = None,
+                  clock_lock_info: Optional[Dict[str, Any]] = None) -> None:
         with self._lock:
             e = self.get(opt, model, arch)
             e["tuned_config"]      = config
@@ -6104,6 +6283,19 @@ class CompileCache:
             # ignore the extra key.
             if early_stop_info is not None:
                 e["early_stop_info"] = early_stop_info
+            # Mandate #1: provenance of the clock state the sweep ran under,
+            # so a noisy (unlocked) winner is identifiable after the fact.
+            if clock_lock_info is not None:
+                e["clock_lock"] = clock_lock_info
+            self._dirty = True
+
+    def annotate_clock_lock(self, opt: str, model: str, arch: str,
+                            clock_lock_info: Dict[str, Any]) -> None:
+        """Mandate #1 — stamp the sweep's clock-lock provenance onto an
+        already-tuned entry without disturbing the winning config."""
+        with self._lock:
+            e = self.get(opt, model, arch)
+            e["clock_lock"] = clock_lock_info
             self._dirty = True
 
     # ── Garbage collection ────────────────────────────────────────────
@@ -11335,20 +11527,33 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
         cost_model_state=cost_model_state)
 
     dims = space[spec.arch]["dims"]
+    # Mandate #1 — pin GPU + memory clocks for the whole sweep so the timing
+    # signal reflects kernel quality, not boost/thermal noise. The lock is a
+    # no-op (status="n/a") on TPU/Pallas and downgrades to a loud "noisy"
+    # warning (not a crash) when the host forbids clock control.
+    clock_lock = _GpuClockLock(spec.arch, vendor, report=report)
     try:
-        if spec.autotune_mode == "exhaustive":
-            winning = _run_exhaustive(spec, survivors, dims, timer, cache,
-                                      space_hash, report, total=n_survivors)
-        else:
-            winning = _run_bayesian(spec, survivors, space, dims, timer, cache,
-                                    space_hash, report,
-                                    cost_model_state=cost_model_state)
+        with clock_lock:
+            if spec.autotune_mode == "exhaustive":
+                winning = _run_exhaustive(spec, survivors, dims, timer, cache,
+                                          space_hash, report, total=n_survivors)
+            else:
+                winning = _run_bayesian(spec, survivors, space, dims, timer,
+                                        cache, space_hash, report,
+                                        cost_model_state=cost_model_state)
     finally:
         if worker is not None:
             try:
                 worker.stop()
             except Exception:
                 pass
+    # Stamp the clock-lock provenance onto the winning cache entry.
+    if winning is not None:
+        try:
+            cache.annotate_clock_lock(spec.optimizer, spec.model, spec.arch,
+                                      clock_lock.record())
+        except Exception as exc:
+            report.write(f"  [clock-lock] cache annotate skipped: {exc}\n")
 
     # Auto-prune the variant cache so a long-running autotune campaign
     # doesn't accumulate gigabytes of stale .so files. Only runs on a
@@ -16184,6 +16389,97 @@ def _self_test_multi_gpu_pool(run) -> None:
     run("multigpu_work_stealing", test_work_stealing_fast_worker_dominates)
 
 
+def _self_test_clock_lock(run) -> None:
+    """`[self-test] clock_lock` section (mandate #1)."""
+    sys.stdout.write("[self-test] clock_lock\n")
+
+    def test_pallas_is_na_not_noisy():
+        """TPU/Pallas has no clock control → status 'n/a', never 'noisy'."""
+        lock = _GpuClockLock("tpu_v6e", "pallas")
+        with lock:
+            pass
+        assert lock.status == "n/a", lock.status
+        assert not lock.noisy, "Pallas must not be flagged noisy"
+        assert not lock.locked
+        rec = lock.record()
+        assert rec["status"] == "n/a" and rec["noisy"] is False
+
+    def test_missing_tool_is_noisy_not_crash():
+        """When nvidia-smi is absent, the lock degrades to a loud 'noisy'
+        state (a valid mode per the mandate) and does NOT crash."""
+        import io
+        rep = io.StringIO()
+        lock = _GpuClockLock("sm_90a", "cuda", report=rep)
+        # Force the smi runner to report 'tool not found' regardless of host.
+        saved = globals()["_run_smi"]
+        try:
+            globals()["_run_smi"] = lambda cmd, timeout=15.0: (
+                127, "", f"{cmd[0]} not found")
+            with lock:
+                pass
+        finally:
+            globals()["_run_smi"] = saved
+        assert lock.noisy, "missing tool must mark sweep noisy"
+        assert lock.status == "noisy"
+        assert not lock.locked
+        log = rep.getvalue()
+        assert "WARNING" in log and "NOT locked" in log, log
+
+    def test_successful_lock_records_clocks_and_restores():
+        """A simulated successful NVIDIA lock records the pinned clocks and
+        queues the -rgc/-rmc restore commands (run on exit)."""
+        restore_calls: List[List[str]] = []
+
+        def _fake_smi(cmd, timeout=15.0):
+            if "--query-gpu=clocks.max.sm,clocks.max.mem" in cmd:
+                return 0, "1980, 2619\n", ""
+            if "-rgc" in cmd or "-rmc" in cmd:
+                restore_calls.append(cmd)
+                return 0, "", ""
+            return 0, "", ""
+
+        saved = globals()["_run_smi"]
+        try:
+            globals()["_run_smi"] = _fake_smi
+            lock = _GpuClockLock("sm_90a", "cuda")
+            with lock:
+                assert lock.locked
+                assert lock.locked_clocks["sm_mhz"] == 1980
+                assert lock.locked_clocks["mem_mhz"] == 2619
+        finally:
+            globals()["_run_smi"] = saved
+        # Both -rgc and -rmc must have run on exit.
+        joined = [" ".join(c) for c in restore_calls]
+        assert any("-rgc" in j for j in joined), joined
+        assert any("-rmc" in j for j in joined), joined
+
+    def test_amd_perflevel_high():
+        """AMD path locks via --setperflevel high and restores to auto."""
+        restore_calls: List[List[str]] = []
+
+        def _fake_smi(cmd, timeout=15.0):
+            if "--setperflevel" in cmd and "auto" in cmd:
+                restore_calls.append(cmd)
+            return 0, "", ""
+
+        saved = globals()["_run_smi"]
+        try:
+            globals()["_run_smi"] = _fake_smi
+            lock = _GpuClockLock("gfx942", "hip")
+            with lock:
+                assert lock.locked
+                assert lock.locked_clocks["perflevel"] == "high"
+        finally:
+            globals()["_run_smi"] = saved
+        assert any("auto" in " ".join(c) for c in restore_calls), restore_calls
+
+    run("clock_lock_pallas_is_na", test_pallas_is_na_not_noisy)
+    run("clock_lock_missing_tool_is_noisy", test_missing_tool_is_noisy_not_crash)
+    run("clock_lock_success_records_and_restores",
+        test_successful_lock_records_clocks_and_restores)
+    run("clock_lock_amd_perflevel_high", test_amd_perflevel_high)
+
+
 def _self_test_kernel_headers(run) -> None:
     """`[self-test] kernel_headers` section."""
     import shutil
@@ -18452,7 +18748,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 156
+_SELF_TEST_EXPECTED_COUNT: int = 160
 
 
 def _self_test() -> int:
@@ -18490,6 +18786,7 @@ def _self_test() -> int:
     _self_test_cost_model(_run)
     _self_test_cache(_run)
     _self_test_multi_gpu_pool(_run)
+    _self_test_clock_lock(_run)
     _self_test_kernel_headers(_run)
     _self_test_arch_table(_run)
     _self_test_kernel_registry(_run)
