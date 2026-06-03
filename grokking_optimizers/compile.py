@@ -1141,8 +1141,8 @@ DEFAULT_SEARCH_SPACE = "<full-programmatic>"
 #   2. ``cartesian_count(space, arch)`` returns the size without iteration.
 #   3. ``ss_prefilter()`` accepts an iterable and streams survivors.
 # Bayesian TPE doesn't care about the size — it samples one config at a
-# time using the per-dim value lists. Exhaustive mode also streams, with a
-# cap (--exhaustive-cap) to prevent infinite enumeration.
+# time using the per-dim value lists. Exhaustive mode streams every survivor
+# via iter_prefilter (UNCAPPED — the full feasible space; see _run_exhaustive).
 #
 # Users can still override the entire space via --search-space <path.yaml>.
 
@@ -11189,22 +11189,25 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
     # iterates the Cartesian. Exhaustive mode streams survivors with a 1M
     # cap to bound memory.
     total_candidates = cartesian_count(space, spec.arch)
-    survivors: List[Dict[str, Any]] = []
+    survivors: Iterable[Dict[str, Any]] = []
+    n_survivors = 0
     if spec.autotune_mode == "exhaustive":
-        exhaustive_cap = 1_000_000
-        survivors, eliminated = ss_prefilter(
-            cartesian(space, spec.arch),
-            space[spec.arch].get("prefilter", {}),
-            max_survivors=exhaustive_cap,
-        )
-        capped = len(survivors) >= exhaustive_cap
-        cap_note = f" (capped at {exhaustive_cap:,})" if capped else ""
+        # TRUE exhaustive: sweep EVERY surviving config — NO cap. The point of
+        # exhaustive is maximal coverage of the whole feasible space; capping it
+        # would silently skip configs (sm_90a alone has ~1.58M survivors > the
+        # old 1M cap). Stream survivors lazily via iter_prefilter so even
+        # multi-million-survivor spaces never materialize the full list. A first
+        # cheap counting pass (feasibility predicate only — NO compiles) gives
+        # the total for the progress bar / ETA; the sweep re-streams them.
+        pf = space[spec.arch].get("prefilter", {})
+        n_survivors = sum(1 for _ in iter_prefilter(
+            cartesian(space, spec.arch), pf))
         report.write(f"  [prefilter] {total_candidates:,} candidates → "
-                     f"{len(survivors):,} survivors{cap_note} "
-                     f"({eliminated:,} eliminated en route)\n")
-        if not survivors:
+                     f"{n_survivors:,} survivors (uncapped — FULL sweep)\n")
+        if not n_survivors:
             report.write("  [jit-autotune] no survivors after prefilter.\n")
             return None
+        survivors = iter_prefilter(cartesian(space, spec.arch), pf)
     else:
         # Bayesian: skip materialization entirely. TPE samples per-dim values
         # via Optuna's suggest_categorical and validates each suggestion with
@@ -11276,7 +11279,7 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
     try:
         if spec.autotune_mode == "exhaustive":
             winning = _run_exhaustive(spec, survivors, dims, timer, cache,
-                                      space_hash, report)
+                                      space_hash, report, total=n_survivors)
         else:
             winning = _run_bayesian(spec, survivors, space, dims, timer, cache,
                                     space_hash, report,
@@ -11309,18 +11312,24 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
     return winning
 
 
-def _run_exhaustive(spec: BuildSpec, configs: List[Dict[str, Any]],
+def _run_exhaustive(spec: BuildSpec, configs: Iterable[Dict[str, Any]],
                     dims: List[Dict[str, Any]],
                     timer, cache: CompileCache, space_hash: str,
-                    report) -> Optional[Dict[str, Any]]:
-    report.write(f"\n  [exhaustive] sweeping {len(configs)} survivors\n")
-    step, close = make_progress(len(configs),
+                    report, total: Optional[int] = None
+                    ) -> Optional[Dict[str, Any]]:
+    # ``configs`` may be a lazy stream (uncapped exhaustive over a multi-million
+    # survivor space never materializes the list); ``total`` is the precomputed
+    # survivor count for the progress bar / ETA.
+    n_total = total if total is not None else len(list(configs))
+    report.write(f"\n  [exhaustive] sweeping {n_total:,} survivors "
+                 f"(uncapped — full search space)\n")
+    step, close = make_progress(n_total,
                                 f"jit-exhaustive {spec.optimizer}/{spec.arch}")
     best: Optional[Dict[str, Any]] = None
     try:
         for i, cfg in enumerate(configs, 1):
             ckey = config_key(cfg)
-            report.write(f"\n  [{i}/{len(configs)}] {ckey}\n")
+            report.write(f"\n  [{i}/{n_total}] {ckey}\n")
             report.flush()
             t0 = time.monotonic()
             result = timer(cfg)
