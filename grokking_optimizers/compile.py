@@ -10936,6 +10936,286 @@ def _record_ptxas_info_for_cfg(cfg: Dict[str, Any],
     return info
 
 
+# ===========================================================================
+# Tier-2 ENTRY-POINT DISCOVERY (mandate #4 / #11 / #22)
+# ===========================================================================
+#
+# The grokking coupling — hardcoded ``torch.ops.grokking_optimizers.fused_*``
+# with an Adam-style 10-arg call on ``param=zeros, grad=ones`` — is replaced
+# by *discovery*. Like PGO tools / Triton's autotuner / pytest-benchmark, we
+# find the tunable entry point and its signature by convention + introspection
+# instead of demanding a manifest:
+#
+#   1. Entry discovery: scan the built artifact for tunable entries —
+#      ``torch.ops`` registrations in a discovered namespace, a conventional
+#      ``__tune_entry__`` / ``__benchmark__`` hook, or pybind/exported symbols.
+#   2. Signature introspection: derive each entry's arity / dtypes / ranks
+#      from the torch schema (or python type hints).
+#   3. Input synthesis (#10, Phase 4): seeded random inputs matching the
+#      discovered signature across magnitude + adversarial regimes.
+#   4. Strict self-oracle (#9, Phase 4): a fast-math-OFF reference build of
+#      the discovered entry on the synthesized inputs is ground truth.
+#
+# If NO tunable entry is discoverable, that is a VALID state, not an error:
+# Tier-2 switches to Tier-1-only with a loud mode-switch line (no manifest
+# demanded). Genuine errors (a discovered entry that fails to load, a
+# malformed schema) crash hard per §2A.
+
+
+@dataclass
+class EntryArg:
+    """One argument of a discovered tunable entry.
+
+    kind  — "tensor" | "scalar"
+    dtype — torch dtype string for tensors ("float32", ...) / "float"|"int"
+            |"bool" for scalars; None when unknown.
+    rank  — tensor rank when derivable from the schema, else None.
+    alias — True when the schema marks the arg mutable (``Tensor(a!)``) — the
+            in-place output we snapshot for the oracle.
+    """
+    name: str
+    kind: str
+    dtype: Optional[str] = None
+    rank: Optional[int] = None
+    alias: bool = False
+
+
+@dataclass
+class DiscoveredEntry:
+    """A tunable entry point found by discovery (mandate #4/#11/#22)."""
+    name: str                       # short op/function name
+    kind: str                       # "torch_op" | "tune_hook" | "pybind"
+    dotted_path: str                # how a subprocess resolves it
+    args: List[EntryArg] = field(default_factory=list)
+    schema: Optional[str] = None    # raw torch schema string when available
+
+    @property
+    def arity(self) -> int:
+        return len(self.args)
+
+    @property
+    def tensor_args(self) -> List[EntryArg]:
+        return [a for a in self.args if a.kind == "tensor"]
+
+    @property
+    def mutated_arg_index(self) -> Optional[int]:
+        """Index of the in-place (``Tensor(a!)``) arg whose post-call value
+        the oracle snapshots. Falls back to the first tensor arg."""
+        for i, a in enumerate(self.args):
+            if a.alias:
+                return i
+        for i, a in enumerate(self.args):
+            if a.kind == "tensor":
+                return i
+        return None
+
+
+# Torch dtype tokens we recognize in a schema's tensor type. Torch schemas
+# don't usually carry dtype, so tensors default to float32 unless a config
+# quant dim narrows them (#18, Phase 6).
+_SCHEMA_SCALAR_TYPES: frozenset = frozenset({
+    "float", "int", "bool", "Scalar", "SymInt", "float?", "int?",
+})
+
+
+def _parse_torch_schema(schema: str) -> List[EntryArg]:
+    """Mandate #11 — parse a torch op schema string into ordered EntryArgs.
+
+    Example::
+
+        fused_adamw_step(Tensor(a!) param, Tensor grad, float lr) -> ()
+          → [EntryArg(param, tensor, alias=True),
+             EntryArg(grad, tensor),
+             EntryArg(lr, scalar, dtype='float')]
+
+    Pure / CPU-testable — the actual op object is not required. Raises
+    ValueError on a schema with no parseable argument list (a malformed
+    schema is an ERROR per §2A, not a silent skip)."""
+    lp = schema.find("(")
+    rp = schema.rfind(") ->")
+    if rp == -1:
+        rp = schema.rfind(")")
+    if lp == -1 or rp == -1 or rp <= lp:
+        raise ValueError(f"unparseable torch schema (no arg list): {schema!r}")
+    arglist = schema[lp + 1:rp].strip()
+    if not arglist:
+        return []
+    args: List[EntryArg] = []
+    depth = 0
+    cur = ""
+    pieces: List[str] = []
+    # Split on top-level commas (tensor types can contain nested brackets).
+    for ch in arglist:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            pieces.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        pieces.append(cur)
+    for piece in pieces:
+        piece = piece.strip()
+        if not piece or piece.startswith("*"):
+            continue
+        # Strip default value ("float lr=1e-3" → "float lr").
+        piece = piece.split("=", 1)[0].strip()
+        toks = piece.split()
+        if len(toks) < 2:
+            # type with no name (rare) — synthesize a name.
+            type_tok, name = toks[0], f"arg{len(args)}"
+        else:
+            type_tok, name = toks[0], toks[-1]
+        alias = "!" in type_tok
+        base = type_tok.split("(")[0]
+        if base.startswith("Tensor"):
+            args.append(EntryArg(name=name, kind="tensor", dtype="float32",
+                                 alias=alias))
+        elif base in _SCHEMA_SCALAR_TYPES or base.rstrip("?") in \
+                _SCHEMA_SCALAR_TYPES:
+            sc = "float" if base.startswith("float") or base == "Scalar" \
+                else ("int" if base.startswith(("int", "SymInt"))
+                      else "bool")
+            args.append(EntryArg(name=name, kind="scalar", dtype=sc))
+        else:
+            # Unknown type — record as scalar/unknown rather than dropping it,
+            # so arity stays correct.
+            args.append(EntryArg(name=name, kind="scalar", dtype=None))
+    return args
+
+
+# Subprocess body that loads the built .so and enumerates discoverable
+# tunable entries, printing one JSON record per line. Run on the GPU/torch
+# host; the parsing of its output happens in-process.
+_DISCOVERY_PROBE = r"""
+import sys, json
+import torch
+try:
+    torch.ops.load_library(r'''__SO__''')
+except Exception as exc:
+    sys.stderr.write("load_library failed: " + repr(exc) + "\n")
+    sys.exit(3)
+out = []
+# 1. torch.ops namespaces. Prefer a configured namespace; else enumerate all.
+wanted_ns = __NS__
+seen = set()
+try:
+    ns_iter = [wanted_ns] if wanted_ns else list(dir(torch.ops))
+    for ns in ns_iter:
+        if ns.startswith("_"):
+            continue
+        try:
+            nsobj = getattr(torch.ops, ns)
+        except Exception:
+            continue
+        for opname in dir(nsobj):
+            if opname.startswith("_"):
+                continue
+            try:
+                packet = getattr(nsobj, opname)
+                schemas = [str(s) for s in
+                           torch._C._jit_get_schemas_for_operator(
+                               "%s::%s" % (ns, opname))]
+            except Exception:
+                schemas = []
+            for sch in schemas:
+                key = (ns, opname, sch)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({"kind": "torch_op", "name": opname,
+                            "dotted_path": "torch.ops.%s.%s" % (ns, opname),
+                            "schema": sch})
+except Exception as exc:
+    sys.stderr.write("torch.ops enumeration error: " + repr(exc) + "\n")
+for rec in out:
+    sys.stdout.write(json.dumps(rec) + "\n")
+sys.stdout.write("__DISCOVERY_DONE__\n")
+"""
+
+
+def _discover_entry_points(so_path: Path, *,
+                           namespace: Optional[str] = None,
+                           report=None,
+                           python: Optional[str] = None
+                           ) -> List[DiscoveredEntry]:
+    """Mandate #4/#11/#22 — discover tunable entry points in a built .so.
+
+    Runs a subprocess that loads the artifact and enumerates torch.ops
+    registrations with their schemas, then introspects each schema into
+    ordered EntryArgs. Returns the discovered entries (possibly empty — an
+    empty result is a VALID state that the caller turns into a Tier-1
+    mode-switch, NOT an error).
+
+    A subprocess that fails to even load the library is an ERROR (§2A): we
+    raise with the full stderr so the caller crashes with diagnostics rather
+    than silently degrading.
+    """
+    ns_literal = repr(namespace) if namespace else "None"
+    script = (_DISCOVERY_PROBE
+              .replace("__SO__", str(so_path))
+              .replace("__NS__", ns_literal))
+    r = subprocess.run([python or sys.executable, "-c", script],
+                       capture_output=True, text=True, timeout=180)
+    if "__DISCOVERY_DONE__" not in (r.stdout or ""):
+        # The probe did not complete — distinguish load failure (rc==3,
+        # an ERROR) from a generic crash.
+        raise RuntimeError(
+            f"entry-point discovery failed (rc={r.returncode}) for "
+            f"{so_path}:\nstdout={r.stdout[-1000:]!r}\n"
+            f"stderr={r.stderr[-2000:]!r}")
+    entries: List[DiscoveredEntry] = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line or line == "__DISCOVERY_DONE__":
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        schema = rec.get("schema")
+        try:
+            args = _parse_torch_schema(schema) if schema else []
+        except ValueError as exc:
+            # A malformed schema on a discovered op is an ERROR (§2A).
+            raise RuntimeError(
+                f"malformed schema on discovered entry "
+                f"{rec.get('dotted_path')}: {exc}")
+        entries.append(DiscoveredEntry(
+            name=rec["name"], kind=rec["kind"],
+            dotted_path=rec["dotted_path"], args=args, schema=schema))
+    if report is not None:
+        report.write(f"  [discovery] {so_path.name}: "
+                     f"{len(entries)} tunable entry point(s) discovered"
+                     f"{' in ns=' + namespace if namespace else ''}.\n")
+        for e in entries:
+            report.write(f"    [entry] {e.dotted_path} "
+                         f"arity={e.arity} tensors={len(e.tensor_args)}\n")
+    return entries
+
+
+def _select_tunable_entry(entries: List[DiscoveredEntry],
+                          prefer: Optional[str] = None
+                          ) -> Optional[DiscoveredEntry]:
+    """Pick the entry to tune. Preference order: an explicit name match,
+    then the entry with the most tensor args that has an in-place output
+    (the canonical 'updates a buffer' shape), then the first entry.
+    Returns None when ``entries`` is empty (→ Tier-1 mode-switch)."""
+    if not entries:
+        return None
+    if prefer:
+        for e in entries:
+            if e.name == prefer or e.dotted_path == prefer:
+                return e
+    in_place = [e for e in entries if e.mutated_arg_index is not None
+                and any(a.alias for a in e.args)]
+    pool = in_place or entries
+    return max(pool, key=lambda e: len(e.tensor_args))
+
+
 _DEFAULT_FUSED_OP_TEMPLATE = (
     "torch.ops.grokking_optimizers.fused_{opt_lower}_simple_step")
 
@@ -12934,6 +13214,8 @@ def build(
     enable_polyhedral: bool = True,
     enable_cost_model: bool = True,
     auto_install_optional_deps: bool = False,
+    cross_host: bool = False,
+    cross_host_march: Optional[str] = None,
 ) -> Optional[Path]:
     """In-process orchestrator. ``main`` handles subprocess split.
 
@@ -13095,6 +13377,8 @@ def build(
         strict_numerics=strict_numerics,
         enable_synth_codegen=enable_synth_codegen,
         enable_polyhedral=enable_polyhedral,
+        cross_host=cross_host,
+        cross_host_march=cross_host_march,
     )
     # BLOCKER 1 fix — wire the ``enable_cost_model`` kwarg through to the
     # spec. The field is defined on BuildSpec but not exposed via its
@@ -13849,6 +14133,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                        help="Alias for --runtime aot.")
     phase.add_argument("--jit-only", action="store_true",
                        help="Alias for --runtime jit.")
+    # Mandate #23 — where work runs. all-on-target: everything on the device
+    # host (default). cpu-then-target: maximize CPU-side work (discovery,
+    # enumeration, source emission, AOT compile, cache prep) on a CPU-only
+    # host, then finish only the irreducible device work on the target. In
+    # cpu-then-target mode the host build uses the #7 portable ISA baseline
+    # (cross_host) so the AOT artifact is not pinned to the build host's CPU.
+    parser.add_argument("--stage",
+                        choices=("all-on-target", "cpu-then-target"),
+                        default="all-on-target",
+                        help="Where the build/tune/validate work runs "
+                             "(mandate #23). Default all-on-target.")
+    parser.add_argument("--cross-host-march", default=None,
+                        help="Portable ISA baseline for cpu-then-target host "
+                             "builds (default x86-64-v3).")
 
     # ── Autotune mode ────────────────────────────────────────────────
     parser.add_argument("--mode", choices=("exhaustive", "bayesian"),
@@ -14418,6 +14716,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             getattr(args, "enable_cost_model", False)),
         auto_install_optional_deps=bool(
             getattr(args, "auto_install_optional_deps", True)),
+        # Mandate #23 — cpu-then-target stage implies a cross-host AOT build
+        # (portable ISA baseline so the artifact isn't pinned to the CPU-only
+        # build host). all-on-target keeps native ISA.
+        cross_host=(getattr(args, "stage", "all-on-target")
+                    == "cpu-then-target"),
+        cross_host_march=getattr(args, "cross_host_march", None),
     )
 
     report = args.report or (
@@ -16888,6 +17192,103 @@ def _self_test_tier1_compile(run) -> None:
     run("compiler_cache_warning_when_absent", test_compiler_cache_warning_when_absent)
 
 
+def _self_test_discovery(run) -> None:
+    """`[self-test] discovery` section (mandate #4/#11/#22 entry-point
+    discovery + signature introspection + #23 stage selector)."""
+    sys.stdout.write("[self-test] discovery\n")
+
+    def test_parse_adam_style_schema():
+        """The historical Adam fused-step schema parses into the right
+        ordered EntryArgs — mutable param first, then grad/state, then
+        float scalars."""
+        sch = ("fused_adamw_step(Tensor(a!) param, Tensor grad, "
+               "Tensor exp_avg, Tensor exp_avg_sq, float lr, float beta1, "
+               "float beta2, float eps, float weight_decay, float step) -> ()")
+        args = _parse_torch_schema(sch)
+        assert len(args) == 10, len(args)
+        assert args[0].name == "param" and args[0].kind == "tensor"
+        assert args[0].alias is True, "param is in-place (Tensor(a!))"
+        assert all(a.kind == "tensor" for a in args[:4])
+        assert all(a.kind == "scalar" and a.dtype == "float"
+                   for a in args[4:])
+
+    def test_parse_mixed_signature():
+        """A (Tensor, Tensor, float) signature → 2 tensors + 1 float scalar
+        (the GOOD behavioral example from the mandate)."""
+        args = _parse_torch_schema("foo(Tensor a, Tensor b, float c) -> Tensor")
+        assert [a.kind for a in args] == ["tensor", "tensor", "scalar"]
+        assert args[2].dtype == "float"
+
+    def test_parse_strips_defaults_and_int():
+        args = _parse_torch_schema("bar(Tensor x, int n=4, bool flag=False) -> ()")
+        assert args[1].kind == "scalar" and args[1].dtype == "int"
+        assert args[2].kind == "scalar" and args[2].dtype == "bool"
+
+    def test_malformed_schema_raises():
+        """A schema with no arg list is an ERROR (§2A), not a silent skip."""
+        try:
+            _parse_torch_schema("not a schema at all")
+            raise AssertionError("expected ValueError on malformed schema")
+        except ValueError:
+            pass
+
+    def test_select_prefers_inplace_most_tensors():
+        """Entry selection prefers the in-place op with the most tensor
+        args (the canonical 'updates a buffer' shape)."""
+        e_small = DiscoveredEntry(
+            name="aux", kind="torch_op", dotted_path="torch.ops.x.aux",
+            args=[EntryArg("a", "tensor", alias=True)])
+        e_big = DiscoveredEntry(
+            name="step", kind="torch_op", dotted_path="torch.ops.x.step",
+            args=[EntryArg("p", "tensor", alias=True),
+                  EntryArg("g", "tensor"), EntryArg("m", "tensor"),
+                  EntryArg("lr", "scalar", dtype="float")])
+        chosen = _select_tunable_entry([e_small, e_big])
+        assert chosen is e_big, chosen.name
+        assert chosen.mutated_arg_index == 0
+
+    def test_select_empty_is_none():
+        """No entries → None (caller switches to Tier-1, a VALID state)."""
+        assert _select_tunable_entry([]) is None
+
+    def test_select_explicit_name_wins():
+        e1 = DiscoveredEntry("a", "torch_op", "torch.ops.x.a",
+                             args=[EntryArg("t", "tensor")])
+        e2 = DiscoveredEntry("b", "torch_op", "torch.ops.x.b",
+                             args=[EntryArg("t", "tensor"),
+                                   EntryArg("u", "tensor")])
+        assert _select_tunable_entry([e1, e2], prefer="a") is e1
+
+    def test_discovery_probe_has_torch_ops_enumeration():
+        """The discovery probe body must enumerate torch.ops and emit the
+        completion sentinel (so the in-process parser can detect success)."""
+        assert "torch.ops.load_library" in _DISCOVERY_PROBE
+        assert "_jit_get_schemas_for_operator" in _DISCOVERY_PROBE
+        assert "__DISCOVERY_DONE__" in _DISCOVERY_PROBE
+
+    def test_stage_selector_sets_cross_host():
+        """--stage cpu-then-target must imply a cross-host (portable ISA)
+        build; all-on-target keeps native."""
+        # cpu-then-target → cross_host True
+        spec_x = BuildSpec(optimizer="adamw", model="decoder", arch="sm_90a",
+                           out_dir=Path("/tmp"), cross_host=True)
+        assert _host_march_flags(spec_x) == ["-march=x86-64-v3"]
+        spec_n = BuildSpec(optimizer="adamw", model="decoder", arch="sm_90a",
+                           out_dir=Path("/tmp"), cross_host=False)
+        assert "-march=native" in _host_march_flags(spec_n)
+
+    run("discovery_parse_adam_schema", test_parse_adam_style_schema)
+    run("discovery_parse_mixed_signature", test_parse_mixed_signature)
+    run("discovery_parse_strips_defaults", test_parse_strips_defaults_and_int)
+    run("discovery_malformed_schema_raises", test_malformed_schema_raises)
+    run("discovery_select_prefers_inplace", test_select_prefers_inplace_most_tensors)
+    run("discovery_select_empty_is_none", test_select_empty_is_none)
+    run("discovery_select_explicit_name", test_select_explicit_name_wins)
+    run("discovery_probe_enumerates_torch_ops",
+        test_discovery_probe_has_torch_ops_enumeration)
+    run("discovery_stage_sets_cross_host", test_stage_selector_sets_cross_host)
+
+
 def _self_test_kernel_headers(run) -> None:
     """`[self-test] kernel_headers` section."""
     import shutil
@@ -19156,7 +19557,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 172
+_SELF_TEST_EXPECTED_COUNT: int = 181
 
 
 def _self_test() -> int:
@@ -19197,6 +19598,7 @@ def _self_test() -> int:
     _self_test_clock_lock(_run)
     _self_test_l2_flush(_run)
     _self_test_tier1_compile(_run)
+    _self_test_discovery(_run)
     _self_test_kernel_headers(_run)
     _self_test_arch_table(_run)
     _self_test_kernel_registry(_run)
