@@ -177,6 +177,10 @@ python -m grokking_optimizers.verify_all                # 152/152, all phases
 python -m grokking_optimizers.verify_all --phase 4      # just MAXIMALITY (fast)
 python -m grokking_optimizers.verify_all --quick        # skip the 99 compiles
 
+# Full-scale binary profiling: prove the emitted machine code is MAXIMAL.
+python -m grokking_optimizers.profile_maximal           # 17/17, all tiers
+python -m grokking_optimizers.profile_maximal --quick   # tier D (functional) only
+
 # The individual gates verify_all orchestrates:
 python -m grokking_optimizers.compile --self-test     # 156 passed, 0 failed
 ruff check grokking_optimizers/ && ruff format --check grokking_optimizers/
@@ -204,6 +208,21 @@ clean; **17/17** gfx942 headers + **33/33** gfx942 fused cells AMDGCN_OK;
 file ↔ solver tier ↔ cell comment ↔ dispatch route ↔ status table); fusion-tier
 map sm_90 **L3×33** / gfx942 **L3×11 + L1×22** / tpu_v6e **L3×33**; the
 math-drift guard passes and **provably triggers** on injected divergence.
+
+**Binary maximality** (`profile_maximal` **17/17**, real emitted-code numbers):
+the sm_90 GEMM TUs emit Hopper **WGMMA tensor cores (80–176/TU) + TMA async
+copies (84–164/TU)** via the CUTLASS Sm90 collectives, with the wgmma mainloop
+**not serialized** (ptxas C7509 = 0, after `-DNDEBUG` strips the CUTLASS asserts
+that an extern `__assert_fail` otherwise forced into the pipeline) and **zero
+register spills**; the fused megakernel cells run at **30–32 real registers**
+(vs the 255 budget) with **0 spills** (the solver's 168–176 estimate is
+conservative; the heavy tiles live in dynamic smem, a launch parameter);
+gfx942 attention/decoder/mamba reach the **MFMA matrix cores** (+ DPP cross-lane
+reductions); and the optimizer math **provably descends** on CPU (Adam core
+32→3.6e-8, Lion 32→2.8e-12). What remains is **silicon-only**: wall-clock
+latency/throughput, achieved occupancy + bandwidth (ncu/rocprof), the
+autotuner's measured-latency config selection, and the gfx942 L1→L3 promotion
+(real LDS via rocprof).
 
 ### Observability — device utilization across all 33 pipelines per arch
 
