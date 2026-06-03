@@ -60,7 +60,7 @@ except Exception as _compile_import_err:  # pragma: no cover - defensive
 
 # ----------------------------------------------------------------------
 # Build-mode env vars (read by build.sh wrapper):
-#   CUDA_DEBUG=1     -> add -G -O0 -lineinfo, drop --use_fast_math
+#   CUDA_DEBUG=1     -> add -G -O0 -lineinfo, drop --use_fast_math + -DNDEBUG
 #   AUTOTUNE_PASS=1  -> first-pass autotune build (informational only;
 #                       autotune writes tuned_configs.h between passes)
 #   FORCE_CUDA=1     -> permit configuring without a visible GPU
@@ -422,8 +422,8 @@ if _has_gpu and _is_hip:
         # Default: every AMD gfx the installed hipcc accepts (probe-filtered).
         offload = _supported_offload()
 
-    hip_cxx = ["-O3", "-std=c++17", "-DWITH_HIP", "-ffast-math", "-funroll-loops", "-fPIC"]
-    hip_nvcc = ["-O3", "-std=c++17", "-DWITH_HIP", "-ffast-math", "-fPIC"] + offload
+    hip_cxx = ["-O3", "-std=c++17", "-DWITH_HIP", "-DNDEBUG", "-ffast-math", "-funroll-loops", "-fPIC"]
+    hip_nvcc = ["-O3", "-std=c++17", "-DWITH_HIP", "-DNDEBUG", "-ffast-math", "-fPIC"] + offload
 
     # Optional fast-attention library gates (Phase 8 Stage 2). The gfx942
     # attention header (kernels/gfx942/attention_gfx942.hip.hpp) #ifdef-routes
@@ -438,9 +438,10 @@ if _has_gpu and _is_hip:
             hip_nvcc.append(f"-D{_macro}")
             print(f"  HIP attention: {_macro}=1 (opt-in library path)")
     if _cuda_debug:
-        # CUDA_DEBUG also affects HIP (hipcc) — drop fast-math, add -g -O0.
-        hip_cxx = [f for f in hip_cxx if f != "-ffast-math"] + ["-g", "-O0"]
-        hip_nvcc = [f for f in hip_nvcc if f != "-ffast-math"] + ["-g", "-O0"]
+        # CUDA_DEBUG also affects HIP (hipcc) — drop fast-math + NDEBUG (restore
+        # asserts), add -g -O0.
+        hip_cxx = [f for f in hip_cxx if f not in ("-ffast-math", "-DNDEBUG")] + ["-g", "-O0"]
+        hip_nvcc = [f for f in hip_nvcc if f not in ("-ffast-math", "-DNDEBUG")] + ["-g", "-O0"]
         print("  HIP build mode: DEBUG (-g -O0, fast-math disabled)")
 
     ext = CUDAExtension(
@@ -501,7 +502,7 @@ elif _has_gpu:
         # device targets); the portable cuBLAS path covers the rest.
         gencode = _supported_gencode(min_cc=90 if _with_cutlass else 0)
 
-    cuda_cxx = ["-O3", "-std=c++17", "-DWITH_CUDA", "-ffast-math", "-funroll-loops", "-fPIC"]
+    cuda_cxx = ["-O3", "-std=c++17", "-DWITH_CUDA", "-DNDEBUG", "-ffast-math", "-funroll-loops", "-fPIC"]
     # NVCC base flags. Prefer compile.py's NVCC_DEVICE_BASE (the autotuner's
     # own base list) so the install build compiles against the SAME base flags
     # the autotuner tunes against (Phase 8 Stage 2 unification). NVCC_DEVICE_BASE
@@ -575,8 +576,8 @@ elif _has_gpu:
         print("  CUDA attention: WITH_FLASH_ATTN_3=1 (opt-in FA3 path)")
 
     if _cuda_debug:
-        # Debug build: device debug info (-G), no opt, no fast-math.
-        cuda_cxx = [f for f in cuda_cxx if f != "-ffast-math"]
+        # Debug build: device debug info (-G), no opt, no fast-math, asserts on.
+        cuda_cxx = [f for f in cuda_cxx if f not in ("-ffast-math", "-DNDEBUG")]
         cuda_cxx = [f for f in cuda_cxx if f != "-O3"] + ["-O0", "-g"]
         # Preserve CUTLASS + opt-in attention macros across the debug rebuild.
         _cutlass_dbg_flags = [
@@ -590,8 +591,10 @@ elif _has_gpu:
         # debug build differs from release only in the debug knobs — not in
         # which base flags are present. gencode (sm_90a + PTX) is preserved.
         if _COMPILE_NVCC_BASE is not None:
+            # Debug build restores asserts: drop -DNDEBUG along with the
+            # release opt/fast-math flags so device + CUTLASS assert() fire.
             _dbg = [f for f in _COMPILE_NVCC_BASE
-                    if f not in ("-O3", "--use_fast_math")]
+                    if f not in ("-O3", "--use_fast_math", "-DNDEBUG")]
             # swap any ptxas opt-level token to -O0 for the debug rebuild.
             _dbg = [("--opt-level=0" if f == "--opt-level=3"
                      else ("-O0" if f == "-O3" else f)) for f in _dbg]
