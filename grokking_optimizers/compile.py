@@ -8033,7 +8033,17 @@ HOST_CFLAGS_BASE = [
 # ``_device_ldflags(spec)``, NEVER in this list — nvcc -c rejects them
 # at the per-TU compile step ("Unknown option").
 NVCC_DEVICE_BASE = [
-    "-O3", "--use_fast_math", "-std=c++17", "-DWITH_CUDA",
+    # -DNDEBUG is a MAXIMALITY flag, not just hygiene: it strips CUTLASS's
+    # device-side assert() calls, which otherwise emit an extern __assert_fail
+    # the Sm90 GEMM mainloop must call — and ptxas then SERIALIZES the
+    # wgmma.mma_async tensor-core pipeline around it (warning C7509). Profiled:
+    # decoder.cu drops from 6 C7509 serializations to 0 with -DNDEBUG, WGMMA
+    # (150) + TMA stay intact. Our own hang-safety guards are NDEBUG-immune
+    # (the megakernel occupancy check is a runtime `if (occ<1) return err`, not
+    # the assert; correctness is static_assert (compile-time) + TORCH_CHECK
+    # (always-on)). CUDA_DEBUG=1 strips -DNDEBUG (see setup.py) to restore
+    # asserts for debugging.
+    "-O3", "--use_fast_math", "-DNDEBUG", "-std=c++17", "-DWITH_CUDA",
     "--expt-relaxed-constexpr",
     # NOTE: ``--threads N`` is a CUDA 11.2+ flag (parallel TU compilation).
     # Gated emission lives in ``_newer_compiler_flags``; the base list
@@ -8086,7 +8096,10 @@ NVCC_DEVICE_BASE = [
 # wave-size / cumode toggles (which are NOT arch-agnostic) live in
 # _device_cflags(spec) and are gated by ARCH_TABLE[arch].warp_size.
 HIPCC_DEVICE_BASE = [
-    "-O3", "-std=c++17", "-DWITH_HIP",
+    # -DNDEBUG: release default (strips device assert()); the gfx942 megakernel
+    # hang-guard is a runtime `if (occ<1) return err`, NDEBUG-immune. Symmetric
+    # with NVCC_DEVICE_BASE. CUDA_DEBUG=1 strips it (setup.py).
+    "-O3", "-std=c++17", "-DWITH_HIP", "-DNDEBUG",
     "-ffast-math", "-fPIC",
     "-mllvm", "-amdgpu-early-inline-all=true",
     "-mllvm", "-amdgpu-function-calls=false",
