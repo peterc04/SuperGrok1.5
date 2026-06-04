@@ -127,6 +127,7 @@ from __future__ import annotations
 import argparse
 import collections
 import concurrent.futures
+import copy
 import datetime
 import hashlib
 import importlib
@@ -191,6 +192,10 @@ import yaml
 
 
 CACHE_VERSION = 4
+# Cap on cache host_history length. _current_host() embeds a fresh timestamp so
+# entries never dedup; without a cap the list grows by 1-2 per invocation
+# forever (see CompileCache._merge_disk_entries).
+_MAX_HOST_HISTORY = 200
 DEFAULT_CACHE_NAME = ".compile_cache.json"
 DEFAULT_PGO_WORKLOAD = Path(__file__).resolve()  # absorbed from scripts/pgo_workload.py
 JIT_CACHE_FLUSH_EVERY = 5   # save cache every N completed JIT trials
@@ -6271,6 +6276,12 @@ class CompileCache:
                 if isinstance(on_disk, dict):
                     self._merge_disk_entries(on_disk)
 
+            # Cap host_history before serialising (it never dedups — see
+            # _MAX_HOST_HISTORY) so the on-disk file can't grow unbounded.
+            hh = self._data.get("host_history")
+            if isinstance(hh, list) and len(hh) > _MAX_HOST_HISTORY:
+                self._data["host_history"] = hh[-_MAX_HOST_HISTORY:]
+
             tmp = self.path.with_suffix(self.path.suffix + ".tmp")
             # Build a serialization view that elides the trial lists —
             # they live in the sidecar now. The shallow-then-per-entry
@@ -6415,6 +6426,12 @@ class CompileCache:
                 if key not in seen:
                     mem_hh.append(h)
                     seen.add(key)
+            # Cap unbounded growth: _current_host() embeds a fresh `recorded_at`
+            # timestamp, so entries never dedup and host_history would grow by
+            # one (or two, with the AOT+JIT subprocess split) per invocation
+            # forever. Keep the most recent _MAX_HOST_HISTORY.
+            if len(mem_hh) > _MAX_HOST_HISTORY:
+                self._data["host_history"] = mem_hh[-_MAX_HOST_HISTORY:]
 
     def key(self, opt: str, model: str, arch: str) -> str:
         return f"{opt}/{model}/{arch}"
@@ -12012,8 +12029,12 @@ def _check_determinism_3x(variant_so: Path, opt_class: str, size: int,
     oracle-matched inputs as the validation pass."""
     import numpy as np
     paths: List[Path] = []
+    # Include a per-variant token (.so stem) + regime/seed in the temp filename
+    # so concurrent determinism checks across configs cannot collide on the same
+    # scratch files (serial today, but the build-pool TODO would break it).
+    vtag = _short_key(f"{Path(variant_so).stem}_{regime}_{seed}")
     for i in range(3):
-        p = out_dir / f"_det_check_{i}_{opt_class}_{size}_{dtype}.npy"
+        p = out_dir / f"_det_check_{i}_{opt_class}_{size}_{dtype}_{vtag}.npy"
         if p.exists():
             try:
                 p.unlink()
@@ -12418,8 +12439,13 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                     spec.cost_model_rejection_threshold_x or 3.0)
                 threshold = threshold_x * best if math.isfinite(best) else \
                     float("inf")
-                # High confidence = sigma small relative to mean.
-                high_confidence = sigma_pred < 0.2 * abs(ms_pred)
+                # High confidence = sigma SMALL BUT POSITIVE relative to mean.
+                # A backend with no real uncertainty estimate returns
+                # sigma_pred == 0.0 (linear fallback, <2 bootstrap models, or
+                # all-equal preds); treating 0.0 as "high confidence" would let
+                # an uncertainty-blind model prune the true optimum. Require a
+                # genuine (>0) estimate before trusting the rejection.
+                high_confidence = 0.0 < sigma_pred < 0.2 * abs(ms_pred)
                 if (math.isfinite(ms_pred) and math.isfinite(threshold)
                         and ms_pred > threshold and high_confidence):
                     n_total = int(cost_model_state.get("n_total", 0)) + 1
@@ -12656,14 +12682,26 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                                         f"{ckey[:24]} -> "
                                         f"{num_status}\n")
                             except Exception as exc:
+                                # We HAD an oracle and chose to validate, but
+                                # comparison errored — exclude (do not let an
+                                # unvalidated contender win as "skipped").
                                 report.write(
                                     f"    [numerical] {ckey[:24]} "
-                                    f"skipped: {exc}\n")
-                                num_status = "skipped"
+                                    f"validation ERROR -> numerical_fail: "
+                                    f"{exc}\n")
+                                num_status = "numerical_fail"
                         else:
+                            # Dump subprocess crashed / produced no output even
+                            # though an oracle exists and validation was
+                            # required. A variant that can't even run to a dump
+                            # is unsafe to ship — exclude it rather than letting
+                            # a fast-but-broken template config win as "skipped"
+                            # (§2A: loud, fail-closed).
                             report.write(
-                                f"    [numerical] {ckey[:24]} dump "
-                                f"failed — skipped\n")
+                                f"    [numerical] {ckey[:24]} dump FAILED "
+                                f"(oracle present, validation required) -> "
+                                f"numerical_fail\n")
+                            num_status = "numerical_fail"
                 progress_state.setdefault("_val_cache", {})[ckey] = \
                     num_status
                 if (num_status not in ("numerical_fail",)
@@ -13085,7 +13123,7 @@ def _run_exhaustive(spec: BuildSpec, configs: Iterable[Dict[str, Any]],
             }
             cache.record_trial(spec.optimizer, spec.model, spec.arch, trial)
             all_trials.append(trial)
-            if result is not None:
+            if result is not None and result.get("timing_ms") is not None:
                 ms = result["timing_ms"]
                 if num_status == "numerical_fail":
                     report.write(f"    median={ms:.4f}ms  "
@@ -20157,8 +20195,10 @@ def _self_test_toolchain_bootstrap(run) -> None:
                      "sm_120a"):
             tv = _target_cuda_version_for_arch(arch)
             need = ARCH_TABLE[arch].min_toolchain_version
-            assert tv[0] >= need[0] or (
-                tv[0] == need[0] and tv[1] >= need[1]), \
+            # Tuple compare — the old `tv[0] >= need[0] or ...` disjunction
+            # short-circuited True on any equal-major/lower-minor result,
+            # making the minor-version floor dead.
+            assert tuple(tv) >= tuple(need), \
                 f"{arch}: target {tv} below min {need}"
         # Non-CUDA arches return (0, 0).
         assert _target_cuda_version_for_arch("gfx942") == (0, 0)
@@ -27028,7 +27068,11 @@ def _deep_merge(*dicts: Dict[str, Any]) -> Dict[str, Any]:
                     and isinstance(v, dict)):
                 out[k] = _deep_merge(out[k], v)
             else:
-                out[k] = v
+                # deepcopy so a nested dict/list present in only ONE layer
+                # (e.g. _DEFAULT_PROJECT_CONFIG) is not aliased into the result
+                # — a caller mutating the returned config's nested values must
+                # not corrupt the module-global default for the rest of the run.
+                out[k] = copy.deepcopy(v)
     return out
 
 
