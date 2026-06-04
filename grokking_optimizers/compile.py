@@ -13469,8 +13469,14 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
             f"(strict_numerics={spec.strict_numerics})\n")
         return None
     out = dict(winner["config"])
+    # Compute the config_key from the CONFIG ALONE — before injecting
+    # timing_ms/stage_won — so it matches the per-variant config_key used in
+    # variant_artifacts (config_key only excludes _DEAD_KEY_DIMS, not these
+    # bookkeeping fields). Polluting the key with timing_ms would break
+    # prune()'s "always keep the tuned winner" preservation. The exhaustive
+    # driver already keys off the pure config; mirror that here.
+    out["config_key"] = config_key(winner["config"])
     out["timing_ms"] = winner["timing_ms"]
-    out["config_key"] = config_key(out)
     out["stage_won"] = winner["stage"]
     report.write(f"\n  [bayesian] WINNER ({winner['stage']}): "
                  f"{out['config_key']} @ {out['timing_ms']:.4f}ms\n")

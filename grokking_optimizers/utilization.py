@@ -115,6 +115,11 @@ class DeviceSampler:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._t0 = 0.0
+        # Crash-hard contract: a mid-run counter-read failure must NOT be
+        # silently swallowed inside the daemon thread (where Python would just
+        # print a traceback and discard it, leaving a green partial record).
+        # Capture it here and re-raise in stop().
+        self._error: Optional[BaseException] = None
 
     def available(self) -> bool:  # pragma: no cover - overridden
         raise RuntimeError(
@@ -132,15 +137,24 @@ class DeviceSampler:
 
     # -- lifecycle ----------------------------------------------------------
     def _loop(self) -> None:
-        while not self._stop.is_set():
-            compute, mem, mem_mb = self._read()
-            self._samples.append(
-                UtilSample(time.monotonic() - self._t0, compute, mem, mem_mb))
-            self._stop.wait(self.interval_s)
+        try:
+            while not self._stop.is_set():
+                compute, mem, mem_mb = self._read()
+                self._samples.append(
+                    UtilSample(time.monotonic() - self._t0,
+                               compute, mem, mem_mb))
+                self._stop.wait(self.interval_s)
+        except BaseException as exc:  # noqa: BLE001 - re-raised in stop()
+            # A device/counter read that starts failing mid-run is a hard
+            # error, not a degradation. Stash it so stop() re-raises on the
+            # caller's thread instead of letting the daemon thread silently die.
+            self._error = exc
+            self._stop.set()
 
     def start(self) -> None:
         self._samples = []
         self._stop.clear()
+        self._error = None
         self._t0 = time.monotonic()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -149,6 +163,13 @@ class DeviceSampler:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+        # Re-raise any mid-run sampling failure (crash-hard contract): never
+        # return a partial sample set as if the run were clean.
+        if self._error is not None:
+            raise RuntimeError(
+                f"DeviceSampler(backend={self.backend!r}): sampling thread "
+                f"failed mid-run after {len(self._samples)} sample(s)"
+            ) from self._error
         return list(self._samples)
 
     def setup(self) -> None:
