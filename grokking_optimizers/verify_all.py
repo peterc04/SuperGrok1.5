@@ -40,6 +40,7 @@ import argparse
 import concurrent.futures
 import dataclasses
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -144,7 +145,12 @@ _EXCLUSIVE = threading.Lock()
 
 
 def _is_oom_kill(rc: int, out: str) -> bool:
-    return rc in (-9, 137) or out.strip().endswith("Killed") or "Killed" in out
+    # SIGKILL is the authoritative signal (rc -9 / 137). The end-of-output
+    # "Killed" line is the kernel's OOM-killer message. An UNANCHORED
+    # `"Killed" in out` would misclassify a deterministic compile error whose
+    # diagnostic merely contains the word "Killed" as a transient OOM, masking
+    # a real failure as flaky — so only trust the rc and the end-of-output tag.
+    return rc in (-9, 137) or out.strip().endswith("Killed")
 
 
 def _run(cmd: List[str], timeout: int = 300) -> Tuple[int, str]:
@@ -505,10 +511,18 @@ def phase5_crossval(rep: Report, tc: Toolchain) -> None:
     wired = (REPO_ROOT / "csrc/fused/fused_wired_cells.inc").read_text()
     rep.add(Check("5", "no stale tpu_v5p in active dispatch",
                   PASS if "tpu_v5p" not in wired else FAIL))
-    route_miss = [f"{m}/{o}"
+    # Check the ACTUAL per-pair route literal for each GPU arch the wired
+    # function dispatches (sm_90 + gfx942; TPU is dispatched separately). The
+    # old check used `+{o}: in wired or '"{m}' in wired and {m}+{o} in wired`,
+    # whose `A or (B and C)` form (with A/B near-always False because every
+    # opt/model appears under *some* pair) could not detect a specific
+    # (model,opt) route being dropped — a reproduced false-green. The route
+    # literals look like "l3:transformer_decoder+adamw:sm_90".
+    _GPU_ARCH_SUFFIXES = ("sm_90", "gfx942")
+    route_miss = [f"{m}+{o}:{suf}"
                   for m in MODELS for o in OPTIMIZERS
-                  if f'+{o}:' not in wired or f'"{m}' not in wired and
-                  f'{m}+{o}' not in wired]
+                  for suf in _GPU_ARCH_SUFFIXES
+                  if f"{m}+{o}:{suf}" not in wired]
     rep.add(Check("5", "wired table routes all model+opt pairs",
                   PASS if not route_miss else FAIL,
                   "" if not route_miss else f"{route_miss[:5]}"))
@@ -516,7 +530,9 @@ def phase5_crossval(rep: Report, tc: Toolchain) -> None:
     # 5c. Self-test suite (authoritative count guard inside compile.py).
     rc, out = _run([sys.executable, "-m", "grokking_optimizers.compile",
                     "--self-test"], timeout=600)
-    ok = rc == 0 and "0 failed" in out
+    # Match the real summary line: `"0 failed"` as a substring also matches
+    # "10 failed"/"20 failed"/etc., so anchor on the full "N passed, 0 failed".
+    ok = rc == 0 and bool(re.search(r"\b[1-9][0-9]* passed, 0 failed\b", out))
     summary = next((ln for ln in out.splitlines()
                     if "passed," in ln and "failed" in ln), "")
     rep.add(Check("5", "compile.py --self-test",

@@ -198,8 +198,8 @@ jobs:
       - name: Verify self-test summary
         if: success()
         run: |
-          tail -n 5 self_test.log | grep -E '\[self-test\] [0-9]+ passed, 0 failed' \
-            || (echo "::error::self-test ran without crashing but reported failures"; \
+          tail -n 5 self_test.log | grep -E '\[self-test\] [1-9][0-9]* passed, 0 failed' \
+            || (echo "::error::self-test ran without crashing but reported failures (or zero tests)"; \
                 tail -n 50 self_test.log; exit 1)
       - name: Surface failure context
         if: failure()
@@ -332,13 +332,16 @@ jobs:
           pip install numpy pyyaml optuna ninja
       - name: --help
         run: python3 -m grokking_optimizers.compile --help > /dev/null
-      - name: --list-archs (must list 26 canonical + 4 alias = 30 keys)
+      - name: --list-archs (must list exactly the 26 canonical archs)
         run: |
           out=$(python3 -m grokking_optimizers.compile --list-archs)
           echo "$out"
           count=$(echo "$out" | grep -c '^sm_\|^gfx\|^tpu_')
-          if [ "$count" -lt 26 ]; then
-            echo "::error::--list-archs printed $count rows, expected >= 26"
+          # --list-archs prints the 26 CANONICAL archs (aliases are not listed
+          # as separate rows). Assert exactly 26 so drift in either direction
+          # (a lost canonical arch OR an unexpected addition) is caught.
+          if [ "$count" -ne 26 ]; then
+            echo "::error::--list-archs printed $count canonical rows, expected exactly 26"
             exit 1
           fi
       - name: --flag-audit (writes audit report, no compiler invocation)
@@ -931,11 +934,15 @@ jobs:
           pip install numpy pyyaml optuna ninja scikit-learn jinja2
       - name: Run self-test twice
         run: |
+          set -o pipefail
           for run in 1 2; do
             echo "::group::self-test run $run"
             python3 -u -m grokking_optimizers.compile --self-test \
               | tee "st_$run.log"
-            tail -n 3 "st_$run.log" | grep -E '[0-9]+ passed, 0 failed' \
+            rc=${PIPESTATUS[0]}
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::self-test run $run exited $rc"; exit "$rc"; fi
+            tail -n 3 "st_$run.log" | grep -E '\[self-test\] [1-9][0-9]* passed, 0 failed' \
               || (echo "::error::self-test run $run did not report all-passed"; exit 1)
             echo "::endgroup::"
           done
@@ -1050,8 +1057,12 @@ jobs:
               else:
                   continue
               # Fresh process so the lru_cache picks up this FORCE_ARCH.
-              code = ("from grokking_optimizers.dispatch import detect_arch;"
-                      "print(detect_arch())")
+              # detect_arch() is arch-HONEST (sm_70 -> sm_70); normalize_arch()
+              # is the impl-family collapse (sm_* -> 90, gfx* -> 942, tpu ->
+              # tpu_v6e) this job actually means to verify.
+              code = ("from grokking_optimizers.dispatch import "
+                      "detect_arch, normalize_arch;"
+                      "print(normalize_arch(detect_arch()))")
               env = dict(os.environ, FORCE_ARCH=arch)
               out = subprocess.run([sys.executable, "-c", code],
                                    capture_output=True, text=True, env=env)
@@ -1113,6 +1124,10 @@ jobs:
                    csrc/fused/sm_90/mega_*.cu 2>/dev/null)
           n=$(echo "$tus" | wc -w)
           echo "compiling $n sm_90 translation units to objects (no GPU)"
+          if [ -z "${tus// }" ] || [ "$n" -lt 44 ]; then
+            echo "::error::expected >=44 sm_90 TUs (11 launch + 33 fused), got $n — glob broken"
+            exit 1
+          fi
           for tu in $tus; do
             if bash scripts/compile_to_object.sh "$tu" -DWITH_CUTLASS; then :; else
               echo "::error::nvcc -c failed: $tu"; fails=$((fails+1)); fi
@@ -1141,20 +1156,25 @@ jobs:
       - name: amdgcn_check over the 15 gfx942 device headers (11 optimizer + 4 model/attention)
         run: |
           set -uo pipefail
-          fails=0
+          shopt -s nullglob
+          fails=0; n=0
           for h in grokking_optimizers/kernels/gfx942/*_gfx942.hip.hpp; do
             case "$h" in
               *common_gfx942.hip.hpp) continue ;;   # included indirectly
             esac
+            n=$((n+1))
             if bash scripts/amdgcn_check.sh --header "$h"; then :; else
               echo "::error::AMDGCN compile failed: $h"; fails=$((fails+1)); fi
           done
+          if [ "$n" -lt 15 ]; then
+            echo "::error::expected >=15 gfx942 device headers, found $n — glob broken"; exit 1; fi
           if [ "$fails" -ne 0 ]; then
             echo "::error::$fails gfx942 header(s) failed the AMDGCN gate"; exit 1; fi
-          echo "all gfx942 per-op device headers passed the AMDGCN gate"
+          echo "all $n gfx942 per-op device headers passed the AMDGCN gate"
       - name: amdgcn_check --cell over the 33 gfx942 fused composition cells
         run: |
           set -uo pipefail
+          shopt -s nullglob
           fails=0; n=0
           # The fused mega_*.hip cells force the composed
           # fused_megakernel<Model, Opt, Tier> instantiation under the bare
@@ -1167,6 +1187,8 @@ jobs:
             if bash scripts/amdgcn_check.sh --cell "$c"; then :; else
               echo "::error::AMDGCN compose gate failed: $c"; fails=$((fails+1)); fi
           done
+          if [ "$n" -lt 33 ]; then
+            echo "::error::expected 33 gfx942 fused cells, found $n — glob broken"; exit 1; fi
           if [ "$fails" -ne 0 ]; then
             echo "::error::$fails gfx942 fused cell(s) failed the AMDGCN gate"; exit 1; fi
           echo "all $n gfx942 fused composition cells passed the AMDGCN gate"
