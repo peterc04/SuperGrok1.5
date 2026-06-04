@@ -8,7 +8,9 @@
 // Per-element pieces (the heavy lifting — matrix multiplications for NS —
 // lives in primitives.cuh / mma.cuh per backend):
 //
-//   momentum_normalize:  buf = momentum * buf + (1 - momentum) * grad;
+//   momentum_normalize:  buf = momentum * buf + grad;   (plain SGD-momentum —
+//                        no (1 - momentum) factor; matches the implementation
+//                        below and bindings.cpp::muon_fused_step)
 //                        X    = buf / ||buf||_F     (Frobenius-normalized)
 //   ns_combine:          Y = a*X + b*A_X + c*AA_X    (polynomial combine)
 //   muon_update:         param = param * decay + neg_lr_scale * orth

@@ -187,7 +187,12 @@ def attention_backward(grad_out, q, k, v, out, softmax_lse, *, causal: bool, til
         o, _ = attention_forward(q_, k_, v_, causal=causal, tile_size=tile_size)
         return o
 
-    grad_q, grad_k, grad_v = jax.grad(_fwd, argnums=(0, 1, 2))(q, k, v)
+    # Use a vector-Jacobian product seeded with grad_out: jax.grad requires a
+    # SCALAR output and would raise on the [B,h,S,d] attention output, and it
+    # would also ignore the incoming cotangent. jax.vjp back-propagates the real
+    # upstream gradient grad_out through the forward.
+    _, vjp_fn = jax.vjp(_fwd, q, k, v)
+    grad_q, grad_k, grad_v = vjp_fn(grad_out)
     return grad_q, grad_k, grad_v
 
 

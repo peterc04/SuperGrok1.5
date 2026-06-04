@@ -38,7 +38,10 @@ def _newton_schulz_ortho(X: jnp.ndarray, ns_steps: int) -> jnp.ndarray:
     """Newton-Schulz orthogonalization (lax.fori_loop / scan-friendly form).
 
     Muon paper coefficients: a=3.4445, b=-4.7750, c=2.0315.
-    Iterates: X <- a*X + b*(X @ X.T) @ X + c*X @ (X.T @ X)
+    Iterates: X <- a*X + b*X(XᵀX) + c*X(XᵀX)²  (the quintic NS polynomial,
+    identical to ``newton_schulz_iterate`` below). The previous third term
+    ``c*X(XᵀX)`` was only cubic — a real divergence from the canonical Muon
+    orthogonalization.
     Converges to the nearest orthogonal matrix.
 
     NOTE: this is the scan-form twin of ``newton_schulz_iterate`` below (the
@@ -59,8 +62,9 @@ def _newton_schulz_ortho(X: jnp.ndarray, ns_steps: int) -> jnp.ndarray:
     )
 
     def ns_body(_, X):
-        A = _mm(X, X.T)
-        return X * a + _mm(A, X) * b + _mm(X, _mm(X.T, X)) * c
+        AX = _mm(X.T, X)          # XᵀX
+        AAX = _mm(AX, AX)         # (XᵀX)²
+        return X * a + _mm(X, AX) * b + _mm(X, AAX) * c
 
     return lax.fori_loop(0, ns_steps, ns_body, X)
 
@@ -122,7 +126,11 @@ def launch_muon_step(
     ns_c: float = 2.0315,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Per-tensor Muon step (fused-TU contract)."""
-    new_buf = momentum * buf + (1.0 - momentum) * grad
+    # Canonical Muon momentum is plain SGD-momentum `buf = momentum*buf + grad`
+    # (csrc/algorithms/muon.h, bindings.cpp muon_fused_step). The spurious
+    # (1-momentum) factor shrank the gradient ~10x and diverged from the
+    # source of truth.
+    new_buf = momentum * buf + grad
     if param.ndim >= 2:
         frob = jnp.linalg.norm(new_buf) + 1e-8
         X = new_buf / frob
