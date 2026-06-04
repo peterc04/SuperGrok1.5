@@ -12314,12 +12314,14 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
             eff_device = list(NVCC_DEVICE_BASE)
         fm_contam = [f for f in eff_device if f in _FAST_MATH_FLAGS]
         if fm_contam:
-            stripped = _strict_math_flags(eff_device)
+            # _strict_math_flags would drop exactly these fast-math tokens
+            # (and append the strict marker); report the real count dropped.
+            _ = _strict_math_flags(eff_device)
             report.write(
                 f"  [numerical] WARNING: oracle build carries fast-math "
                 f"flags {fm_contam} via project config — the strict reference "
-                f"may be CONTAMINATED. Strict build would drop them "
-                f"({len(eff_device) - len(stripped) + 1} change(s)). "
+                f"may be CONTAMINATED. Strict build would drop "
+                f"{len(fm_contam)} fast-math flag(s). "
                 f"A fast-math variant validated against a fast-math oracle is "
                 f"not a real check.\n")
         strict_posture = not fm_contam
