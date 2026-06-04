@@ -11819,7 +11819,18 @@ def _render_arg_construction(entry: Optional["DiscoveredEntry"],
     Adam-style ``(param, grad, m, v, lr, b1, b2, eps, wd, step)`` arg list —
     but with SYNTHESIZED inputs (#10) instead of the degenerate zeros/ones.
     """
+    # #10 — record the reproducible input spec (n_tensors/n_scalars/regime/
+    # seed). Validates the regime (raises on a bad one) and documents the
+    # synthesis as a provenance header so a captured oracle is reproducible.
+    if entry is not None and entry.args:
+        n_tensors = len(entry.tensor_args)
+        n_scalars = entry.arity - n_tensors
+    else:
+        n_tensors, n_scalars = 2, 8  # param,grad + 8 Adam scalars
+    in_spec = _synthesize_input_spec(n_tensors, n_scalars,
+                                     regime=regime, seed=seed)
     lines: List[str] = [
+        f"# input-spec: {in_spec}",
         f"g = torch.Generator().manual_seed({seed})",
     ]
     if entry is not None and entry.args:
@@ -12289,18 +12300,36 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         if ref_state["tried"]:
             return None
         ref_state["tried"] = True
-        # Mandate #9 — the oracle must be a fast-math-OFF strict build of the
-        # discovered entry. The AOT .so is the reference source; once #6
-        # (Phase 7) removes fast-math from the base flags, this AOT build is
-        # strict-math by default (fast-math becomes a separately-validated
-        # variant), so the oracle is uncontaminated. The capture itself runs
-        # on synthesized inputs (#10) under the determinism preamble (#12)
-        # using the discovered signature when available (#11).
-        strict_posture = "--use_fast_math" not in NVCC_DEVICE_BASE \
-            and "-ffast-math" not in HOST_CFLAGS_BASE
+        # Mandate #9 — the oracle must be a fast-math-OFF strict build. The
+        # AOT .so is the reference source; post-#6 the base is strict-math, so
+        # the oracle is uncontaminated. Fix-#2 re-audit — actively GUARD that:
+        # check the EFFECTIVE device flags (base ⊕ project [device_cflags].
+        # extra) for any fast-math token and WARN loudly if present, since a
+        # project that re-adds fast-math to its config would contaminate the
+        # oracle. _strict_math_flags computes what the strict build would be.
+        try:
+            eff_device = _device_cflags(spec)
+        except Exception as exc:
+            _debug_swallow("_resolve_ref.eff_device", exc)
+            eff_device = list(NVCC_DEVICE_BASE)
+        fm_contam = [f for f in eff_device if f in _FAST_MATH_FLAGS]
+        if fm_contam:
+            stripped = _strict_math_flags(eff_device)
+            report.write(
+                f"  [numerical] WARNING: oracle build carries fast-math "
+                f"flags {fm_contam} via project config — the strict reference "
+                f"may be CONTAMINATED. Strict build would drop them "
+                f"({len(eff_device) - len(stripped) + 1} change(s)). "
+                f"A fast-math variant validated against a fast-math oracle is "
+                f"not a real check.\n")
+        strict_posture = not fm_contam
         report.write(
             f"  [numerical] capturing strict oracle "
             f"(base_strict_math={strict_posture}) on synthesized inputs.\n")
+        # Tier-2 (#4/#11/#22) — resolve the entry. Prefer the configured
+        # fused_op_template (grokking path, byte-identical); fall back to
+        # entry-point DISCOVERY on the AOT .so when the template op can't be
+        # found, so a generic zero-manifest project still gets an oracle.
         try:
             p = _capture_reference_output(
                 Path(aot_so), OPT_CLASS[spec.optimizer],
@@ -12309,8 +12338,31 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
             ref_state["path"] = p
             return p
         except Exception as exc:
-            report.write(f"  [numerical] reference capture skipped: {exc}\n")
-            return None
+            report.write(f"  [numerical] template-based reference capture "
+                         f"failed ({exc}); trying entry-point discovery "
+                         f"(Tier-2).\n")
+            try:
+                entries = _discover_entry_points(Path(aot_so), report=report)
+                chosen = _select_tunable_entry(entries)
+                if chosen is None:
+                    report.write("  [numerical] discovery found no tunable "
+                                 "entry — oracle unavailable, validation "
+                                 "disabled for this sweep.\n")
+                    return None
+                report.write(f"  [numerical] discovered entry "
+                             f"{chosen.dotted_path} (arity={chosen.arity}); "
+                             f"capturing oracle from it.\n")
+                p = _capture_reference_output(
+                    Path(aot_so), OPT_CLASS[spec.optimizer],
+                    ref_state["size"], ref_state["dtype"], spec.out_dir,
+                    entry=chosen)
+                ref_state["path"] = p
+                return p
+            except Exception as exc2:
+                report.write(f"  [numerical] discovery-based reference "
+                             f"capture also failed: {exc2}. Validation "
+                             f"disabled for this sweep.\n")
+                return None
 
     def timer(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         ckey = config_key(config)
@@ -13993,7 +14045,7 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
     except Exception as _swexc:
         _debug_swallow('build_jit', _swexc)
         for k, v in tuned.items():
-            if k in ("timing_ms", "config_key", "stage_won"):
+            if k in ("timing_ms", "config_key", "stage_won", "_fastmath"):
                 continue
             macro = {"block": "SG_TUNED_BLOCK_SIZE",
                      "vec": "SG_TUNED_VEC_WIDTH",
@@ -14002,6 +14054,24 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
                 flag = f"-D{macro}={v}"
                 extra_host.append(flag)
                 extra_device.append(flag)
+
+    # Fix-#2 re-audit (Bug 1) — a FAST-MATH winner carries "_fastmath" in its
+    # tuned config, but that key is NOT a search-space dim, so _variant_macros
+    # drops the fast-math compiler flags. Without this, the final rebuild
+    # would ship a STRICT .so that cannot reproduce the winning fast-math
+    # timing. Re-apply the variant's additive flags here so the shipped
+    # artifact IS the fast-math build the sweep validated and picked, and so
+    # the recorded device_flags_hash reflects it.
+    fm_name = tuned.get("_fastmath")
+    if fm_name:
+        _vendor = get_arch_entry(spec.arch).vendor
+        fm_host, fm_device = _fast_math_variant_flags(str(fm_name), _vendor)
+        extra_host = list(extra_host) + fm_host
+        extra_device = list(extra_device) + fm_device
+        report.write(
+            f"  [jit] WINNER is fast-math variant {fm_name!r}: re-applying "
+            f"{fm_host + fm_device} to the final build so the shipped .so "
+            f"matches the validated winning timing.\n")
 
     so_path = _torch_load(spec, sources,
                           host_cflags + extra_host,
@@ -18102,6 +18172,26 @@ def _self_test_fastmath_integration(run) -> None:
         assert "_time_validate_fastmath_variants" in tsrc
         assert "fastmath_sink.append" in tsrc
 
+    def test_fastmath_winner_reapplies_flags_in_final_build():
+        """Fix-#2 re-audit Bug 1 — the final rebuild (build_jit) must re-apply
+        the fast-math flags when the winner carries "_fastmath", so the
+        shipped .so is the fast-math build (not a strict build that can't
+        reproduce the winning timing). Proven via source inspection of the
+        re-apply branch + a behavioral check of the flag composition."""
+        import inspect
+        bjsrc = inspect.getsource(build_jit)
+        assert 'tuned.get("_fastmath")' in bjsrc, \
+            "build_jit must detect a fast-math winner"
+        assert "_fast_math_variant_flags(str(fm_name)" in bjsrc, \
+            "build_jit must re-apply the fast-math variant flags"
+        # Behavioral: the flags that would be appended are the real ones.
+        fm_host, fm_device = _fast_math_variant_flags("full_fast_math", "cuda")
+        assert "--use_fast_math" in fm_device
+        # And _variant_macros would NOT carry them (not a dim), proving the
+        # re-apply is necessary.
+        assert "_fastmath" not in "".join(
+            ["SG_TUNED_BLOCK_SIZE", "SG_TUNED_VEC_WIDTH", "SG_TUNED_UNROLL"])
+
     def test_origin_constants_single_source_of_truth():
         """Defect-1.6 — no stray origin string literal outside the constant
         defs; the gate set is built from the constants."""
@@ -18118,10 +18208,63 @@ def _self_test_fastmath_integration(run) -> None:
     run("fastmath_skipped_never_wins_validated_can",
         test_fastmath_skipped_never_wins_validated_can)
     run("fastmath_pallas_is_na_loud", test_fastmath_pallas_is_na_loud)
+    def test_mandate_features_have_nontest_callsites():
+        """Fix-#2 re-audit (dead-code-vs-tests) — INSTITUTIONAL guard for the
+        bug class that hid the fast-math miss: every mandate feature function
+        must have >=1 NON-TEST call site. A function reachable only from
+        _self_test_*/test_* is 'implemented + unit-tested but never wired' —
+        dead code masquerading as done. This AST check would have caught
+        fast-math, discovery, _strict_math_flags, and _synthesize_input_spec."""
+        import ast as _ast
+        src = Path(__file__).read_text()
+        tree = _ast.parse(src)
+        def_lines = sorted([(n.lineno, n.name) for n in _ast.walk(tree)
+                            if isinstance(n, (_ast.FunctionDef,
+                                              _ast.AsyncFunctionDef))])
+
+        def enc_top(ln):
+            cands = [(dl, dn) for dl, dn in def_lines if dl <= ln]
+            return cands[-1][1] if cands else "<module>"
+        callers: Dict[str, set] = {}
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Call):
+                f = node.func
+                nm = (f.id if isinstance(f, _ast.Name)
+                      else f.attr if isinstance(f, _ast.Attribute) else None)
+                if nm:
+                    callers.setdefault(nm, set()).add(enc_top(node.lineno))
+        FEATURES = [
+            "_time_validate_fastmath_variants", "_fast_math_variant_flags",
+            "_GpuClockLock", "_make_l2_flush_buffer", "_arch_l2_bytes",
+            "_discover_entry_points", "_select_tunable_entry",
+            "_auto_discover_sources", "_host_march_flags",
+            "_synth_dtype_from_config", "_synth_pattern_for_optimizer",
+            "get_fresh_variant", "_render_repro_state", "_debug_swallow",
+            "_strict_math_flags", "_render_arg_construction",
+            "_synthesize_input_spec", "_try_synth_codegen",
+            "_polyhedral_expand_variant", "initialize_registry",
+            "_capture_reference_output",
+        ]
+        dead = []
+        for fn in FEATURES:
+            cs = callers.get(fn, set())
+            nontest = {c for c in cs
+                       if not (c.startswith("_self_test")
+                               or c.startswith("test_"))}
+            nontest.discard(fn)
+            if not nontest:
+                dead.append(fn)
+        assert not dead, (
+            f"mandate feature(s) wired ONLY from tests (dead code): {dead}")
+
     run("fastmath_wired_into_sweep_drivers",
         test_fastmath_wired_into_sweep_drivers)
+    run("fastmath_winner_reapplies_flags_in_final_build",
+        test_fastmath_winner_reapplies_flags_in_final_build)
     run("origin_constants_single_source_of_truth",
         test_origin_constants_single_source_of_truth)
+    run("mandate_features_have_nontest_callsites",
+        test_mandate_features_have_nontest_callsites)
 
 
 def _self_test_silent_degradation(run) -> None:
@@ -21114,7 +21257,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 218
+_SELF_TEST_EXPECTED_COUNT: int = 220
 
 
 def _self_test() -> int:
