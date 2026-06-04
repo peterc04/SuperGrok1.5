@@ -128,7 +128,7 @@ void launch_supergrok11_step(
         // Sweep A: meta-net forward
         auto x = torch::stack({g.to(torch::kFloat32).view({-1}),
                                sharpnesses[i].view({-1})}, /*dim=*/1);
-        auto h = torch::tanh(torch::matmul(x, phi_W1.t()) + phi_b1);
+        auto h = torch::gelu(torch::matmul(x, phi_W1.t()) + phi_b1);  // exact GELU (canonical PyTorch meta-net)
         auto mu_flat = (torch::matmul(h, phi_W2.unsqueeze(1)) + phi_b2).view_as(g);
         mu.copy_(mu_flat);
 
@@ -204,11 +204,11 @@ void launch_supergrok11_step(
 void launch_sg11_mu_metanet(
     torch::Tensor mu, torch::Tensor grad, torch::Tensor sharpness, torch::Tensor smart_grad, float alpha, torch::Tensor W1, torch::Tensor b1, torch::Tensor W2, torch::Tensor b2, float rescale, int hidden_dim
 ) {
-    // phi network forward: 2-input MLP with tanh activation
+    // phi network forward: 2-input MLP with GELU activation (canonical)
     auto gf = grad.to(torch::kFloat32).view({-1});
     auto sf = sharpness.view({-1});
     auto x = torch::stack({gf, sf}, /*dim=*/1);  // [N, 2]
-    auto h = torch::tanh(torch::matmul(x, W1.t()) + b1);
+    auto h = torch::gelu(torch::matmul(x, W1.t()) + b1);  // exact GELU (canonical PyTorch meta-net)
     float b2_val = b2.item<float>();
     auto mu_flat = (torch::matmul(h, W2.unsqueeze(1)) + b2_val).view_as(grad) * rescale;
     mu.copy_(mu_flat);

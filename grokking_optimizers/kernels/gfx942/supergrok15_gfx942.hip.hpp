@@ -123,7 +123,7 @@ void launch_supergrok15_step(
         // Sweep A: meta-net forward
         auto x = torch::stack({g.to(torch::kFloat32).view({-1}),
                                sharpnesses[i].view({-1})}, /*dim=*/1);
-        auto h = torch::tanh(torch::matmul(x, phi_W1.t()) + phi_b1);
+        auto h = torch::gelu(torch::matmul(x, phi_W1.t()) + phi_b1);  // exact GELU (canonical PyTorch meta-net)
         auto mu_flat = (torch::matmul(h, phi_W2.unsqueeze(1)) + phi_b2).view_as(g);
         mu.copy_(mu_flat);
 

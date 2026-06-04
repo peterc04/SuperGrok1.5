@@ -31,7 +31,9 @@
 
 namespace sg { namespace algorithms {
 
-// MLP forward: tanh hidden, linear output. Phi weights: W1[H,2], b1[H], W2[H], b2.
+// MLP forward: GELU hidden, linear output (matches the canonical trainable
+// PyTorch SharpnessMetaNet, which uses nn.GELU). Phi weights: W1[H,2], b1[H],
+// W2[H], b2.
 template <int H>
 __device__ __forceinline__ float sg11_phi_forward(
     const float grad_val,
@@ -45,7 +47,8 @@ __device__ __forceinline__ float sg11_phi_forward(
     #pragma unroll
     for (int j = 0; j < H; j++) {
         float h = W1[j * 2] * grad_val + W1[j * 2 + 1] * sharp_val + b1[j];
-        h = tanhf(h);
+        // Exact erf GELU — matches torch.nn.GELU() in the trainable meta-net.
+        h = 0.5f * h * (1.0f + erff(h * 0.70710678118654752f));
         h_acc += W2[j] * h;
     }
     return h_acc + b2;

@@ -119,7 +119,7 @@ def phi_forward(
     W2: jnp.ndarray, b2: float,
 ) -> jnp.ndarray:
     x = jnp.stack([grad.reshape(-1), sharpness.reshape(-1)], axis=1)
-    h = jnp.tanh(x @ W1.T + b1)
+    h = jax.nn.gelu(x @ W1.T + b1, approximate=False)  # exact GELU (canonical PyTorch meta-net)
     mu = (h @ W2[:, None] + b2).reshape(grad.shape)
     return mu
 
