@@ -5328,7 +5328,7 @@ def _make_trial_record(stage: str, trial_num: int, cfg: Dict[str, Any],
     # Mandate #16/#20/#21 — variant origin (template / synth / polyhedral /
     # cutlass / ck / fastmath). pick_winner gates generated/transformed
     # origins behind a strict-oracle PASS. Defaults to "template".
-    origin = _LAST_VARIANT_ORIGIN.get(ckey, "template")
+    origin = _LAST_VARIANT_ORIGIN.get(ckey, ORIGIN_TEMPLATE)
     return {
         "trial_num":   trial_num,
         "stage":       stage,
@@ -5660,6 +5660,21 @@ def topk_refine(
     return records
 
 
+# Mandate #16 / Fix-#2 Defect-1.6 — SINGLE SOURCE OF TRUTH for variant-origin
+# strings. Every `_LAST_VARIANT_ORIGIN[...] = ...` write, the validation-gate
+# set, and the self-test fixtures reference THESE constants — never a string
+# literal. This kills the spelling footgun: a stray "fast_math"/"fast-math"
+# would land outside _VALIDATION_REQUIRED_ORIGINS and silently bypass the
+# oracle gate (origin-not-in-required-set ⇒ treated as an unguarded template ⇒
+# always eligible). Centralizing the strings makes that impossible.
+ORIGIN_TEMPLATE = "template"     # straight recompile of the committed source
+ORIGIN_SYNTH = "synth"           # OpGraph-synthesised kernel
+ORIGIN_POLYHEDRAL = "polyhedral"  # polyhedral-rescheduled source
+ORIGIN_CUTLASS = "cutlass"       # CUTLASS GEMM emitter
+ORIGIN_CK = "ck"                 # Composable-Kernel GEMM emitter
+ORIGIN_FASTMATH = "fastmath"     # additive fast-math flag variant (#6)
+
+
 # Mandate #16 — variant origins that are GENERATED or TRANSFORMED rather
 # than a straight re-compile of the committed source. These rewrite the
 # kernel (synth codegen, polyhedral reschedule, CUTLASS/CK emitters) or
@@ -5668,7 +5683,7 @@ def topk_refine(
 # ineligible in pick_winner until its numerical_status is a PASS
 # ("ok"/"deterministic"); "skipped" (never validated) is not enough.
 _VALIDATION_REQUIRED_ORIGINS: frozenset = frozenset({
-    "synth", "polyhedral", "cutlass", "ck", "fastmath",
+    ORIGIN_SYNTH, ORIGIN_POLYHEDRAL, ORIGIN_CUTLASS, ORIGIN_CK, ORIGIN_FASTMATH,
 })
 _VALIDATION_PASS_STATES: frozenset = frozenset({"ok", "deterministic"})
 
@@ -5704,7 +5719,7 @@ def pick_winner(all_trials: List[Dict[str, Any]], *,
     # Mandate #16 — drop generated/transformed variants that never passed
     # the strict on-device oracle.
     def _generated_and_unvalidated(t: Dict[str, Any]) -> bool:
-        origin = t.get("origin", "template")
+        origin = t.get("origin", ORIGIN_TEMPLATE)
         if origin not in _VALIDATION_REQUIRED_ORIGINS:
             return False
         return t.get("numerical_status", "skipped") not in \
@@ -6810,6 +6825,15 @@ class BuildSpec:
     # host's ISA. Set by the --stage cpu-then-target path (#23).
     cross_host: bool = False
     cross_host_march: Optional[str] = None
+    # Fix-#2 Defect-1 — explore fast-math (#6) as an additive, oracle-validated
+    # variant during the sweep. When True (default), each time a config sets a
+    # new best the sweep ALSO builds/times/validates the _FAST_MATH_VARIANTS on
+    # that config and emits them as separate origin="fastmath" trials; a
+    # fast-math variant only wins if it matched the strict oracle (#16). Tying
+    # exploration to new-best events bounds the extra compile cost while
+    # guaranteeing the eventual winner's fast-math is explored. Set False to
+    # skip fast-math exploration entirely (pure strict-math sweep).
+    enable_fastmath_variants: bool = True
     macro_prefix: str = "SG_BUILD_"
     fused_op_template: str = (
         "torch.ops.grokking_optimizers.fused_{opt_lower}_simple_step")
@@ -11889,6 +11913,123 @@ def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
     return macros + (extra if "--maxrregcount" not in " ".join(extra_hip) else extra_hip)
 
 
+def _time_validate_fastmath_variants(
+        spec: BuildSpec, config: Dict[str, Any],
+        variant_sources: List[Path],
+        full_host: List[str], full_device: List[str], ldflags: List[str],
+        cache: CompileCache, worker, report, arch_entry,
+        ref_path: Optional[Path], ref_state: Dict[str, Any],
+        variant_dump_dir: Path, strict: bool, numerics_enabled: bool,
+        trial_num: int) -> List[Dict[str, Any]]:
+    """Fix-#2 Defect-1 — build, time, and strictly-validate the fast-math
+    flag variants (#6) of ``config``, returning one trial record per
+    generated variant.
+
+    Each variant adds ``_fast_math_variant_flags(name, vendor)`` ON TOP of the
+    strict build's host/device flags (the base lists are NOT modified). The
+    added flags feed the build signature / cache hash so a fast-math build is
+    tracked separately from the strict build. The variant is timed and its
+    output compared against the SAME strict oracle ``ref_path``; the result is
+    stamped ``origin=ORIGIN_FASTMATH`` + its numerical_status so pick_winner
+    (#16) keeps it ONLY if it matched the strict reference (a diverging
+    fast-math variant is dropped). Loud-not-silent: logs N/A for Pallas and a
+    WARNING when zero variants are generated on a CUDA/HIP sweep (§2A)."""
+    records: List[Dict[str, Any]] = []
+    vendor = arch_entry.vendor
+    if vendor not in ("cuda", "hip"):
+        report.write(f"    [fastmath] N/A for vendor={vendor} "
+                     f"(no nvcc/hipcc fast-math flags); not explored.\n")
+        return records
+    generated = 0
+    for name in _FAST_MATH_VARIANTS:
+        host_fm, dev_fm = _fast_math_variant_flags(name, vendor)
+        if not host_fm and not dev_fm:
+            continue
+        fm_cfg = {**config, "_fastmath": name}
+        fm_ckey = config_key(fm_cfg)
+        fm_host = list(full_host) + host_fm
+        fm_device = list(full_device) + dev_fm
+        # Added flags feed the build signature → device/host cflags hash, so a
+        # fast-math build is never confused with the strict build in the cache.
+        fm_sig = _hash_flags(
+            [str(s) for s in variant_sources]
+            + [_hash_sources(list(variant_sources))]
+            + fm_host + fm_device + list(ldflags))
+        fm_so = cache.get_fresh_variant(
+            spec.optimizer, spec.model, spec.arch, fm_ckey, fm_sig)
+        if fm_so is not None:
+            report.write(f"    [fastmath:{name}] variant-cache HIT "
+                         f"{fm_ckey[:24]} (skipped recompile)\n")
+        else:
+            fm_so = _torch_load(
+                spec, variant_sources, fm_host, fm_device, ldflags, report,
+                module_suffix=f"_{_short_key(fm_ckey)}")
+        if fm_so is None:
+            report.write(f"    [fastmath:{name}] build FAILED — variant "
+                         f"dropped (strict build is unaffected).\n")
+            continue
+        cache.record_variant(spec.optimizer, spec.model, spec.arch,
+                             fm_ckey, fm_so, build_sig=fm_sig)
+        generated += 1
+        # Time the variant, dumping its output for oracle comparison.
+        fm_out = variant_dump_dir / f"_out_fm_{_short_key(fm_ckey)}.npy"
+        if fm_out.exists():
+            try:
+                fm_out.unlink()
+            except OSError:
+                pass
+        prior_dump = os.environ.get("SG_DUMP_OUTPUT")
+        os.environ["SG_DUMP_OUTPUT"] = str(fm_out)
+        try:
+            fm_result = None
+            if worker is not None and worker.alive():
+                fm_result = worker.time(fm_so)
+            if fm_result is None:
+                fm_result = _time_variant_oneshot(
+                    fm_so, OPT_CLASS[spec.optimizer], report=report,
+                    python_package=spec.python_package)
+        finally:
+            if prior_dump is None:
+                os.environ.pop("SG_DUMP_OUTPUT", None)
+            else:
+                os.environ["SG_DUMP_OUTPUT"] = prior_dump
+        # Validate against the SAME strict oracle the strict variant used.
+        fm_status = "skipped"
+        if fm_result is not None and numerics_enabled \
+                and ref_path is not None and fm_out.exists():
+            try:
+                fm_status, max_rel = _compare_outputs(
+                    ref_path, fm_out, ref_state["dtype"])
+                report.write(f"    [fastmath:{name}] {fm_status} "
+                             f"(max_rel={max_rel:.3e}) — origin=fastmath, "
+                             f"needs oracle PASS to win\n")
+                if strict and fm_status in ("ok", "deterministic"):
+                    det = _check_determinism_3x(
+                        fm_so, OPT_CLASS[spec.optimizer], ref_state["size"],
+                        ref_state["dtype"], variant_dump_dir,
+                        fused_op_template=getattr(
+                            spec, "fused_op_template", None))
+                    fm_status = "deterministic" if det else "non_deterministic"
+            except Exception as exc:
+                report.write(f"    [fastmath:{name}] validation error: "
+                             f"{exc}\n")
+                fm_status = "skipped"
+        elif fm_result is not None:
+            report.write(f"    [fastmath:{name}] timed but NOT validated "
+                         f"(numerics_enabled={numerics_enabled}, "
+                         f"oracle={'present' if ref_path else 'absent'}) — "
+                         f"will be ineligible to win (#16).\n")
+        _LAST_VARIANT_ORIGIN[fm_ckey] = ORIGIN_FASTMATH
+        _LAST_NUMERICAL_STATUS[fm_ckey] = fm_status
+        records.append(_make_trial_record(
+            "fastmath", trial_num, fm_cfg, fm_result, host=_current_host()))
+    if generated == 0:
+        report.write(f"    [fastmath] WARNING: 0 fast-math variants generated "
+                     f"for vendor={vendor} — fast-math NOT explored for this "
+                     f"config (check _FAST_MATH_VARIANTS).\n")
+    return records
+
+
 def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                         host_cflags_base: List[str],
                         device_cflags_base: List[str],
@@ -11897,7 +12038,8 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                         worker,                       # Optional[TimingWorker]
                         report,
                         progress_state: Dict[str, Any],
-                        cost_model_state: Optional[Dict[str, Any]] = None):
+                        cost_model_state: Optional[Dict[str, Any]] = None,
+                        fastmath_sink: Optional[List[Dict[str, Any]]] = None):
     """Return a closure ``timer(config) -> result dict | None`` for the
     Bayesian/Exhaustive driver. Builds the variant .so, records it in
     the cache, then asks the worker to time it (fallback: one-shot
@@ -12094,7 +12236,7 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                     # Mandate #20 — a polyhedral reschedule can be ILLEGAL;
                     # tag origin so pick_winner refuses it unless it passes
                     # the strict numeric oracle (#16).
-                    _LAST_VARIANT_ORIGIN[ckey] = "polyhedral"
+                    _LAST_VARIANT_ORIGIN[ckey] = ORIGIN_POLYHEDRAL
         except Exception as exc:
             try:
                 report.write(
@@ -12134,7 +12276,7 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                     # Mandate #16 — this variant is GENERATED; tag its origin
                     # so pick_winner requires a strict-oracle PASS before it
                     # can win (never ships an unvalidated synth kernel).
-                    _LAST_VARIANT_ORIGIN[ckey] = "synth"
+                    _LAST_VARIANT_ORIGIN[ckey] = ORIGIN_SYNTH
                     report.write(
                         f"    [synth_codegen] {ckey[:24]} "
                         f"synth-only build: {synth_path.name} "
@@ -12253,6 +12395,36 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                         f"    [numerical] {ckey[:24]} skipped: {exc}\n")
                     num_status = "skipped"
         _LAST_NUMERICAL_STATUS[ckey] = num_status
+
+        # Fix-#2 Defect-1 — fast-math (#6) variant exploration. When this
+        # config sets a NEW BEST strict time, ALSO build/time/validate the
+        # additive fast-math variants on it and emit them as separate
+        # origin="fastmath" trials into the sink (drained into pick_winner by
+        # the driver). Tying exploration to new-best events bounds the extra
+        # compile cost while GUARANTEEING the eventual winner's fast-math is
+        # explored. A fast-math variant only wins if it matched the strict
+        # oracle (#16); a diverging one is dropped.
+        if (spec.enable_fastmath_variants and fastmath_sink is not None
+                and result is not None
+                and num_status != "numerical_fail"):
+            ms = result.get("timing_ms")
+            best_fm = progress_state.get("fm_best_ms")
+            is_new_best = (ms is not None
+                           and (best_fm is None or ms < best_fm))
+            if is_new_best:
+                progress_state["fm_best_ms"] = ms
+                progress_state["fm_trial_num"] = \
+                    progress_state.get("fm_trial_num", 0) + 1
+                ref_path_fm = _resolve_ref()
+                fm_recs = _time_validate_fastmath_variants(
+                    spec, config, variant_sources, full_host, full_device,
+                    ldflags, cache, worker, report, arch_entry,
+                    ref_path_fm, ref_state, variant_dump_dir, strict,
+                    numerics_enabled, progress_state["fm_trial_num"])
+                for r in fm_recs:
+                    fastmath_sink.append(r)
+                    cache.record_trial(spec.optimizer, spec.model,
+                                       spec.arch, r)
         return result
 
     return timer
@@ -12533,10 +12705,14 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
         "n_rejected":  0,
         "n_total":     0,
     }
+    # Fix-#2 Defect-1 — sink for the fast-math (#6) variant trials the timer
+    # emits on new-best events. Owned here, written by the timer closure,
+    # drained into pick_winner by whichever driver runs.
+    fastmath_sink: List[Dict[str, Any]] = []
     timer = _make_variant_timer(
         spec, sources, host_cflags, device_cflags, ldflags,
         space[spec.arch]["dims"], cache, worker, report, progress_state,
-        cost_model_state=cost_model_state)
+        cost_model_state=cost_model_state, fastmath_sink=fastmath_sink)
 
     dims = space[spec.arch]["dims"]
     # Mandate #1 — pin GPU + memory clocks for the whole sweep so the timing
@@ -12548,11 +12724,13 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
         with clock_lock:
             if spec.autotune_mode == "exhaustive":
                 winning = _run_exhaustive(spec, survivors, dims, timer, cache,
-                                          space_hash, report, total=n_survivors)
+                                          space_hash, report, total=n_survivors,
+                                          fastmath_sink=fastmath_sink)
             else:
                 winning = _run_bayesian(spec, survivors, space, dims, timer,
                                         cache, space_hash, report,
-                                        cost_model_state=cost_model_state)
+                                        cost_model_state=cost_model_state,
+                                        fastmath_sink=fastmath_sink)
     finally:
         if worker is not None:
             try:
@@ -12593,7 +12771,8 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
 def _run_exhaustive(spec: BuildSpec, configs: Iterable[Dict[str, Any]],
                     dims: List[Dict[str, Any]],
                     timer, cache: CompileCache, space_hash: str,
-                    report, total: Optional[int] = None
+                    report, total: Optional[int] = None,
+                    fastmath_sink: Optional[List[Dict[str, Any]]] = None
                     ) -> Optional[Dict[str, Any]]:
     # ``configs`` may be a lazy stream (uncapped exhaustive over a multi-million
     # survivor space never materializes the list); ``total`` is the precomputed
@@ -12603,7 +12782,14 @@ def _run_exhaustive(spec: BuildSpec, configs: Iterable[Dict[str, Any]],
                  f"(uncapped — full search space)\n")
     step, close = make_progress(n_total,
                                 f"jit-exhaustive {spec.optimizer}/{spec.arch}")
-    best: Optional[Dict[str, Any]] = None
+    # Fix-#2 Defect-1 — accumulate ALL trials and select the winner via
+    # pick_winner (not an inline best). This routes exhaustive through the
+    # SAME #16 generated-origin gate the Bayesian path uses, so a fast-math /
+    # synth / polyhedral variant can only win after a strict-oracle PASS —
+    # closing the latent bypass where exhaustive's inline selection skipped
+    # the gate. The per-trial reporting (EXCLUDED lines) is preserved.
+    all_trials: List[Dict[str, Any]] = []
+    running_best: Optional[float] = None
     try:
         for i, cfg in enumerate(configs, 1):
             ckey = config_key(cfg)
@@ -12612,9 +12798,10 @@ def _run_exhaustive(spec: BuildSpec, configs: Iterable[Dict[str, Any]],
             t0 = time.monotonic()
             result = timer(cfg)
             elapsed = time.monotonic() - t0
-            # Stream 10: per-variant numerical-validation tag is stashed
-            # by the variant timer under config_key(cfg).
+            # Stream 10: per-variant numerical-validation tag + origin are
+            # stashed by the variant timer under config_key(cfg).
             num_status = _LAST_NUMERICAL_STATUS.get(ckey, "skipped")
+            origin = _LAST_VARIANT_ORIGIN.get(ckey, ORIGIN_TEMPLATE)
             trial = {
                 "trial_num":   i,
                 "stage":       "exhaustive",
@@ -12626,15 +12813,15 @@ def _run_exhaustive(spec: BuildSpec, configs: Iterable[Dict[str, Any]],
                 "n":           result["n"]         if result else None,
                 "host":        _current_host(),
                 "numerical_status": num_status,
+                "origin":      origin,
                 "recorded_at": datetime.datetime.now().isoformat(),
                 "status":      "ok" if result else "fail",
                 "build_s":     elapsed,
             }
             cache.record_trial(spec.optimizer, spec.model, spec.arch, trial)
+            all_trials.append(trial)
             if result is not None:
                 ms = result["timing_ms"]
-                # Stream 10 — exclude numerically failing variants from
-                # the running best; in strict mode require deterministic.
                 if num_status == "numerical_fail":
                     report.write(f"    median={ms:.4f}ms  "
                                  f"[EXCLUDED: numerical_fail]\n")
@@ -12644,21 +12831,30 @@ def _run_exhaustive(spec: BuildSpec, configs: Iterable[Dict[str, Any]],
                                  f"got {num_status}]\n")
                 else:
                     report.write(f"    median={ms:.4f}ms ({num_status})\n")
-                    if best is None or ms < (best.get("timing_ms") or float("inf")):
-                        best = {**cfg, "timing_ms": ms, "config_key": ckey}
+                    if running_best is None or ms < running_best:
+                        running_best = ms
             else:
                 report.write(f"    FAIL ({elapsed:.1f}s)\n")
-            step(f"best={best['timing_ms']:.3f}ms" if best else "no winner yet")
+            step(f"best={running_best:.3f}ms" if running_best is not None
+                 else "no winner yet")
             if (i % JIT_CACHE_FLUSH_EVERY) == 0:
                 cache.save()
     finally:
         close()
-    if best is None:
-        report.write("\n  [exhaustive] no successful variants — "
-                     "leaving tuned_config unset.\n")
+    # Merge the fast-math (#6) variant trials and select via pick_winner so
+    # the #16 gate is applied uniformly across template + generated origins.
+    pool = all_trials + list(fastmath_sink or [])
+    won = pick_winner(pool, strict_numerics=spec.strict_numerics)
+    if won is None:
+        report.write("\n  [exhaustive] no eligible variants (after #16 + "
+                     "numerical gate) — leaving tuned_config unset.\n")
         return None
+    best = {**won.get("config", {}),
+            "timing_ms": won["timing_ms"],
+            "config_key": won.get("config_key", config_key(won.get("config", {})))}
     report.write(f"\n  [exhaustive] WINNER: {best['config_key']} "
-                 f"@ {best['timing_ms']:.4f}ms\n")
+                 f"@ {best['timing_ms']:.4f}ms "
+                 f"(origin={won.get('origin', ORIGIN_TEMPLATE)})\n")
     cache.set_tuned(spec.optimizer, spec.model, spec.arch, best,
                     mode="exhaustive", search_space_hash=space_hash)
     return best
@@ -12669,6 +12865,7 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
                   timer, cache: CompileCache, space_hash: str,
                   report,
                   cost_model_state: Optional[Dict[str, Any]] = None,
+                  fastmath_sink: Optional[List[Dict[str, Any]]] = None,
                   ) -> Optional[Dict[str, Any]]:
     n_trials = spec.bayesian_trials  # may be None ⇒ auto stopper
     # Build a stopper from BuildSpec; honours --max-tune-seconds / --patience
@@ -12976,7 +13173,14 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
         cache.record_trial(spec.optimizer, spec.model, spec.arch, t)
     cache.save()
 
-    winner = pick_winner(tpe_trials + refine_trials,
+    # Fix-#2 Defect-1 — fold the fast-math (#6) variant trials into the
+    # winner pool. They carry origin="fastmath" and are gated by pick_winner
+    # (#16): kept only when they matched the strict oracle.
+    fm_trials = list(fastmath_sink or [])
+    if fm_trials:
+        report.write(f"  [fastmath] {len(fm_trials)} fast-math variant "
+                     f"trial(s) entered the winner pool (gated by #16).\n")
+    winner = pick_winner(tpe_trials + refine_trials + fm_trials,
                          strict_numerics=spec.strict_numerics)
     if winner is None:
         # Note: pick_winner may have returned None purely because no
@@ -12984,7 +13188,7 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
         # mode, no trial was bit-identical-deterministic across the
         # 3x re-run). Report the breakdown so the user can lower
         # --strict-numerics or widen the search space.
-        finished = [t for t in (tpe_trials + refine_trials)
+        finished = [t for t in (tpe_trials + refine_trials + fm_trials)
                     if t.get("timing_ms") is not None]
         ns_counts: Dict[str, int] = {}
         for t in finished:
@@ -17587,6 +17791,163 @@ def _self_test_clock_lock(run) -> None:
     run("clock_lock_amd_perflevel_high", test_amd_perflevel_high)
 
 
+def _self_test_fastmath_integration(run) -> None:
+    """`[self-test] fastmath_integration` section (Fix-#2 Defect-1).
+
+    The fast-math miss was a feature whose helper self-tests were green while
+    the feature did NOTHING end-to-end. These tests exercise the actual
+    build→time→validate→stamp→gate path (mock-timed, no GPU) — an INTEGRATION
+    test, not an isolated helper test."""
+    import io
+    import tempfile
+    import numpy as np
+    sys.stdout.write("[self-test] fastmath_integration\n")
+
+    def _mock_fastmath_run(compare_status: str):
+        """Run _time_validate_fastmath_variants with build+time mocked.
+        Returns (records, report_text)."""
+        td = Path(tempfile.mkdtemp())
+        report = io.StringIO()
+        spec = BuildSpec(optimizer="adamw", model="decoder", arch="sm_90a",
+                         out_dir=td)
+        cache = CompileCache(td / "c.json")
+        arch_entry = get_arch_entry("sm_90a")
+        ref = td / "ref.npy"
+        np.save(ref, np.zeros(4, dtype=np.float32))
+        ref_state = {"dtype": "float32", "size": 4096}
+        vdir = td / "variants"
+        vdir.mkdir(parents=True, exist_ok=True)
+        ksrc = td / "k.cu"
+        ksrc.write_text("// fake kernel source\n")
+
+        def fake_load(spec, sources, host, device, ld, report,
+                      module_suffix=""):
+            # Fast-math flags must actually be ON the build line.
+            assert ("--use_fast_math" in device or "-ffast-math" in device
+                    or "-fassociative-math" in (host + device)), \
+                f"fast-math flags not on the build: host={host} dev={device}"
+            p = td / f"fake{module_suffix}.so"
+            p.write_bytes(b"\x7fELF")
+            return p
+
+        def fake_oneshot(so, opt_class, report=None, python_package=None):
+            dp = os.environ.get("SG_DUMP_OUTPUT")
+            if dp:
+                np.save(dp, np.zeros(4, dtype=np.float32))
+            return {"timing_ms": 0.123, "min_ms": 0.12, "max_ms": 0.13,
+                    "n": 21}
+
+        def fake_compare(ref_p, out_p, dtype):
+            return (compare_status, 0.0)
+
+        g = globals()
+        saved = {k: g.get(k) for k in
+                 ("_torch_load", "_time_variant_oneshot", "_compare_outputs")}
+        g["_torch_load"] = fake_load
+        g["_time_variant_oneshot"] = fake_oneshot
+        g["_compare_outputs"] = fake_compare
+        try:
+            recs = _time_validate_fastmath_variants(
+                spec, {"block": 128}, [ksrc], ["-O3"], ["-O3"], [],
+                cache, None, report, arch_entry, ref, ref_state, vdir,
+                False, True, 1)
+        finally:
+            for k, v in saved.items():
+                g[k] = v
+            # Clean the sidecars this run wrote so other tests aren't polluted.
+            for name in _FAST_MATH_VARIANTS:
+                ck = config_key({"block": 128, "_fastmath": name})
+                _LAST_VARIANT_ORIGIN.pop(ck, None)
+                _LAST_NUMERICAL_STATUS.pop(ck, None)
+        return recs, report.getvalue()
+
+    def test_fastmath_variants_actually_produced():
+        """(a) The sweep helper produces origin='fastmath' trials that enter
+        the trial stream — the feature is WIRED, not dead code."""
+        recs, log = _mock_fastmath_run("ok")
+        # Two CUDA variants: safe_subset + full_fast_math.
+        assert len(recs) == 2, f"expected 2 fast-math trials, got {len(recs)}"
+        assert all(r["origin"] == ORIGIN_FASTMATH for r in recs), \
+            [r["origin"] for r in recs]
+        assert all(r["numerical_status"] == "ok" for r in recs), recs
+        assert all(r["timing_ms"] == 0.123 for r in recs)
+        # Each fast-math trial carries its variant name in the config.
+        names = {r["config"].get("_fastmath") for r in recs}
+        assert names == set(_FAST_MATH_VARIANTS), names
+
+    def test_fastmath_divergent_marked_fail_then_gated():
+        """A fast-math variant that DIVERGES from the strict oracle is tagged
+        numerical_fail and pick_winner refuses it even when fastest."""
+        recs, _ = _mock_fastmath_run("numerical_fail")
+        assert all(r["numerical_status"] == "numerical_fail" for r in recs)
+        # Make the divergent fast-math trial the fastest; it must NOT win.
+        fast_bad = dict(recs[0])
+        fast_bad["timing_ms"] = 0.001
+        good = {"timing_ms": 0.5, "numerical_status": "ok",
+                "origin": ORIGIN_TEMPLATE, "config": {}, "trial_num": 99}
+        w = pick_winner([fast_bad, good])
+        assert w is not None and w["origin"] == ORIGIN_TEMPLATE, w
+
+    def test_fastmath_skipped_never_wins_validated_can():
+        """(b)/(c) integration: an unvalidated ('skipped') fast-math trial
+        can NEVER win even when fastest; a validated one CAN."""
+        fm_skipped = {"timing_ms": 0.01, "numerical_status": "skipped",
+                      "origin": ORIGIN_FASTMATH, "config": {}, "trial_num": 1}
+        tmpl = {"timing_ms": 0.50, "numerical_status": "ok",
+                "origin": ORIGIN_TEMPLATE, "config": {}, "trial_num": 2}
+        assert pick_winner([fm_skipped, tmpl])["origin"] == ORIGIN_TEMPLATE
+        fm_ok = {"timing_ms": 0.01, "numerical_status": "ok",
+                 "origin": ORIGIN_FASTMATH, "config": {}, "trial_num": 3}
+        assert pick_winner([fm_ok, tmpl])["origin"] == ORIGIN_FASTMATH
+
+    def test_fastmath_pallas_is_na_loud():
+        """Loud-not-silent: Pallas/TPU has no fast-math flags → N/A log line,
+        zero variants, no crash."""
+        report = io.StringIO()
+        spec = BuildSpec(optimizer="adamw", model="decoder", arch="tpu_v6e",
+                         out_dir=Path(tempfile.mkdtemp()))
+        recs = _time_validate_fastmath_variants(
+            spec, {"block": 128}, [], [], [], [], CompileCache(None), None,
+            report, get_arch_entry("tpu_v6e"), None,
+            {"dtype": "float32", "size": 4096}, Path(tempfile.mkdtemp()),
+            False, False, 1)
+        assert recs == []
+        assert "N/A for vendor=pallas" in report.getvalue(), report.getvalue()
+
+    def test_fastmath_wired_into_sweep_drivers():
+        """Proof the sink is drained by BOTH drivers (no dead sink)."""
+        import inspect
+        bsrc = inspect.getsource(_run_bayesian)
+        esrc = inspect.getsource(_run_exhaustive)
+        assert "fastmath_sink" in bsrc and "fm_trials" in bsrc
+        assert "fastmath_sink" in esrc
+        # And the timer emits into the sink on new-best.
+        tsrc = inspect.getsource(_make_variant_timer)
+        assert "_time_validate_fastmath_variants" in tsrc
+        assert "fastmath_sink.append" in tsrc
+
+    def test_origin_constants_single_source_of_truth():
+        """Defect-1.6 — no stray origin string literal outside the constant
+        defs; the gate set is built from the constants."""
+        assert ORIGIN_FASTMATH == "fastmath"
+        assert ORIGIN_FASTMATH in _VALIDATION_REQUIRED_ORIGINS
+        # The misspellings that would bypass the gate must NOT be in the set.
+        assert "fast_math" not in _VALIDATION_REQUIRED_ORIGINS
+        assert "fast-math" not in _VALIDATION_REQUIRED_ORIGINS
+
+    run("fastmath_variants_actually_produced",
+        test_fastmath_variants_actually_produced)
+    run("fastmath_divergent_marked_fail_then_gated",
+        test_fastmath_divergent_marked_fail_then_gated)
+    run("fastmath_skipped_never_wins_validated_can",
+        test_fastmath_skipped_never_wins_validated_can)
+    run("fastmath_pallas_is_na_loud", test_fastmath_pallas_is_na_loud)
+    run("fastmath_wired_into_sweep_drivers",
+        test_fastmath_wired_into_sweep_drivers)
+    run("origin_constants_single_source_of_truth",
+        test_origin_constants_single_source_of_truth)
+
+
 def _self_test_autotune_brain(run) -> None:
     """`[self-test] autotune_brain` section (mandate #13 stopper defaults,
     #14 cost-model cold-start floor, #5 multi-GPU calibration)."""
@@ -20412,7 +20773,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 206
+_SELF_TEST_EXPECTED_COUNT: int = 212
 
 
 def _self_test() -> int:
@@ -20452,6 +20813,7 @@ def _self_test() -> int:
     _self_test_multi_gpu_pool(_run)
     _self_test_clock_lock(_run)
     _self_test_autotune_brain(_run)
+    _self_test_fastmath_integration(_run)
     _self_test_l2_flush(_run)
     _self_test_tier1_compile(_run)
     _self_test_discovery(_run)
