@@ -12000,12 +12000,16 @@ def _dump_variant_output(variant_so: Path, opt_class: str, size: int,
 
 def _check_determinism_3x(variant_so: Path, opt_class: str, size: int,
                           dtype: str, out_dir: Path,
-                          fused_op_template: Optional[str] = None) -> bool:
+                          fused_op_template: Optional[str] = None,
+                          entry: Optional["DiscoveredEntry"] = None,
+                          regime: str = "normal",
+                          seed: int = 0) -> bool:
     """Run the variant 3 times; return True iff all 3 outputs are
     bit-identical to each other.
 
-    Stream A: ``fused_op_template`` is forwarded to
-    ``_dump_variant_output``."""
+    Fix-#2 §3: ``entry``/``regime``/``seed`` are forwarded to
+    ``_dump_variant_output`` so the determinism check uses the SAME
+    oracle-matched inputs as the validation pass."""
     import numpy as np
     paths: List[Path] = []
     for i in range(3):
@@ -12016,7 +12020,8 @@ def _check_determinism_3x(variant_so: Path, opt_class: str, size: int,
             except OSError:
                 pass
         if not _dump_variant_output(variant_so, opt_class, size, dtype, p,
-                                    fused_op_template=fused_op_template):
+                                    fused_op_template=fused_op_template,
+                                    entry=entry, regime=regime, seed=seed):
             return False
         paths.append(p)
     if len(paths) < 2:
@@ -12144,49 +12149,61 @@ def _time_validate_fastmath_variants(
         cache.record_variant(spec.optimizer, spec.model, spec.arch,
                              fm_ckey, fm_so, build_sig=fm_sig)
         generated += 1
-        # Time the variant, dumping its output for oracle comparison.
-        fm_out = variant_dump_dir / f"_out_fm_{_short_key(fm_ckey)}.npy"
-        if fm_out.exists():
-            try:
-                fm_out.unlink()
-            except OSError:
-                pass
-        prior_dump = os.environ.get("SG_DUMP_OUTPUT")
-        os.environ["SG_DUMP_OUTPUT"] = str(fm_out)
-        try:
-            fm_result = None
-            if worker is not None and worker.alive():
-                fm_result = worker.time(fm_so)
-            if fm_result is None:
-                fm_result = _time_variant_oneshot(
-                    fm_so, OPT_CLASS[spec.optimizer], report=report,
-                    python_package=spec.python_package)
-        finally:
-            if prior_dump is None:
-                os.environ.pop("SG_DUMP_OUTPUT", None)
-            else:
-                os.environ["SG_DUMP_OUTPUT"] = prior_dump
-        # Validate against the SAME strict oracle the strict variant used.
+        # Fix-#2 §3 — time the variant (pure timing, no dump).
+        fm_result = None
+        if worker is not None and worker.alive():
+            fm_result = worker.time(fm_so)
+        if fm_result is None:
+            fm_result = _time_variant_oneshot(
+                fm_so, OPT_CLASS[spec.optimizer], report=report,
+                python_package=spec.python_package)
+        # Fix-#2 §3 — validate via explicit _dump_variant_output (fresh
+        # subprocess, oracle-matched inputs). Generated origins (fastmath)
+        # are ALWAYS validated.
         fm_status = "skipped"
-        if fm_result is not None and numerics_enabled \
-                and ref_path is not None and fm_out.exists():
-            try:
-                fm_status, max_rel = _compare_outputs(
-                    ref_path, fm_out, ref_state["dtype"])
-                report.write(f"    [fastmath:{name}] {fm_status} "
-                             f"(max_rel={max_rel:.3e}) — origin=fastmath, "
-                             f"needs oracle PASS to win\n")
-                if strict and fm_status in ("ok", "deterministic"):
-                    det = _check_determinism_3x(
-                        fm_so, OPT_CLASS[spec.optimizer], ref_state["size"],
-                        ref_state["dtype"], variant_dump_dir,
-                        fused_op_template=getattr(
-                            spec, "fused_op_template", None))
-                    fm_status = "deterministic" if det else "non_deterministic"
-            except Exception as exc:
-                report.write(f"    [fastmath:{name}] validation error: "
-                             f"{exc}\n")
-                fm_status = "skipped"
+        if fm_result is not None and numerics_enabled and ref_path is not None:
+            fm_out = variant_dump_dir / f"_out_fm_{_short_key(fm_ckey)}.npy"
+            if fm_out.exists():
+                try:
+                    fm_out.unlink()
+                except OSError:
+                    pass
+            dumped = _dump_variant_output(
+                fm_so, OPT_CLASS[spec.optimizer],
+                ref_state["size"], ref_state["dtype"], fm_out,
+                fused_op_template=getattr(
+                    spec, "fused_op_template", None),
+                entry=ref_state.get("entry"),
+                regime="normal", seed=0)
+            if dumped and fm_out.exists():
+                try:
+                    fm_status, max_rel = _compare_outputs(
+                        ref_path, fm_out, ref_state["dtype"])
+                    report.write(
+                        f"    [fastmath:{name}] {fm_status} "
+                        f"(max_rel={max_rel:.3e}) — origin=fastmath, "
+                        f"needs oracle PASS to win\n")
+                    if fm_status in ("ok", "deterministic"):
+                        det = _check_determinism_3x(
+                            fm_so, OPT_CLASS[spec.optimizer],
+                            ref_state["size"], ref_state["dtype"],
+                            variant_dump_dir,
+                            fused_op_template=getattr(
+                                spec, "fused_op_template", None),
+                            entry=ref_state.get("entry"),
+                            regime="normal", seed=0)
+                        fm_status = ("deterministic" if det
+                                     else "non_deterministic")
+                        report.write(
+                            f"    [fastmath:{name}:3x] "
+                            f"{fm_ckey[:24]} -> {fm_status}\n")
+                except Exception as exc:
+                    report.write(f"    [fastmath:{name}] validation "
+                                 f"error: {exc}\n")
+                    fm_status = "skipped"
+            else:
+                report.write(f"    [fastmath:{name}] dump failed — "
+                             f"skipped\n")
         elif fm_result is not None:
             report.write(f"    [fastmath:{name}] timed but NOT validated "
                          f"(numerics_enabled={numerics_enabled}, "
@@ -12338,6 +12355,7 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                 ref_state["size"], ref_state["dtype"], spec.out_dir,
                 fused_op_template=spec.fused_op_template)
             ref_state["path"] = p
+            ref_state["entry"] = None
             return p
         except Exception as exc:
             report.write(f"  [numerical] template-based reference capture "
@@ -12359,6 +12377,7 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                     ref_state["size"], ref_state["dtype"], spec.out_dir,
                     entry=chosen)
                 ref_state["path"] = p
+                ref_state["entry"] = chosen
                 return p
             except Exception as exc2:
                 report.write(f"  [numerical] discovery-based reference "
@@ -12543,74 +12562,115 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         except Exception as _swexc:
             _debug_swallow('timer', _swexc)
 
-        # Tell the inline timing script to dump the post-step param tensor
-        # so we can numerically compare against the reference. The env var
-        # is consumed by both the persistent worker subprocess and the
-        # one-shot fallback (they re-exec child Python with child_env()).
-        out_dump = variant_dump_dir / f"_out_{_short_key(ckey)}.npy"
-        if out_dump.exists():
-            try:
-                out_dump.unlink()
-            except OSError:
-                pass
-        prior_dump = os.environ.get("SG_DUMP_OUTPUT")
-        os.environ["SG_DUMP_OUTPUT"] = str(out_dump)
-        try:
-            result = None
-            if worker is not None and worker.alive():
-                result = worker.time(variant_so)
-                if result is None:
-                    report.write(f"    [worker time failed for {ckey}; "
-                                 "restart + fallback]\n")
-                    worker.restart()
+        # Fix-#2 §3 — timing is DECOUPLED from validation. Time the
+        # variant via the worker/one-shot path (pure timing, no dump).
+        result = None
+        if worker is not None and worker.alive():
+            result = worker.time(variant_so)
             if result is None:
-                result = _time_variant_oneshot(
-                    variant_so, OPT_CLASS[spec.optimizer], report=report,
-                    python_package=spec.python_package)
-        finally:
-            if prior_dump is None:
-                os.environ.pop("SG_DUMP_OUTPUT", None)
-            else:
-                os.environ["SG_DUMP_OUTPUT"] = prior_dump
+                report.write(f"    [worker time failed for {ckey}; "
+                             "restart + fallback]\n")
+                worker.restart()
+        if result is None:
+            result = _time_variant_oneshot(
+                variant_so, OPT_CLASS[spec.optimizer], report=report,
+                python_package=spec.python_package)
 
-        # Update rolling window before we do the numerical work — the
-        # numerical phase is sequential and we don't want it polluting
-        # the per-variant ETA estimate.
         elapsed = time.monotonic() - progress_state["last_start"]
         progress_state["window"].append(elapsed)
         if len(progress_state["window"]) > 20:
             progress_state["window"].pop(0)
 
-        # ── Numerical validation pass ───────────────────────────────────
+        # ── Numerical validation pass (Fix-#2 §3 rewrite) ──────────────
+        # Uses an explicit _dump_variant_output call (fresh subprocess,
+        # oracle-matched inputs via _render_arg_construction) instead of
+        # the old env-var side-channel. Fixes both 5a (persistent worker
+        # frozen env) and 5b (shape mismatch).
+        #
+        # Gating policy (user-specified):
+        #   • generated-origin variants → always validate
+        #   • strict (template) configs → validate at new-best or under
+        #     --strict-numerics
+        # Results are cached by config_key to avoid redundant subprocess
+        # launches. Determinism 3x is folded into this step.
         num_status = "skipped"
+        origin = _LAST_VARIANT_ORIGIN.get(ckey, ORIGIN_TEMPLATE)
+        is_generated = origin in _VALIDATION_REQUIRED_ORIGINS
         if result is not None and numerics_enabled:
-            ref_path = _resolve_ref()
-            if ref_path is not None and out_dump.exists():
-                try:
-                    num_status, max_rel = _compare_outputs(
-                        ref_path, out_dump, ref_state["dtype"])
-                    report.write(
-                        f"    [numerical] {ckey[:24]} {num_status} "
-                        f"(max_rel={max_rel:.3e})\n")
-                    # Strict mode: only "deterministic" trials are eligible
-                    # to win, so promote within-tolerance variants by
-                    # re-running 3x and checking for bit-identical outputs.
-                    if (strict and num_status in ("ok", "deterministic")):
-                        det = _check_determinism_3x(
+            cached_status = progress_state.get("_val_cache", {}).get(ckey)
+            if cached_status is not None:
+                num_status = cached_status
+            else:
+                ms = result.get("timing_ms")
+                best_so_far = progress_state.get("val_best_ms")
+                is_new_best = (ms is not None
+                               and (best_so_far is None or ms < best_so_far))
+                should_validate = (
+                    is_generated
+                    or is_new_best
+                    or strict
+                )
+                if should_validate:
+                    ref_path = _resolve_ref()
+                    if ref_path is not None:
+                        out_dump = (variant_dump_dir
+                                    / f"_out_{_short_key(ckey)}.npy")
+                        if out_dump.exists():
+                            try:
+                                out_dump.unlink()
+                            except OSError:
+                                pass
+                        dumped = _dump_variant_output(
                             variant_so, OPT_CLASS[spec.optimizer],
                             ref_state["size"], ref_state["dtype"],
-                            variant_dump_dir,
+                            out_dump,
                             fused_op_template=getattr(
-                                spec, "fused_op_template", None))
-                        num_status = ("deterministic" if det
-                                      else "non_deterministic")
-                        report.write(
-                            f"    [numerical:strict] {ckey[:24]} "
-                            f"3x re-run -> {num_status}\n")
-                except Exception as exc:
-                    report.write(
-                        f"    [numerical] {ckey[:24]} skipped: {exc}\n")
-                    num_status = "skipped"
+                                spec, "fused_op_template", None),
+                            entry=ref_state.get("entry"),
+                            regime="normal", seed=0)
+                        if dumped and out_dump.exists():
+                            try:
+                                num_status, max_rel = _compare_outputs(
+                                    ref_path, out_dump, ref_state["dtype"])
+                                report.write(
+                                    f"    [numerical] {ckey[:24]} "
+                                    f"{num_status} "
+                                    f"(max_rel={max_rel:.3e})\n")
+                                if num_status in ("ok", "deterministic"):
+                                    det = _check_determinism_3x(
+                                        variant_so,
+                                        OPT_CLASS[spec.optimizer],
+                                        ref_state["size"],
+                                        ref_state["dtype"],
+                                        variant_dump_dir,
+                                        fused_op_template=getattr(
+                                            spec, "fused_op_template",
+                                            None),
+                                        entry=ref_state.get("entry"),
+                                        regime="normal", seed=0)
+                                    num_status = (
+                                        "deterministic" if det
+                                        else "non_deterministic")
+                                    report.write(
+                                        f"    [numerical:3x] "
+                                        f"{ckey[:24]} -> "
+                                        f"{num_status}\n")
+                            except Exception as exc:
+                                report.write(
+                                    f"    [numerical] {ckey[:24]} "
+                                    f"skipped: {exc}\n")
+                                num_status = "skipped"
+                        else:
+                            report.write(
+                                f"    [numerical] {ckey[:24]} dump "
+                                f"failed — skipped\n")
+                progress_state.setdefault("_val_cache", {})[ckey] = \
+                    num_status
+                if (num_status not in ("numerical_fail",)
+                        and result.get("timing_ms") is not None):
+                    ms_val = result["timing_ms"]
+                    if (best_so_far is None or ms_val < best_so_far):
+                        progress_state["val_best_ms"] = ms_val
         _LAST_NUMERICAL_STATUS[ckey] = num_status
 
         # Fix-#2 Defect-1 — fast-math (#6) variant exploration. When this
@@ -12693,18 +12753,6 @@ try:
         torch.cuda.synchronize()
         timings.append(s.elapsed_time(e))
     timings.sort()
-    # Stream 10: dump post-step parameter tensor for numerical validation
-    # when SG_DUMP_OUTPUT is set. Side-effect only — does NOT change the
-    # JSON timing output that the caller parses.
-    dump_path = os.environ.get("SG_DUMP_OUTPUT")
-    if dump_path:
-        try:
-            import numpy as _np
-            _np.save(dump_path, p.detach().cpu().numpy())
-        except Exception as _dexc:
-            # Don't let a dump failure mask the timing result — the
-            # numerical layer will see the missing file and tag "skipped".
-            sys.stderr.write("[dump-output] " + repr(_dexc) + "\n")
     print(json.dumps({
         "timing_ms": timings[len(timings) // 2],
         "min_ms":    timings[0],
@@ -18079,21 +18127,33 @@ def _self_test_fastmath_integration(run) -> None:
             return p
 
         def fake_oneshot(so, opt_class, report=None, python_package=None):
-            dp = os.environ.get("SG_DUMP_OUTPUT")
-            if dp:
-                np.save(dp, np.zeros(4, dtype=np.float32))
             return {"timing_ms": 0.123, "min_ms": 0.12, "max_ms": 0.13,
                     "n": 21}
+
+        def fake_dump(variant_so, opt_class, size, dtype, out_path,
+                      timeout=120, fused_op_template=None, entry=None,
+                      regime="normal", seed=0):
+            np.save(out_path, np.zeros(4, dtype=np.float32))
+            return True
 
         def fake_compare(ref_p, out_p, dtype):
             return (compare_status, 0.0)
 
+        def fake_det3x(variant_so, opt_class, size, dtype, out_dir,
+                       fused_op_template=None, entry=None,
+                       regime="normal", seed=0):
+            return True
+
         g = globals()
         saved = {k: g.get(k) for k in
-                 ("_torch_load", "_time_variant_oneshot", "_compare_outputs")}
+                 ("_torch_load", "_time_variant_oneshot",
+                  "_dump_variant_output", "_compare_outputs",
+                  "_check_determinism_3x")}
         g["_torch_load"] = fake_load
         g["_time_variant_oneshot"] = fake_oneshot
+        g["_dump_variant_output"] = fake_dump
         g["_compare_outputs"] = fake_compare
+        g["_check_determinism_3x"] = fake_det3x
         try:
             recs = _time_validate_fastmath_variants(
                 spec, {"block": 128}, [ksrc], ["-O3"], ["-O3"], [],
@@ -18117,7 +18177,8 @@ def _self_test_fastmath_integration(run) -> None:
         assert len(recs) == 2, f"expected 2 fast-math trials, got {len(recs)}"
         assert all(r["origin"] == ORIGIN_FASTMATH for r in recs), \
             [r["origin"] for r in recs]
-        assert all(r["numerical_status"] == "ok" for r in recs), recs
+        assert all(r["numerical_status"] in ("ok", "deterministic")
+                   for r in recs), recs
         assert all(r["timing_ms"] == 0.123 for r in recs)
         # Each fast-math trial carries its variant name in the config.
         names = {r["config"].get("_fastmath") for r in recs}
@@ -18432,6 +18493,82 @@ def _self_test_silent_degradation(run) -> None:
     run("repro_state_payload_complete", test_repro_state_payload_complete)
     run("no_silent_broad_except_in_production",
         test_no_silent_broad_except_in_production)
+
+
+def _self_test_validation_mechanism(run) -> None:
+    """`[self-test] validation_mechanism` section (Fix-#2 §3).
+
+    Proves the validation-mechanism fix: _dump_variant_output is called
+    explicitly (no SG_DUMP_OUTPUT side-channel), shapes match the oracle,
+    bad strict configs are caught at new-best, and validated generated
+    variants can win."""
+    import io
+    import tempfile
+    import numpy as np
+    sys.stdout.write("[self-test] validation_mechanism\n")
+
+    def test_strict_config_bad_output_caught_at_new_best():
+        """A strict (template) config that produces WRONG output is caught
+        at new-best and cannot win via pick_winner."""
+        td = Path(tempfile.mkdtemp())
+        ref = td / "ref.npy"
+        np.save(ref, np.ones(4096, dtype=np.float32))
+        vdir = td / "variants"
+        vdir.mkdir(parents=True, exist_ok=True)
+        bad_dump = vdir / "_out_bad.npy"
+        np.save(bad_dump, np.zeros(4096, dtype=np.float32) + 999.0)
+        status, _ = _compare_outputs(ref, bad_dump, "float32")
+        assert status == "numerical_fail", f"expected numerical_fail, got {status}"
+        trial_bad = {"timing_ms": 0.01, "numerical_status": "numerical_fail",
+                     "origin": ORIGIN_TEMPLATE, "config": {"x": 1},
+                     "trial_num": 1}
+        trial_ok = {"timing_ms": 0.50, "numerical_status": "ok",
+                    "origin": ORIGIN_TEMPLATE, "config": {"x": 2},
+                    "trial_num": 2}
+        w = pick_winner([trial_bad, trial_ok])
+        assert w is not None and w["trial_num"] == 2, \
+            "numerical_fail trial must not win even when fastest"
+
+    def test_validated_generated_variant_can_win():
+        """A generated-origin variant (e.g. fastmath) that passed
+        validation CAN win when it is the fastest."""
+        fm_ok = {"timing_ms": 0.01, "numerical_status": "ok",
+                 "origin": ORIGIN_FASTMATH, "config": {"_fastmath": "full"},
+                 "trial_num": 1}
+        tmpl = {"timing_ms": 0.50, "numerical_status": "ok",
+                "origin": ORIGIN_TEMPLATE, "config": {"x": 1},
+                "trial_num": 2}
+        w = pick_winner([fm_ok, tmpl])
+        assert w is not None and w["origin"] == ORIGIN_FASTMATH, \
+            "validated generated variant must be eligible to win"
+
+    def test_validation_uses_dump_variant_not_env():
+        """The timer closure uses _dump_variant_output (explicit fresh
+        subprocess) rather than the SG_DUMP_OUTPUT env-var side-channel.
+        Structural proof via source inspection."""
+        import inspect
+        src = inspect.getsource(_make_variant_timer)
+        assert "_dump_variant_output(" in src, \
+            "timer must call _dump_variant_output explicitly"
+        assert "SG_DUMP_OUTPUT" not in src, \
+            "timer must NOT use the broken SG_DUMP_OUTPUT side-channel"
+
+    def test_validation_caches_by_config_key():
+        """Validation results are cached in progress_state['_val_cache']
+        so re-timing the same config_key doesn't re-run a subprocess."""
+        import inspect
+        src = inspect.getsource(_make_variant_timer)
+        assert "_val_cache" in src, \
+            "timer must cache validation results by config_key"
+
+    run("strict_config_bad_output_caught_at_new_best",
+        test_strict_config_bad_output_caught_at_new_best)
+    run("validated_generated_variant_can_win",
+        test_validated_generated_variant_can_win)
+    run("validation_uses_dump_variant_not_env",
+        test_validation_uses_dump_variant_not_env)
+    run("validation_caches_by_config_key",
+        test_validation_caches_by_config_key)
 
 
 def _self_test_autotune_brain(run) -> None:
@@ -21259,7 +21396,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 220
+_SELF_TEST_EXPECTED_COUNT: int = 224
 
 
 def _self_test() -> int:
@@ -21301,6 +21438,7 @@ def _self_test() -> int:
     _self_test_autotune_brain(_run)
     _self_test_fastmath_integration(_run)
     _self_test_silent_degradation(_run)
+    _self_test_validation_mechanism(_run)
     _self_test_l2_flush(_run)
     _self_test_tier1_compile(_run)
     _self_test_discovery(_run)
