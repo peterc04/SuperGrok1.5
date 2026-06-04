@@ -6426,17 +6426,45 @@ class CompileCache:
             self._dirty = True
 
     def record_variant(self, opt: str, model: str, arch: str,
-                       config_key: str, so_path: Optional[Path]) -> None:
+                       config_key: str, so_path: Optional[Path],
+                       build_sig: Optional[str] = None) -> None:
         with self._lock:
             e = self.get(opt, model, arch)
             if so_path is not None and Path(so_path).exists():
                 stat = Path(so_path).stat()
-                e["variant_artifacts"][config_key] = {
+                rec = {
                     "path":  str(so_path),
                     "size":  stat.st_size,
                     "mtime": stat.st_mtime,
                 }
+                # Perf (time-to-quality) — record the source+flag signature
+                # that produced this .so so a resumed/repeated sweep can REUSE
+                # it instead of paying the full ~125s recompile. The .so is
+                # byte-identical to a rebuild iff the signature matches.
+                if build_sig is not None:
+                    rec["build_sig"] = build_sig
+                e["variant_artifacts"][config_key] = rec
                 self._dirty = True
+
+    def get_fresh_variant(self, opt: str, model: str, arch: str,
+                          config_key: str,
+                          build_sig: str) -> Optional[Path]:
+        """Perf — return a cached variant .so iff it exists on disk AND was
+        built from the same source+flag signature (so it is byte-identical to
+        a rebuild). Skips the recompile on resumed/repeated sweeps. Returns
+        None when there is no reusable artifact."""
+        with self._lock:
+            e = self.get(opt, model, arch)
+            rec = (e.get("variant_artifacts") or {}).get(config_key)
+        if not rec or rec.get("build_sig") != build_sig:
+            return None
+        p = Path(rec.get("path", ""))
+        try:
+            if p.exists() and p.stat().st_size == rec.get("size"):
+                return p
+        except OSError:
+            return None
+        return None
 
     def record_trial(self, opt: str, model: str, arch: str,
                      trial: Dict[str, Any]) -> None:
@@ -12112,18 +12140,35 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                         f"synth-only build: {synth_path.name} "
                         f"(origin=synth — needs oracle PASS to win)\n")
 
-        variant_so = _torch_load(
-            spec, variant_sources,
-            host_cflags_base + host_extra,
-            device_cflags_base + device_extra,
-            ldflags, report,
-            module_suffix=f"_{_short_key(ckey)}",
-        )
+        # Perf (time-to-quality) — build a signature over the exact sources +
+        # host/device flags this variant would compile with. If a cached .so
+        # with the SAME signature is already on disk (resumed/repeated sweep,
+        # or a cost-model re-measure), reuse it and SKIP the ~125s recompile —
+        # the artifact is byte-identical to a rebuild. Any change to sources
+        # or flags changes the signature, so a stale .so is never reused.
+        full_host = host_cflags_base + host_extra
+        full_device = device_cflags_base + device_extra
+        build_sig = _hash_flags(
+            [str(s) for s in variant_sources]
+            + [_hash_sources(list(variant_sources))]
+            + full_host + full_device + list(ldflags))
+        variant_so = cache.get_fresh_variant(
+            spec.optimizer, spec.model, spec.arch, ckey, build_sig)
+        if variant_so is not None:
+            report.write(f"    [variant-cache] HIT {ckey[:24]} — reusing "
+                         f"{variant_so.name} (skipped recompile)\n")
+        else:
+            variant_so = _torch_load(
+                spec, variant_sources,
+                full_host, full_device,
+                ldflags, report,
+                module_suffix=f"_{_short_key(ckey)}",
+            )
         if variant_so is None:
             _LAST_NUMERICAL_STATUS[ckey] = "skipped"
             return None
         cache.record_variant(spec.optimizer, spec.model, spec.arch,
-                             ckey, variant_so)
+                             ckey, variant_so, build_sig=build_sig)
 
         # Stream α — promote any ptxas-v info that _torch_load captured for
         # this variant's build directory into the per-config sidecar so
@@ -17267,6 +17312,37 @@ def _self_test_cache(run) -> None:
                     "numerical_status", "ptxas_info", "recorded_at"):
             assert key in doc, f"docstring missing key {key!r}"
 
+    def test_variant_reuse_skips_recompile():
+        """Perf — a cached variant .so is reused only when its build
+        signature matches; a mismatched signature (sources/flags changed)
+        forces a rebuild. This is what makes a resumed sweep near-free
+        instead of paying the ~125s recompile per already-explored config."""
+        td = Path(tempfile.mkdtemp())
+        try:
+            cp = td / "c.json"
+            cache = CompileCache(cp)
+            so = td / "variant_abc.so"
+            so.write_bytes(b"\x7fELF fake variant")
+            sig = "sig-v1"
+            cache.record_variant("lion", "mamba", "sm_90", "ck1", so,
+                                 build_sig=sig)
+            # Same signature → reuse (skip recompile).
+            hit = cache.get_fresh_variant("lion", "mamba", "sm_90", "ck1", sig)
+            assert hit is not None and Path(hit) == so, hit
+            # Different signature (flags/sources changed) → no reuse.
+            miss = cache.get_fresh_variant("lion", "mamba", "sm_90", "ck1",
+                                           "sig-v2")
+            assert miss is None, "stale-signature .so must not be reused"
+            # Missing config_key → no reuse.
+            assert cache.get_fresh_variant(
+                "lion", "mamba", "sm_90", "unknown", sig) is None
+            # Deleted .so on disk → no reuse even with matching sig.
+            so.unlink()
+            assert cache.get_fresh_variant(
+                "lion", "mamba", "sm_90", "ck1", sig) is None
+        finally:
+            shutil.rmtree(td)
+
     run("cache_concurrent_writes_both_survive",
         test_cache_concurrent_writes_both_survive)
     run("cache_corruption_emits_stderr_notice",
@@ -17277,6 +17353,7 @@ def _self_test_cache(run) -> None:
         test_cache_migrate_v3_uses_cache_version_constant)
     run("make_trial_record_documents_v4_schema",
         test_make_trial_record_documents_v4_schema)
+    run("variant_reuse_skips_recompile", test_variant_reuse_skips_recompile)
 
 
 def _self_test_multi_gpu_pool(run) -> None:
@@ -20335,7 +20412,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 205
+_SELF_TEST_EXPECTED_COUNT: int = 206
 
 
 def _self_test() -> int:
