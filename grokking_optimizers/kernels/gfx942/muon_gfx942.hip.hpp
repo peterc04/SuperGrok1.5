@@ -137,8 +137,10 @@ void launch_muon_step(
         auto& buf = bufs[i];
         auto& g = grads[i];
 
-        // (1) momentum EMA (elementwise — no MFMA/DPP value).
-        buf.mul_(momentum).add_(g.to(buf.scalar_type()), 1.0f - momentum);
+        // (1) momentum (elementwise). Canonical Muon is plain SGD-momentum
+        // buf = momentum*buf + g (csrc/algorithms/muon.h, bindings.cpp) — NOT
+        // an EMA; the (1-momentum) factor was a drift that shrank the gradient.
+        buf.mul_(momentum).add_(g.to(buf.scalar_type()));
 
         if (p.dim() >= 2) {
             auto buf_f = buf.to(torch::kFloat32).contiguous();
@@ -184,7 +186,8 @@ void launch_muon_step(
         auto& buf = bufs[i];
         auto& g = grads[i];
 
-        buf.mul_(momentum).add_(g.to(buf.scalar_type()), 1.0f - momentum);
+        // Canonical plain SGD-momentum: buf = momentum*buf + g (no 1-momentum).
+        buf.mul_(momentum).add_(g.to(buf.scalar_type()));
 
         if (p.dim() >= 2) {
             auto frob = buf.norm() + 1e-8f;
@@ -214,10 +217,12 @@ void launch_muon_ns_combine_update_fused(
 void launch_muon_momentum_normalize(
     torch::Tensor buf, torch::Tensor X, torch::Tensor grad, float momentum, float inv_norm
 ) {
-    // buf = momentum*buf + inv_norm*grad.float()
-    buf.mul_(momentum).add_(grad.to(torch::kFloat32), inv_norm);
-    // X = buf (copy)
-    X.copy_(buf);
+    // Canonical (csrc/algorithms/muon.h): b = momentum*buf + g; buf = b;
+    // X = b * inv_norm. The prior code folded inv_norm INTO buf (poisoning the
+    // persistent momentum state) and dropped the Frobenius normalization of X
+    // entirely (X = buf instead of buf*inv_norm).
+    buf.mul_(momentum).add_(grad.to(torch::kFloat32));   // buf = momentum*buf + g
+    X.copy_(buf * inv_norm);                              // X = buf * inv_norm
 }
 
 void launch_muon_ns_combine(

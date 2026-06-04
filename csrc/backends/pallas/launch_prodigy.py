@@ -101,6 +101,11 @@ def launch_prodigy_step(
     """Per-tensor Prodigy step (fused-TU contract)."""
     delta = param_init - param
     r_sum = jnp.sum(grad * delta) * d_prev
+    # NOTE (audit): this uses the Prodigy-paper L1 norm Σ_j|d²·g_j| (== d²·Σ|g|),
+    # which matches the HIP backend but DIFFERS from canonical prodigy.h, whose
+    # denom is |Σ_j d²·g_j| (abs-of-sum). The header is the outlier vs the paper
+    # + HIP + this path; resolving header-vs-paper is a pending design decision,
+    # so this is left as-is rather than aligned to the (likely-buggy) header.
     s_sum = jnp.sum(jnp.abs(grad)) * (d_prev * d_prev)
     candidate = r_sum / (jnp.abs(s_sum) + 1e-12)
     d = jnp.maximum(d_prev, candidate)
