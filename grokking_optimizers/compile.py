@@ -212,6 +212,25 @@ JIT_CACHE_FLUSH_EVERY = 5   # save cache every N completed JIT trials
 # end. Same shape for [host_cflags] and [xla_env].
 _COMPILE_LOG_LEVEL: int = 0
 
+
+def _debug_swallow(component: str, exc: BaseException,
+                   detail: str = "") -> None:
+    """Fix-#2 Defect-2 — make a recoverable broad-except degradation VISIBLE
+    instead of silent (§2A). Emits ONE line to stderr at debug verbosity
+    (``_COMPILE_LOG_LEVEL >= 2``) naming the component, the swallowed
+    exception, and optional detail. Quiet by default (level 0/1) so normal
+    runs are unchanged; turn on with ``--debug-flags`` / debug mode to see
+    every benign optional-feature/cleanup fallback the build took.
+
+    Use this ONLY for genuinely recoverable absences (optional deps, best-
+    effort cleanup, observability). A correctness/tuning/validation/oracle
+    error must be a loud warning + re-raise, NOT a swallow."""
+    if _COMPILE_LOG_LEVEL >= 2:
+        sfx = f" ({detail})" if detail else ""
+        sys.stderr.write(
+            f"[swallow] {component}: {type(exc).__name__}: {exc}{sfx}\n")
+
+
 # Module-level cache of the arch that the last ``build()`` call resolved.
 # Set whenever ``build()`` enters with ``arch in (None, "auto", "")`` and
 # the auto-detect probe chain picks a value. Tests / harnesses can read
@@ -2113,7 +2132,8 @@ def _megakernel_maxrregcount_values(arch_key: str,
         plan = _mk.solve(model, optimizer, arch_key if arch_key in
                          _mk.MEGAKERNEL_ARCHS else _mk.MEGAKERNEL_ARCHS[0])
         est = max(32, min(cap, int(plan.regs)))
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_megakernel_maxrregcount_values', _swexc)
         est = cap  # solver unavailable → fall back to the full arch range
     # Candidate caps: estimate, a few steps above/below (to bracket the real
     # ptxas number), the arch ceiling, and a low cap that trades occupancy for
@@ -2465,7 +2485,8 @@ def compile_feasibility_check(prefilter_spec: Dict[str, Any]
                 env["__builtins__"] = _PREFILTER_SAFE_BUILTINS
                 if not bool(eval(code, env, env)):  # noqa: S307 — sandboxed
                     return False
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('check', _swexc)
                 return False
         return True
     return check
@@ -3548,8 +3569,8 @@ class PallasTimer:
                 if callable(val) and not isinstance(val, (int, float, bool, str)):
                     try:
                         val = val()
-                    except Exception:
-                        pass
+                    except Exception as _swexc:
+                        _debug_swallow('_build_args', _swexc)
                 kw_args[name] = val
             return pos_args, kw_args
 
@@ -3604,9 +3625,11 @@ class PallasTimer:
                     jax.tree_util.tree_map(
                         lambda x: x.block_until_ready()
                         if hasattr(x, "block_until_ready") else x, out)
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('_call', _swexc)
                 return None
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_call', _swexc)
             return None
 
         # Timed iterations.
@@ -3619,7 +3642,8 @@ class PallasTimer:
                     lambda x: x.block_until_ready()
                     if hasattr(x, "block_until_ready") else x, out)
                 times.append((_time.perf_counter() - t0) * 1000.0)
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_call', _swexc)
             return None
         times.sort()
         return {
@@ -3754,11 +3778,12 @@ class TimingWorker:
                     self._proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     self._proc.kill()
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_terminate_proc', _swexc)
             try:
                 self._proc.kill()
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_terminate_proc', _swexc)
         finally:
             self._proc = None
 
@@ -3807,13 +3832,13 @@ class TimingWorker:
             try:
                 if self._proc and self._proc.poll() is None:
                     os.kill(self._proc.pid, signal.SIGKILL)
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_force_restart', _swexc)
             try:
                 if self._proc:
                     self._proc.wait(timeout=2.0)
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_force_restart', _swexc)
             self._proc = None
             # Re-spawn without re-entering the watchdog plumbing.
             try:
@@ -3834,8 +3859,8 @@ class TimingWorker:
                     if self._proc:
                         try:
                             self._proc.kill()
-                        except Exception:
-                            pass
+                        except Exception as _swexc:
+                            _debug_swallow('_force_restart', _swexc)
                     self._proc = None
             except Exception as exc:  # noqa: BLE001
                 self._error_log.append(("watchdog_restart_spawn", str(exc)))
@@ -3995,6 +4020,12 @@ class MultiGPUTimingPool:
         self.vendor = vendor
         self.devices = self.visible_devices(vendor)
         self._env_var = self.env_var_for(vendor)
+        # Fix-#2 Defect-2 — pop our own kwarg BEFORE constructing TimingWorker
+        # (which would reject the unknown keyword). When True, a total
+        # calibration failure raises in start() rather than silently
+        # proceeding with an uncalibrated cross-GPU pool.
+        self._require_calibration: bool = bool(
+            worker_kwargs.pop("require_calibration", False))
         self.workers: List[TimingWorker] = []
         for dev in self.devices:
             w = TimingWorker(
@@ -4039,28 +4070,61 @@ class MultiGPUTimingPool:
         self.workers = live
         # Mandate #5 — calibrate per-GPU offsets before pooling timings.
         if any_ok and len(self.workers) > 1:
-            self.calibrate()
+            self.calibrate(require=self._require_calibration)
         else:
             self._calib_factors = [1.0] * len(self.workers)
         self._spawn_dispatchers()
         self._started = True
         return any_ok
 
-    def calibrate(self, report=None) -> List[float]:
+    def calibrate(self, report=None, *, require: bool = False) -> List[float]:
         """Mandate #5 — time a fixed reference kernel on every live worker
         and compute per-worker normalization factors (worker_ref_ms /
         fastest_ref_ms). A GPU that bins/throttles slower gets a factor > 1,
         and its measured variant times are later divided by that factor so
-        ranking is consistent with a single-GPU sweep. Workers that fail to
-        calibrate keep factor 1.0 (no normalization)."""
+        ranking is consistent with a single-GPU sweep.
+
+        Fix-#2 Defect-2 — a per-device calibration failure is NO LONGER
+        swallowed silently: it emits a WARNING naming the device and that its
+        offset correction was dropped (factor stays 1.0, which can skew
+        cross-GPU ranking). When ``require=True`` (cross-GPU ``--stage`` modes
+        that DEPEND on the offset correction) a TOTAL calibration failure is
+        an error and RAISES rather than returning a degenerate all-1.0
+        calibration silently."""
         refs: List[Optional[float]] = []
-        for w in self.workers:
+        for idx, w in enumerate(self.workers):
+            dev = self.devices[idx] if idx < len(self.devices) else idx
             try:
                 refs.append(w.calibrate())
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 — surfaced below, not hidden
                 refs.append(None)
+                msg = (f"  [calibrate] WARNING: gpu{dev} calibration FAILED "
+                       f"({type(exc).__name__}: {exc}); its per-GPU offset "
+                       f"correction is DROPPED (factor=1.0) — cross-GPU "
+                       f"ranking on this device may be skewed.\n")
+                if report is not None:
+                    report.write(msg)
+                else:
+                    sys.stderr.write(msg)
         valid = [r for r in refs if r and r > 0]
         if not valid:
+            # Total calibration failure. In a cross-GPU mode that relies on
+            # the offset correction this is an ERROR, not a recoverable
+            # absence — fail loud (§2A) instead of returning all-1.0 silently.
+            total_msg = (
+                f"MultiGPUTimingPool calibration FAILED on ALL "
+                f"{len(self.workers)} device(s): cross-GPU timing offsets "
+                f"cannot be corrected, so cross-device ranking is unreliable.")
+            if require:
+                raise RuntimeError(
+                    total_msg + " (require=True — refusing to proceed with an "
+                    "uncalibrated cross-GPU pool).")
+            warn = f"  [calibrate] WARNING: {total_msg} Proceeding with no "
+            warn += "normalization (all factors = 1.0).\n"
+            if report is not None:
+                report.write(warn)
+            else:
+                sys.stderr.write(warn)
             self._calib_factors = [1.0] * len(self.workers)
             return self._calib_factors
         fastest = min(valid)
@@ -4115,19 +4179,19 @@ class MultiGPUTimingPool:
         for _ in self._dispatch_threads:
             try:
                 self._queue.put(None)
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('stop', _swexc)
         for t in self._dispatch_threads:
             try:
                 t.join(timeout=5.0)
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('stop', _swexc)
         self._dispatch_threads = []
         for w in self.workers:
             try:
                 w.stop()
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('stop', _swexc)
 
     def restart(self) -> bool:
         any_ok = False
@@ -4135,8 +4199,8 @@ class MultiGPUTimingPool:
             try:
                 if w.restart():
                     any_ok = True
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('restart', _swexc)
         return any_ok
 
     # ---- work-stealing dispatcher -----------------------------------
@@ -4152,14 +4216,15 @@ class MultiGPUTimingPool:
         while not self._stopped.is_set():
             try:
                 item = self._queue.get()
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('_dispatch_loop', _swexc)
                 return
             if item is None:
                 # Sentinel: graceful shutdown.
                 try:
                     self._queue.task_done()
-                except Exception:
-                    pass
+                except Exception as _swexc:
+                    _debug_swallow('_dispatch_loop', _swexc)
                 return
             payload, fut = item
             try:
@@ -4180,8 +4245,8 @@ class MultiGPUTimingPool:
                         time.sleep(0.05)
                     try:
                         self._queue.task_done()
-                    except Exception:
-                        pass
+                    except Exception as _swexc:
+                        _debug_swallow('_dispatch_loop', _swexc)
                     continue
                 variant_so, opt_class, kwargs = payload
                 # Real TimingWorker.time only takes variant_so (opt_class
@@ -4199,15 +4264,16 @@ class MultiGPUTimingPool:
                 result = self._normalize_result(result, factor)
                 fut.set_result(result)
             except Exception as exc:  # noqa: BLE001 — propagate to caller
+                _debug_swallow('_dispatch_loop', exc)
                 try:
                     fut.set_exception(exc)
-                except Exception:
-                    pass
+                except Exception as _swexc:
+                    _debug_swallow('_dispatch_loop', _swexc)
             finally:
                 try:
                     self._queue.task_done()
-                except Exception:
-                    pass
+                except Exception as _swexc:
+                    _debug_swallow('_dispatch_loop', _swexc)
 
     # ---- timing API mirroring TimingWorker ---------------------------
 
@@ -4613,8 +4679,8 @@ class CostModel:
             return _factory, "xgboost"
         except ImportError:
             pass
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('_factory', _swexc)
         # Try sklearn — auto-install on miss when the process-wide
         # switch is on. The Python package name is ``sklearn`` but the
         # pip distribution name is ``scikit-learn``.
@@ -4631,8 +4697,8 @@ class CostModel:
                 return _factory_sk, "sklearn"
             except ImportError:
                 pass
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_factory_sk', _swexc)
         else:
             sys.stderr.write(
                 "[cost-model] sklearn unavailable and auto-install off "
@@ -4682,6 +4748,7 @@ class CostModel:
         except Exception as exc:
             # If the chosen backend fails (XGBoost edge case on tiny data),
             # fall through to the linear backend so the layer still works.
+            _debug_swallow('fit', exc)
             self._model = _LinearRidgeRegressor(alpha=1e-2)
             self._model.fit(Xt, yt)
             self._backend = "linear"
@@ -4690,7 +4757,8 @@ class CostModel:
         try:
             train_pred = np.asarray(self._model.predict(Xt))
             self._mae_train = float(np.mean(np.abs(train_pred - yt)))
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('fit', _swexc)
             self._mae_train = None
         try:
             if Xv.shape[0] > 0:
@@ -4699,7 +4767,8 @@ class CostModel:
             else:
                 # No val split (very small dataset) — copy train MAE.
                 self._mae_val = self._mae_train
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('fit', _swexc)
             self._mae_val = None
 
         # Bootstrap mini-models for uncertainty (also serves as fallback
@@ -4712,7 +4781,8 @@ class CostModel:
                 m = factory()
                 m.fit(Xt[bsi], yt[bsi])
                 self._bootstrap_models.append(m)
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('fit', _swexc)
                 continue
 
         # Quantile heads — XGBoost only.
@@ -4732,9 +4802,10 @@ class CostModel:
                     verbosity=0)
                 self._quantile_lo.fit(Xt, yt)
                 self._quantile_hi.fit(Xt, yt)
-            except Exception:
+            except Exception as _swexc:
                 # Older XGBoost without quantile support — leave them None
                 # and fall through to bootstrap at predict() time.
+                _debug_swallow('fit', _swexc)
                 self._quantile_lo = None
                 self._quantile_hi = None
 
@@ -4760,7 +4831,8 @@ class CostModel:
                 lo = float(np.asarray(self._quantile_lo.predict(X)).flat[0])
                 hi = float(np.asarray(self._quantile_hi.predict(X)).flat[0])
                 sigma_val = max(0.0, (hi - lo) / 2.0)
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('predict', _swexc)
                 sigma_val = 0.0
         if sigma_val == 0.0 and self._bootstrap_models:
             try:
@@ -4770,7 +4842,8 @@ class CostModel:
                     preds.append(float(p))
                 if len(preds) >= 2:
                     sigma_val = float(np.std(preds))
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('predict', _swexc)
                 sigma_val = 0.0
         return mean_val, sigma_val
 
@@ -4832,7 +4905,8 @@ class CostModel:
                 import pickle
                 with self.cache_path.open("rb") as fp:
                     state = pickle.load(fp)
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('load', _swexc)
             return False
         if not isinstance(state, dict):
             return False
@@ -4877,8 +4951,9 @@ class _LinearRidgeRegressor:
         b = X_aug.T @ y
         try:
             self.w_ = np.linalg.solve(A, b)
-        except Exception:
+        except Exception as _swexc:
             # Singular matrix — pseudo-inverse fallback.
+            _debug_swallow('fit', _swexc)
             self.w_ = np.linalg.pinv(A) @ b
         return self
 
@@ -4928,7 +5003,8 @@ def _cost_model_train_from_trials(
             continue
         try:
             feat = featurize_config(cfg, dims, arch_entry, stall_info)
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_cost_model_train_from_trials', _swexc)
             continue
         rows_X.append(feat)
         rows_y.append(float(ms))
@@ -4944,14 +5020,15 @@ def _cost_model_train_from_trials(
                     uncertainty_method=uncertainty_method)
     try:
         reg.fit(X, y)
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_cost_model_train_from_trials', _swexc)
         return None
     try:
         reg.save()
-    except Exception:
+    except Exception as _swexc:
         # Cache write failed (disk full / read-only) — still return the
         # in-memory model so the running sweep gets the benefit.
-        pass
+        _debug_swallow('_cost_model_train_from_trials', _swexc)
     return reg
 
 
@@ -5469,7 +5546,8 @@ def run_bayesian(
                     distributions=distributions,
                     value=float(tms),
                 ))
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('run_bayesian', _swexc)
                 continue
 
     # Stream γ.4 — when the caller threaded a device-PGO ``stall_info``
@@ -5483,10 +5561,10 @@ def run_bayesian(
         try:
             bias_trial_queue(study, stall_info, space[arch], arch,
                              max_enqueued=int(bias_max_enqueued))
-        except Exception:
+        except Exception as _swexc:
             # Best-effort: a malformed stall_info / unknown dim must
             # never break the autotune.
-            pass
+            _debug_swallow('run_bayesian', _swexc)
 
     records: List[Dict[str, Any]] = []
     # For progress reporting when no manual cap, use stopper's hard ceiling
@@ -5518,6 +5596,7 @@ def run_bayesian(
             raw = timer(cfg)
         except Exception as exc:
             # Optuna ≥ 4.0 forbids passing a value with state=FAIL.
+            _debug_swallow('run_bayesian', exc)
             study.tell(trial, state=optuna.trial.TrialState.FAIL)
             rec = _make_trial_record("tpe", trial.number, cfg, None, host=host)
             rec["status"] = "fail"
@@ -5578,8 +5657,8 @@ def run_bayesian(
                else 'early-stopped')
         print(f"[autotune] {tag}: {reason} after {len(records)} trials",
               file=out_stream)
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('run_bayesian', _swexc)
     return records, stop_info
 
 
@@ -5992,16 +6071,16 @@ class _DebugTee:
         try:
             self.mirror.write(s)
             self.mirror.flush()
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('write', _swexc)
         return len(s) if isinstance(s, str) else 0
 
     def flush(self):
         self.primary.flush()
         try:
             self.mirror.flush()
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('flush', _swexc)
 
 
 class CompileCache:
@@ -6941,14 +7020,14 @@ def _ensure_nvcc_on_path() -> Optional[str]:
                     site_dirs.append(Path(got))
                 else:
                     site_dirs.extend(Path(p) for p in got)
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_ensure_nvcc_on_path', _swexc)
         for sd in site_dirs:
             for cuda_pkg in ("cuda_nvcc", "cuda-nvcc"):
                 nvcc_p = sd / "nvidia" / cuda_pkg / "bin" / "nvcc"
                 candidates.append(nvcc_p)
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_ensure_nvcc_on_path', _swexc)
 
     for nvcc_p in candidates:
         try:
@@ -7035,7 +7114,8 @@ def _refresh_torch_cuda_home(force: bool = False) -> None:
     """
     try:
         import torch.utils.cpp_extension as cppext
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_refresh_torch_cuda_home', _swexc)
         return
     cuda = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
     if cuda:
@@ -7099,7 +7179,8 @@ def _target_cuda_version_for_arch(arch: str) -> Tuple[int, int]:
                 torch_v = min_v
         else:
             torch_v = min_v
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_target_cuda_version_for_arch', _swexc)
         torch_v = min_v
     # Pick the HIGHER of the two (typed as 2-tuple for the return contract).
     chosen = max(min_v[:2], torch_v[:2])
@@ -7163,7 +7244,8 @@ def _bootstrap_cuda_via_nvidia_apt_repo(stream, arch: Optional[str] = None) -> b
                 if "=" in line:
                     k, v = line.strip().split("=", 1)
                     os_release[k] = v.strip('"')
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_bootstrap_cuda_via_nvidia_apt_repo', _swexc)
         return False
     distro_id = os_release.get("ID", "").lower()
     version_id = os_release.get("VERSION_ID", "").replace(".", "")
@@ -7201,8 +7283,8 @@ def _bootstrap_cuda_via_nvidia_apt_repo(stream, arch: Optional[str] = None) -> b
             if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
                 if int(parts[0]) >= 12:
                     target_ver = f"{parts[0]}-{parts[1]}"
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('_bootstrap_cuda_via_nvidia_apt_repo', _swexc)
 
     keyring_url = (f"https://developer.download.nvidia.com/compute/cuda/repos/"
                    f"{repo_path}/{arch_seg}/cuda-keyring_1.1-1_all.deb")
@@ -7404,8 +7486,8 @@ def _bootstrap_cuda_via_pypi_wheels(stream) -> bool:
             preferred = "cu12"
         elif v.startswith("11"):
             preferred = "cu11"
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_bootstrap_cuda_via_pypi_wheels', _swexc)
     seen: List[str] = []
     for tag in (preferred, "cu12", "cu11"):
         if tag in seen:
@@ -7501,6 +7583,7 @@ def bootstrap_cuda_toolkit(stream=None, arch: Optional[str] = None) -> bool:
             else:
                 ok = fn(stream)
         except Exception as exc:
+            _debug_swallow('bootstrap_cuda_toolkit', exc)
             stream.write(f"[bootstrap] {name} raised {type(exc).__name__}: "
                          f"{exc}\n")
             tried.append(f"{name} (errored)")
@@ -7594,7 +7677,8 @@ def _bootstrap_rocm_via_amd_apt_repo(stream, arch: str) -> bool:
                     if _line.startswith("VERSION_CODENAME="):
                         codename = _line.strip().split("=", 1)[1].strip('"')
                         break
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_bootstrap_rocm_via_amd_apt_repo', _swexc)
             codename = ""
         if not codename:
             stream.write("[bootstrap_rocm:apt] could not determine distro "
@@ -7702,6 +7786,7 @@ def bootstrap_rocm_toolkit(stream=None, arch: str = "gfx942") -> bool:
         try:
             ok = fn(stream, arch)
         except Exception as exc:
+            _debug_swallow('bootstrap_rocm_toolkit', exc)
             stream.write(f"[bootstrap_rocm] {name} raised "
                          f"{type(exc).__name__}: {exc}\n")
             tried.append(f"{name} (errored)")
@@ -7750,6 +7835,7 @@ def bootstrap_jax_tpu(stream=None, arch: str = "tpu_v6e") -> bool:
     except (ImportError, RuntimeError):
         pass
     except Exception as exc:
+        _debug_swallow('bootstrap_jax_tpu', exc)
         stream.write(f"[bootstrap_jax] jax.devices() raised "
                      f"{type(exc).__name__}: {exc}; continuing to install\n")
     # Pick a minimum jax version per arch from ARCH_TABLE.
@@ -7777,8 +7863,8 @@ def bootstrap_jax_tpu(stream=None, arch: str = "tpu_v6e") -> bool:
         if "jax" in sys.modules:
             try:
                 importlib.reload(sys.modules["jax"])
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('bootstrap_jax_tpu', _swexc)
         import jax
         devs = jax.devices()
         ok = any(getattr(d, "platform", "") == "tpu" for d in devs)
@@ -7877,8 +7963,8 @@ def _preflight_toolchain(arch: str,
                                               timeout=10).strip().splitlines()
                 if out:
                     lines.append(f"[preflight] {out[-1]}")
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_preflight_toolchain', _swexc)
             # Hard requirement: each CUDA arch has a min nvcc version (see
             # ARCH_TABLE[arch].min_toolchain_version). Warn loudly if the
             # detected nvcc is too old — otherwise the build dies with
@@ -7932,6 +8018,7 @@ def _preflight_toolchain(arch: str,
             import jax  # noqa: F401
             lines.append(f"[preflight] jax={jax.__version__}")
         except Exception as e:
+            _debug_swallow('_preflight_toolchain', e)
             lines.append(
                 f"[preflight] WARNING: jax not importable: {e}. "
                 "For TPU, pip install 'jax[tpu]' -f "
@@ -8057,10 +8144,10 @@ def _preflight_toolchain(arch: str,
                     f"[preflight] suggestion: {fix_clause} — no alternate "
                     f"arch in ARCH_TABLE is compatible with {have_str}"
                 )
-        except Exception:
+        except Exception as _swexc:
             # Suggestion is advisory — never let it block the preflight
             # output that callers actually need.
-            pass
+            _debug_swallow('_preflight_toolchain', _swexc)
 
     # ── Agent-F2 — dry-run flag-probe pass ───────────────────────────
     # Only runs when:
@@ -8121,6 +8208,7 @@ def _preflight_toolchain(arch: str,
                         f"{entry.vendor} compiler not on PATH")
     except Exception as exc:  # noqa: BLE001
         # Flag-probe is advisory — never let it abort preflight.
+        _debug_swallow('_preflight_toolchain', exc)
         lines.append(
             f"[preflight] flag-probe: skipped due to error "
             f"({type(exc).__name__}: {exc})")
@@ -8238,10 +8326,10 @@ def _dry_run_all_archs(out_dir: Path,
         if config:
             try:
                 apply_to_buildspec(spec, config)
-            except Exception:
+            except Exception as _swexc:
                 # apply_to_buildspec is best-effort; a malformed user
                 # config must never abort the sweep.
-                pass
+                _debug_swallow('_dry_run_all_archs', _swexc)
         # Thread opt-in feature toggles onto the per-arch spec so they
         # influence any downstream config-dependent flag emission AND so
         # ``enabled_features`` (below) reports the effective state. Any
@@ -8267,6 +8355,7 @@ def _dry_run_all_archs(out_dir: Path,
         try:
             preflight_lines = list(_preflight_toolchain(arch, spec))
         except Exception as exc:  # noqa: BLE001 — preflight must never abort sweep
+            _debug_swallow('_dry_run_all_archs', exc)
             preflight_lines = [f"[preflight] arch={arch} EXCEPTION {exc!r}"]
         # Parse PASS / FAIL from the per-arch judgment line(s).
         for ln in preflight_lines:
@@ -8285,6 +8374,7 @@ def _dry_run_all_archs(out_dir: Path,
             resolved = _resolve_sources(spec)
             sources = [str(p) for p in resolved]
         except Exception as exc:  # noqa: BLE001 — one arch failure must not abort
+            _debug_swallow('_dry_run_all_archs', exc)
             resolve_error = f"{type(exc).__name__}: {exc}"
 
         # --- flag emission (host / device / ld) ---
@@ -8297,15 +8387,18 @@ def _dry_run_all_archs(out_dir: Path,
         try:
             host_cflags = list(_host_cflags(spec))
         except Exception as exc:  # noqa: BLE001
+            _debug_swallow('_dry_run_all_archs', exc)
             cflag_error = f"host_cflags: {type(exc).__name__}: {exc}"
         try:
             device_cflags = list(_device_cflags(spec))
         except Exception as exc:  # noqa: BLE001
+            _debug_swallow('_dry_run_all_archs', exc)
             cflag_error = (cflag_error or "") + (
                 f"; device_cflags: {type(exc).__name__}: {exc}")
         try:
             ldflags = list(_ldflags(spec))
         except Exception as exc:  # noqa: BLE001
+            _debug_swallow('_dry_run_all_archs', exc)
             cflag_error = (cflag_error or "") + (
                 f"; ldflags: {type(exc).__name__}: {exc}")
         # Group A.4 — surface device-link-only flags (nvcc -dlink step)
@@ -8316,6 +8409,7 @@ def _dry_run_all_archs(out_dir: Path,
         try:
             device_ldflags = list(_device_ldflags(spec))
         except Exception as exc:  # noqa: BLE001 — never abort sweep
+            _debug_swallow('_dry_run_all_archs', exc)
             cflag_error = (cflag_error or "") + (
                 f"; device_ldflags: {type(exc).__name__}: {exc}")
         # Group A.5 — surface version-gated device cflags from
@@ -8328,6 +8422,7 @@ def _dry_run_all_archs(out_dir: Path,
             _vgh, _vgd = _newer_compiler_flags(arch)
             version_gated_device_cflags = list(_vgd)
         except Exception as exc:  # noqa: BLE001 — never abort sweep
+            _debug_swallow('_dry_run_all_archs', exc)
             cflag_error = (cflag_error or "") + (
                 f"; version_gated_device_cflags: "
                 f"{type(exc).__name__}: {exc}")
@@ -8397,6 +8492,7 @@ def _dry_run_all_archs(out_dir: Path,
             try:
                 manifest["xla_env"] = _xla_env(arch, out_dir)
             except Exception as exc:  # noqa: BLE001 — never abort sweep
+                _debug_swallow('_dry_run_all_archs', exc)
                 manifest["xla_env"] = {}
                 manifest["xla_env_error"] = (
                     f"{type(exc).__name__}: {exc}")
@@ -8411,6 +8507,7 @@ def _dry_run_all_archs(out_dir: Path,
         try:
             sidecar.write_text(json.dumps(manifest, indent=2, sort_keys=True))
         except Exception as exc:  # noqa: BLE001 — sidecar IO must not abort sweep
+            _debug_swallow('_dry_run_all_archs', exc)
             manifest["sidecar_write_error"] = f"{type(exc).__name__}: {exc}"
 
         manifests[arch] = manifest
@@ -9692,18 +9789,19 @@ def _probe_jax_version_string() -> Optional[str]:
     """Return ``jax.__version__`` + jaxlib version, or None on import failure."""
     try:
         import jax  # type: ignore
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_probe_jax_version_string', _swexc)
         return None
     bits: List[str] = []
     try:
         bits.append(f"jax {jax.__version__}")
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_probe_jax_version_string', _swexc)
     try:
         import jaxlib  # type: ignore
         bits.append(f"jaxlib {jaxlib.__version__}")
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_probe_jax_version_string', _swexc)
     return " | ".join(bits) if bits else None
 
 
@@ -9724,7 +9822,8 @@ def _disk_free_human(path: Path) -> str:
                 usage = shutil.disk_usage(str(p))
             else:
                 return "<unknown>"
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_disk_free_human', _swexc)
             return "<unknown>"
 
     def _h(n: int) -> str:
@@ -9820,8 +9919,8 @@ def _emit_flag_trace_block(label: str,
         f"{skipped} skipped due to version gates\n")
     try:
         stream.flush()
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_emit_flag_trace_block', _swexc)
 
 
 def _trace_enabled(spec: Optional["BuildSpec"]) -> bool:
@@ -9841,7 +9940,8 @@ def _trace_enabled(spec: Optional["BuildSpec"]) -> bool:
     try:
         return bool(getattr(spec, "debug", False)
                     or getattr(spec, "debug_symbols", False))
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_trace_enabled', _swexc)
         return False
 
 # ---------------------------------------------------------------------------
@@ -10302,13 +10402,15 @@ def _probe_torch_cuda_arch() -> Optional[str]:
     library missing) — callers must treat None as "try the next source"."""
     try:
         import torch  # noqa: F401
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_probe_torch_cuda_arch', _swexc)
         return None
     try:
         if not torch.cuda.is_available():
             return None
         major, minor = torch.cuda.get_device_capability(0)
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_probe_torch_cuda_arch', _swexc)
         return None
     suffixed = f"sm_{major}{minor}a"
     plain = f"sm_{major}{minor}"
@@ -10331,7 +10433,8 @@ def _probe_rocm_smi_arch() -> Optional[str]:
             [rocm_smi, "--showproductname"],
             capture_output=True, text=True, timeout=10,
         ).stdout
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_probe_rocm_smi_arch', _swexc)
         return None
     if not out:
         return None
@@ -10349,11 +10452,13 @@ def _probe_jax_tpu_arch() -> Optional[str]:
     ``tpu_vN[e|p]`` entry in ARCH_TABLE. Returns None on any failure."""
     try:
         import jax  # noqa: F401
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_probe_jax_tpu_arch', _swexc)
         return None
     try:
         devs = jax.devices()
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_probe_jax_tpu_arch', _swexc)
         return None
     for d in devs:
         if getattr(d, "platform", "") != "tpu":
@@ -10413,7 +10518,8 @@ def _resolve_default_arch(
     # 1. torch.cuda
     try:
         arch = _probe_torch_cuda_arch()
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_resolve_default_arch', _swexc)
         arch = None
     if arch:
         stream.write(f"[arch] auto-detected {arch} from "
@@ -10423,7 +10529,8 @@ def _resolve_default_arch(
     # 2. rocm-smi
     try:
         arch = _probe_rocm_smi_arch()
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_resolve_default_arch', _swexc)
         arch = None
     if arch:
         stream.write(f"[arch] auto-detected {arch} from "
@@ -10433,7 +10540,8 @@ def _resolve_default_arch(
     # 3. jax.devices (TPU)
     try:
         arch = _probe_jax_tpu_arch()
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_resolve_default_arch', _swexc)
         arch = None
     if arch:
         stream.write(f"[arch] auto-detected {arch} from "
@@ -10444,7 +10552,8 @@ def _resolve_default_arch(
     if isinstance(config, dict):
         try:
             cfg_arch = config.get("archs", {}).get("default") or None
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_resolve_default_arch', _swexc)
             cfg_arch = None
         if cfg_arch:
             # Group B9 — validate against ARCH_TABLE before returning so a
@@ -10745,6 +10854,47 @@ def _newer_compiler_flags(arch: str, report=None,
 # Build driver — torch.utils.cpp_extension.load with ninja
 # ---------------------------------------------------------------------------
 
+def _render_repro_state(spec, host_cflags, device_cflags, ldflags,
+                        sources, env_overlay_dict=None) -> str:
+    """Fix-#2 Defect-2 — the §2A reproduction-state payload for a crashing
+    build/oracle. Returns a block listing the resolved host+device flags,
+    arch, optimizer/model/dtype/shape config, the source files, and the
+    relevant environment (CUDA/HIP/JAX home + compiler-cache state) so the
+    failing invocation is reproducible from the crash output alone."""
+    lines = ["\n[repro-state — §2A reproducible context]"]
+    lines.append(f"  arch:       {getattr(spec, 'arch', '?')}")
+    lines.append(f"  optimizer:  {getattr(spec, 'optimizer', '?')}")
+    lines.append(f"  model:      {getattr(spec, 'model', '?')}")
+    # dtype / shape are oracle-side concepts; include when the spec carries
+    # them (best-effort — absent for a pure build crash).
+    for attr in ("dtype", "shape", "fused_op_template", "macro_prefix",
+                 "cross_host", "cross_host_march"):
+        if hasattr(spec, attr):
+            lines.append(f"  {attr+':':12}{getattr(spec, attr)}")
+    lines.append(f"  host_cflags:   {' '.join(map(str, host_cflags or []))}")
+    lines.append(f"  device_cflags: {' '.join(map(str, device_cflags or []))}")
+    lines.append(f"  ldflags:       {' '.join(map(str, ldflags or []))}")
+    try:
+        lines.append(f"  include_paths: {' '.join(_include_paths(spec))}")
+    except Exception as exc:  # never let the repro dump itself crash
+        _debug_swallow("_render_repro_state.include_paths", exc)
+    lines.append(f"  sources ({len(sources or [])}):")
+    for s in (sources or []):
+        lines.append(f"    {s}")
+    # Relevant environment: toolchain homes + compiler-cache state.
+    env_keys = ("CUDA_HOME", "CUDA_PATH", "ROCM_HOME", "ROCM_PATH",
+                "HIP_PATH", "JAX_PLATFORMS", "CC", "CXX", "CCACHE_DIR",
+                "SCCACHE_DIR", "SCCACHE_REDIS_ENDPOINT", "TORCH_CUDA_ARCH_LIST")
+    env_view = dict(os.environ)
+    if env_overlay_dict:
+        env_view.update({k: str(v) for k, v in env_overlay_dict.items()})
+    lines.append("  env:")
+    for k in env_keys:
+        if k in env_view:
+            lines.append(f"    {k}={env_view[k]}")
+    return "\n".join(lines) + "\n"
+
+
 def _summarize_build_failure(exc, collected_text, module_name, elapsed, arch):
     """Build a list of human-readable summary lines for a failed build.
 
@@ -10875,8 +11025,8 @@ def _summarize_build_failure(exc, collected_text, module_name, elapsed, arch):
         import torch
         if torch.cuda.is_available():
             detected_gpu = torch.cuda.get_device_name(0)
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_summarize_build_failure', _swexc)
     # Only suggest "wrong arch" when the failure plausibly looks like
     # an arch / capability mismatch — otherwise it's noise on flag
     # / linker / source-file errors that have nothing to do with arch.
@@ -10969,8 +11119,8 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
                 if _lp.is_file():
                     try:
                         _collected.append(_lp.read_text(errors="replace"))
-                    except Exception:
-                        pass
+                    except Exception as _swexc:
+                        _debug_swallow('_torch_load', _swexc)
             try:
                 _sum_lines = _summarize_build_failure(
                     exc, "\n".join(_collected),
@@ -10981,6 +11131,17 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
             except Exception as _sum_exc:
                 report.write(f"\n[failure summary builder errored: "
                              f"{_sum_exc}]\n")
+            # Fix-#2 Defect-2 — §2A repro state: a build crash must be fixable
+            # from its OUTPUT ALONE, not just locatable. Dump the resolved
+            # flags / arch / config / sources / env so the exact invocation
+            # can be reproduced without re-deriving it.
+            try:
+                report.write(_render_repro_state(
+                    spec, host_cflags, device_cflags, ldflags, sources,
+                    overlay))
+            except Exception as _state_exc:
+                report.write(f"\n[repro-state builder errored: "
+                             f"{_state_exc}]\n")
             report.write(f"\n[build FAILED after {elapsed:.1f}s]\n{exc}\n")
             # Surface the actual compiler/linker error that torch's
             # cpp_extension swallowed. Look in the build directory for
@@ -10990,8 +11151,8 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
                 tb_str = _tb.format_exc()
                 report.write("\n[build FAILED — full traceback]\n")
                 report.write(tb_str)
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_torch_load', _swexc)
             # Dump every log-like file in the build dir
             for log_name in ("build.ninja", ".ninja_log", "build.log",
                              "compile_commands.json"):
@@ -11037,8 +11198,8 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
                         first_line = (ver.stdout or ver.stderr).splitlines()[:1]
                         if first_line:
                             report.write(f"    -> {first_line[0]}\n")
-                    except Exception:
-                        pass
+                    except Exception as _swexc:
+                        _debug_swallow('_torch_load', _swexc)
             cuda_home = os.environ.get("CUDA_HOME", "")
             if cuda_home:
                 report.write(f"\n[CUDA_HOME probe: {cuda_home}]\n")
@@ -11076,8 +11237,8 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
             parsed = _parse_ptxas_v_stderr(captured)
             if parsed:
                 _LAST_PTXAS_INFO_BY_BUILD_DIR[str(build_dir)] = parsed
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_torch_load', _swexc)
     return so
 
 
@@ -11821,7 +11982,8 @@ def _dump_variant_output(variant_so: Path, opt_class: str, size: int,
         r = subprocess.run([sys.executable, "-c", script],
                            capture_output=True, text=True, timeout=timeout)
         return r.returncode == 0 and out_path.exists()
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_dump_variant_output', _swexc)
         return False
 
 
@@ -11894,8 +12056,8 @@ def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
             spec._emitted_sources[config_key(config)] = emitted_path
             macros_only = resolve_macros(config, dims, target)
             return macros_only + residual
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('_variant_macros', _swexc)
     macros = resolve_macros(config, dims, target)
     if target != "device":
         return macros
@@ -12174,7 +12336,8 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                     feat = featurize_config(config, dims, arch_entry_cm,
                                             stall_info_cm)
                     ms_pred, sigma_pred = reg.predict(feat)
-                except Exception:
+                except Exception as _swexc:
+                    _debug_swallow('timer', _swexc)
                     ms_pred, sigma_pred = float("inf"), float("inf")
                 best = cost_model_state.get("best_so_far",
                                             float("inf")) or float("inf")
@@ -12242,8 +12405,8 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                 report.write(
                     f"    [polyhedral] hook failed for {ckey[:24]}: "
                     f"{type(exc).__name__}: {exc}\n")
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('timer', _swexc)
 
         # Per-variant flush of the running ETA window.
         progress_state["last_start"] = time.monotonic()
@@ -12323,8 +12486,8 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
             parsed = _LAST_PTXAS_INFO_BY_BUILD_DIR.pop(bdir, None)
             if parsed:
                 _LAST_PTXAS_INFO[ckey] = parsed
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('timer', _swexc)
 
         # Tell the inline timing script to dump the post-step param tensor
         # so we can numerically compare against the reference. The env var
@@ -12735,8 +12898,8 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
         if worker is not None:
             try:
                 worker.stop()
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_jit_autotune', _swexc)
     # Stamp the clock-lock provenance onto the winning cache entry.
     if winning is not None:
         try:
@@ -13027,8 +13190,8 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
                                 f"measured={tms_f:.4f}ms "
                                 f"rel_err={_abs_err * 100:.1f}% "
                                 f"(n_measured={cost_model_state['n_measured']})\n")
-                    except Exception:
-                        pass
+                    except Exception as _swexc:
+                        _debug_swallow('_cm_wrapped_timer', _swexc)
                 cm_trial_buffer.append({"config": cfg, "timing_ms": tms_f})
                 cm_state["since_last_train"] += 1
                 # Cold start: gather 2x retrain_every signals before the
@@ -13054,7 +13217,8 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
                                     row["config"], dims, cm_arch_entry, None)
                                 pred_ms, _ = sib.predict(feat)
                                 seed_preds.append((feat, float(pred_ms)))
-                        except Exception:
+                        except Exception as _swexc:
+                            _debug_swallow('_cm_wrapped_timer', _swexc)
                             seed_preds = None
                     new_reg = _cost_model_train_from_trials(
                         cm_trial_buffer, dims, cm_arch_entry,
@@ -13077,8 +13241,8 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
                             entry["cost_model_backend"] = new_reg._backend
                             entry["cost_model_n_fit_calls"] = \
                                 new_reg._n_fit_calls
-                        except Exception:
-                            pass
+                        except Exception as _swexc:
+                            _debug_swallow('_cm_wrapped_timer', _swexc)
                         report.write(
                             f"  [cost-model] retrained "
                             f"(n={len(cm_trial_buffer)}, "
@@ -13108,7 +13272,8 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
         if stall_info_for_bias is None:
             try:
                 stall_info_for_bias = read_stall_sidecar(spec.out_dir)
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('_cm_wrapped_timer', _swexc)
                 stall_info_for_bias = None
         if stall_info_for_bias is not None:
             report.write(
@@ -13424,7 +13589,8 @@ def _write_tuned_configs_header(combo: Dict[str, Any], optimizer: str,
     try:
         space = load_embedded_search_space()
         dims = space.get(arch, {}).get("dims", [])
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_write_tuned_configs_header', _swexc)
         dims = []
     name_to_macro = {d["name"]: d.get("macro") for d in dims}
     for k, v in combo.items():
@@ -13824,7 +13990,8 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
                                       spec=spec, arch=spec.arch)
         extra_device = _variant_macros(tuned, dims, "device",
                                         spec=spec, arch=spec.arch)
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('build_jit', _swexc)
         for k, v in tuned.items():
             if k in ("timing_ms", "config_key", "stage_won"):
                 continue
@@ -14091,8 +14258,8 @@ def build(
     try:
         if enable_cost_model:
             spec.enable_cost_model = True
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('build', _swexc)
 
     # Stream 11: optionally load project config and apply to spec. Strictly
     # backward-compatible — if no override is present in the config, the
@@ -14105,22 +14272,23 @@ def build(
             )
             _cfg_arg = config if isinstance(config, (str, Path)) else None
             project_cfg = _load_cfg(Path(_cfg_arg) if _cfg_arg else None)
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('build', _swexc)
             project_cfg = {}
     else:
         project_cfg = config
     try:
         from grokking_optimizers.compile_config import apply_to_buildspec as _apply_cfg2
         _apply_cfg2(spec, project_cfg)
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('build', _swexc)
     # Stream A: make sure spec.config carries the full loaded config even
     # if apply_to_buildspec couldn't (e.g. read-only spec / older signature).
     try:
         if not spec.config and isinstance(project_cfg, dict):
             spec.config = dict(project_cfg)
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('build', _swexc)
 
     # ── Group A.1 — mirror BuildSpec feature toggles into spec.config so
     # the runtime gates that read spec.config["<section>"]["enable"] (e.g.
@@ -14148,11 +14316,11 @@ def build(
                 if not isinstance(spec.config, dict):
                     spec.config = {}
                 spec.config.setdefault(_section, {})[_key] = True
-    except Exception:
+    except Exception as _swexc:
         # Read-only spec / hostile config object — never abort the build
         # over an introspection failure here. The downstream gate will
         # simply read False (the historical behaviour pre-mirror).
-        pass
+        _debug_swallow('build', _swexc)
 
     _validate(spec)
     spec.out_dir.mkdir(parents=True, exist_ok=True)
@@ -14220,18 +14388,20 @@ def build(
                     f"<toolchain probe failed; need "
                     f"{'.'.join(str(x) for x in _need)}>")
         except Exception as _vex:
+            _debug_swallow('build', _vex)
             _verdict = f"<error: {_vex}>"
         # Cache stats — entry count for this run.
         _cache_entries = 0
         try:
             _cache_entries = len(cache._data.get("entries", {}))
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('build', _swexc)
         # Free disk space at <out_dir> and ~/.cache/<project>/nvrtc.
         _df_out = _disk_free_human(spec.out_dir)
         try:
             _pkg = spec.python_package or "grokking_optimizers"
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('build', _swexc)
             _pkg = "grokking_optimizers"
         _nvrtc_cache = Path.home() / ".cache" / _pkg / "nvrtc"
         _df_nvrtc = _disk_free_human(_nvrtc_cache)
@@ -14356,8 +14526,8 @@ def build(
                             _art = _e.get("primary_artifact") if _e else None
                             if _art and _art.get("path"):
                                 spec.aot_so_path = Path(_art["path"])
-                        except Exception:
-                            pass
+                        except Exception as _swexc:
+                            _debug_swallow('build', _swexc)
                     so_path = build_jit(spec, cache, report) or so_path
                     step("jit-autotune")
                 if runtime in ("jit", "both"):
@@ -14382,8 +14552,8 @@ def build(
                 report.write("\n" + msg)
                 try:
                     sys.stderr.write(msg)
-                except Exception:
-                    pass
+                except Exception as _swexc:
+                    _debug_swallow('build', _swexc)
             if profile and runtime != "aot" and not build_produced_nothing:
                 report.write("\n--- PROFILE PASS ---\n")
                 if entry.vendor == "pallas":
@@ -14517,8 +14687,8 @@ def _flag_audit_main(argv: List[str]) -> int:
         _mds = _resolve_enabled_models(_fa_cfg)
         if _mds:
             _fa_model0 = _mds[0]
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_flag_audit_main', _swexc)
     audit_path = out_dir / "flag_audit.txt"
     try:
         audit_fh = open(audit_path, "w")
@@ -14579,6 +14749,7 @@ def _flag_audit_main(argv: List[str]) -> int:
                 try:
                     fn(trace)
                 except Exception as _exc:
+                    _debug_swallow('_flag_audit_main', _exc)
                     trace.append(
                         (f"(EXC: {type(_exc).__name__}: {_exc})",
                          "skipped", "helper raised — sweep continues"))
@@ -14736,7 +14907,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 Path(_dry_cfg_path) if _dry_cfg_path else None)
         except FileNotFoundError:
             raise
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('main', _swexc)
             _dry_cfg = {}
         manifests = _dry_run_all_archs(
             out_dir, config=_dry_cfg,
@@ -15286,7 +15458,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             Path(_cfg_path_final) if _cfg_path_final else None)
     except FileNotFoundError:
         raise
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('main', _swexc)
         project_cfg = {}
     # Note: we deliberately do NOT auto-override args.arch, even when
     # archs.default is set — that would surprise users who passed --arch.
@@ -15552,7 +15725,8 @@ def _e2e_smoke(out_dir: Path, *, max_seconds: float = 120.0) -> int:
         try:
             mtime = tuned_h.stat().st_mtime
             a3_ok = mtime >= smoke_start - 1.0  # 1s slop for clock skew
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_e2e_smoke', _swexc)
             a3_ok = False
         mtime_repr = (datetime.datetime.fromtimestamp(mtime).isoformat()
                       if a3_ok or tuned_h.exists() else "n/a")
@@ -15579,11 +15753,13 @@ def _e2e_smoke(out_dir: Path, *, max_seconds: float = 120.0) -> int:
                 _torch.ops.load_library(str(so))
                 a4_ok = True
                 a4_detail = "torch.ops.load_library OK"
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('_e2e_smoke', _swexc)
                 ctypes.CDLL(str(so))
                 a4_ok = True
                 a4_detail = "ctypes.CDLL OK"
         except Exception as exc:
+            _debug_swallow('_e2e_smoke', exc)
             a4_detail = f"load failed: {exc}"
     sys.stdout.write(
         f"[e2e-smoke] assert so_loads: "
@@ -17946,6 +18122,171 @@ def _self_test_fastmath_integration(run) -> None:
         test_fastmath_wired_into_sweep_drivers)
     run("origin_constants_single_source_of_truth",
         test_origin_constants_single_source_of_truth)
+
+
+def _self_test_silent_degradation(run) -> None:
+    """`[self-test] silent_degradation` section (Fix-#2 Defect-2): no silent
+    broad-except; calibration failure is loud; crash dump carries §2A state."""
+    import io
+    import contextlib
+    sys.stdout.write("[self-test] silent_degradation\n")
+
+    def test_debug_swallow_quiet_default_loud_at_debug():
+        g = globals()
+        saved = g["_COMPILE_LOG_LEVEL"]
+        try:
+            g["_COMPILE_LOG_LEVEL"] = 0
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                _debug_swallow("comp", ValueError("x"))
+            assert buf.getvalue() == "", "must be quiet at level 0"
+            g["_COMPILE_LOG_LEVEL"] = 2
+            buf2 = io.StringIO()
+            with contextlib.redirect_stderr(buf2):
+                _debug_swallow("comp", ValueError("boom"), "detail")
+            out = buf2.getvalue()
+            assert "comp" in out and "ValueError" in out and "detail" in out, out
+        finally:
+            g["_COMPILE_LOG_LEVEL"] = saved
+
+    def _bare_pool():
+        pool = MultiGPUTimingPool.__new__(MultiGPUTimingPool)
+        pool.vendor = "cuda"
+        pool.devices = ["0", "1"]
+        pool._calib_factors = [1.0, 1.0]
+        return pool
+
+    def test_calibration_failure_warns_not_silent():
+        """Defect-2 priority — a per-device calibration failure emits a
+        WARNING naming the device; it is NOT swallowed silently."""
+        class _FailW:
+            def calibrate(self, **kw):
+                raise RuntimeError("boom")
+
+        class _OkW:
+            def calibrate(self, **kw):
+                return 1.0
+        pool = _bare_pool()
+        pool.workers = [_FailW(), _OkW()]
+        rep = io.StringIO()
+        factors = pool.calibrate(report=rep)
+        log = rep.getvalue()
+        assert "WARNING" in log and "gpu0 calibration FAILED" in log, log
+        assert factors[0] == 1.0  # failed device → no correction
+
+    def test_calibration_total_failure_raises_when_required():
+        """Defect-2 — total calibration failure in a cross-GPU mode
+        (require=True) RAISES rather than returning a degenerate all-1.0
+        calibration silently; without require it warns loudly."""
+        class _FailW:
+            def calibrate(self, **kw):
+                raise RuntimeError("boom")
+        pool = _bare_pool()
+        pool.workers = [_FailW(), _FailW()]
+        try:
+            pool.calibrate(report=io.StringIO(), require=True)
+            raise AssertionError("expected RuntimeError on total cal failure")
+        except RuntimeError as exc:
+            assert "ALL" in str(exc), str(exc)
+        rep = io.StringIO()
+        f = pool.calibrate(report=rep)
+        assert f == [1.0, 1.0] and "WARNING" in rep.getvalue()
+
+    def test_require_calibration_kwarg_isolated_from_worker():
+        """The require_calibration kwarg is popped before TimingWorker
+        construction (which would reject the unknown keyword)."""
+        saved = os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        try:
+            pool = MultiGPUTimingPool("Lion", vendor="cuda",
+                                      require_calibration=True,
+                                      enable_watchdog=False)
+            assert pool._require_calibration is True
+            assert len(pool.workers) >= 1  # workers built (kwarg didn't leak)
+        finally:
+            if saved is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = saved
+
+    def test_repro_state_payload_complete():
+        """Defect-2 — the §2A crash payload contains resolved host+device
+        flags, arch, optimizer/model config, sources, and env, so a build
+        crash is fixable from its output alone."""
+        spec = BuildSpec(optimizer="adamw", model="decoder", arch="sm_90a",
+                         out_dir=Path("/tmp"))
+        payload = _render_repro_state(
+            spec, ["-O3", "-ffoo"],
+            ["--use_fast_math", "-Xptxas", "-v"], ["-flto"],
+            [Path("/x/k.cu")], {"CC": "ccache cc"})
+        for needle in ("arch:", "sm_90a", "optimizer:", "adamw", "model:",
+                       "decoder", "host_cflags:", "-ffoo", "device_cflags:",
+                       "--use_fast_math", "ldflags:", "-flto", "sources",
+                       "k.cu", "env:", "CC=ccache cc"):
+            assert needle in payload, (needle, payload[:600])
+
+    def test_no_silent_broad_except_in_production():
+        """Defect-2 acceptance — AST proof: zero broad except handlers in
+        NON-TEST code whose body is pass/continue with no log and no raise."""
+        import ast as _ast
+        src = Path(__file__).read_text()
+        tree = _ast.parse(src)
+        LOG = ("report.write", "sys.stderr.write", "sys.stdout.write",
+               "logging", "_trace_add", "warnings.warn", "_log(", "._log(",
+               "print(", "_codegen_report_log", "_error_log.append",
+               "stderr.write", "_debug_swallow")
+
+        def broad(h):
+            if h.type is None:
+                return True
+            t = h.type
+            n = ([t.id] if isinstance(t, _ast.Name)
+                 else [e.id for e in t.elts if isinstance(e, _ast.Name)]
+                 if isinstance(t, _ast.Tuple) else [])
+            return "Exception" in n or "BaseException" in n
+
+        def haslr(h):
+            for nd in _ast.walk(_ast.Module(body=h.body, type_ignores=[])):
+                if isinstance(nd, _ast.Raise):
+                    return True
+                if isinstance(nd, _ast.Call):
+                    seg = _ast.get_source_segment(src, nd) or ""
+                    if any(m in seg for m in LOG):
+                        return True
+            return False
+        defs = sorted([(n.lineno, n.name) for n in _ast.walk(tree)
+                       if isinstance(n, (_ast.FunctionDef,
+                                         _ast.AsyncFunctionDef))])
+
+        def enc(ln):
+            nm = "<module>"
+            for dl, dn in defs:
+                if dl <= ln:
+                    nm = dn
+                else:
+                    break
+            return nm
+        offenders = []
+        for node in _ast.walk(tree):
+            if (isinstance(node, _ast.ExceptHandler) and broad(node)
+                    and not haslr(node)):
+                b = node.body
+                silent_passcont = (len(b) == 1 and isinstance(
+                    b[0], (_ast.Pass, _ast.Continue)))
+                fn = enc(node.lineno)
+                istest = fn.startswith("_self_test") or fn.startswith("test_")
+                if silent_passcont and not istest:
+                    offenders.append((node.lineno, fn))
+        assert not offenders, f"silent pass/continue broad-excepts: {offenders}"
+
+    run("debug_swallow_quiet_default_loud_at_debug",
+        test_debug_swallow_quiet_default_loud_at_debug)
+    run("calibration_failure_warns_not_silent",
+        test_calibration_failure_warns_not_silent)
+    run("calibration_total_failure_raises_when_required",
+        test_calibration_total_failure_raises_when_required)
+    run("require_calibration_kwarg_isolated",
+        test_require_calibration_kwarg_isolated_from_worker)
+    run("repro_state_payload_complete", test_repro_state_payload_complete)
+    run("no_silent_broad_except_in_production",
+        test_no_silent_broad_except_in_production)
 
 
 def _self_test_autotune_brain(run) -> None:
@@ -20773,7 +21114,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 212
+_SELF_TEST_EXPECTED_COUNT: int = 218
 
 
 def _self_test() -> int:
@@ -20814,6 +21155,7 @@ def _self_test() -> int:
     _self_test_clock_lock(_run)
     _self_test_autotune_brain(_run)
     _self_test_fastmath_integration(_run)
+    _self_test_silent_degradation(_run)
     _self_test_l2_flush(_run)
     _self_test_tier1_compile(_run)
     _self_test_discovery(_run)
@@ -22024,6 +22366,7 @@ def validate_template_render(optimizer: str, arch: str
     except CodegenError as exc:
         return False, f"CodegenError: {exc}"
     except Exception as exc:
+        _debug_swallow('validate_template_render', exc)
         return False, f"{type(exc).__name__}: {exc}"
 
 
@@ -22138,8 +22481,8 @@ def _codegen_report_log(report, msg: str) -> None:
         return
     try:
         report.write(f"[codegen] {msg}\n")
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_codegen_report_log', _swexc)
 
 
 def _enumerate_cutlass_variants(arch: str,
@@ -22186,7 +22529,8 @@ def _enumerate_cutlass_variants(arch: str,
     try:
         elem = getattr(cutlass.DataType, py_dt_name, None) \
             if hasattr(cutlass, "DataType") else None
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_curated_fallback', _swexc)
         elem = None
 
     gemm = None
@@ -22202,7 +22546,8 @@ def _enumerate_cutlass_variants(arch: str,
         try:
             gemm = cutlass.op.Gemm(**kwargs)
             break
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_curated_fallback', _swexc)
             continue
     if gemm is None:
         return _curated_fallback(
@@ -22213,7 +22558,8 @@ def _enumerate_cutlass_variants(arch: str,
         tds_fn = getattr(gemm, "tile_descriptions", None)
         if callable(tds_fn):
             tds = tds_fn()
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_curated_fallback', _swexc)
         tds = None
     if not tds:
         return _curated_fallback(
@@ -22606,11 +22952,12 @@ def _try_import_libclang():
     """
     try:
         from clang import cindex  # type: ignore
-    except Exception:
+    except Exception as _swexc:
         # Try to auto-install libclang. The pip distribution name is
         # ``libclang``; once installed, the wheel ships a ``clang``
         # Python package + bundled ``libclang.so`` so the second import
         # attempt below usually succeeds.
+        _debug_swallow('_try_import_libclang', _swexc)
         ok = _ensure_optional_dep(
             "clang", "polyhedral",
             install=_auto_install_enabled(),
@@ -22619,13 +22966,15 @@ def _try_import_libclang():
             return None
         try:
             from clang import cindex  # type: ignore
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_try_import_libclang', _swexc)
             return None
     # Index construction is what actually loads libclang.so; it can
     # raise LibclangError even when the import succeeded.
     try:
         cindex.Index.create()
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_try_import_libclang', _swexc)
         return None
     return cindex
 
@@ -22635,7 +22984,8 @@ def _try_import_islpy():
     try:
         import islpy  # type: ignore
         return islpy
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_try_import_islpy', _swexc)
         return None
 
 
@@ -22645,8 +22995,8 @@ def _poly_log(report, msg: str) -> None:
         return
     try:
         report.write(f"[polyhedral] {msg}\n")
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_poly_log', _swexc)
 
 
 def extract_loopnest_from_template(emitted_source: Path,
@@ -22753,8 +23103,8 @@ def _find_kernel_cursor(root, cindex):
                 if child.kind == CursorKind.CUDAGLOBAL_ATTR:
                     is_global = True
                     break
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('_find_kernel_cursor', _swexc)
         if is_global or spelling.startswith("launch_"):
             return c
     return None
@@ -22798,8 +23148,8 @@ def _collect_outer_loops(kernel_cursor, cindex
                             var = sub.spelling
                             break
                     break
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('_collect_outer_loops', _swexc)
         out.append((lo, hi, step, var))
         level += 1
     return out
@@ -22840,7 +23190,8 @@ def _permutation_respects_deps(perm: Tuple[int, ...],
         # Map original axis -> position in permutation.
         try:
             permuted = tuple(vec[i] if i < len(vec) else 0 for i in perm)
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_permutation_respects_deps', _swexc)
             return False
         # First non-zero must be positive.
         for c in permuted:
@@ -23012,7 +23363,8 @@ def _apply_schedule_lift_body(loopnest: "LoopNest",
             for c in cursor.walk_preorder():
                 if c.kind == CursorKind.FOR_STMT:
                     fors.append(c)
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_apply_schedule_lift_body', _swexc)
             return None
         body_cursor = None
         if fors:
@@ -23023,7 +23375,8 @@ def _apply_schedule_lift_body(loopnest: "LoopNest",
             inner_for = fors[-1]
             try:
                 children = list(inner_for.get_children())
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('_apply_schedule_lift_body', _swexc)
                 return None
             # For-stmt children: init, cond, inc, body (some kinds
             # may collapse the init). The body is the last
@@ -23043,7 +23396,8 @@ def _apply_schedule_lift_body(loopnest: "LoopNest",
         # Lift the textual extent of the body via libclang's token API.
         try:
             tokens = list(body_cursor.get_tokens())
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_apply_schedule_lift_body', _swexc)
             return None
         if not tokens:
             return None
@@ -23081,7 +23435,8 @@ def _apply_schedule_lift_body(loopnest: "LoopNest",
         if not out_lines:
             return None
         return out_lines
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_apply_schedule_lift_body', _swexc)
         return None
 
 
@@ -23273,8 +23628,8 @@ def _polyhedral_expand_variant(spec, emitted_source: Path,
             spec._emitted_sources[
                 f"{emitted_source.stem}__sched_{sched.cache_key()}"
             ] = sched_path
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('_polyhedral_expand_variant', _swexc)
         out.append(sched_path)
     if out:
         _poly_log(report,
@@ -24253,6 +24608,7 @@ def _emit_gemm_cuda(node: OpNode,
         except CodegenError as exc:
             cutlass_note = f"// CUTLASS unavailable ({exc}); using native-MMA GEMM\n"
         except Exception as exc:  # pragma: no cover — defensive
+            _debug_swallow('_emit_gemm_cuda', exc)
             cutlass_note = f"// CUTLASS dispatch failed ({type(exc).__name__}); using native-MMA GEMM\n"
 
     # Per-arch native MMA path; falls back to scalar triple-loop when
@@ -24791,7 +25147,8 @@ def _try_synth_codegen(spec: "BuildSpec",
             gemm_shape = flat_shape
     except SynthCodegenError:
         return None
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_try_synth_codegen', _swexc)
         return None
     if graph is None:
         return None
@@ -24821,7 +25178,8 @@ def _try_synth_codegen(spec: "BuildSpec",
                                 out_dir=synth_dir)
     except SynthCodegenError:
         return None
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_try_synth_codegen', _swexc)
         return None
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
     tmp.write_text(src, encoding="utf-8")
@@ -24957,7 +25315,8 @@ def _enumerate_ck_variants(arch: str,
                     f"composable_kernel.{attr_path} produced "
                     f"{len(discovered)} variants")
                 break
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_enumerate_ck_variants', _swexc)
             continue
 
     if discovered:
@@ -25346,8 +25705,8 @@ class KernelRegistry:
                         buf = bytearray(log_sz)
                         nvrtc.nvrtcGetProgramLog(prog, buf)
                         log = buf.decode("utf-8", "replace")
-                except Exception:
-                    pass
+                except Exception as _swexc:
+                    _debug_swallow('_nvrtc_compile', _swexc)
                 raise RegistryError(
                     f"NVRTC compile failed: {compile_res!r}\n{log}")
             cubin_ok = (hasattr(nvrtc, "nvrtcGetCUBINSize")
@@ -25368,8 +25727,8 @@ class KernelRegistry:
             # autotune session.
             try:
                 nvrtc.nvrtcDestroyProgram(prog)
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_nvrtc_compile', _swexc)
 
     def _hiprtc_compile(self, src: str) -> bytes:
         try:
@@ -25396,8 +25755,8 @@ class KernelRegistry:
             # Always release the hipRTC program handle (see _nvrtc_compile).
             try:
                 hiprtc.hiprtcDestroyProgram(prog)
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_hiprtc_compile', _swexc)
 
     def _load_cubin(self, cubin_path: Path, op: str):
         return _LoadedKernel(cubin_path, op, vendor=self.vendor)
@@ -25707,9 +26066,10 @@ def get_registry(arch: str,
                     proj_cfg = _DEFAULT_PROJECT_CONFIG.get("project") or {}
                     project_name = str(
                         proj_cfg.get("name") or project_name)
-            except Exception:
+            except Exception as _swexc:
                 # Defensive: any failure to read the config falls back
                 # to the historical ``supergrok`` slug.
+                _debug_swallow('get_registry', _swexc)
                 project_name = "supergrok"
             cd = (Path(os.environ.get("HOME", "/tmp"))
                   / ".cache" / project_name / "nvrtc")
@@ -25760,7 +26120,8 @@ def initialize_registry(spec, report=None, cache=None) -> Optional[KernelRegistr
                     f"[nvrtc] registry consuming tuned config "
                     f"block={tuned_cfg.get('block')} vec={tuned_cfg.get('vec')}"
                     f" unroll={tuned_cfg.get('unroll')} (#15 loop closed)\n")
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('initialize_registry', _swexc)
             tuned_cfg = None
     try:
         cache_dir = Path(spec.out_dir) / "nvrtc_cache"
@@ -25927,7 +26288,8 @@ def _parse_rocprof_csv(csv_path: Path) -> Dict[str, float]:
                         out.get("lds_bank_conflict", 0.0) + val)
                 if "valu" in kl:
                     out["valu_dep"] = out.get("valu_dep", 0.0) + val
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_parse_rocprof_csv', _swexc)
         return {}
     total = sum(out.values())
     if total <= 0:
@@ -26080,7 +26442,8 @@ def bias_trial_queue(study, stall_info: Optional[Dict[str, Any]],
                 enqueued += 1
                 if enqueued >= max_enqueued:
                     return enqueued
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('bias_trial_queue', _swexc)
                 continue
     return enqueued
 
@@ -26338,7 +26701,8 @@ def _load_toml_file(path: Path) -> Dict[str, Any]:
                 try:
                     v = eval(raw, {"__builtins__": {}},
                              {"true": True, "false": False})
-                except Exception:
+                except Exception as _swexc:
+                    _debug_swallow('_load_toml_file', _swexc)
                     v = raw.strip('"').strip("'")
                 cur[key] = v
         return data
@@ -26429,8 +26793,8 @@ def apply_to_buildspec(spec, config: Dict[str, Any]) -> None:
                 config["polyhedral"].get("enable"):
             try:
                 spec.enable_polyhedral = True
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('apply_to_buildspec', _swexc)
     # Stream C — cost model. Master switch is opt-in; per-knob copies
     # honour any non-default value supplied by the user. Missing keys
     # leave the BuildSpec defaults alone (so a TOML without [cost_model]
@@ -26551,9 +26915,9 @@ def apply_to_buildspec(spec, config: Dict[str, Any]) -> None:
     # without having to plumb a separate argument through every layer.
     try:
         spec.config = dict(config) if isinstance(config, dict) else {}
-    except Exception:
+    except Exception as _swexc:
         # Read-only spec (rare; defensive). Skip.
-        pass
+        _debug_swallow('apply_to_buildspec', _swexc)
 
 
 def project_sources(config: Dict[str, Any], vendor: str,
@@ -26613,7 +26977,8 @@ def _resolve_enabled_optimizers(
     try:
         from grokking_optimizers.profile import OPTIMIZERS as _O
         return list(_O)
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_resolve_enabled_optimizers', _swexc)
         return []
 
 
@@ -26627,7 +26992,8 @@ def _resolve_enabled_models(
     try:
         from grokking_optimizers.profile import MODELS as _M
         return list(_M)
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_resolve_enabled_models', _swexc)
         return []
 
 
@@ -26641,7 +27007,8 @@ def _resolve_allowed_archs(
     try:
         from grokking_optimizers.profile import ARCHES as _A
         return list(_A)
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_resolve_allowed_archs', _swexc)
         return []
 
 
