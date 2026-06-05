@@ -137,20 +137,23 @@ if _HAS_JAX:
 
     def muon_adamw_update(params, grads, exp_avg, exp_avg_sq, step,
                           beta1=0.9, beta2=0.98, lr=1e-3, wd=1.0, eps=1e-8):
-        # The Muon launcher's Newton-Schulz path is the matrix (2-D) update;
-        # ``launch_muon_step`` handles 2-D NS + the 1-D AdamW-style momentum
-        # fallback. The fused param tree here stacks layers (rank >= 3), where
-        # the orthogonalisation is undefined, so we apply the AdamW tail that
-        # the former ``muon_adamw_update`` used for non-2D params -- the real
-        # Muon non-matrix update -- over the full state pytree.
-        g = grads.astype(jnp.float32)
-        new_m = beta1 * exp_avg + (1.0 - beta1) * g
-        new_v = beta2 * exp_avg_sq + (1.0 - beta2) * (g * g)
-        bc1 = 1.0 - beta1 ** step
-        bc2 = 1.0 - beta2 ** step
-        update = (new_m / bc1) / (jnp.sqrt(new_v / bc2) + eps)
-        new_p = params.astype(jnp.float32) - lr * (update + wd * params)
-        return new_p, new_m, new_v
+        # Real Muon, delegated to the canonical per-tensor launcher. The fused
+        # composition applies this leaf-wise (``tree_map`` over the param tree),
+        # so each call here receives ONE parameter tensor of its natural rank --
+        # there is no rank>=3 layer-stacking. ``launch_muon_step`` is the source
+        # of truth that the sm_90/gfx942 Muon kernels mirror: it does the 2-D
+        # Newton-Schulz orthogonalization (the whole point of Muon) and the 1-D
+        # plain-momentum fallback. (The former stub applied plain AdamW to every
+        # leaf and never orthogonalized -- it was not Muon at all.)
+        #
+        # Muon's state is a single SGD-momentum buffer; we carry it in
+        # ``exp_avg`` and pass ``exp_avg_sq`` through untouched (Muon has no
+        # second moment) so the state-tree shape the composition expects is
+        # preserved. ``beta1`` is Muon's momentum; ``wd`` is decoupled decay.
+        new_param, new_buf = launch_muon_step(
+            params, exp_avg, grads, lr, beta1, wd, ns_steps=5,
+        )
+        return new_param, new_buf, exp_avg_sq
 
     def neuralgrok_update(params, grads, exp_avg, exp_avg_sq, step,
                           W1, b1, W_last, b_last,

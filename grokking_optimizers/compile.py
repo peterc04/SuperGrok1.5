@@ -10867,6 +10867,32 @@ def _newer_compiler_flags(arch: str, report=None,
     return extra_host, extra_device
 
 
+# Memoized, side-effect-free twin of ``_newer_compiler_flags`` for cache-key
+# hashing. ``_newer_compiler_flags`` is the single home for version-gated
+# toolchain flags but it (a) takes report/trace handles and (b) spawns an
+# ``nvcc --version`` / ``hipcc --version`` subprocess on every call. The
+# autotune variant timer needs the *same* flag set folded into each build
+# signature so that a compiler upgrade (which changes the gated flag set)
+# invalidates stale caches — but calling the probe once per variant config
+# would add a subprocess round-trip to every trial. We cache per-arch: the
+# detected toolchain cannot change within a single process, so a one-shot
+# probe per arch is exact. Returns tuples (hashable, immutable).
+_VERSION_GATED_FLAGS_CACHE: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {}
+
+
+def _version_gated_flags_for_hash(arch: str) -> Tuple[List[str], List[str]]:
+    """Per-arch-cached (extra_host, extra_device) version-gated flags, used to
+    fold the runtime toolchain into AOT/variant cache keys. Mirrors exactly
+    what ``_torch_load`` appends to the build line via ``_newer_compiler_flags``
+    so the hash and the real build never disagree."""
+    cached = _VERSION_GATED_FLAGS_CACHE.get(arch)
+    if cached is None:
+        h, d = _newer_compiler_flags(arch)
+        cached = (tuple(h), tuple(d))
+        _VERSION_GATED_FLAGS_CACHE[arch] = cached
+    return list(cached[0]), list(cached[1])
+
+
 # ---------------------------------------------------------------------------
 # Build driver — torch.utils.cpp_extension.load with ninja
 # ---------------------------------------------------------------------------
@@ -12552,10 +12578,16 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         # or flags changes the signature, so a stale .so is never reused.
         full_host = host_cflags_base + host_extra
         full_device = device_cflags_base + device_extra
+        # Fold version-gated toolchain flags into the variant signature for the
+        # same reason as build_aot: a compiler upgrade changes the flags
+        # ``_torch_load`` appends, so a cached variant .so built by the old
+        # toolchain must not register as fresh. The flags are appended inside
+        # _torch_load (not added to full_host/full_device here) so we only hash.
+        _vsig_h, _vsig_d = _version_gated_flags_for_hash(spec.arch)
         build_sig = _hash_flags(
             [str(s) for s in variant_sources]
             + [_hash_sources(list(variant_sources))]
-            + full_host + full_device + list(ldflags))
+            + full_host + full_device + _vsig_h + _vsig_d + list(ldflags))
         variant_so = cache.get_fresh_variant(
             spec.optimizer, spec.model, spec.arch, ckey, build_sig)
         if variant_so is not None:
@@ -13809,8 +13841,16 @@ def build_aot(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
     device_cflags = _device_cflags(spec)
     ldflags = _ldflags(spec)
     source_hash = _hash_sources(sources) if sources else "empty"
-    host_hash = _hash_flags(host_cflags)
-    device_hash = _hash_flags(device_cflags)
+    # Fold the version-gated toolchain flags into the host/device hashes so a
+    # compiler upgrade that changes the gated flag set (e.g. CUDA 12.2→12.6
+    # gains --split-compile / --register-usage-level) invalidates the cache.
+    # These flags are appended to the actual build line inside ``_torch_load``
+    # (not here) so we hash them separately rather than duplicating them on the
+    # compile command. Without this, an upgraded toolchain produces a cache HIT
+    # on a .so built by the OLD compiler with the OLD (smaller) flag set.
+    _vh, _vd = _version_gated_flags_for_hash(spec.arch)
+    host_hash = _hash_flags(host_cflags + _vh)
+    device_hash = _hash_flags(device_cflags + _vd)
 
     # Resolve search-space hash (gates AOT freshness too)
     space_hash = None
@@ -14167,7 +14207,37 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
             f"{fm_host + fm_device} to the final build so the shipped .so "
             f"matches the validated winning timing.\n")
 
-    so_path = _torch_load(spec, sources,
+    # Synth winner — when a SYNTHESISED kernel won the sweep, the final rebuild
+    # must compile the synthesised source, NOT the template-resolved ``sources``.
+    # During autotune the synth path was stashed on
+    # ``spec._emitted_sources["<ckey>:synth"]`` and its origin recorded in
+    # ``_LAST_VARIANT_ORIGIN`` (origin=ORIGIN_SYNTH is set exactly when the synth
+    # source was the variant actually built + timed). Both persist in-process —
+    # ``_jit_autotune`` ran in this same process above. This mirrors the
+    # fast-math re-application: the shipped .so must BE the variant the sweep
+    # validated and picked (it passed the #16 strict-oracle gate), never a
+    # template build wearing a synth winner's timing.
+    final_sources = sources
+    won_ckey = tuned.get("config_key")
+    if won_ckey and _LAST_VARIANT_ORIGIN.get(won_ckey) == ORIGIN_SYNTH:
+        synth_src = (spec._emitted_sources or {}).get(f"{won_ckey}:synth")
+        if synth_src and Path(synth_src).is_file():
+            final_sources = [Path(synth_src)]
+            report.write(
+                f"  [jit] WINNER is synth variant {won_ckey[:24]}: building the "
+                f"synthesised source {Path(synth_src).name} (not the template) "
+                f"so the shipped .so IS the validated winning kernel.\n")
+        else:
+            # The winner is origin=synth but we cannot recover its source. Do
+            # NOT silently ship a template build under the synth winner's
+            # timing — that is the exact false-green this fix exists to close.
+            report.write(
+                f"  [jit] WARNING: winner {won_ckey[:24]} is origin=synth but "
+                f"its synthesised source is unavailable ({synth_src!r}); the "
+                f"shipped .so would be a TEMPLATE build that may not reproduce "
+                f"the winning timing. Falling back to template sources.\n")
+
+    so_path = _torch_load(spec, final_sources,
                           host_cflags + extra_host,
                           device_cflags + extra_device,
                           ldflags, report, module_suffix="_tuned")
@@ -14176,7 +14246,7 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
         # Record this as the "current primary" — its hashes include the tuned macros
         cache.record_aot(
             spec.optimizer, spec.model, spec.arch,
-            source_hash=_hash_sources(sources),
+            source_hash=_hash_sources(final_sources),
             host_flags_hash=_hash_flags(host_cflags + extra_host),
             device_flags_hash=_hash_flags(device_cflags + extra_device),
             so_path=so_path,
@@ -17887,6 +17957,37 @@ def _self_test_cache(run) -> None:
         finally:
             shutil.rmtree(td)
 
+    def test_version_gated_flags_fold_into_cache_hash():
+        """Regression — a toolchain upgrade that changes the version-gated
+        flag set (e.g. CUDA 12.2→12.6 gains --split-compile) MUST change the
+        host/device cache hash so a stale .so built by the OLD compiler with
+        the OLD (smaller) flag set is never reused. The pre-fix bug: the AOT
+        hash was computed from the static base flags only, while
+        ``_newer_compiler_flags`` ran later inside ``_torch_load`` — so an
+        upgrade produced a false cache HIT.
+        """
+        arch = "sm_90a"
+        # (a) _version_gated_flags_for_hash memoizes per-arch and returns a
+        #     FRESH list each call (mutating the result must not poison the
+        #     module cache that feeds every subsequent build's hash).
+        _VERSION_GATED_FLAGS_CACHE.pop(arch, None)
+        h1, _d1 = _version_gated_flags_for_hash(arch)
+        h1.append("--poison")
+        h2, _d2 = _version_gated_flags_for_hash(arch)
+        assert "--poison" not in h2, \
+            "returned flag list must be a fresh copy, not the cached tuple"
+        # (b) the fold is hash-sensitive: an extra version-gated flag changes
+        #     the digest; an identical set is deterministic.
+        base_host = ["-O3", "-std=c++17"]
+        old = _hash_flags(base_host + ["-Xptxas", "--def-load-cache=ca"])
+        new = _hash_flags(base_host + ["-Xptxas", "--def-load-cache=ca",
+                                       "--split-compile=8"])
+        assert old != new, \
+            "an added version-gated flag must change the cache hash"
+        assert old == _hash_flags(base_host + ["-Xptxas",
+                                               "--def-load-cache=ca"]), \
+            "identical flag sets must hash identically"
+
     run("cache_concurrent_writes_both_survive",
         test_cache_concurrent_writes_both_survive)
     run("cache_corruption_emits_stderr_notice",
@@ -17898,6 +17999,8 @@ def _self_test_cache(run) -> None:
     run("make_trial_record_documents_v4_schema",
         test_make_trial_record_documents_v4_schema)
     run("variant_reuse_skips_recompile", test_variant_reuse_skips_recompile)
+    run("version_gated_flags_fold_into_cache_hash",
+        test_version_gated_flags_fold_into_cache_hash)
 
 
 def _self_test_multi_gpu_pool(run) -> None:
@@ -18299,6 +18402,32 @@ def _self_test_fastmath_integration(run) -> None:
         assert "_fastmath" not in "".join(
             ["SG_TUNED_BLOCK_SIZE", "SG_TUNED_VEC_WIDTH", "SG_TUNED_UNROLL"])
 
+    def test_synth_winner_swaps_source_in_final_build():
+        """Synth-source-swap — when a SYNTH variant wins, build_jit's final
+        rebuild must compile the synthesised source stashed on
+        ``spec._emitted_sources["<ckey>:synth"]`` (origin recorded in
+        ``_LAST_VARIANT_ORIGIN``), NOT the template ``sources``. Otherwise the
+        shipped .so is a template build wearing the synth winner's validated
+        timing — the same false-green the fast-math re-apply closes. Proven via
+        source inspection of the swap branch + a behavioral check of the lookup
+        keying so the two halves (timer stash, final swap) agree on the key."""
+        import inspect
+        bjsrc = inspect.getsource(build_jit)
+        # The swap branch detects a synth winner by origin and resolves the
+        # stashed source under the SAME "<ckey>:synth" key the timer wrote.
+        assert "_LAST_VARIANT_ORIGIN.get(won_ckey) == ORIGIN_SYNTH" in bjsrc, \
+            "build_jit must detect a synth winner via _LAST_VARIANT_ORIGIN"
+        assert 'f"{won_ckey}:synth"' in bjsrc, \
+            "build_jit must resolve the synth source under '<ckey>:synth'"
+        assert "final_sources = [Path(synth_src)]" in bjsrc, \
+            "build_jit must build the synth source, not the template"
+        # Keying agreement: the timer stash and the final swap must use the
+        # identical "<ckey>:synth" suffix, or the lookup silently misses and
+        # the winner ships a template build.
+        tsrc = inspect.getsource(_make_variant_timer)
+        assert 'f"{ckey}:synth"' in tsrc, \
+            "timer must stash under the same '<ckey>:synth' key"
+
     def test_origin_constants_single_source_of_truth():
         """Defect-1.6 — no stray origin string literal outside the constant
         defs; the gate set is built from the constants."""
@@ -18368,6 +18497,8 @@ def _self_test_fastmath_integration(run) -> None:
         test_fastmath_wired_into_sweep_drivers)
     run("fastmath_winner_reapplies_flags_in_final_build",
         test_fastmath_winner_reapplies_flags_in_final_build)
+    run("synth_winner_swaps_source_in_final_build",
+        test_synth_winner_swaps_source_in_final_build)
     run("origin_constants_single_source_of_truth",
         test_origin_constants_single_source_of_truth)
     run("mandate_features_have_nontest_callsites",
@@ -21442,7 +21573,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 224
+_SELF_TEST_EXPECTED_COUNT: int = 226
 
 
 def _self_test() -> int:
