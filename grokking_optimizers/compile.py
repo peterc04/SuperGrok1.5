@@ -12503,6 +12503,12 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         # back on spec._emitted_sources for downstream introspection.
         # Failures here MUST NOT break the un-polyhedral flow — both
         # libclang and islpy are optional.
+        # A polyhedral-transformed source to BUILD for this ckey (None unless
+        # the reschedule actually emitted a compilable variant). Resolved by the
+        # hook below; applied to variant_sources after the template default is
+        # set, so origin=polyhedral is only stamped when a transformed source is
+        # genuinely compiled (never the template wearing a polyhedral tag).
+        poly_source: Optional[Path] = None
         try:
             poly_cfg = (spec.config or {}).get(
                 "polyhedral", {}) or {}
@@ -12519,12 +12525,23 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                         f"on-device oracle (#16/#20).\n")
                 emitted_source = (spec._emitted_sources or {}).get(ckey)
                 if emitted_source is not None and Path(emitted_source).exists():
-                    _polyhedral_expand_variant(
+                    _transformed = _polyhedral_expand_variant(
                         spec, Path(emitted_source), report)
-                    # Mandate #20 — a polyhedral reschedule can be ILLEGAL;
-                    # tag origin so pick_winner refuses it unless it passes
-                    # the strict numeric oracle (#16).
-                    _LAST_VARIANT_ORIGIN[ckey] = ORIGIN_POLYHEDRAL
+                    # Pick the first schedule variant that actually landed on
+                    # disk. ONLY this makes origin=polyhedral honest — the
+                    # previous code discarded the return value, left
+                    # variant_sources pointing at the template, and stamped
+                    # ORIGIN_POLYHEDRAL anyway, so the strict-oracle gate was
+                    # attributing a transformation that was never compiled.
+                    poly_source = next(
+                        (Path(p) for p in _transformed if Path(p).exists()),
+                        None)
+                    if poly_source is None:
+                        report.write(
+                            f"    [polyhedral] {ckey[:24]}: no compilable "
+                            f"schedule variant emitted; building the template "
+                            f"(honestly tagged origin=template, not "
+                            f"polyhedral).\n")
         except Exception as exc:
             try:
                 report.write(
@@ -12545,6 +12562,18 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         # without modifying the timer's return shape. With the flag
         # OFF (the default), this branch is a no-op.
         variant_sources = list(sources)
+        # Mandate #20 — when the polyhedral hook produced a real transformed
+        # source, BUILD it (not the template) and only then stamp the origin,
+        # mirroring the synth path below. The strict on-device oracle (#16/#20)
+        # then validates a transformation that was actually compiled + run.
+        if poly_source is not None:
+            variant_sources = [poly_source]
+            _LAST_VARIANT_ORIGIN[ckey] = ORIGIN_POLYHEDRAL
+            spec._emitted_sources[f"{ckey}:polyhedral"] = poly_source
+            report.write(
+                f"    [polyhedral] {ckey[:24]}: building transformed schedule "
+                f"{poly_source.name} (origin=polyhedral — needs oracle PASS "
+                f"to win)\n")
         if spec.enable_synth_codegen:
             try:
                 synth_path = _try_synth_codegen(spec, config, dims,
@@ -21028,6 +21057,37 @@ def _self_test_polyhedral(run) -> None:
     run("polyhedral_apply_schedule_honest_libclang_fallback",
          test_polyhedral_apply_schedule_honest_libclang_fallback)
 
+    def test_polyhedral_origin_only_when_transformed_source_built():
+        """Mandate #20 — origin=polyhedral must be stamped ONLY when a real
+        transformed source replaces variant_sources (so the strict oracle
+        validates a transformation that actually compiled). The pre-fix bug:
+        the timer discarded _polyhedral_expand_variant's return value, left
+        variant_sources = template, and stamped ORIGIN_POLYHEDRAL anyway —
+        attributing a transform that was never built. Proven by source
+        inspection of the timer's control flow + the keying contract."""
+        import inspect
+        tsrc = inspect.getsource(_make_variant_timer)
+        # The hook must capture the expander's return value (not discard it).
+        assert "_transformed = _polyhedral_expand_variant(" in tsrc, \
+            "timer must capture the transformed-source list from the expander"
+        # The stamp must be guarded by an actual source swap (mirrors synth).
+        assert "if poly_source is not None:" in tsrc, \
+            "origin=polyhedral must be gated on a real transformed source"
+        # The swap must precede/accompany the stamp: variant_sources is
+        # replaced AND origin set in the same guarded block.
+        idx_swap = tsrc.index("variant_sources = [poly_source]")
+        idx_stamp = tsrc.index(
+            "_LAST_VARIANT_ORIGIN[ckey] = ORIGIN_POLYHEDRAL")
+        # The swap must come at or before the stamp (same guarded block).
+        assert idx_swap < idx_stamp, \
+            "must replace variant_sources before stamping origin=polyhedral"
+        # And there must be no UNGUARDED polyhedral stamp (the old bug site):
+        # every ORIGIN_POLYHEDRAL stamp lives under the poly_source guard.
+        assert tsrc.count("_LAST_VARIANT_ORIGIN[ckey] = ORIGIN_POLYHEDRAL") == 1, \
+            "exactly one (guarded) polyhedral origin stamp expected"
+    run("polyhedral_origin_only_when_transformed_source_built",
+        test_polyhedral_origin_only_when_transformed_source_built)
+
     # Stream D — generative / structural codegen. Five tests covering
     # OpGraph construction + topo sort, elementwise lowering on CUDA,
     # adamw_update pattern across (cuda, hip, pallas), and the CK
@@ -21573,7 +21633,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 226
+_SELF_TEST_EXPECTED_COUNT: int = 227
 
 
 def _self_test() -> int:
