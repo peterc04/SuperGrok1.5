@@ -97,7 +97,6 @@ if _HAS_JAX:
     #    re-expose each launcher under the per-tensor call-site signature the
     #    fused composition uses -- no ``kernels.tpu`` dependency.
     from .launch_looksam import launch_looksam_apply
-    from .launch_muon import launch_muon_step
     from .launch_neuralgrok import launch_neuralgrok_step
     from .launch_prodigy import launch_prodigy_step
     from .launch_supergrok11 import launch_supergrok11_step
@@ -137,23 +136,51 @@ if _HAS_JAX:
 
     def muon_adamw_update(params, grads, exp_avg, exp_avg_sq, step,
                           beta1=0.9, beta2=0.98, lr=1e-3, wd=1.0, eps=1e-8):
-        # Real Muon, delegated to the canonical per-tensor launcher. The fused
-        # composition applies this leaf-wise (``tree_map`` over the param tree),
-        # so each call here receives ONE parameter tensor of its natural rank --
-        # there is no rank>=3 layer-stacking. ``launch_muon_step`` is the source
-        # of truth that the sm_90/gfx942 Muon kernels mirror: it does the 2-D
-        # Newton-Schulz orthogonalization (the whole point of Muon) and the 1-D
-        # plain-momentum fallback. (The former stub applied plain AdamW to every
-        # leaf and never orthogonalized -- it was not Muon at all.)
+        # Real Muon for the fused composition. The fused param tree STACKS the
+        # per-layer parameters, so a single leaf here is rank-1 (a bias vector),
+        # rank-2 (one weight matrix), or rank-3+ (a STACK of per-layer weight
+        # matrices). Muon orthogonalizes each 2-D matrix; we treat the LAST TWO
+        # axes as the matrix and BATCH the Newton-Schulz iteration over any
+        # leading (layer) axes via jnp.matmul's native batching, a batched
+        # transpose (swapaxes(-1,-2)), and a PER-matrix Frobenius norm.
         #
-        # Muon's state is a single SGD-momentum buffer; we carry it in
-        # ``exp_avg`` and pass ``exp_avg_sq`` through untouched (Muon has no
-        # second moment) so the state-tree shape the composition expects is
-        # preserved. ``beta1`` is Muon's momentum; ``wd`` is decoupled decay.
-        new_param, new_buf = launch_muon_step(
-            params, exp_avg, grads, lr, beta1, wd, ns_steps=5,
-        )
-        return new_param, new_buf, exp_avg_sq
+        # History: the original stub applied plain AdamW and never
+        # orthogonalized (not Muon at all). Delegating to the per-tensor
+        # ``launch_muon_step`` then broke lowering, because its full-transpose
+        # ``X.T`` and GLOBAL Frobenius norm are valid only for a single 2-D
+        # matrix — on the rank-3 stacked tree ``X.T`` reverses the layer axis
+        # and the matmul shapes become incompatible. The batched form below is
+        # the real Muon orthogonalization that is also correct on the stack.
+        #
+        # Muon's state is one SGD-momentum buffer (carried in ``exp_avg``);
+        # ``exp_avg_sq`` is passed through untouched (Muon has no second
+        # moment). ``beta1`` is Muon's momentum; ``wd`` is decoupled decay.
+        g = grads.astype(jnp.float32)
+        new_buf = beta1 * exp_avg + g
+        p = params.astype(jnp.float32)
+        if params.ndim >= 2:
+            mm = functools.partial(
+                jnp.matmul, precision=jax.lax.Precision.HIGHEST,
+                preferred_element_type=jnp.float32)
+            # Per-matrix Frobenius norm over the last two axes (keepdims so it
+            # broadcasts across any leading stacked-layer axes).
+            frob = jnp.sqrt(jnp.sum(new_buf * new_buf, axis=(-2, -1),
+                                    keepdims=True)) + 1e-8
+            X = new_buf / frob
+            # Muon quintic NS coefficients (Jordan et al. 2024) — same as
+            # launch_muon.newton_schulz_iterate, but batched over leading axes.
+            a, b, c = 3.4445, -4.7750, 2.0315
+            for _ in range(5):
+                Xt = jnp.swapaxes(X, -1, -2)
+                AX = mm(Xt, X)        # Xᵀ X           (batched n×n)
+                AAX = mm(AX, AX)      # (Xᵀ X)²
+                X = a * X + b * mm(X, AX) + c * mm(X, AAX)
+            max_dim = max(params.shape[-1], params.shape[-2])
+            neg_lr_scale = -lr * 0.2 * jnp.sqrt(jnp.float32(max_dim))
+            new_p = p * (1.0 - lr * wd) + neg_lr_scale * X
+        else:
+            new_p = p - lr * new_buf
+        return new_p, new_buf, exp_avg_sq
 
     def neuralgrok_update(params, grads, exp_avg, exp_avg_sq, step,
                           W1, b1, W_last, b_last,
