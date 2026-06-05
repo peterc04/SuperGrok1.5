@@ -1792,8 +1792,19 @@ class SuperGrok2(Optimizer):
             param_info.append((name, p, pidx, grad_flat, sharp_flat))
 
         if not param_info:
-            return torch.zeros((), device=saved_grads and
-                               next(iter(saved_grads.values())).device or 'cpu')
+            # Nothing to do: no saved grad maps into the meta-net's param index
+            # (or every mapped grad is 0-element). Return a 0-d zero loss so the
+            # caller can accumulate it uniformly with the real return paths
+            # (which return ``val_loss.detach()``). Place it on the device of any
+            # saved grad when one exists, else CPU. (The previous
+            # ``saved_grads and ... or 'cpu'`` and/or idiom was precedence-
+            # fragile and keyed the device off saved_grads rather than this
+            # branch's actual trigger; spelled out as if/else for clarity.)
+            if saved_grads:
+                dev = next(iter(saved_grads.values())).device
+            else:
+                dev = torch.device('cpu')
+            return torch.zeros((), device=dev)
 
         use_cuda_bwd = mn.has_cuda_bilevel
 
