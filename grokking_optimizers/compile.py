@@ -11852,6 +11852,105 @@ def _synthesize_input_spec(n_tensors: int, n_scalars: int, *,
             "regime": regime, "seed": seed}
 
 
+def _validation_regimes(spec) -> List[str]:
+    """The input regimes a variant is validated against (Decision #4 —
+    'sweep adversarial regimes'). A variant must match the strict oracle on
+    EVERY returned regime, so a fast-math/synth/polyhedral kernel that only
+    diverges under large dynamic range or denormals is caught — not just a
+    single benign draw.
+
+    Project-agnostic: defaults to the full adversarial set; a project may
+    narrow/reorder it via ``[numerics].regimes`` in its config (any subset of
+    ``_INPUT_REGIMES``). Unknown names are dropped; an empty/garbage override
+    falls back to the full set so coverage can only be reduced deliberately."""
+    cfg = (getattr(spec, "config", None) or {}).get("numerics", {}) or {}
+    override = cfg.get("regimes")
+    if override:
+        valid = [r for r in override if r in _INPUT_REGIMES]
+        if valid:
+            # Preserve _INPUT_REGIMES order for deterministic capture/cache.
+            return [r for r in _INPUT_REGIMES if r in valid]
+    return list(_INPUT_REGIMES)
+
+
+def _validate_against_regimes(
+        variant_so: Path, opt_class: str, ref_state: Dict[str, Any],
+        resolve_ref: Callable[..., Optional[Path]], regimes: List[str],
+        dump_dir: Path, ckey: str, report, *,
+        fused_op_template=None, label: str = "variant",
+        run_determinism: bool = True) -> str:
+    """Validate one variant's output against the strict oracle across MULTIPLE
+    input regimes (Decision #4). The variant must match the oracle on EVERY
+    regime; the first divergence (or per-regime oracle/dump failure) fails
+    closed with ``numerical_fail``. On full agreement, optionally run the 3x
+    determinism check (on the ``normal`` regime — determinism is a kernel
+    property independent of input magnitude). Returns a numerical_status string
+    (``deterministic`` / ``non_deterministic`` / ``ok`` / ``numerical_fail`` /
+    ``skipped``).
+
+    The dump / compare / determinism subprocess helpers are called by the same
+    module-global names the self-tests mock, so this stays CPU-testable."""
+    size = ref_state["size"]
+    dtype = ref_state["dtype"]
+    entry = ref_state.get("entry")
+    max_rel_overall = 0.0
+    validated_any = False
+    for rg in regimes:
+        ref_path = resolve_ref(rg, 0)
+        if ref_path is None:
+            # The 'normal' oracle availability was already checked by the
+            # caller; a None for a LATER regime means that regime's capture
+            # failed. Fail closed rather than silently passing on fewer regimes.
+            report.write(
+                f"    [numerical] {label} {ckey[:24]} regime={rg}: oracle "
+                f"capture FAILED -> numerical_fail\n")
+            return "numerical_fail"
+        out_dump = dump_dir / f"_out_{label}_{_short_key(ckey)}_{rg}.npy"
+        if out_dump.exists():
+            try:
+                out_dump.unlink()
+            except OSError:
+                pass
+        dumped = _dump_variant_output(
+            variant_so, opt_class, size, dtype, out_dump,
+            fused_op_template=fused_op_template, entry=entry,
+            regime=rg, seed=0)
+        if not (dumped and out_dump.exists()):
+            report.write(
+                f"    [numerical] {label} {ckey[:24]} regime={rg}: dump "
+                f"FAILED (oracle present) -> numerical_fail\n")
+            return "numerical_fail"
+        try:
+            st, max_rel = _compare_outputs(ref_path, out_dump, dtype)
+        except Exception as exc:
+            report.write(
+                f"    [numerical] {label} {ckey[:24]} regime={rg}: compare "
+                f"ERROR -> numerical_fail: {exc}\n")
+            return "numerical_fail"
+        validated_any = True
+        max_rel_overall = max(max_rel_overall, max_rel)
+        report.write(
+            f"    [numerical] {label} {ckey[:24]} regime={rg}: {st} "
+            f"(max_rel={max_rel:.3e})\n")
+        if st not in ("ok", "deterministic"):
+            # Diverged on this regime — the variant is unsafe; stop early.
+            return st
+    if not validated_any:
+        return "skipped"
+    if not run_determinism:
+        return "ok"
+    det = _check_determinism_3x(
+        variant_so, opt_class, size, dtype, dump_dir,
+        fused_op_template=fused_op_template, entry=entry,
+        regime="normal", seed=0)
+    status = "deterministic" if det else "non_deterministic"
+    report.write(
+        f"    [numerical:3x] {label} {ckey[:24]} -> {status} "
+        f"(matched oracle on {len(regimes)} regime(s), "
+        f"worst max_rel={max_rel_overall:.3e})\n")
+    return status
+
+
 def _render_arg_construction(entry: Optional["DiscoveredEntry"],
                              size: int, regime: str, seed: int) -> str:
     """Build the subprocess code that constructs the call arguments.
@@ -12143,7 +12242,8 @@ def _time_validate_fastmath_variants(
         variant_sources: List[Path],
         full_host: List[str], full_device: List[str], ldflags: List[str],
         cache: CompileCache, worker, report, arch_entry,
-        ref_path: Optional[Path], ref_state: Dict[str, Any],
+        resolve_ref: Callable[..., Optional[Path]], ref_state: Dict[str, Any],
+        regimes: List[str],
         variant_dump_dir: Path, strict: bool, numerics_enabled: bool,
         trial_num: int) -> List[Dict[str, Any]]:
     """Fix-#2 Defect-1 — build, time, and strictly-validate the fast-math
@@ -12154,17 +12254,24 @@ def _time_validate_fastmath_variants(
     strict build's host/device flags (the base lists are NOT modified). The
     added flags feed the build signature / cache hash so a fast-math build is
     tracked separately from the strict build. The variant is timed and its
-    output compared against the SAME strict oracle ``ref_path``; the result is
-    stamped ``origin=ORIGIN_FASTMATH`` + its numerical_status so pick_winner
-    (#16) keeps it ONLY if it matched the strict reference (a diverging
-    fast-math variant is dropped). Loud-not-silent: logs N/A for Pallas and a
-    WARNING when zero variants are generated on a CUDA/HIP sweep (§2A)."""
+    output compared against the SAME strict oracle, now ACROSS ALL adversarial
+    input regimes (#4): a fast-math kernel is exactly the kind that diverges
+    only under large/denormal magnitudes, so it must match the strict reference
+    on every regime. The result is stamped ``origin=ORIGIN_FASTMATH`` + its
+    numerical_status so pick_winner (#16) keeps it ONLY if it matched the strict
+    reference (a diverging fast-math variant is dropped). Loud-not-silent: logs
+    N/A for Pallas and a WARNING when zero variants are generated on a CUDA/HIP
+    sweep (§2A)."""
     records: List[Dict[str, Any]] = []
     vendor = arch_entry.vendor
     if vendor not in ("cuda", "hip"):
         report.write(f"    [fastmath] N/A for vendor={vendor} "
                      f"(no nvcc/hipcc fast-math flags); not explored.\n")
         return records
+    # Oracle availability (and one-time strict-posture warning) — the 'normal'
+    # regime gates whether validation is possible at all.
+    oracle_available = (numerics_enabled
+                        and resolve_ref("normal", 0) is not None)
     generated = 0
     for name in _FAST_MATH_VARIANTS:
         host_fm, dev_fm = _fast_math_variant_flags(name, vendor)
@@ -12204,58 +12311,21 @@ def _time_validate_fastmath_variants(
             fm_result = _time_variant_oneshot(
                 fm_so, OPT_CLASS[spec.optimizer], report=report,
                 python_package=spec.python_package)
-        # Fix-#2 §3 — validate via explicit _dump_variant_output (fresh
-        # subprocess, oracle-matched inputs). Generated origins (fastmath)
-        # are ALWAYS validated.
+        # Fix-#2 §3 + #4 — validate via the shared multi-regime helper (fresh
+        # subprocess dumps, oracle-matched inputs, fail-closed on the first
+        # diverging regime). Generated origins (fastmath) are ALWAYS validated.
         fm_status = "skipped"
-        if fm_result is not None and numerics_enabled and ref_path is not None:
-            fm_out = variant_dump_dir / f"_out_fm_{_short_key(fm_ckey)}.npy"
-            if fm_out.exists():
-                try:
-                    fm_out.unlink()
-                except OSError:
-                    pass
-            dumped = _dump_variant_output(
-                fm_so, OPT_CLASS[spec.optimizer],
-                ref_state["size"], ref_state["dtype"], fm_out,
-                fused_op_template=getattr(
-                    spec, "fused_op_template", None),
-                entry=ref_state.get("entry"),
-                regime="normal", seed=0)
-            if dumped and fm_out.exists():
-                try:
-                    fm_status, max_rel = _compare_outputs(
-                        ref_path, fm_out, ref_state["dtype"])
-                    report.write(
-                        f"    [fastmath:{name}] {fm_status} "
-                        f"(max_rel={max_rel:.3e}) — origin=fastmath, "
-                        f"needs oracle PASS to win\n")
-                    if fm_status in ("ok", "deterministic"):
-                        det = _check_determinism_3x(
-                            fm_so, OPT_CLASS[spec.optimizer],
-                            ref_state["size"], ref_state["dtype"],
-                            variant_dump_dir,
-                            fused_op_template=getattr(
-                                spec, "fused_op_template", None),
-                            entry=ref_state.get("entry"),
-                            regime="normal", seed=0)
-                        fm_status = ("deterministic" if det
-                                     else "non_deterministic")
-                        report.write(
-                            f"    [fastmath:{name}:3x] "
-                            f"{fm_ckey[:24]} -> {fm_status}\n")
-                except Exception as exc:
-                    report.write(f"    [fastmath:{name}] validation "
-                                 f"error: {exc}\n")
-                    fm_status = "skipped"
-            else:
-                report.write(f"    [fastmath:{name}] dump failed — "
-                             f"skipped\n")
+        if fm_result is not None and oracle_available:
+            fm_status = _validate_against_regimes(
+                fm_so, OPT_CLASS[spec.optimizer], ref_state,
+                resolve_ref, regimes, variant_dump_dir, fm_ckey, report,
+                fused_op_template=getattr(spec, "fused_op_template", None),
+                label=f"fastmath:{name}")
         elif fm_result is not None:
             report.write(f"    [fastmath:{name}] timed but NOT validated "
                          f"(numerics_enabled={numerics_enabled}, "
-                         f"oracle={'present' if ref_path else 'absent'}) — "
-                         f"will be ineligible to win (#16).\n")
+                         f"oracle={'present' if oracle_available else 'absent'})"
+                         f" — will be ineligible to win (#16).\n")
         _LAST_VARIANT_ORIGIN[fm_ckey] = ORIGIN_FASTMATH
         _LAST_NUMERICAL_STATUS[fm_ckey] = fm_status
         records.append(_make_trial_record(
@@ -12353,17 +12423,27 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
     # The reference output is captured lazily on the first variant so we
     # don't pay for it when the autotune cache hits AOT-only or when the
     # AOT .so doesn't expose the expected fused op.
-    ref_state: Dict[str, Any] = {"path": None, "tried": False,
-                                 "size": 4096, "dtype": "float32"}
+    # Per-regime oracle cache (Decision #4). ``paths`` maps (regime, seed) →
+    # captured reference .npy; ``entry`` is the resolved entry-point (None =
+    # template path) and is reused across regimes once resolved.
+    ref_state: Dict[str, Any] = {
+        "paths": {}, "entry": None, "entry_resolved": False,
+        "warned": False, "oracle_unavailable": False,
+        "size": 4096, "dtype": "float32"}
 
-    def _resolve_ref() -> Optional[Path]:
+    def _resolve_ref(regime: str = "normal", seed: int = 0) -> Optional[Path]:
+        """Capture (or return the cached) strict-oracle reference output for a
+        given input regime. The strict-posture warning and entry-point
+        resolution happen once on the first call; subsequent regimes reuse the
+        resolved entry and only differ in the synthesized input draw."""
         if not numerics_enabled:
             return None
-        if ref_state["path"] is not None:
-            return ref_state["path"]
-        if ref_state["tried"]:
+        rk = (regime, seed)
+        cached = ref_state["paths"].get(rk)
+        if cached is not None:
+            return cached
+        if ref_state["oracle_unavailable"]:
             return None
-        ref_state["tried"] = True
         # Mandate #9 — the oracle must be a fast-math-OFF strict build. The
         # AOT .so is the reference source; post-#6 the base is strict-math, so
         # the oracle is uncontaminated. Fix-#2 re-audit — actively GUARD that:
@@ -12371,38 +12451,66 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         # extra) for any fast-math token and WARN loudly if present, since a
         # project that re-adds fast-math to its config would contaminate the
         # oracle. _strict_math_flags computes what the strict build would be.
-        try:
-            eff_device = _device_cflags(spec)
-        except Exception as exc:
-            _debug_swallow("_resolve_ref.eff_device", exc)
-            eff_device = list(NVCC_DEVICE_BASE)
-        fm_contam = [f for f in eff_device if f in _FAST_MATH_FLAGS]
-        if fm_contam:
-            # _strict_math_flags would drop exactly these fast-math tokens
-            # (and append the strict marker); report the real count dropped.
-            _ = _strict_math_flags(eff_device)
+        # One-time (regime-independent).
+        if not ref_state["warned"]:
+            ref_state["warned"] = True
+            try:
+                eff_device = _device_cflags(spec)
+            except Exception as exc:
+                _debug_swallow("_resolve_ref.eff_device", exc)
+                eff_device = list(NVCC_DEVICE_BASE)
+            fm_contam = [f for f in eff_device if f in _FAST_MATH_FLAGS]
+            if fm_contam:
+                # _strict_math_flags would drop exactly these fast-math tokens
+                # (and append the strict marker); report the real count dropped.
+                _ = _strict_math_flags(eff_device)
+                report.write(
+                    f"  [numerical] WARNING: oracle build carries fast-math "
+                    f"flags {fm_contam} via project config — the strict "
+                    f"reference may be CONTAMINATED. Strict build would drop "
+                    f"{len(fm_contam)} fast-math flag(s). "
+                    f"A fast-math variant validated against a fast-math oracle "
+                    f"is not a real check.\n")
+            strict_posture = not fm_contam
             report.write(
-                f"  [numerical] WARNING: oracle build carries fast-math "
-                f"flags {fm_contam} via project config — the strict reference "
-                f"may be CONTAMINATED. Strict build would drop "
-                f"{len(fm_contam)} fast-math flag(s). "
-                f"A fast-math variant validated against a fast-math oracle is "
-                f"not a real check.\n")
-        strict_posture = not fm_contam
-        report.write(
-            f"  [numerical] capturing strict oracle "
-            f"(base_strict_math={strict_posture}) on synthesized inputs.\n")
-        # Tier-2 (#4/#11/#22) — resolve the entry. Prefer the configured
+                f"  [numerical] capturing strict oracle "
+                f"(base_strict_math={strict_posture}) on synthesized inputs "
+                f"across regimes {list(_validation_regimes(spec))}.\n")
+
+        def _capture(entry) -> Path:
+            if entry is None:
+                return _capture_reference_output(
+                    Path(aot_so), OPT_CLASS[spec.optimizer],
+                    ref_state["size"], ref_state["dtype"], spec.out_dir,
+                    fused_op_template=spec.fused_op_template,
+                    regime=regime, seed=seed)
+            return _capture_reference_output(
+                Path(aot_so), OPT_CLASS[spec.optimizer],
+                ref_state["size"], ref_state["dtype"], spec.out_dir,
+                entry=entry, regime=regime, seed=seed)
+
+        # Entry already resolved (a prior regime) — capture this regime directly
+        # with the same entry so all regimes share one oracle source.
+        if ref_state["entry_resolved"]:
+            try:
+                p = _capture(ref_state["entry"])
+                ref_state["paths"][rk] = p
+                return p
+            except Exception as exc:
+                report.write(
+                    f"  [numerical] oracle capture for regime={regime} "
+                    f"failed ({exc}); this regime cannot be validated.\n")
+                return None
+
+        # First capture — resolve the entry: prefer the configured
         # fused_op_template (grokking path, byte-identical); fall back to
         # entry-point DISCOVERY on the AOT .so when the template op can't be
         # found, so a generic zero-manifest project still gets an oracle.
         try:
-            p = _capture_reference_output(
-                Path(aot_so), OPT_CLASS[spec.optimizer],
-                ref_state["size"], ref_state["dtype"], spec.out_dir,
-                fused_op_template=spec.fused_op_template)
-            ref_state["path"] = p
+            p = _capture(None)
             ref_state["entry"] = None
+            ref_state["entry_resolved"] = True
+            ref_state["paths"][rk] = p
             return p
         except Exception as exc:
             report.write(f"  [numerical] template-based reference capture "
@@ -12415,21 +12523,21 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                     report.write("  [numerical] discovery found no tunable "
                                  "entry — oracle unavailable, validation "
                                  "disabled for this sweep.\n")
+                    ref_state["oracle_unavailable"] = True
                     return None
                 report.write(f"  [numerical] discovered entry "
                              f"{chosen.dotted_path} (arity={chosen.arity}); "
                              f"capturing oracle from it.\n")
-                p = _capture_reference_output(
-                    Path(aot_so), OPT_CLASS[spec.optimizer],
-                    ref_state["size"], ref_state["dtype"], spec.out_dir,
-                    entry=chosen)
-                ref_state["path"] = p
+                p = _capture(chosen)
                 ref_state["entry"] = chosen
+                ref_state["entry_resolved"] = True
+                ref_state["paths"][rk] = p
                 return p
             except Exception as exc2:
                 report.write(f"  [numerical] discovery-based reference "
                              f"capture also failed: {exc2}. Validation "
                              f"disabled for this sweep.\n")
+                ref_state["oracle_unavailable"] = True
                 return None
 
     def timer(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -12698,71 +12806,23 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                     or strict
                 )
                 if should_validate:
-                    ref_path = _resolve_ref()
+                    # Resolve the 'normal' oracle first — this preserves the
+                    # one-time strict-posture warning + entry resolution and the
+                    # "skipped when no oracle" semantics. If available, validate
+                    # the variant across ALL adversarial input regimes (#4): a
+                    # variant must match the oracle on every regime or it fails
+                    # closed (a fast-math kernel that only diverges under large/
+                    # denormal magnitudes is caught here, not just on a benign
+                    # draw).
+                    ref_path = _resolve_ref("normal", 0)
                     if ref_path is not None:
-                        out_dump = (variant_dump_dir
-                                    / f"_out_{_short_key(ckey)}.npy")
-                        if out_dump.exists():
-                            try:
-                                out_dump.unlink()
-                            except OSError:
-                                pass
-                        dumped = _dump_variant_output(
-                            variant_so, OPT_CLASS[spec.optimizer],
-                            ref_state["size"], ref_state["dtype"],
-                            out_dump,
+                        num_status = _validate_against_regimes(
+                            variant_so, OPT_CLASS[spec.optimizer], ref_state,
+                            _resolve_ref, _validation_regimes(spec),
+                            variant_dump_dir, ckey, report,
                             fused_op_template=getattr(
                                 spec, "fused_op_template", None),
-                            entry=ref_state.get("entry"),
-                            regime="normal", seed=0)
-                        if dumped and out_dump.exists():
-                            try:
-                                num_status, max_rel = _compare_outputs(
-                                    ref_path, out_dump, ref_state["dtype"])
-                                report.write(
-                                    f"    [numerical] {ckey[:24]} "
-                                    f"{num_status} "
-                                    f"(max_rel={max_rel:.3e})\n")
-                                if num_status in ("ok", "deterministic"):
-                                    det = _check_determinism_3x(
-                                        variant_so,
-                                        OPT_CLASS[spec.optimizer],
-                                        ref_state["size"],
-                                        ref_state["dtype"],
-                                        variant_dump_dir,
-                                        fused_op_template=getattr(
-                                            spec, "fused_op_template",
-                                            None),
-                                        entry=ref_state.get("entry"),
-                                        regime="normal", seed=0)
-                                    num_status = (
-                                        "deterministic" if det
-                                        else "non_deterministic")
-                                    report.write(
-                                        f"    [numerical:3x] "
-                                        f"{ckey[:24]} -> "
-                                        f"{num_status}\n")
-                            except Exception as exc:
-                                # We HAD an oracle and chose to validate, but
-                                # comparison errored — exclude (do not let an
-                                # unvalidated contender win as "skipped").
-                                report.write(
-                                    f"    [numerical] {ckey[:24]} "
-                                    f"validation ERROR -> numerical_fail: "
-                                    f"{exc}\n")
-                                num_status = "numerical_fail"
-                        else:
-                            # Dump subprocess crashed / produced no output even
-                            # though an oracle exists and validation was
-                            # required. A variant that can't even run to a dump
-                            # is unsafe to ship — exclude it rather than letting
-                            # a fast-but-broken template config win as "skipped"
-                            # (§2A: loud, fail-closed).
-                            report.write(
-                                f"    [numerical] {ckey[:24]} dump FAILED "
-                                f"(oracle present, validation required) -> "
-                                f"numerical_fail\n")
-                            num_status = "numerical_fail"
+                            label="variant")
                 progress_state.setdefault("_val_cache", {})[ckey] = \
                     num_status
                 if (num_status not in ("numerical_fail",)
@@ -12791,11 +12851,11 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                 progress_state["fm_best_ms"] = ms
                 progress_state["fm_trial_num"] = \
                     progress_state.get("fm_trial_num", 0) + 1
-                ref_path_fm = _resolve_ref()
                 fm_recs = _time_validate_fastmath_variants(
                     spec, config, variant_sources, full_host, full_device,
                     ldflags, cache, worker, report, arch_entry,
-                    ref_path_fm, ref_state, variant_dump_dir, strict,
+                    _resolve_ref, ref_state, _validation_regimes(spec),
+                    variant_dump_dir, strict,
                     numerics_enabled, progress_state["fm_trial_num"])
                 for r in fm_recs:
                     fastmath_sink.append(r)
@@ -18330,10 +18390,16 @@ def _self_test_fastmath_integration(run) -> None:
         g["_dump_variant_output"] = fake_dump
         g["_compare_outputs"] = fake_compare
         g["_check_determinism_3x"] = fake_det3x
+        # Multi-regime (#4): the mock oracle resolver returns the same ref for
+        # every regime; fake_compare drives the per-regime status. Sweep the
+        # full regime set so the helper exercises all of them.
+        def fake_resolve_ref(regime="normal", seed=0):
+            return ref
         try:
             recs = _time_validate_fastmath_variants(
                 spec, {"block": 128}, [ksrc], ["-O3"], ["-O3"], [],
-                cache, None, report, arch_entry, ref, ref_state, vdir,
+                cache, None, report, arch_entry, fake_resolve_ref, ref_state,
+                list(_INPUT_REGIMES), vdir,
                 False, True, 1)
         finally:
             for k, v in saved.items():
@@ -18393,8 +18459,10 @@ def _self_test_fastmath_integration(run) -> None:
                          out_dir=Path(tempfile.mkdtemp()))
         recs = _time_validate_fastmath_variants(
             spec, {"block": 128}, [], [], [], [], CompileCache(None), None,
-            report, get_arch_entry("tpu_v6e"), None,
-            {"dtype": "float32", "size": 4096}, Path(tempfile.mkdtemp()),
+            report, get_arch_entry("tpu_v6e"),
+            lambda regime="normal", seed=0: None,
+            {"dtype": "float32", "size": 4096}, list(_INPUT_REGIMES),
+            Path(tempfile.mkdtemp()),
             False, False, 1)
         assert recs == []
         assert "N/A for vendor=pallas" in report.getvalue(), report.getvalue()
@@ -18747,15 +18815,20 @@ def _self_test_validation_mechanism(run) -> None:
             "validated generated variant must be eligible to win"
 
     def test_validation_uses_dump_variant_not_env():
-        """The timer closure uses _dump_variant_output (explicit fresh
-        subprocess) rather than the SG_DUMP_OUTPUT env-var side-channel.
+        """Validation uses _dump_variant_output (explicit fresh subprocess)
+        rather than the SG_DUMP_OUTPUT env-var side-channel. The explicit dump
+        now lives in the shared multi-regime helper the timer routes through;
+        neither the timer nor the helper may use the broken side-channel.
         Structural proof via source inspection."""
         import inspect
-        src = inspect.getsource(_make_variant_timer)
-        assert "_dump_variant_output(" in src, \
-            "timer must call _dump_variant_output explicitly"
-        assert "SG_DUMP_OUTPUT" not in src, \
+        helper_src = inspect.getsource(_validate_against_regimes)
+        assert "_dump_variant_output(" in helper_src, \
+            "validation helper must call _dump_variant_output explicitly"
+        timer_src = inspect.getsource(_make_variant_timer)
+        assert "SG_DUMP_OUTPUT" not in timer_src, \
             "timer must NOT use the broken SG_DUMP_OUTPUT side-channel"
+        assert "SG_DUMP_OUTPUT" not in helper_src, \
+            "validation helper must NOT use the broken SG_DUMP_OUTPUT channel"
 
     def test_validation_caches_by_config_key():
         """Validation results are cached in progress_state['_val_cache']
@@ -18765,6 +18838,129 @@ def _self_test_validation_mechanism(run) -> None:
         assert "_val_cache" in src, \
             "timer must cache validation results by config_key"
 
+    def test_validation_regimes_default_and_override():
+        """#4 — default is the full adversarial regime set; a project may
+        narrow it via [numerics].regimes (order normalized to _INPUT_REGIMES);
+        a garbage/empty override falls back to the full set (coverage only
+        shrinks deliberately)."""
+        import types
+        assert _validation_regimes(types.SimpleNamespace(config=None)) \
+            == list(_INPUT_REGIMES)
+        s2 = types.SimpleNamespace(
+            config={"numerics": {"regimes": ["large", "normal", "bogus"]}})
+        # unknown 'bogus' dropped; order normalized to _INPUT_REGIMES.
+        assert _validation_regimes(s2) == ["normal", "large"], \
+            _validation_regimes(s2)
+        s3 = types.SimpleNamespace(config={"numerics": {"regimes": ["bogus"]}})
+        assert _validation_regimes(s3) == list(_INPUT_REGIMES)
+
+    def test_multiregime_fails_if_any_regime_diverges():
+        """#4 — THE point of the sweep: a variant that matches the oracle on
+        'normal' but DIVERGES on a later adversarial regime (large/denormal)
+        must fail closed. The pre-fix validation only checked 'normal' and
+        would have passed such a variant."""
+        td = Path(tempfile.mkdtemp())
+        dump_dir = td / "v"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        ref = td / "ref.npy"
+        np.save(ref, np.zeros(4, dtype=np.float32))
+        ref_state = {"size": 4096, "dtype": "float32", "entry": None}
+        so = td / "k.so"
+        so.write_bytes(b"\x7fELF")
+        seen: List[str] = []
+
+        def fake_dump(variant_so, opt_class, size, dtype, out_path,
+                      timeout=120, fused_op_template=None, entry=None,
+                      regime="normal", seed=0):
+            np.save(out_path, np.zeros(4, dtype=np.float32))
+            seen.append(regime)
+            return True
+
+        def fake_compare(ref_p, out_p, dtype):
+            # Diverge ONLY on the 'large' regime; 'normal' passes.
+            return (("numerical_fail", 9.9) if seen[-1] == "large"
+                    else ("ok", 0.0))
+
+        def fake_det3x(*a, **k):
+            return True
+
+        g = globals()
+        saved = {k: g.get(k) for k in ("_dump_variant_output",
+                                       "_compare_outputs",
+                                       "_check_determinism_3x")}
+        g["_dump_variant_output"] = fake_dump
+        g["_compare_outputs"] = fake_compare
+        g["_check_determinism_3x"] = fake_det3x
+        try:
+            status = _validate_against_regimes(
+                so, "AdamW", ref_state, lambda rg, seed=0: ref,
+                list(_INPUT_REGIMES), dump_dir, "ck1", io.StringIO())
+        finally:
+            for k, v in saved.items():
+                g[k] = v
+        assert status == "numerical_fail", status
+        # Fail-closed: stopped at 'large', never reached 'adversarial'.
+        assert "large" in seen and "adversarial" not in seen, seen
+
+    def test_multiregime_all_pass_runs_determinism():
+        """#4 — when the variant matches on EVERY regime, all regimes are
+        swept and the determinism 3x check runs, yielding 'deterministic'."""
+        td = Path(tempfile.mkdtemp())
+        dump_dir = td / "v"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        ref = td / "ref.npy"
+        np.save(ref, np.zeros(4, dtype=np.float32))
+        ref_state = {"size": 4096, "dtype": "float32", "entry": None}
+        so = td / "k.so"
+        so.write_bytes(b"\x7fELF")
+        seen: List[str] = []
+        det_called = {"n": 0}
+
+        def fake_dump(variant_so, opt_class, size, dtype, out_path,
+                      timeout=120, fused_op_template=None, entry=None,
+                      regime="normal", seed=0):
+            np.save(out_path, np.zeros(4, dtype=np.float32))
+            seen.append(regime)
+            return True
+
+        def fake_compare(ref_p, out_p, dtype):
+            return ("ok", 0.0)
+
+        def fake_det3x(*a, **k):
+            det_called["n"] += 1
+            return True
+
+        g = globals()
+        saved = {k: g.get(k) for k in ("_dump_variant_output",
+                                       "_compare_outputs",
+                                       "_check_determinism_3x")}
+        g["_dump_variant_output"] = fake_dump
+        g["_compare_outputs"] = fake_compare
+        g["_check_determinism_3x"] = fake_det3x
+        try:
+            status = _validate_against_regimes(
+                so, "AdamW", ref_state, lambda rg, seed=0: ref,
+                list(_INPUT_REGIMES), dump_dir, "ck2", io.StringIO())
+        finally:
+            for k, v in saved.items():
+                g[k] = v
+        assert status == "deterministic", status
+        assert seen == list(_INPUT_REGIMES), seen   # ALL regimes swept
+        assert det_called["n"] == 1, det_called       # determinism ran once
+
+    def test_timer_wires_multiregime_validation():
+        """Structural proof: both validation drivers route through the shared
+        multi-regime helper, not an inline single-regime check."""
+        import inspect
+        tsrc = inspect.getsource(_make_variant_timer)
+        assert "_validate_against_regimes(" in tsrc, \
+            "main timer must use the multi-regime validator"
+        assert "_validation_regimes(spec)" in tsrc, \
+            "main timer must sweep the configured regimes"
+        fmsrc = inspect.getsource(_time_validate_fastmath_variants)
+        assert "_validate_against_regimes(" in fmsrc, \
+            "fast-math validator must also sweep regimes"
+
     run("strict_config_bad_output_caught_at_new_best",
         test_strict_config_bad_output_caught_at_new_best)
     run("validated_generated_variant_can_win",
@@ -18773,6 +18969,14 @@ def _self_test_validation_mechanism(run) -> None:
         test_validation_uses_dump_variant_not_env)
     run("validation_caches_by_config_key",
         test_validation_caches_by_config_key)
+    run("validation_regimes_default_and_override",
+        test_validation_regimes_default_and_override)
+    run("multiregime_fails_if_any_regime_diverges",
+        test_multiregime_fails_if_any_regime_diverges)
+    run("multiregime_all_pass_runs_determinism",
+        test_multiregime_all_pass_runs_determinism)
+    run("timer_wires_multiregime_validation",
+        test_timer_wires_multiregime_validation)
 
 
 def _self_test_autotune_brain(run) -> None:
@@ -21633,7 +21837,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 227
+_SELF_TEST_EXPECTED_COUNT: int = 231
 
 
 def _self_test() -> int:
