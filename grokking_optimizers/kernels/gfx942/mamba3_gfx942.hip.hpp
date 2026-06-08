@@ -484,7 +484,7 @@ __device__ __forceinline__ void ssm_scan(
                 float at = ws[l * 2], bt = ws[l * 2 + 1];
                 float ar = ws[i * 2], br = ws[i * 2 + 1];
                 ws[l * 2]     = ar;       ws[l * 2 + 1] = br;
-                ws[i * 2]     = ar * at;  ws[i * 2 + 1] = ar * bt + br;
+                ws[i * 2]     = at * ar;  ws[i * 2 + 1] = at * br + bt;
             }
             amd::workgroup_barrier_acquire();
         }
@@ -624,7 +624,7 @@ __device__ __forceinline__ void ssm_scan_backward(
                 float at = ws[l * 2], bt = ws[l * 2 + 1];
                 float ar = ws[i * 2], br = ws[i * 2 + 1];
                 ws[l * 2] = ar; ws[l * 2 + 1] = br;
-                ws[i * 2] = ar * at; ws[i * 2 + 1] = ar * bt + br;
+                ws[i * 2] = at * ar; ws[i * 2 + 1] = at * br + bt;
             }
             amd::workgroup_barrier_acquire();
         }
