@@ -581,15 +581,22 @@ def has_kernels() -> bool:
 # ----------------------------------------------------------------------
 
 MODELS = ("transformer_decoder", "vit", "mamba3")
-# Canonical optimizer identifiers. MUST match the real optimizer set used by
-# the megakernel solver/codegen (``megakernel.OPTIMIZERS``), the profiler
-# (``profile.OPTIMIZERS``) and the engine name-inference: the baseline is
-# ``adamw`` (a real fused cell + a shipped ``AdamW`` optimizer), NOT
-# ``moe_adam`` (which is not a megakernel cell — ``MoEAwareSuperGrok2`` routes
-# through the ``supergrok2`` cell). The prior list had ``moe_adam`` and was
-# missing ``adamw``; reconciled here.
+SHORT_MODELS = tuple(short_model_name(m) for m in MODELS)
 OPTIMIZERS = ("adamw", "grokadamw", "grokfast", "lion", "looksam", "muon",
-              "neuralgrok", "prodigy", "supergrok2", "supergrok15", "supergrok11")
+              "neuralgrok", "prodigy", "supergrok11", "supergrok15", "supergrok2")
+OPT_CLASS = {
+    "adamw":       "AdamW",
+    "grokadamw":   "GrokAdamW",
+    "grokfast":    "Grokfast",
+    "lion":        "Lion",
+    "looksam":     "LookSAM",
+    "muon":        "Muon",
+    "neuralgrok":  "NeuralGrok",
+    "prodigy":     "Prodigy",
+    "supergrok11": "SuperGrok11",
+    "supergrok15": "SuperGrok15",
+    "supergrok2":  "SuperGrok2",
+}
 
 _FUSED_REGISTRY = {}
 
