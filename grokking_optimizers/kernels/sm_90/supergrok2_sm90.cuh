@@ -678,6 +678,7 @@ parallel_scan_kernel(
                 smem[idx*6+3]=c.m11; smem[idx*6+4]=c.b0; smem[idx*6+5]=c.b1;
             }
             if (stride * 2 >= WARP_SIZE) __syncthreads();
+            else __syncwarp();
         }
 
         // Set last to identity (exclusive scan)
@@ -706,6 +707,7 @@ parallel_scan_kernel(
                 smem[idx*6+3]=c.m11; smem[idx*6+4]=c.b0; smem[idx*6+5]=c.b1;
             }
             if (stride * 2 >= WARP_SIZE) __syncthreads();
+            else __syncwarp();
         }
 
         // Phase 3: re-scan with prefix, accumulate output
