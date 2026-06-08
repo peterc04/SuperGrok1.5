@@ -51,8 +51,8 @@ def looksam_perturb(
     Returns perturbed parameter (original is unchanged — functional).
     """
     g = grad.reshape(-1).astype(jnp.float32)
-    gnorm = jnp.linalg.norm(g)
-    perturbation = jnp.where(gnorm > 0, rho * g / (gnorm + 1e-12), jnp.zeros_like(g))
+    gnorm = jnp.maximum(jnp.linalg.norm(g), 1e-12)
+    perturbation = rho * g / gnorm
     return (param.reshape(-1) + perturbation).reshape(param.shape)
 
 
@@ -62,8 +62,8 @@ def looksam_compute_direction(
 ) -> jnp.ndarray:
     """Compute sharpness-aware direction: normalize(perturbed - original)."""
     diff = perturbed_grad.reshape(-1) - orig_grad.reshape(-1)
-    dnorm = jnp.linalg.norm(diff)
-    return jnp.where(dnorm > 0, diff / dnorm, jnp.zeros_like(diff))
+    dnorm = jnp.maximum(jnp.linalg.norm(diff), 1e-12)
+    return diff / dnorm
 
 
 def looksam_adjust_grad(

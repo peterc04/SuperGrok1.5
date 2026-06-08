@@ -82,7 +82,7 @@ def muon_step(
     if param.ndim >= 2:
         X = new_m
         norm_val = jnp.linalg.norm(X)
-        X_normed = jnp.where(norm_val > 0, X / norm_val, X)
+        X_normed = X / jnp.maximum(norm_val, 1e-8)
         X_ortho = _newton_schulz_ortho(X_normed, config.ns_steps)
         update = X_ortho * norm_val
     else:
