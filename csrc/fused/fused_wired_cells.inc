@@ -6,12 +6,12 @@ std::string wired_fused_cell(const std::string& model,
  const std::string& optimizer, int arch) {
  if (arch == 90 && model == "transformer_decoder" && optimizer == "adamw")
   return "l3:transformer_decoder+adamw:sm_90";
- if (arch == 90 && model == "transformer_decoder" && optimizer == "lion")
-  return "l3:transformer_decoder+lion:sm_90";
- if (arch == 90 && model == "transformer_decoder" && optimizer == "grokfast")
-  return "l3:transformer_decoder+grokfast:sm_90";
  if (arch == 90 && model == "transformer_decoder" && optimizer == "grokadamw")
   return "l3:transformer_decoder+grokadamw:sm_90";
+ if (arch == 90 && model == "transformer_decoder" && optimizer == "grokfast")
+  return "l3:transformer_decoder+grokfast:sm_90";
+ if (arch == 90 && model == "transformer_decoder" && optimizer == "lion")
+  return "l3:transformer_decoder+lion:sm_90";
  if (arch == 90 && model == "transformer_decoder" && optimizer == "looksam")
   return "l3:transformer_decoder+looksam:sm_90";
  if (arch == 90 && model == "transformer_decoder" && optimizer == "muon")
@@ -28,12 +28,12 @@ std::string wired_fused_cell(const std::string& model,
   return "l3:transformer_decoder+supergrok2:sm_90";
  if (arch == 90 && model == "vit" && optimizer == "adamw")
   return "l3:vit+adamw:sm_90";
- if (arch == 90 && model == "vit" && optimizer == "lion")
-  return "l3:vit+lion:sm_90";
- if (arch == 90 && model == "vit" && optimizer == "grokfast")
-  return "l3:vit+grokfast:sm_90";
  if (arch == 90 && model == "vit" && optimizer == "grokadamw")
   return "l3:vit+grokadamw:sm_90";
+ if (arch == 90 && model == "vit" && optimizer == "grokfast")
+  return "l3:vit+grokfast:sm_90";
+ if (arch == 90 && model == "vit" && optimizer == "lion")
+  return "l3:vit+lion:sm_90";
  if (arch == 90 && model == "vit" && optimizer == "looksam")
   return "l3:vit+looksam:sm_90";
  if (arch == 90 && model == "vit" && optimizer == "muon")
@@ -50,12 +50,12 @@ std::string wired_fused_cell(const std::string& model,
   return "l3:vit+supergrok2:sm_90";
  if (arch == 90 && model == "mamba3" && optimizer == "adamw")
   return "l3:mamba3+adamw:sm_90";
- if (arch == 90 && model == "mamba3" && optimizer == "lion")
-  return "l3:mamba3+lion:sm_90";
- if (arch == 90 && model == "mamba3" && optimizer == "grokfast")
-  return "l3:mamba3+grokfast:sm_90";
  if (arch == 90 && model == "mamba3" && optimizer == "grokadamw")
   return "l3:mamba3+grokadamw:sm_90";
+ if (arch == 90 && model == "mamba3" && optimizer == "grokfast")
+  return "l3:mamba3+grokfast:sm_90";
+ if (arch == 90 && model == "mamba3" && optimizer == "lion")
+  return "l3:mamba3+lion:sm_90";
  if (arch == 90 && model == "mamba3" && optimizer == "looksam")
   return "l3:mamba3+looksam:sm_90";
  if (arch == 90 && model == "mamba3" && optimizer == "muon")
@@ -72,12 +72,12 @@ std::string wired_fused_cell(const std::string& model,
   return "l3:mamba3+supergrok2:sm_90";
  if (arch == 942 && model == "transformer_decoder" && optimizer == "adamw")
   return "l1:transformer_decoder+adamw:gfx942";
- if (arch == 942 && model == "transformer_decoder" && optimizer == "lion")
-  return "l1:transformer_decoder+lion:gfx942";
- if (arch == 942 && model == "transformer_decoder" && optimizer == "grokfast")
-  return "l1:transformer_decoder+grokfast:gfx942";
  if (arch == 942 && model == "transformer_decoder" && optimizer == "grokadamw")
   return "l1:transformer_decoder+grokadamw:gfx942";
+ if (arch == 942 && model == "transformer_decoder" && optimizer == "grokfast")
+  return "l1:transformer_decoder+grokfast:gfx942";
+ if (arch == 942 && model == "transformer_decoder" && optimizer == "lion")
+  return "l1:transformer_decoder+lion:gfx942";
  if (arch == 942 && model == "transformer_decoder" && optimizer == "looksam")
   return "l1:transformer_decoder+looksam:gfx942";
  if (arch == 942 && model == "transformer_decoder" && optimizer == "muon")
@@ -94,12 +94,12 @@ std::string wired_fused_cell(const std::string& model,
   return "l1:transformer_decoder+supergrok2:gfx942";
  if (arch == 942 && model == "vit" && optimizer == "adamw")
   return "l1:vit+adamw:gfx942";
- if (arch == 942 && model == "vit" && optimizer == "lion")
-  return "l1:vit+lion:gfx942";
- if (arch == 942 && model == "vit" && optimizer == "grokfast")
-  return "l1:vit+grokfast:gfx942";
  if (arch == 942 && model == "vit" && optimizer == "grokadamw")
   return "l1:vit+grokadamw:gfx942";
+ if (arch == 942 && model == "vit" && optimizer == "grokfast")
+  return "l1:vit+grokfast:gfx942";
+ if (arch == 942 && model == "vit" && optimizer == "lion")
+  return "l1:vit+lion:gfx942";
  if (arch == 942 && model == "vit" && optimizer == "looksam")
   return "l1:vit+looksam:gfx942";
  if (arch == 942 && model == "vit" && optimizer == "muon")
@@ -116,12 +116,12 @@ std::string wired_fused_cell(const std::string& model,
   return "l1:vit+supergrok2:gfx942";
  if (arch == 942 && model == "mamba3" && optimizer == "adamw")
   return "l3:mamba3+adamw:gfx942";
- if (arch == 942 && model == "mamba3" && optimizer == "lion")
-  return "l3:mamba3+lion:gfx942";
- if (arch == 942 && model == "mamba3" && optimizer == "grokfast")
-  return "l3:mamba3+grokfast:gfx942";
  if (arch == 942 && model == "mamba3" && optimizer == "grokadamw")
   return "l3:mamba3+grokadamw:gfx942";
+ if (arch == 942 && model == "mamba3" && optimizer == "grokfast")
+  return "l3:mamba3+grokfast:gfx942";
+ if (arch == 942 && model == "mamba3" && optimizer == "lion")
+  return "l3:mamba3+lion:gfx942";
  if (arch == 942 && model == "mamba3" && optimizer == "looksam")
   return "l3:mamba3+looksam:gfx942";
  if (arch == 942 && model == "mamba3" && optimizer == "muon")
@@ -138,12 +138,12 @@ std::string wired_fused_cell(const std::string& model,
   return "l3:mamba3+supergrok2:gfx942";
  if (arch == -1 && model == "transformer_decoder" && optimizer == "adamw")
   return "l3:transformer_decoder+adamw:tpu_v6e";
- if (arch == -1 && model == "transformer_decoder" && optimizer == "lion")
-  return "l3:transformer_decoder+lion:tpu_v6e";
- if (arch == -1 && model == "transformer_decoder" && optimizer == "grokfast")
-  return "l3:transformer_decoder+grokfast:tpu_v6e";
  if (arch == -1 && model == "transformer_decoder" && optimizer == "grokadamw")
   return "l3:transformer_decoder+grokadamw:tpu_v6e";
+ if (arch == -1 && model == "transformer_decoder" && optimizer == "grokfast")
+  return "l3:transformer_decoder+grokfast:tpu_v6e";
+ if (arch == -1 && model == "transformer_decoder" && optimizer == "lion")
+  return "l3:transformer_decoder+lion:tpu_v6e";
  if (arch == -1 && model == "transformer_decoder" && optimizer == "looksam")
   return "l3:transformer_decoder+looksam:tpu_v6e";
  if (arch == -1 && model == "transformer_decoder" && optimizer == "muon")
@@ -160,12 +160,12 @@ std::string wired_fused_cell(const std::string& model,
   return "l3:transformer_decoder+supergrok2:tpu_v6e";
  if (arch == -1 && model == "vit" && optimizer == "adamw")
   return "l3:vit+adamw:tpu_v6e";
- if (arch == -1 && model == "vit" && optimizer == "lion")
-  return "l3:vit+lion:tpu_v6e";
- if (arch == -1 && model == "vit" && optimizer == "grokfast")
-  return "l3:vit+grokfast:tpu_v6e";
  if (arch == -1 && model == "vit" && optimizer == "grokadamw")
   return "l3:vit+grokadamw:tpu_v6e";
+ if (arch == -1 && model == "vit" && optimizer == "grokfast")
+  return "l3:vit+grokfast:tpu_v6e";
+ if (arch == -1 && model == "vit" && optimizer == "lion")
+  return "l3:vit+lion:tpu_v6e";
  if (arch == -1 && model == "vit" && optimizer == "looksam")
   return "l3:vit+looksam:tpu_v6e";
  if (arch == -1 && model == "vit" && optimizer == "muon")
@@ -182,12 +182,12 @@ std::string wired_fused_cell(const std::string& model,
   return "l3:vit+supergrok2:tpu_v6e";
  if (arch == -1 && model == "mamba3" && optimizer == "adamw")
   return "l3:mamba3+adamw:tpu_v6e";
- if (arch == -1 && model == "mamba3" && optimizer == "lion")
-  return "l3:mamba3+lion:tpu_v6e";
- if (arch == -1 && model == "mamba3" && optimizer == "grokfast")
-  return "l3:mamba3+grokfast:tpu_v6e";
  if (arch == -1 && model == "mamba3" && optimizer == "grokadamw")
   return "l3:mamba3+grokadamw:tpu_v6e";
+ if (arch == -1 && model == "mamba3" && optimizer == "grokfast")
+  return "l3:mamba3+grokfast:tpu_v6e";
+ if (arch == -1 && model == "mamba3" && optimizer == "lion")
+  return "l3:mamba3+lion:tpu_v6e";
  if (arch == -1 && model == "mamba3" && optimizer == "looksam")
   return "l3:mamba3+looksam:tpu_v6e";
  if (arch == -1 && model == "mamba3" && optimizer == "muon")
