@@ -2564,7 +2564,6 @@ __global__ void moe_dynamic_expert_bwd_kernel(
     for (int j = lane; j < hidden; j += nthreads) {
         const float g = dz1[j];
         atomicAdd(&db1[j], g);
-        const float* w1row = W1 + static_cast<long>(j) * d_in;
         float* dw1row = dW1 + static_cast<long>(j) * d_in;
         for (int k = 0; k < d_in; ++k) atomicAdd(&dw1row[k], g * x[k]);
     }
