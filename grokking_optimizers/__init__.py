@@ -39,6 +39,7 @@ import torch  # noqa: F401 — load libc10.so first
 
 from grokking_optimizers.dispatch import (
     get_ops, detect_arch, has_kernels, UnsupportedArchError,
+    MODELS, OPTIMIZERS, OPT_CLASS, SHORT_MODELS,
 )
 
 
@@ -127,6 +128,9 @@ __all__ = [
     "NeuralGrok",
     "Prodigy",
     "MoEAwareSuperGrok2",
+
+    # Canonical model / optimizer lists (single source of truth: dispatch.py)
+    "MODELS", "OPTIMIZERS", "OPT_CLASS", "SHORT_MODELS",
 
     # Dispatch helpers
     "get_gpu_arch", "get_gpu_vendor", "get_backend", "get_arch_label",
