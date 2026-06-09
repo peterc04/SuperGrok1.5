@@ -890,6 +890,7 @@ def train_supergrok2(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         wd_ramp=c.get("sg2_wd_ramp",4.0), wd_scale=c.get("sg2_wd_scale",20.0),
         wd_thresh=c.get("sg2_wd_thresh",0.9),
         sam_enable_threshold=c.get("sg2_sam_enable_threshold",0.0),
+        meta_gate_power=c.get("sg2_meta_gate_power",None),
         use_grad_hooks=c.get("use_grad_hooks",False))
     opt.meta_net=opt.meta_net.to(dev)
     mopt=torch.optim.Adam(opt.meta_net.parameters(), lr=1e-4)

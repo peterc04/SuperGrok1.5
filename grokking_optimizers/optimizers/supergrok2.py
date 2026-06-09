@@ -1215,11 +1215,24 @@ class SuperGrok2(Optimizer):
         expert_allreduce_before_recycle: bool = True,
         mamba_state_sync_interval: int = 1000,
         state_precision: str = 'fp32',
+        meta_gate_power: Optional[float] = None,
         use_grad_hooks: bool = False,
     ):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.state_precision = state_precision
+
+        # Memorization-gate knob, added for API consistency with SuperGrok11/15
+        # (scale base_alpha by the monotonic ratchet (1 − max_train_acc)^p). NOTE:
+        # unlike SG11/15, SG2's observed instability is NOT the meta push — an
+        # on-device isolation shows SG2 collapses at train≈0.5 *before* it
+        # memorizes, and it collapses even with the meta contribution zeroed
+        # (rescale=0). The destabilizer is the grokfast `lamb` amplification term:
+        # with lamb=0 the base Adam core is stable and reaches test≈0.95. So SG2
+        # is a HYPERPARAMETER-TUNING target (tame `lamb`), not a meta-gate fix.
+        # This ratchet is therefore off by default and largely moot for SG2.
+        self.meta_gate_power = meta_gate_power
+        self._max_train_acc = 0.0
 
         self.alpha_init = alpha_init
         self.sam_enable_threshold = sam_enable_threshold
@@ -1583,6 +1596,12 @@ class SuperGrok2(Optimizer):
             self._update_alpha(train_loss, val_loss, train_acc)
 
         base_alpha = self._cached_alpha
+        # Memorization-gated meta correction (monotonic ratchet) — same fix as
+        # SuperGrok11/15. Scale the meta weight by (1 − max_train_acc)^p so the
+        # val-aligned push vanishes as the model memorizes and never re-enables.
+        if self.meta_gate_power is not None:
+            self._max_train_acc = max(self._max_train_acc, self._cached_train_acc)
+            base_alpha = base_alpha * (max(0.0, 1.0 - self._max_train_acc) ** self.meta_gate_power)
         ramp = self._get_ramp_factor()
         gate_signal = self._get_gate_signal()
 
