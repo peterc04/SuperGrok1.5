@@ -440,8 +440,27 @@ void launch_prodigy_dlr_reduce(
     SG_LAUNCH_CHECK(stream);
 }
 
-// Multi-tensor fused reduce + step: accumulate d_lr across all tensors,
-// then apply the Prodigy update to each.
+// Multi-tensor fused reduce + step: accumulate the Prodigy D-estimate's
+// PERSISTENT EMA numerator/denominator across all tensors, update d, then apply
+// the Prodigy update to each.
+//
+// Canonical persistent-EMA estimator (Mishchenko & Defazio 2023 / prodigyopt):
+// r_num_buf and s_den_buf are running EMAs that PERSIST across steps (carried in
+// by the host from the Python optimizer). At step start they are decayed by
+// beta3 = sqrt(beta2) — NOT zeroed — then this step's per-tensor reductions
+//   r += Σ g·(p_init−p)·d²     (numerator, prodigy_partials_step)
+//   s += Σ d²·|g|              (denominator L1, prodigy_partials_step)
+// are atomic-added on top (so r_ema = beta3·r_ema + Σd²·…). d is then
+//   d = max(d_prev, d_coef·r_ema/|s_ema|).
+// This is the FIX for the instantaneous form (which zeroed r/s every step): the
+// EMA averages post-memorization gradient-noise spikes over ~1/(1−beta3) steps
+// so the `max()` no longer locks a single spike in → d PLATEAUS once the params
+// stop drifting from init, instead of ratcheting up without bound (which had
+// blown d past ~1e-1 and collapsed training back to random).
+//
+// prodigy.h's per-element/update device math is UNCHANGED (byte-identical): the
+// EMA persistence + beta3 decay + d_coef scaling all live HERE in the host
+// launcher, so the cross-backend math single-source hash does not move.
 void launch_multi_tensor_prodigy_fused_reduce_step(
     std::vector<torch::Tensor>& params,
     std::vector<torch::Tensor>& grads,
@@ -451,18 +470,22 @@ void launch_multi_tensor_prodigy_fused_reduce_step(
     std::vector<torch::Tensor>& s_bufs,
     std::vector<float>& bc1s, std::vector<float>& bc2s,
     torch::Tensor d_lr_buf,
-    float beta1, float beta2, float lr, float wd, float eps
+    torch::Tensor r_num_buf, torch::Tensor s_den_buf,
+    float beta1, float beta2, float beta3, float lr, float wd, float eps,
+    float d_coef
 ) {
     if (params.empty()) return;
     auto dev = params[0].device();
-    auto r_partial = torch::zeros({1},
-        torch::TensorOptions().device(dev).dtype(torch::kFloat32));
-    auto s_partial = torch::zeros({1},
-        torch::TensorOptions().device(dev).dtype(torch::kFloat32));
     float d_prev = d_lr_buf.item<float>();
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int block = SG_TUNED_BLOCK_SIZE;
+
+    // EMA decay of the PERSISTENT numerator/denominator (in place). The reduce
+    // kernels below atomic-ADD this step's reduction on top, yielding
+    //   r_ema <- beta3·r_ema + Σ d²·<g,p_init−p> ;  s_ema <- beta3·s_ema + Σ d²·|g|.
+    r_num_buf.mul_(beta3);
+    s_den_buf.mul_(beta3);
 
     for (size_t i = 0; i < params.size(); i++) {
         const int64_t N = params[i].numel();
@@ -478,16 +501,23 @@ void launch_multi_tensor_prodigy_fused_reduce_step(
                     param_inits[i].data_ptr<scalar_t>(),
                     grads[i].data_ptr<scalar_t>(),
                     d_prev,
-                    r_partial.data_ptr<float>(),
-                    s_partial.data_ptr<float>(), N);
+                    r_num_buf.data_ptr<float>(),
+                    s_den_buf.data_ptr<float>(), N);
                 SG_LAUNCH_CHECK(stream);
             });
     }
 
+    // d = max(d_prev, d_coef·r_ema/|s_ema|). prodigy_update_d computes
+    // max(d_prev, r/|s|) verbatim (prodigy.h, byte-identical), so d_coef is
+    // folded by passing a SCALED numerator copy; the persistent r_num_buf keeps
+    // the UNSCALED EMA (returned to Python). d_coef defaults to 1.0 (no-op).
+    auto r_for_update = (d_coef == 1.0f)
+        ? r_num_buf
+        : (r_num_buf * d_coef).contiguous();
     prodigy_update_d_kernel<<<1, 1, 0, stream>>>(
         d_lr_buf.data_ptr<float>(),
-        r_partial.data_ptr<float>(),
-        s_partial.data_ptr<float>(), d_prev);
+        r_for_update.data_ptr<float>(),
+        s_den_buf.data_ptr<float>(), d_prev);
     SG_LAUNCH_CHECK(stream);
 
     for (size_t i = 0; i < params.size(); i++) {

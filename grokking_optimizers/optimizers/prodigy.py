@@ -9,6 +9,7 @@ is adjusted adaptively so that manual LR tuning is largely unnecessary.
 All computation is dispatched to the fused C++/CUDA kernel via _ops.
 """
 
+import math
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -41,12 +42,16 @@ class Prodigy(Optimizer):
         betas: Tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 1.0,
+        d0: float = 1e-6,
+        d_coef: float = 1.0,
         use_grad_hooks: bool = False,
     ) -> None:
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
         if eps < 0.0:
             raise ValueError(f"Invalid epsilon value: {eps}")
+        if d0 <= 0.0:
+            raise ValueError(f"Invalid d0 value: {d0}")
         if not 0.0 <= betas[0] < 1.0:
             raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
         if not 0.0 <= betas[1] < 1.0:
@@ -57,11 +62,27 @@ class Prodigy(Optimizer):
             betas=betas,
             eps=eps,
             weight_decay=weight_decay,
+            d0=d0,
+            d_coef=d_coef,
         )
         super().__init__(params, defaults)
 
-        # Global adaptive learning rate shared across all parameter groups.
-        self._d_lr: float = 1e-6
+        # Global adaptive learning rate shared across all parameter groups,
+        # initialised to d0 (the Prodigy D-estimate's starting value).
+        self._d_lr: float = d0
+        # Persistent EMA accumulators for the Prodigy D-estimate (canonical
+        # Mishchenko & Defazio 2023 / prodigyopt form). r/s are NO LONGER
+        # recomputed instantaneously each step: they are running EMAs decayed
+        # by beta3 = sqrt(beta2) across steps. r_ema tracks Σ d²·<g, p0−p>
+        # (numerator) and s_ema tracks Σ d²·‖g‖₁ (denominator) accumulated over
+        # the whole trajectory, so the estimate d_hat = d_coef·r_ema/|s_ema|
+        # PLATEAUS once the parameters stop drifting from init instead of
+        # ratcheting up forever on post-memorization gradient-noise spikes
+        # (the instantaneous form's `max()` locked those spikes in → d blew up
+        # → training collapsed). See the fused launcher for the decay-then-
+        # accumulate wiring.
+        self._r_ema: float = 0.0
+        self._s_ema: float = 0.0
 
         # Per-group cache of static tensor lists (params + exp_avg/exp_avg_sq/s/
         # param_init buffers keep a fixed identity across steps); only grads_list
@@ -150,8 +171,14 @@ class Prodigy(Optimizer):
                 state["step"] += 1
                 step_list.append(state["step"])
 
-            # The kernel returns the updated d_lr value.
-            self._d_lr = fused_step(
+            beta1, beta2 = group["betas"]
+            # beta3 governs the persistent-EMA decay of the D-estimate's
+            # numerator/denominator (canonical Prodigy uses sqrt(beta2)).
+            beta3 = math.sqrt(beta2)
+            # The kernel decays the persistent (r_ema, s_ema) by beta3, adds
+            # this step's reduction, updates d = max(d_prev, d_coef·r_ema/|s_ema|),
+            # applies, and returns the new (d_lr, r_ema, s_ema).
+            self._d_lr, self._r_ema, self._s_ema = fused_step(
                 params_list,
                 grads_list,
                 exp_avg_list,
@@ -160,17 +187,32 @@ class Prodigy(Optimizer):
                 param_init_list,
                 step_list,
                 self._d_lr,
-                group["betas"][0],
-                group["betas"][1],
+                self._r_ema,
+                self._s_ema,
+                beta1,
+                beta2,
+                beta3,
                 group["lr"],
                 group["weight_decay"],
                 group["eps"],
+                group["d0"],
+                group["d_coef"],
             )
 
         return loss
 
     def _single_param_step(self, param, group, state):
-        """Per-parameter step used by the `use_grad_hooks=True` path."""
+        """Per-parameter step used by the `use_grad_hooks=True` path.
+
+        KNOWN LIMITATION: the persistent-EMA D-estimate decays (r_ema, s_ema) by
+        beta3 ONCE PER fused_step CALL. On this per-parameter hook path that is
+        once per param per optimizer step, so a model with K parameters over-
+        decays the shared EMA by beta3**K each step (vs the intended beta3). The
+        D-estimate trajectory therefore differs from the standard (use_grad_hooks
+        =False) path. The grokking race uses use_grad_hooks=False, so this does
+        not affect it; fixing the hook path would require a per-step (not
+        per-param) decay barrier and is left out of scope.
+        """
         if param.grad is None:
             return
         if len(state) == 0:
@@ -180,12 +222,16 @@ class Prodigy(Optimizer):
             state["s"] = torch.zeros_like(param, dtype=torch.float32)
             state["param_init"] = param.data.clone().float()
         state["step"] += 1
-        self._d_lr = _ops.prodigy_fused_step(
+        beta1, beta2 = group["betas"]
+        beta3 = math.sqrt(beta2)
+        self._d_lr, self._r_ema, self._s_ema = _ops.prodigy_fused_step(
             [param], [param.grad], [state["exp_avg"]], [state["exp_avg_sq"]],
             [state["s"]], [state["param_init"]], [state["step"]],
-            getattr(self, '_d_lr', 1e-6),
-            group["betas"][0], group["betas"][1], group["lr"],
+            getattr(self, '_d_lr', group["d0"]),
+            getattr(self, '_r_ema', 0.0), getattr(self, '_s_ema', 0.0),
+            beta1, beta2, beta3, group["lr"],
             group["weight_decay"], group["eps"],
+            group["d0"], group["d_coef"],
         )
 
     @property

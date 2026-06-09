@@ -35,7 +35,7 @@ import torch
 
 sys.path.insert(0, ".")
 from tests.hw.test_reference_parity import (  # noqa: E402
-    ref_adamw_step, ref_lion_step, ref_muon_step,
+    ref_adamw_step, ref_lion_step, ref_muon_step, ref_sg11_step,
 )
 import grokking_optimizers as go            # noqa: E402,F401  (ensures _ops loads)
 import grokking_optimizers._ops as ops      # noqa: E402
@@ -243,6 +243,105 @@ def section3_supergrok_metanet() -> None:
 
 
 # ===========================================================================
+# Section 3b — SuperGrok11 FULL param-update parity (the cosine-gated mixing).
+#   The pre-fix fused path collapsed a memorized solution because it applied mu
+#   TWICE: mu_metanet formed smart_grad = g + alpha*mu, then adam_decay added
+#   AGAIN g_eff = smart_grad + (ramp*gate*lamb)*mu — a coefficient that GREW
+#   with the gate (wrong polarity), destroying the solution as rescale trained.
+#   Canonical (supergrok11.h:101 / Pallas ref / ref_sg11_step) is the SINGLE
+#   gated correction smart_grad = g + (1-gate)*alpha*mu with gate=cos(g,mu),
+#   which SHRINKS as alignment grows so the solution HOLDS.
+#
+#   Section 3 only validated the mu buffer. This validates the ENTIRE param /
+#   moment update against the fp64 oracle. Crucially the reference gate is
+#   recomputed INDEPENDENTLY in fp64 from (grad, mu_buffer) — NOT read from the
+#   kernel — so the gate FAILS if the kernel regresses to cos(smart_grad,mu),
+#   reintroduces the lamb*mu second add, or uses the wrong polarity.
+# ===========================================================================
+def _cosine_gate_ref(grad: torch.Tensor, mu: torch.Tensor) -> float:
+    """clamp(cos(grad, mu), 0, 1) in fp64 — matches compute_cosine_gate_fused
+       (num/sqrt(den_g*den_m + 1e-12))."""
+    g = grad.double().reshape(-1)
+    m = mu.double().reshape(-1)
+    num = (g * m).sum()
+    den = torch.sqrt((g * g).sum() * (m * m).sum() + 1e-12)
+    gate = (num / den) if float(den) > 0.0 else torch.tensor(0.0, dtype=torch.float64)
+    return float(torch.clamp(gate, 0.0, 1.0))
+
+
+def section3b_supergrok11_full_update() -> None:
+    print("\n== Section 3b: SuperGrok11 full param update parity (cosine-gated mixing) ==")
+    try:
+        torch.manual_seed(1107)
+        N, H = 4096, 32
+        # NON-trivial moments so the Adam tail is meaningfully exercised, and a
+        # higher step t so bias correction is non-degenerate.
+        p = torch.randn(N, device=DEV)
+        g = torch.randn(N, device=DEV)
+        ea = torch.randn(N, device=DEV) * 0.1
+        eas = (torch.randn(N, device=DEV) * 0.1).abs()  # exp_avg_sq >= 0
+        mu = torch.zeros(N, device=DEV)
+        sharp = torch.randn(N, device=DEV)
+        # Weights chosen so phi (hence mu) CORRELATES with grad: keep the grad
+        # column positive-mean and zero the sharpness column so mu is a smooth
+        # monotone-ish function of g -> the cosine gate lands in (0,1), which is
+        # exactly the regime the second-mu bug corrupted. (gate==0 or 1 would
+        # not exercise the gate scaling.)
+        W1 = torch.empty(H, 2, device=DEV)
+        W1[:, 0] = (torch.rand(H, device=DEV) * 0.4 + 0.1)   # +0.1..+0.5
+        W1[:, 1] = 0.0
+        b1 = torch.randn(H, device=DEV) * 0.2
+        W2 = (torch.rand(1, H, device=DEV) * 0.4 + 0.1)      # +0.1..+0.5
+        b2 = torch.randn(1, device=DEV) * 0.2
+        rescale = 0.7
+
+        alpha = 0.98
+        beta1 = 0.9
+        beta2 = 0.999
+        lr = 1e-3
+        eps = 1e-8
+        wd = 0.01
+        t = 5
+        gate_temp = 5.0
+
+        p0 = p.double().clone()
+        ea0 = ea.double().clone()
+        eas0 = eas.double().clone()
+        g0 = g.double().clone()
+
+        ops.supergrok11_fused_step(
+            [p], [g], [ea], [eas], [mu], [sharp], [t], [alpha], [beta1],
+            W1, b1, W2, b2, rescale, H,
+            beta2, lr, wd, eps,
+            # lamb, ramp, gate_temperature, grad_clip_norm.
+            # lamb/ramp are now unused in the mixing; grad_clip_norm=0 disables
+            # the in-place grad clip so the fp64 reference grad matches exactly.
+            5.0, 1.0, gate_temp, 0.0)
+        torch.cuda.synchronize()
+
+        # Independent fp64 reference. gate = clamp(cos(grad, mu_buffer),0,1) where
+        # mu_buffer is the kernel's own mu output (= rescale*MLP, validated in §3).
+        gate_ref = _cosine_gate_ref(g0, mu.double())
+        p_exp, m_exp, v_exp = ref_sg11_step(
+            p0, g0, ea0, eas0, mu.double(),
+            gate=gate_ref, alpha=alpha, lr=lr, beta1=beta1, beta2=beta2,
+            eps=eps, wd=wd, t=t)
+
+        dp = (p.double() - p_exp).abs().max().item()
+        dm = (ea.double() - m_exp).abs().max().item()
+        dv = (eas.double() - v_exp).abs().max().item()
+        # The gate MUST be exercised in (0,1), else this test is vacuous.
+        gate_ok = 0.01 < gate_ref < 0.99
+        passed = dp < 1e-4 and dm < 1e-4 and dv < 1e-4 and gate_ok
+        record("supergrok11 full update", passed,
+               f"gate={gate_ref:.3f} (want 0.01..0.99) "
+               f"max|dp|={dp:.2e} |dm|={dm:.2e} |dv|={dv:.2e} (tol 1e-4)")
+    except Exception as exc:
+        record("supergrok11 full update", False,
+               f"raised: {type(exc).__name__}: {exc}")
+
+
+# ===========================================================================
 # Section 4 — SuperGrok2 per-head PEER routing must RUN (no reshape crash).
 # ===========================================================================
 def section4_supergrok2() -> None:
@@ -266,6 +365,7 @@ def main() -> int:
     section1_anchors()
     section2_prodigy()
     section3_supergrok_metanet()
+    section3b_supergrok11_full_update()
     section4_supergrok2()
     n_pass = sum(1 for _, ok, _ in _RESULTS if ok)
     n_fail = len(_RESULTS) - n_pass

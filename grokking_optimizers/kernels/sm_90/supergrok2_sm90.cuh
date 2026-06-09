@@ -1543,6 +1543,9 @@ static void csa_hca_step_one(
     torch::Tensor& csa_out_W,
     torch::Tensor& hca_q_W, torch::Tensor& hca_k_W, torch::Tensor& hca_v_W,
     torch::Tensor& hca_out_W,
+    torch::Tensor& gru_Wz, torch::Tensor& gru_bz,
+    torch::Tensor& gru_Wr, torch::Tensor& gru_br,
+    torch::Tensor& gru_Wh, torch::Tensor& gru_bh,
     torch::Tensor& peer_query_Ws, torch::Tensor& prod_keys_A, torch::Tensor& prod_keys_B,
     torch::Tensor& expert_W1, torch::Tensor& expert_b1,
     torch::Tensor& expert_W2, torch::Tensor& expert_b2,
@@ -1612,9 +1615,17 @@ static void csa_hca_step_one(
                 SG_LAUNCH_CHECK(stream);
             });
     }
-    // Sort the sequence by |grad| (descending) so attention sees a meaningful
-    // ordering; remember the permutation to unsort the result.
-    auto sorted = sort_keys.sort(/*dim=*/0, /*descending=*/true);
+    // Sort the sequence by |grad| ASCENDING so attention sees the SAME ordering
+    // the eager net (supergrok2.py:676 `g.abs().argsort()`) and the bilevel
+    // adjoint oracle (supergrok2_bilevel_adjoint.h:543 "ascending (oracle)")
+    // were trained on. CSA/HCA are sequence attention with windows/compression/
+    // top-k — order-DEPENDENT, NOT permutation-equivariant — so a descending sort
+    // feeds the attention a distribution it never saw and produces garbage
+    // contexts → garbage routing. (The PEER tail downstream IS per-element/
+    // permutation-equivariant, so unsorting the [N] expert output once via this
+    // same `perm` is correct regardless of sort direction.) Remember the
+    // permutation to unsort the result.
+    auto sorted = sort_keys.sort(/*dim=*/0, /*descending=*/false);
     auto perm = std::get<1>(sorted).to(torch::kLong);          // [N]
     auto x_sorted = x_out.index_select(0, perm).contiguous();  // [N, d_model]
 
@@ -1653,12 +1664,70 @@ static void csa_hca_step_one(
                                    ? static_cast<int>(peer_query_Ws.size(2))
                                    : (2 * d_model + 2);
     const int gru_hidden = peer_input_dim - 2 * d_model - 2;
-    // NOTE: gru_new is a zero placeholder — the fused path does not reconstruct
-    // the matrix GRU (deliberate simplification; the gru_* weights are folded
-    // into the scalar mu_state blend in sg2_apply_kernel). Expert-selection match
-    // vs the eager net is validated downstream; if selection diverges, reconstruct
-    // the matrix-GRU forward here.
-    auto gru_new = torch::zeros({N, std::max(gru_hidden, 0)}, fopt32);  // PLACEHOLDER
+    // Matrix-GRU forward (MiniGRU), reconstructed to match the eager net
+    // (supergrok2.py CSAHCAMetaNet.forward:691-700) and the bilevel adjoint
+    // oracle (supergrok2_bilevel_adjoint.h:568-585). gru_new feeds the PEER
+    // routing input (20 of 22 peer_input columns are csa/hca/gru), so a zero
+    // placeholder makes expert selection diverge from the eager net → thrash.
+    //
+    // ALL terms fed to the GRU share the SAME |grad|-ASCENDING sorted order as
+    // csa_ctx/hca_ctx/g_sorted/s_sorted, so the per-element GRU output is in
+    // sorted order; it is written into peer_input directly (no unsort here —
+    // the [N] expert output is unsorted once at step (4)).
+    //
+    //   gru_input = cat(g, s, csa_ctx, hca_ctx)              [N, 2+2*d]
+    //   xh        = cat(gru_input, h_old)                    [N, gru_in+gh]
+    //   z = sigmoid(xh @ Wz.t() + bz) ; r = sigmoid(xh @ Wr.t() + br)
+    //   xrh       = cat(gru_input, r*h_old)
+    //   h_tilde   = tanh(xrh @ Wh.t() + bh)
+    //   h_new     = (1-z)*h_old + z*h_tilde                  [N, gru_hidden]
+    // Weights are PyTorch nn.Linear .weight [out=gh, in], so x @ W.t() is the
+    // forward (matches linear_fwd in the adjoint header). gru_state is the
+    // PER-ELEMENT carried state [N, gru_hidden] (supergrok2.py:1391/1404), NOT a
+    // [gru_hidden] broadcast — sort it by the same `perm`.
+    torch::Tensor gru_new;
+    // gru_hidden <= 0 is the only legitimate no-GRU case (peer_input has no GRU
+    // block). When gru_hidden > 0 and the GRU weights are present, the carried
+    // state MUST be [N, gru_hidden] — error LOUDLY on a mismatch rather than
+    // silently falling back to zeros, which would reintroduce the exact
+    // zero-GRU routing-garbage bug this reconstruction fixes.
+    const bool have_gru = gru_hidden > 0 && gru_Wz.defined() && gru_Wz.numel() > 0;
+    if (have_gru) {
+        TORCH_CHECK(gru_state.defined()
+                    && gru_state.numel() == static_cast<int64_t>(N) * gru_hidden,
+                    "supergrok2: gru_state numel ",
+                    (gru_state.defined() ? gru_state.numel() : -1),
+                    " != N*gru_hidden (", static_cast<int64_t>(N) * gru_hidden,
+                    ") — the matrix-GRU forward needs the per-element carried "
+                    "state [N, gru_hidden]; a mismatch would silently corrupt "
+                    "PEER routing.");
+        auto h_old = gru_state.reshape({N, gru_hidden}).to(torch::kFloat32)
+                         .index_select(0, perm).contiguous();          // [N, gh] sorted
+        auto gru_input = torch::cat({g_sorted.unsqueeze(1), s_sorted.unsqueeze(1),
+                                     csa_ctx, hca_ctx}, 1);             // [N, 2+2*d]
+        auto Wz = gru_Wz.to(torch::kFloat32), Wr = gru_Wr.to(torch::kFloat32),
+             Wh = gru_Wh.to(torch::kFloat32);
+        auto bz = gru_bz.to(torch::kFloat32), br = gru_br.to(torch::kFloat32),
+             bh = gru_bh.to(torch::kFloat32);
+        auto xh = torch::cat({gru_input, h_old}, 1);
+        auto z = torch::sigmoid(torch::mm(xh, Wz.t()) + bz.unsqueeze(0));
+        auto r = torch::sigmoid(torch::mm(xh, Wr.t()) + br.unsqueeze(0));
+        auto xrh = torch::cat({gru_input, r * h_old}, 1);
+        auto h_tilde = torch::tanh(torch::mm(xrh, Wh.t()) + bh.unsqueeze(0));
+        gru_new = (1.0f - z) * h_old + z * h_tilde;                     // [N, gh] sorted
+        // Persist the updated state back IN-PLACE (the fused Python path
+        // supergrok2.py:1646-1694 passes gru_state by reference and never
+        // reassigns it, unlike the eager paths). Write back in ORIGINAL element
+        // order (eager's new_gru / the persistent buffer are original order):
+        // unsort via the same perm, then copy_ into gru_state (downcasts to the
+        // buffer's dtype, e.g. bf16).
+        auto gru_new_orig = torch::empty({N, gru_hidden}, fopt32);
+        gru_new_orig.index_copy_(0, perm, gru_new);
+        gru_state.copy_(gru_new_orig.reshape(gru_state.sizes()));
+    } else {
+        // gru_hidden == 0 or weights/state absent: peer_input has no GRU block.
+        gru_new = torch::zeros({N, std::max(gru_hidden, 0)}, fopt32);
+    }
     auto peer_input = torch::cat({gru_new, csa_ctx, hca_ctx,
                                   g_sorted.unsqueeze(1), s_sorted.unsqueeze(1)}, 1);  // [N, peer_in]
     auto expert_sorted = detail::peer_expert_forward(
@@ -1673,7 +1742,11 @@ static void csa_hca_step_one(
     expert_out.index_copy_(0, perm, expert_sorted);
     expert_out.mul_(rescale);
 
-    // (5) Adam apply (GRU blend is fused inside sg2_apply_step via mu_state).
+    // (5) Adam apply. NOTE: the matrix-GRU above feeds ONLY the PEER routing
+    // input (peer_input), exactly as the eager net — its output does NOT enter
+    // the parameter update directly. sg2_apply_step's separate `mu_state`/
+    // `gru_decay` blend is an expert-output EMA (a temporal smoothing of
+    // expert_out), distinct from the matrix GRU, so there is no double-count.
     {
         const int block = SG_TUNED_BLOCK_SIZE;
         const int grid = std::min<int>(65535, (N + block - 1) / block);
@@ -1690,7 +1763,6 @@ static void csa_hca_step_one(
                 SG_LAUNCH_CHECK(stream);
             });
     }
-    (void)gru_state;  // carried state mirrored by mu_state in the elementwise tail
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1730,10 +1802,12 @@ void launch_csa_hca_step(
         exp_avg.data_ptr(), exp_avg.nbytes(),
         exp_avg_sq.data_ptr(), exp_avg_sq.nbytes());
 
-    (void)gru_Wz; (void)gru_bz; (void)gru_Wr; (void)gru_br;
-    (void)gru_Wh; (void)gru_bh; (void)lamb_eff; (void)pk_dim; (void)gru_hidden;
-    // The carried GRU decay is folded into alpha_mu's elementwise blend; use a
-    // fixed decay derived from beta1 for temporal smoothing (spec §3b GRU).
+    (void)lamb_eff; (void)pk_dim; (void)gru_hidden;
+    // GRU weights (gru_W*/gru_b*) are now plumbed into csa_hca_step_one, which
+    // reconstructs the matrix-GRU forward for the PEER routing input. The scalar
+    // `gru_decay` below is the SEPARATE expert-output EMA decay used by
+    // sg2_apply_step's mu_state blend (not the matrix GRU); keep deriving it
+    // from beta1 for temporal smoothing (spec §3b GRU tail).
     const float gru_decay = beta1;
     csa_hca_step_one(
         param, grad, sharpness, exp_avg, exp_avg_sq, mu, gru_state,
@@ -1741,6 +1815,7 @@ void launch_csa_hca_step(
         csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
         csa_idx_DQ, csa_idx_UQ, csa_idx_K, csa_out_W,
         hca_q_W, hca_k_W, hca_v_W, hca_out_W,
+        gru_Wz, gru_bz, gru_Wr, gru_br, gru_Wh, gru_bh,
         peer_query_Ws, prod_keys_A, prod_keys_B,
         expert_W1, expert_b1, expert_W2, expert_b2,
         rescale, alpha_mu, gru_decay, beta1, beta2, lr, wd_eff, eps, bc1, bc2,
@@ -1788,8 +1863,7 @@ void launch_csa_hca_batched_step(
     const size_t n = params.size();
     if (n == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    (void)gru_Wz; (void)gru_bz; (void)gru_Wr; (void)gru_br;
-    (void)gru_Wh; (void)gru_bh; (void)pk_dim; (void)gru_hidden;
+    (void)pk_dim; (void)gru_hidden;
     for (size_t i = 0; i < n; ++i) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
         const float gru_decay = beta1s[i];
@@ -1800,6 +1874,7 @@ void launch_csa_hca_batched_step(
             csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
             csa_idx_DQ, csa_idx_UQ, csa_idx_K, csa_out_W,
             hca_q_W, hca_k_W, hca_v_W, hca_out_W,
+            gru_Wz, gru_bz, gru_Wr, gru_br, gru_Wh, gru_bh,
             peer_query_Ws, prod_keys_A, prod_keys_B,
             expert_W1, expert_b1, expert_W2, expert_b2,
             rescale, alpha_mus[i], gru_decay, beta1s[i], beta2, lr, wd_eff, eps,

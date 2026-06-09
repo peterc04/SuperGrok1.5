@@ -198,16 +198,24 @@ void launch_prodigy_dlr_reduce(
     denominator.add_(s.to(torch::kFloat32).abs().sum());
 }
 
+// Canonical persistent-EMA Prodigy estimator (mirrors the sm_90 launcher):
+// r_num_buf / s_den_buf are running EMAs that PERSIST across steps, decayed by
+// beta3 = sqrt(beta2) here (NOT zeroed) before this step's r/s reduction is
+// added on top, so d = max(d_prev, d_coef·r_ema/|s_ema|) PLATEAUS once params
+// stop drifting from init (the instantaneous form ratcheted d up without bound
+// and collapsed training). prodigy.h device math is UNCHANGED — the EMA/beta3/
+// d_coef live in this host launcher.
 void launch_multi_tensor_prodigy_fused_reduce_step(
-    std::vector<torch::Tensor>& params, std::vector<torch::Tensor>& grads, std::vector<torch::Tensor>& param_inits, std::vector<torch::Tensor>& exp_avgs, std::vector<torch::Tensor>& exp_avg_sqs, std::vector<torch::Tensor>& s_bufs, std::vector<float>& bc1s, std::vector<float>& bc2s, torch::Tensor d_lr_buf, float beta1, float beta2, float lr, float wd, float eps
+    std::vector<torch::Tensor>& params, std::vector<torch::Tensor>& grads, std::vector<torch::Tensor>& param_inits, std::vector<torch::Tensor>& exp_avgs, std::vector<torch::Tensor>& exp_avg_sqs, std::vector<torch::Tensor>& s_bufs, std::vector<float>& bc1s, std::vector<float>& bc2s, torch::Tensor d_lr_buf, torch::Tensor r_num_buf, torch::Tensor s_den_buf, float beta1, float beta2, float beta3, float lr, float wd, float eps, float d_coef
 ) {
     if (params.empty()) return;
     auto dev = params[0].device();
     float d_prev = d_lr_buf.item<float>();
 
-    // Phase 1: accumulate r and s across all tensors
-    auto r_sum = torch::zeros({}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
-    auto s_sum = torch::zeros({}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
+    // Phase 1: PERSISTENT-EMA accumulate. Seed r/s with the beta3-decayed EMAs
+    // carried in from the host, then add this step's per-tensor reduction.
+    auto r_sum = (r_num_buf.to(torch::kFloat32) * beta3).reshape({});
+    auto s_sum = (s_den_buf.to(torch::kFloat32) * beta3).reshape({});
 #if defined(__HIPCC__)
     // LIVE (hipcc): §5 DPP r/s reduction, one launch per tensor → 2-float AGENT
     // accumulator [r,s]. d_prev² / d_prev² folded in the kernel; identical to ATen.
@@ -241,8 +249,13 @@ void launch_multi_tensor_prodigy_fused_reduce_step(
     }
 #endif
 
-    // Phase 2: update d
-    auto candidate = r_sum / (s_sum.abs() + 1e-12f);
+    // Persist the UNSCALED EMA numerator/denominator back to the host scalars
+    // (d_coef is applied only to the candidate, not the stored EMA).
+    r_num_buf.copy_(r_sum.reshape({1}));
+    s_den_buf.copy_(s_sum.reshape({1}));
+
+    // Phase 2: update d = max(d_prev, d_coef·r_ema/|s_ema|).
+    auto candidate = (d_coef * r_sum) / (s_sum.abs() + 1e-12f);
     d_lr_buf.copy_(torch::maximum(d_lr_buf.new_full({}, d_prev), candidate));
     float d_val = d_lr_buf.item<float>();
 

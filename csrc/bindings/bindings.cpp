@@ -1130,6 +1130,11 @@ namespace sg {
 #undef DECLARE_PRODIGY
 
 // Multi-tensor fused-reduce-step launcher (in multi_tensor_<arch>.cu).
+// r_num_buf / s_den_buf are PERSISTENT device scalars holding the Prodigy
+// D-estimate's EMA numerator/denominator (decayed by beta3 each step, NOT
+// zeroed); d_coef scales the candidate estimate. (See the launcher: this is
+// the canonical persistent-EMA Prodigy estimator, replacing the instantaneous
+// per-step r/s that ratcheted d up without bound.)
 #define DECLARE_MT_PRODIGY(NS) \
  namespace NS { \
  void launch_multi_tensor_prodigy_fused_reduce_step( \
@@ -1141,11 +1146,13 @@ namespace sg {
  std::vector<torch::Tensor>& s_bufs, \
  std::vector<float>& bc1s, std::vector<float>& bc2s, \
  torch::Tensor d_lr_buf, \
- float beta1, float beta2, float lr, float wd, float eps); \
+ torch::Tensor r_num_buf, torch::Tensor s_den_buf, \
+ float beta1, float beta2, float beta3, \
+ float lr, float wd, float eps, float d_coef); \
  }
  DECLARE_MT_PRODIGY(sm90)
 
-DECLARE_MT_PRODIGY(gfx942) 
+DECLARE_MT_PRODIGY(gfx942)
 #undef DECLARE_MT_PRODIGY
 
 void prodigy_step(
@@ -1169,8 +1176,15 @@ void prodigy_dlr_reduce(
 }
 
 // Pre-refactor csrc/common/ops.cpp::prodigy_fused_step.
-// Returns the updated d_lr (computed device-side, single CPU sync).
-float prodigy_fused_step(
+// Canonical persistent-EMA Prodigy D-estimate (Mishchenko & Defazio 2023 /
+// prodigyopt): the numerator r_ema and denominator s_ema are running EMAs
+// decayed by beta3 = sqrt(beta2) across steps (NOT recomputed instantaneously);
+// d = max(d_prev, d_coef·r_ema/|s_ema|). This makes d PLATEAU once the params
+// stop drifting from init, instead of the old instantaneous form whose `max()`
+// locked in post-memorization gradient-noise spikes → d blew up → collapse.
+// Returns (d_lr, r_ema, s_ema) — all three persist across steps in the Python
+// optimizer (like _d_lr). Single CPU sync.
+std::tuple<float, float, float> prodigy_fused_step(
  std::vector<torch::Tensor>& params,
  std::vector<torch::Tensor>& grads,
  std::vector<torch::Tensor>& exp_avgs,
@@ -1179,10 +1193,11 @@ float prodigy_fused_step(
  std::vector<torch::Tensor>& param_inits,
  std::vector<int64_t>& steps,
  float d_lr,
- float beta1, float beta2, float lr, float wd,
- float eps
+ float r_ema, float s_ema,
+ float beta1, float beta2, float beta3, float lr, float wd,
+ float eps, float d0, float d_coef
 ) {
- if (params.empty()) return d_lr;
+ if (params.empty()) return std::make_tuple(d_lr, r_ema, s_ema);
  check_params_grads(params, grads, "prodigy_fused_step");
 
  torch::Device dev(torch::kCPU);
@@ -1202,15 +1217,27 @@ float prodigy_fused_step(
  vs.push_back(s_bufs[i]);
  bc1_vec.push_back(bc1); bc2_vec.push_back(bc2);
  }
- if (vp.empty()) return d_lr;
+ if (vp.empty()) return std::make_tuple(d_lr, r_ema, s_ema);
 
  auto d_lr_buf = torch::tensor(
  {d_lr}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
+ // Persistent EMA numerator/denominator carried in/out as device scalars,
+ // seeded from the Python-held floats. The launcher decays each by beta3 and
+ // adds this step's reduction (d0 is a global constant that cancels in the
+ // ratio, so it is NOT threaded into the device math — the bare d²·<g,p0−p>
+ // and d²·‖g‖₁ partials already match prodigyopt up to that constant factor).
+ auto r_num_buf = torch::tensor(
+ {r_ema}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
+ auto s_den_buf = torch::tensor(
+ {s_ema}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
+ (void)d0;
 
  SG_DISPATCH_CALL(launch_multi_tensor_prodigy_fused_reduce_step,
  vp, vg, vpi, vea, veasq, vs, bc1_vec, bc2_vec, d_lr_buf,
- beta1, beta2, lr, wd, eps);
- return d_lr_buf.item<float>();
+ r_num_buf, s_den_buf,
+ beta1, beta2, beta3, lr, wd, eps, d_coef);
+ return std::make_tuple(
+ d_lr_buf.item<float>(), r_num_buf.item<float>(), s_den_buf.item<float>());
 }
 
 } // namespace sg
@@ -1311,13 +1338,31 @@ void supergrok11_fused_step(
  float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
  float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
 
+ // Canonical SuperGrok v1.1 mixing (csrc/algorithms/supergrok11.h:101,
+ // Pallas ref launch_supergrok11.py, oracle ref_sg11_step):
+ //   gate       = clamp(cosine(grad, mu), 0, 1)
+ //   smart_grad = grad + (1 - gate) * alpha * mu        (applied ONCE)
+ //   AdamW on smart_grad.
+ // The correction SHRINKS as grad/mu alignment (gate) grows — the polarity
+ // that lets a memorized solution HOLD. We reproduce this bit-exactly through
+ // the existing kernels by exact algebra, WITHOUT any kernel signature change:
+ //   * mu_metanet with alpha=0 writes mu = rescale*phi (mu is independent of
+ //     alpha, kernel line ~285) AND its smart_grad output = grad + 0*mu = grad.
+ //   * dispatch_cosine_gate(smart_grad==grad, mu) is therefore cosine(grad, mu).
+ //   * adam_decay computes g_eff = smart_grad + lamb_eff*mu; with
+ //     smart_grad==grad and lamb_eff=(1-gate)*alpha this equals exactly
+ //     grad + (1-gate)*alpha*mu, then the canonical Adam tail.
+ // `lamb`/`ramp` are NOT in the canonical formula (they were the buggy SECOND
+ // mu add `ramp*gate*lamb*mu`, whose coefficient GREW with the gate and
+ // destroyed the memorized solution); they are intentionally unused here.
+ (void)lamb; (void)ramp;
  auto smart_grad = torch::empty_like(params[i]);
  SG_DISPATCH_CALL(launch_sg11_mu_metanet,
- mus[i], grads[i], sharpness_cache[i], smart_grad, alpha,
+ mus[i], grads[i], sharpness_cache[i], smart_grad, /*alpha=*/0.0f,
  W1, b1, W2, b2, rescale, hidden_dim);
 
  float gate = dispatch_cosine_gate(smart_grad, mus[i], gate_temperature);
- float lamb_eff = (ramp > 0.0f) ? (ramp * gate * lamb) : 0.0f;
+ float lamb_eff = (1.0f - gate) * alpha;
 
  SG_DISPATCH_CALL(launch_sg11_adam_decay,
  params[i], exp_avgs[i], exp_avg_sqs[i], smart_grad, mus[i],
@@ -3324,7 +3369,8 @@ PYBIND11_MODULE(_ops, m) {
  m.def("prodigy_step", &sg::prodigy_step);
  m.def("prodigy_dlr_reduce", &sg::prodigy_dlr_reduce);
  m.def("prodigy_fused_step", &sg::prodigy_fused_step,
- "Pre-refactor ops.cpp::prodigy_fused_step (returns updated d_lr)");
+ "Prodigy fused step (persistent-EMA D-estimate); returns "
+ "(d_lr, r_ema, s_ema)");
 
  // NeuralGrok
  m.def("neuralgrok_amplifier", &sg::neuralgrok_amplifier);
