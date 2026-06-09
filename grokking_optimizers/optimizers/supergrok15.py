@@ -348,7 +348,23 @@ class SuperGrok15(Optimizer):
         return loss
 
     def sam_step(self, model, train_x, train_y, criterion):
-        """SAM perturbation + sharpness computation via functional_call (no param modification)."""
+        """SAM ascent step → per-parameter sharpness |g(w+e) − g(w)|.
+
+        Recomputes the gradient at the SAM-perturbed point e(w)=rho·g/‖g‖ via
+        ``torch.func.functional_call`` and stores the elementwise sharpness into
+        ``_flat_sharpness`` — the buffer both ``bilevel_step`` and the fused
+        kernel read as the meta-net's 2nd MLP input. Two correctness points the
+        previous version got wrong (identical bug to supergrok11.sam_step):
+          • the perturbed params are built from ``.detach()`` tensors, so they
+            must be ``.requires_grad_(True)`` or autograd has nothing to
+            differentiate (the old ``sam_loss.backward()`` raised
+            "element 0 … does not require grad" every call → sharpness stayed at
+            its zero init);
+          • ``functional_call`` substitutes the perturbed tensors as the
+            module's params, so gradients live on THEM, not on
+            ``model.parameters().grad``. We take them with ``autograd.grad`` and
+            leave each ``p.grad`` (the original backward result) untouched.
+        """
         self._ensure_state()
         train_grads = {}
         for name, p in model.named_parameters():
@@ -363,34 +379,33 @@ class SuperGrok15(Optimizer):
         grad_norm = total_norm_sq.sqrt() + 1e-12
         rho_over_norm = self.sam_rho / grad_norm
 
-        # Build perturbed parameter dict WITHOUT modifying actual params
+        # Perturbed params must require grad so autograd.grad can differentiate
+        # the SAM loss w.r.t. them (functional_call does NOT write into
+        # model.parameters().grad).
         named_params = dict(model.named_parameters())
-        perturbed_params = {}
+        pert_names = [n for n in named_params if n in train_grads]
+        perturbed = {}
         for name, p in named_params.items():
             if name in train_grads:
-                perturbed_params[name] = p.detach() + rho_over_norm * train_grads[name]
+                perturbed[name] = (p.detach() + rho_over_norm * train_grads[name]).requires_grad_(True)
             else:
-                perturbed_params[name] = p.detach()
+                perturbed[name] = p.detach()
 
-        # Forward at perturbed point — actual params untouched
-        model.zero_grad()
         with torch.enable_grad():
-            sam_logits = torch.func.functional_call(model, perturbed_params, (train_x,))
+            sam_logits = torch.func.functional_call(model, perturbed, (train_x,))
             sam_loss = criterion(sam_logits, train_y)
-            sam_loss.backward()
+            sam_grads = torch.autograd.grad(
+                sam_loss, [perturbed[n] for n in pert_names], allow_unused=True)
         sam_loss_val = sam_loss.item()
 
-        # Compute sharpness = |sam_grad - normal_grad|
-        for name, p in model.named_parameters():
-            pidx = self._param_to_idx.get(id(p))
-            if pidx is not None and p.grad is not None and name in train_grads:
-                sam_grad = p.grad.detach()
-                normal_grad = train_grads[name]
-                self._flat_sharpness[pidx] = (sam_grad - normal_grad).abs()
-
-        # Restore original grads
-        for name, p in model.named_parameters():
-            p.grad = train_grads.get(name)
+        # sharpness = |sam_grad - normal_grad|, flattened to match the (numel,)
+        # zero-init buffer the kernel reshapes
+        for name, sg in zip(pert_names, sam_grads):
+            if sg is None:
+                continue
+            pidx = self._param_to_idx.get(id(named_params[name]))
+            if pidx is not None:
+                self._flat_sharpness[pidx] = (sg.detach() - train_grads[name]).abs().reshape(-1)
 
         return sam_loss_val
 
