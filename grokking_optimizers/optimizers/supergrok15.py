@@ -313,6 +313,15 @@ class SuperGrok15(Optimizer):
         for p in self._flat_params:
             grads.append(p.grad.data if p.grad is not None else torch.Tensor())
 
+        # Own the step counter in Python. The fused binding receives `steps` BY
+        # VALUE (pybind copies the list[int]), so its internal `steps[i] += 1`
+        # never persists back here. Without owning it, _flat_steps stays frozen
+        # at 0 -> bc1/bc2 pinned at t=1 -> Adam denominator ~50x inflated and the
+        # model cannot memorize. Mirrors adamw.py / grokadamw.py.
+        for i, p in enumerate(self._flat_params):
+            if p.grad is not None and p.grad.numel() > 0:
+                self._flat_steps[i] += 1
+
         if self._weights_dirty:
             self._cached_weights = self.meta_net.get_weights()
             self._weights_dirty = False

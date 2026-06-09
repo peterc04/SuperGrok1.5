@@ -1303,7 +1303,9 @@ void supergrok11_fused_step(
 
  for (size_t i = 0; i < n_params; i++) {
  if (!grads[i].defined() || grads[i].numel() == 0) continue;
- steps[i] += 1;
+ // steps[i] is pre-incremented by the Python optimizer (SuperGrok11.step):
+ // pybind passes `steps` by value, so incrementing it here would NOT persist
+ // back to Python and would freeze bias-correction at t=1. Read it as-is.
  float alpha = layer_alphas[i];
  float beta1 = layer_beta1s[i];
  float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
@@ -1440,7 +1442,9 @@ void supergrok15_fused_step(
 
  for (size_t i = 0; i < n_params; i++) {
  if (!grads[i].defined() || grads[i].numel() == 0) continue;
- steps[i] += 1;
+ // steps[i] is pre-incremented by the Python optimizer (SuperGrok15.step):
+ // pybind passes `steps` by value, so incrementing here would not persist and
+ // would freeze bias-correction at t=1. Read it as-is.
  int64_t step = steps[i];
  float alpha = layer_alphas[i];
  float beta1 = layer_beta1s[i];
