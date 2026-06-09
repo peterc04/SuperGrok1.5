@@ -8,7 +8,7 @@
 // Self-tuning Adam. Estimates its own learning rate d from the cumulative
 // parameter trajectory: d_new = max(d_prev, r / s), where r and s are
 // global reductions across all parameters (s is the L1 norm ||·||_1):
-//   r += grad * (param_init - param) * d_prev
+//   r += grad * (param_init - param) * d_prev * d_prev   (degree-2 -> scale-free)
 //   s += d_prev * d_prev * |grad|
 //
 // Three operations:
@@ -39,7 +39,13 @@ __device__ __forceinline__ void prodigy_partials_step(
     const float pi = static_cast<float>(param_init[idx]);
     const float g  = static_cast<float>(grad[idx]);
 
-    r_local += g * (pi - p) * d_prev;
+    // Numerator and denominator must carry the SAME power of d so the estimate
+    // d_hat = r/s is scale-free (degree 0 in d). The denominator carries d²
+    // (below), so the numerator carries d² too. A degree-1 numerator (a single
+    // d_prev) made d_hat ∝ 1/d, which at the d0 = 1e-6 init blew d up by ~1e6×
+    // in a single step (catapult) and destroyed training — the fused kernel
+    // matched the canonical paper formula's intent only once both sides are d².
+    r_local += g * (pi - p) * d_prev * d_prev;
     // Prodigy d-estimate denominator is the L1 norm ||s||_1 = Σ_j |d²·g_j|
     // (arxiv 2306.06101), so accumulate |g| per coordinate. (Previously this
     // summed signed g and took |Σ| at reduce time — abs-of-sum ≠ L1 norm.)

@@ -10,3 +10,5 @@ dist/
 third_party/*
 !third_party/cutlass
 *.ptx
+.ruff_cache/
+.audit_notes.md

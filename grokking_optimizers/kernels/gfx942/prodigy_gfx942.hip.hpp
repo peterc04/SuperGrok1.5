@@ -10,7 +10,7 @@
 //       shared, compiler-verified primitives
 //       csrc/backends/hip/gfx942/amdgcn_primitives.hip.hpp — the prodigy
 //       r-sum and s-sum global reductions (the prodigy_reduce step) computed
-//       TOGETHER in one pass: each thread accumulates r_local += g·(p_init−p)
+//       TOGETHER in one pass: each thread accumulates r_local += g·(p_init−p)·d²
 //       and s_local += |s| (or d²·|g|), two DPP wavefront reduces, an LDS block
 //       tree for each, then two AGENT-scope global atomics. Mirrors the sm_90
 //       prodigy_reduce_kernel, replacing the ATen `.sum()` pair.
@@ -35,7 +35,7 @@
 //
 // COMPUTE PATTERN
 // Mixed: per-element + reduction.
-//   Per element: r_local += g * (p_init - p) * d
+//   Per element: r_local += g * (p_init - p) * d²
 //                s_local += d² * |g|
 //                AdamW apply with d as the lr scale
 //   Reduction:   r_global = sum(r_local) across all elements (single FP32 scalar)
@@ -108,8 +108,8 @@ void launch_prodigy_step(
     auto r_sum = torch::zeros({}, d_t.options());
     auto s_sum = torch::zeros({}, d_t.options());
 #if defined(__HIPCC__)
-    // LIVE (hipcc): the §5 DPP r/s reduction. The kernel folds d_prev (r) and
-    // d_prev² (s) in directly: r = Σ g·(p_init−p)·d_prev, s = Σ d_prev²·|g| —
+    // LIVE (hipcc): the §5 DPP r/s reduction. The kernel folds d_prev² (r) and
+    // d_prev² (s) in directly: r = Σ g·(p_init−p)·d_prev², s = Σ d_prev²·|g| —
     // numerically identical to the ATen body's two scaled .sum()s. One launch
     // per tensor accumulates into a 2-float AGENT accumulator [r,s].
     // §5.LAUNCH grid/block: block(256) = 4 wavefronts, grid = min(1024,(n+255)/256).
@@ -142,7 +142,7 @@ void launch_prodigy_step(
         auto& g = grads[i];
 
         auto delta = (pi - p).to(torch::kFloat32);
-        r_sum += (g.to(torch::kFloat32) * delta).sum() * d_prev;
+        r_sum += (g.to(torch::kFloat32) * delta).sum() * (d_prev * d_prev);
         s_sum += (g.to(torch::kFloat32).abs().sum()) * (d_prev * d_prev);
     }
 #endif
@@ -210,7 +210,7 @@ void launch_multi_tensor_prodigy_fused_reduce_step(
     auto s_sum = torch::zeros({}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
 #if defined(__HIPCC__)
     // LIVE (hipcc): §5 DPP r/s reduction, one launch per tensor → 2-float AGENT
-    // accumulator [r,s]. d_prev / d_prev² folded in the kernel; identical to ATen.
+    // accumulator [r,s]. d_prev² / d_prev² folded in the kernel; identical to ATen.
     auto rs_acc = torch::zeros({2}, torch::TensorOptions().device(dev).dtype(torch::kFloat32));
     auto stream = at::hip::getCurrentHIPStream();
     for (size_t i = 0; i < params.size(); i++) {
@@ -236,7 +236,7 @@ void launch_multi_tensor_prodigy_fused_reduce_step(
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
         auto gf = grads[i].to(torch::kFloat32);
         auto delta = (param_inits[i] - params[i]).to(torch::kFloat32);
-        r_sum += (gf * delta).sum() * d_prev;
+        r_sum += (gf * delta).sum() * (d_prev * d_prev);
         s_sum += gf.abs().sum() * (d_prev * d_prev);
     }
 #endif
@@ -320,7 +320,7 @@ static GrokGridDim   gridDim;
 //
 // The prodigy_reduce step: TWO parallel global sums computed in one pass,
 // mirroring the sm_90 prodigy_reduce_kernel —
-//   r_global = Σ_i g_i · (p_init_i − p_i) · d_prev     (numerator)
+//   r_global = Σ_i g_i · (p_init_i − p_i) · d_prev²    (numerator)
 //   s_global = Σ_i d_prev² · |g_i|                       (|denominator|)
 // then on the host: d_new = max(d_prev, r_global / (|s_global| + 1e-12)).
 // Each thread accumulates BOTH partials, then we run TWO independent
@@ -356,7 +356,7 @@ static constexpr int kWave = 64;   // == amd::kWave (CDNA3 wavefront width)
 __device__ __forceinline__ float dabsf(float x) { return __builtin_fabsf(x); }
 
 // Block (workgroup) prodigy r/s reduction over `[0..n)`, two AGENT atomics.
-// r_i = g_i·(p_init_i − p_i)·d_prev ;  s_i = d_prev²·|g_i|.
+// r_i = g_i·(p_init_i − p_i)·d_prev² ;  s_i = d_prev²·|g_i|.
 // blockDim.x must be a multiple of kWave and <= kWave*kWave (<= 4096); LDS holds
 // one float per wavefront per quantity (<= 2*64 floats).
 __device__ __forceinline__ void prodigy_rs_block(
@@ -376,7 +376,7 @@ __device__ __forceinline__ void prodigy_rs_block(
 
     // VECTORIZED reduction body (WS5/item 6): widen the 3-buffer read to 128-bit
     // (f32x4 / dwordx4) memory access — was three scalar loads/iter. The 4 lanes
-    // accumulate the IDENTICAL scalar partials (r_i = g_i·(p_init_i−p_i)·d_prev,
+    // accumulate the IDENTICAL scalar partials (r_i = g_i·(p_init_i−p_i)·d_prev²,
     // s_i = d²·|g_i|), so the per-thread partials are bit-identical to the scalar
     // form — only the access width changes. A scalar TAIL covers the n%4 remainder.
     // NONTEMPORAL POLICY: g is the read-once grad → streaming (nontemporal); p is
@@ -396,7 +396,7 @@ __device__ __forceinline__ void prodigy_rs_block(
         #pragma unroll
         for (int l = 0; l < 4; ++l) {
             float delta = piv[l] - pv[l];
-            r_local += gv[l] * delta * d_prev;
+            r_local += gv[l] * delta * d2;
             s_local += d2 * dabsf(gv[l]);
         }
     }
@@ -404,7 +404,7 @@ __device__ __forceinline__ void prodigy_rs_block(
     for (int64_t i = n4v + gtid; i < n; i += stride) {
         float gi = amd::streaming_load(&g[i]);
         float delta = amd::cached_load(&p_init[i]) - amd::cached_load(&p[i]);
-        r_local += gi * delta * d_prev;
+        r_local += gi * delta * d2;
         s_local += d2 * dabsf(gi);
     }
     // two wavefront DPP reduces: every lane holds the wavefront r/s sums.

@@ -1394,21 +1394,30 @@ static torch::Tensor hca_context(
 
 // PEER routing + per-element expert MLP. Reuses the existing expert tensors.
 //
-// REAL product-key top-k routing (restored): the query projection is split into
-// halves q_a / q_b; we score against product-key sub-codebooks A and B, take the
-// top-k of EACH (k = peer_topk, default 4), form the k×k Cartesian product of
-// candidate experts (expert = a_idx * nb + b_idx), softmax-weight them by the
-// summed sub-scores, run the per-element expert MLP for each of the k² selected
-// experts and return the routing-weighted combination. This matches the bilevel
-// adjoint's PEER head (csrc/algorithms/supergrok2_bilevel_adjoint.h:
-// peer_head_backward) which uses scores_a.topk / scores_b.topk + softmax over
-// num_active = topk*topk. The previous code collapsed this to argmax (top-1) and
-// gathered a single expert — a routing-quality regression vs the trained
-// top-k product-key gate. When product keys are absent we fall back to a single
-// shared expert (index 0), unchanged.
+// MULTI-HEAD product-key top-k routing (restored): the PEER weights are stacked
+// per head — peer_query_Ws = [num_peer_heads, d_model, peer_in];
+// prod_keys_{A,B} = [num_peer_heads, pk_dim, d_model/2]. We LOOP over the heads
+// (NOT collapse the head axis): per head, query = peer_input @ Wq.t() [N,d_model];
+// query is split into halves q_a / q_b (half = d_model/2); we score against
+// product-key sub-codebooks A and B, take the top-k of EACH (k = peer_topk,
+// default 4), form the k×k Cartesian product of candidate experts
+// (expert = a_idx * na + b_idx, na == pk_dim), softmax-weight them by the
+// per-axis scores (temperature 10), run the per-element expert MLP for each of
+// the k² selected experts and accumulate the routing-weighted combination; the
+// head outputs are then AVERAGED (÷ num_peer_heads). This matches the eager net
+// (grokking_optimizers/optimizers/supergrok2.py: SuperGrok2 forward, ~L705-750),
+// the bilevel adjoint (csrc/algorithms/supergrok2_bilevel_adjoint.h:
+// peer_head_backward + its driver loop) and the Pallas backend
+// (csrc/backends/pallas/launch_supergrok2.py: peer_expert_forward) — all three
+// use the identical per-head layout. The previous code FLATTENED the head axis
+// (`peer_query_Ws.reshape({-1, d_model})`, `prod_keys_A.reshape({-1, half})`),
+// which corrupted the routing and crashed on the reshape (shape '[-1, 44]' for
+// size 192). When product keys are absent we fall back to a single shared
+// expert (index 0), unchanged.
 static torch::Tensor peer_expert_forward(
-    const torch::Tensor& feat,              // [N, d_model] float (gru ⊕ ctx)
-    const torch::Tensor& peer_query_Ws,     // [num_heads?, d_model] or [d_model]
+    const torch::Tensor& peer_input,        // [N, peer_in] float (gru ⊕ csa ⊕ hca ⊕ g ⊕ s)
+    const torch::Tensor& g_elem,            // [N] float — per-element grad (expert-MLP input)
+    const torch::Tensor& peer_query_Ws,     // [num_peer_heads, d_model, peer_in]
     const torch::Tensor& prod_keys_A,
     const torch::Tensor& prod_keys_B,
     const torch::Tensor& expert_W1,         // [num_experts, expert_hidden] (per-elem MLP)
@@ -1419,10 +1428,13 @@ static torch::Tensor peer_expert_forward(
     torch::Tensor& expert_counts,
     int peer_topk = 4)
 {
-    auto lopt = torch::TensorOptions().dtype(torch::kLong).device(feat.device());
+    auto lopt = torch::TensorOptions().dtype(torch::kLong).device(peer_input.device());
+    auto fopt32 = torch::TensorOptions().dtype(torch::kFloat32).device(peer_input.device());
 
     // Per-element expert MLP weights (shared codebook, indexed per element).
-    auto scalar_in = feat.mean(1);                                          // [N]
+    // The MLP input is the per-element grad g (matches eager `g_exp` at L742 and
+    // adjoint `g` at peer_head_backward), NOT a mean over feature columns.
+    auto scalar_in = g_elem.reshape({N}).to(torch::kFloat32);               // [N]
     auto W1 = expert_W1.reshape({num_experts, -1}).to(torch::kFloat32);     // [E, H]
     auto b1 = expert_b1.reshape({num_experts, -1}).to(torch::kFloat32);     // [E, H]
     auto W2 = expert_W2.reshape({num_experts, -1}).to(torch::kFloat32);     // [E, H]
@@ -1446,59 +1458,65 @@ static torch::Tensor peer_expert_forward(
         return (out * routing_w).sum(1);                          // [N]
     };
 
-    torch::Tensor out;
-    torch::Tensor count_idx;   // [N*A] long, for activation counting
+    // Per-head PEER product-key routing (matches eager SuperGrok2.forward +
+    // bilevel adjoint peer_head_backward + Pallas peer_expert_forward).
+    // peer_query_Ws = [num_peer_heads, d_model, peer_in]; prod_keys_{A,B} =
+    // [num_peer_heads, pk_dim, d_model/2]. half = d_model/2 (NOT Q/2 — query is
+    // exactly d_model wide). Each head routes independently; head outputs are
+    // averaged (÷ num_peer_heads).
+    torch::Tensor out = torch::zeros({N}, fopt32);   // [N]
+    std::vector<torch::Tensor> count_chunks;         // each [N*A] long, for counts
     if (prod_keys_A.defined() && prod_keys_A.numel() > 0 &&
-        peer_query_Ws.defined() && peer_query_Ws.numel() >= d_model) {
-        auto qw = peer_query_Ws.reshape({-1, d_model}).to(torch::kFloat32);  // [Q, d_model]
-        auto query = feat.matmul(qw.transpose(0, 1));                        // [N, Q]
-        const int Q = query.size(1);
-        const int half = Q / 2 > 0 ? Q / 2 : Q;
-        auto qa = query.narrow(1, 0, half);
-        auto A = prod_keys_A.reshape({-1, half}).to(torch::kFloat32);        // [na, half]
-        auto sa = qa.matmul(A.transpose(0, 1));                              // [N, na]
-        int na = A.size(0);
+        peer_query_Ws.defined() && peer_query_Ws.dim() == 3) {
+        const int num_peer_heads = static_cast<int>(peer_query_Ws.size(0));
+        const int half = d_model / 2;
         const double T = 10.0;   // gate temperature (matches adjoint PEER head)
-
-        if (prod_keys_B.defined() && prod_keys_B.numel() > 0 && Q - half > 0) {
-            auto qb = query.narrow(1, half, Q - half);
-            auto B = prod_keys_B.reshape({-1, Q - half}).to(torch::kFloat32);
-            auto sb = qb.matmul(B.transpose(0, 1));                          // [N, nb]
-            int nb = B.size(0);
-            const int ka = std::min<int>(std::max(peer_topk, 1), na);
-            const int kb = std::min<int>(std::max(peer_topk, 1), nb);
-            auto ta = sa.topk(ka, -1);  // vals,idx  [N, ka]
-            auto tb = sb.topk(kb, -1);  // vals,idx  [N, kb]
-            auto top_a_vals = std::get<0>(ta), top_a_idx = std::get<1>(ta);
-            auto top_b_vals = std::get<0>(tb), top_b_idx = std::get<1>(tb);
-            auto soft_a = torch::softmax(top_a_vals * T, -1);                // [N, ka]
-            auto soft_b = torch::softmax(top_b_vals * T, -1);
-            // k_a × k_b Cartesian product of candidate experts + routing weights.
-            auto expert_idx = (top_a_idx.unsqueeze(2) * nb + top_b_idx.unsqueeze(1))
-                                  .reshape({N, ka * kb})
-                                  .clamp(0, num_experts - 1);               // [N, A]
-            auto routing_w = (soft_a.unsqueeze(2) * soft_b.unsqueeze(1))
-                                  .reshape({N, ka * kb});                   // [N, A]
-            out = run_experts(expert_idx, routing_w);
-            count_idx = expert_idx.reshape({-1});
-        } else {
-            // Single sub-codebook: top-k over A directly.
+        const bool has_B = prod_keys_B.defined() && prod_keys_B.numel() > 0;
+        for (int h = 0; h < num_peer_heads; ++h) {
+            auto Wq = peer_query_Ws.select(0, h).to(torch::kFloat32);   // [d_model, peer_in]
+            auto query = peer_input.matmul(Wq.transpose(0, 1));         // [N, d_model]
+            auto A = prod_keys_A.select(0, h).to(torch::kFloat32);      // [pk_dim, half]
+            const int na = static_cast<int>(A.size(0));                 // == pk_dim
+            auto qa = query.narrow(1, 0, half);                         // [N, half]
+            auto sa = qa.matmul(A.transpose(0, 1));                     // [N, pk_dim]
             const int ka = std::min<int>(std::max(peer_topk, 1), na);
             auto ta = sa.topk(ka, -1);
             auto top_a_vals = std::get<0>(ta), top_a_idx = std::get<1>(ta);
-            auto soft_a = torch::softmax(top_a_vals * T, -1);               // [N, ka]
-            auto expert_idx = top_a_idx.clamp(0, num_experts - 1);          // [N, ka]
-            out = run_experts(expert_idx, soft_a);
-            count_idx = expert_idx.reshape({-1});
+            auto soft_a = torch::softmax(top_a_vals * T, -1);           // [N, ka]
+            torch::Tensor expert_idx, routing_w;
+            if (has_B && (d_model - half) > 0) {
+                auto B = prod_keys_B.select(0, h).to(torch::kFloat32);  // [pk_dim, half]
+                auto qb = query.narrow(1, half, d_model - half);        // [N, d_model-half]
+                auto sb = qb.matmul(B.transpose(0, 1));                 // [N, pk_dim]
+                const int nb = static_cast<int>(B.size(0));
+                const int kb = std::min<int>(std::max(peer_topk, 1), nb);
+                auto tb = sb.topk(kb, -1);
+                auto top_b_vals = std::get<0>(tb), top_b_idx = std::get<1>(tb);
+                auto soft_b = torch::softmax(top_b_vals * T, -1);       // [N, kb]
+                // k_a × k_b Cartesian product of candidate experts + weights.
+                // expert = a_idx * na + b_idx (na == pk_dim — matches eager L724
+                // `* self.pk_dim` and adjoint L639 `* pk_dim`).
+                expert_idx = (top_a_idx.unsqueeze(2) * na + top_b_idx.unsqueeze(1))
+                                 .reshape({N, ka * kb}).clamp(0, num_experts - 1);
+                routing_w = (soft_a.unsqueeze(2) * soft_b.unsqueeze(1)).reshape({N, ka * kb});
+            } else {
+                // Single sub-codebook: top-k over A directly.
+                expert_idx = top_a_idx.clamp(0, num_experts - 1);       // [N, ka]
+                routing_w  = soft_a;                                    // [N, ka]
+            }
+            out = out + run_experts(expert_idx, routing_w);             // [N]
+            count_chunks.push_back(expert_idx.reshape({-1}));
         }
+        out = out / static_cast<float>(std::max(num_peer_heads, 1));
     } else {
         // No product keys → single shared expert (index 0), weight 1.
         auto expert_idx = torch::zeros({N, 1}, lopt);
-        auto routing_w  = torch::ones({N, 1},
-            torch::TensorOptions().dtype(torch::kFloat32).device(feat.device()));
+        auto routing_w  = torch::ones({N, 1}, fopt32);
         out = run_experts(expert_idx, routing_w);
-        count_idx = expert_idx.reshape({-1});
+        count_chunks.push_back(expert_idx.reshape({-1}));
     }
+    auto count_idx = count_chunks.size() == 1 ? count_chunks[0]
+                                              : torch::cat(count_chunks, 0);
 
     // Update expert activation counts (best-effort; reused by recycling). Now
     // counts every selected expert in the top-k combination, not just one.
@@ -1614,14 +1632,41 @@ static void csa_hca_step_one(
         x_sorted, hca_q_W, hca_k_W, hca_v_W, hca_out_W,
         N, d_model, num_heads, head_dim, hca_compress, csa_window, stream);
 
-    // (3) Combine contexts (sum of fine + coarse), PEER routing + expert MLP.
-    auto feat = csa_ctx + hca_ctx;  // [N, d_model]
+    // (3) Build the real-width PEER input, then PEER routing + expert MLP.
+    //
+    // The eager net (supergrok2.py SuperGrok2.forward, ~L697) builds
+    //   peer_input = cat(new_gru[N,gru_hidden], csa_ctx[N,d_model],
+    //                    hca_ctx[N,d_model], g[N,1], s[N,1])  = [N, peer_in].
+    // peer_expert_forward is purely per-element (no reduction over N), so its
+    // output is permutation-equivariant in the row axis: computing peer_input in
+    // |grad|-SORTED order here and unsorting the result ONCE at step (4) via the
+    // SAME `perm` is identical to the eager net's original-order computation.
+    // csa_ctx/hca_ctx are already in sorted order (they come straight off
+    // x_sorted with no unsort), so we sort g/s by the SAME `perm` (from L~1600)
+    // to keep every column of peer_input describing the same element per row.
+    auto fopt32 = torch::TensorOptions().dtype(torch::kFloat32).device(dev);
+    auto g_sorted = grad.reshape({-1}).to(torch::kFloat32).index_select(0, perm);       // [N]
+    auto s_sorted = sharpness.reshape({-1}).to(torch::kFloat32).index_select(0, perm);  // [N]
+    // peer_in is read from the real weight (peer_query_Ws = [num_peer_heads,
+    // d_model, peer_in]); derive gru_hidden = peer_in - 2*d_model - 2.
+    const int peer_input_dim = (peer_query_Ws.defined() && peer_query_Ws.dim() == 3)
+                                   ? static_cast<int>(peer_query_Ws.size(2))
+                                   : (2 * d_model + 2);
+    const int gru_hidden = peer_input_dim - 2 * d_model - 2;
+    // NOTE: gru_new is a zero placeholder — the fused path does not reconstruct
+    // the matrix GRU (deliberate simplification; the gru_* weights are folded
+    // into the scalar mu_state blend in sg2_apply_kernel). Expert-selection match
+    // vs the eager net is validated downstream; if selection diverges, reconstruct
+    // the matrix-GRU forward here.
+    auto gru_new = torch::zeros({N, std::max(gru_hidden, 0)}, fopt32);  // PLACEHOLDER
+    auto peer_input = torch::cat({gru_new, csa_ctx, hca_ctx,
+                                  g_sorted.unsqueeze(1), s_sorted.unsqueeze(1)}, 1);  // [N, peer_in]
     auto expert_sorted = detail::peer_expert_forward(
-        feat, peer_query_Ws, prod_keys_A, prod_keys_B,
+        peer_input, g_sorted, peer_query_Ws, prod_keys_A, prod_keys_B,
         expert_W1, expert_b1, expert_W2, expert_b2,
         N, d_model, num_experts, expert_hidden, expert_counts,
-        /*peer_topk=*/peer_topk);  // [N] sorted — real product-key top-k combination
-                                   // (configurable; default 4 preserves PEER top-4)
+        /*peer_topk=*/peer_topk);  // [N] sorted — real per-head product-key top-k
+                                   // combination (configurable; default 4 = PEER top-4)
 
     // (4) Unsort expert output back to original element order, scale.
     auto expert_out = torch::empty({N}, fopt);

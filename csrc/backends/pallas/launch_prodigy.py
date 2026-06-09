@@ -55,6 +55,13 @@ def prodigy_step(
     """One Prodigy step. Returns (new_param, new_state, new_d_lr).
 
     Distance-based adaptive LR estimation + Adam.
+
+    NOT ON THE LIVE FUSED-TU PATH — standalone EMA-`s_buf` reference only (no
+    callers; the fused composition in _pallas_fused.py dispatches Prodigy through
+    ``launch_prodigy_step`` below, which is the canonical fused-TU contract).
+    Its d-estimate uses an EMA denominator (degree-1 in d), so the matching
+    scale-free numerator here would be degree-1 (a single d power), NOT the
+    degree-2 form of launch_prodigy_step. Kept as-is; see launch_prodigy_step.
     """
     step = state.step + 1
     p_flat = param.reshape(-1).astype(jnp.float32)
@@ -100,12 +107,15 @@ def launch_prodigy_step(
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, float]:
     """Per-tensor Prodigy step (fused-TU contract)."""
     delta = param_init - param
-    r_sum = jnp.sum(grad * delta) * d_prev
-    # NOTE (audit): this uses the Prodigy-paper L1 norm Σ_j|d²·g_j| (== d²·Σ|g|),
-    # which matches the HIP backend but DIFFERS from canonical prodigy.h, whose
-    # denom is |Σ_j d²·g_j| (abs-of-sum). The header is the outlier vs the paper
-    # + HIP + this path; resolving header-vs-paper is a pending design decision,
-    # so this is left as-is rather than aligned to the (likely-buggy) header.
+    r_sum = jnp.sum(grad * delta) * (d_prev * d_prev)
+    # NOTE (audit): the numerator carries d² (degree-2) to MATCH the denominator's
+    # d² so the estimate d_hat = r/s is scale-free (degree 0 in d). A degree-1
+    # numerator (a single d_prev) made d_hat ∝ 1/d, which at the d0 = 1e-6 init
+    # blew d up by ~1e6× in one step (catapult); the degree-2 form is VALIDATED
+    # on H100 against the external prodigyopt 1.1.2 package (d tracks prodigyopt,
+    # no catapult — see tests/hw/parity_gate_h100.py §2). The denominator is the
+    # Prodigy-paper L1 norm Σ_j|d²·g_j| (== d²·Σ|g|), consistent with canonical
+    # prodigy.h (per-element fabsf, i.e. L1) and the HIP backend.
     s_sum = jnp.sum(jnp.abs(grad)) * (d_prev * d_prev)
     candidate = r_sum / (jnp.abs(s_sum) + 1e-12)
     d = jnp.maximum(d_prev, candidate)

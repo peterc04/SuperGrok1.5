@@ -8759,7 +8759,14 @@ def _build_macros(spec: BuildSpec) -> List[str]:
 # no finite-only assumption) and standard for compute kernels.
 HOST_CFLAGS_BASE = [
     "-O3", "-std=c++17", "-fPIC",
-    "-flto=auto",
+    # NB: host ``-flto=auto`` is DELIBERATELY omitted. nvcc emits one
+    # file-local ``fatbinData`` static per CUDA TU; with host LTO the link
+    # merges every TU's GIMPLE into one ltrans unit where those statics
+    # collide → ``Error: symbol 'fatbinData' is already defined`` and the
+    # .so never links (verified on this H100; the same failure is documented
+    # in setup.py's ``_strip_flto`` for the install build, commit a9276b5).
+    # LTO gives negligible win for these kernels (the heavy lifting is in
+    # device SASS) so dropping it is pure upside here.
     "-fno-semantic-interposition", "-fvisibility=hidden",
     "-fdata-sections", "-ffunction-sections",
     "-fno-math-errno", "-fno-trapping-math",
@@ -8844,17 +8851,27 @@ NVCC_DEVICE_BASE = [
     # lives in ``_newer_compiler_flags`` (probes nvcc at runtime); keeping
     # it out of the base list means CUDA 11/12.0–12.4 builds still succeed.
     "--extra-device-vectorization",
-    "-Xcompiler", "-fPIC", "-Xcompiler", "-flto=auto",
+    # NB: ``-Xcompiler -flto=auto`` (host LTO on the CUDA TU's host portion)
+    # is DELIBERATELY omitted — it is the direct cause of the
+    # ``symbol 'fatbinData' is already defined`` multi-TU link failure (one
+    # fatbinData static per CUDA TU, merged into one ltrans unit by host
+    # LTO). Mirrors setup.py's ``_strip_flto`` for the install build
+    # (commit a9276b5). ``-Xcompiler -fPIC`` stays (position-independent
+    # code is required for the shared object).
+    "-Xcompiler", "-fPIC",
     "-Xcompiler", "-fno-strict-aliasing",
     # Quiet the linker on big templated kernels — these warnings are
     # CUTLASS/cuBLASLt routine and never actionable.
     "-Xnvlink", "--suppress-stack-size-warning",
     "--resource-usage",
-    # F-A — ``-dlto`` / ``-rdc=true`` MOVED to ``_newer_compiler_flags``
-    # gated at CUDA >= 11.4. Per the CUDA Toolkit Features Archive,
-    # device-LTO landed in CUDA 11.4, NOT 11.2 as the previous comment
-    # claimed. CUDA 11.0/11.1/11.2/11.3 nvcc rejects the pair with
-    # "Unknown option '-dlto'" and breaks the per-TU compile entirely.
+    # F-A — ``-dlto`` / ``-rdc=true`` are NOT emitted anywhere on the
+    # compile line. ``-dlto`` conflicts with the ``code=sm_90a`` gencode
+    # this list pairs with (``nvcc fatal: '-dlto' conflicts with
+    # '-gencode' or '-code'``), and ``-rdc=true`` needs a separate
+    # ``nvcc -dlink`` device-link step that the torch.cpp_extension build
+    # path doesn't run. See ``_newer_compiler_flags`` for the full
+    # rationale; the device-link-only ``--device-link-options=-dlto`` (for
+    # a future dlink-capable wrapper) lives in ``_device_ldflags``.
     # F-D — ``--source-in-ptx`` MOVED to ``_device_cflags(spec)`` and is
     # only emitted when ``spec.debug_symbols or spec.profile`` is True
     # (paired with the existing ``-lineinfo`` / ``--generate-line-info``
@@ -8927,9 +8944,21 @@ HIPCC_DEVICE_BASE = [
 ]
 
 LDFLAGS_BASE = [
-    "-flto=auto", "-Wl,--as-needed",
+    # NB: link-time host ``-flto=auto`` is DELIBERATELY omitted (it was here
+    # historically). With the per-TU ``-Xcompiler -flto`` also gone, a
+    # link-time ``-flto`` would have no LTO objects to consume and, worse,
+    # re-triggers the ``fatbinData`` collision when it tries to LTO-merge the
+    # CUDA TUs' host portion. Consistent with setup.py's ``_strip_flto``.
+    "-Wl,--as-needed",
     "-Wl,--gc-sections", "-Wl,-O3",
-    "-Wl,--icf=all",
+    # NB: ``-Wl,--icf=all`` (Identical Code Folding) is DELIBERATELY omitted.
+    # It is an LLD/gold-only option — the default GNU BFD ``ld`` (which
+    # torch.utils.cpp_extension's ``c++ -shared`` link invokes) rejects it
+    # with ``ld: unrecognized option '--icf=all'`` and the .so never links
+    # (verified on ld 2.38). It also offers negligible size benefit for a
+    # JIT extension and aggressive ICF can fold address-compared functions
+    # (a correctness footgun). Forcing ``-fuse-ld=gold`` to keep it would
+    # impose a global linker choice on every user — out of scope here.
 ]
 
 
@@ -9565,14 +9594,37 @@ def _xla_env(arch: str, out_dir: Path,
     return env
 
 
+def _cutlass_include_paths() -> List[str]:
+    """The CUTLASS ``-I`` dirs to feed nvcc when the vendored submodule is
+    checked out, mirroring ``setup.py``'s install build (the two dirs at
+    setup.py ``cuda_include_dirs += [...]``). The ``include`` dir holds the
+    core headers (``cutlass/cutlass.h``) and ``tools/util/include`` holds the
+    util headers (``cutlass/util/packed_stride.hpp``) the sm_90 kernels pull
+    in. Gated on the SAME ``third_party/cutlass/include`` existence check
+    that ``_device_cflags`` uses to emit ``-DWITH_CUTLASS`` — so the macro
+    and the include path are never out of sync (defining the macro without
+    the ``-I`` is exactly the bug that made the JIT build fail to find
+    ``cutlass/cutlass.h``). Empty list when the submodule isn't vendored.
+    """
+    cutlass_inc = REPO_ROOT / "third_party/cutlass/include"
+    if not cutlass_inc.exists():
+        return []
+    return [str(cutlass_inc),
+            str(REPO_ROOT / "third_party/cutlass/tools/util/include")]
+
+
 def _include_paths(spec: Optional["BuildSpec"] = None) -> List[str]:
     """Resolve the ``-I`` include-path list torch's cpp_extension feeds nvcc.
 
     Stream A: ``spec.source_roots["bindings"]`` (if set) overrides the
     historical ``REPO_ROOT/csrc/bindings`` path, and any
     ``spec.source_roots["extra_includes"]`` entries are appended. With no
-    spec (or an empty source_roots dict) the return value is exactly
-    ``[REPO_ROOT/csrc/bindings, REPO_ROOT]`` — byte-identical to today.
+    spec (or an empty source_roots dict) the return value is
+    ``[REPO_ROOT/csrc/bindings, REPO_ROOT]`` plus the CUTLASS include dirs
+    when the vendored submodule is checked out (see
+    ``_cutlass_include_paths`` — these match ``setup.py``'s install build so
+    the JIT autotuner can resolve ``cutlass/cutlass.h`` exactly like the AOT
+    build does).
     """
     paths: List[str] = []
     if spec is not None:
@@ -9585,8 +9637,10 @@ def _include_paths(spec: Optional["BuildSpec"] = None) -> List[str]:
         paths.append(str(REPO_ROOT))
         for extra in roots.get("extra_includes", []) or []:
             paths.append(str(_resolve_path(spec, extra)))
+        paths += _cutlass_include_paths()
         return paths
-    return [str(REPO_ROOT / "csrc/bindings"), str(REPO_ROOT)]
+    return ([str(REPO_ROOT / "csrc/bindings"), str(REPO_ROOT)]
+            + _cutlass_include_paths())
 
 
 # ---------------------------------------------------------------------------
@@ -9607,6 +9661,48 @@ def _writable_cache_dir(name: str) -> Optional[Path]:
     return None
 
 
+def _ccache_masquerade_dir(cache_tool: str) -> Optional[Path]:
+    """Transparent-ccache shim: a dir of symlinks (cc, c++, gcc, g++, clang,
+    clang++ -> cache_tool) so a *bare* compiler name on PATH resolves to the
+    cache wrapper. Satisfies BOTH ninja and torch's
+    check_compiler_ok_for_platform (which runs `which <CXX>` on the whole
+    string then realpath-resolves it). Returns the dir, or None if it cannot be
+    created. Idempotent."""
+    d = _writable_cache_dir("ccache-shim")
+    if d is None:
+        return None
+    for name in ("cc", "c++", "gcc", "g++", "clang", "clang++"):
+        link = d / name
+        try:
+            if link.is_symlink() or link.exists():
+                if link.is_symlink() and os.readlink(link) == cache_tool:
+                    continue
+                link.unlink()
+            link.symlink_to(cache_tool)
+        except OSError:
+            return None
+    return d
+
+
+def _masquerade_compiler_name(shim: Path, cache_tool: str,
+                              env_var: str, default: str) -> str:
+    """Bare compiler name to put in CC/CXX. If the user set a custom compiler
+    (e.g. CXX=/usr/bin/g++-12), ensure a same-basename symlink -> cache_tool
+    exists in the shim dir and return that basename so ccache still drives the
+    user's chosen compiler. Falls back to ``default``."""
+    requested = os.environ.get(env_var, default)
+    base = os.path.basename(requested)
+    link = shim / base
+    try:
+        if not (link.is_symlink() and os.readlink(link) == cache_tool):
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            link.symlink_to(cache_tool)
+    except OSError:
+        return default
+    return base
+
+
 def _sccache_env() -> Dict[str, str]:
     """Detect ccache (preferred for host TUs) and sccache (preferred for
     NVCC), wire whichever is present. Honour ``SCCACHE_REDIS_ENDPOINT``
@@ -9622,20 +9718,27 @@ def _sccache_env() -> Dict[str, str]:
 
     if ccache:
         host_dir = _writable_cache_dir("ccache")
-        if host_dir is not None:
+        shim = _ccache_masquerade_dir(ccache)
+        if host_dir is not None and shim is not None:
             out["CCACHE_DIR"] = str(host_dir)
-            out["CC"]  = f"{ccache} {os.environ.get('CC',  'cc')}"
-            out["CXX"] = f"{ccache} {os.environ.get('CXX', 'c++')}"
+            out["PATH"] = f"{shim}{os.pathsep}{os.environ.get('PATH', '')}"
+            out["CC"]  = _masquerade_compiler_name(shim, ccache, "CC",  "cc")
+            out["CXX"] = _masquerade_compiler_name(shim, ccache, "CXX", "c++")
 
     if sccache:
         sc_dir = _writable_cache_dir("sccache")
         if sc_dir is not None:
             out.setdefault("SCCACHE_DIR", str(sc_dir))
-            # If ccache didn't claim host wrappers, sccache takes them.
-            out.setdefault("CC",  f"{sccache} {os.environ.get('CC',  'cc')}")
-            out.setdefault("CXX", f"{sccache} {os.environ.get('CXX', 'c++')}")
-            out["CUDA_NVCC_EXECUTABLE"] = f"{sccache} nvcc"
-        # Redis backend (§12 I1) propagates unconditionally if user set it.
+            if "CXX" not in out:
+                shim = _ccache_masquerade_dir(sccache)
+                if shim is not None:
+                    out["PATH"] = f"{shim}{os.pathsep}{os.environ.get('PATH', '')}"
+                    out["CC"]  = _masquerade_compiler_name(shim, sccache, "CC",  "cc")
+                    out["CXX"] = _masquerade_compiler_name(shim, sccache, "CXX", "c++")
+            # NVCC through sccache via torch's SUPPORTED knob (PYTORCH_NVCC), NOT
+            # CUDA_NVCC_EXECUTABLE (a CMake var cpp_extension ignores). Space-form
+            # is safe here — torch writes it verbatim into ninja, never which's it.
+            out["PYTORCH_NVCC"] = f"{sccache} nvcc"
         for k in ("SCCACHE_REDIS_ENDPOINT", "SCCACHE_REDIS", "SCCACHE_S3_BUCKET"):
             if k in os.environ:
                 out[k] = os.environ[k]
@@ -10767,20 +10870,30 @@ def _newer_compiler_flags(arch: str, report=None,
             _gate("--diag-suppress=20012,20013",
                   "11.2", fired,
                   f"gated CUDA>=11.2, have {ver_str}")
-            # F-A — ``-dlto`` (compile-time device-LTO bitcode emit) and
-            # ``-rdc=true`` (relocatable device code, required for -dlto
-            # to link across TUs) BOTH require CUDA 11.4+. Per the CUDA
-            # Toolkit Features Archive, device-LTO landed in 11.4 — not
-            # 11.2 as the previous comment in NVCC_DEVICE_BASE claimed.
-            # CUDA 11.0/11.1/11.2/11.3 nvcc reject ``-dlto`` and break
-            # the per-TU compile entirely. We emit the pair together so
-            # the LTO bitcode actually has somewhere to live.
-            fired = ver >= (11, 4)
-            if fired:
-                extra_device += ["-dlto", "-rdc=true"]
-            _gate("-dlto -rdc=true (device LTO pair)",
-                  "11.4", fired,
-                  f"gated CUDA>=11.4, have {ver_str}")
+            # F-A — ``-dlto`` (device-LTO) and ``-rdc=true`` (relocatable
+            # device code) are DELIBERATELY NOT emitted here. ``-dlto`` is
+            # fundamentally incompatible with the SASS-emitting per-TU
+            # compile this codebase uses: every ``nvcc -c`` also passes
+            # ``-gencode=arch=compute_90a,code=sm_90a`` and nvcc fatals
+            # ``'-dlto' conflicts with '-gencode' or '-code'`` (verified on
+            # sm_90a / nvcc 12.4). Device LTO would require switching the
+            # gencode to ``code=lto_90a`` AND a separate ``nvcc -dlink``
+            # device-link step — but the torch.utils.cpp_extension pipeline
+            # (the autotuner's build driver) does ``nvcc -c`` per source then
+            # links with g++ directly, with NO ``nvcc -dlink`` step, so LTO
+            # bitcode would have nowhere to live. ``-rdc=true`` is likewise
+            # dropped: with ``-dlto`` gone it buys no LTO, the kernels make
+            # no cross-TU ``__device__`` calls (so no relocatable code is
+            # needed), and relocatable device code without a device-link
+            # step risks ``__cudaRegisterLinkedBinary`` link failures. So
+            # the pair is invalid/useless for this build mode — not a
+            # tunable. (Device-link-only LTO, if a future wrapper grows the
+            # dlink step, lives in ``_device_ldflags`` as
+            # ``--device-link-options=-dlto``.)
+            _gate("-dlto / -rdc=true (device LTO pair — not emitted)",
+                  "11.4", False,
+                  "device LTO incompatible with code=sm_90a per-TU compile; "
+                  "no nvcc -dlink step in the torch build path")
             fired = ver >= (12, 6)
             if fired:
                 # NVCC 12.6+ supports --split-compile for opt-phase parallelism.
@@ -16541,14 +16654,39 @@ def _self_test_utilization(run) -> None:
 
     def test_track_cell_crashes_on_no_device():
         from grokking_optimizers import utilization as u
-        # No accelerator here → MUST raise RuntimeError, not return a status
-        # record.  Crash-hard policy: failures are never papered over.
+        try:
+            import torch
+            cuda = bool(torch.cuda.is_available())
+        except Exception:
+            cuda = False
+
+        if not cuda:
+            raised = False
+            try:
+                u.track_cell("adamw", "mamba", "sm_90a", iters=1, timeout=30)
+            except RuntimeError:
+                raised = True
+            assert raised, "track_cell must raise RuntimeError when no device"
+            return
+
+        # A device IS present: the no-device raise must NOT fire...
+        s = u.make_sampler("sm_90a")
+        assert s.available() is True and s.backend == "nvml"
+        # ...and crash-hard must STILL hold for a mid-run sampler failure.
+        class _BoomSampler(u.DeviceSampler):
+            backend = "nvml"
+            def available(self):
+                return True
+            def _read(self):
+                raise RuntimeError("counter read failed mid-run")
         raised = False
         try:
-            u.track_cell("adamw", "mamba", "sm_90a", iters=1, timeout=30)
+            u.track_cell("adamw", "mamba", "sm_90a", iters=1, timeout=30,
+                         sampler=_BoomSampler(interval_s=0.01))
         except RuntimeError:
             raised = True
-        assert raised, "track_cell must raise RuntimeError when no device"
+        assert raised, ("track_cell must raise when the sampler fails mid-run, "
+                        "even with a device present")
 
     def test_report_json_schema_roundtrip():
         from grokking_optimizers import utilization as u
@@ -16677,12 +16815,13 @@ def _self_test_flags(run) -> None:
         of the pre-Stream-3 base flag list. Guards against accidental
         regressions on these two canonical archs.
 
-        Post-F-A: ``-dlto`` was moved from NVCC_DEVICE_BASE into
-        ``_newer_compiler_flags`` (CUDA >= 11.4 gate). The base-flag
-        superset list below no longer asserts ``-dlto`` membership on
-        the unconditional ``_device_cflags()`` output; we add a
-        secondary check via the version-gated path so the contract is
-        still expressed when nvcc is available.
+        Post-F-A: ``-dlto`` / ``-rdc=true`` are NO LONGER emitted by
+        ``_newer_compiler_flags`` at all (they were removed — device LTO
+        is incompatible with the ``code=sm_90a`` SASS-emitting per-TU
+        compile, and the torch build path runs no ``nvcc -dlink`` step).
+        The base-flag superset list below never asserted ``-dlto``; we add
+        a secondary NEGATIVE check via the version-gated path so a future
+        edit can't silently re-introduce the invalid pair.
         """
         sm90 = set(_device_cflags(_spec("sm_90a")))
         # Mandate #6 — ``--use_fast_math`` is DELIBERATELY no longer in the
@@ -16698,15 +16837,19 @@ def _self_test_flags(run) -> None:
         # #6 — fast-math must NOT be a default base flag.
         assert "--use_fast_math" not in sm90, \
             "fast-math must be a validated variant, not a base default"
-        # F-A — verify the device-LTO pair still appears under the
-        # version-gated path when nvcc 11.4+ is available.
+        # F-A — verify the device-LTO pair is NEVER injected via the
+        # version-gated path: ``-dlto`` conflicts with ``code=sm_90a`` and
+        # ``-rdc=true`` needs a device-link step the torch build path lacks,
+        # so neither must appear in the fully-expanded device cflags.
         if _probe_nvcc_version() and _probe_nvcc_version() >= (11, 4):
             sm90_gated = set(
                 _device_cflags(_spec("sm_90a"), include_version_gated=True))
-            assert "-dlto" in sm90_gated, \
-                "sm_90 lost -dlto from the CUDA>=11.4 gated path"
-            assert "-rdc=true" in sm90_gated, \
-                "sm_90 lost -rdc=true from the CUDA>=11.4 gated path"
+            assert "-dlto" not in sm90_gated, \
+                "-dlto re-introduced into the gated path (conflicts with " \
+                "code=sm_90a — fatals nvcc -c)"
+            assert "-rdc=true" not in sm90_gated, \
+                "-rdc=true re-introduced into the gated path (no LTO, no " \
+                "dlink step — useless and link-risky)"
 
         gfx942 = set(_device_cflags(_spec("gfx942")))
         # #6 — -ffast-math removed from the gfx942 base too (validated variant).
@@ -16790,17 +16933,19 @@ def _self_test_flags(run) -> None:
 
     def test_stream_alpha_nvcc_flags():
         """Stream α: sm_90a build line must include the new NVCC perf flags
-        (--warn-on-spills, --default-stream per-thread, --source-in-ptx,
-        -rdc=true), and the ptxas-v stderr parser must populate a non-empty
+        (--warn-on-spills, --default-stream per-thread, --source-in-ptx),
+        and the ptxas-v stderr parser must populate a non-empty
         ptxas_info dict in the trial sidecar.
 
         Post-F-A/F-D: ``--source-in-ptx`` is only emitted when
         ``spec.debug_symbols or spec.profile`` (BuildSpec defaults
-        ``profile=True`` so the bare _spec() helper still triggers it),
-        and ``-dlto / -rdc=true`` MOVED to ``_newer_compiler_flags``
-        gated at CUDA >= 11.4 — so we call ``_device_cflags`` with
-        ``include_version_gated=True`` to fold those in, OR (on hosts
-        without nvcc) we relax the version-gated assertions to a probe.
+        ``profile=True`` so the bare _spec() helper still triggers it).
+        ``-dlto / -rdc=true`` are no longer emitted at all (device LTO is
+        incompatible with the ``code=sm_90a`` per-TU compile and the torch
+        build path has no ``nvcc -dlink`` step), so the asserts below come
+        only from the base/feature flags, not from ``_newer_compiler_flags``.
+        We still call ``_device_cflags`` with ``include_version_gated=True``
+        to exercise the fully-expanded list ``--flag-audit`` emits.
         """
         spec_90 = _spec("sm_90a")
         # include_version_gated=True asks _device_cflags to additionally
@@ -16819,13 +16964,13 @@ def _self_test_flags(run) -> None:
         assert "--source-in-ptx" in joined, \
             "sm_90a missing --source-in-ptx (F-D gate: profile=True is " \
             "the default — this should always fire here)"
-        # ``-rdc=true`` is now version-gated at CUDA >= 11.4 (F-A). When
-        # nvcc isn't on PATH the gate can't fire; in that case the
-        # assertion is moot — skip it cleanly.
-        if _probe_nvcc_version() and _probe_nvcc_version() >= (11, 4):
-            assert "-rdc=true" in joined, \
-                "sm_90a missing -rdc=true (F-A gate fired but the flag " \
-                "wasn't appended)"
+        # ``-dlto`` / ``-rdc=true`` are intentionally NOT emitted (see the
+        # docstring / _newer_compiler_flags). Assert the invalid pair stays
+        # out so a regression can't sneak it back in.
+        assert "-dlto" not in joined, \
+            "-dlto must not appear (conflicts with code=sm_90a)"
+        assert "-rdc=true" not in joined, \
+            "-rdc=true must not appear (no LTO / no dlink step)"
         # ---- ptxas-v stderr parser populates per-variant sidecar ---------
         synthetic = (
             "ptxas info    : Compiling entry function '_Znopkernel' for 'sm_90'\n"

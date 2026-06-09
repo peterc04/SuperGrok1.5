@@ -48,7 +48,7 @@ using ::sg::algorithms::sg15_phi_forward;
 using ::sg::algorithms::sg15_sweep_a_step;
 using ::sg::algorithms::sg15_sweep_b_step;
 
-constexpr int SG15_H = 64;
+constexpr int SG15_H = 32;
 
 // Minimum resident blocks/SM for the element-wise sweeps. Caps registers so
 // occupancy stays high on the (memory-bound) Adam apply.
@@ -77,7 +77,7 @@ __global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_SUPERGROK15_MIN_BLOCKS
 sg15_sweep_a_kernel(
     float* mu_out, const GradT* grad, const float* sharpness,
     const float* W1, const float* b1, const float* W2, float b2,
-    float* sharp_partial, int64_t N
+    float rescale, float* sharp_partial, int64_t N
 ) {
     __shared__ float sW1[SG15_H * 2];
     __shared__ float sb1[SG15_H];
@@ -90,7 +90,12 @@ sg15_sweep_a_kernel(
         SG_SANITIZE_GRAD_INPLACE(grad, i);
         const float g = static_cast<float>(grad[i]);
         const float s = sharpness[i];
-        const float mu_val = sg15_phi_forward<SG15_H>(g, s, sW1, sb1, sW2, b2);
+        // Apply the trained rescale here (SharpnessMetaNet defines the
+        // correction as rescale*MLP), mirroring SG11's mu_metanet kernel.
+        // Previously rescale was dropped before this kernel, so mu_buf held the
+        // bare MLP output (the H100 parity gate caught mu == MLP, not rescale*MLP).
+        const float mu_val =
+            rescale * sg15_phi_forward<SG15_H>(g, s, sW1, sb1, sW2, b2);
         sg15_sweep_a_step(mu_out, grad, mu_val, i, sl);
     }
     float r = prim::block_reduce_sum_f32(sl);
@@ -163,6 +168,7 @@ void launch_supergrok15_step(
     const torch::Tensor& phi_b1,
     const torch::Tensor& phi_W2,
     float phi_b2,
+    float rescale,
     torch::Tensor& sharp_partial,
     float gate_global,
     float alpha_base, float alpha_max,
@@ -196,6 +202,7 @@ void launch_supergrok15_step(
                 phi_b1.data_ptr<float>(),
                 phi_W2.data_ptr<float>(),
                 phi_b2,
+                rescale,
                 sharp_partial.data_ptr<float>(), N);
             SG_LAUNCH_CHECK(stream);
         });
@@ -257,7 +264,7 @@ void launch_fused_supergrok15_full_step(
     float alpha_base = alpha;
     float alpha_max = alpha;
     launch_supergrok15_step(param, exp_avg, exp_avg_sq, mu, grad, sharpness,
-                            W1, b1, W2, b2_val, sharp_partial,
+                            W1, b1, W2, b2_val, rescale, sharp_partial,
                             gate_global, alpha_base, alpha_max,
                             lr, beta1, beta2, eps, wd_eff, bc1, bc2);
 }

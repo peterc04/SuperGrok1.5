@@ -21,7 +21,9 @@
 //   Sweep A: meta-net forward + cosine gate reduction
 //   Sweep B: smart_grad mixing + Adam apply (uses gate from sweep A)
 //
-// The meta-net hidden width H is fixed at compile time. Defaults to 64.
+// The meta-net hidden width H is fixed at compile time. Defaults to 32
+// (matches the canonical SharpnessMetaNet hidden_dim in
+// grokking_optimizers/optimizers/supergrok11.py).
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -51,7 +53,7 @@ using ::sg::algorithms::sg11_sweep_a_step;
 using ::sg::algorithms::sg11_sweep_b_step;
 using ::sg::algorithms::sg11_adam_tail;
 
-constexpr int SG11_H = 64;
+constexpr int SG11_H = 32;
 
 // Minimum resident blocks/SM for the element-wise sweeps. Caps registers so
 // occupancy stays high on the (memory-bound) Adam apply.
