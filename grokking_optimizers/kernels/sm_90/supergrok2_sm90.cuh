@@ -1559,6 +1559,15 @@ static void csa_hca_step_one(
     auto x_out = torch::empty({N, d_model}, fopt);
     auto sort_keys = torch::empty({N}, fopt);
     auto sort_idx  = torch::empty({N}, torch::TensorOptions().dtype(torch::kInt32).device(dev));
+    // sg2_input_proj_sort_kernel reads input_proj_W and input_proj_b through the
+    // SAME wt_t template, so they must share a dtype. The Python weight bundle
+    // converts the weight matrix to bf16 (projection_precision='bf16') but leaves
+    // the bias fp32, so the bf16 branch would call data_ptr<at::BFloat16>() on an
+    // fp32 bias ("expected BFloat16 but found Float"). Coerce the bias to the
+    // weight's dtype. Held at function scope so it outlives the async launch.
+    const torch::Tensor input_proj_b_m =
+        (input_proj_b.scalar_type() == input_proj_W.scalar_type())
+        ? input_proj_b : input_proj_b.to(input_proj_W.scalar_type());
     {
         const int block = SG_TUNED_BLOCK_SIZE;
         const int grid = std::min<int>(65535, (N + block - 1) / block);
@@ -1572,14 +1581,14 @@ static void csa_hca_step_one(
                         x_out.data_ptr<float>(), sort_keys.data_ptr<float>(),
                         sort_idx.data_ptr<int>(),
                         input_proj_W.data_ptr<at::BFloat16>(),
-                        input_proj_b.data_ptr<at::BFloat16>(),
+                        input_proj_b_m.data_ptr<at::BFloat16>(),
                         N, d_model);
                 } else {
                     sg2_input_proj_sort_kernel<scalar_t, float><<<grid, block, 0, stream>>>(
                         grad.data_ptr<scalar_t>(), sharpness.data_ptr<scalar_t>(),
                         x_out.data_ptr<float>(), sort_keys.data_ptr<float>(),
                         sort_idx.data_ptr<int>(),
-                        input_proj_W.data_ptr<float>(), input_proj_b.data_ptr<float>(),
+                        input_proj_W.data_ptr<float>(), input_proj_b_m.data_ptr<float>(),
                         N, d_model);
                 }
                 SG_LAUNCH_CHECK(stream);

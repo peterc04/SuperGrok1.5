@@ -620,15 +620,19 @@ def _try_fused_step(model_name, opt_name, model, optimizer, x_batch, y_batch, c)
     """Attempt fused (model, optimizer, arch) kernel; return True if used, False to fallback."""
     if not c.get("use_fused", True):
         return False
-    if not has_fused(model_name, opt_name):
-        return False
     try:
+        # has_fused() canonicalizes the model name and can raise ValueError on an
+        # unrecognized name; keep it inside the guard so the fused path always
+        # degrades to the eager path rather than crashing the run. The built-in
+        # registry is empty (see dispatch.has_fused), so this returns False today.
+        if not has_fused(model_name, opt_name):
+            return False
         params = {n: p for n, p in model.named_parameters()}
         # Fused kernel handles forward + backward + optimizer step in one launch
         dispatch_fused(model_name, opt_name, params, x_batch, None, optimizer.state,
                        optimizer.defaults.get('lr', 1e-3))
         return True
-    except (KeyError, NotImplementedError):
+    except (KeyError, NotImplementedError, ValueError):
         return False
 
 # ── 1. AdamW ──────────────────────────────────────────────────────────
