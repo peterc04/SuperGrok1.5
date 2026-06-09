@@ -59,7 +59,10 @@
 // kernel via hipLaunchKernelGGL (see §5.LAUNCH); the `#else` branch keeps the
 // ATen path as the CPU-host fallback.
 // ════════════════════════════════════════════════════════════════════════════
-#if !defined(__AMDGCN__)
+// SG_GFX942_DEVICE_TU (Stage 7): set by the thin `.hip` device TU so this host
+// launcher is NOT re-emitted in that TU's host pass (it stays owned by the
+// `.hip.cpp` host TU) — avoids a duplicate launch_grokadamw_step at link.
+#if !defined(__AMDGCN__) && !defined(SG_GFX942_DEVICE_TU)
 #include <torch/extension.h>
 #include <vector>
 
@@ -92,8 +95,14 @@ void launch_grokadamw_step(
         // EMA filter + amplification + m/v Adam EMAs + bias-corrected decoupled-
         // WD apply into ONE launch vs the ATen ema + amplify + adam ops).
         // 🟡 hipcc-only — none in this env.
-        const int n = static_cast<int>(p.numel());
-        dim3 grid(min(1024, (n + 255) / 256)), block(256);  // 4 wavefronts/block
+        // 64-bit safe element count + grid sizing (Stage 1): numel can exceed
+        // 2^31, so form n and the block count in int64 then clamp to the 1024-
+        // workgroup cap (fits in unsigned). Mirrors the adamw launcher.
+        const int64_t n = static_cast<int64_t>(p.numel());
+        if (n == 0) continue;
+        const unsigned blocks =
+            static_cast<unsigned>(min<int64_t>(1024, (n + 255) / 256));
+        dim3 grid(blocks), block(256);  // 4 wavefronts/block
         hipLaunchKernelGGL((native::grokadamw_gfx942_kernel<float, float>), grid,
                            block, 0, 0,
                            p.data_ptr<float>(), m.data_ptr<float>(),
@@ -101,6 +110,7 @@ void launch_grokadamw_step(
                            g.data_ptr<float>(),
                            alpha, lamb, lr, beta1, beta2, eps, wd,
                            bc1, bc2, n);
+        SG_HIP_LAUNCH_CHECK(0);  // mirror sm_90 SG_LAUNCH_CHECK after each launch
 #else
         // EMA filter
         prim::ema_update_inplace(ema, g, alpha);
@@ -286,18 +296,33 @@ namespace sg { namespace gfx942 { namespace native {
 
 namespace amd = ::sg::gfx942::amdgcn;
 
+// Stage-1 NaN/Inf gradient sanitization (mirror of sm_90 sg_sanitize_grad).
+// Identity unless built with -DSG_SANITIZE_NONFINITE=1; then a non-finite grad
+// becomes 0 at the read boundary (nan_to_num semantics). Default behavior is
+// byte-identical when OFF.
+#ifndef SG_SANITIZE_NONFINITE
+#define SG_SANITIZE_NONFINITE 0
+#endif
+__device__ __forceinline__ float sg_sanitize_grad(float g) {
+#if SG_SANITIZE_NONFINITE
+    return __builtin_isfinite(g) ? g : 0.0f;
+#else
+    return g;
+#endif
+}
+
 // Per-element GrokAdamW apply — the canonical scalar body, shared by the scalar
 // tail and (replicated lane-by-lane) the f32x4 fast-path so both are identical.
 template <typename ParamT, typename GradT>
 __device__ __forceinline__ void grokadamw_apply_elem(
     ParamT* __restrict__ param, float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq, float* __restrict__ ema,
-    const GradT* __restrict__ grad, int i,
+    const GradT* __restrict__ grad, int64_t i,
     float alpha, float lamb,
     float lr, float beta1, float beta2, float eps, float wd,
     float bc1, float bc2)
 {
-    const float g = static_cast<float>(amd::streaming_load(&grad[i]));
+    const float g = sg_sanitize_grad(static_cast<float>(amd::streaming_load(&grad[i])));
     const float p = static_cast<float>(param[i]);
 
     const float ema_new = alpha * ema[i] + (1.0f - alpha) * g;
@@ -321,18 +346,20 @@ SG_KERNEL_BOUNDS(256, 8) void grokadamw_gfx942_kernel(
     const GradT* __restrict__ grad,
     float alpha, float lamb,
     float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int N)
+    float bc1, float bc2, int64_t N)
 {
-    const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
-    const int tid    = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
-                       + static_cast<int>(threadIdx.x);
+    // 64-bit grid-stride indexing (Stage 1): cast BEFORE the multiply so a
+    // launch covering >2^31 elements cannot wrap the 32-bit product.
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    const int64_t tid    = static_cast<int64_t>(blockIdx.x) * blockDim.x
+                       + threadIdx.x;
 
     // VECTORIZED fast-path: only when param/grad are plain fp32 (the sole
     // instantiation); the constexpr guard lets any future bf16/fp16 combo fall
     // back cleanly to the scalar loop.
     constexpr bool kVecOk =
         sizeof(ParamT) == sizeof(float) && sizeof(GradT) == sizeof(float);
-    const int n4 = kVecOk ? (N >> 2) : 0;   // number of full float4 groups
+    const int64_t n4 = kVecOk ? (N >> 2) : 0;   // number of full float4 groups
 
     using f32x4 = amd::f32x4;
     auto* p4  = reinterpret_cast<f32x4*>(param);
@@ -341,7 +368,7 @@ SG_KERNEL_BOUNDS(256, 8) void grokadamw_gfx942_kernel(
     auto* e4  = reinterpret_cast<f32x4*>(ema);
     const auto* g4 = reinterpret_cast<const f32x4*>(grad);
 
-    for (int q = tid; q < n4; q += stride) {
+    for (int64_t q = tid; q < n4; q += stride) {
         const f32x4 g = amd::streaming_load(&g4[q]);   // 128-bit dwordx4 load
         const f32x4 p = p4[q];
         const f32x4 ea = m4[q];
@@ -350,9 +377,10 @@ SG_KERNEL_BOUNDS(256, 8) void grokadamw_gfx942_kernel(
         f32x4 po, mo, vo, eo;
         // 4 lanes, each evaluating the IDENTICAL scalar GrokAdamW expressions.
         for (int l = 0; l < 4; ++l) {
-            const float ema_new = alpha * em[l] + (1.0f - alpha) * g[l];
+            const float gl = sg_sanitize_grad(g[l]);  // identity unless sanitize on
+            const float ema_new = alpha * em[l] + (1.0f - alpha) * gl;
             eo[l] = ema_new;
-            const float g_amp = g[l] + lamb * ema_new;
+            const float g_amp = gl + lamb * ema_new;
             const float m = beta1 * ea[l] + (1.0f - beta1) * g_amp;
             const float v = beta2 * ev[l] + (1.0f - beta2) * g_amp * g_amp;
             mo[l] = m;
@@ -368,7 +396,7 @@ SG_KERNEL_BOUNDS(256, 8) void grokadamw_gfx942_kernel(
 
     // SCALAR TAIL: the final N%4 elements (and the whole array when kVecOk is
     // false / N<4). Grid-strided over the remaining indices.
-    for (int i = (n4 << 2) + tid; i < N; i += stride) {
+    for (int64_t i = (n4 << 2) + tid; i < N; i += stride) {
         grokadamw_apply_elem(param, exp_avg, exp_avg_sq, ema, grad, i,
                              alpha, lamb, lr, beta1, beta2, eps, wd, bc1, bc2);
     }
@@ -378,7 +406,7 @@ SG_KERNEL_BOUNDS(256, 8) void grokadamw_gfx942_kernel(
 // device pass emits the kernel; the host TU dispatches on dtype.
 template __global__ void grokadamw_gfx942_kernel<float, float>(
     float*, float*, float*, float*, const float*, float, float, float, float,
-    float, float, float, float, float, int);
+    float, float, float, float, float, int64_t);
 
 }}} // namespace sg::gfx942::native
 #endif  // (B) device pass

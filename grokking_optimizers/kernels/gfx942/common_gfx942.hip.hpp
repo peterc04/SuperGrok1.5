@@ -11,6 +11,31 @@ namespace grokking { namespace gfx942 {
 
 enum class NanPolicy : int { kNone = 0, kZero = 1, kPropagate = 2 };
 
+// =========================================================================
+//  Stage-1 NaN/Inf gradient sanitization (Phase 8) — gfx942 mirror of the
+//  sm_90 mechanism (grokking_optimizers/kernels/sm_90/common_sm90.cuh).
+//
+//  When enabled, a non-finite gradient is treated as 0 BEFORE the per-element
+//  step reads it (nan_to_num(nan=0,posinf=0,neginf=0) semantics at the gradient
+//  read boundary only — the optimizer math stays single-sourced). The default
+//  is OFF, so sg_sanitize_grad() is the identity and the device kernels are
+//  byte-for-byte the prior behavior; build with -DSG_SANITIZE_NONFINITE=1 to
+//  turn it on for every gfx942 optimizer apply kernel. Cheap: at most one
+//  __builtin_isfinite-select per element on the hot path.
+// =========================================================================
+#ifndef SG_SANITIZE_NONFINITE
+#define SG_SANITIZE_NONFINITE 0
+#endif
+
+// Returns g when finite, else 0. Identity (zero added instructions) when OFF.
+__device__ __forceinline__ float sg_sanitize_grad(float g) {
+#if SG_SANITIZE_NONFINITE
+    return __builtin_isfinite(g) ? g : 0.0f;
+#else
+    return g;
+#endif
+}
+
 template <typename T>
 __device__ __forceinline__ float to_float(T v) { return static_cast<float>(v); }
 

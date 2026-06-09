@@ -18,6 +18,49 @@
 #include <vector>
 #include <cstdint>
 
+// =========================================================================
+//  Post-launch error check (HIP mirror of sm_90's SG_LAUNCH_CHECK).
+//
+//  SG_HIP_LAUNCH_CHECK(stream) is called immediately AFTER a kernel launch /
+//  HIP op. It reads hipGetLastError() to surface a launch-time failure and
+//  TORCH_CHECKs it, turning a silent async error into an immediate exception.
+//
+//  Release (default): launch-error-only, NO synchronize (keeps async overlap).
+//  Define SG_HIP_LAUNCH_CHECK_SYNC=1 (debug) to additionally
+//  hipStreamSynchronize and catch errors raised during kernel EXECUTION.
+//
+//  Macro (not a function) so __FILE__/__LINE__ point at the launch site; the
+//  do{...}while(0) wrapper makes it a single statement needing a trailing ;.
+//  hipGetLastError / hipSuccess come from <hip/hip_runtime.h>, which the HIP
+//  launch TUs that use this macro already include.
+// =========================================================================
+#ifndef SG_HIP_LAUNCH_CHECK_SYNC
+#define SG_HIP_LAUNCH_CHECK_SYNC 0
+#endif
+
+#if SG_HIP_LAUNCH_CHECK_SYNC
+#define SG_HIP_LAUNCH_CHECK(stream)                                          \
+    do {                                                                     \
+        hipError_t _sg_launch_err = hipGetLastError();                       \
+        TORCH_CHECK(_sg_launch_err == hipSuccess,                            \
+                    "HIP kernel launch failed: ",                            \
+                    hipGetErrorString(_sg_launch_err));                      \
+        hipError_t _sg_sync_err = hipStreamSynchronize(stream);              \
+        TORCH_CHECK(_sg_sync_err == hipSuccess,                              \
+                    "HIP kernel execution failed: ",                         \
+                    hipGetErrorString(_sg_sync_err));                        \
+    } while (0)
+#else
+#define SG_HIP_LAUNCH_CHECK(stream)                                          \
+    do {                                                                     \
+        (void)(stream);                                                      \
+        hipError_t _sg_launch_err = hipGetLastError();                       \
+        TORCH_CHECK(_sg_launch_err == hipSuccess,                            \
+                    "HIP kernel launch failed: ",                            \
+                    hipGetErrorString(_sg_launch_err));                      \
+    } while (0)
+#endif
+
 namespace sg { namespace gfx942 { namespace primitives {
 
 // =========================================================================

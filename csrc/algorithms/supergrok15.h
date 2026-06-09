@@ -29,7 +29,8 @@
 
 namespace sg { namespace algorithms {
 
-// MLP forward: same shape as v1.1 (tanh hidden, linear output).
+// MLP forward: same shape as v1.1 (GELU hidden, linear output — matches the
+// trainable PyTorch SharpnessMetaNet's nn.GELU).
 template <int H>
 __device__ __forceinline__ float sg15_phi_forward(
     const float grad_val,
@@ -43,7 +44,8 @@ __device__ __forceinline__ float sg15_phi_forward(
     #pragma unroll
     for (int j = 0; j < H; j++) {
         float h = W1[j * 2] * grad_val + W1[j * 2 + 1] * sharp_val + b1[j];
-        h = tanhf(h);
+        // Exact erf GELU — matches torch.nn.GELU() in the trainable meta-net.
+        h = 0.5f * h * (1.0f + erff(h * 0.70710678118654752f));
         h_acc += W2[j] * h;
     }
     return h_acc + b2;
@@ -55,7 +57,7 @@ __device__ __forceinline__ void sg15_sweep_a_step(
     float* __restrict__ mu_out,
     const GradT* __restrict__ grad,
     const float mu_val,
-    const int idx,
+    const int64_t idx,
     float& sharp_local
 ) {
     mu_out[idx] = mu_val;
@@ -90,7 +92,7 @@ __device__ __forceinline__ void sg15_sweep_b_step(
     const float wd,
     const float bc1,
     const float bc2,
-    const int idx
+    const int64_t idx
 ) {
     const float g = static_cast<float>(grad[idx]);
     const float p = static_cast<float>(param[idx]);
@@ -105,7 +107,7 @@ __device__ __forceinline__ void sg15_sweep_b_step(
     exp_avg_sq[idx] = v;
 
     // bc1, bc2 un-inverted (= 1 - beta^t): divide for bias correction.
-    const float update = (m / bc1) / (sqrtf(v / bc2) + eps);
+    const float update = (m / sg_safe_bc(bc1)) / (sqrtf(v / sg_safe_bc(bc2)) + eps);
     param[idx] = static_cast<ParamT>(p - lr * (update + wd * p));
 }
 

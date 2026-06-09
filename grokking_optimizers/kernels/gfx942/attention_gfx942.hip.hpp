@@ -57,7 +57,10 @@
 // device-pass content. On a real hipcc build the host pass compiles this and
 // launches the §5 kernels (see §5.LAUNCH).
 // ════════════════════════════════════════════════════════════════════════════
-#if !defined(__AMDGCN__)
+// SG_GFX942_DEVICE_TU (Stage 7): set by the thin `.hip` device TU so the host
+// orchestration is NOT re-compiled in that TU's host pass. The device TU only
+// needs section (B)'s force-instantiated __global__ attention kernels.
+#if !defined(__AMDGCN__) && !defined(SG_GFX942_DEVICE_TU)
 #include "csrc/common/platform.h"
 #include "csrc/common/types.h"
 #include "csrc/common/utils.cuh"
@@ -126,7 +129,8 @@ lds_attention_fwd_kernel(
     int seq_len, float scale
 ) {
     const int bh = blockIdx.x, tid = threadIdx.x;
-    const int N = seq_len, D = kHeadDim, base = bh * N * D;
+    const int N = seq_len, D = kHeadDim;
+    const int64_t base = static_cast<int64_t>(bh) * N * D;
     extern __shared__ float lds[];
     float* scores  = lds;
     float* row_max = scores + N * N;
@@ -135,7 +139,9 @@ lds_attention_fwd_kernel(
     for (int idx = tid; idx < N * N; idx += blockDim.x) {
         int i = idx / N, j = idx % N;
         if constexpr (kCausal) {
-            if (j > i) { scores[idx] = -1e9f; continue; }
+            // Unified mask sentinel (-1e30f), matching the sm_90 path and the
+            // other gfx942 attention kernel (was -1e9f — inconsistent).
+            if (j > i) { scores[idx] = -1e30f; continue; }
         }
         float dot = 0.0f;
         for (int d = 0; d < D; d++)
@@ -146,7 +152,7 @@ lds_attention_fwd_kernel(
     __syncthreads();
     // Row-wise stable softmax
     for (int i = tid; i < N; i += blockDim.x) {
-        float m = -1e9f;
+        float m = -1e30f;   // unified sentinel (matches sm_90 + CUTLASS softmax)
         for (int j = 0; j < N; j++) m = fmaxf(m, scores[i * N + j]);
         row_max[i] = m;
         float s = 0.0f;
@@ -159,7 +165,7 @@ lds_attention_fwd_kernel(
         for (int j = 0; j < N; j++) scores[i * N + j] *= inv_s;
         row_sum[i] = s;
         if (softmax_lse != nullptr)
-            softmax_lse[bh * N + i] = m + logf(fmaxf(s, 1e-12f));
+            softmax_lse[static_cast<int64_t>(bh) * N + i] = m + logf(fmaxf(s, 1e-12f));
     }
     __syncthreads();
     // Out = Softmax(S) * V
@@ -223,7 +229,8 @@ void lds_attention_bwd_kernel(
     int seq_len, float scale
 ) {
     const int bh = blockIdx.x, tid = threadIdx.x;
-    const int N = seq_len, D = kHeadDim, base = bh * N * D;
+    const int N = seq_len, D = kHeadDim;
+    const int64_t base = static_cast<int64_t>(bh) * N * D;
 
     extern __shared__ float lds[];
     float* scores = lds;             // N * N (attention weights)
@@ -239,7 +246,7 @@ void lds_attention_bwd_kernel(
         for (int d = 0; d < D; d++)
             dot += static_cast<float>(q[base + i * D + d])
                  * static_cast<float>(k[base + j * D + d]);
-        float lse = softmax_lse[bh * N + i];
+        float lse = softmax_lse[static_cast<int64_t>(bh) * N + i];
         scores[idx] = ptx_expf(dot * scale - lse);
     }
     __syncthreads();
@@ -575,7 +582,7 @@ __device__ __forceinline__ void attention_fwd_native(
 {
     const int lane = static_cast<int>(threadIdx.x) % kWave;
     const int D = kHeadDimT;
-    const int base = bh * N * D;
+    const int64_t base = static_cast<int64_t>(bh) * N * D;
 
     // S = Q·Kᵀ : A=q[N,D], W=k[N,D] (already Kᵀ-layout, contract over D).
     mfma_matmul_bf16(q + base, k + base, scores, N, N, D);
@@ -590,7 +597,7 @@ __device__ __forceinline__ void attention_fwd_native(
         }
         float lse = softmax_row_inplace(&scores[i * N], N);
         if (softmax_lse != nullptr && lane == 0)
-            softmax_lse[bh * N + i] = lse;
+            softmax_lse[static_cast<int64_t>(bh) * N + i] = lse;
     }
 
     // O = P·V : P is [N,N] (row-major softmax weights), V is [N,D]. Contract over
@@ -632,13 +639,13 @@ __device__ __forceinline__ void attention_bwd_native(
 {
     const int lane = static_cast<int>(threadIdx.x) % kWave;
     const int D = kHeadDimT;
-    const int base = bh * N * D;
+    const int64_t base = static_cast<int64_t>(bh) * N * D;
 
     // Recompute attention weights A_ij = exp(scale·q_i·k_j − lse_i) via MFMA S.
     mfma_matmul_bf16(q + base, k + base, scores, N, N, D);
     amd::wait_vmcnt0();
     for (int i = 0; i < N; ++i) {
-        float lse = softmax_lse[bh * N + i];
+        float lse = softmax_lse[static_cast<int64_t>(bh) * N + i];
         for (int j = lane; j < N; j += kWave) {
             float a = (kCausal && j > i)
                     ? 0.f : dexpf(scores[i * N + j] * scale - lse);

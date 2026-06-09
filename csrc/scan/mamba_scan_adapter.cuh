@@ -195,7 +195,7 @@ parallel_scan_kernel(
                 smem[idx*6]=c.m00; smem[idx*6+1]=c.m01; smem[idx*6+2]=c.m10;
                 smem[idx*6+3]=c.m11; smem[idx*6+4]=c.b0; smem[idx*6+5]=c.b1;
             }
-            if (stride * 2 >= WARP_SIZE) __syncthreads();
+            __syncthreads();
         }
 
         // Set last to identity (exclusive scan)
@@ -223,7 +223,7 @@ parallel_scan_kernel(
                 smem[idx*6]=c.m00; smem[idx*6+1]=c.m01; smem[idx*6+2]=c.m10;
                 smem[idx*6+3]=c.m11; smem[idx*6+4]=c.b0; smem[idx*6+5]=c.b1;
             }
-            if (stride * 2 >= WARP_SIZE) __syncthreads();
+            __syncthreads();
         }
 
         // Phase 3: re-scan with prefix, accumulate output
@@ -310,8 +310,15 @@ cudaError_t selective_scan_forward(
 //   grad_A_log[j,s] += dt[t]*A[s]*A_bar * h[t-1,s] * grad_h[s]
 //   grad_h = A_bar * grad_h   (backprop through recurrence)
 
+// Gradient checkpointing replaces the O(seq_len * d_state) per-thread h_all
+// buffer (128 KB at seq_len=256, d_state=128) with O(sqrt(seq_len) * d_state)
+// checkpoint + segment buffers (~17 KB), enabling nvcc to compile the kernel.
+static constexpr int BW_CKPT_STRIDE = 32;
+static constexpr int BW_MAX_SEQ     = 1024;
+static constexpr int BW_MAX_SEGS    = BW_MAX_SEQ / BW_CKPT_STRIDE;
+
 template <typename ActT>
-__global__ void __launch_bounds__(128, 4)
+__global__ void __launch_bounds__(128, 2)
 scan_backward_kernel(
     const ActT* __restrict__ grad_y,
     const ActT* __restrict__ x,
@@ -332,23 +339,29 @@ scan_backward_kernel(
     if (j >= d_inner) return;
 
     const int bN  = b * seq_len;
-    const int bDi = b * d_inner;
+    const int n_seg = (seq_len + BW_CKPT_STRIDE - 1) / BW_CKPT_STRIDE;
 
     float A[MAX_D_STATE];
     #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         A[s] = -ptx_expf(static_cast<float>(A_log[j * d_state + s]));
 
-    // Forward pass to cache h[t] for all t (needed for grad_C and grad_dt)
-    float h_cache[MAX_D_STATE];
-    float h_prev[MAX_D_STATE];
+    // Checkpoint buffer: h state at segment boundaries.
+    // h_ckpt[seg] = hidden state BEFORE timestep (seg * BW_CKPT_STRIDE).
+    float h_ckpt[BW_MAX_SEGS * MAX_D_STATE];
+
+    // Segment recompute buffer: h[seg_start-1 .. seg_end].
+    // h_seg[0] = checkpoint (h before first timestep), h_seg[i+1] = h after step i.
+    float h_seg[(BW_CKPT_STRIDE + 1) * MAX_D_STATE];
+
+    // Forward pass: store checkpoint at each segment boundary
+    float h_run[MAX_D_STATE];
     #pragma unroll 4
-    for (int s = 0; s < d_state; s++) h_cache[s] = 0.0f;
+    for (int s = 0; s < d_state; s++) {
+        h_run[s] = 0.0f;
+        h_ckpt[s] = 0.0f;
+    }
 
-    // Allocate per-timestep h cache in local memory (seq_len is small)
-    float h_all[256 * MAX_D_STATE];  // PSCAN_THRESHOLD * MAX_D_STATE
-
-    // Forward recompute
     for (int t = 0; t < seq_len; t++) {
         float xv  = static_cast<float>(x[(bN + t) * d_inner + j]);
         float dtv = static_cast<float>(dt[(bN + t) * d_inner + j]);
@@ -356,60 +369,77 @@ scan_backward_kernel(
         for (int s = 0; s < d_state; s++) {
             float A_bar = ptx_expf(A[s] * dtv);
             float B_bar = dtv * static_cast<float>(B[(bN + t) * d_state + s]);
-            h_cache[s] = A_bar * h_cache[s] + B_bar * xv;
-            h_all[t * d_state + s] = h_cache[s];
+            h_run[s] = A_bar * h_run[s] + B_bar * xv;
+        }
+        if ((t + 1) % BW_CKPT_STRIDE == 0) {
+            int ci = (t + 1) / BW_CKPT_STRIDE;
+            #pragma unroll 4
+            for (int s = 0; s < d_state; s++)
+                h_ckpt[ci * d_state + s] = h_run[s];
         }
     }
 
-    // Reverse pass for gradients
+    // Reverse pass: process segments from last to first
     float grad_h[MAX_D_STATE];
     float grad_A_acc[MAX_D_STATE];
     #pragma unroll 4
     for (int s = 0; s < d_state; s++) { grad_h[s] = 0.0f; grad_A_acc[s] = 0.0f; }
 
-    for (int t = seq_len - 1; t >= 0; t--) {
-        float xv   = static_cast<float>(x[(bN + t) * d_inner + j]);
-        float dtv  = static_cast<float>(dt[(bN + t) * d_inner + j]);
-        float gy   = static_cast<float>(grad_y[(bN + t) * d_inner + j]);
+    for (int seg = n_seg - 1; seg >= 0; seg--) {
+        const int seg_start = seg * BW_CKPT_STRIDE;
+        const int seg_end   = min(seg_start + BW_CKPT_STRIDE, seq_len);
+        const int seg_len   = seg_end - seg_start;
 
-        float grad_x_acc  = 0.0f;
-        float grad_dt_acc = 0.0f;
-
+        // Load checkpoint: h_seg[0] = h state before seg_start
         #pragma unroll 4
-        for (int s = 0; s < d_state; s++) {
-            float A_bar = ptx_expf(A[s] * dtv);
-            float bv    = static_cast<float>(B[(bN + t) * d_state + s]);
-            float cv    = static_cast<float>(C[(bN + t) * d_state + s]);
-            float h_t   = h_all[t * d_state + s];
-            float h_tm1 = (t > 0) ? h_all[(t-1) * d_state + s] : 0.0f;
+        for (int s = 0; s < d_state; s++)
+            h_seg[s] = h_ckpt[seg * d_state + s];
 
-            // grad_C[t,s] = h[t,s] * grad_y[t]
-            grad_C[(bN + t) * d_state + s] = static_cast<ActT>(h_t * gy);
-
-            // Accumulate into grad_h
-            grad_h[s] += cv * gy;
-
-            // grad_B[t,s] = dt * x * grad_h[s]
-            grad_B[(bN + t) * d_state + s] = static_cast<ActT>(dtv * xv * grad_h[s]);
-
-            // grad_x accumulation
-            grad_x_acc += bv * dtv * grad_h[s];
-
-            // grad_dt accumulation
-            grad_dt_acc += (A[s] * A_bar * h_tm1 + bv * xv) * grad_h[s];
-
-            // grad_A_log accumulation
-            grad_A_acc[s] += dtv * A[s] * A_bar * h_tm1 * grad_h[s];
-
-            // Backprop through recurrence
-            grad_h[s] = A_bar * grad_h[s];
+        // Recompute forward through segment to fill h_seg[1..seg_len]
+        for (int i = 0; i < seg_len; i++) {
+            int t = seg_start + i;
+            float xv  = static_cast<float>(x[(bN + t) * d_inner + j]);
+            float dtv = static_cast<float>(dt[(bN + t) * d_inner + j]);
+            #pragma unroll 4
+            for (int s = 0; s < d_state; s++) {
+                float A_bar = ptx_expf(A[s] * dtv);
+                float B_bar = dtv * static_cast<float>(B[(bN + t) * d_state + s]);
+                h_seg[(i + 1) * d_state + s] = A_bar * h_seg[i * d_state + s] + B_bar * xv;
+            }
         }
 
-        grad_x[(bN + t) * d_inner + j]  = static_cast<ActT>(grad_x_acc);
-        grad_dt[(bN + t) * d_inner + j] = static_cast<ActT>(grad_dt_acc);
+        // Backward through segment (reverse)
+        for (int i = seg_len - 1; i >= 0; i--) {
+            int t = seg_start + i;
+            float xv   = static_cast<float>(x[(bN + t) * d_inner + j]);
+            float dtv  = static_cast<float>(dt[(bN + t) * d_inner + j]);
+            float gy   = static_cast<float>(grad_y[(bN + t) * d_inner + j]);
+
+            float grad_x_acc  = 0.0f;
+            float grad_dt_acc = 0.0f;
+
+            #pragma unroll 4
+            for (int s = 0; s < d_state; s++) {
+                float A_bar = ptx_expf(A[s] * dtv);
+                float bv    = static_cast<float>(B[(bN + t) * d_state + s]);
+                float cv    = static_cast<float>(C[(bN + t) * d_state + s]);
+                float h_t   = h_seg[(i + 1) * d_state + s];
+                float h_tm1 = h_seg[i * d_state + s];
+
+                grad_C[(bN + t) * d_state + s] = static_cast<ActT>(h_t * gy);
+                grad_h[s] += cv * gy;
+                grad_B[(bN + t) * d_state + s] = static_cast<ActT>(dtv * xv * grad_h[s]);
+                grad_x_acc += bv * dtv * grad_h[s];
+                grad_dt_acc += (A[s] * A_bar * h_tm1 + bv * xv) * grad_h[s];
+                grad_A_acc[s] += dtv * A[s] * A_bar * h_tm1 * grad_h[s];
+                grad_h[s] = A_bar * grad_h[s];
+            }
+
+            grad_x[(bN + t) * d_inner + j]  = static_cast<ActT>(grad_x_acc);
+            grad_dt[(bN + t) * d_inner + j] = static_cast<ActT>(grad_dt_acc);
+        }
     }
 
-    // Accumulate grad_A_log across batch via atomicAdd
     #pragma unroll 4
     for (int s = 0; s < d_state; s++)
         atomicAdd(&grad_A_log[j * d_state + s], grad_A_acc[s]);

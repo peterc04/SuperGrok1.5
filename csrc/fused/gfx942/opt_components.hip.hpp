@@ -29,6 +29,12 @@
 
 namespace sg { namespace fused { namespace gfx942_mega {
 
+// Defensive bias-correction denominator guard (mirrors csrc/common/utils.cuh).
+__device__ __forceinline__ float sg_safe_bc(float bc) {
+    float abs_bc = bc < 0.0f ? -bc : bc;
+    return abs_bc > 1e-30f ? bc : 1e-30f;
+}
+
 // Compile-time optimizer selector — one value per real optimizer (no fallback).
 enum class OptId : int {
     AdamW = 0, Lion = 1, Grokfast = 2, GrokAdamW = 3, LookSAM = 4,
@@ -77,13 +83,13 @@ struct FusedOptState {
 // Shared Adam tail: m,v EMAs on g_eff, bias-corrected decoupled-WD apply.
 // (bc1/bc2 un-inverted = 1-beta^t; divide — matches the algorithm headers.)
 __device__ __forceinline__ float sg_adam_tail(
-        float p, float g_eff, float* m_buf, float* v_buf, int i,
+        float p, float g_eff, float* m_buf, float* v_buf, long long i,
         float b1, float b2, float eps, float bc1, float bc2,
         float lr, float wd) {
     const float m = b1 * m_buf[i] + (1.0f - b1) * g_eff;
     const float v = b2 * v_buf[i] + (1.0f - b2) * g_eff * g_eff;
     m_buf[i] = m; v_buf[i] = v;
-    const float update = (m / bc1) / (__builtin_sqrtf(v / bc2) + eps);
+    const float update = (m / sg_safe_bc(bc1)) / (__builtin_sqrtf(v / sg_safe_bc(bc2)) + eps);
     return p - lr * (update + wd * p);
 }
 
@@ -112,7 +118,7 @@ __device__ __forceinline__ float sg_sg15_alpha(float mu_val, float ab, float am)
 template <OptId Opt>
 __device__ __forceinline__ void apply_optimizer(
         float* __restrict__ params, const float* __restrict__ grad,
-        int i, int step, const FusedOptState& st) {
+        long long i, int step, const FusedOptState& st) {
     (void)step;
     const float g = grad[i];
     const float p = params[i];
@@ -153,11 +159,16 @@ __device__ __forceinline__ void apply_optimizer(
                         + (1.0f - st.beta2) * g_scaled * g_scaled;
         st.exp_avg[i] = m; st.exp_avg_sq[i] = v;
         st.s_track[i] += d * g;
-        const float update = (m / st.bc1) / (__builtin_sqrtf(v / st.bc2) + st.eps);
+        const float update = (m / sg_safe_bc(st.bc1)) / (__builtin_sqrtf(v / sg_safe_bc(st.bc2)) + st.eps);
         params[i] = p - d * (update + st.wd * p);     // prodigy steps with d, not lr
     } else if constexpr (Opt == OptId::NeuralGrok) {
+        // psi_b2 scalar is packed at extra[kPsiB2Off] == st.psi_W2[kPsiHidden];
+        // read it ON-DEVICE here (host can't deref the device pointer, so the
+        // cell leaves st.psi_b2 at 0.0f). Mirrors the sm_90 opt_components fix.
+        const float psi_b2 = (st.psi_W2 != nullptr) ? st.psi_W2[kPsiHidden]
+                                                     : st.psi_b2;
         const float psi = sg_psi_forward(__builtin_fabsf(g), st.psi_W1, st.psi_b1,
-                                         st.psi_W2, st.psi_b2);
+                                         st.psi_W2, psi_b2);
         const float g_amp = (psi * st.alpha + st.beta) * g;
         params[i] = sg_adam_tail(p, g_amp, st.exp_avg, st.exp_avg_sq, i,
                                  st.beta1, st.beta2, st.eps, st.bc1, st.bc2,

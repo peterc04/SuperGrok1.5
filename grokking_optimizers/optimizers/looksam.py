@@ -156,9 +156,21 @@ class LookSAM(Optimizer):
             if len(params_list) == 0:
                 continue
 
-            grads_list = [p.grad for p in params_list]
+            # Canonical LookSAM ``apply`` (csrc/algorithms/looksam.h
+            # ``looksam_apply_step``): on EVERY step blend the cached SAM
+            # direction into the gradient before the AdamW update,
+            #   g_adj = (1 - alpha) * g + alpha * sam_dir,
+            # where ``sam_dir`` was cached by the most recent ``sam_step``.
+            # This is the amortization that makes the k-1 intervening steps
+            # sharpness-aware. Before the first ``sam_step`` the cached
+            # direction is zero, so g_adj = (1 - alpha) * g — identical to the
+            # kernel, which applies the same blend unconditionally.
+            alpha = group["alpha"]
+            grads_list = []
             step_list = []
-            for state in states:
+            for p, state in zip(params_list, states):
+                sam_dir = state["sam_direction"]
+                grads_list.append((1.0 - alpha) * p.grad + alpha * sam_dir)
                 state["step"] += 1
                 step_list.append(state["step"])
 
@@ -241,29 +253,36 @@ class LookSAM(Optimizer):
             perturbed_loss = criterion(model(train_x), train_y)
             perturbed_loss.backward()
 
-        # Step 3 & 4: Restore parameters and compute/adjust directions
+        # Step 3 & 4: Restore parameters, then CACHE the SAM direction.
         for gd in group_data:
             if gd is None:
                 continue
             params_list, orig_grads_list, direction_list, backups, group = gd
 
-            # Collect perturbed gradients
+            # Collect perturbed gradients (∇L at the perturbed point).
             perturbed_grads_list = [p.grad.clone() for p in params_list]
 
             # Restore original parameters
             _ops.looksam_restore_all(params_list, backups)
 
-            # Fused direction computation + gradient adjustment (batched norms)
-            _ops.looksam_compute_directions_and_adjust(
-                orig_grads_list,
-                perturbed_grads_list,
-                orig_grads_list,
-                group["alpha"],
-            )
-
-            # Write adjusted gradients back to parameters
-            for p, g in zip(params_list, orig_grads_list):
-                p.grad.copy_(g)
+            # Canonical LookSAM ``set_direction`` (csrc/algorithms/looksam.h:
+            # ``sam_dir = g_sam - g``): cache the gradient difference into the
+            # per-parameter ``sam_direction`` state. This is the whole point of
+            # LookSAM — the direction is REUSED by ``step()`` on the k-1
+            # intervening (non-SAM) steps via the cached-direction blend. The
+            # previous code adjusted ``p.grad`` in place for the current step
+            # only and never wrote ``sam_direction``, so it was dead state and
+            # every intervening step degenerated to plain AdamW (no SAM at all).
+            #
+            # We also restore ``p.grad`` to the ORIGINAL gradient so the
+            # immediately-following ``step()`` blends from a clean g (matching
+            # the kernel contract where ``looksam_apply_step`` receives the
+            # unperturbed grad and the freshly cached direction).
+            for p, og, pg, sam_dir in zip(
+                    params_list, orig_grads_list, perturbed_grads_list,
+                    direction_list):
+                sam_dir.copy_((pg - og).to(sam_dir.dtype))
+                p.grad.copy_(og)
 
     @property
     def global_step(self) -> int:
@@ -286,9 +305,18 @@ class LookSAM(Optimizer):
             state["step"] = 0
             state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
             state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
+            state["sam_direction"] = torch.zeros_like(param, dtype=torch.float32)
         state["step"] += 1
+        # Same canonical LookSAM blend as the batched step(): apply the cached
+        # SAM direction every step (g_adj = (1-alpha)*g + alpha*sam_dir) so the
+        # hooks path is also sharpness-aware on intervening steps, not plain
+        # AdamW. sam_direction is refreshed by sam_step on the SAM steps.
+        sam_dir = state.setdefault(
+            "sam_direction", torch.zeros_like(param, dtype=torch.float32))
+        alpha = group["alpha"]
+        g_adj = (1.0 - alpha) * param.grad + alpha * sam_dir
         _ops.fused_adamw_simple_step(
-            [param], [param.grad], [state["exp_avg"]], [state["exp_avg_sq"]],
+            [param], [g_adj], [state["exp_avg"]], [state["exp_avg_sq"]],
             [state["step"]], group["betas"][0], group["betas"][1],
             group["lr"], group["weight_decay"], group["eps"],
         )

@@ -117,7 +117,7 @@ struct FusedOptState {
 template <OptId Opt>
 __device__ __forceinline__ void apply_optimizer(
         float* __restrict__ params, const float* __restrict__ grad,
-        int idx, int step, const FusedOptState& st) {
+        int64_t idx, int step, const FusedOptState& st) {
     (void)step;
     if constexpr (Opt == OptId::AdamW) {
         algo::adamw_step<float, float>(
@@ -147,8 +147,15 @@ __device__ __forceinline__ void apply_optimizer(
             st.d_factor, st.beta1, st.beta2, st.eps, st.wd,
             st.bc1, st.bc2, idx);
     } else if constexpr (Opt == OptId::NeuralGrok) {
+        // psi_b2 is the scalar packed immediately after psi_W2 in the `extra`
+        // buffer (extra[kPsiB2Off] == st.psi_W2[kPsiHidden]). Read it ON-DEVICE
+        // here, where the pointer is dereferenceable — the host cell cannot
+        // deref a device pointer, so it leaves st.psi_b2 at its 0.0f default.
+        // This threads the real psi_b2 bias (previously stuck at 0.0).
+        const float psi_b2 = (st.psi_W2 != nullptr) ? st.psi_W2[kPsiHidden]
+                                                     : st.psi_b2;
         const float psi = algo::neuralgrok_psi_forward<kPsiHidden>(
-            fabsf(grad[idx]), st.psi_W1, st.psi_b1, st.psi_W2, st.psi_b2);
+            fabsf(grad[idx]), st.psi_W1, st.psi_b1, st.psi_W2, psi_b2);
         algo::neuralgrok_apply_step<float, float>(
             params, st.exp_avg, st.exp_avg_sq, grad, psi,
             st.alpha, st.beta, st.lr, st.beta1, st.beta2, st.eps, st.wd,

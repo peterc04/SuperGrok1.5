@@ -159,8 +159,18 @@ def check(structural_only: bool = False) -> list:
 
     # (1) structural single-source: per-op MUST #include the canonical header.
     for opt in OPTS:
-        perop = _read(f"grokking_optimizers/kernels/sm_90/{opt}_sm90.cuh")
-        if perop and _canonical_header(opt) not in perop:
+        rel = f"grokking_optimizers/kernels/sm_90/{opt}_sm90.cuh"
+        perop = _read(rel)
+        if not perop:
+            # A missing/renamed consumer would otherwise silently DISABLE drift
+            # detection for this optimizer (the old `if perop and ...` guard
+            # skipped absent files). Fail loudly instead.
+            failures.append(
+                f"[structural] expected consumer {rel} is missing/empty — "
+                f"drift detection for '{opt}' would be silently disabled. "
+                f"Restore the file or update OPTS.")
+            continue
+        if _canonical_header(opt) not in perop:
             failures.append(
                 f"[structural] kernels/sm_90/{opt}_sm90.cuh does NOT #include "
                 f"the canonical {_canonical_header(opt)} (reimplementation → "

@@ -73,7 +73,7 @@ carry over unchanged and were spot-re-confirmed above.
 - DORMANT: none.
 
 ## What remains (the only class)
-On-silicon execution + numeric parity on H100 / MI300X / TPU v5p — every item a
+On-silicon execution + numeric parity on H100 / MI300X / TPU v6e — every item a
 concrete row in `HARDWARE_VALIDATION.md`'s 99-cell checklist. No code is blocked
 on anything but the hardware itself.
 

@@ -1,0 +1,37 @@
+# sdist manifest for grokking-optimizers (Phase 8 Stage 2).
+#
+# package_data in setup.py covers the wheel/bdist for files that live under an
+# importable package; this file covers the SOURCE distribution (sdist), which
+# must additionally carry the csrc/ kernel tree, the math manifest, and the
+# top-level metadata so a `pip install` from sdist can recompile the
+# extension. Keep the two in sync when adding new shipped file types.
+
+# Top-level metadata.
+include README.md
+include LICENSE
+include pyproject.toml
+include setup.py
+include build.sh
+
+# Full C++/CUDA/HIP source tree (the extension is compiled from these).
+# *.inc is required: dispatch.cpp #includes the generated fused dispatch tables
+# (csrc/fused/**/fused_dispatch_table.inc, csrc/fused/fused_wired_cells.inc).
+recursive-include csrc *.cpp *.cu *.cuh *.h *.hpp *.hip *.hip.cpp *.hip.hpp *.inc
+
+# In-package per-arch kernel headers (also shipped via package_data).
+recursive-include grokking_optimizers *.cuh *.hip.hpp
+
+# Autotune / kernel-emit inputs.
+include scripts/optimizer_math_manifest.json
+
+# Submodule include path (CUTLASS headers) — only the headers, not the full
+# repo, so the sdist stays small. The cuda build adds this to include_dirs
+# when WITH_CUTLASS is active.
+recursive-include third_party/cutlass/include *.h *.hpp *.inl
+
+# Prune noise that recursive-include would otherwise pull in.
+global-exclude *.pyc *.pyo __pycache__/*
+prune build
+prune dist
+prune .git
+prune tests

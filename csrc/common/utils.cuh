@@ -13,6 +13,14 @@
  * Uses platform.h macros for CUDA/HIP portability.
  */
 
+// Defensive bias-correction denominator guard. bc = 1 - beta^t; at t==0 bc==0
+// which divides by zero. The host contract is step>=1 so this never fires in
+// normal operation; the guard is free (one fmaxf) and prevents silent NaN
+// poisoning if a caller ever violates the contract.
+__device__ __forceinline__ float sg_safe_bc(float bc) {
+    return fmaxf(bc, 1e-30f);
+}
+
 
 #if GROK_CUDA
 #include <cooperative_groups.h>

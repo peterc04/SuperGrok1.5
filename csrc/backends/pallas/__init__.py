@@ -1,4 +1,4 @@
-"""Pallas/JAX backend for TPU v5p.
+"""Pallas/JAX backend for TPU v6e (Trillium).
 
 Algorithm launchers (one per optimizer):
   launch_adamw, launch_grokadamw, launch_grokfast, launch_lion,

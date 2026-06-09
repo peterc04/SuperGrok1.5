@@ -194,6 +194,7 @@ void grokadamw_fused_step(
  float eps, float grad_clip_norm
 ) {
  const size_t n_params = params.size();
+ check_params_grads(params, grads, "grokadamw_fused_step");
  clip_grad_norms_device_side(grads, n_params, grad_clip_norm);
  if (n_params == 0) return;
 
@@ -254,6 +255,7 @@ void fused_adamw_simple_step(
  float beta1, float beta2, float lr, float wd, float eps
 ) {
  if (params.empty()) return;
+ check_params_grads(params, grads, "fused_adamw_simple_step");
  DISPATCH_GROKADAMW(launch_fused_adamw_simple,
  params, exp_avgs, exp_avg_sqs, grads, steps,
  beta1, beta2, lr, wd, eps);
@@ -329,9 +331,17 @@ void grokfast_fused_step(
  float alpha, float lamb
 ) {
  if (grads.empty()) return;
+ TORCH_CHECK(grads.size() == ema_bufs.size(), "grokfast_fused_step",
+             ": grads.size() (", grads.size(), ") != ema_bufs.size() (",
+             ema_bufs.size(), ")");
  std::vector<torch::Tensor> vg, ve;
  for (size_t i = 0; i < grads.size(); i++) {
  if (!grads[i].defined() || grads[i].numel() == 0) continue;
+ // EMA-only entrypoint: the launcher indexes ema_bufs[i] and grads[i] as
+ // flat data_ptr buffers, so they must match device/dtype/shape/contig.
+ // check_param_grad validates the EMA buffer as the "param" and the grad
+ // against it — the same boundary contract every other *_fused_step uses.
+ check_param_grad(ema_bufs[i], grads[i], "grokfast_fused_step");
  vg.push_back(grads[i]); ve.push_back(ema_bufs[i]);
  }
  if (vg.empty()) return;
@@ -351,6 +361,7 @@ void grokfast_fused_ema_adam_step(
  float alpha, float lamb,
  float beta1, float beta2, float lr, float wd, float eps
 ) {
+ check_params_grads(params, grads, "grokfast_fused_ema_adam_step");
  for (size_t i = 0; i < params.size(); i++) {
  if (!grads[i].defined() || grads[i].numel() == 0) continue;
  float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
@@ -408,6 +419,7 @@ void lion_fused_step(
  float lr, float beta1, float beta2, float wd
 ) {
  if (params.empty()) return;
+ check_params_grads(params, grads, "lion_fused_step");
  std::vector<torch::Tensor> vp, vg, vea;
  for (size_t i = 0; i < params.size(); i++) {
  if (!grads[i].defined() || grads[i].numel() == 0) continue;
@@ -903,6 +915,7 @@ void muon_fused_step(
  std::vector<torch::Tensor>& bufs,
  float momentum, float lr, float wd, int ns_steps
 ) {
+ check_params_grads(params, grads, "muon_fused_step");
  constexpr float NS_A = 3.4445f;
  constexpr float NS_B = -4.7750f;
  constexpr float NS_C = 2.0315f;
@@ -931,6 +944,18 @@ void muon_fused_step(
  float inv_norm = 1.0f / buf_norm;
  auto X = buf * inv_norm;
 
+ // Muon's Newton-Schulz orthogonalization (X.t(), mm) and the
+ // 0.2*sqrt(max(rows,cols)) RMS scale are defined only for a 2D
+ // matrix param. A 1D bias or a 3D/4D conv weight would silently read
+ // p.size(1) as a wrong dimension (or be undefined for dim<2) and
+ // corrupt the update. The Python Muon optimizer routes non-2D params
+ // to the AdamW path (fused_adamw_simple_step); enforce that contract
+ // loudly here so a misrouted param fails instead of corrupting.
+ TORCH_CHECK(p.dim() == 2, "muon_fused_step: param ", i,
+ " has ndim=", p.dim(),
+ " but the Newton-Schulz orthogonalization requires a 2D "
+ "matrix. Route 1D/>=3D params to the AdamW path "
+ "(fused_adamw_simple_step) in the Python wrapper.");
  int64_t rows = p.size(0);
  int64_t cols = p.size(1);
  float max_dim = static_cast<float>(std::max(rows, cols));
@@ -1051,6 +1076,7 @@ void neuralgrok_fused_step(
  float eps, float grad_clip_norm
 ) {
  const size_t n_params = params.size();
+ check_params_grads(params, grads, "neuralgrok_fused_step");
  clip_grad_norms_device_side(grads, n_params, grad_clip_norm);
 
  for (size_t i = 0; i < n_params; i++) {
@@ -1151,6 +1177,7 @@ float prodigy_fused_step(
  float eps
 ) {
  if (params.empty()) return d_lr;
+ check_params_grads(params, grads, "prodigy_fused_step");
 
  torch::Device dev(torch::kCPU);
  for (auto& g : grads) {
@@ -1267,6 +1294,7 @@ void supergrok11_fused_step(
  float grad_clip_norm
 ) {
  const size_t n_params = params.size();
+ check_params_grads(params, grads, "supergrok11_fused_step");
  clip_grad_norms_device_side(grads, n_params, grad_clip_norm);
 
  for (size_t i = 0; i < n_params; i++) {
@@ -1401,6 +1429,7 @@ void supergrok15_fused_step(
  float grad_clip_norm
 ) {
  const size_t n_params = params.size();
+ check_params_grads(params, grads, "supergrok15_fused_step");
  clip_grad_norms_device_side(grads, n_params, grad_clip_norm);
 
  float lamb_eff = (ramp > 0.0f) ? (ramp * gate_signal * lamb) : 0.0f;
@@ -1559,7 +1588,8 @@ namespace sg {
  int expert_hidden, int num_experts, \
  int csa_compress, int csa_window, int csa_topk, \
  int hca_compress, int indexer_rank, \
- torch::Tensor expert_counts); \
+ torch::Tensor expert_counts, \
+ int peer_topk); \
  void launch_csa_hca_batched_step( \
  std::vector<torch::Tensor> params, \
  std::vector<torch::Tensor> grads, \
@@ -1597,7 +1627,8 @@ namespace sg {
  int expert_hidden, int num_experts, \
  int csa_compress, int csa_window, int csa_topk, \
  int hca_compress, int indexer_rank, \
- torch::Tensor expert_counts); \
+ torch::Tensor expert_counts, \
+ int peer_topk); \
  void launch_csa_hca_bilevel_fwd_save( \
  torch::Tensor grad, torch::Tensor sharpness, \
  torch::Tensor input_proj_W, torch::Tensor input_proj_b, \
@@ -1766,9 +1797,11 @@ void supergrok2_step(
  int expert_hidden, int num_experts,
  int csa_compress, int csa_window, int csa_topk,
  int hca_compress, int indexer_rank,
- torch::Tensor expert_counts
+ torch::Tensor expert_counts,
+ int peer_topk = 4
 ) {
  if (grad.numel() == 0) return;
+ check_param_grad(param, grad, "supergrok2_step");
  SG_DISPATCH(launch_csa_hca_step,
  param, grad, sharpness, exp_avg, exp_avg_sq, mu,
  gru_state,
@@ -1784,7 +1817,7 @@ void supergrok2_step(
  d_model, gru_hidden, num_heads, pk_dim,
  expert_hidden, num_experts,
  csa_compress, csa_window, csa_topk,
- hca_compress, indexer_rank, expert_counts);
+ hca_compress, indexer_rank, expert_counts, peer_topk);
 }
 
 // SG2 batched CSA/HCA step. (Renamed from supergrok2_mamba_peer_batched_step;
@@ -1821,9 +1854,11 @@ void supergrok2_batched_step(
  int expert_hidden, int num_experts,
  int csa_compress, int csa_window, int csa_topk,
  int hca_compress, int indexer_rank,
- torch::Tensor expert_counts
+ torch::Tensor expert_counts,
+ int peer_topk = 4
 ) {
  if (params.empty()) return;
+ check_params_grads(params, grads, "supergrok2_batched_step");
  SG_DISPATCH(launch_csa_hca_batched_step,
  params, grads, sharpness_list, exp_avgs, exp_avg_sqs, mus,
  gru_states,
@@ -1839,7 +1874,7 @@ void supergrok2_batched_step(
  d_model, gru_hidden, num_heads, pk_dim,
  expert_hidden, num_experts,
  csa_compress, csa_window, csa_topk,
- hca_compress, indexer_rank, expert_counts);
+ hca_compress, indexer_rank, expert_counts, peer_topk);
 }
 
 // SG2 bilevel forward-save: runs the CSA/HCA attention forward and saves the
@@ -2108,7 +2143,8 @@ void supergrok2_prepare_and_batched_step(
  int64_t expert_hidden, int64_t num_experts,
  int64_t csa_compress, int64_t csa_window, int64_t csa_topk,
  int64_t hca_compress, int64_t indexer_rank,
- torch::Tensor expert_counts
+ torch::Tensor expert_counts,
+ int64_t peer_topk = 4
 ) {
  const size_t n = params.size();
  if (n == 0) return;
@@ -2156,7 +2192,8 @@ void supergrok2_prepare_and_batched_step(
  static_cast<int>(expert_hidden), static_cast<int>(num_experts),
  static_cast<int>(csa_compress), static_cast<int>(csa_window),
  static_cast<int>(csa_topk), static_cast<int>(hca_compress),
- static_cast<int>(indexer_rank), expert_counts);
+ static_cast<int>(indexer_rank), expert_counts,
+ static_cast<int>(peer_topk));
 }
 
 } // namespace sg
@@ -3225,7 +3262,7 @@ PYBIND11_MODULE(_ops, m) {
 
  m.def("detect_arch", &sg::detect_arch,
  "Returns 90 or 942 for the detected GPU (3-arch active set: "
- "sm_90, gfx942, tpu_v5p). TPU handled in Python.");
+ "sm_90, gfx942, tpu_v6e). TPU handled in Python.");
 
  // Fused (model, optimizer, arch) dispatch
  m.def("fused_step", &sg::fused_step,

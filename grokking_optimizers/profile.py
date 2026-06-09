@@ -18,7 +18,7 @@ Profilers, auto-selected from the target arch:
                 --timestamp on``. CSV/JSON outputs are inlined into the
                 report.
 
-    tpu_v5p  -> ``jax.profiler.start_trace / stop_trace`` in-process; XLA
+    tpu_v6e  -> ``jax.profiler.start_trace / stop_trace`` in-process; XLA
                 HLO + op-level capture. The trace directory contents are
                 summarised in the report.
 
@@ -27,7 +27,7 @@ Path inference (when ``--path`` is given):
     csrc/backends/cuda/sm_90/launch_<opt>.cu          -> sm_90, <opt>
     csrc/backends/hip/gfx942/launch_<opt>.hip.cpp     -> gfx942, <opt>
     csrc/backends/hip/gfx942/launch_<opt>.hip         -> gfx942, <opt>
-    csrc/backends/pallas/launch_<opt>.py              -> tpu_v5p, <opt>
+    csrc/backends/pallas/launch_<opt>.py              -> tpu_v6e, <opt>
     build/compiled/grokking_compiled_<opt>_<model>_<arch>/*.so
                                                        -> arch, opt, model
     any other .py                                     -> need --arch
@@ -35,7 +35,7 @@ Path inference (when ``--path`` is given):
 The profiler runs the standard smoke (import the optimizer class, run one
 ``opt.step()``) — the path is the *identifier* of what to profile; the
 actual kernels exercised come from the installed ``grokking_optimizers._ops``
-(or, for tpu_v5p, the matching ``launch_*.py``).
+(or, for tpu_v6e, the matching ``launch_*.py``).
 
 Usage (CLI):
     python -m grokking_optimizers.profile \\
@@ -71,12 +71,9 @@ from typing import Callable, List, Optional, Tuple
 REPO_ROOT = Path(__file__).resolve().parents[1]
 NCPUS = multiprocessing.cpu_count()
 
-OPTIMIZERS: Tuple[str, ...] = (
-    "adamw", "grokadamw", "grokfast", "lion", "looksam", "muon",
-    "neuralgrok", "prodigy", "supergrok11", "supergrok15", "supergrok2",
+from grokking_optimizers.dispatch import (  # noqa: E402
+    OPTIMIZERS, SHORT_MODELS as MODELS, OPT_CLASS,
 )
-
-MODELS: Tuple[str, ...] = ("mamba", "decoder", "vit")
 
 # ARCHES — all GPU/TPU architectures the build/profile pipeline accepts.
 # This MUST stay in sync with grokking_optimizers.compile.ARCH_TABLE; the
@@ -99,20 +96,6 @@ ARCHES: Tuple[str, ...] = (
     # Google / Pallas
     "tpu_v4", "tpu_v5e", "tpu_v5p", "tpu_v6e", "tpu_v7",
 )
-
-OPT_CLASS = {
-    "adamw":       "AdamW",
-    "grokadamw":   "GrokAdamW",
-    "grokfast":    "Grokfast",
-    "lion":        "Lion",
-    "looksam":     "LookSAM",
-    "muon":        "Muon",
-    "neuralgrok":  "NeuralGrok",
-    "prodigy":     "Prodigy",
-    "supergrok11": "SuperGrok11",
-    "supergrok15": "SuperGrok15",
-    "supergrok2":  "SuperGrok2",
-}
 
 # ARCH_INFO is owned by grokking_optimizers.compile (the single source of
 # truth — see ARCH_TABLE there). It is imported lazily by the helper below
@@ -271,7 +254,7 @@ def smoke_script(optimizer: str, model: str, arch: str) -> str:
     grokking_optimizers._ops entirely (which only exists after
     ``pip install -e .``).
     """
-    if arch == "tpu_v5p" or _arch_info().get(arch, {}).get("vendor") == "pallas":
+    if arch == "tpu_v6e" or _arch_info().get(arch, {}).get("vendor") == "pallas":
         return _pallas_smoke_script(optimizer)
     cls = OPT_CLASS[optimizer]
     return textwrap.dedent(f"""\
@@ -419,7 +402,7 @@ def infer_from_path(path: Path) -> dict:
     elif "gfx942" in parts:
         arch = "gfx942"
     elif "pallas" in parts:
-        arch = "tpu_v5p"
+        arch = "tpu_v6e"
 
     name = path.name
 

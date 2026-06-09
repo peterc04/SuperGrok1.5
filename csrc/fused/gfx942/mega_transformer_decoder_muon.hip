@@ -41,7 +41,7 @@ hipError_t mega_transformer_decoder_muon(
     int n_cus = 0;
     err = hipDeviceGetAttribute(&n_cus, hipDeviceAttributeMultiprocessorCount, dev);
     if (err != hipSuccess) return err;
-    ctx.n_ctas = (unsigned)n_cus;
+    ctx.n_groups = (unsigned)n_cus;
     FusedOptState st;
     st.exp_avg = m; st.exp_avg_sq = v;
     st.orth = extra;

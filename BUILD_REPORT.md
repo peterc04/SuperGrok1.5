@@ -6,7 +6,7 @@ verified and how, and the complete list of checks deferred to real silicon.
 > **Status legend** — 🟡 = implemented + structurally / compile verified on the
 > CPU host (nvcc `-c` to object, clang amdgcn device-compile, or Python
 > self-test); **NOT** yet hardware-validated. ✅ = bit-level reference-checked +
-> profiled on real H100 / MI300X / TPU v5p via `HARDWARE_VALIDATION.md`.
+> profiled on real H100 / MI300X / TPU v6e via `HARDWARE_VALIDATION.md`.
 > Every performance cell below is 🟡 pending that runbook.
 
 ## Verification gates used
@@ -16,11 +16,11 @@ verified and how, and the complete list of checks deferred to real silicon.
 | `scripts/compile_to_object.sh <tu.cu>` | nvcc `-c` to object, sm_90a cross-compile (no GPU) | all sm_90 CUDA TUs |
 | `scripts/verify_stage0.sh` | the 14 canonical sm_90 TUs all compile | full sm_90 tree |
 | `scripts/amdgcn_check.sh --header <h>` | clang AMDGPU backend device-compile, gfx942 (no hipcc) | all gfx942 headers |
-| `compile.py --self-test` | Python pipeline: flags, search space, codegen, structure | 138 tests |
+| `compile.py --self-test` | Python pipeline: flags, search space, codegen, structure | 156 tests |
 | `ruff check .` | repo-wide lint | all Python |
 
 **Headline gate results (final):** sm_90 **14/14 COMPILE_OK**; gfx942 **17/17
-AMDGCN_OK**; self-test **138 passed / 0 failed**; ruff **clean repo-wide**; zero
+AMDGCN_OK**; self-test **156 passed / 0 failed**; ruff **clean repo-wide**; zero
 `not_implemented` / throwing stubs tree-wide.
 
 ## Per-stage summary
@@ -177,7 +177,7 @@ bash scripts/verify_stage0.sh                       # 14/14 sm_90 COMPILE_OK
 for h in grokking_optimizers/kernels/gfx942/*.hip.hpp \
          csrc/backends/hip/gfx942/amdgcn_primitives.hip.hpp; do
   bash scripts/amdgcn_check.sh --header "$h"; done   # 17/17 AMDGCN_OK
-PYTHONPATH=. python grokking_optimizers/compile.py --self-test   # 138/0
+PYTHONPATH=. python grokking_optimizers/compile.py --self-test   # 156/0
 ruff check .                                         # clean
 PYTHONPATH=. python -m grokking_optimizers.megakernel            # solver coverage
 PYTHONPATH=. python -m grokking_optimizers.megakernel_codegen --emit-all  # 99-cell manifest
@@ -191,12 +191,12 @@ Full detail + the 99-pipeline table + before→after fuse-tiers are in
 `PHASE4_REPORT.md`. Summary (44/44 components built; verified at each arch's
 gate level; on-silicon execution/numerics 🟡):
 
-| component group | sm_90 | gfx942 | tpu_v5p | verification level |
+| component group | sm_90 | gfx942 | tpu_v6e | verification level |
 |-----------------|-------|--------|---------|--------------------|
 | 11 optimizers   | ✅ built | ✅ built | ✅ built | nvcc-object / clang-amdgcn / jax-lower |
 | 3 models        | ✅ built | ✅ built | ✅ built | nvcc-object / clang-amdgcn / jax-lower |
 | dispatch        | ✅ nvcc | 🟡 hipcc-structural | ✅ unified-py | per arch |
-| compile/codegen | ✅ self-test (138/0) + per-cell register-cap autotuner sweep | | | |
+| compile/codegen | ✅ self-test (156/0) + per-cell register-cap autotuner sweep | | | |
 
 - 33 optimizer + 9 model + 2 (dispatch, compile/codegen) = **44/44 built**.
 - 99 pipelines: **0 STILL-WRAPPER** (anti-false-positive grep = 0). Post-WS1

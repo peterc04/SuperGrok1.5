@@ -40,6 +40,7 @@
 #define SG_TUNED_ASYNC_DEPTH 2
 #endif
 #include "csrc/backends/cuda/sm_90/primitives.cuh"
+#include "grokking_optimizers/kernels/sm_90/common_sm90.cuh"
 
 namespace sg { namespace sm90 {
 
@@ -86,20 +87,21 @@ neuralgrok_kernel(
     const float* W1, const float* b1, const float* W2, float b2,
     float alpha, float beta,
     float lr, float beta1_a, float beta2_a, float eps, float wd,
-    float bc1, float bc2, int N
+    float bc1, float bc2, int64_t N
 ) {
     __shared__ float sW1[NG_H];
     __shared__ float sb1[NG_H];
     __shared__ float sW2[NG_H];
     ng_stage_psi_weights<NG_H>(W1, b1, W2, sW1, sb1, sW2);
 
-    const int stride = prim::grid_stride() * UNROLL;
-    const int base0 = prim::grid_stride_index() * UNROLL;
-    for (int base = base0; base < N; base += stride) {
+    const int64_t stride = prim::grid_stride() * UNROLL;
+    const int64_t base0 = prim::grid_stride_index() * UNROLL;
+    for (int64_t base = base0; base < N; base += stride) {
         #pragma unroll
         for (int u = 0; u < UNROLL; ++u) {
-            const int i = base + u;
+            const int64_t i = base + u;
             if (i < N) {
+                SG_SANITIZE_GRAD_INPLACE(grad, i);
                 const float ag = fabsf(static_cast<float>(grad[i]));
                 const float s = neuralgrok_psi_forward<NG_H>(ag, sW1, sb1, sW2, b2);
                 neuralgrok_apply_step(param, exp_avg, exp_avg_sq, grad, s,
@@ -122,19 +124,20 @@ neuralgrok_kernel_vec4_fp32(
     const float* W1, const float* b1, const float* W2, float b2,
     float alpha, float beta,
     float lr, float beta1_a, float beta2_a, float eps, float wd,
-    float bc1, float bc2, int N4
+    float bc1, float bc2, int64_t N4
 ) {
     __shared__ float sW1[NG_H];
     __shared__ float sb1[NG_H];
     __shared__ float sW2[NG_H];
     ng_stage_psi_weights<NG_H>(W1, b1, W2, sW1, sb1, sW2);
 
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N4; i += stride) {
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N4; i += stride) {
         float4 p = prim::ld_f32v4(param4 + i);
         float4 m = prim::ld_f32v4(exp_avg4 + i);
         float4 v = prim::ld_f32v4(exp_avg_sq4 + i);
         float4 g = prim::ldg_f32v4(grad4 + i);
+        ::grokking::sm90::sg_sanitize_grad4(g);
         #pragma unroll
         for (int u = 0; u < 4; ++u) {
             const float ag = fabsf((&g.x)[u]);
@@ -173,7 +176,8 @@ void launch_neuralgrok_step(
         exp_avg_sq.data_ptr(), exp_avg_sq.nbytes());
 
     const int block = SG_TUNED_BLOCK_SIZE;
-    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    const int grid = static_cast<int>(
+        std::min<int64_t>(65535, (N + block - 1) / block));
 
     const bool all_fp32 = param.scalar_type() == torch::kFloat32 &&
                           grad.scalar_type() == torch::kFloat32;
@@ -186,8 +190,9 @@ void launch_neuralgrok_step(
         prim::is_vec4_alignable(exp_avg.data_ptr(), N) &&
         prim::is_vec4_alignable(exp_avg_sq.data_ptr(), N) &&
         prim::is_vec4_alignable(grad.data_ptr(), N)) {
-        const int N4 = N / 4;
-        const int grid4 = std::min<int>(65535, (N4 + block - 1) / block);
+        const int64_t N4 = N / 4;
+        const int grid4 = static_cast<int>(
+            std::min<int64_t>(65535, (N4 + block - 1) / block));
         neuralgrok_kernel_vec4_fp32<<<grid4, block, 0, stream>>>(
             reinterpret_cast<float4*>(param.data_ptr<float>()),
             reinterpret_cast<float4*>(exp_avg.data_ptr<float>()),
@@ -198,6 +203,7 @@ void launch_neuralgrok_step(
             psi_W2.data_ptr<float>(),
             psi_b2,
             alpha, beta, lr, beta1_a, beta2_a, eps, wd, bc1, bc2, N4);
+        SG_LAUNCH_CHECK(stream);
         return;
     }
 
@@ -215,6 +221,7 @@ void launch_neuralgrok_step(
                 psi_W2.data_ptr<float>(),
                 psi_b2,
                 alpha, beta, lr, beta1_a, beta2_a, eps, wd, bc1, bc2, N);
+            SG_LAUNCH_CHECK(stream);
         });
 }
 
@@ -226,16 +233,16 @@ __global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_NEURALGROK_MIN_BLOCKS)
 neuralgrok_amplifier_kernel(
     const float* grad, float* amplified,
     const float* W1, const float* b1, const float* W2, float b2_scalar,
-    float alpha, float beta, int N
+    float alpha, float beta, int64_t N
 ) {
     __shared__ float sW1[NG_H];
     __shared__ float sb1[NG_H];
     __shared__ float sW2[NG_H];
     ng_stage_psi_weights<NG_H>(W1, b1, W2, sW1, sb1, sW2);
 
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
-        float g = grad[i];
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N; i += stride) {
+        float g = ::grokking::sm90::sg_sanitize_grad(grad[i]);
         float ag = fabsf(g);
         float s = neuralgrok_psi_forward<NG_H>(ag, sW1, sb1, sW2, b2_scalar);
         amplified[i] = alpha * s * g + beta * g;
@@ -252,13 +259,15 @@ void launch_fused_neuralgrok_amplifier(
     if (N == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int block = SG_TUNED_BLOCK_SIZE;
-    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    const int grid = static_cast<int>(
+        std::min<int64_t>(65535, (N + block - 1) / block));
     float b2_val = amplifier_b2.item<float>();
     neuralgrok_amplifier_kernel<<<grid, block, 0, stream>>>(
         grad.data_ptr<float>(), amplified.data_ptr<float>(),
         amplifier_w1.data_ptr<float>(), amplifier_b1.data_ptr<float>(),
         amplifier_w2.data_ptr<float>(), b2_val,
         alpha, beta, N);
+    SG_LAUNCH_CHECK(stream);
 }
 
 // Adam-only on pre-amplified gradient (no psi network evaluation).
@@ -266,13 +275,13 @@ __global__ void neuralgrok_adam_only_kernel(
     float* param, float* exp_avg, float* exp_avg_sq,
     const float* amplified_grad,
     float beta1, float beta2, float lr, float wd, float eps,
-    float bc1, float bc2, int N
+    float bc1, float bc2, int64_t N
 ) {
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N; i += stride) {
         // g_eff is the pre-amplified gradient; the bias-corrected Adam +
         // decoupled-WD math lives once in algorithms/neuralgrok.h.
-        const float g_eff = amplified_grad[i];
+        const float g_eff = ::grokking::sm90::sg_sanitize_grad(amplified_grad[i]);
         neuralgrok_adam_tail(param, exp_avg, exp_avg_sq, g_eff,
                              lr, beta1, beta2, eps, wd, bc1, bc2, i);
     }
@@ -288,11 +297,13 @@ void launch_fused_neuralgrok_adam(
     if (N == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int block = SG_TUNED_BLOCK_SIZE;
-    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    const int grid = static_cast<int>(
+        std::min<int64_t>(65535, (N + block - 1) / block));
     neuralgrok_adam_only_kernel<<<grid, block, 0, stream>>>(
         param.data_ptr<float>(), exp_avg.data_ptr<float>(),
         exp_avg_sq.data_ptr<float>(), amplified_grad.data_ptr<float>(),
         beta1, beta2, lr, weight_decay, eps, bc1, bc2, N);
+    SG_LAUNCH_CHECK(stream);
 }
 
 // Full fused step: psi amplification + Adam update in a single kernel launch.

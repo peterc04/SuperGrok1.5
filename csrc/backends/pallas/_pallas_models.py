@@ -1,8 +1,8 @@
-"""TPU v5p model surface for Decoder Transformer, ViT, and Mamba.
+"""TPU v6e model surface for Decoder Transformer, ViT, and Mamba.
 
 Provides Pallas/JAX implementations of three models used by the grokking
 race driver.  Each model exposes forward and backward functions suitable
-for TPU v5p (128-wide MXU tiles).  All Pallas kernels are wrapped in
+for TPU v6e (256-wide MXU tiles).  All Pallas kernels are wrapped in
 try/except with pure-JAX fallbacks so the code remains functional when
 the Pallas API changes or is unavailable.
 
@@ -85,7 +85,7 @@ def _layer_norm(x, gamma, beta, eps=1e-5):
 #  Shared attention (used by Decoder and ViT)
 # ═══════════════════════════════════════════════════════════════════════
 
-def _hand_tiled_attention_forward(q, k, v, *, causal: bool, tile_size=128):
+def _hand_tiled_attention_forward(q, k, v, *, causal: bool, tile_size=256):
     """Hand-tiled QKV attention in BF16 with optional causal mask.
 
     Args:
@@ -132,12 +132,12 @@ def _hand_tiled_attention_forward(q, k, v, *, causal: bool, tile_size=128):
     return out, softmax_lse
 
 
-def attention_forward(q, k, v, *, causal: bool, tile_size=128):
+def attention_forward(q, k, v, *, causal: bool, tile_size=256):
     """Multi-head attention forward — splash_attention first, hand-tiled fallback.
 
     Path selection (LIVE / FALLBACK, both intentional):
       1. If the TPU splash_attention kernel is importable AND callable, use it
-         (the fast v5p MXU path). It returns the attention output; we recompute
+         (the fast v6e MXU path). It returns the attention output; we recompute
          the log-sum-exp cheaply for the backward contract.
       2. Otherwise — splash not present, not callable, or it raised/returned
          None at trace time — fall through to the hand-tiled Pallas attention
@@ -148,7 +148,7 @@ def attention_forward(q, k, v, *, causal: bool, tile_size=128):
     Args:
         q, k, v: [batch, n_heads, seq_len, d_head]
         causal: whether to apply a causal mask
-        tile_size: Pallas tile size (default 128 for v5p)
+        tile_size: Pallas tile size (default 256 for v6e)
 
     Returns:
         (out, softmax_lse)
@@ -169,7 +169,7 @@ def attention_forward(q, k, v, *, causal: bool, tile_size=128):
     return _hand_tiled_attention_forward(q, k, v, causal=causal, tile_size=tile_size)
 
 
-def attention_backward(grad_out, q, k, v, out, softmax_lse, *, causal: bool, tile_size=128):
+def attention_backward(grad_out, q, k, v, out, softmax_lse, *, causal: bool, tile_size=256):
     """Attention backward pass via JAX autodiff.
 
     Args:
@@ -187,7 +187,12 @@ def attention_backward(grad_out, q, k, v, out, softmax_lse, *, causal: bool, til
         o, _ = attention_forward(q_, k_, v_, causal=causal, tile_size=tile_size)
         return o
 
-    grad_q, grad_k, grad_v = jax.grad(_fwd, argnums=(0, 1, 2))(q, k, v)
+    # Use a vector-Jacobian product seeded with grad_out: jax.grad requires a
+    # SCALAR output and would raise on the [B,h,S,d] attention output, and it
+    # would also ignore the incoming cotangent. jax.vjp back-propagates the real
+    # upstream gradient grad_out through the forward.
+    _, vjp_fn = jax.vjp(_fwd, q, k, v)
+    grad_q, grad_k, grad_v = vjp_fn(grad_out)
     return grad_q, grad_k, grad_v
 
 
@@ -494,8 +499,14 @@ def _jax_selective_scan_fallback(x, B_mat, C_mat, dt, A_log):
 
     final_Ms, final_bs = lax.associative_scan(_combine, (Ms, bs), axis=1)
     # final_bs is the state at each timestep: [B, S, d_inner, d_state]
-    # Output: y_t = C_t . state_t  (dot over d_state)
-    y = jnp.einsum('bsdn,bsn->bsd', final_bs, C_mat)
+    # Output: y_t = C_t . state_t  (dot over d_state).
+    # fp32-accumulate the output contraction so a bf16-default activation path
+    # keeps the C·state reduction on the fp32 MXU fast path (consistent with the
+    # attention QK^T/PV einsums). The scan recurrence itself stays in the input
+    # dtype: it is element-wise (no MXU matmul) and numerically sensitive to the
+    # long product of dA, so bf16 accumulation there would hurt, not help.
+    y = jnp.einsum('bsdn,bsn->bsd', final_bs, C_mat,
+                   preferred_element_type=jnp.float32)
     return y
 
 

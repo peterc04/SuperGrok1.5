@@ -3,7 +3,7 @@
 A grokking-optimizer + model training stack built as **44 reusable components
 that compose into 99 fused training pipelines** across three accelerator
 families — **NVIDIA sm_90 (Hopper)**, **AMD gfx942 (CDNA3 / MI300X)**, and
-**Google TPU v5p** — with **one canonical source of truth per component**
+**Google TPU v6e** — with **one canonical source of truth per component**
 (no parallel math trees, no dead duplicates; enforced by a self-test drift
 guard).
 
@@ -11,7 +11,7 @@ guard).
 > this environment via CPU / clang-AMDGPU-gate / `nvcc -c` / JAX-lowering**.
 > No accelerator is present here, so all *runtime* and *numeric-parity* claims
 > are 🟡 and gated on the executable checklist in
-> [`HARDWARE_VALIDATION.md`](HARDWARE_VALIDATION.md) (H100 / MI300X / TPU v5p).
+> [`HARDWARE_VALIDATION.md`](HARDWARE_VALIDATION.md) (H100 / MI300X / TPU v6e).
 > Nothing in this README claims a hardware result.
 
 ---
@@ -29,7 +29,7 @@ guard).
 **11 optimizers:** AdamW, Lion, Grokfast, GrokAdamW, LookSAM, Prodigy,
 NeuralGrok, Muon, SuperGrok1.1, SuperGrok1.5, SuperGrok2.
 **3 models:** Transformer-Decoder, ViT, Mamba-3.
-**3 archs:** sm_90, gfx942, tpu_v5p.
+**3 archs:** sm_90, gfx942, tpu_v6e.
 
 The **dispatch/compile layer composes any optimizer component with any model
 component** into one fused L3/L1 persistent megakernel per (model, optimizer,
@@ -67,7 +67,7 @@ csrc/fused/
   sm_90/model_stages.cuh           ← element-local model fwd/bwd
   sm_90/fused_megakernel.cuh       ← the composition seam (L3/L1 persistent kernel)
   gfx942/{opt_components,model_stages,fused_megakernel}.hip.hpp
-  {sm_90,gfx942,tpu_v5p}/mega_<model>_<opt>.{cu,hip,py}  ← the 99 real cells
+  {sm_90,gfx942,tpu_v6e}/mega_<model>_<opt>.{cu,hip,py}  ← the 99 real cells
   megakernel_common*.{cuh,hip.hpp} ← task queue, %smid/HW_ID pin, GridBarrier
 ```
 
@@ -103,7 +103,7 @@ enumeration that emits the 99 cells, so it cannot hand-sync-drift.
   The device kernels are the **LIVE path on a hipcc build** (`#if __HIPCC__` →
   `hipLaunchKernelGGL`); ATen/rocBLAS is the `#else` **CPU fallback**. The SG2
   gfx942 bilevel adjoint + MoE compaction are real AMDGCN device code.
-- **tpu_v5p:** **Pallas** programs (`pl.pallas_call` + `BlockSpec`) composed by
+- **tpu_v6e:** **Pallas** programs (`pl.pallas_call` + `BlockSpec`) composed by
   `_pallas_fused.py` into one `jax.jit` fused program per cell (splash-attention
   where available, hand-tiled dense fallback otherwise; `lax.associative_scan`
   for Mamba).
@@ -156,7 +156,7 @@ FORCE_CUDA=1 WITH_CUTLASS=1 TORCH_CUDA_ARCH_LIST="9.0a" \
 # AMD (MI300X):
 WITH_HIP=1 pip install -e . --no-build-isolation     # requires ROCm/hipcc
 
-# TPU v5p:
+# TPU v6e:
 pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 
 # CPU-only (host build; device paths take their ATen/JAX fallbacks):
@@ -172,18 +172,94 @@ fused cells).
 ## 6. Verification (this environment — no accelerator)
 
 ```bash
-python -m grokking_optimizers.compile --self-test     # 141 passed, 0 failed
+# The end-all-be-all: prove the modular composition compiles AND runs maximally.
+python -m grokking_optimizers.verify_all                # 152/152, all phases
+python -m grokking_optimizers.verify_all --phase 4      # just MAXIMALITY (fast)
+python -m grokking_optimizers.verify_all --quick        # skip the 99 compiles
+
+# Full-scale binary profiling: prove the emitted machine code is MAXIMAL.
+python -m grokking_optimizers.profile_maximal           # 17/17, all tiers
+python -m grokking_optimizers.profile_maximal --quick   # tier D (functional) only
+
+# The individual gates verify_all orchestrates:
+python -m grokking_optimizers.compile --self-test     # 156 passed, 0 failed
 ruff check grokking_optimizers/ && ruff format --check grokking_optimizers/
 python scripts/check_math_single_source.py            # drift guard (exit 0)
 scripts/amdgcn_check.sh --header <gfx942 header>       # clang AMDGPU device gate
+scripts/amdgcn_check.sh --cell <gfx942 mega_*.hip>     # full composed-cell gate
 scripts/compile_to_object.sh <tu>.cu -DWITH_CUTLASS    # nvcc -c sm_90a
 ```
 
-System-verified (Phase 5/6): self-test **141/0**; ruff clean; **19/19** gfx942
-headers AMDGCN_OK; **99/99** cells emit real compositions and are 5-way
-consistent (canonical file ↔ solver tier ↔ cell comment ↔ dispatch route ↔
-status table); anti-false-positive sweep = **0**; the math-drift guard passes
-and **provably triggers** on injected divergence.
+**`verify_all` is the single authoritative gate.** It runs six phases: (0)
+toolchain probe, (1) structural inventory, (2) single-component compile gates,
+(3) **MODULAR COMPOSITION** — every optimizer compiles *together with* every
+model across all **99 fused cells** (33 sm_90 via `nvcc -c`, 33 gfx942 via the
+AMDGCN device gate, 33 tpu_v6e via `jax` trace+lower), (4) **MAXIMALITY** —
+every cell at its max feasible fusion tier, codegen idempotency (all 99 cells
+byte-identical to the generator), register+smem budget, math single-source
+drift, (5) cross-validation — dispatch tables match their generators, self-test,
+ruff, the utilization crash-hard contract. Anything needing absent hardware is
+reported `SKIP-silicon`, never a false green.
+
+System-verified: `verify_all` **152/152, 0 fail** — self-test **156/0**; ruff
+clean; **17/17** gfx942 headers + **33/33** gfx942 fused cells AMDGCN_OK;
+**33/33** sm_90 cells `nvcc -c` OK; **33/33** tpu_v6e cells trace+lower OK;
+**99/99** cells byte-idempotent vs the generator and 5-way consistent (canonical
+file ↔ solver tier ↔ cell comment ↔ dispatch route ↔ status table); fusion-tier
+map sm_90 **L3×33** / gfx942 **L3×11 + L1×22** / tpu_v6e **L3×33**; the
+math-drift guard passes and **provably triggers** on injected divergence.
+
+**Binary maximality** (`profile_maximal` **23/23**, real emitted-code numbers —
+all three target archs get the SAME standard):
+- **sm_90 (H100)** — SASS via `cuobjdump` + `ptxas -v`: the GEMM TUs emit Hopper
+  **WGMMA tensor cores (80–176/TU) + TMA async copies (84–164/TU)** via the
+  CUTLASS Sm90 collectives, with the wgmma mainloop **not serialized** (ptxas
+  C7509 = 0, after `-DNDEBUG` strips the CUTLASS asserts that an extern
+  `__assert_fail` otherwise forced into the pipeline) and **zero register
+  spills**; the fused megakernel cells run at **30–32 real registers** (vs the
+  255 budget) with **0 spills**.
+- **gfx942 (MI300X)** — real AMDGCN ISA via `llvm-objdump` + `llvm-readobj`:
+  the attention kernel emits **20 `v_mfma_f32_16x16x16_bf16`** matrix-core
+  instructions + 36 DPP cross-lane ops; decoder/vit/mamba emit `v_mfma` in-ISA;
+  real **VGPR ≤ 105 / 255** from the AMDGPU kernel descriptor.
+- **tpu_v6e (Trillium)** — optimized HLO via `jax` compile + host run: every
+  fused cell compiles to **`dot_general` MXU matmuls (202–618/cell) + XLA
+  fusion (271–744/cell)** and **executes finite** on CPU; the v6e binding uses
+  the **256-wide MXU tile**.
+- **functional**: the optimizer math **provably descends** (Adam core
+  32→3.6e-8, Lion 32→2.8e-12).
+
+What remains is **silicon-only** for every arch: wall-clock latency/throughput,
+achieved occupancy + bandwidth (ncu/rocprof), the autotuner's measured-latency
+config selection, the gfx942 L1→L3 promotion (dynamic-LDS via rocprof), and real
+MXU instruction emission on the TPU.
+
+### Observability — device utilization across all 33 pipelines per arch
+
+`grokking_optimizers/utilization.py` is a **live device-utilization sweep**: for
+a given arch it runs each of the **33 fused pipelines** (11 optimizers × 3
+models) under a sustained load while a low-overhead background poller samples the
+device, then emits one structured record per pipeline (mean/peak compute % +
+memory %, peak device MB) as a table + JSON.
+
+```bash
+python -m grokking_optimizers.utilization --arch tpu_v6e            # sweep all 33
+python -m grokking_optimizers.utilization --arch sm_90a -O supergrok2  # one optimizer ×3
+python -m grokking_optimizers.utilization --arch gfx942 --list      # enumerate, no device
+```
+
+Per-arch sampler backend: NVIDIA → `pynvml` `nvmlDeviceGetUtilizationRates`
+(SM% + mem%, `nvidia-smi` fallback); AMD → `amdsmi` / `rocm-smi --showuse`
+(GPU use% + VRAM%); TPU → JAX `device.memory_stats()` for live HBM utilization
+(MXU compute duty-cycle is xprof-only — see `grokking_optimizers.profile`). It
+complements `grokking_optimizers.profile` (one-shot ncu/rocprof/jax.profiler
+dump) and `bench_backends` (wall-clock). **Failure policy: crash hard, crash
+loud.** If the sampler library is missing, the device is absent, the workload
+fails, or the poller can't read a counter, the module raises immediately with a
+clear, attributable exception — no graceful degradation, no null-metric
+fallback records. Fix the environment, don't paper over it. The enumeration,
+aggregation math, and JSON/table schema are CPU-tested in `--self-test`; the
+actual **numbers** are silicon-only.
 
 ---
 
@@ -193,12 +269,12 @@ and **provably triggers** on injected divergence.
 |------|--------|
 | sm_90 fused L3/L1 + TF32 model GEMM | **LIVE**, nvcc-object-verified; tiers + runtime 🟡 (ptxas/H100) |
 | gfx942 device kernels (11 opt + SG2 fwd/bwd/MoE) | **LIVE on hipcc** (`#if __HIPCC__`); ATen = **FALLBACK** (CPU). clang-gate-verified; host-launch + numerics 🟡 (MI300X) |
-| TPU Pallas fused (33 cells) | **LIVE**, trace+lower-verified; on-TPU runtime 🟡 (v5p) |
+| TPU Pallas fused (33 cells) | **LIVE**, trace+lower-verified; on-TPU runtime 🟡 (v6e) |
 | SG2 bilevel adjoint | **LIVE** (ATen vendor-neutral on CPU; AMDGCN device adjoint on hipcc); numerics 🟡 |
 | math-drift guard | **LIVE + enforced** in `--self-test` |
 
 **The only remaining work class is on-silicon execution + numeric parity** — no
-code is blocked on anything but real H100 / MI300X / TPU v5p hardware. Every such
+code is blocked on anything but real H100 / MI300X / TPU v6e hardware. Every such
 item is a concrete row in the 99-cell checklist in `HARDWARE_VALIDATION.md`.
 
 ---
@@ -220,4 +296,4 @@ controlled conditions — the project's namesake driver.
 > complete: single canonical math source per component (enforced), no dead
 > duplicate trees, generator-driven dispatch, vectorized AMD apply-steps. The
 > ONLY remaining work class is on-silicon validation (gap #7) — the
-> `HARDWARE_VALIDATION.md` runbook on real H100 / MI300X / TPU v5p — to move 🟡 → ✅.
+> `HARDWARE_VALIDATION.md` runbook on real H100 / MI300X / TPU v6e — to move 🟡 → ✅.

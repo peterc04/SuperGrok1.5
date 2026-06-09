@@ -6,9 +6,9 @@
 //       must already be declared in sg::fused::sm90.
 namespace fused { namespace sm90 {
 cudaError_t mega_transformer_decoder_adamw(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
-cudaError_t mega_transformer_decoder_lion(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
-cudaError_t mega_transformer_decoder_grokfast(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
 cudaError_t mega_transformer_decoder_grokadamw(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
+cudaError_t mega_transformer_decoder_grokfast(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
+cudaError_t mega_transformer_decoder_lion(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
 cudaError_t mega_transformer_decoder_looksam(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
 cudaError_t mega_transformer_decoder_muon(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
 cudaError_t mega_transformer_decoder_neuralgrok(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
@@ -17,9 +17,9 @@ cudaError_t mega_transformer_decoder_supergrok11(PersistentContext, float*, cons
 cudaError_t mega_transformer_decoder_supergrok15(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
 cudaError_t mega_transformer_decoder_supergrok2(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
 cudaError_t mega_vit_adamw(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
-cudaError_t mega_vit_lion(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
-cudaError_t mega_vit_grokfast(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
 cudaError_t mega_vit_grokadamw(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
+cudaError_t mega_vit_grokfast(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
+cudaError_t mega_vit_lion(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
 cudaError_t mega_vit_looksam(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
 cudaError_t mega_vit_muon(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
 cudaError_t mega_vit_neuralgrok(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
@@ -28,9 +28,9 @@ cudaError_t mega_vit_supergrok11(PersistentContext, float*, const float*, float*
 cudaError_t mega_vit_supergrok15(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
 cudaError_t mega_vit_supergrok2(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
 cudaError_t mega_mamba3_adamw(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
-cudaError_t mega_mamba3_lion(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
-cudaError_t mega_mamba3_grokfast(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
 cudaError_t mega_mamba3_grokadamw(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
+cudaError_t mega_mamba3_grokfast(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
+cudaError_t mega_mamba3_lion(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
 cudaError_t mega_mamba3_looksam(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
 cudaError_t mega_mamba3_muon(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
 cudaError_t mega_mamba3_neuralgrok(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, cudaStream_t);
@@ -48,12 +48,12 @@ inline cudaError_t dispatch_sm90_cell(
  *found = true;
  if (model == "transformer_decoder" && optimizer == "adamw")
   return mega_transformer_decoder_adamw(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
- if (model == "transformer_decoder" && optimizer == "lion")
-  return mega_transformer_decoder_lion(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
- if (model == "transformer_decoder" && optimizer == "grokfast")
-  return mega_transformer_decoder_grokfast(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
  if (model == "transformer_decoder" && optimizer == "grokadamw")
   return mega_transformer_decoder_grokadamw(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+ if (model == "transformer_decoder" && optimizer == "grokfast")
+  return mega_transformer_decoder_grokfast(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+ if (model == "transformer_decoder" && optimizer == "lion")
+  return mega_transformer_decoder_lion(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
  if (model == "transformer_decoder" && optimizer == "looksam")
   return mega_transformer_decoder_looksam(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
  if (model == "transformer_decoder" && optimizer == "muon")
@@ -70,12 +70,12 @@ inline cudaError_t dispatch_sm90_cell(
   return mega_transformer_decoder_supergrok2(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
  if (model == "vit" && optimizer == "adamw")
   return mega_vit_adamw(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
- if (model == "vit" && optimizer == "lion")
-  return mega_vit_lion(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
- if (model == "vit" && optimizer == "grokfast")
-  return mega_vit_grokfast(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
  if (model == "vit" && optimizer == "grokadamw")
   return mega_vit_grokadamw(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+ if (model == "vit" && optimizer == "grokfast")
+  return mega_vit_grokfast(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+ if (model == "vit" && optimizer == "lion")
+  return mega_vit_lion(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
  if (model == "vit" && optimizer == "looksam")
   return mega_vit_looksam(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
  if (model == "vit" && optimizer == "muon")
@@ -92,12 +92,12 @@ inline cudaError_t dispatch_sm90_cell(
   return mega_vit_supergrok2(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
  if (model == "mamba3" && optimizer == "adamw")
   return mega_mamba3_adamw(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
- if (model == "mamba3" && optimizer == "lion")
-  return mega_mamba3_lion(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
- if (model == "mamba3" && optimizer == "grokfast")
-  return mega_mamba3_grokfast(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
  if (model == "mamba3" && optimizer == "grokadamw")
   return mega_mamba3_grokadamw(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+ if (model == "mamba3" && optimizer == "grokfast")
+  return mega_mamba3_grokfast(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+ if (model == "mamba3" && optimizer == "lion")
+  return mega_mamba3_lion(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
  if (model == "mamba3" && optimizer == "looksam")
   return mega_mamba3_looksam(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
  if (model == "mamba3" && optimizer == "muon")

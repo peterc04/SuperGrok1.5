@@ -55,7 +55,10 @@
 // content. On a real hipcc build the host pass compiles this and launches the
 // §5 kernel via hipLaunchKernelGGL (see §5.LAUNCH).
 // ════════════════════════════════════════════════════════════════════════════
-#if !defined(__AMDGCN__)
+// SG_GFX942_DEVICE_TU (Stage 7): set by the thin `.hip` device TU so this host
+// launcher is NOT re-emitted in that TU's host pass (it stays owned by the
+// `.hip.cpp` host TU) — avoids duplicate launch_looksam_* symbols at link.
+#if !defined(__AMDGCN__) && !defined(SG_GFX942_DEVICE_TU)
 #include <torch/extension.h>
 #include <vector>
 #include <algorithm>
@@ -71,7 +74,7 @@
 #include <ATen/hip/HIPContext.h>
 namespace sg { namespace gfx942 { namespace native {
 extern "C" __global__ void looksam_gfx942_sumsq_reduce(
-    const float* __restrict__ g, float* __restrict__ acc, int n);
+    const float* __restrict__ g, float* __restrict__ acc, int64_t n);
 }}}
 #endif
 
@@ -156,22 +159,27 @@ void launch_looksam_norm_reduce(
     // §5.LAUNCH grid/block: block(256) = 4 wavefronts, grid = min(1024,(n+255)/256).
     auto diff = (sam_grad.to(torch::kFloat32) - grad.to(torch::kFloat32)).contiguous();
     auto gf   = grad.to(torch::kFloat32).contiguous();
-    const int n_diff = static_cast<int>(diff.numel());
-    const int n_grad = static_cast<int>(gf.numel());
+    // 64-bit safe element counts + grid sizing (Stage 1): numel can exceed 2^31.
+    const int64_t n_diff = static_cast<int64_t>(diff.numel());
+    const int64_t n_grad = static_cast<int64_t>(gf.numel());
 
     auto acc_opts = torch::TensorOptions().device(grad.device()).dtype(torch::kFloat32);
     auto acc = torch::zeros({2}, acc_opts);  // [Σ diff², Σ grad²]
     auto stream = at::hip::getCurrentHIPStream();
 
     if (n_diff > 0) {
-        dim3 block(256), grid(std::min(1024, (n_diff + 255) / 256));
+        dim3 block(256), grid(static_cast<unsigned>(
+            std::min<int64_t>(1024, (n_diff + 255) / 256)));
         hipLaunchKernelGGL(native::looksam_gfx942_sumsq_reduce, grid, block, 0, stream,
                            diff.data_ptr<float>(), acc.data_ptr<float>(), n_diff);
+        SG_HIP_LAUNCH_CHECK(stream);  // mirror sm_90 SG_LAUNCH_CHECK
     }
     if (n_grad > 0) {
-        dim3 block(256), grid(std::min(1024, (n_grad + 255) / 256));
+        dim3 block(256), grid(static_cast<unsigned>(
+            std::min<int64_t>(1024, (n_grad + 255) / 256)));
         hipLaunchKernelGGL(native::looksam_gfx942_sumsq_reduce, grid, block, 0, stream,
                            gf.data_ptr<float>(), acc.data_ptr<float>() + 1, n_grad);
+        SG_HIP_LAUNCH_CHECK(stream);  // mirror sm_90 SG_LAUNCH_CHECK
     }
     auto norms = acc.sqrt();  // [‖diff‖, ‖grad‖]
     results[0] = norms[0];
@@ -260,21 +268,37 @@ namespace sg { namespace gfx942 { namespace native {
 namespace amd = ::sg::gfx942::amdgcn;
 static constexpr int kWave = 64;   // == amd::kWave (CDNA3 wavefront width)
 
+// Stage-1 NaN/Inf gradient sanitization (mirror of sm_90 sg_sanitize_grad).
+// Identity unless built with -DSG_SANITIZE_NONFINITE=1; default byte-identical.
+#ifndef SG_SANITIZE_NONFINITE
+#define SG_SANITIZE_NONFINITE 0
+#endif
+__device__ __forceinline__ float sg_sanitize_grad(float g) {
+#if SG_SANITIZE_NONFINITE
+    return __builtin_isfinite(g) ? g : 0.0f;
+#else
+    return g;
+#endif
+}
+
 // Block (workgroup) sum-of-squares of `g[0..n)`, atomically added to *acc.
 // blockDim.x must be a multiple of kWave and <= kWave*kWave (<= 4096); LDS holds
 // one float per wavefront (<= 64 floats).
 __device__ __forceinline__ void looksam_sumsq_block(
-    const float* __restrict__ g, float* __restrict__ acc, int n)
+    const float* __restrict__ g, float* __restrict__ acc, int64_t n)
 {
+    // LDS/lane bookkeeping is LOCAL to the block (<= 4096 threads) → int. Only
+    // the GLOBAL element index/stride (gtid/stride/i) is int64 so the per-element
+    // reduction loop cannot wrap at 2^31 (Stage 1).
     const int tid    = static_cast<int>(threadIdx.x);
     const int lane   = tid % kWave;
     const int waveId = tid / kWave;
     const int wpb    = static_cast<int>(blockDim.x) / kWave;
-    const int gtid   = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + tid;
-    const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    const int64_t gtid   = static_cast<int64_t>(blockIdx.x) * blockDim.x + tid;
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
 
     float local = 0.f;
-    for (int i = gtid; i < n; i += stride) {
+    for (int64_t i = gtid; i < n; i += stride) {
         float v = amd::streaming_load(&g[i]);
         local += v * v;
     }
@@ -296,7 +320,7 @@ __device__ __forceinline__ void looksam_sumsq_block(
 // Bandwidth-bound reduction → high occupancy (256-thread block = 4 wavefronts;
 // 8 waves/EU) to hide global-memory latency. (WS5 occupancy wire.)
 extern "C" SG_KERNEL_BOUNDS(256, 8) void looksam_gfx942_sumsq_reduce(
-    const float* __restrict__ g, float* __restrict__ acc, int n)
+    const float* __restrict__ g, float* __restrict__ acc, int64_t n)
 {
     looksam_sumsq_block(g, acc, n);
 }
@@ -329,10 +353,10 @@ template <typename ParamT, typename GradT>
 __device__ __forceinline__ void looksam_apply_elem(
     ParamT* __restrict__ param, float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq, const float* __restrict__ sam_dir,
-    const GradT* __restrict__ grad, int i, float alpha,
+    const GradT* __restrict__ grad, int64_t i, float alpha,
     float lr, float beta1, float beta2, float eps, float wd, float bc1, float bc2)
 {
-    const float g     = static_cast<float>(amd::streaming_load(&grad[i]));
+    const float g     = sg_sanitize_grad(static_cast<float>(amd::streaming_load(&grad[i])));
     const float sd    = amd::streaming_load(&sam_dir[i]);
     const float p     = static_cast<float>(param[i]);
     const float g_adj = (1.0f - alpha) * g + alpha * sd;
@@ -351,15 +375,16 @@ SG_KERNEL_BOUNDS(256, 8) void looksam_gfx942_apply_kernel(
     float* __restrict__ exp_avg_sq, const float* __restrict__ sam_dir,
     const GradT* __restrict__ grad, float alpha,
     float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int N)
+    float bc1, float bc2, int64_t N)
 {
-    const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
-    const int tid    = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
-                       + static_cast<int>(threadIdx.x);
+    // 64-bit grid-stride indexing (Stage 1): cast BEFORE the multiply.
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    const int64_t tid    = static_cast<int64_t>(blockIdx.x) * blockDim.x
+                       + threadIdx.x;
 
     constexpr bool kVecOk =
         sizeof(ParamT) == sizeof(float) && sizeof(GradT) == sizeof(float);
-    const int n4 = kVecOk ? (N >> 2) : 0;   // number of full float4 groups
+    const int64_t n4 = kVecOk ? (N >> 2) : 0;   // number of full float4 groups
 
     using f32x4 = amd::f32x4;
     auto* p4 = reinterpret_cast<f32x4*>(param);
@@ -368,7 +393,7 @@ SG_KERNEL_BOUNDS(256, 8) void looksam_gfx942_apply_kernel(
     const auto* g4  = reinterpret_cast<const f32x4*>(grad);
     const auto* sd4 = reinterpret_cast<const f32x4*>(sam_dir);
 
-    for (int q = tid; q < n4; q += stride) {
+    for (int64_t q = tid; q < n4; q += stride) {
         const f32x4 g  = amd::streaming_load(&g4[q]);   // 128-bit dwordx4 load
         const f32x4 sd = amd::streaming_load(&sd4[q]);  // sam_dir vector-loaded
         const f32x4 p  = p4[q];
@@ -376,7 +401,8 @@ SG_KERNEL_BOUNDS(256, 8) void looksam_gfx942_apply_kernel(
         const f32x4 ev = v4[q];
         f32x4 mo, vo, po;
         for (int l = 0; l < 4; ++l) {
-            const float g_adj = (1.0f - alpha) * g[l] + alpha * sd[l];
+            const float gl = sg_sanitize_grad(g[l]);  // identity unless sanitize on
+            const float g_adj = (1.0f - alpha) * gl + alpha * sd[l];
             const float m = beta1 * ea[l] + (1.0f - beta1) * g_adj;
             const float v = beta2 * ev[l] + (1.0f - beta2) * g_adj * g_adj;
             mo[l] = m;
@@ -390,7 +416,7 @@ SG_KERNEL_BOUNDS(256, 8) void looksam_gfx942_apply_kernel(
     }
 
     // SCALAR TAIL: the final N%4 elements (and the whole array on fp32 fallback).
-    for (int i = (n4 << 2) + tid; i < N; i += stride) {
+    for (int64_t i = (n4 << 2) + tid; i < N; i += stride) {
         looksam_apply_elem(param, exp_avg, exp_avg_sq, sam_dir, grad, i, alpha,
                            lr, beta1, beta2, eps, wd, bc1, bc2);
     }
@@ -399,7 +425,7 @@ SG_KERNEL_BOUNDS(256, 8) void looksam_gfx942_apply_kernel(
 // Force-instantiate the grokking dtype combo (fp32 param + fp32 grad).
 template __global__ void looksam_gfx942_apply_kernel<float, float>(
     float*, float*, float*, const float*, const float*, float,
-    float, float, float, float, float, float, float, int);
+    float, float, float, float, float, float, float, int64_t);
 
 }}} // namespace sg::gfx942::native
 #endif  // (B) device pass

@@ -6,10 +6,10 @@
 // Algorithm 1 (D-Adaptation-style trajectory estimator + AdamW apply).
 //
 // Self-tuning Adam. Estimates its own learning rate d from the cumulative
-// parameter trajectory: d_new = max(d_prev, r / |s|), where r and s are
-// global reductions across all parameters:
+// parameter trajectory: d_new = max(d_prev, r / s), where r and s are
+// global reductions across all parameters (s is the L1 norm ||·||_1):
 //   r += grad * (param_init - param) * d_prev
-//   s += d_prev * d_prev * grad
+//   s += d_prev * d_prev * |grad|
 //
 // Three operations:
 //   (1) reduce: compute partial r, s sums (block-level)
@@ -31,7 +31,7 @@ __device__ __forceinline__ void prodigy_partials_step(
     const ParamT* __restrict__ param_init,
     const GradT* __restrict__ grad,
     const float d_prev,
-    const int idx,
+    const int64_t idx,
     float& r_local,
     float& s_local
 ) {
@@ -40,7 +40,10 @@ __device__ __forceinline__ void prodigy_partials_step(
     const float g  = static_cast<float>(grad[idx]);
 
     r_local += g * (pi - p) * d_prev;
-    s_local += d_prev * d_prev * g;
+    // Prodigy d-estimate denominator is the L1 norm ||s||_1 = Σ_j |d²·g_j|
+    // (arxiv 2306.06101), so accumulate |g| per coordinate. (Previously this
+    // summed signed g and took |Σ| at reduce time — abs-of-sum ≠ L1 norm.)
+    s_local += d_prev * d_prev * fabsf(g);
 }
 
 // d update — runs on a single thread once r_sum and s_sum are reduced.
@@ -70,7 +73,7 @@ __device__ __forceinline__ void prodigy_apply_step(
     const float wd,
     const float bc1,
     const float bc2,
-    const int idx
+    const int64_t idx
 ) {
     const float g = static_cast<float>(grad[idx]);
     const float p = static_cast<float>(param[idx]);
@@ -83,7 +86,7 @@ __device__ __forceinline__ void prodigy_apply_step(
     s_track[idx]   += d * g;
 
     // bc1, bc2 un-inverted (= 1 - beta^t): divide for bias correction.
-    const float update = (m / bc1) / (sqrtf(v / bc2) + eps);
+    const float update = (m / sg_safe_bc(bc1)) / (sqrtf(v / sg_safe_bc(bc2)) + eps);
     param[idx] = static_cast<ParamT>(p - d * (update + wd * p));
 }
 

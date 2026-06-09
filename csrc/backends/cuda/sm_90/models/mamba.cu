@@ -13,15 +13,16 @@
 namespace sg { namespace sm90 { namespace models { namespace mamba {
 
 // ── forward / backward: full-stack ──────────────────────────────────
+// forward has an extra optional activation_cache parameter (default nullptr).
 template cudaError_t forward<float>(
     const float*, const float*, float*, float*,
-    int, int, int, int, int, int, int, cudaStream_t);
+    int, int, int, int, int, int, int, cudaStream_t, float*);
 template cudaError_t forward<__half>(
     const __half*, const __half*, __half*, __half*,
-    int, int, int, int, int, int, int, cudaStream_t);
+    int, int, int, int, int, int, int, cudaStream_t, __half*);
 template cudaError_t forward<__nv_bfloat16>(
     const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*,
-    int, int, int, int, int, int, int, cudaStream_t);
+    int, int, int, int, int, int, int, cudaStream_t, __nv_bfloat16*);
 
 template cudaError_t backward<float>(
     const float*, const float*, const float*,

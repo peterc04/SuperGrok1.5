@@ -31,6 +31,50 @@
 #include <cooperative_groups/reduce.h>
 
 
+// =========================================================================
+//  Post-launch error check (usable from any .cu launcher).
+//
+//  SG_LAUNCH_CHECK(stream) is called immediately AFTER a kernel launch. It
+//  reads cudaGetLastError() to surface a launch-time failure (bad launch
+//  config, too much shared mem, invalid args) and TORCH_CHECKs it — turning a
+//  silent async error into an immediate, attributable exception.
+//
+//  In release (default) it is launch-error-only: NO synchronize, so the hot
+//  path keeps its async overlap. Define SG_LAUNCH_CHECK_SYNC=1 (debug builds)
+//  to additionally cudaStreamSynchronize and catch errors raised during kernel
+//  EXECUTION (illegal address, etc.) at the launch site instead of later.
+//
+//  Macro (not a function) so __FILE__/__LINE__ point at the launch site and so
+//  it is a no-op-safe statement usable inside any control flow. The
+//  do{...}while(0) wrapper makes it a single statement that needs a trailing ;.
+// =========================================================================
+#ifndef SG_LAUNCH_CHECK_SYNC
+#define SG_LAUNCH_CHECK_SYNC 0
+#endif
+
+#if SG_LAUNCH_CHECK_SYNC
+#define SG_LAUNCH_CHECK(stream)                                               \
+    do {                                                                      \
+        cudaError_t _sg_launch_err = cudaGetLastError();                      \
+        TORCH_CHECK(_sg_launch_err == cudaSuccess,                            \
+                    "CUDA kernel launch failed: ",                            \
+                    cudaGetErrorString(_sg_launch_err));                      \
+        cudaError_t _sg_sync_err = cudaStreamSynchronize(stream);             \
+        TORCH_CHECK(_sg_sync_err == cudaSuccess,                              \
+                    "CUDA kernel execution failed: ",                         \
+                    cudaGetErrorString(_sg_sync_err));                        \
+    } while (0)
+#else
+#define SG_LAUNCH_CHECK(stream)                                               \
+    do {                                                                      \
+        (void)(stream);                                                       \
+        cudaError_t _sg_launch_err = cudaGetLastError();                      \
+        TORCH_CHECK(_sg_launch_err == cudaSuccess,                            \
+                    "CUDA kernel launch failed: ",                            \
+                    cudaGetErrorString(_sg_launch_err));                      \
+    } while (0)
+#endif
+
 namespace sg { namespace sm90 { namespace primitives {
 
 namespace cg = cooperative_groups;
@@ -39,12 +83,17 @@ namespace cg = cooperative_groups;
 //  Grid-stride loop helper
 // =========================================================================
 
-__device__ __forceinline__ int grid_stride_index() {
-    return blockIdx.x * blockDim.x + threadIdx.x;
+// 64-bit global thread index / stride. The per-element step functions in
+// csrc/algorithms/<opt>.h take `const int64_t idx`; the grid-stride loop in
+// each launch_<opt>.cu drives them with these. The block*thread products are
+// formed in 64-bit (cast BEFORE the multiply) so a launch covering >2^31
+// elements cannot overflow the 32-bit product on the way to int64_t.
+__device__ __forceinline__ int64_t grid_stride_index() {
+    return static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 }
 
-__device__ __forceinline__ int grid_stride() {
-    return gridDim.x * blockDim.x;
+__device__ __forceinline__ int64_t grid_stride() {
+    return static_cast<int64_t>(gridDim.x) * blockDim.x;
 }
 
 // =========================================================================

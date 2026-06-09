@@ -39,7 +39,7 @@ __device__ __forceinline__ void grokadamw_step(
     const float wd,
     const float bc1,
     const float bc2,
-    const int idx
+    const int64_t idx
 ) {
     const float g = static_cast<float>(grad[idx]);
     const float p = static_cast<float>(param[idx]);
@@ -59,7 +59,7 @@ __device__ __forceinline__ void grokadamw_step(
 
     // Bias-corrected update with decoupled weight decay.
     // bc1, bc2 are passed un-inverted (= 1 - beta^t), so divide.
-    const float update = (m / bc1) / (sqrtf(v / bc2) + eps);
+    const float update = (m / sg_safe_bc(bc1)) / (sqrtf(v / sg_safe_bc(bc2)) + eps);
     param[idx] = static_cast<ParamT>(p - lr * (update + wd * p));
 }
 
@@ -94,7 +94,7 @@ __device__ __forceinline__ void grokadamw_adam_tail(
 ) {
     const float m = beta1 * m_prev + (1.0f - beta1) * g_eff;
     const float v = beta2 * v_prev + (1.0f - beta2) * g_eff * g_eff;
-    const float update = (m / bc1) / (sqrtf(v / bc2) + eps);
+    const float update = (m / sg_safe_bc(bc1)) / (sqrtf(v / sg_safe_bc(bc2)) + eps);
     m_out = m;
     v_out = v;
     p_out = p - lr * (update + wd * p);

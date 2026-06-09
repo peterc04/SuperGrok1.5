@@ -40,7 +40,7 @@ per-tensor device-function library for that optimizer on that arch.
 |------|-----------|--------|----------|
 | sm_90 | all 11 | **FULLY-BUILT-AND-COMPILE-VERIFIED** | real `csrc/algorithms/<opt>.h` device fns, composed via `opt_components.cuh`; all 11 force-instantiated COMPILE_OK; no fallback |
 | gfx942 | all 11 | **FULLY-BUILT-AND-GATE-VERIFIED** | `opt_components.hip.hpp` = 11 real AMDGCN apply (byte-faithful to the algorithm headers); all 11 force-instantiated under clang `--target=amdgcn-amd-amdhsa -mcpu=gfx942` → AMDGCN_OK; no fallback. Host hipcc + MI300X numerics 🟡 |
-| tpu_v5p | all 11 | **FULLY-BUILT-AND-TRACE-VERIFIED** | `_pallas_fused.py::OPT_STEPS` → 11 real TPU step callables (no aliasing); composed in `fused_step`; 66/66 trace+lower (L1+L3). On-TPU runtime 🟡 |
+| tpu_v6e | all 11 | **FULLY-BUILT-AND-TRACE-VERIFIED** | `_pallas_fused.py::OPT_STEPS` → 11 real TPU step callables (no aliasing); composed in `fused_step`; 66/66 trace+lower (L1+L3). On-TPU runtime 🟡 |
 
 MODEL COMPONENTS (3 × 3 arch = 9).
 
@@ -48,7 +48,7 @@ MODEL COMPONENTS (3 × 3 arch = 9).
 |------|-----------|--------|----------|
 | sm_90 | decoder, vit, mamba3 | **FULLY-BUILT-AND-COMPILE-VERIFIED** (element-local fused + CUTLASS matmul path) | `model_stages.cuh` real element-local fwd/bwd (COMPILE_OK); heavy GEMM = CUTLASS Sm90 path in `backends/cuda/sm_90/models/*`. HONEST: the GEMM is the separate matmul path, not inlined in the persistent megakernel |
 | gfx942 | decoder, vit, mamba3 | **FULLY-BUILT-AND-GATE-VERIFIED** | `model_stages.hip.hpp` real element-local fwd/bwd, AMDGCN_OK; MFMA GEMM = the per-model `kernels/gfx942/<model>.hip.hpp` path |
-| tpu_v5p | decoder, vit, mamba3 | **FULLY-BUILT-AND-TRACE-VERIFIED** | `_pallas_fused.py::MODEL_STAGES` → real `_pallas_models.py` fwd/bwd; trace+lower OK |
+| tpu_v6e | decoder, vit, mamba3 | **FULLY-BUILT-AND-TRACE-VERIFIED** | `_pallas_fused.py::MODEL_STAGES` → real `_pallas_models.py` fwd/bwd; trace+lower OK |
 
 DISPATCH+COMPILE COMPONENT (composes opt × model → fused L3/L1):
 
@@ -56,7 +56,7 @@ DISPATCH+COMPILE COMPONENT (composes opt × model → fused L3/L1):
 |------|--------|----------|
 | sm_90 | **FULLY-BUILT-AND-COMPILE-VERIFIED** | `fused_megakernel.cuh` + `fused_dispatch_table.inc` + `dispatch.cpp::dispatch_sm90_cell`; all 33 cells + dispatch.cpp COMPILE_OK; per-optimizer extra-state plumbed ([m|v|extra]) |
 | gfx942 | **FULLY-BUILT; device gate-verified, host 🟡** | `fused_megakernel.hip.hpp`; 33 cells AMDGCN_OK; HOST hipLaunchKernelGGL launchers + `fused_dispatch_table.inc` + `dispatch.cpp` `#if WITH_HIP` `dispatch_gfx942_cell` route NOW WIRED (faithful sm_90 mirror; compiles only under hipcc → 🟡). WITH_CUDA build COMPILE_OK with the HIP branch excluded |
-| tpu_v5p | **FULLY-BUILT-AND-TRACE-VERIFIED** | each cell binds `step`=partial(fused_step,...) + `verify()`; `megakernel_engine.dispatch_fused_megakernel` is the unified cross-arch entry (tpu→_pallas_fused, gpu→C++ fused_step). 66/66 trace+lower |
+| tpu_v6e | **FULLY-BUILT-AND-TRACE-VERIFIED** | each cell binds `step`=partial(fused_step,...) + `verify()`; `megakernel_engine.dispatch_fused_megakernel` is the unified cross-arch entry (tpu→_pallas_fused, gpu→C++ fused_step). 66/66 trace+lower |
 
 Summary: **44 of 44 components built**; **42 fully gate/trace-verified here**
 (33 opt + 9 model, each at its arch gate: nvcc -c / clang amdgcn / jax lower) +
@@ -70,7 +70,7 @@ unified Python dispatcher, import+trace-verified). Nothing is left as a stub.
 |-----------|-------|--------|
 | sm_90 (3 model × 11 opt) | 33 | **REAL-COMPOSITION-COMPILED** — all 33 individually `nvcc -c sm_90a +CUTLASS` → COMPILE_OK (12 in the cover + 22 by the verify agent + demo's 3 = 33). grep=0 |
 | gfx942 (3 × 11) | 33 | **REAL-COMPOSITION-GATE-VERIFIED** — real `fused_megakernel<ModelId,OptId,FuseTier>` compositions; clang amdgcn gate OK (cover + cells as device-C++); grep=0. Host hipcc 🟡 |
-| tpu_v5p (3 × 11) | 33 | **REAL-COMPOSITION-TRACE-VERIFIED** — bind to `_pallas_fused.fused_step`; 66/66 trace+lower (L1+L3). No stub marker (grep=0) |
+| tpu_v6e (3 × 11) | 33 | **REAL-COMPOSITION-TRACE-VERIFIED** — bind to `_pallas_fused.fused_step`; 66/66 trace+lower (L1+L3). No stub marker (grep=0) |
 
 **0 of 99 pipelines remain STILL-WRAPPER.** Solver tiers (real): 53 L3, 46 L1,
 0 infeasible.
@@ -105,7 +105,7 @@ unified Python dispatcher, import+trace-verified). Nothing is left as a stub.
 
 1. ✅ gfx942 real compositions — `opt_components.hip.hpp` / `model_stages.hip.hpp`
    / `fused_megakernel.hip.hpp`; all 33 gfx942 wrappers replaced; AMDGCN_OK; demo deleted.
-2. ✅ tpu_v5p real compositions — `_pallas_fused.py`; all 33 stubs replaced; 66/66 trace+lower.
+2. ✅ tpu_v6e real compositions — `_pallas_fused.py`; all 33 stubs replaced; 66/66 trace+lower.
 3. ✅ SG2 AMD bilevel adjoint — `supergrok2_bilevel_adjoint_gfx942.hip.hpp` device cut, AMDGCN_OK.
 4. ✅ All 33 sm_90 cells individually `nvcc -c` COMPILE_OK.
 5. ✅ gfx942 MoE compaction off ATen — `moe_compaction_gfx942.hip.hpp` (filter/scatter/histogram), AMDGCN_OK.
@@ -115,7 +115,7 @@ unified Python dispatcher, import+trace-verified). Nothing is left as a stub.
 
 ## What still remains (genuinely external — cannot be done without hardware)
 
-1. **On-silicon runtime + numeric parity** on H100 / MI300X / TPU v5p — every
+1. **On-silicon runtime + numeric parity** on H100 / MI300X / TPU v6e — every
    compile/gate/trace check here is CPU-host (`nvcc -c`, clang amdgcn, jax
    lower); nothing was *executed* on an accelerator. All such items are 🟡 in
    HARDWARE_VALIDATION.md. This is the only remaining class and it requires the

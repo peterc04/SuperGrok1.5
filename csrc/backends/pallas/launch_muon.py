@@ -35,11 +35,21 @@ def init_muon_state(param: jnp.ndarray) -> MuonState:
 
 
 def _newton_schulz_ortho(X: jnp.ndarray, ns_steps: int) -> jnp.ndarray:
-    """Newton-Schulz orthogonalization.
+    """Newton-Schulz orthogonalization (lax.fori_loop / scan-friendly form).
 
     Muon paper coefficients: a=3.4445, b=-4.7750, c=2.0315.
-    Iterates: X <- a*X + b*(X @ X.T) @ X + c*X @ (X.T @ X)
+    Iterates: X <- a*X + b*X(XᵀX) + c*X(XᵀX)²  (the quintic NS polynomial,
+    identical to ``newton_schulz_iterate`` below). The previous third term
+    ``c*X(XᵀX)`` was only cubic — a real divergence from the canonical Muon
+    orthogonalization.
     Converges to the nearest orthogonal matrix.
+
+    NOTE: this is the scan-form twin of ``newton_schulz_iterate`` below (the
+    unrolled form used by the fused-TU launcher). Both use the same Muon
+    coefficients and produce mathematically equivalent results; the two forms
+    coexist because lax.fori_loop (scan) is more XLA-efficient for the
+    standalone reference path while the unrolled loop better matches the
+    per-tensor fused-TU contract.
     """
     a, b, c = 3.4445, -4.7750, 2.0315
 
@@ -52,8 +62,9 @@ def _newton_schulz_ortho(X: jnp.ndarray, ns_steps: int) -> jnp.ndarray:
     )
 
     def ns_body(_, X):
-        A = _mm(X, X.T)
-        return X * a + _mm(A, X) * b + _mm(X, _mm(X.T, X)) * c
+        AX = _mm(X.T, X)          # XᵀX
+        AAX = _mm(AX, AX)         # (XᵀX)²
+        return X * a + _mm(X, AX) * b + _mm(X, AAX) * c
 
     return lax.fori_loop(0, ns_steps, ns_body, X)
 
@@ -71,7 +82,7 @@ def muon_step(
     if param.ndim >= 2:
         X = new_m
         norm_val = jnp.linalg.norm(X)
-        X_normed = jnp.where(norm_val > 0, X / norm_val, X)
+        X_normed = X / jnp.maximum(norm_val, 1e-8)
         X_ortho = _newton_schulz_ortho(X_normed, config.ns_steps)
         update = X_ortho * norm_val
     else:
@@ -84,7 +95,12 @@ def muon_step(
 def newton_schulz_iterate(
     X: jnp.ndarray, ns_steps: int, a: float, b: float, c: float
 ) -> jnp.ndarray:
-    """Unrolled Newton-Schulz variant used by the fused-TU launcher."""
+    """Unrolled Newton-Schulz variant used by the fused-TU launcher.
+
+    This is the unrolled-form twin of ``_newton_schulz_ortho`` above (the
+    scan-friendly form). Both use the same Muon coefficients (a=3.4445,
+    b=-4.7750, c=2.0315) and produce mathematically equivalent results.
+    """
     _mm = functools.partial(
         jnp.matmul,
         precision=lax.Precision.HIGHEST,
@@ -110,7 +126,11 @@ def launch_muon_step(
     ns_c: float = 2.0315,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Per-tensor Muon step (fused-TU contract)."""
-    new_buf = momentum * buf + (1.0 - momentum) * grad
+    # Canonical Muon momentum is plain SGD-momentum `buf = momentum*buf + grad`
+    # (csrc/algorithms/muon.h, bindings.cpp muon_fused_step). The spurious
+    # (1-momentum) factor shrank the gradient ~10x and diverged from the
+    # source of truth.
+    new_buf = momentum * buf + grad
     if param.ndim >= 2:
         frob = jnp.linalg.norm(new_buf) + 1e-8
         X = new_buf / frob

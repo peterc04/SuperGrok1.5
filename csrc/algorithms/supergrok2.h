@@ -111,17 +111,20 @@ constexpr int SG2_HCA_COMPRESS    = 128;  // heavily-compressed pooling stride m
 //  sort_key      = |grad|
 // =========================================================================
 
-template <typename scalar_t>
+// wt_t: projection weight type (float for the FP32 path, __nv_bfloat16 / at::BFloat16
+// for the bf16 bandwidth-saving path). Weights are static_cast<float>() on load so
+// all arithmetic stays in FP32.
+template <typename scalar_t, typename wt_t = float>
 __device__ __forceinline__ void sg2_input_proj_sort(
     const scalar_t* __restrict__ grad,
     const scalar_t* __restrict__ sharpness,
     float* __restrict__ x_out,
     float* __restrict__ sort_keys,
     int* __restrict__ sort_indices,
-    const float* __restrict__ proj_W,
-    const float* __restrict__ proj_b,
-    const int idx,
-    const int N,
+    const wt_t* __restrict__ proj_W,
+    const wt_t* __restrict__ proj_b,
+    const int64_t idx,
+    const int64_t N,
     const int d_model
 ) {
     if (idx >= N) return;
@@ -133,7 +136,10 @@ __device__ __forceinline__ void sg2_input_proj_sort(
 
     #pragma unroll 4
     for (int d = 0; d < d_model; d++) {
-        x_out[idx * d_model + d] = proj_W[d * 2] * g + proj_W[d * 2 + 1] * s + proj_b[d];
+        x_out[idx * d_model + d] =
+            static_cast<float>(proj_W[d * 2])     * g
+          + static_cast<float>(proj_W[d * 2 + 1]) * s
+          + static_cast<float>(proj_b[d]);
     }
     sort_keys[idx]    = fabsf(g);
     sort_indices[idx] = idx;
@@ -163,7 +169,7 @@ __device__ __forceinline__ float sg2_csa_compress_kv(
     const float*  __restrict__ compress_w,   // [csa_window] learned pooling logits
     const int j,                             // compressed-entry index (0..Nc-1)
     const int d,                             // feature channel (0..d_model-1)
-    const int N,
+    const int64_t N,
     const int d_model,
     const int csa_compress,                  // stride m
     const int csa_window                     // pool width W
@@ -317,7 +323,7 @@ __device__ __forceinline__ float sg2_hca_compress_kv(
     const float*  __restrict__ hca_w,    // [hca_compress] weights, or nullptr (mean)
     const int j,                         // compressed-entry index (0..Nh-1)
     const int d,                         // feature channel (0..d_model-1)
-    const int N,
+    const int64_t N,
     const int d_model,
     const int hca_compress               // pooling stride/window M
 ) {
@@ -379,7 +385,7 @@ __device__ __forceinline__ void sg2_apply_step(
     const float wd,
     const float bc1,
     const float bc2,
-    const int idx
+    const int64_t idx
 ) {
     const float g = static_cast<float>(grad[idx]);
     const float p = static_cast<float>(param[idx]);
@@ -398,7 +404,7 @@ __device__ __forceinline__ void sg2_apply_step(
     // bc1, bc2 un-inverted (= 1 - beta^t): divide for bias correction.
     // Matches the convention used by adamw.h / grokadamw.h / etc. and the
     // Python `_single_param_step` in grokking_optimizers/optimizers/supergrok2.py.
-    const float update = (m / bc1) / (sqrtf(v / bc2) + eps);
+    const float update = (m / sg_safe_bc(bc1)) / (sqrtf(v / sg_safe_bc(bc2)) + eps);
     param[idx] = static_cast<ParamT>(p - lr * (update + wd * p));
 }
 
@@ -503,7 +509,7 @@ __device__ __forceinline__ void moe_adam_step(
     const float wd,
     const float bc1,
     const float bc2,
-    const int idx
+    const int64_t idx
 ) {
     adamw_step(param, exp_avg, exp_avg_sq, grad,
                lr, beta1, beta2, eps, wd, bc1, bc2, idx);
