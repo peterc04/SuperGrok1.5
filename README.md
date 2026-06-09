@@ -7,17 +7,24 @@ families — **NVIDIA sm_90 (Hopper)**, **AMD gfx942 (CDNA3 / MI300X)**, and
 (no parallel math trees, no dead duplicates; enforced by a self-test drift
 guard).
 
-> **Status honesty.** The **NVIDIA sm_90 (H100)** path is now **verified on real
+> **Status honesty.** The **NVIDIA sm_90 (H100)** path is **verified on real
 > silicon**: the `_ops` extension builds, links, imports, and runs on an H100
-> 80GB, and the grokking race trains and **groks** there — 6/11 optimizers reach
-> 100% test accuracy on `a÷b mod 97` (Grokfast fastest at 2,600 steps). See
+> 80GB, the fused kernels are **numerically parity-exact** (11/0 on
+> `tests/hw/parity_gate_h100.py`) and **maximal** (sm_90a WGMMA/TMA, 0 live
+> spills), and the grokking race trains and **groks** there — **8/11 optimizers**
+> reach the grok threshold on `a÷b mod 97`, with **Muon (400 steps) and Prodigy
+> (1,000 steps) — both flat-at-random before this audit's on-silicon fixes — now
+> the two fastest** (Muon is the fastest of the field). See
 > [`results/h100_grokking_race/`](results/h100_grokking_race/). Running on-device
-> surfaced (and this branch fixes) several silent kernel bugs the CPU `nvcc -c`
-> gate could not catch — e.g. inverted weight-decay in the fused Muon update.
-> Remaining 🟡: the **gfx942 (MI300X)** and **TPU v6e** runtime paths, full
-> numeric-parity of every fused cell, and 4 optimizers whose on-device kernels
-> are still under repair (Prodigy, SuperGrok1.1/1.5/2 — diagnosed in the race
-> results README). Per-arch detail in
+> surfaced (and this branch fixes) a cluster of silent kernel bugs the CPU
+> `nvcc -c` gate could not catch — inverted weight-decay in fused Muon, a
+> degree-bug + unbounded d-ratchet in Prodigy, a pybind-copied frozen
+> step-counter and meta-net OOB in SuperGrok, a silently-throwing SAM step, and
+> more. Remaining 🟡: the **gfx942 (MI300X)** and **TPU v6e** runtime paths, and
+> the **3 SuperGrok variants** — whose sm_90 kernels are now parity-exact but
+> whose *trained meta-net* destabilizes training (a research-owned dynamics issue,
+> **not** a kernel bug: freezing the meta-net reduces SuperGrok1.1 to AdamW and it
+> groks at step 2,700 — see the race results README). Per-arch detail in
 > [`HARDWARE_VALIDATION.md`](HARDWARE_VALIDATION.md). Historical phase/build
 > reports moved to [`archived_reports/`](archived_reports/).
 
@@ -288,15 +295,15 @@ item is a concrete row in the 99-cell checklist in `HARDWARE_VALIDATION.md`.
 
 ## 8. The grokking race
 
-`grokking_race_v2.py` compares all 12 optimizers (AdamW baseline + 11
+`grokking_race_v2.py` compares all 11 optimizers (AdamW baseline + 10
 grokking-aware variants) head-to-head on algorithmic learning tasks under
 controlled conditions — the project's namesake driver.
 
 ## 9. Deeper docs
 - [`HARDWARE_VALIDATION.md`](HARDWARE_VALIDATION.md) — the 99-cell on-silicon checklist + per-stage bring-up.
-- [`BUILD_REPORT.md`](BUILD_REPORT.md) — per-stage scope, gates, the 44-component table.
-- [`RESTRUCTURE_PLAN.md`](RESTRUCTURE_PLAN.md) — Phase-6 inventory of the (already clean-layered) architecture. NOTE: the codebase was already clean layering, NOT parallel math trees; Phase 7 then closed the residual real gaps — deleted the dead `kernels/tpu/` duplicate, de-inlined 3 optimizers' Adam math to `algorithms/`, hardened the drift guard to catch re-inlining, made the C++ dispatch table generator-driven, and vectorized the 11 gfx942 apply-steps.
-- `PHASE{2,3,4,5,7}_REPORT.md` — the incremental build history (real compositions, register pass, AMD device live-wiring + vectorization, enforced drift guard, dead-tree removal).
+- [`BUILD_REPORT.md`](archived_reports/BUILD_REPORT.md) — per-stage scope, gates, the 44-component table.
+- [`RESTRUCTURE_PLAN.md`](archived_reports/RESTRUCTURE_PLAN.md) — Phase-6 inventory of the (already clean-layered) architecture. NOTE: the codebase was already clean layering, NOT parallel math trees; Phase 7 then closed the residual real gaps — deleted the dead `kernels/tpu/` duplicate, de-inlined 3 optimizers' Adam math to `algorithms/`, hardened the drift guard to catch re-inlining, made the C++ dispatch table generator-driven, and vectorized the 11 gfx942 apply-steps.
+- [`archived_reports/PHASE{3,4,5,6,7}_REPORT.md`](archived_reports/) — the incremental build history (real compositions, register pass, AMD device live-wiring + vectorization, enforced drift guard, dead-tree removal).
 - `csrc/algorithms/SOURCE_OF_TRUTH.md` — the optimizer-math canonical contract.
 
 > **Implementation-maximal.** Across sm_90 / gfx942 / tpu the implementation is
