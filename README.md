@@ -10,11 +10,14 @@ guard).
 > **Status honesty.** The **NVIDIA sm_90 (H100)** path is **verified on real
 > silicon**: the `_ops` extension builds, links, imports, and runs on an H100
 > 80GB, the fused kernels are **numerically parity-exact** (11/0 on
-> `tests/hw/parity_gate_h100.py`) and **maximal** (sm_90a WGMMA/TMA, 0 live
-> spills), and the grokking race trains and **groks** there — **8/11 optimizers**
-> reach the grok threshold on `a÷b mod 97`, with **Muon (400 steps) and Prodigy
-> (1,000 steps) — both flat-at-random before this audit's on-silicon fixes — now
-> the two fastest** (Muon is the fastest of the field). See
+> `tests/hw/parity_gate_h100.py`) and **maximal** (11/0 on `profile_maximal.py`:
+> sm_90a WGMMA/TMA, no wgmma-serialization, 0 live spills), and the grokking race
+> trains and **groks** there — **8/11 optimizers** reach the grok threshold on
+> `a÷b mod 97`. **Muon (400 steps) and Prodigy (1,000 steps) were both
+> flat-at-random for all 15k steps before this audit's on-silicon fixes**; Muon is
+> now the fastest of the field and holds its solution. 7 of the 8 grok cleanly and
+> sustain ~100%; Prodigy hits the threshold at step 1,000 but does **not yet
+> sustain** it (its adaptive `d` later destabilizes — final 0.007). See
 > [`results/h100_grokking_race/`](results/h100_grokking_race/). Running on-device
 > surfaced (and this branch fixes) a cluster of silent kernel bugs the CPU
 > `nvcc -c` gate could not catch — inverted weight-decay in fused Muon, a
@@ -23,8 +26,9 @@ guard).
 > more. Remaining 🟡: the **gfx942 (MI300X)** and **TPU v6e** runtime paths, and
 > the **3 SuperGrok variants** — whose sm_90 kernels are now parity-exact but
 > whose *trained meta-net* destabilizes training (a research-owned dynamics issue,
-> **not** a kernel bug: freezing the meta-net reduces SuperGrok1.1 to AdamW and it
-> groks at step 2,700 — see the race results README). Per-arch detail in
+> **not** a kernel bug: freezing the meta-net (rescale=0) reduces SuperGrok1.1 to
+> a layerwise-β1 AdamW and it groks at step 2,700 — see the race results README).
+> Per-arch detail in
 > [`HARDWARE_VALIDATION.md`](HARDWARE_VALIDATION.md). Historical phase/build
 > reports moved to [`archived_reports/`](archived_reports/).
 

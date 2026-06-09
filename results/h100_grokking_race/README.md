@@ -85,9 +85,10 @@ H100 (`tests/hw/parity_gate_h100.py` → 11 pass / 0 fail):
   (cf. the Prodigy d-ratchet), owned by the algorithm. SuperGrok1.5 gets within
   one step of grokking (peak test-acc **0.918**) before the meta-net destroys it.
   **Decisive control:** freezing the meta-net (`rescale=0`) reduces SuperGrok1.1
-  *exactly to AdamW* and it **groks at step 2,700** — proving the base optimizer
-  and the fused kernel are sound and isolating the collapse to the trained
-  meta-net. No hyperparameter tuning was applied to force a grok.
+  to a plain layerwise-β1 AdamW (the meta correction is the only thing removed)
+  and it **groks at step 2,700** — proving the base optimizer and the fused
+  kernel are sound and isolating the collapse to the trained meta-net. No
+  hyperparameter tuning was applied to force a grok.
 - **SuperGrok2 — runtime fixed, meta routing still flat.** The earlier per-head
   PEER reshape crash and an `input_proj` bf16/fp32 dtype mismatch are fixed (the
   step now runs cleanly and the matrix-GRU reconstruction + ascending-|grad| sort
