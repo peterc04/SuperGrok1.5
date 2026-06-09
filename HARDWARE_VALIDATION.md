@@ -84,6 +84,13 @@ numeric-oracle for every cell is `tests.hw.test_reference_parity --optimizer
 <opt> --model <model> --arch <arch> --steps 20`. Status 🟡 = compile/clang/
 trace-verified in-repo; runtime+numerics pending hardware.
 
+> **sm_90 update (2026-06-09):** the per-op fused **optimizer** kernels (the L1
+> path these cells reuse) are now silicon-validated on a real H100 — numeric
+> parity 11/0, maximality 11/0, and an 8/11 grokking race (see the on-silicon
+> audit in §2). The rows below stay 🟡 because they track the **L3 fused
+> model×optimizer megacell**, which the race does not exercise (eager model +
+> fused optimizer); the L3 megacells remain compile-verified only.
+
 | model | optimizer | sm_90 | gfx942 | tpu_v6e | numeric-oracle reference |
 |-------|-----------|:-----:|:------:|:-------:|--------------------------|
 | transformer | adamw | L3 🟡 | L1 🟡 | L3 🟡 | m/v EMA + bias-corrected decoupled-WD apply |
@@ -124,11 +131,59 @@ Rows: 33 (model×optimizer) × 3 archs = 99 cells. Tier legend: L3=fwd+bwd+opt f
 
 ## 2. Per-stage hardware checks (appended as stages complete)
 
+### On-silicon H100 audit — 2026-06-09 (sm_90a · real H100 80GB HBM3 · CUDA 12.4 · torch 2.4.1)
+
+A full audit of the sm_90 path on a real H100. **Validated on silicon:**
+
+- **Build / link / import / run.** `FORCE_CUDA=1 WITH_CUTLASS=1 pip install -e .`
+  builds, device-links, loads `_ops`, and runs on the H100. (Earlier on-silicon
+  fixes: de-LTO install link, ccache compiler masquerade, n_tasks element-vs-task
+  count, integrated-extension symbol resolution.)
+- **Per-op fused sm_90 optimizer kernels — numeric parity: 11 pass / 0 fail.**
+  `python tests/hw/parity_gate_h100.py` — single-step fused-vs-fp64-reference for
+  adamw/lion/muon; Prodigy d-adaptation (no 1e6 catapult, adapts, converges, vs
+  `prodigyopt` ratio 1.09); SuperGrok11/15 meta-net μ (H=32 OOB fix); SuperGrok11
+  full cosine-gated param update; SuperGrok2 per-head PEER routing runs.
+- **Per-op fused sm_90 optimizer kernels — runtime: 8/11 grok.** The 15,000-step
+  decoder grokking race ran all 11 optimizers through `_ops` →
+  [`results/h100_grokking_race/`](results/h100_grokking_race/). Muon (400 steps)
+  and Prodigy (1,000 steps) — both flat-at-random before this audit — are now the
+  two fastest. The 3 SuperGrok DNFs are research-owned meta-net dynamics, **not**
+  kernel bugs (frozen-meta-net control reduces SuperGrok1.1 to AdamW → groks at
+  step 2,700).
+- **sm_90 maximality — 11 pass / 0 fail** (`python grokking_optimizers/profile_maximal.py`).
+  TIER A (model-stage GEMMs decoder/vit/mamba + SG2 CUTLASS NS): real Hopper
+  WGMMA + TMA, **no wgmma-serialization (C7509=0), no live register spills** (the
+  lone 8B spill is a runtime-dead CUTLASS TF32-RS GEMM, allowlisted fail-closed,
+  168/255 regs). TIER B (real `ptxas` resource health): every probed cell &
+  launcher 0B spills (e.g. `mamba3/supergrok2` 40r, `transformer_decoder/muon`
+  30r, `vit/prodigy` 32r). TIER D: the optimizer math provably descends. VERDICT:
+  **instruction-maximal + correct.** (TIER C gfx942 / TIER E tpu_v6e correctly
+  skip-silicon on an H100.)
+- **Single source of truth — green.** `python scripts/check_math_single_source.py`
+  — no canonical-math drift vs the manifest; one definition per optimizer in
+  `csrc/algorithms/<opt>.h`.
+
+**Boundary (still 🟡 — not validated this session):**
+
+- The **L3 fused model×optimizer megacells** (`csrc/fused/sm_90/mega_*.cu`, the
+  99-cell matrix in §1) are **compile-verified only**. The race uses the eager
+  PyTorch model + fused-*optimizer* (L1) path — `dispatch.has_fused` is empty by
+  design — so the 33 sm_90 L3 megacells are not yet runtime/numeric-validated;
+  those matrix rows stay 🟡.
+- The autotuner's standalone `e2e_smoke` build path needs spec-aware fused-cell
+  source resolution in `compile._resolve_sources` (the generated `mega_*.cu` TUs
+  aren't globbed → undefined `mega_vit_neuralgrok`). The production `_ops` race
+  path is unaffected; deferred.
+- **gfx942 (MI300X)** and **TPU v6e** runtime paths — out of scope this session
+  (H100-only); kernels present and compile/ISA-verified, on-silicon run pending.
+
 ### Stage 0 — compile correctness
-- [ ] `FORCE_CUDA=1 WITH_CUTLASS=1 pip install -e .` links a loadable `_C`
+- [x] `FORCE_CUDA=1 WITH_CUTLASS=1 pip install -e .` links a loadable `_ops`
       extension on an H100 box (the CPU-host `nvcc -c` gate cannot catch device
-      link / ptxas-lowering errors).
-- [ ] `cuobjdump -sass build/.../launch_adamw.o | head` shows real SASS.
+      link / ptxas-lowering errors). **Done — H100, 2026-06-09.**
+- [x] `cuobjdump -sass` shows real Hopper SASS (WGMMA/UTMALDG) — verified by
+      `profile_maximal.py` TIER A/B disassembly. **Done.**
 
 <!-- Stage 1+ checks are appended below by each stage. -->
 
