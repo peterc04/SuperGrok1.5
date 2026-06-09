@@ -355,7 +355,13 @@ void fused_step(const std::string& model, const std::string& optimizer,
  sc.g_next.data_ptr<int>(),
  reinterpret_cast<unsigned*>(sc.g_arrived.data_ptr<int>()),
  reinterpret_cast<unsigned*>(sc.g_generation.data_ptr<int>()),
- static_cast<int>(n), 0u};
+ // n_tasks = number of work tasks = #entries in sizes/offsets (one slab per
+ // parameter tensor; a single flat tensor here → 1). It is NOT the element
+ // count: the megakernel loops `t < n_tasks` reading sizes[t]/offsets[t], so
+ // n_tasks=n would index both 1-element arrays ~n entries out of bounds and
+ // feed garbage offsets into params[] (a multi-GB OOB read). n_ctas (0 here)
+ // is overwritten by the launcher with one persistent CTA per SM.
+ static_cast<int>(sc.sizes.numel()), 0u};
 
  // Use the current CUDA stream so the megakernel orders against the rest of
  // the model's work and is capturable in a CUDA graph (the legacy default
