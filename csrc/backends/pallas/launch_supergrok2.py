@@ -876,8 +876,8 @@ def bilevel_step(
             )
 
             vg_flat = vg.reshape(-1).astype(jnp.float32)
-            vg_norm = jnp.linalg.norm(vg_flat)
-            vg_unit = jnp.where(vg_norm > 1e-12, vg_flat / vg_norm, vg_flat)
+            vg_norm = jnp.maximum(jnp.linalg.norm(vg_flat), 1e-12)
+            vg_unit = vg_flat / vg_norm
 
             total_loss = total_loss - jnp.sum(smart_grad.reshape(-1) * vg_unit)
         return total_loss

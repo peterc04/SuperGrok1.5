@@ -62,7 +62,7 @@ __device__ __forceinline__ void neuralgrok_apply_step(
     const float wd,
     const float bc1,
     const float bc2,
-    const int idx
+    const int64_t idx
 ) {
     const float g = static_cast<float>(grad[idx]);
     const float p = static_cast<float>(param[idx]);
@@ -75,7 +75,7 @@ __device__ __forceinline__ void neuralgrok_apply_step(
     exp_avg_sq[idx] = v;
 
     // bc1, bc2 un-inverted (= 1 - beta^t): divide for bias correction.
-    const float update = (m / bc1) / (sqrtf(v / bc2) + eps);
+    const float update = (m / sg_safe_bc(bc1)) / (sqrtf(v / sg_safe_bc(bc2)) + eps);
     param[idx] = static_cast<ParamT>(p - lr * (update + wd * p));
 }
 
@@ -104,14 +104,14 @@ __device__ __forceinline__ void neuralgrok_adam_tail(
     const float wd,
     const float bc1,
     const float bc2,
-    const int idx
+    const int64_t idx
 ) {
     const float p = static_cast<float>(param[idx]);
     const float m = beta1 * exp_avg[idx]    + (1.0f - beta1) * g_eff;
     const float v = beta2 * exp_avg_sq[idx] + (1.0f - beta2) * g_eff * g_eff;
     exp_avg[idx]    = m;
     exp_avg_sq[idx] = v;
-    const float update = (m / bc1) / (sqrtf(v / bc2) + eps);
+    const float update = (m / sg_safe_bc(bc1)) / (sqrtf(v / sg_safe_bc(bc2)) + eps);
     param[idx] = static_cast<ParamT>(p - lr * (update + wd * p));
 }
 

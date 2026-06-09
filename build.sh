@@ -145,14 +145,19 @@ fi
 #
 # Output layout (matches what Python sees after `pip install -e .`):
 #   dist/
-#   ├── grokking_optimizers/   Python sources + compiled _ops.<...>.so
-#   ├── supergrok2_jax_tpu/    JAX/TPU Python sources
-#   ├── csrc/kernels/tpu/      Pallas Python kernels (re-exports)
-#   ├── csrc/common/tuned_configs.h    post-autotune values
-#   ├── pyproject.toml         build manifest (version pin)
+#   ├── grokking_optimizers/        Python sources + compiled _ops.<...>.so
+#   ├── csrc/backends/pallas/       Pallas/JAX TPU kernels (Python)
+#   ├── csrc/common/tuned_configs.h post-autotune values (if AUTOTUNE ran)
+#   ├── LICENSE
+#   ├── pyproject.toml              build manifest (version pin)
 #   ├── README.md
-#   ├── REFRESH.md
-#   └── INSTALL.md             auto-generated install guide
+#   └── INSTALL.md                  auto-generated install guide (if template)
+#
+# Stage-2 fix (Phase 8): earlier revisions staged `supergrok2_jax_tpu/` and
+# `csrc/kernels/tpu/` — neither path exists in this tree. The JAX/TPU Pallas
+# kernels actually live under `csrc/backends/pallas/`; tuned_configs.h is
+# only present after `--autotune`. Staging is now guarded on existence so a
+# plain `--package` no longer creates empty directories or skips real files.
 #
 # Compiled extensions: torch's BuildExtension produces a single multi-arch
 # fatbin .so (one file with cubin/PTX for every arch listed in setup.py's
@@ -164,18 +169,30 @@ package_dist() {
   local dist_dir="dist"
   echo "build.sh: --package staging into ${dist_dir}/"
   rm -rf "${dist_dir}"
-  mkdir -p "${dist_dir}/grokking_optimizers" \
-           "${dist_dir}/supergrok2_jax_tpu" \
-           "${dist_dir}/csrc/kernels/tpu" \
-           "${dist_dir}/csrc/common"
+  mkdir -p "${dist_dir}/grokking_optimizers"
 
-  # Python sources (preserve subpackage layout).
+  # Python sources (preserve subpackage layout, including kernel headers).
   cp -r grokking_optimizers/*.py "${dist_dir}/grokking_optimizers/"
-  if [[ -d supergrok2_jax_tpu ]]; then
-    cp -r supergrok2_jax_tpu/*.py "${dist_dir}/supergrok2_jax_tpu/" 2>/dev/null || true
+  # Per-arch in-package kernel headers (*.cuh / *.hip.hpp) and any package
+  # data live under grokking_optimizers/kernels/ — copy the whole subpackage.
+  if [[ -d grokking_optimizers/kernels ]]; then
+    cp -r grokking_optimizers/kernels "${dist_dir}/grokking_optimizers/"
   fi
-  if [[ -d csrc/kernels/tpu ]]; then
-    cp -r csrc/kernels/tpu/* "${dist_dir}/csrc/kernels/tpu/" 2>/dev/null || true
+  if [[ -d grokking_optimizers/optimizers ]]; then
+    cp -r grokking_optimizers/optimizers "${dist_dir}/grokking_optimizers/"
+  fi
+
+  # JAX/TPU Pallas kernels (Python). These live under csrc/backends/pallas/,
+  # not the long-gone csrc/kernels/tpu/ or supergrok2_jax_tpu/ paths.
+  if [[ -d csrc/backends/pallas ]]; then
+    mkdir -p "${dist_dir}/csrc/backends/pallas"
+    cp -r csrc/backends/pallas/* "${dist_dir}/csrc/backends/pallas/" 2>/dev/null || true
+  fi
+
+  # Math manifest consumed by the autotuner / kernel emitter.
+  if [[ -f scripts/optimizer_math_manifest.json ]]; then
+    mkdir -p "${dist_dir}/scripts"
+    cp scripts/optimizer_math_manifest.json "${dist_dir}/scripts/"
   fi
 
   # Compiled extension(s). pip install -e . places the .so directly under
@@ -193,15 +210,17 @@ package_dist() {
   done
   echo "build.sh: --package staged ${#ops_files[@]} _ops extension(s)"
 
-  # Post-autotune tuned_configs.h (if AUTOTUNE was run; otherwise the
-  # placeholder values get shipped, which is correct — the consumer can
-  # re-tune later).
+  # Post-autotune tuned_configs.h (only present after `--autotune`; on a
+  # plain build it does not exist and is simply skipped — the consumer can
+  # re-tune later). Guarded so we never mkdir an empty csrc/common/.
   if [[ -f csrc/common/tuned_configs.h ]]; then
+    mkdir -p "${dist_dir}/csrc/common"
     cp csrc/common/tuned_configs.h "${dist_dir}/csrc/common/"
   fi
 
-  # Top-level metadata.
-  for f in pyproject.toml README.md REFRESH.md; do
+  # Top-level metadata. (REFRESH.md does not exist in this tree; LICENSE is
+  # required by the package metadata, so it must ship.)
+  for f in pyproject.toml README.md LICENSE; do
     [[ -f "$f" ]] && cp "$f" "${dist_dir}/"
   done
 

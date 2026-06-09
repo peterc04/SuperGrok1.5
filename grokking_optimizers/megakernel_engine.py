@@ -105,7 +105,7 @@ def dispatch_fused_megakernel(model: str, optimizer: str, *, params=None,
 
     The single cross-arch entry that unifies the three real composition paths
     (Phase 3):
-      * tpu_v5p → csrc.backends.pallas._pallas_fused.fused_step (jax.jit fused
+      * tpu_v6e → csrc.backends.pallas._pallas_fused.fused_step (jax.jit fused
         program; the 33 tpu cells bind to it).
       * sm_90 / gfx942 → the C++ `fused_step` pybind (dispatch.cpp routes to the
         real composed `mega_<model>_<opt>` launcher; gfx942 host launch is 🟡).
@@ -113,13 +113,17 @@ def dispatch_fused_megakernel(model: str, optimizer: str, *, params=None,
     Returns the backend's result (TPU: (new_params, new_state)). Raises a clear
     error if the cell/binding is unavailable on this build (no silent no-op).
     """
-    from grokking_optimizers.dispatch import detect_arch
+    from grokking_optimizers.dispatch import detect_arch, normalize_arch
     arch = detect_arch()
-    tier = "L3" if solve(model, optimizer,
-                         arch if isinstance(arch, str) else
-                         ("sm_90" if arch == 90 else "gfx942")
-                         ).tier == FusionTier.L3_FWD_BWD_OPT else "L1"
-    if arch == "tpu_v5p":
+    # detect_arch() now reports the REAL arch (e.g. sm_80 / sm_90a / gfx942).
+    # The megakernel solver keys on the impl-family label ("sm_90"/"gfx942"/
+    # "tpu_v6e"), so normalise the real arch to its family for the solve() call.
+    impl = normalize_arch(arch)
+    solver_arch = (impl if isinstance(impl, str)
+                   else ("sm_90" if impl == 90 else "gfx942"))
+    tier = ("L3" if solve(model, optimizer, solver_arch).tier
+            == FusionTier.L3_FWD_BWD_OPT else "L1")
+    if arch == "tpu_v6e":
         from csrc.backends.pallas._pallas_fused import fused_step as tpu_fused
         return tpu_fused(model, optimizer, params=params, grads=grads,
                          opt_state=opt_state, inputs=inputs, lr=lr, tier=tier)

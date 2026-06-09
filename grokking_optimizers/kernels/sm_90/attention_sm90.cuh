@@ -134,7 +134,9 @@ smem_attention_fwd_kernel(
     const int tid = threadIdx.x;
     const int N = seq_len;
     const int D = kHeadDim;
-    const int base = bh * N * D;
+    // 64-bit base offset: bh = batch*n_heads can be large, so bh*N*D may exceed
+    // INT_MAX even though N (<=32) keeps the in-block N*N / N*D loops in int.
+    const int64_t base = static_cast<int64_t>(bh) * N * D;
 
     // Shared memory: scores[N][N] + row_max[N] + row_sum[N]
     extern __shared__ float smem[];
@@ -147,7 +149,10 @@ smem_attention_fwd_kernel(
         int i = idx / N;  // query row
         int j = idx % N;  // key column
         if constexpr (kCausal) {
-            if (j > i) { scores[idx] = -1e9f; continue; }
+            // Unified mask sentinel (-1e30f), matching the CUTLASS softmax path
+            // (fmha_softmax_kernel). After exp(score - row_max) this underflows
+            // to 0 in both FP32 and post-bf16-cast probs.
+            if (j > i) { scores[idx] = -1e30f; continue; }
         }
         float dot = 0.0f;
         for (int d = 0; d < D; d++) {
@@ -160,7 +165,7 @@ smem_attention_fwd_kernel(
 
     // Step 2: Row-wise softmax (online stable via max subtraction)
     for (int i = tid; i < N; i += blockDim.x) {
-        float m = -1e9f;
+        float m = -1e30f;   // unified sentinel (matches CUTLASS softmax path)
         for (int j = 0; j < N; j++) m = fmaxf(m, scores[i * N + j]);
         row_max[i] = m;
         float s = 0.0f;
@@ -173,7 +178,7 @@ smem_attention_fwd_kernel(
         for (int j = 0; j < N; j++) scores[i * N + j] *= inv_s;
         row_sum[i] = s;  // keep for lse
         if (softmax_lse != nullptr)
-            softmax_lse[bh * N + i] = m + logf(fmaxf(s, 1e-12f));
+            softmax_lse[static_cast<int64_t>(bh) * N + i] = m + logf(fmaxf(s, 1e-12f));
     }
     __syncthreads();
 
@@ -598,7 +603,8 @@ smem_attention_bwd_kernel(
     const int tid = threadIdx.x;
     const int N = seq_len;
     const int D = kHeadDim;
-    const int base = bh * N * D;
+    // 64-bit base offset (bh=batch*n_heads can exceed INT_MAX*N*D). See fwd.
+    const int64_t base = static_cast<int64_t>(bh) * N * D;
 
     extern __shared__ float smem[];
     float* scores = smem;               // N * N  (attention weights)
@@ -614,7 +620,7 @@ smem_attention_bwd_kernel(
         for (int d = 0; d < D; d++)
             dot += static_cast<float>(q[base + i * D + d])
                  * static_cast<float>(k[base + j * D + d]);
-        float lse = softmax_lse[bh * N + i];
+        float lse = softmax_lse[static_cast<int64_t>(bh) * N + i];
         scores[idx] = ptx_expf(dot * scale - lse);
     }
     __syncthreads();

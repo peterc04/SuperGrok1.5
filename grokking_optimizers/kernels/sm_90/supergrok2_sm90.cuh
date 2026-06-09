@@ -38,6 +38,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <stdexcept>
 #include <cmath>
+#include <climits>
 #include <algorithm>
 #include <string>
 
@@ -169,10 +170,10 @@ constexpr int CSA_MAX_RANK    = ::sg::algorithms::SG2_INDEXER_RANK_MAX;// 8
 //  Grid: one thread per (compressed-entry j, channel d). proj_W is row-major
 //  [d_model, d_model]; out[j, d] = Σ_k proj_W[d,k] * pooled[k].
 
-template <typename feat_t>
+template <typename feat_t, typename wt_t = float>
 __global__ void csa_compress_kv_kernel(
     const feat_t* __restrict__ x_seq,        // [N, d_model] sorted features
-    const float*  __restrict__ proj_W,       // [d_model, d_model] K or V proj
+    const wt_t*   __restrict__ proj_W,       // [d_model, d_model] K or V proj
     const float*  __restrict__ compress_logits, // [csa_window] pooling logits
     float* __restrict__ c_out,               // [Nc, d_model] compressed K/V
     int N, int d_model, int Nc,
@@ -189,16 +190,16 @@ __global__ void csa_compress_kv_kernel(
             // pooled[k] for this compressed entry
             const float pooled = alg::sg2_csa_compress_kv<feat_t>(
                 x_seq, compress_logits, j, k, N, d_model, csa_compress, csa_window);
-            acc += proj_W[d * d_model + k] * pooled;
+            acc += static_cast<float>(proj_W[d * d_model + k]) * pooled;
         }
         c_out[j * d_model + d] = acc;
     }
 }
 
-template <typename feat_t>
+template <typename feat_t, typename wt_t = float>
 __global__ void hca_compress_kv_kernel(
     const feat_t* __restrict__ x_seq,        // [N, d_model] sorted features
-    const float*  __restrict__ proj_W,       // [d_model, d_model] K or V proj
+    const wt_t*   __restrict__ proj_W,       // [d_model, d_model] K or V proj
     const float*  __restrict__ hca_w,        // [hca_compress] weights, or nullptr (mean)
     float* __restrict__ c_out,               // [Nh, d_model] compressed K/V
     int N, int d_model, int Nh,
@@ -214,7 +215,7 @@ __global__ void hca_compress_kv_kernel(
         for (int k = 0; k < d_model; k++) {
             const float pooled = alg::sg2_hca_compress_kv<feat_t>(
                 x_seq, hca_w, j, k, N, d_model, hca_compress);
-            acc += proj_W[d * d_model + k] * pooled;
+            acc += static_cast<float>(proj_W[d * d_model + k]) * pooled;
         }
         c_out[j * d_model + d] = acc;
     }
@@ -223,10 +224,10 @@ __global__ void hca_compress_kv_kernel(
 // ── (1b) Query projection ────────────────────────────────────────────────
 //  q[t, d] = Σ_k q_W[d,k] * x_seq[t,k].  Grid over (t, d).
 
-template <typename feat_t>
+template <typename feat_t, typename wt_t = float>
 __global__ void project_q_kernel(
     const feat_t* __restrict__ x_seq,        // [N, d_model]
-    const float*  __restrict__ q_W,          // [d_model, d_model]
+    const wt_t*   __restrict__ q_W,          // [d_model, d_model]
     float* __restrict__ q_out,               // [N, d_model]
     int N, int d_model
 ) {
@@ -238,7 +239,8 @@ __global__ void project_q_kernel(
         float acc = 0.0f;
         #pragma unroll 4
         for (int k = 0; k < d_model; k++)
-            acc += q_W[d * d_model + k] * static_cast<float>(x_seq[t * d_model + k]);
+            acc += static_cast<float>(q_W[d * d_model + k])
+                 * static_cast<float>(x_seq[t * d_model + k]);
         q_out[idx] = acc;
     }
 }
@@ -251,10 +253,10 @@ __global__ void project_q_kernel(
 //  the key side equivalently; we keep the rank-space dot product (spec §2:
 //  I = qI·kI / sqrt(rank)). kI[s,r] = Σ_m c_pooled[s,m] * idx_K[m,r].
 
-template <typename feat_t>
+template <typename feat_t, typename wt_t = float>
 __global__ void indexer_q_kernel(
     const feat_t* __restrict__ x_seq,        // [N, d_model]
-    const float*  __restrict__ idx_DQ,       // [d_model, rank]
+    const wt_t*   __restrict__ idx_DQ,       // [d_model, rank]
     float* __restrict__ qI_out,              // [N, rank]
     int N, int d_model, int rank
 ) {
@@ -266,15 +268,16 @@ __global__ void indexer_q_kernel(
         float acc = 0.0f;
         #pragma unroll 4
         for (int m = 0; m < d_model; m++)
-            acc += static_cast<float>(x_seq[t * d_model + m]) * idx_DQ[m * rank + r];
+            acc += static_cast<float>(x_seq[t * d_model + m])
+                 * static_cast<float>(idx_DQ[m * rank + r]);
         qI_out[idx] = acc;
     }
 }
 
-template <typename feat_t>
+template <typename feat_t, typename wt_t = float>
 __global__ void indexer_k_kernel(
     const feat_t* __restrict__ x_seq,        // [N, d_model] (compressed pool source)
-    const float*  __restrict__ idx_K,        // [d_model, rank]
+    const wt_t*   __restrict__ idx_K,        // [d_model, rank]
     const float*  __restrict__ compress_logits, // [csa_window]
     float* __restrict__ kI_out,              // [Nc, rank]
     int N, int d_model, int Nc, int rank,
@@ -290,7 +293,7 @@ __global__ void indexer_k_kernel(
         for (int m = 0; m < d_model; m++) {
             const float pooled = alg::sg2_csa_compress_kv<feat_t>(
                 x_seq, compress_logits, s, m, N, d_model, csa_compress, csa_window);
-            acc += pooled * idx_K[m * rank + r];
+            acc += pooled * static_cast<float>(idx_K[m * rank + r]);
         }
         kI_out[idx] = acc;
     }
@@ -675,6 +678,7 @@ parallel_scan_kernel(
                 smem[idx*6+3]=c.m11; smem[idx*6+4]=c.b0; smem[idx*6+5]=c.b1;
             }
             if (stride * 2 >= WARP_SIZE) __syncthreads();
+            else __syncwarp();
         }
 
         // Set last to identity (exclusive scan)
@@ -703,6 +707,7 @@ parallel_scan_kernel(
                 smem[idx*6+3]=c.m11; smem[idx*6+4]=c.b0; smem[idx*6+5]=c.b1;
             }
             if (stride * 2 >= WARP_SIZE) __syncthreads();
+            else __syncwarp();
         }
 
         // Phase 3: re-scan with prefix, accumulate output
@@ -930,14 +935,14 @@ namespace prim = ::sg::sm90::primitives;
 //  Forward kernel 1: input projection + sort
 // =========================================================================
 
-template <typename scalar_t>
+template <typename scalar_t, typename wt_t = float>
 __global__ void sg2_input_proj_sort_kernel(
     const scalar_t* grad, const scalar_t* sharpness,
     float* x_out, float* sort_keys, int* sort_indices,
-    const float* proj_W, const float* proj_b,
-    int N, int d_model
+    const wt_t* proj_W, const wt_t* proj_b,
+    int64_t N, int d_model
 ) {
-    const int idx = prim::grid_stride_index();
+    const int64_t idx = prim::grid_stride_index();
     ::sg::algorithms::sg2_input_proj_sort(
         grad, sharpness, x_out, sort_keys, sort_indices,
         proj_W, proj_b, idx, N, d_model);
@@ -962,10 +967,10 @@ __global__ void sg2_apply_kernel(
     const GradT* grad, const float* expert_out,
     float alpha, float gru_decay,
     float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int N
+    float bc1, float bc2, int64_t N
 ) {
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N; i += stride) {
         ::sg::algorithms::sg2_apply_step(
             param, exp_avg, exp_avg_sq, mu_state, grad, expert_out[i],
             alpha, gru_decay, lr, beta1, beta2, eps, wd, bc1, bc2, i);
@@ -981,24 +986,40 @@ void launch_supergrok2_input_proj_sort(
     torch::Tensor& x_out, torch::Tensor& sort_keys, torch::Tensor& sort_indices,
     const torch::Tensor& proj_W, const torch::Tensor& proj_b
 ) {
-    const int N = grad.numel();
+    const int64_t N = grad.numel();
     const int d_model = proj_W.size(0);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int block = SG_TUNED_BLOCK_SIZE;
-    const int grid = (N + block - 1) / block;
+    // One element per thread (no grid-stride loop in this kernel): grid must
+    // cover all N. Form the division in int64 then cast the (in-range) grid dim.
+    const int grid = static_cast<int>((N + block - 1) / block);
 
+    const bool wt_bf16 = (proj_W.scalar_type() == at::ScalarType::BFloat16);
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         grad.scalar_type(), "sg2_input_proj_sort", [&] {
-            sg2_input_proj_sort_kernel<scalar_t><<<grid, block, 0, stream>>>(
-                grad.data_ptr<scalar_t>(),
-                sharpness.data_ptr<scalar_t>(),
-                x_out.data_ptr<float>(),
-                sort_keys.data_ptr<float>(),
-                sort_indices.data_ptr<int>(),
-                proj_W.data_ptr<float>(),
-                proj_b.data_ptr<float>(),
-                N, d_model);
+            if (wt_bf16) {
+                sg2_input_proj_sort_kernel<scalar_t, at::BFloat16><<<grid, block, 0, stream>>>(
+                    grad.data_ptr<scalar_t>(),
+                    sharpness.data_ptr<scalar_t>(),
+                    x_out.data_ptr<float>(),
+                    sort_keys.data_ptr<float>(),
+                    sort_indices.data_ptr<int>(),
+                    proj_W.data_ptr<at::BFloat16>(),
+                    proj_b.data_ptr<at::BFloat16>(),
+                    N, d_model);
+            } else {
+                sg2_input_proj_sort_kernel<scalar_t, float><<<grid, block, 0, stream>>>(
+                    grad.data_ptr<scalar_t>(),
+                    sharpness.data_ptr<scalar_t>(),
+                    x_out.data_ptr<float>(),
+                    sort_keys.data_ptr<float>(),
+                    sort_indices.data_ptr<int>(),
+                    proj_W.data_ptr<float>(),
+                    proj_b.data_ptr<float>(),
+                    N, d_model);
+            }
+            SG_LAUNCH_CHECK(stream);
         });
 }
 
@@ -1027,6 +1048,7 @@ void launch_supergrok2_apply(
                 grad.data_ptr<scalar_t>(),
                 expert_out.data_ptr<float>(),
                 alpha, gru_decay, lr, beta1, beta2, eps, wd, bc1, bc2, N);
+            SG_LAUNCH_CHECK(stream);
         });
 }
 
@@ -1048,10 +1070,10 @@ __global__ void moe_adam_kernel(
     ParamT* param, float* exp_avg, float* exp_avg_sq,
     const GradT* grad,
     float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int N
+    float bc1, float bc2, int64_t N
 ) {
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N; i += stride) {
         moe_adam_step(param, exp_avg, exp_avg_sq, grad,
                       lr, beta1, beta2, eps, wd, bc1, bc2, i);
     }
@@ -1081,6 +1103,7 @@ void launch_moe_adam_step(
                 exp_avg_sq.data_ptr<float>(),
                 grad.data_ptr<scalar_t>(),
                 lr, beta1, beta2, eps, wd, bc1, bc2, N);
+            SG_LAUNCH_CHECK(stream);
         });
 }
 
@@ -1128,9 +1151,10 @@ __global__ void sg2_gru_blend_kernel(
 namespace detail {
 
 // Strided weighted-pool + project a sorted sequence into compressed K/V.
+// proj_W may be float or bf16 (bandwidth win via wt_t template dispatch).
 static torch::Tensor compress_csa(
     const torch::Tensor& x_sorted_f32,      // [N, d_model] (float, cuda)
-    const torch::Tensor& proj_W,            // [d_model, d_model] float
+    const torch::Tensor& proj_W,            // [d_model, d_model] float or bf16
     const torch::Tensor& compress_logits,   // [csa_window] float
     int N, int d_model, int csa_compress, int csa_window,
     cudaStream_t stream)
@@ -1141,15 +1165,24 @@ static torch::Tensor compress_csa(
     const int total = Nc * d_model;
     const int block = SG_TUNED_BLOCK_SIZE;
     const int grid = std::min<int>(65535, (total + block - 1) / block);
-    csa_hca::csa_compress_kv_kernel<float><<<grid, block, 0, stream>>>(
-        x_sorted_f32.data_ptr<float>(), proj_W.data_ptr<float>(),
-        compress_logits.data_ptr<float>(), out.data_ptr<float>(),
-        N, d_model, Nc, csa_compress, csa_window);
+    if (proj_W.scalar_type() == at::ScalarType::BFloat16) {
+        csa_hca::csa_compress_kv_kernel<float, at::BFloat16><<<grid, block, 0, stream>>>(
+            x_sorted_f32.data_ptr<float>(), proj_W.data_ptr<at::BFloat16>(),
+            compress_logits.data_ptr<float>(), out.data_ptr<float>(),
+            N, d_model, Nc, csa_compress, csa_window);
+    } else {
+        csa_hca::csa_compress_kv_kernel<float, float><<<grid, block, 0, stream>>>(
+            x_sorted_f32.data_ptr<float>(), proj_W.data_ptr<float>(),
+            compress_logits.data_ptr<float>(), out.data_ptr<float>(),
+            N, d_model, Nc, csa_compress, csa_window);
+    }
+    SG_LAUNCH_CHECK(stream);
     return out;
 }
 
 static torch::Tensor compress_hca(
-    const torch::Tensor& x_sorted_f32, const torch::Tensor& proj_W,
+    const torch::Tensor& x_sorted_f32,
+    const torch::Tensor& proj_W,            // float or bf16
     int N, int d_model, int hca_compress, cudaStream_t stream)
 {
     const int Nh = (N + hca_compress - 1) / hca_compress;
@@ -1158,15 +1191,24 @@ static torch::Tensor compress_hca(
     const int total = Nh * d_model;
     const int block = SG_TUNED_BLOCK_SIZE;
     const int grid = std::min<int>(65535, (total + block - 1) / block);
-    csa_hca::hca_compress_kv_kernel<float><<<grid, block, 0, stream>>>(
-        x_sorted_f32.data_ptr<float>(), proj_W.data_ptr<float>(),
-        /*hca_w=*/nullptr, out.data_ptr<float>(),
-        N, d_model, Nh, hca_compress);
+    if (proj_W.scalar_type() == at::ScalarType::BFloat16) {
+        csa_hca::hca_compress_kv_kernel<float, at::BFloat16><<<grid, block, 0, stream>>>(
+            x_sorted_f32.data_ptr<float>(), proj_W.data_ptr<at::BFloat16>(),
+            /*hca_w=*/nullptr, out.data_ptr<float>(),
+            N, d_model, Nh, hca_compress);
+    } else {
+        csa_hca::hca_compress_kv_kernel<float, float><<<grid, block, 0, stream>>>(
+            x_sorted_f32.data_ptr<float>(), proj_W.data_ptr<float>(),
+            /*hca_w=*/nullptr, out.data_ptr<float>(),
+            N, d_model, Nh, hca_compress);
+    }
+    SG_LAUNCH_CHECK(stream);
     return out;
 }
 
 static torch::Tensor project(
-    const torch::Tensor& x_f32, const torch::Tensor& W,  // x:[N,dm] W:[dm,dm]
+    const torch::Tensor& x_f32,             // [N, d_model] float
+    const torch::Tensor& W,                 // [d_model, d_model] float or bf16
     int N, int d_model, cudaStream_t stream)
 {
     auto out = torch::empty({N, d_model},
@@ -1174,9 +1216,16 @@ static torch::Tensor project(
     const int total = N * d_model;
     const int block = SG_TUNED_BLOCK_SIZE;
     const int grid = std::min<int>(65535, (total + block - 1) / block);
-    csa_hca::project_q_kernel<float><<<grid, block, 0, stream>>>(
-        x_f32.data_ptr<float>(), W.data_ptr<float>(), out.data_ptr<float>(),
-        N, d_model);
+    if (W.scalar_type() == at::ScalarType::BFloat16) {
+        csa_hca::project_q_kernel<float, at::BFloat16><<<grid, block, 0, stream>>>(
+            x_f32.data_ptr<float>(), W.data_ptr<at::BFloat16>(), out.data_ptr<float>(),
+            N, d_model);
+    } else {
+        csa_hca::project_q_kernel<float, float><<<grid, block, 0, stream>>>(
+            x_f32.data_ptr<float>(), W.data_ptr<float>(), out.data_ptr<float>(),
+            N, d_model);
+    }
+    SG_LAUNCH_CHECK(stream);
     return out;
 }
 
@@ -1186,7 +1235,7 @@ static torch::Tensor csa_context(
     const torch::Tensor& q_W, const torch::Tensor& k_W, const torch::Tensor& v_W,
     const torch::Tensor& compress_w,
     const torch::Tensor& idx_DQ, const torch::Tensor& idx_K,
-    const torch::Tensor& out_W,
+    const torch::Tensor& out_W,             // float or bf16
     int N, int d_model, int num_heads, int head_dim,
     int csa_compress, int csa_window, int csa_topk, int indexer_rank,
     cudaStream_t stream)
@@ -1195,6 +1244,11 @@ static torch::Tensor csa_context(
     const int Nc = (N + csa_compress - 1) / csa_compress;
     const int topk = std::min(csa_topk, Nc);
     const int block = SG_TUNED_BLOCK_SIZE;
+    // attn_out_proj_kernel is a float-only kernel; upcast out_W if needed.
+    // The Q/K/V projection kernels dispatch on dtype via the wt_t template.
+    const torch::Tensor out_W_f32 =
+        (out_W.scalar_type() == at::ScalarType::BFloat16)
+        ? out_W.to(torch::kFloat32) : out_W;
 
     auto q   = project(x_sorted, q_W, N, d_model, stream);
     auto c_k = compress_csa(x_sorted, k_W, compress_w, N, d_model, csa_compress, csa_window, stream);
@@ -1203,22 +1257,39 @@ static torch::Tensor csa_context(
     auto win_v = project(x_sorted, v_W, N, d_model, stream);
 
     // Indexer projections + top-k selection.
+    // idx_DQ and idx_K follow the same precision as the other projection weights.
+    const bool idx_bf16 = (idx_DQ.scalar_type() == at::ScalarType::BFloat16);
     auto qI = torch::empty({N, indexer_rank}, fopt);
     {
         const int total = N * indexer_rank;
         const int grid = std::min<int>(65535, (total + block - 1) / block);
-        csa_hca::indexer_q_kernel<float><<<grid, block, 0, stream>>>(
-            x_sorted.data_ptr<float>(), idx_DQ.data_ptr<float>(),
-            qI.data_ptr<float>(), N, d_model, indexer_rank);
+        if (idx_bf16) {
+            csa_hca::indexer_q_kernel<float, at::BFloat16><<<grid, block, 0, stream>>>(
+                x_sorted.data_ptr<float>(), idx_DQ.data_ptr<at::BFloat16>(),
+                qI.data_ptr<float>(), N, d_model, indexer_rank);
+        } else {
+            csa_hca::indexer_q_kernel<float, float><<<grid, block, 0, stream>>>(
+                x_sorted.data_ptr<float>(), idx_DQ.data_ptr<float>(),
+                qI.data_ptr<float>(), N, d_model, indexer_rank);
+        }
+        SG_LAUNCH_CHECK(stream);
     }
     auto kI = torch::empty({Nc, indexer_rank}, fopt);
     {
         const int total = Nc * indexer_rank;
         const int grid = std::min<int>(65535, (total + block - 1) / block);
-        csa_hca::indexer_k_kernel<float><<<grid, block, 0, stream>>>(
-            x_sorted.data_ptr<float>(), idx_K.data_ptr<float>(),
-            compress_w.data_ptr<float>(), kI.data_ptr<float>(),
-            N, d_model, Nc, indexer_rank, csa_compress, csa_window);
+        if (idx_bf16) {
+            csa_hca::indexer_k_kernel<float, at::BFloat16><<<grid, block, 0, stream>>>(
+                x_sorted.data_ptr<float>(), idx_K.data_ptr<at::BFloat16>(),
+                compress_w.data_ptr<float>(), kI.data_ptr<float>(),
+                N, d_model, Nc, indexer_rank, csa_compress, csa_window);
+        } else {
+            csa_hca::indexer_k_kernel<float, float><<<grid, block, 0, stream>>>(
+                x_sorted.data_ptr<float>(), idx_K.data_ptr<float>(),
+                compress_w.data_ptr<float>(), kI.data_ptr<float>(),
+                N, d_model, Nc, indexer_rank, csa_compress, csa_window);
+        }
+        SG_LAUNCH_CHECK(stream);
     }
     auto sel = torch::empty({N, std::max(topk, 1)},
         torch::TensorOptions().dtype(torch::kInt32).device(x_sorted.device()));
@@ -1235,6 +1306,7 @@ static torch::Tensor csa_context(
         csa_hca::csa_indexer_topk_kernel<<<grid, block, topk_smem_bytes, stream>>>(
             qI.data_ptr<float>(), kI.data_ptr<float>(), sel.data_ptr<int>(),
             N, Nc, indexer_rank, std::max(topk, 1));
+        SG_LAUNCH_CHECK(stream);
     }
 
     auto concat = torch::empty({N, d_model}, fopt);
@@ -1252,17 +1324,19 @@ static torch::Tensor csa_context(
         csa_hca::csa_attention_kernel<<<grid, block, qsh_bytes, stream>>>(
             q.data_ptr<float>(), c_k.data_ptr<float>(), c_v.data_ptr<float>(),
             win_k.data_ptr<float>(), win_v.data_ptr<float>(),
-            sel.data_ptr<int>(), out_W.data_ptr<float>(),
+            sel.data_ptr<int>(), out_W_f32.data_ptr<float>(),
             concat.data_ptr<float>(), N, Nc, d_model, num_heads, head_dim,
             std::max(topk, 1), csa_window);
+        SG_LAUNCH_CHECK(stream);
     }
     auto ctx = torch::empty({N, d_model}, fopt);
     {
         const int total = N * d_model;
         const int grid = std::min<int>(65535, (total + block - 1) / block);
         csa_hca::attn_out_proj_kernel<<<grid, block, 0, stream>>>(
-            concat.data_ptr<float>(), out_W.data_ptr<float>(),
+            concat.data_ptr<float>(), out_W_f32.data_ptr<float>(),
             ctx.data_ptr<float>(), N, d_model);
+        SG_LAUNCH_CHECK(stream);
     }
     return ctx;
 }
@@ -1270,13 +1344,17 @@ static torch::Tensor csa_context(
 static torch::Tensor hca_context(
     const torch::Tensor& x_sorted,
     const torch::Tensor& q_W, const torch::Tensor& k_W, const torch::Tensor& v_W,
-    const torch::Tensor& out_W,
+    const torch::Tensor& out_W,             // float or bf16
     int N, int d_model, int num_heads, int head_dim,
     int hca_compress, int csa_window, cudaStream_t stream)
 {
     auto fopt = torch::TensorOptions().dtype(torch::kFloat32).device(x_sorted.device());
     const int Nh = (N + hca_compress - 1) / hca_compress;
     const int block = SG_TUNED_BLOCK_SIZE;
+    // attn_out_proj_kernel is float-only; upcast out_W if needed.
+    const torch::Tensor out_W_f32 =
+        (out_W.scalar_type() == at::ScalarType::BFloat16)
+        ? out_W.to(torch::kFloat32) : out_W;
 
     auto q   = project(x_sorted, q_W, N, d_model, stream);
     auto c_k = compress_hca(x_sorted, k_W, N, d_model, hca_compress, stream);
@@ -1300,21 +1378,34 @@ static torch::Tensor hca_context(
             win_k.data_ptr<float>(), win_v.data_ptr<float>(),
             concat.data_ptr<float>(), N, Nh, d_model, num_heads, head_dim,
             csa_window);
+        SG_LAUNCH_CHECK(stream);
     }
     auto ctx = torch::empty({N, d_model}, fopt);
     {
         const int total = N * d_model;
         const int grid = std::min<int>(65535, (total + block - 1) / block);
         csa_hca::attn_out_proj_kernel<<<grid, block, 0, stream>>>(
-            concat.data_ptr<float>(), out_W.data_ptr<float>(),
+            concat.data_ptr<float>(), out_W_f32.data_ptr<float>(),
             ctx.data_ptr<float>(), N, d_model);
+        SG_LAUNCH_CHECK(stream);
     }
     return ctx;
 }
 
 // PEER routing + per-element expert MLP. Reuses the existing expert tensors.
-// Routes each element to its top-1 product-key expert (host-side gather via
-// ATen), runs the per-expert MLP, returns expert_out [N] (sorted order).
+//
+// REAL product-key top-k routing (restored): the query projection is split into
+// halves q_a / q_b; we score against product-key sub-codebooks A and B, take the
+// top-k of EACH (k = peer_topk, default 4), form the k×k Cartesian product of
+// candidate experts (expert = a_idx * nb + b_idx), softmax-weight them by the
+// summed sub-scores, run the per-element expert MLP for each of the k² selected
+// experts and return the routing-weighted combination. This matches the bilevel
+// adjoint's PEER head (csrc/algorithms/supergrok2_bilevel_adjoint.h:
+// peer_head_backward) which uses scores_a.topk / scores_b.topk + softmax over
+// num_active = topk*topk. The previous code collapsed this to argmax (top-1) and
+// gathered a single expert — a routing-quality regression vs the trained
+// top-k product-key gate. When product keys are absent we fall back to a single
+// shared expert (index 0), unchanged.
 static torch::Tensor peer_expert_forward(
     const torch::Tensor& feat,              // [N, d_model] float (gru ⊕ ctx)
     const torch::Tensor& peer_query_Ws,     // [num_heads?, d_model] or [d_model]
@@ -1325,44 +1416,12 @@ static torch::Tensor peer_expert_forward(
     const torch::Tensor& expert_W2,
     const torch::Tensor& expert_b2,
     int N, int d_model, int num_experts, int expert_hidden,
-    torch::Tensor& expert_counts)
+    torch::Tensor& expert_counts,
+    int peer_topk = 4)
 {
-    // Product-key routing: score = feat · query; pick the expert whose
-    // product key (A_i ⊕ B_j) best matches. We implement a robust top-1
-    // gate over a learned query projection. When the product-key tensors are
-    // sentinels we fall back to a single shared expert (index 0).
-    auto fopt = torch::TensorOptions().dtype(torch::kFloat32).device(feat.device());
-    torch::Tensor gate_idx;
-    if (prod_keys_A.defined() && prod_keys_A.numel() > 0 &&
-        peer_query_Ws.defined() && peer_query_Ws.numel() >= d_model) {
-        auto qw = peer_query_Ws.reshape({-1, d_model}).to(torch::kFloat32);  // [Q, d_model]
-        auto query = feat.matmul(qw.transpose(0, 1));                        // [N, Q]
-        // Split query into two halves for product keys A, B.
-        const int Q = query.size(1);
-        const int half = Q / 2 > 0 ? Q / 2 : Q;
-        auto qa = query.narrow(1, 0, half);
-        auto A = prod_keys_A.reshape({-1, half}).to(torch::kFloat32);        // [na, half]
-        auto sa = qa.matmul(A.transpose(0, 1));                             // [N, na]
-        auto top_a = std::get<1>(sa.max(1));                                // [N]
-        int na = A.size(0);
-        torch::Tensor expert;
-        if (prod_keys_B.defined() && prod_keys_B.numel() > 0 && Q - half > 0) {
-            auto qb = query.narrow(1, half, Q - half);
-            auto B = prod_keys_B.reshape({-1, Q - half}).to(torch::kFloat32);
-            auto sb = qb.matmul(B.transpose(0, 1));
-            auto top_b = std::get<1>(sb.max(1));
-            int nb = B.size(0);
-            expert = (top_a * nb + top_b).clamp(0, num_experts - 1);
-        } else {
-            expert = top_a.clamp(0, num_experts - 1);
-        }
-        gate_idx = expert.to(torch::kLong);
-    } else {
-        gate_idx = torch::zeros({N}, torch::TensorOptions().dtype(torch::kLong).device(feat.device()));
-    }
+    auto lopt = torch::TensorOptions().dtype(torch::kLong).device(feat.device());
 
-    // Per-element expert MLP: input is a scalar projection of feat (mean over
-    // d_model), expanded through the selected expert's [expert_hidden] MLP.
+    // Per-element expert MLP weights (shared codebook, indexed per element).
     auto scalar_in = feat.mean(1);                                          // [N]
     auto W1 = expert_W1.reshape({num_experts, -1}).to(torch::kFloat32);     // [E, H]
     auto b1 = expert_b1.reshape({num_experts, -1}).to(torch::kFloat32);     // [E, H]
@@ -1370,19 +1429,82 @@ static torch::Tensor peer_expert_forward(
     auto b2 = expert_b2.reshape({num_experts, -1}).to(torch::kFloat32);     // [E, 1]
     const int H = W1.size(1);
 
-    auto g_W1 = W1.index_select(0, gate_idx);                              // [N, H]
-    auto g_b1 = b1.index_select(0, gate_idx);                              // [N, H]
-    auto g_W2 = W2.index_select(0, gate_idx);                              // [N, H]
-    auto g_b2 = b2.index_select(0, gate_idx).squeeze(-1);                  // [N]
+    // Apply the per-element MLP for a [N, A] block of expert indices, weighted
+    // by routing_w [N, A], reduced over A. scalar_in [N] is the (broadcast) MLP
+    // input. Returns [N].
+    auto run_experts = [&](const torch::Tensor& expert_idx,       // [N, A] long
+                           const torch::Tensor& routing_w) {      // [N, A] float
+        const int64_t A = expert_idx.size(1);
+        auto flat = expert_idx.reshape({-1});                     // [N*A]
+        auto g_W1 = W1.index_select(0, flat).reshape({N, A, H});  // [N,A,H]
+        auto g_b1 = b1.index_select(0, flat).reshape({N, A, H});
+        auto g_W2 = W2.index_select(0, flat).reshape({N, A, H});
+        auto g_b2 = b2.index_select(0, flat).reshape({N, A});     // [N,A]
+        auto si   = scalar_in.reshape({N, 1, 1});                 // [N,1,1]
+        auto hidden = (g_W1 * si + g_b1).clamp_min(0.0f);         // [N,A,H] ReLU
+        auto out    = (g_W2 * hidden).sum(2) + g_b2;              // [N,A]
+        return (out * routing_w).sum(1);                          // [N]
+    };
 
-    auto hidden = (g_W1 * scalar_in.unsqueeze(1) + g_b1).clamp_min(0.0f);  // [N, H] ReLU
-    auto out = (g_W2 * hidden).sum(1) + g_b2;                              // [N]
+    torch::Tensor out;
+    torch::Tensor count_idx;   // [N*A] long, for activation counting
+    if (prod_keys_A.defined() && prod_keys_A.numel() > 0 &&
+        peer_query_Ws.defined() && peer_query_Ws.numel() >= d_model) {
+        auto qw = peer_query_Ws.reshape({-1, d_model}).to(torch::kFloat32);  // [Q, d_model]
+        auto query = feat.matmul(qw.transpose(0, 1));                        // [N, Q]
+        const int Q = query.size(1);
+        const int half = Q / 2 > 0 ? Q / 2 : Q;
+        auto qa = query.narrow(1, 0, half);
+        auto A = prod_keys_A.reshape({-1, half}).to(torch::kFloat32);        // [na, half]
+        auto sa = qa.matmul(A.transpose(0, 1));                              // [N, na]
+        int na = A.size(0);
+        const double T = 10.0;   // gate temperature (matches adjoint PEER head)
 
-    // Update expert activation counts (best-effort; reused by recycling).
+        if (prod_keys_B.defined() && prod_keys_B.numel() > 0 && Q - half > 0) {
+            auto qb = query.narrow(1, half, Q - half);
+            auto B = prod_keys_B.reshape({-1, Q - half}).to(torch::kFloat32);
+            auto sb = qb.matmul(B.transpose(0, 1));                          // [N, nb]
+            int nb = B.size(0);
+            const int ka = std::min<int>(std::max(peer_topk, 1), na);
+            const int kb = std::min<int>(std::max(peer_topk, 1), nb);
+            auto ta = sa.topk(ka, -1);  // vals,idx  [N, ka]
+            auto tb = sb.topk(kb, -1);  // vals,idx  [N, kb]
+            auto top_a_vals = std::get<0>(ta), top_a_idx = std::get<1>(ta);
+            auto top_b_vals = std::get<0>(tb), top_b_idx = std::get<1>(tb);
+            auto soft_a = torch::softmax(top_a_vals * T, -1);                // [N, ka]
+            auto soft_b = torch::softmax(top_b_vals * T, -1);
+            // k_a × k_b Cartesian product of candidate experts + routing weights.
+            auto expert_idx = (top_a_idx.unsqueeze(2) * nb + top_b_idx.unsqueeze(1))
+                                  .reshape({N, ka * kb})
+                                  .clamp(0, num_experts - 1);               // [N, A]
+            auto routing_w = (soft_a.unsqueeze(2) * soft_b.unsqueeze(1))
+                                  .reshape({N, ka * kb});                   // [N, A]
+            out = run_experts(expert_idx, routing_w);
+            count_idx = expert_idx.reshape({-1});
+        } else {
+            // Single sub-codebook: top-k over A directly.
+            const int ka = std::min<int>(std::max(peer_topk, 1), na);
+            auto ta = sa.topk(ka, -1);
+            auto top_a_vals = std::get<0>(ta), top_a_idx = std::get<1>(ta);
+            auto soft_a = torch::softmax(top_a_vals * T, -1);               // [N, ka]
+            auto expert_idx = top_a_idx.clamp(0, num_experts - 1);          // [N, ka]
+            out = run_experts(expert_idx, soft_a);
+            count_idx = expert_idx.reshape({-1});
+        }
+    } else {
+        // No product keys → single shared expert (index 0), weight 1.
+        auto expert_idx = torch::zeros({N, 1}, lopt);
+        auto routing_w  = torch::ones({N, 1},
+            torch::TensorOptions().dtype(torch::kFloat32).device(feat.device()));
+        out = run_experts(expert_idx, routing_w);
+        count_idx = expert_idx.reshape({-1});
+    }
+
+    // Update expert activation counts (best-effort; reused by recycling). Now
+    // counts every selected expert in the top-k combination, not just one.
     if (expert_counts.defined() && expert_counts.numel() >= num_experts) {
-        auto counts = torch::zeros({num_experts},
-            torch::TensorOptions().dtype(torch::kLong).device(feat.device()));
-        counts.scatter_add_(0, gate_idx, torch::ones_like(gate_idx));
+        auto counts = torch::zeros({num_experts}, lopt);
+        counts.scatter_add_(0, count_idx, torch::ones_like(count_idx));
         expert_counts.add_(counts.to(expert_counts.dtype()));
     }
     (void)H; (void)expert_hidden;
@@ -1414,8 +1536,18 @@ static void csa_hca_step_one(
     int csa_compress, int csa_window, int csa_topk,
     int hca_compress, int indexer_rank,
     torch::Tensor& expert_counts,
+    int peer_topk,
     cudaStream_t stream)
 {
+    // SG2 runs sequence-attention over the N "tokens" (materializes [N,d_model]
+    // + N*N attention), so it OOMs far below INT_MAX elements — the int domain
+    // here is safe in practice. Guard the truncation loudly anyway so a >2^31
+    // element param ERRORS instead of silently wrapping `N` into corruption.
+    TORCH_CHECK(grad.numel() <= static_cast<int64_t>(INT_MAX),
+                "supergrok2: param numel ", grad.numel(),
+                " exceeds INT_MAX; the SG2 attention path uses 32-bit token "
+                "indexing (it materializes an N*N attention map and cannot "
+                "reach this size in practice).");
     const int N = static_cast<int>(grad.numel());
     if (N == 0) return;
     const int head_dim = d_model / std::max(num_heads, 1);
@@ -1423,21 +1555,34 @@ static void csa_hca_step_one(
     auto fopt = torch::TensorOptions().dtype(torch::kFloat32).device(dev);
 
     // (1) input projection + sort key.
+    // input_proj_W/b pass through at their native dtype (float or bf16).
     auto x_out = torch::empty({N, d_model}, fopt);
     auto sort_keys = torch::empty({N}, fopt);
     auto sort_idx  = torch::empty({N}, torch::TensorOptions().dtype(torch::kInt32).device(dev));
     {
         const int block = SG_TUNED_BLOCK_SIZE;
         const int grid = std::min<int>(65535, (N + block - 1) / block);
+        const bool wt_bf16 = (input_proj_W.scalar_type() == at::ScalarType::BFloat16);
         AT_DISPATCH_FLOATING_TYPES_AND2(
             at::ScalarType::Half, at::ScalarType::BFloat16,
             grad.scalar_type(), "csa_hca_input_proj_sort", [&] {
-                sg2_input_proj_sort_kernel<scalar_t><<<grid, block, 0, stream>>>(
-                    grad.data_ptr<scalar_t>(), sharpness.data_ptr<scalar_t>(),
-                    x_out.data_ptr<float>(), sort_keys.data_ptr<float>(),
-                    sort_idx.data_ptr<int>(),
-                    input_proj_W.data_ptr<float>(), input_proj_b.data_ptr<float>(),
-                    N, d_model);
+                if (wt_bf16) {
+                    sg2_input_proj_sort_kernel<scalar_t, at::BFloat16><<<grid, block, 0, stream>>>(
+                        grad.data_ptr<scalar_t>(), sharpness.data_ptr<scalar_t>(),
+                        x_out.data_ptr<float>(), sort_keys.data_ptr<float>(),
+                        sort_idx.data_ptr<int>(),
+                        input_proj_W.data_ptr<at::BFloat16>(),
+                        input_proj_b.data_ptr<at::BFloat16>(),
+                        N, d_model);
+                } else {
+                    sg2_input_proj_sort_kernel<scalar_t, float><<<grid, block, 0, stream>>>(
+                        grad.data_ptr<scalar_t>(), sharpness.data_ptr<scalar_t>(),
+                        x_out.data_ptr<float>(), sort_keys.data_ptr<float>(),
+                        sort_idx.data_ptr<int>(),
+                        input_proj_W.data_ptr<float>(), input_proj_b.data_ptr<float>(),
+                        N, d_model);
+                }
+                SG_LAUNCH_CHECK(stream);
             });
     }
     // Sort the sequence by |grad| (descending) so attention sees a meaningful
@@ -1447,16 +1592,17 @@ static void csa_hca_step_one(
     auto x_sorted = x_out.index_select(0, perm).contiguous();  // [N, d_model]
 
     // (2) CSA + HCA contexts.
+    // Projection weights pass through at their native dtype (float or bf16);
+    // the detail:: helpers dispatch on scalar_type() internally.
+    // csa_compress_w stays float (it is a learned logit, not a GEMM operand).
     auto csa_ctx = detail::csa_context(
-        x_sorted, csa_q_W.to(torch::kFloat32), csa_k_W.to(torch::kFloat32),
-        csa_v_W.to(torch::kFloat32), csa_compress_w.to(torch::kFloat32),
-        csa_idx_DQ.to(torch::kFloat32), csa_idx_K.to(torch::kFloat32),
-        csa_out_W.to(torch::kFloat32),
+        x_sorted, csa_q_W, csa_k_W, csa_v_W,
+        csa_compress_w.to(torch::kFloat32),
+        csa_idx_DQ, csa_idx_K, csa_out_W,
         N, d_model, num_heads, head_dim,
         csa_compress, csa_window, csa_topk, indexer_rank, stream);
     auto hca_ctx = detail::hca_context(
-        x_sorted, hca_q_W.to(torch::kFloat32), hca_k_W.to(torch::kFloat32),
-        hca_v_W.to(torch::kFloat32), hca_out_W.to(torch::kFloat32),
+        x_sorted, hca_q_W, hca_k_W, hca_v_W, hca_out_W,
         N, d_model, num_heads, head_dim, hca_compress, csa_window, stream);
 
     // (3) Combine contexts (sum of fine + coarse), PEER routing + expert MLP.
@@ -1464,7 +1610,9 @@ static void csa_hca_step_one(
     auto expert_sorted = detail::peer_expert_forward(
         feat, peer_query_Ws, prod_keys_A, prod_keys_B,
         expert_W1, expert_b1, expert_W2, expert_b2,
-        N, d_model, num_experts, expert_hidden, expert_counts);  // [N] sorted
+        N, d_model, num_experts, expert_hidden, expert_counts,
+        /*peer_topk=*/peer_topk);  // [N] sorted — real product-key top-k combination
+                                   // (configurable; default 4 preserves PEER top-4)
 
     // (4) Unsort expert output back to original element order, scale.
     auto expert_out = torch::empty({N}, fopt);
@@ -1485,6 +1633,7 @@ static void csa_hca_step_one(
                     expert_out.data_ptr<float>(),
                     alpha_mu, gru_decay, lr, beta1, beta2, eps, wd_eff,
                     bc1, bc2, N);
+                SG_LAUNCH_CHECK(stream);
             });
     }
     (void)gru_state;  // carried state mirrored by mu_state in the elementwise tail
@@ -1516,7 +1665,8 @@ void launch_csa_hca_step(
     int expert_hidden, int num_experts,
     int csa_compress, int csa_window, int csa_topk,
     int hca_compress, int indexer_rank,
-    torch::Tensor expert_counts)
+    torch::Tensor expert_counts,
+    int peer_topk = 4)
 {
     if (grad.numel() == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -1542,7 +1692,7 @@ void launch_csa_hca_step(
         rescale, alpha_mu, gru_decay, beta1, beta2, lr, wd_eff, eps, bc1, bc2,
         d_model, num_heads, expert_hidden, num_experts,
         csa_compress, csa_window, csa_topk, hca_compress, indexer_rank,
-        expert_counts, stream);
+        expert_counts, peer_topk, stream);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1578,7 +1728,8 @@ void launch_csa_hca_batched_step(
     int expert_hidden, int num_experts,
     int csa_compress, int csa_window, int csa_topk,
     int hca_compress, int indexer_rank,
-    torch::Tensor expert_counts)
+    torch::Tensor expert_counts,
+    int peer_topk = 4)
 {
     const size_t n = params.size();
     if (n == 0) return;
@@ -1601,7 +1752,7 @@ void launch_csa_hca_batched_step(
             bc1s[i], bc2s[i],
             d_model, num_heads, expert_hidden, num_experts,
             csa_compress, csa_window, csa_topk, hca_compress, indexer_rank,
-            expert_counts, stream);
+            expert_counts, peer_topk, stream);
         (void)lamb_effs;
     }
 }
@@ -2041,6 +2192,7 @@ void moe_count_expert_activations(
     moe_count_expert_activations_kernel<<<grid, block, 0, stream>>>(
         gl.data_ptr<float>(), expert_counts.data_ptr<int>(),
         threshold, N, num_experts);
+    SG_LAUNCH_CHECK(stream);
 }
 
 // ── (2) Switch-Transformer load-balance auxiliary loss ─────────────────────
@@ -2097,6 +2249,7 @@ void moe_apply_frequency_scaling(
     moe_apply_frequency_scaling_kernel<<<grid, block, 0, stream>>>(
         expert_counts.data_ptr<int>(), lr_scale.data_ptr<float>(),
         num_experts, total_activations, min_scale, max_scale, smoothing);
+    SG_LAUNCH_CHECK(stream);
 }
 
 // ── (4) Stream-compaction of active-expert parameters ──────────────────────
@@ -2184,6 +2337,7 @@ void moe_filter_active_params(
         compact_state_m.data_ptr<float>(), compact_state_v.data_ptr<float>(),
         scatter_indices.data_ptr<int>(), compact_count.data_ptr<int>(),
         total_params);
+    SG_LAUNCH_CHECK(stream);
 }
 
 // ── (5) Scatter compacted results back to dense storage ────────────────────
@@ -2225,6 +2379,7 @@ void moe_scatter_results(
         params.data_ptr<float>(),
         state_m.data_ptr<float>(), state_v.data_ptr<float>(),
         compact_N);
+    SG_LAUNCH_CHECK(stream);
 }
 
 // ── (6) Masked gather of active expert weights ─────────────────────────────
@@ -2336,6 +2491,7 @@ torch::Tensor moe_dynamic_expert_fwd(
         w1.data_ptr<float>(), b1.data_ptr<float>(),
         w2.data_ptr<float>(), b2.data_ptr<float>(),
         output.data_ptr<float>(), N, d_in, hidden, d_out);
+    SG_LAUNCH_CHECK(stream);
     return output;
 }
 
@@ -2408,7 +2564,6 @@ __global__ void moe_dynamic_expert_bwd_kernel(
     for (int j = lane; j < hidden; j += nthreads) {
         const float g = dz1[j];
         atomicAdd(&db1[j], g);
-        const float* w1row = W1 + static_cast<long>(j) * d_in;
         float* dw1row = dW1 + static_cast<long>(j) * d_in;
         for (int k = 0; k < d_in; ++k) atomicAdd(&dw1row[k], g * x[k]);
     }
@@ -2457,6 +2612,7 @@ void moe_dynamic_expert_bwd(
         d_input.data_ptr<float>(), d_expert_w1.data_ptr<float>(),
         d_expert_b1.data_ptr<float>(), d_expert_w2.data_ptr<float>(),
         d_expert_b2.data_ptr<float>(), N, d_in, hidden, d_out);
+    SG_LAUNCH_CHECK(stream);
 }
 
 // ── (9) Compacted selective scan — VESTIGIAL ───────────────────────────────
@@ -2549,6 +2705,7 @@ void moe_scan_compacted(
         final_state.defined() ? final_state.data_ptr<float>() : nullptr,
         init.defined() ? init.data_ptr<float>() : nullptr,
         compact_N, d_inner, d_state);
+    SG_LAUNCH_CHECK(stream);
 }
 
 }} // namespace sg::sm90

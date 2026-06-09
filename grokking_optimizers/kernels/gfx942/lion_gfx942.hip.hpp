@@ -71,7 +71,10 @@
 // kernel via hipLaunchKernelGGL (see §5.LAUNCH); the `#else` branch keeps the
 // ATen path as the CPU-host fallback.
 // ════════════════════════════════════════════════════════════════════════════
-#if !defined(__AMDGCN__)
+// SG_GFX942_DEVICE_TU (Stage 7): set by the thin `.hip` device TU so this host
+// launcher is NOT re-emitted in that TU's host pass (it stays owned by the
+// `.hip.cpp` host TU) — avoids a duplicate launch_lion_step at link.
+#if !defined(__AMDGCN__) && !defined(SG_GFX942_DEVICE_TU)
 #include <torch/extension.h>
 #include <vector>
 
@@ -97,13 +100,20 @@ void launch_lion_step(
         // LIVE device path: dispatch the §5 AMDGCN kernel per tensor (fuses the
         // sign-momentum interp + decoupled-WD apply + momentum refresh into ONE
         // launch vs the ATen broadcast chain). 🟡 hipcc-only — none in this env.
-        const int n = static_cast<int>(p.numel());
-        dim3 grid(min(1024, (n + 255) / 256)), block(256);  // 4 wavefronts/block
+        // 64-bit safe element count + grid sizing (Stage 1): numel can exceed
+        // 2^31, so form n and the block count in int64 then clamp to the 1024-
+        // workgroup cap. Mirrors the adamw launcher.
+        const int64_t n = static_cast<int64_t>(p.numel());
+        if (n == 0) continue;
+        const unsigned blocks =
+            static_cast<unsigned>(min<int64_t>(1024, (n + 255) / 256));
+        dim3 grid(blocks), block(256);  // 4 wavefronts/block
         hipLaunchKernelGGL((native::lion_gfx942_kernel<float, float>), grid,
                            block, 0, 0,
                            p.data_ptr<float>(), ea.data_ptr<float>(),
                            g.data_ptr<float>(),
                            lr, beta1, beta2, wd, n);
+        SG_HIP_LAUNCH_CHECK(0);  // mirror sm_90 SG_LAUNCH_CHECK after each launch
 #else
         // Interpolation, sign, update
         auto interp = beta1 * ea + (1.0f - beta1) * g.to(ea.scalar_type());
@@ -210,15 +220,28 @@ namespace sg { namespace gfx942 { namespace native {
 
 namespace amd = ::sg::gfx942::amdgcn;
 
+// Stage-1 NaN/Inf gradient sanitization (mirror of sm_90 sg_sanitize_grad).
+// Identity unless built with -DSG_SANITIZE_NONFINITE=1; default byte-identical.
+#ifndef SG_SANITIZE_NONFINITE
+#define SG_SANITIZE_NONFINITE 0
+#endif
+__device__ __forceinline__ float sg_sanitize_grad(float g) {
+#if SG_SANITIZE_NONFINITE
+    return __builtin_isfinite(g) ? g : 0.0f;
+#else
+    return g;
+#endif
+}
+
 // Per-element Lion apply — the canonical scalar body, shared by the scalar tail
 // and (replicated lane-by-lane) the f32x4 fast-path so both are bit-identical.
 template <typename ParamT, typename GradT>
 __device__ __forceinline__ void lion_apply_elem(
     ParamT* __restrict__ param, float* __restrict__ exp_avg,
-    const GradT* __restrict__ grad, int i,
+    const GradT* __restrict__ grad, int64_t i,
     float lr, float beta1, float beta2, float wd)
 {
-    const float g  = static_cast<float>(amd::streaming_load(&grad[i]));
+    const float g  = sg_sanitize_grad(static_cast<float>(amd::streaming_load(&grad[i])));
     const float ea = exp_avg[i];
     const float p  = static_cast<float>(param[i]);
 
@@ -233,36 +256,39 @@ template <typename ParamT, typename GradT>
 SG_KERNEL_BOUNDS(256, 8) void lion_gfx942_kernel(
     ParamT* __restrict__ param, float* __restrict__ exp_avg,
     const GradT* __restrict__ grad,
-    float lr, float beta1, float beta2, float wd, int N)
+    float lr, float beta1, float beta2, float wd, int64_t N)
 {
-    const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
-    const int tid    = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
-                       + static_cast<int>(threadIdx.x);
+    // 64-bit grid-stride indexing (Stage 1): cast BEFORE the multiply so a
+    // launch covering >2^31 elements cannot wrap the 32-bit product.
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    const int64_t tid    = static_cast<int64_t>(blockIdx.x) * blockDim.x
+                       + threadIdx.x;
 
     // VECTORIZED fast-path: only when param/grad are plain fp32 (the sole
     // instantiation); the constexpr guard lets any future bf16/fp16 combo fall
     // back cleanly to the scalar loop.
     constexpr bool kVecOk =
         sizeof(ParamT) == sizeof(float) && sizeof(GradT) == sizeof(float);
-    const int n4 = kVecOk ? (N >> 2) : 0;   // number of full float4 groups
+    const int64_t n4 = kVecOk ? (N >> 2) : 0;   // number of full float4 groups
 
     using f32x4 = amd::f32x4;
     auto* p4 = reinterpret_cast<f32x4*>(param);
     auto* m4 = reinterpret_cast<f32x4*>(exp_avg);
     const auto* g4 = reinterpret_cast<const f32x4*>(grad);
 
-    for (int q = tid; q < n4; q += stride) {
+    for (int64_t q = tid; q < n4; q += stride) {
         const f32x4 g = amd::streaming_load(&g4[q]);   // 128-bit dwordx4 load
         const f32x4 ea = m4[q];
         const f32x4 p = p4[q];
         f32x4 po, mo;
         // 4 lanes, each evaluating the IDENTICAL scalar Lion expressions.
         for (int l = 0; l < 4; ++l) {
-            const float interp = beta1 * ea[l] + (1.0f - beta1) * g[l];
+            const float gl = sg_sanitize_grad(g[l]);  // identity unless sanitize on
+            const float interp = beta1 * ea[l] + (1.0f - beta1) * gl;
             const float s = (interp != 0.0f)
                                 ? __builtin_copysignf(1.0f, interp) : 0.0f;
             po[l] = p[l] - lr * (s + wd * p[l]);
-            mo[l] = beta2 * ea[l] + (1.0f - beta2) * g[l];
+            mo[l] = beta2 * ea[l] + (1.0f - beta2) * gl;
         }
         amd::streaming_store(&p4[q], po);              // 128-bit dwordx4 store
         m4[q] = mo;
@@ -270,7 +296,7 @@ SG_KERNEL_BOUNDS(256, 8) void lion_gfx942_kernel(
 
     // SCALAR TAIL: the final N%4 elements (and the whole array when kVecOk is
     // false / N<4). Grid-strided over the remaining indices.
-    for (int i = (n4 << 2) + tid; i < N; i += stride) {
+    for (int64_t i = (n4 << 2) + tid; i < N; i += stride) {
         lion_apply_elem(param, exp_avg, grad, i, lr, beta1, beta2, wd);
     }
 }
@@ -278,7 +304,7 @@ SG_KERNEL_BOUNDS(256, 8) void lion_gfx942_kernel(
 // Force-instantiate the grokking dtype combo (fp32 param + fp32 grad) so the
 // device pass emits the kernel; the host TU dispatches on dtype.
 template __global__ void lion_gfx942_kernel<float, float>(
-    float*, float*, const float*, float, float, float, float, int);
+    float*, float*, const float*, float, float, float, float, int64_t);
 
 }}} // namespace sg::gfx942::native
 #endif  // (B) device pass

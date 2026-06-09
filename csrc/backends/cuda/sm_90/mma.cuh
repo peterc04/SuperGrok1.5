@@ -834,9 +834,11 @@ static __global__ void softplus_bias_kernel(
     float* __restrict__ C, const float* __restrict__ bias,
     int M, int N)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < M * N) {
-        int col = idx % N;
+    // 64-bit linear index: M*N (rows * d_inner for the SG2 dt_proj fused path)
+    // can exceed INT_MAX for large parameter tensors. col stays in int (col<N).
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx < static_cast<int64_t>(M) * N) {
+        int col = static_cast<int>(idx % N);
         float val = C[idx] + bias[col];
         C[idx] = (val > 20.0f) ? val : logf(1.0f + expf(val));
     }
@@ -847,9 +849,9 @@ inline void launch_softplus_bias(
     cudaStream_t stream)
 {
     if (!bias) return;
-    int total = M * N;
+    int64_t total = static_cast<int64_t>(M) * N;
     int block = 256;
-    int grid = (total + block - 1) / block;
+    int grid = static_cast<int>((total + block - 1) / block);
     softplus_bias_kernel<<<grid, block, 0, stream>>>(C, bias, M, N);
 }
 

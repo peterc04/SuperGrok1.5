@@ -43,15 +43,18 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import multiprocessing
 import os
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_REPORT = REPO_ROOT / "bench_report.txt"
@@ -325,6 +328,279 @@ def opt_for_launcher(path: Path) -> Optional[Tuple[str, str, str]]:
     return None
 
 
+# ===========================================================================
+#  Real latency/throughput measurement (the timing half — runs on CPU now,
+#  uses CUDA events when a GPU is present). Times the fused optimizer step
+#  against an ATen-baseline reference path on realistic parameter shapes.
+# ===========================================================================
+
+# Realistic per-step workloads: (label, [tensor shapes]) — a transformer-ish
+# mix of 2D weight matrices + 1D bias/norm vectors, several sizes. NOT 64x64.
+BENCH_WORKLOADS: List[Tuple[str, List[Tuple[int, ...]]]] = [
+    ("tiny",   [(256, 256), (256,)]),
+    ("small",  [(1024, 1024), (1024,), (4096, 1024), (4096,)]),
+    ("medium", [(4096, 4096), (4096,), (4096, 11008), (11008,)]),
+    ("wide",   [(8192, 2048), (2048, 8192), (8192,), (2048,)]),
+]
+
+
+def _percentile(samples: List[float], pct: float) -> float:
+    """Nearest-rank percentile (pct in [0, 100]) over a list of latencies."""
+    if not samples:
+        return float("nan")
+    s = sorted(samples)
+    k = max(0, min(len(s) - 1, int(round((pct / 100.0) * (len(s) - 1)))))
+    return s[k]
+
+
+def _time_callable(fn: Callable[[], None], *, warmup: int, iters: int,
+                   cuda: bool) -> List[float]:
+    """Return a list of `iters` per-call latencies in milliseconds.
+
+    Warms up `warmup` times first. On CUDA uses torch.cuda.Event timing (so the
+    async launch queue is measured correctly); on CPU uses time.perf_counter.
+    """
+    import torch
+
+    for _ in range(warmup):
+        fn()
+    if cuda:
+        torch.cuda.synchronize()
+
+    samples: List[float] = []
+    if cuda:
+        for _ in range(iters):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            fn()
+            end.record()
+            torch.cuda.synchronize()
+            samples.append(start.elapsed_time(end))   # ms
+    else:
+        for _ in range(iters):
+            t0 = time.perf_counter()
+            fn()
+            samples.append((time.perf_counter() - t0) * 1e3)   # ms
+    return samples
+
+
+def _make_params(shapes: List[Tuple[int, ...]], device: str, dtype) -> list:
+    import torch
+
+    params = []
+    for shape in shapes:
+        p = torch.nn.Parameter(torch.randn(*shape, device=device, dtype=dtype))
+        p.grad = torch.randn_like(p)
+        params.append(p)
+    return params
+
+
+def _refresh_grads(params: list) -> None:
+    import torch
+
+    for p in params:
+        p.grad = torch.randn_like(p)
+
+
+# ATen baseline: stock torch.optim equivalents for the kernels we can compare
+# against 1:1. The fused path is the project's optimizer; the baseline is the
+# vanilla ATen implementation of the same math.
+ATEN_BASELINE: Dict[str, Callable] = {}
+
+
+def _init_aten_baselines() -> None:
+    import torch
+
+    ATEN_BASELINE["adamw"] = lambda params: torch.optim.AdamW(
+        params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2)
+    # Lion landed in torch.optim in newer releases; fall back to None if absent.
+    if hasattr(torch.optim, "Lion"):
+        ATEN_BASELINE["lion"] = lambda params: torch.optim.Lion(  # type: ignore[attr-defined]
+            params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0)
+
+
+def _build_fused_optimizer(opt_class: str, params: list):
+    """Construct the project's fused optimizer; returns None (and the reason)
+    if the extension isn't built / the class can't run on this device."""
+    try:
+        import grokking_optimizers as go
+        cls = getattr(go, opt_class)
+        return cls(params, lr=1e-3), None
+    except Exception as exc:  # noqa: BLE001 — surface any construction failure
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def run_benchmark(args, report) -> dict:
+    """Time fused vs ATen-baseline optimizer steps over realistic shapes.
+
+    CPU paths run now; GPU paths only when CUDA is available. Returns a JSON-
+    serialisable results dict (also written to `report` as text)."""
+    try:
+        import torch
+    except Exception as exc:  # noqa: BLE001
+        report.write(f"[bench] torch import failed: {exc}\n")
+        return {"error": f"torch import failed: {exc}"}
+
+    cuda = torch.cuda.is_available()
+    device = "cuda" if cuda else "cpu"
+    dtype = torch.float32
+    _init_aten_baselines()
+
+    results: dict = {
+        "schema": "bench_backends/v1",
+        "generated": datetime.datetime.now().isoformat(),
+        "device": device,
+        "torch": torch.__version__,
+        "warmup": args.warmup,
+        "iters": args.iters,
+        "workloads": [w[0] for w in BENCH_WORKLOADS],
+        "measurements": [],
+    }
+
+    section(report, f"BENCHMARK — device={device} warmup={args.warmup} "
+                    f"iters={args.iters}", char="=")
+    if not cuda:
+        report.write(
+            "[bench] no CUDA device — timing the CPU dispatch path. GPU latency "
+            "numbers require a real accelerator (committed baselines are env-"
+            "specific and intentionally not checked in).\n")
+
+    opts = [o for o in OPTIMIZERS
+            if not args.filter or args.filter in o[0]]
+
+    for opt_short, opt_class, _src in opts:
+        for wl_name, shapes in BENCH_WORKLOADS:
+            entry: dict = {
+                "optimizer": opt_short,
+                "workload": wl_name,
+                "n_params": len(shapes),
+                "n_elements": int(sum(_numel(s) for s in shapes)),
+            }
+
+            # ── fused (project) path ──
+            params = _make_params(shapes, device, dtype)
+            opt, why = _build_fused_optimizer(opt_class, params)
+            if opt is None:
+                entry["fused"] = {"skipped": why}
+            else:
+                def _fused_step(_opt=opt, _params=params):
+                    _refresh_grads(_params)
+                    _opt.step()
+
+                try:
+                    lat = _time_callable(_fused_step, warmup=args.warmup,
+                                         iters=args.iters, cuda=cuda)
+                    entry["fused"] = _summarize(lat, entry["n_elements"])
+                except Exception as exc:  # noqa: BLE001
+                    entry["fused"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+            # ── ATen baseline (only where a 1:1 stock optimizer exists) ──
+            base_factory = ATEN_BASELINE.get(opt_short)
+            if base_factory is not None:
+                bparams = _make_params(shapes, device, dtype)
+                try:
+                    bopt = base_factory(bparams)
+
+                    def _base_step(_opt=bopt, _params=bparams):
+                        _refresh_grads(_params)
+                        _opt.step()
+
+                    blat = _time_callable(_base_step, warmup=args.warmup,
+                                          iters=args.iters, cuda=cuda)
+                    entry["aten_baseline"] = _summarize(blat,
+                                                        entry["n_elements"])
+                    # speedup = baseline_median / fused_median (>1 => fused wins)
+                    f = entry.get("fused", {})
+                    if "median_ms" in f and f["median_ms"] > 0:
+                        entry["speedup_vs_aten"] = (
+                            entry["aten_baseline"]["median_ms"] / f["median_ms"])
+                except Exception as exc:  # noqa: BLE001
+                    entry["aten_baseline"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+            results["measurements"].append(entry)
+            _write_bench_row(report, entry)
+
+    return results
+
+
+def _numel(shape: Tuple[int, ...]) -> int:
+    n = 1
+    for d in shape:
+        n *= d
+    return n
+
+
+def _summarize(lat_ms: List[float], n_elements: int) -> dict:
+    median = statistics.median(lat_ms)
+    out = {
+        "median_ms": median,
+        "p90_ms": _percentile(lat_ms, 90),
+        "min_ms": min(lat_ms),
+        "samples": len(lat_ms),
+    }
+    # Throughput: elements updated per second at the median latency.
+    if median > 0:
+        out["throughput_melem_per_s"] = (n_elements / (median / 1e3)) / 1e6
+    return out
+
+
+def _write_bench_row(report, entry: dict) -> None:
+    fused = entry.get("fused", {})
+    base = entry.get("aten_baseline")
+    line = (f"  {entry['optimizer']:<12} {entry['workload']:<7} "
+            f"elems={entry['n_elements']:>11,} ")
+    if "median_ms" in fused:
+        line += (f"fused med={fused['median_ms']:.4f}ms "
+                 f"p90={fused['p90_ms']:.4f}ms "
+                 f"thr={fused.get('throughput_melem_per_s', 0):.1f}Melem/s")
+    elif "skipped" in fused:
+        line += f"fused [skip: {fused['skipped']}]"
+    elif "error" in fused:
+        line += f"fused [err: {fused['error']}]"
+    if base and "median_ms" in base:
+        line += f" | aten med={base['median_ms']:.4f}ms"
+        if "speedup_vs_aten" in entry:
+            line += f" speedup={entry['speedup_vs_aten']:.2f}x"
+    report.write(line + "\n")
+    report.flush()
+
+
+def _run_bench_mode(args) -> int:
+    """Bench mode entry: build (optional), time fused vs ATen, emit text + JSON."""
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    backend = args.backend or detect_backend()
+    with open(args.output, "w") as report:
+        report.write("# SuperGrok optimizer bench (timing mode)\n")
+        report.write(f"# Generated: {datetime.datetime.now().isoformat()}\n")
+        report.write(f"# Backend:   {backend}\n")
+
+        if not args.skip_build and backend in ("cuda", "hip"):
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    build_extension(backend, report)
+                else:
+                    report.write("\n[bench] no accelerator — skipping build; "
+                                 "timing the importable dispatch path.\n")
+            except Exception:  # noqa: BLE001
+                report.write("\n[bench] torch unavailable for build phase.\n")
+        else:
+            report.write("\n[bench] build phase skipped.\n")
+        report.flush()
+
+        results = run_benchmark(args, report)
+
+    if args.json_out is not None:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        with open(args.json_out, "w") as jf:
+            json.dump(results, jf, indent=2, sort_keys=True)
+        sys.stderr.write(f"[bench] JSON written: {args.json_out}\n")
+
+    sys.stdout.write(f"{args.output}\n")
+    return 0 if "error" not in results else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -341,7 +617,23 @@ def main() -> int:
                         help="Only run launchers whose name contains this substring")
     parser.add_argument("--timeout", type=int, default=900,
                         help="Per-command timeout in seconds (default 900)")
+    parser.add_argument("--mode", choices=("bench", "profile"), default="bench",
+                        help="bench: real warmup+timed latency/throughput "
+                             "measurement vs an ATen baseline (default). "
+                             "profile: the legacy ncu/rocprof/jax profiler dump.")
+    parser.add_argument("--warmup", type=int, default=10,
+                        help="Warmup iterations before timing (bench mode)")
+    parser.add_argument("--iters", type=int, default=50,
+                        help="Timed iterations per (optimizer, workload) "
+                             "(bench mode)")
+    parser.add_argument("--json", dest="json_out", type=Path, default=None,
+                        help="Write the bench results to this JSON file "
+                             "(committed-baseline format; numbers are env-"
+                             "specific so don't commit GPU numbers from CI)")
     args = parser.parse_args()
+
+    if args.mode == "bench":
+        return _run_bench_mode(args)
 
     backend = args.backend or detect_backend()
     launchers = list_launchers(backend)

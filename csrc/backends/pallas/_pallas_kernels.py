@@ -105,12 +105,15 @@ if _HAS_PALLAS:
                 ],
                 grid=(N // TILE,),
                 in_specs=[
-                    pl.BlockSpec((TILE, 2, 2), lambda i: (i * TILE, 0, 0)),
-                    pl.BlockSpec((TILE, 2), lambda i: (i * TILE, 0)),
+                    # BlockSpec index_map returns BLOCK indices (block i covers
+                    # rows [i*TILE:(i+1)*TILE]), so the map must be ``i`` — not
+                    # the element offset ``i*TILE`` which over-runs the grid.
+                    pl.BlockSpec((TILE, 2, 2), lambda i: (i, 0, 0)),
+                    pl.BlockSpec((TILE, 2), lambda i: (i, 0)),
                 ],
                 out_specs=[
-                    pl.BlockSpec((TILE, 2, 2), lambda i: (i * TILE, 0, 0)),
-                    pl.BlockSpec((TILE, 2), lambda i: (i * TILE, 0)),
+                    pl.BlockSpec((TILE, 2, 2), lambda i: (i, 0, 0)),
+                    pl.BlockSpec((TILE, 2), lambda i: (i, 0)),
                 ],
             )(Ms, bs)
 
@@ -239,10 +242,14 @@ if _HAS_PALLAS:
                 grid=(num_blocks,),
                 in_specs=[
                     pl.BlockSpec(flat_weights.shape, lambda i: (0, 0)),
-                    pl.BlockSpec((TILE, top_k), lambda i: (i * TILE, 0)),
+                    # BlockSpec index_map returns BLOCK indices (block i covers
+                    # rows [i*TILE:(i+1)*TILE]), so the map must be ``i`` — not
+                    # the element offset ``i*TILE`` which over-runs the grid
+                    # (tiles >=2 read out-of-bounds -> silently wrong / NaN).
+                    pl.BlockSpec((TILE, top_k), lambda i: (i, 0)),
                 ],
                 out_specs=[
-                    pl.BlockSpec((TILE, top_k, D), lambda i: (i * TILE, 0, 0)),
+                    pl.BlockSpec((TILE, top_k, D), lambda i: (i, 0, 0)),
                 ],
             )(flat_weights, expert_indices)
 
@@ -421,15 +428,19 @@ if _HAS_PALLAS:
                 ],
                 grid=(N // TILE,),
                 in_specs=[
-                    pl.BlockSpec((TILE,), lambda i: (i * TILE,)),
-                    pl.BlockSpec((TILE,), lambda i: (i * TILE,)),
-                    pl.BlockSpec((TILE, d_model), lambda i: (i * TILE, 0)),
-                    pl.BlockSpec((TILE, d_model), lambda i: (i * TILE, 0)),
-                    pl.BlockSpec((TILE, gru_hidden), lambda i: (i * TILE, 0)),
+                    # BlockSpec index_map returns BLOCK indices (block i covers
+                    # rows [i*TILE:(i+1)*TILE]), so the map must be ``i`` — not
+                    # the element offset ``i*TILE`` which over-runs the grid
+                    # (tiles >=2 read out-of-bounds -> silently wrong / NaN).
+                    pl.BlockSpec((TILE,), lambda i: (i,)),
+                    pl.BlockSpec((TILE,), lambda i: (i,)),
+                    pl.BlockSpec((TILE, d_model), lambda i: (i, 0)),
+                    pl.BlockSpec((TILE, d_model), lambda i: (i, 0)),
+                    pl.BlockSpec((TILE, gru_hidden), lambda i: (i, 0)),
                 ],
                 out_specs=[
-                    pl.BlockSpec((TILE,), lambda i: (i * TILE,)),
-                    pl.BlockSpec((TILE, gru_hidden), lambda i: (i * TILE, 0)),
+                    pl.BlockSpec((TILE,), lambda i: (i,)),
+                    pl.BlockSpec((TILE, gru_hidden), lambda i: (i, 0)),
                 ],
             )(grad, sharpness, fwd_ctx, bwd_ctx, gru_state)
 
@@ -628,12 +639,18 @@ def _make_pallas_scan_kernel(tile_size: int):
                 ],
                 grid=(num_tiles,),
                 in_specs=[
-                    pl.BlockSpec((TILE, 2, 2), lambda i: (i * TILE, 0, 0)),
-                    pl.BlockSpec((TILE, 2), lambda i: (i * TILE, 0)),
+                    # BlockSpec index_map returns BLOCK indices, not element
+                    # offsets: block i covers rows [i*TILE : (i+1)*TILE]. Using
+                    # ``i * TILE`` here pointed past the array for grid step
+                    # i>=1 (only block 0 landed), leaving tiles 2..K reading/
+                    # writing out-of-bounds blocks — silently wrong (NaN in
+                    # interpret mode) for N > 2*TILE. Must be ``i``.
+                    pl.BlockSpec((TILE, 2, 2), lambda i: (i, 0, 0)),
+                    pl.BlockSpec((TILE, 2), lambda i: (i, 0)),
                 ],
                 out_specs=[
-                    pl.BlockSpec((TILE, 2, 2), lambda i: (i * TILE, 0, 0)),
-                    pl.BlockSpec((TILE, 2), lambda i: (i * TILE, 0)),
+                    pl.BlockSpec((TILE, 2, 2), lambda i: (i, 0, 0)),
+                    pl.BlockSpec((TILE, 2), lambda i: (i, 0)),
                 ],
             )(Ms, bs)
         except Exception:
@@ -795,8 +812,12 @@ def vmem_persistent_expert_mlp(
                 ],
                 grid=(num_blocks,),
                 in_specs=[
-                    pl.BlockSpec((TILE, d_model), lambda i: (i * TILE, 0)),
-                    pl.BlockSpec((TILE, top_k), lambda i: (i * TILE, 0)),
+                    # BlockSpec index_map returns BLOCK indices (block i covers
+                    # rows [i*TILE:(i+1)*TILE]), so the map must be ``i`` — not
+                    # the element offset ``i*TILE`` which over-runs the grid
+                    # (tiles >=2 read out-of-bounds -> silently wrong / NaN).
+                    pl.BlockSpec((TILE, d_model), lambda i: (i, 0)),
+                    pl.BlockSpec((TILE, top_k), lambda i: (i, 0)),
                     # Expert weight tables — full arrays, no tiling
                     pl.BlockSpec((num_experts, expert_hidden, d_model), lambda i: (0, 0, 0)),
                     pl.BlockSpec((num_experts, expert_hidden), lambda i: (0, 0)),
@@ -804,7 +825,7 @@ def vmem_persistent_expert_mlp(
                     pl.BlockSpec((num_experts, d_model), lambda i: (0, 0)),
                 ],
                 out_specs=[
-                    pl.BlockSpec((TILE, d_model), lambda i: (i * TILE, 0)),
+                    pl.BlockSpec((TILE, d_model), lambda i: (i, 0)),
                 ],
             )(x, expert_indices, expert_W1, expert_b1, expert_W2, expert_b2)
             return y
@@ -1068,14 +1089,15 @@ def _make_pallas_persistent_scan_fused_elem(tile_size: int):
                 ],
                 grid=(num_tiles,),
                 in_specs=[
-                    pl.BlockSpec((TILE, 2, 2), lambda i: (i * TILE, 0, 0)),
-                    pl.BlockSpec((TILE, 2), lambda i: (i * TILE, 0)),
-                    pl.BlockSpec((TILE, 2), lambda i: (i * TILE, 0)),
-                    pl.BlockSpec((TILE,), lambda i: (i * TILE,)),
-                    pl.BlockSpec((TILE,), lambda i: (i * TILE,)),
+                    # index_map returns BLOCK indices, so ``i`` (not ``i*TILE``).
+                    pl.BlockSpec((TILE, 2, 2), lambda i: (i, 0, 0)),
+                    pl.BlockSpec((TILE, 2), lambda i: (i, 0)),
+                    pl.BlockSpec((TILE, 2), lambda i: (i, 0)),
+                    pl.BlockSpec((TILE,), lambda i: (i,)),
+                    pl.BlockSpec((TILE,), lambda i: (i,)),
                 ],
                 out_specs=[
-                    pl.BlockSpec((TILE,), lambda i: (i * TILE,)),
+                    pl.BlockSpec((TILE,), lambda i: (i,)),
                     pl.BlockSpec((1, 2, 2), lambda i: (i, 0, 0)),
                     pl.BlockSpec((1, 2), lambda i: (i, 0)),
                 ],

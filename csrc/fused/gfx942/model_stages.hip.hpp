@@ -72,9 +72,13 @@ __device__ void model_forward_stage(const PersistentContext& ctx,
     for (int t = q.next_block(&task_slot); t < ctx.n_tasks;
          t = q.next_block(&task_slot)) {
         const int n = sizes[t], off = offsets[t];
+        // int64 base (#2): off+i can exceed 2^31 once the param blob crosses
+        // ~2 Gi elements; the global index is computed in 64-bit. Behavior-
+        // preserving (same element, wider index type).
+        const long long base64 = (long long)off;
         float acc = 0.0f;
         for (int i = threadIdx.x; i < n; i += blockDim.x) {
-            const float p = params[off + i];
+            const float p = params[base64 + i];
             acc += (M == ModelId::ViT) ? p : p * p;
         }
         // Block reduce (#2): DPP wavefront reduction replaces the former LDS
@@ -102,8 +106,9 @@ __device__ void model_forward_stage(const PersistentContext& ctx,
         blk = red[0];
         const float c = (n > 0) ? blk / (float)n : 0.0f;
         for (int i = threadIdx.x; i < n; i += blockDim.x) {
-            const float x = params[off + i] + input[off + i];
-            acts[off + i] = model_activation<M>(x, c);
+            const long long gi = base64 + i;
+            const float x = params[gi] + input[gi];
+            acts[gi] = model_activation<M>(x, c);
         }
         __builtin_amdgcn_s_barrier();
     }
@@ -120,10 +125,12 @@ __device__ void model_backward_stage(const PersistentContext& ctx,
     for (int t = q.next_block(&task_slot); t < ctx.n_tasks;
          t = q.next_block(&task_slot)) {
         const int n = sizes[t], off = offsets[t];
+        const long long base64 = (long long)off;   // #2 int64 global index base
         for (int i = threadIdx.x; i < n; i += blockDim.x) {
-            const float x = params[off + i];
-            const float upstream = acts[off + i];
-            grad[off + i] = upstream * model_activation_grad<M>(x);
+            const long long gi = base64 + i;
+            const float x = params[gi];
+            const float upstream = acts[gi];
+            grad[gi] = upstream * model_activation_grad<M>(x);
         }
     }
 }

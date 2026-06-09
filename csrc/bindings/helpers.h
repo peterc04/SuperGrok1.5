@@ -65,6 +65,62 @@ namespace gfx942 {}
 
 namespace sg {
 
+// ── Boundary validation for optimizer fused-step entrypoints ─────────
+// The Python wrappers historically owned device/dtype/shape/contiguity
+// invariants; these binding entrypoints trusted them. A non-contiguous param
+// view, a device/dtype mismatch between param and grad, or a shape mismatch
+// silently corrupts the in-place fused update (the launchers index a flat
+// pointer with the param's numel). Validate at the C++ boundary so a bad call
+// fails loudly. `where` is the entrypoint name for the error message.
+//
+// We check the param against its paired grad. Optimizer-state buffers (m, v,
+// ema, …) are allocated by the wrapper from `torch.zeros_like(param)` so they
+// inherit the param's device/dtype/shape/contiguity; the param check is the
+// load-bearing one. A missing/empty grad (sparse-grad fallback) is skipped —
+// the per-op loops already filter those out before dispatch.
+inline void check_param_grad(
+    const torch::Tensor& p,
+    const torch::Tensor& g,
+    const char* where
+) {
+    TORCH_CHECK(p.defined(), where, ": param tensor is undefined");
+#if defined(WITH_HIP)
+    TORCH_CHECK(p.is_hip(), where, ": param must be on a HIP device");
+#else
+    TORCH_CHECK(p.is_cuda(), where, ": param must be on a CUDA device");
+#endif
+    // A non-contiguous param view aliases a strided storage; the fused
+    // launchers treat data_ptr() as a dense [numel] buffer, so a strided view
+    // would read/write the wrong elements and silently corrupt the update.
+    TORCH_CHECK(p.is_contiguous(), where,
+                ": param must be contiguous (got a non-contiguous view); "
+                "call .contiguous() in the Python wrapper before the fused step");
+    if (!g.defined() || g.numel() == 0) return;  // sparse-grad: skip (filtered)
+    TORCH_CHECK(g.device() == p.device(), where,
+                ": grad device (", g.device().str(),
+                ") != param device (", p.device().str(), ")");
+    TORCH_CHECK(g.scalar_type() == p.scalar_type(), where,
+                ": grad dtype (", toString(g.scalar_type()),
+                ") != param dtype (", toString(p.scalar_type()), ")");
+    TORCH_CHECK(g.sizes() == p.sizes(), where,
+                ": grad shape (", g.sizes(), ") != param shape (",
+                p.sizes(), ")");
+    TORCH_CHECK(g.is_contiguous(), where, ": grad must be contiguous");
+}
+
+// Validate every (param, grad) pair in a multi-tensor fused-step entrypoint.
+inline void check_params_grads(
+    const std::vector<torch::Tensor>& params,
+    const std::vector<torch::Tensor>& grads,
+    const char* where
+) {
+    TORCH_CHECK(params.size() == grads.size(), where,
+                ": params.size() (", params.size(),
+                ") != grads.size() (", grads.size(), ")");
+    for (size_t i = 0; i < params.size(); ++i)
+        check_param_grad(params[i], grads[i], where);
+}
+
 // ── Device-side gradient clipping: single CPU sync instead of N ──────
 inline void clip_grad_norms_device_side(
     std::vector<torch::Tensor>& grads,

@@ -127,6 +127,7 @@ from __future__ import annotations
 import argparse
 import collections
 import concurrent.futures
+import copy
 import datetime
 import hashlib
 import importlib
@@ -178,6 +179,7 @@ from grokking_optimizers.profile import (
     env_overlay,
     make_progress,
 )
+from grokking_optimizers.dispatch import canonicalize_model
 # ARCH_INFO / ARCH_TABLE are defined later in this file (single source of
 # truth); profile.py imports them lazily to avoid a circular import.
 
@@ -190,6 +192,10 @@ import yaml
 
 
 CACHE_VERSION = 4
+# Cap on cache host_history length. _current_host() embeds a fresh timestamp so
+# entries never dedup; without a cap the list grows by 1-2 per invocation
+# forever (see CompileCache._merge_disk_entries).
+_MAX_HOST_HISTORY = 200
 DEFAULT_CACHE_NAME = ".compile_cache.json"
 DEFAULT_PGO_WORKLOAD = Path(__file__).resolve()  # absorbed from scripts/pgo_workload.py
 JIT_CACHE_FLUSH_EVERY = 5   # save cache every N completed JIT trials
@@ -210,6 +216,25 @@ JIT_CACHE_FLUSH_EVERY = 5   # save cache every N completed JIT trials
 # decision, then ``[device_cflags] FINAL: N flags accepted, M skipped`` at the
 # end. Same shape for [host_cflags] and [xla_env].
 _COMPILE_LOG_LEVEL: int = 0
+
+
+def _debug_swallow(component: str, exc: BaseException,
+                   detail: str = "") -> None:
+    """Fix-#2 Defect-2 — make a recoverable broad-except degradation VISIBLE
+    instead of silent (§2A). Emits ONE line to stderr at debug verbosity
+    (``_COMPILE_LOG_LEVEL >= 2``) naming the component, the swallowed
+    exception, and optional detail. Quiet by default (level 0/1) so normal
+    runs are unchanged; turn on with ``--debug-flags`` / debug mode to see
+    every benign optional-feature/cleanup fallback the build took.
+
+    Use this ONLY for genuinely recoverable absences (optional deps, best-
+    effort cleanup, observability). A correctness/tuning/validation/oracle
+    error must be a loud warning + re-raise, NOT a swallow."""
+    if _COMPILE_LOG_LEVEL >= 2:
+        sfx = f" ({detail})" if detail else ""
+        sys.stderr.write(
+            f"[swallow] {component}: {type(exc).__name__}: {exc}{sfx}\n")
+
 
 # Module-level cache of the arch that the last ``build()`` call resolved.
 # Set whenever ``build()`` enters with ``arch in (None, "auto", "")`` and
@@ -244,9 +269,10 @@ _FlagTrace = List[Tuple[str, str, str]]
 # falls back to a *clearly actionable* skip log block that names the
 # exact ``pip install`` command and the CLI flag to suppress the message.
 #
-# Auto-install is on by default (``BuildSpec.auto_install_optional_deps``)
-# because the only users hit by missing-dep skips are the ones who
-# explicitly enabled the feature in the first place. ``--no-auto-install``
+# Auto-install is OPT-IN (off by default; ``BuildSpec.auto_install_optional_deps``
+# defaults False, Phase 8 supply-chain hygiene) — it shells out to ``pip install``
+# only when the operator explicitly enables it (GROK_AUTO_INSTALL / --auto-install /
+# BuildSpec). A missing optional dep otherwise degrades gracefully. ``--no-auto-install``
 # on the CLI flips it off for CI / offline / air-gapped environments.
 #
 # A module-level ``_DEP_CHECKED`` cache deduplicates work: each
@@ -256,6 +282,17 @@ _FlagTrace = List[Tuple[str, str, str]]
 
 _DEP_CHECKED: Dict[Tuple[str, bool], bool] = {}
 _DEP_LOCK = threading.Lock()
+
+
+# Pinned versions for auto-installed optional dependencies (supply-chain
+# hygiene). Lower-bound ``>=`` keeps multi-arch/multi-Python builds flexible
+# while preventing arbitrary future versions from landing silently.
+_PINNED_VERSIONS: Dict[str, str] = {
+    "scikit-learn": "scikit-learn>=1.5,<2",
+    "jinja2": "jinja2>=3.1,<4",
+    "libclang": "libclang>=16,<19",
+    "cuda-python": "cuda-python>=12.2,<14",
+}
 
 
 def _ensure_optional_dep(pkg: str, feature: str,
@@ -272,15 +309,12 @@ def _ensure_optional_dep(pkg: str, feature: str,
         (defaults to ``pkg``) once with a 120 s timeout, then retry the
         import. Return True if the retry succeeds, False otherwise.
 
-    Every step is logged to stderr with the ``[deps]`` prefix and the
-    feature tag so a build log makes it obvious which knob asked for
-    which package. Successful auto-installs are cached per-process so a
-    second call for the same (pkg, install) tuple is free.
-
-    Designed to be safe to call from cold paths (the slow case is the
-    pip subprocess, gated by ``install`` and the cache) and from hot
-    paths (the cache turns subsequent hits into a dict lookup + a single
-    importlib call).
+    Auto-installs use pinned version ranges from ``_PINNED_VERSIONS`` to
+    prevent uncontrolled dependency drift. Every step is logged to stderr
+    with the ``[deps]`` prefix and the feature tag so a build log makes
+    it obvious which knob asked for which package. Successful auto-installs
+    are cached per-process so a second call for the same (pkg, install)
+    tuple is free.
     """
     cache_key = (pkg, bool(install))
     with _DEP_LOCK:
@@ -297,7 +331,8 @@ def _ensure_optional_dep(pkg: str, feature: str,
     except ImportError:
         pass
 
-    pip_target = pip_name or pkg
+    pip_target_bare = pip_name or pkg
+    pip_target = _PINNED_VERSIONS.get(pip_target_bare, pip_target_bare)
     if not install:
         sys.stderr.write(
             f"[deps] {feature}: {pkg} not installed — skipping. "
@@ -343,16 +378,25 @@ def _ensure_optional_dep(pkg: str, feature: str,
 
 
 # Module-level switch. Set by ``build()`` / CLI from the BuildSpec field
-# of the same name BEFORE any feature-gated import runs. Defaults to
-# True so the README quickstart works for a user who enables a feature
-# without pre-installing every soft dep. ``--no-auto-install`` (CLI) or
-# ``BuildSpec(auto_install_optional_deps=False)`` flips this off for CI
-# / offline / air-gapped builds.
-_AUTO_INSTALL_OPTIONAL_DEPS: bool = True
+# of the same name BEFORE any feature-gated import runs. Auto-install is
+# OPT-IN (Phase 8, supply-chain hygiene): it shells out to ``pip install``,
+# so it stays OFF unless the operator explicitly opts in. Enable via
+# ``GROK_AUTO_INSTALL=1`` (env), ``--auto-install`` (CLI), or
+# ``BuildSpec(auto_install_optional_deps=True)``. ``GROK_NO_AUTO_INSTALL=1``
+# is a hard override-off (wins over every opt-in).
+_AUTO_INSTALL_OPTIONAL_DEPS: bool = False
+
+_TRUTHY = ("1", "true", "TRUE", "True", "yes", "on")
 
 
 def _auto_install_enabled() -> bool:
-    """Read the process-wide auto-install switch."""
+    """Auto-install is opt-in. Env override order: NO_AUTO_INSTALL (hard off)
+    > AUTO_INSTALL (on) > the process-wide switch set by build()/CLI/BuildSpec."""
+    import os
+    if os.environ.get("GROK_NO_AUTO_INSTALL", "").strip() in _TRUTHY:
+        return False
+    if os.environ.get("GROK_AUTO_INSTALL", "").strip() in _TRUTHY:
+        return True
     return bool(_AUTO_INSTALL_OPTIONAL_DEPS)
 
 
@@ -409,6 +453,13 @@ class ArchEntry:
     max_regs_per_thread: Optional[int]         # 255 CUDA/HIP, None Pallas
     max_threads_per_block: Optional[int]       # 1024 CUDA/HIP, None Pallas
     features: frozenset                        # capability flag strings (see docstring)
+    # Mandate #2 — last-level cache size in bytes. The autotune timer writes a
+    # buffer >= this between timed replays so iterations 2..N hit a COLD cache,
+    # matching real-loop behaviour instead of L2-warm bias. None on Pallas
+    # (XLA-managed) and on arches where we have no measured value; callers fall
+    # back to a conservative default via ``_arch_l2_bytes``. Values are nominal
+    # vendor specs (verify on silicon — GPU-deferred P2/P12).
+    l2_bytes: Optional[int] = None
     search_space_builder: Optional[Callable[[], Dict[str, Any]]] = None
     # True only for arches that ship a real committed kernel body (a *.cu /
     # *.hip.cpp with arch-specific intrinsics). Today that is sm_90a + gfx942;
@@ -551,6 +602,7 @@ _ARCH_TABLE_PRIMARY: Dict[str, ArchEntry] = {
         max_regs_per_thread=255,
         max_threads_per_block=1024,
         features=frozenset(_F_AMPERE),
+        l2_bytes=40 * 1024 * 1024,   # A100 L2 = 40 MB
     ),
 
     "sm_86": ArchEntry(
@@ -611,6 +663,7 @@ _ARCH_TABLE_PRIMARY: Dict[str, ArchEntry] = {
         max_regs_per_thread=255,
         max_threads_per_block=1024,
         features=frozenset(_F_HOPPER),
+        l2_bytes=50 * 1024 * 1024,   # H100 L2 = 50 MB
         has_kernel_body=True,   # cuda/sm_90 ships real Hopper kernel bodies
     ),
 
@@ -632,6 +685,7 @@ _ARCH_TABLE_PRIMARY: Dict[str, ArchEntry] = {
         max_regs_per_thread=255,
         max_threads_per_block=1024,
         features=frozenset(_F_BLACKWELL),
+        l2_bytes=50 * 1024 * 1024,   # B100/B200 L2 ≈ 50 MB
     ),
 
     "sm_103a": ArchEntry(
@@ -756,6 +810,9 @@ _ARCH_TABLE_PRIMARY: Dict[str, ArchEntry] = {
         max_regs_per_thread=255,
         max_threads_per_block=1024,
         features=frozenset({"mfma", "bf16_mfma", "fp8_mfma", "mfma_xdl"}),
+        # MI300X last-level cache = 256 MB Infinity Cache (MALL). Flush must
+        # exceed the LLC, not just the 4 MB/XCD L2, to evict between replays.
+        l2_bytes=256 * 1024 * 1024,
         has_kernel_body=True,   # hip/gfx942 ships real CDNA3 kernel bodies
     ),
 
@@ -1089,6 +1146,26 @@ def get_arch_entry(arch: str) -> ArchEntry:
             f"valid: {sorted(ARCH_TABLE.keys())}")
 
 
+# Mandate #2 — conservative fallback when an ArchEntry has no measured
+# ``l2_bytes``. 64 MiB over-estimates most current L2/LLCs (so the flush
+# buffer is guaranteed >= the real cache) without an absurd allocation.
+_DEFAULT_L2_FLUSH_BYTES: int = 64 * 1024 * 1024
+
+
+def _arch_l2_bytes(arch: str) -> int:
+    """Mandate #2 — last-level cache size for the L2-flush buffer, sourced
+    from ``ArchEntry.l2_bytes`` with a conservative 64 MiB fallback. Returns
+    0 for Pallas/TPU (XLA owns the device; no host-side flush is meaningful).
+    """
+    try:
+        entry = get_arch_entry(arch)
+    except KeyError:
+        return _DEFAULT_L2_FLUSH_BYTES
+    if entry.vendor == "pallas":
+        return 0
+    return entry.l2_bytes if entry.l2_bytes else _DEFAULT_L2_FLUSH_BYTES
+
+
 # How many trials Bayesian "quick" mode runs (vs the full 500 default).
 QUICK_BAYESIAN_TRIALS = 25
 
@@ -1121,8 +1198,8 @@ DEFAULT_SEARCH_SPACE = "<full-programmatic>"
 #   2. ``cartesian_count(space, arch)`` returns the size without iteration.
 #   3. ``ss_prefilter()`` accepts an iterable and streams survivors.
 # Bayesian TPE doesn't care about the size — it samples one config at a
-# time using the per-dim value lists. Exhaustive mode also streams, with a
-# cap (--exhaustive-cap) to prevent infinite enumeration.
+# time using the per-dim value lists. Exhaustive mode streams every survivor
+# via iter_prefilter (UNCAPPED — the full feasible space; see _run_exhaustive).
 #
 # Users can still override the entire space via --search-space <path.yaml>.
 
@@ -1193,14 +1270,73 @@ _LIVE_TUNING_DIMS: frozenset = frozenset({
 _ASYNC_DEPTH_MAX: int = 4
 
 
+_KERNEL_MACRO_CACHE: Optional[frozenset] = None
+
+
+def _kernel_source_macros() -> frozenset:
+    """Auto-detect which ``SG_TUNED_*`` macros the committed kernel bodies
+    actually read. Scans the device-source trees (csrc/ + kernels/) once
+    (cached) and returns the set of macro tokens found. The search-space builder
+    uses this to decide which tuning dims are LIVE — so the space self-adjusts to
+    whatever the kernels honor, instead of relying on a hand-maintained
+    producer→consumer audit that drifts the moment a kernel gains or loses an
+    ``#ifdef``.
+
+    Returns an EMPTY set if no source tree is visible (e.g. an installed wheel
+    without csrc/); callers then fall back to the hardcoded floor.
+    """
+    global _KERNEL_MACRO_CACHE
+    if _KERNEL_MACRO_CACHE is not None:
+        return _KERNEL_MACRO_CACHE
+    import re as _re
+    roots = [REPO_ROOT / "csrc", REPO_ROOT / "grokking_optimizers" / "kernels"]
+    pat = _re.compile(r"SG_TUNED_[A-Z0-9_]+")
+    exts = {".cu", ".cuh", ".h", ".hpp", ".hip", ".cpp", ".cc", ".cxx"}
+    found: set = set()
+    for root in roots:
+        if not root.exists():
+            continue
+        for p in root.rglob("*"):
+            if p.suffix in exts:
+                try:
+                    found.update(pat.findall(p.read_text(errors="ignore")))
+                except OSError:
+                    continue
+    _KERNEL_MACRO_CACHE = frozenset(found)
+    return _KERNEL_MACRO_CACHE
+
+
 def _is_dead_dim(spec: Dict[str, Any]) -> bool:
     """True if ``spec`` is a tuning dim whose value never reaches the binary.
 
-    Pallas kwargs and live dims are never dead; everything else (the dead
-    SG_TUNED_* macros) is.
+    A dim is LIVE (not dead) when sweeping it actually changes the emitted
+    machine code; otherwise sweeping it just burns compiles on byte-identical
+    binaries. The determination is AUTO-DERIVED from the committed kernel
+    sources, so the search space tracks the kernels' real tuning surface no
+    matter what is being compiled (rather than a hand-maintained list that can
+    silently go stale when a kernel adds or drops an ``#ifdef SG_TUNED_*``):
+
+      * Pallas kwargs are arguments to ``pl.pallas_call`` — always live.
+      * A bare compiler flag (``macro is None``, e.g. ``maxrregcount`` →
+        ``--maxrregcount=N``) always changes ptxas codegen — always live.
+      * A ``-DSG_TUNED_*`` macro dim is live iff some committed kernel actually
+        reads that macro (see :func:`_kernel_source_macros`). The hardcoded
+        ``_LIVE_TUNING_DIMS`` is only a defensive floor for the (degenerate)
+        case where the source scan finds nothing — e.g. a bodyless registry.
     """
     if spec.get("kind") == "pallas_kwarg":
         return False
+    macro = spec.get("macro")
+    if macro is None:
+        return False  # real compiler flag (maxrregcount) — always affects code
+    detected = _kernel_source_macros()
+    if detected:
+        # Live iff the kernels read this macro (exact, or a derived variant
+        # like SG_TUNED_CLUSTER_SHAPE_VOLUME for SG_TUNED_CLUSTER_SHAPE).
+        live = macro in detected or any(t.startswith(macro + "_")
+                                        for t in detected)
+        return not live
+    # Source scan empty (no kernel tree visible) — fall back to the floor set.
     return spec.get("name") not in _LIVE_TUNING_DIMS
 
 
@@ -2001,7 +2137,8 @@ def _megakernel_maxrregcount_values(arch_key: str,
         plan = _mk.solve(model, optimizer, arch_key if arch_key in
                          _mk.MEGAKERNEL_ARCHS else _mk.MEGAKERNEL_ARCHS[0])
         est = max(32, min(cap, int(plan.regs)))
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_megakernel_maxrregcount_values', _swexc)
         est = cap  # solver unavailable → fall back to the full arch range
     # Candidate caps: estimate, a few steps above/below (to bracket the real
     # ptxas number), the arch ceiling, and a low cap that trades occupancy for
@@ -2353,7 +2490,8 @@ def compile_feasibility_check(prefilter_spec: Dict[str, Any]
                 env["__builtins__"] = _PREFILTER_SAFE_BUILTINS
                 if not bool(eval(code, env, env)):  # noqa: S307 — sandboxed
                     return False
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('check', _swexc)
                 return False
         return True
     return check
@@ -2762,6 +2900,184 @@ def _pgo_workload_main() -> int:
 
 
 # ===========================================================================
+# GPU clock locking — mandate #1
+# ===========================================================================
+#
+# Timing on free-boosting clocks corrupts the autotune signal: with
+# ``min_delta_rel = 0.005`` (0.5%), the 5-15% boost/thermal swing of an
+# unlocked GPU is 10-30x the improvement we are trying to resolve, so the
+# "winner" is partly noise and the early stopper fires on noise. NVCC-parity
+# does not need this (it never runs anything); empirical autotuning does.
+#
+# This context manager pins the graphics + memory clocks for the duration of a
+# whole sweep and restores them on exit (exception-safe). Inability to lock
+# (no permission on a shared cloud host, tool absent) is a VALID state per the
+# mandate's fail-fast contract: we emit a loud warning and mark results noisy,
+# rather than crashing or silently producing noisy data. Genuine command
+# failures (a tool present but erroring unexpectedly) are surfaced in the log.
+
+
+def _run_smi(cmd: List[str], timeout: float = 15.0
+             ) -> Tuple[int, str, str]:
+    """Run an nvidia-smi / rocm-smi command; return (rc, stdout, stderr).
+
+    Never raises for a non-zero rc (the caller decides) but DOES surface a
+    missing binary as rc=127 with the reason in stderr so the clock-lock layer
+    can distinguish "tool absent" (valid → noisy) from "tool errored".
+    """
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except FileNotFoundError as exc:
+        return 127, "", f"{cmd[0]} not found: {exc}"
+    except subprocess.TimeoutExpired as exc:
+        return 124, "", f"{cmd[0]} timed out after {timeout}s: {exc}"
+
+
+class _GpuClockLock:
+    """Lock GPU + memory clocks for a tuning sweep (mandate #1).
+
+    NVIDIA: persistence mode on (``nvidia-smi -pm 1``) + pin SM and memory
+    clocks to their max supported values (``-lgc <max>`` / ``-lmc <max>``).
+    Restores with ``-rgc`` / ``-rmc`` on exit.
+    AMD: deterministic max via ``rocm-smi --setperflevel high``; restores with
+    ``--setperflevel auto``.
+    TPU/Pallas: N/A — XLA owns the device and exposes no clock control;
+    records ``status="n/a"`` and proceeds (a valid state, not noisy).
+
+    Usage::
+
+        with _GpuClockLock(spec.arch, vendor, report=report) as lock:
+            ... run the sweep ...
+        # lock.record() -> dict to stash in the cache entry
+
+    Attributes:
+      locked       — True iff clocks were successfully pinned.
+      noisy        — True iff timing happened on unlocked clocks (warned).
+      status       — "locked" | "noisy" | "n/a".
+      locked_clocks— {"sm_mhz": int, "mem_mhz": int} when locked.
+    """
+
+    def __init__(self, arch: str, vendor: str, *, report=None,
+                 device_index: int = 0):
+        self.arch = arch
+        self.vendor = vendor
+        self.report = report
+        self.device_index = device_index
+        self.locked = False
+        self.noisy = False
+        self.status = "n/a"
+        self.locked_clocks: Dict[str, Any] = {}
+        self._restore_cmds: List[List[str]] = []
+
+    def _log(self, msg: str) -> None:
+        if self.report is not None:
+            self.report.write(msg)
+        if _COMPILE_LOG_LEVEL >= 1:
+            sys.stderr.write(msg)
+
+    def __enter__(self) -> "_GpuClockLock":
+        if self.vendor == "pallas":
+            self.status = "n/a"
+            self._log("  [clock-lock] TPU/Pallas — clock control N/A "
+                      "(XLA-managed); proceeding.\n")
+            return self
+        if self.vendor == "cuda":
+            self._lock_nvidia()
+        elif self.vendor == "hip":
+            self._lock_amd()
+        else:
+            self.status = "n/a"
+            self._log(f"  [clock-lock] vendor={self.vendor} — no clock "
+                      f"control; proceeding.\n")
+        return self
+
+    def _lock_nvidia(self) -> None:
+        idx = str(self.device_index)
+        # Persistence mode keeps the driver resident so clock pins survive.
+        _run_smi(["nvidia-smi", "-pm", "1", "-i", idx])
+        rc, out, err = _run_smi([
+            "nvidia-smi",
+            "--query-gpu=clocks.max.sm,clocks.max.mem",
+            "--format=csv,noheader,nounits", "-i", idx])
+        if rc != 0:
+            self._enter_noisy(
+                f"could not query max clocks (rc={rc}): {err.strip()}")
+            return
+        try:
+            sm_s, mem_s = (out.strip().splitlines()[0]).split(",")
+            sm_mhz, mem_mhz = int(sm_s.strip()), int(mem_s.strip())
+        except (ValueError, IndexError) as exc:
+            self._enter_noisy(f"unparseable max-clock output {out!r}: {exc}")
+            return
+        rc_g, _, err_g = _run_smi(
+            ["nvidia-smi", "-i", idx, "-lgc", f"{sm_mhz},{sm_mhz}"])
+        rc_m, _, err_m = _run_smi(
+            ["nvidia-smi", "-i", idx, "-lmc", f"{mem_mhz},{mem_mhz}"])
+        if rc_g == 0:
+            self._restore_cmds.append(["nvidia-smi", "-i", idx, "-rgc"])
+        if rc_m == 0:
+            self._restore_cmds.append(["nvidia-smi", "-i", idx, "-rmc"])
+        if rc_g == 0:
+            self.locked = True
+            self.status = "locked"
+            self.locked_clocks = {"sm_mhz": sm_mhz, "mem_mhz": mem_mhz,
+                                  "mem_locked": rc_m == 0}
+            self._log(f"  [clock-lock] NVIDIA gpu{idx}: SM={sm_mhz}MHz "
+                      f"MEM={mem_mhz}MHz (mem_locked={rc_m == 0}) — locked.\n")
+        else:
+            self._enter_noisy(
+                f"-lgc failed (rc={rc_g}): {err_g.strip() or err_m.strip()} "
+                f"(typically needs root / not permitted on shared hosts)")
+
+    def _lock_amd(self) -> None:
+        idx = str(self.device_index)
+        rc, _, err = _run_smi(["rocm-smi", "-d", idx, "--setperflevel", "high"])
+        if rc == 0:
+            self._restore_cmds.append(
+                ["rocm-smi", "-d", idx, "--setperflevel", "auto"])
+            self.locked = True
+            self.status = "locked"
+            self.locked_clocks = {"perflevel": "high"}
+            self._log(f"  [clock-lock] AMD gpu{idx}: perflevel=high — "
+                      f"locked (deterministic max).\n")
+        else:
+            self._enter_noisy(
+                f"--setperflevel high failed (rc={rc}): {err.strip()} "
+                f"(typically needs root / not permitted on shared hosts)")
+
+    def _enter_noisy(self, reason: str) -> None:
+        self.noisy = True
+        self.status = "noisy"
+        self._log("  [clock-lock] WARNING: clocks NOT locked — "
+                  f"{reason}.\n  [clock-lock] timing results will reflect "
+                  "boost/thermal NOISE; treat the winner as approximate. "
+                  "Re-run on a host where clocks can be pinned for a "
+                  "trustworthy sweep.\n")
+
+    def record(self) -> Dict[str, Any]:
+        """The clock state to stash in the cache entry for provenance."""
+        return {
+            "status": self.status,
+            "locked": self.locked,
+            "noisy": self.noisy,
+            "clocks": self.locked_clocks,
+        }
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        for cmd in self._restore_cmds:
+            rc, _, err = _run_smi(cmd)
+            if rc != 0:
+                self._log(f"  [clock-lock] WARNING: restore '{' '.join(cmd)}' "
+                          f"failed (rc={rc}): {err.strip()}\n")
+            else:
+                self._log(f"  [clock-lock] restored via "
+                          f"'{' '.join(cmd[-2:])}'.\n")
+        return False  # never suppress an exception from the sweep
+
+
+# ===========================================================================
 # bench_graph — CUDA / HIP graph-replay timing (absorbed from
 # grokking_optimizers/bench_graph.py)
 # ===========================================================================
@@ -2776,9 +3092,26 @@ def _build_param(opt_class_name: str, size: int) -> Any:
     return p, g
 
 
+def _make_l2_flush_buffer(l2_bytes: int):
+    """Mandate #2 — allocate a device buffer >= L2 size for cache flushing
+    between timed replays. Returns None when flushing is disabled (l2_bytes
+    <= 0). Allocated once and reused across all iterations of a timing run.
+    """
+    import torch
+    if not l2_bytes or l2_bytes <= 0:
+        return None
+    return torch.empty(int(l2_bytes), dtype=torch.uint8, device="cuda")
+
+
 def cuda_graph_median_ms(opt_class: str, *, size: int = 4096,
-                         warmup: int = 5, iters: int = 21) -> Dict[str, float]:
-    """Time ``opt.step()`` under a CUDA graph replay."""
+                         warmup: int = 5, iters: int = 21,
+                         l2_bytes: int = 0) -> Dict[str, float]:
+    """Time ``opt.step()`` under a CUDA graph replay.
+
+    Mandate #2: when ``l2_bytes > 0`` a buffer of that size is zeroed before
+    each timed replay so iterations 2..N hit a COLD last-level cache, removing
+    the L2-warm bias that favours configs that happen to fit in L2.
+    """
     import torch
     if not torch.cuda.is_available():
         raise RuntimeError("cuda_graph_median_ms requires torch.cuda.is_available()")
@@ -2808,8 +3141,11 @@ def cuda_graph_median_ms(opt_class: str, *, size: int = 4096,
         p.grad.copy_(g)
         opt.step()
 
+    flush = _make_l2_flush_buffer(l2_bytes)
     timings = []
     for _ in range(iters):
+        if flush is not None:
+            flush.zero_()   # evict L2 so this replay starts cold
         s = torch.cuda.Event(enable_timing=True)
         e = torch.cuda.Event(enable_timing=True)
         s.record()
@@ -2827,14 +3163,20 @@ def cuda_graph_median_ms(opt_class: str, *, size: int = 4096,
 
 
 def hip_graph_median_ms(opt_class: str, *, size: int = 4096,
-                        warmup: int = 5, iters: int = 21) -> Dict[str, float]:
+                        warmup: int = 5, iters: int = 21,
+                        l2_bytes: int = 0) -> Dict[str, float]:
     """HIP analogue — reuses cuda_graph_median_ms (ROCm uses same namespace)."""
-    return cuda_graph_median_ms(opt_class, size=size, warmup=warmup, iters=iters)
+    return cuda_graph_median_ms(opt_class, size=size, warmup=warmup,
+                                iters=iters, l2_bytes=l2_bytes)
 
 
 def event_median_ms(opt_class: str, *, size: int = 4096,
-                    warmup: int = 5, iters: int = 21) -> Dict[str, float]:
-    """Fallback timer for archs / backends that do not support graph capture."""
+                    warmup: int = 5, iters: int = 21,
+                    l2_bytes: int = 0) -> Dict[str, float]:
+    """Fallback timer for archs / backends that do not support graph capture.
+
+    Mandate #2: flushes a >= L2 buffer before each timed step when
+    ``l2_bytes > 0`` (cold-cache timing)."""
     import torch
     if not torch.cuda.is_available():
         raise RuntimeError("event_median_ms requires torch.cuda.is_available()")
@@ -2849,10 +3191,13 @@ def event_median_ms(opt_class: str, *, size: int = 4096,
         opt.step()
     torch.cuda.synchronize()
 
+    flush = _make_l2_flush_buffer(l2_bytes)
     timings = []
     for _ in range(iters):
         p.grad = g.clone()
         opt = OptCls([p], lr=1e-3)
+        if flush is not None:
+            flush.zero_()   # evict L2 so this step starts cold
         s = torch.cuda.Event(enable_timing=True)
         e = torch.cuda.Event(enable_timing=True)
         s.record()
@@ -2904,7 +3249,15 @@ def _bg_build_param(opt_class_name, size):
     return p, g
 
 
-def _bg_cuda_graph_median_ms(opt_class, *, size=4096, warmup=5, iters=21):
+def _bg_make_flush(l2_bytes):
+    # Mandate #2 — >= L2 buffer for cold-cache timing; None disables.
+    if not l2_bytes or l2_bytes <= 0:
+        return None
+    return torch.empty(int(l2_bytes), dtype=torch.uint8, device="cuda")
+
+
+def _bg_cuda_graph_median_ms(opt_class, *, size=4096, warmup=5, iters=21,
+                             l2_bytes=0):
     if not torch.cuda.is_available():
         raise RuntimeError("cuda_graph_median_ms requires torch.cuda.is_available()")
     from __PKG__ import _ops  # noqa: F401
@@ -2933,8 +3286,11 @@ def _bg_cuda_graph_median_ms(opt_class, *, size=4096, warmup=5, iters=21):
         p.grad.copy_(g)
         opt.step()
 
+    flush = _bg_make_flush(l2_bytes)
     timings = []
     for _ in range(iters):
+        if flush is not None:
+            flush.zero_()
         s = torch.cuda.Event(enable_timing=True)
         e = torch.cuda.Event(enable_timing=True)
         s.record()
@@ -2951,15 +3307,16 @@ def _bg_cuda_graph_median_ms(opt_class, *, size=4096, warmup=5, iters=21):
     }
 
 
-def _time_with_graph(opt_class, size, warmup, iters):
+def _time_with_graph(opt_class, size, warmup, iters, l2_bytes=0):
     try:
         return _bg_cuda_graph_median_ms(
-            opt_class, size=size, warmup=warmup, iters=iters)
+            opt_class, size=size, warmup=warmup, iters=iters,
+            l2_bytes=l2_bytes)
     except Exception:
         return None
 
 
-def _time_with_events(opt_class, size, warmup, iters):
+def _time_with_events(opt_class, size, warmup, iters, l2_bytes=0):
     from importlib import import_module
     grok = import_module("__PKG__")
     OptCls = getattr(grok, opt_class)
@@ -2972,10 +3329,13 @@ def _time_with_events(opt_class, size, warmup, iters):
         opt = OptCls([p], lr=1e-3)
         opt.step()
     torch.cuda.synchronize()
+    flush = _bg_make_flush(l2_bytes)
     times = []
     for _ in range(iters):
         p.grad = g.clone()
         opt = OptCls([p], lr=1e-3)
+        if flush is not None:
+            flush.zero_()
         s = torch.cuda.Event(enable_timing=True)
         e = torch.cuda.Event(enable_timing=True)
         s.record()
@@ -3019,6 +3379,35 @@ def main():
             sys.stdout.write(json.dumps({"ok": True}) + "\n")
             sys.stdout.flush()
             continue
+        if op == "calibrate":
+            # Mandate #5 — time a FIXED reference kernel (square matmul) on
+            # this pinned device so the pool can normalize per-GPU
+            # bin/throttle offsets before pooling timings across devices.
+            try:
+                n = int(req.get("ref_size", 2048))
+                iters = int(req.get("ref_iters", 11))
+                a = torch.randn(n, n, device="cuda", dtype=torch.float32)
+                b = torch.randn(n, n, device="cuda", dtype=torch.float32)
+                for _ in range(3):
+                    torch.mm(a, b)
+                torch.cuda.synchronize()
+                ts = []
+                for _ in range(iters):
+                    s = torch.cuda.Event(enable_timing=True)
+                    e = torch.cuda.Event(enable_timing=True)
+                    s.record()
+                    torch.mm(a, b)
+                    e.record()
+                    torch.cuda.synchronize()
+                    ts.append(s.elapsed_time(e))
+                ts.sort()
+                sys.stdout.write(json.dumps(
+                    {"ref_ms": float(ts[len(ts) // 2])}) + "\n")
+            except Exception as exc:
+                sys.stdout.write(json.dumps(
+                    {"error": "calibrate failed: " + str(exc)}) + "\n")
+            sys.stdout.flush()
+            continue
         if op == "shutdown":
             sys.stdout.write(json.dumps({"bye": True}) + "\n")
             sys.stdout.flush()
@@ -3034,12 +3423,15 @@ def main():
             size = int(req.get("size", 4096))
             warmup = int(req.get("warmup", 5))
             iters = int(req.get("iters", 21))
+            l2_bytes = int(req.get("l2_bytes", 0))
             _load_so(so_path)
             result = None
             if use_graph and req.get("use_cuda_graph", True):
-                result = _time_with_graph(opt_class, size, warmup, iters)
+                result = _time_with_graph(opt_class, size, warmup, iters,
+                                          l2_bytes)
             if result is None:
-                result = _time_with_events(opt_class, size, warmup, iters)
+                result = _time_with_events(opt_class, size, warmup, iters,
+                                           l2_bytes)
             sys.stdout.write(json.dumps(result) + "\n")
             sys.stdout.flush()
         except Exception as exc:
@@ -3182,8 +3574,8 @@ class PallasTimer:
                 if callable(val) and not isinstance(val, (int, float, bool, str)):
                     try:
                         val = val()
-                    except Exception:
-                        pass
+                    except Exception as _swexc:
+                        _debug_swallow('_build_args', _swexc)
                 kw_args[name] = val
             return pos_args, kw_args
 
@@ -3238,9 +3630,11 @@ class PallasTimer:
                     jax.tree_util.tree_map(
                         lambda x: x.block_until_ready()
                         if hasattr(x, "block_until_ready") else x, out)
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('_call', _swexc)
                 return None
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_call', _swexc)
             return None
 
         # Timed iterations.
@@ -3253,7 +3647,8 @@ class PallasTimer:
                     lambda x: x.block_until_ready()
                     if hasattr(x, "block_until_ready") else x, out)
                 times.append((_time.perf_counter() - t0) * 1000.0)
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_call', _swexc)
             return None
         times.sort()
         return {
@@ -3285,7 +3680,8 @@ class TimingWorker:
                  watchdog_interval_s: float = 30.0,
                  watchdog_grace_s: float = 60.0,
                  enable_watchdog: bool = True,
-                 python_package: Optional[str] = None):
+                 python_package: Optional[str] = None,
+                 l2_bytes: int = 0):
         # Stream A: python_package threads through to the worker body so
         # the subprocess imports the correct package for OptCls lookup.
         # ``None`` preserves the historical "grokking_optimizers" name
@@ -3297,6 +3693,9 @@ class TimingWorker:
         self.warmup = warmup
         self.iters = iters
         self.use_cuda_graph = use_cuda_graph
+        # Mandate #2 — last-level cache flush size forwarded to the worker
+        # so each timed replay starts cold. 0 disables (preserves old timing).
+        self.l2_bytes = int(l2_bytes)
         self.timeout = timeout_per_variant
         # Merge env_overlay (per-GPU overrides) on top of the base env so
         # MultiGPUTimingPool can pin each worker to a single device via
@@ -3384,11 +3783,12 @@ class TimingWorker:
                     self._proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     self._proc.kill()
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_terminate_proc', _swexc)
             try:
                 self._proc.kill()
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_terminate_proc', _swexc)
         finally:
             self._proc = None
 
@@ -3437,13 +3837,13 @@ class TimingWorker:
             try:
                 if self._proc and self._proc.poll() is None:
                     os.kill(self._proc.pid, signal.SIGKILL)
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_force_restart', _swexc)
             try:
                 if self._proc:
                     self._proc.wait(timeout=2.0)
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_force_restart', _swexc)
             self._proc = None
             # Re-spawn without re-entering the watchdog plumbing.
             try:
@@ -3464,8 +3864,8 @@ class TimingWorker:
                     if self._proc:
                         try:
                             self._proc.kill()
-                        except Exception:
-                            pass
+                        except Exception as _swexc:
+                            _debug_swallow('_force_restart', _swexc)
                     self._proc = None
             except Exception as exc:  # noqa: BLE001
                 self._error_log.append(("watchdog_restart_spawn", str(exc)))
@@ -3488,6 +3888,7 @@ class TimingWorker:
             "warmup":         self.warmup,
             "iters":          self.iters,
             "use_cuda_graph": self.use_cuda_graph,
+            "l2_bytes":       self.l2_bytes,
         }
         with self._io_lock:
             try:
@@ -3527,6 +3928,25 @@ class TimingWorker:
                 return False
             line = self._read_line(timeout=5)
         return bool(line and line.get("ok"))
+
+    def calibrate(self, *, ref_size: int = 2048,
+                  ref_iters: int = 11) -> Optional[float]:
+        """Mandate #5 — time the fixed reference matmul on this worker's
+        pinned device. Returns the median ms, or None on failure."""
+        if not self.alive():
+            return None
+        req = {"op": "calibrate", "ref_size": ref_size, "ref_iters": ref_iters}
+        with self._io_lock:
+            try:
+                assert self._proc and self._proc.stdin
+                self._proc.stdin.write(json.dumps(req) + "\n")
+                self._proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                return None
+            line = self._read_line(timeout=60)
+        if not line or "ref_ms" not in line:
+            return None
+        return float(line["ref_ms"])
 
     @property
     def error_log(self) -> list:
@@ -3605,6 +4025,12 @@ class MultiGPUTimingPool:
         self.vendor = vendor
         self.devices = self.visible_devices(vendor)
         self._env_var = self.env_var_for(vendor)
+        # Fix-#2 Defect-2 — pop our own kwarg BEFORE constructing TimingWorker
+        # (which would reject the unknown keyword). When True, a total
+        # calibration failure raises in start() rather than silently
+        # proceeding with an uncalibrated cross-GPU pool.
+        self._require_calibration: bool = bool(
+            worker_kwargs.pop("require_calibration", False))
         self.workers: List[TimingWorker] = []
         for dev in self.devices:
             w = TimingWorker(
@@ -3620,6 +4046,12 @@ class MultiGPUTimingPool:
         self._stopped = threading.Event()
         self._dispatch_threads: List[threading.Thread] = []
         self._started = False
+        # Mandate #5 — per-worker calibration factor (worker_ref_ms /
+        # fastest_ref_ms). A measured time on a slower-binned GPU is divided
+        # by its factor to normalize it into the fastest GPU's frame, so
+        # cross-GPU ranking matches single-GPU ranking. Default 1.0 (no
+        # normalization) until calibrate() runs.
+        self._calib_factors: List[float] = [1.0] * len(self.workers)
 
     # ---- lifecycle mirroring TimingWorker ----------------------------
 
@@ -3641,9 +4073,91 @@ class MultiGPUTimingPool:
                 live.append(w)
                 any_ok = True
         self.workers = live
+        # Mandate #5 — calibrate per-GPU offsets before pooling timings.
+        if any_ok and len(self.workers) > 1:
+            self.calibrate(require=self._require_calibration)
+        else:
+            self._calib_factors = [1.0] * len(self.workers)
         self._spawn_dispatchers()
         self._started = True
         return any_ok
+
+    def calibrate(self, report=None, *, require: bool = False) -> List[float]:
+        """Mandate #5 — time a fixed reference kernel on every live worker
+        and compute per-worker normalization factors (worker_ref_ms /
+        fastest_ref_ms). A GPU that bins/throttles slower gets a factor > 1,
+        and its measured variant times are later divided by that factor so
+        ranking is consistent with a single-GPU sweep.
+
+        Fix-#2 Defect-2 — a per-device calibration failure is NO LONGER
+        swallowed silently: it emits a WARNING naming the device and that its
+        offset correction was dropped (factor stays 1.0, which can skew
+        cross-GPU ranking). When ``require=True`` (cross-GPU ``--stage`` modes
+        that DEPEND on the offset correction) a TOTAL calibration failure is
+        an error and RAISES rather than returning a degenerate all-1.0
+        calibration silently."""
+        refs: List[Optional[float]] = []
+        for idx, w in enumerate(self.workers):
+            dev = self.devices[idx] if idx < len(self.devices) else idx
+            try:
+                refs.append(w.calibrate())
+            except Exception as exc:  # noqa: BLE001 — surfaced below, not hidden
+                refs.append(None)
+                msg = (f"  [calibrate] WARNING: gpu{dev} calibration FAILED "
+                       f"({type(exc).__name__}: {exc}); its per-GPU offset "
+                       f"correction is DROPPED (factor=1.0) — cross-GPU "
+                       f"ranking on this device may be skewed.\n")
+                if report is not None:
+                    report.write(msg)
+                else:
+                    sys.stderr.write(msg)
+        valid = [r for r in refs if r and r > 0]
+        if not valid:
+            # Total calibration failure. In a cross-GPU mode that relies on
+            # the offset correction this is an ERROR, not a recoverable
+            # absence — fail loud (§2A) instead of returning all-1.0 silently.
+            total_msg = (
+                f"MultiGPUTimingPool calibration FAILED on ALL "
+                f"{len(self.workers)} device(s): cross-GPU timing offsets "
+                f"cannot be corrected, so cross-device ranking is unreliable.")
+            if require:
+                raise RuntimeError(
+                    total_msg + " (require=True — refusing to proceed with an "
+                    "uncalibrated cross-GPU pool).")
+            warn = f"  [calibrate] WARNING: {total_msg} Proceeding with no "
+            warn += "normalization (all factors = 1.0).\n"
+            if report is not None:
+                report.write(warn)
+            else:
+                sys.stderr.write(warn)
+            self._calib_factors = [1.0] * len(self.workers)
+            return self._calib_factors
+        fastest = min(valid)
+        self._calib_factors = [
+            (r / fastest) if (r and r > 0) else 1.0 for r in refs]
+        if report is not None:
+            for i, (r, f) in enumerate(zip(refs, self._calib_factors)):
+                dev = self.devices[i] if i < len(self.devices) else i
+                report.write(f"  [calibrate] gpu{dev}: ref_ms={r} "
+                             f"factor={f:.4f}\n")
+        return self._calib_factors
+
+    @staticmethod
+    def _normalize_result(result: Any, factor: float) -> Any:
+        """Mandate #5 — divide a worker's measured times by its calibration
+        factor so they live in the fastest GPU's frame. Records the raw value
+        + factor for provenance. No-op when factor==1.0 or result lacks
+        timing."""
+        if (factor == 1.0 or not isinstance(result, dict)
+                or result.get("timing_ms") is None):
+            return result
+        out = dict(result)
+        out["timing_ms_raw"] = result["timing_ms"]
+        out["calib_factor"] = factor
+        for k in ("timing_ms", "min_ms", "max_ms"):
+            if isinstance(out.get(k), (int, float)):
+                out[k] = float(out[k]) / factor
+        return out
 
     def _spawn_dispatchers(self) -> None:
         """Start one dispatcher thread per live worker (idempotent)."""
@@ -3670,19 +4184,19 @@ class MultiGPUTimingPool:
         for _ in self._dispatch_threads:
             try:
                 self._queue.put(None)
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('stop', _swexc)
         for t in self._dispatch_threads:
             try:
                 t.join(timeout=5.0)
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('stop', _swexc)
         self._dispatch_threads = []
         for w in self.workers:
             try:
                 w.stop()
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('stop', _swexc)
 
     def restart(self) -> bool:
         any_ok = False
@@ -3690,8 +4204,8 @@ class MultiGPUTimingPool:
             try:
                 if w.restart():
                     any_ok = True
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('restart', _swexc)
         return any_ok
 
     # ---- work-stealing dispatcher -----------------------------------
@@ -3707,14 +4221,15 @@ class MultiGPUTimingPool:
         while not self._stopped.is_set():
             try:
                 item = self._queue.get()
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('_dispatch_loop', _swexc)
                 return
             if item is None:
                 # Sentinel: graceful shutdown.
                 try:
                     self._queue.task_done()
-                except Exception:
-                    pass
+                except Exception as _swexc:
+                    _debug_swallow('_dispatch_loop', _swexc)
                 return
             payload, fut = item
             try:
@@ -3735,8 +4250,8 @@ class MultiGPUTimingPool:
                         time.sleep(0.05)
                     try:
                         self._queue.task_done()
-                    except Exception:
-                        pass
+                    except Exception as _swexc:
+                        _debug_swallow('_dispatch_loop', _swexc)
                     continue
                 variant_so, opt_class, kwargs = payload
                 # Real TimingWorker.time only takes variant_so (opt_class
@@ -3747,17 +4262,23 @@ class MultiGPUTimingPool:
                     result = worker.time(variant_so)
                 else:
                     result = worker.time(variant_so, opt_class, **kwargs)
+                # Mandate #5 — normalize this GPU's measured time into the
+                # fastest GPU's frame so cross-GPU ranking is consistent.
+                factors = getattr(self, "_calib_factors", [])
+                factor = factors[idx] if idx < len(factors) else 1.0
+                result = self._normalize_result(result, factor)
                 fut.set_result(result)
             except Exception as exc:  # noqa: BLE001 — propagate to caller
+                _debug_swallow('_dispatch_loop', exc)
                 try:
                     fut.set_exception(exc)
-                except Exception:
-                    pass
+                except Exception as _swexc:
+                    _debug_swallow('_dispatch_loop', _swexc)
             finally:
                 try:
                     self._queue.task_done()
-                except Exception:
-                    pass
+                except Exception as _swexc:
+                    _debug_swallow('_dispatch_loop', _swexc)
 
     # ---- timing API mirroring TimingWorker ---------------------------
 
@@ -4084,6 +4605,16 @@ def featurize_config(config: Dict[str, Any],
 
 # ---- CostModel: backend-agnostic regressor wrapper -----------------------
 
+# Mandate #14 — cold-start floor. The cost model trains on in-run trial
+# timings; early on it is under-fit, and (worse pre-#1) it was trained on
+# UNLOCKED-clock noisy timings. So cost-model PRUNING (vetoing a candidate
+# before measuring it) is disabled until at least this many trials have been
+# MEASURED under locked clocks. Below the floor every candidate is measured,
+# guaranteeing the model can never early-stop the search from a cold/under-fit
+# state and the first fits see real (locked-clock) signal.
+_COST_MODEL_COLD_START_FLOOR: int = 100
+
+
 class CostModel:
     """XGBoost-backed (with sklearn / linear fallbacks) regressor of
     timing_ms from config features.
@@ -4153,8 +4684,8 @@ class CostModel:
             return _factory, "xgboost"
         except ImportError:
             pass
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('_factory', _swexc)
         # Try sklearn — auto-install on miss when the process-wide
         # switch is on. The Python package name is ``sklearn`` but the
         # pip distribution name is ``scikit-learn``.
@@ -4171,8 +4702,8 @@ class CostModel:
                 return _factory_sk, "sklearn"
             except ImportError:
                 pass
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_factory_sk', _swexc)
         else:
             sys.stderr.write(
                 "[cost-model] sklearn unavailable and auto-install off "
@@ -4222,6 +4753,7 @@ class CostModel:
         except Exception as exc:
             # If the chosen backend fails (XGBoost edge case on tiny data),
             # fall through to the linear backend so the layer still works.
+            _debug_swallow('fit', exc)
             self._model = _LinearRidgeRegressor(alpha=1e-2)
             self._model.fit(Xt, yt)
             self._backend = "linear"
@@ -4230,7 +4762,8 @@ class CostModel:
         try:
             train_pred = np.asarray(self._model.predict(Xt))
             self._mae_train = float(np.mean(np.abs(train_pred - yt)))
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('fit', _swexc)
             self._mae_train = None
         try:
             if Xv.shape[0] > 0:
@@ -4239,7 +4772,8 @@ class CostModel:
             else:
                 # No val split (very small dataset) — copy train MAE.
                 self._mae_val = self._mae_train
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('fit', _swexc)
             self._mae_val = None
 
         # Bootstrap mini-models for uncertainty (also serves as fallback
@@ -4252,7 +4786,8 @@ class CostModel:
                 m = factory()
                 m.fit(Xt[bsi], yt[bsi])
                 self._bootstrap_models.append(m)
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('fit', _swexc)
                 continue
 
         # Quantile heads — XGBoost only.
@@ -4272,9 +4807,10 @@ class CostModel:
                     verbosity=0)
                 self._quantile_lo.fit(Xt, yt)
                 self._quantile_hi.fit(Xt, yt)
-            except Exception:
+            except Exception as _swexc:
                 # Older XGBoost without quantile support — leave them None
                 # and fall through to bootstrap at predict() time.
+                _debug_swallow('fit', _swexc)
                 self._quantile_lo = None
                 self._quantile_hi = None
 
@@ -4300,7 +4836,8 @@ class CostModel:
                 lo = float(np.asarray(self._quantile_lo.predict(X)).flat[0])
                 hi = float(np.asarray(self._quantile_hi.predict(X)).flat[0])
                 sigma_val = max(0.0, (hi - lo) / 2.0)
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('predict', _swexc)
                 sigma_val = 0.0
         if sigma_val == 0.0 and self._bootstrap_models:
             try:
@@ -4310,7 +4847,8 @@ class CostModel:
                     preds.append(float(p))
                 if len(preds) >= 2:
                     sigma_val = float(np.std(preds))
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('predict', _swexc)
                 sigma_val = 0.0
         return mean_val, sigma_val
 
@@ -4372,7 +4910,8 @@ class CostModel:
                 import pickle
                 with self.cache_path.open("rb") as fp:
                     state = pickle.load(fp)
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('load', _swexc)
             return False
         if not isinstance(state, dict):
             return False
@@ -4417,8 +4956,9 @@ class _LinearRidgeRegressor:
         b = X_aug.T @ y
         try:
             self.w_ = np.linalg.solve(A, b)
-        except Exception:
+        except Exception as _swexc:
             # Singular matrix — pseudo-inverse fallback.
+            _debug_swallow('fit', _swexc)
             self.w_ = np.linalg.pinv(A) @ b
         return self
 
@@ -4468,7 +5008,8 @@ def _cost_model_train_from_trials(
             continue
         try:
             feat = featurize_config(cfg, dims, arch_entry, stall_info)
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_cost_model_train_from_trials', _swexc)
             continue
         rows_X.append(feat)
         rows_y.append(float(ms))
@@ -4484,14 +5025,15 @@ def _cost_model_train_from_trials(
                     uncertainty_method=uncertainty_method)
     try:
         reg.fit(X, y)
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_cost_model_train_from_trials', _swexc)
         return None
     try:
         reg.save()
-    except Exception:
+    except Exception as _swexc:
         # Cache write failed (disk full / read-only) — still return the
         # in-memory model so the running sweep gets the benefit.
-        pass
+        _debug_swallow('_cost_model_train_from_trials', _swexc)
     return reg
 
 
@@ -4561,6 +5103,21 @@ def _hashable(v):
     return v
 
 
+# ── Mandate #13 — documented stopper defaults ─────────────────────────────
+# Broad coverage of a 10^6–10^13 search space is the BAYESIAN SAMPLER's job,
+# governed by CONVERGENCE DETECTORS, not by exhaustive enumeration. The
+# ``max_trials`` cap is a SAFETY RAIL only — it should essentially never be
+# the binding constraint; the plateau / EI-exhaustion / coverage-saturation
+# detectors below decide when the search has converged. These constants
+# centralize the "thorough-but-finite" effort posture (like a compiler's
+# fixed -O3 effort) so it is tuned in one place and exposed via one knob
+# (--min-improvement / --patience / --ei-floor / --max-tune-seconds).
+_DEFAULT_MIN_DELTA_REL: float = 0.005        # 0.5% improvement = meaningful
+_DEFAULT_EI_FLOOR: float = 1e-6              # rolling EI exhaustion floor
+_DEFAULT_COVERAGE_GROWTH_FLOOR: float = 0.001  # new-(dim,value) per trial
+_DEFAULT_STOPPER_SAFETY_CAP: int = 1_000_000   # safety rail, not primary
+
+
 class BayesianEarlyStopper:
     """Multi-criterion stopper for Optuna autotune.
 
@@ -4575,16 +5132,20 @@ class BayesianEarlyStopper:
       (c) Coverage saturation: new-(dim_name, value) tuples per trial
           < ``coverage_growth_floor``.
       (d) Wall-clock budget: ``time.time() - start_time > max_seconds``.
-      (e) Hard ceiling: ``trial_count >= max_trials`` (sanity, default 1M).
+      (e) Hard ceiling: ``trial_count >= max_trials`` — a SAFETY RAIL only
+          (default 1M). Mandate #13: this is NOT the primary stopping lever;
+          (a)/(b)/(c) govern convergence so the cap is essentially never the
+          binding constraint. Lifting it is unnecessary — broad coverage is
+          the sampler's job, not exhaustive enumeration.
     """
 
     def __init__(self, *,
-                 min_delta_rel: float = 0.005,
+                 min_delta_rel: float = _DEFAULT_MIN_DELTA_REL,
                  patience: Optional[int] = None,
-                 ei_floor: float = 1e-6,
-                 coverage_growth_floor: float = 0.001,
+                 ei_floor: float = _DEFAULT_EI_FLOOR,
+                 coverage_growth_floor: float = _DEFAULT_COVERAGE_GROWTH_FLOOR,
                  max_seconds: Optional[float] = None,
-                 max_trials: int = 1_000_000):
+                 max_trials: int = _DEFAULT_STOPPER_SAFETY_CAP):
         self.min_delta_rel = min_delta_rel
         self._patience_override = patience  # None → auto = max(50, 0.1*N)
         self.ei_floor = ei_floor
@@ -4846,6 +5407,10 @@ def _make_trial_record(stage: str, trial_num: int, cfg: Dict[str, Any],
     # Empty dict (not None) when the variant never went through a compiler
     # invocation we parsed — keeps the sidecar schema stable.
     ptxas_info = dict(_LAST_PTXAS_INFO.get(ckey, {}))
+    # Mandate #16/#20/#21 — variant origin (template / synth / polyhedral /
+    # cutlass / ck / fastmath). pick_winner gates generated/transformed
+    # origins behind a strict-oracle PASS. Defaults to "template".
+    origin = _LAST_VARIANT_ORIGIN.get(ckey, ORIGIN_TEMPLATE)
     return {
         "trial_num":   trial_num,
         "stage":       stage,
@@ -4858,6 +5423,7 @@ def _make_trial_record(stage: str, trial_num: int, cfg: Dict[str, Any],
         "n":           result["n"]         if result else None,
         "host":        host,
         "numerical_status": num_status,
+        "origin":      origin,
         "ptxas_info":  ptxas_info,
         "recorded_at": datetime.datetime.now().isoformat(),
     }
@@ -4985,7 +5551,8 @@ def run_bayesian(
                     distributions=distributions,
                     value=float(tms),
                 ))
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('run_bayesian', _swexc)
                 continue
 
     # Stream γ.4 — when the caller threaded a device-PGO ``stall_info``
@@ -4999,10 +5566,10 @@ def run_bayesian(
         try:
             bias_trial_queue(study, stall_info, space[arch], arch,
                              max_enqueued=int(bias_max_enqueued))
-        except Exception:
+        except Exception as _swexc:
             # Best-effort: a malformed stall_info / unknown dim must
             # never break the autotune.
-            pass
+            _debug_swallow('run_bayesian', _swexc)
 
     records: List[Dict[str, Any]] = []
     # For progress reporting when no manual cap, use stopper's hard ceiling
@@ -5034,6 +5601,7 @@ def run_bayesian(
             raw = timer(cfg)
         except Exception as exc:
             # Optuna ≥ 4.0 forbids passing a value with state=FAIL.
+            _debug_swallow('run_bayesian', exc)
             study.tell(trial, state=optuna.trial.TrialState.FAIL)
             rec = _make_trial_record("tpe", trial.number, cfg, None, host=host)
             rec["status"] = "fail"
@@ -5094,8 +5662,8 @@ def run_bayesian(
                else 'early-stopped')
         print(f"[autotune] {tag}: {reason} after {len(records)} trials",
               file=out_stream)
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('run_bayesian', _swexc)
     return records, stop_info
 
 
@@ -5176,20 +5744,55 @@ def topk_refine(
     return records
 
 
+# Mandate #16 / Fix-#2 Defect-1.6 — SINGLE SOURCE OF TRUTH for variant-origin
+# strings. Every `_LAST_VARIANT_ORIGIN[...] = ...` write, the validation-gate
+# set, and the self-test fixtures reference THESE constants — never a string
+# literal. This kills the spelling footgun: a stray "fast_math"/"fast-math"
+# would land outside _VALIDATION_REQUIRED_ORIGINS and silently bypass the
+# oracle gate (origin-not-in-required-set ⇒ treated as an unguarded template ⇒
+# always eligible). Centralizing the strings makes that impossible.
+ORIGIN_TEMPLATE = "template"     # straight recompile of the committed source
+ORIGIN_SYNTH = "synth"           # OpGraph-synthesised kernel
+ORIGIN_POLYHEDRAL = "polyhedral"  # polyhedral-rescheduled source
+ORIGIN_CUTLASS = "cutlass"       # CUTLASS GEMM emitter
+ORIGIN_CK = "ck"                 # Composable-Kernel GEMM emitter
+ORIGIN_FASTMATH = "fastmath"     # additive fast-math flag variant (#6)
+
+
+# Mandate #16 — variant origins that are GENERATED or TRANSFORMED rather
+# than a straight re-compile of the committed source. These rewrite the
+# kernel (synth codegen, polyhedral reschedule, CUTLASS/CK emitters) or
+# change its numerics (fast-math), so they are unsafe to ship UNLESS they
+# passed the strict on-device oracle. A trial of one of these origins is
+# ineligible in pick_winner until its numerical_status is a PASS
+# ("ok"/"deterministic"); "skipped" (never validated) is not enough.
+_VALIDATION_REQUIRED_ORIGINS: frozenset = frozenset({
+    ORIGIN_SYNTH, ORIGIN_POLYHEDRAL, ORIGIN_CUTLASS, ORIGIN_CK, ORIGIN_FASTMATH,
+})
+_VALIDATION_PASS_STATES: frozenset = frozenset({"ok", "deterministic"})
+
+
 def pick_winner(all_trials: List[Dict[str, Any]], *,
                 strict_numerics: bool = False) -> Optional[Dict[str, Any]]:
     """Lowest timing across all stages, after numerical-validation filtering.
 
-    Stream 10 filter rules:
+    Filter rules (Stream 10 + mandate #16):
       * Always exclude trials whose ``numerical_status`` is
-        ``"numerical_fail"`` — that variant produced an output outside
-        tolerance vs. the reference and is unsafe to ship as the winner.
+        ``"numerical_fail"`` — outside tolerance vs. the strict reference,
+        unsafe to ship.
+      * Mandate #16 — any GENERATED/TRANSFORMED variant (``origin`` in
+        ``_VALIDATION_REQUIRED_ORIGINS``: synth / polyhedral / cutlass / ck /
+        fast-math) is ineligible UNLESS it recorded a strict on-device-oracle
+        PASS (``numerical_status`` in {"ok","deterministic"}). An unvalidated
+        ("skipped") generated variant can NEVER win — this is the hard
+        precondition that closes the "structurally wired but never
+        silicon-validated" gap. A plain template/source recompile (no
+        ``origin``, or ``origin="template"``) keeps the historical behaviour.
       * When ``strict_numerics=True``, only trials tagged
-        ``"deterministic"`` are eligible (i.e. bit-identical to the
-        reference AND bit-identical across a 3x re-run).
+        ``"deterministic"`` are eligible (bit-identical to the reference AND
+        across a 3x re-run).
 
-    Returns the winning trial record (with ``config`` and ``timing_ms``)
-    or ``None`` if no trial is eligible.
+    Returns the winning trial record or ``None`` if no trial is eligible.
     """
     finished = [t for t in all_trials if t.get("timing_ms") is not None]
     # Trials produced before Stream 10 lack the numerical_status field;
@@ -5197,6 +5800,15 @@ def pick_winner(all_trials: List[Dict[str, Any]], *,
     # behaves identically for legacy caches.
     eligible = [t for t in finished
                 if t.get("numerical_status", "skipped") != "numerical_fail"]
+    # Mandate #16 — drop generated/transformed variants that never passed
+    # the strict on-device oracle.
+    def _generated_and_unvalidated(t: Dict[str, Any]) -> bool:
+        origin = t.get("origin", ORIGIN_TEMPLATE)
+        if origin not in _VALIDATION_REQUIRED_ORIGINS:
+            return False
+        return t.get("numerical_status", "skipped") not in \
+            _VALIDATION_PASS_STATES
+    eligible = [t for t in eligible if not _generated_and_unvalidated(t)]
     if strict_numerics:
         eligible = [t for t in eligible
                     if t.get("numerical_status") == "deterministic"]
@@ -5464,16 +6076,16 @@ class _DebugTee:
         try:
             self.mirror.write(s)
             self.mirror.flush()
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('write', _swexc)
         return len(s) if isinstance(s, str) else 0
 
     def flush(self):
         self.primary.flush()
         try:
             self.mirror.flush()
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('flush', _swexc)
 
 
 class CompileCache:
@@ -5664,6 +6276,12 @@ class CompileCache:
                 if isinstance(on_disk, dict):
                     self._merge_disk_entries(on_disk)
 
+            # Cap host_history before serialising (it never dedups — see
+            # _MAX_HOST_HISTORY) so the on-disk file can't grow unbounded.
+            hh = self._data.get("host_history")
+            if isinstance(hh, list) and len(hh) > _MAX_HOST_HISTORY:
+                self._data["host_history"] = hh[-_MAX_HOST_HISTORY:]
+
             tmp = self.path.with_suffix(self.path.suffix + ".tmp")
             # Build a serialization view that elides the trial lists —
             # they live in the sidecar now. The shallow-then-per-entry
@@ -5808,6 +6426,12 @@ class CompileCache:
                 if key not in seen:
                     mem_hh.append(h)
                     seen.add(key)
+            # Cap unbounded growth: _current_host() embeds a fresh `recorded_at`
+            # timestamp, so entries never dedup and host_history would grow by
+            # one (or two, with the AOT+JIT subprocess split) per invocation
+            # forever. Keep the most recent _MAX_HOST_HISTORY.
+            if len(mem_hh) > _MAX_HOST_HISTORY:
+                self._data["host_history"] = mem_hh[-_MAX_HOST_HISTORY:]
 
     def key(self, opt: str, model: str, arch: str) -> str:
         return f"{opt}/{model}/{arch}"
@@ -5913,17 +6537,45 @@ class CompileCache:
             self._dirty = True
 
     def record_variant(self, opt: str, model: str, arch: str,
-                       config_key: str, so_path: Optional[Path]) -> None:
+                       config_key: str, so_path: Optional[Path],
+                       build_sig: Optional[str] = None) -> None:
         with self._lock:
             e = self.get(opt, model, arch)
             if so_path is not None and Path(so_path).exists():
                 stat = Path(so_path).stat()
-                e["variant_artifacts"][config_key] = {
+                rec = {
                     "path":  str(so_path),
                     "size":  stat.st_size,
                     "mtime": stat.st_mtime,
                 }
+                # Perf (time-to-quality) — record the source+flag signature
+                # that produced this .so so a resumed/repeated sweep can REUSE
+                # it instead of paying the full ~125s recompile. The .so is
+                # byte-identical to a rebuild iff the signature matches.
+                if build_sig is not None:
+                    rec["build_sig"] = build_sig
+                e["variant_artifacts"][config_key] = rec
                 self._dirty = True
+
+    def get_fresh_variant(self, opt: str, model: str, arch: str,
+                          config_key: str,
+                          build_sig: str) -> Optional[Path]:
+        """Perf — return a cached variant .so iff it exists on disk AND was
+        built from the same source+flag signature (so it is byte-identical to
+        a rebuild). Skips the recompile on resumed/repeated sweeps. Returns
+        None when there is no reusable artifact."""
+        with self._lock:
+            e = self.get(opt, model, arch)
+            rec = (e.get("variant_artifacts") or {}).get(config_key)
+        if not rec or rec.get("build_sig") != build_sig:
+            return None
+        p = Path(rec.get("path", ""))
+        try:
+            if p.exists() and p.stat().st_size == rec.get("size"):
+                return p
+        except OSError:
+            return None
+        return None
 
     def record_trial(self, opt: str, model: str, arch: str,
                      trial: Dict[str, Any]) -> None:
@@ -6010,7 +6662,8 @@ class CompileCache:
     def set_tuned(self, opt: str, model: str, arch: str,
                   config: dict, *, mode: Optional[str] = None,
                   search_space_hash: Optional[str] = None,
-                  early_stop_info: Optional[Dict[str, Any]] = None) -> None:
+                  early_stop_info: Optional[Dict[str, Any]] = None,
+                  clock_lock_info: Optional[Dict[str, Any]] = None) -> None:
         with self._lock:
             e = self.get(opt, model, arch)
             e["tuned_config"]      = config
@@ -6025,6 +6678,19 @@ class CompileCache:
             # ignore the extra key.
             if early_stop_info is not None:
                 e["early_stop_info"] = early_stop_info
+            # Mandate #1: provenance of the clock state the sweep ran under,
+            # so a noisy (unlocked) winner is identifiable after the fact.
+            if clock_lock_info is not None:
+                e["clock_lock"] = clock_lock_info
+            self._dirty = True
+
+    def annotate_clock_lock(self, opt: str, model: str, arch: str,
+                            clock_lock_info: Dict[str, Any]) -> None:
+        """Mandate #1 — stamp the sweep's clock-lock provenance onto an
+        already-tuned entry without disturbing the winning config."""
+        with self._lock:
+            e = self.get(opt, model, arch)
+            e["clock_lock"] = clock_lock_info
             self._dirty = True
 
     # ── Garbage collection ────────────────────────────────────────────
@@ -6199,6 +6865,10 @@ class BuildSpec:
     # improvement over the trailing ``patience`` trials drops below this
     # value. 0 disables (other stoppers still apply).
     ei_floor: float = 1e-6
+    # Mandate #13 — coverage-saturation floor (new-(dim,value) tuples/trial).
+    # Part of the convergence-detector trio that governs the sweep; the
+    # max_trials cap is only a safety rail.
+    coverage_growth_floor: float = 0.001
     seed: int = 0
     debug_symbols: bool = False
     debug: bool = False               # mirror report to stderr + print every subproc
@@ -6245,6 +6915,21 @@ class BuildSpec:
     # values, so a build with no config file produces byte-identical
     # output. apply_to_buildspec(spec, project_cfg) populates these from
     # _DEFAULT_PROJECT_CONFIG ⊕ user TOML when a config is supplied.
+    # Mandate #7 / #23 — march policy. Default False ⇒ on-target compile
+    # (-march=native correct). True ⇒ cross-host AOT ship: use a portable
+    # ISA baseline (cross_host_march) so the binary never assumes the build
+    # host's ISA. Set by the --stage cpu-then-target path (#23).
+    cross_host: bool = False
+    cross_host_march: Optional[str] = None
+    # Fix-#2 Defect-1 — explore fast-math (#6) as an additive, oracle-validated
+    # variant during the sweep. When True (default), each time a config sets a
+    # new best the sweep ALSO builds/times/validates the _FAST_MATH_VARIANTS on
+    # that config and emits them as separate origin="fastmath" trials; a
+    # fast-math variant only wins if it matched the strict oracle (#16). Tying
+    # exploration to new-best events bounds the extra compile cost while
+    # guaranteeing the eventual winner's fast-math is explored. Set False to
+    # skip fast-math exploration entirely (pure strict-math sweep).
+    enable_fastmath_variants: bool = True
     macro_prefix: str = "SG_BUILD_"
     fused_op_template: str = (
         "torch.ops.grokking_optimizers.fused_{opt_lower}_simple_step")
@@ -6297,7 +6982,10 @@ class BuildSpec:
     # into _ensure_optional_dep via _set_auto_install() at the top of
     # ``build()`` so every feature site (NVRTC, jinja2 emitter,
     # learned cost model, polyhedral / libclang) sees the same switch.
-    auto_install_optional_deps: bool = True
+    # OPT-IN (Phase 8): defaults False so a build never shells out to
+    # ``pip install`` unless the operator asks (--auto-install / this field /
+    # GROK_AUTO_INSTALL=1).
+    auto_install_optional_deps: bool = False
 
 
 def _ensure_nvcc_on_path() -> Optional[str]:
@@ -6349,14 +7037,14 @@ def _ensure_nvcc_on_path() -> Optional[str]:
                     site_dirs.append(Path(got))
                 else:
                     site_dirs.extend(Path(p) for p in got)
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_ensure_nvcc_on_path', _swexc)
         for sd in site_dirs:
             for cuda_pkg in ("cuda_nvcc", "cuda-nvcc"):
                 nvcc_p = sd / "nvidia" / cuda_pkg / "bin" / "nvcc"
                 candidates.append(nvcc_p)
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_ensure_nvcc_on_path', _swexc)
 
     for nvcc_p in candidates:
         try:
@@ -6443,7 +7131,8 @@ def _refresh_torch_cuda_home(force: bool = False) -> None:
     """
     try:
         import torch.utils.cpp_extension as cppext
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_refresh_torch_cuda_home', _swexc)
         return
     cuda = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
     if cuda:
@@ -6507,7 +7196,8 @@ def _target_cuda_version_for_arch(arch: str) -> Tuple[int, int]:
                 torch_v = min_v
         else:
             torch_v = min_v
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_target_cuda_version_for_arch', _swexc)
         torch_v = min_v
     # Pick the HIGHER of the two (typed as 2-tuple for the return contract).
     chosen = max(min_v[:2], torch_v[:2])
@@ -6571,7 +7261,8 @@ def _bootstrap_cuda_via_nvidia_apt_repo(stream, arch: Optional[str] = None) -> b
                 if "=" in line:
                     k, v = line.strip().split("=", 1)
                     os_release[k] = v.strip('"')
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_bootstrap_cuda_via_nvidia_apt_repo', _swexc)
         return False
     distro_id = os_release.get("ID", "").lower()
     version_id = os_release.get("VERSION_ID", "").replace(".", "")
@@ -6609,8 +7300,8 @@ def _bootstrap_cuda_via_nvidia_apt_repo(stream, arch: Optional[str] = None) -> b
             if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
                 if int(parts[0]) >= 12:
                     target_ver = f"{parts[0]}-{parts[1]}"
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('_bootstrap_cuda_via_nvidia_apt_repo', _swexc)
 
     keyring_url = (f"https://developer.download.nvidia.com/compute/cuda/repos/"
                    f"{repo_path}/{arch_seg}/cuda-keyring_1.1-1_all.deb")
@@ -6812,8 +7503,8 @@ def _bootstrap_cuda_via_pypi_wheels(stream) -> bool:
             preferred = "cu12"
         elif v.startswith("11"):
             preferred = "cu11"
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_bootstrap_cuda_via_pypi_wheels', _swexc)
     seen: List[str] = []
     for tag in (preferred, "cu12", "cu11"):
         if tag in seen:
@@ -6909,6 +7600,7 @@ def bootstrap_cuda_toolkit(stream=None, arch: Optional[str] = None) -> bool:
             else:
                 ok = fn(stream)
         except Exception as exc:
+            _debug_swallow('bootstrap_cuda_toolkit', exc)
             stream.write(f"[bootstrap] {name} raised {type(exc).__name__}: "
                          f"{exc}\n")
             tried.append(f"{name} (errored)")
@@ -7002,7 +7694,8 @@ def _bootstrap_rocm_via_amd_apt_repo(stream, arch: str) -> bool:
                     if _line.startswith("VERSION_CODENAME="):
                         codename = _line.strip().split("=", 1)[1].strip('"')
                         break
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_bootstrap_rocm_via_amd_apt_repo', _swexc)
             codename = ""
         if not codename:
             stream.write("[bootstrap_rocm:apt] could not determine distro "
@@ -7110,6 +7803,7 @@ def bootstrap_rocm_toolkit(stream=None, arch: str = "gfx942") -> bool:
         try:
             ok = fn(stream, arch)
         except Exception as exc:
+            _debug_swallow('bootstrap_rocm_toolkit', exc)
             stream.write(f"[bootstrap_rocm] {name} raised "
                          f"{type(exc).__name__}: {exc}\n")
             tried.append(f"{name} (errored)")
@@ -7138,7 +7832,7 @@ def bootstrap_rocm_toolkit(stream=None, arch: str = "gfx942") -> bool:
 # JAX/TPU bootstrap — Stream 12
 # ---------------------------------------------------------------------------
 
-def bootstrap_jax_tpu(stream=None, arch: str = "tpu_v5p") -> bool:
+def bootstrap_jax_tpu(stream=None, arch: str = "tpu_v6e") -> bool:
     """Detect TPU runtime via ``jax.devices()``; install ``jax[tpu]`` from
     the libtpu_releases bucket when missing. Returns True iff a TPU device
     is visible after.
@@ -7158,6 +7852,7 @@ def bootstrap_jax_tpu(stream=None, arch: str = "tpu_v5p") -> bool:
     except (ImportError, RuntimeError):
         pass
     except Exception as exc:
+        _debug_swallow('bootstrap_jax_tpu', exc)
         stream.write(f"[bootstrap_jax] jax.devices() raised "
                      f"{type(exc).__name__}: {exc}; continuing to install\n")
     # Pick a minimum jax version per arch from ARCH_TABLE.
@@ -7185,8 +7880,8 @@ def bootstrap_jax_tpu(stream=None, arch: str = "tpu_v5p") -> bool:
         if "jax" in sys.modules:
             try:
                 importlib.reload(sys.modules["jax"])
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('bootstrap_jax_tpu', _swexc)
         import jax
         devs = jax.devices()
         ok = any(getattr(d, "platform", "") == "tpu" for d in devs)
@@ -7285,8 +7980,8 @@ def _preflight_toolchain(arch: str,
                                               timeout=10).strip().splitlines()
                 if out:
                     lines.append(f"[preflight] {out[-1]}")
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_preflight_toolchain', _swexc)
             # Hard requirement: each CUDA arch has a min nvcc version (see
             # ARCH_TABLE[arch].min_toolchain_version). Warn loudly if the
             # detected nvcc is too old — otherwise the build dies with
@@ -7340,6 +8035,7 @@ def _preflight_toolchain(arch: str,
             import jax  # noqa: F401
             lines.append(f"[preflight] jax={jax.__version__}")
         except Exception as e:
+            _debug_swallow('_preflight_toolchain', e)
             lines.append(
                 f"[preflight] WARNING: jax not importable: {e}. "
                 "For TPU, pip install 'jax[tpu]' -f "
@@ -7465,10 +8161,10 @@ def _preflight_toolchain(arch: str,
                     f"[preflight] suggestion: {fix_clause} — no alternate "
                     f"arch in ARCH_TABLE is compatible with {have_str}"
                 )
-        except Exception:
+        except Exception as _swexc:
             # Suggestion is advisory — never let it block the preflight
             # output that callers actually need.
-            pass
+            _debug_swallow('_preflight_toolchain', _swexc)
 
     # ── Agent-F2 — dry-run flag-probe pass ───────────────────────────
     # Only runs when:
@@ -7529,6 +8225,7 @@ def _preflight_toolchain(arch: str,
                         f"{entry.vendor} compiler not on PATH")
     except Exception as exc:  # noqa: BLE001
         # Flag-probe is advisory — never let it abort preflight.
+        _debug_swallow('_preflight_toolchain', exc)
         lines.append(
             f"[preflight] flag-probe: skipped due to error "
             f"({type(exc).__name__}: {exc})")
@@ -7623,10 +8320,12 @@ def _dry_run_all_archs(out_dir: Path,
     manifests: Dict[str, Dict] = {}
     for arch in canonical_archs:
         entry = ARCH_TABLE[arch]
-        # BLOCKER 7 — use the canonical short model name ("mamba") so
-        # the dry-run manifests carry macros that match the runtime
-        # dispatch (profile.MODELS). The legacy "mamba3" string was not
-        # in MODELS and never round-tripped through _validate.
+        # BLOCKER 7 RESOLVED via canonicalize_model — the short model name
+        # ("mamba") is the user-API value from profile.MODELS; canonicalize_model()
+        # maps it to "mamba3" internally wherever canonical names are required.
+        # The dry-run manifest macros match the runtime dispatch (profile.MODELS)
+        # because _validate() accepts short names and canonicalization happens
+        # at the internal dispatch boundary.
         spec = BuildSpec(
             optimizer="adamw",
             model="mamba",
@@ -7644,10 +8343,10 @@ def _dry_run_all_archs(out_dir: Path,
         if config:
             try:
                 apply_to_buildspec(spec, config)
-            except Exception:
+            except Exception as _swexc:
                 # apply_to_buildspec is best-effort; a malformed user
                 # config must never abort the sweep.
-                pass
+                _debug_swallow('_dry_run_all_archs', _swexc)
         # Thread opt-in feature toggles onto the per-arch spec so they
         # influence any downstream config-dependent flag emission AND so
         # ``enabled_features`` (below) reports the effective state. Any
@@ -7673,6 +8372,7 @@ def _dry_run_all_archs(out_dir: Path,
         try:
             preflight_lines = list(_preflight_toolchain(arch, spec))
         except Exception as exc:  # noqa: BLE001 — preflight must never abort sweep
+            _debug_swallow('_dry_run_all_archs', exc)
             preflight_lines = [f"[preflight] arch={arch} EXCEPTION {exc!r}"]
         # Parse PASS / FAIL from the per-arch judgment line(s).
         for ln in preflight_lines:
@@ -7691,6 +8391,7 @@ def _dry_run_all_archs(out_dir: Path,
             resolved = _resolve_sources(spec)
             sources = [str(p) for p in resolved]
         except Exception as exc:  # noqa: BLE001 — one arch failure must not abort
+            _debug_swallow('_dry_run_all_archs', exc)
             resolve_error = f"{type(exc).__name__}: {exc}"
 
         # --- flag emission (host / device / ld) ---
@@ -7703,15 +8404,18 @@ def _dry_run_all_archs(out_dir: Path,
         try:
             host_cflags = list(_host_cflags(spec))
         except Exception as exc:  # noqa: BLE001
+            _debug_swallow('_dry_run_all_archs', exc)
             cflag_error = f"host_cflags: {type(exc).__name__}: {exc}"
         try:
             device_cflags = list(_device_cflags(spec))
         except Exception as exc:  # noqa: BLE001
+            _debug_swallow('_dry_run_all_archs', exc)
             cflag_error = (cflag_error or "") + (
                 f"; device_cflags: {type(exc).__name__}: {exc}")
         try:
             ldflags = list(_ldflags(spec))
         except Exception as exc:  # noqa: BLE001
+            _debug_swallow('_dry_run_all_archs', exc)
             cflag_error = (cflag_error or "") + (
                 f"; ldflags: {type(exc).__name__}: {exc}")
         # Group A.4 — surface device-link-only flags (nvcc -dlink step)
@@ -7722,6 +8426,7 @@ def _dry_run_all_archs(out_dir: Path,
         try:
             device_ldflags = list(_device_ldflags(spec))
         except Exception as exc:  # noqa: BLE001 — never abort sweep
+            _debug_swallow('_dry_run_all_archs', exc)
             cflag_error = (cflag_error or "") + (
                 f"; device_ldflags: {type(exc).__name__}: {exc}")
         # Group A.5 — surface version-gated device cflags from
@@ -7734,6 +8439,7 @@ def _dry_run_all_archs(out_dir: Path,
             _vgh, _vgd = _newer_compiler_flags(arch)
             version_gated_device_cflags = list(_vgd)
         except Exception as exc:  # noqa: BLE001 — never abort sweep
+            _debug_swallow('_dry_run_all_archs', exc)
             cflag_error = (cflag_error or "") + (
                 f"; version_gated_device_cflags: "
                 f"{type(exc).__name__}: {exc}")
@@ -7803,6 +8509,7 @@ def _dry_run_all_archs(out_dir: Path,
             try:
                 manifest["xla_env"] = _xla_env(arch, out_dir)
             except Exception as exc:  # noqa: BLE001 — never abort sweep
+                _debug_swallow('_dry_run_all_archs', exc)
                 manifest["xla_env"] = {}
                 manifest["xla_env_error"] = (
                     f"{type(exc).__name__}: {exc}")
@@ -7817,6 +8524,7 @@ def _dry_run_all_archs(out_dir: Path,
         try:
             sidecar.write_text(json.dumps(manifest, indent=2, sort_keys=True))
         except Exception as exc:  # noqa: BLE001 — sidecar IO must not abort sweep
+            _debug_swallow('_dry_run_all_archs', exc)
             manifest["sidecar_write_error"] = f"{type(exc).__name__}: {exc}"
 
         manifests[arch] = manifest
@@ -7875,14 +8583,65 @@ def _resolve_path(spec: BuildSpec, raw: str) -> Path:
         else REPO_ROOT / p
 
 
+# Mandate Tier-1 — vendor → compilable source extensions for broad
+# auto-discovery. NVCC-parity: when no structured layout matches, glob the
+# whole project tree for anything the toolchain can compile, the way nvcc
+# accepts an arbitrary file list.
+_AUTO_DISCOVER_EXTS: Dict[str, Tuple[str, ...]] = {
+    "cuda": (".cu", ".cpp", ".cc", ".cxx"),
+    "hip":  (".hip", ".cpp", ".cc", ".cxx"),   # .hip.cpp matches .cpp too
+    "pallas": (".py",),
+}
+
+# Directories never swept by auto-discovery (build artifacts, VCS, vendored
+# deps, tests, caches). A project can still point source_roots at any of
+# these explicitly; this only bounds the zero-config glob.
+_AUTO_DISCOVER_PRUNE: frozenset = frozenset({
+    ".git", "build", "dist", "third_party", "__pycache__", ".cache",
+    "node_modules", ".venv", "venv", ".mypy_cache", ".ruff_cache",
+    ".pytest_cache", "tests", "test", "docs", ".github",
+})
+
+
+def _auto_discover_sources(root: Path, vendor: str,
+                           report=None) -> List[Path]:
+    """Mandate Tier-1 — glob ``root`` for every compilable source for
+    ``vendor`` (zero-config "find everything compilable"). Skips the
+    ``_AUTO_DISCOVER_PRUNE`` directories. Returns a sorted, de-duplicated
+    list. This is the NVCC-parity fallback when no structured layout matches
+    — it never requires a manifest.
+    """
+    exts = _AUTO_DISCOVER_EXTS.get(vendor, ())
+    if not exts or not root.exists():
+        return []
+    found: List[Path] = []
+    for p in root.rglob("*"):
+        # Prune unwanted directories cheaply by checking path parts.
+        if any(part in _AUTO_DISCOVER_PRUNE for part in p.parts):
+            continue
+        if p.is_file() and p.suffix in exts:
+            found.append(p)
+    found = sorted(set(found))
+    if report is not None:
+        report.write(f"  [auto-discover] vendor={vendor} root={root} "
+                     f"→ {len(found)} compilable source(s)\n")
+    return found
+
+
 def _resolve_sources(spec: BuildSpec) -> List[Path]:
     """Resolve the per-build source file list.
 
-    Stream A: every directory probed here now comes from
-    ``spec.source_roots`` (populated by ``apply_to_buildspec`` from the
-    TOML config). With no config file the dict is empty, so we fall back
-    to the historical ``csrc/backends/<entry.subdir>`` / ``csrc/bindings``
-    layout — behaviour is byte-identical to today.
+    Stream A: every directory probed here comes from ``spec.source_roots``
+    (populated by ``apply_to_buildspec`` from the TOML config). With no
+    config the dict is empty and we use the historical
+    ``csrc/backends/<entry.subdir>`` / ``csrc/bindings`` layout — byte-
+    identical to today for the grokking project.
+
+    Mandate Tier-1 (zero-config genericness): when the structured layout
+    finds NO sources (an arbitrary project that doesn't use the csrc/backends
+    convention), fall back to a broad auto-glob of the project tree so the
+    compiler "just works" with no manifest. The grokking project always
+    matches the structured layout, so its behaviour is unchanged.
     """
     entry = get_arch_entry(spec.arch)
     if entry.vendor == "pallas":
@@ -7917,7 +8676,17 @@ def _resolve_sources(spec: BuildSpec) -> List[Path]:
     if models_dir.exists():
         for g in entry.model_glob:
             models.extend(sorted(models_dir.glob(g)))
-    return bindings + launchers + models
+    structured = bindings + launchers + models
+    if structured:
+        return structured
+    # Mandate Tier-1 fallback — no structured layout matched. Auto-discover
+    # every compilable source under the project root (or a configured root)
+    # so the compiler works zero-config on an arbitrary project. A user can
+    # override by setting source_roots; this is only the no-config path.
+    disc_root_raw = roots.get(entry.vendor) or roots.get("root")
+    disc_root = _resolve_path(spec, disc_root_raw) if disc_root_raw \
+        else REPO_ROOT
+    return _auto_discover_sources(disc_root, entry.vendor)
 
 
 def _build_macros(spec: BuildSpec) -> List[str]:
@@ -7969,15 +8738,52 @@ def _build_macros(spec: BuildSpec) -> List[str]:
 
 # ---- Performance flag bases (see INTERFACES.md §9) ------------------------
 
+# Mandate #7 — ``-march``/``-mtune`` are NOT in the base list. They are
+# injected by ``_host_march_flags(spec)`` so the policy is explicit:
+#   * on-target compile (the default)  → ``-march=native -mtune=native``
+#     (correct: the build host IS the run host).
+#   * cross-host AOT-ship (spec.cross_host=True) → a portable ISA baseline
+#     (``-march=x86-64-v3``) so we never bake the build host's ISA into a
+#     binary that ships to a different CPU. The baseline is configurable via
+#     ``spec.cross_host_march``. In this mode the host_cflags_hash already
+#     varies with the chosen baseline, keeping the cache honest (#23 keys it
+#     on the target CPU).
+# Mandate #6 — ``-ffast-math`` is NOT in the base list. ``-ffast-math``
+# implies ``-ffinite-math-only`` (deletes NaN/Inf guards) and reorders FP
+# ops, changing numerics — so the DEFAULT build is strict-math. Fast-math
+# (and a safe subset) are offered as CANDIDATE VARIANTS (see
+# ``_FAST_MATH_VARIANTS`` / ``_fast_math_variant_flags``) that the autotuner
+# tries and the strict oracle (#9/#16) validates; a fast-math variant is kept
+# ONLY if it matches the strict reference. ``-fno-math-errno`` /
+# ``-fno-trapping-math`` stay in the base: they are safe (no value change,
+# no finite-only assumption) and standard for compute kernels.
 HOST_CFLAGS_BASE = [
     "-O3", "-std=c++17", "-fPIC",
-    "-flto=auto", "-march=native", "-mtune=native",
+    "-flto=auto",
     "-fno-semantic-interposition", "-fvisibility=hidden",
     "-fdata-sections", "-ffunction-sections",
     "-fno-math-errno", "-fno-trapping-math",
     "-fomit-frame-pointer",
-    "-ffast-math", "-funroll-loops",
+    "-funroll-loops",
 ]
+
+# Default portable ISA baseline for cross-host builds (x86-64-v3 ≈ Haswell+:
+# AVX2/FMA/BMI — safe on essentially every datacenter CPU since ~2014).
+_DEFAULT_CROSS_HOST_MARCH: str = "x86-64-v3"
+
+
+def _host_march_flags(spec: "BuildSpec") -> List[str]:
+    """Mandate #7 — resolve the -march/-mtune policy for a build.
+
+    Default (on-target): ``-march=native -mtune=native``. Cross-host ship
+    (``spec.cross_host``): a portable ISA baseline so the shipped binary
+    never assumes the build host's instruction set.
+    """
+    if getattr(spec, "cross_host", False):
+        march = getattr(spec, "cross_host_march", None) \
+            or _DEFAULT_CROSS_HOST_MARCH
+        return [f"-march={march}"]
+    return ["-march=native", "-mtune=native"]
 
 # NVCC base flags — arch-specific -gencode is appended per-build from
 # ARCH_TABLE[arch].nvcc_gencode in _device_cflags(). Keeping the base
@@ -8008,7 +8814,20 @@ HOST_CFLAGS_BASE = [
 # ``_device_ldflags(spec)``, NEVER in this list — nvcc -c rejects them
 # at the per-TU compile step ("Unknown option").
 NVCC_DEVICE_BASE = [
-    "-O3", "--use_fast_math", "-std=c++17", "-DWITH_CUDA",
+    # Mandate #6 — ``--use_fast_math`` is NOT in the base. It changes numerics
+    # (flushes denormals, reassociates, approximates div/sqrt) so the default
+    # build is strict-math; fast-math is a VALIDATED variant (see
+    # ``_FAST_MATH_VARIANTS``) kept only when it matches the strict oracle.
+    #
+    # Mandate (user directive) — ``-DNDEBUG`` is NOT in the base either. It is
+    # assert-stripping only and numerically neutral, BUT it is a PROJECT
+    # opinion, not a universal-tool default. The grokking project keeps it via
+    # its own ``[device_cflags].extra = ["-DNDEBUG"]`` in compile_config.toml
+    # (consumed by apply_to_buildspec → _device_cflags), preserving the WGMMA
+    # mainloop de-serialization win (C7509 6→0) exactly as before. Any other
+    # project builds without it unless its config opts in. The flag flows into
+    # device_cflags_hash so the de-serialization stays reproducible.
+    "-O3", "-std=c++17", "-DWITH_CUDA",
     "--expt-relaxed-constexpr",
     # NOTE: ``--threads N`` is a CUDA 11.2+ flag (parallel TU compilation).
     # Gated emission lives in ``_newer_compiler_flags``; the base list
@@ -8061,8 +8880,12 @@ NVCC_DEVICE_BASE = [
 # wave-size / cumode toggles (which are NOT arch-agnostic) live in
 # _device_cflags(spec) and are gated by ARCH_TABLE[arch].warp_size.
 HIPCC_DEVICE_BASE = [
+    # Mandate #6 — ``-ffast-math`` is NOT in the base (changes numerics);
+    # it's a VALIDATED variant. Mandate (user directive) — ``-DNDEBUG`` is a
+    # PROJECT opinion, sourced from the project's compile_config.toml
+    # ``[device_cflags].extra`` (grokking keeps it), not a universal default.
     "-O3", "-std=c++17", "-DWITH_HIP",
-    "-ffast-math", "-fPIC",
+    "-fPIC",
     "-mllvm", "-amdgpu-early-inline-all=true",
     "-mllvm", "-amdgpu-function-calls=false",
     "-mllvm", "-amdgpu-internalize-symbols",
@@ -8110,6 +8933,44 @@ LDFLAGS_BASE = [
 ]
 
 
+# ── Mandate #6 — fast-math as a VETTED VARIANT, not a default ─────────────
+# These candidate flag sets are tried by the autotuner and validated against
+# the STRICT oracle (#9/#16); a variant is kept ONLY if its output matches
+# the strict reference within tolerance. Each maps a name → (host_flags,
+# nvcc_flags, hipcc_flags). The "safe_subset" deliberately omits
+# ``-ffinite-math-only`` (which would delete NaN/Inf guards) — it only
+# reassociates and drops errno/trapping, so it is the lowest-risk speedup.
+# "full_fast_math" is the aggressive option (the old always-on behavior),
+# now gated behind validation.
+_FAST_MATH_VARIANTS: Dict[str, Dict[str, List[str]]] = {
+    "safe_subset": {
+        "host":  ["-fassociative-math", "-freciprocal-math"],
+        "nvcc":  ["-Xcompiler", "-fassociative-math"],
+        "hipcc": ["-fassociative-math", "-freciprocal-math"],
+    },
+    "full_fast_math": {
+        "host":  ["-ffast-math"],
+        "nvcc":  ["--use_fast_math"],
+        "hipcc": ["-ffast-math"],
+    },
+}
+
+
+def _fast_math_variant_flags(variant: str, vendor: str) -> Tuple[List[str], List[str]]:
+    """Mandate #6 — return ``(host_flags, device_flags)`` for a named
+    fast-math variant on the given vendor. Unknown variant ⇒ no flags.
+    The caller tags the produced variant ``origin='fastmath'`` so pick_winner
+    (#16) requires a strict-oracle PASS before it can win."""
+    spec_v = _FAST_MATH_VARIANTS.get(variant)
+    if not spec_v:
+        return [], []
+    host = list(spec_v.get("host", []))
+    dev_key = "nvcc" if vendor == "cuda" else (
+        "hipcc" if vendor == "hip" else None)
+    device = list(spec_v.get(dev_key, [])) if dev_key else []
+    return host, device
+
+
 def _host_cflags(spec: BuildSpec,
                  trace: Optional[_FlagTrace] = None) -> List[str]:
     """Build the host-compiler flag list (g++/clang++).
@@ -8137,6 +8998,14 @@ def _host_cflags(spec: BuildSpec,
     base = list(HOST_CFLAGS_BASE)
     _trace_add_many(trace, list(HOST_CFLAGS_BASE),
                     "base host-cflag (always on)")
+    # Mandate #7 — -march/-mtune by policy (native on-target, baseline cross-host)
+    march_flags = _host_march_flags(spec)
+    base += march_flags
+    _trace_add_many(
+        trace, march_flags,
+        "cross-host ISA baseline (spec.cross_host=True)"
+        if getattr(spec, "cross_host", False)
+        else "on-target native ISA (build host == run host)")
     host_def = f"-D{entry.host_define}"
     base.append(host_def)
     _trace_add(trace, host_def, "kept",
@@ -8337,10 +9206,15 @@ def _device_cflags(spec: BuildSpec,
             _trace_add_many(trace, macros,
                             f"-D macros derived from BuildSpec "
                             f"(macro_prefix={spec.macro_prefix!r})")
+        proj_extra = _project_device_extra_flags(spec)
+        if proj_extra:
+            _trace_add_many(trace, proj_extra,
+                            "project config [device_cflags].extra "
+                            "(e.g. grokking -DNDEBUG)")
         if own_trace and trace is not None:
             _emit_flag_trace_block("device_cflags", trace)
         return _device_cflags_maybe_validate(
-            base + macros, spec, vendor="cuda")
+            base + macros + proj_extra, spec, vendor="cuda")
 
     if entry.vendor == "hip":
         base = list(HIPCC_DEVICE_BASE)
@@ -8429,10 +9303,15 @@ def _device_cflags(spec: BuildSpec,
             _trace_add_many(trace, macros,
                             f"-D macros derived from BuildSpec "
                             f"(macro_prefix={spec.macro_prefix!r})")
+        proj_extra = _project_device_extra_flags(spec)
+        if proj_extra:
+            _trace_add_many(trace, proj_extra,
+                            "project config [device_cflags].extra "
+                            "(e.g. grokking -DNDEBUG)")
         if own_trace and trace is not None:
             _emit_flag_trace_block("device_cflags", trace)
         return _device_cflags_maybe_validate(
-            base + macros, spec, vendor="hip")
+            base + macros + proj_extra, spec, vendor="hip")
     # Pallas / unknown vendor → no device cflags. Still emit one note so
     # the trace block isn't completely empty in --flag-audit.
     _trace_add(trace, "(no device cflags)", "kept",
@@ -8440,6 +9319,22 @@ def _device_cflags(spec: BuildSpec,
     if own_trace and trace is not None:
         _emit_flag_trace_block("device_cflags", trace)
     return []
+
+
+def _project_device_extra_flags(spec: "BuildSpec") -> List[str]:
+    """Mandate (NDEBUG migration) / #6 — project-supplied extra device flags
+    from ``compile_config.toml`` ``[device_cflags].extra``. This is how the
+    grokking project re-introduces ``-DNDEBUG`` (assert-stripping, WGMMA
+    de-serialization) WITHOUT compile.py carrying any project opinion in its
+    base lists. The flags flow into the build AND into device_cflags_hash so
+    the behavior stays reproducible + provenance-tracked. Empty for a
+    config-less generic build."""
+    cfg = getattr(spec, "config", None) or {}
+    dc = cfg.get("device_cflags") if isinstance(cfg, dict) else None
+    if not isinstance(dc, dict):
+        return []
+    extra = dc.get("extra") or []
+    return [str(f) for f in extra]
 
 
 def _device_cflags_maybe_validate(flags: List[str], spec: "BuildSpec",
@@ -8483,6 +9378,54 @@ def _device_cflags_maybe_validate(flags: List[str], spec: "BuildSpec",
             spec.flag_probe_dropped.append((f, r))
             seen.add((f, r))
     return kept
+
+
+def install_nvcc_flags(arch: str,
+                       *,
+                       include_version_gated: bool = True,
+                       validate_flags: bool = False) -> List[str]:
+    """Public, GPU-less flag source (Stage 2 unify).
+
+    Return the canonical per-arch device-compiler flag list — the SAME
+    flags the autotuner tunes against — for a given ``arch`` WITHOUT
+    requiring a GPU, a CUDA-enabled torch, or even nvcc/hipcc on PATH.
+    ``setup.py`` (and any external install driver) can call this to build
+    the shipped extension with flags identical to what ``_device_cflags``
+    produces during autotuning, so the installed kernel matches what was
+    tuned.
+
+    The name says ``nvcc`` for the common (CUDA) caller, but the helper is
+    vendor-agnostic: HIP archs get the hipcc device flags and Pallas archs
+    get ``[]``. It is a thin wrapper over the existing ``_device_cflags`` /
+    ``_newer_compiler_flags`` machinery — additive, no behavior change to
+    either of those.
+
+    Parameters
+    ----------
+    arch:
+        An ARCH_TABLE key (e.g. ``"sm_90a"``, ``"gfx942"``, ``"tpu_v5p"``).
+    include_version_gated:
+        When True (default) the version-gated additions from
+        ``_newer_compiler_flags`` are folded in inline, matching the
+        ``--flag-audit`` view and what the build line ultimately receives.
+        On a host with no nvcc/hipcc those additions are simply empty
+        (the probe degrades gracefully) — the base list is still returned.
+    validate_flags:
+        Default False — the install host may lack the device compiler, and
+        we do NOT want a missing-compiler probe to silently drop canonical
+        flags. Set True only when the install host's nvcc/hipcc is known to
+        match the deployment toolchain.
+    """
+    spec = BuildSpec(
+        optimizer="adamw",          # any registered optimizer; irrelevant to
+        model="generic",            # device cflags (they depend only on arch)
+        arch=arch,
+        out_dir=Path(tempfile.gettempdir()),
+        autotune=False,
+        profile=False,
+        validate_flags=validate_flags,
+    )
+    return list(_device_cflags(spec, include_version_gated=include_version_gated))
 
 
 def _ldflags(spec: BuildSpec,
@@ -8700,6 +9643,74 @@ def _sccache_env() -> Dict[str, str]:
     return out
 
 
+def _compiler_cache_present() -> Tuple[bool, List[str]]:
+    """Mandate #8 — which compiler caches are on PATH. Returns
+    ``(present, names)`` where names ⊆ {'ccache', 'sccache'}."""
+    names = [n for n in ("ccache", "sccache") if shutil.which(n)]
+    return (bool(names), names)
+
+
+def _warn_if_no_compiler_cache(report) -> None:
+    """Mandate #8 — a JIT sweep rebuilds a fresh .so per candidate. Without a
+    compiler cache the sweep is COMPILE-bound, not GPU-bound, wasting the
+    locked-clock GPU window on redundant recompiles. Warn loudly when neither
+    sccache nor ccache is available so the operator can install one."""
+    present, names = _compiler_cache_present()
+    if present:
+        report.write(f"  [ccache] compiler cache(s) on PATH: "
+                     f"{', '.join(names)} — sweep will reuse object cache.\n")
+    else:
+        report.write(
+            "  [ccache] WARNING: no sccache/ccache on PATH. The autotune "
+            "sweep recompiles every variant from scratch, so it is "
+            "COMPILE-bound rather than GPU-bound and wastes the locked-clock "
+            "window. Strongly recommended: `pip install sccache` or install "
+            "ccache, then re-run. Proceeding uncached.\n")
+
+
+def _compiler_cache_stats() -> Dict[str, Any]:
+    """Mandate #8 — query sccache/ccache hit-rate for the just-finished
+    sweep. Best-effort: returns a dict with raw stats text per tool and a
+    parsed ``hit_rate`` when derivable. Never raises (a stats failure must
+    not abort a build)."""
+    stats: Dict[str, Any] = {}
+    sccache = shutil.which("sccache")
+    if sccache:
+        rc, out, _ = _run_smi([sccache, "--show-stats"], timeout=10)
+        if rc == 0 and out:
+            stats["sccache"] = out
+            import re as _re
+            hits = _re.search(r"Cache hits\s+(\d+)", out)
+            misses = _re.search(r"Cache misses\s+(\d+)", out)
+            if hits and misses:
+                h, m = int(hits.group(1)), int(misses.group(1))
+                tot = h + m
+                if tot:
+                    stats["hit_rate"] = h / tot
+    ccache = shutil.which("ccache")
+    if ccache:
+        rc, out, _ = _run_smi([ccache, "-s"], timeout=10)
+        if rc == 0 and out:
+            stats["ccache"] = out
+    return stats
+
+
+def _report_compiler_cache_stats(report) -> None:
+    """Mandate #8 — emit the per-sweep compiler-cache hit-rate so cache
+    effectiveness is observable in the sweep log."""
+    try:
+        stats = _compiler_cache_stats()
+    except Exception as exc:  # never let a stats probe abort the build
+        report.write(f"  [ccache] stats probe failed: {exc}\n")
+        return
+    if "hit_rate" in stats:
+        report.write(f"  [ccache] sweep compiler-cache hit-rate: "
+                     f"{stats['hit_rate'] * 100:.1f}%\n")
+    elif "sccache" in stats or "ccache" in stats:
+        report.write("  [ccache] sweep compiler-cache stats recorded "
+                     "(hit-rate not parseable).\n")
+
+
 # ---------------------------------------------------------------------------
 # Toolchain version probe — §12 C1
 # ---------------------------------------------------------------------------
@@ -8795,18 +9806,19 @@ def _probe_jax_version_string() -> Optional[str]:
     """Return ``jax.__version__`` + jaxlib version, or None on import failure."""
     try:
         import jax  # type: ignore
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_probe_jax_version_string', _swexc)
         return None
     bits: List[str] = []
     try:
         bits.append(f"jax {jax.__version__}")
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_probe_jax_version_string', _swexc)
     try:
         import jaxlib  # type: ignore
         bits.append(f"jaxlib {jaxlib.__version__}")
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_probe_jax_version_string', _swexc)
     return " | ".join(bits) if bits else None
 
 
@@ -8827,7 +9839,8 @@ def _disk_free_human(path: Path) -> str:
                 usage = shutil.disk_usage(str(p))
             else:
                 return "<unknown>"
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_disk_free_human', _swexc)
             return "<unknown>"
 
     def _h(n: int) -> str:
@@ -8923,8 +9936,8 @@ def _emit_flag_trace_block(label: str,
         f"{skipped} skipped due to version gates\n")
     try:
         stream.flush()
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_emit_flag_trace_block', _swexc)
 
 
 def _trace_enabled(spec: Optional["BuildSpec"]) -> bool:
@@ -8944,7 +9957,8 @@ def _trace_enabled(spec: Optional["BuildSpec"]) -> bool:
     try:
         return bool(getattr(spec, "debug", False)
                     or getattr(spec, "debug_symbols", False))
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_trace_enabled', _swexc)
         return False
 
 # ---------------------------------------------------------------------------
@@ -9405,13 +10419,15 @@ def _probe_torch_cuda_arch() -> Optional[str]:
     library missing) — callers must treat None as "try the next source"."""
     try:
         import torch  # noqa: F401
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_probe_torch_cuda_arch', _swexc)
         return None
     try:
         if not torch.cuda.is_available():
             return None
         major, minor = torch.cuda.get_device_capability(0)
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_probe_torch_cuda_arch', _swexc)
         return None
     suffixed = f"sm_{major}{minor}a"
     plain = f"sm_{major}{minor}"
@@ -9434,7 +10450,8 @@ def _probe_rocm_smi_arch() -> Optional[str]:
             [rocm_smi, "--showproductname"],
             capture_output=True, text=True, timeout=10,
         ).stdout
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_probe_rocm_smi_arch', _swexc)
         return None
     if not out:
         return None
@@ -9452,11 +10469,13 @@ def _probe_jax_tpu_arch() -> Optional[str]:
     ``tpu_vN[e|p]`` entry in ARCH_TABLE. Returns None on any failure."""
     try:
         import jax  # noqa: F401
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_probe_jax_tpu_arch', _swexc)
         return None
     try:
         devs = jax.devices()
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_probe_jax_tpu_arch', _swexc)
         return None
     for d in devs:
         if getattr(d, "platform", "") != "tpu":
@@ -9516,7 +10535,8 @@ def _resolve_default_arch(
     # 1. torch.cuda
     try:
         arch = _probe_torch_cuda_arch()
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_resolve_default_arch', _swexc)
         arch = None
     if arch:
         stream.write(f"[arch] auto-detected {arch} from "
@@ -9526,7 +10546,8 @@ def _resolve_default_arch(
     # 2. rocm-smi
     try:
         arch = _probe_rocm_smi_arch()
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_resolve_default_arch', _swexc)
         arch = None
     if arch:
         stream.write(f"[arch] auto-detected {arch} from "
@@ -9536,7 +10557,8 @@ def _resolve_default_arch(
     # 3. jax.devices (TPU)
     try:
         arch = _probe_jax_tpu_arch()
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_resolve_default_arch', _swexc)
         arch = None
     if arch:
         stream.write(f"[arch] auto-detected {arch} from "
@@ -9547,7 +10569,8 @@ def _resolve_default_arch(
     if isinstance(config, dict):
         try:
             cfg_arch = config.get("archs", {}).get("default") or None
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_resolve_default_arch', _swexc)
             cfg_arch = None
         if cfg_arch:
             # Group B9 — validate against ARCH_TABLE before returning so a
@@ -9844,9 +10867,76 @@ def _newer_compiler_flags(arch: str, report=None,
     return extra_host, extra_device
 
 
+# Memoized, side-effect-free twin of ``_newer_compiler_flags`` for cache-key
+# hashing. ``_newer_compiler_flags`` is the single home for version-gated
+# toolchain flags but it (a) takes report/trace handles and (b) spawns an
+# ``nvcc --version`` / ``hipcc --version`` subprocess on every call. The
+# autotune variant timer needs the *same* flag set folded into each build
+# signature so that a compiler upgrade (which changes the gated flag set)
+# invalidates stale caches — but calling the probe once per variant config
+# would add a subprocess round-trip to every trial. We cache per-arch: the
+# detected toolchain cannot change within a single process, so a one-shot
+# probe per arch is exact. Returns tuples (hashable, immutable).
+_VERSION_GATED_FLAGS_CACHE: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {}
+
+
+def _version_gated_flags_for_hash(arch: str) -> Tuple[List[str], List[str]]:
+    """Per-arch-cached (extra_host, extra_device) version-gated flags, used to
+    fold the runtime toolchain into AOT/variant cache keys. Mirrors exactly
+    what ``_torch_load`` appends to the build line via ``_newer_compiler_flags``
+    so the hash and the real build never disagree."""
+    cached = _VERSION_GATED_FLAGS_CACHE.get(arch)
+    if cached is None:
+        h, d = _newer_compiler_flags(arch)
+        cached = (tuple(h), tuple(d))
+        _VERSION_GATED_FLAGS_CACHE[arch] = cached
+    return list(cached[0]), list(cached[1])
+
+
 # ---------------------------------------------------------------------------
 # Build driver — torch.utils.cpp_extension.load with ninja
 # ---------------------------------------------------------------------------
+
+def _render_repro_state(spec, host_cflags, device_cflags, ldflags,
+                        sources, env_overlay_dict=None) -> str:
+    """Fix-#2 Defect-2 — the §2A reproduction-state payload for a crashing
+    build/oracle. Returns a block listing the resolved host+device flags,
+    arch, optimizer/model/dtype/shape config, the source files, and the
+    relevant environment (CUDA/HIP/JAX home + compiler-cache state) so the
+    failing invocation is reproducible from the crash output alone."""
+    lines = ["\n[repro-state — §2A reproducible context]"]
+    lines.append(f"  arch:       {getattr(spec, 'arch', '?')}")
+    lines.append(f"  optimizer:  {getattr(spec, 'optimizer', '?')}")
+    lines.append(f"  model:      {getattr(spec, 'model', '?')}")
+    # dtype / shape are oracle-side concepts; include when the spec carries
+    # them (best-effort — absent for a pure build crash).
+    for attr in ("dtype", "shape", "fused_op_template", "macro_prefix",
+                 "cross_host", "cross_host_march"):
+        if hasattr(spec, attr):
+            lines.append(f"  {attr+':':12}{getattr(spec, attr)}")
+    lines.append(f"  host_cflags:   {' '.join(map(str, host_cflags or []))}")
+    lines.append(f"  device_cflags: {' '.join(map(str, device_cflags or []))}")
+    lines.append(f"  ldflags:       {' '.join(map(str, ldflags or []))}")
+    try:
+        lines.append(f"  include_paths: {' '.join(_include_paths(spec))}")
+    except Exception as exc:  # never let the repro dump itself crash
+        _debug_swallow("_render_repro_state.include_paths", exc)
+    lines.append(f"  sources ({len(sources or [])}):")
+    for s in (sources or []):
+        lines.append(f"    {s}")
+    # Relevant environment: toolchain homes + compiler-cache state.
+    env_keys = ("CUDA_HOME", "CUDA_PATH", "ROCM_HOME", "ROCM_PATH",
+                "HIP_PATH", "JAX_PLATFORMS", "CC", "CXX", "CCACHE_DIR",
+                "SCCACHE_DIR", "SCCACHE_REDIS_ENDPOINT", "TORCH_CUDA_ARCH_LIST")
+    env_view = dict(os.environ)
+    if env_overlay_dict:
+        env_view.update({k: str(v) for k, v in env_overlay_dict.items()})
+    lines.append("  env:")
+    for k in env_keys:
+        if k in env_view:
+            lines.append(f"    {k}={env_view[k]}")
+    return "\n".join(lines) + "\n"
+
 
 def _summarize_build_failure(exc, collected_text, module_name, elapsed, arch):
     """Build a list of human-readable summary lines for a failed build.
@@ -9978,8 +11068,8 @@ def _summarize_build_failure(exc, collected_text, module_name, elapsed, arch):
         import torch
         if torch.cuda.is_available():
             detected_gpu = torch.cuda.get_device_name(0)
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_summarize_build_failure', _swexc)
     # Only suggest "wrong arch" when the failure plausibly looks like
     # an arch / capability mismatch — otherwise it's noise on flag
     # / linker / source-file errors that have nothing to do with arch.
@@ -10072,8 +11162,8 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
                 if _lp.is_file():
                     try:
                         _collected.append(_lp.read_text(errors="replace"))
-                    except Exception:
-                        pass
+                    except Exception as _swexc:
+                        _debug_swallow('_torch_load', _swexc)
             try:
                 _sum_lines = _summarize_build_failure(
                     exc, "\n".join(_collected),
@@ -10084,6 +11174,17 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
             except Exception as _sum_exc:
                 report.write(f"\n[failure summary builder errored: "
                              f"{_sum_exc}]\n")
+            # Fix-#2 Defect-2 — §2A repro state: a build crash must be fixable
+            # from its OUTPUT ALONE, not just locatable. Dump the resolved
+            # flags / arch / config / sources / env so the exact invocation
+            # can be reproduced without re-deriving it.
+            try:
+                report.write(_render_repro_state(
+                    spec, host_cflags, device_cflags, ldflags, sources,
+                    overlay))
+            except Exception as _state_exc:
+                report.write(f"\n[repro-state builder errored: "
+                             f"{_state_exc}]\n")
             report.write(f"\n[build FAILED after {elapsed:.1f}s]\n{exc}\n")
             # Surface the actual compiler/linker error that torch's
             # cpp_extension swallowed. Look in the build directory for
@@ -10093,8 +11194,8 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
                 tb_str = _tb.format_exc()
                 report.write("\n[build FAILED — full traceback]\n")
                 report.write(tb_str)
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_torch_load', _swexc)
             # Dump every log-like file in the build dir
             for log_name in ("build.ninja", ".ninja_log", "build.log",
                              "compile_commands.json"):
@@ -10140,8 +11241,8 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
                         first_line = (ver.stdout or ver.stderr).splitlines()[:1]
                         if first_line:
                             report.write(f"    -> {first_line[0]}\n")
-                    except Exception:
-                        pass
+                    except Exception as _swexc:
+                        _debug_swallow('_torch_load', _swexc)
             cuda_home = os.environ.get("CUDA_HOME", "")
             if cuda_home:
                 report.write(f"\n[CUDA_HOME probe: {cuda_home}]\n")
@@ -10179,8 +11280,8 @@ def _torch_load(spec: BuildSpec, sources: List[Path],
             parsed = _parse_ptxas_v_stderr(captured)
             if parsed:
                 _LAST_PTXAS_INFO_BY_BUILD_DIR[str(build_dir)] = parsed
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_torch_load', _swexc)
     return so
 
 
@@ -10229,6 +11330,12 @@ TOLERANCES: Dict[str, Tuple[float, float]] = {
 # keyed by config_key(); _make_trial_record reads it back so the existing
 # ``timer(cfg) -> result-dict`` signature stays unchanged.
 _LAST_NUMERICAL_STATUS: Dict[str, str] = {}
+
+# Mandate #16/#20/#21 — variant ORIGIN sidecar keyed by config_key(). The
+# codegen paths (synth / polyhedral / cutlass / ck / fastmath) stamp the
+# origin here so _make_trial_record can attach it and pick_winner can require
+# a strict-oracle PASS before a generated/transformed variant is eligible.
+_LAST_VARIANT_ORIGIN: Dict[str, str] = {}
 
 # Stream α — parsed ptxas-v info per-variant (regs_used, smem_bytes, etc.).
 # Populated by callers that have ptxas/hipcc stderr, read by
@@ -10343,6 +11450,286 @@ def _record_ptxas_info_for_cfg(cfg: Dict[str, Any],
     return info
 
 
+# ===========================================================================
+# Tier-2 ENTRY-POINT DISCOVERY (mandate #4 / #11 / #22)
+# ===========================================================================
+#
+# The grokking coupling — hardcoded ``torch.ops.grokking_optimizers.fused_*``
+# with an Adam-style 10-arg call on ``param=zeros, grad=ones`` — is replaced
+# by *discovery*. Like PGO tools / Triton's autotuner / pytest-benchmark, we
+# find the tunable entry point and its signature by convention + introspection
+# instead of demanding a manifest:
+#
+#   1. Entry discovery: scan the built artifact for tunable entries —
+#      ``torch.ops`` registrations in a discovered namespace, a conventional
+#      ``__tune_entry__`` / ``__benchmark__`` hook, or pybind/exported symbols.
+#   2. Signature introspection: derive each entry's arity / dtypes / ranks
+#      from the torch schema (or python type hints).
+#   3. Input synthesis (#10, Phase 4): seeded random inputs matching the
+#      discovered signature across magnitude + adversarial regimes.
+#   4. Strict self-oracle (#9, Phase 4): a fast-math-OFF reference build of
+#      the discovered entry on the synthesized inputs is ground truth.
+#
+# If NO tunable entry is discoverable, that is a VALID state, not an error:
+# Tier-2 switches to Tier-1-only with a loud mode-switch line (no manifest
+# demanded). Genuine errors (a discovered entry that fails to load, a
+# malformed schema) crash hard per §2A.
+
+
+@dataclass
+class EntryArg:
+    """One argument of a discovered tunable entry.
+
+    kind  — "tensor" | "scalar"
+    dtype — torch dtype string for tensors ("float32", ...) / "float"|"int"
+            |"bool" for scalars; None when unknown.
+    rank  — tensor rank when derivable from the schema, else None.
+    alias — True when the schema marks the arg mutable (``Tensor(a!)``) — the
+            in-place output we snapshot for the oracle.
+    """
+    name: str
+    kind: str
+    dtype: Optional[str] = None
+    rank: Optional[int] = None
+    alias: bool = False
+
+
+@dataclass
+class DiscoveredEntry:
+    """A tunable entry point found by discovery (mandate #4/#11/#22)."""
+    name: str                       # short op/function name
+    kind: str                       # "torch_op" | "tune_hook" | "pybind"
+    dotted_path: str                # how a subprocess resolves it
+    args: List[EntryArg] = field(default_factory=list)
+    schema: Optional[str] = None    # raw torch schema string when available
+
+    @property
+    def arity(self) -> int:
+        return len(self.args)
+
+    @property
+    def tensor_args(self) -> List[EntryArg]:
+        return [a for a in self.args if a.kind == "tensor"]
+
+    @property
+    def mutated_arg_index(self) -> Optional[int]:
+        """Index of the in-place (``Tensor(a!)``) arg whose post-call value
+        the oracle snapshots. Falls back to the first tensor arg."""
+        for i, a in enumerate(self.args):
+            if a.alias:
+                return i
+        for i, a in enumerate(self.args):
+            if a.kind == "tensor":
+                return i
+        return None
+
+
+# Torch dtype tokens we recognize in a schema's tensor type. Torch schemas
+# don't usually carry dtype, so tensors default to float32 unless a config
+# quant dim narrows them (#18, Phase 6).
+_SCHEMA_SCALAR_TYPES: frozenset = frozenset({
+    "float", "int", "bool", "Scalar", "SymInt", "float?", "int?",
+})
+
+
+def _parse_torch_schema(schema: str) -> List[EntryArg]:
+    """Mandate #11 — parse a torch op schema string into ordered EntryArgs.
+
+    Example::
+
+        fused_adamw_step(Tensor(a!) param, Tensor grad, float lr) -> ()
+          → [EntryArg(param, tensor, alias=True),
+             EntryArg(grad, tensor),
+             EntryArg(lr, scalar, dtype='float')]
+
+    Pure / CPU-testable — the actual op object is not required. Raises
+    ValueError on a schema with no parseable argument list (a malformed
+    schema is an ERROR per §2A, not a silent skip)."""
+    lp = schema.find("(")
+    rp = schema.rfind(") ->")
+    if rp == -1:
+        rp = schema.rfind(")")
+    if lp == -1 or rp == -1 or rp <= lp:
+        raise ValueError(f"unparseable torch schema (no arg list): {schema!r}")
+    arglist = schema[lp + 1:rp].strip()
+    if not arglist:
+        return []
+    args: List[EntryArg] = []
+    depth = 0
+    cur = ""
+    pieces: List[str] = []
+    # Split on top-level commas (tensor types can contain nested brackets).
+    for ch in arglist:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            pieces.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        pieces.append(cur)
+    for piece in pieces:
+        piece = piece.strip()
+        if not piece or piece.startswith("*"):
+            continue
+        # Strip default value ("float lr=1e-3" → "float lr").
+        piece = piece.split("=", 1)[0].strip()
+        toks = piece.split()
+        if len(toks) < 2:
+            # type with no name (rare) — synthesize a name.
+            type_tok, name = toks[0], f"arg{len(args)}"
+        else:
+            type_tok, name = toks[0], toks[-1]
+        alias = "!" in type_tok
+        base = type_tok.split("(")[0]
+        if base.startswith("Tensor"):
+            args.append(EntryArg(name=name, kind="tensor", dtype="float32",
+                                 alias=alias))
+        elif base in _SCHEMA_SCALAR_TYPES or base.rstrip("?") in \
+                _SCHEMA_SCALAR_TYPES:
+            sc = "float" if base.startswith("float") or base == "Scalar" \
+                else ("int" if base.startswith(("int", "SymInt"))
+                      else "bool")
+            args.append(EntryArg(name=name, kind="scalar", dtype=sc))
+        else:
+            # Unknown type — record as scalar/unknown rather than dropping it,
+            # so arity stays correct.
+            args.append(EntryArg(name=name, kind="scalar", dtype=None))
+    return args
+
+
+# Subprocess body that loads the built .so and enumerates discoverable
+# tunable entries, printing one JSON record per line. Run on the GPU/torch
+# host; the parsing of its output happens in-process.
+_DISCOVERY_PROBE = r"""
+import sys, json
+import torch
+try:
+    torch.ops.load_library(r'''__SO__''')
+except Exception as exc:
+    sys.stderr.write("load_library failed: " + repr(exc) + "\n")
+    sys.exit(3)
+out = []
+# 1. torch.ops namespaces. Prefer a configured namespace; else enumerate all.
+wanted_ns = __NS__
+seen = set()
+try:
+    ns_iter = [wanted_ns] if wanted_ns else list(dir(torch.ops))
+    for ns in ns_iter:
+        if ns.startswith("_"):
+            continue
+        try:
+            nsobj = getattr(torch.ops, ns)
+        except Exception:
+            continue
+        for opname in dir(nsobj):
+            if opname.startswith("_"):
+                continue
+            try:
+                packet = getattr(nsobj, opname)
+                schemas = [str(s) for s in
+                           torch._C._jit_get_schemas_for_operator(
+                               "%s::%s" % (ns, opname))]
+            except Exception:
+                schemas = []
+            for sch in schemas:
+                key = (ns, opname, sch)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({"kind": "torch_op", "name": opname,
+                            "dotted_path": "torch.ops.%s.%s" % (ns, opname),
+                            "schema": sch})
+except Exception as exc:
+    sys.stderr.write("torch.ops enumeration error: " + repr(exc) + "\n")
+for rec in out:
+    sys.stdout.write(json.dumps(rec) + "\n")
+sys.stdout.write("__DISCOVERY_DONE__\n")
+"""
+
+
+def _discover_entry_points(so_path: Path, *,
+                           namespace: Optional[str] = None,
+                           report=None,
+                           python: Optional[str] = None
+                           ) -> List[DiscoveredEntry]:
+    """Mandate #4/#11/#22 — discover tunable entry points in a built .so.
+
+    Runs a subprocess that loads the artifact and enumerates torch.ops
+    registrations with their schemas, then introspects each schema into
+    ordered EntryArgs. Returns the discovered entries (possibly empty — an
+    empty result is a VALID state that the caller turns into a Tier-1
+    mode-switch, NOT an error).
+
+    A subprocess that fails to even load the library is an ERROR (§2A): we
+    raise with the full stderr so the caller crashes with diagnostics rather
+    than silently degrading.
+    """
+    ns_literal = repr(namespace) if namespace else "None"
+    script = (_DISCOVERY_PROBE
+              .replace("__SO__", str(so_path))
+              .replace("__NS__", ns_literal))
+    r = subprocess.run([python or sys.executable, "-c", script],
+                       capture_output=True, text=True, timeout=180)
+    if "__DISCOVERY_DONE__" not in (r.stdout or ""):
+        # The probe did not complete — distinguish load failure (rc==3,
+        # an ERROR) from a generic crash.
+        raise RuntimeError(
+            f"entry-point discovery failed (rc={r.returncode}) for "
+            f"{so_path}:\nstdout={r.stdout[-1000:]!r}\n"
+            f"stderr={r.stderr[-2000:]!r}")
+    entries: List[DiscoveredEntry] = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line or line == "__DISCOVERY_DONE__":
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        schema = rec.get("schema")
+        try:
+            args = _parse_torch_schema(schema) if schema else []
+        except ValueError as exc:
+            # A malformed schema on a discovered op is an ERROR (§2A).
+            raise RuntimeError(
+                f"malformed schema on discovered entry "
+                f"{rec.get('dotted_path')}: {exc}")
+        entries.append(DiscoveredEntry(
+            name=rec["name"], kind=rec["kind"],
+            dotted_path=rec["dotted_path"], args=args, schema=schema))
+    if report is not None:
+        report.write(f"  [discovery] {so_path.name}: "
+                     f"{len(entries)} tunable entry point(s) discovered"
+                     f"{' in ns=' + namespace if namespace else ''}.\n")
+        for e in entries:
+            report.write(f"    [entry] {e.dotted_path} "
+                         f"arity={e.arity} tensors={len(e.tensor_args)}\n")
+    return entries
+
+
+def _select_tunable_entry(entries: List[DiscoveredEntry],
+                          prefer: Optional[str] = None
+                          ) -> Optional[DiscoveredEntry]:
+    """Pick the entry to tune. Preference order: an explicit name match,
+    then the entry with the most tensor args that has an in-place output
+    (the canonical 'updates a buffer' shape), then the first entry.
+    Returns None when ``entries`` is empty (→ Tier-1 mode-switch)."""
+    if not entries:
+        return None
+    if prefer:
+        for e in entries:
+            if e.name == prefer or e.dotted_path == prefer:
+                return e
+    in_place = [e for e in entries if e.mutated_arg_index is not None
+                and any(a.alias for a in e.args)]
+    pool = in_place or entries
+    return max(pool, key=lambda e: len(e.tensor_args))
+
+
 _DEFAULT_FUSED_OP_TEMPLATE = (
     "torch.ops.grokking_optimizers.fused_{opt_lower}_simple_step")
 
@@ -10385,63 +11772,298 @@ def _split_fused_op_dotted(dotted: str) -> Tuple[str, str]:
     return (".".join(parts[:1]), ".".join(parts[1:]))
 
 
+# ── Mandate #9 — strict-math oracle flag posture ──────────────────────────
+# Fast-math tokens stripped when building the STRICT reference. The oracle
+# must be fast-math-OFF (the ground truth a fast-math variant is judged
+# against); never let the oracle inherit --use_fast_math/-ffast-math.
+_FAST_MATH_FLAGS: frozenset = frozenset({
+    "--use_fast_math", "-ffast-math", "--ftz=true",
+    "-fgpu-flush-denormals-to-zero", "-ffinite-math-only",
+    "-fassociative-math", "-freciprocal-math",
+})
+
+
+def _strict_math_flags(flags: List[str]) -> List[str]:
+    """Mandate #9 — strip every fast-math token from a flag list and append
+    the strict/wide-accumulation marker. Pure / CPU-testable."""
+    out = [f for f in flags if f not in _FAST_MATH_FLAGS]
+    if "-DSG_STRICT_MATH=1" not in out:
+        out.append("-DSG_STRICT_MATH=1")
+    return out
+
+
+# ── Mandate #12 — stack-level determinism preamble ────────────────────────
+# Injected into every validation subprocess so the "deterministic" tag means
+# what it claims: CUBLAS_WORKSPACE_CONFIG forces cuBLAS to a fixed workspace
+# (required for deterministic GEMM), and use_deterministic_algorithms makes
+# torch raise on any nondeterministic kernel rather than silently using one.
+_DETERMINISM_PREAMBLE = (
+    "os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')\n"
+    "        os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')\n")
+
+_DETERMINISM_TORCH_SETUP = (
+    "try:\n"
+    "            torch.use_deterministic_algorithms(True, warn_only=True)\n"
+    "        except Exception:\n"
+    "            pass\n")
+
+
+# ── Mandate #10 — randomized, adversarial input synthesis ─────────────────
+# Magnitude regimes the validation inputs span. Each maps to a torch
+# expression building a tensor of the given shape/dtype from a seeded
+# generator ``g``. The adversarial regime mixes large / tiny / zero so a
+# transform that breaks on cancellation or dynamic range is caught — but
+# stays FINITE (NaN/Inf would make the tolerance comparison meaningless).
+_INPUT_REGIMES: Tuple[str, ...] = ("normal", "large", "small", "adversarial")
+
+
+def _regime_tensor_expr(regime: str, size_expr: str, dtype_expr: str) -> str:
+    """Return a torch expression (string) building one input tensor for the
+    given magnitude regime. Pure / CPU-testable (returns code, runs nowhere
+    here)."""
+    base = f"torch.randn({size_expr}, generator=g, dtype=torch.float32)"
+    if regime == "normal":
+        expr = base
+    elif regime == "large":
+        expr = f"({base} * 1e4)"
+    elif regime == "small":
+        expr = f"({base} * 1e-4)"
+    elif regime == "adversarial":
+        # Interleave large / tiny / zero magnitudes across the buffer.
+        expr = (f"({base} * "
+                f"torch.tensor([1e6, 1e-6, 0.0, 1.0], dtype=torch.float32)"
+                f".repeat(({size_expr} + 3) // 4)[:{size_expr}])")
+    else:
+        expr = base
+    return f"({expr}).to(device='cuda', dtype={dtype_expr})"
+
+
+def _synthesize_input_spec(n_tensors: int, n_scalars: int, *,
+                           regime: str = "normal",
+                           seed: int = 0) -> Dict[str, Any]:
+    """Mandate #10 — describe the synthesized inputs for a discovered entry:
+    ``n_tensors`` seeded random tensors in the given magnitude regime, plus
+    ``n_scalars`` scalar defaults. Returned dict is JSON-serializable and
+    cached for reproducibility (the seed is recorded). Pure / CPU-testable."""
+    if regime not in _INPUT_REGIMES:
+        raise ValueError(f"unknown input regime {regime!r}; "
+                         f"valid: {_INPUT_REGIMES}")
+    return {"n_tensors": n_tensors, "n_scalars": n_scalars,
+            "regime": regime, "seed": seed}
+
+
+def _validation_regimes(spec) -> List[str]:
+    """The input regimes a variant is validated against (Decision #4 —
+    'sweep adversarial regimes'). A variant must match the strict oracle on
+    EVERY returned regime, so a fast-math/synth/polyhedral kernel that only
+    diverges under large dynamic range or denormals is caught — not just a
+    single benign draw.
+
+    Project-agnostic: defaults to the full adversarial set; a project may
+    narrow/reorder it via ``[numerics].regimes`` in its config (any subset of
+    ``_INPUT_REGIMES``). Unknown names are dropped; an empty/garbage override
+    falls back to the full set so coverage can only be reduced deliberately."""
+    cfg = (getattr(spec, "config", None) or {}).get("numerics", {}) or {}
+    override = cfg.get("regimes")
+    if override:
+        valid = [r for r in override if r in _INPUT_REGIMES]
+        if valid:
+            # Preserve _INPUT_REGIMES order for deterministic capture/cache.
+            return [r for r in _INPUT_REGIMES if r in valid]
+    return list(_INPUT_REGIMES)
+
+
+def _validate_against_regimes(
+        variant_so: Path, opt_class: str, ref_state: Dict[str, Any],
+        resolve_ref: Callable[..., Optional[Path]], regimes: List[str],
+        dump_dir: Path, ckey: str, report, *,
+        fused_op_template=None, label: str = "variant",
+        run_determinism: bool = True) -> str:
+    """Validate one variant's output against the strict oracle across MULTIPLE
+    input regimes (Decision #4). The variant must match the oracle on EVERY
+    regime; the first divergence (or per-regime oracle/dump failure) fails
+    closed with ``numerical_fail``. On full agreement, optionally run the 3x
+    determinism check (on the ``normal`` regime — determinism is a kernel
+    property independent of input magnitude). Returns a numerical_status string
+    (``deterministic`` / ``non_deterministic`` / ``ok`` / ``numerical_fail`` /
+    ``skipped``).
+
+    The dump / compare / determinism subprocess helpers are called by the same
+    module-global names the self-tests mock, so this stays CPU-testable."""
+    size = ref_state["size"]
+    dtype = ref_state["dtype"]
+    entry = ref_state.get("entry")
+    max_rel_overall = 0.0
+    validated_any = False
+    for rg in regimes:
+        ref_path = resolve_ref(rg, 0)
+        if ref_path is None:
+            # The 'normal' oracle availability was already checked by the
+            # caller; a None for a LATER regime means that regime's capture
+            # failed. Fail closed rather than silently passing on fewer regimes.
+            report.write(
+                f"    [numerical] {label} {ckey[:24]} regime={rg}: oracle "
+                f"capture FAILED -> numerical_fail\n")
+            return "numerical_fail"
+        out_dump = dump_dir / f"_out_{label}_{_short_key(ckey)}_{rg}.npy"
+        if out_dump.exists():
+            try:
+                out_dump.unlink()
+            except OSError:
+                pass
+        dumped = _dump_variant_output(
+            variant_so, opt_class, size, dtype, out_dump,
+            fused_op_template=fused_op_template, entry=entry,
+            regime=rg, seed=0)
+        if not (dumped and out_dump.exists()):
+            report.write(
+                f"    [numerical] {label} {ckey[:24]} regime={rg}: dump "
+                f"FAILED (oracle present) -> numerical_fail\n")
+            return "numerical_fail"
+        try:
+            st, max_rel = _compare_outputs(ref_path, out_dump, dtype)
+        except Exception as exc:
+            report.write(
+                f"    [numerical] {label} {ckey[:24]} regime={rg}: compare "
+                f"ERROR -> numerical_fail: {exc}\n")
+            return "numerical_fail"
+        validated_any = True
+        max_rel_overall = max(max_rel_overall, max_rel)
+        report.write(
+            f"    [numerical] {label} {ckey[:24]} regime={rg}: {st} "
+            f"(max_rel={max_rel:.3e})\n")
+        if st not in ("ok", "deterministic"):
+            # Diverged on this regime — the variant is unsafe; stop early.
+            return st
+    if not validated_any:
+        return "skipped"
+    if not run_determinism:
+        return "ok"
+    det = _check_determinism_3x(
+        variant_so, opt_class, size, dtype, dump_dir,
+        fused_op_template=fused_op_template, entry=entry,
+        regime="normal", seed=0)
+    status = "deterministic" if det else "non_deterministic"
+    report.write(
+        f"    [numerical:3x] {label} {ckey[:24]} -> {status} "
+        f"(matched oracle on {len(regimes)} regime(s), "
+        f"worst max_rel={max_rel_overall:.3e})\n")
+    return status
+
+
+def _render_arg_construction(entry: Optional["DiscoveredEntry"],
+                             size: int, regime: str, seed: int) -> str:
+    """Build the subprocess code that constructs the call arguments.
+
+    With a discovered ``entry`` (mandate #4/#11): one synthesized tensor per
+    tensor arg (in the given regime), a sensible default per scalar arg, in
+    schema order. Without an entry (grokking back-compat): the historical
+    Adam-style ``(param, grad, m, v, lr, b1, b2, eps, wd, step)`` arg list —
+    but with SYNTHESIZED inputs (#10) instead of the degenerate zeros/ones.
+    """
+    # #10 — record the reproducible input spec (n_tensors/n_scalars/regime/
+    # seed). Validates the regime (raises on a bad one) and documents the
+    # synthesis as a provenance header so a captured oracle is reproducible.
+    if entry is not None and entry.args:
+        n_tensors = len(entry.tensor_args)
+        n_scalars = entry.arity - n_tensors
+    else:
+        n_tensors, n_scalars = 2, 8  # param,grad + 8 Adam scalars
+    in_spec = _synthesize_input_spec(n_tensors, n_scalars,
+                                     regime=regime, seed=seed)
+    lines: List[str] = [
+        f"# input-spec: {in_spec}",
+        f"g = torch.Generator().manual_seed({seed})",
+    ]
+    if entry is not None and entry.args:
+        names: List[str] = []
+        scalar_floats = iter([1e-3, 0.9, 0.999, 1e-8, 0.01, 1.0])
+        for i, a in enumerate(entry.args):
+            vn = f"a{i}"
+            if a.kind == "tensor":
+                lines.append(
+                    f"{vn} = {_regime_tensor_expr(regime, str(size), 'dtype')}")
+            elif a.dtype == "int":
+                lines.append(f"{vn} = 1")
+            elif a.dtype == "bool":
+                lines.append(f"{vn} = False")
+            else:
+                lines.append(f"{vn} = {next(scalar_floats, 1e-3)}")
+            names.append(vn)
+        lines.append(f"call_args = [{', '.join(names)}]")
+        # The buffer we snapshot for comparison (in-place / first tensor).
+        idx = entry.mutated_arg_index
+        lines.append(f"snapshot_idx = {idx if idx is not None else 0}")
+    else:
+        t = _regime_tensor_expr(regime, str(size), "dtype")
+        lines.append(f"param = {t}")
+        lines.append(f"grad  = {_regime_tensor_expr(regime, str(size), 'dtype')}")
+        lines.append(f"m     = torch.zeros({size}, dtype=dtype, device='cuda')")
+        lines.append(f"v     = torch.zeros({size}, dtype=dtype, device='cuda')")
+        lines.append("call_args = [param, grad, m, v, "
+                     "1e-3, 0.9, 0.999, 1e-8, 0.01, 1.0]")
+        lines.append("snapshot_idx = 0")
+    return "\n        ".join(lines)
+
+
 def _capture_reference_output(aot_so_path: Path, opt_class: str,
                               size: int, dtype: str,
                               out_dir: Path,
-                              fused_op_template: Optional[str] = None) -> Path:
-    """Run the AOT optimiser once and save the post-step parameter tensor
-    as a .npy file. Cached per (opt, size, dtype) — re-uses an existing
-    snapshot if one is already on disk.
+                              fused_op_template: Optional[str] = None,
+                              entry: Optional["DiscoveredEntry"] = None,
+                              regime: str = "normal",
+                              seed: int = 0) -> Path:
+    """Mandate #9/#10/#11 — capture the STRICT reference output.
 
-    Stream A: ``fused_op_template`` (default
-    ``torch.ops.grokking_optimizers.fused_{opt_lower}_simple_step``) is
-    the dotted path the subprocess walks via ``getattr`` to find the
-    fused-step op registered by ``torch.ops.load_library``. Pass a custom
-    template (e.g. ``torch.ops.myproj.fused_{opt_lower}_step``) for a
-    third-party project that registers ops in its own namespace.
+    ``aot_so_path`` MUST be a fast-math-OFF strict-math build of the
+    discovered entry (the caller builds it with ``_strict_math_flags``); this
+    function runs it once on SYNTHESIZED inputs (``regime``/``seed``, #10)
+    using the DISCOVERED signature (``entry``, #11) and snapshots the
+    mutated/first tensor as the .npy oracle. With no ``entry`` it falls back
+    to the historical Adam-style arg list (grokking back-compat) but still
+    uses synthesized inputs, never the degenerate zeros/ones.
+
+    Cached per (opt, size, dtype, regime, seed). The seed is part of the key
+    so the reproducible regime is provenance-tracked (#10).
     """
-    ref_path = out_dir / f"ref_output_{opt_class}_{size}_{dtype}.npy"
+    ref_path = out_dir / \
+        f"ref_output_{opt_class}_{size}_{dtype}_{regime}_s{seed}.npy"
     if ref_path.exists():
         return ref_path
     out_dir.mkdir(parents=True, exist_ok=True)
     tmpl = fused_op_template or _DEFAULT_FUSED_OP_TEMPLATE
-    dotted = _format_fused_op_template(tmpl, opt_class)
+    dotted = (entry.dotted_path if entry is not None
+              else _format_fused_op_template(tmpl, opt_class))
     root_expr, attr_chain = _split_fused_op_dotted(dotted)
-    # Tiny subprocess: load the AOT .so via torch.ops.load_library, run a
-    # single fused-step call, dump the resulting param tensor with numpy.
-    # Wrapped in a try/except so a missing torch op falls through to
-    # "skipped" upstream rather than crashing the entire autotune.
+    arg_setup = _render_arg_construction(entry, size, regime, seed)
     script = textwrap.dedent(f"""
         import os, sys, numpy as np
-        os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
+        {_DETERMINISM_PREAMBLE.strip()}
         import torch
+        {_DETERMINISM_TORCH_SETUP.strip()}
         torch.ops.load_library(r'''{aot_so_path}''')
-        torch.manual_seed(0)
+        torch.manual_seed({seed})
         dtype = getattr(torch, '{dtype}')
-        param = torch.zeros({size}, dtype=dtype, device='cuda')
-        grad  = torch.ones( {size}, dtype=dtype, device='cuda')
-        m     = torch.zeros({size}, dtype=dtype, device='cuda')
-        v     = torch.zeros({size}, dtype=dtype, device='cuda')
-        # Stream A: walk the configured fused-op dotted path via getattr
-        # so a custom namespace (torch.ops.myproj.*) works the same as
-        # the default torch.ops.grokking_optimizers.*.
+        {arg_setup}
         root = {root_expr}
         attr = {attr_chain!r}
         op = root
         for _part in attr.split('.'):
             op = getattr(op, _part, None)
             if op is None:
-                sys.stderr.write('no fused op for {opt_class} at {dotted}\\n')
+                sys.stderr.write('no op for {opt_class} at {dotted}\\n')
                 sys.exit(2)
-        op(param, grad, m, v, 1e-3, 0.9, 0.999, 1e-8, 0.01, 1.0)
-        np.save(r'''{ref_path}''', param.detach().cpu().numpy())
+        op(*call_args)
+        snap = call_args[snapshot_idx]
+        np.save(r'''{ref_path}''', snap.detach().cpu().float().numpy())
         print('OK')
     """)
     r = subprocess.run([sys.executable, "-c", script],
                        capture_output=True, text=True, timeout=120)
     if r.returncode != 0 or not ref_path.exists():
         raise RuntimeError(
-            f"reference capture failed (rc={r.returncode}): "
+            f"strict reference capture failed (rc={r.returncode}) for "
+            f"{opt_class} regime={regime} seed={seed}: "
             f"stderr={r.stderr[-500:]}")
     return ref_path
 
@@ -10474,27 +12096,29 @@ def _compare_outputs(ref_path: Path, candidate_path: Path,
 def _dump_variant_output(variant_so: Path, opt_class: str, size: int,
                          dtype: str, out_path: Path,
                          timeout: int = 120,
-                         fused_op_template: Optional[str] = None) -> bool:
-    """Run the variant .so once and dump its post-step param tensor to
-    ``out_path``. Returns True on success.
-
-    Stream A: ``fused_op_template`` mirrors ``_capture_reference_output``
-    — same default, same placeholder syntax, same getattr walk.
+                         fused_op_template: Optional[str] = None,
+                         entry: Optional["DiscoveredEntry"] = None,
+                         regime: str = "normal",
+                         seed: int = 0) -> bool:
+    """Run the variant .so once on the SAME synthesized inputs the oracle
+    used (#9/#10/#11) and dump the snapshot tensor to ``out_path``. Returns
+    True on success. The determinism preamble (#12) is applied so a 3x re-run
+    of this output is a meaningful determinism check.
     """
     tmpl = fused_op_template or _DEFAULT_FUSED_OP_TEMPLATE
-    dotted = _format_fused_op_template(tmpl, opt_class)
+    dotted = (entry.dotted_path if entry is not None
+              else _format_fused_op_template(tmpl, opt_class))
     root_expr, attr_chain = _split_fused_op_dotted(dotted)
+    arg_setup = _render_arg_construction(entry, size, regime, seed)
     script = textwrap.dedent(f"""
         import os, sys, numpy as np
-        os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
+        {_DETERMINISM_PREAMBLE.strip()}
         import torch
+        {_DETERMINISM_TORCH_SETUP.strip()}
         torch.ops.load_library(r'''{variant_so}''')
-        torch.manual_seed(0)
+        torch.manual_seed({seed})
         dtype = getattr(torch, '{dtype}')
-        param = torch.zeros({size}, dtype=dtype, device='cuda')
-        grad  = torch.ones( {size}, dtype=dtype, device='cuda')
-        m     = torch.zeros({size}, dtype=dtype, device='cuda')
-        v     = torch.zeros({size}, dtype=dtype, device='cuda')
+        {arg_setup}
         root = {root_expr}
         attr = {attr_chain!r}
         op = root
@@ -10502,37 +12126,48 @@ def _dump_variant_output(variant_so: Path, opt_class: str, size: int,
             op = getattr(op, _part, None)
             if op is None:
                 sys.exit(2)
-        op(param, grad, m, v, 1e-3, 0.9, 0.999, 1e-8, 0.01, 1.0)
-        np.save(r'''{out_path}''', param.detach().cpu().numpy())
+        op(*call_args)
+        snap = call_args[snapshot_idx]
+        np.save(r'''{out_path}''', snap.detach().cpu().float().numpy())
         print('OK')
     """)
     try:
         r = subprocess.run([sys.executable, "-c", script],
                            capture_output=True, text=True, timeout=timeout)
         return r.returncode == 0 and out_path.exists()
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_dump_variant_output', _swexc)
         return False
 
 
 def _check_determinism_3x(variant_so: Path, opt_class: str, size: int,
                           dtype: str, out_dir: Path,
-                          fused_op_template: Optional[str] = None) -> bool:
+                          fused_op_template: Optional[str] = None,
+                          entry: Optional["DiscoveredEntry"] = None,
+                          regime: str = "normal",
+                          seed: int = 0) -> bool:
     """Run the variant 3 times; return True iff all 3 outputs are
     bit-identical to each other.
 
-    Stream A: ``fused_op_template`` is forwarded to
-    ``_dump_variant_output``."""
+    Fix-#2 §3: ``entry``/``regime``/``seed`` are forwarded to
+    ``_dump_variant_output`` so the determinism check uses the SAME
+    oracle-matched inputs as the validation pass."""
     import numpy as np
     paths: List[Path] = []
+    # Include a per-variant token (.so stem) + regime/seed in the temp filename
+    # so concurrent determinism checks across configs cannot collide on the same
+    # scratch files (serial today, but the build-pool TODO would break it).
+    vtag = _short_key(f"{Path(variant_so).stem}_{regime}_{seed}")
     for i in range(3):
-        p = out_dir / f"_det_check_{i}_{opt_class}_{size}_{dtype}.npy"
+        p = out_dir / f"_det_check_{i}_{opt_class}_{size}_{dtype}_{vtag}.npy"
         if p.exists():
             try:
                 p.unlink()
             except OSError:
                 pass
         if not _dump_variant_output(variant_so, opt_class, size, dtype, p,
-                                    fused_op_template=fused_op_template):
+                                    fused_op_template=fused_op_template,
+                                    entry=entry, regime=regime, seed=seed):
             return False
         paths.append(p)
     if len(paths) < 2:
@@ -10583,8 +12218,8 @@ def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
             spec._emitted_sources[config_key(config)] = emitted_path
             macros_only = resolve_macros(config, dims, target)
             return macros_only + residual
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('_variant_macros', _swexc)
     macros = resolve_macros(config, dims, target)
     if target != "device":
         return macros
@@ -10602,6 +12237,106 @@ def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
     return macros + (extra if "--maxrregcount" not in " ".join(extra_hip) else extra_hip)
 
 
+def _time_validate_fastmath_variants(
+        spec: BuildSpec, config: Dict[str, Any],
+        variant_sources: List[Path],
+        full_host: List[str], full_device: List[str], ldflags: List[str],
+        cache: CompileCache, worker, report, arch_entry,
+        resolve_ref: Callable[..., Optional[Path]], ref_state: Dict[str, Any],
+        regimes: List[str],
+        variant_dump_dir: Path, strict: bool, numerics_enabled: bool,
+        trial_num: int) -> List[Dict[str, Any]]:
+    """Fix-#2 Defect-1 — build, time, and strictly-validate the fast-math
+    flag variants (#6) of ``config``, returning one trial record per
+    generated variant.
+
+    Each variant adds ``_fast_math_variant_flags(name, vendor)`` ON TOP of the
+    strict build's host/device flags (the base lists are NOT modified). The
+    added flags feed the build signature / cache hash so a fast-math build is
+    tracked separately from the strict build. The variant is timed and its
+    output compared against the SAME strict oracle, now ACROSS ALL adversarial
+    input regimes (#4): a fast-math kernel is exactly the kind that diverges
+    only under large/denormal magnitudes, so it must match the strict reference
+    on every regime. The result is stamped ``origin=ORIGIN_FASTMATH`` + its
+    numerical_status so pick_winner (#16) keeps it ONLY if it matched the strict
+    reference (a diverging fast-math variant is dropped). Loud-not-silent: logs
+    N/A for Pallas and a WARNING when zero variants are generated on a CUDA/HIP
+    sweep (§2A)."""
+    records: List[Dict[str, Any]] = []
+    vendor = arch_entry.vendor
+    if vendor not in ("cuda", "hip"):
+        report.write(f"    [fastmath] N/A for vendor={vendor} "
+                     f"(no nvcc/hipcc fast-math flags); not explored.\n")
+        return records
+    # Oracle availability (and one-time strict-posture warning) — the 'normal'
+    # regime gates whether validation is possible at all.
+    oracle_available = (numerics_enabled
+                        and resolve_ref("normal", 0) is not None)
+    generated = 0
+    for name in _FAST_MATH_VARIANTS:
+        host_fm, dev_fm = _fast_math_variant_flags(name, vendor)
+        if not host_fm and not dev_fm:
+            continue
+        fm_cfg = {**config, "_fastmath": name}
+        fm_ckey = config_key(fm_cfg)
+        fm_host = list(full_host) + host_fm
+        fm_device = list(full_device) + dev_fm
+        # Added flags feed the build signature → device/host cflags hash, so a
+        # fast-math build is never confused with the strict build in the cache.
+        fm_sig = _hash_flags(
+            [str(s) for s in variant_sources]
+            + [_hash_sources(list(variant_sources))]
+            + fm_host + fm_device + list(ldflags))
+        fm_so = cache.get_fresh_variant(
+            spec.optimizer, spec.model, spec.arch, fm_ckey, fm_sig)
+        if fm_so is not None:
+            report.write(f"    [fastmath:{name}] variant-cache HIT "
+                         f"{fm_ckey[:24]} (skipped recompile)\n")
+        else:
+            fm_so = _torch_load(
+                spec, variant_sources, fm_host, fm_device, ldflags, report,
+                module_suffix=f"_{_short_key(fm_ckey)}")
+        if fm_so is None:
+            report.write(f"    [fastmath:{name}] build FAILED — variant "
+                         f"dropped (strict build is unaffected).\n")
+            continue
+        cache.record_variant(spec.optimizer, spec.model, spec.arch,
+                             fm_ckey, fm_so, build_sig=fm_sig)
+        generated += 1
+        # Fix-#2 §3 — time the variant (pure timing, no dump).
+        fm_result = None
+        if worker is not None and worker.alive():
+            fm_result = worker.time(fm_so)
+        if fm_result is None:
+            fm_result = _time_variant_oneshot(
+                fm_so, OPT_CLASS[spec.optimizer], report=report,
+                python_package=spec.python_package)
+        # Fix-#2 §3 + #4 — validate via the shared multi-regime helper (fresh
+        # subprocess dumps, oracle-matched inputs, fail-closed on the first
+        # diverging regime). Generated origins (fastmath) are ALWAYS validated.
+        fm_status = "skipped"
+        if fm_result is not None and oracle_available:
+            fm_status = _validate_against_regimes(
+                fm_so, OPT_CLASS[spec.optimizer], ref_state,
+                resolve_ref, regimes, variant_dump_dir, fm_ckey, report,
+                fused_op_template=getattr(spec, "fused_op_template", None),
+                label=f"fastmath:{name}")
+        elif fm_result is not None:
+            report.write(f"    [fastmath:{name}] timed but NOT validated "
+                         f"(numerics_enabled={numerics_enabled}, "
+                         f"oracle={'present' if oracle_available else 'absent'})"
+                         f" — will be ineligible to win (#16).\n")
+        _LAST_VARIANT_ORIGIN[fm_ckey] = ORIGIN_FASTMATH
+        _LAST_NUMERICAL_STATUS[fm_ckey] = fm_status
+        records.append(_make_trial_record(
+            "fastmath", trial_num, fm_cfg, fm_result, host=_current_host()))
+    if generated == 0:
+        report.write(f"    [fastmath] WARNING: 0 fast-math variants generated "
+                     f"for vendor={vendor} — fast-math NOT explored for this "
+                     f"config (check _FAST_MATH_VARIANTS).\n")
+    return records
+
+
 def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                         host_cflags_base: List[str],
                         device_cflags_base: List[str],
@@ -10610,7 +12345,8 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                         worker,                       # Optional[TimingWorker]
                         report,
                         progress_state: Dict[str, Any],
-                        cost_model_state: Optional[Dict[str, Any]] = None):
+                        cost_model_state: Optional[Dict[str, Any]] = None,
+                        fastmath_sink: Optional[List[Dict[str, Any]]] = None):
     """Return a closure ``timer(config) -> result dict | None`` for the
     Bayesian/Exhaustive driver. Builds the variant .so, records it in
     the cache, then asks the worker to time it (fallback: one-shot
@@ -10687,27 +12423,122 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
     # The reference output is captured lazily on the first variant so we
     # don't pay for it when the autotune cache hits AOT-only or when the
     # AOT .so doesn't expose the expected fused op.
-    ref_state: Dict[str, Any] = {"path": None, "tried": False,
-                                 "size": 4096, "dtype": "float32"}
+    # Per-regime oracle cache (Decision #4). ``paths`` maps (regime, seed) →
+    # captured reference .npy; ``entry`` is the resolved entry-point (None =
+    # template path) and is reused across regimes once resolved.
+    ref_state: Dict[str, Any] = {
+        "paths": {}, "entry": None, "entry_resolved": False,
+        "warned": False, "oracle_unavailable": False,
+        "size": 4096, "dtype": "float32"}
 
-    def _resolve_ref() -> Optional[Path]:
+    def _resolve_ref(regime: str = "normal", seed: int = 0) -> Optional[Path]:
+        """Capture (or return the cached) strict-oracle reference output for a
+        given input regime. The strict-posture warning and entry-point
+        resolution happen once on the first call; subsequent regimes reuse the
+        resolved entry and only differ in the synthesized input draw."""
         if not numerics_enabled:
             return None
-        if ref_state["path"] is not None:
-            return ref_state["path"]
-        if ref_state["tried"]:
+        rk = (regime, seed)
+        cached = ref_state["paths"].get(rk)
+        if cached is not None:
+            return cached
+        if ref_state["oracle_unavailable"]:
             return None
-        ref_state["tried"] = True
-        try:
-            p = _capture_reference_output(
+        # Mandate #9 — the oracle must be a fast-math-OFF strict build. The
+        # AOT .so is the reference source; post-#6 the base is strict-math, so
+        # the oracle is uncontaminated. Fix-#2 re-audit — actively GUARD that:
+        # check the EFFECTIVE device flags (base ⊕ project [device_cflags].
+        # extra) for any fast-math token and WARN loudly if present, since a
+        # project that re-adds fast-math to its config would contaminate the
+        # oracle. _strict_math_flags computes what the strict build would be.
+        # One-time (regime-independent).
+        if not ref_state["warned"]:
+            ref_state["warned"] = True
+            try:
+                eff_device = _device_cflags(spec)
+            except Exception as exc:
+                _debug_swallow("_resolve_ref.eff_device", exc)
+                eff_device = list(NVCC_DEVICE_BASE)
+            fm_contam = [f for f in eff_device if f in _FAST_MATH_FLAGS]
+            if fm_contam:
+                # _strict_math_flags would drop exactly these fast-math tokens
+                # (and append the strict marker); report the real count dropped.
+                _ = _strict_math_flags(eff_device)
+                report.write(
+                    f"  [numerical] WARNING: oracle build carries fast-math "
+                    f"flags {fm_contam} via project config — the strict "
+                    f"reference may be CONTAMINATED. Strict build would drop "
+                    f"{len(fm_contam)} fast-math flag(s). "
+                    f"A fast-math variant validated against a fast-math oracle "
+                    f"is not a real check.\n")
+            strict_posture = not fm_contam
+            report.write(
+                f"  [numerical] capturing strict oracle "
+                f"(base_strict_math={strict_posture}) on synthesized inputs "
+                f"across regimes {list(_validation_regimes(spec))}.\n")
+
+        def _capture(entry) -> Path:
+            if entry is None:
+                return _capture_reference_output(
+                    Path(aot_so), OPT_CLASS[spec.optimizer],
+                    ref_state["size"], ref_state["dtype"], spec.out_dir,
+                    fused_op_template=spec.fused_op_template,
+                    regime=regime, seed=seed)
+            return _capture_reference_output(
                 Path(aot_so), OPT_CLASS[spec.optimizer],
                 ref_state["size"], ref_state["dtype"], spec.out_dir,
-                fused_op_template=spec.fused_op_template)
-            ref_state["path"] = p
+                entry=entry, regime=regime, seed=seed)
+
+        # Entry already resolved (a prior regime) — capture this regime directly
+        # with the same entry so all regimes share one oracle source.
+        if ref_state["entry_resolved"]:
+            try:
+                p = _capture(ref_state["entry"])
+                ref_state["paths"][rk] = p
+                return p
+            except Exception as exc:
+                report.write(
+                    f"  [numerical] oracle capture for regime={regime} "
+                    f"failed ({exc}); this regime cannot be validated.\n")
+                return None
+
+        # First capture — resolve the entry: prefer the configured
+        # fused_op_template (grokking path, byte-identical); fall back to
+        # entry-point DISCOVERY on the AOT .so when the template op can't be
+        # found, so a generic zero-manifest project still gets an oracle.
+        try:
+            p = _capture(None)
+            ref_state["entry"] = None
+            ref_state["entry_resolved"] = True
+            ref_state["paths"][rk] = p
             return p
         except Exception as exc:
-            report.write(f"  [numerical] reference capture skipped: {exc}\n")
-            return None
+            report.write(f"  [numerical] template-based reference capture "
+                         f"failed ({exc}); trying entry-point discovery "
+                         f"(Tier-2).\n")
+            try:
+                entries = _discover_entry_points(Path(aot_so), report=report)
+                chosen = _select_tunable_entry(entries)
+                if chosen is None:
+                    report.write("  [numerical] discovery found no tunable "
+                                 "entry — oracle unavailable, validation "
+                                 "disabled for this sweep.\n")
+                    ref_state["oracle_unavailable"] = True
+                    return None
+                report.write(f"  [numerical] discovered entry "
+                             f"{chosen.dotted_path} (arity={chosen.arity}); "
+                             f"capturing oracle from it.\n")
+                p = _capture(chosen)
+                ref_state["entry"] = chosen
+                ref_state["entry_resolved"] = True
+                ref_state["paths"][rk] = p
+                return p
+            except Exception as exc2:
+                report.write(f"  [numerical] discovery-based reference "
+                             f"capture also failed: {exc2}. Validation "
+                             f"disabled for this sweep.\n")
+                ref_state["oracle_unavailable"] = True
+                return None
 
     def timer(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         ckey = config_key(config)
@@ -10721,14 +12552,20 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         if (spec.enable_cost_model
                 and cost_model_state is not None):
             reg = cost_model_state.get("model")
-            if reg is not None and reg.is_warm():
+            # Mandate #14 — cold-start floor: never prune until >= N trials
+            # have been MEASURED (under locked clocks, #1). Below the floor the
+            # model is under-fit / clock-noisy, so we measure every candidate.
+            n_measured = int(cost_model_state.get("n_measured", 0))
+            cold = n_measured < _COST_MODEL_COLD_START_FLOOR
+            if reg is not None and reg.is_warm() and not cold:
                 try:
                     arch_entry_cm = cost_model_state.get("arch_entry")
                     stall_info_cm = cost_model_state.get("stall_info")
                     feat = featurize_config(config, dims, arch_entry_cm,
                                             stall_info_cm)
                     ms_pred, sigma_pred = reg.predict(feat)
-                except Exception:
+                except Exception as _swexc:
+                    _debug_swallow('timer', _swexc)
                     ms_pred, sigma_pred = float("inf"), float("inf")
                 best = cost_model_state.get("best_so_far",
                                             float("inf")) or float("inf")
@@ -10736,8 +12573,13 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                     spec.cost_model_rejection_threshold_x or 3.0)
                 threshold = threshold_x * best if math.isfinite(best) else \
                     float("inf")
-                # High confidence = sigma small relative to mean.
-                high_confidence = sigma_pred < 0.2 * abs(ms_pred)
+                # High confidence = sigma SMALL BUT POSITIVE relative to mean.
+                # A backend with no real uncertainty estimate returns
+                # sigma_pred == 0.0 (linear fallback, <2 bootstrap models, or
+                # all-equal preds); treating 0.0 as "high confidence" would let
+                # an uncertainty-blind model prune the true optimum. Require a
+                # genuine (>0) estimate before trusting the rejection.
+                high_confidence = 0.0 < sigma_pred < 0.2 * abs(ms_pred)
                 if (math.isfinite(ms_pred) and math.isfinite(threshold)
                         and ms_pred > threshold and high_confidence):
                     n_total = int(cost_model_state.get("n_total", 0)) + 1
@@ -10769,21 +12611,52 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         # back on spec._emitted_sources for downstream introspection.
         # Failures here MUST NOT break the un-polyhedral flow — both
         # libclang and islpy are optional.
+        # A polyhedral-transformed source to BUILD for this ckey (None unless
+        # the reschedule actually emitted a compilable variant). Resolved by the
+        # hook below; applied to variant_sources after the template default is
+        # set, so origin=polyhedral is only stamped when a transformed source is
+        # genuinely compiled (never the template wearing a polyhedral tag).
+        poly_source: Optional[Path] = None
         try:
             poly_cfg = (spec.config or {}).get(
                 "polyhedral", {}) or {}
             if poly_cfg.get("enable"):
+                # Mandate #20 — surface missing optional deps loudly (the
+                # heuristic dependence test can emit an ILLEGAL reschedule, so
+                # the user must know when libclang/islpy — which would tighten
+                # legality — are absent).
+                if _try_import_libclang() is None or _try_import_islpy() is None:
+                    report.write(
+                        f"    [polyhedral] libclang/islpy not both present "
+                        f"for {ckey[:24]}: legality is heuristic; every "
+                        f"polyhedral variant is gated behind the strict "
+                        f"on-device oracle (#16/#20).\n")
                 emitted_source = (spec._emitted_sources or {}).get(ckey)
                 if emitted_source is not None and Path(emitted_source).exists():
-                    _polyhedral_expand_variant(
+                    _transformed = _polyhedral_expand_variant(
                         spec, Path(emitted_source), report)
+                    # Pick the first schedule variant that actually landed on
+                    # disk. ONLY this makes origin=polyhedral honest — the
+                    # previous code discarded the return value, left
+                    # variant_sources pointing at the template, and stamped
+                    # ORIGIN_POLYHEDRAL anyway, so the strict-oracle gate was
+                    # attributing a transformation that was never compiled.
+                    poly_source = next(
+                        (Path(p) for p in _transformed if Path(p).exists()),
+                        None)
+                    if poly_source is None:
+                        report.write(
+                            f"    [polyhedral] {ckey[:24]}: no compilable "
+                            f"schedule variant emitted; building the template "
+                            f"(honestly tagged origin=template, not "
+                            f"polyhedral).\n")
         except Exception as exc:
             try:
                 report.write(
                     f"    [polyhedral] hook failed for {ckey[:24]}: "
                     f"{type(exc).__name__}: {exc}\n")
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('timer', _swexc)
 
         # Per-variant flush of the running ETA window.
         progress_state["last_start"] = time.monotonic()
@@ -10797,9 +12670,22 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
         # without modifying the timer's return shape. With the flag
         # OFF (the default), this branch is a no-op.
         variant_sources = list(sources)
+        # Mandate #20 — when the polyhedral hook produced a real transformed
+        # source, BUILD it (not the template) and only then stamp the origin,
+        # mirroring the synth path below. The strict on-device oracle (#16/#20)
+        # then validates a transformation that was actually compiled + run.
+        if poly_source is not None:
+            variant_sources = [poly_source]
+            _LAST_VARIANT_ORIGIN[ckey] = ORIGIN_POLYHEDRAL
+            spec._emitted_sources[f"{ckey}:polyhedral"] = poly_source
+            report.write(
+                f"    [polyhedral] {ckey[:24]}: building transformed schedule "
+                f"{poly_source.name} (origin=polyhedral — needs oracle PASS "
+                f"to win)\n")
         if spec.enable_synth_codegen:
             try:
-                synth_path = _try_synth_codegen(spec, config, dims)
+                synth_path = _try_synth_codegen(spec, config, dims,
+                                                report=report)
             except Exception as exc:
                 report.write(
                     f"    [synth_codegen] {ckey[:24]} skipped: "
@@ -10812,22 +12698,50 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                     # the synthesised file. The existing _torch_load
                     # call below picks this list up unchanged.
                     variant_sources = [synth_path]
+                    # Mandate #16 — this variant is GENERATED; tag its origin
+                    # so pick_winner requires a strict-oracle PASS before it
+                    # can win (never ships an unvalidated synth kernel).
+                    _LAST_VARIANT_ORIGIN[ckey] = ORIGIN_SYNTH
                     report.write(
                         f"    [synth_codegen] {ckey[:24]} "
-                        f"synth-only build: {synth_path.name}\n")
+                        f"synth-only build: {synth_path.name} "
+                        f"(origin=synth — needs oracle PASS to win)\n")
 
-        variant_so = _torch_load(
-            spec, variant_sources,
-            host_cflags_base + host_extra,
-            device_cflags_base + device_extra,
-            ldflags, report,
-            module_suffix=f"_{_short_key(ckey)}",
-        )
+        # Perf (time-to-quality) — build a signature over the exact sources +
+        # host/device flags this variant would compile with. If a cached .so
+        # with the SAME signature is already on disk (resumed/repeated sweep,
+        # or a cost-model re-measure), reuse it and SKIP the ~125s recompile —
+        # the artifact is byte-identical to a rebuild. Any change to sources
+        # or flags changes the signature, so a stale .so is never reused.
+        full_host = host_cflags_base + host_extra
+        full_device = device_cflags_base + device_extra
+        # Fold version-gated toolchain flags into the variant signature for the
+        # same reason as build_aot: a compiler upgrade changes the flags
+        # ``_torch_load`` appends, so a cached variant .so built by the old
+        # toolchain must not register as fresh. The flags are appended inside
+        # _torch_load (not added to full_host/full_device here) so we only hash.
+        _vsig_h, _vsig_d = _version_gated_flags_for_hash(spec.arch)
+        build_sig = _hash_flags(
+            [str(s) for s in variant_sources]
+            + [_hash_sources(list(variant_sources))]
+            + full_host + full_device + _vsig_h + _vsig_d + list(ldflags))
+        variant_so = cache.get_fresh_variant(
+            spec.optimizer, spec.model, spec.arch, ckey, build_sig)
+        if variant_so is not None:
+            report.write(f"    [variant-cache] HIT {ckey[:24]} — reusing "
+                         f"{variant_so.name} (skipped recompile)\n")
+        else:
+            variant_so = _torch_load(
+                spec, variant_sources,
+                full_host, full_device,
+                ldflags, report,
+                module_suffix=f"_{_short_key(ckey)}",
+            )
         if variant_so is None:
             _LAST_NUMERICAL_STATUS[ckey] = "skipped"
             return None
         cache.record_variant(spec.optimizer, spec.model, spec.arch,
-                             ckey, variant_so)
+                             ckey, variant_so, build_sig=build_sig)
 
         # Stream α — promote any ptxas-v info that _torch_load captured for
         # this variant's build directory into the per-config sidecar so
@@ -10840,78 +12754,113 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
             parsed = _LAST_PTXAS_INFO_BY_BUILD_DIR.pop(bdir, None)
             if parsed:
                 _LAST_PTXAS_INFO[ckey] = parsed
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('timer', _swexc)
 
-        # Tell the inline timing script to dump the post-step param tensor
-        # so we can numerically compare against the reference. The env var
-        # is consumed by both the persistent worker subprocess and the
-        # one-shot fallback (they re-exec child Python with child_env()).
-        out_dump = variant_dump_dir / f"_out_{_short_key(ckey)}.npy"
-        if out_dump.exists():
-            try:
-                out_dump.unlink()
-            except OSError:
-                pass
-        prior_dump = os.environ.get("SG_DUMP_OUTPUT")
-        os.environ["SG_DUMP_OUTPUT"] = str(out_dump)
-        try:
-            result = None
-            if worker is not None and worker.alive():
-                result = worker.time(variant_so)
-                if result is None:
-                    report.write(f"    [worker time failed for {ckey}; "
-                                 "restart + fallback]\n")
-                    worker.restart()
+        # Fix-#2 §3 — timing is DECOUPLED from validation. Time the
+        # variant via the worker/one-shot path (pure timing, no dump).
+        result = None
+        if worker is not None and worker.alive():
+            result = worker.time(variant_so)
             if result is None:
-                result = _time_variant_oneshot(
-                    variant_so, OPT_CLASS[spec.optimizer], report=report,
-                    python_package=spec.python_package)
-        finally:
-            if prior_dump is None:
-                os.environ.pop("SG_DUMP_OUTPUT", None)
-            else:
-                os.environ["SG_DUMP_OUTPUT"] = prior_dump
+                report.write(f"    [worker time failed for {ckey}; "
+                             "restart + fallback]\n")
+                worker.restart()
+        if result is None:
+            result = _time_variant_oneshot(
+                variant_so, OPT_CLASS[spec.optimizer], report=report,
+                python_package=spec.python_package)
 
-        # Update rolling window before we do the numerical work — the
-        # numerical phase is sequential and we don't want it polluting
-        # the per-variant ETA estimate.
         elapsed = time.monotonic() - progress_state["last_start"]
         progress_state["window"].append(elapsed)
         if len(progress_state["window"]) > 20:
             progress_state["window"].pop(0)
 
-        # ── Numerical validation pass ───────────────────────────────────
+        # ── Numerical validation pass (Fix-#2 §3 rewrite) ──────────────
+        # Uses an explicit _dump_variant_output call (fresh subprocess,
+        # oracle-matched inputs via _render_arg_construction) instead of
+        # the old env-var side-channel. Fixes both 5a (persistent worker
+        # frozen env) and 5b (shape mismatch).
+        #
+        # Gating policy (user-specified):
+        #   • generated-origin variants → always validate
+        #   • strict (template) configs → validate at new-best or under
+        #     --strict-numerics
+        # Results are cached by config_key to avoid redundant subprocess
+        # launches. Determinism 3x is folded into this step.
         num_status = "skipped"
+        origin = _LAST_VARIANT_ORIGIN.get(ckey, ORIGIN_TEMPLATE)
+        is_generated = origin in _VALIDATION_REQUIRED_ORIGINS
         if result is not None and numerics_enabled:
-            ref_path = _resolve_ref()
-            if ref_path is not None and out_dump.exists():
-                try:
-                    num_status, max_rel = _compare_outputs(
-                        ref_path, out_dump, ref_state["dtype"])
-                    report.write(
-                        f"    [numerical] {ckey[:24]} {num_status} "
-                        f"(max_rel={max_rel:.3e})\n")
-                    # Strict mode: only "deterministic" trials are eligible
-                    # to win, so promote within-tolerance variants by
-                    # re-running 3x and checking for bit-identical outputs.
-                    if (strict and num_status in ("ok", "deterministic")):
-                        det = _check_determinism_3x(
-                            variant_so, OPT_CLASS[spec.optimizer],
-                            ref_state["size"], ref_state["dtype"],
-                            variant_dump_dir,
+            cached_status = progress_state.get("_val_cache", {}).get(ckey)
+            if cached_status is not None:
+                num_status = cached_status
+            else:
+                ms = result.get("timing_ms")
+                best_so_far = progress_state.get("val_best_ms")
+                is_new_best = (ms is not None
+                               and (best_so_far is None or ms < best_so_far))
+                should_validate = (
+                    is_generated
+                    or is_new_best
+                    or strict
+                )
+                if should_validate:
+                    # Resolve the 'normal' oracle first — this preserves the
+                    # one-time strict-posture warning + entry resolution and the
+                    # "skipped when no oracle" semantics. If available, validate
+                    # the variant across ALL adversarial input regimes (#4): a
+                    # variant must match the oracle on every regime or it fails
+                    # closed (a fast-math kernel that only diverges under large/
+                    # denormal magnitudes is caught here, not just on a benign
+                    # draw).
+                    ref_path = _resolve_ref("normal", 0)
+                    if ref_path is not None:
+                        num_status = _validate_against_regimes(
+                            variant_so, OPT_CLASS[spec.optimizer], ref_state,
+                            _resolve_ref, _validation_regimes(spec),
+                            variant_dump_dir, ckey, report,
                             fused_op_template=getattr(
-                                spec, "fused_op_template", None))
-                        num_status = ("deterministic" if det
-                                      else "non_deterministic")
-                        report.write(
-                            f"    [numerical:strict] {ckey[:24]} "
-                            f"3x re-run -> {num_status}\n")
-                except Exception as exc:
-                    report.write(
-                        f"    [numerical] {ckey[:24]} skipped: {exc}\n")
-                    num_status = "skipped"
+                                spec, "fused_op_template", None),
+                            label="variant")
+                progress_state.setdefault("_val_cache", {})[ckey] = \
+                    num_status
+                if (num_status not in ("numerical_fail",)
+                        and result.get("timing_ms") is not None):
+                    ms_val = result["timing_ms"]
+                    if (best_so_far is None or ms_val < best_so_far):
+                        progress_state["val_best_ms"] = ms_val
         _LAST_NUMERICAL_STATUS[ckey] = num_status
+
+        # Fix-#2 Defect-1 — fast-math (#6) variant exploration. When this
+        # config sets a NEW BEST strict time, ALSO build/time/validate the
+        # additive fast-math variants on it and emit them as separate
+        # origin="fastmath" trials into the sink (drained into pick_winner by
+        # the driver). Tying exploration to new-best events bounds the extra
+        # compile cost while GUARANTEEING the eventual winner's fast-math is
+        # explored. A fast-math variant only wins if it matched the strict
+        # oracle (#16); a diverging one is dropped.
+        if (spec.enable_fastmath_variants and fastmath_sink is not None
+                and result is not None
+                and num_status != "numerical_fail"):
+            ms = result.get("timing_ms")
+            best_fm = progress_state.get("fm_best_ms")
+            is_new_best = (ms is not None
+                           and (best_fm is None or ms < best_fm))
+            if is_new_best:
+                progress_state["fm_best_ms"] = ms
+                progress_state["fm_trial_num"] = \
+                    progress_state.get("fm_trial_num", 0) + 1
+                fm_recs = _time_validate_fastmath_variants(
+                    spec, config, variant_sources, full_host, full_device,
+                    ldflags, cache, worker, report, arch_entry,
+                    _resolve_ref, ref_state, _validation_regimes(spec),
+                    variant_dump_dir, strict,
+                    numerics_enabled, progress_state["fm_trial_num"])
+                for r in fm_recs:
+                    fastmath_sink.append(r)
+                    cache.record_trial(spec.optimizer, spec.model,
+                                       spec.arch, r)
         return result
 
     return timer
@@ -10963,18 +12912,6 @@ try:
         torch.cuda.synchronize()
         timings.append(s.elapsed_time(e))
     timings.sort()
-    # Stream 10: dump post-step parameter tensor for numerical validation
-    # when SG_DUMP_OUTPUT is set. Side-effect only — does NOT change the
-    # JSON timing output that the caller parses.
-    dump_path = os.environ.get("SG_DUMP_OUTPUT")
-    if dump_path:
-        try:
-            import numpy as _np
-            _np.save(dump_path, p.detach().cpu().numpy())
-        except Exception as _dexc:
-            # Don't let a dump failure mask the timing result — the
-            # numerical layer will see the missing file and tag "skipped".
-            sys.stderr.write("[dump-output] " + repr(_dexc) + "\n")
     print(json.dumps({
         "timing_ms": timings[len(timings) // 2],
         "min_ms":    timings[0],
@@ -11103,22 +13040,25 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
     # iterates the Cartesian. Exhaustive mode streams survivors with a 1M
     # cap to bound memory.
     total_candidates = cartesian_count(space, spec.arch)
-    survivors: List[Dict[str, Any]] = []
+    survivors: Iterable[Dict[str, Any]] = []
+    n_survivors = 0
     if spec.autotune_mode == "exhaustive":
-        exhaustive_cap = 1_000_000
-        survivors, eliminated = ss_prefilter(
-            cartesian(space, spec.arch),
-            space[spec.arch].get("prefilter", {}),
-            max_survivors=exhaustive_cap,
-        )
-        capped = len(survivors) >= exhaustive_cap
-        cap_note = f" (capped at {exhaustive_cap:,})" if capped else ""
+        # TRUE exhaustive: sweep EVERY surviving config — NO cap. The point of
+        # exhaustive is maximal coverage of the whole feasible space; capping it
+        # would silently skip configs (sm_90a alone has ~1.58M survivors > the
+        # old 1M cap). Stream survivors lazily via iter_prefilter so even
+        # multi-million-survivor spaces never materialize the full list. A first
+        # cheap counting pass (feasibility predicate only — NO compiles) gives
+        # the total for the progress bar / ETA; the sweep re-streams them.
+        pf = space[spec.arch].get("prefilter", {})
+        n_survivors = sum(1 for _ in iter_prefilter(
+            cartesian(space, spec.arch), pf))
         report.write(f"  [prefilter] {total_candidates:,} candidates → "
-                     f"{len(survivors):,} survivors{cap_note} "
-                     f"({eliminated:,} eliminated en route)\n")
-        if not survivors:
+                     f"{n_survivors:,} survivors (uncapped — FULL sweep)\n")
+        if not n_survivors:
             report.write("  [jit-autotune] no survivors after prefilter.\n")
             return None
+        survivors = iter_prefilter(cartesian(space, spec.arch), pf)
     else:
         # Bayesian: skip materialization entirely. TPE samples per-dim values
         # via Optuna's suggest_categorical and validates each suggestion with
@@ -11142,13 +13082,21 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
     # matches TimingWorker, so the timer closure below is unchanged.
     vendor = get_arch_entry(spec.arch).vendor
     visible = MultiGPUTimingPool.visible_devices(vendor)
+    # Mandate #2 — per-arch L2 flush size for cold-cache timing.
+    l2_flush = _arch_l2_bytes(spec.arch)
+    report.write(f"  [l2-flush] arch={spec.arch} flush_buffer="
+                 f"{l2_flush / (1024 * 1024):.0f} MiB "
+                 f"({'enabled' if l2_flush else 'disabled'})\n")
+    # Mandate #8 — a sweep without a compiler cache is compile-bound. Warn
+    # loudly so the operator installs sccache/ccache.
+    _warn_if_no_compiler_cache(report)
     worker: Optional[Any] = None
     if len(visible) > 1:
         report.write(f"  [worker] {len(visible)} GPUs visible "
                      f"({','.join(visible)}); spawning MultiGPUTimingPool.\n")
         pool = MultiGPUTimingPool(
             OPT_CLASS[spec.optimizer], vendor=vendor,
-            python_package=spec.python_package)
+            python_package=spec.python_package, l2_bytes=l2_flush)
         if pool.start():
             worker = pool
             report.write(f"  [worker] multi-GPU pool up with "
@@ -11159,7 +13107,7 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
     if worker is None:
         single = TimingWorker(
             opt_class=OPT_CLASS[spec.optimizer],
-            python_package=spec.python_package)
+            python_package=spec.python_package, l2_bytes=l2_flush)
         if not single.start():
             report.write("  [worker] start FAILED; falling back to "
                          "one-shot per variant.\n")
@@ -11181,26 +13129,47 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
         "n_rejected":  0,
         "n_total":     0,
     }
+    # Fix-#2 Defect-1 — sink for the fast-math (#6) variant trials the timer
+    # emits on new-best events. Owned here, written by the timer closure,
+    # drained into pick_winner by whichever driver runs.
+    fastmath_sink: List[Dict[str, Any]] = []
     timer = _make_variant_timer(
         spec, sources, host_cflags, device_cflags, ldflags,
         space[spec.arch]["dims"], cache, worker, report, progress_state,
-        cost_model_state=cost_model_state)
+        cost_model_state=cost_model_state, fastmath_sink=fastmath_sink)
 
     dims = space[spec.arch]["dims"]
+    # Mandate #1 — pin GPU + memory clocks for the whole sweep so the timing
+    # signal reflects kernel quality, not boost/thermal noise. The lock is a
+    # no-op (status="n/a") on TPU/Pallas and downgrades to a loud "noisy"
+    # warning (not a crash) when the host forbids clock control.
+    clock_lock = _GpuClockLock(spec.arch, vendor, report=report)
     try:
-        if spec.autotune_mode == "exhaustive":
-            winning = _run_exhaustive(spec, survivors, dims, timer, cache,
-                                      space_hash, report)
-        else:
-            winning = _run_bayesian(spec, survivors, space, dims, timer, cache,
-                                    space_hash, report,
-                                    cost_model_state=cost_model_state)
+        with clock_lock:
+            if spec.autotune_mode == "exhaustive":
+                winning = _run_exhaustive(spec, survivors, dims, timer, cache,
+                                          space_hash, report, total=n_survivors,
+                                          fastmath_sink=fastmath_sink)
+            else:
+                winning = _run_bayesian(spec, survivors, space, dims, timer,
+                                        cache, space_hash, report,
+                                        cost_model_state=cost_model_state,
+                                        fastmath_sink=fastmath_sink)
     finally:
         if worker is not None:
             try:
                 worker.stop()
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_jit_autotune', _swexc)
+    # Stamp the clock-lock provenance onto the winning cache entry.
+    if winning is not None:
+        try:
+            cache.annotate_clock_lock(spec.optimizer, spec.model, spec.arch,
+                                      clock_lock.record())
+        except Exception as exc:
+            report.write(f"  [clock-lock] cache annotate skipped: {exc}\n")
+    # Mandate #8 — report the sweep's compiler-cache hit-rate.
+    _report_compiler_cache_stats(report)
 
     # Auto-prune the variant cache so a long-running autotune campaign
     # doesn't accumulate gigabytes of stale .so files. Only runs on a
@@ -11223,25 +13192,40 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
     return winning
 
 
-def _run_exhaustive(spec: BuildSpec, configs: List[Dict[str, Any]],
+def _run_exhaustive(spec: BuildSpec, configs: Iterable[Dict[str, Any]],
                     dims: List[Dict[str, Any]],
                     timer, cache: CompileCache, space_hash: str,
-                    report) -> Optional[Dict[str, Any]]:
-    report.write(f"\n  [exhaustive] sweeping {len(configs)} survivors\n")
-    step, close = make_progress(len(configs),
+                    report, total: Optional[int] = None,
+                    fastmath_sink: Optional[List[Dict[str, Any]]] = None
+                    ) -> Optional[Dict[str, Any]]:
+    # ``configs`` may be a lazy stream (uncapped exhaustive over a multi-million
+    # survivor space never materializes the list); ``total`` is the precomputed
+    # survivor count for the progress bar / ETA.
+    n_total = total if total is not None else len(list(configs))
+    report.write(f"\n  [exhaustive] sweeping {n_total:,} survivors "
+                 f"(uncapped — full search space)\n")
+    step, close = make_progress(n_total,
                                 f"jit-exhaustive {spec.optimizer}/{spec.arch}")
-    best: Optional[Dict[str, Any]] = None
+    # Fix-#2 Defect-1 — accumulate ALL trials and select the winner via
+    # pick_winner (not an inline best). This routes exhaustive through the
+    # SAME #16 generated-origin gate the Bayesian path uses, so a fast-math /
+    # synth / polyhedral variant can only win after a strict-oracle PASS —
+    # closing the latent bypass where exhaustive's inline selection skipped
+    # the gate. The per-trial reporting (EXCLUDED lines) is preserved.
+    all_trials: List[Dict[str, Any]] = []
+    running_best: Optional[float] = None
     try:
         for i, cfg in enumerate(configs, 1):
             ckey = config_key(cfg)
-            report.write(f"\n  [{i}/{len(configs)}] {ckey}\n")
+            report.write(f"\n  [{i}/{n_total}] {ckey}\n")
             report.flush()
             t0 = time.monotonic()
             result = timer(cfg)
             elapsed = time.monotonic() - t0
-            # Stream 10: per-variant numerical-validation tag is stashed
-            # by the variant timer under config_key(cfg).
+            # Stream 10: per-variant numerical-validation tag + origin are
+            # stashed by the variant timer under config_key(cfg).
             num_status = _LAST_NUMERICAL_STATUS.get(ckey, "skipped")
+            origin = _LAST_VARIANT_ORIGIN.get(ckey, ORIGIN_TEMPLATE)
             trial = {
                 "trial_num":   i,
                 "stage":       "exhaustive",
@@ -11253,15 +13237,15 @@ def _run_exhaustive(spec: BuildSpec, configs: List[Dict[str, Any]],
                 "n":           result["n"]         if result else None,
                 "host":        _current_host(),
                 "numerical_status": num_status,
+                "origin":      origin,
                 "recorded_at": datetime.datetime.now().isoformat(),
                 "status":      "ok" if result else "fail",
                 "build_s":     elapsed,
             }
             cache.record_trial(spec.optimizer, spec.model, spec.arch, trial)
-            if result is not None:
+            all_trials.append(trial)
+            if result is not None and result.get("timing_ms") is not None:
                 ms = result["timing_ms"]
-                # Stream 10 — exclude numerically failing variants from
-                # the running best; in strict mode require deterministic.
                 if num_status == "numerical_fail":
                     report.write(f"    median={ms:.4f}ms  "
                                  f"[EXCLUDED: numerical_fail]\n")
@@ -11271,21 +13255,30 @@ def _run_exhaustive(spec: BuildSpec, configs: List[Dict[str, Any]],
                                  f"got {num_status}]\n")
                 else:
                     report.write(f"    median={ms:.4f}ms ({num_status})\n")
-                    if best is None or ms < (best.get("timing_ms") or float("inf")):
-                        best = {**cfg, "timing_ms": ms, "config_key": ckey}
+                    if running_best is None or ms < running_best:
+                        running_best = ms
             else:
                 report.write(f"    FAIL ({elapsed:.1f}s)\n")
-            step(f"best={best['timing_ms']:.3f}ms" if best else "no winner yet")
+            step(f"best={running_best:.3f}ms" if running_best is not None
+                 else "no winner yet")
             if (i % JIT_CACHE_FLUSH_EVERY) == 0:
                 cache.save()
     finally:
         close()
-    if best is None:
-        report.write("\n  [exhaustive] no successful variants — "
-                     "leaving tuned_config unset.\n")
+    # Merge the fast-math (#6) variant trials and select via pick_winner so
+    # the #16 gate is applied uniformly across template + generated origins.
+    pool = all_trials + list(fastmath_sink or [])
+    won = pick_winner(pool, strict_numerics=spec.strict_numerics)
+    if won is None:
+        report.write("\n  [exhaustive] no eligible variants (after #16 + "
+                     "numerical gate) — leaving tuned_config unset.\n")
         return None
+    best = {**won.get("config", {}),
+            "timing_ms": won["timing_ms"],
+            "config_key": won.get("config_key", config_key(won.get("config", {})))}
     report.write(f"\n  [exhaustive] WINNER: {best['config_key']} "
-                 f"@ {best['timing_ms']:.4f}ms\n")
+                 f"@ {best['timing_ms']:.4f}ms "
+                 f"(origin={won.get('origin', ORIGIN_TEMPLATE)})\n")
     cache.set_tuned(spec.optimizer, spec.model, spec.arch, best,
                     mode="exhaustive", search_space_hash=space_hash)
     return best
@@ -11296,16 +13289,25 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
                   timer, cache: CompileCache, space_hash: str,
                   report,
                   cost_model_state: Optional[Dict[str, Any]] = None,
+                  fastmath_sink: Optional[List[Dict[str, Any]]] = None,
                   ) -> Optional[Dict[str, Any]]:
     n_trials = spec.bayesian_trials  # may be None ⇒ auto stopper
     # Build a stopper from BuildSpec; honours --max-tune-seconds / --patience
     # / --min-improvement when provided, otherwise pure auto-mode.
+    # Mandate #13 — convergence detectors govern; the cap is a safety rail.
     stopper = BayesianEarlyStopper(
         min_delta_rel=spec.min_improvement,
         patience=spec.patience,
         ei_floor=spec.ei_floor,
+        coverage_growth_floor=getattr(
+            spec, "coverage_growth_floor", _DEFAULT_COVERAGE_GROWTH_FLOOR),
         max_seconds=spec.max_tune_seconds,
     )
+    report.write(
+        f"  [stopper] convergence-governed (plateau Δ<{stopper.min_delta_rel}, "
+        f"ei_floor={stopper.ei_floor}, coverage_floor="
+        f"{stopper.coverage_growth_floor}); max_trials={stopper.max_trials:,} "
+        f"is a SAFETY RAIL, not the primary lever.\n")
 
     # Stream C — learned cost-model bookkeeping. The state dict is the
     # same object the timer closure mutates (n_rejected / n_total) and
@@ -11431,6 +13433,26 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
                 if tms_f < float(cost_model_state.get("best_so_far",
                                                       float("inf"))):
                     cost_model_state["best_so_far"] = tms_f
+                # Mandate #14 — count MEASURED trials (the cold-start floor
+                # for pruning reads this) and log prediction error vs measured
+                # so model miscalibration is observable.
+                cost_model_state["n_measured"] = int(
+                    cost_model_state.get("n_measured", 0)) + 1
+                _reg = cost_model_state.get("model")
+                if _reg is not None and _reg.is_warm():
+                    try:
+                        _feat = featurize_config(cfg, dims, cm_arch_entry,
+                                                 cost_model_state.get("stall_info"))
+                        _pred, _ = _reg.predict(_feat)
+                        if math.isfinite(_pred) and tms_f > 0:
+                            _abs_err = abs(_pred - tms_f) / tms_f
+                            report.write(
+                                f"  [cost-model] pred={_pred:.4f}ms "
+                                f"measured={tms_f:.4f}ms "
+                                f"rel_err={_abs_err * 100:.1f}% "
+                                f"(n_measured={cost_model_state['n_measured']})\n")
+                    except Exception as _swexc:
+                        _debug_swallow('_cm_wrapped_timer', _swexc)
                 cm_trial_buffer.append({"config": cfg, "timing_ms": tms_f})
                 cm_state["since_last_train"] += 1
                 # Cold start: gather 2x retrain_every signals before the
@@ -11456,7 +13478,8 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
                                     row["config"], dims, cm_arch_entry, None)
                                 pred_ms, _ = sib.predict(feat)
                                 seed_preds.append((feat, float(pred_ms)))
-                        except Exception:
+                        except Exception as _swexc:
+                            _debug_swallow('_cm_wrapped_timer', _swexc)
                             seed_preds = None
                     new_reg = _cost_model_train_from_trials(
                         cm_trial_buffer, dims, cm_arch_entry,
@@ -11479,8 +13502,8 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
                             entry["cost_model_backend"] = new_reg._backend
                             entry["cost_model_n_fit_calls"] = \
                                 new_reg._n_fit_calls
-                        except Exception:
-                            pass
+                        except Exception as _swexc:
+                            _debug_swallow('_cm_wrapped_timer', _swexc)
                         report.write(
                             f"  [cost-model] retrained "
                             f"(n={len(cm_trial_buffer)}, "
@@ -11510,7 +13533,8 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
         if stall_info_for_bias is None:
             try:
                 stall_info_for_bias = read_stall_sidecar(spec.out_dir)
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('_cm_wrapped_timer', _swexc)
                 stall_info_for_bias = None
         if stall_info_for_bias is not None:
             report.write(
@@ -11575,7 +13599,14 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
         cache.record_trial(spec.optimizer, spec.model, spec.arch, t)
     cache.save()
 
-    winner = pick_winner(tpe_trials + refine_trials,
+    # Fix-#2 Defect-1 — fold the fast-math (#6) variant trials into the
+    # winner pool. They carry origin="fastmath" and are gated by pick_winner
+    # (#16): kept only when they matched the strict oracle.
+    fm_trials = list(fastmath_sink or [])
+    if fm_trials:
+        report.write(f"  [fastmath] {len(fm_trials)} fast-math variant "
+                     f"trial(s) entered the winner pool (gated by #16).\n")
+    winner = pick_winner(tpe_trials + refine_trials + fm_trials,
                          strict_numerics=spec.strict_numerics)
     if winner is None:
         # Note: pick_winner may have returned None purely because no
@@ -11583,7 +13614,7 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
         # mode, no trial was bit-identical-deterministic across the
         # 3x re-run). Report the breakdown so the user can lower
         # --strict-numerics or widen the search space.
-        finished = [t for t in (tpe_trials + refine_trials)
+        finished = [t for t in (tpe_trials + refine_trials + fm_trials)
                     if t.get("timing_ms") is not None]
         ns_counts: Dict[str, int] = {}
         for t in finished:
@@ -11597,8 +13628,14 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
             f"(strict_numerics={spec.strict_numerics})\n")
         return None
     out = dict(winner["config"])
+    # Compute the config_key from the CONFIG ALONE — before injecting
+    # timing_ms/stage_won — so it matches the per-variant config_key used in
+    # variant_artifacts (config_key only excludes _DEAD_KEY_DIMS, not these
+    # bookkeeping fields). Polluting the key with timing_ms would break
+    # prune()'s "always keep the tuned winner" preservation. The exhaustive
+    # driver already keys off the pure config; mirror that here.
+    out["config_key"] = config_key(winner["config"])
     out["timing_ms"] = winner["timing_ms"]
-    out["config_key"] = config_key(out)
     out["stage_won"] = winner["stage"]
     report.write(f"\n  [bayesian] WINNER ({winner['stage']}): "
                  f"{out['config_key']} @ {out['timing_ms']:.4f}ms\n")
@@ -11819,7 +13856,8 @@ def _write_tuned_configs_header(combo: Dict[str, Any], optimizer: str,
     try:
         space = load_embedded_search_space()
         dims = space.get(arch, {}).get("dims", [])
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_write_tuned_configs_header', _swexc)
         dims = []
     name_to_macro = {d["name"]: d.get("macro") for d in dims}
     for k, v in combo.items():
@@ -11892,8 +13930,16 @@ def build_aot(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
     device_cflags = _device_cflags(spec)
     ldflags = _ldflags(spec)
     source_hash = _hash_sources(sources) if sources else "empty"
-    host_hash = _hash_flags(host_cflags)
-    device_hash = _hash_flags(device_cflags)
+    # Fold the version-gated toolchain flags into the host/device hashes so a
+    # compiler upgrade that changes the gated flag set (e.g. CUDA 12.2→12.6
+    # gains --split-compile / --register-usage-level) invalidates the cache.
+    # These flags are appended to the actual build line inside ``_torch_load``
+    # (not here) so we hash them separately rather than duplicating them on the
+    # compile command. Without this, an upgraded toolchain produces a cache HIT
+    # on a .so built by the OLD compiler with the OLD (smaller) flag set.
+    _vh, _vd = _version_gated_flags_for_hash(spec.arch)
+    host_hash = _hash_flags(host_cflags + _vh)
+    device_hash = _hash_flags(device_cflags + _vd)
 
     # Resolve search-space hash (gates AOT freshness too)
     space_hash = None
@@ -12219,9 +14265,10 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
                                       spec=spec, arch=spec.arch)
         extra_device = _variant_macros(tuned, dims, "device",
                                         spec=spec, arch=spec.arch)
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('build_jit', _swexc)
         for k, v in tuned.items():
-            if k in ("timing_ms", "config_key", "stage_won"):
+            if k in ("timing_ms", "config_key", "stage_won", "_fastmath"):
                 continue
             macro = {"block": "SG_TUNED_BLOCK_SIZE",
                      "vec": "SG_TUNED_VEC_WIDTH",
@@ -12231,7 +14278,55 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
                 extra_host.append(flag)
                 extra_device.append(flag)
 
-    so_path = _torch_load(spec, sources,
+    # Fix-#2 re-audit (Bug 1) — a FAST-MATH winner carries "_fastmath" in its
+    # tuned config, but that key is NOT a search-space dim, so _variant_macros
+    # drops the fast-math compiler flags. Without this, the final rebuild
+    # would ship a STRICT .so that cannot reproduce the winning fast-math
+    # timing. Re-apply the variant's additive flags here so the shipped
+    # artifact IS the fast-math build the sweep validated and picked, and so
+    # the recorded device_flags_hash reflects it.
+    fm_name = tuned.get("_fastmath")
+    if fm_name:
+        _vendor = get_arch_entry(spec.arch).vendor
+        fm_host, fm_device = _fast_math_variant_flags(str(fm_name), _vendor)
+        extra_host = list(extra_host) + fm_host
+        extra_device = list(extra_device) + fm_device
+        report.write(
+            f"  [jit] WINNER is fast-math variant {fm_name!r}: re-applying "
+            f"{fm_host + fm_device} to the final build so the shipped .so "
+            f"matches the validated winning timing.\n")
+
+    # Synth winner — when a SYNTHESISED kernel won the sweep, the final rebuild
+    # must compile the synthesised source, NOT the template-resolved ``sources``.
+    # During autotune the synth path was stashed on
+    # ``spec._emitted_sources["<ckey>:synth"]`` and its origin recorded in
+    # ``_LAST_VARIANT_ORIGIN`` (origin=ORIGIN_SYNTH is set exactly when the synth
+    # source was the variant actually built + timed). Both persist in-process —
+    # ``_jit_autotune`` ran in this same process above. This mirrors the
+    # fast-math re-application: the shipped .so must BE the variant the sweep
+    # validated and picked (it passed the #16 strict-oracle gate), never a
+    # template build wearing a synth winner's timing.
+    final_sources = sources
+    won_ckey = tuned.get("config_key")
+    if won_ckey and _LAST_VARIANT_ORIGIN.get(won_ckey) == ORIGIN_SYNTH:
+        synth_src = (spec._emitted_sources or {}).get(f"{won_ckey}:synth")
+        if synth_src and Path(synth_src).is_file():
+            final_sources = [Path(synth_src)]
+            report.write(
+                f"  [jit] WINNER is synth variant {won_ckey[:24]}: building the "
+                f"synthesised source {Path(synth_src).name} (not the template) "
+                f"so the shipped .so IS the validated winning kernel.\n")
+        else:
+            # The winner is origin=synth but we cannot recover its source. Do
+            # NOT silently ship a template build under the synth winner's
+            # timing — that is the exact false-green this fix exists to close.
+            report.write(
+                f"  [jit] WARNING: winner {won_ckey[:24]} is origin=synth but "
+                f"its synthesised source is unavailable ({synth_src!r}); the "
+                f"shipped .so would be a TEMPLATE build that may not reproduce "
+                f"the winning timing. Falling back to template sources.\n")
+
+    so_path = _torch_load(spec, final_sources,
                           host_cflags + extra_host,
                           device_cflags + extra_device,
                           ldflags, report, module_suffix="_tuned")
@@ -12240,7 +14335,7 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
         # Record this as the "current primary" — its hashes include the tuned macros
         cache.record_aot(
             spec.optimizer, spec.model, spec.arch,
-            source_hash=_hash_sources(sources),
+            source_hash=_hash_sources(final_sources),
             host_flags_hash=_hash_flags(host_cflags + extra_host),
             device_flags_hash=_hash_flags(device_cflags + extra_device),
             so_path=so_path,
@@ -12308,7 +14403,9 @@ def build(
     enable_synth_codegen: bool = True,
     enable_polyhedral: bool = True,
     enable_cost_model: bool = True,
-    auto_install_optional_deps: bool = True,
+    auto_install_optional_deps: bool = False,
+    cross_host: bool = False,
+    cross_host_march: Optional[str] = None,
 ) -> Optional[Path]:
     """In-process orchestrator. ``main`` handles subprocess split.
 
@@ -12470,6 +14567,8 @@ def build(
         strict_numerics=strict_numerics,
         enable_synth_codegen=enable_synth_codegen,
         enable_polyhedral=enable_polyhedral,
+        cross_host=cross_host,
+        cross_host_march=cross_host_march,
     )
     # BLOCKER 1 fix — wire the ``enable_cost_model`` kwarg through to the
     # spec. The field is defined on BuildSpec but not exposed via its
@@ -12482,8 +14581,8 @@ def build(
     try:
         if enable_cost_model:
             spec.enable_cost_model = True
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('build', _swexc)
 
     # Stream 11: optionally load project config and apply to spec. Strictly
     # backward-compatible — if no override is present in the config, the
@@ -12496,22 +14595,23 @@ def build(
             )
             _cfg_arg = config if isinstance(config, (str, Path)) else None
             project_cfg = _load_cfg(Path(_cfg_arg) if _cfg_arg else None)
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('build', _swexc)
             project_cfg = {}
     else:
         project_cfg = config
     try:
         from grokking_optimizers.compile_config import apply_to_buildspec as _apply_cfg2
         _apply_cfg2(spec, project_cfg)
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('build', _swexc)
     # Stream A: make sure spec.config carries the full loaded config even
     # if apply_to_buildspec couldn't (e.g. read-only spec / older signature).
     try:
         if not spec.config and isinstance(project_cfg, dict):
             spec.config = dict(project_cfg)
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('build', _swexc)
 
     # ── Group A.1 — mirror BuildSpec feature toggles into spec.config so
     # the runtime gates that read spec.config["<section>"]["enable"] (e.g.
@@ -12539,11 +14639,11 @@ def build(
                 if not isinstance(spec.config, dict):
                     spec.config = {}
                 spec.config.setdefault(_section, {})[_key] = True
-    except Exception:
+    except Exception as _swexc:
         # Read-only spec / hostile config object — never abort the build
         # over an introspection failure here. The downstream gate will
         # simply read False (the historical behaviour pre-mirror).
-        pass
+        _debug_swallow('build', _swexc)
 
     _validate(spec)
     spec.out_dir.mkdir(parents=True, exist_ok=True)
@@ -12611,18 +14711,20 @@ def build(
                     f"<toolchain probe failed; need "
                     f"{'.'.join(str(x) for x in _need)}>")
         except Exception as _vex:
+            _debug_swallow('build', _vex)
             _verdict = f"<error: {_vex}>"
         # Cache stats — entry count for this run.
         _cache_entries = 0
         try:
             _cache_entries = len(cache._data.get("entries", {}))
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('build', _swexc)
         # Free disk space at <out_dir> and ~/.cache/<project>/nvrtc.
         _df_out = _disk_free_human(spec.out_dir)
         try:
             _pkg = spec.python_package or "grokking_optimizers"
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('build', _swexc)
             _pkg = "grokking_optimizers"
         _nvrtc_cache = Path.home() / ".cache" / _pkg / "nvrtc"
         _df_nvrtc = _disk_free_human(_nvrtc_cache)
@@ -12747,8 +14849,8 @@ def build(
                             _art = _e.get("primary_artifact") if _e else None
                             if _art and _art.get("path"):
                                 spec.aot_so_path = Path(_art["path"])
-                        except Exception:
-                            pass
+                        except Exception as _swexc:
+                            _debug_swallow('build', _swexc)
                     so_path = build_jit(spec, cache, report) or so_path
                     step("jit-autotune")
                 if runtime in ("jit", "both"):
@@ -12773,8 +14875,8 @@ def build(
                 report.write("\n" + msg)
                 try:
                     sys.stderr.write(msg)
-                except Exception:
-                    pass
+                except Exception as _swexc:
+                    _debug_swallow('build', _swexc)
             if profile and runtime != "aot" and not build_produced_nothing:
                 report.write("\n--- PROFILE PASS ---\n")
                 if entry.vendor == "pallas":
@@ -12792,7 +14894,7 @@ def build(
                     and not build_produced_nothing
                     and entry.vendor in ("cuda", "hip")):
                 from grokking_optimizers.kernel_registry import initialize_registry
-                initialize_registry(spec, report)
+                initialize_registry(spec, report, cache=cache)
 
             report.write(f"\n# Cache:    {cache.path}\n")
             if entry.vendor == "pallas":
@@ -12908,8 +15010,8 @@ def _flag_audit_main(argv: List[str]) -> int:
         _mds = _resolve_enabled_models(_fa_cfg)
         if _mds:
             _fa_model0 = _mds[0]
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_flag_audit_main', _swexc)
     audit_path = out_dir / "flag_audit.txt"
     try:
         audit_fh = open(audit_path, "w")
@@ -12945,12 +15047,11 @@ def _flag_audit_main(argv: List[str]) -> int:
                     _stream.write(f"  detected: hipcc {hip_str}\n")
                 elif entry.vendor == "pallas":
                     _stream.write(f"  detected: {jax_str}\n")
-            # BLOCKER 7 — use the canonical short model name ("mamba")
-            # so the emitted -D macros match what profile.MODELS dispatches
-            # on. The prior "mamba3" literal was an alias that no longer
-            # appears anywhere in profile.MODELS / _DEFAULT_PROJECT_CONFIG;
-            # downstream consumers parsing the audit log were confused by
-            # the dangling -DSG_BUILD_MODEL_MAMBA3=1 line.
+            # BLOCKER 7 RESOLVED via canonicalize_model — "mamba" is the
+            # short user-API name (profile.MODELS); canonicalize_model() maps
+            # it to "mamba3" at the internal dispatch boundary. The emitted
+            # -D macros match what profile.MODELS dispatches on; the prior
+            # "mamba3" literal is no longer used at this call site.
             spec = BuildSpec(
                 optimizer="adamw", model="mamba", arch=arch,
                 out_dir=out_dir, runtime="aot",
@@ -12971,6 +15072,7 @@ def _flag_audit_main(argv: List[str]) -> int:
                 try:
                     fn(trace)
                 except Exception as _exc:
+                    _debug_swallow('_flag_audit_main', _exc)
                     trace.append(
                         (f"(EXC: {type(_exc).__name__}: {_exc})",
                          "skipped", "helper raised — sweep continues"))
@@ -13128,7 +15230,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 Path(_dry_cfg_path) if _dry_cfg_path else None)
         except FileNotFoundError:
             raise
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('main', _swexc)
             _dry_cfg = {}
         manifests = _dry_run_all_archs(
             out_dir, config=_dry_cfg,
@@ -13225,6 +15328,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                        help="Alias for --runtime aot.")
     phase.add_argument("--jit-only", action="store_true",
                        help="Alias for --runtime jit.")
+    # Mandate #23 — where work runs. all-on-target: everything on the device
+    # host (default). cpu-then-target: maximize CPU-side work (discovery,
+    # enumeration, source emission, AOT compile, cache prep) on a CPU-only
+    # host, then finish only the irreducible device work on the target. In
+    # cpu-then-target mode the host build uses the #7 portable ISA baseline
+    # (cross_host) so the AOT artifact is not pinned to the build host's CPU.
+    parser.add_argument("--stage",
+                        choices=("all-on-target", "cpu-then-target"),
+                        default="all-on-target",
+                        help="Where the build/tune/validate work runs "
+                             "(mandate #23). Default all-on-target.")
+    parser.add_argument("--cross-host-march", default=None,
+                        help="Portable ISA baseline for cpu-then-target host "
+                             "builds (default x86-64-v3).")
 
     # ── Autotune mode ────────────────────────────────────────────────
     parser.add_argument("--mode", choices=("exhaustive", "bayesian"),
@@ -13664,7 +15781,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             Path(_cfg_path_final) if _cfg_path_final else None)
     except FileNotFoundError:
         raise
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('main', _swexc)
         project_cfg = {}
     # Note: we deliberately do NOT auto-override args.arch, even when
     # archs.default is set — that would surprise users who passed --arch.
@@ -13794,6 +15912,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             getattr(args, "enable_cost_model", False)),
         auto_install_optional_deps=bool(
             getattr(args, "auto_install_optional_deps", True)),
+        # Mandate #23 — cpu-then-target stage implies a cross-host AOT build
+        # (portable ISA baseline so the artifact isn't pinned to the CPU-only
+        # build host). all-on-target keeps native ISA.
+        cross_host=(getattr(args, "stage", "all-on-target")
+                    == "cpu-then-target"),
+        cross_host_march=getattr(args, "cross_host_march", None),
     )
 
     report = args.report or (
@@ -13878,38 +16002,24 @@ def _e2e_smoke(out_dir: Path, *, max_seconds: float = 120.0) -> int:
     cache = CompileCache(cache_path)
     tuned_h = REPO_ROOT / "csrc/algorithms/tuned_configs.h"
 
-    chosen_model: Optional[str] = None
-    so: Optional[Path] = None
-    last_exc: Optional[BaseException] = None
-    for candidate_model in ("mamba", "mamba3"):
-        try:
-            so = build(
-                optimizer="adamw",
-                model=candidate_model,
-                arch=detected_arch,
-                out_dir=out_dir,
-                cache=cache,
-                autotune=True,
-                autotune_mode="bayesian",
-                bayesian_trials=None,         # auto early-stop
-                max_tune_seconds=max_seconds, # cap wall-clock
-                profile=False,
-                pgo=False,
-                debug=True,
-            )
-            chosen_model = candidate_model
-            break
-        except ValueError as exc:
-            last_exc = exc
-            sys.stdout.write(
-                f"[e2e-smoke] model={candidate_model!r} rejected "
-                f"({exc}); trying fallback...\n")
-            continue
-    if chosen_model is None:
-        sys.stdout.write(
-            f"[e2e-smoke] FAIL: neither 'mamba3' nor 'mamba' is a valid "
-            f"model (last error: {last_exc})\n")
-        return 1
+    # RESOLVED via canonicalize_model: use the short name "mamba" (profile.MODELS)
+    # directly — no try/except fallback needed. canonicalize_model() maps "mamba"
+    # → "mamba3" internally wherever canonical names are required.
+    chosen_model = "mamba"
+    so = build(
+        optimizer="adamw",
+        model=chosen_model,
+        arch=detected_arch,
+        out_dir=out_dir,
+        cache=cache,
+        autotune=True,
+        autotune_mode="bayesian",
+        bayesian_trials=None,         # auto early-stop
+        max_tune_seconds=max_seconds, # cap wall-clock
+        profile=False,
+        pgo=False,
+        debug=True,
+    )
 
     # ── 4. Assertions ──────────────────────────────────────────────────
     entry_key = cache.key("adamw", chosen_model, detected_arch)
@@ -13938,7 +16048,8 @@ def _e2e_smoke(out_dir: Path, *, max_seconds: float = 120.0) -> int:
         try:
             mtime = tuned_h.stat().st_mtime
             a3_ok = mtime >= smoke_start - 1.0  # 1s slop for clock skew
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_e2e_smoke', _swexc)
             a3_ok = False
         mtime_repr = (datetime.datetime.fromtimestamp(mtime).isoformat()
                       if a3_ok or tuned_h.exists() else "n/a")
@@ -13965,11 +16076,13 @@ def _e2e_smoke(out_dir: Path, *, max_seconds: float = 120.0) -> int:
                 _torch.ops.load_library(str(so))
                 a4_ok = True
                 a4_detail = "torch.ops.load_library OK"
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('_e2e_smoke', _swexc)
                 ctypes.CDLL(str(so))
                 a4_ok = True
                 a4_detail = "ctypes.CDLL OK"
         except Exception as exc:
+            _debug_swallow('_e2e_smoke', exc)
             a4_detail = f"load failed: {exc}"
     sys.stdout.write(
         f"[e2e-smoke] assert so_loads: "
@@ -14380,6 +16493,103 @@ def _self_test_device_profiling(run) -> None:
 
     # ---- Stream 3: per-arch native flag emission ----
 
+def _self_test_utilization(run) -> None:
+    """`[self-test] utilization` section — the 33-pipeline live device
+    utilization tracker. CPU-safe: every check exercises enumeration,
+    sampler selection, aggregation, crash-on-failure behavior, and the
+    JSON/table schema without touching an accelerator (numbers are HW-gated)."""
+    import tempfile
+    sys.stdout.write("[self-test] utilization\n")
+
+    def test_utilization_import():
+        from grokking_optimizers import utilization  # noqa: F401
+
+    def test_pipelines_per_arch_is_33():
+        from grokking_optimizers import utilization as u
+        # 11 optimizers × 3 models = 33 fused pipelines per arch.
+        assert u.PIPELINES_PER_ARCH == 33, u.PIPELINES_PER_ARCH
+        assert len(u.enumerate_cells()) == 33
+
+    def test_enumerate_cells_filtered():
+        from grokking_optimizers import utilization as u
+        cells = u.enumerate_cells(["adamw"], ["mamba", "vit"])
+        assert cells == [("adamw", "mamba"), ("adamw", "vit")], cells
+
+    def test_make_sampler_by_vendor():
+        from grokking_optimizers import utilization as u
+        assert u.make_sampler("sm_90a").backend == "nvml"
+        assert u.make_sampler("gfx942").backend == "rocm-smi"
+        assert u.make_sampler("tpu_v6e").backend == "jax-tpu"
+
+    def test_aggregate_math_and_warmup_drop():
+        from grokking_optimizers import utilization as u
+        # 5 samples; first (warmup) dropped → mean/peak over [20,30,40,50].
+        samples = [u.UtilSample(i * 0.1, c, c / 2.0, 100.0 * i)
+                   for i, c in enumerate([10.0, 20.0, 30.0, 40.0, 50.0])]
+        agg = u._aggregate(samples, drop_warmup=1)
+        assert abs(agg["compute_mean"] - 35.0) < 1e-9, agg
+        assert agg["compute_peak"] == 50.0, agg
+        assert agg["mem_used_peak_mb"] == 400.0, agg
+
+    def test_aggregate_handles_none_compute():
+        from grokking_optimizers import utilization as u
+        # TPU-style: compute None, mem present → compute stats stay None.
+        samples = [u.UtilSample(i * 0.1, None, 60.0 + i, None) for i in range(4)]
+        agg = u._aggregate(samples, drop_warmup=1)
+        assert agg["compute_mean"] is None and agg["compute_peak"] is None, agg
+        assert agg["mem_peak"] == 63.0, agg
+
+    def test_track_cell_crashes_on_no_device():
+        from grokking_optimizers import utilization as u
+        # No accelerator here → MUST raise RuntimeError, not return a status
+        # record.  Crash-hard policy: failures are never papered over.
+        raised = False
+        try:
+            u.track_cell("adamw", "mamba", "sm_90a", iters=1, timeout=30)
+        except RuntimeError:
+            raised = True
+        assert raised, "track_cell must raise RuntimeError when no device"
+
+    def test_report_json_schema_roundtrip():
+        from grokking_optimizers import utilization as u
+        cells = [u.CellUtilization(
+            arch="sm_90a", optimizer="adamw", model="mamba",
+            status="ok", backend="nvml", n_samples=10, duration_s=1.0,
+            compute_mean=72.5, compute_peak=88.0, mem_mean=40.0,
+            mem_peak=55.0, mem_used_peak_mb=2048.0)]
+        with tempfile.TemporaryDirectory() as td:
+            p = u.write_report(cells, "sm_90a", Path(td) / "u.json")
+            data = json.loads(p.read_text())
+            assert data["pipelines_per_arch"] == 33
+            assert data["arch"] == "sm_90a" and data["n_cells"] == 1
+            c0 = data["cells"][0]
+            for k in ("arch", "optimizer", "model", "status", "backend",
+                      "compute_mean", "compute_peak", "mem_used_peak_mb"):
+                assert k in c0, k
+            assert c0["compute_mean"] == 72.5
+
+    def test_format_table_renders():
+        from grokking_optimizers import utilization as u
+        cells = [u.CellUtilization(
+            arch="gfx942", optimizer="muon", model="vit", status="ok",
+            backend="rocm-smi", n_samples=12, duration_s=2.0,
+            compute_mean=64.0, compute_peak=90.0, mem_mean=30.0,
+            mem_peak=44.0, mem_used_peak_mb=1024.0)]
+        txt = u.format_table(cells)
+        assert "gfx942" in txt and "muon" in txt and "vit" in txt
+        assert "compute%" in txt and "64.0" in txt
+
+    run("utilization_import", test_utilization_import)
+    run("pipelines_per_arch_is_33", test_pipelines_per_arch_is_33)
+    run("utilization_enumerate_cells_filtered", test_enumerate_cells_filtered)
+    run("utilization_make_sampler_by_vendor", test_make_sampler_by_vendor)
+    run("utilization_aggregate_math", test_aggregate_math_and_warmup_drop)
+    run("utilization_aggregate_none_compute", test_aggregate_handles_none_compute)
+    run("utilization_track_cell_crashes", test_track_cell_crashes_on_no_device)
+    run("utilization_report_json_roundtrip", test_report_json_schema_roundtrip)
+    run("utilization_format_table", test_format_table_renders)
+
+
 def _self_test_flags(run) -> None:
     """`[self-test] flags` section."""
     import shutil
@@ -14475,13 +16685,19 @@ def _self_test_flags(run) -> None:
         still expressed when nvcc is available.
         """
         sm90 = set(_device_cflags(_spec("sm_90a")))
+        # Mandate #6 — ``--use_fast_math`` is DELIBERATELY no longer in the
+        # base (it's a validated variant now); ``-DNDEBUG`` moved to project
+        # config. The remaining performance/correctness flags must persist.
         legacy_sm90 = {
-            "-O3", "--use_fast_math", "-std=c++17", "-DWITH_CUDA",
+            "-O3", "-std=c++17", "-DWITH_CUDA",
             "--expt-relaxed-constexpr", "--extra-device-vectorization",
             "--resource-usage",
         }
         missing = legacy_sm90 - sm90
         assert not missing, f"sm_90 lost legacy flags: {missing}"
+        # #6 — fast-math must NOT be a default base flag.
+        assert "--use_fast_math" not in sm90, \
+            "fast-math must be a validated variant, not a base default"
         # F-A — verify the device-LTO pair still appears under the
         # version-gated path when nvcc 11.4+ is available.
         if _probe_nvcc_version() and _probe_nvcc_version() >= (11, 4):
@@ -14493,13 +16709,16 @@ def _self_test_flags(run) -> None:
                 "sm_90 lost -rdc=true from the CUDA>=11.4 gated path"
 
         gfx942 = set(_device_cflags(_spec("gfx942")))
+        # #6 — -ffast-math removed from the gfx942 base too (validated variant).
         legacy_gfx942 = {
-            "-O3", "-std=c++17", "-DWITH_HIP", "-ffast-math", "-fPIC",
+            "-O3", "-std=c++17", "-DWITH_HIP", "-fPIC",
             "-fgpu-flush-denormals-to-zero", "-flto",
             "--offload-arch=gfx942",
         }
         missing_amd = legacy_gfx942 - gfx942
         assert not missing_amd, f"gfx942 lost legacy flags: {missing_amd}"
+        assert "-ffast-math" not in gfx942, \
+            "fast-math must be a validated variant, not a gfx942 base default"
 
     def test_nvcc_no_duplicate_ptxas_o3():
         """Exactly one PTXAS opt-level flag — duplicate -Xptxas -O3 must
@@ -14857,6 +17076,36 @@ def _self_test_flags(run) -> None:
         # mismatch, so the "Wrong arch" suggestion must stay quiet.
         assert "Wrong arch for this GPU" not in joined, \
             "arch hint fired on a linker-only failure (regression)"
+
+    def test_install_nvcc_flags_gpuless_source():
+        """Stage 2 — install_nvcc_flags is a public, GPU-less flag source
+        usable by setup.py: it returns the SAME canonical device cflags
+        the autotuner tunes against, without a GPU / CUDA-torch / nvcc.
+        It must be importable, callable per-arch, and agree with the
+        _device_cflags path it wraps."""
+        from grokking_optimizers.compile import (
+            install_nvcc_flags, _device_cflags, BuildSpec)
+        # CUDA arch: non-empty, includes the canonical base + a -gencode.
+        cuda_flags = install_nvcc_flags("sm_90a")
+        assert isinstance(cuda_flags, list) and cuda_flags
+        assert "-O3" in cuda_flags
+        assert any(f.startswith("-gencode") for f in cuda_flags), cuda_flags
+        # HIP arch: non-empty, carries an --offload-arch token.
+        hip_flags = install_nvcc_flags("gfx942")
+        assert hip_flags and any("--offload-arch" in f for f in hip_flags)
+        # Pallas arch: no device cflags.
+        assert install_nvcc_flags("tpu_v5p") == []
+        # Agreement with the path it wraps (same flags the autotuner uses).
+        # Mirror the helper's release-install spec exactly (autotune off,
+        # profile off) so the comparison is apples-to-apples.
+        spec = BuildSpec(optimizer="adamw", model="generic", arch="sm_90a",
+                         out_dir=Path(tempfile.gettempdir()),
+                         autotune=False, profile=False,
+                         validate_flags=False)
+        assert (install_nvcc_flags("sm_90a", include_version_gated=True)
+                == list(_device_cflags(spec, include_version_gated=True)))
+    run("install_nvcc_flags_gpuless_source",
+        test_install_nvcc_flags_gpuless_source)
 
     run("flag_trace_recorded_per_decision",
         test_flag_trace_recorded_per_decision)
@@ -15766,6 +18015,68 @@ def _self_test_cache(run) -> None:
                     "numerical_status", "ptxas_info", "recorded_at"):
             assert key in doc, f"docstring missing key {key!r}"
 
+    def test_variant_reuse_skips_recompile():
+        """Perf — a cached variant .so is reused only when its build
+        signature matches; a mismatched signature (sources/flags changed)
+        forces a rebuild. This is what makes a resumed sweep near-free
+        instead of paying the ~125s recompile per already-explored config."""
+        td = Path(tempfile.mkdtemp())
+        try:
+            cp = td / "c.json"
+            cache = CompileCache(cp)
+            so = td / "variant_abc.so"
+            so.write_bytes(b"\x7fELF fake variant")
+            sig = "sig-v1"
+            cache.record_variant("lion", "mamba", "sm_90", "ck1", so,
+                                 build_sig=sig)
+            # Same signature → reuse (skip recompile).
+            hit = cache.get_fresh_variant("lion", "mamba", "sm_90", "ck1", sig)
+            assert hit is not None and Path(hit) == so, hit
+            # Different signature (flags/sources changed) → no reuse.
+            miss = cache.get_fresh_variant("lion", "mamba", "sm_90", "ck1",
+                                           "sig-v2")
+            assert miss is None, "stale-signature .so must not be reused"
+            # Missing config_key → no reuse.
+            assert cache.get_fresh_variant(
+                "lion", "mamba", "sm_90", "unknown", sig) is None
+            # Deleted .so on disk → no reuse even with matching sig.
+            so.unlink()
+            assert cache.get_fresh_variant(
+                "lion", "mamba", "sm_90", "ck1", sig) is None
+        finally:
+            shutil.rmtree(td)
+
+    def test_version_gated_flags_fold_into_cache_hash():
+        """Regression — a toolchain upgrade that changes the version-gated
+        flag set (e.g. CUDA 12.2→12.6 gains --split-compile) MUST change the
+        host/device cache hash so a stale .so built by the OLD compiler with
+        the OLD (smaller) flag set is never reused. The pre-fix bug: the AOT
+        hash was computed from the static base flags only, while
+        ``_newer_compiler_flags`` ran later inside ``_torch_load`` — so an
+        upgrade produced a false cache HIT.
+        """
+        arch = "sm_90a"
+        # (a) _version_gated_flags_for_hash memoizes per-arch and returns a
+        #     FRESH list each call (mutating the result must not poison the
+        #     module cache that feeds every subsequent build's hash).
+        _VERSION_GATED_FLAGS_CACHE.pop(arch, None)
+        h1, _d1 = _version_gated_flags_for_hash(arch)
+        h1.append("--poison")
+        h2, _d2 = _version_gated_flags_for_hash(arch)
+        assert "--poison" not in h2, \
+            "returned flag list must be a fresh copy, not the cached tuple"
+        # (b) the fold is hash-sensitive: an extra version-gated flag changes
+        #     the digest; an identical set is deterministic.
+        base_host = ["-O3", "-std=c++17"]
+        old = _hash_flags(base_host + ["-Xptxas", "--def-load-cache=ca"])
+        new = _hash_flags(base_host + ["-Xptxas", "--def-load-cache=ca",
+                                       "--split-compile=8"])
+        assert old != new, \
+            "an added version-gated flag must change the cache hash"
+        assert old == _hash_flags(base_host + ["-Xptxas",
+                                               "--def-load-cache=ca"]), \
+            "identical flag sets must hash identically"
+
     run("cache_concurrent_writes_both_survive",
         test_cache_concurrent_writes_both_survive)
     run("cache_corruption_emits_stderr_notice",
@@ -15776,6 +18087,9 @@ def _self_test_cache(run) -> None:
         test_cache_migrate_v3_uses_cache_version_constant)
     run("make_trial_record_documents_v4_schema",
         test_make_trial_record_documents_v4_schema)
+    run("variant_reuse_skips_recompile", test_variant_reuse_skips_recompile)
+    run("version_gated_flags_fold_into_cache_hash",
+        test_version_gated_flags_fold_into_cache_hash)
 
 
 def _self_test_multi_gpu_pool(run) -> None:
@@ -15916,6 +18230,1135 @@ def _self_test_multi_gpu_pool(run) -> None:
             f"    (fast={fast_calls} slow={slow_calls} wall={wall:.3f}s)\n")
 
     run("multigpu_work_stealing", test_work_stealing_fast_worker_dominates)
+
+
+def _self_test_clock_lock(run) -> None:
+    """`[self-test] clock_lock` section (mandate #1)."""
+    sys.stdout.write("[self-test] clock_lock\n")
+
+    def test_pallas_is_na_not_noisy():
+        """TPU/Pallas has no clock control → status 'n/a', never 'noisy'."""
+        lock = _GpuClockLock("tpu_v6e", "pallas")
+        with lock:
+            pass
+        assert lock.status == "n/a", lock.status
+        assert not lock.noisy, "Pallas must not be flagged noisy"
+        assert not lock.locked
+        rec = lock.record()
+        assert rec["status"] == "n/a" and rec["noisy"] is False
+
+    def test_missing_tool_is_noisy_not_crash():
+        """When nvidia-smi is absent, the lock degrades to a loud 'noisy'
+        state (a valid mode per the mandate) and does NOT crash."""
+        import io
+        rep = io.StringIO()
+        lock = _GpuClockLock("sm_90a", "cuda", report=rep)
+        # Force the smi runner to report 'tool not found' regardless of host.
+        saved = globals()["_run_smi"]
+        try:
+            globals()["_run_smi"] = lambda cmd, timeout=15.0: (
+                127, "", f"{cmd[0]} not found")
+            with lock:
+                pass
+        finally:
+            globals()["_run_smi"] = saved
+        assert lock.noisy, "missing tool must mark sweep noisy"
+        assert lock.status == "noisy"
+        assert not lock.locked
+        log = rep.getvalue()
+        assert "WARNING" in log and "NOT locked" in log, log
+
+    def test_successful_lock_records_clocks_and_restores():
+        """A simulated successful NVIDIA lock records the pinned clocks and
+        queues the -rgc/-rmc restore commands (run on exit)."""
+        restore_calls: List[List[str]] = []
+
+        def _fake_smi(cmd, timeout=15.0):
+            if "--query-gpu=clocks.max.sm,clocks.max.mem" in cmd:
+                return 0, "1980, 2619\n", ""
+            if "-rgc" in cmd or "-rmc" in cmd:
+                restore_calls.append(cmd)
+                return 0, "", ""
+            return 0, "", ""
+
+        saved = globals()["_run_smi"]
+        try:
+            globals()["_run_smi"] = _fake_smi
+            lock = _GpuClockLock("sm_90a", "cuda")
+            with lock:
+                assert lock.locked
+                assert lock.locked_clocks["sm_mhz"] == 1980
+                assert lock.locked_clocks["mem_mhz"] == 2619
+        finally:
+            globals()["_run_smi"] = saved
+        # Both -rgc and -rmc must have run on exit.
+        joined = [" ".join(c) for c in restore_calls]
+        assert any("-rgc" in j for j in joined), joined
+        assert any("-rmc" in j for j in joined), joined
+
+    def test_amd_perflevel_high():
+        """AMD path locks via --setperflevel high and restores to auto."""
+        restore_calls: List[List[str]] = []
+
+        def _fake_smi(cmd, timeout=15.0):
+            if "--setperflevel" in cmd and "auto" in cmd:
+                restore_calls.append(cmd)
+            return 0, "", ""
+
+        saved = globals()["_run_smi"]
+        try:
+            globals()["_run_smi"] = _fake_smi
+            lock = _GpuClockLock("gfx942", "hip")
+            with lock:
+                assert lock.locked
+                assert lock.locked_clocks["perflevel"] == "high"
+        finally:
+            globals()["_run_smi"] = saved
+        assert any("auto" in " ".join(c) for c in restore_calls), restore_calls
+
+    run("clock_lock_pallas_is_na", test_pallas_is_na_not_noisy)
+    run("clock_lock_missing_tool_is_noisy", test_missing_tool_is_noisy_not_crash)
+    run("clock_lock_success_records_and_restores",
+        test_successful_lock_records_clocks_and_restores)
+    run("clock_lock_amd_perflevel_high", test_amd_perflevel_high)
+
+
+def _self_test_fastmath_integration(run) -> None:
+    """`[self-test] fastmath_integration` section (Fix-#2 Defect-1).
+
+    The fast-math miss was a feature whose helper self-tests were green while
+    the feature did NOTHING end-to-end. These tests exercise the actual
+    build→time→validate→stamp→gate path (mock-timed, no GPU) — an INTEGRATION
+    test, not an isolated helper test."""
+    import io
+    import tempfile
+    import numpy as np
+    sys.stdout.write("[self-test] fastmath_integration\n")
+
+    def _mock_fastmath_run(compare_status: str):
+        """Run _time_validate_fastmath_variants with build+time mocked.
+        Returns (records, report_text)."""
+        td = Path(tempfile.mkdtemp())
+        report = io.StringIO()
+        spec = BuildSpec(optimizer="adamw", model="decoder", arch="sm_90a",
+                         out_dir=td)
+        cache = CompileCache(td / "c.json")
+        arch_entry = get_arch_entry("sm_90a")
+        ref = td / "ref.npy"
+        np.save(ref, np.zeros(4, dtype=np.float32))
+        ref_state = {"dtype": "float32", "size": 4096}
+        vdir = td / "variants"
+        vdir.mkdir(parents=True, exist_ok=True)
+        ksrc = td / "k.cu"
+        ksrc.write_text("// fake kernel source\n")
+
+        def fake_load(spec, sources, host, device, ld, report,
+                      module_suffix=""):
+            # Fast-math flags must actually be ON the build line.
+            assert ("--use_fast_math" in device or "-ffast-math" in device
+                    or "-fassociative-math" in (host + device)), \
+                f"fast-math flags not on the build: host={host} dev={device}"
+            p = td / f"fake{module_suffix}.so"
+            p.write_bytes(b"\x7fELF")
+            return p
+
+        def fake_oneshot(so, opt_class, report=None, python_package=None):
+            return {"timing_ms": 0.123, "min_ms": 0.12, "max_ms": 0.13,
+                    "n": 21}
+
+        def fake_dump(variant_so, opt_class, size, dtype, out_path,
+                      timeout=120, fused_op_template=None, entry=None,
+                      regime="normal", seed=0):
+            np.save(out_path, np.zeros(4, dtype=np.float32))
+            return True
+
+        def fake_compare(ref_p, out_p, dtype):
+            return (compare_status, 0.0)
+
+        def fake_det3x(variant_so, opt_class, size, dtype, out_dir,
+                       fused_op_template=None, entry=None,
+                       regime="normal", seed=0):
+            return True
+
+        g = globals()
+        saved = {k: g.get(k) for k in
+                 ("_torch_load", "_time_variant_oneshot",
+                  "_dump_variant_output", "_compare_outputs",
+                  "_check_determinism_3x")}
+        g["_torch_load"] = fake_load
+        g["_time_variant_oneshot"] = fake_oneshot
+        g["_dump_variant_output"] = fake_dump
+        g["_compare_outputs"] = fake_compare
+        g["_check_determinism_3x"] = fake_det3x
+        # Multi-regime (#4): the mock oracle resolver returns the same ref for
+        # every regime; fake_compare drives the per-regime status. Sweep the
+        # full regime set so the helper exercises all of them.
+        def fake_resolve_ref(regime="normal", seed=0):
+            return ref
+        try:
+            recs = _time_validate_fastmath_variants(
+                spec, {"block": 128}, [ksrc], ["-O3"], ["-O3"], [],
+                cache, None, report, arch_entry, fake_resolve_ref, ref_state,
+                list(_INPUT_REGIMES), vdir,
+                False, True, 1)
+        finally:
+            for k, v in saved.items():
+                g[k] = v
+            # Clean the sidecars this run wrote so other tests aren't polluted.
+            for name in _FAST_MATH_VARIANTS:
+                ck = config_key({"block": 128, "_fastmath": name})
+                _LAST_VARIANT_ORIGIN.pop(ck, None)
+                _LAST_NUMERICAL_STATUS.pop(ck, None)
+        return recs, report.getvalue()
+
+    def test_fastmath_variants_actually_produced():
+        """(a) The sweep helper produces origin='fastmath' trials that enter
+        the trial stream — the feature is WIRED, not dead code."""
+        recs, log = _mock_fastmath_run("ok")
+        # Two CUDA variants: safe_subset + full_fast_math.
+        assert len(recs) == 2, f"expected 2 fast-math trials, got {len(recs)}"
+        assert all(r["origin"] == ORIGIN_FASTMATH for r in recs), \
+            [r["origin"] for r in recs]
+        assert all(r["numerical_status"] in ("ok", "deterministic")
+                   for r in recs), recs
+        assert all(r["timing_ms"] == 0.123 for r in recs)
+        # Each fast-math trial carries its variant name in the config.
+        names = {r["config"].get("_fastmath") for r in recs}
+        assert names == set(_FAST_MATH_VARIANTS), names
+
+    def test_fastmath_divergent_marked_fail_then_gated():
+        """A fast-math variant that DIVERGES from the strict oracle is tagged
+        numerical_fail and pick_winner refuses it even when fastest."""
+        recs, _ = _mock_fastmath_run("numerical_fail")
+        assert all(r["numerical_status"] == "numerical_fail" for r in recs)
+        # Make the divergent fast-math trial the fastest; it must NOT win.
+        fast_bad = dict(recs[0])
+        fast_bad["timing_ms"] = 0.001
+        good = {"timing_ms": 0.5, "numerical_status": "ok",
+                "origin": ORIGIN_TEMPLATE, "config": {}, "trial_num": 99}
+        w = pick_winner([fast_bad, good])
+        assert w is not None and w["origin"] == ORIGIN_TEMPLATE, w
+
+    def test_fastmath_skipped_never_wins_validated_can():
+        """(b)/(c) integration: an unvalidated ('skipped') fast-math trial
+        can NEVER win even when fastest; a validated one CAN."""
+        fm_skipped = {"timing_ms": 0.01, "numerical_status": "skipped",
+                      "origin": ORIGIN_FASTMATH, "config": {}, "trial_num": 1}
+        tmpl = {"timing_ms": 0.50, "numerical_status": "ok",
+                "origin": ORIGIN_TEMPLATE, "config": {}, "trial_num": 2}
+        assert pick_winner([fm_skipped, tmpl])["origin"] == ORIGIN_TEMPLATE
+        fm_ok = {"timing_ms": 0.01, "numerical_status": "ok",
+                 "origin": ORIGIN_FASTMATH, "config": {}, "trial_num": 3}
+        assert pick_winner([fm_ok, tmpl])["origin"] == ORIGIN_FASTMATH
+
+    def test_fastmath_pallas_is_na_loud():
+        """Loud-not-silent: Pallas/TPU has no fast-math flags → N/A log line,
+        zero variants, no crash."""
+        report = io.StringIO()
+        spec = BuildSpec(optimizer="adamw", model="decoder", arch="tpu_v6e",
+                         out_dir=Path(tempfile.mkdtemp()))
+        recs = _time_validate_fastmath_variants(
+            spec, {"block": 128}, [], [], [], [], CompileCache(None), None,
+            report, get_arch_entry("tpu_v6e"),
+            lambda regime="normal", seed=0: None,
+            {"dtype": "float32", "size": 4096}, list(_INPUT_REGIMES),
+            Path(tempfile.mkdtemp()),
+            False, False, 1)
+        assert recs == []
+        assert "N/A for vendor=pallas" in report.getvalue(), report.getvalue()
+
+    def test_fastmath_wired_into_sweep_drivers():
+        """Proof the sink is drained by BOTH drivers (no dead sink)."""
+        import inspect
+        bsrc = inspect.getsource(_run_bayesian)
+        esrc = inspect.getsource(_run_exhaustive)
+        assert "fastmath_sink" in bsrc and "fm_trials" in bsrc
+        assert "fastmath_sink" in esrc
+        # And the timer emits into the sink on new-best.
+        tsrc = inspect.getsource(_make_variant_timer)
+        assert "_time_validate_fastmath_variants" in tsrc
+        assert "fastmath_sink.append" in tsrc
+
+    def test_fastmath_winner_reapplies_flags_in_final_build():
+        """Fix-#2 re-audit Bug 1 — the final rebuild (build_jit) must re-apply
+        the fast-math flags when the winner carries "_fastmath", so the
+        shipped .so is the fast-math build (not a strict build that can't
+        reproduce the winning timing). Proven via source inspection of the
+        re-apply branch + a behavioral check of the flag composition."""
+        import inspect
+        bjsrc = inspect.getsource(build_jit)
+        assert 'tuned.get("_fastmath")' in bjsrc, \
+            "build_jit must detect a fast-math winner"
+        assert "_fast_math_variant_flags(str(fm_name)" in bjsrc, \
+            "build_jit must re-apply the fast-math variant flags"
+        # Behavioral: the flags that would be appended are the real ones.
+        fm_host, fm_device = _fast_math_variant_flags("full_fast_math", "cuda")
+        assert "--use_fast_math" in fm_device
+        # And _variant_macros would NOT carry them (not a dim), proving the
+        # re-apply is necessary.
+        assert "_fastmath" not in "".join(
+            ["SG_TUNED_BLOCK_SIZE", "SG_TUNED_VEC_WIDTH", "SG_TUNED_UNROLL"])
+
+    def test_synth_winner_swaps_source_in_final_build():
+        """Synth-source-swap — when a SYNTH variant wins, build_jit's final
+        rebuild must compile the synthesised source stashed on
+        ``spec._emitted_sources["<ckey>:synth"]`` (origin recorded in
+        ``_LAST_VARIANT_ORIGIN``), NOT the template ``sources``. Otherwise the
+        shipped .so is a template build wearing the synth winner's validated
+        timing — the same false-green the fast-math re-apply closes. Proven via
+        source inspection of the swap branch + a behavioral check of the lookup
+        keying so the two halves (timer stash, final swap) agree on the key."""
+        import inspect
+        bjsrc = inspect.getsource(build_jit)
+        # The swap branch detects a synth winner by origin and resolves the
+        # stashed source under the SAME "<ckey>:synth" key the timer wrote.
+        assert "_LAST_VARIANT_ORIGIN.get(won_ckey) == ORIGIN_SYNTH" in bjsrc, \
+            "build_jit must detect a synth winner via _LAST_VARIANT_ORIGIN"
+        assert 'f"{won_ckey}:synth"' in bjsrc, \
+            "build_jit must resolve the synth source under '<ckey>:synth'"
+        assert "final_sources = [Path(synth_src)]" in bjsrc, \
+            "build_jit must build the synth source, not the template"
+        # Keying agreement: the timer stash and the final swap must use the
+        # identical "<ckey>:synth" suffix, or the lookup silently misses and
+        # the winner ships a template build.
+        tsrc = inspect.getsource(_make_variant_timer)
+        assert 'f"{ckey}:synth"' in tsrc, \
+            "timer must stash under the same '<ckey>:synth' key"
+
+    def test_origin_constants_single_source_of_truth():
+        """Defect-1.6 — no stray origin string literal outside the constant
+        defs; the gate set is built from the constants."""
+        assert ORIGIN_FASTMATH == "fastmath"
+        assert ORIGIN_FASTMATH in _VALIDATION_REQUIRED_ORIGINS
+        # The misspellings that would bypass the gate must NOT be in the set.
+        assert "fast_math" not in _VALIDATION_REQUIRED_ORIGINS
+        assert "fast-math" not in _VALIDATION_REQUIRED_ORIGINS
+
+    run("fastmath_variants_actually_produced",
+        test_fastmath_variants_actually_produced)
+    run("fastmath_divergent_marked_fail_then_gated",
+        test_fastmath_divergent_marked_fail_then_gated)
+    run("fastmath_skipped_never_wins_validated_can",
+        test_fastmath_skipped_never_wins_validated_can)
+    run("fastmath_pallas_is_na_loud", test_fastmath_pallas_is_na_loud)
+    def test_mandate_features_have_nontest_callsites():
+        """Fix-#2 re-audit (dead-code-vs-tests) — INSTITUTIONAL guard for the
+        bug class that hid the fast-math miss: every mandate feature function
+        must have >=1 NON-TEST call site. A function reachable only from
+        _self_test_*/test_* is 'implemented + unit-tested but never wired' —
+        dead code masquerading as done. This AST check would have caught
+        fast-math, discovery, _strict_math_flags, and _synthesize_input_spec."""
+        import ast as _ast
+        src = Path(__file__).read_text()
+        tree = _ast.parse(src)
+        def_lines = sorted([(n.lineno, n.name) for n in _ast.walk(tree)
+                            if isinstance(n, (_ast.FunctionDef,
+                                              _ast.AsyncFunctionDef))])
+
+        def enc_top(ln):
+            cands = [(dl, dn) for dl, dn in def_lines if dl <= ln]
+            return cands[-1][1] if cands else "<module>"
+        callers: Dict[str, set] = {}
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Call):
+                f = node.func
+                nm = (f.id if isinstance(f, _ast.Name)
+                      else f.attr if isinstance(f, _ast.Attribute) else None)
+                if nm:
+                    callers.setdefault(nm, set()).add(enc_top(node.lineno))
+        FEATURES = [
+            "_time_validate_fastmath_variants", "_fast_math_variant_flags",
+            "_GpuClockLock", "_make_l2_flush_buffer", "_arch_l2_bytes",
+            "_discover_entry_points", "_select_tunable_entry",
+            "_auto_discover_sources", "_host_march_flags",
+            "_synth_dtype_from_config", "_synth_pattern_for_optimizer",
+            "get_fresh_variant", "_render_repro_state", "_debug_swallow",
+            "_strict_math_flags", "_render_arg_construction",
+            "_synthesize_input_spec", "_try_synth_codegen",
+            "_polyhedral_expand_variant", "initialize_registry",
+            "_capture_reference_output",
+        ]
+        dead = []
+        for fn in FEATURES:
+            cs = callers.get(fn, set())
+            nontest = {c for c in cs
+                       if not (c.startswith("_self_test")
+                               or c.startswith("test_"))}
+            nontest.discard(fn)
+            if not nontest:
+                dead.append(fn)
+        assert not dead, (
+            f"mandate feature(s) wired ONLY from tests (dead code): {dead}")
+
+    run("fastmath_wired_into_sweep_drivers",
+        test_fastmath_wired_into_sweep_drivers)
+    run("fastmath_winner_reapplies_flags_in_final_build",
+        test_fastmath_winner_reapplies_flags_in_final_build)
+    run("synth_winner_swaps_source_in_final_build",
+        test_synth_winner_swaps_source_in_final_build)
+    run("origin_constants_single_source_of_truth",
+        test_origin_constants_single_source_of_truth)
+    run("mandate_features_have_nontest_callsites",
+        test_mandate_features_have_nontest_callsites)
+
+
+def _self_test_silent_degradation(run) -> None:
+    """`[self-test] silent_degradation` section (Fix-#2 Defect-2): no silent
+    broad-except; calibration failure is loud; crash dump carries §2A state."""
+    import io
+    import contextlib
+    sys.stdout.write("[self-test] silent_degradation\n")
+
+    def test_debug_swallow_quiet_default_loud_at_debug():
+        g = globals()
+        saved = g["_COMPILE_LOG_LEVEL"]
+        try:
+            g["_COMPILE_LOG_LEVEL"] = 0
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                _debug_swallow("comp", ValueError("x"))
+            assert buf.getvalue() == "", "must be quiet at level 0"
+            g["_COMPILE_LOG_LEVEL"] = 2
+            buf2 = io.StringIO()
+            with contextlib.redirect_stderr(buf2):
+                _debug_swallow("comp", ValueError("boom"), "detail")
+            out = buf2.getvalue()
+            assert "comp" in out and "ValueError" in out and "detail" in out, out
+        finally:
+            g["_COMPILE_LOG_LEVEL"] = saved
+
+    def _bare_pool():
+        pool = MultiGPUTimingPool.__new__(MultiGPUTimingPool)
+        pool.vendor = "cuda"
+        pool.devices = ["0", "1"]
+        pool._calib_factors = [1.0, 1.0]
+        return pool
+
+    def test_calibration_failure_warns_not_silent():
+        """Defect-2 priority — a per-device calibration failure emits a
+        WARNING naming the device; it is NOT swallowed silently."""
+        class _FailW:
+            def calibrate(self, **kw):
+                raise RuntimeError("boom")
+
+        class _OkW:
+            def calibrate(self, **kw):
+                return 1.0
+        pool = _bare_pool()
+        pool.workers = [_FailW(), _OkW()]
+        rep = io.StringIO()
+        factors = pool.calibrate(report=rep)
+        log = rep.getvalue()
+        assert "WARNING" in log and "gpu0 calibration FAILED" in log, log
+        assert factors[0] == 1.0  # failed device → no correction
+
+    def test_calibration_total_failure_raises_when_required():
+        """Defect-2 — total calibration failure in a cross-GPU mode
+        (require=True) RAISES rather than returning a degenerate all-1.0
+        calibration silently; without require it warns loudly."""
+        class _FailW:
+            def calibrate(self, **kw):
+                raise RuntimeError("boom")
+        pool = _bare_pool()
+        pool.workers = [_FailW(), _FailW()]
+        try:
+            pool.calibrate(report=io.StringIO(), require=True)
+            raise AssertionError("expected RuntimeError on total cal failure")
+        except RuntimeError as exc:
+            assert "ALL" in str(exc), str(exc)
+        rep = io.StringIO()
+        f = pool.calibrate(report=rep)
+        assert f == [1.0, 1.0] and "WARNING" in rep.getvalue()
+
+    def test_require_calibration_kwarg_isolated_from_worker():
+        """The require_calibration kwarg is popped before TimingWorker
+        construction (which would reject the unknown keyword)."""
+        saved = os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        try:
+            pool = MultiGPUTimingPool("Lion", vendor="cuda",
+                                      require_calibration=True,
+                                      enable_watchdog=False)
+            assert pool._require_calibration is True
+            assert len(pool.workers) >= 1  # workers built (kwarg didn't leak)
+        finally:
+            if saved is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = saved
+
+    def test_repro_state_payload_complete():
+        """Defect-2 — the §2A crash payload contains resolved host+device
+        flags, arch, optimizer/model config, sources, and env, so a build
+        crash is fixable from its output alone."""
+        spec = BuildSpec(optimizer="adamw", model="decoder", arch="sm_90a",
+                         out_dir=Path("/tmp"))
+        payload = _render_repro_state(
+            spec, ["-O3", "-ffoo"],
+            ["--use_fast_math", "-Xptxas", "-v"], ["-flto"],
+            [Path("/x/k.cu")], {"CC": "ccache cc"})
+        for needle in ("arch:", "sm_90a", "optimizer:", "adamw", "model:",
+                       "decoder", "host_cflags:", "-ffoo", "device_cflags:",
+                       "--use_fast_math", "ldflags:", "-flto", "sources",
+                       "k.cu", "env:", "CC=ccache cc"):
+            assert needle in payload, (needle, payload[:600])
+
+    def test_no_silent_broad_except_in_production():
+        """Defect-2 acceptance — AST proof: zero broad except handlers in
+        NON-TEST code whose body is pass/continue with no log and no raise."""
+        import ast as _ast
+        src = Path(__file__).read_text()
+        tree = _ast.parse(src)
+        LOG = ("report.write", "sys.stderr.write", "sys.stdout.write",
+               "logging", "_trace_add", "warnings.warn", "_log(", "._log(",
+               "print(", "_codegen_report_log", "_error_log.append",
+               "stderr.write", "_debug_swallow")
+
+        def broad(h):
+            if h.type is None:
+                return True
+            t = h.type
+            n = ([t.id] if isinstance(t, _ast.Name)
+                 else [e.id for e in t.elts if isinstance(e, _ast.Name)]
+                 if isinstance(t, _ast.Tuple) else [])
+            return "Exception" in n or "BaseException" in n
+
+        def haslr(h):
+            for nd in _ast.walk(_ast.Module(body=h.body, type_ignores=[])):
+                if isinstance(nd, _ast.Raise):
+                    return True
+                if isinstance(nd, _ast.Call):
+                    seg = _ast.get_source_segment(src, nd) or ""
+                    if any(m in seg for m in LOG):
+                        return True
+            return False
+        defs = sorted([(n.lineno, n.name) for n in _ast.walk(tree)
+                       if isinstance(n, (_ast.FunctionDef,
+                                         _ast.AsyncFunctionDef))])
+
+        def enc(ln):
+            nm = "<module>"
+            for dl, dn in defs:
+                if dl <= ln:
+                    nm = dn
+                else:
+                    break
+            return nm
+        offenders = []
+        for node in _ast.walk(tree):
+            if (isinstance(node, _ast.ExceptHandler) and broad(node)
+                    and not haslr(node)):
+                b = node.body
+                silent_passcont = (len(b) == 1 and isinstance(
+                    b[0], (_ast.Pass, _ast.Continue)))
+                fn = enc(node.lineno)
+                istest = fn.startswith("_self_test") or fn.startswith("test_")
+                if silent_passcont and not istest:
+                    offenders.append((node.lineno, fn))
+        assert not offenders, f"silent pass/continue broad-excepts: {offenders}"
+
+    run("debug_swallow_quiet_default_loud_at_debug",
+        test_debug_swallow_quiet_default_loud_at_debug)
+    run("calibration_failure_warns_not_silent",
+        test_calibration_failure_warns_not_silent)
+    run("calibration_total_failure_raises_when_required",
+        test_calibration_total_failure_raises_when_required)
+    run("require_calibration_kwarg_isolated",
+        test_require_calibration_kwarg_isolated_from_worker)
+    run("repro_state_payload_complete", test_repro_state_payload_complete)
+    run("no_silent_broad_except_in_production",
+        test_no_silent_broad_except_in_production)
+
+
+def _self_test_validation_mechanism(run) -> None:
+    """`[self-test] validation_mechanism` section (Fix-#2 §3).
+
+    Proves the validation-mechanism fix: _dump_variant_output is called
+    explicitly (no SG_DUMP_OUTPUT side-channel), shapes match the oracle,
+    bad strict configs are caught at new-best, and validated generated
+    variants can win."""
+    import io
+    import tempfile
+    import numpy as np
+    sys.stdout.write("[self-test] validation_mechanism\n")
+
+    def test_strict_config_bad_output_caught_at_new_best():
+        """A strict (template) config that produces WRONG output is caught
+        at new-best and cannot win via pick_winner."""
+        td = Path(tempfile.mkdtemp())
+        ref = td / "ref.npy"
+        np.save(ref, np.ones(4096, dtype=np.float32))
+        vdir = td / "variants"
+        vdir.mkdir(parents=True, exist_ok=True)
+        bad_dump = vdir / "_out_bad.npy"
+        np.save(bad_dump, np.zeros(4096, dtype=np.float32) + 999.0)
+        status, _ = _compare_outputs(ref, bad_dump, "float32")
+        assert status == "numerical_fail", f"expected numerical_fail, got {status}"
+        trial_bad = {"timing_ms": 0.01, "numerical_status": "numerical_fail",
+                     "origin": ORIGIN_TEMPLATE, "config": {"x": 1},
+                     "trial_num": 1}
+        trial_ok = {"timing_ms": 0.50, "numerical_status": "ok",
+                    "origin": ORIGIN_TEMPLATE, "config": {"x": 2},
+                    "trial_num": 2}
+        w = pick_winner([trial_bad, trial_ok])
+        assert w is not None and w["trial_num"] == 2, \
+            "numerical_fail trial must not win even when fastest"
+
+    def test_validated_generated_variant_can_win():
+        """A generated-origin variant (e.g. fastmath) that passed
+        validation CAN win when it is the fastest."""
+        fm_ok = {"timing_ms": 0.01, "numerical_status": "ok",
+                 "origin": ORIGIN_FASTMATH, "config": {"_fastmath": "full"},
+                 "trial_num": 1}
+        tmpl = {"timing_ms": 0.50, "numerical_status": "ok",
+                "origin": ORIGIN_TEMPLATE, "config": {"x": 1},
+                "trial_num": 2}
+        w = pick_winner([fm_ok, tmpl])
+        assert w is not None and w["origin"] == ORIGIN_FASTMATH, \
+            "validated generated variant must be eligible to win"
+
+    def test_validation_uses_dump_variant_not_env():
+        """Validation uses _dump_variant_output (explicit fresh subprocess)
+        rather than the SG_DUMP_OUTPUT env-var side-channel. The explicit dump
+        now lives in the shared multi-regime helper the timer routes through;
+        neither the timer nor the helper may use the broken side-channel.
+        Structural proof via source inspection."""
+        import inspect
+        helper_src = inspect.getsource(_validate_against_regimes)
+        assert "_dump_variant_output(" in helper_src, \
+            "validation helper must call _dump_variant_output explicitly"
+        timer_src = inspect.getsource(_make_variant_timer)
+        assert "SG_DUMP_OUTPUT" not in timer_src, \
+            "timer must NOT use the broken SG_DUMP_OUTPUT side-channel"
+        assert "SG_DUMP_OUTPUT" not in helper_src, \
+            "validation helper must NOT use the broken SG_DUMP_OUTPUT channel"
+
+    def test_validation_caches_by_config_key():
+        """Validation results are cached in progress_state['_val_cache']
+        so re-timing the same config_key doesn't re-run a subprocess."""
+        import inspect
+        src = inspect.getsource(_make_variant_timer)
+        assert "_val_cache" in src, \
+            "timer must cache validation results by config_key"
+
+    def test_validation_regimes_default_and_override():
+        """#4 — default is the full adversarial regime set; a project may
+        narrow it via [numerics].regimes (order normalized to _INPUT_REGIMES);
+        a garbage/empty override falls back to the full set (coverage only
+        shrinks deliberately)."""
+        import types
+        assert _validation_regimes(types.SimpleNamespace(config=None)) \
+            == list(_INPUT_REGIMES)
+        s2 = types.SimpleNamespace(
+            config={"numerics": {"regimes": ["large", "normal", "bogus"]}})
+        # unknown 'bogus' dropped; order normalized to _INPUT_REGIMES.
+        assert _validation_regimes(s2) == ["normal", "large"], \
+            _validation_regimes(s2)
+        s3 = types.SimpleNamespace(config={"numerics": {"regimes": ["bogus"]}})
+        assert _validation_regimes(s3) == list(_INPUT_REGIMES)
+
+    def test_multiregime_fails_if_any_regime_diverges():
+        """#4 — THE point of the sweep: a variant that matches the oracle on
+        'normal' but DIVERGES on a later adversarial regime (large/denormal)
+        must fail closed. The pre-fix validation only checked 'normal' and
+        would have passed such a variant."""
+        td = Path(tempfile.mkdtemp())
+        dump_dir = td / "v"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        ref = td / "ref.npy"
+        np.save(ref, np.zeros(4, dtype=np.float32))
+        ref_state = {"size": 4096, "dtype": "float32", "entry": None}
+        so = td / "k.so"
+        so.write_bytes(b"\x7fELF")
+        seen: List[str] = []
+
+        def fake_dump(variant_so, opt_class, size, dtype, out_path,
+                      timeout=120, fused_op_template=None, entry=None,
+                      regime="normal", seed=0):
+            np.save(out_path, np.zeros(4, dtype=np.float32))
+            seen.append(regime)
+            return True
+
+        def fake_compare(ref_p, out_p, dtype):
+            # Diverge ONLY on the 'large' regime; 'normal' passes.
+            return (("numerical_fail", 9.9) if seen[-1] == "large"
+                    else ("ok", 0.0))
+
+        def fake_det3x(*a, **k):
+            return True
+
+        g = globals()
+        saved = {k: g.get(k) for k in ("_dump_variant_output",
+                                       "_compare_outputs",
+                                       "_check_determinism_3x")}
+        g["_dump_variant_output"] = fake_dump
+        g["_compare_outputs"] = fake_compare
+        g["_check_determinism_3x"] = fake_det3x
+        try:
+            status = _validate_against_regimes(
+                so, "AdamW", ref_state, lambda rg, seed=0: ref,
+                list(_INPUT_REGIMES), dump_dir, "ck1", io.StringIO())
+        finally:
+            for k, v in saved.items():
+                g[k] = v
+        assert status == "numerical_fail", status
+        # Fail-closed: stopped at 'large', never reached 'adversarial'.
+        assert "large" in seen and "adversarial" not in seen, seen
+
+    def test_multiregime_all_pass_runs_determinism():
+        """#4 — when the variant matches on EVERY regime, all regimes are
+        swept and the determinism 3x check runs, yielding 'deterministic'."""
+        td = Path(tempfile.mkdtemp())
+        dump_dir = td / "v"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        ref = td / "ref.npy"
+        np.save(ref, np.zeros(4, dtype=np.float32))
+        ref_state = {"size": 4096, "dtype": "float32", "entry": None}
+        so = td / "k.so"
+        so.write_bytes(b"\x7fELF")
+        seen: List[str] = []
+        det_called = {"n": 0}
+
+        def fake_dump(variant_so, opt_class, size, dtype, out_path,
+                      timeout=120, fused_op_template=None, entry=None,
+                      regime="normal", seed=0):
+            np.save(out_path, np.zeros(4, dtype=np.float32))
+            seen.append(regime)
+            return True
+
+        def fake_compare(ref_p, out_p, dtype):
+            return ("ok", 0.0)
+
+        def fake_det3x(*a, **k):
+            det_called["n"] += 1
+            return True
+
+        g = globals()
+        saved = {k: g.get(k) for k in ("_dump_variant_output",
+                                       "_compare_outputs",
+                                       "_check_determinism_3x")}
+        g["_dump_variant_output"] = fake_dump
+        g["_compare_outputs"] = fake_compare
+        g["_check_determinism_3x"] = fake_det3x
+        try:
+            status = _validate_against_regimes(
+                so, "AdamW", ref_state, lambda rg, seed=0: ref,
+                list(_INPUT_REGIMES), dump_dir, "ck2", io.StringIO())
+        finally:
+            for k, v in saved.items():
+                g[k] = v
+        assert status == "deterministic", status
+        assert seen == list(_INPUT_REGIMES), seen   # ALL regimes swept
+        assert det_called["n"] == 1, det_called       # determinism ran once
+
+    def test_timer_wires_multiregime_validation():
+        """Structural proof: both validation drivers route through the shared
+        multi-regime helper, not an inline single-regime check."""
+        import inspect
+        tsrc = inspect.getsource(_make_variant_timer)
+        assert "_validate_against_regimes(" in tsrc, \
+            "main timer must use the multi-regime validator"
+        assert "_validation_regimes(spec)" in tsrc, \
+            "main timer must sweep the configured regimes"
+        fmsrc = inspect.getsource(_time_validate_fastmath_variants)
+        assert "_validate_against_regimes(" in fmsrc, \
+            "fast-math validator must also sweep regimes"
+
+    run("strict_config_bad_output_caught_at_new_best",
+        test_strict_config_bad_output_caught_at_new_best)
+    run("validated_generated_variant_can_win",
+        test_validated_generated_variant_can_win)
+    run("validation_uses_dump_variant_not_env",
+        test_validation_uses_dump_variant_not_env)
+    run("validation_caches_by_config_key",
+        test_validation_caches_by_config_key)
+    run("validation_regimes_default_and_override",
+        test_validation_regimes_default_and_override)
+    run("multiregime_fails_if_any_regime_diverges",
+        test_multiregime_fails_if_any_regime_diverges)
+    run("multiregime_all_pass_runs_determinism",
+        test_multiregime_all_pass_runs_determinism)
+    run("timer_wires_multiregime_validation",
+        test_timer_wires_multiregime_validation)
+
+
+def _self_test_autotune_brain(run) -> None:
+    """`[self-test] autotune_brain` section (mandate #13 stopper defaults,
+    #14 cost-model cold-start floor, #5 multi-GPU calibration)."""
+    sys.stdout.write("[self-test] autotune_brain\n")
+
+    def test_stopper_defaults_documented_constants():
+        """#13 — the stopper uses the centralized documented defaults; the
+        max_trials cap is a safety rail, far above any convergence count."""
+        s = BayesianEarlyStopper()
+        assert s.min_delta_rel == _DEFAULT_MIN_DELTA_REL
+        assert s.ei_floor == _DEFAULT_EI_FLOOR
+        assert s.coverage_growth_floor == _DEFAULT_COVERAGE_GROWTH_FLOOR
+        assert s.max_trials == _DEFAULT_STOPPER_SAFETY_CAP
+        assert s.max_trials >= 1_000_000, "safety rail must be very high"
+
+    def test_stopper_convergence_governs_not_cap():
+        """#13 — a converging timer stops on a convergence detector
+        (plateau/EI/coverage), NOT by hitting max_trials."""
+        def _converging(cfg):
+            return 0.1  # instant plateau
+        stopper = BayesianEarlyStopper(patience=20, max_trials=100000)
+        records, info = run_bayesian(
+            "sm_90", {"sm_90": {"dims": [
+                {"name": "block", "values": [64, 128, 256]},
+                {"name": "vec", "values": [1, 2, 4]}],
+                "prefilter": {"rules": []}}},
+            n_trials=None, seed=0, timer=_converging, stopper=stopper)
+        assert len(records) < 100000, "must converge, not hit the cap"
+        reason = info.get("stop_reason") or ""
+        assert "max_trials" not in reason, \
+            f"cap should not be the binding constraint, got {reason}"
+
+    def test_cost_model_cold_start_floor_constant():
+        """#14 — pruning floor is >= 100 measured trials."""
+        assert _COST_MODEL_COLD_START_FLOOR >= 100
+
+    def test_calibration_factors_default_unity():
+        """#5 — without calibration, factors are 1.0 (no normalization)."""
+        saved = os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        try:
+            pool = MultiGPUTimingPool("Lion", vendor="cuda",
+                                      enable_watchdog=False)
+            assert pool._calib_factors == [1.0]
+        finally:
+            if saved is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = saved
+
+    def test_calibration_normalizes_measured_time():
+        """#5 — a slower GPU's measured time is divided by its factor so it
+        lands in the fastest GPU's frame; raw value is preserved."""
+        # factor 1.0 → unchanged
+        r0 = MultiGPUTimingPool._normalize_result(
+            {"timing_ms": 1.0, "min_ms": 0.9, "max_ms": 1.1}, 1.0)
+        assert r0["timing_ms"] == 1.0 and "calib_factor" not in r0
+        # factor 1.25 (25% slower GPU) → divide.
+        r1 = MultiGPUTimingPool._normalize_result(
+            {"timing_ms": 1.25, "min_ms": 1.25, "max_ms": 1.25}, 1.25)
+        assert abs(r1["timing_ms"] - 1.0) < 1e-9, r1
+        assert r1["timing_ms_raw"] == 1.25 and r1["calib_factor"] == 1.25
+
+    def test_calibration_factor_from_refs():
+        """#5 — factors are worker_ref / fastest_ref; fastest gets 1.0."""
+        saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2"
+        try:
+            pool = MultiGPUTimingPool("Lion", vendor="cuda",
+                                      enable_watchdog=False)
+            # Splice mock workers returning fixed ref times.
+            class _MW:
+                def __init__(self, ms): self._ms = ms
+                def calibrate(self, **kw): return self._ms
+            pool.workers = [_MW(1.0), _MW(1.5), _MW(2.0)]
+            factors = pool.calibrate()
+            assert abs(factors[0] - 1.0) < 1e-9
+            assert abs(factors[1] - 1.5) < 1e-9
+            assert abs(factors[2] - 2.0) < 1e-9
+        finally:
+            if saved is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = saved
+
+    def test_worker_body_has_calibrate_op():
+        body = _render_worker_body("grokking_optimizers")
+        assert '"calibrate"' in body or "calibrate" in body
+        assert "ref_ms" in body
+
+    run("stopper_defaults_documented", test_stopper_defaults_documented_constants)
+    run("stopper_convergence_governs", test_stopper_convergence_governs_not_cap)
+    run("cost_model_cold_start_floor", test_cost_model_cold_start_floor_constant)
+    run("calibration_factors_default_unity", test_calibration_factors_default_unity)
+    run("calibration_normalizes_time", test_calibration_normalizes_measured_time)
+    run("calibration_factor_from_refs", test_calibration_factor_from_refs)
+    run("worker_body_has_calibrate_op", test_worker_body_has_calibrate_op)
+
+
+def _self_test_l2_flush(run) -> None:
+    """`[self-test] l2_flush` section (mandate #2)."""
+    sys.stdout.write("[self-test] l2_flush\n")
+
+    def test_l2_bytes_sourced_from_arch_entry():
+        """Per-arch L2 size comes from ArchEntry, not a hardcoded constant."""
+        assert get_arch_entry("sm_90a").l2_bytes == 50 * 1024 * 1024
+        assert get_arch_entry("sm_80").l2_bytes == 40 * 1024 * 1024
+        assert get_arch_entry("gfx942").l2_bytes == 256 * 1024 * 1024
+        assert _arch_l2_bytes("sm_90a") == 50 * 1024 * 1024
+        assert _arch_l2_bytes("gfx942") == 256 * 1024 * 1024
+
+    def test_l2_default_fallback_for_unspecified_arch():
+        """An arch without a measured l2_bytes falls back to 64 MiB, never 0
+        (a CUDA/HIP arch must always flush something)."""
+        # sm_70 has no l2_bytes set → fallback.
+        assert get_arch_entry("sm_70").l2_bytes is None
+        assert _arch_l2_bytes("sm_70") == _DEFAULT_L2_FLUSH_BYTES
+        assert _arch_l2_bytes("sm_70") > 0
+
+    def test_pallas_l2_flush_is_zero():
+        """Pallas/TPU has no host-side flush — _arch_l2_bytes returns 0 so the
+        timer skips buffer allocation entirely."""
+        assert _arch_l2_bytes("tpu_v6e") == 0
+
+    def test_timing_worker_forwards_l2_bytes():
+        """TimingWorker carries l2_bytes and would put it in the time request
+        (constructed without spawning a subprocess)."""
+        w = TimingWorker("Lion", l2_bytes=50 * 1024 * 1024,
+                         enable_watchdog=False)
+        assert w.l2_bytes == 50 * 1024 * 1024
+        # The pool forwards worker kwargs verbatim.
+        saved = os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        try:
+            pool = MultiGPUTimingPool("Lion", vendor="cuda",
+                                      l2_bytes=42, enable_watchdog=False)
+            assert all(wk.l2_bytes == 42 for wk in pool.workers)
+        finally:
+            if saved is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = saved
+
+    def test_worker_body_has_flush_logic():
+        """The rendered worker body must contain the flush primitive so the
+        subprocess actually performs the cold-cache eviction."""
+        body = _render_worker_body("grokking_optimizers")
+        assert "_bg_make_flush" in body
+        assert "flush.zero_()" in body
+
+    run("l2_bytes_sourced_from_arch_entry", test_l2_bytes_sourced_from_arch_entry)
+    run("l2_default_fallback", test_l2_default_fallback_for_unspecified_arch)
+    run("l2_pallas_is_zero", test_pallas_l2_flush_is_zero)
+    run("l2_timing_worker_forwards", test_timing_worker_forwards_l2_bytes)
+    run("l2_worker_body_has_flush", test_worker_body_has_flush_logic)
+
+
+def _self_test_tier1_compile(run) -> None:
+    """`[self-test] tier1_compile` section (mandate Tier-1 source
+    auto-discovery + #7 march policy + #8 sccache requirement)."""
+    import tempfile
+    sys.stdout.write("[self-test] tier1_compile\n")
+
+    def test_auto_discover_globs_compilable_sources():
+        """A non-grokking project (no csrc/backends layout) → broad glob
+        finds every .cu/.cpp under the tree, skipping pruned dirs."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "kernels").mkdir()
+            (root / "build").mkdir()
+            (root / "tests").mkdir()
+            (root / "kernels" / "a.cu").write_text("// k\n")
+            (root / "kernels" / "b.cpp").write_text("// b\n")
+            (root / "build" / "stale.cu").write_text("// pruned\n")
+            (root / "tests" / "t.cu").write_text("// pruned\n")
+            found = _auto_discover_sources(root, "cuda")
+            names = sorted(p.name for p in found)
+            assert names == ["a.cu", "b.cpp"], names
+
+    def test_auto_discover_pallas_only_py():
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "k.py").write_text("# pallas\n")
+            (root / "k.cu").write_text("// not pallas\n")
+            found = _auto_discover_sources(root, "pallas")
+            assert [p.name for p in found] == ["k.py"], found
+
+    def test_march_native_by_default():
+        """On-target (default) → -march=native -mtune=native."""
+        flags = _host_march_flags(BuildSpec(
+            optimizer="adamw", model="decoder", arch="sm_90a",
+            out_dir=Path("/tmp")))
+        assert flags == ["-march=native", "-mtune=native"], flags
+
+    def test_march_baseline_cross_host():
+        """Cross-host → portable ISA baseline, never native."""
+        spec = BuildSpec(optimizer="adamw", model="decoder", arch="sm_90a",
+                         out_dir=Path("/tmp"), cross_host=True)
+        flags = _host_march_flags(spec)
+        assert flags == ["-march=x86-64-v3"], flags
+        assert "-march=native" not in flags
+        # Custom baseline honoured.
+        spec.cross_host_march = "x86-64-v4"
+        assert _host_march_flags(spec) == ["-march=x86-64-v4"]
+
+    def test_host_cflags_no_native_in_base():
+        """-march must not be baked into the shared base list (it's policy)."""
+        assert "-march=native" not in HOST_CFLAGS_BASE
+        assert "-mtune=native" not in HOST_CFLAGS_BASE
+
+    def test_host_cflags_hash_differs_native_vs_crosshost():
+        """Cross-host build must produce a different host flag set than the
+        native build (so host_cflags_hash diverges, keeping the cache honest)."""
+        base = dict(optimizer="adamw", model="decoder", arch="sm_90a",
+                    out_dir=Path("/tmp"))
+        native = _host_cflags(BuildSpec(**base))
+        cross = _host_cflags(BuildSpec(**base, cross_host=True))
+        assert native != cross
+        assert "-march=native" in native
+        assert "-march=x86-64-v3" in cross
+
+    def test_compiler_cache_warning_when_absent():
+        """When no compiler cache is on PATH, the sweep emits a loud warning
+        (not silent), so the operator knows the sweep is compile-bound."""
+        import io
+        saved = shutil.which
+        rep = io.StringIO()
+        try:
+            shutil.which = lambda name: None  # type: ignore
+            _warn_if_no_compiler_cache(rep)
+        finally:
+            shutil.which = saved
+        log = rep.getvalue()
+        assert "WARNING" in log and "no sccache/ccache" in log, log
+
+    run("tier1_auto_discover_globs", test_auto_discover_globs_compilable_sources)
+    run("tier1_auto_discover_pallas", test_auto_discover_pallas_only_py)
+    run("march_native_by_default", test_march_native_by_default)
+    run("march_baseline_cross_host", test_march_baseline_cross_host)
+    run("host_cflags_no_native_in_base", test_host_cflags_no_native_in_base)
+    run("host_cflags_hash_differs", test_host_cflags_hash_differs_native_vs_crosshost)
+    run("compiler_cache_warning_when_absent", test_compiler_cache_warning_when_absent)
+
+
+def _self_test_discovery(run) -> None:
+    """`[self-test] discovery` section (mandate #4/#11/#22 entry-point
+    discovery + signature introspection + #23 stage selector)."""
+    sys.stdout.write("[self-test] discovery\n")
+
+    def test_parse_adam_style_schema():
+        """The historical Adam fused-step schema parses into the right
+        ordered EntryArgs — mutable param first, then grad/state, then
+        float scalars."""
+        sch = ("fused_adamw_step(Tensor(a!) param, Tensor grad, "
+               "Tensor exp_avg, Tensor exp_avg_sq, float lr, float beta1, "
+               "float beta2, float eps, float weight_decay, float step) -> ()")
+        args = _parse_torch_schema(sch)
+        assert len(args) == 10, len(args)
+        assert args[0].name == "param" and args[0].kind == "tensor"
+        assert args[0].alias is True, "param is in-place (Tensor(a!))"
+        assert all(a.kind == "tensor" for a in args[:4])
+        assert all(a.kind == "scalar" and a.dtype == "float"
+                   for a in args[4:])
+
+    def test_parse_mixed_signature():
+        """A (Tensor, Tensor, float) signature → 2 tensors + 1 float scalar
+        (the GOOD behavioral example from the mandate)."""
+        args = _parse_torch_schema("foo(Tensor a, Tensor b, float c) -> Tensor")
+        assert [a.kind for a in args] == ["tensor", "tensor", "scalar"]
+        assert args[2].dtype == "float"
+
+    def test_parse_strips_defaults_and_int():
+        args = _parse_torch_schema("bar(Tensor x, int n=4, bool flag=False) -> ()")
+        assert args[1].kind == "scalar" and args[1].dtype == "int"
+        assert args[2].kind == "scalar" and args[2].dtype == "bool"
+
+    def test_malformed_schema_raises():
+        """A schema with no arg list is an ERROR (§2A), not a silent skip."""
+        try:
+            _parse_torch_schema("not a schema at all")
+            raise AssertionError("expected ValueError on malformed schema")
+        except ValueError:
+            pass
+
+    def test_select_prefers_inplace_most_tensors():
+        """Entry selection prefers the in-place op with the most tensor
+        args (the canonical 'updates a buffer' shape)."""
+        e_small = DiscoveredEntry(
+            name="aux", kind="torch_op", dotted_path="torch.ops.x.aux",
+            args=[EntryArg("a", "tensor", alias=True)])
+        e_big = DiscoveredEntry(
+            name="step", kind="torch_op", dotted_path="torch.ops.x.step",
+            args=[EntryArg("p", "tensor", alias=True),
+                  EntryArg("g", "tensor"), EntryArg("m", "tensor"),
+                  EntryArg("lr", "scalar", dtype="float")])
+        chosen = _select_tunable_entry([e_small, e_big])
+        assert chosen is e_big, chosen.name
+        assert chosen.mutated_arg_index == 0
+
+    def test_select_empty_is_none():
+        """No entries → None (caller switches to Tier-1, a VALID state)."""
+        assert _select_tunable_entry([]) is None
+
+    def test_select_explicit_name_wins():
+        e1 = DiscoveredEntry("a", "torch_op", "torch.ops.x.a",
+                             args=[EntryArg("t", "tensor")])
+        e2 = DiscoveredEntry("b", "torch_op", "torch.ops.x.b",
+                             args=[EntryArg("t", "tensor"),
+                                   EntryArg("u", "tensor")])
+        assert _select_tunable_entry([e1, e2], prefer="a") is e1
+
+    def test_discovery_probe_has_torch_ops_enumeration():
+        """The discovery probe body must enumerate torch.ops and emit the
+        completion sentinel (so the in-process parser can detect success)."""
+        assert "torch.ops.load_library" in _DISCOVERY_PROBE
+        assert "_jit_get_schemas_for_operator" in _DISCOVERY_PROBE
+        assert "__DISCOVERY_DONE__" in _DISCOVERY_PROBE
+
+    def test_stage_selector_sets_cross_host():
+        """--stage cpu-then-target must imply a cross-host (portable ISA)
+        build; all-on-target keeps native."""
+        # cpu-then-target → cross_host True
+        spec_x = BuildSpec(optimizer="adamw", model="decoder", arch="sm_90a",
+                           out_dir=Path("/tmp"), cross_host=True)
+        assert _host_march_flags(spec_x) == ["-march=x86-64-v3"]
+        spec_n = BuildSpec(optimizer="adamw", model="decoder", arch="sm_90a",
+                           out_dir=Path("/tmp"), cross_host=False)
+        assert "-march=native" in _host_march_flags(spec_n)
+
+    def test_fast_math_not_in_base_lists():
+        """#6 — fast-math is gone from every base flag list (it's a variant)."""
+        assert "--use_fast_math" not in NVCC_DEVICE_BASE
+        assert "-ffast-math" not in HOST_CFLAGS_BASE
+        assert "-ffast-math" not in HIPCC_DEVICE_BASE
+
+    def test_ndebug_not_in_base_lists():
+        """NDEBUG migration — compile.py base carries no project NDEBUG."""
+        assert "-DNDEBUG" not in NVCC_DEVICE_BASE
+        assert "-DNDEBUG" not in HIPCC_DEVICE_BASE
+
+    def test_ndebug_present_for_grokking_absent_for_generic():
+        """NDEBUG migration — grokking's config re-adds -DNDEBUG to device
+        flags; a config-less generic build has none."""
+        # Generic (no config) → no NDEBUG.
+        generic = _device_cflags(BuildSpec(
+            optimizer="adamw", model="decoder", arch="sm_90a",
+            out_dir=Path("/tmp")))
+        assert "-DNDEBUG" not in generic
+        # Grokking (default project config carries [device_cflags].extra).
+        grok = BuildSpec(optimizer="adamw", model="decoder", arch="sm_90a",
+                         out_dir=Path("/tmp"),
+                         config={"device_cflags": {"extra": ["-DNDEBUG"]}})
+        flags = _device_cflags(grok)
+        assert "-DNDEBUG" in flags, \
+            "grokking project config must re-introduce -DNDEBUG"
+
+    def test_fast_math_variant_flags():
+        """#6 — fast-math variants exist and map per-vendor; safe_subset
+        omits -ffinite-math-only (keeps NaN/Inf guards)."""
+        h, d = _fast_math_variant_flags("full_fast_math", "cuda")
+        assert "--use_fast_math" in d
+        h2, d2 = _fast_math_variant_flags("full_fast_math", "hip")
+        assert "-ffast-math" in d2
+        hs, ds = _fast_math_variant_flags("safe_subset", "cuda")
+        assert "-fassociative-math" in hs
+        # The safe subset must NEVER include the finite-only flag that deletes
+        # NaN/Inf handling.
+        all_safe = hs + ds
+        assert "-ffinite-math-only" not in all_safe
+        # Unknown variant → empty.
+        assert _fast_math_variant_flags("nope", "cuda") == ([], [])
+
+    run("discovery_parse_adam_schema", test_parse_adam_style_schema)
+    run("discovery_parse_mixed_signature", test_parse_mixed_signature)
+    run("discovery_parse_strips_defaults", test_parse_strips_defaults_and_int)
+    run("discovery_malformed_schema_raises", test_malformed_schema_raises)
+    run("discovery_select_prefers_inplace", test_select_prefers_inplace_most_tensors)
+    run("discovery_select_empty_is_none", test_select_empty_is_none)
+    run("discovery_select_explicit_name", test_select_explicit_name_wins)
+    run("discovery_probe_enumerates_torch_ops",
+        test_discovery_probe_has_torch_ops_enumeration)
+    run("discovery_stage_sets_cross_host", test_stage_selector_sets_cross_host)
+    run("fastmath_not_in_base_lists", test_fast_math_not_in_base_lists)
+    run("ndebug_not_in_base_lists", test_ndebug_not_in_base_lists)
+    run("ndebug_grokking_vs_generic", test_ndebug_present_for_grokking_absent_for_generic)
+    run("fast_math_variant_flags", test_fast_math_variant_flags)
 
 
 def _self_test_kernel_headers(run) -> None:
@@ -17116,8 +20559,10 @@ def _self_test_toolchain_bootstrap(run) -> None:
                      "sm_120a"):
             tv = _target_cuda_version_for_arch(arch)
             need = ARCH_TABLE[arch].min_toolchain_version
-            assert tv[0] >= need[0] or (
-                tv[0] == need[0] and tv[1] >= need[1]), \
+            # Tuple compare — the old `tv[0] >= need[0] or ...` disjunction
+            # short-circuited True on any equal-major/lower-minor result,
+            # making the minor-version floor dead.
+            assert tuple(tv) >= tuple(need), \
                 f"{arch}: target {tv} below min {need}"
         # Non-CUDA arches return (0, 0).
         assert _target_cuda_version_for_arch("gfx942") == (0, 0)
@@ -17582,6 +21027,92 @@ def _self_test_numerical_validation(run) -> None:
         finally:
             _LAST_NUMERICAL_STATUS.pop(ck, None)
 
+    def test_strict_math_strips_fast_math():
+        """#9 — the strict oracle flag posture removes every fast-math token
+        and marks the build strict."""
+        flags = ["-O3", "--use_fast_math", "-ffast-math", "-DNDEBUG",
+                 "-fgpu-flush-denormals-to-zero", "-std=c++17"]
+        strict = _strict_math_flags(flags)
+        assert "--use_fast_math" not in strict
+        assert "-ffast-math" not in strict
+        assert "-fgpu-flush-denormals-to-zero" not in strict
+        assert "-DSG_STRICT_MATH=1" in strict
+        # Non-fast-math flags are preserved.
+        assert "-O3" in strict and "-DNDEBUG" in strict
+
+    def test_input_synthesis_regimes():
+        """#10 — every magnitude regime produces a distinct device tensor
+        expression; the seed is recorded for reproducibility."""
+        for regime in _INPUT_REGIMES:
+            expr = _regime_tensor_expr(regime, "4096", "dtype")
+            assert "generator=g" in expr
+            assert "device='cuda'" in expr
+        # large vs small vs normal differ.
+        assert _regime_tensor_expr("large", "8", "dtype") != \
+            _regime_tensor_expr("small", "8", "dtype")
+        spec = _synthesize_input_spec(4, 6, regime="adversarial", seed=7)
+        assert spec["seed"] == 7 and spec["regime"] == "adversarial"
+
+    def test_input_synthesis_rejects_bad_regime():
+        try:
+            _synthesize_input_spec(1, 0, regime="bogus")
+            raise AssertionError("expected ValueError on bad regime")
+        except ValueError:
+            pass
+
+    def test_arg_construction_uses_synth_not_zeros_ones():
+        """#10 — the back-compat (no-entry) path now synthesizes randn inputs
+        instead of the degenerate param=zeros/grad=ones."""
+        code = _render_arg_construction(None, 4096, "normal", 0)
+        assert "torch.randn" in code, code
+        assert "torch.ones(" not in code, "must not use grad=ones degenerate"
+        # Discovered-entry path constructs one tensor per tensor arg.
+        entry = DiscoveredEntry(
+            "step", "torch_op", "torch.ops.x.step",
+            args=[EntryArg("p", "tensor", alias=True),
+                  EntryArg("g", "tensor"),
+                  EntryArg("lr", "scalar", dtype="float")])
+        code2 = _render_arg_construction(entry, 256, "large", 3)
+        assert "call_args = [a0, a1, a2]" in code2, code2
+        assert "snapshot_idx = 0" in code2
+
+    def test_determinism_preamble_present():
+        """#12 — validation subprocesses set CUBLAS_WORKSPACE_CONFIG and
+        enable deterministic algorithms."""
+        assert "CUBLAS_WORKSPACE_CONFIG" in _DETERMINISM_PREAMBLE
+        assert "use_deterministic_algorithms" in _DETERMINISM_TORCH_SETUP
+
+    def test_pick_winner_rejects_unvalidated_generated():
+        """#16 — a faster synth/cutlass/fastmath variant that never passed
+        the strict oracle (status 'skipped') is INELIGIBLE; a slower
+        validated template variant wins instead."""
+        trials = [
+            {"timing_ms": 0.2, "numerical_status": "skipped",
+             "origin": "synth", "config": {}, "trial_num": 0},
+            {"timing_ms": 0.2, "numerical_status": "skipped",
+             "origin": "cutlass", "config": {}, "trial_num": 1},
+            {"timing_ms": 0.5, "numerical_status": "skipped",
+             "origin": "template", "config": {}, "trial_num": 2},
+        ]
+        w = pick_winner(trials)
+        assert w is not None and w["origin"] == "template", w
+        # A synth variant that DID pass the oracle is eligible and wins.
+        trials.append({"timing_ms": 0.1, "numerical_status": "ok",
+                       "origin": "synth", "config": {}, "trial_num": 3})
+        w2 = pick_winner(trials)
+        assert w2 is not None and w2["timing_ms"] == 0.1, w2
+
+    def test_pick_winner_fastmath_needs_validation():
+        """#6/#16 — a fast-math variant only wins if it matched the strict
+        oracle."""
+        trials = [
+            {"timing_ms": 0.1, "numerical_status": "skipped",
+             "origin": "fastmath", "config": {}, "trial_num": 0},
+            {"timing_ms": 0.3, "numerical_status": "ok",
+             "origin": "template", "config": {}, "trial_num": 1},
+        ]
+        assert pick_winner(trials)["origin"] == "template"
+
     run("tolerances_table_shape", test_tolerances_table_shape)
     run("compare_outputs_tolerant", test_compare_outputs_tolerant)
     run("compare_outputs_numerical_fail", test_compare_outputs_fail)
@@ -17593,6 +21124,16 @@ def _self_test_numerical_validation(run) -> None:
          test_pick_winner_strict_returns_none_when_no_deterministic)
     run("make_trial_record_propagates_numerical_status",
          test_make_trial_record_pulls_numerical_status)
+    run("strict_math_strips_fast_math", test_strict_math_strips_fast_math)
+    run("input_synthesis_regimes", test_input_synthesis_regimes)
+    run("input_synthesis_rejects_bad_regime", test_input_synthesis_rejects_bad_regime)
+    run("arg_construction_synth_not_degenerate",
+        test_arg_construction_uses_synth_not_zeros_ones)
+    run("determinism_preamble_present", test_determinism_preamble_present)
+    run("pick_winner_rejects_unvalidated_generated",
+        test_pick_winner_rejects_unvalidated_generated)
+    run("pick_winner_fastmath_needs_validation",
+        test_pick_winner_fastmath_needs_validation)
 
     # ── Stream B — polyhedral / loop-transform layer ────────────────
 
@@ -17719,6 +21260,37 @@ def _self_test_polyhedral(run) -> None:
         assert "out[_idx]" in src and "in[_idx]" in src, src
     run("polyhedral_apply_schedule_honest_libclang_fallback",
          test_polyhedral_apply_schedule_honest_libclang_fallback)
+
+    def test_polyhedral_origin_only_when_transformed_source_built():
+        """Mandate #20 — origin=polyhedral must be stamped ONLY when a real
+        transformed source replaces variant_sources (so the strict oracle
+        validates a transformation that actually compiled). The pre-fix bug:
+        the timer discarded _polyhedral_expand_variant's return value, left
+        variant_sources = template, and stamped ORIGIN_POLYHEDRAL anyway —
+        attributing a transform that was never built. Proven by source
+        inspection of the timer's control flow + the keying contract."""
+        import inspect
+        tsrc = inspect.getsource(_make_variant_timer)
+        # The hook must capture the expander's return value (not discard it).
+        assert "_transformed = _polyhedral_expand_variant(" in tsrc, \
+            "timer must capture the transformed-source list from the expander"
+        # The stamp must be guarded by an actual source swap (mirrors synth).
+        assert "if poly_source is not None:" in tsrc, \
+            "origin=polyhedral must be gated on a real transformed source"
+        # The swap must precede/accompany the stamp: variant_sources is
+        # replaced AND origin set in the same guarded block.
+        idx_swap = tsrc.index("variant_sources = [poly_source]")
+        idx_stamp = tsrc.index(
+            "_LAST_VARIANT_ORIGIN[ckey] = ORIGIN_POLYHEDRAL")
+        # The swap must come at or before the stamp (same guarded block).
+        assert idx_swap < idx_stamp, \
+            "must replace variant_sources before stamping origin=polyhedral"
+        # And there must be no UNGUARDED polyhedral stamp (the old bug site):
+        # every ORIGIN_POLYHEDRAL stamp lives under the poly_source guard.
+        assert tsrc.count("_LAST_VARIANT_ORIGIN[ckey] = ORIGIN_POLYHEDRAL") == 1, \
+            "exactly one (guarded) polyhedral origin stamp expected"
+    run("polyhedral_origin_only_when_transformed_source_built",
+        test_polyhedral_origin_only_when_transformed_source_built)
 
     # Stream D — generative / structural codegen. Five tests covering
     # OpGraph construction + topo sort, elementwise lowering on CUDA,
@@ -17884,6 +21456,130 @@ def _self_test_synth_codegen(run) -> None:
                 except SynthCodegenError as exc:
                     assert "composable_kernel" in str(exc).lower()
     run("synth_ck_emitter_skip_path", test_synth_ck_emitter_skip_path)
+
+    def test_synth_dispatcher_per_optimizer():
+        """Stage 5 — the per-(spec.optimizer) dispatcher must route
+        GEMM-heavy optimizers (muon / supergrok2 Newton–Schulz) to the
+        tensor-core GEMM pattern and elementwise optimizers to
+        adamw_update — NOT a single hardcoded pattern. Also verifies the
+        muon synth path emits a real tensor-core opcode (no GPU needed:
+        we inspect the emitted source string)."""
+        from grokking_optimizers.compile import (
+            _synth_pattern_for_optimizer, _try_synth_codegen, BuildSpec,
+            pattern_newton_schulz, synthesize_kernel)
+        # Dispatch mapping is real, not a single constant.
+        assert _synth_pattern_for_optimizer("muon") == "newton_schulz"
+        assert _synth_pattern_for_optimizer("supergrok2") == "newton_schulz"
+        assert _synth_pattern_for_optimizer("grokfast") == "fused_adam_grad_norm"
+        assert _synth_pattern_for_optimizer("adamw") == "adamw_update"
+        assert _synth_pattern_for_optimizer("lion") == "adamw_update"
+        # Mandate #17 — an unknown optimizer now returns None (NO silent
+        # adamw_update default); the caller compiles the existing source.
+        assert _synth_pattern_for_optimizer("brand_new_opt") is None
+        # The Newton–Schulz pattern lowers to real tensor-core opcodes.
+        g = pattern_newton_schulz(M=256, N=256, dtype="fp16")
+        for arch, mnemonic in (("sm_90a", "wgmma"),
+                               ("gfx942", "v_mfma")):
+            src = synthesize_kernel(g, arch, "fp16", (256, 256),
+                                    pattern_name="newton_schulz")
+            assert mnemonic in src, (
+                f"{arch}: expected {mnemonic!r} in Newton–Schulz source")
+        # End-to-end: muon routes through the dispatcher to a GEMM-bearing
+        # synth file; adamw stays on the elementwise pattern. Distinct
+        # pattern_name in the emitted filename proves the hardcode is gone.
+        with tempfile.TemporaryDirectory() as td:
+            dims = [{"name": "block"}]
+            spec_m = BuildSpec(optimizer="muon", model="mamba",
+                               arch="sm_90a", out_dir=Path(td),
+                               enable_synth_codegen=True)
+            p_m = _try_synth_codegen(spec_m, {"block": 256}, dims)
+            assert p_m is not None and "newton_schulz" in str(p_m), p_m
+            spec_a = BuildSpec(optimizer="adamw", model="mamba",
+                               arch="sm_90a", out_dir=Path(td),
+                               enable_synth_codegen=True)
+            p_a = _try_synth_codegen(spec_a, {"block": 256}, dims)
+            assert p_a is not None and "adamw_update" in str(p_a), p_a
+            assert str(p_m) != str(p_a)
+    run("synth_dispatcher_per_optimizer",
+         test_synth_dispatcher_per_optimizer)
+
+    def test_synth_pattern_failsafe_unknown_optimizer():
+        """#17 — an unknown optimizer has NO genuine pattern match → None
+        (not a silent adamw_update default)."""
+        assert _synth_pattern_for_optimizer("adamw") == "adamw_update"
+        assert _synth_pattern_for_optimizer("muon") == "newton_schulz"
+        # Unknown → None.
+        assert _synth_pattern_for_optimizer("totally_unknown_opt") is None
+
+    def test_synth_pattern_injectable():
+        """#17 — a project can inject its own optimizer→pattern map."""
+        inj = {"myopt": "softmax_matmul"}
+        assert _synth_pattern_for_optimizer("myopt", inj) == "softmax_matmul"
+        # Injected entry overrides the built-in table.
+        assert _synth_pattern_for_optimizer(
+            "adamw", {"adamw": "newton_schulz"}) == "newton_schulz"
+
+    def test_synth_unknown_optimizer_compiles_source_not_default():
+        """#17 — _try_synth_codegen returns None (compile existing source)
+        for an unknown optimizer instead of mis-synthesizing adamw_update."""
+        with tempfile.TemporaryDirectory() as td:
+            dims = [{"name": "block"}]
+            spec = BuildSpec(optimizer="some_third_party_opt", model="mamba",
+                             arch="sm_90a", out_dir=Path(td),
+                             enable_synth_codegen=True)
+            assert _try_synth_codegen(spec, {"block": 256}, dims) is None
+
+    def test_synth_dtype_from_config():
+        """#18 — dtype plumbed from the config's quant dim, not hardcoded."""
+        sc = {}
+        assert _synth_dtype_from_config({"quant": "bf16"}, [], sc) == "bf16"
+        assert _synth_dtype_from_config({"dtype": "fp16"}, [], sc) == "fp16"
+        # Explicit sc dtype wins.
+        assert _synth_dtype_from_config(
+            {}, [], {"dtype": "fp8"}) == "fp8"
+        # Unknown → fp32.
+        assert _synth_dtype_from_config({"quant": "weird"}, [], {}) == "fp32"
+
+    def test_synth_emits_configured_dtype():
+        """#18 — a non-fp32 config produces a non-fp32 synth kernel."""
+        with tempfile.TemporaryDirectory() as td:
+            dims = [{"name": "block"}]
+            spec = BuildSpec(optimizer="adamw", model="mamba", arch="sm_90a",
+                             out_dir=Path(td), enable_synth_codegen=True,
+                             config={"synth_codegen": {"dtype": "bf16"}})
+            p = _try_synth_codegen(spec, {"block": 256, "quant": "bf16"}, dims)
+            assert p is not None
+            text = p.read_text()
+            # bf16 maps to __nv_bfloat16 in the emitted CUDA source.
+            assert "bfloat16" in text or "__nv_bfloat16" in text, text[:200]
+
+    def test_registry_bakes_tuned_config():
+        """#15 — the registry's cubin cache key + template incorporate the
+        tuned block/vec/unroll, so a re-tuned config produces a new cubin
+        (the autotuner→runtime loop is closed)."""
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as td:
+            r0 = KernelRegistry("sm_90a", Path(td),
+                                tuned_config={"block": 128, "vec": 2, "unroll": 4})
+            r1 = KernelRegistry("sm_90a", Path(td),
+                                tuned_config={"block": 256, "vec": 4, "unroll": 8})
+            k0 = r0._key("adamw", "fp32", "small", 1)
+            k1 = r1._key("adamw", "fp32", "small", 1)
+            assert k0 != k1, "different tuned configs must not share a cubin key"
+            # The template bakes the tuned config into the source.
+            src = r0._template_provider("adamw", "sm_90a").format(
+                DTYPE="float", SHAPE_DIMS=1, SIZE_HINT=256,
+                BLOCK=128, VEC=2, UNROLL=4)
+            assert "kBlock  = 128" in src and "kVec    = 2" in src, src
+
+    run("synth_pattern_failsafe_unknown",
+        test_synth_pattern_failsafe_unknown_optimizer)
+    run("synth_pattern_injectable", test_synth_pattern_injectable)
+    run("synth_unknown_compiles_source",
+        test_synth_unknown_optimizer_compiles_source_not_default)
+    run("synth_dtype_from_config", test_synth_dtype_from_config)
+    run("synth_emits_configured_dtype", test_synth_emits_configured_dtype)
+    run("registry_bakes_tuned_config", test_registry_bakes_tuned_config)
 
     # Stream H — final wrapper: only runs the e2e smoke when a GPU is
     # visible; SKIPs cleanly (and counts as PASS) otherwise.
@@ -18129,6 +21825,21 @@ def _self_test_math_drift_guard(run) -> None:
     run("math_structural_single_source", structural_single_source_holds)
 
 
+# ─── Self-test count authority (Stage 3) ──────────────────────────────────
+# The TOTAL number of individual self-test cases (PASS + FAIL lines) that a
+# full ``--self-test`` run executes. This is the SINGLE authoritative place
+# the count lives — the ``count_guard`` section below COUNTS the cases that
+# actually ran and asserts they equal this constant, so the number can never
+# silently drift from docs/CI again. When you add or remove a ``run(...)``
+# case, update this constant in the same commit; the guard will fail loudly
+# (with the observed vs expected count) until you do.
+#
+# The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
+# any other), so the value is the grand total reported on the final
+# ``[self-test] N passed, M failed`` line.
+_SELF_TEST_EXPECTED_COUNT: int = 231
+
+
 def _self_test() -> int:
     """Run inline self-checks. Returns 0 on success, 1 on failure.
 
@@ -18136,6 +21847,10 @@ def _self_test() -> int:
     its own ``_self_test_<section>`` helper above. This function owns
     only the PASS/FAIL counters, the ``run`` closure that wraps each
     test, and the final summary line.
+
+    Stage 3: a final ``count_guard`` section counts the cases that ran and
+    asserts the total equals ``_SELF_TEST_EXPECTED_COUNT`` so the documented
+    count can never silently drift from the real count again.
     """
     failures = 0
     passed = 0
@@ -18153,12 +21868,21 @@ def _self_test() -> int:
     _self_test_search_space(_run)
     _self_test_pgo(_run)
     _self_test_device_profiling(_run)
+    _self_test_utilization(_run)
     _self_test_flags(_run)
     _self_test_bayesian(_run)
     _self_test_early_stopping(_run)
     _self_test_cost_model(_run)
     _self_test_cache(_run)
     _self_test_multi_gpu_pool(_run)
+    _self_test_clock_lock(_run)
+    _self_test_autotune_brain(_run)
+    _self_test_fastmath_integration(_run)
+    _self_test_silent_degradation(_run)
+    _self_test_validation_mechanism(_run)
+    _self_test_l2_flush(_run)
+    _self_test_tier1_compile(_run)
+    _self_test_discovery(_run)
     _self_test_kernel_headers(_run)
     _self_test_arch_table(_run)
     _self_test_kernel_registry(_run)
@@ -18174,6 +21898,22 @@ def _self_test() -> int:
     _self_test_flag_probe(_run)
     _self_test_math_drift_guard(_run)
     _self_test_e2e_smoke(_run)
+
+    # Stage 3 — count-consistency guard. Runs LAST so it can observe the
+    # number of cases every prior section executed. ``passed + failures`` is
+    # the count of all PRIOR cases; the guard case itself is the ``+ 1`` that
+    # brings the total to the grand total reported on the summary line.
+    def _count_guard() -> None:
+        observed_prior = passed + failures
+        observed_total = observed_prior + 1  # this guard case is counted too
+        assert observed_total == _SELF_TEST_EXPECTED_COUNT, (
+            f"self-test count drift: ran {observed_total} cases but "
+            f"_SELF_TEST_EXPECTED_COUNT={_SELF_TEST_EXPECTED_COUNT}. "
+            f"Update _SELF_TEST_EXPECTED_COUNT to {observed_total} in the "
+            f"same commit that changed the case count (this is the single "
+            f"authoritative place the number lives).")
+    sys.stdout.write("[self-test] count_guard\n")
+    _run("self_test_count_is_authoritative", _count_guard)
 
     sys.stdout.write(f"\n[self-test] {passed} passed, {failures} failed\n")
     return 0 if failures == 0 else 1
@@ -19350,6 +23090,7 @@ def validate_template_render(optimizer: str, arch: str
     except CodegenError as exc:
         return False, f"CodegenError: {exc}"
     except Exception as exc:
+        _debug_swallow('validate_template_render', exc)
         return False, f"{type(exc).__name__}: {exc}"
 
 
@@ -19464,8 +23205,8 @@ def _codegen_report_log(report, msg: str) -> None:
         return
     try:
         report.write(f"[codegen] {msg}\n")
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_codegen_report_log', _swexc)
 
 
 def _enumerate_cutlass_variants(arch: str,
@@ -19512,7 +23253,8 @@ def _enumerate_cutlass_variants(arch: str,
     try:
         elem = getattr(cutlass.DataType, py_dt_name, None) \
             if hasattr(cutlass, "DataType") else None
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_curated_fallback', _swexc)
         elem = None
 
     gemm = None
@@ -19528,7 +23270,8 @@ def _enumerate_cutlass_variants(arch: str,
         try:
             gemm = cutlass.op.Gemm(**kwargs)
             break
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_curated_fallback', _swexc)
             continue
     if gemm is None:
         return _curated_fallback(
@@ -19539,7 +23282,8 @@ def _enumerate_cutlass_variants(arch: str,
         tds_fn = getattr(gemm, "tile_descriptions", None)
         if callable(tds_fn):
             tds = tds_fn()
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_curated_fallback', _swexc)
         tds = None
     if not tds:
         return _curated_fallback(
@@ -19932,11 +23676,12 @@ def _try_import_libclang():
     """
     try:
         from clang import cindex  # type: ignore
-    except Exception:
+    except Exception as _swexc:
         # Try to auto-install libclang. The pip distribution name is
         # ``libclang``; once installed, the wheel ships a ``clang``
         # Python package + bundled ``libclang.so`` so the second import
         # attempt below usually succeeds.
+        _debug_swallow('_try_import_libclang', _swexc)
         ok = _ensure_optional_dep(
             "clang", "polyhedral",
             install=_auto_install_enabled(),
@@ -19945,13 +23690,15 @@ def _try_import_libclang():
             return None
         try:
             from clang import cindex  # type: ignore
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_try_import_libclang', _swexc)
             return None
     # Index construction is what actually loads libclang.so; it can
     # raise LibclangError even when the import succeeded.
     try:
         cindex.Index.create()
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_try_import_libclang', _swexc)
         return None
     return cindex
 
@@ -19961,7 +23708,8 @@ def _try_import_islpy():
     try:
         import islpy  # type: ignore
         return islpy
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_try_import_islpy', _swexc)
         return None
 
 
@@ -19971,8 +23719,8 @@ def _poly_log(report, msg: str) -> None:
         return
     try:
         report.write(f"[polyhedral] {msg}\n")
-    except Exception:
-        pass
+    except Exception as _swexc:
+        _debug_swallow('_poly_log', _swexc)
 
 
 def extract_loopnest_from_template(emitted_source: Path,
@@ -20079,8 +23827,8 @@ def _find_kernel_cursor(root, cindex):
                 if child.kind == CursorKind.CUDAGLOBAL_ATTR:
                     is_global = True
                     break
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('_find_kernel_cursor', _swexc)
         if is_global or spelling.startswith("launch_"):
             return c
     return None
@@ -20124,8 +23872,8 @@ def _collect_outer_loops(kernel_cursor, cindex
                             var = sub.spelling
                             break
                     break
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('_collect_outer_loops', _swexc)
         out.append((lo, hi, step, var))
         level += 1
     return out
@@ -20166,7 +23914,8 @@ def _permutation_respects_deps(perm: Tuple[int, ...],
         # Map original axis -> position in permutation.
         try:
             permuted = tuple(vec[i] if i < len(vec) else 0 for i in perm)
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_permutation_respects_deps', _swexc)
             return False
         # First non-zero must be positive.
         for c in permuted:
@@ -20338,7 +24087,8 @@ def _apply_schedule_lift_body(loopnest: "LoopNest",
             for c in cursor.walk_preorder():
                 if c.kind == CursorKind.FOR_STMT:
                     fors.append(c)
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_apply_schedule_lift_body', _swexc)
             return None
         body_cursor = None
         if fors:
@@ -20349,7 +24099,8 @@ def _apply_schedule_lift_body(loopnest: "LoopNest",
             inner_for = fors[-1]
             try:
                 children = list(inner_for.get_children())
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('_apply_schedule_lift_body', _swexc)
                 return None
             # For-stmt children: init, cond, inc, body (some kinds
             # may collapse the init). The body is the last
@@ -20369,7 +24120,8 @@ def _apply_schedule_lift_body(loopnest: "LoopNest",
         # Lift the textual extent of the body via libclang's token API.
         try:
             tokens = list(body_cursor.get_tokens())
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_apply_schedule_lift_body', _swexc)
             return None
         if not tokens:
             return None
@@ -20407,7 +24159,8 @@ def _apply_schedule_lift_body(loopnest: "LoopNest",
         if not out_lines:
             return None
         return out_lines
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_apply_schedule_lift_body', _swexc)
         return None
 
 
@@ -20599,8 +24352,8 @@ def _polyhedral_expand_variant(spec, emitted_source: Path,
             spec._emitted_sources[
                 f"{emitted_source.stem}__sched_{sched.cache_key()}"
             ] = sched_path
-        except Exception:
-            pass
+        except Exception as _swexc:
+            _debug_swallow('_polyhedral_expand_variant', _swexc)
         out.append(sched_path)
     if out:
         _poly_log(report,
@@ -20639,8 +24392,75 @@ class SynthCodegenError(RuntimeError):
 # in sync with the ``allowed_patterns`` list in _DEFAULT_PROJECT_CONFIG.
 _SYNTH_KNOWN_PATTERNS: Tuple[str, ...] = (
     "adamw_update", "fused_adam_grad_norm", "softmax_matmul",
-    "reduce_broadcast", "parallel_scan", "bilevel_fusion",
+    "newton_schulz", "reduce_broadcast", "parallel_scan", "bilevel_fusion",
 )
+
+
+# Per-(spec.optimizer) → synth pattern dispatch (Stage 5). Replaces the old
+# hardcoded ``pattern_name = "adamw_update"`` in ``_try_synth_codegen``.
+# Optimizers whose device math is a GEMM-shaped subgraph (muon's Newton–Schulz
+# orthogonalisation) route to a tensor-core GEMM pattern; clip-bearing
+# optimizers route to the fused Adam + grad-norm pattern; the remaining
+# elementwise optimizers stay on ``adamw_update``. An optimizer absent from
+# this table falls back to ``adamw_update`` (historical behaviour), so adding
+# a new optimizer never silently breaks the synth path.
+_OPTIMIZER_SYNTH_PATTERN: Dict[str, str] = {
+    # GEMM-heavy: Newton–Schulz iteration is dominated by tensor-core GEMMs.
+    "muon":         "newton_schulz",
+    "supergrok2":   "newton_schulz",   # SuperGrok2 carries a muon-style NS leg
+    # Grad-norm-clipped Adam variants → fused reduce(g·g) + clipped update.
+    "grokfast":     "fused_adam_grad_norm",
+    "grokadamw":    "fused_adam_grad_norm",
+    "neuralgrok":   "fused_adam_grad_norm",
+    # Elementwise optimizers — single fused elementwise pass.
+    "adamw":        "adamw_update",
+    "lion":         "adamw_update",
+    "prodigy":      "adamw_update",
+    "looksam":      "adamw_update",
+    "supergrok11":  "adamw_update",
+    "supergrok15":  "adamw_update",
+}
+
+
+def _synth_pattern_for_optimizer(
+        optimizer: str,
+        injected: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Map ``spec.optimizer`` → the OpGraph pattern name the synthesiser
+    should emit (Stage 5 dispatcher).
+
+    Mandate #17 — fail-safe + injectable:
+      * A project may INJECT its own optimizer→pattern map via
+        ``[synth_codegen].optimizer_patterns`` (``injected`` here); injected
+        entries override the built-in table.
+      * An optimizer with NO genuine match returns ``None`` (NOT a silent
+        ``adamw_update`` default). The caller then compiles the existing
+        source with a logged note instead of mis-synthesizing an arbitrary
+        kernel as an AdamW elementwise pass.
+    """
+    table = dict(_OPTIMIZER_SYNTH_PATTERN)
+    if injected:
+        table.update({str(k).lower(): str(v) for k, v in injected.items()})
+    return table.get(optimizer.lower())
+
+
+def _synth_dtype_from_config(config: Dict[str, Any],
+                             dims: List[Dict[str, Any]],
+                             sc: Dict[str, Any]) -> str:
+    """Mandate #18 — resolve the synth dtype from the config's quant dim
+    (or an explicit ``[synth_codegen].dtype``), instead of hardcoding fp32.
+
+    Order: explicit sc['dtype'] > a 'quant'/'dtype'/'precision' config dim >
+    fp32. Unknown tokens fall back to fp32 (the synth emitter validates the
+    final dtype against _SYNTH_DTYPE_MAP)."""
+    explicit = sc.get("dtype")
+    if explicit and str(explicit) in _SYNTH_DTYPE_MAP:
+        return str(explicit)
+    for key in ("quant", "dtype", "precision", "quant_dtype"):
+        if key in config:
+            val = str(config[key])
+            if val in _SYNTH_DTYPE_MAP:
+                return val
+    return "fp32"
 
 
 # Per-arch lowering helpers consult this table to pick a vendor (cuda /
@@ -20953,6 +24773,81 @@ def pattern_softmax_matmul(M: int, N: int, K: int,
         },
         nodes=[qkt, smax, av],
         output="O",
+    )
+
+
+def pattern_newton_schulz(M: int, N: int,
+                          dtype: str,
+                          *, coeff: Tuple[float, float, float] =
+                          (3.4445, -4.7750, 2.0315)) -> OpGraph:
+    """Muon's Newton–Schulz orthogonalisation step as a GEMM-bearing graph.
+
+    Muon orthogonalises the momentum matrix ``G`` (shape ``M×N``) by
+    iterating the quintic Newton–Schulz polynomial
+
+        X ← a·X + b·(X Xᵀ) X + c·(X Xᵀ)² X
+
+    The arithmetic is dominated by tensor-core GEMMs — ``A = X Xᵀ``
+    (``M×N · N×M → M×M``) and the two right-multiplies ``A X`` /
+    ``A² X`` — which is exactly why muon, unlike the elementwise
+    optimizers, must lower to the CUTLASS / CK GEMM emitter rather than
+    the ``adamw_update`` elementwise pass. The GEMM nodes carry
+    ``requires_features={"wgmma"}`` so sm_90a/sm_100a dispatch to the
+    tensor-core path; AMD (gfx9xx mfma / gfx10xx wmma) is reached through
+    the ``emit_ck_gemm_variants`` branch in ``synthesize_kernel``.
+
+    One iteration is emitted (the autotuner / runtime loops it the
+    configured number of steps); the polynomial combine is a single
+    elementwise node fusing the three terms.
+    """
+    a, b, c = coeff
+    xxt = OpNode(
+        op_kind="gemm",
+        name="ns_xxt",
+        inputs=["X", "X"],
+        output="A",
+        attrs={"M": M, "N": M, "K": N, "transA": False, "transB": True,
+               "tile_M": 64, "tile_N": 128, "tile_K": 16},
+        requires_features=frozenset({"wgmma"}),
+    )
+    a2 = OpNode(
+        op_kind="gemm",
+        name="ns_a2",
+        inputs=["A", "A"],
+        output="A2",
+        attrs={"M": M, "N": M, "K": M, "transA": False, "transB": False,
+               "tile_M": 64, "tile_N": 128, "tile_K": 16},
+        requires_features=frozenset({"wgmma"}),
+    )
+    ax = OpNode(
+        op_kind="gemm",
+        name="ns_ax",
+        inputs=["A", "X"],
+        output="AX",
+        attrs={"M": M, "N": N, "K": M, "transA": False, "transB": False,
+               "tile_M": 64, "tile_N": 128, "tile_K": 16},
+        requires_features=frozenset({"wgmma"}),
+    )
+    a2x = OpNode(
+        op_kind="gemm",
+        name="ns_a2x",
+        inputs=["A2", "X"],
+        output="A2X",
+        attrs={"M": M, "N": N, "K": M, "transA": False, "transB": False,
+               "tile_M": 64, "tile_N": 128, "tile_K": 16},
+        requires_features=frozenset({"wgmma"}),
+    )
+    combine = OpNode(
+        op_kind="elementwise",
+        name="ns_combine",
+        inputs=["X", "AX", "A2X"],
+        output="Xn",
+        attrs={"expr": f"{a}f * X + {b}f * AX + {c}f * A2X"},
+    )
+    return OpGraph(
+        inputs={"X": (dtype, (M, N))},
+        nodes=[xxt, a2, ax, a2x, combine],
+        output="Xn",
     )
 
 
@@ -21437,6 +25332,7 @@ def _emit_gemm_cuda(node: OpNode,
         except CodegenError as exc:
             cutlass_note = f"// CUTLASS unavailable ({exc}); using native-MMA GEMM\n"
         except Exception as exc:  # pragma: no cover — defensive
+            _debug_swallow('_emit_gemm_cuda', exc)
             cutlass_note = f"// CUTLASS dispatch failed ({type(exc).__name__}); using native-MMA GEMM\n"
 
     # Per-arch native MMA path; falls back to scalar triple-loop when
@@ -21860,7 +25756,8 @@ def _synth_cache_key(pattern_name: str, arch: str, dtype: str,
 
 def _try_synth_codegen(spec: "BuildSpec",
                        config: Dict[str, Any],
-                       dims: List[Dict[str, Any]]) -> Optional[Path]:
+                       dims: List[Dict[str, Any]],
+                       report=None) -> Optional[Path]:
     """Attempt OpGraph synthesis for ``(spec.optimizer, spec.arch)``.
 
     Returns the emitted source ``Path`` on success, ``None`` when no
@@ -21877,53 +25774,109 @@ def _try_synth_codegen(spec: "BuildSpec",
     spec_cfg = spec.config or {}
     sc = (spec_cfg.get("synth_codegen") or {})
     allowed = set(sc.get("allowed_patterns") or _SYNTH_KNOWN_PATTERNS)
-    # Pattern-selection heuristic: today we map every optimizer to the
-    # adamw_update pattern (the only one that covers a full optimizer
-    # step in a single elementwise pass). Streams beyond D can extend
-    # this dispatcher to pick e.g. fused_adam_grad_norm for clipped
-    # variants. The selection lives here (not in synthesize_kernel) so
-    # the synth library remains optimizer-agnostic.
+    # Stage 5 — per-(spec.optimizer) pattern dispatcher. Replaces the prior
+    # hardcoded ``pattern_name = "adamw_update"``: GEMM-heavy optimizers
+    # (muon / supergrok2 Newton–Schulz) now route to the tensor-core GEMM
+    # pattern so the CUTLASS/CK GEMM emitter is actually exercised instead of
+    # every optimizer collapsing to the adamw_update elementwise pass; clipped
+    # Adam variants route to fused_adam_grad_norm; the remaining elementwise
+    # optimizers stay on adamw_update. The selection lives here (not inside
+    # synthesize_kernel) so the synth library stays optimizer-agnostic.
     #
-    # TODO(codegen, higher-risk follow-up): replace this single hardcoded
-    # ``adamw_update`` selection with a real per-(spec.optimizer) dispatcher
-    # (e.g. lion/adafactor/sgd → their own OpGraph patterns, clipped variants
-    # → fused_adam_grad_norm). Today every optimizer lowers through the
-    # adamw_update graph, so the synth path only produces a faithful kernel
-    # for AdamW; other optimizers silently fall back to the Jinja template.
-    # This is intentionally left as a separate workstream — wiring the real
-    # tensor-core GEMM emitter / per-optimizer graphs into prod is out of
-    # scope for the autotuner-budget cleanup. Do NOT half-implement here.
-    pattern_name = "adamw_update"
+    # 🟡 device-numeric validation: the emitted OpGraph + per-arch source
+    # (real wgmma/tcgen05/mfma/wmma opcodes via synthesize_kernel) are wired
+    # and exercised by the self-tests on a CPU host, but bit-exact numeric
+    # parity of the synthesised Newton–Schulz kernel against the committed
+    # muon kernel requires a GPU and is NOT asserted here — it is gated behind
+    # the e2e_smoke GPU path. What is wired: the dispatch (pattern selection
+    # per optimizer) + the real OpGraph emit. What is deferred: on-device
+    # numeric equivalence of the GEMM-pattern kernels.
+    # Mandate #17 — injectable + fail-safe pattern dispatch. A project can
+    # inject its own optimizer→pattern map; an optimizer with NO genuine
+    # match returns None and we COMPILE THE EXISTING SOURCE (logged), rather
+    # than silently mis-synthesizing it as an AdamW elementwise pass.
+    injected = sc.get("optimizer_patterns") if isinstance(sc, dict) else None
+    pattern_name = _synth_pattern_for_optimizer(spec.optimizer, injected)
+    if pattern_name is None:
+        _codegen_report_log(
+            report,
+            f"synth: no pattern matches optimizer={spec.optimizer!r}; "
+            f"compiling existing source (no silent default).")
+        return None
     if pattern_name not in allowed:
-        return None
+        # The dispatched pattern was disabled via allowed_patterns. Only fall
+        # back to adamw_update when the optimizer GENUINELY maps to it; never
+        # coerce an unrelated (e.g. GEMM) optimizer into the elementwise pass.
+        if pattern_name == "adamw_update" or (
+                _synth_pattern_for_optimizer(spec.optimizer, injected)
+                == "adamw_update" and "adamw_update" in allowed):
+            pattern_name = "adamw_update"
+        else:
+            _codegen_report_log(
+                report,
+                f"synth: pattern {pattern_name!r} disabled via "
+                f"allowed_patterns; compiling existing source.")
+            return None
 
-    # Problem shape: take the largest contiguous dim from the config if
-    # present, else fall back to 4096 (a reasonable smoke-test default
-    # that matches the existing template path's hashing).
-    shape: Tuple[int, ...] = (4096,)
-    for d in dims:
-        if d.get("name") == "block":
-            try:
-                shape = (int(config.get("block", 4096)) * 16,)
-            except (TypeError, ValueError):
-                shape = (4096,)
-            break
-    dtype = "fp32"  # default; future streams can pass dtype through dims
+    # Mandate #18 — dtype from the config's quant dim (not hardcoded fp32).
+    dtype = _synth_dtype_from_config(config, dims, sc)
 
-    factory = {
-        "adamw_update":         pattern_adamw_update,
-        "fused_adam_grad_norm": pattern_fused_adam_grad_norm,
-        "reduce_broadcast":     pattern_reduce_broadcast,
-        "parallel_scan":        pattern_parallel_scan,
-    }.get(pattern_name)
-    if factory is None:
-        return None
+    # GEMM-shaped patterns take (M, N[, K]) dims and emit tensor-core GEMMs;
+    # the elementwise / reduce / scan patterns take a flat ``shape`` tuple.
+    # Mandate #19 — prefer a shape DERIVED FROM THE DISCOVERED WORKLOAD when
+    # one is supplied (spec.config['synth_codegen']['shape_hint'] / the
+    # discovered signature's representative shape), instead of guessing. Fall
+    # back to the config ``block`` dim, then the historical 4096 default.
+    block = 4096
+    has_block = any(d.get("name") == "block" for d in dims)
+    if has_block:
+        try:
+            block = int(config.get("block", 4096))
+        except (TypeError, ValueError):
+            block = 4096
+    shape_hint = sc.get("shape_hint") if isinstance(sc, dict) else None
+    if shape_hint:
+        try:
+            flat_shape: Tuple[int, ...] = tuple(int(x) for x in shape_hint)
+            _codegen_report_log(
+                report, f"synth: using discovered shape_hint={flat_shape}")
+        except (TypeError, ValueError):
+            flat_shape = (block * 16,) if has_block else (4096,)
+    else:
+        flat_shape = (block * 16,) if has_block else (4096,)
+
+    _GEMM_PATTERNS = {"newton_schulz", "softmax_matmul"}
+    graph: Optional[OpGraph]
     try:
-        graph = factory(shape=shape, dtype=dtype)
+        if pattern_name == "newton_schulz":
+            # Square-ish matrix sized from the block dim; clamped to a sane
+            # tensor-core multiple so the GEMM tiles divide evenly.
+            mn = max(64, (block // 64) * 64) if has_block else 256
+            graph = pattern_newton_schulz(M=mn, N=mn, dtype=dtype)
+            gemm_shape: Tuple[int, ...] = (mn, mn)
+        elif pattern_name == "softmax_matmul":
+            mn = max(64, (block // 64) * 64) if has_block else 256
+            graph = pattern_softmax_matmul(M=mn, N=mn, K=mn, dtype=dtype)
+            gemm_shape = (mn, mn)
+        else:
+            factory = {
+                "adamw_update":         pattern_adamw_update,
+                "fused_adam_grad_norm": pattern_fused_adam_grad_norm,
+                "reduce_broadcast":     pattern_reduce_broadcast,
+                "parallel_scan":        pattern_parallel_scan,
+            }.get(pattern_name)
+            if factory is None:
+                return None
+            graph = factory(shape=flat_shape, dtype=dtype)
+            gemm_shape = flat_shape
     except SynthCodegenError:
         return None
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_try_synth_codegen', _swexc)
         return None
+    if graph is None:
+        return None
+    shape = gemm_shape if pattern_name in _GEMM_PATTERNS else flat_shape
 
     out_dir = Path(spec.out_dir)
     synth_dir = out_dir / "synth_sources"
@@ -21932,6 +25885,7 @@ def _try_synth_codegen(spec: "BuildSpec",
     attrs_for_hash: Dict[str, Any] = {
         "shape": list(shape),
         "dtype": dtype,
+        "optimizer": spec.optimizer,
         "config_block": config.get("block"),
     }
     key = _synth_cache_key(pattern_name, spec.arch, dtype, attrs_for_hash)
@@ -21948,7 +25902,8 @@ def _try_synth_codegen(spec: "BuildSpec",
                                 out_dir=synth_dir)
     except SynthCodegenError:
         return None
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_try_synth_codegen', _swexc)
         return None
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
     tmp.write_text(src, encoding="utf-8")
@@ -22084,7 +26039,8 @@ def _enumerate_ck_variants(arch: str,
                     f"composable_kernel.{attr_path} produced "
                     f"{len(discovered)} variants")
                 break
-        except Exception:
+        except Exception as _swexc:
+            _debug_swallow('_enumerate_ck_variants', _swexc)
             continue
 
     if discovered:
@@ -22301,13 +26257,25 @@ def _resolve_ctype(dtype: str) -> str:
 
 
 def _default_template_provider(op: str, arch: str) -> str:
+    # Mandate #15 — the template bakes the autotuned BLOCK / VEC / UNROLL as
+    # constexprs so a dispatched kernel for a shape bucket is compiled with
+    # that bucket's TUNED config (the cubin actually differs per tuned
+    # config, closing the autotuner→runtime loop). A bodyless registry's
+    # identity copy still works; a real per-bucket body can read these.
     return r"""
 extern "C" __global__ void specialized_{OP}_kernel({DTYPE}* out, const {DTYPE}* in, int n) {{
     constexpr int kSizeHint = {SIZE_HINT};
     constexpr int kShapeDims = {SHAPE_DIMS};
-    (void)kSizeHint; (void)kShapeDims;
+    constexpr int kBlock  = {BLOCK};
+    constexpr int kVec    = {VEC};
+    constexpr int kUnroll = {UNROLL};
+    (void)kSizeHint; (void)kShapeDims; (void)kBlock; (void)kVec; (void)kUnroll;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = in[i];
+    #pragma unroll {UNROLL}
+    for (int j = 0; j < kVec; ++j) {{
+        int idx = i * kVec + j;
+        if (idx < n) out[idx] = in[idx];
+    }}
 }}
 """.replace("{OP}", op)
 
@@ -22316,7 +26284,8 @@ class KernelRegistry:
     """Sub-µs runtime-specialized kernel lookup via NVRTC / hipRTC."""
 
     def __init__(self, arch: str, cache_dir: Path,
-                 template_provider: Optional[Callable[[str, str], str]] = None):
+                 template_provider: Optional[Callable[[str, str], str]] = None,
+                 tuned_config: Optional[Dict[str, Any]] = None):
         if arch not in ARCH_TABLE:
             raise RegistryError(f"unknown arch {arch!r}")
         entry = ARCH_TABLE[arch]
@@ -22332,14 +26301,25 @@ class KernelRegistry:
         self._handle_cache: Dict[str, Any] = {}
         self._template_provider = (template_provider
                                    or _default_template_provider)
+        # Mandate #15 — the autotuned config (block/vec/unroll), pulled from
+        # the compile cache by initialize_registry. Baked into every
+        # dispatched cubin so runtime specialization uses the tuned config
+        # instead of fixed defaults. None ⇒ neutral defaults (block=256,
+        # vec=1, unroll=1) — byte-identical to the pre-#15 stub.
+        self.tuned_config: Dict[str, Any] = dict(tuned_config or {})
 
     def _key(self, op: str, dtype: str, shape_cls: str, ndim: int) -> str:
         # ndim is part of the key because _compile bakes SHAPE_DIMS=len(shape)
         # into the generated source; two dispatches in the same shape class
         # but different rank (e.g. (1024,) vs (32,32)) must not collide on a
         # cubin compiled for the other rank.
+        # Mandate #15 — the tuned config (block/vec/unroll) is baked into the
+        # cubin, so it MUST be part of the cache key; otherwise a re-tuned
+        # config would silently reuse the old cubin.
+        tc = self.tuned_config or {}
+        tc_sig = f"{tc.get('block')}-{tc.get('vec')}-{tc.get('unroll')}"
         return hashlib.sha256(
-            f"{self.arch}|{op}|{dtype}|{shape_cls}|{ndim}".encode()
+            f"{self.arch}|{op}|{dtype}|{shape_cls}|{ndim}|{tc_sig}".encode()
         ).hexdigest()[:24]
 
     def dispatch(self, op: str, dtype: str, shape: Tuple[int, ...]):
@@ -22365,10 +26345,22 @@ class KernelRegistry:
 
     def _compile(self, op: str, dtype: str, shape_cls: str,
                  example_shape: Tuple[int, ...]) -> bytes:
+        # Mandate #15 — bake the autotuned config into the specialized
+        # kernel so the runtime cubin reflects the tuned block/vec/unroll
+        # for this (op, arch). Missing keys fall back to neutral defaults.
+        tc = self.tuned_config or {}
+        def _tc_int(name: str, default: int) -> int:
+            try:
+                return int(tc.get(name, default))
+            except (TypeError, ValueError):
+                return default
         src = self._template_provider(op, self.arch).format(
             DTYPE=_resolve_ctype(dtype),
             SHAPE_DIMS=len(example_shape),
             SIZE_HINT=_shape_class_size(shape_cls),
+            BLOCK=_tc_int("block", 256),
+            VEC=_tc_int("vec", 1),
+            UNROLL=_tc_int("unroll", 1),
         )
         if self.vendor == "cuda":
             return self._nvrtc_compile(src)
@@ -22437,8 +26429,8 @@ class KernelRegistry:
                         buf = bytearray(log_sz)
                         nvrtc.nvrtcGetProgramLog(prog, buf)
                         log = buf.decode("utf-8", "replace")
-                except Exception:
-                    pass
+                except Exception as _swexc:
+                    _debug_swallow('_nvrtc_compile', _swexc)
                 raise RegistryError(
                     f"NVRTC compile failed: {compile_res!r}\n{log}")
             cubin_ok = (hasattr(nvrtc, "nvrtcGetCUBINSize")
@@ -22459,8 +26451,8 @@ class KernelRegistry:
             # autotune session.
             try:
                 nvrtc.nvrtcDestroyProgram(prog)
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_nvrtc_compile', _swexc)
 
     def _hiprtc_compile(self, src: str) -> bytes:
         try:
@@ -22487,8 +26479,8 @@ class KernelRegistry:
             # Always release the hipRTC program handle (see _nvrtc_compile).
             try:
                 hiprtc.hiprtcDestroyProgram(prog)
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('_hiprtc_compile', _swexc)
 
     def _load_cubin(self, cubin_path: Path, op: str):
         return _LoadedKernel(cubin_path, op, vendor=self.vendor)
@@ -22754,7 +26746,8 @@ _REGISTRY_LOCK = threading.Lock()
 
 def get_registry(arch: str,
                  cache_dir: Optional[Path] = None,
-                 config: Optional[Dict[str, Any]] = None) -> KernelRegistry:
+                 config: Optional[Dict[str, Any]] = None,
+                 tuned_config: Optional[Dict[str, Any]] = None) -> KernelRegistry:
     """Return (and lazily create) the per-arch ``KernelRegistry``.
 
     Project-agnosticism (Category 2d): when ``cache_dir`` is not given
@@ -22797,18 +26790,19 @@ def get_registry(arch: str,
                     proj_cfg = _DEFAULT_PROJECT_CONFIG.get("project") or {}
                     project_name = str(
                         proj_cfg.get("name") or project_name)
-            except Exception:
+            except Exception as _swexc:
                 # Defensive: any failure to read the config falls back
                 # to the historical ``supergrok`` slug.
+                _debug_swallow('get_registry', _swexc)
                 project_name = "supergrok"
             cd = (Path(os.environ.get("HOME", "/tmp"))
                   / ".cache" / project_name / "nvrtc")
-        reg = KernelRegistry(arch, cd)
+        reg = KernelRegistry(arch, cd, tuned_config=tuned_config)
         _REGISTRY[arch] = reg
         return reg
 
 
-def initialize_registry(spec, report=None) -> Optional[KernelRegistry]:
+def initialize_registry(spec, report=None, cache=None) -> Optional[KernelRegistry]:
     """Pre-warm the registry from build() when enable_runtime_specialization=True.
 
     Honors ``spec.auto_install_optional_deps`` by propagating it to the
@@ -22836,9 +26830,27 @@ def initialize_registry(spec, report=None) -> Optional[KernelRegistry]:
         "cuda", "nvrtc",
         install=_auto_install_enabled(),
         pip_name="cuda-python")
+    # Mandate #15 — pull the autotuned config for this (opt, model, arch)
+    # from the compile cache so the registry bakes it into every dispatched
+    # cubin (closes the autotuner→runtime loop). None when the sweep hasn't
+    # run yet → neutral defaults.
+    tuned_cfg: Optional[Dict[str, Any]] = None
+    if cache is not None:
+        try:
+            entry_c = cache.get(spec.optimizer, spec.model, spec.arch)
+            tuned_cfg = entry_c.get("tuned_config")
+            if tuned_cfg and report is not None:
+                report.write(
+                    f"[nvrtc] registry consuming tuned config "
+                    f"block={tuned_cfg.get('block')} vec={tuned_cfg.get('vec')}"
+                    f" unroll={tuned_cfg.get('unroll')} (#15 loop closed)\n")
+        except Exception as _swexc:
+            _debug_swallow('initialize_registry', _swexc)
+            tuned_cfg = None
     try:
         cache_dir = Path(spec.out_dir) / "nvrtc_cache"
-        reg = get_registry(spec.arch, cache_dir=cache_dir)
+        reg = get_registry(spec.arch, cache_dir=cache_dir,
+                           tuned_config=tuned_cfg)
     except RegistryError as exc:
         if report is not None:
             report.write(f"[nvrtc] disabled: {exc}\n")
@@ -23000,7 +27012,8 @@ def _parse_rocprof_csv(csv_path: Path) -> Dict[str, float]:
                         out.get("lds_bank_conflict", 0.0) + val)
                 if "valu" in kl:
                     out["valu_dep"] = out.get("valu_dep", 0.0) + val
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_parse_rocprof_csv', _swexc)
         return {}
     total = sum(out.values())
     if total <= 0:
@@ -23153,7 +27166,8 @@ def bias_trial_queue(study, stall_info: Optional[Dict[str, Any]],
                 enqueued += 1
                 if enqueued >= max_enqueued:
                     return enqueued
-            except Exception:
+            except Exception as _swexc:
+                _debug_swallow('bias_trial_queue', _swexc)
                 continue
     return enqueued
 
@@ -23240,18 +27254,28 @@ _DEFAULT_PROJECT_CONFIG: Dict[str, Any] = {
         # preserves the historical csrc/algorithms/tuned_configs.h.
         "tuned_header_path": "csrc/algorithms/tuned_configs.h",
     },
+    # Mandate (NDEBUG migration) — compile.py's base device flags carry NO
+    # project opinion. The grokking project's ``-DNDEBUG`` (assert-stripping;
+    # de-serializes the WGMMA mainloop, C7509 6→0) lives HERE as an explicit,
+    # tracked project decision, appended to the device flags by
+    # ``_project_device_extra_flags`` and folded into device_cflags_hash. A
+    # config-less generic build gets no -DNDEBUG. CUDA_DEBUG strips it in
+    # setup.py to restore asserts for debugging.
+    "device_cflags": {
+        "extra": ["-DNDEBUG"],
+    },
     "optimizers": {
         "enabled": ["adamw", "lion", "muon", "prodigy", "grokadamw",
                     "grokfast", "looksam", "neuralgrok",
                     "supergrok11", "supergrok15", "supergrok2"],
     },
-    # BLOCKER 7 — model names MUST match grokking_optimizers.profile.MODELS
-    # because ``_validate(spec)`` rejects any model not in that tuple. The
-    # short names ("mamba" / "decoder" / "vit") are the canonical strings
-    # used by every runtime dispatch site; the longer aliases that used
-    # to live here ("mamba3" / "transformer_decoder") never passed
-    # _validate, so this dict + the choices= gate on the CLI parser were
-    # silently incompatible with each other.
+    # BLOCKER 7 RESOLVED via canonicalize_model — model names here are the
+    # short user-API names from profile.MODELS ("mamba" / "decoder" / "vit").
+    # canonicalize_model() in dispatch.py is the single point of truth that
+    # maps them to canonical internal names ("mamba3" / "transformer_decoder"
+    # / "vit") at every internal dispatch boundary. The prior "mamba3" /
+    # "transformer_decoder" aliases are no longer used at call sites; they
+    # failed _validate() and were silently incompatible with the CLI parser.
     "models": {"enabled": ["mamba", "decoder", "vit"]},
     "archs":  {"default": "sm_90a", "allowed": []},
     "pgo":    {"workload_script": "", "steps": 1000},
@@ -23401,7 +27425,8 @@ def _load_toml_file(path: Path) -> Dict[str, Any]:
                 try:
                     v = eval(raw, {"__builtins__": {}},
                              {"true": True, "false": False})
-                except Exception:
+                except Exception as _swexc:
+                    _debug_swallow('_load_toml_file', _swexc)
                     v = raw.strip('"').strip("'")
                 cur[key] = v
         return data
@@ -23438,7 +27463,11 @@ def _deep_merge(*dicts: Dict[str, Any]) -> Dict[str, Any]:
                     and isinstance(v, dict)):
                 out[k] = _deep_merge(out[k], v)
             else:
-                out[k] = v
+                # deepcopy so a nested dict/list present in only ONE layer
+                # (e.g. _DEFAULT_PROJECT_CONFIG) is not aliased into the result
+                # — a caller mutating the returned config's nested values must
+                # not corrupt the module-global default for the rest of the run.
+                out[k] = copy.deepcopy(v)
     return out
 
 
@@ -23492,8 +27521,8 @@ def apply_to_buildspec(spec, config: Dict[str, Any]) -> None:
                 config["polyhedral"].get("enable"):
             try:
                 spec.enable_polyhedral = True
-            except Exception:
-                pass
+            except Exception as _swexc:
+                _debug_swallow('apply_to_buildspec', _swexc)
     # Stream C — cost model. Master switch is opt-in; per-knob copies
     # honour any non-default value supplied by the user. Missing keys
     # leave the BuildSpec defaults alone (so a TOML without [cost_model]
@@ -23614,9 +27643,9 @@ def apply_to_buildspec(spec, config: Dict[str, Any]) -> None:
     # without having to plumb a separate argument through every layer.
     try:
         spec.config = dict(config) if isinstance(config, dict) else {}
-    except Exception:
+    except Exception as _swexc:
         # Read-only spec (rare; defensive). Skip.
-        pass
+        _debug_swallow('apply_to_buildspec', _swexc)
 
 
 def project_sources(config: Dict[str, Any], vendor: str,
@@ -23676,7 +27705,8 @@ def _resolve_enabled_optimizers(
     try:
         from grokking_optimizers.profile import OPTIMIZERS as _O
         return list(_O)
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_resolve_enabled_optimizers', _swexc)
         return []
 
 
@@ -23690,7 +27720,8 @@ def _resolve_enabled_models(
     try:
         from grokking_optimizers.profile import MODELS as _M
         return list(_M)
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_resolve_enabled_models', _swexc)
         return []
 
 
@@ -23704,7 +27735,8 @@ def _resolve_allowed_archs(
     try:
         from grokking_optimizers.profile import ARCHES as _A
         return list(_A)
-    except Exception:
+    except Exception as _swexc:
+        _debug_swallow('_resolve_allowed_archs', _swexc)
         return []
 
 

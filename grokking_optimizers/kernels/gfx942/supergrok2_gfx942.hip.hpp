@@ -104,7 +104,10 @@
 // content. On a real hipcc build the host pass compiles this and launches the §5
 // kernels via hipLaunchKernelGGL (see §5.LAUNCH).
 // ════════════════════════════════════════════════════════════════════════════
-#if !defined(__AMDGCN__)
+// SG_GFX942_DEVICE_TU (Stage 7): set by the thin `.hip` device TU so this host
+// orchestration is NOT re-emitted in that TU's host pass (it stays owned by the
+// `.hip.cpp` host TU) — avoids duplicate launch_supergrok2_* symbols at link.
+#if !defined(__AMDGCN__) && !defined(SG_GFX942_DEVICE_TU)
 #include <torch/extension.h>
 #include <ATen/ATen.h>
 #include <vector>
@@ -217,7 +220,7 @@ __global__ void sg2_gfx942_adam_apply(
     ParamT* __restrict__ param, float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq, const GradT* __restrict__ grad,
     float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int N);
+    float bc1, float bc2, int64_t N);
 }  // namespace native
 #endif  // __HIPCC__
 
@@ -299,10 +302,19 @@ static torch::Tensor csa_hca_attention(
     const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
     const double sqrt_d = std::sqrt(static_cast<double>(d));
 
+    // Upcast weight matrices to float32 for ATen mm (rocBLAS handles bf16
+    // internally for the MFMA path; the device path packs via sg2_pack_bf16).
+    // This is the bandwidth-saving boundary: bf16 weights are loaded once and
+    // upcast here rather than storing a redundant fp32 copy.
+    auto q_Wf  = q_W.to(torch::kFloat32);
+    auto k_Wf  = k_W.to(torch::kFloat32);
+    auto v_Wf  = v_W.to(torch::kFloat32);
+    auto out_Wf = out_W.to(torch::kFloat32);
+
     // Per-token projections (nn.Linear: x @ W.t()).
-    auto q     = torch::mm(x, q_W.t());   // [N, d]
-    auto k_tok = torch::mm(x, k_W.t());   // [N, d]
-    auto v_tok = torch::mm(x, v_W.t());   // [N, d]
+    auto q     = torch::mm(x, q_Wf.t());   // [N, d]
+    auto k_tok = torch::mm(x, k_Wf.t());   // [N, d]
+    auto v_tok = torch::mm(x, v_Wf.t());   // [N, d]
 
     if (mode_csa) {
         const int64_t stride = csa_compress;
@@ -325,8 +337,9 @@ static torch::Tensor csa_hca_attention(
         auto c_v = (v_tok.index({gather_c}) * w_eff.unsqueeze(-1)).sum(/*dim=*/1);  // [Nc, d]
 
         // ── Lightning indexer top-k selection ──
-        auto qI     = torch::mm(torch::mm(x, idx_DQ), idx_UQ);        // [N, d]
-        auto kI_tok = torch::mm(torch::mm(x, idx_K), idx_UQ);         // [N, d]
+        // Upcast indexer matrices to float32 for ATen mm compatibility.
+        auto qI     = torch::mm(torch::mm(x, idx_DQ.to(torch::kFloat32)), idx_UQ.to(torch::kFloat32));  // [N, d]
+        auto kI_tok = torch::mm(torch::mm(x, idx_K.to(torch::kFloat32)), idx_UQ.to(torch::kFloat32));   // [N, d]
         auto c_kI   = (kI_tok.index({gather_c}) * w_eff.unsqueeze(-1)).sum(/*dim=*/1);  // [Nc, d]
         auto idx_scores = torch::mm(qI, c_kI.t()) / sqrt_d;           // [N, Nc]
         const int64_t topk = std::min<int64_t>(csa_topk, nc);
@@ -363,7 +376,7 @@ static torch::Tensor csa_hca_attention(
         auto ctx_h = torch::einsum("nhk,nkhd->nhd", {attn_c, sel_vh})
                    + torch::einsum("nhw,nwhd->nhd", {attn_w, win_v});            // [N,H,hd]
         auto ctx = ctx_h.reshape({N, d});
-        return torch::mm(ctx, out_W.t());                                        // [N, d]
+        return torch::mm(ctx, out_Wf.t());                                       // [N, d]
     } else {
         // ── HCA: stride-128 mean pool, dense attention over all entries ──
         const int64_t stride = hca_compress;
@@ -413,7 +426,7 @@ static torch::Tensor csa_hca_attention(
         auto ctx_h = torch::einsum("hnm,hmd->hnd", {attn_c, c_vh})
                    + torch::einsum("hnw,hnwd->hnd", {attn_w, win_vh});          // [H, N, hd]
         auto ctx = ctx_h.permute({1, 0, 2}).reshape({N, d});
-        return torch::mm(ctx, out_W.t());                                        // [N, d]
+        return torch::mm(ctx, out_Wf.t());                                       // [N, d]
     }
 }
 
@@ -448,11 +461,12 @@ static torch::Tensor csa_hca_attention_device(
     if (N == 0) return torch::zeros({0, d}, opts_f32);
     const auto head_dim = d / num_heads;
     const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
-    const double sqrt_d = std::sqrt(static_cast<double>(d));
 
-    auto q     = torch::mm(x, q_W.t());   // [N, d]
-    auto k_tok = torch::mm(x, k_W.t());
-    auto v_tok = torch::mm(x, v_W.t());
+    // Upcast projection weights to float32 for ATen mm; bf16 activations reach
+    // the MFMA kernels via sg2_pack_bf16 on the intermediate activation path.
+    auto q     = torch::mm(x, q_W.to(torch::kFloat32).t());   // [N, d]
+    auto k_tok = torch::mm(x, k_W.to(torch::kFloat32).t());
+    auto v_tok = torch::mm(x, v_W.to(torch::kFloat32).t());
 
     hipStream_t stream = at::hip::getCurrentHIPStream();
 
@@ -497,6 +511,7 @@ static torch::Tensor csa_hca_attention_device(
                 dim3(1), dim3(64), lds, stream,
                 sg2_bf16_ptr_c(qp), sg2_bf16_ptr_c(ckp), sg2_bf16_ptr_c(cvp),
                 sg2_bf16_ptr(outp), (int)N, (int)Lc, (float)scale);
+            SG_HIP_LAUNCH_CHECK(stream);  // mirror sm_90 SG_LAUNCH_CHECK
             ctx_heads.index({Slice(), h, Slice()}).copy_(outp.to(torch::kFloat32));
         }
     } else {
@@ -516,11 +531,12 @@ static torch::Tensor csa_hca_attention_device(
                 dim3(1), dim3(64), lds, stream,
                 sg2_bf16_ptr_c(qp), sg2_bf16_ptr_c(kp), sg2_bf16_ptr_c(vp),
                 sg2_bf16_ptr(outp), (int)N, (int)stride, (float)scale);
+            SG_HIP_LAUNCH_CHECK(stream);  // mirror sm_90 SG_LAUNCH_CHECK
             ctx_heads.index({Slice(), h, Slice()}).copy_(outp.to(torch::kFloat32));
         }
     }
     auto ctx = ctx_heads.reshape({N, d});
-    return torch::mm(ctx, out_W.t());
+    return torch::mm(ctx, out_W.to(torch::kFloat32).t());
 }
 #endif  // __HIPCC__
 
@@ -724,8 +740,12 @@ static void sg2_step_one_param(
     auto s_sorted = s_flat.index_select(0, sort_idx);
 
     // (2) input projection: [g, s] (rescaled) → x_proj [N, d_model]
+    // Upcast projection weights to float32 for ATen addmm (bf16 pass-through
+    // on the MFMA device path happens via sg2_pack_bf16 in the launcher).
     auto inp = torch::stack({g_sorted * rescale, s_sorted * rescale}, /*dim=*/1);
-    auto x_proj = torch::addmm(input_proj_b.unsqueeze(0), inp, input_proj_W.t());
+    auto x_proj = torch::addmm(
+        input_proj_b.to(torch::kFloat32).unsqueeze(0),
+        inp, input_proj_W.to(torch::kFloat32).t());
 
     // (3) CSA attention → fine-grained / local context (was mamba_fwd).
     // (4) HCA attention → global coarse context (was mamba_bwd). The HCA layer
@@ -796,6 +816,7 @@ static void sg2_step_one_param(
                 sg2_bf16_ptr_c(W1p), sg2_bf16_ptr_c(W2p),
                 pout.data_ptr<float>(),
                 (int)num_keys, (int)half_qd, (int)expert_hidden);
+            SG_HIP_LAUNCH_CHECK(stream);  // mirror sm_90 SG_LAUNCH_CHECK
         }
         peer_out = pout / (double)nph;
         // expert_counts: keep the ATen activation histogram (rocPRIM-shaped scatter,
@@ -841,6 +862,7 @@ static void sg2_step_one_param(
             sg2_bf16_ptr_c(Wrp), brf.data_ptr<float>(),
             sg2_bf16_ptr_c(Whp), bhf.data_ptr<float>(),
             hnew.data_ptr<float>(), (int)in_dim, (int)gru_hidden);
+        SG_HIP_LAUNCH_CHECK(stream);  // mirror sm_90 SG_LAUNCH_CHECK
         gru_new = hnew;
     }
 #else
@@ -1272,6 +1294,7 @@ void launch_csa_hca_backward(
             d_gru_Wz.data_ptr<float>(), d_gru_Wr.data_ptr<float>(), d_gru_Wh.data_ptr<float>(),
             d_gru_bz.data_ptr<float>(), d_gru_br.data_ptr<float>(), d_gru_bh.data_ptr<float>(),
             (int)in_dim, (int)gru_hidden);
+        SG_HIP_LAUNCH_CHECK(stream);  // mirror sm_90 SG_LAUNCH_CHECK
 
         // d_peer_out: the GRU input is [peer_out]; its grad is d_x_gru[:,0].
         auto d_peer_out = d_x_gru.index({Slice(), 0}).contiguous();   // [N]
@@ -1299,6 +1322,7 @@ void launch_csa_hca_backward(
                 dprod_B[h].data_ptr<float>(),   // adds into d_prod_keys_A/B below
                 d_expert_W1.data_ptr<float>(), d_expert_W2.data_ptr<float>(),
                 (int)num_keys, (int)half_qd, (int)expert_hidden);
+            SG_HIP_LAUNCH_CHECK(stream);  // mirror sm_90 SG_LAUNCH_CHECK
         }
 
         // (A3) Attention-context backward — device kernel per head (CSA + HCA),
@@ -1484,6 +1508,7 @@ void launch_csa_hca_backward_batched(
                     Ph.data_ptr<float>(), sg2_bf16_ptr_c(dctxp),
                     sg2_bf16_ptr(dq), sg2_bf16_ptr(dck), sg2_bf16_ptr(dcv),
                     (int)n, (int)Lc, (float)(1.0 / std::sqrt((double)head_dim)));
+                SG_HIP_LAUNCH_CHECK(st);  // mirror sm_90 SG_LAUNCH_CHECK
             }
         }
 #endif  // __HIPCC__
@@ -1550,14 +1575,16 @@ void launch_moe_adam_step(
         if (p.scalar_type() == torch::kFloat32 && g.scalar_type() == torch::kFloat32 &&
             p.is_contiguous() && g.is_contiguous() &&
             m.is_contiguous() && v.is_contiguous()) {
-            int n = static_cast<int>(p.numel());
+            const int64_t n = static_cast<int64_t>(p.numel());  // Stage 1: 64-bit
             hipStream_t stream = at::hip::getCurrentHIPStream();
-            dim3 grid(std::min(1024, (n + 255) / 256)), block(256);
+            dim3 grid(static_cast<unsigned>(
+                std::min<int64_t>(1024, (n + 255) / 256))), block(256);
             hipLaunchKernelGGL((native::sg2_gfx942_adam_apply<float, float>),
                                grid, block, 0, stream,
                                p.data_ptr<float>(), m.data_ptr<float>(),
                                v.data_ptr<float>(), g.data_ptr<float>(),
                                lr, beta1, beta2, eps, wd, bc1, bc2, n);
+            SG_HIP_LAUNCH_CHECK(stream);  // mirror sm_90 SG_LAUNCH_CHECK
             continue;
         }
 #endif
@@ -1608,6 +1635,7 @@ void moe_count_expert_activations(
             gl.data_ptr<float>(),
             reinterpret_cast<unsigned*>(counts_u.data_ptr<int>()),
             threshold, N, num_experts);
+        SG_HIP_LAUNCH_CHECK(st);  // mirror sm_90 SG_LAUNCH_CHECK
         expert_counts.copy_(counts_u);
         return;
     }
@@ -1684,6 +1712,7 @@ void moe_filter_active_params(
             out_idx.data_ptr<int>(),
             reinterpret_cast<unsigned*>(cursor.data_ptr<int>()),
             total_params);
+        SG_HIP_LAUNCH_CHECK(st);  // mirror sm_90 SG_LAUNCH_CHECK
         const int64_t Kd = cursor.to(torch::kCPU).item<int>();
         // The device filter emits indices in cursor (atomic) order; sort to the
         // deterministic ascending order the ATen contract guarantees.
@@ -1730,6 +1759,7 @@ void moe_scatter_results(
                 dim3(blocks), dim3(threads), 0, st,
                 s.data_ptr<float>(), idx_i.data_ptr<int>(), d.data_ptr<float>(),
                 compact_N, /*row_stride=*/1, /*accumulate=*/0);
+            SG_HIP_LAUNCH_CHECK(st);  // mirror sm_90 SG_LAUNCH_CHECK
             dst.copy_(d.to(dst.dtype()));
         };
         launch(params, compact_params);
@@ -2523,6 +2553,20 @@ namespace sg { namespace gfx942 { namespace native {
 namespace amd_apply = ::sg::gfx942::amdgcn;
 using f32x4 = ::sg::gfx942::amdgcn::f32x4;
 
+// Stage-1 NaN/Inf gradient sanitization (mirror of sm_90 sg_sanitize_grad).
+// Identity unless built with -DSG_SANITIZE_NONFINITE=1; applied on the AdamW
+// apply path's grad read only. Default behavior is byte-identical when OFF.
+#ifndef SG_SANITIZE_NONFINITE
+#define SG_SANITIZE_NONFINITE 0
+#endif
+__device__ __forceinline__ float sg2_sanitize_grad(float g) {
+#if SG_SANITIZE_NONFINITE
+    return __builtin_isfinite(g) ? g : 0.0f;
+#else
+    return g;
+#endif
+}
+
 // Identical per-element apply (used by both the f32x4 lanes and the scalar tail).
 __device__ __forceinline__ float sg2_adam_apply_elem(
     float* __restrict__ pp, float* __restrict__ pm, float* __restrict__ pv,
@@ -2545,19 +2589,20 @@ SG_KERNEL_BOUNDS(256, 8) void sg2_gfx942_adam_apply(
     ParamT* __restrict__ param, float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq, const GradT* __restrict__ grad,
     float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int N)
+    float bc1, float bc2, int64_t N)
 {
-    const int gtid   = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x)
-                       + static_cast<int>(threadIdx.x);
-    const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
-    const int n4     = N & ~3;   // largest multiple of 4 <= N
+    // 64-bit grid-stride indexing (Stage 1): cast BEFORE the multiply.
+    const int64_t gtid   = static_cast<int64_t>(blockIdx.x) * blockDim.x
+                       + threadIdx.x;
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    const int64_t n4     = N & ~static_cast<int64_t>(3);   // largest mult of 4 <= N
 
     // Vectorized body: 4 contiguous floats / iter via f32x4 (128-bit access).
     // NONTEMPORAL POLICY (matches adamw_gfx942): grad is read-once this step →
     // streaming (nontemporal, L2-bypass); exp_avg / exp_avg_sq are recurring
     // STATE (read+written every step, reused next step) → CACHED; param is read
     // once then written once → cached load + streaming store.
-    for (int base = gtid * 4; base < n4; base += stride * 4) {
+    for (int64_t base = gtid * 4; base < n4; base += stride * 4) {
         f32x4 pv4 = amd_apply::cached_load(reinterpret_cast<const f32x4*>(param + base));
         f32x4 mv4 = amd_apply::cached_load(reinterpret_cast<const f32x4*>(exp_avg + base));
         f32x4 vv4 = amd_apply::cached_load(reinterpret_cast<const f32x4*>(exp_avg_sq + base));
@@ -2566,7 +2611,7 @@ SG_KERNEL_BOUNDS(256, 8) void sg2_gfx942_adam_apply(
         #pragma unroll
         for (int j = 0; j < 4; ++j) {
             float pj = pv4[j], mj = mv4[j], vj = vv4[j];
-            ov4[j] = sg2_adam_apply_elem(&pj, &mj, &vj, gv4[j],
+            ov4[j] = sg2_adam_apply_elem(&pj, &mj, &vj, sg2_sanitize_grad(gv4[j]),
                                          lr, beta1, beta2, eps, wd, bc1, bc2);
             mv4[j] = mj;
             vv4[j] = vj;
@@ -2577,9 +2622,9 @@ SG_KERNEL_BOUNDS(256, 8) void sg2_gfx942_adam_apply(
     }
 
     // Scalar tail: the n%4 remainder, identical per-element function.
-    for (int i = n4 + gtid; i < N; i += stride) {
+    for (int64_t i = n4 + gtid; i < N; i += stride) {
         float pi = param[i], mi = exp_avg[i], vi = exp_avg_sq[i];
-        float out = sg2_adam_apply_elem(&pi, &mi, &vi, grad[i],
+        float out = sg2_adam_apply_elem(&pi, &mi, &vi, sg2_sanitize_grad(grad[i]),
                                         lr, beta1, beta2, eps, wd, bc1, bc2);
         exp_avg[i]    = mi;
         exp_avg_sq[i] = vi;
@@ -2590,7 +2635,7 @@ SG_KERNEL_BOUNDS(256, 8) void sg2_gfx942_adam_apply(
 // Force-instantiate the <float,float> apply the host launcher dispatches.
 template __global__ void sg2_gfx942_adam_apply<float, float>(
     float*, float*, float*, const float*,
-    float, float, float, float, float, float, float, int);
+    float, float, float, float, float, float, float, int64_t);
 
 }}}  // namespace sg::gfx942::native
 #endif  // (B) device pass

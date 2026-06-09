@@ -35,6 +35,7 @@
 #define SG_TUNED_ASYNC_DEPTH 2
 #endif
 #include "csrc/backends/cuda/sm_90/primitives.cuh"
+#include "grokking_optimizers/kernels/sm_90/common_sm90.cuh"
 
 namespace sg { namespace sm90 {
 
@@ -56,15 +57,16 @@ __global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_LION_MIN_BLOCKS)
 lion_kernel(
     ParamT* param, float* exp_avg,
     const GradT* grad,
-    float lr, float beta1, float beta2, float wd, int N
+    float lr, float beta1, float beta2, float wd, int64_t N
 ) {
-    const int stride = prim::grid_stride() * UNROLL;
-    const int base0 = prim::grid_stride_index() * UNROLL;
-    for (int base = base0; base < N; base += stride) {
+    const int64_t stride = prim::grid_stride() * UNROLL;
+    const int64_t base0 = prim::grid_stride_index() * UNROLL;
+    for (int64_t base = base0; base < N; base += stride) {
         #pragma unroll
         for (int u = 0; u < UNROLL; ++u) {
-            const int i = base + u;
+            const int64_t i = base + u;
             if (i < N) {
+                SG_SANITIZE_GRAD_INPLACE(grad, i);
                 lion_step(param, exp_avg, grad, lr, beta1, beta2, wd, i);
             }
         }
@@ -74,10 +76,11 @@ lion_kernel(
 __global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_LION_MIN_BLOCKS)
 lion_kernel_vec4_fp32(
     float4* param4, float4* exp_avg4, const float4* grad4,
-    float lr, float beta1, float beta2, float wd, int N4
+    float lr, float beta1, float beta2, float wd, int64_t N4
 ) {
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N4; i += stride) {
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N4; i += stride) {
+        SG_SANITIZE_GRAD4_INPLACE(grad4, i);
         lion_step_vec4(param4, exp_avg4, grad4, lr, beta1, beta2, wd, i);
     }
 }
@@ -97,7 +100,9 @@ void launch_lion_step(
     prim::L2PersistScope l2(stream, exp_avg.data_ptr(), exp_avg.nbytes());
 
     const int block = SG_TUNED_BLOCK_SIZE;
-    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    // Clamp the grid in int64 (N can exceed 2^31) then cast the grid dim to int.
+    const int grid = static_cast<int>(
+        std::min<int64_t>(65535, (N + block - 1) / block));
 
     const bool all_fp32 = param.scalar_type() == torch::kFloat32 &&
                           grad.scalar_type() == torch::kFloat32;
@@ -105,13 +110,15 @@ void launch_lion_step(
     if (SG_TUNED_VEC_WIDTH == 4 && all_fp32 &&
         prim::is_vec4_alignable(param.data_ptr(), N) &&
         prim::is_vec4_alignable(grad.data_ptr(), N)) {
-        const int N4 = N / 4;
-        const int grid4 = std::min<int>(65535, (N4 + block - 1) / block);
+        const int64_t N4 = N / 4;
+        const int grid4 = static_cast<int>(
+            std::min<int64_t>(65535, (N4 + block - 1) / block));
         lion_kernel_vec4_fp32<<<grid4, block, 0, stream>>>(
             reinterpret_cast<float4*>(param.data_ptr<float>()),
             reinterpret_cast<float4*>(exp_avg.data_ptr<float>()),
             reinterpret_cast<const float4*>(grad.data_ptr<float>()),
             lr, beta1, beta2, wd, N4);
+        SG_LAUNCH_CHECK(stream);
         return;
     }
 
@@ -124,6 +131,7 @@ void launch_lion_step(
                 exp_avg.data_ptr<float>(),
                 grad.data_ptr<scalar_t>(),
                 lr, beta1, beta2, wd, N);
+            SG_LAUNCH_CHECK(stream);
         });
 }
 

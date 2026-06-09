@@ -23,7 +23,7 @@ __device__ __forceinline__ void lion_step(
     const float beta1,
     const float beta2,
     const float wd,
-    const int idx
+    const int64_t idx
 ) {
     const float g  = static_cast<float>(grad[idx]);
     const float ea = exp_avg[idx];
@@ -44,7 +44,7 @@ __device__ __forceinline__ void lion_step_vec4(
     const float beta1,
     const float beta2,
     const float wd,
-    const int i
+    const int64_t i
 ) {
     float4 p  = param4[i];
     float4 ea = exp_avg4[i];

@@ -1,6 +1,6 @@
-"""Real TPU/Pallas fused composition for the tpu_v5p megakernel cells.
+"""Real TPU/Pallas fused composition for the tpu_v6e megakernel cells.
 
-This module turns the 33 ``csrc/fused/tpu_v5p/mega_<model>_<optimizer>.py``
+This module turns the 33 ``csrc/fused/tpu_v6e/mega_<model>_<optimizer>.py``
 structural stubs into a *real* fused program. It composes the real TPU
 optimizer kernels with the real TPU model kernels into a single jitted step
 function, so XLA fuses forward -> backward -> optimizer into one program
@@ -47,6 +47,8 @@ from __future__ import annotations
 
 import functools
 from typing import Any, Callable, Dict, Tuple
+
+from grokking_optimizers.dispatch import canonicalize_model
 
 # ---------------------------------------------------------------------------
 # JAX / Pallas availability guard (mirrors the other pallas backend files).
@@ -95,7 +97,6 @@ if _HAS_JAX:
     #    re-expose each launcher under the per-tensor call-site signature the
     #    fused composition uses -- no ``kernels.tpu`` dependency.
     from .launch_looksam import launch_looksam_apply
-    from .launch_muon import launch_muon_step
     from .launch_neuralgrok import launch_neuralgrok_step
     from .launch_prodigy import launch_prodigy_step
     from .launch_supergrok11 import launch_supergrok11_step
@@ -135,20 +136,51 @@ if _HAS_JAX:
 
     def muon_adamw_update(params, grads, exp_avg, exp_avg_sq, step,
                           beta1=0.9, beta2=0.98, lr=1e-3, wd=1.0, eps=1e-8):
-        # The Muon launcher's Newton-Schulz path is the matrix (2-D) update;
-        # ``launch_muon_step`` handles 2-D NS + the 1-D AdamW-style momentum
-        # fallback. The fused param tree here stacks layers (rank >= 3), where
-        # the orthogonalisation is undefined, so we apply the AdamW tail that
-        # the former ``muon_adamw_update`` used for non-2D params -- the real
-        # Muon non-matrix update -- over the full state pytree.
+        # Real Muon for the fused composition. The fused param tree STACKS the
+        # per-layer parameters, so a single leaf here is rank-1 (a bias vector),
+        # rank-2 (one weight matrix), or rank-3+ (a STACK of per-layer weight
+        # matrices). Muon orthogonalizes each 2-D matrix; we treat the LAST TWO
+        # axes as the matrix and BATCH the Newton-Schulz iteration over any
+        # leading (layer) axes via jnp.matmul's native batching, a batched
+        # transpose (swapaxes(-1,-2)), and a PER-matrix Frobenius norm.
+        #
+        # History: the original stub applied plain AdamW and never
+        # orthogonalized (not Muon at all). Delegating to the per-tensor
+        # ``launch_muon_step`` then broke lowering, because its full-transpose
+        # ``X.T`` and GLOBAL Frobenius norm are valid only for a single 2-D
+        # matrix — on the rank-3 stacked tree ``X.T`` reverses the layer axis
+        # and the matmul shapes become incompatible. The batched form below is
+        # the real Muon orthogonalization that is also correct on the stack.
+        #
+        # Muon's state is one SGD-momentum buffer (carried in ``exp_avg``);
+        # ``exp_avg_sq`` is passed through untouched (Muon has no second
+        # moment). ``beta1`` is Muon's momentum; ``wd`` is decoupled decay.
         g = grads.astype(jnp.float32)
-        new_m = beta1 * exp_avg + (1.0 - beta1) * g
-        new_v = beta2 * exp_avg_sq + (1.0 - beta2) * (g * g)
-        bc1 = 1.0 - beta1 ** step
-        bc2 = 1.0 - beta2 ** step
-        update = (new_m / bc1) / (jnp.sqrt(new_v / bc2) + eps)
-        new_p = params.astype(jnp.float32) - lr * (update + wd * params)
-        return new_p, new_m, new_v
+        new_buf = beta1 * exp_avg + g
+        p = params.astype(jnp.float32)
+        if params.ndim >= 2:
+            mm = functools.partial(
+                jnp.matmul, precision=jax.lax.Precision.HIGHEST,
+                preferred_element_type=jnp.float32)
+            # Per-matrix Frobenius norm over the last two axes (keepdims so it
+            # broadcasts across any leading stacked-layer axes).
+            frob = jnp.sqrt(jnp.sum(new_buf * new_buf, axis=(-2, -1),
+                                    keepdims=True)) + 1e-8
+            X = new_buf / frob
+            # Muon quintic NS coefficients (Jordan et al. 2024) — same as
+            # launch_muon.newton_schulz_iterate, but batched over leading axes.
+            a, b, c = 3.4445, -4.7750, 2.0315
+            for _ in range(5):
+                Xt = jnp.swapaxes(X, -1, -2)
+                AX = mm(Xt, X)        # Xᵀ X           (batched n×n)
+                AAX = mm(AX, AX)      # (Xᵀ X)²
+                X = a * X + b * mm(X, AX) + c * mm(X, AAX)
+            max_dim = max(params.shape[-1], params.shape[-2])
+            neg_lr_scale = -lr * 0.2 * jnp.sqrt(jnp.float32(max_dim))
+            new_p = p * (1.0 - lr * wd) + neg_lr_scale * X
+        else:
+            new_p = p - lr * new_buf
+        return new_p, new_buf, exp_avg_sq
 
     def neuralgrok_update(params, grads, exp_avg, exp_avg_sq, step,
                           W1, b1, W_last, b_last,
@@ -483,6 +515,7 @@ def _apply_kernel_optimizer(
     """
     meta = static.get("meta", {})
     step = static.get("step", 1)
+    _prodigy_d_leaves = False
 
     if optimizer == "supergrok2":
         # sg2_update(params, grads, state, meta_weights, hyperparams) per leaf.
@@ -541,7 +574,7 @@ def _apply_kernel_optimizer(
     elif optimizer == "prodigy":
         s_buf = opt_state["s"]
         p0 = opt_state["param_init"]
-        d_lr = meta.get("d_lr", 1e-6)
+        d_lr = opt_state.get("d_lr_scalar", meta.get("d_lr", 1e-6))
 
         def _leaf(p, g, m, v, s, pi):
             return step_fn(p, g, m, v, s, pi, step, d_lr,
@@ -550,6 +583,7 @@ def _apply_kernel_optimizer(
 
         out = jax.tree_util.tree_map(_leaf, params, grads, exp_avg, exp_avg_sq, s_buf, p0)
         new_keys = ("exp_avg", "exp_avg_sq", "s", "_d_lr")
+        _prodigy_d_leaves = True
 
     else:  # supergrok11 / supergrok15
         mu = opt_state["mu"]
@@ -582,6 +616,15 @@ def _apply_kernel_optimizer(
         new_state[k] = jax.tree_util.tree_unflatten(
             treedef, [t[i + 1] for t in leaves]
         )
+
+    if _prodigy_d_leaves:
+        d_idx = new_keys.index("_d_lr")
+        per_leaf_d = [t[d_idx + 1] for t in leaves]
+        d_reduced = per_leaf_d[0]
+        for d_val in per_leaf_d[1:]:
+            d_reduced = jnp.maximum(d_reduced, d_val)
+        new_state["d_lr_scalar"] = d_reduced
+
     return new_params, new_state
 
 
@@ -741,6 +784,7 @@ def fused_step(
     not traced). Returns ``(new_params, new_opt_state_dynamic)`` -- a single XLA
     program for L3, NOT a stub.
     """
+    model = canonicalize_model(model)
     _require_ready(model, optimizer)
     dyn_state, static = _split_static(opt_state)
 
@@ -970,31 +1014,20 @@ def _build_dummy_opt_state(optimizer: str, params: Any) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # trace_check: prove the composition traces + lowers without running on HW.
 # ---------------------------------------------------------------------------
-def trace_check(model: str, optimizer: str, tier: str = "L3") -> str:
-    """Trace + lower :func:`fused_step` for a cell on tiny dummy inputs.
-
-    Builds tiny model weights / inputs / optimizer state, then runs
-    :func:`jax.eval_shape` and ``jax.jit(...).lower(...)`` to confirm the real
-    fused program traces and lowers to HLO. NO hardware execution occurs.
-
-    Returns ``"ok"`` on success; raises on any failure.
-    """
+def _build_cell_call(model: str, optimizer: str, tier: str):
+    """Shared setup for trace_check / profile_cell: build the real fused
+    closure + its (weights, dyn_state) args on tiny dummy inputs. Returns
+    ``(call_fn, weights, dyn_state)``."""
+    model = canonicalize_model(model)
     _require_ready(model, optimizer)
     batch, weights, cfg = _TINY_MODELS[model]()
     opt_state = _build_dummy_opt_state(optimizer, weights)
 
-    # Real forward (undecorated body) to size the upstream cotangent.
     forward = _forward_fn(model)
     logits_shape = jax.eval_shape(lambda w: forward(batch, w, cfg), weights)
     grad_logits = jnp.ones(logits_shape.shape, logits_shape.dtype)
     inputs = {"batch": batch, "cfg": cfg, "grad_logits": grad_logits}
-
-    # For L1 (optimizer-only) supply zero grads shaped like the params.
     dummy_grads = None if tier == "L3" else _zeros_like_tree(weights)
-
-    # Only the DYNAMIC state crosses the trace/lower boundary; the ``_static``
-    # config is re-attached as python constants inside the closure so it is
-    # never converted to a tracer (it drives kernel control flow + dims).
     dyn_state, static = _split_static(opt_state)
 
     def _call(w, st):
@@ -1005,12 +1038,56 @@ def trace_check(model: str, optimizer: str, tier: str = "L3") -> str:
             lr=1e-3, tier=tier,
         )
 
+    return _call, weights, dyn_state
+
+
+def trace_check(model: str, optimizer: str, tier: str = "L3") -> str:
+    """Trace + lower :func:`fused_step` for a cell on tiny dummy inputs.
+
+    Builds tiny model weights / inputs / optimizer state, then runs
+    :func:`jax.eval_shape` and ``jax.jit(...).lower(...)`` to confirm the real
+    fused program traces and lowers to HLO. NO hardware execution occurs.
+
+    Returns ``"ok"`` on success; raises on any failure.
+    """
+    _call, weights, dyn_state = _build_cell_call(model, optimizer, tier)
+
     # 1) Shape inference (cheap): proves the fused closure is traceable.
     jax.eval_shape(_call, weights, dyn_state)
 
     # 2) Full lowering of fused_step to HLO (no hardware execution).
     jax.jit(_call).lower(weights, dyn_state)
     return "ok"
+
+
+def profile_cell(model: str, optimizer: str, tier: str = "L3") -> Dict[str, Any]:
+    """Compile a cell's real fused program to optimized HLO + EXECUTE it on the
+    host (CPU) backend — the TPU-side analogue of the sm_90 SASS / gfx942 ISA
+    audit. The TPU MXU is XLA-compiler-mapped from ``dot_general`` ops, so the
+    optimized-HLO dot/fusion/convert counts are the instruction-level evidence;
+    real MXU emission + wall-clock are the silicon-only residual.
+
+    Returns a dict: n_dot (MXU matmuls), n_fusion (XLA fusions = the L3 fusion),
+    n_convert (bf16<->f32), executed (bool), finite (bool), hlo_chars.
+    """
+    import re as _re
+
+    _call, weights, dyn_state = _build_cell_call(model, optimizer, tier)
+    jitted = jax.jit(_call)
+    hlo = jitted.lower(weights, dyn_state).compile().as_text()
+    n_dot = len(_re.findall(r"\bdot\b|dot_general|custom-call.*gemm", hlo))
+    n_fusion = len(_re.findall(r"\bfusion\b|kLoop|kInput|kOutput", hlo))
+    n_convert = len(_re.findall(r"\bconvert\b", hlo))
+
+    # Execute on the host backend and confirm every output leaf is finite.
+    out = jitted(weights, dyn_state)
+    leaves = jax.tree_util.tree_leaves(out)
+    finite = all(bool(jnp.all(jnp.isfinite(x))) for x in leaves
+                 if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating))
+    return {
+        "n_dot": n_dot, "n_fusion": n_fusion, "n_convert": n_convert,
+        "executed": True, "finite": finite, "hlo_chars": len(hlo),
+    }
 
 
 __all__ = [

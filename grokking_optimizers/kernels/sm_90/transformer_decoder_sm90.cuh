@@ -1011,6 +1011,7 @@ cudaError_t forward(
     ActT* embed_out = activations + L.input_ids_saved;
     embedding_kernel<ActT, WeightT><<<B*S, 128, 0, stream>>>(
         input, tok_embed, pos_embed, embed_out, B, S, D, V);
+    SG_LAUNCH_CHECK(stream);
 
     ActT* layer_input = embed_out;
 
@@ -1041,6 +1042,7 @@ cudaError_t forward(
             (WeightT*)sl.qkv_out, 3*D, stream);
         bias_add_kernel<ActT, WeightT><<<B*S, 256, 0, stream>>>(
             sl.qkv_out, lw.qkv_b, B*S, 3*D);
+        SG_LAUNCH_CHECK(stream);
 
         // Split into Q/K/V in [B, H, S, d_h] layout (3 contiguous slabs)
         ActT* q_buf = sl.attn_in_qkv;
@@ -1048,6 +1050,7 @@ cudaError_t forward(
         ActT* v_buf = sl.attn_in_qkv + (size_t)2*B*S*D;
         qkv_split_kernel<ActT><<<B*S, 128, 0, stream>>>(
             sl.qkv_out, q_buf, k_buf, v_buf, B, S, H, d_head);
+        SG_LAUNCH_CHECK(stream);
 
         // Attention forward
         attention::attention_forward<ActT, 32, /*kCausal=*/true>(
@@ -1058,6 +1061,7 @@ cudaError_t forward(
         // Reshape attention output [B, H, S, d] -> [B, S, D]
         attn_out_reshape_kernel<ActT><<<B*S, 128, 0, stream>>>(
             sl.attn_out_perhead, sl.attn_out, B, S, H, d_head);
+        SG_LAUNCH_CHECK(stream);
 
         // Output projection: attn_proj = attn_out @ out_W^T  (out_W [D,D]).
 #ifdef WITH_CUTLASS
@@ -1076,12 +1080,14 @@ cudaError_t forward(
             (WeightT*)sl.attn_proj, D, stream);
         bias_add_kernel<ActT, WeightT><<<B*S, 128, 0, stream>>>(
             sl.attn_proj, lw.out_b, B*S, D);
+        SG_LAUNCH_CHECK(stream);
 
         // n1: x = LN(qkv_in + attn_proj) [post-norm]
         residual_layernorm_kernel<ActT, WeightT>
             <<<B*S, 128, D*sizeof(float), stream>>>(
                 sl.qkv_in, sl.attn_proj, lw.n1_g, lw.n1_b,
                 sl.n1_in, sl.layer1_out, B*S, D, eps);
+        SG_LAUNCH_CHECK(stream);
 
         // FFN up: ffn_pre = layer1_out @ ff1_W^T  (ff1_W [FH,D]).
 #ifdef WITH_CUTLASS
@@ -1100,6 +1106,7 @@ cudaError_t forward(
             (WeightT*)sl.ffn_pre, FH, stream);
         bias_add_kernel<ActT, WeightT><<<B*S, 256, 0, stream>>>(
             sl.ffn_pre, lw.ff1_b, B*S, FH);
+        SG_LAUNCH_CHECK(stream);
 
         // GELU
         {
@@ -1107,6 +1114,7 @@ cudaError_t forward(
             int block = 256, grid = (int)((n + block - 1) / block);
             gelu_fwd_kernel<ActT><<<grid, block, 0, stream>>>(
                 sl.ffn_pre, sl.ffn_post, n);
+            SG_LAUNCH_CHECK(stream);
         }
 
         // FFN down: ffn_out = ffn_post @ ff2_W^T  (ff2_W [D,FH]).
@@ -1126,12 +1134,14 @@ cudaError_t forward(
             (WeightT*)sl.ffn_out, D, stream);
         bias_add_kernel<ActT, WeightT><<<B*S, 128, 0, stream>>>(
             sl.ffn_out, lw.ff2_b, B*S, D);
+        SG_LAUNCH_CHECK(stream);
 
         // n2: layer_out = LN(layer1_out + ffn_out) [post-norm]
         residual_layernorm_kernel<ActT, WeightT>
             <<<B*S, 128, D*sizeof(float), stream>>>(
                 sl.layer1_out, sl.ffn_out, lw.n2_g, lw.n2_b,
                 sl.n2_in, sl.layer_out, B*S, D, eps);
+        SG_LAUNCH_CHECK(stream);
 
         layer_input = sl.layer_out;
     }
@@ -1141,6 +1151,7 @@ cudaError_t forward(
     layernorm_kernel<ActT, WeightT>
         <<<B*S, 128, D*sizeof(float), stream>>>(
             layer_input, final_g, final_b, final_norm_out, B*S, D, eps);
+    SG_LAUNCH_CHECK(stream);
 
     // Vocab head (full): logits[B*S, V] = norm @ vocab_W^T + b  (vocab_W [V,D]).
     ActT* logits_full = final_norm_out + L.final_norm_out;
@@ -1160,10 +1171,12 @@ cudaError_t forward(
         (WeightT*)logits_full, V, stream);
     bias_add_kernel<ActT, WeightT><<<B*S, 128, 0, stream>>>(
         logits_full, vocab_b, B*S, V);
+    SG_LAUNCH_CHECK(stream);
 
     // Last-token output [B, V]
     last_token_kernel<ActT><<<B, 128, 0, stream>>>(
         logits_full, output, B, S, V);
+    SG_LAUNCH_CHECK(stream);
 
     // Handle is owned by the CUDA caching context — do NOT destroy it.
     return cudaGetLastError();
@@ -1252,6 +1265,7 @@ cudaError_t backward(
     // 1. Scatter grad_output into grad_logits_full (overwrites logits_full)
     last_token_scatter_kernel<ActT><<<B*S, 128, 0, stream>>>(
         grad_output, logits_full, B, S, V);
+    SG_LAUNCH_CHECK(stream);
 
     // 2. Vocab head bwd. Compute weight grad FIRST (needs saved final_norm_out).
     // grad_vocab_W [V, D] += grad_logits^T [V, B*S] * final_norm_out [B*S, D]
@@ -1263,6 +1277,7 @@ cudaError_t backward(
     // grad_vocab_b
     bias_bwd_kernel<ActT, WeightT><<<(V+255)/256, 256, 0, stream>>>(
         logits_full, g_vocab_b, B*S, V);
+    SG_LAUNCH_CHECK(stream);
     // grad_norm_out (= grad of input to vocab head) = grad_logits * vocab_W
     // Overwrite final_norm_out — no longer needed.
     cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -1277,6 +1292,7 @@ cudaError_t backward(
         <<<B*S, 128, D*sizeof(float), stream>>>(
             sl_last.layer_out, final_norm_out, final_g,
             grad_stack_out, g_final_g, g_final_b, B*S, D, eps);
+    SG_LAUNCH_CHECK(stream);
 
     ActT* grad_y = grad_stack_out;  // grad w.r.t. last layer's output
 
@@ -1293,6 +1309,7 @@ cudaError_t backward(
             <<<B*S, 128, D*sizeof(float), stream>>>(
                 sl.n2_in, grad_y, lw.n2_g,
                 sl.ffn_out, gw.n2_g, gw.n2_b, B*S, D, eps);
+        SG_LAUNCH_CHECK(stream);
         ActT* grad_n2_in = sl.ffn_out;     // alias (grad for both branches)
 
         // ── FFN-down bwd: y = ffn_post * ff2_W^T + ff2_b
@@ -1305,6 +1322,7 @@ cudaError_t backward(
             gw.ff2_W, FH, stream);
         bias_bwd_kernel<ActT, WeightT><<<(D+255)/256, 256, 0, stream>>>(
             grad_n2_in, gw.ff2_b, B*S, D);
+        SG_LAUNCH_CHECK(stream);
         // Then: activation grad. Overwrite ffn_post (no longer needed).
         // grad_ffn_post = grad_n2_in * ff2_W
         cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -1319,6 +1337,7 @@ cudaError_t backward(
             int block = 256, grid = (int)((n + block - 1) / block);
             gelu_bwd_kernel<ActT><<<grid, block, 0, stream>>>(
                 sl.ffn_pre, grad_ffn_post, sl.ffn_pre, n);
+            SG_LAUNCH_CHECK(stream);
         }
         ActT* grad_ffn_pre = sl.ffn_pre;
 
@@ -1331,6 +1350,7 @@ cudaError_t backward(
             gw.ff1_W, D, stream);
         bias_bwd_kernel<ActT, WeightT><<<(FH+255)/256, 256, 0, stream>>>(
             grad_ffn_pre, gw.ff1_b, B*S, FH);
+        SG_LAUNCH_CHECK(stream);
         // Activation grad: grad_layer1_ff = grad_ffn_pre * ff1_W
         // Overwrite layer1_out (no longer needed after weight grad).
         cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -1345,6 +1365,7 @@ cudaError_t backward(
             int block = 256, grid = (int)((n + block - 1) / block);
             add_inplace_kernel<ActT><<<grid, block, 0, stream>>>(
                 grad_layer1_ff, grad_n2_in, n);
+            SG_LAUNCH_CHECK(stream);
         }
         ActT* grad_layer1_out = grad_layer1_ff;
 
@@ -1354,6 +1375,7 @@ cudaError_t backward(
             <<<B*S, 128, D*sizeof(float), stream>>>(
                 sl.n1_in, grad_layer1_out, lw.n1_g,
                 sl.attn_proj, gw.n1_g, gw.n1_b, B*S, D, eps);
+        SG_LAUNCH_CHECK(stream);
         ActT* grad_n1_in = sl.attn_proj;
 
         // ── out projection bwd: y = attn_out * out_W^T + out_b
@@ -1365,6 +1387,7 @@ cudaError_t backward(
             gw.out_W, D, stream);
         bias_bwd_kernel<ActT, WeightT><<<(D+255)/256, 256, 0, stream>>>(
             grad_n1_in, gw.out_b, B*S, D);
+        SG_LAUNCH_CHECK(stream);
         // Activation grad. Overwrite attn_out.
         cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
             B*S, D, D, 1.0f, 0.0f,
@@ -1375,6 +1398,7 @@ cudaError_t backward(
         // Reshape [B, S, D] -> [B, H, S, d] for attention_backward
         attn_out_inverse_reshape_kernel<ActT><<<B*S, 128, 0, stream>>>(
             grad_attn_out, sl.attn_out_perhead, B, S, H, d_head);
+        SG_LAUNCH_CHECK(stream);
         // After this, attn_out_perhead holds grad in [B,H,S,d] layout.
 
         // ── Attention bwd
@@ -1403,6 +1427,7 @@ cudaError_t backward(
         // Reuse qkv_out as the merged grad buffer.
         qkv_merge_kernel<ActT><<<B*S, 128, 0, stream>>>(
             grad_q_buf, grad_k_buf, grad_v_buf, sl.qkv_out, B, S, H, d_head);
+        SG_LAUNCH_CHECK(stream);
         ActT* grad_qkv_out = sl.qkv_out;
 
         // ── QKV projection bwd: y = qkv_in * qkv_W^T + qkv_b
@@ -1414,6 +1439,7 @@ cudaError_t backward(
             gw.qkv_W, D, stream);
         bias_bwd_kernel<ActT, WeightT><<<(3*D+255)/256, 256, 0, stream>>>(
             grad_qkv_out, gw.qkv_b, B*S, 3*D);
+        SG_LAUNCH_CHECK(stream);
         // Activation grad: grad_qkv_in = grad_qkv_out * qkv_W
         // Write into qkv_in (no longer needed).
         cublas_gemm_rm<WeightT>(cublas, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -1428,6 +1454,7 @@ cudaError_t backward(
             int block = 256, grid = (int)((n + block - 1) / block);
             add_inplace_kernel<ActT><<<grid, block, 0, stream>>>(
                 grad_qkv_in, grad_n1_in, n);
+            SG_LAUNCH_CHECK(stream);
         }
         grad_y = grad_qkv_in;
     }
@@ -1436,6 +1463,7 @@ cudaError_t backward(
     //    stashed the input ids at activations_saved[0..B*S).
     embedding_bwd_kernel<ActT, WeightT><<<B*S, 128, 0, stream>>>(
         input_ids_saved, grad_y, g_tok_embed, g_pos_embed, B, S, D, V);
+    SG_LAUNCH_CHECK(stream);
 
     // grad_input is grad w.r.t. token IDs — undefined for integer inputs.
     cudaMemsetAsync(grad_input, 0, (size_t)B*S*sizeof(ActT), stream);

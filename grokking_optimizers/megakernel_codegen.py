@@ -7,7 +7,7 @@ instantiating the ONE templated L3 megakernel from
 
 You do NOT hand-write 99 kernels: the demo TU is the structural template, and
 the generator re-instantiates ``l3_megakernel<Model, Optimizer>`` (sm_90 /
-gfx942) or emits the Pallas program (tpu_v5p) per cell. It can emit a single
+gfx942) or emits the Pallas program (tpu_v6e) per cell. It can emit a single
 cell's source string (``--emit <model> <optimizer> <arch>``) or report the full
 99-cell manifest with tiers (``--emit-all``).
 
@@ -15,6 +15,16 @@ The set of cells that already have a REAL, wired fused TU (the three the demo
 instantiates + dispatch.cpp routes to) is :data:`WIRED_CELLS`; every other cell
 is generator-emittable but not yet compiled into the extension (the manifest
 flags which is which, mirroring dispatch.cpp's honesty contract, §1.12).
+
+BUILD-TIME GENERATOR — NOT a runtime module. It is invoked from the build
+(``setup.py`` materializes the per-cell sources it emits) and as a CLI::
+
+    python -m grokking_optimizers.megakernel_codegen --emit-all
+    python -m grokking_optimizers.megakernel_codegen --emit mamba3 supergrok2 sm_90
+    python -m grokking_optimizers.megakernel_codegen --write-all
+
+It has NO runtime call sites in the optimizer hot path by design; see
+:func:`main` / the ``__main__`` entry below.
 """
 
 from __future__ import annotations
@@ -65,7 +75,7 @@ WIRED_CELLS: Tuple[Tuple[str, str, str], ...] = tuple(
     for o in ("adamw", "lion", "grokfast", "grokadamw", "looksam", "muon",
               "neuralgrok", "prodigy", "supergrok11", "supergrok15",
               "supergrok2")
-    for a in ("sm_90", "gfx942", "tpu_v5p")
+    for a in ("sm_90", "gfx942", "tpu_v6e")
 )
 
 
@@ -93,15 +103,64 @@ _OPT_EXTRA_FIELD: Dict[str, Optional[str]] = {
     "grokadamw": "ema",
     "looksam": "sam_dir",
     "prodigy": "s_track",
-    "neuralgrok": None,        # psi-net weights are per-tensor, host-supplied 🟡
+    "neuralgrok": None,        # psi-net weights bound explicitly — see below
     "muon": "orth",
     "supergrok11": "mu",
     "supergrok15": "mu",
     "supergrok2": "smart_grad",
 }
 
+# NeuralGrok needs its psi-net weights bound from the packed `extra` buffer
+# (layout W1|b1|W2|b2 in opt_components.{cuh,hip.hpp}). It does NOT use a single
+# `extra` n-slice field like the other optimizers, so it gets a bespoke bind
+# block instead of the generic `st.<field> = extra` / `(void)extra` line. The
+# psi_b2 scalar is left host-side at 0 and read ON-DEVICE (st.psi_W2[kPsiHidden],
+# where the device pointer is dereferenceable). This keeps the codegen the
+# single source for the cells (the bind used to be hand-patched into the files).
+_PSI_BIND_CUDA = """
+    // #5: bind the psi-net weights from the packed `extra` buffer (layout in
+    // opt_components.cuh: W1|b1|W2|b2). Without this the psi pointers stay null
+    // and neuralgrok_psi_forward null-derefs on this real path.
+    if (extra) {
+        st.psi_W1 = extra + kPsiW1Off;
+        st.psi_b1 = extra + kPsiB1Off;
+        st.psi_W2 = extra + kPsiW2Off;
+        // st.psi_b2 left at 0.0f host-side: the real psi_b2 scalar lives at
+        // extra[kPsiB2Off] and is read ON-DEVICE in apply_optimizer<NeuralGrok>
+        // (st.psi_W2[kPsiHidden]), where the device pointer is dereferenceable.
+    }"""
+
+_PSI_BIND_HIP = """
+    // #5: bind psi-net weights from the packed `extra` buffer (W1|b1|W2|b2,
+    // layout in opt_components.hip.hpp) — without this the psi pointers are null
+    // and sg_psi_forward null-derefs. psi_b2 is read on-device in apply_optimizer<NeuralGrok> (st.psi_W2[kPsiHidden]).
+    if (extra) {
+        st.psi_W1 = extra + kPsiW1Off;
+        st.psi_b1 = extra + kPsiB1Off;
+        st.psi_W2 = extra + kPsiW2Off;
+    }"""
+
 
 # ── Per-arch source emission ─────────────────────────────────────────────
+
+def _fuse_tier_tag(tier: FusionTier, *, lower: bool = False) -> str:
+    """Map a solver ``FusionTier`` to the C++ ``FuseTier`` instantiation tag.
+
+    The emitters only support L3 (fwd+bwd+opt) and L1 (opt-only). The old
+    ``"L3" if tier == L3 else "L1"`` form SILENTLY coerced L2_BWD_OPT (and
+    L0_UNFUSED) to L1 — emitting a kernel that fuses only the optimizer tail
+    instead of backward+optimizer, a wrong-kernel landmine if the cost model
+    ever yields an L2 cell. Fail loudly instead so the codegen is corrected.
+    """
+    mapping = {FusionTier.L3_FWD_BWD_OPT: "l3", FusionTier.L1_OPT_ONLY: "l1"}
+    tag = mapping.get(tier)
+    if tag is None:
+        raise ValueError(
+            f"megakernel_codegen: FusionTier {tier.name} has no emitter "
+            f"mapping (only L3/L1 are emittable). The solver returned a tier "
+            f"the codegen cannot emit — add an emitter or fix the cost model.")
+    return tag if lower else tag.upper()
+
 
 def _emit_cuda(plan: FusionPlan) -> str:
     """Emit the sm_90 .cu source for a cell as a REAL component composition.
@@ -115,12 +174,16 @@ def _emit_cuda(plan: FusionPlan) -> str:
     m_enum = _MODEL_ENUM[plan.model]
     o_enum, _ = _opt_enum(plan.optimizer)
     sym = _cell_symbol(plan.model, plan.optimizer)
-    tier = "L3" if plan.tier == FusionTier.L3_FWD_BWD_OPT else "L1"
+    tier = _fuse_tier_tag(plan.tier)
     extra_field = _OPT_EXTRA_FIELD[plan.optimizer]
-    extra_line = (f"\n    st.{extra_field} = extra;  // {plan.optimizer}'s third "
-                  f"per-element state buffer" if extra_field else
-                  "\n    (void)extra;  // adamw/lion/neuralgrok need no 'extra' "
-                  "n-slice")
+    if plan.optimizer == "neuralgrok":
+        extra_line = _PSI_BIND_CUDA
+    elif extra_field:
+        extra_line = (f"\n    st.{extra_field} = extra;  // {plan.optimizer}'s "
+                      f"third per-element state buffer")
+    else:
+        extra_line = ("\n    (void)extra;  // adamw/lion/neuralgrok need no "
+                      "'extra' n-slice")
     return f"""// csrc/fused/sm_90/{sym}.cu  — GENERATED by megakernel_codegen.py
 // Cell: ({plan.model}, {plan.optimizer}, {plan.arch})  tier={plan.tier.name}
 //   regs={plan.regs}/{plan.budget_regs}  smem={plan.smem}/{plan.budget_smem}
@@ -172,10 +235,14 @@ def _emit_hip(plan: FusionPlan) -> str:
     m_enum = _MODEL_ENUM[plan.model]
     o_enum, _ = _opt_enum(plan.optimizer)
     sym = _cell_symbol(plan.model, plan.optimizer)
-    tier = "L3" if plan.tier == FusionTier.L3_FWD_BWD_OPT else "L1"
+    tier = _fuse_tier_tag(plan.tier)
     extra_field = _OPT_EXTRA_FIELD[plan.optimizer]
-    extra_line = (f"\n    st.{extra_field} = extra;" if extra_field
-                  else "\n    (void)extra;")
+    if plan.optimizer == "neuralgrok":
+        extra_line = _PSI_BIND_HIP
+    elif extra_field:
+        extra_line = f"\n    st.{extra_field} = extra;"
+    else:
+        extra_line = "\n    (void)extra;"
     return f"""// csrc/fused/gfx942/{sym}.hip  — GENERATED by megakernel_codegen.py
 // Cell: ({plan.model}, {plan.optimizer}, {plan.arch})  tier={plan.tier.name}
 //   §1.13 ping-pong / 4-wave-interleave (NOT warp-specialized).
@@ -219,7 +286,7 @@ hipError_t {sym}(
     int n_cus = 0;
     err = hipDeviceGetAttribute(&n_cus, hipDeviceAttributeMultiprocessorCount, dev);
     if (err != hipSuccess) return err;
-    ctx.n_ctas = (unsigned)n_cus;
+    ctx.n_groups = (unsigned)n_cus;
     FusedOptState st;
     st.exp_avg = m; st.exp_avg_sq = v;{extra_line}
     st.lr = lr;
@@ -236,7 +303,7 @@ hipError_t {sym}(
 
 
 def _emit_pallas(plan: FusionPlan) -> str:
-    """Emit a tpu_v5p cell as a REAL fused composition (not a stub).
+    """Emit a tpu_v6e cell as a REAL fused composition (not a stub).
 
     The cell binds to the real fused program in
     csrc/backends/pallas/_pallas_fused.py::fused_step, which composes — inside
@@ -247,8 +314,8 @@ def _emit_pallas(plan: FusionPlan) -> str:
     selects L3 (fwd+bwd+opt) vs L1 (opt-only).
     """
     sym = _cell_symbol(plan.model, plan.optimizer)
-    tier = "L3" if plan.tier == FusionTier.L3_FWD_BWD_OPT else "L1"
-    return f'''# csrc/fused/tpu_v5p/{sym}.py
+    tier = _fuse_tier_tag(plan.tier)
+    return f'''# csrc/fused/tpu_v6e/{sym}.py
 # GENERATED by megakernel_codegen.py — cell ({plan.model}, {plan.optimizer},
 # {plan.arch}), tier={plan.tier.name}.
 #
@@ -284,7 +351,7 @@ def emit_cell(model: str, optimizer: str, arch: str) -> str:
         return _emit_cuda(plan)
     if arch == "gfx942":
         return _emit_hip(plan)
-    if arch == "tpu_v5p":
+    if arch == "tpu_v6e":
         return _emit_pallas(plan)
     raise KeyError(f"unknown arch '{arch}' (not a megakernel target)")
 
@@ -346,8 +413,8 @@ def _format_manifest(rows: List[Dict[str, object]]) -> str:
 
 # ── Materialize all cells to disk ─────────────────────────────────────
 
-_ARCH_EXT = {"sm_90": ".cu", "gfx942": ".hip", "tpu_v5p": ".py"}
-_ARCH_DIR = {"sm_90": "sm_90", "gfx942": "gfx942", "tpu_v5p": "tpu_v5p"}
+_ARCH_EXT = {"sm_90": ".cu", "gfx942": ".hip", "tpu_v6e": ".py"}
+_ARCH_DIR = {"sm_90": "sm_90", "gfx942": "gfx942", "tpu_v6e": "tpu_v6e"}
 
 
 def write_all(root: str = "csrc/fused") -> List[str]:
@@ -464,7 +531,16 @@ def dispatch_table_gfx942() -> str:
 def dispatch_table() -> str:
     """Emit the C++ wired_fused_cell() body covering all 99 cells."""
     lines: List[str] = []
-    lines.append("// AUTO-GENERATED by megakernel_codegen.py --dispatch-table")
+    lines.append(
+        "// AUTO-GENERATED by: python -m grokking_optimizers.megakernel_codegen "
+        "--dispatch-table")
+    lines.append(
+        "// Do NOT hand-edit. Derived from the SAME solver enumeration "
+        "(megakernel.solve_all)")
+    lines.append(
+        "// that emits the 99 csrc/fused/<arch>/mega_*.{cu,hip,py} cells, so it "
+        "cannot drift.")
+    lines.append("// dispatch.cpp #includes this inside its anonymous namespace.")
     lines.append("std::string wired_fused_cell(const std::string& model,")
     lines.append(" const std::string& optimizer, int arch) {")
     seen: set = set()
@@ -473,10 +549,10 @@ def dispatch_table() -> str:
         if key in seen:
             continue
         seen.add(key)
-        tier_tag = "l3" if plan.tier == FusionTier.L3_FWD_BWD_OPT else "l1"
-        arch_int = {"sm_90": 90, "gfx942": 942, "tpu_v5p": -1}[plan.arch]
+        tier_tag = _fuse_tier_tag(plan.tier, lower=True)
+        arch_int = {"sm_90": 90, "gfx942": 942, "tpu_v6e": -1}[plan.arch]
         arch_lit = {"sm_90": "sm_90", "gfx942": "gfx942",
-                    "tpu_v5p": "tpu_v5p"}[plan.arch]
+                    "tpu_v6e": "tpu_v6e"}[plan.arch]
         lines.append(
             f' if (arch == {arch_int} && model == "{plan.model}"'
             f' && optimizer == "{plan.optimizer}")')
