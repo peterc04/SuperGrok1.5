@@ -639,6 +639,27 @@ elif _has_gpu:
     if _autotune_pass:
         print("  CUDA build mode: AUTOTUNE_PASS=1 (first pass, stub configs)")
 
+    # Strip host-side LTO (-Xcompiler -flto / -flto=auto) from the INSTALL build.
+    # nvcc emits one `fatbinData` symbol per CUDA TU; when distutils links the
+    # final .so it drives gcc's LTO over the thin-LTO objects, and lto-wrapper
+    # merges the per-TU fatbinData into one assembly → "symbol fatbinData is
+    # already defined" (a hard link failure). LTO of the thin host glue is a
+    # negligible win for a GPU-kernel extension, and the autotuner's own flag
+    # tables (compile.py) keep -flto for its standalone single-TU probes — this
+    # only de-LTOs the multi-TU install link so `pip install -e .` / build_ext
+    # link reliably.
+    def _strip_flto(flags):
+        out = []
+        for f in flags:
+            if "flto" in f:
+                if out and out[-1] == "-Xcompiler":
+                    out.pop()           # drop the paired `-Xcompiler` token too
+                continue
+            out.append(f)
+        return out
+    cuda_nvcc = _strip_flto(cuda_nvcc)
+    cuda_cxx = _strip_flto(cuda_cxx)
+
     ext = CUDAExtension(
         name="grokking_optimizers._ops",
         sources=sources,

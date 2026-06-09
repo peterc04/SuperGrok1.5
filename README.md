@@ -7,12 +7,19 @@ families — **NVIDIA sm_90 (Hopper)**, **AMD gfx942 (CDNA3 / MI300X)**, and
 (no parallel math trees, no dead duplicates; enforced by a self-test drift
 guard).
 
-> **Status honesty.** Everything below is **implemented and system-verified on
-> this environment via CPU / clang-AMDGPU-gate / `nvcc -c` / JAX-lowering**.
-> No accelerator is present here, so all *runtime* and *numeric-parity* claims
-> are 🟡 and gated on the executable checklist in
-> [`HARDWARE_VALIDATION.md`](HARDWARE_VALIDATION.md) (H100 / MI300X / TPU v6e).
-> Nothing in this README claims a hardware result.
+> **Status honesty.** The **NVIDIA sm_90 (H100)** path is now **verified on real
+> silicon**: the `_ops` extension builds, links, imports, and runs on an H100
+> 80GB, and the grokking race trains and **groks** there — 6/11 optimizers reach
+> 100% test accuracy on `a÷b mod 97` (Grokfast fastest at 2,600 steps). See
+> [`results/h100_grokking_race/`](results/h100_grokking_race/). Running on-device
+> surfaced (and this branch fixes) several silent kernel bugs the CPU `nvcc -c`
+> gate could not catch — e.g. inverted weight-decay in the fused Muon update.
+> Remaining 🟡: the **gfx942 (MI300X)** and **TPU v6e** runtime paths, full
+> numeric-parity of every fused cell, and 4 optimizers whose on-device kernels
+> are still under repair (Prodigy, SuperGrok1.1/1.5/2 — diagnosed in the race
+> results README). Per-arch detail in
+> [`HARDWARE_VALIDATION.md`](HARDWARE_VALIDATION.md). Historical phase/build
+> reports moved to [`archived_reports/`](archived_reports/).
 
 ---
 

@@ -255,7 +255,14 @@ muon_ns_combine_update_kernel(
     for (int64_t i = prim::grid_stride_index(); i < N; i += stride) {
         float y = a * X[i] + b * AX[i] + c * AAX[i];
         float p = static_cast<float>(param[i]);
-        param[i] = static_cast<ParamT>(p + neg_lr_scale * y - decay_factor * p);
+        // decay_factor = 1 - lr*wd is the RETENTION factor (host: muon_fused_step
+        // bindings.cpp). The canonical update (muon.h / muon_update_step / the
+        // non-fused launch_muon_update) is p*decay_factor + neg_lr_scale*orth.
+        // The previous form p + neg_lr_scale*y - decay_factor*p == p*(1-decay_factor)
+        // + ... inverted it (retained lr*wd≈2% of the param each step instead of
+        // 98%), so the fused NS path silently destroyed the weights while the
+        // non-fused path was correct.
+        param[i] = static_cast<ParamT>(p * decay_factor + neg_lr_scale * y);
     }
 }
 

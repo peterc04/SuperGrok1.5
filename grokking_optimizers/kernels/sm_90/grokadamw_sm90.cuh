@@ -280,8 +280,13 @@ void launch_fused_grokadamw_step_q3(
     const int block = SG_TUNED_BLOCK_SIZE;
     const int grid = static_cast<int>(
         std::min<int64_t>(65535, (N + block - 1) / block));
-    const int q_block_size = std::max<int>(1,
-        static_cast<int>(N / exp_avg_scales.numel()));
+    // CEIL division: the kernel indexes ea_scales[i / q_block_size] for
+    // i in [0, N). With floor division, a non-divisible N (N % numel != 0)
+    // makes q_block_size too small so the largest i maps to scale_idx == numel
+    // (one past the end → OOB read). ceil(N/numel) guarantees i/q_block_size
+    // <= numel-1 for every i < N.
+    const int q_block_size = std::max<int>(1, static_cast<int>(
+        (N + exp_avg_scales.numel() - 1) / exp_avg_scales.numel()));
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
