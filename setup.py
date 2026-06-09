@@ -32,6 +32,23 @@ from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension
 
 # ----------------------------------------------------------------------
+# Absolute repo root (directory containing this setup.py). Include dirs MUST
+# be absolute: torch's BuildExtension runs ninja with cwd=build_temp, so a
+# relative "-I." resolves to the build-temp dir, NOT the project root — and the
+# project-root-relative  #include "csrc/fused/sm_90/..."  in dispatch.cpp would
+# not be found (fatal error: No such file or directory). Anchoring every
+# include dir to abspath(__file__) makes the build work regardless of the
+# invoking cwd (pip editable PEP 660, `setup.py build_ext`, or wheel build),
+# matching what scripts/compile_to_object.sh achieves by cd-ing to the root.
+# ----------------------------------------------------------------------
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _abs_incs(dirs):
+    """Anchor repo-relative include dirs at the repo root; pass absolutes through."""
+    return [d if os.path.isabs(d) else os.path.join(_REPO_ROOT, d) for d in dirs]
+
+# ----------------------------------------------------------------------
 # Stage-2 unification (Phase 8): source the CUDA device flags from the
 # autotuner's own flag tables so the install build compiles against the
 # SAME base flags the autotuner tunes against. compile.py exposes a
@@ -451,7 +468,7 @@ if _has_gpu and _is_hip:
         # inlined into every backend file. Only csrc/bindings/ (the one
         # surviving cross-file boundary) and csrc/ (for algorithm-header
         # absolute-path includes from launch files) remain.
-        include_dirs=[".", "csrc/bindings", "csrc"],
+        include_dirs=_abs_incs([".", "csrc/bindings", "csrc"]),
         define_macros=[("WITH_HIP", None)],
         extra_compile_args={"cxx": hip_cxx, "nvcc": hip_nvcc},
     )
@@ -625,7 +642,7 @@ elif _has_gpu:
     ext = CUDAExtension(
         name="grokking_optimizers._ops",
         sources=sources,
-        include_dirs=cuda_include_dirs,
+        include_dirs=_abs_incs(cuda_include_dirs),
         define_macros=cuda_define_macros,
         extra_compile_args={"cxx": cuda_cxx, "nvcc": cuda_nvcc},
     )

@@ -145,7 +145,7 @@ muon_update_kernel_vec4_fp32(
 }
 
 void launch_muon_momentum_normalize(
-    torch::Tensor& buf, torch::Tensor& X, const torch::Tensor& grad,
+    torch::Tensor buf, torch::Tensor X, torch::Tensor grad,
     float momentum, float inv_norm
 ) {
     const int64_t N = buf.numel();
@@ -188,8 +188,8 @@ void launch_muon_momentum_normalize(
 }
 
 void launch_muon_ns_combine(
-    torch::Tensor& Y, const torch::Tensor& X,
-    const torch::Tensor& AX, const torch::Tensor& AAX,
+    torch::Tensor Y, torch::Tensor X,
+    torch::Tensor AX, torch::Tensor AAX,
     float a, float b, float c
 ) {
     const int64_t N = Y.numel();
@@ -206,7 +206,7 @@ void launch_muon_ns_combine(
 }
 
 void launch_muon_update(
-    torch::Tensor& param, const torch::Tensor& orth,
+    torch::Tensor param, torch::Tensor orth,
     float neg_lr_scale, float decay_factor
 ) {
     const int64_t N = param.numel();

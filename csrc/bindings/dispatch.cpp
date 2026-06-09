@@ -170,9 +170,18 @@ int detect_arch() {
 // =====================================================================
 
 #if defined(WITH_CUDA) && !defined(WITH_HIP)
-namespace fused { namespace sm90 {
+namespace fused {
 // The persistent-megakernel scratch the host zero-initializes (mirror of
 // csrc/fused/megakernel_common.cuh::PersistentContext — kept layout-identical).
+//
+// This MUST live in sg::fused (NOT sg::fused::sm90): the real struct in
+// megakernel_common.cuh is declared in sg::fused, so every generated cell .cu
+// (which opens sg::fused::sm90 and names PersistentContext unqualified) binds
+// sg::fused::PersistentContext via enclosing-namespace lookup. The dispatch
+// table .inc below opens sg::fused::sm90 too, so it resolves this same shadow
+// by the identical lookup — making the call-site mangling match the .cu
+// definitions. A shadow in sg::fused::sm90 would mangle the cell parameter as
+// sg::fused::sm90::PersistentContext and fail to link against the .cu symbols.
 struct PersistentContext {
  int* g_next_task;
  unsigned* g_arrived;
@@ -180,7 +189,7 @@ struct PersistentContext {
  int n_tasks;
  unsigned n_ctas;
 };
-}} // namespace fused::sm90
+} // namespace fused
 // Phase 3 Stage 5: all 33 sm_90 cells are real component compositions
 // (csrc/fused/sm_90/mega_<model>_<opt>.cu → fused_megakernel.cuh →
 // opt_components.cuh/model_stages.cuh). This generated table declares every
@@ -342,7 +351,7 @@ void fused_step(const std::string& model, const std::string& optimizer,
  "megakernel ABI (PersistentContext.n_tasks / sizes / offsets). "
  "Use the per-op path for params with > 2^31-1 elements.");
 
- fused::sm90::PersistentContext ctx{
+ fused::PersistentContext ctx{
  sc.g_next.data_ptr<int>(),
  reinterpret_cast<unsigned*>(sc.g_arrived.data_ptr<int>()),
  reinterpret_cast<unsigned*>(sc.g_generation.data_ptr<int>()),

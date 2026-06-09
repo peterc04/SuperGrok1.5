@@ -59,6 +59,19 @@ __device__ __forceinline__ float ptx_expf(float x) { return expf(x); }
 
 namespace sg { namespace sm90 { namespace models { namespace mamba_adapter {
 
+// ── Dtype cast helpers (intrinsic-based) ──────────────────────────────
+// A bare static_cast between {__half,__nv_bfloat16} and float is rejected
+// under torch's -D__CUDA_NO_HALF_CONVERSIONS__ / -D__CUDA_NO_BFLOAT16_CONVERSIONS__
+// (the CUDAExtension default, which strips operator float()/the float ctor).
+// Route every half/bf16<->float conversion through the always-available
+// conversion intrinsics; the generic templates keep float/int casts unchanged.
+template <typename T> __device__ __forceinline__ float to_float(T v) { return static_cast<float>(v); }
+template <> __device__ __forceinline__ float to_float<__half>(__half v) { return __half2float(v); }
+template <> __device__ __forceinline__ float to_float<__nv_bfloat16>(__nv_bfloat16 v) { return __bfloat162float(v); }
+template <typename T> __device__ __forceinline__ T from_float(float v) { return static_cast<T>(v); }
+template <> __device__ __forceinline__ __half from_float<__half>(float v) { return __float2half(v); }
+template <> __device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
+
 // ── Sequential scan kernel (N < PSCAN_THRESHOLD) ──────────────────────
 // One thread per d_inner dimension, sequential over timesteps.
 
@@ -84,25 +97,25 @@ sequential_scan_kernel(
     float A[MAX_D_STATE];
     #pragma unroll 4
     for (int s = 0; s < d_state; s++)
-        A[s] = -ptx_expf(static_cast<float>(A_log[j * d_state + s]));
+        A[s] = -ptx_expf(to_float(A_log[j * d_state + s]));
 
     float h[MAX_D_STATE];
     #pragma unroll 4
     for (int s = 0; s < d_state; s++) h[s] = 0.0f;
 
     for (int t = 0; t < seq_len; t++) {
-        float x_val  = static_cast<float>(x[(bN + t) * d_inner + j]);
-        float dt_val = static_cast<float>(dt[(bN + t) * d_inner + j]);
+        float x_val  = to_float(x[(bN + t) * d_inner + j]);
+        float dt_val = to_float(dt[(bN + t) * d_inner + j]);
         float y_acc  = 0.0f;
 
         #pragma unroll 4
         for (int s = 0; s < d_state; s++) {
             float A_bar = ptx_expf(A[s] * dt_val);
-            float B_bar = dt_val * static_cast<float>(B[(bN + t) * d_state + s]);
+            float B_bar = dt_val * to_float(B[(bN + t) * d_state + s]);
             h[s] = A_bar * h[s] + B_bar * x_val;
-            y_acc += static_cast<float>(C[(bN + t) * d_state + s]) * h[s];
+            y_acc += to_float(C[(bN + t) * d_state + s]) * h[s];
         }
-        y[(bN + t) * d_inner + j] = static_cast<ActT>(y_acc);
+        y[(bN + t) * d_inner + j] = from_float<ActT>(y_acc);
     }
 
     if (state_save != nullptr) {
@@ -147,11 +160,11 @@ parallel_scan_kernel(
     float A_coeff[MAX_D_STATE];
     #pragma unroll 4
     for (int s = 0; s < d_state; s++)
-        A_coeff[s] = -ptx_expf(static_cast<float>(A_log[j * d_state + s]));
+        A_coeff[s] = -ptx_expf(to_float(A_log[j * d_state + s]));
 
     // Zero output for accumulation across d_state pairs
     for (int step = 0; step < cnt; step++) {
-        y[(bN + t0 + step) * d_inner + j] = static_cast<ActT>(0.0f);
+        y[(bN + t0 + step) * d_inner + j] = from_float<ActT>(0.0f);
     }
     __syncthreads();
 
@@ -165,13 +178,13 @@ parallel_scan_kernel(
         #pragma unroll 4
         for (int step = 0; step < cnt; step++) {
             int t = t0 + step;
-            float dtv = static_cast<float>(dt[(bN + t) * d_inner + j]);
-            float xv  = static_cast<float>(x[(bN + t) * d_inner + j]);
+            float dtv = to_float(dt[(bN + t) * d_inner + j]);
+            float xv  = to_float(x[(bN + t) * d_inner + j]);
             Affine2x2 elem;
             elem.m00 = ptx_expf(A_coeff[s0] * dtv);  elem.m01 = 0.0f;
             elem.m10 = 0.0f;                          elem.m11 = ptx_expf(A_coeff[s1] * dtv);
-            elem.b0  = dtv * static_cast<float>(B[(bN + t) * d_state + s0]) * xv;
-            elem.b1  = dtv * static_cast<float>(B[(bN + t) * d_state + s1]) * xv;
+            elem.b0  = dtv * to_float(B[(bN + t) * d_state + s0]) * xv;
+            elem.b1  = dtv * to_float(B[(bN + t) * d_state + s1]) * xv;
             summary = affine_combine(summary, elem);
         }
 
@@ -232,20 +245,20 @@ parallel_scan_kernel(
         #pragma unroll 4
         for (int step = 0; step < cnt; step++) {
             int t = t0 + step;
-            float dtv = static_cast<float>(dt[(bN + t) * d_inner + j]);
-            float xv  = static_cast<float>(x[(bN + t) * d_inner + j]);
+            float dtv = to_float(dt[(bN + t) * d_inner + j]);
+            float xv  = to_float(x[(bN + t) * d_inner + j]);
             Affine2x2 elem;
             elem.m00 = ptx_expf(A_coeff[s0] * dtv);  elem.m01 = 0.0f;
             elem.m10 = 0.0f;                          elem.m11 = ptx_expf(A_coeff[s1] * dtv);
-            elem.b0  = dtv * static_cast<float>(B[(bN + t) * d_state + s0]) * xv;
-            elem.b1  = dtv * static_cast<float>(B[(bN + t) * d_state + s1]) * xv;
+            elem.b0  = dtv * to_float(B[(bN + t) * d_state + s0]) * xv;
+            elem.b1  = dtv * to_float(B[(bN + t) * d_state + s1]) * xv;
             run = affine_combine(run, elem);
 
             // h = run applied to zero initial state -> h = run.b
-            float c0 = static_cast<float>(C[(bN + t) * d_state + s0]);
-            float c1 = static_cast<float>(C[(bN + t) * d_state + s1]);
-            float prev = static_cast<float>(y[(bN + t) * d_inner + j]);
-            y[(bN + t) * d_inner + j] = static_cast<ActT>(prev + run.b0*c0 + run.b1*c1);
+            float c0 = to_float(C[(bN + t) * d_state + s0]);
+            float c1 = to_float(C[(bN + t) * d_state + s1]);
+            float prev = to_float(y[(bN + t) * d_inner + j]);
+            y[(bN + t) * d_inner + j] = from_float<ActT>(prev + run.b0*c0 + run.b1*c1);
         }
 
         if (state_save != nullptr && t1 == N && cnt > 0) {
@@ -261,13 +274,13 @@ parallel_scan_kernel(
         float hv = 0.0f;
         for (int step = 0; step < cnt; step++) {
             int t = t0 + step;
-            float dtv = static_cast<float>(dt[(bN + t) * d_inner + j]);
-            float xv  = static_cast<float>(x[(bN + t) * d_inner + j]);
+            float dtv = to_float(dt[(bN + t) * d_inner + j]);
+            float xv  = to_float(x[(bN + t) * d_inner + j]);
             hv = ptx_expf(A_coeff[s] * dtv) * hv
-               + dtv * static_cast<float>(B[(bN + t) * d_state + s]) * xv;
-            float prev = static_cast<float>(y[(bN + t) * d_inner + j]);
-            float cv   = static_cast<float>(C[(bN + t) * d_state + s]);
-            y[(bN + t) * d_inner + j] = static_cast<ActT>(prev + hv * cv);
+               + dtv * to_float(B[(bN + t) * d_state + s]) * xv;
+            float prev = to_float(y[(bN + t) * d_inner + j]);
+            float cv   = to_float(C[(bN + t) * d_state + s]);
+            y[(bN + t) * d_inner + j] = from_float<ActT>(prev + hv * cv);
         }
         if (state_save != nullptr && t1 == N && cnt > 0)
             state_save[(bDi + j) * d_state + s] = hv;
@@ -344,7 +357,7 @@ scan_backward_kernel(
     float A[MAX_D_STATE];
     #pragma unroll 4
     for (int s = 0; s < d_state; s++)
-        A[s] = -ptx_expf(static_cast<float>(A_log[j * d_state + s]));
+        A[s] = -ptx_expf(to_float(A_log[j * d_state + s]));
 
     // Checkpoint buffer: h state at segment boundaries.
     // h_ckpt[seg] = hidden state BEFORE timestep (seg * BW_CKPT_STRIDE).
@@ -363,12 +376,12 @@ scan_backward_kernel(
     }
 
     for (int t = 0; t < seq_len; t++) {
-        float xv  = static_cast<float>(x[(bN + t) * d_inner + j]);
-        float dtv = static_cast<float>(dt[(bN + t) * d_inner + j]);
+        float xv  = to_float(x[(bN + t) * d_inner + j]);
+        float dtv = to_float(dt[(bN + t) * d_inner + j]);
         #pragma unroll 4
         for (int s = 0; s < d_state; s++) {
             float A_bar = ptx_expf(A[s] * dtv);
-            float B_bar = dtv * static_cast<float>(B[(bN + t) * d_state + s]);
+            float B_bar = dtv * to_float(B[(bN + t) * d_state + s]);
             h_run[s] = A_bar * h_run[s] + B_bar * xv;
         }
         if ((t + 1) % BW_CKPT_STRIDE == 0) {
@@ -398,12 +411,12 @@ scan_backward_kernel(
         // Recompute forward through segment to fill h_seg[1..seg_len]
         for (int i = 0; i < seg_len; i++) {
             int t = seg_start + i;
-            float xv  = static_cast<float>(x[(bN + t) * d_inner + j]);
-            float dtv = static_cast<float>(dt[(bN + t) * d_inner + j]);
+            float xv  = to_float(x[(bN + t) * d_inner + j]);
+            float dtv = to_float(dt[(bN + t) * d_inner + j]);
             #pragma unroll 4
             for (int s = 0; s < d_state; s++) {
                 float A_bar = ptx_expf(A[s] * dtv);
-                float B_bar = dtv * static_cast<float>(B[(bN + t) * d_state + s]);
+                float B_bar = dtv * to_float(B[(bN + t) * d_state + s]);
                 h_seg[(i + 1) * d_state + s] = A_bar * h_seg[i * d_state + s] + B_bar * xv;
             }
         }
@@ -411,9 +424,9 @@ scan_backward_kernel(
         // Backward through segment (reverse)
         for (int i = seg_len - 1; i >= 0; i--) {
             int t = seg_start + i;
-            float xv   = static_cast<float>(x[(bN + t) * d_inner + j]);
-            float dtv  = static_cast<float>(dt[(bN + t) * d_inner + j]);
-            float gy   = static_cast<float>(grad_y[(bN + t) * d_inner + j]);
+            float xv   = to_float(x[(bN + t) * d_inner + j]);
+            float dtv  = to_float(dt[(bN + t) * d_inner + j]);
+            float gy   = to_float(grad_y[(bN + t) * d_inner + j]);
 
             float grad_x_acc  = 0.0f;
             float grad_dt_acc = 0.0f;
@@ -421,22 +434,22 @@ scan_backward_kernel(
             #pragma unroll 4
             for (int s = 0; s < d_state; s++) {
                 float A_bar = ptx_expf(A[s] * dtv);
-                float bv    = static_cast<float>(B[(bN + t) * d_state + s]);
-                float cv    = static_cast<float>(C[(bN + t) * d_state + s]);
+                float bv    = to_float(B[(bN + t) * d_state + s]);
+                float cv    = to_float(C[(bN + t) * d_state + s]);
                 float h_t   = h_seg[(i + 1) * d_state + s];
                 float h_tm1 = h_seg[i * d_state + s];
 
-                grad_C[(bN + t) * d_state + s] = static_cast<ActT>(h_t * gy);
+                grad_C[(bN + t) * d_state + s] = from_float<ActT>(h_t * gy);
                 grad_h[s] += cv * gy;
-                grad_B[(bN + t) * d_state + s] = static_cast<ActT>(dtv * xv * grad_h[s]);
+                grad_B[(bN + t) * d_state + s] = from_float<ActT>(dtv * xv * grad_h[s]);
                 grad_x_acc += bv * dtv * grad_h[s];
                 grad_dt_acc += (A[s] * A_bar * h_tm1 + bv * xv) * grad_h[s];
                 grad_A_acc[s] += dtv * A[s] * A_bar * h_tm1 * grad_h[s];
                 grad_h[s] = A_bar * grad_h[s];
             }
 
-            grad_x[(bN + t) * d_inner + j]  = static_cast<ActT>(grad_x_acc);
-            grad_dt[(bN + t) * d_inner + j] = static_cast<ActT>(grad_dt_acc);
+            grad_x[(bN + t) * d_inner + j]  = from_float<ActT>(grad_x_acc);
+            grad_dt[(bN + t) * d_inner + j] = from_float<ActT>(grad_dt_acc);
         }
     }
 

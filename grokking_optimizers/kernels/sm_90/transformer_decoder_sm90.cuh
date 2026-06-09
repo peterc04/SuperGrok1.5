@@ -285,19 +285,16 @@ template <typename T>
 __host__ __device__ __forceinline__ float to_float(T x) { return static_cast<float>(x); }
 template <>
 __host__ __device__ __forceinline__ float to_float<__nv_bfloat16>(__nv_bfloat16 x) {
-#ifdef __CUDA_ARCH__
+    // __bfloat162float / __half2float are __host__ __device__ and remain
+    // available under torch's -D__CUDA_NO_BFLOAT16_CONVERSIONS__ /
+    // -D__CUDA_NO_HALF_CONVERSIONS__ (which strip the operator float() that a
+    // bare static_cast<float> would need on the host pass). Use the intrinsics
+    // unconditionally so the host and device branches stay bit-identical.
     return __bfloat162float(x);
-#else
-    return static_cast<float>(x);
-#endif
 }
 template <>
 __host__ __device__ __forceinline__ float to_float<__half>(__half x) {
-#ifdef __CUDA_ARCH__
     return __half2float(x);
-#else
-    return static_cast<float>(x);
-#endif
 }
 template <typename T>
 __device__ __forceinline__ T from_float(float x) { return static_cast<T>(x); }

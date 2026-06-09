@@ -139,8 +139,8 @@ looksam_apply_kernel_vec4_fp32(
 }
 
 void launch_looksam_perturb(
-    torch::Tensor& param, torch::Tensor& backup,
-    const torch::Tensor& grad, float scale
+    torch::Tensor param, torch::Tensor backup,
+    torch::Tensor grad, float scale
 ) {
     const int64_t N = param.numel();
     if (N == 0) return;
@@ -164,7 +164,7 @@ void launch_looksam_perturb(
 }
 
 void launch_looksam_restore(
-    torch::Tensor& param, const torch::Tensor& backup
+    torch::Tensor param, torch::Tensor backup
 ) {
     const int64_t N = param.numel();
     if (N == 0) return;

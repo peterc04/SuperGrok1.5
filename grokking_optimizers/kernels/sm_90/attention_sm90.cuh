@@ -91,6 +91,19 @@ __device__ __forceinline__ float ptx_expf(float x) { return expf(x); }
 
 namespace sg { namespace sm90 { namespace models { namespace attention {
 
+// ── Dtype cast helpers (intrinsic-based) ────────────────────────────────
+// static_cast between {__half,__nv_bfloat16} and float is rejected under
+// torch's -D__CUDA_NO_HALF_CONVERSIONS__ / -D__CUDA_NO_BFLOAT16_CONVERSIONS__
+// (CUDAExtension default — strips operator float()/the float ctor). Route
+// half/bf16<->float through the always-available conversion intrinsics; the
+// generic templates leave float/int casts unchanged.
+template <typename T> __device__ __forceinline__ float to_float(T v) { return static_cast<float>(v); }
+template <> __device__ __forceinline__ float to_float<__half>(__half v) { return __half2float(v); }
+template <> __device__ __forceinline__ float to_float<__nv_bfloat16>(__nv_bfloat16 v) { return __bfloat162float(v); }
+template <typename T> __device__ __forceinline__ T from_float(float v) { return static_cast<T>(v); }
+template <> __device__ __forceinline__ __half from_float<__half>(float v) { return __float2half(v); }
+template <> __device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(float v) { return __float2bfloat16(v); }
+
 // ── Launch configuration descriptor ────────────────────────────────────
 template <typename ActT, int kHeadDim, bool kCausal>
 struct AttentionLaunchConfig {
@@ -156,8 +169,8 @@ smem_attention_fwd_kernel(
         }
         float dot = 0.0f;
         for (int d = 0; d < D; d++) {
-            dot += static_cast<float>(q[base + i * D + d])
-                 * static_cast<float>(k[base + j * D + d]);
+            dot += to_float(q[base + i * D + d])
+                 * to_float(k[base + j * D + d]);
         }
         scores[idx] = dot * scale;
     }
@@ -188,9 +201,9 @@ smem_attention_fwd_kernel(
         int d = idx % D;
         float acc = 0.0f;
         for (int j = 0; j < N; j++) {
-            acc += scores[i * N + j] * static_cast<float>(v[base + j * D + d]);
+            acc += scores[i * N + j] * to_float(v[base + j * D + d]);
         }
-        out[base + idx] = static_cast<ActT>(acc);
+        out[base + idx] = from_float<ActT>(acc);
     }
 }
 
@@ -457,7 +470,7 @@ __global__ void fmha_softmax_kernel(
     float inv = 1.0f / fmaxf(row_sum, 1e-12f);
 
     for (int j = tid; j < N; j += blockDim.x)
-        P[i * N + j] = static_cast<ActT>(sh[j] * inv);
+        P[i * N + j] = from_float<ActT>(sh[j] * inv);
     if (lse != nullptr && tid == 0)
         lse[i] = row_max + logf(fmaxf(row_sum, 1e-12f));
 }
@@ -467,7 +480,7 @@ template <typename ActT>
 __global__ void fmha_cast_kernel(const float* __restrict__ src,
                                  ActT* __restrict__ dst, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) dst[idx] = static_cast<ActT>(src[idx]);
+    if (idx < n) dst[idx] = from_float<ActT>(src[idx]);
 }
 
 template <typename ActT, int kHeadDim, bool kCausal>
@@ -618,8 +631,8 @@ smem_attention_bwd_kernel(
         }
         float dot = 0.0f;
         for (int d = 0; d < D; d++)
-            dot += static_cast<float>(q[base + i * D + d])
-                 * static_cast<float>(k[base + j * D + d]);
+            dot += to_float(q[base + i * D + d])
+                 * to_float(k[base + j * D + d]);
         float lse = softmax_lse[static_cast<int64_t>(bh) * N + i];
         scores[idx] = ptx_expf(dot * scale - lse);
     }
@@ -630,8 +643,8 @@ smem_attention_bwd_kernel(
         int j = idx / D, d = idx % D;
         float acc = 0.0f;
         for (int i = 0; i < N; i++) acc += scores[i * N + j]
-            * static_cast<float>(grad_out[base + i * D + d]);
-        grad_v[base + idx] = static_cast<ActT>(acc);
+            * to_float(grad_out[base + i * D + d]);
+        grad_v[base + idx] = from_float<ActT>(acc);
     }
     __syncthreads();
 
@@ -640,8 +653,8 @@ smem_attention_bwd_kernel(
         int i = idx / N, j = idx % N;
         float acc = 0.0f;
         for (int d = 0; d < D; d++)
-            acc += static_cast<float>(grad_out[base + i * D + d])
-                 * static_cast<float>(v[base + j * D + d]);
+            acc += to_float(grad_out[base + i * D + d])
+                 * to_float(v[base + j * D + d]);
         dA[idx] = acc;
     }
     __syncthreads();
@@ -663,8 +676,8 @@ smem_attention_bwd_kernel(
         int i = idx / D, d = idx % D;
         float acc = 0.0f;
         for (int j = 0; j < N; j++)
-            acc += dA[i * N + j] * static_cast<float>(k[base + j * D + d]);
-        grad_q[base + idx] = static_cast<ActT>(acc);
+            acc += dA[i * N + j] * to_float(k[base + j * D + d]);
+        grad_q[base + idx] = from_float<ActT>(acc);
     }
 
     // dK = dS^T Q
@@ -672,8 +685,8 @@ smem_attention_bwd_kernel(
         int j = idx / D, d = idx % D;
         float acc = 0.0f;
         for (int i = 0; i < N; i++)
-            acc += dA[i * N + j] * static_cast<float>(q[base + i * D + d]);
-        grad_k[base + idx] = static_cast<ActT>(acc);
+            acc += dA[i * N + j] * to_float(q[base + i * D + d]);
+        grad_k[base + idx] = from_float<ActT>(acc);
     }
 }
 

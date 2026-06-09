@@ -35,13 +35,36 @@ namespace gfx942 {}
 
 } // namespace sg
 
+// ── Backend-gated dispatch case fragments ────────────────────────────
+// A CUDA build links ONLY sg::sm90 symbols; a HIP build ONLY sg::gfx942. A
+// `case` that calls the other arch's namespace is an undefined symbol that
+// makes the .so fail to load (e.g. sg::gfx942::moe_filter_active_params in a
+// CUDA-only build — the gfx942 .hip TUs are never compiled by nvcc). Gate each
+// case by its backend macro, mirroring dispatch.cpp's WITH_CUDA/WITH_HIP split,
+// so the Python front-end binds exactly the backend that was compiled in.
+// (WITH_HIP wins if both are somehow defined, matching dispatch.cpp.)
+#if defined(WITH_CUDA) && !defined(WITH_HIP)
+#  define SG_CASE_SM90_RET(METHOD, ...)  case 90:  return ::sg::sm90::METHOD(__VA_ARGS__);
+#  define SG_CASE_SM90_CALL(METHOD, ...) case 90:  ::sg::sm90::METHOD(__VA_ARGS__); break;
+#else
+#  define SG_CASE_SM90_RET(METHOD, ...)
+#  define SG_CASE_SM90_CALL(METHOD, ...)
+#endif
+#if defined(WITH_HIP)
+#  define SG_CASE_GFX942_RET(METHOD, ...)  case 942: return ::sg::gfx942::METHOD(__VA_ARGS__);
+#  define SG_CASE_GFX942_CALL(METHOD, ...) case 942: ::sg::gfx942::METHOD(__VA_ARGS__); break;
+#else
+#  define SG_CASE_GFX942_RET(METHOD, ...)
+#  define SG_CASE_GFX942_CALL(METHOD, ...)
+#endif
+
 // ── Dispatch macro: returns from enclosing function ──────────────────
 #define SG_DISPATCH(METHOD, ...) \
     do { \
         const int sg_arch_ = ::sg::detect_arch(); \
         switch (sg_arch_) { \
-            case 90:  return ::sg::sm90::METHOD(__VA_ARGS__); \
-            case 942: return ::sg::gfx942::METHOD(__VA_ARGS__); \
+            SG_CASE_SM90_RET(METHOD, __VA_ARGS__) \
+            SG_CASE_GFX942_RET(METHOD, __VA_ARGS__) \
             default: \
                 throw std::runtime_error( \
                     std::string(#METHOD) + " dispatch: unsupported arch " + \
@@ -54,8 +77,8 @@ namespace gfx942 {}
     do { \
         const int sg_arch_ = ::sg::detect_arch(); \
         switch (sg_arch_) { \
-            case 90:  ::sg::sm90::METHOD(__VA_ARGS__); break; \
-            case 942: ::sg::gfx942::METHOD(__VA_ARGS__); break; \
+            SG_CASE_SM90_CALL(METHOD, __VA_ARGS__) \
+            SG_CASE_GFX942_CALL(METHOD, __VA_ARGS__) \
             default: \
                 throw std::runtime_error( \
                     std::string(#METHOD) + " dispatch: unsupported arch " + \

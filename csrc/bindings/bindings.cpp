@@ -118,8 +118,8 @@ DECLARE_MT_GROKADAMW(gfx942)
  do { \
  const int a = sg::detect_arch(); \
  switch (a) { \
- case 90: return sg::sm90::METHOD(__VA_ARGS__); \
- case 942: return sg::gfx942::METHOD(__VA_ARGS__); \
+ SG_CASE_SM90_RET(METHOD, __VA_ARGS__) \
+ SG_CASE_GFX942_RET(METHOD, __VA_ARGS__) \
  default: \
  throw std::runtime_error( \
  "GrokAdamW dispatch: unsupported arch " + \
@@ -808,9 +808,15 @@ void multi_tensor_grokadamw(
  float alpha, float lamb, float beta1, float beta2,
  float lr, float weight_decay, float eps, float bc1, float bc2)
 {
+ // Broadcast the scalar bias-corrections into the per-tensor vectors the real
+ // launcher takes (DECLARE_MT_GROKADAMW signature, defined in
+ // kernels/<arch>/grokadamw_*): every param steps together here, so bc is
+ // uniform. The scalar-bc DECLARE_MT overload above is defined by no backend.
+ std::vector<float> bc1s(params.size(), bc1);
+ std::vector<float> bc2s(params.size(), bc2);
  SG_DISPATCH(launch_multi_tensor_grokadamw,
  params, exp_avgs, exp_avg_sqs, emas, grads,
- alpha, lamb, beta1, beta2, lr, weight_decay, eps, bc1, bc2);
+ bc1s, bc2s, alpha, lamb, beta1, beta2, lr, weight_decay, eps);
 }
 
 void multi_tensor_lion(
@@ -1264,10 +1270,8 @@ static float dispatch_cosine_gate(
 {
  const int sg_arch_ = ::sg::detect_arch();
  switch (sg_arch_) {
-
- case 90: return ::sg::sm90::compute_cosine_gate_fused(smart_grad, mu, gate_temp);
-
- case 942: return ::sg::gfx942::compute_cosine_gate_fused(smart_grad, mu, gate_temp);
+ SG_CASE_SM90_RET(compute_cosine_gate_fused, smart_grad, mu, gate_temp)
+ SG_CASE_GFX942_RET(compute_cosine_gate_fused, smart_grad, mu, gate_temp)
  default:
  throw std::runtime_error(
  "compute_cosine_gate_fused: unsupported arch " +
@@ -2564,6 +2568,7 @@ cudaError_t do_forward(
  patch_size, d_model, n_heads, d_head,
  n_layers, n_classes, ffn_expansion, stream);
  }
+#if defined(WITH_HIP)
  if (a == 942) {
  return sg::gfx942::models::vit::forward<ActT, ActT>(
  static_cast<const ActT*>(input),
@@ -2574,6 +2579,7 @@ cudaError_t do_forward(
  patch_size, d_model, n_heads, d_head,
  n_layers, n_classes, ffn_expansion, stream);
  }
+#endif
  throw std::runtime_error("vit_forward: unsupported arch " + std::to_string(a));
 }
 
@@ -2598,6 +2604,7 @@ cudaError_t do_backward(
  patch_size, d_model, n_heads, d_head,
  n_layers, n_classes, ffn_expansion, stream);
  }
+#if defined(WITH_HIP)
  if (a == 942) {
  return sg::gfx942::models::vit::backward<ActT, ActT>(
  static_cast<const ActT*>(grad_output),
@@ -2609,6 +2616,7 @@ cudaError_t do_backward(
  patch_size, d_model, n_heads, d_head,
  n_layers, n_classes, ffn_expansion, stream);
  }
+#endif
  throw std::runtime_error("vit_backward: unsupported arch " + std::to_string(a));
 }
 
@@ -2828,7 +2836,8 @@ namespace sg { namespace sm90 { namespace models { namespace mamba {
  template <typename T>
  cudaError_t forward(const T*, const T*, T*, T*,
  int batch, int seq_len, int d_model, int d_state,
- int d_conv, int expand, int n_layers, cudaStream_t);
+ int d_conv, int expand, int n_layers, cudaStream_t,
+ T* activation_cache = nullptr);
  template <typename T>
  cudaError_t backward(const T*, const T*, const T*,
  T*, T*,
@@ -2925,7 +2934,9 @@ void mamba_forward(
  tptr<scalar_t>(states),
  batch, seq_len, d_model, d_state,
  d_conv, expand, n_layers, stream);
- } else if (sg_arch == 942) {
+ }
+#if defined(WITH_HIP)
+ else if (sg_arch == 942) {
  err = ::sg::gfx942::models::mamba::forward<scalar_t>(
  reinterpret_cast<const scalar_t*>(input.data_ptr()),
  ctptr<scalar_t>(weights),
@@ -2933,7 +2944,9 @@ void mamba_forward(
  tptr<scalar_t>(states),
  batch, seq_len, d_model, d_state,
  d_conv, expand, n_layers, stream);
- } else {
+ }
+#endif
+ else {
  TORCH_CHECK(false, "mamba_forward: unsupported arch ", sg_arch);
  }
  check_cuda(err, "forward");
@@ -2975,7 +2988,9 @@ void mamba_backward(
  tptr<scalar_t>(grad_weights),
  batch, seq_len, d_model, d_state,
  d_conv, expand, n_layers, stream);
- } else if (sg_arch == 942) {
+ }
+#if defined(WITH_HIP)
+ else if (sg_arch == 942) {
  err = ::sg::gfx942::models::mamba::backward<scalar_t>(
  ctptr<scalar_t>(grad_output),
  ctptr<scalar_t>(states_saved),
@@ -2984,7 +2999,9 @@ void mamba_backward(
  tptr<scalar_t>(grad_weights),
  batch, seq_len, d_model, d_state,
  d_conv, expand, n_layers, stream);
- } else {
+ }
+#endif
+ else {
  TORCH_CHECK(false, "mamba_backward: unsupported arch ", sg_arch);
  }
  check_cuda(err, "backward");
@@ -3038,13 +3055,17 @@ void mamba_selective_scan_forward(
  ctptr<scalar_t>(A), ctptr<scalar_t>(B),
  tptr<scalar_t>(out), tptr<scalar_t>(state),
  batch, seq_len, d_state, stream);
- } else if (sg_arch == 942) {
+ }
+#if defined(WITH_HIP)
+ else if (sg_arch == 942) {
  err = ::sg::gfx942::models::mamba::selective_scan_fwd<scalar_t>(
  ctptr<scalar_t>(u), ctptr<scalar_t>(delta),
  ctptr<scalar_t>(A), ctptr<scalar_t>(B),
  tptr<scalar_t>(out), tptr<scalar_t>(state),
  batch, seq_len, d_state, stream);
- } else {
+ }
+#endif
+ else {
  TORCH_CHECK(false,
  "mamba_selective_scan_forward: unsupported arch ", sg_arch);
  }
@@ -3090,7 +3111,9 @@ void mamba_selective_scan_backward(
  tptr<scalar_t>(grad_u), tptr<scalar_t>(grad_delta),
  tptr<scalar_t>(grad_A), tptr<scalar_t>(grad_B),
  batch, seq_len, d_state, stream);
- } else if (sg_arch == 942) {
+ }
+#if defined(WITH_HIP)
+ else if (sg_arch == 942) {
  err = ::sg::gfx942::models::mamba::selective_scan_bwd<scalar_t>(
  ctptr<scalar_t>(grad_out),
  ctptr<scalar_t>(u), ctptr<scalar_t>(delta),
@@ -3099,7 +3122,9 @@ void mamba_selective_scan_backward(
  tptr<scalar_t>(grad_u), tptr<scalar_t>(grad_delta),
  tptr<scalar_t>(grad_A), tptr<scalar_t>(grad_B),
  batch, seq_len, d_state, stream);
- } else {
+ }
+#endif
+ else {
  TORCH_CHECK(false,
  "mamba_selective_scan_backward: unsupported arch ", sg_arch);
  }
