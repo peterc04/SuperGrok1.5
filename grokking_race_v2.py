@@ -736,6 +736,8 @@ def train_supergrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         zero_loss_threshold=c.get("supergrok_zero_loss_thresh",1e-4),
         zero_acc_threshold=c.get("supergrok_zero_acc_thresh",0.995),
         meta_hidden_dim=c.get("supergrok_meta_dim",32),
+        rescale_clamp=c.get("supergrok_rescale_clamp",None),
+        meta_gate_power=c.get("supergrok_meta_gate_power",None),
         use_grad_hooks=c.get("use_grad_hooks",False))
     opt.meta_net=opt.meta_net.to(dev)
     mopt=torch.optim.Adam(opt.meta_net.parameters(), lr=1e-4)
@@ -809,6 +811,7 @@ def train_supergrok15(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         wd_ramp=c.get("supergrok15_wd_ramp",4.0),
         wd_scale=c.get("supergrok15_wd_scale",20.0),
         wd_thresh=c.get("supergrok15_wd_thresh",0.9),
+        meta_gate_power=c.get("supergrok15_meta_gate_power",None),
         use_grad_hooks=c.get("use_grad_hooks",False))
     opt.meta_net=opt.meta_net.to(dev)
     mopt=torch.optim.Adam(opt.meta_net.parameters(), lr=1e-4)
@@ -1738,12 +1741,14 @@ if __name__ == "__main__":
                        "supergrok_warmup_ramp": 100, "supergrok_grad_clip": 1.0,
                        "supergrok_meta_dim": 32, "supergrok_gate_temp": 5.0,
                        "supergrok_alpha_update_freq": 50, "supergrok_meta_update_freq": 5,
-                       "supergrok_zero_loss_thresh": 1e-4, "supergrok_zero_acc_thresh": 0.995},
+                       "supergrok_zero_loss_thresh": 1e-4, "supergrok_zero_acc_thresh": 0.995,
+                       "supergrok_meta_gate_power": 1.0},
         "supergrok15":{"weight_decay": 1.0, "supergrok15_alpha": 0.98, "supergrok15_lamb": 2.0,
                        "supergrok15_gamma": 0.1, "supergrok15_kappa": 0.1, "supergrok15_warmup": 100,
                        "supergrok15_warmup_ramp": 100, "supergrok15_grad_clip": 1.0,
                        "supergrok15_meta_dim": 32, "supergrok15_alpha_update_freq": 50,
                        "supergrok15_zero_loss_thresh": 1e-4, "supergrok15_zero_acc_thresh": 0.995,
+                       "supergrok15_meta_gate_power": 1.0,
                        "supergrok15_sam_rho": 0.05,
                        "supergrok15_gate_scale": 20.0, "supergrok15_gate_thresh": 0.8,
                        "supergrok15_sam_freq_min": 3, "supergrok15_sam_freq_max": 20,

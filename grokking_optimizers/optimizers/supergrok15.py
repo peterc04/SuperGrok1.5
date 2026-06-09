@@ -127,6 +127,7 @@ class SuperGrok15(Optimizer):
         wd_scale: float = 20.0,
         wd_thresh: float = 0.9,
         sam_enable_threshold: float = 0.0,
+        meta_gate_power: Optional[float] = None,
         use_grad_hooks: bool = False,
         grad_checkpoint: bool = True,
     ):
@@ -146,6 +147,13 @@ class SuperGrok15(Optimizer):
         self.zero_loss_threshold = zero_loss_threshold
         self.zero_acc_threshold = zero_acc_threshold
         self.sam_rho = sam_rho
+        # Memorization-gated meta correction (same fix as SuperGrok11): scale the
+        # meta-mixing α by a MONOTONIC ratchet (1 − max_train_acc)^p so the
+        # val-aligned bilevel push vanishes once the model memorizes and never
+        # re-enables on a transient dip — preventing the post-memorization
+        # collapse. None = off (legacy). Set via `supergrok15_meta_gate_power`.
+        self.meta_gate_power = meta_gate_power
+        self._max_train_acc = 0.0
         self.meta_hidden_dim = meta_hidden_dim
 
         self.gate_scale = gate_scale
@@ -321,6 +329,14 @@ class SuperGrok15(Optimizer):
         for i, p in enumerate(self._flat_params):
             if p.grad is not None and p.grad.numel() > 0:
                 self._flat_steps[i] += 1
+
+        # Memorization-gated meta correction (monotonic ratchet) — same fix as
+        # SuperGrok11. Scale α by (1 − max_train_acc)^p so the val-aligned bilevel
+        # push vanishes as the model memorizes and never re-enables on a dip.
+        if self.meta_gate_power is not None:
+            self._max_train_acc = max(self._max_train_acc, self._cached_train_acc)
+            gate = max(0.0, 1.0 - self._max_train_acc) ** self.meta_gate_power
+            layer_alphas = [a * gate for a in layer_alphas]
 
         if self._weights_dirty:
             self._cached_weights = self.meta_net.get_weights()

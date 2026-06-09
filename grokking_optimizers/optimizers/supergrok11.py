@@ -106,6 +106,8 @@ class SuperGrok11(Optimizer):
         zero_acc_threshold: float = 0.995,
         sam_rho: float = 0.05,
         sam_enable_threshold: float = 0.0,
+        rescale_clamp: Optional[float] = None,
+        meta_gate_power: Optional[float] = None,
         use_grad_hooks: bool = False,
         grad_checkpoint: bool = True,
     ):
@@ -128,6 +130,27 @@ class SuperGrok11(Optimizer):
         self.zero_loss_threshold = zero_loss_threshold
         self.zero_acc_threshold = zero_acc_threshold
         self.sam_rho = sam_rho
+        # Bound the learned meta-net output scale. The meta-loss
+        # (−Σ smart_grad·vg_unit) is linear in `rescale` with no magnitude
+        # penalty, so Adam grows it without bound until the correction
+        # rescale·MLP(grad,sharpness) buries the real gradient and training
+        # collapses (~step 900). Clamping rescale after each meta_step keeps the
+        # correction a bounded *steer* on the update instead of a runaway term.
+        # None = unbounded (legacy). Set via `supergrok_rescale_clamp`.
+        self.rescale_clamp = rescale_clamp
+        # Memorization-gated meta correction. The collapse is NOT a magnitude
+        # runaway — it's that the val-aligned meta push is *applied at all* after
+        # the model memorizes, walking it off the memorized minimum (verified:
+        # with the meta weight α≈0 training is stable; re-enabling α once
+        # memorized collapses it). The natural signal is train PROGRESS, not
+        # ‖grad‖ (which is pinned at gradient_clipping). The legacy reactive
+        # alpha schedule oscillates (a train dip snaps α back up → re-collapse),
+        # so we gate by a MONOTONIC ratchet: scale α by (1 − max_train_acc)^p.
+        # Once the model memorizes the meta contribution ratchets to ~0 and stays
+        # there → SG reduces to its (grokking) AdamW core through the plateau.
+        # None = off (legacy). Set via `supergrok_meta_gate_power`.
+        self.meta_gate_power = meta_gate_power
+        self._max_train_acc = 0.0
 
         if meta_net is None:
             self.meta_net = SharpnessMetaNet(meta_hidden_dim,
@@ -258,6 +281,15 @@ class SuperGrok11(Optimizer):
         for i, p in enumerate(self._flat_params):
             if p.grad is not None and p.grad.numel() > 0:
                 self._flat_steps[i] += 1
+
+        # Memorization-gated meta correction (monotonic ratchet). Scale α by
+        # (1 − max_train_acc)^p so the val-aligned meta push vanishes as the model
+        # memorizes and — unlike the reactive alpha schedule — never re-enables on
+        # a transient train dip. See __init__ for the why.
+        if self.meta_gate_power is not None:
+            self._max_train_acc = max(self._max_train_acc, self._cached_train_acc)
+            gate = max(0.0, 1.0 - self._max_train_acc) ** self.meta_gate_power
+            layer_alphas = [a * gate for a in layer_alphas]
 
         if self._weights_dirty:
             self._cached_weights = self.meta_net.get_weights()
@@ -393,6 +425,8 @@ class SuperGrok11(Optimizer):
 
         meta_loss.backward()
         meta_optimizer.step()
+        if self.rescale_clamp is not None:
+            self.meta_net.rescale.data.clamp_(-self.rescale_clamp, self.rescale_clamp)
         self._weights_dirty = True
 
         for name, p in named_params:
