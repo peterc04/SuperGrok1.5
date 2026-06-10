@@ -135,6 +135,7 @@ import json
 import os
 import platform
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -1340,19 +1341,85 @@ def _is_dead_dim(spec: Dict[str, Any]) -> bool:
     return spec.get("name") not in _LIVE_TUNING_DIMS
 
 
-# Dim names dropped from ``config_key`` so binary-identical configs collapse to
-# one cache entry. This is the union of dead-macro dim names across all
-# CUDA/HIP builders. ``num_stages`` is deliberately EXCLUDED here: it is a dead
-# device macro on CUDA/HIP (handled by pinning, below) but is ALSO a genuine,
-# live ``pl.pallas_call`` kwarg on Pallas archs — dropping it from the key
-# unconditionally would alias two distinct Pallas configs. Pinning the CUDA/HIP
-# num_stages dim already collapses those, so it need not appear here.
-_DEAD_KEY_DIMS: frozenset = frozenset({
-    "swizzle", "tma", "tma_descriptors", "wgmma_shape", "warp_specialization",
-    "fp8_layout", "fp4_layout", "tcgen05_variant", "lds_padding",
-    "waves_per_eu", "mfma_shape", "fp8_mfma_layout", "fp4_mfma_layout",
-    "scheduler_hint", "wmma_shape", "dpp_modifier", "tgsplit",
-})
+# Review fix P0.3 (revive bug) — config_key used to drop a STATIC frozenset of
+# dim names. That set listed wgmma_shape / warp_specialization unconditionally,
+# so the moment a kernel STARTED consuming SG_TUNED_WGMMA_SHAPE (the whole point
+# of the wgmma program) two genuinely-distinct binaries would still alias to one
+# config_key → false cache HIT → the new tuned variant never built. The
+# exclusion set is now DERIVED from _is_dead_dim at first use (memoized): a dim
+# name is dropped from config_key iff it is dead in EVERY arch it appears in AND
+# live in NONE. This auto-revives any dim a kernel begins consuming, and keeps
+# the num_stages carve-out correct (dead device macro on CUDA/HIP but a LIVE
+# pl.pallas_call kwarg on Pallas → live somewhere → NOT excluded, so two distinct
+# Pallas configs never alias).
+_DEAD_KEY_DIMS_CACHE: Optional[frozenset] = None
+
+# P0.2 — back-compat dim→macro fallback for _write_tuned_configs_header when the
+# live search space cannot be loaded. Widened from the SAFE-4 to the full union
+# of macro-carrying dim names across all CUDA/HIP builders, so a failed load
+# still emits every macro the JSON export persists (not just block/vec/unroll/
+# async_depth). maxrregcount is a ptxas flag (no -D macro) and is excluded.
+# Kept in lockstep with the _dim(...) macro arguments in the Stream-2 builders.
+_DERIVED_HEADER_BACKCOMPAT: Dict[str, str] = {
+    "block":               "SG_TUNED_BLOCK_SIZE",
+    "vec":                 "SG_TUNED_VEC_WIDTH",
+    "unroll":              "SG_TUNED_UNROLL",
+    "async_depth":         "SG_TUNED_ASYNC_DEPTH",
+    "num_stages":          "SG_TUNED_NUM_STAGES",
+    "cluster_shape":       "SG_TUNED_CLUSTER_SHAPE",
+    "swizzle":             "SG_TUNED_SWIZZLE",
+    "tma":                 "SG_TUNED_TMA",
+    "tma_descriptors":     "SG_TUNED_TMA_DESCRIPTORS",
+    "wgmma_shape":         "SG_TUNED_WGMMA_SHAPE",
+    "warp_specialization": "SG_TUNED_WARP_SPECIALIZATION",
+    "fp8_layout":          "SG_TUNED_FP8_LAYOUT",
+    "fp4_layout":          "SG_TUNED_FP4_LAYOUT",
+    "tcgen05_variant":     "SG_TUNED_TCGEN05_VARIANT",
+    "lds_padding":         "SG_TUNED_LDS_PADDING",
+    "waves_per_eu":        "SG_TUNED_WAVES_PER_EU",
+    "mfma_shape":          "SG_TUNED_MFMA_SHAPE",
+    "fp8_mfma_layout":     "SG_TUNED_FP8_MFMA_LAYOUT",
+    "fp4_mfma_layout":     "SG_TUNED_FP4_MFMA_LAYOUT",
+    "scheduler_hint":      "SG_TUNED_SCHEDULER_HINT",
+    "wmma_shape":          "SG_TUNED_WMMA_SHAPE",
+    "dpp_modifier":        "SG_TUNED_DPP_MODIFIER",
+    "tgsplit":             "SG_TUNED_TGSPLIT",
+}
+
+
+def _dead_key_dims() -> frozenset:
+    """Dim names safe to drop from ``config_key`` (memoized).
+
+    Built from the full programmatic search space: a name qualifies only when
+    every dim carrying it is dead (``_is_dead_dim``) and none is live, so a dim
+    any kernel consumes (live in ≥1 arch) is KEPT in the key. ``num_stages``
+    therefore stays in the key (live Pallas kwarg) while pure dead macros like
+    ``swizzle`` are dropped. Falls back to an empty set if the space cannot be
+    built (degenerate registry) — i.e. it never aliases when unsure."""
+    global _DEAD_KEY_DIMS_CACHE
+    if _DEAD_KEY_DIMS_CACHE is not None:
+        return _DEAD_KEY_DIMS_CACHE
+    dead_everywhere: set = set()
+    live_somewhere: set = set()
+    try:
+        space = build_full_search_space()
+    except Exception:  # noqa: BLE001 — never let key-derivation crash config_key
+        space = {}
+    for _arch, block in (space or {}).items():
+        if not isinstance(block, dict):
+            continue
+        for d in block.get("dims", []) or []:
+            name = d.get("name")
+            if not name:
+                continue
+            if _is_dead_dim(d):
+                dead_everywhere.add(name)
+            else:
+                live_somewhere.add(name)
+    # Drop only names dead in every arch they appear in AND never live anywhere.
+    result = frozenset(dead_everywhere - live_somewhere)
+    _DEAD_KEY_DIMS_CACHE = result
+    return result
 
 
 def _pin_dead_dims(dims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2261,9 +2328,130 @@ def _sha256_str(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+# Review fix P0.1 (header-blind cache) — _hash_sources used to hash ONLY the
+# .cu/.cpp translation units it was handed, but the kernel BODIES live in
+# #included .cuh/.h files. Editing a header (e.g. adamw_sm90.cuh) changed the
+# emitted binary while leaving source_hash unchanged → a stale .so scored a
+# cache HIT and the edit never rebuilt. We now fold every repo-relative
+# transitive #include into source_hash via a one-pass regex walk rooted at each
+# TU. The walk result is cached per (resolved-path, mtime) so re-hashing the
+# same unchanged tree is cheap; a header edit bumps its mtime, evicts the cache
+# line, and the new content flows into the hash.
+_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*(?:"([^"]+)"|<([^>]+)>)', re.M)
+
+# Per-source include-walk cache: maps a resolved header/TU path to
+# (mtime_ns, frozenset_of_transitively_included_repo_paths). Keyed by mtime so a
+# content edit (which bumps mtime) invalidates exactly the edited file's line.
+_INCLUDE_WALK_CACHE: Dict[str, Tuple[int, frozenset]] = {}
+
+# Roots a bare ``#include "foo.cuh"`` / ``<sub/dir/foo.h>`` is resolved against,
+# in addition to the including file's own directory. Mirrors the -I list
+# _include_paths feeds nvcc (csrc/bindings + REPO_ROOT) PLUS the kernel trees so
+# repo-relative includes like "grokking_optimizers/kernels/sm_90/adamw_sm90.cuh"
+# and "csrc/algorithms/tuned_configs.h" resolve. We deliberately restrict the
+# walk to paths UNDER REPO_ROOT (third-party / system headers like <cuda.h> or
+# cutlass are toolchain-versioned and already covered by the device-flags hash),
+# so a CUDA upgrade does not thrash this content hash.
+def _include_search_roots() -> List[Path]:
+    return [
+        REPO_ROOT,
+        REPO_ROOT / "csrc",
+        REPO_ROOT / "csrc" / "bindings",
+        REPO_ROOT / "grokking_optimizers" / "kernels",
+    ]
+
+
+def _resolve_include(spec_text: str, including_dir: Path,
+                     roots: List[Path]) -> Optional[Path]:
+    """Resolve one ``#include`` target to a repo-relative file, or None.
+
+    Tries the including file's own directory first (C++ ``""`` semantics),
+    then each search root. Only paths that exist AND live under REPO_ROOT are
+    returned — anything else (system / third-party header) is skipped so the
+    walk stays repo-local."""
+    candidates = [including_dir / spec_text]
+    candidates += [r / spec_text for r in roots]
+    for cand in candidates:
+        try:
+            if not cand.is_file():
+                continue
+            resolved = cand.resolve()
+        except OSError:
+            continue
+        # Restrict to repo-relative paths (task P0.1).
+        try:
+            resolved.relative_to(REPO_ROOT.resolve())
+        except ValueError:
+            continue
+        return resolved
+    return None
+
+
+def _walk_includes_one(path: Path, roots: List[Path]) -> frozenset:
+    """Return the set of repo-relative files ``path`` transitively #includes
+    (NOT including ``path`` itself). One-pass BFS; each file's own
+    (mtime-keyed) include set is memoized so a deep header DAG is walked once
+    per edit. Cycles are handled by the visited set."""
+    try:
+        st = path.stat()
+    except OSError:
+        return frozenset()
+    key = str(path)
+    cached = _INCLUDE_WALK_CACHE.get(key)
+    if cached is not None and cached[0] == st.st_mtime_ns:
+        return cached[1]
+    # Compute the full transitive closure starting from path's direct includes.
+    visited: set = set()
+    stack: List[Path] = [path]
+    seen_start = {path.resolve()}
+    while stack:
+        cur = stack.pop()
+        try:
+            text = cur.read_text(errors="ignore")
+        except OSError:
+            continue
+        cur_dir = cur.parent
+        for m in _INCLUDE_RE.finditer(text):
+            target = m.group(1) or m.group(2)
+            if not target:
+                continue
+            dep = _resolve_include(target, cur_dir, roots)
+            if dep is None or dep in seen_start:
+                continue
+            if dep not in visited:
+                visited.add(dep)
+                stack.append(dep)
+    result = frozenset(visited)
+    _INCLUDE_WALK_CACHE[key] = (st.st_mtime_ns, result)
+    return result
+
+
+def _transitive_include_set(paths: List[Path]) -> List[Path]:
+    """Union of every repo-relative header transitively #included by ``paths``.
+
+    Returned sorted and deduplicated, EXCLUDING the input ``paths`` themselves
+    (the caller hashes those separately). Used by _hash_sources so a kernel
+    header edit invalidates the AOT/JIT freshness check."""
+    roots = _include_search_roots()
+    inputs = {p.resolve() for p in paths if str(p)}
+    acc: set = set()
+    for p in paths:
+        try:
+            if not Path(p).is_file():
+                continue
+        except OSError:
+            continue
+        acc |= _walk_includes_one(Path(p), roots)
+    # Drop any header that is itself one of the input TUs (hashed separately).
+    return sorted(h for h in acc if h not in inputs)
+
+
 def _hash_sources(paths: List[Path]) -> str:
     h = hashlib.sha256()
-    for p in sorted(paths):
+    # P0.1 — hash the TUs AND their transitive repo-relative #include closure so
+    # a kernel-body header edit busts the cache (was: TUs only → stale .so HIT).
+    all_files = list(paths) + _transitive_include_set(list(paths))
+    for p in sorted(set(all_files)):
         rel = (str(p.relative_to(REPO_ROOT))
                if str(p).startswith(str(REPO_ROOT)) else str(p))
         h.update(rel.encode("utf-8"))
@@ -2346,10 +2534,39 @@ def _validate_arch(arch: str, block: Any) -> None:
     rules = prefilter_block.get("rules", []) if prefilter_block else []
     if rules and not isinstance(rules, list):
         raise SearchSpaceError(f"{arch}.prefilter.rules must be a list")
+    dim_names = {d["name"] for d in dims
+                 if isinstance(d, dict) and isinstance(d.get("name"), str)}
     for rule in rules:
         if not isinstance(rule, dict) or "expr" not in rule:
             raise SearchSpaceError(
                 f"{arch}.prefilter.rules each entry must be a dict with 'expr'")
+        # MED.9 — fail-fast at SPACE-BUILD on a malformed rule: a syntax error,
+        # or a name that is neither a declared dim nor a safe builtin (a typo'd
+        # dim or a missing-dim reference). Pre-fix this only surfaced LATER as a
+        # silent per-config rejection in compile_feasibility_check (every config
+        # the rule touched was dropped, with no error). Catching it here turns a
+        # rule authoring mistake into a loud build error instead of a silent
+        # search-space corruption.
+        expr = rule["expr"]
+        if not isinstance(expr, str):
+            raise SearchSpaceError(
+                f"{arch}.prefilter.rules: 'expr' must be a str, got "
+                f"{type(expr).__name__}")
+        try:
+            code = compile(expr, "<prefilter>", "eval")
+        except SyntaxError as exc:
+            raise SearchSpaceError(
+                f"{arch}.prefilter rule {rule.get('name', expr)!r}: "
+                f"syntax error in expr: {exc}") from exc
+        unknown = [n for n in code.co_names
+                   if n not in dim_names and n not in _PREFILTER_SAFE_BUILTINS]
+        if unknown:
+            raise SearchSpaceError(
+                f"{arch}.prefilter rule {rule.get('name', expr)!r} references "
+                f"name(s) {unknown} that are neither a declared dim "
+                f"({sorted(dim_names)}) nor a permitted builtin "
+                f"({sorted(_PREFILTER_SAFE_BUILTINS)}). Fix the rule or add the "
+                f"dim — a missing dim would otherwise silently reject configs.")
 
 
 def _validate_dim(arch: str, dim: Any, seen: set) -> None:
@@ -2467,6 +2684,11 @@ _PREFILTER_SAFE_BUILTINS = {
     "int": int, "bool": bool, "True": True, "False": False,
 }
 
+# MED.9 — warn-once-per-rule guard so a prefilter rule that errors at SWEEP time
+# (e.g. a config whose value type the rule didn't anticipate) is surfaced loudly
+# without spamming once per config across a multi-million-config sweep.
+_PREFILTER_EVAL_ERROR_WARNED: set = set()
+
 
 def compile_feasibility_check(prefilter_spec: Dict[str, Any]
                               ) -> Callable[[Dict[str, Any]], bool]:
@@ -2477,22 +2699,41 @@ def compile_feasibility_check(prefilter_spec: Dict[str, Any]
     full programmatic search space (billions of candidates), enumerating
     survivors up-front is infeasible — but checking one TPE-sampled
     cfg against the rules is cheap.
+
+    Review fix MED.9 — sweep-time eval errors are now PASS-THROUGH (the rule is
+    treated as satisfied) plus a loud warn-once, NOT a silent rejection. The
+    pre-fix ``return False`` silently ELIMINATED every config a buggy/edge-case
+    rule touched, hiding both real misconfigurations and legitimate configs.
+    Naming/missing-dim and syntax errors are caught earlier at space-build
+    (``_validate_arch``); a residual runtime error here (e.g. an unanticipated
+    value type) must not silently shrink the search space.
     """
     rules: List[Dict[str, Any]] = (prefilter_spec or {}).get("rules", []) or []
-    compiled = [compile(r["expr"], "<prefilter>", "eval") for r in rules]
+    compiled = [(r.get("name") or r["expr"], compile(r["expr"], "<prefilter>",
+                                                     "eval")) for r in rules]
 
     def check(cfg: Dict[str, Any]) -> bool:
         if not compiled:
             return True
-        for code in compiled:
+        for rname, code in compiled:
             try:
                 env = dict(cfg)
                 env["__builtins__"] = _PREFILTER_SAFE_BUILTINS
                 if not bool(eval(code, env, env)):  # noqa: S307 — sandboxed
                     return False
             except Exception as _swexc:
+                # MED.9 — pass-through + loud once (do NOT silently reject).
+                if rname not in _PREFILTER_EVAL_ERROR_WARNED:
+                    _PREFILTER_EVAL_ERROR_WARNED.add(rname)
+                    sys.stderr.write(
+                        f"  [prefilter] WARNING: rule {rname!r} raised at sweep "
+                        f"time ({type(_swexc).__name__}: {_swexc}); treating the "
+                        f"config as FEASIBLE for this rule (pass-through) rather "
+                        f"than silently rejecting it. Fix the rule if this is "
+                        f"unexpected — configs are NOT being dropped on its "
+                        f"account.\n")
                 _debug_swallow('check', _swexc)
-                return False
+                continue  # pass-through: this rule does not veto the config
         return True
     return check
 
@@ -2661,14 +2902,16 @@ def hash_space(space: Dict[str, Any], arch: str) -> str:
 def config_key(config: Dict[str, Any]) -> str:
     """Compact, deterministic key — used as cache.variant_artifacts subkey.
 
-    Dead tuning dims (``_DEAD_KEY_DIMS`` — macros no kernel consumes) are
-    EXCLUDED so two configs that differ only in a dead dim hash to the SAME
-    key and therefore collapse to one cache entry / one compile. This fixes
-    the false-cache-miss → full-recompile path the dead macros used to cause.
+    Dead tuning dims (see :func:`_dead_key_dims` — macros NO kernel consumes in
+    ANY arch) are EXCLUDED so two configs that differ only in a dead dim hash to
+    the SAME key and collapse to one cache entry / one compile. P0.3: the
+    exclusion set is now DERIVED from _is_dead_dim, so a dim a kernel begins
+    consuming is automatically KEPT in the key (no static-list revive bug).
     """
+    excluded = _dead_key_dims()
     parts = []
     for k in sorted(config.keys()):
-        if k in _DEAD_KEY_DIMS:
+        if k in excluded:
             continue
         parts.append(f"{k}={_format_value(config[k])}")
     return "_".join(parts)
@@ -2835,12 +3078,18 @@ def collect_workload(
 # pgo_workload — default PGO workload (absorbed from scripts/pgo_workload.py)
 # ===========================================================================
 
-def _pgo_workload_main() -> int:
+def _pgo_workload_main(argv: Optional[List[str]] = None) -> int:
     """Default PGO workload entry point (was scripts/pgo_workload.py).
 
     Stream A: ``--python-package`` overrides the default
     ``grokking_optimizers`` import target so a third-party project that
     re-uses compile.py's PGO loop can point at its own package.
+
+    Review fix HIGH.5: accepts an explicit ``argv`` so ``main()``'s early
+    ``--so`` intercept can route the collect_workload command line here in-
+    process (and so the self-test can drive the exact argv without a
+    subprocess). When ``argv is None`` it falls back to ``sys.argv`` (the
+    historical subprocess entry point).
     """
     import argparse as _ap
     parser = _ap.ArgumentParser(
@@ -2860,7 +3109,7 @@ def _pgo_workload_main() -> int:
     parser.add_argument("--python-package", default="grokking_optimizers",
                         help="Python package to import OptCls from "
                              "(default: grokking_optimizers).")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     pkg = args.python_package or "grokking_optimizers"
 
     if args.so:
@@ -3425,13 +3674,33 @@ def main():
             iters = int(req.get("iters", 21))
             l2_bytes = int(req.get("l2_bytes", 0))
             _load_so(so_path)
+            # MED.11 — tag the timing result with its provenance ("graph" when
+            # the CUDA-graph replay produced it, "event" when we fell back to
+            # plain cudaEvent timing) and surface a LOUD one-line notice to
+            # stderr on the graph→event fallback. The graph path is lower-
+            # overhead / lower-variance; a silent fallback hides a systematic
+            # change in the timing methodology that the operator should see.
             result = None
-            if use_graph and req.get("use_cuda_graph", True):
+            tried_graph = use_graph and req.get("use_cuda_graph", True)
+            if tried_graph:
                 result = _time_with_graph(opt_class, size, warmup, iters,
                                           l2_bytes)
+            timer_kind = "graph"
             if result is None:
+                if tried_graph:
+                    timer_kind = "event"
+                    sys.stderr.write(
+                        "  [timer] WARNING: CUDA-graph capture failed for "
+                        f"{opt_class}; FELL BACK to cudaEvent timing for this "
+                        "variant (higher launch-overhead / variance). Timings "
+                        'are tagged "timer":"event".\n')
+                    sys.stderr.flush()
+                else:
+                    timer_kind = "event"
                 result = _time_with_events(opt_class, size, warmup, iters,
                                            l2_bytes)
+            if isinstance(result, dict):
+                result["timer"] = timer_kind
             sys.stdout.write(json.dumps(result) + "\n")
             sys.stdout.flush()
         except Exception as exc:
@@ -3890,6 +4159,16 @@ class TimingWorker:
             "use_cuda_graph": self.use_cuda_graph,
             "l2_bytes":       self.l2_bytes,
         }
+        # MED.12 — stamp a liveness heartbeat BEFORE acquiring _io_lock. A long
+        # timing call (a multi-second graph capture + replay) holds _io_lock for
+        # its whole duration, so the watchdog's ping() blocks behind it and
+        # _last_pong_ts cannot advance from a pong. Pre-fix, _last_pong_ts only
+        # refreshed AFTER time() returned, so a single timing call longer than
+        # watchdog_grace_s could age past the grace window and the watchdog would
+        # SIGKILL a HEALTHY (merely busy) worker. Stamping here means "this
+        # worker is actively in a timing call" — the watchdog's age check sees a
+        # fresh heartbeat and does not false-positive on a slow-but-alive worker.
+        self._last_pong_ts = time.time()
         with self._io_lock:
             try:
                 assert self._proc and self._proc.stdin
@@ -5386,6 +5665,9 @@ def _make_trial_record(stage: str, trial_num: int, cfg: Dict[str, Any],
       * ``min_ms``            — minimum per-iteration timing observed.
       * ``max_ms``            — maximum per-iteration timing observed.
       * ``n``                 — number of timed iterations.
+      * ``timer``             — timing-method provenance ``"graph" | "event"``
+                                (MED.11); ``None`` when the worker reported
+                                none (older worker / non-CUDA timer path).
       * ``host``              — caller-supplied host descriptor dict
                                 (matches ``_current_host()`` shape) so
                                 the sidecar is self-describing.
@@ -5421,6 +5703,12 @@ def _make_trial_record(stage: str, trial_num: int, cfg: Dict[str, Any],
         "min_ms":      result["min_ms"]    if result else None,
         "max_ms":      result["max_ms"]    if result else None,
         "n":           result["n"]         if result else None,
+        # MED.11 — persist the timing-method provenance ("graph" | "event")
+        # so a post-hoc reader can tell which configs were timed under the
+        # lower-overhead CUDA-graph path vs the cudaEvent fallback. ``None``
+        # when the timer didn't report one (older worker / non-CUDA path).
+        "timer":       (result.get("timer") if isinstance(result, dict)
+                        else None),
         "host":        host,
         "numerical_status": num_status,
         "origin":      origin,
@@ -6482,12 +6770,33 @@ class CompileCache:
             return False
 
     def is_jit_fresh(self, opt: str, model: str, arch: str,
-                     search_space_hash: Optional[str] = None) -> bool:
+                     search_space_hash: Optional[str] = None,
+                     source_hash: Optional[str] = None,
+                     host_flags_hash: Optional[str] = None,
+                     device_flags_hash: Optional[str] = None) -> bool:
+        # Review fix MED.10 — fold the source / host-cflags / device-cflags
+        # hashes into the JIT freshness gate (mirroring is_aot_fresh). Pre-fix,
+        # is_jit_fresh keyed ONLY on search_space_hash, so an edit to a kernel
+        # header or a compiler-flag change left a JIT winner looking fresh and
+        # its tuned_config (block/vec/unroll picked for the OLD binary) was
+        # re-served for a different binary. The new args are OPTIONAL and use the
+        # same "stored value is None ⇒ legacy entry, treat as compatible"
+        # tolerance as is_aot_fresh so older cache files still hit.
         e = self.get(opt, model, arch)
         if not (e["jit_completed_at"] and e["tuned_config"]):
             return False
         if (search_space_hash is not None
                 and e.get("search_space_hash") not in (None, search_space_hash)):
+            return False
+        if (source_hash is not None
+                and e.get("jit_source_hash") not in (None, source_hash)):
+            return False
+        if (host_flags_hash is not None
+                and e.get("jit_host_cflags_hash") not in (None, host_flags_hash)):
+            return False
+        if (device_flags_hash is not None
+                and e.get("jit_device_cflags_hash")
+                not in (None, device_flags_hash)):
             return False
         return True
 
@@ -6662,6 +6971,9 @@ class CompileCache:
     def set_tuned(self, opt: str, model: str, arch: str,
                   config: dict, *, mode: Optional[str] = None,
                   search_space_hash: Optional[str] = None,
+                  source_hash: Optional[str] = None,
+                  host_flags_hash: Optional[str] = None,
+                  device_flags_hash: Optional[str] = None,
                   early_stop_info: Optional[Dict[str, Any]] = None,
                   clock_lock_info: Optional[Dict[str, Any]] = None) -> None:
         with self._lock:
@@ -6673,6 +6985,14 @@ class CompileCache:
                 e["mode"] = mode
             if search_space_hash is not None:
                 e["search_space_hash"] = search_space_hash
+            # MED.10 — persist the build-input hashes the JIT winner was tuned
+            # against so is_jit_fresh can invalidate on a header / flag change.
+            if source_hash is not None:
+                e["jit_source_hash"] = source_hash
+            if host_flags_hash is not None:
+                e["jit_host_cflags_hash"] = host_flags_hash
+            if device_flags_hash is not None:
+                e["jit_device_cflags_hash"] = device_flags_hash
             # Stream-5 additive field: stopper diagnostics for this run.
             # Backward-compatible — readers that don't know about it just
             # ignore the extra key.
@@ -6691,6 +7011,26 @@ class CompileCache:
         with self._lock:
             e = self.get(opt, model, arch)
             e["clock_lock"] = clock_lock_info
+            self._dirty = True
+
+    def annotate_jit_build_hashes(self, opt: str, model: str, arch: str, *,
+                                  source_hash: Optional[str] = None,
+                                  host_flags_hash: Optional[str] = None,
+                                  device_flags_hash: Optional[str] = None
+                                  ) -> None:
+        """Review fix MED.10 — stamp the build-input hashes the JIT winner was
+        tuned against onto an already-tuned entry, so is_jit_fresh can later
+        invalidate the cached winner on a kernel-header or compiler-flag change
+        (the tuned block/vec/unroll were chosen for THAT binary). Does not touch
+        the winning config; only adds the freshness keys."""
+        with self._lock:
+            e = self.get(opt, model, arch)
+            if source_hash is not None:
+                e["jit_source_hash"] = source_hash
+            if host_flags_hash is not None:
+                e["jit_host_cflags_hash"] = host_flags_hash
+            if device_flags_hash is not None:
+                e["jit_device_cflags_hash"] = device_flags_hash
             self._dirty = True
 
     # ── Garbage collection ────────────────────────────────────────────
@@ -12292,10 +12632,16 @@ def _check_determinism_3x(variant_so: Path, opt_class: str, size: int,
     return True
 
 
+# MED.6 — warn-once guard so a broken default-on emitter is surfaced LOUDLY
+# (mirroring 14068) but not once-per-trial across a multi-thousand-config sweep.
+_EMITTER_FAILURE_WARNED: set = set()
+
+
 def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
                     target: str,
                     spec: Optional["BuildSpec"] = None,
-                    arch: Optional[str] = None) -> List[str]:
+                    arch: Optional[str] = None,
+                    report=None) -> List[str]:
     """Macros + extra-flag overrides for one config × target.
 
     Stream 3: ``arch`` is threaded through so the NVCC/HIPCC extra
@@ -12309,6 +12655,13 @@ def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
     a signature change. Residual host-side macros are still appended to
     the cflags so host code that needs them keeps working. On any
     emitter failure we fall through to the legacy macros-only path.
+
+    Review fix MED.6: that fall-through used to be SILENT (_debug_swallow,
+    quiet by default). When the emitter is the DEFAULT-ON code path, a
+    CodegenError there means every "emitted" variant is silently the legacy
+    macros-only build instead — a fail-OPEN degradation the operator never
+    sees. We now emit a LOUD one-line WARNING (warn-once per opt/arch,
+    mirroring the 14068 tuned_configs.h warning) when ``report`` is supplied.
     """
     # Stream 3 — if arch wasn't passed explicitly, lift it off spec.
     if arch is None and spec is not None:
@@ -12333,6 +12686,18 @@ def _variant_macros(config: Dict[str, Any], dims: List[Dict[str, Any]],
             return macros_only + residual
         except Exception as _swexc:
             _debug_swallow('_variant_macros', _swexc)
+            # MED.6 — surface the swallowed emitter failure LOUDLY (warn-once).
+            wkey = (getattr(spec, "optimizer", "?"), arch or "?")
+            if report is not None and wkey not in _EMITTER_FAILURE_WARNED:
+                _EMITTER_FAILURE_WARNED.add(wkey)
+                report.write(
+                    "  [emitter] WARNING: enable_emitter is ON but "
+                    f"emit_variant_source FAILED for {wkey[0]}/{wkey[1]} "
+                    f"({type(_swexc).__name__}: {_swexc}); FALLING BACK to the "
+                    "legacy macros-only device build for this and every "
+                    "subsequent variant. The emitted-source code path is NOT "
+                    "in effect — fix the codegen template/inputs to use it. "
+                    "(Tuning continues with the macros-only build.)\n")
     macros = resolve_macros(config, dims, target)
     if target != "device":
         return macros
@@ -12711,9 +13076,10 @@ def _make_variant_timer(spec: BuildSpec, sources: List[Path],
                     cost_model_state.get("n_total", 0)) + 1
 
         host_extra = _variant_macros(config, dims, "host",
-                                      spec=spec, arch=spec.arch)
+                                      spec=spec, arch=spec.arch, report=report)
         device_extra = _variant_macros(config, dims, "device",
-                                        spec=spec, arch=spec.arch)
+                                        spec=spec, arch=spec.arch,
+                                        report=report)
 
         # ── Stream B — polyhedral fan-out hook ──────────────────────────
         # OFF by default; gated on spec.config["polyhedral"]["enable"].
@@ -13140,8 +13506,19 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
     space_hash = hash_space(space, spec.arch)
     report.write(f"  [search-space] hash={space_hash[:16]}\n")
 
+    # MED.10 — fold the JIT build-input hashes into the freshness gate so a
+    # kernel-header edit or a compiler-flag change invalidates a stale winner
+    # (whose block/vec/unroll were tuned for the OLD binary). Same source-hash
+    # base as build_aot; ``"empty"`` mirrors that path when no sources resolve.
+    jit_source_hash = _hash_sources(sources) if sources else "empty"
+    jit_host_hash = _hash_flags(host_cflags)
+    jit_device_hash = _hash_flags(device_cflags)
+
     if cache.is_jit_fresh(spec.optimizer, spec.model, spec.arch,
-                          search_space_hash=space_hash):
+                          search_space_hash=space_hash,
+                          source_hash=jit_source_hash,
+                          host_flags_hash=jit_host_hash,
+                          device_flags_hash=jit_device_hash):
         tuned = cache.get(spec.optimizer, spec.model, spec.arch)["tuned_config"]
         report.write(f"  [jit-autotune] cache hit: tuned={tuned}\n")
         return tuned
@@ -13281,6 +13658,16 @@ def _jit_autotune(spec: BuildSpec, sources: List[Path],
                                       clock_lock.record())
         except Exception as exc:
             report.write(f"  [clock-lock] cache annotate skipped: {exc}\n")
+        # MED.10 — persist the build-input hashes this winner was tuned
+        # against so a later run with an edited header / changed flags re-tunes
+        # instead of re-serving a stale block/vec/unroll for a different binary.
+        try:
+            cache.annotate_jit_build_hashes(
+                spec.optimizer, spec.model, spec.arch,
+                source_hash=jit_source_hash, host_flags_hash=jit_host_hash,
+                device_flags_hash=jit_device_hash)
+        except Exception as exc:
+            report.write(f"  [jit-hash] cache annotate skipped: {exc}\n")
     # Mandate #8 — report the sweep's compiler-cache hit-rate.
     _report_compiler_cache_stats(report)
 
@@ -13743,7 +14130,7 @@ def _run_bayesian(spec: BuildSpec, prefiltered: List[Dict[str, Any]],
     out = dict(winner["config"])
     # Compute the config_key from the CONFIG ALONE — before injecting
     # timing_ms/stage_won — so it matches the per-variant config_key used in
-    # variant_artifacts (config_key only excludes _DEAD_KEY_DIMS, not these
+    # variant_artifacts (config_key only excludes dead-everywhere dims, not these
     # bookkeeping fields). Polluting the key with timing_ms would break
     # prune()'s "always keep the tuned winner" preservation. The exhaustive
     # driver already keys off the pure config; mirror that here.
@@ -13945,6 +14332,122 @@ def _neighbour_estimate(seeds: List[Dict[str, Any]],
 
 
 # ---------------------------------------------------------------------------
+# Canonical tuned-winner JSON (lever (b)) — the PRODUCT-build handoff.
+#
+# This is the SINGLE place that persists per-(arch, optimizer) launch-param
+# winners to grokking_optimizers/_kernel_tuned.json, which setup.py's
+# BuildExtension reads to inject per-TU -DSG_TUNED_* / --maxrregcount into the
+# shipped _ops*.so. The header writer below (_write_tuned_configs_header) is a
+# SECONDARY consumer kept for back-compat; this JSON is the canonical contract.
+#
+# The injector module (grokking_optimizers/_tuned_inject.py) is *pure stdlib*
+# and is loaded BY FILE PATH so that pulling it in here can never re-enter the
+# grokking_optimizers package __init__ (which imports torch + probes CUDA).
+# ---------------------------------------------------------------------------
+_TUNED_INJECT_MOD = None  # lazily loaded (by path), cached per process.
+
+
+def _load_tuned_inject():
+    """Load grokking_optimizers/_tuned_inject.py by path (stdlib-only module).
+
+    Returns the module or ``None`` if it cannot be loaded — the caller treats
+    None as "no canonical-JSON export this run" (loud, non-fatal).
+    """
+    global _TUNED_INJECT_MOD
+    if _TUNED_INJECT_MOD is not None:
+        return _TUNED_INJECT_MOD
+    try:
+        mod_path = REPO_ROOT / "grokking_optimizers" / "_tuned_inject.py"
+        spec = importlib.util.spec_from_file_location(
+            "grokking_optimizers_tuned_inject", str(mod_path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        _TUNED_INJECT_MOD = mod
+        return mod
+    except Exception as _swexc:  # noqa: BLE001 — optional handoff, never fatal.
+        _debug_swallow('_load_tuned_inject', _swexc)
+        return None
+
+
+def _compile_py_version_hash() -> Optional[str]:
+    """Short content hash of this compile.py — provenance for the JSON _meta."""
+    try:
+        return hashlib.sha256(
+            Path(__file__).read_bytes()).hexdigest()[:16]
+    except Exception:  # pragma: no cover - read of own source never fails
+        return None
+
+
+def _live_macro_map(arch: str) -> Dict[str, str]:
+    """Review fix P0.2 — derive the ``{dim_name: SG_TUNED_MACRO}`` map for
+    ``arch`` from the live search space, restricted to dims that carry a macro.
+
+    This is the producer side of the handoff: the map is passed to
+    ``export_winner`` so the stdlib-only consumer can emit ``-D<macro>=<v>`` for
+    EVERY macro-carrying winner dim (cluster_shape + any feature macro a kernel
+    consumes), not just the hardcoded SAFE five. Best-effort: returns ``{}`` if
+    the space can't be built (the export then degrades to the SAFE-5 floor)."""
+    try:
+        space = load_embedded_search_space()
+        dims = space.get(arch, {}).get("dims", []) or []
+    except Exception as _swexc:  # noqa: BLE001 — optional handoff, never fatal.
+        _debug_swallow('_live_macro_map', _swexc)
+        return {}
+    out: Dict[str, str] = {}
+    for d in dims:
+        macro = d.get("macro")
+        name = d.get("name")
+        if macro and name:
+            out[name] = str(macro)
+    return out
+
+
+def _export_kernel_tuned_json(combo: Dict[str, Any], optimizer: str,
+                              model: str, arch: str, report) -> None:
+    """Persist a JIT winner to the canonical _kernel_tuned.json (lever (b)).
+
+    Write-on-win, atomic (handled inside export_winner), and NEVER raises into
+    the tuning run — a failed persist emits a LOUD one-line warning to the
+    report and is otherwise ignored, so a tuning sweep is never lost to a JSON
+    write hiccup. P0.2: EVERY winner dim carrying a macro in the live search
+    space is persisted (the five SAFE dims plus cluster_shape and any consumed
+    feature macro), together with the dim→macro map the consumer applies; only
+    bookkeeping keys (timing_ms / config_key / ...) are dropped.
+    """
+    inject = _load_tuned_inject()
+    if inject is None:
+        report.write(
+            "  [kernel_tuned.json] WARNING: could not load the _tuned_inject "
+            "helper; this winner was NOT persisted to the canonical JSON "
+            "(the product build will fall back to in-header defaults for "
+            f"{optimizer}/{arch}). The tuning run itself is unaffected.\n")
+        return
+    try:
+        ok = inject.export_winner(
+            optimizer, model, arch, combo,
+            source="grokking_optimizers.compile.build_jit",
+            version_hash=_compile_py_version_hash(),
+            macro_map=_live_macro_map(arch))
+    except Exception as _swexc:  # noqa: BLE001 — defensive; export is fail-closed.
+        _debug_swallow('_export_kernel_tuned_json', _swexc)
+        ok = False
+    if ok:
+        try:
+            disp = Path(inject.KERNEL_TUNED_JSON).relative_to(REPO_ROOT)
+        except (ValueError, AttributeError):
+            disp = getattr(inject, "KERNEL_TUNED_JSON", "_kernel_tuned.json")
+        report.write(
+            f"  [kernel_tuned.json] persisted winner {optimizer}/"
+            f"{inject.canonical_arch_key(arch)} -> {disp}\n")
+    else:
+        report.write(
+            "  [kernel_tuned.json] WARNING: failed to persist winner "
+            f"{optimizer}/{arch} to the canonical JSON (write error). The "
+            "product build will use in-header defaults for this optimizer; "
+            "the tuning run is unaffected.\n")
+
+
+# ---------------------------------------------------------------------------
 # tuned_configs.h — written from the cache's winning config
 # ---------------------------------------------------------------------------
 
@@ -13965,28 +14468,56 @@ def _write_tuned_configs_header(combo: Dict[str, Any], optimizer: str,
         tuned_h = REPO_ROOT / tuned_h
     tuned_h.parent.mkdir(parents=True, exist_ok=True)
     macros: List[str] = []
-    # Try to load the space to map dim -> macro
+    # Try to load the space to map dim -> macro.
+    #
+    # Audit fix (#3): a SILENT failure here used to shrink the emitted header
+    # to ONLY the back-compat keys (block/vec/unroll) — dropping async_depth
+    # and every feature macro — because _debug_swallow is quiet by default and
+    # `dims = []` empties name_to_macro. That is a fail-OPEN degradation that
+    # ships an under-specified header without telling anyone. We now FAIL
+    # LOUD: write a warning to the report so the operator sees the space load
+    # broke, AND widen the back-compat map below to the full SAFE per-TU set so
+    # the four canonical macros (block/vec/unroll/async_depth) still emit even
+    # on a failed load. (The canonical product-build handoff is the JSON from
+    # _export_kernel_tuned_json; this header is a secondary consumer.)
+    space_load_failed = False
     try:
         space = load_embedded_search_space()
         dims = space.get(arch, {}).get("dims", [])
     except Exception as _swexc:
         _debug_swallow('_write_tuned_configs_header', _swexc)
+        report.write(
+            "  [tuned_configs.h] WARNING: load_embedded_search_space() failed "
+            f"({type(_swexc).__name__}: {_swexc}); the dim->macro map is "
+            "unavailable. Emitting the SAFE per-TU macros from the back-compat "
+            "fallback only (block/vec/unroll/async_depth) — feature macros are "
+            "OMITTED. Re-run with the search space loadable for a full header.\n")
         dims = []
+        space_load_failed = True
     name_to_macro = {d["name"]: d.get("macro") for d in dims}
+    # Back-compat fallback — P0.2: widened from the SAFE-4 to the full derived
+    # macro-dim set so a FAILED space load still emits the same macros the JSON
+    # export persists (block/vec/unroll/async_depth + cluster_shape + the
+    # feature macros), kept in lockstep with _DERIVED_HEADER_BACKCOMPAT (which is
+    # itself derived from the live space at import, falling back to a static
+    # superset). On a healthy load name_to_macro already supplies these; on a
+    # failed load this is the only thing standing between the operator and a
+    # silently-truncated header. maxrregcount is a ptxas flag, not a -D macro,
+    # so it is intentionally absent.
+    backcompat = dict(_DERIVED_HEADER_BACKCOMPAT)
     for k, v in combo.items():
-        if k in ("timing_ms", "config_key", "stage_won"):
+        if k in ("timing_ms", "config_key", "stage_won", "_fastmath", "model"):
             continue
         macro = name_to_macro.get(k)
         if not macro:
-            # Fallback for back-compat keys (block / vec / unroll).
-            backcompat = {
-                "block":  "SG_TUNED_BLOCK_SIZE",
-                "vec":    "SG_TUNED_VEC_WIDTH",
-                "unroll": "SG_TUNED_UNROLL",
-            }
             macro = backcompat.get(k)
         if macro:
             macros.append((macro, v))
+    if space_load_failed and not macros:
+        report.write(
+            "  [tuned_configs.h] WARNING: winning combo had no SAFE per-TU "
+            "dims after the space-load failure; the header will carry no "
+            "tuned macros (in-header #ifndef defaults remain in force).\n")
     body = ["// Auto-generated by grokking_optimizers.compile JIT autotune.",
             "// Do not edit by hand — re-run with --jit-only to refresh.",
             f"// Winning combo: optimizer={optimizer} model={model} arch={arch}",
@@ -14366,6 +14897,14 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
     space_hash = e.get("search_space_hash")
     _write_tuned_configs_header(tuned, spec.optimizer, spec.model, spec.arch,
                                 report, spec=spec)
+    # Lever (b): persist this winner to the CANONICAL per-(arch, optimizer)
+    # JSON (grokking_optimizers/_kernel_tuned.json) that the PRODUCT build
+    # (setup.py's BuildExtension) reads to inject -DSG_TUNED_* / --maxrregcount
+    # per TU. This is the handoff that makes the autotuner's output ACTIVE in
+    # the shipped _ops*.so (the tuned_configs.h above is a secondary consumer).
+    # Write-on-win, atomic, and NEVER fatal to the tuning run.
+    _export_kernel_tuned_json(tuned, spec.optimizer, spec.model, spec.arch,
+                              report)
 
     # Try to assemble macros via the resolved YAML space; fall back to
     # the tuned dict's literal keys.
@@ -14375,19 +14914,39 @@ def build_jit(spec: BuildSpec, cache: CompileCache, report) -> Optional[Path]:
         space = get_search_space(spec.search_space_path)
         dims = space.get(spec.arch, {}).get("dims", [])
         extra_host = _variant_macros(tuned, dims, "host",
-                                      spec=spec, arch=spec.arch)
+                                      spec=spec, arch=spec.arch, report=report)
         extra_device = _variant_macros(tuned, dims, "device",
-                                        spec=spec, arch=spec.arch)
+                                        spec=spec, arch=spec.arch,
+                                        report=report)
     except Exception as _swexc:
         _debug_swallow('build_jit', _swexc)
+        # P0.2 — widen the lockstep fallback from block/vec/unroll to the full
+        # derived macro-dim set, and emit tuple dims (cluster_shape) as nvcc-safe
+        # per-axis macros (_0/_1/_2 + _VOLUME) exactly like resolve_macros, so a
+        # space-load failure still rebuilds with the SAME macros the winner used.
         for k, v in tuned.items():
-            if k in ("timing_ms", "config_key", "stage_won", "_fastmath"):
+            if k in ("timing_ms", "config_key", "stage_won", "_fastmath",
+                     "model"):
                 continue
-            macro = {"block": "SG_TUNED_BLOCK_SIZE",
-                     "vec": "SG_TUNED_VEC_WIDTH",
-                     "unroll": "SG_TUNED_UNROLL"}.get(k)
-            if macro:
-                flag = f"-D{macro}={v}"
+            macro = _DERIVED_HEADER_BACKCOMPAT.get(k)
+            if not macro:
+                continue
+            if isinstance(v, (tuple, list)):
+                comps = list(v)
+                vol = 1
+                for i, comp in enumerate(comps):
+                    flag = f"-D{macro}_{i}={_format_value(comp)}"
+                    extra_host.append(flag)
+                    extra_device.append(flag)
+                    try:
+                        vol *= int(comp)
+                    except (TypeError, ValueError):
+                        vol = 0
+                vflag = f"-D{macro}_VOLUME={vol}"
+                extra_host.append(vflag)
+                extra_device.append(vflag)
+            else:
+                flag = f"-D{macro}={_format_value(v)}"
                 extra_host.append(flag)
                 extra_device.append(flag)
 
@@ -15215,6 +15774,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         if os.environ.get("GROK_NO_AUTO_INSTALL"):
             _set_auto_install(False)
         return _self_test()
+    # Review fix HIGH.5 — default PGO workload routing. DEFAULT_PGO_WORKLOAD is
+    # __file__, so collect_workload() invokes `python compile.py --so ... --opt
+    # ... --steps ...`. The main argparse below has no --so/--opt/--steps and
+    # would reject those argv (the PGO loop's default workload was effectively
+    # broken). Detect the workload's signature flag (--so) BEFORE the main
+    # parser and route to _pgo_workload_main (mirrors the --self-test intercept).
+    if "--so" in _argv:
+        return _pgo_workload_main(_argv)
     # Stream — debug-flags: bump _COMPILE_LOG_LEVEL globally BEFORE any
     # early-intercept path runs, so --flag-audit and the regular build
     # path all see the bumped level.
@@ -16313,6 +16880,57 @@ def _self_test_search_space(run) -> None:
         assert eliminated > 0, "prefilter eliminated nothing — rules broken?"
         assert len(survivors) > 0, "prefilter eliminated everything — rules too strict?"
 
+    def test_prefilter_naming_error_raises_at_build_passthrough_at_sweep():
+        """Review fix MED.9 — a prefilter rule referencing a missing/typo'd dim
+        is caught LOUD at space-build (_validate_arch raises), while a residual
+        runtime eval-error at SWEEP time is PASS-THROUGH + warn-once (never a
+        silent rejection). Pre-fix both collapsed to a silent per-config
+        ``return False`` that quietly shrank the search space."""
+        # (a) build-time: an undeclared name in a rule expr → SearchSpaceError.
+        bad = {"dims": [{"name": "block", "type": "int", "values": [128, 256]}],
+               "prefilter": {"rules": [
+                   {"name": "r", "expr": "block <= NONEXISTENT_DIM"}]}}
+        raised = False
+        try:
+            _validate_arch("test", bad)
+        except SearchSpaceError as exc:
+            raised = True
+            assert "NONEXISTENT_DIM" in str(exc)
+        assert raised, "missing-dim prefilter rule must raise at space-build"
+        # A syntax error is likewise a build-time raise.
+        syn = {"dims": [{"name": "block", "type": "int", "values": [1]}],
+               "prefilter": {"rules": [{"name": "s", "expr": "block <= "}]}}
+        try:
+            _validate_arch("test", syn)
+            assert False, "syntax-error rule must raise at space-build"
+        except SearchSpaceError:
+            pass
+        # A VALID rule (only declared dims + safe builtins) must NOT raise.
+        ok = {"dims": [{"name": "block", "type": "int", "values": [128, 256]},
+                       {"name": "vec", "type": "int", "values": [1, 4]}],
+              "prefilter": {"rules": [
+                  {"name": "v", "expr": "block % (vec * 4) == 0"}]}}
+        _validate_arch("test", ok)  # no raise
+        # (b) sweep-time: a runtime eval-error → pass-through (True), warn-once.
+        saved = set(_PREFILTER_EVAL_ERROR_WARNED)
+        try:
+            _PREFILTER_EVAL_ERROR_WARNED.clear()
+            chk = compile_feasibility_check(
+                {"rules": [{"name": "tc", "expr": "block % 2 == 0"}]})
+            # block as a str makes ``%`` raise TypeError at eval time.
+            assert chk({"block": "oops"}) is True, (
+                "sweep-time eval-error must PASS-THROUGH, not reject")
+            assert "tc" in _PREFILTER_EVAL_ERROR_WARNED, "must warn once"
+            # A well-typed config still evaluates normally (True/False honored).
+            assert chk({"block": 128}) is True
+            assert chk({"block": 127}) is False
+        finally:
+            _PREFILTER_EVAL_ERROR_WARNED.clear()
+            _PREFILTER_EVAL_ERROR_WARNED.update(saved)
+        sys.stdout.write(
+            "    [prefilter] build-time raise on missing dim; sweep-time "
+            "eval-error → pass-through + warn-once (no silent reject)\n")
+
     def test_config_key_deterministic():
         cfg1 = {"block": 256, "vec": 4, "unroll": 8}
         cfg2 = {"unroll": 8, "block": 256, "vec": 4}
@@ -16409,12 +17027,62 @@ def _self_test_search_space(run) -> None:
             assert max(ad["values"]) == _ASYNC_DEPTH_MAX == 4, (
                 f"{arch}: async_depth max {max(ad['values'])} != 4")
 
+    def test_dead_key_dims_derived_revives_consumed_macro():
+        """Review fix P0.3 — config_key's exclusion set is DERIVED from
+        _is_dead_dim, not a static frozenset. (a) A macro-CONSUMING dim stays IN
+        config_key (proves the static-list revive bug is gone: when a kernel
+        starts reading SG_TUNED_WGMMA_SHAPE, wgmma_shape auto-rejoins the key so
+        two distinct binaries no longer alias). (b) A non-consumed macro dim is
+        pinned + EXCLUDED. (c) num_stages stays in the key (live Pallas kwarg)."""
+        global _KERNEL_MACRO_CACHE, _DEAD_KEY_DIMS_CACHE
+        # Baseline: with the real kernel sources, wgmma_shape is dead (no kernel
+        # reads SG_TUNED_WGMMA_SHAPE) so it is EXCLUDED; block is consumed → kept.
+        base_dead = _dead_key_dims()
+        assert "wgmma_shape" in base_dead, (
+            "baseline: wgmma_shape should be excluded (no kernel consumes it)")
+        assert "block" not in base_dead, "block is consumed → must stay in key"
+        assert "num_stages" not in base_dead, (
+            "num_stages is a live Pallas kwarg → must NOT be excluded")
+        # The non-consumed dead dim must not appear in a key; a consumed one must.
+        cfg = {"block": 128, "vec": 4, "unroll": 8,
+               "wgmma_shape": "m64n128k16"}
+        assert "wgmma_shape" not in config_key(cfg)
+        assert "block" in config_key(cfg)
+        # (a) REVIVE: simulate a kernel that begins consuming SG_TUNED_WGMMA_SHAPE.
+        # Monkeypatch the detected-macro cache, clear the derived key cache, and
+        # confirm wgmma_shape REJOINS config_key (the static-list bug would have
+        # kept it permanently dropped).
+        saved_macros = _KERNEL_MACRO_CACHE
+        saved_key = _DEAD_KEY_DIMS_CACHE
+        try:
+            _KERNEL_MACRO_CACHE = frozenset(
+                (saved_macros or frozenset()) | {"SG_TUNED_WGMMA_SHAPE"})
+            _DEAD_KEY_DIMS_CACHE = None  # force re-derivation
+            revived = _dead_key_dims()
+            assert "wgmma_shape" not in revived, (
+                "a now-consumed macro dim must be REVIVED into config_key "
+                "(no static-list drop)")
+            assert "wgmma_shape" in config_key(cfg), (
+                "config_key must now distinguish wgmma_shape values")
+            # A still-dead dim (swizzle) stays excluded.
+            assert "swizzle" in revived
+        finally:
+            _KERNEL_MACRO_CACHE = saved_macros
+            _DEAD_KEY_DIMS_CACHE = saved_key
+        sys.stdout.write(
+            "    [revive] wgmma_shape: excluded when dead, in config_key once "
+            "a kernel consumes SG_TUNED_WGMMA_SHAPE (no static-list drop)\n")
+
     run("load_yaml_validates_shape", test_load_yaml_validates_shape)
     run("load_yaml_rejects_duplicate_dim", test_load_yaml_rejects_duplicate_dim)
     run("embedded_yaml_loads", test_real_yaml_loads)
     run("cartesian_counts", test_cartesian_counts)
     run("prefilter_eliminates", test_prefilter_eliminates)
+    run("prefilter_naming_error_raises_at_build_passthrough_at_sweep",
+        test_prefilter_naming_error_raises_at_build_passthrough_at_sweep)
     run("dead_dims_pinned_and_collapsed", test_dead_dims_pinned_and_collapsed)
+    run("dead_key_dims_derived_revives_consumed_macro",
+        test_dead_key_dims_derived_revives_consumed_macro)
     run("async_depth_capped_to_kernel_clamp",
         test_async_depth_capped_to_kernel_clamp)
     run("config_key_deterministic", test_config_key_deterministic)
@@ -16469,10 +17137,58 @@ def _self_test_pgo(run) -> None:
         finally:
             shutil.rmtree(td)
 
+    def test_default_pgo_workload_argv_routes_through_main():
+        """Review fix HIGH.5 — DEFAULT_PGO_WORKLOAD is __file__, so
+        collect_workload() runs `python compile.py --so ... --opt ... --steps
+        ...`. main() now intercepts --so and routes to _pgo_workload_main BEFORE
+        the main argparse (which has no --so/--opt/--steps and would reject the
+        command). Proves: (a) the EXACT collect_workload argv reaches
+        _pgo_workload_main; (b) _pgo_workload_main's parser accepts it (the
+        --steps 1 CPU/dry contract) without the main parser SystemExit-ing."""
+        # Build the EXACT argv collect_workload(14328) emits (minus the
+        # leading `python compile.py`, which main() never sees).
+        so_path = "/tmp/does_not_matter.so"
+        workload_argv = ["--so", so_path, "--opt", "Lion",
+                         "--model", "mamba", "--arch", "sm_90", "--steps", "1"]
+        # (a) Route: monkeypatch _pgo_workload_main to capture argv (so we test
+        # the INTERCEPT, not the torch/.so execution which needs a GPU).
+        captured = {}
+        real = globals()["_pgo_workload_main"]
+        def _spy(argv=None):
+            captured["argv"] = argv
+            return 0
+        globals()["_pgo_workload_main"] = _spy
+        try:
+            rc = main(workload_argv)
+        finally:
+            globals()["_pgo_workload_main"] = real
+        assert rc == 0, f"main() returned {rc} for the PGO workload argv"
+        assert captured.get("argv") == workload_argv, (
+            f"main() did not route --so argv to _pgo_workload_main; "
+            f"captured={captured.get('argv')}")
+        # (b) The real parser accepts the exact argv (parse-only, no execution),
+        # confirming --steps 1 and the rest are valid for the dry CPU path.
+        import argparse as _ap
+        _p = _ap.ArgumentParser()
+        _p.add_argument("--so", type=Path, required=True)
+        _p.add_argument("--opt", required=True)
+        _p.add_argument("--model", default="mamba")
+        _p.add_argument("--arch", default="sm_90")
+        _p.add_argument("--steps", type=int, default=1000)
+        _p.add_argument("--size", type=int, default=2048)
+        _p.add_argument("--python-package", default="grokking_optimizers")
+        ns = _p.parse_args(workload_argv)
+        assert ns.opt == "Lion" and ns.steps == 1 and str(ns.so) == so_path
+        sys.stdout.write(
+            "    [pgo-route] collect_workload argv (--so/--opt/--steps 1) "
+            "routes to _pgo_workload_main, parser accepts it\n")
+
     run("hash_workload_deterministic", test_hash_workload_deterministic)
     run("hash_workload_changes", test_hash_workload_changes)
     run("instrument_flags_cuda", test_instrument_flags_cuda)
     run("use_flags_round_trip", test_use_flags_round_trip)
+    run("default_pgo_workload_argv_routes_through_main",
+        test_default_pgo_workload_argv_routes_through_main)
 
 
 def _self_test_device_profiling(run) -> None:
@@ -18222,6 +18938,78 @@ def _self_test_cache(run) -> None:
                                                "--def-load-cache=ca"]), \
             "identical flag sets must hash identically"
 
+    def test_header_edit_busts_source_hash_and_freshness():
+        """Review fix P0.1 — _hash_sources folds the transitive #include
+        closure, so editing a kernel-body HEADER (not the .cu TU) changes
+        source_hash and flips is_aot_fresh / is_jit_fresh to STALE. The pre-fix
+        bug: only the .cu/.cpp TUs were hashed, so a header edit (where the
+        kernel bodies actually live) scored a false cache HIT and the changed
+        binary was never rebuilt."""
+        # Build a tiny TU + header tree UNDER REPO_ROOT (the walk is repo-local
+        # by design), in a unique temp dir we clean up.
+        td = Path(tempfile.mkdtemp(prefix="_p0_1_hdrtest_", dir=str(REPO_ROOT)))
+        try:
+            hdr = td / "body.cuh"
+            hdr.write_text("#define SG_X 1\n")
+            tu = td / "tu.cu"
+            tu.write_text('#include "body.cuh"\nint k(){return SG_X;}\n')
+            # A real (dummy) .so so is_aot_fresh's primary_artifact check passes.
+            so = td / "k.so"
+            so.write_bytes(b"\x7fELF dummy artifact for freshness test")
+            # The walk must discover the header transitively from the TU.
+            inc = _transitive_include_set([tu])
+            assert hdr.resolve() in inc, (
+                "transitive include walk failed to find the header")
+            h_before = _hash_sources([tu])
+            # Wire a cache entry recording that exact source_hash as fresh,
+            # with a present artifact (is_aot_fresh requires primary_artifact).
+            cp = td / "cache.json"
+            cache = CompileCache(cp)
+            cache.record_aot("lion", "mamba", "sm_90",
+                             source_hash=h_before, host_flags_hash="h",
+                             device_flags_hash="d", so_path=so,
+                             pgo_enabled=False, pgo_workload_hash=None,
+                             search_space_hash="ss")
+            # JIT half: set_tuned marks jit_completed_at + tuned_config and
+            # (after MED.10) persists the source/cflags hashes that is_jit_fresh
+            # now folds in — so the same header edit flips the JIT path stale too.
+            cache.set_tuned("lion", "mamba", "sm_90", {"block": 256},
+                            search_space_hash="ss",
+                            source_hash=h_before, host_flags_hash="h",
+                            device_flags_hash="d")
+            assert cache.is_aot_fresh("lion", "mamba", "sm_90", h_before,
+                                      "h", "d",
+                                      search_space_hash="ss"), (
+                "AOT should start fresh")
+            assert cache.is_jit_fresh("lion", "mamba", "sm_90",
+                                      search_space_hash="ss",
+                                      source_hash=h_before,
+                                      host_flags_hash="h",
+                                      device_flags_hash="d"), (
+                "JIT should start fresh")
+            # EDIT THE HEADER CONTENT (mtime bumps → walk-cache line evicts).
+            hdr.write_text("#define SG_X 2\n")
+            h_after = _hash_sources([tu])
+            assert h_after != h_before, (
+                "header content edit must change _hash_sources "
+                "(transitive #include closure is hashed)")
+            # The recorded (stale) source_hash now mismatches → NOT fresh.
+            assert not cache.is_aot_fresh("lion", "mamba", "sm_90", h_after,
+                                          "h", "d",
+                                          search_space_hash="ss"), (
+                "AOT must go STALE after a header edit")
+            assert not cache.is_jit_fresh("lion", "mamba", "sm_90",
+                                          search_space_hash="ss",
+                                          source_hash=h_after,
+                                          host_flags_hash="h",
+                                          device_flags_hash="d"), (
+                "JIT must go STALE after a header edit (MED.10 fold)")
+            sys.stdout.write(
+                f"    [hdr-stale] source_hash before={h_before[:12]} "
+                f"after={h_after[:12]} (header edit ⇒ AOT/JIT stale)\n")
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
     run("cache_concurrent_writes_both_survive",
         test_cache_concurrent_writes_both_survive)
     run("cache_corruption_emits_stderr_notice",
@@ -18235,6 +19023,8 @@ def _self_test_cache(run) -> None:
     run("variant_reuse_skips_recompile", test_variant_reuse_skips_recompile)
     run("version_gated_flags_fold_into_cache_hash",
         test_version_gated_flags_fold_into_cache_hash)
+    run("header_edit_busts_source_hash_and_freshness",
+        test_header_edit_busts_source_hash_and_freshness)
 
 
 def _self_test_multi_gpu_pool(run) -> None:
@@ -18899,6 +19689,79 @@ def _self_test_silent_degradation(run) -> None:
                     offenders.append((node.lineno, fn))
         assert not offenders, f"silent pass/continue broad-excepts: {offenders}"
 
+    def test_kernel_tuned_json_persists_every_macro_dim_and_roundtrips():
+        """Review fix P0.2 — the JSON export persists EVERY macro-carrying
+        winner dim (not just the SAFE five), records the producer dim→macro map,
+        and the stdlib-only consumer emits the right nvcc flags after reload —
+        WITHOUT importing compile.py. Proves: (a) a synthetic scalar feature
+        macro dim round-trips and emits -D<macro>=<v>; (b) a tuple dim
+        (cluster_shape) emits per-axis _0/_1/_2 + _VOLUME (nvcc-safe); (c) a
+        map-LESS (legacy 5-dim) JSON still loads and emits the SAFE floor; (d) a
+        winner dim with NO macro mapping is ignored (graceful degradation)."""
+        inject = _load_tuned_inject()
+        assert inject is not None, "could not load _tuned_inject helper"
+        with tempfile.TemporaryDirectory() as td:
+            jp = str(Path(td) / "_kernel_tuned.json")
+            # Producer side: a winner carrying the SAFE dims + a tuple dim
+            # (cluster_shape) + a synthetic scalar feature macro (wgmma_shape),
+            # with the dim→macro map compile.py derives from the live space.
+            combo = {"block": 128, "vec": 4, "unroll": 8, "async_depth": 3,
+                     "maxrregcount": 64, "cluster_shape": (2, 2, 1),
+                     "wgmma_shape": "m64n128k16",
+                     "timing_ms": 0.5, "config_key": "abc"}
+            macro_map = {"block": "SG_TUNED_BLOCK_SIZE",
+                         "vec": "SG_TUNED_VEC_WIDTH",
+                         "unroll": "SG_TUNED_UNROLL",
+                         "async_depth": "SG_TUNED_ASYNC_DEPTH",
+                         "cluster_shape": "SG_TUNED_CLUSTER_SHAPE",
+                         "wgmma_shape": "SG_TUNED_WGMMA_SHAPE"}
+            ok = inject.export_winner("adamw", "mamba", "sm_90a", combo,
+                                      path=jp, macro_map=macro_map)
+            assert ok, "export_winner returned False"
+            # (a)+(b) round-trip: the extra dims survive in the JSON.
+            data = inject.load_tuned(jp)
+            entry = data["sm_90"]["adamw"]
+            assert entry["cluster_shape"] == [2, 2, 1], (
+                f"tuple dim cluster_shape not persisted: {entry.get('cluster_shape')}")
+            assert entry["wgmma_shape"] == "m64n128k16", (
+                "synthetic scalar macro dim not persisted")
+            assert "timing_ms" not in entry and "config_key" not in entry, (
+                "bookkeeping keys must not persist")
+            assert data["sm_90"].get("_macros", {}).get("wgmma_shape") == \
+                "SG_TUNED_WGMMA_SHAPE", "dim→macro map not recorded in JSON"
+            # Consumer side: the right nvcc flags come back, no compile.py import.
+            flags = inject.source_extra_nvcc_flags("adamw", data, "sm_90a")
+            assert "-DSG_TUNED_BLOCK_SIZE=128" in flags
+            assert "--maxrregcount=64" in flags
+            assert "-DSG_TUNED_WGMMA_SHAPE=m64n128k16" in flags, (
+                f"synthetic macro not emitted: {flags}")
+            # cluster_shape → per-axis + volume (NOT a single -Dfoo=2,2,1).
+            assert "-DSG_TUNED_CLUSTER_SHAPE_0=2" in flags
+            assert "-DSG_TUNED_CLUSTER_SHAPE_1=2" in flags
+            assert "-DSG_TUNED_CLUSTER_SHAPE_2=1" in flags
+            assert "-DSG_TUNED_CLUSTER_SHAPE_VOLUME=4" in flags
+            assert not any("=2,2,1" in f for f in flags), (
+                "tuple must not emit a comma-valued -D (nvcc rejects it)")
+            # (c) legacy map-LESS JSON still loads + emits the SAFE floor.
+            legacy = {"sm_90": {"adamw": {"block": 256, "vec": 2, "unroll": 1,
+                                          "async_depth": 2, "maxrregcount": 0,
+                                          "model": "mamba"}}}
+            lflags = inject.source_extra_nvcc_flags("adamw", legacy, "sm_90a")
+            assert "-DSG_TUNED_BLOCK_SIZE=256" in lflags
+            assert all("CLUSTER_SHAPE" not in f for f in lflags), (
+                "legacy JSON has no extra dims to emit")
+            # (d) a winner dim with no macro mapping is ignored (no crash).
+            unmapped = {"sm_90": {"adamw": {"block": 64, "vec": 1, "unroll": 1,
+                                            "mystery_dim": "x", "model": "m"}}}
+            uflags = inject.source_extra_nvcc_flags("adamw", unmapped, "sm_90a")
+            assert "-DSG_TUNED_BLOCK_SIZE=64" in uflags
+            assert all("mystery" not in f.lower() for f in uflags), (
+                "unmapped dim must be ignored, not emitted")
+            sys.stdout.write(
+                f"    [dim-roundtrip] persisted cluster_shape={entry['cluster_shape']} "
+                f"wgmma_shape={entry['wgmma_shape']!r}; consumer emitted "
+                f"per-axis cluster macros + -DSG_TUNED_WGMMA_SHAPE\n")
+
     run("debug_swallow_quiet_default_loud_at_debug",
         test_debug_swallow_quiet_default_loud_at_debug)
     run("calibration_failure_warns_not_silent",
@@ -18910,6 +19773,8 @@ def _self_test_silent_degradation(run) -> None:
     run("repro_state_payload_complete", test_repro_state_payload_complete)
     run("no_silent_broad_except_in_production",
         test_no_silent_broad_except_in_production)
+    run("kernel_tuned_json_persists_every_macro_dim_and_roundtrips",
+        test_kernel_tuned_json_persists_every_macro_dim_and_roundtrips)
 
 
 def _self_test_validation_mechanism(run) -> None:
@@ -21545,9 +22410,13 @@ def _self_test_synth_codegen(run) -> None:
             assert marker in src or "extern \"C\"" in src, (
                 f"{arch}: missing {marker!r} in synthesized source")
 
-        # Stream γ.2 — GEMM-bearing OpGraph should emit native MMA
-        # opcodes on archs that support them. We build a tiny GEMM
-        # OpGraph and verify the mnemonic appears in the source.
+        # Review fix MED.8 — the per-arch native MMA mainloops were ZERO-
+        # FRAGMENT STUBS (zeroed register fragments / bogus cp.async ⇒ all-zero
+        # output). Until real fragment loads are wired
+        # (``_MMA_NATIVE_LOADS_WIRED``), the synth GEMM must emit the
+        # numerically-CORRECT SCALAR mainloop and the honest stub marker — NOT
+        # the broken native opcode that would silently compute zeros. This
+        # asserts the smoking-gun stubs are GONE and the scalar path is live.
         gemm_node = OpNode(op_kind="gemm", name="g",
                            inputs=["A", "B"], output="C",
                            attrs={"M": 256, "N": 256, "K": 256,
@@ -21556,20 +22425,28 @@ def _self_test_synth_codegen(run) -> None:
         gg = OpGraph(inputs={"A": ("fp16", (256, 256)),
                              "B": ("fp16", (256, 256))},
                      nodes=[gemm_node], output="C")
-        mma_expected = {
+        stub_mnemonics = {
             "sm_90a":  "wgmma.mma_async.sync.aligned.m64n128k16",
             "sm_100a": "tcgen05.mma.async",
             "gfx942":  "v_mfma_f32_16x16x16_f16",
             "gfx1100": "v_wmma_f32_16x16x16_f16",
         }
-        for arch, mnemonic in mma_expected.items():
+        assert not _MMA_NATIVE_LOADS_WIRED, (
+            "if native MMA loads are wired, revive the opcode-presence asserts")
+        for arch, mnemonic in stub_mnemonics.items():
             try:
                 src = synthesize_kernel(gg, arch, "fp16", (256, 256))
             except Exception as exc:
                 raise AssertionError(f"{arch}: GEMM synth failed: {exc}")
-            assert mnemonic in src, (
-                f"{arch}: expected MMA opcode {mnemonic!r} "
-                f"in emitted source; got first 400 chars:\n{src[:400]}")
+            # The broken native opcode must NOT appear (no zeros-producing path).
+            assert mnemonic not in src, (
+                f"{arch}: zero-fragment native opcode {mnemonic!r} must be "
+                f"SKIPPED until real loads exist; got:\n{src[:400]}")
+            # The honest stub marker + the correct scalar mainloop must appear.
+            assert "NOT WIRED" in src and "SCALAR mainloop" in src, (
+                f"{arch}: missing MED.8 stub marker in emitted GEMM source")
+            assert "acc += (" in src and "A[r * K + k]" in src, (
+                f"{arch}: scalar GEMM mainloop not emitted")
     run("synth_adamw_pattern_lowers_per_vendor",
          test_synth_adamw_pattern_lowers_per_vendor)
 
@@ -21621,14 +22498,19 @@ def _self_test_synth_codegen(run) -> None:
         # Mandate #17 — an unknown optimizer now returns None (NO silent
         # adamw_update default); the caller compiles the existing source.
         assert _synth_pattern_for_optimizer("brand_new_opt") is None
-        # The Newton–Schulz pattern lowers to real tensor-core opcodes.
+        # MED.8 — the Newton–Schulz GEMM lowers to the numerically-correct
+        # SCALAR mainloop (the native tensor-core opcodes are zero-fragment
+        # stubs, skipped until real loads are wired). Assert the broken opcode
+        # is absent and the scalar path is present.
         g = pattern_newton_schulz(M=256, N=256, dtype="fp16")
-        for arch, mnemonic in (("sm_90a", "wgmma"),
+        for arch, mnemonic in (("sm_90a", "wgmma.mma_async"),
                                ("gfx942", "v_mfma")):
             src = synthesize_kernel(g, arch, "fp16", (256, 256),
                                     pattern_name="newton_schulz")
-            assert mnemonic in src, (
-                f"{arch}: expected {mnemonic!r} in Newton–Schulz source")
+            assert mnemonic not in src, (
+                f"{arch}: zero-fragment {mnemonic!r} must be skipped (MED.8)")
+            assert "SCALAR mainloop" in src, (
+                f"{arch}: expected scalar GEMM mainloop in Newton–Schulz source")
         # End-to-end: muon routes through the dispatcher to a GEMM-bearing
         # synth file; adamw stays on the elementwise pattern. Distinct
         # pattern_name in the emitted filename proves the hardcode is gone.
@@ -21698,6 +22580,79 @@ def _self_test_synth_codegen(run) -> None:
             # bf16 maps to __nv_bfloat16 in the emitted CUDA source.
             assert "bfloat16" in text or "__nv_bfloat16" in text, text[:200]
 
+    def test_native_mma_zero_fragment_stub_skipped_scalar_live():
+        """Review fix MED.8 — _gemm_native_mma_mainloop returns None for every
+        stub arch (wgmma/tcgen05/mfma/wmma) until real fragment loads are wired,
+        so the caller emits the numerically-correct scalar mainloop. Proves the
+        zero-fragment native path can no longer be selected (it would compute
+        all-zero results and could win a sweep when validation is off)."""
+        assert not _MMA_NATIVE_LOADS_WIRED, (
+            "native MMA loads now wired — update MED.8 tests to assert the real "
+            "opcode + a numerical check instead of the scalar fallback")
+        feats = {
+            "sm_90a":  frozenset({"wgmma"}),
+            "sm_100a": frozenset({"tcgen05"}),
+            "gfx942":  frozenset({"mfma"}),
+            "gfx1100": frozenset({"wmma"}),
+        }
+        for arch, fs in feats.items():
+            res = _gemm_native_mma_mainloop(arch, fs, "fp16",
+                                            256, 256, 256, 64, 128, 16)
+            assert res is None, (
+                f"{arch}: zero-fragment native MMA must be SKIPPED (None), "
+                f"got {res!r}")
+        # The full GEMM emitter then produces a scalar kernel with the stub
+        # marker — never the zeroed-fragment intrinsics.
+        node = OpNode(op_kind="gemm", name="g", inputs=["A", "B"], output="C",
+                      attrs={"M": 128, "N": 128, "K": 128})
+        with tempfile.TemporaryDirectory() as td:
+            src = _emit_gemm_cuda(node, "fp16", "sm_90a", Path(td),
+                                  frozenset({"wgmma"}))
+        assert "a_frag = {0" not in src, "zeroed MFMA/WMMA fragment leaked"
+        assert 'r"(0)' not in src and "wgmma.mma_async" not in src, (
+            "bogus cp.async / wgmma asm leaked into emitted source")
+        assert "NOT WIRED" in src and "acc += (" in src, (
+            "scalar mainloop + honest stub marker must be present")
+        sys.stdout.write(
+            "    [mma-stub] wgmma/tcgen05/mfma/wmma zero-fragment paths skipped "
+            "→ scalar mainloop emitted (loud, no zeros-win)\n")
+
+    def test_hip_dtypes_use_hip_spellings_and_fp8_is_loud():
+        """Review fix MED.7 — HIP synth/rt-compile sources use HIP scalar
+        spellings, never the CUDA ones (which hipcc/hiprtc can't compile).
+        bf16 → __hip_bfloat16 (CUDA path stays __nv_bfloat16); FP8 on HIP is a
+        LOUD SynthCodegenError, not a silently-miscompiled __nv_fp8 source."""
+        # Dtype-triple: vendor-correct bf16 spelling.
+        assert _synth_dtype_triple("bf16", is_hip=False)[0] == "__nv_bfloat16"
+        assert _synth_dtype_triple("bf16", is_hip=True)[0] == "__hip_bfloat16"
+        # _resolve_ctype (rt-compile template path) mirrors it.
+        assert _resolve_ctype("bf16", is_hip=False) == "__nv_bfloat16"
+        assert _resolve_ctype("bf16", is_hip=True) == "__hip_bfloat16"
+        # FP8 on HIP → loud unsupported (every FP8 token).
+        for tok in ("fp8", "e4m3", "e5m2"):
+            raised = False
+            try:
+                _synth_dtype_triple(tok, is_hip=True)
+            except SynthCodegenError:
+                raised = True
+            assert raised, f"FP8 token {tok!r} must raise on HIP"
+            # CUDA still resolves FP8 (the type exists there).
+            assert "fp8" in _synth_dtype_triple(tok, is_hip=False)[0].lower()
+        # End-to-end: a bf16 synth source for a gfx arch carries the HIP type +
+        # the HIP bf16 header, not the CUDA ones.
+        if "gfx942" in ARCH_TABLE:
+            node = OpNode(op_kind="elementwise", name="copy",
+                          inputs=["x"], output="y", attrs={"expr": "x + x"})
+            g = OpGraph(inputs={"x": ("bf16", (256,))}, nodes=[node],
+                        output="y")
+            src = synthesize_kernel(g, "gfx942", "bf16", (256,))
+            assert "__hip_bfloat16" in src and "__nv_bfloat16" not in src, (
+                "HIP synth source must use __hip_bfloat16, not the CUDA type")
+            assert "hip/hip_bf16.h" in src, "HIP bf16 header missing"
+        sys.stdout.write(
+            "    [hip-dtype] bf16→__hip_bfloat16 (+hip_bf16.h); FP8 on HIP is a "
+            "loud SynthCodegenError\n")
+
     def test_registry_bakes_tuned_config():
         """#15 — the registry's cubin cache key + template incorporate the
         tuned block/vec/unroll, so a re-tuned config produces a new cubin
@@ -21724,6 +22679,10 @@ def _self_test_synth_codegen(run) -> None:
         test_synth_unknown_optimizer_compiles_source_not_default)
     run("synth_dtype_from_config", test_synth_dtype_from_config)
     run("synth_emits_configured_dtype", test_synth_emits_configured_dtype)
+    run("native_mma_zero_fragment_stub_skipped_scalar_live",
+        test_native_mma_zero_fragment_stub_skipped_scalar_live)
+    run("hip_dtypes_use_hip_spellings_and_fp8_is_loud",
+        test_hip_dtypes_use_hip_spellings_and_fp8_is_loud)
     run("registry_bakes_tuned_config", test_registry_bakes_tuned_config)
 
     # Stream H — final wrapper: only runs the e2e smoke when a GPU is
@@ -21982,7 +22941,7 @@ def _self_test_math_drift_guard(run) -> None:
 # The count INCLUDES the count_guard case itself (it is a ``run(...)`` like
 # any other), so the value is the grand total reported on the final
 # ``[self-test] N passed, M failed`` line.
-_SELF_TEST_EXPECTED_COUNT: int = 231
+_SELF_TEST_EXPECTED_COUNT: int = 238
 
 
 def _self_test() -> int:
@@ -24775,8 +25734,36 @@ def _synth_arch_features(arch: str) -> frozenset:
     return frozenset()
 
 
-def _synth_dtype_triple(dtype: str) -> Tuple[str, str, str]:
-    """Resolve (scalar_t, accum_t, jax_t) for ``dtype``; default to fp32."""
+# MED.7 — HIP has its OWN low-precision scalar types; the CUDA spellings in
+# _SYNTH_DTYPE_MAP (__nv_bfloat16 / __nv_fp8_e4m3 / ...) do not exist under
+# hipcc and would fail to compile if emitted into a .hip.cpp source. bf16 maps
+# to __hip_bfloat16 (from <hip/hip_bf16.h>); FP8 has no portable hip_fp8 scalar
+# in the supported ROCm baseline, so it is a LOUD unsupported error rather than
+# a silently-miscompiled source.
+_SYNTH_DTYPE_MAP_HIP: Dict[str, Tuple[str, str, str]] = {
+    "bf16":     ("__hip_bfloat16", "float", "jnp.bfloat16"),
+    "bfloat16": ("__hip_bfloat16", "float", "jnp.bfloat16"),
+}
+_SYNTH_FP8_TOKENS: frozenset = frozenset({"fp8", "e4m3", "e5m2"})
+
+
+def _synth_dtype_triple(dtype: str,
+                        is_hip: bool = False) -> Tuple[str, str, str]:
+    """Resolve (scalar_t, accum_t, jax_t) for ``dtype``; default to fp32.
+
+    MED.7: when ``is_hip`` is True, low-precision types are remapped to their
+    HIP scalar spellings (bf16 → ``__hip_bfloat16``); FP8 (no portable HIP
+    scalar in the ROCm baseline) raises ``SynthCodegenError`` loudly instead of
+    emitting a CUDA ``__nv_fp8_*`` type that hipcc cannot compile."""
+    if is_hip:
+        if dtype in _SYNTH_FP8_TOKENS:
+            raise SynthCodegenError(
+                f"synth dtype {dtype!r} (FP8) is unsupported on HIP/ROCm: there "
+                f"is no portable __hip_fp8 scalar in the supported baseline. "
+                f"Emit fp16/bf16/fp32 for this gfx target, or extend "
+                f"_SYNTH_DTYPE_MAP_HIP once a ROCm FP8 type is committed.")
+        if dtype in _SYNTH_DTYPE_MAP_HIP:
+            return _SYNTH_DTYPE_MAP_HIP[dtype]
     return _SYNTH_DTYPE_MAP.get(dtype, ("float", "float", "jnp.float32"))
 
 
@@ -25112,7 +26099,7 @@ def _emit_elementwise_cuda(node: OpNode,
     header include (handled by the caller). The expression body is
     inlined verbatim into the loop.
     """
-    scalar_t, _, _ = _synth_dtype_triple(dtype)
+    scalar_t, _, _ = _synth_dtype_triple(dtype, is_hip=is_hip)  # MED.7
     expr = str(node.attrs.get("expr", "x"))
     fn_name = f"synth_elementwise_{_synth_sanitize(node.name)}"
     n_elems = 1
@@ -25153,7 +26140,7 @@ def _emit_reduce_cuda(node: OpNode,
     """Warp-shuffle reduction for small tensors, block-reduce + atomic
     for large tensors (above ``_REDUCE_WARP_FAST_THRESHOLD``).
     """
-    scalar_t, accum_t, _ = _synth_dtype_triple(dtype)
+    scalar_t, accum_t, _ = _synth_dtype_triple(dtype, is_hip=is_hip)  # MED.7
     op = str(node.attrs.get("op", "sum"))
     fn_name = f"synth_reduce_{_synth_sanitize(node.name)}"
     n_elems = 1
@@ -25258,6 +26245,24 @@ __device__ {accum_t} {_helper_name}({accum_t}* addr, {accum_t} val) {{
 """.rstrip("\n") + "\n"
 
 
+# Review fix MED.8 — the native-MMA mainloops below are ZERO-FRAGMENT STUBS:
+# the wgmma/tcgen05 paths never stage real A/B tiles into shared memory (the
+# cp.async dest operand is a literal 0), and the MFMA/WMMA paths feed explicitly
+# zeroed register fragments (``a_frag = {0,...}``) to the matrix intrinsic. On
+# the TARGET arch (where the #if is taken) they therefore compute on zeros and
+# emit a WRONG (all-zero) result, while only the #else scalar branch — taken on
+# OTHER archs — is correct. Shipping that as a "native MMA" variant is a silent
+# numerical bug: a zero-producing kernel that is fast (does no real work) could
+# win a sweep whenever numerical validation is disabled. Until real fragment
+# loads are wired, we LOUDLY skip the native path per arch (warn-once) and return
+# None so the caller emits its numerically-correct scalar triple-loop. Flip this
+# to True only when the #if branches stage real operands and pass the numerical
+# gate on silicon. The stub bodies are kept below (unreachable) as the wiring
+# scaffold so the opcode shapes are not lost.
+_MMA_NATIVE_LOADS_WIRED: bool = False
+_MMA_STUB_WARNED: set = set()
+
+
 def _gemm_native_mma_mainloop(arch: str, features: frozenset,
                               dtype: str,
                               M: int, N: int, K: int,
@@ -25276,9 +26281,37 @@ def _gemm_native_mma_mainloop(arch: str, features: frozenset,
     arch macro so the file compiles cleanly on hosts that target a
     different SM / GFX. The ``#else`` branch is a scalar triple-loop,
     keeping behaviour numerically correct across archs.
+
+    MED.8: until ``_MMA_NATIVE_LOADS_WIRED`` is True the native bodies are
+    zero-fragment stubs, so this returns None (loud warn-once per arch) and the
+    caller's scalar mainloop — numerically correct — is used instead.
     """
     if dtype not in ("fp16", "f16", "half", "bf16", "bfloat16",
                      "fp32", "f32", "float"):
+        return None
+    # MED.8 — would this arch+feature combo have selected a (stubbed) native
+    # opcode? If so, LOUDLY skip it (real fragment loads not wired yet) and let
+    # the caller emit the correct scalar mainloop.
+    if not _MMA_NATIVE_LOADS_WIRED:
+        _stub = None
+        if arch == "sm_90a" and "wgmma" in features:
+            _stub = "wgmma.mma_async"
+        elif arch == "sm_100a" and "tcgen05" in features:
+            _stub = "tcgen05.mma.async"
+        elif arch.startswith("gfx9") and "mfma" in features:
+            _stub = "v_mfma_f32_16x16x16_f16"
+        elif (arch.startswith(("gfx10", "gfx11", "gfx12"))
+              and "wmma" in features):
+            _stub = "v_wmma_f32_16x16x16_f16"
+        if _stub is not None and arch not in _MMA_STUB_WARNED:
+            _MMA_STUB_WARNED.add(arch)
+            sys.stderr.write(
+                f"  [synth-gemm] WARNING: native MMA opcode {_stub!r} for "
+                f"{arch} is a ZERO-FRAGMENT STUB (real A/B fragment loads not "
+                f"wired); SKIPPING the native path and emitting the "
+                f"numerically-correct SCALAR mainloop instead. This GEMM will "
+                f"NOT use tensor cores until the loads are implemented and pass "
+                f"the numerical gate on silicon.\n")
         return None
     # NVIDIA Hopper (sm_90a) → wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16
     if arch == "sm_90a" and "wgmma" in features:
@@ -25454,7 +26487,8 @@ def _emit_gemm_cuda(node: OpNode,
     OpGraph node's ``attrs``; they default to (64, 128, 16) — the
     canonical wgmma m64n128k16 tile — when unspecified.
     """
-    scalar_t, accum_t, _ = _synth_dtype_triple(dtype)
+    scalar_t, accum_t, _ = _synth_dtype_triple(
+        dtype, is_hip=(_synth_arch_vendor(arch) == "hip"))  # MED.7
     M = int(node.attrs.get("M", 0)) or 256
     N = int(node.attrs.get("N", 0)) or 256
     K = int(node.attrs.get("K", 0)) or 256
@@ -25499,7 +26533,9 @@ def _emit_gemm_cuda(node: OpNode,
 
     return f"""
 // node: {node.name} (gemm M={M} N={N} K={K})
-// no native MMA available for {arch}; using scalar mainloop
+// MED.8: native MMA (wgmma/tcgen05/mfma/wmma) is NOT WIRED for {arch} — the
+// native mainloop is a zero-fragment stub (real A/B fragment loads pending), so
+// we emit the numerically-correct SCALAR mainloop here. NOT a tensor-core path.
 {cutlass_note}__global__ void {fn_name}(
         const {scalar_t}* __restrict__ A,
         const {scalar_t}* __restrict__ B,
@@ -25522,7 +26558,7 @@ def _emit_scan_cuda(node: OpNode,
                     shape: Tuple[int, ...],
                     is_hip: bool) -> str:
     """Blelloch parallel scan (work-efficient, in-place on shared mem)."""
-    scalar_t, _, _ = _synth_dtype_triple(dtype)
+    scalar_t, _, _ = _synth_dtype_triple(dtype, is_hip=is_hip)  # MED.7
     op = str(node.attrs.get("op", "sum"))
     fn_name = f"synth_scan_{_synth_sanitize(node.name)}"
     combine = "+" if op == "sum" else "?"  # max-scan needs an op fn
@@ -25575,7 +26611,7 @@ def _emit_scatter_gather_cuda(node: OpNode,
                               shape: Tuple[int, ...],
                               is_hip: bool) -> str:
     """Indexed load (gather) or store (scatter) along ``axis``."""
-    scalar_t, _, _ = _synth_dtype_triple(dtype)
+    scalar_t, _, _ = _synth_dtype_triple(dtype, is_hip=is_hip)  # MED.7
     fn_name = f"synth_{node.op_kind}_{_synth_sanitize(node.name)}"
     if node.op_kind == "gather":
         body = (f"        {node.output}_ptr[i] = "
@@ -25747,8 +26783,13 @@ def synthesize_kernel(opgraph: OpGraph,
 
     if vendor in ("cuda", "hip"):
         is_hip = (vendor == "hip")
+        # MED.7 — emit the vendor-correct low-precision headers. HIP bf16 lives
+        # in <hip/hip_bf16.h> (NOT cuda_bf16.h); always include it on HIP so a
+        # bf16 synth source resolves __hip_bfloat16. (FP8 on HIP is rejected
+        # upstream by _synth_dtype_triple, so no hip_fp8 header is needed.)
         header_inc = ("#include <hip/hip_runtime.h>\n"
                       "#include <hip/hip_fp16.h>\n"
+                      "#include <hip/hip_bf16.h>\n"
                       if is_hip
                       else "#include <cuda_runtime.h>\n"
                            "#include <cuda_fp16.h>\n"
@@ -25822,7 +26863,7 @@ def synthesize_kernel(opgraph: OpGraph,
         # smoke launcher; real callers wire each kernel individually via
         # the per-node launch_ helpers that the cache index records.
         first_node = nodes[0] if nodes else None
-        scalar_t, _, _ = _synth_dtype_triple(dtype)
+        scalar_t, _, _ = _synth_dtype_triple(dtype, is_hip=is_hip)  # MED.7
         n_elems = 1
         for s in problem_shape:
             n_elems *= int(s)
@@ -26395,9 +27436,19 @@ _DTYPE_C_TYPE: Dict[str, str] = {
     "bf16":  "__nv_bfloat16", "bfloat16": "__nv_bfloat16",
     "fp64":  "double", "f64":   "double", "double": "double",
 }
+# MED.7 — HIP spellings for the low-precision scalar types that differ from CUDA
+# (the rt-compile template path also reaches the HIP backend via _hiprtc_compile).
+_DTYPE_C_TYPE_HIP: Dict[str, str] = {
+    "bf16":  "__hip_bfloat16", "bfloat16": "__hip_bfloat16",
+}
 
 
-def _resolve_ctype(dtype: str) -> str:
+def _resolve_ctype(dtype: str, is_hip: bool = False) -> str:
+    """Map a dtype mnemonic to its C scalar type. MED.7: on HIP, bf16 resolves
+    to __hip_bfloat16 (not the CUDA __nv_bfloat16 that hipcc/hiprtc can't
+    compile)."""
+    if is_hip and dtype in _DTYPE_C_TYPE_HIP:
+        return _DTYPE_C_TYPE_HIP[dtype]
     return _DTYPE_C_TYPE.get(dtype, dtype)
 
 
@@ -26500,7 +27551,7 @@ class KernelRegistry:
             except (TypeError, ValueError):
                 return default
         src = self._template_provider(op, self.arch).format(
-            DTYPE=_resolve_ctype(dtype),
+            DTYPE=_resolve_ctype(dtype, is_hip=(self.vendor == "hip")),  # MED.7
             SHAPE_DIMS=len(example_shape),
             SIZE_HINT=_shape_class_size(shape_cls),
             BLOCK=_tc_int("block", 256),

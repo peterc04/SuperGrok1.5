@@ -22,12 +22,20 @@ it never triggers ``grokking_optimizers/__init__.py`` (which does
 ``import torch`` + ``get_ops()`` and would probe CUDA). Do NOT add any
 ``grokking_optimizers``-relative imports or third-party imports here.
 
-SCOPE (phase 1 — the five SAFE per-TU dims only): block / vec / unroll /
-async_depth as ``-DSG_TUNED_*`` macros, plus maxrregcount as a real
-``--maxrregcount=N`` ptxas flag. ``cluster_shape`` and the feature macros
-(TMA / WGMMA / fp8 / swizzle / ...) are component-scoped and riskier
-(they change which kernel specialization compiles); they are deliberately
-phase-2 and are NOT emitted here.
+SCOPE — the five canonical SAFE per-TU dims (block / vec / unroll /
+async_depth as ``-DSG_TUNED_*`` macros + maxrregcount as a real
+``--maxrregcount=N`` ptxas flag) are hardcoded in :data:`MACROS` as the
+always-known floor. Review fix P0.2: the exporter ALSO persists EVERY OTHER
+winner dim that carries a macro in the live search space (cluster_shape, and
+any feature macro a kernel begins consuming), together with the dim→macro map
+the producer derived. The consumer (:func:`source_extra_nvcc_flags`) reads that
+persisted ``_macros`` map so it can emit ``-D<macro>=<v>`` for dims it has no
+hardcoded entry for — WITHOUT importing compile.py (this module stays pure
+stdlib). Tuple dims (cluster_shape) emit nvcc-safe per-axis scalar macros
+``<MACRO>_0/_1/_2`` plus ``<MACRO>_VOLUME`` exactly as compile.py's
+``resolve_macros`` does (a single ``-Dfoo=2,1,1`` is rejected by the -D lexer).
+An unknown macro (no map entry, not in MACROS) is IGNORED with a one-line
+warning so a stale setup.py degrades gracefully (task P0.2).
 """
 
 from __future__ import annotations
@@ -184,6 +192,11 @@ def optimizer_for_source(path: str) -> Optional[str]:
 # --------------------------------------------------------------------------
 # Flag computation.
 # --------------------------------------------------------------------------
+# Warn at most once per (arch, dim) about an unmapped macro dim, so a stale
+# setup.py degrades gracefully (P0.2) without spamming the build log.
+_WARNED_UNMAPPED: set = set()
+
+
 def source_extra_nvcc_flags(optimizer: Optional[str],
                             tuned: Optional[Dict[str, Any]],
                             arch_key: str) -> List[str]:
@@ -194,20 +207,31 @@ def source_extra_nvcc_flags(optimizer: Optional[str],
     (no JSON), the arch is absent, or the optimizer has no recorded winner.
     Same value is applied to every TU of the same optimizer (design 1b).
 
-    The emitted list is deterministic (``_EMIT_ORDER``); macro dims become
-    ``-D<macro>=<v>`` and ``maxrregcount`` becomes ``--maxrregcount=<n>``
-    only when ``n > 0``.
+    Deterministic order: the five hardcoded SAFE dims first (``_EMIT_ORDER``),
+    then any EXTRA persisted macro dims (P0.2) in sorted order. Scalar macro
+    dims become ``-D<macro>=<v>``; tuple dims (cluster_shape) become per-axis
+    ``-D<macro>_0/_1/_2`` + ``-D<macro>_VOLUME`` (nvcc rejects ``-Dfoo=2,1,1``);
+    ``maxrregcount`` becomes ``--maxrregcount=<n>`` only when ``n > 0``. The
+    extra dims' macro names come from the persisted ``_macros`` map; an
+    UNKNOWN dim (not SAFE and not in the map) is ignored with a one-line
+    warning (graceful degradation for a stale reader).
     """
     if optimizer is None or not tuned:
         return []
-    arch_block = tuned.get(canonical_arch_key(arch_key))
+    canon = canonical_arch_key(arch_key)
+    arch_block = tuned.get(canon)
     if not isinstance(arch_block, dict):
         return []
     combo = arch_block.get(optimizer)
     if not isinstance(combo, dict):
         return []
+    # P0.2 — producer-persisted dim→macro map for the extra (non-SAFE) dims.
+    macro_map = arch_block.get("_macros")
+    if not isinstance(macro_map, dict):
+        macro_map = {}
 
     flags: List[str] = []
+    # (1) hardcoded SAFE floor, in canonical emit order.
     for key in _EMIT_ORDER:
         if key not in combo:
             continue
@@ -225,7 +249,53 @@ def source_extra_nvcc_flags(optimizer: Optional[str],
                 continue
             if n > 0:
                 flags.append(f"{spec['flag']}={n}")
+    # (2) extra persisted macro dims (cluster_shape + any consumed feature
+    # macro), sorted for deterministic build.ninja output. Skip the SAFE dims
+    # (already emitted), the model provenance, and any internal bookkeeping.
+    for key in sorted(combo.keys()):
+        if key in MACROS or key in _NON_DIM_KEYS:
+            continue
+        value = combo[key]
+        macro = macro_map.get(key)
+        if not macro:
+            # Unknown dim with no mapping — a stale setup.py can't know its
+            # macro name. Ignore it (graceful degradation) but say so once.
+            wk = (canon, key)
+            if wk not in _WARNED_UNMAPPED:
+                _WARNED_UNMAPPED.add(wk)
+                import sys as _sys
+                _sys.stderr.write(
+                    f"  [tuned-inject] WARNING: winner dim {key!r} for "
+                    f"{optimizer}/{canon} has no macro mapping in the JSON's "
+                    f"_macros table; skipping it (the kernel keeps its in-header "
+                    f"default). Re-export with a current compile.py to map it.\n")
+            continue
+        flags.extend(_emit_macro_flags(macro, value))
     return flags
+
+
+def _emit_macro_flags(macro: str, value: Any) -> List[str]:
+    """Emit nvcc-safe ``-D`` flags for one macro dim's value.
+
+    Mirrors compile.py's ``resolve_macros``: a tuple/list value (cluster_shape)
+    becomes per-axis ``-D<macro>_0/_1/_2`` plus ``-D<macro>_VOLUME=<product>``
+    (a single ``-Dfoo=2,1,1`` is rejected by the -D lexer); a scalar becomes
+    ``-D<macro>=<v>``."""
+    if isinstance(value, (tuple, list)):
+        out: List[str] = []
+        comps = list(value)
+        for i, comp in enumerate(comps):
+            out.append(f"-D{macro}_{i}={_macro_value(comp)}")
+        vol = 1
+        for comp in comps:
+            try:
+                vol *= int(comp)
+            except (TypeError, ValueError):
+                vol = 0
+                break
+        out.append(f"-D{macro}_VOLUME={vol}")
+        return out
+    return [f"-D{macro}={_macro_value(value)}"]
 
 
 def _macro_value(value: Any) -> str:
@@ -285,31 +355,71 @@ def load_tuned(path: Optional[str] = None) -> Optional[Dict[str, Any]]:
 # --------------------------------------------------------------------------
 # JSON export (producer side — compile.py build_jit).
 # --------------------------------------------------------------------------
-# Only the safe per-TU dims are persisted; everything else in the winning
-# combo (timing_ms, config_key, feature macros, fast-math markers, ...) is
-# dropped from the JSON. The JSON is a STABLE handoff contract, not a dump of
-# the autotuner's internal trial record.
+# The five SAFE per-TU dims are ALWAYS persisted (the MACROS floor). Review fix
+# P0.2: EVERY other winner dim that carries a macro in the live search space is
+# persisted too (so a winning cluster_shape / feature-macro value actually
+# reaches the product build instead of being silently dropped). Bookkeeping keys
+# (timing_ms, config_key, stage_won, fast-math markers, ...) are still dropped —
+# the JSON is a STABLE handoff contract, not a dump of the trial record.
 _PERSIST_KEYS = tuple(MACROS.keys())  # block, vec, unroll, async_depth, maxrregcount
 
+# Combo keys that are autotuner bookkeeping, never a tunable macro dim — always
+# dropped from the persisted payload regardless of the macro map.
+_NON_DIM_KEYS = frozenset({
+    "timing_ms", "config_key", "stage_won", "_fastmath", "origin", "status",
+    "error", "value_ms", "trial_num", "stage", "host", "model",
+})
 
-def _winner_payload(combo: Dict[str, Any]) -> Dict[str, Any]:
-    """Project a winner combo down to the persisted per-TU dims."""
+
+def _coerce_scalar(value: Any) -> Optional[Any]:
+    """Coerce a winner value to a JSON-stable scalar, or None to skip."""
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, (int, float, str)):
+        return value
+    return None
+
+
+def _winner_payload(combo: Dict[str, Any],
+                    macro_map: Optional[Dict[str, str]] = None
+                    ) -> Dict[str, Any]:
+    """Project a winner combo down to the persisted dims.
+
+    P0.2: persists (a) the five hardcoded SAFE dims (always), and (b) EVERY
+    extra combo key present in ``macro_map`` (the producer-derived dim→macro
+    map from the live search space). Scalars persist as-is; tuple/list dims
+    (cluster_shape) persist as a list so the consumer can emit per-axis macros.
+    Keys that are neither a SAFE dim nor in the macro map are dropped (they are
+    bookkeeping or non-macro flags)."""
     payload: Dict[str, Any] = {}
+    # (a) hardcoded SAFE floor.
     for key in _PERSIST_KEYS:
         if key not in combo:
             continue
         value = combo[key]
         if MACROS[key]["kind"] == "flag":
-            # maxrregcount stored as int (0 == unset).
             try:
-                payload[key] = int(value)
+                payload[key] = int(value)  # maxrregcount (0 == unset)
             except (TypeError, ValueError):
                 continue
-        elif isinstance(value, bool):
-            payload[key] = bool(value)
-        elif isinstance(value, (int, float, str)):
-            payload[key] = value
-        # tuples/lists (e.g. cluster_shape) are intentionally NOT persisted.
+        else:
+            sv = _coerce_scalar(value)
+            if sv is not None:
+                payload[key] = sv
+    # (b) every extra macro-carrying dim the producer derived from the space.
+    for key, _macro in (macro_map or {}).items():
+        if key in payload or key in _NON_DIM_KEYS or key not in combo:
+            continue
+        value = combo[key]
+        if isinstance(value, (tuple, list)):
+            # Persist tuple dims (e.g. cluster_shape) as a list of ints/scalars;
+            # the consumer emits FOO_0/_1/_2 + FOO_VOLUME (nvcc-safe).
+            payload[key] = [_coerce_scalar(v) for v in value
+                            if _coerce_scalar(v) is not None]
+        else:
+            sv = _coerce_scalar(value)
+            if sv is not None:
+                payload[key] = sv
     return payload
 
 
@@ -320,13 +430,22 @@ def export_winner(optimizer: str,
                  *,
                  path: Optional[str] = None,
                  source: str = "compile.build_jit",
-                 version_hash: Optional[str] = None) -> bool:
+                 version_hash: Optional[str] = None,
+                 macro_map: Optional[Dict[str, str]] = None) -> bool:
     """Persist ONE (arch, optimizer) winner to the canonical JSON.
 
     READ-MERGE-WRITE (design 1a): ``build_jit`` runs a single optimizer, so
     this merges into any existing JSON rather than overwriting — tuning all
     11 optimizers in sequence accumulates 11 entries. The write is atomic
     (tmp file + ``os.replace``) so a reader never sees a half-written file.
+
+    ``macro_map`` (P0.2) is the producer-derived ``{dim_name: SG_TUNED_MACRO}``
+    map for THIS arch's live search space. The extra (non-SAFE) dims it names
+    are persisted in the winner, and the map itself is recorded in the arch
+    block under ``_macros`` so the stdlib-only consumer
+    (:func:`source_extra_nvcc_flags`) can emit ``-D<macro>=<v>`` for them
+    WITHOUT importing compile.py. When ``None`` (legacy callers), behaviour is
+    the old SAFE-5-only export.
 
     Returns ``True`` on success, ``False`` on any failure. This function
     MUST NEVER raise into the caller — a failed persist is a loud warning,
@@ -341,7 +460,7 @@ def export_winner(optimizer: str,
     try:
         target = path or KERNEL_TUNED_JSON
         arch_key = canonical_arch_key(arch)
-        payload = _winner_payload(combo)
+        payload = _winner_payload(combo, macro_map)
 
         # Read-merge: start from any existing JSON so sibling optimizers'
         # winners survive. A corrupt existing file is discarded (we cannot
@@ -355,6 +474,15 @@ def export_winner(optimizer: str,
         entry = dict(payload)
         entry["model"] = model  # provenance: which model's sweep won this.
         arch_block[optimizer] = entry
+        # P0.2 — record the dim→macro map for this arch so the consumer can
+        # apply the extra (non-SAFE) macros. Merge so sibling optimizers'
+        # contributions accumulate; a per-arch map is shared across its opts.
+        if macro_map:
+            existing_map = arch_block.get("_macros")
+            if not isinstance(existing_map, dict):
+                existing_map = {}
+            existing_map.update({k: str(v) for k, v in macro_map.items() if v})
+            arch_block["_macros"] = existing_map
         existing[arch_key] = arch_block
 
         meta = existing.get("_meta")
