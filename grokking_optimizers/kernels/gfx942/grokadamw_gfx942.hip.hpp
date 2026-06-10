@@ -162,8 +162,21 @@ void launch_fused_grokadamw_step_q3(
     float lr, float weight_decay, float eps,
     float bc1, float bc2, unsigned global_step
 ) {
-    auto ea = exp_avg_int8.to(torch::kFloat32) * exp_avg_scales.repeat_interleave(
-        exp_avg_int8.numel() / exp_avg_scales.numel());
+    // CEIL block size: each per-block scale covers q_block_size consecutive
+    // int8 entries, with q_block_size = ceil(numel / num_scales) so that the
+    // per-element scale index i / q_block_size stays <= num_scales-1 for every i
+    // from 0 to numel-1. FLOOR division (the prior numel / num_scales) made
+    // q_block_size too small on a non-divisible numel, so the largest i indexed
+    // scale number num_scales -- one past the end (the sm_90 twin's Q3 OOB read,
+    // fixed in commit a9276b5; here it instead under-sized the repeat_interleave
+    // output so the dequantized state held fewer than numel elements). Slice to
+    // exactly numel since num_scales*q_block_size may exceed it.
+    const int64_t q_block_size = std::max<int64_t>(
+        1, (exp_avg_int8.numel() + exp_avg_scales.numel() - 1)
+               / exp_avg_scales.numel());
+    auto ea = exp_avg_int8.to(torch::kFloat32)
+        * exp_avg_scales.repeat_interleave(q_block_size)
+              .narrow(0, 0, exp_avg_int8.numel());
     auto eas = exp_avg_sq_bf16.to(torch::kFloat32);
     auto ema_f = ema_bf16.to(torch::kFloat32);
     std::vector<torch::Tensor> vp{param}, vea{ea}, veas{eas},

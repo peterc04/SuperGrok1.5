@@ -1815,3 +1815,55 @@ remaining checks need real accelerators:
 | WS2 | MI300X: numeric parity of the 11 gfx942 device apply kernels + Muon NS MFMA + SG2 adjoint + MoE vs their ATen references; confirm DPP/MFMA issue |
 | WS3 | H100: TF32 tensor-core FP32 path numerics (accepted ~10-bit-mantissa TC precision; `-DSG_FORCE_SCALAR_FP32` for exact); confirm WGMMA engages |
 | WS5 | TPU v6e: the 4 base `kernels/tpu` shims resolve to the same executed `launch_<opt>` math |
+
+## gfx942 drift-closure pass — sm_90→gfx942 semantic port (CPU-only; no hipcc here)
+
+The sm_90 optimizer kernels took on-silicon correctness fixes during the H100
+phase that the gfx942 (MI300X) twins had not yet received. This pass ports the
+SEMANTIC (math/behavior) fixes into the gfx942 ATen launchers — idiom (PTX/vec4/
+`__restrict__`/prmt) deltas are deliberately deferred to a CDNA3 pass on real
+silicon. Verified by line-by-line port review vs the canonical
+`csrc/algorithms/<opt>.h` headers + the sm_90 twins; CPU reference-parity
+(`tests/hw/test_reference_parity.py -m "not hw"`) 31/0; `scripts/
+check_math_single_source.py` unchanged (no canonical-math movement — the fixes
+make the gfx942 ATen match the existing canonical math). NO signatures changed →
+no `bindings.cpp` / `csrc/fused/gfx942/` caller edits. Nothing built (hipcc
+absent); all run/numeric gates below stay 🟡 for MI300X day-1.
+
+- **muon — INVERTED weight decay (LIVE BUG fixed).** Both gfx942 ATen launchers
+  `launch_muon_ns_combine_update_fused` and `launch_muon_update` applied
+  `param.mul_(1 - decay_factor)`, but `decay_factor = 1 - lr·wd` is the RETENTION
+  factor (canonical `muon.h::muon_update_step` = `param·decay_factor +
+  neg_lr_scale·orth`). The old form retained ≈lr·wd (~2%) of each weight per step
+  instead of ~98% — the identical inversion the sm_90 fused path had (commit
+  a9276b5, which flat-lined Muon until fixed). Now `param.mul_(decay_factor)`.
+  The §5.3 device `muon_apply_elem` was already correct (`p·decay + …`, decay
+  passed straight through); its contract comment was refreshed to match.
+- **grokadamw Q3 — per-block scale index overrun (semantic fix).** The gfx942
+  ATen dequant used `exp_avg_scales.repeat_interleave(numel / num_scales)` (FLOOR
+  division). On a non-divisible `numel` the interleaved scales were SHORTER than
+  `numel`, so the dequantized state had the wrong element count (the gfx942
+  manifestation of the sm_90 Q3 OOB read, ceil-fixed in a9276b5). Switched to
+  `q_block_size = ceil(numel / num_scales)` + `narrow(0,0,numel)`, so
+  `scale_idx = i / q_block_size ≤ num_scales-1` for every element — bit-identical
+  index mapping to the sm_90 `grokadamw_q3_kernel`.
+- **SG2 MoE dynamic-expert backward — nondeterministic default (mirrored).** The
+  gfx942 `moe_dynamic_expert_bwd` accumulated per-expert grads via `index_add_`,
+  which on a GPU device lowers to floating-point atomic scatter (run-to-run
+  NONDETERMINISTIC). The sm_90 twin (commit 5cb32b8) made the atomic path
+  NON-default and selects a deterministic one-block-per-expert reduction by
+  default, gating the fast path behind `SG2_ATOMIC_MOE_BWD=1`. Mirrored here: the
+  default is now an atomic-free per-expert one-hot contraction (`onehot[E,N] @
+  dgrad` — fixed reduction order, reproducible), with `SG2_ATOMIC_MOE_BWD=1`
+  restoring the `index_add_` fast path. AMBIGUOUS/flagged: `supergrok2_gfx942.
+  hip.hpp` is concurrently edited by a sibling agent (the `slows` grokfast-EMA
+  signature threading on `launch_csa_hca[_batched]_step`, already present and
+  correct vs canonical `sg2_apply_step`); this MoE-bwd edit is in a textually
+  DISJOINT region (no hunk overlap) but the file ownership overlap is noted.
+
+| arch | on-silicon check (🟡) — gfx942 drift-closure |
+|------|----------------------------------------------|
+| MI300X gfx942 | muon: weights RETAIN ~(1−lr·wd) per step (not ~lr·wd); fused + non-fused NS apply bit-match canonical `muon.h` and the sm_90 twin on a non-trivial wd>0 run |
+| MI300X gfx942 | grokadamw Q3: dequant state length == `numel` and `ea_scale[i]==scales[i/q_block_size]` for a non-divisible `numel`; full-step parity vs the fp32 grokadamw reference |
+| MI300X gfx942 | SG2 MoE bwd: deterministic default is run-to-run bit-stable AND equals the `SG2_ATOMIC_MOE_BWD=1` path within fp32 atomic tolerance; one-hot contraction grads match `torch.autograd` on the recompute graph |
+| MI300X gfx942 | hipcc front-end: all three edited `.hip.hpp` TUs compile (`<cstdlib>` for `std::getenv`; `scatter_`/`mm`/`narrow`/`repeat_interleave` lower); no signature/ABI drift vs `bindings.cpp` dispatch |

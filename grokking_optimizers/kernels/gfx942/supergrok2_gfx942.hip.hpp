@@ -116,6 +116,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>   // std::getenv (SG2_ATOMIC_MOE_BWD opt-in for the MoE bwd)
 
 #include "csrc/algorithms/supergrok2_bilevel_adjoint.h"
 
@@ -677,6 +678,7 @@ static void sg2_step_one_param(
     torch::Tensor& exp_avg,
     torch::Tensor& exp_avg_sq,
     torch::Tensor& mu,
+    torch::Tensor& slow,
     torch::Tensor& gru_state,
     // input projection
     const torch::Tensor& input_proj_W,
@@ -718,6 +720,10 @@ static void sg2_step_one_param(
 ) {
     using namespace torch::indexing;
     (void)indexer_rank;  // implied by idx_* tensor shapes
+    // `mu` (expert-output EMA) is consumed on the canonical sm_90 path; this
+    // ATen transcription folds the expert/GRU term into smart_g and carries the
+    // restored grokfast slow-grad EMA in the dedicated `slow` buffer instead.
+    (void)mu;
 
     const auto N = param.numel();
     if (N == 0) return;
@@ -877,9 +883,19 @@ static void sg2_step_one_param(
     // (8) smart_grad: g + rescale * gru[:, 0].  UNCHANGED.
     auto smart_g = g_flat + rescale * gru_new.index({Slice(), 0});
 
-    // (9) mu update and effective gradient.  UNCHANGED.
-    mu.reshape({N}).mul_(alpha_mu).add_(g_flat, 1.0f - alpha_mu);
-    auto eff_grad = smart_g + lamb_eff * mu.reshape({N});
+    // (9) slow-gradient EMA + grokfast effective gradient.
+    // Canonical (csrc/algorithms/supergrok2.h::sg2_apply_step) carries the
+    // slow-gradient EMA in the dedicated `slow` buffer (decay alpha) and the
+    // expert-output EMA in `mu`. This ATen transcription folds the expert/GRU
+    // term into `smart_g` (it has no separate expert-EMA), so it uses ONLY the
+    // slow buffer here: slow = alpha*slow + (1-alpha)*g ;
+    // eff_grad = smart_g + lamb_eff*slow. `mu` is consumed on the canonical
+    // sm_90 path's expert-EMA and stays untouched on this arch (the Python
+    // optimizer carries both buffers). This preserves the prior gfx942 grokfast
+    // behavior (was `lamb_eff*mu`, with mu the slow EMA) under the converged
+    // buffer naming.
+    slow.reshape({N}).mul_(alpha_mu).add_(g_flat, 1.0f - alpha_mu);
+    auto eff_grad = smart_g + lamb_eff * slow.reshape({N});
 
     // (10) AdamW step.  UNCHANGED.
     auto ea = exp_avg.reshape({N});
@@ -909,6 +925,7 @@ static void sg2_step_one_param(
 void launch_csa_hca_step(
     torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness,
     torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor mu,
+    torch::Tensor slow,
     torch::Tensor gru_state,
     // --- shared input projection ---
     torch::Tensor input_proj_W, torch::Tensor input_proj_b,
@@ -940,7 +957,7 @@ void launch_csa_hca_step(
     (void)expert_b1; (void)expert_b2;   // expert MLP biases unused on this path
     (void)d_model; (void)gru_hidden; (void)pk_dim; (void)expert_hidden;
     sg2_step_one_param(
-        param, grad, sharpness, exp_avg, exp_avg_sq, mu, gru_state,
+        param, grad, sharpness, exp_avg, exp_avg_sq, mu, slow, gru_state,
         input_proj_W, input_proj_b,
         csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
         csa_idx_DQ, csa_idx_UQ, csa_idx_K, csa_out_W,
@@ -966,6 +983,7 @@ void launch_csa_hca_batched_step(
     std::vector<torch::Tensor> exp_avgs,
     std::vector<torch::Tensor> exp_avg_sqs,
     std::vector<torch::Tensor> mus,
+    std::vector<torch::Tensor> slows,
     std::vector<torch::Tensor> gru_states,
     // --- shared input projection ---
     torch::Tensor input_proj_W, torch::Tensor input_proj_b,
@@ -1003,6 +1021,7 @@ void launch_csa_hca_batched_step(
     TORCH_CHECK(exp_avgs.size()        == n_params, "exp_avgs size mismatch");
     TORCH_CHECK(exp_avg_sqs.size()     == n_params, "exp_avg_sqs size mismatch");
     TORCH_CHECK(mus.size()             == n_params, "mus size mismatch");
+    TORCH_CHECK(slows.size()           == n_params, "slows size mismatch");
     TORCH_CHECK(gru_states.size()      == n_params, "gru_states size mismatch");
     TORCH_CHECK(alpha_mus.size()       == n_params, "alpha_mus size mismatch");
 
@@ -1010,7 +1029,7 @@ void launch_csa_hca_batched_step(
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
         sg2_step_one_param(
             params[i], grads[i], sharpness_list[i],
-            exp_avgs[i], exp_avg_sqs[i], mus[i], gru_states[i],
+            exp_avgs[i], exp_avg_sqs[i], mus[i], slows[i], gru_states[i],
             input_proj_W, input_proj_b,
             csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
             csa_idx_DQ, csa_idx_UQ, csa_idx_K, csa_out_W,
@@ -1858,11 +1877,41 @@ void moe_dynamic_expert_bwd(
     auto dx = torch::bmm(W1g.transpose(1, 2), dz1.unsqueeze(2)).squeeze(2); // [N,d_in]
     d_input.copy_(dx);
 
-    // Scatter-accumulate per-expert grads.
-    d_expert_w1.index_add_(0, idx, dW1);
-    d_expert_b1.index_add_(0, idx, db1);
-    d_expert_w2.index_add_(0, idx, dW2);
-    d_expert_b2.index_add_(0, idx, db2);
+    // Scatter-accumulate per-expert grads. Tensor::index_add_ on a GPU device is
+    // documented run-to-run NONDETERMINISTIC (it lowers to floating-point atomic
+    // scatter, completion-order-dependent). The sm_90 twin (commit 5cb32b8) made
+    // the per-token atomic path NON-default and selects a DETERMINISTIC
+    // one-block-per-expert (atomic-free, fixed-order) reduction by default,
+    // gating the fast atomic variant behind SG2_ATOMIC_MOE_BWD=1; HIP atomics
+    // have the same nondeterminism, so mirror that default here.
+    const char* atomic_env = std::getenv("SG2_ATOMIC_MOE_BWD");
+    const bool use_atomic = (atomic_env != nullptr && atomic_env[0] == '1');
+    if (use_atomic) {
+        // Fast (nondeterministic) atomic scatter — opt-in for speed comparisons.
+        d_expert_w1.index_add_(0, idx, dW1);
+        d_expert_b1.index_add_(0, idx, db1);
+        d_expert_w2.index_add_(0, idx, dW2);
+        d_expert_b2.index_add_(0, idx, db2);
+        return;
+    }
+    // Deterministic default: per-expert reduction via a dense one-hot contraction
+    // (onehot[E,N] @ dgrad[N,...]). A matmul/sum reduction has a FIXED summation
+    // order, so the result is reproducible run-to-run (atomic-free), matching the
+    // sm_90 deterministic one-block-per-expert default. Mathematically identical
+    // to index_add_ (Σ over the tokens routed to each expert), only the reduction
+    // order differs. onehot[e,n] = 1 iff token n routed to expert e.
+    const int64_t E = expert_w1.size(0);
+    auto onehot = torch::zeros({E, N}, x.options());                  // [E,N]
+    onehot.scatter_(0, idx.reshape({1, N}), 1.0f);
+    // W1/b1: [E,H,d_in] += onehot @ dW1[N,H,d_in] (flatten trailing dims to mm).
+    d_expert_w1.add_(torch::mm(onehot, dW1.reshape({N, -1}))
+                         .reshape(d_expert_w1.sizes()));
+    d_expert_b1.add_(torch::mm(onehot, db1.reshape({N, -1}))
+                         .reshape(d_expert_b1.sizes()));
+    d_expert_w2.add_(torch::mm(onehot, dW2.reshape({N, -1}))
+                         .reshape(d_expert_w2.sizes()));
+    d_expert_b2.add_(torch::mm(onehot, db2.reshape({N, -1}))
+                         .reshape(d_expert_b2.sizes()));
 }
 
 // ── (9) Compacted selective scan — VESTIGIAL ──

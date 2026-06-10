@@ -209,9 +209,15 @@ void launch_muon_ns_combine_update_fused(
 ) {
     // Y = a*X + b*AX + c*AAX
     auto Y = a * X + b * AX + c * AAX;
-    // param = param + neg_lr_scale*Y - decay_factor*param
-    //       = (1 - decay_factor)*param + neg_lr_scale*Y
-    param.mul_(1.0f - decay_factor).add_(Y.to(param.scalar_type()), neg_lr_scale);
+    // decay_factor = 1 - lr*wd is the RETENTION factor (host: muon_fused_step,
+    // csrc/bindings/bindings.cpp). The canonical update (csrc/algorithms/muon.h
+    // muon_update_step, and the sm_90 twin muon_ns_combine_update_kernel) is
+    // param = param*decay_factor + neg_lr_scale*Y. The previous mul_(1 -
+    // decay_factor) inverted it (retained lr*wd≈2% of the param each step
+    // instead of 98%) — the same INVERTED-weight-decay bug fixed on sm_90 in
+    // commit a9276b5; it silently destroyed the weights through the fused NS
+    // path while flat-lining training.
+    param.mul_(decay_factor).add_(Y.to(param.scalar_type()), neg_lr_scale);
 }
 
 void launch_muon_momentum_normalize(
@@ -235,9 +241,12 @@ void launch_muon_ns_combine(
 void launch_muon_update(
     torch::Tensor param, torch::Tensor orth, float neg_lr_scale, float decay_factor
 ) {
-    // param = param + neg_lr_scale*orth - decay_factor*param
-    //       = (1 - decay_factor)*param + neg_lr_scale*orth
-    param.mul_(1.0f - decay_factor).add_(orth.to(param.scalar_type()), neg_lr_scale);
+    // decay_factor = 1 - lr*wd is the RETENTION factor. Canonical update
+    // (csrc/algorithms/muon.h muon_update_step; sm_90 twin launch_muon_update /
+    // muon_update_kernel) is param = param*decay_factor + neg_lr_scale*orth.
+    // The previous mul_(1 - decay_factor) inverted weight decay (same bug class
+    // as the fused path above / the sm_90 a9276b5 fix).
+    param.mul_(decay_factor).add_(orth.to(param.scalar_type()), neg_lr_scale);
 }
 
 }} // namespace sg::gfx942
@@ -564,10 +573,13 @@ extern "C" SG_KERNEL_BOUNDS(64, 4) void muon_gfx942_newton_schulz(
 // host scalars are known, the apply is the decoupled-weight-decay step from
 // launch_muon_update() / launch_muon_step() stage (5):
 //   param = param·decay + neg_lr_scale·orth
-// where decay = 1 - lr·wd and neg_lr_scale = -lr·0.2·sqrt(max(rows,cols)) are
-// uniform host scalars. Math is verbatim from the ATen body
-// (param.mul_(1 - decay_factor).add_(orth, neg_lr_scale), here folded as
-// param·decay + neg_lr_scale·orth with decay = 1 - decay_factor).
+// where decay = 1 - lr·wd is the RETENTION factor and neg_lr_scale =
+// -lr·0.2·sqrt(max(rows,cols)) are uniform host scalars. This `decay` is the
+// host's decay_factor passed straight through (decay == decay_factor). Math is
+// verbatim from the ATen body
+// (param.mul_(decay_factor).add_(orth, neg_lr_scale)) and from canonical
+// csrc/algorithms/muon.h::muon_update_step (param·decay_factor + neg_lr_scale·
+// orth).
 //
 // VECTORIZATION (WS5/B — scalar→f32x4): the fp32 path is bandwidth-bound, so the
 // bulk loop is widened to 128-bit (dwordx4) memory access. orth is vector-loaded
