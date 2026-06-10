@@ -322,6 +322,8 @@ def make_plot(rows, path):
                            ("tf32_tc", "TF32 tensor-core peak", "-."),
                            ("bf16_tc", "BF16/FP16 tensor-core peak", ":"),
                            ("fp8_tc", "FP8/INT8 tensor-core peak", (0, (1, 1)))]:
+        if PEAKS.get(key) is None:  # fp8/int8 peaks retired with the precision program
+            continue
         ax.plot(ais, np.minimum(PEAKS[key], ais * PEAKS["hbm_bw"]),
                 ls, lw=1.2, label=label)
     colors = {"decoder": "#1f77b4", "vit": "#2ca02c", "mamba": "#d62728"}
