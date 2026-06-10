@@ -70,6 +70,10 @@ ignore = [
 # functional gain is riskier than the style. Scoped here so the rest of the
 # tree still enforces E701/E702/E401/F541.
 "grokking_race_v2.py" = ["E701", "E702", "E401", "F541"]
+# The tuner package follows the race driver's compact idiom (it embeds the
+# same train-fn dispatch tables and progress one-liners) — same rationale,
+# same scoping as above.
+"tuning/*.py" = ["E701", "E702"]
 
 [format]
 # Match the existing code style — 4-space indent, double quotes, trailing

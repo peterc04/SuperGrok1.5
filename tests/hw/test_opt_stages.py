@@ -42,23 +42,14 @@ from tests.hw.test_reference_parity import (  # noqa: E402
 )
 
 
-# NOTE on prodigy: we do NOT reuse ``ref_prodigy_partials`` from
-# test_reference_parity.py — it is STALE relative to the canonical math in
-# csrc/algorithms/prodigy.h (the single source of truth, SOURCE_OF_TRUTH.md):
-#   * its r uses d_prev^1   ; prodigy.h:48 uses d_prev^2 (degree-2, scale-free).
-#   * its s uses SIGNED g   ; prodigy.h:52 uses fabsf(g) (the L1 norm ‖·‖₁,
-#                             the documented arxiv 2306.06101 denominator).
-# The stage MIRRORS the canonical header (the device code calls
-# prodigy_partials_step), so the oracle here transcribes prodigy.h:48,52
-# directly. ``ref_prodigy_update_d`` (max(d_prev, r/|s|)) matches the header
-# (prodigy.h:56-65) and IS reused. The sibling test file is left untouched.
-def ref_prodigy_partials_canonical(p, p_init, g, *, d_prev):
-    """fp64 transcription of prodigy.h:48,52 (the canonical, NOT the stale ref):
-        r += g*(p_init - p)*d_prev^2 ;  s += d_prev^2 * |g|."""
-    p, p_init, g = map(_f64, (p, p_init, g))
-    r = (g * (p_init - p) * d_prev * d_prev).sum()
-    s = (d_prev * d_prev * g.abs()).sum()
-    return r, s
+# prodigy: ``ref_prodigy_partials`` in test_reference_parity.py was once STALE
+# vs csrc/algorithms/prodigy.h (d_prev^1 + signed g instead of the canonical
+# d_prev^2 + |g|, prodigy.h:48,52) — this file carried its own canonical copy
+# while the sibling was sibling-owned. The shared ref has since been fixed to
+# the canonical form, so it is the single fp64 transcription again; the alias
+# below keeps this file's call sites stable.
+from tests.hw.test_reference_parity import ref_prodigy_partials as \
+    ref_prodigy_partials_canonical
 
 
 # ===========================================================================

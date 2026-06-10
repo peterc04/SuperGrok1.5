@@ -12,3 +12,18 @@ third_party/*
 *.ptx
 .ruff_cache/
 .audit_notes.md
+# Host-specific autotuner winners (lever (b)): produced by
+# `grokking_optimizers.compile ... --jit-only`, consumed by setup.py's
+# TunedBuildExtension to bake per-TU flags into _ops*.so. NOT committed —
+# one host's tuned launch params must not silently apply to every build. A
+# wheel built on a tuned host still ships it via package_data. Delete it to
+# fall back to in-header kernel defaults. See AUTOTUNE_LINKAGE.md.
+grokking_optimizers/_kernel_tuned.json
+# Training data (regenerable via torchvision download) — 64 MB of binaries.
+data/
+# Tuner runtime artifacts: the Optuna journal + per-worker/launcher logs are
+# operational scratch, not deliverables (curated summaries live in results/
+# h100_grokking_race/). Era-archived journals stay local too.
+results/tuning/
+# NFS silly-rename handles (deleted-but-open files on NFS mounts).
+.nfs*
