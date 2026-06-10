@@ -1,0 +1,1464 @@
+{
+  "peaks": {
+    "fp32_cuda": 66900000000000.0,
+    "tf32_tc": 494700000000000.0,
+    "bf16_tc": 989400000000000.0,
+    "fp8_tc": 1978900000000000.0,
+    "int8_tc": 1978900000000000.0,
+    "hbm_bw": 3350000000000.0
+  },
+  "rows": [
+    {
+      "optimizer": "adamw",
+      "model": "decoder",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 59.55393116424187,
+      "wall_per_step_ms": 16.791502768173814,
+      "flops_per_step": 42392782156.8,
+      "bytes_per_step_analytical": 497567608.0,
+      "achieved_flops_per_s": 2524656830426.768,
+      "arithmetic_intensity": 85.20004412505888,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 285420147818947.25,
+      "fraction_of_roofline": 0.008845405097429397,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 29632107076.38848,
+      "fraction_of_hbm_bw": 0.008845405097429397,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.012458422221243382
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.017248213198035954
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.017509890999644995
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.017276333551853894
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.01752229481935501
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.01727207712829113
+        }
+      ]
+    },
+    {
+      "optimizer": "neuralgrok",
+      "model": "decoder",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 5.919119209409326,
+      "wall_per_step_ms": 168.94405478611588,
+      "flops_per_step": 46939564676.8,
+      "bytes_per_step_analytical": 497567608.0,
+      "achieved_flops_per_s": 277840878959.75836,
+      "arithmetic_intensity": 94.33806365626599,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 316032513248491.06,
+      "fraction_of_roofline": 0.0008791528317888506,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 2945161986.492649,
+      "fraction_of_hbm_bw": 0.0008791528317888505,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.15374519899487496
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.16842412296682596
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.16926189521327614
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.1716751167550683
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.17051301524043083
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.17192714624106883
+        }
+      ]
+    },
+    {
+      "optimizer": "grokadamw",
+      "model": "decoder",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 7.479128514170544,
+      "wall_per_step_ms": 133.70541743002832,
+      "flops_per_step": 42392782156.8,
+      "bytes_per_step_analytical": 500949648.0,
+      "achieved_flops_per_s": 317061065823.9432,
+      "arithmetic_intensity": 84.6248366997555,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 283493202944180.94,
+      "fraction_of_roofline": 0.0011184079989613425,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 3746666796.520497,
+      "fraction_of_hbm_bw": 0.0011184079989613423,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.12309788009151816
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.13652641819790007
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.13588899336755275
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.13690928993746637
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.136854743771255
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.13573889080435037
+        }
+      ]
+    },
+    {
+      "optimizer": "supergrok",
+      "model": "decoder",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 3.1744512834170604,
+      "wall_per_step_ms": 315.01507212407887,
+      "flops_per_step": 55367254839.3,
+      "bytes_per_step_analytical": 504331688.0,
+      "achieved_flops_per_s": 175760653183.89536,
+      "arithmetic_intensity": 109.78341467867473,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 367774439173560.4,
+      "fraction_of_roofline": 0.0004779033952953709,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 1600976374.2394924,
+      "fraction_of_hbm_bw": 0.0004779033952953709,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.2837237731553614
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.3145231266506016
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.31514062639325857
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.31622812235727904
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.31565623451024294
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.32040798403322696
+        }
+      ]
+    },
+    {
+      "optimizer": "supergrok15",
+      "model": "decoder",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 6.227621178835439,
+      "wall_per_step_ms": 160.57495651766658,
+      "flops_per_step": 44397589940.85,
+      "bytes_per_step_analytical": 504331688.0,
+      "achieved_flops_per_s": 276491371404.8887,
+      "arithmetic_intensity": 88.03252105160205,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 294908945522866.9,
+      "fraction_of_roofline": 0.0009375482690586944,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 3140786701.3466268,
+      "fraction_of_hbm_bw": 0.0009375482690586946,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.14279615646228194
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.16046992279589176
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.16191934812813996
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.16047696638852357
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.15962743051350117
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.16294738836586475
+        }
+      ]
+    },
+    {
+      "optimizer": "supergrok2",
+      "model": "decoder",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 2.5950138178768567,
+      "wall_per_step_ms": 385.3544027823955,
+      "flops_per_step": 46940884305.25,
+      "bytes_per_step_analytical": 521241888.0,
+      "achieved_flops_per_s": 121812243395.48262,
+      "arithmetic_intensity": 90.0558558049924,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 301687116946724.56,
+      "fraction_of_roofline": 0.00040377011994514054,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 1352629901.8162208,
+      "fraction_of_hbm_bw": 0.00040377011994514054,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.34483846044167876
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.3848069623112679
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.47972893100231884
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.35865617990493776
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.35080237528309227
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.47539878357201815
+        }
+      ]
+    },
+    {
+      "optimizer": "grokfast",
+      "model": "decoder",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 6.897714609425458,
+      "wall_per_step_ms": 144.97555445879698,
+      "flops_per_step": 42392782156.8,
+      "bytes_per_step_analytical": 500949648.0,
+      "achieved_flops_per_s": 292413312817.15027,
+      "arithmetic_intensity": 84.6248366997555,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 283493202944180.94,
+      "fraction_of_roofline": 0.0010314649867451168,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 3455407705.5961404,
+      "fraction_of_hbm_bw": 0.0010314649867451166,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.13143308823928238
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.1457901645451784
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.1461115324869752
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.14704406969249248
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.14831574875861406
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.14856253312900664
+        }
+      ]
+    },
+    {
+      "optimizer": "muon",
+      "model": "decoder",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 9.396563843847423,
+      "wall_per_step_ms": 106.4218810852617,
+      "flops_per_step": 46243407959.8,
+      "bytes_per_step_analytical": 497567608.0,
+      "achieved_flops_per_s": 434529135251.34283,
+      "arithmetic_intensity": 92.93894380640631,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 311345461751461.1,
+      "fraction_of_roofline": 0.0013956494911052083,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 4675425795.202448,
+      "fraction_of_hbm_bw": 0.0013956494911052083,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.09549394575878978
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.1059167331084609
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.10633708536624908
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.10612112460657955
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.10604055495932699
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.10588962715119124
+        }
+      ]
+    },
+    {
+      "optimizer": "lion",
+      "model": "decoder",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 49.84350963814399,
+      "wall_per_step_ms": 20.06279267370701,
+      "flops_per_step": 42392782156.8,
+      "bytes_per_step_analytical": 494185568.0,
+      "achieved_flops_per_s": 2113005046020.1995,
+      "arithmetic_intensity": 85.78312460310457,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 287373467420400.3,
+      "fraction_of_roofline": 0.007352818842280495,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 24631943121.639664,
+      "fraction_of_hbm_bw": 0.007352818842280497,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.01576289879158139
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.020883959624916314
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.021079142205417158
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.021080094575881957
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.02108294889330864
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.021066312864422797
+        }
+      ]
+    },
+    {
+      "optimizer": "looksam",
+      "model": "decoder",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 7.785383344796698,
+      "wall_per_step_ms": 128.44582671299577,
+      "flops_per_step": 50413196994.6,
+      "bytes_per_step_analytical": 500949648.0,
+      "achieved_flops_per_s": 392486064239.7138,
+      "arithmetic_intensity": 100.63525784651314,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 337128113785819.0,
+      "fraction_of_roofline": 0.0011642044913793938,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 3900085046.1209683,
+      "fraction_of_hbm_bw": 0.0011642044913793936,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.11528630508109927
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.1293125462718308
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.12958805300295353
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.12941060019657016
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.12950074514374138
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.12900039423257112
+        }
+      ]
+    },
+    {
+      "optimizer": "prodigy",
+      "model": "decoder",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 40.70364999795161,
+      "wall_per_step_ms": 24.567821314558387,
+      "flops_per_step": 42392782158.8,
+      "bytes_per_step_analytical": 504331688.0,
+      "achieved_flops_per_s": 1725540967431.203,
+      "arithmetic_intensity": 84.0573439414737,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 281592102203936.94,
+      "fraction_of_roofline": 0.006127803137680039,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 20528140511.228134,
+      "fraction_of_hbm_bw": 0.00612780313768004,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.017387674562633036
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.01924298331141472
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.019215612113475798
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.019217280484735966
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.019212074857205153
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.01923095704987645
+        }
+      ]
+    },
+    {
+      "optimizer": "adamw",
+      "model": "vit",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 35.466066681836075,
+      "wall_per_step_ms": 28.19596570916474,
+      "flops_per_step": 186123042544.0,
+      "bytes_per_step_analytical": 1959076648.0,
+      "achieved_flops_per_s": 6601052237891.717,
+      "arithmetic_intensity": 95.0054928856464,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 318268401166915.44,
+      "fraction_of_roofline": 0.020740520308297285,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 69480743032.7959,
+      "fraction_of_hbm_bw": 0.020740520308297282,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.02732344102114439
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.03003538055345416
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.030126826371997595
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.030099765583872794
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.030095423106104136
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.030089911818504334
+        }
+      ]
+    },
+    {
+      "optimizer": "neuralgrok",
+      "model": "vit",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 5.7901922679466775,
+      "wall_per_step_ms": 172.70583664998412,
+      "flops_per_step": 205722033288.0,
+      "bytes_per_step_analytical": 1959076648.0,
+      "achieved_flops_per_s": 1191170126490.4465,
+      "arithmetic_intensity": 105.00969091639135,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 351782464569911.0,
+      "fraction_of_roofline": 0.0033860986446461174,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 11343430459.564495,
+      "fraction_of_hbm_bw": 0.003386098644646118,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.15675609856843947
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.17455994803458452
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.1742830694653094
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.17388707473874093
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.17411923008039593
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.1737239726819098
+        }
+      ]
+    },
+    {
+      "optimizer": "grokadamw",
+      "model": "vit",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 6.31188123522602,
+      "wall_per_step_ms": 158.43137136660516,
+      "flops_per_step": 186123042544.0,
+      "bytes_per_step_analytical": 1962420784.0,
+      "achieved_flops_per_s": 1174786539676.6477,
+      "arithmetic_intensity": 94.84359524802097,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 317726044080870.25,
+      "fraction_of_roofline": 0.003697482663327503,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 12386566922.147135,
+      "fraction_of_hbm_bw": 0.003697482663327503,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.144653641525656
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.16080568553879857
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.1606879286468029
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.1607416839338839
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.16093446891754865
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.1607716901227832
+        }
+      ]
+    },
+    {
+      "optimizer": "supergrok",
+      "model": "vit",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 2.851247846057937,
+      "wall_per_step_ms": 350.72363189421594,
+      "flops_per_step": 242784052774.7,
+      "bytes_per_step_analytical": 1965764920.0,
+      "achieved_flops_per_s": 692237507531.0798,
+      "arithmetic_intensity": 123.5061478127812,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 413745595172817.0,
+      "fraction_of_roofline": 0.0016730994011958963,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 5604882994.006252,
+      "fraction_of_hbm_bw": 0.001673099401195896,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.3191118797287345
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.3525958423502743
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.352646863181144
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.3525096632540226
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.35271622482687237
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.352791010774672
+        }
+      ]
+    },
+    {
+      "optimizer": "supergrok15",
+      "model": "vit",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 5.557474248648539,
+      "wall_per_step_ms": 179.9378558062017,
+      "flops_per_step": 194907267036.15,
+      "bytes_per_step_analytical": 1965764920.0,
+      "achieved_flops_per_s": 1083192117427.8679,
+      "arithmetic_intensity": 99.15085219658411,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 332155354858556.75,
+      "fraction_of_roofline": 0.0032611008721781065,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 10924687921.796656,
+      "fraction_of_hbm_bw": 0.003261100872178106,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.16121575506404043
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.18314064349979162
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.18449240140616893
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.1832298501394689
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.17913167783990502
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.18787686163559555
+        }
+      ]
+    },
+    {
+      "optimizer": "supergrok2",
+      "model": "vit",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 2.6140532057070676,
+      "wall_per_step_ms": 382.547684116289,
+      "flops_per_step": 197422057594.55,
+      "bytes_per_step_analytical": 1982485600.0,
+      "achieved_flops_per_s": 516071762532.3187,
+      "arithmetic_intensity": 99.58309790222435,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 333603377972451.56,
+      "fraction_of_roofline": 0.0015469620411785372,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 5182322837.948099,
+      "fraction_of_hbm_bw": 0.001546962041178537,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.3646287973970175
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.40448149433359504
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.4707986043766141
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.338158973492682
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.353554255515337
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.47122526802122594
+        }
+      ]
+    },
+    {
+      "optimizer": "grokfast",
+      "model": "vit",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 6.2157950803157185,
+      "wall_per_step_ms": 160.88046453893185,
+      "flops_per_step": 186123042544.0,
+      "bytes_per_step_analytical": 1962420784.0,
+      "achieved_flops_per_s": 1156902692178.3884,
+      "arithmetic_intensity": 94.84359524802097,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 317726044080870.25,
+      "fraction_of_roofline": 0.003641195658118363,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 12198005454.696516,
+      "fraction_of_hbm_bw": 0.003641195658118363,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.1467173745855689
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.16270634848624468
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.16295102974399925
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.16264017559587957
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.16295645274221898
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.1629554414190352
+        }
+      ]
+    },
+    {
+      "optimizer": "muon",
+      "model": "vit",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 8.597586926517275,
+      "wall_per_step_ms": 116.3117056619376,
+      "flops_per_step": 189959655035.0,
+      "bytes_per_step_analytical": 1959076648.0,
+      "achieved_flops_per_s": 1633194646694.6475,
+      "arithmetic_intensity": 96.96387082604845,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 324828967267262.3,
+      "fraction_of_roofline": 0.005027860231907488,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 16843331776.890087,
+      "fraction_of_hbm_bw": 0.005027860231907488,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.10649183392524719
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.1180522988550365
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.11799150230363012
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.11817113729193807
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.11809965940192342
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.1184240460395813
+        }
+      ]
+    },
+    {
+      "optimizer": "lion",
+      "model": "vit",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 35.64928532781558,
+      "wall_per_step_ms": 28.051053220406175,
+      "flops_per_step": 186123042544.0,
+      "bytes_per_step_analytical": 1955732512.0,
+      "achieved_flops_per_s": 6635153449732.215,
+      "arithmetic_intensity": 95.1679441856106,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 318812613021795.5,
+      "fraction_of_roofline": 0.020812079506021944,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 69720466345.17352,
+      "fraction_of_hbm_bw": 0.020812079506021947,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.027225411124527456
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.029982148110866545
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.029988813027739526
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.029970292188227176
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.029952051769942045
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.029983318783342837
+        }
+      ]
+    },
+    {
+      "optimizer": "looksam",
+      "model": "vit",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 5.9081435832699905,
+      "wall_per_step_ms": 169.2579040955752,
+      "flops_per_step": 221261110947.0,
+      "bytes_per_step_analytical": 1962420784.0,
+      "achieved_flops_per_s": 1307242412868.7075,
+      "arithmetic_intensity": 112.74906623033401,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 377709371871618.94,
+      "fraction_of_roofline": 0.0034609742575120194,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 11594263762.665264,
+      "fraction_of_hbm_bw": 0.003460974257512019,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.15097125377506018
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.1713688164949417
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.1712463296018541
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.17119618793949484
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.17131164912134408
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.1714524826966226
+        }
+      ]
+    },
+    {
+      "optimizer": "prodigy",
+      "model": "vit",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 29.20940537000575,
+      "wall_per_step_ms": 34.235548013821244,
+      "flops_per_step": 186123042546.0,
+      "bytes_per_step_analytical": 1965764920.0,
+      "achieved_flops_per_s": 5436543398424.941,
+      "arithmetic_intensity": 94.6822484481003,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 317185532301136.0,
+      "fraction_of_roofline": 0.017139947585199083,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 57418824410.41692,
+      "fraction_of_hbm_bw": 0.017139947585199083,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.03262439426034689
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.03632698068395257
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.03602711008861661
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.03605112545192242
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.03631351524963975
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.035998859629035
+        }
+      ]
+    },
+    {
+      "optimizer": "adamw",
+      "model": "mamba",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 8.97010480904647,
+      "wall_per_step_ms": 111.48141758516431,
+      "flops_per_step": 51748803020.8,
+      "bytes_per_step_analytical": 697030440.0,
+      "achieved_flops_per_s": 464192186839.2766,
+      "arithmetic_intensity": 74.24181219517472,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 248710070853835.3,
+      "fraction_of_roofline": 0.0018663988363867992,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 6252436101.895777,
+      "fraction_of_hbm_bw": 0.001866398836386799,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.10579008888453245
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.1166462010703981
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.11668178578838706
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.11662331260740758
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.11674752999097109
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.11675040638074279
+        }
+      ]
+    },
+    {
+      "optimizer": "neuralgrok",
+      "model": "mamba",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 4.131267161204531,
+      "wall_per_step_ms": 242.05648315139115,
+      "flops_per_step": 57252348084.8,
+      "bytes_per_step_analytical": 697030440.0,
+      "achieved_flops_per_s": 236524745544.58536,
+      "arithmetic_intensity": 82.1375148046619,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 275160674595617.38,
+      "fraction_of_roofline": 0.0008595877513826701,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 2879618967.131945,
+      "fraction_of_hbm_bw": 0.0008595877513826701,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.22258980264887213
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.24648286513984202
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.24675272526219488
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.24714683312922717
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.24625466568395496
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.24676015060395
+        }
+      ]
+    },
+    {
+      "optimizer": "grokadamw",
+      "model": "mamba",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 5.684204904448404,
+      "wall_per_step_ms": 175.926099922508,
+      "flops_per_step": 51748803020.8,
+      "bytes_per_step_analytical": 699105840.0,
+      "achieved_flops_per_s": 294150799930.1658,
+      "arithmetic_intensity": 74.02141429801244,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 247971737898341.7,
+      "fraction_of_roofline": 0.0011862271177482155,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 3973860844.4565215,
+      "fraction_of_hbm_bw": 0.0011862271177482155,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.16393122989684344
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.1815419729799032
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.18095909347757697
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.18143526511266828
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.18144766772165893
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.18117357222363353
+        }
+      ]
+    },
+    {
+      "optimizer": "supergrok",
+      "model": "mamba",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 2.3751647185154776,
+      "wall_per_step_ms": 421.02343142963946,
+      "flops_per_step": 67589943124.3,
+      "bytes_per_step_analytical": 701181240.0,
+      "achieved_flops_per_s": 160537248235.30515,
+      "arithmetic_intensity": 96.39439743752985,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 322921231415725.0,
+      "fraction_of_roofline": 0.0004971405798605772,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 1665420942.5329335,
+      "fraction_of_hbm_bw": 0.0004971405798605772,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.38682837737724185
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.4262553398497403
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.4267486774362624
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.42726754732429983
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.42666023401543496
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.4263673199340701
+        }
+      ]
+    },
+    {
+      "optimizer": "supergrok15",
+      "model": "mamba",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 4.086531439746633,
+      "wall_per_step_ms": 244.7063028253615,
+      "flops_per_step": 54201832583.75,
+      "bytes_per_step_analytical": 701181240.0,
+      "achieved_flops_per_s": 221497492945.37784,
+      "arithmetic_intensity": 77.30074550161953,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 258957497430425.44,
+      "fraction_of_roofline": 0.0008553430394688146,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 2865399182.220529,
+      "fraction_of_hbm_bw": 0.0008553430394688147,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.21701241517439485
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.25174274342134595
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.25410773130133746
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.2522050180472434
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.24101928239688278
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.26472636619582773
+        }
+      ]
+    },
+    {
+      "optimizer": "supergrok2",
+      "model": "mamba",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 2.9540531937381354,
+      "wall_per_step_ms": 338.5179393924773,
+      "flops_per_step": 55762533666.15,
+      "bytes_per_step_analytical": 711558240.0,
+      "achieved_flops_per_s": 164725490667.42072,
+      "arithmetic_intensity": 78.3667878909673,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 262528739434740.47,
+      "fraction_of_roofline": 0.0006274569825082646,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 2101980891.4026866,
+      "fraction_of_hbm_bw": 0.0006274569825082646,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.30530646406114104
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.35817947508767245
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.3914467445574701
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.322317692451179
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.31189306136220696
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.40483800545334814
+        }
+      ]
+    },
+    {
+      "optimizer": "grokfast",
+      "model": "mamba",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 4.812218705549112,
+      "wall_per_step_ms": 207.80435412190855,
+      "flops_per_step": 51748803020.8,
+      "bytes_per_step_analytical": 699105840.0,
+      "achieved_flops_per_s": 249026557886.47018,
+      "arithmetic_intensity": 74.02141429801244,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 247971737898341.7,
+      "fraction_of_roofline": 0.0010042537911661568,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 3364250200.406625,
+      "fraction_of_hbm_bw": 0.0010042537911661566,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.19180274493992328
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.2130767520517111
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.2130049668252468
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.21300364080816508
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.21288845501840115
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.21287134122103452
+        }
+      ]
+    },
+    {
+      "optimizer": "muon",
+      "model": "mamba",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 5.621155674991114,
+      "wall_per_step_ms": 177.89936052635312,
+      "flops_per_step": 54206942681.8,
+      "bytes_per_step_analytical": 697030440.0,
+      "achieved_flops_per_s": 304705663479.7181,
+      "arithmetic_intensity": 77.76840087758578,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 260524142939912.34,
+      "fraction_of_roofline": 0.0011695870487903144,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 3918116613.4475527,
+      "fraction_of_hbm_bw": 0.0011695870487903142,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.16523876301944257
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.18293452644720673
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.1830200375057757
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.18308176267892123
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.18304984951391817
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.1831249998882413
+        }
+      ]
+    },
+    {
+      "optimizer": "lion",
+      "model": "mamba",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 8.981508587704987,
+      "wall_per_step_ms": 111.33987016044557,
+      "flops_per_step": 51748803020.8,
+      "bytes_per_step_analytical": 694955040.0,
+      "achieved_flops_per_s": 464782318734.769,
+      "arithmetic_intensity": 74.46352647618758,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 249452813695228.4,
+      "fraction_of_roofline": 0.001863207361142944,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 6241744659.828862,
+      "fraction_of_hbm_bw": 0.0018632073611429439,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.10517455926164984
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.11661338079720736
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.11649391762912273
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.11666471725329756
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.11660578437149524
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.11642248071730137
+        }
+      ]
+    },
+    {
+      "optimizer": "looksam",
+      "model": "mamba",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 4.552324767235253,
+      "wall_per_step_ms": 219.66798309236765,
+      "flops_per_step": 61561647651.0,
+      "bytes_per_step_analytical": 699105840.0,
+      "achieved_flops_per_s": 280248613313.4572,
+      "arithmetic_intensity": 88.05769331150202,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 294993272593531.75,
+      "fraction_of_roofline": 0.0009500169642838226,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 3182556830.3508058,
+      "fraction_of_hbm_bw": 0.0009500169642838226,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.1941236786544323
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.22514570113271476
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.22525917226448655
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.22492688186466694
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.22523766178637744
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.2251581178046763
+        }
+      ]
+    },
+    {
+      "optimizer": "prodigy",
+      "model": "mamba",
+      "precision": "bf16",
+      "use_amp": false,
+      "steps_per_s": 8.333832618761281,
+      "wall_per_step_ms": 119.99281072057784,
+      "flops_per_step": 51748803022.8,
+      "bytes_per_step_analytical": 701181240.0,
+      "achieved_flops_per_s": 431265862613.26306,
+      "arithmetic_intensity": 73.80232109860783,
+      "matmul_peak_used": 989400000000000.0,
+      "roofline_ceiling_flops_per_s": 247237775680336.25,
+      "fraction_of_roofline": 0.0017443364446493978,
+      "bound_regime_at_AI": "memory",
+      "achieved_bytes_per_s_analytical": 5843527089.575482,
+      "fraction_of_hbm_bw": 0.0017443364446493978,
+      "per10step_series_incl_eval": [
+        {
+          "step": 10,
+          "wall_per_step_incl_eval": 0.11316089890897274
+        },
+        {
+          "step": 20,
+          "wall_per_step_incl_eval": 0.12550143925473095
+        },
+        {
+          "step": 30,
+          "wall_per_step_incl_eval": 0.12541896086186172
+        },
+        {
+          "step": 40,
+          "wall_per_step_incl_eval": 0.12533738063648342
+        },
+        {
+          "step": 50,
+          "wall_per_step_incl_eval": 0.12510342067107558
+        },
+        {
+          "step": 60,
+          "wall_per_step_incl_eval": 0.12542685167863965
+        }
+      ]
+    }
+  ]
+}

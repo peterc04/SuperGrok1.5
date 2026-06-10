@@ -268,9 +268,12 @@ cudaError_t mega_mamba_real_adamw(
 // passes 0), and (b) the `workspace` pointer is UNUSED — the TC activations/grad
 // scratch is a different size (model_*_tc dims), so each launcher TU owns its own
 // cached device scratch internally; dispatch passes nullptr for it. `loss_out`
-// still points at state[3*total] (read back by the Python wrapper). Mamba has NO
-// TC launcher here ON PURPOSE: it is the measured-scalar-wins carve-out (905a4bb,
-// 0.46×) — its L3-REAL path stays the scalar megakernel, logged honestly as such.
+// still points at state[3*total] (read back by the Python wrapper). Mamba NOW has a
+// TC launcher too (cycle-2 directive (c)): mega_mamba_real_adamw_tc_launcher.cu wires
+// launch_fused_mamba_megakernel_tc into _ops. The 0.46× scalar-wins carve-out is a
+// PERFORMANCE fact (scan-dominated) the roofline surfaces, not a correctness reason —
+// the mamba TC kernel is 5/5-validated (test_mamba_tc.py). fp32 mamba still routes to
+// the scalar megakernel; bf16 mamba×{adamw,lion,grokfast} now route to the TC path.
 // opt_id (owner baseline directive): the OptId int selecting the in-kernel optimizer
 // TAIL. The wgmma fwd+bwd is optimizer-independent; opt_id picks apply_optimizer<Opt>.
 // 0=AdamW,1=Lion,2=Grokfast,3=GrokAdamW,6=NeuralGrok are the single-launch TC tails;
@@ -288,6 +291,16 @@ cudaError_t mega_vit_real_adamw_tc(
     float* state, float* grad, float* workspace, float* loss_out,
     float lr, int step, const FusedScalars& scalars, cudaStream_t stream,
     int ncta_cap, int opt_id);   // opt_id: OptId int for the in-kernel tail
+// Mamba TC launcher (cycle-2): same boundary as the decoder (int tokens), NO
+// sizes/offsets (the kernel reads kMambaSizes/kMambaOffsets __constant__ tables),
+// NO workspace (the launcher owns its own TC-sized scratch). opt_id ∈ {0,1,2}
+// (adamw/lion/grokfast) for mamba's single-launch TC tails.
+cudaError_t mega_mamba_real_adamw_tc(
+    ::sg::fused::PersistentContext ctx, float* params,
+    const int* tokens, const int* targets, int B,
+    float* state, float* grad, float* workspace, float* loss_out,
+    float lr, int step, const FusedScalars& scalars, cudaStream_t stream,
+    int ncta_cap, int opt_id);
 }}  // namespace fused::sm90
 #endif
 
@@ -867,27 +880,41 @@ void fused_step(const std::string& model, const std::string& optimizer,
  return;
  }
 
- // ── PHASE 2: the TRUE L3 fused Mamba megakernel (real fwd+bwd+adamw). ──
- // Fires for (mamba3, adamw, !opt_only): ONE persistent kernel, no surrogate, no
- // intermediate launches. CANONICAL model name is "mamba3" (NOT "mamba" — the
- // Python wrapper canonicalizes before calling, and the wired-cell table emits
- // mamba3; matching "mamba" here would never fire and fall through to the
- // surrogate path). Mamba's input is int32 tokens like the decoder (NOT ViT's
- // float pack):
+ // ── PHASE 2: the TRUE L3 fused Mamba megakernel (real fwd+bwd+opt). ──
+ // Fires for (mamba3, !opt_only) on the scalar path for adamw, AND on the wgmma
+ // path for the single-launch tails {adamw,lion,grokfast} (cycle-2 directive (c)):
+ // ONE persistent kernel, no surrogate, no intermediate launches. CANONICAL model
+ // name is "mamba3" (NOT "mamba" — the Python wrapper canonicalizes before calling,
+ // and the wired-cell table emits mamba3; matching "mamba" here would never fire and
+ // fall through to the surrogate path). Mamba's input is int32 tokens like the
+ // decoder (NOT ViT's float pack):
  //   input = int32 [B*(8+1)]  (tokens[B*8] row-major [B][8], then targets[B])
  // `state` = float [3*total + 1] ([m|v|extra] + a trailing loss slot). The
  // workspace is device scratch (never crosses the ABI). Placed BEFORE the
  // surrogate route so the real path wins.
- if (arch == 90 && model == "mamba3" && optimizer == "adamw" && !opt_only) {
- // Mamba is the measured-scalar-wins carve-out (905a4bb: TC 0.46×). There is NO
- // mamba TC launcher linked into _ops, so a wgmma request CANNOT be honored —
- // FAIL LOUD rather than silently running scalar under a wgmma label (the
- // no-suppression rule; the Python wrapper never requests wgmma for mamba, so
- // this only fires if a caller forces it, and must not be a silent degrade).
- TORCH_CHECK(!want_wgmma,
- "fused_step: gemm_impl='wgmma' requested for mamba3, but mamba keeps the "
- "scalar L3 megakernel (measured scalar-wins, 905a4bb 0.46×) — no mamba TC "
- "launcher is wired into _ops. Use gemm_impl='scalar' for mamba.");
+ // OPTID-GENERIC GATE (mirrors the decoder): mamba's scalar real megakernel exists
+ // ONLY for adamw; the wgmma TC launcher supports {adamw,lion,grokfast} (opt_id
+ // 0/1/2). grokadamw/neuralgrok are NOT mamba TC tails (grokadamw's 3-mechanism gap;
+ // neuralgrok's host-coupled amplifier) — mb_opt_id caps them out, so a wgmma request
+ // for them falls through to eager (NOT here). The STAGED/coupled opts never reach
+ // here (wgmma_tail_opt_id < 0).
+ const int mb_opt_id = wgmma_tail_opt_id(optimizer);
+ const bool mb_tc_tail = (mb_opt_id == 0 || mb_opt_id == 1 || mb_opt_id == 2);
+ const bool mamba_l3_real = (optimizer == "adamw")
+                            || (want_wgmma && mb_tc_tail);
+ if (arch == 90 && model == "mamba3" && mamba_l3_real && !opt_only) {
+ // A wgmma request for a NON-TC-tail mamba optimizer (grokadamw/neuralgrok) is a
+ // loud error rather than a silent scalar run under a wgmma label (no-suppression).
+ // The scalar real kernel covers only adamw, so a non-adamw scalar request is also
+ // rejected (no silent adamw fallback). The Python gate (gemm_impl_for_cell) only
+ // ever asks for mamba wgmma on {adamw,lion,grokfast}, so these fire only if forced.
+ TORCH_CHECK(want_wgmma || optimizer == "adamw",
+ "fused_step: mamba3 scalar L3 path exists ONLY for adamw (got '", optimizer,
+ "'); the non-adamw mamba tails are wgmma-only. Use gemm_impl='wgmma'.");
+ TORCH_CHECK(!want_wgmma || mb_tc_tail,
+ "fused_step: gemm_impl='wgmma' requested for mamba3 with optimizer '", optimizer,
+ "', but the mamba TC launcher supports only adamw/lion/grokfast (opt_id 0/1/2). "
+ "grokadamw/neuralgrok are not mamba TC tails — use the eager/per-op path.");
  const int64_t total = kMambaTotalElems;
  TORCH_CHECK(params.numel() == total,
  "fused Mamba megakernel: params has ", params.numel(),
@@ -933,16 +960,37 @@ void fused_step(const std::string& model, const std::string& optimizer,
  alpha_max, gate, d_factor, neg_lr_scale, decay_factor};
 
  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
- cudaError_t err = fused::sm90::mega_mamba_real_adamw(
+ // GEMM-engine branch (mirrors the decoder/vit). want_wgmma → the bf16 tensor-core
+ // launcher (mega_mamba_real_adamw_tc_launcher.cu: HGMMA in SASS for the 4 projection
+ // GEMMs, scan/conv scalar by design; owns its own TC-sized workspace, so we pass
+ // nullptr for the scalar `workspace`); else the shipped fp32 scalar launcher
+ // (mega_mamba_real_adamw.cu, scalar msc.workspace). Both run the REAL mamba fwd+bwd
+ // +opt as ONE persistent kernel. NO silent fallback: a wgmma request runs wgmma or
+ // the launcher returns a cuda error that throws below (the no-suppression rule).
+ cudaError_t err;
+ if (want_wgmma) {
+ // opt_id (mb_opt_id ∈ {0,1,2} — the gate required it on the wgmma path) selects the
+ // in-kernel tail (apply_optimizer<Opt>); the fwd+bwd is optimizer-independent.
+ err = fused::sm90::mega_mamba_real_adamw_tc(
+ ctx, params.data_ptr<float>(),
+ input.data_ptr<int>(),                              // tokens
+ input.data_ptr<int>() + (int64_t)B * kMambaSeq,     // targets
+ B, m, grad.data_ptr<float>(),    // reduced-grad OUTPUT (exposed to caller)
+ /*workspace=*/nullptr, loss_slot,  // TC launcher owns its own TC-sized scratch
+ lr, static_cast<int>(step), scalars, stream, /*ncta_cap=*/0, mb_opt_id);
+ } else {
+ err = fused::sm90::mega_mamba_real_adamw(
  ctx, params.data_ptr<float>(),
  input.data_ptr<int>(),                              // tokens
  input.data_ptr<int>() + (int64_t)B * kMambaSeq,     // targets
  B, m, grad.data_ptr<float>(),    // reduced-grad OUTPUT (exposed to caller)
  msc.workspace.data_ptr<float>(), loss_slot,
  lr, static_cast<int>(step), scalars, stream);
+ }
  if (err != cudaSuccess)
  throw std::runtime_error(
- std::string("fused Mamba megakernel launch failed: ") +
+ std::string(want_wgmma ? "fused Mamba TC (wgmma) megakernel launch failed: "
+ : "fused Mamba megakernel launch failed: ") +
  cudaGetErrorString(err));
  return;
  }

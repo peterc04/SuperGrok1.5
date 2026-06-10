@@ -1394,17 +1394,26 @@ def train_grokfast(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
+    mtype=c.get("model_type","decoder")
     for step in (pb:=_pbar("Grokfast",c["max_steps"],bp)):
-        # NO L3-TC path: grokfast is BLOCKED from the bf16 TC driver — the optimizer
-        # cold-starts ema=grad0 (grokfast.py) while the TC P3 state cache inits ema=0,
-        # so the in-kernel ema slice diverges from the real optimizer for ~1/(1-alpha)
-        # steps (state-gate: ema rel 0.98 at step 1). Converting needs a step==1 ema
-        # init in the shared TC P3 (cold-start-STAGED). Until then: real eager step.
+        # L3-TC path (cycle 2): grokfast is now wgmma-wired for {decoder,vit,mamba}. The
+        # ema cold-start blocker is fixed in apply_optimizer<Grokfast> (step==1 →
+        # ema=grad, matching the eager ema=grad0 seed), so the bf16 TC megakernel
+        # runs the REAL fwd+bwd AND the Grokfast tail (EMA-amplify + Adam on g_amp)
+        # in ONE persistent kernel — identical fwd+bwd to the adamw TC cell, only the
+        # per-element tail differs. _opt_scalars_from forwards grokfast_alpha/lamb. If
+        # it ran it returns the loss and we SKIP the eager fwd/bwd/step. Otherwise
+        # (fp32 / fp16-AMP): real eager step (grokfast has no whitelisted L1 fused
+        # tail, so the eager optimizer.step runs the fused per-op kernel).
         # [A4-M5] L1 fused tail integration requires the adamw/lion post-backward
         # structure — do not re-add the pre-forward continue pattern.
-        with _autocast(c):
-            loss=F.cross_entropy(m(tx),ty)
-        opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+        l3_loss=_try_fused_train_step(mtype, "grokfast", m, opt, tx, ty, c)
+        if l3_loss is not None:
+            loss=torch.as_tensor(l3_loss)
+        else:
+            with _autocast(c):
+                loss=F.cross_entropy(m(tx),ty)
+            opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break

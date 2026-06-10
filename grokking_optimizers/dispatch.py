@@ -672,17 +672,45 @@ _FUSED_L3_REAL = frozenset({
     # mega_{decoder,vit}_real_adamw_tc_launcher.cu + dispatch.cpp).
     ("transformer_decoder", "lion"),
     ("vit", "lion"),
+    # grokfast (cycle 2): CONVERTED. The ema cold-start blocker is fixed in
+    # apply_optimizer<Grokfast> (opt_components.cuh) — at step==1 it seeds ema=grad,
+    # so grokfast_fused_step's e_new = alpha*g + (1-alpha)*g = g matches the eager
+    # ema=grad0 seed (grokfast.py _group_cache). The state-aware tail gate now passes
+    # params AND state (ema rel < 1e-4) for {decoder,vit}×grokfast; A/A/A clean.
+    # grokfast's constructor has NO grad_clip, and _opt_scalars_from already forwards
+    # grokfast_alpha/grokfast_lamb, so the cold-start was the ONLY remaining gap.
+    ("transformer_decoder", "grokfast"),
+    ("vit", "grokfast"),
+    # mamba (cycle-2 directive (c)): the mamba TC kernel is now wired in-_ops
+    # (mega_mamba_real_adamw_tc_launcher.cu + dispatch.cpp wgmma branch). mamba×adamw
+    # was already L3-REAL (scalar engine); it now ALSO has the wgmma path. lion +
+    # grokfast join via the OptId-generic launcher (opt_id 1/2). The 0.46× scalar-wins
+    # is a perf fact the roofline reports, not a correctness block. grokadamw/neuralgrok
+    # are NOT mamba TC tails (grokadamw's 3-mechanism gap; neuralgrok host-coupled).
+    ("mamba3", "lion"),
+    ("mamba3", "grokfast"),
     # NOTE — BLOCKED (state-gate evidence), deliberately NOT registered:
-    #  * grokadamw: per-tensor beta1 = beta1·(1-gamma)^i (gamma=0.1) is unrepresentable
-    #    in one global FusedScalars (rebase_state rebases pointers, not scalars) — same
-    #    ABI-gap class as SG11/SG15 sharpness. Inert at step 1 (Adam→sign), diverges
-    #    multi-step.
-    #  * grokfast: the optimizer COLD-STARTS ema=grad0 (grokfast.py:143, with a cited
-    #    comment that the kernel has no matching init); the TC P3 state cache inits
-    #    ema=0, so the ema slice diverges 50x at step 1 (state-gate: ema rel 0.98) and
-    #    for ~1/(1-alpha) steps after. Converting it needs a step==1 ema=grad init in
-    #    the shared TC P3 (a kernel change → grokfast becomes cold-start-STAGED, not a
-    #    nothing-needed direct tail). Blocked until that lands.
+    #  * grokadamw: THREE eager mechanisms the single global FusedScalars/state cache
+    #    cannot carry, ALL required for a faithful conversion (no-suppression):
+    #      (i)  per-tensor layer-wise beta1 = beta1·(1-gamma)^layer (gamma=0.1) —
+    #           rebase_state rebases POINTERS, not scalars; needs an offsets-indexed
+    #           per-tensor scalar side-channel next to FusedScalars (ABI-gap pattern).
+    #           This is a HARD state-gate fail AT STEP 1 (not a hollow-pass): the kernel
+    #           uses one global beta1 while eager uses beta1·(1-gamma)^layer, so the
+    #           m-state diverges for every layer>=1 (m=beta1·m_prev+(1-beta1)·g_amp
+    #           differs) — OBSERVED m-rel = 0.895 at step 1 (deepest layer: beta1_i→0 so
+    #           eager m≈g_amp while the kernel's global-beta1 m=0.1·g_amp; reproduce by
+    #           temp-registering grokadamw/decoder and running the tail gate).
+    #      (ii) per-tensor grad-NORM clip to grad_clip=1.0 (the eager grokadamw_fused_step
+    #           calls clip_grad_norms_device_side BEFORE apply, bindings.cpp:215) — needs
+    #           a P3 per-tensor norm reduction; the kernel's grokadamw_step has no clip.
+    #           ADDITIONAL multi-step divergence: measured inert at step 1 (max grad-norm
+    #           0.72<1.0) but FIRES by step 50 (param rel 2e-4) as grads grow.
+    #      (iii) adaptive alpha_t = alpha·exp(-kappa·signal) from the train/val gap —
+    #           also multi-step (no losses fed at step 1).
+    #    The ema cold-start is staged in apply_optimizer<GrokAdamW>; the remaining gap is
+    #    exactly (i)+(ii)+(iii). (i) alone fails the step-1 state gate, so the cell cannot
+    #    be registered on any single-step pass.
 })
 
 _FUSED_REGISTRY = {}
@@ -985,15 +1013,27 @@ _L3_REAL_SPEC = {
 _L3_WGMMA_CELLS = frozenset({
     ("transformer_decoder", "adamw"),
     ("vit", "adamw"),
-    # NOTE: ("mamba3", "adamw") deliberately ABSENT — scalar-only by measurement.
+    # mamba (cycle-2 directive (c)): the mamba TC kernel (launch_fused_mamba_megakernel_tc)
+    # is now WIRED into _ops via mega_mamba_real_adamw_tc_launcher.cu + the dispatch.cpp
+    # wgmma branch. The 0.46× scalar-wins carve-out is a PERFORMANCE fact (scan-dominated)
+    # the roofline surfaces — not a correctness reason (test_mamba_tc 5/5). adamw/lion/
+    # grokfast route to the TC path at bf16; grokadamw/neuralgrok are NOT mamba TC tails.
+    ("mamba3", "adamw"),
+    ("mamba3", "lion"),
+    ("mamba3", "grokfast"),
     # OWNER BASELINE: single-launch optimizer tails on the bf16 TC decoder/vit driver.
     # Each entry's tail runs in-kernel via apply_optimizer<Opt> over the TC-reduced
-    # grad; added per-model as the launcher opt_id switch lands. grokfast + grokadamw
-    # are excluded — the state-aware gate proved their kernel state diverges from the
-    # real optimizer (grokfast ema cold-start; grokadamw per-layer beta1). See the
-    # _FUSED_L3_REAL note for the cited blockers.
+    # grad; added per-model as the launcher opt_id switch lands.
     ("transformer_decoder", "lion"),
     ("vit", "lion"),
+    # grokfast (cycle 2): the ema cold-start (state-aware tail blocker (a)) is fixed in
+    # apply_optimizer<Grokfast> (opt_components.cuh: step==1 → ema=grad, matching the
+    # eager ema=grad0 seed). State + params now match the real Grokfast at step 1
+    # (state-gate clean). grokadamw stays excluded — its per-tensor layer-wise beta1
+    # AND per-tensor grad-norm clip (bindings.cpp clip_grad_norms_device_side) are not
+    # representable in the single global FusedScalars; see the _FUSED_L3_REAL note.
+    ("transformer_decoder", "grokfast"),
+    ("vit", "grokfast"),
 })
 
 
@@ -1001,16 +1041,19 @@ def gemm_impl_for_cell(model_name, opt_name, precision):
     """The GEMM engine token ("wgmma" | "scalar") for an L3-REAL cell at `precision`.
 
     Path-matched semantics (replaces the old fp32-only gate, owner directive task 1):
-      * precision == "bf16"  → "wgmma" for the TC-capable cells (decoder/vit×{adamw,
-                               lion}), "scalar" for mamba×adamw (the measured carve-out).
+      * precision == "bf16"  → "wgmma" for the TC-capable cells (decoder/vit/mamba ×
+                               {adamw, lion, grokfast} as wired in _L3_WGMMA_CELLS),
+                               "scalar" otherwise. mamba is NOW a wgmma cell (cycle-2
+                               directive (c)) — the 0.46× scalar-wins is a perf fact the
+                               roofline reports, not a correctness carve-out.
       * precision == "fp32"  → "scalar" for ADAMW cells (the fp32 owner-computes
-                               megakernel exists only for adamw); None for the non-adamw
-                               single-launch tails (lion) — they have NO scalar real
-                               fwd+bwd+opt kernel, only the wgmma one, so at fp32 the
-                               caller declines to eager (the honest path). Returning
-                               "scalar" for them would route to the SURROGATE cell
-                               (wired_fused_cell) → a dtype throw on the token input, a
-                               loud-but-wrong fallthrough; None avoids it cleanly.
+                               megakernel exists only for adamw, all 3 models); None for
+                               the non-adamw single-launch tails (lion/grokfast) — they
+                               have NO scalar real fwd+bwd+opt kernel, only the wgmma one,
+                               so at fp32 the caller declines to eager (the honest path).
+                               Returning "scalar" for them would route to the SURROGATE
+                               cell (wired_fused_cell) → a dtype throw on the token input,
+                               a loud-but-wrong fallthrough; None avoids it cleanly.
     Any other precision returns None → the caller declines the L3 path entirely
     (fp16-AMP / tf32 have no in-kernel carrier here; eager is the honest path).
 

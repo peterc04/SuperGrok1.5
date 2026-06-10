@@ -185,7 +185,7 @@ template <OptId Opt>
 __device__ __forceinline__ void apply_optimizer(
         float* __restrict__ params, const float* __restrict__ grad,
         int64_t idx, int step, const FusedOptState& st) {
-    (void)step;
+    (void)step;  // referenced only by the cold-start branches (grokfast/grokadamw)
     if constexpr (Opt == OptId::AdamW) {
         algo::adamw_step<float, float>(
             params, st.exp_avg, st.exp_avg_sq, grad,
@@ -194,11 +194,33 @@ __device__ __forceinline__ void apply_optimizer(
         algo::lion_step<float, float>(
             params, st.exp_avg, grad, st.lr, st.beta1, st.beta2, st.wd, idx);
     } else if constexpr (Opt == OptId::Grokfast) {
+        // COLD-START (state-aware tail; owner baseline blocker (a)): the eager
+        // Grokfast seeds the slow-grad EMA with the FIRST gradient, not zeros
+        // (grokfast.py _group_cache: state["ema"] = grad0.clone()), because a
+        // zero seed under-amplifies the early grokking phase and the kernel
+        // applies no EMA bias correction. The persistent [m|v|extra] state cache
+        // zero-inits ema=0, so at step 1 we must seed ema=grad HERE — then
+        // grokfast_fused_step's e_new = alpha*g + (1-alpha)*g = g matches the
+        // eager ema=grad0 exactly. Per-element on this thread's own idx (the P3
+        // tail owns each element once), so no race / no barrier needed. For
+        // step>1 the cache carries the real EMA forward (no reseed).
+        if (step == 1) st.ema[idx] = grad[idx];
         algo::grokfast_fused_step<float, float>(
             params, st.exp_avg, st.exp_avg_sq, st.ema, grad,
             st.alpha, st.lamb, st.lr, st.beta1, st.beta2, st.eps, st.wd,
             st.bc1, st.bc2, idx);
     } else if constexpr (Opt == OptId::GrokAdamW) {
+        // COLD-START (same as Grokfast: eager GrokAdamW seeds ema=grad0 —
+        // grokadamw.py _group_cache). Seed ema=grad at step 1 so e_new collapses
+        // to g, matching eager. NOTE: this is necessary-but-NOT-sufficient for a
+        // faithful GrokAdamW conversion — eager ALSO applies (i) per-tensor
+        // layer-wise beta1 = beta1*(1-gamma)^layer and (ii) a per-tensor
+        // grad-norm clip to grad_clip (bindings.cpp clip_grad_norms_device_side)
+        // BEFORE this apply. Those two need a per-tensor scalar side-channel +
+        // a P3 norm reduction; until both land, GrokAdamW stays BLOCKED (not
+        // registered in _FUSED_L3_REAL). The cold-start is staged here so the
+        // remaining gap is exactly (i)+(ii).
+        if (step == 1) st.ema[idx] = grad[idx];
         algo::grokadamw_step<float, float>(
             params, st.exp_avg, st.exp_avg_sq, st.ema, grad,
             st.alpha, st.lamb, st.lr, st.beta1, st.beta2, st.eps, st.wd,

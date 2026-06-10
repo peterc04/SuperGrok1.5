@@ -70,33 +70,41 @@ _BLOCK_REASONS = {
                 "TC driver (OPTSTAGES §2)."),
     "muon": ("STAGED: grid-cooperative Newton-Schulz orthogonalization precompute "
              "not wired into the TC driver; may need a separate launch (OPTSTAGES §3)."),
-    "neuralgrok": ("HOST-COUPLED amplifier: train_amplifier_step trains the psi/"
-                   "amplifier MLP host-side between steps; train_neuralgrok does not "
-                   "call the L3-TC path (frozen-snapshot integration deferred)."),
-    # grokfast/grokadamw: the wgmma single-launch TAIL exists + is built (OptId 2,3),
-    # but the state-aware L3-TC gate proved the kernel state diverges from the real
-    # optimizer — so registering them would run a DIFFERENT optimizer (the
-    # breadth-faking opt_components.cuh forbids). Cited evidence:
-    "grokfast": ("STATE-DIVERGENT: optimizer cold-starts ema=grad0 (grokfast.py:143) "
-                 "but the TC P3 state cache inits ema=0 → ema slice rel 0.98 at step 1 "
-                 "(state-gate). Needs a step==1 ema=grad init in the shared TC P3 "
-                 "(cold-start-STAGED). Tail+kernel built; not registered."),
-    "grokadamw": ("ABI-GAP: per-tensor beta1 = beta1·(1-gamma)^i (gamma=0.1) is not "
-                  "representable in one global FusedScalars (rebase_state rebases "
-                  "pointers, not scalars) — same class as SG11/SG15 sharpness. Inert "
-                  "at step 1 (Adam→sign), diverges multi-step. Tail built; not registered."),
+    "neuralgrok": ("KERNEL-READY, RACE-BLOCKED (directive item d): the psi MLP is in "
+                   "opt_components.cuh (kPsiHidden=16 == race neural_hidden=16, 2-layer), "
+                   "so a snapshot-plumbed L3 step would PASS the tail gate (m/v parity "
+                   "validates the psi pack; clip is inert at steps 1&50, max grad-norm "
+                   "0.72<1.0). BUT train_neuralgrok trains the amplifier BETWEEN steps via "
+                   "a differentiable Python rebuild that needs the model grads, and the L3 "
+                   "megakernel returns only the loss — snapshot-plumbing alone yields a "
+                   "frozen-amplifier (non-faithful) race. The race integration (re-extract "
+                   "+ keep the amplifier-training half) is deferred; needs owner re-scope."),
+    # grokadamw: the wgmma single-launch TAIL exists + is built (OptId 3), but the
+    # state-aware L3-TC gate proves the kernel would run a DIFFERENT optimizer (the
+    # breadth-faking opt_components.cuh forbids). grokfast is CONVERTED in cycle 2 (no
+    # longer here): its ema cold-start is fixed (apply_optimizer<Grokfast> step==1 →
+    # ema=grad) so it should be OBSERVED as wgmma; if it ever shows here, the kernel
+    # rebuild is stale. Cited evidence for the still-blocked grokadamw:
+    "grokadamw": ("3-MECHANISM ABI-GAP: (i) per-tensor beta1 = beta1·(1-gamma)^layer "
+                  "(gamma=0.1) not representable in one global FusedScalars (rebase_state "
+                  "rebases pointers, not scalars) — a HARD step-1 state-gate fail (observed "
+                  "m-rel 0.895, the kernel's global beta1 vs eager's per-layer decay); (ii) "
+                  "per-tensor grad-norm clip to grad_clip=1.0 (eager clip_grad_norms_device_"
+                  "side before apply, inert at step 1 / fires by step 50); (iii) adaptive "
+                  "alpha_t. (i) alone blocks any single-step pass; (ii)+(iii) add multi-step "
+                  "divergence. Tail+cold-start built; not registered until the per-tensor "
+                  "side-channel + P3 norm-clip land."),
 }
 # Per-(model) note for any cell that routes to a scalar L3 megakernel rather than
 # wgmma (mamba's measured carve-out — the path EXISTS but scalar wins on wall).
 _MODEL_NOTE = {
-    "mamba": ("mamba projections HAVE an OptId-generic wgmma TC kernel (launch_fused_"
-              "mamba_megakernel_tc<Opt>), but (a) it has NO in-_ops launcher TU — the "
-              "standalone mega_mamba_real_adamw_tc.cu owns a pybind module so setup.py "
-              "drops it; a launcher TU like mega_{decoder,vit}_real_adamw_tc_launcher.cu "
-              "is needed to reach it from dispatch.cpp — and (b) mamba×adamw is the "
-              "measured scalar-wins carve-out (_L3_WGMMA_CELLS excludes it, 0.46x: the "
-              "selective-scan/conv1d dominate, not the GEMMs). So mamba runs the scalar "
-              "L3 megakernel; the wgmma route is buildable but not yet wired in-_ops."),
+    "mamba": ("mamba×{adamw,lion,grokfast} now run the OptId-generic wgmma TC kernel "
+              "(launch_fused_mamba_megakernel_tc<Opt>), WIRED in-_ops via mega_mamba_"
+              "real_adamw_tc_launcher.cu + the dispatch.cpp wgmma branch (cycle-2). The "
+              "0.46x scalar-wins (905a4bb: selective-scan/conv1d dominate, not the 4 "
+              "projection GEMMs) is a PERFORMANCE fact the roofline reports, not a "
+              "correctness carve-out (test_mamba_tc 5/5). fp32 mamba still routes to the "
+              "scalar megakernel; grokadamw/neuralgrok are not mamba TC tails."),
 }
 
 _G = None

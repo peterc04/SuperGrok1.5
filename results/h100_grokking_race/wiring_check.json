@@ -1,14 +1,19 @@
 {
   "summary": {
     "total_cells": 33,
-    "converted_l3_tc": 4,
-    "blocked": 29,
-    "fraction_l3_tc": 0.1212,
+    "converted_l3_tc": 9,
+    "blocked": 24,
+    "fraction_l3_tc": 0.2727,
     "converted_cells": [
       "adamw/decoder",
+      "grokfast/decoder",
       "lion/decoder",
       "adamw/vit",
-      "lion/vit"
+      "grokfast/vit",
+      "lion/vit",
+      "adamw/mamba",
+      "grokfast/mamba",
+      "lion/mamba"
     ],
     "blocked_cells": [
       "neuralgrok/decoder",
@@ -16,7 +21,6 @@
       "supergrok/decoder",
       "supergrok15/decoder",
       "supergrok2/decoder",
-      "grokfast/decoder",
       "muon/decoder",
       "looksam/decoder",
       "prodigy/decoder",
@@ -25,19 +29,15 @@
       "supergrok/vit",
       "supergrok15/vit",
       "supergrok2/vit",
-      "grokfast/vit",
       "muon/vit",
       "looksam/vit",
       "prodigy/vit",
-      "adamw/mamba",
       "neuralgrok/mamba",
       "grokadamw/mamba",
       "supergrok/mamba",
       "supergrok15/mamba",
       "supergrok2/mamba",
-      "grokfast/mamba",
       "muon/mamba",
-      "lion/mamba",
       "looksam/mamba",
       "prodigy/mamba"
     ]
@@ -47,7 +47,7 @@
       "model": "decoder",
       "optimizer": "adamw",
       "executed_path": "L3-TC-megakernel(wgmma)",
-      "l3_steps_fired": 2,
+      "l3_steps_fired": 4,
       "l3_engines_seen": [
         "wgmma"
       ],
@@ -67,7 +67,7 @@
       "abi_stale": false,
       "error": null,
       "is_l3_tc": false,
-      "reason_if_blocked": "HOST-COUPLED amplifier: train_amplifier_step trains the psi/amplifier MLP host-side between steps; train_neuralgrok does not call the L3-TC path (frozen-snapshot integration deferred)."
+      "reason_if_blocked": "KERNEL-READY, RACE-BLOCKED (directive item d): the psi MLP is in opt_components.cuh (kPsiHidden=16 == race neural_hidden=16, 2-layer), so a snapshot-plumbed L3 step would PASS the tail gate (m/v parity validates the psi pack; clip is inert at steps 1&50, max grad-norm 0.72<1.0). BUT train_neuralgrok trains the amplifier BETWEEN steps via a differentiable Python rebuild that needs the model grads, and the L3 megakernel returns only the loss \u2014 snapshot-plumbing alone yields a frozen-amplifier (non-faithful) race. The race integration (re-extract + keep the amplifier-training half) is deferred; needs owner re-scope."
     },
     {
       "model": "decoder",
@@ -79,7 +79,7 @@
       "abi_stale": false,
       "error": null,
       "is_l3_tc": false,
-      "reason_if_blocked": "ABI-GAP: per-tensor beta1 = beta1\u00b7(1-gamma)^i (gamma=0.1) is not representable in one global FusedScalars (rebase_state rebases pointers, not scalars) \u2014 same class as SG11/SG15 sharpness. Inert at step 1 (Adam\u2192sign), diverges multi-step. Tail built; not registered."
+      "reason_if_blocked": "3-MECHANISM ABI-GAP: (i) per-tensor beta1 = beta1\u00b7(1-gamma)^layer (gamma=0.1) not representable in one global FusedScalars (rebase_state rebases pointers, not scalars) \u2014 a HARD step-1 state-gate fail (observed m-rel 0.895, the kernel's global beta1 vs eager's per-layer decay); (ii) per-tensor grad-norm clip to grad_clip=1.0 (eager clip_grad_norms_device_side before apply, inert at step 1 / fires by step 50); (iii) adaptive alpha_t. (i) alone blocks any single-step pass; (ii)+(iii) add multi-step divergence. Tail+cold-start built; not registered until the per-tensor side-channel + P3 norm-clip land."
     },
     {
       "model": "decoder",
@@ -120,14 +120,16 @@
     {
       "model": "decoder",
       "optimizer": "grokfast",
-      "executed_path": "eager",
-      "l3_steps_fired": 0,
-      "l3_engines_seen": [],
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
       "l1_steps_fired": 0,
       "abi_stale": false,
       "error": null,
-      "is_l3_tc": false,
-      "reason_if_blocked": "STATE-DIVERGENT: optimizer cold-starts ema=grad0 (grokfast.py:143) but the TC P3 state cache inits ema=0 \u2192 ema slice rel 0.98 at step 1 (state-gate). Needs a step==1 ema=grad init in the shared TC P3 (cold-start-STAGED). Tail+kernel built; not registered."
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
     },
     {
       "model": "decoder",
@@ -145,7 +147,7 @@
       "model": "decoder",
       "optimizer": "lion",
       "executed_path": "L3-TC-megakernel(wgmma)",
-      "l3_steps_fired": 2,
+      "l3_steps_fired": 4,
       "l3_engines_seen": [
         "wgmma"
       ],
@@ -183,7 +185,7 @@
       "model": "vit",
       "optimizer": "adamw",
       "executed_path": "L3-TC-megakernel(wgmma)",
-      "l3_steps_fired": 2,
+      "l3_steps_fired": 4,
       "l3_engines_seen": [
         "wgmma"
       ],
@@ -203,7 +205,7 @@
       "abi_stale": false,
       "error": null,
       "is_l3_tc": false,
-      "reason_if_blocked": "HOST-COUPLED amplifier: train_amplifier_step trains the psi/amplifier MLP host-side between steps; train_neuralgrok does not call the L3-TC path (frozen-snapshot integration deferred)."
+      "reason_if_blocked": "KERNEL-READY, RACE-BLOCKED (directive item d): the psi MLP is in opt_components.cuh (kPsiHidden=16 == race neural_hidden=16, 2-layer), so a snapshot-plumbed L3 step would PASS the tail gate (m/v parity validates the psi pack; clip is inert at steps 1&50, max grad-norm 0.72<1.0). BUT train_neuralgrok trains the amplifier BETWEEN steps via a differentiable Python rebuild that needs the model grads, and the L3 megakernel returns only the loss \u2014 snapshot-plumbing alone yields a frozen-amplifier (non-faithful) race. The race integration (re-extract + keep the amplifier-training half) is deferred; needs owner re-scope."
     },
     {
       "model": "vit",
@@ -215,7 +217,7 @@
       "abi_stale": false,
       "error": null,
       "is_l3_tc": false,
-      "reason_if_blocked": "ABI-GAP: per-tensor beta1 = beta1\u00b7(1-gamma)^i (gamma=0.1) is not representable in one global FusedScalars (rebase_state rebases pointers, not scalars) \u2014 same class as SG11/SG15 sharpness. Inert at step 1 (Adam\u2192sign), diverges multi-step. Tail built; not registered."
+      "reason_if_blocked": "3-MECHANISM ABI-GAP: (i) per-tensor beta1 = beta1\u00b7(1-gamma)^layer (gamma=0.1) not representable in one global FusedScalars (rebase_state rebases pointers, not scalars) \u2014 a HARD step-1 state-gate fail (observed m-rel 0.895, the kernel's global beta1 vs eager's per-layer decay); (ii) per-tensor grad-norm clip to grad_clip=1.0 (eager clip_grad_norms_device_side before apply, inert at step 1 / fires by step 50); (iii) adaptive alpha_t. (i) alone blocks any single-step pass; (ii)+(iii) add multi-step divergence. Tail+cold-start built; not registered until the per-tensor side-channel + P3 norm-clip land."
     },
     {
       "model": "vit",
@@ -256,14 +258,16 @@
     {
       "model": "vit",
       "optimizer": "grokfast",
-      "executed_path": "eager",
-      "l3_steps_fired": 0,
-      "l3_engines_seen": [],
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
       "l1_steps_fired": 0,
       "abi_stale": false,
       "error": null,
-      "is_l3_tc": false,
-      "reason_if_blocked": "STATE-DIVERGENT: optimizer cold-starts ema=grad0 (grokfast.py:143) but the TC P3 state cache inits ema=0 \u2192 ema slice rel 0.98 at step 1 (state-gate). Needs a step==1 ema=grad init in the shared TC P3 (cold-start-STAGED). Tail+kernel built; not registered."
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
     },
     {
       "model": "vit",
@@ -281,7 +285,7 @@
       "model": "vit",
       "optimizer": "lion",
       "executed_path": "L3-TC-megakernel(wgmma)",
-      "l3_steps_fired": 2,
+      "l3_steps_fired": 4,
       "l3_engines_seen": [
         "wgmma"
       ],
@@ -318,16 +322,16 @@
     {
       "model": "mamba",
       "optimizer": "adamw",
-      "executed_path": "L3-scalar-megakernel",
-      "l3_steps_fired": 2,
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
       "l3_engines_seen": [
-        "scalar"
+        "wgmma"
       ],
       "l1_steps_fired": 0,
       "abi_stale": false,
       "error": null,
-      "is_l3_tc": false,
-      "reason_if_blocked": "ran the fp32 SCALAR L3 megakernel, not the bf16 wgmma TC engine. mamba projections HAVE an OptId-generic wgmma TC kernel (launch_fused_mamba_megakernel_tc<Opt>), but (a) it has NO in-_ops launcher TU \u2014 the standalone mega_mamba_real_adamw_tc.cu owns a pybind module so setup.py drops it; a launcher TU like mega_{decoder,vit}_real_adamw_tc_launcher.cu is needed to reach it from dispatch.cpp \u2014 and (b) mamba\u00d7adamw is the measured scalar-wins carve-out (_L3_WGMMA_CELLS excludes it, 0.46x: the selective-scan/conv1d dominate, not the GEMMs). So mamba runs the scalar L3 megakernel; the wgmma route is buildable but not yet wired in-_ops."
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
     },
     {
       "model": "mamba",
@@ -339,7 +343,7 @@
       "abi_stale": false,
       "error": null,
       "is_l3_tc": false,
-      "reason_if_blocked": "HOST-COUPLED amplifier: train_amplifier_step trains the psi/amplifier MLP host-side between steps; train_neuralgrok does not call the L3-TC path (frozen-snapshot integration deferred)."
+      "reason_if_blocked": "KERNEL-READY, RACE-BLOCKED (directive item d): the psi MLP is in opt_components.cuh (kPsiHidden=16 == race neural_hidden=16, 2-layer), so a snapshot-plumbed L3 step would PASS the tail gate (m/v parity validates the psi pack; clip is inert at steps 1&50, max grad-norm 0.72<1.0). BUT train_neuralgrok trains the amplifier BETWEEN steps via a differentiable Python rebuild that needs the model grads, and the L3 megakernel returns only the loss \u2014 snapshot-plumbing alone yields a frozen-amplifier (non-faithful) race. The race integration (re-extract + keep the amplifier-training half) is deferred; needs owner re-scope."
     },
     {
       "model": "mamba",
@@ -351,7 +355,7 @@
       "abi_stale": false,
       "error": null,
       "is_l3_tc": false,
-      "reason_if_blocked": "ABI-GAP: per-tensor beta1 = beta1\u00b7(1-gamma)^i (gamma=0.1) is not representable in one global FusedScalars (rebase_state rebases pointers, not scalars) \u2014 same class as SG11/SG15 sharpness. Inert at step 1 (Adam\u2192sign), diverges multi-step. Tail built; not registered."
+      "reason_if_blocked": "3-MECHANISM ABI-GAP: (i) per-tensor beta1 = beta1\u00b7(1-gamma)^layer (gamma=0.1) not representable in one global FusedScalars (rebase_state rebases pointers, not scalars) \u2014 a HARD step-1 state-gate fail (observed m-rel 0.895, the kernel's global beta1 vs eager's per-layer decay); (ii) per-tensor grad-norm clip to grad_clip=1.0 (eager clip_grad_norms_device_side before apply, inert at step 1 / fires by step 50); (iii) adaptive alpha_t. (i) alone blocks any single-step pass; (ii)+(iii) add multi-step divergence. Tail+cold-start built; not registered until the per-tensor side-channel + P3 norm-clip land."
     },
     {
       "model": "mamba",
@@ -392,14 +396,16 @@
     {
       "model": "mamba",
       "optimizer": "grokfast",
-      "executed_path": "eager",
-      "l3_steps_fired": 0,
-      "l3_engines_seen": [],
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
       "l1_steps_fired": 0,
       "abi_stale": false,
       "error": null,
-      "is_l3_tc": false,
-      "reason_if_blocked": "STATE-DIVERGENT: optimizer cold-starts ema=grad0 (grokfast.py:143) but the TC P3 state cache inits ema=0 \u2192 ema slice rel 0.98 at step 1 (state-gate). Needs a step==1 ema=grad init in the shared TC P3 (cold-start-STAGED). Tail+kernel built; not registered."
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
     },
     {
       "model": "mamba",
@@ -416,14 +422,16 @@
     {
       "model": "mamba",
       "optimizer": "lion",
-      "executed_path": "eager+L1-fused-tail",
-      "l3_steps_fired": 0,
-      "l3_engines_seen": [],
-      "l1_steps_fired": 2,
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
       "abi_stale": false,
       "error": null,
-      "is_l3_tc": false,
-      "reason_if_blocked": "BLOCKED by the missing mamba wgmma launcher TU. mamba projections HAVE an OptId-generic wgmma TC kernel (launch_fused_mamba_megakernel_tc<Opt>), but (a) it has NO in-_ops launcher TU \u2014 the standalone mega_mamba_real_adamw_tc.cu owns a pybind module so setup.py drops it; a launcher TU like mega_{decoder,vit}_real_adamw_tc_launcher.cu is needed to reach it from dispatch.cpp \u2014 and (b) mamba\u00d7adamw is the measured scalar-wins carve-out (_L3_WGMMA_CELLS excludes it, 0.46x: the selective-scan/conv1d dominate, not the GEMMs). So mamba runs the scalar L3 megakernel; the wgmma route is buildable but not yet wired in-_ops."
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
     },
     {
       "model": "mamba",

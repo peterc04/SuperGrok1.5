@@ -35,7 +35,8 @@ import torch
 
 sys.path.insert(0, ".")
 from tests.hw.test_reference_parity import (  # noqa: E402
-    ref_adamw_step, ref_lion_step, ref_muon_step, ref_sg11_step,
+    ref_adamw_step, ref_grokadamw_step, ref_lion_step, ref_muon_step,
+    ref_sg11_step,
 )
 import grokking_optimizers as go            # noqa: E402,F401  (ensures _ops loads)
 import grokking_optimizers._ops as ops      # noqa: E402
@@ -314,9 +315,13 @@ def section3b_supergrok11_full_update() -> None:
             W1, b1, W2, b2, rescale, H,
             beta2, lr, wd, eps,
             # lamb, ramp, gate_temperature, grad_clip_norm.
-            # lamb/ramp are now unused in the mixing; grad_clip_norm=0 disables
-            # the in-place grad clip so the fp64 reference grad matches exactly.
-            5.0, 1.0, gate_temp, 0.0)
+            # FIX 2 (Option B): lamb/ramp are now LIVE multipliers on the single
+            # canonical (1-gate)*alpha term (lamb_eff = ramp*lamb*(1-gate)*alpha).
+            # Pass lamb=ramp=1.0 here so lamb_eff == (1-gate)*alpha, the exact
+            # identity ref_sg11_step validates (the live-lamb scaling is checked
+            # separately below). grad_clip_norm=0 disables the in-place grad clip
+            # so the fp64 reference grad matches exactly.
+            1.0, 1.0, gate_temp, 0.0)
         torch.cuda.synchronize()
 
         # Independent fp64 reference. gate = clamp(cos(grad, mu_buffer),0,1) where
@@ -336,16 +341,60 @@ def section3b_supergrok11_full_update() -> None:
         record("supergrok11 full update", passed,
                f"gate={gate_ref:.3f} (want 0.01..0.99) "
                f"max|dp|={dp:.2e} |dm|={dm:.2e} |dv|={dv:.2e} (tol 1e-4)")
+
+        # FIX 2 teeth: lamb is now a LIVE multiplier. Re-run identically but with
+        # lamb=L≠1; the correction (hence the first moment from a zero init)
+        # must scale by L*ramp. ea2 = (1-beta1)*(g + L*(1-gate)*alpha*mu) at the
+        # zero moment init, compared to the fp64 prediction. If lamb were still
+        # (void)-ed/ignored, ea2 would equal the lamb=1 moment ⇒ FAIL.
+        L = 2.0
+        p2 = p0.clone().float()
+        ea2 = torch.zeros(N, device=DEV)
+        eas2 = torch.zeros(N, device=DEV)
+        mu2 = torch.zeros(N, device=DEV)
+        ops.supergrok11_fused_step(
+            [torch.nn.Parameter(p2)], [g], [ea2], [eas2], [mu2], [sharp],
+            [t], [alpha], [beta1], W1, b1, W2, b2, rescale, H,
+            beta2, lr, wd, eps, L, 1.0, gate_temp, 0.0)
+        torch.cuda.synchronize()
+        gate2 = _cosine_gate_ref(g0, mu2.double())  # mu2 == mu (same inputs)
+        smart2 = g0 + L * (1.0 - gate2) * alpha * mu2.double()
+        m2_exp = (1.0 - beta1) * smart2  # zero-init first moment
+        dm2 = (ea2.double() - m2_exp).abs().max().item()
+        # Non-vacuous: the lamb=1 moment must DIFFER from the lamb=L moment.
+        m1 = (1.0 - beta1) * (g0 + 1.0 * (1.0 - gate2) * alpha * mu2.double())
+        live_diff = (m2_exp - m1).abs().max().item()
+        lamb_live_ok = dm2 < 1e-4 and live_diff > 1e-4
+        record("supergrok11 lamb is live", lamb_live_ok,
+               f"L={L}: max|dm2|={dm2:.2e} (tol 1e-4), "
+               f"lamb=1-vs-L moment gap={live_diff:.2e} (want >1e-4)")
     except Exception as exc:
         record("supergrok11 full update", False,
                f"raised: {type(exc).__name__}: {exc}")
 
 
 # ===========================================================================
-# Section 4 — SuperGrok2 per-head PEER routing must RUN (no reshape crash).
+# Section 4 — SuperGrok2 full param-update parity (restored grokfast term).
+#   The kernel apply sg2_apply_step (csrc/algorithms/supergrok2.h) was missing
+#   the grokfast amplification: a prior refactor (void)-ed lamb_eff in the sm_90
+#   launchers, so smart_grad lost its `lamb_eff*slow_new` term. The fix restores
+#   it as the single source: smart_grad = g + alpha*mu_new + lamb_eff*slow_new,
+#   with mu_new = gru_decay*mu + (1-gru_decay)*expert_out the expert-output EMA
+#   and slow_new = alpha*slow + (1-alpha)*g the slow-gradient EMA.
+#
+#   Like §3b for SG11, this validates the WHOLE param/moment update against the
+#   fp64 oracle ref_sg2_apply_step. Crucially it does NOT reconstruct the heavy
+#   PEER/CSA/HCA meta-net: on a FRESH optimizer (mu=slow=0) one step leaves
+#   mu_buf = (1-gru_decay)*expert_out = mu_new and slow_buf = (1-alpha)*g =
+#   slow_new in the persisted buffers, so the kernel's OWN post-step mu/slow
+#   buffers recover the exact smart_grad it used — and ref_sg2_apply_step with a
+#   NONZERO lamb_eff reproduces the param iff the kernel actually consumed
+#   lamb_eff*slow_new. If the kernel regresses to the (void)-ed drop, the
+#   reference (which adds lamb_eff*slow_buf) diverges and this FAILS.
 # ===========================================================================
 def section4_supergrok2() -> None:
-    print("\n== Section 4: SuperGrok2 per-head PEER routing runs (no crash) ==")
+    print("\n== Section 4: SuperGrok2 full param update parity (grokfast term) ==")
+    # 4a: still assert the per-head PEER routing path RUNS (no reshape crash).
     try:
         torch.manual_seed(3)
         p = torch.nn.Parameter(torch.randn(256, device=DEV))
@@ -359,6 +408,167 @@ def section4_supergrok2() -> None:
     except Exception as exc:
         record("supergrok2 runs", False, f"raised: {type(exc).__name__}: {exc}")
 
+    # 4b: numeric parity of the kernel apply against the fp64 reference, with a
+    # NONZERO lamb_eff so the restored slow term is exercised.
+    try:
+        from tests.hw.test_reference_parity import ref_sg2_apply_step
+        torch.manual_seed(4)
+        N = 512
+        p = torch.nn.Parameter(torch.randn(N, device=DEV))
+        # warmup_steps=0, warmup_ramp=1 ⇒ ramp=1.0 after the first step; a high
+        # train_acc drives the accuracy gate ≈1 ⇒ lamb_eff = lamb*ramp*gate > 0.
+        # gradient_clipping huge ⇒ the kernel's in-step global-norm clip is a
+        # no-op, so the fp64 reference can use the RAW grad (||g||≈sqrt(N)≫1
+        # would otherwise be scaled inside the kernel and break the comparison).
+        opt = go.SuperGrok2([p], lr=1e-3, warmup_steps=0, warmup_ramp=1,
+                            lamb=2.0, gradient_clipping=1e9)
+        p0 = p.detach().double().clone()
+        g = torch.randn_like(p)
+        g0 = g.double().clone()
+        p.grad = g.clone()
+        # train_acc=1.0 ⇒ gate_signal = sigmoid(gate_scale*(1.0-gate_thresh)).
+        opt.step(train_acc=1.0)
+        torch.cuda.synchronize()
+
+        # Recover the EXACT scalars the kernel used for this (single) param.
+        ramp = opt._get_ramp_factor()
+        gate_signal = opt._get_gate_signal()
+        lamb_eff = float(opt.lamb) * float(ramp) * float(gate_signal)
+        base_alpha = opt._cached_alpha
+        alpha = max(0.0, min(1.0, base_alpha * float(opt._flat_layer_alphas[0])))
+        gru_decay = float(opt._flat_layer_beta1s[0])  # kernel gru_decay = beta1
+        beta2 = opt.param_groups[0]["betas"][1]
+        lr = opt.param_groups[0]["lr"]
+        eps = opt.param_groups[0]["eps"]
+        wd_eff = opt._get_effective_wd(opt.param_groups[0]["weight_decay"])
+        t = int(opt._flat_steps[0])  # = 1
+
+        # Post-step persisted EMAs ARE mu_new / slow_new (mu0=slow0=0). Feeding
+        # them as (mu_state=0, expert_out, slow_state=0) to the reference would
+        # need expert_out; instead recover the contribution directly: with
+        # mu_state=mu_buf/gru-form already applied, run the reference with
+        # mu_state=0 and expert_out chosen so (1-gru_decay)*expert_out = mu_buf,
+        # and slow_state=0 so (1-alpha)*g = slow_buf must hold (it does by
+        # construction). Simplest: pass expert_out = mu_buf/(1-gru_decay).
+        mu_buf = opt._flat_mus[0].double()
+        slow_buf = opt._flat_slows[0].double()
+        ea_buf = opt._flat_exp_avgs[0].double()       # = (1-beta1)*smart_grad
+        easq_buf = opt._flat_exp_avg_sqs[0].double()  # = (1-beta2)*smart_grad^2
+        # Recover the PEER expert_out contribution from the post-step expert-EMA
+        # buffer (mu0=0 ⇒ mu_buf = (1-gru_decay)*expert_out). Feeding this back
+        # reproduces mu_new exactly; the discriminating check is on the MOMENTS
+        # (and slow), which carry the lamb_eff*slow_new term linearly.
+        expert_out = mu_buf / max(1e-9, (1.0 - gru_decay))
+
+        p_exp, m_exp, v_exp, mu_new_exp, slow_new_exp = ref_sg2_apply_step(
+            p0, g0,
+            torch.zeros(N, dtype=torch.float64, device=DEV),   # exp_avg0 = 0
+            torch.zeros(N, dtype=torch.float64, device=DEV),   # exp_avg_sq0 = 0
+            torch.zeros(N, dtype=torch.float64, device=DEV),   # mu_state0 = 0
+            torch.zeros(N, dtype=torch.float64, device=DEV),   # slow_state0 = 0
+            expert_out=expert_out, alpha=alpha, gru_decay=gru_decay,
+            lamb_eff=lamb_eff, lr=lr, beta1=gru_decay, beta2=beta2, eps=eps,
+            wd=wd_eff, t=t)
+
+        # The Adam param update at t=1 saturates to ≈sign(smart_grad), so |dp| is
+        # a WEAK probe of the lamb term. The first/second moments are
+        # linear/quadratic in smart_grad from the zero init, so |dm|/|dv| carry
+        # the FULL lamb_eff*slow_new contribution — these are the teeth: if the
+        # kernel regressed to the (void)-ed drop (smart_grad = g + alpha*mu_new,
+        # no slow), |dm| diverges by O(lamb_eff*|slow|) ≫ 1e-4.
+        dp = (p.double() - p_exp).abs().max().item()
+        dm = (ea_buf - m_exp).abs().max().item()
+        dv = (easq_buf - v_exp).abs().max().item()
+        dslow = (slow_buf - slow_new_exp).abs().max().item()
+        # lamb_eff MUST be exercised (nonzero), else the slow term is vacuous.
+        lamb_ok = lamb_eff > 1e-3
+        passed = (dm < 1e-4 and dv < 1e-4 and dslow < 1e-4
+                  and dp < 1e-4 and lamb_ok)
+        record("supergrok2 full update", passed,
+               f"lamb_eff={lamb_eff:.3f} (want >1e-3) "
+               f"max|dm|={dm:.2e} |dv|={dv:.2e} |dslow|={dslow:.2e} "
+               f"|dp|={dp:.2e} (tol 1e-4)")
+    except Exception as exc:
+        record("supergrok2 full update", False,
+               f"raised: {type(exc).__name__}: {exc}")
+
+
+# ===========================================================================
+# Section 5 — GrokAdamW PUBLISHED full update: per-tensor LAYER-WISE β1 +
+#   amplified slow-grad (nonzero lamb), validated against the fp64 oracle.
+#   Mirrors §3b (SG11): two tensors with DISTINCT β1_i (β1_0 != β1_1, the
+#   layer-wise decay) must each match ref_grokadamw_step under their OWN β1,
+#   AND the resulting moments must DIFFER between the two — proving the kernel
+#   consumed the per-tensor β1 vector (not a single global β1). lamb>0 keeps the
+#   EMA amplification live; nonzero ema/moments + t>1 exercise the full tail.
+# ===========================================================================
+def section_grokadamw() -> None:
+    print("\n== Section 5: GrokAdamW layer-wise β1 + amplification parity ==")
+    try:
+        torch.manual_seed(515)
+        N = 4096
+        alpha, lamb = 0.9, 2.0          # lamb>0 ⇒ slow-grad amplification live
+        beta1, beta2 = 0.9, 0.999
+        gamma = 0.1
+        lr, eps, wd = 1e-3, 1e-8, 0.01
+        t = 5
+        # Layer-wise β1: β1_0 = β1 (i=0), β1_1 = β1*(1-gamma) (i=1) — the
+        # published β1_i = β1*(1-gamma)**i. DISTINCT so the per-tensor vector
+        # path is meaningfully exercised.
+        beta1s = [beta1, beta1 * (1.0 - gamma)]
+
+        # IDENTICAL grad / ema / moment seeds for both tensors, so any divergence
+        # in the OUTPUT moments is attributable SOLELY to the differing β1.
+        g = torch.randn(N, device=DEV)
+        ema_seed = torch.randn(N, device=DEV) * 0.1
+        ea_seed = torch.randn(N, device=DEV) * 0.1
+        eas_seed = (torch.randn(N, device=DEV) * 0.1).abs()  # exp_avg_sq >= 0
+
+        params = [torch.randn(N, device=DEV), torch.randn(N, device=DEV)]
+        grads = [g.clone(), g.clone()]
+        exp_avgs = [ea_seed.clone(), ea_seed.clone()]
+        exp_avg_sqs = [eas_seed.clone(), eas_seed.clone()]
+        ema_bufs = [ema_seed.clone(), ema_seed.clone()]
+        steps = [t, t]
+        # fp64 snapshots of the inputs BEFORE the in-place kernel mutates them.
+        snaps = [(params[i].double().clone(), exp_avgs[i].double().clone(),
+                  exp_avg_sqs[i].double().clone(), ema_bufs[i].double().clone())
+                 for i in range(2)]
+
+        ops.grokadamw_fused_step(
+            params, grads, exp_avgs, exp_avg_sqs, ema_bufs, steps,
+            beta1s,                      # PUBLISHED: per-tensor layer-β1 vector
+            alpha, lamb, beta1, beta2, lr, wd, eps, 0.0)  # grad_clip=0 ⇒ off
+        torch.cuda.synchronize()
+
+        ok = True
+        details = []
+        first_moments = []
+        for i in range(2):
+            p0, ea0, eas0, ema0 = snaps[i]
+            p_exp, m_exp, v_exp, ema_exp = ref_grokadamw_step(
+                p0, g.double(), ea0, eas0, ema0,
+                alpha=alpha, lamb=lamb, lr=lr, beta1=beta1s[i], beta2=beta2,
+                eps=eps, wd=wd, t=t)
+            dp = (params[i].double() - p_exp).abs().max().item()
+            dm = (exp_avgs[i].double() - m_exp).abs().max().item()
+            dv = (exp_avg_sqs[i].double() - v_exp).abs().max().item()
+            de = (ema_bufs[i].double() - ema_exp).abs().max().item()
+            ok = ok and dp < 1e-4 and dm < 1e-4 and dv < 1e-4 and de < 1e-4
+            details.append(f"L{i}(β1={beta1s[i]:.3f}) "
+                           f"|dp|={dp:.1e}|dm|={dm:.1e}|dv|={dv:.1e}|de|={de:.1e}")
+            first_moments.append(exp_avgs[i].double())
+        # Teeth: identical inputs but different β1 ⇒ the two first moments MUST
+        # differ, proving the kernel consumed the per-tensor β1 (not one global).
+        moment_gap = (first_moments[0] - first_moments[1]).abs().max().item()
+        teeth_ok = moment_gap > 1e-4
+        record("grokadamw layer-wise β1", ok and teeth_ok,
+               "; ".join(details) + f"; L0-vs-L1 moment gap={moment_gap:.1e} "
+               f"(want >1e-4) (tol 1e-4)")
+    except Exception as exc:
+        record("grokadamw layer-wise β1", False,
+               f"raised: {type(exc).__name__}: {exc}")
+
 
 def main() -> int:
     print(f"H100 PARITY GATE — device={torch.cuda.get_device_name(0)}")
@@ -367,6 +577,7 @@ def main() -> int:
     section3_supergrok_metanet()
     section3b_supergrok11_full_update()
     section4_supergrok2()
+    section_grokadamw()
     n_pass = sum(1 for _, ok, _ in _RESULTS if ok)
     n_fail = len(_RESULTS) - n_pass
     print(f"\n=== PARITY GATE: {n_pass} pass, {n_fail} fail ===")

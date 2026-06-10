@@ -95,21 +95,40 @@ _CELLS = {
     "adamw/vit":     dict(model="vit",     opt="adamw", factory=_adamw_factory),
     "lion/decoder":  dict(model="decoder", opt="lion", factory=_lion_factory),
     "lion/vit":      dict(model="vit",     opt="lion", factory=_lion_factory),
+    # grokfast (cycle 2): the kernel cold-starts ema=grad at step==1
+    # (apply_optimizer<Grokfast> in opt_components.cuh), matching the eager
+    # ema=grad0 seed (grokfast.py _group_cache), so the (1b) STATE check now passes
+    # the ema slice (was rel 0.98 when the kernel inited ema=0). grokfast has no
+    # grad_clip and _opt_scalars_from forwards grokfast_alpha/lamb, so the live
+    # optimizer's full mechanism reaches the tail.
+    "grokfast/decoder": dict(model="decoder", opt="grokfast", factory=_grokfast_factory),
+    "grokfast/vit":     dict(model="vit",     opt="grokfast", factory=_grokfast_factory),
+    # mamba (cycle-2 directive (c)): the mamba TC kernel is now wired in-_ops, so the
+    # same OptId-generic tail runs over the mamba TC-reduced grad. adamw is the
+    # regression guard for mamba's wgmma launcher (the scalar mamba×adamw path stays
+    # too); lion/grokfast are the new tails. mamba's wgmma kernel needs B%16==0 —
+    # fused_train_step truncates the batch (kSeq=8). The cold-start fix applies to
+    # mamba's P3 identically (apply_optimizer<Grokfast> is model-independent).
+    "adamw/mamba":    dict(model="mamba", opt="adamw", factory=_adamw_factory),
+    "lion/mamba":     dict(model="mamba", opt="lion", factory=_lion_factory),
+    "grokfast/mamba": dict(model="mamba", opt="grokfast", factory=_grokfast_factory),
 }
 
 # BLOCKED cells — kept here (commented) with the state-gate evidence that blocks them,
 # so the reason is reproducible. NOT registered in _FUSED_L3_REAL; the gate's
 # has_l3_real precondition would (correctly) refuse to run them as "converted".
-#  * grokfast/{decoder,vit}: state-gate ema rel ≈ 0.98 — the optimizer cold-starts
-#    ema=grad0 (grokfast.py:143) while the TC P3 cache inits ema=0. PARAMS match at
-#    step 1 (Adam→sign masks it) but the ema/m/v STATE diverges. Needs a step==1
-#    ema=grad init in the shared TC P3 (cold-start-STAGED).
-#  * grokadamw/decoder: per-tensor beta1 = beta1·(1-gamma)^i (gamma=0.1) is not
-#    representable in one global FusedScalars. Inert at step 1, diverges multi-step.
+#  * grokadamw/{decoder,vit}: THREE eager mechanisms a single global FusedScalars
+#    cannot carry, ALL required (no-suppression): (i) per-tensor layer-wise beta1 =
+#    beta1·(1-gamma)^layer (gamma=0.1); (ii) per-tensor grad-norm clip to grad_clip=1.0
+#    (eager grokadamw_fused_step → clip_grad_norms_device_side, bindings.cpp:215); (iii)
+#    adaptive alpha_t. The single-step gate would HOLLOW-PASS: (ii)+(iii) are inert at
+#    step 1 (no reduced-grad tensor norm > 1.0 / no losses fed), so registering on a
+#    green single-step gate would read "converted" while the cell diverges multi-step.
+#    Needs the per-tensor scalar side-channel (i) + a P3 norm reduction (ii). The ema
+#    cold-start is already staged in apply_optimizer<GrokAdamW>.
 _BLOCKED_EVIDENCE = {
-    "grokfast/decoder":  dict(model="decoder", opt="grokfast", factory=_grokfast_factory),
-    "grokfast/vit":      dict(model="vit",     opt="grokfast", factory=_grokfast_factory),
     "grokadamw/decoder": dict(model="decoder", opt="grokadamw", factory=_grokadamw_factory),
+    "grokadamw/vit":     dict(model="vit",     opt="grokadamw", factory=_grokadamw_factory),
 }
 
 

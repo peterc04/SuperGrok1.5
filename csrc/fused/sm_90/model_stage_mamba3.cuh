@@ -353,7 +353,7 @@ __device__ __forceinline__ void mb_layernorm_fwd(
 }
 
 // ── LayerNorm backward (mirrors decoder dec_layernorm_bwd; accumulates affine). ─
-__device__ void mb_layernorm_bwd(
+__device__ inline void mb_layernorm_bwd(
         const float* __restrict__ dy, const float* __restrict__ xhat,
         const float* __restrict__ inv, const float* __restrict__ gamma,
         float* __restrict__ dx_out, float* __restrict__ gw, float* __restrict__ gb,
@@ -389,7 +389,7 @@ __device__ void mb_layernorm_bwd(
 
 // ── dW += dY^T @ X for a linear Y = X @ W^T (+ b). dX = dY @ W (set or add).
 //    Owner-thread per (o,i) for dW; db[o]+=Σ_s dY. Mirrors decoder dec_linear_bwd.─
-__device__ void mb_linear_bwd(
+__device__ inline void mb_linear_bwd(
         const float* __restrict__ dY, const float* __restrict__ X,
         const float* __restrict__ W, int in_dim, int out_dim,
         float* __restrict__ dW, float* __restrict__ db,
@@ -424,7 +424,7 @@ __device__ void mb_linear_bwd(
 // ── CONV1D (depthwise, NON-causal, k=3, pad=1) forward. ───────────────────────
 //   out[t,c] = b[c] + W[c,0,0]*in[t-1,c] + W[c,0,1]*in[t,c] + W[c,0,2]*in[t+1,c].
 //   Mirrors mamba_oracle.conv1d_forward.
-__device__ void mb_conv1d_fwd(const float* __restrict__ in,
+__device__ inline void mb_conv1d_fwd(const float* __restrict__ in,
                               const float* __restrict__ W,
                               const float* __restrict__ b,
                               float* __restrict__ out) {
@@ -445,7 +445,7 @@ __device__ void mb_conv1d_fwd(const float* __restrict__ in,
 
 // ── CONV1D backward. dW[c,0,k]+=Σ_t dy[t,c]*in[t+k-1,c]; db[c]+=Σ_t dy[t,c];
 //   dx[tt,c]=Σ_k W[c,0,k]*dy[tt-k+1,c] (in-range). Mirrors conv1d_backward.
-__device__ void mb_conv1d_bwd(const float* __restrict__ dy,
+__device__ inline void mb_conv1d_bwd(const float* __restrict__ dy,
                              const float* __restrict__ in,
                              const float* __restrict__ W,
                              float* __restrict__ dW, float* __restrict__ db,
@@ -491,7 +491,7 @@ __device__ void mb_conv1d_bwd(const float* __restrict__ dy,
 //    A[s]=-exp(A_log[j,s]); dt_t=softplus(dt_pre[t,j]);
 //    h[s] = exp(dt_t*A[s])*h[s] + dt_t*Bmat[t,s]*x[t,j]; y[t,j]=Σ_s Cmat[t,s]*h[s].
 //  x_main is passed in (caller materialises silu(conv) into a buffer). ──────────
-__device__ void mb_scan_fwd(const float* __restrict__ A_log,
+__device__ inline void mb_scan_fwd(const float* __restrict__ A_log,
                            const float* __restrict__ x_main,  // [kSeq,d_inner]
                            const MambaSampleSmem::LayerAct* a,
                            float* __restrict__ y_scan_out) {
@@ -532,7 +532,7 @@ __device__ void mb_scan_fwd(const float* __restrict__ A_log,
 //   dA_log[j,s]  += dA[s]*A[s]   (A=-exp(A_log))   (owner j -> plain write)
 // dBmat/dCmat are shared across channels -> reduced over threads in a FIXED order
 // (mb_block_sum, ascending lane/warp = deterministic) into smem dBmat/dCmat.
-__device__ void mb_scan_bwd(const float* __restrict__ A_log,
+__device__ inline void mb_scan_bwd(const float* __restrict__ A_log,
                            const float* __restrict__ x_main,    // [kSeq,d_inner]
                            const MambaSampleSmem::LayerAct* a,
                            const float* __restrict__ dy_scan,   // [kSeq,d_inner]
@@ -630,7 +630,7 @@ __device__ __forceinline__ void mb_make_x_main(const MambaSampleSmem::LayerAct* 
 //  FORWARD for one sample (CTA-cooperative). Mirrors mamba_oracle.mamba_forward.
 //  Caches BOTH layers' forward activations into sm->act[li]; returns sample NLL.
 // ────────────────────────────────────────────────────────────────────────────
-__device__ float mb_forward_sample(const MambaWeights& w, const int* tokens_s,
+__device__ inline float mb_forward_sample(const MambaWeights& w, const int* tokens_s,
                                     int target, MambaSampleSmem* sm) {
     // Embedding + positional.
     for (int idx = threadIdx.x; idx < mb::kSeq * mb::kD; idx += blockDim.x) {
@@ -753,7 +753,7 @@ __device__ float mb_forward_sample(const MambaWeights& w, const int* tokens_s,
 //  every weight grad into the CTA partial `g`. Mirrors mamba_oracle.mamba_backward
 //  + ssm_layer_backward, in the documented order 1..13.
 // ────────────────────────────────────────────────────────────────────────────
-__device__ void mb_backward_sample(const MambaWeights& w, const MambaGrad& g,
+__device__ inline void mb_backward_sample(const MambaWeights& w, const MambaGrad& g,
                                     const int* tokens_s, int target, int B,
                                     MambaSampleSmem* sm) {
     // ── CE backward: dlogits = (softmax - onehot)/B. ──
