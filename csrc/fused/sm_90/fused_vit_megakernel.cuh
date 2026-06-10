@@ -57,6 +57,44 @@
 #include <cstdint>
 #include <cassert>
 
+// ============================================================================
+//  SG_TUNED_GEMM_IMPL — the per-cell GEMM-engine selector (mirrors the decoder
+//  twin fused_decoder_megakernel.cuh). The scalar fp32 owner-computes path
+//  (model_stage_vit.cuh) and the bf16 wgmma tensor-core path
+//  (model_stage_vit_tc.cuh) are compiled ALONGSIDE each other; the autotuner
+//  injects -DSG_TUNED_GEMM_IMPL=<token> per-TU to pick one. Absent the macro,
+//  the SCALAR path compiles verbatim (CONTRACT rule 3) — the shipped default
+//  that all of test_vit_megakernel.py's L3-REAL gates exercise; adding this seam
+//  must leave those numbers BIT-IDENTICAL (the macros below are only #defined
+//  here; the scalar kernel body does not reference them).
+//
+//  Tokens are integers (the preprocessor cannot compare strings):
+//      SG_GEMM_IMPL_SCALAR = 0   (default; the verbatim fp32 path below)
+//      SG_GEMM_IMPL_WGMMA  = 1   (the Fork-B bf16 tensor-core ViT cell)
+//
+//  The wgmma token pulls in the validated GEMM engine (model_stage_vit_tc.cuh)
+//  and the phase-restructured fwd+bwd+AdamW persistent kernel at the BOTTOM of
+//  this file (fused_vit_megakernel_tc / launch_fused_vit_megakernel_tc). The
+//  scalar default path is UNCHANGED and its gates stay bit-identical; this is a
+//  PARALLEL kernel, not an edit of the scalar one.
+// ============================================================================
+#ifndef SG_GEMM_IMPL_SCALAR
+#define SG_GEMM_IMPL_SCALAR 0
+#endif
+#ifndef SG_GEMM_IMPL_WGMMA
+#define SG_GEMM_IMPL_WGMMA  1
+#endif
+#ifndef SG_TUNED_GEMM_IMPL
+#define SG_TUNED_GEMM_IMPL SG_GEMM_IMPL_SCALAR
+#endif
+#if (SG_TUNED_GEMM_IMPL != SG_GEMM_IMPL_SCALAR) && \
+    (SG_TUNED_GEMM_IMPL != SG_GEMM_IMPL_WGMMA)
+#error "SG_TUNED_GEMM_IMPL must be SG_GEMM_IMPL_SCALAR (0) or SG_GEMM_IMPL_WGMMA (1)"
+#endif
+#if (SG_TUNED_GEMM_IMPL == SG_GEMM_IMPL_WGMMA)
+#include "csrc/fused/sm_90/model_stage_vit_tc.cuh"
+#endif
+
 namespace sg { namespace fused { namespace sm90 {
 
 // Compile-time guard: the byte budget the launcher uses (sizeof(VitSampleSmem))
@@ -108,7 +146,7 @@ struct ViTInputCtx {
 // __constant__ tables kVitSizes/kVitOffsets (vit_layout.cuh), read directly by
 // the reduce + optimizer phases.
 template <OptId Opt>
-__global__ void __launch_bounds__(256)
+__global__ void __launch_bounds__(SG_TUNED_MEGA_BLOCK)
 fused_vit_megakernel(PersistentContext ctx,
                      float* __restrict__ params,
                      ViTInputCtx in,
@@ -237,7 +275,7 @@ cudaError_t launch_fused_vit_megakernel(
     // (2) Occupancy with the REAL dynamic-smem request (hang-freedom is honest).
     int occ = 0;
     err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &occ, (const void*)&fused_vit_megakernel<Opt>, 256,
+        &occ, (const void*)&fused_vit_megakernel<Opt>, SG_TUNED_MEGA_BLOCK,
         /*dynamicSMemBytes=*/dyn_smem);
     if (err != cudaSuccess) return err;
     // At least one CTA per SM must be resident or the grid barrier can never be
@@ -258,11 +296,199 @@ cudaError_t launch_fused_vit_megakernel(
     if (ctx.g_next_task) { err = cudaMemsetAsync(ctx.g_next_task, 0, sizeof(int), stream); if (err) return err; }
 
     // (3) Launch WITH the dynamic-smem byte count.
-    dim3 grid(launch_ctas), block(256);
+    dim3 grid(launch_ctas), block(SG_TUNED_MEGA_BLOCK);
     fused_vit_megakernel<Opt><<<grid, block, dyn_smem, stream>>>(
         ctx, params, in, grad, lr, step, st);
     return cudaGetLastError();
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+//  WGMMA CELL DRIVER (DESIGN-TC-PIPELINE.md Fork B, the ViT twin of the decoder
+//  R2.3 driver). Compiled only under the wgmma token; the scalar path above is
+//  untouched. The TC path's per-CTA tile scratch lives in HBM (NOT dynamic smem)
+//  — the only smem the TC kernel needs is the tiny wgmma staging arena (one
+//  A(64×16) + one B(N×16) bf16 tile + a 256-float reduction + the 10 dW specs),
+//  which is STATIC (≈ 7 KB), so this kernel — unlike the scalar ViT one — needs
+//  NO dynamic-smem opt-in. The big ViT activation footprint (which forced the
+//  scalar path to 184 KB dynamic smem) becomes HBM acts here (Fork B), so the
+//  occupancy story is the decoder TC one: static smem, 0 dynamic.
+// ════════════════════════════════════════════════════════════════════════════
+#if (SG_TUNED_GEMM_IMPL == SG_GEMM_IMPL_WGMMA)
+
+// TC megakernel threads: 256 (the engine's producer+consumer warpgroup layout;
+// wgmma is warpgroup-scoped on threads 0..127). We do NOT apply the scalar
+// path's asymmetric setmaxnreg (it would STARVE the MMA warpgroup); the
+// validated selftest ran no split. We match it.
+#define SG_VIT_TC_MEGA_BLOCK 256
+
+// ── smem arena for the unpipelined engine: one A(64×16) + one B(N×16) bf16 tile
+//    + the 256-float reduction slot + the 10 dW specs (identical for all threads
+//    → shared, not per-thread stack). 16B-aligned. N = SG_TUNED_TILE_N. ──
+struct VitTcSmem {
+    __nv_bfloat16 sA[64 * 16];
+    __nv_bfloat16 sB[SG_TUNED_TILE_N * 16];
+    float red[256];
+    vittc::VitDwSpec spec[10];
+};
+
+// ── TC workspace layout (carved from in.workspace; the host sizes it). Regions
+//    (float units):
+//      [0 .. acts_f)                      : VitActs bf16 region (reinterpreted)
+//      [acts_f .. acts_f + nCTA*scratch)  : per-CTA tile scratch (f32)
+//      [.. + nCTA*kLnVecElems)            : per-CTA LN-vec partials (f32)
+//      [.. + nCTA)                        : per-CTA loss slots (f32)
+//      [.. + 1)                           : reduced scalar loss (host reads it)
+//    acts_f = ceil(acts_bf16 / 2). ──
+__host__ __device__ __forceinline__ int64_t vit_tc_acts_floats(int T, int B) {
+    return (vittc::vit_acts_bf16_count(T, B) + 1) / 2;
+}
+__host__ __device__ __forceinline__ int64_t vit_tc_workspace_floats(int T, int B, int nCTA) {
+    return vit_tc_acts_floats(T, B)
+         + (int64_t)nCTA * vittc::vit_tile_scratch_total_f32()
+         + (int64_t)nCTA * vittc::kLnVecElems
+         + nCTA + 1;
+}
+
+template <OptId Opt>
+__global__ void __launch_bounds__(SG_VIT_TC_MEGA_BLOCK)
+fused_vit_megakernel_tc(PersistentContext ctx,
+                        float* __restrict__ params,
+                        ViTInputCtx in,
+                        float* __restrict__ grad,
+                        float lr, int step, FusedOptState st) {
+    __shared__ VitTcSmem sm;
+    GridBarrier bar = ctx.barrier();
+    const int cta = blockIdx.x;
+    const int nCTA = (int)ctx.n_ctas;
+    const int B = in.B;
+    const int T = B * vit::kSeq;
+    const int Tp = B * vit::kNPatch;
+
+    // Workspace partition.
+    float* ws = in.workspace;
+    const int64_t acts_f = vit_tc_acts_floats(T, B);
+    __nv_bfloat16* acts_base = reinterpret_cast<__nv_bfloat16*>(ws);
+    float* scratch_base = ws + acts_f;
+    const int64_t scratch_per = vittc::vit_tile_scratch_total_f32();
+    float* lnvec_base = scratch_base + (int64_t)nCTA * scratch_per;
+    float* loss_part  = lnvec_base + (int64_t)nCTA * vittc::kLnVecElems;
+    float* loss_out   = loss_part + nCTA;
+
+    vittc::VitActs acts = vittc::vit_acts_bind(acts_base, T, B);
+    vittc::VitTileScratch sc = vittc::vit_tile_scratch_bind(scratch_base + (int64_t)cta * scratch_per);
+    float* my_lnvec = lnvec_base + (int64_t)cta * vittc::kLnVecElems;
+
+    VitWeights w = vit_bind(params);
+
+    // ── P0: zero this CTA's LN-vec partials + loss slot (dW/cls/pos/patch grads
+    //    are written-once → no pre-zero). ──
+    for (int i = threadIdx.x; i < vittc::kLnVecElems; i += blockDim.x) my_lnvec[i] = 0.0f;
+    if (threadIdx.x == 0) loss_part[cta] = 0.0f;
+    bar.sync();   // B0
+
+    // ── P1: token-tile-parallel fwd+bwd. Each CTA grid-strides over tiles of
+    //    kTileM rows; for its tile it runs fwd (→ acts X, NLL) then bwd (→ acts
+    //    dY, dh0, LN-vec partials). Barrier-free within the tile. ──
+    const int nrows_tile = vittc::kTileM;
+    const int n_tiles = (T + nrows_tile - 1) / nrows_tile;
+    float nll_acc = 0.0f;
+    for (int ti = cta; ti < n_tiles; ti += nCTA) {
+        const int g0 = ti * nrows_tile;
+        const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
+        float nll = vittc::vittc_forward_tile(w, g0, nrows, acts, sc, in.patches, in.targets,
+                                              sm.sA, sm.sB, sm.red);
+        vittc::vittc_backward_tile(w, g0, nrows, B, acts, sc, in.targets,
+                                   my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
+        if (threadIdx.x == 0) nll_acc += nll;
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) loss_part[cta] = nll_acc;
+    bar.sync();   // B1: all acts (X + dY) + LN-vec partials complete
+
+    // ── P2: assemble all 32 grads into `grad`. dW output-stationary (gt % nCTA),
+    //    biases, cls/pos owner-scan, LN-vec reduce. No partials. The 10 dW specs
+    //    are built into SHARED smem (thread 0; identical for all). ──
+    if (threadIdx.x == 0) vittc::vittc_build_dw_specs(acts, B, T, Tp, sm.spec);
+    __syncthreads();
+    vittc::VitDwSpec* spec = sm.spec;
+    const int n_dw = vittc::vittc_dw_total_tiles<SG_TUNED_TILE_N>(spec);
+    for (int gt = cta; gt < n_dw; gt += nCTA)
+        vittc::vittc_dw_run_tile<SG_TUNED_TILE_N>(spec, gt, acts.dh0, grad, sm.sA, sm.sB);
+    vittc::vittc_dw_biases(spec, acts.dh0, grad);
+    vittc::vittc_clspos_owner_scan(acts, T, grad, cta, nCTA);
+    vittc::vittc_lnvec_reduce(lnvec_base, grad, nCTA, cta);
+    // Loss reduce (fp64) by CTA 0.
+    if (cta == 0 && threadIdx.x == 0) {
+        double s = 0.0;
+        for (int c = 0; c < nCTA; ++c) s += (double)loss_part[c];
+        *in.loss_out = (float)(s / (double)B);
+    }
+    (void)loss_out;
+    bar.sync_reset(ctx.g_next_task);   // B2: reduced grad ready; reset queue
+
+    // ── P3: scalar optimizer tail over the reduced grad (REUSED verbatim). ──
+    st.lr = lr;
+    {
+        __shared__ int task_slot;
+        TaskQueue q = ctx.queue();
+        for (int t = q.next_block(&task_slot); t < kVitNumTensors;
+             t = q.next_block(&task_slot)) {
+            const int n = kVitSizes[t];
+            const int64_t off = (int64_t)kVitOffsets[t];
+            const FusedOptState ts = vit_rebase_state<Opt>(st, off);
+            float* __restrict__ p = params + off;
+            const float* __restrict__ gg = grad + off;
+            for (int i = threadIdx.x; i < n; i += blockDim.x)
+                apply_optimizer<Opt>(p, gg, (int64_t)i, step, ts);
+        }
+    }
+}
+
+// ncta_cap (default 0): if >0, launch min(n_sms, ncta_cap) CTAs instead of one
+// per SM. The grid barrier rendezvous is over the LAUNCHED count (ctx.n_ctas);
+// any cap is hang-safe as long as the workspace + dW-tile/cls/pos ownership use
+// the SAME nCTA (they read ctx.n_ctas). The shipped path passes 0 (full
+// saturation); a memory-constrained TEST passes a small cap so the per-CTA
+// scratch (nCTA × slab) fits. Determinism is preserved per fixed nCTA.
+template <OptId Opt>
+cudaError_t launch_fused_vit_megakernel_tc(
+        PersistentContext ctx, float* params, ViTInputCtx in,
+        float* grad, float lr, int step, FusedOptState st, cudaStream_t stream,
+        int ncta_cap = 0) {
+    int dev = 0;
+    cudaError_t err = cudaGetDevice(&dev);
+    if (err != cudaSuccess) return err;
+    int n_sms = 0;
+    err = cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, dev);
+    if (err != cudaSuccess) return err;
+
+    // Hang-freedom: certify one block/SM occupancy with the ACTUAL dynamic smem
+    // (0 here — VitTcSmem is static). If the static smem + 200-reg consumer can't
+    // place one block/SM, REFUSE (the grid barrier would hang).
+    int occ = 0;
+    err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &occ, (const void*)&fused_vit_megakernel_tc<Opt>, SG_VIT_TC_MEGA_BLOCK,
+        /*dynamicSMemBytes=*/0);
+    if (err != cudaSuccess) return err;
+    if (occ < 1) return cudaErrorLaunchOutOfResources;
+
+    unsigned launch_ctas = (unsigned)n_sms;
+    if (ncta_cap > 0 && (unsigned)ncta_cap < launch_ctas) launch_ctas = (unsigned)ncta_cap;
+    ctx.n_ctas = launch_ctas;
+    // B%16 required (the dW K-loop contracts K=T=B*kSeq and K=B in 16-step atoms).
+    if ((in.B % 16) != 0) return cudaErrorInvalidValue;
+
+    if (ctx.g_arrived) { err = cudaMemsetAsync(ctx.g_arrived, 0, sizeof(unsigned), stream); if (err) return err; }
+    if (ctx.g_generation) { err = cudaMemsetAsync(ctx.g_generation, 0, sizeof(unsigned), stream); if (err) return err; }
+    if (ctx.g_next_task) { err = cudaMemsetAsync(ctx.g_next_task, 0, sizeof(int), stream); if (err) return err; }
+
+    dim3 grid(launch_ctas), block(SG_VIT_TC_MEGA_BLOCK);
+    fused_vit_megakernel_tc<Opt><<<grid, block, 0, stream>>>(
+        ctx, params, in, grad, lr, step, st);
+    return cudaGetLastError();
+}
+
+#endif  // SG_TUNED_GEMM_IMPL == SG_GEMM_IMPL_WGMMA
 
 }}} // namespace sg::fused::sm90
 
