@@ -112,6 +112,73 @@ struct FusedOptState {
     float alpha = 0.98f, beta = 0.0f, lamb = 2.0f, alpha_max = 1.0f;
 };
 
+// =========================================================================
+//  FusedScalars — the FULL runtime scalar set the host passes per fused_step.
+//
+//  C2-GAP FIX (the whole point of this struct). Previously each mega_*.cu host
+//  entry bound ONLY pointers + lr into FusedOptState and left every other scalar
+//  at its struct default — which silently froze the math: bc1/bc2 == 1.0 (NO
+//  Adam bias correction, stuck at t=1), gate == 1.0 (SG gating inert), d_factor
+//  == 1.0 (Prodigy d-adaptation inert), and beta1/beta2/eps/wd/alpha/lamb/
+//  alpha_max/beta/neg_lr_scale/decay_factor never reaching apply_optimizer<>.
+//  apply_optimizer<> already READS all of these from FusedOptState; the only gap
+//  was that nobody SET them. This POD carries them across the host→kernel ABI so
+//  the cell can populate FusedOptState with the live optimizer's real values.
+//
+//  Defaults here reproduce the OLD inert behavior EXACTLY (bc=gate=d_factor=1,
+//  decay_factor=1, the same beta/eps/wd/alpha defaults), so a caller that does
+//  not pass scalars yields byte-identical results to the pre-fix cells — the
+//  widening is additive, not a behavior change for unset fields.
+//
+//  Per-tensor step count / bias correction (loud assumption): the megakernel
+//  treats the whole flat param as ONE task, so a SINGLE (bc1, bc2) pair is bound
+//  per call. That is correct ONLY when every parameter tensor shares the same
+//  step counter — which holds in the grokking race (all params step together
+//  every iteration). The host computes bc1 = 1 - beta1^step, bc2 = 1 - beta2^step
+//  from that shared step and passes them here. If a future caller steps tensors
+//  at different counts, it must call fused_step per-tensor with that tensor's bc.
+// =========================================================================
+struct FusedScalars {
+    float lr           = 1e-3f;
+    float beta1        = 0.9f;
+    float beta2        = 0.999f;
+    float eps          = 1e-8f;
+    float wd           = 0.01f;
+    float bc1          = 1.0f;   // 1 - beta1^step (un-inverted; apply divides)
+    float bc2          = 1.0f;   // 1 - beta2^step (un-inverted; apply divides)
+    float alpha        = 0.98f;  // meta-net strength / grokfast_alpha / neuralgrok alpha
+    float beta         = 0.0f;   // neuralgrok beta (affine psi term)
+    float lamb         = 2.0f;   // grokfast/grokadamw amplification (grokfast_lamb)
+    float alpha_max    = 1.0f;   // SG15 per-coord alpha clip ceiling
+    float gate         = 1.0f;   // SG11 cosine gate / SG15 sigmoid(accuracy) gate
+    float d_factor     = 1.0f;   // Prodigy adaptive d (effective LR scale)
+    float neg_lr_scale = 0.0f;   // Muon: -lr * ns_scale (2D NS-orth apply)
+    float decay_factor = 1.0f;   // Muon: 1 - lr*wd (decoupled decay multiplier)
+};
+
+// Fold the runtime scalars into a FusedOptState (pointers are bound separately
+// by each cell). Single seam so every cell applies the SAME scalar mapping — no
+// per-cell drift in which field a scalar lands in. apply_optimizer<> reads these
+// exact fields, so this is the bridge that un-freezes bc1/bc2/gate/d_factor/etc.
+__host__ __device__ __forceinline__ void apply_scalars(FusedOptState& st,
+                                                        const FusedScalars& s) {
+    st.lr           = s.lr;
+    st.beta1        = s.beta1;
+    st.beta2        = s.beta2;
+    st.eps          = s.eps;
+    st.wd           = s.wd;
+    st.bc1          = s.bc1;
+    st.bc2          = s.bc2;
+    st.alpha        = s.alpha;
+    st.beta         = s.beta;
+    st.lamb         = s.lamb;
+    st.alpha_max    = s.alpha_max;
+    st.gate         = s.gate;
+    st.d_factor     = s.d_factor;
+    st.neg_lr_scale = s.neg_lr_scale;
+    st.decay_factor = s.decay_factor;
+}
+
 // Dispatch to the REAL per-element optimizer step. Each branch is a genuine,
 // distinct call into csrc/algorithms/<opt>.h — there is no AdamW fallback.
 template <OptId Opt>

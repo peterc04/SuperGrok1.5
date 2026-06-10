@@ -80,6 +80,39 @@ struct FusedOptState {
     float alpha = 0.98f, beta = 0.0f, lamb = 2.0f, alpha_max = 1.0f;
 };
 
+// FusedScalars — full runtime scalar set (AMD twin of the sm_90 struct). See
+// opt_components.cuh for the C2-gap rationale: previously each cell bound only
+// lr, freezing bc1/bc2/gate/d_factor at 1.0; this carries the live values so
+// apply_optimizer<> (which already reads them) is no longer inert. Defaults
+// reproduce the old inert behavior exactly. One (bc1,bc2) pair per call is valid
+// only when all param tensors share a step counter (true in the grokking race).
+struct FusedScalars {
+    float lr           = 1e-3f;
+    float beta1        = 0.9f;
+    float beta2        = 0.999f;
+    float eps          = 1e-8f;
+    float wd           = 0.01f;
+    float bc1          = 1.0f;
+    float bc2          = 1.0f;
+    float alpha        = 0.98f;
+    float beta         = 0.0f;
+    float lamb         = 2.0f;
+    float alpha_max    = 1.0f;
+    float gate         = 1.0f;
+    float d_factor     = 1.0f;
+    float neg_lr_scale = 0.0f;
+    float decay_factor = 1.0f;
+};
+
+__host__ __device__ __forceinline__ void apply_scalars(FusedOptState& st,
+                                                        const FusedScalars& s) {
+    st.lr = s.lr; st.beta1 = s.beta1; st.beta2 = s.beta2; st.eps = s.eps;
+    st.wd = s.wd; st.bc1 = s.bc1; st.bc2 = s.bc2; st.alpha = s.alpha;
+    st.beta = s.beta; st.lamb = s.lamb; st.alpha_max = s.alpha_max;
+    st.gate = s.gate; st.d_factor = s.d_factor;
+    st.neg_lr_scale = s.neg_lr_scale; st.decay_factor = s.decay_factor;
+}
+
 // Shared Adam tail: m,v EMAs on g_eff, bias-corrected decoupled-WD apply.
 // (bc1/bc2 un-inverted = 1-beta^t; divide — matches the algorithm headers.)
 __device__ __forceinline__ float sg_adam_tail(

@@ -1,0 +1,55 @@
+// csrc/fused/sm_90/mega_decoder_real_adamw.cu — PHASE 1 host-launcher TU for the
+// TRUE L3 fused (transformer_decoder × adamw) megakernel.
+//
+// WHY A SEPARATE .cu (the 33-cell pattern): dispatch.cpp is HOST-compiled (it is
+// a .cpp in the cpp_extension source list), so it cannot host <<<>>> launches,
+// __global__ kernels, or device intrinsics. This nvcc-compiled TU (setup.py
+// globs csrc/fused/sm_90/*.cu) owns ALL of that. It exposes ONE non-template host
+// launcher whose boundary signature is decomposed to plain pointers/ints + the
+// FusedScalars POD — NO header-only types (DecoderTokenCtx/FusedOptState) cross
+// the boundary — so dispatch.cpp can `extern`-declare it using only the mirror
+// structs it already has (sg::fused::PersistentContext, sg::fused::sm90::
+// FusedScalars). The FQN + layout match → the mangling matches → it links.
+//
+// Inside (where the device header IS visible) it builds FusedOptState +
+// DecoderTokenCtx and calls launch_fused_decoder_megakernel<OptId::AdamW>, which
+// runs the REAL decoder fwd+bwd + AdamW as one persistent kernel (no surrogate,
+// no intermediate launches). See fused_decoder_megakernel.cuh +
+// model_stages_decoder.cuh (transcribed from the verified oracle).
+
+#include "csrc/fused/sm_90/fused_decoder_megakernel.cuh"
+
+namespace sg { namespace fused { namespace sm90 {
+
+cudaError_t mega_decoder_real_adamw(
+        PersistentContext ctx, float* params,
+        const int* tokens, const int* targets, int B,
+        float* state, float* grad, float* workspace, float* loss_out,
+        const int* sizes, const int* offsets,
+        float lr, int step, const FusedScalars& scalars, cudaStream_t stream) {
+    // sizes/offsets are unused on this path (the kernel reads the generated
+    // __constant__ kDecSizes/kDecOffsets directly); kept in the signature for ABI
+    // symmetry with the surrogate cells and forward-compat. Silence the warning.
+    (void)sizes; (void)offsets;
+
+    const int64_t total = kDecTotalElems;
+    // AdamW state binding: state = [m | v | extra] (3*total) + 1 trailing loss
+    // slot. extra is unused by AdamW (rebase_state<AdamW> guards it out).
+    FusedOptState st;
+    st.exp_avg    = state;
+    st.exp_avg_sq = state + total;
+    apply_scalars(st, scalars);   // FULL scalar set (un-frozen bc1/bc2/...)
+    st.lr = lr;
+
+    DecoderTokenCtx tok;
+    tok.tokens    = tokens;
+    tok.targets   = targets;
+    tok.B         = B;
+    tok.workspace = workspace;
+    tok.loss_out  = loss_out;
+
+    return launch_fused_decoder_megakernel<OptId::AdamW>(
+        ctx, params, tok, grad, lr, step, st, stream);
+}
+
+}}}  // namespace sg::fused::sm90

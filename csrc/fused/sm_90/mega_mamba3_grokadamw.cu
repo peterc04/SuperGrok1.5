@@ -7,27 +7,46 @@
 // device-function component (csrc/algorithms/grokadamw.h via
 // opt_components.cuh::apply_optimizer<OptId::GrokAdamW>) with the real model
 // stage component (model_stages.cuh::model_*_stage<ModelId::Mamba3>) over the
-// shared persistent-megakernel substrate. Fuse tier L3 chosen by the solver.
+// shared persistent-megakernel substrate. Solver fuse tier (perf placement): L3.
 #include "csrc/fused/sm_90/fused_megakernel.cuh"
 
 namespace sg { namespace fused { namespace sm90 {
 
 // Uniform host entry (the symbol fused_step dispatches to). Binds this
 // optimizer's REAL state buffers: m/v (Adam moments) + the per-optimizer
-// `extra` n-slice (ema/sam_dir/s_track/mu/orth/smart_grad). Scalar hyperparams
-// (prodigy d, sg gates, neuralgrok psi-net) are host-supplied at runtime (🟡
-// no-GPU here) — see HARDWARE_VALIDATION.md. Composition + apply math are
-// real + compiled.
+// `extra` n-slice (ema/sam_dir/s_track/mu/orth/smart_grad), AND the FULL runtime
+// scalar set via apply_scalars() — beta1/beta2/eps/wd/alpha/lamb/alpha_max/beta/
+// gate/d_factor/neg_lr_scale/decay_factor + un-inverted bc1/bc2. This closes the
+// C2 gap: every scalar apply_optimizer<GrokAdamW> reads is now SET from the live
+// optimizer (previously only lr was bound, freezing bc/gate/d_factor at 1.0).
+//
+// TIER SELECTOR (`opt_only`): this entry instantiates BOTH tiers and selects at
+// runtime. opt_only=true → L1: the fused optimizer TAIL only; the kernel reads
+// the REAL gradient from the global `grad` buffer (computed by the framework's
+// own fwd/bwd) and applies the canonical update — this is the NUMERICALLY
+// FAITHFUL path the grokking race uses (real grad in, real updated params out).
+// opt_only=false → L3: the kernel ALSO runs the megakernel's element-local model
+// fwd/bwd over the flat param blob (model_stages.cuh) — a SURROGATE model, NOT
+// the real Transformer/ViT/Mamba graph, so its loss does not match eager. L3 is
+// kept compiled (perf-placement coverage) but is not the race path; see
+// BUILD_AND_VALIDATE.md. Both tiers share this identical scalar/pointer binding.
 cudaError_t mega_mamba3_grokadamw(
         PersistentContext ctx, float* params, const float* input, float* acts,
         float* grad, float* m, float* v, float* extra,
         const int* sizes, const int* offsets,
-        float lr, int step, cudaStream_t stream) {
+        float lr, int step, const FusedScalars& scalars, bool opt_only,
+        cudaStream_t stream) {
     FusedOptState st;
     st.exp_avg = m;
     st.exp_avg_sq = v;
     st.ema = extra;  // grokadamw's third per-element state buffer
-    st.lr = lr;
+    apply_scalars(st, scalars);  // FULL scalar set (un-freezes bc1/bc2/gate/d/…)
+    st.lr = lr;                  // lr also passed positionally for the L3 phase
+    if (opt_only) {
+        return launch_fused_megakernel<ModelId::Mamba3, OptId::GrokAdamW,
+                                       FuseTier::L1>(
+            ctx, params, input, acts, grad, sizes, offsets, lr, step, st, stream);
+    }
     return launch_fused_megakernel<ModelId::Mamba3, OptId::GrokAdamW,
                                    FuseTier::L3>(
         ctx, params, input, acts, grad, sizes, offsets, lr, step, st, stream);

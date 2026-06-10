@@ -2,113 +2,114 @@
 // Do not edit by hand. hipcc/WITH_HIP only (🟡 MI300X).
 // PersistentContext must already be declared in sg::fused::gfx942_mega.
 namespace fused { namespace gfx942_mega {
-hipError_t mega_transformer_decoder_adamw(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_transformer_decoder_grokadamw(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_transformer_decoder_grokfast(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_transformer_decoder_lion(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_transformer_decoder_looksam(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_transformer_decoder_muon(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_transformer_decoder_neuralgrok(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_transformer_decoder_prodigy(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_transformer_decoder_supergrok11(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_transformer_decoder_supergrok15(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_transformer_decoder_supergrok2(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_vit_adamw(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_vit_grokadamw(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_vit_grokfast(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_vit_lion(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_vit_looksam(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_vit_muon(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_vit_neuralgrok(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_vit_prodigy(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_vit_supergrok11(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_vit_supergrok15(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_vit_supergrok2(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_mamba3_adamw(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_mamba3_grokadamw(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_mamba3_grokfast(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_mamba3_lion(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_mamba3_looksam(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_mamba3_muon(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_mamba3_neuralgrok(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_mamba3_prodigy(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_mamba3_supergrok11(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_mamba3_supergrok15(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
-hipError_t mega_mamba3_supergrok2(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, hipStream_t);
+hipError_t mega_transformer_decoder_adamw(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_transformer_decoder_grokadamw(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_transformer_decoder_grokfast(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_transformer_decoder_lion(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_transformer_decoder_looksam(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_transformer_decoder_muon(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_transformer_decoder_neuralgrok(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_transformer_decoder_prodigy(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_transformer_decoder_supergrok11(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_transformer_decoder_supergrok15(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_transformer_decoder_supergrok2(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_vit_adamw(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_vit_grokadamw(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_vit_grokfast(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_vit_lion(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_vit_looksam(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_vit_muon(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_vit_neuralgrok(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_vit_prodigy(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_vit_supergrok11(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_vit_supergrok15(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_vit_supergrok2(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_mamba3_adamw(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_mamba3_grokadamw(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_mamba3_grokfast(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_mamba3_lion(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_mamba3_looksam(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_mamba3_muon(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_mamba3_neuralgrok(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_mamba3_prodigy(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_mamba3_supergrok11(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_mamba3_supergrok15(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
+hipError_t mega_mamba3_supergrok2(PersistentContext, float*, const float*, float*, float*, float*, float*, float*, const int*, const int*, float, int, const FusedScalars&, bool, hipStream_t);
 
 inline hipError_t dispatch_gfx942_cell(
  const std::string& model, const std::string& optimizer,
  PersistentContext ctx, float* params, const float* input,
  float* acts, float* grad, float* m, float* v, float* extra,
  const int* sizes, const int* offsets, float lr, int step,
+ const FusedScalars& scalars, bool opt_only,
  hipStream_t stream, bool* found) {
  *found = true;
  if (model == "transformer_decoder" && optimizer == "adamw")
-  return mega_transformer_decoder_adamw(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_transformer_decoder_adamw(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "transformer_decoder" && optimizer == "grokadamw")
-  return mega_transformer_decoder_grokadamw(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_transformer_decoder_grokadamw(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "transformer_decoder" && optimizer == "grokfast")
-  return mega_transformer_decoder_grokfast(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_transformer_decoder_grokfast(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "transformer_decoder" && optimizer == "lion")
-  return mega_transformer_decoder_lion(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_transformer_decoder_lion(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "transformer_decoder" && optimizer == "looksam")
-  return mega_transformer_decoder_looksam(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_transformer_decoder_looksam(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "transformer_decoder" && optimizer == "muon")
-  return mega_transformer_decoder_muon(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_transformer_decoder_muon(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "transformer_decoder" && optimizer == "neuralgrok")
-  return mega_transformer_decoder_neuralgrok(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_transformer_decoder_neuralgrok(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "transformer_decoder" && optimizer == "prodigy")
-  return mega_transformer_decoder_prodigy(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_transformer_decoder_prodigy(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "transformer_decoder" && optimizer == "supergrok11")
-  return mega_transformer_decoder_supergrok11(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_transformer_decoder_supergrok11(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "transformer_decoder" && optimizer == "supergrok15")
-  return mega_transformer_decoder_supergrok15(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_transformer_decoder_supergrok15(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "transformer_decoder" && optimizer == "supergrok2")
-  return mega_transformer_decoder_supergrok2(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_transformer_decoder_supergrok2(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "vit" && optimizer == "adamw")
-  return mega_vit_adamw(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_vit_adamw(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "vit" && optimizer == "grokadamw")
-  return mega_vit_grokadamw(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_vit_grokadamw(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "vit" && optimizer == "grokfast")
-  return mega_vit_grokfast(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_vit_grokfast(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "vit" && optimizer == "lion")
-  return mega_vit_lion(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_vit_lion(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "vit" && optimizer == "looksam")
-  return mega_vit_looksam(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_vit_looksam(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "vit" && optimizer == "muon")
-  return mega_vit_muon(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_vit_muon(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "vit" && optimizer == "neuralgrok")
-  return mega_vit_neuralgrok(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_vit_neuralgrok(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "vit" && optimizer == "prodigy")
-  return mega_vit_prodigy(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_vit_prodigy(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "vit" && optimizer == "supergrok11")
-  return mega_vit_supergrok11(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_vit_supergrok11(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "vit" && optimizer == "supergrok15")
-  return mega_vit_supergrok15(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_vit_supergrok15(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "vit" && optimizer == "supergrok2")
-  return mega_vit_supergrok2(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_vit_supergrok2(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "mamba3" && optimizer == "adamw")
-  return mega_mamba3_adamw(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_mamba3_adamw(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "mamba3" && optimizer == "grokadamw")
-  return mega_mamba3_grokadamw(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_mamba3_grokadamw(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "mamba3" && optimizer == "grokfast")
-  return mega_mamba3_grokfast(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_mamba3_grokfast(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "mamba3" && optimizer == "lion")
-  return mega_mamba3_lion(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_mamba3_lion(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "mamba3" && optimizer == "looksam")
-  return mega_mamba3_looksam(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_mamba3_looksam(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "mamba3" && optimizer == "muon")
-  return mega_mamba3_muon(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_mamba3_muon(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "mamba3" && optimizer == "neuralgrok")
-  return mega_mamba3_neuralgrok(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_mamba3_neuralgrok(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "mamba3" && optimizer == "prodigy")
-  return mega_mamba3_prodigy(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_mamba3_prodigy(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "mamba3" && optimizer == "supergrok11")
-  return mega_mamba3_supergrok11(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_mamba3_supergrok11(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "mamba3" && optimizer == "supergrok15")
-  return mega_mamba3_supergrok15(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_mamba3_supergrok15(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  if (model == "mamba3" && optimizer == "supergrok2")
-  return mega_mamba3_supergrok2(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, stream);
+  return mega_mamba3_supergrok2(ctx, params, input, acts, grad, m, v, extra, sizes, offsets, lr, step, scalars, opt_only, stream);
  *found = false;
  return hipSuccess;
 }

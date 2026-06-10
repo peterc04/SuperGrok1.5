@@ -13,10 +13,16 @@
 #if defined(__AMDGCN__) || defined(__HIPCC__) || defined(GROK_HIP_DEVICE)
 namespace sg { namespace fused { namespace gfx942_mega {
 
-// Force this cell's real composed kernel instantiation so the device pass emits
-// it (and the free-standing AMDGCN gate type-checks the full expansion).
+// Force BOTH tier instantiations so the device pass emits them and the free-
+// standing AMDGCN gate type-checks the full expansion. The host entry selects
+// L1 (opt-only, real-grad tail — the faithful path) or L3 (surrogate model fwd/
+// bwd + opt) at runtime; both must exist as symbols.
 template __global__ void
 fused_megakernel<ModelId::TransformerDecoder, OptId::NeuralGrok, FuseTier::L1>(
+    PersistentContext, float*, const float*, float*, float*,
+    const int*, const int*, float, int, FusedOptState);
+template __global__ void
+fused_megakernel<ModelId::TransformerDecoder, OptId::NeuralGrok, FuseTier::L3>(
     PersistentContext, float*, const float*, float*, float*,
     const int*, const int*, float, int, FusedOptState);
 
@@ -25,9 +31,11 @@ fused_megakernel<ModelId::TransformerDecoder, OptId::NeuralGrok, FuseTier::L1>(
 
 // ── HOST launcher (hipcc host pass only; 🟡 MI300X — not the bare amdgcn gate,
 //    not the WITH_CUDA build). Faithful mirror of the verified sm_90 launcher:
-//    one persistent workgroup per CU, 256 threads (4 wavefronts). __HIPCC__ is
-//    defined for the hipcc host pass, so FusedOptState/fused_megakernel (guarded
-//    on __HIPCC__) are visible here. ───────────────────────────────────────────
+//    binds m/v/extra + the FULL scalar set (apply_scalars, closing the C2 gap)
+//    and selects the tier via opt_only. Uses launch_fused_megakernel (the
+//    hang-free occupancy-capped helper) for each tier. __HIPCC__ is defined for
+//    the hipcc host pass, so FusedOptState/FusedScalars/fused_megakernel are
+//    visible here. ─────────────────────────────────────────────────────────────
 #if defined(__HIPCC__) && !defined(__AMDGCN__)
 #include <hip/hip_runtime.h>
 namespace sg { namespace fused { namespace gfx942_mega {
@@ -35,13 +43,7 @@ hipError_t mega_transformer_decoder_neuralgrok(
         PersistentContext ctx, float* params, const float* input, float* acts,
         float* grad, float* m, float* v, float* extra,
         const int* sizes, const int* offsets, float lr, int step,
-        hipStream_t stream) {
-    int dev = 0; hipError_t err = hipGetDevice(&dev);
-    if (err != hipSuccess) return err;
-    int n_cus = 0;
-    err = hipDeviceGetAttribute(&n_cus, hipDeviceAttributeMultiprocessorCount, dev);
-    if (err != hipSuccess) return err;
-    ctx.n_groups = (unsigned)n_cus;
+        const FusedScalars& scalars, bool opt_only, hipStream_t stream) {
     FusedOptState st;
     st.exp_avg = m; st.exp_avg_sq = v;
     // #5: bind psi-net weights from the packed `extra` buffer (W1|b1|W2|b2,
@@ -52,13 +54,16 @@ hipError_t mega_transformer_decoder_neuralgrok(
         st.psi_b1 = extra + kPsiB1Off;
         st.psi_W2 = extra + kPsiW2Off;
     }
+    apply_scalars(st, scalars);  // FULL scalar set (un-freezes bc1/bc2/gate/d/…)
     st.lr = lr;
-    dim3 grid((unsigned)n_cus), block(256);
-    hipLaunchKernelGGL(
-        (fused_megakernel<ModelId::TransformerDecoder, OptId::NeuralGrok, FuseTier::L1>),
-        grid, block, 0, stream,
-        ctx, params, input, acts, grad, sizes, offsets, lr, step, st);
-    return hipGetLastError();
+    if (opt_only) {
+        return launch_fused_megakernel<ModelId::TransformerDecoder, OptId::NeuralGrok,
+                                       FuseTier::L1>(
+            ctx, params, input, acts, grad, sizes, offsets, lr, step, st, stream);
+    }
+    return launch_fused_megakernel<ModelId::TransformerDecoder, OptId::NeuralGrok,
+                                   FuseTier::L3>(
+        ctx, params, input, acts, grad, sizes, offsets, lr, step, st, stream);
 }
 }}}  // namespace sg::fused::gfx942_mega
 #endif
