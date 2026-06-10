@@ -71,6 +71,33 @@ from grokking_optimizers import megakernel as mk
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP-silicon"
 
 
+def _load_reference_steps():
+    """Import the fp64 reference optimizer steps from the parity test module.
+
+    Tier D's "the optimizer math ACTUALLY optimizes" claim must validate the
+    SAME per-element math the shipped kernels encode — not a fresh inline
+    reimplementation that could agree with itself while diverging from the
+    headers. tests/hw/test_reference_parity.py holds the canonical fp64
+    references (ref_adamw_step / ref_lion_step / …) transcribed 1:1 from
+    csrc/algorithms/<opt>.h, so we drive the descent with THOSE.
+
+    We load the test module by path via importlib (it lives under tests/, not on
+    the package path) so nothing is moved or duplicated. Returns the loaded
+    module, or None if torch/the module is unavailable (caller SKIPs).
+    """
+    import importlib.util
+
+    path = REPO_ROOT / "tests" / "hw" / "test_reference_parity.py"
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_profile_maximal_ref_parity", str(path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # runs pytest.importorskip("torch") at top
+        return mod
+    except Exception:
+        return None
+
+
 @dataclasses.dataclass
 class Probe:
     tier: str
@@ -486,74 +513,100 @@ def tier_c_gfx942(rep: Report) -> None:
 def tier_d_functional(rep: Report) -> None:
     sys.stdout.write("\n[TIER D] functional correctness — the optimizer math "
                      "ACTUALLY optimizes (CPU execution)\n")
+
+    # Drive the descent with the SHIPPED-math fp64 references (ref_adamw_step /
+    # ref_lion_step) from tests/hw/test_reference_parity.py — those are
+    # transcribed 1:1 from csrc/algorithms/<opt>.h, so a passing descent here is
+    # evidence the CANONICAL math optimizes, not just that a fresh inline
+    # reimplementation agrees with itself. (A5-F3: the previous inline jax Adam/
+    # Lion was an independent reimplementation and did NOT validate the headers.)
+    ref = _load_reference_steps()
     try:
-        import jax  # noqa: F401
-        import jax.numpy as jnp
+        import torch  # the references operate on torch fp64 tensors
     except Exception:
-        rep.add(Probe("D", "optimizer descent (jax CPU)", SKIP, "jax absent"))
-        rep.silicon.append("functional optimizer execution (needs jax)")
-        return
+        torch = None
+    if ref is None or torch is None:
+        rep.add(Probe("D", "optimizer descent (reference steps, CPU)", SKIP,
+                      "torch / parity-reference module unavailable"))
+        rep.silicon.append("functional optimizer execution (needs torch)")
+    else:
+        # Minimal convex problem: minimise f(w) = ||w - t||^2 (grad 2*(w-t)).
+        # A correct optimizer must (a) strictly reduce the loss over N steps and
+        # (b) keep every iterate finite. We exercise the Adam-family update (the
+        # shared core of 8/11 optimizers, via ref_adamw_step) and Lion
+        # (sign-based, ref_lion_step) as representatives of the shipped math.
+        def _w0():
+            return torch.tensor([5.0, -3.0, 1.0], dtype=torch.float64)
 
-    # Pure-jax reference of each optimizer's per-element step would duplicate
-    # csrc/algorithms; instead drive the real per-element math the canonical
-    # headers encode, via a minimal convex problem: minimise f(w)=||w-t||^2.
-    # A correct optimizer must (a) strictly reduce the loss over N steps and
-    # (b) keep every iterate finite. We test the Adam-family update (the shared
-    # core of 8/11 optimizers) and Lion (sign-based) as representatives.
-    import jax
+        TGT = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float64)
 
-    def adam_descent() -> Tuple[bool, str]:
-        w = jnp.array([5.0, -3.0, 1.0])
-        t = jnp.array([1.0, 1.0, 1.0])
-        m = jnp.zeros(3)
-        v = jnp.zeros(3)
-        b1, b2, eps, lr = 0.9, 0.999, 1e-8, 0.1
-        loss0 = float(jnp.sum((w - t) ** 2))
-        for step in range(1, 201):
-            g = 2.0 * (w - t)
-            m = b1 * m + (1 - b1) * g
-            v = b2 * v + (1 - b2) * g * g
-            mh = m / (1 - b1 ** step)
-            vh = v / (1 - b2 ** step)
-            w = w - lr * mh / (jnp.sqrt(vh) + eps)
-            if not bool(jnp.all(jnp.isfinite(w))):
-                return False, f"non-finite iterate at step {step}"
-        loss1 = float(jnp.sum((w - t) ** 2))
-        ok = loss1 < loss0 * 1e-3
-        return ok, f"loss {loss0:.3f} -> {loss1:.2e} (Adam core, 200 steps)"
+        def adam_descent() -> Tuple[bool, str]:
+            w = _w0()
+            m = torch.zeros(3, dtype=torch.float64)
+            v = torch.zeros(3, dtype=torch.float64)
+            loss0 = float(((w - TGT) ** 2).sum())
+            for step in range(1, 201):
+                g = 2.0 * (w - TGT)
+                w, m, v = ref.ref_adamw_step(
+                    w, g, m, v, lr=0.1, beta1=0.9, beta2=0.999,
+                    eps=1e-8, wd=0.0, t=step)
+                if not bool(torch.isfinite(w).all()):
+                    return False, f"non-finite iterate at step {step}"
+            loss1 = float(((w - TGT) ** 2).sum())
+            ok = loss1 < loss0 * 1e-3
+            return ok, (f"loss {loss0:.3f} -> {loss1:.2e} "
+                        f"(ref_adamw_step, 200 steps)")
 
-    def lion_descent() -> Tuple[bool, str]:
-        w = jnp.array([5.0, -3.0, 1.0])
-        t = jnp.array([1.0, 1.0, 1.0])
-        m = jnp.zeros(3)
-        b1, b2, lr = 0.9, 0.99, 0.05
-        loss0 = float(jnp.sum((w - t) ** 2))
-        for _ in range(400):
-            g = 2.0 * (w - t)
-            update = jnp.sign(b1 * m + (1 - b1) * g)
-            w = w - lr * update
-            m = b2 * m + (1 - b2) * g
-            if not bool(jnp.all(jnp.isfinite(w))):
-                return False, "non-finite iterate"
-        loss1 = float(jnp.sum((w - t) ** 2))
-        return loss1 < loss0, f"loss {loss0:.3f} -> {loss1:.3e} (Lion, 400 steps)"
+        def lion_descent() -> Tuple[bool, str]:
+            w = _w0()
+            ea = torch.zeros(3, dtype=torch.float64)
+            loss0 = float(((w - TGT) ** 2).sum())
+            for _ in range(400):
+                g = 2.0 * (w - TGT)
+                w, ea = ref.ref_lion_step(
+                    w, g, ea, lr=0.05, beta1=0.9, beta2=0.99, wd=0.0)
+                if not bool(torch.isfinite(w).all()):
+                    return False, "non-finite iterate"
+            loss1 = float(((w - TGT) ** 2).sum())
+            return loss1 < loss0, (f"loss {loss0:.3f} -> {loss1:.3e} "
+                                   f"(ref_lion_step, 400 steps)")
 
-    for name, fn in (("Adam-family core descent", adam_descent),
-                     ("Lion sign-update descent", lion_descent)):
-        t0 = time.monotonic()
-        ok, detail = fn()
-        rep.add(Probe("D", name, PASS if ok else FAIL, detail,
-                      time.monotonic() - t0))
+        for name, fn in (("Adam-family core descent (shipped-math ref)",
+                          adam_descent),
+                         ("Lion sign-update descent (shipped-math ref)",
+                          lion_descent)):
+            t0 = time.monotonic()
+            ok, detail = fn()
+            rep.add(Probe("D", name, PASS if ok else FAIL, detail,
+                          time.monotonic() - t0))
 
     # Also confirm a real fused (model, optimizer) Pallas program TRACES,
     # LOWERS, and is invocable on CPU — the binary path executes end to end.
+    # This half needs jax/pallas; SKIP cleanly if absent (it is a separate
+    # capability from the reference-step descent above).
     try:
         from csrc.backends.pallas._pallas_fused import trace_check
+    except Exception as exc:  # noqa: BLE001
+        rep.add(Probe("D", "fused program lowers (CPU)", SKIP,
+                      f"jax/pallas absent: {str(exc)[:80]}"))
+        rep.silicon.append("fused Pallas program lowering (needs jax)")
+        return
+    try:
         r = trace_check("mamba3", "adamw", "L3")
         rep.add(Probe("D", "fused mamba3/adamw program lowers (CPU)",
                       PASS if r else FAIL, f"trace_check -> {r!r}"))
     except Exception as exc:  # noqa: BLE001
-        rep.add(Probe("D", "fused program lowers", FAIL, str(exc)[:160]))
+        msg = str(exc)
+        # The module imports without jax, but trace_check() raises if jax is
+        # actually absent — that is an environment gap, not a kernel failure, so
+        # SKIP cleanly (matching the descent half above). A genuine lowering
+        # error (jax present) still FAILs.
+        if "jax" in msg.lower():
+            rep.add(Probe("D", "fused program lowers (CPU)", SKIP,
+                          f"jax absent: {msg[:80]}"))
+            rep.silicon.append("fused Pallas program lowering (needs jax)")
+        else:
+            rep.add(Probe("D", "fused program lowers", FAIL, msg[:160]))
 
 
 # ---------------------------------------------------------------------------

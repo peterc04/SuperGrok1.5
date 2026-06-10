@@ -16,6 +16,7 @@ from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
 from grokking_optimizers.dispatch import get_ops
+from grokking_optimizers.optimizers.adamw import _validate_grad
 
 _ops = get_ops()  # Fails loudly if C++ extension not built
 
@@ -170,7 +171,10 @@ class LookSAM(Optimizer):
             step_list = []
             for p, state in zip(params_list, states):
                 sam_dir = state["sam_direction"]
-                grads_list.append((1.0 - alpha) * p.grad + alpha * sam_dir)
+                # Validate (sparse/CPU/dtype/contiguity) before the data_ptr is
+                # handed to the fused kernel — looksam blends the validated grad.
+                g = _validate_grad(p)
+                grads_list.append((1.0 - alpha) * g + alpha * sam_dir)
                 state["step"] += 1
                 step_list.append(state["step"])
 
@@ -294,6 +298,30 @@ class LookSAM(Optimizer):
         k = self.param_groups[0]["k"]
         return self._global_step % k == 0
 
+    def state_dict(self) -> dict:
+        """Include the SAM-cadence counter in the checkpoint.
+
+        ``_global_step`` (which drives ``should_sam_step`` every k steps) lives on
+        the optimizer instance, not the per-parameter ``state`` dict, so the base
+        ``Optimizer.state_dict`` would drop it and a resumed run would mis-phase
+        its SAM cadence. Stash it under a private ``"_looksam"`` key.
+        """
+        sd = super().state_dict()
+        sd["_looksam"] = {"_global_step": self._global_step}
+        return sd
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        """Restore the SAM-cadence counter, then the base state.
+
+        Pops the private ``"_looksam"`` blob (default-absent so OLD checkpoints
+        load cleanly with the constructor-initialised ``_global_step``).
+        """
+        sd = dict(state_dict)
+        blob = sd.pop("_looksam", None)
+        if blob is not None:
+            self._global_step = blob.get("_global_step", self._global_step)
+        super().load_state_dict(sd)
+
     def _single_param_step(self, param, group, state):
         """Per-parameter step used by the `use_grad_hooks=True` path.
 
@@ -314,7 +342,8 @@ class LookSAM(Optimizer):
         sam_dir = state.setdefault(
             "sam_direction", torch.zeros_like(param, dtype=torch.float32))
         alpha = group["alpha"]
-        g_adj = (1.0 - alpha) * param.grad + alpha * sam_dir
+        g = _validate_grad(param)
+        g_adj = (1.0 - alpha) * g + alpha * sam_dir
         _ops.fused_adamw_simple_step(
             [param], [g_adj], [state["exp_avg"]], [state["exp_avg_sq"]],
             [state["step"]], group["betas"][0], group["betas"][1],

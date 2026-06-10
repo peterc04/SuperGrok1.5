@@ -1219,6 +1219,18 @@ class SuperGrok2(Optimizer):
     ):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
+        if len(self.param_groups) > 1:
+            # LOUD unsupported (not a silent wrong): every SG2 step path
+            # (step / step_compiled / batched) reads lr/betas/eps/wd from
+            # param_groups[0] and would silently apply them to ALL groups.
+            # SuperGrok11/15 honor per-group scalars via one fused call per
+            # group; porting that across SG2's three dispatch paths is queued
+            # work — until then, refuse rather than mis-apply.
+            raise NotImplementedError(
+                "SuperGrok2 currently supports a single param group "
+                f"(got {len(self.param_groups)}): the fused step paths read "
+                "hyperparameters from param_groups[0] only. Merge your groups "
+                "or use per-parameter masks; per-group support is tracked.")
         self.state_precision = state_precision
 
         # NOTE (owner directive — no functionality suppression): a

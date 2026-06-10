@@ -3437,7 +3437,11 @@ PYBIND11_MODULE(_ops, m) {
  py::arg("d_factor") = 1.0f, py::arg("bc1") = 1.0f, py::arg("bc2") = 1.0f,
  py::arg("neg_lr_scale") = 0.0f, py::arg("decay_factor") = 1.0f,
  py::arg("beta") = 0.0f, py::arg("alpha_max") = 1.0f,
- py::arg("step") = 1, py::arg("opt_only") = true);
+ py::arg("step") = 1, py::arg("opt_only") = true,
+ // GEMM-engine selector for the L3-REAL path (task 1). Default "scalar" keeps
+ // the old call shape valid (back-compat); the Python wrapper passes "wgmma"
+ // for decoder/vit at bf16 to take the tensor-core launchers.
+ py::arg("gemm_impl") = "scalar");
 
  // GrokAdamW
  m.def("grokadamw_step", &sg::grokadamw_step);

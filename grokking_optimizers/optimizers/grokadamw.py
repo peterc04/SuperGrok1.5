@@ -5,9 +5,55 @@ Combines AdamW with an exponential moving average (EMA) gradient filter that
 detects and amplifies slow-learning gradient signals, accelerating the
 transition from memorisation to generalisation (grokking).
 
-All computation is dispatched to the fused C++/CUDA kernel via _ops.
+This is the PUBLISHED GrokAdamW algorithm (QuixiAI/grokadamw aka
+cognitivecomputations/grokadamw; also HF transformers PR #32521). Two
+mechanisms beyond plain EMA-filtered AdamW make it "grokking-aware", BOTH wired
+here (they were previously dead constructor args):
+
+  (1) LAYER-WISE β1 MOMENTUM DECAY.  Per the reference (grokadamw.py):
+          layer_beta1 = beta1 * (1 - gamma) ** i
+      where ``i`` is the enumeration index of the parameter tensor. Earlier
+      layers keep the full β1; later layers get a progressively smaller β1
+      (less momentum), which the paper motivates as promoting early-layer
+      generalisation. gamma default 0.1. Implemented with the SAME flat-index
+      pattern as supergrok11.py's ``_flat_layer_beta1s``.
+
+  (2) GROKKING-SIGNAL-DRIVEN ADAPTIVE α.  α is the EMA decay of the slow-grad
+      filter; the reference modulates it from a grokking signal. VERBATIM from
+      the reference (grokadamw.py):
+          # _default_grokking_signal(train_loss, eval_loss):
+          diff      = max(0, eval_loss - train_loss)
+          max_loss  = max(eval_loss, train_loss)
+          signal    = diff / max_loss if max_loss > 0 else 0.0
+          # then, per param-group:
+          alpha = alpha_init * math.exp(-grokking_signal_decay_rate * signal)
+      i.e. ALPHA SCHEDULE  α_t = alpha_init · exp(−κ · signal),  with the
+      signal the *max-normalised* (NOT train-normalised) clipped val−train gap
+      and κ == ``grokking_signal_decay_rate`` (default 0.1). The slow-grad
+      filter + amplification it feeds is unchanged and identical to the kernel
+      math (csrc/algorithms/grokadamw.h):
+          grok_ema  = α·grok_ema + (1−α)·grad
+          grok_grad = grad + lamb·grok_ema
+      lamb default 2.0 in the reference. (Our historical default was 5.0; we
+      keep the constructor default at the reference value 2.0 — see __init__.)
+
+INTERPRETATION / SOURCE NOTES (read LOUDLY):
+  * The reference α update lives in ``_default_grokking_signal`` +
+    the per-group ``alpha = alpha_init * math.exp(...)`` line of
+    cognitivecomputations/grokadamw grokadamw.py. We transcribe THAT formula
+    (max-normalised signal, exp decay), NOT SuperGrok11's train-normalised
+    variant — the two differ only in the signal denominator and this one is
+    the published GrokAdamW.
+  * The fused kernel consumes a SCALAR α per multi-tensor call, so the live
+    α_t is simply passed through. β1 is per-tensor: until the vector ABI lands
+    we partition the fused call per tensor (each with its own β1_i); post
+    rebuild a single call passes the whole β1 vector. See ``step``.
+
+All hot-path computation is dispatched to the fused C++/CUDA kernel via _ops.
 """
 
+import math
+import warnings
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -62,19 +108,35 @@ def _adamw_step_reference(params, grads, exp_avgs, exp_avg_sqs, steps,
 class GrokAdamW(Optimizer):
     """Adam with grokking-aware EMA gradient filtering and amplification.
 
+    Implements the PUBLISHED GrokAdamW (cognitivecomputations/grokadamw):
+    layer-wise β1 decay + grokking-signal-driven adaptive α (see module
+    docstring for the transcribed formulas and source lines).
+
     Args:
         params: Iterable of parameters or parameter groups.
         lr: Learning rate (default: 1e-3).
         betas: Coefficients for computing running averages of gradient
-            and its square (default: (0.9, 0.98)).
+            and its square (default: (0.9, 0.98)). The reference uses
+            (0.9, 0.999); we keep our (0.9, 0.98) project default.
         eps: Term added to the denominator for numerical stability
             (default: 1e-8).
         weight_decay: Decoupled weight decay coefficient (default: 1.0).
-        alpha: EMA decay factor for gradient filter (default: 0.98).
+        alpha: ``alpha_init`` — the BASE EMA decay of the slow-grad filter
+            (default: 0.98). When ``step`` is given both ``train_loss`` and
+            ``val_loss``, the LIVE decay becomes
+            ``alpha_t = alpha * exp(-kappa * signal)`` (reference formula).
         lamb: Amplification factor applied to the filtered gradient
-            signal (default: 5.0).
-        gamma: Deprecated — unused. Kept for API backward compatibility.
-        decay: Deprecated — unused. Kept for API backward compatibility.
+            signal (default: 2.0 — the reference default; was 5.0 historically).
+        gamma: LAYER-WISE β1 decay rate (WIRED, not deprecated). β1 for the
+            i-th parameter tensor is ``betas[0] * (1 - gamma) ** i`` (reference
+            grokadamw.py). gamma=0 ⇒ a single global β1 (identical layers);
+            gamma>0 ⇒ later layers get less momentum (default: 0.1).
+        kappa: ``grokking_signal_decay_rate`` — the exponential decay rate of
+            α vs the grokking signal (reference name; default: 0.1). Only
+            active when ``step`` receives both train_loss and val_loss.
+        decay: Back-compat alias accepted but NOT used by the published
+            algorithm (the reference has no second decay knob). Kept so old
+            call sites do not break; silently ignored (default: 0.1).
         grad_clip: Maximum gradient norm for per-parameter clipping
             (default: 1.0).
     """
@@ -87,8 +149,9 @@ class GrokAdamW(Optimizer):
         eps: float = 1e-8,
         weight_decay: float = 1.0,
         alpha: float = 0.98,
-        lamb: float = 5.0,
+        lamb: float = 2.0,
         gamma: float = 0.1,
+        kappa: float = 0.1,
         decay: float = 0.1,
         grad_clip: float = 1.0,
         use_grad_hooks: bool = False,
@@ -109,6 +172,19 @@ class GrokAdamW(Optimizer):
             raise ValueError(f"Invalid weight_decay: {weight_decay}")
         if grad_clip <= 0.0:
             raise ValueError(f"Invalid grad_clip (must be > 0): {grad_clip}")
+        if gamma is None:
+            gamma = 0.0
+        if not 0.0 <= gamma < 1.0:
+            raise ValueError(f"Invalid gamma (layer-wise β1 decay, want "
+                             f"0<=gamma<1): {gamma}")
+        if kappa is None:
+            kappa = 0.0
+        if kappa < 0.0:
+            raise ValueError(f"Invalid kappa (grokking_signal_decay_rate, want "
+                             f">=0): {kappa}")
+        # `decay` is the one remaining back-compat-only arg: the PUBLISHED
+        # GrokAdamW has no second decay knob, so we accept it and ignore it
+        # (no DeprecationWarning churn — it simply has no published role).
 
         defaults = dict(
             lr=lr,
@@ -118,6 +194,7 @@ class GrokAdamW(Optimizer):
             alpha=alpha,
             lamb=lamb,
             gamma=gamma,
+            kappa=kappa,
             decay=decay,
             grad_clip=grad_clip,
         )
@@ -130,13 +207,72 @@ class GrokAdamW(Optimizer):
         # Lazily-bound fused kernel callable (resolved once at first step()).
         self._fused_step = None
 
+        # ── Layer-wise β1 (PUBLISHED GrokAdamW): β1_i = β1 * (1 - gamma)**i,
+        # i the flat enumeration index of the param tensor — the SAME pattern as
+        # supergrok11.py::_flat_layer_beta1s. Precompute the per-param-id β1 so
+        # the hot path is a dict lookup. Index runs across ALL groups (global
+        # layer order), matching the reference's single enumerate(params).
+        self._layer_beta1_by_id: dict = {}
+        idx = 0
+        for group in self.param_groups:
+            beta1 = group["betas"][0]
+            g_gamma = group["gamma"]
+            for p in group["params"]:
+                self._layer_beta1_by_id[id(p)] = beta1 * ((1.0 - g_gamma) ** idx)
+                idx += 1
+
+        # Grokking signal (one scalar per step — the reference computes a single
+        # train/val signal shared across groups) and whether it has ever been
+        # set. α is derived PER GROUP from it (alpha_init & kappa are group-level
+        # in the reference), so we keep the signal, not a pre-baked α.
+        self._grok_signal: float = 0.0
+        self._signal_active: bool = False
+
         self._use_grad_hooks = use_grad_hooks
         if use_grad_hooks:
             _register_grad_hooks(self)
 
+    def _layer_beta1(self, p) -> float:
+        """Per-tensor β1 (= β1 * (1-gamma)**layer_index). Falls back to the
+        group β1 for a param added after construction (defensive: a freshly
+        ``add_param_group``'d tensor not yet indexed gets gamma^0 = full β1)."""
+        return self._layer_beta1_by_id.get(
+            id(p), self.param_groups[0]["betas"][0])
+
+    @staticmethod
+    def _grokking_signal(train_loss, val_loss) -> float:
+        """Reference _default_grokking_signal (max-normalised clipped gap):
+            diff = max(0, val - train); m = max(val, train); signal = diff/m.
+        Returns 0.0 if either loss is None or m<=0."""
+        if train_loss is None or val_loss is None:
+            return 0.0
+        diff = max(0.0, float(val_loss) - float(train_loss))
+        max_loss = max(float(val_loss), float(train_loss))
+        return diff / max_loss if max_loss > 0.0 else 0.0
+
+    def _alpha_for_group(self, group) -> float:
+        """Live α_t for a group (PUBLISHED GrokAdamW, per group):
+            α = alpha_init * exp(-kappa * signal).
+        Until a (train_loss, val_loss) pair has ever been supplied, returns the
+        group's alpha_init unchanged. alpha_init == group["alpha"] and
+        kappa == group["kappa"] (grokking_signal_decay_rate)."""
+        if not self._signal_active:
+            return group["alpha"]
+        return group["alpha"] * math.exp(-group["kappa"] * self._grok_signal)
+
     def add_param_group(self, param_group) -> None:
         self._static_cache = {}
         super().add_param_group(param_group)
+        # Layer indices shift when a group is appended, so recompute the
+        # per-param-id β1 across ALL groups (global enumeration order).
+        self._layer_beta1_by_id = {}
+        idx = 0
+        for group in self.param_groups:
+            beta1 = group["betas"][0]
+            g_gamma = group["gamma"]
+            for p in group["params"]:
+                self._layer_beta1_by_id[id(p)] = beta1 * ((1.0 - g_gamma) ** idx)
+                idx += 1
 
     def _group_cache(self, group, grads_by_id):
         """Return cached (params, exp_avg, exp_avg_sq, ema, states).
@@ -176,12 +312,20 @@ class GrokAdamW(Optimizer):
         return entry
 
     @torch.no_grad()
-    def step(self, closure=None) -> Optional[float]:
+    def step(self, closure=None, train_loss=None, val_loss=None
+             ) -> Optional[float]:
         """Perform a single optimisation step.
 
         Args:
             closure: A closure that re-evaluates the model and returns the loss
                 (optional).
+            train_loss: Current training loss (scalar / float). When BOTH this
+                and ``val_loss`` are given, the live grokking signal is
+                recomputed and α_t = alpha_init * exp(-kappa * signal) drives the
+                slow-grad EMA decay this step (PUBLISHED GrokAdamW). Pass them on
+                the cadence the caller wants α to adapt; on steps where either is
+                None, α stays at its previous value (alpha_init on the first).
+            val_loss: Current validation/eval loss (scalar / float).
 
         Returns:
             The loss value if *closure* is provided, otherwise ``None``.
@@ -190,6 +334,15 @@ class GrokAdamW(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        # Grokking-signal → live α_t (reference: alpha = alpha_init *
+        # exp(-grokking_signal_decay_rate * signal), applied per group in
+        # _alpha_for_group). Only recomputes when BOTH losses are supplied;
+        # otherwise the last signal carries over (and α stays at alpha_init until
+        # the first pair arrives).
+        if train_loss is not None and val_loss is not None:
+            self._grok_signal = self._grokking_signal(train_loss, val_loss)
+            self._signal_active = True
 
         if self._use_grad_hooks:
             return loss
@@ -217,27 +370,100 @@ class GrokAdamW(Optimizer):
                 state["step"] += 1
                 step_list.append(state["step"])
 
-            fused_step(
-                params_list,
-                grads_list,
-                exp_avg_list,
-                exp_avg_sq_list,
-                ema_list,
-                step_list,
-                group["alpha"],
-                group["lamb"],
-                group["betas"][0],
-                group["betas"][1],
-                group["lr"],
-                group["weight_decay"],
-                group["eps"],
-                group["grad_clip"],
-            )
+            # Live α_t (group alpha_init if no signal yet) — a SCALAR the kernel
+            # accepts as-is. β1 is PER-TENSOR (layer-wise decay), so it must vary
+            # per param: β1_i = β1*(1-gamma)**layer_index.
+            alpha_t = self._alpha_for_group(group)
+            beta1s = [self._layer_beta1(p) for p in params_list]
+
+            self._dispatch_grokadamw(
+                fused_step, params_list, grads_list, exp_avg_list,
+                exp_avg_sq_list, ema_list, step_list, alpha_t, beta1s, group)
 
         return loss
 
+    # Has the rebuilt extension grown the vector-β1 ABI? None = unprobed;
+    # True/False latched after the first attempt so we don't re-raise/re-catch
+    # the TypeError every step. Class-level so all instances share the verdict.
+    _vector_beta1_abi: Optional[bool] = None
+
+    def _dispatch_grokadamw(self, fused_step, params_list, grads_list,
+                            exp_avg_list, exp_avg_sq_list, ema_list, step_list,
+                            alpha_t, beta1s, group):
+        """Drive the fused GrokAdamW kernel with a live scalar α_t and a
+        PER-TENSOR β1 vector (layer-wise decay).
+
+        Two paths, selected by an ABI probe (stale-ABI latch):
+          • VECTOR ABI (post-rebuild): the C++ ``grokadamw_fused_step`` accepts a
+            ``layer_beta1s`` vector after ``steps`` — ONE multi-tensor launch
+            passes the whole β1 vector + scalar α_t. Faithful and fastest.
+          • INTERIM (no rebuild): the shipped binding takes a SCALAR β1, so we
+            PARTITION the params by their β1_i value and issue one fused call per
+            distinct β1 (each its own scalar β1 + the live α_t). Correctness over
+            launch count until the ABI lands. With gamma=0 every β1_i is equal ⇒
+            exactly one call (no regression vs the old single-call path)."""
+        cls = type(self)
+        if cls._vector_beta1_abi is not False:
+            # Try the new signature: layer_beta1s inserted right after steps.
+            try:
+                fused_step(
+                    params_list, grads_list, exp_avg_list, exp_avg_sq_list,
+                    ema_list, step_list, beta1s,
+                    alpha_t, group["lamb"], group["betas"][0],
+                    group["betas"][1], group["lr"], group["weight_decay"],
+                    group["eps"], group["grad_clip"],
+                )
+                if cls._vector_beta1_abi is None:
+                    cls._vector_beta1_abi = True
+                return
+            except TypeError:
+                if cls._vector_beta1_abi is None:
+                    cls._vector_beta1_abi = False
+                    warnings.warn(
+                        "GrokAdamW: the compiled extension does not yet expose "
+                        "the vector-β1 grokadamw_fused_step ABI; using the "
+                        "interim per-β1 partitioned launch (correct, slightly "
+                        "more launches). Rebuild (`pip install -e .`) to get the "
+                        "single-call vector path.", RuntimeWarning, stacklevel=2)
+                # fall through to the interim partitioned path
+        self._dispatch_partitioned(
+            fused_step, params_list, grads_list, exp_avg_list, exp_avg_sq_list,
+            ema_list, step_list, alpha_t, beta1s, group)
+
+    @staticmethod
+    def _dispatch_partitioned(fused_step, params_list, grads_list, exp_avg_list,
+                              exp_avg_sq_list, ema_list, step_list, alpha_t,
+                              beta1s, group):
+        """Interim path: group tensors by identical β1_i and issue one scalar-β1
+        fused call per group (each passing the live scalar α_t)."""
+        # Bucket indices by their β1 value (preserve first-seen order).
+        buckets: dict = {}
+        order = []
+        for i, b1 in enumerate(beta1s):
+            if b1 not in buckets:
+                buckets[b1] = []
+                order.append(b1)
+            buckets[b1].append(i)
+        for b1 in order:
+            idxs = buckets[b1]
+            fused_step(
+                [params_list[i] for i in idxs],
+                [grads_list[i] for i in idxs],
+                [exp_avg_list[i] for i in idxs],
+                [exp_avg_sq_list[i] for i in idxs],
+                [ema_list[i] for i in idxs],
+                [step_list[i] for i in idxs],
+                alpha_t, group["lamb"], b1, group["betas"][1],
+                group["lr"], group["weight_decay"], group["eps"],
+                group["grad_clip"],
+            )
+
     def _single_param_step(self, param, group, state):
-        """Per-parameter step used by the `use_grad_hooks=True` path."""
+        """Per-parameter step used by the `use_grad_hooks=True` path.
+
+        Uses this param's LAYER-WISE β1 and the live α_t (updated by step() from
+        the grokking signal). Routed through the SAME ABI-probed dispatcher as
+        the batched path so it is correct both pre- and post-rebuild."""
         if param.grad is None:
             return
         grad = _validate_grad(param)
@@ -247,14 +473,13 @@ class GrokAdamW(Optimizer):
             state["exp_avg_sq"] = torch.zeros_like(param, dtype=torch.float32)
             state["ema"] = grad.detach().to(torch.float32).clone()
         state["step"] += 1
-        _ops.grokadamw_fused_step(
-            [param], [grad], [state["exp_avg"]], [state["exp_avg_sq"]],
-            [state["ema"]], [state["step"]],
-            group["alpha"], group["lamb"],
-            group["betas"][0], group["betas"][1], group["lr"],
-            group["weight_decay"], group["eps"],
-            group["grad_clip"],
-        )
+        fused_step = self._fused_step
+        if fused_step is None:
+            fused_step = self._fused_step = _ops.bind("grokadamw_fused_step")
+        self._dispatch_grokadamw(
+            fused_step, [param], [grad], [state["exp_avg"]],
+            [state["exp_avg_sq"]], [state["ema"]], [state["step"]],
+            self._alpha_for_group(group), [self._layer_beta1(param)], group)
 
 
 # ── Shared (inlined) helper: register post_accumulate_grad_hook on each param.

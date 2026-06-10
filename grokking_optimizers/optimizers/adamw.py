@@ -42,6 +42,11 @@ def _validate_grad(p):
     if g.is_sparse:
         raise RuntimeError(
             "fused optimizer kernel does not support sparse gradients")
+    if not g.is_cuda:
+        raise RuntimeError(
+            "fused optimizer kernel requires CUDA tensors; got a CPU gradient. "
+            "These are GPU-only kernels with no CPU fallback — move the model "
+            "and gradients to a CUDA device before step().")
     if g.dtype != p.dtype:
         raise RuntimeError(
             f"grad dtype {g.dtype} != param dtype {p.dtype}; cast gradients "

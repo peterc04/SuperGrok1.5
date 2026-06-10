@@ -257,6 +257,33 @@ cudaError_t mega_mamba_real_adamw(
     const int* tokens, const int* targets, int B,
     float* state, float* grad, float* workspace, float* loss_out,
     float lr, int step, const FusedScalars& scalars, cudaStream_t stream);
+
+// R2.4 — extern decls of the WIRED tensor-core (bf16 wgmma) launchers. Their
+// definitions live in csrc/fused/sm_90/mega_{decoder,vit}_real_adamw_tc_launcher.cu
+// (compiled -DSG_TUNED_GEMM_IMPL=1, globbed into _ops; NO own pybind module — they
+// call ONLY launch_*_megakernel_tc, never the scalar launcher template, so they
+// co-reside with the scalar TUs without an ODR/duplicate-symbol clash — proven by
+// the two-TU link probe at landing). The boundary mirrors the scalar launchers
+// EXCEPT: (a) a trailing `int ncta_cap` (0 = one CTA/SM = full saturation; the race
+// passes 0), and (b) the `workspace` pointer is UNUSED — the TC activations/grad
+// scratch is a different size (model_*_tc dims), so each launcher TU owns its own
+// cached device scratch internally; dispatch passes nullptr for it. `loss_out`
+// still points at state[3*total] (read back by the Python wrapper). Mamba has NO
+// TC launcher here ON PURPOSE: it is the measured-scalar-wins carve-out (905a4bb,
+// 0.46×) — its L3-REAL path stays the scalar megakernel, logged honestly as such.
+cudaError_t mega_decoder_real_adamw_tc(
+    ::sg::fused::PersistentContext ctx, float* params,
+    const int* tokens, const int* targets, int B,
+    float* state, float* grad, float* workspace, float* loss_out,
+    const int* sizes, const int* offsets,
+    float lr, int step, const FusedScalars& scalars, cudaStream_t stream,
+    int ncta_cap);
+cudaError_t mega_vit_real_adamw_tc(
+    ::sg::fused::PersistentContext ctx, float* params,
+    const float* patches, const int* targets, int B,
+    float* state, float* grad, float* workspace, float* loss_out,
+    float lr, int step, const FusedScalars& scalars, cudaStream_t stream,
+    int ncta_cap);
 }}  // namespace fused::sm90
 #endif
 
@@ -545,8 +572,27 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // opt_only=false → L3: the kernel also runs the SURROGATE element-local
  // model fwd/bwd (model_stages.*), whose loss does NOT match the real
  // Transformer/ViT/Mamba graph (see BUILD_AND_VALIDATE.md).
- bool opt_only) {
+ bool opt_only,
+ // GEMM-engine selector for the L3-REAL path (owner directive task 1, the
+ // GEMM_IMPL=wgmma wiring). "scalar" (default) → the shipped fp32
+ // owner-computes megakernel (mega_*_real_adamw.cu). "wgmma" → the bf16
+ // tensor-core cell (mega_*_real_adamw_tc_launcher.cu, HGMMA in SASS). The
+ // Python caller (dispatch.fused_train_step) picks it per (model, precision):
+ // decoder/vit at bf16 → "wgmma"; mamba (and every fp32 race) → "scalar".
+ // IGNORED on the L1 tail (opt_only=true) and by the surrogate cells — only the
+ // three L3-REAL blocks below read it. A defaulted arg keeps the pybind ABI
+ // back-compatible: an un-rebuilt _ops still accepts the old call shape, and a
+ // stale _ops that predates this arg trips the caller's one-shot TypeError latch
+ // (→ loud degrade to eager, never silent).
+ const std::string& gemm_impl) {
  int arch = detect_arch();
+ // Resolve the GEMM engine ONCE. Unknown tokens FAIL LOUD (no silent scalar
+ // fallback — the owner no-suppression rule): a typo'd "wgma" must not quietly
+ // run scalar under a TC-requested run and corrupt the roofline fractions.
+ const bool want_wgmma = (gemm_impl == "wgmma");
+ TORCH_CHECK(gemm_impl == "scalar" || gemm_impl == "wgmma",
+ "fused_step: unknown gemm_impl '", gemm_impl,
+ "' (expected 'scalar' or 'wgmma').");
  std::string arch_str = (arch == 90) ? "sm_90"
  : (arch == 942) ? "gfx942" : "tpu_v6e";
  // `gamma` is carried for ABI completeness / forward-compat (the directive's
@@ -637,11 +683,27 @@ void fused_step(const std::string& model, const std::string& optimizer,
  alpha_max, gate, d_factor, neg_lr_scale, decay_factor};
 
  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
- // Call the extern nvcc launcher (defined in mega_decoder_real_adamw.cu). All
- // <<<>>> / __global__ / device-intrinsic code lives there; this host TU only
- // passes plain pointers + the FusedScalars POD. sizes/offsets are nullptr (the
- // kernel uses its __constant__ layout tables).
- cudaError_t err = fused::sm90::mega_decoder_real_adamw(
+ // GEMM-engine branch (owner directive task 1). want_wgmma → the bf16 tensor-core
+ // launcher (mega_decoder_real_adamw_tc_launcher.cu: HGMMA in SASS, its own
+ // TC-sized workspace, so we pass nullptr for the scalar `workspace`); else the
+ // shipped fp32 scalar launcher (mega_decoder_real_adamw.cu, scalar dsc.workspace).
+ // Both run the REAL decoder fwd+bwd+AdamW as ONE persistent kernel. NO silent
+ // fallback: a wgmma request runs wgmma or the launcher returns a cuda error that
+ // throws below (the no-suppression rule — a TC-requested run never secretly runs
+ // scalar). All <<<>>>/__global__/device code lives in the launcher TUs; this host
+ // TU passes only plain pointers + the FusedScalars POD.
+ cudaError_t err;
+ if (want_wgmma) {
+ err = fused::sm90::mega_decoder_real_adamw_tc(
+ ctx, params.data_ptr<float>(),
+ input.data_ptr<int>(),                              // tokens
+ input.data_ptr<int>() + (int64_t)B * kDecoderSeq,   // targets
+ B, m, grad.data_ptr<float>(),    // reduced-grad OUTPUT (exposed to caller)
+ /*workspace=*/nullptr, loss_slot,  // TC launcher owns its own TC-sized scratch
+ /*sizes=*/nullptr, /*offsets=*/nullptr,
+ lr, static_cast<int>(step), scalars, stream, /*ncta_cap=*/0);
+ } else {
+ err = fused::sm90::mega_decoder_real_adamw(
  ctx, params.data_ptr<float>(),
  input.data_ptr<int>(),                              // tokens
  input.data_ptr<int>() + (int64_t)B * kDecoderSeq,   // targets
@@ -649,9 +711,11 @@ void fused_step(const std::string& model, const std::string& optimizer,
  dsc.workspace.data_ptr<float>(), loss_slot,
  /*sizes=*/nullptr, /*offsets=*/nullptr,
  lr, static_cast<int>(step), scalars, stream);
+ }
  if (err != cudaSuccess)
  throw std::runtime_error(
- std::string("fused decoder megakernel launch failed: ") +
+ std::string(want_wgmma ? "fused decoder TC (wgmma) megakernel launch failed: "
+ : "fused decoder megakernel launch failed: ") +
  cudaGetErrorString(err));
  return;
  }
@@ -718,17 +782,34 @@ void fused_step(const std::string& model, const std::string& optimizer,
  alpha_max, gate, d_factor, neg_lr_scale, decay_factor};
 
  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
- cudaError_t err = fused::sm90::mega_vit_real_adamw(
+ // GEMM-engine branch (task 1). want_wgmma → bf16 tensor-core launcher
+ // (mega_vit_real_adamw_tc_launcher.cu, its own TC-sized scratch → nullptr
+ // workspace); else the fp32 scalar launcher. ViT input is FLOAT patches with the
+ // int targets bit-reinterpreted out of the trailing float slots (same pointer
+ // arithmetic both ways). NO silent fallback (no-suppression rule).
+ const float* vit_patches = input.data_ptr<float>();
+ const int* vit_targets = reinterpret_cast<const int*>(
+ input.data_ptr<float>() + (int64_t)B * kVitPatchElems);
+ cudaError_t err;
+ if (want_wgmma) {
+ err = fused::sm90::mega_vit_real_adamw_tc(
  ctx, params.data_ptr<float>(),
- input.data_ptr<float>(),                                  // patches
- reinterpret_cast<const int*>(input.data_ptr<float>()
- + (int64_t)B * kVitPatchElems),                          // targets (bit-cast)
+ vit_patches, vit_targets,
+ B, m, grad.data_ptr<float>(),
+ /*workspace=*/nullptr, loss_slot,  // TC launcher owns its own TC-sized scratch
+ lr, static_cast<int>(step), scalars, stream, /*ncta_cap=*/0);
+ } else {
+ err = fused::sm90::mega_vit_real_adamw(
+ ctx, params.data_ptr<float>(),
+ vit_patches, vit_targets,
  B, m, grad.data_ptr<float>(),    // reduced-grad OUTPUT (exposed to caller)
  vsc.workspace.data_ptr<float>(), loss_slot,
  lr, static_cast<int>(step), scalars, stream);
+ }
  if (err != cudaSuccess)
  throw std::runtime_error(
- std::string("fused ViT megakernel launch failed: ") +
+ std::string(want_wgmma ? "fused ViT TC (wgmma) megakernel launch failed: "
+ : "fused ViT megakernel launch failed: ") +
  cudaGetErrorString(err));
  return;
  }
@@ -745,6 +826,15 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // workspace is device scratch (never crosses the ABI). Placed BEFORE the
  // surrogate route so the real path wins.
  if (arch == 90 && model == "mamba3" && optimizer == "adamw" && !opt_only) {
+ // Mamba is the measured-scalar-wins carve-out (905a4bb: TC 0.46×). There is NO
+ // mamba TC launcher linked into _ops, so a wgmma request CANNOT be honored —
+ // FAIL LOUD rather than silently running scalar under a wgmma label (the
+ // no-suppression rule; the Python wrapper never requests wgmma for mamba, so
+ // this only fires if a caller forces it, and must not be a silent degrade).
+ TORCH_CHECK(!want_wgmma,
+ "fused_step: gemm_impl='wgmma' requested for mamba3, but mamba keeps the "
+ "scalar L3 megakernel (measured scalar-wins, 905a4bb 0.46×) — no mamba TC "
+ "launcher is wired into _ops. Use gemm_impl='scalar' for mamba.");
  const int64_t total = kMambaTotalElems;
  TORCH_CHECK(params.numel() == total,
  "fused Mamba megakernel: params has ", params.numel(),

@@ -306,17 +306,7 @@ class SuperGrok15(Optimizer):
         base_alpha = self._cached_alpha
         ramp = self._get_ramp_factor()
         layer_alphas = [max(0.0, min(1.0, base_alpha * f)) for f in self._flat_layer_alphas]
-
-        group = self.param_groups[0]
-        lr = group["lr"]
-        beta2 = group["betas"][1]
-        eps = group["eps"]
-        wd_eff = self._get_effective_wd(group["weight_decay"])
         gate_signal = self._get_gate_signal()
-
-        grads = []
-        for p in self._flat_params:
-            grads.append(p.grad.data if p.grad is not None else torch.Tensor())
 
         # Own the step counter in Python. The fused binding receives `steps` BY
         # VALUE (pybind copies the list[int]), so its internal `steps[i] += 1`
@@ -334,21 +324,37 @@ class SuperGrok15(Optimizer):
 
         # CPU build dispatches to _ops_cpu (testing only — no Python reference path).
         ops_impl = _ops if self._flat_params[0].is_cuda else _ops_cpu
-        ops_impl.supergrok15_fused_step(
-            self._flat_param_data,
-            grads,
-            self._flat_exp_avgs,
-            self._flat_exp_avg_sqs,
-            self._flat_mus,
-            self._flat_sharpness,
-            self._flat_steps,
-            layer_alphas,
-            self._flat_layer_beta1s,
-            W1, b1, W2, b2, rescale, self.meta_hidden_dim,
-            beta2, lr, wd_eff, eps,
-            self.lamb, ramp, gate_signal,
-            self.gradient_clipping,
-        )
+        # ONE fused call PER PARAM GROUP so per-group lr/betas/eps/wd are
+        # honored (torch.optim contract; same fix as SuperGrok11.step). The
+        # original single call fed every group's params with group 0's scalars.
+        # Single-group models take one call exactly as before. Global layer
+        # indices (layerwise beta1/alpha schedules) were assigned at __init__
+        # across groups and are preserved by the contiguous slices.
+        flat_idx = 0
+        for group in self.param_groups:
+            n_g = len(group["params"])
+            if n_g == 0:
+                continue
+            sl = slice(flat_idx, flat_idx + n_g)
+            flat_idx += n_g
+            grads_g = [p.grad.data if p.grad is not None else torch.Tensor()
+                       for p in self._flat_params[sl]]
+            ops_impl.supergrok15_fused_step(
+                self._flat_param_data[sl],
+                grads_g,
+                self._flat_exp_avgs[sl],
+                self._flat_exp_avg_sqs[sl],
+                self._flat_mus[sl],
+                self._flat_sharpness[sl],
+                self._flat_steps[sl],
+                layer_alphas[sl],
+                self._flat_layer_beta1s[sl],
+                W1, b1, W2, b2, rescale, self.meta_hidden_dim,
+                group["betas"][1], group["lr"],
+                self._get_effective_wd(group["weight_decay"]), group["eps"],
+                self.lamb, ramp, gate_signal,
+                self.gradient_clipping,
+            )
 
         return loss
 

@@ -122,7 +122,13 @@ __device__ void fused_optimizer_stage(const PersistentContext& ctx,
 // the tensor in bwd; a workgroup-local LDS acts tile cannot cross that barrier
 // safely. Math is still CALLED via apply_optimizer (drift-guard safe); only the
 // grad source pointer changes to LDS. Grad value is bit-identical. 🟡 perf.
-static constexpr int kGradTile = 1024;   // floats per LDS grad tile (4 KB)
+// SG_TUNED_GRAD_TILE — floats per LDS grad tile (AMD twin; sizes __shared__
+// smem_grad[]). Default 1024 → byte-identical untuned build. NEEDS-PARITY for a
+// non-default winner (LDS footprint + chunk bounds). Not registered on gfx942.
+#ifndef SG_TUNED_GRAD_TILE
+#define SG_TUNED_GRAD_TILE 1024
+#endif
+static constexpr int kGradTile = SG_TUNED_GRAD_TILE;   // floats / LDS grad tile
 
 template <ModelId M, OptId Opt>
 __device__ void fused_backward_optimizer_stage(
@@ -171,7 +177,7 @@ __device__ void fused_backward_optimizer_stage(
 // barrier whose last arriver resets the task-queue counter race-free.
 template <ModelId M, OptId Opt, FuseTier Tier>
 __global__ void
-SG_MK_FWGS(256, 256)
+SG_MK_FWGS(SG_TUNED_MEGA_BLOCK, SG_TUNED_MEGA_BLOCK)
 fused_megakernel(PersistentContext ctx,
                  float* __restrict__ params,
                  const float* __restrict__ input,
@@ -243,7 +249,7 @@ hipError_t launch_fused_megakernel(
         &occ_blocks_per_cu,
         reinterpret_cast<const void*>(
             &fused_megakernel<M, Opt, Tier>),
-        /*blockSize=*/256, /*dynamicSMemBytes=*/0);
+        /*blockSize=*/SG_TUNED_MEGA_BLOCK, /*dynamicSMemBytes=*/0);
     if (err != hipSuccess) return err;
     assert(occ_blocks_per_cu >= 1 &&
            "fused_megakernel: 0 workgroups/CU occupancy — GridBarrier would "
@@ -269,7 +275,7 @@ hipError_t launch_fused_megakernel(
     }
 
     st.lr = lr;
-    dim3 grid(launch_groups), block(256);
+    dim3 grid(launch_groups), block(SG_TUNED_MEGA_BLOCK);
     hipLaunchKernelGGL((fused_megakernel<M, Opt, Tier>), grid, block, 0, stream,
                        ctx, params, input, acts, grad, sizes, offsets,
                        lr, step, st);

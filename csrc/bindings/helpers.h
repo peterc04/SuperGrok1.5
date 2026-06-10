@@ -25,9 +25,30 @@ inline bool is_hip_arch(int a)  { return a == 942; }
 
 // ── Fused (model, optimizer, arch) megakernel dispatch (impl in
 //    dispatch.cpp). Declared here so bindings.cpp can bind &sg::fused_step.
+//
+// The trailing scalar args carry the FULL optimizer-state scalar set so the
+// fused tail's apply_optimizer<> runs its real math (C2-gap fix). Defaults
+// reproduce the pre-fix inert behavior (bc1/bc2/gate/d_factor == 1.0), so a
+// caller that passes only the first 7 args is unchanged. bc1/bc2 are un-inverted
+// (= 1 - beta^step). `opt_only` selects L1 (faithful real-grad optimizer tail,
+// the default + the race path) vs L3 (surrogate-model fwd+bwd+opt). Keep this
+// declaration's defaults in sync with the definition in dispatch.cpp.
 void fused_step(const std::string& model, const std::string& optimizer,
                 torch::Tensor params, torch::Tensor input,
-                torch::Tensor grad, torch::Tensor state, float lr);
+                torch::Tensor grad, torch::Tensor state, float lr,
+                float beta1 = 0.9f, float beta2 = 0.999f, float eps = 1e-8f,
+                float weight_decay = 0.01f, float alpha = 0.98f,
+                float lamb = 2.0f, float gamma = 0.0f, float gate = 1.0f,
+                float d_factor = 1.0f, float bc1 = 1.0f, float bc2 = 1.0f,
+                float neg_lr_scale = 0.0f, float decay_factor = 1.0f,
+                float beta = 0.0f, float alpha_max = 1.0f,
+                int64_t step = 1, bool opt_only = true,
+                // GEMM-engine selector for the L3-REAL path (task 1): "scalar"
+                // (default; the shipped fp32 megakernel) or "wgmma" (the bf16
+                // tensor-core launcher). Default keeps old call shapes valid. Keep
+                // in sync with the definition in dispatch.cpp (which, per the C++
+                // rule, omits the default — it lives only on this declaration).
+                const std::string& gemm_impl = "scalar");
 
 // ── Per-arch namespace handles ───────────────────────────────────────
 namespace sm90 {}
@@ -142,6 +163,44 @@ inline void check_params_grads(
                 ") != grads.size() (", grads.size(), ")");
     for (size_t i = 0; i < params.size(); ++i)
         check_param_grad(params[i], grads[i], where);
+}
+
+// ── Secondary-list length guard for multi-tensor entrypoints ─────────
+// check_params_grads validates the PRIMARY (params, grads) pairing. A
+// multi-tensor fused step also receives several SECONDARY parallel lists
+// (exp_avgs, exp_avg_sqs, emas, mus, slows, gru_states, sharpness caches, per-
+// param step counters, per-layer scalar vectors, …). The launchers index those
+// lists by the same i used for params[i], so a short/long secondary list either
+// reads out of bounds or silently pairs the wrong buffer with a param — the same
+// class of silent corruption check_param_grad guards against, but on the state
+// side. Validate each secondary list's length == the expected element count.
+//
+// `what` names the offending list, `fn` the entrypoint, both in the message.
+// A templated overload covers the scalar vectors (std::vector<float/int64_t/
+// double>) so the SuperGrok per-layer alpha/beta1/step vectors are guarded too.
+inline void check_list_len(
+    const std::vector<torch::Tensor>& v,
+    size_t expect,
+    const char* what,
+    const char* fn
+) {
+    TORCH_CHECK(v.size() == expect, fn, ": ", what, " list length (", v.size(),
+                ") != expected (", expect, ") — every secondary list must be "
+                "the same length as params/grads; the launcher indexes them in "
+                "lockstep.");
+}
+
+template <typename Scalar>
+inline void check_list_len(
+    const std::vector<Scalar>& v,
+    size_t expect,
+    const char* what,
+    const char* fn
+) {
+    TORCH_CHECK(v.size() == expect, fn, ": ", what, " list length (", v.size(),
+                ") != expected (", expect, ") — every secondary list must be "
+                "the same length as params/grads; the launcher indexes them in "
+                "lockstep.");
 }
 
 // ── Device-side gradient clipping: single CPU sync instead of N ──────

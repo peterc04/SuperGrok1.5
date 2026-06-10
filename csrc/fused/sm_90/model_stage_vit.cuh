@@ -393,7 +393,14 @@ __device__ __forceinline__ void vit_attention(VitSampleSmem* sm) {
 //  the same value). Recompute-friendly: the layer-local scratch reflects the LAST
 //  layer processed; backward recomputes per layer from layer_in.
 // ────────────────────────────────────────────────────────────────────────────
-__device__ float vit_forward_sample(const VitWeights& w, int target,
+// `inline` (vague linkage) REQUIRED — same reason as the decoder dec_* helpers:
+// this header is now pulled by TWO co-resident _ops TUs (the scalar launcher
+// mega_vit_real_adamw.cu AND the wired TC launcher mega_vit_real_adamw_tc_launcher.cu,
+// -DSG_TUNED_GEMM_IMPL=1). These 5 non-template __device__ free fns would otherwise
+// emit two strong definitions → "multiple definition" at host link (the template
+// megakernels + __constant__ tables already merge/are-internal). inline lets the
+// linker merge them; NOT __forceinline__ (large fns; forcing expansion is bloat).
+__device__ inline float vit_forward_sample(const VitWeights& w, int target,
                                      VitSampleSmem* sm) {
     // Embedding: position 0 = cls + pos[0]; positions 1..16 = patch_proj(patch_i)
     //   + pos[1+i].  Build h0 into layer_in[0].
@@ -497,7 +504,7 @@ __device__ float vit_forward_sample(const VitWeights& w, int target,
 // ── Recompute one layer's forward intermediates into sm (qkv, x1, ff0, gact,
 //    attn, and ctx := r2), reading from sm->layer_in[li]. Mirrors the fwd layer
 //    body but leaves r2 in sm->ctx and x1 in sm->x1 for the backward chain. ─────
-__device__ void vit_recompute_layer(const VitWeights& w, int li,
+__device__ inline void vit_recompute_layer(const VitWeights& w, int li,
                                      VitSampleSmem* sm) {
     const VitWeights::Layer& L = w.layer[li];
     float* hin = &sm->layer_in[li][0][0];
@@ -537,7 +544,7 @@ __device__ void vit_recompute_layer(const VitWeights& w, int li,
 // LayerNorm backward (same as decoder): given dy [kSeq,d] and cached (xhat,inv),
 // returns dx [kSeq,d] into dx_out and ACCUMULATES dgamma/dbeta into gw/gb [d].
 // Owner-thread rule for gw/gb: thread owns feature j (strided), sums over rows.
-__device__ void vit_layernorm_bwd(
+__device__ inline void vit_layernorm_bwd(
         const float* __restrict__ dy, const float* __restrict__ xhat,
         const float* __restrict__ inv, const float* __restrict__ gamma,
         float* __restrict__ dx_out, float* __restrict__ gw, float* __restrict__ gb,
@@ -590,7 +597,7 @@ __device__ void vit_layernorm_bwd(
 // does NOT catch it (it indexes buffers semantically, not by flat offset), so the
 // stride is now part of the call contract. W/dW stay at in_dim — those are the
 // genuinely-packed param/grad tensors, not smem scratch.
-__device__ void vit_linear_bwd(
+__device__ inline void vit_linear_bwd(
         const float* __restrict__ dY, const float* __restrict__ X,
         const float* __restrict__ W, int in_dim, int out_dim,
         float* __restrict__ dW, float* __restrict__ db,
@@ -633,7 +640,7 @@ __device__ void vit_linear_bwd(
 //  Transcribed from tests/hw/vit_oracle.py::vit_backward (structurally mirrored
 //  in tests/hw/vit_kernel_mirror.py).
 // ────────────────────────────────────────────────────────────────────────────
-__device__ void vit_backward_sample(const VitWeights& w, const VitGrad& g,
+__device__ inline void vit_backward_sample(const VitWeights& w, const VitGrad& g,
                                      int target, int B, VitSampleSmem* sm) {
     // ── CE backward: dlogits = (softmax - onehot)/B. ──
     float lmax = -CUDART_INF_F;

@@ -366,6 +366,29 @@ __device__ __forceinline__ float sg2_hca_compress_kv(
 //  Combines temporal memory, smart_grad, and Adam update.
 //  PEER routing handles its own selection on the host side; this is
 //  the per-element body that consumes the routed expert output.
+//
+//  TWO per-element EMAs feed smart_grad (matches the Python reference
+//  grokking_optimizers/optimizers/supergrok2.py::_single_param_step):
+//
+//    mu_new   = gru_decay*mu_state + (1-gru_decay)*expert_out
+//                 — expert-output EMA (spec §3b GRU tail); `mu_state` is the
+//                   per-element expert-EMA buffer, NOT the matrix-GRU hidden
+//                   state (which is reconstructed host-side for PEER routing).
+//    slow_new = alpha*slow_state + (1-alpha)*g
+//                 — slow-gradient EMA at decay `alpha`; the grokfast term
+//                   `lamb_eff*slow_new` is the low-frequency amplification.
+//
+//    smart_grad = g + alpha*mu_new + lamb_eff*slow_new
+//
+//  NOTE: the `lamb_eff*slow_new` grokfast term was SILENTLY DROPPED in a prior
+//  refactor — `sg2_apply_step` took no `lamb` param and the sm_90 launchers
+//  `(void)`-ed `lamb_eff`/`lamb_effs`, so the host-computed amplification
+//  (lamb·ramp·gate_signal) never reached the update. It is RESTORED here as the
+//  single source of truth; the launchers now thread the real lamb_eff + a
+//  `slow_state` buffer. `alpha` is deliberately BOTH the mu/slow mixing
+//  coefficient and the slow-EMA decay (matches the Python ref's `alpha_i` used
+//  for both `smart_grad = ... + alpha*mu_new` and `slow.mul_(alpha).add_(g,
+//  1-alpha)`).
 // =========================================================================
 
 template <typename ParamT, typename GradT>
@@ -373,11 +396,13 @@ __device__ __forceinline__ void sg2_apply_step(
     ParamT* __restrict__ param,
     float* __restrict__ exp_avg,
     float* __restrict__ exp_avg_sq,
-    float* __restrict__ mu_state,    // GRU hidden state
+    float* __restrict__ mu_state,    // per-element expert-output EMA buffer
+    float* __restrict__ slow_state,  // per-element slow-gradient EMA (grokfast)
     const GradT* __restrict__ grad,
     const float expert_out,          // PEER expert output for this element
     const float alpha,
     const float gru_decay,
+    const float lamb_eff,            // grokfast amplification = lamb·ramp·gate
     const float lr,
     const float beta1,
     const float beta2,
@@ -394,7 +419,11 @@ __device__ __forceinline__ void sg2_apply_step(
     const float mu_new = gru_decay * mu_state[idx] + (1.0f - gru_decay) * expert_out;
     mu_state[idx] = mu_new;
 
-    const float smart_grad = g + alpha * mu_new;
+    // Slow-gradient EMA at decay `alpha` (the restored grokfast accumulator).
+    const float slow_new = alpha * slow_state[idx] + (1.0f - alpha) * g;
+    slow_state[idx] = slow_new;
+
+    const float smart_grad = g + alpha * mu_new + lamb_eff * slow_new;
 
     const float m = beta1 * exp_avg[idx]    + (1.0f - beta1) * smart_grad;
     const float v = beta2 * exp_avg_sq[idx] + (1.0f - beta2) * smart_grad * smart_grad;
@@ -516,3 +545,34 @@ __device__ __forceinline__ void moe_adam_step(
 }
 
 }} // namespace sg::algorithms
+
+// ═════════════════════════════════════════════════════════════════════════
+//  TODO (fused SG2 path — owned by the fused/megakernel agent, NOT edited here)
+//
+//  The fused path csrc/fused/** shares the SAME grokfast drop fixed above, but
+//  in a DIFFERENT place than the per-op path. The fused SG2 tail
+//  (csrc/fused/sm_90/opt_components.cuh, apply_optimizer<SuperGrok2>) does NOT
+//  call sg2_apply_step — it runs `adamw_step` directly on a PRECOMPUTED
+//  `st.smart_grad` that a SEPARATE meta-net launch produced. So the fused tail
+//  cannot add `lamb_eff*slow_new` itself (it never sees expert_out / mu / slow
+//  / lamb separately — only the finished smart_grad).
+//
+//  To converge the fused path with this single-source change, the producer of
+//  the fused `st.smart_grad` (the separate CSA/HCA+PEER meta-net launch that
+//  fills FusedOptState.smart_grad) must fold in the restored grokfast term so
+//  that, per element:
+//
+//      smart_grad = g + alpha*mu_new + lamb_eff*slow_new
+//                   (mu_new   = gru_decay*mu_state + (1-gru_decay)*expert_out,
+//                    slow_new = alpha*slow_state   + (1-alpha)*g)
+//
+//  Concretely the fused side needs to (a) carry a per-element `slow_state`
+//  buffer alongside the expert-EMA `mu_state` (same dtype/layout; zero-init),
+//  (b) consume the `lamb_eff` scalar (host already computes lamb·ramp·gate),
+//  and (c) add `lamb_eff*slow_new` (updating slow_state) when it writes
+//  st.smart_grad — i.e. match the math now centralized in sg2_apply_step here.
+//  Alternatively, route the fused tail through sg2_apply_step (signature now
+//  sg2_apply_step(param, exp_avg, exp_avg_sq, mu_state, slow_state, grad,
+//  expert_out, alpha, gru_decay, lamb_eff, lr, beta1, beta2, eps, wd, bc1, bc2,
+//  idx)) instead of adamw_step, passing the raw expert_out + the two EMAs.
+// ═════════════════════════════════════════════════════════════════════════

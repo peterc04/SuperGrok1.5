@@ -577,12 +577,23 @@ class TrainResult:
                  "grokking_step_test_confirmed","best_metric_acc",
                  # [A4-M4] per-run resolved matmul precision + AMP flag (each
                  # optimizer can carry a different tuned precision)
-                 "matmul_precision","use_amp")
+                 "matmul_precision","use_amp",
+                 # WIRING GUARD (task 2): which execution path the train loop
+                 # ACTUALLY took this run — "L3-TC bf16" / "L3-scalar fp32" /
+                 # "L1+eager". Set once (first step) by the train_* loop; carried
+                 # into the run JSON so a silently-degraded run is visible.
+                 "train_path",
+                 # Whether fusion was REQUESTED this run (c["use_fused"]). The FLOP
+                 # pass disables it deliberately; the guard must not flag that as a
+                 # degrade — so _record_train_path reads this fact off the result.
+                 "use_fused_requested")
     def __init__(self, name, seed=42, model_type="decoder", frac_train=0.5, val_ratio=0.10,
                  matmul_precision="auto", use_amp=False):
         self.name=name; self.seed=seed; self.model_type=model_type
         self.frac_train=frac_train; self.val_ratio=val_ratio
         self.matmul_precision=matmul_precision; self.use_amp=use_amp
+        self.train_path=None  # set once per run by the train_* loop (task 2)
+        self.use_fused_requested=True  # overwritten by _tr from c["use_fused"]
         self.steps=[]; self.train_losses=[]; self.train_accs=[]
         self.val_losses=[]; self.val_accs=[]
         self.test_losses=[]; self.test_accs=[]
@@ -712,8 +723,69 @@ def _eval_log(r, step, m, tx, ty, vax, vay, tex, tey, c, st, pb):
         cb(step, ta, va, tea)
     stop_acc = va if c.get("early_stop_on", "test") == "val" else tea
     return st.step(stop_acc, step), tl, tel
+
+# Map a TrainResult.name (the display name passed to _tr, e.g. "AdamW") to the
+# optimizer KEY gemm_impl_for_cell expects ("adamw"). Only adamw cells have an
+# L3-REAL path, so the wiring-guard degrade check only needs the adamw entry; the
+# rest map to their keys for completeness (they always run eager, never L3).
+OPT_KEY_BY_NAME = {
+    "AdamW": "adamw", "NeuralGrok": "neuralgrok", "GrokAdamW": "grokadamw",
+    "SuperGrok": "supergrok11", "SuperGrok1.5": "supergrok15",
+    "SuperGrok2": "supergrok2", "Grokfast": "grokfast", "Muon": "muon",
+    "Lion": "lion", "LookSAM": "looksam", "Prodigy": "prodigy",
+}
+
+def _record_train_path(r):
+    """Compose r.train_path from the per-run path signals (task 2 WIRING GUARD).
+
+    Reads the module globals LAST_L3_ENGINE (set by _try_fused_train_step on a
+    successful L3 step → carries the ACTUAL engine) and LAST_L1_FIRED (set by
+    _try_fused_step). Composes the human label the directive lists: "L3-TC bf16" /
+    "L3-scalar fp32" / "L1+eager" / "eager".
+
+    LOUD-DEGRADE: for an L3-REAL-CAPABLE cell+precision (decoder/vit×adamw at bf16,
+    any ×adamw at fp32) that EXPECTED L3 but did not fire it, mark the path DEGRADED
+    and emit a one-time stderr banner — UNLESS the stale-ABI latch tripped (a
+    legitimate rebuild-pending soft-degrade, labelled as such, not a failure). The
+    sweep CONTINUES (a hard raise would forfeit the roofline deliverable); the smoke
+    gate asserts engine separately where "TC must fire" is load-bearing.
+    """
+    if LAST_L3_ENGINE is not None:
+        r.train_path = LAST_L3_ENGINE["path"]
+        return
+    base = "L1+eager" if LAST_L1_FIRED else "eager"
+    # Whether THIS cell could even take an L3-REAL path (the 3 adamw cells on sm_90).
+    # has_l3_real is the decisive gate — without it, gemm_impl_for_cell's "scalar"
+    # default would flag every non-adamw cell (muon/prodigy/…), which CORRECTLY run
+    # eager. opt_key maps the display name → optimizer key for has_l3_real.
+    opt_key = OPT_KEY_BY_NAME.get(r.name)
+    l3_capable = opt_key is not None and has_l3_real(r.model_type, opt_key)
+    expected_engine = (gemm_impl_for_cell(r.model_type, opt_key, r.matmul_precision)
+                       if l3_capable else None)
+    # DEGRADED fires ONLY for a genuine silent gate regression: an L3-capable cell,
+    # fusion requested, not AMP, a wired precision (expected_engine set), that
+    # declined L3 anyway AND is NOT the legitimate stale-ABI soft-degrade. Anything
+    # else (non-L3 cell, use_fused off — e.g. the FLOP pass, AMP, tf32/fp16) is an
+    # honest eager run, not a degrade.
+    degraded = (l3_capable and r.use_fused_requested and not r.use_amp
+                and expected_engine is not None and not _FUSED_ABI_STALE)
+    if l3_capable and r.use_fused_requested and not r.use_amp \
+            and expected_engine is not None and _FUSED_ABI_STALE:
+        r.train_path = f"{base}(ABI-stale, rebuild pending)"
+    elif degraded:
+        want = _l3_path_label(expected_engine, r.matmul_precision)
+        r.train_path = f"{base}(DEGRADED: expected {want})"
+        msg = (f"[WIRING-GUARD] {r.name}/{r.model_type} @ {r.matmul_precision}: "
+               f"expected {want} but ran {base} — L3-REAL path did NOT fire "
+               f"(not ABI-stale). Roofline/race row is degraded; investigate.")
+        print(msg, file=sys.stderr, flush=True)
+    else:
+        r.train_path = base
+
+
 def _fin(r, st, step, t0, m, tex, tey, p=97):
     if torch.cuda.is_available(): torch.cuda.synchronize()
+    _record_train_path(r)  # task 2: stamp the ACTUAL executed path onto the result
     r.wall_time=time.time()-t0; r.total_steps=step
     r.grokking_step=st.grokking_step; r.grokking_wall=st.grokking_wall
     r.stopping_reason=st.stopping_reason; r.stopping_step=st.stopping_step
@@ -758,9 +830,16 @@ def _tr(name, c):
     # [A4-M4] capture the per-run resolved matmul precision + AMP flag so
     # save_json can record what precision actually ran (config c is not in
     # save_json's scope; the TrainResult carries it).
-    return TrainResult(name, c["seed"], c.get("model_type","decoder"), c.get("frac_train",0.5),
-                       c.get("val_ratio",0.10), matmul_precision=_resolve_matmul_precision(c),
-                       use_amp=bool(c.get("use_amp", False)))
+    # WIRING GUARD (task 2): reset the per-run path signals at run start so _fin
+    # composes train_path from THIS run only (globals resolved at call-time, so the
+    # forward reference to LAST_L3_ENGINE/LAST_L1_FIRED defined below is fine).
+    global LAST_L3_ENGINE, LAST_L1_FIRED
+    LAST_L3_ENGINE = None; LAST_L1_FIRED = False
+    r = TrainResult(name, c["seed"], c.get("model_type","decoder"), c.get("frac_train",0.5),
+                    c.get("val_ratio",0.10), matmul_precision=_resolve_matmul_precision(c),
+                    use_amp=bool(c.get("use_amp", False)))
+    r.use_fused_requested = bool(c.get("use_fused", True))  # task 2: guard input
+    return r
 
 # ── C++/CUDA fused optimizers (grokking_optimizers package) ────────────
 from grokking_optimizers import (
@@ -770,7 +849,32 @@ from grokking_optimizers import (
 from grokking_optimizers.dispatch import (
     detect_arch, has_fused, dispatch_fused, fused_optimizer_step,
     announce_fused_readiness, has_l3_real, fused_train_step,
+    gemm_impl_for_cell, canonicalize_model,
 )
+
+# ── WIRING GUARD (owner directive task 2): the engine that ACTUALLY executed the
+# last L3-REAL fused train step, set by _try_fused_train_step on every successful
+# L3 step. None when the last step took the eager/L1 path. The roofline harness
+# reads this (via the dispatch wrapper) to label the row with the REAL path
+# (L3-TC bf16 / L3-scalar fp32) and pick the matching ceiling — never inferred from
+# the requested precision. Format: dict(engine="wgmma"|"scalar", model=<canon>,
+# precision=<str>, path=<human label>) or None. Module-global is safe: each train_*
+# runs in one process, one model at a time.
+LAST_L3_ENGINE = None
+# Companion flag (task 2): True once the L1 fused optimizer-tail fired this run
+# (whitelisted cell: eager fwd+bwd + fused tail). Lets _fin compose the path label
+# without hand-editing every train_* loop. Reset at run start by _tr; the stale-ABI
+# soft-degrade reason is tracked separately so the guard does not fire spuriously.
+LAST_L1_FIRED = False
+
+
+def _l3_path_label(engine, precision):
+    """Human path label for TrainResult/run-JSON/roofline rows (task 2)."""
+    if engine == "wgmma":
+        return f"L3-TC {precision}"
+    if engine == "scalar":
+        return f"L3-scalar {precision}"
+    return "L1+eager"
 
 def _maybe_wrap_cuda_graph(opt, c):
     """No-op shim. CUDA Graph wrapping was removed in the post-refactor
@@ -825,6 +929,8 @@ def _try_fused_step(model_name, opt_name, model, optimizer, x_batch, y_batch, c)
         optimizer._fused_step_counter = step
         fused_optimizer_step(model_name, opt_name, model, optimizer,
                              state_cache=cache, step=step)
+        global LAST_L1_FIRED
+        LAST_L1_FIRED = True  # task 2: L1 fused tail fired this run (for _fin's path)
         return True
     except TypeError as e:
         # STALE-ABI GUARD: a pybind TypeError here means the compiled _ops
@@ -862,54 +968,71 @@ def _try_fused_train_step(model_name, opt_name, model, optimizer, x_batch,
 
     Returns the training LOSS (a float, mean cross-entropy) if the fused train step
     ran — the caller then SKIPS its own fwd/bwd/step and logs THIS loss — or
-    ``None`` if the L3-REAL kernel is unavailable (caller falls back to eager + the
-    L1 fused optimizer step). Degrades to None (never crashes) on any ABI/build
-    problem, exactly like _try_fused_step.
+    ``None`` if the L3-REAL path is NOT APPLICABLE for this cell/precision (caller
+    falls back to eager + the L1 fused optimizer step). A None return is the honest
+    eager path, NOT a degrade.
+
+    WIRING GUARD (task 2): once the path-matched gate has SELECTED an engine for an
+    L3-REAL cell, a launch failure RAISES (loud) rather than returning None — a
+    silent degrade to eager here would let a roofline/race run secretly measure the
+    wrong path. The ONLY soft-degrade is a stale-ABI TypeError (compiled _ops
+    predates the widened fused_step signature → rebuild pending), which warns once
+    and falls back process-wide. On every success this sets the module-global
+    LAST_L3_ENGINE to the engine that ACTUALLY ran (dispatch.cpp has no silent
+    fallback: a wgmma request runs wgmma or throws), so the path report is the real
+    executed path, not the requested one.
     """
-    global _FUSED_ABI_STALE
+    global _FUSED_ABI_STALE, LAST_L3_ENGINE
+    LAST_L3_ENGINE = None  # default: this step did NOT take L3 (set on success below)
     if _FUSED_ABI_STALE or not c.get("use_fused", True):
         return None
-    # PRECISION GATE (owner fairness rule): the L3 kernels compute fp32; the race
-    # compares optimizers by steps-to-grok, and precision changes trajectories.
-    # If one cell trained fp32-in-kernel while its competitors ran bf16-eager,
-    # the comparison would confound optimizer with precision. So the L3 path runs
-    # ONLY when the run's RESOLVED precision is fp32 (vit/mamba auto = fp32 →
-    # fused runs; bf16 default decoder race → eager bf16 like everyone else).
-    # The bf16+TC retrofit (decision A) flips this gate to "bf16" when the
-    # kernels themselves compute bf16. Validation/smokes pin fp32 explicitly to
-    # keep exercising L3. Legacy use_amp (fp16 GradScaler) also declines.
-    if c.get("use_amp", False) or _resolve_matmul_precision(c) != "fp32":
+    # AVAILABILITY (legit-eager, not a degrade): not an L3-REAL cell on this arch.
+    if not has_l3_real(model_name, opt_name):
         return None
+    # PATH-MATCHED PRECISION GATE (owner directive task 1 — replaces the fp32-only
+    # gate). The engine map picks the ACTUAL in-kernel GEMM engine for the run's
+    # resolved precision: fp32 → scalar (all cells); bf16 → wgmma (decoder/vit TC
+    # cells) / scalar (mamba carve-out). Fairness is preserved because the engine
+    # MATCHES the run precision — a bf16 race runs the bf16 TC kernel (not fp32
+    # in-kernel while competitors run bf16-eager, the old confound). fp16-AMP and
+    # tf32 have no in-kernel carrier here → engine None → decline to eager (honest).
+    if c.get("use_amp", False):
+        return None
+    precision = _resolve_matmul_precision(c)
+    gemm_impl = gemm_impl_for_cell(model_name, opt_name, precision)
+    if gemm_impl is None:
+        return None  # unwired precision (fp16/tf32) — eager is the honest path
+    # COMMITTED to the L3 path with a selected engine. From here a failure is LOUD.
+    announce_fused_readiness()  # one-time loud run-start banner (idempotent)
+    # Persistent flat-param + [m|v|extra]+loss state on the optimizer instance
+    # (keyed by canonical model name), surviving across iterations — the megakernel
+    # owns optimizer.step(), so the torch optimizer's .state never fills;
+    # reallocating per step would reset momentum and never grok.
+    cache = getattr(optimizer, "_fused_train_cache", None)
+    if cache is None:
+        cache = {}
+        optimizer._fused_train_cache = cache
+    step = getattr(optimizer, "_fused_train_counter", 0) + 1
+    optimizer._fused_train_counter = step
     try:
-        # has_l3_real(): True ONLY for the L3-REAL cell on sm_90 with a compiled
-        # fused TU. Keep inside the guard so the path degrades rather than crashes.
-        if not has_l3_real(model_name, opt_name):
-            return None
-        announce_fused_readiness()  # one-time loud run-start banner (idempotent)
-        # Persistent flat-param + [m|v|extra]+loss state on the optimizer instance
-        # (keyed by canonical model name), surviving across iterations — the
-        # megakernel owns optimizer.step(), so the torch optimizer's .state never
-        # fills; reallocating per step would reset momentum and never grok.
-        cache = getattr(optimizer, "_fused_train_cache", None)
-        if cache is None:
-            cache = {}
-            optimizer._fused_train_cache = cache
-        step = getattr(optimizer, "_fused_train_counter", 0) + 1
-        optimizer._fused_train_counter = step
-        return fused_train_step(model_name, opt_name, model, optimizer,
-                                x_batch, y_batch, state_cache=cache, step=step)
+        loss = fused_train_step(model_name, opt_name, model, optimizer,
+                                x_batch, y_batch, state_cache=cache, step=step,
+                                gemm_impl=gemm_impl)
     except TypeError as e:
-        # STALE-ABI guard (same as _try_fused_step): a pybind TypeError means the
-        # compiled _ops predates the widened fused_step signature. Degrade LOUDLY
-        # ONCE to eager; never retry.
+        # STALE-ABI guard ONLY (compiled _ops predates the widened/gemm_impl
+        # signature). This is the one legitimate soft-degrade: rebuild pending.
+        # Degrade LOUDLY ONCE to eager process-wide; never retry.
         if not _FUSED_ABI_STALE:
             _FUSED_ABI_STALE = True
             warnings.warn(
                 "fused_step ABI mismatch (stale _ops build predates the widened "
                 f"signature) — eager train steps until rebuild: {e}")
         return None
-    except (KeyError, NotImplementedError, ValueError, RuntimeError):
-        return None
+    # Success → record the ACTUAL executed engine for the wiring guard / roofline.
+    LAST_L3_ENGINE = dict(
+        engine=gemm_impl, model=canonicalize_model(model_name),
+        precision=precision, path=_l3_path_label(gemm_impl, precision))
+    return loss
 
 # ── 1. AdamW ──────────────────────────────────────────────────────────
 def train_adamw(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
@@ -1591,6 +1714,7 @@ def save_json(rbo, save_dir="results", total_wall=None, model_type="decoder", fr
             "component_failures":dict(getattr(r,"component_failures",{}) or {}),  # [A4-H2]
             "matmul_precision":r.matmul_precision,  # [A4-M4]
             "use_amp":bool(r.use_amp),  # [A4-M4]
+            "train_path":getattr(r,"train_path",None),  # task 2: ACTUAL executed path
             "model_type":r.model_type,"frac_train":r.frac_train} for r in runs]
     with open(os.path.join(save_dir,f"results_{model_type}_ft{int(frac_train*100)}.json"),"w") as f:
         json.dump(d,f,indent=2)

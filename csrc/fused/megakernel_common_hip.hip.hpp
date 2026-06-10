@@ -84,6 +84,17 @@ static __attribute__((unused)) sg_mk_detail::_Dim3Stub blockDim{1u, 1u, 1u};
 #  define SG_MK_FWGS(lo, hi) __attribute__((amdgpu_flat_work_group_size(lo, hi)))
 #endif
 
+// SG_TUNED_MEGA_BLOCK — threads per persistent megakernel workgroup, the AMD
+// twin of the token in megakernel_common.cuh. Default 256 (= 4 wavefronts of 64
+// → byte-identical untuned build). NEEDS-PARITY before a non-default winner
+// ships: the §1.13 ping-pong interleave + shared staging assume the 256-thread
+// (4-wavefront) shape. Defined here (the HIP path does NOT see the .cuh guard);
+// not registered on gfx942 (no AMD silicon in CI + sm_90-led roll-out) so the
+// HIP build always takes this default — see report.
+#ifndef SG_TUNED_MEGA_BLOCK
+#define SG_TUNED_MEGA_BLOCK 256
+#endif
+
 namespace sg { namespace fused { namespace gfx942 {
 
 // CDNA3 wavefront width (matches amdgcn_primitives.hip.hpp::kWave).

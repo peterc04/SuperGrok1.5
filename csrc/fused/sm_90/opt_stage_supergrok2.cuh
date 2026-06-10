@@ -158,7 +158,7 @@
 // -----------------------------------
 // Self-contained: includes only the substrate (megakernel_common.cuh) + the
 // algorithm header (csrc/algorithms/supergrok2.h) + CUDA. No globals, no repo
-// build flags (the one tunable, SG2_MEGA_BLOCK, is #ifndef-defaulted). All state
+// build flags (the one tunable, SG_TUNED_MEGA_BLOCK, is #ifndef-defaulted). All state
 // flows through the documented POD structs below + explicit pointers.
 // ============================================================================
 
@@ -1114,12 +1114,16 @@ __device__ void sg2_meta_stages(
 //  ONE grid barrier at the end (so a composing model stage can reset the
 //  queue). The weight bundle is staged into smem ONCE per CTA up front.
 // =====================================================================
-#ifndef SG2_MEGA_BLOCK
-#define SG2_MEGA_BLOCK 256
+// SG_TUNED_MEGA_BLOCK — unified with the fused megakernel's block-thread dim
+// (csrc/fused/sm_90/fused_megakernel.cuh). Default 256 (byte-identical untuned
+// build). NEEDS-PARITY before shipping a non-default winner (per-head PEER
+// routing + scan tiling assume the 256-thread shape).
+#ifndef SG_TUNED_MEGA_BLOCK
+#define SG_TUNED_MEGA_BLOCK 256
 #endif
 
 template <typename Dims, typename ParamT, typename GradT>
-__global__ void __launch_bounds__(SG2_MEGA_BLOCK)
+__global__ void __launch_bounds__(SG_TUNED_MEGA_BLOCK)
 sg2_meta_optimizer_megakernel(
     PersistentContext ctx,
     SG2Weights w,
@@ -1151,7 +1155,7 @@ sg2_meta_optimizer_megakernel(
 }
 
 // =====================================================================
-//  Host launcher — one persistent CTA per SM, SG2_MEGA_BLOCK thr/CTA.
+//  Host launcher — one persistent CTA per SM, SG_TUNED_MEGA_BLOCK thr/CTA.
 //  Mirrors launch_fused_decoder_megakernel's hang-freedom contract:
 //  occupancy>=1 or refuse (the GridBarrier rendezvous of n_ctas CTAs can
 //  never complete if a CTA cannot be placed). Zeroes the barrier+queue
@@ -1174,7 +1178,7 @@ cudaError_t launch_sg2_meta_optimizer_tail(
     int occ = 0;
     err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &occ, (const void*)&sg2_meta_optimizer_megakernel<Dims, ParamT, GradT>,
-        SG2_MEGA_BLOCK, /*dynamicSMemBytes=*/0);
+        SG_TUNED_MEGA_BLOCK, /*dynamicSMemBytes=*/0);
     if (err != cudaSuccess) return err;
     if (occ < 1) return cudaErrorLaunchOutOfResources;
 
@@ -1186,7 +1190,7 @@ cudaError_t launch_sg2_meta_optimizer_tail(
     if (ctx.g_generation){ err = cudaMemsetAsync(ctx.g_generation, 0, sizeof(unsigned), stream); if (err) return err; }
     if (ctx.g_next_task) { err = cudaMemsetAsync(ctx.g_next_task, 0, sizeof(int), stream); if (err) return err; }
 
-    dim3 grid(launch_ctas), block(SG2_MEGA_BLOCK);
+    dim3 grid(launch_ctas), block(SG_TUNED_MEGA_BLOCK);
     sg2_meta_optimizer_megakernel<Dims, ParamT, GradT><<<grid, block, 0, stream>>>(
         ctx, w, st, sc, params, grads, sharpness);
     return cudaGetLastError();

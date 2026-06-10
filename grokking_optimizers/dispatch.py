@@ -938,8 +938,49 @@ _L3_REAL_SPEC = {
 }
 
 
+# Per-(canonical_model, gemm_engine) READINESS for the L3-REAL train path. The
+# GEMM engine is the owner directive's GEMM_IMPL axis (task 1): "wgmma" runs the
+# bf16 tensor-core launcher (mega_{decoder,vit}_real_adamw_tc_launcher.cu, wired
+# into _ops), "scalar" runs the shipped fp32 megakernel. Mamba has NO wgmma
+# launcher (the measured scalar-wins carve-out, 905a4bb 0.46×), so requesting
+# wgmma for it is unsupported and FAILS LOUD (dispatch.cpp TORCH_CHECK) — never a
+# silent scalar run under a wgmma label. Single source of truth the race + tests
+# read so the path map cannot drift.
+_L3_WGMMA_CELLS = frozenset({
+    ("transformer_decoder", "adamw"),
+    ("vit", "adamw"),
+    # NOTE: ("mamba3", "adamw") deliberately ABSENT — scalar-only by measurement.
+})
+
+
+def gemm_impl_for_cell(model_name, opt_name, precision):
+    """The GEMM engine token ("wgmma" | "scalar") for an L3-REAL cell at `precision`.
+
+    Path-matched semantics (replaces the old fp32-only gate, owner directive task 1):
+      * precision == "bf16"  → "wgmma" for the TC-capable cells (decoder/vit×adamw),
+                               "scalar" for mamba (the measured carve-out).
+      * precision == "fp32"  → "scalar" for ALL cells (the fp32 owner-computes
+                               megakernel; eager-vs-TC parity at bf16 is gated
+                               separately, so fp32 stays on the verified scalar
+                               path).
+    Any other precision returns None → the caller declines the L3 path entirely
+    (fp16-AMP / tf32 have no in-kernel carrier here; eager is the honest path).
+
+    The engine returned is the ACTUAL engine dispatch.cpp will run (it has no silent
+    fallback: an unsupported wgmma request throws), so a successful fused_train_step
+    with this token PROVES that engine executed — the basis of the path report.
+    """
+    model_c = canonicalize_model(model_name)
+    if precision == "fp32":
+        return "scalar"
+    if precision == "bf16":
+        return "wgmma" if (model_c, opt_name) in _L3_WGMMA_CELLS else "scalar"
+    return None
+
+
 def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
                      targets, *, state_cache, step, return_grad=False,
+                     gemm_impl="scalar",
                      lr=None, betas=None, weight_decay=None, eps=None):
     """Run ONE TRUE L3 fused TRAIN step (real fwd+bwd+opt) for an L3-REAL cell.
 
@@ -990,6 +1031,15 @@ def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
             [total] tensor; slice it by the model's layout offsets for per-tensor
             grads) — used by the parity test to compare the kernel's backward
             against the oracle. Default False (the race only needs the loss).
+        gemm_impl: GEMM-engine token forwarded to ops.fused_step (owner directive
+            task 1). "scalar" (default) → the shipped fp32 owner-computes
+            megakernel; "wgmma" → the bf16 tensor-core launcher (decoder/vit only;
+            wired into _ops via mega_{decoder,vit}_real_adamw_tc_launcher.cu). On the
+            "wgmma" path the batch B is truncated to the largest multiple of 16 ≤ B
+            (the TC dW K-loop is 16-step atoms; the race full batch is not ÷16), for
+            both tokens and targets consistently. dispatch.cpp has NO silent
+            fallback: an unsupported wgmma request (e.g. mamba) throws, so a
+            successful return PROVES the requested engine executed.
 
     Returns the scalar training loss (mean CE) as a float; or (loss, grad) when
     ``return_grad=True``. Raises if the cell is not L3-REAL or a param layout is
@@ -1068,6 +1118,24 @@ def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
     # packing dispatch.cpp reads for this model (int tokens vs float patches).
     B = int(tokens.shape[0])
     per = spec["per"]
+    # WGMMA TILING REQUIREMENT (not suppression): the TC launchers process the dW
+    # K-loop in 16-step atoms and require B %% 16 == 0 (they return cudaErrorInvalidValue
+    # otherwise → dispatch throws). The race full batch is not a multiple of 16
+    # (e.g. decoder 4191, vit 4234), so on the wgmma path we truncate to the largest
+    # multiple of 16 ≤ B, dropping the trailing < 16 samples for BOTH tokens and
+    # targets consistently. This is a kernel input-shape constraint, identical to
+    # what tuning.roofline.measure_tc_cell already does; the <0.4%% batch delta vs the
+    # eager competitors is negligible and logged. The scalar path takes any B.
+    if gemm_impl == "wgmma":
+        B_tc = B - (B % 16)
+        if B_tc < 16:
+            raise RuntimeError(
+                f"fused_train_step: wgmma path needs B>=16 (got B={B}); the TC "
+                f"dW K-loop is 16-step atoms. Use a larger batch or gemm_impl='scalar'.")
+        if B_tc != B:
+            tokens = tokens[:B_tc]
+            targets = targets[:B_tc]
+            B = B_tc
     if spec["kind"] == "int_tokens":
         # decoder/mamba: int32 tokens[B*per] ++ int32 targets[B]. tokens is [B,per].
         S = int(tokens.shape[1])
@@ -1113,7 +1181,7 @@ def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
                    beta1=scalars["beta1"], beta2=scalars["beta2"],
                    eps=scalars["eps"], weight_decay=scalars["weight_decay"],
                    bc1=scalars["bc1"], bc2=scalars["bc2"],
-                   step=scalars["step"], opt_only=False)
+                   step=scalars["step"], opt_only=False, gemm_impl=gemm_impl)
 
     # Scatter the updated flat params back into the live model (same order).
     off = 0

@@ -341,7 +341,18 @@ __device__ __forceinline__ void dec_layernorm_fwd(
 //  ff0/gact/attn + LN caches) reflects the LAST layer processed; backward
 //  recomputes per layer from layer_in.
 // ────────────────────────────────────────────────────────────────────────────
-__device__ float dec_forward_sample(const DecWeights& w, const int* tokens_s,
+// `inline` (vague linkage) is REQUIRED, not optional: these dec_* helpers are
+// non-template __device__ free functions DEFINED in this header. The header is now
+// included by TWO TUs that co-reside in _ops — the scalar launcher
+// (mega_decoder_real_adamw.cu) AND the wired TC launcher
+// (mega_decoder_real_adamw_tc_launcher.cu, -DSG_TUNED_GEMM_IMPL=1). Without
+// `inline` each TU emits a strong definition → "multiple definition" at host link
+// (the template megakernels + __constant__ tables already have vague/internal
+// linkage and never collided; only these 5 non-template defs did). `inline` lets
+// the linker merge the identical definitions. NOT __forceinline__ — these are
+// large (dec_backward_sample recomputes a full layer); forcing expansion is pure
+// bloat. Single-TU JIT (the parity _tc.cu modules) is byte-identical under inline.
+__device__ inline float dec_forward_sample(const DecWeights& w, const int* tokens_s,
                                      int target, DecSampleSmem* sm) {
     // Embedding + positional: h0[s, j] = tok[tok_s][j] + pos[s][j].
     for (int idx = threadIdx.x; idx < dec::kSeq * dec::kD; idx += blockDim.x) {
@@ -495,7 +506,7 @@ __device__ float dec_forward_sample(const DecWeights& w, const int* tokens_s,
 // Recompute one layer's forward intermediates into sm (qkv, x1, ff0, gact, attn,
 // and ctx := r2), reading from sm->layer_in[li]. Mirrors the fwd layer body but
 // also leaves r2 in sm->ctx and x1 in sm->x1 for the backward chain.
-__device__ void dec_recompute_layer(const DecWeights& w, int li,
+__device__ inline void dec_recompute_layer(const DecWeights& w, int li,
                                      DecSampleSmem* sm) {
     const DecWeights::Layer& L = w.layer[li];
     float* hin = &sm->layer_in[li][0][0];
@@ -571,7 +582,7 @@ __device__ void dec_recompute_layer(const DecWeights& w, int li,
 // positions, returns dx [kSeq,d] into dx_out, and ACCUMULATES dgamma/dbeta
 // (summed over positions) into the CTA grad partials gw/gb [d]. Owner-thread
 // rule for gw/gb: thread owns feature j (strided), sums over positions locally.
-__device__ void dec_layernorm_bwd(
+__device__ inline void dec_layernorm_bwd(
         const float* __restrict__ dy, const float* __restrict__ xhat,
         const float* __restrict__ inv, const float* __restrict__ gamma,
         float* __restrict__ dx_out, float* __restrict__ gw, float* __restrict__ gb,
@@ -623,7 +634,7 @@ __device__ void dec_layernorm_bwd(
 // (params decayed to zero via weight decay; train acc pinned at 1/97). The CPU
 // structural mirror did NOT catch it (it indexes buffers semantically, not by
 // flat offset), so the stride is now part of the call contract.
-__device__ void dec_linear_bwd(
+__device__ inline void dec_linear_bwd(
         const float* __restrict__ dY, const float* __restrict__ X,
         const float* __restrict__ W, int in_dim, int out_dim,
         float* __restrict__ dW, float* __restrict__ db,
@@ -668,7 +679,7 @@ __device__ void dec_linear_bwd(
 //
 //  Transcribed from tests/hw/decoder_oracle.py::decoder_backward.
 // ────────────────────────────────────────────────────────────────────────────
-__device__ void dec_backward_sample(const DecWeights& w, const DecGrad& g,
+__device__ inline void dec_backward_sample(const DecWeights& w, const DecGrad& g,
                                      const int* tokens_s, int target, int B,
                                      DecSampleSmem* sm) {
     // ── CE backward: dlogits = (softmax - onehot)/B. (logits cached in fwd.) ──

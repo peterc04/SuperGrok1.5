@@ -9,6 +9,7 @@ jointly trained alongside the main model.
 All heavy computation is dispatched to the fused C++/CUDA kernel via _ops.
 """
 
+import warnings
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -18,6 +19,7 @@ from torch.optim.optimizer import Optimizer
 from torch.utils.checkpoint import checkpoint as _grad_checkpoint
 
 from grokking_optimizers.dispatch import get_ops
+from grokking_optimizers.optimizers.adamw import _validate_grad
 
 _ops = get_ops()  # Fails loudly if C++ extension not built
 
@@ -126,10 +128,17 @@ class NeuralGrok(Optimizer):
         beta: Secondary amplification scale factor (default: 4.0).
         num_layers: Number of layers in the amplifier MLP (default: 3).
         hidden_dim: Hidden dimension of the amplifier MLP (default: 128).
-        inner_steps: Number of inner amplifier update steps per
-            optimizer step (default: 1).
+        inner_steps: Deprecated — dead arg with no kernel slot; ignored. The
+            fused kernel performs exactly one amplifier evaluation per step.
+            Kept for API backward compatibility; passing a non-default value
+            emits a DeprecationWarning (default: 1).
         grad_clip: Maximum gradient norm for per-parameter clipping
             (default: 1.0).
+        amplifier_lr: Learning rate for the INTERNALLY-owned Adam that trains
+            the amplifier in :meth:`train_amplifier_step` (default: 1e-3). The
+            amplifier is trained inside the optimizer (AdamW-parity directive:
+            the caller does not have to own an optimizer), though an external
+            one may still be passed to ``train_amplifier_step``.
     """
 
     def __init__(
@@ -145,6 +154,7 @@ class NeuralGrok(Optimizer):
         hidden_dim: int = 128,
         inner_steps: int = 1,
         grad_clip: float = 1.0,
+        amplifier_lr: float = 1e-3,
         use_grad_hooks: bool = False,
         grad_checkpoint: bool = True,
     ) -> None:
@@ -156,6 +166,16 @@ class NeuralGrok(Optimizer):
             raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
         if not 0.0 <= betas[1] < 1.0:
             raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+        # `inner_steps` is a dead arg: the fused kernel does ONE amplifier
+        # evaluation per step (no kernel slot for inner iterations). Warn if a
+        # non-default value is passed so callers know it is ignored; still
+        # accepted for back-compat.
+        if inner_steps != 1:
+            warnings.warn(
+                "NeuralGrok 'inner_steps' is deprecated and has no kernel slot; "
+                "it is ignored (the fused kernel performs one amplifier "
+                "evaluation per step).",
+                DeprecationWarning, stacklevel=2)
 
         defaults = dict(
             lr=lr,
@@ -177,6 +197,12 @@ class NeuralGrok(Optimizer):
 
         self._meta_weights_dirty = True
         self._cached_meta_weights = None
+
+        # Internally-owned Adam over the amplifier params, lazily constructed on
+        # first train_amplifier_step (AdamW-parity directive: the caller does
+        # not have to own an amplifier optimizer). amplifier_lr is its LR.
+        self._amplifier_lr = amplifier_lr
+        self._amp_opt = None
 
         # Per-group cache of static tensor lists (params + exp_avg/exp_avg_sq
         # buffers keep a fixed identity across steps); only grads_list and step
@@ -256,7 +282,7 @@ class NeuralGrok(Optimizer):
             if len(params_list) == 0:
                 continue
 
-            grads_list = [p.grad for p in params_list]
+            grads_list = [_validate_grad(p) for p in params_list]
             step_list = []
             for state in states:
                 state["step"] += 1
@@ -305,10 +331,200 @@ class NeuralGrok(Optimizer):
         """Return the gradient amplifier module."""
         return self.amplifier
 
+    def train_amplifier_step(self, model, val_x, val_y, criterion,
+                             amplifier_optimizer=None):
+        """Train the gradient amplifier via a one-step lookahead objective.
+
+        AUDIT A3 (the defect this fixes): the amplifier MLP was AUTOGRAD-
+        UNREACHABLE on every path that ever existed. The fused kernel consumes
+        it only through DETACHED ``get_weights()`` snapshots (step()/_single_
+        param_step), and the race's old ``aloss = neural_beta*CE(m(vax), vay)``
+        contained ONLY the model ``m`` — the amplifier params were in neither
+        that graph nor any optimizer's param_groups, so ``aloss.backward()``
+        left them grad-less and ``aopt.step()`` was a permanent no-op. The
+        amplifier was therefore frozen at random init for the entire run, and
+        ``mark_amplifier_dirty()`` faithfully refreshed a snapshot of weights
+        that never changed.
+
+        THE FIX (mirrors the proven SuperGrok11.meta_step lookahead template):
+        rebuild the amplified update DIFFERENTIABLY THROUGH THE AMPLIFIER in
+        Python, take one virtual optimizer step, evaluate validation loss
+        there, and backprop into the amplifier weights. The graph now reaches
+        the amplifier, so its parameters actually move; the kernel then picks
+        up the trained weights via the snapshot refresh (mark_amplifier_dirty).
+
+        Steps (each annotated with the SG11.meta_step line it mirrors):
+          (a) snapshot current per-param grads g, DETACHED (they exist right
+              after the caller's backward; we differentiate w.r.t. the
+              amplifier, not w.r.t. g).
+          (b) amplified_g = (psi*alpha + beta) * g, where
+              psi = amplifier(|g|) is built KEEPING THE GRAPH to the amplifier
+              weights. FEATURIZATION PARITY IS THE CORRECTNESS CRUX: the
+              deployed kernel feeds the per-element scalar |g| (fabsf(grad[idx])
+              — csrc/fused/sm_90/opt_components.cuh:225; raw |g|, NO norm) into a
+              2-layer ReLU MLP psi = sum_j W2[j]*relu(W1[j]*|g| + b1[j]) + b2
+              (csrc/algorithms/neuralgrok.h:38-45), then applies
+              g_amp = (psi*alpha + beta)*g (neuralgrok.h:70). With num_layers=2
+              (the race's setting, and the kernel's documented 2-layer contract
+              — get_weights' note), _Amplifier.forward is EXACTLY that MLP, so
+              feeding it |g| reshaped to [N,1] trains the deployed function.
+          (c) virtual step at the optimizer's OWN lr/wd (decoupled-WD shrink +
+              the amplified gradient), built from p.detach() — same recipe as
+              SG11.meta_step's lookahead:
+                  w⁺ = p·(1 − lr·wd) − lr·amplified_g
+          (d) amp_loss = criterion(functional_call(model, w⁺, val_x), val_y),
+              backward into the amplifier optimizer, step it.
+
+              OBJECTIVE CHOICE — VAL-ONLY (not SG11's two-term val+train): the
+              SG meta-net adds a learned correction to the gradient
+              (grad + rescale·MLP), so it can REDIRECT the step in an
+              ARBITRARY direction off the train manifold; SG11 needed the train
+              anchor because the val-optimal additive push walks the weights
+              off a memorized minimum and collapses. The amplifier is far more
+              constrained: it is a PER-COORDINATE MULTIPLICATIVE rescale —
+              g_amp = (psi·alpha + beta)·g — that acts INDEPENDENTLY on each
+              coordinate and cannot introduce cross-coordinate rotation the way
+              the additive meta can. (It is not strictly sign-preserving: psi is
+              an unbounded linear output, so psi·alpha+beta can go negative and
+              flip an individual coordinate; but it still cannot synthesize an
+              off-manifold direction out of coordinates the gradient leaves at
+              zero, and the search space is a diagonal rescale of g, not all of
+              R^n.) The off-manifold collapse mode the train anchor exists to
+              prevent is therefore much weaker here, so we start val-only — the
+              simplest objective that makes the amplifier learn a useful
+              per-coordinate scale. If a future run shows val-only overshoot,
+              add the train term exactly as in SG11.meta_step (the hook for it
+              is one line below).
+          (e) mark_amplifier_dirty() so the next kernel step() re-extracts the
+              just-trained weights (the snapshot refresh — necessary but
+              useless until now, since the weights finally change).
+          (f) restore each p.grad untouched (snapshot/restore, like
+              SG11.meta_step) so the subsequent fused step() consumes the
+              caller's original backward result, not our intermediate state.
+
+        Args:
+            model: the model whose validation loss defines the objective.
+            val_x, val_y: held-out batch (the same held-out convention the
+                SuperGrok bilevel/meta nets use).
+            criterion: loss (e.g. nn.CrossEntropyLoss()).
+            amplifier_optimizer: OPTIONAL external optimizer over the amplifier
+                params (e.g. the race's existing aopt). If None, the
+                internally-owned Adam (amplifier_lr) is lazily built and used —
+                so the caller is not required to own one.
+
+        Returns:
+            The scalar validation loss at the virtual step (float).
+        """
+        named_params = list(model.named_parameters())
+
+        # (a) Snapshot DETACHED grads. These are the caller's backward result;
+        # we differentiate the objective w.r.t. the AMPLIFIER, with g held
+        # constant (detached) — exactly SG11.meta_step's `saved_grads`.
+        saved_grads = {}
+        for name, p in named_params:
+            if p.grad is not None:
+                saved_grads[name] = p.grad.detach().clone()
+        if not saved_grads:
+            # No grads to amplify (caller has not run backward, or all grads are
+            # None). Nothing to train against — fail LOUDLY rather than silently
+            # no-op, per the honesty rails (a silent no-op here would recreate
+            # exactly the A3 defect this method exists to kill).
+            raise RuntimeError(
+                "train_amplifier_step called with no parameter gradients — run "
+                "loss.backward() before training the amplifier (A3: a silent "
+                "no-op here is the defect this method fixes).")
+
+        # Pick the optimizer: external if supplied, else the lazily-built
+        # internal Adam over the amplifier params (AdamW-parity directive).
+        if amplifier_optimizer is None:
+            if self._amp_opt is None:
+                self._amp_opt = torch.optim.Adam(
+                    self.amplifier.parameters(), lr=self._amplifier_lr)
+            amplifier_optimizer = self._amp_opt
+
+        # (b) Build the amplified gradient DIFFERENTIABLY through the amplifier.
+        # Batched: one amplifier forward over all params' |g| concatenated, then
+        # scatter back (mirrors SG11.meta_step's batched meta-net forward). The
+        # amplifier weights require grad, so the graph reaches them; g itself is
+        # detached, so we differentiate ONLY the amplifier (psi*alpha+beta).
+        group = self.param_groups[0]
+        alpha = float(group["alpha"])
+        beta = float(group["beta"])
+        lr_eff = float(group["lr"])
+        wd_eff = float(group.get("weight_decay", 0.0))
+
+        all_abs = []
+        all_names = []
+        all_sizes = []
+        for name, _p in named_params:
+            if name in saved_grads:
+                g = saved_grads[name]
+                # KERNEL FEATURIZATION: per-element scalar |g| (raw, no norm).
+                # Shape [N, 1] is the _Amplifier input contract (Linear(1, H)).
+                all_abs.append(g.reshape(-1, 1).abs())
+                all_names.append(name)
+                all_sizes.append(g.numel())
+
+        with torch.enable_grad():
+            cat_abs = torch.cat(all_abs, dim=0)            # [sum(N), 1]
+            # _Amplifier.forward == the kernel's 2-layer ReLU MLP when
+            # num_layers==2 (the deployed config). If num_layers>2 the kernel
+            # only evaluates first+last layer (get_weights' documented contract)
+            # while this trains the full stack — flag LOUDLY so we never
+            # silently optimize a function the kernel does not run.
+            if len(self.amplifier.net) != 3:
+                warnings.warn(
+                    "NeuralGrok amplifier has num_layers != 2; the fused kernel "
+                    "evaluates only a 2-layer (first+last) MLP, so "
+                    "train_amplifier_step is optimizing a DIFFERENT function "
+                    "than the kernel deploys. Set num_layers=2 for parity.",
+                    RuntimeWarning, stacklevel=2)
+            cat_psi = self.amplifier(cat_abs).reshape(-1)  # [sum(N)] psi(|g|)
+
+            # (c) Virtual step at the optimizer's own lr/wd, from p.detach():
+            #     w⁺ = p·(1 − lr·wd) − lr·(psi·alpha + beta)·g
+            # amplified_g keeps the graph to the amplifier (via psi); g detached.
+            virtual = {}
+            offset = 0
+            for name, p in named_params:
+                base = p.detach()
+                if name in saved_grads:
+                    idx = all_names.index(name)
+                    size = all_sizes[idx]
+                    psi = cat_psi[offset:offset + size].reshape(saved_grads[name].shape)
+                    offset += size
+                    amplified_g = (psi * alpha + beta) * saved_grads[name]
+                    virtual[name] = base * (1.0 - lr_eff * wd_eff) - lr_eff * amplified_g
+                else:
+                    virtual[name] = base
+
+            # (d) Validation loss at the virtual step. functional_call swaps the
+            # virtual tensors in as the module's params, so grads flow back
+            # through amplified_g into the amplifier ONLY (real params untouched).
+            amplifier_optimizer.zero_grad()
+            val_logits = torch.func.functional_call(model, virtual, (val_x,))
+            amp_loss = criterion(val_logits, val_y)
+
+        amp_loss.backward()
+        amplifier_optimizer.step()
+
+        # (e) Refresh the kernel's weight snapshot — now meaningful because the
+        # weights actually changed (pre-A3-fix this was a no-op on frozen
+        # weights).
+        self.mark_amplifier_dirty()
+
+        # (f) Restore the caller's grads untouched so the subsequent fused
+        # step() consumes the original backward result (SG11.meta_step parity).
+        for name, p in named_params:
+            p.grad = saved_grads.get(name)
+
+        return amp_loss.item()
+
     def _single_param_step(self, param, group, state):
         """Per-parameter step used by the `use_grad_hooks=True` path."""
         if param.grad is None:
             return
+        grad = _validate_grad(param)
         if len(state) == 0:
             state["step"] = 0
             state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
@@ -320,7 +536,7 @@ class NeuralGrok(Optimizer):
         W1, b1, W_last, b_last = self._cached_meta_weights
         device = param.device
         _ops.neuralgrok_fused_step(
-            [param], [param.grad], [state["exp_avg"]], [state["exp_avg_sq"]],
+            [param], [grad], [state["exp_avg"]], [state["exp_avg_sq"]],
             [state["step"]],
             W1.to(device), b1.to(device), W_last.to(device), b_last.to(device),
             group["alpha"], group["beta"],

@@ -17,6 +17,7 @@ from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
 from grokking_optimizers.dispatch import get_ops
+from grokking_optimizers.optimizers.adamw import _validate_grad
 
 _ops = get_ops()  # Fails loudly if C++ extension not built
 
@@ -165,7 +166,7 @@ class Prodigy(Optimizer):
             if len(params_list) == 0:
                 continue
 
-            grads_list = [p.grad for p in params_list]
+            grads_list = [_validate_grad(p) for p in params_list]
             step_list = []
             for state in states:
                 state["step"] += 1
@@ -215,6 +216,7 @@ class Prodigy(Optimizer):
         """
         if param.grad is None:
             return
+        grad = _validate_grad(param)
         if len(state) == 0:
             state["step"] = 0
             state["exp_avg"] = torch.zeros_like(param, dtype=torch.float32)
@@ -225,7 +227,7 @@ class Prodigy(Optimizer):
         beta1, beta2 = group["betas"]
         beta3 = math.sqrt(beta2)
         self._d_lr, self._r_ema, self._s_ema = _ops.prodigy_fused_step(
-            [param], [param.grad], [state["exp_avg"]], [state["exp_avg_sq"]],
+            [param], [grad], [state["exp_avg"]], [state["exp_avg_sq"]],
             [state["s"]], [state["param_init"]], [state["step"]],
             getattr(self, '_d_lr', group["d0"]),
             getattr(self, '_r_ema', 0.0), getattr(self, '_s_ema', 0.0),
@@ -238,6 +240,40 @@ class Prodigy(Optimizer):
     def d_lr(self) -> float:
         """Current adaptive learning rate estimated by Prodigy."""
         return self._d_lr
+
+    def state_dict(self) -> dict:
+        """Include the persistent D-estimate scalars in the checkpoint.
+
+        The Prodigy D-estimate state (``_d_lr`` and the EMA numerator/denominator
+        ``_r_ema``/``_s_ema``) lives on the optimizer instance, NOT inside the
+        per-parameter ``state`` dict, so the base ``Optimizer.state_dict`` would
+        silently drop it — a resumed run would restart d at d0 and re-walk the
+        whole estimate trajectory. Stash the three scalars under a private
+        ``"_prodigy"`` key so they round-trip.
+        """
+        sd = super().state_dict()
+        sd["_prodigy"] = {
+            "_d_lr": self._d_lr,
+            "_r_ema": self._r_ema,
+            "_s_ema": self._s_ema,
+        }
+        return sd
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        """Restore the persistent D-estimate scalars, then the base state.
+
+        Pops the private ``"_prodigy"`` blob (default-absent so OLD checkpoints
+        without it load cleanly, keeping the constructor-initialised d0 seed) and
+        restores ``_d_lr``/``_r_ema``/``_s_ema`` before delegating the rest to the
+        base optimizer.
+        """
+        sd = dict(state_dict)
+        blob = sd.pop("_prodigy", None)
+        if blob is not None:
+            self._d_lr = blob.get("_d_lr", self._d_lr)
+            self._r_ema = blob.get("_r_ema", self._r_ema)
+            self._s_ema = blob.get("_s_ema", self._s_ema)
+        super().load_state_dict(sd)
 
 
 # ── Shared (inlined) helper: register post_accumulate_grad_hook on each param.

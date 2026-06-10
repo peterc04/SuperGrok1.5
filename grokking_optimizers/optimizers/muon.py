@@ -17,6 +17,7 @@ from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
 from grokking_optimizers.dispatch import get_ops
+from grokking_optimizers.optimizers.adamw import _validate_grad
 
 _ops = get_ops()  # Fails loudly if C++ extension not built
 
@@ -29,10 +30,28 @@ class Muon(Optimizer):
         (momentum + Newton-Schulz orthogonalisation).
       - **1D params** (biases, norms, etc.): updated with AdamW.
 
+    Two construction forms:
+      - **Explicit split** ``Muon(params_2d, params_1d, ...)``: you pre-route the
+        2D (matrix) params and the 1D/other params yourself.
+      - **Single iterable** ``Muon(params, ...)`` (``params_1d`` left as None):
+        the constructor AUTO-SPLITS ``params`` by ``p.ndim`` — every 2D tensor
+        goes to the Muon group, everything else (1D biases/norms, >=3D conv
+        weights) to the AdamW group. This mirrors the standard PyTorch optimizer
+        signature ``Opt(model.parameters(), ...)``.
+
+    Back-compat: an all-2D iterable is a no-op under auto-split (every param
+    lands in the 2D group, exactly as if passed as ``params_2d``). The only
+    behavioural change is mixed-ndim input passed positionally as the first arg:
+    previously those 1D params reached the Newton-Schulz path and tripped the
+    ``muon_fused_step`` ``p.dim()==2`` assert; now they are routed to AdamW —
+    strictly an improvement, not a regression.
+
     Args:
-        params_2d: Iterable of 2D parameters for Muon updates.
+        params_2d: Iterable of 2D parameters for Muon updates. If ``params_1d``
+            is omitted, this is treated as a single combined iterable and split
+            by ``ndim`` into the 2D (Muon) and non-2D (AdamW) groups.
         params_1d: Iterable of non-2D parameters for AdamW updates
-            (optional).
+            (optional). When omitted, ``params_2d`` is auto-split by ``ndim``.
         lr: Learning rate for 2D Muon updates (default: 0.02).
         momentum: Momentum coefficient for 2D updates (default: 0.95).
         weight_decay: Weight decay for 2D params (default: 1.0).
@@ -69,8 +88,18 @@ class Muon(Optimizer):
         if ns_steps < 1:
             raise ValueError(f"Invalid ns_steps: {ns_steps}")
 
-        params_2d_list = list(params_2d)
-        params_1d_list = list(params_1d) if params_1d is not None else []
+        if params_1d is None:
+            # Single-iterable form: consume once, then split by ndim. 2D matrices
+            # → Muon (Newton-Schulz); everything else → AdamW. (Consuming into a
+            # list first is required so a generator is not exhausted by the
+            # split scan.)
+            all_p = list(params_2d)
+            params_2d_list = [p for p in all_p if getattr(p, "ndim", None) == 2]
+            params_1d_list = [p for p in all_p if getattr(p, "ndim", None) != 2]
+        else:
+            # Explicit split: caller pre-routed the two groups (verbatim path).
+            params_2d_list = list(params_2d)
+            params_1d_list = list(params_1d)
 
         # Build param groups: group 0 = 2D (Muon), group 1 = 1D (AdamW)
         param_groups = [
@@ -206,7 +235,7 @@ class Muon(Optimizer):
         if len(params_list) == 0:
             return
 
-        grads_list = [p.grad for p in params_list]
+        grads_list = [_validate_grad(p) for p in params_list]
 
         fused_step = self._muon_fused_step
         if fused_step is None:
@@ -229,7 +258,7 @@ class Muon(Optimizer):
         if len(params_list) == 0:
             return
 
-        grads_list = [p.grad for p in params_list]
+        grads_list = [_validate_grad(p) for p in params_list]
         step_list = []
         for state in states:
             state["step"] += 1
@@ -259,10 +288,11 @@ class Muon(Optimizer):
         """Per-parameter step used by the `use_grad_hooks=True` path."""
         if param.grad is None:
             return
+        grad = _validate_grad(param)
         if len(state) == 0:
             state["momentum_buffer"] = torch.zeros_like(param, dtype=torch.float32)
         _ops.muon_fused_step(
-            [param], [param.grad], [state["momentum_buffer"]],
+            [param], [grad], [state["momentum_buffer"]],
             group.get("momentum", 0.95),
             group["lr"],
             group["weight_decay"],

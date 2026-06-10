@@ -38,6 +38,19 @@
 #include "csrc/backends/cuda/sm_90/warp_specialize.cuh"
 #include <cuda_runtime.h>
 
+// SG_TUNED_MEGA_BLOCK — threads per persistent megakernel CTA, shared by EVERY
+// L3 megakernel that composes this substrate (the fused elementwise megakernel
+// + the decoder / vit / mamba model drivers + the SuperGrok2 stage). Default
+// 256 (= two 128-thread Hopper warp-groups → byte-identical untuned build).
+// NEEDS-PARITY before shipping a non-default winner: the §3.4 producer/consumer
+// warp-specialization and the per-model shared staging/reduction buffers assume
+// the 256-thread (2 warp-group) shape, so any swept value must remain a
+// multiple of the warp-group size AND be re-validated on the H100 parity gate —
+// the autotuner cannot prove launch-shape correctness on its own.
+#ifndef SG_TUNED_MEGA_BLOCK
+#define SG_TUNED_MEGA_BLOCK 256
+#endif
+
 namespace sg { namespace fused {
 
 // =========================================================================
