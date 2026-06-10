@@ -989,27 +989,46 @@ def launch_supergrok2_step(
     exp_avg: jnp.ndarray,
     exp_avg_sq: jnp.ndarray,
     mu_state: jnp.ndarray,
+    slow_state: jnp.ndarray,
     grad: jnp.ndarray,
+    expert_out: jnp.ndarray,
     sharpness: jnp.ndarray,
     A_log: jnp.ndarray,
     proj_W: jnp.ndarray, proj_b: jnp.ndarray,
-    alpha: float, gru_decay: float,
+    alpha: float, gru_decay: float, lamb_eff: float,
     lr: float, beta1: float, beta2: float, eps: float, wd: float,
     bc1: float, bc2: float,
 ) -> Tuple[jnp.ndarray, ...]:
     """Per-tensor SG2 step (fused-TU contract).
 
-    Pure-JAX fallback that treats SG2 as `smart_grad = grad + alpha*mu` +
-    Adam. The Pallas-accelerated path (when available) is wired through
-    the supergrok2_step entrypoint above.
+    Byte-faithful to csrc/algorithms/supergrok2.h::sg2_apply_step (the single
+    source of truth, lines 395-438):
+
+        mu_new     = gru_decay*mu_state + (1-gru_decay)*expert_out   (supergrok2.h:419)
+        slow_new   = alpha*slow_state   + (1-alpha)*g                (supergrok2.h:423)
+        smart_grad = g + alpha*mu_new + lamb_eff*slow_new            (supergrok2.h:426)
+        m = beta1*exp_avg    + (1-beta1)*smart_grad                  (supergrok2.h:428)
+        v = beta2*exp_avg_sq + (1-beta2)*smart_grad^2               (supergrok2.h:429)
+        update = (m/bc1) / (sqrt(v/bc2) + eps)                       (supergrok2.h:436)
+        p_new  = p - lr*(update + wd*p)                              (supergrok2.h:437)
+
+    `expert_out` is the PEER expert output for the element (produced by the
+    separate CSA/HCA+PEER meta-net launch; here it is an input, matching the
+    kernel's `const float expert_out` argument). `alpha` is BOTH the mu/slow
+    mixing coefficient AND the slow-EMA decay (supergrok2.h:388-394). The
+    `lamb_eff*slow_new` grokfast term was previously DROPPED here (the step took
+    no expert_out/slow_state/lamb_eff and used `smart = grad + alpha*mu_state`);
+    restored to match the header — see supergrok2_sm90.cuh:555-573 and the
+    parity reference ref_sg2_apply_step (tests/hw/test_reference_parity.py:237).
     """
-    smart = grad + alpha * mu_state
+    mu_new = gru_decay * mu_state + (1.0 - gru_decay) * expert_out
+    slow_new = alpha * slow_state + (1.0 - alpha) * grad
+    smart = grad + alpha * mu_new + lamb_eff * slow_new
     m = beta1 * exp_avg + (1.0 - beta1) * smart
     v = beta2 * exp_avg_sq + (1.0 - beta2) * smart * smart
     update = (m / bc1) / (jnp.sqrt(v / bc2) + eps)
     new_param = param - lr * (update + wd * param)
-    new_mu = gru_decay * mu_state + (1.0 - gru_decay) * smart
-    return new_param, m, v, new_mu
+    return new_param, m, v, mu_new, slow_new
 
 
 # ═════════════════════════════════════════════════════════════════════════

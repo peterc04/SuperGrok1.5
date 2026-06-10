@@ -281,10 +281,14 @@ if _HAS_JAX:
         ramp = hyperparams.get("ramp", 1.0)
         gate_signal = hyperparams.get("gate_signal", 0.0)
         grad_clip = hyperparams.get("grad_clip", 1.0)
+        # alpha_i is BOTH the slow-EMA decay and the mu/slow mixing coefficient
+        # (supergrok2.py _single_param_step:2379/2405; supergrok2.h:388-394).
+        alpha = hyperparams.get("alpha", 0.98)
 
         exp_avg = state["exp_avg"]
         exp_avg_sq = state["exp_avg_sq"]
         mu = state["mu"]
+        slow = state["slow"]
         sharpness = state["sharpness"]
         gru_state = state["gru_state"]
         step = state["step"]
@@ -313,18 +317,37 @@ if _HAS_JAX:
         )
         smart_g = smart_g.reshape(g.shape)
 
-        effective_g = gc + ramp * lamb * gate_signal * (smart_g - gc)
+        # Restored grokfast amplification — byte-faithful to the authoritative
+        # eager path supergrok2.py::_single_param_step:2394-2406 (and the kernel
+        # tail csrc/algorithms/supergrok2.h::sg2_apply_step:423-426):
+        #   slow_new   = alpha*slow + (1-alpha)*g       (dedicated slow-grad EMA)
+        #   lamb_eff   = lamb*ramp*gate_signal          (supergrok2.py:2356)
+        #   effective  = smart_grad + lamb_eff*slow_new (supergrok2.py:2406)
+        # The meta_net already folds the expert output into smart_g, so the
+        # expert term enters at FULL weight (smart_g = g + rescale*expert_out);
+        # the PRIOR `gc + ramp*lamb*gate*(smart_g-gc)` BOTH mis-scaled the expert
+        # contribution AND silently dropped the slow-grad grokfast term entirely.
+        # `g` here is the clipped grad `gc`, matching _single_param_step (which
+        # clips `grad` BEFORE both the meta_net and the slow EMA, lines 2376/2405).
+        lamb_eff = lamb * ramp * gate_signal
+        new_slow = alpha * slow + (1.0 - alpha) * gc
+        effective_g = smart_g + lamb_eff * new_slow
+
         new_exp_avg = layer_beta1 * exp_avg + (1.0 - layer_beta1) * effective_g
         new_exp_avg_sq = beta2 * exp_avg_sq + (1.0 - beta2) * (effective_g ** 2)
         bc1 = 1.0 - layer_beta1 ** step
         bc2 = 1.0 - beta2 ** step
         update = (new_exp_avg / bc1) / (jnp.sqrt(new_exp_avg_sq / bc2) + eps)
+        # `mu` (expert-output EMA) is reserved for the kernel sg2_apply_step path;
+        # the eager meta_net path does not consume it (the expert output is
+        # already inside smart_g). Carried as a layer_beta1 EMA of effective_g so
+        # the buffer stays live and shape-stable (unchanged from the prior form).
         new_mu = layer_beta1 * mu + (1.0 - layer_beta1) * effective_g
         new_p = params.astype(jnp.float32) - lr * (update + wd * params)
 
         new_state = {
             "exp_avg": new_exp_avg, "exp_avg_sq": new_exp_avg_sq,
-            "mu": new_mu, "sharpness": sharpness,
+            "mu": new_mu, "slow": new_slow, "sharpness": sharpness,
             "gru_state": new_gru, "step": step + 1,
         }
         return new_p, new_state
@@ -939,6 +962,11 @@ def _build_dummy_opt_state(optimizer: str, params: Any) -> Dict[str, Any]:
                 "exp_avg": jnp.zeros_like(p, dtype=jnp.float32),
                 "exp_avg_sq": jnp.zeros_like(p, dtype=jnp.float32),
                 "mu": jnp.zeros_like(p, dtype=jnp.float32),
+                # Dedicated slow-gradient EMA buffer (the restored grokfast term;
+                # _flat_slows in grokking_optimizers/optimizers/supergrok2.py).
+                # DISTINCT from `mu` (the expert-output EMA) — see the canonical
+                # sg2_apply_step (supergrok2.h:419/423) and _single_param_step.
+                "slow": jnp.zeros_like(p, dtype=jnp.float32),
                 "sharpness": jnp.zeros((n,), dtype=jnp.float32),
                 "gru_state": jnp.zeros((n, 4), dtype=jnp.float32),
                 "step": 1,
@@ -977,6 +1005,9 @@ def _build_dummy_opt_state(optimizer: str, params: Any) -> Dict[str, Any]:
                 "layer_beta1": 0.9, "beta2": 0.999, "lr": 1e-3, "wd": 1.0,
                 "eps": 1e-8, "lamb": 2.0, "ramp": 1.0, "gate_signal": 0.0,
                 "grad_clip": 1.0,
+                # alpha = slow-EMA decay AND mu/slow mixing coeff (alpha_i in
+                # _single_param_step; alpha_init default 0.98).
+                "alpha": 0.98,
             },
         }
         return state
