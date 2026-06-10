@@ -90,13 +90,14 @@
     (SG_TUNED_GEMM_IMPL != SG_GEMM_IMPL_WGMMA)
 #error "SG_TUNED_GEMM_IMPL must be SG_GEMM_IMPL_SCALAR (0) or SG_GEMM_IMPL_WGMMA (1)"
 #endif
+// WGMMA-PATH (R2.3, NOW LANDED): the Fork-B tensor-core CELL DRIVER. Selecting
+// the wgmma token pulls in the validated GEMM engine (model_stage_decoder_tc
+// .cuh, test_decoder_tc.py 13/13 on the 18/18 substrate) and the
+// phase-restructured fwd+bwd+AdamW persistent kernel below (fused_decoder_
+// megakernel_tc / launch_fused_decoder_megakernel_tc). The scalar default path
+// is UNCHANGED and its gates stay bit-identical; this is a PARALLEL kernel.
 #if (SG_TUNED_GEMM_IMPL == SG_GEMM_IMPL_WGMMA)
-#error "SG_TUNED_GEMM_IMPL=wgmma: the decoder Fork-B tensor-core CELL DRIVER is \
-not yet authored (DESIGN-TC-PIPELINE.md R2.3). The wgmma GEMM ENGINE is \
-validated (tests/hw/test_decoder_tc.py 13/13 on an 18/18 substrate), but the \
-phase-restructured fwd+bwd megakernel that drives it is pending. Refusing to \
-compile rather than silently ship the scalar body under the wgmma token (the \
-no-suppression directive). Build with the default (scalar) until R2.3 lands."
+#include "csrc/fused/sm_90/model_stage_decoder_tc.cuh"
 #endif
 
 namespace sg { namespace fused { namespace sm90 {
@@ -146,7 +147,7 @@ struct DecoderTokenCtx {
 // the reduce + optimizer phases read them directly. This also lets the host side
 // (dispatch.cpp) avoid building any layout tensors.
 template <OptId Opt>
-__global__ void __launch_bounds__(256)
+__global__ void __launch_bounds__(SG_TUNED_MEGA_BLOCK)
 fused_decoder_megakernel(PersistentContext ctx,
                          float* __restrict__ params,
                          DecoderTokenCtx tok,
@@ -261,7 +262,7 @@ cudaError_t launch_fused_decoder_megakernel(
 
     int occ = 0;
     err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &occ, (const void*)&fused_decoder_megakernel<Opt>, 256,
+        &occ, (const void*)&fused_decoder_megakernel<Opt>, SG_TUNED_MEGA_BLOCK,
         /*dynamicSMemBytes=*/0);
     if (err != cudaSuccess) return err;
     // Hang-freedom: at least one CTA per SM must be resident or the grid barrier
@@ -280,11 +281,203 @@ cudaError_t launch_fused_decoder_megakernel(
     if (ctx.g_generation) { err = cudaMemsetAsync(ctx.g_generation, 0, sizeof(unsigned), stream); if (err) return err; }
     if (ctx.g_next_task) { err = cudaMemsetAsync(ctx.g_next_task, 0, sizeof(int), stream); if (err) return err; }
 
-    dim3 grid(launch_ctas), block(256);
+    dim3 grid(launch_ctas), block(SG_TUNED_MEGA_BLOCK);
     fused_decoder_megakernel<Opt><<<grid, block, 0, stream>>>(
         ctx, params, tok, grad, lr, step, st);
     return cudaGetLastError();
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+//  WGMMA CELL DRIVER (DESIGN-TC-PIPELINE.md Fork B, R2.3). Compiled only under
+//  the wgmma token; the scalar path above is untouched.
+// ════════════════════════════════════════════════════════════════════════════
+#if (SG_TUNED_GEMM_IMPL == SG_GEMM_IMPL_WGMMA)
+
+// TC megakernel threads: 256 (the engine's producer+consumer warpgroup layout;
+// wgmma is warpgroup-scoped on threads 0..127). We do NOT apply the scalar
+// path's asymmetric setmaxnreg (dealloc<32> on WG0) — that would STARVE the MMA
+// warpgroup (WG0 issues the wgmma; a 128-wide accumulator needs 64 fp32 regs/
+// thread). The validated selftest ran no split; we match it.
+#define SG_TC_MEGA_BLOCK 256
+
+// ── smem arena for the unpipelined engine: one A(64×16) + one B(N×16) bf16 tile
+//    + the 256-float reduction slot. 16B-aligned. N = SG_TUNED_TILE_N. The 9 dW
+//    specs live here too (identical for all threads → shared, not per-thread
+//    stack: keeps the launch's local-memory reservation small so the persistent
+//    kernel places on a memory-tight GPU). ──
+struct DecTcSmem {
+    __nv_bfloat16 sA[64 * 16];
+    __nv_bfloat16 sB[SG_TUNED_TILE_N * 16];
+    float red[256];
+    dectc::DecDwSpec spec[9];
+};
+
+// ── TC workspace layout (carved from tok.workspace; the host sizes it for the
+//    TC path — see dec_tc_workspace_floats). Regions (float units):
+//      [0 .. acts_f)                      : DecActs bf16 region (reinterpreted)
+//      [acts_f .. acts_f + nCTA*scratch)  : per-CTA tile scratch (f32)
+//      [.. + nCTA*kLnVecElems)            : per-CTA LN-vec partials (f32)
+//      [.. + nCTA)                        : per-CTA loss slots (f32)
+//      [.. + 1)                           : reduced scalar loss (host reads it)
+//    acts_f = ceil(acts_bf16 / 2). ──
+__host__ __device__ __forceinline__ int64_t dec_tc_acts_floats(int T, int B) {
+    // mirror dectc::dec_acts_bind's running offset (bf16 elems) → floats.
+    const int64_t d = dec::kD, dff = dec::kDff, V = dec::kVocab, L = dec::kLayers;
+    const int64_t Td = (int64_t)T * d, T3d = (int64_t)T * 3 * d, Tff = (int64_t)T * dff;
+    int64_t bf = 0;
+    for (int li = 0; li < L; ++li) bf += Td + Td + Td + Tff + T3d + Td + Tff + Td;
+    bf += (int64_t)B * d + (int64_t)B * V + Td;     // X_hn + dY_logits + dh0
+    return (bf + 1) / 2;
+}
+__host__ __device__ __forceinline__ int64_t dec_tc_workspace_floats(int T, int B, int nCTA) {
+    return dec_tc_acts_floats(T, B)
+         + (int64_t)nCTA * dectc::dec_tile_scratch_total_f32()
+         + (int64_t)nCTA * dectc::kLnVecElems
+         + nCTA + 1;
+}
+
+template <OptId Opt>
+__global__ void __launch_bounds__(SG_TC_MEGA_BLOCK)
+fused_decoder_megakernel_tc(PersistentContext ctx,
+                            float* __restrict__ params,
+                            DecoderTokenCtx tok,
+                            float* __restrict__ grad,
+                            float lr, int step, FusedOptState st) {
+    __shared__ DecTcSmem sm;
+    GridBarrier bar = ctx.barrier();
+    const int cta = blockIdx.x;
+    const int nCTA = (int)ctx.n_ctas;
+    const int B = tok.B;
+    const int T = B * dec::kSeq;
+
+    // Workspace partition.
+    float* ws = tok.workspace;
+    const int64_t acts_f = dec_tc_acts_floats(T, B);
+    __nv_bfloat16* acts_base = reinterpret_cast<__nv_bfloat16*>(ws);
+    float* scratch_base = ws + acts_f;
+    const int64_t scratch_per = dectc::dec_tile_scratch_total_f32();
+    float* lnvec_base = scratch_base + (int64_t)nCTA * scratch_per;
+    float* loss_part  = lnvec_base + (int64_t)nCTA * dectc::kLnVecElems;
+    float* loss_out   = loss_part + nCTA;
+
+    dectc::DecActs acts = dectc::dec_acts_bind(acts_base, T, B);
+    dectc::DecTileScratch sc = dectc::dec_tile_scratch_bind(scratch_base + (int64_t)cta * scratch_per);
+    float* my_lnvec = lnvec_base + (int64_t)cta * dectc::kLnVecElems;
+
+    DecWeights w = dec_bind(params);
+
+    // ── P0: zero this CTA's LN-vec partials + loss slot (dW/embed grads are
+    //    written-once → no pre-zero). ──
+    for (int i = threadIdx.x; i < dectc::kLnVecElems; i += blockDim.x) my_lnvec[i] = 0.0f;
+    if (threadIdx.x == 0) loss_part[cta] = 0.0f;
+    bar.sync();   // B0
+
+    // ── P1: token-tile-parallel fwd+bwd. Each CTA grid-strides over tiles of
+    //    kTileM rows; for its tile it runs fwd (→ acts X, NLL) then bwd (→ acts
+    //    dY, dh0, LN-vec partials). Barrier-free within the tile. ──
+    const int nrows_tile = dectc::kTileM;
+    const int n_tiles = (T + nrows_tile - 1) / nrows_tile;
+    float nll_acc = 0.0f;
+    for (int ti = cta; ti < n_tiles; ti += nCTA) {
+        const int g0 = ti * nrows_tile;
+        const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
+        float nll = dectc::dectc_forward_tile(w, g0, nrows, acts, sc, tok.tokens, tok.targets,
+                                              sm.sA, sm.sB, sm.red);
+        dectc::dectc_backward_tile(w, g0, nrows, B, acts, sc, tok.targets,
+                                   my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
+        if (threadIdx.x == 0) nll_acc += nll;
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) loss_part[cta] = nll_acc;
+    bar.sync();   // B1: all acts (X + dY) + LN-vec partials complete
+
+    // ── P2: assemble all 30 grads into `grad`. dW output-stationary (gt %
+    //    nCTA), biases, embedding owner-scan, LN-vec reduce. No partials. The 9
+    //    dW specs are built into SHARED smem (thread 0; identical for all) so the
+    //    9-spec array is NOT on every thread's stack (shrinks the launch's local
+    //    reservation — the persistent kernel must place on a memory-tight GPU). ──
+    if (threadIdx.x == 0) dectc::dectc_build_dw_specs(acts, B, T, sm.spec);
+    __syncthreads();
+    dectc::DecDwSpec* spec = sm.spec;
+    const int n_dw = dectc::dectc_dw_total_tiles<SG_TUNED_TILE_N>(spec);
+    for (int gt = cta; gt < n_dw; gt += nCTA)
+        dectc::dectc_dw_run_tile<SG_TUNED_TILE_N>(spec, gt, grad, sm.sA, sm.sB);
+    dectc::dectc_dw_biases(spec, grad);
+    dectc::dectc_embed_owner_scan(acts, tok.tokens, T, grad, cta, nCTA);
+    dectc::dectc_lnvec_reduce(lnvec_base, grad, nCTA, cta);
+    // Loss reduce (fp64) by CTA 0.
+    if (cta == 0 && threadIdx.x == 0) {
+        double s = 0.0;
+        for (int c = 0; c < nCTA; ++c) s += (double)loss_part[c];
+        *tok.loss_out = (float)(s / (double)B);
+    }
+    (void)loss_out;
+    bar.sync_reset(ctx.g_next_task);   // B2: reduced grad ready; reset queue
+
+    // ── P3: scalar optimizer tail over the reduced grad (REUSED verbatim). ──
+    st.lr = lr;
+    {
+        __shared__ int task_slot;
+        TaskQueue q = ctx.queue();
+        for (int t = q.next_block(&task_slot); t < kDecNumTensors;
+             t = q.next_block(&task_slot)) {
+            const int n = kDecSizes[t];
+            const int64_t off = (int64_t)kDecOffsets[t];
+            const FusedOptState ts = rebase_state<Opt>(st, off);
+            float* __restrict__ p = params + off;
+            const float* __restrict__ gg = grad + off;
+            for (int i = threadIdx.x; i < n; i += blockDim.x)
+                apply_optimizer<Opt>(p, gg, (int64_t)i, step, ts);
+        }
+    }
+}
+
+// ncta_cap (default 0): if >0, launch min(n_sms, ncta_cap) CTAs instead of one
+// per SM. The grid barrier rendezvous is over the LAUNCHED count (ctx.n_ctas),
+// so any cap is hang-safe as long as the workspace + dW-tile/embedding ownership
+// use the SAME nCTA (they read ctx.n_ctas). The shipped path passes 0 (full
+// saturation); a memory-constrained TEST passes a small cap so the per-CTA
+// scratch fits (the scratch is nCTA×slab). Determinism is preserved per fixed
+// nCTA (the dW/embedding owner maps are functions of nCTA).
+template <OptId Opt>
+cudaError_t launch_fused_decoder_megakernel_tc(
+        PersistentContext ctx, float* params, DecoderTokenCtx tok,
+        float* grad, float lr, int step, FusedOptState st, cudaStream_t stream,
+        int ncta_cap = 0) {
+    int dev = 0;
+    cudaError_t err = cudaGetDevice(&dev);
+    if (err != cudaSuccess) return err;
+    int n_sms = 0;
+    err = cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, dev);
+    if (err != cudaSuccess) return err;
+
+    // Hang-freedom: certify one block/SM occupancy with the ACTUAL dynamic smem
+    // (0 here — DecTcSmem is static). If the static smem + 200-reg consumer
+    // can't place one block/SM, REFUSE (the grid barrier would hang).
+    int occ = 0;
+    err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &occ, (const void*)&fused_decoder_megakernel_tc<Opt>, SG_TC_MEGA_BLOCK,
+        /*dynamicSMemBytes=*/0);
+    if (err != cudaSuccess) return err;
+    if (occ < 1) return cudaErrorLaunchOutOfResources;
+
+    unsigned launch_ctas = (unsigned)n_sms;
+    if (ncta_cap > 0 && (unsigned)ncta_cap < launch_ctas) launch_ctas = (unsigned)ncta_cap;
+    ctx.n_ctas = launch_ctas;
+    // B%16 required (the dW K-loop contracts K=T=B*kSeq and K=B in 16-step atoms).
+    if ((tok.B % 16) != 0) return cudaErrorInvalidValue;
+
+    if (ctx.g_arrived) { err = cudaMemsetAsync(ctx.g_arrived, 0, sizeof(unsigned), stream); if (err) return err; }
+    if (ctx.g_generation) { err = cudaMemsetAsync(ctx.g_generation, 0, sizeof(unsigned), stream); if (err) return err; }
+    if (ctx.g_next_task) { err = cudaMemsetAsync(ctx.g_next_task, 0, sizeof(int), stream); if (err) return err; }
+
+    dim3 grid(launch_ctas), block(SG_TC_MEGA_BLOCK);
+    fused_decoder_megakernel_tc<Opt><<<grid, block, 0, stream>>>(
+        ctx, params, tok, grad, lr, step, st);
+    return cudaGetLastError();
+}
+
+#endif  // SG_TUNED_GEMM_IMPL == SG_GEMM_IMPL_WGMMA
 
 }}} // namespace sg::fused::sm90
 

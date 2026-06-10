@@ -271,6 +271,862 @@ __device__ void tc_gemm_block_unpipelined(
 #endif
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  THIN ORIENTATION WRAPPERS over tc_gemm_block_unpipelined. These reproduce
+//  the THREE accessor patterns the engine is silicon-validated on
+//  (decoder_tc_selftest.cu / test_decoder_tc.py 13/13): fwd (Y=X·Wᵀ, no
+//  transpose), dX (dX=dY·W, W transposed-staged), dW (dW=dYᵀ·X, BOTH
+//  transposed-staged, K=T). The driver calls THESE — it never re-derives the
+//  staging (the no-suppression / reuse-the-validated-unit discipline).
+//
+//  All operands are HBM bf16 row-major. The caller passes one A(64×16) + one
+//  B(Nmax×16) smem staging pair (the engine reuses them across k-steps). N is
+//  the compile-time wgmma atom width (128 for in/out/ff dX-N=d; the fwd loops
+//  N-tiles internally). Accumulation is fp32; output written via the accessor.
+// ════════════════════════════════════════════════════════════════════════
+
+// (fwd) Y[M,Nout] = X[M,Kin] @ W[Nout,Kin]ᵀ.  Tiles N over [0,Nout) in width-N
+// atoms (Nout∈{d=128, 3d=384, dff=512}). M = kTileM (kAtomsM stacked atoms).
+// Y is written row-major [M, Nout] at base `Yout` with row stride Nout.
+// NOTE on weights: the params blob is fp32; the wgmma engine needs bf16 B
+// operands. We convert ON READ in the accessor (`__float2bfloat16(W[...])`) —
+// deterministic, so every read yields the same bf16 (determinism-safe), and it
+// needs NO bf16 weight buffer or cross-CTA conversion phase. Cost: weight bytes
+// read as fp32 (2×) in fwd/dX — a perf-phase optimization, not a correctness gate.
+template <int N>
+__device__ __forceinline__ void dectc_gemm_fwd(
+        const __nv_bfloat16* __restrict__ X, const float* __restrict__ W,
+        __nv_bfloat16* __restrict__ Yout, int Kin, int Nout,
+        __nv_bfloat16* sA, __nv_bfloat16* sB) {
+    const int k_steps = Kin / wgs::kWgmmaAtomK;
+    for (int n0 = 0; n0 < Nout; n0 += N) {
+        const int n_real = (Nout - n0) < N ? (Nout - n0) : N;
+        auto srcA = [&] (int m, int k) -> __nv_bfloat16 { return X[(int64_t)m * Kin + k]; };
+        auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
+            int nn = n0 + n; return nn < Nout ? __float2bfloat16(W[(int64_t)nn * Kin + k]) : __float2bfloat16(0.f); };
+        auto out  = [&] (int m, int n, float v) {
+            Yout[(int64_t)m * Nout + n0 + n] = __float2bfloat16(v); };
+        tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
+            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB);
+    }
+}
+
+// Same as dectc_gemm_fwd but emits the fp32 result (no bf16 round) — for the
+// few fwd outputs consumed by fp32 elementwise stages directly. Writes [M,Nout]
+// fp32 at `Yf32`.
+template <int N>
+__device__ __forceinline__ void dectc_gemm_fwd_f32(
+        const __nv_bfloat16* __restrict__ X, const float* __restrict__ W,
+        float* __restrict__ Yf32, int Kin, int Nout,
+        __nv_bfloat16* sA, __nv_bfloat16* sB) {
+    const int k_steps = Kin / wgs::kWgmmaAtomK;
+    for (int n0 = 0; n0 < Nout; n0 += N) {
+        const int n_real = (Nout - n0) < N ? (Nout - n0) : N;
+        auto srcA = [&] (int m, int k) -> __nv_bfloat16 { return X[(int64_t)m * Kin + k]; };
+        auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
+            int nn = n0 + n; return nn < Nout ? __float2bfloat16(W[(int64_t)nn * Kin + k]) : __float2bfloat16(0.f); };
+        auto out  = [&] (int m, int n, float v) { Yf32[(int64_t)m * Nout + n0 + n] = v; };
+        tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
+            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB);
+    }
+}
+
+// (dX) dX[M,Kin] = dY[M,Nout] @ W[Nout,Kin].  N(wgmma) = Kin (the in_dim, tiled
+// by width N). K = Nout (the contracted out_dim). W is staged transposed:
+// srcB(n=kin, k=out) = W[out·Kin + kin] (fp32 → bf16 on read). Writes fp32 dX
+// [M,Kin] (LN/elementwise bwd consume it fp32).
+template <int N>
+__device__ __forceinline__ void dectc_gemm_dx_f32(
+        const __nv_bfloat16* __restrict__ dY, const float* __restrict__ W,
+        float* __restrict__ dXf32, int Kin, int Nout,
+        __nv_bfloat16* sA, __nv_bfloat16* sB) {
+    const int k_steps = Nout / wgs::kWgmmaAtomK;
+    for (int n0 = 0; n0 < Kin; n0 += N) {
+        const int n_real = (Kin - n0) < N ? (Kin - n0) : N;
+        auto srcA = [&] (int m, int k) -> __nv_bfloat16 { return dY[(int64_t)m * Nout + k]; };
+        // B[n=kin, k=out] = W[out, kin]  (transposed read; fp32 → bf16).
+        auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
+            int nn = n0 + n; return nn < Kin ? __float2bfloat16(W[(int64_t)k * Kin + nn]) : __float2bfloat16(0.f); };
+        auto out  = [&] (int m, int n, float v) { dXf32[(int64_t)m * Kin + n0 + n] = v; };
+        tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/kAtomsM>(
+            0, kAtomsM, n_real, k_steps, srcA, srcB, out, sA, sB);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Per-CTA TILE SCRATCH (HBM). One tile's forward intermediates the backward
+//  reads, reused across the tiles a CTA grid-strides over (a CTA finishes a
+//  tile's fwd+bwd before the next tile, so one slab per CTA suffices). Sized
+//  for kTileM rows. The X-inputs / dY-adjoints that OTHER CTAs read in P2's dW
+//  do NOT live here — they live in the full-T DecActs (cross-CTA). This holds
+//  only the within-tile fwd state + the running adjoint so the backward needs
+//  NO recompute.
+//
+//  DEDICATED, NON-ALIASED buffers (the TC test sizes its own workspace; HBM is
+//  NOT scarce, so hand-managed aliasing — the stride/alias bug class that bit
+//  the scalar path at model_stages_decoder.cuh:619-625, which the CPU mirror
+//  does NOT cover for tile-batched reuse — is avoided entirely). Each fp32
+//  intermediate gets its own slot.
+// ════════════════════════════════════════════════════════════════════════
+
+// nSamp samples per tile, H*S*S attention entries each; V logits each.
+constexpr int kNSampPerTile  = kTileM / dec::kSeq;
+constexpr int kAttnPerTile   = kNSampPerTile * dec::kHeads * dec::kSeq * dec::kSeq;
+constexpr int kLogitsPerTile = kNSampPerTile * dec::kVocab;
+
+// CRITICAL: the forward runs ALL layers, THEN the backward runs ALL layers (NOT
+// interleaved per-layer). So every forward intermediate the backward reads PER
+// LAYER must be stored PER LAYER — a single-buffered cache holds only the LAST
+// layer's values and the earlier layers' backward reads garbage (the "forward
+// exact, layer-0 grads wrong, error compounds backward" bug). qkv / ff0pre /
+// attn / n1·n2 LN caches are therefore [kLayers]-indexed. fnx/fni (final norm,
+// one instance) + the transient dh/x1/finalin/logits/work/work2/dsc stay single.
+struct DecTileScratch {
+    __nv_bfloat16* qkv[dec::kLayers];     // [kTileM, 3d]  per layer
+    __nv_bfloat16* ff0pre[dec::kLayers];  // [kTileM, dff] per layer
+    float* attn[dec::kLayers];            // [kAttnPerTile] per layer
+    float* n1x[dec::kLayers]; float* n1i[dec::kLayers];
+    float* n2x[dec::kLayers]; float* n2i[dec::kLayers];
+    float* dsc;             // [kAttnPerTile] attention dscores (transient, bwd-only)
+    float* fnx; float* fni; // final-norm LN caches (single)
+    float* dh;              // [kTileM, d]    running adjoint wrt block output
+    float* x1;              // [kTileM, d]    n1 output (fp32, residual base for r2)
+    float* finalin;         // [kTileM, d]    last-layer n2 output (fp32, head input)
+    float* logits;          // [kLogitsPerTile] per-sample last-pos logits (fp32)
+    float* work;            // [kTileM, dff]  GEMM output / general fp32 scratch
+    float* work2;           // [kTileM, dff]  second fp32 scratch (bwd dx1/dqkv)
+};
+
+// Bytes one CTA's scratch occupies (for host sizing of the workspace tail).
+__host__ __device__ __forceinline__ int64_t dec_tile_scratch_bf16_count() {
+    // (qkv + ff0pre) per layer.
+    return (int64_t)dec::kLayers * ((int64_t)kTileM * 3 * dec::kD + (int64_t)kTileM * dec::kDff);
+}
+__host__ __device__ __forceinline__ int64_t dec_tile_scratch_f32_count() {
+    return (int64_t)dec::kLayers * (                     // per-layer:
+             (int64_t)kAttnPerTile                       //   attn
+           + 2 * ((int64_t)kTileM * dec::kD + kTileM))    //   n1+n2 xhat+inv
+         + (int64_t)kAttnPerTile                          // dsc (single)
+         + ((int64_t)kTileM * dec::kD + kTileM)           // fn xhat+inv (single)
+         + (int64_t)kTileM * dec::kD                      // dh
+         + (int64_t)kTileM * dec::kD                      // x1
+         + (int64_t)kTileM * dec::kD                      // finalin
+         + (int64_t)kLogitsPerTile                        // logits
+         + 2 * (int64_t)kTileM * dec::kDff;               // work + work2
+}
+__host__ __device__ __forceinline__ int64_t dec_tile_scratch_total_f32() {
+    return (dec_tile_scratch_bf16_count() + 1) / 2 + dec_tile_scratch_f32_count();
+}
+
+__device__ __forceinline__ DecTileScratch dec_tile_scratch_bind(float* slab) {
+    DecTileScratch s;
+    __nv_bfloat16* b = reinterpret_cast<__nv_bfloat16*>(slab);
+    int64_t bo = 0;
+    for (int li = 0; li < dec::kLayers; ++li) { s.qkv[li]    = b + bo; bo += (int64_t)kTileM * 3 * dec::kD; }
+    for (int li = 0; li < dec::kLayers; ++li) { s.ff0pre[li] = b + bo; bo += (int64_t)kTileM * dec::kDff; }
+    float* f = slab + (dec_tile_scratch_bf16_count() + 1) / 2;
+    int64_t fo = 0;
+    for (int li = 0; li < dec::kLayers; ++li) { s.attn[li] = f + fo; fo += kAttnPerTile; }
+    for (int li = 0; li < dec::kLayers; ++li) { s.n1x[li] = f + fo; fo += (int64_t)kTileM * dec::kD; s.n1i[li] = f + fo; fo += kTileM; }
+    for (int li = 0; li < dec::kLayers; ++li) { s.n2x[li] = f + fo; fo += (int64_t)kTileM * dec::kD; s.n2i[li] = f + fo; fo += kTileM; }
+    s.dsc  = f + fo; fo += kAttnPerTile;
+    s.fnx  = f + fo; fo += (int64_t)kTileM * dec::kD;
+    s.fni  = f + fo; fo += kTileM;
+    s.dh   = f + fo; fo += (int64_t)kTileM * dec::kD;
+    s.x1   = f + fo; fo += (int64_t)kTileM * dec::kD;
+    s.finalin = f + fo; fo += (int64_t)kTileM * dec::kD;
+    s.logits  = f + fo; fo += kLogitsPerTile;
+    s.work    = f + fo; fo += (int64_t)kTileM * dec::kDff;
+    s.work2   = f + fo; fo += (int64_t)kTileM * dec::kDff;
+    return s;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  TILE-AWARE SCALAR ELEMENTWISE STAGES (fp32, CTA-cooperative over kTileM
+//  rows). These mirror the scalar oracle's per-row math (model_stages_decoder
+//  .cuh) but operate on a whole tile of `nrows` rows at once, reading/writing
+//  HBM [rows×width] buffers. Reductions reuse the validated dec_block_sum /
+//  dec_block_max helpers (whole-block, looped per row — LN/softmax are ≪1% of
+//  FLOPs, so the sequential row loop is not a bottleneck). `red` is a 256-float
+//  smem reduction slot (from the engine's smem arena).
+// ════════════════════════════════════════════════════════════════════════
+
+// LayerNorm fwd over the last dim d, for `nrows` rows. y, xhat are fp32 HBM
+// [rows×d]; inv is fp32 HBM [rows]. gamma/beta are fp32 [d] (params). Caches
+// xhat+inv for the bwd (identical to dec_layernorm_fwd but tiled).
+__device__ __forceinline__ void dectc_ln_fwd_tile(
+        const float* __restrict__ x, const float* __restrict__ gamma,
+        const float* __restrict__ beta, int nrows,
+        float* __restrict__ y, float* __restrict__ xhat, float* __restrict__ inv,
+        float* red) {
+    for (int s = 0; s < nrows; ++s) {
+        const float* xr = x + (int64_t)s * dec::kD;
+        float sum = 0.0f;
+        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) sum += xr[j];
+        float mean = dec_block_sum(sum, red) / (float)dec::kD;
+        float vs = 0.0f;
+        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) { float c = xr[j] - mean; vs += c * c; }
+        float var = dec_block_sum(vs, red) / (float)dec::kD;
+        float iv = rsqrtf(var + dec::kLnEps);
+        if (threadIdx.x == 0) inv[s] = iv;
+        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
+            float xh = (xr[j] - mean) * iv;
+            xhat[(int64_t)s * dec::kD + j] = xh;
+            y[(int64_t)s * dec::kD + j] = xh * gamma[j] + beta[j];
+        }
+        __syncthreads();
+    }
+}
+
+// LayerNorm bwd for `nrows` rows: dy [rows×d] fp32, cached xhat/inv → dx [rows×d]
+// fp32; ACCUMULATES dgamma/dbeta (summed over the tile's rows) into a per-CTA
+// LN-vec partial slot gw/gb [d] (plain += : single owner thread per feature j
+// across rows, deterministic — same rule as the scalar dec_layernorm_bwd).
+__device__ __forceinline__ void dectc_ln_bwd_tile(
+        const float* __restrict__ dy, const float* __restrict__ xhat,
+        const float* __restrict__ inv, const float* __restrict__ gamma, int nrows,
+        float* __restrict__ dx, float* __restrict__ gw, float* __restrict__ gb,
+        float* red) {
+    for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
+        float dgw = 0.0f, dgb = 0.0f;
+        for (int s = 0; s < nrows; ++s) {
+            float d = dy[(int64_t)s * dec::kD + j];
+            dgb += d; dgw += d * xhat[(int64_t)s * dec::kD + j];
+        }
+        gw[j] += dgw; gb[j] += dgb;
+    }
+    for (int s = 0; s < nrows; ++s) {
+        const float* dyr = dy + (int64_t)s * dec::kD;
+        const float* xhr = xhat + (int64_t)s * dec::kD;
+        float sda = 0.0f, sdax = 0.0f;
+        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
+            float dxhat = dyr[j] * gamma[j]; sda += dxhat; sdax += dxhat * xhr[j];
+        }
+        sda = dec_block_sum(sda, red);
+        sdax = dec_block_sum(sdax, red);
+        float iv = inv[s];
+        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
+            float dxhat = dyr[j] * gamma[j];
+            dx[(int64_t)s * dec::kD + j] = iv * (dxhat - (sda + xhr[j] * sdax) / (float)dec::kD);
+        }
+        __syncthreads();
+    }
+}
+
+// Per-sample causal self-attention FORWARD over a tile. qkv is bf16 HBM
+// [rows×3d] (q|k|v). Writes ctx fp32 HBM [rows×d] and attn weights fp32 to
+// `attn_w` [nSamp×H×S×S]. Each (sample,head,qpos) row is owned by one thread —
+// identical math to dec_forward_sample's attention block, looped over samples.
+__device__ __forceinline__ void dectc_attn_fwd_tile(
+        const __nv_bfloat16* __restrict__ qkv, int nrows,
+        float* __restrict__ ctx, float* __restrict__ attn_w) {
+    const int nsamp = nrows / dec::kSeq;
+    const float scale = dec::attn_scale();
+    const int rows_per = nsamp * dec::kHeads * dec::kSeq;   // (sample,head,qpos)
+    for (int r = threadIdx.x; r < rows_per; r += blockDim.x) {
+        const int si = r / (dec::kHeads * dec::kSeq);
+        const int rem = r % (dec::kHeads * dec::kSeq);
+        const int hh = rem / dec::kSeq, qi = rem % dec::kSeq;
+        const int qoff = hh * dec::kDhead;
+        const int rbase = si * dec::kSeq;        // first row of this sample
+        const __nv_bfloat16* qrow = qkv + (int64_t)(rbase + qi) * 3 * dec::kD + qoff;
+        float maxs = -CUDART_INF_F; float sc[dec::kSeq];
+        #pragma unroll
+        for (int kj = 0; kj < dec::kSeq; ++kj) {
+            if (kj > qi) { sc[kj] = -CUDART_INF_F; continue; }
+            const __nv_bfloat16* krow = qkv + (int64_t)(rbase + kj) * 3 * dec::kD + dec::kD + qoff;
+            float dot = 0.0f;
+            #pragma unroll
+            for (int t = 0; t < dec::kDhead; ++t)
+                dot += __bfloat162float(qrow[t]) * __bfloat162float(krow[t]);
+            sc[kj] = dot * scale; maxs = fmaxf(maxs, sc[kj]);
+        }
+        float denom = 0.0f;
+        #pragma unroll
+        for (int kj = 0; kj < dec::kSeq; ++kj) {
+            float e = (kj <= qi) ? __expf(sc[kj] - maxs) : 0.0f; sc[kj] = e; denom += e;
+        }
+        float invd = 1.0f / denom;
+        float* aw = attn_w + ((int64_t)(si * dec::kHeads + hh) * dec::kSeq + qi) * dec::kSeq;
+        #pragma unroll
+        for (int kj = 0; kj < dec::kSeq; ++kj) aw[kj] = sc[kj] * invd;
+        #pragma unroll
+        for (int t = 0; t < dec::kDhead; ++t) {
+            float acc = 0.0f;
+            #pragma unroll
+            for (int kj = 0; kj <= qi; ++kj) {
+                float vv = __bfloat162float(qkv[(int64_t)(rbase + kj) * 3 * dec::kD + 2 * dec::kD + qoff + t]);
+                acc += aw[kj] * vv;
+            }
+            ctx[(int64_t)(rbase + qi) * dec::kD + qoff + t] = acc;
+        }
+    }
+    __syncthreads();
+}
+
+// Global SAMPLE index of the si-th sample in a tile whose first token row is g0.
+__device__ __forceinline__ int si_global(int g0, int si) { return g0 / dec::kSeq + si; }
+
+// ════════════════════════════════════════════════════════════════════════
+//  FORWARD over one TOKEN TILE (nrows = nsamp samples × kSeq positions), global
+//  token rows [g0, g0+nrows). Tile-batched: the four per-layer linears
+//  (in_proj/out_proj/ff0/ff2) run on wgmma (M=nrows, N-tiled); attention/LN/
+//  GELU are scalar fp32 over the tile; head/CE are scalar per-sample (M=nsamp<
+//  64). Writes the DecActs X-inputs (bf16 dW operands), the per-CTA tile scratch
+//  (qkv/ff0pre/attn/LN caches/x1/finalin/logits the bwd needs), and returns the
+//  tile's summed NLL (thread 0 holds it). `tok_ids`/`tgt_ids` are HBM int32.
+//
+//  DATAFLOW (DecActs X-regions = bf16 dW operands AND inter-stage operands;
+//  dedicated fp32 scratch for residuals/LN; weights convert fp32→bf16 on read):
+//    X_in[li]  := layer input (bf16)           [embedding for li=0]
+//    qkv(bf16) := X_in @ in_w^T
+//    ctx       := attn(qkv) → X_ctx[li] (bf16, out_proj input + dW operand)
+//    a(work)   := X_ctx @ out_w^T ; r1=X_in+a (work); n1(r1)→x1(fp32)→X_x1[li]
+//    ff0(work) := X_x1 @ ff0_w^T → ff0pre(bf16); gelu→X_gact[li](bf16)
+//    ff2(work) := X_gact @ ff2_w^T ; r2=x1+ff2 (work); n2(r2)→X_in[li+1]
+//                 (last layer: n2→finalin fp32, the head input)
+// ════════════════════════════════════════════════════════════════════════
+__device__ float dectc_forward_tile(
+        const DecWeights& w, int g0, int nrows, const DecActs& acts,
+        const DecTileScratch& sc, const int* __restrict__ tok_ids,
+        const int* __restrict__ tgt_ids,
+        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
+    const int nsamp = nrows / dec::kSeq;
+    // ── Embedding: X_in[0][r] = tok[token_id[g0+r]] + pos[(g0+r)%S]. bf16. ──
+    for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+        const int r = idx / dec::kD, j = idx % dec::kD;
+        const int g = g0 + r;
+        const int tid = tok_ids[g];
+        const int sp = g % dec::kSeq;            // position within the sample
+        float v = w.tok[(int64_t)tid * dec::kD + j] + w.pos[(int64_t)sp * dec::kD + j];
+        acts.X_in[0][(int64_t)g * dec::kD + j] = __float2bfloat16(v);
+    }
+    __syncthreads();
+
+    for (int li = 0; li < dec::kLayers; ++li) {
+        const DecWeights::Layer& L = w.layer[li];
+        const __nv_bfloat16* Xin = acts.X_in[li] + (int64_t)g0 * dec::kD;        // [nrows,d]
+        // qkv = Xin @ in_w^T   (N=3d, K=d). bf16 → scratch.qkv[li].
+        dectc_gemm_fwd<SG_TUNED_TILE_N>(Xin, L.in_w, sc.qkv[li], dec::kD, 3 * dec::kD, sA, sB);
+        __syncthreads();
+        // attention → ctx (work fp32) + attn[li] weights.
+        dectc_attn_fwd_tile(sc.qkv[li], nrows, sc.work, sc.attn[li]);
+        // ctx bf16 → X_ctx[li] (out_proj input + its dW operand).
+        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+            const int r = idx / dec::kD, j = idx % dec::kD;
+            acts.X_ctx[li][(int64_t)(g0 + r) * dec::kD + j] = __float2bfloat16(sc.work[(int64_t)r * dec::kD + j]);
+        }
+        __syncthreads();
+        // a = X_ctx @ out_w^T  (N=d, K=d). fp32 → work.
+        dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_ctx[li] + (int64_t)g0 * dec::kD, L.out_w,
+                                            sc.work, dec::kD, dec::kD, sA, sB);
+        __syncthreads();
+        // r1 = Xin + a → work (fp32, overwrite a in place row-by-row safe: same index).
+        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+            const int r = idx / dec::kD, j = idx % dec::kD;
+            sc.work[(int64_t)r * dec::kD + j] += __bfloat162float(Xin[(int64_t)r * dec::kD + j]);
+        }
+        __syncthreads();
+        // n1(r1) → x1 (fp32) + caches[li]; then bf16 → X_x1[li] (ff0 input + dW operand).
+        dectc_ln_fwd_tile(sc.work, L.n1_w, L.n1_b, nrows, sc.x1, sc.n1x[li], sc.n1i[li], red);
+        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+            const int r = idx / dec::kD, j = idx % dec::kD;
+            acts.X_x1[li][(int64_t)(g0 + r) * dec::kD + j] = __float2bfloat16(sc.x1[(int64_t)r * dec::kD + j]);
+        }
+        __syncthreads();
+        // ff0 = X_x1 @ ff0_w^T  (N=dff, K=d). fp32 → work; pre-gelu bf16 → ff0pre;
+        // gelu → X_gact[li] (bf16, ff2 input + dW operand).
+        dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_x1[li] + (int64_t)g0 * dec::kD, L.ff0_w,
+                                            sc.work, dec::kD, dec::kDff, sA, sB);
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < nrows * dec::kDff; idx += blockDim.x) {
+            const int r = idx / dec::kDff, j = idx % dec::kDff;
+            float pre = sc.work[(int64_t)r * dec::kDff + j];
+            sc.ff0pre[li][(int64_t)r * dec::kDff + j] = __float2bfloat16(pre);
+            acts.X_gact[li][(int64_t)(g0 + r) * dec::kDff + j] = __float2bfloat16(dec_gelu(pre));
+        }
+        __syncthreads();
+        // ff2 = X_gact @ ff2_w^T (N=d, K=dff). fp32 → work.
+        dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_gact[li] + (int64_t)g0 * dec::kDff, L.ff2_w,
+                                            sc.work, dec::kDff, dec::kD, sA, sB);
+        __syncthreads();
+        // r2 = x1 + ff2 → work (fp32). x1 lives in the dedicated fp32 buffer (no bf16 round).
+        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+            const int r = idx / dec::kD, j = idx % dec::kD;
+            sc.work[(int64_t)r * dec::kD + j] += sc.x1[(int64_t)r * dec::kD + j];
+        }
+        __syncthreads();
+        if (li + 1 < dec::kLayers) {
+            // n2(r2) → finalin (fp32 reused) + n2 caches[li]; bf16 → X_in[li+1].
+            dectc_ln_fwd_tile(sc.work, L.n2_w, L.n2_b, nrows, sc.finalin, sc.n2x[li], sc.n2i[li], red);
+            for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+                const int r = idx / dec::kD, j = idx % dec::kD;
+                acts.X_in[li + 1][(int64_t)(g0 + r) * dec::kD + j] = __float2bfloat16(sc.finalin[(int64_t)r * dec::kD + j]);
+            }
+            __syncthreads();
+        } else {
+            // last layer: n2(r2) → finalin (fp32, all positions; head reads last pos) + n2 caches[li].
+            dectc_ln_fwd_tile(sc.work, L.n2_w, L.n2_b, nrows, sc.finalin, sc.n2x[li], sc.n2i[li], red);
+        }
+    }
+
+    // ── Final norm + head + CE, scalar PER-SAMPLE on the LAST position only.
+    //    finalin holds the last-layer n2 output [nrows,d] fp32. ──
+    float nll_acc = 0.0f;
+    for (int si = 0; si < nsamp; ++si) {
+        const int rlast = si * dec::kSeq + (dec::kSeq - 1);
+        const float* hlast = sc.finalin + (int64_t)rlast * dec::kD;
+        float sum = 0.0f;
+        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) sum += hlast[j];
+        float mean = dec_block_sum(sum, red) / (float)dec::kD;
+        float vs = 0.0f;
+        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) { float c = hlast[j] - mean; vs += c * c; }
+        float var = dec_block_sum(vs, red) / (float)dec::kD;
+        float iv = rsqrtf(var + dec::kLnEps);
+        if (threadIdx.x == 0) sc.fni[rlast] = iv;
+        // fn_xhat cache (last row); hn → X_hn (bf16 head dW operand) AND reuse the
+        // X_hn bf16 as the scalar head input (read back below).
+        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
+            float xh = (hlast[j] - mean) * iv;
+            sc.fnx[(int64_t)rlast * dec::kD + j] = xh;
+            float hn = xh * w.norm_w[j] + w.norm_b[j];
+            acts.X_hn[(int64_t)si_global(g0, si) * dec::kD + j] = __float2bfloat16(hn);
+        }
+        __syncthreads();
+        // logits[o] = hn · out_w[o] + out_b[o]  (scalar; hn read from X_hn bf16 so the
+        // head input == the head dW operand exactly). Store into sc.logits[si*V..].
+        float* lg = sc.logits + (int64_t)si * dec::kVocab;
+        const __nv_bfloat16* hnb = acts.X_hn + (int64_t)si_global(g0, si) * dec::kD;
+        for (int o = threadIdx.x; o < dec::kVocab; o += blockDim.x) {
+            const float* Wr = w.out_w + (int64_t)o * dec::kD;
+            float acc = w.out_b[o];
+            #pragma unroll 4
+            for (int k = 0; k < dec::kD; ++k) acc += __bfloat162float(hnb[k]) * Wr[k];
+            lg[o] = acc;
+        }
+        __syncthreads();
+        int tgt = tgt_ids[si_global(g0, si)];
+        float lmax = -CUDART_INF_F;
+        for (int o = threadIdx.x; o < dec::kVocab; o += blockDim.x) lmax = fmaxf(lmax, lg[o]);
+        lmax = dec_block_max(lmax, red);
+        float es = 0.0f;
+        for (int o = threadIdx.x; o < dec::kVocab; o += blockDim.x) es += __expf(lg[o] - lmax);
+        es = dec_block_sum(es, red);
+        float logz = lmax + __logf(es);
+        if (threadIdx.x == 0) nll_acc += (logz - lg[tgt]);
+        __syncthreads();
+    }
+    return nll_acc;
+}
+
+// Attention BACKWARD over a tile (the oracle's 3-pass form, tile-batched).
+// Reads qkv (bf16), attn weights, and dctx [nrows,d] fp32; writes dqkv [nrows,3d]
+// fp32 into `dqkv_out`. dsc is the per-CTA dscores scratch. Mirror of
+// dec_backward_sample's attention block (A: dv, B: dscores, C: dq/dk), looped
+// over the tile's samples. scale = 1/sqrt(dh).
+__device__ __forceinline__ void dectc_attn_bwd_tile(
+        const __nv_bfloat16* __restrict__ qkv, const float* __restrict__ attn_w,
+        const float* __restrict__ dctx, int nrows,
+        float* __restrict__ dqkv_out, float* __restrict__ dsc) {
+    const int nsamp = nrows / dec::kSeq;
+    const float scale = dec::attn_scale();
+    // A: dv[kj] = Σ_{qi>=kj} attn[qi,kj] * dctx[qi].  Owner: (sample,kj,head,t).
+    for (int r = threadIdx.x; r < nsamp * dec::kSeq * dec::kHeads * dec::kDhead; r += blockDim.x) {
+        const int si  = r / (dec::kSeq * dec::kHeads * dec::kDhead);
+        int rem = r % (dec::kSeq * dec::kHeads * dec::kDhead);
+        const int kj  = rem / (dec::kHeads * dec::kDhead);
+        rem = rem % (dec::kHeads * dec::kDhead);
+        const int hh  = rem / dec::kDhead, t = rem % dec::kDhead;
+        const int qoff = hh * dec::kDhead;
+        const int rbase = si * dec::kSeq;
+        const float* aw = attn_w + ((int64_t)(si * dec::kHeads + hh) * dec::kSeq) * dec::kSeq;  // [S,S]
+        float acc = 0.0f;
+        #pragma unroll
+        for (int qi = kj; qi < dec::kSeq; ++qi)
+            acc += aw[qi * dec::kSeq + kj] * dctx[(int64_t)(rbase + qi) * dec::kD + qoff + t];
+        dqkv_out[(int64_t)(rbase + kj) * 3 * dec::kD + 2 * dec::kD + qoff + t] = acc;   // dv block
+    }
+    __syncthreads();
+    // B: dscores ds[qi,kj] = attn*(datt - Σ_k datt*attn)*scale, masked kj>qi → 0.
+    //    datt[kj] = Σ_t dctx[qi,qoff+t]*v[kj,qoff+t]. Owner: (sample,head,qi).
+    for (int r = threadIdx.x; r < nsamp * dec::kHeads * dec::kSeq; r += blockDim.x) {
+        const int si = r / (dec::kHeads * dec::kSeq);
+        int rem = r % (dec::kHeads * dec::kSeq);
+        const int hh = rem / dec::kSeq, qi = rem % dec::kSeq;
+        const int qoff = hh * dec::kDhead;
+        const int rbase = si * dec::kSeq;
+        const float* aw = attn_w + ((int64_t)(si * dec::kHeads + hh) * dec::kSeq) * dec::kSeq;
+        float datt[dec::kSeq];
+        #pragma unroll
+        for (int kj = 0; kj < dec::kSeq; ++kj) {
+            if (kj > qi) { datt[kj] = 0.0f; continue; }
+            float acc = 0.0f;
+            #pragma unroll
+            for (int t = 0; t < dec::kDhead; ++t)
+                acc += dctx[(int64_t)(rbase + qi) * dec::kD + qoff + t]
+                     * __bfloat162float(qkv[(int64_t)(rbase + kj) * 3 * dec::kD + 2 * dec::kD + qoff + t]);
+            datt[kj] = acc;
+        }
+        float dot = 0.0f;
+        #pragma unroll
+        for (int kj = 0; kj <= qi; ++kj) dot += datt[kj] * aw[qi * dec::kSeq + kj];
+        float* ds = dsc + ((int64_t)(si * dec::kHeads + hh) * dec::kSeq + qi) * dec::kSeq;
+        #pragma unroll
+        for (int kj = 0; kj < dec::kSeq; ++kj) {
+            float a = aw[qi * dec::kSeq + kj];
+            ds[kj] = (kj <= qi) ? a * (datt[kj] - dot) * scale : 0.0f;
+        }
+    }
+    __syncthreads();
+    // C: dq[qi] = Σ_kj ds[qi,kj]*k[kj]; dk[kj] = Σ_qi ds[qi,kj]*q[qi]. Owner: (sample,pos,head,t).
+    for (int r = threadIdx.x; r < nsamp * dec::kSeq * dec::kHeads * dec::kDhead; r += blockDim.x) {
+        const int si = r / (dec::kSeq * dec::kHeads * dec::kDhead);
+        int rem = r % (dec::kSeq * dec::kHeads * dec::kDhead);
+        const int pos = rem / (dec::kHeads * dec::kDhead);
+        rem = rem % (dec::kHeads * dec::kDhead);
+        const int hh = rem / dec::kDhead, t = rem % dec::kDhead;
+        const int qoff = hh * dec::kDhead;
+        const int rbase = si * dec::kSeq;
+        const float* ds = dsc + ((int64_t)(si * dec::kHeads + hh) * dec::kSeq) * dec::kSeq;  // [S,S]
+        float dq = 0.0f, dk = 0.0f;
+        #pragma unroll
+        for (int kj = 0; kj < dec::kSeq; ++kj) {
+            dq += ds[pos * dec::kSeq + kj] * __bfloat162float(qkv[(int64_t)(rbase + kj) * 3 * dec::kD + dec::kD + qoff + t]);
+            dk += ds[kj * dec::kSeq + pos] * __bfloat162float(qkv[(int64_t)(rbase + kj) * 3 * dec::kD + qoff + t]);
+        }
+        dqkv_out[(int64_t)(rbase + pos) * 3 * dec::kD + qoff + t] = dq;             // dq block
+        dqkv_out[(int64_t)(rbase + pos) * 3 * dec::kD + dec::kD + qoff + t] = dk;   // dk block
+    }
+    __syncthreads();
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  BACKWARD over one TOKEN TILE. Assumes dectc_forward_tile ran for THIS tile
+//  (scratch + DecActs X-inputs populated). Fork B: computes dX via wgmma and
+//  WRITES the dY output-adjoints to DecActs (dY_qkv/dY_a/dY_ff0/dY_ff2/
+//  dY_logits) + dh0 for P2's output-stationary dW — it does NOT touch the
+//  weight dW here. ACCUMULATES the 10 LN-vector grads (γ/β) into the per-CTA
+//  LN-vec partials `lnvec` [kNumLnVec × d] (deterministic single-owner-per-j).
+//  `B` is the full batch (CE mean scale). Mirrors dec_backward_sample.
+//
+//  dqkv/dctx/dgact intermediates use the fp32 `work` buffer + a second fp32
+//  buffer `work2` (caller passes both, each [nrows×dff]); dh (running adjoint)
+//  is the dedicated scratch.dh.
+// ════════════════════════════════════════════════════════════════════════
+__device__ void dectc_backward_tile(
+        const DecWeights& w, int g0, int nrows, int B, const DecActs& acts,
+        const DecTileScratch& sc, const int* __restrict__ tgt_ids,
+        float* __restrict__ lnvec, float* __restrict__ work2,
+        __nv_bfloat16* sA, __nv_bfloat16* sB, float* red) {
+    const int nsamp = nrows / dec::kSeq;
+    // LN-vec partial slots (dense order; see kLnVecTensorIdx).
+    float* gn_n1w[dec::kLayers]; float* gn_n1b[dec::kLayers];
+    float* gn_n2w[dec::kLayers]; float* gn_n2b[dec::kLayers];
+    for (int li = 0; li < dec::kLayers; ++li) {
+        gn_n1w[li] = lnvec + (int64_t)(li * 4 + 0) * dec::kD;
+        gn_n1b[li] = lnvec + (int64_t)(li * 4 + 1) * dec::kD;
+        gn_n2w[li] = lnvec + (int64_t)(li * 4 + 2) * dec::kD;
+        gn_n2b[li] = lnvec + (int64_t)(li * 4 + 3) * dec::kD;
+    }
+    float* gn_normw = lnvec + (int64_t)8 * dec::kD;
+    float* gn_normb = lnvec + (int64_t)9 * dec::kD;
+
+    // ── CE bwd (per sample): dlogits = (softmax - onehot)/B, overwrite logits.
+    //    head bwd: dY_logits[si] = dlogits (the head dW operand); dhn = dlogits@out_w.
+    //    final-norm bwd: dh_last (last position only) → scratch.dh (zero others). ──
+    // First zero scratch.dh for the whole tile (only last positions get grad).
+    for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) sc.dh[idx] = 0.0f;
+    __syncthreads();
+    for (int si = 0; si < nsamp; ++si) {
+        const int rlast = si * dec::kSeq + (dec::kSeq - 1);
+        const int gs = si_global(g0, si);
+        float* lg = sc.logits + (int64_t)si * dec::kVocab;
+        int tgt = tgt_ids[gs];
+        // softmax of cached logits.
+        float lmax = -CUDART_INF_F;
+        for (int o = threadIdx.x; o < dec::kVocab; o += blockDim.x) lmax = fmaxf(lmax, lg[o]);
+        lmax = dec_block_max(lmax, red);
+        float es = 0.0f;
+        for (int o = threadIdx.x; o < dec::kVocab; o += blockDim.x) es += __expf(lg[o] - lmax);
+        es = dec_block_sum(es, red);
+        float inv_es = 1.0f / es;
+        // dlogits → overwrite lg, AND write to dY_logits[gs] (bf16, head dW operand).
+        for (int o = threadIdx.x; o < dec::kVocab; o += blockDim.x) {
+            float smo = __expf(lg[o] - lmax) * inv_es;
+            float dl = (smo - ((o == tgt) ? 1.0f : 0.0f)) / (float)B;
+            lg[o] = dl;
+            acts.dY_logits[(int64_t)gs * dec::kVocab + o] = __float2bfloat16(dl);
+        }
+        __syncthreads();
+        // dhn[j] = Σ_o dlogits[o] * out_w[o,j]  (head dX), feature-parallel → dh row rlast.
+        // Then final-norm bwd of that single row → scratch.dh[rlast].
+        // Use fnx cache (xhat) + fni (inv). Accumulate norm γ/β. (head dW is P2.)
+        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
+            float dhn = 0.0f;
+            for (int o = 0; o < dec::kVocab; ++o)
+                dhn += lg[o] * w.out_w[(int64_t)o * dec::kD + j];
+            // final-norm bwd needs the row-reduce of dxhat; stash dhn into work row rlast.
+            sc.work[(int64_t)rlast * dec::kD + j] = dhn;
+        }
+        __syncthreads();
+        // norm γ/β: dnorm_w[j] += dhn*xhat; dnorm_b[j] += dhn. (Only last pos contributes.)
+        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
+            float dhn = sc.work[(int64_t)rlast * dec::kD + j];
+            float xh = sc.fnx[(int64_t)rlast * dec::kD + j];
+            gn_normw[j] += dhn * xh; gn_normb[j] += dhn;
+        }
+        __syncthreads();
+        // LN dx (single row): dxhat=dhn*norm_w; reduce; dh[rlast] = inv*(dxhat-(sda+xhat*sdax)/d).
+        {
+            const float* dyr = sc.work + (int64_t)rlast * dec::kD;
+            const float* xhr = sc.fnx + (int64_t)rlast * dec::kD;
+            float sda = 0.0f, sdax = 0.0f;
+            for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
+                float dxhat = dyr[j] * w.norm_w[j]; sda += dxhat; sdax += dxhat * xhr[j];
+            }
+            sda = dec_block_sum(sda, red); sdax = dec_block_sum(sdax, red);
+            float iv = sc.fni[rlast];
+            for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
+                float dxhat = dyr[j] * w.norm_w[j];
+                sc.dh[(int64_t)rlast * dec::kD + j] = iv * (dxhat - (sda + xhr[j] * sdax) / (float)dec::kD);
+            }
+            __syncthreads();
+        }
+    }
+    // scratch.dh now = grad wrt last-layer output [nrows,d] (only last positions nonzero).
+
+    // ── per-layer backward (reverse). dh is the running adjoint (grad wrt the
+    //    layer's n2 output). All fwd intermediates are in scratch/DecActs (NO
+    //    recompute). ──
+    for (int li = dec::kLayers - 1; li >= 0; --li) {
+        const DecWeights::Layer& L = w.layer[li];
+        // n2 bwd: dh → dr2 (work fp32), accumulate n2 γ/β. xhat=n2x[li], inv=n2i[li].
+        dectc_ln_bwd_tile(sc.dh, sc.n2x[li], sc.n2i[li], L.n2_w, nrows, sc.work, gn_n2w[li], gn_n2b[li], red);
+        // r2 = x1 + ff2 → dx1 = dr2 (residual), dff2 = dr2. dff2 → dY_ff2 acts (bf16).
+        // dx1 starts as dr2 (copy into work2), the FFN path adds to it.
+        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+            work2[idx] = sc.work[idx];   // dx1 := dr2 (residual part)
+            acts.dY_ff2[li][(int64_t)g0 * dec::kD + idx] = __float2bfloat16(sc.work[idx]);  // dff2
+        }
+        __syncthreads();
+        // ff2 dX: dgact = dff2 @ ff2_w  (N=dff, K=d). fp32 → tw? need a [nrows,dff] buffer.
+        //   Use sc.work (currently dr2, no longer needed — dx1 saved in work2, dff2 in acts).
+        dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_ff2[li] + (int64_t)g0 * dec::kD, L.ff2_w,
+                                           sc.work, dec::kDff, dec::kD, sA, sB);  // dgact [nrows,dff]
+        __syncthreads();
+        // dff0 = dgact * gelu'(ff0pre) → dY_ff0 acts (bf16) AND keep fp32 in sc.work for dX.
+        for (int idx = threadIdx.x; idx < nrows * dec::kDff; idx += blockDim.x) {
+            float dff0 = sc.work[idx] * dec_gelu_grad(__bfloat162float(sc.ff0pre[li][idx]));
+            sc.work[idx] = dff0;
+            acts.dY_ff0[li][(int64_t)g0 * dec::kDff + idx] = __float2bfloat16(dff0);
+        }
+        __syncthreads();
+        // ff0 dX: dx1 += dff0 @ ff0_w  (output width Kin=d, contract Nout=dff). fp32
+        //   → sc.x1 (free now — fwd x1 consumed); then add to work2.
+        dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_ff0[li] + (int64_t)g0 * dec::kDff, L.ff0_w,
+                                           sc.x1, /*Kin=*/dec::kD, /*Nout=*/dec::kDff, sA, sB);  // dx1_ffn [nrows,d]
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
+            work2[idx] += sc.x1[idx];   // dx1 = residual + FFN path
+        __syncthreads();
+        // n1 bwd: dx1 (work2) → dr1 (work), accumulate n1 γ/β. xhat=n1x[li], inv=n1i[li].
+        dectc_ln_bwd_tile(work2, sc.n1x[li], sc.n1i[li], L.n1_w, nrows, sc.work, gn_n1w[li], gn_n1b[li], red);
+        // r1 = x_in + a → da = dr1 (out_proj output adjoint), dx_in = dr1 (residual).
+        // SAVE the residual dr1 into sc.dh NOW (dh is free — its grad was consumed into
+        // dr2 at the top of this layer); attention bwd will overwrite work2. Then add the
+        // in_proj dX path to it. da → dY_a acts (bf16, out_proj dW operand).
+        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
+            sc.dh[idx] = sc.work[idx];   // residual dx_in := dr1  (saved across attn bwd)
+            acts.dY_a[li][(int64_t)g0 * dec::kD + idx] = __float2bfloat16(sc.work[idx]);  // da
+        }
+        __syncthreads();
+        // out_proj dX: dctx = da @ out_w  (N=d, K=d). fp32 → sc.work (dctx [nrows,d]).
+        dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_a[li] + (int64_t)g0 * dec::kD, L.out_w,
+                                           sc.work, dec::kD, dec::kD, sA, sB);  // dctx
+        __syncthreads();
+        // attention bwd: (qkv[li], attn[li], dctx=work) → dqkv [nrows,3d] fp32 into
+        //   work2 (3d=384 ≤ dff=512, fits). Then → dY_qkv acts (bf16, in_proj dW operand).
+        dectc_attn_bwd_tile(sc.qkv[li], sc.attn[li], sc.work, nrows, work2, sc.dsc);
+        for (int idx = threadIdx.x; idx < nrows * 3 * dec::kD; idx += blockDim.x)
+            acts.dY_qkv[li][(int64_t)g0 * 3 * dec::kD + idx] = __float2bfloat16(work2[idx]);
+        __syncthreads();
+        // in_proj dX: dx_in_attn = dqkv @ in_w  (output width Kin=d, contract Nout=3d).
+        //   fp32 → sc.work; ADD residual (in sc.dh) → new running adjoint dh.
+        dectc_gemm_dx_f32<SG_TUNED_TILE_N>(acts.dY_qkv[li] + (int64_t)g0 * 3 * dec::kD, L.in_w,
+                                           sc.work, /*Kin=*/dec::kD, /*Nout=*/3 * dec::kD, sA, sB);  // dx_in_attn
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
+            sc.dh[idx] += sc.work[idx];   // dx_in = residual (in dh) + attn path
+        __syncthreads();
+    }
+
+    // ── embedding bwd: dh = grad wrt h0 [nrows,d]. Write dh0 acts (bf16); the
+    //    tok/pos owner-scan (P2) reads dh0 by global token row. ──
+    for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x)
+        acts.dh0[(int64_t)g0 * dec::kD + idx] = __float2bfloat16(sc.dh[idx]);
+    __syncthreads();
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  P2 — OUTPUT-STATIONARY dW (the Q2 deliverable). Each of the 9 weight
+//  matrices dW = dYᵀ @ X (K=T) is split into 64×N output tiles; tile_id %
+//  nCTA owns each (fixed every step → determinism + L2 warmth). The owner CTA
+//  contracts the FULL token dimension itself (ascending-t, no float atomics, no
+//  partials) via the validated dW orientation (tc_gemm_block_unpipelined with
+//  BOTH operands transposed-staged, MaxAtomsM=1 → one 64×N tile, 64 acc regs/
+//  thread, no spill). Writes the tile into `grad` (the reduced-grad output).
+//
+//  The 9 weights, in dec_layout tensor-index order, with their (dY,X) acts and
+//  the contraction length K (T for per-position weights, B for the head).
+// ════════════════════════════════════════════════════════════════════════
+struct DecDwSpec {
+    const __nv_bfloat16* dY;   // [K, Nout]
+    const __nv_bfloat16* X;    // [K, Kin]
+    int Nout; int Kin; int K;
+    int grad_off;              // element offset of this weight in `grad`
+    const __nv_bfloat16* dY_bias;  // same as dY (bias db = Σ_K dY)
+    int bias_off;              // element offset of the bias in `grad`
+};
+
+// Build the 9 specs (called by all CTAs; cheap). T = B*kSeq.
+__device__ __forceinline__ void dectc_build_dw_specs(
+        const DecActs& acts, int B, int T, DecDwSpec spec[9]) {
+    // dec_layout offsets: see kDecOffsets. Weight tensor indices (and bias idx):
+    //   L0: in_w=2 (in_b=3), out_w=4 (out_b=5), ff0_w=10 (ff0_b=11), ff2_w=12 (ff2_b=13)
+    //   L1: in_w=14(15), out_w=16(17), ff0_w=22(23), ff2_w=24(25)
+    //   head: out_w=28 (out_b=29)
+    const int wi[9]  = {2,4,10,12, 14,16,22,24, 28};
+    const int bi[9]  = {3,5,11,13, 15,17,23,25, 29};
+    for (int s = 0; s < 8; ++s) {
+        const int li = s / 4, kind = s % 4;
+        DecDwSpec& sp = spec[s];
+        sp.K = T; sp.grad_off = kDecOffsets[wi[s]]; sp.bias_off = kDecOffsets[bi[s]];
+        if (kind == 0)      { sp.dY = acts.dY_qkv[li]; sp.X = acts.X_in[li];  sp.Nout = 3 * dec::kD; sp.Kin = dec::kD;   }
+        else if (kind == 1) { sp.dY = acts.dY_a[li];   sp.X = acts.X_ctx[li]; sp.Nout = dec::kD;     sp.Kin = dec::kD;   }
+        else if (kind == 2) { sp.dY = acts.dY_ff0[li]; sp.X = acts.X_x1[li];  sp.Nout = dec::kDff;   sp.Kin = dec::kD;   }
+        else                { sp.dY = acts.dY_ff2[li]; sp.X = acts.X_gact[li];sp.Nout = dec::kD;     sp.Kin = dec::kDff; }
+        sp.dY_bias = sp.dY;
+    }
+    DecDwSpec& hd = spec[8];
+    hd.dY = acts.dY_logits; hd.X = acts.X_hn; hd.Nout = dec::kVocab; hd.Kin = dec::kD; hd.K = B;
+    hd.grad_off = kDecOffsets[28]; hd.bias_off = kDecOffsets[29]; hd.dY_bias = hd.dY;
+}
+
+// Total number of 64×N dW output tiles across the 9 weights (for the tile loop).
+template <int N>
+__device__ __forceinline__ int dectc_dw_total_tiles(const DecDwSpec spec[9]) {
+    int n = 0;
+    for (int s = 0; s < 9; ++s)
+        n += ((spec[s].Nout + 63) / 64) * ((spec[s].Kin + N - 1) / N);
+    return n;
+}
+
+// Run ONE global dW tile `gt` (if it belongs to this CTA): decode (weight, M-atom,
+// N-tile), then contract K via the dW GEMM into grad[grad_off]. MaxAtomsM=1.
+template <int N>
+__device__ __forceinline__ void dectc_dw_run_tile(
+        const DecDwSpec spec[9], int gt, float* __restrict__ grad,
+        __nv_bfloat16* sA, __nv_bfloat16* sB) {
+    // Decode gt → (s, m_atom, n_tile).
+    int acc = 0, s = 0, m_atom = 0, n_tile = 0;
+    for (s = 0; s < 9; ++s) {
+        const int ma = (spec[s].Nout + 63) / 64;
+        const int nt = (spec[s].Kin + N - 1) / N;
+        if (gt < acc + ma * nt) { int loc = gt - acc; m_atom = loc / nt; n_tile = loc % nt; break; }
+        acc += ma * nt;
+    }
+    const DecDwSpec& sp = spec[s];
+    const int mbase = m_atom * 64;
+    const int n0 = n_tile * N;
+    const int n_real = (sp.Kin - n0) < N ? (sp.Kin - n0) : N;
+    const int k_steps = sp.K / wgs::kWgmmaAtomK;     // K = T or B (must be /16; padded by caller)
+    const int Nout = sp.Nout, Kin = sp.Kin;
+    const __nv_bfloat16* dY = sp.dY; const __nv_bfloat16* X = sp.X;
+    // The engine (tc_gemm_block_unpipelined, mbase0=mbase, m_atoms=1) passes the
+    // GLOBAL row m = mbase + mn to srcA/out (it adds mbase0 itself), so the
+    // accessors use `m` RAW — adding mbase again would double-count (the selftest
+    // passes mbase0=0 and uses m raw; we pass mbase0=mbase and likewise use m raw).
+    // A[m=out, k=t] = dY[t,out]  (transposed read); B[n=in, k=t] = X[t,in] (transposed).
+    auto srcA = [&] (int m, int k) -> __nv_bfloat16 {
+        return m < Nout ? dY[(int64_t)k * Nout + m] : __float2bfloat16(0.f); };
+    auto srcB = [&] (int n, int k) -> __nv_bfloat16 {
+        int nn = n0 + n; return nn < Kin ? X[(int64_t)k * Kin + nn] : __float2bfloat16(0.f); };
+    auto out  = [&] (int m, int n, float v) {
+        if (m < Nout) grad[sp.grad_off + (int64_t)m * Kin + n0 + n] = v; };
+    tc_gemm_block_unpipelined<N, /*MaxAtomsM=*/1>(
+        mbase, /*m_atoms=*/1, n_real, k_steps, srcA, srcB, out, sA, sB);
+}
+
+// Biases db = Σ_K dY  (per output row). Work-stealing over the 9 weights' rows is
+// overkill; instead each CTA strides ALL bias outputs (cheap: ≤ 3d=384 rows × 9).
+// Single owner per output element (thread strides global bias-row index) → no atomics.
+__device__ __forceinline__ void dectc_dw_biases(
+        const DecDwSpec spec[9], float* __restrict__ grad) {
+    for (int s = 0; s < 9; ++s) {
+        const DecDwSpec& sp = spec[s];
+        for (int o = threadIdx.x; o < sp.Nout; o += blockDim.x) {
+            float accv = 0.0f;
+            for (int k = 0; k < sp.K; ++k) accv += __bfloat162float(sp.dY_bias[(int64_t)k * sp.Nout + o]);
+            grad[sp.bias_off + o] = accv;
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  P2 — EMBEDDING owner-scan (tok/pos). dh0 [T,d] (bf16) holds grad wrt h0.
+//    tok grad: row r (token id) of tok.weight → owner CTA (r % nCTA); the owner
+//    scans ALL T tokens in ascending t, accumulating dh0[t,:] for tokens whose
+//    id == r. pos grad: row p → owner; sums dh0[t,:] over t with (t%S)==p.
+//    Fixed t-order + single owner per row → deterministic, atomic-free.
+//    `tok_ids` is HBM int32 [T]. Writes grad[tok_off..], grad[pos_off..].
+// ════════════════════════════════════════════════════════════════════════
+__device__ __forceinline__ void dectc_embed_owner_scan(
+        const DecActs& acts, const int* __restrict__ tok_ids, int T,
+        float* __restrict__ grad, int cta, int nCTA) {
+    const int tok_off = kDecOffsets[0];   // tok.weight [V,d]
+    const int pos_off = kDecOffsets[1];   // pos.weight [S,d]
+    // tok rows owned by this CTA: r in [0,V) with r % nCTA == cta.
+    for (int r = cta; r < dec::kVocab; r += nCTA) {
+        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
+            float accv = 0.0f;
+            for (int t = 0; t < T; ++t)
+                if (tok_ids[t] == r) accv += __bfloat162float(acts.dh0[(int64_t)t * dec::kD + j]);
+            grad[tok_off + (int64_t)r * dec::kD + j] = accv;
+        }
+    }
+    // pos rows owned by this CTA: p in [0,S) with p % nCTA == cta.
+    for (int p = cta; p < dec::kSeq; p += nCTA) {
+        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
+            float accv = 0.0f;
+            for (int t = 0; t < T; ++t)
+                if ((t % dec::kSeq) == p) accv += __bfloat162float(acts.dh0[(int64_t)t * dec::kD + j]);
+            grad[pos_off + (int64_t)p * dec::kD + j] = accv;
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  P2 — LN-vector grad reduce. The 10 γ/β grads were accumulated tile-locally
+//    into each CTA's lnvec partials [kNumLnVec × d]; sum across CTAs in
+//    ASCENDING CTA index (deterministic) into the 10 dec_layout slots of grad.
+//    `lnvec_base` is the start of the [nCTA × kLnVecElems] partial region.
+// ════════════════════════════════════════════════════════════════════════
+__device__ __forceinline__ void dectc_lnvec_reduce(
+        const float* __restrict__ lnvec_base, float* __restrict__ grad,
+        int nCTA, int cta) {
+    // Each CTA reduces a subset of the 10 LN tensors (round-robin by tensor).
+    for (int v = cta; v < kNumLnVec; v += nCTA) {
+        const int goff = kLnVecTensorIdx[v];
+        const int64_t gbase = kDecOffsets[goff];
+        for (int j = threadIdx.x; j < dec::kD; j += blockDim.x) {
+            float accv = 0.0f;
+            for (int c = 0; c < nCTA; ++c)
+                accv += lnvec_base[(int64_t)c * kLnVecElems + (int64_t)v * dec::kD + j];
+            grad[gbase + j] = accv;
+        }
+    }
+}
+
 }  // namespace dectc
 
 }}} // namespace sg::fused::sm90
