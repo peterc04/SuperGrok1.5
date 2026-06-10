@@ -324,8 +324,10 @@ def make_plot(rows, path):
                            ("fp8_tc", "FP8/INT8 tensor-core peak", (0, (1, 1)))]:
         if PEAKS.get(key) is None:  # fp8/int8 peaks retired with the precision program
             continue
+        # linestyle= keyword required: tuple dash specs (0,(1,1)) passed
+        # positionally are parsed as a data series and crash matplotlib.
         ax.plot(ais, np.minimum(PEAKS[key], ais * PEAKS["hbm_bw"]),
-                ls, lw=1.2, label=label)
+                linestyle=ls, lw=1.2, label=label)
     colors = {"decoder": "#1f77b4", "vit": "#2ca02c", "mamba": "#d62728"}
     for r in rows:
         ax.scatter(r["arithmetic_intensity"], r["achieved_flops_per_s"],
