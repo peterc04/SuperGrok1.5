@@ -106,8 +106,6 @@ class SuperGrok11(Optimizer):
         zero_acc_threshold: float = 0.995,
         sam_rho: float = 0.05,
         sam_enable_threshold: float = 0.0,
-        rescale_clamp: Optional[float] = None,
-        meta_gate_power: Optional[float] = None,
         use_grad_hooks: bool = False,
         grad_checkpoint: bool = True,
     ):
@@ -130,27 +128,14 @@ class SuperGrok11(Optimizer):
         self.zero_loss_threshold = zero_loss_threshold
         self.zero_acc_threshold = zero_acc_threshold
         self.sam_rho = sam_rho
-        # Bound the learned meta-net output scale. The meta-loss
-        # (−Σ smart_grad·vg_unit) is linear in `rescale` with no magnitude
-        # penalty, so Adam grows it without bound until the correction
-        # rescale·MLP(grad,sharpness) buries the real gradient and training
-        # collapses (~step 900). Clamping rescale after each meta_step keeps the
-        # correction a bounded *steer* on the update instead of a runaway term.
-        # None = unbounded (legacy). Set via `supergrok_rescale_clamp`.
-        self.rescale_clamp = rescale_clamp
-        # Memorization-gated meta correction. The collapse is NOT a magnitude
-        # runaway — it's that the val-aligned meta push is *applied at all* after
-        # the model memorizes, walking it off the memorized minimum (verified:
-        # with the meta weight α≈0 training is stable; re-enabling α once
-        # memorized collapses it). The natural signal is train PROGRESS, not
-        # ‖grad‖ (which is pinned at gradient_clipping). The legacy reactive
-        # alpha schedule oscillates (a train dip snaps α back up → re-collapse),
-        # so we gate by a MONOTONIC ratchet: scale α by (1 − max_train_acc)^p.
-        # Once the model memorizes the meta contribution ratchets to ~0 and stays
-        # there → SG reduces to its (grokking) AdamW core through the plateau.
-        # None = off (legacy). Set via `supergrok_meta_gate_power`.
-        self.meta_gate_power = meta_gate_power
-        self._max_train_acc = 0.0
+        # NOTE (owner directive — no functionality suppression): two earlier
+        # collapse mitigations were REMOVED from this class rather than left as
+        # dormant knobs: a `rescale_clamp` on the meta-net output scale and a
+        # `meta_gate_power` memorization ratchet that multiplied the meta
+        # contribution toward 0 post-memorization. Both "fixed" the collapse by
+        # suppressing the meta. The functionality-preserving replacement is the
+        # two-term lookahead meta objective in `meta_step` (val_CE + train_CE at
+        # a virtual step), which keeps the meta fully active for the whole run.
 
         if meta_net is None:
             self.meta_net = SharpnessMetaNet(meta_hidden_dim,
@@ -282,15 +267,6 @@ class SuperGrok11(Optimizer):
             if p.grad is not None and p.grad.numel() > 0:
                 self._flat_steps[i] += 1
 
-        # Memorization-gated meta correction (monotonic ratchet). Scale α by
-        # (1 − max_train_acc)^p so the val-aligned meta push vanishes as the model
-        # memorizes and — unlike the reactive alpha schedule — never re-enables on
-        # a transient train dip. See __init__ for the why.
-        if self.meta_gate_power is not None:
-            self._max_train_acc = max(self._max_train_acc, self._cached_train_acc)
-            gate = max(0.0, 1.0 - self._max_train_acc) ** self.meta_gate_power
-            layer_alphas = [a * gate for a in layer_alphas]
-
         if self._weights_dirty:
             self._cached_weights = self.meta_net.get_weights()
             self._weights_dirty = False
@@ -373,8 +349,38 @@ class SuperGrok11(Optimizer):
 
         return sam_loss_val
 
-    def meta_step(self, model, val_x, val_y, criterion, meta_optimizer):
-        """Bilevel meta-net training. Batched meta-net forward."""
+    def meta_step(self, model, val_x, val_y, criterion, meta_optimizer,
+                  train_x=None, train_y=None):
+        """Bilevel meta-net training — two-term lookahead descent objective.
+
+        Trains the meta-net so the smart gradient it emits improves validation
+        WITHOUT leaving the train manifold, one virtual step ahead:
+
+            w⁺ = w·(1−lr·wd) − lr·meta_net(g, sharpness)
+            meta_loss = val_CE(w⁺) + train_CE(w⁺)
+
+        differentiated through the virtual step into the meta-net weights via
+        ``torch.func.functional_call`` (real params untouched — virtual params
+        are built from ``p.detach()``; ``p.grad`` is snapshotted/restored).
+
+        History of this objective (both predecessors collapsed training):
+        • unbounded alignment ``−Σ(smart_grad·vg_unit)`` rewarded sheer
+          magnitude along the val-gradient → post-memorization the unopposed
+          push walked the weights off the minimum (collapse @~900).
+        • val-only lookahead ``val_CE(w⁺)`` self-regulates against single-step
+          damage, but at a memorized-not-grokked point the val-optimal push is
+          LARGE, and the kernel re-applies the cached meta output every step
+          between meta updates (freq=5) → overshoot past the lookahead horizon
+          (SG11 collapse @~1200; SG15 oscillated to test 0.92 then collapsed).
+        The train term anchors the manifold: off-manifold pushes raise
+        train_CE sharply at a memorized point, so the optimum is movement
+        ALONG the train level-set toward better val — the grokking direction —
+        and after any slip the train term dominates and pulls back
+        (self-healing). The meta stays FULLY ACTIVE the entire run; restraint
+        is learned, not gated (no functionality suppression). Kernel path
+        unchanged: it consumes refreshed meta weights via ``_weights_dirty``.
+
+        Batched meta-net forward — one call instead of per-parameter."""
         self._ensure_state()
         named_params = list(model.named_parameters())
 
@@ -408,25 +414,30 @@ class SuperGrok11(Optimizer):
                 smart_grads[name] = cat_smart[offset:offset+size].reshape(saved_grads[name].shape)
                 offset += size
 
-        model.zero_grad()
-        with torch.enable_grad():
-            val_loss = criterion(model(val_x), val_y)
-            val_loss.backward()
+        # Virtual step at the optimizer's own lr/wd (decoupled-WD shrink + the
+        # smart gradient), then evaluate validation CE there. Gradients flow
+        # back through smart_grads into the meta-net only.
+        group = self.param_groups[0]
+        lr_eff = float(group["lr"])
+        wd_eff = float(group.get("weight_decay", 0.0))
+        virtual = {}
+        for name, p in named_params:
+            base = p.detach()
+            if name in smart_grads:
+                virtual[name] = base * (1.0 - lr_eff * wd_eff) - lr_eff * smart_grads[name]
+            else:
+                virtual[name] = base
 
         meta_optimizer.zero_grad()
-        device = val_x.device
-        meta_loss = torch.tensor(0.0, device=device)
-        for name, p in named_params:
-            if name in smart_grads and p.grad is not None:
-                vg = p.grad.detach()
-                vg_norm = vg.norm()
-                vg_unit = vg / vg_norm if vg_norm > 1e-12 else vg
-                meta_loss = meta_loss - (smart_grads[name] * vg_unit).sum()
-
+        with torch.enable_grad():
+            val_loss = criterion(
+                torch.func.functional_call(model, virtual, (val_x,)), val_y)
+            meta_loss = val_loss
+            if train_x is not None and train_y is not None:
+                meta_loss = meta_loss + criterion(
+                    torch.func.functional_call(model, virtual, (train_x,)), train_y)
         meta_loss.backward()
         meta_optimizer.step()
-        if self.rescale_clamp is not None:
-            self.meta_net.rescale.data.clamp_(-self.rescale_clamp, self.rescale_clamp)
         self._weights_dirty = True
 
         for name, p in named_params:
@@ -471,6 +482,138 @@ class SuperGrok11(Optimizer):
 
     def get_global_step(self):
         return self._global_step
+
+    # ── Checkpoint fidelity ──────────────────────────────────────────────────
+    # The base Optimizer.state_dict() serializes only param_groups + self.state
+    # — but ALL of SuperGrok1.1's evolving state lives outside self.state (the
+    # flat Adam moments, the meta-net mu inputs, the per-param step counters,
+    # the trained meta-net itself). Without these overrides a checkpoint/resume
+    # silently reset momentum AND the trained meta-net to init — a suppression-
+    # class bug in API form. The derived per-param constants (_flat_layer_*) are
+    # NOT serialized: they are pure functions of the config, rebuilt in __init__.
+    _EXTRA_KEY = "supergrok11_extra"
+
+    def state_dict(self):
+        sd = super().state_dict()
+        self._ensure_state()
+        sd[self._EXTRA_KEY] = {
+            "global_step": self._global_step,
+            "cached_alpha": self._cached_alpha,
+            "cached_train_acc": self._cached_train_acc,
+            "flat_steps": list(self._flat_steps),
+            "flat_exp_avgs": [t.detach().clone() for t in self._flat_exp_avgs],
+            "flat_exp_avg_sqs": [t.detach().clone() for t in self._flat_exp_avg_sqs],
+            "flat_mus": [t.detach().clone() for t in self._flat_mus],
+            "flat_sharpness": [t.detach().clone() for t in self._flat_sharpness],
+            "meta_net": self.meta_net.state_dict(),
+        }
+        # The step_full path owns an internal Adam over the meta-net; its
+        # momentum is part of the training state (dropping it makes a resumed
+        # run diverge by one meta-step's worth, ~3e-8 after 2 steps — measured).
+        if hasattr(self, "_auto_meta_opt"):
+            sd[self._EXTRA_KEY]["auto_meta_opt"] = self._auto_meta_opt.state_dict()
+        return sd
+
+    def load_state_dict(self, state_dict):
+        extra = state_dict.get(self._EXTRA_KEY)
+        base = {k: v for k, v in state_dict.items() if k != self._EXTRA_KEY}
+        super().load_state_dict(base)
+        if extra is None:
+            return  # plain/base checkpoint: behave like the base class
+        self._ensure_state()
+        n = len(self._flat_params)
+        for key in ("flat_exp_avgs", "flat_exp_avg_sqs", "flat_mus",
+                    "flat_sharpness"):
+            saved = extra[key]
+            live = getattr(self, "_" + key)
+            if len(saved) != n:
+                raise ValueError(
+                    f"SuperGrok11.load_state_dict: checkpoint has {len(saved)} "
+                    f"{key} buffers but the optimizer holds {n} params — "
+                    f"the model architecture changed.")
+            for dst, src in zip(live, saved):
+                if dst.numel() != src.numel():
+                    raise ValueError(
+                        f"SuperGrok11.load_state_dict: {key} numel mismatch "
+                        f"({dst.numel()} vs checkpoint {src.numel()}).")
+                dst.copy_(src.to(dst.device, dtype=dst.dtype))
+        self._flat_steps = list(extra["flat_steps"])
+        self._global_step = int(extra["global_step"])
+        self._cached_alpha = float(extra["cached_alpha"])
+        self._cached_train_acc = float(extra["cached_train_acc"])
+        self.meta_net.load_state_dict(extra["meta_net"])
+        if "auto_meta_opt" in extra:
+            if not hasattr(self, "_auto_meta_opt"):
+                self._auto_meta_opt = torch.optim.Adam(
+                    self.meta_net.parameters(), lr=1e-4)
+            self._auto_meta_opt.load_state_dict(extra["auto_meta_opt"])
+        self._weights_dirty = True   # re-extract kernel weights from the loaded net
+
+    def step_full(self, model, train_x, train_y, val_x, val_y, criterion=None):
+        """Complete training step: forward + backward + SAM + meta-learning + optimizer.
+
+        The AdamW-grade self-contained path (mirrors SuperGrok15/SuperGrok2
+        ``step_full``): owns the forward/backward, runs ``sam_step`` and
+        ``meta_step`` on their cadences with an internally-managed meta
+        optimizer, and feeds ``step()`` the train/val statistics it needs — so
+        the FULL machinery is exercised without any external choreography.
+        External drivers (the race loop) may still call sam_step/meta_step/
+        step() directly; this wrapper makes that advanced wiring optional,
+        not required.
+        """
+        if criterion is None:
+            criterion = nn.CrossEntropyLoss()
+        if not hasattr(self, '_auto_meta_opt'):
+            self._auto_meta_opt = torch.optim.Adam(self.meta_net.parameters(), lr=1e-4)
+
+        model.zero_grad()
+        logits = model(train_x)
+        loss = criterion(logits, train_y)
+        loss.backward()
+
+        metrics: Dict[str, float] = {}
+        step_num = self._global_step + 1
+
+        sam_freq_eff = self._get_effective_sam_freq()
+        if step_num % sam_freq_eff == 0:
+            try:
+                metrics["sam_loss"] = self.sam_step(model, train_x, train_y, criterion)
+            except Exception as e:
+                import warnings
+                warnings.warn(f"SuperGrok1.1 sam_step failed at step {step_num}: {e}")
+
+        if step_num % self.meta_update_freq == 0:
+            try:
+                # Two-term lookahead objective: pass the train batch so the
+                # meta-net descends val_CE + train_CE at the virtual step
+                # (train_x/train_y omitted would silently drop the train
+                # anchor that stabilizes the meta — keep them explicit).
+                metrics["val_loss"] = self.meta_step(
+                    model, val_x, val_y, criterion, self._auto_meta_opt,
+                    train_x=train_x, train_y=train_y)
+            except Exception as e:
+                import warnings
+                warnings.warn(f"SuperGrok1.1 meta_step failed at step {step_num}: {e}")
+
+        kw: Dict[str, float] = {}
+        alpha_freq = self.alpha_update_freq
+        if (step_num % alpha_freq == 0) or step_num == 1:
+            with torch.no_grad():
+                train_loss_val = loss.item()
+                train_acc = (logits.detach().argmax(-1) == train_y).float().mean().item()
+            kw["train_loss"] = train_loss_val
+            kw["train_acc"] = train_acc
+            metrics["train_loss"] = train_loss_val
+            metrics["train_acc"] = train_acc
+            if step_num % alpha_freq == 0:
+                with torch.no_grad():
+                    val_loss_val = criterion(model(val_x), val_y).item()
+                kw["val_loss"] = val_loss_val
+                if "val_loss" not in metrics:
+                    metrics["val_loss"] = val_loss_val
+
+        self.step(**kw)
+        return metrics
 
 
 # ── Shared (inlined) helper: register post_accumulate_grad_hook on each param.

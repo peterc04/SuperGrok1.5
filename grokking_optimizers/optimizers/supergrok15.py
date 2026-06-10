@@ -127,7 +127,6 @@ class SuperGrok15(Optimizer):
         wd_scale: float = 20.0,
         wd_thresh: float = 0.9,
         sam_enable_threshold: float = 0.0,
-        meta_gate_power: Optional[float] = None,
         use_grad_hooks: bool = False,
         grad_checkpoint: bool = True,
     ):
@@ -147,13 +146,11 @@ class SuperGrok15(Optimizer):
         self.zero_loss_threshold = zero_loss_threshold
         self.zero_acc_threshold = zero_acc_threshold
         self.sam_rho = sam_rho
-        # Memorization-gated meta correction (same fix as SuperGrok11): scale the
-        # meta-mixing α by a MONOTONIC ratchet (1 − max_train_acc)^p so the
-        # val-aligned bilevel push vanishes once the model memorizes and never
-        # re-enables on a transient dip — preventing the post-memorization
-        # collapse. None = off (legacy). Set via `supergrok15_meta_gate_power`.
-        self.meta_gate_power = meta_gate_power
-        self._max_train_acc = 0.0
+        # NOTE (owner directive — no functionality suppression): the
+        # `meta_gate_power` memorization ratchet was REMOVED (it multiplied the
+        # meta contribution toward 0 post-memorization = suppression). The
+        # functionality-preserving replacement is the two-term lookahead
+        # objective in `bilevel_step` (val_CE + train_CE at a virtual step).
         self.meta_hidden_dim = meta_hidden_dim
 
         self.gate_scale = gate_scale
@@ -330,14 +327,6 @@ class SuperGrok15(Optimizer):
             if p.grad is not None and p.grad.numel() > 0:
                 self._flat_steps[i] += 1
 
-        # Memorization-gated meta correction (monotonic ratchet) — same fix as
-        # SuperGrok11. Scale α by (1 − max_train_acc)^p so the val-aligned bilevel
-        # push vanishes as the model memorizes and never re-enables on a dip.
-        if self.meta_gate_power is not None:
-            self._max_train_acc = max(self._max_train_acc, self._cached_train_acc)
-            gate = max(0.0, 1.0 - self._max_train_acc) ** self.meta_gate_power
-            layer_alphas = [a * gate for a in layer_alphas]
-
         if self._weights_dirty:
             self._cached_weights = self.meta_net.get_weights()
             self._weights_dirty = False
@@ -426,7 +415,23 @@ class SuperGrok15(Optimizer):
         return sam_loss_val
 
     def bilevel_step(self, model, train_x, train_y, val_x, val_y, criterion, meta_optimizer):
-        """Bilevel meta-net training. Uses cached sharpness. Batched meta-net forward."""
+        """Bilevel meta-net training — lookahead validation-descent objective.
+
+        Trains the meta-net so its smart gradient improves validation WITHOUT
+        leaving the train manifold, one virtual step ahead:
+        ``w⁺ = w·(1−lr·wd) − lr·meta_net(g, sharpness)``,
+        ``meta_loss = val_CE(w⁺) + train_CE(w⁺)``, differentiated through the
+        virtual step (``functional_call``; real params/grads untouched).
+        Replaces the unbounded-alignment objective ``−Σ(smart_grad·vg_unit)``
+        whose magnitude reward collapsed training once the train gradient
+        vanished; the val-only lookahead variant nearly grokked (test 0.92)
+        but oscillated and collapsed — the kernel re-applies the cached meta
+        output every step between bilevel updates, overshooting the lookahead
+        horizon. The train term anchors the train level-set, making the
+        optimum "move along the manifold toward better val" (the grokking
+        direction) and self-healing after slips. Same fix as
+        SuperGrok11.meta_step — meta FULLY ACTIVE, no gating/suppression.
+        Uses cached sharpness. Batched meta-net forward."""
         self._ensure_state()
         named_params = list(model.named_parameters())
 
@@ -460,21 +465,25 @@ class SuperGrok15(Optimizer):
                 smart_grads[name] = cat_smart[offset:offset+size].reshape(saved_grads[name].shape)
                 offset += size
 
-        model.zero_grad()
-        with torch.enable_grad():
-            val_loss = criterion(model(val_x), val_y)
-            val_loss.backward()
+        # Virtual step at the optimizer's own lr/wd, evaluate val CE there;
+        # gradients flow back through smart_grads into the meta-net only.
+        group = self.param_groups[0]
+        lr_eff = float(group["lr"])
+        wd_eff = float(group.get("weight_decay", 0.0))
+        virtual = {}
+        for name, p in named_params:
+            base = p.detach()
+            if name in smart_grads:
+                virtual[name] = base * (1.0 - lr_eff * wd_eff) - lr_eff * smart_grads[name]
+            else:
+                virtual[name] = base
 
         meta_optimizer.zero_grad()
-        device = val_x.device
-        meta_loss = torch.tensor(0.0, device=device)
-        for name, p in named_params:
-            if name in smart_grads and p.grad is not None:
-                vg = p.grad.detach()
-                vg_norm = vg.norm()
-                vg_unit = vg / vg_norm if vg_norm > 1e-12 else vg
-                meta_loss = meta_loss - (smart_grads[name] * vg_unit).sum()
-
+        with torch.enable_grad():
+            val_loss = criterion(
+                torch.func.functional_call(model, virtual, (val_x,)), val_y)
+            meta_loss = val_loss + criterion(
+                torch.func.functional_call(model, virtual, (train_x,)), train_y)
         meta_loss.backward()
         meta_optimizer.step()
         self._weights_dirty = True
@@ -537,6 +546,67 @@ class SuperGrok15(Optimizer):
         if self.param_groups:
             return self._get_effective_wd(self.param_groups[0]["weight_decay"])
         return 0.0
+
+    # ── Checkpoint fidelity (same contract as SuperGrok11) ──────────────────
+    # All evolving state lives outside base Optimizer.state (flat Adam moments,
+    # mu/sharpness meta inputs, per-param step counters, the trained meta-net,
+    # the step_full-internal meta Adam). Serialize it or a resume silently
+    # resets momentum AND the meta-net. Derived constants (_flat_layer_*) are
+    # rebuilt by __init__ and not serialized.
+    _EXTRA_KEY = "supergrok15_extra"
+
+    def state_dict(self):
+        sd = super().state_dict()
+        self._ensure_state()
+        sd[self._EXTRA_KEY] = {
+            "global_step": self._global_step,
+            "cached_alpha": self._cached_alpha,
+            "cached_train_acc": self._cached_train_acc,
+            "flat_steps": list(self._flat_steps),
+            "flat_exp_avgs": [t.detach().clone() for t in self._flat_exp_avgs],
+            "flat_exp_avg_sqs": [t.detach().clone() for t in self._flat_exp_avg_sqs],
+            "flat_mus": [t.detach().clone() for t in self._flat_mus],
+            "flat_sharpness": [t.detach().clone() for t in self._flat_sharpness],
+            "meta_net": self.meta_net.state_dict(),
+        }
+        if hasattr(self, "_auto_meta_opt"):
+            sd[self._EXTRA_KEY]["auto_meta_opt"] = self._auto_meta_opt.state_dict()
+        return sd
+
+    def load_state_dict(self, state_dict):
+        extra = state_dict.get(self._EXTRA_KEY)
+        base = {k: v for k, v in state_dict.items() if k != self._EXTRA_KEY}
+        super().load_state_dict(base)
+        if extra is None:
+            return  # plain/base checkpoint: behave like the base class
+        self._ensure_state()
+        n = len(self._flat_params)
+        for key in ("flat_exp_avgs", "flat_exp_avg_sqs", "flat_mus",
+                    "flat_sharpness"):
+            saved = extra[key]
+            live = getattr(self, "_" + key)
+            if len(saved) != n:
+                raise ValueError(
+                    f"SuperGrok15.load_state_dict: checkpoint has {len(saved)} "
+                    f"{key} buffers but the optimizer holds {n} params — "
+                    f"the model architecture changed.")
+            for dst, src in zip(live, saved):
+                if dst.numel() != src.numel():
+                    raise ValueError(
+                        f"SuperGrok15.load_state_dict: {key} numel mismatch "
+                        f"({dst.numel()} vs checkpoint {src.numel()}).")
+                dst.copy_(src.to(dst.device, dtype=dst.dtype))
+        self._flat_steps = list(extra["flat_steps"])
+        self._global_step = int(extra["global_step"])
+        self._cached_alpha = float(extra["cached_alpha"])
+        self._cached_train_acc = float(extra["cached_train_acc"])
+        self.meta_net.load_state_dict(extra["meta_net"])
+        if "auto_meta_opt" in extra:
+            if not hasattr(self, "_auto_meta_opt"):
+                self._auto_meta_opt = torch.optim.Adam(
+                    self.meta_net.parameters(), lr=1e-4)
+            self._auto_meta_opt.load_state_dict(extra["auto_meta_opt"])
+        self._weights_dirty = True   # re-extract kernel weights from the loaded net
 
     def step_full(self, model, train_x, train_y, val_x, val_y, criterion=None):
         """Complete training step: forward + backward + SAM + meta-learning + optimizer."""

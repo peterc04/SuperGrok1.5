@@ -1215,24 +1215,21 @@ class SuperGrok2(Optimizer):
         expert_allreduce_before_recycle: bool = True,
         mamba_state_sync_interval: int = 1000,
         state_precision: str = 'fp32',
-        meta_gate_power: Optional[float] = None,
         use_grad_hooks: bool = False,
     ):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.state_precision = state_precision
 
-        # Memorization-gate knob, added for API consistency with SuperGrok11/15
-        # (scale base_alpha by the monotonic ratchet (1 − max_train_acc)^p). NOTE:
-        # unlike SG11/15, SG2's observed instability is NOT the meta push — an
-        # on-device isolation shows SG2 collapses at train≈0.5 *before* it
-        # memorizes, and it collapses even with the meta contribution zeroed
-        # (rescale=0). The destabilizer is the grokfast `lamb` amplification term:
-        # with lamb=0 the base Adam core is stable and reaches test≈0.95. So SG2
-        # is a HYPERPARAMETER-TUNING target (tame `lamb`), not a meta-gate fix.
-        # This ratchet is therefore off by default and largely moot for SG2.
-        self.meta_gate_power = meta_gate_power
-        self._max_train_acc = 0.0
+        # NOTE (owner directive — no functionality suppression): a
+        # `meta_gate_power` memorization-ratchet knob was REMOVED here (it
+        # scaled base_alpha toward 0 post-memorization = suppression, and was
+        # moot for SG2 anyway: on-device isolation shows SG2 destabilizes
+        # *before* memorization via the grokfast `lamb` amplification schedule
+        # — lamb_eff spikes at train_acc≈gate_thresh — while the base Adam core
+        # is stable). The fix path is TUNING the schedule scalars (lamb,
+        # gate_scale, gate_thresh, meta_rescale, sg2_meta_lr) with everything
+        # active — see tuning/tune_optimizers.py.
 
         self.alpha_init = alpha_init
         self.sam_enable_threshold = sam_enable_threshold
@@ -1348,6 +1345,7 @@ class SuperGrok2(Optimizer):
         self._flat_exp_avg_sqs = []
         self._flat_exp_avg_scales = []  # Config 3: INT8 per-block scales
         self._flat_mus = []
+        self._flat_slows = []  # slow-gradient EMA (restored grokfast term)
         self._flat_sharpness = []
         self._flat_gru_states = []
         self._flat_mamba_fwd_states = []
@@ -1399,6 +1397,11 @@ class SuperGrok2(Optimizer):
                     torch.zeros(N, dtype=torch.bfloat16, device=p.device))
                 self._flat_mus.append(
                     torch.zeros(N, dtype=torch.bfloat16, device=p.device))
+                # Slow-gradient EMA buffer (restored grokfast term). Allocated
+                # exactly like _flat_mus so the kernel's sg2_apply_step has a
+                # dedicated `slow` accumulator distinct from the expert-EMA mu.
+                self._flat_slows.append(
+                    torch.zeros(N, dtype=torch.bfloat16, device=p.device))
                 self._flat_sharpness.append(
                     torch.zeros(N, dtype=torch.bfloat16, device=p.device))
                 self._flat_gru_states.append(
@@ -1411,6 +1414,11 @@ class SuperGrok2(Optimizer):
                 self._flat_exp_avg_sqs.append(
                     torch.zeros(N, dtype=torch.float32, device=p.device))
                 self._flat_mus.append(
+                    torch.zeros(N, dtype=torch.float32, device=p.device))
+                # Slow-gradient EMA buffer (restored grokfast term). Allocated
+                # exactly like _flat_mus so the kernel's sg2_apply_step has a
+                # dedicated `slow` accumulator distinct from the expert-EMA mu.
+                self._flat_slows.append(
                     torch.zeros(N, dtype=torch.float32, device=p.device))
                 self._flat_sharpness.append(
                     torch.zeros(N, dtype=torch.float32, device=p.device))
@@ -1596,12 +1604,6 @@ class SuperGrok2(Optimizer):
             self._update_alpha(train_loss, val_loss, train_acc)
 
         base_alpha = self._cached_alpha
-        # Memorization-gated meta correction (monotonic ratchet) — same fix as
-        # SuperGrok11/15. Scale the meta weight by (1 − max_train_acc)^p so the
-        # val-aligned push vanishes as the model memorizes and never re-enables.
-        if self.meta_gate_power is not None:
-            self._max_train_acc = max(self._max_train_acc, self._cached_train_acc)
-            base_alpha = base_alpha * (max(0.0, 1.0 - self._max_train_acc) ** self.meta_gate_power)
         ramp = self._get_ramp_factor()
         gate_signal = self._get_gate_signal()
 
@@ -1670,6 +1672,9 @@ class SuperGrok2(Optimizer):
                 [self._flat_exp_avg_sqs[i] for i in active_indices],
                 [self._flat_gru_states[i] for i in active_indices],
                 [self._flat_mus[i] for i in active_indices],
+                # slows mirror mus (restored grokfast slow-grad EMA); position
+                # matches supergrok2_prepare_and_batched_step's `slows` param.
+                [self._flat_slows[i] for i in active_indices],
                 sharpness_list,
                 [int(self._flat_steps[i]) for i in active_indices],
                 [float(self._flat_layer_alphas[i]) for i in active_indices],
@@ -1730,7 +1735,26 @@ class SuperGrok2(Optimizer):
         return loss
 
     def sam_step(self, model, train_x, train_y, criterion):
-        """SAM perturbation + sharpness computation via functional_call (no param modification)."""
+        """SAM ascent step → per-parameter sharpness |g(w+e) − g(w)|.
+
+        Recomputes the gradient at the SAM-perturbed point e(w)=rho·g/‖g‖ via
+        ``torch.func.functional_call`` and writes the elementwise sharpness into
+        ``_flat_sharpness`` (the buffer the meta-net's 2nd input and the fused
+        kernel read). Mirrors the SuperGrok11 fix — the previous version was
+        broken on **every** call (silently: the race loop swallows the exception),
+        so SG2 ran with NO SAM signal, and because it ``model.zero_grad()``'d and
+        then raised, it also left the params grad-less → starved ``bilevel_step``
+        (the only meta-net trainer) of gradients. Two correctness points:
+          • the perturbed params come from ``.detach()`` so they must be
+            ``.requires_grad_(True)`` or autograd has nothing to differentiate
+            (the old ``sam_loss.backward()`` raised "element 0 … does not require
+            grad" every time);
+          • ``functional_call`` substitutes the perturbed tensors as the module's
+            params, so gradients live on THEM — take them with ``autograd.grad``
+            and leave each ``p.grad`` (the original backward result ``step()``
+            and ``bilevel_step`` consume) completely untouched (no zero_grad).
+        Sharpness is flattened to ``(numel,)`` to match its ``torch.zeros(N)`` init.
+        """
         self._ensure_state()
         train_grads = {}
         for name, p in model.named_parameters():
@@ -1745,29 +1769,27 @@ class SuperGrok2(Optimizer):
         rho_over_norm = self.sam_rho / grad_norm
 
         named_params = dict(model.named_parameters())
-        perturbed_params = {}
+        pert_names = [n for n in named_params if n in train_grads]
+        perturbed = {}
         for name, p in named_params.items():
             if name in train_grads:
-                perturbed_params[name] = p.detach() + rho_over_norm * train_grads[name]
+                perturbed[name] = (p.detach() + rho_over_norm * train_grads[name]).requires_grad_(True)
             else:
-                perturbed_params[name] = p.detach()
+                perturbed[name] = p.detach()
 
-        model.zero_grad()
         with torch.enable_grad():
-            sam_logits = torch.func.functional_call(model, perturbed_params, (train_x,))
+            sam_logits = torch.func.functional_call(model, perturbed, (train_x,))
             sam_loss = criterion(sam_logits, train_y)
-            sam_loss.backward()
-        sam_loss_val = sam_loss.detach()  # keep on device, avoid CPU sync
+            sam_grads = torch.autograd.grad(
+                sam_loss, [perturbed[n] for n in pert_names], allow_unused=True)
+        sam_loss_val = sam_loss.item()
 
-        for name, p in model.named_parameters():
-            pidx = self._param_to_idx.get(id(p))
-            if pidx is not None and p.grad is not None and name in train_grads:
-                sam_grad = p.grad.detach()
-                normal_grad = train_grads[name]
-                self._flat_sharpness[pidx] = (sam_grad - normal_grad).abs()
-
-        for name, p in model.named_parameters():
-            p.grad = train_grads.get(name)
+        for name, sg in zip(pert_names, sam_grads):
+            if sg is None:
+                continue
+            pidx = self._param_to_idx.get(id(named_params[name]))
+            if pidx is not None:
+                self._flat_sharpness[pidx] = (sg.detach() - train_grads[name]).abs().reshape(-1)
 
         return sam_loss_val
 
@@ -2133,6 +2155,7 @@ class SuperGrok2(Optimizer):
         self._static_exp_avgs = list(self._flat_exp_avgs)
         self._static_exp_avg_sqs = list(self._flat_exp_avg_sqs)
         self._static_mus = list(self._flat_mus)
+        self._static_slows = list(self._flat_slows)  # mirror _static_mus
         self._static_gru_states = list(self._flat_gru_states)
         # CSA/HCA attention is stateless — no static scan-state lists needed.
 
@@ -2217,6 +2240,7 @@ class SuperGrok2(Optimizer):
         active_exp_avgs = []
         active_exp_avg_sqs = []
         active_mus = []
+        active_slows = []
         active_gru_states = []
 
         base_alpha = self._cached_alpha
@@ -2235,6 +2259,7 @@ class SuperGrok2(Optimizer):
             active_exp_avgs.append(self._flat_exp_avgs[i])
             active_exp_avg_sqs.append(self._flat_exp_avg_sqs[i])
             active_mus.append(self._flat_mus[i])
+            active_slows.append(self._flat_slows[i])
             active_gru_states.append(self._flat_gru_states[i])
             alpha_mus.append(float(alpha_i))
             lamb_effs.append(float(lamb_eff))
@@ -2251,6 +2276,9 @@ class SuperGrok2(Optimizer):
         batched_step(
             active_params, active_grads, active_sharpness,
             active_exp_avgs, active_exp_avg_sqs, active_mus,
+            # slows mirror mus (restored grokfast slow-grad EMA); position
+            # matches supergrok2_batched_step's `slows` param (after mus).
+            active_slows,
             active_gru_states,
             # ── shared input projection ──
             w['input_proj_W'], w['input_proj_b'],
@@ -2351,9 +2379,19 @@ class SuperGrok2(Optimizer):
         self._flat_gru_states[pidx] = new_gru.detach()
         # Attention is stateless: no scan state to persist.
 
-        mu = self._flat_mus[pidx]
-        mu.mul_(alpha_i).add_(grad.reshape(-1), alpha=1.0 - alpha_i)
-        effective_grad = smart_grad.reshape(-1) + lamb_eff * mu
+        # Restored grokfast amplification. Use the dedicated slow-gradient EMA
+        # buffer (_flat_slows) here, NOT _flat_mus: the kernel paths (step /
+        # step_compiled) reserve _flat_mus for sg2_apply_step's expert-output
+        # EMA (mu_new = gru_decay*mu + (1-gru_decay)*expert_out) and carry the
+        # slow-grad EMA in _flat_slows. The eager meta_net already folds the
+        # expert output into `smart_grad`, so this path only needs the slow EMA:
+        #   slow = alpha*slow + (1-alpha)*g ; eff = smart_grad + lamb_eff*slow
+        # which mirrors sg2_apply_step's `slow_new` term (alpha == alpha_i is
+        # both the mixing coeff and the slow-EMA decay). Converging the buffer
+        # convention keeps _flat_mus consistent across every code path.
+        slow = self._flat_slows[pidx]
+        slow.mul_(alpha_i).add_(grad.reshape(-1), alpha=1.0 - alpha_i)
+        effective_grad = smart_grad.reshape(-1) + lamb_eff * slow
 
         fg = effective_grad.reshape(-1).float()
         ea = self._flat_exp_avgs[pidx]
@@ -2375,6 +2413,74 @@ class SuperGrok2(Optimizer):
         if self.param_groups:
             return self._get_effective_wd(self.param_groups[0]["weight_decay"])
         return 0.0
+
+    # ── Checkpoint fidelity (same contract as SuperGrok11/15) ───────────────
+    # All evolving state lives outside base Optimizer.state: the flat Adam
+    # moments (+ INT8 scales under config3), the expert-EMA mu, the grokfast
+    # slow EMA, sharpness, the per-coordinate GRU hidden states, per-param step
+    # counters, the trained CSA/HCA/PEER meta-net (whose expert_counts /
+    # step_counter recycling buffers ride its own state_dict), and the
+    # step_full-internal meta Adam. Serialize all of it or a resume silently
+    # resets the optimizer AND the trained meta-net. Derived constants
+    # (_flat_layer_*) are rebuilt by __init__ and not serialized; the legacy
+    # _flat_mamba_*_states are None placeholders and skipped.
+    _EXTRA_KEY = "supergrok2_extra"
+    _EXTRA_TENSOR_LISTS = ("flat_exp_avgs", "flat_exp_avg_sqs",
+                           "flat_exp_avg_scales", "flat_mus", "flat_slows",
+                           "flat_sharpness", "flat_gru_states")
+
+    def state_dict(self):
+        sd = super().state_dict()
+        self._ensure_state()
+        sd[self._EXTRA_KEY] = {
+            "global_step": self._global_step,
+            "step_counter": self._step_counter,
+            "cached_alpha": self._cached_alpha,
+            "cached_train_acc": self._cached_train_acc,
+            "flat_steps": list(self._flat_steps),
+            "meta_net": self.meta_net.state_dict(),
+        }
+        for key in self._EXTRA_TENSOR_LISTS:
+            sd[self._EXTRA_KEY][key] = [t.detach().clone()
+                                        for t in getattr(self, "_" + key)]
+        if hasattr(self, "_auto_meta_opt"):
+            sd[self._EXTRA_KEY]["auto_meta_opt"] = self._auto_meta_opt.state_dict()
+        return sd
+
+    def load_state_dict(self, state_dict):
+        extra = state_dict.get(self._EXTRA_KEY)
+        base = {k: v for k, v in state_dict.items() if k != self._EXTRA_KEY}
+        super().load_state_dict(base)
+        if extra is None:
+            return  # plain/base checkpoint: behave like the base class
+        self._ensure_state()
+        n = len(self._flat_params)
+        for key in self._EXTRA_TENSOR_LISTS:
+            saved = extra[key]
+            live = getattr(self, "_" + key)
+            if len(saved) != len(live):
+                raise ValueError(
+                    f"SuperGrok2.load_state_dict: checkpoint has {len(saved)} "
+                    f"{key} buffers but the optimizer holds {len(live)} (model "
+                    f"params: {n}) — architecture or state_precision changed.")
+            for dst, src in zip(live, saved):
+                if dst.numel() != src.numel():
+                    raise ValueError(
+                        f"SuperGrok2.load_state_dict: {key} numel mismatch "
+                        f"({dst.numel()} vs checkpoint {src.numel()}).")
+                dst.copy_(src.to(dst.device, dtype=dst.dtype))
+        self._flat_steps = list(extra["flat_steps"])
+        self._global_step = int(extra["global_step"])
+        self._step_counter = int(extra["step_counter"])
+        self._cached_alpha = float(extra["cached_alpha"])
+        self._cached_train_acc = float(extra["cached_train_acc"])
+        self.meta_net.load_state_dict(extra["meta_net"])
+        if "auto_meta_opt" in extra:
+            if not hasattr(self, "_auto_meta_opt"):
+                self._auto_meta_opt = torch.optim.Adam(
+                    self.meta_net.parameters(), lr=1e-4)
+            self._auto_meta_opt.load_state_dict(extra["auto_meta_opt"])
+        self._weights_dirty = True   # re-extract kernel weights from the loaded net
 
     def step_full(self, model, train_x, train_y, val_x, val_y, criterion=None):
         """Complete training step: forward + backward + SAM + meta-learning + optimizer."""
