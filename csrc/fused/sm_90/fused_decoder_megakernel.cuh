@@ -51,6 +51,54 @@
 #include <cstdint>
 #include <cassert>
 
+// ============================================================================
+//  SG_TUNED_GEMM_IMPL — the per-cell GEMM-engine selector (DESIGN-TC-PIPELINE.md
+//  §9 / the owner "BOTH paths compiled, the tuner picks" directive). The scalar
+//  fp32 owner-computes path (model_stages_decoder.cuh) and the bf16 wgmma
+//  tensor-core path (model_stage_decoder_tc.cuh) are compiled ALONGSIDE each
+//  other; the kernel-autotuner injects -DSG_TUNED_GEMM_IMPL=<token> per-TU to
+//  pick one. Absent the macro, the SCALAR path compiles verbatim (CONTRACT
+//  rule 3: an untuned build is a correct build) — this is the shipped default
+//  and the path all of test_megakernel_vs_eager.py's L3-REAL decoder gates
+//  exercise; adding this seam must leave those numbers BIT-IDENTICAL.
+//
+//  Tokens are integers (the C preprocessor cannot compare strings, and the
+//  autotuner's -D injection passes an integer literal):
+//      SG_GEMM_IMPL_SCALAR = 0   (default; the verbatim fp32 path below)
+//      SG_GEMM_IMPL_WGMMA  = 1   (the Fork-B bf16 tensor-core cell)
+//
+//  WGMMA-PATH STATUS (honest, no-suppression — MEMORY.md "fix components, never
+//  disable them"): the validated unit today is the GEMM ENGINE
+//  (model_stage_decoder_tc.cuh::tc_gemm_block_unpipelined + the wgmma.cuh /
+//  tile_pipeline.cuh substrate), silicon-gated 13/13 by test_decoder_tc.py
+//  (fwd/dX/dW vs the bf16-rounded fp64 oracle, A=I localizations exactly 0.0,
+//  dW A/A/A bit-identical) on a validated 18/18 substrate. The full Fork-B
+//  fwd+bwd CELL DRIVER (the phase-restructured P0→P1(fwd+bwd, acts→HBM)→
+//  optimizer megakernel that REPLACES the body below) is DESIGN §11 work item
+//  R2.3 and is NOT yet authored. Selecting the wgmma token therefore FAILS THE
+//  COMPILE LOUDLY (the #error below) rather than silently shipping the scalar
+//  body under a wgmma name — a wgmma-requested cell that secretly ran scalar
+//  would be exactly the functionality suppression the owner forbids. The seam
+//  is in place and dormant; wiring the driver into it is the bounded next step.
+// ============================================================================
+#define SG_GEMM_IMPL_SCALAR 0
+#define SG_GEMM_IMPL_WGMMA  1
+#ifndef SG_TUNED_GEMM_IMPL
+#define SG_TUNED_GEMM_IMPL SG_GEMM_IMPL_SCALAR
+#endif
+#if (SG_TUNED_GEMM_IMPL != SG_GEMM_IMPL_SCALAR) && \
+    (SG_TUNED_GEMM_IMPL != SG_GEMM_IMPL_WGMMA)
+#error "SG_TUNED_GEMM_IMPL must be SG_GEMM_IMPL_SCALAR (0) or SG_GEMM_IMPL_WGMMA (1)"
+#endif
+#if (SG_TUNED_GEMM_IMPL == SG_GEMM_IMPL_WGMMA)
+#error "SG_TUNED_GEMM_IMPL=wgmma: the decoder Fork-B tensor-core CELL DRIVER is \
+not yet authored (DESIGN-TC-PIPELINE.md R2.3). The wgmma GEMM ENGINE is \
+validated (tests/hw/test_decoder_tc.py 13/13 on an 18/18 substrate), but the \
+phase-restructured fwd+bwd megakernel that drives it is pending. Refusing to \
+compile rather than silently ship the scalar body under the wgmma token (the \
+no-suppression directive). Build with the default (scalar) until R2.3 lands."
+#endif
+
 namespace sg { namespace fused { namespace sm90 {
 
 // Rebase a FusedOptState's per-element state pointers to a parameter-tensor

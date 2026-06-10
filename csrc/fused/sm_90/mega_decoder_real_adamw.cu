@@ -19,6 +19,20 @@
 
 #include "csrc/fused/sm_90/fused_decoder_megakernel.cuh"
 
+// GEMM-engine selector (DESIGN-TC-PIPELINE.md §9). This cell TU is one of the
+// per-TU sites the kernel-autotuner targets with -DSG_TUNED_GEMM_IMPL=<token>
+// (the other being fused_decoder_megakernel.cuh, included above, which owns the
+// token definitions + the scalar-default + the wgmma-pending #error). The guard
+// is repeated here at the CELL boundary so a wgmma-requested decoder×adamw cell
+// refuses LOUDLY at its own launcher TU — it never links a scalar body under the
+// wgmma name (the owner no-suppression directive). When the Fork-B driver lands
+// (DESIGN R2.3) the wgmma branch will select the tensor-core launcher here;
+// until then the only buildable token is the scalar default (the shipped path).
+#if (SG_TUNED_GEMM_IMPL == SG_GEMM_IMPL_WGMMA)
+#error "mega_decoder_real_adamw: SG_TUNED_GEMM_IMPL=wgmma but the decoder Fork-B \
+tensor-core cell driver is pending (DESIGN R2.3); see fused_decoder_megakernel.cuh."
+#endif
+
 namespace sg { namespace fused { namespace sm90 {
 
 cudaError_t mega_decoder_real_adamw(
