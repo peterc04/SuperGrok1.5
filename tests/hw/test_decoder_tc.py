@@ -483,7 +483,14 @@ def _run_tc_step(mod, params, tokens, targets, state, lr, betas, wd, eps, step):
 # real bug makes early layers ≫ late); the absolute floor is calibrated below.
 _TC_GRAD_REL_WEIGHTS = 0.15   # weight matrices (dW, T-contraction bf16 floor)
 _TC_GRAD_REL_BIASES = 0.08    # biases / LN vectors / embeddings (less cancellation)
-_TC_LOSS_REL = 5e-3           # loss (logsumexp fp32)
+# loss (logsumexp fp32) — bf16-floor CALIBRATED, ViT-equivalent (the same discipline:
+# gate to the measured bf16 floor, NOT a loose 5e-3). With all four linear biases
+# folded (in/out/ff0/ff2 — matching the scalar path + the bf16-faithful oracle) the
+# fixed kernel loss-rel is 2.85e-5; the bias-omission bug rode at 2.52e-4. 1e-4 threads
+# the measured (2.85e-5, 2.52e-4) window (geometric-mean-centered, ~3x margin each side):
+# it PASSES the faithful kernel (3.5x headroom) and CATCHES the bias bug (2.5x), per the
+# no-suppression discipline — a 50x tightening over the old 5e-3 that never saw the bug.
+_TC_LOSS_REL = 1e-4
 
 
 @_GATE
