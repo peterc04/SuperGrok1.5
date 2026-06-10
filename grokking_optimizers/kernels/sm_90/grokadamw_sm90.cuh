@@ -50,9 +50,25 @@ __device__ __forceinline__ int8_t ptx_int8_stochastic_round(
     float scaled = val / fmaxf(scale, 1e-12f);
     float tr = truncf(scaled);
     float frac = fabsf(scaled - tr);
-    // Extract lower 16 bits as threshold using prmt
+    // Extract the LOW 16 bits of rand_bits as a contiguous uint16 threshold.
+    //
+    // prmt.b32 d, a, b, c builds d from 4 bytes selected by the nibbles of the
+    // control word c. Byte sources are indexed 0..3 = a.b0..a.b3, 4..7 = b.b0..
+    // b.b3. With a = rand_bits and b = 0, sources 4/5/6/7 are all zero. The
+    // control nibbles are read low→high → c=0x4410 lays out result bytes as:
+    //   d.b0 = src 0 = rand_bits.b0   (low byte of the low half)
+    //   d.b1 = src 1 = rand_bits.b1   (high byte of the low half)
+    //   d.b2 = src 4 = 0
+    //   d.b3 = src 4 = 0
+    // i.e. d == (rand_bits & 0xFFFF): the contiguous low 16 bits, so threshold =
+    // d/65536 is uniform in [0,1). The previous control 0x4140 selected bytes
+    // [b0,0,b1,0] (interleaved with zero bytes), giving d up to ~0x00FF00FF so
+    // threshold ranged over [0,256) — the round-up branch (frac>threshold) then
+    // fired only when frac>~1, i.e. essentially never (~1/256), biasing the INT8
+    // momentum quantization toward truncation. 0x4410 restores the intended
+    // [0,1) stochastic-rounding threshold.
     unsigned lo16;
-    asm("prmt.b32 %0, %1, 0, 0x4140;" : "=r"(lo16) : "r"(rand_bits));
+    asm("prmt.b32 %0, %1, 0, 0x4410;" : "=r"(lo16) : "r"(rand_bits));
     float threshold = (float)lo16 / 65536.0f;
     if (frac > threshold) tr += (scaled > 0) ? 1.0f : -1.0f;
     return (int8_t)fmaxf(-127.0f, fminf(127.0f, tr));
@@ -66,14 +82,14 @@ namespace prim = ::sg::sm90::primitives;
 using ::sg::algorithms::grokadamw_step;
 using ::sg::algorithms::grokadamw_adam_tail;
 
-#ifndef SG_GROKADAMW_MIN_BLOCKS
-#define SG_GROKADAMW_MIN_BLOCKS 4
+#ifndef SG_TUNED_MIN_BLOCKS
+#define SG_TUNED_MIN_BLOCKS 4
 #endif
 
 // SG_TUNED_UNROLL-parameterized scalar grid-stride kernel; calls the canonical
 // per-element grokadamw_step (math single-sourced in algorithms/grokadamw.h).
 template <typename ParamT, typename GradT, int UNROLL>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_GROKADAMW_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 grokadamw_kernel(
     ParamT* param, float* exp_avg, float* exp_avg_sq, float* ema,
     const GradT* grad,
@@ -98,7 +114,7 @@ grokadamw_kernel(
 }
 
 // FP32 vec4 fast path: float4 global traffic, canonical step CALLED 4×.
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_GROKADAMW_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 grokadamw_kernel_vec4_fp32(
     float4* param4, float4* exp_avg4, float4* exp_avg_sq4, float4* ema4,
     const float4* grad4,

@@ -41,19 +41,18 @@ namespace sg { namespace sm90 {
 
 namespace prim = ::sg::sm90::primitives;
 using ::sg::algorithms::lion_step;
-using ::sg::algorithms::lion_step_vec4;
 
 // Minimum resident blocks/SM for the bandwidth-bound element-wise applies.
 // Caps registers so occupancy stays high on the memory-bound path.
-#ifndef SG_LION_MIN_BLOCKS
-#define SG_LION_MIN_BLOCKS 4
+#ifndef SG_TUNED_MIN_BLOCKS
+#define SG_TUNED_MIN_BLOCKS 4
 #endif
 
 // SG_TUNED_UNROLL elements per iteration; the canonical lion_step is CALLED
 // (math single-sourced) — the unroll only changes the loop structure the
 // autotuner generates, not the math.
 template <typename ParamT, typename GradT, int UNROLL>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_LION_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 lion_kernel(
     ParamT* param, float* exp_avg,
     const GradT* grad,
@@ -73,15 +72,37 @@ lion_kernel(
     }
 }
 
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_LION_MIN_BLOCKS)
+// FP32 vec4 fast path — register-sanitize pattern (matches grokadamw/adamw):
+// load param/momentum with cached ld_f32v4 and grad with read-only ldg_f32v4
+// (const cache), zero any non-finite gradient lane IN REGISTERS, then CALL the
+// canonical scalar lion_step 4× on the register lanes. Math single-sourced in
+// algorithms/lion.h — NOT re-typed here.
+//
+// BEHAVIORAL NOTE: this path no longer writes the sanitized gradient back to the
+// caller's grad buffer on a NaN/Inf (the old lion_step_vec4 re-read grad from
+// memory, which is why it needed the in-place writeback). It now matches the
+// register-sanitize family: the vec4 path does NOT mutate the caller's grad on
+// NaN. The scalar (non-vec4) lion_kernel path is UNCHANGED.
+//
+// SASS expectation post-rebuild: the redundant per-element STG.E.128 writeback
+// of the grad is gone, and the grad load is a const-cached LDG.E.128.
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 lion_kernel_vec4_fp32(
     float4* param4, float4* exp_avg4, const float4* grad4,
     float lr, float beta1, float beta2, float wd, int64_t N4
 ) {
     const int64_t stride = prim::grid_stride();
     for (int64_t i = prim::grid_stride_index(); i < N4; i += stride) {
-        SG_SANITIZE_GRAD4_INPLACE(grad4, i);
-        lion_step_vec4(param4, exp_avg4, grad4, lr, beta1, beta2, wd, i);
+        float4 p  = prim::ld_f32v4(param4 + i);
+        float4 ea = prim::ld_f32v4(exp_avg4 + i);
+        float4 g  = prim::ldg_f32v4(grad4 + i);
+        ::grokking::sm90::sg_sanitize_grad4(g);
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            lion_step(&p.x, &ea.x, &g.x, lr, beta1, beta2, wd, u);
+        }
+        prim::st_f32v4(param4 + i, p);
+        prim::st_f32v4(exp_avg4 + i, ea);
     }
 }
 
@@ -107,8 +128,12 @@ void launch_lion_step(
     const bool all_fp32 = param.scalar_type() == torch::kFloat32 &&
                           grad.scalar_type() == torch::kFloat32;
 
+    // #8 alignment symmetry: the vec4 kernel now reads/writes exp_avg (the Lion
+    // momentum buffer) as float4 too, so it must also be 16B-alignable before the
+    // vec4 path is taken (matches grokadamw/prodigy/neuralgrok discipline).
     if (SG_TUNED_VEC_WIDTH == 4 && all_fp32 &&
         prim::is_vec4_alignable(param.data_ptr(), N) &&
+        prim::is_vec4_alignable(exp_avg.data_ptr(), N) &&
         prim::is_vec4_alignable(grad.data_ptr(), N)) {
         const int64_t N4 = N / 4;
         const int grid4 = static_cast<int>(

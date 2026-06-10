@@ -1524,9 +1524,12 @@ def _cuda_common_rules(arch_key: str) -> List[Dict[str, str]]:
          "expr": f"block % {warp} == 0"},
         {"name": "vec_block_alignment",
          "expr": "block % (vec * 4) == 0"},
-        # Smem heuristic: block * num_stages * 4 * vec ≤ max_smem_per_block.
+        # Smem heuristic: block * stages * 4 * vec ≤ max_smem_per_block. The
+        # device SG_TUNED_NUM_STAGES macro is dead (no CUDA kernel reads it), so
+        # num_stages is no longer a device dim; the pipeline depth is fixed at 1
+        # for the elementwise path, leaving the budget = block * 4 * vec.
         {"name": "smem_budget",
-         "expr": f"(block * num_stages * 4 * vec) <= {smem}"},
+         "expr": f"(block * 4 * vec) <= {smem}"},
     ]
 
 
@@ -1542,7 +1545,7 @@ def _cdna_common_rules(arch_key: str) -> List[Dict[str, str]]:
         {"name": "vec_block_alignment",
          "expr": "block % (vec * 4) == 0"},
         {"name": "lds_budget",
-         "expr": f"(block * num_stages * 4 * vec) <= {smem}"},
+         "expr": f"(block * 4 * vec) <= {smem}"},
         # Combined waves_per_eu × per-thread reg budget heuristic.
         {"name": "occupancy_budget",
          "expr": "(block * (waves_per_eu if waves_per_eu else 1) * vec * 4) <= 65536"},
@@ -1561,7 +1564,7 @@ def _rdna_common_rules(arch_key: str) -> List[Dict[str, str]]:
         {"name": "vec_block_alignment",
          "expr": "block % (vec * 4) == 0"},
         {"name": "lds_budget",
-         "expr": f"(block * num_stages * 4 * vec) <= {smem}"},
+         "expr": f"(block * 4 * vec) <= {smem}"},
     ]
 
 
@@ -1590,8 +1593,11 @@ def _build_cuda_space(arch_key: str,
              "SG_TUNED_VEC_WIDTH", ["host", "device"]),
         _dim("unroll", "int", unroll_values,
              "SG_TUNED_UNROLL", ["host", "device"]),
-        _dim("num_stages", "int", stages_values,
-             "SG_TUNED_NUM_STAGES", ["device"]),
+        # NOTE: num_stages is NOT a device dim — SG_TUNED_NUM_STAGES is dead on
+        # CUDA (no kernel #ifdef's it). It survives only as a LIVE pl.pallas_call
+        # kwarg in _build_pallas_space (and therefore stays in config_key + the
+        # cost-model column). ``stages_values`` is accepted for back-compat but
+        # only feeds the Pallas builder.
         _dim("maxrregcount", "int", _maxrregcount_values(arch_key),
              None, ["device"]),
         _dim("swizzle", "int", [0, 32, 64, 128, 256],
@@ -1608,8 +1614,6 @@ def _build_cuda_space(arch_key: str,
         dims.append(_dim("async_depth", "int",
                          list(range(1, _ASYNC_DEPTH_MAX + 1)),
                          "SG_TUNED_ASYNC_DEPTH", ["device"]))
-        rules.append({"name": "async_depth_stages",
-                      "expr": "async_depth >= num_stages - 1"})
 
     if "wgmma" in features:
         # sm_90a: base wgmma shapes; sm_100a/103a add tcgen05 variants.
@@ -1686,8 +1690,8 @@ def _build_cdna_space(arch_key: str,
              "SG_TUNED_VEC_WIDTH", ["host", "device"]),
         _dim("unroll", "int", unroll_values,
              "SG_TUNED_UNROLL", ["host", "device"]),
-        _dim("num_stages", "int", stages_values,
-             "SG_TUNED_NUM_STAGES", ["device"]),
+        # num_stages dropped from device dims (SG_TUNED_NUM_STAGES is dead on
+        # HIP — no kernel reads it); it lives on only as a Pallas kwarg.
         _dim("maxrregcount", "int", _maxrregcount_values(arch_key),
              None, ["device"]),
         _dim("lds_padding", "int", [0, 4, 8, 16, 32],
@@ -1753,8 +1757,8 @@ def _build_rdna_space(arch_key: str,
              "SG_TUNED_VEC_WIDTH", ["host", "device"]),
         _dim("unroll", "int", unroll_values,
              "SG_TUNED_UNROLL", ["host", "device"]),
-        _dim("num_stages", "int", stages_values,
-             "SG_TUNED_NUM_STAGES", ["device"]),
+        # num_stages dropped from device dims (SG_TUNED_NUM_STAGES is dead on
+        # HIP — no kernel reads it); it lives on only as a Pallas kwarg.
         _dim("maxrregcount", "int", _maxrregcount_values(arch_key),
              None, ["device"]),
         _dim("lds_padding", "int", [0, 4, 8, 16, 32],
@@ -1839,8 +1843,51 @@ def _sm90_full_space() -> Dict[str, Any]:
                  "SG_TUNED_VEC_WIDTH", ["host", "device"]),
             _dim("unroll", "int", [1, 2, 4, 8, 16, 32, 64, 128],
                  "SG_TUNED_UNROLL", ["host", "device"]),
-            _dim("num_stages", "int", list(range(1, 9)),
-                 "SG_TUNED_NUM_STAGES", ["device"]),
+            # min_blocks => __launch_bounds__ 2nd arg (min CTAs/SM) on every
+            # sm_90 optimizer launcher (kernels/sm_90/*_sm90.cuh). Default 4
+            # matches the committed #ifndef SG_TUNED_MIN_BLOCKS literal, so the
+            # no-JSON build is byte-identical (verified via nvcc -E). LIVE on
+            # sm_90 (the scanner sees SG_TUNED_MIN_BLOCKS in the kernel bodies).
+            # MUST stay AFTER (block, vec, unroll): those three are the codegen
+            # template's baked operands (the SM_90A .j2 has no default() for them
+            # and the codegen self-tests sample dims[:3]); min_blocks is not a
+            # codegen dim, so it belongs past the first-three window.
+            _dim("min_blocks", "int", [1, 2, 3, 4, 6, 8],
+                 "SG_TUNED_MIN_BLOCKS", ["device"]),
+            # prod_regs / cons_regs => setmaxnreg targets for the producer /
+            # consumer warp-groups of the warp-specialized sm_90 paths (the
+            # fused megakernel's §3.4 split AND tile_pipeline.cuh share these
+            # tokens). Defaults 32 / 200 match the fused megakernel's prior
+            # literals (byte-identical untuned build, verified via nvcc -E).
+            # Multiples of 8 (setmaxnreg granularity); the producer wants few
+            # regs, the consumer holds the fp32 accumulator + addressing. Kept
+            # past the first-three codegen window. The scanner already sees both
+            # tokens (tile_pipeline.cuh) so they are LIVE; registering the dims
+            # is what makes the autotuner actually sweep them.
+            _dim("prod_regs", "int", [32, 24, 40, 48, 56],
+                 "SG_TUNED_PROD_REGS", ["device"]),
+            _dim("cons_regs", "int", [200, 168, 184, 216, 232, 240],
+                 "SG_TUNED_CONS_REGS", ["device"]),
+            # === RISKY (needs-parity) fused-megakernel launch dims ===========
+            # mega_block / grad_tile are consumed by the L3 fused megakernels
+            # (csrc/fused/sm_90/*: the fused tail + the decoder/vit/mamba drivers
+            # + the SuperGrok2 stage), tuned through the SAME sweep machinery via
+            # megakernel_cell_search_space (which builds this space). Defaults
+            # (256 / 1024) equal the prior literals so the untuned build is
+            # byte-identical (verified via nvcc -E). NEEDS-PARITY before shipping
+            # a non-default winner: mega_block must stay a multiple of the
+            # 128-thread warp-group (the §3.4 producer/consumer split) and
+            # grad_tile resizes a __shared__ array — the autotuner cannot prove
+            # either is correct; only the H100 parity gate can. Sweep sets are
+            # kept SMALL (2 values each) to respect the per-arch cardinality
+            # budget; widen once parity validates the shape.
+            _dim("mega_block", "int", [256, 512],
+                 "SG_TUNED_MEGA_BLOCK", ["device"]),
+            _dim("grad_tile", "int", [1024, 2048],
+                 "SG_TUNED_GRAD_TILE", ["device"]),
+            # num_stages dropped: SG_TUNED_NUM_STAGES is dead on sm_90 (no kernel
+            # reads it). It remains a LIVE Pallas kwarg only (see
+            # _build_pallas_space), so it stays in config_key + the cost model.
             _dim("maxrregcount", "int", list(range(32, 253, 4)) + [255],
                  None, ["device"]),
             _dim("cluster_shape", "tuple", _hopper_cluster_shapes(),
@@ -1863,16 +1910,17 @@ def _sm90_full_space() -> Dict[str, Any]:
                 {"name": "warps_per_block", "expr": "(block // 32) <= 32"},
                 {"name": "vec_block_alignment",
                  "expr": "block % (vec * 4) == 0"},
-                {"name": "stages_block",
-                 "expr": "num_stages * vec <= block // 32"},
+                # vec width must not exceed the warp count (was
+                # "num_stages * vec <= block // 32" with the now-removed device
+                # num_stages dim; num_stages was pinned to 1 → vec <= warps).
+                {"name": "vec_le_warps",
+                 "expr": "vec <= block // 32"},
                 {"name": "tma_requires_block",
                  "expr": "(not tma) or block >= 128"},
                 {"name": "warpspec_requires_block",
                  "expr": "(not warp_specialization) or block >= 128"},
                 {"name": "cluster_volume",
                  "expr": "cluster_shape[0] * cluster_shape[1] * cluster_shape[2] <= 8"},
-                {"name": "async_depth_stages",
-                 "expr": "async_depth >= num_stages - 1"},
             ],
         },
     }
@@ -1933,8 +1981,8 @@ def _gfx942_full_space() -> Dict[str, Any]:
                  "SG_TUNED_VEC_WIDTH", ["host", "device"]),
             _dim("unroll", "int", [1, 2, 4, 8, 16, 32, 64, 128],
                  "SG_TUNED_UNROLL", ["host", "device"]),
-            _dim("num_stages", "int", list(range(1, 9)),
-                 "SG_TUNED_NUM_STAGES", ["device"]),
+            # num_stages dropped: SG_TUNED_NUM_STAGES is dead on gfx942 (no HIP
+            # kernel reads it); it persists only as a Pallas kwarg.
             _dim("maxrregcount", "int", list(range(32, 256, 4)),
                  None, ["device"]),
             _dim("waves_per_eu", "int", list(range(1, 11)),
@@ -1950,6 +1998,16 @@ def _gfx942_full_space() -> Dict[str, Any]:
                  ["default", "llvm", "iglp_max_throughput",
                   "iglp_max_throughput_v2", "iglp_gemm", "none"],
                  "SG_TUNED_SCHEDULER_HINT", ["device"]),
+            # NOTE: SG_TUNED_MIN_BLOCKS is intentionally NOT registered here.
+            # The macro is consumed only by the sm_90 launchers; no gfx942 HIP
+            # body reads it. Because the liveness scanner is GLOBAL (a macro seen
+            # in any device tree reads live everywhere), registering it on gfx942
+            # would mark it live-but-unconsumed here → 6 binary-identical HIP
+            # builds with 6 distinct config_keys (false cache misses + redundant
+            # compiles), the exact pathology the dead-dim derivation exists to
+            # kill. This mirrors SG_TUNED_CLUSTER_SHAPE, another sm_90-only macro
+            # deliberately absent from this space. Re-add (one _dim line) if/when
+            # a gfx942 launcher adopts the macro.
         ]),
         "prefilter": {
             # AMDGPU per-thread VGPR ceiling is 255, not 256.
@@ -4647,6 +4705,11 @@ _COST_MODEL_CANONICAL_DIM_VALUES: "collections.OrderedDict[str, Tuple[Any, ...]]
         ("async_depth",           (1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16)),
         ("warp_specialization",   (0, 1)),
         ("tma_descriptors",       (0, 1, 2, 4, 8)),
+        ("min_blocks",            (1, 2, 3, 4, 6, 8)),
+        ("prod_regs",             (24, 32, 40, 48, 56)),
+        ("cons_regs",             (168, 184, 200, 216, 232, 240)),
+        ("mega_block",            (256, 384, 512)),
+        ("grad_tile",             (512, 1024, 2048)),
     ])
 
 # Numeric features emitted for every config (zero-filled when the dim
@@ -8968,6 +9031,33 @@ def _auto_discover_sources(root: Path, vendor: str,
     return found
 
 
+def _owns_extension_module_tu(path: Path) -> bool:
+    """True if ``path`` is a standalone-JIT TU that must NOT be linked into a
+    shared ``_ops``-style module: it defines its OWN pybind module via
+    ``PYBIND11_MODULE(TORCH_EXTENSION_NAME …)`` and is loaded directly through
+    ``torch.utils.cpp_extension.load`` by its test. Linking it alongside the
+    real bindings re-emits ``PyInit__ops`` (multiple definition) and, via its
+    #included megakernel header, the cell helpers it instantiates.
+
+    Mirrors ``setup.py._collect``'s filter (the AOT path). The ``*_selftest``
+    name rule is kept for the wgmma/decoder self-test TUs; the content check
+    catches same-shaped drivers regardless of name (e.g.
+    ``mega_decoder_real_adamw_tc.cu``, whose header explicitly states "No
+    setup.py glob change"). Limited to CUDA ``.cu`` — the HIP cell TUs use the
+    ``SG_GFX942_DEVICE_TU`` guard, not their own pybind module.
+    """
+    name = path.name
+    if name.endswith("_selftest.cu") or "_overlay" in name:
+        return True
+    if path.suffix != ".cu":
+        return False
+    try:
+        return "PYBIND11_MODULE(TORCH_EXTENSION_NAME" in path.read_text(
+            errors="ignore")
+    except OSError:
+        return False
+
+
 def _resolve_sources(spec: BuildSpec) -> List[Path]:
     """Resolve the per-build source file list.
 
@@ -9016,7 +9106,28 @@ def _resolve_sources(spec: BuildSpec) -> List[Path]:
     if models_dir.exists():
         for g in entry.model_glob:
             models.extend(sorted(models_dir.glob(g)))
-    structured = bindings + launchers + models
+    # Fused L3 megakernel cell TUs (csrc/fused/<arch>/*.<ext>). dispatch.cpp
+    # #includes fused_dispatch_table.inc which references EVERY mega_<model>_<opt>
+    # cell symbol unconditionally, so a JIT/AOT module that links bindings+dispatch
+    # but NOT these TUs builds clean yet fails to dlopen with "undefined symbol:
+    # sg::fused::sm90::mega_<…>" (observed: an adamw/decoder sweep .so missing
+    # mega_vit_supergrok2). setup.py's AOT extension already globs
+    # csrc/fused/<arch>/*.cu, so this restores parity for the structured (non-
+    # auto-discover) JIT path that the autotuner uses. Same standalone-JIT
+    # exclusion as setup.py._collect: drop *_selftest.cu and any TU that owns a
+    # PYBIND11_MODULE(TORCH_EXTENSION_NAME …) (e.g. mega_decoder_real_adamw_tc.cu),
+    # which are JIT-loaded directly by their tests and would re-emit PyInit__ops /
+    # the decoder dec_* helpers, colliding inside this module.
+    fused_arch_subdir = entry.subdir.split("/", 1)[-1]  # cuda/sm_90 -> sm_90
+    fused_dir = REPO_ROOT / "csrc/fused" / fused_arch_subdir
+    fused: List[Path] = []
+    if fused_dir.exists():
+        fused_exts = _AUTO_DISCOVER_EXTS.get(entry.vendor, ())
+        for p in sorted(fused_dir.iterdir()):
+            if (p.is_file() and p.suffix in fused_exts
+                    and not _owns_extension_module_tu(p)):
+                fused.append(p)
+    structured = bindings + launchers + models + fused
     if structured:
         return structured
     # Mandate Tier-1 fallback — no structured layout matched. Auto-discover
@@ -16849,14 +16960,24 @@ def _self_test_search_space(run) -> None:
         of dicts).
 
         After the dead-dim pruning (only block/vec/unroll/maxrregcount +
-        async_depth/cluster_shape on Hopper expand the product; every dead
-        SG_TUNED macro is pinned to one value) the sm_90 live space is a few
-        million combos, not the ~3.7B of the old fully-dead-inflated space."""
+        async_depth/cluster_shape + the registered launch dims — min_blocks,
+        prod_regs, cons_regs — on Hopper expand the product; every dead
+        SG_TUNED macro is pinned to one value) the sm_90 live space is ~10^9,
+        not the ~10^11 it would be if dead-dim pinning regressed.
+
+        The ceiling is a DEAD-INFLATION guard, not a sampler limit (the tuner
+        uses TPE/Bayesian sampling + prefilter and never enumerates). It is set
+        to separate the legitimate all-live space (~1.05e9 with the launch dims
+        registered) from a pin-regression (the four dead macros num_stages /
+        swizzle / warp_specialization / tma carry a 160x product → ~1.7e11),
+        so 10^10 passes the former and still trips on the latter. Raising it to
+        admit live launch dims is recalibration, NOT suppression: no coverage is
+        removed (owner rule: every perf constant stays a swept SG_TUNED dim)."""
         space = load_embedded_search_space()
         count = cartesian_count(space, "sm_90")
-        # Sanity bound — pruned sm_90 live space is in the low millions.
+        # Sanity bound — all-live sm_90 space is ~10^9; dead-inflation is ~10^11.
         assert count > 1_000_000, f"sm_90 count too small: {count}"
-        assert count < 10**9, f"sm_90 count unreasonably large: {count}"
+        assert count < 10**10, f"sm_90 count unreasonably large: {count}"
         # Iterator yields exactly that many items — verify on a tiny slice.
         it = cartesian(space, "sm_90")
         first_few = list(itertools.islice(it, 5))
@@ -16866,17 +16987,34 @@ def _self_test_search_space(run) -> None:
         assert set(first_few[0].keys()) == names
 
     def test_prefilter_eliminates():
-        """Stream the prefilter against a CAPPED slice of the full space —
-        verifies the prefilter actually rejects some configs, without
-        materializing the billion-config Cartesian product."""
+        """Prove the prefilter rules actually discriminate — one explicitly
+        eliminable config is rejected and one valid config survives.
+
+        This asserts the RULES directly rather than scanning the first-N
+        Cartesian items: the lexicographic order (and therefore which configs
+        land in any window) depends on dim count and ordering, so a window
+        scan silently goes vacuous the moment a new dim is appended (it pushes
+        the first eliminable config past the cap). The two explicit configs
+        carry every key the sm_90 prefilter rules reference, so the check is
+        invariant to how many tuning dims the space grows."""
         space = load_embedded_search_space()
-        # Take the first 50k Cartesian items and run prefilter on them.
-        slice_iter = itertools.islice(cartesian(space, "sm_90"), 50_000)
-        survivors, eliminated = ss_prefilter(
-            slice_iter, space["sm_90"]["prefilter"])
-        # Some configs must pass (block=32, vec=1 + reasonable values).
-        # Some must fail (e.g. block=32 with stages=8 violates stages_block).
-        assert len(survivors) + eliminated == 50_000
+        pf = space["sm_90"]["prefilter"]
+        # Base config = first value of every sm_90 dim → block=32, vec=1, ...
+        # which satisfies all rules (a known survivor).
+        base = {d["name"]: d["values"][0] for d in space["sm_90"]["dims"]}
+        surv, elim = ss_prefilter(iter([dict(base)]), pf)
+        assert len(surv) == 1 and elim == 0, \
+            f"baseline valid config was eliminated: surv={surv} elim={elim}"
+        # block=32 with vec=2 violates stages_block (num_stages*vec <= block//32
+        # → 1*2 <= 1 is false) and vec_block_alignment (32 % 8 != 0) → eliminated.
+        bad = dict(base); bad["vec"] = 2
+        surv2, elim2 = ss_prefilter(iter([bad]), pf)
+        assert len(surv2) == 0 and elim2 == 1, \
+            f"explicitly-eliminable config survived — rules broken? " \
+            f"surv={surv2} elim={elim2}"
+        # Streaming sanity: count is conserved over a mixed batch.
+        survivors, eliminated = ss_prefilter(iter([dict(base), bad]), pf)
+        assert len(survivors) + eliminated == 2
         assert eliminated > 0, "prefilter eliminated nothing — rules broken?"
         assert len(survivors) > 0, "prefilter eliminated everything — rules too strict?"
 
@@ -16951,8 +17089,17 @@ def _self_test_search_space(run) -> None:
         Bounds reflect the dead-dim pruning: only the LIVE dims
         (block/vec/unroll/maxrregcount, plus async_depth/cluster_shape on
         Hopper+) expand the CUDA/HIP product now — the dead SG_TUNED macros
-        are each pinned to a single value — so the per-arch live space is
-        ~10^4..10^7, not the old ~10^6..10^13 dead-inflated range."""
+        are each pinned to a single value — so most arches' live space is
+        ~10^4..10^7, not the old ~10^6..10^13 dead-inflated range.
+
+        sm_90a is the exception: it additionally carries the registered
+        warp-launch dims (min_blocks / prod_regs / cons_regs, sm_90-only macros
+        consumed by the *_sm90.cuh launchers + the fused megakernel), which lift
+        its all-live space to ~10^9. Its ceiling is raised to 10^10 to admit
+        them — that still trips on a dead-dim pin regression (~1.7e11) so the
+        guard's purpose is intact, and no live coverage is removed (owner rule:
+        every perf constant stays a swept SG_TUNED dim, no hand-tuning). Every
+        OTHER arch keeps the tight 10^8 dead-inflation ceiling."""
         space = build_full_search_space()
         all_arches = _canonical_arches()
         assert len(all_arches) >= 20, f"only {len(all_arches)} canonical arches"
@@ -16961,7 +17108,10 @@ def _self_test_search_space(run) -> None:
             cnt = cartesian_count(space, arch)
             vendor = ARCH_TABLE[arch].vendor
             if vendor in ("cuda", "hip"):
-                assert 10_000 <= cnt <= 10**8, (
+                # sm_90a carries the extra live warp-launch dims (~10^9); all
+                # other CUDA/HIP arches keep the tight dead-inflation ceiling.
+                hi = 10**10 if arch == "sm_90a" else 10**8
+                assert 10_000 <= cnt <= hi, (
                     f"{arch}: count {cnt} out of CUDA/HIP bounds")
             else:  # pallas
                 assert 10 <= cnt <= 10**6, (

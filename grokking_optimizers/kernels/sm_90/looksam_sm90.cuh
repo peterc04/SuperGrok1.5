@@ -48,12 +48,12 @@ using ::sg::algorithms::looksam_restore_step;
 using ::sg::algorithms::looksam_set_direction;
 using ::sg::algorithms::looksam_apply_step;
 
-#ifndef SG_LOOKSAM_MIN_BLOCKS
-#define SG_LOOKSAM_MIN_BLOCKS 4
+#ifndef SG_TUNED_MIN_BLOCKS
+#define SG_TUNED_MIN_BLOCKS 4
 #endif
 
 template <typename ParamT, typename GradT>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_LOOKSAM_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 looksam_perturb_kernel(
     ParamT* param, ParamT* backup, const GradT* grad, float scale, int64_t N
 ) {
@@ -65,7 +65,7 @@ looksam_perturb_kernel(
 }
 
 template <typename ParamT>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_LOOKSAM_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 looksam_restore_kernel(
     ParamT* param, const ParamT* backup, int64_t N
 ) {
@@ -76,7 +76,7 @@ looksam_restore_kernel(
 }
 
 template <typename GradT>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_LOOKSAM_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 looksam_set_direction_kernel(
     float* sam_dir, const GradT* grad_sam, const GradT* grad_orig, int64_t N
 ) {
@@ -88,7 +88,7 @@ looksam_set_direction_kernel(
 
 // SG_TUNED_UNROLL-parameterized scalar apply; calls canonical looksam_apply_step.
 template <typename ParamT, typename GradT, int UNROLL>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_LOOKSAM_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 looksam_apply_kernel(
     ParamT* param, float* exp_avg, float* exp_avg_sq,
     const float* sam_dir, const GradT* grad,
@@ -112,7 +112,24 @@ looksam_apply_kernel(
 }
 
 // FP32 vec4 fast path for the Adam apply: float4 traffic, canonical step 4×.
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_LOOKSAM_MIN_BLOCKS)
+//
+// Register-sanitize pattern (matches grokadamw/adamw/lion): load param/state
+// with cached ld_f32v4, sam_dir + grad with read-only ldg_f32v4 (const cache),
+// zero any non-finite gradient lane IN REGISTERS (sg_sanitize_grad4), then CALL
+// the canonical scalar looksam_apply_step 4× on the register lanes. Math is
+// single-sourced in algorithms/looksam.h — NOT re-typed here.
+//
+// BEHAVIORAL NOTE: this path no longer writes the sanitized gradient back to the
+// caller's grad buffer on a NaN/Inf — the prior SG_SANITIZE_GRAD4_INPLACE here
+// was a redundant global writeback (the scalar looksam_apply_step reads the
+// already-sanitized REGISTER lane &g.x, never grad4 in memory), so it cost one
+// extra STG.E.128 per 4 elements with no effect on the result. The vec4 path now
+// matches the register-sanitize family: it does NOT mutate the caller's grad on
+// NaN. The scalar (non-vec4) looksam_apply_kernel path is UNCHANGED.
+//
+// SASS expectation post-rebuild: the redundant per-element STG.E.128 writeback
+// of the grad is gone; the grad load stays a const-cached LDG.E.128.
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 looksam_apply_kernel_vec4_fp32(
     float4* param4, float4* exp_avg4, float4* exp_avg_sq4,
     const float4* sam_dir4, const float4* grad4,
@@ -121,12 +138,12 @@ looksam_apply_kernel_vec4_fp32(
 ) {
     const int64_t stride = prim::grid_stride();
     for (int64_t i = prim::grid_stride_index(); i < N4; i += stride) {
-        SG_SANITIZE_GRAD4_INPLACE(grad4, i);
         float4 p  = prim::ld_f32v4(param4 + i);
         float4 m  = prim::ld_f32v4(exp_avg4 + i);
         float4 v  = prim::ld_f32v4(exp_avg_sq4 + i);
         float4 d  = prim::ldg_f32v4(sam_dir4 + i);
         float4 g  = prim::ldg_f32v4(grad4 + i);
+        ::grokking::sm90::sg_sanitize_grad4(g);
         #pragma unroll
         for (int u = 0; u < 4; ++u) {
             looksam_apply_step(&p.x, &m.x, &v.x, &d.x, &g.x,

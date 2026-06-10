@@ -49,16 +49,23 @@ namespace sg { namespace sm90 {
 
 namespace prim = ::sg::sm90::primitives;
 using ::sg::algorithms::sg11_phi_forward;
-using ::sg::algorithms::sg11_sweep_a_step;
-using ::sg::algorithms::sg11_sweep_b_step;
 using ::sg::algorithms::sg11_adam_tail;
+// NOTE: sg11_sweep_a_step / sg11_sweep_b_step were the per-element bodies of the
+// two-sweep cosine-gate path (sg11_sweep_a_kernel / sg11_sweep_b_kernel /
+// launch_supergrok11_step). That path was DEAD device code — no binding and no
+// in-file caller launched launch_supergrok11_step (the live SG v1.1 path is
+// launch_sg11_mu_metanet + compute_cosine_gate_fused + launch_sg11_adam_decay,
+// orchestrated by supergrok11_fused_step in csrc/bindings/bindings.cpp). The
+// sweep kernels + launcher are removed below, so these two using-declarations
+// (which only fed them) are dropped as well. The canonical step bodies remain in
+// csrc/algorithms/supergrok11.h, untouched.
 
 constexpr int SG11_H = 32;
 
 // Minimum resident blocks/SM for the element-wise sweeps. Caps registers so
 // occupancy stays high on the (memory-bound) Adam apply.
-#ifndef SG_SUPERGROK11_MIN_BLOCKS
-#define SG_SUPERGROK11_MIN_BLOCKS 4
+#ifndef SG_TUNED_MIN_BLOCKS
+#define SG_TUNED_MIN_BLOCKS 4
 #endif
 
 // Cooperatively stage the per-element meta-net phi weights into shared memory
@@ -79,192 +86,31 @@ __device__ __forceinline__ void sg11_stage_phi_weights(
     __syncthreads();
 }
 
-template <typename GradT>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_SUPERGROK11_MIN_BLOCKS)
-sg11_sweep_a_kernel(
-    float* mu_out, const GradT* grad, const float* sharpness, const float* momentum,
-    const float* W1, const float* b1, const float* W2, float b2,
-    float* gate_num_p, float* gate_den_g_p, float* gate_den_m_p,
-    int64_t N
-) {
-    __shared__ float sW1[SG11_H * 2];
-    __shared__ float sb1[SG11_H];
-    __shared__ float sW2[SG11_H];
-    sg11_stage_phi_weights<SG11_H>(W1, b1, W2, sW1, sb1, sW2);
-
-    float gn = 0.0f, gdg = 0.0f, gdm = 0.0f;
-    const int64_t stride = prim::grid_stride();
-    for (int64_t i = prim::grid_stride_index(); i < N; i += stride) {
-        SG_SANITIZE_GRAD_INPLACE(grad, i);
-        const float g = static_cast<float>(grad[i]);
-        const float s = sharpness[i];
-        const float mu_val = sg11_phi_forward<SG11_H>(g, s, sW1, sb1, sW2, b2);
-        sg11_sweep_a_step(mu_out, grad, sharpness, momentum, mu_val, i,
-                          gn, gdg, gdm);
-    }
-    float r1 = prim::block_reduce_sum_f32(gn);
-    float r2 = prim::block_reduce_sum_f32(gdg);
-    float r3 = prim::block_reduce_sum_f32(gdm);
-    if (threadIdx.x == 0) {
-        atomicAdd(gate_num_p, r1);
-        atomicAdd(gate_den_g_p, r2);
-        atomicAdd(gate_den_m_p, r3);
-    }
-}
-
-template <typename ParamT, typename GradT, int UNROLL>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_SUPERGROK11_MIN_BLOCKS)
-sg11_sweep_b_kernel(
-    ParamT* param, float* exp_avg, float* exp_avg_sq,
-    const GradT* grad, const float* mu, float gate,
-    float alpha, float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int64_t N
-) {
-    const int64_t stride = prim::grid_stride() * UNROLL;
-    const int64_t base0 = prim::grid_stride_index() * UNROLL;
-    for (int64_t base = base0; base < N; base += stride) {
-        #pragma unroll
-        for (int u = 0; u < UNROLL; ++u) {
-            const int64_t i = base + u;
-            if (i < N) {
-                SG_SANITIZE_GRAD_INPLACE(grad, i);
-                sg11_sweep_b_step(param, exp_avg, exp_avg_sq, grad, mu, gate,
-                                  alpha, lr, beta1, beta2, eps, wd, bc1, bc2, i);
-            }
-        }
-    }
-}
-
-// FP32 vec4 sweep B: float4 traffic on param/state/grad/mu, canonical
-// sg11_sweep_b_step CALLED 4× on the register lanes. Math is NOT re-typed here.
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_SUPERGROK11_MIN_BLOCKS)
-sg11_sweep_b_kernel_vec4_fp32(
-    float4* param4, float4* exp_avg4, float4* exp_avg_sq4,
-    const float4* grad4, const float4* mu4, float gate,
-    float alpha, float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2, int64_t N4
-) {
-    const int64_t stride = prim::grid_stride();
-    for (int64_t i = prim::grid_stride_index(); i < N4; i += stride) {
-        float4 p  = prim::ld_f32v4(param4 + i);
-        float4 m  = prim::ld_f32v4(exp_avg4 + i);
-        float4 v  = prim::ld_f32v4(exp_avg_sq4 + i);
-        float4 g  = prim::ldg_f32v4(grad4 + i);
-        float4 mu = prim::ldg_f32v4(mu4 + i);
-        ::grokking::sm90::sg_sanitize_grad4(g);
-        #pragma unroll
-        for (int u = 0; u < 4; ++u) {
-            sg11_sweep_b_step(&p.x, &m.x, &v.x, &g.x, &mu.x, gate,
-                              alpha, lr, beta1, beta2, eps, wd, bc1, bc2, u);
-        }
-        prim::st_f32v4(param4 + i, p);
-        prim::st_f32v4(exp_avg4 + i, m);
-        prim::st_f32v4(exp_avg_sq4 + i, v);
-    }
-}
-
-void launch_supergrok11_step(
-    torch::Tensor& param,
-    torch::Tensor& exp_avg,
-    torch::Tensor& exp_avg_sq,
-    torch::Tensor& mu_buf,
-    const torch::Tensor& grad,
-    const torch::Tensor& sharpness,
-    const torch::Tensor& momentum,
-    const torch::Tensor& phi_W1,
-    const torch::Tensor& phi_b1,
-    const torch::Tensor& phi_W2,
-    float phi_b2,
-    torch::Tensor& gate_partials,  // [3] {num, den_g, den_m}
-    float alpha,
-    float lr, float beta1, float beta2, float eps, float wd,
-    float bc1, float bc2
-) {
-    const int64_t N = param.numel();
-    if (N == 0) return;
-
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-
-    // §6.1: keep the Adam moments (m, v) L2-resident across the step.
-    prim::L2PersistScope l2(stream,
-        exp_avg.data_ptr(), exp_avg.nbytes(),
-        exp_avg_sq.data_ptr(), exp_avg_sq.nbytes());
-
-    const int block = SG_TUNED_BLOCK_SIZE;
-    const int grid = static_cast<int>(
-        std::min<int64_t>(65535, (N + block - 1) / block));
-
-    gate_partials.zero_();
-
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
-        grad.scalar_type(), "sg11_sweep_a", [&] {
-            sg11_sweep_a_kernel<scalar_t><<<grid, block, 0, stream>>>(
-                mu_buf.data_ptr<float>(),
-                grad.data_ptr<scalar_t>(),
-                sharpness.data_ptr<float>(),
-                momentum.data_ptr<float>(),
-                phi_W1.data_ptr<float>(),
-                phi_b1.data_ptr<float>(),
-                phi_W2.data_ptr<float>(),
-                phi_b2,
-                gate_partials.data_ptr<float>(),
-                gate_partials.data_ptr<float>() + 1,
-                gate_partials.data_ptr<float>() + 2,
-                N);
-            SG_LAUNCH_CHECK(stream);
-        });
-
-    // Host-side reduction of the 3 scalars and gate clamp.
-    auto partials_cpu = gate_partials.to(torch::kCPU);
-    float gn  = partials_cpu[0].item<float>();
-    float gdg = partials_cpu[1].item<float>();
-    float gdm = partials_cpu[2].item<float>();
-    float denom = sqrtf(gdg * gdm + 1e-12f);
-    float gate = (denom > 0.0f) ? (gn / denom) : 0.0f;
-    gate = fminf(fmaxf(gate, 0.0f), 1.0f);
-
-    const bool all_fp32 = param.scalar_type() == torch::kFloat32 &&
-                          grad.scalar_type() == torch::kFloat32;
-    if (SG_TUNED_VEC_WIDTH == 4 && all_fp32 &&
-        prim::is_vec4_alignable(param.data_ptr(), N) &&
-        prim::is_vec4_alignable(exp_avg.data_ptr(), N) &&
-        prim::is_vec4_alignable(exp_avg_sq.data_ptr(), N) &&
-        prim::is_vec4_alignable(grad.data_ptr(), N) &&
-        prim::is_vec4_alignable(mu_buf.data_ptr(), N)) {
-        const int64_t N4 = N / 4;
-        const int grid4 = static_cast<int>(
-            std::min<int64_t>(65535, (N4 + block - 1) / block));
-        sg11_sweep_b_kernel_vec4_fp32<<<grid4, block, 0, stream>>>(
-            reinterpret_cast<float4*>(param.data_ptr<float>()),
-            reinterpret_cast<float4*>(exp_avg.data_ptr<float>()),
-            reinterpret_cast<float4*>(exp_avg_sq.data_ptr<float>()),
-            reinterpret_cast<const float4*>(grad.data_ptr<float>()),
-            reinterpret_cast<const float4*>(mu_buf.data_ptr<float>()),
-            gate, alpha, lr, beta1, beta2, eps, wd, bc1, bc2, N4);
-        SG_LAUNCH_CHECK(stream);
-        return;
-    }
-
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16,
-        param.scalar_type(), "sg11_sweep_b", [&] {
-            sg11_sweep_b_kernel<scalar_t, scalar_t, SG_TUNED_UNROLL>
-                <<<grid, block, 0, stream>>>(
-                param.data_ptr<scalar_t>(),
-                exp_avg.data_ptr<float>(),
-                exp_avg_sq.data_ptr<float>(),
-                grad.data_ptr<scalar_t>(),
-                mu_buf.data_ptr<float>(),
-                gate, alpha, lr, beta1, beta2, eps, wd, bc1, bc2, N);
-            SG_LAUNCH_CHECK(stream);
-        });
-}
+// ── DEAD-CODE REMOVAL (SASS audit #5): SG v1.1 two-sweep cosine-gate path ──
+//
+// REMOVED here: sg11_sweep_a_kernel, sg11_sweep_b_kernel,
+// sg11_sweep_b_kernel_vec4_fp32, and their sole host launcher
+// launch_supergrok11_step.
+//
+// These were never-called device kernels. A whole-tree reference scan
+// (csrc/bindings/bindings.cpp + all csrc + all Python) found ZERO references to
+// any of the four C++ symbols outside this file, and no in-file caller launched
+// launch_supergrok11_step. (The identically-named Python function in
+// csrc/backends/pallas/launch_supergrok11.py is a separate JAX/Pallas symbol,
+// not this CUDA launcher.)
+//
+// The LIVE SG v1.1 CUDA path is unchanged: launch_sg11_mu_metanet ->
+// compute_cosine_gate_fused -> launch_sg11_adam_decay (plus launch_sg11_sam_-
+// perturb / launch_sg11_sharpness_restore), orchestrated by
+// supergrok11_fused_step in csrc/bindings/bindings.cpp. sg11_stage_phi_weights
+// (used by the live sg11_mu_metanet_kernel) and the canonical per-element bodies
+// in csrc/algorithms/supergrok11.h are untouched. This is removal of dead device
+// code, NOT suppression of any reachable functionality.
 
 
 // Meta-net forward: mu[i] = phi(grad[i], sharpness[i]); smart_grad = grad + alpha*mu
 template <typename GradT>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_SUPERGROK11_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 sg11_mu_metanet_kernel(
     float* mu, const GradT* grad, const float* sharpness,
     float* smart_grad, float alpha,

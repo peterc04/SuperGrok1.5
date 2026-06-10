@@ -51,12 +51,12 @@ using ::sg::algorithms::muon_momentum_normalize_step;
 using ::sg::algorithms::muon_ns_combine_step;
 using ::sg::algorithms::muon_update_step;
 
-#ifndef SG_MUON_MIN_BLOCKS
-#define SG_MUON_MIN_BLOCKS 4
+#ifndef SG_TUNED_MIN_BLOCKS
+#define SG_TUNED_MIN_BLOCKS 4
 #endif
 
 template <typename GradT, int UNROLL>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_MUON_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 muon_momentum_normalize_kernel(
     float* buf, float* X, const GradT* grad,
     float momentum, float inv_norm, int64_t N
@@ -76,7 +76,7 @@ muon_momentum_normalize_kernel(
 }
 
 // FP32 vec4 momentum-normalize: float4 traffic, canonical step CALLED 4×.
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_MUON_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 muon_momentum_normalize_kernel_vec4_fp32(
     float4* buf4, float4* X4, const float4* grad4,
     float momentum, float inv_norm, int64_t N4
@@ -96,7 +96,7 @@ muon_momentum_normalize_kernel_vec4_fp32(
     }
 }
 
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_MUON_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 muon_ns_combine_kernel(
     float* Y, const float* X, const float* AX, const float* AAX,
     float a, float b, float c, int64_t N
@@ -108,7 +108,7 @@ muon_ns_combine_kernel(
 }
 
 template <typename ParamT, int UNROLL>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_MUON_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 muon_update_kernel(
     ParamT* param, const float* orth,
     float neg_lr_scale, float decay_factor, int64_t N
@@ -127,7 +127,7 @@ muon_update_kernel(
 }
 
 // FP32 vec4 update: float4 traffic, canonical muon_update_step CALLED 4×.
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_MUON_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 muon_update_kernel_vec4_fp32(
     float4* param4, const float4* orth4,
     float neg_lr_scale, float decay_factor, int64_t N4
@@ -246,9 +246,11 @@ void launch_muon_update(
 // Fused Newton-Schulz combine + parameter update in a single pass.
 // Y = a*X + b*AX + c*AAX (NS combine), then param -= lr_scale*Y + decay*param.
 template <typename ParamT>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_MUON_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 muon_ns_combine_update_kernel(
-    ParamT* param, const float* X, const float* AX, const float* AAX,
+    ParamT* __restrict__ param,
+    const float* __restrict__ X, const float* __restrict__ AX,
+    const float* __restrict__ AAX,
     float a, float b, float c, float neg_lr_scale, float decay_factor, int64_t N
 ) {
     const int64_t stride = prim::grid_stride();

@@ -47,12 +47,11 @@ namespace sg { namespace sm90 {
 
 namespace prim = ::sg::sm90::primitives;
 using ::sg::algorithms::adamw_step;
-using ::sg::algorithms::adamw_step_vec4;
 
 // Minimum resident blocks/SM for the bandwidth-bound element-wise applies.
 // Caps registers so occupancy stays high on the memory-bound path.
-#ifndef SG_ADAMW_MIN_BLOCKS
-#define SG_ADAMW_MIN_BLOCKS 4
+#ifndef SG_TUNED_MIN_BLOCKS
+#define SG_TUNED_MIN_BLOCKS 4
 #endif
 
 // =========================================================================
@@ -62,7 +61,7 @@ using ::sg::algorithms::adamw_step_vec4;
 // =========================================================================
 
 template <typename ParamT, typename GradT, int UNROLL>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_ADAMW_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 adamw_kernel(
     ParamT* param, float* exp_avg, float* exp_avg_sq,
     const GradT* grad,
@@ -85,10 +84,27 @@ adamw_kernel(
 }
 
 // =========================================================================
-//  FP32 vec4 fast path (when param, grad, both states are FP32 and 16B-aligned)
+//  FP32 vec4 fast path (when param, grad, both states are FP32 and 16B-aligned).
+//
+//  Register-sanitize pattern (matches grokadamw/neuralgrok): load param/state
+//  with cached ld_f32v4 and grad with the read-only ldg_f32v4 (const cache),
+//  zero any non-finite gradient lane IN REGISTERS (sg_sanitize_grad4), then CALL
+//  the canonical scalar adamw_step 4× on the register lanes (&p.x/&m.x/&v.x/&g.x
+//  with index u). Math is single-sourced in algorithms/adamw.h — NOT re-typed.
+//
+//  BEHAVIORAL NOTE: this path no longer writes the sanitized gradient back to
+//  the caller's grad buffer on a NaN/Inf (the old adamw_step_vec4 re-read grad
+//  from memory, so it required the in-place writeback). The vec4 path therefore
+//  matches the register-sanitize family: it does NOT mutate the caller's grad on
+//  NaN. The scalar (non-vec4) adamw_kernel path is UNCHANGED — it still uses
+//  SG_SANITIZE_GRAD_INPLACE because the scalar adamw_step re-reads grad[idx].
+//
+//  SASS expectation post-rebuild: the redundant per-element STG.E.128 store of
+//  the sanitized grad is gone (one fewer 128-bit DRAM write per 4 elements), and
+//  the grad load becomes a const-cached LDG.E.128.
 // =========================================================================
 
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_ADAMW_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 adamw_kernel_vec4_fp32(
     float4* param4, float4* exp_avg4, float4* exp_avg_sq4,
     const float4* grad4,
@@ -97,9 +113,19 @@ adamw_kernel_vec4_fp32(
 ) {
     const int64_t stride = prim::grid_stride();
     for (int64_t i = prim::grid_stride_index(); i < N4; i += stride) {
-        SG_SANITIZE_GRAD4_INPLACE(grad4, i);
-        adamw_step_vec4(param4, exp_avg4, exp_avg_sq4, grad4,
-                        lr, beta1, beta2, eps, wd, bc1, bc2, i);
+        float4 p = prim::ld_f32v4(param4 + i);
+        float4 m = prim::ld_f32v4(exp_avg4 + i);
+        float4 v = prim::ld_f32v4(exp_avg_sq4 + i);
+        float4 g = prim::ldg_f32v4(grad4 + i);
+        ::grokking::sm90::sg_sanitize_grad4(g);
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            adamw_step(&p.x, &m.x, &v.x, &g.x,
+                       lr, beta1, beta2, eps, wd, bc1, bc2, u);
+        }
+        prim::st_f32v4(param4 + i, p);
+        prim::st_f32v4(exp_avg4 + i, m);
+        prim::st_f32v4(exp_avg_sq4 + i, v);
     }
 }
 
@@ -133,8 +159,13 @@ void launch_adamw_step(
     const bool all_fp32 = param.scalar_type() == torch::kFloat32 &&
                           grad.scalar_type() == torch::kFloat32;
 
+    // #8 alignment symmetry: the vec4 kernel now reads/writes exp_avg and
+    // exp_avg_sq as float4 too, so ALL four buffers must be 16B-alignable before
+    // taking the vec4 path (matches grokadamw/prodigy/neuralgrok discipline).
     if (SG_TUNED_VEC_WIDTH == 4 && all_fp32 &&
         prim::is_vec4_alignable(param.data_ptr(), N) &&
+        prim::is_vec4_alignable(exp_avg.data_ptr(), N) &&
+        prim::is_vec4_alignable(exp_avg_sq.data_ptr(), N) &&
         prim::is_vec4_alignable(grad.data_ptr(), N)) {
         const int64_t N4 = N / 4;
         const int grid4 = static_cast<int>(

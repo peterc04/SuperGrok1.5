@@ -326,7 +326,19 @@ cudaError_t selective_scan_forward(
 // Gradient checkpointing replaces the O(seq_len * d_state) per-thread h_all
 // buffer (128 KB at seq_len=256, d_state=128) with O(sqrt(seq_len) * d_state)
 // checkpoint + segment buffers (~17 KB), enabling nvcc to compile the kernel.
-static constexpr int BW_CKPT_STRIDE = 32;
+// SG_TUNED_BW_CKPT_STRIDE — the checkpoint interval. Default 32 (= prior literal
+// → byte-identical untuned build). NEEDS-PARITY before a non-default winner
+// ships AND is doubly load-bearing: it sizes the per-thread stack array
+// `h_seg[(BW_CKPT_STRIDE + 1) * MAX_D_STATE]`, so too large a value spills /
+// fails to compile (the whole reason checkpointing exists here) and any value
+// changes the bwd recomputation granularity — correctness must be re-checked on
+// the mamba parity gate. (Macro guard added so it is -D-overridable; not yet
+// wired into the autotuner search space — see report: scan dims deferred on the
+// per-arch cardinality budget, and this one needs a compile-feasibility prefilter.)
+#ifndef SG_TUNED_BW_CKPT_STRIDE
+#define SG_TUNED_BW_CKPT_STRIDE 32
+#endif
+static constexpr int BW_CKPT_STRIDE = SG_TUNED_BW_CKPT_STRIDE;
 static constexpr int BW_MAX_SEQ     = 1024;
 static constexpr int BW_MAX_SEGS    = BW_MAX_SEQ / BW_CKPT_STRIDE;
 

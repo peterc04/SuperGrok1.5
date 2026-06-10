@@ -31,7 +31,18 @@ constexpr int MAX_CKPT_INTERVAL = 32;   // max checkpoint interval for bilevel g
 
 constexpr int SG2M_BLOCK = 256;         // forward kernel block size
 constexpr int SG2B_BLOCK = 256;         // backward kernel block size
-constexpr int PSCAN_BLOCK = 512;        // threads per parallel scan block (must be power of 2)
+// SG_TUNED_PSCAN_BLOCK — threads per parallel-scan block (MUST stay a power of
+// two). Default 512 (= prior literal → byte-identical untuned build). NEEDS-
+// PARITY before a non-default winner ships: the Blelloch up/down-sweep indexing
+// and the shared scratch sizing assume a power-of-two block, and callers clamp
+// it via min(PSCAN_BLOCK, 256) — the autotuner cannot prove scan correctness,
+// only the mamba/SG2 parity gate can. (Macro guard added so the constant is
+// -D-overridable; not yet wired into the autotuner search space — see report:
+// scan dims are deferred on the per-arch cardinality budget.)
+#ifndef SG_TUNED_PSCAN_BLOCK
+#define SG_TUNED_PSCAN_BLOCK 512
+#endif
+constexpr int PSCAN_BLOCK = SG_TUNED_PSCAN_BLOCK;  // power of 2
 constexpr int PSCAN_THRESHOLD = 256;    // fall back to sequential scan if N < this
 constexpr int GEMM_PRECOMPUTE_THRESHOLD = 1024;  // use GEMM when N >= this
 

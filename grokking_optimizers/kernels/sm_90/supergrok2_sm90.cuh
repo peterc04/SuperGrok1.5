@@ -41,6 +41,7 @@
 #include <climits>
 #include <algorithm>
 #include <string>
+#include <cstdlib>   // std::getenv (SG2_ATOMIC_MOE_BWD opt-in for the MoE bwd)
 
 #include "csrc/algorithms/supergrok2.h"
 #include "csrc/algorithms/supergrok2_bilevel_adjoint.h"
@@ -964,16 +965,18 @@ __global__ void sg2_input_proj_sort_kernel(
 template <typename ParamT, typename GradT>
 __global__ void sg2_apply_kernel(
     ParamT* param, float* exp_avg, float* exp_avg_sq, float* mu_state,
+    float* slow_state,
     const GradT* grad, const float* expert_out,
-    float alpha, float gru_decay,
+    float alpha, float gru_decay, float lamb_eff,
     float lr, float beta1, float beta2, float eps, float wd,
     float bc1, float bc2, int64_t N
 ) {
     const int64_t stride = prim::grid_stride();
     for (int64_t i = prim::grid_stride_index(); i < N; i += stride) {
         ::sg::algorithms::sg2_apply_step(
-            param, exp_avg, exp_avg_sq, mu_state, grad, expert_out[i],
-            alpha, gru_decay, lr, beta1, beta2, eps, wd, bc1, bc2, i);
+            param, exp_avg, exp_avg_sq, mu_state, slow_state, grad,
+            expert_out[i], alpha, gru_decay, lamb_eff,
+            lr, beta1, beta2, eps, wd, bc1, bc2, i);
     }
 }
 
@@ -1025,9 +1028,10 @@ void launch_supergrok2_input_proj_sort(
 
 void launch_supergrok2_apply(
     torch::Tensor& param, torch::Tensor& exp_avg, torch::Tensor& exp_avg_sq,
-    torch::Tensor& mu_state, const torch::Tensor& grad,
+    torch::Tensor& mu_state, torch::Tensor& slow_state,
+    const torch::Tensor& grad,
     const torch::Tensor& expert_out,
-    float alpha, float gru_decay,
+    float alpha, float gru_decay, float lamb_eff,
     float lr, float beta1, float beta2, float eps, float wd,
     float bc1, float bc2
 ) {
@@ -1035,7 +1039,11 @@ void launch_supergrok2_apply(
     if (N == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int block = SG_TUNED_BLOCK_SIZE;
-    const int grid = std::min<int>(65535, (N + block - 1) / block);
+    // #9 int-width: clamp the grid in int64 (N is int64; the (N+block-1)/block
+    // ceil-div can exceed 2^31 before the 65535 cap) then narrow the grid dim to
+    // int — matches the grokadamw/adamw launcher idiom.
+    const int grid = static_cast<int>(
+        std::min<int64_t>(65535, (N + block - 1) / block));
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
@@ -1045,9 +1053,11 @@ void launch_supergrok2_apply(
                 exp_avg.data_ptr<float>(),
                 exp_avg_sq.data_ptr<float>(),
                 mu_state.data_ptr<float>(),
+                slow_state.data_ptr<float>(),
                 grad.data_ptr<scalar_t>(),
                 expert_out.data_ptr<float>(),
-                alpha, gru_decay, lr, beta1, beta2, eps, wd, bc1, bc2, N);
+                alpha, gru_decay, lamb_eff,
+                lr, beta1, beta2, eps, wd, bc1, bc2, N);
             SG_LAUNCH_CHECK(stream);
         });
 }
@@ -1123,10 +1133,13 @@ __global__ void sg2_gru_blend_kernel(
     const float* __restrict__ candidate,    // [N] candidate (expert/attn output)
     const float* __restrict__ z_gate,       // [N] update gate in [0,1] or nullptr
     float* __restrict__ out,                // [N] new gru output
-    float gru_decay, int N
+    float gru_decay, int64_t N
 ) {
-    const int stride = prim::grid_stride();
-    for (int i = prim::grid_stride_index(); i < N; i += stride) {
+    // #9 int-width: mirror the other SG2 element-wise kernels — the index/stride
+    // are int64 (grid_stride()/grid_stride_index() return int64_t) so a launch
+    // covering >2^31 elements cannot truncate the global index.
+    const int64_t stride = prim::grid_stride();
+    for (int64_t i = prim::grid_stride_index(); i < N; i += stride) {
         const float z = (z_gate != nullptr) ? z_gate[i] : gru_decay;
         const float h = z * gru_state[i] + (1.0f - z) * candidate[i];
         gru_state[i] = h;
@@ -1535,6 +1548,7 @@ static torch::Tensor peer_expert_forward(
 static void csa_hca_step_one(
     torch::Tensor& param, torch::Tensor& grad, torch::Tensor& sharpness,
     torch::Tensor& exp_avg, torch::Tensor& exp_avg_sq, torch::Tensor& mu,
+    torch::Tensor& slow,
     torch::Tensor& gru_state,
     torch::Tensor& input_proj_W, torch::Tensor& input_proj_b,
     torch::Tensor& csa_q_W, torch::Tensor& csa_k_W, torch::Tensor& csa_v_W,
@@ -1549,7 +1563,7 @@ static void csa_hca_step_one(
     torch::Tensor& peer_query_Ws, torch::Tensor& prod_keys_A, torch::Tensor& prod_keys_B,
     torch::Tensor& expert_W1, torch::Tensor& expert_b1,
     torch::Tensor& expert_W2, torch::Tensor& expert_b2,
-    float rescale, float alpha_mu, float gru_decay,
+    float rescale, float alpha_mu, float gru_decay, float lamb_eff,
     float beta1, float beta2, float lr, float wd_eff, float eps,
     float bc1, float bc2,
     int d_model, int num_heads,
@@ -1747,6 +1761,9 @@ static void csa_hca_step_one(
     // the parameter update directly. sg2_apply_step's separate `mu_state`/
     // `gru_decay` blend is an expert-output EMA (a temporal smoothing of
     // expert_out), distinct from the matrix GRU, so there is no double-count.
+    // The restored grokfast term lives in sg2_apply_step too: a separate `slow`
+    // EMA of g (decay alpha_mu) amplified by `lamb_eff` (= lamb·ramp·gate, was
+    // (void)-ed before) — see csrc/algorithms/supergrok2.h.
     {
         const int block = SG_TUNED_BLOCK_SIZE;
         const int grid = std::min<int>(65535, (N + block - 1) / block);
@@ -1756,9 +1773,10 @@ static void csa_hca_step_one(
                 sg2_apply_kernel<scalar_t, scalar_t><<<grid, block, 0, stream>>>(
                     param.data_ptr<scalar_t>(),
                     exp_avg.data_ptr<float>(), exp_avg_sq.data_ptr<float>(),
-                    mu.data_ptr<float>(), grad.data_ptr<scalar_t>(),
+                    mu.data_ptr<float>(), slow.data_ptr<float>(),
+                    grad.data_ptr<scalar_t>(),
                     expert_out.data_ptr<float>(),
-                    alpha_mu, gru_decay, lr, beta1, beta2, eps, wd_eff,
+                    alpha_mu, gru_decay, lamb_eff, lr, beta1, beta2, eps, wd_eff,
                     bc1, bc2, N);
                 SG_LAUNCH_CHECK(stream);
             });
@@ -1771,6 +1789,7 @@ static void csa_hca_step_one(
 void launch_csa_hca_step(
     torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness,
     torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor mu,
+    torch::Tensor slow,
     torch::Tensor gru_state,
     torch::Tensor input_proj_W, torch::Tensor input_proj_b,
     torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W,
@@ -1802,7 +1821,10 @@ void launch_csa_hca_step(
         exp_avg.data_ptr(), exp_avg.nbytes(),
         exp_avg_sq.data_ptr(), exp_avg_sq.nbytes());
 
-    (void)lamb_eff; (void)pk_dim; (void)gru_hidden;
+    (void)pk_dim; (void)gru_hidden;
+    // `lamb_eff` is now LIVE: it is the restored grokfast amplification
+    // (lamb·ramp·gate) threaded into sg2_apply_step's `slow` EMA term. It was
+    // previously (void)-ed here, silently dropping the mechanism.
     // GRU weights (gru_W*/gru_b*) are now plumbed into csa_hca_step_one, which
     // reconstructs the matrix-GRU forward for the PEER routing input. The scalar
     // `gru_decay` below is the SEPARATE expert-output EMA decay used by
@@ -1810,7 +1832,7 @@ void launch_csa_hca_step(
     // from beta1 for temporal smoothing (spec §3b GRU tail).
     const float gru_decay = beta1;
     csa_hca_step_one(
-        param, grad, sharpness, exp_avg, exp_avg_sq, mu, gru_state,
+        param, grad, sharpness, exp_avg, exp_avg_sq, mu, slow, gru_state,
         input_proj_W, input_proj_b,
         csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
         csa_idx_DQ, csa_idx_UQ, csa_idx_K, csa_out_W,
@@ -1818,7 +1840,8 @@ void launch_csa_hca_step(
         gru_Wz, gru_bz, gru_Wr, gru_br, gru_Wh, gru_bh,
         peer_query_Ws, prod_keys_A, prod_keys_B,
         expert_W1, expert_b1, expert_W2, expert_b2,
-        rescale, alpha_mu, gru_decay, beta1, beta2, lr, wd_eff, eps, bc1, bc2,
+        rescale, alpha_mu, gru_decay, lamb_eff,
+        beta1, beta2, lr, wd_eff, eps, bc1, bc2,
         d_model, num_heads, expert_hidden, num_experts,
         csa_compress, csa_window, csa_topk, hca_compress, indexer_rank,
         expert_counts, peer_topk, stream);
@@ -1836,6 +1859,7 @@ void launch_csa_hca_batched_step(
     std::vector<torch::Tensor> exp_avgs,
     std::vector<torch::Tensor> exp_avg_sqs,
     std::vector<torch::Tensor> mus,
+    std::vector<torch::Tensor> slows,
     std::vector<torch::Tensor> gru_states,
     torch::Tensor input_proj_W, torch::Tensor input_proj_b,
     torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W,
@@ -1864,12 +1888,15 @@ void launch_csa_hca_batched_step(
     if (n == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     (void)pk_dim; (void)gru_hidden;
+    // `lamb_effs[i]` is now LIVE (was (void)-ed): threaded into csa_hca_step_one
+    // as the grokfast amplification for sg2_apply_step's `slow` EMA. `slows[i]`
+    // is the per-tensor slow-gradient EMA buffer, mirroring `mus[i]`.
     for (size_t i = 0; i < n; ++i) {
         if (!grads[i].defined() || grads[i].numel() == 0) continue;
         const float gru_decay = beta1s[i];
         csa_hca_step_one(
             params[i], grads[i], sharpness_list[i],
-            exp_avgs[i], exp_avg_sqs[i], mus[i], gru_states[i],
+            exp_avgs[i], exp_avg_sqs[i], mus[i], slows[i], gru_states[i],
             input_proj_W, input_proj_b,
             csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
             csa_idx_DQ, csa_idx_UQ, csa_idx_K, csa_out_W,
@@ -1877,12 +1904,12 @@ void launch_csa_hca_batched_step(
             gru_Wz, gru_bz, gru_Wr, gru_br, gru_Wh, gru_bh,
             peer_query_Ws, prod_keys_A, prod_keys_B,
             expert_W1, expert_b1, expert_W2, expert_b2,
-            rescale, alpha_mus[i], gru_decay, beta1s[i], beta2, lr, wd_eff, eps,
+            rescale, alpha_mus[i], gru_decay, lamb_effs[i],
+            beta1s[i], beta2, lr, wd_eff, eps,
             bc1s[i], bc2s[i],
             d_model, num_heads, expert_hidden, num_experts,
             csa_compress, csa_window, csa_topk, hca_compress, indexer_rank,
             expert_counts, peer_topk, stream);
-        (void)lamb_effs;
     }
 }
 
@@ -2630,9 +2657,21 @@ torch::Tensor moe_dynamic_expert_fwd(
 //    d(W2 b2): dy = rw * d_output ; dW2_e += dy ⊗ h ; db2_e += dy
 //    dh = W2ᵀ dy ; dz1 = dh ⊙ [z1>0]
 //    dW1_e += dz1 ⊗ x ; db1_e += dz1 ; d_input[t] = W1ᵀ dz1
-//  Expert-weight grads are accumulated with atomics (many tokens share e).
-//  One block per token; hidden activation + dz1 recomputed in shared memory.
-__global__ void moe_dynamic_expert_bwd_kernel(
+//  Two implementations follow; the launcher moe_dynamic_expert_bwd selects one.
+//
+//  Both REQUIRE the d_expert_* output buffers pre-zeroed by the caller (the
+//  Python bilevel backward allocates them with torch.zeros_like before the
+//  call — supergrok2.py). d_input[t] is written exactly once per token by
+//  whichever kernel processes token t, so it does not need pre-zeroing.
+//
+//  ───────────────────────────────────────────────────────────────────────
+//  (8a) ATOMIC variant — one block PER TOKEN. Expert-weight grads are summed
+//  with cross-block float atomicAdd because many tokens share an expert e.
+//  This is FAST but the atomic completion order is nondeterministic, so the
+//  fp32 sums (and thus the whole bilevel backward, and SG2 training) are NOT
+//  reproducible run-to-run (SASS audit #2: 42 REDG.E.ADD.F32). Selectable via
+//  SG2_ATOMIC_MOE_BWD=1 for speed comparisons only.
+__global__ void moe_dynamic_expert_bwd_atomic_kernel(
     const float* __restrict__ d_output,
     const float* __restrict__ input,
     const int* __restrict__ expert_indices,
@@ -2707,6 +2746,128 @@ __global__ void moe_dynamic_expert_bwd_kernel(
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────
+//  (8b) DETERMINISTIC variant (DEFAULT) — one block PER EXPERT. Block e scans
+//  the whole token list IN INDEX ORDER and processes only the tokens whose
+//  expert_indices[t]==e, accumulating that expert's weight grads with a SINGLE
+//  writer per output element (no atomics): block e owns d_expert_*[e]
+//  exclusively (different experts ⇒ different output slices ⇒ no cross-block
+//  race), and within the block each output element is updated by exactly one
+//  owning thread, summing token contributions sequentially in token-index
+//  order. The summation order is therefore fixed and the result is bitwise
+//  reproducible run-to-run — eliminating the audit-#2 nondeterminism.
+//
+//  d_input[t] for a matched token is computed once (by the owning expert-block,
+//  partitioned across threads) and written, not accumulated — each token maps to
+//  exactly one expert, so no other block writes that row.
+//
+//  Cost: the token scan is O(N_tokens) per expert-block, i.e. O(N_tokens × E)
+//  predicate evaluations total. At SG2 scale (N≈4–17K tokens, E≈144) this is a
+//  cheap integer compare per (token,expert) and well worth determinism; the FLOP
+//  work is identical to the atomic path (only matched tokens do the MLP math).
+//
+//  FULL DETERMINISM (no atomics at all, not even in shared): every reduction is
+//  an owner-computes loop in a FIXED index order —
+//    • dW2[o,*], db2[o]   : owner = thread for output row o; += over tokens in
+//                           token-index order.
+//    • dz1[j] = [h_j>0]·Σ_o W2[o,j]·dy_o : owner = thread for hidden unit j sums
+//                           over o ASCENDING (so dz1 is reproducible, unlike the
+//                           atomic path which reduced dz1 via shared atomicAdd).
+//    • dW1[j,*], db1[j]   : owner = thread for hidden unit j; += over tokens.
+//    • d_input[t][k]      : Σ_j W1[j,k]·dz1[j], one writer per (t,k).
+//  Shared scratch: h[hidden], dz1[hidden], dy[d_out] (dy staged so the dz1 owner
+//  can sum over all o without re-reading/rescaling d_output).
+__global__ void moe_dynamic_expert_bwd_deterministic_kernel(
+    const float* __restrict__ d_output,
+    const float* __restrict__ input,
+    const int* __restrict__ expert_indices,
+    const float* __restrict__ routing_weights,
+    const float* __restrict__ expert_w1, const float* __restrict__ expert_b1,
+    const float* __restrict__ expert_w2, const float* __restrict__ expert_b2,
+    float* __restrict__ d_input, float* __restrict__ d_expert_w1,
+    float* __restrict__ d_expert_b1, float* __restrict__ d_expert_w2,
+    float* __restrict__ d_expert_b2,
+    int N, int d_in, int hidden, int d_out
+) {
+    const int e = blockIdx.x;            // one block per expert
+    const int lane = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const float* W1  = expert_w1 + static_cast<long>(e) * hidden * d_in;
+    const float* b1  = expert_b1 + static_cast<long>(e) * hidden;
+    const float* W2  = expert_w2 + static_cast<long>(e) * d_out * hidden;
+
+    float* dW1 = d_expert_w1 + static_cast<long>(e) * hidden * d_in;
+    float* db1 = d_expert_b1 + static_cast<long>(e) * hidden;
+    float* dW2 = d_expert_w2 + static_cast<long>(e) * d_out * hidden;
+    float* db2 = d_expert_b2 + static_cast<long>(e) * d_out;
+
+    // Per-token scratch shared by the block.
+    extern __shared__ float smem[];
+    float* h   = smem;                       // [hidden] relu(W1 x + b1)
+    float* dz1 = smem + hidden;              // [hidden] dh ⊙ [z1>0]
+    float* dy  = smem + 2 * hidden;          // [d_out]  rw · d_output[t]
+
+    // Scan all tokens in index order; only this expert's tokens contribute.
+    for (int t = 0; t < N; ++t) {
+        if (expert_indices[t] != e) continue;
+        const float rw = routing_weights[t];
+        const float* x      = input + static_cast<long>(t) * d_in;
+        const float* dy_row = d_output + static_cast<long>(t) * d_out;
+
+        // Stage dy = rw·d_output[t] into shared; recompute forward hidden act.
+        for (int o = lane; o < d_out; o += nthreads) dy[o] = rw * dy_row[o];
+        for (int j = lane; j < hidden; j += nthreads) {
+            float acc = b1[j];
+            const float* w1row = W1 + static_cast<long>(j) * d_in;
+            for (int k = 0; k < d_in; ++k) acc += w1row[k] * x[k];
+            h[j] = acc > 0.0f ? acc : 0.0f;
+        }
+        __syncthreads();
+
+        // db2 += dy ; dW2 += dy⊗h. Owner = thread for output row o (single
+        // writer); += ordered across tokens by the sequential scan.
+        for (int o = lane; o < d_out; o += nthreads) {
+            const float dyo = dy[o];
+            db2[o] += dyo;
+            float* dw2row = dW2 + static_cast<long>(o) * hidden;
+            for (int j = 0; j < hidden; ++j) dw2row[j] += dyo * h[j];
+        }
+
+        // dz1[j] = [h_j>0] · Σ_o W2[o,j]·dy_o. Owner = thread for hidden unit j;
+        // the Σ_o runs o ASCENDING (fixed order) so dz1 is reproducible.
+        for (int j = lane; j < hidden; j += nthreads) {
+            float acc = 0.0f;
+            if (h[j] > 0.0f) {
+                for (int o = 0; o < d_out; ++o) {
+                    acc += W2[static_cast<long>(o) * hidden + j] * dy[o];
+                }
+            }
+            dz1[j] = acc;
+        }
+        __syncthreads();
+
+        // db1 += dz1 ; dW1 += dz1⊗x. Owner = thread for hidden unit j.
+        for (int j = lane; j < hidden; j += nthreads) {
+            const float g = dz1[j];
+            db1[j] += g;
+            float* dw1row = dW1 + static_cast<long>(j) * d_in;
+            for (int k = 0; k < d_in; ++k) dw1row[k] += g * x[k];
+        }
+        // d_input[t][k] = Σ_j W1[j,k]·dz1[j]; written once (token t's only expert
+        // is e), threads partition k.
+        float* dx = d_input + static_cast<long>(t) * d_in;
+        for (int k = lane; k < d_in; k += nthreads) {
+            float acc = 0.0f;
+            for (int j = 0; j < hidden; ++j) {
+                acc += W1[static_cast<long>(j) * d_in + k] * dz1[j];
+            }
+            dx[k] = acc;
+        }
+        __syncthreads();  // h/dz1/dy reused next matched token; order the reuse.
+    }
+}
+
 void moe_dynamic_expert_bwd(
     torch::Tensor d_output, torch::Tensor input,
     torch::Tensor expert_indices, torch::Tensor routing_weights,
@@ -2729,11 +2890,39 @@ void moe_dynamic_expert_bwd(
     auto rw  = routing_weights.to(torch::kFloat32).contiguous();
     auto ei  = expert_indices.to(torch::kInt32).contiguous();
 
+    const int E = static_cast<int>(expert_w1.size(0));
+
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int block = std::min<int>(256, std::max<int>(d_out, hidden));
-    const int grid = N;
-    const size_t smem = static_cast<size_t>(2 * hidden) * sizeof(float);
-    moe_dynamic_expert_bwd_kernel<<<grid, block, smem, stream>>>(
+
+    // SASS audit #2: the per-token atomic path is run-to-run NONDETERMINISTIC
+    // (cross-block float atomicAdd into the per-expert grads). The DETERMINISTIC
+    // one-block-per-expert path is the DEFAULT. Set SG2_ATOMIC_MOE_BWD=1 to opt
+    // back into the faster atomic path for speed comparisons (NOT reproducible).
+    const char* atomic_env = std::getenv("SG2_ATOMIC_MOE_BWD");
+    const bool use_atomic = (atomic_env != nullptr && atomic_env[0] == '1');
+
+    if (use_atomic) {
+        const int grid = N;                                  // one block per token
+        const size_t smem = static_cast<size_t>(2 * hidden) * sizeof(float);
+        moe_dynamic_expert_bwd_atomic_kernel<<<grid, block, smem, stream>>>(
+            dout.data_ptr<float>(), inp.data_ptr<float>(),
+            ei.data_ptr<int>(), rw.data_ptr<float>(),
+            w1.data_ptr<float>(), b1.data_ptr<float>(),
+            w2.data_ptr<float>(), b2.data_ptr<float>(),
+            d_input.data_ptr<float>(), d_expert_w1.data_ptr<float>(),
+            d_expert_b1.data_ptr<float>(), d_expert_w2.data_ptr<float>(),
+            d_expert_b2.data_ptr<float>(), N, d_in, hidden, d_out);
+        SG_LAUNCH_CHECK(stream);
+        return;
+    }
+
+    // Deterministic default: one block per expert, atomic-free fixed-order sums.
+    // Extra shared scratch holds dy[d_out] alongside h[hidden] and dz1[hidden].
+    const int grid = E;                                      // one block per expert
+    const size_t smem =
+        static_cast<size_t>(2 * hidden + d_out) * sizeof(float);
+    moe_dynamic_expert_bwd_deterministic_kernel<<<grid, block, smem, stream>>>(
         dout.data_ptr<float>(), inp.data_ptr<float>(),
         ei.data_ptr<int>(), rw.data_ptr<float>(),
         w1.data_ptr<float>(), b1.data_ptr<float>(),

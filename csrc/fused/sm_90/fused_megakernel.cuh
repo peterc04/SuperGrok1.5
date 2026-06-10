@@ -45,11 +45,35 @@ enum class FuseTier : int { L1 = 1, L3 = 3 };
 // compute + optimizer tail). Partitioning lets the consumer claim a large
 // register file WITHOUT the producer's allocation counting against the L3
 // footprint, so no single warp-group needs the full fused register budget.
-static constexpr int kProducerRegsF = 32;
-static constexpr int kConsumerRegsF = 200;
+// SG_TUNED_PROD_REGS / SG_TUNED_CONS_REGS — the setmaxnreg targets for the
+// producer / consumer warp-groups, exposed as autotuner dims. The SAME macro
+// tokens drive the warp-specialized tile pipeline (csrc/backends/cuda/sm_90/
+// tile_pipeline.cuh); a single -DSG_TUNED_{PROD,CONS}_REGS=N flag therefore
+// tunes whichever sm_90 register-split path the unit being built compiles.
+// Defaults equal the prior literals (32 / 200) so an untuned / no-JSON build is
+// byte-identical (verified via nvcc -E). NOTE: tile_pipeline.cuh's #ifndef
+// defaults differ (40 / 232); that is harmless ONLY because the two headers are
+// never co-included in one TU (fused_megakernel reaches setmaxnreg via
+// warp_specialize.cuh, not via wgmma.cuh→tile_pipeline.cuh — the latter is
+// pulled solely by decoder_tc_selftest.cu). If a future TU includes both, the
+// divergent #ifndef defaults make include order decide the value — then they
+// must be reconciled to one default (see report).
+#ifndef SG_TUNED_PROD_REGS
+#define SG_TUNED_PROD_REGS 32
+#endif
+#ifndef SG_TUNED_CONS_REGS
+#define SG_TUNED_CONS_REGS 200
+#endif
+static constexpr int kProducerRegsF = SG_TUNED_PROD_REGS;
+static constexpr int kConsumerRegsF = SG_TUNED_CONS_REGS;
 // Warp-group size on Hopper (threads). 256-thread block => 2 warp-groups.
 static constexpr int kWarpGroupThreads = 128;
-static constexpr int kFusedBlockThreads = 256;
+// SG_TUNED_MEGA_BLOCK (the per-CTA thread count) is defined in
+// megakernel_common.cuh (#include'd above) so the fused megakernel and the
+// model drivers share one tunable; default 256 → byte-identical untuned build.
+// NEEDS-PARITY before a non-default winner ships (2-warp-group split + shared
+// buffer sizing assumptions; see the macro's definition site).
+static constexpr int kFusedBlockThreads = SG_TUNED_MEGA_BLOCK;
 
 // =========================================================================
 //  Optimizer stage — the fused tail. Pulls tensors from the queue and applies
@@ -174,7 +198,16 @@ __device__ void fused_optimizer_stage(const PersistentContext& ctx,
 //  grad = acts[gi] * model_activation_grad<M>(params[gi]) — same expression,
 //  same operand order; only its storage class (SMEM vs global) changed.
 // =========================================================================
-static constexpr int kGradTile = 1024;   // floats per SMEM grad tile (4 KB)
+// SG_TUNED_GRAD_TILE — floats per SMEM grad tile (the cross-phase bwd→opt
+// fusion buffer). Default 1024 (4 KB → byte-identical untuned build). NEEDS-
+// PARITY before shipping a non-default winner: it sizes the __shared__
+// smem_grad[] array, so a swept value changes the static SMEM footprint and the
+// chunk loop bounds; correctness (no overrun, matching the global-grad path)
+// must be re-checked on the H100 parity gate, not assumed by the autotuner.
+#ifndef SG_TUNED_GRAD_TILE
+#define SG_TUNED_GRAD_TILE 1024
+#endif
+static constexpr int kGradTile = SG_TUNED_GRAD_TILE;   // floats / SMEM grad tile
 
 template <ModelId M, OptId Opt>
 __device__ void fused_backward_optimizer_stage(

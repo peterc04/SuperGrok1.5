@@ -55,8 +55,8 @@ constexpr int NG_H = 64;
 // Minimum resident blocks/SM. The psi-net forward is compute-heavy per element
 // but the bound is still memory traffic on the Adam state; cap registers so
 // occupancy stays high.
-#ifndef SG_NEURALGROK_MIN_BLOCKS
-#define SG_NEURALGROK_MIN_BLOCKS 4
+#ifndef SG_TUNED_MIN_BLOCKS
+#define SG_TUNED_MIN_BLOCKS 4
 #endif
 
 // Cooperatively stage the per-element psi-net weights (W1[H], b1[H], W2[H]) into
@@ -80,7 +80,7 @@ __device__ __forceinline__ void ng_stage_psi_weights(
 }
 
 template <typename ParamT, typename GradT, int UNROLL>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_NEURALGROK_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 neuralgrok_kernel(
     ParamT* param, float* exp_avg, float* exp_avg_sq,
     const GradT* grad,
@@ -117,7 +117,7 @@ neuralgrok_kernel(
 // the canonical neuralgrok_psi_forward<H> + neuralgrok_apply_step 4× on the
 // register lanes. The math is NOT re-typed here (single-source guard), only the
 // global traffic is widened and the weights are shared-staged.
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_NEURALGROK_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 neuralgrok_kernel_vec4_fp32(
     float4* param4, float4* exp_avg4, float4* exp_avg_sq4,
     const float4* grad4,
@@ -229,7 +229,7 @@ void launch_neuralgrok_step(
 // Amplifier-only: amplified[i] = psi(|grad[i]|) * grad[i], where
 // psi is the 1-hidden-layer network (W1,b1,W2,b2) with ReLU.
 // alpha, beta scale the amplified gradient: out = alpha * psi(|g|) * g + beta * g
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_NEURALGROK_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 neuralgrok_amplifier_kernel(
     const float* grad, float* amplified,
     const float* W1, const float* b1, const float* W2, float b2_scalar,

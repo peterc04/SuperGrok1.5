@@ -68,8 +68,8 @@ using ::sg::algorithms::prodigy_partials_step;
 using ::sg::algorithms::prodigy_update_d;
 using ::sg::algorithms::prodigy_apply_step;
 
-#ifndef SG_PRODIGY_MIN_BLOCKS
-#define SG_PRODIGY_MIN_BLOCKS 4
+#ifndef SG_TUNED_MIN_BLOCKS
+#define SG_TUNED_MIN_BLOCKS 4
 #endif
 
 // Compile-time cluster volume from the tuned shape, capped at the Hopper
@@ -83,7 +83,7 @@ constexpr int kClusterVolume =
 }  // namespace prodigy_detail
 
 template <typename ParamT, typename GradT>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_PRODIGY_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 prodigy_reduce_kernel(
     const ParamT* param, const ParamT* param_init, const GradT* grad,
     float d_prev,
@@ -115,7 +115,7 @@ prodigy_reduce_kernel(
 // device scalar zeroed before launch. The multi-tensor path keeps the separate
 // d-update kernel (it accumulates across many launches before the update).
 template <typename ParamT, typename GradT>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_PRODIGY_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 prodigy_reduce_and_update_d_kernel(
     const ParamT* param, const ParamT* param_init, const GradT* grad,
     float d_prev,
@@ -197,7 +197,7 @@ __global__ void prodigy_update_d_kernel(
 }
 
 template <typename ParamT, typename GradT, int UNROLL>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_PRODIGY_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 prodigy_apply_kernel(
     ParamT* param, float* exp_avg, float* exp_avg_sq, float* s_track,
     const GradT* grad, const float* d_ptr,
@@ -221,7 +221,7 @@ prodigy_apply_kernel(
 }
 
 // FP32 vec4 apply: float4 traffic, canonical prodigy_apply_step CALLED 4×.
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_PRODIGY_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 prodigy_apply_kernel_vec4_fp32(
     float4* param4, float4* exp_avg4, float4* exp_avg_sq4, float4* s_track4,
     const float4* grad4, const float* d_ptr,
@@ -398,10 +398,11 @@ void launch_fused_prodigy_step(
 
 // DLR reduction: numerator += <grad, param - param_init>,
 // denominator += ||s|| * d + eps.
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_PRODIGY_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 prodigy_dlr_reduce_kernel(
-    const float* grad, const float* param, const float* param_init,
-    const float* s, float* numerator, float* denominator,
+    const float* __restrict__ grad, const float* __restrict__ param,
+    const float* __restrict__ param_init, const float* __restrict__ s,
+    float* __restrict__ numerator, float* __restrict__ denominator,
     float eps, int64_t N
 ) {
     float num_acc = 0.0f, den_acc = 0.0f;

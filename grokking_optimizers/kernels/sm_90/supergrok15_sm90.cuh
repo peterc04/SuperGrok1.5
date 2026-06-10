@@ -52,8 +52,8 @@ constexpr int SG15_H = 32;
 
 // Minimum resident blocks/SM for the element-wise sweeps. Caps registers so
 // occupancy stays high on the (memory-bound) Adam apply.
-#ifndef SG_SUPERGROK15_MIN_BLOCKS
-#define SG_SUPERGROK15_MIN_BLOCKS 4
+#ifndef SG_TUNED_MIN_BLOCKS
+#define SG_TUNED_MIN_BLOCKS 4
 #endif
 
 // Cooperatively stage the per-element meta-net phi weights into shared memory
@@ -73,7 +73,7 @@ __device__ __forceinline__ void sg15_stage_phi_weights(
 }
 
 template <typename GradT>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_SUPERGROK15_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 sg15_sweep_a_kernel(
     float* mu_out, const GradT* grad, const float* sharpness,
     const float* W1, const float* b1, const float* W2, float b2,
@@ -103,7 +103,7 @@ sg15_sweep_a_kernel(
 }
 
 template <typename ParamT, typename GradT, int UNROLL>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_SUPERGROK15_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 sg15_sweep_b_kernel(
     ParamT* param, float* exp_avg, float* exp_avg_sq,
     const GradT* grad, const float* mu,
@@ -129,7 +129,7 @@ sg15_sweep_b_kernel(
 
 // FP32 vec4 sweep B: float4 traffic on param/state/grad/mu, canonical
 // sg15_sweep_b_step CALLED 4× on the register lanes. Math is NOT re-typed here.
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_SUPERGROK15_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 sg15_sweep_b_kernel_vec4_fp32(
     float4* param4, float4* exp_avg4, float4* exp_avg_sq4,
     const float4* grad4, const float4* mu4,

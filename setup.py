@@ -416,9 +416,33 @@ def _collect(globs):
     # define their OWN pybind module and are JIT-loaded by their tests —
     # linking them into _ops would collide on PyInit__ops (multiple
     # definition; observed at the wgmma substrate landing).
+    #
+    # The same collision is produced by any standalone-JIT cell driver that
+    # owns a PYBIND11_MODULE(TORCH_EXTENSION_NAME, …) and is loaded directly
+    # via torch.utils.cpp_extension.load (e.g. csrc/fused/sm_90/
+    # mega_decoder_real_adamw_tc.cu — the R2.3 Fork-B TC cell, JIT-loaded by
+    # tests/hw/test_decoder_tc.py PART 2; its own header states "No setup.py
+    # glob change"). These slip past the *_selftest.cu name filter, so we also
+    # drop, content-wise, any .cu that declares its own
+    # PYBIND11_MODULE(TORCH_EXTENSION_NAME …): inside _ops that macro re-emits
+    # PyInit__ops and (via its #included megakernel header) the decoder dec_*
+    # helpers, both already defined by bindings.cpp / the scalar cell TU. The
+    # check is content-based so it auto-tracks new standalone-JIT drivers
+    # regardless of naming. (.cu only — the standalone-JIT pattern is CUDA;
+    # HIP cell TUs use the SG_GFX942_DEVICE_TU guard, not their own module.)
+    def _owns_extension_module(path: str) -> bool:
+        if not path.endswith(".cu"):
+            return False
+        try:
+            with open(path, "r", errors="ignore") as fh:
+                return "PYBIND11_MODULE(TORCH_EXTENSION_NAME" in fh.read()
+        except OSError:
+            return False
+
     return [s for s in out
             if "_overlay" not in os.path.basename(s)
-            and not os.path.basename(s).endswith("_selftest.cu")]
+            and not os.path.basename(s).endswith("_selftest.cu")
+            and not _owns_extension_module(s)]
 
 
 COMMON_BINDINGS = [

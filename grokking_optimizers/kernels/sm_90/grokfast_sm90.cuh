@@ -44,8 +44,8 @@ using ::sg::algorithms::grokfast_fused_step;
 
 // Minimum resident blocks/SM for the bandwidth-bound element-wise applies.
 // Caps registers so occupancy stays high on the memory-bound path.
-#ifndef SG_GROKFAST_MIN_BLOCKS
-#define SG_GROKFAST_MIN_BLOCKS 4
+#ifndef SG_TUNED_MIN_BLOCKS
+#define SG_TUNED_MIN_BLOCKS 4
 #endif
 
 // SG_TUNED_UNROLL-parameterized scalar grid-stride kernel. Each iteration
@@ -53,7 +53,7 @@ using ::sg::algorithms::grokfast_fused_step;
 // CALLED (math single-sourced in algorithms/grokfast.h) — the unroll only
 // changes the loop structure the autotuner generates, not the math.
 template <typename ParamT, typename GradT, int UNROLL>
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_GROKFAST_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 grokfast_kernel(
     ParamT* param, float* exp_avg, float* exp_avg_sq, float* ema,
     const GradT* grad,
@@ -81,7 +81,7 @@ grokfast_kernel(
 // transaction per 4 elements), then CALLS the canonical scalar
 // grokfast_fused_step 4× on register-resident lanes — the math is NOT
 // re-typed here (single-source guard), only the global traffic is widened.
-__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_GROKFAST_MIN_BLOCKS)
+__global__ void __launch_bounds__(SG_TUNED_BLOCK_SIZE, SG_TUNED_MIN_BLOCKS)
 grokfast_kernel_vec4_fp32(
     float4* param4, float4* exp_avg4, float4* exp_avg_sq4, float4* ema4,
     const float4* grad4,
