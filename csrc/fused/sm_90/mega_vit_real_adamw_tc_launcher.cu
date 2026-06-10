@@ -59,12 +59,20 @@ VitTcLauncherScratch& vit_tc_launcher_scratch(int dev, int64_t need_floats) {
 // mega_vit_real_adamw EXCEPT it takes NO workspace pointer (TC workspace is a
 // different size; this TU owns it). `loss_out` points into the caller's
 // state[3*total] slot.
+//
+// OPTID-GENERIC (owner baseline directive — all 33 cells on L3-TC): identical to the
+// decoder TC launcher — the wgmma fwd+bwd is optimizer-independent, only the per-
+// element tail (apply_optimizer<Opt>) differs. `opt_id` selects the kernel
+// instantiation over the SAME [m|v|extra]+loss state buffer (ema = extra slice for
+// grokfast/grokadamw; the neuralgrok psi-net pack lives at the head of extra). The
+// STAGED/model-coupled/SG2 optimizers are NOT cases (no single-launch TC path);
+// dispatch.cpp gates them out and an unsupported id returns cudaErrorInvalidValue.
 cudaError_t mega_vit_real_adamw_tc(
         PersistentContext ctx, float* params,
         const float* patches, const int* targets, int B,
         float* state, float* grad, float* /*workspace_unused*/, float* loss_out,
         float lr, int step, const FusedScalars& scalars, cudaStream_t stream,
-        int ncta_cap) {
+        int ncta_cap, int opt_id) {
     const int64_t total = kVitTotalElems;
     const int T = B * vit::kSeq;
 
@@ -85,9 +93,14 @@ cudaError_t mega_vit_real_adamw_tc(
     ctx.g_generation = sc.g_generation;
     ctx.n_tasks      = kVitNumTensors;
 
+    float* const extra_slice = state + 2 * total;
     FusedOptState st;
     st.exp_avg    = state;
     st.exp_avg_sq = state + total;
+    st.ema        = extra_slice;          // grokfast/grokadamw slow-grad EMA
+    st.psi_W1     = extra_slice + kPsiW1Off;   // neuralgrok psi-net pack
+    st.psi_b1     = extra_slice + kPsiB1Off;
+    st.psi_W2     = extra_slice + kPsiW2Off;
     apply_scalars(st, scalars);
     st.lr = lr;
 
@@ -98,8 +111,25 @@ cudaError_t mega_vit_real_adamw_tc(
     in.workspace = sc.workspace;
     in.loss_out  = loss_out;
 
-    return launch_fused_vit_megakernel_tc<OptId::AdamW>(
-        ctx, params, in, grad, lr, step, st, stream, nCTA);
+    switch (static_cast<OptId>(opt_id)) {
+        case OptId::AdamW:
+            return launch_fused_vit_megakernel_tc<OptId::AdamW>(
+                ctx, params, in, grad, lr, step, st, stream, nCTA);
+        case OptId::Lion:
+            return launch_fused_vit_megakernel_tc<OptId::Lion>(
+                ctx, params, in, grad, lr, step, st, stream, nCTA);
+        case OptId::Grokfast:
+            return launch_fused_vit_megakernel_tc<OptId::Grokfast>(
+                ctx, params, in, grad, lr, step, st, stream, nCTA);
+        case OptId::GrokAdamW:
+            return launch_fused_vit_megakernel_tc<OptId::GrokAdamW>(
+                ctx, params, in, grad, lr, step, st, stream, nCTA);
+        case OptId::NeuralGrok:
+            return launch_fused_vit_megakernel_tc<OptId::NeuralGrok>(
+                ctx, params, in, grad, lr, step, st, stream, nCTA);
+        default:
+            return cudaErrorInvalidValue;
+    }
 }
 
 }}}  // namespace sg::fused::sm90

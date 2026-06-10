@@ -271,19 +271,23 @@ cudaError_t mega_mamba_real_adamw(
 // still points at state[3*total] (read back by the Python wrapper). Mamba has NO
 // TC launcher here ON PURPOSE: it is the measured-scalar-wins carve-out (905a4bb,
 // 0.46×) — its L3-REAL path stays the scalar megakernel, logged honestly as such.
+// opt_id (owner baseline directive): the OptId int selecting the in-kernel optimizer
+// TAIL. The wgmma fwd+bwd is optimizer-independent; opt_id picks apply_optimizer<Opt>.
+// 0=AdamW,1=Lion,2=Grokfast,3=GrokAdamW,6=NeuralGrok are the single-launch TC tails;
+// any other value the launcher rejects with cudaErrorInvalidValue (→ LOUD throw here).
 cudaError_t mega_decoder_real_adamw_tc(
     ::sg::fused::PersistentContext ctx, float* params,
     const int* tokens, const int* targets, int B,
     float* state, float* grad, float* workspace, float* loss_out,
     const int* sizes, const int* offsets,
     float lr, int step, const FusedScalars& scalars, cudaStream_t stream,
-    int ncta_cap);
+    int ncta_cap, int opt_id);
 cudaError_t mega_vit_real_adamw_tc(
     ::sg::fused::PersistentContext ctx, float* params,
     const float* patches, const int* targets, int B,
     float* state, float* grad, float* workspace, float* loss_out,
     float lr, int step, const FusedScalars& scalars, cudaStream_t stream,
-    int ncta_cap);
+    int ncta_cap, int opt_id);   // opt_id: OptId int for the in-kernel tail
 }}  // namespace fused::sm90
 #endif
 
@@ -540,6 +544,23 @@ inline MambaScratch& mamba_scratch_for(const torch::Tensor& params) {
 }
 #endif
 
+// OptId int for the in-kernel optimizer TAIL, MIRRORING
+// csrc/fused/sm_90/opt_components.cuh::OptId (kept as a local int map so this TU
+// stays free of the device header — same discipline as the FusedScalars mirror).
+// Returns the OptId for a SINGLE-LAUNCH wgmma-capable tail (no precompute stage, no
+// 2nd backward, no sharpness ABI), or -1 for an optimizer whose L3-TC path needs more
+// than the fwd+bwd+tail single launch (prodigy/muon/SG11/SG15/looksam/SG2). The
+// owner-baseline directive routes exactly the -1!=... set onto the TC driver; the
+// rest FAIL LOUD (here / in the Python gate) with their cited blocker.
+static int wgmma_tail_opt_id(const std::string& optimizer) {
+    if (optimizer == "adamw")      return 0;   // OptId::AdamW
+    if (optimizer == "lion")       return 1;   // OptId::Lion
+    if (optimizer == "grokfast")   return 2;   // OptId::Grokfast
+    if (optimizer == "grokadamw")  return 3;   // OptId::GrokAdamW
+    if (optimizer == "neuralgrok") return 6;   // OptId::NeuralGrok
+    return -1;                                 // STAGED / model-coupled / SG2
+}
+
 } // anonymous namespace
 
 // NOTE: the default argument VALUES live on the declaration in helpers.h (which
@@ -627,8 +648,16 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // (kSeq/kVocab/kD); B is derived from input.numel(). This leaves the 33
  // generated surrogate cells untouched (their surrogate-L3 path is now
  // unreachable dead code; see BUILD_AND_VALIDATE.md PHASE-1).
- if (arch == 90 && model == "transformer_decoder" && optimizer == "adamw"
- && !opt_only) {
+ // OPTID-GENERIC GATE (owner baseline directive — all 33 cells on L3-TC): the
+ // decoder real fwd+bwd+opt megakernel fires for adamw (scalar OR wgmma) AND, on
+ // the wgmma path only, for the single-launch optimizer tails (lion/grokfast/
+ // grokadamw/neuralgrok). The scalar real decoder kernel exists ONLY for adamw, so
+ // a non-adamw scalar request is rejected inside (no silent adamw fallback). The
+ // STAGED/coupled optimizers never reach here (wgmma_tail_opt_id < 0 → eager).
+ const int dec_opt_id = wgmma_tail_opt_id(optimizer);
+ const bool dec_l3_real = (optimizer == "adamw")
+                          || (want_wgmma && dec_opt_id >= 0);
+ if (arch == 90 && model == "transformer_decoder" && dec_l3_real && !opt_only) {
  const int64_t total = kDecoderTotalElems;
  TORCH_CHECK(params.numel() == total,
  "fused decoder megakernel: params has ", params.numel(),
@@ -694,6 +723,10 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // TU passes only plain pointers + the FusedScalars POD.
  cudaError_t err;
  if (want_wgmma) {
+ // opt_id selects the in-kernel tail (apply_optimizer<Opt>); the fwd+bwd is
+ // optimizer-independent. dec_opt_id is >=0 here (the gate required it on the
+ // wgmma path), so adamw/lion/grokfast/grokadamw/neuralgrok route to their own
+ // tail instantiation; an unsupported id returns cudaErrorInvalidValue → throw.
  err = fused::sm90::mega_decoder_real_adamw_tc(
  ctx, params.data_ptr<float>(),
  input.data_ptr<int>(),                              // tokens
@@ -701,8 +734,14 @@ void fused_step(const std::string& model, const std::string& optimizer,
  B, m, grad.data_ptr<float>(),    // reduced-grad OUTPUT (exposed to caller)
  /*workspace=*/nullptr, loss_slot,  // TC launcher owns its own TC-sized scratch
  /*sizes=*/nullptr, /*offsets=*/nullptr,
- lr, static_cast<int>(step), scalars, stream, /*ncta_cap=*/0);
+ lr, static_cast<int>(step), scalars, stream, /*ncta_cap=*/0, dec_opt_id);
  } else {
+ // The SCALAR real decoder kernel exists only for adamw. A non-adamw scalar
+ // request has no real fwd+bwd+opt scalar TU → FAIL LOUD (no adamw fallback).
+ TORCH_CHECK(optimizer == "adamw",
+ "fused decoder megakernel: the scalar (fp32) real fwd+bwd+opt path is "
+ "wired for adamw only; optimizer '", optimizer, "' has a real L3-TC path "
+ "via gemm_impl='wgmma' (single-launch tail) but no scalar one. Use bf16.");
  err = fused::sm90::mega_decoder_real_adamw(
  ctx, params.data_ptr<float>(),
  input.data_ptr<int>(),                              // tokens
@@ -734,7 +773,13 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // [3*total + 1] ([m|v|extra] + a trailing loss slot the kernel writes the mean
  // loss into). The workspace is device scratch (never crosses the ABI). Placed
  // BEFORE the surrogate route so the real path wins.
- if (arch == 90 && model == "vit" && optimizer == "adamw" && !opt_only) {
+ // OPTID-GENERIC GATE (owner baseline directive — twin of the decoder gate): the
+ // vit real fwd+bwd+opt megakernel fires for adamw (scalar OR wgmma) AND, on the
+ // wgmma path only, for the single-launch tails (lion/grokfast/grokadamw/neuralgrok).
+ const int vit_opt_id = wgmma_tail_opt_id(optimizer);
+ const bool vit_l3_real = (optimizer == "adamw")
+                          || (want_wgmma && vit_opt_id >= 0);
+ if (arch == 90 && model == "vit" && vit_l3_real && !opt_only) {
  const int64_t total = kVitTotalElems;
  TORCH_CHECK(params.numel() == total,
  "fused ViT megakernel: params has ", params.numel(),
@@ -792,13 +837,21 @@ void fused_step(const std::string& model, const std::string& optimizer,
  input.data_ptr<float>() + (int64_t)B * kVitPatchElems);
  cudaError_t err;
  if (want_wgmma) {
+ // opt_id selects the in-kernel tail; vit_opt_id is >=0 here (the gate required
+ // it on the wgmma path). adamw/lion/grokfast/grokadamw/neuralgrok route to their
+ // own tail; an unsupported id returns cudaErrorInvalidValue → throw below.
  err = fused::sm90::mega_vit_real_adamw_tc(
  ctx, params.data_ptr<float>(),
  vit_patches, vit_targets,
  B, m, grad.data_ptr<float>(),
  /*workspace=*/nullptr, loss_slot,  // TC launcher owns its own TC-sized scratch
- lr, static_cast<int>(step), scalars, stream, /*ncta_cap=*/0);
+ lr, static_cast<int>(step), scalars, stream, /*ncta_cap=*/0, vit_opt_id);
  } else {
+ // The SCALAR real vit kernel exists only for adamw — fail loud otherwise.
+ TORCH_CHECK(optimizer == "adamw",
+ "fused ViT megakernel: the scalar (fp32) real fwd+bwd+opt path is wired "
+ "for adamw only; optimizer '", optimizer, "' has a real L3-TC path via "
+ "gemm_impl='wgmma' (single-launch tail) but no scalar one. Use bf16.");
  err = fused::sm90::mega_vit_real_adamw(
  ctx, params.data_ptr<float>(),
  vit_patches, vit_targets,

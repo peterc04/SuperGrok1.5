@@ -77,6 +77,24 @@ DecTcLauncherScratch& dec_tc_launcher_scratch(int dev, int64_t need_floats) {
 // size from the scalar nCTA*total partials, so this TU allocates+owns it. `loss_out`
 // still points into the caller's state[3*total] slot (dispatch reads it back).
 //
+// OPTID-GENERIC (owner baseline directive — all 33 cells on L3-TC): the fwd+bwd+
+// grad-reduction is OPTIMIZER-INDEPENDENT (the same validated wgmma decoder kernel);
+// ONLY the per-element optimizer TAIL (apply_optimizer<Opt>) differs, and that tail
+// is the 14/0-apply-parity math already in opt_components.cuh. So this launcher
+// takes `opt_id` (the OptId int) and dispatches to the matching kernel instantiation
+// over the SAME state buffer. The state layout is [m | v | extra] (3*total) + loss:
+//   * lion              uses m only (v/extra unread; bound harmlessly)
+//   * adamw             uses m, v
+//   * grokfast/grokadamw use m, v, ema  (ema == the `extra` slice, state + 2*total)
+//   * neuralgrok        uses m, v, AND a psi-net weight pack the cell supplies in the
+//                       `extra` slice (kPsiPackFloats floats); st.psi_W1/b1/W2 bind
+//                       to those offsets, exactly as opt_components.cuh documents.
+// The STAGED optimizers (prodigy/muon/SG11/SG15) and the model-coupled (looksam) and
+// SG2 are NOT routed here — they need precompute stages / a 2nd backward / a sharpness
+// ABI field that this single-launch path does not carry; dispatch.cpp gates them out
+// (and wiring_check fails them loud with the cited reason). NeuralGrok is wired but
+// its host-trained amplifier is a separate concern (the race fn gates it).
+//
 // ncta_cap: forwarded to the TC launcher (0 = one CTA/SM = full saturation, the
 // shipped config). The race always passes 0.
 cudaError_t mega_decoder_real_adamw_tc(
@@ -85,7 +103,7 @@ cudaError_t mega_decoder_real_adamw_tc(
         float* state, float* grad, float* /*workspace_unused*/, float* loss_out,
         const int* sizes, const int* offsets,
         float lr, int step, const FusedScalars& scalars, cudaStream_t stream,
-        int ncta_cap) {
+        int ncta_cap, int opt_id) {
     (void)sizes; (void)offsets;  // TC kernel reads kDecSizes/kDecOffsets directly.
 
     const int64_t total = kDecTotalElems;
@@ -112,9 +130,22 @@ cudaError_t mega_decoder_real_adamw_tc(
     ctx.g_generation  = sc.g_generation;
     ctx.n_tasks       = kDecNumTensors;  // parameter tensors for reduce+opt phases
 
+    // Bind the optimizer state slices. [m | v | extra] over the SAME state buffer;
+    // each tail reads only its own buffers (opt_components.cuh guarantees unused
+    // pointers are never dereferenced). ema/psi-net live in the `extra` slice.
+    float* const m_slice     = state;
+    float* const v_slice     = state + total;
+    float* const extra_slice = state + 2 * total;
     FusedOptState st;
-    st.exp_avg    = state;
-    st.exp_avg_sq = state + total;
+    st.exp_avg    = m_slice;
+    st.exp_avg_sq = v_slice;
+    st.ema        = extra_slice;          // grokfast/grokadamw slow-grad EMA
+    // NeuralGrok psi-net pack (kPsiPackFloats floats at the head of `extra`): the
+    // cell places [psi_W1 | psi_b1 | psi_W2 | psi_b2] there; bind the device pointers
+    // so the apply reads real weights (psi_b2 is read on-device from psi_W2[kPsiHidden]).
+    st.psi_W1     = extra_slice + kPsiW1Off;
+    st.psi_b1     = extra_slice + kPsiB1Off;
+    st.psi_W2     = extra_slice + kPsiW2Off;
     apply_scalars(st, scalars);   // FULL scalar set (un-frozen bc1/bc2/...)
     st.lr = lr;
 
@@ -125,8 +156,30 @@ cudaError_t mega_decoder_real_adamw_tc(
     tok.workspace = sc.workspace;
     tok.loss_out  = loss_out;
 
-    return launch_fused_decoder_megakernel_tc<OptId::AdamW>(
-        ctx, params, tok, grad, lr, step, st, stream, nCTA);
+    // Dispatch to the matching kernel instantiation. The fwd+bwd is identical across
+    // these OptIds; the template differs ONLY in the P3 apply_optimizer<Opt> tail.
+    // Unsupported opt_ids return cudaErrorInvalidValue → dispatch.cpp throws LOUD (no
+    // silent scalar/adamw fallback — the no-suppression rule). The STAGED/model-coupled
+    // optimizers are intentionally NOT cases here (they cannot run as a single launch).
+    switch (static_cast<OptId>(opt_id)) {
+        case OptId::AdamW:
+            return launch_fused_decoder_megakernel_tc<OptId::AdamW>(
+                ctx, params, tok, grad, lr, step, st, stream, nCTA);
+        case OptId::Lion:
+            return launch_fused_decoder_megakernel_tc<OptId::Lion>(
+                ctx, params, tok, grad, lr, step, st, stream, nCTA);
+        case OptId::Grokfast:
+            return launch_fused_decoder_megakernel_tc<OptId::Grokfast>(
+                ctx, params, tok, grad, lr, step, st, stream, nCTA);
+        case OptId::GrokAdamW:
+            return launch_fused_decoder_megakernel_tc<OptId::GrokAdamW>(
+                ctx, params, tok, grad, lr, step, st, stream, nCTA);
+        case OptId::NeuralGrok:
+            return launch_fused_decoder_megakernel_tc<OptId::NeuralGrok>(
+                ctx, params, tok, grad, lr, step, st, stream, nCTA);
+        default:
+            return cudaErrorInvalidValue;  // STAGED/coupled opt not single-launch TC
+    }
 }
 
 }}}  // namespace sg::fused::sm90

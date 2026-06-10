@@ -1395,9 +1395,13 @@ def train_grokfast(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("Grokfast",c["max_steps"],bp)):
-        # [A4-M5] L1 fused tail integration for this optimizer requires the
-        # adamw/lion post-backward structure (see train_adamw) — do not re-add
-        # the pre-forward continue pattern (it skips side-steps and eval).
+        # NO L3-TC path: grokfast is BLOCKED from the bf16 TC driver — the optimizer
+        # cold-starts ema=grad0 (grokfast.py) while the TC P3 state cache inits ema=0,
+        # so the in-kernel ema slice diverges from the real optimizer for ~1/(1-alpha)
+        # steps (state-gate: ema rel 0.98 at step 1). Converting needs a step==1 ema
+        # init in the shared TC P3 (cold-start-STAGED). Until then: real eager step.
+        # [A4-M5] L1 fused tail integration requires the adamw/lion post-backward
+        # structure — do not re-add the pre-forward continue pattern.
         with _autocast(c):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
@@ -1441,16 +1445,26 @@ def train_lion(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
+    mtype=c.get("model_type","decoder")
     for step in (pb:=_pbar("Lion",c["max_steps"],bp)):
-        # Real forward + backward; the whitelisted L1 fused tail applies the Lion
-        # update on the real grad (lion uses only the m=exp_avg slice of [m|v|extra]).
-        with _autocast(c):
-            loss=F.cross_entropy(m(tx),ty)
-        opt.zero_grad(); scaler.scale(loss).backward()
-        if _try_fused_step(c.get("model_type","decoder"), "lion", m, opt, tx, ty, c):
-            scaler.update()           # fused path: skip scaler.step(opt)
+        # L3-TC path (owner baseline directive): for a wgmma-wired (model × lion)
+        # cell the bf16 tensor-core megakernel runs the REAL fwd+bwd AND the Lion
+        # tail (apply_optimizer<Lion>) in ONE persistent kernel — identical fwd+bwd
+        # to the adamw TC cell, only the per-element tail differs. If it ran it
+        # returns the loss and we SKIP the eager fwd/bwd/step. Otherwise: eager
+        # fwd+bwd + the whitelisted L1 fused tail (lion uses only the m=exp_avg
+        # slice of [m|v|extra]).
+        l3_loss=_try_fused_train_step(mtype, "lion", m, opt, tx, ty, c)
+        if l3_loss is not None:
+            loss=torch.as_tensor(l3_loss)
         else:
-            scaler.step(opt); scaler.update()
+            with _autocast(c):
+                loss=F.cross_entropy(m(tx),ty)
+            opt.zero_grad(); scaler.scale(loss).backward()
+            if _try_fused_step(mtype, "lion", m, opt, tx, ty, c):
+                scaler.update()           # fused path: skip scaler.step(opt)
+            else:
+                scaler.step(opt); scaler.update()
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break

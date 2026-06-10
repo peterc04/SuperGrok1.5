@@ -655,10 +655,34 @@ _FUSED_READY = frozenset(
 # these cells via fused_train_step() (NOT the L1 per-tensor fused_optimizer_step).
 # Kept as a SET so the tier semantics are a single source of truth the race + the
 # parity tests both read.
+# OWNER BASELINE DIRECTIVE (all 33 cells on L3-TC): the decoder/vit wgmma fwd+bwd is
+# optimizer-independent, so the SINGLE-LAUNCH optimizer tails (lion/grokfast/grokadamw
+# /neuralgrok) compose into the SAME TC driver via apply_optimizer<Opt> (the 14/0-
+# apply-parity math). They are L3-REAL on the wgmma path. Added per-model as each
+# model's launcher gains the opt_id switch (decoder first; vit/mamba follow). The
+# STAGED (prodigy/muon/SG11/SG15), model-coupled (looksam) and SG2 cells are NOT here:
+# their L3-TC needs a precompute stage / 2nd backward / sharpness ABI not in the
+# single-launch path (INTEGRATION-OPTSTAGES verdict table) — wiring_check fails them
+# loud with the cited blocker, which is the directive's "report converted/blocked".
 _FUSED_L3_REAL = frozenset({
     ("transformer_decoder", "adamw"),
     ("vit", "adamw"),
     ("mamba3", "adamw"),
+    # decoder + vit single-launch TC tails (opt_id switch wired in the
+    # mega_{decoder,vit}_real_adamw_tc_launcher.cu + dispatch.cpp).
+    ("transformer_decoder", "lion"),
+    ("vit", "lion"),
+    # NOTE — BLOCKED (state-gate evidence), deliberately NOT registered:
+    #  * grokadamw: per-tensor beta1 = beta1·(1-gamma)^i (gamma=0.1) is unrepresentable
+    #    in one global FusedScalars (rebase_state rebases pointers, not scalars) — same
+    #    ABI-gap class as SG11/SG15 sharpness. Inert at step 1 (Adam→sign), diverges
+    #    multi-step.
+    #  * grokfast: the optimizer COLD-STARTS ema=grad0 (grokfast.py:143, with a cited
+    #    comment that the kernel has no matching init); the TC P3 state cache inits
+    #    ema=0, so the ema slice diverges 50x at step 1 (state-gate: ema rel 0.98) and
+    #    for ~1/(1-alpha) steps after. Converting it needs a step==1 ema=grad init in
+    #    the shared TC P3 (a kernel change → grokfast becomes cold-start-STAGED, not a
+    #    nothing-needed direct tail). Blocked until that lands.
 })
 
 _FUSED_REGISTRY = {}
@@ -822,8 +846,20 @@ def _opt_scalars_from(optimizer, step):
     wd = float(g.get("weight_decay", 0.0))
     bc1 = 1.0 - beta1 ** step
     bc2 = 1.0 - beta2 ** step
-    return dict(lr=lr, beta1=beta1, beta2=beta2, eps=eps, weight_decay=wd,
-                bc1=bc1, bc2=bc2, step=int(step))
+    out = dict(lr=lr, beta1=beta1, beta2=beta2, eps=eps, weight_decay=wd,
+               bc1=bc1, bc2=bc2, step=int(step))
+    # grokfast/grokadamw: the in-kernel apply_optimizer<Opt> reads st.alpha/st.lamb
+    # (the EMA decay + amplification). Pull the REAL configured values from the
+    # optimizer's param_groups so the kernel uses the live mechanism — NOT the
+    # FusedScalars struct default (which only coincidentally matches 0.98/2.0).
+    # grokfast uses grokfast_alpha/grokfast_lamb; grokadamw uses alpha/lamb.
+    if "grokfast_alpha" in g:
+        out["alpha"] = float(g["grokfast_alpha"])
+        out["lamb"] = float(g.get("grokfast_lamb", 2.0))
+    elif "alpha" in g and "lamb" in g:   # grokadamw (also lion has no alpha key)
+        out["alpha"] = float(g["alpha"])
+        out["lamb"] = float(g["lamb"])
+    return out
 
 
 def fused_optimizer_step(model_name, opt_name, torch_module, optimizer, *,
@@ -950,6 +986,14 @@ _L3_WGMMA_CELLS = frozenset({
     ("transformer_decoder", "adamw"),
     ("vit", "adamw"),
     # NOTE: ("mamba3", "adamw") deliberately ABSENT — scalar-only by measurement.
+    # OWNER BASELINE: single-launch optimizer tails on the bf16 TC decoder/vit driver.
+    # Each entry's tail runs in-kernel via apply_optimizer<Opt> over the TC-reduced
+    # grad; added per-model as the launcher opt_id switch lands. grokfast + grokadamw
+    # are excluded — the state-aware gate proved their kernel state diverges from the
+    # real optimizer (grokfast ema cold-start; grokadamw per-layer beta1). See the
+    # _FUSED_L3_REAL note for the cited blockers.
+    ("transformer_decoder", "lion"),
+    ("vit", "lion"),
 })
 
 
@@ -957,12 +1001,16 @@ def gemm_impl_for_cell(model_name, opt_name, precision):
     """The GEMM engine token ("wgmma" | "scalar") for an L3-REAL cell at `precision`.
 
     Path-matched semantics (replaces the old fp32-only gate, owner directive task 1):
-      * precision == "bf16"  → "wgmma" for the TC-capable cells (decoder/vit×adamw),
-                               "scalar" for mamba (the measured carve-out).
-      * precision == "fp32"  → "scalar" for ALL cells (the fp32 owner-computes
-                               megakernel; eager-vs-TC parity at bf16 is gated
-                               separately, so fp32 stays on the verified scalar
-                               path).
+      * precision == "bf16"  → "wgmma" for the TC-capable cells (decoder/vit×{adamw,
+                               lion}), "scalar" for mamba×adamw (the measured carve-out).
+      * precision == "fp32"  → "scalar" for ADAMW cells (the fp32 owner-computes
+                               megakernel exists only for adamw); None for the non-adamw
+                               single-launch tails (lion) — they have NO scalar real
+                               fwd+bwd+opt kernel, only the wgmma one, so at fp32 the
+                               caller declines to eager (the honest path). Returning
+                               "scalar" for them would route to the SURROGATE cell
+                               (wired_fused_cell) → a dtype throw on the token input, a
+                               loud-but-wrong fallthrough; None avoids it cleanly.
     Any other precision returns None → the caller declines the L3 path entirely
     (fp16-AMP / tf32 have no in-kernel carrier here; eager is the honest path).
 
@@ -972,7 +1020,9 @@ def gemm_impl_for_cell(model_name, opt_name, precision):
     """
     model_c = canonicalize_model(model_name)
     if precision == "fp32":
-        return "scalar"
+        # Only adamw has a scalar real fwd+bwd+opt megakernel. Non-adamw L3-REAL cells
+        # (lion) are wgmma-only → decline at fp32 (eager), never the surrogate.
+        return "scalar" if opt_name == "adamw" else None
     if precision == "bf16":
         return "wgmma" if (model_c, opt_name) in _L3_WGMMA_CELLS else "scalar"
     return None
@@ -1177,11 +1227,20 @@ def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
     # weight grad there (and consumes it in the optimizer tail WITHOUT overwriting),
     # so after the call grad_out holds exactly the grad the AdamW step used — the
     # parity test slices it per-tensor against the oracle (the keystone check).
+    # Forward alpha/lamb when the optimizer carries them (grokfast/grokadamw): the
+    # in-kernel apply_optimizer<Opt> reads st.alpha/st.lamb. Omitting them would leave
+    # the FusedScalars defaults (0.98/2.0) — wrong if the cell ran a configured value.
+    _extra_scalars = {}
+    if "alpha" in scalars:
+        _extra_scalars["alpha"] = scalars["alpha"]
+    if "lamb" in scalars:
+        _extra_scalars["lamb"] = scalars["lamb"]
     ops.fused_step(model_c, opt_name, flat, packed, grad_out, state, scalars["lr"],
                    beta1=scalars["beta1"], beta2=scalars["beta2"],
                    eps=scalars["eps"], weight_decay=scalars["weight_decay"],
                    bc1=scalars["bc1"], bc2=scalars["bc2"],
-                   step=scalars["step"], opt_only=False, gemm_impl=gemm_impl)
+                   step=scalars["step"], opt_only=False, gemm_impl=gemm_impl,
+                   **_extra_scalars)
 
     # Scatter the updated flat params back into the live model (same order).
     off = 0
