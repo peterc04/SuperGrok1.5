@@ -189,6 +189,23 @@ struct PersistentContext {
  int n_tasks;
  unsigned n_ctas;
 };
+// FusedScalars mirror — layout-identical to csrc/fused/sm_90/opt_components.cuh
+// ::FusedScalars (the FULL runtime scalar set the host binds: lr, beta1, beta2,
+// eps, wd, bc1, bc2, alpha, beta, lamb, alpha_max, gate, d_factor, neg_lr_scale,
+// decay_factor — 15 floats). This MUST live in sg::fused::sm90 (NOT sg::fused):
+// the generated cell launchers take `const FusedScalars&` resolved by enclosing-
+// namespace lookup to sg::fused::sm90::FusedScalars; the dispatch table .inc
+// (opened in sg::fused::sm90) resolves the same name the same way, so the call-
+// site parameter mangling matches the .cu definitions. A mirror in sg::fused
+// would mangle as sg::fused::FusedScalars and fail to link. Keep field order /
+// types byte-identical to the real struct — fused_step memcpy-fills this and the
+// cell reads it positionally via apply_scalars().
+namespace sm90 {
+struct FusedScalars {
+ float lr, beta1, beta2, eps, wd, bc1, bc2, alpha, beta, lamb, alpha_max,
+       gate, d_factor, neg_lr_scale, decay_factor;
+};
+} // namespace sm90
 } // namespace fused
 // Phase 3 Stage 5: all 33 sm_90 cells are real component compositions
 // (csrc/fused/sm_90/mega_<model>_<opt>.cu → fused_megakernel.cuh →
@@ -196,6 +213,51 @@ struct PersistentContext {
 // cell launcher and routes (model, optimizer) → the real symbol. It replaces
 // the 3 hard-coded demo routes (the toy megakernel_demo.cu was deleted).
 #include "csrc/fused/sm_90/fused_dispatch_table.inc"
+
+// PHASE 1 — extern decl of the TRUE L3 fused decoder launcher. Its DEFINITION
+// lives in the nvcc-compiled csrc/fused/sm_90/mega_decoder_real_adamw.cu (which
+// owns all the <<<>>> / __global__ / device-intrinsic code — dispatch.cpp is
+// HOST-compiled and cannot host any of it). The boundary signature is decomposed
+// to plain pointers/ints + the FusedScalars mirror (NO header-only types like
+// DecoderTokenCtx/FusedOptState), and uses the same sg::fused::PersistentContext
+// + sg::fused::sm90::FusedScalars mirror types the 33 surrogate cells already use
+// — so the FQN/layout/mangling match the .cu definition (the existing cell cheat).
+// kDecTotalElems / kDecNumTensors are NOT visible here (they live in the device
+// header); fused_step's decoder branch passes the element count it already knows.
+namespace fused { namespace sm90 {
+cudaError_t mega_decoder_real_adamw(
+    ::sg::fused::PersistentContext ctx, float* params,
+    const int* tokens, const int* targets, int B,
+    float* state, float* grad, float* workspace, float* loss_out,
+    const int* sizes, const int* offsets,
+    float lr, int step, const FusedScalars& scalars, cudaStream_t stream);
+}}  // namespace fused::sm90
+
+// PHASE 2 — extern decls of the TRUE L3 fused ViT + Mamba launchers. Definitions
+// live in the nvcc-compiled csrc/fused/sm_90/mega_{vit,mamba}_real_adamw.cu (which
+// own all the <<<>>> / __global__ / device-intrinsic code). Boundary signatures
+// are plain pointers/ints + the FusedScalars mirror (NO header-only ViTInputCtx /
+// MambaTokenCtx / FusedOptState), using the same sg::fused::PersistentContext +
+// sg::fused::sm90::FusedScalars mirror types the cells already use — so FQN /
+// layout / mangling match the .cu definitions. UNLIKE the decoder launcher these
+// take NO sizes/offsets (the kernels read kVitSizes/kMambaSizes __constant__
+// tables directly), matching the .cu definitions exactly — a mismatch is a loud
+// link error, not silent. kVitTotalElems / kMambaTotalElems are NOT visible here
+// (they live in the device headers); the branches below pass the element count
+// they already know. ViT takes FLOAT patches; Mamba takes int tokens (the .cu
+// signatures differ in the first input-pointer type).
+namespace fused { namespace sm90 {
+cudaError_t mega_vit_real_adamw(
+    ::sg::fused::PersistentContext ctx, float* params,
+    const float* patches, const int* targets, int B,
+    float* state, float* grad, float* workspace, float* loss_out,
+    float lr, int step, const FusedScalars& scalars, cudaStream_t stream);
+cudaError_t mega_mamba_real_adamw(
+    ::sg::fused::PersistentContext ctx, float* params,
+    const int* tokens, const int* targets, int B,
+    float* state, float* grad, float* workspace, float* loss_out,
+    float lr, int step, const FusedScalars& scalars, cudaStream_t stream);
+}}  // namespace fused::sm90
 #endif
 
 // gfx942 twin (🟡 hipcc/MI300X only). Faithful mirror of the sm_90 block: the
@@ -213,6 +275,13 @@ struct PersistentContext {   // mirror of megakernel_common_hip.hip.hpp
  unsigned* g_generation;
  int n_tasks;
  unsigned n_ctas;
+};
+// FusedScalars mirror — layout-identical to gfx942/opt_components.hip.hpp
+// ::FusedScalars (same 15 floats). In sg::fused::gfx942_mega so the dispatch
+// table's `const FusedScalars&` resolves to the same type the .hip cells define.
+struct FusedScalars {
+ float lr, beta1, beta2, eps, wd, bc1, bc2, alpha, beta, lamb, alpha_max,
+       gate, d_factor, neg_lr_scale, decay_factor;
 };
 }} // namespace fused::gfx942_mega
 #include "csrc/fused/gfx942/fused_dispatch_table.inc"
@@ -280,14 +349,212 @@ inline FusedScratch& fused_scratch_for(const torch::Tensor& params, int64_t n) {
 }
 #endif
 
+#if defined(WITH_CUDA) && !defined(WITH_HIP)
+// PHASE-1 decoder L3-REAL: the flat param element count for the small decoder
+// (vocab=99,d=128,heads=4,layers=2,seq=4). MUST equal
+// sg::fused::sm90::kDecTotalElems — that device-side constant is NOT visible in
+// this HOST-compiled TU (it lives in the device-only decoder_layout.cuh), so we
+// mirror the literal here and cross-check it against params.numel() at the call
+// site (a mismatch fails loudly). The .cu's static_asserts guard the device side.
+constexpr int64_t kDecoderTotalElems = 422755;
+constexpr int     kDecoderSeq        = 4;   // mirror of SG_DEC_SEQ
+
+// PHASE-1 decoder L3-REAL scratch: per-CTA grad-partial workspace + barrier
+// counters + a reduced-grad buffer. The workspace is nCTA*total grad partials +
+// nCTA loss partials; sized for nCTA = #SMs (the launcher pins one CTA per SM).
+// The per-tensor sizes/offsets are NOT built here — the kernel reads the
+// generated __constant__ kDecSizes/kDecOffsets tables directly. Persisted + reset
+// per step (the big workspace is zeroed IN-KERNEL by phase P0; the host only
+// resets the barrier/task counters here).
+struct DecoderScratch {
+ torch::Tensor g_next;        // int32 [1]
+ torch::Tensor g_arrived;     // int32 [1] (unsigned-reinterpreted)
+ torch::Tensor g_generation;  // int32 [1] (unsigned-reinterpreted)
+ torch::Tensor workspace;     // float [nCTA*total + nCTA] partials + loss slots
+ int n_ctas = 0;
+};
+
+inline DecoderScratch& decoder_scratch_for(const torch::Tensor& params) {
+ static std::unordered_map<long long, DecoderScratch> cache;
+ const long long dev_idx =
+ params.device().is_cuda() ? static_cast<long long>(params.device().index())
+ : -1LL;
+ const long long key = dev_idx;   // one decoder shape per device (fixed total)
+ auto it = cache.find(key);
+ const int64_t total = kDecoderTotalElems;
+ if (it == cache.end()) {
+ int dev = params.device().is_cuda() ? params.device().index() : 0;
+ int n_sms = 1;
+ cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, dev);
+ auto opts_i =
+ torch::TensorOptions().device(params.device()).dtype(torch::kInt32);
+ auto opts_f =
+ torch::TensorOptions().device(params.device()).dtype(torch::kFloat32);
+ DecoderScratch s;
+ s.g_next = torch::zeros({1}, opts_i);
+ s.g_arrived = torch::zeros({1}, opts_i);
+ s.g_generation = torch::zeros({1}, opts_i);
+ // The reduced grad is now routed through the ABI `grad` tensor (exposed to the
+ // caller for per-tensor parity); no internal grad scratch needed.
+ // workspace: nCTA*total partials + nCTA loss slots. Zeroed in-kernel (P0);
+ // allocate (not zero) — the in-kernel P0 + the loss reduce overwrite it.
+ s.workspace = torch::empty({(int64_t)n_sms * total + n_sms}, opts_f);
+ s.n_ctas = n_sms;
+ it = cache.emplace(key, std::move(s)).first;
+ } else {
+ it->second.g_next.zero_();
+ it->second.g_arrived.zero_();
+ it->second.g_generation.zero_();
+ }
+ return it->second;
+}
+
+// PHASE-2 ViT L3-REAL: the flat param element count for the small ViT
+// (p=97,d=128,heads=4,layers=2,patch=49,npatch=16). MUST equal
+// sg::fused::sm90::kVitTotalElems (the device-side constant in vit_layout.cuh,
+// NOT visible in this HOST-compiled TU); mirrored here and cross-checked against
+// params.numel() at the call site (a mismatch fails loudly). The .cu's
+// static_asserts guard the device side. ViT carries FLOAT patches (NOT int
+// tokens), so its packing differs from the decoder/mamba — see the branch.
+constexpr int64_t kVitTotalElems = 418017;
+constexpr int     kVitPatchElems = 16 * 49;   // 784 (kNPatch*kPatch)
+
+// PHASE-2 ViT L3-REAL scratch: per-CTA grad-partial workspace + barrier counters.
+// Modeled BYTE-FOR-BYTE on DecoderScratch/decoder_scratch_for; only the total
+// changes. The per-tensor sizes/offsets are NOT built here — the kernel reads the
+// generated __constant__ kVitSizes/kVitOffsets tables directly.
+struct ViTScratch {
+ torch::Tensor g_next;        // int32 [1]
+ torch::Tensor g_arrived;     // int32 [1] (unsigned-reinterpreted)
+ torch::Tensor g_generation;  // int32 [1] (unsigned-reinterpreted)
+ torch::Tensor workspace;     // float [nCTA*total + nCTA] partials + loss slots
+ int n_ctas = 0;
+};
+
+inline ViTScratch& vit_scratch_for(const torch::Tensor& params) {
+ static std::unordered_map<long long, ViTScratch> cache;
+ const long long dev_idx =
+ params.device().is_cuda() ? static_cast<long long>(params.device().index())
+ : -1LL;
+ const long long key = dev_idx;   // one ViT shape per device (fixed total)
+ auto it = cache.find(key);
+ const int64_t total = kVitTotalElems;
+ if (it == cache.end()) {
+ int dev = params.device().is_cuda() ? params.device().index() : 0;
+ int n_sms = 1;
+ cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, dev);
+ auto opts_i =
+ torch::TensorOptions().device(params.device()).dtype(torch::kInt32);
+ auto opts_f =
+ torch::TensorOptions().device(params.device()).dtype(torch::kFloat32);
+ ViTScratch s;
+ s.g_next = torch::zeros({1}, opts_i);
+ s.g_arrived = torch::zeros({1}, opts_i);
+ s.g_generation = torch::zeros({1}, opts_i);
+ // workspace: nCTA*total partials + nCTA loss slots. Zeroed in-kernel (P0);
+ // allocate (not zero) — the in-kernel P0 + the loss reduce overwrite it.
+ s.workspace = torch::empty({(int64_t)n_sms * total + n_sms}, opts_f);
+ s.n_ctas = n_sms;
+ it = cache.emplace(key, std::move(s)).first;
+ } else {
+ it->second.g_next.zero_();
+ it->second.g_arrived.zero_();
+ it->second.g_generation.zero_();
+ }
+ return it->second;
+}
+
+// PHASE-2 Mamba L3-REAL: the flat param element count for the small Mamba
+// (ntok=99,p=97,d=128,layers=2,seq=8). MUST equal sg::fused::sm90::
+// kMambaTotalElems (the device-side constant in mamba3_layout.cuh). Mamba carries
+// int32 tokens like the decoder (NOT ViT's float patches) — see the branch.
+constexpr int64_t kMambaTotalElems = 259425;
+constexpr int     kMambaSeq        = 8;   // mirror of SG_MB_SEQ
+
+// PHASE-2 Mamba L3-REAL scratch: modeled on DecoderScratch/decoder_scratch_for.
+struct MambaScratch {
+ torch::Tensor g_next;        // int32 [1]
+ torch::Tensor g_arrived;     // int32 [1] (unsigned-reinterpreted)
+ torch::Tensor g_generation;  // int32 [1] (unsigned-reinterpreted)
+ torch::Tensor workspace;     // float [nCTA*total + nCTA] partials + loss slots
+ int n_ctas = 0;
+};
+
+inline MambaScratch& mamba_scratch_for(const torch::Tensor& params) {
+ static std::unordered_map<long long, MambaScratch> cache;
+ const long long dev_idx =
+ params.device().is_cuda() ? static_cast<long long>(params.device().index())
+ : -1LL;
+ const long long key = dev_idx;   // one Mamba shape per device (fixed total)
+ auto it = cache.find(key);
+ const int64_t total = kMambaTotalElems;
+ if (it == cache.end()) {
+ int dev = params.device().is_cuda() ? params.device().index() : 0;
+ int n_sms = 1;
+ cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, dev);
+ auto opts_i =
+ torch::TensorOptions().device(params.device()).dtype(torch::kInt32);
+ auto opts_f =
+ torch::TensorOptions().device(params.device()).dtype(torch::kFloat32);
+ MambaScratch s;
+ s.g_next = torch::zeros({1}, opts_i);
+ s.g_arrived = torch::zeros({1}, opts_i);
+ s.g_generation = torch::zeros({1}, opts_i);
+ // workspace: nCTA*total partials + nCTA loss slots. Zeroed in-kernel (P0).
+ s.workspace = torch::empty({(int64_t)n_sms * total + n_sms}, opts_f);
+ s.n_ctas = n_sms;
+ it = cache.emplace(key, std::move(s)).first;
+ } else {
+ it->second.g_next.zero_();
+ it->second.g_arrived.zero_();
+ it->second.g_generation.zero_();
+ }
+ return it->second;
+}
+#endif
+
 } // anonymous namespace
 
+// NOTE: the default argument VALUES live on the declaration in helpers.h (which
+// bindings.cpp sees for the py::arg defaults). C++ forbids repeating a default
+// argument on both the declaration and the definition, so the definition below
+// lists the parameters WITHOUT defaults. Keep the two signatures in lock-step:
+// (model, optimizer, params, input, grad, state, lr, beta1, beta2, eps,
+//  weight_decay, alpha, lamb, gamma, gate, d_factor, bc1, bc2, neg_lr_scale,
+//  decay_factor, beta, alpha_max, step, opt_only).
 void fused_step(const std::string& model, const std::string& optimizer,
  torch::Tensor params, torch::Tensor input,
- torch::Tensor grad, torch::Tensor state, float lr) {
+ torch::Tensor grad, torch::Tensor state, float lr,
+ // FULL scalar set (C2-gap fix). apply_optimizer<> reads every one of
+ // these; before this widening only `lr` was bound and the rest sat at
+ // FusedOptState defaults (bc1/bc2/gate/d_factor == 1.0 → NO bias
+ // correction, SG gating + Prodigy d-adaptation inert). bc1/bc2 are
+ // un-inverted (= 1 - beta^step); the caller computes them from the shared
+ // step counter (valid because all race params step together — the
+ // megakernel treats the flat param as one task with one bc pair).
+ float beta1, float beta2, float eps,
+ float weight_decay, float alpha, float lamb,
+ float gamma, float gate, float d_factor,
+ float bc1, float bc2,
+ float neg_lr_scale, float decay_factor,
+ float beta, float alpha_max,
+ int64_t step,
+ // Tier selector. opt_only=true → L1: fused optimizer TAIL only; the kernel
+ // reads the REAL grad from `grad` (framework-computed) and applies the
+ // canonical update — the numerically-faithful path the race uses.
+ // opt_only=false → L3: the kernel also runs the SURROGATE element-local
+ // model fwd/bwd (model_stages.*), whose loss does NOT match the real
+ // Transformer/ViT/Mamba graph (see BUILD_AND_VALIDATE.md).
+ bool opt_only) {
  int arch = detect_arch();
  std::string arch_str = (arch == 90) ? "sm_90"
  : (arch == 942) ? "gfx942" : "tpu_v6e";
+ // `gamma` is carried for ABI completeness / forward-compat (the directive's
+ // scalar set lists it). No current apply_optimizer<> branch consumes a gamma
+ // term — SG15's gamma_alpha folds into the host-side alpha schedule (it
+ // arrives here already baked into `alpha`), so binding it again would double-
+ // apply. Kept in the ABI so a future cell can read it without re-widening.
+ (void)gamma;
 
  const std::string cell = wired_fused_cell(model, optimizer, arch);
  if (cell.empty()) {
@@ -301,6 +568,242 @@ void fused_step(const std::string& model, const std::string& optimizer,
  }
 
 #if defined(WITH_CUDA) && !defined(WITH_HIP)
+ // ── PHASE 1: the TRUE L3 fused decoder megakernel (real fwd+bwd+adamw). ──
+ // Fires for (transformer_decoder, adamw, !opt_only): ONE persistent kernel,
+ // no surrogate, no intermediate launches. The token path is carried through
+ // the EXISTING fused_step arity (the pybind py::arg list pins it) by reading
+ // tokens/targets from the int32-reinterpreted `input` tensor:
+ //   input = int32 [B*(kSeq+1)]  (first B*kSeq tokens row-major, last B targets)
+ // and `state` = float [3*total + 1] ([m|v|extra] + a trailing loss slot the
+ // kernel writes the mean loss into, which the Python wrapper reads back). The
+ // workspace (nCTA*total grad partials + nCTA loss partials) is device scratch
+ // allocated here — it never crosses the ABI. S/vocab/d are compile-time
+ // (kSeq/kVocab/kD); B is derived from input.numel(). This leaves the 33
+ // generated surrogate cells untouched (their surrogate-L3 path is now
+ // unreachable dead code; see BUILD_AND_VALIDATE.md PHASE-1).
+ if (arch == 90 && model == "transformer_decoder" && optimizer == "adamw"
+ && !opt_only) {
+ const int64_t total = kDecoderTotalElems;
+ TORCH_CHECK(params.numel() == total,
+ "fused decoder megakernel: params has ", params.numel(),
+ " elements but the small decoder has ", total,
+ ". Pass the flat concat of named_parameters() in order.");
+ TORCH_CHECK(params.scalar_type() == torch::kFloat32 && params.is_contiguous(),
+ "fused decoder megakernel: params must be contiguous fp32.");
+ // input = int32 tokens(B*kSeq) ++ targets(B). B = numel/(kSeq+1).
+ TORCH_CHECK(input.scalar_type() == torch::kInt32 && input.is_contiguous(),
+ "fused decoder megakernel: input must be contiguous int32 "
+ "(packed tokens[B*kSeq]++targets[B]).");
+ const int64_t in_n = input.numel();
+ TORCH_CHECK(in_n % (kDecoderSeq + 1) == 0 && in_n > 0,
+ "fused decoder megakernel: input.numel() (", in_n,
+ ") must be B*(kSeq+1) = B*", kDecoderSeq + 1, ".");
+ const int B = (int)(in_n / (kDecoderSeq + 1));
+ // state = [m|v|extra] (3*total) + 1 loss slot.
+ TORCH_CHECK(state.numel() >= 3 * total + 1 &&
+ state.scalar_type() == torch::kFloat32 && state.is_contiguous(),
+ "fused decoder megakernel: state must be contiguous fp32 with "
+ ">= 3*total+1 = ", 3 * total + 1, " elements ([m|v|extra]+loss).");
+ // grad = the REDUCED weight-grad OUTPUT [total]: the kernel writes the
+ // deterministically-reduced grad here (P2) and consumes it in the optimizer
+ // tail (P3), which does NOT overwrite it — so after the call this buffer holds
+ // exactly the grad the AdamW step used. Routing it through the ABI `grad`
+ // tensor (instead of an internal scratch) EXPOSES the kernel's grads to the
+ // caller so the parity test can compare every weight grad per-tensor against
+ // the oracle (the keystone validation of the hand-written backward).
+ TORCH_CHECK(grad.numel() == total &&
+ grad.scalar_type() == torch::kFloat32 && grad.is_contiguous(),
+ "fused decoder megakernel: grad must be contiguous fp32 with total = ",
+ total, " elements (the reduced weight-grad output buffer).");
+
+ DecoderScratch& dsc = decoder_scratch_for(params);
+ // PersistentContext built from the mirror struct (same layout/FQN as the .cu).
+ // n_tasks = #parameter tensors (30) for the reduce + optimizer phases — the
+ // kernel reads the per-tensor numel/offset from its __constant__ tables.
+ fused::PersistentContext ctx{
+ dsc.g_next.data_ptr<int>(),
+ reinterpret_cast<unsigned*>(dsc.g_arrived.data_ptr<int>()),
+ reinterpret_cast<unsigned*>(dsc.g_generation.data_ptr<int>()),
+ 30,                    // kDecNumTensors (mirror; the .cu static-asserts it)
+ 0u};                   // n_ctas overwritten by the launcher (one CTA/SM)
+
+ float* m = state.data_ptr<float>();
+ float* loss_slot = m + 3 * total;          // the trailing loss slot
+
+ // FULL scalar set (un-frozen bc1/bc2/...). Field order MUST match the mirror
+ // fused::sm90::FusedScalars (== the real struct the .cu reads positionally).
+ fused::sm90::FusedScalars scalars{
+ lr, beta1, beta2, eps, weight_decay, bc1, bc2, alpha, beta, lamb,
+ alpha_max, gate, d_factor, neg_lr_scale, decay_factor};
+
+ cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ // Call the extern nvcc launcher (defined in mega_decoder_real_adamw.cu). All
+ // <<<>>> / __global__ / device-intrinsic code lives there; this host TU only
+ // passes plain pointers + the FusedScalars POD. sizes/offsets are nullptr (the
+ // kernel uses its __constant__ layout tables).
+ cudaError_t err = fused::sm90::mega_decoder_real_adamw(
+ ctx, params.data_ptr<float>(),
+ input.data_ptr<int>(),                              // tokens
+ input.data_ptr<int>() + (int64_t)B * kDecoderSeq,   // targets
+ B, m, grad.data_ptr<float>(),    // reduced-grad OUTPUT (exposed to caller)
+ dsc.workspace.data_ptr<float>(), loss_slot,
+ /*sizes=*/nullptr, /*offsets=*/nullptr,
+ lr, static_cast<int>(step), scalars, stream);
+ if (err != cudaSuccess)
+ throw std::runtime_error(
+ std::string("fused decoder megakernel launch failed: ") +
+ cudaGetErrorString(err));
+ return;
+ }
+
+ // ── PHASE 2: the TRUE L3 fused ViT megakernel (real fwd+bwd+adamw). ──
+ // Fires for (vit, adamw, !opt_only): ONE persistent kernel, no surrogate, no
+ // intermediate launches. UNLIKE the decoder/mamba (int tokens), ViT's input is
+ // FLOAT image patches with int targets BIT-REINTERPRETED into trailing float
+ // slots (fused_step's arity has one input tensor; the symmetric move to the
+ // decoder's int pack):
+ //   input = float32 [B*16*49 + B]  (B*784 patch pixels row-major [B][16][49],
+ //                                   then B targets bit-cast to float)
+ // dispatch reads patches as input.data_ptr<float>() and targets as
+ // reinterpret_cast<const int*>(input.data_ptr<float>() + B*784) — a BIT
+ // REINTERPRET (NOT a value cast), lossless for ALL int32. `state` = float
+ // [3*total + 1] ([m|v|extra] + a trailing loss slot the kernel writes the mean
+ // loss into). The workspace is device scratch (never crosses the ABI). Placed
+ // BEFORE the surrogate route so the real path wins.
+ if (arch == 90 && model == "vit" && optimizer == "adamw" && !opt_only) {
+ const int64_t total = kVitTotalElems;
+ TORCH_CHECK(params.numel() == total,
+ "fused ViT megakernel: params has ", params.numel(),
+ " elements but the small ViT has ", total,
+ ". Pass the flat concat of named_parameters() in order.");
+ TORCH_CHECK(params.scalar_type() == torch::kFloat32 && params.is_contiguous(),
+ "fused ViT megakernel: params must be contiguous fp32.");
+ // input = float32 patches(B*784) ++ int-target-bits(B). B = numel/(784+1).
+ TORCH_CHECK(input.scalar_type() == torch::kFloat32 && input.is_contiguous(),
+ "fused ViT megakernel: input must be contiguous fp32 (packed patch "
+ "pixels[B*16*49] ++ int-target-bits[B] bit-reinterpreted into floats).");
+ const int64_t in_n = input.numel();
+ TORCH_CHECK(in_n % (kVitPatchElems + 1) == 0 && in_n > 0,
+ "fused ViT megakernel: input.numel() (", in_n,
+ ") must be B*(16*49+1) = B*", kVitPatchElems + 1, ".");
+ const int B = (int)(in_n / (kVitPatchElems + 1));
+ // state = [m|v|extra] (3*total) + 1 loss slot.
+ TORCH_CHECK(state.numel() >= 3 * total + 1 &&
+ state.scalar_type() == torch::kFloat32 && state.is_contiguous(),
+ "fused ViT megakernel: state must be contiguous fp32 with "
+ ">= 3*total+1 = ", 3 * total + 1, " elements ([m|v|extra]+loss).");
+ // grad = the REDUCED weight-grad OUTPUT [total] (same contract as the
+ // decoder): the kernel writes the deterministically-reduced grad here (P2) and
+ // consumes it in the optimizer tail (P3) WITHOUT overwriting it, so after the
+ // call this buffer holds exactly the grad the AdamW step used — the parity test
+ // slices it per-tensor against the oracle (the keystone check).
+ TORCH_CHECK(grad.numel() == total &&
+ grad.scalar_type() == torch::kFloat32 && grad.is_contiguous(),
+ "fused ViT megakernel: grad must be contiguous fp32 with total = ",
+ total, " elements (the reduced weight-grad output buffer).");
+
+ ViTScratch& vsc = vit_scratch_for(params);
+ fused::PersistentContext ctx{
+ vsc.g_next.data_ptr<int>(),
+ reinterpret_cast<unsigned*>(vsc.g_arrived.data_ptr<int>()),
+ reinterpret_cast<unsigned*>(vsc.g_generation.data_ptr<int>()),
+ 32,                    // kVitNumTensors (mirror; the .cu static-asserts it)
+ 0u};                   // n_ctas overwritten by the launcher (one CTA/SM)
+
+ float* m = state.data_ptr<float>();
+ float* loss_slot = m + 3 * total;          // the trailing loss slot
+
+ fused::sm90::FusedScalars scalars{
+ lr, beta1, beta2, eps, weight_decay, bc1, bc2, alpha, beta, lamb,
+ alpha_max, gate, d_factor, neg_lr_scale, decay_factor};
+
+ cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ cudaError_t err = fused::sm90::mega_vit_real_adamw(
+ ctx, params.data_ptr<float>(),
+ input.data_ptr<float>(),                                  // patches
+ reinterpret_cast<const int*>(input.data_ptr<float>()
+ + (int64_t)B * kVitPatchElems),                          // targets (bit-cast)
+ B, m, grad.data_ptr<float>(),    // reduced-grad OUTPUT (exposed to caller)
+ vsc.workspace.data_ptr<float>(), loss_slot,
+ lr, static_cast<int>(step), scalars, stream);
+ if (err != cudaSuccess)
+ throw std::runtime_error(
+ std::string("fused ViT megakernel launch failed: ") +
+ cudaGetErrorString(err));
+ return;
+ }
+
+ // ── PHASE 2: the TRUE L3 fused Mamba megakernel (real fwd+bwd+adamw). ──
+ // Fires for (mamba3, adamw, !opt_only): ONE persistent kernel, no surrogate, no
+ // intermediate launches. CANONICAL model name is "mamba3" (NOT "mamba" — the
+ // Python wrapper canonicalizes before calling, and the wired-cell table emits
+ // mamba3; matching "mamba" here would never fire and fall through to the
+ // surrogate path). Mamba's input is int32 tokens like the decoder (NOT ViT's
+ // float pack):
+ //   input = int32 [B*(8+1)]  (tokens[B*8] row-major [B][8], then targets[B])
+ // `state` = float [3*total + 1] ([m|v|extra] + a trailing loss slot). The
+ // workspace is device scratch (never crosses the ABI). Placed BEFORE the
+ // surrogate route so the real path wins.
+ if (arch == 90 && model == "mamba3" && optimizer == "adamw" && !opt_only) {
+ const int64_t total = kMambaTotalElems;
+ TORCH_CHECK(params.numel() == total,
+ "fused Mamba megakernel: params has ", params.numel(),
+ " elements but the small Mamba has ", total,
+ ". Pass the flat concat of named_parameters() in order.");
+ TORCH_CHECK(params.scalar_type() == torch::kFloat32 && params.is_contiguous(),
+ "fused Mamba megakernel: params must be contiguous fp32.");
+ // input = int32 tokens(B*kSeq) ++ targets(B). B = numel/(kSeq+1).
+ TORCH_CHECK(input.scalar_type() == torch::kInt32 && input.is_contiguous(),
+ "fused Mamba megakernel: input must be contiguous int32 "
+ "(packed tokens[B*kSeq]++targets[B]).");
+ const int64_t in_n = input.numel();
+ TORCH_CHECK(in_n % (kMambaSeq + 1) == 0 && in_n > 0,
+ "fused Mamba megakernel: input.numel() (", in_n,
+ ") must be B*(kSeq+1) = B*", kMambaSeq + 1, ".");
+ const int B = (int)(in_n / (kMambaSeq + 1));
+ // state = [m|v|extra] (3*total) + 1 loss slot.
+ TORCH_CHECK(state.numel() >= 3 * total + 1 &&
+ state.scalar_type() == torch::kFloat32 && state.is_contiguous(),
+ "fused Mamba megakernel: state must be contiguous fp32 with "
+ ">= 3*total+1 = ", 3 * total + 1, " elements ([m|v|extra]+loss).");
+ // grad = the REDUCED weight-grad OUTPUT [total] (same contract as the
+ // decoder): the only check that exercises the hand-written selective-scan
+ // backward's magnitudes per-tensor against the oracle (the keystone).
+ TORCH_CHECK(grad.numel() == total &&
+ grad.scalar_type() == torch::kFloat32 && grad.is_contiguous(),
+ "fused Mamba megakernel: grad must be contiguous fp32 with total = ",
+ total, " elements (the reduced weight-grad output buffer).");
+
+ MambaScratch& msc = mamba_scratch_for(params);
+ fused::PersistentContext ctx{
+ msc.g_next.data_ptr<int>(),
+ reinterpret_cast<unsigned*>(msc.g_arrived.data_ptr<int>()),
+ reinterpret_cast<unsigned*>(msc.g_generation.data_ptr<int>()),
+ 28,                    // kMambaNumTensors (mirror; the .cu static-asserts it)
+ 0u};                   // n_ctas overwritten by the launcher (one CTA/SM)
+
+ float* m = state.data_ptr<float>();
+ float* loss_slot = m + 3 * total;          // the trailing loss slot
+
+ fused::sm90::FusedScalars scalars{
+ lr, beta1, beta2, eps, weight_decay, bc1, bc2, alpha, beta, lamb,
+ alpha_max, gate, d_factor, neg_lr_scale, decay_factor};
+
+ cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ cudaError_t err = fused::sm90::mega_mamba_real_adamw(
+ ctx, params.data_ptr<float>(),
+ input.data_ptr<int>(),                              // tokens
+ input.data_ptr<int>() + (int64_t)B * kMambaSeq,     // targets
+ B, m, grad.data_ptr<float>(),    // reduced-grad OUTPUT (exposed to caller)
+ msc.workspace.data_ptr<float>(), loss_slot,
+ lr, static_cast<int>(step), scalars, stream);
+ if (err != cudaSuccess)
+ throw std::runtime_error(
+ std::string("fused Mamba megakernel launch failed: ") +
+ cudaGetErrorString(err));
+ return;
+ }
+
  if (arch == 90) {
  // Prepare the megakernel inputs from the tensors. The persistent scratch
  // (task counter + barrier state) is device-allocated and zero-initialized
@@ -368,14 +871,26 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // stream 0 serialized against all work and blocked graph capture).
  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
 
+ // Pack the FULL scalar set for this cell. apply_optimizer<> reads every one
+ // (the C2-gap fix); the cell's apply_scalars() copies them into FusedOptState.
+ // Field order MUST match fused::sm90::FusedScalars (lr, beta1, beta2, eps, wd,
+ // bc1, bc2, alpha, beta, lamb, alpha_max, gate, d_factor, neg_lr_scale,
+ // decay_factor). bc1/bc2 are un-inverted (= 1 - beta^step) — ONE pair per call
+ // is correct because the megakernel processes the flat param as a single task
+ // and all race params share `step`.
+ fused::sm90::FusedScalars scalars{
+ lr, beta1, beta2, eps, weight_decay, bc1, bc2, alpha, beta, lamb,
+ alpha_max, gate, d_factor, neg_lr_scale, decay_factor};
+
  // Route to the real composed cell launcher (all 33 sm_90 cells). `found`
  // is set false only if no cell matches (then we fall through to the honest
- // not-compiled signal below).
+ // not-compiled signal below). `opt_only` selects L1 (faithful real-grad tail)
+ // vs L3 (surrogate-model fwd+bwd+opt).
  bool found = false;
  cudaError_t err = fused::sm90::dispatch_sm90_cell(
  model, optimizer, ctx, p, in, sc.acts.data_ptr<float>(), gr, m, v, extra,
- sc.sizes.data_ptr<int>(), sc.offsets.data_ptr<int>(), lr, /*step=*/1,
- stream, &found);
+ sc.sizes.data_ptr<int>(), sc.offsets.data_ptr<int>(), lr,
+ static_cast<int>(step), scalars, opt_only, stream, &found);
 
  if (found) {
  if (err != cudaSuccess)
@@ -415,13 +930,23 @@ void fused_step(const std::string& model, const std::string& optimizer,
  sc.g_next.data_ptr<int>(),
  reinterpret_cast<unsigned*>(sc.g_arrived.data_ptr<int>()),
  reinterpret_cast<unsigned*>(sc.g_generation.data_ptr<int>()),
- static_cast<int>(n), 0u};
+ // n_tasks = TASK count (sizes/offsets entries), NOT the element count n —
+ // the megakernel loops t < n_tasks reading sizes[t]/offsets[t]; passing n
+ // here was the same multi-GB OOB the sm_90 path fixed (47d8007), left
+ // unfixed on this HIP twin until now.
+ static_cast<int>(sc.sizes.numel()), 0u};
  // Current HIP stream for graph capture / proper ordering (was default 0).
  hipStream_t stream = c10::hip::getCurrentHIPStream().stream();
+ // FULL scalar set (mirror of the sm_90 path); field order matches
+ // fused::gfx942_mega::FusedScalars. bc1/bc2 un-inverted (= 1 - beta^step).
+ fused::gfx942_mega::FusedScalars scalars{
+ lr, beta1, beta2, eps, weight_decay, bc1, bc2, alpha, beta, lamb,
+ alpha_max, gate, d_factor, neg_lr_scale, decay_factor};
  bool found = false;
  hipError_t herr = fused::gfx942_mega::dispatch_gfx942_cell(
  model, optimizer, ctx, p, in, sc.acts.data_ptr<float>(), gr, m, v, extra,
- sc.sizes.data_ptr<int>(), sc.offsets.data_ptr<int>(), lr, 1, stream, &found);
+ sc.sizes.data_ptr<int>(), sc.offsets.data_ptr<int>(), lr,
+ static_cast<int>(step), scalars, opt_only, stream, &found);
  if (found) {
  if (herr != hipSuccess)
  throw std::runtime_error(

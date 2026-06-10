@@ -177,10 +177,21 @@ void grokadamw_step_q3(
 }
 
 // ---------------------------------------------------------------------
-// High-level vector-signature entry point — restored from pre-refactor
-// csrc/common/ops.cpp::grokadamw_fused_step. Loops over per-param
-// scalars (bc1, bc2) on the host, then calls the multi-tensor launcher
-// in the arch-detected namespace.
+// High-level vector-signature entry point — PUBLISHED GrokAdamW.
+//
+// β1 is now PER-TENSOR (layer-wise momentum decay, β1_i = β1*(1-gamma)**i,
+// computed Python-side and passed in `layer_beta1s`), mirroring
+// supergrok11_fused_step's `layer_beta1s` plumbing. Because the multi-tensor
+// launcher (launch_multi_tensor_grokadamw) takes a SINGLE scalar beta1 for the
+// whole batch, a per-tensor β1 can no longer go through it; instead we LOOP and
+// call the single-tensor launcher per param with its own β1_i (exactly as
+// grokfast_fused_ema_adam_step loops over grokfast_adam). The bias-correction
+// uses the SAME per-tensor β1_i the kernel uses for the moment update
+// (bc1 = 1 - β1_i**step), matching SG11 (bindings.cpp ~L1374).
+//
+// `alpha` is the LIVE α_t (grokking-signal-modulated) the Python optimizer
+// computed this step — a scalar, passed straight through (the slow-grad EMA +
+// amplification math is unchanged: csrc/algorithms/grokadamw.h).
 // ---------------------------------------------------------------------
 void grokadamw_fused_step(
  std::vector<torch::Tensor>& params,
@@ -189,12 +200,18 @@ void grokadamw_fused_step(
  std::vector<torch::Tensor>& exp_avg_sqs,
  std::vector<torch::Tensor>& emas,
  std::vector<int64_t>& steps,
+ std::vector<double>& layer_beta1s,
  float alpha, float lamb_grok,
  float beta1, float beta2, float lr, float wd,
  float eps, float grad_clip_norm
 ) {
  const size_t n_params = params.size();
  check_params_grads(params, grads, "grokadamw_fused_step");
+ check_list_len(exp_avgs, n_params, "exp_avgs", "grokadamw_fused_step");
+ check_list_len(exp_avg_sqs, n_params, "exp_avg_sqs", "grokadamw_fused_step");
+ check_list_len(emas, n_params, "emas", "grokadamw_fused_step");
+ check_list_len(steps, n_params, "steps", "grokadamw_fused_step");
+ check_list_len(layer_beta1s, n_params, "layer_beta1s", "grokadamw_fused_step");
  clip_grad_norms_device_side(grads, n_params, grad_clip_norm);
  if (n_params == 0) return;
 
@@ -204,45 +221,27 @@ void grokadamw_fused_step(
  // pybind-copied vector so an increment would not persist back to Python
  // anyway, and incrementing made bias correction permanently off-by-one
  // (bc computed with step+1).
-
- // Common case: every param has a grad. Then the per-tensor lists are just
- // the inputs verbatim, so we skip rebuilding the 5 parallel filtered tensor
- // vectors (vp/vg/vea/veas/vema) and pass the originals straight through. The
- // bias-correction scalars are intrinsically per-param and still computed.
- bool all_present = true;
- for (size_t i = 0; i < n_params; i++) {
- if (!grads[i].defined() || grads[i].numel() == 0) { all_present = false; break; }
- }
-
- if (all_present) {
- std::vector<float> bc1_vec, bc2_vec;
- bc1_vec.reserve(n_params); bc2_vec.reserve(n_params);
- for (size_t i = 0; i < n_params; i++) {
- bc1_vec.push_back(1.0f - std::pow(beta1, static_cast<float>(steps[i])));
- bc2_vec.push_back(1.0f - std::pow(beta2, static_cast<float>(steps[i])));
- }
- DISPATCH_GROKADAMW(launch_multi_tensor_grokadamw,
- params, exp_avgs, exp_avg_sqs, emas, grads, bc1_vec, bc2_vec,
- alpha, lamb_grok, beta1, beta2, lr, wd, eps);
- }
-
- // Sparse-grad fallback: build the filtered parallel vectors.
- std::vector<torch::Tensor> vp, vg, vea, veas, vema;
- std::vector<float> bc1_vec, bc2_vec;
+ //
+ // `beta1` (scalar) is retained in the signature for ABI compatibility with
+ // the historical single-β1 call shape and is used ONLY as the fallback β1 for
+ // any tensor whose layer_beta1s entry is non-finite/<=0 (defensive); the live
+ // per-tensor value is layer_beta1s[i].
  for (size_t i = 0; i < n_params; i++) {
  if (!grads[i].defined() || grads[i].numel() == 0) continue;
- float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
+ float b1 = static_cast<float>(layer_beta1s[i]);
+ if (!(b1 > 0.0f) || b1 >= 1.0f) b1 = beta1;  // defensive fallback
+ float bc1 = 1.0f - std::pow(b1, static_cast<float>(steps[i]));
  float bc2 = 1.0f - std::pow(beta2, static_cast<float>(steps[i]));
- vp.push_back(params[i]); vg.push_back(grads[i]);
- vea.push_back(exp_avgs[i]); veas.push_back(exp_avg_sqs[i]);
- vema.push_back(emas[i]);
- bc1_vec.push_back(bc1); bc2_vec.push_back(bc2);
+ // Loop through the single-tensor WRAPPER (exactly as grokfast_fused_
+ // ema_adam_step loops over grokfast_adam) — NOT the DISPATCH_GROKADAMW
+ // macro inline: that macro's arch cases expand to `case 90: return ...`,
+ // and an inline `return` exits THIS function after tensor 0, silently
+ // skipping every later parameter. Caught by the parity gate's layer-wise
+ // β1 section the first time the vector ABI went live: L0 exact at 1e-7,
+ // L1's moments untouched (solved per-element b1 == 1.0, spread 0).
+ grokadamw_step(params[i], exp_avgs[i], exp_avg_sqs[i], emas[i], grads[i],
+ alpha, lamb_grok, b1, beta2, lr, wd, eps, bc1, bc2);
  }
- if (vp.empty()) return;
-
- DISPATCH_GROKADAMW(launch_multi_tensor_grokadamw,
- vp, vea, veas, vema, vg, bc1_vec, bc2_vec,
- alpha, lamb_grok, beta1, beta2, lr, wd, eps);
 }
 
 // Shared simple AdamW (used by Muon and LookSAM 1D-param paths).
@@ -362,6 +361,13 @@ void grokfast_fused_ema_adam_step(
  float beta1, float beta2, float lr, float wd, float eps
 ) {
  check_params_grads(params, grads, "grokfast_fused_ema_adam_step");
+ {
+ const size_t n = params.size();
+ check_list_len(emas, n, "emas", "grokfast_fused_ema_adam_step");
+ check_list_len(exp_avgs, n, "exp_avgs", "grokfast_fused_ema_adam_step");
+ check_list_len(exp_avg_sqs, n, "exp_avg_sqs", "grokfast_fused_ema_adam_step");
+ check_list_len(steps, n, "steps", "grokfast_fused_ema_adam_step");
+ }
  for (size_t i = 0; i < params.size(); i++) {
  if (!grads[i].defined() || grads[i].numel() == 0) continue;
  float bc1 = 1.0f - std::pow(beta1, static_cast<float>(steps[i]));
@@ -420,6 +426,7 @@ void lion_fused_step(
 ) {
  if (params.empty()) return;
  check_params_grads(params, grads, "lion_fused_step");
+ check_list_len(exp_avgs, params.size(), "exp_avgs", "lion_fused_step");
  std::vector<torch::Tensor> vp, vg, vea;
  for (size_t i = 0; i < params.size(); i++) {
  if (!grads[i].defined() || grads[i].numel() == 0) continue;
@@ -922,6 +929,7 @@ void muon_fused_step(
  float momentum, float lr, float wd, int ns_steps
 ) {
  check_params_grads(params, grads, "muon_fused_step");
+ check_list_len(bufs, params.size(), "bufs", "muon_fused_step");
  constexpr float NS_A = 3.4445f;
  constexpr float NS_B = -4.7750f;
  constexpr float NS_C = 2.0315f;
@@ -1083,6 +1091,9 @@ void neuralgrok_fused_step(
 ) {
  const size_t n_params = params.size();
  check_params_grads(params, grads, "neuralgrok_fused_step");
+ check_list_len(exp_avgs, n_params, "exp_avgs", "neuralgrok_fused_step");
+ check_list_len(exp_avg_sqs, n_params, "exp_avg_sqs", "neuralgrok_fused_step");
+ check_list_len(steps, n_params, "steps", "neuralgrok_fused_step");
  clip_grad_norms_device_side(grads, n_params, grad_clip_norm);
 
  for (size_t i = 0; i < n_params; i++) {
@@ -1199,6 +1210,14 @@ std::tuple<float, float, float> prodigy_fused_step(
 ) {
  if (params.empty()) return std::make_tuple(d_lr, r_ema, s_ema);
  check_params_grads(params, grads, "prodigy_fused_step");
+ {
+ const size_t n = params.size();
+ check_list_len(exp_avgs, n, "exp_avgs", "prodigy_fused_step");
+ check_list_len(exp_avg_sqs, n, "exp_avg_sqs", "prodigy_fused_step");
+ check_list_len(s_bufs, n, "s_bufs", "prodigy_fused_step");
+ check_list_len(param_inits, n, "param_inits", "prodigy_fused_step");
+ check_list_len(steps, n, "steps", "prodigy_fused_step");
+ }
 
  torch::Device dev(torch::kCPU);
  for (auto& g : grads) {
@@ -1250,7 +1269,12 @@ std::tuple<float, float, float> prodigy_fused_step(
 // 1. mu_metanet kernel produces smart_grad (and updates mu)
 // 2. compute_cosine_gate_fused does a 3-quantity reduction
 // (dot, |sg|², |mu|²), syncs once to CPU, returns sigmoid(t·cos_sim)
-// 3. adam_decay applies the Adam step using lamb_eff = ramp·gate·lamb
+// 3. adam_decay applies the Adam step using the single live correction
+// lamb_eff = ramp·lamb·(1-gate)·alpha (lamb/ramp are live multipliers on the
+// canonical (1-gate)·alpha term; lamb=ramp=1 ⇒ the plain (1-gate)·alpha). The
+// earlier note here said "lamb_eff = ramp·gate·lamb", which described a SECOND
+// mu add that never matched this code and has been removed — see the detailed
+// block in supergrok11_fused_step below.
 
 
 #include <cmath>
@@ -1326,6 +1350,13 @@ void supergrok11_fused_step(
 ) {
  const size_t n_params = params.size();
  check_params_grads(params, grads, "supergrok11_fused_step");
+ check_list_len(exp_avgs, n_params, "exp_avgs", "supergrok11_fused_step");
+ check_list_len(exp_avg_sqs, n_params, "exp_avg_sqs", "supergrok11_fused_step");
+ check_list_len(mus, n_params, "mus", "supergrok11_fused_step");
+ check_list_len(sharpness_cache, n_params, "sharpness_cache", "supergrok11_fused_step");
+ check_list_len(steps, n_params, "steps", "supergrok11_fused_step");
+ check_list_len(layer_alphas, n_params, "layer_alphas", "supergrok11_fused_step");
+ check_list_len(layer_beta1s, n_params, "layer_beta1s", "supergrok11_fused_step");
  clip_grad_norms_device_side(grads, n_params, grad_clip_norm);
 
  for (size_t i = 0; i < n_params; i++) {
@@ -1341,28 +1372,39 @@ void supergrok11_fused_step(
  // Canonical SuperGrok v1.1 mixing (csrc/algorithms/supergrok11.h:101,
  // Pallas ref launch_supergrok11.py, oracle ref_sg11_step):
  //   gate       = clamp(cosine(grad, mu), 0, 1)
- //   smart_grad = grad + (1 - gate) * alpha * mu        (applied ONCE)
+ //   smart_grad = grad + lamb_eff * mu                  (applied ONCE)
  //   AdamW on smart_grad.
- // The correction SHRINKS as grad/mu alignment (gate) grows — the polarity
- // that lets a memorized solution HOLD. We reproduce this bit-exactly through
- // the existing kernels by exact algebra, WITHOUT any kernel signature change:
+ // The base correction (1-gate)*alpha SHRINKS as grad/mu alignment (gate)
+ // grows — the polarity that lets a memorized solution HOLD. We reproduce this
+ // through the existing kernels by exact algebra, WITHOUT any kernel signature
+ // change:
  //   * mu_metanet with alpha=0 writes mu = rescale*phi (mu is independent of
  //     alpha, kernel line ~285) AND its smart_grad output = grad + 0*mu = grad.
  //   * dispatch_cosine_gate(smart_grad==grad, mu) is therefore cosine(grad, mu).
  //   * adam_decay computes g_eff = smart_grad + lamb_eff*mu; with
- //     smart_grad==grad and lamb_eff=(1-gate)*alpha this equals exactly
- //     grad + (1-gate)*alpha*mu, then the canonical Adam tail.
- // `lamb`/`ramp` are NOT in the canonical formula (they were the buggy SECOND
- // mu add `ramp*gate*lamb*mu`, whose coefficient GREW with the gate and
- // destroyed the memorized solution); they are intentionally unused here.
- (void)lamb; (void)ramp;
+ //     smart_grad==grad and the lamb_eff below this is the single live add,
+ //     then the canonical Adam tail.
+ //
+ // OWNER DECISION (Option B): `lamb`/`ramp` are made LIVE as MULTIPLIERS on the
+ // single canonical term. The pre-fix code had a SECOND mu add
+ // `ramp*gate*lamb*mu` (the OLD comment: "they were the buggy SECOND mu add …
+ // whose coefficient GREW with the gate and destroyed the memorized solution");
+ // that second add was REMOVED as a collapse mitigation, which suppressed the
+ // lamb/ramp mechanism entirely (they were (void)-ed). It is RESTORED here
+ // MULTIPLICATIVELY on the ONE live, correctly-shrinking term:
+ //   lamb_eff = ramp * lamb * (1 - gate) * alpha
+ // so lamb=1.0 with post-warmup ramp=1.0 reproduces the previous behavior
+ // EXACTLY ((1-gate)*alpha), while lamb is a genuine tuner dial that scales the
+ // correction WITHOUT flipping its polarity (it still shrinks as the gate
+ // grows). ramp is the warmup schedule (0 during warmup → no correction early).
+ const float lamb_eff_scale = ramp * lamb;
  auto smart_grad = torch::empty_like(params[i]);
  SG_DISPATCH_CALL(launch_sg11_mu_metanet,
  mus[i], grads[i], sharpness_cache[i], smart_grad, /*alpha=*/0.0f,
  W1, b1, W2, b2, rescale, hidden_dim);
 
  float gate = dispatch_cosine_gate(smart_grad, mus[i], gate_temperature);
- float lamb_eff = (1.0f - gate) * alpha;
+ float lamb_eff = lamb_eff_scale * (1.0f - gate) * alpha;
 
  SG_DISPATCH_CALL(launch_sg11_adam_decay,
  params[i], exp_avgs[i], exp_avg_sqs[i], smart_grad, mus[i],
@@ -1481,6 +1523,13 @@ void supergrok15_fused_step(
 ) {
  const size_t n_params = params.size();
  check_params_grads(params, grads, "supergrok15_fused_step");
+ check_list_len(exp_avgs, n_params, "exp_avgs", "supergrok15_fused_step");
+ check_list_len(exp_avg_sqs, n_params, "exp_avg_sqs", "supergrok15_fused_step");
+ check_list_len(mus, n_params, "mus", "supergrok15_fused_step");
+ check_list_len(sharpness_cache, n_params, "sharpness_cache", "supergrok15_fused_step");
+ check_list_len(steps, n_params, "steps", "supergrok15_fused_step");
+ check_list_len(layer_alphas, n_params, "layer_alphas", "supergrok15_fused_step");
+ check_list_len(layer_beta1s, n_params, "layer_beta1s", "supergrok15_fused_step");
  clip_grad_norms_device_side(grads, n_params, grad_clip_norm);
 
  float lamb_eff = (ramp > 0.0f) ? (ramp * gate_signal * lamb) : 0.0f;
@@ -1613,6 +1662,7 @@ namespace sg {
  void launch_csa_hca_step( \
  torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness, \
  torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor mu,\
+ torch::Tensor slow, \
  torch::Tensor gru_state, \
  /* --- shared input projection --- */ \
  torch::Tensor input_proj_W, torch::Tensor input_proj_b, \
@@ -1650,6 +1700,7 @@ namespace sg {
  std::vector<torch::Tensor> exp_avgs, \
  std::vector<torch::Tensor> exp_avg_sqs, \
  std::vector<torch::Tensor> mus, \
+ std::vector<torch::Tensor> slows, \
  std::vector<torch::Tensor> gru_states, \
  /* --- shared input projection --- */ \
  torch::Tensor input_proj_W, torch::Tensor input_proj_b, \
@@ -1827,6 +1878,7 @@ DECLARE_SG2(gfx942)
 void supergrok2_step(
  torch::Tensor param, torch::Tensor grad, torch::Tensor sharpness,
  torch::Tensor exp_avg, torch::Tensor exp_avg_sq, torch::Tensor mu,
+ torch::Tensor slow,
  torch::Tensor gru_state,
  torch::Tensor input_proj_W, torch::Tensor input_proj_b,
  torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W,
@@ -1857,6 +1909,7 @@ void supergrok2_step(
  check_param_grad(param, grad, "supergrok2_step");
  SG_DISPATCH(launch_csa_hca_step,
  param, grad, sharpness, exp_avg, exp_avg_sq, mu,
+ slow,
  gru_state,
  input_proj_W, input_proj_b,
  csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
@@ -1883,6 +1936,7 @@ void supergrok2_batched_step(
  std::vector<torch::Tensor> exp_avgs,
  std::vector<torch::Tensor> exp_avg_sqs,
  std::vector<torch::Tensor> mus,
+ std::vector<torch::Tensor> slows,
  std::vector<torch::Tensor> gru_states,
  torch::Tensor input_proj_W, torch::Tensor input_proj_b,
  torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W,
@@ -1912,8 +1966,23 @@ void supergrok2_batched_step(
 ) {
  if (params.empty()) return;
  check_params_grads(params, grads, "supergrok2_batched_step");
+ {
+ const size_t n = params.size();
+ check_list_len(sharpness_list, n, "sharpness_list", "supergrok2_batched_step");
+ check_list_len(exp_avgs, n, "exp_avgs", "supergrok2_batched_step");
+ check_list_len(exp_avg_sqs, n, "exp_avg_sqs", "supergrok2_batched_step");
+ check_list_len(mus, n, "mus", "supergrok2_batched_step");
+ check_list_len(slows, n, "slows", "supergrok2_batched_step");
+ check_list_len(gru_states, n, "gru_states", "supergrok2_batched_step");
+ check_list_len(alpha_mus, n, "alpha_mus", "supergrok2_batched_step");
+ check_list_len(lamb_effs, n, "lamb_effs", "supergrok2_batched_step");
+ check_list_len(beta1s, n, "beta1s", "supergrok2_batched_step");
+ check_list_len(bc1s, n, "bc1s", "supergrok2_batched_step");
+ check_list_len(bc2s, n, "bc2s", "supergrok2_batched_step");
+ }
  SG_DISPATCH(launch_csa_hca_batched_step,
  params, grads, sharpness_list, exp_avgs, exp_avg_sqs, mus,
+ slows,
  gru_states,
  input_proj_W, input_proj_b,
  csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
@@ -2171,6 +2240,7 @@ void supergrok2_prepare_and_batched_step(
  std::vector<torch::Tensor> exp_avg_sqs,
  std::vector<torch::Tensor> gru_states,
  std::vector<torch::Tensor> mus,
+ std::vector<torch::Tensor> slows,
  std::vector<torch::Tensor> sharpnesses,
  std::vector<int64_t> steps,
  std::vector<double> layer_alphas,
@@ -2201,6 +2271,17 @@ void supergrok2_prepare_and_batched_step(
 ) {
  const size_t n = params.size();
  if (n == 0) return;
+ check_params_grads(params, grads, "supergrok2_prepare_and_batched_step");
+ // Secondary state + scalar lists are indexed in lockstep with params[i].
+ check_list_len(exp_avgs, n, "exp_avgs", "supergrok2_prepare_and_batched_step");
+ check_list_len(exp_avg_sqs, n, "exp_avg_sqs", "supergrok2_prepare_and_batched_step");
+ check_list_len(gru_states, n, "gru_states", "supergrok2_prepare_and_batched_step");
+ check_list_len(mus, n, "mus", "supergrok2_prepare_and_batched_step");
+ check_list_len(slows, n, "slows", "supergrok2_prepare_and_batched_step");
+ check_list_len(sharpnesses, n, "sharpnesses", "supergrok2_prepare_and_batched_step");
+ check_list_len(steps, n, "steps", "supergrok2_prepare_and_batched_step");
+ check_list_len(layer_alphas, n, "layer_alphas", "supergrok2_prepare_and_batched_step");
+ check_list_len(layer_beta1s, n, "layer_beta1s", "supergrok2_prepare_and_batched_step");
 
  // Host-side global-norm gradient clipping (arch-independent prep).
  clip_grad_norms_device_side(grads, n, static_cast<float>(gradient_clipping));
@@ -2229,7 +2310,7 @@ void supergrok2_prepare_and_batched_step(
  const float rescale = static_cast<float>(lamb);
 
  SG_DISPATCH(launch_csa_hca_batched_step,
- params, grads, sharp_list, exp_avgs, exp_avg_sqs, mus, gru_states,
+ params, grads, sharp_list, exp_avgs, exp_avg_sqs, mus, slows, gru_states,
  input_proj_W, input_proj_b,
  csa_q_W, csa_k_W, csa_v_W, csa_compress_w,
  csa_idx_DQ, csa_idx_UQ, csa_idx_K, csa_out_W,
@@ -3287,43 +3368,18 @@ void mamba_selective_scan_backward(
 // Registration
 // ---------------------------------------------------------------------
 
+// OWNER-DECIDED REMOVAL (2026-06-10): the `_ops.models.*` submodule exported
+// 13 per-op model kernels (decoder/vit/mamba fwd+bwd + attention/scan/patch
+// component entries) with ZERO Python consumers anywhere (race, tuner, tests —
+// verified by the cleanup inventory and re-verified at deletion). They were
+// pre-megakernel scaffolding; the portable reuse surface for model math is the
+// stage-header layer (csrc/fused/sm_90/model_stage*.cuh, COMPONENT_CONTRACT.md),
+// not pybind exports — an exported, untested, unused API is liability, not
+// portability. The underlying sg::* host functions + kernels are excised in the
+// dead-code pass that accompanies the dispatch-table prune (kept this commit so
+// the binding removal is independently revertible).
 void register_model_bindings(py::module_& m) {
- auto models = m.def_submodule("models",
- "Per-arch optimized model kernels (decoder, vit, mamba)");
-
- // Decoder Transformer
- models.def("decoder_forward", &sg::decoder_forward,
- "Decoder Transformer forward pass");
- models.def("decoder_backward", &sg::decoder_backward,
- "Decoder Transformer backward pass");
- models.def("decoder_attention_forward", &sg::decoder_attention_forward,
- "Decoder multi-head attention forward (component test)");
- models.def("decoder_attention_backward", &sg::decoder_attention_backward,
- "Decoder multi-head attention backward (component test)");
-
- // Vision Transformer
- models.def("vit_forward", &sg::vit_forward,
- "Vision Transformer forward pass");
- models.def("vit_backward", &sg::vit_backward,
- "Vision Transformer backward pass");
- models.def("vit_attention_forward", &sg::vit_attention_forward,
- "ViT multi-head attention forward (component test)");
- models.def("vit_attention_backward", &sg::vit_attention_backward,
- "ViT multi-head attention backward (component test)");
- models.def("vit_patch_project", &sg::vit_patch_project,
- "ViT patch projection (component test)");
-
- // Mamba (SSM)
- models.def("mamba_forward", &sg::mamba_forward,
- "Mamba SSM forward pass");
- models.def("mamba_backward", &sg::mamba_backward,
- "Mamba SSM backward pass");
- models.def("mamba_layer_forward", &sg::mamba_layer_forward,
- "Mamba single-layer forward (component test)");
- models.def("mamba_selective_scan_forward", &sg::mamba_selective_scan_forward,
- "Mamba selective scan forward (component test)");
- models.def("mamba_selective_scan_backward", &sg::mamba_selective_scan_backward,
- "Mamba selective scan backward (component test)");
+ (void)m;  // intentionally registers nothing — see removal note above
 }
 
 
@@ -3331,24 +3387,65 @@ void register_model_bindings(py::module_& m) {
 // Forward declaration for model bindings aggregator (models_module.cpp)
 void register_model_bindings(pybind11::module_& m);
 
+// ── Exported-ABI schema version (A5-F6) ──────────────────────────────
+// Single integer that versions the SET of exported pybind signatures below
+// (every m.def's argument list + return type, and the secondary-list/scalar
+// contracts the Python optimizers rely on). BUMP THIS on ANY exported-signature
+// change: adding/removing/reordering a fused-step argument, changing a tensor
+// list into a scalar (or vice-versa), changing a return tuple, or renaming an
+// exported symbol. A stale prebuilt .so paired with newer Python wrappers (or
+// the reverse) otherwise mis-marshals arguments silently; a version mismatch
+// must fail loudly instead.
+//
+// The Python-side assertion (compare _ops.__abi_schema__ against the value the
+// wrappers were written for) lands SEPARATELY in grokking_optimizers/dispatch.py
+// (sibling-owned). Until that check exists this attribute is exported but inert
+// — that is intentional and harmless: it merely makes the version observable
+// now so the Python guard can be added without a coordinated ABI bump.
+constexpr int GROK_ABI_SCHEMA = 1;
+
 PYBIND11_MODULE(_ops, m) {
  m.doc() = "Grokking Optimizers — specialized per-arch C++/CUDA/HIP kernels";
+
+ // Exported-ABI schema version (see GROK_ABI_SCHEMA above). Bump on ANY
+ // exported-signature change; the Python-side compatibility assert lands in
+ // dispatch.py (sibling-owned) and is inert until then.
+ m.attr("__abi_schema__") = GROK_ABI_SCHEMA;
 
  m.def("detect_arch", &sg::detect_arch,
  "Returns 90 or 942 for the detected GPU (3-arch active set: "
  "sm_90, gfx942, tpu_v6e). TPU handled in Python.");
 
- // Fused (model, optimizer, arch) dispatch
+ // Fused (model, optimizer, arch) dispatch. The trailing scalar args carry the
+ // FULL optimizer-state scalar set (C2-gap fix) so the fused tail's real math
+ // runs; py::arg defaults reproduce the pre-fix inert behavior, so a short call
+ // ops.fused_step(model, opt, params, input, grad, state, lr) still works.
+ // bc1/bc2 are un-inverted (= 1 - beta^step). opt_only=true → L1 faithful tail.
  m.def("fused_step", &sg::fused_step,
  "Fused (model, optimizer, arch) kernel dispatch. Routes to the "
- "appropriate fused TU based on detected hardware.");
+ "appropriate fused TU based on detected hardware. Carries the full "
+ "optimizer scalar set (beta1/beta2/eps/weight_decay/alpha/lamb/gamma/"
+ "gate/d_factor/bc1/bc2/neg_lr_scale/decay_factor/beta/alpha_max/step); "
+ "opt_only=True selects the L1 real-grad optimizer tail (the faithful "
+ "path), False the L3 surrogate-model fwd+bwd+opt.",
+ py::arg("model"), py::arg("optimizer"), py::arg("params"),
+ py::arg("input"), py::arg("grad"), py::arg("state"), py::arg("lr"),
+ py::arg("beta1") = 0.9f, py::arg("beta2") = 0.999f,
+ py::arg("eps") = 1e-8f, py::arg("weight_decay") = 0.01f,
+ py::arg("alpha") = 0.98f, py::arg("lamb") = 2.0f,
+ py::arg("gamma") = 0.0f, py::arg("gate") = 1.0f,
+ py::arg("d_factor") = 1.0f, py::arg("bc1") = 1.0f, py::arg("bc2") = 1.0f,
+ py::arg("neg_lr_scale") = 0.0f, py::arg("decay_factor") = 1.0f,
+ py::arg("beta") = 0.0f, py::arg("alpha_max") = 1.0f,
+ py::arg("step") = 1, py::arg("opt_only") = true);
 
  // GrokAdamW
  m.def("grokadamw_step", &sg::grokadamw_step);
  m.def("grokadamw_clip_step", &sg::grokadamw_clip_step);
  m.def("grokadamw_step_q3", &sg::grokadamw_step_q3);
  m.def("grokadamw_fused_step", &sg::grokadamw_fused_step,
- "Pre-refactor ops.cpp::grokadamw_fused_step (vector signature)");
+ "PUBLISHED GrokAdamW vector step: per-tensor layer_beta1s (layer-wise "
+ "momentum decay) + live scalar alpha_t (grokking-signal-modulated).");
  m.def("fused_adamw_simple_step", &sg::fused_adamw_simple_step,
  "Shared simple AdamW step (vector signature)");
 

@@ -193,28 +193,47 @@ def _emit_cuda(plan: FusionPlan) -> str:
 // device-function component (csrc/algorithms/{plan.optimizer}.h via
 // opt_components.cuh::apply_optimizer<OptId::{o_enum}>) with the real model
 // stage component (model_stages.cuh::model_*_stage<ModelId::{m_enum}>) over the
-// shared persistent-megakernel substrate. Fuse tier {tier} chosen by the solver.
+// shared persistent-megakernel substrate. Solver fuse tier (perf placement): {tier}.
 #include "csrc/fused/sm_90/fused_megakernel.cuh"
 
 namespace sg {{ namespace fused {{ namespace sm90 {{
 
 // Uniform host entry (the symbol fused_step dispatches to). Binds this
 // optimizer's REAL state buffers: m/v (Adam moments) + the per-optimizer
-// `extra` n-slice (ema/sam_dir/s_track/mu/orth/smart_grad). Scalar hyperparams
-// (prodigy d, sg gates, neuralgrok psi-net) are host-supplied at runtime (🟡
-// no-GPU here) — see HARDWARE_VALIDATION.md. Composition + apply math are
-// real + compiled.
+// `extra` n-slice (ema/sam_dir/s_track/mu/orth/smart_grad), AND the FULL runtime
+// scalar set via apply_scalars() — beta1/beta2/eps/wd/alpha/lamb/alpha_max/beta/
+// gate/d_factor/neg_lr_scale/decay_factor + un-inverted bc1/bc2. This closes the
+// C2 gap: every scalar apply_optimizer<{o_enum}> reads is now SET from the live
+// optimizer (previously only lr was bound, freezing bc/gate/d_factor at 1.0).
+//
+// TIER SELECTOR (`opt_only`): this entry instantiates BOTH tiers and selects at
+// runtime. opt_only=true → L1: the fused optimizer TAIL only; the kernel reads
+// the REAL gradient from the global `grad` buffer (computed by the framework's
+// own fwd/bwd) and applies the canonical update — this is the NUMERICALLY
+// FAITHFUL path the grokking race uses (real grad in, real updated params out).
+// opt_only=false → L3: the kernel ALSO runs the megakernel's element-local model
+// fwd/bwd over the flat param blob (model_stages.cuh) — a SURROGATE model, NOT
+// the real Transformer/ViT/Mamba graph, so its loss does not match eager. L3 is
+// kept compiled (perf-placement coverage) but is not the race path; see
+// BUILD_AND_VALIDATE.md. Both tiers share this identical scalar/pointer binding.
 cudaError_t {sym}(
         PersistentContext ctx, float* params, const float* input, float* acts,
         float* grad, float* m, float* v, float* extra,
         const int* sizes, const int* offsets,
-        float lr, int step, cudaStream_t stream) {{
+        float lr, int step, const FusedScalars& scalars, bool opt_only,
+        cudaStream_t stream) {{
     FusedOptState st;
     st.exp_avg = m;
     st.exp_avg_sq = v;{extra_line}
-    st.lr = lr;
+    apply_scalars(st, scalars);  // FULL scalar set (un-freezes bc1/bc2/gate/d/…)
+    st.lr = lr;                  // lr also passed positionally for the L3 phase
+    if (opt_only) {{
+        return launch_fused_megakernel<ModelId::{m_enum}, OptId::{o_enum},
+                                       FuseTier::L1>(
+            ctx, params, input, acts, grad, sizes, offsets, lr, step, st, stream);
+    }}
     return launch_fused_megakernel<ModelId::{m_enum}, OptId::{o_enum},
-                                   FuseTier::{tier}>(
+                                   FuseTier::L3>(
         ctx, params, input, acts, grad, sizes, offsets, lr, step, st, stream);
 }}
 
@@ -258,10 +277,16 @@ def _emit_hip(plan: FusionPlan) -> str:
 #if defined(__AMDGCN__) || defined(__HIPCC__) || defined(GROK_HIP_DEVICE)
 namespace sg {{ namespace fused {{ namespace gfx942_mega {{
 
-// Force this cell's real composed kernel instantiation so the device pass emits
-// it (and the free-standing AMDGCN gate type-checks the full expansion).
+// Force BOTH tier instantiations so the device pass emits them and the free-
+// standing AMDGCN gate type-checks the full expansion. The host entry selects
+// L1 (opt-only, real-grad tail — the faithful path) or L3 (surrogate model fwd/
+// bwd + opt) at runtime; both must exist as symbols.
 template __global__ void
-fused_megakernel<ModelId::{m_enum}, OptId::{o_enum}, FuseTier::{tier}>(
+fused_megakernel<ModelId::{m_enum}, OptId::{o_enum}, FuseTier::L1>(
+    PersistentContext, float*, const float*, float*, float*,
+    const int*, const int*, float, int, FusedOptState);
+template __global__ void
+fused_megakernel<ModelId::{m_enum}, OptId::{o_enum}, FuseTier::L3>(
     PersistentContext, float*, const float*, float*, float*,
     const int*, const int*, float, int, FusedOptState);
 
@@ -270,9 +295,11 @@ fused_megakernel<ModelId::{m_enum}, OptId::{o_enum}, FuseTier::{tier}>(
 
 // ── HOST launcher (hipcc host pass only; 🟡 MI300X — not the bare amdgcn gate,
 //    not the WITH_CUDA build). Faithful mirror of the verified sm_90 launcher:
-//    one persistent workgroup per CU, 256 threads (4 wavefronts). __HIPCC__ is
-//    defined for the hipcc host pass, so FusedOptState/fused_megakernel (guarded
-//    on __HIPCC__) are visible here. ───────────────────────────────────────────
+//    binds m/v/extra + the FULL scalar set (apply_scalars, closing the C2 gap)
+//    and selects the tier via opt_only. Uses launch_fused_megakernel (the
+//    hang-free occupancy-capped helper) for each tier. __HIPCC__ is defined for
+//    the hipcc host pass, so FusedOptState/FusedScalars/fused_megakernel are
+//    visible here. ─────────────────────────────────────────────────────────────
 #if defined(__HIPCC__) && !defined(__AMDGCN__)
 #include <hip/hip_runtime.h>
 namespace sg {{ namespace fused {{ namespace gfx942_mega {{
@@ -280,22 +307,19 @@ hipError_t {sym}(
         PersistentContext ctx, float* params, const float* input, float* acts,
         float* grad, float* m, float* v, float* extra,
         const int* sizes, const int* offsets, float lr, int step,
-        hipStream_t stream) {{
-    int dev = 0; hipError_t err = hipGetDevice(&dev);
-    if (err != hipSuccess) return err;
-    int n_cus = 0;
-    err = hipDeviceGetAttribute(&n_cus, hipDeviceAttributeMultiprocessorCount, dev);
-    if (err != hipSuccess) return err;
-    ctx.n_groups = (unsigned)n_cus;
+        const FusedScalars& scalars, bool opt_only, hipStream_t stream) {{
     FusedOptState st;
     st.exp_avg = m; st.exp_avg_sq = v;{extra_line}
+    apply_scalars(st, scalars);  // FULL scalar set (un-freezes bc1/bc2/gate/d/…)
     st.lr = lr;
-    dim3 grid((unsigned)n_cus), block(256);
-    hipLaunchKernelGGL(
-        (fused_megakernel<ModelId::{m_enum}, OptId::{o_enum}, FuseTier::{tier}>),
-        grid, block, 0, stream,
-        ctx, params, input, acts, grad, sizes, offsets, lr, step, st);
-    return hipGetLastError();
+    if (opt_only) {{
+        return launch_fused_megakernel<ModelId::{m_enum}, OptId::{o_enum},
+                                       FuseTier::L1>(
+            ctx, params, input, acts, grad, sizes, offsets, lr, step, st, stream);
+    }}
+    return launch_fused_megakernel<ModelId::{m_enum}, OptId::{o_enum},
+                                   FuseTier::L3>(
+        ctx, params, input, acts, grad, sizes, offsets, lr, step, st, stream);
 }}
 }}}}}}  // namespace sg::fused::gfx942_mega
 #endif
@@ -436,7 +460,8 @@ def write_all(root: str = "csrc/fused") -> List[str]:
 
 _CELL_LAUNCHER_SIG = (
     "PersistentContext, float*, const float*, float*, float*, float*, float*, "
-    "float*, const int*, const int*, float, int, cudaStream_t")
+    "float*, const int*, const int*, float, int, const FusedScalars&, bool, "
+    "cudaStream_t")
 
 
 def dispatch_table_sm90() -> str:
@@ -468,6 +493,7 @@ def dispatch_table_sm90() -> str:
     lines.append(" PersistentContext ctx, float* params, const float* input,")
     lines.append(" float* acts, float* grad, float* m, float* v, float* extra,")
     lines.append(" const int* sizes, const int* offsets, float lr, int step,")
+    lines.append(" const FusedScalars& scalars, bool opt_only,")
     lines.append(" cudaStream_t stream, bool* found) {")
     lines.append(" *found = true;")
     for model, opt, sym in syms:
@@ -475,7 +501,7 @@ def dispatch_table_sm90() -> str:
             f' if (model == "{model}" && optimizer == "{opt}")')
         lines.append(
             f"  return {sym}(ctx, params, input, acts, grad, m, v, extra, sizes,"
-            " offsets, lr, step, stream);")
+            " offsets, lr, step, scalars, opt_only, stream);")
     lines.append(" *found = false;")
     lines.append(" return cudaSuccess;")
     lines.append("}")
@@ -485,7 +511,8 @@ def dispatch_table_sm90() -> str:
 
 _GFX942_CELL_SIG = (
     "PersistentContext, float*, const float*, float*, float*, float*, float*, "
-    "float*, const int*, const int*, float, int, hipStream_t")
+    "float*, const int*, const int*, float, int, const FusedScalars&, bool, "
+    "hipStream_t")
 
 
 def dispatch_table_gfx942() -> str:
@@ -514,18 +541,527 @@ def dispatch_table_gfx942() -> str:
     lines.append(" PersistentContext ctx, float* params, const float* input,")
     lines.append(" float* acts, float* grad, float* m, float* v, float* extra,")
     lines.append(" const int* sizes, const int* offsets, float lr, int step,")
+    lines.append(" const FusedScalars& scalars, bool opt_only,")
     lines.append(" hipStream_t stream, bool* found) {")
     lines.append(" *found = true;")
     for model, opt, sym in syms:
         lines.append(f' if (model == "{model}" && optimizer == "{opt}")')
         lines.append(
             f"  return {sym}(ctx, params, input, acts, grad, m, v, extra, sizes,"
-            " offsets, lr, step, stream);")
+            " offsets, lr, step, scalars, opt_only, stream);")
     lines.append(" *found = false;")
     lines.append(" return hipSuccess;")
     lines.append("}")
     lines.append("}} // namespace fused::gfx942_mega  (within namespace sg)")
     return "\n".join(lines)
+
+
+# ── PHASE 1: the real transformer-decoder weight layout (single C++ source). ──
+# The L3-REAL decoder megakernel (csrc/fused/sm_90/model_stages_decoder.cuh) needs
+# the flat-buffer OFFSETS/SIZES of the eager model's 30 parameter tensors, in
+# named_parameters() ORDER. This is THE single source of truth; the device header
+# csrc/fused/sm_90/decoder_layout.cuh is GENERATED from it (so it cannot drift),
+# and tests/hw/decoder_oracle.py::decoder_param_layout() builds the same table
+# from the same shapes (asserted == the live model's named_parameters in the
+# parity test). Keep the shape constants here == decoder_oracle.py.
+_DEC_VOCAB, _DEC_D, _DEC_HEADS, _DEC_LAYERS, _DEC_SEQ = 99, 128, 4, 2, 4
+_DEC_DFF = 4 * _DEC_D
+
+
+def _decoder_param_sizes() -> List[int]:
+    """Per-tensor numel in named_parameters() order (mirror of decoder_oracle.py
+    decoder_param_spec()). 30 tensors, total 422755."""
+    d, dff, v, seq = _DEC_D, _DEC_DFF, _DEC_VOCAB, _DEC_SEQ
+    sizes = [v * d, seq * d]                      # tok, pos
+    for _ in range(_DEC_LAYERS):
+        sizes += [
+            3 * d * d, 3 * d,                     # attn.in_proj_weight/bias
+            d * d, d,                             # attn.out_proj.weight/bias
+            d, d, d, d,                           # n1.w/b, n2.w/b
+            dff * d, dff,                         # ff.0.weight/bias
+            d * dff, d,                           # ff.2.weight/bias
+        ]
+    sizes += [d, d, v * d, v]                     # norm.w/b, out.weight/bias
+    return sizes
+
+
+def decoder_layout_header() -> str:
+    """Emit csrc/fused/sm_90/decoder_layout.cuh (the GENERATED weight-layout
+    mirror + static_asserts). Single source of truth for the L3-REAL decoder
+    flat-buffer offsets/sizes; a count/total mismatch fails the BUILD."""
+    sizes = _decoder_param_sizes()
+    offsets, acc = [], 0
+    for n in sizes:
+        offsets.append(acc)
+        acc += n
+    total = acc
+    n_tensors = len(sizes)
+
+    def _fmt(arr):
+        # 10 per line for readability.
+        rows = []
+        for i in range(0, len(arr), 10):
+            rows.append("    " + ", ".join(str(x) for x in arr[i:i + 10]))
+        return ",\n".join(rows)
+
+    sizes_block = _fmt(sizes)
+    offsets_block = _fmt(offsets)
+    return f"""#ifndef SG_FUSED_SM90_DECODER_LAYOUT_CUH_
+#define SG_FUSED_SM90_DECODER_LAYOUT_CUH_
+// ============================================================================
+// csrc/fused/sm_90/decoder_layout.cuh — GENERATED weight-layout mirror for the
+// L3-REAL transformer-decoder megakernel (PHASE 1).
+//
+// AUTO-GENERATED by: python -m grokking_optimizers.megakernel_codegen \\
+//     --decoder-layout > csrc/fused/sm_90/decoder_layout.cuh
+// Do NOT hand-edit the numbers. SINGLE SOURCE OF TRUTH: megakernel_codegen.py
+// _decoder_param_sizes() (mirrored by tests/hw/decoder_oracle.py, asserted ==
+// the eager model's named_parameters() order in the parity test). The flat blob
+// is torch.cat([p.reshape(-1) for _, p in model.named_parameters()]); the kernel
+// addresses tensor i at params + kDecOffsets[i] for kDecSizes[i] elements.
+//
+// A count/total mismatch fails the BUILD loudly (a static_assert below), never
+// corrupts at dispatch.
+// ============================================================================
+
+#include <cstdint>
+
+namespace sg {{ namespace fused {{ namespace sm90 {{
+
+constexpr int SG_DEC_VOCAB  = {_DEC_VOCAB};
+constexpr int SG_DEC_D      = {_DEC_D};
+constexpr int SG_DEC_HEADS  = {_DEC_HEADS};
+constexpr int SG_DEC_LAYERS = {_DEC_LAYERS};
+constexpr int SG_DEC_SEQ    = {_DEC_SEQ};
+constexpr int SG_DEC_DFF    = 4 * SG_DEC_D;   // {_DEC_DFF}
+
+constexpr int     kDecNumTensors = {n_tensors};
+constexpr int64_t kDecTotalElems = {total};
+
+// Per-tensor element offsets into the flat param blob, named_parameters() order.
+__device__ __constant__ int kDecOffsets[kDecNumTensors] = {{
+{offsets_block}
+}};
+
+// Per-tensor element sizes (numel), same order.
+__device__ __constant__ int kDecSizes[kDecNumTensors] = {{
+{sizes_block}
+}};
+
+static_assert(kDecNumTensors == {n_tensors},
+              "decoder_layout: tensor count drifted. Regenerate via "
+              "megakernel_codegen.py --decoder-layout.");
+static_assert(kDecTotalElems == {total},
+              "decoder_layout: total param count drifted. Regenerate.");
+
+// Host-constexpr mirrors so a sum/offset cross-check folds at compile time (a
+// __constant__ array can't be folded in a constexpr). These guarantee
+// offsets/sizes/total agree.
+namespace dec_layout_check {{
+constexpr int kSizes[kDecNumTensors] = {{
+{sizes_block}
+}};
+constexpr int kOffsets[kDecNumTensors] = {{
+{offsets_block}
+}};
+constexpr int64_t sum_sizes() {{
+    int64_t s = 0;
+    for (int i = 0; i < kDecNumTensors; ++i) s += kSizes[i];
+    return s;
+}}
+constexpr bool offsets_consistent() {{
+    int64_t acc = 0;
+    for (int i = 0; i < kDecNumTensors; ++i) {{
+        if (kOffsets[i] != (int)acc) return false;
+        acc += kSizes[i];
+    }}
+    return true;
+}}
+static_assert(sum_sizes() == kDecTotalElems,
+              "decoder_layout: sum(kDecSizes) != kDecTotalElems. Regenerate.");
+static_assert(offsets_consistent(),
+              "decoder_layout: kDecOffsets[i] != sum(kDecSizes[0..i)). Regenerate.");
+}}  // namespace dec_layout_check
+
+}}}}}} // namespace sg::fused::sm90
+
+#endif  // SG_FUSED_SM90_DECODER_LAYOUT_CUH_
+"""
+
+
+# ── PHASE 2: the real ViT weight layout (single C++ source). ────────────────
+# The L3-REAL ViT megakernel (csrc/fused/sm_90/model_stage_vit.cuh) needs the
+# flat-buffer OFFSETS/SIZES of the eager model's 32 parameter tensors, in
+# named_parameters() ORDER. THE single source of truth is the same shapes the
+# oracle (tests/hw/vit_oracle.py::vit_param_layout()) encodes; the device header
+# csrc/fused/sm_90/vit_layout.cuh is GENERATED from THIS so it cannot drift.
+# CRITICAL ORDERING: cls_token (a leaf nn.Parameter on the ViT module) is yielded
+# BEFORE the patch_proj submodule's params, so the first three tensors are
+# cls_token, patch_proj.weight, patch_proj.bias. Keep these constants ==
+# vit_oracle.py.
+_VIT_VOCAB, _VIT_D, _VIT_HEADS, _VIT_LAYERS, _VIT_PATCH, _VIT_NPATCH = \
+    97, 128, 4, 2, 49, 16
+_VIT_DFF = 4 * _VIT_D
+
+
+def _vit_param_sizes() -> List[int]:
+    """Per-tensor numel in named_parameters() order (mirror of vit_oracle.py
+    vit_param_layout()). 32 tensors, total 418017. cls_token leads (leaf before
+    the patch_proj submodule)."""
+    d, dff, v, patch, npatch = _VIT_D, _VIT_DFF, _VIT_VOCAB, _VIT_PATCH, _VIT_NPATCH
+    sizes = [1 * 1 * d, d * patch, d, (npatch + 1) * d]   # cls, patch.w/b, pos
+    for _ in range(_VIT_LAYERS):
+        sizes += [
+            3 * d * d, 3 * d,                     # attn.in_proj_weight/bias
+            d * d, d,                             # attn.out_proj.weight/bias
+            d, d, d, d,                           # n1.w/b, n2.w/b
+            dff * d, dff,                         # ff.0.weight/bias
+            d * dff, d,                           # ff.2.weight/bias
+        ]
+    sizes += [d, d, v * d, v]                     # norm.w/b, out.weight/bias
+    return sizes
+
+
+def vit_layout_header() -> str:
+    """Emit csrc/fused/sm_90/vit_layout.cuh (the weight-layout mirror +
+    static_asserts + the dynamic-smem budget block). Byte-identical to the
+    hand-written header; a count/total/smem mismatch fails the BUILD."""
+    sizes = _vit_param_sizes()
+    offsets, acc = [], 0
+    for n in sizes:
+        offsets.append(acc)
+        acc += n
+    total = acc
+    n_tensors = len(sizes)
+
+    def _fmt(arr):
+        rows = []
+        for i in range(0, len(arr), 10):
+            rows.append("    " + ", ".join(str(x) for x in arr[i:i + 10]))
+        return ",\n".join(rows)
+
+    sizes_block = _fmt(sizes)
+    offsets_block = _fmt(offsets)
+    return f"""#ifndef SG_FUSED_SM90_VIT_LAYOUT_CUH_
+#define SG_FUSED_SM90_VIT_LAYOUT_CUH_
+// ============================================================================
+// csrc/fused/sm_90/vit_layout.cuh — weight-layout mirror for the L3-REAL
+// Vision-Transformer megakernel (PHASE 2).
+//
+// HAND-WRITTEN (PHASE 2 deliverable) — MARKED FOR CODEGEN ADOPTION. The decoder
+// twin (decoder_layout.cuh) is emitted by megakernel_codegen.py --decoder-layout;
+// the integrator should add a `--vit-layout` emitter (mirroring
+// _decoder_param_sizes / decoder_layout_header) whose output is byte-identical to
+// THIS file, then regenerate so it cannot drift. Until then, the numbers below are
+// generated FROM the single source of truth — tests/hw/vit_oracle.py
+// ::vit_param_layout() (asserted == the live model's named_parameters() order in
+// the parity test, tests/hw/test_vit_megakernel.py) — and guarded by the
+// static_asserts below. A count/total mismatch fails the BUILD loudly, never
+// corrupts at dispatch.
+//
+// The flat blob is torch.cat([p.reshape(-1) for _, p in model.named_parameters()]);
+// the kernel addresses tensor i at params + kVitOffsets[i] for kVitSizes[i] elems.
+//
+// named_parameters() ORDER (32 tensors) — note cls_token (a leaf nn.Parameter on
+// the ViT module) is yielded BEFORE the patch_proj submodule's params:
+//   0  cls_token              [1,1,128]
+//   1  patch_proj.weight      [128,49]
+//   2  patch_proj.bias        [128]
+//   3  pos.weight             [17,128]
+//   4..15   layers.0.{{attn.in_proj_w/b, attn.out_proj.w/b, n1.w/b, n2.w/b,
+//                     ff.0.w/b, ff.2.w/b}}
+//   16..27  layers.1.{{...same...}}
+//   28 norm.weight [128]  29 norm.bias [128]  30 out.weight [97,128]  31 out.bias [97]
+// ============================================================================
+
+#include <cstdint>
+
+namespace sg {{ namespace fused {{ namespace sm90 {{
+
+constexpr int SG_VIT_VOCAB  = {_VIT_VOCAB};          // p (head Linear(d, p))
+constexpr int SG_VIT_D      = {_VIT_D};
+constexpr int SG_VIT_HEADS  = {_VIT_HEADS};
+constexpr int SG_VIT_LAYERS = {_VIT_LAYERS};
+constexpr int SG_VIT_PATCH  = {_VIT_PATCH};          // patch pixel count (7×7)
+constexpr int SG_VIT_NPATCH = {_VIT_NPATCH};          // image patches
+constexpr int SG_VIT_SEQ    = SG_VIT_NPATCH + 1;  // 17 (CLS + 16 patches)
+constexpr int SG_VIT_DFF    = 4 * SG_VIT_D;       // 512
+
+constexpr int     kVitNumTensors = {n_tensors};
+constexpr int64_t kVitTotalElems = {total};
+
+// Per-tensor element offsets into the flat param blob, named_parameters() order.
+__device__ __constant__ int kVitOffsets[kVitNumTensors] = {{
+{offsets_block}
+}};
+
+// Per-tensor element sizes (numel), same order.
+__device__ __constant__ int kVitSizes[kVitNumTensors] = {{
+{sizes_block}
+}};
+
+static_assert(kVitNumTensors == {n_tensors},
+              "vit_layout: tensor count drifted. Regenerate from "
+              "vit_oracle.py::vit_param_layout() (codegen adoption: --vit-layout).");
+static_assert(kVitTotalElems == {total},
+              "vit_layout: total param count drifted. Regenerate.");
+
+// Host-constexpr mirrors so a sum/offset cross-check folds at compile time (a
+// __constant__ array can't be folded in a constexpr). These guarantee
+// offsets/sizes/total agree.
+namespace vit_layout_check {{
+constexpr int kSizes[kVitNumTensors] = {{
+{sizes_block}
+}};
+constexpr int kOffsets[kVitNumTensors] = {{
+{offsets_block}
+}};
+constexpr int64_t sum_sizes() {{
+    int64_t s = 0;
+    for (int i = 0; i < kVitNumTensors; ++i) s += kSizes[i];
+    return s;
+}}
+constexpr bool offsets_consistent() {{
+    int64_t acc = 0;
+    for (int i = 0; i < kVitNumTensors; ++i) {{
+        if (kOffsets[i] != (int)acc) return false;
+        acc += kSizes[i];
+    }}
+    return true;
+}}
+static_assert(sum_sizes() == kVitTotalElems,
+              "vit_layout: sum(kVitSizes) != kVitTotalElems. Regenerate.");
+static_assert(offsets_consistent(),
+              "vit_layout: kVitOffsets[i] != sum(kVitSizes[0..i)). Regenerate.");
+
+// ── Per-CTA dynamic-smem budget guard. The ViT per-sample working set
+//    (VitSampleSmem, model_stage_vit.cuh) is ≈ 188,080 bytes (≈ 183.67 KB) at
+//    seq=17 — FAR over the 48 KB STATIC __shared__ cap (so it MUST be dynamic
+//    smem), but comfortably UNDER the sm_90 per-block dynamic cap of 227 KB
+//    (232448 B). This bound is the size the launcher passes to
+//    cudaFuncSetAttribute(MaxDynamicSharedMemorySize) + <<<dynamicSMemBytes>>>.
+//    Computed from the field list (all float, 4 B, no padding):
+//      patch 16*49 + layer_in 2*17*128 + final_in 17*128 + qkv 17*384
+//      + ctx 17*128 + x1 17*128 + ff0 17*512 + gact 17*512 + attn 4*17*17
+//      + n1_xhat 17*128 + n1_inv 17 + n2_xhat 17*128 + n2_inv 17
+//      + fn_xhat 17*128 + fn_inv 17 + dh 17*128 + logits 97 + dsc 4*17*17
+//      + red 256  = 47020 floats = 188080 bytes.
+//    (If VitSampleSmem changes, update BOTH this literal and the sum below;
+//    fused_vit_megakernel.cuh static_asserts sizeof(VitSampleSmem) against it.) ─
+constexpr int kVitSampleSmemFloats =
+    16 * 49            // patch[NPATCH][PATCH]
+  + 2 * 17 * 128       // layer_in[LAYERS][SEQ][D]
+  + 17 * 128           // final_in[SEQ][D]
+  + 17 * 384           // qkv[SEQ][3D]
+  + 17 * 128           // ctx[SEQ][D]
+  + 17 * 128           // x1[SEQ][D]
+  + 17 * 512           // ff0[SEQ][DFF]
+  + 17 * 512           // gact[SEQ][DFF]
+  + 4 * 17 * 17        // attn[HEADS][SEQ][SEQ]
+  + 17 * 128 + 17      // n1_xhat[SEQ][D] + n1_inv[SEQ]
+  + 17 * 128 + 17      // n2_xhat[SEQ][D] + n2_inv[SEQ]
+  + 17 * 128 + 17      // fn_xhat[SEQ][D] + fn_inv[SEQ]
+  + 17 * 128           // dh[SEQ][D]
+  + 97                 // logits[VOCAB]
+  + 4 * 17 * 17        // dsc[HEADS][SEQ][SEQ]
+  + 256;               // red[256]
+constexpr int kVitSampleSmemBytes = kVitSampleSmemFloats * (int)sizeof(float);
+static_assert(kVitSampleSmemBytes == 188080,
+              "vit_layout: VitSampleSmem byte budget drifted from 188080.");
+static_assert(kVitSampleSmemBytes < 227 * 1024,
+              "vit_layout: VitSampleSmem exceeds the sm_90 227 KB dynamic-smem "
+              "per-block cap — the megakernel could not launch.");
+}}  // namespace vit_layout_check
+
+}}}}}} // namespace sg::fused::sm90
+
+#endif  // SG_FUSED_SM90_VIT_LAYOUT_CUH_
+"""
+
+
+# ── PHASE 2: the real Mamba weight layout (single C++ source). ──────────────
+# The L3-REAL Mamba megakernel (csrc/fused/sm_90/model_stage_mamba3.cuh) needs the
+# flat-buffer OFFSETS/SIZES of the eager model's 28 parameter tensors, in
+# named_parameters() ORDER. THE single source of truth is the same shapes the
+# oracle (tests/hw/mamba_oracle.py::mamba_param_layout()) encodes; the device
+# header csrc/fused/sm_90/mamba3_layout.cuh is GENERATED from THIS so it cannot
+# drift. CRITICAL ORDERING: within each SelectiveSSMLayer, A_log and D (the
+# module's OWN nn.Parameters) are yielded BEFORE in_proj (a submodule) — NOT the
+# __init__ visual order. Keep these constants == mamba_oracle.py.
+_MAMBA_VOCAB, _MAMBA_PHEAD, _MAMBA_D, _MAMBA_LAYERS, _MAMBA_SEQ = 99, 97, 128, 2, 8
+_MAMBA_DINNER, _MAMBA_STATE, _MAMBA_DTRANK, _MAMBA_CONVK = 256, 16, 8, 3
+
+
+def _mamba_param_sizes() -> List[int]:
+    """Per-tensor numel in named_parameters() order (mirror of mamba_oracle.py
+    mamba_param_layout()). 28 tensors, total 259425. Per layer the leaf-before-
+    submodule order is A_log, D, in_proj, conv1d.w, conv1d.b, x_proj, dt_proj.w,
+    dt_proj.b, out_proj, norm.w, norm.b."""
+    d, v, ph, seq = _MAMBA_D, _MAMBA_VOCAB, _MAMBA_PHEAD, _MAMBA_SEQ
+    di, st, dtr, ck = _MAMBA_DINNER, _MAMBA_STATE, _MAMBA_DTRANK, _MAMBA_CONVK
+    sizes = [v * d, seq * d]                          # tok, pos
+    for _ in range(_MAMBA_LAYERS):
+        sizes += [
+            di * st,                                  # A_log [d_inner, state]
+            di,                                       # D [d_inner]
+            2 * di * d,                               # in_proj [2*d_inner, d]
+            di * 1 * ck,                              # conv1d.weight [d_inner,1,3]
+            di,                                       # conv1d.bias [d_inner]
+            (dtr + 2 * st) * di,                      # x_proj [dt_rank+2*state, d_inner]
+            di * dtr,                                 # dt_proj.weight [d_inner, dt_rank]
+            di,                                       # dt_proj.bias [d_inner]
+            d * di,                                   # out_proj [d, d_inner]
+            d, d,                                     # norm.weight/bias
+        ]
+    sizes += [d, d, ph * d, ph]                       # norm.w/b, out.weight/bias
+    return sizes
+
+
+def mamba_layout_header() -> str:
+    """Emit csrc/fused/sm_90/mamba3_layout.cuh (the weight-layout mirror +
+    static_asserts + the dynamic-smem budget block). Byte-identical to the
+    hand-written header; a count/total/smem mismatch fails the BUILD.
+
+    kMambaSmemFloats is the FIELD-BY-FIELD element count of MambaSampleSmem
+    (model_stage_mamba3.cuh), NOT a sizeof() (this generator is host Python, not
+    nvcc). The 36281 total is documented field-by-field in the emitted comment.
+    """
+    sizes = _mamba_param_sizes()
+    offsets, acc = [], 0
+    for n in sizes:
+        offsets.append(acc)
+        acc += n
+    total = acc
+    n_tensors = len(sizes)
+
+    def _fmt(arr):
+        rows = []
+        for i in range(0, len(arr), 10):
+            rows.append("    " + ", ".join(str(x) for x in arr[i:i + 10]))
+        return ",\n".join(rows)
+
+    sizes_block = _fmt(sizes)
+    offsets_block = _fmt(offsets)
+    return f"""#ifndef SG_FUSED_SM90_MAMBA3_LAYOUT_CUH_
+#define SG_FUSED_SM90_MAMBA3_LAYOUT_CUH_
+// ============================================================================
+// csrc/fused/sm_90/mamba3_layout.cuh — weight-layout mirror for the L3-REAL
+// Mamba megakernel (PHASE 2).
+//
+// HAND-WRITTEN (not generated): megakernel_codegen.py is OFF-LIMITS for this
+// phase per the owner directive, so this header is hand-derived from the SINGLE
+// SOURCE OF TRUTH tests/hw/mamba_oracle.py::mamba_param_layout(), which is
+// asserted == the eager model's named_parameters() ORDER + count + total in the
+// parity test (tests/hw/test_mamba_megakernel.py). When megakernel_codegen.py is
+// later extended with a --mamba-layout emitter (the decoder pattern), this file
+// becomes its generated output; until then the numbers below are pinned by the
+// static_asserts and the Python parity test. The flat blob is
+// torch.cat([p.reshape(-1) for _, p in model.named_parameters()]); the kernel
+// addresses tensor i at params + kMambaOffsets[i] for kMambaSizes[i] elements.
+//
+// CRITICAL ORDERING NOTE: PyTorch yields a module's OWN nn.Parameters before its
+// submodules, so within each SelectiveSSMLayer **A_log and D come BEFORE in_proj**
+// (NOT the __init__ visual order). The order below matches the verified dump.
+//
+// A count/total mismatch fails the BUILD loudly (the static_asserts below), never
+// corrupts at dispatch.
+// ============================================================================
+
+#include <cstdint>
+
+namespace sg {{ namespace fused {{ namespace sm90 {{
+
+constexpr int SG_MB_VOCAB  = {_MAMBA_VOCAB};    // ntok (tok embedding rows)
+constexpr int SG_MB_PHEAD  = {_MAMBA_PHEAD};    // p (head width = out Linear cols)
+constexpr int SG_MB_D      = {_MAMBA_D};   // d_model
+constexpr int SG_MB_LAYERS = {_MAMBA_LAYERS};     // nl
+constexpr int SG_MB_SEQ    = {_MAMBA_SEQ};     // seq_len
+constexpr int SG_MB_DINNER = {_MAMBA_DINNER};   // d_inner (= d * expand_factor=2)
+constexpr int SG_MB_STATE  = {_MAMBA_STATE};    // state_dim
+constexpr int SG_MB_DTRANK = {_MAMBA_DTRANK};     // dt_rank = max(d/16,1)
+constexpr int SG_MB_CONVK  = {_MAMBA_CONVK};     // conv1d kernel size
+
+constexpr int     kMambaNumTensors = {n_tensors};
+constexpr int64_t kMambaTotalElems = {total};
+
+// Per-tensor element offsets into the flat param blob, named_parameters() order.
+__device__ __constant__ int kMambaOffsets[kMambaNumTensors] = {{
+{offsets_block}
+}};
+
+// Per-tensor element sizes (numel), same order.
+__device__ __constant__ int kMambaSizes[kMambaNumTensors] = {{
+{sizes_block}
+}};
+
+static_assert(kMambaNumTensors == {n_tensors},
+              "mamba3_layout: tensor count drifted from the oracle layout (28).");
+static_assert(kMambaTotalElems == {total},
+              "mamba3_layout: total param count drifted (259425).");
+
+// Host-constexpr mirrors so a sum/offset cross-check folds at compile time (a
+// __constant__ array can't be folded in a constexpr).
+namespace mamba_layout_check {{
+constexpr int kSizes[kMambaNumTensors] = {{
+{sizes_block}
+}};
+constexpr int kOffsets[kMambaNumTensors] = {{
+{offsets_block}
+}};
+constexpr int64_t sum_sizes() {{
+    int64_t s = 0;
+    for (int i = 0; i < kMambaNumTensors; ++i) s += kSizes[i];
+    return s;
+}}
+constexpr bool offsets_consistent() {{
+    int64_t acc = 0;
+    for (int i = 0; i < kMambaNumTensors; ++i) {{
+        if (kOffsets[i] != (int)acc) return false;
+        acc += kSizes[i];
+    }}
+    return true;
+}}
+static_assert(sum_sizes() == kMambaTotalElems,
+              "mamba3_layout: sum(kMambaSizes) != kMambaTotalElems. Re-derive "
+              "from tests/hw/mamba_oracle.py::mamba_param_layout().");
+static_assert(offsets_consistent(),
+              "mamba3_layout: kMambaOffsets[i] != sum(kMambaSizes[0..i)).");
+}}  // namespace mamba_layout_check
+
+// ── SMEM footprint of MambaSampleSmem (model_stage_mamba3.cuh). The Mamba CTA
+//    smem EXCEEDS the 48 KB static cap (d_inner=256 + both-layer caching), so the
+//    launcher MUST declare it DYNAMIC and opt in via
+//    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+//    kMambaSmemBytes) before launch (sm_90 has ~228 KB smem/SM; one persistent
+//    block/SM still places, occupancy>=1 holds, NO CUDA graphs). This is the
+//    HONEST deviation from the decoder's <48 KB static footprint — see the
+//    SMEM BUDGET note in model_stage_mamba3.cuh and INTEGRATION-MAMBA.md.
+//
+//    The number below is a static_assert-guarded mirror of sizeof(MambaSampleSmem)
+//    computed field-by-field (all fields are float, 4-byte aligned -> no padding):
+//      layer_in   [2][8][128]              = 2048
+//      final_in   [8][128]                 = 1024
+//      act[2].{{ x_main_raw,z,conv,dt_pre,y_scan [8][256] (5*2048),
+//               Bmat,Cmat [8][16] (2*128), ln_xhat [8][128], ln_inv [8] }}
+//                 per layer = 11528 ; x2  = 23056
+//      fn_xhat[8][128]=1024; fn_inv[8]=8; logits[97]=97
+//      dh,dr [8][128] (2*1024); adj_a,adj_b,adj_c [8][256] (3*2048)
+//      dbc [8][40]=320; dBmat,dCmat [8][16] (2*128); red[256]
+//      ------------------------------------------------------- = 36281 floats
+constexpr int64_t kMambaSmemFloats = 36281;
+constexpr int64_t kMambaSmemBytes  = kMambaSmemFloats * (int64_t)sizeof(float); // 145124
+static_assert(kMambaSmemBytes > 48 * 1024,
+              "mamba3_layout: if the smem ever drops below 48KB, switch the "
+              "launcher back to STATIC smem (no opt-in needed).");
+static_assert(kMambaSmemBytes < 224 * 1024,
+              "mamba3_layout: CTA smem exceeds the sm_90 ~228KB/SM budget; "
+              "one-block-per-SM would fail to place (GridBarrier hang). Shrink "
+              "the live set (e.g. drop a cached LayerAct buffer).");
+
+}}}}}} // namespace sg::fused::sm90
+
+#endif  // SG_FUSED_SM90_MAMBA3_LAYOUT_CUH_
+"""
 
 
 def dispatch_table() -> str:
@@ -581,6 +1117,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="emit the generated sm_90 real-composition dispatch .inc")
     ap.add_argument("--dispatch-table-gfx942", action="store_true",
                     help="emit the generated gfx942 real-composition dispatch .inc")
+    ap.add_argument("--decoder-layout", action="store_true",
+                    help="emit the PHASE-1 L3-REAL decoder weight-layout header "
+                         "(csrc/fused/sm_90/decoder_layout.cuh)")
+    ap.add_argument("--vit-layout", action="store_true",
+                    help="emit the PHASE-2 L3-REAL ViT weight-layout header "
+                         "(csrc/fused/sm_90/vit_layout.cuh)")
+    ap.add_argument("--mamba-layout", action="store_true",
+                    help="emit the PHASE-2 L3-REAL Mamba weight-layout header "
+                         "(csrc/fused/sm_90/mamba3_layout.cuh)")
     args = ap.parse_args(argv)
 
     if args.emit:
@@ -613,6 +1158,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.dispatch_table_gfx942:
         sys.stdout.write(dispatch_table_gfx942() + "\n")
+        return 0
+
+    if args.decoder_layout:
+        sys.stdout.write(decoder_layout_header())
+        return 0
+
+    if args.vit_layout:
+        sys.stdout.write(vit_layout_header())
+        return 0
+
+    if args.mamba_layout:
+        sys.stdout.write(mamba_layout_header())
         return 0
 
     ap.print_help()

@@ -239,8 +239,30 @@ DEFAULT_CONFIG: Dict = {
     "num_layers": 2, "dim_model": 128, "num_heads": 4, "num_tokens": 99,
     "lr": 1e-3, "weight_decay": 1.0, "beta1": 0.9, "beta2": 0.98,
     "max_steps": 100_000, "early_stop_threshold": 0.95,
-    "early_stop_max_steps": 20_000, "eval_every": 100,
-    "early_stop_patience": 500, "log_every": 10, "seed": 42,
+    "early_stop_max_steps": 20_000, "eval_every": 10,  # owner: track metrics every 10 gradient steps
+    # Owner (2026-06-10): the race stops on VAL grokking (val>=0.95, patience-
+    # held); TEST stays the report metric (grokking_step_test_confirmed). No
+    # heuristic dead-stop: non-grokking cells run to early_stop_max_steps (an
+    # honest DNF) under live supervision.
+    "early_stop_on": "val",
+    # Matmul precision policy (owner: BF16 tensor-core is the intended default;
+    # configurable axis). "bf16" -> autocast(bfloat16) fwd/bwd on tensor cores
+    # (fp32 master weights + fp32 grads at the optimizer boundary, so every
+    # fused optimizer kernel ABI is unchanged); "tf32" -> fp32 autocast OFF +
+    # allow_tf32 GEMMs; "fp32" -> strict CUDA-core fp32 (the legacy baseline).
+    # Meta/SAM side-steps and evaluate() deliberately stay fp32 (sharpness and
+    # accuracy metrics are numerics-sensitive). Roofline ceilings follow this
+    # axis (tuning/roofline.py).
+    # Owner decision (2026-06-10): precision program dropped — industry
+    # standard fixed everywhere = bf16 mixed precision (bf16 compute, fp32
+    # master weights/optimizer state). "auto"/per-model modes remain available
+    # as explicit overrides only.
+    "matmul_precision": "bf16",
+    # [A4-H1] patience counts EVALS, not steps: 50 evals × eval_every=10 =
+    # 500-step post-grok hold. The old 500 (× eval_every=100 = 50k steps)
+    # EXCEEDED max_steps, so the {metric}_threshold stop was unreachable and
+    # every race run burned the full step budget instead of stopping at grok.
+    "early_stop_patience": 50, "seed": 42,
     "compile_model": False, "use_amp": False, "model_type": "decoder",
     "patch_dim": 49, "num_patches": 16,
     "chain_length": 3, "seq_len": 8,
@@ -485,18 +507,22 @@ def evaluate(model, x, y, p=97):
     return loss, acc
 
 class EarlyStopper:
-    def __init__(self, threshold=0.95, max_steps=20_000, patience=500):
+    def __init__(self, threshold=0.95, max_steps=20_000, patience=500, metric_name="test_acc"):
         self.threshold=threshold; self.max_steps=max_steps; self.patience=patience
-        self._triggered=False; self._counter=0; self.best_test_acc=0.
+        self.metric_name=metric_name  # which accuracy feeds step(): "test_acc" or "val_acc"
+        # [A4-M1/M2] best_metric_acc / metric_acc are metric-agnostic names: under
+        # val-stopping this tracks val, under test-stopping it tracks test — the
+        # old test_acc-specific names mislabelled the val-criterion runs.
+        self._triggered=False; self._counter=0; self.best_metric_acc=0.
         self.grokking_step=None; self.grokking_wall=None; self._t0=time.time()
         self.stopping_reason=None; self.stopping_step=None
-    def step(self, test_acc, current_step):
+    def step(self, metric_acc, current_step):
         if current_step >= self.max_steps:
             if self.stopping_reason is None:
                 self.stopping_reason="max_steps"; self.stopping_step=current_step
             return True
-        self.best_test_acc = max(self.best_test_acc, test_acc)
-        if test_acc >= self.threshold:
+        self.best_metric_acc = max(self.best_metric_acc, metric_acc)
+        if metric_acc >= self.threshold:
             if not self._triggered:
                 if torch.cuda.is_available(): torch.cuda.synchronize()
                 self._triggered=True; self.grokking_step=current_step
@@ -504,7 +530,7 @@ class EarlyStopper:
             self._counter += 1
             if self._counter >= self.patience:
                 if self.stopping_reason is None:
-                    self.stopping_reason="test_acc_threshold"; self.stopping_step=current_step
+                    self.stopping_reason=f"{self.metric_name}_threshold"; self.stopping_step=current_step
                 return True
         else: self._counter=0
         return False
@@ -545,10 +571,18 @@ class TrainResult:
                  "grokking_step","grokking_wall","final_val_acc","final_train_acc",
                  "final_test_acc","final_test_loss","final_val_loss",
                  "stopping_reason","stopping_step","val_test_gap",
-                 "model_type","frac_train","val_ratio")
-    def __init__(self, name, seed=42, model_type="decoder", frac_train=0.5, val_ratio=0.10):
+                 "model_type","frac_train","val_ratio","component_failures",
+                 # [A4-M3] TEST-confirmed grok flag (val-trained metas can fake-
+                 # grok val); [A4-M2] best metric-criterion acc seen by the stopper
+                 "grokking_step_test_confirmed","best_metric_acc",
+                 # [A4-M4] per-run resolved matmul precision + AMP flag (each
+                 # optimizer can carry a different tuned precision)
+                 "matmul_precision","use_amp")
+    def __init__(self, name, seed=42, model_type="decoder", frac_train=0.5, val_ratio=0.10,
+                 matmul_precision="auto", use_amp=False):
         self.name=name; self.seed=seed; self.model_type=model_type
         self.frac_train=frac_train; self.val_ratio=val_ratio
+        self.matmul_precision=matmul_precision; self.use_amp=use_amp
         self.steps=[]; self.train_losses=[]; self.train_accs=[]
         self.val_losses=[]; self.val_accs=[]
         self.test_losses=[]; self.test_accs=[]
@@ -556,13 +590,62 @@ class TrainResult:
         self.grokking_wall=None; self.final_val_acc=0.; self.final_train_acc=0.
         self.final_test_acc=0.; self.final_test_loss=0.; self.final_val_loss=0.
         self.stopping_reason=None; self.stopping_step=None; self.val_test_gap=0.
+        # per-component failure counts (sam_step/meta_step/bilevel_step) — a
+        # component that breaks must be VISIBLE in results, never silent
+        self.component_failures={}
+        # [A4-M3] True iff grokking_step is set AND the eval nearest it had
+        # test_acc >= threshold-0.05 (set in _fin); guards against val-only
+        # fake-grok by val-trained meta-nets. [A4-M2] best metric-criterion acc.
+        self.grokking_step_test_confirmed=False; self.best_metric_acc=0.
 
 def _merge(base, ov):
     m = dict(base)
     if ov: m.update(ov)
     return m
+# Measured per-model precision verdicts (results/h100_grokking_race/
+# PRECISION_ANALYSIS.md, 3 seeds/cell): decoder stands at EVERY precision
+# (bf16 = fastest that fully stands); vit only fully stands at fp32 (tf32 lost
+# 1/3 seeds, bf16 2/3); mamba untested -> conservative fp32 until measured.
+# The tuner additionally tunes precision per (optimizer, model); "auto" is the
+# default for untuned contexts.
+_AUTO_PRECISION = {"decoder": "bf16", "vit": "fp32", "mamba": "fp32"}
+
+def _resolve_matmul_precision(c):
+    mp = c.get("matmul_precision", "auto")
+    if mp == "auto":
+        return _AUTO_PRECISION.get(c.get("model_type", "decoder"), "fp32")
+    return mp
+
+def _autocast(c):
+    """Forward/backward autocast per the matmul_precision axis.
+
+    Precedence: legacy use_amp=True keeps the old fp16+GradScaler behavior;
+    otherwise matmul_precision selects bf16 autocast (default) or none
+    (tf32/fp32 — those differ via the allow_tf32 backend flag set in
+    _apply_matmul_precision). GradScaler stays enabled only for fp16 (bf16
+    needs no loss scaling; the existing scaler calls are no-op passthroughs
+    when disabled)."""
+    if c.get("use_amp", False):
+        return torch.amp.autocast('cuda')
+    mp = _resolve_matmul_precision(c)
+    if mp == "bf16" or mp in ("fp8", "fp8e5m2", "int8"):
+        # fp8/int8 swap the Linear GEMMs to native kernels (lowprec.py); all
+        # other ops ride the standard bf16 carrier, as in TE-style recipes.
+        return torch.amp.autocast('cuda', dtype=torch.bfloat16)
+    import contextlib
+    return contextlib.nullcontext()
+
+def _apply_matmul_precision(c):
+    tf32 = (_resolve_matmul_precision(c) == "tf32")
+    torch.backends.cuda.matmul.allow_tf32 = tf32
+    torch.backends.cudnn.allow_tf32 = tf32
+
 def _stopper(c):
-    return EarlyStopper(c["early_stop_threshold"], c.get("early_stop_max_steps", c["max_steps"]), c["early_stop_patience"])
+    # early_stop_on: "test" (default, historical) or "val" — which accuracy
+    # triggers the threshold/patience stop. Tuner + the val-criterion race use "val".
+    metric = "val_acc" if c.get("early_stop_on", "test") == "val" else "test_acc"
+    return EarlyStopper(c["early_stop_threshold"], c.get("early_stop_max_steps", c["max_steps"]),
+                        c["early_stop_patience"], metric_name=metric)
 def _pbar(name, mx, pos):
     return tqdm(range(1, mx+1), desc=f"{name:<14s}", position=pos, leave=True, ncols=120,
                 bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {postfix}]")
@@ -571,20 +654,70 @@ def _progressive_eval_freq(step, base_freq=10, max_freq=50, scale=0.01, thresh=5
     heat = 1.0 / (1.0 + math.exp(-scale * (step - thresh)))
     freq = max_freq - (max_freq - base_freq) * heat
     return max(base_freq, round(freq))
+def _component_guard(r, comp, step, c, fn, *a):
+    """Run an optimizer side-component (sam/meta/bilevel) LOUDLY.
+
+    No silent suppression (owner directive): failures are counted in
+    r.component_failures (lands in saved results), warned with the count, and
+    re-raised when c["strict_components"] is set — the tuner sets it so a
+    hyperparameter config that crashes a component scores as a CRASH instead
+    of quietly degrading to its base optimizer and masquerading as a DNF
+    (which is how SuperGrok2 ran for weeks with SAM 100% dead)."""
+    try:
+        fn(*a); return True
+    except Exception as e:
+        n = r.component_failures[comp] = r.component_failures.get(comp, 0) + 1
+        warnings.warn(f"{r.name} {comp} failed at step {step} (#{n}): {e}")
+        if c.get("strict_components", False): raise
+        return False
+
 def _eval_log(r, step, m, tx, ty, vax, vay, tex, tey, c, st, pb):
-    tl, ta = evaluate(m, tx, ty, c["p"])
-    vl, va = evaluate(m, vax, vay, c["p"])
-    tel, tea = evaluate(m, tex, tey, c["p"])
+    # Fused single-sync evaluation. The naive 3× evaluate() did SIX GPU→CPU
+    # .item() round-trips per eval AND built autograd graphs for ~9.3K samples
+    # (evaluate() lacked no_grad) — at the tuner's every-step cadence across a
+    # 28-worker MPS fleet those sync stalls dominated (GPU ~25-40% util).
+    # Identical math: same ops/dtypes, all metrics computed on-device, ONE
+    # device→host transfer.
+    p_ = c["p"]
+    if c.get("fast_val_eval") and step % 10 != 0:
+        # Between full evals: VAL-ONLY check (465 samples vs ~9.3K for the
+        # triple) feeding just the early-stopper — preserves every-step
+        # grokking_step resolution at ~1/9 the eval cost. Records/callbacks
+        # stay on the 10-step grid.
+        with torch.no_grad():
+            logits = m(vax)
+            va_t = torch.stack([F.cross_entropy(logits, vay),
+                                (logits[:, :p_].argmax(-1) == vay).float().mean()])
+            vl_f, va_f = va_t.cpu().tolist()
+        stop_acc = va_f if c.get("early_stop_on", "test") == "val" else None
+        if stop_acc is None:
+            return False, None, None  # fast path only valid with val stopping
+        return st.step(stop_acc, step), None, None
+    with torch.no_grad():
+        outs = []
+        for x_, y_ in ((tx, ty), (vax, vay), (tex, tey)):
+            logits = m(x_)
+            outs.append(torch.stack([
+                F.cross_entropy(logits, y_),
+                (logits[:, :p_].argmax(-1) == y_).float().mean()]))
+        (tl, ta), (vl, va), (tel, tea) = torch.stack(outs).cpu().tolist()
     r.steps.append(step); r.train_losses.append(tl); r.train_accs.append(ta)
     r.val_losses.append(vl); r.val_accs.append(va)
     r.test_losses.append(tel); r.test_accs.append(tea)
     pb.set_postfix({"trn":f"{ta:.3f}","val":f"{va:.3f}","tst":f"{tea:.3f}","tl":f"{tl:.3f}"}, refresh=False)
-    return st.step(tea, step), tl, tel
+    # Optional per-eval observer (e.g. the Optuna tuner's pruning hook). May
+    # raise (optuna.TrialPruned) to abort the run; absent in the race itself.
+    cb = c.get("_eval_callback")
+    if cb is not None:
+        cb(step, ta, va, tea)
+    stop_acc = va if c.get("early_stop_on", "test") == "val" else tea
+    return st.step(stop_acc, step), tl, tel
 def _fin(r, st, step, t0, m, tex, tey, p=97):
     if torch.cuda.is_available(): torch.cuda.synchronize()
     r.wall_time=time.time()-t0; r.total_steps=step
     r.grokking_step=st.grokking_step; r.grokking_wall=st.grokking_wall
     r.stopping_reason=st.stopping_reason; r.stopping_step=st.stopping_step
+    r.best_metric_acc=st.best_metric_acc  # [A4-M2] best stopper-criterion acc
     r.final_train_acc = r.train_accs[-1] if r.train_accs else 0.
     r.final_val_acc = r.val_accs[-1] if r.val_accs else 0.
     r.final_val_loss = r.val_losses[-1] if r.val_losses else 0.
@@ -593,47 +726,190 @@ def _fin(r, st, step, t0, m, tex, tey, p=97):
         r.final_test_loss, r.final_test_acc = evaluate(m, tex, tey, p)
     m.train()
     r.val_test_gap = r.final_val_acc - r.final_test_acc
+    # [A4-M3] TEST-confirm the first threshold crossing. Under val-stopping the
+    # stopper triggers on val, but the SuperGrok meta-nets TRAIN on val, so a
+    # val-only "grok" can be circular — confirm it transferred to the held-out
+    # TEST split at the recorded eval nearest grokking_step (test_acc within
+    # 0.05 of the stop threshold). Under test-stopping this is trivially True
+    # whenever grokked (the criterion already IS test). recorded test_accs live
+    # on the 10-step grid (r.steps/r.test_accs); fast_val_eval steps aren't
+    # recorded, so we snap to the nearest recorded eval.
+    if r.grokking_step is not None and r.steps and r.test_accs:
+        gi = min(range(len(r.steps)), key=lambda i: abs(r.steps[i] - r.grokking_step))
+        r.grokking_step_test_confirmed = bool(r.test_accs[gi] >= st.threshold - 0.05)
+    else:
+        r.grokking_step_test_confirmed = False
     return r
 def _load(c, device, init_state):
+    _apply_matmul_precision(c)  # set GEMM precision policy for this run
     m = build_model(c, device, c.get("compile_model", False))
+    _mp = _resolve_matmul_precision(c)
+    if _mp in ("fp8", "fp8e5m2", "int8"):
+        from grokking_optimizers.lowprec import swap_linears_lowprec
+        # swap AFTER build; weights load below targets the same (shared)
+        # Parameter objects, so init/state keys are unaffected
+        m._lowprec_report = swap_linears_lowprec(m, _mp)
     try: m.load_state_dict(copy.deepcopy(init_state), strict=True)
     except RuntimeError:
         raw = m._orig_mod if hasattr(m, "_orig_mod") else m
         raw.load_state_dict(copy.deepcopy(init_state), strict=True)
     return m
 def _tr(name, c):
-    return TrainResult(name, c["seed"], c.get("model_type","decoder"), c.get("frac_train",0.5), c.get("val_ratio",0.10))
+    # [A4-M4] capture the per-run resolved matmul precision + AMP flag so
+    # save_json can record what precision actually ran (config c is not in
+    # save_json's scope; the TrainResult carries it).
+    return TrainResult(name, c["seed"], c.get("model_type","decoder"), c.get("frac_train",0.5),
+                       c.get("val_ratio",0.10), matmul_precision=_resolve_matmul_precision(c),
+                       use_amp=bool(c.get("use_amp", False)))
 
 # ── C++/CUDA fused optimizers (grokking_optimizers package) ────────────
 from grokking_optimizers import (
     SuperGrok15, SuperGrok2, SuperGrok11,
     GrokAdamW, NeuralGrok, Prodigy, Grokfast, Lion, LookSAM, Muon,
 )
-from grokking_optimizers.dispatch import detect_arch, has_fused, dispatch_fused
+from grokking_optimizers.dispatch import (
+    detect_arch, has_fused, dispatch_fused, fused_optimizer_step,
+    announce_fused_readiness, has_l3_real, fused_train_step,
+)
 
 def _maybe_wrap_cuda_graph(opt, c):
     """No-op shim. CUDA Graph wrapping was removed in the post-refactor
     cleanup; the race is single-node and does not need graph capture."""
     return opt
 
+# Process-wide stale-ABI latch for the fused optimizer path: set on the first
+# pybind TypeError (extension predates the widened fused_step signature) so
+# every subsequent step takes the eager path without re-attempting.
+_FUSED_ABI_STALE = False
+
 def _try_fused_step(model_name, opt_name, model, optimizer, x_batch, y_batch, c):
-    """Attempt fused (model, optimizer, arch) kernel; return True if used, False to fallback."""
-    if not c.get("use_fused", True):
+    """Run the L1 fused optimizer-tail megakernel for a whitelisted cell.
+
+    CONTRACT CHANGE (lever (a)): this is now a post-backward OPTIMIZER STEP, not a
+    fwd+bwd+opt launch. The caller MUST have already run the real forward +
+    ``loss.backward()`` so every parameter carries its real ``p.grad``; this
+    applies the canonical optimizer update in-place via ``ops.fused_step``
+    (``opt_only=True`` → the L1 real-grad tail). Returns True if the fused step
+    ran (the caller must then SKIP its own ``optimizer.step()`` / ``scaler.step``);
+    False if the cell is not on the readiness whitelist (caller runs eager).
+
+    Why not L3 (fwd+bwd+opt in one launch): the L3 megakernel runs an element-
+    local SURROGATE model over the flat param blob (csrc/.../model_stages.cuh),
+    NOT the real Transformer/ViT/Mamba graph, so its loss cannot match eager. The
+    L1 tail consumes the real gradient and IS the eager optimizer step. See
+    BUILD_AND_VALIDATE.md.
+
+    State ownership: ``optimizer.step()`` is replaced, so the torch optimizer's
+    own ``.state`` never fills. We keep a persistent per-parameter ``[m|v|extra]``
+    buffer in a cache attached to the optimizer instance (allocated once per
+    param) plus a step counter — reallocating per step would reset momentum and
+    the run would never grok.
+    """
+    global _FUSED_ABI_STALE
+    if _FUSED_ABI_STALE or not c.get("use_fused", True):
         return False
     try:
-        # has_fused() canonicalizes the model name and can raise ValueError on an
-        # unrecognized name; keep it inside the guard so the fused path always
-        # degrades to the eager path rather than crashing the run. The built-in
-        # registry is empty (see dispatch.has_fused), so this returns False today.
+        # has_fused() is the readiness gate: True ONLY for whitelisted cells on a
+        # GPU arch with a compiled fused TU. Keep it inside the guard so the fused
+        # path always degrades to eager rather than crashing the run.
         if not has_fused(model_name, opt_name):
             return False
-        params = {n: p for n, p in model.named_parameters()}
-        # Fused kernel handles forward + backward + optimizer step in one launch
-        dispatch_fused(model_name, opt_name, params, x_batch, None, optimizer.state,
-                       optimizer.defaults.get('lr', 1e-3))
+        announce_fused_readiness()  # one-time loud run-start banner (idempotent)
+        # Persistent per-parameter state + step counter live on the optimizer
+        # instance so they survive across iterations (the cache key is id(param)).
+        cache = getattr(optimizer, "_fused_state_cache", None)
+        if cache is None:
+            cache = {}
+            optimizer._fused_state_cache = cache
+        step = getattr(optimizer, "_fused_step_counter", 0) + 1
+        optimizer._fused_step_counter = step
+        fused_optimizer_step(model_name, opt_name, model, optimizer,
+                             state_cache=cache, step=step)
         return True
-    except (KeyError, NotImplementedError, ValueError):
+    except TypeError as e:
+        # STALE-ABI GUARD: a pybind TypeError here means the compiled _ops
+        # extension predates the widened fused_step signature (rebuild
+        # pending). Without this catch the error escaped and CRASHED runs —
+        # poisoning tuner trials with crash scores. Degrade LOUDLY ONCE per
+        # process to the validated eager path; never retry (per-step retries
+        # would spam and re-fail identically).
+        if not _FUSED_ABI_STALE:
+            _FUSED_ABI_STALE = True
+            warnings.warn(
+                "fused_step ABI mismatch (stale _ops build predates the widened "
+                f"signature) — eager optimizer steps until rebuild: {e}")
         return False
+    except (KeyError, NotImplementedError, ValueError, RuntimeError):
+        # Any assembly/ABI problem (unbuilt extension, unsupported dtype/layout,
+        # non-whitelisted cell) degrades to the eager path — never crash the run.
+        return False
+
+def _try_fused_train_step(model_name, opt_name, model, optimizer, x_batch,
+                          y_batch, c):
+    """PHASE 1+2 — run the TRUE L3 fused TRAIN step (real fwd+bwd+opt in ONE
+    persistent megakernel) for an L3-REAL cell. Model-GENERIC: fires for whichever
+    of (transformer_decoder|vit|mamba × adamw) has a compiled real fwd+bwd+opt
+    kernel on this arch (has_l3_real gates it; PHASE 1 decoder, PHASE 2 vit+mamba).
+    x_batch is the per-model input the cell expects — int token ids [B,seq] for
+    decoder/mamba, float patches [B,16,49] for vit — and flows unchanged into
+    fused_train_step, which packs it per model (see dispatch.py).
+
+    Unlike ``_try_fused_step`` (the L1 post-backward optimizer tail, which needs
+    the caller to have already run fwd+bwd), this REPLACES the eager forward +
+    backward + optimizer.step() entirely: ONE persistent kernel runs the real
+    model forward+backward AND AdamW — real model math, real optimizer math,
+    ZERO intermediate launches (the owner rejected CUDA graphs; this is the path).
+
+    Returns the training LOSS (a float, mean cross-entropy) if the fused train step
+    ran — the caller then SKIPS its own fwd/bwd/step and logs THIS loss — or
+    ``None`` if the L3-REAL kernel is unavailable (caller falls back to eager + the
+    L1 fused optimizer step). Degrades to None (never crashes) on any ABI/build
+    problem, exactly like _try_fused_step.
+    """
+    global _FUSED_ABI_STALE
+    if _FUSED_ABI_STALE or not c.get("use_fused", True):
+        return None
+    # PRECISION GATE (owner fairness rule): the L3 kernels compute fp32; the race
+    # compares optimizers by steps-to-grok, and precision changes trajectories.
+    # If one cell trained fp32-in-kernel while its competitors ran bf16-eager,
+    # the comparison would confound optimizer with precision. So the L3 path runs
+    # ONLY when the run's RESOLVED precision is fp32 (vit/mamba auto = fp32 →
+    # fused runs; bf16 default decoder race → eager bf16 like everyone else).
+    # The bf16+TC retrofit (decision A) flips this gate to "bf16" when the
+    # kernels themselves compute bf16. Validation/smokes pin fp32 explicitly to
+    # keep exercising L3. Legacy use_amp (fp16 GradScaler) also declines.
+    if c.get("use_amp", False) or _resolve_matmul_precision(c) != "fp32":
+        return None
+    try:
+        # has_l3_real(): True ONLY for the L3-REAL cell on sm_90 with a compiled
+        # fused TU. Keep inside the guard so the path degrades rather than crashes.
+        if not has_l3_real(model_name, opt_name):
+            return None
+        announce_fused_readiness()  # one-time loud run-start banner (idempotent)
+        # Persistent flat-param + [m|v|extra]+loss state on the optimizer instance
+        # (keyed by canonical model name), surviving across iterations — the
+        # megakernel owns optimizer.step(), so the torch optimizer's .state never
+        # fills; reallocating per step would reset momentum and never grok.
+        cache = getattr(optimizer, "_fused_train_cache", None)
+        if cache is None:
+            cache = {}
+            optimizer._fused_train_cache = cache
+        step = getattr(optimizer, "_fused_train_counter", 0) + 1
+        optimizer._fused_train_counter = step
+        return fused_train_step(model_name, opt_name, model, optimizer,
+                                x_batch, y_batch, state_cache=cache, step=step)
+    except TypeError as e:
+        # STALE-ABI guard (same as _try_fused_step): a pybind TypeError means the
+        # compiled _ops predates the widened fused_step signature. Degrade LOUDLY
+        # ONCE to eager; never retry.
+        if not _FUSED_ABI_STALE:
+            _FUSED_ABI_STALE = True
+            warnings.warn(
+                "fused_step ABI mismatch (stale _ops build predates the widened "
+                f"signature) — eager train steps until rebuild: {e}")
+        return None
+    except (KeyError, NotImplementedError, ValueError, RuntimeError):
+        return None
 
 # ── 1. AdamW ──────────────────────────────────────────────────────────
 def train_adamw(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
@@ -643,54 +919,97 @@ def train_adamw(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
+    mtype=c.get("model_type","decoder")
     for step in (pb:=_pbar("AdamW",c["max_steps"],bp)):
-        # Try fused kernel path
-        if _try_fused_step("transformer", "grokadamw", m, opt, tx, ty, c):
-            step += 1
-            continue
-        # Fallback: separate forward/backward/step
-        with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
-            loss=F.cross_entropy(m(tx),ty)
-        opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+        # PHASE 1 — TRUE L3 fused path for (decoder × adamw): ONE persistent
+        # megakernel runs the REAL fwd+bwd+AdamW. If it ran, it returns the loss
+        # and we SKIP the eager fwd/bwd/step entirely (the kernel already updated
+        # the params in place). eval below stays eager/unchanged. Falls back to the
+        # eager fwd+bwd + L1 fused tail when the L3-REAL kernel is unavailable
+        # (non-decoder, AMP on, unbuilt TU, non-sm_90).
+        l3_loss=_try_fused_train_step(mtype, "adamw", m, opt, tx, ty, c)
+        if l3_loss is not None:
+            loss=torch.as_tensor(l3_loss)  # for _eval_log's .item()-style logging
+        else:
+            # Real forward + backward (the megakernel L1 path is an OPTIMIZER step
+            # on the real grad — NOT a fused fwd/bwd; see _try_fused_step).
+            with _autocast(c):
+                loss=F.cross_entropy(m(tx),ty)
+            opt.zero_grad(); scaler.scale(loss).backward()
+            # Whitelisted cell (decoder/vit/mamba × adamw): the L1 fused tail
+            # applies the AdamW update in-place. On the fused path skip
+            # scaler.step(opt) (the update already happened); still call
+            # scaler.update() to advance the AMP scale.
+            if _try_fused_step(mtype, "adamw", m, opt, tx, ty, c):
+                scaler.update()
+            else:
+                scaler.step(opt); scaler.update()
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
     pb.close(); return _fin(r,st,step,t0,m,tex,tey,c["p"])
 
 # ── 2. NeuralGrok ─────────────────────────────────────────────────────
-# NOTE: The NeuralGrok amplifier MLP is trained here via aopt on the outer
-# split, but opt.step() calls the fused C++ kernel which uses a *snapshot*
-# of the amplifier weights (cached at build time).  The amplifier's
-# learned weights therefore lag behind by one step.  This is intentional:
-# the C++ kernel cannot call back into Python autograd, so the amplifier
-# must be trained separately and its updated weights are picked up on the
-# next opt.step() call when the cache is refreshed.
+# NOTE: The NeuralGrok amplifier MLP is trained here via opt.train_amplifier_
+# step on the held-out (val) split. The fused C++ kernel cannot call back into
+# Python autograd, so it consumes a DETACHED snapshot of the amplifier weights;
+# train_amplifier_step rebuilds the amplified update differentiably in Python
+# (one-step lookahead val objective, mirroring SG11.meta_step), trains the
+# amplifier, then marks the snapshot dirty so the next opt.step() re-extracts
+# the freshly-trained weights. (AUDIT A3: before this, the amplifier's outer
+# loss contained only the model — never the amplifier params — so the amplifier
+# was frozen at random init and the snapshot refresh recopied unchanged
+# weights. See NeuralGrok.train_amplifier_step for the full A3 writeup.)
 def train_neuralgrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("NeuralGrok",c); m=_load(c,dev,init)
     opt=NeuralGrok(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
         weight_decay=c["weight_decay"], alpha=c.get("neural_alpha",10.0),
-        beta=c.get("neural_beta",4.0), num_layers=c.get("neural_layers",3),
+        beta=c.get("neural_beta",4.0), num_layers=c.get("neural_layers",2),  # [A4-M6] align with OPTIMIZER_CONFIGS (kernel evaluates a 2-layer MLP)
         hidden_dim=c.get("neural_hidden",128), inner_steps=c.get("inner_steps",1),
         grad_clip=c.get("neural_grad_clip",1.0),
         use_grad_hooks=c.get("use_grad_hooks",False))
     opt.amplifier=opt.amplifier.to(dev)
+    # External amplifier optimizer, passed explicitly to train_amplifier_step.
+    # (NeuralGrok also owns an internal Adam as the AdamW-parity fallback; we
+    # keep this explicit aopt so the race's training LR for the amplifier stays
+    # visible at the call site.)
     aopt=opt.get_amplifier_optimizer(lr=1e-3)
-    ni=int(tx.size(0)*0.9); ix,ox,iy,oy = tx[:ni],tx[ni:],ty[:ni],ty[ni:]
+    crit_ng=nn.CrossEntropyLoss()
+    # Batch standardization (owner: identical batch per optimizer within a
+    # model). The old 90/10 carve-out trained the MODEL on only 90% of the
+    # train split (3772 of 4191) — the lone optimizer not at full batch. Model
+    # gradients now use the FULL train batch like every other optimizer; the
+    # amplifier's outer objective trains on the VAL split — the same held-out
+    # convention the SuperGrok bilevel/meta nets already use. Mechanism intact,
+    # batch equalized.
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("NeuralGrok",c["max_steps"],bp)):
-        # Try fused kernel path
-        if _try_fused_step("transformer", "neuralgrok", m, opt, ix, iy, c):
-            step += 1
-            continue
-        # Fallback: separate forward/backward/step
-        with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
-            loss=F.cross_entropy(m(ix),iy)
-        opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt)
-        aopt.zero_grad()
-        with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
-            aloss=c.get("neural_beta",4.0)*F.cross_entropy(m(ox),oy)
-        scaler.scale(aloss).backward(); scaler.step(aopt); scaler.update()
+        # [A4-M5] L1 fused tail integration for this optimizer requires the
+        # adamw/lion post-backward structure (see train_adamw) — do not re-add
+        # the pre-forward continue pattern (it skips side-steps and eval).
+        with _autocast(c):
+            loss=F.cross_entropy(m(tx),ty)
+        opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
+        # AUDIT A3 FIX: the old block here — aopt.zero_grad(); aloss=neural_beta*
+        # CE(m(vax),vay); scaler.scale(aloss).backward(); scaler.step(aopt) —
+        # was a PERMANENT NO-OP: aloss's graph contained only the model m, and
+        # the amplifier params were in neither that graph nor aopt-reachable
+        # autograd, so the amplifier stayed frozen at random init and the
+        # standalone mark_amplifier_dirty() refreshed unchanged weights forever.
+        # train_amplifier_step rebuilds the amplified update DIFFERENTIABLY
+        # through the amplifier (lookahead val objective, mirroring SG11.
+        # meta_step) so the amplifier actually trains; it snapshots/restores
+        # p.grad and calls mark_amplifier_dirty() itself. Grads are unscaled
+        # above (like train_supergrok) so the method reads true-scale grads.
+        # NOTE (AMP): this race defaults use_amp=False, so unscaled grads are
+        # finite here. Under AMP a non-finite grad would propagate into the
+        # amplifier objective; _component_guard catches exceptions but not a
+        # silent NaN. If AMP is ever enabled for this optimizer, add the same
+        # post-unscale isfinite skip train_supergrok uses before this call.
+        _component_guard(r, "amplifier_step", step, c, opt.train_amplifier_step,
+                         m, vax, vay, crit_ng, aopt)
+        scaler.step(opt); scaler.update()
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
@@ -701,21 +1020,41 @@ def train_grokadamw(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("GrokAdamW",c); m=_load(c,dev,init)
     opt=GrokAdamW(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
         weight_decay=c["weight_decay"], alpha=c.get("grokadamw_alpha",0.98),
-        lamb=c.get("grokadamw_lamb",5.0), gamma=c.get("grokadamw_gamma",0.1),
-        decay=c.get("grokadamw_decay",0.1), grad_clip=c.get("grokadamw_grad_clip",1.0),
+        # PUBLISHED GrokAdamW: gamma (layer-wise β1 decay) and kappa
+        # (grokking_signal_decay_rate, the α schedule rate) are WIRED mechanisms
+        # (ref cognitivecomputations/grokadamw), not dead args. train/val loss
+        # are fed below so α adapts from the grokking signal.
+        gamma=c.get("grokadamw_gamma",0.1), kappa=c.get("grokadamw_kappa",0.1),
+        lamb=c.get("grokadamw_lamb",2.0), grad_clip=c.get("grokadamw_grad_clip",1.0),
         use_grad_hooks=c.get("use_grad_hooks",False))
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
+    alpha_freq=c.get("grokadamw_alpha_update_freq",50)
     for step in (pb:=_pbar("GrokAdamW",c["max_steps"],bp)):
-        # Try fused kernel path
-        if _try_fused_step("transformer", "grokadamw", m, opt, tx, ty, c):
-            step += 1
-            continue
-        # Fallback: separate forward/backward/step
-        with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
+        # [A4-M5] L1 fused tail integration for this optimizer requires the
+        # adamw/lion post-backward structure (see train_adamw) — do not re-add
+        # the pre-forward continue pattern (it skips side-steps and eval).
+        with _autocast(c):
             loss=F.cross_entropy(m(tx),ty)
-        opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+        opt.zero_grad(); scaler.scale(loss).backward()
+        # Feed the grokking signal: train_loss every alpha_freq/eval step, val CE
+        # on the alpha cadence (mirrors the SuperGrok needs_metrics pattern). α_t
+        # = alpha_init*exp(-kappa*signal) only updates when BOTH are present.
+        kw={}
+        needs_metrics=(step%alpha_freq==0) or (step%eval_every==0) or step==1
+        if needs_metrics:
+            with torch.no_grad():
+                kw["train_loss"]=loss.item()
+            if step%alpha_freq==0:
+                with torch.no_grad():
+                    kw["val_loss"]=F.cross_entropy(m(vax),vay).item()
+        # scaler.step doesn't forward kwargs, so unscale + step directly (same as
+        # the SuperGrok loops). Fall back to a plain step on a stale optimizer.
+        scaler.unscale_(opt)
+        try: opt.step(**kw)
+        except TypeError: opt.step()
+        scaler.update()
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
@@ -727,7 +1066,7 @@ def train_supergrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     r=_tr("SuperGrok",c); m=_load(c,dev,init)
     opt=SuperGrok11(m.parameters(), lr=c["lr"], betas=(c["beta1"],c["beta2"]),
         weight_decay=c["weight_decay"], alpha_init=c.get("supergrok_alpha",0.98),
-        lamb=c.get("supergrok_lamb",5.0), gamma=c.get("supergrok_gamma",0.1),
+        lamb=c.get("supergrok_lamb",1.0), gamma=c.get("supergrok_gamma",0.1),  # [A4-M6] align with OPTIMIZER_CONFIGS (lamb=1 identity default)
         kappa=c.get("supergrok_kappa",0.1), warmup_steps=c.get("supergrok_warmup",100),
         warmup_ramp=c.get("supergrok_warmup_ramp",100),
         gradient_clipping=c.get("supergrok_grad_clip",1.0),
@@ -736,21 +1075,17 @@ def train_supergrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         zero_loss_threshold=c.get("supergrok_zero_loss_thresh",1e-4),
         zero_acc_threshold=c.get("supergrok_zero_acc_thresh",0.995),
         meta_hidden_dim=c.get("supergrok_meta_dim",32),
-        rescale_clamp=c.get("supergrok_rescale_clamp",None),
-        meta_gate_power=c.get("supergrok_meta_gate_power",None),
         use_grad_hooks=c.get("use_grad_hooks",False))
     opt.meta_net=opt.meta_net.to(dev)
-    mopt=torch.optim.Adam(opt.meta_net.parameters(), lr=1e-4)
+    mopt=torch.optim.Adam(opt.meta_net.parameters(), lr=c.get("supergrok_meta_lr",1e-4))
     crit_sg=nn.CrossEntropyLoss()
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("SuperGrok",c["max_steps"],bp)):
-        # Try fused kernel path
-        if _try_fused_step("transformer", "supergrok11", m, opt, tx, ty, c):
-            step += 1
-            continue
-        # Fallback: separate forward/backward/step
-        with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
+        # [A4-M5] L1 fused tail integration for this optimizer requires the
+        # adamw/lion post-backward structure (see train_adamw) — do not re-add
+        # the pre-forward continue pattern (it skips side-steps and eval).
+        with _autocast(c):
             logits=m(tx); loss=F.cross_entropy(logits,ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
         if c.get("use_amp", False):
@@ -758,12 +1093,10 @@ def train_supergrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
             if _has_inf:
                 scaler.update(); continue
         if step%muf==0:
-            try: opt.meta_step(m, vax, vay, crit_sg, mopt)
-            except Exception as e: warnings.warn(f"SuperGrok meta_step failed at step {step}: {e}")
+            _component_guard(r, "meta_step", step, c, opt.meta_step, m, vax, vay, crit_sg, mopt, tx, ty)
         sam_freq = max(1, muf * 2)
         if hasattr(opt, 'sam_step') and step % sam_freq == 0 and opt._get_effective_sam_freq() < 999999:
-            try: opt.sam_step(m, tx, ty, crit_sg)
-            except Exception as e: warnings.warn(f"SuperGrok sam_step failed at step {step}: {e}")
+            _component_guard(r, "sam_step", step, c, opt.sam_step, m, tx, ty, crit_sg)
         alpha_freq=c.get("supergrok_alpha_update_freq",50)
         kw={}
         needs_metrics=(step%alpha_freq==0) or (step%eval_every==0) or step==1
@@ -811,21 +1144,18 @@ def train_supergrok15(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         wd_ramp=c.get("supergrok15_wd_ramp",4.0),
         wd_scale=c.get("supergrok15_wd_scale",20.0),
         wd_thresh=c.get("supergrok15_wd_thresh",0.9),
-        meta_gate_power=c.get("supergrok15_meta_gate_power",None),
         use_grad_hooks=c.get("use_grad_hooks",False))
     opt.meta_net=opt.meta_net.to(dev)
-    mopt=torch.optim.Adam(opt.meta_net.parameters(), lr=1e-4)
+    mopt=torch.optim.Adam(opt.meta_net.parameters(), lr=c.get("supergrok15_meta_lr",1e-4))
     crit_s15=nn.CrossEntropyLoss()
     alpha_freq=c.get("supergrok15_alpha_update_freq",50)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("SuperGrok1.5",c["max_steps"],bp)):
-        # Try fused kernel path
-        if _try_fused_step("transformer", "supergrok15", m, opt, tx, ty, c):
-            step += 1
-            continue
-        # Fallback: separate forward/backward/step
-        with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
+        # [A4-M5] L1 fused tail integration for this optimizer requires the
+        # adamw/lion post-backward structure (see train_adamw) — do not re-add
+        # the pre-forward continue pattern (it skips side-steps and eval).
+        with _autocast(c):
             logits=m(tx); loss=F.cross_entropy(logits,ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
         if c.get("use_amp", False):
@@ -834,12 +1164,10 @@ def train_supergrok15(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
                 scaler.update(); continue
         sam_freq_eff=opt._get_effective_sam_freq()
         if sam_freq_eff < 999999 and step%sam_freq_eff==0:
-            try: opt.sam_step(m, tx, ty, crit_s15)
-            except Exception as e: warnings.warn(f"SuperGrok1.5 sam_step failed at step {step}: {e}")
+            _component_guard(r, "sam_step", step, c, opt.sam_step, m, tx, ty, crit_s15)
         bilevel_freq_eff=opt._get_effective_bilevel_freq()
         if step%bilevel_freq_eff==0:
-            try: opt.bilevel_step(m, tx, ty, vax, vay, crit_s15, mopt)
-            except Exception as e: warnings.warn(f"SuperGrok1.5 bilevel_step failed at step {step}: {e}")
+            _component_guard(r, "bilevel_step", step, c, opt.bilevel_step, m, tx, ty, vax, vay, crit_s15, mopt)
         kw={}
         needs_metrics=(step%alpha_freq==0) or (step%eval_every==0) or step==1
         if needs_metrics:
@@ -890,21 +1218,18 @@ def train_supergrok2(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         wd_ramp=c.get("sg2_wd_ramp",4.0), wd_scale=c.get("sg2_wd_scale",20.0),
         wd_thresh=c.get("sg2_wd_thresh",0.9),
         sam_enable_threshold=c.get("sg2_sam_enable_threshold",0.0),
-        meta_gate_power=c.get("sg2_meta_gate_power",None),
         use_grad_hooks=c.get("use_grad_hooks",False))
     opt.meta_net=opt.meta_net.to(dev)
-    mopt=torch.optim.Adam(opt.meta_net.parameters(), lr=1e-4)
+    mopt=torch.optim.Adam(opt.meta_net.parameters(), lr=c.get("sg2_meta_lr",1e-4))
     crit_s2=nn.CrossEntropyLoss()
     alpha_freq=c.get("sg2_alpha_update_freq",50)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("SuperGrok2",c["max_steps"],bp)):
-        # Try fused kernel path
-        if _try_fused_step("transformer", "supergrok2", m, opt, tx, ty, c):
-            step += 1
-            continue
-        # Fallback: separate forward/backward/step
-        with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
+        # [A4-M5] L1 fused tail integration for this optimizer requires the
+        # adamw/lion post-backward structure (see train_adamw) — do not re-add
+        # the pre-forward continue pattern (it skips side-steps and eval).
+        with _autocast(c):
             logits=m(tx); loss=F.cross_entropy(logits,ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
         if c.get("use_amp", False):
@@ -913,12 +1238,10 @@ def train_supergrok2(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
                 scaler.update(); continue
         sam_freq_eff=opt._get_effective_sam_freq()
         if sam_freq_eff < 999999 and step%sam_freq_eff==0:
-            try: opt.sam_step(m, tx, ty, crit_s2)
-            except Exception as e: warnings.warn(f"SuperGrok2 sam_step failed at step {step}: {e}")
+            _component_guard(r, "sam_step", step, c, opt.sam_step, m, tx, ty, crit_s2)
         bilevel_freq_eff=opt._get_effective_bilevel_freq()
         if step%bilevel_freq_eff==0:
-            try: opt.bilevel_step(m, tx, ty, vax, vay, crit_s2, mopt)
-            except Exception as e: warnings.warn(f"SuperGrok2 bilevel_step failed at step {step}: {e}")
+            _component_guard(r, "bilevel_step", step, c, opt.bilevel_step, m, tx, ty, vax, vay, crit_s2, mopt)
         kw={}
         needs_metrics=(step%alpha_freq==0) or (step%eval_every==0) or step==1
         if needs_metrics:
@@ -949,12 +1272,10 @@ def train_grokfast(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("Grokfast",c["max_steps"],bp)):
-        # Try fused kernel path
-        if _try_fused_step("transformer", "grokfast", m, opt, tx, ty, c):
-            step += 1
-            continue
-        # Fallback: separate forward/backward/step
-        with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
+        # [A4-M5] L1 fused tail integration for this optimizer requires the
+        # adamw/lion post-backward structure (see train_adamw) — do not re-add
+        # the pre-forward continue pattern (it skips side-steps and eval).
+        with _autocast(c):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
         if step%eval_every==0 or step==1:
@@ -977,12 +1298,10 @@ def train_muon(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("Muon",c["max_steps"],bp)):
-        # Try fused kernel path
-        if _try_fused_step("transformer", "muon", m, opt, tx, ty, c):
-            step += 1
-            continue
-        # Fallback: separate forward/backward/step
-        with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
+        # [A4-M5] L1 fused tail integration for this optimizer requires the
+        # adamw/lion post-backward structure (see train_adamw) — do not re-add
+        # the pre-forward continue pattern (it skips side-steps and eval).
+        with _autocast(c):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
         if step%eval_every==0 or step==1:
@@ -1000,14 +1319,15 @@ def train_lion(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("Lion",c["max_steps"],bp)):
-        # Try fused kernel path
-        if _try_fused_step("transformer", "lion", m, opt, tx, ty, c):
-            step += 1
-            continue
-        # Fallback: separate forward/backward/step
-        with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
+        # Real forward + backward; the whitelisted L1 fused tail applies the Lion
+        # update on the real grad (lion uses only the m=exp_avg slice of [m|v|extra]).
+        with _autocast(c):
             loss=F.cross_entropy(m(tx),ty)
-        opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+        opt.zero_grad(); scaler.scale(loss).backward()
+        if _try_fused_step(c.get("model_type","decoder"), "lion", m, opt, tx, ty, c):
+            scaler.update()           # fused path: skip scaler.step(opt)
+        else:
+            scaler.step(opt); scaler.update()
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
@@ -1025,12 +1345,10 @@ def train_looksam(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("LookSAM",c["max_steps"],bp)):
-        # Try fused kernel path
-        if _try_fused_step("transformer", "looksam", m, opt, tx, ty, c):
-            step += 1
-            continue
-        # Fallback: separate forward/backward/step
-        with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
+        # [A4-M5] L1 fused tail integration for this optimizer requires the
+        # adamw/lion post-backward structure (see train_adamw) — do not re-add
+        # the pre-forward continue pattern (it skips side-steps and eval).
+        with _autocast(c):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
         if c.get("use_amp", False):
@@ -1055,12 +1373,10 @@ def train_prodigy(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     for step in (pb:=_pbar("Prodigy",c["max_steps"],bp)):
-        # Try fused kernel path
-        if _try_fused_step("transformer", "prodigy", m, opt, tx, ty, c):
-            step += 1
-            continue
-        # Fallback: separate forward/backward/step
-        with torch.amp.autocast('cuda', enabled=c.get("use_amp",False)):
+        # [A4-M5] L1 fused tail integration for this optimizer requires the
+        # adamw/lion post-backward structure (see train_adamw) — do not re-add
+        # the pre-forward continue pattern (it skips side-steps and eval).
+        with _autocast(c):
             loss=F.cross_entropy(m(tx),ty)
         opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
         if step%eval_every==0 or step==1:
@@ -1104,10 +1420,33 @@ def _ema_smooth(values, alpha=0.9):
         smoothed.append(alpha * smoothed[-1] + (1 - alpha) * v)
     return smoothed
 
+def _is_crashed(r):
+    """[A4-H3] A stub crash result has no recorded curve (steps==[]) and a
+    CRASHED: stopping_reason — distinguish it from a genuine DNF (which has a
+    full curve but never grokked)."""
+    return (not r.steps) and isinstance(r.stopping_reason, str) and r.stopping_reason.startswith("CRASHED:")
+
+def _live(runs):
+    """[A4-H3] Drop crash stubs (steps==[] / CRASHED reason) from a runs list so
+    curve/bar aggregations operate only on runs that actually produced data;
+    crashes are counted separately (save_json _meta.crashes, print_summary)."""
+    return [r for r in runs if not _is_crashed(r)]
+
+def _grok_rate(runs):
+    """[A4-H3] Grok success rate over LIVE runs (crash stubs excluded from both
+    numerator and denominator); np.nan when every seed crashed so the heatmap
+    renders it as 0 via nan_to_num rather than dividing by zero."""
+    lv=_live(runs)
+    if not lv: return float("nan")
+    return sum(1 for r in lv if r.grokking_step)/len(lv)
+
 def _interpolate_runs(runs, attr, num_points=500):
     """Interpolate multiple runs onto a common step grid, return mean ± std."""
+    runs = _live(runs)  # [A4-H3] skip crashed runs (empty curves)
     if not runs: return [], [], []
-    max_step = max(r.steps[-1] for r in runs if r.steps)
+    steps_avail = [r.steps[-1] for r in runs if r.steps]
+    if not steps_avail: return [], [], []
+    max_step = max(steps_avail)
     if max_step == 0: return [], [], []
     common_steps = np.linspace(0, max_step, num_points)
     interpolated = []
@@ -1154,13 +1493,19 @@ def plot_comparison(rbo, save_dir="results", thresh=0.95, ft=0.5, model_type="de
     plt.tight_layout(); plt.savefig(os.path.join(save_dir,f"curves{suffix}.png"), dpi=150, bbox_inches="tight"); plt.close()
 
     # ── Race bar chart ──────────────────────────────────────────────
-    ns = sorted(rbo.keys(), key=lambda n: np.mean([r.grokking_wall or r.wall_time for r in rbo[n]]))
+    # [A4-H3] rank/aggregate over LIVE runs only (crash stubs have empty curves);
+    # a name with only crashes sorts last (1e9) and renders a zero bar.
+    def _gw_key(n):
+        lv=_live(rbo[n]); return np.mean([r.grokking_wall or r.wall_time for r in lv]) if lv else 1e9
+    ns = sorted(rbo.keys(), key=_gw_key)
     fig2,(ax1,ax2) = plt.subplots(1,2,figsize=(18,6))
     fig2.suptitle(f"Grokking Race — {mt_label}  [{task_label}] | split={ft*100:.0f}/{(1-ft)*100:.0f}", fontsize=13, fontweight="bold")
     for i,name in enumerate(ns):
-        runs=rbo[name]; wt=[r.grokking_wall or r.wall_time for r in runs]; gs=[r.grokking_step or r.total_steps for r in runs]
+        runs=_live(rbo[name])
+        wt=[r.grokking_wall or r.wall_time for r in runs] or [0.0]
+        gs=[r.grokking_step or r.total_steps for r in runs] or [0]
         clr=COLORS.get(name,"#888888"); dname=DISPLAY_NAMES.get(name,name)
-        nogrok=any(r.grokking_wall is None for r in runs)
+        nogrok=any(r.grokking_wall is None for r in runs) or not runs
         ax1.barh(i, np.mean(wt), xerr=np.std(wt) if len(wt)>1 else 0, color=clr, edgecolor="black", alpha=0.85, capsize=4)
         ax1.text(np.mean(wt)+(np.std(wt) if len(wt)>1 else 0)+0.3, i, f"{np.mean(wt):.1f}s"+(" ✗" if nogrok else " ✓"), va="center", fontsize=9)
         ax2.barh(i, np.mean(gs), xerr=np.std(gs) if len(gs)>1 else 0, color=clr, edgecolor="black", alpha=0.85, capsize=4)
@@ -1173,39 +1518,79 @@ def plot_comparison(rbo, save_dir="results", thresh=0.95, ft=0.5, model_type="de
 def print_summary(rbo, total_wall=None, model_type="decoder", frac_train=0.5):
     w=105; mt_label=MODEL_LABELS.get(model_type,model_type)
     print("\n"+"="*w); print(f"  🏁  GROKKING RACE — {mt_label} | split={frac_train*100:.0f}/{(1-frac_train)*100:.0f}"); print("="*w)
-    ranked=sorted(rbo.items(), key=lambda kv: np.mean([r.grokking_wall or 1e9 for r in kv[1]]))
-    multi=any(len(v)>1 for v in rbo.values())
+    # [A4-H3] rank/aggregate over LIVE runs (crash stubs excluded); a name with
+    # only crashes sorts last. Crash counts are reported loudly below the table.
+    crash_counts={name: sum(1 for r in runs if _is_crashed(r)) for name,runs in rbo.items()}
+    def _rank_key(kv):
+        lv=_live(kv[1]); return np.mean([r.grokking_wall or 1e9 for r in lv]) if lv else 1e9
+    ranked=sorted(rbo.items(), key=_rank_key)
+    multi=any(len(_live(v))>1 for v in rbo.values())
     hdr=f"  {'#':>2} {'Optimizer':<14} {'Grok Wall (s)':>14} {'Grok Steps':>12} {'Total Steps':>12} {'Val Acc':>9} {'Status':>8}"
     if multi: hdr+=f" {'Seeds':>6}"
     print(hdr); print("  "+"-"*(w-2))
     medals=["🥇","🥈","🥉"]+["  "]*20
     for rank,(name,runs) in enumerate(ranked):
         dname=DISPLAY_NAMES.get(name,name)
-        gw=[r.grokking_wall or r.wall_time for r in runs]; va=[r.final_val_acc for r in runs]
-        nogrok=any(r.grokking_wall is None for r in runs)
+        lv=_live(runs)
+        if not lv:
+            # All seeds crashed — show CRASHED row, skip the (undefined) stats.
+            line=f"  {medals[rank]} {dname:<14} {'—':>14} {'—':>12} {'—':>12} {'—':>9} {'✗ CRASH':>8}"
+            if multi: line+=f" {len(runs):>6}"
+            print(line); continue
+        gw=[r.grokking_wall or r.wall_time for r in lv]; va=[r.final_val_acc for r in lv]
+        nogrok=any(r.grokking_wall is None for r in lv)
         line=(f"  {medals[rank]} {dname:<14} {np.mean(gw):>14.2f} "
-              f"{np.mean([r.grokking_step or r.total_steps for r in runs]):>12,.0f} "
-              f"{np.mean([r.total_steps for r in runs]):>12,.0f} "
+              f"{np.mean([r.grokking_step or r.total_steps for r in lv]):>12,.0f} "
+              f"{np.mean([r.total_steps for r in lv]):>12,.0f} "
               f"{np.mean(va):>9.4f} {'✗ DNF' if nogrok else '✓ GROK':>8}")
-        if multi: line+=f" {len(runs):>6}"
+        if multi: line+=f" {len(lv):>6}"
         print(line)
     print("  "+"-"*(w-2))
+    # [A4-H3] LOUD per-optimizer crash count — a crashed config must never hide.
+    total_crashes=sum(crash_counts.values())
+    if total_crashes:
+        print(f"  ⚠ CRASHES ({total_crashes} run(s) crashed — counted, excluded from stats above):")
+        for name in sorted(crash_counts):
+            if crash_counts[name]:
+                ex=next((r.stopping_reason for r in rbo[name] if _is_crashed(r)), "")
+                print(f"      ✗ {DISPLAY_NAMES.get(name,name):<14} {crash_counts[name]} crash(es)   e.g. {ex}")
+        print("  "+"-"*(w-2))
     if total_wall: print(f"  Pipeline wall: {total_wall:.1f}s"); print("="*w)
+
+def _crash_stub(name, cfg, exc):
+    """[A4-H3] Build a stub TrainResult for a run that CRASHED so it is counted,
+    not dropped. Empty curves, total_steps=0, stopping_reason carries the
+    exception. Every results-list consumer guards on steps==[] (see _is_crashed,
+    print_summary, plot_comparison, _interpolate_runs, _plot_full_sweep)."""
+    r = _tr(name, cfg)
+    r.stopping_reason = f"CRASHED: {type(exc).__name__}: {exc}"[:300]
+    r.total_steps = 0
+    return r
 
 def save_json(rbo, save_dir="results", total_wall=None, model_type="decoder", frac_train=0.5):
     os.makedirs(save_dir, exist_ok=True)
-    d={"_meta":{"total_wall":total_wall,"model_type":model_type,"frac_train":frac_train}}
+    # [A4-M4] record the default matmul precision policy; [A4-H3] per-optimizer
+    # crash counts so a crashed config is COUNTED, never silently dropped.
+    crashes={name: sum(1 for r in runs if _is_crashed(r)) for name,runs in rbo.items()}
+    d={"_meta":{"total_wall":total_wall,"model_type":model_type,"frac_train":frac_train,
+                "matmul_precision_default":DEFAULT_CONFIG.get("matmul_precision"),
+                "crashes":crashes}}
     for name,runs in rbo.items():
         d[name]=[{"seed":r.seed,"steps":r.steps,"train_losses":r.train_losses,"train_accs":r.train_accs,
             "val_losses":r.val_losses,"val_accs":r.val_accs,
             "test_losses":r.test_losses,"test_accs":r.test_accs,
             "wall_time":r.wall_time,"total_steps":r.total_steps,
             "grokking_step":r.grokking_step,"grokking_wall":r.grokking_wall,
+            "grokking_step_test_confirmed":r.grokking_step_test_confirmed,  # [A4-M3]
+            "best_metric_acc":r.best_metric_acc,  # [A4-M2]
             "final_val_acc":r.final_val_acc,"final_train_acc":r.final_train_acc,
             "final_test_acc":r.final_test_acc,"final_test_loss":r.final_test_loss,
             "final_val_loss":r.final_val_loss,"stopping_reason":r.stopping_reason,
             "stopping_step":r.stopping_step,"val_test_gap":r.val_test_gap,
             "val_ratio":r.val_ratio,
+            "component_failures":dict(getattr(r,"component_failures",{}) or {}),  # [A4-H2]
+            "matmul_precision":r.matmul_precision,  # [A4-M4]
+            "use_amp":bool(r.use_amp),  # [A4-M4]
             "model_type":r.model_type,"frac_train":r.frac_train} for r in runs]
     with open(os.path.join(save_dir,f"results_{model_type}_ft{int(frac_train*100)}.json"),"w") as f:
         json.dump(d,f,indent=2)
@@ -1261,7 +1646,9 @@ def _gpu_worker(gpu_id, task_queue, base, merged, result_queue, worker_id):
             except Exception as e:
                 import traceback; traceback.print_exc()
                 print(f"  [GPU {gpu_id}] ✗ {name} seed={s} FAILED: {e}")
-                result_queue.put((name, s, None))
+                # [A4-H3] send a CRASH STUB (empty curves) instead of None so the
+                # collector counts the crash rather than dropping the run.
+                result_queue.put((name, s, _crash_stub(name, cfg, e)))
 
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -1271,14 +1658,15 @@ def _gpu_worker(gpu_id, task_queue, base, merged, result_queue, worker_id):
 # ── run_pipeline ──────────────────────────────────────────────────────
 def run_pipeline(optimizers=None, optimizer_configs=None, seeds=None,
                  compile_model=False, parallel=True, max_steps=None,
-                 lr=None, weight_decay=None, threshold=None, log_every=None,
+                 lr=None, weight_decay=None, threshold=None,
                  frac_train=None, val_ratio=None, seed=None, device_str=None,
                  save_dir="results", model_type=None, gpu_ids=None,
                  use_amp=False, model_scale=None,
                  early_stop_max_steps=None, eval_every=None):
     base=dict(DEFAULT_CONFIG)
+    # [A4-M8] log_every dropped: dead config key, never read by any train loop.
     for k,v in [("max_steps",max_steps),("lr",lr),("weight_decay",weight_decay),
-                ("early_stop_threshold",threshold),("log_every",log_every),
+                ("early_stop_threshold",threshold),
                 ("frac_train",frac_train),("val_ratio",val_ratio),("seed",seed),
                 ("model_type",model_type),("early_stop_max_steps",early_stop_max_steps),
                 ("eval_every",eval_every)]:
@@ -1379,7 +1767,11 @@ def run_pipeline(optimizers=None, optimizer_configs=None, seeds=None,
             try:
                 name, s, res = result_queue.get(timeout=7200)  # 2hr max per task
                 received += 1
-                if res is not None:
+                # [A4-H3] crash stubs (and any None from a legacy worker) are
+                # COUNTED, never dropped: stubs go into results_by_opt so the
+                # JSON summary's per-optimizer crash count sees them, but they
+                # are logged as errors (not "completed") in the progress board.
+                if res is not None and not _is_crashed(res):
                     results_by_opt[name].append(res)
                     grokked = res.grokking_step is not None
                     with _PROGRESS_LOCK:
@@ -1392,8 +1784,11 @@ def run_pipeline(optimizers=None, optimizer_configs=None, seeds=None,
                         _ntfy(f"✓ {name} grokked at step {res.grokking_step} ({res.grokking_wall:.1f}s) | {mt} ft={base['frac_train']} seed={s}",
                                title="Grokked!", tags="white_check_mark")
                 else:
+                    if res is not None:
+                        results_by_opt[name].append(res)  # keep the crash stub for the count
+                    reason = res.stopping_reason if res is not None else "worker returned None"
                     with _PROGRESS_LOCK:
-                        _PROGRESS["errors"].append({"name":name, "seed":s, "error":"worker returned None"})
+                        _PROGRESS["errors"].append({"name":name, "seed":s, "error":reason})
                 _update_progress(current_run=received, current_task=f"[multi-GPU] {received}/{total_tasks}")
             except Exception as e:
                 print(f"  ✗ Queue error: {e}")
@@ -1445,7 +1840,10 @@ def run_pipeline(optimizers=None, optimizer_configs=None, seeds=None,
                 with _PROGRESS_LOCK:
                     _PROGRESS["errors"].append({"name":name, "seed":s, "error":str(e)})
                 _ntfy(f"⚠ {name} FAILED: {e} | {mt} seed={s}", title="Error", priority="high", tags="warning")
-                return (name, None)
+                # [A4-H3] return a CRASH STUB (empty curves) instead of dropping
+                # the run, so the crash is counted in the summary/JSON and never
+                # silently vanishes. cfg carries this run's model_type/ft/val_ratio.
+                return (name, _crash_stub(name, cfg, e))
 
         run_idx = _PROGRESS.get("current_run", 0)
         for n,s in tasks:
@@ -1515,8 +1913,9 @@ def _plot_split_comparison(all_results, save_dir, model_type):
     for si,ft in enumerate(splits):
         rbo=all_results[ft]; walls=[]; stps=[]
         for name in all_opts:
-            if name in rbo:
-                runs=rbo[name]; walls.append(np.mean([r.grokking_wall or r.wall_time for r in runs]))
+            runs=_live(rbo[name]) if name in rbo else []  # [A4-H3] crash stubs excluded
+            if runs:
+                walls.append(np.mean([r.grokking_wall or r.wall_time for r in runs]))
                 stps.append(np.mean([r.grokking_step or r.total_steps for r in runs]))
             else: walls.append(0); stps.append(0)
         off=(si-ns_/2+0.5)*bw
@@ -1530,7 +1929,7 @@ def _plot_split_comparison(all_results, save_dir, model_type):
     for si,ft in enumerate(splits):
         rbo=all_results[ft]
         for oi,name in enumerate(all_opts):
-            if name in rbo: runs=rbo[name]; gm[oi,si]=sum(1 for r in runs if r.grokking_step)/len(runs)
+            if name in rbo: runs=rbo[name]; gm[oi,si]=np.nan_to_num(_grok_rate(runs))  # [A4-H3] live-only, NaN→0
     im=ax3.imshow(gm,cmap="RdYlGn",aspect="auto",vmin=0,vmax=1)
     ax3.set_xticks(range(ns_)); ax3.set_xticklabels([f"{ft*100:.0f}/{(1-ft)*100:.0f}" for ft in splits])
     ax3.set_yticks(range(no)); ax3.set_yticklabels([DISPLAY_NAMES.get(n,n) for n in all_opts])
@@ -1553,8 +1952,9 @@ def _plot_architecture_comparison(all_results, save_dir, frac_train):
     for mi,mt in enumerate(mts):
         rbo=all_results[mt]; walls=[]; stps=[]
         for name in all_opts:
-            if name in rbo:
-                runs=rbo[name]; walls.append(np.mean([r.grokking_wall or r.wall_time for r in runs]))
+            runs=_live(rbo[name]) if name in rbo else []  # [A4-H3] crash stubs excluded
+            if runs:
+                walls.append(np.mean([r.grokking_wall or r.wall_time for r in runs]))
                 stps.append(np.mean([r.grokking_step or r.total_steps for r in runs]))
             else: walls.append(0); stps.append(0)
         off=(mi-nm/2+0.5)*bw
@@ -1585,7 +1985,7 @@ def _plot_architecture_comparison(all_results, save_dir, frac_train):
     for mi,mt in enumerate(mts):
         rbo=all_results[mt]
         for oi,name in enumerate(all_opts):
-            if name in rbo: runs=rbo[name]; gm[oi,mi]=sum(1 for r in runs if r.grokking_step)/len(runs)
+            if name in rbo: runs=rbo[name]; gm[oi,mi]=np.nan_to_num(_grok_rate(runs))  # [A4-H3] live-only, NaN→0
     im=ax3.imshow(gm,cmap="RdYlGn",aspect="auto",vmin=0,vmax=1)
     ax3.set_xticks(range(nm)); ax3.set_xticklabels([MODEL_LABELS.get(mt,mt) for mt in mts],fontsize=8)
     ax3.set_yticks(range(no)); ax3.set_yticklabels([DISPLAY_NAMES.get(n,n) for n in all_opts])
@@ -1610,7 +2010,7 @@ def _plot_full_sweep(all_results, save_dir, splits, model_types):
             if key in all_results:
                 rbo=all_results[key]
                 for oi,name in enumerate(all_opts):
-                    if name in rbo: runs=rbo[name]; gm[oi,ci]=sum(1 for r in runs if r.grokking_step)/len(runs)
+                    if name in rbo: runs=rbo[name]; gm[oi,ci]=_grok_rate(runs)  # [A4-H3] live-only (NaN if all crashed; nan_to_num at imshow)
     fig,ax=plt.subplots(figsize=(max(14,nc*1.2),max(6,no*0.5)))
     im=ax.imshow(np.nan_to_num(gm,nan=0),cmap="RdYlGn",aspect="auto",vmin=0,vmax=1)
     ax.set_xticks(range(nc)); ax.set_xticklabels(cl,rotation=45,ha="right",fontsize=8)
@@ -1635,6 +2035,104 @@ def _plot_full_sweep(all_results, save_dir, splits, model_types):
 #  Just change MODE below. No commenting/uncommenting needed.
 # ═══════════════════════════════════════════════════════════════════════
 
+# Per-optimizer hyperparameter base configs (module-level so the offline
+# tuner in tuning/ can import them; __main__ uses the same object).
+OPTIMIZER_CONFIGS = {
+    "adamw":      {"weight_decay": 1.0},
+    "neuralgrok": {"weight_decay": 1.0, "neural_alpha": 10.0, "neural_beta": 4.0,
+                   # neural_layers=2 matches the CUDA kernel's documented contract
+                   # (neuralgrok.py get_weights: "C++ kernel only evaluates a
+                   # 2-layer MLP ... Set num_layers=2 for exact CUDA/Python
+                   # parity"). The old value 3 silently trained a 3-layer net
+                   # while the kernel applied an incoherent first+last sandwich.
+                   #
+                   # neural_hidden=16 is a CONSERVATIVE parity choice that makes
+                   # the trained net == the deployed net under EITHER reading of
+                   # the kernel. Evidence: the only neuralgrok_psi_forward
+                   # instantiation visible in the tree is the MEGA path's
+                   # <kPsiHidden=16> (csrc/fused/sm_90/opt_components.cuh:61/225,
+                   # "Matches the per-op neuralgrok kernel's default
+                   # instantiation"; mega cells pack exactly 3*kPsiHidden+1
+                   # floats). The path step() actually binds —
+                   # launch_fused_neuralgrok_full_step (bindings.cpp:1085/1108)
+                   # — receives hidden_dim as a RUNTIME arg (:1110) but has NO
+                   # in-tree definition, so whether it is pinned to 16 or loops
+                   # over runtime hidden_dim is NOT source-confirmable here (and
+                   # with no-builds, not empirically either). 16 sidesteps the
+                   # question: if pinned-16, it matches the pin; if runtime, we
+                   # now pass 16. The old 128 was safe ONLY under the runtime
+                   # reading — under a 16-pin it silently truncated 128→16, the
+                   # same train/deploy split as the A3 defect (one layer down),
+                   # which is the asymmetry that makes 16 the safe choice now
+                   # that the A3 amplifier-training fix is LIVE. NOTE: this
+                   # parity is CONFIG-enforced, not class-enforced — the
+                   # NeuralGrok ctor default stays hidden_dim=128, so direct
+                   # construction outside this config still builds a 128-wide net.
+                   "neural_layers": 2, "neural_hidden": 16, "inner_steps": 1},
+    "grokadamw":  {"weight_decay": 1.0, "grokadamw_alpha": 0.98, "grokadamw_lamb": 2.0,
+                   # PUBLISHED GrokAdamW (cognitivecomputations/grokadamw): gamma
+                   # is the LAYER-WISE β1 decay (β1_i = β1*(1-gamma)**i) and kappa
+                   # is grokking_signal_decay_rate (α schedule). Both WIRED now —
+                   # gamma drives per-tensor β1 in the binding; kappa drives the
+                   # grokking-signal α in step(). Reference defaults: gamma 0.1,
+                   # kappa 0.1, lamb 2.0.
+                   "grokadamw_gamma": 0.1, "grokadamw_kappa": 0.1,
+                   "grokadamw_alpha_update_freq": 50,
+                   "grokadamw_grad_clip": 1.0},
+    "supergrok":  {"weight_decay": 1.0, "supergrok_alpha": 0.98, "supergrok_lamb": 1.0,  # identity default: lamb is now a live multiplier (lamb=1 ⇒ prior validated (1-gate)*alpha behavior); the tuner explores the dial.
+                   "supergrok_gamma": 0.1, "supergrok_kappa": 0.1, "supergrok_warmup": 100,
+                   "supergrok_warmup_ramp": 100, "supergrok_grad_clip": 1.0,
+                   "supergrok_meta_dim": 32, "supergrok_gate_temp": 5.0,
+                   "supergrok_alpha_update_freq": 50, "supergrok_meta_update_freq": 5,
+                   "supergrok_zero_loss_thresh": 1e-4, "supergrok_zero_acc_thresh": 0.995},
+                   # (the meta_gate_power suppression ratchet was REMOVED from the
+                   # SuperGroks entirely — owner no-suppression directive; the
+                   # two-term lookahead meta objective replaces it)
+    "supergrok15":{"weight_decay": 1.0, "supergrok15_alpha": 0.98, "supergrok15_lamb": 2.0,
+                   "supergrok15_gamma": 0.1, "supergrok15_kappa": 0.1, "supergrok15_warmup": 100,
+                   "supergrok15_warmup_ramp": 100, "supergrok15_grad_clip": 1.0,
+                   "supergrok15_meta_dim": 32, "supergrok15_alpha_update_freq": 50,
+                   "supergrok15_zero_loss_thresh": 1e-4, "supergrok15_zero_acc_thresh": 0.995,
+                   "supergrok15_sam_rho": 0.05,
+                   "supergrok15_gate_scale": 20.0, "supergrok15_gate_thresh": 0.8,
+                   "supergrok15_sam_freq_min": 3, "supergrok15_sam_freq_max": 20,
+                   "supergrok15_sam_scale": 20.0, "supergrok15_sam_thresh": 0.85,
+                   "supergrok15_bilevel_freq_min": 5, "supergrok15_bilevel_freq_max": 30,
+                   "supergrok15_bilevel_scale": 20.0, "supergrok15_bilevel_thresh": 0.9,
+                   "supergrok15_wd_ramp": 4.0, "supergrok15_wd_scale": 20.0,
+                   "supergrok15_wd_thresh": 0.9},
+    "supergrok2": {"weight_decay": 1.0, "sg2_alpha": 0.98, "sg2_lamb": 2.0,
+                   "sg2_gamma": 0.1, "sg2_kappa": 0.1, "sg2_warmup": 100,
+                   "sg2_warmup_ramp": 100, "sg2_grad_clip": 1.0,
+                   # Key-name truth fix (audit): the four architecture entries
+                   # here previously used names train_supergrok2 never reads, so
+                   # they were silently IGNORED and SG2 always ran constructor
+                   # defaults. Renamed to the real keys with the values that
+                   # actually ran (d_model=8, 144 experts, gru_hidden=4) to keep
+                   # continuity with every validated SG2 result; raising them
+                   # (e.g. 1024 experts, the old intent) is a deliberate
+                   # architecture change for the owner to opt into.
+                   "sg2_d_model": 8, "sg2_num_experts": 144,
+                   "sg2_expert_hidden": 16, "sg2_gru_hidden": 4,
+                   "sg2_num_peer_heads": 4, "sg2_meta_rescale": 0.1,
+                   "sg2_alpha_update_freq": 50,
+                   "sg2_zero_loss_thresh": 1e-4, "sg2_zero_acc_thresh": 0.995,
+                   "sg2_sam_rho": 0.05,
+                   "sg2_gate_scale": 20.0, "sg2_gate_thresh": 0.8,
+                   "sg2_sam_freq_min": 3, "sg2_sam_freq_max": 20,
+                   "sg2_sam_scale": 20.0, "sg2_sam_thresh": 0.85,
+                   "sg2_bilevel_freq_min": 5, "sg2_bilevel_freq_max": 30,
+                   "sg2_bilevel_scale": 20.0, "sg2_bilevel_thresh": 0.9,
+                   "sg2_wd_ramp": 4.0, "sg2_wd_scale": 20.0,
+                   "sg2_wd_thresh": 0.9, "sg2_sam_enable_threshold": 0.0},
+    "grokfast":   {"weight_decay": 1.0, "grokfast_alpha": 0.98, "grokfast_lamb": 2.0},
+    "muon":       {"weight_decay": 1.0, "muon_lr": 0.02, "muon_momentum": 0.95},
+    "lion":       {"lion_lr": 3e-4, "lion_wd": 3.0},
+    "looksam":    {"weight_decay": 1.0, "looksam_rho": 0.05, "looksam_k": 5,
+                   "looksam_alpha": 0.7},
+    "prodigy":    {"weight_decay": 1.0, "prodigy_lr": 1.0},
+}
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Grokking Race — GCP VM Edition (Multi-GPU)")
     parser.add_argument("--setup", action="store_true", help="Install dependencies and exit")
@@ -1656,8 +2154,13 @@ if __name__ == "__main__":
                         help="Test accuracy threshold for early stopping (default: 0.95)")
     parser.add_argument("--early-stop-max-steps", type=int, default=20000,
                         help="Max steps before forced stop (default: 20000)")
-    parser.add_argument("--eval-every", type=int, default=100,
-                        help="Evaluate val accuracy every N steps (default: 100)")
+    parser.add_argument("--eval-every", type=int, default=10,
+                        # [A4-H1] default 100→10 (owner: track metrics every 10
+                        # gradient steps). The old argparse default 100 silently
+                        # overrode DEFAULT_CONFIG's eval_every=10 (argparse always
+                        # sets DEFAULT_CONFIG["eval_every"] below), so the race
+                        # only evaluated every 100 steps despite the directive.
+                        help="Evaluate val accuracy every N steps (default: 10)")
     parser.add_argument("--optimizers", type=str, default=None,
                         help="Comma-separated optimizer names to run (default: all 11)")
     parser.add_argument("--seeds", type=str, default=None,
@@ -1731,56 +2234,7 @@ if __name__ == "__main__":
     MODE = "D"
 
     # ── Per-optimizer hyperparameters ─────────────────────────────────
-    optimizer_configs = {
-        "adamw":      {"weight_decay": 1.0},
-        "neuralgrok": {"weight_decay": 1.0, "neural_alpha": 10.0, "neural_beta": 4.0,
-                       "neural_layers": 3, "neural_hidden": 128, "inner_steps": 1},
-        "grokadamw":  {"weight_decay": 1.0, "grokadamw_alpha": 0.98, "grokadamw_lamb": 5.0,
-                       "grokadamw_gamma": 0.1, "grokadamw_decay": 0.1, "grokadamw_grad_clip": 1.0},
-        "supergrok":  {"weight_decay": 1.0, "supergrok_alpha": 0.98, "supergrok_lamb": 5.0,
-                       "supergrok_gamma": 0.1, "supergrok_kappa": 0.1, "supergrok_warmup": 100,
-                       "supergrok_warmup_ramp": 100, "supergrok_grad_clip": 1.0,
-                       "supergrok_meta_dim": 32, "supergrok_gate_temp": 5.0,
-                       "supergrok_alpha_update_freq": 50, "supergrok_meta_update_freq": 5,
-                       "supergrok_zero_loss_thresh": 1e-4, "supergrok_zero_acc_thresh": 0.995,
-                       "supergrok_meta_gate_power": 1.0},
-        "supergrok15":{"weight_decay": 1.0, "supergrok15_alpha": 0.98, "supergrok15_lamb": 2.0,
-                       "supergrok15_gamma": 0.1, "supergrok15_kappa": 0.1, "supergrok15_warmup": 100,
-                       "supergrok15_warmup_ramp": 100, "supergrok15_grad_clip": 1.0,
-                       "supergrok15_meta_dim": 32, "supergrok15_alpha_update_freq": 50,
-                       "supergrok15_zero_loss_thresh": 1e-4, "supergrok15_zero_acc_thresh": 0.995,
-                       "supergrok15_meta_gate_power": 1.0,
-                       "supergrok15_sam_rho": 0.05,
-                       "supergrok15_gate_scale": 20.0, "supergrok15_gate_thresh": 0.8,
-                       "supergrok15_sam_freq_min": 3, "supergrok15_sam_freq_max": 20,
-                       "supergrok15_sam_scale": 20.0, "supergrok15_sam_thresh": 0.85,
-                       "supergrok15_bilevel_freq_min": 5, "supergrok15_bilevel_freq_max": 30,
-                       "supergrok15_bilevel_scale": 20.0, "supergrok15_bilevel_thresh": 0.9,
-                       "supergrok15_wd_ramp": 4.0, "supergrok15_wd_scale": 20.0,
-                       "supergrok15_wd_thresh": 0.9},
-        "supergrok2": {"weight_decay": 1.0, "sg2_alpha": 0.98, "sg2_lamb": 2.0,
-                       "sg2_gamma": 0.1, "sg2_kappa": 0.1, "sg2_warmup": 100,
-                       "sg2_warmup_ramp": 100, "sg2_grad_clip": 1.0,
-                       "sg2_num_inducing": 16, "sg2_meta_d_model": 8,
-                       "sg2_num_peer_experts": 1024, "sg2_expert_hidden": 4,
-                       "sg2_recurrent_dim": 8, "sg2_meta_rescale": 0.1,
-                       "sg2_alpha_update_freq": 50,
-                       "sg2_zero_loss_thresh": 1e-4, "sg2_zero_acc_thresh": 0.995,
-                       "sg2_sam_rho": 0.05,
-                       "sg2_gate_scale": 20.0, "sg2_gate_thresh": 0.8,
-                       "sg2_sam_freq_min": 3, "sg2_sam_freq_max": 20,
-                       "sg2_sam_scale": 20.0, "sg2_sam_thresh": 0.85,
-                       "sg2_bilevel_freq_min": 5, "sg2_bilevel_freq_max": 30,
-                       "sg2_bilevel_scale": 20.0, "sg2_bilevel_thresh": 0.9,
-                       "sg2_wd_ramp": 4.0, "sg2_wd_scale": 20.0,
-                       "sg2_wd_thresh": 0.9, "sg2_sam_enable_threshold": 0.0},
-        "grokfast":   {"weight_decay": 1.0, "grokfast_alpha": 0.98, "grokfast_lamb": 2.0},
-        "muon":       {"weight_decay": 1.0, "muon_lr": 0.02, "muon_momentum": 0.95},
-        "lion":       {"lion_lr": 3e-4, "lion_wd": 3.0},
-        "looksam":    {"weight_decay": 1.0, "looksam_rho": 0.05, "looksam_k": 5,
-                       "looksam_alpha": 0.7},
-        "prodigy":    {"weight_decay": 1.0, "prodigy_lr": 1.0},
-    }
+    optimizer_configs = dict(OPTIMIZER_CONFIGS)  # see module-level OPTIMIZER_CONFIGS
 
     ALL_OPTIMIZERS = ["adamw","neuralgrok","grokadamw","supergrok","supergrok15",
                       "supergrok2","grokfast","muon","lion","looksam","prodigy"]
@@ -1792,7 +2246,9 @@ if __name__ == "__main__":
         max_steps=args.early_stop_max_steps,
         lr=1e-3,
         threshold=args.early_stop_test_acc,
-        log_every=10,
+        # [A4-M8] log_every removed — it was never read by any train loop
+        # (write-only into config); dropped from DEFAULT_CONFIG, _common, and
+        # run_pipeline's signature/merge.
         save_dir=args.output,
         gpu_ids=gpu_ids,
         use_amp=False,

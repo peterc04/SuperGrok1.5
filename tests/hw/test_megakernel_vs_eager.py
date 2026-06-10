@@ -645,8 +645,12 @@ def _grok_smoke_impl(seed, *, max_steps=None, device="cuda"):
     """
     import grokking_race_v2 as race
     c = dict(race.DEFAULT_CONFIG)
+    # matmul_precision pinned fp32: the race default is bf16, and the L3 path
+    # now declines non-fp32 runs (precision fairness gate). The smoke EXISTS to
+    # exercise the L3 kernel — without the pin it would silently validate the
+    # eager path instead.
     c.update(dict(model_type="decoder", seed=seed, use_fused=True,
-                  use_amp=False, eval_every=50))
+                  use_amp=False, eval_every=50, matmul_precision="fp32"))
     if max_steps is not None:
         c["max_steps"] = max_steps
         c["early_stop_max_steps"] = max_steps

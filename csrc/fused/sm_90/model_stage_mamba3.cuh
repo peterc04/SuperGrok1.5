@@ -322,12 +322,19 @@ __device__ __forceinline__ void mb_linear(
 }
 
 // ── LayerNorm forward (last dim width=d). Caches xhat + inv_std. ──────────────
+// ldX is the EXPLICIT row stride of x (no default) — the caller stages the
+// residual into adj_c, whose DECLARED width is kDInner (256), not kD (128).
+// The packed-stride read (x + s*kD) was the stride-bug class of 5cb32b8 all
+// over again: row 0 correct, rows 1..7 read uninitialized smem — caught on
+// first silicon run of the cell (the CPU mirror indexes semantically and
+// cannot see it). y/xhat_out remain packed kD-wide buffers.
 __device__ __forceinline__ void mb_layernorm_fwd(
         const float* __restrict__ x, const float* __restrict__ gamma,
         const float* __restrict__ beta, float* __restrict__ y,
-        float* __restrict__ xhat_out, float* __restrict__ inv_out, float* red) {
+        float* __restrict__ xhat_out, float* __restrict__ inv_out, float* red,
+        int ldX) {
     for (int s = 0; s < mb::kSeq; ++s) {
-        const float* xr = x + s * mb::kD;
+        const float* xr = x + s * ldX;
         float sum = 0.0f;
         for (int j = threadIdx.x; j < mb::kD; j += blockDim.x) sum += xr[j];
         float mean = mb_block_sum(sum, red) / (float)mb::kD;
@@ -702,7 +709,8 @@ __device__ float mb_forward_sample(const MambaWeights& w, const int* tokens_s,
         float* dst = (li + 1 < mb::kLayers) ? &sm->layer_in[li + 1][0][0]
                                             : &sm->final_in[0][0];
         mb_layernorm_fwd(&sm->adj_c[0][0], L.n_w, L.n_b, dst,
-                         &a->ln_xhat[0][0], &a->ln_inv[0], sm->red);
+                         &a->ln_xhat[0][0], &a->ln_inv[0], sm->red,
+                         /*ldX=*/mb::kDInner);  // adj_c rows are kDInner wide
     }
 
     // Final norm (LAST position) + head -> logits -> NLL.

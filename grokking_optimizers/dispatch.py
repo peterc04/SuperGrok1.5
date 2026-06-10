@@ -26,6 +26,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import sys
 from typing import Union
 
 import torch
@@ -563,21 +564,50 @@ def has_kernels() -> bool:
 
 
 # ----------------------------------------------------------------------
-# Fused (model, optimizer, arch) kernel registry.
+# Fused (model, optimizer, arch) kernel registry + L1 megakernel readiness.
 #
-# This registry is intentionally EMPTY: the live fused execution path is the
-# megakernel engine (``grokking_optimizers.megakernel_engine``) keyed on the
-# canonical names in ``megakernel.MODELS`` / ``megakernel.OPTIMIZERS``. Nothing
-# in the package populates ``_FUSED_REGISTRY``.
+# THE LIVE FUSED PATH (lever (a)). ``register_fused`` populates ``_FUSED_REGISTRY``
+# for the cells on the READINESS whitelist (``_FUSED_READY``). For a whitelisted
+# (model, optimizer) cell, ``has_fused(...)`` returns True and ``dispatch_fused``
+# runs the L1 fused optimizer-tail megakernel via ``ops.fused_step`` —
+# numerically the canonical optimizer update over the REAL gradient the framework
+# already computed (the C++ ``opt_only=True`` path; dispatch.cpp/opt_components).
 #
-# The registry + ``register_fused`` / ``has_fused`` / ``dispatch_fused`` are
-# retained only because ``grokking_race_v2.py`` imports ``has_fused`` /
-# ``dispatch_fused`` as an optional fast-path probe: ``has_fused(...)`` returns
-# False (empty registry) so the race always falls back to the eager path. They
-# are kept as a stable no-op shim rather than deleted to avoid breaking that
-# importer. ``MODELS`` / ``OPTIMIZERS`` here are validation lists of the
-# canonical model/optimizer identifiers; ``MODELS`` mirrors the canonical
-# ``megakernel.MODELS`` triple.
+# L1 vs L3 (the tier landscape after PHASE 1):
+#   * L1 (this whitelist, {adamw,lion}×3 models): the fused optimizer TAIL only —
+#     consumes the real ``p.grad`` the framework computed and applies the
+#     canonical update. Faithful + validatable; the cell stays model-agnostic.
+#   * L3-SURROGATE (the 33 generated cells' opt_only=False path): an element-local
+#     SURROGATE model (csrc/fused/sm_90/model_stages.cuh: acts=GELU(param+input),
+#     grad=acts*GELU'(param)) over the flat param blob — NOT the real graph; its
+#     loss cannot match eager, so it is NOT used by the race. Still compiled
+#     (perf-placement coverage) but unreachable on the race path.
+#   * L3-REAL (PHASE 1; ONLY (transformer_decoder, adamw) on sm_90): the TRUE
+#     fused megakernel — ONE persistent kernel runs the REAL decoder fwd+bwd +
+#     AdamW, no surrogate, no intermediate launches (model_stages_decoder.cuh +
+#     fused_decoder_megakernel.cuh + mega_decoder_real_adamw.cu, transcribed from
+#     the verified oracle). Its loss DOES match eager (validated to 1e-5).
+#     Reached via ``fused_train_step`` / ``has_l3_real`` (the L3-REAL tier marker
+#     ``_FUSED_L3_REAL``), which REPLACES the eager fwd+bwd+opt for that one cell.
+# So "L3 can't match eager" is true for the SURROGATE L3 cells but FALSE for the
+# L3-REAL decoder×adamw cell. See BUILD_AND_VALIDATE.md §PHASE-1.
+#
+# WHY THIS WHITELIST (adamw, lion). The L1 tail's only non-pointer inputs are the
+# scalars (lr/betas/eps/wd/bc1/bc2) and the persistent m|v state — all directly
+# computable from the live optimizer + a step counter, with NO separate per-step
+# precompute. The other 9 optimizers need a precomputed per-step quantity the L1
+# tail reads but does not itself produce — prodigy's adaptive ``d``, grokfast/
+# grokadamw's slow-grad EMA seeding, looksam's SAM direction, muon's NS-orth
+# direction, SG11/15's reduced gate + mu, SG2's meta-net smart-grad. Those are
+# honest-staged behind the readiness gate (a loud one-time TODO at run start)
+# rather than wired with placeholder scalars (which would silently degrade the
+# math — the exact suppression the owner forbids). ``register_fused`` is the seam
+# to add them once their precompute is plumbed + validated.
+#
+# NOTE (L1 is model-agnostic): the L1 tail (fused_optimizer_stage<Opt>) never
+# touches the model stages, so a cell's result depends only on the optimizer, not
+# the model. All 3 models × {adamw, lion} are therefore equivalent on L1 and all
+# are whitelisted; the parity test needs only ONE model per optimizer.
 # ----------------------------------------------------------------------
 
 MODELS = ("transformer_decoder", "vit", "mamba3")
@@ -598,35 +628,122 @@ OPT_CLASS = {
     "supergrok2":  "SuperGrok2",
 }
 
+# READINESS whitelist: (canonical_model, optimizer) cells cleared for the L1
+# megakernel path this pass. Everything else uses the existing per-op/eager path.
+# Kept as the SINGLE source of truth for "which cell may take the megakernel"; the
+# validation script (tests/hw/test_megakernel_vs_eager.py) asserts each of these
+# matches its eager reference before it is trusted on hardware.
+_FUSED_READY_OPTIMIZERS = ("adamw", "lion")
+_FUSED_READY = frozenset(
+    (m, o) for m in MODELS for o in _FUSED_READY_OPTIMIZERS
+)
+
+# PHASE 1+2 — L3-REAL tier marker. These (canonical_model, optimizer) cells have a
+# TRUE L3 fused megakernel: ONE persistent kernel runs the REAL model fwd+bwd +
+# AdamW (no surrogate, no intermediate launches), transcribed from the verified
+# per-model oracle:
+#   * (transformer_decoder, adamw)  — PHASE 1 (model_stages_decoder.cuh +
+#                                     fused_decoder_megakernel.cuh)
+#   * (vit, adamw)                  — PHASE 2 (model_stage_vit.cuh +
+#                                     fused_vit_megakernel.cuh; dynamic smem)
+#   * (mamba3, adamw)               — PHASE 2 (model_stage_mamba3.cuh +
+#                                     fused_mamba_megakernel.cuh; dynamic smem)
+# NOTE the CANONICAL name "mamba3" (canonicalize_model maps the user "mamba" →
+# "mamba3"; the C++ dispatch + wired-cell table also use "mamba3"). These are the
+# ONLY L3-REAL cells — every other cell's L3 path is still the element-local
+# SURROGATE (loud honesty: do NOT use opt_only=False for them). The race reaches
+# these cells via fused_train_step() (NOT the L1 per-tensor fused_optimizer_step).
+# Kept as a SET so the tier semantics are a single source of truth the race + the
+# parity tests both read.
+_FUSED_L3_REAL = frozenset({
+    ("transformer_decoder", "adamw"),
+    ("vit", "adamw"),
+    ("mamba3", "adamw"),
+})
+
 _FUSED_REGISTRY = {}
 
 
+def fused_ready_cells():
+    """The (canonical_model, optimizer) pairs cleared for the L1 megakernel path.
+
+    Single source of truth for the readiness whitelist; the race and the
+    validation script both read it so they cannot disagree on which cell is live.
+    """
+    return frozenset(_FUSED_READY)
+
+
+def fused_l3_real_cells():
+    """The (canonical_model, optimizer) pairs with a TRUE L3 fused megakernel
+    (real fwd+bwd+opt in one persistent kernel). Currently only
+    (transformer_decoder, adamw). Single source of truth for the L3-REAL tier."""
+    return frozenset(_FUSED_L3_REAL)
+
+
+def has_l3_real(model, optimizer, arch=None) -> bool:
+    """Whether the TRUE L3 fused megakernel (real fwd+bwd+opt) is available for
+    (model, optimizer) on the detected arch. True ONLY for the L3-REAL cell(s) on
+    sm_90 with a compiled fused TU. The decoder real path is sm_90-only (the
+    nvcc-compiled mega_decoder_real_adamw.cu); gfx942 keeps the eager path."""
+    if arch is None:
+        try:
+            arch = detect_arch()
+        except UnsupportedArchError:
+            return False
+    try:
+        model = canonicalize_model(model)
+    except ValueError:
+        return False
+    impl = normalize_arch(arch) if not isinstance(arch, int) else arch
+    if impl != 90:   # the real decoder fwd/bwd .cu is sm_90-only for PHASE 1
+        return False
+    return (model, optimizer) in _FUSED_L3_REAL
+
+
 def register_fused(model, optimizer, arch):
-    """Register a fused (model, optimizer, arch) kernel. Currently unused — the
-    live path is the megakernel engine; kept as a stable shim (see module note).
+    """Register a fused (model, optimizer, arch) kernel callable.
+
+    Used to populate ``_FUSED_REGISTRY`` for the readiness-whitelisted cells (see
+    ``_register_ready_cells`` below). The registered callable takes the same
+    ``(params, inputs, grads, state, lr)`` shape ``dispatch_fused`` forwards.
     """
     def decorator(fn):
-        _FUSED_REGISTRY[(model, optimizer, arch)] = fn
+        _FUSED_REGISTRY[(canonicalize_model(model), optimizer, arch)] = fn
         return fn
     return decorator
 
 
 def has_fused(model, optimizer, arch=None):
-    """Whether a fused kernel is registered for (model, optimizer, arch).
+    """Whether the L1 megakernel path is available for (model, optimizer, arch).
 
-    Always False with the (empty) built-in registry — callers fall back to the
-    eager path. See the module note above.
+    True iff the cell is on the readiness whitelist (``_FUSED_READY``) for the
+    detected arch. The arch must be a real GPU arch with a compiled fused TU
+    (sm_90 / gfx942); on any other arch (CPU host, TPU) this returns False so the
+    caller uses the eager path. Tolerant of an unknown model name (returns False).
     """
     if arch is None:
-        arch = detect_arch()
-    model = canonicalize_model(model)
-    return (model, optimizer, arch) in _FUSED_REGISTRY
+        try:
+            arch = detect_arch()
+        except UnsupportedArchError:
+            return False
+    try:
+        model = canonicalize_model(model)
+    except ValueError:
+        return False
+    # The compiled fused TU exists only for the GPU impl families (sm_90/gfx942).
+    impl = normalize_arch(arch) if not isinstance(arch, int) else arch
+    if impl not in (90, 942):
+        return False
+    return (model, optimizer) in _FUSED_READY
 
 
 def dispatch_fused(model, optimizer, params, inputs, grads, state, lr, arch=None):
     """Dispatch to a registered fused kernel, or raise KeyError if none.
 
-    Unused by the package's live path (kept as a shim for grokking_race_v2.py).
+    The whitelisted cells register a callable here via ``register_fused``; the
+    race reaches the megakernel through the higher-level
+    :func:`fused_optimizer_step` (which assembles persistent state + live
+    scalars), so this remains the low-level registry shim.
     """
     if arch is None:
         arch = detect_arch()
@@ -638,3 +755,406 @@ def dispatch_fused(model, optimizer, params, inputs, grads, state, lr, arch=None
             f"Available: {list(_FUSED_REGISTRY.keys())}"
         )
     return _FUSED_REGISTRY[key](params, inputs, grads, state, lr)
+
+
+# ----------------------------------------------------------------------
+# L1 megakernel optimizer-step driver (the live race path for whitelisted cells).
+# ----------------------------------------------------------------------
+
+# One-time run-start announcement guard (so the readiness summary prints ONCE per
+# process, not per step — the owner directive: "says so ONCE loudly at run start").
+_FUSED_ANNOUNCED = False
+
+
+def announce_fused_readiness(force: bool = False) -> None:
+    """Print, ONCE per process, which cells take the L1 megakernel path.
+
+    Loud + honest at run start: lists the whitelisted (model, optimizer) cells
+    that will use the fused optimizer-tail megakernel and notes that every other
+    cell uses the eager/per-op path. Idempotent (guarded by ``_FUSED_ANNOUNCED``).
+    """
+    global _FUSED_ANNOUNCED
+    if _FUSED_ANNOUNCED and not force:
+        return
+    _FUSED_ANNOUNCED = True
+    ready = sorted(f"{short_model_name(m)}:{o}" for (m, o) in _FUSED_READY)
+    l3_real = sorted(f"{short_model_name(m)}:{o}" for (m, o) in _FUSED_L3_REAL)
+    msg = (
+        f"[fused] L3-REAL fused-train path (real fwd+bwd+opt in ONE persistent "
+        f"kernel) ENABLED for {len(l3_real)} cell(s): {', '.join(l3_real)}. "
+        f"L1 fused-optimizer-tail path ENABLED for {len(ready)} cell(s): "
+        f"{', '.join(ready)}. All other (model, optimizer) cells use the "
+        f"eager/per-op path (the surrogate L3 cells are compiled but unused by "
+        f"the race; see BUILD_AND_VALIDATE.md §PHASE-1).")
+    # Print to stderr so the run-start banner is ALWAYS visible (the module
+    # logger has a NullHandler by default, so logger.warning would be silent
+    # unless GROK_LOG_LEVEL is set). Also log it for structured-log consumers.
+    print(msg, file=sys.stderr, flush=True)
+    logger.warning(msg)
+
+
+# Per-optimizer extra-state requirement for the L1 tail's `extra` (3rd n-slice).
+# Only the whitelisted optimizers are listed; adamw/lion need no extra slice (it
+# is allocated and zeroed but never read — rebase_state<Opt> guards it out).
+_OPT_USES_EXTRA = {
+    "adamw": False,
+    "lion":  False,
+}
+
+
+def _opt_scalars_from(optimizer, step):
+    """Extract the FULL scalar set for ``ops.fused_step`` from a live optimizer.
+
+    Pulls lr/betas/eps/weight_decay from ``param_groups[0]`` (so a scheduled lr is
+    honored) and computes the UN-INVERTED bias corrections bc1 = 1 - beta1**step,
+    bc2 = 1 - beta2**step from the shared step counter. One (bc1, bc2) pair is
+    correct because the race steps every parameter together (the megakernel treats
+    each flat param as one task; see opt_components.cuh FusedScalars note).
+
+    Returns a kwargs dict for ``ops.fused_step`` (only the fields the whitelisted
+    optimizers consume are set; the rest keep their inert ABI defaults).
+    """
+    g = optimizer.param_groups[0]
+    betas = g.get("betas", (0.9, 0.999))
+    beta1, beta2 = float(betas[0]), float(betas[1])
+    lr = float(g.get("lr", 1e-3))
+    eps = float(g.get("eps", 1e-8))
+    wd = float(g.get("weight_decay", 0.0))
+    bc1 = 1.0 - beta1 ** step
+    bc2 = 1.0 - beta2 ** step
+    return dict(lr=lr, beta1=beta1, beta2=beta2, eps=eps, weight_decay=wd,
+                bc1=bc1, bc2=bc2, step=int(step))
+
+
+def fused_optimizer_step(model_name, opt_name, torch_module, optimizer, *,
+                         state_cache, step):
+    """Run ONE L1 fused optimizer-tail step over the live model's parameters.
+
+    This is the live race path for a readiness-whitelisted cell. The caller has
+    ALREADY run the real forward + backward, so every trainable parameter carries
+    its real ``p.grad``; this applies the canonical optimizer update to each
+    parameter in-place via the fused megakernel (``ops.fused_step`` with
+    ``opt_only=True`` → the L1 real-grad tail).
+
+    State ownership (critical): because the fused path REPLACES ``optimizer.step()``
+    the torch optimizer's own ``.state`` never fills, so we keep our OWN persistent
+    per-parameter ``[m|v|extra]`` (one contiguous 3n fp32 buffer) in
+    ``state_cache`` (a dict the caller threads across steps). Reallocating it per
+    step would reset momentum every step (the optimizer would never grok); we
+    allocate once per parameter and reuse.
+
+    Args:
+        model_name: user/canonical model name (canonicalized internally).
+        opt_name: optimizer key (must be on the readiness whitelist).
+        torch_module: the ``nn.Module`` being trained (provides named params+grads).
+        optimizer: the live torch optimizer (source of lr/betas/eps/wd).
+        state_cache: dict persisted across steps: id(param) -> 3n fp32 state tensor.
+        step: 1-based step counter (drives bias correction).
+
+    Returns True on success. Raises if the cell is not whitelisted or a param is
+    in an unsupported layout (no silent corruption).
+    """
+    model_c = canonicalize_model(model_name)
+    if (model_c, opt_name) not in _FUSED_READY:
+        raise KeyError(
+            f"fused_optimizer_step: cell ({model_c}, {opt_name}) is not on the "
+            f"L1 readiness whitelist {sorted(_FUSED_READY)}")
+    ops = get_ops()
+    if not hasattr(ops, "fused_step"):
+        raise RuntimeError("ops.fused_step unavailable; build the extension.")
+
+    scalars = _opt_scalars_from(optimizer, step)
+
+    for _, p in torch_module.named_parameters():
+        if not p.requires_grad:
+            continue
+        g = p.grad
+        if g is None:
+            # No grad for this param this step (e.g. an unused head). Skip it
+            # rather than feed a stale/zero buffer — the eager step would also be
+            # a no-op for a None grad.
+            continue
+        # The L1 tail indexes raw dense float memory; a non-contiguous param/grad
+        # or a non-fp32 dtype would silently address the wrong elements. fused_step
+        # does NOT run check_param_grad (that guard is on the per-op path), so we
+        # enforce it here. amp is off by default in the race (fp32 params).
+        if p.dtype != torch.float32 or g.dtype != torch.float32:
+            raise RuntimeError(
+                f"fused_optimizer_step requires fp32 params AND grads (got "
+                f"param {p.dtype}, grad {g.dtype}); the L1 megakernel tail reads "
+                f"raw float memory. Disable AMP for the fused path.")
+        if g.is_sparse:
+            raise RuntimeError("fused_optimizer_step does not support sparse grads")
+        param = p.data if p.data.is_contiguous() else p.data.contiguous()
+        grad = g if g.is_contiguous() else g.contiguous()
+        n = param.numel()
+        key = id(p)
+        st = state_cache.get(key)
+        if st is None or st.numel() != 3 * n:
+            # Persistent [m|v|extra] state, zero-init ONCE per parameter.
+            st = torch.zeros(3 * n, dtype=torch.float32, device=param.device)
+            state_cache[key] = st
+        # input is unused on the L1 tail (auto in = input.numel()? : p); pass the
+        # param as a harmless non-empty placeholder so the C++ side does not fall
+        # back to the acts buffer. grad is the REAL gradient just computed.
+        ops.fused_step(model_c, opt_name, param.view(-1), param.view(-1),
+                       grad.view(-1), st, scalars["lr"],
+                       beta1=scalars["beta1"], beta2=scalars["beta2"],
+                       eps=scalars["eps"], weight_decay=scalars["weight_decay"],
+                       bc1=scalars["bc1"], bc2=scalars["bc2"],
+                       step=scalars["step"], opt_only=True)
+        # If .contiguous() copied, write the update back into the param storage.
+        if param.data_ptr() != p.data.data_ptr():
+            p.data.copy_(param.view_as(p.data))
+    return True
+
+
+# Per-model flat-buffer element counts. Each MUST equal the C++/CUDA total the
+# corresponding .cu static-asserts (kDecTotalElems / kVitTotalElems /
+# kMambaTotalElems). The Python wrapper builds the flat param/state buffers to
+# this size. The no-GPU layout tests cross-check these against the oracle totals.
+_DECODER_TOTAL_ELEMS = 422755   # small decoder (vocab=99,d=128,heads=4,layers=2,seq=4)
+_DECODER_SEQ = 4
+_VIT_TOTAL_ELEMS = 418017       # small ViT (p=97,d=128,heads=4,layers=2,patch=49,npatch=16)
+_VIT_PATCH_ELEMS = 16 * 49      # 784 patch pixels per sample ([16][49] row-major)
+_MAMBA_TOTAL_ELEMS = 259425     # small Mamba (ntok=99,p=97,d=128,layers=2,seq=8)
+_MAMBA_SEQ = 8
+
+# L3-REAL per-(canonical_model) ABI spec for fused_train_step. Each model carries
+# its (token/patch) input through the single `input` tensor with the packing
+# dispatch.cpp reads:
+#   * "kind"  — "int_tokens" (decoder/mamba: int32 tokens[B*seq]++targets[B]) or
+#               "float_patches" (vit: float32 patches[B*per]++int-target-bits[B]
+#               BIT-REINTERPRETED into the trailing float slots, NOT a value cast)
+#   * "total" — flat param element count (== the .cu's static_asserted total)
+#   * "per"   — per-sample input width (seq for tokens; patch-pixel count for vit)
+_L3_REAL_SPEC = {
+    "transformer_decoder": {"kind": "int_tokens", "total": _DECODER_TOTAL_ELEMS,
+                            "per": _DECODER_SEQ},
+    "mamba3":              {"kind": "int_tokens", "total": _MAMBA_TOTAL_ELEMS,
+                            "per": _MAMBA_SEQ},
+    "vit":                 {"kind": "float_patches", "total": _VIT_TOTAL_ELEMS,
+                            "per": _VIT_PATCH_ELEMS},
+}
+
+
+def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
+                     targets, *, state_cache, step, return_grad=False,
+                     lr=None, betas=None, weight_decay=None, eps=None):
+    """Run ONE TRUE L3 fused TRAIN step (real fwd+bwd+opt) for an L3-REAL cell.
+
+    PHASE 1+2: for an L3-REAL cell ((transformer_decoder|vit|mamba3, adamw)) this
+    REPLACES the eager forward + backward + optimizer.step() with ONE persistent
+    megakernel that runs the REAL model forward+backward AND the AdamW update —
+    real model math, real optimizer math, ZERO intermediate kernel launches (the
+    owner rejected CUDA graphs; this is the chosen path). The caller MUST therefore
+    NOT run its own forward/backward/step for this cell; it uses the LOSS this
+    returns for logging.
+
+    The input path is carried through the existing ``ops.fused_step`` ABI (whose
+    pybind arity is pinned), packed PER MODEL into the single ``input`` tensor:
+      * int_tokens (decoder/mamba): ``input`` = int32 [B*(per+1)] = tokens[B*per]
+        ++ targets[B]  (per = seq: decoder 4, mamba 8).  ``tokens`` is [B, per].
+      * float_patches (vit): ``input`` = float32 [B*(per+1)] = patches[B*per] ++
+        targets BIT-REINTERPRETED into the trailing float slots (per = 16*49 = 784;
+        ``tokens`` here is the float patch tensor [B, 16, 49]). The targets are
+        carried via ``tensor.view(torch.int32)/view(torch.float32)`` bit-reinterpret
+        (NOT a value cast) so they are lossless for ALL int32 — dispatch.cpp reads
+        them back with reinterpret_cast<const int*>. This mirrors the decoder's
+        int pack: one contiguous ``input`` tensor.
+    ``params`` = the flat concat of ``named_parameters()`` (in order); ``state`` =
+    [m|v|extra] (3*total) + a trailing loss slot the kernel writes the mean
+    cross-entropy into. We read that slot back and return it.
+
+    State/params ownership (critical): the megakernel updates the FLAT param
+    buffer in place, so we keep BOTH the flat param buffer AND the [m|v|extra|loss]
+    state in ``state_cache`` (keyed by the model id), allocated ONCE and reused —
+    reallocating per step would reset momentum and the run would never grok. After
+    the kernel we scatter the updated flat params back into the live
+    ``p.data`` (named_parameters() order), so the model carries the new weights for
+    the next eager eval.
+
+    Args:
+        model_name/opt_name: must be an L3-REAL cell ((decoder|vit|mamba, adamw)).
+        torch_module: the live model nn.Module (NOT torch.compile-wrapped — the
+            flat layout assumes the eager named_parameters() order).
+        optimizer: live torch optimizer (source of lr/betas/eps/wd).
+        tokens: the per-sample input. int64/int32 [B, kSeq] token ids in [0, vocab)
+            for decoder/mamba; the float patch tensor [B, 16, 49] for vit (the arg
+            keeps its name for ABI symmetry across models).
+        targets: int64/int32 [B] target ids.
+        state_cache: dict persisted across steps (canonical model name -> {flat,
+            state, grad_out, names}).
+        step: 1-based step counter (drives bias correction).
+        return_grad: if True, also return the reduced weight-grad buffer (a flat
+            [total] tensor; slice it by the model's layout offsets for per-tensor
+            grads) — used by the parity test to compare the kernel's backward
+            against the oracle. Default False (the race only needs the loss).
+
+    Returns the scalar training loss (mean CE) as a float; or (loss, grad) when
+    ``return_grad=True``. Raises if the cell is not L3-REAL or a param layout is
+    unexpected (no silent corruption).
+
+    lr/betas/weight_decay/eps: ACCEPTED for signature-compatibility with the parity
+    test helpers (test_{vit,mamba,decoder}_megakernel.py pass them explicitly per
+    INTEGRATION-VIT.md §6), but the AUTHORITATIVE scalars come from
+    ``optimizer.param_groups[0]`` via _opt_scalars_from — exactly as the decoder
+    path does (which passes none of them). They are accepted-and-ignored here so a
+    scheduled lr on the optimizer is always honored from the single source; the
+    test's _Opt stand-in carries the same values in param_groups[0], so there is no
+    divergence.
+    """
+    del lr, betas, weight_decay, eps  # see docstring: optimizer.param_groups is authoritative
+    model_c = canonicalize_model(model_name)
+    if (model_c, opt_name) not in _FUSED_L3_REAL:
+        raise KeyError(
+            f"fused_train_step: cell ({model_c}, {opt_name}) is not an L3-REAL "
+            f"cell {sorted(_FUSED_L3_REAL)}")
+    spec = _L3_REAL_SPEC.get(model_c)
+    if spec is None:
+        raise KeyError(
+            f"fused_train_step: no L3-REAL ABI spec for model {model_c!r} "
+            f"(known: {sorted(_L3_REAL_SPEC)})")
+    ops = get_ops()
+    if not hasattr(ops, "fused_step"):
+        raise RuntimeError("ops.fused_step unavailable; build the extension.")
+
+    # Collect the trainable params in named_parameters() ORDER (the flat layout).
+    named = [(n, p) for n, p in torch_module.named_parameters() if p.requires_grad]
+    total = sum(p.numel() for _, p in named)
+    if total != spec["total"]:
+        raise RuntimeError(
+            f"fused_train_step: {model_c} has {total} params but the L3-REAL "
+            f"megakernel layout expects {spec['total']}. The model arch changed — "
+            f"regenerate csrc/fused/sm_90/{model_c}_layout.cuh (or vit_layout/"
+            f"mamba3_layout) and update the _*_TOTAL_ELEMS mirror.")
+    p0 = named[0][1]
+    if p0.dtype != torch.float32:
+        raise RuntimeError(
+            "fused_train_step requires fp32 params (the megakernel reads raw "
+            "float memory). Disable AMP for the L3-REAL fused path.")
+    device = p0.device
+
+    cache = state_cache.get(model_c)
+    if cache is None or cache["flat"].numel() != total:
+        # Persistent flat param mirror + [m|v|extra]+loss state + a SEPARATE
+        # reduced-grad output buffer (NOT `flat` — `flat` is params; reusing it
+        # for grad would corrupt the weights). All allocated ONCE and reused
+        # (reallocating state per step would reset momentum → never grok).
+        flat = torch.empty(total, dtype=torch.float32, device=device)
+        state = torch.zeros(3 * total + 1, dtype=torch.float32, device=device)
+        grad_out = torch.zeros(total, dtype=torch.float32, device=device)
+        names = [n for n, _ in named]
+        cache = dict(flat=flat, state=state, grad_out=grad_out, names=names)
+        state_cache[model_c] = cache
+    elif cache["names"] != [n for n, _ in named]:
+        raise RuntimeError(
+            "fused_train_step: named_parameters() order changed between steps; "
+            "the flat layout would be wrong. Do not re-create the model mid-run.")
+    flat = cache["flat"]
+    state = cache["state"]
+    grad_out = cache["grad_out"]
+
+    # Pack the CURRENT params into the flat buffer (named_parameters() order). The
+    # kernel updates `flat` in place; we scatter it back afterward. (Copying in is
+    # cheap relative to the fwd/bwd; it also picks up any eager change to a param.)
+    off = 0
+    for _, p in named:
+        n = p.numel()
+        flat[off:off + n].copy_(p.data.reshape(-1))
+        off += n
+
+    # Pack the per-sample input ++ targets into ONE contiguous `input` tensor, the
+    # packing dispatch.cpp reads for this model (int tokens vs float patches).
+    B = int(tokens.shape[0])
+    per = spec["per"]
+    if spec["kind"] == "int_tokens":
+        # decoder/mamba: int32 tokens[B*per] ++ int32 targets[B]. tokens is [B,per].
+        S = int(tokens.shape[1])
+        if S != per:
+            raise RuntimeError(
+                f"fused_train_step: {model_c} seq is {S} but the L3-REAL kernel "
+                f"is compiled for kSeq={per}.")
+        tok_i = tokens.to(device=device, dtype=torch.int32).contiguous().reshape(-1)
+        tgt_i = targets.to(device=device, dtype=torch.int32).contiguous().reshape(-1)
+        packed = torch.empty(B * (per + 1), dtype=torch.int32, device=device)
+        packed[: B * per].copy_(tok_i)
+        packed[B * per:].copy_(tgt_i)
+    elif spec["kind"] == "float_patches":
+        # vit: float32 patches[B*per] ++ int-target-bits[B] BIT-REINTERPRETED into
+        # the trailing float slots. tokens here is the float patch tensor [B,16,49].
+        n_in = int(tokens.numel() // B) if B else 0
+        if n_in != per:
+            raise RuntimeError(
+                f"fused_train_step: {model_c} per-sample patch width is {n_in} "
+                f"but the L3-REAL kernel is compiled for {per} (16*49). patches "
+                f"must be [B, 16, 49] (or any [B, ...] with 784 elems/sample).")
+        patch_f = tokens.to(device=device, dtype=torch.float32).contiguous().reshape(-1)
+        # Bit-reinterpret the int32 targets into float slots (NOT a value cast):
+        # int32 -> view as float32 copies the BIT PATTERN, lossless for all int32.
+        tgt_bits = (targets.to(device=device, dtype=torch.int32).contiguous()
+                    .reshape(-1).view(torch.float32))
+        packed = torch.empty(B * (per + 1), dtype=torch.float32, device=device)
+        packed[: B * per].copy_(patch_f)
+        packed[B * per:].copy_(tgt_bits)
+    else:
+        raise RuntimeError(
+            f"fused_train_step: unknown input kind {spec['kind']!r} for {model_c}")
+
+    scalars = _opt_scalars_from(optimizer, step)
+    # opt_only=False selects the L3-REAL decoder path in dispatch.cpp (which reads
+    # tokens/targets from `input` and runs the real fwd+bwd+adamw). The 33 surrogate
+    # cells are NOT reached (only this exact model+optimizer routes to the real .cu).
+    # `grad_out` is the ABI grad arg: the kernel writes the deterministically-reduced
+    # weight grad there (and consumes it in the optimizer tail WITHOUT overwriting),
+    # so after the call grad_out holds exactly the grad the AdamW step used — the
+    # parity test slices it per-tensor against the oracle (the keystone check).
+    ops.fused_step(model_c, opt_name, flat, packed, grad_out, state, scalars["lr"],
+                   beta1=scalars["beta1"], beta2=scalars["beta2"],
+                   eps=scalars["eps"], weight_decay=scalars["weight_decay"],
+                   bc1=scalars["bc1"], bc2=scalars["bc2"],
+                   step=scalars["step"], opt_only=False)
+
+    # Scatter the updated flat params back into the live model (same order).
+    off = 0
+    for _, p in named:
+        n = p.numel()
+        p.data.reshape(-1).copy_(flat[off:off + n])
+        off += n
+
+    # The kernel wrote the mean CE loss into state[3*total]; read it back.
+    loss = float(state[3 * total].item())
+    if return_grad:
+        # grad_out is the persistent buffer; clone so the caller's snapshot is not
+        # overwritten by the next step. Returned as a flat [total] tensor (slice it
+        # by the decoder layout offsets to get per-tensor grads).
+        return loss, grad_out.clone()
+    return loss
+
+
+def _register_ready_cells():
+    """Populate ``_FUSED_REGISTRY`` for every readiness-whitelisted cell.
+
+    The registered callable is a thin shim so ``dispatch_fused`` / ``has_fused``
+    see a real entry; the live race uses :func:`fused_optimizer_step` directly
+    (it owns the persistent state + per-step scalars the low-level registry shim
+    cannot carry). Registering for the detected GPU arch only (the compiled TU).
+    """
+    try:
+        arch = detect_arch()
+    except UnsupportedArchError:
+        return
+    impl = normalize_arch(arch) if not isinstance(arch, int) else arch
+    if impl not in (90, 942):
+        return
+    for (m, o) in _FUSED_READY:
+        def _shim(params, inputs, grads, state, lr, _m=m, _o=o):
+            ops = get_ops()
+            ops.fused_step(_m, _o, params, inputs, grads, state, float(lr),
+                           opt_only=True)
+            return params
+        register_fused(m, o, arch)(_shim)
+
+
+# Populate the registry at import (no-op / silent on CPU + non-GPU arches).
+_register_ready_cells()

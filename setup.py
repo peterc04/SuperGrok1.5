@@ -21,6 +21,7 @@ To build for a specific arch subset:
 """
 
 import glob
+import importlib.util
 import os
 import re
 import shutil
@@ -30,6 +31,33 @@ import tempfile
 import torch
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension
+import torch.utils.cpp_extension as _torch_cpp_ext
+
+
+# ----------------------------------------------------------------------
+# Lever (b): autotuner → product-build linkage.
+#
+# Load the pure-stdlib injector module (grokking_optimizers/_tuned_inject.py)
+# BY FILE PATH so importing it never re-enters grokking_optimizers/__init__.py
+# (which imports torch + probes CUDA). It is the single source of truth for
+# the canonical _kernel_tuned.json schema, the TU->optimizer mapping, and the
+# per-TU -DSG_TUNED_* / --maxrregcount flag computation. If it cannot be
+# loaded, the build degrades to identical-to-today (in-header defaults) with a
+# loud notice — never a hard failure.
+# ----------------------------------------------------------------------
+def _load_tuned_inject():
+    try:
+        mod_path = os.path.join(_REPO_ROOT, "grokking_optimizers",
+                                "_tuned_inject.py")
+        spec = importlib.util.spec_from_file_location(
+            "grokking_optimizers_tuned_inject", mod_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception as exc:  # noqa: BLE001 — optional; degrade gracefully.
+        print(f"  [tuned-inject] could not load _tuned_inject.py ({exc}); "
+              "build will use in-header kernel defaults (no per-TU tuning).")
+        return None
 
 # ----------------------------------------------------------------------
 # Absolute repo root (directory containing this setup.py). Include dirs MUST
@@ -384,8 +412,13 @@ def _collect(globs):
     # All *_overlay.* files have been merged into per-arch canonical
     # kernels in csrc/kernels/{cuda,hip}/<arch>/. The filter is
     # retained as a no-op safety net in case a stray overlay file is
-    # checked in by accident.
-    return [s for s in out if "_overlay" not in os.path.basename(s)]
+    # checked in by accident. *_selftest.cu TUs (e.g. wgmma_selftest.cu)
+    # define their OWN pybind module and are JIT-loaded by their tests —
+    # linking them into _ops would collide on PyInit__ops (multiple
+    # definition; observed at the wgmma substrate landing).
+    return [s for s in out
+            if "_overlay" not in os.path.basename(s)
+            and not os.path.basename(s).endswith("_selftest.cu")]
 
 
 COMMON_BINDINGS = [
@@ -677,6 +710,144 @@ else:
     )
 
 
+# ----------------------------------------------------------------------
+# Lever (b): per-TU tuned-flag injection at build time.
+#
+# PROBLEM torch's BuildExtension cannot express directly: extra_compile_args
+# is PER-LANGUAGE (one 'nvcc' list for every .cu), not per-source. The
+# autotuner picks DIFFERENT launch params (block/vec/unroll/async_depth +
+# maxrregcount) per optimizer, so each optimizer's TU needs its OWN nvcc
+# flags. torch 2.4.1's ninja path (unix_wrap_ninja_compile ->
+# _write_ninja_file_and_compile_objects -> _write_ninja_file) computes ONE
+# shared `cuda_post_cflags` ninja variable applied to every .cu via a single
+# `rule cuda_compile` (see /usr/local/lib/python3.11/dist-packages/torch/
+# utils/cpp_extension.py:2260-2368). It emits one `build <obj>: cuda_compile
+# <src>` statement per source but no per-statement flag override.
+#
+# HOOK CHOSEN: monkeypatch the MODULE-LEVEL torch.utils.cpp_extension.
+# _write_ninja_file (the function that emits those per-source build
+# statements and receives `sources`, `objects`, `cuda_post_cflags`) for the
+# duration of super().build_extensions(). We call the ORIGINAL writer
+# unchanged (so build.ninja is byte-correct), then APPEND a per-build-
+# statement `cuda_post_cflags = <FULL list>` override line under each TU that
+# maps to a tuned optimizer. We do NOT touch self.compiler.compile (torch
+# rebinds it inside build_extensions, so the timing of that binding is
+# irrelevant — whatever compile fn torch ends up calling routes through OUR
+# _write_ninja_file). All per-TU flags land in the SAME build.ninja, so the
+# runbook's `grep build.ninja for SG_TUNED + maxrregcount` succeeds.
+#
+# NINJA SCOPING (load-bearing): each override emits the FULL flag list
+# (global cuda_post_cflags + that optimizer's extras), NOT a self-referential
+# `cuda_post_cflags = $cuda_post_cflags ...` — a wrong eval order would
+# silently drop every base nvcc flag (arch/-O3/fast-math) and ship a
+# wrong-but-compiling kernel. We have the full list at write time; we emit it.
+# Extras are shlex.quoted to match torch's own quoting of the base flags.
+#
+# DEGRADES GRACEFULLY: no _kernel_tuned.json -> identical-to-today build
+# (one-line notice). _write_ninja_file absent in a future torch -> loud
+# warning + stock build, never a hard failure (hasattr-guarded).
+# ----------------------------------------------------------------------
+_TUNED_INJECT = _load_tuned_inject()
+# Arch key for the JSON lookup: the JSON uses the short, user-facing key.
+# NOTE: this phase only emits per-TU flags onto CUDA (.cu) TUs (sm_90). A
+# "gfx942" key here is wired but currently a NO-OP — optimizer_for_source()
+# rejects non-.cu sources, and the HIP VGPR-cap equivalent
+# (-amdgpu-max-num-vgprs) is intentionally out of scope (see _tuned_inject.py
+# docstring + AUTOTUNE_LINKAGE.md §5). So on a HIP build nothing is injected.
+_BUILD_ARCH_KEY = "gfx942" if _is_hip else "sm_90"
+
+
+class TunedBuildExtension(BuildExtension):
+    """BuildExtension that injects per-TU autotuned nvcc flags (lever (b))."""
+
+    def build_extensions(self):
+        import shlex as _shlex
+
+        inject = _TUNED_INJECT
+        tuned = inject.load_tuned() if inject is not None else None
+
+        # No injector module OR no JSON -> stock build (identical to today).
+        if inject is None:
+            print("  [tuned-inject] injector module unavailable; building "
+                  "with in-header kernel defaults (no per-TU tuning).")
+            return super().build_extensions()
+        if not tuned:
+            print(f"  [tuned-inject] no {os.path.basename(inject.KERNEL_TUNED_JSON)} "
+                  "found; building with in-header kernel defaults. Run "
+                  "`python -m grokking_optimizers.compile ... --jit-only` to "
+                  "produce winners (see AUTOTUNE_LINKAGE.md).")
+            return super().build_extensions()
+
+        # Drift guard (design 1c): the MACROS table must agree with the
+        # kernel header #ifndef defaults. We do not have a GPU here, but we
+        # can confirm the macro NAMES we are about to emit are the ones the
+        # header guards. Best-effort, never fatal.
+        _verify_macro_names(inject)
+
+        orig_writer = getattr(_torch_cpp_ext, "_write_ninja_file", None)
+        if orig_writer is None:
+            # Future/older torch without this internal -> cannot inject.
+            print("  [tuned-inject] WARNING: torch.utils.cpp_extension."
+                  "_write_ninja_file is unavailable in this torch "
+                  f"({getattr(torch, '__version__', '?')}); per-TU tuned "
+                  "flags will NOT be injected — building with in-header "
+                  "defaults. (The tuned JSON exists but cannot be applied.)")
+            return super().build_extensions()
+
+        arch_key = _BUILD_ARCH_KEY
+
+        def _patched_writer(*args, **kwargs):
+            # torch calls _write_ninja_file entirely by keyword
+            # (cpp_extension.py:1771); read what we need from kwargs.
+            orig_writer(*args, **kwargs)
+            path = kwargs.get("path")
+            sources = kwargs.get("sources")
+            objects = kwargs.get("objects")
+            cuda_post_cflags = kwargs.get("cuda_post_cflags")
+            if not (path and sources and objects):
+                return
+            try:
+                n = inject.inject_overrides_into_ninja(
+                    path, list(sources), list(objects),
+                    list(cuda_post_cflags or []), tuned, arch_key,
+                    quote=_shlex.quote)
+                if n:
+                    print(f"  [tuned-inject] injected per-TU tuned flags into "
+                          f"{n} CUDA TU(s) in {os.path.basename(path)}.")
+            except Exception as exc:  # noqa: BLE001 — never break the build.
+                print(f"  [tuned-inject] WARNING: per-TU override append "
+                      f"failed ({exc}); build.ninja left as torch wrote it "
+                      "(in-header defaults apply). Build continues.")
+
+        _torch_cpp_ext._write_ninja_file = _patched_writer
+        try:
+            return super().build_extensions()
+        finally:
+            _torch_cpp_ext._write_ninja_file = orig_writer
+
+
+def _verify_macro_names(inject):
+    """Best-effort drift check: the macro names we emit are guarded by the
+    kernel header. Loud warning on mismatch; never fatal (design 1c)."""
+    try:
+        header = os.path.join(_REPO_ROOT, "grokking_optimizers", "kernels",
+                              "sm_90", "adamw_sm90.cuh")
+        if not os.path.isfile(header):
+            return
+        with open(header, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        missing = [name for name in inject.header_default_macros()
+                   if name not in text]
+        if missing:
+            print("  [tuned-inject] WARNING: macro name(s) in the injector "
+                  f"source-of-truth are NOT guarded by {os.path.basename(header)}: "
+                  f"{missing}. Emitting them anyway, but they may be silent "
+                  "no-ops — reconcile _tuned_inject.MACROS with the header "
+                  "(#ifndef SG_TUNED_*).")
+    except Exception:  # noqa: BLE001 — diagnostic only.
+        pass
+
+
 setup(
     name="grokking-optimizers",
     version="3.0.0",
@@ -708,11 +879,19 @@ setup(
             "kernels/sm_90/*.cuh",
             "kernels/gfx942/*.hip.hpp",
             "kernels/gfx942/*.cuh",
+            # Lever (b): ship the canonical autotuner winners when a wheel is
+            # built on a tuned host (gitignored in source — see .gitignore).
+            # Absent, the build uses in-header defaults.
+            "_kernel_tuned.json",
         ],
     },
     include_package_data=True,
     ext_modules=[ext],
-    cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
+    # Lever (b): TunedBuildExtension injects per-TU autotuned nvcc flags from
+    # grokking_optimizers/_kernel_tuned.json (degrades to stock BuildExtension
+    # behavior when the JSON is absent). use_ninja=True is REQUIRED — the
+    # injection hook patches the ninja-path _write_ninja_file.
+    cmdclass={"build_ext": TunedBuildExtension.with_options(use_ninja=True)},
     python_requires=">=3.10",
     install_requires=["torch>=2.0.0"],
     extras_require={

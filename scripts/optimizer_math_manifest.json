@@ -1,5 +1,17 @@
 {
-  "_doc": "WS2 drift guard: normalized hashes of the canonical csrc/algorithms/<opt>.h math. Regenerate with `--update-manifest` ONLY when intentionally changing the canonical math (and after syncing the gfx942/TPU re-expressions).",
+  "_doc": "WS2 drift guard: normalized hashes of the canonical csrc/algorithms/<opt>.h math (`hashes`) AND of the pybind binding entrypoints in csrc/bindings/bindings.cpp (`binding_regions`: boundary guards + bias-correction + argument plumbing). Regenerate with `--update-manifest` ONLY when intentionally changing the canonical math (and after syncing the gfx942/TPU re-expressions) or the binding entrypoints.",
+  "binding_regions": {
+    "grokadamw_fused_step": "ccf8b9575ca6bf62c1996585ba10c96b0bcd248bc9ea03c530bcf5861a641fb4",
+    "grokfast_fused_ema_adam_step": "65f9093d4d114ec4ecf8dd5429de8f9510813b4192ad7f4505ca88d70102f2b3",
+    "lion_fused_step": "270679eadeb9db749068818e698baeb74deb85b69198aad3cac049c5c7d889a1",
+    "muon_fused_step": "80e6f83d339d008fa751190411998accd37f85114a1611c0c363ce2dc511d23e",
+    "neuralgrok_fused_step": "5e0049ec5590c265808b585ab5e431840b0395595125c167aceb218d92bfc376",
+    "prodigy_fused_step": "c46f4394c314f422f6eba5938e8902bf5fe8663667e7ee0f69c9e7dbb2653459",
+    "supergrok11_fused_step": "6ca13b57acf243b1a3baaeebd4dd3b428a684c00f0d527d2817afdf7471b3452",
+    "supergrok15_fused_step": "268c23ddf6fe36b6ad985e3aba4d7b7b5c44b23d47c0278d69ed20f7f86d3a36",
+    "supergrok2_batched_step": "0dd33ec21edfc9f20139b8884d0e7e661eaf2233389ff54bf6c55982c54dd85d",
+    "supergrok2_prepare_and_batched_step": "8121742e2148a725798d42c7328894aa61f26c749b88deffbc4b5e93e90d98e8"
+  },
   "hashes": {
     "adamw": "63b7c22c88a93b0169b108f107a2d92949e267e35543f9d8ea59464525a8a299",
     "grokadamw": "a013e9867c648d5cd5879e32af709aaada913ca01ae21be590aa98bd79715d42",
@@ -11,6 +23,6 @@
     "prodigy": "42185881a56b92453587fa7c58e05472876cede6801160f40dbb0de705946f8d",
     "supergrok11": "41baebea99e4b30bd4f1879dfb6d610093194d7a0f169685fd34467133161e41",
     "supergrok15": "fcef03e5c3571f4a4965b2e2a2de483d21679a00129ce894f0ad83c9f38599db",
-    "supergrok2": "3717a80ee51444b2c5e48f599f6ed29e8142eb914520388b19bddfaedc543b7a"
+    "supergrok2": "fdf5c82eb9278b942f83927f8b690e7735a45c76fcbb55b029bc25335e0921a2"
   }
 }
