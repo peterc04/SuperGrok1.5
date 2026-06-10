@@ -61,6 +61,45 @@ _PRECISION_PEAK = {
     "fp8": PEAKS["fp8_tc"], "fp8e5m2": PEAKS["fp8_tc"], "int8": PEAKS["int8_tc"],
 }
 
+# [R2.4 item 2] BATCH-SATURATION SWEEP (decoder, min-of-3 wall, quiet GPU). The
+# operating-point evidence: the one-CTA-per-SM TC megakernel is occupancy-pinned, so
+# its throughput (samples/s = achieved FLOP/s, FLOPs linear in B) saturates at B≈2k
+# (one 16-row dW atom × 132 SMs ≈ 2112) and DECLINES past 16k — batch does NOT buy
+# roofline fraction for it. Eager (cuBLAS batched GEMMs) saturates much later (≈32-65k)
+# because it is not occupancy-capped. B=16384 is the chosen shared point (owner's
+# "B≈16k+" floor; megakernel within 3.5% of its peak there; eager at its knee). This
+# is the honest negative result (no-suppression): the path to higher megakernel
+# fraction is multi-CTA-per-tensor tiling, NOT a larger batch. Tables stored in the
+# run JSON as `batch_saturation_sweep`.
+BATCH_SATURATION_SWEEP = {
+    "note": ("decoder, min-of-3 wall, quiet GPU (tuner fleet SIGSTOPped). "
+             "throughput = samples/s ∝ achieved FLOP/s. megakernel = TC "
+             "tc_train_step (one CTA/SM); eager = lion fwd+bwd+step bf16-autocast."),
+    "megakernel_tc": [
+        {"B": 1024,   "wall_ms": 8.820,    "throughput_samples_per_s": 116098, "peak_vram_gb": 0.250},
+        {"B": 2048,   "wall_ms": 14.374,   "throughput_samples_per_s": 142477, "peak_vram_gb": 0.524},
+        {"B": 4096,   "wall_ms": 28.714,   "throughput_samples_per_s": 142646, "peak_vram_gb": 0.630},
+        {"B": 8192,   "wall_ms": 58.173,   "throughput_samples_per_s": 140821, "peak_vram_gb": 0.840},
+        {"B": 16384,  "wall_ms": 119.077,  "throughput_samples_per_s": 137591, "peak_vram_gb": 1.260},
+        {"B": 32768,  "wall_ms": 255.077,  "throughput_samples_per_s": 128463, "peak_vram_gb": 2.103},
+        {"B": 65536,  "wall_ms": 505.165,  "throughput_samples_per_s": 129732, "peak_vram_gb": 3.787},
+        {"B": 131072, "wall_ms": 1022.129, "throughput_samples_per_s": 128234, "peak_vram_gb": 7.154},
+    ],
+    "eager_lion": [
+        {"B": 4096,   "wall_ms": 6.472,   "throughput_samples_per_s": 632904,  "peak_vram_gb": 0.220},
+        {"B": 8192,   "wall_ms": 14.245,  "throughput_samples_per_s": 575065,  "peak_vram_gb": 0.368},
+        {"B": 16384,  "wall_ms": 14.353,  "throughput_samples_per_s": 1141497, "peak_vram_gb": 0.583},
+        {"B": 32768,  "wall_ms": 19.007,  "throughput_samples_per_s": 1724025, "peak_vram_gb": 1.096},
+        {"B": 65536,  "wall_ms": 35.794,  "throughput_samples_per_s": 1830900, "peak_vram_gb": 2.120},
+        {"B": 131072, "wall_ms": 69.709,  "throughput_samples_per_s": 1880273, "peak_vram_gb": 4.170},
+        {"B": 262144, "wall_ms": 137.169, "throughput_samples_per_s": 1911100, "peak_vram_gb": 8.269},
+    ],
+    "verdict": ("megakernel saturates ~8× below the owner's 16k estimate (occupancy "
+                "pinned at 1 CTA/SM); eager saturates ~32-65k. VRAM is NOT the binding "
+                "constraint at d=128 (literal VRAM-max ≈ B~1-2M yields no fraction gain). "
+                "16384 = fair shared point + megakernel ceiling."),
+}
+
 OPTS = ["adamw", "neuralgrok", "grokadamw", "supergrok", "supergrok15",
         "supergrok2", "grokfast", "muon", "lion", "looksam", "prodigy"]
 
@@ -133,6 +172,32 @@ def _data_init(model):
     return _CACHE[model]
 
 
+def _tile_train_data(data, B):
+    """DETERMINISTIC repeat-tile the TRAIN split (tx, ty) of a race data tuple up
+    to exactly B rows (owner directive R2.4 item 2: "tile data if dataset<max;
+    full-batch repeated/tiled deterministically"). The race train functions consume
+    the WHOLE (tx, ty) every step (full-batch grokking), so a larger tx/ty IS a
+    larger train batch — this is the only surface needed to drive the megakernel /
+    eager paths at B without touching the train loop.
+
+    Tiling is index-only (``idx = arange(B) % n_train``) — NO RNG, NO new samples:
+    sample i appears ⌈B/n⌉ times, byte-identical across runs, so the wall, FLOPs/step
+    and peak VRAM are reproducible. If B <= n_train we truncate (never upsample past
+    the requested B). The eval/val/test splits (vax..tey) pass through UNCHANGED —
+    the roofline disables eval (eval_every=1e9) so they are never touched; keeping
+    them intact preserves the train-fn signature.
+
+    data = (tx, ty, vax, vay, tex, tey). Returns the same tuple with tx, ty tiled.
+    """
+    import torch
+    tx, ty = data[0], data[1]
+    n = tx.shape[0]
+    if B is None or B == n:
+        return data
+    idx = torch.arange(B, device=tx.device) % n     # deterministic, RNG-free
+    return (tx[idx], ty[idx]) + tuple(data[2:])
+
+
 def bytes_per_step(opt, model, n_params, batch, seq, dim, layers):
     """Analytical main-memory traffic per training step (bytes, fp32).
 
@@ -191,10 +256,18 @@ def _resolve_precision(opt, model, tuned_configs):
 
 
 def measure_pipeline(opt, model, timed_steps, tuned_configs=None,
-                     force_precision=None):
+                     force_precision=None, max_batch=None):
     import torch
     g = _g()
     data, init, n_params = _data_init(model)
+    # [R2.4-MAXBATCH item 2] train every cell at the per-model max batch (same B
+    # within a model, deterministic repeat-tile of the native train split). B is
+    # chosen at the SM-saturation operating point (16384 by default — one 128-row
+    # tile per 132 SMs; the megakernel's one-CTA-per-SM throughput is already within
+    # ~3.5% of its 4k-batch peak there, and eager is at its utilization knee). The
+    # wall, FLOPs/step and peak VRAM below are then all measured AT this batch.
+    if max_batch is not None:
+        data = _tile_train_data(data, max_batch)
     dev = torch.device("cuda")
     # [A6-HIGH] per-pipeline precision: prefer the tuner's winning precision for
     # this (opt, model); fall back to the auto-resolved default. Applied to EVERY
@@ -266,6 +339,18 @@ def measure_pipeline(opt, model, timed_steps, tuned_configs=None,
     # REAL megakernel is what is timed.
     g._try_fused_train_step = _wrap_l3
     g._try_fused_step = _wrap_l1
+    # [R2.4-PEAKVRAM item 2] capture PEAK VRAM of the PRODUCTION path only. This MUST
+    # be measured during the wall pass (use_fused=True → the real megakernel/L1 path),
+    # NOT across the whole function: pass 3 (FLOP count) runs use_fused=False → EAGER
+    # for every cell, and eager allocates the full activation graph while the
+    # megakernel keeps activations CTA-local. A whole-function max_memory_allocated
+    # would report the eager-flop-pass VRAM for the 3 adamw megakernel cells —
+    # misrepresenting exactly the production paths this table exists to characterise.
+    # Reset before the warmup so the reading is steady-state (warmup transients
+    # included is fine — they ARE part of the path's footprint), capture right after
+    # the timed walls and BEFORE pass 2/3.
+    torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
+    peak_vram_bytes = None
     try:
         c = _cfgp(25, 10**9)
         torch.manual_seed(42)
@@ -279,6 +364,7 @@ def measure_pipeline(opt, model, timed_steps, tuned_configs=None,
             fn(c, init, *data, dev, bp=0)
             torch.cuda.synchronize()
             walls.append(time.perf_counter() - t0)
+        peak_vram_bytes = int(torch.cuda.max_memory_allocated())  # production-path peak
     finally:
         g._try_fused_train_step = _orig_l3
         g._try_fused_step = _orig_l1
@@ -402,7 +488,12 @@ def measure_pipeline(opt, model, timed_steps, tuned_configs=None,
         "steps_per_s": 1.0 / wall_per_step,
         "wall_per_step_ms": wall_per_step * 1e3,
         "flops_per_step": flops_per_step,
-        "batch": int(batch),              # full-batch size (for TC-row FLOP scaling)
+        "batch": int(batch),              # the ACTUAL train batch this row ran at
+        # [R2.4 item 2] PEAK VRAM (torch.cuda.max_memory_allocated) of the PRODUCTION
+        # path, measured during the wall pass (use_fused=True), NOT the eager flop
+        # pass. None only if the wall pass raised before capture.
+        "peak_vram_bytes": peak_vram_bytes,
+        "max_batch_requested": (int(max_batch) if max_batch is not None else None),
         "seq_for_acts": int(seq), "dim_for_acts": int(dc.get("dim_model", 128)),
         "layers_for_acts": int(dc.get("num_layers", 2)),
         "bytes_per_step_analytical": bps,
@@ -777,6 +868,18 @@ def main():
     ap.add_argument("--tc-models", default="",
                     help="models to ALSO measure via the standalone TC + scalar megakernel "
                          "TUs (default off; the bf16 race rows already exercise the TC path)")
+    # [R2.4 item 2] MAX-BATCH operating point. Every cell trains at this batch (same
+    # B within a model, deterministic repeat-tile of the native ~4.2k-pair train
+    # split). Default 16384 = the owner's "B≈16k+ fills 132 SMs" floor (≈ one 128-row
+    # tile per 132 SMs). MEASURED: the one-CTA-per-SM megakernel already saturates at
+    # B≈2k (within 96% of peak from 2048 on; one 16-row dW atom per SM ≈ 2112) and
+    # DECLINES past 16k, while eager (cuBLAS batched GEMMs) is at its utilization knee
+    # at 16k (~60% of its 32-65k plateau). 16384 is the shared point that is fair to
+    # both and is the megakernel ceiling (larger only hurts it). Pass 0 for the native
+    # per-model batch (no tiling).
+    ap.add_argument("--max-batch", type=int, default=16384,
+                    help="train every cell at this batch (deterministic repeat-tile; "
+                         "default 16384 = SM-saturation operating point; 0 = native batch)")
     ap.add_argument("--baseline", default=str(ROOT / "results" / "h100_grokking_race"
                     / "archive" / "roofline_eager_baseline_20260610.json"),
                     help="archived eager roofline.json to diff against for deltas")
@@ -785,9 +888,10 @@ def main():
     opts = [o for o in args.opts.split(",") if o]
     tc_models = [m for m in args.tc_models.split(",") if m]
     force_prec = args.force_precision or None
+    max_batch = args.max_batch if args.max_batch and args.max_batch > 0 else None
     OUT.mkdir(parents=True, exist_ok=True)
-    print(f"[roofline] force_precision={force_prec!r}  TASK1 scalar rows + "
-          f"TASK2/3 TC cells for {tc_models}", flush=True)
+    print(f"[roofline] force_precision={force_prec!r}  max_batch={max_batch}  "
+          f"TASK1 race rows + TASK2/3 TC cells for {tc_models}", flush=True)
     rows = []
     # ── TASK 1: scalar race rows, fp32-forced (adamw → real L3 megakernel) ──
     for model in models:
@@ -795,15 +899,16 @@ def main():
         for opt in opts:
             try:
                 r = measure_pipeline(opt, model, args.steps, tuned_configs=tuned,
-                                     force_precision=force_prec)
+                                     force_precision=force_prec, max_batch=max_batch)
                 rows.append(r)
+                _pv = r.get("peak_vram_bytes")
+                _pvs = f"{_pv/1e9:5.2f}GB" if _pv else "  n/a "
                 print(f"  {opt:11s}/{model:7s} [{r['precision']:5s}|{r['path']:22s}] "
+                      f"B={r['batch']:>6} "
                       f"{r['steps_per_s']:7.1f} steps/s  "
-                      f"{r['flops_per_step']/1e9:7.2f} GF/step  "
                       f"achieved={r['achieved_flops_per_s']/1e12:6.3f} TF/s  "
-                      f"AI={r['arithmetic_intensity']:6.1f}  "
                       f"roof%={100*r['fraction_of_roofline']:6.2f}  "
-                      f"({r['bound_regime_at_AI']})", flush=True)
+                      f"VRAM={_pvs}  ({r['bound_regime_at_AI']})", flush=True)
             except Exception as e:
                 import traceback
                 print(f"  {opt}/{model} FAILED: {e}", flush=True)
@@ -839,11 +944,49 @@ def main():
             traceback.print_exc()
 
     deltas = _delta_vs_baseline(rows, args.baseline)
+    # [R2.4 item 2] PEAK-VRAM table per pipeline (model × optimizer), production-path
+    # peak measured during the wall pass. Grouped by model with the per-model batch.
+    vram_table = []
+    for r in rows:
+        pv = r.get("peak_vram_bytes")
+        vram_table.append({
+            "model": r["model"], "optimizer": r["optimizer"],
+            "path_family": r.get("path_family"), "path": r.get("path"),
+            "batch": r.get("batch"),
+            "peak_vram_bytes": pv,
+            "peak_vram_gb": (round(pv / 1e9, 4) if pv else None),
+        })
+    # [R2.4 item 2] the baseline JSON predates max-batch tiling (native ~4.2k batch),
+    # so `deltas_vs_eager` is BATCH-CONFOUNDED — a fraction move there mixes path +
+    # precision + ceiling + BATCH. ROOFLINE.md leads with absolute TF/s and ignores
+    # these deltas; flag it so no reader mistakes a batch effect for a path effect.
+    _baseline_batch_differs = (max_batch is not None)
     (OUT / "roofline.json").write_text(json.dumps(
         {"peaks": PEAKS, "force_precision": force_prec,
+         "max_batch": max_batch,
          "baseline_for_deltas": args.baseline,
+         "baseline_batch_differs": _baseline_batch_differs,
+         "deltas_batch_confounded_note": (
+             "deltas_vs_eager compares max-batch rows against a native-batch baseline; "
+             "a fraction move there mixes batch with path/precision — read absolute "
+             "achieved_flops_per_s, not the delta." if _baseline_batch_differs else None),
+         "batch_saturation_sweep": BATCH_SATURATION_SWEEP,
+         "peak_vram_table": vram_table,
          "rows": rows, "deltas_vs_eager": deltas}, indent=2))
     print(f"wrote {OUT/'roofline.json'}", flush=True)
+    # ── PEAK-VRAM table to stdout (per pipeline, grouped by model) ──
+    print(f"\n[roofline] PEAK VRAM per pipeline (production path, B={max_batch}, "
+          f"torch.cuda.max_memory_allocated during the wall pass):", flush=True)
+    for model in models:
+        mrows = [v for v in vram_table if v["model"] == model]
+        if not mrows:
+            continue
+        b = next((v["batch"] for v in mrows if v["batch"]), "?")
+        print(f"  ── {model} (B={b}) ──", flush=True)
+        for v in mrows:
+            pg = f"{v['peak_vram_gb']:6.3f} GB" if v["peak_vram_gb"] is not None else "   n/a  "
+            print(f"     {v['optimizer']:11s} [{str(v['path_family']):6s}] "
+                  f"peak={pg}  ({v['path']})", flush=True)
     if deltas:
         print("\n[roofline] DELTAS vs eager baseline — fraction moves confound PATH "
               "+ PRECISION + CEILING; achieved TF/s is the honest axis:", flush=True)
