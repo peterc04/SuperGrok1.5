@@ -65,6 +65,29 @@
 #include <cstdint>
 #include <cassert>
 
+// ── GEMM-impl seam (the decoder/vit pattern, owner directive: BOTH paths
+//    compiled, the tuner picks). The SCALAR default body above is the live path
+//    and its gates stay bit-identical; selecting the wgmma token pulls in the
+//    Fork-B tensor-core CELL DRIVER (model_stage_mamba_tc.cuh + the _tc kernel/
+//    launcher at the bottom). This is a PARALLEL kernel — nothing here edits the
+//    scalar path. ──
+#ifndef SG_GEMM_IMPL_SCALAR
+#define SG_GEMM_IMPL_SCALAR 0
+#endif
+#ifndef SG_GEMM_IMPL_WGMMA
+#define SG_GEMM_IMPL_WGMMA  1
+#endif
+#ifndef SG_TUNED_GEMM_IMPL
+#define SG_TUNED_GEMM_IMPL SG_GEMM_IMPL_SCALAR
+#endif
+#if (SG_TUNED_GEMM_IMPL != SG_GEMM_IMPL_SCALAR) && \
+    (SG_TUNED_GEMM_IMPL != SG_GEMM_IMPL_WGMMA)
+#error "SG_TUNED_GEMM_IMPL must be SG_GEMM_IMPL_SCALAR (0) or SG_GEMM_IMPL_WGMMA (1)"
+#endif
+#if (SG_TUNED_GEMM_IMPL == SG_GEMM_IMPL_WGMMA)
+#include "csrc/fused/sm_90/model_stage_mamba_tc.cuh"
+#endif
+
 namespace sg { namespace fused { namespace sm90 {
 
 // Compile-time guard: the byte budget the launcher uses (kMambaSmemBytes) MUST
@@ -119,7 +142,7 @@ struct MambaTokenCtx {
 // __constant__ tables kMambaSizes/kMambaOffsets (mamba3_layout.cuh), read directly
 // by the reduce + optimizer phases.
 template <OptId Opt>
-__global__ void __launch_bounds__(256)
+__global__ void __launch_bounds__(SG_TUNED_MEGA_BLOCK)
 fused_mamba_megakernel(PersistentContext ctx,
                        float* __restrict__ params,
                        MambaTokenCtx tok,
@@ -141,7 +164,7 @@ fused_mamba_megakernel(PersistentContext ctx,
     // SYMMETRIC selective-scan work, each thread owning a channel j∈[0,256) and
     // holding large register-resident scan state (fwd A[16]+h[16]; bwd adds
     // hh[kSeq+1][kState]+a_save[kSeq][kState]+dB_loc/dC_loc[kSeq][kState]+gh+dA),
-    // so a dealloc<32> would spill it. __launch_bounds__(256) sets the uniform
+    // so a dealloc<32> would spill it. __launch_bounds__(SG_TUNED_MEGA_BLOCK) sets the uniform
     // budget; the compiler allocates symmetrically across all 256 threads.
 
     // ── P0: zero this CTA's grad-partial slice + its loss slot. ───────────────
@@ -251,7 +274,7 @@ cudaError_t launch_fused_mamba_megakernel(
     // (2) Occupancy with the REAL dynamic-smem request (hang-freedom is honest).
     int occ = 0;
     err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &occ, (const void*)&fused_mamba_megakernel<Opt>, 256,
+        &occ, (const void*)&fused_mamba_megakernel<Opt>, SG_TUNED_MEGA_BLOCK,
         /*dynamicSMemBytes=*/dyn_smem);
     if (err != cudaSuccess) return err;
     // At least one CTA per SM must be resident or the grid barrier can never be
@@ -272,11 +295,191 @@ cudaError_t launch_fused_mamba_megakernel(
     if (ctx.g_next_task) { err = cudaMemsetAsync(ctx.g_next_task, 0, sizeof(int), stream); if (err) return err; }
 
     // (3) Launch WITH the dynamic-smem byte count.
-    dim3 grid(launch_ctas), block(256);
+    dim3 grid(launch_ctas), block(SG_TUNED_MEGA_BLOCK);
     fused_mamba_megakernel<Opt><<<grid, block, dyn_smem, stream>>>(
         ctx, params, tok, grad, lr, step, st);
     return cudaGetLastError();
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+//  WGMMA CELL DRIVER (Fork B, R2 Mamba TC). Compiled only under the wgmma token;
+//  the scalar path above is untouched. UNLIKE the scalar Mamba megakernel, this
+//  uses STATIC smem (the per-(layer,sample) activation cache lives in HBM tile-
+//  scratch, NOT smem — so NO dynamic-smem opt-in; the decoder TC launcher's
+//  contract, not the scalar mamba launcher's three-step opt-in).
+// ════════════════════════════════════════════════════════════════════════════
+#if (SG_TUNED_GEMM_IMPL == SG_GEMM_IMPL_WGMMA)
+
+// TC megakernel threads: 256 (the scan owns channels 0..255; the wgmma is
+// warpgroup-scoped on threads 0..127). No asymmetric setmaxnreg.
+#define SG_MB_TC_MEGA_BLOCK 256
+
+// ── Static smem arena: one A(64×16) + one B(N×16) bf16 tile + the 256-float
+//    reduction slot + the scan-bwd cross-channel reduce targets (dBmat/dCmat,
+//    [kSeq×kState] each) + the 8 dW specs (shared, not per-thread stack). ──
+struct MbTcSmem {
+    __nv_bfloat16 sA[64 * 16];
+    __nv_bfloat16 sB[SG_TUNED_TILE_N * 16];
+    float red[256];
+    float dBmat[mb::kSeq * mb::kState];
+    float dCmat[mb::kSeq * mb::kState];
+    mbtc::MbDwSpec spec[8];
+};
+
+// TC workspace layout (carved from tok.workspace; host sizes it):
+//   [0 .. acts_f)                          : MbActs bf16 region
+//   [acts_f .. + nCTA*scratch)             : per-CTA tile scratch (f32)
+//   [.. + nCTA*kPartElems)                 : per-CTA non-GEMM grad partials (f32)
+//   [.. + nCTA)                            : per-CTA loss slots
+//   [.. + 1)                               : reduced scalar loss
+__host__ __device__ __forceinline__ int64_t mb_tc_acts_floats(int T) {
+    return mbtc::mb_acts_floats(T);
+}
+__host__ __device__ __forceinline__ int64_t mb_tc_workspace_floats(int T, int nCTA) {
+    return mb_tc_acts_floats(T)
+         + (int64_t)nCTA * mbtc::mb_tile_scratch_floats()
+         + (int64_t)nCTA * mbtc::kPartElems
+         + nCTA + 1;
+}
+
+template <OptId Opt>
+__global__ void __launch_bounds__(SG_MB_TC_MEGA_BLOCK)
+fused_mamba_megakernel_tc(PersistentContext ctx,
+                          float* __restrict__ params,
+                          MambaTokenCtx tok,
+                          float* __restrict__ grad,
+                          float lr, int step, FusedOptState st) {
+    __shared__ MbTcSmem sm;
+    GridBarrier bar = ctx.barrier();
+    const int cta = blockIdx.x;
+    const int nCTA = (int)ctx.n_ctas;
+    const int B = tok.B;
+    const int T = B * mb::kSeq;
+
+    // Workspace partition.
+    float* ws = tok.workspace;
+    const int64_t acts_f = mb_tc_acts_floats(T);
+    __nv_bfloat16* acts_base = reinterpret_cast<__nv_bfloat16*>(ws);
+    float* scratch_base = ws + acts_f;
+    const int64_t scratch_per = mbtc::mb_tile_scratch_floats();
+    float* part_base = scratch_base + (int64_t)nCTA * scratch_per;
+    float* loss_part = part_base + (int64_t)nCTA * mbtc::kPartElems;
+    float* loss_out  = loss_part + nCTA;
+
+    mbtc::MbActs acts = mbtc::mb_acts_bind(acts_base, T);
+    mbtc::MbTileScratch sc = mbtc::mb_tile_scratch_bind(scratch_base + (int64_t)cta * scratch_per);
+    float* my_part = part_base + (int64_t)cta * mbtc::kPartElems;
+    mbtc::MbPartial part = mbtc::mb_partial_bind(my_part);
+
+    MambaWeights w = mb_bind(params);
+
+    // ── P0: zero this CTA's non-GEMM grad partial + loss slot. ──
+    for (int64_t i = threadIdx.x; i < mbtc::kPartElems; i += blockDim.x) my_part[i] = 0.0f;
+    if (threadIdx.x == 0) loss_part[cta] = 0.0f;
+    bar.sync();   // B0
+
+    // ── P1: sample-tile-parallel fwd+bwd. Each CTA grid-strides over tiles of
+    //    kTileM rows; fwd (→ acts X, NLL) then bwd (→ acts dY, dh0, partial). ──
+    const int nrows_tile = mbtc::kTileM;
+    const int n_tiles = (T + nrows_tile - 1) / nrows_tile;
+    float nll_acc = 0.0f;
+    for (int ti = cta; ti < n_tiles; ti += nCTA) {
+        const int g0 = ti * nrows_tile;
+        const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
+        float nll = mbtc::mbtc_forward_tile(w, g0, nrows, acts, sc, tok.tokens, tok.targets,
+                                            sm.sA, sm.sB, sm.red);
+        mbtc::mbtc_backward_tile(w, g0, nrows, B, acts, sc, part, tok.tokens, tok.targets,
+                                 sm.sA, sm.sB, sm.red, sm.dBmat, sm.dCmat);
+        if (threadIdx.x == 0) nll_acc += nll;
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) loss_part[cta] = nll_acc;
+    bar.sync();   // B1: all acts (X + dY + dh0) + partials complete
+
+    // ── P2: assemble all 28 grads. 8 projection dW output-stationary (gt %
+    //    nCTA), dt_proj.bias, non-GEMM partial-reduce, embedding owner-scan. ──
+    if (threadIdx.x == 0) mbtc::mbtc_build_dw_specs(acts, T, sm.spec);
+    __syncthreads();
+    mbtc::MbDwSpec* spec = sm.spec;
+    const int n_dw = mbtc::mbtc_dw_total_tiles<SG_TUNED_TILE_N>(spec);
+    for (int gt = cta; gt < n_dw; gt += nCTA)
+        mbtc::mbtc_dw_run_tile<SG_TUNED_TILE_N>(spec, gt, grad, sm.sA, sm.sB);
+    mbtc::mbtc_dw_biases(spec, grad);
+    mbtc::mbtc_partial_reduce(part_base, grad, nCTA, cta);
+    mbtc::mbtc_embed_owner_scan(acts, tok.tokens, T, grad, cta, nCTA);
+    // Loss reduce (fp64 ordered) by CTA 0.
+    if (cta == 0 && threadIdx.x == 0) {
+        double s = 0.0;
+        for (int c = 0; c < nCTA; ++c) s += (double)loss_part[c];
+        *tok.loss_out = (float)(s / (double)B);
+    }
+    (void)loss_out;
+    bar.sync_reset(ctx.g_next_task);   // B2: reduced grad ready; reset queue
+
+    // ── P3: the REAL optimizer tail over the reduced grad (work-steal 28). ──
+    st.lr = lr;
+    {
+        __shared__ int task_slot;
+        TaskQueue q = ctx.queue();
+        for (int t = q.next_block(&task_slot); t < kMambaNumTensors;
+             t = q.next_block(&task_slot)) {
+            const int n = kMambaSizes[t];
+            const int64_t off = (int64_t)kMambaOffsets[t];
+            const FusedOptState ts = mamba_rebase_state<Opt>(st, off);
+            float* __restrict__ p = params + off;
+            const float* __restrict__ gg = grad + off;
+            for (int i = threadIdx.x; i < n; i += blockDim.x)
+                apply_optimizer<Opt>(p, gg, (int64_t)i, step, ts);
+        }
+    }
+}
+
+// Launcher (static-smem; the decoder TC contract). ncta_cap>0 caps the launched
+// CTAs (the per-CTA scratch is nCTA×slab; a memory-tight TEST caps it). Grid
+// barrier rendezvous is over the LAUNCHED count → hang-safe; determinism is per
+// fixed nCTA (dW-tile / partial / embed owner maps read ctx.n_ctas). B%16 req.
+template <OptId Opt>
+cudaError_t launch_fused_mamba_megakernel_tc(
+        PersistentContext ctx, float* params, MambaTokenCtx tok,
+        float* grad, float lr, int step, FusedOptState st, cudaStream_t stream,
+        int ncta_cap = 0) {
+    int dev = 0;
+    cudaError_t err = cudaGetDevice(&dev);
+    if (err != cudaSuccess) return err;
+    int n_sms = 0;
+    err = cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, dev);
+    if (err != cudaSuccess) return err;
+
+    int occ = 0;
+    err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &occ, (const void*)&fused_mamba_megakernel_tc<Opt>, SG_MB_TC_MEGA_BLOCK,
+        /*dynamicSMemBytes=*/0);
+    if (err != cudaSuccess) return err;
+    if (occ < 1) return cudaErrorLaunchOutOfResources;
+
+    unsigned launch_ctas = (unsigned)n_sms;
+    if (ncta_cap > 0 && (unsigned)ncta_cap < launch_ctas) launch_ctas = (unsigned)ncta_cap;
+    ctx.n_ctas = launch_ctas;
+    // B%16: the dW K-loop contracts K=T=B·8 in 16-step atoms. It ALSO guarantees
+    // FULL tiles (T%kTileM==0 for kTileM∈{64,128}), which the projection GEMMs
+    // REQUIRE — they process a compile-time M-extent of kTileM rows (kAtomsM
+    // atoms), NOT the runtime `nrows`; a partial final tile would feed garbage
+    // pad rows to the wgmma while the scalar scan/conv loops process only nsamp.
+    // (A future relaxation to B%2 would satisfy the K-atom reason but silently
+    // break partial tiles — keep B%16.)
+    if ((tok.B % 16) != 0) return cudaErrorInvalidValue;
+
+    if (ctx.g_arrived) { err = cudaMemsetAsync(ctx.g_arrived, 0, sizeof(unsigned), stream); if (err) return err; }
+    if (ctx.g_generation) { err = cudaMemsetAsync(ctx.g_generation, 0, sizeof(unsigned), stream); if (err) return err; }
+    if (ctx.g_next_task) { err = cudaMemsetAsync(ctx.g_next_task, 0, sizeof(int), stream); if (err) return err; }
+
+    dim3 grid(launch_ctas), block(SG_MB_TC_MEGA_BLOCK);
+    fused_mamba_megakernel_tc<Opt><<<grid, block, 0, stream>>>(
+        ctx, params, tok, grad, lr, step, st);
+    return cudaGetLastError();
+}
+
+#endif  // SG_TUNED_GEMM_IMPL == SG_GEMM_IMPL_WGMMA
 
 }}} // namespace sg::fused::sm90
 
