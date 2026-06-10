@@ -579,12 +579,14 @@ __device__ __forceinline__ int si_global(int g0, int si) { return g0 / dec::kSeq
 //  DATAFLOW (DecActs X-regions = bf16 dW operands AND inter-stage operands;
 //  dedicated fp32 scratch for residuals/LN; weights convert fp32→bf16 on read):
 //    X_in[li]  := layer input (bf16)           [embedding for li=0]
-//    qkv(bf16) := X_in @ in_w^T
+//    qkv(bf16) := X_in @ in_w^T + in_b   (in_b folded fp32 → re-round bf16)
 //    ctx       := attn(qkv) → X_ctx[li] (bf16, out_proj input + dW operand)
-//    a(work)   := X_ctx @ out_w^T ; r1=X_in+a (work); n1(r1)→x1(fp32)→X_x1[li]
-//    ff0(work) := X_x1 @ ff0_w^T → ff0pre(bf16); gelu→X_gact[li](bf16)
-//    ff2(work) := X_gact @ ff2_w^T ; r2=x1+ff2 (work); n2(r2)→X_in[li+1]
+//    a(work)   := X_ctx @ out_w^T ; r1=X_in+a+out_b (work); n1(r1)→x1(fp32)→X_x1[li]
+//    ff0(work) := X_x1 @ ff0_w^T ; (ff0+ff0_b)→ff0pre(bf16); gelu(ff0+ff0_b)→X_gact[li](bf16)
+//    ff2(work) := X_gact @ ff2_w^T ; r2=x1+ff2+ff2_b (work); n2(r2)→X_in[li+1]
 //                 (last layer: n2→finalin fp32, the head input)
+//  BIASES (in/out/ff0/ff2) are folded in fp32 at these points (the oracle adds
+//  them in fp32 after the bf16 matmul); LN β + head out_b were already applied.
 // ════════════════════════════════════════════════════════════════════════
 __device__ float dectc_forward_tile(
         const DecWeights& w, int g0, int nrows, const DecActs& acts,
@@ -606,8 +608,16 @@ __device__ float dectc_forward_tile(
     for (int li = 0; li < dec::kLayers; ++li) {
         const DecWeights::Layer& L = w.layer[li];
         const __nv_bfloat16* Xin = acts.X_in[li] + (int64_t)g0 * dec::kD;        // [nrows,d]
-        // qkv = Xin @ in_w^T   (N=3d, K=d). bf16 → scratch.qkv[li].
+        // qkv = Xin @ in_w^T + in_b   (N=3d, K=d). bf16 → scratch.qkv[li].
         dectc_gemm_fwd<SG_TUNED_TILE_N>(Xin, L.in_w, sc.qkv[li], dec::kD, 3 * dec::kD, sA, sB);
+        __syncthreads();
+        // add in_b (the fwd GEMM did W only; bias folded in scalar here for qkv —
+        // matches the bf16-faithful oracle qkv = bf(x_in @ bf(in_w)^T + in_b)).
+        for (int idx = threadIdx.x; idx < nrows * 3 * dec::kD; idx += blockDim.x) {
+            const int j = idx % (3 * dec::kD);
+            float v = __bfloat162float(sc.qkv[li][idx]) + L.in_b[j];
+            sc.qkv[li][idx] = __float2bfloat16(v);
+        }
         __syncthreads();
         // attention → ctx (work fp32) + attn[li] weights.
         dectc_attn_fwd_tile(sc.qkv[li], nrows, sc.work, sc.attn[li]);
@@ -617,14 +627,15 @@ __device__ float dectc_forward_tile(
             acts.X_ctx[li][(int64_t)(g0 + r) * dec::kD + j] = __float2bfloat16(sc.work[(int64_t)r * dec::kD + j]);
         }
         __syncthreads();
-        // a = X_ctx @ out_w^T  (N=d, K=d). fp32 → work.
+        // a = X_ctx @ out_w^T (+ out_b)  (N=d, K=d). fp32 → work.
         dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_ctx[li] + (int64_t)g0 * dec::kD, L.out_w,
                                             sc.work, dec::kD, dec::kD, sA, sB);
         __syncthreads();
-        // r1 = Xin + a → work (fp32, overwrite a in place row-by-row safe: same index).
+        // r1 = Xin + a + out_b → work (fp32). out_b folded here (the GEMM did W only)
+        // — matches the oracle a = ctx_b @ out_w^T + out_b kept fp32 through r1.
         for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
             const int r = idx / dec::kD, j = idx % dec::kD;
-            sc.work[(int64_t)r * dec::kD + j] += __bfloat162float(Xin[(int64_t)r * dec::kD + j]);
+            sc.work[(int64_t)r * dec::kD + j] += __bfloat162float(Xin[(int64_t)r * dec::kD + j]) + L.out_b[j];
         }
         __syncthreads();
         // n1(r1) → x1 (fp32) + caches[li]; then bf16 → X_x1[li] (ff0 input + dW operand).
@@ -634,26 +645,28 @@ __device__ float dectc_forward_tile(
             acts.X_x1[li][(int64_t)(g0 + r) * dec::kD + j] = __float2bfloat16(sc.x1[(int64_t)r * dec::kD + j]);
         }
         __syncthreads();
-        // ff0 = X_x1 @ ff0_w^T  (N=dff, K=d). fp32 → work; pre-gelu bf16 → ff0pre;
-        // gelu → X_gact[li] (bf16, ff2 input + dW operand).
+        // ff0 = X_x1 @ ff0_w^T (+ ff0_b)  (N=dff, K=d). fp32 → work; (pre+b) bf16 →
+        // ff0pre; gelu(pre+b) → X_gact[li] (bf16, ff2 input + dW operand). ff0_b folded
+        // into pre (fp32) — matches the oracle ff0pre=bf(ff0+b), gact=bf(gelu(ff0+b)).
         dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_x1[li] + (int64_t)g0 * dec::kD, L.ff0_w,
                                             sc.work, dec::kD, dec::kDff, sA, sB);
         __syncthreads();
         for (int idx = threadIdx.x; idx < nrows * dec::kDff; idx += blockDim.x) {
             const int r = idx / dec::kDff, j = idx % dec::kDff;
-            float pre = sc.work[(int64_t)r * dec::kDff + j];
+            float pre = sc.work[(int64_t)r * dec::kDff + j] + L.ff0_b[j];
             sc.ff0pre[li][(int64_t)r * dec::kDff + j] = __float2bfloat16(pre);
             acts.X_gact[li][(int64_t)(g0 + r) * dec::kDff + j] = __float2bfloat16(dec_gelu(pre));
         }
         __syncthreads();
-        // ff2 = X_gact @ ff2_w^T (N=d, K=dff). fp32 → work.
+        // ff2 = X_gact @ ff2_w^T (+ ff2_b) (N=d, K=dff). fp32 → work.
         dectc_gemm_fwd_f32<SG_TUNED_TILE_N>(acts.X_gact[li] + (int64_t)g0 * dec::kDff, L.ff2_w,
                                             sc.work, dec::kDff, dec::kD, sA, sB);
         __syncthreads();
-        // r2 = x1 + ff2 → work (fp32). x1 lives in the dedicated fp32 buffer (no bf16 round).
+        // r2 = x1 + ff2 + ff2_b → work (fp32). x1 lives in the dedicated fp32 buffer
+        // (no bf16 round). ff2_b folded here — matches the oracle r2 = x1 + (ff2 + ff2_b).
         for (int idx = threadIdx.x; idx < nrows * dec::kD; idx += blockDim.x) {
             const int r = idx / dec::kD, j = idx % dec::kD;
-            sc.work[(int64_t)r * dec::kD + j] += sc.x1[(int64_t)r * dec::kD + j];
+            sc.work[(int64_t)r * dec::kD + j] += sc.x1[(int64_t)r * dec::kD + j] + L.ff2_b[j];
         }
         __syncthreads();
         if (li + 1 < dec::kLayers) {
