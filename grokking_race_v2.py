@@ -1253,14 +1253,50 @@ def train_supergrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         # in the persistent state slice) + the per-tensor meta-net mu/gate precompute (P2.45:
         # mu=rescale·phi(g,sharpness), gate=clamp(cos(g,mu),0,1)) + the SG11 apply (smart_grad=
         # g+(1−gate)·alpha·mu → AdamW), ALL in-kernel — ZERO intermediate launches. If it ran we
-        # SKIP the eager fwd/bwd/sam_step/step (params updated in place); the bilevel meta_step
-        # (host-side amplifier training, needs the autograd graph the megakernel does not return)
-        # is NOT run on the L3 path — the deployed meta-net snapshot is scattered into the state
-        # each step (fused_train_step), faithful to the kernel's evaluated weights. NOTE (honesty,
-        # per .audit_notes.md): without bilevel training the meta-net stays at init (rescale=0 ⇒
-        # mu≈0), so the L3 SG11 race is ≈AdamW — the cell is PARITY-correct + L3-TC, but grok is a
-        # separate documented result (the meta-net memorize-then-collapse dynamics are unchanged).
-        # Falls back to eager (AMP on / non-sm_90 / fp32 / unregistered cell, e.g. mamba).
+        # SKIP the eager fwd/bwd/step (params updated in place by the kernel, which owns the
+        # weight + m/v update).
+        #
+        # REAL-SG ON L3 (owner decision "b") — mirrors train_neuralgrok's host-side amplifier
+        # training precisely. The bilevel meta_step (SharpnessMetaNet training) needs the eager
+        # fwd/bwd autograd graph the megakernel does NOT return, EXACTLY like neuralgrok's
+        # train_amplifier_step needs the eager pass that seeds p.grad. So on the side-step cadence
+        # we (1) run an eager fwd/bwd to SEED p.grad with the |g| featurization the meta-net/SAM
+        # read, (2) run sam_step (seeds _flat_sharpness — the meta-net's 2nd input) then meta_step
+        # (trains the meta-net via the val+train lookahead, sets _weights_dirty, RESTORES p.grad),
+        # then (3) launch the L3 kernel — fused_train_step re-extracts the FRESH meta-net phi pack
+        # into the kernel's `extra` state slice and reads the live sg_rescale (_opt_scalars_from)
+        # BEFORE the launch, so the kernel evaluates the meta-net we just trained THIS step (the
+        # snapshot refresh the megakernel path needs — it cannot run the bilevel autograd itself,
+        # like neuralgrok's psi_pack re-extraction). KERNEL MATH UNCHANGED: this is host-side
+        # training only; the in-kernel scalars (_cached_train_acc/_cached_alpha gate + alpha) are
+        # NOT fed on the L3 path, so single-step parity (the tail gate, which forces its own
+        # rescale) is preserved — only the meta-net weights move (rescale off 0 ⇒ mu≠0), which
+        # flow through the already-live phi pack + sg_rescale read. HONESTY: with the meta-net now
+        # genuinely trained this runs as REAL SG (rescale≠0, mu≠0) and exhibits the documented
+        # SG memorize-then-collapse dynamics — it will NOT grok. That is the faithful RESULT.
+        sam_freq = max(1, muf * 2)
+        meta_due = (step % muf == 0)
+        sam_due = (hasattr(opt, 'sam_step') and step % sam_freq == 0
+                   and opt._get_effective_sam_freq() < 999999)
+        if meta_due or sam_due:
+            # (1) Eager featurization fwd/bwd — seeds p.grad (the |g|/SAM input the host
+            # side-steps need). The kernel below computes its OWN deterministically-reduced
+            # grad and owns the weight update, so this grad is meta-featurization ONLY.
+            with _autocast(c):
+                logits=m(tx); loss=F.cross_entropy(logits,ty)
+            opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
+            _has_inf=False
+            if c.get("use_amp", False):
+                _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all()
+                               for p in m.parameters())
+            if not _has_inf:
+                # (2) SAM 2nd backward → _flat_sharpness, then the bilevel meta-net training
+                # (val+train lookahead). Eager ORDER mirrors the eager fallback below
+                # (meta_step then sam_step); each restores p.grad / leaves it untouched.
+                if meta_due:
+                    _component_guard(r, "meta_step", step, c, opt.meta_step, m, vax, vay, crit_sg, mopt, tx, ty)
+                if sam_due:
+                    _component_guard(r, "sam_step", step, c, opt.sam_step, m, tx, ty, crit_sg)
         l3_loss=_try_fused_train_step(mtype, "supergrok11", m, opt, tx, ty, c)
         if l3_loss is not None:
             loss=torch.as_tensor(l3_loss)
@@ -1344,12 +1380,46 @@ def train_supergrok15(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         # + the per-tensor meta-net mu precompute (P2.45: mu=rescale·phi(g,sharpness)) + the SG15
         # apply (per-coord alpha clip + smart_grad=g+gate·a·mu → AdamW, gate=sigmoid(accuracy) host
         # scalar), ALL in-kernel — ZERO intermediate launches. If it ran we SKIP the eager fwd/bwd/
-        # sam_step/bilevel_step/step (params updated in place); the host-side bilevel training is
-        # NOT run on the L3 path — the deployed meta-net snapshot is scattered into the state each
-        # step (fused_train_step). NOTE (honesty, per .audit_notes.md): without bilevel training the
-        # meta-net stays at init (rescale=0 ⇒ mu≈0), so the L3 SG15 race is ≈AdamW — PARITY-correct +
-        # L3-TC, but grok is a separate documented result. Falls back to eager (AMP / non-sm_90 /
-        # fp32 / unregistered cell, e.g. mamba).
+        # step (params updated in place by the kernel, which owns the weight + m/v update).
+        #
+        # REAL-SG ON L3 (owner decision "b") — mirrors train_neuralgrok's host-side amplifier
+        # training precisely (and the SG11 L3 branch above). The bilevel_step (SharpnessMetaNet
+        # training) needs the eager fwd/bwd autograd graph the megakernel does NOT return, EXACTLY
+        # like neuralgrok's train_amplifier_step needs the eager pass that seeds p.grad. So on the
+        # side-step cadence we (1) run an eager fwd/bwd to SEED p.grad with the |g| featurization
+        # the SAM/meta-net read, (2) run sam_step (seeds _flat_sharpness — the meta-net's 2nd input)
+        # then bilevel_step (trains the meta-net via the val+train lookahead, sets _weights_dirty,
+        # RESTORES p.grad) — eager ORDER mirrors the eager fallback below (sam then bilevel), then
+        # (3) launch the L3 kernel — fused_train_step re-extracts the FRESH meta-net phi pack into
+        # the kernel's `extra` state slice and reads the live sg_rescale BEFORE the launch, so the
+        # kernel evaluates the meta-net we just trained THIS step (the snapshot refresh the
+        # megakernel path needs — like neuralgrok's psi_pack re-extraction). KERNEL MATH UNCHANGED:
+        # host-side training only; the in-kernel scalars (gate=sigmoid(_cached_train_acc), alpha)
+        # are NOT fed on the L3 path, so single-step parity (the tail gate, which forces its own
+        # rescale) is preserved — only the meta-net weights move (rescale off 0 ⇒ mu≠0), flowing
+        # through the already-live phi pack + sg_rescale read. HONESTY: with the meta-net now
+        # genuinely trained this runs as REAL SG (rescale≠0, mu≠0) and exhibits the documented SG
+        # memorize-then-collapse dynamics — it will NOT grok. That is the faithful RESULT.
+        sam_freq_eff=opt._get_effective_sam_freq()
+        bilevel_freq_eff=opt._get_effective_bilevel_freq()
+        sam_due=(sam_freq_eff < 999999 and step % sam_freq_eff == 0)
+        bilevel_due=(step % bilevel_freq_eff == 0)
+        if sam_due or bilevel_due:
+            # (1) Eager featurization fwd/bwd — seeds p.grad (meta-featurization ONLY; the kernel
+            # below computes its own deterministically-reduced grad and owns the weight update).
+            with _autocast(c):
+                logits=m(tx); loss=F.cross_entropy(logits,ty)
+            opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
+            _has_inf=False
+            if c.get("use_amp", False):
+                _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all()
+                               for p in m.parameters())
+            if not _has_inf:
+                # (2) SAM 2nd backward → _flat_sharpness, then the bilevel meta-net training.
+                if sam_due:
+                    _component_guard(r, "sam_step", step, c, opt.sam_step, m, tx, ty, crit_s15)
+                if bilevel_due:
+                    _component_guard(r, "bilevel_step", step, c, opt.bilevel_step, m, tx, ty, vax, vay, crit_s15, mopt)
         l3_loss=_try_fused_train_step(mtype, "supergrok15", m, opt, tx, ty, c)
         if l3_loss is not None:
             loss=torch.as_tensor(l3_loss)
