@@ -356,6 +356,20 @@ _CELLS = {
     # branch reads the eager NS-group momentum for the 2D matrices). pos.weight rows=4 is
     # the smallest NS matrix in the whole campaign — this gate exercises it against eager.
     "muon/decoder": dict(model="decoder", opt="muon", factory=_muon_factory, param_tol=2e-3),
+    # muon (mamba — wave-2 mamba lane): the SAME STAGED grid-cooperative Newton-Schulz P2.7
+    # phase on the mamba TC kernel (fused_mamba_megakernel_tc) — the 13 ndim==2 mamba weights
+    # (mbtc::kMbMuon2D: tok[99,128]/pos[8,128]/A_log[256,16]/in_proj[512,128]/x_proj[40,256]/
+    # dt_proj[256,8]/out_proj[128,256] × 2 layers + out.weight[97,128]) orthogonalized in-
+    # kernel, 1D/non-2D weights (incl. the ndim==3 conv1d.weight) → AdamW aux tail. param_tol=
+    # 2e-3 for the NS 2D path (OPTSTAGES §8); the (1b) STATE check stays TIGHT (1e-4) — the
+    # momentum buf=μ·buf+g has NO NS, so it must match eager exactly (the run_cell_gate
+    # momentum_buffer branch reads the eager NS-group momentum for the 13 2D matrices). CRITICAL:
+    # muon/mamba is a SINGLE forward + NS precompute (NOT a 2nd forward), so — UNLIKE the
+    # SAM-2nd-pass mamba cells looksam/SG11/15 — it does NOT hit the shared mamba-forward A/A/A
+    # race; the (2) A/A/A determinism check below VERIFIES this (it must be bit-exact). A_log
+    # [256,16] (rows≫cols) + x_proj [40,256] (cols≫rows) + dt_proj [256,8] exercise NS shapes
+    # neither decoder nor vit muon had. fused_train_step truncates B to B%16 (mamba needs it).
+    "muon/mamba": dict(model="mamba", opt="muon", factory=_muon_factory, param_tol=2e-3),
     # looksam (decoder — SAM-tier lane): CONVERTED. The MODEL-COUPLED SAM 2nd backward
     # (st.sam_dir = g_sam − g) is an IN-KERNEL phase (P2.4) on the decoder TC kernel: on
     # SAM steps (every k) it perturbs p'=p+(rho/‖g‖)·g, runs a FULL SECOND in-kernel

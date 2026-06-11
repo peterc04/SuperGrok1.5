@@ -1,9 +1,9 @@
 {
   "summary": {
     "total_cells": 33,
-    "converted_l3_tc": 25,
-    "blocked": 8,
-    "fraction_l3_tc": 0.7576,
+    "converted_l3_tc": 26,
+    "blocked": 7,
+    "fraction_l3_tc": 0.7879,
     "converted_cells": [
       "adamw/decoder",
       "neuralgrok/decoder",
@@ -29,6 +29,7 @@
       "neuralgrok/mamba",
       "grokadamw/mamba",
       "grokfast/mamba",
+      "muon/mamba",
       "lion/mamba"
     ],
     "blocked_cells": [
@@ -37,7 +38,6 @@
       "supergrok/mamba",
       "supergrok15/mamba",
       "supergrok2/mamba",
-      "muon/mamba",
       "looksam/mamba",
       "prodigy/mamba"
     ]
@@ -442,14 +442,16 @@
     {
       "model": "mamba",
       "optimizer": "muon",
-      "executed_path": "eager",
-      "l3_steps_fired": 0,
-      "l3_engines_seen": [],
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
       "l1_steps_fired": 0,
       "abi_stale": false,
       "error": null,
-      "is_l3_tc": false,
-      "reason_if_blocked": "STAGED grid-cooperative NS, CONVERTED for vit (wave-2): the 11 2D weights' Newton-Schulz orthogonalization is the in-kernel P2.7 phase (grid-barrier-looped, no separate launch); the 1D weights take the P3 AdamW tail with INDEPENDENT aux_lr/aux_betas (the eager non-2D group, carried by the append-only FusedScalars aux_* widening). OPTSTAGES \u00a73. decoder/mamba\u00d7muon are still blocked (no P2.7 wiring there) \u2014 vit fires wgmma; if vit\u00d7muon shows here, the kernel rebuild is stale."
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
     },
     {
       "model": "mamba",

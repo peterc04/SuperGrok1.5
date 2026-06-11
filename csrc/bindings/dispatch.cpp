@@ -1077,7 +1077,7 @@ void fused_step(const std::string& model, const std::string& optimizer,
  const bool mb_is_sg = (optimizer == "supergrok11" || optimizer == "supergrok15");
  const bool mb_tc_tail = (mb_opt_id >= 0 && !mb_is_sg &&
                           (optimizer != "prodigy" || mb_prodigy_probe) &&
-                          (optimizer != "looksam" || mb_looksam_probe));  // {adamw,lion,grokfast,grokadamw,neuralgrok}; mamba prodigy+looksam+SG11/15 BLOCKED (shared mamba-forward A/A/A race); SG2 = -1
+                          (optimizer != "looksam" || mb_looksam_probe));  // {adamw,lion,grokfast,grokadamw,neuralgrok,muon}; mamba prodigy+looksam+SG11/15 BLOCKED (shared mamba-forward A/A/A race); SG2 = -1. MUON is a SINGLE forward + NS precompute (opt_id 7, P2.7) — NOT a 2nd forward, so it does NOT hit that race (A/A/A bit-exact via test_l3tc_tail_gate); routed unconditionally.
  const bool mamba_l3_real = (optimizer == "adamw")
                             || (want_wgmma && mb_tc_tail);
  if (arch == 90 && model == "mamba3" && mamba_l3_real && !opt_only) {
@@ -1091,9 +1091,11 @@ void fused_step(const std::string& model, const std::string& optimizer,
  TORCH_CHECK(!want_wgmma || mb_tc_tail,
  "fused_step: gemm_impl='wgmma' requested for mamba3 with optimizer '", optimizer,
  "', but the mamba TC launcher production-routes only the single-launch tails "
- "{adamw,lion,grokfast,grokadamw,neuralgrok} (opt_id 0/1/2/3/6). STAGED Prodigy (opt_id 5) "
- "and MODEL-COUPLED LookSAM (opt_id 4) are CODE-LANDED but BLOCKED on the shared mamba-"
- "forward A/A/A race (set SG_MAMBA_PRODIGY_PROBE / SG_MAMBA_LOOKSAM_PROBE to observe). "
+ "{adamw,lion,grokfast,grokadamw,neuralgrok,muon} (opt_id 0/1/2/3/6/7). STAGED Muon (opt_id 7, "
+ "in-kernel P2.7 grid-cooperative Newton-Schulz) is a SINGLE forward + NS precompute — NOT a "
+ "2nd forward — so it does NOT hit the shared mamba-forward A/A/A race (A/A/A bit-exact). STAGED "
+ "Prodigy (opt_id 5) and MODEL-COUPLED LookSAM (opt_id 4) are CODE-LANDED but BLOCKED on that race "
+ "(set SG_MAMBA_PRODIGY_PROBE / SG_MAMBA_LOOKSAM_PROBE to observe). "
  "The remaining SAM opts (SG11/15) and SG2 are not mamba TC tails — use the eager/per-op path.");
  const int64_t total = kMambaTotalElems;
  TORCH_CHECK(params.numel() == total,

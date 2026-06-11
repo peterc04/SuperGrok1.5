@@ -207,6 +207,21 @@ cudaError_t mega_mamba_real_adamw_tc(
             // launch. The decoder/vit twins proved this routing.
             return launch_fused_mamba_megakernel_tc<OptId::LookSAM>(
                 ctx, params, tok, grad, lr, step, st, stream, nCTA);
+        case OptId::Muon:
+            // STAGED grid-cooperative Newton-Schulz (mamba muon lane): the SAME single
+            // persistent launch — the NS orthogonalization of the 13 2D weights (tok/pos/
+            // A_log/in_proj/x_proj/dt_proj/out_proj × 2 layers + out.weight) is an IN-KERNEL
+            // phase (P2.7, between B2/P2.6 and P3), grid-barrier-looped per matrix, NOT a
+            // separate launch. The per-matrix NS scratch lives in the workspace
+            // (mb_tc_muon_floats, carved after the LookSAM scratch). The persistent momentum
+            // buffer is the m-slice (st.exp_avg, bound above); the 1D/non-2D weights take the
+            // AdamW tail in P3 reading the INDEPENDENT aux_lr/aux_betas (eager Muon adamw_*
+            // group, carried via apply_scalars). The decoder/vit twins proved this routing.
+            // muon/mamba is a SINGLE forward + NS precompute (NOT a 2nd forward), so it does
+            // NOT hit the shared mamba-forward A/A/A race that blocks the SAM-2nd-pass mamba
+            // cells — VERIFIED A/A/A bit-exact by test_l3tc_tail_gate (muon/mamba).
+            return launch_fused_mamba_megakernel_tc<OptId::Muon>(
+                ctx, params, tok, grad, lr, step, st, stream, nCTA);
         default:
             return cudaErrorInvalidValue;  // STAGED/coupled opt not single-launch TC
     }

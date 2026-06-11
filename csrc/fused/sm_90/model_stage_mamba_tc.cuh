@@ -167,6 +167,52 @@ constexpr int kMbTcSmemA1 = wgs::kWgmmaAtomM * wgs::kWgmmaAtomK;   // 64*16 bf16
 constexpr int kMbTcSmemB1 = SG_TUNED_TILE_N * wgs::kWgmmaAtomK;    // N*16 bf16
 
 // ════════════════════════════════════════════════════════════════════════
+//  MUON 2D-WEIGHT TABLE — the ndim==2 mamba weights orthogonalized by the
+//  in-kernel grid-cooperative Newton-Schulz P2.7 phase (Muon ONLY). Mirrors
+//  the decoder twin's kDecMuon2D (model_stage_decoder_tc.cuh) and the vit twin's
+//  kVitMuon2D. Muon auto-splits params by p.ndim: ndim==2 → NS, everything else →
+//  AdamW (muon.py:91-98 _split_by_ndim; muon.h:75-76). For the small Mamba the
+//  ndim==2 weights are EXACTLY these 13 (the flat named_parameters() tensor index
+//  + rows[dim0] + cols[dim1], matching the LIVE model's p.shape EXACTLY — verified
+//  against tests/hw/mamba_oracle.py::mamba_param_spec, the SAME source the layout
+//  header mamba3_layout.cuh static_asserts == named_parameters()). All ndim==1
+//  weights (D, conv1d.bias, dt_proj.bias, norm γ/β, out.bias) AND the ndim==3
+//  conv1d.weight [256,1,3] take the AdamW aux tail in P3. The kernel's Muon P2.7
+//  loops THIS table running the grid-cooperative NS per matrix; P3 routes tensor t
+//  to the NS apply iff it is in the table, else the AdamW aux tail. Indices MUST
+//  match mamba3_layout / named_parameters() order. ──
+constexpr int kMbNumMuon2D = 13;
+struct MbMuon2D { int tidx; int rows; int cols; };
+__device__ __constant__ MbMuon2D kMbMuon2D[kMbNumMuon2D] = {
+    { 0, mb::kVocab,      mb::kD       },   // tok.weight            [99,128]
+    { 1, mb::kSeq,        mb::kD       },   // pos.weight            [8,128]
+    { 2, mb::kDInner,     mb::kState   },   // L0 A_log              [256,16]
+    { 4, 2*mb::kDInner,   mb::kD       },   // L0 in_proj.weight     [512,128]
+    { 7, mb::kDbc,        mb::kDInner  },   // L0 x_proj.weight      [40,256]
+    { 8, mb::kDInner,     mb::kDtRank  },   // L0 dt_proj.weight     [256,8]
+    {10, mb::kD,          mb::kDInner  },   // L0 out_proj.weight    [128,256]
+    {13, mb::kDInner,     mb::kState   },   // L1 A_log              [256,16]
+    {15, 2*mb::kDInner,   mb::kD       },   // L1 in_proj.weight     [512,128]
+    {18, mb::kDbc,        mb::kDInner  },   // L1 x_proj.weight      [40,256]
+    {19, mb::kDInner,     mb::kDtRank  },   // L1 dt_proj.weight     [256,8]
+    {21, mb::kD,          mb::kDInner  },   // L1 out_proj.weight    [128,256]
+    {26, mb::kPHead,      mb::kD       },   // out.weight            [97,128]
+};
+// Is tensor index `t` one of the Muon 2D matrices (orthogonalized in P2.7)? P3
+// uses this to route ONLY the 1D / non-2D weights to the AdamW aux tail for Muon.
+__device__ __forceinline__ bool mb_is_muon_2d(int t) {
+    #pragma unroll
+    for (int mi = 0; mi < kMbNumMuon2D; ++mi) if (kMbMuon2D[mi].tidx == t) return true;
+    return false;
+}
+// Largest 2D weight (numel) + largest #rows over the table — sizes the per-matrix
+// NS scratch (the stage runs ONE matrix at a time, reusing the buffers). in_proj
+// [512,128]=65536 is the largest numel; in_proj rows=512 is the largest #rows
+// (A=XXᵀ is rows×rows). Mirrors dec's kDecMuonMaxNumel/kDecMuonMaxRows.
+constexpr int kMbMuonMaxNumel = 2 * mb::kDInner * mb::kD;   // 512*128 = 65536 (in_proj)
+constexpr int kMbMuonMaxRows  = 2 * mb::kDInner;            // 512 (in_proj rows)
+
+// ════════════════════════════════════════════════════════════════════════
 //  SOFTWARE-PIPELINED single-CTA batch GEMM: D[M,N] = Σ_k A[m,k]·B[n,k], bf16
 //  operands (accessor-sourced + Major-K staged), fp32 accumulator, ASCENDING-k.
 //  One warpgroup (threads 0..127) issues the wgmma; all `nthreads` stage. The

@@ -98,13 +98,15 @@ _BLOCK_REASONS = {
                 "tensors d-reduction is the in-kernel P2.6 phase + the owner-block "
                 "beta3-EMA/d_coef/persist (OPTSTAGES §2). Only mamba×prodigy is still "
                 "blocked (no mamba P2.6 wiring) — decoder/vit fire wgmma."),
-    "muon": ("STAGED grid-cooperative NS, CONVERTED for vit (wave-2): the 11 2D "
-             "weights' Newton-Schulz orthogonalization is the in-kernel P2.7 phase "
-             "(grid-barrier-looped, no separate launch); the 1D weights take the P3 "
-             "AdamW tail with INDEPENDENT aux_lr/aux_betas (the eager non-2D group, "
-             "carried by the append-only FusedScalars aux_* widening). OPTSTAGES §3. "
-             "decoder/mamba×muon are still blocked (no P2.7 wiring there) — vit fires "
-             "wgmma; if vit×muon shows here, the kernel rebuild is stale."),
+    "muon": ("STAGED grid-cooperative NS, CONVERTED for decoder+vit+mamba (wave-2): the "
+             "2D weights' Newton-Schulz orthogonalization is the in-kernel P2.7 phase "
+             "(grid-barrier-looped, no separate launch; decoder/mamba 13 2D weights, vit 11); "
+             "the 1D weights take the P3 AdamW tail with INDEPENDENT aux_lr/aux_betas (the "
+             "eager non-2D group, carried by the append-only FusedScalars aux_* widening). "
+             "OPTSTAGES §3. muon/mamba is a SINGLE forward + NS precompute (NOT a 2nd forward), "
+             "so it does NOT hit the shared mamba-forward A/A/A race that blocks looksam/prodigy/"
+             "SG mamba — A/A/A bit-exact. ALL THREE fire wgmma; if ANY shows here, the rebuild "
+             "is stale."),
     "neuralgrok": ("KERNEL-READY, RACE-BLOCKED (directive item d): the psi MLP is in "
                    "opt_components.cuh (kPsiHidden=16 == race neural_hidden=16, 2-layer), "
                    "so a snapshot-plumbed L3 step would PASS the tail gate (m/v parity "

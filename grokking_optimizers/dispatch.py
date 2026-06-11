@@ -830,7 +830,8 @@ _FUSED_L3_REAL = frozenset({
     # AdamW tail in P3 (muon.py auto-split by p.ndim). Still a SINGLE persistent launch
     # (no separate NS launch — the in-kernel grid-cooperative form places one CTA/SM:
     # VitTcSmem is static ~7KB, NS buffers are HBM). The vit launcher binds the momentum
-    # to st.exp_avg + routes opt_id=7. mamba×muon stays blocked (no mamba P2.7).
+    # to st.exp_avg + routes opt_id=7. mamba×muon is now CONVERTED too (see the
+    # ("mamba3","muon") entry below — single forward + NS precompute, NO 2nd-forward race).
     ("vit", "muon"),
     # muon (decoder — wave-2 decoder lane): the SAME STAGED grid-cooperative Newton-
     # Schulz P2.7 phase ported onto the decoder TC kernel (fused_decoder_megakernel_tc):
@@ -842,8 +843,25 @@ _FUSED_L3_REAL = frozenset({
     # The NS scratch is carved in dec_tc_workspace_floats (dec_tc_muon_floats), after the
     # Prodigy reduce slots — so the 5 already-green decoder cells stay byte-identical.
     # The aux_lr/aux_betas plumbing + 4*total state sizing are model-agnostic. Still a
-    # SINGLE persistent launch. mamba×muon stays blocked (no mamba P2.7).
+    # SINGLE persistent launch.
     ("transformer_decoder", "muon"),
+    # muon (mamba — wave-2 mamba lane): the SAME in-kernel P2.7 grid-cooperative Newton-
+    # Schulz ported onto fused_mamba_megakernel_tc (the grid-cooperative NS phase, model-
+    # agnostic in opt_stages_precompute.cuh). The 13 ndim==2 mamba weights (mbtc::kMbMuon2D
+    # — tok[99,128]/pos[8,128]/A_log[256,16]/in_proj[512,128]/x_proj[40,256]/dt_proj[256,8]/
+    # out_proj[128,256] × 2 layers + out.weight[97,128]) are orthogonalized in-kernel
+    # (buf=μ·buf+g with buf the PERSISTENT m-slice, ‖buf‖→inv_norm→X, 5×NS {A=XXᵀ,AX,AAX,
+    # combine}, then the muon.h apply); the 1D/non-2D weights (D, conv1d.w/b, dt_proj.bias,
+    # LN γ/β, out.bias) take the AdamW aux tail in P3 (muon.py auto-split by p.ndim — the
+    # ndim==3 conv1d.weight also routes to the aux tail). The mamba launcher binds the
+    # momentum to st.exp_avg + routes opt_id=7 (case OptId::Muon). The NS scratch is carved
+    # in mb_tc_workspace_floats (mb_tc_muon_floats), after the LookSAM scratch — so the
+    # already-green mamba cells stay byte-identical. CRITICAL DETERMINISM NOTE: unlike the
+    # SAM-2nd-pass mamba cells (looksam/SG11/15) which re-run the mamba forward and hit the
+    # shared mamba-forward A/A/A race, muon/mamba is a SINGLE forward + NS precompute (no 2nd
+    # forward), so it does NOT hit that race — VERIFIED A/A/A bit-exact by test_l3tc_tail_gate
+    # (muon/mamba). Still a SINGLE persistent launch.
+    ("mamba3", "muon"),
     # looksam (decoder — SAM-tier lane): CONVERTED. The MODEL-COUPLED SAM 2nd backward
     # (st.sam_dir = g_sam − g, INTEGRATION-OPTSTAGES §6) is now an IN-KERNEL phase (P2.4,
     # between B2 and P2.5/P3) on the decoder TC kernel (fused_decoder_megakernel.cuh):
@@ -1477,8 +1495,18 @@ _L3_WGMMA_CELLS = frozenset({
     # onto the decoder TC driver, the launcher dispatches case OptId::Muon. WITHOUT this
     # entry gemm_impl_for_cell returns "scalar" → the scalar adamw-only decoder path →
     # an Int/Float dtype throw on the token input (the bug this fixes). With it →
-    # "wgmma", the real TC path. mamba×muon stays blocked (no mamba P2.7).
+    # "wgmma", the real TC path.
     ("transformer_decoder", "muon"),
+    # muon (mamba — wave-2 mamba lane): the SAME in-kernel P2.7 grid-cooperative NS ported
+    # onto fused_mamba_megakernel_tc (13 ndim==2 weights: mbtc::kMbMuon2D). dispatch.cpp's
+    # wgmma_tail_opt_id("muon")=7 routes it onto the mamba TC driver, the launcher dispatches
+    # case OptId::Muon; mb_tc_tail is true for muon (NOT sg/prodigy/looksam) so it routes
+    # unconditionally. WITHOUT this entry gemm_impl_for_cell returns "scalar" for mamba×muon
+    # → the scalar adamw-only mamba path throws on the non-adamw optimizer; WITH it → "wgmma".
+    # muon/mamba is a SINGLE forward + NS precompute (NOT a 2nd forward), so it does NOT hit
+    # the shared mamba-forward A/A/A race that blocks looksam/prodigy/SG mamba — VERIFIED
+    # A/A/A bit-exact by test_l3tc_tail_gate (muon/mamba). Single persistent wgmma launch.
+    ("mamba3", "muon"),
     # looksam (decoder — SAM-tier lane): CONVERTED. The SAM 2nd backward is the in-kernel
     # P2.4 phase (perturb→2nd fwd+bwd→sam_dir=g_sam−g) on the decoder TC kernel; opt_id=4
     # routes it onto the TC driver (dispatch.cpp wgmma_tail_opt_id("looksam")=4 → case
