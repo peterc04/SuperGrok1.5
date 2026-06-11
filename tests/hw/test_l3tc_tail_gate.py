@@ -458,14 +458,23 @@ _CELLS = {
     # looksam were already A/A/A-clean; mamba now joins them.
     "looksam/mamba": dict(model="mamba", opt="looksam", factory=_looksam_factory,
                           sam_dir_tol=2e-2),
-    # NOTE: supergrok11/mamba and supergrok15/mamba remain UNregistered — they are code-ABSENT
-    # in the mamba TC kernel/launcher (the mamba megakernel SAM block + mega_mamba_real_adamw_
-    # tc_launcher.cu switch carry only OptId::LookSAM, no SG sharpness/meta-net case). The A/A/A
-    # determinism root cause is now fixed (the LookSAM mamba instantiation proves the SAM 2nd-
-    # pass path is deterministic), so the remaining work to un-dormant them is to ADD the SG
-    # sharpness=(g_sam−g)² + per-tensor meta-net mu path to the mamba kernel/launcher (the
-    # decoder/vit twins exist) — a feature port, not a determinism fix. SG11/SG15 keep the
-    # won't-grok caveat regardless. Tracked separately.
+    # supergrok11/15 (mamba — wave-4 mamba SG lane): CONVERTED via the FEATURE PORT (the
+    # decoder/vit twins ported onto fused_mamba_megakernel.cuh + mega_mamba_real_adamw_tc_
+    # launcher.cu): the P2.4 SAM 2nd backward extends to SG (sharpness=(g_sam−g)²) + the
+    # per-tensor meta-net mu precompute (P2.45/P3) + the SG11 cosine gate run as in-kernel
+    # phases; the launcher gained the OptId::SuperGrok11/15 cases (opt_id 8/9). The shared-
+    # mamba-forward A/A/A race is FIXED (commit 0b57f7e — the LookSAM mamba instantiation
+    # proved the SAM double-forward is race-free), so the (2) A/A/A determinism check below
+    # VERIFIES SG11/15 are bit-exact too. Same 4-surface validation as decoder/vit (sharpness
+    # vs the bf16-faithful 2nd backward, mu vs the canonical phi, 1a/1b apply tail). HONEST
+    # CAVEAT: SG11/15 mamba reach L3-TC + single-step parity but WON'T GROK on L3 (the meta-net
+    # is untrained — a separate owner-approved host-training task, NOT done here).
+    "supergrok11/mamba": dict(model="mamba", opt="supergrok11",
+                              factory=_supergrok11_factory,
+                              sharpness_tol=2e-2, mu_tol=3e-3),
+    "supergrok15/mamba": dict(model="mamba", opt="supergrok15",
+                              factory=_supergrok15_factory,
+                              sharpness_tol=2e-2, mu_tol=3e-3),
     # supergrok2 (decoder/vit — the LAST/hardest cell): CONVERTED via the DEDICATED
     # ops.sg2_fused_step entry. The FULL CSA/HCA/PEER/GRU meta-net AS the optimizer phase
     # (P3-SG2): in-kernel SEGMENTED SORT (STAGE -1, index-tie-break strategy A) → S0..S5,
@@ -476,10 +485,15 @@ _CELLS = {
     # deterministic by construction); (tie-probe) strategy-A (|g|,idx) perm total-order; and
     # the (N>64 CSA fidelity PROBE) which REPORTS the won't-grok divergence (kernel drops
     # idx_UQ, /sqrt(rank) vs /sqrt(d)) — NOT a regression. run_cell_gate short-circuits to it.
-    # mamba×supergrok2 BLOCKED (SAM double-forward + segmented sort re-trip the shared mamba-
-    # forward A/A/A race; code-absent in the mamba kernel/launcher).
+    # supergrok2 (mamba — the LAST/hardest cell): PORTED onto the mamba megakernel (P3-SG2:
+    # segmented sort STAGE -1 + the sg2_meta_stages CSA/HCA/GRU/PEER pipeline + the SAM 2nd
+    # backward) + the DEDICATED mega_mamba_sg2_tc launcher entry. ⚠ A/A/A: the SAM double-
+    # forward + segmented sort re-exercise the shared mamba forward (the .sg2_spec.md-flagged
+    # risk); the gate is the gate — if A/A/A re-trips, mamba×supergrok2 is landed dormant.
+    # Won't GROK (CSA idx_UQ fidelity gap, out of scope).
     "supergrok2/decoder": dict(model="decoder", opt="supergrok2", factory=None),
     "supergrok2/vit": dict(model="vit", opt="supergrok2", factory=None),
+    # __SG2_MAMBA_TEST_CELL__
 }
 
 # BLOCKED cells — kept here (commented) with the state-gate evidence that blocks them,
@@ -524,6 +538,15 @@ def _sg_bf16_sharpness_oracle(model, named_ref, tx, ty, grad, rho, total, dev):
     checked at that floor. A SKIPPED SAM phase (sharpness≈0) fails the liveness assert."""
     if model == "decoder":
         from tests.hw.test_decoder_tc import _bf16_faithful_oracle as _orc
+        B = int(tx.shape[0]); B16 = B - (B % 16)
+        a0 = tx[:B16].to(torch.long); a1 = ty[:B16].to(torch.long)
+        named_d = {n: p.detach() for n, p in named_ref}
+        _lo, go = _orc(named_d, a0, a1)
+    elif model == "mamba":
+        # The mamba twin of the decoder branch: int tokens, the bf16-faithful fp64 mamba
+        # oracle (the SAME instrument the looksam/mamba sam_dir check + the first-grad gate
+        # use). B%16 truncation matches fused_train_step's wgmma path.
+        from tests.hw.test_mamba_tc import _bf16_faithful_mamba_oracle as _orc
         B = int(tx.shape[0]); B16 = B - (B % 16)
         a0 = tx[:B16].to(torch.long); a1 = ty[:B16].to(torch.long)
         named_d = {n: p.detach() for n, p in named_ref}

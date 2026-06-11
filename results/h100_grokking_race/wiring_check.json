@@ -1,9 +1,9 @@
 {
   "summary": {
     "total_cells": 33,
-    "converted_l3_tc": 30,
-    "blocked": 3,
-    "fraction_l3_tc": 0.9091,
+    "converted_l3_tc": 32,
+    "blocked": 1,
+    "fraction_l3_tc": 0.9697,
     "converted_cells": [
       "adamw/decoder",
       "neuralgrok/decoder",
@@ -30,6 +30,8 @@
       "adamw/mamba",
       "neuralgrok/mamba",
       "grokadamw/mamba",
+      "supergrok/mamba",
+      "supergrok15/mamba",
       "grokfast/mamba",
       "muon/mamba",
       "lion/mamba",
@@ -37,8 +39,6 @@
       "prodigy/mamba"
     ],
     "blocked_cells": [
-      "supergrok/mamba",
-      "supergrok15/mamba",
       "supergrok2/mamba"
     ]
   },
@@ -396,26 +396,30 @@
     {
       "model": "mamba",
       "optimizer": "supergrok",
-      "executed_path": "eager",
-      "l3_steps_fired": 0,
-      "l3_engines_seen": [],
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
       "l1_steps_fired": 0,
       "abi_stale": false,
       "error": null,
-      "is_l3_tc": false,
-      "reason_if_blocked": "MODEL-COUPLED 2nd-pass (OPTSTAGES \u00a74): SG11's `sharpness` is (g_sam\u2212g)\u00b2 from a SAM SECOND backward at perturbed weights \u2014 a FULL second in-kernel model fwd+bwd+dW-assembly (perturb\u21922nd backward\u2192restore), the SAME model-stage machinery as looksam, a DIFFERENT category from the per-element/precompute tails (prodigy-d, muon-NS) that were in scope. The per-tensor mu/gate meta-MLP precompute sits ON TOP of that 2nd pass. NOTE: the missing `sharpness` FusedOptState field is cheap (append-only, as aux_* proved) but INSUFFICIENT \u2014 the second fwd+bwd pipeline is the real blocker. A host-side 2nd backward feeding st.sharpness would be an intermediate launch (violates single-persistent-launch). Probed re-invocable (vittc_forward_tile/vittc_backward_tile are device fns) but the unit of work is the whole P1+P2 pipeline, twice."
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
     },
     {
       "model": "mamba",
       "optimizer": "supergrok15",
-      "executed_path": "eager",
-      "l3_steps_fired": 0,
-      "l3_engines_seen": [],
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
       "l1_steps_fired": 0,
       "abi_stale": false,
       "error": null,
-      "is_l3_tc": false,
-      "reason_if_blocked": "MODEL-COUPLED 2nd-pass (OPTSTAGES \u00a75): same blocker as SG11 \u2014 SG15's `sharpness` is a SAM SECOND-backward side-channel needing a FULL second in-kernel model fwd+bwd+dW-assembly. SG15 is SIMPLER than SG11 in the tail (gate is a host scalar, no cosine stage) but identical at the blocking layer: the 2nd pass is model-stage machinery, out of the per-element-tail scope. The missing `sharpness` field is cheap but insufficient (the 2nd fwd+bwd is the real cost)."
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
     },
     {
       "model": "mamba",

@@ -95,6 +95,14 @@
 #endif
 #if (SG_TUNED_GEMM_IMPL == SG_GEMM_IMPL_WGMMA)
 #include "csrc/fused/sm_90/model_stage_mamba_tc.cuh"
+// SuperGrok2 FULL CSA/HCA/PEER/GRU meta-net stages (composed as the optimizer phase)
+// — the mamba twin of the decoder/vit SG2 include. Pulls in sg2_meta_stages + the
+// in-kernel segmented sort (STAGE -1) + SG2Dims/SG2State/SG2Scalars/SG2Weights. Only
+// under the wgmma token. The SG2 weight bundle is read from HBM (it does NOT fit smem
+// alongside MbTcSmem); the composed path instantiates sg2_meta_stages with
+// WeightsT==SG2Weights + BuildSort=true. The SG11/15 phi helpers ride
+// opt_stages_precompute.cuh (already included above).
+#include "csrc/fused/sm_90/opt_stage_supergrok2.cuh"
 #endif
 
 namespace sg { namespace fused { namespace sm90 {
@@ -439,6 +447,28 @@ __host__ __device__ __forceinline__ int64_t mb_tc_muon_floats(int nCTA) {
          + (int64_t)mbtc::kMbMuonMaxRows * mbtc::kMbMuonMaxRows
          + nCTA + 1;
 }
+// ── SuperGrok2 compile-time dims = the race config (== SG2Dims defaults). The mamba
+//    twin of dec_sg2_ws_stride_floats / dec_tc_sg2_floats. The composed megakernel
+//    reads the meta-net weights from HBM, so the only SG2 workspace is the per-CTA
+//    meta-net scratch (sg2_ws_stride, sized for the LARGEST tensor — the 65536-element
+//    in_proj weight — which bounds every tensor's intermediates + the in-kernel
+//    segmented-sort key/idx/perm/unsort), PLUS a row_off64 staging prefix
+//    (kMambaNumTensors int64 = 2*N floats — the adapter that builds SG2State.row_off
+//    (const int64_t*) from the __constant__ int kMambaOffsets). Carved UNCONDITIONALLY
+//    (carve-LAST) so the opt-agnostic cached launcher workspace fits every OptId;
+//    unused by every non-SG2 cell (its P3-SG2 phase is if-constexpr'd out →
+//    byte-identical). ──
+using MbSG2Dims = SG2Dims<>;
+constexpr int kMbSG2Nmax = 65536;   // max(kMambaSizes) — in_proj [512,128] (the per-CTA carve bound)
+__host__ __device__ __forceinline__ int64_t mb_sg2_ws_stride_floats() {
+    return (int64_t)2 * kMambaNumTensors
+         + sg2_ws_stride<MbSG2Dims>((int64_t)kMbSG2Nmax);
+}
+__host__ __device__ __forceinline__ int64_t mb_tc_sg2_floats(int nCTA) {
+    // +1 for the 8-byte realignment slack of sg2_ws_base (kMambaTotalElems is odd, so
+    // the per-CTA int64 row_off64 prefix may need a +1 bump to land 8-byte aligned).
+    return (int64_t)nCTA * mb_sg2_ws_stride_floats() + 1;
+}
 __host__ __device__ __forceinline__ int64_t mb_tc_workspace_floats(int T, int nCTA) {
     return mb_tc_acts_floats(T)
          + (int64_t)nCTA * mbtc::mb_tile_scratch_floats()
@@ -448,6 +478,7 @@ __host__ __device__ __forceinline__ int64_t mb_tc_workspace_floats(int T, int nC
          + mb_tc_opt_reduce_floats(nCTA)                // STAGED-opt (Prodigy) reduce slots
          + mb_tc_looksam_floats()                       // STAGED-opt (LookSAM) SAM 2nd-bwd scratch
          + mb_tc_muon_floats(nCTA)                      // STAGED-opt (Muon) NS per-matrix scratch
+         + mb_tc_sg2_floats(nCTA)                       // SuperGrok2 meta-net per-CTA scratch (carve-LAST)
 #if SG_MB_TC_PROFILE
          + (int64_t)nCTA * SG_MBTC_PROF_SLOTS * 2 + 2  // phase-profiler (doubles=2 floats) + align pad
 #endif
@@ -500,11 +531,22 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
     //   [muon_X | muon_AX | muon_AAX | muon_orth] (each kMbMuonMaxNumel)
     //   [muon_A (kMbMuonMaxRows²)] [nrm_partials (nCTA)] [inv_norm (1)]
     float* muon_base  = sam_grad + kMambaTotalElems;
+    // SuperGrok2 meta-net per-CTA scratch, carved AFTER the Muon NS scratch (term order
+    // matches mb_tc_workspace_floats — carving it LAST [before the optional profiler]
+    // keeps every prior region's offset unchanged, so the already-green mamba cells are
+    // byte-identical). Each CTA owns mb_sg2_ws_stride_floats() (row_off64 staging +
+    // meta-net scratch). ALIGN to 8 bytes (even float offset): the per-CTA slice fronts
+    // an int64 row_off64 staging array; kMambaTotalElems is odd so sam_grad+total lands
+    // on an odd float offset (4-byte) → an int64 read there is misaligned. Round up to
+    // the next even float (the carve reserves +1 slack). Unused unless Opt==SuperGrok2.
+    float* sg2_ws_base = muon_base + mb_tc_muon_floats(nCTA);
+    if (((uintptr_t)sg2_ws_base & 0x7) != 0) sg2_ws_base += 1;   // → 8-byte aligned
+    (void)sg2_ws_base;   // referenced only by the SuperGrok2 P3-SG2 phase
 #if SG_MB_TC_PROFILE
     // 8-byte align the double accumulator: round the float offset up to an even
-    // count so reinterpret_cast<double*> is aligned (past the Muon NS scratch — the
+    // count so reinterpret_cast<double*> is aligned (past the SG2 scratch — the
     // phase-profiler is the LAST workspace term, mirroring mb_tc_workspace_floats).
-    float* prof_f = muon_base + mb_tc_muon_floats(nCTA);
+    float* prof_f = sg2_ws_base + mb_tc_sg2_floats(nCTA);
     uintptr_t _pa = reinterpret_cast<uintptr_t>(prof_f);
     if (_pa & 0x7u) prof_f = reinterpret_cast<float*>((_pa + 7u) & ~uintptr_t(7u));
     double* prof = reinterpret_cast<double*>(prof_f);   // [nCTA*SLOTS], host-zeroed
@@ -626,7 +668,20 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
     //    opt's path is byte-identical (no extra barrier / work). On a NON-SAM step
     //    (looksam_sam==0) this whole block is skipped — st.sam_dir already holds the
     //    cached direction.
-    if constexpr (Opt == OptId::LookSAM) {
+    //    SuperGrok11/15 SHARE this exact SAM 2nd-backward machinery (INTEGRATION-
+    //    OPTSTAGES §4/§5): the ONLY difference is the side-channel write — LookSAM writes
+    //    st.sam_dir[i] = g_sam − g, SG11/15 write st.sharpness[i] = (g_sam − g)²
+    //    (supergrok11_sm90.cuh:246 / supergrok15_sm90.cuh:315). sharpness is then the 2nd
+    //    MLP input the P2.45 meta-net mu precompute reads. SuperGrok2 ALSO shares it (its
+    //    meta-net's 2nd MLP input is the SAME sharpness signal, read by sg2_meta_stages).
+    //    The SAM-step gate (st.looksam_sam) and the perturbation radius (st.rho) are the
+    //    same every-k cadence; on a non-SAM step the cached side-channel is reused verbatim.
+    //    The now-FIXED register-pressure wgmma-accumulator-spill race (commit 0b57f7e)
+    //    un-dormanted the mamba SAM 2nd-pass (looksam/mamba A/A/A bit-exact), so porting
+    //    SG11/15/SG2 onto the SAME machinery is a feature port (not a determinism fix);
+    //    the gate re-verifies A/A/A for each new SG cell.
+    if constexpr (Opt == OptId::LookSAM || Opt == OptId::SuperGrok11 ||
+                  Opt == OptId::SuperGrok15 || Opt == OptId::SuperGrok2) {
         if (st.looksam_sam != 0.0f) {
             // (a) GLOBAL ‖g‖ over the reduced grad, deterministic (reuse the loss
             //     workspace as P2.5 does: loss_part[nCTA] = per-CTA Σg², loss_out[1]
@@ -712,13 +767,23 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
             mbtc::mbtc_partial_reduce(part_base, sam_grad, nCTA, cta);
             mbtc::mbtc_embed_owner_scan(acts, tok.tokens, T, sam_grad, cta, nCTA);
             bar.sync();   // B2.4f: g_sam fully assembled in sam_grad
-            // (d) sam_dir = g_sam − g (into the persistent extra slice) + restore p.
+            // (d) WRITE the SAM side-channel (into the persistent state slice) + restore p.
+            //     LookSAM → sam_dir = g_sam − g; SuperGrok11/15/SuperGrok2 → sharpness =
+            //     (g_sam − g)² (SG2 shares the SAM 2nd-backward machinery: its meta-net's
+            //     2nd MLP input is the SAME sharpness signal, read by sg2_meta_stages).
+            //     Mirrors the decoder/vit twins' unified P2.4 write.
             {
                 const int64_t gstride = (int64_t)blockDim.x * gridDim.x;
                 for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
                      i < total_e; i += gstride) {
-                    // st.sam_dir is the extra-slice base (host-bound). g_sam − g.
-                    const_cast<float*>(st.sam_dir)[i] = sam_grad[i] - grad[i];
+                    const float diff = sam_grad[i] - grad[i];
+                    if constexpr (Opt == OptId::LookSAM) {
+                        // st.sam_dir is the extra-slice base (host-bound). g_sam − g.
+                        const_cast<float*>(st.sam_dir)[i] = diff;
+                    } else {
+                        // SuperGrok11/15/SuperGrok2: sharpness = (g_sam − g)² (state slice).
+                        const_cast<float*>(st.sharpness)[i] = diff * diff;
+                    }
                     params[i] = sam_backup[i];   // restore the ORIGINAL weights
                 }
             }
@@ -934,6 +999,92 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
         }
     }
 
+    // ── P2.45 (SuperGrok11/15 ONLY) staged into P3: the per-TENSOR meta-net mu
+    //    precompute (INTEGRATION-OPTSTAGES §4/§5) — PORT of the decoder/vit twins'
+    //    P2.45 onto the mamba constant tables. SINGLE task-queue drain, NO grid
+    //    barrier: each tensor T is SELF-CONTAINED — mu(T) = sg_rescale·phi(g[T],
+    //    sharpness[T]) (per element) and, for SG11, the per-tensor cosine gate(T) =
+    //    clamp(cos(g[T], mu[T]), 0, 1) depend ONLY on T's own elements, so mu(+gate)→
+    //    apply fuse into ONE body the SAME CTA owns end-to-end inside the EXISTING P3
+    //    drain. The phi weights (per-TENSOR weight set) are staged to SMEM ONCE per
+    //    block before the drain. SG15's gate is the host scalar st.gate (no cosine
+    //    stage); SG11 binds the per-tensor gate the helper returns. sharpness (the 2nd
+    //    MLP input) was produced by P2.4 (or the cached prior step).
+    __shared__ float sg_sW1[kSgPhiHidden * 2];
+    __shared__ float sg_sb1[kSgPhiHidden];
+    __shared__ float sg_sW2[kSgPhiHidden];
+    if constexpr (Opt == OptId::SuperGrok11 || Opt == OptId::SuperGrok15) {
+        sg_stage_phi_weights<kSgPhiHidden>(st.sg_phi_W1, st.sg_phi_b1, st.sg_phi_W2,
+                                           sg_sW1, sg_sb1, sg_sW2);   // syncs
+    }
+
+    // ── P3-SG2 (SuperGrok2 ONLY): the FULL CSA/HCA/PEER/GRU meta-net as the optimizer
+    //    phase — PORT of the decoder/vit twins' P3-SG2 onto the mamba constant tables.
+    //    Run INSTEAD of the per-element apply_optimizer<SuperGrok2> (which is only the
+    //    Adam-on-smart_grad stub). Each CTA work-steals WHOLE tensors from the queue
+    //    (reset at B2 / B2.4g) and runs sg2_meta_stages for each tensor end-to-end:
+    //    STAGE -1 in-kernel segmented sort (|grad| ascending, index tie-break — strategy
+    //    A) → S0..S5 (input-proj, CSA, HCA, GRU, PEER, apply). The SAM-written
+    //    st.sharpness (P2.4, (g_sam−g)²) is the meta-net's 2nd MLP input (sharp_base).
+    //    The meta-net WEIGHTS come from HBM — sg2_meta_stages is instantiated with
+    //    WeightsT==SG2Weights + BuildSort=true. The per-tensor intermediates + the
+    //    segmented-sort scratch live in this CTA's slice of the SG2 workspace (carve-
+    //    LAST, after the Muon NS scratch). This whole phase is if-constexpr'd to
+    //    SuperGrok2, so every other cell is byte-identical (no extra barrier/work). The
+    //    kernel returns after this — no trailing grid barrier (each tensor is CTA-local).
+    //    ⚠ A/A/A: the SAM double-forward + segmented sort re-exercise the shared mamba
+    //    forward (the .sg2_spec.md-flagged risk). The gate re-verifies A/A/A; if it trips
+    //    the race, mamba×supergrok2 lands DORMANT (dispatch-gated to eager).
+    if constexpr (Opt == OptId::SuperGrok2) {
+        // Reconstruct the SG2 weight bundle (HBM pointers) from the threaded fields.
+        SG2Weights w2{
+            st.sg2_input_proj_W, st.sg2_input_proj_b,
+            st.sg2_csa_q_W, st.sg2_csa_k_W, st.sg2_csa_v_W, st.sg2_csa_out_W,
+            st.sg2_csa_compress_w, st.sg2_csa_idx_DQ, st.sg2_csa_idx_K,
+            st.sg2_hca_q_W, st.sg2_hca_k_W, st.sg2_hca_v_W, st.sg2_hca_out_W,
+            st.sg2_gru_Wz, st.sg2_gru_bz, st.sg2_gru_Wr, st.sg2_gru_br,
+            st.sg2_gru_Wh, st.sg2_gru_bh,
+            st.sg2_peer_query_Ws, st.sg2_prod_keys_A, st.sg2_prod_keys_B,
+            st.sg2_expert_W1, st.sg2_expert_b1, st.sg2_expert_W2, st.sg2_expert_b2};
+        SG2Scalars sc2{
+            st.sg2_alpha, st.sg2_gru_decay, st.sg2_lamb_eff,
+            st.sg2_beta1, st.sg2_bc1, st.sg2_bc2,
+            st.sg2_rescale, st.beta2, lr, st.wd, st.eps};
+        // Stage row_off (int64) for the SG2State adapter once into the FRONT of this
+        // CTA's SG2 workspace slice (kMambaOffsets is __constant__ int; SG2State.row_off
+        // wants const int64_t*). All CTAs stage their own copy (cheap, kMambaNumTensors).
+        float* sg2_base = sg2_ws_base + (int64_t)blockIdx.x * mb_sg2_ws_stride_floats();
+        int64_t* row_off64 = reinterpret_cast<int64_t*>(sg2_base);
+        for (int t = threadIdx.x; t < kMambaNumTensors; t += blockDim.x)
+            row_off64[t] = (int64_t)kMambaOffsets[t];
+        // The meta-net scratch starts AFTER the row_off64 staging block: reserve
+        // kMambaNumTensors int64 = 2*N floats.
+        float* sg2_meta_ws = sg2_base + 2 * kMambaNumTensors;
+        __syncthreads();
+        SG2State stt{};
+        stt.exp_avg     = st.exp_avg;
+        stt.exp_avg_sq  = st.exp_avg_sq;
+        stt.mu          = const_cast<float*>(st.mu);
+        stt.slow        = st.sg2_slow;
+        stt.gru_state   = st.sg2_gru_state;
+        stt.perm        = nullptr;          // built in-kernel (BuildSort=true)
+        stt.unsort      = nullptr;
+        stt.workspace   = sg2_meta_ws;
+        stt.ws_stride   = sg2_ws_stride<MbSG2Dims>((int64_t)kMbSG2Nmax);
+        stt.n_tensors   = kMambaNumTensors;
+        stt.n           = kMambaSizes;      // __constant__ int[]
+        stt.row_off     = row_off64;
+        __shared__ int task_slot2;
+        TaskQueue q2 = ctx.queue();
+        for (int t = q2.next_block(&task_slot2); t < kMambaNumTensors;
+             t = q2.next_block(&task_slot2)) {
+            sg2_meta_stages<MbSG2Dims, SG2Weights, float, float, /*BuildSort=*/true>(
+                w2, t, stt, sc2, params, grad, st.sharpness, sg2_meta_ws);
+        }
+        SG_MBTC_PROF_ACC(3, _pt);          // close P3 (SG2 owns the optimizer phase)
+        return;   // SG2 owns the whole optimizer phase; skip P3.
+    }
+
     // ── P3: the REAL optimizer tail over the reduced grad (work-steal 28). ──
     st.lr = lr;
     {
@@ -962,6 +1113,31 @@ fused_mamba_megakernel_tc(PersistentContext ctx,
                 const float b1 = st.beta1 * powf(1.0f - st.gamma, (float)t);
                 ts.beta1 = b1;
                 ts.bc1   = 1.0f - powf(b1, (float)step);
+            }
+            // SuperGrok11/15 meta-net mu (+ SG11 per-tensor gate) precompute for THIS
+            // tensor, BEFORE the apply reads ts.mu/ts.gate — PORT of the decoder/vit P3.
+            // mu(T)=sg_rescale·phi(g,sharpness) over [off,off+n); SG11 also computes the
+            // clamped cosine gate(T) (block-uniform __syncthreads/reduce — the whole CTA
+            // owns t). SG15's gate is st.gate (host sigmoid(accuracy)). Helpers index
+            // grad/sharpness/mu by off+i, so pass the BASE pointers (st.mu, grad,
+            // st.sharpness) + off; the apply then reads ts.mu (== st.mu+off). phi_b2 read
+            // on-device from sg_phi_W2[H].
+            if constexpr (Opt == OptId::SuperGrok11) {
+                const float b2 = (st.sg_phi_W2 != nullptr) ? st.sg_phi_W2[kSgPhiHidden]
+                                                           : st.sg_phi_b2;
+                const float g8 = sg11_precompute_mu_and_gate_for_tensor<kSgPhiHidden>(
+                    st.mu, grad, st.sharpness, sg_sW1, sg_sb1, sg_sW2,
+                    b2, st.sg_rescale, off, n);
+                ts.gate = g8;            // per-tensor cosine gate the apply tail reads
+                __syncthreads();         // mu(T) fully written + gate broadcast before apply
+            } else if constexpr (Opt == OptId::SuperGrok15) {
+                const float b2 = (st.sg_phi_W2 != nullptr) ? st.sg_phi_W2[kSgPhiHidden]
+                                                           : st.sg_phi_b2;
+                sg15_precompute_mu_for_tensor<kSgPhiHidden>(
+                    st.mu, grad, st.sharpness, sg_sW1, sg_sb1, sg_sW2,
+                    b2, st.sg_rescale, off, n);
+                // ts.gate stays = st.gate (the host sigmoid(accuracy) scalar).
+                __syncthreads();         // mu(T) visible before the apply reads it
             }
             float* __restrict__ p = params + off;
             const float* __restrict__ gg = grad + off;

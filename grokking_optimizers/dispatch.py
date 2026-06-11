@@ -967,6 +967,24 @@ _FUSED_L3_REAL = frozenset({
     # re-trip the shared mamba-forward A/A/A race; code-absent in the mamba kernel/launcher).
     ("transformer_decoder", "supergrok2"),
     ("vit", "supergrok2"),
+    # supergrok11/15 (mamba — wave-4 mamba SG lane): CONVERTED. The decoder/vit SG11/15
+    # in-kernel SAM 2nd backward (P2.4, sharpness=(g_sam−g)²) + the per-tensor meta-net mu
+    # precompute (P2.45/P3, mu=sg_rescale·phi(g,sharpness); SG11 also the cosine gate) are
+    # PORTED onto the mamba TC kernel (fused_mamba_megakernel.cuh) + launcher (opt_id 8/9).
+    # The shared-mamba-forward A/A/A race that blocked the SAM 2nd-pass mamba cells is FIXED
+    # (commit 0b57f7e — register-pressure wgmma-accumulator spill; it un-dormanted
+    # looksam/mamba, which proved the SAM double-forward path is race-free). SG11/15 ride the
+    # SAME single-launch TC tail (the meta-net mu is a per-element/per-tensor body, NOT the
+    # full CSA/HCA meta-net of SG2). The phi pack + sharpness ride the extended state buffer
+    # (4*total+1+kSgPhiPack); fused_train_step scatters the phi pack each step (model-agnostic,
+    # shared with decoder/vit) and sizes the state. HONEST CAVEAT: SG11/15 mamba reach L3-TC +
+    # single-step parity but WON'T GROK on L3 (the meta-net is untrained — a separate
+    # owner-approved host-training task, NOT done here). A/A/A re-verified by the tail gate; if
+    # either trips the race it is gated OUT of _L3_WGMMA_CELLS (landed dormant — no
+    # non-deterministic production cell).
+    ("mamba3", "supergrok11"),
+    ("mamba3", "supergrok15"),
+    # __SG2_MAMBA_FUSED_L3_REAL__
 })
 
 _FUSED_REGISTRY = {}
@@ -1619,6 +1637,18 @@ _L3_WGMMA_CELLS = frozenset({
     # the mamba kernel/launcher carry no SG2 case — code-absent).
     ("transformer_decoder", "supergrok2"),
     ("vit", "supergrok2"),
+    # supergrok11/15 (mamba — wave-4 mamba SG lane): CONVERTED. The bf16 TC mamba launcher
+    # routes opt_id 8/9 (OptId::SuperGrok11/15) over the mamba TC-reduced grad; the kernel's
+    # P2.4 SAM 2nd backward (sharpness=(g_sam−g)²) + P2.45/P3 per-tensor meta-net mu precompute
+    # land in fused_mamba_megakernel_tc (ported from decoder/vit). The shared-mamba-forward
+    # A/A/A race that blocked them is fixed (commit 0b57f7e — looksam/mamba proved the SAM
+    # double-forward is race-free); the tail gate re-verifies A/A/A. gemm_impl_for_cell →
+    # "wgmma". If either trips the race the entry is REMOVED here (landed dormant; the
+    # _FUSED_L3_REAL entry would then route to eager via has_l3_real-only-on-membership? no —
+    # see the dormant carve below). They reach L3-TC but WON'T GROK (meta-net untrained).
+    ("mamba3", "supergrok11"),
+    ("mamba3", "supergrok15"),
+    # __SG2_MAMBA_L3_WGMMA__
 })
 
 

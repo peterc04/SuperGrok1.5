@@ -369,6 +369,26 @@ cudaError_t mega_vit_sg2_tc(
     float rescale, float beta2, float lr, float wd, float eps,
     float rho, float sam_on,
     int step, cudaStream_t stream, int ncta_cap);
+// SuperGrok2 DEDICATED mamba TC launcher (the mamba twin of mega_{decoder,vit}_sg2_tc).
+// int32 tokens (like the decoder), the same SG2 meta-net bundle + per-tensor scalar
+// arrays + state layout. The mamba megakernel's P3-SG2 phase runs sg2_meta_stages.
+cudaError_t mega_mamba_sg2_tc(
+    ::sg::fused::PersistentContext ctx, float* params,
+    const int* tokens, const int* targets, int B,
+    float* state, float* grad, float* loss_out,
+    const float* input_proj_W, const float* input_proj_b,
+    const float* csa_q_W, const float* csa_k_W, const float* csa_v_W, const float* csa_out_W,
+    const float* csa_compress_w, const float* csa_idx_DQ, const float* csa_idx_K,
+    const float* hca_q_W, const float* hca_k_W, const float* hca_v_W, const float* hca_out_W,
+    const float* gru_Wz, const float* gru_bz, const float* gru_Wr, const float* gru_br,
+    const float* gru_Wh, const float* gru_bh,
+    const float* peer_query_Ws, const float* prod_keys_A, const float* prod_keys_B,
+    const float* expert_W1, const float* expert_b1, const float* expert_W2, const float* expert_b2,
+    const float* sc_alpha, const float* sc_gru_decay, const float* sc_lamb_eff,
+    const float* sc_beta1, const float* sc_bc1, const float* sc_bc2,
+    float rescale, float beta2, float lr, float wd, float eps,
+    float rho, float sam_on,
+    int step, cudaStream_t stream, int ncta_cap);
 }}  // namespace fused::sm90
 #endif
 
@@ -1094,15 +1114,17 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // PROBE / SG_MAMBA_LOOKSAM_PROBE diagnostic overrides are retired (the cells route in
  // production now). The 6 basic mamba cells stay byte-identical (the scan math is unchanged;
  // __noinline__ does not alter results — re-gated green).
- // SuperGrok11/15 stay BLOCKED — but on a DIFFERENT reason than the (now-fixed) race: they
- // are CODE-ABSENT in the mamba TC kernel/launcher (the mamba megakernel SAM block + the
- // launcher switch carry only OptId::LookSAM; there is NO SG sharpness=(g_sam−g)²/meta-net mu
- // case). Un-dormanting them is a FEATURE PORT (the decoder/vit twins exist), not a
- // determinism fix; the now-deterministic LookSAM mamba instantiation proves the SAM 2nd-pass
- // path is race-free. So a forced wgmma request for SG11/15 mamba still fails LOUD here.
- const bool mb_is_sg = (optimizer == "supergrok11" || optimizer == "supergrok15"
-                        || optimizer == "supergrok2");
- const bool mb_tc_tail = (mb_opt_id >= 0 && !mb_is_sg);  // {adamw,lion,grokfast,grokadamw,neuralgrok,muon,prodigy,looksam}; mamba SG11/15/SG2 = code-absent block (SG2 is decoder/vit-only via the dedicated entry).
+ // SuperGrok11/15 are now CONVERTED — the FEATURE PORT landed (the mamba megakernel SAM
+ // block extends to SG11/15/SG2: sharpness=(g_sam−g)² in P2.4 + the per-tensor meta-net mu
+ // precompute in P2.45/P3; the launcher switch gained the OptId::SuperGrok11/15 cases). The
+ // now-deterministic LookSAM mamba instantiation proved the SAM 2nd-pass path is race-free,
+ // so SG11/15 ride the SAME single-launch TC tail (opt_id 8/9). The gate re-verifies A/A/A
+ // for each; if either trips the race it is landed DORMANT (gated out of _L3_WGMMA_CELLS).
+ // SuperGrok2 stays OUT of the generic single-launch tail — it routes via the DEDICATED
+ // sg2_fused_step → mega_mamba_sg2_tc entry (the FULL meta-net weight bundle + per-tensor
+ // scalar ARRAYS don't fit the generic FusedScalars/boundary). So mb_is_sg gates SG2 only.
+ const bool mb_is_sg2 = (optimizer == "supergrok2");
+ const bool mb_tc_tail = (mb_opt_id >= 0 && !mb_is_sg2);  // {adamw,lion,grokfast,grokadamw,neuralgrok,muon,prodigy,looksam,supergrok11,supergrok15}; SG2 = dedicated entry (sg2_fused_step).
  const bool mamba_l3_real = (optimizer == "adamw")
                             || (want_wgmma && mb_tc_tail);
  if (arch == 90 && model == "mamba3" && mamba_l3_real && !opt_only) {
@@ -1115,12 +1137,11 @@ void fused_step(const std::string& model, const std::string& optimizer,
  "'); the non-adamw mamba tails are wgmma-only. Use gemm_impl='wgmma'.");
  TORCH_CHECK(!want_wgmma || mb_tc_tail,
  "fused_step: gemm_impl='wgmma' requested for mamba3 with optimizer '", optimizer,
- "', but the mamba TC launcher production-routes the tails "
- "{adamw,lion,grokfast,grokadamw,neuralgrok,muon,prodigy,looksam} (opt_id 0/1/2/3/6/7/5/4). "
- "Prodigy (P2.6 d-estimate) + LookSAM (P2.4 SAM 2nd backward) are now A/A/A bit-exact "
- "(the register-pressure wgmma-accumulator-spill race is fixed). SuperGrok11/15 are CODE-ABSENT "
- "in the mamba kernel/launcher (no SG sharpness/meta-net case — a feature port, not this fix) "
- "and SG2 is eager-only — use the eager/per-op path for those.");
+ "', but the mamba TC launcher generic single-launch tail production-routes "
+ "{adamw,lion,grokfast,grokadamw,neuralgrok,muon,prodigy,looksam,supergrok11,supergrok15} "
+ "(opt_id 0/1/2/3/6/7/5/4/8/9). SuperGrok2 routes via the DEDICATED sg2_fused_step entry "
+ "(the FULL meta-net weight bundle + per-tensor scalar arrays don't fit fused_step's ABI), "
+ "NOT this generic path — call ops.sg2_fused_step (dispatch.fused_train_step does so).");
  const int64_t total = kMambaTotalElems;
  TORCH_CHECK(params.numel() == total,
  "fused Mamba megakernel: params has ", params.numel(),
@@ -1140,14 +1161,21 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // state = [m|v|extra] (3*total) + 1 loss slot. PRODIGY (STAGED global-d) needs a
  // LARGER buffer: [m|v|s_track | loss | param_init(total) | r_ema|s_ema|d_lr] =
  // 4*total + 4 (the TC launcher carves param_init at loss_slot+1, the 3 persisted
- // estimator scalars after it — identical to the decoder/vit prodigy state). The host
- // (fused_train_step) sizes it per-cell, keyed on opt_name=="prodigy" (model-agnostic).
- const int64_t min_state = (optimizer == "prodigy") ? (4 * total + 4) : (3 * total + 1);
+ // estimator scalars after it — identical to the decoder/vit prodigy state). SuperGrok11/15
+ // need [m|v|mu | loss | sharpness(total) | phi_pack(4H+1)] = 4*total + 1 + (4*32+1) (the
+ // launcher carves sharpness at loss_slot+1, the phi pack after it — identical to the
+ // decoder/vit SG state). The host (fused_train_step) sizes it per-cell (model-agnostic).
+ const int64_t min_state =
+     (optimizer == "prodigy") ? (4 * total + 4)
+   : (optimizer == "supergrok11" || optimizer == "supergrok15") ? (4 * total + 1 + (4 * 32 + 1))
+   : (3 * total + 1);
  TORCH_CHECK(state.numel() >= min_state &&
  state.scalar_type() == torch::kFloat32 && state.is_contiguous(),
  "fused Mamba megakernel: state must be contiguous fp32 with >= ", min_state,
  " elements (", (optimizer == "prodigy")
  ? "[m|v|s_track|loss|param_init|r_ema|s_ema|d_lr] for Prodigy"
+ : (optimizer == "supergrok11" || optimizer == "supergrok15")
+ ? "[m|v|mu|loss|sharpness|phi_pack] for SuperGrok11/15"
  : "[m|v|extra]+loss", ").");
  // grad = the REDUCED weight-grad OUTPUT [total] (same contract as the
  // decoder): the only check that exercises the hand-written selective-scan
@@ -1502,9 +1530,55 @@ void sg2_fused_step(
  W(sc_alpha), W(sc_gru_decay), W(sc_lamb_eff), W(sc_beta1), W(sc_bc1), W(sc_bc2),
  (float)rescale, (float)beta2, (float)lr, (float)wd, (float)eps,
  (float)rho, (float)sam_on, (int)step, stream, /*ncta_cap=*/0);
+ } else if (model == "mamba3") {
+ // The mamba twin of the decoder branch: int32 tokens, the SAME SG2 meta-net bundle
+ // + per-tensor scalar arrays + state layout. The mamba megakernel's P3-SG2 phase
+ // runs sg2_meta_stages. ⚠ A/A/A: the SAM double-forward + segmented sort re-exercise
+ // the shared mamba forward (the .sg2_spec.md-flagged risk); the gate re-verifies
+ // bit-determinism, and the cell is landed DORMANT (gated out of _L3_WGMMA_CELLS) if it
+ // re-trips the race. Routed here regardless so the kernel is exercisable + gateable.
+ const int64_t total = kMambaTotalElems;
+ const int GH = 4;   // SG2Dims gru_hidden default
+ const int64_t min_state = (int64_t)(5 + GH) * total + 1;   // [m|v|mu|loss|sharpness|slow|gru_state]
+ TORCH_CHECK(params.numel() == total,
+ "sg2_fused_step: mamba params has ", params.numel(), " != ", total);
+ TORCH_CHECK(grad.numel() == total,
+ "sg2_fused_step: mamba grad has ", grad.numel(), " != ", total);
+ TORCH_CHECK(state.numel() >= min_state,
+ "sg2_fused_step: mamba state needs >= ", min_state,
+ " floats ([m|v|mu|loss|sharpness|slow|gru_state(total*", GH, ")]) got ",
+ state.numel(), ".");
+ TORCH_CHECK(input.scalar_type() == torch::kInt32 && input.is_contiguous(),
+ "sg2_fused_step: mamba input must be contiguous int32 (tokens[B*kSeq]++targets[B]).");
+ const int64_t in_n = input.numel();
+ TORCH_CHECK(in_n % (kMambaSeq + 1) == 0 && in_n > 0,
+ "sg2_fused_step: mamba input.numel() must be B*(kSeq+1).");
+ const int B = (int)(in_n / (kMambaSeq + 1));
+ MambaScratch& msc = mamba_scratch_for(params);
+ fused::PersistentContext ctx{
+ msc.g_next.data_ptr<int>(),
+ reinterpret_cast<unsigned*>(msc.g_arrived.data_ptr<int>()),
+ reinterpret_cast<unsigned*>(msc.g_generation.data_ptr<int>()),
+ 28,                    // kMambaNumTensors (mirror; the .cu static-asserts it)
+ 0u};
+ float* loss_slot = st + 3 * total;
+ err = fused::sm90::mega_mamba_sg2_tc(
+ ctx, params.data_ptr<float>(),
+ input.data_ptr<int>(), input.data_ptr<int>() + (int64_t)B * kMambaSeq, B,
+ st, grad.data_ptr<float>(), loss_slot,
+ W(input_proj_W), W(input_proj_b),
+ W(csa_q_W), W(csa_k_W), W(csa_v_W), W(csa_out_W),
+ W(csa_compress_w), W(csa_idx_DQ), W(csa_idx_K),
+ W(hca_q_W), W(hca_k_W), W(hca_v_W), W(hca_out_W),
+ W(gru_Wz), W(gru_bz), W(gru_Wr), W(gru_br), W(gru_Wh), W(gru_bh),
+ W(peer_query_Ws), W(prod_keys_A), W(prod_keys_B),
+ W(expert_W1), W(expert_b1), W(expert_W2), W(expert_b2),
+ W(sc_alpha), W(sc_gru_decay), W(sc_lamb_eff), W(sc_beta1), W(sc_bc1), W(sc_bc2),
+ (float)rescale, (float)beta2, (float)lr, (float)wd, (float)eps,
+ (float)rho, (float)sam_on, (int)step, stream, /*ncta_cap=*/0);
  } else {
  throw std::runtime_error("sg2_fused_step: SuperGrok2 L3-TC is wired for "
- "transformer_decoder + vit only (mamba is code-absent / A/A/A-blocked); got " + model);
+ "transformer_decoder + vit + mamba3; got " + model);
  }
  if (err != cudaSuccess)
  throw std::runtime_error(std::string("sg2_fused_step launch failed: ") +
