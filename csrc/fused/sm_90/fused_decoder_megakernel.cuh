@@ -547,34 +547,60 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     //      s_ema  <- beta3·s_ema + Σ d_prev²·|g|            then add this step's Σ)
     //      d       = max(d_prev, d_coef·r_ema/|s_ema|)      (prodigy_update_d; d_coef
     //                scales ONLY the candidate — persisted r_ema stays UNSCALED)
-    //    DETERMINISM (COMPONENT_CONTRACT): NO float atomic. Each CTA publishes its
-    //    (r,s) into per-CTA slots (opt_reduce) → grid barrier → CTA0 owner-sums in
-    //    ascending index order → writes d back to the persisted slot + a broadcast
-    //    slot. The decay is on the persisted SCALARS (not the per-CTA partials):
-    //    the work-steal queue reassigns tensors to CTAs across steps, so a per-CTA
-    //    EMA is undefined — the live form is a scalar EMA (prodigy_sm90.cuh:488).
+    //
+    //    DETERMINISM — FIXED-PARTITION reduction (mirrors the A/A/A-CLEAN GrokAdamW
+    //    P2.5 grad-norm reduce above), NOT the work-steal task-queue drain. ROOT-
+    //    CAUSE FIX: the previous form drained the global TaskQueue (q.next_block →
+    //    atomicAdd(g_next_task)) inside phaseA and then reset that SAME counter in a
+    //    sync_RESET barrier (B2.6a). The work-steal claim order is timing-dependent,
+    //    so each CTA's (r,s) slot held a DIFFERENT, non-reproducible subset-sum each
+    //    run; folding the counter reset into the barrier on top of that exposed a
+    //    grid-barrier visibility window that made the WHOLE persistent step non-
+    //    deterministic (P1/P2 loss+grad differed across bit-identical re-runs, with
+    //    NaN in the tail) — A/A/A FAIL. GrokAdamW's P2.5 reduces a FIXED contiguous
+    //    element range per CTA with a plain sync() and is A/A/A-CLEAN; prodigy now
+    //    uses the IDENTICAL shape. Each CTA owns [e0,e0+ecnt) of the FLAT [0,total)
+    //    arrays — params/param_init/grad are parallel flat blobs, so a contiguous
+    //    flat range sum == the cross-all-TENSORS sum (tensor boundaries are
+    //    irrelevant to a global Σ). The per-element contribution still CALLS the
+    //    canonical prodigy_partials_step (prodigy.h:28-53, single-source). NO float
+    //    atomic; per-CTA (r,s) slot publish → ONE plain grid barrier → CTA0 owner-
+    //    sums ascending → EMA-decay/update_d → broadcast → ONE plain grid barrier.
+    //    g_next_task is UNTOUCHED here (B2 already reset it to 0), so P3's queue
+    //    drain runs unchanged — no sync_reset needed in P2.6.
     //    Guarded so every other opt's P3 is byte-identical (no extra barrier/work).
     if constexpr (Opt == OptId::Prodigy) {
-        PrecomputeWorkspace pw{};
-        pw.prodigy_partials = opt_reduce;            // [r slots | s slots]
-        pw.prodigy_d        = opt_reduce + 2 * nCTA; // reduced-d broadcast slot
-        // d_prev: persisted d_lr (slot 2 of prodigy_persist), or d0 at step 1.
+        // Per-CTA (r,s) slots in opt_reduce ([r slots | s slots]) + the reduced-d
+        // broadcast slot. d_prev: persisted d_lr (slot 2), or d0 cold-start at step 1.
+        float* r_part = opt_reduce;                  // [nCTA] per-CTA Σ d²·<g,p0−p>
+        float* s_part = opt_reduce + nCTA;           // [nCTA] per-CTA Σ d²·|g|
+        float* d_bc   = opt_reduce + 2 * nCTA;       // [1] reduced-d broadcast
         const float d_prev = (step == 1) ? st.d0 : st.prodigy_persist[2];
-        st.d_factor = d_prev;   // phaseA reads st.d_factor as d_prev (prodigy.h)
-        // Phase A: each CTA accumulates Σ d_prev²·<g,p0−p> / Σ d_prev²·|g| over its
-        // claimed tensors → per-CTA (r,s) slots. Drains the task queue (the P3
-        // re-drain below needs a queue reset, done at the barrier).
-        prodigy_precompute_reduce_phaseA(ctx, params, st.param_init, grad,
-                                         kDecSizes, kDecOffsets, d_prev, pw);
-        bar.sync_reset(ctx.g_next_task);   // B2.6a: slots published; reset queue for P3
-        // Owner block (CTA0 thread0): EMA decay + accumulate + d_coef + update_d,
-        // byte-matching launch_multi_tensor_prodigy_fused_reduce_step.
+        // FIXED contiguous element range over the flat [0,total_p) arrays (same split
+        // as GrokAdamW P2.5: even base + remainder to the low CTAs → deterministic).
+        const int64_t total_p = kDecTotalElems;
+        const int64_t pbase = total_p / nCTA, prem = total_p % nCTA;
+        const int64_t pe0 = (int64_t)cta * pbase + (cta < prem ? cta : prem);
+        const int64_t pecnt = pbase + (cta < prem ? 1 : 0);
+        float r_acc = 0.0f, s_acc = 0.0f;
+        for (int64_t i = threadIdx.x; i < pecnt; i += blockDim.x) {
+            // Canonical per-element partials (prodigy.h:28-53): r carries d²·<g,p0−p>,
+            // s carries d²·|g| (the L1-norm denominator). params/param_init/grad are
+            // flat blobs → index pe0+i is the same element in all three.
+            algo::prodigy_partials_step(params, st.param_init, grad,
+                                        d_prev, pe0 + i, r_acc, s_acc);
+        }
+        // Deterministic in-CTA two-value reduction (fixed thread count) → thread0
+        // publishes this CTA's (r,s) slot. No atomic.
+        float r_block, s_block;
+        prim::block_reduce_sum2_f32(r_acc, s_acc, r_block, s_block);
+        if (threadIdx.x == 0) { r_part[cta] = r_block; s_part[cta] = s_block; }
+        bar.sync();   // B2.6a: all per-CTA (r,s) partials published & visible
+        // Owner block (CTA0 thread0): ascending owner-sum + EMA decay + accumulate +
+        // d_coef + update_d, byte-matching launch_multi_tensor_prodigy_fused_reduce_step.
         if (cta == 0 && threadIdx.x == 0) {
             float r_step = 0.0f, s_step = 0.0f;     // ascending-CTA owner-sum
-            for (int c = 0; c < nCTA; ++c) {
-                r_step += pw.prodigy_partials[c];
-                s_step += pw.prodigy_partials[nCTA + c];
-            }
+            for (int c = 0; c < nCTA; ++c) { r_step += r_part[c]; s_step += s_part[c]; }
             // Decay persisted scalars by beta3, then add this step's reduction.
             const float r_ema = st.beta3 * st.prodigy_persist[0] + r_step;
             const float s_ema = st.beta3 * st.prodigy_persist[1] + s_step;
@@ -585,10 +611,10 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
             st.prodigy_persist[0] = r_ema;          // persist UNSCALED EMA
             st.prodigy_persist[1] = s_ema;
             st.prodigy_persist[2] = d_new;          // persisted d_lr for next step
-            pw.prodigy_d[0]       = d_new;          // broadcast to all CTAs
+            d_bc[0]               = d_new;          // broadcast to all CTAs
         }
         bar.sync();   // B2.6b: d visible to every CTA before the apply
-        st.d_factor = pw.prodigy_d[0];              // the reduced d the tail reads
+        st.d_factor = d_bc[0];                      // the reduced d the tail reads
     }
 
     // ── P2.7 (Muon ONLY): grid-cooperative Newton-Schulz orthogonalization of the
