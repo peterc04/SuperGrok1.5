@@ -3,8 +3,6 @@
 #
 # Usage:
 #   ./build.sh                    # default: plain release build
-#   ./build.sh --autotune         # two-pass build (stub -> tune.py -> rebuild)
-#   ./build.sh --no-autotune      # explicit single-pass (default behavior)
 #   ./build.sh --debug            # -G -O0 -lineinfo, fast-math off (CUDA_DEBUG=1)
 #   ./build.sh --profile          # release build, then ncu --set full
 #   ./build.sh --package          # build + stage redistributable dist/ tree
@@ -13,8 +11,19 @@
 # Env:
 #   MAX_JOBS   parallel ninja jobs (default: $(nproc))
 #
-# --package combines well with --autotune, --debug, --no-autotune. Combining
-# with --debug skips the strip step so the extensions stay debuggable.
+# AUTOTUNING (the old --autotune two-pass flow was REMOVED — it called a
+# nonexistent autotune/tune.py and staged the wrong header path). The kernel
+# autotuner is now grokking_optimizers.compile: it JIT-builds + times variants
+# and writes the winners to grokking_optimizers/_kernel_tuned.json. The NEXT
+# plain `./build.sh` (or `pip install -e .`) reads that JSON and injects the
+# per-TU -DSG_TUNED_* / --maxrregcount flags into the shipped _ops*.so. Full
+# operator procedure: see AUTOTUNE_LINKAGE.md. In short:
+#     python -m grokking_optimizers.compile --optimizer <opt> --model <model> \
+#         --arch sm_90 --jit-only      # repeat per optimizer -> _kernel_tuned.json
+#     ./build.sh                       # rebuild; tuned flags are now active
+#
+# --package combines well with --debug. Combining with --debug skips the strip
+# step so the extensions stay debuggable.
 #
 # The ninja invocation by torch's BuildExtension prints "[N/M] ..." progress
 # lines on stderr. We tee everything to build.log and post-process with a
@@ -25,7 +34,6 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-AUTOTUNE=0
 DEBUG=0
 PROFILE=0
 PACKAGE=0
@@ -33,14 +41,26 @@ TARBALL=0
 
 for arg in "$@"; do
   case "$arg" in
-    --autotune)        AUTOTUNE=1 ;;
-    --no-autotune)     AUTOTUNE=0 ;;
     --debug)           DEBUG=1 ;;
     --profile)         PROFILE=1 ;;
     --package)         PACKAGE=1 ;;
     --package-tarball) PACKAGE=1; TARBALL=1 ;;
+    --autotune|--no-autotune)
+      # Removed: the two-pass --autotune flow called a nonexistent
+      # autotune/tune.py and staged the wrong tuned-header path. The kernel
+      # autotuner is now `python -m grokking_optimizers.compile` writing
+      # grokking_optimizers/_kernel_tuned.json, which the NEXT plain build
+      # consumes automatically. See AUTOTUNE_LINKAGE.md.
+      echo "build.sh: '$arg' has been removed." >&2
+      echo "  Run the autotuner, then rebuild:" >&2
+      echo "    python -m grokking_optimizers.compile --optimizer <opt> \\" >&2
+      echo "        --model <model> --arch sm_90 --jit-only   # per optimizer" >&2
+      echo "    ./build.sh                                     # tuned flags active" >&2
+      echo "  Details: AUTOTUNE_LINKAGE.md" >&2
+      exit 2
+      ;;
     -h|--help)
-      sed -n '2,21p' "$0"
+      sed -n '2,28p' "$0"
       exit 0
       ;;
     *)
@@ -122,16 +142,12 @@ run_build() {
 
 START=$SECONDS
 
-if [[ "$AUTOTUNE" == "1" ]]; then
-  echo "build.sh: --autotune two-pass build"
-  AUTOTUNE_PASS=1 run_build "pass 1: stub configs"
-  echo "build.sh: running autotune/tune.py to write tuned_configs.h"
-  python autotune/tune.py
-  unset AUTOTUNE_PASS
-  run_build "pass 2: tuned configs"
-else
-  run_build "single-pass build"
-fi
+# Single-pass build. Kernel autotuning is decoupled (see the AUTOTUNING note
+# in the header / AUTOTUNE_LINKAGE.md): run grokking_optimizers.compile to
+# write grokking_optimizers/_kernel_tuned.json, then this build's
+# TunedBuildExtension injects the per-TU tuned flags automatically. If the JSON
+# is absent the build uses the in-header kernel defaults.
+run_build "single-pass build"
 
 if [[ "$PROFILE" == "1" ]]; then
   echo "build.sh: --profile running ncu"
@@ -146,8 +162,8 @@ fi
 # Output layout (matches what Python sees after `pip install -e .`):
 #   dist/
 #   ├── grokking_optimizers/        Python sources + compiled _ops.<...>.so
+#   │                               (+ _kernel_tuned.json if winners exist)
 #   ├── csrc/backends/pallas/       Pallas/JAX TPU kernels (Python)
-#   ├── csrc/common/tuned_configs.h post-autotune values (if AUTOTUNE ran)
 #   ├── LICENSE
 #   ├── pyproject.toml              build manifest (version pin)
 #   ├── README.md
@@ -155,9 +171,15 @@ fi
 #
 # Stage-2 fix (Phase 8): earlier revisions staged `supergrok2_jax_tpu/` and
 # `csrc/kernels/tpu/` — neither path exists in this tree. The JAX/TPU Pallas
-# kernels actually live under `csrc/backends/pallas/`; tuned_configs.h is
-# only present after `--autotune`. Staging is now guarded on existence so a
-# plain `--package` no longer creates empty directories or skips real files.
+# kernels actually live under `csrc/backends/pallas/`. Staging is guarded on
+# existence so a plain `--package` never creates empty directories.
+#
+# Tuned provenance: the tuned launch params are BAKED INTO the .so at build
+# time (TunedBuildExtension, lever (b)). The canonical winners file
+# grokking_optimizers/_kernel_tuned.json is staged alongside the .so when it
+# exists so a consumer can see / re-apply what was tuned. (The legacy
+# csrc/common/tuned_configs.h staging was wrong — compile.py writes
+# csrc/algorithms/tuned_configs.h, a secondary header — and is dropped.)
 #
 # Compiled extensions: torch's BuildExtension produces a single multi-arch
 # fatbin .so (one file with cubin/PTX for every arch listed in setup.py's
@@ -173,6 +195,11 @@ package_dist() {
 
   # Python sources (preserve subpackage layout, including kernel headers).
   cp -r grokking_optimizers/*.py "${dist_dir}/grokking_optimizers/"
+  # Canonical tuned winners (lever (b)). The launch params are already baked
+  # into the .so; this file records WHAT was tuned (provenance / re-apply).
+  if [[ -f grokking_optimizers/_kernel_tuned.json ]]; then
+    cp grokking_optimizers/_kernel_tuned.json "${dist_dir}/grokking_optimizers/"
+  fi
   # Per-arch in-package kernel headers (*.cuh / *.hip.hpp) and any package
   # data live under grokking_optimizers/kernels/ — copy the whole subpackage.
   if [[ -d grokking_optimizers/kernels ]]; then
@@ -210,13 +237,10 @@ package_dist() {
   done
   echo "build.sh: --package staged ${#ops_files[@]} _ops extension(s)"
 
-  # Post-autotune tuned_configs.h (only present after `--autotune`; on a
-  # plain build it does not exist and is simply skipped — the consumer can
-  # re-tune later). Guarded so we never mkdir an empty csrc/common/.
-  if [[ -f csrc/common/tuned_configs.h ]]; then
-    mkdir -p "${dist_dir}/csrc/common"
-    cp csrc/common/tuned_configs.h "${dist_dir}/csrc/common/"
-  fi
+  # (The tuned launch params are baked into the .so above and the canonical
+  # winners file grokking_optimizers/_kernel_tuned.json is staged with the
+  # Python sources. There is no separate csrc/common/tuned_configs.h to ship —
+  # that path was never written by the autotuner.)
 
   # Top-level metadata. (REFRESH.md does not exist in this tree; LICENSE is
   # required by the package metadata, so it must ship.)

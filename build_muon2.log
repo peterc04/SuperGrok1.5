@@ -1,0 +1,66 @@
+/usr/local/lib/python3.11/dist-packages/torch/cuda/__init__.py:58: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/usr/local/lib/python3.11/dist-packages/setuptools/config/_apply_pyprojecttoml.py:71: _MissingDynamic: `authors` defined outside of `pyproject.toml` is ignored.
+!!
+
+        ********************************************************************************
+        The following seems to be defined outside of `pyproject.toml`:
+
+        `authors = 'Peter C.'`
+
+        According to the spec (see the link below), however, setuptools CANNOT
+        consider this value unless `authors` is listed as `dynamic`.
+
+        https://packaging.python.org/en/latest/specifications/pyproject-toml/#declaring-project-metadata-the-project-table
+
+        To prevent this problem, you can list `authors` under `dynamic` or alternatively
+        remove the `[project]` table from your file and rely entirely on other means of
+        configuration.
+        ********************************************************************************
+
+!!
+  _handle_missing_dynamic(dist, project_table)
+/usr/local/lib/python3.11/dist-packages/setuptools/config/_apply_pyprojecttoml.py:71: _MissingDynamic: `classifiers` defined outside of `pyproject.toml` is ignored.
+!!
+
+        ********************************************************************************
+        The following seems to be defined outside of `pyproject.toml`:
+
+        `classifiers = ['Development Status :: 4 - Beta', 'Intended Audience :: Science/Research', 'License :: OSI Approved :: MIT License', 'Topic :: Scientific/Engineering :: Artificial Intelligence', 'Programming Language :: Python :: 3', 'Programming Language :: Python :: 3.10', 'Programming Language :: C++']`
+
+        According to the spec (see the link below), however, setuptools CANNOT
+        consider this value unless `classifiers` is listed as `dynamic`.
+
+        https://packaging.python.org/en/latest/specifications/pyproject-toml/#declaring-project-metadata-the-project-table
+
+        To prevent this problem, you can list `classifiers` under `dynamic` or alternatively
+        remove the `[project]` table from your file and rely entirely on other means of
+        configuration.
+        ********************************************************************************
+
+!!
+  _handle_missing_dynamic(dist, project_table)
+/usr/local/lib/python3.11/dist-packages/setuptools/config/_apply_pyprojecttoml.py:78: SetuptoolsWarning: `install_requires` overwritten in `pyproject.toml` (dependencies)
+  corresp(dist, value, root_dir)
+  CUTLASS: auto-enabled (CUDA>=12 toolkit + cutlass headers present); set WITH_CUTLASS=0 to force cuBLAS fallback
+  Compiler launcher: ccache -> /usr/bin/ccache
+  Preflight: nvcc CUDA 12.x matches torch.version.cuda 12.4
+Building Grokking Optimizers C++/CUDA extension
+  CUDA version: 12.4
+  CUDA archs (from TORCH_CUDA_ARCH_LIST): 9.0a -> ['-gencode=arch=compute_90a,code=sm_90a']
+  NVCC base flags: compile.NVCC_DEVICE_BASE (strict) + grokking project flags (--use_fast_math, -DNDEBUG)
+  CUTLASS enabled for archs: ['90a']
+running build_ext
+/usr/local/lib/python3.11/dist-packages/torch/utils/cpp_extension.py:424: UserWarning: There are no x86_64-linux-gnu-g++ version bounds defined for CUDA version 12.4
+  warnings.warn(f'There are no {compiler_name} version bounds defined for CUDA version {cuda_str_version}')
+  [tuned-inject] no _kernel_tuned.json found; building with in-header kernel defaults. Run `python -m grokking_optimizers.compile ... --jit-only` to produce winners (see AUTOTUNE_LINKAGE.md).
+building 'grokking_optimizers._ops' extension
+Emitting ninja build file /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/build.ninja...
+Compiling objects...
+Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+[1/1] c++ -MMD -MF /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/bindings/dispatch.o.d -Wsign-compare -DNDEBUG -g -fwrapv -O2 -Wall -g -fstack-protector-strong -Wformat -Werror=format-security -g -fwrapv -O2 -fPIC -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/bindings/dispatch.cpp -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/bindings/dispatch.o -O3 -std=c++17 -DWITH_CUDA -DNDEBUG -ffast-math -funroll-loops -fPIC -DWITH_CUTLASS -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/csrc/bindings/dispatch.cpp:352:1: warning: multi-line comment [-Wcomment]
+  352 | //   python -m grokking_optimizers.megakernel_codegen --dispatch-table > \
+      | ^
+x86_64-linux-gnu-g++ -Wsign-compare -DNDEBUG -g -fwrapv -O2 -Wall -g -fstack-protector-strong -Wformat -Werror=format-security -g -fwrapv -O2 -shared -Wl,-O1 -Wl,-Bsymbolic-functions /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_adamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_grokadamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_grokfast.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_lion.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_looksam.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_muon.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_neuralgrok.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_prodigy.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_supergrok11.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_supergrok15.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_supergrok2.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/models/decoder.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/models/mamba.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/models/vit.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/bindings/bindings.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/bindings/dispatch.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_decoder_real_adamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_adamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_grokadamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_grokfast.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_lion.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_looksam.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_muon.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_neuralgrok.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_prodigy.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_supergrok11.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_supergrok15.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_supergrok2.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba_real_adamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba_real_adamw_tc_launcher.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_adamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_grokadamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_grokfast.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_lion.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_looksam.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_muon.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_neuralgrok.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_prodigy.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_supergrok11.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_supergrok15.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_supergrok2.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_adamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_grokadamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_grokfast.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_lion.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_looksam.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_muon.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_neuralgrok.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_prodigy.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_real_adamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_real_adamw_tc_launcher.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_supergrok11.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_supergrok15.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_supergrok2.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/sg2_meta_tail.o -L/usr/local/lib/python3.11/dist-packages/torch/lib -L/usr/local/cuda/lib64 -L/usr/lib/x86_64-linux-gnu -lc10 -ltorch -ltorch_cpu -ltorch_python -lcudart -lc10_cuda -ltorch_cuda -o build/lib.linux-x86_64-cpython-311/grokking_optimizers/_ops.cpython-311-x86_64-linux-gnu.so
+copying build/lib.linux-x86_64-cpython-311/grokking_optimizers/_ops.cpython-311-x86_64-linux-gnu.so -> grokking_optimizers

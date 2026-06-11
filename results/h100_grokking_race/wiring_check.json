@@ -1,50 +1,20 @@
 {
   "summary": {
-    "total_cells": 3,
-    "converted_l3_tc": 3,
+    "total_cells": 1,
+    "converted_l3_tc": 1,
     "blocked": 0,
     "fraction_l3_tc": 1.0,
     "converted_cells": [
-      "adamw/mamba",
-      "lion/mamba",
-      "grokfast/mamba"
+      "prodigy/vit"
     ],
     "blocked_cells": []
   },
   "rows": [
     {
-      "model": "mamba",
-      "optimizer": "adamw",
+      "model": "vit",
+      "optimizer": "prodigy",
       "executed_path": "L3-TC-megakernel(wgmma)",
-      "l3_steps_fired": 4,
-      "l3_engines_seen": [
-        "wgmma"
-      ],
-      "l1_steps_fired": 0,
-      "abi_stale": false,
-      "error": null,
-      "is_l3_tc": true,
-      "reason_if_blocked": ""
-    },
-    {
-      "model": "mamba",
-      "optimizer": "lion",
-      "executed_path": "L3-TC-megakernel(wgmma)",
-      "l3_steps_fired": 4,
-      "l3_engines_seen": [
-        "wgmma"
-      ],
-      "l1_steps_fired": 0,
-      "abi_stale": false,
-      "error": null,
-      "is_l3_tc": true,
-      "reason_if_blocked": ""
-    },
-    {
-      "model": "mamba",
-      "optimizer": "grokfast",
-      "executed_path": "L3-TC-megakernel(wgmma)",
-      "l3_steps_fired": 4,
+      "l3_steps_fired": 8,
       "l3_engines_seen": [
         "wgmma"
       ],

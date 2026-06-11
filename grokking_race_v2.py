@@ -1154,30 +1154,51 @@ def train_grokadamw(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
     alpha_freq=c.get("grokadamw_alpha_update_freq",50)
+    mtype=c.get("model_type","decoder")
     for step in (pb:=_pbar("GrokAdamW",c["max_steps"],bp)):
         # [A4-M5] L1 fused tail integration for this optimizer requires the
         # adamw/lion post-backward structure (see train_adamw) — do not re-add
         # the pre-forward continue pattern (it skips side-steps and eval).
-        with _autocast(c):
-            loss=F.cross_entropy(m(tx),ty)
-        opt.zero_grad(); scaler.scale(loss).backward()
-        # Feed the grokking signal: train_loss every alpha_freq/eval step, val CE
-        # on the alpha cadence (mirrors the SuperGrok needs_metrics pattern). α_t
-        # = alpha_init*exp(-kappa*signal) only updates when BOTH are present.
-        kw={}
+        #
+        # GROKKING SIGNAL (mechanism iii) — computed BEFORE the step on the
+        # alpha cadence so the LIVE α_t = α_init·exp(-κ·signal) is bound to THIS
+        # step (eager: step()'s pre-step forward train_loss drives this step's α;
+        # the fused launch produces train_loss only AFTER α is bound, so on the L3
+        # path we take a host forward HERE to get train_loss pre-launch — bit-
+        # faithful to eager, +1 forward per alpha_freq steps). _alpha_for_group
+        # reads opt._grok_signal/_signal_active, which we set here.
         needs_metrics=(step%alpha_freq==0) or (step%eval_every==0) or step==1
-        if needs_metrics:
+        kw={}
+        if needs_metrics and (step%alpha_freq==0):
+            # Both losses → update the live grokking signal (drives α this step).
             with torch.no_grad():
-                kw["train_loss"]=loss.item()
-            if step%alpha_freq==0:
-                with torch.no_grad():
-                    kw["val_loss"]=F.cross_entropy(m(vax),vay).item()
-        # scaler.step doesn't forward kwargs, so unscale + step directly (same as
-        # the SuperGrok loops). Fall back to a plain step on a stale optimizer.
-        scaler.unscale_(opt)
-        try: opt.step(**kw)
-        except TypeError: opt.step()
-        scaler.update()
+                tl=F.cross_entropy(m(tx),ty).item()
+                vl=F.cross_entropy(m(vax),vay).item()
+            opt._grok_signal=opt._grokking_signal(tl,vl); opt._signal_active=True
+            kw["train_loss"]=tl; kw["val_loss"]=vl   # eager branch re-uses these
+        elif needs_metrics:
+            with torch.no_grad():
+                kw["train_loss"]=F.cross_entropy(m(tx),ty).item()
+        # PHASE 1 — TRUE L3 fused path for (decoder × grokadamw): ONE persistent
+        # megakernel runs the REAL fwd+bwd+GrokAdamW (all 3 mechanisms: per-tensor
+        # layer-wise β1, GLOBAL grad-norm clip, and the LIVE α_t above which
+        # _opt_scalars_from forwards via opt._alpha_for_group). If it ran we SKIP
+        # the eager fwd/bwd/step (the kernel updated params in place); the signal
+        # was already set above so α adapts on this path too. Falls back to eager
+        # + the loss-fed step() when L3-REAL is unavailable (AMP on / non-sm_90).
+        l3_loss=_try_fused_train_step(mtype, "grokadamw", m, opt, tx, ty, c)
+        if l3_loss is not None:
+            loss=torch.as_tensor(l3_loss)
+        else:
+            with _autocast(c):
+                loss=F.cross_entropy(m(tx),ty)
+            opt.zero_grad(); scaler.scale(loss).backward()
+            # scaler.step doesn't forward kwargs, so unscale + step directly (same
+            # as the SuperGrok loops). Fall back to a plain step on a stale opt.
+            scaler.unscale_(opt)
+            try: opt.step(**kw)
+            except TypeError: opt.step()
+            scaler.update()
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
@@ -1433,13 +1454,22 @@ def train_muon(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
+    mtype=c.get("model_type","decoder")
     for step in (pb:=_pbar("Muon",c["max_steps"],bp)):
-        # [A4-M5] L1 fused tail integration for this optimizer requires the
-        # adamw/lion post-backward structure (see train_adamw) — do not re-add
-        # the pre-forward continue pattern (it skips side-steps and eval).
-        with _autocast(c):
-            loss=F.cross_entropy(m(tx),ty)
-        opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+        # TRUE L3 fused path for (vit × muon): ONE persistent megakernel runs the REAL
+        # fwd+bwd + the STAGED grid-cooperative Newton-Schulz (P2.7: NS-orthogonalize the
+        # 2D weights, all CTAs per matrix) + the muon apply, with the 1D weights on the
+        # AdamW tail. If it ran we SKIP the eager fwd/bwd/step; else fall back to eager.
+        # The momentum buffer is carried in the driver-owned m-slice; _opt_scalars_from
+        # forwards muon's lr/momentum(β1)/wd from opt.param_groups. (Same hook the other
+        # L3-TC loops use.)
+        l3_loss=_try_fused_train_step(mtype, "muon", m, opt, tx, ty, c)
+        if l3_loss is not None:
+            loss=torch.as_tensor(l3_loss)
+        else:
+            with _autocast(c):
+                loss=F.cross_entropy(m(tx),ty)
+            opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
@@ -1518,13 +1548,24 @@ def train_prodigy(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     opt=_maybe_wrap_cuda_graph(opt, c)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
+    mtype=c.get("model_type","decoder")
     for step in (pb:=_pbar("Prodigy",c["max_steps"],bp)):
-        # [A4-M5] L1 fused tail integration for this optimizer requires the
-        # adamw/lion post-backward structure (see train_adamw) — do not re-add
-        # the pre-forward continue pattern (it skips side-steps and eval).
-        with _autocast(c):
-            loss=F.cross_entropy(m(tx),ty)
-        opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+        # TRUE L3 fused path for (decoder|vit × prodigy): ONE persistent megakernel
+        # runs the REAL fwd+bwd + the STAGED global-d estimate (P2.6: cross-all-tensors
+        # (r,s) owner-computes reduction → beta3-EMA decay of the persisted (r_ema,
+        # s_ema) → d=max(d_prev,d_coef·r_ema/|s_ema|)) + the prodigy apply, all in-
+        # kernel. If it ran we SKIP the eager fwd/bwd/step (params updated in place);
+        # else fall back to eager (AMP on / non-sm_90 / unregistered cell). The trajectory
+        # anchor param_init + the persisted estimator scalars are carried in the
+        # driver-owned state buffer (4*total+4); _opt_scalars_from forwards d0/d_coef/
+        # beta3 from opt.param_groups. (Same hook the adamw/grokadamw loops use.)
+        l3_loss=_try_fused_train_step(mtype, "prodigy", m, opt, tx, ty, c)
+        if l3_loss is not None:
+            loss=torch.as_tensor(l3_loss)
+        else:
+            with _autocast(c):
+                loss=F.cross_entropy(m(tx),ty)
+            opt.zero_grad(); scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break

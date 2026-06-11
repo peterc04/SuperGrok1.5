@@ -72,6 +72,13 @@ def main():
         print(f"   {n:14s}: {c:>14d} cyc  ~{ms:8.3f} ms  {100.0*c/tot:5.1f}% of summed-phase cyc", flush=True)
     print(f"   {'SUM':14s}: {tot:>14d} cyc  ~{tot/(sm_ghz*1e9)*1e3:8.3f} ms", flush=True)
     print(f"[vit-phase] DOMINANT = {names[cyc.index(max(cyc))]} ({100.0*max(cyc)/tot:.1f}%)", flush=True)
+    if hasattr(mod, "tc_profile_head_read"):
+        head = mod.tc_profile_head_read()
+        hf = head[0] / (sm_ghz * 1e9) * 1e3
+        hb = head[1] / (sm_ghz * 1e9) * 1e3
+        print(f"[vit-phase] per-sample HEAD/CE loops (SUBSET of P1): "
+              f"fwd_head ~{hf:.3f}ms (of P1_fwd {cyc[0]/(sm_ghz*1e9)*1e3:.1f}ms), "
+              f"bwd_head ~{hb:.3f}ms (of P1_bwd {cyc[1]/(sm_ghz*1e9)*1e3:.1f}ms)", flush=True)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,1439 @@
+/usr/local/lib/python3.11/dist-packages/torch/cuda/__init__.py:58: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/usr/local/lib/python3.11/dist-packages/setuptools/config/_apply_pyprojecttoml.py:71: _MissingDynamic: `authors` defined outside of `pyproject.toml` is ignored.
+!!
+
+        ********************************************************************************
+        The following seems to be defined outside of `pyproject.toml`:
+
+        `authors = 'Peter C.'`
+
+        According to the spec (see the link below), however, setuptools CANNOT
+        consider this value unless `authors` is listed as `dynamic`.
+
+        https://packaging.python.org/en/latest/specifications/pyproject-toml/#declaring-project-metadata-the-project-table
+
+        To prevent this problem, you can list `authors` under `dynamic` or alternatively
+        remove the `[project]` table from your file and rely entirely on other means of
+        configuration.
+        ********************************************************************************
+
+!!
+  _handle_missing_dynamic(dist, project_table)
+/usr/local/lib/python3.11/dist-packages/setuptools/config/_apply_pyprojecttoml.py:71: _MissingDynamic: `classifiers` defined outside of `pyproject.toml` is ignored.
+!!
+
+        ********************************************************************************
+        The following seems to be defined outside of `pyproject.toml`:
+
+        `classifiers = ['Development Status :: 4 - Beta', 'Intended Audience :: Science/Research', 'License :: OSI Approved :: MIT License', 'Topic :: Scientific/Engineering :: Artificial Intelligence', 'Programming Language :: Python :: 3', 'Programming Language :: Python :: 3.10', 'Programming Language :: C++']`
+
+        According to the spec (see the link below), however, setuptools CANNOT
+        consider this value unless `classifiers` is listed as `dynamic`.
+
+        https://packaging.python.org/en/latest/specifications/pyproject-toml/#declaring-project-metadata-the-project-table
+
+        To prevent this problem, you can list `classifiers` under `dynamic` or alternatively
+        remove the `[project]` table from your file and rely entirely on other means of
+        configuration.
+        ********************************************************************************
+
+!!
+  _handle_missing_dynamic(dist, project_table)
+/usr/local/lib/python3.11/dist-packages/setuptools/config/_apply_pyprojecttoml.py:78: SetuptoolsWarning: `install_requires` overwritten in `pyproject.toml` (dependencies)
+  corresp(dist, value, root_dir)
+  CUTLASS: auto-enabled (CUDA>=12 toolkit + cutlass headers present); set WITH_CUTLASS=0 to force cuBLAS fallback
+  Compiler launcher: ccache -> /usr/bin/ccache
+  Preflight: nvcc CUDA 12.x matches torch.version.cuda 12.4
+Building Grokking Optimizers C++/CUDA extension
+  CUDA version: 12.4
+  CUDA archs (from TORCH_CUDA_ARCH_LIST): 9.0a -> ['-gencode=arch=compute_90a,code=sm_90a']
+  NVCC base flags: compile.NVCC_DEVICE_BASE (strict) + grokking project flags (--use_fast_math, -DNDEBUG)
+  CUTLASS enabled for archs: ['90a']
+running build_ext
+/usr/local/lib/python3.11/dist-packages/torch/utils/cpp_extension.py:424: UserWarning: There are no x86_64-linux-gnu-g++ version bounds defined for CUDA version 12.4
+  warnings.warn(f'There are no {compiler_name} version bounds defined for CUDA version {cuda_str_version}')
+  [tuned-inject] no _kernel_tuned.json found; building with in-header kernel defaults. Run `python -m grokking_optimizers.compile ... --jit-only` to produce winners (see AUTOTUNE_LINKAGE.md).
+building 'grokking_optimizers._ops' extension
+Emitting ninja build file /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/build.ninja...
+Compiling objects...
+Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+[1/41] c++ -MMD -MF /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/bindings/dispatch.o.d -Wsign-compare -DNDEBUG -g -fwrapv -O2 -Wall -g -fstack-protector-strong -Wformat -Werror=format-security -g -fwrapv -O2 -fPIC -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/bindings/dispatch.cpp -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/bindings/dispatch.o -O3 -std=c++17 -DWITH_CUDA -DNDEBUG -ffast-math -funroll-loops -fPIC -DWITH_CUTLASS -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/csrc/bindings/dispatch.cpp:352:1: warning: multi-line comment [-Wcomment]
+  352 | //   python -m grokking_optimizers.megakernel_codegen --dispatch-table > \
+      | ^
+[2/41] c++ -MMD -MF /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/bindings/bindings.o.d -Wsign-compare -DNDEBUG -g -fwrapv -O2 -Wall -g -fstack-protector-strong -Wformat -Werror=format-security -g -fwrapv -O2 -fPIC -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/bindings/bindings.cpp -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/bindings/bindings.o -O3 -std=c++17 -DWITH_CUDA -DNDEBUG -ffast-math -funroll-loops -fPIC -DWITH_CUTLASS -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+[3/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_grokfast.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_mamba3_grokfast.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_grokfast.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE2ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE2ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE2ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE2ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[4/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_grokfast.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_transformer_decoder_grokfast.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_grokfast.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE2ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE2ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE2ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE2ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[5/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_prodigy.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_vit_prodigy.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_prodigy.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE5ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE5ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE5ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE5ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 30 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[6/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_supergrok2.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_transformer_decoder_supergrok2.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_supergrok2.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE10ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE10ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE10ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE10ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[7/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_adamw.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_mamba3_adamw.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_adamw.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE0ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE0ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE0ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE0ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[8/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_prodigy.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_transformer_decoder_prodigy.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_prodigy.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE5ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE5ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE5ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE5ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 30 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[9/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_lion.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_mamba3_lion.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_lion.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE1ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE1ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE1ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE1ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[10/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_muon.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_mamba3_muon.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_muon.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE7ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE7ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 30 registers, 136 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE7ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE7ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 26 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[11/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_neuralgrok.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_transformer_decoder_neuralgrok.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_neuralgrok.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE6ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE6ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE6ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE6ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[12/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_grokfast.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_vit_grokfast.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_grokfast.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE2ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE2ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE2ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE2ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[13/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_supergrok11.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_vit_supergrok11.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_supergrok11.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE8ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE8ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE8ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE8ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[14/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_neuralgrok.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_vit_neuralgrok.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_neuralgrok.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE6ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE6ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE6ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE6ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[15/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_neuralgrok.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_mamba3_neuralgrok.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_neuralgrok.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE6ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE6ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE6ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE6ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[16/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_supergrok2.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_mamba3_supergrok2.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_supergrok2.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE10ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE10ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE10ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE10ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[17/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_prodigy.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_mamba3_prodigy.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_prodigy.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE5ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE5ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE5ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE5ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 30 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[18/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_muon.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_vit_muon.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_muon.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE7ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE7ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 30 registers, 136 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE7ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE7ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 26 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[19/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_supergrok2.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_vit_supergrok2.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_supergrok2.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE10ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE10ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE10ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE10ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[20/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_lion.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_transformer_decoder_lion.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_lion.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE1ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE1ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE1ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE1ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[21/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_grokadamw.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_vit_grokadamw.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_grokadamw.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE3ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE3ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE3ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE3ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[22/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_muon.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_transformer_decoder_muon.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_muon.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE7ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE7ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 30 registers, 136 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE7ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE7ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 26 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[23/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_grokadamw.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_mamba3_grokadamw.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_grokadamw.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE3ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE3ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE3ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE3ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[24/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_supergrok15.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_vit_supergrok15.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_supergrok15.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE9ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE9ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE9ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE9ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 30 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[25/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_adamw.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_transformer_decoder_adamw.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_adamw.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE0ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE0ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE0ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE0ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[26/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_lion.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_vit_lion.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_lion.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE1ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE1ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE1ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE1ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[27/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_supergrok11.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_transformer_decoder_supergrok11.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_supergrok11.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE8ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE8ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE8ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE8ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[28/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_looksam.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_mamba3_looksam.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_looksam.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE4ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE4ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE4ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE4ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[29/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_grokadamw.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_transformer_decoder_grokadamw.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_grokadamw.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE3ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE3ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE3ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE3ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[30/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_decoder_real_adamw.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_decoder_real_adamw.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_decoder_real_adamw.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9024fused_decoder_megakernelILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE', 80 bytes spill stores, 68 bytes spill loads
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9024fused_decoder_megakernelILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9024fused_decoder_megakernelILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    544 bytes stack frame, 80 bytes spill stores, 68 bytes spill loads
+ptxas info    : Used 80 registers, 544 bytes cumulative stack size, 42968 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[31/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_looksam.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_transformer_decoder_looksam.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_looksam.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE4ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE4ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE4ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE4ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[32/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_supergrok15.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_mamba3_supergrok15.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_supergrok15.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE9ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE9ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE9ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE9ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 30 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[33/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_adamw.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_vit_adamw.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_adamw.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE0ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE0ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE0ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE0ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[34/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_supergrok11.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_mamba3_supergrok11.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_supergrok11.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE8ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE8ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE8ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE2ELNS1_5OptIdE8ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[35/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_looksam.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_vit_looksam.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_looksam.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE4ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE4ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE4ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE1ELNS1_5OptIdE4ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[36/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_supergrok15.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_transformer_decoder_supergrok15.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_supergrok15.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE9ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE9ELNS1_8FuseTierE3EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, 4232 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE9ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9016fused_megakernelILNS1_7ModelIdE0ELNS1_5OptIdE9ELNS1_8FuseTierE1EEEvNS0_17PersistentContextEPfPKfS7_S7_PKiSB_fiNS1_13FusedOptStateE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 30 registers, 4 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[37/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_real_adamw.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_vit_real_adamw.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_real_adamw.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7508) Potential Performance Loss: 'setmaxnreg' ignored; unable to determine register count at entry.
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9020fused_vit_megakernelILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9020fused_vit_megakernelILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+    512 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 80 registers, 512 bytes cumulative stack size, 16 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[38/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba_real_adamw.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_mamba_real_adamw.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba_real_adamw.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9022fused_mamba_megakernelILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE', 1908 bytes spill stores, 2024 bytes spill loads
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9022fused_mamba_megakernelILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9022fused_mamba_megakernelILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+    2224 bytes stack frame, 1908 bytes spill stores, 2024 bytes spill loads
+ptxas info    : Used 255 registers, 2224 bytes cumulative stack size, 48 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[39/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_real_adamw_tc_launcher.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_vit_real_adamw_tc_launcher.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_real_adamw_tc_launcher.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 6432 bytes spill stores, 6636 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 6448 bytes spill stores, 6668 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 6432 bytes spill stores, 6636 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 6432 bytes spill stores, 6636 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE', 6432 bytes spill stores, 6636 bytes spill loads
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+    2688 bytes stack frame, 6432 bytes spill stores, 6636 bytes spill loads
+ptxas info    : Used 255 registers, 2688 bytes cumulative stack size, 7652 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+    2704 bytes stack frame, 6448 bytes spill stores, 6668 bytes spill loads
+ptxas info    : Used 255 registers, 2704 bytes cumulative stack size, 7652 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+    2688 bytes stack frame, 6432 bytes spill stores, 6636 bytes spill loads
+ptxas info    : Used 255 registers, 2688 bytes cumulative stack size, 7652 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+    2688 bytes stack frame, 6432 bytes spill stores, 6636 bytes spill loads
+ptxas info    : Used 255 registers, 2688 bytes cumulative stack size, 7652 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9023fused_vit_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_11ViTInputCtxES5_fiNS1_13FusedOptStateE
+    2688 bytes stack frame, 6432 bytes spill stores, 6636 bytes spill loads
+ptxas info    : Used 255 registers, 2688 bytes cumulative stack size, 7652 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[40/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE5EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    1152 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 252 registers, 1152 bytes cumulative stack size, 14012 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    1152 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 128 registers, 1152 bytes cumulative stack size, 13748 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    1152 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 252 registers, 1152 bytes cumulative stack size, 13748 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    1152 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 128 registers, 1152 bytes cumulative stack size, 13748 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    1152 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 128 registers, 1152 bytes cumulative stack size, 13748 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9027fused_decoder_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_15DecoderTokenCtxES5_fiNS1_13FusedOptStateE
+    1152 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 128 registers, 1152 bytes cumulative stack size, 13748 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+[41/41] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba_real_adamw_tc_launcher.o.d -DWITH_CUDA -DWITH_CUTLASS -I/workspace/SuperGrok1.5/. -I/workspace/SuperGrok1.5/csrc/bindings -I/workspace/SuperGrok1.5/csrc -I/workspace/SuperGrok1.5/third_party/cutlass/include -I/workspace/SuperGrok1.5/third_party/cutlass/tools/util/include -I/usr/local/lib/python3.11/dist-packages/torch/include -I/usr/local/lib/python3.11/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/lib/python3.11/dist-packages/torch/include/TH -I/usr/local/lib/python3.11/dist-packages/torch/include/THC -I/usr/local/cuda/include -I/usr/include/python3.11 -c -c /workspace/SuperGrok1.5/csrc/fused/sm_90/mega_mamba_real_adamw_tc_launcher.cu -o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba_real_adamw_tc_launcher.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 -DWITH_CUDA --expt-relaxed-constexpr -Xfatbin -compress-all -Xptxas --opt-level=3 -Xptxas -v -Xptxas --warn-on-spills --extra-device-vectorization -Xcompiler -fPIC -Xcompiler -fno-strict-aliasing -Xnvlink --suppress-stack-size-warning --resource-usage --default-stream per-thread --use_fast_math -DNDEBUG -lineinfo -gencode=arch=compute_90a,code=sm_90a -gencode=arch=compute_90,code=compute_90 -DWITH_CUTLASS -DCUTLASS_NVCC_ARCHS=90a -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_ops -D_GLIBCXX_USE_CXX11_ABI=0
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE', 2636 bytes spill stores, 2672 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE', 2636 bytes spill stores, 2672 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE', 2636 bytes spill stores, 2672 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE', 2636 bytes spill stores, 2672 bytes spill loads
+ptxas info    : (C7515) Potential Performance Loss: wgmma.mma_async instructions are serialized due to non wgmma instructions defining accumulator registers of a wgmma between start and end of the pipeline stage in the function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE'
+ptxas warning : Registers are spilled to local memory in function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE', 2636 bytes spill stores, 2672 bytes spill loads
+ptxas info    : 23 bytes gmem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE6EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+    3408 bytes stack frame, 2636 bytes spill stores, 2672 bytes spill loads
+ptxas info    : Used 255 registers, 3408 bytes cumulative stack size, 14788 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE3EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+    3408 bytes stack frame, 2636 bytes spill stores, 2672 bytes spill loads
+ptxas info    : Used 255 registers, 3408 bytes cumulative stack size, 14788 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE2EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+    3408 bytes stack frame, 2636 bytes spill stores, 2672 bytes spill loads
+ptxas info    : Used 255 registers, 3408 bytes cumulative stack size, 14788 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE1EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+    3408 bytes stack frame, 2636 bytes spill stores, 2672 bytes spill loads
+ptxas info    : Used 255 registers, 3408 bytes cumulative stack size, 14788 bytes smem
+ptxas info    : Compiling entry function '_ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE' for 'sm_90a'
+ptxas info    : Function properties for _ZN2sg5fused4sm9025fused_mamba_megakernel_tcILNS1_5OptIdE0EEEvNS0_17PersistentContextEPfNS1_13MambaTokenCtxES5_fiNS1_13FusedOptStateE
+    3408 bytes stack frame, 2636 bytes spill stores, 2672 bytes spill loads
+ptxas info    : Used 255 registers, 3408 bytes cumulative stack size, 14788 bytes smem
+ptxas info    : Compiling entry function '_ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv' for 'sm_90a'
+ptxas info    : Function properties for _ZN3cub17CUB_200302_900_NS11EmptyKernelIvEEvv
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 4 registers
+/workspace/SuperGrok1.5/./csrc/algorithms/muon.h(76): warning #737-D: using-declaration ignored -- it refers to the current namespace
+  using sg::algorithms::adamw_step;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+x86_64-linux-gnu-g++ -Wsign-compare -DNDEBUG -g -fwrapv -O2 -Wall -g -fstack-protector-strong -Wformat -Werror=format-security -g -fwrapv -O2 -shared -Wl,-O1 -Wl,-Bsymbolic-functions /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_adamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_grokadamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_grokfast.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_lion.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_looksam.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_muon.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_neuralgrok.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_prodigy.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_supergrok11.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_supergrok15.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/launch_supergrok2.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/models/decoder.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/models/mamba.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/backends/cuda/sm_90/models/vit.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/bindings/bindings.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/bindings/dispatch.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_decoder_real_adamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_decoder_real_adamw_tc_launcher.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_adamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_grokadamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_grokfast.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_lion.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_looksam.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_muon.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_neuralgrok.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_prodigy.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_supergrok11.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_supergrok15.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba3_supergrok2.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba_real_adamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_mamba_real_adamw_tc_launcher.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_adamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_grokadamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_grokfast.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_lion.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_looksam.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_muon.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_neuralgrok.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_prodigy.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_supergrok11.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_supergrok15.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_transformer_decoder_supergrok2.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_adamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_grokadamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_grokfast.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_lion.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_looksam.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_muon.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_neuralgrok.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_prodigy.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_real_adamw.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_real_adamw_tc_launcher.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_supergrok11.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_supergrok15.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/mega_vit_supergrok2.o /workspace/SuperGrok1.5/build/temp.linux-x86_64-cpython-311/csrc/fused/sm_90/sg2_meta_tail.o -L/usr/local/lib/python3.11/dist-packages/torch/lib -L/usr/local/cuda/lib64 -L/usr/lib/x86_64-linux-gnu -lc10 -ltorch -ltorch_cpu -ltorch_python -lcudart -lc10_cuda -ltorch_cuda -o build/lib.linux-x86_64-cpython-311/grokking_optimizers/_ops.cpython-311-x86_64-linux-gnu.so
+copying build/lib.linux-x86_64-cpython-311/grokking_optimizers/_ops.cpython-311-x86_64-linux-gnu.so -> grokking_optimizers
