@@ -466,6 +466,20 @@ _CELLS = {
     # sharpness=(g_sam−g)² + per-tensor meta-net mu path to the mamba kernel/launcher (the
     # decoder/vit twins exist) — a feature port, not a determinism fix. SG11/SG15 keep the
     # won't-grok caveat regardless. Tracked separately.
+    # supergrok2 (decoder/vit — the LAST/hardest cell): CONVERTED via the DEDICATED
+    # ops.sg2_fused_step entry. The FULL CSA/HCA/PEER/GRU meta-net AS the optimizer phase
+    # (P3-SG2): in-kernel SEGMENTED SORT (STAGE -1, index-tie-break strategy A) → S0..S5,
+    # reading st.sharpness from the SAM 2nd backward (P2.4, shared with SG11/15). The SG2
+    # gate (tests/hw/_sg2_l3tc_gate.run_sg2_gate) validates FOUR surfaces: (B1) single-step
+    # vs ops.supergrok2_batched_step (the per-op ORACLE, SAME low-rank indexer) max|Δ{param,
+    # m,v,mu,slow,gru_state}| < 1e-5; (A/A/A) bit-determinism (the index-tie-break sort is
+    # deterministic by construction); (tie-probe) strategy-A (|g|,idx) perm total-order; and
+    # the (N>64 CSA fidelity PROBE) which REPORTS the won't-grok divergence (kernel drops
+    # idx_UQ, /sqrt(rank) vs /sqrt(d)) — NOT a regression. run_cell_gate short-circuits to it.
+    # mamba×supergrok2 BLOCKED (SAM double-forward + segmented sort re-trip the shared mamba-
+    # forward A/A/A race; code-absent in the mamba kernel/launcher).
+    "supergrok2/decoder": dict(model="decoder", opt="supergrok2", factory=None),
+    "supergrok2/vit": dict(model="vit", opt="supergrok2", factory=None),
 }
 
 # BLOCKED cells — kept here (commented) with the state-gate evidence that blocks them,
@@ -699,6 +713,15 @@ def run_cell_gate(cell_key, verbose=True):
                                               canonicalize_model, fused_train_step)
     spec = _CELLS[cell_key]
     model, opt = spec["model"], spec["opt"]
+    # ── SuperGrok2 dedicated gate (the LAST/hardest cell). SG2's optimizer phase is the
+    # FULL CSA/HCA/PEER/GRU meta-net (in-kernel segmented sort + SAM 2nd backward +
+    # sg2_meta_stages), validated against the per-op ORACLE (ops.supergrok2_batched_step,
+    # the SAME low-rank indexer) — NOT the eager opt.step() (its bilevel/sam/ramp binding
+    # is not the L3 apply). tests/hw/_sg2_l3tc_gate owns the (B1)+(A/A/A)+(tie-probe)+(N>64
+    # CSA fidelity probe) verdict; short-circuit run_cell_gate to it.
+    if opt == "supergrok2":
+        from tests.hw._sg2_l3tc_gate import run_sg2_gate
+        return run_sg2_gate(model, verbose=verbose)
     g, c, m, data, dev = _build_cell(model)
     canon = canonicalize_model(model)
     # Precondition: the cell must actually be wired L3-TC (wgmma) — else the gate is

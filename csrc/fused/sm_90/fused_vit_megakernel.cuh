@@ -99,6 +99,12 @@
 #endif
 #if (SG_TUNED_GEMM_IMPL == SG_GEMM_IMPL_WGMMA)
 #include "csrc/fused/sm_90/model_stage_vit_tc.cuh"
+// SuperGrok2 FULL CSA/HCA/PEER/GRU meta-net stages (composed as the optimizer
+// phase) — the ViT twin of the decoder's SG2 composition. Pulls in sg2_meta_stages
+// + the in-kernel segmented sort (STAGE -1). The SG2 weight bundle is read from HBM
+// (it does not fit smem alongside ViT's dynamic VitSampleSmem), so the composed
+// path instantiates sg2_meta_stages with WeightsT==SG2Weights + BuildSort=true.
+#include "csrc/fused/sm_90/opt_stage_supergrok2.cuh"
 #endif
 
 namespace sg { namespace fused { namespace sm90 {
@@ -397,6 +403,20 @@ __host__ __device__ __forceinline__ int64_t vit_tc_muon_floats(int nCTA) {
 __host__ __device__ __forceinline__ int64_t vit_tc_looksam_floats() {
     return (int64_t)2 * kVitTotalElems;       // [sam_backup | sam_grad]
 }
+// ── SuperGrok2 — the ViT twin of dec_tc_sg2_floats. Weights from HBM; the only SG2
+//    workspace is the per-CTA meta-net scratch (sized for the largest tensor) + the
+//    row_off64 staging prefix (kVitNumTensors int64 = 2*N floats — the adapter that
+//    builds SG2State.row_off (const int64_t*) from __constant__ int kVitOffsets). ──
+using VitSG2Dims = SG2Dims<>;
+constexpr int kVitSG2Nmax = 65536;   // max(kVitSizes)
+__host__ __device__ __forceinline__ int64_t vit_sg2_ws_stride_floats() {
+    return (int64_t)2 * kVitNumTensors
+         + sg2_ws_stride<VitSG2Dims>((int64_t)kVitSG2Nmax);
+}
+__host__ __device__ __forceinline__ int64_t vit_tc_sg2_floats(int nCTA) {
+    // +1 for the 8-byte realignment slack of sg2_ws_base (kVitTotalElems is odd).
+    return (int64_t)nCTA * vit_sg2_ws_stride_floats() + 1;
+}
 __host__ __device__ __forceinline__ int64_t vit_tc_workspace_floats(int T, int B, int nCTA) {
     return vit_tc_acts_floats(T, B)
          + (int64_t)nCTA * vittc::vit_tile_scratch_total_f32()
@@ -405,7 +425,8 @@ __host__ __device__ __forceinline__ int64_t vit_tc_workspace_floats(int T, int B
          + vit_tc_dw_part_floats()           // split-K dW partials (G>1)
          + vit_tc_opt_reduce_floats(nCTA)    // STAGED-opt (Prodigy) reduce slots
          + vit_tc_muon_floats(nCTA)          // STAGED-opt (Muon) NS per-matrix scratch
-         + vit_tc_looksam_floats();          // STAGED-opt (LookSAM) SAM 2nd-bwd scratch
+         + vit_tc_looksam_floats()           // STAGED-opt (LookSAM) SAM 2nd-bwd scratch
+         + vit_tc_sg2_floats(nCTA);          // SuperGrok2 meta-net per-CTA scratch (carve-LAST)
 }
 
 #ifdef SG_VIT_PROFILE
@@ -461,6 +482,15 @@ fused_vit_megakernel_tc(PersistentContext ctx,
     //   [sam_backup (total)] [sam_grad (total)]. Unused unless Opt==LookSAM.
     float* sam_backup = muon_base + vit_tc_muon_floats(nCTA);
     float* sam_grad   = sam_backup + kVitTotalElems;
+    // SuperGrok2 meta-net per-CTA scratch, carved AFTER the LookSAM sam_grad (term
+    // order matches vit_tc_workspace_floats — carve-LAST keeps every prior region's
+    // offset unchanged, so the already-green cells are byte-identical). ALIGN to 8
+    // bytes (the per-CTA slice fronts an int64 row_off64 staging array; kVitTotalElems
+    // is odd so sam_grad+total lands on an odd float offset → an int64 read there is
+    // misaligned). Round up to the next even float. Unused unless Opt==SuperGrok2.
+    float* sg2_ws_base = sam_grad + kVitTotalElems;
+    if (((uintptr_t)sg2_ws_base & 0x7) != 0) sg2_ws_base += 1;   // → 8-byte aligned
+    (void)sg2_ws_base;   // referenced only by the SuperGrok2 P3-SG2 phase
 
     vittc::VitActs acts = vittc::vit_acts_bind(acts_base, T, B);
     vittc::VitTileScratch sc = vittc::vit_tile_scratch_bind(scratch_base + (int64_t)cta * scratch_per);
@@ -607,7 +637,7 @@ fused_vit_megakernel_tc(PersistentContext ctx,
     //    :315), the 2nd MLP input the P2.45 meta-net mu precompute reads. Same st.looksam_sam
     //    SAM-step gate + st.rho radius; cached sharpness reused on non-SAM steps.
     if constexpr (Opt == OptId::LookSAM || Opt == OptId::SuperGrok11 ||
-                  Opt == OptId::SuperGrok15) {
+                  Opt == OptId::SuperGrok15 || Opt == OptId::SuperGrok2) {
         if (st.looksam_sam != 0.0f) {
             // (a) GLOBAL ‖g‖ over the reduced grad, deterministic (reuse the loss
             //     workspace as P2.5 does: loss_part[nCTA] = per-CTA Σg², loss_out[1]
@@ -907,6 +937,56 @@ fused_vit_megakernel_tc(PersistentContext ctx,
     if constexpr (Opt == OptId::SuperGrok11 || Opt == OptId::SuperGrok15) {
         sg_stage_phi_weights<kSgPhiHidden>(st.sg_phi_W1, st.sg_phi_b1, st.sg_phi_W2,
                                            sg_sW1, sg_sb1, sg_sW2);   // syncs
+    }
+
+    // ── P3-SG2 (SuperGrok2 ONLY) — the ViT twin of the decoder's P3-SG2 phase. The
+    //    FULL CSA/HCA/PEER/GRU meta-net as the optimizer phase, run INSTEAD of the
+    //    per-element apply_optimizer<SuperGrok2> stub. Each CTA work-steals WHOLE
+    //    tensors and runs sg2_meta_stages (STAGE -1 in-kernel segmented sort → S0..S5)
+    //    reading st.sharpness (P2.4 SAM 2nd backward) + the HBM meta-net bundle. The
+    //    kernel returns after this. if-constexpr'd to SuperGrok2 ⇒ every other cell is
+    //    byte-identical.
+    if constexpr (Opt == OptId::SuperGrok2) {
+        SG2Weights w2{
+            st.sg2_input_proj_W, st.sg2_input_proj_b,
+            st.sg2_csa_q_W, st.sg2_csa_k_W, st.sg2_csa_v_W, st.sg2_csa_out_W,
+            st.sg2_csa_compress_w, st.sg2_csa_idx_DQ, st.sg2_csa_idx_K,
+            st.sg2_hca_q_W, st.sg2_hca_k_W, st.sg2_hca_v_W, st.sg2_hca_out_W,
+            st.sg2_gru_Wz, st.sg2_gru_bz, st.sg2_gru_Wr, st.sg2_gru_br,
+            st.sg2_gru_Wh, st.sg2_gru_bh,
+            st.sg2_peer_query_Ws, st.sg2_prod_keys_A, st.sg2_prod_keys_B,
+            st.sg2_expert_W1, st.sg2_expert_b1, st.sg2_expert_W2, st.sg2_expert_b2};
+        SG2Scalars sc2{
+            st.sg2_alpha, st.sg2_gru_decay, st.sg2_lamb_eff,
+            st.sg2_beta1, st.sg2_bc1, st.sg2_bc2,
+            st.sg2_rescale, st.beta2, lr, st.wd, st.eps};
+        float* sg2_base = sg2_ws_base + (int64_t)blockIdx.x * vit_sg2_ws_stride_floats();
+        int64_t* row_off64 = reinterpret_cast<int64_t*>(sg2_base);
+        for (int t = threadIdx.x; t < kVitNumTensors; t += blockDim.x)
+            row_off64[t] = (int64_t)kVitOffsets[t];
+        float* sg2_meta_ws = sg2_base + 2 * kVitNumTensors;
+        __syncthreads();
+        SG2State stt{};
+        stt.exp_avg     = st.exp_avg;
+        stt.exp_avg_sq  = st.exp_avg_sq;
+        stt.mu          = const_cast<float*>(st.mu);
+        stt.slow        = st.sg2_slow;
+        stt.gru_state   = st.sg2_gru_state;
+        stt.perm        = nullptr;
+        stt.unsort      = nullptr;
+        stt.workspace   = sg2_meta_ws;
+        stt.ws_stride   = sg2_ws_stride<VitSG2Dims>((int64_t)kVitSG2Nmax);
+        stt.n_tensors   = kVitNumTensors;
+        stt.n           = kVitSizes;
+        stt.row_off     = row_off64;
+        __shared__ int task_slot2;
+        TaskQueue q2 = ctx.queue();
+        for (int t = q2.next_block(&task_slot2); t < kVitNumTensors;
+             t = q2.next_block(&task_slot2)) {
+            sg2_meta_stages<VitSG2Dims, SG2Weights, float, float, /*BuildSort=*/true>(
+                w2, t, stt, sc2, params, grad, st.sharpness, sg2_meta_ws);
+        }
+        return;   // SG2 owns the whole optimizer phase; skip P3.
     }
 
     // ── P3: scalar optimizer tail over the reduced grad (REUSED verbatim). ──

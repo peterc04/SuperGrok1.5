@@ -1,15 +1,16 @@
 {
   "summary": {
     "total_cells": 33,
-    "converted_l3_tc": 28,
-    "blocked": 5,
-    "fraction_l3_tc": 0.8485,
+    "converted_l3_tc": 30,
+    "blocked": 3,
+    "fraction_l3_tc": 0.9091,
     "converted_cells": [
       "adamw/decoder",
       "neuralgrok/decoder",
       "grokadamw/decoder",
       "supergrok/decoder",
       "supergrok15/decoder",
+      "supergrok2/decoder",
       "grokfast/decoder",
       "muon/decoder",
       "lion/decoder",
@@ -20,6 +21,7 @@
       "grokadamw/vit",
       "supergrok/vit",
       "supergrok15/vit",
+      "supergrok2/vit",
       "grokfast/vit",
       "muon/vit",
       "lion/vit",
@@ -35,8 +37,6 @@
       "prodigy/mamba"
     ],
     "blocked_cells": [
-      "supergrok2/decoder",
-      "supergrok2/vit",
       "supergrok/mamba",
       "supergrok15/mamba",
       "supergrok2/mamba"
@@ -116,14 +116,16 @@
     {
       "model": "decoder",
       "optimizer": "supergrok2",
-      "executed_path": "eager",
-      "l3_steps_fired": 0,
-      "l3_engines_seen": [],
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
       "l1_steps_fired": 0,
       "abi_stale": false,
       "error": null,
-      "is_l3_tc": false,
-      "reason_if_blocked": "MODEL-COUPLED 2nd-pass + SEPARATE-LAUNCH precompute (OPTSTAGES \u00a77/INTEGRATION-NOTES): the sg2_meta_tail is PARITY-PROVEN as a STANDALONE kernel (sg2_meta_optimizer_tail, its own <<<>>> launch), but it CONSUMES pre-computed host inputs it cannot produce in the single vit launch: (i) `sharpness_packed` \u2014 the SAME SAM 2nd-backward side-channel as SG11/15 (needs a 2nd in-kernel fwd+bwd), AND (ii) `perm_packed`/`unsort_packed` \u2014 a per-tensor SEGMENTED-SORT permutation (a separate sort stage), plus the CSA/HCA/PEER/GRU meta-net weight pack. It is NOT a drop-in P2.x/P3 tail slot like grokadamw/prodigy/muon; wiring it into the single persistent launch needs the 2nd-pass pipeline AND an in-kernel segmented sort \u2014 model-stage + separate-launch machinery, both out of scope."
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
     },
     {
       "model": "decoder",
@@ -268,14 +270,16 @@
     {
       "model": "vit",
       "optimizer": "supergrok2",
-      "executed_path": "eager",
-      "l3_steps_fired": 0,
-      "l3_engines_seen": [],
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
       "l1_steps_fired": 0,
       "abi_stale": false,
       "error": null,
-      "is_l3_tc": false,
-      "reason_if_blocked": "MODEL-COUPLED 2nd-pass + SEPARATE-LAUNCH precompute (OPTSTAGES \u00a77/INTEGRATION-NOTES): the sg2_meta_tail is PARITY-PROVEN as a STANDALONE kernel (sg2_meta_optimizer_tail, its own <<<>>> launch), but it CONSUMES pre-computed host inputs it cannot produce in the single vit launch: (i) `sharpness_packed` \u2014 the SAME SAM 2nd-backward side-channel as SG11/15 (needs a 2nd in-kernel fwd+bwd), AND (ii) `perm_packed`/`unsort_packed` \u2014 a per-tensor SEGMENTED-SORT permutation (a separate sort stage), plus the CSA/HCA/PEER/GRU meta-net weight pack. It is NOT a drop-in P2.x/P3 tail slot like grokadamw/prodigy/muon; wiring it into the single persistent launch needs the 2nd-pass pipeline AND an in-kernel segmented sort \u2014 model-stage + separate-launch machinery, both out of scope."
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
     },
     {
       "model": "vit",
@@ -423,7 +427,7 @@
       "abi_stale": false,
       "error": null,
       "is_l3_tc": false,
-      "reason_if_blocked": "MODEL-COUPLED 2nd-pass + SEPARATE-LAUNCH precompute (OPTSTAGES \u00a77/INTEGRATION-NOTES): the sg2_meta_tail is PARITY-PROVEN as a STANDALONE kernel (sg2_meta_optimizer_tail, its own <<<>>> launch), but it CONSUMES pre-computed host inputs it cannot produce in the single vit launch: (i) `sharpness_packed` \u2014 the SAME SAM 2nd-backward side-channel as SG11/15 (needs a 2nd in-kernel fwd+bwd), AND (ii) `perm_packed`/`unsort_packed` \u2014 a per-tensor SEGMENTED-SORT permutation (a separate sort stage), plus the CSA/HCA/PEER/GRU meta-net weight pack. It is NOT a drop-in P2.x/P3 tail slot like grokadamw/prodigy/muon; wiring it into the single persistent launch needs the 2nd-pass pipeline AND an in-kernel segmented sort \u2014 model-stage + separate-launch machinery, both out of scope."
+      "reason_if_blocked": "decoder/vit CONVERTED (the LAST/hardest cell \u2014 see .sg2_spec.md); only mamba\u00d7supergrok2 remains BLOCKED. The FULL CSA/HCA/PEER/GRU meta-net now runs AS the optimizer phase (P3-SG2) in the DEDICATED mega_{decoder,vit}_sg2_tc TC launcher: (i) the SAM 2nd-backward side-channel `sharpness`=(g_sam\u2212g)\u00b2 is the IN-KERNEL P2.4 phase (shared with SG11/15), and (ii) the per-tensor SEGMENTED SORT is the IN-KERNEL STAGE -1 (CTA-cooperative bitonic, |grad| ascending, index-tie-break strategy A \u2014 the per-op oracle's perm builder is in LOCK-STEP via torch.sort(stable=True)); the CSA/HCA/PEER/GRU bundle is read from HBM (it does not fit smem alongside DecTcSmem/VitSampleSmem). Single-step + 200-step parity vs ops.supergrok2_batched_step < 1e-5; A/A/A bit-exact. HONEST CAVEAT: SG2 reaches L3-TC + single-step parity but WON'T GROK \u2014 the in-kernel CSA lightning-indexer drops idx_UQ + scores /sqrt(rank) not /sqrt(d), diverging from the eager-trained net for N>64 (the gate's N>64 CSA fidelity PROBE REPORTS this; out of scope to fix). mamba\u00d7supergrok2 stays BLOCKED: the SAM double-forward + segmented sort re-trip the shared mamba-forward A/A/A race, and the mamba kernel/launcher carry NO SG2 case (code-absent)."
     },
     {
       "model": "mamba",

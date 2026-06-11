@@ -2402,8 +2402,16 @@ class SuperGrok2(Optimizer):
         unsort_packed = torch.empty(total, dtype=torch.int32, device=dev)
         for t, gt in enumerate(grads):
             o, m = row_off_cpu[t], n_cpu[t]
-            _, perm = gt.reshape(-1).abs().sort(dim=0, descending=False)  # [m]
-            unsort = perm.argsort()                                       # inverse perm
+            # STRATEGY A (index tie-break), LOCK-STEP with the per-op oracle's stable
+            # sort (supergrok2_sm90.cuh) AND the L3-TC fused kernel's in-kernel
+            # segmented sort: stable=True breaks |grad| ties by ascending original
+            # index (the (|grad|, idx) total order), so the standalone megakernel's
+            # host-precomputed perm is byte-faithful to both. A plain unstable sort
+            # would drift the persisted gru_state on ties (bf16 grads collide).
+            _, perm = gt.reshape(-1).abs().sort(dim=0, descending=False, stable=True)  # [m]
+            # unsort is the inverse permutation; build it by scatter (perm is a
+            # permutation, so argsort(stable) is exact and tie-free here).
+            unsort = perm.argsort(stable=True)                            # inverse perm
             perm_packed[o:o + m] = perm.to(torch.int32)
             unsort_packed[o:o + m] = unsort.to(torch.int32)
 

@@ -1639,7 +1639,20 @@ static void csa_hca_step_one(
     // permutation-equivariant, so unsorting the [N] expert output once via this
     // same `perm` is correct regardless of sort direction.) Remember the
     // permutation to unsort the result.
-    auto sorted = sort_keys.sort(/*dim=*/0, /*descending=*/false);
+    //
+    // TIE SEMANTICS — STRATEGY A (index tie-break), LOCK-STEP with the L3-TC fused
+    // megakernel's in-kernel segmented sort (csrc/fused/sm_90/opt_stage_supergrok2
+    // .cuh sg2_stage_segmented_sort). A plain .sort(0,false) is UNSTABLE on CUDA, so
+    // on |grad| TIES (which DO occur — bf16-rounded grads collide, ~hundreds of ties
+    // in a real decoder/vit step) it picks a scheduling-dependent order that the
+    // deterministic fused kernel cannot reproduce → the persisted gru_state (scattered
+    // by perm) would silently drift over the trajectory. stable=true imposes the SAME
+    // total order the fused kernel uses: equal |grad| keep ascending ORIGINAL index,
+    // i.e. the comparison key is the pair (|grad|, idx). Deterministic + A/A/A-clean +
+    // byte-faithful to the fused path BY CONSTRUCTION. (For continuous grads P(tie)=0,
+    // so this is identical to the old unstable sort there — only the measure-zero tie
+    // set is now fixed deterministically.)
+    auto sorted = sort_keys.sort(/*stable=*/true, /*dim=*/0, /*descending=*/false);
     auto perm = std::get<1>(sorted).to(torch::kLong);          // [N]
     auto x_sorted = x_out.index_select(0, perm).contiguous();  // [N, d_model]
 

@@ -196,6 +196,45 @@ struct FusedOptState {
     const float* sg_phi_W2 = nullptr;   // [kSgPhiHidden]
     float        sg_phi_b2 = 0.0f;      // read on-device from sg_phi_W2[kSgPhiHidden]
     float        sg_rescale = 0.0f;     // SharpnessMetaNet rescale (mu = rescale·phi)
+    // ── SuperGrok2 (decoder/vit L3-TC, FULL CSA/HCA/PEER/GRU meta-net as the
+    //    optimizer phase). The composed megakernel runs sg2_meta_stages per tensor
+    //    INSTEAD of apply_optimizer<SuperGrok2> (which is only the Adam-on-smart_grad
+    //    stub). These plumb the meta-net state + HBM weight bundle + per-tensor scalar
+    //    arrays the kernel reconstructs SG2Weights/SG2Scalars/SG2State from (kept as
+    //    raw pointers here so opt_components.cuh need NOT include the heavy
+    //    opt_stage_supergrok2.cuh / supergrok2.h). m/v reuse exp_avg/exp_avg_sq, the
+    //    expert-EMA mu reuses st.mu, and the SAM side-channel (g_sam−g)² reuses
+    //    st.sharpness (SG2 shares the SAM 2nd-backward machinery). perm/unsort are
+    //    built IN-KERNEL into the per-CTA workspace (STAGE -1), NOT here. Inert null
+    //    defaults ⇒ every non-SG2 cell is byte-identical (the SG2 phase is
+    //    if-constexpr'd to OptId::SuperGrok2 only).
+    float*       sg2_slow = nullptr;      // [total] grokfast slow-grad EMA (persisted)
+    float*       sg2_gru_state = nullptr; // [total*gru_hidden] per-element GRU state, row-major
+    // meta-net weight bundle (HBM; model-independent; staged NOT to smem — the SG2
+    // bundle does not fit alongside DecTcSmem/VitTcSmem under the 48KB cap).
+    const float* sg2_input_proj_W = nullptr;  const float* sg2_input_proj_b = nullptr;
+    const float* sg2_csa_q_W = nullptr;  const float* sg2_csa_k_W = nullptr;
+    const float* sg2_csa_v_W = nullptr;  const float* sg2_csa_out_W = nullptr;
+    const float* sg2_csa_compress_w = nullptr;
+    const float* sg2_csa_idx_DQ = nullptr;  const float* sg2_csa_idx_K = nullptr;
+    const float* sg2_hca_q_W = nullptr;  const float* sg2_hca_k_W = nullptr;
+    const float* sg2_hca_v_W = nullptr;  const float* sg2_hca_out_W = nullptr;
+    const float* sg2_gru_Wz = nullptr;  const float* sg2_gru_bz = nullptr;
+    const float* sg2_gru_Wr = nullptr;  const float* sg2_gru_br = nullptr;
+    const float* sg2_gru_Wh = nullptr;  const float* sg2_gru_bh = nullptr;
+    const float* sg2_peer_query_Ws = nullptr;
+    const float* sg2_prod_keys_A = nullptr;  const float* sg2_prod_keys_B = nullptr;
+    const float* sg2_expert_W1 = nullptr;  const float* sg2_expert_b1 = nullptr;
+    const float* sg2_expert_W2 = nullptr;  const float* sg2_expert_b2 = nullptr;
+    // per-tensor scalar arrays (device, length #tensors). These do NOT fit the
+    // global FusedScalars POD (it carries only scalars), so they ride here as
+    // device buffers the host fills (alpha_i/gru_decay_i/lamb_eff_i/beta1_i + the
+    // per-tensor bias corrections). Shared scalars (rescale/beta2/lr/wd/eps) ride
+    // the existing FusedScalars fields (lr/beta2/eps/wd) + sg2_rescale below.
+    const float* sg2_alpha = nullptr;      const float* sg2_gru_decay = nullptr;
+    const float* sg2_lamb_eff = nullptr;   const float* sg2_beta1 = nullptr;
+    const float* sg2_bc1 = nullptr;        const float* sg2_bc2 = nullptr;
+    float        sg2_rescale = 0.0f;       // expert-output scale (shared)
 };
 
 // =========================================================================

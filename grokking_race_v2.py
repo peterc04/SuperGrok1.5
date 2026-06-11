@@ -1430,7 +1430,28 @@ def train_supergrok2(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     alpha_freq=c.get("sg2_alpha_update_freq",50)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
+    mtype=c.get("model_type","decoder")
     for step in (pb:=_pbar("SuperGrok2",c["max_steps"],bp)):
+        # SuperGrok2 L3-TC path (decoder/vit): the DEDICATED fused megakernel runs the
+        # REAL fwd+bwd + the FULL CSA/HCA/PEER/GRU meta-net AS the optimizer phase (in-
+        # kernel segmented sort + SAM 2nd backward + sg2_meta_stages) in ONE persistent
+        # launch — replacing the eager fwd/bwd + sam_step + bilevel_step + opt.step(). The
+        # meta-net snapshot is scattered into the dedicated entry each step (faithful to
+        # the kernel's evaluated weights). HONEST CAVEAT (per .sg2_spec.md): SG2 reaches
+        # L3-TC + single-step parity vs the per-op oracle but WON'T GROK on the L3 path —
+        # the in-kernel CSA lightning-indexer drops idx_UQ + scores /sqrt(rank) not
+        # /sqrt(d), so it diverges from the eager-trained net for N>64 (a separate, out-of-
+        # scope fidelity gap). The cell is PARITY-correct + L3-TC; grok is a documented
+        # separate result. Falls back to eager (AMP on / non-sm_90 / fp32 / mamba —
+        # mamba×SG2 is BLOCKED: the SAM double-forward + segmented sort re-trip the shared
+        # mamba-forward A/A/A race, and the mamba kernel/launcher carry no SG2 case).
+        l3_loss=_try_fused_train_step(mtype, "supergrok2", m, opt, tx, ty, c)
+        if l3_loss is not None:
+            loss=torch.as_tensor(l3_loss)
+            if step%eval_every==0 or step==1:
+                done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
+                if done: break
+            continue
         # [A4-M5] L1 fused tail integration for this optimizer requires the
         # adamw/lion post-backward structure (see train_adamw) — do not re-add
         # the pre-forward continue pattern (it skips side-steps and eval).

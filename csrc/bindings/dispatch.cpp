@@ -329,6 +329,46 @@ cudaError_t mega_mamba_real_adamw_tc(
     float* state, float* grad, float* workspace, float* loss_out,
     float lr, int step, const FusedScalars& scalars, cudaStream_t stream,
     int ncta_cap, int opt_id);
+// SuperGrok2 DEDICATED TC launchers (decoder/vit). SG2 needs the FULL CSA/HCA/PEER/
+// GRU meta-net weight bundle (26 HBM ptrs) + per-tensor scalar ARRAYS (6, length P)
+// + the meta-net state, none of which fit the FusedScalars POD or the generic
+// mega_*_real_adamw_tc boundary — so these are PARALLEL entries (the generic
+// launcher + the 28 byte-identical cells are UNTOUCHED). The state buffer carries
+// [m|v|mu|loss|sharpness|slow|gru_state]; perm/unsort are built in-kernel.
+cudaError_t mega_decoder_sg2_tc(
+    ::sg::fused::PersistentContext ctx, float* params,
+    const int* tokens, const int* targets, int B,
+    float* state, float* grad, float* loss_out,
+    const float* input_proj_W, const float* input_proj_b,
+    const float* csa_q_W, const float* csa_k_W, const float* csa_v_W, const float* csa_out_W,
+    const float* csa_compress_w, const float* csa_idx_DQ, const float* csa_idx_K,
+    const float* hca_q_W, const float* hca_k_W, const float* hca_v_W, const float* hca_out_W,
+    const float* gru_Wz, const float* gru_bz, const float* gru_Wr, const float* gru_br,
+    const float* gru_Wh, const float* gru_bh,
+    const float* peer_query_Ws, const float* prod_keys_A, const float* prod_keys_B,
+    const float* expert_W1, const float* expert_b1, const float* expert_W2, const float* expert_b2,
+    const float* sc_alpha, const float* sc_gru_decay, const float* sc_lamb_eff,
+    const float* sc_beta1, const float* sc_bc1, const float* sc_bc2,
+    float rescale, float beta2, float lr, float wd, float eps,
+    float rho, float sam_on,
+    int step, cudaStream_t stream, int ncta_cap);
+cudaError_t mega_vit_sg2_tc(
+    ::sg::fused::PersistentContext ctx, float* params,
+    const float* patches, const int* targets, int B,
+    float* state, float* grad, float* loss_out,
+    const float* input_proj_W, const float* input_proj_b,
+    const float* csa_q_W, const float* csa_k_W, const float* csa_v_W, const float* csa_out_W,
+    const float* csa_compress_w, const float* csa_idx_DQ, const float* csa_idx_K,
+    const float* hca_q_W, const float* hca_k_W, const float* hca_v_W, const float* hca_out_W,
+    const float* gru_Wz, const float* gru_bz, const float* gru_Wr, const float* gru_br,
+    const float* gru_Wh, const float* gru_bh,
+    const float* peer_query_Ws, const float* prod_keys_A, const float* prod_keys_B,
+    const float* expert_W1, const float* expert_b1, const float* expert_W2, const float* expert_b2,
+    const float* sc_alpha, const float* sc_gru_decay, const float* sc_lamb_eff,
+    const float* sc_beta1, const float* sc_bc1, const float* sc_bc2,
+    float rescale, float beta2, float lr, float wd, float eps,
+    float rho, float sam_on,
+    int step, cudaStream_t stream, int ncta_cap);
 }}  // namespace fused::sm90
 #endif
 
@@ -618,8 +658,14 @@ static int wgmma_tail_opt_id(const std::string& optimizer) {
     if (optimizer == "supergrok15") return 9;  // OptId::SuperGrok15 (same SAM 2nd backward +
                                                // per-tensor mu precompute; gate is a host
                                                // scalar — SINGLE persistent launch)
-    return -1;                                 // SG2 (no single-launch TC: segmented sort +
-                                               // CSA/HCA meta-net, out of scope)
+    if (optimizer == "supergrok2")  return 10; // OptId::SuperGrok2 (FULL CSA/HCA/PEER/GRU
+                                               // meta-net as the optimizer phase: in-kernel
+                                               // SEGMENTED SORT (STAGE -1) + SAM 2nd backward
+                                               // → sharpness + sg2_meta_stages; routed via the
+                                               // DEDICATED mega_*_sg2_tc entry, NOT the generic
+                                               // single-launch tail switch). Decoder/vit only;
+                                               // mamba stays -1 (code-absent + A/A/A race).
+    return -1;                                 // unroutable on the single-launch TC path
 }
 
 } // anonymous namespace
@@ -748,8 +794,12 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // a non-adamw scalar request is rejected inside (no silent adamw fallback). The
  // STAGED/coupled optimizers never reach here (wgmma_tail_opt_id < 0 → eager).
  const int dec_opt_id = wgmma_tail_opt_id(optimizer);
- const bool dec_l3_real = (optimizer == "adamw")
-                          || (want_wgmma && dec_opt_id >= 0);
+ // SuperGrok2 routes through the DEDICATED ops.sg2_fused_step entry (it needs the
+ // meta-net weight bundle + per-tensor scalar arrays this generic block cannot carry),
+ // so EXCLUDE it here even though wgmma_tail_opt_id("supergrok2")==10.
+ const bool dec_l3_real = ((optimizer == "adamw")
+                          || (want_wgmma && dec_opt_id >= 0))
+                          && optimizer != "supergrok2";
  if (arch == 90 && model == "transformer_decoder" && dec_l3_real && !opt_only) {
  const int64_t total = kDecoderTotalElems;
  TORCH_CHECK(params.numel() == total,
@@ -893,8 +943,11 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // vit real fwd+bwd+opt megakernel fires for adamw (scalar OR wgmma) AND, on the
  // wgmma path only, for the single-launch tails (lion/grokfast/grokadamw/neuralgrok).
  const int vit_opt_id = wgmma_tail_opt_id(optimizer);
- const bool vit_l3_real = (optimizer == "adamw")
-                          || (want_wgmma && vit_opt_id >= 0);
+ // SuperGrok2 routes through the DEDICATED ops.sg2_fused_step entry (see the decoder
+ // block) — EXCLUDE it from the generic vit block.
+ const bool vit_l3_real = ((optimizer == "adamw")
+                          || (want_wgmma && vit_opt_id >= 0))
+                          && optimizer != "supergrok2";
  if (arch == 90 && model == "vit" && vit_l3_real && !opt_only) {
  const int64_t total = kVitTotalElems;
  TORCH_CHECK(params.numel() == total,
@@ -1047,8 +1100,9 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // case). Un-dormanting them is a FEATURE PORT (the decoder/vit twins exist), not a
  // determinism fix; the now-deterministic LookSAM mamba instantiation proves the SAM 2nd-pass
  // path is race-free. So a forced wgmma request for SG11/15 mamba still fails LOUD here.
- const bool mb_is_sg = (optimizer == "supergrok11" || optimizer == "supergrok15");
- const bool mb_tc_tail = (mb_opt_id >= 0 && !mb_is_sg);  // {adamw,lion,grokfast,grokadamw,neuralgrok,muon,prodigy,looksam}; mamba SG11/15 = code-absent block; SG2 = -1.
+ const bool mb_is_sg = (optimizer == "supergrok11" || optimizer == "supergrok15"
+                        || optimizer == "supergrok2");
+ const bool mb_tc_tail = (mb_opt_id >= 0 && !mb_is_sg);  // {adamw,lion,grokfast,grokadamw,neuralgrok,muon,prodigy,looksam}; mamba SG11/15/SG2 = code-absent block (SG2 is decoder/vit-only via the dedicated entry).
  const bool mamba_l3_real = (optimizer == "adamw")
                             || (want_wgmma && mb_tc_tail);
  if (arch == 90 && model == "mamba3" && mamba_l3_real && !opt_only) {
@@ -1321,6 +1375,144 @@ void fused_step(const std::string& model, const std::string& optimizer,
  throw std::runtime_error(
  "fused TU for " + cell + " is manifest-registered but not compiled into "
  "this build (CPU build has no fused TU). Use the per-op path.");
+}
+
+// ── sg2_fused_step — the DEDICATED SuperGrok2 L3-TC entry (decoder/vit). SG2's
+//    optimizer phase is the FULL CSA/HCA/PEER/GRU meta-net (in-kernel segmented sort
+//    + SAM 2nd backward → sharpness + sg2_meta_stages), which needs the meta-net
+//    weight bundle (26 HBM ptrs) + per-tensor scalar arrays (6, length P) + the
+//    meta-net state — none representable in fused_step's FusedScalars POD. So this is
+//    a PARALLEL host entry (fused_step + the 28 byte-identical cells are UNTOUCHED).
+//    The Python caller (dispatch.fused_train_step's supergrok2 branch) packs `input`
+//    (tokens/patches) IDENTICALLY to fused_step and supplies the bundle + scalar
+//    arrays. The reduced grad is written to `grad` (return_grad parity), the loss to
+//    state[3*total]. wgmma-only (the SG2 meta-net rides the bf16 TC fwd+bwd). NO
+//    silent fallback: an unsupported model/shape throws.
+void sg2_fused_step(
+ const std::string& model,
+ torch::Tensor params, torch::Tensor input, torch::Tensor grad, torch::Tensor state,
+ // SG2 meta-net weight bundle (fp32, contiguous), in SG2Weights order.
+ torch::Tensor input_proj_W, torch::Tensor input_proj_b,
+ torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W, torch::Tensor csa_out_W,
+ torch::Tensor csa_compress_w, torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_K,
+ torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W, torch::Tensor hca_out_W,
+ torch::Tensor gru_Wz, torch::Tensor gru_bz, torch::Tensor gru_Wr, torch::Tensor gru_br,
+ torch::Tensor gru_Wh, torch::Tensor gru_bh,
+ torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+ torch::Tensor expert_W1, torch::Tensor expert_b1, torch::Tensor expert_W2, torch::Tensor expert_b2,
+ // per-tensor scalar arrays (length P = #param tensors), named_parameters() order.
+ torch::Tensor sc_alpha, torch::Tensor sc_gru_decay, torch::Tensor sc_lamb_eff,
+ torch::Tensor sc_beta1, torch::Tensor sc_bc1, torch::Tensor sc_bc2,
+ // shared scalars + SAM gate.
+ double rescale, double beta2, double lr, double wd, double eps,
+ double rho, double sam_on, int64_t step) {
+#if defined(WITH_CUDA) && !defined(WITH_HIP)
+ int arch = detect_arch();
+ TORCH_CHECK(arch == 90, "sg2_fused_step: SuperGrok2 L3-TC is sm_90 only.");
+ TORCH_CHECK(params.scalar_type() == torch::kFloat32 && params.is_contiguous(),
+ "sg2_fused_step: params must be contiguous fp32 (flat named_parameters()).");
+ TORCH_CHECK(state.scalar_type() == torch::kFloat32 && state.is_contiguous(),
+ "sg2_fused_step: state must be contiguous fp32.");
+ TORCH_CHECK(grad.scalar_type() == torch::kFloat32 && grad.is_contiguous(),
+ "sg2_fused_step: grad must be contiguous fp32 (reduced weight-grad output).");
+ cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+ auto W = [](torch::Tensor& t) {
+ TORCH_CHECK(t.scalar_type() == torch::kFloat32 && t.is_contiguous(),
+ "sg2_fused_step: meta-net weights + scalar arrays must be contiguous fp32.");
+ return t.data_ptr<float>();
+ };
+ float* st = state.data_ptr<float>();
+ cudaError_t err = cudaSuccess;
+ if (model == "transformer_decoder") {
+ const int64_t total = kDecoderTotalElems;
+ const int GH = 4;   // SG2Dims gru_hidden default
+ const int64_t min_state = (int64_t)(5 + GH) * total + 1;   // [m|v|mu|loss|sharpness|slow|gru_state]
+ TORCH_CHECK(params.numel() == total,
+ "sg2_fused_step: decoder params has ", params.numel(), " != ", total);
+ TORCH_CHECK(grad.numel() == total,
+ "sg2_fused_step: decoder grad has ", grad.numel(), " != ", total);
+ TORCH_CHECK(state.numel() >= min_state,
+ "sg2_fused_step: decoder state needs >= ", min_state,
+ " floats ([m|v|mu|loss|sharpness|slow|gru_state(total*", GH, ")]) got ",
+ state.numel(), ".");
+ TORCH_CHECK(input.scalar_type() == torch::kInt32 && input.is_contiguous(),
+ "sg2_fused_step: decoder input must be contiguous int32 (tokens[B*kSeq]++targets[B]).");
+ const int64_t in_n = input.numel();
+ TORCH_CHECK(in_n % (kDecoderSeq + 1) == 0 && in_n > 0,
+ "sg2_fused_step: decoder input.numel() must be B*(kSeq+1).");
+ const int B = (int)(in_n / (kDecoderSeq + 1));
+ DecoderScratch& dsc = decoder_scratch_for(params);
+ fused::PersistentContext ctx{
+ dsc.g_next.data_ptr<int>(),
+ reinterpret_cast<unsigned*>(dsc.g_arrived.data_ptr<int>()),
+ reinterpret_cast<unsigned*>(dsc.g_generation.data_ptr<int>()),
+ 30, 0u};
+ float* loss_slot = st + 3 * total;
+ err = fused::sm90::mega_decoder_sg2_tc(
+ ctx, params.data_ptr<float>(),
+ input.data_ptr<int>(), input.data_ptr<int>() + (int64_t)B * kDecoderSeq, B,
+ st, grad.data_ptr<float>(), loss_slot,
+ W(input_proj_W), W(input_proj_b),
+ W(csa_q_W), W(csa_k_W), W(csa_v_W), W(csa_out_W),
+ W(csa_compress_w), W(csa_idx_DQ), W(csa_idx_K),
+ W(hca_q_W), W(hca_k_W), W(hca_v_W), W(hca_out_W),
+ W(gru_Wz), W(gru_bz), W(gru_Wr), W(gru_br), W(gru_Wh), W(gru_bh),
+ W(peer_query_Ws), W(prod_keys_A), W(prod_keys_B),
+ W(expert_W1), W(expert_b1), W(expert_W2), W(expert_b2),
+ W(sc_alpha), W(sc_gru_decay), W(sc_lamb_eff), W(sc_beta1), W(sc_bc1), W(sc_bc2),
+ (float)rescale, (float)beta2, (float)lr, (float)wd, (float)eps,
+ (float)rho, (float)sam_on, (int)step, stream, /*ncta_cap=*/0);
+ } else if (model == "vit") {
+ const int64_t total = kVitTotalElems;
+ const int GH = 4;
+ const int64_t min_state = (int64_t)(5 + GH) * total + 1;
+ TORCH_CHECK(params.numel() == total,
+ "sg2_fused_step: vit params has ", params.numel(), " != ", total);
+ TORCH_CHECK(grad.numel() == total,
+ "sg2_fused_step: vit grad has ", grad.numel(), " != ", total);
+ TORCH_CHECK(state.numel() >= min_state,
+ "sg2_fused_step: vit state needs >= ", min_state, " got ", state.numel());
+ TORCH_CHECK(input.scalar_type() == torch::kFloat32 && input.is_contiguous(),
+ "sg2_fused_step: vit input must be contiguous float32 (patches++target-bits).");
+ const int64_t in_n = input.numel();
+ TORCH_CHECK(in_n % (kVitPatchElems + 1) == 0 && in_n > 0,
+ "sg2_fused_step: vit input.numel() must be B*(patch_elems+1).");
+ const int B = (int)(in_n / (kVitPatchElems + 1));
+ ViTScratch& vsc = vit_scratch_for(params);
+ fused::PersistentContext ctx{
+ vsc.g_next.data_ptr<int>(),
+ reinterpret_cast<unsigned*>(vsc.g_arrived.data_ptr<int>()),
+ reinterpret_cast<unsigned*>(vsc.g_generation.data_ptr<int>()),
+ 32,                    // kVitNumTensors (mirror; the .cu static-asserts it)
+ 0u};
+ float* loss_slot = st + 3 * total;
+ // targets are bit-reinterpreted in the trailing float slots (same as fused_step).
+ const float* patches = input.data_ptr<float>();
+ const int* targets = reinterpret_cast<const int*>(input.data_ptr<float>() + (int64_t)B * kVitPatchElems);
+ err = fused::sm90::mega_vit_sg2_tc(
+ ctx, params.data_ptr<float>(), patches, targets, B,
+ st, grad.data_ptr<float>(), loss_slot,
+ W(input_proj_W), W(input_proj_b),
+ W(csa_q_W), W(csa_k_W), W(csa_v_W), W(csa_out_W),
+ W(csa_compress_w), W(csa_idx_DQ), W(csa_idx_K),
+ W(hca_q_W), W(hca_k_W), W(hca_v_W), W(hca_out_W),
+ W(gru_Wz), W(gru_bz), W(gru_Wr), W(gru_br), W(gru_Wh), W(gru_bh),
+ W(peer_query_Ws), W(prod_keys_A), W(prod_keys_B),
+ W(expert_W1), W(expert_b1), W(expert_W2), W(expert_b2),
+ W(sc_alpha), W(sc_gru_decay), W(sc_lamb_eff), W(sc_beta1), W(sc_bc1), W(sc_bc2),
+ (float)rescale, (float)beta2, (float)lr, (float)wd, (float)eps,
+ (float)rho, (float)sam_on, (int)step, stream, /*ncta_cap=*/0);
+ } else {
+ throw std::runtime_error("sg2_fused_step: SuperGrok2 L3-TC is wired for "
+ "transformer_decoder + vit only (mamba is code-absent / A/A/A-blocked); got " + model);
+ }
+ if (err != cudaSuccess)
+ throw std::runtime_error(std::string("sg2_fused_step launch failed: ") +
+ cudaGetErrorString(err));
+#else
+ (void)model; (void)params; (void)input; (void)grad; (void)state;
+ throw std::runtime_error("sg2_fused_step: built without CUDA.");
+#endif
 }
 
 } // namespace sg

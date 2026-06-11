@@ -264,4 +264,110 @@ cudaError_t mega_decoder_real_adamw_tc(
     }
 }
 
+// mega_decoder_sg2_tc — the DEDICATED SuperGrok2 TC launcher. SG2 needs the FULL
+// CSA/HCA/PEER/GRU meta-net weight bundle (26 HBM pointers, model-independent) +
+// per-tensor scalar ARRAYS (alpha/gru_decay/lamb_eff/beta1/bc1/bc2, length P) +
+// the meta-net state (m/v/mu/slow/gru_state/sharpness), none of which fit the
+// FusedScalars POD or the generic mega_decoder_real_adamw_tc boundary. So this is
+// a PARALLEL entry (the generic launcher + the 28 byte-identical cells are
+// UNTOUCHED). It binds the SG2 state slices, threads the weight bundle + scalar
+// arrays through FusedOptState's sg2_* fields, and dispatches the OptId::SuperGrok2
+// kernel instantiation (its P3-SG2 phase runs sg2_meta_stages per tensor: STAGE -1
+// in-kernel segmented sort → CSA/HCA/GRU/PEER/apply, reading st.sharpness from the
+// SAM 2nd backward (P2.4, shared with SG11/15)).
+//
+// STATE LAYOUT (host sizes it; this carves it):
+//   [m(total) | v(total) | mu(total) | loss(1) | sharpness(total) | slow(total)
+//    | gru_state(total*GH)]   ⇒ min_state = (4+1+GH)*total + 1   (GH=gru_hidden=4)
+// perm/unsort are built IN-KERNEL into the per-CTA workspace (NOT state).
+cudaError_t mega_decoder_sg2_tc(
+        PersistentContext ctx, float* params,
+        const int* tokens, const int* targets, int B,
+        float* state, float* grad, float* loss_out,
+        // SG2 meta-net weight bundle (HBM, fp32, model-independent), in SG2Weights order.
+        const float* input_proj_W, const float* input_proj_b,
+        const float* csa_q_W, const float* csa_k_W, const float* csa_v_W, const float* csa_out_W,
+        const float* csa_compress_w, const float* csa_idx_DQ, const float* csa_idx_K,
+        const float* hca_q_W, const float* hca_k_W, const float* hca_v_W, const float* hca_out_W,
+        const float* gru_Wz, const float* gru_bz, const float* gru_Wr, const float* gru_br,
+        const float* gru_Wh, const float* gru_bh,
+        const float* peer_query_Ws, const float* prod_keys_A, const float* prod_keys_B,
+        const float* expert_W1, const float* expert_b1, const float* expert_W2, const float* expert_b2,
+        // per-tensor scalar arrays (device, length kDecNumTensors).
+        const float* sc_alpha, const float* sc_gru_decay, const float* sc_lamb_eff,
+        const float* sc_beta1, const float* sc_bc1, const float* sc_bc2,
+        // shared scalars + the SAM 2nd-backward gate (SG2 reuses the LookSAM P2.4
+        // machinery: rho = perturbation radius, sam_on = every-k SAM-step gate).
+        float rescale, float beta2, float lr, float wd, float eps,
+        float rho, float sam_on,
+        int step, cudaStream_t stream, int ncta_cap) {
+    const int64_t total = kDecTotalElems;
+    // gru_state spans total*GH (GH=DecSG2Dims::gru_hidden); the layout is fixed by
+    // the kernel's SG2State carve, so the slices below need no GH arithmetic here.
+    const int T = B * dec::kSeq;
+
+    int dev = 0;
+    cudaError_t err = cudaGetDevice(&dev);
+    if (err != cudaSuccess) return err;
+    int n_sms = 1;
+    err = cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, dev);
+    if (err != cudaSuccess) return err;
+    int nCTA = n_sms;
+    if (ncta_cap > 0 && ncta_cap < nCTA) nCTA = ncta_cap;
+
+    const int64_t need = dec_tc_workspace_floats(T, B, nCTA);
+    DecTcLauncherScratch& sc = dec_tc_launcher_scratch(dev, need);
+    ctx.g_next_task   = sc.g_next;
+    ctx.g_arrived     = sc.g_arrived;
+    ctx.g_generation  = sc.g_generation;
+    ctx.n_tasks       = kDecNumTensors;
+
+    // Bind the SG2 state slices: [m | v | mu | loss | sharpness | slow | gru_state].
+    FusedOptState st;
+    st.exp_avg     = state;                       // m
+    st.exp_avg_sq  = state + total;               // v
+    st.mu          = state + 2 * total;           // expert-output EMA
+    // loss_out points at state + 3*total (dispatch's loss slot).
+    float* sharp_base = loss_out + 1;             // state + 3*total + 1
+    st.sharpness   = sharp_base;                  // (g_sam − g)² (SAM 2nd backward, P2.4)
+    st.sg2_slow    = sharp_base + total;          // grokfast slow-grad EMA
+    st.sg2_gru_state = st.sg2_slow + total;       // [total*GH] per-element GRU state
+    // meta-net weight bundle (HBM).
+    st.sg2_input_proj_W = input_proj_W; st.sg2_input_proj_b = input_proj_b;
+    st.sg2_csa_q_W = csa_q_W; st.sg2_csa_k_W = csa_k_W; st.sg2_csa_v_W = csa_v_W;
+    st.sg2_csa_out_W = csa_out_W; st.sg2_csa_compress_w = csa_compress_w;
+    st.sg2_csa_idx_DQ = csa_idx_DQ; st.sg2_csa_idx_K = csa_idx_K;
+    st.sg2_hca_q_W = hca_q_W; st.sg2_hca_k_W = hca_k_W; st.sg2_hca_v_W = hca_v_W;
+    st.sg2_hca_out_W = hca_out_W;
+    st.sg2_gru_Wz = gru_Wz; st.sg2_gru_bz = gru_bz; st.sg2_gru_Wr = gru_Wr;
+    st.sg2_gru_br = gru_br; st.sg2_gru_Wh = gru_Wh; st.sg2_gru_bh = gru_bh;
+    st.sg2_peer_query_Ws = peer_query_Ws; st.sg2_prod_keys_A = prod_keys_A;
+    st.sg2_prod_keys_B = prod_keys_B;
+    st.sg2_expert_W1 = expert_W1; st.sg2_expert_b1 = expert_b1;
+    st.sg2_expert_W2 = expert_W2; st.sg2_expert_b2 = expert_b2;
+    // per-tensor scalar arrays.
+    st.sg2_alpha = sc_alpha; st.sg2_gru_decay = sc_gru_decay; st.sg2_lamb_eff = sc_lamb_eff;
+    st.sg2_beta1 = sc_beta1; st.sg2_bc1 = sc_bc1; st.sg2_bc2 = sc_bc2;
+    st.sg2_rescale = rescale;
+    // shared scalars the SG2 phase reads (beta2/lr/wd/eps via FusedScalars fields).
+    st.beta2 = beta2; st.lr = lr; st.wd = wd; st.eps = eps;
+    // SAM 2nd-backward gate: SG2 reuses the LookSAM P2.4 machinery. st.rho is the
+    // perturbation radius (SG2's sam_rho); st.looksam_sam is the every-k SAM-step gate
+    // (1.0 ⇒ run the in-kernel perturb→2nd fwd+bwd→sharpness=(g_sam−g)² this step;
+    // 0.0 ⇒ reuse the cached sharpness). On a non-SAM step the cached sharpness feeds
+    // the meta-net verbatim (eager-faithful).
+    st.rho = rho;
+    st.looksam_sam = sam_on;
+
+    DecoderTokenCtx tok;
+    tok.tokens    = tokens;
+    tok.targets   = targets;
+    tok.B         = B;
+    tok.workspace = sc.workspace;
+    tok.loss_out  = loss_out;
+
+    return launch_fused_decoder_megakernel_tc<OptId::SuperGrok2>(
+        ctx, params, tok, grad, lr, step, st, stream, nCTA);
+}
+
 }}}  // namespace sg::fused::sm90

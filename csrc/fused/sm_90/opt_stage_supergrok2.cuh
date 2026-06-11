@@ -417,7 +417,21 @@ struct SG2Work {
     float* concat;     // [N, d_model]
     float* new_gru;    // [N, gru_hidden]
     float* expert_out; // [N]
+    // ── STAGE -1 in-kernel segmented sort scratch (composed-megakernel path only;
+    //    the standalone path pre-computes perm/unsort host-side into st.perm). ──
+    float* sort_keys;  // [N] |grad| keys (bitonic, padded with +INF to Npow2≤2N)
+    int*   sort_idx;   // [N] original-row indices carried through the sort
+    int*   perm;       // [N] sorted-row -> original-row (sort output)
+    int*   unsort;     // [N] original-row -> sorted-row (inverse perm)
 };
+
+// Smallest power of two >= n (n>=1). Used to pad the bitonic sort length AND to
+// size the sort scratch (declared before sg2_ws_stride, which reserves 2*Npow2).
+__host__ __device__ __forceinline__ int sg2_next_pow2(int n) {
+    int p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
 
 // floats-per-CTA stride. Conservatively sized for the LARGEST tensor (Nmax) so
 // the same slice serves every tensor. Ncmax = ceil(Nmax/csa_compress) bounds the
@@ -444,6 +458,14 @@ __host__ __device__ inline int64_t sg2_ws_stride(int64_t Nmax) {
     f += Nmax * d;          // concat
     f += Nmax * gh;         // new_gru
     f += Nmax;              // expert_out
+    // STAGE -1 segmented-sort scratch (composed path). The bitonic sort pads the
+    // per-tensor N up to Npow2 = next_pow2(N), so keys AND idx each need Npow2 (not
+    // N) slots. Reserve 2*Npow2(Nmax) for keys+idx — this bounds 2*Npow2(N) for ANY
+    // N<=Nmax (Npow2 is monotonic), WITHOUT assuming Nmax is itself a power of two
+    // (so a future model whose largest tensor is non-pow2 is still safe). perm/unsort
+    // are exactly Nmax each (one int per element).
+    f += 2 * (int64_t)sg2_next_pow2((int)Nmax);   // sort_keys[Npow2] + sort_idx[Npow2]
+    f += 2 * Nmax;                                 // perm[Nmax] + unsort[Nmax]
     return f;
 }
 
@@ -471,6 +493,20 @@ __device__ __forceinline__ SG2Work<Dims> sg2_carve_ws(
     ws.concat   = p;   p += Nmax * d;
     ws.new_gru  = p;   p += Nmax * gh;
     ws.expert_out = p; p += Nmax;
+    // STAGE -1 sort scratch. The bitonic sort pads N up to Npow2 = next_pow2(N),
+    // so keys/idx need Npow2 (NOT N) slots — carving them at N would overflow into
+    // perm/unsort whenever N is not a power of two (e.g. N=384 → Npow2=512), which
+    // SILENTLY corrupts perm (a non-permutation → missing scatter targets → zero
+    // gru_state). Carve keys[Npow2] + idx[Npow2], then perm[N] + unsort[N]. The host
+    // sizes the per-CTA slice at sg2_ws_stride(real_Nmax) which reserves 2*Npow2(Nmax)
+    // (keys+idx) + 2*Nmax (perm+unsort); since this carves at Nmax_arg==N<=Nmax and
+    // Npow2 is monotonic, 2*Npow2(N)+2*N <= 2*Npow2(Nmax)+2*Nmax fits — with NO
+    // power-of-two assumption on Nmax (a future non-pow2-largest model is safe).
+    const int64_t np2 = (int64_t)sg2_next_pow2((int)Nmax);
+    ws.sort_keys = p;                              p += np2;
+    ws.sort_idx  = reinterpret_cast<int*>(p);      p += np2;
+    ws.perm      = reinterpret_cast<int*>(p);      p += Nmax;
+    ws.unsort    = reinterpret_cast<int*>(p);      p += Nmax;
     return ws;
 }
 
@@ -487,9 +523,9 @@ __device__ __forceinline__ SG2Work<Dims> sg2_carve_ws(
 // source original row src=perm[r], projects that row's (g,s) directly into
 // x_sorted[r,:]. This matches csa_hca_step_one (project all, gather by perm)
 // bit-for-bit since the projection is per-row and the gather is a pure permute.
-template <typename Dims, typename GradT>
+template <typename Dims, typename WeightsT, typename GradT>
 __device__ __forceinline__ void sg2_stage_input_proj_sorted(
-    const SG2SmemWeights<Dims>& w,
+    const WeightsT& w,
     const GradT* __restrict__ grad,   // [N] original order (tensor slice)
     const float* __restrict__ sharp,  // [N] original order
     const int* __restrict__ perm,     // [N] sorted-row -> original-row
@@ -752,9 +788,9 @@ __device__ __forceinline__ void sg2_stage_out_proj(
 //   h̃ = tanh(xrh @ Wh.T + bh),  h_new = (1-z)*h_old + z*h̃
 // Owner thread per sorted row r computes the whole gru_hidden vector. The new
 // state is written back to gru_state in ORIGINAL order (gru_state[src]).
-template <typename Dims>
+template <typename Dims, typename WeightsT>
 __device__ __forceinline__ void sg2_stage_gru(
-    const SG2SmemWeights<Dims>& w,
+    const WeightsT& w,
     const float* __restrict__ g_sorted,   // [N]
     const float* __restrict__ s_sorted,   // [N]
     const float* __restrict__ csa_ctx,    // [N, d_model] (sorted)
@@ -828,9 +864,9 @@ __device__ __forceinline__ void sg2_stage_gru(
 //     soft_a⊗soft_b; per expert: ReLU MLP on scalar g; out = Σ routing*mlp;
 //   head outputs averaged ÷ num_peer_heads; expert_out *= rescale.
 // Owner thread per row r. The MLP input scalar is g_sorted[r] (matches eager).
-template <typename Dims>
+template <typename Dims, typename WeightsT>
 __device__ __forceinline__ void sg2_stage_peer(
-    const SG2SmemWeights<Dims>& w,
+    const WeightsT& w,
     const float* __restrict__ new_gru,    // [N, gru_hidden] sorted
     const float* __restrict__ csa_ctx,    // [N, d_model] sorted
     const float* __restrict__ hca_ctx,    // [N, d_model] sorted
@@ -976,15 +1012,107 @@ __device__ __forceinline__ void sg2_stage_apply(
 }
 
 // =====================================================================
+//  STAGE -1 — in-kernel SEGMENTED SORT (the composed-megakernel path's
+//  only big new device code). Per tensor, sort the [N] |grad| keys
+//  ASCENDING and write perm/unsort BEFORE S0. The standalone path
+//  pre-computes perm/unsort host-side (torch) and SKIPS this stage.
+//
+//  TIE SEMANTICS — STRATEGY A (index tie-break). The eager net + the per-op
+//  oracle sort by |grad| via torch.sort/argsort, which is UNSTABLE on CUDA.
+//  Reproducing an unstable order in a deterministic kernel is impossible, so
+//  we impose a TOTAL order by tie-breaking on the ORIGINAL index: the
+//  comparison key is the pair (|g|, idx) with SMALLER idx first on a |g| tie.
+//  This is (a) deterministic run-to-run (A/A/A-clean BY CONSTRUCTION — no
+//  scheduling dependence), and (b) the EXACT order the oracle's lock-step perm
+//  builder uses (the gate's tie-probe drives both with the same (|g|,idx) rule).
+//  For CONTINUOUS grads P(|g| tie)=0, so this coincides with any stable/unstable
+//  sort — the trajectory parity is unaffected; the tie-break only fixes the
+//  measure-zero tie set deterministically. A total order is ALSO required for the
+//  bitonic network to be correct (raw |g| with ties is not a total order).
+//
+//  ALGORITHM: a CTA-cooperative bitonic sort over Npow2 = next_pow2(N). The pad
+//  region [N, Npow2) is seeded with +INF keys (and idx>=N) so it sorts to the
+//  TOP (ascending) and never enters the first N output slots. One 256-thread CTA
+//  owns the whole tensor; grid-stride over Npow2 when Npow2 > blockDim.x.
+//  O(N log^2 N) — a STAGE-1 correctness cost, not a hot path.
+template <typename GradT>
+__device__ __forceinline__ void sg2_stage_segmented_sort(
+    const GradT* __restrict__ grad,   // [N] original order (tensor slice)
+    float* __restrict__ keys,         // [Npow2] scratch
+    int* __restrict__ idx,            // [Npow2] scratch
+    int* __restrict__ perm,           // [N] out: sorted-row -> original-row
+    int* __restrict__ unsort,         // [N] out: original-row -> sorted-row
+    int N) {
+    if (N <= 0) return;
+    // Npow2 = smallest power of two >= N.
+    int np2 = 1;
+    while (np2 < N) np2 <<= 1;
+    // Initialize keys/idx. Real elements get (|grad|, i); pad gets (+INF, i) with
+    // i>=N so the pad's index tie-break keeps it strictly above any real element
+    // sharing +INF (none do — real |g| is finite or NaN; NaN guarded to 0).
+    for (int i = threadIdx.x; i < np2; i += blockDim.x) {
+        if (i < N) {
+            float g = static_cast<float>(grad[i]);
+            if (!isfinite(g)) g = 0.0f;       // NaN/Inf guard (matches S0's guard)
+            keys[i] = fabsf(g);
+            idx[i]  = i;
+        } else {
+            keys[i] = INFINITY;
+            idx[i]  = i;                       // i>=N => sorts above all real rows
+        }
+    }
+    __syncthreads();
+    // Bitonic sort (ascending by (keys, idx)). For each (k, j) stage, thread t
+    // compares lane t with lane t^j; the swap direction is set by (t & k).
+    for (int k = 2; k <= np2; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int t = threadIdx.x; t < np2; t += blockDim.x) {
+                const int ixj = t ^ j;
+                if (ixj > t) {
+                    // ascending block when (t & k)==0, descending otherwise.
+                    const bool ascending = ((t & k) == 0);
+                    const float ka = keys[t],   kb = keys[ixj];
+                    const int   ia = idx[t],    ib = idx[ixj];
+                    // (ka,ia) > (kb,ib) under the (|g|, idx) total order?
+                    const bool a_gt_b = (ka > kb) || (ka == kb && ia > ib);
+                    // swap so that the pair is in the block's required order.
+                    if (a_gt_b == ascending) {
+                        keys[t] = kb; keys[ixj] = ka;
+                        idx[t]  = ib; idx[ixj]  = ia;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    // perm[r] = idx[r] for r<N (the first N sorted slots are the real elements,
+    // since the +INF pad sorted to the top). Build unsort by scatter (race-free:
+    // each sorted row r writes its distinct original slot perm[r]).
+    for (int r = threadIdx.x; r < N; r += blockDim.x) {
+        const int src = idx[r];
+        perm[r] = src;
+        unsort[src] = r;
+    }
+    __syncthreads();
+}
+
+// =====================================================================
 //  sg2_meta_stages<Dims> — the FULL per-tensor pipeline, CTA-local.
 //  Runs S0..S5 for ONE tensor (task id `t`) the calling CTA owns. All
 //  intermediates live in this CTA's workspace slice. __syncthreads()
 //  separates data-dependent stages WITHIN the CTA (the only coupling is
 //  this CTA's own rows; no cross-CTA dependence, hence no grid barrier).
 // =====================================================================
-template <typename Dims, typename ParamT, typename GradT>
+// WeightsT is either SG2SmemWeights<Dims> (standalone: weights staged to smem)
+// or SG2Weights (composed megakernel: weights read from HBM — the SG2 bundle
+// does NOT fit smem alongside the model's DecTcSmem/VitTcSmem, see the launcher).
+// Both expose the SAME member names indexed as arrays, so the stage bodies are
+// identical. BuildSort=true runs STAGE -1 (in-kernel segmented sort) and consumes
+// ws.perm/ws.unsort; BuildSort=false consumes the pre-computed st.perm/st.unsort.
+template <typename Dims, typename WeightsT, typename ParamT, typename GradT,
+          bool BuildSort = false>
 __device__ void sg2_meta_stages(
-    const SG2SmemWeights<Dims>& w,
+    const WeightsT& w,
     int tid,                            // task (tensor) index
     const SG2State& st,
     const SG2Scalars& sc,
@@ -1010,14 +1138,27 @@ __device__ void sg2_meta_stages(
     float* mu = st.mu + off;
     float* slow = st.slow + off;
     float* gru_state = st.gru_state + off * Dims::gru_hidden;
-    const int* perm = st.perm + off;
-    const int* unsort = st.unsort + off;
 
     // Workspace (carved for Nmax, used for this N).
     SG2Work<Dims> ws = sg2_carve_ws<Dims>(ws_base, /*Nmax=*/N /*carved per tensor*/);
     // NOTE: we carve at exactly N (not Nmax) so the buffers are tightly packed
     // for THIS tensor — valid because ws_stride(Nmax) >= ws_stride(N). The host
     // sizes the slice for Nmax; carving at N keeps the working set contiguous.
+
+    // STAGE -1: per-tensor segmented sort (composed path). The standalone path
+    // pre-computes perm/unsort host-side; there BuildSort=false skips this and the
+    // pointers come from st.perm/st.unsort.
+    const int* perm;
+    const int* unsort;
+    if constexpr (BuildSort) {
+        sg2_stage_segmented_sort<GradT>(grad, ws.sort_keys, ws.sort_idx,
+                                        ws.perm, ws.unsort, N);  // syncs internally
+        perm = ws.perm;
+        unsort = ws.unsort;
+    } else {
+        perm = st.perm + off;
+        unsort = st.unsort + off;
+    }
 
     // S0: input projection + gather sorted features.
     sg2_stage_input_proj_sorted<Dims>(w, grad, sharp, perm, ws.x_sorted, N);
@@ -1145,7 +1286,8 @@ sg2_meta_optimizer_megakernel(
     TaskQueue q = ctx.queue();
     for (int t = q.next_block(&task_slot); t < st.n_tensors;
          t = q.next_block(&task_slot)) {
-        sg2_meta_stages<Dims, ParamT, GradT>(
+        sg2_meta_stages<Dims, SG2SmemWeights<Dims>, ParamT, GradT,
+                        /*BuildSort=*/false>(
             sw, t, st, sc, params, grads, sharpness, my_ws);
     }
 

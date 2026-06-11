@@ -204,4 +204,82 @@ cudaError_t mega_vit_real_adamw_tc(
     }
 }
 
+// mega_vit_sg2_tc — the DEDICATED SuperGrok2 ViT TC launcher (twin of
+// mega_decoder_sg2_tc). Binds the SG2 meta-net state slices + the HBM weight bundle
+// + per-tensor scalar arrays, dispatches launch_fused_vit_megakernel_tc<SuperGrok2>.
+// State layout: [m | v | mu | loss | sharpness | slow | gru_state(total*GH)].
+cudaError_t mega_vit_sg2_tc(
+        PersistentContext ctx, float* params,
+        const float* patches, const int* targets, int B,
+        float* state, float* grad, float* loss_out,
+        const float* input_proj_W, const float* input_proj_b,
+        const float* csa_q_W, const float* csa_k_W, const float* csa_v_W, const float* csa_out_W,
+        const float* csa_compress_w, const float* csa_idx_DQ, const float* csa_idx_K,
+        const float* hca_q_W, const float* hca_k_W, const float* hca_v_W, const float* hca_out_W,
+        const float* gru_Wz, const float* gru_bz, const float* gru_Wr, const float* gru_br,
+        const float* gru_Wh, const float* gru_bh,
+        const float* peer_query_Ws, const float* prod_keys_A, const float* prod_keys_B,
+        const float* expert_W1, const float* expert_b1, const float* expert_W2, const float* expert_b2,
+        const float* sc_alpha, const float* sc_gru_decay, const float* sc_lamb_eff,
+        const float* sc_beta1, const float* sc_bc1, const float* sc_bc2,
+        float rescale, float beta2, float lr, float wd, float eps,
+        float rho, float sam_on,
+        int step, cudaStream_t stream, int ncta_cap) {
+    const int64_t total = kVitTotalElems;
+    const int T = B * vit::kSeq;
+
+    int dev = 0;
+    cudaError_t err = cudaGetDevice(&dev);
+    if (err != cudaSuccess) return err;
+    int n_sms = 1;
+    err = cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, dev);
+    if (err != cudaSuccess) return err;
+    int nCTA = n_sms;
+    if (ncta_cap > 0 && ncta_cap < nCTA) nCTA = ncta_cap;
+
+    const int64_t need = vit_tc_workspace_floats(T, B, nCTA);
+    VitTcLauncherScratch& sc = vit_tc_launcher_scratch(dev, need);
+    ctx.g_next_task  = sc.g_next;
+    ctx.g_arrived    = sc.g_arrived;
+    ctx.g_generation = sc.g_generation;
+    ctx.n_tasks      = kVitNumTensors;
+
+    FusedOptState st;
+    st.exp_avg     = state;
+    st.exp_avg_sq  = state + total;
+    st.mu          = state + 2 * total;
+    float* sharp_base = loss_out + 1;             // state + 3*total + 1
+    st.sharpness   = sharp_base;
+    st.sg2_slow    = sharp_base + total;
+    st.sg2_gru_state = st.sg2_slow + total;
+    st.sg2_input_proj_W = input_proj_W; st.sg2_input_proj_b = input_proj_b;
+    st.sg2_csa_q_W = csa_q_W; st.sg2_csa_k_W = csa_k_W; st.sg2_csa_v_W = csa_v_W;
+    st.sg2_csa_out_W = csa_out_W; st.sg2_csa_compress_w = csa_compress_w;
+    st.sg2_csa_idx_DQ = csa_idx_DQ; st.sg2_csa_idx_K = csa_idx_K;
+    st.sg2_hca_q_W = hca_q_W; st.sg2_hca_k_W = hca_k_W; st.sg2_hca_v_W = hca_v_W;
+    st.sg2_hca_out_W = hca_out_W;
+    st.sg2_gru_Wz = gru_Wz; st.sg2_gru_bz = gru_bz; st.sg2_gru_Wr = gru_Wr;
+    st.sg2_gru_br = gru_br; st.sg2_gru_Wh = gru_Wh; st.sg2_gru_bh = gru_bh;
+    st.sg2_peer_query_Ws = peer_query_Ws; st.sg2_prod_keys_A = prod_keys_A;
+    st.sg2_prod_keys_B = prod_keys_B;
+    st.sg2_expert_W1 = expert_W1; st.sg2_expert_b1 = expert_b1;
+    st.sg2_expert_W2 = expert_W2; st.sg2_expert_b2 = expert_b2;
+    st.sg2_alpha = sc_alpha; st.sg2_gru_decay = sc_gru_decay; st.sg2_lamb_eff = sc_lamb_eff;
+    st.sg2_beta1 = sc_beta1; st.sg2_bc1 = sc_bc1; st.sg2_bc2 = sc_bc2;
+    st.sg2_rescale = rescale;
+    st.beta2 = beta2; st.lr = lr; st.wd = wd; st.eps = eps;
+    st.rho = rho;
+    st.looksam_sam = sam_on;
+
+    ViTInputCtx in;
+    in.patches   = patches;
+    in.targets   = targets;
+    in.B         = B;
+    in.workspace = sc.workspace;
+    in.loss_out  = loss_out;
+
+    return launch_fused_vit_megakernel_tc<OptId::SuperGrok2>(
+        ctx, params, in, grad, lr, step, st, stream, nCTA);
+}
+
 }}}  // namespace sg::fused::sm90

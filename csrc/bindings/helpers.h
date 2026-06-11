@@ -81,6 +81,28 @@ void fused_step(const std::string& model, const std::string& optimizer,
                 // sync with the dispatch.cpp definition + the pybind py::arg list.
                 float sg_rescale = 0.0f);
 
+// ── SuperGrok2 DEDICATED L3-TC entry (decoder/vit). SG2's optimizer phase is the
+//    FULL CSA/HCA/PEER/GRU meta-net (in-kernel segmented sort + SAM 2nd backward →
+//    sharpness + sg2_meta_stages), needing the meta-net weight bundle (26 tensors) +
+//    per-tensor scalar ARRAYS (6, length P), none representable in fused_step's
+//    FusedScalars POD. A PARALLEL entry; fused_step + the 28 cells are UNTOUCHED.
+//    Definition in dispatch.cpp; pybind registration in bindings.cpp. ──
+void sg2_fused_step(
+    const std::string& model,
+    torch::Tensor params, torch::Tensor input, torch::Tensor grad, torch::Tensor state,
+    torch::Tensor input_proj_W, torch::Tensor input_proj_b,
+    torch::Tensor csa_q_W, torch::Tensor csa_k_W, torch::Tensor csa_v_W, torch::Tensor csa_out_W,
+    torch::Tensor csa_compress_w, torch::Tensor csa_idx_DQ, torch::Tensor csa_idx_K,
+    torch::Tensor hca_q_W, torch::Tensor hca_k_W, torch::Tensor hca_v_W, torch::Tensor hca_out_W,
+    torch::Tensor gru_Wz, torch::Tensor gru_bz, torch::Tensor gru_Wr, torch::Tensor gru_br,
+    torch::Tensor gru_Wh, torch::Tensor gru_bh,
+    torch::Tensor peer_query_Ws, torch::Tensor prod_keys_A, torch::Tensor prod_keys_B,
+    torch::Tensor expert_W1, torch::Tensor expert_b1, torch::Tensor expert_W2, torch::Tensor expert_b2,
+    torch::Tensor sc_alpha, torch::Tensor sc_gru_decay, torch::Tensor sc_lamb_eff,
+    torch::Tensor sc_beta1, torch::Tensor sc_bc1, torch::Tensor sc_bc2,
+    double rescale, double beta2, double lr, double wd, double eps,
+    double rho, double sam_on, int64_t step);
+
 // ── Per-arch namespace handles ───────────────────────────────────────
 namespace sm90 {}
 namespace gfx942 {}

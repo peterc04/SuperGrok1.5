@@ -955,6 +955,18 @@ _FUSED_L3_REAL = frozenset({
     # supergrok15 (vit — SAM-tier lane): CONVERTED. The IDENTICAL SAM 2nd backward + mu precompute
     # on the ViT TC kernel; host-scalar gate. The vit launcher routes opt_id=9. mamba stays blocked.
     ("vit", "supergrok15"),
+    # supergrok2 (decoder/vit — the LAST/hardest cell): CONVERTED via the DEDICATED
+    # ops.sg2_fused_step entry (sg2_fused_step in dispatch.cpp → mega_{decoder,vit}_sg2_tc).
+    # The FULL CSA/HCA/PEER/GRU meta-net AS the optimizer phase: P3-SG2 runs the in-kernel
+    # SEGMENTED SORT (STAGE -1, index-tie-break strategy A) → S0..S5, reading st.sharpness
+    # from the SAM 2nd backward (P2.4, shared with SG11/15). Weights from HBM; per-tensor
+    # scalar arrays via the dedicated entry. Single-step + 200-step parity vs the per-op
+    # oracle (ops.supergrok2_batched_step, SAME low-rank indexer) < 1e-5; A/A/A bit-exact.
+    # HONEST CAVEAT: SG2 won't GROK (CSA lightning-indexer fidelity gap, N>64 — the gate's
+    # N>64 probe REPORTS it). mamba×supergrok2 BLOCKED (SAM double-forward + segmented sort
+    # re-trip the shared mamba-forward A/A/A race; code-absent in the mamba kernel/launcher).
+    ("transformer_decoder", "supergrok2"),
+    ("vit", "supergrok2"),
 })
 
 _FUSED_REGISTRY = {}
@@ -1174,6 +1186,31 @@ def _opt_scalars_from(optimizer, step):
         out["d0"] = float(g["d0"])
         out["d_coef"] = float(g["d_coef"])
         out["beta3"] = _math.sqrt(beta2)
+    elif (hasattr(optimizer, "meta_net") and hasattr(optimizer, "sam_rho")
+          and hasattr(getattr(optimizer, "meta_net", None), "num_experts")):
+        # supergrok2 (decoder/vit L3-TC, DEDICATED entry). MUST precede the SG11/15
+        # branch below: SG2's CSAHCAMetaNet ALSO has .rescale (so that branch's
+        # distinguisher would WRONGLY match it), but SG2's meta-net is a CSAHCAMetaNet
+        # (has .num_experts/.csa_compress) which the SharpnessMetaNet (SG11/15) lacks.
+        # The PER-TENSOR scalars (alpha_i/gru_decay_i/lamb_eff/beta1_i/bc1_i/bc2_i) do
+        # NOT fit the global FusedScalars POD — they are computed + passed as device
+        # ARRAYS by the SG2 branch of fused_train_step (via ops.sg2_fused_step), NOT
+        # here. This branch only sets the SHARED scalars (lr/beta2/wd/eps already in
+        # `out`) + the SAM 2nd-backward gate (rho = sam_rho, looksam_sam = the every-k
+        # SAM-step cadence). The SAM cadence: train_supergrok2 fires sam_step on a
+        # dynamic _get_effective_sam_freq; for the L3 path we use the sam_freq_min base
+        # and fire at step 1 + every sam_freq_min steps (a faithful base cadence; the
+        # adaptive freq depends on metrics the L3 step does not feed). REPORTED in the
+        # gate. wd_eff = the progressive WD ramp (same _get_effective_wd as eager).
+        out["rho"] = float(getattr(optimizer, "sam_rho", 0.05))
+        sfmin = max(1, int(getattr(optimizer, "sam_freq_min", 3)))
+        out["looksam_sam"] = 1.0 if (int(step) % sfmin == 0 or int(step) == 1) else 0.0
+        # decoupled-WD ramp (eager _get_effective_wd); fall back to the group wd.
+        try:
+            out["weight_decay"] = float(optimizer._get_effective_wd(wd))
+        except Exception:
+            out["weight_decay"] = wd
+        return out
     elif (hasattr(optimizer, "meta_net") and hasattr(optimizer, "sam_rho")
           and hasattr(getattr(optimizer, "meta_net", None), "rescale")):
         # supergrok11 / supergrok15 (decoder/vit L3-TC, MODEL-COUPLED SAM 2nd backward +
@@ -1565,6 +1602,23 @@ _L3_WGMMA_CELLS = frozenset({
     # (same shared mamba-forward race; code-absent in the mamba kernel/launcher).
     ("transformer_decoder", "supergrok15"),
     ("vit", "supergrok15"),
+    # supergrok2 (decoder/vit — the LAST/hardest cell): CONVERTED via the DEDICATED
+    # ops.sg2_fused_step entry. SG2's optimizer phase is the FULL CSA/HCA/PEER/GRU
+    # meta-net run AS in-kernel stages (P3-SG2): STAGE -1 in-kernel SEGMENTED SORT
+    # (|grad| ascending, index tie-break — strategy A) → S0..S5 (CSA/HCA/GRU/PEER/
+    # apply), reading st.sharpness from the SAM 2nd backward (P2.4, shared with SG11/15).
+    # The meta-net WEIGHTS come from HBM (the 35 KB bundle does NOT fit smem alongside
+    # DecTcSmem/VitSampleSmem under the 48 KB cap) + per-tensor scalar ARRAYS ride the
+    # dedicated entry (they don't fit the global FusedScalars). Single-step + 200-step
+    # parity vs ops.supergrok2_batched_step (the per-op oracle, SAME low-rank indexer)
+    # < 1e-5; A/A/A bit-exact via the index-tie-break sort. HONEST CAVEAT: SG2 reaches
+    # L3-TC + single-step parity but WON'T GROK — the CSA lightning-indexer fidelity gap
+    # (kernel drops idx_UQ, /sqrt(rank) vs /sqrt(d), diverges for N>64); the gate's N>64
+    # CSA fidelity PROBE REPORTS this (not a regression). mamba×supergrok2 is BLOCKED
+    # (SAM double-forward + segmented sort re-trip the shared mamba-forward A/A/A race;
+    # the mamba kernel/launcher carry no SG2 case — code-absent).
+    ("transformer_decoder", "supergrok2"),
+    ("vit", "supergrok2"),
 })
 
 
@@ -1737,6 +1791,14 @@ def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
             _state_floats = 4 * total + 4
         elif opt_name in ("supergrok11", "supergrok15"):
             _state_floats = 4 * total + 1 + _sg_phi_pack
+        elif opt_name == "supergrok2":
+            # SuperGrok2 (DEDICATED entry) state: [m | v | mu | loss | sharpness(total)
+            # | slow(total) | gru_state(total*GH)] = (5+GH)*total + 1, GH=gru_hidden=4.
+            # perm/unsort are built IN-KERNEL into the per-CTA workspace (NOT state).
+            # The launcher carves sharpness at loss_slot+1, slow after it, gru_state
+            # after slow. mu reuses the 3rd slice; m/v the first two. zero-init.
+            _SG2_GH = 4
+            _state_floats = (5 + _SG2_GH) * total + 1
         else:
             _state_floats = 3 * total + 1
         state = torch.zeros(_state_floats, dtype=torch.float32, device=device)
@@ -1970,12 +2032,112 @@ def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
         _extra_scalars["alpha_max"] = scalars["alpha_max"]
     if "gate" in scalars:
         _extra_scalars["gate"] = scalars["gate"]
-    ops.fused_step(model_c, opt_name, flat, packed, grad_out, state, scalars["lr"],
-                   beta1=scalars["beta1"], beta2=scalars["beta2"],
-                   eps=scalars["eps"], weight_decay=scalars["weight_decay"],
-                   bc1=scalars["bc1"], bc2=scalars["bc2"],
-                   step=scalars["step"], opt_only=False, gemm_impl=gemm_impl,
-                   **_extra_scalars)
+
+    # ── SuperGrok2 DEDICATED entry (decoder/vit L3-TC). SG2 routes through
+    #    ops.sg2_fused_step (NOT ops.fused_step): its optimizer phase is the FULL
+    #    CSA/HCA/PEER/GRU meta-net (in-kernel segmented sort + SAM 2nd backward +
+    #    sg2_meta_stages), needing the meta-net weight bundle + per-tensor scalar
+    #    ARRAYS the generic ABI cannot carry. We build BOTH here (the per-tensor
+    #    scalars in named_parameters() == flat layout order) and call the dedicated
+    #    binding; everything else (param pack-in, scatter-back, loss read) is shared.
+    if opt_name == "supergrok2":
+        if not hasattr(optimizer, "meta_net"):
+            raise RuntimeError(
+                "fused_train_step: supergrok2 L3 cell requires an optimizer exposing "
+                f"meta_net (a CSAHCAMetaNet); got {type(optimizer).__name__}.")
+        net = optimizer.meta_net
+        GH = int(getattr(net, "gru_hidden", 4))
+        _SG2_GH = 4
+        if GH != _SG2_GH:
+            raise RuntimeError(
+                f"fused_train_step: supergrok2 meta-net gru_hidden is {GH} but the "
+                f"kernel is compiled for SG2Dims gru_hidden={_SG2_GH}.")
+        # Meta-net weight bundle, mapped to the kernel ABI keys (get_weights() uses
+        # gru_W_z; the kernel takes gru_Wz). peer_queries/product_keys are per-head
+        # lists → stack. expert_W1/W2 → [E, hidden]. fp32 + contiguous.
+        w = net.get_weights(None)
+        ne = int(net.num_experts)
+        def _f32c(t):
+            t = t if t.dtype == torch.float32 else t.float()
+            return t.contiguous().to(device=device)
+        peer_Ws = _f32c(torch.stack([q.float().contiguous() for q in w['peer_queries']]))
+        pkA = _f32c(torch.stack([k.float().contiguous() for k in w['product_keys_A']]))
+        pkB = _f32c(torch.stack([k.float().contiguous() for k in w['product_keys_B']]))
+        # Per-tensor scalar arrays (length P = #tensors), in named_parameters() order.
+        # Formulas mirror supergrok2.py step_compiled (:2258-2280): alpha_i =
+        # clamp(base_alpha·layer_alpha[i],0,1); beta1_i = layer_beta1[i]; gru_decay==
+        # beta1; lamb_eff = lamb·ramp·gate_signal (uniform); bc1_i=1-beta1_i^step,
+        # bc2_i=1-beta2^step. The optimizer builds _flat_layer_{alphas,beta1s} from its
+        # param_groups (== model.parameters() == named order). If a SG2 run ever
+        # reorders, the (n,off) layout would drift — guarded by the count check.
+        P = len(named)
+        import math as _m
+        beta1_g = float(optimizer.param_groups[0].get("betas", (0.9, 0.999))[0])
+        beta2_g = float(optimizer.param_groups[0].get("betas", (0.9, 0.999))[1])
+        base_alpha = float(getattr(optimizer, "_cached_alpha",
+                                   getattr(optimizer, "alpha_init", 0.98)))
+        try:
+            ramp = float(optimizer._get_ramp_factor())
+        except Exception:
+            ramp = 1.0
+        try:
+            gate_signal = float(optimizer._get_gate_signal())
+        except Exception:
+            gate_signal = 1.0
+        lamb = float(getattr(optimizer, "lamb", 2.0))
+        lamb_eff = lamb * ramp * gate_signal
+        la = getattr(optimizer, "_flat_layer_alphas", None)
+        lb = getattr(optimizer, "_flat_layer_beta1s", None)
+        # FAIL LOUD if the optimizer's per-layer tables don't cover all P tensors:
+        # silently falling back to alpha=1.0/beta1_g for a missing tail would diverge
+        # from the eager per-tensor scalars WITHOUT an error (the per-op oracle would
+        # IndexError instead). In the wired path the optimizer is built over
+        # model.parameters() so len == P; a mismatch is a real misconfiguration.
+        if la is not None and len(la) != P:
+            raise RuntimeError(
+                f"fused_train_step: supergrok2 _flat_layer_alphas has {len(la)} "
+                f"entries but the model has {P} trainable tensors — the optimizer "
+                f"must wrap the SAME params the L3 layout enumerates.")
+        if lb is not None and len(lb) != P:
+            raise RuntimeError(
+                f"fused_train_step: supergrok2 _flat_layer_beta1s has {len(lb)} "
+                f"entries but the model has {P} trainable tensors.")
+        alpha_a = []; gd_a = []; le_a = []; b1_a = []; bc1_a = []; bc2_a = []
+        st_step = int(scalars["step"])
+        for i in range(P):
+            la_i = float(la[i]) if (la is not None and i < len(la)) else 1.0
+            b1_i = float(lb[i]) if (lb is not None and i < len(lb)) else beta1_g
+            a_i = max(0.0, min(1.0, base_alpha * la_i))
+            alpha_a.append(a_i); gd_a.append(b1_i); le_a.append(lamb_eff)
+            b1_a.append(b1_i)
+            bc1_a.append(1.0 - b1_i ** st_step)
+            bc2_a.append(1.0 - beta2_g ** st_step)
+        def _arr(v):
+            return torch.tensor(v, dtype=torch.float32, device=device).contiguous()
+        rescale = float(getattr(net, "rescale", 0.1))
+        ops.sg2_fused_step(
+            model_c, flat, packed, grad_out, state,
+            _f32c(w['input_proj_W']), _f32c(w['input_proj_b']),
+            _f32c(w['csa_q_W']), _f32c(w['csa_k_W']), _f32c(w['csa_v_W']), _f32c(w['csa_out_W']),
+            _f32c(w['csa_compress_w']), _f32c(w['csa_idx_DQ']), _f32c(w['csa_idx_K']),
+            _f32c(w['hca_q_W']), _f32c(w['hca_k_W']), _f32c(w['hca_v_W']), _f32c(w['hca_out_W']),
+            _f32c(w['gru_W_z']), _f32c(w['gru_b_z']), _f32c(w['gru_W_r']), _f32c(w['gru_b_r']),
+            _f32c(w['gru_W_h']), _f32c(w['gru_b_h']),
+            peer_Ws, pkA, pkB,
+            _f32c(w['expert_W1'].reshape(ne, -1)), _f32c(w['expert_b1']),
+            _f32c(w['expert_W2'].reshape(ne, -1)), _f32c(w['expert_b2'].reshape(-1)),
+            _arr(alpha_a), _arr(gd_a), _arr(le_a), _arr(b1_a), _arr(bc1_a), _arr(bc2_a),
+            rescale, beta2_g, float(scalars["lr"]),
+            float(scalars["weight_decay"]), float(scalars["eps"]),
+            float(scalars.get("rho", 0.05)), float(scalars.get("looksam_sam", 0.0)),
+            int(scalars["step"]))
+    else:
+        ops.fused_step(model_c, opt_name, flat, packed, grad_out, state, scalars["lr"],
+                       beta1=scalars["beta1"], beta2=scalars["beta2"],
+                       eps=scalars["eps"], weight_decay=scalars["weight_decay"],
+                       bc1=scalars["bc1"], bc2=scalars["bc2"],
+                       step=scalars["step"], opt_only=False, gemm_impl=gemm_impl,
+                       **_extra_scalars)
 
     # Scatter the updated flat params back into the live model (same order).
     off = 0

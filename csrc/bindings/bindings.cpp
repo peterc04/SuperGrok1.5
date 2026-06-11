@@ -3506,6 +3506,30 @@ PYBIND11_MODULE(_ops, m) {
  // buffer ride the STATE buffer (cell-scattered), so only this scalar is in the ABI.
  py::arg("sg_rescale") = 0.0f);
 
+ // SuperGrok2 DEDICATED L3-TC entry (decoder/vit). The FULL CSA/HCA/PEER/GRU
+ // meta-net as the optimizer phase: in-kernel SEGMENTED SORT (STAGE -1) + SAM 2nd
+ // backward → sharpness + sg2_meta_stages. Needs the meta-net weight bundle + the
+ // per-tensor scalar arrays this generic fused_step ABI cannot carry, so it is a
+ // PARALLEL entry (fused_step + the 28 byte-identical cells are UNTOUCHED).
+ m.def("sg2_fused_step", &sg::sg2_fused_step,
+ "SuperGrok2 L3-TC fused train step (decoder/vit): in-kernel segmented sort + "
+ "SAM 2nd backward + full CSA/HCA/PEER/GRU meta-net as the optimizer phase. "
+ "Writes the reduced grad into `grad` and the loss into state[3*total].",
+ py::arg("model"), py::arg("params"), py::arg("input"), py::arg("grad"),
+ py::arg("state"),
+ py::arg("input_proj_W"), py::arg("input_proj_b"),
+ py::arg("csa_q_W"), py::arg("csa_k_W"), py::arg("csa_v_W"), py::arg("csa_out_W"),
+ py::arg("csa_compress_w"), py::arg("csa_idx_DQ"), py::arg("csa_idx_K"),
+ py::arg("hca_q_W"), py::arg("hca_k_W"), py::arg("hca_v_W"), py::arg("hca_out_W"),
+ py::arg("gru_Wz"), py::arg("gru_bz"), py::arg("gru_Wr"), py::arg("gru_br"),
+ py::arg("gru_Wh"), py::arg("gru_bh"),
+ py::arg("peer_query_Ws"), py::arg("prod_keys_A"), py::arg("prod_keys_B"),
+ py::arg("expert_W1"), py::arg("expert_b1"), py::arg("expert_W2"), py::arg("expert_b2"),
+ py::arg("sc_alpha"), py::arg("sc_gru_decay"), py::arg("sc_lamb_eff"),
+ py::arg("sc_beta1"), py::arg("sc_bc1"), py::arg("sc_bc2"),
+ py::arg("rescale"), py::arg("beta2"), py::arg("lr"), py::arg("wd"), py::arg("eps"),
+ py::arg("rho"), py::arg("sam_on"), py::arg("step"));
+
  // GrokAdamW
  m.def("grokadamw_step", &sg::grokadamw_step);
  m.def("grokadamw_clip_step", &sg::grokadamw_clip_step);
