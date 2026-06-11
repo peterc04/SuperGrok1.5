@@ -112,7 +112,13 @@ cudaError_t mega_vit_real_adamw_tc(
     st.s_track         = extra_slice;            // Prodigy `s` (per-element accumulator)
     st.param_init      = loss_out + 1;           // state + 3*total + 1
     st.prodigy_persist = loss_out + 1 + total;   // [r_ema | s_ema | d_lr]
-    apply_scalars(st, scalars);   // FULL scalar set (+ d0/d_coef/beta3 for Prodigy)
+    // LookSAM (MODEL-COUPLED SAM 2nd backward) — the ViT twin of the decoder TC
+    // launcher's sam_dir binding. sam_dir is the PERSISTENT cached SAM direction
+    // (g_sam − g), carried across steps in the `extra` slice (aliases the grokfast EMA /
+    // Prodigy s_track slot — harmless: LookSAM has none of those). The in-kernel P2.4
+    // phase WRITES it on SAM steps (st.looksam_sam!=0); the apply tail READS it every step.
+    st.sam_dir         = extra_slice;            // [total] cached SAM direction
+    apply_scalars(st, scalars);   // FULL scalar set (+ d0/d_coef/beta3 + rho/looksam_sam)
     st.lr = lr;
 
     ViTInputCtx in;
@@ -153,6 +159,17 @@ cudaError_t mega_vit_real_adamw_tc(
             // Muon momentum; the 1D/non-2D weights take the AdamW tail in P3 (reading
             // st.exp_avg/exp_avg_sq). The per-matrix NS scratch lives in the workspace.
             return launch_fused_vit_megakernel_tc<OptId::Muon>(
+                ctx, params, in, grad, lr, step, st, stream, nCTA);
+        case OptId::LookSAM:
+            // MODEL-COUPLED SAM 2nd backward (vit SAM-tier lane): the SAME single
+            // persistent launch — the perturb→2nd in-kernel fwd+bwd→sam_dir=g_sam−g is
+            // an IN-KERNEL phase (P2.4, between B2 and P2.5/P3), gated to every-k SAM
+            // steps by st.looksam_sam. The transient backup + g_sam buffers live in the
+            // workspace (vit_tc_looksam_floats, carved after the Muon scratch); sam_dir
+            // persists in the extra slice (st.sam_dir, bound above). The apply tail (P3)
+            // blends g_adj=(1−α)g+α·sam_dir and runs AdamW. NOT a separate launch. The
+            // decoder twin (mega_decoder_real_adamw_tc_launcher.cu) proved this routing.
+            return launch_fused_vit_megakernel_tc<OptId::LookSAM>(
                 ctx, params, in, grad, lr, step, st, stream, nCTA);
         default:
             return cudaErrorInvalidValue;

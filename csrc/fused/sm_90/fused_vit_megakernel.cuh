@@ -379,6 +379,21 @@ __host__ __device__ __forceinline__ int64_t vit_tc_muon_floats(int nCTA) {
          + (int64_t)kVitMuonMaxRows * kVitMuonMaxRows
          + nCTA + 1;
 }
+// ── LookSAM (STAGED in-kernel SAM 2nd backward) transient scratch — the ViT twin of
+//    the decoder's dec_tc_looksam_floats (fused_decoder_megakernel.cuh). The SAM step
+//    perturbs p in place, runs a SECOND fwd+bwd at p', and needs (a) a param BACKUP for
+//    the exact restore (eager clones p before perturbing; an fp32 add is not bit-
+//    reversible, so save — don't subtract back) + (b) a SEPARATE g_sam grad buffer so
+//    the 2nd backward does NOT clobber the first grad `grad` (sam_dir = g_sam − grad
+//    reads both). Both are total-sized + transient (NOT persistent state — sam_dir
+//    itself persists in the `extra` state slice, bound by the cell). Carved
+//    UNCONDITIONALLY (≈ 2·kVitTotalElems ≈ 3.3 MB) so the opt-agnostic launcher fits
+//    every OptId; unused by every non-LookSAM cell (its P2.4 phase is if-constexpr'd
+//    out → byte-identical). The ‖g‖ reduction reuses the loss workspace (sq_part/ron_bc,
+//    as GrokAdamW's P2.5 / the decoder twin do), so no extra here. ──
+__host__ __device__ __forceinline__ int64_t vit_tc_looksam_floats() {
+    return (int64_t)2 * kVitTotalElems;       // [sam_backup | sam_grad]
+}
 __host__ __device__ __forceinline__ int64_t vit_tc_workspace_floats(int T, int B, int nCTA) {
     return vit_tc_acts_floats(T, B)
          + (int64_t)nCTA * vittc::vit_tile_scratch_total_f32()
@@ -386,7 +401,8 @@ __host__ __device__ __forceinline__ int64_t vit_tc_workspace_floats(int T, int B
          + nCTA + 1
          + vit_tc_dw_part_floats()           // split-K dW partials (G>1)
          + vit_tc_opt_reduce_floats(nCTA)    // STAGED-opt (Prodigy) reduce slots
-         + vit_tc_muon_floats(nCTA);         // STAGED-opt (Muon) NS per-matrix scratch
+         + vit_tc_muon_floats(nCTA)          // STAGED-opt (Muon) NS per-matrix scratch
+         + vit_tc_looksam_floats();          // STAGED-opt (LookSAM) SAM 2nd-bwd scratch
 }
 
 #ifdef SG_VIT_PROFILE
@@ -436,6 +452,12 @@ fused_vit_megakernel_tc(PersistentContext ctx,
     //   [muon_X | muon_AX | muon_AAX | muon_orth] (each kVitMuonMaxNumel)
     //   [muon_A (kVitMuonMaxRows²)] [nrm_partials (nCTA)] [inv_norm (1)]
     float* muon_base = opt_reduce + vit_tc_opt_reduce_floats(nCTA);
+    // LookSAM SAM 2nd-backward scratch, carved AFTER the Muon scratch (term order
+    // matches vit_tc_workspace_floats — carving it LAST keeps every prior region's
+    // offset unchanged, so the already-green cells are byte-identical). Layout:
+    //   [sam_backup (total)] [sam_grad (total)]. Unused unless Opt==LookSAM.
+    float* sam_backup = muon_base + vit_tc_muon_floats(nCTA);
+    float* sam_grad   = sam_backup + kVitTotalElems;
 
     vittc::VitActs acts = vittc::vit_acts_bind(acts_base, T, B);
     vittc::VitTileScratch sc = vittc::vit_tile_scratch_bind(scratch_base + (int64_t)cta * scratch_per);
@@ -548,6 +570,131 @@ fused_vit_megakernel_tc(PersistentContext ctx,
     if (threadIdx.x == 0) { unsigned long long _gab = clock64(); atomicMax(&g_vit_prof_max[4], _gab - _gaa); }
 #endif
     bar.sync_reset(ctx.g_next_task);   // B2: reduced grad ready; reset queue
+
+    // ── P2.4 (LookSAM ONLY, SAM steps): the MODEL-COUPLED SAM 2nd backward that
+    //    produces st.sam_dir = g_sam − g (INTEGRATION-OPTSTAGES §6). PORT of the
+    //    decoder twin's P2.4 (fused_decoder_megakernel.cuh) onto the ViT tile fns.
+    //    Eager LookSAM, every k steps (looksam.py sam_step + looksam.h):
+    //      ‖g‖     = GLOBAL L2 norm over ALL reduced grads; rho_over_norm = rho/‖g‖
+    //      p'      = p + rho_over_norm·g          (perturb in the grad direction;
+    //                backup = p.clone() for the exact restore — fp32 add is not
+    //                bit-reversible, so we MUST save, not subtract back)
+    //      g_sam   = ∇L(p')                       (a FULL SECOND in-kernel fwd+bwd +
+    //                deterministic grad assembly at the perturbed weights, written to
+    //                the SEPARATE `sam_grad` buffer so `grad` (the first grad the apply
+    //                tail blends from) is untouched)
+    //      sam_dir = g_sam − g                    (cached in the PERSISTENT `extra`
+    //                state slice == st.sam_dir; reused verbatim on the k−1 intervening
+    //                steps where looksam_sam==0, so NO 2nd pass runs then)
+    //      restore p = backup
+    //    The apply tail (P3, apply_optimizer<LookSAM>) then blends g_adj=(1−α)g+α·
+    //    sam_dir and runs AdamW — UNCHANGED. DETERMINISM: the ‖g‖ reduction is the
+    //    IDENTICAL deterministic ascending-CTA shape as GrokAdamW's P2.5 (fixed
+    //    contiguous per-CTA range → per-CTA partial → CTA0 ascending sum), and the
+    //    2nd fwd+bwd+assembly reuses the SAME A/A/A-clean machinery as the first pass
+    //    (fixed tile ownership, ascending-k reductions), so the whole phase is
+    //    deterministic BY CONSTRUCTION. Guarded so every other opt's path is byte-
+    //    identical (no extra barrier / work). On a NON-SAM step (looksam_sam==0) this
+    //    whole block is skipped — st.sam_dir already holds the cached direction.
+    if constexpr (Opt == OptId::LookSAM) {
+        if (st.looksam_sam != 0.0f) {
+            // (a) GLOBAL ‖g‖ over the reduced grad, deterministic (reuse the loss
+            //     workspace as P2.5 does: loss_part[nCTA] = per-CTA Σg², loss_out[1]
+            //     broadcasts rho_over_norm). The reduced loss is already in
+            //     *in.loss_out (host state), so this is free scratch.
+            float* sq_part = loss_part;          // [nCTA] per-CTA Σ g²  (ascending reduce)
+            float* ron_bc  = loss_out;           // [1] broadcast rho_over_norm
+            const int64_t total_e = kVitTotalElems;
+            {
+                const int64_t base = total_e / nCTA, rem = total_e % nCTA;
+                const int64_t e0 = (int64_t)cta * base + (cta < rem ? cta : rem);
+                const int64_t ecnt = base + (cta < rem ? 1 : 0);
+                float tsum = 0.0f;
+                for (int64_t i = threadIdx.x; i < ecnt; i += blockDim.x) {
+                    const float gv = grad[e0 + i];
+                    tsum += gv * gv;
+                }
+                float* red = sm.red;
+                red[threadIdx.x] = tsum;
+                __syncthreads();
+                for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+                    if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+                    __syncthreads();
+                }
+                if (threadIdx.x == 0) sq_part[cta] = red[0];
+                bar.sync();   // B2.4a: all per-CTA Σg² partials complete
+                if (cta == 0 && threadIdx.x == 0) {
+                    double ss = 0.0;
+                    for (int c = 0; c < nCTA; ++c) ss += (double)sq_part[c];
+                    const float gnorm = sqrtf((float)ss);
+                    // rho / ‖g‖ (matches bindings.cpp looksam_perturb_all). gnorm>0 in
+                    // any real training step; guard div-by-0 → 0 (no perturb) to be safe.
+                    *ron_bc = (gnorm > 0.0f) ? (st.rho / gnorm) : 0.0f;
+                }
+                bar.sync();   // B2.4b: rho_over_norm broadcast ready
+            }
+            const float rho_over_norm = *ron_bc;
+            // (b) Backup + perturb p in place: p' = p + rho_over_norm·g. Grid-strided
+            //     over the flat param vector (each element owned once → no race).
+            {
+                const int64_t gstride = (int64_t)blockDim.x * gridDim.x;
+                for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+                     i < total_e; i += gstride) {
+                    sam_backup[i] = params[i];
+                    params[i] = params[i] + rho_over_norm * grad[i];
+                }
+            }
+            bar.sync();   // B2.4c: all params perturbed before the 2nd forward reads them
+            // (c) SECOND fwd+bwd at the perturbed weights → g_sam in `sam_grad`. Mirror
+            //     P1 + P2 EXACTLY, but: re-zero the lnvec partials (they accumulate), do
+            //     NOT write the loss (keep the first-pass loss), and assemble into
+            //     `sam_grad` (NOT `grad`). `w` wraps `params` (now perturbed) so the tile
+            //     fns read the perturbed weights with no re-bind needed.
+            for (int i = threadIdx.x; i < vittc::kLnVecElems; i += blockDim.x) my_lnvec[i] = 0.0f;
+            bar.sync();   // B2.4d: lnvec partials cleared before the 2nd backward accumulates
+            for (int ti = cta; ti < n_tiles; ti += nCTA) {
+                const int g0 = ti * nrows_tile;
+                const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
+                vittc::vittc_forward_tile(w, g0, nrows, acts, sc, in.patches, in.targets,
+                                          sm.sA, sm.sB, sm.red);
+                vittc::vittc_backward_tile(w, g0, nrows, B, acts, sc, in.targets,
+                                           my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
+                __syncthreads();
+            }
+            bar.sync();   // B2.4e: all 2nd-pass acts (X + dY) + LN-vec partials complete
+            // Re-build the dW specs from the 2nd-pass acts (dY adjoints changed).
+            if (threadIdx.x == 0) vittc::vittc_build_dw_specs(acts, B, T, Tp, sm.spec);
+            __syncthreads();
+            vittc::VitDwSpec* spec2 = sm.spec;
+            const int n_dw2 = vittc::vittc_dw_total_tiles<SG_TUNED_TILE_N>(spec2);
+            if (kDwG > 1) {
+                for (int item = cta; item < n_dw2 * kDwG; item += nCTA) {
+                    const int gt = item / kDwG, kc = item % kDwG;
+                    vittc::vittc_dw_run_tile_splitk<SG_TUNED_TILE_N>(spec2, gt, kc, kDwG, acts.dh0, dw_part, sm.sA, sm.sB);
+                }
+                bar.sync();
+                vittc::vittc_dw_reduce_splitk<SG_TUNED_TILE_N>(spec2, n_dw2, kDwG, dw_part, sam_grad, cta, nCTA);
+            } else {
+                for (int gt = cta; gt < n_dw2; gt += nCTA)
+                    vittc::vittc_dw_run_tile<SG_TUNED_TILE_N>(spec2, gt, acts.dh0, sam_grad, sm.sA, sm.sB);
+            }
+            vittc::vittc_dw_biases(spec2, acts.dh0, sam_grad, cta, nCTA);
+            vittc::vittc_clspos_owner_scan(acts, T, sam_grad, cta, nCTA);
+            vittc::vittc_lnvec_reduce(lnvec_base, sam_grad, nCTA, cta);
+            bar.sync();   // B2.4f: g_sam fully assembled in sam_grad
+            // (d) sam_dir = g_sam − g (into the persistent extra slice) + restore p.
+            {
+                const int64_t gstride = (int64_t)blockDim.x * gridDim.x;
+                for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+                     i < total_e; i += gstride) {
+                    // st.sam_dir is the extra-slice base (host-bound). g_sam − g.
+                    const_cast<float*>(st.sam_dir)[i] = sam_grad[i] - grad[i];
+                    params[i] = sam_backup[i];   // restore the ORIGINAL weights
+                }
+            }
+            bar.sync_reset(ctx.g_next_task);   // B2.4g: params restored + sam_dir ready; reset queue for P3
+        }
+    }
 
     // ── P2.5 (GrokAdamW ONLY): GLOBAL grad-norm clip coefficient. Identical to the
     //    decoder twin (fused_decoder_megakernel.cuh P2.5). Eager grokadamw clips the

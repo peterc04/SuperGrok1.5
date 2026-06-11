@@ -333,6 +333,16 @@ _CELLS = {
     #        (2) A/A/A proves the 2nd pass introduced no race.
     "looksam/decoder": dict(model="decoder", opt="looksam", factory=_looksam_factory,
                             sam_dir_tol=2e-2),
+    # looksam (vit — SAM-tier lane): CONVERTED. The IDENTICAL in-kernel P2.4 SAM 2nd
+    # backward ported onto the ViT TC kernel (fused_vit_megakernel.cuh): on the step-1
+    # SAM step it perturbs p'=p+(rho/‖g‖)·g, runs a FULL SECOND ViT fwd+bwd at p' →
+    # g_sam (via vittc_forward_tile/vittc_backward_tile + vittc_dw_*/clspos/lnvec into a
+    # SEPARATE sam_grad buffer), writes sam_dir=g_sam−g (persisted in `extra`), restores
+    # p. (1a/1b) parity + the sam_dir oracle use the ViT bf16-faithful oracle (gate (A),
+    # vit branch above); (2) A/A/A proves the 2nd pass introduced no race (vit's forward
+    # is deterministic — vit Prodigy/Muon are A/A/A-green, same fixed reductions).
+    "looksam/vit": dict(model="vit", opt="looksam", factory=_looksam_factory,
+                        sam_dir_tol=2e-2),
 }
 
 # BLOCKED cells — kept here (commented) with the state-gate evidence that blocks them,
@@ -483,7 +493,10 @@ def run_cell_gate(cell_key, verbose=True):
     if opt == "looksam":
         kstate0 = cache[canon]["state"]
         k_sam = kstate0[2 * total:3 * total]           # the kernel's cached sam_dir
-        # (A) bf16-faithful sam_dir reference (decoder oracle, perturbed by ron·g).
+        # (A) bf16-faithful sam_dir reference (per-model oracle, perturbed by ron·g).
+        #     The SAME bf16-faithful fp64 oracle each model's first-grad gate uses
+        #     (test_<model>_tc), run TWICE (at p and at p'=p+ron·g) → sam_dir_bf =
+        #     g_sam_bf − g_bf, compared to the kernel's sam_dir at the bf16 floor.
         if model == "decoder":
             from tests.hw.test_decoder_tc import _bf16_faithful_oracle
             B = int(tx.shape[0]); B16 = B - (B % 16)
@@ -503,10 +516,33 @@ def run_cell_gate(cell_key, verbose=True):
             _lo2, grads_o2 = _bf16_faithful_oracle(named_pert, tok_o, tgt_o)
             r_sam = torch.cat([(grads_o2[n_] - grads_o[n_]).reshape(-1).double()
                                for n_, _ in named_ref]).float().to(dev)
+        elif model == "vit":
+            # ViT bf16-faithful oracle (test_vit_tc._bf16_faithful_oracle): input is
+            # FLOAT image patches [B,16,49] (tx == data[0]), targets [B]. B16-truncate
+            # to match the kernel's B%16 batch (fused_train_step truncates the same way).
+            from tests.hw.test_vit_tc import _bf16_faithful_oracle as _vit_bf16_oracle
+            B = int(tx.shape[0]); B16 = B - (B % 16)
+            patches_o = tx[:B16].detach().cpu().double()
+            tgt_o = ty[:B16].detach().cpu().to(torch.long)
+            named_d = {n: p.detach().cpu() for n, p in named_ref}
+            _lo, grads_o = _vit_bf16_oracle(named_d, patches_o, tgt_o)
+            gn = torch.sqrt(sum((gv.double() ** 2).sum() for gv in grads_o.values())).item()
+            rho = float(opt_ref.param_groups[0]["rho"])
+            ron = rho / gn
+            # perturb each param by ron·g (g = the kernel's reduced grad, layout order).
+            off = 0; named_pert = {}
+            for n_, p in named_ref:
+                k = p.numel()
+                named_pert[n_] = (p.detach().cpu().double()
+                                  + ron * grad[off:off + k].reshape(p.shape).cpu().double())
+                off += k
+            _lo2, grads_o2 = _vit_bf16_oracle(named_pert, patches_o, tgt_o)
+            r_sam = torch.cat([(grads_o2[n_] - grads_o[n_]).reshape(-1).double()
+                               for n_, _ in named_ref]).float().to(dev)
         else:
             raise NotImplementedError(
                 f"{cell_key}: looksam sam_dir reference oracle not wired for {model} "
-                f"(only decoder's bf16-faithful oracle is available here).")
+                f"(only decoder/vit bf16-faithful oracles are available here).")
         sd_abs = (k_sam - r_sam).abs().max().item()
         sd_den = r_sam.abs().max().item() + 1e-30
         looksam_sam_dir_rel = sd_abs / sd_den

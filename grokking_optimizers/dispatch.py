@@ -865,6 +865,15 @@ _FUSED_L3_REAL = frozenset({
     # ascending shape; the 2nd fwd+bwd reuses the A/A/A-clean first-pass machinery → A/A/A by
     # construction. vit + mamba looksam follow (the same in-kernel phase ported per model).
     ("transformer_decoder", "looksam"),
+    # looksam (vit — SAM-tier lane): CONVERTED. The IDENTICAL in-kernel P2.4 SAM 2nd backward,
+    # ported onto the ViT TC kernel (fused_vit_megakernel.cuh): the ViT tile fns (vittc_forward_
+    # tile/vittc_backward_tile + vittc_dw_*/vittc_clspos_owner_scan/vittc_lnvec_reduce) run the
+    # 2nd fwd+bwd at p' into a SEPARATE sam_grad buffer; the transient backup+sam_grad live in
+    # vit_tc_workspace_floats (vit_tc_looksam_floats, after the Muon scratch — prior cells
+    # byte-identical). The vit launcher binds st.sam_dir to the extra slice + routes opt_id=4
+    # (case OptId::LookSAM). vit's forward is deterministic (vit Prodigy/Muon are A/A/A-green),
+    # so the SAM 2nd backward is A/A/A by construction (same fixed reductions as the decoder).
+    ("vit", "looksam"),
 })
 
 _FUSED_REGISTRY = {}
@@ -1351,6 +1360,12 @@ _L3_WGMMA_CELLS = frozenset({
     # input; WITH it → "wgmma", the real TC path. vit×looksam joins (the same in-kernel P2.4
     # phase ported to the vit TC kernel). mamba×looksam follows once the mamba phase lands.
     ("transformer_decoder", "looksam"),
+    # looksam (vit — SAM-tier lane): CONVERTED. The IDENTICAL in-kernel P2.4 SAM 2nd backward
+    # on the ViT TC kernel (fused_vit_megakernel.cuh); opt_id=4 routes it onto the vit TC driver
+    # (wgmma_tail_opt_id("looksam")=4 → case OptId::LookSAM in the vit launcher). WITHOUT this
+    # entry gemm_impl_for_cell returns "scalar" → the scalar adamw-only vit path → throws; WITH
+    # it → "wgmma", the real TC path. mamba×looksam follows once the mamba phase lands.
+    ("vit", "looksam"),
 })
 
 
