@@ -40,9 +40,20 @@ only composition seam.
    dispatch.
 
 ## Phase status
-- Phase 1 (in flight): real decoder fwd+bwd stages, validated vs eager — lands
-  in `model_stages.cuh`, then is split per-model per this contract.
-- Phase 2: vit + mamba3 stage headers (built against this contract natively).
+
+> **Boundary (per `HARDWARE_VALIDATION.md` §2, 2026-06-09):** the L3 fused
+> model×optimizer megacells are **compile-verified only** on sm_90 — the
+> on-silicon H100 race exercises the eager model + fused-*optimizer* (L1) path,
+> not the L3 megakernel, so "validated vs eager" below remains the open gate for
+> every phase. No phase is silicon-complete.
+
+- Phase 1 (in flight): real decoder fwd+bwd stages. The per-model split has
+  landed (`model_stage_decoder*.cuh` + `fused_decoder_megakernel.cuh` exist per
+  this contract); the **validated-vs-eager** gate is still open — these stages
+  are compile-verified only (§2), not yet runtime/numeric-checked on silicon.
+- Phase 2: vit + mamba3 stage headers (`model_stage_{vit,mamba3}*.cuh` +
+  `fused_{vit,mamba}_megakernel.cuh` present, built against this contract
+  natively); same compile-verified-only boundary applies.
 - Phase 3: optimizer precompute stages in-kernel for the 9 non-trivial tails;
   SuperGrok2's CSA/HCA/PEER/GRU meta as in-kernel stages (the full
   "vit×sg2 in one binary").

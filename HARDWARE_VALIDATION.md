@@ -60,11 +60,18 @@ python -m tests.hw.test_reference_parity \
     --rtol 1e-3 --atol 1e-5
 ```
 
-### Cell status matrix (filled in as stages land; all 🟡 until silicon)
+### Cell status matrix (filled in as stages land; markers track the L3 fused cell)
+
+> **sm_90 L1 update (2026-06-09):** the per-op fused **optimizer** kernels these
+> cells reuse are now silicon-validated on a real H100 — numeric parity 11/0,
+> maximality 11/0, 8/11 grokking race (see §2). The markers below stay 🟡 because
+> each tracks the **L3 fused model×optimizer megacell** (fwd+bwd+opt in one
+> binary), which the race does not exercise and which remains compile-verified
+> only. The L1 optimizer-kernel path is no longer hw-deferred.
 
 | optimizer    | transformer | vit | mamba | notes |
 |--------------|:-----------:|:---:|:-----:|-------|
-| adamw        | 🟡 | 🟡 | 🟡 | elementwise math proven; kernel path hw-deferred |
+| adamw        | 🟡 | 🟡 | 🟡 | elementwise math proven; L1 opt-kernel silicon-validated (§2), L3 megacell hw-deferred |
 | lion         | 🟡 | 🟡 | 🟡 | |
 | grokfast     | 🟡 | 🟡 | 🟡 | |
 | grokadamw    | 🟡 | 🟡 | 🟡 | fused + Q3 quant path needs numeric check |
@@ -304,7 +311,7 @@ top-k-index path, so the adjoint correctly accumulates zero into those three
 buffers. Marked 🟡 only to flag for explicit on-device confirmation that the
 oracle indeed yields zero (rather than a surrogate) for those parameters.
 
-**Stage-1A correctness re-review (Opus 4.8, 2026-06-01) — `scripts/REVIEW_1A.md`.**
+**Stage-1A correctness re-review (Opus 4.8, 2026-06-01) — `docs/reviews/REVIEW_1A.md`.**
 The hand-written adjoint was re-verified by a line-by-line Python transcription
 of `supergrok2_bilevel_adjoint.h` compared against `torch.autograd.grad` through
 the real `forward_for_bilevel` (CPU fp32). **All 24 weight-grad buffers match
