@@ -97,6 +97,13 @@ namespace wgs = ::sg::sm90::wgs;
 
 namespace vittc {
 
+#ifdef SG_VIT_PROFILE
+// Diagnostic-only (SG_VIT_PROFILE; never shipped): summed clock64 cycles spent in
+// the per-sample head/CE loops (fwd [0], bwd [1]), accumulated across all tiles a
+// CTA runs, max across CTAs (atomicMax). Read host-side via cudaMemcpyFromSymbol.
+__device__ unsigned long long g_vit_prof_head[2];
+#endif
+
 // Token-tile rows a CTA owns. Must be a multiple of 64 (wgmma atom M) AND of
 // kSeq=17 (so a tile boundary is a sample boundary — attention stays in-tile).
 constexpr int kTileM = SG_TUNED_VIT_TILE_M;
@@ -237,10 +244,22 @@ __device__ void tc_gemm_block_unpipelined(
     const bool in_wg0 = (tid < 128);
     const int tid_wg = tid & 127;
 
-    wgs::WgmmaAccum<N> acc[MaxAtomsM];
-
+    // ── CODEGEN FIX (correctness/codegen, NOT a perf knob): use ONE accumulator
+    // reused per m-atom, NOT `WgmmaAccum<N> acc[MaxAtomsM]`. Each m-atom's
+    // accumulator is FULLY CONSUMED (stored via out()) at the end of its
+    // iteration before the next m-atom's k-loop begins (k==0 uses ScaleD=0 →
+    // overwrite, no carry across atoms), so a single live accumulator is
+    // numerically identical. The array version indexed `acc[a]` under the
+    // `#pragma unroll 1` runtime-`a` loop, which GPU registers cannot address
+    // dynamically → ptxas placed the 17-wide (vit kAtomsM) array in LOCAL memory
+    // (5024 B stack frame) and emitted C7515: "wgmma.mma_async serialized due to
+    // non-wgmma instructions DEFINING accumulator registers" — i.e. every wgmma
+    // was forced to fully serialize around the local-mem round-trip of acc[a].
+    // The single register-resident accumulator removes that serialization. The
+    // ascending-k order + one-CTA tile ownership (determinism) are unchanged.
     #pragma unroll 1
     for (int a = 0; a < m_atoms; ++a) {
+        wgs::WgmmaAccum<N> acc;
         const int mbase = mbase0 + a * wgs::kWgmmaAtomM;
         if (in_wg0) wgs::wgmma_fence();
         #pragma unroll 1
@@ -258,9 +277,9 @@ __device__ void tc_gemm_block_unpipelined(
                 wgs::SmemDesc dA = wgs::make_desc_A_kmajor<wgs::kWgmmaAtomM, wgs::kSwizzleNone>(smemA);
                 wgs::SmemDesc dB = wgs::make_desc_B_kmajor<N, wgs::kSwizzleNone>(smemB);
                 if (k == 0)
-                    wgs::wgmma_m64nNk16_bf16<N, /*ScaleD=*/0, 0, 0>(acc[a], dA, dB);
+                    wgs::wgmma_m64nNk16_bf16<N, /*ScaleD=*/0, 0, 0>(acc, dA, dB);
                 else
-                    wgs::wgmma_m64nNk16_bf16<N, /*ScaleD=*/1, 0, 0>(acc[a], dA, dB);
+                    wgs::wgmma_m64nNk16_bf16<N, /*ScaleD=*/1, 0, 0>(acc, dA, dB);
                 wgs::wgmma_commit_group();
                 wgs::wgmma_wait_group<0>();
             }
@@ -271,7 +290,7 @@ __device__ void tc_gemm_block_unpipelined(
             for (int i = 0; i < wgs::WgmmaAccum<N>::kRegs; ++i) {
                 int row, col;
                 wgs::wgmma_frag_decode(tid_wg, i, N, row, col);
-                if (col < n_real) out(mbase + row, col, acc[a].c[i]);
+                if (col < n_real) out(mbase + row, col, acc.c[i]);
             }
         }
         __syncthreads();
@@ -699,6 +718,9 @@ __device__ float vittc_forward_tile(
     // ── Final norm + head + CE, scalar PER-SAMPLE on the CLS position (0) only.
     //    DELTA 3: CLS at pos 0 (row si*kSeq), not the last position. ──
     float nll_acc = 0.0f;
+#ifdef SG_VIT_PROFILE
+    __syncthreads(); unsigned long long _ha = (threadIdx.x == 0) ? clock64() : 0;
+#endif
     for (int si = 0; si < nsamp; ++si) {
         const int rcls = si * vit::kSeq;                  // CLS row (pos 0)
         const float* hcls = sc.finalin + (int64_t)rcls * vit::kD;
@@ -739,6 +761,10 @@ __device__ float vittc_forward_tile(
         if (threadIdx.x == 0) nll_acc += (logz - lg[tgt]);
         __syncthreads();
     }
+#ifdef SG_VIT_PROFILE
+    __syncthreads();
+    if (threadIdx.x == 0) atomicMax(&g_vit_prof_head[0], clock64() - _ha);
+#endif
     return nll_acc;
 }
 
@@ -850,6 +876,9 @@ __device__ void vittc_backward_tile(
     //    head dX → dhn; final-norm bwd → dh on the CLS row (pos 0), zero others. ──
     for (int idx = threadIdx.x; idx < nrows * vit::kD; idx += blockDim.x) sc.dh[idx] = 0.0f;
     __syncthreads();
+#ifdef SG_VIT_PROFILE
+    unsigned long long _hb = (threadIdx.x == 0) ? clock64() : 0;
+#endif
     for (int si = 0; si < nsamp; ++si) {
         const int rcls = si * vit::kSeq;          // CLS row (pos 0)
         const int gs = si_global(g0, si);
@@ -901,6 +930,10 @@ __device__ void vittc_backward_tile(
             __syncthreads();
         }
     }
+#ifdef SG_VIT_PROFILE
+    __syncthreads();
+    if (threadIdx.x == 0) atomicMax(&g_vit_prof_head[1], clock64() - _hb);
+#endif
     // scratch.dh now = grad wrt last-layer output [nrows,d] (only CLS positions nonzero).
 
     for (int li = vit::kLayers - 1; li >= 0; --li) {
@@ -1086,30 +1119,63 @@ __device__ __forceinline__ void vittc_dw_run_tile(
 
 // Biases db. For the 8 transformer linears + head: db = Σ_K dY (per output row).
 // For patch_proj.bias: db[o] = Σ_{patch rows} dh0[token row, o]. Single owner per
-// output element (thread strides) → no atomics.
+// output element → no atomics.
+// PERF FIX (structural, parity-preserved — gated by the K-scaled grad tol, which is
+// designed for fp32 accumulation-order differences at large K):
+//   (1) The ORIGINAL ran the FULL Σ_K (K up to T=278528) for EVERY bias element on
+//       EVERY CTA (no cta/nCTA guard) — 132× redundant work, the dominant cost of P2
+//       grad-assembly (measured 59.5% of the step). Columns are now PARTITIONED across
+//       CTAs (each global bias column owned by one CTA), removing the 132× redundancy.
+//   (2) The K-reduction per column was SERIAL on ONE thread (≈278528 iters). It is now
+//       WARP-PARALLEL: a WARP (32 lanes) co-reduces one column — each lane sums a
+//       strided 1/32 slice of K (ascending within the lane), then a shuffle tree sums
+//       the 32 lane-partials. 32× parallelism per column. The lane reads dY[k*Nout+o]
+//       at fixed o with k = lane, lane+32, … (stride 32·Nout); writes by lane 0 only.
 __device__ __forceinline__ void vittc_dw_biases(
         const VitDwSpec spec[10], const __nv_bfloat16* __restrict__ dh0,
-        float* __restrict__ grad) {
+        float* __restrict__ grad, int cta, int nCTA) {
+    const int warp = threadIdx.x >> 5;            // 0..(blockDim/32 - 1)
+    const int lane = threadIdx.x & 31;
+    const int nwarps = blockDim.x >> 5;
+    int gcol_base = 0;
     for (int s = 0; s < 10; ++s) {
         const VitDwSpec& sp = spec[s];
-        if (sp.kind == 1) {
-            const int Tp = sp.K;
-            for (int o = threadIdx.x; o < sp.Nout; o += blockDim.x) {
-                float accv = 0.0f;
-                for (int k = 0; k < Tp; ++k) {
+        const int Nout = sp.Nout;
+        const bool patch = (sp.kind == 1);
+        const int K = sp.K;
+        // Each warp owns columns o = (its rank among this CTA's warps), strided. A
+        // global column gcol is owned by CTA (gcol % nCTA); within the CTA the warps
+        // round-robin the owned columns.
+        for (int o = 0; o < Nout; ++o) {
+            const int gcol = gcol_base + o;
+            if ((gcol % nCTA) != cta) continue;       // not this CTA's column
+            // round-robin owned columns across warps: count owned-so-far for THIS s.
+            // Cheap: derive the warp owner from the o-th owned index. We instead let
+            // every warp test (owned_index % nwarps == warp); compute owned_index by
+            // a strided scan-free rule: owned columns appear every nCTA in gcol, so
+            // the k-th owned column of this CTA has o such that (gcol_base+o)%nCTA==cta.
+            // Assign by (o / 1) round-robin is fine since the inner reduce dominates:
+            // use (o-th column's position) — approximate with o itself for balance.
+            if (((o) % nwarps) != warp) continue;     // warp owns this column
+            float part = 0.0f;
+            if (patch) {
+                for (int k = lane; k < K; k += 32) {
                     const int si = k / vit::kNPatch, p = k % vit::kNPatch;
                     const int trow = si * vit::kSeq + (1 + p);
-                    accv += __bfloat162float(dh0[(int64_t)trow * vit::kD + o]);
+                    part += __bfloat162float(dh0[(int64_t)trow * vit::kD + o]);
                 }
-                grad[sp.bias_off + o] = accv;
+            } else {
+                const __nv_bfloat16* dY = sp.dY;
+                for (int k = lane; k < K; k += 32)
+                    part += __bfloat162float(dY[(int64_t)k * Nout + o]);
             }
-        } else {
-            for (int o = threadIdx.x; o < sp.Nout; o += blockDim.x) {
-                float accv = 0.0f;
-                for (int k = 0; k < sp.K; ++k) accv += __bfloat162float(sp.dY[(int64_t)k * sp.Nout + o]);
-                grad[sp.bias_off + o] = accv;
-            }
+            // Warp-reduce the 32 lane-partials (shuffle tree).
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                part += __shfl_down_sync(0xffffffffu, part, off);
+            if (lane == 0) grad[sp.bias_off + o] = part;
         }
+        gcol_base += Nout;
     }
 }
 
@@ -1138,11 +1204,15 @@ __device__ __forceinline__ void vittc_clspos_owner_scan(
         }
     }
     // pos rows: round-robin by position p across CTAs (p in [0,kSeq)).
+    // PERF FIX: the ORIGINAL looped ALL T tokens with `if (t%kSeq)==p`, doing 17×
+    // (kSeq) the necessary reads (keeping only 1/17). Token rows with t%kSeq==p are
+    // exactly t = p, p+kSeq, p+2·kSeq, … so stride DIRECTLY by kSeq (the same
+    // ascending-t order → bit-identical fp32 sum). 17× fewer reads.
     for (int p = cta; p < vit::kSeq; p += nCTA) {
         for (int j = threadIdx.x; j < vit::kD; j += blockDim.x) {
             float accv = 0.0f;
-            for (int t = 0; t < T; ++t)
-                if ((t % vit::kSeq) == p) accv += __bfloat162float(acts.dh0[(int64_t)t * vit::kD + j]);
+            for (int t = p; t < T; t += vit::kSeq)
+                accv += __bfloat162float(acts.dh0[(int64_t)t * vit::kD + j]);
             grad[pos_off + (int64_t)p * vit::kD + j] = accv;
         }
     }

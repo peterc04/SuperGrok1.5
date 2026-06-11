@@ -306,8 +306,11 @@ cudaError_t launch_fused_decoder_megakernel(
 //    stack: keeps the launch's local-memory reservation small so the persistent
 //    kernel places on a memory-tight GPU). ──
 struct DecTcSmem {
-    __nv_bfloat16 sA[64 * 16];
-    __nv_bfloat16 sB[SG_TUNED_TILE_N * 16];
+    // kDecTcStages A(64×16) + kDecTcStages B(N×16) bf16 tiles — the GEMM K-loop
+    // double-buffer ring (slot s at sA + s*64*16 / sB + s*N*16). At S=2 + N=128
+    // the ring is 2·(2KB+4KB)=12KB; DecTcSmem total ~13.5KB ≪ the 48KB static cap.
+    __nv_bfloat16 sA[dectc::kDecTcStages * 64 * 16];
+    __nv_bfloat16 sB[dectc::kDecTcStages * SG_TUNED_TILE_N * 16];
     float red[256];
     dectc::DecDwSpec spec[9];
 };
@@ -329,11 +332,16 @@ __host__ __device__ __forceinline__ int64_t dec_tc_acts_floats(int T, int B) {
     bf += (int64_t)B * d + (int64_t)B * V + Td;     // X_hn + dY_logits + dh0
     return (bf + 1) / 2;
 }
+// dW split-K partial floats (0 when G==1 → no extra scratch, single-CTA path).
+__host__ __device__ __forceinline__ int64_t dec_tc_dw_part_floats() {
+    return (dectc::kDecDwSplitK > 1) ? dectc::dec_dw_part_floats(dectc::kDecDwSplitK) : 0;
+}
 __host__ __device__ __forceinline__ int64_t dec_tc_workspace_floats(int T, int B, int nCTA) {
     return dec_tc_acts_floats(T, B)
          + (int64_t)nCTA * dectc::dec_tile_scratch_total_f32()
          + (int64_t)nCTA * dectc::kLnVecElems
-         + nCTA + 1;
+         + nCTA + 1
+         + dec_tc_dw_part_floats();          // split-K dW partials (G>1)
 }
 
 template <OptId Opt>
@@ -359,6 +367,10 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     float* lnvec_base = scratch_base + (int64_t)nCTA * scratch_per;
     float* loss_part  = lnvec_base + (int64_t)nCTA * dectc::kLnVecElems;
     float* loss_out   = loss_part + nCTA;
+    // Split-K dW partials (G>1): the (gt,kc) 64×N partial tiles, carved AFTER the
+    // loss slot (matches dec_tc_workspace_floats's term order). G==1 → dw_part unused.
+    float* dw_part    = loss_out + 1;
+    const int kDwG    = dectc::kDecDwSplitK;
 
     dectc::DecActs acts = dectc::dec_acts_bind(acts_base, T, B);
     dectc::DecTileScratch sc = dectc::dec_tile_scratch_bind(scratch_base + (int64_t)cta * scratch_per);
@@ -400,8 +412,19 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     __syncthreads();
     dectc::DecDwSpec* spec = sm.spec;
     const int n_dw = dectc::dectc_dw_total_tiles<SG_TUNED_TILE_N>(spec);
-    for (int gt = cta; gt < n_dw; gt += nCTA)
-        dectc::dectc_dw_run_tile<SG_TUNED_TILE_N>(spec, gt, grad, sm.sA, sm.sB);
+    if (kDwG > 1) {
+        // SPLIT-K (multi-CTA tiling): fan (n_dw·G) (tile,chunk) partials over the
+        // grid so the ~62% idle SMs do work; deterministic ascending-chunk reduce.
+        for (int item = cta; item < n_dw * kDwG; item += nCTA) {
+            const int gt = item / kDwG, kc = item % kDwG;
+            dectc::dectc_dw_run_tile_splitk<SG_TUNED_TILE_N>(spec, gt, kc, kDwG, dw_part, sm.sA, sm.sB);
+        }
+        bar.sync();   // all (gt,kc) partials complete before the reduce reads them
+        dectc::dectc_dw_reduce_splitk<SG_TUNED_TILE_N>(spec, n_dw, kDwG, dw_part, grad, cta, nCTA);
+    } else {
+        for (int gt = cta; gt < n_dw; gt += nCTA)
+            dectc::dectc_dw_run_tile<SG_TUNED_TILE_N>(spec, gt, grad, sm.sA, sm.sB);
+    }
     dectc::dectc_dw_biases(spec, grad);
     dectc::dectc_embed_owner_scan(acts, tok.tokens, T, grad, cta, nCTA);
     dectc::dectc_lnvec_reduce(lnvec_base, grad, nCTA, cta);
@@ -414,7 +437,61 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
     (void)loss_out;
     bar.sync_reset(ctx.g_next_task);   // B2: reduced grad ready; reset queue
 
-    // ── P3: scalar optimizer tail over the reduced grad (REUSED verbatim). ──
+    // ── P2.5 (GrokAdamW ONLY): GLOBAL grad-norm clip coefficient. Eager
+    //    grokadamw clips the WHOLE grad set to grad_clip via a GLOBAL L2 norm
+    //    (clip_grad_norms_device_side → total_norm = sqrt(Σ_i ‖g_i‖²),
+    //    clip_coef = grad_clip/(total_norm+1e-6) when total_norm>grad_clip,
+    //    else 1) BEFORE the apply. We replicate it on the REDUCED grad with a
+    //    deterministic ascending reduction (no float atomics): each CTA sums a
+    //    contiguous element-range into a per-CTA partial slot, CTA0 sums the
+    //    partials in ascending CTA order → total_norm → clip_coef, broadcast via
+    //    a workspace slot. The grad buffer is NOT mutated (the return_grad oracle
+    //    + the eager-side clip must both see the unclipped reduced grad); the
+    //    coefficient is applied per-element inside apply_optimizer<GrokAdamW>.
+    //    Guarded so every other opt's P3 is byte-identical (no extra barrier/work).
+    if constexpr (Opt == OptId::GrokAdamW) {
+        // Reuse the (now-consumed) loss workspace: loss_part[nCTA] holds per-CTA
+        // partial sum-of-squares; loss_out (1 float) broadcasts clip_coef. The
+        // reduced loss is already in *tok.loss_out (state), so this is free scratch.
+        float* sq_part = loss_part;          // [nCTA] per-CTA Σ g²  (ascending reduce)
+        float* coef_bc = loss_out;           // [1] broadcast clip_coef
+        // Per-CTA contiguous element range over `grad` (the reduced grad, [total]).
+        const int64_t total = kDecTotalElems;
+        const int64_t base = total / nCTA, rem = total % nCTA;
+        const int64_t e0 = (int64_t)cta * base + (cta < rem ? cta : rem);
+        const int64_t ecnt = base + (cta < rem ? 1 : 0);
+        // Thread-local partial → block reduce (fixed tree) → thread0 writes the slot.
+        float tsum = 0.0f;
+        for (int64_t i = threadIdx.x; i < ecnt; i += blockDim.x) {
+            const float gv = grad[e0 + i];
+            tsum += gv * gv;
+        }
+        // Block reduction via the smem the TC GEMM already owns (sm.red, fp32).
+        float* red = sm.red;
+        red[threadIdx.x] = tsum;
+        __syncthreads();
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) sq_part[cta] = red[0];
+        bar.sync();   // B2.5a: all per-CTA sum-of-squares partials complete
+        // CTA0 ascending-order reduce → total_norm → clip_coef (deterministic).
+        if (cta == 0 && threadIdx.x == 0) {
+            double ss = 0.0;
+            for (int c = 0; c < nCTA; ++c) ss += (double)sq_part[c];
+            const float total_norm = sqrtf((float)ss);
+            float coef = 1.0f;
+            if (st.grad_clip > 0.0f && total_norm > st.grad_clip)
+                coef = st.grad_clip / (total_norm + 1e-6f);
+            *coef_bc = coef;
+        }
+        bar.sync();   // B2.5b: clip_coef broadcast slot ready for all CTAs
+        st.clip_coef = *coef_bc;   // every CTA reads the single global coefficient
+    }
+
+    // ── P3: the REAL optimizer tail over the reduced grad (work-steal the 30
+    //    tensors). apply_optimizer<Opt> is the canonical csrc/algorithms math. ──
     st.lr = lr;
     {
         __shared__ int task_slot;
@@ -423,7 +500,18 @@ fused_decoder_megakernel_tc(PersistentContext ctx,
              t = q.next_block(&task_slot)) {
             const int n = kDecSizes[t];
             const int64_t off = (int64_t)kDecOffsets[t];
-            const FusedOptState ts = rebase_state<Opt>(st, off);
+            FusedOptState ts = rebase_state<Opt>(st, off);
+            // (i) PER-TENSOR LAYER-WISE β1 (GrokAdamW only): β1_i = β1·(1-γ)^t,
+            //     t == the tensor's flat named_parameters() layer index (the
+            //     work-steal task id maps 1:1 to kDecOffsets order == the eager
+            //     enumeration order, so t IS the eager layer index). bc1 must be
+            //     rebased TOO (= 1-β1_i^step) or m_hat=m/bc1 mismatches eager
+            //     (~9.6× on the deepest layer); bc2 stays global (β2 not layer-wise).
+            if constexpr (Opt == OptId::GrokAdamW) {
+                const float b1 = st.beta1 * powf(1.0f - st.gamma, (float)t);
+                ts.beta1 = b1;
+                ts.bc1   = 1.0f - powf(b1, (float)step);
+            }
             float* __restrict__ p = params + off;
             const float* __restrict__ gg = grad + off;
             for (int i = threadIdx.x; i < n; i += blockDim.x)
@@ -464,7 +552,11 @@ cudaError_t launch_fused_decoder_megakernel_tc(
     unsigned launch_ctas = (unsigned)n_sms;
     if (ncta_cap > 0 && (unsigned)ncta_cap < launch_ctas) launch_ctas = (unsigned)ncta_cap;
     ctx.n_ctas = launch_ctas;
-    // B%16 required (the dW K-loop contracts K=T=B*kSeq and K=B in 16-step atoms).
+    // B%16 required (the dW K-loop contracts K=T=B*kSeq and K=B in 16-step atoms,
+    // AND it guarantees full token tiles for the projections). NO G-divisibility
+    // guard: the split-K dW uses a FLOOR-BALANCED K-partition (dectc_dw_run_tile_
+    // splitk) that sums to KS exactly for any KS≥G, so it works at the production
+    // truncated B (e.g. 4176, where head KS=B/16=261 is NOT divisible by G=4).
     if ((tok.B % 16) != 0) return cudaErrorInvalidValue;
 
     if (ctx.g_arrived) { err = cudaMemsetAsync(ctx.g_arrived, 0, sizeof(unsigned), stream); if (err) return err; }

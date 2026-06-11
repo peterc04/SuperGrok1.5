@@ -110,6 +110,12 @@ struct FusedOptState {
     float lr = 1e-3f, beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f, wd = 0.01f;
     float bc1 = 1.0f, bc2 = 1.0f;       // un-inverted bias-corrections
     float alpha = 0.98f, beta = 0.0f, lamb = 2.0f, alpha_max = 1.0f;
+    // GrokAdamW (decoder L3-TC conversion): layer-wise β1 decay rate γ + global
+    // grad-norm clip threshold. clip_coef is DEVICE-computed once per launch (the
+    // global grad-norm reduction in P2.5) and stashed here; it passes through
+    // rebase_state unchanged (a scalar). Defaults are the inert no-op (γ=0 ⇒ a
+    // single global β1; grad_clip<=0 ⇒ no clip; clip_coef=1 ⇒ grad unscaled).
+    float gamma = 0.0f, grad_clip = 0.0f, clip_coef = 1.0f;
 };
 
 // =========================================================================
@@ -154,6 +160,11 @@ struct FusedScalars {
     float d_factor     = 1.0f;   // Prodigy adaptive d (effective LR scale)
     float neg_lr_scale = 0.0f;   // Muon: -lr * ns_scale (2D NS-orth apply)
     float decay_factor = 1.0f;   // Muon: 1 - lr*wd (decoupled decay multiplier)
+    // ── GrokAdamW append-only widening (decoder L3-TC conversion). Both default
+    //    to the INERT value (0.0 ⇒ disabled), so every other cell is byte-identical
+    //    (additive ABI, same contract as the original C2-gap widening above).
+    float gamma     = 0.0f;   // GrokAdamW layer-wise β1 decay rate: β1_i=β1*(1-γ)^i
+    float grad_clip = 0.0f;   // GrokAdamW global grad-norm clip (<=0 ⇒ no clip)
 };
 
 // Fold the runtime scalars into a FusedOptState (pointers are bound separately
@@ -177,6 +188,10 @@ __host__ __device__ __forceinline__ void apply_scalars(FusedOptState& st,
     st.d_factor     = s.d_factor;
     st.neg_lr_scale = s.neg_lr_scale;
     st.decay_factor = s.decay_factor;
+    st.gamma        = s.gamma;       // GrokAdamW layer-wise β1 decay rate
+    st.grad_clip    = s.grad_clip;   // GrokAdamW global grad-norm clip threshold
+    // st.clip_coef is NOT host-bound: the kernel computes it on-device (P2.5) from
+    // the reduced grad's global L2 norm and st.grad_clip, then applies it in P3.
 }
 
 // Dispatch to the REAL per-element optimizer step. Each branch is a genuine,
@@ -210,21 +225,55 @@ __device__ __forceinline__ void apply_optimizer(
             st.alpha, st.lamb, st.lr, st.beta1, st.beta2, st.eps, st.wd,
             st.bc1, st.bc2, idx);
     } else if constexpr (Opt == OptId::GrokAdamW) {
-        // COLD-START (same as Grokfast: eager GrokAdamW seeds ema=grad0 —
-        // grokadamw.py _group_cache). Seed ema=grad at step 1 so e_new collapses
-        // to g, matching eager. NOTE: this is necessary-but-NOT-sufficient for a
-        // faithful GrokAdamW conversion — eager ALSO applies (i) per-tensor
-        // layer-wise beta1 = beta1*(1-gamma)^layer and (ii) a per-tensor
-        // grad-norm clip to grad_clip (bindings.cpp clip_grad_norms_device_side)
-        // BEFORE this apply. Those two need a per-tensor scalar side-channel +
-        // a P3 norm reduction; until both land, GrokAdamW stays BLOCKED (not
-        // registered in _FUSED_L3_REAL). The cold-start is staged here so the
-        // remaining gap is exactly (i)+(ii).
-        if (step == 1) st.ema[idx] = grad[idx];
-        algo::grokadamw_step<float, float>(
-            params, st.exp_avg, st.exp_avg_sq, st.ema, grad,
-            st.alpha, st.lamb, st.lr, st.beta1, st.beta2, st.eps, st.wd,
-            st.bc1, st.bc2, idx);
+        // FAITHFUL GrokAdamW (decoder L3-TC conversion) — all THREE eager
+        // mechanisms now land, so the cell is no longer a hollow pass:
+        //
+        //  (i)  PER-TENSOR LAYER-WISE β1 = β1·(1-γ)^layer (grokadamw.py
+        //       _layer_beta1_by_id). The caller (the P3 work-steal loop, which
+        //       owns the tensor index t == the flat named_parameters() layer
+        //       index) has ALREADY rebased st.beta1 to β1_i AND st.bc1 to
+        //       1-β1_i^step for THIS tensor before calling us (see the
+        //       fused_decoder_megakernel P3 block, guarded by if constexpr
+        //       GrokAdamW). So st.beta1/st.bc1 here are the per-tensor values;
+        //       this branch just consumes them. bc2 stays global (β2 is not
+        //       layer-wise). This is the mechanism that fails the STATE gate at
+        //       step 1 if dropped (m-rel 0.895), so it is load-bearing.
+        //
+        //  (ii) GLOBAL GRAD-NORM CLIP to grad_clip (bindings.cpp
+        //       clip_grad_norms_device_side → a GLOBAL norm over ALL tensors,
+        //       one scalar clip_coef = grad_clip/(‖g‖₂+1e-6) applied to every
+        //       grad when ‖g‖₂ > grad_clip). The kernel computes ‖g‖₂ + clip_coef
+        //       ON-DEVICE in P2.5 (deterministic ascending-CTA reduction over the
+        //       reduced grad) and stashes st.clip_coef; we scale the grad by it
+        //       HERE. Eager clips IN-PLACE before the ema-seed AND the step, so we
+        //       use the SAME clipped grad for both. At step 1 ‖g‖₂≈0.72<1 ⇒
+        //       clip_coef=1 (inert), but it FIRES multi-step — the missing-clip
+        //       2e-4 divergence is what the multi-step parity check catches.
+        //
+        //  (iii) ADAPTIVE α = alpha_init·exp(-κ·signal): in-context this is a
+        //       genuine NO-OP. No race/gate path feeds (train_loss, val_loss) to
+        //       GrokAdamW.step(), so eager α stays at alpha_init for ALL steps =
+        //       the static st.alpha bound here. Faithful, not dropped (verified:
+        //       fused_train_step/fused_optimizer_step/race never pass losses).
+        //
+        // COLD-START: eager seeds ema=grad0 (clipped) — grokadamw.py _group_cache.
+        const float gc = grad[idx] * st.clip_coef;   // (ii) global-clipped grad
+        if (step == 1) st.ema[idx] = gc;              // cold-start on CLIPPED grad
+        // EMA filter + amplification (csrc/algorithms/grokadamw.h math), on gc.
+        const float ema_new = st.alpha * st.ema[idx] + (1.0f - st.alpha) * gc;
+        st.ema[idx] = ema_new;
+        const float g_amp = gc + st.lamb * ema_new;
+        // Adam moments + decoupled-WD apply: the canonical grokadamw_adam_tail
+        // (bit-identical to grokadamw_step's tail), driven by the per-tensor
+        // st.beta1/st.bc1 (i) and the un-inverted global st.bc2.
+        float m_out, v_out, p_out;
+        algo::grokadamw_adam_tail(
+            g_amp, params[idx], st.exp_avg[idx], st.exp_avg_sq[idx],
+            st.lr, st.beta1, st.beta2, st.eps, st.wd, st.bc1, st.bc2,
+            m_out, v_out, p_out);
+        st.exp_avg[idx]    = m_out;
+        st.exp_avg_sq[idx] = v_out;
+        params[idx]        = p_out;
     } else if constexpr (Opt == OptId::LookSAM) {
         algo::looksam_apply_step<float, float>(
             params, st.exp_avg, st.exp_avg_sq, st.sam_dir, grad,

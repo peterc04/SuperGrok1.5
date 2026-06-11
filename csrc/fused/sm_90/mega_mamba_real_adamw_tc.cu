@@ -48,10 +48,17 @@ struct TcScratch {
 
 static int tc_effective_nctas(const torch::Tensor& params, int ncta_cap) {
     int dev = params.get_device();
-    int n_sms = 1;
-    cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, dev);
-    int n = n_sms;
-    if (ncta_cap > 0 && ncta_cap < n) n = ncta_cap;
+    // Use the EXACT count the launcher will run (occ·n_sms with occupancy-fill) so
+    // the workspace (per-CTA scratch + partials = nCTA·slab) is sized for what runs.
+    // occ is register-capped uniform across OptIds by __launch_bounds__(256,2), so
+    // AdamW's count == every tail's count. Fall back to n_sms if the attr query fails.
+    int n = ::sg::fused::sm90::mb_tc_launched_nctas<::sg::fused::sm90::OptId::AdamW>(dev, ncta_cap);
+    if (n <= 0) {
+        int n_sms = 1;
+        cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, dev);
+        n = n_sms;
+        if (ncta_cap > 0 && ncta_cap < n) n = ncta_cap;
+    }
     return n;
 }
 

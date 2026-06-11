@@ -203,7 +203,11 @@ struct PersistentContext {
 namespace sm90 {
 struct FusedScalars {
  float lr, beta1, beta2, eps, wd, bc1, bc2, alpha, beta, lamb, alpha_max,
-       gate, d_factor, neg_lr_scale, decay_factor;
+       gate, d_factor, neg_lr_scale, decay_factor,
+       // GrokAdamW append-only widening (decoder L3-TC) — keep in lock-step with
+       // the real fused::sm90::FusedScalars (opt_components.cuh). Inert defaults
+       // (0.0) for every non-GrokAdamW caller; layout stays byte-identical.
+       gamma, grad_clip;
 };
 } // namespace sm90
 } // namespace fused
@@ -618,7 +622,13 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // back-compatible: an un-rebuilt _ops still accepts the old call shape, and a
  // stale _ops that predates this arg trips the caller's one-shot TypeError latch
  // (→ loud degrade to eager, never silent).
- const std::string& gemm_impl) {
+ const std::string& gemm_impl,
+ // GrokAdamW GLOBAL grad-norm clip threshold (decoder L3-TC, mechanism (ii)).
+ // Trailing defaulted arg (same back-compat pattern as gemm_impl): ≤0 ⇒ no clip
+ // (the inert default for every non-GrokAdamW cell). Flows into FusedScalars
+ // below → the kernel's P2.5 global-norm reduction. A stale _ops without this
+ // arg trips the caller's TypeError latch (loud degrade, never silent).
+ float grad_clip) {
  int arch = detect_arch();
  // Resolve the GEMM engine ONCE. Unknown tokens FAIL LOUD (no silent scalar
  // fallback — the owner no-suppression rule): a typo'd "wgma" must not quietly
@@ -629,12 +639,14 @@ void fused_step(const std::string& model, const std::string& optimizer,
  "' (expected 'scalar' or 'wgmma').");
  std::string arch_str = (arch == 90) ? "sm_90"
  : (arch == 942) ? "gfx942" : "tpu_v6e";
- // `gamma` is carried for ABI completeness / forward-compat (the directive's
- // scalar set lists it). No current apply_optimizer<> branch consumes a gamma
- // term — SG15's gamma_alpha folds into the host-side alpha schedule (it
- // arrives here already baked into `alpha`), so binding it again would double-
- // apply. Kept in the ABI so a future cell can read it without re-widening.
- (void)gamma;
+ // `gamma` is NOW LIVE for the decoder L3-TC GrokAdamW cell: it is the
+ // layer-wise β1 decay rate (β1_i = β1·(1-γ)^layer), consumed in the kernel's
+ // P3 tail (fused_decoder_megakernel_tc, if constexpr GrokAdamW). For every
+ // OTHER cell it stays inert — γ defaults to 0.0 (a single global β1), and no
+ // other apply_optimizer<> branch reads st.gamma. (SG15's gamma_alpha still
+ // arrives pre-baked into `alpha`, untouched.) `grad_clip` is likewise live
+ // ONLY for the decoder GrokAdamW global grad-norm clip (P2.5); ≤0 ⇒ no clip.
+ // Both flow to the kernel via the FusedScalars POD below → apply_scalars.
 
  const std::string cell = wired_fused_cell(model, optimizer, arch);
  if (cell.empty()) {
@@ -720,9 +732,10 @@ void fused_step(const std::string& model, const std::string& optimizer,
 
  // FULL scalar set (un-frozen bc1/bc2/...). Field order MUST match the mirror
  // fused::sm90::FusedScalars (== the real struct the .cu reads positionally).
+ // gamma/grad_clip appended (decoder GrokAdamW): inert (0.0) for all other cells.
  fused::sm90::FusedScalars scalars{
  lr, beta1, beta2, eps, weight_decay, bc1, bc2, alpha, beta, lamb,
- alpha_max, gate, d_factor, neg_lr_scale, decay_factor};
+ alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip};
 
  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
  // GEMM-engine branch (owner directive task 1). want_wgmma → the bf16 tensor-core
@@ -837,7 +850,7 @@ void fused_step(const std::string& model, const std::string& optimizer,
 
  fused::sm90::FusedScalars scalars{
  lr, beta1, beta2, eps, weight_decay, bc1, bc2, alpha, beta, lamb,
- alpha_max, gate, d_factor, neg_lr_scale, decay_factor};
+ alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip};
 
  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
  // GEMM-engine branch (task 1). want_wgmma → bf16 tensor-core launcher
@@ -957,7 +970,7 @@ void fused_step(const std::string& model, const std::string& optimizer,
 
  fused::sm90::FusedScalars scalars{
  lr, beta1, beta2, eps, weight_decay, bc1, bc2, alpha, beta, lamb,
- alpha_max, gate, d_factor, neg_lr_scale, decay_factor};
+ alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip};
 
  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
  // GEMM-engine branch (mirrors the decoder/vit). want_wgmma → the bf16 tensor-core
@@ -1071,7 +1084,7 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // and all race params share `step`.
  fused::sm90::FusedScalars scalars{
  lr, beta1, beta2, eps, weight_decay, bc1, bc2, alpha, beta, lamb,
- alpha_max, gate, d_factor, neg_lr_scale, decay_factor};
+ alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip};
 
  // Route to the real composed cell launcher (all 33 sm_90 cells). `found`
  // is set false only if no cell matches (then we fall through to the honest

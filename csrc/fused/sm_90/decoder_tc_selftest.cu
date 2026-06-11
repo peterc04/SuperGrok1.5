@@ -49,7 +49,7 @@ gemm_fwd_kernel(const __nv_bfloat16* __restrict__ X,   // [M, Kin] row-major
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     extern __shared__ __nv_bfloat16 smem[];
     __nv_bfloat16* sA = smem;
-    __nv_bfloat16* sB = sA + 64 * 16;          // A is 64x16
+    __nv_bfloat16* sB = sA + dectc::kDecTcStages * 64 * 16;   // B ring after the A ring          // A is 64x16
     const int M = dectc::kTileM;
     const int m_atoms = M / 64;
     const int k_steps = Kin / 16;
@@ -80,7 +80,7 @@ gemm_dx_kernel(const __nv_bfloat16* __restrict__ dY,   // [M, Nout] row-major
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     extern __shared__ __nv_bfloat16 smem[];
     __nv_bfloat16* sA = smem;
-    __nv_bfloat16* sB = sA + 64 * 16;
+    __nv_bfloat16* sB = sA + dectc::kDecTcStages * 64 * 16;   // B ring after the A ring
     const int M = dectc::kTileM;
     const int m_atoms = M / 64;
     const int k_steps = Nout / 16;
@@ -110,7 +110,7 @@ gemm_dw_kernel(const __nv_bfloat16* __restrict__ dY,   // [T, Nout] row-major
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     extern __shared__ __nv_bfloat16 smem[];
     __nv_bfloat16* sA = smem;
-    __nv_bfloat16* sB = sA + 64 * 16;
+    __nv_bfloat16* sB = sA + dectc::kDecTcStages * 64 * 16;   // B ring after the A ring
     const int k_steps = T / 16;
     const int m_atoms = (Nout + 63) / 64;        // up to 8 for Nout=512
     // A[m=out, k=t] = dY[t, out]  → transposed read.
@@ -126,7 +126,13 @@ gemm_dw_kernel(const __nv_bfloat16* __restrict__ dY,   // [T, Nout] row-major
 #endif
 }
 
-static size_t arena_bytes() { return (size_t)(64 * 16 + 128 * 16) * sizeof(__nv_bfloat16) + 256; }
+// kDecTcStages tiles per operand (the GEMM K-loop double-buffer ring; S=2 → 2
+// A-tiles + 2 B-tiles). Mirrors DecTcSmem.sA/sB; without this the pipelined
+// tc_gemm_block_unpipelined writes ring slot 1 out of bounds (illegal access).
+static size_t arena_bytes() {
+    return (size_t)(dectc::kDecTcStages * 64 * 16
+                    + dectc::kDecTcStages * 128 * 16) * sizeof(__nv_bfloat16) + 256;
+}
 
 template <int N>
 static torch::Tensor run_fwd(torch::Tensor X, torch::Tensor W, int Kin, int Nout) {

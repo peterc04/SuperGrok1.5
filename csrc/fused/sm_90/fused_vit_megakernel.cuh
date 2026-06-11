@@ -349,6 +349,17 @@ __host__ __device__ __forceinline__ int64_t vit_tc_workspace_floats(int T, int B
          + nCTA + 1;
 }
 
+#ifdef SG_VIT_PROFILE
+// Diagnostic-only (behind SG_VIT_PROFILE; NEVER on the shipped path): per-phase
+// clock64() deltas, max across CTAs (= critical-path duration per phase). Slots:
+// [0]=P1 fwd, [1]=P1 bwd, [2]=B1 barrier wait, [3]=P2 dW-GEMM loop,
+// [4]=P2 grad-assembly (biases+clspos+lnvec+loss), [5]=P3 opt tail. Read
+// host-side via cudaMemcpyFromSymbol. clock64() is per-SM; a CTA stays on one SM
+// so its own deltas are valid; atomicMax across CTAs gives the slowest CTA per
+// phase.
+__device__ unsigned long long g_vit_prof_max[6];
+#endif
+
 template <OptId Opt>
 __global__ void __launch_bounds__(SG_VIT_TC_MEGA_BLOCK)
 fused_vit_megakernel_tc(PersistentContext ctx,
@@ -392,18 +403,41 @@ fused_vit_megakernel_tc(PersistentContext ctx,
     const int nrows_tile = vittc::kTileM;
     const int n_tiles = (T + nrows_tile - 1) / nrows_tile;
     float nll_acc = 0.0f;
+#ifdef SG_VIT_PROFILE
+    unsigned long long prof_fwd = 0, prof_bwd = 0;
+#endif
     for (int ti = cta; ti < n_tiles; ti += nCTA) {
         const int g0 = ti * nrows_tile;
         const int nrows = (T - g0) < nrows_tile ? (T - g0) : nrows_tile;
+#ifdef SG_VIT_PROFILE
+        __syncthreads(); unsigned long long _c0 = clock64();
+#endif
         float nll = vittc::vittc_forward_tile(w, g0, nrows, acts, sc, in.patches, in.targets,
                                               sm.sA, sm.sB, sm.red);
+#ifdef SG_VIT_PROFILE
+        __syncthreads(); unsigned long long _c1 = clock64();
+#endif
         vittc::vittc_backward_tile(w, g0, nrows, B, acts, sc, in.targets,
                                    my_lnvec, sc.work2, sm.sA, sm.sB, sm.red);
+#ifdef SG_VIT_PROFILE
+        __syncthreads(); unsigned long long _c2 = clock64();
+        if (threadIdx.x == 0) { prof_fwd += _c1 - _c0; prof_bwd += _c2 - _c1; }
+#endif
         if (threadIdx.x == 0) nll_acc += nll;
         __syncthreads();
     }
     if (threadIdx.x == 0) loss_part[cta] = nll_acc;
+#ifdef SG_VIT_PROFILE
+    if (threadIdx.x == 0) {
+        atomicMax(&g_vit_prof_max[0], prof_fwd);
+        atomicMax(&g_vit_prof_max[1], prof_bwd);
+    }
+    unsigned long long _b1a = (threadIdx.x == 0) ? clock64() : 0;
+#endif
     bar.sync();   // B1: all acts (X + dY) + LN-vec partials complete
+#ifdef SG_VIT_PROFILE
+    if (threadIdx.x == 0) { unsigned long long _b1b = clock64(); atomicMax(&g_vit_prof_max[2], _b1b - _b1a); }
+#endif
 
     // ── P2: assemble all 32 grads into `grad`. dW output-stationary (gt % nCTA),
     //    biases, cls/pos owner-scan, LN-vec reduce. No partials. The 10 dW specs
@@ -412,9 +446,17 @@ fused_vit_megakernel_tc(PersistentContext ctx,
     __syncthreads();
     vittc::VitDwSpec* spec = sm.spec;
     const int n_dw = vittc::vittc_dw_total_tiles<SG_TUNED_TILE_N>(spec);
+#ifdef SG_VIT_PROFILE
+    __syncthreads(); unsigned long long _dwa = (threadIdx.x == 0) ? clock64() : 0;
+#endif
     for (int gt = cta; gt < n_dw; gt += nCTA)
         vittc::vittc_dw_run_tile<SG_TUNED_TILE_N>(spec, gt, acts.dh0, grad, sm.sA, sm.sB);
-    vittc::vittc_dw_biases(spec, acts.dh0, grad);
+#ifdef SG_VIT_PROFILE
+    __syncthreads();
+    if (threadIdx.x == 0) { unsigned long long _dwb = clock64(); atomicMax(&g_vit_prof_max[3], _dwb - _dwa); }
+    unsigned long long _gaa = (threadIdx.x == 0) ? clock64() : 0;
+#endif
+    vittc::vittc_dw_biases(spec, acts.dh0, grad, cta, nCTA);
     vittc::vittc_clspos_owner_scan(acts, T, grad, cta, nCTA);
     vittc::vittc_lnvec_reduce(lnvec_base, grad, nCTA, cta);
     // Loss reduce (fp64) by CTA 0.
@@ -424,10 +466,16 @@ fused_vit_megakernel_tc(PersistentContext ctx,
         *in.loss_out = (float)(s / (double)B);
     }
     (void)loss_out;
+#ifdef SG_VIT_PROFILE
+    if (threadIdx.x == 0) { unsigned long long _gab = clock64(); atomicMax(&g_vit_prof_max[4], _gab - _gaa); }
+#endif
     bar.sync_reset(ctx.g_next_task);   // B2: reduced grad ready; reset queue
 
     // ── P3: scalar optimizer tail over the reduced grad (REUSED verbatim). ──
     st.lr = lr;
+#ifdef SG_VIT_PROFILE
+    unsigned long long _p3a = (threadIdx.x == 0) ? clock64() : 0;
+#endif
     {
         __shared__ int task_slot;
         TaskQueue q = ctx.queue();
@@ -442,6 +490,9 @@ fused_vit_megakernel_tc(PersistentContext ctx,
                 apply_optimizer<Opt>(p, gg, (int64_t)i, step, ts);
         }
     }
+#ifdef SG_VIT_PROFILE
+    if (threadIdx.x == 0) { unsigned long long _p3b = clock64(); atomicMax(&g_vit_prof_max[5], _p3b - _p3a); }
+#endif
 }
 
 // ncta_cap (default 0): if >0, launch min(n_sms, ncta_cap) CTAs instead of one

@@ -362,6 +362,28 @@ static std::vector<torch::Tensor> scalar_train_step(
     return {loss_cpu, grad};
 }
 
+#ifdef SG_VIT_PROFILE
+// Diagnostic-only: read + reset the per-phase clock64 maxima (cycles). Returns
+// [P1_fwd, P1_bwd, P2_dW, P3_opt]. Call AFTER one tc_train_step; divide by the
+// SM clock to convert to ms (or just read the RATIOS — phase attribution).
+static std::vector<int64_t> tc_profile_read() {
+    unsigned long long h[6] = {0, 0, 0, 0, 0, 0};
+    cudaMemcpyFromSymbol(h, ::sg::fused::sm90::g_vit_prof_max, sizeof(h));
+    unsigned long long z[6] = {0, 0, 0, 0, 0, 0};
+    cudaMemcpyToSymbol(::sg::fused::sm90::g_vit_prof_max, z, sizeof(z));
+    return {(int64_t)h[0], (int64_t)h[1], (int64_t)h[2],
+            (int64_t)h[3], (int64_t)h[4], (int64_t)h[5]};
+}
+// per-sample head/CE loop cost (fwd[0], bwd[1]) — a SUBSET of P1_fwd/P1_bwd.
+static std::vector<int64_t> tc_profile_head_read() {
+    unsigned long long h[2] = {0, 0};
+    cudaMemcpyFromSymbol(h, ::sg::fused::sm90::vittc::g_vit_prof_head, sizeof(h));
+    unsigned long long z[2] = {0, 0};
+    cudaMemcpyToSymbol(::sg::fused::sm90::vittc::g_vit_prof_head, z, sizeof(z));
+    return {(int64_t)h[0], (int64_t)h[1]};
+}
+#endif
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, mm) {
     // PART 1 GEMM-orientation micro-gates (engine, ViT TILE_M).
     mm.def("gemm_fwd", &gemm_fwd, "TC fwd Y=X@W^T (TILE_M x N), bf16/fp32acc");
@@ -386,4 +408,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mm) {
     mm.attr("TILE_M") = (int)vittc::kTileM;
     mm.attr("TILE_N") = (int)SG_TUNED_TILE_N;
     mm.attr("TOTAL") = (int)kVitTotalElems;
+#ifdef SG_VIT_PROFILE
+    mm.def("tc_profile_read", &tc_profile_read,
+           "diagnostic-only: per-phase clock64 maxima [P1fwd,P1bwd,P2dW,P3opt] (cycles), resets after read");
+    mm.def("tc_profile_head_read", &tc_profile_head_read,
+           "diagnostic-only: per-sample head/CE loop cycles [fwd,bwd] (subset of P1), resets after read");
+    mm.attr("HAS_PROFILE") = true;
+#endif
 }

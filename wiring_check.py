@@ -79,21 +79,14 @@ _BLOCK_REASONS = {
                    "megakernel returns only the loss — snapshot-plumbing alone yields a "
                    "frozen-amplifier (non-faithful) race. The race integration (re-extract "
                    "+ keep the amplifier-training half) is deferred; needs owner re-scope."),
-    # grokadamw: the wgmma single-launch TAIL exists + is built (OptId 3), but the
-    # state-aware L3-TC gate proves the kernel would run a DIFFERENT optimizer (the
-    # breadth-faking opt_components.cuh forbids). grokfast is CONVERTED in cycle 2 (no
-    # longer here): its ema cold-start is fixed (apply_optimizer<Grokfast> step==1 →
-    # ema=grad) so it should be OBSERVED as wgmma; if it ever shows here, the kernel
-    # rebuild is stale. Cited evidence for the still-blocked grokadamw:
-    "grokadamw": ("3-MECHANISM ABI-GAP: (i) per-tensor beta1 = beta1·(1-gamma)^layer "
-                  "(gamma=0.1) not representable in one global FusedScalars (rebase_state "
-                  "rebases pointers, not scalars) — a HARD step-1 state-gate fail (observed "
-                  "m-rel 0.895, the kernel's global beta1 vs eager's per-layer decay); (ii) "
-                  "per-tensor grad-norm clip to grad_clip=1.0 (eager clip_grad_norms_device_"
-                  "side before apply, inert at step 1 / fires by step 50); (iii) adaptive "
-                  "alpha_t. (i) alone blocks any single-step pass; (ii)+(iii) add multi-step "
-                  "divergence. Tail+cold-start built; not registered until the per-tensor "
-                  "side-channel + P3 norm-clip land."),
+    # grokadamw (decoder): CONVERTED in this cycle (no longer blocked) — all THREE
+    # eager mechanisms land in the bf16 TC path: (i) per-tensor layer-wise β1 +
+    # rebased bc1 in the kernel P3 (t == flat layer index); (ii) GLOBAL grad-norm
+    # clip via the kernel's P2.5 deterministic global-norm reduction (γ/grad_clip
+    # thread through FusedScalars); (iii) adaptive-α is a no-op in-context (no
+    # losses fed to .step()), so the static α is faithful. So decoder×grokadamw
+    # should be OBSERVED as wgmma; if it ever shows here, the kernel rebuild is
+    # stale. (vit×grokadamw remains a separate, not-yet-converted cell.)
 }
 # Per-(model) note for any cell that routes to a scalar L3 megakernel rather than
 # wgmma (mamba's measured carve-out — the path EXISTS but scalar wins on wall).

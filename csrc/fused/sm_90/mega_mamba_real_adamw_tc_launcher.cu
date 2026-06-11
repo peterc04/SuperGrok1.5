@@ -106,8 +106,11 @@ cudaError_t mega_mamba_real_adamw_tc(
     int n_sms = 1;
     err = cudaDeviceGetAttribute(&n_sms, cudaDevAttrMultiProcessorCount, dev);
     if (err != cudaSuccess) return err;
-    int nCTA = n_sms;
-    if (ncta_cap > 0 && ncta_cap < nCTA) nCTA = ncta_cap;
+    // Size the workspace for the EXACT count the kernel launcher runs (occ·n_sms with
+    // the occupancy-fill default; reg-capped uniform across OptIds, so AdamW's count
+    // == every tail's). Falls back to n_sms if the occ query fails.
+    int nCTA = mb_tc_launched_nctas<OptId::AdamW>(dev, ncta_cap);
+    if (nCTA <= 0) { nCTA = n_sms; if (ncta_cap > 0 && ncta_cap < nCTA) nCTA = ncta_cap; }
 
     const int64_t need = mb_tc_workspace_floats(T, nCTA);
     MbTcLauncherScratch& sc = mb_tc_launcher_scratch(dev, need);

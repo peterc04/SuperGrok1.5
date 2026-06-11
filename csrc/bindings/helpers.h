@@ -48,7 +48,12 @@ void fused_step(const std::string& model, const std::string& optimizer,
                 // tensor-core launcher). Default keeps old call shapes valid. Keep
                 // in sync with the definition in dispatch.cpp (which, per the C++
                 // rule, omits the default — it lives only on this declaration).
-                const std::string& gemm_impl = "scalar");
+                const std::string& gemm_impl = "scalar",
+                // GrokAdamW GLOBAL grad-norm clip threshold (decoder L3-TC,
+                // mechanism (ii)). Trailing defaulted arg (≤0 ⇒ no clip = inert for
+                // every non-GrokAdamW cell). Keep in sync with the definition in
+                // dispatch.cpp + the pybind py::arg list (bindings.cpp).
+                float grad_clip = 0.0f);
 
 // ── Per-arch namespace handles ───────────────────────────────────────
 namespace sm90 {}
