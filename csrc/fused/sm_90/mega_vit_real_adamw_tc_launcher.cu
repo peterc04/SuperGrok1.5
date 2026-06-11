@@ -118,7 +118,21 @@ cudaError_t mega_vit_real_adamw_tc(
     // Prodigy s_track slot — harmless: LookSAM has none of those). The in-kernel P2.4
     // phase WRITES it on SAM steps (st.looksam_sam!=0); the apply tail READS it every step.
     st.sam_dir         = extra_slice;            // [total] cached SAM direction
-    apply_scalars(st, scalars);   // FULL scalar set (+ d0/d_coef/beta3 + rho/looksam_sam)
+    // SuperGrok11/15 (MODEL-COUPLED SAM 2nd backward + per-tensor meta-net mu). State
+    // layout: [m | v | mu | loss | sharpness(total) | phi_pack(4H+1)] — the ViT twin of
+    // the decoder binding. st.mu = the `extra` slice (P2.45-filled, apply reads it);
+    // st.sharpness = loss_out+1 (PERSISTED (g_sam−g)² from P2.4); st.sg_phi_W1/b1/W2 =
+    // the host-scattered phi pack after sharpness (sg_phi_b2 read on-device from [H]).
+    st.mu              = extra_slice;            // [total] meta-net mu (P2.45-filled)
+    {
+        float* sharp_base = loss_out + 1;        // state + 3*total + 1
+        float* phi_base   = sharp_base + total;  // phi pack after sharpness
+        st.sharpness = sharp_base;
+        st.sg_phi_W1 = phi_base + kSgPhiW1Off;
+        st.sg_phi_b1 = phi_base + kSgPhiB1Off;
+        st.sg_phi_W2 = phi_base + kSgPhiW2Off;   // sg_phi_b2 read on-device from [H]
+    }
+    apply_scalars(st, scalars);   // FULL scalar set (+ d0/d_coef/beta3 + rho/looksam_sam/sg_rescale)
     st.lr = lr;
 
     ViTInputCtx in;
@@ -170,6 +184,20 @@ cudaError_t mega_vit_real_adamw_tc(
             // blends g_adj=(1−α)g+α·sam_dir and runs AdamW. NOT a separate launch. The
             // decoder twin (mega_decoder_real_adamw_tc_launcher.cu) proved this routing.
             return launch_fused_vit_megakernel_tc<OptId::LookSAM>(
+                ctx, params, in, grad, lr, step, st, stream, nCTA);
+        case OptId::SuperGrok11:
+            // MODEL-COUPLED SAM 2nd backward + per-tensor meta-net mu/gate (wave-3 vit
+            // lane): the SAME single persistent launch — the SAM 2nd backward (P2.4,
+            // sharpness=(g_sam−g)²) + per-tensor mu precompute (P2.45) + per-tensor cosine
+            // gate are in-kernel phases; the apply tail (sg11_sweep_b_step) runs in P3.
+            // SAM scratch reuses the looksam buffers; sharpness + phi pack ride the
+            // extended state (bound above). The decoder twin proved this routing.
+            return launch_fused_vit_megakernel_tc<OptId::SuperGrok11>(
+                ctx, params, in, grad, lr, step, st, stream, nCTA);
+        case OptId::SuperGrok15:
+            // Same SAM 2nd backward + mu precompute; SIMPLER tail (host-scalar gate, no
+            // cosine stage). sg15_sweep_b_step does the per-coord alpha clip + AdamW.
+            return launch_fused_vit_megakernel_tc<OptId::SuperGrok15>(
                 ctx, params, in, grad, lr, step, st, stream, nCTA);
         default:
             return cudaErrorInvalidValue;

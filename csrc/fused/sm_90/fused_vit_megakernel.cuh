@@ -127,6 +127,9 @@ vit_rebase_state(const FusedOptState& s, int64_t off) {
     if (t.orth)       t.orth       += off;
     if (t.smart_grad) t.smart_grad += off;
     if (t.param_init) t.param_init += off;   // Prodigy trajectory anchor p0
+    if (t.sharpness)  t.sharpness  += off;   // SuperGrok11/15 (g_sam−g)² (per element)
+    // SuperGrok11/15 phi weights (sg_phi_W1/b1/W2) are a per-TENSOR weight SET (NOT a
+    // per-element slice) — so NOT rebased (staged to SMEM once, like NeuralGrok's psi).
     return t;
 }
 
@@ -596,7 +599,15 @@ fused_vit_megakernel_tc(PersistentContext ctx,
     //    deterministic BY CONSTRUCTION. Guarded so every other opt's path is byte-
     //    identical (no extra barrier / work). On a NON-SAM step (looksam_sam==0) this
     //    whole block is skipped — st.sam_dir already holds the cached direction.
-    if constexpr (Opt == OptId::LookSAM) {
+    //
+    //    SuperGrok11/15 SHARE this exact SAM 2nd-backward machinery (INTEGRATION-
+    //    OPTSTAGES §4/§5): IDENTICAL perturb→2nd in-kernel fwd+bwd→restore; only the
+    //    elementwise WRITE in (d) differs — LookSAM writes sam_dir = g_sam − g, SG11/15
+    //    write sharpness = (g_sam − g)² (supergrok11_sm90.cuh:246 / supergrok15_sm90.cuh
+    //    :315), the 2nd MLP input the P2.45 meta-net mu precompute reads. Same st.looksam_sam
+    //    SAM-step gate + st.rho radius; cached sharpness reused on non-SAM steps.
+    if constexpr (Opt == OptId::LookSAM || Opt == OptId::SuperGrok11 ||
+                  Opt == OptId::SuperGrok15) {
         if (st.looksam_sam != 0.0f) {
             // (a) GLOBAL ‖g‖ over the reduced grad, deterministic (reuse the loss
             //     workspace as P2.5 does: loss_part[nCTA] = per-CTA Σg², loss_out[1]
@@ -682,17 +693,22 @@ fused_vit_megakernel_tc(PersistentContext ctx,
             vittc::vittc_clspos_owner_scan(acts, T, sam_grad, cta, nCTA);
             vittc::vittc_lnvec_reduce(lnvec_base, sam_grad, nCTA, cta);
             bar.sync();   // B2.4f: g_sam fully assembled in sam_grad
-            // (d) sam_dir = g_sam − g (into the persistent extra slice) + restore p.
+            // (d) WRITE the SAM side-channel (persistent state slice) + restore p.
+            //     LookSAM → sam_dir = g_sam − g; SuperGrok11/15 → sharpness = (g_sam − g)².
             {
                 const int64_t gstride = (int64_t)blockDim.x * gridDim.x;
                 for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
                      i < total_e; i += gstride) {
-                    // st.sam_dir is the extra-slice base (host-bound). g_sam − g.
-                    const_cast<float*>(st.sam_dir)[i] = sam_grad[i] - grad[i];
+                    const float diff = sam_grad[i] - grad[i];
+                    if constexpr (Opt == OptId::LookSAM) {
+                        const_cast<float*>(st.sam_dir)[i] = diff;
+                    } else {
+                        const_cast<float*>(st.sharpness)[i] = diff * diff;
+                    }
                     params[i] = sam_backup[i];   // restore the ORIGINAL weights
                 }
             }
-            bar.sync_reset(ctx.g_next_task);   // B2.4g: params restored + sam_dir ready; reset queue for P3
+            bar.sync_reset(ctx.g_next_task);   // B2.4g: params restored + side-channel ready; reset queue for P3
         }
     }
 
@@ -879,6 +895,20 @@ fused_vit_megakernel_tc(PersistentContext ctx,
         }
     }
 
+    // ── P2.45 (SuperGrok11/15 ONLY) staged into P3: the per-TENSOR meta-net mu
+    //    precompute (INTEGRATION-OPTSTAGES §4/§5) — ViT twin of the decoder's. SINGLE
+    //    task-queue drain, NO grid barrier (each tensor is self-contained: mu(T) +
+    //    SG11's per-tensor cosine gate(T) depend ONLY on T's elements). The phi weights
+    //    (per-TENSOR weight set) stage to SMEM ONCE per block before the drain; SG15's
+    //    gate is the host scalar st.gate. sharpness was produced by P2.4 (or cached).
+    __shared__ float sg_sW1[kSgPhiHidden * 2];
+    __shared__ float sg_sb1[kSgPhiHidden];
+    __shared__ float sg_sW2[kSgPhiHidden];
+    if constexpr (Opt == OptId::SuperGrok11 || Opt == OptId::SuperGrok15) {
+        sg_stage_phi_weights<kSgPhiHidden>(st.sg_phi_W1, st.sg_phi_b1, st.sg_phi_W2,
+                                           sg_sW1, sg_sb1, sg_sW2);   // syncs
+    }
+
     // ── P3: scalar optimizer tail over the reduced grad (REUSED verbatim). ──
     st.lr = lr;
 #ifdef SG_VIT_PROFILE
@@ -907,6 +937,25 @@ fused_vit_megakernel_tc(PersistentContext ctx,
                 const float b1 = st.beta1 * powf(1.0f - st.gamma, (float)t);
                 ts.beta1 = b1;
                 ts.bc1   = 1.0f - powf(b1, (float)step);
+            }
+            // SuperGrok11/15 meta-net mu (+ SG11 per-tensor gate) precompute for THIS
+            // tensor, BEFORE the apply reads ts.mu/ts.gate (ViT twin of the decoder's).
+            if constexpr (Opt == OptId::SuperGrok11) {
+                const float b2 = (st.sg_phi_W2 != nullptr) ? st.sg_phi_W2[kSgPhiHidden]
+                                                           : st.sg_phi_b2;
+                const float g8 = sg11_precompute_mu_and_gate_for_tensor<kSgPhiHidden>(
+                    st.mu, grad, st.sharpness, sg_sW1, sg_sb1, sg_sW2,
+                    b2, st.sg_rescale, off, n);
+                ts.gate = g8;            // per-tensor cosine gate the apply tail reads
+                __syncthreads();         // mu(T) fully written + gate broadcast before apply
+            } else if constexpr (Opt == OptId::SuperGrok15) {
+                const float b2 = (st.sg_phi_W2 != nullptr) ? st.sg_phi_W2[kSgPhiHidden]
+                                                           : st.sg_phi_b2;
+                sg15_precompute_mu_for_tensor<kSgPhiHidden>(
+                    st.mu, grad, st.sharpness, sg_sW1, sg_sb1, sg_sW2,
+                    b2, st.sg_rescale, off, n);
+                // ts.gate stays = st.gate (the host sigmoid(accuracy) scalar).
+                __syncthreads();         // mu(T) visible before the apply reads it
             }
             float* __restrict__ p = params + off;
             const float* __restrict__ gg = grad + off;

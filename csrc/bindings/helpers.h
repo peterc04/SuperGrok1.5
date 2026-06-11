@@ -73,7 +73,13 @@ void fused_step(const std::string& model, const std::string& optimizer,
                 // fwd+bwd→sam_dir=g_sam−g phase). Trailing defaulted args = inert
                 // (0.0) for every non-LookSAM cell. Keep in sync with the
                 // dispatch.cpp definition + the pybind py::arg list (bindings.cpp).
-                float rho = 0.0f, float looksam_sam = 0.0f);
+                float rho = 0.0f, float looksam_sam = 0.0f,
+                // SuperGrok11/15 meta-net rescale (decoder/vit L3-TC). mu =
+                // rescale·phi(g, sharpness). The phi weights + sharpness buffer ride
+                // the STATE buffer (cell-scattered), so only this scalar is in the ABI.
+                // Trailing defaulted arg = inert (0.0) for every non-SG cell. Keep in
+                // sync with the dispatch.cpp definition + the pybind py::arg list.
+                float sg_rescale = 0.0f);
 
 // ── Per-arch namespace handles ───────────────────────────────────────
 namespace sm90 {}

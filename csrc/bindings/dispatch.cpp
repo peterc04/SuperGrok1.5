@@ -225,7 +225,13 @@ struct FusedScalars {
        // perturbation radius; looksam_sam = the every-k SAM-step gate (1.0 ⇒ run the
        // in-kernel perturb→2nd fwd+bwd→sam_dir=g_sam−g; 0.0 ⇒ reuse the cached
        // sam_dir). Inert defaults (0.0) for every non-LookSAM caller; byte-identical.
-       rho, looksam_sam;
+       rho, looksam_sam,
+       // SuperGrok11/15 append-only widening (decoder/vit L3-TC, meta-net mu) — KEEP
+       // IN LOCK-STEP with the real fused::sm90::FusedScalars (opt_components.cuh): one
+       // trailing field. sg_rescale = the SharpnessMetaNet rescale (mu = rescale·phi).
+       // The phi weights + sharpness are DEVICE pointers the cell binds directly; only
+       // this scalar flows through the POD. Inert default (0.0) for every non-SG caller.
+       sg_rescale;
 };
 } // namespace sm90
 } // namespace fused
@@ -605,7 +611,15 @@ static int wgmma_tail_opt_id(const std::string& optimizer) {
     if (optimizer == "muon")       return 7;   // OptId::Muon (STAGED grid-cooperative
                                                // Newton-Schulz — in-kernel P2.7, still a
                                                // SINGLE persistent launch; vit wired)
-    return -1;                                 // SG11/SG15/SG2 (no single-launch TC)
+    if (optimizer == "supergrok11") return 8;  // OptId::SuperGrok11 (MODEL-COUPLED SAM 2nd
+                                               // backward → sharpness=(g_sam−g)² in P2.4 +
+                                               // per-tensor meta-net mu/gate precompute in
+                                               // P2.45; SINGLE persistent launch)
+    if (optimizer == "supergrok15") return 9;  // OptId::SuperGrok15 (same SAM 2nd backward +
+                                               // per-tensor mu precompute; gate is a host
+                                               // scalar — SINGLE persistent launch)
+    return -1;                                 // SG2 (no single-launch TC: segmented sort +
+                                               // CSA/HCA meta-net, out of scope)
 }
 
 } // anonymous namespace
@@ -674,7 +688,15 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // gate (1.0 ⇒ run the in-kernel perturb→2nd fwd+bwd→sam_dir=g_sam−g phase). Flow into
  // FusedScalars → the kernel's P2.4 SAM 2nd-backward phase. A stale _ops without these
  // args trips the caller's TypeError latch (loud degrade to eager, never silent).
- float rho, float looksam_sam) {
+ float rho, float looksam_sam,
+ // SuperGrok11/15 scalars (decoder/vit L3-TC, meta-net mu). Trailing defaulted arg
+ // (same back-compat pattern): inert default (0.0) for every non-SG cell. sg_rescale =
+ // the SharpnessMetaNet rescale (mu = rescale·phi(g, sharpness)). The phi weights +
+ // sharpness buffer are carried in the STATE buffer (the cell scatters/binds them);
+ // only this scalar flows through the ABI. Flows into FusedScalars → the kernel's P2.45
+ // meta-net mu precompute. SG also reuses `rho` (its SAM perturbation radius) + `alpha`
+ // (the meta-net strength). A stale _ops without this arg trips the TypeError latch.
+ float sg_rescale) {
  int arch = detect_arch();
  // Resolve the GEMM engine ONCE. Unknown tokens FAIL LOUD (no silent scalar
  // fallback — the owner no-suppression rule): a typo'd "wgma" must not quietly
@@ -748,13 +770,20 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // state = [m|v|extra] (3*total) + 1 loss slot. PRODIGY (STAGED global-d) needs a
  // LARGER buffer: [m|v|extra/s_track | loss | param_init(total) | r_ema|s_ema|d_lr]
  // = 4*total + 4 (the TC launcher carves param_init at loss_slot+1, the 3 persisted
- // estimator scalars after it). The host (fused_train_step) sizes it per-cell.
- const int64_t min_state = (optimizer == "prodigy") ? (4 * total + 4) : (3 * total + 1);
+ // estimator scalars after it). SuperGrok11/15 (meta-net mu + SAM 2nd backward) need
+ // [m|v|mu | loss | sharpness(total) | phi_pack(4*32+1)] = 4*total + 1 + kSgPhiPack
+ // (the TC launcher carves sharpness at loss_slot+1 and the phi pack after it). The
+ // host (fused_train_step) sizes it per-cell.
+ const bool is_sg = (optimizer == "supergrok11" || optimizer == "supergrok15");
+ const int64_t min_state = (optimizer == "prodigy") ? (4 * total + 4)
+                         : is_sg ? (4 * total + 1 + (int64_t)(4 * 32 + 1))
+                         : (3 * total + 1);
  TORCH_CHECK(state.numel() >= min_state &&
  state.scalar_type() == torch::kFloat32 && state.is_contiguous(),
  "fused decoder megakernel: state must be contiguous fp32 with >= ", min_state,
  " elements (", (optimizer == "prodigy")
  ? "[m|v|s_track|loss|param_init|r_ema|s_ema|d_lr] for Prodigy"
+ : is_sg ? "[m|v|mu|loss|sharpness|phi_pack] for SuperGrok11/15"
  : "[m|v|extra]+loss", ").");
  // grad = the REDUCED weight-grad OUTPUT [total]: the kernel writes the
  // deterministically-reduced grad here (P2) and consumes it in the optimizer
@@ -790,7 +819,8 @@ void fused_step(const std::string& model, const std::string& optimizer,
  alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip,
  d0, d_coef, beta3,    // Prodigy estimator scalars (inert for non-Prodigy cells)
  aux_lr, aux_beta1, aux_beta2,   // Muon 1D-group AdamW hyperparams (decoder L3-TC
- rho, looksam_sam};    // LookSAM SAM 2nd-backward scalars (inert for non-LookSAM cells)
+ rho, looksam_sam,     // LookSAM SAM 2nd-backward scalars (inert for non-LookSAM cells)
+ sg_rescale};          // SuperGrok11/15 meta-net rescale (inert for non-SG cells)
  // STAGED NS). MUST be passed here — the mirror FusedScalars (line 204) declares
  // aux_* with NO in-class default, so omitting them aggregate-inits to 0.0 (→ the
  // 1D AdamW tail would run β1=β2=0: m=g/v=g², the (1b) state FAIL this fixes).
@@ -882,11 +912,19 @@ void fused_step(const std::string& model, const std::string& optimizer,
  "fused ViT megakernel: input.numel() (", in_n,
  ") must be B*(16*49+1) = B*", kVitPatchElems + 1, ".");
  const int B = (int)(in_n / (kVitPatchElems + 1));
- // state = [m|v|extra] (3*total) + 1 loss slot.
- TORCH_CHECK(state.numel() >= 3 * total + 1 &&
+ // state = [m|v|extra] (3*total) + 1 loss slot. PRODIGY needs 4*total+4; SuperGrok11/15
+ // (meta-net mu + SAM 2nd backward) need [m|v|mu|loss|sharpness(total)|phi_pack(4*32+1)]
+ // = 4*total + 1 + kSgPhiPack. The host (fused_train_step) sizes it per-cell.
+ const bool vit_is_sg = (optimizer == "supergrok11" || optimizer == "supergrok15");
+ const int64_t vit_min_state = (optimizer == "prodigy") ? (4 * total + 4)
+                             : vit_is_sg ? (4 * total + 1 + (int64_t)(4 * 32 + 1))
+                             : (3 * total + 1);
+ TORCH_CHECK(state.numel() >= vit_min_state &&
  state.scalar_type() == torch::kFloat32 && state.is_contiguous(),
  "fused ViT megakernel: state must be contiguous fp32 with "
- ">= 3*total+1 = ", 3 * total + 1, " elements ([m|v|extra]+loss).");
+ ">= ", vit_min_state, " elements (", vit_is_sg
+ ? "[m|v|mu|loss|sharpness|phi_pack] for SuperGrok11/15"
+ : "[m|v|extra]+loss", ").");
  // grad = the REDUCED weight-grad OUTPUT [total] (same contract as the
  // decoder): the kernel writes the deterministically-reduced grad here (P2) and
  // consumes it in the optimizer tail (P3) WITHOUT overwriting it, so after the
@@ -913,7 +951,8 @@ void fused_step(const std::string& model, const std::string& optimizer,
  alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip,
  d0, d_coef, beta3,    // Prodigy estimator scalars (inert for non-Prodigy cells)
  aux_lr, aux_beta1, aux_beta2,   // Muon 1D-group AdamW hyperparams (inert for non-Muon)
- rho, looksam_sam};    // LookSAM SAM 2nd-backward scalars (inert for non-LookSAM cells)
+ rho, looksam_sam,     // LookSAM SAM 2nd-backward scalars (inert for non-LookSAM cells)
+ sg_rescale};          // SuperGrok11/15 meta-net rescale (inert for non-SG cells)
 
  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
  // GEMM-engine branch (task 1). want_wgmma → bf16 tensor-core launcher
@@ -1024,9 +1063,21 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // with this routed unless the cell is proven A/A/A-clean.
  static const bool mb_looksam_probe =
      (std::getenv("SG_MAMBA_LOOKSAM_PROBE") != nullptr);
- const bool mb_tc_tail = (mb_opt_id >= 0 &&
+ // SuperGrok11/15 CARVE-OUT (no-suppression): wgmma_tail_opt_id now returns 8/9 for
+ // them (decoder/vit SG11/15 ARE registered-converted + A/A/A-clean via the in-kernel
+ // SAM 2nd backward + per-tensor mu precompute). But the mamba SG11/15 path is BLOCKED
+ // on the SAME shared mamba scan/forward A/A/A determinism race that blocks mamba×
+ // prodigy/looksam (the SG SAM 2nd backward re-runs the mamba forward TWICE + register
+ // pressure → exposes the latent race). The mamba megakernel deliberately does NOT carry
+ // the SG SAM/mu phases (decoder/vit only) and the mamba launcher has NO SG case, so this
+ // is a code-absent block (stricter than looksam's code-landed-dormant) — SG mamba is
+ // simply not a mamba TC tail. Exclude it here so a forced wgmma request fails LOUD with
+ // the cited reason rather than hitting the launcher's cudaErrorInvalidValue. Lift once
+ // the mamba forward is fixed (megakernel_common.cuh GridBarrier / model_stage_mamba3.cuh).
+ const bool mb_is_sg = (optimizer == "supergrok11" || optimizer == "supergrok15");
+ const bool mb_tc_tail = (mb_opt_id >= 0 && !mb_is_sg &&
                           (optimizer != "prodigy" || mb_prodigy_probe) &&
-                          (optimizer != "looksam" || mb_looksam_probe));  // {adamw,lion,grokfast,grokadamw,neuralgrok}; mamba prodigy+looksam BLOCKED (shared mamba-forward A/A/A race) unless their probe; SG11/15/SG2 = -1
+                          (optimizer != "looksam" || mb_looksam_probe));  // {adamw,lion,grokfast,grokadamw,neuralgrok}; mamba prodigy+looksam+SG11/15 BLOCKED (shared mamba-forward A/A/A race); SG2 = -1
  const bool mamba_l3_real = (optimizer == "adamw")
                             || (want_wgmma && mb_tc_tail);
  if (arch == 90 && model == "mamba3" && mamba_l3_real && !opt_only) {
@@ -1096,8 +1147,9 @@ void fused_step(const std::string& model, const std::string& optimizer,
  alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip,
  d0, d_coef, beta3,    // Prodigy estimator scalars (inert for non-Prodigy cells)
  aux_lr, aux_beta1, aux_beta2,   // Muon 1D-group AdamW hyperparams (inert for non-Muon)
- rho, looksam_sam};    // LookSAM SAM 2nd-backward scalars (inert for non-LookSAM cells).
- // MUST be passed (the mirror FusedScalars declares all 25 fields with NO in-class
+ rho, looksam_sam,     // LookSAM SAM 2nd-backward scalars (inert for non-LookSAM cells).
+ sg_rescale};          // SuperGrok11/15 meta-net rescale (inert; mamba SG is gated out).
+ // MUST be passed (the mirror FusedScalars declares all 26 fields with NO in-class
  // defaults — omitting these aggregate-inits them to 0.0, which for LookSAM means
  // rho=0/looksam_sam=0 → the P2.4 SAM phase is INERT and sam_dir never gets written).
  // Lock-step with the decoder/vit PODs above.

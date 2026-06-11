@@ -115,6 +115,53 @@ def _prodigy_factory(g, params, c):
                      betas=(c["beta1"], c["beta2"]))
 
 
+def _supergrok11_factory(g, params, c):
+    # train_supergrok: SuperGrok11(...). The gate drives the REAL optimizer but with TWO
+    # gate-specific overrides that make the SAM 2nd backward + meta-net mu NON-VACUOUS at
+    # step 1 (no-hollow-pass): (1) warmup_steps=0 so the ramp factor is 1.0 at step 1 (the
+    # default warmup_steps=100 ⇒ ramp=0 ⇒ alpha=0 ⇒ mu contributes nothing — eager-faithful
+    # but it would make the apply check blind to mu); (2) a NONZERO meta_net rescale (the
+    # SharpnessMetaNet inits rescale=0 ⇒ mu≡0 — that hides the whole mu/sharpness pipeline).
+    # We force rescale to a small nonzero value AFTER construction so mu = rescale·phi(g,
+    # sharpness) is a real, checkable quantity. meta_hidden_dim=32 (the kernel's compile-time
+    # kSgPhiHidden — the known prior 64-bug). lamb=1.0 (the production supergrok_lamb default).
+    import torch
+    opt = g.SuperGrok11(params, lr=c["lr"], betas=(c["beta1"], c["beta2"]),
+                        weight_decay=c["weight_decay"],
+                        alpha_init=c.get("supergrok_alpha", 0.98),
+                        lamb=c.get("supergrok_lamb", 1.0),
+                        gamma=c.get("supergrok_gamma", 0.1),
+                        warmup_steps=0, warmup_ramp=1,
+                        meta_hidden_dim=32,
+                        gate_temperature=c.get("supergrok_gate_temp", 5.0))
+    # nonzero rescale so mu != 0 (the meta-net forward is exercised, not a no-op).
+    with torch.no_grad():
+        opt.meta_net.rescale.fill_(0.1)
+    opt.meta_net = opt.meta_net.to(next(iter(opt.param_groups[0]["params"])).device)
+    opt._weights_dirty = True   # re-extract the (now nonzero-rescale) weights
+    return opt
+
+
+def _supergrok15_factory(g, params, c):
+    # train_supergrok15: SuperGrok15(...). Same gate-specific overrides as SG11 (warmup_steps=0
+    # ⇒ ramp=1, nonzero rescale ⇒ mu!=0, meta_hidden_dim=32). SG15's gate is the host scalar
+    # sigmoid(gate_scale·(acc - gate_thresh)); at step 1 acc=0 so it is a small positive value.
+    import torch
+    opt = g.SuperGrok15(params, lr=c["lr"], betas=(c["beta1"], c["beta2"]),
+                        weight_decay=c["weight_decay"],
+                        alpha_init=c.get("supergrok15_alpha", 0.98),
+                        lamb=c.get("supergrok15_lamb", 2.0),
+                        gamma=c.get("supergrok15_gamma", 0.1),
+                        warmup_steps=0, warmup_ramp=1,
+                        meta_hidden_dim=32,
+                        sam_rho=c.get("supergrok15_sam_rho", 0.05))
+    with torch.no_grad():
+        opt.meta_net.rescale.fill_(0.1)
+    opt.meta_net = opt.meta_net.to(next(iter(opt.param_groups[0]["params"])).device)
+    opt._weights_dirty = True
+    return opt
+
+
 def _neuralgrok_canonical_mv(grad, opt_obj, step):
     """The (m, v) the NeuralGrok tail MUST produce, by the canonical header math.
 
@@ -343,6 +390,38 @@ _CELLS = {
     # is deterministic — vit Prodigy/Muon are A/A/A-green, same fixed reductions).
     "looksam/vit": dict(model="vit", opt="looksam", factory=_looksam_factory,
                         sam_dir_tol=2e-2),
+    # supergrok11 (decoder/vit — SAM-tier lane): CONVERTED. The MODEL-COUPLED SAM 2nd backward
+    # (P2.4, sharpness=(g_sam−g)²) + the per-TENSOR meta-net mu/gate precompute (P2.45,
+    # mu=rescale·phi(g,sharpness), gate=clamp(cos(g,mu),0,1)) are IN-KERNEL phases; the apply
+    # tail (sg11_sweep_b_step: smart_grad=g+(1−gate)·alpha·mu, AdamW) runs in P3. The gate
+    # (factory: warmup_steps=0 ⇒ ramp=1, rescale=0.1 ⇒ mu!=0) validates FOUR surfaces vs the
+    # canonical fp64 math (run_cell_gate's opt=="supergrok11"/"supergrok15" branch):
+    #   (A) sharpness — vs the bf16-faithful 2nd backward (g_sam−g)² (the SAME oracle the
+    #       looksam sam_dir check uses, squared); a SKIPPED SAM phase (sharpness≈0) fails it.
+    #   (B) mu — vs rescale·phi(g, sharpness) (canonical sg11_phi_forward / ref_sg_phi_forward),
+    #       on the SAME captured grad + the kernel's OWN sharpness (so the meta-net forward is
+    #       validated independent of the bf16 2nd-backward floor).
+    #   (1a) params + (1b) m/v — vs ref_sg11_step (smart_grad=g+(1−gate)·alpha·mu, AdamW) with
+    #       the kernel's grad/mu/gate, tight 1e-4 (the apply tail math).
+    # mamba×supergrok11 is BLOCKED (shared mamba-forward A/A/A race; code-absent in the mamba
+    # kernel/launcher). sharpness_tol=2e-2 (the bf16-TC vs bf16-faithful 2nd-backward floor,
+    # the SAME design floor as looksam's sam_dir); mu_tol=3e-3 (fp32 phi reorder, SG-family).
+    "supergrok11/decoder": dict(model="decoder", opt="supergrok11",
+                                factory=_supergrok11_factory,
+                                sharpness_tol=2e-2, mu_tol=3e-3),
+    "supergrok11/vit": dict(model="vit", opt="supergrok11",
+                            factory=_supergrok11_factory,
+                            sharpness_tol=2e-2, mu_tol=3e-3),
+    # supergrok15 (decoder/vit — SAM-tier lane): CONVERTED. SAME SAM 2nd backward + mu precompute
+    # as SG11, but SIMPLER tail: the gate is a HOST SCALAR (sigmoid(accuracy)), NO per-tensor
+    # cosine — so the precompute is just mu=rescale·phi(g,sharpness); the apply (sg15_sweep_b_step)
+    # does the per-coord alpha clip + smart_grad=g+gate·a·mu + AdamW. Validated vs ref_sg15_step.
+    "supergrok15/decoder": dict(model="decoder", opt="supergrok15",
+                                factory=_supergrok15_factory,
+                                sharpness_tol=2e-2, mu_tol=3e-3),
+    "supergrok15/vit": dict(model="vit", opt="supergrok15",
+                            factory=_supergrok15_factory,
+                            sharpness_tol=2e-2, mu_tol=3e-3),
     # NOTE: looksam/mamba is NOT registered — it FAILS A/A/A (the SAME latent shared mamba
     # scan/forward race that blocks prodigy/mamba). The in-kernel P2.4 SAM 2nd backward IS
     # code-landed (fused_mamba_megakernel.cuh + the mamba launcher case OptId::LookSAM) and the
@@ -387,6 +466,199 @@ def _build_cell(model, seed=42):
     return g, c, m, data, dev
 
 
+def _sg_bf16_sharpness_oracle(model, named_ref, tx, ty, grad, rho, total, dev):
+    """The (g_sam − g)² sharpness the SAM 2nd backward MUST produce, via the bf16-FAITHFUL
+    fp64 oracle (the SAME instrument the looksam sam_dir check + the first-grad gate use).
+    Runs the oracle TWICE — at p and at p'=p+ron·g (ron=rho/‖g‖_global, g the kernel's reduced
+    grad) — and returns sharpness_bf = (g_sam_bf − g_bf)² flattened (named layout order). The
+    bf16-TC kernel 2nd backward vs this fp64-bf16-faithful 2nd backward differ only by the bf16
+    floor (the SAME design floor the looksam sam_dir 2e-2 tol calibrates), so sharpness is
+    checked at that floor. A SKIPPED SAM phase (sharpness≈0) fails the liveness assert."""
+    if model == "decoder":
+        from tests.hw.test_decoder_tc import _bf16_faithful_oracle as _orc
+        B = int(tx.shape[0]); B16 = B - (B % 16)
+        a0 = tx[:B16].to(torch.long); a1 = ty[:B16].to(torch.long)
+        named_d = {n: p.detach() for n, p in named_ref}
+        _lo, go = _orc(named_d, a0, a1)
+    elif model == "vit":
+        from tests.hw.test_vit_tc import _bf16_faithful_oracle as _orc
+        B = int(tx.shape[0]); B16 = B - (B % 16)
+        a0 = tx[:B16].detach().cpu().double(); a1 = ty[:B16].detach().cpu().to(torch.long)
+        named_d = {n: p.detach().cpu() for n, p in named_ref}
+        _lo, go = _orc(named_d, a0, a1)
+    else:
+        raise NotImplementedError(f"sg sharpness oracle not wired for {model}")
+    gn = torch.sqrt(sum((gv.double() ** 2).sum() for gv in go.values())).item()
+    ron = rho / gn
+    off = 0; named_pert = {}
+    cpu = (model == "vit")
+    for n_, p in named_ref:
+        k = p.numel()
+        base = (p.detach().cpu().double() if cpu else p.detach().double())
+        gslice = grad[off:off + k].reshape(p.shape)
+        gslice = (gslice.cpu().double() if cpu else gslice.double())
+        named_pert[n_] = base + ron * gslice
+        off += k
+    _lo2, go2 = _orc(named_pert, a0, a1)
+    sharp = torch.cat([((go2[n_] - go[n_]).reshape(-1).double()) ** 2
+                       for n_, _ in named_ref]).float().to(dev)
+    return sharp
+
+
+def _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon, opt_obj, grad,
+                      loss, p_after, total, named0, cache, verbose):
+    """Dedicated SuperGrok11/15 gate: validate the kernel vs the CANONICAL fp64 math its
+    apply_optimizer<SG> calls (ref_sg11_step/ref_sg15_step + ref_sg_phi_forward), plus the
+    SAM 2nd backward (sharpness) vs the bf16-faithful oracle. Returns (ok, detail)."""
+    import torch
+    from grokking_optimizers.dispatch import _opt_scalars_from, fused_train_step
+    from tests.hw.test_reference_parity import (ref_sg11_step, ref_sg15_step,
+                                                ref_sg_phi_forward, ref_sg15_alpha_per_coord)
+    model, opt = spec["model"], spec["opt"]
+    tx, ty = data[0], data[1]
+
+    # Kernel state slices: [m | v | mu | loss | sharpness(total) | phi_pack].
+    kstate = cache[canon]["state"]
+    k_m = kstate[0:total]; k_v = kstate[total:2 * total]
+    k_mu = kstate[2 * total:3 * total]
+    k_sharp = kstate[3 * total + 1:4 * total + 1]
+
+    # The SAME scalars the kernel received (alpha/sg_rescale/rho/gate/looksam_sam).
+    scalars = _opt_scalars_from(opt_obj, 1)
+    alpha = float(scalars.get("alpha", 0.0))
+    sg_rescale = float(scalars.get("sg_rescale", 0.0))
+    rho = float(scalars.get("rho", 0.05))
+    gate_global = float(scalars.get("gate", 0.0))   # SG15 host scalar (SG11: per-tensor cosine)
+    sam_on = float(scalars.get("looksam_sam", 0.0))
+    beta1, beta2 = float(scalars["beta1"]), float(scalars["beta2"])
+    lr, eps, wd = float(scalars["lr"]), float(scalars["eps"]), float(scalars["weight_decay"])
+    alpha_max = float(scalars.get("alpha_max", alpha))
+
+    # Per-tensor (name, offset, numel) in the flat layout.
+    off = 0; layout = []
+    for n_, p in named0:
+        layout.append((n_, off, p.numel(), p.shape)); off += p.numel()
+
+    # ── (A) sharpness vs the bf16-faithful 2nd backward (g_sam−g)². Liveness: a real SAM
+    # step makes sharpness O((ron·‖∇‖)²) ≫ 0. The factory uses k=… so step 1 IS a SAM step.
+    g_r, c_r, m_ref, data_r, dev_r = _build_cell(model)
+    named_ref = [(n, p) for n, p in m_ref.named_parameters() if p.requires_grad]
+    sharp_ref = _sg_bf16_sharpness_oracle(model, named_ref, tx, ty, grad, rho, total, dev)
+    assert sam_on != 0.0, f"{cell_key}: looksam_sam==0 — the SAM 2nd backward did not run at step 1"
+    assert sharp_ref.abs().max().item() > 1e-8, (
+        f"{cell_key}: oracle sharpness is ~0 (the 2nd backward produced no signal) — vacuous gate")
+    sh_abs = (k_sharp - sharp_ref).abs().max().item()
+    sh_den = sharp_ref.abs().max().item() + 1e-30
+    sharp_rel = sh_abs / sh_den
+    sharp_tol = spec.get("sharpness_tol", 2e-2)
+    sharp_ok = sharp_rel < sharp_tol
+    # Liveness on the KERNEL side too: a kernel that skipped the SAM phase would leave
+    # sharpness=0 (the zero-init state) → mu=rescale·phi(g,0)≈small, but the apply would
+    # still ≈match; the sharpness check above (k_sharp vs the nonzero oracle) catches it.
+    assert k_sharp.abs().max().item() > 1e-8, (
+        f"{cell_key}: kernel sharpness is ~0 — the in-kernel SAM 2nd backward did not write it")
+
+    # ── (B) mu vs rescale·phi(g, sharpness). Use the kernel's OWN sharpness (so the meta-net
+    # forward is validated independent of the bf16 2nd-backward floor) and the SAME phi weights
+    # the kernel read (opt_obj.meta_net — the gate scattered THESE into the state). fp64 phi.
+    W1, b1, W2, b2, rescale = opt_obj.meta_net.get_weights()
+    H = opt_obj.meta_net.hidden_dim
+    W1d = W1.reshape(-1).double().to(dev); b1d = b1.reshape(-1).double().to(dev)
+    W2d = W2.reshape(-1).double().to(dev); b2d = float(b2.reshape(-1)[0])
+    gK = grad.double()                       # the kernel's reduced grad
+    shK = k_sharp.double()                   # the kernel's sharpness
+    # ref_sg_phi_forward broadcasts grad_val/sharp_val (each [N,1]) against W1[:,0]/[:,1].
+    phi = ref_sg_phi_forward(gK.unsqueeze(1), shK.unsqueeze(1), W1d, b1d, W2d, b2d)  # [N]
+    mu_ref = (float(rescale) * phi)
+    mu_abs = (k_mu.double() - mu_ref).abs().max().item()
+    mu_den = mu_ref.abs().max().item() + 1e-30
+    mu_rel = mu_abs / mu_den
+    mu_tol = spec.get("mu_tol", 3e-3)
+    mu_ok = mu_rel < mu_tol
+    assert mu_ref.abs().max().item() > 1e-10, (
+        f"{cell_key}: oracle mu is ~0 (rescale·phi≈0) — the factory must force a nonzero rescale")
+
+    # ── (1a)+(1b) apply tail: params + m/v vs the canonical fp64 ref (ref_sg{11,15}_step) with
+    # the kernel's grad + the kernel's mu + the per-tensor gate. The kernel's apply consumes
+    # mu=k_mu (the precompute output) — so the reference uses k_mu too (the apply MATH is what
+    # (1a/1b) isolate; (B) already validated mu separately). m/v start at 0 (zero-init cache).
+    p_ref = torch.empty(total, device=dev, dtype=torch.float64)
+    m_ref_f = torch.empty(total, device=dev, dtype=torch.float64)
+    v_ref_f = torch.empty(total, device=dev, dtype=torch.float64)
+    p_before_t = torch.cat([p.data.reshape(-1).double() for _, p in named_ref])
+    for (n_, o, k, sh) in layout:
+        gt = grad[o:o + k].double()
+        mut = k_mu[o:o + k].double()
+        pt = p_before_t[o:o + k]
+        zt = torch.zeros(k, dtype=torch.float64, device=dev)
+        if opt == "supergrok11":
+            # per-tensor cosine gate (the kernel's P2.45 gate): clamp(<g,mu>/sqrt(|g|²|mu|²+1e-12),0,1).
+            num = (gt * mut).sum()
+            den = torch.sqrt((gt * gt).sum() * (mut * mut).sum() + 1e-12)
+            gate_t = float(torch.clamp(num / den, 0.0, 1.0)) if den > 0 else 0.0
+            pn, mn, vn = ref_sg11_step(pt, gt, zt, zt, mut, gate=gate_t, alpha=alpha,
+                                       lr=lr, beta1=beta1, beta2=beta2, eps=eps, wd=wd, t=1)
+        else:
+            pn, mn, vn = ref_sg15_step(pt, gt, zt, zt, mut, gate_global=gate_global,
+                                       alpha_base=alpha, alpha_max=alpha_max, lr=lr,
+                                       beta1=beta1, beta2=beta2, eps=eps, wd=wd, t=1)
+        p_ref[o:o + k] = pn; m_ref_f[o:o + k] = mn; v_ref_f[o:o + k] = vn
+
+    def _rel(a, b):
+        d = (a.double() - b).abs().max().item(); return d / (b.abs().max().item() + 1e-30)
+    param_rel = _rel(p_after, p_ref)
+    m_rel = _rel(k_m, m_ref_f)
+    v_rel = _rel(k_v, v_ref_f)
+    param_tol = spec.get("param_tol", 1e-4)
+    param_ok = param_rel < param_tol
+    state_ok = (m_rel < 1e-4 and v_rel < 1e-4)
+    if verbose:
+        print(f"  (1a) params vs canonical SG: max-rel={param_rel:.3e} (tol {param_tol:.0e}) "
+              f"{'OK' if param_ok else 'FAIL'}  loss={loss:.5f}", flush=True)
+        print(f"  (1b) STATE vs canonical SG: m={m_rel:.3e} v={v_rel:.3e} (tol 1e-4) "
+              f"{'OK' if state_ok else 'FAIL'}", flush=True)
+        print(f"  (A) sharpness vs bf16-faithful 2nd backward: rel={sharp_rel:.3e} "
+              f"(tol {sharp_tol:.0e}, bf16-TC vs bf16-faithful floor) "
+              f"{'OK' if sharp_ok else 'FAIL'}", flush=True)
+        print(f"  (B) mu vs rescale·phi(g,sharpness): rel={mu_rel:.3e} (tol {mu_tol:.0e}) "
+              f"{'OK' if mu_ok else 'FAIL'}  [rescale={float(rescale):.3g} alpha={alpha:.3g} "
+              f"gate_global={gate_global:.3g}]", flush=True)
+    tail_ok = param_ok and state_ok and sharp_ok and mu_ok
+
+    # ── (2) A/A/A determinism: re-run the production step 3× from the SAME init.
+    def _one():
+        g2, c2, m2, data2, dev2 = _build_cell(model)
+        tx2, ty2 = data2[0], data2[1]
+        opt2 = spec["factory"](g2, m2.parameters(), c2)
+        cc = {}
+        L, G = fused_train_step(canon, opt, m2, opt2, tx2, ty2, state_cache=cc,
+                                step=1, return_grad=True, gemm_impl="wgmma")
+        P = torch.empty(total, device=dev2)
+        o = 0
+        for _, p in m2.named_parameters():
+            if p.requires_grad:
+                k = p.numel(); P[o:o + k].copy_(p.data.reshape(-1)); o += k
+        # also snapshot the mu + sharpness slices (the new SG machinery) for determinism.
+        S = cc[canon]["state"]
+        MU = S[2 * total:3 * total].clone(); SH = S[3 * total + 1:4 * total + 1].clone()
+        return L, G.clone(), P, MU, SH
+    L1, G1, P1, MU1, SH1 = _one(); L2, G2, P2, MU2, SH2 = _one(); L3, G3, P3, MU3, SH3 = _one()
+    det_ok = (L1 == L2 == L3 and torch.equal(G1, G2) and torch.equal(G2, G3)
+              and torch.equal(P1, P2) and torch.equal(P2, P3)
+              and torch.equal(MU1, MU2) and torch.equal(MU2, MU3)
+              and torch.equal(SH1, SH2) and torch.equal(SH2, SH3))
+    if verbose:
+        print(f"  (2) A/A/A determinism: loss {L1:.6f}/{L2:.6f}/{L3:.6f}  "
+              f"grad-eq={torch.equal(G1,G2) and torch.equal(G2,G3)}  "
+              f"param-eq={torch.equal(P1,P2) and torch.equal(P2,P3)}  "
+              f"mu-eq={torch.equal(MU1,MU2) and torch.equal(MU2,MU3)}  "
+              f"sharp-eq={torch.equal(SH1,SH2) and torch.equal(SH2,SH3)}  "
+              f"{'OK' if det_ok else 'FAIL'}", flush=True)
+    ok = tail_ok and det_ok
+    return ok, dict(param_rel=param_rel, sharp_rel=sharp_rel, mu_rel=mu_rel,
+                    loss=loss, det=det_ok)
+
+
 def run_cell_gate(cell_key, verbose=True):
     """Run gates (1)+(2) for one converted cell. Returns (ok, detail)."""
     from grokking_optimizers.dispatch import (has_l3_real, gemm_impl_for_cell,
@@ -426,6 +698,18 @@ def run_cell_gate(cell_key, verbose=True):
     off = 0
     for _, p in named0:
         n = p.numel(); p_after[off:off + n].copy_(p.data.reshape(-1)); off += n
+
+    # ── SuperGrok11/15 dedicated gate (MODEL-COUPLED SAM 2nd backward + meta-net mu).
+    # The SG path does NOT run the eager opt.step() comparison (its bilevel/ramp binding is
+    # not the L3 apply): it validates the kernel against the CANONICAL fp64 math the kernel's
+    # apply_optimizer<SG> calls — the same single-source as ref_sg11_step/ref_sg15_step — plus
+    # the SAM 2nd backward (sharpness) vs the bf16-faithful oracle and mu vs rescale·phi. Short-
+    # circuits run_cell_gate (it owns its own (1a/1b)+(A/B)+(2) verdict).
+    if opt in ("supergrok11", "supergrok15"):
+        ok, detail = _run_sg_cell_gate(cell_key, spec, g, c, m, data, dev, canon,
+                                       opt_obj, grad, loss, p_after, total,
+                                       named0, cache, verbose)
+        return ok, detail
 
     # REFERENCE = the REAL eager optimizer (not a header re-transcription). Build a
     # FRESH model with the SAME init (same seed), INJECT the kernel's TC-reduced grad

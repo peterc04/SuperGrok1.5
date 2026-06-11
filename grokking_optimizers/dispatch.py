@@ -889,6 +889,41 @@ _FUSED_L3_REAL = frozenset({
     # mb_looksam carve-out (mirroring the mamba×prodigy carve-out). Lift BOTH once the mamba
     # forward is fixed by its owner (megakernel_common.cuh GridBarrier / model_stage_mamba3.cuh).
     # ✓ decoder + vit looksam ARE registered-converted (A/A/A bit-exact); only mamba is blocked.
+    # supergrok11 (decoder — SAM-tier lane): CONVERTED. SG11 REUSES the IDENTICAL in-kernel
+    # SAM 2nd backward as looksam (P2.4) — but the elementwise write differs: it stores
+    # sharpness=(g_sam−g)² (supergrok11_sm90.cuh:246, NOT looksam's sam_dir=g_sam−g), the
+    # 2nd MLP input. ON TOP of that 2nd pass runs a per-TENSOR meta-net mu precompute (P2.45,
+    # staged into the P3 drain): mu=sg_rescale·phi(g,sharpness) over each tensor + a per-tensor
+    # cosine gate (clamp(cos(g,mu),0,1)), via sg11_precompute_mu_and_gate_for_tensor<32>
+    # (opt_stages_precompute.cuh, CPU-fp64-validated 9/9). The apply tail (sg11_sweep_b_step:
+    # smart_grad=g+(1−gate)·alpha·mu, AdamW) runs in P3. SharpnessMetaNet hidden_dim=32
+    # (NOT 64 — a known prior bug). The phi weights + sharpness ride the extended state buffer
+    # (4*total+1+kSgPhiPack); fused_train_step scatters the phi pack each step (like NeuralGrok's
+    # psi pack) and sizes the state. _opt_scalars_from forwards sg_rescale + alpha + rho (the SAM
+    # radius) + looksam_sam (the SAM-step gate, same every-k cadence). The decoder launcher binds
+    # st.mu/st.sharpness/st.sg_phi_* + routes opt_id=8. Single persistent launch (SAM 2nd backward
+    # + mu precompute are in-kernel phases). A/A/A by construction (same fixed reductions as
+    # looksam/the first pass). mamba×supergrok11 is BLOCKED (shared mamba-forward A/A/A race).
+    ("transformer_decoder", "supergrok11"),
+    # supergrok11 (vit — SAM-tier lane): CONVERTED. The IDENTICAL in-kernel SAM 2nd backward +
+    # per-tensor mu precompute ported onto the ViT TC kernel (fused_vit_megakernel.cuh): the ViT
+    # tile fns run the 2nd fwd+bwd at p' → sharpness=(g_sam−g)², the P2.45 phase fills mu over
+    # kVitSizes/kVitOffsets, the apply tail runs in P3. The vit launcher binds st.mu/st.sharpness/
+    # st.sg_phi_* + routes opt_id=8. vit's forward is deterministic (vit looksam/prodigy/muon are
+    # A/A/A-green), so SG11 is A/A/A by construction. mamba×supergrok11 stays blocked.
+    ("vit", "supergrok11"),
+    # supergrok15 (decoder — SAM-tier lane): CONVERTED. SAME SAM 2nd backward + per-tensor mu
+    # precompute as SG11, but SIMPLER tail: the gate is a HOST SCALAR (st.gate=sigmoid(accuracy)),
+    # NO per-tensor cosine stage — so the precompute is just mu=sg_rescale·phi(g,sharpness) via
+    # sg15_precompute_mu_for_tensor<32>. The apply tail (sg15_sweep_b_step) does the per-coord
+    # alpha clip (clamp(alpha·(1+mu),0,alpha_max)) + smart_grad=g+gate·a·mu + AdamW. SharpnessMetaNet
+    # hidden_dim=32. State/phi-pack/scalars identical to SG11 (the launcher routes opt_id=9; the
+    # gate is the host scalar, not per-tensor). Single persistent launch; A/A/A by construction.
+    # mamba×supergrok15 is BLOCKED (shared mamba-forward A/A/A race).
+    ("transformer_decoder", "supergrok15"),
+    # supergrok15 (vit — SAM-tier lane): CONVERTED. The IDENTICAL SAM 2nd backward + mu precompute
+    # on the ViT TC kernel; host-scalar gate. The vit launcher routes opt_id=9. mamba stays blocked.
+    ("vit", "supergrok15"),
 })
 
 _FUSED_REGISTRY = {}
@@ -1108,6 +1143,83 @@ def _opt_scalars_from(optimizer, step):
         out["d0"] = float(g["d0"])
         out["d_coef"] = float(g["d_coef"])
         out["beta3"] = _math.sqrt(beta2)
+    elif (hasattr(optimizer, "meta_net") and hasattr(optimizer, "sam_rho")
+          and hasattr(getattr(optimizer, "meta_net", None), "rescale")):
+        # supergrok11 / supergrok15 (decoder/vit L3-TC, MODEL-COUPLED SAM 2nd backward +
+        # per-tensor meta-net mu). The SG optimizers carry their hyperparameters on the
+        # INSTANCE (not param_groups: the group has only lr/betas/eps/wd from `defaults`),
+        # so read them from the optimizer object. The distinguisher from SG2 (which ALSO has
+        # meta_net + sam_rho but a CSAHCAMetaNet) is meta_net.rescale — a SharpnessMetaNet
+        # attribute SG2's meta-net lacks; SG2 is not an L3-REAL cell anyway, but this keeps
+        # the branch unambiguous. We FAITHFULLY reproduce the eager binding's scalar mapping
+        # so the in-kernel apply tail (sg{11,15}_sweep_b_step) consumes the SAME effective
+        # scalars the eager supergrok{11,15}_fused_step would:
+        #
+        #   sg_rescale = meta_net.rescale (the SharpnessMetaNet output scale; mu =
+        #                rescale·phi(g, sharpness)). The phi WEIGHTS (W1/b1/W2/b2) are
+        #                scattered into the state buffer by fused_train_step (the kernel
+        #                reads them from there); only this scalar is in the FusedScalars POD.
+        #   rho        = sam_rho (the SAM perturbation radius; the in-kernel P2.4 perturb
+        #                uses st.rho/‖g‖, identical to the eager sam_perturb_all).
+        #   looksam_sam= the SAM-step gate from the every-(2·meta_update_freq) cadence the
+        #                race uses (train_supergrok: sam_freq = max(1, muf*2)); we recompute
+        #                it from `step` so it does NOT depend on the eager step()/global_step
+        #                having run (mirrors the looksam looksam_sam computation).
+        #   ramp       = the warmup ramp factor (eager _get_ramp_factor at this step).
+        #   base_alpha = the cached meta-net strength (eager _cached_alpha = alpha_init until
+        #                a (loss,acc) signal updates it; the L3 path does not feed losses, so
+        #                it stays alpha_init — faithful, like grokadamw's static-α in-context).
+        #   layer_alpha= base_alpha·(1-gamma_alpha)^(max_idx-idx), clamped [0,1]. gamma_alpha
+        #                defaults to 0 (both SG), so it is UNIFORM = clamp(base_alpha,0,1) for
+        #                every tensor — representable as the single FusedScalars.alpha.
+        import math as _math
+        rescale = float(optimizer.meta_net.get_weights()[4])
+        out["sg_rescale"] = rescale
+        out["rho"] = float(getattr(optimizer, "sam_rho", 0.05))
+        # SAM cadence: the race fires sam_step every sam_freq = max(1, meta_update_freq*2)
+        # steps (train_supergrok). The eager should-SAM check is step % sam_freq == 0 (1-based
+        # `step` here is the authoritative counter the L3 path passes). At step 1 the gate (k=…)
+        # decides if the 2nd backward runs; on intervening steps the cached sharpness is reused.
+        muf = int(getattr(optimizer, "meta_update_freq", 5))
+        sam_freq = max(1, muf * 2)
+        out["looksam_sam"] = 1.0 if (int(step) % sam_freq == 0 or int(step) == 1) else 0.0
+        # ramp + base_alpha + layer_alpha (uniform with gamma_alpha=0). _get_ramp_factor reads
+        # _global_step; the L3 path owns `step`, so compute the ramp from `step` directly to be
+        # independent of whether eager step() ran (warmup_steps/warmup_ramp are instance attrs).
+        ws = int(getattr(optimizer, "warmup_steps", 100))
+        wr = max(1, int(getattr(optimizer, "warmup_ramp", 100)))
+        gstep = int(step)
+        ramp = 0.0 if gstep <= ws else min(1.0, (gstep - ws) / wr)
+        base_alpha = float(getattr(optimizer, "_cached_alpha",
+                                   getattr(optimizer, "alpha_init", 0.98)))
+        layer_alpha = max(0.0, min(1.0, base_alpha))   # gamma_alpha=0 ⇒ uniform
+        lamb = float(getattr(optimizer, "lamb", 2.0))
+        # The kernel's sg11_sweep_b_step does smart_grad = g + (1-gate)·alpha·mu; the eager
+        # SG11 binding does g_eff = g + ramp·lamb·(1-gate)·layer_alpha·mu (lamb_eff =
+        # ramp·lamb·(1-gate)·alpha). Fold ramp·lamb into alpha so the single canonical term
+        # matches: alpha_kernel = ramp·lamb·layer_alpha. The kernel's sg15_sweep_b_step does
+        # smart_grad = g + gate_global·a·mu with a = clamp(alpha_base·(1+mu),0,alpha_max); the
+        # eager SG15 binding passes gate_global = ramp·gate_signal·lamb, alpha_base = alpha_max
+        # = layer_alpha. So SG15's `alpha`/`alpha_max` stay = layer_alpha and the gate carries
+        # ramp·gate_signal·lamb (set below); SG11's alpha carries ramp·lamb·layer_alpha and its
+        # gate is the per-tensor cosine (computed in-kernel — NOT a host scalar).
+        is_sg15 = hasattr(optimizer, "_get_gate_signal")
+        if is_sg15:
+            out["alpha"] = layer_alpha
+            out["alpha_max"] = layer_alpha
+            # gate_global = ramp·gate_signal·lamb (the eager lamb_eff for SG15). gate_signal =
+            # sigmoid(gate_scale·(acc - gate_thresh)); _cached_train_acc=0 at step 1 ⇒ a small
+            # positive sigmoid. Read it from the optimizer (it owns _get_gate_signal).
+            try:
+                gate_signal = float(optimizer._get_gate_signal())
+            except Exception:
+                gate_signal = 0.0
+            out["gate"] = (ramp * gate_signal * lamb) if ramp > 0.0 else 0.0
+        else:
+            # SG11: alpha absorbs ramp·lamb·layer_alpha; the gate is the per-tensor cosine the
+            # kernel computes in P2.45 (NOT passed as a scalar — leave FusedScalars.gate inert).
+            out["alpha"] = (ramp * lamb * layer_alpha) if ramp > 0.0 else 0.0
+        return out
     elif "rho" in g and "k" in g and "alpha" in g:
         # looksam (decoder/vit/mamba L3-TC, MODEL-COUPLED SAM 2nd backward): the kernel's
         # P2.4 phase reads st.rho (perturbation radius) + st.looksam_sam (the every-k
@@ -1388,6 +1500,24 @@ _L3_WGMMA_CELLS = frozenset({
     # mb_looksam carve-out is the C++-side guard (env SG_MAMBA_LOOKSAM_PROBE to observe the
     # landed-dormant tail). Lift once the mamba forward is fixed by its owner.
     ("vit", "looksam"),
+    # supergrok11 (decoder/vit — SAM-tier lane): CONVERTED. The in-kernel SAM 2nd backward
+    # (P2.4, sharpness=(g_sam−g)²) + per-tensor meta-net mu/gate precompute (P2.45) route onto
+    # the {decoder,vit} TC driver via opt_id=8 (dispatch.cpp wgmma_tail_opt_id("supergrok11")=8
+    # → case OptId::SuperGrok11). WITHOUT these entries gemm_impl_for_cell returns "scalar" → the
+    # scalar adamw-only path → a dtype/loud throw; WITH them → "wgmma", the real TC path. mamba×
+    # supergrok11 is BLOCKED (deliberately NOT registered): the SG SAM 2nd backward re-runs the
+    # mamba forward TWICE, exposing the SAME shared mamba-forward A/A/A race as mamba×prodigy/
+    # looksam; the mamba megakernel/launcher carry NO SG case (code-absent block). has_l3_real is
+    # False for mamba×SG → fused_train_step declines → eager. dispatch.cpp's mb_is_sg carve-out
+    # is the C++-side guard. Lift once the mamba forward is fixed by its owner.
+    ("transformer_decoder", "supergrok11"),
+    ("vit", "supergrok11"),
+    # supergrok15 (decoder/vit — SAM-tier lane): CONVERTED. SAME SAM 2nd backward + mu precompute
+    # as SG11, host-scalar gate (no per-tensor cosine). opt_id=9 routes onto the TC driver
+    # (wgmma_tail_opt_id("supergrok15")=9 → case OptId::SuperGrok15). mamba×supergrok15 is BLOCKED
+    # (same shared mamba-forward race; code-absent in the mamba kernel/launcher).
+    ("transformer_decoder", "supergrok15"),
+    ("vit", "supergrok15"),
 })
 
 
@@ -1548,7 +1678,20 @@ def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
         # extras zero-init; param_init is seeded = params at step 1 below (so r=0 at
         # step 1 ⇒ d stays at d0, matching eager). d_lr's zero-init is overridden by
         # the kernel's step-1 d0 cold-start (st.d0), so d_lr starts at d0 like eager.
-        _state_floats = (4 * total + 4) if opt_name == "prodigy" else (3 * total + 1)
+        # SuperGrok11/15 (meta-net mu + SAM 2nd backward) need a LARGER buffer carrying the
+        # PERSISTED sharpness + the phi-net weight pack:
+        #   [m | v | mu | loss | sharpness(total) | phi_pack(4H+1)] = 4*total + 1 + kSgPhiPack
+        #   (the TC launcher carves sharpness at loss_slot+1 and the phi pack after it,
+        #   matching dispatch.cpp's SG state-size check). The extras zero-init; sharpness
+        #   stays 0 until the first SAM step writes it (eager-faithful: _flat_sharpness
+        #   zero-init). H=32 (the kernel's compile-time kSgPhiHidden).
+        _sg_phi_pack = 4 * 32 + 1
+        if opt_name == "prodigy":
+            _state_floats = 4 * total + 4
+        elif opt_name in ("supergrok11", "supergrok15"):
+            _state_floats = 4 * total + 1 + _sg_phi_pack
+        else:
+            _state_floats = 3 * total + 1
         state = torch.zeros(_state_floats, dtype=torch.float32, device=device)
         grad_out = torch.zeros(total, dtype=torch.float32, device=device)
         names = [n for n, _ in named]
@@ -1666,6 +1809,44 @@ def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
                 f"slice (state has {state.numel()}, needs >= {2 * total + npk + 1}).")
         state[2 * total:2 * total + npk].copy_(pack)
 
+    # SuperGrok11/15 SEAM: scatter the FRESH SharpnessMetaNet phi-net weight pack into the
+    # state slice the kernel reads (state[4*total+1 : 4*total+1+kSgPhiPack], right after the
+    # PERSISTED sharpness buffer at state[3*total+1 : 4*total+1]). The TC launcher binds
+    # st.sg_phi_W1/b1/W2 from there (sg_phi_b2 read on-device from sg_phi_W2[H]); the kernel's
+    # P2.45 mu precompute reads the host-owned meta-net weights. We re-lay it EVERY step (cheap,
+    # 129 floats) so a host-trained meta-net (meta_step) is picked up on the very next launch
+    # (the snapshot refresh the megakernel path needs — it cannot run the bilevel autograd).
+    # Pack layout matches opt_components.cuh's kSgPhi*Off: [W1(2H) | b1(H) | W2(H) | b2(1)]
+    # (H=32). The kernel's sg11_phi_forward reads W1 as [H,2] row-major; the meta-net's
+    # Linear(2,H).weight is [H,2] (out=H rows, in=2 cols) → row-major flatten = [j*2],[j*2+1],
+    # exactly what the kernel indexes. W2 is the Linear(H,1).weight [1,H] → flatten = [H]. b2 is
+    # the scalar Linear(H,1).bias. Guard on the SG instance (meta_net) so a non-SG optimizer
+    # (the parity-test stand-ins) never trips it.
+    if opt_name in ("supergrok11", "supergrok15"):
+        if not hasattr(optimizer, "meta_net"):
+            raise RuntimeError(
+                "fused_train_step: supergrok11/15 L3 cell requires an optimizer exposing "
+                f"meta_net (a SharpnessMetaNet) to fill the kernel's phi pack; got "
+                f"{type(optimizer).__name__}.")
+        W1, b1, W2, b2, _rescale = optimizer.meta_net.get_weights()
+        H = optimizer.meta_net.hidden_dim
+        if H != 32:
+            raise RuntimeError(
+                f"fused_train_step: supergrok11/15 SharpnessMetaNet hidden_dim is {H} but the "
+                f"kernel is compiled for kSgPhiHidden=32 (the known prior 64-bug). Build the "
+                f"meta-net with meta_hidden_dim=32.")
+        pack = torch.empty(4 * H + 1, dtype=torch.float32, device=device)
+        pack[0:2 * H].copy_(W1.reshape(-1).to(device=device, dtype=torch.float32))   # W1 [H,2]→row-major
+        pack[2 * H:3 * H].copy_(b1.reshape(-1).to(device=device, dtype=torch.float32))
+        pack[3 * H:4 * H].copy_(W2.reshape(-1).to(device=device, dtype=torch.float32))  # W2 [1,H]→[H]
+        pack[4 * H].copy_(torch.as_tensor(float(b2.reshape(-1)[0]), dtype=torch.float32, device=device))
+        phi_off = 4 * total + 1
+        if phi_off + pack.numel() > state.numel():
+            raise RuntimeError(
+                f"fused_train_step: phi pack ({pack.numel()} floats) does not fit "
+                f"(state has {state.numel()}, needs >= {phi_off + pack.numel()}).")
+        state[phi_off:phi_off + pack.numel()].copy_(pack)
+
     scalars = _opt_scalars_from(optimizer, step)
     # opt_only=False selects the L3-REAL decoder path in dispatch.cpp (which reads
     # tokens/targets from `input` and runs the real fwd+bwd+adamw). The 33 surrogate
@@ -1730,6 +1911,18 @@ def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
         _extra_scalars["rho"] = scalars["rho"]
     if "looksam_sam" in scalars:
         _extra_scalars["looksam_sam"] = scalars["looksam_sam"]
+    # supergrok11/15 (decoder/vit L3-TC, meta-net mu): the kernel's P2.45 mu precompute reads
+    # st.sg_rescale (mu = rescale·phi(g, sharpness)); SG15's apply also reads st.gate (the host
+    # sigmoid(accuracy)) + alpha_max. _opt_scalars_from sets these only for SG; omitting them
+    # leaves the inert FusedScalars defaults (sg_rescale=0 ⇒ mu=0 ⇒ the SG tail degenerates to
+    # AdamW on g). Forward them so the live meta-net mechanism executes. (alpha/gate/alpha_max
+    # are forwarded by the generic _extra_scalars branches above when present in scalars.)
+    if "sg_rescale" in scalars:
+        _extra_scalars["sg_rescale"] = scalars["sg_rescale"]
+    if "alpha_max" in scalars:
+        _extra_scalars["alpha_max"] = scalars["alpha_max"]
+    if "gate" in scalars:
+        _extra_scalars["gate"] = scalars["gate"]
     ops.fused_step(model_c, opt_name, flat, packed, grad_out, state, scalars["lr"],
                    beta1=scalars["beta1"], beta2=scalars["beta2"],
                    eps=scalars["eps"], weight_decay=scalars["weight_decay"],

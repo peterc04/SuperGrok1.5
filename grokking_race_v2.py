@@ -1245,7 +1245,29 @@ def train_supergrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     crit_sg=nn.CrossEntropyLoss()
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
+    mtype=c.get("model_type","decoder")
     for step in (pb:=_pbar("SuperGrok",c["max_steps"],bp)):
+        # TRUE L3 fused path for (decoder|vit × supergrok11): ONE persistent megakernel runs
+        # the REAL fwd+bwd + the MODEL-COUPLED SAM 2nd backward (P2.4: on every-k SAM steps
+        # perturb p'=p+(rho/‖g‖)·g → 2nd in-kernel fwd+bwd at p' → sharpness=(g_sam−g)², cached
+        # in the persistent state slice) + the per-tensor meta-net mu/gate precompute (P2.45:
+        # mu=rescale·phi(g,sharpness), gate=clamp(cos(g,mu),0,1)) + the SG11 apply (smart_grad=
+        # g+(1−gate)·alpha·mu → AdamW), ALL in-kernel — ZERO intermediate launches. If it ran we
+        # SKIP the eager fwd/bwd/sam_step/step (params updated in place); the bilevel meta_step
+        # (host-side amplifier training, needs the autograd graph the megakernel does not return)
+        # is NOT run on the L3 path — the deployed meta-net snapshot is scattered into the state
+        # each step (fused_train_step), faithful to the kernel's evaluated weights. NOTE (honesty,
+        # per .audit_notes.md): without bilevel training the meta-net stays at init (rescale=0 ⇒
+        # mu≈0), so the L3 SG11 race is ≈AdamW — the cell is PARITY-correct + L3-TC, but grok is a
+        # separate documented result (the meta-net memorize-then-collapse dynamics are unchanged).
+        # Falls back to eager (AMP on / non-sm_90 / fp32 / unregistered cell, e.g. mamba).
+        l3_loss=_try_fused_train_step(mtype, "supergrok11", m, opt, tx, ty, c)
+        if l3_loss is not None:
+            loss=torch.as_tensor(l3_loss)
+            if step%eval_every==0 or step==1:
+                done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
+                if done: break
+            continue
         # [A4-M5] L1 fused tail integration for this optimizer requires the
         # adamw/lion post-backward structure (see train_adamw) — do not re-add
         # the pre-forward continue pattern (it skips side-steps and eval).
@@ -1315,7 +1337,26 @@ def train_supergrok15(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     alpha_freq=c.get("supergrok15_alpha_update_freq",50)
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
+    mtype=c.get("model_type","decoder")
     for step in (pb:=_pbar("SuperGrok1.5",c["max_steps"],bp)):
+        # TRUE L3 fused path for (decoder|vit × supergrok15): ONE persistent megakernel runs
+        # the REAL fwd+bwd + the SAME MODEL-COUPLED SAM 2nd backward (P2.4: sharpness=(g_sam−g)²)
+        # + the per-tensor meta-net mu precompute (P2.45: mu=rescale·phi(g,sharpness)) + the SG15
+        # apply (per-coord alpha clip + smart_grad=g+gate·a·mu → AdamW, gate=sigmoid(accuracy) host
+        # scalar), ALL in-kernel — ZERO intermediate launches. If it ran we SKIP the eager fwd/bwd/
+        # sam_step/bilevel_step/step (params updated in place); the host-side bilevel training is
+        # NOT run on the L3 path — the deployed meta-net snapshot is scattered into the state each
+        # step (fused_train_step). NOTE (honesty, per .audit_notes.md): without bilevel training the
+        # meta-net stays at init (rescale=0 ⇒ mu≈0), so the L3 SG15 race is ≈AdamW — PARITY-correct +
+        # L3-TC, but grok is a separate documented result. Falls back to eager (AMP / non-sm_90 /
+        # fp32 / unregistered cell, e.g. mamba).
+        l3_loss=_try_fused_train_step(mtype, "supergrok15", m, opt, tx, ty, c)
+        if l3_loss is not None:
+            loss=torch.as_tensor(l3_loss)
+            if step%eval_every==0 or step==1:
+                done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
+                if done: break
+            continue
         # [A4-M5] L1 fused tail integration for this optimizer requires the
         # adamw/lion post-backward structure (see train_adamw) — do not re-add
         # the pre-forward continue pattern (it skips side-steps and eval).

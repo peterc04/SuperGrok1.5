@@ -1,21 +1,313 @@
 {
   "summary": {
-    "total_cells": 3,
-    "converted_l3_tc": 2,
-    "blocked": 1,
-    "fraction_l3_tc": 0.6667,
+    "total_cells": 33,
+    "converted_l3_tc": 25,
+    "blocked": 8,
+    "fraction_l3_tc": 0.7576,
     "converted_cells": [
+      "adamw/decoder",
+      "neuralgrok/decoder",
+      "grokadamw/decoder",
+      "supergrok/decoder",
+      "supergrok15/decoder",
+      "grokfast/decoder",
+      "muon/decoder",
+      "lion/decoder",
       "looksam/decoder",
-      "looksam/vit"
+      "prodigy/decoder",
+      "adamw/vit",
+      "neuralgrok/vit",
+      "grokadamw/vit",
+      "supergrok/vit",
+      "supergrok15/vit",
+      "grokfast/vit",
+      "muon/vit",
+      "lion/vit",
+      "looksam/vit",
+      "prodigy/vit",
+      "adamw/mamba",
+      "neuralgrok/mamba",
+      "grokadamw/mamba",
+      "grokfast/mamba",
+      "lion/mamba"
     ],
     "blocked_cells": [
-      "looksam/mamba"
+      "supergrok2/decoder",
+      "supergrok2/vit",
+      "supergrok/mamba",
+      "supergrok15/mamba",
+      "supergrok2/mamba",
+      "muon/mamba",
+      "looksam/mamba",
+      "prodigy/mamba"
     ]
   },
   "rows": [
     {
       "model": "decoder",
+      "optimizer": "adamw",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "decoder",
+      "optimizer": "neuralgrok",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "decoder",
+      "optimizer": "grokadamw",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "decoder",
+      "optimizer": "supergrok",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "decoder",
+      "optimizer": "supergrok15",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "decoder",
+      "optimizer": "supergrok2",
+      "executed_path": "eager",
+      "l3_steps_fired": 0,
+      "l3_engines_seen": [],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": false,
+      "reason_if_blocked": "MODEL-COUPLED 2nd-pass + SEPARATE-LAUNCH precompute (OPTSTAGES \u00a77/INTEGRATION-NOTES): the sg2_meta_tail is PARITY-PROVEN as a STANDALONE kernel (sg2_meta_optimizer_tail, its own <<<>>> launch), but it CONSUMES pre-computed host inputs it cannot produce in the single vit launch: (i) `sharpness_packed` \u2014 the SAME SAM 2nd-backward side-channel as SG11/15 (needs a 2nd in-kernel fwd+bwd), AND (ii) `perm_packed`/`unsort_packed` \u2014 a per-tensor SEGMENTED-SORT permutation (a separate sort stage), plus the CSA/HCA/PEER/GRU meta-net weight pack. It is NOT a drop-in P2.x/P3 tail slot like grokadamw/prodigy/muon; wiring it into the single persistent launch needs the 2nd-pass pipeline AND an in-kernel segmented sort \u2014 model-stage + separate-launch machinery, both out of scope."
+    },
+    {
+      "model": "decoder",
+      "optimizer": "grokfast",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "decoder",
+      "optimizer": "muon",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "decoder",
+      "optimizer": "lion",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "decoder",
       "optimizer": "looksam",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "decoder",
+      "optimizer": "prodigy",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "vit",
+      "optimizer": "adamw",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "vit",
+      "optimizer": "neuralgrok",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "vit",
+      "optimizer": "grokadamw",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "vit",
+      "optimizer": "supergrok",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "vit",
+      "optimizer": "supergrok15",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "vit",
+      "optimizer": "supergrok2",
+      "executed_path": "eager",
+      "l3_steps_fired": 0,
+      "l3_engines_seen": [],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": false,
+      "reason_if_blocked": "MODEL-COUPLED 2nd-pass + SEPARATE-LAUNCH precompute (OPTSTAGES \u00a77/INTEGRATION-NOTES): the sg2_meta_tail is PARITY-PROVEN as a STANDALONE kernel (sg2_meta_optimizer_tail, its own <<<>>> launch), but it CONSUMES pre-computed host inputs it cannot produce in the single vit launch: (i) `sharpness_packed` \u2014 the SAME SAM 2nd-backward side-channel as SG11/15 (needs a 2nd in-kernel fwd+bwd), AND (ii) `perm_packed`/`unsort_packed` \u2014 a per-tensor SEGMENTED-SORT permutation (a separate sort stage), plus the CSA/HCA/PEER/GRU meta-net weight pack. It is NOT a drop-in P2.x/P3 tail slot like grokadamw/prodigy/muon; wiring it into the single persistent launch needs the 2nd-pass pipeline AND an in-kernel segmented sort \u2014 model-stage + separate-launch machinery, both out of scope."
+    },
+    {
+      "model": "vit",
+      "optimizer": "grokfast",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "vit",
+      "optimizer": "muon",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "vit",
+      "optimizer": "lion",
       "executed_path": "L3-TC-megakernel(wgmma)",
       "l3_steps_fired": 4,
       "l3_engines_seen": [
@@ -42,6 +334,138 @@
       "reason_if_blocked": ""
     },
     {
+      "model": "vit",
+      "optimizer": "prodigy",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "mamba",
+      "optimizer": "adamw",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "mamba",
+      "optimizer": "neuralgrok",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "mamba",
+      "optimizer": "grokadamw",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "mamba",
+      "optimizer": "supergrok",
+      "executed_path": "eager",
+      "l3_steps_fired": 0,
+      "l3_engines_seen": [],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": false,
+      "reason_if_blocked": "MODEL-COUPLED 2nd-pass (OPTSTAGES \u00a74): SG11's `sharpness` is (g_sam\u2212g)\u00b2 from a SAM SECOND backward at perturbed weights \u2014 a FULL second in-kernel model fwd+bwd+dW-assembly (perturb\u21922nd backward\u2192restore), the SAME model-stage machinery as looksam, a DIFFERENT category from the per-element/precompute tails (prodigy-d, muon-NS) that were in scope. The per-tensor mu/gate meta-MLP precompute sits ON TOP of that 2nd pass. NOTE: the missing `sharpness` FusedOptState field is cheap (append-only, as aux_* proved) but INSUFFICIENT \u2014 the second fwd+bwd pipeline is the real blocker. A host-side 2nd backward feeding st.sharpness would be an intermediate launch (violates single-persistent-launch). Probed re-invocable (vittc_forward_tile/vittc_backward_tile are device fns) but the unit of work is the whole P1+P2 pipeline, twice."
+    },
+    {
+      "model": "mamba",
+      "optimizer": "supergrok15",
+      "executed_path": "eager",
+      "l3_steps_fired": 0,
+      "l3_engines_seen": [],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": false,
+      "reason_if_blocked": "MODEL-COUPLED 2nd-pass (OPTSTAGES \u00a75): same blocker as SG11 \u2014 SG15's `sharpness` is a SAM SECOND-backward side-channel needing a FULL second in-kernel model fwd+bwd+dW-assembly. SG15 is SIMPLER than SG11 in the tail (gate is a host scalar, no cosine stage) but identical at the blocking layer: the 2nd pass is model-stage machinery, out of the per-element-tail scope. The missing `sharpness` field is cheap but insufficient (the 2nd fwd+bwd is the real cost)."
+    },
+    {
+      "model": "mamba",
+      "optimizer": "supergrok2",
+      "executed_path": "eager",
+      "l3_steps_fired": 0,
+      "l3_engines_seen": [],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": false,
+      "reason_if_blocked": "MODEL-COUPLED 2nd-pass + SEPARATE-LAUNCH precompute (OPTSTAGES \u00a77/INTEGRATION-NOTES): the sg2_meta_tail is PARITY-PROVEN as a STANDALONE kernel (sg2_meta_optimizer_tail, its own <<<>>> launch), but it CONSUMES pre-computed host inputs it cannot produce in the single vit launch: (i) `sharpness_packed` \u2014 the SAME SAM 2nd-backward side-channel as SG11/15 (needs a 2nd in-kernel fwd+bwd), AND (ii) `perm_packed`/`unsort_packed` \u2014 a per-tensor SEGMENTED-SORT permutation (a separate sort stage), plus the CSA/HCA/PEER/GRU meta-net weight pack. It is NOT a drop-in P2.x/P3 tail slot like grokadamw/prodigy/muon; wiring it into the single persistent launch needs the 2nd-pass pipeline AND an in-kernel segmented sort \u2014 model-stage + separate-launch machinery, both out of scope."
+    },
+    {
+      "model": "mamba",
+      "optimizer": "grokfast",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "mamba",
+      "optimizer": "muon",
+      "executed_path": "eager",
+      "l3_steps_fired": 0,
+      "l3_engines_seen": [],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": false,
+      "reason_if_blocked": "STAGED grid-cooperative NS, CONVERTED for vit (wave-2): the 11 2D weights' Newton-Schulz orthogonalization is the in-kernel P2.7 phase (grid-barrier-looped, no separate launch); the 1D weights take the P3 AdamW tail with INDEPENDENT aux_lr/aux_betas (the eager non-2D group, carried by the append-only FusedScalars aux_* widening). OPTSTAGES \u00a73. decoder/mamba\u00d7muon are still blocked (no P2.7 wiring there) \u2014 vit fires wgmma; if vit\u00d7muon shows here, the kernel rebuild is stale."
+    },
+    {
+      "model": "mamba",
+      "optimizer": "lion",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
       "model": "mamba",
       "optimizer": "looksam",
       "executed_path": "eager",
@@ -52,6 +476,18 @@
       "error": null,
       "is_l3_tc": false,
       "reason_if_blocked": "BLOCKED: mamba\u00d7looksam in-kernel phase is code-landed (launcher case + if-constexpr'd kernel phase, byte-identical for the routed tails) but FAILS A/A/A on the shared mamba scan/forward race (same class as mamba\u00d7prodigy; for looksam, measured even on a SAM-OFF step \u2192 not the SAM code). Gated to eager via the dispatch.cpp carve-out. decoder/vit looksam ARE L3-TC-converted (A/A/A-clean)."
+    },
+    {
+      "model": "mamba",
+      "optimizer": "prodigy",
+      "executed_path": "eager",
+      "l3_steps_fired": 0,
+      "l3_engines_seen": [],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": false,
+      "reason_if_blocked": "BLOCKED: mamba\u00d7prodigy in-kernel phase is code-landed (launcher case + if-constexpr'd kernel phase, byte-identical for the routed tails) but FAILS A/A/A on the shared mamba scan/forward race (same class as mamba\u00d7prodigy; for looksam, measured even on a SAM-OFF step \u2192 not the SAM code). Gated to eager via the dispatch.cpp carve-out. decoder/vit prodigy ARE L3-TC-converted (A/A/A-clean)."
     }
   ]
 }

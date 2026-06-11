@@ -164,7 +164,24 @@ cudaError_t mega_decoder_real_adamw_tc(
     // grokfast EMA / Prodigy s_track slot — harmless: LookSAM has none of those). The
     // in-kernel P2.4 phase WRITES it on SAM steps; the apply tail READS it every step.
     st.sam_dir        = extra_slice;            // [total] cached SAM direction
-    apply_scalars(st, scalars);   // FULL scalar set (un-frozen bc1/bc2/... + d0/d_coef/beta3 + rho/looksam_sam)
+    // SuperGrok11/15 (MODEL-COUPLED SAM 2nd backward + per-tensor meta-net mu). State
+    // layout: [m | v | mu | loss | sharpness(total) | phi_pack(4H+1)].
+    //   * st.mu = the `extra` slice (recomputed each step by the P2.45 precompute; the
+    //     apply reads it — it aliases sam_dir/ema/s_track, harmless: SG has none).
+    //   * st.sharpness = loss_slot+1 (PERSISTED (g_sam−g)²; the P2.4 SAM 2nd backward
+    //     writes it on SAM steps, the cached value is reused on intervening steps).
+    //   * st.sg_phi_W1/b1/W2 = the phi pack at sharpness+total (host-scattered each step,
+    //     like NeuralGrok's psi pack); sg_phi_b2 is read on-device from sg_phi_W2[H].
+    st.mu             = extra_slice;            // [total] meta-net mu (P2.45-filled)
+    {
+        float* sharp_base = loss_out + 1;       // state + 3*total + 1
+        float* phi_base   = sharp_base + total; // phi pack after sharpness
+        st.sharpness = sharp_base;
+        st.sg_phi_W1 = phi_base + kSgPhiW1Off;
+        st.sg_phi_b1 = phi_base + kSgPhiB1Off;
+        st.sg_phi_W2 = phi_base + kSgPhiW2Off;  // sg_phi_b2 read on-device from [H]
+    }
+    apply_scalars(st, scalars);   // FULL scalar set (un-frozen bc1/bc2/... + d0/d_coef/beta3 + rho/looksam_sam/sg_rescale)
     st.lr = lr;
 
     DecoderTokenCtx tok;
@@ -223,6 +240,24 @@ cudaError_t mega_decoder_real_adamw_tc(
             // persists in the extra slice (st.sam_dir, bound above). The apply tail (P3)
             // blends g_adj=(1−α)g+α·sam_dir and runs AdamW. NOT a separate launch.
             return launch_fused_decoder_megakernel_tc<OptId::LookSAM>(
+                ctx, params, tok, grad, lr, step, st, stream, nCTA);
+        case OptId::SuperGrok11:
+            // MODEL-COUPLED SAM 2nd backward + per-tensor meta-net mu/gate (wave-3
+            // decoder lane): the SAME single persistent launch. The SAM 2nd backward
+            // (P2.4, sharpness=(g_sam−g)²) + the per-tensor mu precompute (P2.45,
+            // mu=rescale·phi(g,sharpness)) + the per-tensor cosine gate are ALL
+            // in-kernel phases between B2 and P3; the apply tail (sg11_sweep_b_step:
+            // smart_grad=g+(1−gate)·alpha·mu, AdamW) runs in P3. The SAM scratch reuses
+            // the looksam buffers (dec_tc_looksam_floats); sharpness + the phi pack ride
+            // the extended state buffer (bound above). NOT a separate launch.
+            return launch_fused_decoder_megakernel_tc<OptId::SuperGrok11>(
+                ctx, params, tok, grad, lr, step, st, stream, nCTA);
+        case OptId::SuperGrok15:
+            // Same SAM 2nd backward + mu precompute as SG11, but SIMPLER tail: the gate
+            // is a host scalar (st.gate = sigmoid(accuracy)), NO per-tensor cosine stage;
+            // the apply tail (sg15_sweep_b_step) does the per-coord alpha clip + smart_grad
+            // = g + gate·a·mu + AdamW. Single persistent launch.
+            return launch_fused_decoder_megakernel_tc<OptId::SuperGrok15>(
                 ctx, params, tok, grad, lr, step, st, stream, nCTA);
         default:
             return cudaErrorInvalidValue;  // STAGED/coupled opt not single-launch TC

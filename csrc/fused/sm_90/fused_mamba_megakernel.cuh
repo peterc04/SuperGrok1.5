@@ -127,6 +127,9 @@ mamba_rebase_state(const FusedOptState& s, int64_t off) {
     if (t.param_init) t.param_init += off;   // Prodigy trajectory anchor p0 (per-tensor
                                              // slice). prodigy_persist is a GLOBAL 3-
                                              // scalar [r_ema|s_ema|d_lr] — NOT rebased.
+    if (t.sharpness)  t.sharpness  += off;   // SuperGrok11/15 (g_sam−g)² (per element;
+                                             // DORMANT for mamba — gated out, no SG case).
+    // SuperGrok11/15 phi weights are a per-TENSOR weight set (NOT rebased).
     return t;
 }
 

@@ -78,6 +78,27 @@ static constexpr int kPsiW2Off = 2 * kPsiHidden;
 static constexpr int kPsiB2Off = 3 * kPsiHidden;   // scalar slot (device-side)
 static constexpr int kPsiPackFloats = 3 * kPsiHidden + 1;
 
+// SuperGrok11/15 SharpnessMetaNet (phi-net) hidden width (compile-time). Matches
+// the canonical per-op kernels' SG11_H / SG15_H == 32 (supergrok11_sm90.cuh:63,
+// supergrok15_sm90.cuh:51) and opt_stages_precompute.cuh::kSGMetaHidden — NOT the
+// 16 of NeuralGrok's psi width. The phi-net is W1[H,2] (row-major), b1[H], W2[H],
+// b2 scalar — IDENTICAL shape to the psi-net but 2 inputs/hidden unit (grad +
+// sharpness) and H=32. An SG11/SG15 cell carries this weight pack in the head of a
+// dedicated state slice (host-scattered each step, like NeuralGrok's psi pack):
+//   phi[0           .. 2*H)            = phi_W1 [H,2]  (row-major: [j*2], [j*2+1])
+//   phi[2*H         .. 3*H)            = phi_b1 [H]
+//   phi[3*H         .. 4*H)            = phi_W2 [H]
+//   phi[4*H]                          = phi_b2 (scalar; read on-device)
+// The cell binds st.sg_phi_W1/b1/W2 from these offsets (a real bound pointer, not a
+// null-deref) and reads phi_b2 on-device from sg_phi_W2[H] (a host scalar cannot
+// deref a device pointer — same pattern as psi_b2).
+static constexpr int kSgPhiHidden = 32;
+static constexpr int kSgPhiW1Off  = 0;
+static constexpr int kSgPhiB1Off  = 2 * kSgPhiHidden;
+static constexpr int kSgPhiW2Off  = 3 * kSgPhiHidden;
+static constexpr int kSgPhiB2Off  = 4 * kSgPhiHidden;   // scalar slot (device-side)
+static constexpr int kSgPhiPackFloats = 4 * kSgPhiHidden + 1;
+
 // All optimizer state any of the 11 tails may read. A given cell zero-fills the
 // pointers its optimizer does not use; each apply_optimizer<> branch touches
 // ONLY its own optimizer's real buffers (so unused ones are never dereferenced).
@@ -154,6 +175,27 @@ struct FusedOptState {
     // are inert (rho=0 ⇒ no perturb; looksam_sam=0 ⇒ no 2nd pass) so every non-LookSAM
     // cell is byte-identical.
     float rho = 0.0f, looksam_sam = 0.0f;
+    // SuperGrok11/15 (decoder/vit L3-TC, MODEL-COUPLED SAM 2nd backward + per-tensor
+    // meta-net mu precompute). The SAME in-kernel SAM machinery as LookSAM produces
+    // `sharpness = (g_sam − g)²` (NOT looksam's sam_dir = g_sam − g; the elementwise
+    // write differs — supergrok11_sm90.cuh:246 / supergrok15_sm90.cuh:315), persisted
+    // across steps in a state slice the cell binds. The per-tensor meta-net precompute
+    // phase (P2.45) then fills st.mu = sg_rescale·phi(g, sharpness) over each tensor via
+    // sg11_precompute_mu_and_gate_for_tensor<32> / sg15_precompute_mu_for_tensor<32>
+    // (opt_stages_precompute.cuh), and the apply tail reads st.mu (+ st.gate). The phi
+    // weights (W1[H,2]/b1[H]/W2[H]/b2) are a per-TENSOR weight set carried as device
+    // pointers (the cell scatters the host meta-net pack into a state slice and binds
+    // these, exactly like NeuralGrok's psi pointers). sg_phi_b2 is read on-device from
+    // sg_phi_W2[kSgPhiHidden] (a host scalar cannot deref a device pointer — the cell
+    // leaves it at 0.0f). sg_rescale rides FusedScalars. Defaults are inert (null phi /
+    // sharpness ⇒ the precompute phase is if-constexpr'd to SG11/SG15 only, never run
+    // for other cells), so every non-SG cell is byte-identical.
+    const float* sharpness = nullptr;   // [total] (g_sam − g)², persisted, SAM 2nd pass
+    const float* sg_phi_W1 = nullptr;   // [kSgPhiHidden*2]  (row-major [H,2])
+    const float* sg_phi_b1 = nullptr;   // [kSgPhiHidden]
+    const float* sg_phi_W2 = nullptr;   // [kSgPhiHidden]
+    float        sg_phi_b2 = 0.0f;      // read on-device from sg_phi_W2[kSgPhiHidden]
+    float        sg_rescale = 0.0f;     // SharpnessMetaNet rescale (mu = rescale·phi)
 };
 
 // =========================================================================
@@ -231,6 +273,15 @@ struct FusedScalars {
     //    caller is byte-identical (only OptId::LookSAM's model phase reads them).
     float rho         = 0.0f;
     float looksam_sam = 0.0f;
+    // ── SuperGrok11/15 append-only widening (decoder/vit L3-TC, meta-net mu). The
+    //    ONLY SG scalar that flows through here: the SharpnessMetaNet rescale (mu =
+    //    rescale·phi(g, sharpness), supergrok11_sm90.cuh:130 / supergrok15_sm90.cuh:98).
+    //    The phi WEIGHTS + sharpness are DEVICE pointers the cell binds directly (not
+    //    scalars). rho is SHARED with LookSAM (SG's SAM perturbation radius also rides
+    //    st.rho); st.alpha carries the SG meta-net strength (the apply tail reads it).
+    //    Inert default (0.0 ⇒ mu=0 ⇒ the SG tail degenerates to AdamW on g) for every
+    //    non-SG caller; layout stays byte-identical (only the SG P2.45 phase + tail read it).
+    float sg_rescale  = 0.0f;
 };
 
 // Fold the runtime scalars into a FusedOptState (pointers are bound separately
@@ -264,8 +315,9 @@ __host__ __device__ __forceinline__ void apply_scalars(FusedOptState& st,
     st.aux_lr       = s.aux_lr;      // Muon 1D-group AdamW lr (eager adamw_lr)
     st.aux_beta1    = s.aux_beta1;   // Muon 1D-group AdamW betas[0]
     st.aux_beta2    = s.aux_beta2;   // Muon 1D-group AdamW betas[1]
-    st.rho          = s.rho;         // LookSAM perturbation radius
+    st.rho          = s.rho;         // LookSAM / SuperGrok11/15 SAM perturbation radius
     st.looksam_sam  = s.looksam_sam; // LookSAM every-k SAM-step gate (1=run 2nd bwd)
+    st.sg_rescale   = s.sg_rescale;  // SuperGrok11/15 SharpnessMetaNet rescale (mu=rescale·phi)
     // st.d_factor is NOT host-bound for the STAGED-d cell: the kernel's Prodigy
     // reduction stage computes it on-device (between B2 and P3) and stashes it.
     // st.param_init / st.prodigy_persist are device pointers bound by the cell.

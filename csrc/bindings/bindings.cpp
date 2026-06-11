@@ -3497,7 +3497,14 @@ PYBIND11_MODULE(_ops, m) {
  // degrade). The LookSAM cell passes rho (perturbation radius) + looksam_sam (the
  // every-k SAM-step gate, 1.0 on SAM steps) so the kernel's P2.4 perturb→2nd
  // fwd+bwd→sam_dir=g_sam−g phase fires on the right cadence.
- py::arg("rho") = 0.0f, py::arg("looksam_sam") = 0.0f);
+ py::arg("rho") = 0.0f, py::arg("looksam_sam") = 0.0f,
+ // SuperGrok11/15 meta-net rescale (decoder/vit L3-TC). Trailing defaulted arg →
+ // back-compat preserved (inert 0.0 for every non-SG cell; a stale _ops without it
+ // trips the caller's one-shot TypeError latch, loud degrade). The SG cell passes the
+ // SharpnessMetaNet rescale so the kernel's P2.45 meta-net mu precompute (mu =
+ // rescale·phi(g, sharpness)) runs the live mechanism; the phi weights + sharpness
+ // buffer ride the STATE buffer (cell-scattered), so only this scalar is in the ABI.
+ py::arg("sg_rescale") = 0.0f);
 
  // GrokAdamW
  m.def("grokadamw_step", &sg::grokadamw_step);
