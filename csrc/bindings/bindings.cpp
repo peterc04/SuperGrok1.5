@@ -3490,7 +3490,14 @@ PYBIND11_MODULE(_ops, m) {
  // non-Muon cell). The vit Muon cell passes adamw_lr/adamw_betas so the kernel's
  // Muon P3 1D AdamW tail matches the eager non-2D group.
  py::arg("aux_lr") = 1e-3f, py::arg("aux_beta1") = 0.9f,
- py::arg("aux_beta2") = 0.98f);
+ py::arg("aux_beta2") = 0.98f,
+ // LookSAM SAM 2nd-backward scalars (decoder/vit/mamba L3-TC, MODEL-COUPLED).
+ // Trailing defaulted args → back-compat preserved (inert 0.0 for every non-LookSAM
+ // cell; a stale _ops without them trips the caller's one-shot TypeError latch, loud
+ // degrade). The LookSAM cell passes rho (perturbation radius) + looksam_sam (the
+ // every-k SAM-step gate, 1.0 on SAM steps) so the kernel's P2.4 perturb→2nd
+ // fwd+bwd→sam_dir=g_sam−g phase fires on the right cadence.
+ py::arg("rho") = 0.0f, py::arg("looksam_sam") = 0.0f);
 
  // GrokAdamW
  m.def("grokadamw_step", &sg::grokadamw_step);

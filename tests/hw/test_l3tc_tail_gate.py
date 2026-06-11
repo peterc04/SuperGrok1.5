@@ -92,6 +92,19 @@ def _muon_factory(g, params, c):
                   weight_decay=c["weight_decay"])
 
 
+def _looksam_factory(g, params, c):
+    # train_looksam: LookSAM(lr, betas=(beta1,beta2), weight_decay, rho=looksam_rho
+    # (0.05), k=looksam_k (5), alpha=looksam_alpha (0.7)). The race uses these exact
+    # defaults; the gate drives the SAME optimizer. Its state is exp_avg/exp_avg_sq +
+    # sam_direction (the kernel's `extra` slice). k=5 so step 1 is a SAM step
+    # (should_sam_step: _global_step%k==0, _global_step starts 0) — the gate runs at
+    # step 1, exercising the in-kernel SAM 2nd backward.
+    return g.LookSAM(params, lr=c["lr"], betas=(c["beta1"], c["beta2"]),
+                     weight_decay=c["weight_decay"],
+                     rho=c.get("looksam_rho", 0.05), k=c.get("looksam_k", 5),
+                     alpha=c.get("looksam_alpha", 0.7))
+
+
 def _prodigy_factory(g, params, c):
     # train_prodigy: Prodigy(lr=prodigy_lr (1.0), weight_decay, d0=1e-6, d_coef=1.0,
     # betas=(0.9,0.999)). The race uses the defaults; the gate drives the EXACT same
@@ -296,6 +309,30 @@ _CELLS = {
     # branch reads the eager NS-group momentum for the 2D matrices). pos.weight rows=4 is
     # the smallest NS matrix in the whole campaign — this gate exercises it against eager.
     "muon/decoder": dict(model="decoder", opt="muon", factory=_muon_factory, param_tol=2e-3),
+    # looksam (decoder — SAM-tier lane): CONVERTED. The MODEL-COUPLED SAM 2nd backward
+    # (st.sam_dir = g_sam − g) is an IN-KERNEL phase (P2.4) on the decoder TC kernel: on
+    # SAM steps (every k) it perturbs p'=p+(rho/‖g‖)·g, runs a FULL SECOND in-kernel
+    # fwd+bwd at p' → g_sam, writes sam_dir=g_sam−g (persisted in the `extra` slice), and
+    # restores p; the apply tail blends g_adj=(1−α)g+α·sam_dir → AdamW. The gate runs at
+    # step 1 (a SAM step), so the 2nd backward fires. run_cell_gate has a looksam branch:
+    #   (1a) params — copy the kernel's OWN sam_dir into opt_ref's sam_direction, inject
+    #        the kernel grad g, then opt_ref.step() blends the SAME direction and runs
+    #        AdamW: tight (1e-4) APPLY-TAIL parity (the 14/0 apply math on the kernel's
+    #        reduced grad + sam_dir). param_tol stays tight — the apply has no NS-style
+    #        fp32 accumulation, so a dropped blend / wrong AdamW shows immediately.
+    #   (1b) STATE — m/v from the blended grad (tight 1e-4); the `extra` slice (== the
+    #        kernel's sam_dir) is checked against an INDEPENDENT bf16-floor reference: the
+    #        eager LookSAM.sam_step's 2nd backward (fp32 autograd through the reference
+    #        model at the SAME perturbed weights) → sam_dir_eager = g_sam_eager − g. The
+    #        kernel's bf16-TC 2nd backward vs the fp32 eager 2nd backward differ only by
+    #        the bf16 floor (the SAME DESIGN ≤2e-2 the first-grad adamw gate calibrates),
+    #        so sam_dir is checked at 2e-2 — a REAL parity against a real 2nd backward, not
+    #        a self-referential pass. A kernel that SKIPPED the SAM phase (sam_dir≈0) FAILS
+    #        this (g_sam_eager−g is O(rho)≫0). The 2nd backward's exact correctness is
+    #        inherited from the shared adamw grad gate (same fwd/bwd/assembly code), and
+    #        (2) A/A/A proves the 2nd pass introduced no race.
+    "looksam/decoder": dict(model="decoder", opt="looksam", factory=_looksam_factory,
+                            sam_dir_tol=2e-2),
 }
 
 # BLOCKED cells — kept here (commented) with the state-gate evidence that blocks them,
@@ -424,6 +461,76 @@ def run_cell_gate(cell_key, verbose=True):
         # device before the eager reference's per-op neuralgrok kernel so its psi-weight
         # staging is not racing the just-finished L3 launch's teardown.
         torch.cuda.synchronize()
+    # LOOKSAM: the kernel ran the in-kernel SAM 2nd backward (P2.4) on this (step-1) SAM
+    # step, writing sam_dir = g_sam − g into the `extra` state slice and BLENDING
+    # g_adj=(1−α)g+α·sam_dir in the apply. The gate validates BOTH surfaces:
+    #   (A) sam_dir parity — vs the bf16-FAITHFUL fp64 oracle's OWN 2nd backward (the
+    #       SAME instrument test_tc_single_step_grad_parity uses for the first grad, NOT
+    #       a fp32-autograd reference: fp32-autograd carries a ~6.6e-2 bf16-storage gap
+    #       that is WRONG for a bf16-TC kernel — measured: kernel-vs-bf16faithful 1.8e-2,
+    #       eager-fp32-vs-bf16faithful 6.6e-2, so the kernel is CLOSER to the bf16 truth
+    #       than fp32 is). We perturb the oracle params by ron·g (ron=rho/‖g‖_global, the
+    #       SAME global-norm perturb the kernel + binding's looksam_perturb_all use, with
+    #       g the kernel's reduced grad) and form sam_dir_bf = g_sam_bf − g_bf. Compared
+    #       at the DESIGN bf16 floor (sam_dir_tol=2e-2). A SKIPPED SAM phase (sam_dir≈0)
+    #       fails it (‖sam_dir_bf‖ is O(ron·‖∇‖)≫0). DECODER-specific (the oracle is the
+    #       decoder one); vit/mamba use their own bf16-faithful oracle when ported.
+    #   (B) apply-tail parity — set opt_ref's sam_direction to the KERNEL's sam_dir so
+    #       opt_ref.step() blends the SAME direction the kernel used; this isolates (1a)
+    #       params + (1b) m/v to the apply math at tight tol (1e-4), free of the 2nd-
+    #       backward bf16 gap. The injected p.grad already holds the kernel's g.
+    looksam_sam_dir_rel = None
+    if opt == "looksam":
+        kstate0 = cache[canon]["state"]
+        k_sam = kstate0[2 * total:3 * total]           # the kernel's cached sam_dir
+        # (A) bf16-faithful sam_dir reference (decoder oracle, perturbed by ron·g).
+        if model == "decoder":
+            from tests.hw.test_decoder_tc import _bf16_faithful_oracle
+            B = int(tx.shape[0]); B16 = B - (B % 16)
+            tok_o = tx[:B16].to(torch.long); tgt_o = ty[:B16].to(torch.long)
+            named_d = {n: p.detach() for n, p in named_ref}
+            _lo, grads_o = _bf16_faithful_oracle(named_d, tok_o, tgt_o)
+            gn = torch.sqrt(sum((gv.double() ** 2).sum() for gv in grads_o.values())).item()
+            rho = float(opt_ref.param_groups[0]["rho"])
+            ron = rho / gn
+            # perturb each param by ron·g (g = the kernel's reduced grad, layout order).
+            off = 0; named_pert = {}
+            for n_, p in named_ref:
+                k = p.numel()
+                named_pert[n_] = (p.detach().double()
+                                  + ron * grad[off:off + k].reshape(p.shape).double())
+                off += k
+            _lo2, grads_o2 = _bf16_faithful_oracle(named_pert, tok_o, tgt_o)
+            r_sam = torch.cat([(grads_o2[n_] - grads_o[n_]).reshape(-1).double()
+                               for n_, _ in named_ref]).float().to(dev)
+        else:
+            raise NotImplementedError(
+                f"{cell_key}: looksam sam_dir reference oracle not wired for {model} "
+                f"(only decoder's bf16-faithful oracle is available here).")
+        sd_abs = (k_sam - r_sam).abs().max().item()
+        sd_den = r_sam.abs().max().item() + 1e-30
+        looksam_sam_dir_rel = sd_abs / sd_den
+        # Liveness: a real SAM step makes sam_dir O(ron·‖∇‖) ≫ 0 — a skipped phase is ~0.
+        assert r_sam.abs().max().item() > 1e-6, (
+            f"{cell_key}: oracle sam_dir is ~0 (the 2nd backward produced no direction) "
+            f"— the gate's sam_dir parity would be vacuous.")
+        # (B) set opt_ref's sam_direction to the KERNEL's sam_dir for the apply parity.
+        # LookSAM.step()'s _group_cache only INITIALISES state[p] when len(state)==0, so
+        # we must seed the FULL state (exp_avg/exp_avg_sq/step/sam_direction) here — else
+        # adding only sam_direction makes len(state)>0 and step() KeyErrors on exp_avg.
+        # exp_avg/exp_avg_sq start at ZERO (the kernel's zero-init m/v cache), step=0.
+        off = 0
+        for _, p in named_ref:
+            n = p.numel()
+            stt = opt_ref.state[p]
+            stt["step"] = 0
+            stt["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+            stt["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+            stt["sam_direction"] = k_sam[off:off + n].reshape(p.shape).clone().float()
+            off += n
+        # Invalidate the static cache so step() rebuilds it from the seeded state (the
+        # factory may have warmed it; we want our seeded exp_avg/sam_direction used).
+        opt_ref._static_cache = {}
     opt_ref.step()
     p_ref = torch.cat([p.data.reshape(-1) for _, p in named_ref])
 
@@ -514,12 +621,28 @@ def run_cell_gate(cell_key, verbose=True):
     # reorder tol. ema only checked when the optimizer HAS an ema buffer.
     state_ok = (m_rel < 1e-4 and v_rel < 1e-4
                 and (ema_rel is None or ema_rel < 1e-4))
+    # LOOKSAM: the `extra` slice is the SAM direction (sam_dir=g_sam−g), NOT an EMA/s —
+    # so it is NOT in the m/v/ema state check above. It is validated SEPARATELY against
+    # the INDEPENDENT eager 2nd backward (looksam_sam_dir_rel, computed before step())
+    # at the bf16 floor (sam_dir_tol). This is the load-bearing check for the new SAM
+    # machinery — fold it into state_ok so a wrong/skipped sam_dir FAILS the gate.
+    sam_ok = True
+    if opt == "looksam":
+        sam_tol = spec.get("sam_dir_tol", 2e-2)
+        sam_ok = (looksam_sam_dir_rel is not None and looksam_sam_dir_rel < sam_tol)
+        state_ok = state_ok and sam_ok
     if verbose:
         ema_s = f"ema={ema_rel:.3e}" if ema_rel is not None else "ema=n/a"
         ref_s = "canonical neuralgrok.h" if opt == "neuralgrok" else "REAL eager"
         print(f"  (1b) STATE vs {ref_s}: m={m_rel:.3e} v={v_rel:.3e} {ema_s} "
               f"(tol 1e-4) {'OK' if state_ok else 'FAIL — kernel state != reference'}",
               flush=True)
+        if opt == "looksam":
+            print(f"  (1b-sam) sam_dir vs bf16-faithful 2nd backward: rel={looksam_sam_dir_rel:.3e} "
+                  f"(tol {spec.get('sam_dir_tol', 2e-2):.0e}, kernel bf16-TC vs bf16-faithful "
+                  f"fp64 oracle = the DESIGN bf16 floor) "
+                  f"{'OK' if sam_ok else 'FAIL — kernel sam_dir != bf16-faithful 2nd backward'}",
+                  flush=True)
         if opt == "neuralgrok":
             print(f"       [diag] eager per-op kernel vs canonical: m={eager_m_rel:.3e} "
                   f"v={eager_v_rel:.3e} (large => eager cross-cell contamination, "

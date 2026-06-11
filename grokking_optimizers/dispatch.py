@@ -844,6 +844,27 @@ _FUSED_L3_REAL = frozenset({
     # The aux_lr/aux_betas plumbing + 4*total state sizing are model-agnostic. Still a
     # SINGLE persistent launch. mamba×muon stays blocked (no mamba P2.7).
     ("transformer_decoder", "muon"),
+    # looksam (decoder — SAM-tier lane): CONVERTED. The MODEL-COUPLED SAM 2nd backward
+    # (st.sam_dir = g_sam − g, INTEGRATION-OPTSTAGES §6) is now an IN-KERNEL phase (P2.4,
+    # between B2 and P2.5/P3) on the decoder TC kernel (fused_decoder_megakernel.cuh):
+    # on every-k SAM steps it computes the GLOBAL ‖g‖ (deterministic ascending-CTA reduce,
+    # IDENTICAL shape to GrokAdamW's P2.5), perturbs p'=p+(rho/‖g‖)·g (backup saved for the
+    # exact restore), runs a FULL SECOND in-kernel fwd+bwd at p' (re-invoking dectc_forward_
+    # tile/dectc_backward_tile + the deterministic grad assembly into a SEPARATE sam_grad
+    # buffer so the first grad is untouched), writes sam_dir=g_sam−g into the PERSISTENT
+    # `extra` state slice, and restores p. On the k−1 intervening steps (looksam_sam==0) the
+    # cached sam_dir is reused verbatim, NO 2nd pass. The apply tail (apply_optimizer<LookSAM>,
+    # already in opt_components.cuh) blends g_adj=(1−α)g+α·sam_dir and runs AdamW. Still a
+    # SINGLE persistent launch (the SAM 2nd backward is an in-kernel phase, the same shape as
+    # Prodigy's P2.6 / Muon's P2.7). The SAM-step gate is host-computed from the every-k cadence
+    # ((step-1)%k==0, _opt_scalars_from) and threaded via FusedScalars.looksam_sam; rho rides
+    # FusedScalars.rho, α the existing alpha. The transient backup+sam_grad buffers are carved
+    # in dec_tc_workspace_floats (dec_tc_looksam_floats, after the Muon scratch — the prior
+    # cells stay byte-identical). The decoder launcher binds st.sam_dir to the extra slice +
+    # routes opt_id=4 (case OptId::LookSAM). DETERMINISM: every reduction is the deterministic
+    # ascending shape; the 2nd fwd+bwd reuses the A/A/A-clean first-pass machinery → A/A/A by
+    # construction. vit + mamba looksam follow (the same in-kernel phase ported per model).
+    ("transformer_decoder", "looksam"),
 })
 
 _FUSED_REGISTRY = {}
@@ -1063,6 +1084,21 @@ def _opt_scalars_from(optimizer, step):
         out["d0"] = float(g["d0"])
         out["d_coef"] = float(g["d_coef"])
         out["beta3"] = _math.sqrt(beta2)
+    elif "rho" in g and "k" in g and "alpha" in g:
+        # looksam (decoder/vit/mamba L3-TC, MODEL-COUPLED SAM 2nd backward): the kernel's
+        # P2.4 phase reads st.rho (perturbation radius) + st.looksam_sam (the every-k
+        # SAM-step gate) and st.alpha (the cached-direction blend, looksam.h:81). LookSAM's
+        # param_group carries `rho`, `k`, `alpha` (and NO d0/momentum/grokfast_alpha/beta,
+        # which distinguishes it from the branches above). Forward them so the kernel runs
+        # the live mechanism. The SAM cadence: eager should_sam_step() is _global_step % k
+        # == 0 with _global_step starting at 0 and incrementing in step() — so SAM fires at
+        # global_step ∈ {0, k, 2k} ↔ 1-based `step` ∈ {1, 1+k, 1+2k} ↔ (step-1) % k == 0.
+        # We compute the flag from `step` (the authoritative 1-based counter the L3 path
+        # passes) so it does NOT depend on whether the eager step()/global_step ran.
+        out["alpha"] = float(g["alpha"])
+        out["rho"] = float(g["rho"])
+        kk = int(g.get("k", 5))
+        out["looksam_sam"] = 1.0 if ((int(step) - 1) % max(kk, 1) == 0) else 0.0
     elif "momentum" in g and "betas" not in g:
         # muon (vit L3-TC, STAGED grid-cooperative NS): the kernel's P2.7 reads the
         # momentum as st.beta1 (buf = β1·buf + g, muon.h:43-44). Muon's 2D param_group
@@ -1307,6 +1343,14 @@ _L3_WGMMA_CELLS = frozenset({
     # an Int/Float dtype throw on the token input (the bug this fixes). With it →
     # "wgmma", the real TC path. mamba×muon stays blocked (no mamba P2.7).
     ("transformer_decoder", "muon"),
+    # looksam (decoder — SAM-tier lane): CONVERTED. The SAM 2nd backward is the in-kernel
+    # P2.4 phase (perturb→2nd fwd+bwd→sam_dir=g_sam−g) on the decoder TC kernel; opt_id=4
+    # routes it onto the TC driver (dispatch.cpp wgmma_tail_opt_id("looksam")=4 → case
+    # OptId::LookSAM in the decoder launcher). WITHOUT this entry gemm_impl_for_cell returns
+    # "scalar" → the scalar adamw-only decoder path → an Int/Float dtype throw on the token
+    # input; WITH it → "wgmma", the real TC path. vit×looksam joins (the same in-kernel P2.4
+    # phase ported to the vit TC kernel). mamba×looksam follows once the mamba phase lands.
+    ("transformer_decoder", "looksam"),
 })
 
 
@@ -1639,6 +1683,16 @@ def fused_train_step(model_name, opt_name, torch_module, optimizer, tokens,
         _extra_scalars["aux_beta1"] = scalars["aux_beta1"]
     if "aux_beta2" in scalars:
         _extra_scalars["aux_beta2"] = scalars["aux_beta2"]
+    # looksam (decoder/vit/mamba L3-TC, MODEL-COUPLED SAM 2nd backward): the kernel's
+    # P2.4 phase reads st.rho + st.looksam_sam. _opt_scalars_from sets these only for
+    # looksam; omitting them leaves the inert FusedScalars defaults (rho=0 ⇒ no perturb,
+    # looksam_sam=0 ⇒ no 2nd backward), which would DROP the SAM direction entirely (the
+    # cell would degenerate to plain AdamW on g). Forward them so the in-kernel perturb→
+    # 2nd fwd+bwd→sam_dir=g_sam−g fires on the every-k cadence.
+    if "rho" in scalars:
+        _extra_scalars["rho"] = scalars["rho"]
+    if "looksam_sam" in scalars:
+        _extra_scalars["looksam_sam"] = scalars["looksam_sam"]
     ops.fused_step(model_c, opt_name, flat, packed, grad_out, state, scalars["lr"],
                    beta1=scalars["beta1"], beta2=scalars["beta2"],
                    eps=scalars["eps"], weight_decay=scalars["weight_decay"],

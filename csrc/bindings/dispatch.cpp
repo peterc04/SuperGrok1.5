@@ -218,7 +218,14 @@ struct FusedScalars {
        // hyperparameters (adamw_lr/adamw_betas, muon.py:115-125); these carry them
        // to the kernel's Muon P3 1D tail. Defaults = eager Muon adamw_* defaults;
        // every non-Muon caller leaves them untouched (only OptId::Muon's P3 reads).
-       aux_lr, aux_beta1, aux_beta2;
+       aux_lr, aux_beta1, aux_beta2,
+       // LookSAM append-only widening (decoder/vit/mamba L3-TC, MODEL-COUPLED SAM 2nd
+       // backward) — KEEP IN LOCK-STEP with the real fused::sm90::FusedScalars
+       // (opt_components.cuh): same 2 trailing fields, same order. rho = SAM
+       // perturbation radius; looksam_sam = the every-k SAM-step gate (1.0 ⇒ run the
+       // in-kernel perturb→2nd fwd+bwd→sam_dir=g_sam−g; 0.0 ⇒ reuse the cached
+       // sam_dir). Inert defaults (0.0) for every non-LookSAM caller; byte-identical.
+       rho, looksam_sam;
 };
 } // namespace sm90
 } // namespace fused
@@ -577,14 +584,20 @@ inline MambaScratch& mamba_scratch_for(const torch::Tensor& params) {
 // stays free of the device header — same discipline as the FusedScalars mirror).
 // Returns the OptId for a SINGLE-LAUNCH wgmma-capable tail (no precompute stage, no
 // 2nd backward, no sharpness ABI), or -1 for an optimizer whose L3-TC path needs more
-// than the fwd+bwd+tail single launch (prodigy/muon/SG11/SG15/looksam/SG2). The
-// owner-baseline directive routes exactly the -1!=... set onto the TC driver; the
+// than the fwd+bwd+tail single launch (SG11/SG15/SG2). LookSAM IS now wired: its SAM
+// 2nd backward is an IN-KERNEL phase (P2.4) — a perturb→2nd fwd+bwd→sam_dir=g_sam−g
+// loop between B2 and P3, gated to every-k SAM steps — so it remains a SINGLE
+// persistent launch (the same shape as Prodigy's P2.6 / Muon's P2.7 in-kernel stages).
+// The owner-baseline directive routes exactly the -1!=... set onto the TC driver; the
 // rest FAIL LOUD (here / in the Python gate) with their cited blocker.
 static int wgmma_tail_opt_id(const std::string& optimizer) {
     if (optimizer == "adamw")      return 0;   // OptId::AdamW
     if (optimizer == "lion")       return 1;   // OptId::Lion
     if (optimizer == "grokfast")   return 2;   // OptId::Grokfast
     if (optimizer == "grokadamw")  return 3;   // OptId::GrokAdamW
+    if (optimizer == "looksam")    return 4;   // OptId::LookSAM (MODEL-COUPLED SAM 2nd
+                                               // backward — in-kernel P2.4 perturb→2nd
+                                               // fwd+bwd→sam_dir, SINGLE persistent launch)
     if (optimizer == "prodigy")    return 5;   // OptId::Prodigy (STAGED global-d,
                                                // in-kernel P2.6 reduction — still a
                                                // SINGLE persistent launch)
@@ -592,7 +605,7 @@ static int wgmma_tail_opt_id(const std::string& optimizer) {
     if (optimizer == "muon")       return 7;   // OptId::Muon (STAGED grid-cooperative
                                                // Newton-Schulz — in-kernel P2.7, still a
                                                // SINGLE persistent launch; vit wired)
-    return -1;                                 // model-coupled / SG2 (no single-launch TC)
+    return -1;                                 // SG11/SG15/SG2 (no single-launch TC)
 }
 
 } // anonymous namespace
@@ -654,7 +667,14 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // args (same back-compat pattern): eager Muon adamw_* defaults for every non-Muon
  // cell. Flow into FusedScalars → the kernel's Muon P3 1D tail (which device-computes
  // aux_bc1/bc2 = 1-aux_beta^step). The default args live on the helpers.h declaration.
- float aux_lr, float aux_beta1, float aux_beta2) {
+ float aux_lr, float aux_beta1, float aux_beta2,
+ // LookSAM scalars (decoder/vit/mamba L3-TC, MODEL-COUPLED SAM 2nd backward).
+ // Trailing defaulted args (same back-compat pattern): inert defaults (0.0) for every
+ // non-LookSAM cell. rho = SAM perturbation radius; looksam_sam = the every-k SAM-step
+ // gate (1.0 ⇒ run the in-kernel perturb→2nd fwd+bwd→sam_dir=g_sam−g phase). Flow into
+ // FusedScalars → the kernel's P2.4 SAM 2nd-backward phase. A stale _ops without these
+ // args trips the caller's TypeError latch (loud degrade to eager, never silent).
+ float rho, float looksam_sam) {
  int arch = detect_arch();
  // Resolve the GEMM engine ONCE. Unknown tokens FAIL LOUD (no silent scalar
  // fallback — the owner no-suppression rule): a typo'd "wgma" must not quietly
@@ -769,7 +789,8 @@ void fused_step(const std::string& model, const std::string& optimizer,
  lr, beta1, beta2, eps, weight_decay, bc1, bc2, alpha, beta, lamb,
  alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip,
  d0, d_coef, beta3,    // Prodigy estimator scalars (inert for non-Prodigy cells)
- aux_lr, aux_beta1, aux_beta2};  // Muon 1D-group AdamW hyperparams (decoder L3-TC
+ aux_lr, aux_beta1, aux_beta2,   // Muon 1D-group AdamW hyperparams (decoder L3-TC
+ rho, looksam_sam};    // LookSAM SAM 2nd-backward scalars (inert for non-LookSAM cells)
  // STAGED NS). MUST be passed here — the mirror FusedScalars (line 204) declares
  // aux_* with NO in-class default, so omitting them aggregate-inits to 0.0 (→ the
  // 1D AdamW tail would run β1=β2=0: m=g/v=g², the (1b) state FAIL this fixes).
@@ -891,7 +912,8 @@ void fused_step(const std::string& model, const std::string& optimizer,
  lr, beta1, beta2, eps, weight_decay, bc1, bc2, alpha, beta, lamb,
  alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip,
  d0, d_coef, beta3,    // Prodigy estimator scalars (inert for non-Prodigy cells)
- aux_lr, aux_beta1, aux_beta2};   // Muon 1D-group AdamW hyperparams (inert for non-Muon)
+ aux_lr, aux_beta1, aux_beta2,   // Muon 1D-group AdamW hyperparams (inert for non-Muon)
+ rho, looksam_sam};    // LookSAM SAM 2nd-backward scalars (inert for non-LookSAM cells)
 
  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
  // GEMM-engine branch (task 1). want_wgmma → bf16 tensor-core launcher
@@ -971,7 +993,15 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // (synccheck=0). Routing prodigy on the mamba prod path would ship a non-deterministic
  // cell, so exclude it for mamba ONLY here. Owner: fix the mamba forward, then lift this
  // carve-out. See dispatch.py's note.
- const bool mb_tc_tail = (mb_opt_id >= 0 && optimizer != "prodigy");  // {adamw,lion,grokfast,grokadamw,neuralgrok}; mamba prodigy BLOCKED (separate mamba-forward A/A/A issue); SAM/SG2 = -1
+ // DIAGNOSTIC OVERRIDE (env SG_MAMBA_PRODIGY_PROBE=1): TEMPORARILY lift the
+ // prodigy carve-out so the A/A/A determinism of the landed-dormant mamba prodigy
+ // tail can be OBSERVED on a real build (the fix-or-cite empirical step). OFF by
+ // default → production behavior is byte-identical to before. Never commit with
+ // this path routed unless the cell is proven A/A/A-clean (no-suppression).
+ static const bool mb_prodigy_probe =
+     (std::getenv("SG_MAMBA_PRODIGY_PROBE") != nullptr);
+ const bool mb_tc_tail = (mb_opt_id >= 0 &&
+                          (optimizer != "prodigy" || mb_prodigy_probe));  // {adamw,lion,grokfast,grokadamw,neuralgrok}; mamba prodigy BLOCKED (separate mamba-forward A/A/A issue) unless probe; SAM/SG2 = -1
  const bool mamba_l3_real = (optimizer == "adamw")
                             || (want_wgmma && mb_tc_tail);
  if (arch == 90 && model == "mamba3" && mamba_l3_real && !opt_only) {

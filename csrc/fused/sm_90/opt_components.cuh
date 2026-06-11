@@ -142,6 +142,18 @@ struct FusedOptState {
     // = 1-aux_beta^step). Defaults = eager Muon adamw_* defaults; non-Muon cells
     // never read these (byte-identical).
     float aux_lr = 1e-3f, aux_beta1 = 0.9f, aux_beta2 = 0.98f;
+    // LookSAM (decoder/vit/mamba L3-TC, MODEL-COUPLED SAM 2nd backward). rho is the
+    // perturbation radius; the model phase computes rho_over_norm = rho/‖g‖_global
+    // ON-DEVICE (same deterministic ascending-CTA reduction as GrokAdamW's P2.5),
+    // perturbs p'=p+rho_over_norm·g, runs a SECOND in-kernel fwd+bwd at p' → g_sam,
+    // and writes st.sam_dir = g_sam − g (persisted in the `extra` state slice) BEFORE
+    // the apply tail blends g_adj=(1−α)g+α·sam_dir. looksam_sam is the SAM-step gate
+    // (1.0 on every-k SAM steps, 0.0 on intervening steps — the host computes it from
+    // the optimizer's _global_step%%k cadence); when 0 the cached sam_dir is reused
+    // verbatim and NO 2nd backward runs. α rides the shared st.alpha field. Defaults
+    // are inert (rho=0 ⇒ no perturb; looksam_sam=0 ⇒ no 2nd pass) so every non-LookSAM
+    // cell is byte-identical.
+    float rho = 0.0f, looksam_sam = 0.0f;
 };
 
 // =========================================================================
@@ -211,6 +223,14 @@ struct FusedScalars {
     float aux_lr    = 1e-3f;  // Muon 1D-group AdamW lr (eager adamw_lr)
     float aux_beta1 = 0.9f;   // Muon 1D-group AdamW betas[0] (eager adamw_betas[0])
     float aux_beta2 = 0.98f;  // Muon 1D-group AdamW betas[1] (eager adamw_betas[1])
+    // ── LookSAM append-only widening (decoder/vit/mamba L3-TC, MODEL-COUPLED SAM
+    //    2nd backward). rho = SAM perturbation radius; looksam_sam = the every-k
+    //    SAM-step gate (1.0 ⇒ run the in-kernel perturb→2nd fwd+bwd→sam_dir=g_sam−g;
+    //    0.0 ⇒ reuse the cached sam_dir, no 2nd pass). α rides the existing `alpha`
+    //    field. Defaults are inert (rho=0 / looksam_sam=0), so every non-LookSAM
+    //    caller is byte-identical (only OptId::LookSAM's model phase reads them).
+    float rho         = 0.0f;
+    float looksam_sam = 0.0f;
 };
 
 // Fold the runtime scalars into a FusedOptState (pointers are bound separately
@@ -244,6 +264,8 @@ __host__ __device__ __forceinline__ void apply_scalars(FusedOptState& st,
     st.aux_lr       = s.aux_lr;      // Muon 1D-group AdamW lr (eager adamw_lr)
     st.aux_beta1    = s.aux_beta1;   // Muon 1D-group AdamW betas[0]
     st.aux_beta2    = s.aux_beta2;   // Muon 1D-group AdamW betas[1]
+    st.rho          = s.rho;         // LookSAM perturbation radius
+    st.looksam_sam  = s.looksam_sam; // LookSAM every-k SAM-step gate (1=run 2nd bwd)
     // st.d_factor is NOT host-bound for the STAGED-d cell: the kernel's Prodigy
     // reduction stage computes it on-device (between B2 and P3) and stashes it.
     // st.param_init / st.prodigy_persist are device pointers bound by the cell.

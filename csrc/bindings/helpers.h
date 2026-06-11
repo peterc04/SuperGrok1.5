@@ -66,7 +66,14 @@ void fused_step(const std::string& model, const std::string& optimizer,
                 // adamw_* defaults (inert for every non-Muon cell). Keep in sync
                 // with the dispatch.cpp definition + the pybind py::arg list.
                 float aux_lr = 1e-3f, float aux_beta1 = 0.9f,
-                float aux_beta2 = 0.98f);
+                float aux_beta2 = 0.98f,
+                // LookSAM SAM 2nd-backward scalars (decoder/vit/mamba L3-TC,
+                // MODEL-COUPLED). rho = SAM perturbation radius; looksam_sam = the
+                // every-k SAM-step gate (1.0 ⇒ run the in-kernel perturb→2nd
+                // fwd+bwd→sam_dir=g_sam−g phase). Trailing defaulted args = inert
+                // (0.0) for every non-LookSAM cell. Keep in sync with the
+                // dispatch.cpp definition + the pybind py::arg list (bindings.cpp).
+                float rho = 0.0f, float looksam_sam = 0.0f);
 
 // ── Per-arch namespace handles ───────────────────────────────────────
 namespace sm90 {}

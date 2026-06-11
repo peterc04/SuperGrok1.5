@@ -1540,21 +1540,37 @@ def train_looksam(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     crit_ls=nn.CrossEntropyLoss()
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
+    mtype=c.get("model_type","decoder")
     for step in (pb:=_pbar("LookSAM",c["max_steps"],bp)):
-        # [A4-M5] L1 fused tail integration for this optimizer requires the
-        # adamw/lion post-backward structure (see train_adamw) — do not re-add
-        # the pre-forward continue pattern (it skips side-steps and eval).
-        with _autocast(c):
-            loss=F.cross_entropy(m(tx),ty)
-        opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
-        if c.get("use_amp", False):
-            _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
-            if _has_inf:
-                scaler.update(); continue
-        if opt.should_sam_step():
-            opt.sam_step(m, tx, ty, crit_ls)
-        opt.step()
-        scaler.update()
+        # TRUE L3 fused path for (decoder|vit|mamba × looksam): ONE persistent megakernel
+        # runs the REAL fwd+bwd + the MODEL-COUPLED SAM 2nd backward (P2.4: on every-k SAM
+        # steps perturb p'=p+(rho/‖g‖)·g → 2nd in-kernel fwd+bwd at p' → sam_dir=g_sam−g,
+        # cached in the persistent extra slice; intervening steps reuse it) + the LookSAM
+        # apply (g_adj=(1−α)g+α·sam_dir → AdamW), all in-kernel — ZERO intermediate launches
+        # (the eager sam_step's host perturb + 2nd backward + restore are now IN the kernel).
+        # The SAM cadence is host-computed from the every-k gate (_opt_scalars_from) and
+        # threaded via FusedScalars.looksam_sam, so it matches the eager should_sam_step()
+        # phase. If it ran we SKIP the eager fwd/bwd/sam_step/step (params updated in place);
+        # else fall back to eager (AMP on / non-sm_90 / fp32 / unregistered cell). (Same hook
+        # the adamw/prodigy loops use.)
+        l3_loss=_try_fused_train_step(mtype, "looksam", m, opt, tx, ty, c)
+        if l3_loss is not None:
+            loss=torch.as_tensor(l3_loss)
+        else:
+            # [A4-M5] L1 fused tail integration for this optimizer requires the
+            # adamw/lion post-backward structure (see train_adamw) — do not re-add
+            # the pre-forward continue pattern (it skips side-steps and eval).
+            with _autocast(c):
+                loss=F.cross_entropy(m(tx),ty)
+            opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)
+            if c.get("use_amp", False):
+                _has_inf = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in m.parameters())
+                if _has_inf:
+                    scaler.update(); continue
+            if opt.should_sam_step():
+                opt.sam_step(m, tx, ty, crit_ls)
+            opt.step()
+            scaler.update()
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break
