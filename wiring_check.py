@@ -267,6 +267,20 @@ def check_cell(opt, model, steps=4):
         _wgmma_tails = {"adamw", "lion", "grokfast", "grokadamw", "neuralgrok"}
         if model == "mamba" and opt in _wgmma_tails and opt not in _BLOCK_REASONS:
             reason = ("BLOCKED by the missing mamba wgmma launcher TU. " + _MODEL_NOTE["mamba"])
+        elif model == "mamba" and opt in ("prodigy", "looksam"):
+            # decoder/vit prodigy+looksam ARE CONVERTED (they don't reach this branch); the
+            # mamba in-kernel P2.6/P2.4 phases are CODE-LANDED + compile-clean (if-constexpr'd,
+            # mamba×{adamw,lion,grokfast} stay bit-identical) but FAIL A/A/A on the SAME latent
+            # shared mamba scan/forward race (for looksam: non-deterministic EVEN on a SAM-OFF
+            # step, so NOT the SAM code). dispatch.cpp's mb_prodigy/mb_looksam carve-outs gate
+            # them to eager (env SG_MAMBA_{PRODIGY,LOOKSAM}_PROBE to observe). Lift once the
+            # mamba forward is fixed (megakernel_common.cuh GridBarrier / model_stage_mamba3.cuh).
+            reason = ("BLOCKED: mamba×" + opt + " in-kernel phase is code-landed (launcher "
+                      "case + if-constexpr'd kernel phase, byte-identical for the routed tails) "
+                      "but FAILS A/A/A on the shared mamba scan/forward race (same class as "
+                      "mamba×prodigy; for looksam, measured even on a SAM-OFF step → not the SAM "
+                      "code). Gated to eager via the dispatch.cpp carve-out. decoder/vit " + opt +
+                      " ARE L3-TC-converted (A/A/A-clean).")
         else:
             reason = _BLOCK_REASONS.get(
                 opt, "no production L3-TC route wired for this (model, optimizer).")

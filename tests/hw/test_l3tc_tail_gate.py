@@ -343,6 +343,16 @@ _CELLS = {
     # is deterministic — vit Prodigy/Muon are A/A/A-green, same fixed reductions).
     "looksam/vit": dict(model="vit", opt="looksam", factory=_looksam_factory,
                         sam_dir_tol=2e-2),
+    # NOTE: looksam/mamba is NOT registered — it FAILS A/A/A (the SAME latent shared mamba
+    # scan/forward race that blocks prodigy/mamba). The in-kernel P2.4 SAM 2nd backward IS
+    # code-landed (fused_mamba_megakernel.cuh + the mamba launcher case OptId::LookSAM) and the
+    # mamba bf16-faithful sam_dir oracle branch (gate (A), above) is wired for the probe, but
+    # the LookSAM mamba INSTANTIATION's grad is non-deterministic across bit-identical re-runs
+    # (loss ~5e-5 spread, grad maxΔ~1e-3, intermittent NaN) — MEASURED even on a SAM-OFF step
+    # (no 2nd backward), so it is the shared forward, NOT the SAM code (the sam_dir reductions
+    # are fixed-ownership mirrors of the A/A/A-clean P1+P2). dispatch.cpp gates it to eager
+    # (mb_looksam carve-out, env SG_MAMBA_LOOKSAM_PROBE to observe). Stays blocked until the
+    # racy mamba forward is fixed. decoder/vit looksam ARE registered-converted (A/A/A-clean).
 }
 
 # BLOCKED cells — kept here (commented) with the state-gate evidence that blocks them,
@@ -539,10 +549,34 @@ def run_cell_gate(cell_key, verbose=True):
             _lo2, grads_o2 = _vit_bf16_oracle(named_pert, patches_o, tgt_o)
             r_sam = torch.cat([(grads_o2[n_] - grads_o[n_]).reshape(-1).double()
                                for n_, _ in named_ref]).float().to(dev)
+        elif model == "mamba":
+            # Mamba bf16-faithful oracle (test_mamba_tc._bf16_faithful_mamba_oracle):
+            # input is int tokens [B,kSeq] (tx == data[0]) like the decoder, targets [B].
+            # B16-truncate to match the kernel's B%16 batch (fused_train_step truncates
+            # the same way; the mamba TC launcher requires B%16==0).
+            from tests.hw.test_mamba_tc import _bf16_faithful_mamba_oracle as _mb_bf16_oracle
+            B = int(tx.shape[0]); B16 = B - (B % 16)
+            tok_o = tx[:B16].detach().cpu().to(torch.long)
+            tgt_o = ty[:B16].detach().cpu().to(torch.long)
+            named_d = {n: p.detach().cpu() for n, p in named_ref}
+            _lo, grads_o = _mb_bf16_oracle(named_d, tok_o, tgt_o)
+            gn = torch.sqrt(sum((gv.double() ** 2).sum() for gv in grads_o.values())).item()
+            rho = float(opt_ref.param_groups[0]["rho"])
+            ron = rho / gn
+            # perturb each param by ron·g (g = the kernel's reduced grad, layout order).
+            off = 0; named_pert = {}
+            for n_, p in named_ref:
+                k = p.numel()
+                named_pert[n_] = (p.detach().cpu().double()
+                                  + ron * grad[off:off + k].reshape(p.shape).cpu().double())
+                off += k
+            _lo2, grads_o2 = _mb_bf16_oracle(named_pert, tok_o, tgt_o)
+            r_sam = torch.cat([(grads_o2[n_] - grads_o[n_]).reshape(-1).double()
+                               for n_, _ in named_ref]).float().to(dev)
         else:
             raise NotImplementedError(
                 f"{cell_key}: looksam sam_dir reference oracle not wired for {model} "
-                f"(only decoder/vit bf16-faithful oracles are available here).")
+                f"(only decoder/vit/mamba bf16-faithful oracles are available here).")
         sd_abs = (k_sam - r_sam).abs().max().item()
         sd_den = r_sam.abs().max().item() + 1e-30
         looksam_sam_dir_rel = sd_abs / sd_den

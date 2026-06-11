@@ -874,6 +874,21 @@ _FUSED_L3_REAL = frozenset({
     # (case OptId::LookSAM). vit's forward is deterministic (vit Prodigy/Muon are A/A/A-green),
     # so the SAM 2nd backward is A/A/A by construction (same fixed reductions as the decoder).
     ("vit", "looksam"),
+    # looksam (mamba): BLOCKED — A/A/A determinism FAILS on the mamba TC kernel (same class
+    # as mamba×prodigy). The in-kernel P2.4 SAM 2nd backward IS code-landed + compile-clean
+    # (fused_mamba_megakernel.cuh, if-constexpr'd → mamba×{adamw,lion,grokfast} stay bit-
+    # identical A/A/A, and the mamba launcher routes opt_id=4), but the LookSAM template
+    # INSTANTIATION (fused_mamba_megakernel_tc<LookSAM>) is NOT registered here: its grad is
+    # NON-DETERMINISTIC across bit-identical re-runs (loss varies ~5e-5, grad maxΔ~1e-3, and
+    # intermittent NaN). MEASURED: the non-determinism appears EVEN on a SAM-OFF step (no 2nd
+    # backward), so it is NOT in the SAM phase code (the sam_dir reductions are fixed-ownership
+    # mirrors of P1+P2) — it is the SAME latent shared mamba scan/forward race that blocks
+    # mamba×prodigy, exposed here by the LookSAM instantiation's register/occupancy profile
+    # (the if-constexpr'd P2.4 changes ptxas allocation). Registering it would ship a non-
+    # deterministic cell (no-suppression violation). dispatch.cpp gates it to eager via the
+    # mb_looksam carve-out (mirroring the mamba×prodigy carve-out). Lift BOTH once the mamba
+    # forward is fixed by its owner (megakernel_common.cuh GridBarrier / model_stage_mamba3.cuh).
+    # ✓ decoder + vit looksam ARE registered-converted (A/A/A bit-exact); only mamba is blocked.
 })
 
 _FUSED_REGISTRY = {}
@@ -1364,7 +1379,14 @@ _L3_WGMMA_CELLS = frozenset({
     # on the ViT TC kernel (fused_vit_megakernel.cuh); opt_id=4 routes it onto the vit TC driver
     # (wgmma_tail_opt_id("looksam")=4 → case OptId::LookSAM in the vit launcher). WITHOUT this
     # entry gemm_impl_for_cell returns "scalar" → the scalar adamw-only vit path → throws; WITH
-    # it → "wgmma", the real TC path. mamba×looksam follows once the mamba phase lands.
+    # it → "wgmma", the real TC path. mamba×looksam is BLOCKED (deliberately NOT registered
+    # here): its in-kernel P2.4 IS code-landed but the LookSAM mamba instantiation FAILS A/A/A
+    # (the same latent shared mamba-forward race as mamba×prodigy — non-deterministic EVEN on
+    # SAM-OFF steps, so NOT the SAM code). Absent this registry entry gemm_impl_for_cell returns
+    # "scalar" for mamba×looksam, and has_l3_real is False, so fused_train_step declines the L3
+    # path and the race runs eager LookSAM — never a non-deterministic wgmma cell. dispatch.cpp's
+    # mb_looksam carve-out is the C++-side guard (env SG_MAMBA_LOOKSAM_PROBE to observe the
+    # landed-dormant tail). Lift once the mamba forward is fixed by its owner.
     ("vit", "looksam"),
 })
 

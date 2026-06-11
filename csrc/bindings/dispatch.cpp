@@ -970,12 +970,17 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // surrogate route so the real path wins.
  // OPTID-GENERIC GATE (mirrors the decoder): mamba's scalar real megakernel exists
  // ONLY for adamw; the wgmma TC launcher supports the single-launch tails
- // {adamw,lion,grokfast,grokadamw,neuralgrok} (opt_id 0/1/2/3/6). Prodigy (opt_id 5) is
- // CONVERTED + A/A/A-clean for decoder+vit, and CODE-LANDED but BLOCKED for mamba via the
- // carve-out below (a SEPARATE mamba scan/forward determinism issue — cited there). The
- // model-coupled SAM opts (SG11/15/looksam) and SG2 never reach here (wgmma_tail_opt_id
- // < 0 → eager). mb_tc_tail is the single source of the routed set, so this gate cannot
- // drift from the launcher's switch.
+ // {adamw,lion,grokfast,grokadamw,neuralgrok} (opt_id 0/1/2/3/6). TWO tails are CODE-LANDED
+ // (the launcher has their case + the kernel their if-constexpr'd phase) but BLOCKED for
+ // mamba via the carve-outs below, on the SAME latent shared mamba scan/forward determinism
+ // race: Prodigy (opt_id 5, in-kernel P2.6 d-estimate — CONVERTED + A/A/A-clean for decoder/
+ // vit) and MODEL-COUPLED LookSAM (opt_id 4, in-kernel P2.4 SAM 2nd backward — CONVERTED +
+ // A/A/A-clean for decoder/vit). Both mamba instantiations FAIL A/A/A (non-deterministic
+ // grad, intermittent NaN — for LookSAM, measured EVEN on a SAM-OFF step, so it is the shared
+ // forward, not the SAM code); their register/occupancy profile exposes the race that the
+ // simple tails (bit-identical on the SAME forward) do not. The remaining SAM opts (SG11/15)
+ // and SG2 never reach here (wgmma_tail_opt_id < 0 → eager). mb_tc_tail is the single source
+ // of the routed set, so this gate cannot drift from the launcher's switch.
  const int mb_opt_id = wgmma_tail_opt_id(optimizer);
  // mamba×prodigy CARVE-OUT (no-suppression): wgmma_tail_opt_id returns 5 for prodigy
  // (decoder/vit prodigy ARE registered-converted AND A/A/A-clean — they PASS test_l3tc_
@@ -1000,8 +1005,28 @@ void fused_step(const std::string& model, const std::string& optimizer,
  // this path routed unless the cell is proven A/A/A-clean (no-suppression).
  static const bool mb_prodigy_probe =
      (std::getenv("SG_MAMBA_PRODIGY_PROBE") != nullptr);
+ // mamba×looksam CARVE-OUT (no-suppression): wgmma_tail_opt_id returns 4 for looksam, and
+ // the in-kernel P2.4 SAM 2nd backward IS code-landed in fused_mamba_megakernel_tc<LookSAM>
+ // (the launcher routes case OptId::LookSAM; the FusedScalars POD carries rho/looksam_sam).
+ // But the LookSAM mamba INSTANTIATION FAILS test_l3tc_tail_gate A/A/A: its grad is NON-
+ // DETERMINISTIC across bit-identical re-runs (loss varies ~5e-5, grad maxΔ~1e-3, intermittent
+ // NaN). MEASURED: the non-determinism appears EVEN on a SAM-OFF step (no 2nd backward), so it
+ // is NOT the SAM phase code (the sam_dir reductions are fixed-ownership mirrors of the A/A/A-
+ // clean P1+P2) — it is the SAME latent shared mamba scan/forward race that blocks mamba×
+ // prodigy, exposed here by the LookSAM instantiation's register/occupancy profile (the if-
+ // constexpr'd P2.4 shifts ptxas allocation; mamba×{adamw,lion,grokfast} on the SAME forward
+ // stay bit-identical). Routing it would ship a non-deterministic cell, so exclude it for
+ // mamba ONLY here (decoder/vit looksam ARE A/A/A-clean + registered-converted). Owner: fix
+ // the mamba forward (megakernel_common.cuh GridBarrier / model_stage_mamba3.cuh), then lift
+ // BOTH this and the prodigy carve-out. DIAGNOSTIC OVERRIDE (env SG_MAMBA_LOOKSAM_PROBE=1):
+ // TEMPORARILY route the landed-dormant tail so its A/A/A can be OBSERVED on a real build (the
+ // fix-or-cite empirical step). OFF by default → production is byte-identical. Never commit
+ // with this routed unless the cell is proven A/A/A-clean.
+ static const bool mb_looksam_probe =
+     (std::getenv("SG_MAMBA_LOOKSAM_PROBE") != nullptr);
  const bool mb_tc_tail = (mb_opt_id >= 0 &&
-                          (optimizer != "prodigy" || mb_prodigy_probe));  // {adamw,lion,grokfast,grokadamw,neuralgrok}; mamba prodigy BLOCKED (separate mamba-forward A/A/A issue) unless probe; SAM/SG2 = -1
+                          (optimizer != "prodigy" || mb_prodigy_probe) &&
+                          (optimizer != "looksam" || mb_looksam_probe));  // {adamw,lion,grokfast,grokadamw,neuralgrok}; mamba prodigy+looksam BLOCKED (shared mamba-forward A/A/A race) unless their probe; SG11/15/SG2 = -1
  const bool mamba_l3_real = (optimizer == "adamw")
                             || (want_wgmma && mb_tc_tail);
  if (arch == 90 && model == "mamba3" && mamba_l3_real && !opt_only) {
@@ -1014,10 +1039,11 @@ void fused_step(const std::string& model, const std::string& optimizer,
  "'); the non-adamw mamba tails are wgmma-only. Use gemm_impl='wgmma'.");
  TORCH_CHECK(!want_wgmma || mb_tc_tail,
  "fused_step: gemm_impl='wgmma' requested for mamba3 with optimizer '", optimizer,
- "', but the mamba TC launcher supports only the single-launch tails "
- "{adamw,lion,grokfast,grokadamw,neuralgrok} + STAGED Prodigy (opt_id 0/1/2/3/5/6). "
- "The model-coupled SAM opts (SG11/15/looksam) and SG2 are not mamba TC tails — "
- "use the eager/per-op path.");
+ "', but the mamba TC launcher production-routes only the single-launch tails "
+ "{adamw,lion,grokfast,grokadamw,neuralgrok} (opt_id 0/1/2/3/6). STAGED Prodigy (opt_id 5) "
+ "and MODEL-COUPLED LookSAM (opt_id 4) are CODE-LANDED but BLOCKED on the shared mamba-"
+ "forward A/A/A race (set SG_MAMBA_PRODIGY_PROBE / SG_MAMBA_LOOKSAM_PROBE to observe). "
+ "The remaining SAM opts (SG11/15) and SG2 are not mamba TC tails — use the eager/per-op path.");
  const int64_t total = kMambaTotalElems;
  TORCH_CHECK(params.numel() == total,
  "fused Mamba megakernel: params has ", params.numel(),
@@ -1068,7 +1094,13 @@ void fused_step(const std::string& model, const std::string& optimizer,
  fused::sm90::FusedScalars scalars{
  lr, beta1, beta2, eps, weight_decay, bc1, bc2, alpha, beta, lamb,
  alpha_max, gate, d_factor, neg_lr_scale, decay_factor, gamma, grad_clip,
- d0, d_coef, beta3};   // Prodigy estimator scalars (inert for non-Prodigy cells)
+ d0, d_coef, beta3,    // Prodigy estimator scalars (inert for non-Prodigy cells)
+ aux_lr, aux_beta1, aux_beta2,   // Muon 1D-group AdamW hyperparams (inert for non-Muon)
+ rho, looksam_sam};    // LookSAM SAM 2nd-backward scalars (inert for non-LookSAM cells).
+ // MUST be passed (the mirror FusedScalars declares all 25 fields with NO in-class
+ // defaults — omitting these aggregate-inits them to 0.0, which for LookSAM means
+ // rho=0/looksam_sam=0 → the P2.4 SAM phase is INERT and sam_dir never gets written).
+ // Lock-step with the decoder/vit PODs above.
 
  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
  // GEMM-engine branch (mirrors the decoder/vit). want_wgmma → the bf16 tensor-core
