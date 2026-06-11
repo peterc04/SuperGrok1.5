@@ -1107,6 +1107,7 @@ def train_neuralgrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
     # batch equalized.
     scaler=torch.amp.GradScaler('cuda', enabled=c.get("use_amp",False))
     st=_stopper(c); m.train(); t0=time.time(); eval_every=c.get("eval_every",100)
+    mtype=c.get("model_type","decoder")
     for step in (pb:=_pbar("NeuralGrok",c["max_steps"],bp)):
         # [A4-M5] L1 fused tail integration for this optimizer requires the
         # adamw/lion post-backward structure (see train_adamw) — do not re-add
@@ -1132,7 +1133,26 @@ def train_neuralgrok(c, init, tx, ty, vax, vay, tex, tey, dev, bp=0):
         # post-unscale isfinite skip train_supergrok uses before this call.
         _component_guard(r, "amplifier_step", step, c, opt.train_amplifier_step,
                          m, vax, vay, crit_ng, aopt)
-        scaler.step(opt); scaler.update()
+        # PHASE 1 — TRUE L3 fused path for (model × neuralgrok): ONE persistent
+        # bf16 wgmma megakernel runs the REAL fwd+bwd AND the amplified-AdamW tail
+        # (apply_optimizer<NeuralGrok>: g_amp=(psi*alpha+beta)*g over the TC-reduced
+        # grad). The amplifier's lookahead autograd CANNOT run in-kernel, so it is
+        # trained HOST-SIDE just above — the eager fwd+bwd we already ran seeds
+        # p.grad (the |g| featurization the amplifier needs), and fused_train_step
+        # re-extracts the freshly-trained psi_pack() into the kernel's `extra` state
+        # slice BEFORE this launch (so the kernel evaluates the amplifier we just
+        # trained THIS step). On the L3 path the host grad is amplifier-featurization
+        # ONLY: the kernel computes its own deterministically-reduced grad and owns
+        # the in-place weight + m/v update, so we SKIP scaler.step(opt) — identical to
+        # train_adamw's L3 branch. Falls back to the eager loss-fed step below when
+        # L3-REAL is unavailable (AMP on / non-sm_90 / unwired precision); since
+        # _try_fused_train_step declines under AMP, l3_loss!=None ⇒ scaler was disabled
+        # ⇒ the unscale_ above was a no-op (no stranded pending-unscale state).
+        l3_loss=_try_fused_train_step(mtype, "neuralgrok", m, opt, tx, ty, c)
+        if l3_loss is not None:
+            loss=torch.as_tensor(l3_loss)  # for _eval_log's .item()-style logging
+        else:
+            scaler.step(opt); scaler.update()
         if step%eval_every==0 or step==1:
             done,_,_=_eval_log(r,step,m,tx,ty,vax,vay,tex,tey,c,st,pb)
             if done: break

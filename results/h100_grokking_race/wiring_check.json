@@ -1,20 +1,50 @@
 {
   "summary": {
-    "total_cells": 1,
-    "converted_l3_tc": 1,
+    "total_cells": 3,
+    "converted_l3_tc": 3,
     "blocked": 0,
     "fraction_l3_tc": 1.0,
     "converted_cells": [
-      "prodigy/vit"
+      "neuralgrok/decoder",
+      "neuralgrok/vit",
+      "neuralgrok/mamba"
     ],
     "blocked_cells": []
   },
   "rows": [
     {
-      "model": "vit",
-      "optimizer": "prodigy",
+      "model": "decoder",
+      "optimizer": "neuralgrok",
       "executed_path": "L3-TC-megakernel(wgmma)",
-      "l3_steps_fired": 8,
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "vit",
+      "optimizer": "neuralgrok",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
+      "l3_engines_seen": [
+        "wgmma"
+      ],
+      "l1_steps_fired": 0,
+      "abi_stale": false,
+      "error": null,
+      "is_l3_tc": true,
+      "reason_if_blocked": ""
+    },
+    {
+      "model": "mamba",
+      "optimizer": "neuralgrok",
+      "executed_path": "L3-TC-megakernel(wgmma)",
+      "l3_steps_fired": 4,
       "l3_engines_seen": [
         "wgmma"
       ],

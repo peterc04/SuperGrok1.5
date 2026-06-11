@@ -705,8 +705,8 @@ _FUSED_L3_REAL = frozenset({
     # clip in the eager BINDING (helpers.h clip_grad_norms_device_side), NOT in the
     # neuralgrok.h algorithm the kernel implements; the L3-TC gate asserts the clip
     # is INERT (global grad-norm <= grad_clip) at the gated step so the parity is
-    # real, not a hollow pass. mamba×neuralgrok stays OUT (no mamba TC neuralgrok
-    # tail — the mamba launcher's opt_id switch does not include NeuralGrok).
+    # real, not a hollow pass. mamba×neuralgrok is ALSO wired (the wave-2 mamba lane
+    # below) — the mamba TC launcher now DOES include the OptId::NeuralGrok case.
     ("transformer_decoder", "neuralgrok"),
     ("vit", "neuralgrok"),
     # neuralgrok (mamba — wave-2 mamba lane): the mamba TC launcher gained the
